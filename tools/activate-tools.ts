@@ -23,6 +23,8 @@ import { Type } from "../clients/deps/typebox.js";
 export interface ActivatableToolInfo {
 	name: string;
 	summary: string;
+	/** Optional guide the model should load only after selecting this tool family. */
+	skillPath?: string;
 }
 
 /** The subset of the host `pi` API this tool needs, kept minimal + optional
@@ -122,15 +124,25 @@ export function createActivateToolsTool(
 					deferralApplies: options.deferredToolSupport?.(ctx) ?? false,
 				});
 			}
+			const requestedSet = new Set(requested);
+			const skillPaths = [...new Set(
+				lazyTools
+					.filter((tool) => requestedSet.has(tool.name))
+					.map((tool) => tool.skillPath)
+					.filter((skillPath): skillPath is string => Boolean(skillPath)),
+			)];
+			const skillHint = skillPaths.length > 0
+				? ` Before first use, read: ${skillPaths.join(", ")}.`
+				: "";
 
 			return {
 				content: [
 					{
 						type: "text" as const,
-						text: `Activated: ${requested.join(", ")}. Available starting next turn.`,
+						text: `Activated: ${requested.join(", ")}. Available starting next turn.${skillHint}`,
 					},
 				],
-				details: { matches: requested, added },
+				details: { matches: requested, added, skillPaths },
 			};
 		},
 	};

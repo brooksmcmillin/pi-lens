@@ -18,7 +18,9 @@ loader tool `pi_lens_activate_tools`, per pi's dynamic-tool-loading API
 "Available starting next turn"; do not retry the tool in the same turn.
 Feature-detected: on hosts without that API, the six situational tools fall back
 to being statically active, exactly as before (`tools/activate-tools.ts`, wired
-in `index.ts`).
+in `index.ts`). The default skill catalog also omits the AST and LSP navigation
+guides until a tool from that family is active. The loader returns the matching
+`SKILL.md` path so you can read the guide after you choose a tool family.
 
 ## Per-edit
 
