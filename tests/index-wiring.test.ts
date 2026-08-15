@@ -91,6 +91,7 @@ const EXPECTED_TOOLS = [
 ];
 const EXPECTED_HOOKS = [
 	"resources_discover",
+	"before_agent_start",
 	"session_start",
 	"session_before_fork",
 	"tool_call",
@@ -438,6 +439,24 @@ describe("index.ts extension wiring", () => {
 					`generic skill dir must not exist (regression guard against rename-back): ${name}`,
 				).toBe(false);
 			}
+		});
+
+		it("filters inactive navigation guides through the before_agent_start hook", async () => {
+			const pi = createPiMock();
+			extension(pi.asExtensionAPI());
+			const systemPrompt = `<available_skills>
+  <skill><name>pi-lens-write-ast-grep-rule</name></skill>
+  <skill><name>pi-lens-ast-grep</name></skill>
+  <skill><name>pi-lens-lsp-navigation</name></skill>
+</available_skills>`;
+			const result = await pi.emit("before_agent_start", {
+				systemPrompt,
+				systemPromptOptions: { selectedTools: ["read", "ast_grep_search"] },
+			});
+			expect(result).toEqual({
+				systemPrompt: expect.stringContaining("<name>pi-lens-ast-grep</name>"),
+			});
+			expect((result as { systemPrompt: string }).systemPrompt).not.toContain("pi-lens-lsp-navigation");
 		});
 	});
 
