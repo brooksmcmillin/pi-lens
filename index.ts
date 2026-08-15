@@ -185,6 +185,7 @@ import {
 import { logSessionStart } from "./clients/sessionstart-logger.js";
 import { logConcurrentSessionBind } from "./clients/session-start-observability.js";
 import { warmFormatters } from "./clients/formatters-lazy.js";
+import { filterInactivePiLensSkills } from "./clients/conditional-skills.js";
 
 type DispatchIntegration = Awaited<ReturnType<typeof loadDispatchIntegration>>;
 let loadedDispatchIntegration: DispatchIntegration | undefined;
@@ -1403,29 +1404,37 @@ export default function (pi: ExtensionAPI) {
 		}),
 		createLensDiagnosticMarkTool(() => runtime.projectRoot),
 	];
+	const skillsDir = resolvePackagePath(import.meta.url, "skills");
+	const astGrepSkillPath = path.join(skillsDir, "pi-lens-ast-grep", "SKILL.md");
+	const lspNavigationSkillPath = path.join(skillsDir, "pi-lens-lsp-navigation", "SKILL.md");
 	const LAZY_TOOL_CATALOG: ActivatableToolInfo[] = [
 		{
 			name: "ast_grep_search",
+			skillPath: astGrepSkillPath,
 			summary:
 				"AST-aware structural code search across ~40 languages (ast-grep patterns).",
 		},
 		{
 			name: "ast_grep_replace",
+			skillPath: astGrepSkillPath,
 			summary:
 				"AST-aware structural code rewrite/refactor (ast-grep patterns).",
 		},
 		{
 			name: "ast_grep_outline",
+			skillPath: astGrepSkillPath,
 			summary:
 				"Syntax-only file/dir structure (symbols/imports/exports/members) via ast-grep outline — no index/LSP.",
 		},
 		{
 			name: "ast_grep_dump",
+			skillPath: astGrepSkillPath,
 			summary:
 				"Dump the tree-sitter AST for a source snippet to discover node kinds/field names.",
 		},
 		{
 			name: "lsp_navigation",
+			skillPath: lspNavigationSkillPath,
 			summary:
 				"IDE-style LSP navigation: definition, references, implementation, rename, call hierarchy.",
 		},
@@ -1494,11 +1503,14 @@ export default function (pi: ExtensionAPI) {
 		// join lands on the non-existent dist/skills/ and skills silently fail to load
 		// (#205). resolvePackagePath walks up to package.json, correct for both the
 		// source (index.ts at root) and dist (dist/index.js) layouts.
-		const skillsDir = resolvePackagePath(import.meta.url, "skills");
-
 		return {
 			skillPaths: [skillsDir],
 		};
+	});
+
+	pi.on("before_agent_start", async (event) => {
+		const filtered = filterInactivePiLensSkills(event.systemPrompt, event.systemPromptOptions);
+		return filtered === event.systemPrompt ? undefined : { systemPrompt: filtered };
 	});
 
 	// --- Events ---

@@ -5,9 +5,9 @@ import {
 } from "../../tools/activate-tools.js";
 
 const CATALOG: ActivatableToolInfo[] = [
-	{ name: "ast_grep_search", summary: "Structural search." },
-	{ name: "ast_grep_replace", summary: "Structural replace." },
-	{ name: "lsp_navigation", summary: "LSP nav." },
+	{ name: "ast_grep_search", summary: "Structural search.", skillPath: "/skills/ast/SKILL.md" },
+	{ name: "ast_grep_replace", summary: "Structural replace.", skillPath: "/skills/ast/SKILL.md" },
+	{ name: "lsp_navigation", summary: "LSP nav.", skillPath: "/skills/lsp/SKILL.md" },
 ];
 
 describe("pi_lens_activate_tools", () => {
@@ -54,7 +54,9 @@ describe("pi_lens_activate_tools", () => {
 		expect(result.details).toEqual({
 			matches: ["ast_grep_replace", "lsp_navigation"],
 			added: ["ast_grep_replace", "lsp_navigation"],
+			skillPaths: ["/skills/ast/SKILL.md", "/skills/lsp/SKILL.md"],
 		});
+		expect(result.content[0]?.text).toContain("Before first use, read: /skills/ast/SKILL.md, /skills/lsp/SKILL.md");
 	});
 
 	it("ignores unknown tool names not in the catalog", async () => {
@@ -92,6 +94,13 @@ describe("pi_lens_activate_tools", () => {
 		expect(result.details).toEqual({
 			matches: ["ast_grep_search"],
 			added: ["ast_grep_search"],
+			skillPaths: ["/skills/ast/SKILL.md"],
 		});
+	});
+
+	it("deduplicates one guide shared by several requested tools", async () => {
+		const tool = createActivateToolsTool({}, CATALOG);
+		const result = await tool.execute("4", { tools: ["ast_grep_search", "ast_grep_replace"] }, undefined, null);
+		expect(result.details.skillPaths).toEqual(["/skills/ast/SKILL.md"]);
 	});
 });
