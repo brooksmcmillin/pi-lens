@@ -24,6 +24,19 @@ export interface WorklogEntry {
 	fixable: boolean;
 	fixSuggestion?: string;
 	autoFixed: boolean;
+	/** Model/provider that produced the code this diagnostic fired against
+	 * (#1448). Optional — blank/omitted whenever the runtime doesn't know the
+	 * active identity (e.g. project-wide scans outside a live agent turn).
+	 * Old entries predate these fields entirely; readers must treat both as
+	 * optional. */
+	model?: string;
+	provider?: string;
+}
+
+/** Identity to attribute a worklog append to, when known. */
+export interface WorklogIdentity {
+	model?: string;
+	provider?: string;
 }
 
 // --- Paths ---
@@ -43,6 +56,7 @@ export function appendToWorklog(
 	cwd: string,
 	diagnostics: Diagnostic[],
 	autoFixed: boolean,
+	identity?: WorklogIdentity,
 ): void {
 	if (diagnostics.length === 0) return;
 
@@ -50,6 +64,8 @@ export function appendToWorklog(
 	try {
 		fs.mkdirSync(path.dirname(worklogPath), { recursive: true });
 		const timestamp = new Date().toISOString();
+		const model = identity?.model?.trim() || undefined;
+		const provider = identity?.provider?.trim() || undefined;
 		const lines =
 			diagnostics
 				.map((d) => {
@@ -64,6 +80,8 @@ export function appendToWorklog(
 						fixable: d.fixable ?? false,
 						fixSuggestion: d.fixSuggestion,
 						autoFixed,
+						model,
+						provider,
 					};
 					return JSON.stringify(entry);
 				})

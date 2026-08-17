@@ -136,6 +136,106 @@ describe("getProjectDataDir", () => {
 		);
 	});
 
+	// #1448: model/provider attribution
+	it("carries model and provider when an identity is supplied", () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-worklog-model-"));
+		process.env.PILENS_DATA_DIR = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-global-data-"),
+		);
+
+		appendToWorklog(
+			cwd,
+			[
+				{
+					id: "demo-id",
+					tool: "eslint",
+					severity: "warning",
+					semantic: "warning",
+					filePath: path.join(cwd, "src", "index.ts"),
+					message: "demo",
+					rule: "demo-rule",
+					line: 1,
+					column: 1,
+					fixable: true,
+				},
+			],
+			false,
+			{ model: "claude-sonnet-4-5", provider: "anthropic" },
+		);
+
+		const entries = readWorklog(cwd);
+		expect(entries).toHaveLength(1);
+		expect(entries[0].model).toBe("claude-sonnet-4-5");
+		expect(entries[0].provider).toBe("anthropic");
+	});
+
+	it("omits model and provider from the persisted line when identity is unknown", () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-worklog-blank-"));
+		process.env.PILENS_DATA_DIR = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-global-data-"),
+		);
+
+		appendToWorklog(
+			cwd,
+			[
+				{
+					id: "demo-id",
+					tool: "eslint",
+					severity: "warning",
+					semantic: "warning",
+					filePath: path.join(cwd, "src", "index.ts"),
+					message: "demo",
+					rule: "demo-rule",
+					line: 1,
+					column: 1,
+					fixable: true,
+				},
+			],
+			false,
+		);
+
+		const raw = fs.readFileSync(
+			path.join(getProjectDataDir(cwd), "worklog.jsonl"),
+			"utf8",
+		);
+		expect(raw).not.toContain('"model"');
+		expect(raw).not.toContain('"provider"');
+
+		const entries = readWorklog(cwd);
+		expect(entries).toHaveLength(1);
+		expect(entries[0].model).toBeUndefined();
+		expect(entries[0].provider).toBeUndefined();
+	});
+
+	it("parses old-shape entries that predate the model/provider fields", () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-worklog-old-"));
+		process.env.PILENS_DATA_DIR = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-global-data-"),
+		);
+		fs.mkdirSync(getProjectDataDir(cwd), { recursive: true });
+		const oldEntry = {
+			timestamp: new Date().toISOString(),
+			filePath: path.join(cwd, "src", "legacy.ts"),
+			rule: "legacy-rule",
+			tool: "eslint",
+			message: "legacy entry, no model/provider fields at all",
+			line: 1,
+			fixable: false,
+			autoFixed: true,
+		};
+		fs.writeFileSync(
+			path.join(getProjectDataDir(cwd), "worklog.jsonl"),
+			`${JSON.stringify(oldEntry)}\n`,
+			"utf8",
+		);
+
+		const entries = readWorklog(cwd);
+		expect(entries).toHaveLength(1);
+		expect(entries[0].rule).toBe("legacy-rule");
+		expect(entries[0].model).toBeUndefined();
+		expect(entries[0].provider).toBeUndefined();
+	});
+
 	it("stores rule cache under the configured data directory", () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-rule-cache-"));
 		const prev = process.env.PILENS_DATA_DIR;

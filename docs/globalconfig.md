@@ -25,6 +25,18 @@ Each runtime toggle is settable from the CLI *and* from `config.json`. The two a
 | `--lens-actionable-warning-autofix` | `actionableWarnings.autoFix.enabled` | `false` |
 | `--lens-actionable-warning-all` | `actionableWarnings.deltaOnly` (`false`) | `true` |
 | `--lens-compact-tool-line` | `ui.compactToolLine` | `false` |
+| `--no-lazy-tools` | `tools.lazy` | `true` |
+| `--lens-turn-end-madge` | `turnEnd.madge.enabled` | `false` |
+
+By default pi-lens registers six situational tools (the `ast_grep_*` family,
+`lsp_navigation`, `lens_diagnostic_mark`) inactive and exposes a small loader,
+`pi_lens_activate_tools`, that the model calls to activate the ones it needs.
+`--no-lazy-tools` turns that off: every pi-lens tool is active from the first
+turn and pi-lens never changes the tool list. Use it if you would rather spend
+the tokens of a longer tool list than have the list change mid-session. The
+loader tool is still registered and still describes itself as activating
+inactive tools; under this flag those tools are already active, so calling it
+does nothing.
 
 Keys are positive (`"enabled": true` means the feature runs), so a `--no-*` flag corresponds to setting its key `false`. A `no-*` flag on the command line is a one-way switch: it can disable, never re-enable, so `--no-lsp` wins over `lsp.enabled: true` but nothing on the CLI overrides `lsp.enabled: false`. Set the key back to `true` to re-enable.
 
@@ -78,6 +90,8 @@ Hide the diagnostics widget by default, run formatting immediately after write/e
 `contextInjection.enabled` (default `true`) controls whether pi-lens prepends automatic findings — session-start guidance, turn-end findings, and test findings — into the next model turn. Set it to `false` (or use `--no-lens-context` / `PI_LENS_NO_CONTEXT_INJECTION=1` / `/lens-context-toggle`) to keep tools, LSP, read-guard, and formatting running while avoiding the prompt-cache invalidation that injected messages cause in long, cache-sensitive sessions. Findings are still cached, so `lens_diagnostics` and `/lens-health` keep working.
 
 `actionableWarnings.enabled` gates the turn_end report. `includeLspCodeActions` fetches LSP code actions for each warning (requires an active language server). `deltaOnly` (default `true`) limits the report to lines touched in the current turn. `autoFix.enabled` applies conservative LSP quickfixes at `agent_end`; `autoFix.maxFixes` caps the number applied per turn (default `5`, must be a non-negative whole number). `maxFixes: 0` keeps the report and applies nothing, which is a useful halfway step before enabling `autoFix` for real. Unlike the toggles in the table above there is no CLI counterpart, since it takes a number rather than being on or off.
+
+`turnEnd.madge.enabled` (default `false`) runs the per-turn-end madge circular-dependency check on import-changed files. It is off by default because that pass only writes debug output — user-facing madge diagnostics come from the session-start scan cache and the `lens_diagnostics` extractor — and its subprocess spawns dominated the turn-end latency tail (#766). Enable it with `--lens-turn-end-madge` or `turnEnd.madge.enabled: true` if you want the per-edit circular-dependency note.
 
 `ignore` is an array of gitignore-style glob patterns excluded from pi-lens scans across **every** project — the global counterpart to the per-project `.pi-lens.json` `ignore` below. Precedence is lowest: a project `.gitignore` or `.pi-lens.json` (including a `!negation`) overrides it, so you can globally hide e.g. `scratch/**` and still re-include it in one repo.
 

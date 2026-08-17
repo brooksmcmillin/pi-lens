@@ -412,6 +412,10 @@ export async function analyzeFile(
 
 	const reportsBefore = getLatencyReports().length;
 	const start = Date.now();
+	// No telemetryModel/telemetryProvider here (#1448): this MCP facade has no
+	// RuntimeCoordinator to hold a host-reported identity (see the module doc
+	// above), so any worklog entries this dispatch produces get a blank
+	// model/provider — that's correct, not a gap.
 	const result = await dispatchLintWithResult(
 		absPath,
 		cwd,

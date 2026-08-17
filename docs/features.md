@@ -40,6 +40,19 @@ Repositories can disable all immediate and deferred auto-format mutations with
 keeping formatter detection, lint dispatch, LSP synchronization, and
 diagnostics available.
 
+**Auto-fix timing depends on the tool.** A `write` (new file, full overwrite,
+or a bash-authored write like `sed -i`/a redirect) still gets pipeline autofix
+immediately, in the same tool result; when it changes the file, the result
+carries the full authoritative post-fix content (capped at 2 MiB per file, one
+shared budget across a multi-file bash write — past that it degrades to a
+re-read warning). An `edit` defers autofix to `agent_end`, where it joins the
+same per-file deferred-mutation queue as deferred formatting — one coalesced
+record per file (`kinds: {autofix, format}`), autofix draining before format
+so the final state is formatter-stable. A `write` immediately followed by an
+`edit` on the same file in the same turn demotes the write's autofix to
+deferred too. See `clients/pipeline.ts`, `clients/runtime-tool-result.ts`, and
+`clients/runtime-agent-end.ts`.
+
 Deferred formatting (the `agent_end` default) runs with **bounded
 concurrency**: at most three formatter subprocesses in flight at once, with
 results applied in admission order and cooperative yields between files, so a
@@ -155,7 +168,7 @@ When `actionableWarnings.autoFix.enabled` is set in global or project config (or
 
 ### Bus Events — `pilens:files:touched` (#482)
 
-pi-lens writes files **outside the agent's own tool calls**: dispatch autofix (biome/ruff/eslint/stylelint/sqlfluff/rubocop/ktlint/rust-clippy/dart-fix/golangci-lint/detekt/ktfmt/markdownlint/oxlint --fix) and formatter runs (immediate or deferred-at-`agent_end`) both mutate files after the fact, and the conservative actionable-warnings autofix above applies LSP quickfixes the same way. Other extensions in the same session that track file mutations are otherwise blind to those writes.
+pi-lens writes files **outside the agent's own tool calls**: dispatch autofix (biome/ruff/eslint/stylelint/sqlfluff/rubocop/ktlint/ktfmt/rust-clippy/dart-fix/golangci-lint/detekt/markdownlint/oxlint --fix) mutates the file immediately for a `write` and at `agent_end` for a deferred `edit` (see "Formatters" above); formatter runs (immediate or deferred-at-`agent_end`) do the same; and the conservative actionable-warnings autofix above applies LSP quickfixes at `agent_end` the same way. Other extensions in the same session that track file mutations are otherwise blind to those writes — this event, published either way, is how they find out.
 
 pi-lens broadcasts them on pi's shared in-process event bus (`pi.events`, exposed to every extension via the `ExtensionAPI`) as a single named event:
 
@@ -319,7 +332,21 @@ Trivy requires an **explicit** opt-in (rather than just a manifest being present
 }
 ```
 
-**IaC misconfiguration (per-edit, not a session scan).** When `trivy.enabled` is set, pi-lens also runs `trivy config` as an on-write dispatch runner (alongside hadolint/tflint) over **Dockerfiles** and **Kubernetes manifests** (YAML with an `apiVersion:` + `kind:` signature) — Trivy's security-policy engine (runs-as-root, no `HEALTHCHECK`, `privileged: true`, missing resource limits, …), a different class from hadolint's lint. On Dockerfiles, trivy-config findings that hadolint already reports at the same line are suppressed, so it only adds the security checks hadolint lacks. Terraform/Helm/Compose/CloudFormation are tracked as follow-ups.
+**IaC misconfiguration (per-edit, not a session scan).** When `trivy.enabled` is set, pi-lens also runs `trivy config` as an on-write dispatch runner (alongside hadolint/tflint) over **Dockerfiles** and **Kubernetes manifests** (YAML with an `apiVersion:` + `kind:` signature) — Trivy's security-policy engine (runs-as-root, no `HEALTHCHECK`, `privileged: true`, missing resource limits, …), a different class from hadolint's lint. On Dockerfiles, trivy-config findings that hadolint already reports at the same line are suppressed, so it only adds the security checks hadolint lacks. Compose/CloudFormation are tracked as follow-ups; Terraform is covered by the same runner, and Helm charts are covered by rendered-manifest validation below.
+
+**Rendered-manifest validation for Helm charts (opt-in).** `helm lint` checks a chart's source; it cannot see what the chart produces. When a project sets
+
+```json
+{ "helm": { "renderValidation": { "enabled": true } } }
+```
+
+pi-lens also renders the nearest chart with `helm template` into a scratch directory under the system temp dir and validates the output:
+
+- a **failed render** (a missing values key, a nil pointer in a template expression, a dependency declared in `Chart.yaml` but absent from `charts/`) is reported as a blocking finding on the template that failed — charts that pass `helm lint` and still cannot be installed;
+- every rendered document must declare `apiVersion` and `kind`, so a conditional that renders a headless fragment is flagged instead of installing as a silent no-op;
+- when `trivy.enabled` is also set, `trivy config` runs over the rendered manifests, which is the only way Trivy's Kubernetes policy checks can see a chart's real output.
+
+It is **off by default** because rendering executes chart-authored template code, and the switch alone is not enough: the render also requires **host project trust**, since `.pi-lens.json` is a tracked file a cloned repository could ship pre-enabled. The switch is read from the chart's own project root, not the current directory. In untrusted mode the refusal is reported rather than silently skipped. Nothing is written to the chart directory, `--dependency-update` is never passed, and the scratch directory is removed on every exit path. Findings map back to the source template through helm's own `# Source:` annotations; rendered line numbers travel in the message, since they do not correspond to template lines. Full OpenAPI schema validation (kubeconform) is not included.
 
 ### MCP Server (Experimental)
 

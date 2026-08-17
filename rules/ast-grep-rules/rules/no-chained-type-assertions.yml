@@ -1,0 +1,21 @@
+id: no-chained-type-assertions
+language: TypeScript
+severity: warning
+message: "Chained type assertion (x as A as B) — stacking assertions with no runtime check between them"
+note: |
+  `x as A as B` stacks two assertions with no runtime check between
+  them, so the compiler can't verify either hop. Narrow with a type
+  guard, or assert once to the type you actually need. `as const`
+  chains are allowed — they don't launder the value's type, they just
+  freeze a literal. `as unknown as B` chains are also allowed: routing
+  a cast through `unknown` (rather than through an unrelated concrete
+  type) is the standard, TypeScript-endorsed way to perform a cast that
+  the compiler can't otherwise verify as safe — see no-as-any.yml's own
+  note, which recommends this exact form as the safe replacement for
+  `as any`. An FP-scan of the pi-lens codebase found 22 chained-assertion
+  hits and all 22 were `as unknown as`; none were a genuine two
+  concrete-type stack.
+rule:
+  pattern: $X as $A as $B
+  not:
+    pattern: "$X as unknown as $B"

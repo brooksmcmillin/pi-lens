@@ -42,6 +42,41 @@ HTTPServer    → httpserver, http, server
 each through `splitIdentifier`; queries are tokenized the same way so
 `"authenticate user"` matches `authenticateUser`, `auth_user`, etc.
 
+## Query prefix filters (#1450)
+
+The query string can mix plain terms with composable `key:value` filters,
+parsed by `parseWordIndexQuery` (`clients/word-index.ts`) before tokenization:
+
+- `lang:<kind>` — restrict to a file kind's extensions, drawn from
+  `KIND_EXTENSIONS` (`clients/file-kinds.ts`) — the single source of truth
+  (#894 invariant), so there is no second, hand-maintained language list here.
+- `file:<substr>` — path substring match against the index's own stored path,
+  normalized through `wordIndexKey` (case-folded on win32 only, matching how
+  the index's own path-keyed maps already fold win32 paths, #1025).
+- `ext:<ext>` — literal extension match (`ext:ts` and `ext:.ts` are
+  equivalent).
+- Any filter may be negated with a leading `-` (`-file:test`).
+
+Example: `lang:jsts file:clients/ -file:test rank`. Multiple positive filters
+of the SAME key OR together; different keys AND; negations always subtract.
+Filters are applied as a `fileFilter` predicate BEFORE BM25/priors/centrality
+scoring (same seam as the pre-existing `paths`/`lang` structured options,
+#771), so a surviving file's score is unaffected by filtering. An unrecognized
+`key:` token passes through as an ordinary search term (colon-bearing terms
+like `std::vector`, URLs, and Windows paths search normally). Only a
+recognized key with a bad value — an unrecognized `lang:` kind — throws
+`WordIndexQueryError`
+naming the supported list — never silently falls through as a literal search
+term. Both the pi `symbol_search` tool and the MCP `pilens_symbol_search`
+mirror inherit the syntax for free since both pass their `query` argument
+straight through to `searchWordIndex` (the entry point where parsing happens).
+
+DF-normalization: BM25's per-token `idf` is computed from the FULL,
+unfiltered posting for that token before `fileFilter` is applied per
+candidate file — a filtered query reuses the global, corpus-wide document
+frequency rather than recomputing it over the filtered subset. Documented as
+an acceptable approximation (see the doc comment on `searchWordIndex`).
+
 ## Lifecycle
 
 The index is built/refreshed in **every** startup mode: load the persisted

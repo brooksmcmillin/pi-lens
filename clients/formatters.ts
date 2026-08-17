@@ -20,6 +20,13 @@ import {
 	hasDetectableIndentation,
 } from "./dispatch/indent-detect.js";
 import { logLatency } from "./latency-logger.js";
+import {
+	type AvailabilityLatch,
+	classifyProbeFailure,
+	createAvailabilityLatch,
+	logAvailabilityDecision,
+	startHostStallSampler,
+} from "./dispatch/runners/utils/availability-policy.js";
 import { findGlobalBinary } from "./package-manager.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
 import { assertInstallAllowed } from "./project-trust.js";
@@ -69,6 +76,8 @@ export async function tryLazyInstallFormatterTool(
 			ignoreAmbientSignal: true,
 		});
 		const ok = !res.error && res.status === 0;
+		// A fresh binary on PATH invalidates every "not found" verdict (#1495).
+		if (ok) resetWhichLatches();
 		if (!ok) {
 			logExtension({
 				subsystem: "format",
@@ -85,6 +94,7 @@ export async function tryLazyInstallFormatterTool(
 		ignoreAmbientSignal: true,
 	});
 	const ok = !res.error && res.status === 0;
+	if (ok) resetWhichLatches();
 	if (!ok) {
 		logExtension({
 			subsystem: "format",
@@ -196,14 +206,121 @@ async function findUp(
 	return found;
 }
 
+const WHICH_BUDGET_MS = 5000;
+
+/**
+ * PATH lookups, governed by the shared availability policy (#1495).
+ *
+ * `which()` is a spawn on a 5 s budget, not a filesystem check, and around a
+ * dozen `detect*` implementations gate on it. A transient timeout used to drop
+ * the formatter AND get written to `detectionCache` as an empty enabled-list —
+ * a cache invalidated only by a config file's mtime or size, never by time. One
+ * stalled `which rustfmt` therefore disabled Rust formatting for the session
+ * unless the user happened to edit a config file.
+ *
+ * Now: only a genuine absence latches, a stall expires on a cooldown, and the
+ * detection pass refuses to cache an empty result a stall caused.
+ */
+const whichLatchByCommand = new Map<
+	string,
+	{ latch: AvailabilityLatch; resolved: string | null }
+>();
+
+/**
+ * Commands whose CURRENT `which` verdict is transient — a probe that never got a
+ * fair hearing, still inside its cooldown.
+ *
+ * Scoped per command on purpose (#1495 review). The first cut counted transient
+ * verdicts process-wide and compared the count across a detection pass, which
+ * over-suppressed: one stalled `which rustfmt` stopped an unrelated Python or
+ * shell detection from caching, and stamped `reason: "probe-timeout"` on
+ * selections where nothing had timed out. A command leaves the set as soon as
+ * its verdict becomes trustworthy — a resolved path or a genuine absence.
+ */
+const whichTransientCommands = new Set<string>();
+
+/** Drop the PATH verdicts, so a newly installed binary is visible at once. */
+function resetWhichLatches(): void {
+	whichLatchByCommand.clear();
+	whichTransientCommands.clear();
+}
+
 async function which(command: string): Promise<string | null> {
+	let entry = whichLatchByCommand.get(command);
+	if (!entry) {
+		entry = { latch: createAvailabilityLatch(), resolved: null };
+		whichLatchByCommand.set(command, entry);
+	}
+	const memo = entry.latch.read();
+	if (memo !== null) return memo ? entry.resolved : null;
+
+	const stallSampler = startHostStallSampler();
+	const startedAt = Date.now();
 	const result = await safeSpawnAsync(
 		process.platform === "win32" ? "where" : "which",
 		[command],
-		{ timeout: 5000 },
+		{ timeout: WHICH_BUDGET_MS },
 	);
-	if (result.error || result.status !== 0) return null;
-	return result.stdout?.trim().split(/\r?\n/)[0] ?? null;
+	const hostStallMs = stallSampler.stop();
+	const elapsedMs = Date.now() - startedAt;
+
+	const resolved =
+		!result.error && result.status === 0
+			? (result.stdout?.trim().split(/\r?\n/)[0] ?? null)
+			: null;
+	if (resolved) {
+		entry.resolved = resolved;
+		entry.latch.noteAvailable();
+		whichTransientCommands.delete(command);
+		logAvailabilityDecision({
+			tool: command,
+			verdict: "available",
+			outcome: "success",
+			cause: "ok",
+			elapsedMs,
+			latched: true,
+			hostStallMs,
+			budgetMs: WHICH_BUDGET_MS,
+		});
+		return resolved;
+	}
+
+	entry.resolved = null;
+	// A `which`/`where` that RAN and found nothing exits nonzero with NO spawn
+	// error, and only that is a genuine absence an install would fix.
+	//
+	// An UNSPAWNABLE prober is the opposite (#1495 review): EACCES, `spawn
+	// UNKNOWN`, EMFILE, an unresolvable cwd, or `where`/`which` itself missing
+	// says nothing about the tool that was asked for. Claiming `missing` there
+	// was the worst version of this bug, because the prober is shared by every
+	// which-gated formatter — one EACCES would have latched a dozen of them off
+	// for the session. So the `missing` override is granted only to a prober that
+	// ran, and anything that stopped it from running stays transient.
+	const proberRan = !result.error;
+	const classified = classifyProbeFailure(result, {
+		hostStallMs,
+		...(proberRan && { unclassifiedFailureOutcome: "missing" as const }),
+	});
+	let { outcome, cause } = classified;
+	if (!proberRan && outcome !== "transient") {
+		outcome = "transient";
+		cause = "probe-rejected";
+	}
+	const retryAfterMs = entry.latch.noteUnavailable(outcome, cause);
+	if (outcome === "transient") whichTransientCommands.add(command);
+	else whichTransientCommands.delete(command);
+	logAvailabilityDecision({
+		tool: command,
+		verdict: "unavailable",
+		outcome,
+		cause,
+		elapsedMs,
+		latched: retryAfterMs === 0,
+		hostStallMs,
+		...(retryAfterMs > 0 && { retryAfterMs }),
+		budgetMs: WHICH_BUDGET_MS,
+	});
+	return null;
 }
 
 async function resolveGoFmtBinary(): Promise<string | null> {
@@ -1203,9 +1320,16 @@ export async function getFormattersForFile(
 	const configSignature = await formatterConfigSignature(cwd);
 	// Check cache
 	let cached = detectionCache.get(normalizedCwd);
-	if (cached?.signature !== configSignature) {
-		cached = undefined;
+	if (cached && cached.signature !== configSignature) {
+		// An EXISTING entry whose signature moved is the user telling us the world
+		// changed. Re-probe PATH too, so "install the tool, touch the config" still
+		// works within one session now that a durable absence latches (#1495).
+		// Scoped to a real change on purpose: keying this off "no entry yet" would
+		// drop every PATH verdict on the first save in each new directory, which in
+		// a monorepo means re-probing forever.
 		detectionCache.delete(normalizedCwd);
+		cached = undefined;
+		resetWhichLatches();
 	}
 	if (!cached) {
 		cached = { signature: configSignature, entries: new Map() };
@@ -1280,6 +1404,30 @@ export async function getFormattersForFile(
 	}
 
 	const enabled = selected ? [selected] : [];
+	// The #925/#1467 `wouldPoisonCache` shape: an empty result produced while a
+	// PATH probe was timing out is not a finding about this project. Caching it
+	// would survive until a config file's mtime or size changed, so leave the
+	// cache untouched and let the next turn re-detect.
+	// Which of THIS file's candidates are currently un-answered? Scoped to the
+	// candidates' own binaries, so a stalled `which rustfmt` cannot stop a shell
+	// or Python detection from caching (#1495 review).
+	//
+	// Residual: a formatter whose detection consults MORE than `command[0]` is
+	// matched on that primary only, and the extras come in two shapes.
+	//   * Install fallbacks — `rustfmt`→`rustup`, `csharpier`→`dotnet`. Harmless
+	//     here: they are reached only after the primary already answered, so the
+	//     primary is in the transient set whenever the answer was not real.
+	//   * Co-equal ALTERNATIVES — psscriptanalyzer-format's `pwsh` ?? `powershell`,
+	//     oxfmt's global `vp`. Neither is `command[0]`, so a stall on the
+	//     alternative alone still yields an empty result this guard will cache.
+	// That second shape is tracked with the degraded-selection work in #1539, and
+	// `tests/clients/formatter-probe-commands.test.ts` fails if a new formatter
+	// grows an extra probed binary without being accounted for.
+	const stalledCandidateCommands = candidateFormatters
+		.map((formatter) => formatter.command[0])
+		.filter((command) => command && whichTransientCommands.has(command));
+	const poisonedByTransientProbe =
+		enabled.length === 0 && stalledCandidateCommands.length > 0;
 
 	let selectionReason: string;
 	if (!selected) {
@@ -1300,10 +1448,16 @@ export async function getFormattersForFile(
 		durationMs: 0,
 		metadata: {
 			formatter: selected?.name ?? null,
-			reason: selectionReason,
+			reason: poisonedByTransientProbe ? "probe-timeout" : selectionReason,
 			cwd,
+			...(poisonedByTransientProbe && {
+				cached: false,
+				stalledProbes: stalledCandidateCommands,
+			}),
 		},
 	});
+
+	if (poisonedByTransientProbe) return enabled;
 
 	// Store the list of enabled formatter names in cache
 	const enabledNames = enabled.map((f) => f.name);
@@ -1313,10 +1467,12 @@ export async function getFormattersForFile(
 
 export function clearFormatterCache(): void {
 	detectionCache.clear();
+	resetWhichLatches();
 }
 
 export function clearFormatterRuntimeState(): void {
 	detectionCache.clear();
+	resetWhichLatches();
 	_lazyInstallAttempts.clear();
 }
 

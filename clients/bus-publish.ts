@@ -23,6 +23,7 @@ import { appendRecentTouches } from "./recent-touches.js";
 import {
 	createLiveBusEmitter,
 	recordStaleBusFailure,
+	resolveLiveBusEmitter,
 	type BusEmitFn,
 	type BusEmitGetter,
 } from "./live-bus-emitter.js";
@@ -174,8 +175,13 @@ export function publishFilesTouched(args: PublishFilesTouchedArgs): void {
 		args.dbg?.(`bus-publish: recent-touches append failed: ${err}`);
 	});
 
-	const busEmit = liveEmitter.get();
-	if (!busEmit) {
+	const resolution = resolveLiveBusEmitter(liveEmitter, () => ({
+		event: BUS_FILES_TOUCHED_EVENT,
+		cwd: normalizeFilePath(args.cwd),
+		reason: args.reason,
+	}));
+	if (resolution.outcome === "stale-session") return;
+	if (resolution.outcome === "unwired") {
 		if (!hasLoggedUnwired) {
 			hasLoggedUnwired = true;
 			logBusEvent({
@@ -187,6 +193,7 @@ export function publishFilesTouched(args: PublishFilesTouchedArgs): void {
 		}
 		return;
 	}
+	const busEmit = resolution.emit;
 
 	try {
 		const payload: FilesTouchedPayload = {
@@ -218,6 +225,7 @@ export function publishFilesTouched(args: PublishFilesTouchedArgs): void {
 			cwd: normalizeFilePath(args.cwd),
 			reason: args.reason,
 			error: String(err),
+			ctxSource: resolution.ctxSource,
 		});
 		if (!hasLoggedFailure) {
 			hasLoggedFailure = true;

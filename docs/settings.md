@@ -70,6 +70,13 @@ column is the effective behavior when nothing is set.
 | `--lens-actionable-warning-autofix` | `actionableWarnings.autoFix.enabled` | project | **off** |
 | `--lens-actionable-warning-all` | `actionableWarnings.deltaOnly` (`false`) | global | `deltaOnly` **on** (report this turn only) |
 | `--lens-compact-tool-line` | `ui.compactToolLine` | global | **off** (two-row tool rendering) |
+| `--no-lazy-tools` | `tools.lazy` | global | lazy tools **on** (six situational tools start inactive) |
+| `--lens-turn-end-madge` | `turnEnd.madge.enabled` | global | **off** (madge runs at session start, not per turn) |
+
+`--no-lazy-tools` keeps every pi-lens tool active for the whole session, so the
+advertised tool list never changes. The `pi_lens_activate_tools` loader stays
+registered and keeps its usual description; under this flag the tools it names
+are already active, so calling it is a no-op.
 
 `--lens-guard` is **EXPERIMENTAL and strictly opt-in**. When enabled, actual
 `git commit`/`git push` commands are blocked only for current, structured
@@ -100,6 +107,7 @@ field docs.
 | `maxProjectFiles` | project | `2000` | Base scale knob; derives five subsystem size budgets |
 | `reviewGraph.maxFiles` | project | derived (clamped `100`–`20000`) | Explicit review-graph file budget |
 | `trivy.enabled` / `trivy.minSeverity` | project | off | Opt-in Trivy vulnerability scanning |
+| `helm.renderValidation.enabled` | project | off | Opt-in `helm template` rendering plus rendered-manifest validation. Rendering executes chart templates, so it **also requires host project trust** and is read from the chart's own project root — see below |
 
 ## Global vs project config
 
@@ -135,7 +143,23 @@ A project file honors **only**:
 
 - the three mutation controls — `format.enabled`, `autofix.enabled`,
   `actionableWarnings.autoFix.enabled`;
-- `ignore`, `rules`, `maxProjectFiles`, `reviewGraph`, and `trivy`.
+- `ignore`, `rules`, `maxProjectFiles`, `reviewGraph`, `trivy`, and `helm`.
+
+### `helm.renderValidation.enabled` needs trust as well as consent
+
+Rendering a Helm chart runs the chart's own Go templates, so this switch is not
+sufficient on its own. Two independent conditions must both hold:
+
+1. **The project consents.** `helm.renderValidation.enabled` must be `true`,
+   read from the `.pi-lens.json` that governs the **chart's own project root** —
+   not the current working directory. An opt-in in an unrelated directory does
+   not authorize rendering another project's chart.
+2. **The host trusts the project.** `.pi-lens.json` is a tracked file, so a
+   cloned repository can arrive with the switch already on and would otherwise
+   authorize execution of its own templates. In untrusted mode pi-lens refuses
+   to render and reports the refusal, naming trust as the reason, rather than
+   skipping silently. This is the same trust gate that governs LSP server spawns
+   and tool auto-installs.
 
 Most toggles are **global-only**. Putting a global-only key such as
 `"lsp": { "enabled": false }` in a `.pi-lens.json` is **not** honored at project

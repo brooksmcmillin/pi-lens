@@ -264,4 +264,29 @@ describe("synthesizeReplaceRule", () => {
 		expect(yaml).toContain("inside:");
 		expect(yaml).toContain("fix:");
 	});
+
+	it("supports hasDescendantKind with stopBy: end, alongside fix (#1423)", () => {
+		const yaml = synthesizeReplaceRule({
+			pattern: "var $X",
+			lang: "javascript",
+			rewrite: "let $X",
+			hasDescendantKind: "await_expression",
+		});
+		expect(yaml).toContain("has:");
+		expect(yaml).toContain("kind: await_expression");
+		expect(yaml).toContain("stopBy: end");
+		expect(yaml).toContain("fix:");
+	});
+
+	it("rejects hasKind and hasDescendantKind combined on replace (#1423)", () => {
+		expect(() =>
+			synthesizeReplaceRule({
+				pattern: "var $X",
+				lang: "javascript",
+				rewrite: "let $X",
+				hasKind: "identifier",
+				hasDescendantKind: "await_expression",
+			}),
+		).toThrow(/mutually exclusive/);
+	});
 });

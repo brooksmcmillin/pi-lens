@@ -6,7 +6,7 @@ description: Use when writing a new pi-lens tree-sitter query rule YAML file —
 # Writing a pi-lens tree-sitter Rule
 
 Drop path: `rules/tree-sitter-queries/<language>/<id>.yml`  
-Language dir is **lowercase**: `typescript` `javascript` `tsx` `python` `go` `rust` `java` `csharp` `kotlin` `ruby` `cpp` `c` `css`
+Language dir is **lowercase**: `typescript` `javascript` `tsx` `python` `go` `rust` `java` `csharp` `kotlin` `php` `ruby` `cpp` `c` `css`
 
 Project rules merge with built-ins (both run). To disable a language's built-ins: rename dir to `<lang>-disabled/`.
 
@@ -115,6 +115,8 @@ predicates:
    treeSitterRunner.run() via makeRealRunnerCtx (tests/support/real-runner-ctx.ts) —
    runQueryOnFile bypasses dispatch (skip_test_files, tiers, delta, rule cache).
    Template: tests/clients/dispatch/runners/tree-sitter-skip-test-files.test.ts.
+   (These test paths exist only in a pi-lens source checkout — the installed
+   npm package ships no tests/ directory.)
 
 ✅ JS files also run typescript/ rules (shared grammar) — one rule in
    rules/tree-sitter-queries/typescript/ covers BOTH .ts and .js. No -js copy needed.

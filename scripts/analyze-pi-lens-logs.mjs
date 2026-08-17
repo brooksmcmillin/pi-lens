@@ -12,6 +12,7 @@
  *   ~/.pi-lens/actionable-warnings*.log  JSONL advisory pipeline (inject/suppress)
  *   ~/.pi-lens/ast-grep-tools*.log   JSONL MCP ast-grep search/replace telemetry
  *   ~/.pi-lens/logs/*.jsonl          JSONL diagnostic findings
+ *   ~/.pi-lens/projects/<slug>/worklog.jsonl  JSONL fix worklog (rule/tool/model/provider, #1448)
  */
 
 import fs from "node:fs";
@@ -69,6 +70,7 @@ async function main() {
 		analyzeSessionStart(files.sessionStart, state),
 		analyzeActionableWarnings(files.actionableWarnings, state),
 		analyzeAstGrepTools(files.astGrepTools, state),
+		analyzeWorklog(files.worklog, state),
 	]);
 
 	const report = buildReport(state);
@@ -139,6 +141,13 @@ function discoverLogFiles(logRoot, archived) {
 		.filter((name) => name.endsWith(".jsonl"))
 		.map((name) => path.join(logsDir, name));
 
+	// worklog.jsonl lives per-project under projects/<slug>/ (getProjectDataDir),
+	// not at the log root — walk one level to find every project's file (#1448).
+	const projectsDir = path.join(logRoot, "projects");
+	const worklogs = safeReaddir(projectsDir)
+		.map((slug) => path.join(projectsDir, slug, "worklog.jsonl"))
+		.filter((file) => fs.existsSync(file));
+
 	const byPrefix = (prefix) =>
 		allRootFiles.filter((file) => {
 			const base = path.basename(file);
@@ -156,6 +165,7 @@ function discoverLogFiles(logRoot, archived) {
 		actionableWarnings: byPrefix("actionable-warnings"),
 		astGrepTools: byPrefix("ast-grep-tools"),
 		diagnostics: dailyLogs,
+		worklog: worklogs,
 	};
 }
 
@@ -262,6 +272,14 @@ function createState(files) {
 			calls: 0,
 			errors: [],
 			slow: [],
+		},
+		worklog: {
+			// key: "<rule>||<model>" (model "" when the entry predates #1448 or the
+			// runtime didn't know it) -> { total, autoFixed }
+			byRuleModel: new Map(),
+			byModel: counter(),
+			byModelAutoFixed: counter(),
+			byProvider: counter(),
 		},
 	};
 }
@@ -733,6 +751,39 @@ async function analyzeAstGrepTools(files, state) {
 					byDuration,
 				);
 			}
+		});
+	}
+}
+
+/**
+ * Per-model rollup (#1448): rule × model counts and auto-fixed vs
+ * agent-required rates, from worklog.jsonl's optional `model`/`provider`
+ * fields. Entries predating #1448 (or written outside a live agent turn)
+ * have neither field — bucketed under the empty-string model/provider key so
+ * "unattributed" volume stays visible rather than silently dropped.
+ */
+async function analyzeWorklog(files, state) {
+	for (const file of files) {
+		await forEachJsonLine(file, "worklog", state, (entry) => {
+			const ts = dateOf(entry.timestamp);
+			if (!inWindow(ts)) return;
+			state.seen.inc("worklog");
+			const rule = entry.rule ?? "unknown";
+			const model = entry.model ?? "";
+			const provider = entry.provider ?? "";
+			const key = `${rule}||${model}`;
+			const row = state.worklog.byRuleModel.get(key) ?? {
+				rule,
+				model,
+				total: 0,
+				autoFixed: 0,
+			};
+			row.total += 1;
+			if (entry.autoFixed) row.autoFixed += 1;
+			state.worklog.byRuleModel.set(key, row);
+			state.worklog.byModel.inc(model || "(unknown)");
+			if (entry.autoFixed) state.worklog.byModelAutoFixed.inc(model || "(unknown)");
+			state.worklog.byProvider.inc(provider || "(unknown)");
 		});
 	}
 }
@@ -1259,6 +1310,17 @@ function buildReport(state) {
 			errors: state.astGrep.errors.slice(0, limit),
 			slow: state.astGrep.slow.slice(0, limit),
 		},
+		worklog: {
+			byModel: state.worklog.byModel.top(limit * 2),
+			byProvider: state.worklog.byProvider.top(limit * 2),
+			byRuleModel: [...state.worklog.byRuleModel.values()]
+				.map((row) => ({
+					...row,
+					autoFixedRate: row.total ? row.autoFixed / row.total : 0,
+				}))
+				.sort((a, b) => b.total - a.total)
+				.slice(0, limit * 3),
+		},
 	};
 }
 
@@ -1397,6 +1459,23 @@ function printReport(report) {
 			`  started=${ws.started} completed=${ws.completed} incomplete=${ws.incomplete} aborted=${ws.aborted} fileTimeouts=${ws.timedOutFilesTotal} (in ${ws.timedOutSweeps} sweeps)`,
 		);
 	}
+	const wl = report.worklog;
+	if (wl && (wl.byModel.length || wl.byRuleModel.length)) {
+		console.log("\nWorklog per-model rollup (#1448)");
+		console.log(
+			`  by model: ${wl.byModel.map((x) => `${x.key}=${x.count}`).join(", ")}`,
+		);
+		if (wl.byProvider.length)
+			console.log(
+				`  by provider: ${wl.byProvider.map((x) => `${x.key}=${x.count}`).join(", ")}`,
+			);
+		console.log("  rule × model (auto-fixed vs agent-required):");
+		for (const row of wl.byRuleModel.slice(0, limit))
+			console.log(
+				`    ${String(row.total).padStart(5)}  ${row.rule} [${row.model || "(unknown)"}]  autoFixed=${row.autoFixed} (${(row.autoFixedRate * 100).toFixed(0)}%)`,
+			);
+	}
+
 	const timeouts = Object.entries(report.latency.phaseTimeouts ?? {});
 	if (timeouts.length) {
 		console.log("\nPhase timeouts");

@@ -198,7 +198,12 @@ function verifyLine(
 	}
 }
 
-export function createLensDiagnosticMarkTool(getCwd: () => string) {
+export function createLensDiagnosticMarkTool(
+	getCwd: () => string,
+	/** Runtime telemetry identity, when known (#1448 class sweep) — attributed
+	 * onto the disposition log alongside the mark. */
+	getIdentity?: () => { model?: string; provider?: string },
+) {
 	return {
 		name: "lens_diagnostic_mark" as const,
 		label: "Mark Diagnostic",
@@ -387,6 +392,7 @@ export function createLensDiagnosticMarkTool(getCwd: () => string) {
 				},
 				disposition,
 				reason,
+				getIdentity?.(),
 			);
 
 			const verb =

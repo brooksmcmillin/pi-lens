@@ -13,6 +13,7 @@
  */
 
 import { logExtension } from "../../extension-log.js";
+import { touchCoverageGap } from "../../lsp/diagnostic-binding.js";
 import { getLSPService } from "../../lsp/index.js";
 import { RUNTIME_CONFIG } from "../../runtime-config.js";
 import { PRIORITY } from "../priorities.js";
@@ -143,6 +144,13 @@ const lspRunner: RunnerDefinition = {
 		// one spawned server) — an empty `lspDiags` in that case is NOT a
 		// confirmed clean result and must not be reported as one (#570).
 		let diagnosticsInconclusive = false;
+		// #1470/#1493: server ids the touch carries no evidence for — an auxiliary
+		// whose push wait our aux grace timer cut off (#1470), or one that stayed
+		// silent with no stored publication for this content (#1493). The touch is
+		// NOT inconclusive (the primary answered, and its findings below are real),
+		// so this is tracked separately: the only claim it invalidates is "0
+		// diagnostics means clean".
+		let unconfirmedServerIds: readonly string[] = [];
 		let usedWarmAttach = false;
 		let failureReason = "";
 		const content = readFileContent(ctx.filePath);
@@ -171,11 +179,24 @@ const lspRunner: RunnerDefinition = {
 			usedWarmAttach = attached?.available === true;
 			// #1179 (shape-5 structural fix): both branches normalize to the
 			// `touchFile` wrapper shape. The warm-attach IPC branch resolves a plain
-			// diagnostics array (the socket cannot carry a side-channel; the IPC client
-			// already rejected any inconclusive answer, so `available` ⟹ confirmed) —
-			// wrap it as `{ diags }`; the incumbent branch already returns the wrapper.
+			// diagnostics array — `available` no longer implies a fully confirmed
+			// answer: a `partial` confirmation (an auxiliary that never
+			// reported — cut off by the grace timer, or silent) is served as
+			// `available: true` too (the IPC gate at
+			// `clients/mcp/ipc.ts:248` rejects only `inconclusive`). Carry the
+			// incumbent's `unconfirmedServerIds` onto the wrapper so
+			// `touchCoverageGap` below sees it — dropping it here is the same
+			// false-clean defect already fixed at `clients/lsp/index.ts` (the
+			// workspace sweep wrapper) and `tools/lsp-diagnostics.ts` (the tool
+			// consumer); wrap it as `{ diags }`; the incumbent branch already
+			// returns the wrapper.
 			const touched = attached?.available
-				? { diags: attached.response.diagnostics }
+				? {
+						diags: attached.response.diagnostics,
+						...(attached.response.unconfirmedServerIds !== undefined && {
+							unconfirmedServerIds: attached.response.unconfirmedServerIds,
+						}),
+					}
 				: await lspService.touchFile(ctx.filePath, content, {
 				diagnostics: "document",
 				collectDiagnostics: true,
@@ -190,6 +211,7 @@ const lspRunner: RunnerDefinition = {
 			} else {
 				lspDiags = touched.diags;
 				diagnosticsInconclusive = touched.inconclusive === true;
+				unconfirmedServerIds = touchCoverageGap(touched);
 			}
 		} catch (err) {
 			serverFailed = true;
@@ -252,6 +274,21 @@ const lspRunner: RunnerDefinition = {
 		}
 
 		if (lspDiags.length === 0) {
+			if (unconfirmedServerIds.length > 0) {
+				// #1470/#1493: an auxiliary never reported — cut off by the aux grace
+				// timer, or silent with nothing published for this content — so this
+				// empty merged result is missing whatever that scanner would have said.
+				// A hung OR silent opengrep must not read as a clean bill of health on
+				// the security lane. `RunnerResult` has no channel for "clean for these servers,
+				// unknown for those", so the only honest verdict this seam can express
+				// for an EMPTY result is "not checked" — which is what "skipped" means
+				// here, and it lets the coverage notice say so once. Nothing is thrown
+				// away: the primary answered with zero findings, so there is nothing to
+				// report; when it DOES have findings the branches below still report
+				// them (see the non-empty path), which is how a trustworthy primary
+				// stays trustworthy under an auxiliary that never reported.
+				return { status: "skipped", diagnostics: [], semantic: "none" };
+			}
 			return {
 				status: "succeeded",
 				diagnostics: [],

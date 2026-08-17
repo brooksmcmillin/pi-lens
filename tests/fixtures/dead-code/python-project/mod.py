@@ -14,3 +14,12 @@ class UnusedClass:
 
 
 print(used_func())
+
+
+def fixture(func):  # stand-in for pytest.fixture, keeps the fixture dep-free
+    return func
+
+
+@fixture
+def framework_called_fixture():
+    return 3

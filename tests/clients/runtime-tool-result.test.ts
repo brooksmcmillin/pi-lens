@@ -7,6 +7,9 @@ import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { handleToolResult } from "../../clients/runtime-tool-result.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 
+const logLatency = vi.hoisted(() => vi.fn());
+vi.mock("../../clients/latency-logger.js", () => ({ logLatency }));
+
 vi.mock("../../clients/pipeline.js", () => ({
 	runPipeline: vi.fn(),
 }));
@@ -608,6 +611,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 		const { runPipeline } = await import("../../clients/pipeline.js");
 		const env = setupTestEnvironment("pi-lens-runtime-tool-large-content-");
 		try {
+			logLatency.mockClear();
 			const boundaryPath = createTempFile(env.tmpDir, "boundary.ts", "x\n");
 			const filePath = createTempFile(env.tmpDir, "large.ts", "x\n");
 			const boundaryContent = "x".repeat(2 * 1024 * 1024);
@@ -627,6 +631,14 @@ describe("runtime-tool-result inline behavior warnings", () => {
 			expect(boundaryReturned?.content.some((part) => part.text?.includes(boundaryContent))).toBe(true);
 			expect(returned?.content.some((part) => part.text?.includes(content))).toBe(false);
 			expect(returned?.content.at(-1)?.text).toContain("too large to attach");
+			expect(logLatency).toHaveBeenCalledWith(expect.objectContaining({
+				phase: "authoritative_content_attachment_decision",
+				metadata: expect.objectContaining({ bytes: boundaryContent.length, decision: "attached" }),
+			}));
+			expect(logLatency).toHaveBeenCalledWith(expect.objectContaining({
+				phase: "authoritative_content_attachment_decision",
+				metadata: expect.objectContaining({ bytes: content.length, decision: "size-capped" }),
+			}));
 		} finally { env.cleanup(); }
 	});
 

@@ -238,7 +238,8 @@ export const SERVER_DIAGNOSTIC_STRATEGIES: Record<string, DiagnosticStrategy> =
 		// (#242), so on a 2500ms-capped edit opengrep waits min(2500, 3500)=2500
 		// and on uncapped paths it gets its full 3500. 3500 covers warm and most
 		// cold; a cold scan that overruns isn't lost — late diagnostics are cached
-		// and surface on the next edit.
+		// and surface on the next unchanged-content read through the content-bound
+		// auxiliary carry-over path.
 		opengrep: {
 			seedFirstPush: false,
 			pullRetryBudgetMs: 0,
@@ -274,7 +275,8 @@ export const SERVER_DIAGNOSTIC_STRATEGIES: Record<string, DiagnosticStrategy> =
 		// reopen-on-resync. A native single-workflow audit is sub-second offline;
 		// online mode may add a GitHub-API round-trip, so 2000ms gives headroom
 		// (bounded by the per-edit caller cap as a ceiling, #242), and any late online
-		// finding is cached and surfaces on the next edit.
+		// finding can surface on the next unchanged-content read through the
+		// content-bound auxiliary carry-over path.
 		zizmor: {
 			seedFirstPush: true,
 			pullRetryBudgetMs: 0,

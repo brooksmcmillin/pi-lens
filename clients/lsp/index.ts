@@ -8,7 +8,6 @@
  * - Resource cleanup
  */
 
-import { createHash } from "node:crypto";
 import * as nodeFs from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -36,6 +35,7 @@ import { shouldPreferPullOnlyDiagnostics } from "../lsp-budget.js";
 import { withDeadline } from "../deadline-utils.js";
 import {
 	isAtOrAboveHomeDir,
+	isWindowsPath,
 	normalizeMapKey,
 	uriToPath,
 } from "../path-utils.js";
@@ -50,9 +50,12 @@ import {
 } from "../lsp-mutation.js";
 import { createLSPClient } from "./client.js";
 import {
+	auxiliaryCoverageGap,
 	bindingStateLabel,
 	composeBoundToCurrentDisk,
 	createDiskBindingCache,
+	hashDiagnosticContent,
+	touchCoverageGap,
 	type BoundToCurrentDisk,
 	type DiagnosticBinding,
 	type DiskBindingCache,
@@ -353,13 +356,15 @@ function readTsserverSyncGraceMs(): number {
 }
 /**
  * Read the `PI_LENS_AUX_GRACE_MS` env override at call time (not module
- * load time) so tests can set it per-case. Controls how long auxiliary-role
- * promises (opengrep, ast-grep, zizmor, …) are waited after all primary-role
- * promises have settled in both getDiagnostics (raceToCompletion) and the
- * touchFile push wait. Default 500ms — conservative enough to include
- * auxiliaries that are nearly done while not blocking the primary result.
- * Returns undefined when the var is absent (caller falls back to the
- * raceToCompletion default of 500ms, keeping the two in sync).
+ * load time) so tests can set it per-case. Controls the CEILING on how long
+ * auxiliary-role promises (opengrep, ast-grep, zizmor, …) are waited after
+ * all primary-role promises have settled, in both getDiagnostics
+ * (raceToCompletion) and the touchFile push wait (#1458 S2 — the two lanes
+ * share the same declared-budget-capped-by-ceiling shape). Each auxiliary
+ * still gets only its OWN declared `aggregateWaitMs` up to this ceiling —
+ * this is not a flat per-touch wait. Returns undefined when the var is
+ * absent; each call site then supplies its own default ceiling (touchFile:
+ * 2000ms; getDiagnostics: 2000ms — see the `?? 2000` at each call site).
  */
 function readEnvAuxGraceMs(): number | undefined {
 	const raw = process.env.PI_LENS_AUX_GRACE_MS;
@@ -757,6 +762,19 @@ function notifyWriteBudgetMs(): number {
 	return Number.isFinite(raw) && raw > 0 ? raw : 2000;
 }
 
+// #1459: how long ONE auxiliary notify write may stay outstanding before the
+// server counts as wedged rather than merely slow. A scanner whose per-file work
+// exceeds the write budget is normal (opengrep routinely needs >2s on a large
+// file) and must not be demoted for it — the gate defers the next write instead.
+// A write still unaccepted after this window is a different animal: nothing is
+// draining that stdin, so the server is demoted through the existing breaker.
+// Expressed as a multiple of the write budget so tuning one moves both.
+const NOTIFY_WEDGED_BUDGET_MULTIPLIER = 5;
+
+function notifyWedgedMs(): number {
+	return notifyWriteBudgetMs() * NOTIFY_WEDGED_BUDGET_MULTIPLIER;
+}
+
 // Budget for one project-wide `workspace/diagnostic` pull (#387 Item 2). Larger
 // than a per-file wait — it's a single request but scans the whole program —
 // yet bounded so a hung server still falls back to the per-file path.
@@ -951,6 +969,27 @@ export class LSPService {
 	 * successful write clears its entry.
 	 */
 	private readonly notifyWriteBackpressureStreak = new Map<string, number>();
+	/**
+	 * #1459: the ONE outstanding auxiliary notify write per server key
+	 * ("serverId:normalizedRoot"). A `reopenOnResync` scanner re-parses the whole
+	 * file on every `didOpen`, so a `clientScope: "all"` sweep that fans out
+	 * across a neighbour set pushes N full re-scans at it inside a few
+	 * milliseconds; its stdin stops draining and the #743 write deadline expires
+	 * for each one, which walked the breaker open in three touches. The gate keeps
+	 * a sweep to one in-flight resync per auxiliary: while one is outstanding the
+	 * next touch DEFERS its write and reports the server as uncovered instead of
+	 * adding to the flood. `startedAt` dates the outstanding write so a write that
+	 * never lands is still demoted (see {@link demoteForNotifyStall}).
+	 */
+	private readonly outstandingAuxNotifyWrites = new Map<
+		string,
+		{
+			startedAt: number;
+			client: LSPClientInfo;
+			settled: Promise<void>;
+			wedgeTimer: ReturnType<typeof setTimeout>;
+		}
+	>();
 	/** LRU clock for capacity eviction, keyed by the canonical server/root key. */
 	private readonly clientLastUsedAt = new Map<string, number>();
 	/**
@@ -1018,11 +1057,15 @@ export class LSPService {
 		])) {
 			if (!key.startsWith(prefix)) continue;
 			const ancestorKey = key.slice(prefix.length);
-			const relative = path.relative(ancestorKey, rootKey);
+			const pathApi =
+				isWindowsPath(ancestorKey) || isWindowsPath(rootKey)
+					? path.win32
+					: path;
+			const relative = pathApi.relative(ancestorKey, rootKey);
 			if (
 				relative === "" ||
 				relative.startsWith("..") ||
-				path.isAbsolute(relative)
+				pathApi.isAbsolute(relative)
 			) {
 				continue;
 			}
@@ -1388,6 +1431,24 @@ export class LSPService {
 			return;
 		}
 		this.notifyWriteBackpressureStreak.delete(key);
+		this.demoteForNotifyStall(key, entry, filePath, {
+			consecutiveTimeouts: NOTIFY_BACKPRESSURE_BROKEN_AFTER,
+		});
+	}
+
+	/**
+	 * The demotion itself, shared by the #743 consecutive-timeout streak and the
+	 * #1459 wedged-write rule. Both mean the same thing — this client's input path
+	 * is not moving — and both need the same teardown.
+	 */
+	private demoteForNotifyStall(
+		key: string,
+		entry: SpawnedServer,
+		filePath: string,
+		reason: { consecutiveTimeouts: number } | { outstandingMs: number },
+	): void {
+		this.notifyWriteBackpressureStreak.delete(key);
+		this.outstandingAuxNotifyWrites.delete(key);
 		this.state.broken.set(key, Date.now() + BROKEN_BASE_COOLDOWN_MS);
 		void entry.client.shutdown().catch(() => {});
 		this.state.clients.delete(key);
@@ -1403,9 +1464,197 @@ export class LSPService {
 			metadata: {
 				serverId: entry.info.id,
 				cooldownMs: BROKEN_BASE_COOLDOWN_MS,
-				consecutiveTimeouts: NOTIFY_BACKPRESSURE_BROKEN_AFTER,
+				...reason,
 			},
 		});
+	}
+
+	/**
+	 * #1459: the caller's write deadline is a LATENCY bound, not a health verdict.
+	 * A scanner whose `didOpen` lands a second after we stopped waiting is slow,
+	 * not broken, so its late success retracts the timeout it was charged for.
+	 * Without this, three slow-but-healthy scans in a row opened the breaker and
+	 * blacked out the security lane for 15 s.
+	 */
+	private retractNotifyWriteBackpressure(
+		key: string,
+		serverId: string,
+		filePath: string,
+		outstandingMs: number,
+		client: LSPClientInfo,
+	): void {
+		// Generation-checked, exactly like the gate: a predecessor's late landing
+		// must not decrement its SUCCESSOR's streak and mask a real stall.
+		if (this.state.clients.get(key) !== client) return;
+		const streak = this.notifyWriteBackpressureStreak.get(key);
+		if (!streak) return;
+		const streakAfter = streak - 1;
+		if (streakAfter <= 0) this.notifyWriteBackpressureStreak.delete(key);
+		else this.notifyWriteBackpressureStreak.set(key, streakAfter);
+		logLatency({
+			type: "phase",
+			phase: "lsp_notify_write_late_landed",
+			filePath: normalizeMapKey(filePath),
+			durationMs: outstandingMs,
+			metadata: { serverId, outstandingMs, streakAfter },
+		});
+	}
+
+	/**
+	 * #1459: take this auxiliary's resync slot, waiting up to `budgetMs` for it.
+	 *
+	 * The gate is a QUEUE, not a drop: a healthy scanner accepts a `didOpen` in
+	 * milliseconds, so a sweep's neighbours take their turns one after another and
+	 * every file still gets scanned — what the gate prevents is N simultaneous
+	 * full re-scans flooding one stdin. Only a scanner that cannot accept a write
+	 * inside the budget makes a waiter give up, and giving up is reported as a
+	 * coverage gap rather than pushed anyway.
+	 *
+	 * The slot is CLAIMED SYNCHRONOUSLY: the check and the insert sit in one
+	 * uninterrupted run of statements, and the returned handle owns the entry. A
+	 * version that returned "the slot looks free, go write" and let the caller
+	 * insert its own record after an `await` was not a gate at all — when the
+	 * holder's write landed, every waiter woke in the same microtask batch, each
+	 * read an empty map, and all of them wrote at once (measured: one write at t=0,
+	 * then a five-wide flood at t=50 for six touches). That is #1459's own root
+	 * cause rebuilt inside the fix for it.
+	 *
+	 * Returns a handle with `release()` (call on the write's settle, idempotent), or
+	 * a verdict naming how long the blocking write has been outstanding.
+	 */
+	private async claimAuxNotifySlot(
+		clientKey: string,
+		entry: SpawnedServer,
+		filePath: string,
+		budgetMs: number,
+	): Promise<{ release: () => void } | { outstandingMs: number }> {
+		const deadline = Date.now() + budgetMs;
+		for (;;) {
+			const outstanding = this.outstandingAuxNotifyWrites.get(clientKey);
+			// A record left behind by a PREVIOUS client generation (evicted,
+			// respawned) says nothing about this client's stdin — drop it, so a stale
+			// entry can never starve a healthy server.
+			if (outstanding && outstanding.client !== entry.client) {
+				this.outstandingAuxNotifyWrites.delete(clientKey);
+			} else if (outstanding) {
+				const outstandingMs = Date.now() - outstanding.startedAt;
+				const remainingMs = deadline - Date.now();
+				if (remainingMs <= 0) return { outstandingMs };
+				// `settled` never rejects, so this only resolves or times out.
+				await withDeadline(outstanding.settled, {
+					ms: remainingMs,
+					onTimeout: "undefined",
+					onReject: "undefined",
+				});
+				continue;
+			}
+			// This client was evicted or replaced while we queued — writing to it
+			// would target a retired generation. Report the gap instead.
+			//
+			// `!== entry.client` covers BOTH shapes, and the missing-entry one is the
+			// dangerous half: eviction (idle, capacity, a #743 demotion) DELETES the
+			// registry entry, so an `undefined`-exempting guard would wave the waiter
+			// through to a corpse whose write resolves `true` — and `markTouched` would
+			// then record this content as delivered, which is exactly the #1253
+			// laundering the debounce entry must never do.
+			const current = this.state.clients.get(clientKey);
+			if (current !== entry.client) {
+				return { outstandingMs: 0 };
+			}
+			// ---- No `await` from here to the `set` below: the claim is atomic. ----
+			let resolveSettled: (() => void) | undefined;
+			const settled = new Promise<void>((resolve) => {
+				resolveSettled = resolve;
+			});
+			const token = {
+				startedAt: Date.now(),
+				client: entry.client,
+				settled,
+				// A write nothing accepts for the whole wedge window is a dead input
+				// path, not a slow scan. Armed HERE rather than checked by the next
+				// waiter: inside a burst every waiter arrives within one budget, so a
+				// waiter-side check could never see the wedge window elapse and a
+				// wedged scanner was never demoted. Unref'd so it cannot hold a
+				// one-shot host alive, and cleared on release.
+				wedgeTimer: setTimeout(() => {
+					if (this.outstandingAuxNotifyWrites.get(clientKey) !== token) return;
+					this.demoteForNotifyStall(clientKey, entry, filePath, {
+						outstandingMs: Date.now() - token.startedAt,
+					});
+					resolveSettled?.();
+				}, notifyWedgedMs()),
+			};
+			token.wedgeTimer.unref?.();
+			this.outstandingAuxNotifyWrites.set(clientKey, token);
+			return {
+				release: (): void => {
+					clearTimeout(token.wedgeTimer);
+					if (this.outstandingAuxNotifyWrites.get(clientKey) === token) {
+						this.outstandingAuxNotifyWrites.delete(clientKey);
+					}
+					resolveSettled?.();
+				},
+			};
+		}
+	}
+
+	/**
+	 * #1459: the auxiliary scanners that WOULD have attached to this touch but got
+	 * no client because their circuit breaker is open (cooldown or permanent).
+	 *
+	 * A skipped scanner said nothing about the file. Until now it also left no
+	 * trace on the result: it simply dropped out of `spawned`, and the touch
+	 * resolved `confirmation: "confirmed"` on the strength of whoever was left —
+	 * so a 15 s opengrep cooldown read as "scanned, clean" for every file swept
+	 * inside it. Naming the scanners here narrows the touch to `"partial"` instead,
+	 * which every coverage consumer already fails closed on (#1470).
+	 *
+	 * Deliberately AUXILIARY-only. A broken primary is already visible through the
+	 * `no_clients` failure kind and the demonstrated-cold path; the false-clean
+	 * hazard this addresses is the scanner lane, where an empty result is the
+	 * normal, expected answer.
+	 *
+	 * SCOPE, stated so the next reader does not assume the room is closed: this
+	 * covers the BREAKER doors only (cooldown + permanent). `ensureClientForServer`
+	 * also drops a scanner for a temporarily-unavailable command (the #1496 latch),
+	 * `optionalDisabled`, a spawn failure, or capacity eviction. Those are the same
+	 * defect class in the same lane, but they are persistent-absence states rather
+	 * than a transient blackout, so flagging every touch partial for them is a
+	 * broader behavior change than #1459 is scoped to make. Tracked separately.
+	 */
+	private async brokenSkippedAuxiliaryServerIds(
+		filePath: string,
+		clientScope: LSPTouchClientScope,
+		options: LSPTouchFileOptions,
+		spawned: SpawnedServer[],
+	): Promise<string[]> {
+		// "primary" scope attaches no auxiliaries at all, so nothing was skipped.
+		if (clientScope === "primary") return [];
+		const enabledAuxiliaries =
+			clientScope === "with-auxiliary"
+				? new Set(options.auxiliaryServerIds ?? [])
+				: undefined;
+		const attached = new Set(spawned.map((entry) => entry.info.id));
+		const skipped: string[] = [];
+		for (const server of getServersForFileWithConfig(filePath)) {
+			if (server.role !== "auxiliary") continue;
+			if (attached.has(server.id)) continue;
+			// An explicitly excluded server (the #584 workspace-sweep exclusion) was
+			// never asked, and its findings come from its own CLI extractor — that is
+			// a routing decision, not a coverage gap.
+			if (options.excludeServerIds?.has(server.id)) continue;
+			if (enabledAuxiliaries && !enabledAuxiliaries.has(server.id)) continue;
+			const key = await this.demonstratedReadyKeyFor(server, filePath);
+			if (!key) continue;
+			const brokenUntil = this.state.broken.get(key);
+			if (
+				this.permanentlyBroken.has(key) ||
+				(typeof brokenUntil === "number" && brokenUntil > Date.now())
+			) {
+				skipped.push(server.id);
+			}
+		}
+		return skipped;
 	}
 
 	private activeClientsForCwd(
@@ -2335,8 +2584,57 @@ export class LSPService {
 		);
 		const notifySkipped =
 			spawned.length > 0 && notifySkippedServerIds.size === spawned.length;
+		// #1531: the pre-notify diagnostics baseline for THIS file on each client.
+		// It used to be `client.diagnosticsVersion`, a client-GLOBAL counter that also
+		// advances for files this touch never mentions — which let a sibling file's
+		// publication both end this file's wait early and read as an answer for it.
+		// `getDiagnosticsVersionForPath` returns that same counter's value as of this
+		// file's last publication, so every comparison downstream stays on one axis
+		// while ignoring sibling paths. Captured here because the notify below clears
+		// each client's cache for the file.
+		//
+		// The accessor is REQUIRED on `LSPClient`, so a real client always answers
+		// with a number. The optional call is only so a hand-written test double that
+		// predates it fails CLOSED — `undefined` keeps the existing "no usable
+		// baseline" branch below and can never satisfy the evidence check — instead of
+		// quietly reverting to the global counter, which is the defect itself.
+		const readPathVersion = (
+			client: (typeof spawned)[number]["client"],
+		): number | undefined => client.getDiagnosticsVersionForPath?.(filePath);
 		const diagnosticBaselines = new Map(
-			spawned.map((entry) => [entry.client, entry.client.diagnosticsVersion]),
+			spawned.map((entry) => [entry.client, readPathVersion(entry.client)]),
+		);
+		// #1458: read a late auxiliary publication BEFORE the ordinary resync
+		// clears its client cache. Carry it only when the publication's exact
+		// sent-content fingerprint matches this touch's content. A changed edit,
+		// version-less publication, or malformed binding fails closed and is not
+		// replayed. The fresh notify still runs below, so scanners continue toward
+		// a publication for this touch while the prior late result reaches the read.
+		const touchContentHash = this.hashContent(content);
+		const carriedAuxiliary = options.collectDiagnostics
+			? spawned.flatMap((entry) => {
+					if (entry.info.role !== "auxiliary") return [];
+					const binding = entry.client.getDiagnosticBinding?.(filePath);
+					if (binding?.contentHash !== touchContentHash) return [];
+					const diags = entry.client.getDiagnostics(filePath);
+					return diags.length > 0 ? [{ diags, binding }] : [];
+				})
+			: [];
+		// #1493: auxiliaries whose STORED publication already covers exactly the
+		// bytes this touch carries. Read BEFORE the notify below, which clears each
+		// client's cache for the file. Unlike `carriedAuxiliary` this does not
+		// require findings: an empty publication bound to this content is evidence
+		// the scanner reported, which is what keeps a genuinely clean file clean
+		// when its wait produces nothing new (a debounce-skipped notify, or a late
+		// publication carried in from the previous touch).
+		const auxPublishedThisContent = new Set(
+			spawned.flatMap((entry) =>
+				entry.info.role === "auxiliary" &&
+				entry.client.getDiagnosticBinding?.(filePath)?.contentHash ===
+					touchContentHash
+					? [entry.info.id]
+					: [],
+			),
 		);
 		// #743: PER-SERVER notify-write deadlines. Each server's didOpen/didChange
 		// write gets its OWN notifyWriteBudgetMs budget rather than one shared
@@ -2352,8 +2650,26 @@ export class LSPService {
 		// server timed out"; this list carries the per-server detail the
 		// demonstratedReady gate reads so a healthy sibling stays eligible.
 		const notifyWriteTimedOutServerIds: string[] = [];
+		// #1459: auxiliaries whose resync was DEFERRED because the gate already had
+		// one outstanding write for that server. They carry no evidence about this
+		// content, so they join the coverage gap below.
+		const notifyDeferredServerIds: string[] = [];
 		if (!notifySkipped) {
 			const budget = notifyWriteBudgetMs();
+			// #1459: how long a queued auxiliary may wait for its resync slot. Bounded
+			// by the write budget AND by whatever the caller already declared it is
+			// willing to spend on this touch (`maxClientWaitMs` — cascade's cold
+			// snapshot passes 1000ms), minus what the client wait above already spent.
+			// A flat write-budget wait would tax a caller that asked for less than one
+			// budget in total. Non-positive means "no time left to queue": the server
+			// is reported as uncovered immediately.
+			const queueWaitMs =
+				options.maxClientWaitMs !== undefined
+					? Math.min(
+							budget,
+							Math.max(0, options.maxClientWaitMs - (Date.now() - startedAt)),
+						)
+					: budget;
 			await Promise.all(
 				spawned.map(async (entry) => {
 					// #743: this server already has this content from a recent touch
@@ -2366,21 +2682,98 @@ export class LSPService {
 						entry.info,
 						filePath,
 					);
+					// #1459: one outstanding resync per auxiliary. Primaries are
+					// untouched — they serve one file per touch and are not the fan-out
+					// target a `clientScope: "all"` sweep floods.
+					const gated =
+						entry.info.role === "auxiliary" && clientKey !== undefined;
+					let slot: { release: () => void } | undefined;
+					if (gated && clientKey) {
+						const claim = await this.claimAuxNotifySlot(
+							clientKey,
+							entry,
+							filePath,
+							queueWaitMs,
+						);
+						if ("outstandingMs" in claim) {
+							// Queued behind a write the scanner has not accepted inside our
+							// budget. Pushing anyway is what floods it, so this touch reports
+							// the scanner as uncovered instead. The wedge timer armed with the
+							// blocking write is what demotes a dead input path.
+							notifyDeferredServerIds.push(entry.info.id);
+							logLatency({
+								type: "phase",
+								phase: "lsp_notify_resync_deferred",
+								filePath: normalizedPath,
+								durationMs: claim.outstandingMs,
+								metadata: {
+									serverId: entry.info.id,
+									source,
+									clientScope,
+									outstandingMs: claim.outstandingMs,
+									queueWaitMs,
+								},
+							});
+							return;
+						}
+						slot = claim;
+					}
 					let wrote: true | undefined;
 					let rejected = false;
 					try {
-						wrote = await withDeadline(
-							entry.client.notify
-								.open(filePath, content, languageId, undefined, silent)
-								.then(() => true as const),
-							{ ms: budget, onTimeout: "undefined", onReject: "propagate" },
-						);
+						const writeStartedAt = Date.now();
+						// Constructed inside the try so a client double without `notify`
+						// (or any synchronous throw) still reads as a rejected write rather
+						// than rejecting the whole per-file `Promise.all`.
+						const writePromise = entry.client.notify
+							.open(filePath, content, languageId, undefined, silent)
+							.then(() => true as const);
+						if (slot && clientKey) {
+							const client = entry.client;
+							const release = slot.release;
+							// Release the slot on the write's OWN settle, whatever the caller
+							// below decided to wait for. The handle is identity-checked, so a
+							// demotion (which clears the map) or a later claim cannot be
+							// released by this one.
+							void writePromise.then(
+								() => {
+									release();
+									// The write landed, just not inside the caller's budget —
+									// retract the timeout it was charged for. A write that landed
+									// IN budget took the success path below, which clears the
+									// streak outright, so only the late case retracts. A landing
+									// past the WEDGE window keeps its strike: at that point the
+									// stall was long enough that #743's demotion is the honest
+									// verdict, not a latency artifact.
+									const outstandingMs = Date.now() - writeStartedAt;
+									if (outstandingMs > budget && outstandingMs <= notifyWedgedMs()) {
+										this.retractNotifyWriteBackpressure(
+											clientKey,
+											entry.info.id,
+											filePath,
+											outstandingMs,
+											client,
+										);
+									}
+								},
+								release,
+							);
+						}
+						wrote = await withDeadline(writePromise, {
+							ms: budget,
+							onTimeout: "undefined",
+							onReject: "propagate",
+						});
 					} catch {
 						// The write itself rejected (not backpressure): the content did
 						// not land, so this server is inconclusive for the touch, but a
 						// rejection is not a stdin-backpressure signal and must not count
 						// toward the backpressure demotion streak.
 						rejected = true;
+						// A synchronous throw (a client double without `notify`) never
+						// reached the settle handlers that release the slot — release it
+						// here so one bad client cannot wedge the queue. Idempotent.
+						slot?.release();
 					}
 					if (wrote === true) {
 						// A clean write clears any accrued backpressure streak (#743).
@@ -2418,12 +2811,21 @@ export class LSPService {
 		// File-level flag: at least one server's write timed out (kept for the
 		// conservative touch-wide `inconclusive` merge semantics — see below).
 		const notifyWriteTimedOut = notifyWriteTimedOutServerIds.length > 0;
+		// #1459: read by the diagnostics wait and the merge below — a deferred
+		// server is neither waited on nor read from.
+		const deferredResyncServerIds = new Set(notifyDeferredServerIds);
 
 		let diagnosticsTimedOut = false;
 		// R8 (#714): server ids of aux-role servers whose push wait was cut off by
 		// the aux grace window. Undefined when no aux was cut off (primary-only
 		// paths never set this). Logged in lsp_touch_file metadata.
 		let auxCutOffServerIds: string[] | undefined;
+		// #1493: aux-role servers this touch carries NO evidence from — the cut-off
+		// set above PLUS the ones that stayed silent through their own budget with
+		// no stored publication for this content. This is what narrows the
+		// confirmation; `auxCutOffServerIds` stays cut_off-only so the R8 latency
+		// field keeps its original meaning.
+		let auxUnconfirmedServerIds: string[] | undefined;
 		// #707: tsserver sync clean-confirm state. `tsserverSyncEligible` is the
 		// full gate (evaluated once, before the wait); `tsserverSyncConfirmed`
 		// holds the sync commands' answer when the racing confirm won the wait
@@ -2598,9 +3000,15 @@ export class LSPService {
 				timeoutFor = () => callerCap ?? modeFloor;
 			}
 			// Detection deadline = the slowest individual server's budget.
+			// #1459: computed over the servers actually WAITED ON. A deferred server
+			// contributes no wait, so including its (typically longest) scanner budget
+			// here would raise the aggregate threshold above anything that can elapse
+			// and mask a real timeout on the servers that did wait.
 			const timeoutMs = Math.max(
 				0,
-				...spawned.map((e) => timeoutFor(e.client.serverId)),
+				...spawned
+					.filter((e) => !deferredResyncServerIds.has(e.info.id))
+					.map((e) => timeoutFor(e.client.serverId)),
 			);
 
 			// #707: evaluate the tsserver sync clean-confirm gate BEFORE the wait
@@ -2653,8 +3061,18 @@ export class LSPService {
 			// The #707 tsserver sync race operates exclusively on single-server
 			// primary-scope touches (guarded by `clientScope === "primary" &&
 			// spawned.length === 1`), so there is NO interaction with this path.
+			// #1458 S4: also gated on `collectDiagnostics` — a non-collecting
+			// with-auxiliary touch has nothing to carry the aux wait's result
+			// INTO (its diagnostics are discarded either way), so paying up to
+			// `auxCeilingMs` of extra latency for it buys nothing. Both current
+			// callers (`getDiagnostics`'s with-auxiliary path and the cascade's
+			// collecting touch) already pass `collectDiagnostics: true`, so this
+			// is latent-today defense, not a behavior change — but a future
+			// non-collecting with-auxiliary caller must not silently inherit the
+			// full aux-grace cost for diagnostics it's about to throw away.
 			const hasTouchAuxiliaries =
 				clientScope === "with-auxiliary" &&
+				options.collectDiagnostics === true &&
 				spawned.some((e) => e.info.role === "auxiliary");
 
 			// Per-server wait promises (each already bounded by its own
@@ -2668,7 +3086,21 @@ export class LSPService {
 				}
 			}
 			const perServerWaits = spawned.map((entry) => {
+				// #1459: a DEFERRED server never received this content, so its version
+				// can never advance past the baseline — waiting on it burns its whole
+				// budget and would flip the touch to `inconclusive`, discarding a
+				// primary answer that IS trustworthy. It contributes no wait; the
+				// coverage gap below is what reports its absence.
+				if (deferredResyncServerIds.has(entry.info.id)) {
+					return Promise.resolve(undefined);
+				}
 				const serverTimeout = timeoutFor(entry.client.serverId);
+				// #1531: a per-path baseline. `clientWaitForDiagnostics` compares it
+				// against this path's own publication stamp, so a sibling file's
+				// publication on a shared client can no longer end this wait before the
+				// server's own budget lapses — which is what kept the outcome labels
+				// honest (`cut_off` means our grace won, `silent` means the server's own
+				// budget lapsed with nothing published).
 				const baseline = diagnosticBaselines.get(entry.client);
 				const pullOnly =
 					classifyServerWaitTier(
@@ -2702,52 +3134,150 @@ export class LSPService {
 						const primaryWaits = perServerWaits.filter(
 							(_, i) => spawned[i].info.role !== "auxiliary",
 						);
-						// Aux waits: auxiliary servers (advisory).
+						// Aux waits: auxiliary servers (advisory). `client` and the
+						// pre-notify `diagnosticsVersion` baseline travel alongside the
+						// promise so the outcome can be decided from EVIDENCE after the
+						// race, not from how the raced promise settled (#1458 S1 — see
+						// below).
 						const auxWaits = perServerWaits
 							.map((p, i) =>
 								spawned[i].info.role === "auxiliary"
-									? { promise: p, serverId: spawned[i].info.id }
+									? {
+											promise: p,
+											serverId: spawned[i].info.id,
+											client: spawned[i].client,
+											baseline: diagnosticBaselines.get(spawned[i].client),
+										}
 									: null,
 							)
 							.filter(
-								(x): x is { promise: Promise<void | undefined>; serverId: string } =>
-									x !== null,
+								(
+									x,
+								): x is {
+									promise: Promise<void | undefined>;
+									serverId: string;
+									client: (typeof spawned)[number]["client"];
+									baseline: number | undefined;
+								} => x !== null,
 							);
-						const auxGraceMs = readEnvAuxGraceMs() ?? 500;
-						// After all primaries settle, give auxiliaries at most auxGraceMs.
-						// Late aux results are dropped from the wait (advisory only — they
-						// land in the client cache and surface on the next edit); aux servers
-						// that did answer within the grace are included automatically since
+						const auxCeilingMs = readEnvAuxGraceMs() ?? 2000;
+						// After all primaries settle, give each auxiliary the smaller of
+						// its declared wait budget and the global auxiliary ceiling. The
+						// 2000ms default admits measured ~1.3s warm scanner runs without
+						// making every edit pay opengrep's 3500ms cold-start allowance.
+						// Late aux results are dropped from this wait. A later unchanged-
+						// content read may carry a SHA-256-bound cache publication before its
+						// resync clears the cache; changed or unknown content never replays.
+						// Aux servers that answer within the grace are included automatically since
 						// their waitForDiagnostics already resolved. The cut-off server ids
 						// are logged in the latency metadata (lsp_touch_file phase, field
 						// `auxCutOffServerIds`).
 						return Promise.all(primaryWaits).then(async () => {
 							if (auxWaits.length === 0) return;
-							const auxTimeout = new Promise<"timeout">((resolve) => {
-								const t = setTimeout(() => resolve("timeout"), auxGraceMs);
-								if (typeof t === "object" && "unref" in t) t.unref?.();
-							});
-							const auxAll = Promise.all(auxWaits.map((a) => a.promise)).then(
-								() => "done" as const,
-							);
-							const outcome = await Promise.race([auxAll, auxTimeout]);
-							if (outcome === "timeout") {
-								// Record which auxiliaries did NOT finish in time.
-								const unfinished: string[] = [];
-								for (const a of auxWaits) {
-									let done = false;
-									// Check synchronously if already resolved by racing against
-									// a resolved promise.
-									await Promise.race([
-										a.promise.then(() => {
-											done = true;
-										}),
-										Promise.resolve(),
+							const auxWaitStartedAt = Date.now();
+							const outcomes = await Promise.all(
+								auxWaits.map(async (aux) => {
+									const budgetMs = Math.min(
+										timeoutFor(aux.serverId),
+										auxCeilingMs,
+									);
+									let timer: ReturnType<typeof setTimeout> | undefined;
+									const timeout = new Promise<false>((resolve) => {
+										timer = setTimeout(() => resolve(false), budgetMs);
+										if (typeof timer === "object" && "unref" in timer) {
+											timer.unref?.();
+										}
+									});
+									const raced = await Promise.race([
+										aux.promise.then(() => true as const),
+										timeout,
 									]);
-									if (!done) unfinished.push(a.serverId);
-								}
-								if (unfinished.length > 0) auxCutOffServerIds = unfinished;
-							}
+									if (timer) clearTimeout(timer);
+									// #1458 S1: `waitForDiagnostics` RESOLVES on its own timeout
+									// (client.ts) — it never rejects, and a silent scanner that
+									// published nothing looks identical, promise-wise, to one
+									// that answered. `raced === true` only means "the promise
+									// settled before our timer fired"; it is not proof anything
+									// was published. Decide the outcome from evidence instead:
+									// did this aux's `diagnosticsVersion` advance past the
+									// pre-notify baseline captured before the wait started?
+									//   - raced === false            → "cut_off" (our timer won;
+									//     the aux's own wait never got to answer for itself).
+									//   - raced === true, no evidence → "silent" (the aux's own
+									//     wait gave up within its budget with nothing to report —
+									//     NOT the same as having answered).
+									//   - raced === true, evidence   → "answered" (a fresh
+									//     publication actually landed for this touch).
+									//
+									// #1531: the evidence is read PER PATH. The global
+									// `diagnosticsVersion` advances for every file this client
+									// publishes, so a concurrent touch of an unrelated file used to
+									// hand this one an unearned "answered" row. The per-path stamp
+									// carries the global counter's value at store time, so the
+									// comparison stays monotonic across cache evictions while
+									// ignoring sibling paths — and it is the SAME axis `baseline`
+									// was captured on above.
+									const currentPathVersion = readPathVersion(aux.client);
+									const publishedEvidence =
+										raced &&
+										Number.isFinite(aux.baseline) &&
+										currentPathVersion !== undefined &&
+										currentPathVersion > (aux.baseline as number);
+									// #1459: a DEFERRED aux was never sent this content and is not
+									// waited on at all, so its instantly-resolved placeholder
+									// promise must not read as "silent". "Silent" is the reserved
+									// signal for a scanner that HAD the content, finished inside
+									// its own budget, and published nothing (#1493) — recording a
+									// deferral there would corrupt the one row that tracks it.
+									const outcome = deferredResyncServerIds.has(aux.serverId)
+										? ("deferred" as const)
+										: !raced
+											? ("cut_off" as const)
+											: publishedEvidence
+												? ("answered" as const)
+												: ("silent" as const);
+									return {
+										serverId: aux.serverId,
+										outcome,
+										// #1493: carried into the coverage-gap policy so a silent
+										// auxiliary that already published for these exact bytes is
+										// not demoted. Logged too — it is the reason a `silent` row
+										// did not narrow the touch.
+										publishedThisContent: auxPublishedThisContent.has(
+											aux.serverId,
+										),
+										budgetMs,
+										elapsedMs: Date.now() - auxWaitStartedAt,
+										// #1458 S3: elapsed measured from BEFORE the primary wait
+										// (waitStartedAt), not just from auxWaitStartedAt — this is
+										// what lets a latency row validate the ~1.3s warm-scanner
+										// figure the 2000ms ceiling was set from; `elapsedMs` alone
+										// only covers the POST-primary aux phase.
+										elapsedSinceNotifyMs: Date.now() - waitStartedAt,
+									};
+								}),
+							);
+							const unfinished = outcomes
+								.filter((outcome) => outcome.outcome === "cut_off")
+								.map((outcome) => outcome.serverId);
+							if (unfinished.length > 0) auxCutOffServerIds = unfinished;
+							// #1493: one policy over both no-answer shapes. Lives in
+							// diagnostic-binding.ts so no consumer re-derives the rule from
+							// an outcome string.
+							const uncovered = auxiliaryCoverageGap(outcomes);
+							if (uncovered.length > 0) auxUnconfirmedServerIds = uncovered;
+							logLatency({
+								type: "phase",
+								phase: "lsp_aux_wait_outcome",
+								filePath: normalizedPath,
+								durationMs: Date.now() - auxWaitStartedAt,
+								// #1533: `waitShape` names the producer, because the aggregate
+								// path emits the same row with the same outcome vocabulary
+								// minus `cut_off`. A field query that sees only `silent` rows
+								// must be able to tell "our ceiling was in play" from "the
+								// auxiliary's own full budget lapsed".
+								metadata: { clientScope, waitShape: "aux_grace", outcomes },
+							});
 						});
 					})()
 				: Promise.all(perServerWaits).then(() => {});
@@ -2828,6 +3358,111 @@ export class LSPService {
 				await pushWait;
 			}
 			const waitedMs = Date.now() - waitStartedAt;
+			// #1533: the same auxiliary coverage evidence for a collecting touch that
+			// did NOT enter the aux-grace wait — in practice `clientScope: "all"`, the
+			// batch/directory scan surface. Auxiliaries ARE spawned on that scope
+			// (`getClientsForFile` returns every matching server, #573) and each one is
+			// waited on inside `Promise.all(perServerWaits)` on its own per-server
+			// budget, but `hasTouchAuxiliaries` is `with-auxiliary`-only, so no evidence
+			// was ever derived and a silent scanner aggregated as an unqualified
+			// `"confirmed"` — the #1493 false clean surviving on a different scope.
+			//
+			// NO SECOND WAIT. Every aux promise here has already settled (the
+			// `Promise.all` above awaited it), so this reads post-wait state only. That
+			// is deliberate: #1459's resync gate exists to ABSORB the aux fan-out of an
+			// "all"-scope sweep into deferrals, and entering a per-neighbour aux grace
+			// here would pay back the latency that gate just recovered. The evidence is
+			// free; only the verdict changes.
+			//
+			// WHICH verdicts change, stated without overreach. Where the auxiliary's
+			// budget is the MAX over waited servers (`perServerTimeout` is
+			// `min(callerCap, strategyWait)` per server, `timeoutMs` is the max across
+			// them), a silent auxiliary already tripped `diagnosticsTimedOut` and the
+			// touch was already `inconclusive` — which is decided BEFORE the coverage
+			// gap, so those results are unchanged. That covers opengrep on every current
+			// per-edit path, whose 3500 exceeds either cap. But a FASTER auxiliary beside
+			// a slower primary (typos 1500 or ast-grep 1800 next to rust-analyzer 3000
+			// under a 2000 cap) settles inside `timeoutMs`, so nothing timed out and this
+			// block genuinely narrows a result that used to read `confirmed`. That is the
+			// fix working: the scanner said nothing about these bytes. It is fail-safe —
+			// the primary's findings still ride along and only the coverage claim is
+			// withdrawn — and the cost is a skipped cache seed for that file. Both cases
+			// are pinned in `tests/clients/lsp/service-aux-grace.test.ts`.
+			//
+			// `cut_off` cannot arise on this path — there is no grace timer to end a
+			// wait early — so the shapes are `answered` / `silent` / `deferred`, decided
+			// by exactly the rules the grace path uses (#1458 S1: a settled promise is
+			// not proof of a publication; only a `diagnosticsVersion` advance past the
+			// pre-notify baseline is). `waitShape` distinguishes the two producers in
+			// field data, since a `silent` row here means the auxiliary's own full
+			// per-server budget lapsed rather than our ceiling cutting it short.
+			//
+			// A server the caller EXCLUDED (`WORKSPACE_SWEEP_EXCLUDED_SERVER_IDS`, #584)
+			// never reaches `spawned`, so it cannot be reported here — an excluded-by-
+			// design scanner is a routing decision, not a coverage gap, exactly as
+			// `brokenSkippedAuxiliaryServerIds` already treats it.
+			//
+			// Written as `!hasTouchAuxiliaries` rather than `clientScope === "all"` so a
+			// future scope that spawns auxiliaries without entering the grace wait fails
+			// closed here by default instead of needing to be remembered. The #707
+			// tsserver sync race can reach here with `pushWait` still pending, but it is
+			// gated on `clientScope === "primary" && spawned.length === 1`, which spawns
+			// no auxiliaries at all — so the per-role filter below is empty and no
+			// evidence is read before its wait ends.
+			//
+			// `elapsedMs` and `elapsedSinceNotifyMs` are equal by construction here:
+			// there is no separate post-primary aux phase to measure, so both describe
+			// the one aggregate wait. Both fields are kept so a query can read either
+			// producer's rows without special-casing the schema.
+			//
+			// The evidence is read PER PATH, through the same `readPathVersion` accessor
+			// the grace path uses (#1531, landed on master while this was in review).
+			// This is NOT interchangeable with `client.diagnosticsVersion`: that global
+			// counter also advances for files this touch never mentions, so two
+			// CONCURRENT touches sharing one auxiliary client cross-satisfy — a
+			// publication for a.ts hands b.ts an unearned `answered`. That matters
+			// especially here, because the highest-frequency `"all"` caller (the cascade
+			// neighbour fan-out in `clients/dispatch/integration.ts`) is a
+			// `Promise.allSettled` and its touches are always concurrent. Reading the
+			// per-path stamp keeps this comparison on the SAME axis `baseline` was
+			// captured on, and `undefined` from a double that predates the accessor fails
+			// CLOSED rather than silently reverting to the global counter.
+			if (!hasTouchAuxiliaries && options.collectDiagnostics === true) {
+				const auxEntries = spawned.filter(
+					(entry) => entry.info.role === "auxiliary",
+				);
+				if (auxEntries.length > 0) {
+					const outcomes = auxEntries.map((entry) => {
+						const baseline = diagnosticBaselines.get(entry.client);
+						const currentPathVersion = readPathVersion(entry.client);
+						const publishedEvidence =
+							Number.isFinite(baseline) &&
+							currentPathVersion !== undefined &&
+							currentPathVersion > (baseline as number);
+						return {
+							serverId: entry.info.id,
+							outcome: deferredResyncServerIds.has(entry.info.id)
+								? ("deferred" as const)
+								: publishedEvidence
+									? ("answered" as const)
+									: ("silent" as const),
+							publishedThisContent: auxPublishedThisContent.has(entry.info.id),
+							budgetMs: timeoutFor(entry.client.serverId),
+							elapsedMs: waitedMs,
+							elapsedSinceNotifyMs: waitedMs,
+						};
+					});
+					const uncovered = auxiliaryCoverageGap(outcomes);
+					if (uncovered.length > 0) auxUnconfirmedServerIds = uncovered;
+					logLatency({
+						type: "phase",
+						phase: "lsp_aux_wait_outcome",
+						filePath: normalizedPath,
+						durationMs: waitedMs,
+						metadata: { clientScope, waitShape: "aggregate", outcomes },
+					});
+				}
+			}
 			if (tsserverSyncConfirmed !== undefined) {
 				// #707: the racing sync confirm won — a definitive answer well under
 				// the push-wait budget. Not a timeout, not inconclusive.
@@ -2871,6 +3506,12 @@ export class LSPService {
 					durationMs: waitedMs,
 					metadata: {
 						source,
+						// #1444: WHICH server(s) burned the budget — without this the
+						// ~221/day timeout rows can't be attributed to a server at all.
+						// `info.id` (not `client.serverId`) for the same reason the
+						// degradation ledger above uses it: test doubles and lightweight
+						// clients need not expose `serverId`.
+						serverIds: spawned.map((e) => e.info.id),
 						clientScope,
 						diagnosticsMode,
 						timeoutMs,
@@ -2978,9 +3619,19 @@ export class LSPService {
 		let collected = options.collectDiagnostics
 			? tsserverSyncConfirmed !== undefined
 				? mergeLspDiagnostics(tsserverSyncConfirmed)
-				: mergeLspDiagnostics(
-						spawned.flatMap((entry) => entry.client.getDiagnostics(filePath)),
-					)
+				: mergeLspDiagnostics([
+						// #1459: a DEFERRED server's cache still holds the PREVIOUS
+						// content's findings — the resync that would have cleared it never
+						// ran. Merging them would report another revision's findings (and
+						// its line numbers) as this touch's answer, the one hazard the
+						// gate itself creates. Drop them; the gap is reported instead.
+						...spawned.flatMap((entry) =>
+							deferredResyncServerIds.has(entry.info.id)
+								? []
+								: entry.client.getDiagnostics(filePath),
+						),
+						...carriedAuxiliary.flatMap((entry) => entry.diags),
+					])
 			: undefined;
 		// #1095 (P3-b): whether `collected` came from a tsserver sync confirm
 		// (`tsserverSyncRequest`) rather than the publish cache. A sync-confirmed
@@ -3138,6 +3789,72 @@ export class LSPService {
 		// confirmed answer.
 		const inconclusive = notifyWriteTimedOut || diagnosticsTimedOut;
 
+		// #1470/#1493: an auxiliary whose push wait was CUT OFF by the aux grace
+		// timer (R8/#714) contributed exactly as much evidence about this file as one
+		// that went silent inside its own budget — none. Both now narrow the
+		// confirmation, through the one `auxiliaryCoverageGap` policy. A hung or
+		// silent opengrep used to resolve `confirmation: "confirmed"` and read as
+		// confirmed-clean on the security lane; the silent half survived #1470
+		// because it only tripped `diagnosticsTimedOut` when it was the ONLY
+		// auxiliary, so a fast sibling hid it (#1493).
+		// This does NOT flip the touch to inconclusive: that would discard a
+		// primary answer that IS trustworthy (#533 honesty doctrine cuts both ways —
+		// overclaiming and underclaiming are both dishonest). Instead the confirmation
+		// is NARROWED: `"partial"`, naming the servers it does not speak for, so every
+		// consumer that treats confirmation as proof of coverage fails closed while
+		// the primary's findings still flow.
+		// #1459: two more doors into the same room, and they open BEFORE any wait —
+		// so `auxiliaryCoverageGap` (which reads wait outcomes) cannot see either on
+		// its own. A scanner whose breaker was open never attached, and one whose
+		// resync the fan-out gate deferred never received this content.
+		//
+		// The deferred ids are unioned in rather than left to the aux-wait policy on
+		// purpose: an aux outcome row requires an auxiliary to have been SPAWNED, and a
+		// breaker-skipped scanner never was. #1533: an `"all"`-scope sweep emits outcome
+		// rows now too, so a spawned-but-deferred server arrives through BOTH routes as
+		// outcome `"deferred"` — where a stored publication
+		// for these exact bytes can still exempt it — so the Set dedups rather than
+		// double-reports, and #1493's content-hash exemption is not bypassed here:
+		// a deferred aux is only unioned in because the gate itself proves it was
+		// never sent this content.
+		const brokenSkippedServerIds =
+			collected !== undefined
+				? await this.brokenSkippedAuxiliaryServerIds(
+						filePath,
+						clientScope,
+						options,
+						spawned,
+					)
+				: [];
+		const unconfirmedServerIds = [
+			...new Set([
+				...(auxUnconfirmedServerIds ?? []),
+				...notifyDeferredServerIds.filter(
+					(serverId) => !auxPublishedThisContent.has(serverId),
+				),
+				...brokenSkippedServerIds,
+			]),
+		];
+		const coverageGap = unconfirmedServerIds.length > 0;
+		// The record that proves a blackout is no longer read as clean: one row per
+		// touch that a scanner did not cover, naming the scanner and the reason.
+		if (brokenSkippedServerIds.length > 0 || notifyDeferredServerIds.length > 0) {
+			logLatency({
+				type: "phase",
+				phase: "lsp_scanner_coverage_gap",
+				filePath: normalizedPath,
+				durationMs: Date.now() - startedAt,
+				metadata: {
+					source,
+					clientScope,
+					...(brokenSkippedServerIds.length > 0 && { brokenSkippedServerIds }),
+					...(notifyDeferredServerIds.length > 0 && {
+						deferredResyncServerIds: notifyDeferredServerIds,
+					}),
+				},
+			});
+		}
+
 		// #667: a confirmed (non-inconclusive) diagnostics-mode touch is the
 		// "actually warm" signal `ensureWarmForSweep` waits for — mark every
 		// spawned server so a later sweep in this session sees the check as a
@@ -3148,10 +3865,26 @@ export class LSPService {
 		// write stalled must still be eligible, so only servers whose OWN write
 		// timed out are skipped here (rather than gating the whole loop on the
 		// file-level `inconclusive`).
+		//
+		// #1470/#1493: same per-server reasoning for an auxiliary that contributed
+		// no evidence. "Demonstrated ready" means this server answered for this
+		// file; an auxiliary our grace timer cut off, or one that stayed silent
+		// through its own budget, demonstrably did not.
+		//
+		// NO TEST PINS THIS LINE, and that is a property of today's readers rather
+		// than a coverage gap: `ensureWarmForSweep` filters `role === "auxiliary"`
+		// out of its server list entirely, so no reader consumes an auxiliary's
+		// `demonstratedReady` mark and deleting this `continue` changes no observable
+		// behavior (verified by mutation — the LSP suite stays green). It stays
+		// because the mark's meaning is "this server answered", and the moment any
+		// reader stops filtering auxiliaries out, marking a cut-off scanner warm
+		// would let it skip a warm-up it never earned.
 		const notifyTimedOutServerIds = new Set(notifyWriteTimedOutServerIds);
+		const uncoveredServerIds = new Set(unconfirmedServerIds);
 		if (diagnosticsMode !== "none" && !diagnosticsTimedOut) {
 			for (const entry of spawned) {
 				if (notifyTimedOutServerIds.has(entry.info.id)) continue;
+				if (uncoveredServerIds.has(entry.info.id)) continue;
 				const key = await this.demonstratedReadyKeyFor(entry.info, filePath);
 				if (key) this.markDemonstratedReadyKey(key);
 			}
@@ -3166,7 +3899,14 @@ export class LSPService {
 		// empty `collected` must never erase a previously-confirmed non-empty
 		// record (that's the #570 bug — a timeout silently reporting as clean
 		// and wiping out known-good diagnostic state).
-		if (collected !== undefined && !inconclusive) {
+		// #1470/#1493: a PARTIAL touch is the same hazard wearing a different flag.
+		// Its merged array is missing whatever the unreporting auxiliary would have said, so
+		// priming the cache with it would let `actionable-warnings`' hash-guarded
+		// read replay a partially-covered result as an authoritative observation —
+		// and an empty one would DELETE a previously-confirmed record on the strength
+		// of a scanner that never answered. Skip the prime; the next read pays a real
+		// round trip instead of trusting an incomplete one.
+		if (collected !== undefined && !inconclusive && !coverageGap) {
 			const normalizedKey = normalizeMapKey(filePath);
 			if (collected.length > 0) {
 				this.lastKnownDiagnostics.set(normalizedKey, collected);
@@ -3190,6 +3930,15 @@ export class LSPService {
 
 		if (collected !== undefined && inconclusive) {
 			result.inconclusive = true;
+		} else if (collected !== undefined && coverageGap) {
+			// #1470/#1493: narrowed, not collapsed. Reached for EITHER no-answer
+			// shape — a cut-off auxiliary or a silent one with nothing published for
+			// this content. The primary's findings ride along in `.diags` exactly as
+			// before; what changes is that the touch now states which servers it does
+			// not speak for, so no consumer can read this as a full clean bill of
+			// health.
+			result.confirmation = "partial";
+			result.unconfirmedServerIds = [...unconfirmedServerIds];
 		} else if (collected !== undefined) {
 			// Preserve the lower-level affirmative result across consumers. In
 			// particular, the silent-clean gates above clear diagnosticsTimedOut only
@@ -3215,9 +3964,14 @@ export class LSPService {
 						// Optional-chain so a client without the getter (test doubles, a
 						// partially-mocked client) yields "unknown" rather than throwing —
 						// unknown preserves pre-#1095 behavior for that contributor.
-						spawned.map((entry) =>
-							entry.client.getDiagnosticBinding?.(filePath),
-						),
+						[
+							// #1459: a deferred server contributed no diagnostics (above), so
+							// its stale binding must not decide the merged verdict either.
+							...spawned
+								.filter((entry) => !deferredResyncServerIds.has(entry.info.id))
+								.map((entry) => entry.client.getDiagnosticBinding?.(filePath)),
+							...carriedAuxiliary.map((entry) => entry.binding),
+						],
 					);
 			result.binding = binding;
 		}
@@ -3259,11 +4013,36 @@ export class LSPService {
 				}),
 				diagnosticsTimedOut,
 				inconclusive,
+				// #1470: the touch's own honesty verdict, so a `cut_off` row in
+				// `lsp_aux_wait_outcome` can be joined to the touch that produced it and
+				// shown NOT to have claimed confirmation for that server's coverage.
+				// Absent for a non-collecting touch, which claims nothing either way.
+				...(result.confirmation !== undefined && {
+					confirmation: result.confirmation,
+				}),
 				// R8 (#714): server ids of auxiliaries whose push wait was cut off by
 				// the aux grace window (primary settled clean + aux timed out in grace).
 				// Absent when no aux was cut off. These servers' diagnostics are
 				// advisory-only and will surface on the next edit from their cache.
 				...(auxCutOffServerIds !== undefined && { auxCutOffServerIds }),
+				// #1493: the full set the confirmation was narrowed on — the cut-off
+				// ids plus every auxiliary that stayed silent with nothing published
+				// for this content. Absent when the touch speaks for every server.
+				// This is the join key for the issue's observability contract: a
+				// `silent` row in `lsp_aux_wait_outcome` must appear here, on a touch
+				// whose `confirmation` is `"partial"`.
+				...(auxUnconfirmedServerIds !== undefined && {
+					auxUnconfirmedServerIds,
+				}),
+				// #1459: scanners this touch does not speak for because their breaker
+				// was open, or because the resync gate deferred their write. Separate
+				// fields because these two doors open BEFORE any wait, so neither can
+				// appear in an `lsp_aux_wait_outcome` row on the sweep path. Absent
+				// when every configured scanner got this content.
+				...(brokenSkippedServerIds.length > 0 && { brokenSkippedServerIds }),
+				...(notifyDeferredServerIds.length > 0 && {
+					deferredResyncServerIds: notifyDeferredServerIds,
+				}),
 			},
 		});
 		return result;
@@ -3413,17 +4192,37 @@ export class LSPService {
 		// Full mode: 400ms grace — wait a bit for other clients to catch up.
 		const graceMs = diagnosticsMode === "document" ? 0 : EARLY_UNBLOCK_GRACE_MS;
 
-		// R8 (#714): per-promise role descriptors so raceToCompletion can apply
-		// a bounded aux grace once all primary-role promises have settled.
-		// Servers with role:"auxiliary" (opengrep, ast-grep, zizmor, …) get at
-		// most PI_LENS_AUX_GRACE_MS (default 500ms) after the primary settles;
-		// late arrivals are dropped (advisory only — they land in the client
+		// R8 (#714) / #1458 S2: per-promise role descriptors so raceToCompletion
+		// can apply a bounded aux grace once all primary-role promises have
+		// settled. Servers with role:"auxiliary" (opengrep, ast-grep, zizmor, …)
+		// get their OWN declared `aggregateWaitMs` budget after the primary
+		// settles, capped by the PI_LENS_AUX_GRACE_MS global ceiling (default
+		// 2000ms) — the same "declared budget, capped by a ceiling" shape
+		// `touchFile`'s with-auxiliary push wait uses, so this lane can no longer
+		// starve a scanner whose measured warm run (e.g. opengrep ~1.3s) is
+		// shorter than the ceiling but longer than a flat short grace. Late
+		// arrivals are still dropped (advisory only — they land in the client
 		// cache and surface on the next edit). Primary-only callers have no
 		// auxiliary descriptors, so this path is never entered and there is
 		// zero behavior change for the single-server hot path.
-		const diagDescriptors: PromiseDescriptor[] = spawned.map((entry) => ({
-			role: entry.info.role === "auxiliary" ? "auxiliary" : "primary",
-		}));
+		const diagDescriptors: PromiseDescriptor[] = spawned.map((entry) => {
+			if (entry.info.role !== "auxiliary") return { role: "primary" };
+			const strategy = getStrategy(
+				entry.info.id,
+				entry.client.getLaunchVariant?.(),
+			);
+			// Deleting this `budgetMs` fails no end-to-end test, and that is
+			// expected rather than a coverage gap: every promise in `clientWaits`
+			// already self-bounds at this same `strategy.aggregateWaitMs`, so an
+			// auxiliary cuts itself off at its declared budget whether or not the
+			// shared grace timer also knows about it. The descriptor is what keeps
+			// the two agreeing — it is the mitigation for the over-granting
+			// `raceToCompletion` documents, and it starts mattering the moment a
+			// promise here stops self-bounding. The narrowing itself is pinned in
+			// tests/clients/lsp/aggregation.test.ts, which can build the
+			// non-self-bounded promises this path cannot.
+			return { role: "auxiliary", budgetMs: strategy.aggregateWaitMs };
+		});
 
 		// Result-aware racing: trigger early-unblock when any client has results,
 		// OR when a seedFirstPush server returns (its first push is authoritative
@@ -3446,7 +4245,10 @@ export class LSPService {
 				),
 				graceMs,
 				descriptors: diagDescriptors,
-				auxGraceMs: readEnvAuxGraceMs(),
+				// #1458 S2: ceiling, not a flat wait — each auxiliary's own
+				// budgetMs (above) determines the actual per-touch grace up to
+				// this cap. Matches touchFile's `readEnvAuxGraceMs() ?? 2000`.
+				auxGraceMs: readEnvAuxGraceMs() ?? 2000,
 			},
 		);
 
@@ -3544,8 +4346,15 @@ export class LSPService {
 		return merged;
 	}
 
+	/**
+	 * Delegates to {@link hashDiagnosticContent} rather than re-hashing here. Every
+	 * comparison this hash takes part in (`publishedThisContent`, the carried-aux
+	 * check, the last-known content guard) is against a hash the client produced
+	 * with that function, so the two implementations must agree byte for byte —
+	 * a duplicate is a silent divergence waiting for one of them to be tuned.
+	 */
 	private hashContent(content: string): string {
-		return createHash("sha256").update(content).digest("hex");
+		return hashDiagnosticContent(content);
 	}
 
 	/**
@@ -4759,7 +5568,17 @@ export class LSPService {
 				// answer, so `available` implies confirmed) — wrap it as `{ diags }`;
 				// the incumbent branch already returns the wrapper.
 				const touchResult = attached?.available
-					? { diags: attached.response.diagnostics }
+					? {
+							diags: attached.response.diagnostics,
+							// #1470: the incumbent's coverage gap crosses the socket as an
+							// explicit DTO field, so carry it onto the wrapper the sweep
+							// reads. Dropping it here would let a partially covered
+							// incumbent answer be persisted as a confirmed sweep result —
+							// the same false clean this change closes on the local route.
+							...(attached.response.unconfirmedServerIds !== undefined && {
+								unconfirmedServerIds: attached.response.unconfirmedServerIds,
+							}),
+						}
 					: await withDeadline(
 							this.touchFile(filePath, content, {
 								diagnostics: "document",
@@ -4784,7 +5603,24 @@ export class LSPService {
 				// `perFileMs` deadline, which only catches a touch that never returned at
 				// all within budget. Either one means the result wasn't confirmed.
 				const inconclusive = touchResult?.inconclusive === true;
-				const timedOut = touchResult === undefined || inconclusive;
+				// #1470/#1493: an auxiliary that never reported — cut off by the grace
+				// timer, or silent with nothing published for this content — is the
+				// THIRD reason this result is not a confirmed observation, and it is
+				// deliberately not `inconclusive`. The
+				// record loop below persists every `!timedOut` result into the workspace
+				// cache, so reading `inconclusive` alone caches a partially covered
+				// answer as clean and replays it on every later sweep. The warm-attach
+				// incumbent reaches this branch through the aux GRACE wait (its touch
+				// runs `clientScope: "with-auxiliary"`), where all three no-answer shapes
+				// arise. #1459 added the two pre-wait doors for the sweep's own local
+				// `clientScope: "all"` touch — a scanner whose breaker was open, or whose
+				// resync the fan-out gate deferred. #1533 closed the last hole: `"all"`
+				// still never enters the grace wait, but it now derives the SAME evidence
+				// from post-wait state, so a silent auxiliary narrows this scope too
+				// instead of aggregating as a confirmed clean. Every route is gated here.
+				const coverageGap = touchCoverageGap(touchResult).length > 0;
+				const timedOut =
+					touchResult === undefined || inconclusive || coverageGap;
 				if (timedOut) timedOutFiles += 1;
 				// #1104 (shape 5 — AGENTS.md): the touch's content binding is an
 				// EXPLICIT enumerable field on the wrapper now (#1179), so it survives
@@ -5273,6 +6109,10 @@ export class LSPService {
 		});
 		this.state.clients.clear();
 		this.state.broken.clear();
+		// #1459: every gated client is gone, so no outstanding-write record can
+		// describe a live one. The gate's identity check already neutralises a stale
+		// entry; clearing keeps the map honest rather than relying on that.
+		this.outstandingAuxNotifyWrites.clear();
 		this.workspaceProbeLogged.clear();
 		this.warmStartLogged.clear();
 	}

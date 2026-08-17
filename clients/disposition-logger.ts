@@ -49,6 +49,11 @@ export interface DispositionLogEntry {
 	/** The store entry's disposition this mark overwrote, when it did — the
 	 * re-mark history the latest-wins store loses. */
 	previousDisposition?: string;
+	/** Model/provider active when the mark was made, when known (#1448 class
+	 * sweep — same optional-attribution pattern as WorklogEntry). Blank when
+	 * the runtime doesn't know its identity. */
+	model?: string;
+	provider?: string;
 }
 
 export function logDispositionEvent(entry: DispositionLogEntry): void {

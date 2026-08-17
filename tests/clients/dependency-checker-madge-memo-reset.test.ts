@@ -25,7 +25,18 @@ import { removeTempDirSync, setupTestEnvironment } from "./test-utils.js";
 const findNodeToolBinary = vi.fn();
 const ensureTool = vi.fn();
 const isSpawnableCommand = vi.fn();
-const MANAGED_TOOLS_DIR = path.posix.join("/fake", "pi-lens", "tools");
+// Must be fully qualified under the HOST's semantics (`isFullyQualified` in
+// clients/path-utils.ts), not just POSIX-absolute — on win32 a leading "/"
+// alone is ambient-drive-relative, not fully qualified, so a POSIX-only fake
+// dir silently fails `classifyMadgeKind`'s `isFullyQualified(resolved)` gate
+// and every resolution classifies as "path" instead of "managed" (#1498).
+// `path.join` (host-native, not `path.posix`) keeps the constructed path
+// consistent with `path.relative`'s host semantics too, which the
+// managed-vs-local/global classification in `isWithin` relies on.
+const MANAGED_TOOLS_DIR = path.join(
+	process.platform === "win32" ? String.raw`C:\fake\pi-lens` : "/fake/pi-lens",
+	"tools",
+);
 
 vi.mock("../../clients/package-manager.js", () => ({ findNodeToolBinary }));
 vi.mock("../../clients/installer/index.js", () => ({
@@ -82,7 +93,7 @@ describe("madge managed-path memo reset hook (#1276)", () => {
 		// directly (this is what `finishInstallAttempt` now calls on success).
 		resetMadgeManagedPathMemo();
 
-		const managed = path.posix.join(
+		const managed = path.join(
 			MANAGED_TOOLS_DIR,
 			"node_modules",
 			".bin",

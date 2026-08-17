@@ -11,6 +11,8 @@ import { resetDegradationLedger } from "./degradation-ledger.js";
 import type { DependencyChecker } from "./dependency-checker.js";
 import { getDiagnosticTracker } from "./diagnostic-tracker.js";
 import { resetDispatchAvailabilityState } from "./dispatch/runners/utils/runner-helpers.js";
+import { resetInstallRetryLatches } from "./dispatch/runners/utils/availability-policy.js";
+import { resetPsScriptAnalyzerAvailability } from "./dispatch/runners/psscriptanalyzer.js";
 import type { FileKind } from "./file-kinds.js";
 import { clearAllSessions as clearFileTimeSessions } from "./file-time.js";
 import {
@@ -93,6 +95,7 @@ import { isWarmAttached } from "./warm-attach.js";
 import { setSessionLanguages } from "./widget-state.js";
 import { logWordIndex } from "./word-index-logger.js";
 import { resetWorkspaceTopology } from "./workspace-topology.js";
+import { resetZizmorTokenAvailability } from "./zizmor-config.js";
 
 interface SessionStartDeps {
 	ctxCwd?: string;
@@ -1841,6 +1844,21 @@ export async function handleSessionStart(
 	// the tool for the rest of the process lifetime. Clear it here, same
 	// boundary as the other per-session caches on this line.
 	resetDispatchAvailabilityState();
+	// #1535: same #1266 pattern, one caller earlier — the `gh auth token` latch
+	// zizmor's spawn reads is process-lived storage whose durability contract is
+	// per SESSION, not per process. Without this, a user who runs `gh auth
+	// login` and starts a fresh session still reads the previous session's
+	// stale "no token" verdict until the cooldown (if any) happens to expire.
+	resetZizmorTokenAvailability();
+	// psscriptanalyzer's two latches are module-local, so the generation counter
+	// above does not reach them (#1490).
+	resetPsScriptAnalyzerAvailability();
+	// #1497: the install-class retry ceiling is terminal for a SESSION, but the
+	// latches holding it live on process-lived client instances (bootstrap builds
+	// them once). Same #1266/#1490/#1535 shape — without this line "terminal for
+	// the session" is terminal for the process, and a repaired network never
+	// re-earns its `go install`.
+	resetInstallRetryLatches();
 	// #1123 item 3: a fresh session can re-report smells that a prior session
 	// already surfaced once (see `checkSmellsAndNoteOnce`'s once-per-session gate).
 	resetSmellsSessionState();

@@ -116,6 +116,10 @@ describe("countRecentSmells", () => {
 		writeLines(path.join(tmpDir, "bus-events.log"), [
 			staleCtxLine(),
 			staleCtxLine(),
+			JSON.stringify({
+				outcome: "skipped_stale_session",
+				error: "Error: ctx is stale after session replacement",
+			}),
 			JSON.stringify({ outcome: "emitted", event: "x" }),
 			JSON.stringify({ outcome: "emit_failed", error: "ECONNRESET" }),
 			"not json at all",
@@ -185,6 +189,15 @@ describe("countRecentSmells", () => {
 		expect(countRecentSmells(tmpDir, sessionStartMs).staleCtxEmitFailed).toBe(1);
 	});
 
+	it("excludes pre-window rows and counts rows inside the rolling fallback window", () => {
+		const now = Date.now();
+		writeLines(path.join(tmpDir, "bus-events.log"), [
+			staleCtxLine(new Date(now - 25 * 60 * 60_000).toISOString()),
+			staleCtxLine(new Date(now - 23 * 60 * 60_000).toISOString()),
+		]);
+		expect(countRecentSmells(tmpDir).staleCtxEmitFailed).toBe(1);
+	});
+
 	it("does not report matching rows without a parseable timestamp when scoped", () => {
 		// An explicitly unparseable ts, NOT the helper default (which is
 		// `new Date().toISOString()` — a valid current timestamp that on a fast
@@ -245,6 +258,10 @@ describe("formatSmellsHealthLine (always-on)", () => {
 		});
 		expect(line).toContain("stale-ctx emit_failed=0");
 		expect(line).toContain("opengrep respawn=0");
+		// S3c (#1432 review): /lens-health has no session boundary to anchor to
+		// and falls back to the 24h rolling window — label it explicitly rather
+		// than the ambiguous "recent tail-scan".
+		expect(line).toContain("last 24h tail-scan");
 	});
 });
 

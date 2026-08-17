@@ -17,7 +17,14 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { isCommandAvailableAsync, safeSpawnAsync } from "./safe-spawn.js";
+import {
+	type AvailabilityLatch,
+	classifyProbeFailure,
+	createAvailabilityLatch,
+	logAvailabilityDecision,
+	startHostStallSampler,
+} from "./dispatch/runners/utils/availability-policy.js";
+import { safeSpawnAsync } from "./safe-spawn.js";
 
 export type NodePackageManager = "npm" | "pnpm" | "yarn" | "bun";
 
@@ -90,20 +97,107 @@ function readPackageManagerField(
 // AVAILABILITY (cached per process; reset in tests)
 // ============================================================================
 
-const availabilityCache = new Map<NodePackageManager, Promise<boolean>>();
+/**
+ * Budget for the `where`/`which <pm>` probe. Matches the previous
+ * `isCommandAvailableAsync` default so the observable timing is unchanged.
+ */
+const PROBE_TIMEOUT_MS = 5_000;
+
+/**
+ * A timed-out probe used to be memoized as a permanent `false` — the process
+ * would silently downgrade a declared pnpm/yarn manager to npm for its whole
+ * life. The blast radius was internal: this resolver only serves installs
+ * into pi-lens's own managed tools directory and `pilens_rebuild` on a
+ * pi-lens source checkout, never a user project's lockfile (#1496). Each
+ * manager now sits behind the shared transient-aware latch (#1467/#1476):
+ * only a genuine absence (`where`/`which` exits non-zero, or ENOENT) latches;
+ * a timeout, abort or host stall expires on a cooldown and is re-probed.
+ */
+const availabilityLatches = new Map<NodePackageManager, AvailabilityLatch>();
+const inFlightProbes = new Map<NodePackageManager, Promise<boolean>>();
+
+function getLatch(pm: NodePackageManager): AvailabilityLatch {
+	let latch = availabilityLatches.get(pm);
+	if (!latch) {
+		latch = createAvailabilityLatch();
+		availabilityLatches.set(pm, latch);
+	}
+	return latch;
+}
+
+async function probeAvailability(pm: NodePackageManager): Promise<boolean> {
+	const latch = getLatch(pm);
+	const startedAt = Date.now();
+	const finder = onWindows() ? "where" : "which";
+	const sampler = startHostStallSampler();
+	let result: Awaited<ReturnType<typeof safeSpawnAsync>>;
+	let hostStallMs: number;
+	try {
+		result = await safeSpawnAsync(finder, [pm], { timeout: PROBE_TIMEOUT_MS });
+	} finally {
+		hostStallMs = sampler.stop();
+	}
+	const elapsedMs = Date.now() - startedAt;
+
+	if (result.status === 0 && !result.error) {
+		latch.noteAvailable();
+		logAvailabilityDecision({
+			tool: pm,
+			verdict: "available",
+			outcome: "success",
+			cause: "ok",
+			elapsedMs,
+			latched: true,
+			hostStallMs,
+			budgetMs: PROBE_TIMEOUT_MS,
+		});
+		return true;
+	}
+
+	const { outcome, cause, evidence } = classifyProbeFailure(result, {
+		hostStallMs,
+		// Preserve pre-#1496 meaning for anything the classifier can't place: a
+		// present manager that rejects its probe is durable, same as before.
+		unclassifiedFailureOutcome: "missing",
+	});
+	const retryAfterMs = latch.noteUnavailable(outcome, cause);
+	logAvailabilityDecision({
+		tool: pm,
+		verdict: "unavailable",
+		outcome,
+		cause,
+		elapsedMs,
+		latched: outcome !== "transient",
+		hostStallMs,
+		...(retryAfterMs > 0 && { retryAfterMs }),
+		budgetMs: PROBE_TIMEOUT_MS,
+		classifiedBy: "probe",
+		evidence,
+	});
+	return false;
+}
 
 function isAvailable(pm: NodePackageManager): Promise<boolean> {
-	let cached = availabilityCache.get(pm);
-	if (!cached) {
-		cached = isCommandAvailableAsync(pm);
-		availabilityCache.set(pm, cached);
-	}
-	return cached;
+	const latch = getLatch(pm);
+	const memo = latch.read();
+	if (memo !== null) return Promise.resolve(memo);
+
+	// A verdict can now expire, so concurrent callers arriving just after a
+	// cooldown must share ONE probe rather than each spawning their own.
+	const inFlight = inFlightProbes.get(pm);
+	if (inFlight) return inFlight;
+
+	const probe = probeAvailability(pm).finally(() => {
+		inFlightProbes.delete(pm);
+	});
+	inFlightProbes.set(pm, probe);
+	return probe;
 }
 
 /** Clear the process-wide availability cache. Intended for tests. */
 export function _resetPackageManagerCache(): void {
-	availabilityCache.clear();
+	availabilityLatches.clear();
+	inFlightProbes.clear();
 }
 
 // ============================================================================

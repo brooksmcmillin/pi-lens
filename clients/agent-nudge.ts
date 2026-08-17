@@ -266,12 +266,19 @@ export function wireAgentNudgeSubscriber(
  *   - all local         → "after your last turn" (the original #485 wording,
  *                         unchanged — verified by the pre-existing #485
  *                         tests);
- *   - all cross-process → "by another pi-lens instance (e.g. a subagent's)";
- *   - mixed             → "after your last turn (N of them by another
- *                         pi-lens instance)" — the base framing stays local
+ *   - all cross-process → "by an automatic run outside your turn";
+ *   - mixed             → "after your last turn (N of them by an automatic
+ *                         run outside it)" — the base framing stays local
  *                         and the cross-process portion is counted out
- *                         precisely, so no local file is ever misattributed
- *                         to another instance.
+ *                         precisely, so no local file is ever misattributed.
+ *
+ * The cross-process wording names the ACTION, not the process identity. It
+ * used to read "by another pi-lens instance (e.g. a subagent's)", which sent
+ * agents investigating what other instance was running — the exact behavior
+ * this nudge exists to prevent. Which process formatted the file is an
+ * implementation detail the reading agent cannot act on; that it was an
+ * automatic run outside their turn is the whole actionable content. The
+ * origin split stays exact in the telemetry for human debugging.
  *
  * Clears the accumulator ONLY here, on actual injection — never on
  * agent_end/agent_settled/turn_start. Files formatted at the last turn_end of
@@ -329,10 +336,10 @@ export function consumeAgentNudge(
 		// and calls out the cross-process portion by exact count.
 		const attribution =
 			localCount === 0
-				? "by another pi-lens instance (e.g. a subagent's)"
+				? "by an automatic run outside your turn"
 				: crossProcessCount === 0
 					? "after your last turn"
-					: `after your last turn (${crossProcessCount} of them by another pi-lens instance)`;
+					: `after your last turn (${crossProcessCount} of them by an automatic run outside it)`;
 		const message = `pi-lens: ${filesTotal} file(s) were ${verbLabel} ${attribution}: ${nameList} — working-tree changes to these are expected; re-read before editing.`;
 
 		logLatency({

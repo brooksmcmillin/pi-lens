@@ -1,5 +1,11 @@
 import { performance } from "node:perf_hooks";
-import { PI_LENS_EVAL_STARTED_MS } from "./console-guard-install.js";
+// #1434 S3d: import the constant from the side-effect-free module, not from
+// `console-guard-install.ts` — that module installs the console guard as an
+// import side effect, so importing it here (for a single constant, from a
+// module measuring load time) would have silently installed the guard
+// wherever this file is imported, including test-only measurement code that
+// has no business flipping a global switch.
+import { PI_LENS_EVAL_STARTED_MS } from "./eval-timestamp.js";
 
 /**
  * Startup timing for pi-lens.

@@ -16,6 +16,15 @@ import {
 import { getProjectIgnoreGlobs } from "./file-utils.js";
 import { findGlobalBinary } from "./package-manager.js";
 import { safeSpawnAsync, type SpawnResult } from "./safe-spawn.js";
+import {
+	type AvailabilityCause,
+	type ProbeEvidence,
+	classifyProbeFailure,
+	describeInstallAttempt,
+	createAvailabilityLatch,
+	logAvailabilityDecision,
+	startHostStallSampler,
+} from "./dispatch/runners/utils/availability-policy.js";
 
 /**
  * Build the `bash -c` argv that runs `cmd` with `allArgs` as POSITIONAL
@@ -109,6 +118,8 @@ export interface SgScanResult {
 }
 
 const DEFAULT_EXEC_TIMEOUT_MS = 30_000;
+/** Budget for a single `--version` candidate probe, ms. */
+const PROBE_TIMEOUT_MS = 5_000;
 const MAX_SG_OUTPUT_BYTES = 8 * 1024 * 1024;
 
 /**
@@ -171,8 +182,31 @@ export class SgRunner {
 	private log: (msg: string) => void;
 	private sgPath: string | null = null;
 	private sgArgsPrefix: string[] = [];
-	private available: boolean | null = null;
+	/**
+	 * Availability memo, backed by the shared transient-aware latch (#1476).
+	 *
+	 * Before this, one failed sweep over every candidate — timeouts included —
+	 * latched `false` for the life of the process AND ran a full auto-install
+	 * first. A host stall during warm-up therefore both disabled ast-grep until
+	 * restart and paid for an install nobody needed.
+	 */
+	private readonly availabilityLatch = createAvailabilityLatch();
 	private ensureInFlight: Promise<boolean> | null = null;
+	/**
+	 * Whether a DIRECT candidate — one that would have been ast-grep itself —
+	 * failed for a transient reason in the current sweep. Only these block the
+	 * install: a slow `npx` says nothing about whether ast-grep is on this
+	 * machine, and letting it block turned "ast-grep is genuinely absent on a
+	 * slow host" into "ast-grep is never installed and npx is re-spawned every
+	 * sweep, forever".
+	 */
+	private sweepSawTransient = false;
+	private sweepTransientCause: AvailabilityCause = "probe-timeout";
+	/** A transient on the npx fallback: not evidence, but not nothing either. */
+	private sweepFallbackTransient = false;
+	private sweepFallbackCause: AvailabilityCause = "probe-timeout";
+	/** Host stall summed over every probe of the current sweep, ms. */
+	private sweepHostStallMs = 0;
 
 	constructor(verbose = false) {
 		this.log = verbose
@@ -189,8 +223,10 @@ export class SgRunner {
 	 * `KnipClient.ensureAvailable` and `DependencyChecker.ensureAvailable`.
 	 */
 	async ensureAvailable(): Promise<boolean> {
-		// Fast path: already checked.
-		if (this.available !== null) return this.available;
+		// Fast path: already decided. `read()` returns null when the last verdict
+		// was transient and its cooldown expired, which re-enters the sweep.
+		const memo = this.availabilityLatch.read();
+		if (memo !== null) return memo;
 		if (this.ensureInFlight) return this.ensureInFlight;
 
 		this.ensureInFlight = this.doEnsureAvailable();
@@ -202,18 +238,27 @@ export class SgRunner {
 	}
 
 	private async doEnsureAvailable(): Promise<boolean> {
+		const startedAt = Date.now();
+		this.sweepSawTransient = false;
+		this.sweepTransientCause = "probe-timeout";
+		this.sweepFallbackTransient = false;
+		this.sweepFallbackCause = "probe-timeout";
+		this.sweepHostStallMs = 0;
+
 		// Step 1: PATH — canonical binary names + npx fallback.
 		// Prefer ast-grep over sg on Linux: /usr/bin/sg is util-linux, not ast-grep.
 		const pathCommand = await this.probeCommandCandidates([
 			{ cmd: "ast-grep", argsPrefix: [] },
 			{ cmd: "sg", argsPrefix: [] },
-			{ cmd: "npx", argsPrefix: ["--no", "--", "ast-grep"] },
+			// `npx --no -- ast-grep` starts a Node process before it can answer, so
+			// it is the candidate most likely to blow a 5 s budget on a cold or busy
+			// box. Marked a fallback so its timeout cannot veto the install.
+			{ cmd: "npx", argsPrefix: ["--no", "--", "ast-grep"], fallback: true },
 		]);
 		if (pathCommand) {
 			this.sgPath = pathCommand.cmd;
 			this.sgArgsPrefix = pathCommand.argsPrefix;
-			this.available = true;
-			this.log(`ast-grep found on PATH: ${pathCommand.cmd}`);
+			this.noteAvailable(startedAt, `ast-grep found on PATH: ${pathCommand.cmd}`);
 			return true;
 		}
 
@@ -226,8 +271,7 @@ export class SgRunner {
 			if (globalBin && (await this.probeCommand(globalBin, []))) {
 				this.sgPath = globalBin;
 				this.sgArgsPrefix = [];
-				this.available = true;
-				this.log(`ast-grep found in global bin: ${globalBin}`);
+				this.noteAvailable(startedAt, `ast-grep found in global bin: ${globalBin}`);
 				return true;
 			}
 		}
@@ -239,8 +283,10 @@ export class SgRunner {
 		if (platformBinary) {
 			this.sgPath = platformBinary;
 			this.sgArgsPrefix = [];
-			this.available = true;
-			this.log(`ast-grep found via platform package: ${platformBinary}`);
+			this.noteAvailable(
+				startedAt,
+				`ast-grep found via platform package: ${platformBinary}`,
+			);
 			return true;
 		}
 
@@ -250,10 +296,30 @@ export class SgRunner {
 			if (brewBinary) {
 				this.sgPath = brewBinary;
 				this.sgArgsPrefix = [];
-				this.available = true;
-				this.log(`ast-grep found via Homebrew: ${brewBinary}`);
+				this.noteAvailable(startedAt, `ast-grep found via Homebrew: ${brewBinary}`);
 				return true;
 			}
+		}
+
+		// A timeout on a DIRECT candidate means the machine answered, not the tool
+		// (#1476). Installing ast-grep because the host event loop stalled is a
+		// heavyweight reaction to a hiccup, and latching the result disabled the
+		// tool until restart. Retry the sweep later instead.
+		//
+		// The npx fallback is deliberately NOT part of this test. Gating the
+		// install on it regressed the very host this change targets: a slow box
+		// with no ast-grep timed out `npx --no -- ast-grep` every sweep, so the
+		// install below was never reached and the slow npx was re-spawned on each
+		// escalating retry instead — worse than the latch it replaced.
+		if (this.sweepSawTransient) {
+			this.log(
+				"ast-grep availability probe timed out; will retry (not installing)",
+			);
+			return this.noteUnavailable(
+				startedAt,
+				"transient",
+				this.sweepTransientCause,
+			);
 		}
 
 		// Step 4: install via the typed shared seam, then validate the returned
@@ -269,12 +335,88 @@ export class SgRunner {
 		if (installed.outcome === "success") {
 			this.sgPath = installed.value;
 			this.sgArgsPrefix = [];
-			this.available = true;
-			this.log(`ast-grep auto-installed: ${installed.value}`);
+			this.noteAvailable(startedAt, `ast-grep auto-installed: ${installed.value}`);
 			return true;
 		}
 
-		this.available = false;
+		// The install failed AND the npx fallback never got a fair hearing, so
+		// "ast-grep is not installed" is not a fact yet. Expire the verdict.
+		if (this.sweepFallbackTransient) {
+			return this.noteUnavailable(
+				startedAt,
+				"transient",
+				this.sweepFallbackCause,
+			);
+		}
+		// #1500: ASSERTED, not derived — and justified, because every candidate
+		// probe answered "not found", so the absence is real. What the install did
+		// is recorded as evidence rather than folded into the verdict: it is the one
+		// fact separating "never installable here" from "the download failed", and
+		// from "no install was attempted at all" (auto-install off, trust denied,
+		// or an attempt already suppressed this session).
+		const { getInstallAttempt } = await import("./installer/index.js");
+		return this.noteUnavailable(
+			startedAt,
+			"missing",
+			"not-found",
+			describeInstallAttempt(getInstallAttempt("ast-grep"), {
+				installedButRejected: installed.outcome === "non-installable",
+			}),
+			"caller",
+		);
+	}
+
+	/** Record a successful sweep: available, latched, one decision record. */
+	private noteAvailable(startedAt: number, message: string): void {
+		this.availabilityLatch.noteAvailable();
+		this.log(message);
+		logAvailabilityDecision({
+			tool: "ast-grep",
+			verdict: "available",
+			outcome: "success",
+			cause: "ok",
+			elapsedMs: Date.now() - startedAt,
+			latched: true,
+			hostStallMs: this.sweepHostStallMs,
+			budgetMs: PROBE_TIMEOUT_MS,
+		});
+	}
+
+	/**
+	 * Record a failed sweep. A `transient` outcome expires after a bounded
+	 * cooldown; anything else is remembered for the session, as before. The
+	 * elapsed/stall numbers describe the WHOLE sweep, because the verdict is
+	 * about the sweep rather than any single candidate — reporting zero here
+	 * would erase the evidence that cracked #1467.
+	 */
+	private noteUnavailable(
+		startedAt: number,
+		outcome: "missing" | "transient",
+		cause: AvailabilityCause,
+		evidence?: ProbeEvidence,
+		/**
+		 * How this arm reached its verdict. Per arm on purpose (#1500 review): the
+		 * sweep's own transient/missing conclusions ARE derived from candidate
+		 * probes, but the post-install assertion is not, and hardcoding `"probe"`
+		 * here labelled an assertion as a derivation — the exact confusion the
+		 * field was added to remove.
+		 */
+		classifiedBy: "probe" | "caller" = "probe",
+	): false {
+		const retryAfterMs = this.availabilityLatch.noteUnavailable(outcome, cause);
+		logAvailabilityDecision({
+			tool: "ast-grep",
+			verdict: "unavailable",
+			outcome,
+			cause,
+			elapsedMs: Date.now() - startedAt,
+			latched: outcome !== "transient",
+			hostStallMs: this.sweepHostStallMs,
+			...(retryAfterMs > 0 && { retryAfterMs }),
+			budgetMs: PROBE_TIMEOUT_MS,
+			classifiedBy,
+			...(evidence !== undefined && { evidence }),
+		});
 		return false;
 	}
 
@@ -360,25 +502,61 @@ export class SgRunner {
 		return /\bast[- ]grep\b/i.test(output);
 	}
 
+	/**
+	 * Probe one candidate. A failure is CLASSIFIED, not merely counted: a
+	 * timeout/abort marks the whole sweep transient so the caller retries later
+	 * instead of installing and latching. A command that answers but is not
+	 * ast-grep (Linux `/usr/bin/sg` is util-linux) is a durable no.
+	 */
 	private async probeCommand(
 		cmd: string,
 		argsPrefix: string[],
+		fallback = false,
 	): Promise<boolean> {
-		const result = await safeSpawnAsync(cmd, [...argsPrefix, "--version"], {
-			timeout: 5000,
-		});
-		return (
+		// Host-side budget: measure the loop stall that overlapped the window so
+		// the classifier can tell "the tool is slow" from "the host was busy".
+		const sampler = startHostStallSampler();
+		let result: Awaited<ReturnType<typeof safeSpawnAsync>>;
+		let hostStallMs: number;
+		try {
+			result = await safeSpawnAsync(cmd, [...argsPrefix, "--version"], {
+				timeout: PROBE_TIMEOUT_MS,
+			});
+		} finally {
+			hostStallMs = sampler.stop();
+			this.sweepHostStallMs += hostStallMs;
+		}
+		if (
 			!result.error &&
 			result.status === 0 &&
 			this.isAstGrepVersionOutput(`${result.stdout}\n${result.stderr}`)
-		);
+		) {
+			return true;
+		}
+		const { outcome, cause } = classifyProbeFailure(result, { hostStallMs });
+		if (outcome === "transient") {
+			if (fallback) {
+				this.sweepFallbackTransient = true;
+				this.sweepFallbackCause = cause;
+			} else {
+				this.sweepSawTransient = true;
+				this.sweepTransientCause = cause;
+			}
+		}
+		return false;
 	}
 
 	private async probeCommandCandidates(
-		candidates: Array<{ cmd: string; argsPrefix: string[] }>,
+		candidates: Array<{ cmd: string; argsPrefix: string[]; fallback?: boolean }>,
 	): Promise<{ cmd: string; argsPrefix: string[] } | undefined> {
 		for (const candidate of candidates) {
-			if (await this.probeCommand(candidate.cmd, candidate.argsPrefix)) {
+			if (
+				await this.probeCommand(
+					candidate.cmd,
+					candidate.argsPrefix,
+					candidate.fallback ?? false,
+				)
+			) {
 				return candidate;
 			}
 		}

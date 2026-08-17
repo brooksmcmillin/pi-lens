@@ -450,6 +450,22 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 						syntheticAttachmentBytes + blockBytes >
 							AUTHORITATIVE_CONTENT_MAX_BYTES
 					) {
+						// S3e (#1432 review): this is the SECOND
+						// `authoritative_content_attachment_decision` row for `wp` —
+						// the synthetic `handleToolResult` call above already logged
+						// an "attached" row for the same path under its per-file
+						// cap. This outer, aggregate-budget row is logged later and
+						// is the one that matches what the caller actually sees
+						// (the re-read warning below, not the attachment), so it
+						// wins for `wp`; the inner "attached" row is a stale
+						// per-file view superseded by this shared-budget decision.
+						logLatency({
+							type: "phase",
+							phase: "authoritative_content_attachment_decision",
+							filePath: wp,
+							durationMs: 0,
+							metadata: { path: wp, bytes: blockBytes, decision: "aggregate-budget-degraded" },
+						});
 						syntheticWriteContent.push({
 							type: "text",
 							text: `⚠️ **File was modified by auto-format/fix. You MUST re-read ${wp} before making any further edits — the aggregate authoritative content for this command is too large to attach.**`,
@@ -781,6 +797,8 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 				sessionId: runtime.telemetrySessionId,
 				turnIndex: runtime.turnIndex,
 				writeIndex,
+				modelId: runtime.telemetryModelId,
+				provider: runtime.telemetryProviderId,
 			},
 			getFlag,
 			getFlagSource,
@@ -1121,6 +1139,25 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	const postMutation = result.postMutation;
 	const attachAuthoritativeContent = postMutation !== undefined &&
 		Buffer.byteLength(postMutation.content, "utf-8") <= AUTHORITATIVE_CONTENT_MAX_BYTES;
+	if (postMutation) {
+		const bytes = Buffer.byteLength(postMutation.content, "utf-8");
+		// S3e (#1432 review): when this call is the synthetic per-file
+		// `handleToolResult` recursion a multi-file bash write drives (see the
+		// bash branch above), the OUTER aggregate-budget loop may log a SECOND
+		// `authoritative_content_attachment_decision` row for this same
+		// `filePath` right after this one, downgrading an "attached" here to
+		// "aggregate-budget-degraded" once the shared budget is exhausted.
+		// Both rows are intentional (this one reflects the per-file cap
+		// decision; the outer one reflects the aggregate-budget decision that
+		// can override it) — the outer row, logged later, wins for that path.
+		logLatency({
+			type: "phase",
+			phase: "authoritative_content_attachment_decision",
+			filePath: postMutation.filePath,
+			durationMs: 0,
+			metadata: { path: postMutation.filePath, bytes, decision: attachAuthoritativeContent ? "attached" : "size-capped" },
+		});
+	}
 	const returnedContent = attachAuthoritativeContent
 		? [
 				...event.content,

@@ -25,4 +25,10 @@ describe("installer managed tool coverage", () => {
 		const missing = MANAGED_LSP_TOOL_IDS.filter((toolId) => !isKnownToolId(toolId));
 		expect(missing).toEqual([]);
 	});
+
+	it("pins the managed classic TypeScript compiler below TypeScript 7", async () => {
+		const { TOOLS } = await import("../../../clients/installer/index.ts");
+		const typescript = TOOLS.find((tool) => tool.id === "typescript");
+		expect(typescript?.packageName).toBe("typescript@5.9.3");
+	});
 });

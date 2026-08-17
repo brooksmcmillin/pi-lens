@@ -15,12 +15,15 @@ import { createPiMock } from "./support/pi-mock.js";
 // exercised end-to-end, not re-asserted by a mock.
 
 let mockedCounts = { staleCtxEmitFailed: 0, opengrepRespawn: 0 };
+const countRecentSmells = vi.fn(
+	(_root?: string, _sessionStartMs?: number) => mockedCounts,
+);
 vi.mock("../clients/smells-rollup.js", async (importActual) => {
 	const actual =
 		await importActual<typeof import("../clients/smells-rollup.js")>();
 	return {
 		...actual,
-		countRecentSmells: () => mockedCounts,
+		countRecentSmells,
 	};
 });
 
@@ -31,7 +34,7 @@ vi.mock("../clients/bootstrap.js", () => ({
 		knipClient: { isAvailable: () => false },
 		depChecker: { isAvailable: () => false },
 		testRunnerClient: { detectRunner: () => null },
-		deadCodeClients: {},
+		deadCodeClients: [],
 	}),
 }));
 vi.mock("../clients/runtime-turn.js", () => ({
@@ -74,6 +77,7 @@ describe("index turn_end smells-rollup wiring (#1123 item 3)", () => {
 	beforeEach(async () => {
 		vi.resetModules();
 		notify.mockClear();
+		countRecentSmells.mockClear();
 		mockedCounts = { staleCtxEmitFailed: 0, opengrepRespawn: 0 };
 		const { resetSmellsSessionState } = await import(
 			"../clients/smells-rollup.js"
@@ -97,6 +101,22 @@ describe("index turn_end smells-rollup wiring (#1123 item 3)", () => {
 		expect(calls).toHaveLength(1);
 		expect(String(calls[0][0])).toContain("stale-ctx emit_failed");
 		expect(calls[0][1]).toBe("warning");
+	});
+
+	it("passes the in-process session start, not the 24h fallback (S3c, #1432 review)", async () => {
+		mockedCounts = { staleCtxEmitFailed: 5, opengrepRespawn: 0 };
+		const before = Date.now();
+		await driveTurns(20);
+		const after = Date.now();
+		expect(countRecentSmells).toHaveBeenCalled();
+		const [rootArg, sessionStartArg] = countRecentSmells.mock.calls.at(-1)!;
+		expect(rootArg).toBeUndefined();
+		expect(sessionStartArg).toBeTypeOf("number");
+		// The session (and thus its recorded start) is created inside
+		// driveTurns, so it falls within [before, after] — nowhere near a
+		// 24h-ago fallback value.
+		expect(sessionStartArg as number).toBeGreaterThanOrEqual(before);
+		expect(sessionStartArg as number).toBeLessThanOrEqual(after);
 	});
 
 	it("does not notify again on turn 40 for a smell already notified this session", async () => {

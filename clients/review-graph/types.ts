@@ -142,9 +142,34 @@ export interface ReviewGraphPersistCoverage {
  */
 export type CascadeIndeterminateReason =
 	| "graph_degraded" // review graph skipped (too_many_files / unsafe_root)
-	| "missing_node" // changed file has no node in the (otherwise-built) graph
+	| "missing_node" // changed file has no node in the (otherwise-built) graph, and the graph SHOULD know it — a real gap
+	| "excluded_by_role" // #1445: changed file has no node because its role (test, #260) is excluded from the graph BY DESIGN — not a gap, never agent-facing
 	| "error" // the deferred compute threw before producing a result
 	| "lsp_binding_rejected"; // #1104: every degraded-fallback display candidate was binding-rejected (stale/pre-fix-edit snapshot) and withheld
+
+/**
+ * #1550: evidence for a `missing_node` verdict — what was SOUGHT and what the
+ * graph had NEAREST. LOG-ONLY, deliberately kept out of `detail`: the turn-end
+ * advisory groups runs BY `detail` string (#1104), so a per-file diagnostic
+ * there would fragment the grouping into one bucket per file and leak graph
+ * internals into agent-facing prose. Lets the next occurrence be diagnosed from
+ * the record alone — a cold/empty graph (`graphFileCount: 0`) reads differently
+ * from a healthy graph that simply never admitted this file
+ * (`sameDirFileCount > 0`), and from a graph inconsistency where the file node
+ * vanished but its symbol nodes survived (`symbolNodeCount > 0`).
+ */
+export interface CascadeMissingNodeDiagnostic {
+	/** The node id looked up, under the graph's own key normalization. */
+	soughtNodeId: string;
+	/** File nodes the graph did hold — 0 means a cold/empty graph, not a gap. */
+	graphFileCount: number;
+	/** Symbol nodes still keyed to the sought file. >0 is an inconsistency. */
+	symbolNodeCount: number;
+	/** Known file nodes in the sought file's own directory. */
+	sameDirFileCount: number;
+	/** Closest known file node: a same-basename twin, else a directory sibling. */
+	nearestFile?: string;
+}
 
 export interface CascadeIndeterminate {
 	reason: CascadeIndeterminateReason;
@@ -153,6 +178,8 @@ export interface CascadeIndeterminate {
 	/** Populated for `graph_degraded` from getLastGraphBuildInfo(). */
 	sourceFileCount?: number;
 	maxFileCount?: number;
+	/** #1550: log-only evidence for `missing_node` — never agent-facing. */
+	diagnostic?: CascadeMissingNodeDiagnostic;
 }
 
 export interface ImpactCascadeResult {

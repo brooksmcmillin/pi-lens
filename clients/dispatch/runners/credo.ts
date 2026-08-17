@@ -10,15 +10,22 @@ import type {
 import { PRIORITY } from "../priorities.js";
 import { createCwdCachedProbe } from "./utils/runner-helpers.js";
 
-// Per-cwd cached `mix credo --version` probe (#120). Before this, the probe
-// fired on every Elixir file save in projects with mix.exs.
-const probeCredo = createCwdCachedProbe(async (cwd) => {
-	const r = await safeSpawnAsync("mix", ["credo", "--version"], {
-		timeout: 10000,
-		cwd,
-	});
-	return !r.error && r.status === 0;
-});
+const CREDO_PROBE_BUDGET_MS = 10_000;
+
+// Per-cwd cached `mix credo --version` probe (#120), governed by the shared
+// availability policy (#1494). The probe returns the spawn result so the policy
+// can tell a cold-BEAM timeout from a genuinely absent credo: the 10 s budget
+// here is the widest in the repo and the most likely to expire on a slow first
+// compile, and latching that as "not installed" used to disable credo for the
+// rest of the session.
+const probeCredo = createCwdCachedProbe(
+	(cwd) =>
+		safeSpawnAsync("mix", ["credo", "--version"], {
+			timeout: CREDO_PROBE_BUDGET_MS,
+			cwd,
+		}),
+	{ tool: "credo", budgetMs: CREDO_PROBE_BUDGET_MS },
+);
 
 interface CredoIssue {
 	filename: string;

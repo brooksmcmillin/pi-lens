@@ -59,6 +59,81 @@ describe("pi_lens_activate_tools", () => {
 		expect(result.content[0]?.text).toContain("Before first use, read: /skills/ast/SKILL.md, /skills/lsp/SKILL.md");
 	});
 
+	it("mutates once per distinct tool and reports the actual added count", async () => {
+		let active = ["lens_diagnostics"];
+		const setCalls: string[][] = [];
+		const mutations: Array<Record<string, unknown>> = [];
+		const pi = {
+			getActiveTools: () => active,
+			setActiveTools: (names: string[]) => {
+				setCalls.push(names);
+				active = names;
+			},
+		};
+		const tool = createActivateToolsTool(pi, CATALOG, {
+			deferredToolSupport: () => false,
+			onMutation: (mutation) => mutations.push(mutation),
+		});
+
+		await tool.execute(
+			"monotonic-1",
+			{ tools: ["ast_grep_search"] },
+			undefined,
+			null,
+		);
+		const repeated = await tool.execute(
+			"monotonic-2",
+			{ tools: ["ast_grep_search"] },
+			undefined,
+			null,
+		);
+
+		expect(setCalls).toHaveLength(1);
+		expect(active).toEqual(["lens_diagnostics", "ast_grep_search"]);
+		expect(repeated.details).toEqual({
+			matches: ["ast_grep_search"],
+			added: [],
+			skillPaths: ["/skills/ast/SKILL.md"],
+		});
+		expect(mutations).toEqual([
+			expect.objectContaining({
+				addedCount: 1,
+				removedCount: 0,
+				reason: "lazy_activation",
+				deferralApplies: false,
+			}),
+		]);
+	});
+
+	// #1453: the extension has to remember what the model activated so it can
+	// restore that posture after the host rebuilds the session. A tool that is
+	// already active still has to be remembered — otherwise the next
+	// fork/reload/resume would drop it.
+	it("reports every requested tool to onActivated, already-active ones included", async () => {
+		let active = ["lens_diagnostics", "ast_grep_search"];
+		const activated: string[][] = [];
+		const pi = {
+			getActiveTools: () => active,
+			setActiveTools: (names: string[]) => {
+				active = names;
+			},
+		};
+		const tool = createActivateToolsTool(pi, CATALOG, {
+			onActivated: (names) => activated.push(names),
+		});
+
+		await tool.execute(
+			"remember-1",
+			{ tools: ["ast_grep_search", "lsp_navigation"] },
+			undefined,
+			null,
+		);
+		// No valid names: nothing to remember.
+		await tool.execute("remember-2", { tools: ["nope"] }, undefined, null);
+
+		expect(activated).toEqual([["ast_grep_search", "lsp_navigation"]]);
+	});
+
 	it("ignores unknown tool names not in the catalog", async () => {
 		const pi = {
 			getActiveTools: () => [],

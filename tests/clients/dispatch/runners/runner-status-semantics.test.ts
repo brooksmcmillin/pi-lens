@@ -18,7 +18,14 @@ const codeAction = vi.fn();
 // (shape-5 structural fix) — wrap a mocked diagnostics array in the same shape.
 const diagsResult = (
 	diags: unknown[],
-	extra: { inconclusive?: boolean } = {},
+	extra: {
+		inconclusive?: boolean;
+		// #1470: the narrowed confirmation an aux cut off by the grace timer
+		// produces — the touch is NOT inconclusive, but it no longer speaks for
+		// the named servers.
+		confirmation?: "confirmed" | "partial";
+		unconfirmedServerIds?: string[];
+	} = {},
 ) => ({ diags, ...extra });
 const readFileContent = vi.fn(() => "const x = 1;\n");
 const warmAttach = vi.hoisted(() => ({
@@ -303,6 +310,107 @@ describe("runner status/semantic edge cases", () => {
 			const result = await runner.run(ctx(filePath, env.tmpDir) as never);
 			expect(result.status).toBe("skipped");
 			expect(result.diagnostics).toEqual([]);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("lsp runner returns skipped for an EMPTY result whose auxiliary was cut off (#1470)", async () => {
+		// The practical shape from #1470: opengrep hangs, our grace timer cuts it
+		// off, the primary answers clean. The touch is deliberately NOT
+		// inconclusive (the primary's answer is real), so the pre-fix runner
+		// reported "succeeded / no-diagnostics" — a clean bill of health on the
+		// security lane for a scan that never ran. `RunnerResult` has no
+		// per-server coverage channel, so "skipped" is the honest verdict for an
+		// EMPTY result and the coverage notice says so.
+		const runner = (await import("../../../../clients/dispatch/runners/lsp.js"))
+			.default;
+		const env = setupTestEnvironment("pi-lens-lsp-cutoff-");
+		try {
+			const filePath = path.join(env.tmpDir, "main.ts");
+			fs.writeFileSync(filePath, "const x = 1;\n");
+
+			supportsLSP.mockReturnValue(true);
+			touchFile.mockResolvedValue(
+				diagsResult([], {
+					confirmation: "partial",
+					unconfirmedServerIds: ["opengrep"],
+				}),
+			);
+
+			const result = await runner.run(ctx(filePath, env.tmpDir) as never);
+			expect(result.status).toBe("skipped");
+			expect(result.diagnostics).toEqual([]);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("lsp runner still reports the PRIMARY's findings when only an auxiliary was cut off (#1470)", async () => {
+		// The other half of the narrowing: collapsing a partial touch to
+		// skipped/inconclusive across the board would discard a trustworthy
+		// primary answer. Real findings must still reach the agent.
+		const runner = (await import("../../../../clients/dispatch/runners/lsp.js"))
+			.default;
+		const env = setupTestEnvironment("pi-lens-lsp-cutoff-findings-");
+		try {
+			const filePath = path.join(env.tmpDir, "main.ts");
+			fs.writeFileSync(filePath, "const x = 1;\n");
+
+			supportsLSP.mockReturnValue(true);
+			codeAction.mockResolvedValue([]);
+			touchFile.mockResolvedValue(
+				diagsResult(
+					[
+						{
+							severity: 1,
+							message: "Type error",
+							range: {
+								start: { line: 0, character: 0 },
+								end: { line: 0, character: 5 },
+							},
+						},
+					],
+					{ confirmation: "partial", unconfirmedServerIds: ["opengrep"] },
+				),
+			);
+
+			const result = await runner.run(ctx(filePath, env.tmpDir) as never);
+			expect(result.status).toBe("failed");
+			expect(result.failureKind).toBe("blocking_diagnostics");
+			expect(result.diagnostics[0]?.message).toContain("Type error");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("lsp runner returns skipped for a warm-attached EMPTY result whose auxiliary was cut off (#1470)", async () => {
+		// The same #1470 shape as the incumbent-touch test above, but on the
+		// warm-attach IPC route: `available: true` with an empty diagnostics
+		// array and `unconfirmedServerIds` on the response DTO. The wrapper this
+		// runner builds from a warm-attach answer must carry that field through
+		// to `touchCoverageGap`, not drop it — a hung opengrep must not read as
+		// a clean bill of health here either.
+		const runner = (await import("../../../../clients/dispatch/runners/lsp.js"))
+			.default;
+		const env = setupTestEnvironment("pi-lens-lsp-warm-cutoff-");
+		try {
+			const filePath = path.join(env.tmpDir, "main.ts");
+			fs.writeFileSync(filePath, "const x = 1;\n");
+
+			warmAttach.diagnostics.mockResolvedValue({
+				available: true,
+				response: {
+					diagnostics: [],
+					confirmation: "partial",
+					unconfirmedServerIds: ["opengrep"],
+				},
+			});
+
+			const result = await runner.run(ctx(filePath, env.tmpDir) as never);
+			expect(result.status).toBe("skipped");
+			expect(result.diagnostics).toEqual([]);
+			expect(touchFile).not.toHaveBeenCalled();
 		} finally {
 			env.cleanup();
 		}

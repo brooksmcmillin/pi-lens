@@ -18,16 +18,33 @@ pi-lens hooks into the pi agent lifecycle:
 
 ## On-write pipeline
 
-For each write/edit, pi-lens runs a language-aware pipeline:
+For each write/edit, pi-lens runs a language-aware pipeline. Format and safe
+autofix (steps 1–2) run on different schedules depending on the tool:
 
-1. Format queue / immediate formatting when configured.
-2. Safe autofix from tools with deterministic fix support.
+- **`write`** (new file, full overwrite, bash-authored write): autofix runs
+  immediately, in the same tool result, carrying the fixed file's full content
+  back to the agent when it fits under the per-file cap.
+- **`edit`**: autofix defers to `agent_end`, joining the same per-file queue as
+  deferred formatting; autofix drains before format so the final state is
+  formatter-stable. A `write` followed by an `edit` on the same file in the
+  same turn demotes the write's autofix to deferred too.
+
+1. Format queue / immediate formatting when configured (deferred to
+   `agent_end` for an `edit` even under `--immediate-format`, so it lands
+   after autofix reformats the file).
+2. Safe autofix from tools with deterministic fix support — immediate for
+   `write`, deferred to `agent_end` for `edit` (see above).
 3. LSP file sync and diagnostic wait.
 4. Parallel dispatch runners: LSP, ast-grep, tree-sitter, fact rules, and
-   language-specific linters/security scanners.
+   language-specific linters/security scanners. For a deferred `edit`, these
+   run against the not-yet-autofixed disk state, so a lint finding autofix
+   would have cleared may appear here and resolve itself at `agent_end`.
 5. Cascade diagnostics for likely affected neighbors.
 6. Deduplication and routing to blockers, actionable warnings, or code-quality
    history.
+
+See [`docs/agent-guide.md`](agent-guide.md#6-auto-format--auto-fix-timing--dont-be-surprised)
+for the consumer-facing version of this routing.
 
 ## Agent tools
 
@@ -92,6 +109,8 @@ pi --no-opengrep         # Disable the Opengrep security scanner (default-on aux
 pi --no-read-guard       # Disable the read-before-edit behavior monitor
 pi --lens-turn-summary   # Persist a per-turn summary of diagnostics, autofixes, and autoformats
 pi --lens-compact-tool-line   # Render tool results as one compact, theme-aware line (closes #1327)
+pi --no-lazy-tools       # Keep every pi-lens tool active instead of activating the situational ones on demand
+pi --lens-turn-end-madge # Run the madge circular-dependency check at every turn end, not just at session start
 
 # Actionable warnings (all default off)
 pi --lens-actionable-warnings          # Report fixable warnings at turn end

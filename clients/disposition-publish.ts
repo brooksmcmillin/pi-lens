@@ -27,6 +27,7 @@ import { normalizeFilePath } from "./path-utils.js";
 import {
 	createLiveBusEmitter,
 	recordStaleBusFailure,
+	resolveLiveBusEmitter,
 	type BusEmitFn,
 	type BusEmitGetter,
 } from "./live-bus-emitter.js";
@@ -105,8 +106,12 @@ export function publishDisposition(args: PublishDispositionArgs): void {
 		}
 		return;
 	}
-	const busEmit = liveEmitter.get();
-	if (!busEmit) {
+	const resolution = resolveLiveBusEmitter(liveEmitter, () => ({
+		event: BUS_DISPOSITION_EVENT,
+		cwd: normalizeFilePath(args.cwd),
+	}));
+	if (resolution.outcome === "stale-session") return;
+	if (resolution.outcome === "unwired") {
 		if (!hasLoggedUnwired) {
 			hasLoggedUnwired = true;
 			logBusEvent({
@@ -117,6 +122,7 @@ export function publishDisposition(args: PublishDispositionArgs): void {
 		}
 		return;
 	}
+	const busEmit = resolution.emit;
 
 	try {
 		const payload: PilensDispositionPayload = {
@@ -144,6 +150,7 @@ export function publishDisposition(args: PublishDispositionArgs): void {
 			outcome: "emit_failed",
 			cwd: normalizeFilePath(args.cwd),
 			error: String(err),
+			ctxSource: resolution.ctxSource,
 		});
 		if (!hasLoggedFailure) {
 			hasLoggedFailure = true;

@@ -86,8 +86,24 @@ export interface WarmDiagnosticsResponse {
 	 * flag is carried explicitly rather than inferred. Optional: an incumbent
 	 * built before this field simply omits it, and the consumer then falls back
 	 * to today's unconfirmed handling.
+	 *
+	 * #1470/#1493: `"partial"` is the narrowed verdict — the incumbent's touch
+	 * completed, but an auxiliary contributed no evidence and `unconfirmedServerIds`
+	 * names it. A consumer testing `=== "confirmed"` therefore fails closed for free;
+	 * one that wants the narrowing reads the id list.
 	 */
-	confirmation?: "confirmed";
+	confirmation?: "confirmed" | "partial";
+	/**
+	 * #1470/#1493: server ids the incumbent's touch carries no evidence for — every
+	 * auxiliary that never reported, whether the aux grace timer cut its push wait
+	 * off (#1470) or it stayed silent with no stored publication for this content
+	 * (#1493). Both shapes cross this boundary under the one name; a consumer must
+	 * not assume a hung server. Present only alongside `confirmation: "partial"`.
+	 * Re-surfaced as an EXPLICIT enumerable DTO field for the same reason
+	 * `inconclusive` is: no side-channel survives `JSON.stringify` of the
+	 * diagnostics array.
+	 */
+	unconfirmedServerIds?: string[];
 }
 
 export interface WarmCodeActionRange {

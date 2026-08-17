@@ -1,0 +1,287 @@
+/**
+ * #1501 — `SecurityScanClient.probeVersion` emitted its availability_decision
+ * record before the caller decided the cooldown, so a transient probe verdict
+ * carried no `retryAfterMs` while every other field was present.
+ *
+ * These tests pin the FULL record shape for all four probeVersion consumers
+ * (gitleaks, trivy and opengrep through `ensureViaInstaller`; govulncheck
+ * directly). Success and durable-missing records must keep their exact
+ * metadata key set, and the transient record must gain exactly one field —
+ * `retryAfterMs`, decided by the seam at log time. The transient assertions
+ * fail on pre-fix code (the field is absent); the pins pass identically
+ * before and after.
+ */
+
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { TRANSIENT_BASE_COOLDOWN_MS } from "../../clients/dispatch/runners/utils/availability-policy.ts";
+
+const {
+	safeSpawnAsync,
+	safeSpawn,
+	ensureTool,
+	getInstallAttempt,
+	logLatency,
+} = vi.hoisted(() => ({
+	safeSpawnAsync: vi.fn(),
+	safeSpawn: vi.fn(),
+	ensureTool: vi.fn(),
+	getInstallAttempt: vi.fn(),
+	logLatency: vi.fn(),
+}));
+
+// Spread the real module: only `logLatency` is intercepted, so the rest of
+// the import graph (including availability-policy's logAvailabilityDecision,
+// which funnels through it) keeps working.
+vi.mock("../../clients/latency-logger.js", async (importOriginal) => {
+	const actual =
+		await importOriginal<typeof import("../../clients/latency-logger.js")>();
+	return { ...actual, logLatency };
+});
+
+vi.mock("../../clients/safe-spawn.js", () => ({
+	safeSpawn,
+	safeSpawnAsync,
+	isCommandAvailableAsync: vi.fn(async () => false),
+}));
+
+vi.mock("../../clients/installer/index.js", () => ({
+	ensureTool,
+	getInstallAttempt,
+	isSpawnableCommand: vi.fn(async () => true),
+	resetPathWalkMemo: vi.fn(),
+	getToolEnvironment: vi.fn(async () => ({})),
+}));
+
+vi.mock("../../clients/project-trust.js", () => ({
+	assertInstallAllowed: vi.fn(() => true),
+}));
+
+/** A probe the host killed at its budget: says nothing about the tool. */
+const timeoutResult = {
+	stdout: "",
+	stderr: "",
+	status: null,
+	error: new Error("Process timed out after 5000ms"),
+	failure: "timeout",
+	spawnFailure: { kind: "timeout" },
+};
+
+/** A probe that proved the tool is not on this machine. */
+const missingResult = {
+	stdout: "",
+	stderr: "",
+	status: null,
+	error: Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" }),
+	failure: "spawn",
+	spawnFailure: { kind: "tool-not-found" },
+};
+
+const okResult = (stdout: string) => ({
+	stdout,
+	stderr: "",
+	status: 0,
+	error: undefined,
+});
+
+interface ScanClient {
+	ensureAvailable(): Promise<boolean>;
+}
+
+async function makeClient(tool: string): Promise<ScanClient> {
+	switch (tool) {
+		case "gitleaks":
+			return new (
+				await import("../../clients/gitleaks-client.js")
+			).GitleaksClient();
+		case "trivy":
+			return new (await import("../../clients/trivy-client.js")).TrivyClient();
+		case "opengrep":
+			return new (
+				await import("../../clients/opengrep-client.js")
+			).OpengrepClient();
+		case "govulncheck":
+			return new (
+				await import("../../clients/govulncheck-client.js")
+			).GovulncheckClient();
+		default:
+			throw new Error(`unknown tool ${tool}`);
+	}
+}
+
+/** Availability decision records emitted for `tool`, oldest first. */
+function decisionsFor(tool: string): Array<Record<string, unknown>> {
+	return logLatency.mock.calls
+		.map((call) => call[0] as Record<string, unknown>)
+		.filter(
+			(entry) =>
+				entry?.phase === "availability_decision" &&
+				(entry.metadata as Record<string, unknown> | undefined)?.tool === tool,
+		);
+}
+
+function metadataOf(record: Record<string, unknown>): Record<string, unknown> {
+	return record.metadata as Record<string, unknown>;
+}
+
+/**
+ * The metadata key set every probe record carries today.
+ *
+ * `classifiedBy` and `evidence` joined it in #1500: a verdict now says whether a
+ * probe derived it or a call site asserted it, and carries the spawn facts it was
+ * derived FROM. Both are unconditional on a probe record — a probe always has a
+ * result to describe — so they belong in the exact-shape pin rather than behind a
+ * `toMatchObject`.
+ */
+const BASELINE_KEYS = [
+	"budgetMs",
+	"cause",
+	"classifiedBy",
+	"evidence",
+	"hostStallMs",
+	"latched",
+	"outcome",
+	"tool",
+	"verdict",
+];
+
+function advancePastCooldown(): void {
+	vi.setSystemTime(new Date(Date.now() + TRANSIENT_BASE_COOLDOWN_MS + 1));
+}
+
+beforeEach(() => {
+	vi.resetAllMocks();
+	ensureTool.mockResolvedValue(null);
+	safeSpawn.mockReturnValue({ stdout: "", stderr: "", status: 1 });
+	vi.useFakeTimers({ toFake: ["Date"] });
+});
+
+afterEach(() => {
+	vi.useRealTimers();
+});
+
+const CONSUMERS = ["gitleaks", "trivy", "opengrep", "govulncheck"] as const;
+
+describe.each(CONSUMERS)("probeVersion telemetry: %s (#1501)", (tool) => {
+	it("pins the success record: exact fields, no retryAfterMs", async () => {
+		safeSpawnAsync.mockImplementation(async (cmd: string) =>
+			cmd === tool ? okResult(`${tool} 1.0.0`) : missingResult,
+		);
+		const client = await makeClient(tool);
+
+		expect(await client.ensureAvailable()).toBe(true);
+		const records = decisionsFor(tool);
+		expect(records).toHaveLength(1);
+		expect(metadataOf(records[0])).toMatchObject({
+			tool,
+			verdict: "available",
+			outcome: "success",
+			cause: "ok",
+			latched: true,
+			budgetMs: 5000,
+		});
+		expect(Object.keys(metadataOf(records[0])).sort()).toEqual(BASELINE_KEYS);
+	});
+
+	it("pins the durable-missing record: exact fields, no retryAfterMs", async () => {
+		// Every spawn misses: the version probe, and (for govulncheck) the
+		// `go version` preflight of the install path.
+		safeSpawnAsync.mockImplementation(async () => missingResult);
+		const client = await makeClient(tool);
+
+		expect(await client.ensureAvailable()).toBe(false);
+		const records = decisionsFor(tool);
+		// TWO rows since #1500: the probe's verdict, then the durable-absence
+		// ASSERTION that follows the install path. The second one used to be
+		// silent — the tool went quiet for the session with nothing to audit.
+		expect(records).toHaveLength(2);
+		expect(metadataOf(records[0])).toMatchObject({
+			tool,
+			verdict: "unavailable",
+			outcome: "missing",
+			cause: "not-found",
+			latched: true,
+			budgetMs: 5000,
+			classifiedBy: "probe",
+		});
+		expect(Object.keys(metadataOf(records[0])).sort()).toEqual(BASELINE_KEYS);
+
+		// The assertion row has no probe of its own: no budget, no stall, and its
+		// evidence describes the install rather than a spawn result.
+		expect(metadataOf(records[1])).toMatchObject({
+			tool,
+			verdict: "unavailable",
+			outcome: "missing",
+			cause: "not-found",
+			latched: true,
+			classifiedBy: "caller",
+		});
+		expect(Object.keys(metadataOf(records[1])).sort()).toEqual([
+			"cause",
+			"classifiedBy",
+			"evidence",
+			"latched",
+			"outcome",
+			"tool",
+			"verdict",
+		]);
+	});
+
+	it("a transient verdict carries retryAfterMs at log time", async () => {
+		safeSpawnAsync.mockImplementation(async (cmd: string) =>
+			cmd === tool ? timeoutResult : missingResult,
+		);
+		const client = await makeClient(tool);
+
+		expect(await client.ensureAvailable()).toBe(false);
+		const records = decisionsFor(tool);
+		expect(records).toHaveLength(1);
+		expect(metadataOf(records[0])).toMatchObject({
+			tool,
+			verdict: "unavailable",
+			outcome: "transient",
+			cause: "probe-timeout",
+			latched: false,
+			budgetMs: 5000,
+		});
+		// THE #1501 gap: pre-fix this field is absent, so a transient verdict
+		// says the tool is off but not when it comes back.
+		expect(metadataOf(records[0]).retryAfterMs).toBe(
+			TRANSIENT_BASE_COOLDOWN_MS,
+		);
+	});
+});
+
+describe.each(["gitleaks", "govulncheck"] as const)(
+	"probeVersion telemetry: %s cooldown lifecycle (#1501)",
+	(tool) => {
+		it("suppresses re-probes during the cooldown, then escalates once", async () => {
+			safeSpawnAsync.mockImplementation(async (cmd: string) =>
+				cmd === tool ? timeoutResult : missingResult,
+			);
+			const client = await makeClient(tool);
+
+			expect(await client.ensureAvailable()).toBe(false);
+			expect(metadataOf(decisionsFor(tool)[0]).retryAfterMs).toBe(
+				TRANSIENT_BASE_COOLDOWN_MS,
+			);
+
+			// Inside the cooldown the verdict is served from the latch: no new
+			// probe, no new record.
+			const spawns = safeSpawnAsync.mock.calls.length;
+			expect(await client.ensureAvailable()).toBe(false);
+			expect(safeSpawnAsync.mock.calls.length).toBe(spawns);
+			expect(decisionsFor(tool)).toHaveLength(1);
+
+			// After the cooldown the seam re-probes, and the second transient
+			// verdict escalates the schedule exactly once (base × 2). A caller
+			// re-marking the same verdict would double-escalate to base × 4.
+			advancePastCooldown();
+			expect(await client.ensureAvailable()).toBe(false);
+			const records = decisionsFor(tool);
+			expect(records).toHaveLength(2);
+			expect(metadataOf(records[1]).retryAfterMs).toBe(
+				2 * TRANSIENT_BASE_COOLDOWN_MS,
+			);
+		});
+	},
+);

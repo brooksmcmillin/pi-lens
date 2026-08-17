@@ -17,6 +17,7 @@ import {
 	publishFormatQueued,
 	publishFormatStart,
 	wireFormatEventsBusEmitter,
+	wireFormatEventsBusEmitterGetter,
 } from "../../clients/format-events-publish.js";
 import { _resetForTests as _resetBusPublishForTests } from "../../clients/bus-publish.js";
 
@@ -46,8 +47,30 @@ describe("format-events-publish — pilens:format:queued / pilens:format:start (
 					filePath: "/repo/src/a.ts",
 					cwd: "/repo",
 					tool: "write",
+					kinds: ["format"],
 				}),
 			).not.toThrow();
+		});
+
+		it("skips a stale session target without attempting emit", () => {
+			const emit = vi.fn();
+			wireFormatEventsBusEmitterGetter(() => ({
+				emit,
+				ctx: {
+					isIdle: () => {
+						throw new Error("This extension ctx is stale after session replacement or reload");
+					},
+				},
+			}));
+
+			publishFormatQueued({ filePath: "/repo/a.ts", cwd: "/repo", tool: "write", kinds: ["format"] });
+
+			expect(emit).not.toHaveBeenCalled();
+			expect(logBusEvent).toHaveBeenCalledWith(expect.objectContaining({
+				event: BUS_FORMAT_QUEUED_EVENT,
+				outcome: "skipped_stale_session",
+				level: "info",
+			}));
 		});
 
 		it("emits the exact payload shape: v, source, filePath, cwd, tool", () => {
@@ -58,6 +81,7 @@ describe("format-events-publish — pilens:format:queued / pilens:format:start (
 				filePath: "/repo/src/a.ts",
 				cwd: "/repo",
 				tool: "edit",
+				kinds: ["format"],
 			});
 
 			expect(emit).toHaveBeenCalledTimes(1);
@@ -70,6 +94,7 @@ describe("format-events-publish — pilens:format:queued / pilens:format:start (
 				v: BUS_FORMAT_QUEUED_VERSION,
 				source: "pi-lens",
 				tool: "edit",
+				kinds: ["format"],
 			});
 			expect(payload.filePath).toEqual(expect.any(String));
 			expect(payload.cwd).toEqual(expect.any(String));
@@ -83,6 +108,7 @@ describe("format-events-publish — pilens:format:queued / pilens:format:start (
 				filePath: "C:\\repo\\src\\a.ts",
 				cwd: "C:\\repo",
 				tool: "write",
+				kinds: ["format"],
 			});
 
 			const payload = emit.mock.calls[0][1] as {
@@ -103,6 +129,7 @@ describe("format-events-publish — pilens:format:queued / pilens:format:start (
 				filePath: "/repo/a.ts",
 				cwd: "/repo",
 				tool: "write",
+				kinds: ["format"],
 			});
 
 			expect(emit).not.toHaveBeenCalled();
@@ -120,6 +147,7 @@ describe("format-events-publish — pilens:format:queued / pilens:format:start (
 					filePath: "/repo/a.ts",
 					cwd: "/repo",
 					tool: "write",
+					kinds: ["format"],
 					dbg,
 				}),
 			).not.toThrow();
@@ -130,6 +158,7 @@ describe("format-events-publish — pilens:format:queued / pilens:format:start (
 					filePath: "/repo/b.ts",
 					cwd: "/repo",
 					tool: "write",
+					kinds: ["format"],
 					dbg,
 				}),
 			).not.toThrow();
@@ -145,6 +174,7 @@ describe("format-events-publish — pilens:format:queued / pilens:format:start (
 				filePath: "/repo/a.ts",
 				cwd: "/repo",
 				tool: "write",
+				kinds: ["format"],
 			});
 
 			expect(logBusEvent).toHaveBeenCalledWith(
@@ -157,8 +187,8 @@ describe("format-events-publish — pilens:format:queued / pilens:format:start (
 		});
 
 		it("logs 'skipped_unwired' once when busEmit was never wired", () => {
-			publishFormatQueued({ filePath: "/repo/a.ts", cwd: "/repo", tool: "write" });
-			publishFormatQueued({ filePath: "/repo/b.ts", cwd: "/repo", tool: "write" });
+			publishFormatQueued({ filePath: "/repo/a.ts", cwd: "/repo", tool: "write", kinds: ["format"] });
+			publishFormatQueued({ filePath: "/repo/b.ts", cwd: "/repo", tool: "write", kinds: ["format"] });
 
 			const unwiredCalls = logBusEvent.mock.calls.filter(
 				(c) => (c[0] as { outcome: string }).outcome === "skipped_unwired",
@@ -193,6 +223,7 @@ describe("format-events-publish — pilens:format:queued / pilens:format:start (
 				v: BUS_FORMAT_START_VERSION,
 				source: "pi-lens",
 				fileCount: 2,
+				kinds: ["format"],
 			});
 			expect(payload.paths).toHaveLength(2);
 		});

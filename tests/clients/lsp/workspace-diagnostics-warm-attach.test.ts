@@ -88,6 +88,40 @@ describe("runWorkspaceDiagnostics warm attach sweeps (#822)", () => {
 		expect(warmup).not.toHaveBeenCalled();
 	});
 
+	// #1470: the sweep's own honesty gate. `runWorkspaceDiagnostics` persists
+	// every `!timedOut` result into the workspace-diagnostics cache, and it read
+	// only `inconclusive` — which a partially covered touch deliberately is not.
+	// The incumbent touches with `clientScope: "with-auxiliary"`, so it is the one
+	// route into this sweep that can produce a coverage gap today, and the gap has
+	// to reach the `timedOut` computation or the sweep caches a partial answer as
+	// a confirmed clean and replays it on every later sweep.
+	it("does not cache a sweep result whose auxiliary the incumbent could not cover (#1470)", async () => {
+		fs.mkdirSync(path.join(tmp, ".pi-lens"));
+		const file = path.join(tmp, "a.ts");
+		fs.writeFileSync(file, "const x = 1;\n");
+		tryWarmAttachedDiagnostics.mockResolvedValue({
+			available: true,
+			response: {
+				diagnostics: [],
+				confirmation: "partial",
+				unconfirmedServerIds: ["typos"],
+			},
+		});
+
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const results = await new LSPService().runWorkspaceDiagnostics(tmp, {
+			files: [file],
+		});
+
+		expect(results[0]?.timedOut).toBe(true);
+		const { cacheKeyFor, loadWorkspaceDiagnosticsCache } = await import(
+			"../../../clients/lsp/workspace-diagnostics-cache.js"
+		);
+		expect(
+			loadWorkspaceDiagnosticsCache(tmp)?.entries[cacheKeyFor(file)],
+		).toBeUndefined();
+	});
+
 	it("promotes after an IPC failure and completes that file and the remainder locally", async () => {
 		const files = ["a.ts", "b.ts", "c.ts"].map((name) =>
 			path.join(tmp, name),

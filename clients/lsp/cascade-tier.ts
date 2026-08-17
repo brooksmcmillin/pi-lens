@@ -32,6 +32,12 @@
  * NOT tier-3 — the caller keeps today's full in-lane wait. Fail-safe is
  * always "wait like before".
  *
+ * Native TS7 is the cascade-only exception. It is not silent on clean, but
+ * its publication does not settle inside the cold-snapshot budget. Cascade
+ * classifies it as `collect-later`, sends the same no-wait touch, and
+ * reconciles its later per-file push or pull publication. The shared server
+ * policy remains `waits`, so main-lane behavior does not change.
+ *
  * #524/#529/#541/#558: a server id can now be backed by more than one actual
  * binary — "typescript" is classic typescript-language-server OR TS7's
  * native `tsc --lsp --stdio` (PR #526). PR #526 originally routed the
@@ -46,9 +52,11 @@
  * confirmed still silent (`cleanPubs=0(v:0)`) in the same run. This is
  * therefore an EVIDENCE-BASED revert, not the original unverified caution:
  * native-ts7's clean-signal behavior IS known, and it is "publishes, not
- * silent". The snapshot's `launchVariant` marker again routes a native-ts7
- * snapshot through "waits" while the shared `silentOnClean` flag stays
- * `true` for classic. `scripts/probe-clean-signal.mjs`'s drift check no
+ * silent". The shared classifier still routes a native-ts7 snapshot through
+ * `waits`. The cascade-only wrapper routes it through `collect-later` because
+ * the measured publication arrives after the in-lane budget. The shared
+ * `silentOnClean` flag stays `true` for classic.
+ * `scripts/probe-clean-signal.mjs`'s drift check no
  * longer compares native-ts7 rows against the shared marker (it now expects
  * `false` for them explicitly) — see that file's header for the regression
  * watch this sets up for a future TS7 build that becomes silent again.
@@ -61,11 +69,50 @@ import { registerQuietWindowTask } from "../quiet-window.js";
 import type { LSPDiagnostic } from "./client.js";
 import type { LSPService } from "./index.js";
 
-export {
-	classifyCascadeWaitTier,
+import {
+	classifyCascadeWaitTier as classifySharedCascadeWaitTier,
 	classifyServerWaitTier,
-	type CascadeWaitTier,
+	resolvePrimaryServerForWaitPolicy,
+	type CascadeWaitTier as SharedCascadeWaitTier,
 } from "./wait-policy/classification.js";
+
+export { classifyServerWaitTier };
+
+/** Cascade-only extension of the shared wait policy. Native TS7 keeps the
+ * shared `waits` policy everywhere else, but cascade collects its late pull
+ * result outside the bounded in-lane fan-out. */
+export type CascadeWaitTier = SharedCascadeWaitTier | "collect-later";
+
+/**
+ * The cascade lane's wait tier for `filePath`. DELEGATES to the shared
+ * `wait-policy/classification.ts` rule — this wrapper adds exactly one
+ * cascade-only override on top of it (native TS7's push-only snapshot →
+ * `collect-later`) and never re-implements the classification itself.
+ *
+ * #1444 coverage tradeoff: the no-wait touch this tier selects is
+ * `clientScope: "primary"`, and the tier itself is decided from the PRIMARY
+ * (non-auxiliary) server alone. That tradeoff already existed for
+ * `tier3-silent`; the override enlarges the population it applies to — every
+ * native-TS7 TypeScript neighbour now takes the no-wait path too, so an
+ * auxiliary server configured for those files no longer gets touched in-lane
+ * for them (its findings arrive via the next per-edit dispatch, as they
+ * already did for classic tier-3 files).
+ */
+export function classifyCascadeWaitTier(
+	lspService: Pick<LSPService, "getCapabilitySnapshots">,
+	filePath: string,
+	snapshots: Awaited<ReturnType<LSPService["getCapabilitySnapshots"]>>,
+): CascadeWaitTier {
+	const primary = resolvePrimaryServerForWaitPolicy(filePath, snapshots);
+	if (
+		primary?.serverId === "typescript" &&
+		primary.snapshot?.launchVariant === "native-ts7" &&
+		primary.snapshot.workspaceDiagnosticsSupport?.mode === "push-only"
+	) {
+		return "collect-later";
+	}
+	return classifySharedCascadeWaitTier(lspService, filePath, snapshots);
+}
 
 // --- Kill switch (lazy, memoized — house style per clients/runtime-config.ts /
 // clients/quiet-window.ts's isQuietWindowEnabled) ---
@@ -143,6 +190,13 @@ export interface ReconcileOutcome {
 	 * stay logs-only). Populated only for `resolved-found`.
 	 */
 	diagnostics?: LSPDiagnostic[];
+	/**
+	 * #1444: the client's PER-FILE publish timestamp that resolved this touch
+	 * (`getAllDiagnostics()`'s `ts`). Populated for both resolved outcomes; the
+	 * footer reconcile stamps it as the observation time so a late clean is not
+	 * recorded as observed "now". Never set for `unresolved`.
+	 */
+	publishedAt?: number;
 }
 
 /**
@@ -209,6 +263,7 @@ export async function reconcileOutstandingCascadeTouches(
 				outcome: found ? "resolved-found" : "resolved-clean",
 				ageMs,
 				diagnosticCount: entry.diags.length,
+				publishedAt: entry.ts,
 				// #1023: carry the diagnostics so the task can re-surface them.
 				...(found && { diagnostics: entry.diags }),
 			});
@@ -249,6 +304,20 @@ export interface CascadeTierReconcileOptions {
 	 * Never called for `resolved-clean`/`unresolved`.
 	 */
 	onResolvedFound?: (neighbor: ResolvedFoundNeighbor) => void;
+	/**
+	 * #1444: called (best-effort) for each `resolved-clean` outcome — a per-file
+	 * publish that landed AFTER the touch and carried no errors, i.e. a
+	 * CONFIRMED clean observation by the same standard the in-lane path uses
+	 * (`isConfirmedTouch`, `clients/dispatch/integration.ts`). Wired in index.ts
+	 * to clear the neighbour's now-stale LSP-error entries from the footer, which
+	 * the skipped in-lane wait could not do. Never called for
+	 * `resolved-found`/`unresolved` (a missing answer is not a clean answer).
+	 */
+	onResolvedClean?: (neighbor: {
+		filePath: string;
+		serverId: string;
+		publishedAt: number;
+	}) => void;
 }
 
 /**
@@ -270,16 +339,27 @@ export function registerCascadeTierReconcileTask(
 		if (outcomes.length === 0) return;
 
 		// #1023: re-inject each resolved-found neighbor error so it reaches the
-		// agent (previously logs-only). Isolated per-outcome — a throwing callback
-		// must not drop the log line or the sibling re-injections.
+		// agent (previously logs-only). #1444: hand each resolved-CLEAN outcome to
+		// the footer reconcile for the mirror-image case. Isolated per-outcome — a
+		// throwing callback must not drop the log line or the sibling deliveries.
 		for (const o of outcomes) {
-			if (o.outcome !== "resolved-found" || !o.diagnostics?.length) continue;
 			try {
-				options.onResolvedFound?.({
-					filePath: o.filePath,
-					serverId: o.serverId,
-					diagnostics: o.diagnostics,
-				});
+				if (o.outcome === "resolved-found" && o.diagnostics?.length) {
+					options.onResolvedFound?.({
+						filePath: o.filePath,
+						serverId: o.serverId,
+						diagnostics: o.diagnostics,
+					});
+				} else if (o.outcome === "resolved-clean" && o.publishedAt != null) {
+					// #1444: the stale-footer half of the same honesty problem — the
+					// neighbour proved clean, but only after the in-lane wait was
+					// skipped, so nothing has cleared its earlier error entries.
+					options.onResolvedClean?.({
+						filePath: o.filePath,
+						serverId: o.serverId,
+						publishedAt: o.publishedAt,
+					});
+				}
 			} catch {
 				// best-effort surfacing; the log below is the durable record.
 			}

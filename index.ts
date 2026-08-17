@@ -1,5 +1,11 @@
 import "./clients/console-guard-install.js";
-import { installConsoleGuard, logExtension } from "./clients/extension-log.js";
+import {
+	closeModuleLoadConsoleWindow,
+	installConsoleGuard,
+	logExtension,
+	runInConsoleCaptureWindow,
+	withConsoleCaptureWindows,
+} from "./clients/extension-log.js";
 import { wireUserNotifier } from "./clients/user-notify.js";
 import {
 	getDegradationSummary,
@@ -32,6 +38,7 @@ import {
 	getSessionLanguages,
 	importWidgetState,
 	type PersistedWidgetState,
+	reconcileCascadeNeighborLspErrors,
 	renderWidget,
 	scheduleStaleReconcile,
 	setRenderCallback,
@@ -67,6 +74,7 @@ import { wireBusEmitterGetter } from "./clients/bus-publish.js";
 import { wireDiagnosticsBusEmitterGetter } from "./clients/diagnostics-publish.js";
 import { wireDispositionBusEmitterGetter } from "./clients/disposition-publish.js";
 import { wireFormatEventsBusEmitterGetter } from "./clients/format-events-publish.js";
+import { emitBusEventRollupAtSessionEnd } from "./clients/bus-events-logger.js";
 import {
 	consumeAgentNudge,
 	recordCrossProcessTouches,
@@ -77,8 +85,7 @@ import {
 	readCrossProcessTouchesForTurnStart,
 } from "./clients/recent-touches.js";
 import { registerCascadeTierReconcileTask } from "./clients/lsp/cascade-tier.js";
-import { formatCascadeNeighborDiagnostics } from "./clients/cascade-format.js";
-import { convertLspDiagnostics } from "./clients/dispatch/utils/lsp-diagnostics.js";
+import { buildResolvedFoundCascadeRun } from "./clients/cascade-format.js";
 import { initLSPConfig } from "./clients/lsp/config.js";
 import { getLSPService, resetLSPService } from "./clients/lsp/index.js";
 import { warmLspService } from "./clients/lsp-lazy.js";
@@ -158,6 +165,12 @@ import {
 import { createProjectReportTool } from "./tools/project-report.js";
 import { createSymbolSearchTool } from "./tools/symbol-search.js";
 import { getLastLoggedPhase, logLatency } from "./clients/latency-logger.js";
+import {
+	isFreshSessionStart,
+	planToolSet,
+	recordToolSetMutation,
+	supportsDeferredTools,
+} from "./clients/tool-set-policy.js";
 import {
 	clearCachePrefixSession,
 	logCacheUsage,
@@ -347,7 +360,7 @@ export function createHostPorts(
 			sink: (subsystem) => (entry) =>
 				logExtension({ subsystem, level: "debug", message: "host sink entry", metadata: { entry } }),
 		},
-		emit: { bus: emit, lens: emit },
+		emit: { bus: emit },
 		status: { set: (name, value) => context()?.ui?.setStatus?.(name, value) },
 		spawn: { abortSignal: () => context()?.signal, isAllowed: assertInstallAllowed },
 		render: { invalidate: () => options.getRenderInvalidator?.()?.() },
@@ -504,7 +517,26 @@ function cleanStaleTsBuildInfo(cwd: string): string[] {
 
 // --- Extension ---
 
-export default function (pi: ExtensionAPI) {
+/**
+ * The extension activation. Always reached through the default export below,
+ * which runs it inside a console capture window (#1434).
+ */
+function activateExtension(hostPi: ExtensionAPI) {
+	// #1434: every pi-lens entry point registered through this API runs inside a
+	// capture window, so a dependency writing to console during our work reaches
+	// the log instead of pi's frame. Host-initiated output stays on the real
+	// console, because it runs outside every window.
+	const pi = withConsoleCaptureWindows(hostPi);
+	// Event contexts belong to the activation that owns this factory closure.
+	// The process-global latest ctx remains only a boot-window fallback.
+	// biome-ignore lint/suspicious/noExplicitAny: heterogeneous pi event ctx shapes
+	let ownEventCtx: any;
+	// biome-ignore lint/suspicious/noExplicitAny: heterogeneous pi event ctx shapes
+	const rememberOwnEventCtx = (ctx: any): void => {
+		if (!ctx) return;
+		ownEventCtx = ctx;
+		rememberEventCtx(ctx);
+	};
 	let renderInvalidator: (() => void) | undefined;
 	const hostPorts = createHostPorts(pi, {
 		getContext: () => latestEventCtx,
@@ -535,8 +567,20 @@ export default function (pi: ExtensionAPI) {
 		// become stale; every session_start must reclaim them before #473 can
 		// return early for a concurrent in-process subagent. (#1383)
 		wireUserNotifier(hostPorts);
-		initLensEventsGetter(() => ({ emit: hostPorts.emit.lens }));
-		const getLiveEmit = () => hostPorts.emit.bus;
+		const getLiveEmit = () => ({
+			emit: hostPorts.emit.bus,
+			// H2 (#1415 review): NOT `?? latestEventCtx`. The global belongs to
+			// whichever activation last received an event — a SIBLING activation
+			// after a replacement, with no relation to this closure's `pi.events`.
+			// Falling back to it pairs a live emitter with a foreign ctx, which
+			// the stale-session probe cannot catch (it looks live) and silently
+			// drops every publish until this activation's own first handler
+			// fires. An unset `ownEventCtx` (this activation's own boot window)
+			// must probe undefined -> "ready" -> delivery attempted, exactly like
+			// today, not borrow a sibling's ctx.
+			ctx: ownEventCtx,
+		});
+		initLensEventsGetter(getLiveEmit);
 		wireBusEmitterGetter(getLiveEmit);
 		wireDiagnosticsBusEmitterGetter(getLiveEmit);
 		wireDispositionBusEmitterGetter(getLiveEmit);
@@ -546,6 +590,12 @@ export default function (pi: ExtensionAPI) {
 	refreshCtxDerivedPlumbing();
 	// #485: read-only bus subscriber — never publishes, so the #482 loop guard
 	// (ingest -> write -> publish) has no write side to trip here.
+	// #1434 residual risk, accepted not fixed: `pi.events` is the raw host bus,
+	// not `pi` itself, so `withConsoleCaptureWindows` does not wrap its
+	// `subscribe`. A future subscriber body that logs would bypass the capture
+	// window. Subscribers registered on this bus are subscribe-only today
+	// (never publish), so nothing currently exercises that gap — revisit if
+	// `pi.events` grows a subscriber that does real work inside its callback.
 	wireAgentNudgeSubscriber({
 		events: pi.events,
 		getReadGuard: () => runtime.readGuard,
@@ -1402,7 +1452,10 @@ export default function (pi: ExtensionAPI) {
 			readGuard: runtime.readGuard,
 			dbg,
 		}),
-		createLensDiagnosticMarkTool(() => runtime.projectRoot),
+		createLensDiagnosticMarkTool(() => runtime.projectRoot, () => ({
+			model: runtime.telemetryModelId,
+			provider: runtime.telemetryProviderId,
+		})),
 	];
 	const skillsDir = resolvePackagePath(import.meta.url, "skills");
 	const astGrepSkillPath = path.join(skillsDir, "pi-lens-ast-grep", "SKILL.md");
@@ -1444,12 +1497,34 @@ export default function (pi: ExtensionAPI) {
 				"Record a disposition for a diagnostic: false-positive / suppress (inline ignore comment) / defer (this session) / flagged (to fix).",
 		},
 	];
+	// #1453: the lazy tools the model activated in THIS logical conversation.
+	// Extension closure state outlives a session rebuild (the runner keeps the
+	// activated extension; it does not re-run this factory), which is exactly
+	// what lets a fork/reload/resume restore the parent's tool posture. Reset
+	// on startup/new, carried across fork/reload/resume — see the session_start
+	// handler below.
+	const rememberedLazyTools = new Set<string>();
 	const activateToolsTool = createActivateToolsTool(
 		pi as unknown as {
 			getActiveTools?: () => string[];
 			setActiveTools?: (names: string[]) => void;
 		},
 		LAZY_TOOL_CATALOG,
+		{
+			onActivated: (names) => {
+				for (const name of names) rememberedLazyTools.add(name);
+			},
+			deferredToolSupport: (ctx) => {
+				try {
+					return supportsDeferredTools(
+						(ctx as { model?: Parameters<typeof supportsDeferredTools>[0] })?.model,
+					);
+				} catch {
+					return false;
+				}
+			},
+			onMutation: recordToolSetMutation,
+		},
 	);
 
 	// #1327: opt-in compact one-line tool rendering. Read once at load (like
@@ -1523,11 +1598,12 @@ export default function (pi: ExtensionAPI) {
 		void warmFormatters().catch((err) =>
 			logExtension({ subsystem: "format", level: "warn", message: `formatter warm failed: ${err}` }),
 		);
-		rememberEventCtx(ctx);
+		rememberOwnEventCtx(ctx);
 		refreshCtxDerivedPlumbing();
 		const sessionStartFiredAt = Date.now();
 		try {
 			dbg("session_start fired");
+			const sessionReason = (event as { reason?: string }).reason;
 
 			// #1334 S5: adopt the HOST's project-trust decision before anything
 			// below can auto-install a tool or spawn an LSP server. pi-lens is a
@@ -1547,44 +1623,9 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 
-			// Dynamic tooling (#pi 0.80.x+): deactivate the 5 situational tools
-			// (LAZY_TOOL_CATALOG) now that the extension has actually finished
-			// loading — session_start is the correct lifecycle point for this
-			// call (#643; see the comment left at the old call site above, right
-			// after tool registration, for why it can never succeed there).
-			// Feature-detected the same way as elsewhere in this handler:
-			// `pi.getActiveTools`/`setActiveTools` aren't guaranteed present on
-			// every host the broad `@earendil-works/pi-coding-agent` peer
-			// dependency allows, so probe with typeof rather than assuming the
-			// pinned devDependency version's API exists at runtime. session_start
-			// fires multiple times per process (fork/reload/new/resume, see the
-			// reasonLabel handling below); re-running this every time is fine —
-			// `setActiveTools` just replaces the current active set, it isn't
-			// additive or stateful across calls.
-			try {
-				const piWithActiveTools = pi as unknown as {
-					getActiveTools?: () => string[];
-					setActiveTools?: (names: string[]) => void;
-				};
-				if (
-					typeof piWithActiveTools.getActiveTools === "function" &&
-					typeof piWithActiveTools.setActiveTools === "function"
-				) {
-					const lazyNames = new Set(LAZY_TOOL_CATALOG.map((t) => t.name));
-					const active = piWithActiveTools.getActiveTools();
-					const initiallyActive = active.filter((name) => !lazyNames.has(name));
-					piWithActiveTools.setActiveTools(initiallyActive);
-				}
-			} catch (deactivateErr) {
-				dbg(
-					`dynamic tool deactivation failed (older pi host lacking getActiveTools/setActiveTools, or a genuine host error): ${deactivateErr}`,
-				);
-			}
-
 			// #190: pi's session lifecycle. `reason` distinguishes new/resume/fork/
 			// reload/startup; the STABLE session id comes from the session manager
 			// (the event carries none), and is what lets a resumed session rehydrate.
-			const sessionReason = (event as { reason?: string }).reason;
 			const stableSessionId = (() => {
 				try {
 					return (
@@ -1613,6 +1654,77 @@ export default function (pi: ExtensionAPI) {
 					sameCwd: (ctx as { cwd?: string })?.cwd === process.cwd(),
 				});
 				return;
+			}
+
+			// Dynamic tooling (#pi 0.80.x+): put the active tool set back to the
+			// posture this logical conversation had — the always-active baseline
+			// plus exactly the lazy tools (LAZY_TOOL_CATALOG) the model activated
+			// via pi_lens_activate_tools. session_start is the correct lifecycle
+			// point for this call (#643; see the comment left at the old call site
+			// above, right after tool registration, for why it can never succeed
+			// there).
+			//
+			// #1453: this RESTORES, it does not merely shrink. Every session_start
+			// reason arrives with all registered pi-lens tools active, because the
+			// host builds a fresh AgentSession with `includeAllExtensionTools: true`
+			// on fork/reload/resume just as it does on startup, and never persists
+			// an active-tool set per session. Skipping the call on those reasons
+			// would therefore leave every lazy tool active forever AND change the
+			// advertised tool list relative to the parent's cached prompt prefix.
+			// Rebuilding the same set instead keeps the prefix identical and
+			// genuinely preserves the model's activations, because pi-lens's own
+			// closure state (`rememberedLazyTools`) survives the rebuild.
+			//
+			// Deliberately BELOW the #473 concurrent-secondary guard: the active
+			// tool set is shared runtime state (one loader per process), so a
+			// secondary's session_start must never rewrite the still-live
+			// primary's set — last writer would win.
+			//
+			// Feature-detected the same way as elsewhere in this handler:
+			// `pi.getActiveTools`/`setActiveTools` aren't guaranteed present on
+			// every host the broad `@earendil-works/pi-coding-agent` peer
+			// dependency allows, so probe with typeof rather than assuming the
+			// pinned devDependency version's API exists at runtime. Under
+			// `--no-lazy-tools` nothing is touched at all: all-active IS the
+			// requested posture.
+			try {
+				const piWithActiveTools = pi as unknown as {
+					getActiveTools?: () => string[];
+					setActiveTools?: (names: string[]) => void;
+				};
+				if (
+					getLensFlag("no-lazy-tools") !== true &&
+					typeof piWithActiveTools.getActiveTools === "function" &&
+					typeof piWithActiveTools.setActiveTools === "function"
+				) {
+					// A fresh conversation starts with no activation memory; a
+					// rebuild inherits the parent's.
+					if (isFreshSessionStart(sessionReason)) rememberedLazyTools.clear();
+					const lazyNames = new Set(LAZY_TOOL_CATALOG.map((t) => t.name));
+					const plan = planToolSet(
+						piWithActiveTools.getActiveTools(),
+						lazyNames,
+						rememberedLazyTools,
+					);
+					if (plan.changed) {
+						piWithActiveTools.setActiveTools(plan.desired);
+						recordToolSetMutation({
+							addedCount: plan.addedCount,
+							removedCount: plan.removedCount,
+							reason: isFreshSessionStart(sessionReason)
+								? "fresh_session_lazy_deactivation"
+								: "session_rebuild_restore",
+							deferralApplies: supportsDeferredTools(
+								(ctx as { model?: Parameters<typeof supportsDeferredTools>[0] })
+									?.model,
+							),
+						});
+					}
+				}
+			} catch (toolSetErr) {
+				dbg(
+					`dynamic tool set restore failed (older pi host lacking getActiveTools/setActiveTools, or a genuine host error): ${toolSetErr}`,
+				);
 			}
 
 			// #449 slice 1 / #472: register this process in the cross-process
@@ -1894,7 +2006,7 @@ export default function (pi: ExtensionAPI) {
 	// Real-time feedback on file writes/edits
 	// biome-ignore lint/suspicious/noExplicitAny: pi.on overload mismatch for tool_result event type
 	(pi as any).on("tool_result", async (event: any, ctx: any) => {
-		rememberEventCtx(ctx);
+		rememberOwnEventCtx(ctx);
 		if (!lensEnabled) return;
 		updateRuntimeIdentityFromEvent(event);
 		// Publish this turn's abort signal so the dispatch's linter/type-check
@@ -1952,7 +2064,7 @@ export default function (pi: ExtensionAPI) {
 	// --- Turn end: batch jscpd/madge on collected files, then clear state ---
 	// Clear cascade snapshot at start of each new turn so stale data never leaks
 	pi.on("turn_start", (_event: any, ctx) => {
-		rememberEventCtx(ctx);
+		rememberOwnEventCtx(ctx);
 		// Trust can change without a new session. Re-adopt before this turn can
 		// reach any install-capable or LSP-spawn path.
 		adoptProjectTrustFromPorts(hostPorts);
@@ -2141,7 +2253,12 @@ export default function (pi: ExtensionAPI) {
 			// gate). See clients/smells-rollup.ts for the tail-scan cost bound.
 			if (shouldCheckSmellsThisTurn(runtime.turnIndex)) {
 				try {
-					for (const note of checkSmellsAndNoteOnce(countRecentSmells())) {
+					// S3c (#1432 review): use the in-process session start instead of
+					// letting countRecentSmells() fall back to its 24h rolling
+					// window — turn_end already knows exactly when this session
+					// began, so admitted rows are scoped to it, not to a day-wide
+					// guess that could straddle multiple sessions.
+					for (const note of checkSmellsAndNoteOnce(countRecentSmells(undefined, runtime.sessionStartedAt))) {
 						notifyUi(ctx, note, "warning");
 					}
 				} catch {
@@ -2239,43 +2356,27 @@ export default function (pi: ExtensionAPI) {
 	// previously this outcome was logs-only, a silent under-report (#533).
 	registerCascadeTierReconcileTask(() => getLSPService(), {
 		onResolvedFound: ({ filePath, diagnostics }) => {
-			const cwd = runtime.projectRoot;
-			const diags = convertLspDiagnostics(
-				diagnostics.filter((d) => d.severity === 1),
+			const run = buildResolvedFoundCascadeRun(runtime.projectRoot, {
 				filePath,
-				{ tool: "lsp" },
-			);
-			if (diags.length === 0) return;
-			const neighbors = [
-				{
-					filePath,
-					reason: "references" as const,
-					diagnostics: diags,
-					lspTouched: true,
-				},
-			];
-			const formatted = formatCascadeNeighborDiagnostics(cwd, neighbors, {
-				noun: "cold neighbor",
+				diagnostics,
 			});
-			if (!formatted) return;
-			runtime.appendCascadeRun({
-				filePath,
-				result: {
-					filePath,
-					impact: {
-						filePath,
-						changedSymbols: [],
-						directImporters: [],
-						directCallers: [],
-						neighborFiles: [filePath],
-						riskFlags: [],
-					},
-					neighbors,
-					formatted,
-				},
-				neighborCount: 1,
-				diagnosticCount: diags.length,
-			});
+			// #1443: the appended run outlives this turn's consumption —
+			// `beginTurn` carries it into the next turn_end exactly once instead
+			// of wiping it (which used to dead-end this whole delivery path).
+			if (run) runtime.appendCascadeRun(run);
+		},
+		// #1444 (issue impact #2): the mirror case — the neighbour published
+		// CLEAN after the skipped in-lane wait. The in-lane path reconciles that
+		// into the footer (`reconcileCascadeNeighborLspErrors`, the #1093 seam);
+		// the skipped path never could, so a fixed neighbour kept showing its old
+		// errors. Errors-only MERGE, so a live warning/biome finding survives; no
+		// write token exists at quiet-window time (the run is idle, nothing is
+		// racing this write), and `publishedAt` stamps the real observation time.
+		// Scope caveat: the touch was `clientScope: "primary"`, so this clears the
+		// LSP-error entries of a multi-primary-server file on one server's clean —
+		// the same errors-only tradeoff the in-lane reconcile documents.
+		onResolvedClean: ({ filePath, publishedAt }) => {
+			reconcileCascadeNeighborLspErrors(filePath, [], undefined, publishedAt);
 		},
 	});
 	// #484: emit the opt-in run summary entry HERE, not at turn_end. The SDK's
@@ -2453,6 +2554,12 @@ export default function (pi: ExtensionAPI) {
 			processExiting: true,
 			reason: "session_shutdown",
 		});
+		// S2d (gap 5, #1432 review): one session_end_bus_rollup row per event
+		// name with any activity this session — same primary-only placement as
+		// the shared-infra teardown above (a concurrent secondary already
+		// returned before reaching here), since the rollup counters are
+		// process-wide module state a live secondary would still need.
+		emitBusEventRollupAtSessionEnd(runtime.projectRoot);
 		// #1123 item 4: dump active handles AFTER teardown — whatever is still
 		// alive at this point is exactly what would keep a --print/--no-session
 		// process from exiting (the #1097 lesson: what survives IS the leak).
@@ -2664,3 +2771,13 @@ export default function (pi: ExtensionAPI) {
 		},
 	);
 }
+
+export default function (pi: ExtensionAPI) {
+	return runInConsoleCaptureWindow(() => activateExtension(pi));
+}
+
+// #1434: the import graph has finished evaluating, so the module window closes
+// here. Everything after this point is host-owned execution, until one of
+// pi-lens's own entry points opens its own window. This must stay the last
+// statement in index.ts.
+closeModuleLoadConsoleWindow();

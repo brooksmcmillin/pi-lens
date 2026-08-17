@@ -13,6 +13,14 @@ const sharedExclude = [
 	"**/dist/**",
 	"**/.{git,cache,output,temp}/**",
 	"**/.claude/**",
+	// Fixture projects carry *.test.ts files that belong to the FIXTURE's own
+	// toolchain (e.g. the native-TS7/Vitest fixture the live integration suite
+	// copies out and type-checks) — they are inputs, not repo tests, and fail
+	// when collected here (#1412 PR #1433 CI).
+	"tests/fixtures/**",
+	// The live suite's copied-out temp projects (gitignored, cleaned in
+	// afterAll, but a mid-run collection race must not pick them up).
+	"tests/native-ts7-live-*/**",
 ];
 
 // The two slow real-process files `npm run test:integration` runs on their own.

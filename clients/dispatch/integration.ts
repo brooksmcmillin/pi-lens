@@ -54,14 +54,15 @@ import type {
 } from "../cascade-types.js";
 import { getDiagnosticTracker } from "../diagnostic-tracker.js";
 import {
+	classifyCascadeWaitTier,
 	isTierAwareCascadeEnabled,
 	recordOutstandingCascadeTouch,
 } from "../lsp/cascade-tier.js";
-import { classifyCascadeWaitTier } from "../lsp/wait-policy/index.js";
 import {
 	type BoundToCurrentDisk,
 	type TouchFileResult,
 	bindingStateLabel,
+	touchCoverageGap,
 } from "../lsp/diagnostic-binding.js";
 import { getServersForFileWithConfig } from "../lsp/config.js";
 import { getLSPService } from "../lsp/index.js";
@@ -572,6 +573,13 @@ function readBoundToCurrentDisk(
  * a future flag cannot be silently missed at just one of the several gate sites:
  *  - `inconclusive` (#1093/#571): the notify/diagnostics wait lapsed its deadline,
  *    so a resolved `[]` is NOT a confirmed clean (the #533 false-clean trap).
+ *  - a COVERAGE GAP (#1470/#1493): an auxiliary never reported — its push wait was
+ *    cut off by the aux grace timer (#1470), or it stayed silent with no stored
+ *    publication for this content (#1493) — so the merged result is missing whatever
+ *    that scanner would have said. Such a touch is deliberately NOT `inconclusive`
+ *    (the primary answered), which is exactly why it needs naming here: reading
+ *    `!inconclusive` alone would let a hung or silent opengrep wipe a live footer
+ *    finding and seed the recently-clean cache.
  *  - `binding.boundToCurrentDisk === false` (#1095): the diagnostics were computed
  *    against a DIFFERENT disk state than what is on disk now (the server's view
  *    diverged / a pre-fix buffer) — not an observation of current disk. `true` and
@@ -587,7 +595,11 @@ function readInconclusive(rawDiags: unknown): boolean {
 }
 
 function isConfirmedTouch(rawDiags: TouchFileResult): boolean {
-	return !readInconclusive(rawDiags) && readBoundToCurrentDisk(rawDiags) !== false;
+	return (
+		!readInconclusive(rawDiags) &&
+		touchCoverageGap(rawDiags).length === 0 &&
+		readBoundToCurrentDisk(rawDiags) !== false
+	);
 }
 
 // #459: the reverse-dependency index is a pure function of the review graph.
@@ -925,6 +937,12 @@ export async function computeCascadeForFile(
 	let importerSet = new Set<string>();
 	let callerSet = new Set<string>();
 	let referenceCount = 0;
+	// #1446 item 4: how many eligible neighbors the flat CASCADE_NEIGHBOUR_BUDGET
+	// cut off, distinct from candidates dropped by the filters above it
+	// (missing on disk, vendor, ignored, already-primary-this-turn) — those are
+	// never actionable regardless of budget, so counting them as "truncated"
+	// would overstate what a larger budget could actually recover.
+	let cascadeBudgetTruncated = 0;
 
 	if (CASCADE_GRAPH_KINDS.has(fileKind)) {
 		const graphStart = Date.now();
@@ -1309,7 +1327,7 @@ export async function computeCascadeForFile(
 		referenceCount = impact.neighborFiles.filter(
 			(n) => !importerOrCallerSet.has(n),
 		).length;
-		sortedNeighbors = [...impact.neighborFiles]
+		const eligibleNeighbors = [...impact.neighborFiles]
 			.filter((n) => nodeFs.existsSync(n))
 			.filter((n) => !isExternalOrVendorFile(n, cwd))
 			// Honour the project's ignore config: a user-ignored neighbour (e.g.
@@ -1322,8 +1340,12 @@ export async function computeCascadeForFile(
 				const rank = (p: string) =>
 					importerSet.has(p) ? 0 : callerSet.has(p) ? 1 : 2;
 				return rank(a) - rank(b);
-			})
-			.slice(0, CASCADE_NEIGHBOUR_BUDGET);
+			});
+		cascadeBudgetTruncated = Math.max(
+			0,
+			eligibleNeighbors.length - CASCADE_NEIGHBOUR_BUDGET,
+		);
+		sortedNeighbors = eligibleNeighbors.slice(0, CASCADE_NEIGHBOUR_BUDGET);
 	} else {
 		logCascade({
 			phase: "cascade_skip",
@@ -1375,6 +1397,28 @@ export async function computeCascadeForFile(
 	// the latter must not collapse into a clean-looking result (#1104 honesty
 	// rule, same doctrine as #1023's graph-degraded indeterminate marker).
 	let fallbackBindingRejected = false;
+	// #1444: neighbours whose in-lane wait was skipped for the quiet-window
+	// reconcile to answer later. Logged on `cascade_result` so a cascade that
+	// deferred EVERY neighbour is distinguishable from a genuine leaf (both are
+	// `neighborCount: 0` with no output otherwise).
+	let collectLaterSkipped = 0;
+	// #1446 item 5: `recentlyCleanNeighborCache` and `neighborTouchCache` hits
+	// are the whole point of both caches, but neither was ever counted — the
+	// only visible signal was 267s/day of touch wall time with no way to tell
+	// whether the caches were absorbing repeat work or every touch was cold.
+	let recentlyCleanHits = 0;
+	let cacheHits = 0;
+	// F1 (#1446 follow-up): `coldTouches` must be counted at the point each
+	// neighbour's OUTCOME is actually known, not derived from `coldSnapshotPaths`
+	// (finalized earlier, before the cache-hit checks below run against it). Using
+	// the pre-outcome list let a neighbour double-count (cold-snapshot AND cache/
+	// recently-clean hit) or vanish from every bucket (an `activePaths` neighbour —
+	// e.g. Python/Go — that misses both caches). These four counters partition the
+	// touched-neighbour set `[...activePaths, ...coldSnapshotPaths]` exactly once
+	// each: a neighbour with no LSP server configured is the only outcome
+	// deliberately excluded (never attempted, no bucket).
+	let deferredTouches = 0;
+	let coldTouches = 0;
 
 	if (sortedNeighbors.length > 0) {
 		const snapshotPaths = sortedNeighbors.filter(shouldReadCascadeFromSnapshot);
@@ -1519,6 +1563,7 @@ export async function computeCascadeForFile(
 					!hasFreshPassiveErrors
 				) {
 					producedLspData = true;
+					recentlyCleanHits++;
 					const durationMs = Date.now() - neighborStart;
 					logCascade({
 						phase: "neighbor_snapshot",
@@ -1548,6 +1593,7 @@ export async function computeCascadeForFile(
 					writeSeq != null ? neighborTouchCache.get(cacheKey) : undefined;
 				if (cached?.turnSeq === turnSeq && cached?.writeSeq === writeSeq) {
 					producedLspData = true;
+					cacheHits++;
 					const durationMs = Date.now() - neighborStart;
 					logCascade({
 						phase: "neighbor_snapshot",
@@ -1584,10 +1630,10 @@ export async function computeCascadeForFile(
 				// A6: async read to avoid blocking event loop on network-mounted drives
 				const content = await nodeFs.promises.readFile(neighborPath, "utf8");
 
-				// #458: tier-aware cascade-lane wait. A Tier-3 (push-only,
-				// silent-on-clean — typescript is the lone core-set instance today)
-				// primary can never give this in-lane wait an affirmative clean
-				// signal, so the budget is pure cost. Fire the touch (didOpen/
+				// #458/#1444: tier-aware cascade-lane wait. A Tier-3 silent server
+				// cannot give this wait an affirmative clean signal. Native TS7 does
+				// publish, but not inside the cold-snapshot budget. In both cases the
+				// in-lane budget is pure cost. Fire the touch (didOpen/
 				// didChange still happens — the server starts real work) and record
 				// it as outstanding for the agent_settled quiet window to reconcile
 				// instead of waiting here. Ambiguous/missing capability data always
@@ -1605,7 +1651,7 @@ export async function computeCascadeForFile(
 							neighborPath,
 							snapshots,
 						);
-						if (tier === "tier3-silent") {
+						if (tier === "tier3-silent" || tier === "collect-later") {
 							const spawnedForTouch =
 								await lspService.getClientForFile(neighborPath);
 							if (spawnedForTouch) {
@@ -1628,6 +1674,13 @@ export async function computeCascadeForFile(
 									touchedAt,
 								});
 								const durationMs = Date.now() - neighborStart;
+								if (tier === "collect-later") collectLaterSkipped++;
+								// F1: both tier3-silent and collect-later skip the in-lane
+								// wait and record an outstanding touch for the quiet-window
+								// reconcile — neither a cache hit nor a genuine completed
+								// cold touch, so both share this explicit "deferred" bucket
+								// instead of falling out of the partition uncounted.
+								deferredTouches++;
 								logCascade({
 									phase: "cascade_tier3_skip",
 									filePath,
@@ -1635,7 +1688,10 @@ export async function computeCascadeForFile(
 									durationMs,
 									lspServerCount: configuredServerCount,
 									coldSnapshot: isColdSnapshot,
-									metadata: { serverId: spawnedForTouch.client.serverId },
+									metadata: {
+										serverId: spawnedForTouch.client.serverId,
+										waitTier: tier,
+									},
 								});
 								// Deliberately NOT cached as clean/diagnosed — the wait was
 								// skipped, not resolved, so neither neighborTouchCache nor
@@ -1658,6 +1714,14 @@ export async function computeCascadeForFile(
 				// Cold-snapshot neighbors (autoPropagate LSP, server warm) use a tighter
 				// 1000ms budget — they should respond quickly; we'd rather return zero
 				// than block cascade for 2s on a slow open.
+				// F1: this is the ONE remaining outcome after cache hit, recently-clean
+				// hit, and tier-aware deferral have all been ruled out — a genuine
+				// active LSP touch is being issued right now. Count it here (an
+				// attempt, whether it resolves, times out, or the promise rejects
+				// below in the allSettled catch) rather than from `coldSnapshotPaths`,
+				// which is finalized before any of the above checks run and includes
+				// neighbours that resolve via cache/recently-clean instead.
+				coldTouches++;
 				const rawDiags = await lspService.touchFile(neighborPath, content, {
 					diagnostics: "document",
 					collectDiagnostics: true,
@@ -1682,6 +1746,11 @@ export async function computeCascadeForFile(
 				const confirmed = isConfirmedTouch(rawDiags);
 				const bindingRejected = readBoundToCurrentDisk(rawDiags) === false;
 				const inconclusive = readInconclusive(rawDiags);
+				// #1470/#1493: the third, independent reason a touch is unconfirmed — an
+				// auxiliary that never reported, cut off by our grace timer or silent
+				// with nothing published for this content. Logged alongside the other two
+				// so cascade.log alone still tells the three apart.
+				const unconfirmedServerIds = touchCoverageGap(rawDiags);
 				// #692: `source: "cascade"` no longer overrides `rule` (see the
 				// doc comment on the sibling call above) — dropped rather than
 				// migrated to `scanOrigin` since cascade output never touches
@@ -1695,8 +1764,9 @@ export async function computeCascadeForFile(
 				);
 				const durationMs = Date.now() - neighborStart;
 
-				// Update cache for this neighbor at the current write sequence
-				if (writeSeq != null) {
+				// Cache only a confirmed answer. An inconclusive or binding-rejected
+				// result must not become a confirmed cache hit on the next cascade.
+				if (writeSeq != null && confirmed) {
 					neighborTouchCache.set(cacheKey, {
 						turnSeq,
 						writeSeq,
@@ -1736,6 +1806,9 @@ export async function computeCascadeForFile(
 					metadata: {
 						inconclusive,
 						...(bindingRejected && { bindingState: bindingStateLabel(false) }),
+						...(unconfirmedServerIds.length > 0 && {
+							unconfirmedServerIds: [...unconfirmedServerIds],
+						}),
 					},
 				});
 
@@ -1767,6 +1840,16 @@ export async function computeCascadeForFile(
 					reason: neighborReason(importerSet, callerSet, neighborPath),
 					diagnostics: diags,
 					lspTouched: true as const,
+					...(inconclusive && { inconclusive: true as const }),
+					// #1459: carry the coverage gap to the agent-facing surface. A
+					// scanner whose breaker was open, whose resync the fan-out gate
+					// deferred, or whom the aux grace timer cut off never looked at this
+					// file — without this the neighbour reaches the agent as
+					// `{ diagnostics: [] }` with no marker, which is the false-clean the
+					// touch already refuses to claim for itself.
+					...(unconfirmedServerIds.length > 0 && {
+						unconfirmedServerIds: [...unconfirmedServerIds],
+					}),
 					durationMs,
 				} satisfies CascadeResult["neighbors"][number];
 			}),
@@ -1896,9 +1979,29 @@ export async function computeCascadeForFile(
 		metadata: {
 			filesWithErrors,
 			hasOutput: formatted.length > 0,
+			// #1444: >0 means "answers are still outstanding", not "nothing found".
+			collectLaterSkipped,
 			// Log when cascade ran but found nothing — distinguishes "clean" from "no signal"
 			noNeighbors: visibleNeighbors.length === 0,
 			noErrors: visibleNeighbors.length > 0 && filesWithErrors === 0,
+			// #1446 item 5: cache effectiveness as a number instead of an inference
+			// from `coldSnapshot`/`snapshotMissing` flags scattered across
+			// per-neighbor `neighbor_touch`/`neighbor_snapshot` rows.
+			// F1: cacheHits + recentlyCleanHits + deferredTouches + coldTouches
+			// partition `[...activePaths, ...coldSnapshotPaths]` exactly — each
+			// counter increments at the point its neighbour's outcome is actually
+			// decided, not from `coldSnapshotPaths` (a pre-outcome list finalized
+			// before the cache-hit checks run). A neighbour with no LSP server
+			// configured is the one deliberately uncounted outcome (never touched).
+			cacheHits,
+			recentlyCleanHits,
+			deferredTouches,
+			coldTouches,
+			// #1446 item 4: the budget in force and how many eligible candidates
+			// it cut off this run — the correctness half (a truncated run being
+			// silently discarded) is #1443; this is observability only.
+			neighborBudget: CASCADE_NEIGHBOUR_BUDGET,
+			budgetTruncated: cascadeBudgetTruncated,
 			neighbors: visibleNeighbors.slice(0, 10).map((n) => ({
 				file: n.filePath.replace(/\\/g, "/").split("/").slice(-2).join("/"),
 				diagnostics: n.diagnostics.length,
@@ -2190,6 +2293,10 @@ export async function dispatchLintWithResult(
 		projectRoot?: string;
 		/** Ordered per-file pipeline token, when called from tool_result. */
 		writeIndex?: number;
+		/** Runtime telemetry identity, when known (#1448) — see
+		 * DispatchContext.telemetryModel's doc. */
+		telemetryModel?: string;
+		telemetryProvider?: string;
 	},
 ): Promise<DispatchResult> {
 	// Default true preserves the per-edit fast path (errors only). Callers that
@@ -2204,6 +2311,8 @@ export async function dispatchLintWithResult(
 		modifiedRanges,
 		options?.projectRoot,
 		options?.writeIndex,
+		options?.telemetryModel,
+		options?.telemetryProvider,
 	);
 	sessionFacts.clearFileFactsFor(ctx.filePath);
 

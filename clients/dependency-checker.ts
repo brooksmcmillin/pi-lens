@@ -21,6 +21,7 @@ import {
 	getManagedToolEnvironment,
 	resolveAvailableOrInstall,
 } from "./dispatch/runners/utils/runner-helpers.js";
+import { createAvailabilityLatch } from "./dispatch/runners/utils/availability-policy.js";
 
 // --- Types ---
 
@@ -261,7 +262,8 @@ export class DependencyChecker {
 			unclassifiedFailureOutcome: "missing",
 		},
 	);
-	private available: boolean | null = null;
+	/** Transient-aware availability memo — see `ensureAvailable` (#1467). */
+	private readonly availabilityLatch = createAvailabilityLatch();
 	private ensureInFlight: Promise<boolean> | null = null;
 	private checkInFlight = new Map<string, Promise<DepCheckResult>>();
 	private scanInFlight = new Map<
@@ -441,11 +443,16 @@ export class DependencyChecker {
 	}
 
 	/**
-	 * Check if madge is available, auto-install if not
+	 * Check if madge is available, auto-install if not.
+	 *
+	 * Shares knip's latch policy (#1467): only a durable verdict is memoized, so
+	 * a probe that timed out — madge's `--version` is ~0.7 s today, but a host
+	 * event-loop stall can expire any budget — does not disable madge for the
+	 * life of the process.
 	 */
 	async ensureAvailable(cwd = process.cwd()): Promise<boolean> {
-		// Fast path: already checked
-		if (this.available !== null) return this.available;
+		const memo = this.availabilityLatch.read();
+		if (memo !== null) return memo;
 		if (this.ensureInFlight) return this.ensureInFlight;
 
 		this.ensureInFlight = this.doEnsureAvailable(cwd);
@@ -462,8 +469,16 @@ export class DependencyChecker {
 			"madge",
 			cwd,
 		);
-		this.available = resolved !== null;
-		return this.available;
+		if (resolved !== null) {
+			this.availabilityLatch.noteAvailable();
+			return true;
+		}
+		const verdict = this.madgeAvailability.getVerdict(cwd);
+		this.availabilityLatch.noteUnavailable(
+			verdict.outcome ?? "missing",
+			verdict.cause ?? "not-found",
+		);
+		return false;
 	}
 
 	/**

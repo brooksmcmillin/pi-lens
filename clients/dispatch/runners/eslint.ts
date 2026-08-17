@@ -21,26 +21,36 @@ import {
 	resolveToolCommand,
 } from "./utils/runner-helpers.js";
 
+const ESLINT_PROBE_BUDGET_MS = 5000;
+
 // Per-cwd cached eslint `--version` verification (#120). Before this, every
 // dispatch invocation ran a fresh `safeSpawnAsync(cmd, ["--version"])` after
 // the local cmd resolution. The probe is cached per cwd because
 // `resolveToolCommand("eslint")` is deterministic from cwd; the underlying
 // cmd identity is captured inside the probe closure.
+//
+// The verdict is governed by the shared availability policy (#1494): the probe
+// hands back the spawn result, so one stalled probe on the first JS/TS save
+// expires on a cooldown instead of disabling eslint for the whole session.
 function makeEslintProbe(cmd: string) {
-	return createCwdCachedProbe(async (cwd) => {
-		const r = await safeSpawnAsync(cmd, ["--version"], { timeout: 5000, cwd });
-		return !r.error && r.status === 0;
-	});
+	return createCwdCachedProbe(
+		(cwd) =>
+			safeSpawnAsync(cmd, ["--version"], {
+				timeout: ESLINT_PROBE_BUDGET_MS,
+				cwd,
+			}),
+		{ tool: "eslint", budgetMs: ESLINT_PROBE_BUDGET_MS },
+	);
 }
-const eslintProbeByCmd = new Map<
+const eslintAvailabilityByCmd = new Map<
 	string,
 	ReturnType<typeof makeEslintProbe>
 >();
 function getEslintProbe(cmd: string) {
-	const existing = eslintProbeByCmd.get(cmd);
+	const existing = eslintAvailabilityByCmd.get(cmd);
 	if (existing) return existing;
 	const created = makeEslintProbe(cmd);
-	eslintProbeByCmd.set(cmd, created);
+	eslintAvailabilityByCmd.set(cmd, created);
 	return created;
 }
 

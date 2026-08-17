@@ -95,6 +95,9 @@ const PROJECT_OWN_CONFIG_KEYS = [
 	"maxProjectFiles",
 	"reviewGraph",
 	"trivy",
+	// `helm.renderValidation.enabled` — the opt-in for rendered-manifest
+	// validation, read via `.raw` in the helm-render runner (#1283).
+	"helm",
 ] as const;
 
 export interface PiLensProjectRuleConfig {

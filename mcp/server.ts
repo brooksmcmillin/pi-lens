@@ -705,7 +705,8 @@ const ALL_TOOLS = [
 			properties: {
 				query: {
 					type: "string",
-					description: "Identifier-ish query, e.g. 'authenticate user'.",
+					description:
+						"Identifier-ish query, e.g. 'authenticate user'. Mix in composable prefix filters: lang:<kind> (e.g. lang:jsts, lang:python — kinds from file-kinds.ts), file:<substr> (path substring), ext:<ext> (e.g. ext:ts or ext:.ts), each optionally negated with a leading '-' (-file:test). Filters apply before ranking; e.g. 'lang:jsts file:clients/ -file:test rank'. Unknown prefixes/kinds error with the supported list.",
 				},
 				cwd: { type: "string" },
 				limit: {

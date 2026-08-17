@@ -182,6 +182,11 @@ export interface DispatchContext {
 	readonly modifiedRanges?: ModifiedRange[];
 	/** Ordered per-file pipeline token used by widget reconciliation (#1198). */
 	readonly writeIndex?: number;
+	/** Model/provider active for this dispatch, when the runtime knows it
+	 * (#1448) — threaded to the worklog append so repair history can be
+	 * attributed. Blank/absent outside a live agent turn (e.g. project scans). */
+	readonly telemetryModel?: string;
+	readonly telemetryProvider?: string;
 
 	hasTool(command: string): Promise<boolean>;
 	log(message: string): void;

@@ -2,17 +2,22 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	buildWordIndex,
+	buildWordIndexQueryFilter,
 	centralityFromReverseDeps,
 	deserializeWordIndex,
 	getWordIndexBuildStatus,
+	parseWordIndexQuery,
 	searchWordIndex,
 	serializeWordIndex,
 	splitIdentifier,
 	tokenizeLine,
 	WORD_INDEX_FORMAT_VERSION,
+	WordIndexQueryError,
+	wordIndexKey,
 	_resetWordIndexBuildGuardForTests,
 	triggerBackgroundWordIndexBuild,
 } from "../../clients/word-index.ts";
+import { KIND_EXTENSIONS } from "../../clients/file-kinds.ts";
 import { loadProjectSnapshot } from "../../clients/project-snapshot.ts";
 import { createTempFile, setupTestEnvironment } from "./test-utils.ts";
 
@@ -65,6 +70,207 @@ describe("tokenizeLine", () => {
 
 	it("returns nothing for a line with no identifiers", () => {
 		expect(tokenizeLine("   () => { + - * }")).toEqual([]);
+	});
+});
+
+// #1450: lang:/file:/ext: prefix filters mixed into the plain query string.
+describe("parseWordIndexQuery (#1450)", () => {
+	it("splits plain terms with no filters, unchanged", () => {
+		const parsed = parseWordIndexQuery("authenticate user");
+		expect(parsed.terms).toBe("authenticate user");
+		expect(parsed.filters).toEqual([]);
+	});
+
+	it("extracts a lang: filter", () => {
+		const parsed = parseWordIndexQuery("lang:jsts rank");
+		expect(parsed.terms.trim()).toBe("rank");
+		expect(parsed.filters).toEqual([{ key: "lang", value: "jsts", negated: false }]);
+	});
+
+	it("extracts a file: filter", () => {
+		const parsed = parseWordIndexQuery("file:clients/ rank");
+		expect(parsed.terms.trim()).toBe("rank");
+		expect(parsed.filters).toEqual([
+			{ key: "file", value: "clients/", negated: false },
+		]);
+	});
+
+	it("extracts an ext: filter", () => {
+		const parsed = parseWordIndexQuery("ext:ts rank");
+		expect(parsed.terms.trim()).toBe("rank");
+		expect(parsed.filters).toEqual([{ key: "ext", value: "ts", negated: false }]);
+	});
+
+	it("extracts a negated filter with a leading -", () => {
+		const parsed = parseWordIndexQuery("-file:test rank");
+		expect(parsed.terms.trim()).toBe("rank");
+		expect(parsed.filters).toEqual([
+			{ key: "file", value: "test", negated: true },
+		]);
+	});
+
+	it("extracts mixed filters and terms in the issue's own example", () => {
+		const parsed = parseWordIndexQuery("lang:ts file:clients/ -file:test rank");
+		expect(parsed.terms.trim()).toBe("rank");
+		expect(parsed.filters).toEqual([
+			{ key: "lang", value: "ts", negated: false },
+			{ key: "file", value: "clients/", negated: false },
+			{ key: "file", value: "test", negated: true },
+		]);
+	});
+
+	it("passes an unknown colon token through as an ordinary term", () => {
+		// Legitimate search terms carry colons: C++ scope operators, log
+		// prefixes, URLs, Windows paths, TODO tags. None may throw; all must
+		// search as plain terms, matching the pre-filter behavior.
+		for (const query of [
+			"std::vector rank",
+			"error:foo",
+			"http://example.com",
+			"TODO:fixme",
+			String.raw`C:\Users\foo`,
+			"type:foo rank",
+		]) {
+			const parsed = parseWordIndexQuery(query);
+			expect(parsed.filters).toEqual([]);
+			expect(parsed.terms).toBe(query);
+		}
+	});
+
+	it("still throws WordIndexQueryError for a KNOWN key with a bad value", () => {
+		// The throw lives at filter-build time (eager resolution), not parse.
+		const parsed = parseWordIndexQuery("lang:notalang rank");
+		let caught: unknown;
+		try {
+			buildWordIndexQueryFilter(parsed.filters);
+		} catch (err) {
+			caught = err;
+		}
+		expect(caught).toBeInstanceOf(WordIndexQueryError);
+	});
+
+	it("treats a bare hyphenated term (no colon) as an ordinary term, not a filter", () => {
+		const parsed = parseWordIndexQuery("-rank other");
+		expect(parsed.filters).toEqual([]);
+		expect(parsed.terms.trim()).toBe("-rank other");
+	});
+
+	it("treats an empty-value key: as an ordinary term, not a filter", () => {
+		const parsed = parseWordIndexQuery("lang: rank");
+		expect(parsed.filters).toEqual([]);
+		expect(parsed.terms.trim()).toBe("lang: rank");
+	});
+});
+
+// `file:` case behavior mirrors the SAME normalizer the index's own
+// path-keyed maps already fold through (#1025) — probe its REAL behavior
+// rather than branching on `process.platform` (the #1024/shape-2/shape-7
+// class): folds case only where the host's map-key normalizer does
+// (win32), never on a case-sensitive FS (e.g. Linux CI), so this test is
+// honest either way instead of vacuously passing.
+const WORD_INDEX_KEY_FOLDS_CASE = wordIndexKey("A.ts") === wordIndexKey("a.ts");
+
+describe("buildWordIndexQueryFilter (#1450)", () => {
+	it("lang: accepts every KIND_EXTENSIONS key — no second, hand-maintained language list (#894)", () => {
+		// Coverage-style assertion: the accepted `lang:` values ARE
+		// KIND_EXTENSIONS' own keys, proven by resolving each key through the
+		// real filter builder rather than any duplicated list.
+		for (const kind of Object.keys(KIND_EXTENSIONS)) {
+			const predicate = buildWordIndexQueryFilter([
+				{ key: "lang", value: kind, negated: false },
+			]);
+			expect(predicate).toBeTypeOf("function");
+		}
+	});
+
+	it("lang: throws for an unrecognized kind, listing known kinds", () => {
+		expect(() =>
+			buildWordIndexQueryFilter([{ key: "lang", value: "klingon", negated: false }]),
+		).toThrow(WordIndexQueryError);
+	});
+
+	it("lang: matches files by KIND_EXTENSIONS extension set", () => {
+		const predicate = buildWordIndexQueryFilter([
+			{ key: "lang", value: "python", negated: false },
+		]);
+		expect(predicate?.("scripts/tool.py")).toBe(true);
+		expect(predicate?.("src/tool.ts")).toBe(false);
+	});
+
+	it("ext: normalizes with or without a leading dot", () => {
+		const withDot = buildWordIndexQueryFilter([
+			{ key: "ext", value: ".ts", negated: false },
+		]);
+		const withoutDot = buildWordIndexQueryFilter([
+			{ key: "ext", value: "ts", negated: false },
+		]);
+		expect(withDot?.("src/tool.ts")).toBe(true);
+		expect(withoutDot?.("src/tool.ts")).toBe(true);
+		expect(withDot?.("src/tool.tsx")).toBe(false);
+	});
+
+	it("file: substring-matches the (wordIndexKey-normalized) path", () => {
+		const predicate = buildWordIndexQueryFilter([
+			{ key: "file", value: "clients/", negated: false },
+		]);
+		expect(predicate?.("clients/word-index.ts")).toBe(true);
+		expect(predicate?.("tools/symbol-search.ts")).toBe(false);
+	});
+
+	it("file: matches regardless of separator (backslash vs forward slash, all platforms)", () => {
+		const predicate = buildWordIndexQueryFilter([
+			{ key: "file", value: "clients/word-index.ts", negated: false },
+		]);
+		expect(predicate?.("sub\\clients\\word-index.ts")).toBe(true);
+	});
+
+	it.skipIf(!WORD_INDEX_KEY_FOLDS_CASE)(
+		"file: is case-insensitive on a case-insensitive FS (win32)",
+		() => {
+			const predicate = buildWordIndexQueryFilter([
+				{ key: "file", value: "CLIENTS/", negated: false },
+			]);
+			expect(predicate?.("clients/word-index.ts")).toBe(true);
+		},
+	);
+
+	it.skipIf(WORD_INDEX_KEY_FOLDS_CASE)(
+		"file: is case-SENSITIVE on a case-sensitive FS (POSIX/Linux CI)",
+		() => {
+			const predicate = buildWordIndexQueryFilter([
+				{ key: "file", value: "CLIENTS/", negated: false },
+			]);
+			expect(predicate?.("clients/word-index.ts")).toBe(false);
+		},
+	);
+
+	it("same-key positive filters OR together", () => {
+		const predicate = buildWordIndexQueryFilter([
+			{ key: "lang", value: "python", negated: false },
+			{ key: "lang", value: "go", negated: false },
+		]);
+		expect(predicate?.("a.py")).toBe(true);
+		expect(predicate?.("b.go")).toBe(true);
+		expect(predicate?.("c.ts")).toBe(false);
+	});
+
+	it("different-key filters AND together", () => {
+		const predicate = buildWordIndexQueryFilter([
+			{ key: "lang", value: "jsts", negated: false },
+			{ key: "file", value: "clients/", negated: false },
+		]);
+		expect(predicate?.("clients/word-index.ts")).toBe(true);
+		expect(predicate?.("tools/word-index.ts")).toBe(false);
+		expect(predicate?.("clients/tool.py")).toBe(false);
+	});
+
+	it("negations always subtract, even against a matching positive filter", () => {
+		const predicate = buildWordIndexQueryFilter([
+			{ key: "file", value: "clients/", negated: false },
+			{ key: "file", value: "test", negated: true },
+		]);
+		expect(predicate?.("clients/word-index.ts")).toBe(true);
+		expect(predicate?.("clients/word-index.test.ts")).toBe(false);
 	});
 });
 
@@ -153,6 +359,93 @@ describe("searchWordIndex fileFilter (#771)", () => {
 		});
 		const plain = searchWordIndex(index, "user");
 		expect(withUndefinedFilter).toEqual(plain);
+	});
+});
+
+// #1450: the SAME query-string filter syntax exercised end-to-end through
+// searchWordIndex, which is the word-index query entry point both symbol_search
+// and pilens_symbol_search forward their raw `query` argument into unchanged.
+describe("searchWordIndex inline query filters (#1450)", () => {
+	const files = [
+		{
+			path: "src/auth/login.ts",
+			content:
+				"export function authenticateUser(credentials) {\n  return verifyPassword(credentials);\n}",
+		},
+		{
+			path: "src/user/profile.ts",
+			content:
+				"export function loadUserProfile(userId) {\n  return db.users.find(userId);\n}",
+		},
+		{
+			path: "scripts/authenticate.py",
+			content: "def authenticate_user(id):\n    return id\n",
+		},
+		{
+			path: "src/user/profile.test.ts",
+			content:
+				"export function loadUserProfile(userId) {\n  return db.users.find(userId);\n}",
+		},
+	];
+
+	it("an unfiltered query is byte-identical to before (regression guard)", () => {
+		const index = buildWordIndex(files);
+		const before = searchWordIndex(index, "user");
+		const after = searchWordIndex(index, "user");
+		expect(after).toEqual(before);
+	});
+
+	it("filters BEFORE ranking: the filtered top hit differs from the unfiltered global top", () => {
+		const index = buildWordIndex(files);
+		const unfiltered = searchWordIndex(index, "user");
+		// The global top hit for "user" is whichever file scores highest overall.
+		expect(unfiltered[0].file).not.toBe("scripts/authenticate.py");
+
+		// Excluding the global top via a lang: filter changes what wins.
+		const filtered = searchWordIndex(index, "lang:python user");
+		expect(filtered).toHaveLength(1);
+		expect(filtered[0].file).toBe("scripts/authenticate.py");
+		expect(filtered[0].file).not.toBe(unfiltered[0].file);
+	});
+
+	it("file: filter scopes hits to a path substring", () => {
+		const index = buildWordIndex(files);
+		const results = searchWordIndex(index, "file:auth/ user");
+		expect(results.map((r) => r.file)).toEqual(["src/auth/login.ts"]);
+	});
+
+	it("negated file: filter excludes matching paths", () => {
+		const index = buildWordIndex(files);
+		const results = searchWordIndex(index, "-file:test profile");
+		expect(results.map((r) => r.file)).toEqual(["src/user/profile.ts"]);
+	});
+
+	it("combined lang:/file:/-file: filters from the issue's own example", () => {
+		const index = buildWordIndex(files);
+		const results = searchWordIndex(index, "lang:jsts file:src/ -file:test user");
+		expect(results.map((r) => r.file).sort()).toEqual(
+			["src/auth/login.ts", "src/user/profile.ts"].sort(),
+		);
+	});
+
+	it("an unknown lang: value propagates WordIndexQueryError out of searchWordIndex", () => {
+		const index = buildWordIndex(files);
+		expect(() => searchWordIndex(index, "lang:klingon user")).toThrow(
+			WordIndexQueryError,
+		);
+	});
+
+	it("empty result after filtering is a normal empty array, not a thrown error", () => {
+		const index = buildWordIndex(files);
+		expect(searchWordIndex(index, "lang:go user")).toEqual([]);
+	});
+
+	it("composes (AND) with a caller-supplied fileFilter option", () => {
+		const index = buildWordIndex(files);
+		const results = searchWordIndex(index, "lang:jsts user", {
+			fileFilter: (file) => file.startsWith("src/auth/"),
+		});
+		expect(results.map((r) => r.file)).toEqual(["src/auth/login.ts"]);
 	});
 });
 

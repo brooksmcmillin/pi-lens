@@ -52,6 +52,72 @@ export interface LatencyEntry {
 let lastPhase: { phase: string; ts: string } | undefined;
 
 /**
+ * Phases excluded from `lastPhase` attribution alongside `loop_block`.
+ * #1412 L3: `lsp_typescript_project_identity` is the classic-TS first-open
+ * project-identity probe (tsserver-sync.ts) — a detached, best-effort
+ * telemetry sample fired on every first didOpen, not genuine work. Letting it
+ * win `lastPhase` would overwrite the real stall attribution for a
+ * loop_block that happens to land right after a first open.
+ * #1432 review: `advisory_provenance_decision`,
+ * `authoritative_content_attachment_decision`, and
+ * `agent_end_deferred_mutation_drain` are the same shape — zero-duration
+ * decision telemetry, not genuine work — so they get the same exclusion.
+ * `agent_end_deferred_mutation_requeue` (S2d gap 4's per-requeue record) and
+ * `session_end_bus_rollup` (S2d gap 5's session-end rollup) are new
+ * zero-duration siblings of the same shape, added alongside them.
+ *
+ * `lsp_aux_wait_outcome` (#1458) is DIFFERENT from every entry above: its
+ * `durationMs` is a REAL bounded wait, not zero-duration decision telemetry.
+ * WHICH wait depends on the row's `waitShape` (#1533), so read that field before
+ * comparing two rows: `"aux_grace"` measures only the post-primary auxiliary
+ * grace (up to a few seconds), while `"aggregate"` — the `clientScope: "all"`
+ * producer, which arms no grace of its own — measures the whole diagnostics wait
+ * from before the primaries settled. The `"aggregate"` number is therefore
+ * systematically larger for the same auxiliary; it is not a regression. It is
+ * still
+ * excluded because it is a WAIT-OUTCOME RECORD written after the aux wait
+ * already completed, not the stall itself — that wait ran inside the
+ * `lsp_touch_file`/diagnostics phase surrounding it, so letting this summary
+ * row win `lastPhase` would misattribute a `loop_block` to the record instead
+ * of to whatever phase is actually stalled when the block fires.
+ * #1453: `tool_set_mutation` records an active-tool-set rewrite (zero-duration
+ * bookkeeping, and it fires during session_start where a real stall must stay
+ * attributed to the work around it), so it is excluded for the same reason.
+ * #1467: `availability_decision` records a tool-probe verdict. Its `durationMs`
+ * is the child's own probe time (often zero for a fast path or a cached
+ * decision) and the record is bookkeeping ABOUT a probe, not host work — a
+ * loop_block landing next to one must stay attributed to whatever really
+ * stalled the loop, which is frequently the very thing that expired the probe.
+ *
+ * #1461 slice 1: `finding_dead_path_drop` is the same shape — the record a
+ * delivery seam writes when it drops findings whose cited path no longer
+ * exists.
+ *
+ * #1459: the three scanner-coverage records are summary rows written from inside
+ * `lsp_touch_file`, and two of them carry ANOTHER write's age as `durationMs`
+ * (`lsp_notify_resync_deferred`, `lsp_notify_write_late_landed`) rather than
+ * their own work. `lsp_scanner_coverage_gap` reports the touch's elapsed time for
+ * joinability. Letting any of them win `lastPhase` would attribute a `loop_block`
+ * to the record instead of to the touch that is actually stalled.
+ */
+const LAST_PHASE_EXCLUDED = new Set([
+	"loop_block",
+	"lsp_typescript_project_identity",
+	"advisory_provenance_decision",
+	"authoritative_content_attachment_decision",
+	"agent_end_deferred_mutation_drain",
+	"agent_end_deferred_mutation_requeue",
+	"session_end_bus_rollup",
+	"lsp_aux_wait_outcome",
+	"tool_set_mutation",
+	"availability_decision",
+	"finding_dead_path_drop",
+	"lsp_scanner_coverage_gap",
+	"lsp_notify_resync_deferred",
+	"lsp_notify_write_late_landed",
+]);
+
+/**
  * The last non-`loop_block` phase logged, or undefined if none yet. Carries its
  * own `ts` so a consumer can gauge staleness: it is intentionally NOT cleared at
  * turn/window boundaries, so on a turn that logged no phase of its own it may
@@ -64,7 +130,7 @@ export function getLastLoggedPhase(): { phase: string; ts: string } | undefined 
 
 export function logLatency(entry: LatencyEntry): void {
 	const ts = new Date().toISOString();
-	if (entry.type === "phase" && entry.phase && entry.phase !== "loop_block") {
+	if (entry.type === "phase" && entry.phase && !LAST_PHASE_EXCLUDED.has(entry.phase)) {
 		lastPhase = { phase: entry.phase, ts };
 	}
 	if (isTestMode()) {

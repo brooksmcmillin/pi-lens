@@ -52,12 +52,15 @@ Use `$$$` when you don't need the captured value; `$$$NAME` when you do.
 
 Use these instead of writing raw YAML:
 
-| Parameter | What it does |
-|---|---|
-| `insideKind` | Only match inside an ancestor of this node kind |
-| `hasKind` | Only match nodes that contain a descendant of this kind |
-| `follows` | Only match nodes preceded by a sibling matching this pattern |
-| `precedes` | Only match nodes followed by a sibling matching this pattern |
+| Parameter | Tool | What it does |
+|---|---|---|
+| `insideKind` | both | Only match inside an ancestor of this node kind (searches ALL ancestors, `stopBy: end`) |
+| `hasKind` | both | Only match nodes whose **immediate child** has this kind (`stopBy: neighbor` — NOT recursive) |
+| `hasDescendantKind` | both | Only match nodes containing this kind **anywhere in their descendants** (`stopBy: end`) — use this instead of `hasKind` when the target isn't a direct child |
+| `follows` | both | Only match nodes preceded by a sibling matching this pattern |
+| `precedes` | both | Only match nodes followed by a sibling matching this pattern |
+
+`hasKind` and `hasDescendantKind` are mutually exclusive on both tools — combining them errors.
 
 ```
 # console.log only inside functions
@@ -152,13 +155,9 @@ Use these as starting points, then scope `paths` tightly.
 
 | Task | Pattern / params |
 |---|---|
-| Find pi lifecycle handlers | `pattern: pi.on($EVENT, $HANDLER)` |
-| Find timers | `pattern: setTimeout($CALLBACK, $$$REST)` or `setInterval($CALLBACK, $$$REST)` |
-| Find immediate/deferred work | `pattern: setImmediate($CALLBACK)` |
-| Find promise callbacks | `pattern: $PROMISE.then($CALLBACK)` / `.catch($CALLBACK)` / `.finally($CALLBACK)` |
 | Find object-literal function dependency by name | `pattern: { resetLSPService: $FN, $$$REST }` |
-| Find fire-and-forget async calls | `pattern: void $CALL` |
 | Find empty catches | `pattern: try { $$$BODY } catch ($ERR) { }` |
+| Find fire-and-forget async calls | `pattern: void $CALL` |
 
 For lifecycle bugs, search first, then use the returned `details.matchLocations[].readSlice` handle for bounded context.
 

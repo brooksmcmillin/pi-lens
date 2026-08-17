@@ -171,6 +171,135 @@ describe("index.ts extension wiring", () => {
 		}
 	});
 
+	it("probes the ctx owned by the activation whose emitter is selected", async () => {
+		_resetSessionLifecycleForTests();
+		resetBusPublishForTests();
+		try {
+			const liveCtx = makeCtx({ cwd: process.cwd(), sessionId: "live-owner" });
+			const staleCtx = makeCtx({ cwd: process.cwd(), sessionId: "stale-sibling" });
+			staleCtx.isIdle = () => {
+				throw new Error("This extension ctx is stale after session replacement");
+			};
+
+			const ownerEmit = vi.fn();
+			const owner = createPiMock();
+			const ownerApi = owner.asExtensionAPI();
+			(ownerApi as unknown as { events: { emit: typeof ownerEmit } }).events = {
+				emit: ownerEmit,
+			};
+			extension(ownerApi);
+			await owner.emit("session_start", { reason: "startup" }, liveCtx);
+
+			const sibling = createPiMock();
+			extension(sibling.asExtensionAPI());
+			// Reclaim the process-global publisher for the owner, then let a stale
+			// sibling handler overwrite only the process-global fallback ctx.
+			await owner.emit("session_start", { reason: "resume" }, liveCtx);
+			await sibling.emit("turn_start", {}, staleCtx);
+			publishFilesTouched({
+				reason: "autofix",
+				paths: ["/repo/live-owner.ts"],
+				cwd: "/repo",
+			});
+
+			expect(
+				ownerEmit.mock.calls.filter(([event]) => event === "pilens:files:touched"),
+			).toHaveLength(1);
+		} finally {
+			_resetSessionLifecycleForTests();
+			resetBusPublishForTests();
+		}
+	});
+
+	it("skips a stale owning ctx even when the global fallback is fresh", async () => {
+		_resetSessionLifecycleForTests();
+		resetBusPublishForTests();
+		try {
+			const staleOwnerCtx = makeCtx({ cwd: process.cwd(), sessionId: "stale-owner" });
+			staleOwnerCtx.isIdle = () => {
+				throw new Error("This extension ctx is stale after session replacement");
+			};
+			const freshGlobalCtx = makeCtx({ cwd: process.cwd(), sessionId: "fresh-sibling" });
+			const ownerEmit = vi.fn();
+			const owner = createPiMock();
+			const ownerApi = owner.asExtensionAPI();
+			(ownerApi as unknown as { events: { emit: typeof ownerEmit } }).events = {
+				emit: ownerEmit,
+			};
+			extension(ownerApi);
+			await owner.emit("session_start", { reason: "startup" }, staleOwnerCtx);
+
+			const sibling = createPiMock();
+			extension(sibling.asExtensionAPI());
+			await owner.emit("session_start", { reason: "resume" }, staleOwnerCtx);
+			await sibling.emit("turn_start", {}, freshGlobalCtx);
+			publishFilesTouched({
+				reason: "autofix",
+				paths: ["/repo/stale-owner.ts"],
+				cwd: "/repo",
+			});
+
+			expect(
+				ownerEmit.mock.calls.filter(([event]) => event === "pilens:files:touched"),
+			).toHaveLength(0);
+		} finally {
+			_resetSessionLifecycleForTests();
+			resetBusPublishForTests();
+		}
+	});
+
+	it("delivers through its own boot window without borrowing a stale sibling's ctx (H2, #1415)", async () => {
+		// Pins the boot-window behavior directly, replacing a test that
+		// asserted delivery via `ownEventCtx ?? latestEventCtx` -- the
+		// reviewer proved that assertion vacuous, since it passes exactly
+		// the same way with the fallback arm removed (an unset ownEventCtx
+		// probes as inconclusive and falls through to "ready" either way).
+		//
+		// This version proves the fallback's ABSENCE actually matters: a
+		// sibling activation ("A") sets the process-global latest-ctx to a
+		// CONFIRMED-STALE ctx. Under the old `?? latestEventCtx` fallback, a
+		// fresh boot activation ("B") with no ctx of its own would have
+		// paired its live emitter with A's stale ctx and been silently
+		// DROPPED (stale-session). With the fallback removed, B's own unset
+		// `ownEventCtx` correctly probes as undefined (inconclusive) rather
+		// than confirmed-stale, so delivery is still attempted.
+		_resetSessionLifecycleForTests();
+		resetBusPublishForTests();
+		try {
+			const staleSiblingCtx = makeCtx({ cwd: process.cwd(), sessionId: "stale-sibling" });
+			staleSiblingCtx.isIdle = () => {
+				throw new Error("This extension ctx is stale after session replacement");
+			};
+			const sibling = createPiMock();
+			extension(sibling.asExtensionAPI());
+			// Sets the process-global `latestEventCtx` to a confirmed-stale ctx
+			// belonging to a DIFFERENT activation than the one created below.
+			await sibling.emit("turn_start", {}, staleSiblingCtx);
+
+			const bootEmit = vi.fn();
+			const boot = createPiMock();
+			const bootApi = boot.asExtensionAPI();
+			(bootApi as unknown as { events: { emit: typeof bootEmit } }).events = {
+				emit: bootEmit,
+			};
+			extension(bootApi);
+			// Boot activation never receives an event of its own -- its
+			// `ownEventCtx` closure variable stays unset.
+			publishFilesTouched({
+				reason: "autofix",
+				paths: ["/repo/boot.ts"],
+				cwd: "/repo",
+			});
+
+			expect(
+				bootEmit.mock.calls.filter(([event]) => event === "pilens:files:touched"),
+			).toHaveLength(1);
+		} finally {
+			_resetSessionLifecycleForTests();
+			resetBusPublishForTests();
+		}
+	});
+
 	describe("registration", () => {
 		it("registers every expected flag, command, tool, and lifecycle hook", () => {
 			const pi = createPiMock();
@@ -307,6 +436,173 @@ describe("index.ts extension wiring", () => {
 					expect(pi.activeTools.has(t), `should stay active: ${t}`).toBe(
 						true,
 					);
+				}
+			} finally {
+				if (prevDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+				else process.env.PILENS_DATA_DIR = prevDataDir;
+				removeTempDirSync(tmp);
+			}
+		});
+
+		// #1453: fork/reload/resume are session REBUILDS. The host constructs a
+		// fresh AgentSession with every registered extension tool active
+		// (`simulateSessionRebuild`) before emitting the event, so pi-lens must
+		// RESTORE the parent's posture — the always-active baseline plus exactly
+		// the lazy tools the model activated. Skipping the mutation would leave
+		// all six lazy tools active; a plain baseline shrink would drop the
+		// model's activation. These assertions catch both.
+		it.each(["fork", "reload", "resume"])(
+			"restores the parent's tool posture on %s session_start",
+			async (reason) => {
+				const tmp = fs.mkdtempSync(
+					path.join(os.tmpdir(), `pi-lens-wiring-${reason}-`),
+				);
+				const prevDataDir = process.env.PILENS_DATA_DIR;
+				process.env.PILENS_DATA_DIR = path.join(tmp, "data");
+				try {
+					_resetSessionLifecycleForTests();
+					const pi = createPiMock();
+					extension(pi.asExtensionAPI());
+					const ctx = makeCtx({ cwd: tmp, sessionId: `cache-${reason}` });
+					await pi.emit("session_start", { reason: "startup" }, ctx);
+					const loader = pi.getTool("pi_lens_activate_tools") as {
+						execute: (...args: unknown[]) => Promise<unknown>;
+					};
+					await loader.execute(
+						"activate",
+						{ tools: ["ast_grep_search"] },
+						undefined,
+						undefined,
+						ctx,
+					);
+					const parentPosture = new Set(pi.activeTools);
+					expect(parentPosture.has("ast_grep_search")).toBe(true);
+					expect(parentPosture.has("ast_grep_replace")).toBe(false);
+
+					// The host re-activates EVERYTHING before the rebuilt session
+					// announces itself.
+					pi.simulateSessionRebuild();
+					for (const tool of EXPECTED_TOOLS) {
+						expect(pi.activeTools.has(tool), tool).toBe(true);
+					}
+
+					await pi.emit("session_start", { reason }, ctx);
+
+					// Character-for-character the parent's set: the advertised tool
+					// list still matches the cached prompt prefix AND the model's
+					// activation survived.
+					expect([...pi.activeTools].sort()).toEqual([...parentPosture].sort());
+					expect(pi.activeTools.has("ast_grep_search")).toBe(true);
+					expect(pi.activeTools.has("ast_grep_replace")).toBe(false);
+					expect(pi.activeTools.has("lsp_navigation")).toBe(false);
+				} finally {
+					if (prevDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+					else process.env.PILENS_DATA_DIR = prevDataDir;
+					removeTempDirSync(tmp);
+				}
+			},
+		);
+
+		// A genuinely new conversation drops the activation memory: the rebuilt
+		// all-active set shrinks back to the bare baseline.
+		it("forgets the previous conversation's activations on a new session", async () => {
+			const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-wiring-new-"));
+			const prevDataDir = process.env.PILENS_DATA_DIR;
+			process.env.PILENS_DATA_DIR = path.join(tmp, "data");
+			try {
+				_resetSessionLifecycleForTests();
+				const pi = createPiMock();
+				extension(pi.asExtensionAPI());
+				const ctx = makeCtx({ cwd: tmp, sessionId: "cache-new" });
+				await pi.emit("session_start", { reason: "startup" }, ctx);
+				const loader = pi.getTool("pi_lens_activate_tools") as {
+					execute: (...args: unknown[]) => Promise<unknown>;
+				};
+				await loader.execute(
+					"activate",
+					{ tools: ["ast_grep_search"] },
+					undefined,
+					undefined,
+					ctx,
+				);
+				expect(pi.activeTools.has("ast_grep_search")).toBe(true);
+
+				pi.simulateSessionRebuild();
+				await pi.emit("session_start", { reason: "new" }, ctx);
+
+				expect(pi.activeTools.has("ast_grep_search")).toBe(false);
+				expect(pi.activeTools.has("lens_diagnostics")).toBe(true);
+			} finally {
+				if (prevDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+				else process.env.PILENS_DATA_DIR = prevDataDir;
+				removeTempDirSync(tmp);
+			}
+		});
+
+		// #473: the active tool set is process-shared runtime state. A
+		// concurrently-live secondary's session_start must not rewrite it out
+		// from under the still-live primary (last writer would win).
+		it("leaves the tool set alone on a concurrent secondary session_start", async () => {
+			const tmp = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-wiring-secondary-tools-"),
+			);
+			const prevDataDir = process.env.PILENS_DATA_DIR;
+			process.env.PILENS_DATA_DIR = path.join(tmp, "data");
+			try {
+				_resetSessionLifecycleForTests();
+				const pi = createPiMock();
+				extension(pi.asExtensionAPI());
+				await pi.emit(
+					"session_start",
+					{ reason: "startup" },
+					makeCtx({ cwd: tmp, sessionId: "primary" }),
+				);
+				// A subagent binds in-process; the host hands it an all-active
+				// runtime just like any other session construction.
+				pi.simulateSessionRebuild();
+
+				await pi.emit(
+					"session_start",
+					{ reason: "startup" },
+					makeCtx({ cwd: tmp, sessionId: "secondary" }),
+				);
+
+				// Untouched: the secondary returned at the #473 guard, above the
+				// tool-set mutation.
+				for (const tool of EXPECTED_TOOLS) {
+					expect(pi.activeTools.has(tool), tool).toBe(true);
+				}
+			} finally {
+				if (prevDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+				else process.env.PILENS_DATA_DIR = prevDataDir;
+				removeTempDirSync(tmp);
+			}
+		});
+
+		it("keeps every tool statically active when lazy tooling is disabled", async () => {
+			const tmp = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-wiring-static-tools-"),
+			);
+			const prevDataDir = process.env.PILENS_DATA_DIR;
+			process.env.PILENS_DATA_DIR = path.join(tmp, "data");
+			try {
+				_resetSessionLifecycleForTests();
+				const pi = createPiMock({ "no-lazy-tools": true });
+				extension(pi.asExtensionAPI());
+				const ctx = makeCtx({ cwd: tmp, sessionId: "static" });
+				await pi.emit("session_start", { reason: "startup" }, ctx);
+
+				for (const tool of EXPECTED_TOOLS) {
+					expect(pi.activeTools.has(tool), tool).toBe(true);
+				}
+
+				// Still all-active after a rebuild: under the opt-out pi-lens never
+				// touches the set, on any reason.
+				pi.simulateSessionRebuild();
+				await pi.emit("session_start", { reason: "fork" }, ctx);
+
+				for (const tool of EXPECTED_TOOLS) {
+					expect(pi.activeTools.has(tool), tool).toBe(true);
 				}
 			} finally {
 				if (prevDataDir === undefined) delete process.env.PILENS_DATA_DIR;

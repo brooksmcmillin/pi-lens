@@ -10,6 +10,7 @@ import {
 	STALE_HEARTBEAT_MS,
 } from "./instance-reaper.js";
 import { logLatency } from "./latency-logger.js";
+import { touchCoverageGap } from "./lsp/diagnostic-binding.js";
 import { loadLspService } from "./lsp-lazy.js";
 import {
 	contentHash,
@@ -134,6 +135,11 @@ async function serveRequest(
 		source: "warm-attach-incumbent",
 	});
 	const servedAt = Date.now();
+	// #1470: the coverage gap is read through the shared helper, never re-derived
+	// from `confirmation === "partial"`. The two fields are set together today, so
+	// either test passes — which is exactly the coincidence `touchCoverageGap`'s
+	// own doc comment warns against. One reader, one rule.
+	const coverageGap = touchCoverageGap(touched);
 	if (servedAt <= req.deadlineAt && touched !== undefined && !touched.inconclusive) {
 		state.servedDiagnosticHashes.set(
 			normalizeFilePath(req.file),
@@ -160,6 +166,17 @@ async function serveRequest(
 			// server is indistinguishable from "never answered" on the far side.
 			...(touched?.confirmation === "confirmed"
 				? { confirmation: "confirmed" as const }
+				: {}),
+			// #1470: a PARTIAL touch crosses the socket as itself rather than as a
+			// missing key. Omitting it would still fail closed on the far side, but it
+			// would be indistinguishable from an old incumbent that never sent the
+			// field — and the whole point of narrowing is that the reader can tell
+			// which coverage is real.
+			...(coverageGap.length > 0
+				? {
+						confirmation: "partial" as const,
+						unconfirmedServerIds: [...coverageGap],
+					}
 				: {}),
 		},
 	};

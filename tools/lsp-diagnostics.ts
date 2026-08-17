@@ -32,6 +32,8 @@ import { detectFileRole } from "../clients/file-role.js";
 import type { LSPDiagnostic } from "../clients/lsp/client.js";
 import {
 	hashDiagnosticContent,
+	touchCompletedConfirmationPolicy,
+	touchCoverageGap,
 	type DiagnosticBinding,
 	type TouchFileResult,
 } from "../clients/lsp/diagnostic-binding.js";
@@ -668,6 +670,17 @@ type DiagnosticsCollectionResult = {
 	 */
 	confirmedByTouch: boolean;
 	/**
+	 * #1470/#1493: server ids the touch carries no evidence for — an auxiliary whose
+	 * push wait was cut off by the aux grace timer (#1470), or one that stayed silent
+	 * with no stored publication for this content (#1493). Empty when every spawned
+	 * server got to answer. `confirmedByTouch` stays TRUE in that case: the primary's
+	 * own confirmation is untouched, and conflating the two would report a hung or
+	 * silent opengrep as "typescript could not confirm clean", a different lie. The caller
+	 * demotes the FILE-level verdict to "unconfirmed" while keeping the primary line
+	 * honest.
+	 */
+	unconfirmedServerIds: readonly string[];
+	/**
 	 * #692: the file content read while collecting (undefined only when the
 	 * read itself failed) — reused by the widget-reconcile caller so it can
 	 * derive `fileRole` for `retagAuxiliaryDiagnostics`'s `skipTestFiles` gate
@@ -740,9 +753,16 @@ async function collectDiagnosticsForFile(
 					// confirmation: it carries the same caveat all-scope local
 					// touches do, and classic TypeScript still needs the primary-only
 					// tsserver sync check below rather than this verdict.
+					// #1470: `"partial"` counts, for the same reason the local touch
+					// branch below accepts it — the incumbent's primary confirmed; only
+					// a named auxiliary did not.
 					confirmedByTouch:
-						attached.response.confirmation === "confirmed" &&
+						attached.response.confirmation !== undefined &&
 						primaryServerId(absPath) !== "typescript",
+					// #1470: the incumbent's narrowed verdict, carried as an explicit DTO
+					// field across the socket. An older incumbent omits it → empty → the
+					// pre-#1470 handling, unchanged.
+					unconfirmedServerIds: attached.response.unconfirmedServerIds ?? [],
 					content,
 				};
 			}
@@ -814,12 +834,21 @@ async function collectDiagnosticsForFile(
 	// one; the openFile-only / getDiagnostics fallback leaves it undefined →
 	// "unknown", no demotion).
 	const binding = usedTouch ? touched?.binding : undefined;
+	// #1470: `"partial"` counts here. `confirmedByTouch` feeds
+	// `canTrustTouchConfirmation`, which asks about the PRIMARY's own verdict —
+	// and a partial touch is one whose primary confirmed while an auxiliary was
+	// cut off. Excluding it would render "Primary LSP: unconfirmed" for a primary
+	// that did confirm. The coverage gap is carried separately, below.
 	const confirmedByTouch =
-		usedTouch && touched?.confirmation === "confirmed";
+		usedTouch && touchCompletedConfirmationPolicy(touched);
 	return {
 		diagnostics: filtered,
 		timedOut,
 		confirmedByTouch,
+		// #1470: only a touch actually contributes a coverage gap; the
+		// openFile+getDiagnostics fallback never reports one, which is honest —
+		// that path claims no confirmation at all.
+		unconfirmedServerIds: usedTouch ? touchCoverageGap(touched) : [],
 		content,
 		binding,
 	};
@@ -1078,6 +1107,7 @@ async function collectFileDiagnosticResult(
 		diagnostics: rawDiags,
 		timedOut,
 		confirmedByTouch,
+		unconfirmedServerIds,
 		content: collectedContent,
 		binding,
 	} = await collectDiagnosticsForFile(file, lspService, waitMs, serverScope);
@@ -1118,6 +1148,15 @@ async function collectFileDiagnosticResult(
 	// re-cementing path). "unknown"/true bindings leave the verdict untouched.
 	const boundMismatch = binding?.boundToCurrentDisk === false;
 	if (boundMismatch) confirmation = "unconfirmed";
+	// #1470/#1493: an auxiliary that never reported — cut off by the aux grace timer,
+	// or silent with nothing published for this content — contributed no evidence
+	// about this file, so a "clean" verdict computed from the merged result would
+	// be claiming coverage this batch does not have. Demote it — that also keeps
+	// the entry out of the workspace cache below, which would otherwise replay the
+	// partial answer as a confirmed clean on every later sweep.
+	if (unconfirmedServerIds.length > 0 && confirmation === "clean") {
+		confirmation = "unconfirmed";
+	}
 	const filteredDiags = applySeverityFilter(effectiveRawDiags, severity);
 	reconcileWidgetFromLspResult(
 		file,
@@ -1172,6 +1211,7 @@ async function runFileDiagnostics(
 		diagnostics: rawDiags,
 		timedOut,
 		confirmedByTouch,
+		unconfirmedServerIds,
 		content: collectedContent,
 		binding,
 	} = await collectDiagnosticsForFile(absPath, lspService, waitMs, serverScope);
@@ -1216,6 +1256,16 @@ async function runFileDiagnostics(
 	// longer "definitionally confirmed". "unknown"/true bindings are unchanged.
 	const boundMismatch = binding?.boundToCurrentDisk === false;
 	if (boundMismatch) confirmation = "unconfirmed";
+	// #1470/#1493: NARROWED, not collapsed. An auxiliary that never reported — the aux
+	// grace timer cut it off, or it stayed silent with nothing published for this
+	// content — makes the FILE-level verdict unconfirmed. The merged result is missing
+	// whatever that scanner would have said, and this tool is the security lane's read surface. The
+	// PRIMARY's own verdict is untouched (`primaryCoverageGapOnly` below), so a
+	// TypeScript answer stays "confirmed clean" on its own line while an explicit
+	// line names the scanner whose coverage is absent.
+	const primaryCoverageGapOnly =
+		unconfirmedServerIds.length > 0 && confirmation === "clean";
+	if (primaryCoverageGapOnly) confirmation = "unconfirmed";
 	const filtered = applySeverityFilter(effectiveRawDiags, severity);
 	const total = filtered.length;
 	const truncated = total > MAX_DIAGNOSTICS;
@@ -1246,7 +1296,11 @@ async function runFileDiagnostics(
 				"Re-check after the server settles, or increase waitMs."
 			);
 		}
-		if (unconfirmed) {
+		// #1470: a file demoted ONLY because an auxiliary was cut off must not render
+		// the silent-on-clean text — the primary did confirm, and saying otherwise is
+		// the same overclaim in the opposite direction. The coverage line below names
+		// what is actually missing.
+		if (unconfirmed && !primaryCoverageGapOnly) {
 			return (
 				`Primary LSP${primaryId ? ` (${primaryId})` : ""}: unconfirmed — ` +
 				"cannot confirm clean (push-only, silent-on-clean, e.g. classic " +
@@ -1261,11 +1315,22 @@ async function runFileDiagnostics(
 		return `Primary LSP${primaryId ? ` (${primaryId})` : ""}: ${primaryDiags.length} diagnostic${primaryDiags.length === 1 ? "" : "s"}.`;
 	})();
 
+	// #1470: this is the narrowing made readable. It states exactly which servers
+	// this result does NOT speak for, so "no auxiliary findings" can never be read
+	// as "the security scanners found nothing".
+	const coverageLine =
+		unconfirmedServerIds.length > 0
+			? `Auxiliary coverage INCOMPLETE — ${[...unconfirmedServerIds].join(", ")} did not answer within the wait budget, so ${unconfirmedServerIds.length === 1 ? "its findings are" : "their findings are"} NOT included here. This is not a clean bill of health for ${unconfirmedServerIds.length === 1 ? "that scanner" : "those scanners"}; re-check after the next edit, or use waitMs to wait longer.`
+			: undefined;
+
 	let text: string;
 	if (total === 0) {
-		text = [primaryLine, "", unavailable ?? "No auxiliary findings."].join(
-			"\n",
-		);
+		text = [
+			primaryLine,
+			"",
+			unavailable ?? "No auxiliary findings.",
+			...(coverageLine ? [coverageLine] : []),
+		].join("\n");
 	} else {
 		const lines = [primaryLine, ""];
 		if (primaryDiags.length > 0) {
@@ -1275,6 +1340,7 @@ async function runFileDiagnostics(
 			lines.push(`Auxiliary findings (${auxiliaryDiags.length}):`);
 			lines.push(...auxiliaryDiags.map(formatDiag));
 		}
+		if (coverageLine) lines.push("", coverageLine);
 		if (unavailable) lines.unshift(unavailable, "");
 		if (truncated) {
 			lines.unshift(
@@ -1306,6 +1372,11 @@ async function runFileDiagnostics(
 			truncated,
 			unconfirmed,
 			timedOut: unconfirmed ? timedOut : undefined,
+			// #1470: which servers this result does NOT speak for. Absent when it
+			// speaks for all of them.
+			...(unconfirmedServerIds.length > 0 && {
+				unconfirmedServerIds: [...unconfirmedServerIds],
+			}),
 			lspHealth,
 			waitMs,
 		},

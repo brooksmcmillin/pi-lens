@@ -23,6 +23,7 @@ describe("dispatch integration groups", () => {
 			"yamllint",
 			"trivy-config",
 			"helm-lint",
+			"helm-render",
 		]);
 		// mode:"all" — yamllint (smart-default) runs alongside the LSP rather than
 		// being suppressed when the LSP succeeds (#209 fallback→all fix).

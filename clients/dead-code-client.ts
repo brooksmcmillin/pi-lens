@@ -16,6 +16,13 @@ import { createSubsystemLogger } from "./extension-log.js";
 import * as path from "node:path";
 import { findNearestMarkerRoot } from "./path-utils.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
+import {
+	type ProbeEvidence,
+	classifyProbeFailure,
+	createAvailabilityLatch,
+	logAvailabilityDecision,
+	startHostStallSampler,
+} from "./dispatch/runners/utils/availability-policy.js";
 
 // --- Types ---
 
@@ -52,6 +59,8 @@ export interface DeadCodeClient {
 	readonly language: string;
 	/** Cheap synchronous probe: does a project of this language live at cwd? */
 	detect(cwd: string): boolean;
+	/** Is this file one this client analyzes? Gates the per-turn delta re-scan. */
+	owns(filePath: string): boolean;
 	/** Resolve the binary (PATH first, then auto-install). */
 	ensureAvailable(): Promise<boolean>;
 	/** Project-wide scan. Never throws; failures come back as success:false. */
@@ -83,6 +92,22 @@ const VULTURE_EXCLUDES = [
 	"*/site-packages/*",
 	"*/__pycache__/*",
 	"*/.eggs/*",
+];
+
+// Decorators whose target is called by a framework, never by name in the tree.
+// vulture cannot see those call sites, so every such symbol is a permanent
+// false positive that reappears in every scan — the fastest way to teach a
+// reader to stop reading the advisory. Glob-matched by vulture itself.
+const VULTURE_IGNORE_DECORATORS = [
+	"@pytest.fixture",
+	"@pytest.fixture(*",
+	"@fixture",
+	"@fixture(*",
+	"@app.*",
+	"@router.*",
+	"@celery.task*",
+	"@task",
+	"@shared_task*",
 ];
 
 // vulture line: `path/to/file.py:12: unused function 'foo' (60% confidence)`
@@ -137,7 +162,12 @@ export class PythonDeadCodeClient implements DeadCodeClient {
 	readonly id = "python";
 	readonly language = "Python";
 
-	private available: boolean | null = null;
+	/**
+	 * Transient-aware memo (#1467): only a durable "vulture is not installed"
+	 * verdict is remembered for the session. A probe that timed out expires and
+	 * is re-probed, so vulture cannot be disabled for the process by one stall.
+	 */
+	private readonly availabilityLatch = createAvailabilityLatch();
 	private resolved: { cmd: string; prefix: string[] } | null = null;
 	private ensureInFlight: Promise<boolean> | null = null;
 	private inFlight = new Map<string, Promise<DeadCodeResult>>();
@@ -159,6 +189,11 @@ export class PythonDeadCodeClient implements DeadCodeClient {
 
 	detect(cwd: string): boolean {
 		return this.resolveProjectRoot(cwd) !== null;
+	}
+
+	owns(filePath: string): boolean {
+		const ext = path.extname(filePath).toLowerCase();
+		return ext === ".py" || ext === ".pyi";
 	}
 
 	/**
@@ -187,7 +222,8 @@ export class PythonDeadCodeClient implements DeadCodeClient {
 	}
 
 	async ensureAvailable(): Promise<boolean> {
-		if (this.available !== null) return this.available;
+		const memo = this.availabilityLatch.read();
+		if (memo !== null) return memo;
 		if (this.ensureInFlight) return this.ensureInFlight;
 		this.ensureInFlight = this.doEnsureAvailable();
 		try {
@@ -210,19 +246,97 @@ export class PythonDeadCodeClient implements DeadCodeClient {
 			{ cmd: "python", prefix: ["-m", "vulture"] },
 			{ cmd: "python3", prefix: ["-m", "vulture"] },
 		];
+		// A timeout on ANY candidate means the machine, not the tool, answered —
+		// the run gets a bounded retry instead of a permanent skip (#1467).
+		let sawTransient = false;
+		let transientCause: ReturnType<typeof classifyProbeFailure>["cause"] =
+			"probe-timeout";
+		// Accumulated across ALL candidates, because the failure verdicts below
+		// are about the whole sweep rather than any one probe. Reporting zero
+		// here would erase the evidence that cracked #1467: four 5s probes and
+		// a stalled host look identical to an absent tool without these two
+		// numbers.
+		const sweepStartedAt = Date.now();
+		let sweepHostStallMs = 0;
+		/** What the last classified candidate returned (#1500 review): this was
+		 * computed and thrown away, so every vulture row said "missing" with no
+		 * trace of which candidate reported what. */
+		let sweepEvidence: ProbeEvidence | undefined;
 		for (const c of candidates) {
-			const probe = await safeSpawnAsync(c.cmd, [...c.prefix, "--version"], {
-				timeout: 5000,
-			});
+			const sampler = startHostStallSampler();
+			const startedAt = Date.now();
+			let probe: Awaited<ReturnType<typeof safeSpawnAsync>>;
+			let hostStallMs: number;
+			try {
+				probe = await safeSpawnAsync(c.cmd, [...c.prefix, "--version"], {
+					timeout: 5000,
+				});
+			} finally {
+				hostStallMs = sampler.stop();
+				sweepHostStallMs += hostStallMs;
+			}
 			if (!probe.error && probe.status === 0) {
 				this.resolved = c;
-				this.available = true;
+				this.availabilityLatch.noteAvailable();
 				this.log(`vulture found: ${[c.cmd, ...c.prefix].join(" ")}`);
+				logAvailabilityDecision({
+					tool: "vulture",
+					verdict: "available",
+					outcome: "success",
+					cause: "ok",
+					elapsedMs: Date.now() - startedAt,
+					latched: true,
+					hostStallMs,
+					budgetMs: 5000,
+				});
 				return true;
 			}
+			const classified = classifyProbeFailure(probe, {
+				hostStallMs,
+				command: c.cmd,
+			});
+			sweepEvidence = classified.evidence;
+			if (classified.outcome === "transient") {
+				sawTransient = true;
+				transientCause = classified.cause;
+			}
 		}
-		this.available = false;
+		if (sawTransient) {
+			const retryAfterMs = this.availabilityLatch.noteUnavailable(
+				"transient",
+				transientCause,
+			);
+			this.log("vulture probe timed out; will retry (not treated as missing)");
+			logAvailabilityDecision({
+				tool: "vulture",
+				verdict: "unavailable",
+				outcome: "transient",
+				cause: transientCause,
+				elapsedMs: Date.now() - sweepStartedAt,
+				hostStallMs: sweepHostStallMs,
+				latched: false,
+				retryAfterMs,
+				budgetMs: 5000,
+				classifiedBy: "probe",
+				...(sweepEvidence !== undefined && { evidence: sweepEvidence }),
+			});
+			return false;
+		}
+		this.availabilityLatch.noteUnavailable("missing", "not-found");
 		this.log("vulture not installed; skipping (no auto-install)");
+		logAvailabilityDecision({
+			tool: "vulture",
+			verdict: "unavailable",
+			outcome: "missing",
+			cause: "not-found",
+			elapsedMs: Date.now() - sweepStartedAt,
+			hostStallMs: sweepHostStallMs,
+			latched: true,
+			budgetMs: 5000,
+			// Every candidate probe was classified, and none was transient (#1500).
+			classifiedBy: "probe",
+			...(sweepEvidence !== undefined && { evidence: sweepEvidence }),
+		});
 		return false;
 	}
 
@@ -261,6 +375,7 @@ export class PythonDeadCodeClient implements DeadCodeClient {
 			".",
 			`--min-confidence=${this.minConfidence}`,
 			`--exclude=${VULTURE_EXCLUDES.join(",")}`,
+			`--ignore-decorators=${VULTURE_IGNORE_DECORATORS.join(",")}`,
 		];
 		const result = await safeSpawnAsync(invocation.cmd, args, {
 			timeout: ANALYSIS_TIMEOUT_MS,
@@ -334,37 +449,60 @@ export function deadCodeIssueCount(result: DeadCodeResult): number {
 	);
 }
 
-/**
- * Format cached dead-code results into one turn_end advisory, or "" when there
- * is nothing to report. Merges multiple languages (polyglot repos) under one
- * `[Dead code]` heading so it reads consistently next to the Knip advisory.
- * Advisory-only: these are project-wide signals, never blockers.
- */
-export function formatDeadCodeAdvisory(
-	results: DeadCodeResult[],
-	maxPerLang = 10,
-): string {
-	const withFindings = results.filter(
-		(r) => r.success && deadCodeIssueCount(r) > 0,
-	);
-	if (withFindings.length === 0) return "";
+/** Every bucket flattened — delta diffing and diagnostic mapping want one list. */
+export function deadCodeIssues(result: DeadCodeResult): DeadCodeIssue[] {
+	return [
+		...result.unusedExports,
+		...result.unusedFiles,
+		...result.unusedDeps,
+		...result.unlistedDeps,
+	];
+}
 
-	const lines: string[] = [];
-	for (const r of withFindings) {
-		const count = deadCodeIssueCount(r);
-		lines.push(`${r.language}: ${count} unused symbol(s)`);
-		for (const issue of r.unusedExports.slice(0, maxPerLang)) {
-			const loc = issue.file
-				? ` (${issue.file}${issue.line ? `:${issue.line}` : ""})`
-				: "";
-			lines.push(`    - unused ${issue.kind} '${issue.name}'${loc}`);
-		}
-		if (r.unusedExports.length > maxPerLang) {
-			lines.push(`    … and ${r.unusedExports.length - maxPerLang} more`);
-		}
+/**
+ * Joins finding-identity parts into a stable key for diffing one scan
+ * against the previous one. The string-only signature is load-bearing: a
+ * line/column number cannot be passed without a compile error. An edit
+ * shifts every line below it, and a scan delta is then filtered to exactly
+ * the files the edit touched — so a line in the key turns each shifted
+ * pre-existing finding into a "newly unused" report under a heading that
+ * blames the agent's own edit for orphaning it. Inserting four lines above
+ * one real finding produced four false ones (#1477, #1483). Shared by
+ * knip's per-turn delta in runtime-turn.ts so the rule lives in one place.
+ */
+export function stableFindingKey(
+	...parts: Array<string | undefined>
+): string {
+	return parts.map((part) => part ?? "").join(":");
+}
+
+/** Stable identity for diffing one scan against the previous one. */
+export function deadCodeIssueKey(issue: DeadCodeIssue): string {
+	return stableFindingKey(issue.category, issue.file, issue.name);
+}
+
+/**
+ * Format this turn's ATTRIBUTABLE delta — symbols that became unused in files
+ * the agent just edited — or "" when there is nothing to report. Mirrors the
+ * Knip advisory's contract deliberately: the project-wide list is not injected
+ * per turn (hundreds of pre-existing findings would drown the blockers and burn
+ * context every turn), it stays available on demand via lens_diagnostics.
+ */
+export function formatDeadCodeDelta(
+	issues: DeadCodeIssue[],
+	language: string,
+	max = 5,
+): string {
+	if (issues.length === 0) return "";
+	let report = `💀 Newly unused ${language} symbols in files you edited — check if callers need updating (dead-code):\n`;
+	for (const issue of issues.slice(0, max)) {
+		const loc = issue.file
+			? `${issue.file}${issue.line ? `:${issue.line}` : ""}`
+			: "(unknown)";
+		report += `  ${loc} — unused ${issue.kind} ${issue.name}\n`;
 	}
-	return (
-		"💀 [Dead code] project-wide unused symbols — verify before removing:\n  " +
-		lines.join("\n  ")
-	);
+	if (issues.length > max) {
+		report += `  … and ${issues.length - max} more\n`;
+	}
+	return report;
 }

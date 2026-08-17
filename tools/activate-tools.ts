@@ -34,9 +34,28 @@ export type ActiveToolsHost = {
 	setActiveTools?: (names: string[]) => void;
 };
 
+export interface ActivateToolsOptions {
+	deferredToolSupport?: (ctx: unknown) => boolean;
+	/**
+	 * Called with every lazy tool name the model asked for, so the extension
+	 * can remember this logical session's activations and restore them after
+	 * the host rebuilds the session — fork/reload/resume construct a fresh
+	 * AgentSession with every registered tool active again, while pi-lens's
+	 * closure state survives (see clients/tool-set-policy.ts).
+	 */
+	onActivated?: (names: string[]) => void;
+	onMutation?: (mutation: {
+		addedCount: number;
+		removedCount: number;
+		reason: "lazy_activation";
+		deferralApplies: boolean;
+	}) => void;
+}
+
 export function createActivateToolsTool(
 	pi: ActiveToolsHost,
 	lazyTools: ActivatableToolInfo[],
+	options: ActivateToolsOptions = {},
 ) {
 	const lazyNames = lazyTools.map((t) => t.name);
 	const lazyNameSet = new Set(lazyNames);
@@ -63,6 +82,7 @@ export function createActivateToolsTool(
 			params: Record<string, unknown>,
 			_signal: AbortSignal | undefined,
 			_onUpdate: unknown,
+			ctx?: unknown,
 		) {
 			const requested = Array.isArray(params.tools)
 				? (params.tools as unknown[]).filter(
@@ -85,11 +105,24 @@ export function createActivateToolsTool(
 
 			// Additive only, per the docs' contract: never drop currently active
 			// tools in the same call.
+			// Remember every requested tool, not just the newly-added ones: a
+			// tool that is already active still has to survive the next
+			// fork/reload/resume restore.
+			options.onActivated?.(requested);
+
 			const active =
 				typeof pi.getActiveTools === "function" ? pi.getActiveTools() : [];
-			const merged = [...new Set([...active, ...requested])];
-			if (typeof pi.setActiveTools === "function") {
+			const activeSet = new Set(active);
+			const added = requested.filter((name) => !activeSet.has(name));
+			const merged = [...new Set([...active, ...added])];
+			if (added.length > 0 && typeof pi.setActiveTools === "function") {
 				pi.setActiveTools(merged);
+				options.onMutation?.({
+					addedCount: added.length,
+					removedCount: 0,
+					reason: "lazy_activation",
+					deferralApplies: options.deferredToolSupport?.(ctx) ?? false,
+				});
 			}
 			const requestedSet = new Set(requested);
 			const skillPaths = [...new Set(
@@ -109,7 +142,7 @@ export function createActivateToolsTool(
 						text: `Activated: ${requested.join(", ")}. Available starting next turn.${skillHint}`,
 					},
 				],
-				details: { matches: requested, added: requested, skillPaths },
+				details: { matches: requested, added, skillPaths },
 			};
 		},
 	};

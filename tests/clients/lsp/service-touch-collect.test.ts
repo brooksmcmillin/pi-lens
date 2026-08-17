@@ -263,6 +263,21 @@ describe("LSPService.touchFile collectDiagnostics", () => {
 		expect(client.notify.open).toHaveBeenCalledTimes(2);
 	});
 
+	// `diagnosticsVersion` is DELIBERATELY absent, and the omission is load-bearing
+	// for these probes specifically. Every assertion in this describe block pins a
+	// BUDGET — which `timeoutMs` reached which client — and a finite baseline routes
+	// the wait through the version-baseline branch, which appends a
+	// `{ minVersion }` argument the assertions do not model.
+	//
+	// Recorded here because the #1533 sweep for unfaithful auxiliary doubles found
+	// this file (the class: a double with `waitForDiagnostics` but no
+	// `diagnosticsVersion` reads as a silent scanner). It is safe TODAY because no
+	// probe here observes `confirmation` or `unconfirmedServerIds` — the missing
+	// property cannot decide a verdict nobody reads. If you add a verdict assertion
+	// to this file, give the double a version getter first (see
+	// `service-aux-grace.test.ts`) and update these budget assertions to expect the
+	// `{ minVersion }` argument, or the new assertion passes on the fixture's gap
+	// rather than on behavior (defect shape 7).
 	function makeBudgetClient() {
 		return {
 			isAlive: () => true,

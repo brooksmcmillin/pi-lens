@@ -92,9 +92,24 @@ function makeServer(
 	};
 }
 
-/** A push-only server that never publishes — a clean file under marksman. */
+/**
+ * A push-only server that never publishes — a clean file under marksman.
+ *
+ * Both publication axes are present and NEITHER advances. That is the whole point
+ * of this double, and stating it explicitly matters: with the properties absent,
+ * the pre-notify baseline is `undefined`, so #1533's evidence check reads "no
+ * publication" for the same reason it reads it for a genuinely silent server —
+ * the verdict would come from the fixture's omission rather than from modelled
+ * behavior (defect shape 7). Silence here is earned, not inferred from a gap.
+ *
+ * #1531: the axis the evidence check actually reads is the PER-PATH stamp, so a
+ * double that answers only on `diagnosticsVersion` exercises just the fail-closed
+ * branch. This one answers on both, and returns 0 on both forever.
+ */
 function makeSilentClient(serverId: string, root: string) {
 	return {
+		diagnosticsVersion: 0,
+		getDiagnosticsVersionForPath: vi.fn(() => 0),
 		isAlive: () => true,
 		shutdown: async () => {},
 		getWorkspaceDiagnosticsSupport: () => ({
@@ -121,16 +136,42 @@ function makeSilentClient(serverId: string, root: string) {
 	};
 }
 
-/** A server that answers promptly (found something, or a confirmed empty). */
+/**
+ * A server that answers promptly (found something, or a confirmed empty).
+ *
+ * #1533: "answers" means a PUBLICATION LANDED, which advances the client's version
+ * state on a real client (`client.ts` `recordBinding`). An empty publication counts
+ * — that is exactly what makes a confirmed-clean scanner distinguishable from one
+ * that never spoke. The accessors are declared on THIS object rather than inherited
+ * through the spread of `makeSilentClient`, because a spread would evaluate a getter
+ * once and freeze it; the bump has to be observable after the wait resolves.
+ *
+ * #1531: both axes advance together, as production does — the client-global counter
+ * and the PER-PATH stamp recording that counter's value for this file. The per-path
+ * stamp is the one the evidence check reads, so bumping only the global counter
+ * would leave this "answering" double indistinguishable from a silent one.
+ */
 function makeAnsweringClient(
 	serverId: string,
 	root: string,
 	filePath: string,
 	diagnostics: unknown[],
 ) {
+	let version = 0;
+	const stampsByPath = new Map<string, number>();
 	return {
 		...makeSilentClient(serverId, root),
-		waitForDiagnostics: vi.fn().mockResolvedValue(undefined),
+		get diagnosticsVersion() {
+			return version;
+		},
+		getDiagnosticsVersionForPath: vi.fn(
+			(path: string) => stampsByPath.get(path) ?? 0,
+		),
+		waitForDiagnostics: vi.fn(async (path: string) => {
+			version += 1;
+			stampsByPath.set(path, version);
+			return undefined;
+		}),
 		getDiagnostics: vi.fn(() => diagnostics),
 		getAllDiagnostics: vi.fn(
 			() =>

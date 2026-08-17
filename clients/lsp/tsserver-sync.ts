@@ -34,6 +34,8 @@
  */
 
 import type { LSPDiagnostic } from "./client.js";
+import { logLatency } from "../latency-logger.js";
+import { normalizeMapKey } from "../path-utils.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -63,6 +65,129 @@ export interface TsserverSyncCapableService {
 // ---------------------------------------------------------------------------
 
 export const TSSERVER_REQUEST_COMMAND = "typescript.tsserverRequest";
+
+export interface TsserverProjectIdentityCommandChannel {
+	executeCommand?: (
+		command: string,
+		args?: unknown[],
+	) => Promise<{ executed: boolean; result?: unknown; reason?: string }>;
+}
+
+export interface TsserverProjectIdentityProbeOptions {
+	serverId: string;
+	launchVariant?: "classic" | "native-ts7";
+	clientRoot: string;
+	file: string;
+	/**
+	 * #1412 L2: caller-supplied `normalizeMapKey(file)`. `handleNotifyOpen`
+	 * already computes this before calling in (client.ts) — recomputing it here
+	 * would just repeat the same normalization for every first open. Falls back
+	 * to normalizing `file` locally if a caller (e.g. an older test) omits it.
+	 */
+	normalizedFile?: string;
+	probedFiles: Set<string>;
+	commandChannel: TsserverProjectIdentityCommandChannel;
+}
+
+function classifyProjectInfo(body: unknown): {
+	projectKind: "configured" | "inferred" | "unassociated";
+	configFile?: string;
+	association: "associated" | "unassociated" | "language-service-disabled";
+} {
+	if (!body || typeof body !== "object") {
+		return { projectKind: "unassociated", association: "unassociated" };
+	}
+	const info = body as Record<string, unknown>;
+	const configFile =
+		typeof info.configFileName === "string" && info.configFileName.length > 0
+			? info.configFileName
+			: undefined;
+	const inferred = configFile
+		? /(?:^|[/\\])inferredProject\d*\*?$/i.test(configFile) ||
+				/inferred[-_ ]?project/i.test(configFile)
+		: false;
+	const projectKind = configFile
+		? inferred
+			? "inferred"
+			: /(?:^|[/\\])(?:tsconfig|jsconfig)\.json$/i.test(configFile)
+				? "configured"
+				: "unassociated"
+		: "unassociated";
+	return {
+		projectKind,
+		...(configFile ? { configFile } : {}),
+		association:
+			info.languageServiceDisabled === true
+				? "language-service-disabled"
+				: projectKind === "unassociated"
+					? "unassociated"
+					: "associated",
+	};
+}
+
+/**
+ * #1412: after classic TypeScript's first successful didOpen, sample the
+ * tsserver project association without delaying diagnostics. The supplied
+ * executeCommand channel owns the existing bounded anti-deadlock backstop.
+ */
+export async function probeTsserverProjectIdentity(
+	options: TsserverProjectIdentityProbeOptions,
+): Promise<void> {
+	const normalizedFile = options.normalizedFile ?? normalizeMapKey(options.file);
+	const startedAt = Date.now();
+	// Logging starts only once a probe is actually eligible and attempted:
+	// ineligible servers (wrong serverId/launchVariant, no command channel) and
+	// already-probed dedupe are both routine, high-volume, and per-server — a
+	// bare return keeps them out of the telemetry stream entirely instead of
+	// writing an `lsp_typescript_project_identity` row per didOpen on every
+	// server (python, go, opengrep, ...).
+	const logOutcome = (outcome: "ok" | "not-executed" | "no-response" | "unsuccessful" | "threw", metadata: Record<string, unknown> = {}) => logLatency({
+		type: "phase", phase: "lsp_typescript_project_identity", filePath: normalizedFile,
+		durationMs: Date.now() - startedAt,
+		metadata: { serverId: options.serverId, launchVariant: options.launchVariant, clientRoot: options.clientRoot, outcome, ...metadata },
+	});
+	if (
+		options.serverId !== "typescript" ||
+		options.launchVariant !== "classic" ||
+		typeof options.commandChannel.executeCommand !== "function"
+	) {
+		return;
+	}
+	if (options.probedFiles.has(normalizedFile)) return;
+	// Claim before yielding so concurrent opens cannot issue duplicate probes.
+	options.probedFiles.add(normalizedFile);
+	try {
+		const outcome = await options.commandChannel.executeCommand(
+			TSSERVER_REQUEST_COMMAND,
+			["projectInfo", { file: options.file, needFileNameList: false }],
+		);
+		if (!outcome.executed) { logOutcome("not-executed"); return; }
+		const response = outcome.result as
+			| { success?: boolean; body?: unknown }
+			| undefined;
+		if (!response) { logOutcome("no-response"); return; }
+		if (response.success !== true) { logOutcome("unsuccessful"); return; }
+		const identity = classifyProjectInfo(response.body);
+		logLatency({
+			type: "phase",
+			phase: "lsp_typescript_project_identity",
+			filePath: normalizedFile,
+			durationMs: Date.now() - startedAt,
+			metadata: {
+				outcome: "ok",
+				serverId: options.serverId,
+				launchVariant: options.launchVariant,
+				clientRoot: options.clientRoot,
+				projectKind: identity.projectKind,
+				configFile: identity.configFile,
+				association: identity.association,
+			},
+		});
+	} catch {
+		logOutcome("threw");
+		// Best-effort telemetry: command errors/timeouts never reach diagnostics.
+	}
+}
 
 // ---------------------------------------------------------------------------
 // Helpers

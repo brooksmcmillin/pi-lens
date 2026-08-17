@@ -47,6 +47,10 @@ const EXEMPT = new Map<string, string>([
 		"IaC misconfig; trivy.enabled-gated (off by default), needs trivy + opt-in fixture",
 	],
 	[
+		"helm-render",
+		"rendered-manifest validation; helm.renderValidation.enabled-gated (off by default, rendering executes chart templates), needs helm + an opt-in fixture",
+	],
+	[
 		"terragrunt",
 		"terragrunt CLI JSON shape is unverified (binary not installed in dev/CI to confirm `hcl validate --json` output); no fixture yet",
 	],

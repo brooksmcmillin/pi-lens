@@ -373,6 +373,135 @@ describe("symbol_search tool", () => {
 		});
 	});
 
+	// #1450: lang:/file:/ext: prefix filters (+ `-` negation) embedded in the
+	// query STRING itself — distinct from the structured `paths`/`lang` params
+	// tested above (#771), and exercised through the same tool entry point.
+	describe("inline query prefix filters (#1450)", () => {
+		function makeFixture(env: { tmpDir: string }) {
+			const tsFile = createTempFile(
+				env.tmpDir,
+				"src/auth/login.ts",
+				"export function authenticateUser(id) { return id; }",
+			);
+			const pyFile = createTempFile(
+				env.tmpDir,
+				"scripts/authenticate.py",
+				"def authenticate_user(id):\n    return id\n",
+			);
+			warmWordIndexSnapshot(env.tmpDir, [
+				{ path: tsFile, content: "export function authenticateUser(id) { return id; }" },
+				{
+					path: pyFile,
+					content: "def authenticate_user(id):\n    return id\n",
+				},
+			]);
+			return { tsFile, pyFile };
+		}
+
+		it("lang: filters hits to one file kind before ranking", async () => {
+			const env = setupTestEnvironment("pi-lens-symbolsearch-querylang-");
+			try {
+				makeFixture(env);
+				const tool = createSymbolSearchTool(() => env.tmpDir);
+				const result = await tool.execute(
+					"1",
+					{ query: "lang:python authenticate user" },
+					undefined,
+					null,
+					{ cwd: env.tmpDir },
+				);
+				const text = String(result.content[0]?.text);
+				const payload = JSON.parse(text.slice(text.indexOf("{"))) as {
+					results: Array<{ file: string }>;
+				};
+				expect(payload.results).toHaveLength(1);
+				expect(payload.results[0].file.replace(/\\/g, "/")).toBe(
+					"scripts/authenticate.py",
+				);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("file: filter scopes hits to a path substring", async () => {
+			const env = setupTestEnvironment("pi-lens-symbolsearch-queryfile-");
+			try {
+				makeFixture(env);
+				const tool = createSymbolSearchTool(() => env.tmpDir);
+				const result = await tool.execute(
+					"1",
+					{ query: "file:src/auth authenticate user" },
+					undefined,
+					null,
+					{ cwd: env.tmpDir },
+				);
+				const text = String(result.content[0]?.text);
+				const payload = JSON.parse(text.slice(text.indexOf("{"))) as {
+					results: Array<{ file: string }>;
+				};
+				expect(payload.results).toHaveLength(1);
+				expect(payload.results[0].file.replace(/\\/g, "/")).toBe(
+					"src/auth/login.ts",
+				);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("an unknown colon token searches as a plain term; a bad lang: value fails loudly", async () => {
+			const env = setupTestEnvironment("pi-lens-symbolsearch-queryunknown-");
+			try {
+				makeFixture(env);
+				const tool = createSymbolSearchTool(() => env.tmpDir);
+				// Colon-bearing term: no error, ordinary search (old behavior).
+				const passThrough = await tool.execute(
+					"1",
+					{ query: "type:foo authenticate user" },
+					undefined,
+					null,
+					{ cwd: env.tmpDir },
+				);
+				expect(passThrough.isError).not.toBe(true);
+				// Known key, bad value: the loud-failure contract survives.
+				const badValue = await tool.execute(
+					"2",
+					{ query: "lang:notalang authenticate user" },
+					undefined,
+					null,
+					{ cwd: env.tmpDir },
+				);
+				expect(badValue.isError).toBe(true);
+				expect(String(badValue.content[0]?.text)).toContain("lang");
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("unfiltered inline-filter-free queries reproduce today's output (regression guard)", async () => {
+			const env = setupTestEnvironment("pi-lens-symbolsearch-querynofilter-");
+			try {
+				makeFixture(env);
+				const tool = createSymbolSearchTool(() => env.tmpDir);
+				const result = await tool.execute(
+					"1",
+					{ query: "authenticate user" },
+					undefined,
+					null,
+					{ cwd: env.tmpDir },
+				);
+				const text = String(result.content[0]?.text);
+				const payload = JSON.parse(text.slice(text.indexOf("{"))) as {
+					results: Array<{ file: string }>;
+				};
+				expect(payload.results.map((r) => r.file.replace(/\\/g, "/")).sort()).toEqual(
+					["scripts/authenticate.py", "src/auth/login.ts"].sort(),
+				);
+			} finally {
+				env.cleanup();
+			}
+		});
+	});
+
 	// #771: graph-aware hit annotations — read-only, present only when the
 	// cached review graph happens to be warm; a cold cache must neither
 	// annotate nor trigger a build (the tool's latency profile is unchanged).

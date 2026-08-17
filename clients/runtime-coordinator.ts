@@ -5,6 +5,7 @@ import type { ActionableWarningRecord } from "./actionable-warnings.js";
 import type { FunctionCallGraph } from "./call-graph.js";
 import type { WordIndex } from "./word-index.js";
 import type { CascadeRun } from "./cascade-types.js";
+import { logCascade } from "./cascade-logger.js";
 import type { CodeQualityWarningRecord } from "./code-quality-warnings.js";
 import type { FileComplexity } from "./complexity-client.js";
 import { normalizeMapKey } from "./path-utils.js";
@@ -13,6 +14,7 @@ import { ReadGuard } from "./read-guard.js";
 import type { RuleScanResult } from "./rules-scanner.js";
 import { RUNTIME_CONFIG } from "./runtime-config.js";
 import { TurnSummaryCollector } from "./turn-summary.js";
+import { deriveProviderFromModelId } from "./model-provider.js";
 
 export interface ErrorDebtBaseline {
 	testsPassed: boolean;
@@ -106,6 +108,19 @@ export class RuntimeCoordinator {
 	private _lifecycleReason: string | undefined;
 	private _hasStableSessionId = false;
 	private _telemetryModel = "unknown";
+	// Raw model/provider identity, separate from the combined `provider/model`
+	// display string above — worklog/disposition attribution (#1448) wants the
+	// two fields apart, blank when the host never supplied them. `_telemetryProvider`
+	// is the explicit host value when given, else derived from the model id
+	// (deriveProviderFromModelId, blank on ambiguity — never guessed).
+	private _telemetryModelId = "";
+	private _telemetryProvider = "";
+	// True once a host has supplied an explicit provider this session. An
+	// explicit provider is never downgraded by a derivation from a later
+	// model-only call; a DERIVED provider, by contrast, is re-derived on
+	// every model-only call so a mid-session model switch (e.g. gpt-5-mini →
+	// claude-sonnet-4-5) doesn't leave a stale provider from the old model.
+	private _telemetryProviderIsExplicit = false;
 	private _turnIndex = 0;
 	private _writeIndex = 0;
 	private _projectSeq = 0;
@@ -170,6 +185,9 @@ export class RuntimeCoordinator {
 		this._telemetrySessionId = `lens-${Date.now().toString(36)}-${randomBytes(4).toString("hex")}`;
 		this._hasStableSessionId = false;
 		this._telemetryModel = "unknown";
+		this._telemetryModelId = "";
+		this._telemetryProvider = "";
+		this._telemetryProviderIsExplicit = false;
 		this._turnIndex = 0;
 		this._writeIndex = 0;
 		this._projectSeq = 0;
@@ -249,7 +267,30 @@ export class RuntimeCoordinator {
 	}
 
 	beginTurn(): void {
-		this._cascadeRuns = [];
+		// #1443: runs sitting here at turn_start were appended AFTER the last
+		// turn_end drained them (consumeCascadeRuns) — the quiet-window reconcile's
+		// late re-injection (`onResolvedFound`, clients/lsp/cascade-tier.ts) lands
+		// in exactly that window. Wiping them dead-ended that delivery path: the
+		// finding was computed, formatted, appended, and then deleted before any
+		// turn_end could render it. Carry them into THIS turn instead, exactly
+		// once: `carriedTurns` is stamped on the way through and a run that the
+		// next turn_end still did not consume is dropped here with a log line
+		// rather than queued forever (a stale finding must not outlive the state
+		// it describes, and an unbounded queue would replay it every turn).
+		this._cascadeRuns = this._cascadeRuns.flatMap((run) => {
+			const carriedTurns = (run.carriedTurns ?? 0) + 1;
+			if (carriedTurns > 1) {
+				logCascade({
+					phase: "cascade_carry_over_drop",
+					filePath: run.filePath,
+					neighborCount: run.neighborCount,
+					diagnosticCount: run.diagnosticCount,
+					metadata: { carriedTurns, turnIndex: this._turnIndex },
+				});
+				return [];
+			}
+			return [{ ...run, carriedTurns }];
+		});
 		// _pendingCascadeRuns is deliberately NOT cleared here: a cascade compute
 		// still in flight past last turn_end's settle cap (fresh graph builds have
 		// measured up to ~19s) must surface on the NEXT turn_end, not be dropped —
@@ -325,6 +366,21 @@ export class RuntimeCoordinator {
 		} else if (provider) {
 			this._telemetryModel = provider;
 		}
+		if (model) this._telemetryModelId = model;
+		if (provider) {
+			this._telemetryProvider = provider;
+			this._telemetryProviderIsExplicit = true;
+		} else if (model && !this._telemetryProviderIsExplicit) {
+			// No explicit provider has ever been reported this session, so the
+			// provider is (still) a derivation — re-derive it from the CURRENT
+			// model id every time. Without this, a stale derived provider from
+			// an earlier model would survive a mid-session model switch (e.g.
+			// gpt-5-mini → claude-sonnet-4-5 with no explicit provider on
+			// either call) because the old "has any provider ever been set"
+			// guard treated the derived value as sticky. An explicit provider,
+			// once set, is never touched here regardless of later model calls.
+			this._telemetryProvider = deriveProviderFromModelId(model);
+		}
 	}
 
 	get telemetrySessionId(): string {
@@ -360,6 +416,19 @@ export class RuntimeCoordinator {
 
 	get telemetryModel(): string {
 		return this._telemetryModel;
+	}
+
+	/** Raw model id (never the combined `provider/model` display string), blank
+	 * when the host hasn't reported one this session. Worklog/disposition
+	 * attribution (#1448) reads this, not {@link telemetryModel}. */
+	get telemetryModelId(): string {
+		return this._telemetryModelId;
+	}
+
+	/** Explicit host-reported provider, or a conservative derivation from the
+	 * model id (see clients/model-provider.ts), blank when neither is known. */
+	get telemetryProviderId(): string {
+		return this._telemetryProvider;
 	}
 
 	get turnIndex(): number {
@@ -553,6 +622,27 @@ export class RuntimeCoordinator {
 		const runs = this._cascadeRuns;
 		this._cascadeRuns = [];
 		return runs;
+	}
+
+	/**
+	 * R1 (#1443 follow-up): non-destructive peek used by turn_end's read-only
+	 * fast path. A carried cascade run (or one still in flight) represents a
+	 * DELIVERY OPPORTUNITY, not turn activity — an agent that answers a question
+	 * without editing anything must still get yesterday's late finding. Before
+	 * this, the files-empty early return skipped `settleCascadeRuns` /
+	 * `consumeCascadeRuns` entirely on a read-only turn, so `beginTurn`'s next
+	 * carry pass saw the run as having survived a turn_start with no offsetting
+	 * drain and dropped it — burning the one-turn carry allowance on a turn that
+	 * never had a chance to deliver.
+	 */
+	hasCascadeRuns(): boolean {
+		// Carried, ALREADY-BUILT runs only. Pending (still-settling) computes are
+		// deliberately excluded: a read-only turn that fell through for a pending
+		// run would block on the full settle cap — every turn, forever, when the
+		// compute never resolves (re-review finding F1). A pending run loses
+		// nothing by waiting: settleCascadeRuns re-parks it and the next turn
+		// that actually settles it delivers it.
+		return this._cascadeRuns.length > 0;
 	}
 
 	recordInlineBlockers(filePath: string, summary: string): void {

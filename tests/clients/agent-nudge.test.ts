@@ -345,7 +345,7 @@ describe("agent-nudge — inline context nudge for out-of-view mutations (#485)"
 	});
 
 	describe("#492: cross-process origin merge + framing", () => {
-		it("a pure cross-process batch uses the 'another pi-lens instance' framing", () => {
+		it("a pure cross-process batch names the automatic run, not the process", () => {
 			recordCrossProcessTouches([
 				{ path: "/repo/src/child.ts", reason: "autofix" },
 			]);
@@ -353,7 +353,7 @@ describe("agent-nudge — inline context nudge for out-of-view mutations (#485)"
 			const result = consumeAgentNudge();
 			expect(result).toBeDefined();
 			expect(result?.messages[0].content).toContain(
-				"by another pi-lens instance (e.g. a subagent's)",
+				"by an automatic run outside your turn",
 			);
 			expect(result?.messages[0].content).not.toContain("after your last turn");
 		});
@@ -367,7 +367,7 @@ describe("agent-nudge — inline context nudge for out-of-view mutations (#485)"
 
 			const result = consumeAgentNudge();
 			expect(result?.messages[0].content).toContain("after your last turn");
-			expect(result?.messages[0].content).not.toContain("another pi-lens instance");
+			expect(result?.messages[0].content).not.toContain("outside your turn");
 		});
 
 		it("a mixed batch (local + cross-process) produces ONE message that never assigns local files to another instance", () => {
@@ -384,13 +384,13 @@ describe("agent-nudge — inline context nudge for out-of-view mutations (#485)"
 			expect(result?.messages).toHaveLength(1);
 			expect(result?.messages[0].content).toContain("2 file(s)");
 			// Mixed framing: local base wording + exact cross-process count. The
-			// whole-batch "were autofixed by another pi-lens instance" clause must
+			// whole-batch "were autofixed by an automatic run" clause must
 			// NOT be used here — that would misattribute the local file too.
 			expect(result?.messages[0].content).toContain(
-				"after your last turn (1 of them by another pi-lens instance)",
+				"after your last turn (1 of them by an automatic run outside it)",
 			);
 			expect(result?.messages[0].content).not.toContain(
-				"autofixed by another pi-lens instance",
+				"autofixed by an automatic run",
 			);
 		});
 
@@ -408,7 +408,7 @@ describe("agent-nudge — inline context nudge for out-of-view mutations (#485)"
 			const result = consumeAgentNudge();
 			expect(result?.messages[0].content).toContain("3 file(s)");
 			expect(result?.messages[0].content).toContain(
-				"after your last turn (2 of them by another pi-lens instance)",
+				"after your last turn (2 of them by an automatic run outside it)",
 			);
 		});
 
@@ -428,7 +428,7 @@ describe("agent-nudge — inline context nudge for out-of-view mutations (#485)"
 			// cross-process (the "local is sticky" rule).
 			expect(result?.messages[0].content).toContain("1 file(s)");
 			expect(result?.messages[0].content).toContain("after your last turn");
-			expect(result?.messages[0].content).not.toContain("another pi-lens instance");
+			expect(result?.messages[0].content).not.toContain("outside your turn");
 		});
 
 		it("the reverse order (local first, then the SAME file arrives via cross-process) still reads as local", () => {
@@ -443,7 +443,7 @@ describe("agent-nudge — inline context nudge for out-of-view mutations (#485)"
 
 			const result = consumeAgentNudge();
 			expect(result?.messages[0].content).toContain("1 file(s)");
-			expect(result?.messages[0].content).not.toContain("another pi-lens instance");
+			expect(result?.messages[0].content).not.toContain("outside your turn");
 		});
 
 		it("agent_nudge phase metadata reports the local/cross-process origin mix", () => {

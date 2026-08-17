@@ -120,6 +120,46 @@ describe("#1253 — warm-attach serves the touch confirmation", () => {
 		expect(result.diagnostics).toHaveLength(1);
 	});
 
+	it("carries the NARROWED confirmation and the server ids across the wire (#1470)", async () => {
+		// A partial touch is not inconclusive — the primary answered — so without
+		// an explicit narrowed value the far side would read `confirmation` as
+		// absent and be unable to tell "old incumbent" from "opengrep was cut off".
+		touchFile.mockResolvedValue({
+			diags: [],
+			confirmation: "partial",
+			unconfirmedServerIds: ["opengrep"],
+		});
+
+		const result = await serve();
+		const overTheWire = JSON.parse(
+			JSON.stringify(result),
+		) as WarmDiagnosticsResponse;
+
+		expect(overTheWire.confirmation).toBe("partial");
+		expect(overTheWire.unconfirmedServerIds).toEqual(["opengrep"]);
+		// The load-bearing consequence: every existing consumer tests
+		// `=== "confirmed"`, so the narrowing fails closed for free.
+		expect(overTheWire.confirmation).not.toBe("confirmed");
+	});
+
+	it("reads the coverage gap through touchCoverageGap, not off the confirmation string (#1470)", async () => {
+		// `touchCoverageGap`'s own doc comment forbids re-deriving the rule from a
+		// `confirmation` string literal. The producer sets both fields together
+		// today, so a re-derivation passes every other test in this file — this one
+		// hands the serve path a touch that names a coverage gap WITHOUT the
+		// narrowed string, which is exactly what a second producer (or a widened
+		// confirmation vocabulary) would look like. One reader, one rule.
+		touchFile.mockResolvedValue({
+			diags: [],
+			unconfirmedServerIds: ["opengrep"],
+		});
+
+		const result = await serve();
+
+		expect(result.confirmation).toBe("partial");
+		expect(result.unconfirmedServerIds).toEqual(["opengrep"]);
+	});
+
 	it("survives the JSON round trip the socket actually performs", async () => {
 		touchFile.mockResolvedValue({ diags: [], confirmation: "confirmed" });
 

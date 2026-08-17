@@ -395,7 +395,11 @@ export const TOOLS: ToolDefinition[] = [
 		checkCommand: "tsc",
 		checkArgs: ["--version"],
 		installStrategy: "npm",
-		packageName: "typescript",
+		// The managed compiler serves the classic typescript-language-server
+		// fallback. TypeScript 7 removed lib/tsserver.js and is selected only from
+		// project-local installs through the native `tsc --lsp --stdio` path.
+		// Revisit when typescript-language-server supports TS 7 — refs #1436.
+		packageName: "typescript@5.9.3",
 		binaryName: "tsc",
 	},
 	{
@@ -1430,6 +1434,65 @@ export function getInstallFailureReason(toolId: string): string | undefined {
 	return installFailureReasons.get(toolId);
 }
 
+/**
+ * What the last install attempt for a tool actually DID (#1500 review).
+ *
+ * `installFailureReasons` cannot answer this and never could: it is a REFUSAL
+ * map, written by the `PI_LENS_DISABLE_TOOL_INSTALL` branches and the install-lock
+ * skip, and by nothing on the genuine-failure or success paths. Inferring
+ * attempt-ness from it inverts the answer in both directions — a kill-switch
+ * decline reads as a failed download, and a failed download reads as a policy
+ * decision. So the outcome is recorded explicitly, at each branch that knows it.
+ *
+ *   * `succeeded`  — an install ran and reported success.
+ *   * `failed`     — an install ran and did not succeed. The retry candidate.
+ *   * `declined`   — policy said no: kill switch, `allowInstall: false`, project
+ *                    trust, an unknown tool id. Nothing ran.
+ *   * `skipped`    — another process holds the install lock. Nothing ran.
+ */
+export type InstallAttemptOutcome =
+	| "succeeded"
+	| "failed"
+	| "declined"
+	| "skipped";
+
+export interface InstallAttempt {
+	outcome: InstallAttemptOutcome;
+	/** Why, when there is something to say. */
+	reason?: string;
+	/** Epoch ms, so a caller can tell a fresh record from a stale one. */
+	at: number;
+}
+
+const installAttempts = new Map<string, InstallAttempt>();
+
+function noteInstallAttempt(
+	toolId: string,
+	outcome: InstallAttemptOutcome,
+	reason?: string,
+): void {
+	installAttempts.set(toolId, { outcome, reason, at: Date.now() });
+}
+
+/** Record an outcome only if this attempt has not already recorded its own. */
+function noteInstallAttemptIfUnrecorded(
+	toolId: string,
+	outcome: InstallAttemptOutcome,
+	reason?: string,
+): void {
+	if (installAttempts.has(toolId)) return;
+	noteInstallAttempt(toolId, outcome, reason);
+}
+
+/**
+ * What the last install attempt for `toolId` did, or `undefined` when no attempt
+ * has been recorded in this session. Consumers map this onto the
+ * `availability_decision` record's install evidence (#1500).
+ */
+export function getInstallAttempt(toolId: string): InstallAttempt | undefined {
+	return installAttempts.get(toolId);
+}
+
 // Session-lifetime cache: once a tool path is resolved, skip the process-spawn check on subsequent calls.
 const resolvedPathCache = new BoundedLruCache<string, string>(256);
 
@@ -1759,6 +1822,7 @@ export function resetProbeCacheStateForTesting(): void {
 	resolvedPathCache.clear();
 	ensureInFlight.clear();
 	installFailureReasons.clear();
+	installAttempts.clear();
 	lastManagedInstallVersion.clear();
 	resetPathWalkMemo();
 	if (_probeCacheFlushTimer !== null) {
@@ -3525,6 +3589,13 @@ async function finishInstallAttempt(
 	logSessionStart(
 		`auto-install ${toolId}: ${ok ? "success" : "failed"} (${Date.now() - startedAt}ms)`,
 	);
+	// Every install strategy funnels its outcome through here, so this one write
+	// records attempt-ness for all of them (#1500).
+	noteInstallAttempt(
+		toolId,
+		ok ? "succeeded" : "failed",
+		ok ? undefined : (installFailureReasons.get(toolId) ?? "install failed"),
+	);
 	if (ok) {
 		// A prior availability probe may have cached ENOENT for this exact child
 		// PATH. Make a successful mutation visible immediately rather than waiting
@@ -3563,6 +3634,11 @@ export async function installTool(toolId: string): Promise<boolean> {
 			toolId,
 			"installation disabled by PI_LENS_DISABLE_TOOL_INSTALL=1",
 		);
+		noteInstallAttempt(
+			toolId,
+			"declined",
+			"installation disabled by PI_LENS_DISABLE_TOOL_INSTALL=1",
+		);
 		logSessionStart(
 			`auto-install ${toolId}: refused — PI_LENS_DISABLE_TOOL_INSTALL=1`,
 		);
@@ -3570,6 +3646,7 @@ export async function installTool(toolId: string): Promise<boolean> {
 	}
 	const tool = TOOLS.find((t) => t.id === toolId);
 	if (!tool) {
+		noteInstallAttempt(toolId, "declined", "unknown tool id");
 		logSessionStart(`auto-install ${toolId}: unknown tool id`);
 		return false;
 	}
@@ -3650,7 +3727,14 @@ export async function ensureTool(
 		logSessionStart(
 			`auto-install ensure ${toolId}: install gated — ${projectTrustDenialReason()}; discovery only`,
 		);
-		return ensureToolResolved(toolId, { ...opts, allowInstall: false });
+		const denialReason = projectTrustDenialReason();
+		const discovered = await ensureToolResolved(toolId, {
+			...opts,
+			allowInstall: false,
+		});
+		// AFTER the discovery pass, which clears the per-attempt record on entry.
+		noteInstallAttempt(toolId, "declined", `project trust: ${denialReason}`);
+		return discovered;
 	}
 	return ensureToolResolved(toolId, opts);
 }
@@ -3660,6 +3744,9 @@ async function ensureToolResolved(
 	opts?: { forceReinstall?: boolean; allowInstall?: boolean },
 ): Promise<string | undefined> {
 	installFailureReasons.delete(toolId);
+	// A fresh ensure supersedes whatever the last one recorded, and the trust-gate
+	// branch above deliberately keeps its `declined` record by never reaching here.
+	installAttempts.delete(toolId);
 	const cacheResolvedPath = (result: string | undefined): string | undefined => {
 		if (result) {
 			resolvedPathCache.set(toolId, result);
@@ -3691,6 +3778,7 @@ async function ensureToolResolved(
 		}
 
 		if (opts.allowInstall === false) {
+			noteInstallAttempt(toolId, "declined", "install disabled by caller");
 			logSessionStart(
 				`auto-install ensure ${toolId}: force reinstall blocked — install disabled, discovery only (${Date.now() - ensureStartMs}ms)`,
 			);
@@ -3701,6 +3789,11 @@ async function ensureToolResolved(
 				toolId,
 				"installation disabled by PI_LENS_DISABLE_TOOL_INSTALL=1",
 			);
+			noteInstallAttempt(
+				toolId,
+				"declined",
+				"installation disabled by PI_LENS_DISABLE_TOOL_INSTALL=1",
+			);
 			logSessionStart(
 				`auto-install ensure ${toolId}: refused — PI_LENS_DISABLE_TOOL_INSTALL=1`,
 			);
@@ -3709,6 +3802,7 @@ async function ensureToolResolved(
 
 		const lock = await acquireInstallLock();
 		if (!lock.release) {
+			noteInstallAttempt(toolId, "skipped", lock.reason ?? "install lock held");
 			logSessionStart(`auto-install ensure ${toolId}: ${lock.reason}`);
 			return undefined;
 		}
@@ -3719,6 +3813,9 @@ async function ensureToolResolved(
 			await lock.release();
 		}
 		if (!installed) {
+			// installTool RAN. Whatever it recorded stands; otherwise this is a
+			// genuine failure, which is what the caller needs to see (#1500).
+			noteInstallAttemptIfUnrecorded(toolId, "failed", "install failed");
 			logSessionStart(
 				`auto-install ensure ${toolId}: force reinstall failed (${Date.now() - ensureStartMs}ms)`,
 			);
@@ -3827,6 +3924,7 @@ async function ensureToolResolved(
 		// caller forbids installs (allowInstall:false, e.g. PI_LENS_DISABLE_LSP_INSTALL=1)
 		// we must still return a discovered binary and only skip the actual install.
 		if (opts?.allowInstall === false) {
+			noteInstallAttempt(toolId, "declined", "install disabled by caller");
 			logSessionStart(
 				`auto-install ensure ${toolId}: install disabled — discovery only, not found (${Date.now() - ensureStartMs}ms)`,
 			);
@@ -3835,6 +3933,11 @@ async function ensureToolResolved(
 		if (process.env.PI_LENS_DISABLE_TOOL_INSTALL === "1") {
 			installFailureReasons.set(
 				toolId,
+				"installation disabled by PI_LENS_DISABLE_TOOL_INSTALL=1",
+			);
+			noteInstallAttempt(
+				toolId,
+				"declined",
 				"installation disabled by PI_LENS_DISABLE_TOOL_INSTALL=1",
 			);
 			logSessionStart(
@@ -3846,6 +3949,7 @@ async function ensureToolResolved(
 		const lock = await acquireInstallLock();
 		if (!lock.release) {
 			installFailureReasons.set(toolId, lock.reason ?? "install lock failed");
+			noteInstallAttempt(toolId, "skipped", lock.reason ?? "install lock held");
 			logSessionStart(`auto-install ensure ${toolId}: ${lock.reason}`);
 			return undefined;
 		}
@@ -3855,6 +3959,11 @@ async function ensureToolResolved(
 			// installed by its predecessor and must not run a second package manager.
 			const installedByPeer = await getToolPath(toolId);
 			if (installedByPeer) {
+				noteInstallAttempt(
+					toolId,
+					"succeeded",
+					"installed by a concurrent process",
+				);
 				resolvedPathCache.set(toolId, installedByPeer);
 				void updateProbeCache(toolId, installedByPeer);
 				return installedByPeer;
@@ -3864,6 +3973,9 @@ async function ensureToolResolved(
 			await lock.release();
 		}
 		if (!installed) {
+			// installTool RAN and did not succeed. A genuine failure unless it
+			// recorded a more specific outcome of its own (#1500).
+			noteInstallAttemptIfUnrecorded(toolId, "failed", "install failed");
 			logSessionStart(
 				`auto-install ensure ${toolId}: unavailable (${Date.now() - ensureStartMs}ms)`,
 			);

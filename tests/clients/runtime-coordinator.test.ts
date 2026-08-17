@@ -90,6 +90,67 @@ describe("RuntimeCoordinator", () => {
 		expect(runtime.shouldWarmLspOnRead(filePath)).toBe(true);
 	});
 
+	describe("telemetry model/provider identity (#1448)", () => {
+		it("exposes the raw model id separately from the combined display string", () => {
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ model: "claude-sonnet-4-5", provider: "anthropic" });
+
+			expect(runtime.telemetryModelId).toBe("claude-sonnet-4-5");
+			expect(runtime.telemetryProviderId).toBe("anthropic");
+			expect(runtime.telemetryModel).toBe("anthropic/claude-sonnet-4-5");
+		});
+
+		it("derives a blank provider before any identity is set", () => {
+			const runtime = new RuntimeCoordinator();
+
+			expect(runtime.telemetryModelId).toBe("");
+			expect(runtime.telemetryProviderId).toBe("");
+		});
+
+		it("derives provider from a known model-id prefix when the host omits provider", () => {
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ model: "claude-sonnet-4-5" });
+
+			expect(runtime.telemetryProviderId).toBe("anthropic");
+		});
+
+		it("leaves provider blank when the model id is ambiguous", () => {
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ model: "some-custom-finetune" });
+
+			expect(runtime.telemetryProviderId).toBe("");
+		});
+
+		it("never lets a later ambiguous model overwrite an already-known provider", () => {
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ model: "gpt-5", provider: "openai" });
+			runtime.setTelemetryIdentity({ model: "some-custom-finetune" });
+
+			expect(runtime.telemetryProviderId).toBe("openai");
+		});
+
+		it("re-derives a DERIVED provider across a mid-session model switch with no explicit provider", () => {
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ model: "gpt-5-mini" });
+			expect(runtime.telemetryProviderId).toBe("openai");
+
+			// Switch models without an explicit provider — the stale "openai"
+			// derivation must not survive; it has to re-derive for the new model.
+			runtime.setTelemetryIdentity({ model: "claude-sonnet-4-5" });
+			expect(runtime.telemetryProviderId).toBe("anthropic");
+		});
+
+		it("resetForSession clears the raw model/provider identity", () => {
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ model: "claude-sonnet-4-5", provider: "anthropic" });
+
+			runtime.resetForSession();
+
+			expect(runtime.telemetryModelId).toBe("");
+			expect(runtime.telemetryProviderId).toBe("");
+		});
+	});
+
 	describe("getFilesChangedSince (#451)", () => {
 		it("returns only files bumped after the given projectSeq", () => {
 			const runtime = new RuntimeCoordinator();

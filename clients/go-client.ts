@@ -8,9 +8,11 @@
  */
 
 import { createSubsystemLogger } from "./extension-log.js";
-import * as fs from "node:fs";
 import * as path from "node:path";
-import { safeSpawnAsync } from "./safe-spawn.js";
+import {
+	type ToolchainAvailability,
+	createToolchainAvailability,
+} from "./dispatch/runners/utils/toolchain-availability.js";
 
 // --- Types ---
 
@@ -33,6 +35,9 @@ const GO_WINDOWS_PATHS = [
 	"go.exe", // PATH
 ];
 
+/** Budget for the PATH candidate's `go version` probe, ms. */
+const PROBE_TIMEOUT_MS = 3_000;
+
 const GO_UNIX_PATHS = [
 	"/usr/local/go/bin/go",
 	"/usr/bin/go",
@@ -42,61 +47,42 @@ const GO_UNIX_PATHS = [
 // --- Client ---
 
 export class GoClient {
-	private goAvailable: boolean | null = null;
-	private goPath: string | null = null;
+	/**
+	 * Availability lifecycle, behind the shared transient-aware latch (#1476).
+	 * The PATH candidate is resolved by spawning `go version` with a 3 s budget,
+	 * so a host stall could latch "no Go toolchain" for the whole session and
+	 * silently disable every Go diagnostic until restart.
+	 */
+	private readonly availability: ToolchainAvailability;
 	private log: (msg: string) => void;
 
 	constructor(verbose = false) {
 		this.log = verbose
 			? createSubsystemLogger("go")
 			: () => {};
+		this.availability = createToolchainAvailability({
+			tool: "go",
+			label: "Go",
+			windowsPaths: GO_WINDOWS_PATHS,
+			unixPaths: GO_UNIX_PATHS,
+			probeArgs: ["version"],
+			budgetMs: PROBE_TIMEOUT_MS,
+			log: (msg) => this.log(msg),
+		});
 	}
 
 	/**
 	 * Find go executable path (async — probes PATH candidates off the event loop).
 	 */
 	async findGoPathAsync(): Promise<string | null> {
-		if (this.goPath) return this.goPath;
-
-		const paths =
-			process.platform === "win32" ? GO_WINDOWS_PATHS : GO_UNIX_PATHS;
-
-		for (const p of paths) {
-			try {
-				if (p.includes("\\") || p.includes("/")) {
-					// Absolute path - check if exists
-					if (fs.existsSync(p)) {
-						this.goPath = p;
-						return p;
-					}
-				} else {
-					// Relative (PATH) - try running it
-					const result = await safeSpawnAsync(p, ["version"], {
-						timeout: 3000,
-					});
-					if (!result.error && result.status === 0) {
-						this.goPath = p;
-						return p;
-					}
-				}
-			} catch (err) {
-				void err;
-			}
-		}
-
-		return null;
+		return this.availability.findPath();
 	}
 
 	/**
 	 * Check if Go is installed (cached)
 	 */
 	async isGoAvailableAsync(): Promise<boolean> {
-		if (this.goAvailable !== null) return this.goAvailable;
-		this.goAvailable = (await this.findGoPathAsync()) !== null;
-		if (this.goAvailable) {
-			this.log(`Go found: ${this.goPath}`);
-		}
-		return this.goAvailable;
+		return this.availability.isAvailable();
 	}
 
 	/**

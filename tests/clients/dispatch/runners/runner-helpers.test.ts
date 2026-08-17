@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	createAvailabilityChecker,
+	createVenvFinder,
 	getSgCommand,
 	isSgAvailableAsync,
 	lspPrimaryCoversFile,
@@ -515,10 +516,29 @@ describe("runner-helpers availability checker", () => {
 			expect(await checker.isAvailableAsync(dirA.tmpDir)).toBe(false);
 			expect(await checker.isAvailableAsync(dirB.tmpDir)).toBe(true);
 			expect(checker.getCommand(dirA.tmpDir)).toBeNull();
-			expect(checker.getCommand(dirB.tmpDir)).toContain(dirB.tmpDir);
+			// Exact path, not toContain: a quote-wrapped path still *contains*
+			// tmpDir but is a literal filename under shell:false (#1508).
+			expect(checker.getCommand(dirB.tmpDir)).toBe(ruffBUnix);
 		} finally {
 			dirA.cleanup();
 			dirB.cleanup();
+		}
+	});
+
+	it("venv-resolved command path is returned verbatim, never quote-wrapped (#1508)", () => {
+		const env = setupTestEnvironment("pi-lens-venv-quote-");
+		try {
+			const toolPath = path.join(env.tmpDir, ".venv", "bin", "ruff");
+			fs.mkdirSync(path.dirname(toolPath), { recursive: true });
+			fs.writeFileSync(toolPath, "#!/bin/sh\nexit 0\n");
+
+			// Every spawn consumer runs shell:false (safe-spawn #817), so a
+			// quote-wrapped path is a literal filename that ENOENTs on every
+			// platform.
+			const resolved = createVenvFinder("ruff", ".exe")(env.tmpDir);
+			expect(resolved).toBe(toolPath);
+		} finally {
+			env.cleanup();
 		}
 	});
 });

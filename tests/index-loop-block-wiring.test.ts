@@ -45,7 +45,7 @@ vi.mock("../clients/bootstrap.js", () => ({
 		knipClient: { isAvailable: () => false },
 		depChecker: { isAvailable: () => false },
 		testRunnerClient: { detectRunner: () => null },
-		deadCodeClients: {},
+		deadCodeClients: [],
 	}),
 }));
 vi.mock("../clients/runtime-turn.js", () => ({

@@ -144,4 +144,105 @@ describe("dispatch availability suppression is reset at session start (#1266)", 
 		expect(third).toBeNull();
 		expect(ensureToolMock).toHaveBeenCalledTimes(2);
 	});
+
+	// #1490: psscriptanalyzer's interpreter and module verdicts live in
+	// module-local latches, so `resetDispatchAvailabilityState`'s generation
+	// counter — the mechanism every other runner inherits — does not reach them.
+	// Without explicit wiring, a PowerShell install done mid-process stayed
+	// invisible until the host restarted. Same shape as #1266 above: the helper
+	// worked when called directly, and nothing called it.
+	it("re-probes PowerShell after handleSessionStart", async () => {
+		const spawnMod = await import("../../clients/safe-spawn.js");
+		const spawnMock = vi.mocked(spawnMod.safeSpawnAsync);
+		const runner = (
+			await import("../../clients/dispatch/runners/psscriptanalyzer.js")
+		).default;
+		const psProbes = () =>
+			spawnMock.mock.calls.filter((call) =>
+				(call[1] as string[] | undefined)?.includes("-NoProfile"),
+			).length;
+
+		const ctx = { cwd: tmpDir, filePath: `${tmpDir}/script.ps1` } as never;
+		expect((await runner.run(ctx)).status).toBe("skipped");
+		const afterFirst = psProbes();
+		expect(afterFirst).toBeGreaterThan(0);
+
+		// Same session: the verdict is latched, so nothing is re-probed.
+		expect((await runner.run(ctx)).status).toBe("skipped");
+		expect(psProbes()).toBe(afterFirst);
+
+		await handleSessionStart(makeDeps(tmpDir));
+
+		expect((await runner.run(ctx)).status).toBe("skipped");
+		expect(psProbes()).toBeGreaterThan(afterFirst);
+	});
+
+	// #1497: govulncheck's install-class retry ceiling is terminal for a
+	// SESSION, but the latch holding it lives on a process-lived client
+	// instance. Same shape a third time — the re-arm helper is proved directly
+	// in `install-retry-session-rearm.test.ts`, and this is the only test that
+	// fails if nothing on the session_start path calls it.
+	it("re-runs an exhausted `go install` after handleSessionStart", async () => {
+		vi.useFakeTimers({ toFake: ["Date"] });
+		try {
+			const spawnMod = await import("../../clients/safe-spawn.js");
+			const spawnMock = vi.mocked(spawnMod.safeSpawnAsync);
+			const { INSTALL_TRANSIENT_COOLDOWNS_MS } = await import(
+				"../../clients/dispatch/runners/utils/availability-policy.js"
+			);
+			spawnMock.mockImplementation((async (cmd: unknown, args: unknown) => {
+				const argv = Array.isArray(args) ? args.join(" ") : "";
+				if (String(cmd) === "go" && argv.startsWith("version"))
+					return { stdout: "go1.22.0", stderr: "", status: 0 };
+				if (String(cmd) === "go" && argv.startsWith("install"))
+					return {
+						stdout: "",
+						stderr: "",
+						status: null,
+						error: new Error("Process timed out after 60000ms"),
+						failure: "timeout",
+						spawnFailure: { kind: "timeout" },
+					};
+				return {
+					stdout: "",
+					stderr: "",
+					status: null,
+					error: Object.assign(new Error("spawn missing ENOENT"), {
+						code: "ENOENT",
+					}),
+					failure: "spawn",
+					spawnFailure: { kind: "tool-not-found" },
+				};
+			}) as never);
+			const installs = () =>
+				spawnMock.mock.calls.filter(
+					([cmd, args]) =>
+						String(cmd) === "go" &&
+						Array.isArray(args) &&
+						args[0] === "install",
+				).length;
+
+			const { GovulncheckClient } = await import(
+				"../../clients/govulncheck-client.js"
+			);
+			const client = new GovulncheckClient(false);
+			for (const cooldown of [0, ...INSTALL_TRANSIENT_COOLDOWNS_MS]) {
+				vi.setSystemTime(new Date(Date.now() + cooldown + 1));
+				expect(await client.ensureAvailable()).toBe(false);
+			}
+			const atCeiling = installs();
+
+			// Ceiling reached: a day of waiting inside the session buys nothing.
+			vi.setSystemTime(new Date(Date.now() + 24 * 60 * 60 * 1000));
+			expect(await client.ensureAvailable()).toBe(false);
+			expect(installs()).toBe(atCeiling);
+
+			await handleSessionStart(makeDeps(tmpDir));
+
+			expect(await client.ensureAvailable()).toBe(false);
+			expect(installs()).toBeGreaterThan(atCeiling);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
 });

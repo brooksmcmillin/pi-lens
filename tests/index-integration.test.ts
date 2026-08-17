@@ -260,6 +260,33 @@ describe("index.ts integration", () => {
 		expect(order).toEqual(["reset_lsp_service", "dump:session_shutdown"]);
 	}, INTEGRATION_TIMEOUT_MS);
 
+	it("session_shutdown emits the bus-event session-end rollup (S2d gap 5, #1432 review)", async () => {
+		vi.doMock("../clients/lsp/index.js", () => ({
+			getLSPService: () => ({
+				touchFile: vi.fn(),
+				getAliveClientCount: () => 0,
+				getAliveServerIds: () => [],
+			}),
+			resetLSPService: vi.fn(),
+		}));
+		const emitBusEventRollupAtSessionEnd = vi.fn();
+		vi.doMock("../clients/bus-events-logger.js", async (importActual) => {
+			const actual =
+				await importActual<typeof import("../clients/bus-events-logger.js")>();
+			return { ...actual, emitBusEventRollupAtSessionEnd };
+		});
+
+		const { default: registerExtension } = await import("../index.ts");
+		const { pi, handlers } = createMockPi();
+		registerExtension(pi as any);
+
+		const shutdown = handlers.session_shutdown?.[0];
+		expect(shutdown).toBeTypeOf("function");
+		shutdown?.({ reason: "quit" }, { cwd: tmpDir });
+
+		expect(emitBusEventRollupAtSessionEnd).toHaveBeenCalledTimes(1);
+	}, INTEGRATION_TIMEOUT_MS);
+
 	it("agent_settled dumps active handles AFTER quiet-window work is scheduled (#1123 item 4)", async () => {
 		// #1097's leak (a stray ref'd timer) only surfaces once whatever
 		// agent_settled itself queues is already in flight, so the dump must

@@ -19,6 +19,7 @@ import goVetRunner from "./go-vet.js";
 import golangciRunner from "./golangci-lint.js";
 import hadolintRunner from "./hadolint.js";
 import helmLintRunner from "./helm-lint.js";
+import helmRenderRunner from "./helm-render.js";
 import htmlhintRunner from "./htmlhint.js";
 import javacRunner from "./javac.js";
 import ktlintRunner from "./ktlint.js";
@@ -87,6 +88,7 @@ export function registerDefaultRunners(registry: RunnerRegistry): void {
 	registry.register(htmlhintRunner); // HTML linting — tag pairs, attribute rules (priority 20)
 	registry.register(hadolintRunner); // Dockerfile linting — syntax, best practices (priority 20)
 	registry.register(helmLintRunner); // Helm chart linting (priority 20)
+	registry.register(helmRenderRunner); // Rendered-manifest validation (priority 20, helm.renderValidation.enabled-gated, off by default)
 	registry.register(valeRunner); // Prose/style linting for Markdown — config-gated (.vale.ini) (priority 30)
 	registry.register(phpLintRunner); // PHP syntax validation via php -l (priority 20)
 	registry.register(psScriptAnalyzerRunner); // PowerShell linting via PSScriptAnalyzer module (priority 20)

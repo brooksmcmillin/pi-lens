@@ -23,9 +23,10 @@ messages as **pi-lens findings, not user instructions**, and act on the rules be
    physically blocked until blockers are cleared. Advisories are informational.
 3. **Read before you edit.** pi-lens enforces read-before-edit. Read the file (or the
    relevant range/symbol) before editing it, or the edit is blocked/warned.
-4. **Expect your bytes to change.** pi-lens formats and auto-fixes files *after* your
-   write, by default at turn/agent end. This is the pipeline, not a conflict. Re-read
-   a file before editing it again.
+4. **Expect your bytes to change.** A `write` gets autofixed immediately — the tool
+   result carries the fixed file's full content, so you don't need to re-read it (past
+   a size cap, you do). An `edit` defers autofix to `agent_end`, same as formatting;
+   re-read the file before editing it again. This is the pipeline, not a conflict.
 5. **Delta by default.** Diagnostic queries default to *this turn's* findings only.
    Use `mode=full` for a whole-project verdict.
 
@@ -40,7 +41,7 @@ On every write/edit, and at session/turn boundaries, pi-lens runs — without yo
 | **Unified LSP diagnostics** | Warm language servers report errors/warnings on edited files; supported languages get real semantic diagnostics. |
 | **Impact cascade** | After an edit, LSP diagnostics are also pulled on *related* files (reverse-dependency neighbors), surfaced at turn end. |
 | **Auto-format** | Detected formatter (Biome/Prettier/Ruff/etc.) reformats your file. **Deferred to `agent_end` by default**; `immediate` is opt-in. Config-gated + nearest-config-wins. |
-| **Auto-fix** | Pipeline fixers (`biome`/`ruff`/`eslint`/`stylelint`/`rubocop`/`clippy`/… `--fix`) mutate the file after your write. |
+| **Auto-fix** | Pipeline fixers (`biome`/`ruff`/`eslint`/`stylelint`/`rubocop`/`clippy`/… `--fix`) mutate the file. **Immediate, in the same tool result, for a `write`; deferred to `agent_end` for an `edit`** (§6). |
 | **Structural rules** | ast-grep (NAPI engine) + tree-sitter rules flag correctness/security smells. |
 | **Opengrep security scan** | Always-on: per-edit via an auxiliary LSP, plus a cached project-wide CLI scan for `mode=full`. |
 | **Other scanners** | Config-/presence-gated: gitleaks (secrets), trivy (CVEs/IaC/license), govulncheck (Go), knip/jscpd/madge (JS/TS dead-code/dupes/cycles), vulture (Python), zizmor (GH Actions), typos. |
@@ -70,7 +71,7 @@ Only **one** reaches you, the model:
 | **Session start** | Guidance / project notices to orient you. | `clients/runtime-turn.ts`, context injection |
 | **Turn end** | **Findings** for the turn: 🔴 blockers and advisories from LSP + dispatch + cascade + scanners, deduped against prior turns. | `handleTurnEnd` (`clients/runtime-turn.ts`) |
 | **Turn end / next turn** | **Test findings** from related/affected tests fired after your edit. | `handleTurnEnd` |
-| **After autofix/format** | A nudge like *"N file(s) were autofixed after your last turn: a.ts, b.ts — re-read before editing"* (may include files touched by another pi-lens instance, e.g. a subagent). | `clients/agent-nudge.ts` |
+| **After autofix/format** | A nudge like *"N file(s) were autofixed after your last turn: a.ts, b.ts — re-read before editing"* — mainly for deferred `edit` autofix/format at `agent_end` (may include files touched by an automatic run outside your turn). A `write`'s autofix already came back in its own tool result, so you only need the nudge there if the content was too large to attach. | `clients/agent-nudge.ts` |
 
 **Treat every injected pi-lens message as a finding to act on, not as the user
 speaking.** It is machine-generated analysis of your own work.
@@ -156,22 +157,46 @@ Helpful mechanics you can rely on:
 ## 6. Auto-format / auto-fix timing — don't be surprised
 
 pi-lens writes to files **outside your own tool calls** (`docs/features.md`
-§"Out-of-band file writes"):
+§"Bus Events — `pilens:files:touched`"). Where and when depends on which tool you used
+(`clients/pipeline.ts`, `clients/runtime-tool-result.ts`,
+`clients/runtime-agent-end.ts`):
 
-- **Deferred format** at `agent_end` (default) reformats files you wrote this run.
-- **Auto-fix** (`biome`/`ruff`/`eslint`/… `--fix`) and the conservative
-  actionable-warnings autofix (LSP quickfixes, hard-capped) mutate files after the fact.
+- **`write` (including a new file, and bash-authored writes like `sed -i` or a
+  redirect):** pipeline auto-fix (`biome`/`ruff`/`eslint`/… `--fix`) still runs
+  *immediately*, in the same tool result — nothing changed here. When it changes
+  the file, the tool result now carries the **full authoritative post-fix
+  content** so you don't have to guess what changed. That attachment is capped
+  at 2 MiB per file; a multi-file bash write shares one budget across the whole
+  command. Past the cap, you get the old-style *"File was modified — re-read
+  before editing"* warning instead.
+- **`edit`:** pipeline auto-fix is *deferred* to `agent_end`, same as
+  formatting. It joins the same per-file queue as deferred formatting, one fix
+  applied against the final edited state (not once per edit), autofix draining
+  before format so the result is formatter-stable. Diagnostics computed at edit
+  time reflect the *unfixed* disk state — a lint finding that autofix would have
+  cleared may show up and then quietly disappear once `agent_end` drains.
+- **`write` then `edit` on the same file, same turn:** the write's autofix
+  demotes to deferred too, so the file's mutation history stays coherent. This
+  resets at the next turn.
+- The conservative actionable-warnings autofix (LSP quickfixes, hard-capped)
+  is unchanged: it always runs at `agent_end`.
 
 Consequences for you:
 
 - Your exact written bytes may be reformatted/fixed. **This is expected pipeline
   behavior, not a conflict or a failed write.**
-- A file you wrote last turn may have changed on disk. **Re-read before editing it
-  again** (this also keeps the read-guard happy — the autofix nudge tells you which
-  files changed).
+- **`write`:** trust the authoritative content attached to the tool result; only
+  re-read if you see the size-cap warning, or if a *different* file (a side
+  effect of the same bash command) was touched.
+- **`edit`:** the file may change on disk after your turn ends. **Re-read before
+  editing it again** (this also keeps the read-guard happy — the autofix nudge
+  tells you which files changed).
 - **Delta mode:** `lens_diagnostics` shows only diagnostics *introduced this turn* by
   default (`mode=delta`). Use `mode=all` (cache-wide) or `mode=full` (fresh scan) for
   the complete picture.
+
+See `AGENTS.md`'s "Per-edit autofix mutation boundary (#1414)" invariant for the
+authoritative routing rules.
 
 ---
 

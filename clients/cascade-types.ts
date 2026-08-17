@@ -11,6 +11,16 @@ export interface CascadeNeighborResult {
 	reason: "imports" | "calls" | "references" | "fallback";
 	diagnostics: Diagnostic[];
 	lspTouched: boolean;
+	/** The touch did not confirm either clean state or diagnostics. */
+	inconclusive?: boolean;
+	/**
+	 * #1459/#1470: scanners that did NOT look at this file — breaker open, resync
+	 * deferred by the fan-out gate, or cut off by the aux grace timer. Present
+	 * means "these findings are not a full picture", so a zero-diagnostic
+	 * neighbour must not be rendered as a clean leaf. Deliberately separate from
+	 * `inconclusive`: the primary answered and its findings stand.
+	 */
+	unconfirmedServerIds?: string[];
 	durationMs?: number;
 }
 
@@ -49,4 +59,16 @@ export interface CascadeRun {
 	 * `skipReason` so a thrown compute (`skipReason: "error"`) can surface too.
 	 */
 	indeterminate?: CascadeIndeterminate;
+	/**
+	 * #1443: how many turn boundaries this run has survived without being
+	 * consumed. Stamped by `RuntimeCoordinator.beginTurn` when it carries a run
+	 * appended after the previous turn_end's `consumeCascadeRuns` (the
+	 * quiet-window reconcile's late re-injection). The carry is bounded to ONE
+	 * turn — beginTurn drops (and logs) anything that would reach 2. The
+	 * turn-end origin filter does NOT read this field to decide whether to
+	 * keep or reject a run (see `getFilesChangedSince` in runtime-turn.ts for
+	 * the actual per-file supersede check) — it is carried through only for
+	 * observability in the drop log's metadata.
+	 */
+	carriedTurns?: number;
 }

@@ -31,7 +31,13 @@ import { getDiagnosticTracker } from "./diagnostic-tracker.js";
 import { loadDispatchIntegration } from "./dispatch/lazy.js";
 import { toRunnerDisplayPath } from "./dispatch/runner-context.js";
 import {
+	type AvailabilityLatch,
+	classifyProbeFailure,
 	createAvailabilityChecker,
+	createAvailabilityLatch,
+	describeProbeEvidence,
+	logAvailabilityDecision,
+	startHostStallSampler,
 	resolveAvailableOrInstall,
 	resolveCommandArgsWithInstallFallback,
 	resolveToolCommand,
@@ -239,6 +245,10 @@ export interface PipelineContext {
 		sessionId: string;
 		turnIndex: number;
 		writeIndex: number;
+		/** Raw model id / provider, separate from the combined `model` display
+		 * string above — worklog attribution (#1448) wants the two apart. */
+		modelId?: string;
+		provider?: string;
 	};
 	/** pi.getFlag accessor */
 	getFlag: (name: string, filePath?: string) => boolean | string | undefined;
@@ -368,7 +378,18 @@ export {
 	hasStylelintConfig,
 };
 
-const _eslintCache = new BoundedLruCache<string, { available: boolean; bin: string | null }>(32);
+/**
+ * eslint autofix availability, per cwd + PATH. The verdict is owned by the
+ * shared availability latch (#1494): a `missing` / `non-installable` outcome
+ * sticks for the session, a timeout expires on a cooldown and is re-probed, so
+ * one stalled probe cannot silently stop autofixing a project's JS/TS.
+ */
+const ESLINT_FIX_PROBE_BUDGET_MS = 5000;
+
+const _eslintCache = new BoundedLruCache<
+	string,
+	{ latch: AvailabilityLatch; bin: string | null }
+>(32);
 
 /**
  * Run eslint --fix on a file. Runs a single spawn and diffs the file before/after,
@@ -386,18 +407,74 @@ async function tryEslintFix(filePath: string, cwd: string): Promise<number> {
 	const cacheKey = `${path.resolve(cwd)}|${process.env.PATH ?? ""}`;
 	let cached = _eslintCache.get(cacheKey);
 	if (!cached) {
-		const candidate = resolveToolCommand(cwd, "eslint") ?? "eslint";
-		const check = await safeSpawnAsync(candidate, ["--version"], {
-			timeout: 5000,
-			cwd,
-		});
-		cached = {
-			available: !check.error && check.status === 0,
-			bin: !check.error && check.status === 0 ? candidate : null,
-		};
+		cached = { latch: createAvailabilityLatch(), bin: null };
 		_eslintCache.set(cacheKey, cached);
 	}
-	if (!cached.available || !cached.bin) return 0;
+	if (cached.latch.read() === null) {
+		const candidate = resolveToolCommand(cwd, "eslint") ?? "eslint";
+		// The budget is enforced by a HOST-side timer, so a stalled event loop
+		// expires it while eslint is still healthy. Measure the overlapping stall
+		// and hand it to the classifier, exactly like the runner path: without it a
+		// host-stall timeout is re-caused as `probe-timeout` and gets the escalating
+		// 30s→300s cooldown instead of the 5s host-stall one (#1467).
+		const stallSampler = startHostStallSampler();
+		const startedAt = Date.now();
+		let check: Awaited<ReturnType<typeof safeSpawnAsync>>;
+		let hostStallMs: number;
+		try {
+			check = await safeSpawnAsync(candidate, ["--version"], {
+				timeout: ESLINT_FIX_PROBE_BUDGET_MS,
+				cwd,
+			});
+		} finally {
+			hostStallMs = stallSampler.stop();
+		}
+		const elapsedMs = Date.now() - startedAt;
+		const decisionCwd = path.resolve(cwd);
+		if (!check.error && check.status === 0) {
+			cached.bin = candidate;
+			cached.latch.noteAvailable();
+			logAvailabilityDecision(
+				{
+					tool: "eslint",
+					verdict: "available",
+					outcome: "success",
+					cause: "ok",
+					elapsedMs,
+					latched: true,
+					hostStallMs,
+					budgetMs: ESLINT_FIX_PROBE_BUDGET_MS,
+					classifiedBy: "probe",
+					evidence: describeProbeEvidence(check, "eslint"),
+				},
+				decisionCwd,
+			);
+		} else {
+			cached.bin = null;
+			const { outcome, cause, evidence } = classifyProbeFailure(check, {
+				hostStallMs,
+				command: "eslint",
+			});
+			const retryAfterMs = cached.latch.noteUnavailable(outcome, cause);
+			logAvailabilityDecision(
+				{
+					tool: "eslint",
+					verdict: "unavailable",
+					outcome,
+					cause,
+					elapsedMs,
+					latched: retryAfterMs === 0,
+					hostStallMs,
+					...(retryAfterMs > 0 && { retryAfterMs }),
+					budgetMs: ESLINT_FIX_PROBE_BUDGET_MS,
+					classifiedBy: "probe",
+					evidence,
+				},
+				decisionCwd,
+			);
+		}
+	}
+	if (cached.latch.read() !== true || !cached.bin) return 0;
 	const cmd = cached.bin;
 
 	return detectFileChangedAfterCommand(
@@ -1283,6 +1360,8 @@ export async function runPipeline(
 		{
 			projectRoot: ctx.projectRoot,
 			writeIndex: ctx.telemetry?.writeIndex,
+			telemetryModel: ctx.telemetry?.modelId,
+			telemetryProvider: ctx.telemetry?.provider,
 		},
 	);
 	recordDiagnostics(

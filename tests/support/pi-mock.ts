@@ -109,6 +109,17 @@ export interface PiMock {
 	getHandlerOrThrow(event: string): Hook;
 	getTool(name: string): unknown | undefined;
 	getCommand(name: string): RecordedCommand | undefined;
+	/**
+	 * #1453: reproduce what the host does before EVERY `session_start`.
+	 * `AgentSession`'s constructor calls `_buildRuntime({ includeAllExtensionTools:
+	 * true })`, and fork / newSession / switchSession / importFromJsonl / reload
+	 * each construct a FRESH session that way before the event is emitted. The
+	 * active tool set is never persisted per session, so every registered tool
+	 * is active again by the time pi-lens's handler runs — while the extension's
+	 * own closure state survives (the runner does not re-run the factory).
+	 * Call this before emitting a fork/reload/resume `session_start`.
+	 */
+	simulateSessionRebuild(): void;
 	/** Run every handler registered for `event`; return the last defined result. */
 	emit(event: string, payload?: unknown, ctx?: unknown): Promise<unknown>;
 	/** Invoke a registered command's handler. */
@@ -212,6 +223,9 @@ export function createPiMock(
 		},
 		getCommand(name) {
 			return commands.get(name);
+		},
+		simulateSessionRebuild() {
+			for (const name of tools.keys()) activeTools.add(name);
 		},
 		async emit(event, payload, ctx) {
 			let result: unknown;

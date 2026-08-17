@@ -15,14 +15,17 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	getExcludedDirGlobs,
-	getGlobalPiLensDir,
 	getProjectIgnoreGlobs,
 	getProjectIgnoreMatcher,
 } from "./file-utils.js";
 import { findNodeToolBinary } from "./package-manager.js";
 import { isAtOrAboveHomeDir, isFullyQualified } from "./path-utils.js";
 import { getJscpdMaxEntriesDerived } from "./project-scale.js";
-import { createAvailabilityChecker, resolveAvailableOrInstall } from "./dispatch/runners/utils/runner-helpers.js";
+import {
+	createAvailabilityChecker,
+	findManagedNodeToolBinary,
+	resolveAvailableOrInstall,
+} from "./dispatch/runners/utils/runner-helpers.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
 import { shouldRecurseIntoDir, walkTreeStackSync } from "./source-walker.js";
 
@@ -57,13 +60,8 @@ const SCAN_TIMEOUT_MS = 30_000;
 
 const jscpdAvailability = createAvailabilityChecker("jscpd", "", ["--version"], {
 	probeTimeout: 1500,
-	fastPath: () => {
-		const localBase = path.join(getGlobalPiLensDir(), "tools", "node_modules", ".bin", "jscpd");
-		const candidates = process.platform === "win32"
-			? [`${localBase}.cmd`, `${localBase}.exe`, localBase]
-			: [localBase];
-		return candidates.find((candidate) => fs.existsSync(candidate)) ?? null;
-	},
+	// One definition of the managed-shim fast path, shared with knip (#1476).
+	fastPath: () => findManagedNodeToolBinary("jscpd"),
 });
 
 // --- Client ---

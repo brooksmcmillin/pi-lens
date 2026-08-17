@@ -54,6 +54,29 @@ export function classifyServerWaitTier(
 }
 
 /**
+ * Resolve `filePath`'s PRIMARY (non-auxiliary) server id and its live
+ * capability snapshot, or `undefined` when the file has no primary server
+ * configured. The single place that decides what "this file's server" means
+ * for wait-policy purposes — shared by {@link classifyCascadeWaitTier} and the
+ * cascade-lane wrapper in `clients/lsp/cascade-tier.ts`, which needs the same
+ * id/snapshot pair to apply its one cascade-only override.
+ */
+export function resolvePrimaryServerForWaitPolicy(
+	filePath: string,
+	snapshots: Awaited<ReturnType<LSPService["getCapabilitySnapshots"]>>,
+): { serverId: string; snapshot: LSPCapabilitySnapshot | undefined } | undefined {
+	const servers = getServersForFileWithConfig(filePath).filter(
+		(s) => s.role !== "auxiliary",
+	);
+	const primary = servers[0];
+	if (!primary) return undefined;
+	return {
+		serverId: primary.id,
+		snapshot: snapshots.find((s) => s.serverId === primary.id),
+	};
+}
+
+/**
  * Classify whether `filePath`'s PRIMARY language server is a cascade-lane
  * Tier-3 (push-only, silent-on-clean) server. Ambiguous or missing capability
  * data is always `"waits"` (today's behavior) — this function must never be
@@ -67,12 +90,7 @@ export function classifyCascadeWaitTier(
 	snapshots: Awaited<ReturnType<LSPService["getCapabilitySnapshots"]>>,
 ): CascadeWaitTier {
 	void lspService; // kept in the signature for call-site clarity/typing only
-	const servers = getServersForFileWithConfig(filePath).filter(
-		(s) => s.role !== "auxiliary",
-	);
-	const primary = servers[0];
+	const primary = resolvePrimaryServerForWaitPolicy(filePath, snapshots);
 	if (!primary) return "waits";
-
-	const snapshot = snapshots.find((s) => s.serverId === primary.id);
-	return classifyServerWaitTier(primary.id, snapshot);
+	return classifyServerWaitTier(primary.serverId, primary.snapshot);
 }

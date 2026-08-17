@@ -1,8 +1,10 @@
 /**
  * package-manager: declaration detection (real lockfiles in temp dirs),
  * availability-aware resolution, command builders, and global-bin discovery.
- * `isCommandAvailableAsync`/`safeSpawnAsync` are mocked so the system's real
- * package managers never leak into the assertions.
+ * `safeSpawnAsync` is mocked so the system's real package managers never leak
+ * into the assertions. The availability probe now spawns `where`/`which <pm>`
+ * directly (#1496), so `onlyAvailable` mocks that call rather than the old
+ * `isCommandAvailableAsync` wrapper.
  */
 
 import * as fs from "node:fs";
@@ -16,10 +18,7 @@ vi.mock("../../clients/safe-spawn.js", async (importOriginal) => ({
 	isCommandAvailableAsync: vi.fn(),
 	safeSpawnAsync: vi.fn(),
 }));
-import {
-	isCommandAvailableAsync,
-	safeSpawnAsync,
-} from "../../clients/safe-spawn.js";
+import { safeSpawnAsync } from "../../clients/safe-spawn.js";
 import {
 	_resetPackageManagerCache,
 	allAvailableGlobalBinDirs,
@@ -51,12 +50,43 @@ function projectWith(files: Record<string, string>): string {
 	return dir;
 }
 
-/** Make `isCommandAvailableAsync` resolve true only for the listed managers. */
+/**
+ * The availability probe spawns `where`/`which <pm>` directly (#1496); a
+ * non-probe call (e.g. `npm config get prefix`, `pnpm bin -g`) falls through
+ * to `queryResponder`, which individual tests set to answer those queries.
+ */
+let queryResponder:
+	| ((cmd: string, args: string[]) => Promise<{ stdout: string; stderr: string; status: number | null; error?: Error }>)
+	| null = null;
+/** Every non-probe (query) call `onlyAvailable`'s mock forwarded — asserts on this, not on `safeSpawnAsync` overall, since the availability probe itself now spawns too. */
+let queryCalls: Array<{ cmd: string; args: string[] }> = [];
+
+function setQueryResponder(
+	responder: (
+		cmd: string,
+		args: string[],
+	) => Promise<{ stdout: string; stderr: string; status: number | null; error?: Error }>,
+): void {
+	queryResponder = responder;
+}
+
+/** Make the `where`/`which <pm>` probe resolve available only for the listed managers. */
 function onlyAvailable(...available: string[]): void {
 	const set = new Set(available);
-	vi.mocked(isCommandAvailableAsync).mockImplementation(async (cmd) =>
-		set.has(cmd),
-	);
+	vi.mocked(safeSpawnAsync).mockImplementation(async (cmd, args) => {
+		const finder = process.platform === "win32" ? "where" : "which";
+		if (cmd === finder) {
+			const pm = (args ?? [])[0];
+			// A real `where`/`which` runs fine and exits 1 when it finds
+			// nothing — no spawn error. That is the "genuine absence" shape.
+			return set.has(pm)
+				? { stdout: `${pm}\n`, stderr: "", status: 0 }
+				: { stdout: "", stderr: "", status: 1 };
+		}
+		queryCalls.push({ cmd, args: args ?? [] });
+		if (queryResponder) return queryResponder(cmd, args ?? []);
+		return { stdout: "", stderr: "", status: 1 };
+	});
 }
 
 /** Override process.platform for a test; restored in afterEach. */
@@ -68,8 +98,9 @@ function setPlatform(platform: NodeJS.Platform): void {
 
 beforeEach(() => {
 	_resetPackageManagerCache();
-	vi.mocked(isCommandAvailableAsync).mockReset();
 	vi.mocked(safeSpawnAsync).mockReset();
+	queryResponder = null;
+	queryCalls = [];
 });
 
 afterEach(() => {
@@ -242,11 +273,11 @@ describe("allAvailableGlobalBinDirs", () => {
 	it("resolves the npm prefix to its bin dir on Unix", async () => {
 		setPlatform("linux");
 		onlyAvailable("npm");
-		vi.mocked(safeSpawnAsync).mockResolvedValue({
+		setQueryResponder(async () => ({
 			stdout: "/usr/local\n",
 			stderr: "",
 			status: 0,
-		});
+		}));
 		// allAvailableGlobalBinDirs path.resolve()s each dir (dedup); resolve the
 		// expected too so the assertion holds on Windows (drive-prefixed) as well.
 		expect(await allAvailableGlobalBinDirs()).toEqual([
@@ -263,7 +294,8 @@ describe("allAvailableGlobalBinDirs", () => {
 			expect(await allAvailableGlobalBinDirs()).toEqual([
 				path.resolve(path.join("/opt/bun", "bin")),
 			]);
-			expect(safeSpawnAsync).not.toHaveBeenCalled();
+			// bun's bin dir is deterministic — no query spawn beyond the probe.
+			expect(queryCalls).toEqual([]);
 		} finally {
 			if (saved === undefined) delete process.env.BUN_INSTALL;
 			else process.env.BUN_INSTALL = saved;
@@ -273,7 +305,8 @@ describe("allAvailableGlobalBinDirs", () => {
 	it("returns nothing when no manager is installed", async () => {
 		onlyAvailable();
 		expect(await allAvailableGlobalBinDirs()).toEqual([]);
-		expect(safeSpawnAsync).not.toHaveBeenCalled();
+		// No manager passed its probe, so no query spawn was ever reached.
+		expect(queryCalls).toEqual([]);
 	});
 });
 
@@ -289,11 +322,11 @@ describe("findGlobalBinary", () => {
 			process.platform === "win32" ? prefix : path.join(prefix, "bin");
 		fs.mkdirSync(binDir, { recursive: true });
 		onlyAvailable("npm");
-		vi.mocked(safeSpawnAsync).mockResolvedValue({
+		setQueryResponder(async () => ({
 			stdout: `${prefix}\n`,
 			stderr: "",
 			status: 0,
-		});
+		}));
 		return { prefix, binDir };
 	}
 
@@ -349,11 +382,11 @@ describe("findNodeToolBinary", () => {
 		fs.mkdirSync(binDir, { recursive: true });
 		fs.writeFileSync(path.join(binDir, "madge"), "#!/bin/sh\n");
 		onlyAvailable("npm");
-		vi.mocked(safeSpawnAsync).mockResolvedValue({
+		setQueryResponder(async () => ({
 			stdout: `${prefix}\n`,
 			stderr: "",
 			status: 0,
-		});
+		}));
 
 		const cwd = tmpDir(); // clean project, no node_modules
 		expect(await findNodeToolBinary("madge", cwd)).toBe(

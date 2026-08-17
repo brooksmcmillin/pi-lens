@@ -243,8 +243,8 @@ Initial assumption ("knip/jscpd are booboo-only") was **wrong**. Verified:
 | layer | handler | runs |
 |-------|---------|------|
 | per-edit | `dispatchLintWithResult` | LSP, tree-sitter, ast-grep, fact-rules, biome/ruff/eslint/oxlint |
-| per-turn | `handleTurnEnd` (`runtime-turn.ts`) | **knip** (`:298`), **jscpd** (incremental, `getFilesForJscpd`), **madge/dep circular** (`:426`), **cascade merge** (`:175`), **tests** (`:461`), actionable/code-quality warnings aggregation, project-diagnostics delta |
-| per-session | `handleSessionStart` (`runtime-session.ts`) | **jscpd full scan** (`:505`), knip, type-coverage, dep, govulncheck, gitleaks, todo, complexity baselines, dominant-language **LSP warm** (#203). The production path does not currently populate the error-debt baseline. |
+| per-turn | `handleTurnEnd` (`runtime-turn.ts`) | **knip**, **jscpd** (incremental, `getFilesForJscpd`), **madge/dep circular** (opt-in via `--lens-turn-end-madge`), **cascade merge**, **tests**, actionable/code-quality warnings aggregation, project-diagnostics delta |
+| per-session | `handleSessionStart` (`runtime-session.ts`) | **jscpd full scan**, knip, type-coverage, dep, govulncheck, gitleaks, todo, complexity baselines, dominant-language **LSP warm** (#203). The production path does not currently populate the error-debt baseline. |
 
 The initial MCP implementation invoked **none** of the lifecycle handlers —
 only the per-edit layer. The shipped server now exposes `pilens_session_start`

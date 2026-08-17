@@ -140,7 +140,7 @@ const PRIMARY_DISPATCH_GROUPS: Partial<Record<FileKind, RunnerGroup>> = {
 	},
 	yaml: {
 		mode: "all",
-		runnerIds: ["lsp", "yamllint", "trivy-config", "helm-lint"],
+		runnerIds: ["lsp", "yamllint", "trivy-config", "helm-lint", "helm-render"],
 		filterKinds: ["yaml"],
 	},
 	sql: {
@@ -204,7 +204,9 @@ const PRIMARY_DISPATCH_GROUPS: Partial<Record<FileKind, RunnerGroup>> = {
 	haskell: { mode: "fallback", runnerIds: ["lsp"], filterKinds: ["haskell"] },
 	"helm-template": {
 		mode: "all",
-		runnerIds: ["helm-lint"],
+		// helm-render is opt-in (`helm.renderValidation.enabled`) and skips itself
+		// when the switch is absent, so it costs nothing when unconfigured (#1283).
+		runnerIds: ["helm-lint", "helm-render"],
 		filterKinds: ["helm-template"],
 	},
 	elixir: {

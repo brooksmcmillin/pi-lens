@@ -62,6 +62,875 @@ describe("test-runner-client", () => {
 		expect(result.failed).toBe(1);
 	});
 
+	// #1479: the agent-facing surface asks the same "was this measured at all"
+	// question the turn-end log asks, and now reads it from the same predicate.
+	describe("formatResult duration suffix (#1479)", () => {
+		const format = (duration?: number) =>
+			new TestRunnerClient(false).formatResult({
+				file: "/tmp/foo.test.ts",
+				sourceFile: "",
+				runner: "vitest",
+				passed: 2,
+				failed: 0,
+				skipped: 0,
+				failures: [],
+				duration,
+			});
+
+		it("prints the suffix for a measured run", () => {
+			expect(format(1230)).toContain(" (1.23s)");
+		});
+
+		it("omits the suffix for an unmeasured run", () => {
+			expect(format(undefined)).not.toContain("(");
+		});
+
+		// Scope decision carried over from #1479 and deliberately unchanged: a
+		// measured zero rounds to `(0.00s)`, which is prompt noise, so the
+		// agent-facing string suppresses it. The turn-end log still says `0ms`
+		// for the same result — that surface is where the distinction matters.
+		it("omits the suffix for a measured zero, unlike the turn-end log", () => {
+			expect(format(0)).not.toContain("(");
+		});
+
+		it("omits the suffix for a non-finite duration rather than printing it", () => {
+			expect(format(Number.POSITIVE_INFINITY)).not.toContain("(");
+			expect(format(Number.NaN)).not.toContain("(");
+		});
+	});
+
+	// #1480: `parseGenericRunnerOutput` hardcoded duration 0 for every runner
+	// but go, so the turn-end log printed a constant that looked like a
+	// measurement — the very thing #1479 set out to stop it doing. Durations
+	// are pinned to EXACT values here: a `> 0` assertion would accept the next
+	// plausible constant, which is how this defect class survived #1452's
+	// sweep in the first place.
+	describe("generic runner durations (#1480)", () => {
+		const parse = (output: string, runner: string, exitCode = 0) =>
+			(new TestRunnerClient(false) as any).parseGenericRunnerOutput(
+				output,
+				"",
+				exitCode,
+				`/tmp/test.${runner}`,
+				runner,
+			);
+
+		// Format from the libtest printer shipped with the local rustc 1.94.1
+		// (`formatters/pretty.rs` + `time.rs`), NOT a live `cargo test` — this
+		// box has no MSVC linker, so cargo cannot link a test binary.
+		it("parses the cargo test-result summary duration", () => {
+			const result = parse(
+				[
+					"running 3 tests",
+					"test tests::ok1 ... ok",
+					"test tests::ign ... ignored",
+					"",
+					"test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.25s",
+					"",
+				].join("\n"),
+				"cargo",
+			);
+
+			expect(result.passed).toBe(2);
+			expect(result.skipped).toBe(1);
+			expect(result.duration).toBe(250);
+		});
+
+		it("ignores a cargo panic message that mimics the summary suffix", () => {
+			// First-match hazard: the assertion diff below carries the same
+			// "; finished in ..." text the summary does. The pattern is anchored
+			// to the start of the `test result:` line so the diff cannot win.
+			const result = parse(
+				[
+					"thread 'tests::bad' panicked at src/lib.rs:9:",
+					'  left: "; finished in 99.9s"',
+					"",
+					"test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.50s",
+				].join("\n"),
+				"cargo",
+				101,
+			);
+
+			expect(result.duration).toBe(500);
+		});
+
+		it("leaves cargo unmeasured when the summary carries no elapsed time", () => {
+			// Older rustc omits the suffix entirely. Absent, not 0: 0 would
+			// claim libtest reported a sub-millisecond run.
+			const result = parse(
+				"test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
+				"cargo",
+			);
+
+			expect(result.passed).toBe(2);
+			expect(result.duration).toBeUndefined();
+		});
+
+		// Format from the vstest.console.dll shipped with the local .NET SDK
+		// 8.0.423 (summary literal plus the " h"/" m"/" s"/" ms"/"< 1 ms" unit
+		// literals), NOT a live `dotnet test` — NuGet restore has no network.
+		it("parses the dotnet/vstest summary duration in ms", () => {
+			const result = parse(
+				"Failed!  - Failed:     1, Passed:     2, Skipped:     0, Total:     3, Duration: 250 ms - t.dll (net8.0)",
+				"dotnet",
+				1,
+			);
+
+			expect(result.failed).toBe(1);
+			expect(result.passed).toBe(2);
+			expect(result.duration).toBe(250);
+		});
+
+		it("sums the dotnet/vstest multi-unit duration token list", () => {
+			// vstest joins unit tokens with spaces rather than printing one
+			// number, so "1 m 30 s" is 90s and "2 s 345 ms" is 2345ms.
+			const minutes = parse(
+				"Passed!  - Failed:     0, Passed:     3, Skipped:     0, Total:     3, Duration: 1 m 30 s - t.dll (net8.0)",
+				"dotnet",
+			);
+			const seconds = parse(
+				"Passed!  - Failed:     0, Passed:     3, Skipped:     0, Total:     3, Duration: 2 s 345 ms - t.dll (net8.0)",
+				"dotnet",
+			);
+			const hours = parse(
+				"Passed!  - Failed:     0, Passed:     3, Skipped:     0, Total:     3, Duration: 1 h 2 m - t.dll (net8.0)",
+				"dotnet",
+			);
+
+			expect(minutes.duration).toBe(90_000);
+			expect(seconds.duration).toBe(2345);
+			expect(hours.duration).toBe(3_720_000);
+		});
+
+		it("reports vstest's sub-millisecond run as a measured zero", () => {
+			// `< 1 ms` is vstest saying it timed the run and the figure rounds
+			// below its resolution. With duration optional that is exactly 0 —
+			// measured, rounds to nothing. Under the old 0-means-unmeasured
+			// representation this case could not be expressed at all and was
+			// reported as absent.
+			const result = parse(
+				"Passed!  - Failed:     0, Passed:     1, Skipped:     0, Total:     1, Duration: < 1 ms - t.dll (net8.0)",
+				"dotnet",
+			);
+
+			expect(result.passed).toBe(1);
+			expect(result.duration).toBe(0);
+		});
+
+		it("leaves dotnet unmeasured when the duration tail carries no units", () => {
+			// A tail that matched but yields no unit token is an unrecognised
+			// format, not a zero-length run.
+			const result = parse(
+				"Passed!  - Failed:     0, Passed:     1, Skipped:     0, Total:     1, Duration: whenever",
+				"dotnet",
+			);
+
+			expect(result.duration).toBeUndefined();
+		});
+
+		// Surefire format from its console reporter, NOT a live maven run —
+		// there is no mvn on this box.
+		it("sums the maven/surefire per-class Time elapsed lines", () => {
+			const result = parse(
+				[
+					"[INFO] Running com.example.AppTest",
+					"[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.05 s -- in com.example.AppTest",
+					"[INFO] Running com.example.OtherTest",
+					"[INFO] Tests run: 2, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.125 s -- in com.example.OtherTest",
+					"[INFO] Results:",
+					"[ERROR] Tests run: 4, Failures: 1, Errors: 0, Skipped: 0",
+					"[INFO] Total time:  9.876 s",
+				].join("\n"),
+				"maven",
+				1,
+			);
+
+			// 50 + 125. NOT 9876: "[INFO] Total time" is whole-build wall clock
+			// including compile, and reporting it as test time would be a wrong
+			// number rather than an absent one.
+			expect(result.duration).toBe(175);
+			expect(result.failed).toBe(1);
+		});
+
+		it("reports a surefire class that ran in 0.00 s as a measured zero", () => {
+			// The guard is "did a line match", not "is the sum positive".
+			// Surefire prints `Time elapsed: 0.00 s` for a trivial class and
+			// that IS a reading; calling it unmeasured would be the `> 0`
+			// mistake this port exists to avoid.
+			const result = parse(
+				"[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.00 s -- in com.example.TrivialTest",
+				"maven",
+			);
+
+			expect(result.duration).toBe(0);
+		});
+
+		it("leaves maven unmeasured when no Time elapsed line survives -q", () => {
+			// `mvn test -q` suppresses surefire's INFO lines, so the aggregate
+			// alone is what reaches us. Absent is the honest report.
+			const result = parse(
+				[
+					"[INFO] Results:",
+					"[ERROR] Tests run: 4, Failures: 1, Errors: 0, Skipped: 0",
+				].join("\n"),
+				"maven",
+				1,
+			);
+
+			expect(result.duration).toBeUndefined();
+		});
+
+		it("accepts the surefire 2.x 'sec' spelling", () => {
+			const result = parse(
+				"Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.012 sec - in com.example.AppTest",
+				"maven",
+			);
+
+			expect(result.duration).toBe(12);
+		});
+
+		// REAL capture: rspec-core 3.13.6 on ruby 3.4.10.
+		it("parses the rspec Finished-in line", () => {
+			const result = parse(
+				[
+					".F",
+					"",
+					"Finished in 0.32394 seconds (files took 0.49427 seconds to load)",
+					"2 examples, 1 failure",
+				].join("\n"),
+				"rspec",
+				1,
+			);
+
+			expect(result.passed).toBe(1);
+			expect(result.failed).toBe(1);
+			// 323.94ms, NOT the 494.27ms file-load time that trails it on the
+			// same line.
+			expect(result.duration).toBe(324);
+		});
+
+		it("parses the rspec minutes form", () => {
+			// From RSpec::Core::Formatters::Helpers.format_duration in the
+			// installed gem: past 60s it prints "N minutes M.MM seconds".
+			const result = parse(
+				[
+					"Finished in 2 minutes 15.14 seconds (files took 0.5 seconds to load)",
+					"2 examples, 0 failures",
+				].join("\n"),
+				"rspec",
+			);
+
+			expect(result.duration).toBe(135_140);
+		});
+
+		it("ignores an rspec failure diff that mimics the Finished-in line", () => {
+			// First-match hazard: the quoted expectation below would win an
+			// unanchored /m match. The pattern requires the line to START with
+			// "Finished in", which rspec's own summary does and a diff does not.
+			const result = parse(
+				[
+					"Failures:",
+					"",
+					"  1) demo fails",
+					"     Failure/Error: expect(log).to eq 'Finished in 99 seconds'",
+					"",
+					"Finished in 0.32394 seconds (files took 0.49427 seconds to load)",
+					"2 examples, 1 failure",
+				].join("\n"),
+				"rspec",
+				1,
+			);
+
+			expect(result.duration).toBe(324);
+		});
+
+		// REAL capture: minitest 5.25.4 on ruby 3.4.10.
+		it("parses the minitest Finished-in line", () => {
+			const result = parse(
+				[
+					"Run options: --seed 63795",
+					"",
+					"F.",
+					"",
+					"Finished in 0.254594s, 7.8557 runs/s, 7.8557 assertions/s.",
+					"",
+					"2 runs, 2 assertions, 1 failures, 0 errors, 0 skips",
+				].join("\n"),
+				"minitest",
+				1,
+			);
+
+			expect(result.passed).toBe(1);
+			expect(result.failed).toBe(1);
+			expect(result.duration).toBe(255);
+		});
+
+		// Gradle's console summary carries no elapsed time and "BUILD
+		// SUCCESSFUL in 3s" is whole-build wall clock, so this stays unmeasured
+		// on purpose. #1479 makes that absence legible in the log.
+		it("leaves gradle unmeasured rather than borrowing the build time", () => {
+			const result = parse(
+				[
+					"> Task :test FAILED",
+					"4 tests completed, 1 failed",
+					"BUILD FAILED in 3s",
+				].join("\n"),
+				"gradle",
+				1,
+			);
+
+			expect(result.failed).toBe(1);
+			expect(result.passed).toBe(3);
+			expect(result.duration).toBeUndefined();
+		});
+
+		it("still parses the go package summary duration", () => {
+			const result = parse("ok  \texample.com/pkg\t0.253s\n", "go");
+
+			expect(result.duration).toBe(253);
+		});
+
+		it("leaves an unrecognised runner summary unmeasured", () => {
+			const result = parse("everything is fine\n", "somethingelse");
+
+			expect(result.duration).toBeUndefined();
+		});
+
+		// #1480 review: the probes used to run over EVERY runner's output, so
+		// "gradle carries no elapsed time" was a claim about gradle's text, not
+		// a property of the code. It was false. Real gradle output satisfies
+		// go's `ok <pkg> <n>s` probe, and the build wall clock came out as test
+		// time — the one number this function exists to refuse.
+		it("does not let gradle borrow the build wall clock via go's probe", () => {
+			const result = parse(
+				"> Task :test\nsome output ok\nin 3s\nBUILD SUCCESSFUL in 3s\n",
+				"gradle",
+			);
+
+			expect(result.duration).toBeUndefined();
+		});
+
+		it("does not score an unknown runner with another runner's pattern", () => {
+			// The `default:` arm of the switch sends every custom or
+			// unrecognised runner here, so its arbitrary output must not be
+			// mined for other runners' summaries. This payload satisfies the
+			// go, cargo, dotnet, maven, rspec AND minitest probes at once.
+			const result = parse(
+				[
+					"ok  \texample.com/pkg\t9.000s",
+					"test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.00s",
+					"Failed:     0, Passed:     1, Skipped:     0, Total:     1, Duration: 9 s - t.dll (net8.0)",
+					"Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 9.0 s -- in com.example.AppTest",
+					"Finished in 9.0 seconds (files took 0.1 seconds to load)",
+					"Finished in 9.0s, 1.0 runs/s, 1.0 assertions/s.",
+				].join("\n"),
+				"mytestrunner",
+			);
+
+			expect(result.duration).toBeUndefined();
+		});
+
+		it("does not score one known runner with another known runner's pattern", () => {
+			// rspec's own line, handed to minitest. Probe selection is by
+			// runner name, so no fallthrough scores it.
+			const result = parse(
+				[
+					"Finished in 0.32394 seconds (files took 0.49427 seconds to load)",
+					"2 examples, 0 failures",
+				].join("\n"),
+				"minitest",
+			);
+
+			expect(result.duration).toBeUndefined();
+		});
+
+		it("stops the dotnet duration scan at the assembly separator", () => {
+			// The `-` stop in `Duration:\s*([^\r\n-]+)` is the only thing
+			// keeping the assembly NAME out of the unit scan. This name carries
+			// a unit-shaped token on purpose: without the stop it adds 30
+			// seconds that vstest never reported.
+			const result = parse(
+				"Passed!  - Failed:     0, Passed:     1, Skipped:     0, Total:     1, Duration: 250 ms - Timeouts.30s.Tests.dll (net8.0)",
+				"dotnet",
+			);
+
+			expect(result.duration).toBe(250);
+		});
+
+		it("reads minitest's own Finished-in line, not a decoy", () => {
+			// Two decoys, one per guard in `/^Finished in\s+([\d.]+)s\s*,/im`.
+			// The indented one is what `^` rejects. The column-0 one is what the
+			// trailing `,` rejects — `^` alone does not rank two line-start
+			// matches, so without the comma the suite's own printf wins.
+			const result = parse(
+				[
+					"Run options: --seed 63795",
+					'  left: "Finished in 99.9s, boom"',
+					"Finished in 42s",
+					"",
+					"Finished in 0.254594s, 7.8557 runs/s, 7.8557 assertions/s.",
+					"",
+					"2 runs, 2 assertions, 0 failures, 0 errors, 0 skips",
+				].join("\n"),
+				"minitest",
+			);
+
+			expect(result.duration).toBe(255);
+		});
+
+		// KNOWN LIMIT, pinned so it stays known. cargo across crates, dotnet
+		// across assemblies and `go test ./...` across packages print one
+		// summary per unit and only the first is read, so a multi-unit run
+		// under-reports. Left as-is because the count parsers have the same
+		// first-match shape: duration and counts describe the same scope.
+		it("reads only the first summary of a multi-crate cargo run", () => {
+			const result = parse(
+				[
+					"test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s",
+					"",
+					"test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.00s",
+				].join("\n"),
+				"cargo",
+			);
+
+			// 100, not 2100. Under-reported, and deliberately so.
+			expect(result.duration).toBe(100);
+		});
+	});
+
+	// #1480 review: the maven aggregate is per MODULE, not per reactor.
+	describe("maven multi-module counts (#1480)", () => {
+		const parse = (output: string, exitCode: number) =>
+			(new TestRunnerClient(false) as any).parseGenericRunnerOutput(
+				output,
+				"",
+				exitCode,
+				"/tmp/pom.xml",
+				"maven",
+			);
+
+		// `--fail-at-end` keeps building after a module fails, so the LAST
+		// `Results:` block belongs to the last module — which can be green
+		// while the reactor is red. Reachable without pi-lens passing the flag:
+		// maven also reads `.mvn/maven.config` and `MAVEN_ARGS`.
+		const failAtEndReactor = [
+			"[INFO] --- Building module-one ---",
+			"[INFO] Tests run: 10, Failures: 3, Errors: 0, Skipped: 0, Time elapsed: 1.0 s -- in com.example.OneTest",
+			"[INFO] Results:",
+			"[ERROR] Tests run: 10, Failures: 3, Errors: 0, Skipped: 0",
+			"[INFO] --- Building module-two ---",
+			"[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.5 s -- in com.example.TwoTest",
+			"[INFO] Results:",
+			"[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0",
+			"[ERROR] BUILD FAILURE",
+		].join("\n");
+
+		it("sums every module's aggregate instead of reporting the last one", () => {
+			const result = parse(failAtEndReactor, 1);
+
+			// 11 run reactor-wide, 3 failed. Reading the last aggregate alone
+			// reported 1 passed / 0 failed and printed PASS over a red build.
+			expect(result.failed).toBe(3);
+			expect(result.passed).toBe(8);
+		});
+
+		it("counts the same scope the duration sums over", () => {
+			const result = parse(failAtEndReactor, 1);
+
+			// Both reactor-wide: 1.0s + 0.5s across the same two modules the
+			// counts came from. Before this, duration was every module and
+			// counts were the last one.
+			expect(result.duration).toBe(1500);
+		});
+
+		it("never reports a non-zero exit as a pass", () => {
+			// A green last module, or any parse that finds no failure, must not
+			// talk the runner's own exit code out of a failure.
+			const result = parse(
+				[
+					"[INFO] Results:",
+					"[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0",
+					"[ERROR] BUILD FAILURE",
+				].join("\n"),
+				1,
+			);
+
+			expect(result.failed).toBeGreaterThan(0);
+		});
+
+		it("still scores a single-module run by its aggregate, not by its classes twice", () => {
+			const result = parse(
+				[
+					"[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.05 s -- in com.example.AppTest",
+					"[INFO] Tests run: 2, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.125 s -- in com.example.OtherTest",
+					"[INFO] Results:",
+					"[ERROR] Tests run: 4, Failures: 1, Errors: 0, Skipped: 0",
+				].join("\n"),
+				1,
+			);
+
+			// 4 tests, not 8: per-class lines carry `Time elapsed` and the
+			// aggregate does not, which is how the two are told apart.
+			expect(result.failed).toBe(1);
+			expect(result.passed).toBe(3);
+		});
+	});
+
+	// #1487: a runner that never ran (spawn/config/load failure) must not be
+	// reported to the agent as a failing test. `failed` used to be pre-seeded
+	// to 1 for any non-zero exit, which made the runner-error branch
+	// (`failed === 0`) unreachable on exactly the path it exists for.
+	describe("runner-start failures report as errors, not test failures (#1487)", () => {
+		const parse = (output: string, exitCode: number, runner = "cargo") =>
+			(new TestRunnerClient(false) as any).parseGenericRunnerOutput(
+				"",
+				output,
+				exitCode,
+				`/tmp/test.${runner}`,
+				runner,
+			);
+
+		it("reports a non-zero exit with no counts and error text as a runner error, not a failing test", () => {
+			const result = parse("error: could not load configuration file", 1);
+
+			expect(result.error).toBe("Runner cargo exited with 1");
+			expect(result.passed).toBe(0);
+			expect(result.failed).toBe(0);
+		});
+
+		it("does not invent a failure name for a runner-start error", () => {
+			const result = parse("error: could not load configuration file", 1);
+
+			expect(result.failures).toEqual([]);
+		});
+
+		it("renders the runner-error surface, not a failed-test surface", () => {
+			const client = new TestRunnerClient(false);
+			const result = parse("error: could not load configuration file", 1);
+
+			expect(client.formatResult(result)).toBe(
+				"[Tests] ⚠ Could not run tests: Runner cargo exited with 1",
+			);
+		});
+
+		it("still reports parsed counts, and never PASS, for a non-zero exit with real counts", () => {
+			// Counts DID parse (0 failed via the cargo summary), so this is a
+			// real run, not a runner-start failure — the #1480 guard must
+			// still force at least one failure rather than reading it as a
+			// runner error.
+			const result = parse(
+				"test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out",
+				1,
+			);
+
+			expect(result.error).toBeUndefined();
+			expect(result.failed).toBeGreaterThan(0);
+		});
+
+		it("still reports a failure for a non-zero exit with no counts and no error text", () => {
+			// No count parser matched AND no "error" text — ambiguous, but
+			// still a non-zero exit, so the #1480 exit-code-distrust guard
+			// must still apply and this must not render as PASS.
+			const result = parse("unexpected termination", 1);
+
+			expect(result.error).toBeUndefined();
+			expect(result.failed).toBeGreaterThan(0);
+		});
+	});
+
+	// #1524: a REAL failing run must never be downgraded to "could not run
+	// tests" just because its runner has no count parser in
+	// `parseGenericRunnerDuration`/the count-matching block above. go (the
+	// `default:` case's only text-only runner with no cargo/dotnet/maven/
+	// rspec/minitest/gradle summary shape) never sets `matched`, so before
+	// this fix `exitCode !== 0 && !matched && lower.includes("error")` fired
+	// on a genuine `--- FAIL:`/panic that happened to mention the word
+	// "error" — a real failing test rendered as a runner-start error, and
+	// the failing test's own name was extracted into `failures` and then
+	// discarded because `runnerError` was already decided first.
+	describe("a real failing run is never downgraded to a runner error (#1524)", () => {
+		const parse = (
+			output: string,
+			exitCode: number,
+			runner = "go",
+			runnerFile = `/tmp/test.${runner}`,
+		) =>
+			(new TestRunnerClient(false) as any).parseGenericRunnerOutput(
+				"",
+				output,
+				exitCode,
+				runnerFile,
+				runner,
+			);
+
+		it("reports a go test failure by name, not as a runner error", () => {
+			const result = parse(
+				"--- FAIL: TestParse\n    parse_test.go:22: unexpected error: bad token\nFAIL\texample.com/pkg\t0.01s\n",
+				1,
+			);
+
+			expect(result.error).toBeUndefined();
+			expect(result.failed).toBeGreaterThan(0);
+			expect(result.failures).toEqual(
+				expect.arrayContaining([expect.objectContaining({ name: "TestParse" })]),
+			);
+		});
+
+		it("reports a go panic by name, not as a runner error", () => {
+			const result = parse(
+				"--- FAIL: TestBoom\npanic: runtime error: index out of range [3] with length 3\n\ngoroutine 1 [running]:\nFAIL\texample.com/pkg\t0.01s\n",
+				2,
+			);
+
+			expect(result.error).toBeUndefined();
+			expect(result.failed).toBeGreaterThan(0);
+			expect(result.failures).toEqual(
+				expect.arrayContaining([expect.objectContaining({ name: "TestBoom" })]),
+			);
+		});
+
+		it("reports an unknown-runner (bazel) failure with a parseable count summary, not a runner error", () => {
+			// #1524-r3: updated from the original round's fixture, which
+			// relied on a bare `FAILED ...`/`Error: ...` text pair alone to
+			// veto the runner-error branch. That is exactly the ambiguous
+			// shape #1524-r3 removed the veto from — see the gradle/maven/
+			// rspec runner-error tests below, which use the same bare-text
+			// shape and now correctly render AS runner errors. An
+			// unrecognised runner with no `--- FAIL:` marker of its own can
+			// still report a real failure, but only via a count summary a
+			// parser actually recognises (rspec's `N examples, N failures`
+			// applies to any runner name, not just `rspec`).
+			const result = parse(
+				"3 examples, 1 failure\nError: expected 1 to equal 2\n",
+				1,
+				"bazel",
+			);
+
+			expect(result.error).toBeUndefined();
+			expect(result.failed).toBeGreaterThan(0);
+		});
+
+		it("still reports a genuine runner-start failure as an error (no failure names, #1487 stays green)", () => {
+			const result = parse("go: cannot find main module; error initializing", 1);
+
+			expect(result.error).toBe("Runner go exited with 1");
+			expect(result.failed).toBe(0);
+			expect(result.failures).toEqual([]);
+		});
+	});
+
+	// #1524-r3: a round-2 review found the fix itself had two defects.
+	//
+	// S2: the `FAILED`/`Failure:` name regexes let their own `\s+` gap cross
+	// a newline. A bare keyword at end-of-line has nothing after it on that
+	// line, so the gap ate the newline and the capture grabbed the FIRST
+	// TOKEN OF THE NEXT LINE as the "test name" — and, worse, that invented
+	// name then counted as evidence a test ran, vetoing the runner-error
+	// branch for build-tool failures (a gradle task failing to compile, a
+	// maven goal failing before surefire runs, an rspec file that never
+	// loaded) that have nothing to do with any test.
+	//
+	// S3: go's only text evidence was `--- FAIL: TestName`, which a panic in
+	// `TestMain`/package `init` never prints — the process dies before any
+	// test runs, so there is no test to name. That real go failure (exit 2,
+	// `FAIL\t<pkg>`, no `--- FAIL:`) still hit the runner-error branch.
+	describe("failure-name regexes and go's count parser (#1524-r3)", () => {
+		const parse = (
+			output: string,
+			exitCode: number,
+			runner: string,
+			runnerFile = `/tmp/test.${runner}`,
+		) =>
+			(new TestRunnerClient(false) as any).parseGenericRunnerOutput(
+				"",
+				output,
+				exitCode,
+				runnerFile,
+				runner,
+			);
+
+		it("reports a gradle compile failure as a runner error, not a fabricated test failure", () => {
+			const result = parse(
+				"> Task :compileJava FAILED\n\nFAILURE: Build failed with an exception.\n\n* What went wrong:\nexecution failed\nerror: cannot find symbol\n",
+				1,
+				"gradle",
+			);
+
+			expect(result.error).toBe("Runner gradle exited with 1");
+			expect(result.failed).toBe(0);
+			expect(result.failures).toEqual([]);
+		});
+
+		it("reports a maven failed-goal build as a runner error, not a fabricated test failure", () => {
+			const result = parse(
+				"[ERROR] Failed to execute goal org.apache.maven.plugins:maven-compiler-plugin:3.11.0:compile (default-compile) on project foo: Compilation failure: FAILED\n[ERROR] error: cannot find symbol\n",
+				1,
+				"maven",
+			);
+
+			expect(result.error).toBe("Runner maven exited with 1");
+			expect(result.failed).toBe(0);
+			expect(result.failures).toEqual([]);
+		});
+
+		it("reports an rspec load error as a runner error, not a fabricated test failure", () => {
+			const result = parse(
+				"An error occurred while loading ./spec/foo_spec.rb.\nFailure:\n  cannot load such file -- foo\n",
+				1,
+				"rspec",
+			);
+
+			expect(result.error).toBe("Runner rspec exited with 1");
+			expect(result.failed).toBe(0);
+			expect(result.failures).toEqual([]);
+		});
+
+		it("reports a go panic in TestMain as a test failure, not a runner error", () => {
+			// No `--- FAIL:` — the process died in TestMain/init before any
+			// individual test ran — but `FAIL\t<pkg>` is go's own verdict
+			// line for exactly this case, and the go count parser reads it.
+			// Uses go's real nil-pointer panic wording, which contains
+			// "error" ("runtime error: ...") — the S3 scenario specifically
+			// requires that word present, or the old code's `lower.includes
+			// ("error")` gate would never have fired in the first place and
+			// this test would not prove the bug.
+			const result = parse(
+				"panic: runtime error: invalid memory address or nil pointer dereference [signal SIGSEGV: segmentation violation code=0x1 addr=0x0 pc=0x476f00]\n\ngoroutine 1 [running]:\nexample.com/pkg.TestMain(0x0)\n\t/repo/main_test.go:10 +0x20\nFAIL\texample.com/pkg\t0.00s\n",
+				2,
+				"go",
+			);
+
+			expect(result.error).toBeUndefined();
+			expect(result.failed).toBeGreaterThan(0);
+		});
+
+		it("does not invent a failure name from the line after a newline-spanning FAILED", () => {
+			const result = parse("FAILED\n\nsome trailing note\n", 1, "cargo");
+
+			expect(
+				result.failures.some((f: { name: string }) => f.name === "some trailing note"),
+			).toBe(false);
+		});
+	});
+
+	// #1524-r4: a third review pass found three residuals in the go count
+	// parser round 3 added.
+	//
+	// S3: `/^FAIL[^\S\n]+\S+/m` (a real per-package verdict line) also
+	// matched go's INFRASTRUCTURE verdict lines — `FAIL <pkg> [build
+	// failed]` (a compile error) and `FAIL <pkg> [setup failed]` (no
+	// packages to test). Neither ran a single test, but both rendered as a
+	// fabricated `✗ 1/1 failed` instead of the runner error they are.
+	//
+	// S4a: the ok-package pass count was in an `else if` off the fail
+	// branch, so a mixed multi-package run — some packages clean, one
+	// package with a real failure — silently dropped the clean packages'
+	// pass count.
+	//
+	// S4b: every `--- FAIL:` line was counted, but go prints one PER LEVEL
+	// of a failing subtest tree — a parent `TestA` and its child
+	// `TestA/sub` both get a line for what is one underlying failure — so
+	// counting lines inflated `failed`.
+	describe("go infrastructure verdicts, mixed-package counts, subtests (#1524-r4)", () => {
+		const parse = (output: string, exitCode: number, runner = "go") =>
+			(new TestRunnerClient(false) as any).parseGenericRunnerOutput(
+				"",
+				output,
+				exitCode,
+				`/tmp/test.${runner}`,
+				runner,
+			);
+
+		it("reports a go compile failure ([build failed]) as a runner error", () => {
+			const result = parse(
+				"# example.com/pkg\n./main_test.go:8:2: undefined: Bar (compile error)\nFAIL\texample.com/pkg [build failed]\n",
+				1,
+			);
+
+			expect(result.error).toBe("Runner go exited with 1");
+			expect(result.failed).toBe(0);
+			expect(result.failures).toEqual([]);
+		});
+
+		it("reports a go setup failure ([setup failed]) as a runner error", () => {
+			const result = parse(
+				"FAIL\texample.com/pkg [setup failed]\nerror: no packages to test\n",
+				1,
+			);
+
+			expect(result.error).toBe("Runner go exited with 1");
+			expect(result.failed).toBe(0);
+			expect(result.failures).toEqual([]);
+		});
+
+		it("counts clean packages as passed alongside a real failure in the same run", () => {
+			const result = parse(
+				"ok  \texample.com/a\t0.01s\n--- FAIL: TestB\n    b_test.go:5: assertion failed\nFAIL\texample.com/b\t0.01s\nok  \texample.com/c\t0.02s\n",
+				1,
+			);
+
+			expect(result.passed).toBe(2);
+			expect(result.failed).toBe(1);
+		});
+
+		it("does not double-count a failing subtest against its already-counted parent", () => {
+			const result = parse(
+				"--- FAIL: TestA\n--- FAIL: TestA/sub1\n--- FAIL: TestA/sub2\nFAIL\texample.com/pkg\t0.01s\n",
+				1,
+			);
+
+			expect(result.failed).toBe(1);
+		});
+	});
+
+	// #1524-r4 (tidy): a runner-error result must not also carry leftover
+	// failure names — the two branches of `formatResult` are mutually
+	// exclusive, so a `TestResult` claiming both is self-contradictory.
+	describe("a runner-error result has no leftover failure names (#1524-r4 tidy)", () => {
+		it("clears failures when the rspec load-error text also matches a same-line Failure: name", () => {
+			const result = (new TestRunnerClient(false) as any).parseGenericRunnerOutput(
+				"",
+				"An error occurred while loading ./spec/foo_spec.rb.\nFailure: cannot load such file -- foo\n",
+				1,
+				"/tmp/spec/foo_spec.rb",
+				"rspec",
+			);
+
+			expect(result.error).toBe("Runner rspec exited with 1");
+			expect(result.failures).toEqual([]);
+		});
+	});
+
+	// #1480 P3: `parseFloat(seconds) * 1000` is not an integer count of
+	// milliseconds. `in 2.01s` is 2009.9999999999998, and the turn-end log
+	// prints the number as it stands.
+	describe("summary durations are whole milliseconds (#1480)", () => {
+		it("rounds the pytest summary duration", () => {
+			const result = (new TestRunnerClient(false) as any).parsePytestOutput(
+				"===== 3 passed in 2.01s =====",
+				"",
+				0,
+				"/tmp/test_foo.py",
+				"/tmp",
+				"pytest",
+			);
+
+			expect(result.duration).toBe(2010);
+		});
+
+		it("rounds the mix test summary duration", () => {
+			const result = (new TestRunnerClient(false) as any).parseMixTestOutput(
+				"Finished in 2.01 seconds (0.00s async, 2.01s sync)\n3 tests, 0 failures",
+				"",
+				0,
+				"/tmp/foo_test.exs",
+				"mix",
+			);
+
+			expect(result.duration).toBe(2010);
+		});
+	});
+
 	it("prefers failed-first target when failure cache exists", () => {
 		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
 		cleanups.push(cleanup);
@@ -737,6 +1606,482 @@ describe("test-runner-client", () => {
 		expect(result.failed).toBe(3);
 		expect(result.skipped).toBe(1);
 		expect(result.failures[0].name).toBe("Foo\\BarTest::testSomething");
+	});
+
+	// #1452: PHPUnit's own elapsed time was never parsed, so every PHPUnit run
+	// reported 0ms. The summary line changed shape across supported majors, so
+	// both are pinned. Literal lines, not a live run — there is no PHP toolchain
+	// on the machine this was written on.
+	it("parses the PHPUnit >= 9.3 clock Time line (MM:SS.mmm)", () => {
+		const client = new TestRunnerClient(false) as any;
+		const result = client.parsePhpunitOutput(
+			"...\n\nTime: 00:00.123, Memory: 8.00 MB\n\nOK (12 tests, 34 assertions)\n",
+			"",
+			0,
+			"/tmp/BarTest.php",
+			"phpunit",
+		);
+
+		expect(result.passed).toBe(12);
+		expect(result.duration).toBe(123);
+	});
+
+	it("reads a PHPUnit fractional second as tenths, not as milliseconds", () => {
+		const client = new TestRunnerClient(false) as any;
+		// "00:00.1" is a TENTH of a second. Parsing the fraction as an integer
+		// would report 1ms for a 100ms run.
+		const result = client.parsePhpunitOutput(
+			"Time: 00:00.1, Memory: 8.00 MB\nOK (1 test, 1 assertion)\n",
+			"",
+			0,
+			"/tmp/BarTest.php",
+			"phpunit",
+		);
+
+		expect(result.duration).toBe(100);
+	});
+
+	it("parses a PHPUnit Time line carrying hours", () => {
+		const client = new TestRunnerClient(false) as any;
+		const result = client.parsePhpunitOutput(
+			"Time: 01:02:03.456, Memory: 8.00 MB\nOK (1 test, 1 assertion)\n",
+			"",
+			0,
+			"/tmp/BarTest.php",
+			"phpunit",
+		);
+
+		expect(result.duration).toBe(3_723_456);
+	});
+
+	it("parses the legacy PHPUnit <= 9.2 Time line (seconds and ms)", () => {
+		const client = new TestRunnerClient(false) as any;
+		const seconds = client.parsePhpunitOutput(
+			"Time: 1.23 seconds, Memory: 10.00MB\nOK (2 tests, 2 assertions)\n",
+			"",
+			0,
+			"/tmp/BarTest.php",
+			"phpunit",
+		);
+		const millis = client.parsePhpunitOutput(
+			"Time: 123 ms, Memory: 10.00MB\nOK (2 tests, 2 assertions)\n",
+			"",
+			0,
+			"/tmp/BarTest.php",
+			"phpunit",
+		);
+
+		expect(seconds.duration).toBe(1230);
+		expect(millis.duration).toBe(123);
+	});
+
+	it("leaves the PHPUnit duration unmeasured when no Time line is present", () => {
+		const client = new TestRunnerClient(false) as any;
+		const result = client.parsePhpunitOutput(
+			"...\n\nOK (12 tests, 34 assertions)\n",
+			"",
+			0,
+			"/tmp/BarTest.php",
+			"phpunit",
+		);
+
+		// #1479: this assertion used to read `toBe(0)` while its own comment
+		// said the parser "must degrade to unmeasured". It could not — the type
+		// had no way to say so, and 0 is what a sub-millisecond run reports.
+		// Now it can, so the assertion says what the comment always meant.
+		expect(result.duration).toBeUndefined();
+	});
+
+	// --- vitest / jest JSON reporter (#1452) ---
+	//
+	// The payloads below are trimmed captures of REAL runs of a three-test file
+	// (one 120ms pass, one fail, one skip) under vitest 4.1.10 and jest 30.4.2
+	// on node 24.5.0. Trimmed of `snapshot`/`failureMessages`/suite counters
+	// only — every field these assertions read is verbatim, including vitest's
+	// float `endTime` and jest's `duration: null` on the skipped assertion.
+	//
+	// Note what is NOT in either capture: `perfStats`. It lives on jest's
+	// internal TestResult, not on the JSON reporter's output, so a duration fix
+	// that reads it would still report 0.
+
+	const VITEST_JSON = JSON.stringify({
+		numPassedTests: 1,
+		numFailedTests: 1,
+		numPendingTests: 1,
+		numTodoTests: 0,
+		startTime: 1786866554004,
+		testResults: [
+			{
+				name: "/tmp/vtjson/sample.test.js",
+				status: "failed",
+				startTime: 1786866554330,
+				endTime: 1786866554461.674,
+				assertionResults: [
+					{ status: "passed", title: "slow pass", duration: 122.60340400000001 },
+					{ status: "failed", title: "quick fail", duration: 8.674104 },
+					{ status: "skipped", title: "skipped" },
+				],
+			},
+		],
+	});
+
+	const JEST_JSON = JSON.stringify({
+		numPassedTests: 1,
+		numFailedTests: 1,
+		numPendingTests: 1,
+		numTodoTests: 0,
+		startTime: 1786866618394,
+		testResults: [
+			{
+				name: "/tmp/jestjson/sample.test.js",
+				status: "failed",
+				startTime: 1786866618477,
+				endTime: 1786866619206,
+				assertionResults: [
+					{ status: "passed", title: "slow pass", duration: 124 },
+					{ status: "failed", title: "quick fail", duration: 3 },
+					{ status: "pending", title: "skipped", duration: null },
+				],
+			},
+		],
+	});
+
+	it("extracts a real duration from a vitest --reporter=json payload", () => {
+		const client = new TestRunnerClient(false) as any;
+		const result = client.parseVitestOutput(
+			VITEST_JSON,
+			"",
+			"/tmp/vtjson/sample.test.js",
+			"/tmp/vtjson",
+			"vitest",
+		);
+
+		expect(result.passed).toBe(1);
+		expect(result.failed).toBe(1);
+		// 1786866554461.674 - 1786866554330, rounded. Pinned exactly rather than
+		// "> 0": the whole defect was a plausible-looking constant.
+		expect(result.duration).toBe(132);
+	});
+
+	it("extracts a real duration from a jest --json payload", () => {
+		const client = new TestRunnerClient(false) as any;
+		const result = client.parseJestOutput(
+			JEST_JSON,
+			"",
+			"/tmp/jestjson/sample.test.js",
+			"/tmp/jestjson",
+			"jest",
+		);
+
+		expect(result.passed).toBe(1);
+		expect(result.failed).toBe(1);
+		expect(result.duration).toBe(729);
+	});
+
+	it("counts a skipped test from numPendingTests, which is what both reporters emit", () => {
+		const client = new TestRunnerClient(false) as any;
+		const vitest = client.parseVitestOutput(
+			VITEST_JSON,
+			"",
+			"/tmp/vtjson/sample.test.js",
+			"/tmp/vtjson",
+			"vitest",
+		);
+		const jest = client.parseJestOutput(
+			JEST_JSON,
+			"",
+			"/tmp/jestjson/sample.test.js",
+			"/tmp/jestjson",
+			"jest",
+		);
+
+		// Neither payload has `numSkippedTests`, which is the field the parser
+		// used to read — so this was always 0 for a file with skips in it.
+		expect(vitest.skipped).toBe(1);
+		expect(jest.skipped).toBe(1);
+	});
+
+	// Both captures above happen to carry `numTodoTests: 0`, so the todo half of
+	// the skip count is unasserted and can be deleted without failing anything.
+	// Real runs do emit it: a `test.todo` alongside a `test.skip` gives
+	// numPendingTests 1 / numTodoTests 1 on vitest 4.1.10 and jest 30.4.2.
+	// Synthetic rather than captured — kept minimal so it is obviously not
+	// passing itself off as one of the recorded payloads above.
+	it("folds numTodoTests into the same skipped figure as numPendingTests", () => {
+		const client = new TestRunnerClient(false) as any;
+		const result = client.parseVitestOutput(
+			JSON.stringify({
+				numPassedTests: 1,
+				numFailedTests: 0,
+				numPendingTests: 1,
+				numTodoTests: 2,
+				testResults: [
+					{
+						name: "/tmp/vtjson/todo.test.js",
+						status: "passed",
+						startTime: 1786866554330,
+						endTime: 1786866554430,
+						assertionResults: [{ status: "passed", title: "p", duration: 1 }],
+					},
+				],
+			}),
+			"",
+			"/tmp/vtjson/todo.test.js",
+			"/tmp/vtjson",
+			"vitest",
+		);
+
+		expect(result.skipped).toBe(3);
+	});
+
+	// A reporter that emits `numSkippedTests: 0` while a skip really did happen
+	// must not resurrect the defect: `??` accepts a present 0, so the count has
+	// to be the larger of the two readings rather than the first one found.
+	it("does not let a zero numSkippedTests mask a real pending count", () => {
+		const client = new TestRunnerClient(false) as any;
+		const result = client.parseVitestOutput(
+			JSON.stringify({
+				numPassedTests: 1,
+				numFailedTests: 0,
+				numSkippedTests: 0,
+				numPendingTests: 3,
+				numTodoTests: 0,
+				testResults: [
+					{
+						name: "/tmp/vtjson/mask.test.js",
+						status: "passed",
+						startTime: 1786866554330,
+						endTime: 1786866554430,
+						assertionResults: [{ status: "passed", title: "p", duration: 1 }],
+					},
+				],
+			}),
+			"",
+			"/tmp/vtjson/mask.test.js",
+			"/tmp/vtjson",
+			"vitest",
+		);
+
+		expect(result.skipped).toBe(3);
+	});
+
+	it("falls back to summed assertion durations when a payload carries only perfStats", () => {
+		const client = new TestRunnerClient(false) as any;
+		// The pre-#1452 suggestion was to read `testResults[].perfStats`. This
+		// payload is that hypothetical shape: perfStats present, the per-suite
+		// epoch pair absent. The fallback keeps a real figure rather than 0.
+		const result = client.parseVitestOutput(
+			JSON.stringify({
+				numPassedTests: 2,
+				numFailedTests: 0,
+				testResults: [
+					{
+						name: "/tmp/a.test.js",
+						status: "passed",
+						perfStats: { start: 1000, end: 1400, runtime: 400, slow: false },
+						assertionResults: [
+							{ status: "passed", title: "a", duration: 30.4 },
+							{ status: "passed", title: "b", duration: 11.2 },
+						],
+					},
+				],
+			}),
+			"",
+			"/tmp/a.test.js",
+			"/tmp",
+			"vitest",
+		);
+
+		expect(result.duration).toBe(42);
+	});
+
+	it("reports the wall-clock span, not the sum, across parallel suites", () => {
+		const client = new TestRunnerClient(false) as any;
+		const result = client.parseJestOutput(
+			JSON.stringify({
+				numPassedTests: 2,
+				numFailedTests: 0,
+				testResults: [
+					{ name: "/tmp/a.test.js", status: "passed", startTime: 1000, endTime: 1500 },
+					{ name: "/tmp/b.test.js", status: "passed", startTime: 1100, endTime: 1900 },
+				],
+			}),
+			"",
+			"/tmp/a.test.js",
+			"/tmp",
+			"jest",
+		);
+
+		// Summing the two suites would claim 1300ms of elapsed time for a run
+		// that took 900ms of wall clock.
+		expect(result.duration).toBe(900);
+	});
+
+	it("reports unmeasured rather than a negative duration when suite timestamps are inverted", () => {
+		const client = new TestRunnerClient(false) as any;
+		const result = client.parseVitestOutput(
+			JSON.stringify({
+				numPassedTests: 1,
+				numFailedTests: 0,
+				testResults: [
+					{
+						name: "/tmp/a.test.js",
+						status: "passed",
+						startTime: 2000,
+						endTime: 1000,
+						assertionResults: [{ status: "passed", title: "a", duration: null }],
+					},
+				],
+			}),
+			"",
+			"/tmp/a.test.js",
+			"/tmp",
+			"vitest",
+		);
+
+		// #1479: an inverted pair is garbage, not a measurement of zero. The
+		// assertion sum is unavailable too (`duration: null`), so there is
+		// nothing to report and the result says exactly that.
+		expect(result.duration).toBeUndefined();
+	});
+
+	// --- #1479: unmeasured is a distinct state from zero ---
+	//
+	// Every case below pins an EXACT value rather than a relation. `> 0` would
+	// accept the next plausible constant and `toBeFalsy()` would accept both
+	// states at once, which is the confusion being removed.
+
+	it("reports a measured zero when a readable suite pair has no elapsed span", () => {
+		const client = new TestRunnerClient(false) as any;
+		const result = client.parseVitestOutput(
+			JSON.stringify({
+				numPassedTests: 1,
+				numFailedTests: 0,
+				testResults: [
+					{
+						name: "/tmp/a.test.js",
+						status: "passed",
+						startTime: 1_760_000_000_000,
+						endTime: 1_760_000_000_000,
+						assertionResults: [{ status: "passed", title: "a", duration: null }],
+					},
+				],
+			}),
+			"",
+			"/tmp/a.test.js",
+			"/tmp",
+			"vitest",
+		);
+
+		// The timestamps were read and they were equal. That is a sub-millisecond
+		// run, not a missing measurement, and 0 is the honest figure.
+		expect(result.duration).toBe(0);
+	});
+
+	it("reports unmeasured when a JSON payload carries no suite timing at all", () => {
+		const client = new TestRunnerClient(false) as any;
+		const result = client.parseVitestOutput(
+			JSON.stringify({
+				numPassedTests: 1,
+				numFailedTests: 0,
+				testResults: [
+					{
+						name: "/tmp/a.test.js",
+						status: "passed",
+						assertionResults: [{ status: "passed", title: "a", duration: null }],
+					},
+				],
+			}),
+			"",
+			"/tmp/a.test.js",
+			"/tmp",
+			"vitest",
+		);
+
+		expect(result.duration).toBeUndefined();
+	});
+
+	it("reports unmeasured when a runner's output cannot be parsed at all", () => {
+		const client = new TestRunnerClient(false) as any;
+		// Unparseable stdout takes the emptyResult path — the same object a
+		// runner crash and a spawn failure return. Nothing ran, so there is no
+		// elapsed time; this used to carry `duration: 0`.
+		const result = client.parseVitestOutput(
+			"FAIL  not json at all\n",
+			"",
+			"/tmp/a.test.js",
+			"/tmp",
+			"vitest",
+		);
+
+		expect(result.error).toBe("Tests failed (could not parse output)");
+		expect(result.duration).toBeUndefined();
+	});
+
+	it("reports unmeasured for pytest output with no summary line", () => {
+		const client = new TestRunnerClient(false) as any;
+		const result = client.parsePytestOutput(
+			"collected 0 items\n\nno tests ran\n",
+			"",
+			0,
+			"/tmp/test_foo.py",
+			"/tmp",
+			"pytest",
+		);
+
+		expect(result.duration).toBeUndefined();
+	});
+
+	it("reports unmeasured when pytest's summary is detected but not extractable", () => {
+		const client = new TestRunnerClient(false) as any;
+		// PRE-EXISTING AND NOT CHANGED HERE: the summary DETECTOR carries `/i`
+		// and every extractor below it does not, so an upper-cased summary is
+		// recognised and then reads back as nothing — passed included. This
+		// fixture is the only way to reach the parser's inner duration branch.
+		// #1479's point is narrow: that branch used to substitute 0, and a 0 in
+		// the turn-end log is a claim. It now declines to claim one.
+		const result = client.parsePytestOutput(
+			"=== 3 PASSED IN 0.50S ===\n",
+			"",
+			0,
+			"/tmp/test_foo.py",
+			"/tmp",
+			"pytest",
+		);
+
+		expect(result.passed).toBe(0);
+		expect(result.duration).toBeUndefined();
+	});
+
+	it("reports a measured zero for pytest's own `in 0.00s`", () => {
+		const client = new TestRunnerClient(false) as any;
+		const result = client.parsePytestOutput(
+			"=== 3 passed in 0.00s ===\n",
+			"",
+			0,
+			"/tmp/test_foo.py",
+			"/tmp",
+			"pytest",
+		);
+
+		// pytest prints this for a fast file. It is a real reading and the only
+		// reason `0` has to stay distinguishable from absence at all.
+		expect(result.passed).toBe(3);
+		expect(result.duration).toBe(0);
+	});
+
+	it("reports unmeasured for mix test output with no `Finished in` line", () => {
+		const client = new TestRunnerClient(false) as any;
+		const result = client.parseMixTestOutput(
+			"3 tests, 0 failures\n",
+			"",
+			0,
+			"/tmp/foo_test.exs",
+			"mix",
+		);
+
+		expect(result.passed).toBe(3);
+		expect(result.duration).toBeUndefined();
 	});
 
 	// --- mix test (ExUnit) ---

@@ -30,21 +30,33 @@ const rustClient = new RustClient();
 // after install. We can't `delete` a Promise mid-flight, so the safe path
 // is: if the cached probe resolves false AND the install just succeeded,
 // fall back to a one-shot fresh probe rather than reusing the cached false.
-const probeClippy = (cargoExe: string) =>
-	createCwdCachedProbe(async (cwd) => {
-		const r = await safeSpawnAsync(cargoExe, ["clippy", "--version"], {
-			timeout: 8000,
-			cwd,
-		});
-		return !r.error && r.status === 0;
-	});
+//
+// The verdict is governed by the shared availability policy (#1494): a probe
+// timeout expires on a cooldown, so only a genuinely absent clippy latches.
+const CLIPPY_PROBE_BUDGET_MS = 8000;
 
-const clippyProbeByCargo = new Map<string, ReturnType<typeof probeClippy>>();
+const makeClippyProbe = (cargoExe: string) =>
+	createCwdCachedProbe(
+		(cwd) =>
+			safeSpawnAsync(cargoExe, ["clippy", "--version"], {
+				timeout: CLIPPY_PROBE_BUDGET_MS,
+				cwd,
+			}),
+		{ tool: "clippy", budgetMs: CLIPPY_PROBE_BUDGET_MS },
+	);
+
+const clippyAvailabilityByCargo = new Map<
+	string,
+	ReturnType<typeof makeClippyProbe>
+>();
 function getClippyProbe(cargoExe: string) {
-	const existing = clippyProbeByCargo.get(cargoExe);
-	if (existing) return existing;
-	const created = probeClippy(cargoExe);
-	clippyProbeByCargo.set(cargoExe, created);
+	return clippyAvailabilityByCargo.get(cargoExe) ?? refreshClippyProbe(cargoExe);
+}
+
+/** Replace the cached probe so a post-install state is observed. */
+function refreshClippyProbe(cargoExe: string) {
+	const created = makeClippyProbe(cargoExe);
+	clippyAvailabilityByCargo.set(cargoExe, created);
 	return created;
 }
 
@@ -64,10 +76,15 @@ const rustClippyRunner: RunnerDefinition = {
 
 		const clippyProbe = getClippyProbe(cargoExe);
 		if (!(await clippyProbe(ctx.cwd))) {
+			// A timed-out probe is not evidence that clippy is missing, so it must
+			// not drive an install. Skip this turn and let the policy re-probe once
+			// its cooldown expires (#1494).
+			if (clippyProbe.getVerdict(ctx.cwd).outcome === "transient") {
+				return { status: "skipped", diagnostics: [], semantic: "none" };
+			}
 			await tryLazyInstall("rust-clippy", ctx.cwd);
 			// Bust the cwd-keyed cache so the post-install state is observed.
-			clippyProbeByCargo.set(cargoExe, probeClippy(cargoExe));
-			if (!(await getClippyProbe(cargoExe)(ctx.cwd))) {
+			if (!(await refreshClippyProbe(cargoExe)(ctx.cwd))) {
 				return { status: "skipped", diagnostics: [], semantic: "none" };
 			}
 		}

@@ -21,6 +21,7 @@
  * entry) — never a raw write.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
 import { getGlobalPiLensDir } from "./file-utils.js";
@@ -135,7 +136,281 @@ const CONSOLE_METHODS = [
 
 type ConsoleMethod = (typeof CONSOLE_METHODS)[number];
 
+type ConsoleFn = (...args: unknown[]) => void;
+
 let consoleGuardInstalled = false;
+/** The console methods captured before the patch, for an exact restore. */
+const originalConsoleMethods = new Map<ConsoleMethod, ConsoleFn>();
+/** The replacements this module installed, so uninstall never clobbers a later patch. */
+const installedConsoleMethods = new Map<ConsoleMethod, ConsoleFn>();
+
+/**
+ * The async capture window (#1434).
+ *
+ * The guard must catch pi-lens's own writes without swallowing the host's. pi's
+ * one-shot CLI commands print through `console.log`, so a permanent global
+ * reroute makes `pi list` print nothing in any project whose cwd loads the
+ * extension first. The store answers "is pi-lens executing right now?" and
+ * `AsyncLocalStorage` carries that answer into every promise, timer and
+ * callback created inside the window — so an async handler still captures after
+ * an `await`, while host code outside the window keeps its real sink.
+ *
+ * Built LAZILY (S1b, #1434 review): an active `AsyncLocalStorage` enables an
+ * async_hooks init hook for every promise in the process on Node 22 — the same
+ * hazard `tree-sitter-client.ts`'s `parseCacheMeasurement.disable()` comment
+ * documents — so constructing one at module scope taxes every `await` in the
+ * host even when the kill switch (`PI_LENS_CONSOLE_GUARD=0`) or test mode means
+ * the guard never installs and nothing ever reads the store. Construction is
+ * deferred to the first `runInConsoleCaptureWindow` call, and only happens once
+ * `installConsoleGuard()` has actually installed (never under the kill switch
+ * or test mode, since `consoleGuardInstalled` stays false in both).
+ */
+let consoleCaptureStorage: AsyncLocalStorage<true> | undefined;
+
+function getConsoleCaptureStorage(): AsyncLocalStorage<true> | undefined {
+	if (!consoleGuardInstalled) return undefined;
+	if (consoleCaptureStorage === undefined) {
+		consoleCaptureStorage = new AsyncLocalStorage<true>();
+	}
+	return consoleCaptureStorage;
+}
+
+/**
+ * Module evaluation is the one window `AsyncLocalStorage` cannot wrap: the
+ * module graph is evaluated by the loader, not by a pi-lens call. It is
+ * synchronous, so a plain flag is enough (#1333's original concern — a
+ * transitively loaded dependency writing during its own init).
+ */
+let moduleLoadWindowOpen = false;
+
+/**
+ * True while pi-lens owns execution, so console writes belong in the log.
+ *
+ * `consoleCaptureStorage` may not have been constructed yet (S1b) — that state
+ * means "no window was ever opened through `runInConsoleCaptureWindow`", i.e.
+ * the same as an empty store, so it reads as "no window" rather than throwing.
+ */
+export function isConsoleCaptureActive(): boolean {
+	return (
+		moduleLoadWindowOpen || consoleCaptureStorage?.getStore() === true
+	);
+}
+
+/**
+ * Open the module-evaluation window. Called by `clients/console-guard-install.ts`
+ * before any other pi-lens module evaluates.
+ *
+ * The window closes explicitly at the end of `index.ts`. The backstop below
+ * closes it anyway if that never runs (an import throws, or the entry changes
+ * shape), because a leaked window would capture the host's output — the very
+ * bug this design fixes. Module evaluation is synchronous, so the end of the
+ * current macrotask is always past it. The timer is unref'd, so it can never
+ * hold a one-shot CLI process open (defect shape 4).
+ */
+export function openModuleLoadConsoleWindow(): void {
+	if (moduleLoadWindowOpen) return;
+	moduleLoadWindowOpen = true;
+	const backstop = setImmediate(() => {
+		moduleLoadWindowOpen = false;
+	});
+	backstop.unref?.();
+}
+
+/** Close the module-evaluation window. Idempotent. */
+export function closeModuleLoadConsoleWindow(): void {
+	moduleLoadWindowOpen = false;
+}
+
+/**
+ * Run `fn` inside a capture window. Console writes from `fn`, and from anything
+ * `fn` schedules, go to the extension log instead of the terminal.
+ *
+ * When the guard was never installed (kill switch or test mode), there is
+ * nothing for a window to gate — `installConsoleGuard`'s own dispatcher is the
+ * only reader of `isConsoleCaptureActive()`, and it short-circuits before that
+ * call in both cases. Skip constructing the `AsyncLocalStorage` (S1b) and run
+ * `fn` directly.
+ */
+export function runInConsoleCaptureWindow<T>(fn: () => T): T {
+	const storage = getConsoleCaptureStorage();
+	if (!storage) return fn();
+	return storage.run(true, fn);
+}
+
+function inCaptureWindow<T extends ConsoleFn | ((...args: never[]) => unknown)>(
+	fn: T,
+): T {
+	return function (this: unknown, ...args: unknown[]): unknown {
+		return runInConsoleCaptureWindow(() =>
+			(fn as (...a: unknown[]) => unknown).apply(this, args),
+		);
+	} as unknown as T;
+}
+
+/**
+ * True for every host API member that can hand pi-lens's own functions back to
+ * the host to be called later: `on(event, handler)` and any `register*`
+ * method (`registerTool`, `registerCommand`, `registerMessageRenderer`,
+ * `registerShortcut`, `registerFlag`, `registerMarkdownTransformer`,
+ * `registerEntryRenderer`, `registerProvider`, and any the host adds later).
+ *
+ * This is a DENY-LIST, not an allow-list (#1434 S1a review): every member
+ * matching this predicate gets its function arguments wrapped, with no
+ * per-method exemption. The earlier allow-list form (only `on` and
+ * `registerTool`) let the 9 `registerCommand` call sites and
+ * `registerMessageRenderer` bypass the window, regressing #1333 for those
+ * paths — a host callback fired for one of them would still write straight to
+ * the terminal.
+ */
+function isCaptureSeam(prop: PropertyKey): boolean {
+	return prop === "on" || (typeof prop === "string" && prop.startsWith("register"));
+}
+
+/**
+ * Wrap every function value found in `value`, in place. Handles the two
+ * shapes a `register*`/`on` call takes today: a function passed directly
+ * (`on(event, handler)`, `registerMessageRenderer(type, fn)`), and a
+ * function ONE level inside a plain options/definition object
+ * (`options.handler`, `tool.execute`).
+ *
+ * Deliberately NOT recursive past that one level (#1434 perf review): a tool
+ * definition's `parameters`/`schema` is a large, deeply nested TypeBox object
+ * that holds no functions, but walking its full tree on every `registerTool`
+ * call — across every tool, on every extension activation, across the many
+ * test files that re-activate the extension per case — measurably slowed
+ * activation (a wiring test tripped its 5s budget under transform load; see
+ * the commit body for the measured before/after). Checking only the
+ * argument's own top-level keys is O(keys), independent of how deep an
+ * unrelated nested value's own structure goes, and covers every shape
+ * PI-LENS actually registers (`options.handler`, `tool.execute` — never two
+ * levels deep). It does NOT cover every shape the host's `ExtensionAPI` type
+ * permits: `registerProvider`'s `config.oauth.*` callbacks sit two levels
+ * deep and `config.models[]` sits behind a skipped array. pi-lens never
+ * calls `registerProvider`; extend the descent if that changes (same known-
+ * gap convention as the `pi.events` note in AGENTS.md).
+ *
+ * Mutates the object in place rather than copying — a spread copy would drop
+ * non-enumerable or prototype-carried members of a definition object (defect
+ * shape 5), and these definitions are pi-lens's own, built just above the
+ * register call.
+ */
+function wrapFunctionsInPlace(value: unknown): unknown {
+	if (typeof value === "function") {
+		return inCaptureWindow(value as ConsoleFn);
+	}
+	if (value === null || typeof value !== "object" || Array.isArray(value)) {
+		return value;
+	}
+	const obj = value as Record<string, unknown>;
+	for (const key of Object.keys(obj)) {
+		const propValue = obj[key];
+		if (typeof propValue === "function") {
+			assignWrapped(obj, key, propValue as ConsoleFn);
+		}
+	}
+	return value;
+}
+
+/**
+ * Assign a wrapped function back onto `obj[key]`, degrading instead of
+ * throwing or dropping the registration when the property resists (S2b).
+ * ESM is always strict mode, so assigning into a non-writable data property
+ * throws a `TypeError`; `Object.defineProperty` is tried next (it can
+ * redefine a configurable-but-non-writable property); if both fail the
+ * property is frozen solid, so the ORIGINAL unwrapped function is left in
+ * place — the registration still succeeds, just without the console-capture
+ * net for that one callback, which is strictly better than the tool/command
+ * never registering at all.
+ */
+function assignWrapped(
+	obj: Record<string, unknown>,
+	key: string,
+	fn: ConsoleFn,
+): void {
+	const wrapped = inCaptureWindow(fn);
+	try {
+		obj[key] = wrapped;
+		return;
+	} catch {
+		// Non-writable data property — fall through to defineProperty.
+	}
+	try {
+		Object.defineProperty(obj, key, {
+			value: wrapped,
+			writable: true,
+			configurable: true,
+			enumerable: true,
+		});
+	} catch {
+		// Frozen solid: leave the original unwrapped function in place rather
+		// than throwing (which would abort the whole register call) or silently
+		// dropping it.
+	}
+}
+
+/**
+ * Wrap the host extension API so every pi-lens entry point runs in a capture
+ * window.
+ *
+ * pi calls our event handlers and tool bodies from its own async context, so a
+ * window opened during registration does not reach them. Wrapping every
+ * `register*`/`on` seam (see `isCaptureSeam`) covers every current and future
+ * handler from one place, instead of a hand-maintained list of call sites.
+ * Everything else forwards untouched, except it is bound to `target` (S3a) so
+ * a destructured reference (`const { getFlag } = pi`) keeps working, and
+ * wrapper functions are memoized per-proxy in `wrapperCache` (S3b) so
+ * `proxy.on === proxy.on` — code that compares handler identity, or a test
+ * asserting a mock was called with a specific function reference across two
+ * reads of the same property, sees a stable value.
+ */
+export function withConsoleCaptureWindows<T extends object>(api: T): T {
+	const wrapperCache = new Map<PropertyKey, unknown>();
+	const proxy: T = new Proxy(api, {
+		get(target, prop): unknown {
+			// A non-configurable, non-writable OWN data property is a proxy
+			// invariant: the get trap MUST return the exact value the target
+			// holds, or the engine throws a TypeError on read. Degrade to the raw
+			// value instead of tripping that invariant (S2a) — a frozen host API
+			// loses the capture window for that member, but keeps working.
+			const descriptor = Reflect.getOwnPropertyDescriptor(target, prop);
+			if (descriptor && descriptor.writable === false && descriptor.configurable === false) {
+				return descriptor.value;
+			}
+			const cached = wrapperCache.get(prop);
+			if (cached !== undefined) return cached;
+			const value = Reflect.get(target, prop, target);
+			if (typeof value !== "function") return value;
+			const method = value as (...args: unknown[]) => unknown;
+			// A host that returns `this` for chaining would hand back the raw API,
+			// so a chained `on(...).on(...)` would register an unwrapped handler.
+			// Keep the proxy on the chain.
+			const keepProxy = (result: unknown): unknown =>
+				result === target ? proxy : result;
+			// Pass-through members are cached too (S3a/S3b: `proxy.getFlag ===
+			// proxy.getFlag`), but the cached wrapper re-reads `target[prop]` on
+			// EVERY call rather than closing over `method` -- a plain
+			// `method.bind(target)` pins the function reference captured at first
+			// access, so a host (or a test simulating one) that reassigns its own
+			// method after registration would silently keep calling the stale one.
+			// Re-reading keeps the cached wrapper's identity stable while staying
+			// live to whatever `target[prop]` currently is.
+			const wrapper = isCaptureSeam(prop)
+				? (...args: unknown[]): unknown => {
+						const wrapped = args.map((arg) => wrapFunctionsInPlace(arg));
+						return keepProxy(method.apply(target, wrapped));
+					}
+				: (...args: unknown[]): unknown => {
+						const current = Reflect.get(target, prop, target) as (
+							...a: unknown[]
+						) => unknown;
+						return current.apply(target, args);
+					};
+			wrapperCache.set(prop, wrapper);
+			return wrapper;
+		},
+	});
+	return proxy;
+}
 
 function formatConsoleArgs(args: unknown[]): string {
 	return args
@@ -157,6 +432,12 @@ function formatConsoleArgs(args: unknown[]): string {
  * mirror of `mcp/server.ts`'s `console.log = console.error` guard, which
  * protects the JSON-RPC stdout channel for the same structural reason.
  *
+ * The patch is a DISPATCHER, not a permanent reroute (#1434). It sends a write
+ * to the extension log only while pi-lens owns execution; every other write
+ * goes to the original console method. pi's own one-shot CLI commands print
+ * through `console.log`, so an unconditional reroute silenced them: `pi list`
+ * exited 0 with no output in any project whose cwd loaded the extension first.
+ *
  * This is a NET, not the fix: pi-lens's own sites are migrated to real sinks
  * with real schemas. Idempotent, and inert under test mode (vitest owns the
  * console) and under `PI_LENS_CONSOLE_GUARD=0`.
@@ -170,8 +451,15 @@ export function installConsoleGuard(): boolean {
 	consoleGuardInstalled = true;
 	const target = console as unknown as Record<ConsoleMethod, unknown>;
 	for (const method of CONSOLE_METHODS) {
-		if (typeof target[method] !== "function") continue;
-		target[method] = (...args: unknown[]): void => {
+		const original = target[method];
+		if (typeof original !== "function") continue;
+		const originalFn = original as ConsoleFn;
+		originalConsoleMethods.set(method, originalFn);
+		const replacement: ConsoleFn = (...args: unknown[]): void => {
+			if (!isConsoleCaptureActive()) {
+				originalFn.apply(console, args);
+				return;
+			}
 			logExtension({
 				subsystem: "console",
 				level:
@@ -180,11 +468,36 @@ export function installConsoleGuard(): boolean {
 				metadata: { method },
 			});
 		};
+		installedConsoleMethods.set(method, replacement);
+		target[method] = replacement;
 	}
 	return true;
 }
 
-/** Test-only: forget that the guard was installed. */
-export function _resetConsoleGuardForTests(): void {
+/**
+ * Restore the exact console methods captured at install time.
+ *
+ * A method someone else patched after us is left alone — restoring it would
+ * clobber their replacement. Returns true when this call uninstalled.
+ */
+export function uninstallConsoleGuard(): boolean {
+	if (!consoleGuardInstalled) return false;
 	consoleGuardInstalled = false;
+	const target = console as unknown as Record<ConsoleMethod, unknown>;
+	for (const [method, original] of originalConsoleMethods) {
+		if (target[method] === installedConsoleMethods.get(method)) {
+			target[method] = original;
+		}
+	}
+	originalConsoleMethods.clear();
+	installedConsoleMethods.clear();
+	return true;
+}
+
+/** Test-only: uninstall the guard and close every open capture window. */
+export function _resetConsoleGuardForTests(): void {
+	uninstallConsoleGuard();
+	consoleGuardInstalled = false;
+	consoleCaptureStorage = undefined;
+	moduleLoadWindowOpen = false;
 }

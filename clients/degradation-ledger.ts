@@ -13,7 +13,9 @@ export type DegradationKind =
 	| "formatter-failure"
 	| "wasm-abort"
 	| "lsp-diagnostics-timeout"
-	| "bus-stale";
+	| "bus-stale"
+	| "query-predicates-invalid"
+	| "install-retry-exhausted";
 
 export interface DegradationRecord {
 	kind: unknown;
@@ -39,6 +41,19 @@ const groups = new Map<
 >();
 const onceKeys = new Set<string>();
 const tallies = new Map<string, number>();
+// Monotonic session-boundary counter (#1536 review F5): callers that keep
+// their OWN once-per-session latch outside the ledger (a per-instance Set
+// the ledger itself doesn't own) can compare this lazily at use time and
+// clear their latch on a mismatch — the same clear-on-transition shape as
+// project-trust.ts's trustGeneration, but keyed to the ledger's own reset
+// (resetDegradationLedger, wired into handleSessionStart) rather than a
+// trust change.
+let ledgerGeneration = 0;
+
+/** Current session generation. Bump on every `resetDegradationLedger()`. */
+export function getDegradationLedgerGeneration(): number {
+	return ledgerGeneration;
+}
 
 export function recordDegradation(record: DegradationRecord): void {
 	try {
@@ -185,6 +200,7 @@ export function resetDegradationLedger(): void {
 	groups.clear();
 	onceKeys.clear();
 	tallies.clear();
+	ledgerGeneration++;
 }
 
 export const DEGRADATION_ENTRIES_PER_KIND = ENTRIES_PER_KIND;

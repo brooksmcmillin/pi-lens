@@ -29,6 +29,22 @@ describe("ast_grep_replace tool", () => {
 			expect(langSchema.enum).toContain("python");
 			expect(langSchema.enum).toContain("rust");
 		});
+
+		it("hasKind description describes immediate-child semantics, not descendant (#1423)", () => {
+			const tool = createAstGrepReplaceTool(makeClient());
+			const properties = (tool.parameters as { properties: Record<string, unknown> }).properties;
+			const hasKindSchema = properties.hasKind as { description: string };
+			expect(hasKindSchema.description).not.toContain("descendant");
+			expect(hasKindSchema.description.toLowerCase()).toContain("immediate child");
+		});
+
+		it("advertises hasDescendantKind alongside hasKind (#1423)", () => {
+			const tool = createAstGrepReplaceTool(makeClient());
+			const properties = (tool.parameters as { properties: Record<string, unknown> }).properties;
+			expect(properties).toHaveProperty("hasDescendantKind");
+			const hasDescendantKindSchema = properties.hasDescendantKind as { description: string };
+			expect(hasDescendantKindSchema.description.toLowerCase()).toContain("descendant");
+		});
 	});
 
 	describe("lang double-quote stripping", () => {
@@ -138,6 +154,48 @@ describe("ast_grep_replace tool", () => {
 			);
 			expect(replace).toHaveBeenCalledOnce();
 			expect(replaceWithRule).not.toHaveBeenCalled();
+		});
+
+		it("routes to replaceWithRule when hasDescendantKind is set, producing stopBy: end (#1423)", async () => {
+			const replaceWithRule = vi.fn().mockResolvedValue({ matches: [], totalMatches: 0, applied: false });
+			const replace = vi.fn();
+			const tool = createAstGrepReplaceTool(makeClient({ replaceWithRule, replace }));
+			await tool.execute(
+				"r4",
+				{ pattern: "var $X", rewrite: "let $X", lang: "typescript", hasDescendantKind: "await_expression" },
+				new AbortController().signal,
+				null,
+				{ cwd: "." },
+			);
+			expect(replaceWithRule).toHaveBeenCalledOnce();
+			expect(replace).not.toHaveBeenCalled();
+			const calledYaml = replaceWithRule.mock.calls[0][0] as string;
+			expect(calledYaml).toContain("has:");
+			expect(calledYaml).toContain("kind: await_expression");
+			expect(calledYaml).toContain("stopBy: end");
+			expect(calledYaml).toContain("fix:");
+		});
+
+		it("errors clearly when hasKind and hasDescendantKind are combined (#1423)", async () => {
+			const replaceWithRule = vi.fn();
+			const tool = createAstGrepReplaceTool(makeClient({ replaceWithRule }));
+			const result = await tool.execute(
+				"r5",
+				{
+					pattern: "var $X",
+					rewrite: "let $X",
+					lang: "typescript",
+					hasKind: "identifier",
+					hasDescendantKind: "await_expression",
+				},
+				new AbortController().signal,
+				null,
+				{ cwd: "." },
+			);
+			expect(replaceWithRule).not.toHaveBeenCalled();
+			expect(result.isError).toBe(true);
+			const text = String(result.content[0].text);
+			expect(text).toContain("mutually exclusive");
 		});
 	});
 

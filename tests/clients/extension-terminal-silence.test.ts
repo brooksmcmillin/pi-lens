@@ -261,19 +261,57 @@ it("console guard is index.ts's first import (import-time install)", () => {
 	expect(firstImport).toContain("./clients/console-guard-install.js");
 });
 
+// #1434 S3c: the symmetric pin. The module-evaluation window opened by the
+// first import above must close as index.ts's LAST statement -- closing it
+// any earlier would leave the rest of the module graph's evaluation (and any
+// import between the open and the premature close) outside the window;
+// leaving it open past this point (never calling it, or a later statement
+// sliding below it) leaks the window into host-owned execution, capturing
+// output that belongs on the real console (the exact #1333 bug this design
+// fixes). The unref'd setImmediate backstop in extension-log.ts is a
+// fallback for the "this line never runs" case, not a substitute for it.
+it("console guard's module-load window closes as index.ts's last statement", () => {
+	const src = fs.readFileSync(path.join(REPO_ROOT, "index.ts"), "utf8");
+	const lastStatement = src
+		.split("\n")
+		.map((line) => line.trim())
+		.filter(
+			(line) =>
+				line.length > 0 &&
+				!line.startsWith("//") &&
+				!line.startsWith("/*") &&
+				!line.startsWith("*"),
+		)
+		.pop();
+	expect(lastStatement).toContain("closeModuleLoadConsoleWindow();");
+});
+
 it("captures the startup marker before installing the console guard", () => {
-	const src = fs.readFileSync(
+	// #1434 S3d: the timestamp itself now lives in eval-timestamp.ts, a
+	// side-effect-free module (so importing it from startup-timing.ts never
+	// installs the console guard). console-guard-install.ts must still import
+	// it FIRST -- ahead of extension-log.js -- so evaluation order still
+	// captures the timestamp before installConsoleGuard()'s own work.
+	const markerSrc = fs.readFileSync(
+		path.join(REPO_ROOT, "clients/eval-timestamp.ts"),
+		"utf8",
+	);
+	expect(markerSrc).toContain("PI_LENS_EVAL_STARTED_MS = performance.now()");
+
+	const installSrc = fs.readFileSync(
 		path.join(REPO_ROOT, "clients/console-guard-install.ts"),
 		"utf8",
 	);
-	expect(src.indexOf("PI_LENS_EVAL_STARTED_MS = performance.now()"))
-		.toBeLessThan(src.indexOf("installConsoleGuard();"));
-	expect(src).not.toContain("startup-marker");
+	expect(installSrc.indexOf('from "./eval-timestamp.js"'))
+		.toBeLessThan(installSrc.indexOf('from "./extension-log.js"'));
+	expect(installSrc.indexOf('from "./eval-timestamp.js"'))
+		.toBeLessThan(installSrc.indexOf("installConsoleGuard();"));
+	expect(installSrc).not.toContain("startup-marker");
 	// #1374 review P2: strictly pin the marker as the FIRST executable
-	// statement -- anything (even another import's side effect declared in
-	// this file) sliding above it re-bills that cost to host_boot and
-	// silently skews the host_boot/extension_eval latency split.
-	const firstStatement = src
+	// statement of eval-timestamp.ts -- anything sliding above it re-bills
+	// that cost to host_boot and silently skews the host_boot/extension_eval
+	// latency split.
+	const firstStatement = markerSrc
 		.split("\n")
 		.map((line) => line.trim())
 		.filter(
@@ -285,4 +323,18 @@ it("captures the startup marker before installing the console guard", () => {
 				!line.startsWith("import "),
 		)[0];
 	expect(firstStatement).toContain("PI_LENS_EVAL_STARTED_MS");
+});
+
+it("importing startup-timing never installs the console guard (#1434 S3d)", () => {
+	// The booby trap: startup-timing.ts used to import PI_LENS_EVAL_STARTED_MS
+	// FROM console-guard-install.ts, so importing startup-timing.ts anywhere
+	// (e.g. a load-time measurement in a test) silently installed the guard as
+	// a side effect. It must now import the constant from the
+	// side-effect-free eval-timestamp.ts module instead.
+	const src = fs.readFileSync(
+		path.join(REPO_ROOT, "clients/startup-timing.ts"),
+		"utf8",
+	);
+	expect(src).not.toMatch(/^import .*console-guard-install/m);
+	expect(src).toContain('from "./eval-timestamp.js"');
 });

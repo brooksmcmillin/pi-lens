@@ -16,7 +16,20 @@ import { getGlobalPiLensDir } from "./file-utils.js";
 import { findGlobalBinary } from "./package-manager.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
 import { biomeConfigArgs } from "./tool-policy.js";
-import { resolveManagedToolClient } from "./dispatch/runners/utils/runner-helpers.js";
+import {
+	type ClientAvailabilityResult,
+	resolveManagedToolClient,
+} from "./dispatch/runners/utils/runner-helpers.js";
+import {
+	type AvailabilityCause,
+	type AvailabilityOutcome,
+	type ProbeEvidence,
+	classifyProbeFailure,
+	describeInstallAttempt,
+	createAvailabilityLatch,
+	logAvailabilityDecision,
+	startHostStallSampler,
+} from "./dispatch/runners/utils/availability-policy.js";
 
 // --- Types ---
 
@@ -34,8 +47,30 @@ export interface BiomeDiagnostic {
 
 // --- Client ---
 
+const PROBE_TIMEOUT_MS = 10_000;
+
 export class BiomeClient {
-	private biomeAvailable: boolean | null = null;
+	/**
+	 * Availability memo, backed by the shared transient-aware latch (#1476).
+	 *
+	 * Biome is the hot-path formatter: before this, ANY probe failure — a
+	 * timeout included — collapsed to `{ outcome: "missing" }`, which both
+	 * triggered an install and latched `false` for the life of the process. One
+	 * slow first format then disabled formatting until restart.
+	 */
+	private readonly availabilityLatch = createAvailabilityLatch();
+	/** Cause of the last probe, read when the resolution comes back. */
+	private lastProbeCause: AvailabilityCause | null = null;
+	/**
+	 * Measurements of the last failed probe, held until the latch decides how
+	 * long the verdict lasts. The decision record is emitted after that, so it
+	 * can carry `retryAfterMs` — a latch you can see is worth little if the
+	 * retry schedule is not greppable beside it (#1474).
+	 */
+	private lastProbeElapsedMs = 0;
+	private lastProbeHostStallMs = 0;
+	/** Raw facts from the last probe, carried into the decision record (#1500). */
+	private lastProbeEvidence: ProbeEvidence | undefined;
 	// Per-cwd cache of the resolved biome binary. Keying by cwd matters in
 	// monorepos where different sub-packages each ship their own biome
 	// installation; sharing one slot across the whole client would cause
@@ -132,9 +167,14 @@ export class BiomeClient {
 	 * `ensureInFlight` promise so probing/auto-install isn't duplicated.
 	 * Mirrors the dedupe pattern in `SgRunner` / `KnipClient` /
 	 * `DependencyChecker`.
+	 *
+	 * The memo returns `null` when the last verdict was transient and its
+	 * cooldown expired, which re-enters the probe: "biome is not installed" is a
+	 * fact worth caching, "the probe timed out" is a moment worth retrying.
 	 */
 	async ensureAvailable(): Promise<boolean> {
-		if (this.biomeAvailable !== null) return this.biomeAvailable;
+		const memo = this.availabilityLatch.read();
+		if (memo !== null) return memo;
 		if (this.ensureInFlight) return this.ensureInFlight;
 
 		this.ensureInFlight = this.doEnsureAvailable();
@@ -145,23 +185,134 @@ export class BiomeClient {
 		}
 	}
 
+	/**
+	 * Probe `biome --version` and classify the failure through the shared
+	 * policy. Only a durable verdict (`missing` / `non-installable`) may reach
+	 * the install branch of `resolveManagedToolClient`; a transient one returns
+	 * as `transient`, which that seam passes straight back without installing.
+	 */
+	private async probeBiome(): Promise<ClientAvailabilityResult<true>> {
+		// The probe budget is enforced by a HOST-side timer, so a stalled event
+		// loop expires it while the child is still healthy. Measure the stall
+		// that overlapped the window and let the classifier see it (#1467).
+		const sampler = startHostStallSampler();
+		const startedAt = Date.now();
+		let result: Awaited<ReturnType<typeof this.spawnBiomeAsync>>;
+		let hostStallMs: number;
+		try {
+			result = await this.spawnBiomeAsync(["--version"], PROBE_TIMEOUT_MS);
+		} finally {
+			hostStallMs = sampler.stop();
+		}
+		const elapsedMs = Date.now() - startedAt;
+
+		if (!result.error && result.status === 0) {
+			this.lastProbeCause = "ok";
+			logAvailabilityDecision({
+				tool: "biome",
+				verdict: "available",
+				outcome: "success",
+				cause: "ok",
+				elapsedMs,
+				latched: true,
+				hostStallMs,
+				budgetMs: PROBE_TIMEOUT_MS,
+			});
+			return { outcome: "success", value: true };
+		}
+
+		// `unclassifiedFailureOutcome: "missing"` preserves the pre-#1476
+		// meaning of a plain non-zero exit (npx reporting no biome package):
+		// still "missing", still installable. Only the timeout/abort arm changes.
+		const { outcome, cause, evidence } = classifyProbeFailure(result, {
+			hostStallMs,
+			unclassifiedFailureOutcome: "missing",
+		});
+		// `classifyProbeFailure` is typed over the full outcome union but never
+		// returns "success" for a failed probe; narrow it for the seam's type.
+		const failureOutcome: Exclude<AvailabilityOutcome, "success"> =
+			outcome === "success" ? "non-installable" : outcome;
+		this.lastProbeCause = cause;
+		this.lastProbeElapsedMs = elapsedMs;
+		this.lastProbeHostStallMs = hostStallMs;
+		this.lastProbeEvidence = evidence;
+		// The record is emitted by `doEnsureAvailable`, once the latch has said how
+		// long this verdict holds.
+		return { outcome: failureOutcome };
+	}
+
 	private async doEnsureAvailable(): Promise<boolean> {
-		const outcome = await resolveManagedToolClient({
+		const resolved = await resolveManagedToolClient({
 			toolId: "biome",
 			cwd: process.cwd(),
-			probe: async () => {
-				const result = await this.spawnBiomeAsync(["--version"], 10000);
-				return !result.error && result.status === 0
-					? { outcome: "success" as const, value: true }
-					: { outcome: "missing" as const };
-			},
+			probe: () => this.probeBiome(),
 			acceptInstalled: (installedPath) => {
 				this.autoInstalledBinaryPath = installedPath;
 				return true;
 			},
 		});
-		this.biomeAvailable = outcome.outcome === "success";
-		return this.biomeAvailable;
+		if (resolved.outcome === "success") {
+			this.availabilityLatch.noteAvailable();
+			// The probe itself logs a clean hit. This arm is the other way to
+			// succeed — the install repaired a durable miss — and it needs its own
+			// record, or "biome went missing and came back" reads as silence.
+			if (this.lastProbeCause !== null && this.lastProbeCause !== "ok") {
+				logAvailabilityDecision({
+					tool: "biome",
+					verdict: "available",
+					outcome: "success",
+					cause: "ok",
+					elapsedMs: this.lastProbeElapsedMs,
+					latched: true,
+					hostStallMs: this.lastProbeHostStallMs,
+					budgetMs: PROBE_TIMEOUT_MS,
+				});
+			}
+			return true;
+		}
+		// A transient probe expires; a durable verdict is remembered for the
+		// session exactly as before.
+		const cause = this.lastProbeCause ?? "not-found";
+		const retryAfterMs = this.availabilityLatch.noteUnavailable(
+			resolved.outcome,
+			cause,
+		);
+		// `missing` IS the install-failure arm (#1500 review). `resolveManagedToolClient`
+		// only reaches the installer when the probe said `missing`, so every `missing`
+		// verdict here has already been through it — declined, suppressed, or tried
+		// and failed, which is what `describeInstallAttempt` separates. The earlier
+		// marker sat on the `non-installable` arm instead, and that arm cannot happen
+		// for biome at all: its `acceptInstalled` always accepts. So the one row that
+		// needed the fact was the one shipping without it.
+		let installEvidence: ProbeEvidence | undefined;
+		if (resolved.outcome === "missing") {
+			const { getInstallAttempt } = await import("./installer/index.js");
+			installEvidence = describeInstallAttempt(getInstallAttempt("biome"));
+		}
+		const evidence = { ...this.lastProbeEvidence, ...installEvidence };
+		logAvailabilityDecision({
+			tool: "biome",
+			verdict: "unavailable",
+			outcome: resolved.outcome,
+			cause,
+			elapsedMs: this.lastProbeElapsedMs,
+			latched: resolved.outcome !== "transient",
+			hostStallMs: this.lastProbeHostStallMs,
+			...(retryAfterMs > 0 && { retryAfterMs }),
+			budgetMs: PROBE_TIMEOUT_MS,
+			// Per arm: a probe-derived verdict says `probe`, while a verdict asserted
+			// by the install seam — or a cause that fell back because no probe ran —
+			// says `caller`.
+			classifiedBy:
+				this.lastProbeCause === null || resolved.outcome === "non-installable"
+					? "caller"
+					: "probe",
+			...(Object.keys(evidence).length > 0 && { evidence }),
+		});
+		if (resolved.outcome === "transient") {
+			this.log("biome availability probe timed out; will retry (not installing)");
+		}
+		return false;
 	}
 
 	/**

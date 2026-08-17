@@ -42,6 +42,7 @@ import {
 import { recordLspChild, removeLspChild } from "../instance-registry.js";
 import type { LSPProcess } from "./launch.js";
 import { normalizeMapKey, uriToPath } from "./path-utils.js";
+import { probeTsserverProjectIdentity } from "./tsserver-sync.js";
 import {
 	ADVERTISED_POSITION_ENCODINGS,
 	convertCharacterOffset,
@@ -300,8 +301,20 @@ export interface LSPClientInfo {
 	 * the binding as "unknown", i.e. pre-#1095 behavior).
 	 */
 	getDiagnosticBinding(filePath: string): StoredDiagnosticBinding | undefined;
-	/** Monotonic counter bumped when fresh diagnostics are stored for this client. */
+	/** Monotonic counter bumped when fresh diagnostics are stored for this client.
+	 *  Client-GLOBAL: any path's publication advances it, so it cannot answer
+	 *  "did this server report on file X?" — use `getDiagnosticsVersionForPath`. */
 	readonly diagnosticsVersion: number;
+	/**
+	 * #1531: the value `diagnosticsVersion` held when diagnostics were last stored
+	 * for `filePath` — 0 when this client has stored none. Compare a baseline read
+	 * before a notify against a later read to prove a publication landed for THAT
+	 * file, rather than for an unrelated one on the same client. REQUIRED: an
+	 * optional accessor let a double silently fall back to the global counter,
+	 * which is the very defect this closes — every client, real or test, answers
+	 * per path.
+	 */
+	getDiagnosticsVersionForPath(filePath: string): number;
 	waitForDiagnostics(
 		filePath: string,
 		timeoutMs?: number,
@@ -589,6 +602,13 @@ const EXECUTE_COMMAND_TIMEOUT_MS = positiveIntFromEnv(
 	"PI_LENS_LSP_EXECUTE_COMMAND_TIMEOUT_MS",
 	30_000,
 );
+// #1412 H1: short ceiling for the read-only tsserver project-identity probe.
+// This is a telemetry sample, not a mutation — it must never hold the door
+// open for anything close to EXECUTE_COMMAND_TIMEOUT_MS.
+const PROBE_COMMAND_TIMEOUT_MS = positiveIntFromEnv(
+	"PI_LENS_LSP_PROJECT_IDENTITY_PROBE_TIMEOUT_MS",
+	2_500,
+);
 
 const LSP_CRASH_CODES = new Set([
 	"ERR_STREAM_DESTROYED",
@@ -675,6 +695,18 @@ export interface LSPClientState {
 	readonly documentOpenedAt: Map<string, number>;
 	readonly diagnosticEmitter: EventEmitter;
 	diagnosticsVersion: number;
+	/** #1531: the value `diagnosticsVersion` had when fresh diagnostics were last
+	 *  STORED for each path. It records the global counter's value rather than a
+	 *  private per-path sequence, so the numbers stay globally monotonic: a
+	 *  baseline captured for path A remains comparable even after A's entry is
+	 *  evicted, while a publication for path B never moves A's stamp. That is what
+	 *  lets the auxiliary evidence check ask "did this aux publish for THIS file?"
+	 *  instead of "did anything at all land on this client?". Written in lockstep
+	 *  with `pushDiagnostics`/`documentPullDiagnostics`, cleared by
+	 *  `clearDiagnosticsForPath`. A plain Map keyed by the already normalized path
+	 *  for the same hot-receive-path reason as `diagnosticPublicationCounts`
+	 *  above; readers fold their input through `normalizeMapKey`. */
+	readonly diagnosticsVersionsByPath: Map<string, number>;
 	readonly documentVersions: Map<string, number>;
 	/** The LSP document version (`publishDiagnostics.version`) the cached
 	 *  diagnostics for a path were computed against. Only set when the server
@@ -723,6 +755,8 @@ export interface LSPClientState {
 	/** Original URI spelling for each open document; path keys are normalized. */
 	readonly openDocumentUris?: Map<string, string>;
 	readonly pendingOpens: Set<string>;
+	/** Normalized files already claimed by the classic tsserver project probe. */
+	projectIdentityProbedFiles?: Set<string>;
 	/** Mutable: updated by applyDynamicCapabilities after registerCapability events */
 	workspaceDiagnosticsSupport: LSPWorkspaceDiagnosticsSupport;
 	/** Mutable: upgraded by applyDynamicCapabilities after registerCapability events */
@@ -1044,6 +1078,28 @@ function getMergedDiagnosticsForPath(
 	);
 }
 
+/** #1531: bump the client-global diagnostics counter and stamp the path it was
+ * bumped FOR. The single seam every "fresh diagnostics stored" site goes
+ * through, so the per-path stamp can never drift from the global counter. */
+export function bumpDiagnosticsVersion(
+	state: LSPClientState,
+	normalizedPath: string,
+): void {
+	state.diagnosticsVersion += 1;
+	state.diagnosticsVersionsByPath?.set(normalizedPath, state.diagnosticsVersion);
+}
+
+/** #1531: the global counter's value when diagnostics were last stored for
+ * `normalizedPath`, or 0 when nothing is stored. 0 is a safe floor because the
+ * counter starts at 0 and only ever increases, so any later publication for the
+ * path compares greater than a baseline read while it was absent. */
+export function diagnosticsVersionForPath(
+	state: LSPClientState,
+	normalizedPath: string,
+): number {
+	return state.diagnosticsVersionsByPath?.get(normalizedPath) ?? 0;
+}
+
 /** Exported for tests: the quiet-window timer cancel on clear/resync is the
  * headline #1412 safety property (a stale versionless publication must never
  * land after the document content changed). */
@@ -1068,6 +1124,12 @@ export function clearDiagnosticsForPath(
 	// `documentContentHashes` record is intentionally retained: it describes what
 	// we sent, which the NEXT publish for that version still needs to bind to.)
 	state.diagnosticBindings?.delete(normalizedPath);
+	// #1531: the per-path publication stamp describes diagnostics that no longer
+	// exist — drop it with them. Safe because the stamps hold the GLOBAL counter's
+	// value: a baseline captured before this clear still compares less than any
+	// later publication for the path, so dropping the entry cannot manufacture a
+	// missed answer.
+	state.diagnosticsVersionsByPath?.delete(normalizedPath);
 	// #1104: a resync invalidates any `unchanged`-report basis too — the next
 	// pull must not inherit a resultId/contentHash computed against the
 	// content this resync just replaced.
@@ -1330,10 +1392,12 @@ export function setupIncomingHandlers(
 			// Known, deliberately out-of-scope gaps: the pull-diagnostics path
 			// (clientRequestPullDiagnostics/clientRequestWorkspaceDiagnostics) has no
 			// version stamp to compare against in this codebase's current handling,
-			// so nothing analogous is applied there. And diagnosticsVersion is a
-			// single global counter rather than per-path, so an unrelated path's
-			// fresh push can still satisfy a wait for this path's version bump —
-			// both are separate, larger changes.
+			// so nothing analogous is applied there. The other gap this note used to
+			// record — `diagnosticsVersion` being a single global counter, so an
+			// unrelated path's fresh push satisfied a wait for THIS path — is closed by
+			// #1531: every bump also stamps `diagnosticsVersionsByPath`, and both the
+			// `minVersion` freshness gate and the auxiliary answered/silent evidence
+			// check read that per-path stamp.
 			const isSupersededPush = (): boolean => {
 				if (docVersion === undefined) return false;
 				const currentVersion = state.documentVersions.get(normalizedPath);
@@ -1350,7 +1414,7 @@ export function setupIncomingHandlers(
 				state.pushDiagnostics.set(normalizedPath, newDiags);
 				state.pushDiagnosticTimestamps.set(normalizedPath, Date.now());
 				recordDocVersion();
-				state.diagnosticsVersion += 1;
+				bumpDiagnosticsVersion(state, normalizedPath);
 				state.diagnosticEmitter.emit("diagnostics", normalizedPath);
 				logSequence(true, "first-push");
 				return;
@@ -1366,7 +1430,7 @@ export function setupIncomingHandlers(
 				state.pushDiagnostics.set(normalizedPath, newDiags);
 				state.pushDiagnosticTimestamps.set(normalizedPath, Date.now());
 				recordDocVersion();
-				state.diagnosticsVersion += 1;
+				bumpDiagnosticsVersion(state, normalizedPath);
 				state.diagnosticEmitter.emit("diagnostics", normalizedPath);
 				logSequence(true, "quiet-window");
 			}, strategy.debounceMs);
@@ -1616,7 +1680,7 @@ async function clientRequestPullDiagnostics(
 			const primaryItems = normalizeLspDiagnostics(report.items ?? []);
 			state.documentPullDiagnostics.set(normalizedPath, primaryItems);
 			state.documentPullDiagnosticTimestamps.set(normalizedPath, now);
-			state.diagnosticsVersion += 1;
+			bumpDiagnosticsVersion(state, normalizedPath);
 			state.diagnosticBindings.set(normalizedPath, { contentHash: sentHash });
 			totalCount = primaryItems.length;
 		}
@@ -1626,6 +1690,14 @@ async function clientRequestPullDiagnostics(
 			state.pullResultIds.delete(normalizedPath);
 		}
 
+		// #1531 note (pre-existing, unchanged): a related document's diagnostics are
+		// STORED below but earn no version bump and therefore no per-path stamp —
+		// exactly as before, since this loop never bumped the global counter either.
+		// A wait on a path that only ever hears about itself through some other
+		// document's `relatedDocuments` sees no freshness evidence and rides its
+		// timeout. Direction is under-detection, and correcting it means deciding
+		// what a related-document publication is evidence OF (its binding is
+		// honestly "unknown" per #1104), so it stays out of scope here.
 		if (report.relatedDocuments) {
 			for (const [relatedUri, related] of Object.entries(
 				report.relatedDocuments,
@@ -1806,8 +1878,17 @@ export async function clientWaitForDiagnostics(
 ): Promise<void> {
 	const normalizedPath = normalizeMapKey(filePath);
 	const minVersion = options.minVersion;
+	// #1531: the freshness gate is PER PATH. `minVersion` is a reading of the
+	// client-global counter, and `diagnosticsVersionsByPath` stores that same
+	// counter's value at each store — the two are on one axis, so comparing them
+	// asks "has a publication landed for THIS file since the baseline?" instead of
+	// "has anything at all landed on this client?". Reading the global counter here
+	// let a sibling file's publication end this file's wait before its own budget
+	// lapsed, which then labelled the outcome row `silent` (reserved for "own
+	// budget lapsed with nothing published") instead of `cut_off`.
 	const hasFreshDiagnostics = (): boolean =>
-		minVersion === undefined || state.diagnosticsVersion > minVersion;
+		minVersion === undefined ||
+		diagnosticsVersionForPath(state, normalizedPath) > minVersion;
 
 	// Version coherence: a cached push is "stale" only when the server reported
 	// the document version it computed against AND that version lags the latest
@@ -2026,6 +2107,26 @@ export async function handleNotifyOpen(
 	state.openDocuments.add(normalizedPath);
 	state.closedDocuments?.delete(normalizedPath);
 	state.openDocumentUris?.set(normalizedPath, uri);
+	// Telemetry is deliberately detached after didOpen succeeds.
+	// #1412 H1: routed through runReadOnlyServerCommand, NOT runServerCommand —
+	// the probe must never open the serverEditsAllowed/activeMutationContext
+	// mutation-acceptance window; it is a diagnostic sample, not a mutation, and
+	// carries its own short PROBE_COMMAND_TIMEOUT_MS backstop. The probe itself
+	// is classic-only and swallows every failure.
+	void probeTsserverProjectIdentity({
+		serverId: state.serverId,
+		launchVariant: state.launchVariant,
+		clientRoot: state.root,
+		file: filePath,
+		normalizedFile: normalizedPath,
+		probedFiles:
+			state.projectIdentityProbedFiles ??
+			(state.projectIdentityProbedFiles = new Set()),
+		commandChannel: {
+			executeCommand: (command, args) =>
+				runReadOnlyServerCommand(state, command, args),
+		},
+	});
 }
 
 export async function handleNotifyChange(
@@ -2083,6 +2184,11 @@ export async function closeDocument(
 	state.documentVersions.delete(normalizedPath);
 	state.documentOpenedAt.delete(normalizedPath);
 	state.diagnosticPublicationCounts.delete(normalizedPath);
+	// #1412 L1: projectIdentityProbedFiles is a claim-once memo scoped to the
+	// document's open lifetime (re-probing a closed-then-reopened file is
+	// harmless and cheap) — mirror openDocuments' own per-close cleanup so it
+	// doesn't grow unbounded across a long session's worth of open/close churn.
+	state.projectIdentityProbedFiles?.delete(normalizedPath);
 	clearDiagnosticsForPath(state, normalizedPath);
 }
 
@@ -2101,6 +2207,9 @@ export async function clientShutdown(
 	state.pendingOpens.clear();
 	state.openDocuments.clear();
 	state.openDocumentUris?.clear();
+	// #1412 L1: mirror openDocuments' clear — a shut-down/evicted client's
+	// probe memo is moot along with everything else document-scoped.
+	state.projectIdentityProbedFiles?.clear();
 	// #271: drop any pending watched-files batch + its timer (a dying client's
 	// queued FS changes are moot, and the timer must not outlive the connection).
 	state.watchQueue?.cancel();
@@ -2332,6 +2441,51 @@ export async function runServerCommand(
 		state.serverEditsAllowed -= 1;
 		state.activeMutationDepth = Math.max(0, (state.activeMutationDepth ?? 0) - 1);
 		if (state.activeMutationDepth === 0) state.activeMutationContext = undefined;
+	}
+}
+
+// #1412 H1/H2: read-only sibling of runServerCommand for telemetry/identity
+// probes that must NOT participate in the mutation-acceptance window. Unlike
+// runServerCommand this never touches serverEditsAllowed, activeMutationDepth,
+// or activeMutationContext — a probe firing mid-flight must leave a concurrent
+// real executeCommand's mutation context untouched, and must not itself open
+// the workspace/applyEdit acceptance window (client.ts's applyEdit handler
+// gates on serverEditsAllowed > 0). Preserves the allowlist-by-advertisement
+// invariant. Short PROBE_COMMAND_TIMEOUT_MS backstop — this is a diagnostic
+// sample, not a mutation, and must never hold anything up for anywhere near
+// EXECUTE_COMMAND_TIMEOUT_MS.
+export async function runReadOnlyServerCommand(
+	state: LSPClientState,
+	command: string,
+	args: unknown[] | undefined,
+	timeoutMs: number = PROBE_COMMAND_TIMEOUT_MS,
+): Promise<{ executed: boolean; result?: unknown; reason?: string }> {
+	if (!isClientAlive(state)) {
+		return { executed: false, reason: "lsp client not alive" };
+	}
+	if (!state.advertisedCommands.has(command)) {
+		return {
+			executed: false,
+			reason: `command "${command}" is not advertised by the ${state.serverId} server`,
+		};
+	}
+	try {
+		const result = await withTimeout(
+			safeSendRequest<unknown>(state.connection, "workspace/executeCommand", {
+				command,
+				arguments: args ?? [],
+			}),
+			timeoutMs,
+		);
+		return { executed: true, result };
+	} catch (err) {
+		if (err instanceof Error && err.message.startsWith("Timeout after")) {
+			return {
+				executed: false,
+				reason: `workspace/executeCommand timed out after ${timeoutMs}ms`,
+			};
+		}
+		throw err;
 	}
 }
 
@@ -2601,6 +2755,7 @@ export async function createLSPClient(options: {
 		documentOpenedAt: new Map(),
 		diagnosticEmitter,
 		diagnosticsVersion: 0,
+		diagnosticsVersionsByPath: new Map(),
 		documentVersions: new Map(),
 		diagnosticDocVersions: new Map(),
 		documentContentHashes: new Map(),
@@ -2611,6 +2766,7 @@ export async function createLSPClient(options: {
 		closedDocuments: new Set(),
 		openDocumentUris: new Map(),
 		pendingOpens: new Set(),
+		projectIdentityProbedFiles: new Set(),
 		// these are filled in after initialize — cast to avoid two-phase init
 		workspaceDiagnosticsSupport:
 			undefined as unknown as LSPWorkspaceDiagnosticsSupport,
@@ -2804,6 +2960,10 @@ export async function createLSPClient(options: {
 
 		getDiagnosticBinding(filePath) {
 			return state.diagnosticBindings.get(normalizeMapKey(filePath));
+		},
+
+		getDiagnosticsVersionForPath(filePath) {
+			return diagnosticsVersionForPath(state, normalizeMapKey(filePath));
 		},
 
 		getAllDiagnostics() {

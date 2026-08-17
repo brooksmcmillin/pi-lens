@@ -388,6 +388,7 @@ function emitMarkTelemetry(
 	anchor: string,
 	reason: string | undefined,
 	existing: DispositionEntry | undefined,
+	identity: { model?: string; provider?: string } | undefined,
 ): void {
 	try {
 		logDispositionEvent({
@@ -400,6 +401,8 @@ function emitMarkTelemetry(
 			reason,
 			anchor,
 			previousDisposition: existing?.disposition,
+			model: identity?.model || undefined,
+			provider: identity?.provider || undefined,
 		});
 		publishDisposition({
 			cwd,
@@ -432,6 +435,7 @@ export function markDisposition(
 	target: DispositionMarkTarget,
 	disposition: Disposition,
 	reason?: string,
+	identity?: { model?: string; provider?: string },
 ): string {
 	const anchor =
 		disposition === "false-positive"
@@ -443,7 +447,7 @@ export function markDisposition(
 	const existing = readState(cwd).dispositions?.[anchor];
 	if (disposition === "defer") {
 		deferredThisSession.add(anchor);
-		emitMarkTelemetry(cwd, target, disposition, anchor, reason, existing);
+		emitMarkTelemetry(cwd, target, disposition, anchor, reason, existing, identity);
 		return anchor;
 	}
 
@@ -463,7 +467,7 @@ export function markDisposition(
 		lineText,
 	};
 	commitDisposition(cwd, anchor, entry);
-	emitMarkTelemetry(cwd, target, disposition, anchor, reason, existing);
+	emitMarkTelemetry(cwd, target, disposition, anchor, reason, existing, identity);
 	return anchor;
 }
 

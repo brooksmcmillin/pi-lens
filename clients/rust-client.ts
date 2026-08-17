@@ -8,9 +8,11 @@
  */
 
 import { createSubsystemLogger } from "./extension-log.js";
-import * as fs from "node:fs";
 import * as path from "node:path";
-import { safeSpawnAsync } from "./safe-spawn.js";
+import {
+	type ToolchainAvailability,
+	createToolchainAvailability,
+} from "./dispatch/runners/utils/toolchain-availability.js";
 
 // --- Types ---
 
@@ -33,6 +35,9 @@ const CARGO_WINDOWS_PATHS = [
 	"cargo.exe", // PATH
 ];
 
+/** Budget for the PATH candidate's `cargo --version` probe, ms. */
+const PROBE_TIMEOUT_MS = 3_000;
+
 const CARGO_UNIX_PATHS = [
 	path.join(process.env.HOME || "", ".cargo", "bin", "cargo"),
 	"/usr/local/cargo/bin/cargo",
@@ -43,59 +48,42 @@ const CARGO_UNIX_PATHS = [
 // --- Client ---
 
 export class RustClient {
-	private cargoAvailable: boolean | null = null;
-	private cargoPath: string | null = null;
+	/**
+	 * Availability lifecycle, behind the shared transient-aware latch (#1476).
+	 * The PATH candidate is resolved by spawning `cargo --version` with a 3 s
+	 * budget, so a host stall could latch "no cargo" for the session and silently
+	 * disable every Rust diagnostic until restart.
+	 */
+	private readonly availability: ToolchainAvailability;
 	private log: (msg: string) => void;
 
 	constructor(verbose = false) {
 		this.log = verbose
 			? createSubsystemLogger("rust")
 			: () => {};
+		this.availability = createToolchainAvailability({
+			tool: "cargo",
+			label: "Cargo",
+			windowsPaths: CARGO_WINDOWS_PATHS,
+			unixPaths: CARGO_UNIX_PATHS,
+			probeArgs: ["--version"],
+			budgetMs: PROBE_TIMEOUT_MS,
+			log: (msg) => this.log(msg),
+		});
 	}
 
 	/**
 	 * Find cargo executable path (async — probes PATH candidates off the event loop).
 	 */
 	async findCargoPathAsync(): Promise<string | null> {
-		if (this.cargoPath) return this.cargoPath;
-
-		const paths =
-			process.platform === "win32" ? CARGO_WINDOWS_PATHS : CARGO_UNIX_PATHS;
-
-		for (const p of paths) {
-			try {
-				if (p.includes("\\") || p.includes("/")) {
-					if (fs.existsSync(p)) {
-						this.cargoPath = p;
-						return p;
-					}
-				} else {
-					const result = await safeSpawnAsync(p, ["--version"], {
-						timeout: 3000,
-					});
-					if (!result.error && result.status === 0) {
-						this.cargoPath = p;
-						return p;
-					}
-				}
-			} catch (err) {
-				void err;
-			}
-		}
-
-		return null;
+		return this.availability.findPath();
 	}
 
 	/**
 	 * Check if cargo is installed (cached)
 	 */
 	async isAvailableAsync(): Promise<boolean> {
-		if (this.cargoAvailable !== null) return this.cargoAvailable;
-		this.cargoAvailable = (await this.findCargoPathAsync()) !== null;
-		if (this.cargoAvailable) {
-			this.log(`Cargo found: ${this.cargoPath}`);
-		}
-		return this.cargoAvailable;
+		return this.availability.isAvailable();
 	}
 
 	/**

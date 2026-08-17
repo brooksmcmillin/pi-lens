@@ -20,15 +20,22 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as path from "node:path";
+import {
+	getDegradationLedgerGeneration,
+	incrementDegradationCount,
+	recordDegradation,
+	recordDegradationOnce,
+} from "./degradation-ledger.js";
 import { loadWebTreeSitter } from "./deps/web-tree-sitter.js";
+import { transientRetryDelayMs } from "./dispatch/runners/utils/availability-policy.js";
 import { getProjectIgnoreMatcher, isExcludedDirName } from "./file-utils.js";
 import {
-	downloadGrammar,
+	downloadGrammarDetailed,
+	fileHasWasmMagic,
 	grammarBlockReason,
 	LANGUAGE_TO_GRAMMAR,
 } from "./grammar-source.js";
 import { resolvePackagePath } from "./package-root.js";
-import { recordDegradation } from "./degradation-ledger.js";
 import {
 	assertInstallAllowed,
 	getProjectTrustGeneration,
@@ -159,6 +166,21 @@ function createParserCounters(): TreeSitterParserCounters {
 	};
 }
 
+/**
+ * `size:mtimeMs` identity for a grammar candidate, or undefined when the path
+ * is absent or not a regular file. Doubles as the existence check on the
+ * resolve path and as the invalidation key for the verified-preamble memo
+ * (#1548) — `size` + `mtimeMs` is the codebase's standard cheap stamp.
+ */
+function grammarFileStamp(filePath: string): string | undefined {
+	try {
+		const stat = fs.statSync(filePath);
+		return stat.isFile() ? `${stat.size}:${stat.mtimeMs}` : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 export function isTreeSitterWasmAbortError(error: unknown): boolean {
 	const message = error instanceof Error ? error.message : String(error);
 	return message.includes("Aborted") || message.includes("abort()");
@@ -174,8 +196,53 @@ export class TreeSitterClient {
 	private treeCache: TreeCache;
 	private navigator = new TreeSitterNavigator();
 	private grammarsDir: string;
-	/** In-flight/settled lazy grammar fetches, keyed by wasm filename. */
+	/** In-flight lazy grammar fetches, keyed by wasm filename. Evicted on
+	 * settle (#1536) — a rejected/false attempt must not be remembered as the
+	 * permanent answer for the session; only concurrent demands during the
+	 * SAME probe share it. */
 	private grammarEnsurePromises = new Map<string, Promise<boolean>>();
+	/** Epoch ms before which a failed grammar download is not retried
+	 * (#1536). A transient download failure — offline, DNS hiccup, CDN blip —
+	 * says nothing durable about the grammar, so it gets a bounded cooldown
+	 * (the `transientRetryDelayMs` shape from availability-policy.ts) instead
+	 * of latching for the process lifetime. */
+	private grammarRetryAtMs = new Map<string, number>();
+	/**
+	 * Grammar path → the `size:mtimeMs` stamp at which its wasm preamble was
+	 * verified (#1548). A POSITIVE-only memo, so the steady-state resolve costs
+	 * one `stat` (which the old `existsSync` already paid) and re-reads the
+	 * header only when the stamp moves. Stamped rather than a bare `Set`
+	 * because a memo that never expires is defect-shape 6: the file it vouches
+	 * for can be replaced under it. Failures are deliberately NOT memoized — a
+	 * poisoned path must be re-examined on the next resolve so a successful
+	 * re-download over it is picked up immediately.
+	 */
+	private verifiedGrammarPaths = new Map<string, string>();
+	/** Paths already reported as non-wasm, to log/record them once each. */
+	private poisonedGrammarPaths = new Set<string>();
+	/** Consecutive download failures per grammar, for the exponential
+	 * cooldown; reset on success. */
+	private grammarFailureAttempts = new Map<string, number>();
+	/**
+	 * Retry delay (ms) last SHOWN to the user for this grammar, or `-1` for a
+	 * durable (non-retryable) failure already announced. The cooldown lets
+	 * the ensure loop retry silently in the background — only the delay's
+	 * FIRST appearance, and any later escalation the user was never told
+	 * about, needs to interrupt them (#1536 review F6): a fresh 30s cooldown
+	 * re-notifies the same as an escalated 300s one once it's a genuinely new
+	 * number, but two consecutive 30s cooldowns (identical, nothing new to
+	 * say) do not. Absence means "not yet notified this streak."
+	 *
+	 * Session-scoped (#1536 review F5): cleared whenever the degradation
+	 * ledger's own generation moves past `grammarNotificationsLedgerGen`,
+	 * mirroring `trustBlockedGrammarNotifications` below — a lazy
+	 * compare-at-use-time against a monotonic counter, not a listener. Tied to
+	 * the LEDGER's generation (bumped by `resetDegradationLedger`, which
+	 * `handleSessionStart` calls first thing) rather than trust, since this
+	 * is a session boundary, not a trust transition.
+	 */
+	private grammarLastNotifiedDelayMs = new Map<string, number>();
+	private grammarNotificationsLedgerGen = getDegradationLedgerGeneration();
 	private trustBlockedGrammarNotifications = new Set<string>();
 	private trustNotificationsGeneration = getProjectTrustGeneration();
 	// biome-ignore lint/suspicious/noExplicitAny: Optional dependency loaded dynamically
@@ -435,13 +502,84 @@ export class TreeSitterClient {
 		return dirs;
 	}
 
-	/** Absolute path to `grammarFile` across all source dirs, else undefined. */
+	/**
+	 * Absolute path to `grammarFile` across all source dirs, else undefined.
+	 *
+	 * Existence is not enough (#1548): a file whose first four bytes aren't the
+	 * wasm preamble is not a grammar, and returning it would report the language
+	 * as available while every `Language.load` fails — the permanent-poisoning
+	 * shape this issue is about. #1548 stops NEW poisoned files from being
+	 * written, but a file poisoned before that shipped is already on disk, so
+	 * the resolve path has to reject it too: a rejected candidate is treated as
+	 * absent, which lets `ensureGrammar` re-download over it.
+	 */
 	private resolveGrammarFile(grammarFile: string): string | undefined {
 		for (const dir of this.grammarSourceDirs()) {
 			const candidate = path.join(dir, grammarFile);
-			if (fs.existsSync(candidate)) return candidate;
+			const stamp = grammarFileStamp(candidate);
+			if (!stamp) continue;
+			if (this.verifiedGrammarPaths.get(candidate) === stamp) return candidate;
+			if (fileHasWasmMagic(candidate)) {
+				this.verifiedGrammarPaths.set(candidate, stamp);
+				return candidate;
+			}
+			this.verifiedGrammarPaths.delete(candidate);
+			this.reportPoisonedGrammarFile(candidate, grammarFile);
 		}
 		return undefined;
+	}
+
+	/**
+	 * Clear the once-per-session grammar report gates when the degradation
+	 * ledger's own generation has moved (#1536 review F5). Lazy
+	 * compare-at-use-time against a monotonic counter, bumped by
+	 * `resetDegradationLedger`, which `handleSessionStart` calls first thing —
+	 * no listener, no retention. Every gate keyed to a SESSION rather than to
+	 * the process lives here, so a new one cannot forget to re-arm: a gate that
+	 * outlives the ledger it guards silently swallows the record it was only
+	 * ever meant to de-duplicate (#1560 review F1).
+	 */
+	private refreshGrammarSessionLatches(): void {
+		const ledgerGen = getDegradationLedgerGeneration();
+		if (ledgerGen === this.grammarNotificationsLedgerGen) return;
+		this.grammarNotificationsLedgerGen = ledgerGen;
+		this.grammarLastNotifiedDelayMs.clear();
+		this.poisonedGrammarPaths.clear();
+	}
+
+	/**
+	 * Log + record a grammar file on disk that isn't a wasm module, once per
+	 * path per session. No user notification here: the caller goes on to attempt
+	 * a re-download, and `recordGrammarFailure` is what interrupts the user if
+	 * that also fails. A silent recovery should stay silent.
+	 */
+	private reportPoisonedGrammarFile(
+		candidate: string,
+		grammarFile: string,
+	): void {
+		// Per SESSION, not per process (#1560 review F1). The file is still
+		// poisoned after a session boundary and still degrades the language, so
+		// the new session's ledger has to carry the entry — a client-lifetime
+		// gate would leave `resetDegradationLedger` with a permanently empty
+		// grammar-blocked group and no record of why the language is degraded.
+		this.refreshGrammarSessionLatches();
+		if (this.poisonedGrammarPaths.has(candidate)) return;
+		this.poisonedGrammarPaths.add(candidate);
+		logTreeSitterDiagnostic({
+			subsystem: "tree-sitter-client",
+			level: "warn",
+			message:
+				`ignoring ${candidate}: the file is not a wasm module (missing the \\0asm preamble) — ` +
+				`most likely a captive-portal or proxy page written by an earlier download (#1548). ` +
+				`pi-lens will treat the grammar as missing and try to fetch it again.`,
+			metadata: { grammarFile, path: candidate, outcome: "not-wasm" },
+		});
+		incrementDegradationCount({
+			kind: "grammar-blocked",
+			subject: grammarFile,
+			reason:
+				"on-disk grammar file is not a wasm module — ignored, re-fetching",
+		});
 	}
 
 	/** Find tree-sitter grammar directory */
@@ -542,52 +680,211 @@ export class TreeSitterClient {
 		const inflight = this.grammarEnsurePromises.get(grammarFile);
 		if (inflight) return inflight;
 
+		// A failed download only stays refused for its cooldown window (#1536):
+		// past that, fall through and retry rather than remembering an offline
+		// moment for the life of the process. No download is attempted while the
+		// cooldown is live, so a hard-down CDN is not re-hit on every parse. A
+		// DURABLE failure (grammarBlockDurable below) sets this to +Infinity,
+		// which reads the same as "still cooling down" here — it just never
+		// expires, matching the issue's "a genuinely unavailable grammar may
+		// still latch" allowance.
+		const retryAt = this.grammarRetryAtMs.get(grammarFile);
+		if (retryAt !== undefined && Date.now() < retryAt) {
+			return false;
+		}
+
 		const task = (async (): Promise<boolean> => {
-			const dir =
-				this.grammarsDir && fs.existsSync(this.grammarsDir)
-					? this.grammarsDir
-					: this.grammarsWriteDir();
-			if (!dir) return false;
-			// Reuse the shared single-file downloader (same CDN/source as the
-			// postinstall) — see clients/grammar-source.ts.
-			const ok = await downloadGrammar(dir, grammarFile);
-			if (ok) {
-				if (!this.grammarsDir) this.grammarsDir = dir;
-				logTreeSitterDiagnostic({
-					subsystem: "tree-sitter-client",
-					level: "warn",
-					message: `fetched missing tree-sitter grammar ${grammarFile} at runtime (install scripts were skipped by the package manager)`,
-					metadata: { grammarFile, outcome: "fetched" },
-				});
-			} else {
-				// Surface the degradation once per grammar (the promise cache dedupes)
-				// instead of failing silently — otherwise pnpm/bun users offline get
-				// no signal that a language's tree-sitter features are unavailable.
-				const unavailable =
-					`tree-sitter grammar '${grammarFile}' is unavailable — ` +
-					`symbol search, module reports and structural rules for this language will be degraded. ` +
-					`The package manager skipped install scripts and the runtime download failed (offline or CDN unreachable). ` +
-					`Fix: reinstall with a manager that runs postinstall, allow its build scripts ` +
-					`(pnpm approve-builds / bun trustedDependencies), or restore network access.`;
-				logTreeSitterDiagnostic({
-					subsystem: "tree-sitter-client",
-					message: unavailable,
-					metadata: { grammarFile, outcome: "unavailable" },
-				});
-				recordDegradation({
-					kind: "grammar-blocked",
-					subject: grammarFile,
-					reason: "runtime grammar download failed",
-				});
-				// HUMAN-audience: an offline grammar fetch silently degrades this
-				// language's features, so it reaches the user through the HOST's
-				// render path (#1333) rather than a raw terminal write.
-				notifyUserDegradation(`pi-lens: ${unavailable}`);
+			try {
+				return await this.fetchGrammar(grammarFile);
+			} catch (err) {
+				// Defensive (#1548): nothing in `fetchGrammar` throws today —
+				// `downloadGrammarDetailed` catches internally. But a thrown error
+				// here used to skip the whole `else` arm, so NO cooldown was armed
+				// and the rejection escaped through `task.finally` — the exact
+				// pre-#1536 shape (no cooldown, possible unhandled rejection). Funnel
+				// it into the same retryable failure path instead, so a future
+				// refactor that lets an exception out cannot regress to it.
+				const message = err instanceof Error ? err.message : String(err);
+				this.recordGrammarFailure(
+					grammarFile,
+					`The runtime grammar fetch threw an unexpected error (${message}).`,
+					/* retryable */ true,
+				);
+				return false;
 			}
-			return ok;
 		})();
 		this.grammarEnsurePromises.set(grammarFile, task);
+		// Evict on settle regardless of outcome (#1536): a resolved TRUE is
+		// superseded by resolveGrammarFile() finding the file on disk on the
+		// next call, and a resolved FALSE must not be remembered as the
+		// permanent verdict — only concurrent callers during the SAME in-flight
+		// attempt should ever observe this promise.
+		//
+		// The trailing `.catch` is UNFALSIFIABLE scaffolding, not verified
+		// defence (#1560 review F3): `finally` returns a DERIVED promise that
+		// rejects whenever `task` does, but the task's own try/catch above means
+		// it cannot reject, so no test can make this handler fire and removing it
+		// changes nothing today. It is here for the day the try/catch above stops
+		// being exhaustive — or the eviction callback itself throws — because at
+		// that point the fork becomes an unhandled rejection nobody is awaiting.
+		void task
+			.finally(() => {
+				if (this.grammarEnsurePromises.get(grammarFile) === task) {
+					this.grammarEnsurePromises.delete(grammarFile);
+				}
+			})
+			.catch(() => {
+				/* see above: the task's own catch is the real handler */
+			});
 		return task;
+	}
+
+	/**
+	 * One grammar-fetch attempt: locate a writable dir, download, and record the
+	 * outcome. Split out of `ensureGrammar` so the whole body sits under one
+	 * try/catch that funnels any throw into `recordGrammarFailure` (#1548).
+	 */
+	private async fetchGrammar(grammarFile: string): Promise<boolean> {
+		const dir =
+			this.grammarsDir && fs.existsSync(this.grammarsDir)
+				? this.grammarsDir
+				: this.grammarsWriteDir();
+		if (!dir) {
+			// No writable grammars directory could be located (e.g. pi compiled
+			// this module to a temp dir and web-tree-sitter isn't resolvable
+			// from there yet). This is an environment condition, not a CDN
+			// verdict — #1536 review F2: it must get the same cooldown +
+			// notification treatment as a download failure, not a silent
+			// unmemoized `false` that re-does the same failing resolution
+			// sweep on every single demand.
+			this.recordGrammarFailure(
+				grammarFile,
+				"No writable grammars directory could be located for the runtime fetch.",
+				/* retryable */ true,
+			);
+			return false;
+		}
+		// Reuse the shared single-file downloader (same CDN/source as the
+		// postinstall) — see clients/grammar-source.ts.
+		const { ok, retryable, reason } = await downloadGrammarDetailed(
+			dir,
+			grammarFile,
+		);
+		if (ok) {
+			if (!this.grammarsDir) this.grammarsDir = dir;
+			this.grammarRetryAtMs.delete(grammarFile);
+			this.grammarFailureAttempts.delete(grammarFile);
+			this.grammarLastNotifiedDelayMs.delete(grammarFile);
+			logTreeSitterDiagnostic({
+				subsystem: "tree-sitter-client",
+				level: "warn",
+				message: `fetched missing tree-sitter grammar ${grammarFile} at runtime (install scripts were skipped by the package manager)`,
+				metadata: { grammarFile, outcome: "fetched" },
+			});
+		} else {
+			// `retryable` distinguishes a durable CDN verdict (404/410 — a
+			// retry hits the same answer) from everything else (offline, DNS,
+			// a down CDN, a 5xx, a timeout), which says nothing durable about
+			// the grammar (#1536 review F4). Only the retryable case gets the
+			// bounded cooldown; a durable failure keeps the pre-#1536 latched
+			// behavior, matching the issue's own allowance.
+			//
+			// `reason`, when the downloader supplies one, names the actual failure
+			// shape (#1548: "returned an HTML page, not a wasm module") instead of
+			// the generic guess — the difference between a diagnosable log line
+			// and one that sends the user to inspect their package manager while a
+			// captive portal is the real cause.
+			this.recordGrammarFailure(
+				grammarFile,
+				reason ??
+					"The package manager skipped install scripts and the runtime download failed.",
+				retryable,
+			);
+		}
+		return ok;
+	}
+
+	/**
+	 * Record one failed grammar-ensure attempt: arm (or extend) the retry
+	 * cooldown, record the degradation, and notify the user at most once per
+	 * session per DISTINCT retry delay (#1536 review F1/F2/F4/F5/F6). Shared
+	 * by the "no writable directory" and "download failed" arms of
+	 * `ensureGrammar` — both are failures of the SAME ensure attempt, just
+	 * with a different point of failure.
+	 */
+	private recordGrammarFailure(
+		grammarFile: string,
+		detail: string,
+		retryable: boolean,
+	): void {
+		const attempts = (this.grammarFailureAttempts.get(grammarFile) ?? 0) + 1;
+		this.grammarFailureAttempts.set(grammarFile, attempts);
+		// A durable verdict (404/410) never expires -- matches the issue's "a
+		// genuinely unavailable grammar may still latch" allowance. Everything
+		// else gets the bounded exponential cooldown.
+		const retryDelayMs = retryable
+			? transientRetryDelayMs(attempts, "probe-timeout")
+			: undefined;
+		this.grammarRetryAtMs.set(
+			grammarFile,
+			retryDelayMs === undefined
+				? Number.POSITIVE_INFINITY
+				: Date.now() + retryDelayMs,
+		);
+
+		const unavailable = retryable
+			? `tree-sitter grammar '${grammarFile}' is unavailable — symbol search, ` +
+				`module reports and structural rules for this language will be degraded. ` +
+				`${detail} pi-lens will retry automatically in ${Math.round((retryDelayMs as number) / 1000)}s; ` +
+				`if the problem persists, allow the package manager's build scripts ` +
+				`(pnpm approve-builds / bun trustedDependencies) or restore network access.`
+			: `tree-sitter grammar '${grammarFile}' is unavailable — symbol search, ` +
+				`module reports and structural rules for this language will be degraded. ` +
+				`${detail} The grammar source reports it does not exist (not a network problem), so this will not ` +
+				`resolve on retry. Fix: reinstall with a manager that runs postinstall, allow its build scripts ` +
+				`(pnpm approve-builds / bun trustedDependencies), or restore network access.`;
+
+		logTreeSitterDiagnostic({
+			subsystem: "tree-sitter-client",
+			message: unavailable,
+			metadata: {
+				grammarFile,
+				outcome: "unavailable",
+				retryable,
+				retryDelayMs,
+				attempts,
+			},
+		});
+		// #1536 review F1: incrementDegradationCount keeps ONE ring-buffer slot
+		// per subject (bumping its count in place) instead of recordDegradation's
+		// one-new-entry-per-call — a grammar retrying every cooldown window would
+		// otherwise flood the shared "grammar-blocked" kind's 20-slot ring and
+		// evict unrelated entries (e.g. a different grammar's V8-crash block
+		// reason from loadLanguage/grammarBlockReason) after ~20 cycles.
+		incrementDegradationCount({
+			kind: "grammar-blocked",
+			subject: grammarFile,
+			// #1548: carry `detail` into the RETRYABLE reason too. All retryable
+			// failures used to share one string, so the ledger could not tell an
+			// offline laptop from a captive portal serving HTML — the two need
+			// different user actions, and the ledger is what a bug report shows.
+			reason: retryable
+				? `runtime grammar download failed — retryable (${detail.trim()})`
+				: `runtime grammar download failed — durable (${detail.trim()})`,
+		});
+
+		this.refreshGrammarSessionLatches();
+		// HUMAN-audience: an offline grammar fetch silently degrades this
+		// language's features, so it reaches the user through the HOST's render
+		// path (#1333) rather than a raw terminal write. Notify once per DISTINCT
+		// retry delay this session (#1536 review F6) -- a fresh failure streak or
+		// an escalated backoff is new information worth surfacing; an unchanged
+		// repeat during the same cooldown tier is not.
+		const notifyKey = retryDelayMs ?? -1;
+		if (this.grammarLastNotifiedDelayMs.get(grammarFile) !== notifyKey) {
+			this.grammarLastNotifiedDelayMs.set(grammarFile, notifyKey);
+			notifyUserDegradation(`pi-lens: ${unavailable}`);
+		}
 	}
 
 	/** Initialize tree-sitter WASM runtime */
@@ -2764,20 +3061,18 @@ export class TreeSitterClient {
 				return !hasExceptionSpec;
 			}
 			case "eq_mod_fn": {
-				// Workaround for web-tree-sitter not auto-applying #eq? predicates
-				// on the structural pattern of a query that has predicates. The
-				// query captures @MOD, @FN but the predicates aren't enforced
-				// (see evaluatePredicates in clients/tree-sitter-client.ts).
+				// Belt-and-braces re-check of the #eq? predicates that
+				// evaluatePredicates already enforces (clients/tree-sitter-client.ts).
 				// This filter re-applies the #eq? checks at post_filter time.
 				const mod = captures.MOD?.text ?? "";
 				const fn = captures.FN?.text ?? "";
 				return mod === "threading" && fn === "Thread";
 			}
 			case "regex_first_arg_identifier": {
-				// Workaround for web-tree-sitter not auto-applying #eq?/#match?
-				// predicates on the structural pattern (see evaluatePredicates).
-				// This post_filter re-applies both predicate checks AND
-				// the first-argument check:
+				// Belt-and-braces re-check of the #eq?/#match? predicates that
+				// evaluatePredicates already enforces, plus the first-argument
+				// check that predicates can't express. This post_filter re-applies
+				// both predicate checks AND the first-argument check:
 				// 1. MOD must be "re"  (would-be #eq? @MOD "re")
 				// 2. FUNC must match the regex method pattern (#match? @FUNC ...)
 				// 3. First arg must be an identifier (dynamic pattern)
@@ -3597,12 +3892,86 @@ export class TreeSitterClient {
 	}
 
 	/**
-	 * Evaluate text predicates (#match?, #eq?) for a query match.
-	 * web-tree-sitter stores these as compiled functions in query.textPredicates[patternIndex]
-	 * and does NOT apply them automatically via .matches().
+	 * Latch so the "textPredicates is malformed" diagnostic log line fires once
+	 * per `TreeSitterClient` instance for the life of the process (this client is
+	 * a process-wide singleton in production — see clients/tree-sitter-shared.ts),
+	 * not once per call. This gates ONLY the log line: process-wide log volume is
+	 * the concern here, not the user-facing degradation record below, which must
+	 * re-arm every session (see recordDegradationOnce) — including for a Query
+	 * object the LRU query cache (queryCache/queryBatchCache above) kept alive
+	 * across a session boundary, since the cache is evicted, never cleared.
+	 */
+	private textPredicatesInvalidLogged = false;
+
+	/**
+	 * Typed accessor for `query.textPredicates`. If the property is missing or the
+	 * wrong shape — e.g. a future web-tree-sitter upgrade renames or removes it —
+	 * `query.textPredicates?.[i] ?? []` would silently mean "no predicates for this
+	 * pattern," passing every match through unfiltered. That's a silent fail-open on
+	 * #match?/#eq? predicates that rules rely on for correctness, and because this
+	 * runs for every match of every query, it would zero out ALL structural matches
+	 * across every language while pi-lens reports "no issues found." Fail loud (log
+	 * once per client instance, record a degradation so it reaches the user) and
+	 * closed (report the query has no usable predicates) instead of guessing.
+	 *
+	 * No WeakSet short-circuit for already-known-bad queries here (#1523 review
+	 * R1): `Array.isArray` is O(1), so memoizing it buys nothing, and a
+	 * process-lifetime WeakSet would make the SAME cached Query object (the query
+	 * cache is LRU-evicted, never cleared) skip straight past
+	 * `recordDegradationOnce` on every call after the first — which is exactly
+	 * what made the degradation record fail to re-arm across a session boundary
+	 * for a query the cache kept warm. `recordDegradationOnce` itself is called
+	 * unconditionally on every invalid check; the ledger's own once-per-kind/
+	 * subject dedupe (cleared by resetDegradationLedger, which handleSessionStart
+	 * calls first thing — clients/runtime-session.ts) is the single source of
+	 * truth for "how often does this actually get recorded."
+	 */
+	// biome-ignore lint/suspicious/noExplicitAny: web-tree-sitter Query instances
+	private hasValidTextPredicates(query: any): boolean {
+		const valid = Array.isArray(query?.textPredicates);
+		if (!valid) {
+			if (!this.textPredicatesInvalidLogged) {
+				this.textPredicatesInvalidLogged = true;
+				logTreeSitterDiagnostic({
+					subsystem: "tree-sitter-client",
+					message:
+						"web-tree-sitter Query.textPredicates is missing or not an array — " +
+						"#match?/#eq? predicates cannot be evaluated. Failing CLOSED: matches " +
+						"for this query are dropped rather than reported unfiltered.",
+					metadata: { textPredicatesType: typeof query?.textPredicates },
+				});
+			}
+			// User-facing signal (#1523 review F1). Called unconditionally on every
+			// invalid check (not gated by a client-lifetime latch) so it re-arms
+			// every session, per the R1 fix above.
+			recordDegradationOnce({
+				kind: "query-predicates-invalid",
+				subject: "web-tree-sitter",
+				reason:
+					"Query.textPredicates is missing or not an array — #match?/#eq? " +
+					"predicates cannot be evaluated; structural matches relying on them " +
+					"are dropped fail-closed",
+			});
+		}
+		return valid;
+	}
+
+	/**
+	 * Evaluate text predicates (#match?, #eq?) for a query match. web-tree-sitter
+	 * 0.25's `Query.matches()` DOES apply these predicates itself (probed on the
+	 * shipped grammars — see clients/tree-sitter-symbol-extractor.ts), so this is a
+	 * belt-and-braces re-filter, not a workaround for missing enforcement. It also
+	 * doubles as the fail-closed guard (#1523): if `query.textPredicates` is ever
+	 * missing or malformed, this drops the match instead of assuming it already
+	 * passed upstream.
 	 */
 	// biome-ignore lint/suspicious/noExplicitAny: web-tree-sitter types
 	private evaluatePredicates(query: any, match: any): boolean {
+		if (!this.hasValidTextPredicates(query)) return false;
+		// `?.` guards a post-validation removal of the property (e.g. a later
+		// mutation strips it after the first successful check) so the read can't
+		// throw here — an uncaught throw would be swallowed by the outer try/catch
+		// in searchFileWithQuery and silently zero out matches for the whole file.
 		const predicates: Array<(captures: unknown) => boolean> =
 			query.textPredicates?.[match.patternIndex] ?? [];
 		return predicates.every((fn) => fn(match.captures));
@@ -3640,7 +4009,9 @@ export class TreeSitterClient {
 							}
 						}
 
-						// Evaluate #match? and #eq? predicates that web-tree-sitter doesn't enforce automatically
+						// Belt-and-braces re-check of #match?/#eq? predicates (web-tree-sitter
+						// 0.25's Query.matches() already applies them) plus the fail-closed
+						// guard for a malformed query.textPredicates (see evaluatePredicates).
 						if (!this.evaluatePredicates(query, match)) {
 							continue;
 						}

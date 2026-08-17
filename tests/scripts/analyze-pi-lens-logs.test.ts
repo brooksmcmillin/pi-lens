@@ -202,6 +202,72 @@ describe("analyze-pi-lens-logs.mjs", () => {
 			.join("\n");
 		fs.writeFileSync(path.join(root, "sessionstart.log"), `${sessionstart}\n`);
 
+		// projects/<slug>/worklog.jsonl (#1448) — two projects, mixing attributed
+		// and unattributed (pre-#1448 / unknown-identity) entries so the rollup
+		// exercises rule × model grouping AND blank-model bucketing together.
+		const worklogA = [
+			{
+				timestamp: NOW,
+				filePath: "/proj/a/x.ts",
+				rule: "no-unused-vars",
+				tool: "eslint",
+				message: "x is unused",
+				line: 1,
+				fixable: true,
+				autoFixed: true,
+				model: "claude-sonnet-4-5",
+				provider: "anthropic",
+			},
+			{
+				timestamp: NOW,
+				filePath: "/proj/a/y.ts",
+				rule: "no-unused-vars",
+				tool: "eslint",
+				message: "y is unused",
+				line: 2,
+				fixable: true,
+				autoFixed: false,
+				model: "claude-sonnet-4-5",
+				provider: "anthropic",
+			},
+			// Pre-#1448 shape: no model/provider fields at all.
+			{
+				timestamp: NOW,
+				filePath: "/proj/a/z.ts",
+				rule: "no-unused-vars",
+				tool: "eslint",
+				message: "z is unused",
+				line: 3,
+				fixable: true,
+				autoFixed: true,
+			},
+		]
+			.map((e) => JSON.stringify(e))
+			.join("\n");
+		const projA = path.join(root, "projects", "proj-a");
+		fs.mkdirSync(projA, { recursive: true });
+		fs.writeFileSync(path.join(projA, "worklog.jsonl"), `${worklogA}\n`);
+
+		const worklogB = [
+			{
+				timestamp: NOW,
+				filePath: "/proj/b/w.ts",
+				rule: "no-explicit-any",
+				tool: "eslint",
+				message: "unexpected any",
+				line: 4,
+				fixable: false,
+				autoFixed: false,
+				model: "gpt-5",
+				provider: "openai",
+			},
+		]
+			.map((e) => JSON.stringify(e))
+			.join("\n");
+		const projB = path.join(root, "projects", "proj-b");
+		fs.mkdirSync(projB, { recursive: true });
+		fs.writeFileSync(path.join(projB, "worklog.jsonl"), `${worklogB}\n`);
+
 		report = runReport(root);
 	});
 
@@ -286,6 +352,51 @@ describe("analyze-pi-lens-logs.mjs", () => {
 			(s: any) => s.id === "lsp-workspace-file-timeouts",
 		);
 		expect(timeouts?.count).toBe(1);
+	});
+
+	describe("worklog per-model rollup (#1448)", () => {
+		it("discovers worklog.jsonl under each project's data dir", () => {
+			expect(report.filesScanned.worklog).toBe(2);
+			expect(report.rowsSeen.worklog).toBe(4);
+		});
+
+		it("groups rule x model counts, bucketing unattributed entries as blank", () => {
+			const rows: { rule: string; model: string; total: number; autoFixed: number }[] =
+				report.worklog.byRuleModel;
+			const attributed = rows.find(
+				(r) => r.rule === "no-unused-vars" && r.model === "claude-sonnet-4-5",
+			);
+			expect(attributed).toBeDefined();
+			expect(attributed?.total).toBe(2);
+			expect(attributed?.autoFixed).toBe(1);
+
+			const blank = rows.find((r) => r.rule === "no-unused-vars" && r.model === "");
+			expect(blank).toBeDefined();
+			expect(blank?.total).toBe(1);
+			expect(blank?.autoFixed).toBe(1);
+
+			const other = rows.find(
+				(r) => r.rule === "no-explicit-any" && r.model === "gpt-5",
+			);
+			expect(other?.total).toBe(1);
+			expect(other?.autoFixed).toBe(0);
+		});
+
+		it("rolls up totals by model and by provider, with an (unknown) bucket", () => {
+			const byModel = Object.fromEntries(
+				report.worklog.byModel.map((x: { key: string; count: number }) => [x.key, x.count]),
+			);
+			expect(byModel["claude-sonnet-4-5"]).toBe(2);
+			expect(byModel["gpt-5"]).toBe(1);
+			expect(byModel["(unknown)"]).toBe(1);
+
+			const byProvider = Object.fromEntries(
+				report.worklog.byProvider.map((x: { key: string; count: number }) => [x.key, x.count]),
+			);
+			expect(byProvider.anthropic).toBe(2);
+			expect(byProvider.openai).toBe(1);
+			expect(byProvider["(unknown)"]).toBe(1);
+		});
 	});
 
 	it("surfaces ast-grep tool errors as a smell", () => {

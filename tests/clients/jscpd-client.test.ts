@@ -39,7 +39,15 @@ describe("jscpd-client", () => {
 		const { JscpdClient } = await import("../../clients/jscpd-client.js");
 		const safeSpawnMod = await import("../../clients/safe-spawn.js");
 		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-jscpd-managed-");
-		const managed = "/fake/managed/jscpd";
+		// Must be fully qualified under the HOST's semantics (`isFullyQualified`
+		// in clients/path-utils.ts), not just POSIX-absolute — on win32 a
+		// leading "/" alone is ambient-drive-relative, not fully qualified, so
+		// a bare "/fake/managed/jscpd" silently fails the client's
+		// `isFullyQualified(resolved)` gate and the client falls through to
+		// npx instead of the managed path (#1491).
+		const managed = process.platform === "win32"
+			? String.raw`C:\fake\managed\jscpd.exe`
+			: "/fake/managed/jscpd";
 		try {
 			fs.writeFileSync(path.join(tmpDir, "src.ts"), "const x = 1;\n");
 			ensureTool.mockResolvedValue(managed);

@@ -107,3 +107,146 @@ describe("raceToCompletion", () => {
 		expect(result).toHaveLength(0);
 	});
 });
+
+// #1458 S2: PromiseDescriptor.budgetMs caps the aux-grace window at
+// min(auxGraceMs ceiling, max(budgetMs of still-pending auxiliaries)) —
+// the same declared-budget-capped-by-ceiling shape touchFile's per-server
+// aux wait uses, extended to the shared raceToCompletion timer.
+describe("raceToCompletion — auxiliary budgetMs (#1458 S2)", () => {
+	beforeEach(() => {
+		vi.useFakeTimers();
+	});
+
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	it("shortens the aux-grace window to a declared budget below the ceiling", async () => {
+		const primary = new Promise<{ id: string; count: number }>((resolve) =>
+			setTimeout(() => resolve({ id: "primary", count: 1 }), 100),
+		);
+		// Declared budget (300ms) is well under the 2000ms ceiling — the window
+		// must be capped at ~300ms, not stretched to the ceiling.
+		const aux = new Promise<{ id: string; count: number }>((resolve) =>
+			setTimeout(() => resolve({ id: "aux", count: 1 }), 5000),
+		);
+
+		const resultPromise = raceToCompletion(
+			[primary, aux],
+			(results) => results.some((r) => r.count > 0),
+			{
+				timeoutMs: 10000,
+				graceMs: 0,
+				descriptors: [
+					{ role: "primary" },
+					{ role: "auxiliary", budgetMs: 300 },
+				],
+				auxGraceMs: 2000,
+			},
+		);
+
+		await vi.advanceTimersByTimeAsync(100); // primary settles
+		await vi.advanceTimersByTimeAsync(300); // declared budget elapses
+		await vi.advanceTimersByTimeAsync(10);
+
+		const result = await resultPromise;
+		expect(result).toHaveLength(1);
+		expect(result[0].id).toBe("primary");
+	});
+
+	it("caps a declared budget above the ceiling at the ceiling", async () => {
+		const primary = new Promise<{ id: string; count: number }>((resolve) =>
+			setTimeout(() => resolve({ id: "primary", count: 1 }), 100),
+		);
+		// Declared budget (3500ms, e.g. opengrep cold-start) exceeds the 2000ms
+		// ceiling — the window must be capped at the ceiling, not the budget.
+		const aux = new Promise<{ id: string; count: number }>((resolve) =>
+			setTimeout(() => resolve({ id: "aux", count: 1 }), 3500),
+		);
+
+		const resultPromise = raceToCompletion(
+			[primary, aux],
+			(results) => results.some((r) => r.count > 0),
+			{
+				timeoutMs: 10000,
+				graceMs: 0,
+				descriptors: [
+					{ role: "primary" },
+					{ role: "auxiliary", budgetMs: 3500 },
+				],
+				auxGraceMs: 2000,
+			},
+		);
+
+		await vi.advanceTimersByTimeAsync(100); // primary settles
+		await vi.advanceTimersByTimeAsync(2000); // ceiling elapses; aux still pending
+		await vi.advanceTimersByTimeAsync(10);
+
+		const result = await resultPromise;
+		expect(result).toHaveLength(1);
+		expect(result[0].id).toBe("primary");
+	});
+
+	it("admits a declared budget within the ceiling that beats a flat short default", async () => {
+		const primary = new Promise<{ id: string; count: number }>((resolve) =>
+			setTimeout(() => resolve({ id: "primary", count: 1 }), 100),
+		);
+		// Warm-run aux answers at 1300ms — within its declared 1800ms budget and
+		// the 2000ms ceiling, but past a flat 500ms default grace.
+		const aux = new Promise<{ id: string; count: number }>((resolve) =>
+			setTimeout(() => resolve({ id: "aux", count: 1 }), 1300),
+		);
+
+		const resultPromise = raceToCompletion(
+			[primary, aux],
+			(results) => results.some((r) => r.count > 0),
+			{
+				timeoutMs: 10000,
+				graceMs: 0,
+				descriptors: [
+					{ role: "primary" },
+					{ role: "auxiliary", budgetMs: 1800 },
+				],
+				auxGraceMs: 2000,
+			},
+		);
+
+		await vi.advanceTimersByTimeAsync(1300);
+		await vi.advanceTimersByTimeAsync(10);
+
+		const result = await resultPromise;
+		expect(result).toHaveLength(2);
+		expect(result.map((r) => r.id).sort()).toEqual(["aux", "primary"]);
+	});
+
+	it("without budgetMs, keeps the flat ceiling as the window (back-compat)", async () => {
+		const primary = new Promise<{ id: string; count: number }>((resolve) =>
+			setTimeout(() => resolve({ id: "primary", count: 1 }), 100),
+		);
+		// Aux resolves well past primary-settle(100) + ceiling(500) = 600, with
+		// margin so it isn't racing the grace timer within the same tick.
+		const aux = new Promise<{ id: string; count: number }>((resolve) =>
+			setTimeout(() => resolve({ id: "aux", count: 1 }), 900),
+		);
+
+		const resultPromise = raceToCompletion(
+			[primary, aux],
+			(results) => results.some((r) => r.count > 0),
+			{
+				timeoutMs: 10000,
+				graceMs: 0,
+				// No budgetMs on the auxiliary descriptor — flat 500ms applies.
+				descriptors: [{ role: "primary" }, { role: "auxiliary" }],
+				auxGraceMs: 500,
+			},
+		);
+
+		await vi.advanceTimersByTimeAsync(100);
+		await vi.advanceTimersByTimeAsync(500);
+		await vi.advanceTimersByTimeAsync(10);
+
+		const result = await resultPromise;
+		expect(result).toHaveLength(1);
+		expect(result[0].id).toBe("primary");
+	});
+});

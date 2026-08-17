@@ -24,14 +24,19 @@
  * alongside.
  *
  * The tail scan is bounded, but the tail can contain prior-session rows. The
- * session-start caller supplies the session boundary, and rows are admitted
- * only when their own UTC timestamp is at or after that boundary. This keeps
- * the same bounded read without reporting historical failures as current, so
- * this module does not additionally instrument the write call sites
- * (`bus-publish.ts`, `clients/lsp/index.ts`'s respawn path) with parallel
- * live counters. That keeps the change contained to one new module + three
- * small call sites (session_start, `/lens-health`, `turn_end`) instead of
- * touching every producer of the two source logs.
+ * `session_start` and `turn_end` callers supply the in-process session
+ * boundary (`runtime.sessionStartedAt`), and rows are admitted only when
+ * their own UTC timestamp is at or after that boundary. `/lens-health` has
+ * no per-session caller to anchor to (it can run at any point, including
+ * outside a turn) so it omits `sessionStartMs` and falls back to
+ * `SMELLS_ROLLING_WINDOW_MS` (24h) — its rendered line is labeled "last 24h
+ * tail-scan" to say so explicitly rather than implying a session-scoped
+ * count it isn't. This keeps the same bounded read without reporting
+ * historical failures as current, so this module does not additionally
+ * instrument the write call sites (`bus-publish.ts`, `clients/lsp/index.ts`'s
+ * respawn path) with parallel live counters. That keeps the change contained
+ * to one new module + three small call sites (session_start, `/lens-health`,
+ * `turn_end`) instead of touching every producer of the two source logs.
  *
  * Smells covered (deliberately a SUBSET — the two the issue named as having
  * gone unnoticed; the full catalogue stays in the manual analyzer):
@@ -55,6 +60,7 @@ import { getGlobalPiLensDir } from "./file-utils.js";
 
 /** Bounded tail-read budget PER source log file — never a full-file scan. */
 export const SMELLS_TAIL_BYTES_PER_FILE = 64 * 1024;
+export const SMELLS_ROLLING_WINDOW_MS = 24 * 60 * 60_000;
 
 /** Re-check cadence at `turn_end`, mirroring `memory-sampler.ts`'s pattern —
  *  cheap enough (bounded ~128KB I/O) not to need finer throttling, but a
@@ -178,6 +184,7 @@ export function countRecentSmells(
 	root: string = getGlobalPiLensDir(),
 	sessionStartMs?: number,
 ): SmellsRollupCounts {
+	const sinceMs = sessionStartMs ?? Date.now() - SMELLS_ROLLING_WINDOW_MS;
 	const busTail = tailReadText(
 		path.join(root, "bus-events.log"),
 		SMELLS_TAIL_BYTES_PER_FILE,
@@ -190,12 +197,12 @@ export function countRecentSmells(
 		staleCtxEmitFailed: countMatchingLines(
 			busTail,
 			isStaleCtxEmitFailed,
-			sessionStartMs,
+			sinceMs,
 		),
 		opengrepRespawn: countMatchingLines(
 			latencyTail,
 			isOpengrepRespawn,
-			sessionStartMs,
+			sinceMs,
 		),
 	};
 }
@@ -228,7 +235,7 @@ export function formatSmellsSessionStartLine(
  */
 export function formatSmellsHealthLine(counts: SmellsRollupCounts): string {
 	return (
-		`Smells (recent tail-scan): stale-ctx emit_failed=${counts.staleCtxEmitFailed}` +
+		`Smells (last 24h tail-scan): stale-ctx emit_failed=${counts.staleCtxEmitFailed}` +
 		` · opengrep respawn=${counts.opengrepRespawn}`
 	);
 }

@@ -100,4 +100,39 @@ describe("deferred cascade settle (#450)", () => {
 		expect(settled).toBe(0);
 		expect(timedOut).toBe(0);
 	});
+	// #1443: a run appended AFTER a turn_end consumed (the quiet-window reconcile's
+	// late re-injection) has never reached the agent — turn_start must carry it
+	// instead of wiping it, and must carry it for exactly ONE turn.
+	it("carries a post-consumption run across one turn boundary", () => {
+		const runtime = new RuntimeCoordinator();
+		runtime.beginTurn();
+		expect(runtime.consumeCascadeRuns()).toHaveLength(0);
+		runtime.appendCascadeRun(run("late-neighbor.ts"));
+
+		runtime.beginTurn();
+		const carried = runtime.consumeCascadeRuns();
+		expect(carried.map((r) => r.filePath)).toEqual(["late-neighbor.ts"]);
+		expect(carried[0]?.carriedTurns).toBe(1);
+
+		// Consumed once: nothing is left to replay on the turn after that.
+		runtime.beginTurn();
+		expect(runtime.consumeCascadeRuns()).toHaveLength(0);
+	});
+
+	it("drops a carried run the NEXT turn_end never consumed (one-turn bound)", () => {
+		const runtime = new RuntimeCoordinator();
+		runtime.appendCascadeRun(run("never-consumed.ts"));
+
+		runtime.beginTurn(); // carried once
+		runtime.beginTurn(); // that turn_end never ran — drop, do not queue forever
+		expect(runtime.consumeCascadeRuns()).toHaveLength(0);
+	});
+
+	it("clears carried runs on session reset", () => {
+		const runtime = new RuntimeCoordinator();
+		runtime.appendCascadeRun(run("late-neighbor.ts"));
+		runtime.resetForSession();
+		runtime.beginTurn();
+		expect(runtime.consumeCascadeRuns()).toHaveLength(0);
+	});
 });

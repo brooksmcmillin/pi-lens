@@ -25,8 +25,14 @@ export interface HostPorts {
 		sink(subsystem: string): HostLogSink;
 	};
 	readonly emit: {
+		/**
+		 * Every `pi.events` publish, including the `pi-lens/*` producer family
+		 * (clients/lens-events.ts). A separate `.lens` port existed briefly but
+		 * was never wired to anything but this same `emit` function — removed
+		 * as vestigial (#1415 review) rather than kept as a distinction with no
+		 * behavioral difference.
+		 */
 		bus(channel: string, payload: unknown): void;
-		lens(channel: string, payload: unknown): void;
 	};
 	readonly status: {
 		set(name: string, value: string): void;
@@ -77,7 +83,7 @@ export function createDefaultHostPorts(
 			suppressesUserNotify: () => false,
 		},
 		log: { extension: () => {}, debug: () => {}, sink: () => () => {} },
-		emit: { bus: () => {}, lens: () => {} },
+		emit: { bus: () => {} },
 		status: { set: () => {} },
 		spawn: { abortSignal: () => undefined, isAllowed: () => true },
 		render: { invalidate: () => {} },

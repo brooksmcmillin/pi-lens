@@ -641,6 +641,29 @@ describe("mark telemetry (#690 — NDJSON log + pilens:diagnostic:disposition)",
 		expect(logDispositionEvent).toHaveBeenCalledTimes(1);
 	});
 
+	it("attributes the mark to model/provider when an identity is supplied (#1448)", () => {
+		markDisposition(
+			cwd(),
+			{ cwd: cwd(), filePath: filePath(), ...diag, content },
+			"flagged",
+			undefined,
+			{ model: "claude-sonnet-4-5", provider: "anthropic" },
+		);
+		expect(logDispositionEvent).toHaveBeenCalledWith(
+			expect.objectContaining({
+				model: "claude-sonnet-4-5",
+				provider: "anthropic",
+			}),
+		);
+	});
+
+	it("leaves model/provider blank when no identity is supplied", () => {
+		mark("flagged");
+		expect(logDispositionEvent).toHaveBeenCalledWith(
+			expect.objectContaining({ model: undefined, provider: undefined }),
+		);
+	});
+
 	it("swallows an emit throw — the mark itself must never fail on telemetry", () => {
 		wireDispositionBusEmitter(() => {
 			throw new Error("bus explosion");

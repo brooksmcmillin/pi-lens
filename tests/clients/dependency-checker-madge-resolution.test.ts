@@ -29,6 +29,18 @@ const ensureTool = vi.fn();
 // tests that care about staleness override it explicitly.
 const isSpawnableCommand = vi.fn();
 const MANAGED_TOOLS_DIR = path.join(os.tmpdir(), "pilens-fake-home", "tools");
+// Fake absolute paths standing in for a global-bin install, OUTSIDE the
+// managed tree and any project root. Must be fully qualified under the
+// HOST's semantics (`isFullyQualified` in clients/path-utils.ts) — on win32
+// a bare "/usr/..." literal is ambient-drive-relative, not fully qualified,
+// so `classifyMadgeKind`'s `isFullyQualified(resolved)` gate silently
+// classifies it as "path" instead of "global" (same defect shape as #1491).
+const GLOBAL_BIN_1 = process.platform === "win32"
+	? String.raw`C:\fake-global\local\bin\madge`
+	: "/usr/local/bin/madge";
+const GLOBAL_BIN_2 = process.platform === "win32"
+	? String.raw`C:\fake-global\bin\madge`
+	: "/usr/bin/madge";
 
 vi.mock("../../clients/safe-spawn.js", () => ({ safeSpawnAsync, safeSpawn }));
 vi.mock("../../clients/package-manager.js", () => ({ findNodeToolBinary }));
@@ -109,9 +121,7 @@ describe("DependencyChecker madge resolution (#766)", () => {
 		);
 		// findNodeToolBinary probes npm/pnpm/yarn/bun GLOBAL bins too, so the step
 		// that answered says nothing about where the binary lives.
-		findNodeToolBinary.mockResolvedValue(
-			path.posix.join("/", "usr", "local", "bin", "madge"),
-		);
+		findNodeToolBinary.mockResolvedValue(GLOBAL_BIN_1);
 
 		const { stats } = await new DependencyChecker().checkFilesBatch(
 			[writeSource("a.ts", ["./b.js"])],
@@ -167,7 +177,7 @@ describe("DependencyChecker madge resolution (#766)", () => {
 		expect(bare.stats.commandKind).toBe("path");
 
 		// ...or an absolute path outside the managed tree.
-		ensureTool.mockResolvedValue(path.posix.join("/", "usr", "bin", "madge"));
+		ensureTool.mockResolvedValue(GLOBAL_BIN_2);
 		const global = await new DependencyChecker().checkFilesBatch(
 			[writeSource("b.ts", ["./c.js"])],
 			tmp,

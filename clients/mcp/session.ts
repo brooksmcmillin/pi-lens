@@ -324,8 +324,8 @@ async function runTurnEndNow(
 
 	const outcome: TurnEndOutcome = deferredDelivery
 		? {
-				turnEnd: joinMessages(peekTurnEndFindings(ctx.cacheManager, cwd, ctx.runtime)),
-				tests: joinMessages(peekTestFindings(ctx.cacheManager, cwd, ctx.runtime)),
+				turnEnd: joinMessages(peekTurnEndFindings(ctx.cacheManager, cwd, ctx.runtime, true)),
+				tests: joinMessages(peekTestFindings(ctx.cacheManager, cwd, ctx.runtime, true)),
 				filesRegistered: registered,
 			}
 		: {
@@ -422,8 +422,8 @@ function runTurnEndForIpcNow(cwd: string): Promise<TurnEndDelivery> {
 
 		const ctx = await getMcpSessionContext();
 		const cachedOutcome: TurnEndOutcome = {
-			turnEnd: joinMessages(peekTurnEndFindings(ctx.cacheManager, cwd, ctx.runtime)),
-			tests: joinMessages(peekTestFindings(ctx.cacheManager, cwd, ctx.runtime)),
+			turnEnd: joinMessages(peekTurnEndFindings(ctx.cacheManager, cwd, ctx.runtime, true)),
+			tests: joinMessages(peekTestFindings(ctx.cacheManager, cwd, ctx.runtime, true)),
 			filesRegistered: 0,
 		};
 		const transaction = hasTurnEndFindings(cachedOutcome)

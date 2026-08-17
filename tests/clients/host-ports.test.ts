@@ -25,7 +25,6 @@ describe("HostPorts contract (#1358 S2)", () => {
 			ports.log.debug("x");
 			ports.log.sink("test")({ x: 1 });
 			ports.emit.bus("x", {});
-			ports.emit.lens("x", {});
 			ports.status.set("x", "y");
 			ports.render.invalidate();
 			ports.tools.setActive(["x"]);
@@ -39,7 +38,7 @@ describe("HostPorts contract (#1358 S2)", () => {
 			trust: { isProjectTrusted: () => "trusted" },
 			mode: { current: () => "rpc", supportsTuiWidget: () => false, suppressesUserNotify: () => false },
 			log: { extension: () => called.push("extension"), debug: () => called.push("debug"), sink: () => () => called.push("sink") },
-			emit: { bus: () => called.push("bus"), lens: () => called.push("lens") },
+			emit: { bus: () => called.push("bus") },
 			status: { set: () => called.push("status") },
 			spawn: { abortSignal: () => AbortSignal.abort(), isAllowed: () => false },
 			render: { invalidate: () => called.push("render") },
@@ -49,7 +48,7 @@ describe("HostPorts contract (#1358 S2)", () => {
 			tools: { has: async () => true, getActive: () => ["read"], setActive: () => called.push("tools") },
 		});
 		fake.notify.user("x"); fake.log.extension({ subsystem: "x", message: "x" }); fake.log.debug("x"); fake.log.sink("x")({});
-		fake.emit.bus("x", {}); fake.emit.lens("x", {}); fake.status.set("x", "x"); fake.render.invalidate(); fake.tools.setActive([]);
+		fake.emit.bus("x", {}); fake.status.set("x", "x"); fake.render.invalidate(); fake.tools.setActive([]);
 		expect(fake.trust.isProjectTrusted()).toBe("trusted");
 		expect(fake.mode.current()).toBe("rpc");
 		expect(fake.spawn.abortSignal()?.aborted).toBe(true);
@@ -60,7 +59,7 @@ describe("HostPorts contract (#1358 S2)", () => {
 		expect(fake.flags.get("x")).toBe(true);
 		expect(await fake.tools.has("x")).toBe(true);
 		expect(fake.tools.getActive()).toEqual(["read"]);
-		expect(called).toEqual(["notify", "extension", "debug", "sink", "bus", "lens", "status", "render", "tools"]);
+		expect(called).toEqual(["notify", "extension", "debug", "sink", "bus", "status", "render", "tools"]);
 	});
 
 	// #1367 review: parity must be proven against the REAL adapter fed an

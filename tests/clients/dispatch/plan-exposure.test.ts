@@ -83,6 +83,7 @@ describe("dispatch plan exposure", () => {
 	it("routes tpl helpers through the explicit Helm template plan", () => {
 		expect(flattenRunnerIds(TOOL_PLANS["helm-template"])).toEqual([
 			"helm-lint",
+			"helm-render",
 		]);
 	});
 

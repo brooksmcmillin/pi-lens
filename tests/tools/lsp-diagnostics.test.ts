@@ -1130,6 +1130,181 @@ describe("lsp_diagnostics tool", () => {
 			}
 		});
 
+		it("a cut-off auxiliary demotes the file verdict but keeps the primary line honest (#1470)", async () => {
+			// The narrowing, end to end on the tool that IS the security lane's read
+			// surface. The primary confirmed clean; opengrep was cut off. Pre-fix
+			// this rendered "Primary LSP: confirmed clean." + "No auxiliary
+			// findings." with `unconfirmed: false` — a clean bill of health for a
+			// scan that never ran. It must now say which coverage is missing WITHOUT
+			// claiming the primary failed to confirm (that would be the same
+			// overclaim pointing the other way).
+			mocked.cascadeTier = "tier3-silent";
+			(mocked.service as any).touchFile = vi.fn().mockResolvedValue({
+				diags: [],
+				confirmation: "partial",
+				unconfirmedServerIds: ["opengrep"],
+			});
+			const tmpDir = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-marksman-cutoff-"),
+			);
+			const file = path.join(tmpDir, "README.md");
+			fs.writeFileSync(file, "# Example\n");
+
+			try {
+				const result = await runMarkdown(
+					{ path: file, severity: "all", serverScope: "all", waitMs: 500 },
+					[file],
+				);
+				const text = result.content?.[0]?.text ?? "";
+				expect(result.details?.unconfirmed).toBe(true);
+				expect(result.details?.unconfirmedServerIds).toEqual(["opengrep"]);
+				expect(text).toContain("Auxiliary coverage INCOMPLETE");
+				expect(text).toContain("opengrep");
+				// The primary's own verdict is untouched — no silent-on-clean text.
+				expect(text).not.toContain("push-only, silent-on-clean");
+			} finally {
+				removeTempDirSync(tmpDir);
+			}
+		});
+
+		// #1470 F2: the WARM-ATTACH consumer path. A warm session never reaches the
+		// local `touchFile` branch above — `isWarmAttached()` sends every file to
+		// the incumbent instead — so the two tests below are the ones that actually
+		// cover the default route. Without them, dropping
+		// `attached.response.unconfirmedServerIds` or narrowing the incumbent's
+		// `confirmation !== undefined` check back to `=== "confirmed"` restores the
+		// exact pre-fix false clean while the whole tools suite stays green.
+		it("carries the INCUMBENT's coverage gap into the rendered result (#1470)", async () => {
+			// Non-empty result on purpose: this is the `total > 0` render branch,
+			// where the coverage line is appended after the findings rather than
+			// after "No auxiliary findings." Both branches must say it.
+			mocked.warmAttached = true;
+			mocked.attachedDiagnostics.mockResolvedValue({
+				available: true,
+				response: {
+					diagnostics: [
+						{
+							severity: 1,
+							message: "from incumbent",
+							range: {
+								start: { line: 0, character: 0 },
+								end: { line: 0, character: 1 },
+							},
+							source: "marksman",
+						},
+					],
+					confirmation: "partial",
+					unconfirmedServerIds: ["opengrep"],
+				},
+			});
+			const tmpDir = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-attached-cutoff-findings-"),
+			);
+			const file = path.join(tmpDir, "README.md");
+			fs.writeFileSync(file, "# Example\n");
+
+			try {
+				const result = await runMarkdown(
+					{ path: file, severity: "all", serverScope: "all", waitMs: 500 },
+					[file],
+				);
+				const text = result.content?.[0]?.text ?? "";
+				expect(result.details?.unconfirmedServerIds).toEqual(["opengrep"]);
+				expect(text).toContain("from incumbent");
+				expect(text).toContain("Auxiliary coverage INCOMPLETE");
+				expect(text).toContain("opengrep");
+			} finally {
+				removeTempDirSync(tmpDir);
+			}
+		});
+
+		it("an INCUMBENT partial confirmation still counts as the primary's confirmation (#1470)", async () => {
+			// The other half of the warm-attach consumer contract. Reading the
+			// incumbent's verdict as `=== "confirmed"` looks safely fail-closed, but
+			// it drops the primary's real confirmation on the floor and renders the
+			// silent-on-clean apology for a primary that DID confirm — the same
+			// overclaim pointing the other way. The honest output demotes the FILE
+			// verdict and names the scanner, nothing more.
+			mocked.cascadeTier = "tier3-silent";
+			mocked.warmAttached = true;
+			mocked.attachedDiagnostics.mockResolvedValue({
+				available: true,
+				response: {
+					diagnostics: [],
+					confirmation: "partial",
+					unconfirmedServerIds: ["opengrep"],
+				},
+			});
+			const tmpDir = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-attached-cutoff-clean-"),
+			);
+			const file = path.join(tmpDir, "README.md");
+			fs.writeFileSync(file, "# Example\n");
+
+			try {
+				const result = await runMarkdown(
+					{ path: file, severity: "all", serverScope: "all", waitMs: 500 },
+					[file],
+				);
+				const text = result.content?.[0]?.text ?? "";
+				expect(result.details?.unconfirmed).toBe(true);
+				expect(result.details?.unconfirmedServerIds).toEqual(["opengrep"]);
+				expect(text).toContain("Auxiliary coverage INCOMPLETE");
+				expect(text).not.toContain("push-only, silent-on-clean");
+			} finally {
+				removeTempDirSync(tmpDir);
+			}
+		});
+
+		// #1470 F3: the BATCH/directory route has its own demotion site
+		// (`collectFileDiagnosticResult`), and its own consequence — the persisted
+		// workspace-diagnostics cache, whose write gate is `confirmation !==
+		// "unconfirmed"`. Without the demotion a partially covered batch result is
+		// recorded as a confirmed clean and replayed by every later sweep, so the
+		// false clean outlives the touch that produced it.
+		it("a batch file whose auxiliary was cut off is neither counted clean nor cached (#1470)", async () => {
+			mocked.cascadeTier = "tier3-silent";
+			const touchFile = vi.fn().mockResolvedValue({
+				diags: [],
+				confirmation: "partial",
+				unconfirmedServerIds: ["opengrep"],
+			});
+			(mocked.service as any).touchFile = touchFile;
+			const tmpDir = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-batch-cutoff-"),
+			);
+			const dataDir = path.join(tmpDir, "data");
+			const previousDataDir = process.env.PILENS_DATA_DIR;
+			process.env.PILENS_DATA_DIR = dataDir;
+			const file = path.join(tmpDir, "README.md");
+			fs.writeFileSync(file, "# Example\n");
+
+			try {
+				const first = await runMarkdown(
+					{ paths: [file], severity: "all", serverScope: "all", waitMs: 500 },
+					[file],
+				);
+				expect(first.details?.cleanFiles).toBe(0);
+				expect(first.details?.unconfirmedFiles).toBe(1);
+
+				// The replay half: a second batch over the same unchanged file must
+				// still pay a real touch. A cached "clean" entry would serve the
+				// lookup instead, and the partial answer would read as confirmed
+				// forever after.
+				touchFile.mockClear();
+				const second = await runMarkdown(
+					{ paths: [file], severity: "all", serverScope: "all", waitMs: 500 },
+					[file],
+				);
+				expect(touchFile).toHaveBeenCalledTimes(1);
+				expect(second.details?.cleanFiles).toBe(0);
+			} finally {
+				if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+				else process.env.PILENS_DATA_DIR = previousDataDir;
+				removeTempDirSync(tmpDir);
+			}
+		});
+
 		it("missing confirmation metadata stays unconfirmed and does not try a TypeScript command", async () => {
 			mocked.cascadeTier = "tier3-silent";
 			const getAdvertisedCommands = vi.fn().mockResolvedValue([]);

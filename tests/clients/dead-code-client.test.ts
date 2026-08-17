@@ -14,7 +14,9 @@ import { describe, expect, it } from "vitest";
 import {
 	PythonDeadCodeClient,
 	parseVultureOutput,
-	formatDeadCodeAdvisory,
+	deadCodeIssueKey,
+	deadCodeIssues,
+	formatDeadCodeDelta,
 	deadCodeIssueCount,
 	getDeadCodeClients,
 	type DeadCodeResult,
@@ -198,7 +200,18 @@ describe("getDeadCodeClients", () => {
 	});
 });
 
-describe("formatDeadCodeAdvisory", () => {
+describe("PythonDeadCodeClient.owns", () => {
+	it("claims Python sources only, so a JS-only turn skips the re-scan", () => {
+		const client = new PythonDeadCodeClient();
+		expect(client.owns("/repo/pkg/mod.py")).toBe(true);
+		expect(client.owns("/repo/pkg/mod.PY")).toBe(true);
+		expect(client.owns("/repo/pkg/stub.pyi")).toBe(true);
+		expect(client.owns("/repo/src/app.ts")).toBe(false);
+		expect(client.owns("/repo/README.md")).toBe(false);
+	});
+});
+
+describe("dead-code turn delta helpers", () => {
 	const result = (over: Partial<DeadCodeResult>): DeadCodeResult => ({
 		success: true,
 		language: "Python",
@@ -209,45 +222,52 @@ describe("formatDeadCodeAdvisory", () => {
 		summary: "",
 		...over,
 	});
-
-	it("returns empty string when there are no findings", () => {
-		expect(formatDeadCodeAdvisory([result({})])).toBe("");
-		expect(formatDeadCodeAdvisory([result({ success: false })])).toBe("");
+	const issue = (name: string, line: number) => ({
+		category: "export" as const,
+		kind: "function",
+		name,
+		file: "mod.py",
+		line,
+		confidence: 60,
 	});
 
-	it("lists symbols under a single heading and caps with a +more line", () => {
-		const exports = Array.from({ length: 12 }, (_, i) => ({
-			category: "export" as const,
-			kind: "function",
-			name: `f${i}`,
-			file: "mod.py",
-			line: i + 1,
-			confidence: 60,
-		}));
-		const out = formatDeadCodeAdvisory([result({ unusedExports: exports })], 10);
-		expect(out).toContain("[Dead code]");
-		expect(out).toContain("Python: 12 unused symbol(s)");
-		expect(out).toContain("unused function 'f0' (mod.py:1)");
+	it("flattens every bucket so no finding escapes the diff", () => {
+		const r = result({
+			unusedExports: [issue("a", 1)],
+			unusedFiles: [{ category: "file", kind: "file", name: "orphan.py" }],
+		});
+		expect(deadCodeIssues(r).map((i) => i.name)).toEqual(["a", "orphan.py"]);
+		expect(deadCodeIssueCount(r)).toBe(2);
+	});
+
+	it("keys an issue by category/file/name so a moved symbol is not new", () => {
+		expect(deadCodeIssueKey(issue("a", 1))).toBe("export:mod.py:a");
+		expect(deadCodeIssueKey(issue("a", 1))).toBe(deadCodeIssueKey(issue("a", 2)));
+	});
+});
+
+describe("formatDeadCodeDelta", () => {
+	const issue = (name: string, line: number) => ({
+		category: "export" as const,
+		kind: "function",
+		name,
+		file: "mod.py",
+		line,
+		confidence: 60,
+	});
+
+	it("returns empty string when the edit created nothing", () => {
+		expect(formatDeadCodeDelta([], "Python")).toBe("");
+	});
+
+	it("names the edited symbols and caps with a +more line", () => {
+		const out = formatDeadCodeDelta(
+			Array.from({ length: 7 }, (_, i) => issue(`f${i}`, i + 1)),
+			"Python",
+		);
+		expect(out).toContain("Newly unused Python symbols in files you edited");
+		expect(out).toContain("mod.py:1 — unused function f0");
 		expect(out).toContain("… and 2 more");
-	});
-
-	it("merges multiple languages under one heading", () => {
-		const py = result({
-			language: "Python",
-			unusedExports: [
-				{ category: "export", kind: "function", name: "a", file: "x.py" },
-			],
-		});
-		const go = result({
-			language: "Go",
-			unusedExports: [
-				{ category: "export", kind: "func", name: "B", file: "y.go" },
-			],
-		});
-		const out = formatDeadCodeAdvisory([py, go]);
-		expect(out).toContain("Python: 1 unused symbol(s)");
-		expect(out).toContain("Go: 1 unused symbol(s)");
-		expect(deadCodeIssueCount(py)).toBe(1);
 	});
 });
 
@@ -261,6 +281,9 @@ describe("PythonDeadCodeClient.analyze (integration, real vulture)", () => {
 			const names = result.unusedExports.map((i) => i.name);
 			expect(names).toContain("unused_func");
 			expect(names).toContain("UnusedClass");
+			// Framework-invoked symbols have no visible call site, so reporting them
+			// is permanent noise the reader can never resolve (--ignore-decorators).
+			expect(names).not.toContain("framework_called_fixture");
 			// file paths are project-relative
 			expect(result.unusedExports[0]?.file).not.toContain(PY_FIXTURE);
 		},

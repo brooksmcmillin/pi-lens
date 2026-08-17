@@ -119,7 +119,7 @@ describe("extension-log sink (#1333)", () => {
 });
 
 describe("console guard (#1333)", () => {
-	it("reroutes console.* into the sink and is idempotent", async () => {
+	it("reroutes console.* into the sink inside a window and is idempotent", async () => {
 		const sink = await loadSink();
 		const original = console.error;
 		expect(sink.installConsoleGuard()).toBe(true);
@@ -127,13 +127,15 @@ describe("console guard (#1333)", () => {
 		try {
 			expect(console.error).not.toBe(original);
 			const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
-			console.error("rogue dependency line", { detail: 1 });
-			console.log("rogue stdout line");
+			sink.runInConsoleCaptureWindow(() => {
+				console.error("rogue dependency line", { detail: 1 });
+				console.log("rogue stdout line");
+			});
 			expect(stderr).not.toHaveBeenCalled();
 			stderr.mockRestore();
 			await sink.flushExtensionLog();
 		} finally {
-			console.error = original;
+			sink.uninstallConsoleGuard();
 		}
 
 		const lines = readLines(sink.getExtensionLogPath()).filter(
@@ -154,5 +156,207 @@ describe("console guard (#1333)", () => {
 		process.env.PI_LENS_CONSOLE_GUARD = "0";
 		sink = await loadSink();
 		expect(sink.installConsoleGuard()).toBe(false);
+	});
+});
+
+/**
+ * The guard used to replace console globally and permanently, so pi's own
+ * one-shot CLI commands printed nothing: `pi list` exited 0 with no output in
+ * any project whose cwd loaded the extension first. The guard now captures only
+ * while pi-lens owns execution.
+ */
+describe("console guard capture windows (#1434)", () => {
+	/** Console methods the sink patches, captured before any install. */
+	function snapshotConsole(): Record<string, unknown> {
+		const target = console as unknown as Record<string, unknown>;
+		return Object.fromEntries(
+			["log", "info", "warn", "error", "debug", "trace", "dir"].map((name) => [
+				name,
+				target[name],
+			]),
+		);
+	}
+
+	function consoleLines(sink: {
+		getExtensionLogPath(): string;
+	}): [unknown, unknown][] {
+		return readLines(sink.getExtensionLogPath())
+			.filter((l) => l.subsystem === "console")
+			.map((l) => [l.level, l.message]);
+	}
+
+	it("lets host output outside every window reach the real console", async () => {
+		const sink = await loadSink();
+		const seen: unknown[][] = [];
+		const originalLog = console.log;
+		console.log = (...args: unknown[]): void => {
+			seen.push(args);
+		};
+		try {
+			expect(sink.installConsoleGuard()).toBe(true);
+			// The host CLI printing its own command output — no pi-lens frame on
+			// the stack, so this must land on the real sink.
+			console.log("pi list output");
+			await sink.flushExtensionLog();
+			expect(seen).toEqual([["pi list output"]]);
+			expect(consoleLines(sink)).toEqual([]);
+		} finally {
+			sink.uninstallConsoleGuard();
+			console.log = originalLog;
+		}
+	});
+
+	it("captures a write from inside a window, including after an await", async () => {
+		const sink = await loadSink();
+		const seen: unknown[][] = [];
+		const originalLog = console.log;
+		console.log = (...args: unknown[]): void => {
+			seen.push(args);
+		};
+		try {
+			sink.installConsoleGuard();
+			await sink.runInConsoleCaptureWindow(async () => {
+				console.log("sync inside the window");
+				await new Promise((resolve) => setTimeout(resolve, 1));
+				console.log("async continuation inside the window");
+			});
+			console.log("back on host time");
+			await sink.flushExtensionLog();
+			expect(seen).toEqual([["back on host time"]]);
+			expect(consoleLines(sink)).toEqual([
+				["debug", "sync inside the window"],
+				["debug", "async continuation inside the window"],
+			]);
+		} finally {
+			sink.uninstallConsoleGuard();
+			console.log = originalLog;
+		}
+	});
+
+	it("captures module evaluation until the module window closes", async () => {
+		const sink = await loadSink();
+		const seen: unknown[][] = [];
+		const originalLog = console.log;
+		console.log = (...args: unknown[]): void => {
+			seen.push(args);
+		};
+		try {
+			sink.installConsoleGuard();
+			sink.openModuleLoadConsoleWindow();
+			expect(sink.isConsoleCaptureActive()).toBe(true);
+			console.log("dependency init noise");
+			sink.closeModuleLoadConsoleWindow();
+			expect(sink.isConsoleCaptureActive()).toBe(false);
+			console.log("host output after load");
+			await sink.flushExtensionLog();
+			expect(seen).toEqual([["host output after load"]]);
+			expect(consoleLines(sink)).toEqual([["debug", "dependency init noise"]]);
+		} finally {
+			sink.uninstallConsoleGuard();
+			sink.closeModuleLoadConsoleWindow();
+			console.log = originalLog;
+		}
+	});
+
+	it("leaves console untouched under PI_LENS_CONSOLE_GUARD=0", async () => {
+		process.env.PI_LENS_CONSOLE_GUARD = "0";
+		const sink = await loadSink();
+		const before = snapshotConsole();
+		const seen: unknown[][] = [];
+		const originalLog = console.log;
+		console.log = (...args: unknown[]): void => {
+			seen.push(args);
+		};
+		try {
+			expect(sink.installConsoleGuard()).toBe(false);
+			sink.openModuleLoadConsoleWindow();
+			console.log("kill switch keeps this visible");
+			expect(seen).toEqual([["kill switch keeps this visible"]]);
+			await sink.flushExtensionLog();
+			expect(consoleLines(sink)).toEqual([]);
+		} finally {
+			sink.closeModuleLoadConsoleWindow();
+			console.log = originalLog;
+		}
+		for (const name of Object.keys(before)) {
+			expect((console as unknown as Record<string, unknown>)[name]).toBe(
+				before[name],
+			);
+		}
+	});
+
+	it("restores the exact original methods and reinstalls cleanly", async () => {
+		const sink = await loadSink();
+		const before = snapshotConsole();
+		expect(sink.installConsoleGuard()).toBe(true);
+		expect(console.log).not.toBe(before.log);
+		expect(sink.uninstallConsoleGuard()).toBe(true);
+		for (const name of Object.keys(before)) {
+			expect((console as unknown as Record<string, unknown>)[name]).toBe(
+				before[name],
+			);
+		}
+		// Idempotent: a second uninstall reports that it did nothing.
+		expect(sink.uninstallConsoleGuard()).toBe(false);
+		// A later window must not resurrect the patch on its own.
+		sink.runInConsoleCaptureWindow(() => {
+			expect(console.log).toBe(before.log);
+		});
+		expect(sink.installConsoleGuard()).toBe(true);
+		expect(console.log).not.toBe(before.log);
+		expect(sink.uninstallConsoleGuard()).toBe(true);
+		expect(console.log).toBe(before.log);
+	});
+
+	it("opens a window around every handler and tool registered through the API", async () => {
+		const sink = await loadSink();
+		// #1434 S1b: the capture-window AsyncLocalStorage is now built lazily,
+		// and only once the guard has actually installed -- install it first so
+		// runInConsoleCaptureWindow (which inCaptureWindow calls under the hood)
+		// does not treat "guard never installed" as "no window" here.
+		expect(sink.installConsoleGuard()).toBe(true);
+		const handlers = new Map<string, (...args: unknown[]) => unknown>();
+		const tools: { execute?: (...args: unknown[]) => unknown }[] = [];
+		const hostApi = {
+			on(event: string, handler: (...args: unknown[]) => unknown) {
+				handlers.set(event, handler);
+				return this;
+			},
+			registerTool(tool: { execute?: (...args: unknown[]) => unknown }) {
+				tools.push(tool);
+			},
+			unrelated: 7,
+		};
+		const api = sink.withConsoleCaptureWindows(hostApi);
+		expect(api.unrelated).toBe(7);
+
+		// A chaining host returns `this`; the chain must stay wrapped.
+		expect(api.on("noop", () => {})).toBe(api);
+
+		let handlerSawWindow: boolean | undefined;
+		api.on("session_start", async () => {
+			await new Promise((resolve) => setTimeout(resolve, 1));
+			handlerSawWindow = sink.isConsoleCaptureActive();
+			return "handler-result";
+		});
+		let toolSawWindow: boolean | undefined;
+		const tool = {
+			name: "lens_diagnostics",
+			execute: async () => {
+				toolSawWindow = sink.isConsoleCaptureActive();
+				return "tool-result";
+			},
+		};
+		api.registerTool(tool);
+
+		expect(sink.isConsoleCaptureActive()).toBe(false);
+		await expect(handlers.get("session_start")?.()).resolves.toBe(
+			"handler-result",
+		);
+		await expect(tools[0].execute?.()).resolves.toBe("tool-result");
+		expect(handlerSawWindow).toBe(true);
+		expect(toolSawWindow).toBe(true);
+		expect(sink.isConsoleCaptureActive()).toBe(false);
+		sink.uninstallConsoleGuard();
 	});
 });
