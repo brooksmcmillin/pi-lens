@@ -93,6 +93,7 @@ describe("pi_lens_activate_tools", () => {
 		expect(repeated.details).toEqual({
 			matches: ["ast_grep_search"],
 			added: [],
+			skillPaths: ["/skills/ast/SKILL.md"],
 		});
 		expect(mutations).toEqual([
 			expect.objectContaining({
