@@ -120,7 +120,9 @@ export function paintCompact(
  * Build a `renderResult` for a tool. `summarize` produces the one-line collapsed
  * view from the structured result; the expanded view shows the full payload.
  */
-export function compactRenderResult<D = unknown>(summarize: CompactSummarizer<D>) {
+export function compactRenderResult<D = unknown>(
+	summarize: CompactSummarizer<D>,
+) {
 	return (
 		result: CompactResultLike<D>,
 		options: { expanded: boolean },

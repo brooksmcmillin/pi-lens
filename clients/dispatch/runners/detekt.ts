@@ -10,7 +10,7 @@ import type {
 	RunnerResult,
 } from "../types.js";
 import { createAvailabilityChecker } from "./utils/runner-helpers.js";
-import { spawnFailedWithNoOutput } from "./utils/spawn-outcome.js";
+import { parseToolRun } from "./utils/tool-failure.js";
 
 const detekt = createAvailabilityChecker("detekt", ".bat");
 
@@ -169,12 +169,16 @@ const detektRunner: RunnerDefinition = {
 			{ cwd, timeout: 60000 },
 		);
 
+		// #1948: detekt reports across both streams, so the gate and the parser
+		// read the same concatenated string. A nonzero exit that yields zero
+		// findings out of real output is a parser break, not clean Kotlin.
 		const raw = `${result.stdout ?? ""}${result.stderr ?? ""}`;
-		if (spawnFailedWithNoOutput(result, raw)) {
-			return { status: "skipped", diagnostics: [], semantic: "none" };
-		}
+		const run = parseToolRun("detekt", { result, output: raw }, (out) =>
+			parseDetektOutput(out, ctx.filePath),
+		);
+		if (run.skipped) return run.skipped;
 
-		const diagnostics = parseDetektOutput(raw, ctx.filePath);
+		const diagnostics = run.diagnostics;
 
 		if (diagnostics.length === 0) {
 			return { status: "succeeded", diagnostics: [], semantic: "none" };
@@ -190,4 +194,4 @@ const detektRunner: RunnerDefinition = {
 };
 
 export default detektRunner;
-export { parseDetektOutput, DETEKT_FIXABLE_RULES };
+export { DETEKT_FIXABLE_RULES, parseDetektOutput };

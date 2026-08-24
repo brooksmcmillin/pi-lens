@@ -46,7 +46,9 @@ function loadRawRules(): { file: string; doc: RawRule }[] {
 		.filter((f) => f.endsWith(".yml"))
 		.map((file) => ({
 			file,
-			doc: yaml.load(fs.readFileSync(path.join(RULES_DIR, file), "utf8")) as RawRule,
+			doc: yaml.load(
+				fs.readFileSync(path.join(RULES_DIR, file), "utf8"),
+			) as RawRule,
 		}))
 		.filter((r) => r.doc && r.doc.id && r.doc.rule);
 }

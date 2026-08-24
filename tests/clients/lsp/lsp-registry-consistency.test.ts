@@ -35,7 +35,10 @@ describe("LSP_SERVERS registry consistency", () => {
 			expect(typeof s.spawn, `spawn on ${s.id}`).toBe("function");
 			expect(typeof s.root, `root on ${s.id}`).toBe("function");
 			expect(Array.isArray(s.extensions), `extensions on ${s.id}`).toBe(true);
-			expect(s.extensions.length, `non-empty extensions on ${s.id}`).toBeGreaterThan(0);
+			expect(
+				s.extensions.length,
+				`non-empty extensions on ${s.id}`,
+			).toBeGreaterThan(0);
 		}
 	});
 
@@ -57,7 +60,9 @@ describe("LSP_SERVERS registry consistency", () => {
 	it("server ids are globally unique", () => {
 		const seen = new Map<string, number>();
 		for (const s of LSP_SERVERS) seen.set(s.id, (seen.get(s.id) ?? 0) + 1);
-		const dupes = [...seen.entries()].filter(([, n]) => n > 1).map(([id]) => id);
+		const dupes = [...seen.entries()]
+			.filter(([, n]) => n > 1)
+			.map(([id]) => id);
 		expect(dupes, `duplicate server ids: ${dupes.join(", ")}`).toEqual([]);
 	});
 
@@ -69,16 +74,20 @@ describe("LSP_SERVERS registry consistency", () => {
 			for (const ext of s.extensions) {
 				expect(typeof ext, `${s.id} extension type`).toBe("string");
 				expect(ext.length, `${s.id} empty extension`).toBeGreaterThan(0);
-				expect(ext, `${s.id} extension "${ext}" has separator/space`).not.toMatch(
-					/[\\/\s]/,
-				);
+				expect(
+					ext,
+					`${s.id} extension "${ext}" has separator/space`,
+				).not.toMatch(/[\\/\s]/);
 			}
 		}
 	});
 
 	it("optional timeouts, when set, are positive finite numbers", () => {
 		for (const s of LSP_SERVERS) {
-			for (const key of ["initializeTimeoutMs", "clientWaitTimeoutMs"] as const) {
+			for (const key of [
+				"initializeTimeoutMs",
+				"clientWaitTimeoutMs",
+			] as const) {
 				const v = s[key];
 				if (v !== undefined) {
 					expect(Number.isFinite(v), `${s.id}.${key}`).toBe(true);

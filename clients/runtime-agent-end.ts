@@ -16,17 +16,18 @@ import {
 import type { FormatService } from "./format-service.js";
 import { logLatency } from "./latency-logger.js";
 import { isPathIgnoredByProject } from "./file-utils.js";
-import { newLspMutationCorrelationId, type LspMutationContext } from "./lsp-mutation.js";
+import { admitBounded, emitBounded } from "./bounded-telemetry.js";
+import {
+	newLspMutationCorrelationId,
+	type LspMutationContext,
+} from "./lsp-mutation.js";
 import {
 	getGlobalActionableWarningMaxFixes,
 	type PiLensFlagSource,
 } from "./lens-config.js";
 import { resyncLspFile, runAutofix, runFormatPhase } from "./pipeline.js";
 import { getAmbientAbortSignal } from "./safe-spawn.js";
-import {
-	appendProjectChange,
-	type ProjectChangeSource,
-} from "./project-changes.js";
+import { type ProjectChangeSource } from "./project-changes.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
 import {
 	getAutofixPolicyForFile,
@@ -65,7 +66,10 @@ interface AgentEndDeps {
 	getFormatService: () => FormatService;
 	biomeClient?: BiomeClient;
 	ruffClient?: RuffClient;
-	getAutofixClients?: () => Promise<{ biomeClient: BiomeClient; ruffClient: RuffClient }>;
+	getAutofixClients?: () => Promise<{
+		biomeClient: BiomeClient;
+		ruffClient: RuffClient;
+	}>;
 	/**
 	 * The STABLE pi session id for the ctx this `agent_end` fired on. Used to
 	 * scope the deferred-format drain to records this session actually
@@ -92,22 +96,16 @@ function recordProjectChange(args: {
 	source: ProjectChangeSource;
 	dbg: (msg: string) => void;
 }): void {
-	const bump = (args.runtime as Partial<RuntimeCoordinator>).bumpFileSeq;
-	if (!bump) return;
-	const { projectSeq, fileSeq } = bump.call(args.runtime, args.filePath);
-	try {
-		appendProjectChange(args.cwd, {
-			seq: projectSeq,
-			timestamp: new Date().toISOString(),
-			sessionId: args.runtime.telemetrySessionId,
-			turnIndex: args.runtime.turnIndex,
-			source: args.source,
-			filePath: path.resolve(args.filePath),
-			fileSeq,
-		});
-	} catch (err) {
-		args.dbg(`project change log append failed for ${args.filePath}: ${err}`);
-	}
+	// One mutation seam (#2000 phase 1): bump + receipt + change-log live in
+	// RuntimeCoordinator.recordProjectMutation; this wrapper only carries the
+	// legacy dbg shape.
+	(args.runtime as Partial<RuntimeCoordinator>).recordProjectMutation?.({
+		filePath: args.filePath,
+		source: args.source,
+		cwd: args.cwd,
+		onAppendError: (err) =>
+			args.dbg(`project change log append failed for ${args.filePath}: ${err}`),
+	});
 }
 
 export async function handleAgentEnd({
@@ -129,11 +127,12 @@ export async function handleAgentEnd({
 	// session (e.g. a concurrent in-process secondary/subagent) stay queued
 	// for their owner's own agent_end, unless they've been stale long enough
 	// to fall back to "claim as orphaned" (see claimDeferredFormatFiles).
-	const { claimed, staleClaimed, deferredToOwner } =
+	const { claimed, staleClaimed, deferredToOwner, droppedOrphans } =
 		runtime.claimDeferredMutations(
 			currentSessionId,
 			Date.now(),
 			staleAfterMs,
+			ctxCwd ?? runtime.projectRoot,
 		);
 	const records = [...claimed, ...staleClaimed];
 	const requeuedKinds = new Set<"autofix" | "format">();
@@ -146,7 +145,11 @@ export async function handleAgentEnd({
 	// from "M files failed to format".
 	const requeue = (
 		pending: Parameters<RuntimeCoordinator["requeueDeferredMutations"]>[0],
-		reason: "abort" | "autofix-failed" | "format-failed" | "clients-unavailable",
+		reason:
+			| "abort"
+			| "autofix-failed"
+			| "format-failed"
+			| "clients-unavailable",
 	): void => {
 		if (pending.length === 0) return;
 		const kinds = new Set<"autofix" | "format">();
@@ -176,14 +179,94 @@ export async function handleAgentEnd({
 	const rootActionableAutofixEnabled = !!getFlag(
 		"lens-actionable-warning-autofix",
 	);
+	// The actionable-warnings cache is only ever written when the
+	// "lens-actionable-warnings" writer flag is on (clients/runtime-turn.ts).
+	// A reader that ignores this gate always misses in a host where the
+	// writer is off and logs "cache missing or expired" at every agent_end,
+	// misdirecting the debug log toward a bogus cache problem instead of the
+	// real cause: the feature that populates the cache is disabled (#1607).
+	const actionableWarningsWriterEnabled = !!getFlag("lens-actionable-warnings");
 	// A path-aware source resolver signals that nested configs may re-enable
 	// actionable autofix even when the root default is off. Legacy/test hosts
 	// without that resolver keep the old fast exit and avoid a cache read.
 	const inspectActionableReport =
-		rootActionableAutofixEnabled && typeof cacheManager.readCache === "function"
-			? true
-			: getFlagSource !== undefined &&
-				typeof cacheManager.readCache === "function";
+		actionableWarningsWriterEnabled &&
+		typeof cacheManager.readCache === "function" &&
+		(rootActionableAutofixEnabled || getFlagSource !== undefined);
+	if (droppedOrphans.length > 0) {
+		// #1642 F3: a stale/foreign record whose origin (the cwd/worktree it
+		// was actually queued under) does NOT match this flush's own
+		// workspace/worktree is left queued and NEVER formatted by this
+		// flush — claiming it would be the same worktree→parent
+		// re-attribution the reported incident hit, just via the orphan
+		// fallback instead of tool_result's path resolution. It stays in
+		// `_pendingDeferredMutations` (not deleted) so a flush whose origin
+		// actually matches can still claim it later; a genuinely abandoned
+		// origin will keep surfacing this record on every subsequent
+		// agent_end, which is the deliberately safer trade-off over silently
+		// losing it forever.
+		dbg(
+			`agent_end deferred_format: left ${droppedOrphans.length} orphaned file(s) queued due to a mismatched origin (unclaimed >${staleAfterMs}ms, not formatted by this flush): ${droppedOrphans
+				.map((r) => `${r.filePath} origin=${r.originCwd}`)
+				.join(", ")}`,
+		);
+		// #1678 item 1: a genuinely abandoned origin re-surfaces the SAME
+		// record on every subsequent agent_end for as long as the queued
+		// entry lives — by design (see the comment above), but the repo
+		// invariant is that a repeated degradation goes through the ledger's
+		// counting path instead of accumulating as unbounded raw log lines.
+		// The ledger is the single source of truth for whether THIS is a
+		// record's first appearance (its return value): the detailed forensic
+		// record below names only the orphans on that rising edge, with file
+		// identity/origin/age. Every later repeat of
+		// the same record is counted ONLY by the ledger's running count —
+		// no second raw event, no parallel "already logged" latch to
+		// maintain here.
+		// #1743: `admitBounded` IS that ledger call, plus the registry
+		// membership the bounded-telemetry sweep checks. This site admits PER
+		// ORPHAN and then writes ONE batched record naming the admitted ones,
+		// which is why it uses `admitBounded` directly instead of a per-record
+		// `emitBounded` — the per-call form would turn one log line into N.
+		const firstSeenOrphans: typeof droppedOrphans = [];
+		for (const record of droppedOrphans) {
+			const isFirstOccurrence = admitBounded(
+				"agent_end_deferred_format_orphan_origin_mismatch",
+				record.filePath,
+				{
+					ledgerKind: "path-attribution-orphan-unresolved",
+					risingEdgePer: "identity",
+					reason: `origin=${record.originCwd} unclaimed >${staleAfterMs}ms`,
+				},
+			);
+			if (isFirstOccurrence) firstSeenOrphans.push(record);
+		}
+		if (firstSeenOrphans.length > 0) {
+			// Already admitted above, one orphan at a time — hence no bounding
+			// options here. The batch's own identity is the origin this flush ran
+			// under; per-file identity rides in `metadata.files`.
+			emitBounded(
+				"agent_end_deferred_format_orphan_origin_mismatch",
+				ctxCwd ?? runtime.projectRoot,
+				{
+					type: "phase",
+					toolName: "agent_end",
+					durationMs: 0,
+					metadata: {
+						fileCount: firstSeenOrphans.length,
+						staleAfterMs,
+						currentOriginCwd: ctxCwd ?? runtime.projectRoot,
+						files: firstSeenOrphans.map((r) => ({
+							filePath: r.filePath,
+							originCwd: r.originCwd,
+							ownerSessionId: r.ownerSessionId,
+							queuedTurnIndex: r.queuedTurnIndex,
+							ageMs: Date.now() - r.lastTouchedAt,
+						})),
+					},
+				},
+			);
+		}
+	}
 	if (records.length === 0 && !inspectActionableReport) return undefined;
 	if (deferredToOwner.length > 0) {
 		dbg(
@@ -244,11 +327,21 @@ export async function handleAgentEnd({
 	// autofix reaches the final edited state first and formatting stabilizes it.
 	const ambientSignal = getAmbientAbortSignal();
 	const executedAutofixScopes = new Set<string>();
-	const autofixRecords = records.filter((candidate) => candidate.kinds.has("autofix"));
-	if (autofixRecords.length > 0 && (!biomeClient || !ruffClient) && getAutofixClients) {
+	const autofixRecords = records.filter((candidate) =>
+		candidate.kinds.has("autofix"),
+	);
+	if (
+		autofixRecords.length > 0 &&
+		(!biomeClient || !ruffClient) &&
+		getAutofixClients
+	) {
 		({ biomeClient, ruffClient } = await getAutofixClients());
 	}
-	for (let autofixIndex = 0; autofixIndex < autofixRecords.length; autofixIndex++) {
+	for (
+		let autofixIndex = 0;
+		autofixIndex < autofixRecords.length;
+		autofixIndex++
+	) {
 		const record = autofixRecords[autofixIndex];
 		if (ambientSignal?.aborted) {
 			requeue(
@@ -268,7 +361,16 @@ export async function handleAgentEnd({
 		}
 		if (!biomeClient || !ruffClient) {
 			dbg(`agent_end deferred_autofix: clients unavailable for ${filePath}`);
-			requeue([{ ...record, kinds: new Set(["autofix"]), toolNames: new Set(record.toolNames) }], "clients-unavailable");
+			requeue(
+				[
+					{
+						...record,
+						kinds: new Set(["autofix"]),
+						toolNames: new Set(record.toolNames),
+					},
+				],
+				"clients-unavailable",
+			);
 			continue;
 		}
 		const policy = getAutofixPolicyForFile(filePath, {
@@ -283,9 +385,10 @@ export async function handleAgentEnd({
 			hasKtfmtConfig: hasKtfmtConfig(record.cwd),
 			hasKtlintConfig: hasKtlintConfig(record.cwd),
 		});
-		const scopeKey = policy?.scope && policy.scope !== "file"
-			? `${policy.defaultTool ?? "unknown"}:${path.resolve(record.cwd)}`
-			: `${policy?.defaultTool ?? "unknown"}:${filePath}`;
+		const scopeKey =
+			policy?.scope && policy.scope !== "file"
+				? `${policy.defaultTool ?? "unknown"}:${path.resolve(record.cwd)}`
+				: `${policy?.defaultTool ?? "unknown"}:${filePath}`;
 		if (executedAutofixScopes.has(scopeKey)) continue;
 		executedAutofixScopes.add(scopeKey);
 		try {
@@ -301,10 +404,22 @@ export async function handleAgentEnd({
 			for (const changed of result.changedFiles) {
 				const changedPath = path.resolve(changed);
 				deferredAutofixChanged.add(changedPath);
-				for (const tool of tools) deferredAutofixFixes.push({ path: changedPath, tool, kind: "autofix" });
+				for (const tool of tools)
+					deferredAutofixFixes.push({
+						path: changedPath,
+						tool,
+						kind: "autofix",
+					});
 				if (!nodeFs.existsSync(changedPath)) continue;
-				recordProjectChange({ runtime, cwd: record.turnStateCwd, filePath: changedPath, source: "autofix", dbg });
-				if (!getFlag("no-read-guard")) runtime.readGuard.recordWritten(changedPath);
+				recordProjectChange({
+					runtime,
+					cwd: record.turnStateCwd,
+					filePath: changedPath,
+					source: "autofix",
+					dbg,
+				});
+				if (!getFlag("no-read-guard"))
+					runtime.readGuard.recordWritten(changedPath);
 				const content = nodeFs.readFileSync(changedPath, "utf-8");
 				cacheManager.addModifiedRange(
 					changedPath,
@@ -318,7 +433,16 @@ export async function handleAgentEnd({
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
 			summary.failed.push({ filePath, errors: [message] });
-			requeue([{ ...record, kinds: new Set(["autofix"]), toolNames: new Set(record.toolNames) }], "autofix-failed");
+			requeue(
+				[
+					{
+						...record,
+						kinds: new Set(["autofix"]),
+						toolNames: new Set(record.toolNames),
+					},
+				],
+				"autofix-failed",
+			);
 		}
 	}
 	if (deferredAutofixFixes.length > 0) {
@@ -365,20 +489,22 @@ export async function handleAgentEnd({
 		});
 	}
 
-	const formatRecords = records.filter((record) => record.kinds.has("format")).filter((record) => {
-		const disabled = !!getFlag("no-autoformat", record.filePath);
-		if (disabled) {
-			const source = getFlagSource?.("no-autoformat", record.filePath);
-			dbg(
-				`agent_end deferred_format: skipping ${record.filePath} (--no-autoformat${source ? `, source=${source}` : ""})`,
-			);
-			summary.skipped.push({
-				filePath: record.filePath,
-				reason: "no-autoformat",
-			});
-		}
-		return !disabled;
-	});
+	const formatRecords = records
+		.filter((record) => record.kinds.has("format"))
+		.filter((record) => {
+			const disabled = !!getFlag("no-autoformat", record.filePath);
+			if (disabled) {
+				const source = getFlagSource?.("no-autoformat", record.filePath);
+				dbg(
+					`agent_end deferred_format: skipping ${record.filePath} (--no-autoformat${source ? `, source=${source}` : ""})`,
+				);
+				summary.skipped.push({
+					filePath: record.filePath,
+					reason: "no-autoformat",
+				});
+			}
+			return !disabled;
+		});
 
 	if (formatRecords.length > 0) {
 		// Formatter subprocesses are independent across files, so retain bounded
@@ -432,11 +558,13 @@ export async function handleAgentEnd({
 		);
 		if (ambientSignal?.aborted) {
 			requeue(
-				formatRecords.filter((_, index) => !started.has(index)).map((record) => ({
-					...record,
-					kinds: new Set(["format" as const]),
-					toolNames: new Set(record.toolNames),
-				})),
+				formatRecords
+					.filter((_, index) => !started.has(index))
+					.map((record) => ({
+						...record,
+						kinds: new Set(["format" as const]),
+						toolNames: new Set(record.toolNames),
+					})),
 				"abort",
 			);
 		}
@@ -447,7 +575,11 @@ export async function handleAgentEnd({
 			const { record, filePath, fileStart } = entry;
 			if (entry.missing) {
 				dbg(`agent_end deferred_format skipped missing file: ${filePath}`);
-				if (!summary.skipped.some((item) => item.filePath === filePath && item.reason === "missing")) {
+				if (
+					!summary.skipped.some(
+						(item) => item.filePath === filePath && item.reason === "missing",
+					)
+				) {
 					summary.skipped.push({ filePath, reason: "missing" });
 				}
 				continue;
@@ -455,7 +587,16 @@ export async function handleAgentEnd({
 			if (entry.error) {
 				dbg(`agent_end deferred_format failed for ${filePath}: ${entry.error}`);
 				summary.failed.push({ filePath, errors: [entry.error] });
-				requeue([{ ...record, kinds: new Set(["format"]), toolNames: new Set(record.toolNames) }], "format-failed");
+				requeue(
+					[
+						{
+							...record,
+							kinds: new Set(["format"]),
+							toolNames: new Set(record.toolNames),
+						},
+					],
+					"format-failed",
+				);
 				continue;
 			}
 			const result = entry.result;
@@ -465,7 +606,16 @@ export async function handleAgentEnd({
 
 			if (result.formatFailures.length > 0) {
 				summary.failed.push({ filePath, errors: result.formatFailures });
-				requeue([{ ...record, kinds: new Set(["format"]), toolNames: new Set(record.toolNames) }], "format-failed");
+				requeue(
+					[
+						{
+							...record,
+							kinds: new Set(["format"]),
+							toolNames: new Set(record.toolNames),
+						},
+					],
+					"format-failed",
+				);
 			}
 
 			if (result.formatChanged) {
@@ -564,15 +714,39 @@ export async function handleAgentEnd({
 	}
 
 	if (inspectActionableReport) {
+		const actionCwd = ctxCwd ?? runtime.projectRoot;
+		const actionableWarningsMaxAgeMs = 10 * 60_000;
 		const actionReport = cacheManager.readCache<ActionableWarningsReport>(
 			"actionable-warnings",
-			ctxCwd ?? runtime.projectRoot,
-			10 * 60_000,
+			actionCwd,
+			actionableWarningsMaxAgeMs,
 		);
 		if (!actionReport?.data) {
-			dbg(
-				"agent_end actionable_warnings_autofix: cache missing or expired, skipping fixes",
-			);
+			// Distinguish "no cache file was ever written" from "a cache file
+			// exists but its TTL elapsed" (#1607) — both used to collapse into
+			// one "cache missing or expired" line, which doesn't tell a reader
+			// whether the writer ran and produced a stale file, or never ran.
+			const inspection =
+				typeof cacheManager.inspectCache === "function"
+					? cacheManager.inspectCache(
+							"actionable-warnings",
+							actionCwd,
+							actionableWarningsMaxAgeMs,
+						)
+					: undefined;
+			if (inspection === "missing") {
+				dbg(
+					"agent_end actionable_warnings_autofix: cache absent, skipping fixes",
+				);
+			} else if (inspection === "stale") {
+				dbg(
+					"agent_end actionable_warnings_autofix: cache expired, skipping fixes",
+				);
+			} else {
+				dbg(
+					`agent_end actionable_warnings_autofix: cache missing or expired${inspection ? ` (${inspection})` : ""}, skipping fixes`,
+				);
+			}
 		} else {
 			const enabledFiles = actionReport.data.files.filter((file) => {
 				// #1247: the per-edit dispatch surface gates ignored files before
@@ -580,10 +754,7 @@ export async function handleAgentEnd({
 				// `.pi-lens.json` `ignore` entry cannot protect a prose file
 				// (CHANGELOG.md / AGENTS.md) from being rewritten here.
 				if (
-					isPathIgnoredByProject(
-						file.filePath,
-						ctxCwd ?? runtime.projectRoot,
-					)
+					isPathIgnoredByProject(file.filePath, ctxCwd ?? runtime.projectRoot)
 				) {
 					dbg(
 						`agent_end actionable_warnings_autofix: skipped ${file.filePath} (ignored by project)`,
@@ -667,7 +838,10 @@ export async function handleAgentEnd({
 					cacheManager,
 					readGuard: getFlag("no-read-guard") ? undefined : runtime.readGuard,
 					recordAutofix: getFlag("lens-turn-summary")
-						? (filePath) => runtime.turnSummary.recordAutofix(filePath, { tool: "lsp-quickfix" })
+						? (filePath) =>
+								runtime.turnSummary.recordAutofix(filePath, {
+									tool: "lsp-quickfix",
+								})
 						: undefined,
 					dbg,
 				};
@@ -711,7 +885,9 @@ export async function handleAgentEnd({
 					);
 				}
 			} else {
-				dbg("agent_end actionable_warnings_autofix: fresh report, 0 autofix-eligible warnings, skipping")
+				dbg(
+					"agent_end actionable_warnings_autofix: fresh report, 0 autofix-eligible warnings, skipping",
+				);
 			}
 		}
 	}
@@ -726,7 +902,9 @@ export async function handleAgentEnd({
 			autofixRecords: autofixRecords.length,
 			formatRecords: formatRecords.length,
 			coalescedPaths: records.length,
-			requeuedKinds: [...requeuedKinds].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
+			requeuedKinds: [...requeuedKinds].sort((a, b) =>
+				a < b ? -1 : a > b ? 1 : 0,
+			),
 		},
 	});
 	logLatency({

@@ -30,7 +30,9 @@ let cwd: string;
 let files: string[];
 
 beforeAll(() => {
-	cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-full-binding-occupancy-"));
+	cwd = fs.mkdtempSync(
+		path.join(os.tmpdir(), "pi-lens-full-binding-occupancy-"),
+	);
 	files = [];
 	for (let i = 0; i < FILE_COUNT; i += 1) {
 		const file = path.join(cwd, `${i}.ts`);

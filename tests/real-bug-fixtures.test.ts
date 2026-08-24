@@ -10,12 +10,7 @@ interface FixtureManifest {
 	}>;
 }
 
-const ROOT = path.resolve(
-	process.cwd(),
-	"tests",
-	"fixtures",
-	"real-bugs",
-);
+const ROOT = path.resolve(process.cwd(), "tests", "fixtures", "real-bugs");
 
 describe("real bug fixtures", () => {
 	it("covers all target languages", () => {
@@ -23,7 +18,9 @@ describe("real bug fixtures", () => {
 		const manifest = JSON.parse(raw) as FixtureManifest;
 
 		const langs = new Set(manifest.fixtures.map((f) => f.language));
-		expect(langs).toEqual(new Set(["typescript", "python", "go", "rust", "ruby"]));
+		expect(langs).toEqual(
+			new Set(["typescript", "python", "go", "rust", "ruby"]),
+		);
 	});
 
 	it("fixture files exist and include declared bug class markers", () => {

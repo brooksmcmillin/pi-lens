@@ -12,6 +12,7 @@ import {
 	createAvailabilityChecker,
 	resolveToolCommandWithInstallFallback,
 } from "./utils/runner-helpers.js";
+import { parseToolRun } from "./utils/tool-failure.js";
 
 const vale = createAvailabilityChecker("vale", ".exe");
 
@@ -37,60 +38,60 @@ function findValeConfig(cwd: string): string | undefined {
 /**
  * Parse Vale JSON output.
  *
- * Format:
+ * #1933 review F1: this used to assume a `{ Data: { Files: [...] } }`
+ * envelope that no real `vale` binary ever emits -- that shape traces to an
+ * unverified claim, never checked against a real run (AGENTS.md defect
+ * shape 16). Verified against a real `vale --output JSON` v3.9.6 run: the
+ * top level is a flat map keyed by the linted file's path (exactly the
+ * string passed on the command line, so its exact spelling isn't load-
+ * bearing here -- one file is linted per invocation, so this reads every
+ * value in the map rather than matching a specific key), each value an
+ * array of alert objects:
+ *
  * {
- *   "Data": {
- *     "Files": [
- *       {
- *         "Path": "file.md",
- *         "Alerts": [
- *           {
- *             "Line": 10,
- *             "Column": 5,
- *             "Severity": "warning",
- *             "Message": "some message",
- *             "Check": "some-rule"
- *           }
- *         ]
- *       }
- *     ],
- *     "LintedTotal": 1
- *   }
+ *   "path/passed/on/cli.md": [
+ *     {
+ *       "Line": 10,
+ *       "Span": [5, 12],
+ *       "Severity": "warning",
+ *       "Message": "some message",
+ *       "Check": "Google.SomeRule"
+ *     }
+ *   ]
  * }
+ *
+ * There is no separate "Column" field. `Span` is the [start, end] column
+ * range of the match within `Line`; `Span[0]` is the column Vale's own
+ * `--output line` formatter prints.
+ *
+ * Before this fix, the old shape meant `parsed?.Data?.Files` was always
+ * undefined, so every real Vale run -- however many errors it actually
+ * found -- silently parsed to zero diagnostics and reported "succeeded".
  */
 interface ValeAlert {
 	Line?: number;
-	Column?: number;
+	Span?: [number, number];
 	Severity?: string;
 	Message?: string;
 	Check?: string;
 	Action?: unknown;
 }
 
-interface ValeFile {
-	Path?: string;
-	Alerts?: ValeAlert[];
-}
+type ValeOutput = Record<string, ValeAlert[]>;
 
-function parseValeOutput(raw: string, filePath: string): Diagnostic[] {
+export function parseValeOutput(raw: string, filePath: string): Diagnostic[] {
 	const diagnostics: Diagnostic[] = [];
 
 	if (!raw.trim()) return diagnostics;
 
 	try {
-		const parsed = JSON.parse(raw) as {
-			Data?: {
-				Files?: ValeFile[];
-			};
-		};
+		const parsed = JSON.parse(raw) as ValeOutput;
+		if (!parsed || typeof parsed !== "object") return diagnostics;
 
-		const files = parsed?.Data?.Files;
-		if (!files) return diagnostics;
+		for (const alerts of Object.values(parsed)) {
+			if (!Array.isArray(alerts)) continue;
 
-		for (const file of files) {
-			if (!file.Alerts) continue;
-
-			for (const alert of file.Alerts) {
+			for (const alert of alerts) {
 				if (!alert.Message) continue;
 
 				const severityMap: Record<string, "error" | "warning" | "info"> = {
@@ -107,7 +108,7 @@ function parseValeOutput(raw: string, filePath: string): Diagnostic[] {
 					message: `[${alert.Check ?? "vale"}] ${alert.Message}`,
 					filePath,
 					line: alert.Line ?? 1,
-					column: alert.Column ?? 1,
+					column: alert.Span?.[0] ?? 1,
 					severity,
 					semantic: severity === "error" ? "blocking" : "warning",
 					tool: "vale",
@@ -140,7 +141,7 @@ const valeRunner: RunnerDefinition = {
 		}
 
 		let cmd: string | null = null;
-		if (await (vale.isAvailableAsync(cwd))) {
+		if (await vale.isAvailableAsync(cwd)) {
 			cmd = vale.getCommand(cwd);
 		} else {
 			cmd = await resolveToolCommandWithInstallFallback(cwd, "vale");
@@ -155,8 +156,21 @@ const valeRunner: RunnerDefinition = {
 			{ cwd, timeout: 15000 },
 		);
 
-		const raw = result.stdout || "";
-		const diagnostics = parseValeOutput(raw, ctx.filePath);
+		// #1816: this runner read `result.status` zero times, so a Vale that
+		// rejected its config exited nonzero with an empty stdout, parsed to
+		// zero alerts, and reported clean prose. No exit-code table: Vale's
+		// nonzero codes vary with --minAlertLevel, so the conservative
+		// nothing-to-parse rule is the only safe discriminator here.
+		//
+		// #1948: `parseToolRun` adds the second gate. Vale's `Data.Files`
+		// envelope bug produced exactly this shape — exit 1, a full JSON
+		// report on stdout, zero alerts parsed — and left no record.
+		const run = parseToolRun("vale", { result }, (raw) =>
+			parseValeOutput(raw, ctx.filePath),
+		);
+		if (run.skipped) return run.skipped;
+
+		const diagnostics = run.diagnostics;
 
 		if (diagnostics.length === 0) {
 			return { status: "succeeded", diagnostics: [], semantic: "none" };

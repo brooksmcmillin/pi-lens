@@ -18,7 +18,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	classifyProbeFailure,
 	describeProbeEvidence,
-} from "../../clients/dispatch/runners/utils/availability-policy.ts";
+} from "../../clients/dispatch/runners/utils/availability-policy.js";
 
 const { safeSpawnAsync, logLatencySpy, ensureTool, getInstallAttempt } =
 	vi.hoisted(() => ({
@@ -250,9 +250,8 @@ describe("govulncheck's own durable-absence arms (#1500)", () => {
 	async function govulncheck(): Promise<{
 		ensureAvailable(): Promise<boolean>;
 	}> {
-		const { GovulncheckClient } = await import(
-			"../../clients/govulncheck-client.js"
-		);
+		const { GovulncheckClient } =
+			await import("../../clients/govulncheck-client.js");
 		return new GovulncheckClient();
 	}
 
@@ -289,14 +288,13 @@ describe("govulncheck's own durable-absence arms (#1500)", () => {
 	});
 
 	it("records a durable `go install` failure as an attempt that failed", async () => {
-		safeSpawnAsync.mockImplementation(
-			async (cmd: string, args: string[]) => {
-				if (cmd !== "go") return notFoundResult;
-				if (args[0] === "version") return { stdout: "go1.22", stderr: "", status: 0 };
-				// `go install` ran and refused: module not found, compile error.
-				return { stdout: "", stderr: "no required module provides", status: 1 };
-			},
-		);
+		safeSpawnAsync.mockImplementation(async (cmd: string, args: string[]) => {
+			if (cmd !== "go") return notFoundResult;
+			if (args[0] === "version")
+				return { stdout: "go1.22", stderr: "", status: 0 };
+			// `go install` ran and refused: module not found, compile error.
+			return { stdout: "", stderr: "no required module provides", status: 1 };
+		});
 
 		expect(await (await govulncheck()).ensureAvailable()).toBe(false);
 		const last = decisions()[decisions().length - 1];
@@ -336,5 +334,117 @@ describe("govulncheck's own durable-absence arms (#1500)", () => {
 		expect(last?.evidence).toMatchObject({
 			installReason: expect.stringContaining("GOBIN"),
 		});
+	});
+});
+
+/**
+ * #1606 review F1 — the sweep that produced the `ensureViaInstaller` fix
+ * grepped for `ensureTool(` call sites and missed govulncheck entirely: it
+ * recovers via `go install`, not the shared installer, so it never showed up
+ * in that grep. Its own success arms (reprobe-on-PATH after `go install`, and
+ * the canonical $GOBIN/$GOPATH walk) set `available = true` after the initial
+ * probe already latched an `unavailable` row — the identical one-sided-logging
+ * shape, missed by enumerating call sites instead of known probeVersion
+ * consumers.
+ */
+describe("govulncheck's compensating available rows (#1606)", () => {
+	async function govulncheck(): Promise<{
+		ensureAvailable(): Promise<boolean>;
+	}> {
+		const { GovulncheckClient } =
+			await import("../../clients/govulncheck-client.js");
+		return new GovulncheckClient();
+	}
+
+	it("emits a compensating row when the post-install reprobe finds it on PATH", async () => {
+		let govulncheckCalls = 0;
+		safeSpawnAsync.mockImplementation(async (cmd: string, args: string[]) => {
+			if (cmd === "go" && args[0] === "version") {
+				return { stdout: "go1.22", stderr: "", status: 0 };
+			}
+			if (cmd === "go" && args[0] === "install") {
+				return { stdout: "", stderr: "", status: 0 };
+			}
+			if (cmd === "govulncheck") {
+				govulncheckCalls += 1;
+				// First call is the initial PATH probe (misses); the second is the
+				// post-install reprobe (hits, now that `go install` put it on PATH).
+				return govulncheckCalls === 1
+					? notFoundResult
+					: { stdout: "govulncheck v1.1.0", stderr: "", status: 0 };
+			}
+			return notFoundResult;
+		});
+
+		expect(await (await govulncheck()).ensureAvailable()).toBe(true);
+		const rows = decisions();
+		// Pre-fix: exactly one row (the initial probe's latched unavailable).
+		expect(rows).toHaveLength(2);
+		expect(rows[0]).toMatchObject({
+			tool: "govulncheck",
+			verdict: "unavailable",
+			outcome: "missing",
+			classifiedBy: "probe",
+		});
+		expect(rows[1]).toMatchObject({
+			tool: "govulncheck",
+			verdict: "available",
+			outcome: "success",
+			cause: "ok",
+			classifiedBy: "caller",
+			evidence: {
+				install: "succeeded",
+				binary: "govulncheck",
+				source: "go-install",
+			},
+		});
+	});
+
+	it("emits a compensating row when the binary is found in $GOBIN", async () => {
+		const gobin = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-gobin-"));
+		const ext = process.platform === "win32" ? ".exe" : "";
+		const binaryPath = path.join(gobin, `govulncheck${ext}`);
+		fs.writeFileSync(binaryPath, "");
+		const prevGobin = process.env.GOBIN;
+		process.env.GOBIN = gobin;
+		try {
+			safeSpawnAsync.mockImplementation(async (cmd: string, args: string[]) => {
+				if (cmd === "go" && args[0] === "version") {
+					return { stdout: "go1.22", stderr: "", status: 0 };
+				}
+				if (cmd === "go" && args[0] === "install") {
+					return { stdout: "", stderr: "", status: 0 };
+				}
+				// Both the initial probe and the post-install reprobe miss on PATH;
+				// only the $GOBIN filesystem walk finds it.
+				return notFoundResult;
+			});
+
+			expect(await (await govulncheck()).ensureAvailable()).toBe(true);
+			const rows = decisions();
+			// Pre-fix: exactly one row (the initial probe's latched unavailable).
+			expect(rows).toHaveLength(2);
+			expect(rows[0]).toMatchObject({
+				tool: "govulncheck",
+				verdict: "unavailable",
+				outcome: "missing",
+				classifiedBy: "probe",
+			});
+			expect(rows[1]).toMatchObject({
+				tool: "govulncheck",
+				verdict: "available",
+				outcome: "success",
+				cause: "ok",
+				classifiedBy: "caller",
+				evidence: {
+					install: "succeeded",
+					binary: `govulncheck${ext}`,
+					source: "go-install",
+				},
+			});
+		} finally {
+			process.env.GOBIN = prevGobin;
+			fs.rmSync(gobin, { recursive: true, force: true });
+		}
 	});
 });

@@ -2,6 +2,30 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const activationToolFactoryOverride = vi.hoisted(() => ({
+	enabled: false,
+	description: undefined as string | undefined,
+}));
+
+vi.mock("../tools/activate-tools.js", async (importOriginal) => {
+	const actual =
+		await importOriginal<typeof import("../tools/activate-tools.js")>();
+	return {
+		...actual,
+		createActivateToolsTool: (
+			...args: Parameters<typeof actual.createActivateToolsTool>
+		) => {
+			const tool = actual.createActivateToolsTool(...args);
+			if (!activationToolFactoryOverride.enabled) return tool;
+			return {
+				...tool,
+				description: activationToolFactoryOverride.description,
+			};
+		},
+	};
+});
+
 import { CacheManager } from "../clients/cache-manager.js";
 import { snapshotAdvisoryProvenance } from "../clients/advisory-provenance.js";
 import { getLatencyLogPath } from "../clients/latency-logger.js";
@@ -17,7 +41,8 @@ import {
 	resetDegradationLedger,
 } from "../clients/degradation-ledger.js";
 import { _resetSessionLifecycleForTests } from "../clients/session-lifecycle.js";
-import { createPiMock, makeCtx } from "./support/pi-mock.js";
+import { makeSessionStartEvent } from "./support/host-event-factory.js";
+import { createPiMock, makeCtx, makeStaleCtx } from "./support/pi-mock.js";
 import { removeTempDirSync } from "./clients/test-utils.js";
 
 // #643: the dynamic-tool-deactivation call now runs inside the session_start
@@ -34,7 +59,11 @@ vi.mock("../clients/bootstrap.js", () => ({
 		ruffClient: { isAvailable: () => false },
 		knipClient: {
 			isAvailable: () => false,
-			analyze: async () => ({ success: false, summary: "unavailable", issues: [] }),
+			analyze: async () => ({
+				success: false,
+				summary: "unavailable",
+				issues: [],
+			}),
 		},
 		jscpdClient: { isAvailable: () => false },
 		depChecker: { isAvailable: () => false },
@@ -89,6 +118,24 @@ const EXPECTED_TOOLS = [
 	"read_symbol",
 	"read_enclosing",
 ];
+const ALWAYS_ACTIVE_TOOLS = [
+	"lens_diagnostics",
+	"lsp_diagnostics",
+	"symbol_search",
+	"project_report",
+	"module_report",
+	"read_symbol",
+	"read_enclosing",
+];
+const ACTIVATION_TOOLS = ["pi_lens_activate_tools"];
+const LAZY_TOOLS = [
+	"ast_grep_search",
+	"ast_grep_replace",
+	"ast_grep_outline",
+	"ast_grep_dump",
+	"lsp_navigation",
+	"lens_diagnostic_mark",
+];
 const EXPECTED_HOOKS = [
 	"resources_discover",
 	"before_agent_start",
@@ -110,7 +157,9 @@ describe("index.ts extension wiring", () => {
 		try {
 			const parent = createPiMock();
 			const parentApi = parent.asExtensionAPI();
-			(parentApi as unknown as { events: { emit: ReturnType<typeof vi.fn> } }).events = {
+			(
+				parentApi as unknown as { events: { emit: ReturnType<typeof vi.fn> } }
+			).events = {
 				emit: vi.fn(),
 			};
 			extension(parentApi);
@@ -122,7 +171,9 @@ describe("index.ts extension wiring", () => {
 
 			const dbg = vi.fn();
 			wireBusEmitter(() => {
-				throw new Error("This extension ctx is stale after session replacement or reload");
+				throw new Error(
+					"This extension ctx is stale after session replacement or reload",
+				);
 			});
 			publishFilesTouched({
 				reason: "autofix",
@@ -138,14 +189,18 @@ describe("index.ts extension wiring", () => {
 			const recoveredEmit = vi.fn();
 			const subagent = createPiMock();
 			const subagentApi = subagent.asExtensionAPI();
-			(subagentApi as unknown as { events: { emit: typeof recoveredEmit } }).events = {
+			(
+				subagentApi as unknown as { events: { emit: typeof recoveredEmit } }
+			).events = {
 				emit: recoveredEmit,
 			};
 			extension(subagentApi);
 			// Model another activation winning the module singleton after factory
 			// load. The guarded session_start itself must reclaim the wiring.
 			wireBusEmitter(() => {
-				throw new Error("This extension ctx is stale after session replacement or reload");
+				throw new Error(
+					"This extension ctx is stale after session replacement or reload",
+				);
 			});
 			await subagent.emit(
 				"session_start",
@@ -161,7 +216,9 @@ describe("index.ts extension wiring", () => {
 
 			expect(recoveredEmit).toHaveBeenCalledWith(
 				"pilens:files:touched",
-				expect.objectContaining({ paths: [expect.stringContaining("recovered.ts")] }),
+				expect.objectContaining({
+					paths: [expect.stringContaining("recovered.ts")],
+				}),
 			);
 			expect(dbg).toHaveBeenCalledTimes(1);
 		} finally {
@@ -176,9 +233,14 @@ describe("index.ts extension wiring", () => {
 		resetBusPublishForTests();
 		try {
 			const liveCtx = makeCtx({ cwd: process.cwd(), sessionId: "live-owner" });
-			const staleCtx = makeCtx({ cwd: process.cwd(), sessionId: "stale-sibling" });
+			const staleCtx = makeCtx({
+				cwd: process.cwd(),
+				sessionId: "stale-sibling",
+			});
 			staleCtx.isIdle = () => {
-				throw new Error("This extension ctx is stale after session replacement");
+				throw new Error(
+					"This extension ctx is stale after session replacement",
+				);
 			};
 
 			const ownerEmit = vi.fn();
@@ -203,7 +265,9 @@ describe("index.ts extension wiring", () => {
 			});
 
 			expect(
-				ownerEmit.mock.calls.filter(([event]) => event === "pilens:files:touched"),
+				ownerEmit.mock.calls.filter(
+					([event]) => event === "pilens:files:touched",
+				),
 			).toHaveLength(1);
 		} finally {
 			_resetSessionLifecycleForTests();
@@ -215,11 +279,19 @@ describe("index.ts extension wiring", () => {
 		_resetSessionLifecycleForTests();
 		resetBusPublishForTests();
 		try {
-			const staleOwnerCtx = makeCtx({ cwd: process.cwd(), sessionId: "stale-owner" });
+			const staleOwnerCtx = makeCtx({
+				cwd: process.cwd(),
+				sessionId: "stale-owner",
+			});
 			staleOwnerCtx.isIdle = () => {
-				throw new Error("This extension ctx is stale after session replacement");
+				throw new Error(
+					"This extension ctx is stale after session replacement",
+				);
 			};
-			const freshGlobalCtx = makeCtx({ cwd: process.cwd(), sessionId: "fresh-sibling" });
+			const freshGlobalCtx = makeCtx({
+				cwd: process.cwd(),
+				sessionId: "fresh-sibling",
+			});
 			const ownerEmit = vi.fn();
 			const owner = createPiMock();
 			const ownerApi = owner.asExtensionAPI();
@@ -240,7 +312,9 @@ describe("index.ts extension wiring", () => {
 			});
 
 			expect(
-				ownerEmit.mock.calls.filter(([event]) => event === "pilens:files:touched"),
+				ownerEmit.mock.calls.filter(
+					([event]) => event === "pilens:files:touched",
+				),
 			).toHaveLength(0);
 		} finally {
 			_resetSessionLifecycleForTests();
@@ -266,9 +340,14 @@ describe("index.ts extension wiring", () => {
 		_resetSessionLifecycleForTests();
 		resetBusPublishForTests();
 		try {
-			const staleSiblingCtx = makeCtx({ cwd: process.cwd(), sessionId: "stale-sibling" });
+			const staleSiblingCtx = makeCtx({
+				cwd: process.cwd(),
+				sessionId: "stale-sibling",
+			});
 			staleSiblingCtx.isIdle = () => {
-				throw new Error("This extension ctx is stale after session replacement");
+				throw new Error(
+					"This extension ctx is stale after session replacement",
+				);
 			};
 			const sibling = createPiMock();
 			extension(sibling.asExtensionAPI());
@@ -292,7 +371,9 @@ describe("index.ts extension wiring", () => {
 			});
 
 			expect(
-				bootEmit.mock.calls.filter(([event]) => event === "pilens:files:touched"),
+				bootEmit.mock.calls.filter(
+					([event]) => event === "pilens:files:touched",
+				),
 			).toHaveLength(1);
 		} finally {
 			_resetSessionLifecycleForTests();
@@ -301,6 +382,56 @@ describe("index.ts extension wiring", () => {
 	});
 
 	describe("registration", () => {
+		// #1988: validate metadata at the same host boundary that exposed the
+		// failure. Keep the matrix across both registration-time feature flags and
+		// assert each registration group so a bypassed group cannot hide behind a
+		// passing helper-only test.
+		it.each([
+			{ compactToolLine: false, supportsActiveTools: false },
+			{ compactToolLine: false, supportsActiveTools: true },
+			{ compactToolLine: true, supportsActiveTools: false },
+			{ compactToolLine: true, supportsActiveTools: true },
+		])(
+			"registers non-empty descriptions through the host seam (compact=$compactToolLine, dynamic=$supportsActiveTools)",
+			({ compactToolLine, supportsActiveTools }) => {
+				activationToolFactoryOverride.enabled = true;
+				activationToolFactoryOverride.description = undefined;
+				try {
+					const pi = createPiMock(
+						compactToolLine ? { "lens-compact-tool-line": true } : {},
+						{ supportsActiveTools },
+					);
+					extension(pi.asExtensionAPI());
+					expect(
+						(pi.getTool("pi_lens_activate_tools") as { description?: unknown })
+							.description,
+					).toBe("Use the pi_lens_activate_tools tool.");
+
+					for (const [group, names] of Object.entries({
+						alwaysActive: ALWAYS_ACTIVE_TOOLS,
+						activation: ACTIVATION_TOOLS,
+						lazy: LAZY_TOOLS,
+					})) {
+						for (const name of names) {
+							expect(pi.getTool(name), `${group} tool: ${name}`).toBeDefined();
+						}
+					}
+
+					for (const [name, tool] of pi.tools) {
+						const description = (tool as { description?: unknown }).description;
+						expect(description, `description: ${name}`).toBeTypeOf("string");
+						expect(
+							(description as string).trim(),
+							`description: ${name}`,
+						).not.toBe("");
+					}
+				} finally {
+					activationToolFactoryOverride.enabled = false;
+					activationToolFactoryOverride.description = undefined;
+				}
+			},
+		);
+
 		it("registers every expected flag, command, tool, and lifecycle hook", () => {
 			const pi = createPiMock();
 			extension(pi.asExtensionAPI());
@@ -400,9 +531,7 @@ describe("index.ts extension wiring", () => {
 				}
 				for (const t of ALWAYS_ACTIVE) {
 					expect(pi.getTool(t), `tool registered: ${t}`).toBeDefined();
-					expect(pi.activeTools.has(t), `should start active: ${t}`).toBe(
-						true,
-					);
+					expect(pi.activeTools.has(t), `should start active: ${t}`).toBe(true);
 				}
 			} finally {
 				if (prevDataDir === undefined) delete process.env.PILENS_DATA_DIR;
@@ -433,9 +562,7 @@ describe("index.ts extension wiring", () => {
 					// Every tool — including the normally-lazy 6 — stays active because
 					// index.ts never found getActiveTools/setActiveTools to call, so it
 					// skipped the deactivation step entirely (the graceful fallback).
-					expect(pi.activeTools.has(t), `should stay active: ${t}`).toBe(
-						true,
-					);
+					expect(pi.activeTools.has(t), `should stay active: ${t}`).toBe(true);
 				}
 			} finally {
 				if (prevDataDir === undefined) delete process.env.PILENS_DATA_DIR;
@@ -621,15 +748,23 @@ describe("index.ts extension wiring", () => {
 				const pi = createPiMock();
 				extension(pi.asExtensionAPI());
 
-				for (const t of ["lens_diagnostics", "lsp_diagnostics", "module_report"]) {
+				for (const t of [
+					"lens_diagnostics",
+					"lsp_diagnostics",
+					"module_report",
+				]) {
 					const tool = pi.getTool(t) as
 						| { renderCall?: unknown; renderResult?: unknown }
 						| undefined;
 					expect(tool, `tool: ${t}`).toBeDefined();
-					expect(tool?.renderCall, `${t}.renderCall should be absent when off`).toBeUndefined();
-					expect(tool?.renderResult, `${t}.renderResult should still exist`).toBeTypeOf(
-						"function",
-					);
+					expect(
+						tool?.renderCall,
+						`${t}.renderCall should be absent when off`,
+					).toBeUndefined();
+					expect(
+						tool?.renderResult,
+						`${t}.renderResult should still exist`,
+					).toBeTypeOf("function");
 				}
 			});
 
@@ -639,12 +774,17 @@ describe("index.ts extension wiring", () => {
 
 				const tool = pi.getTool("lens_diagnostics") as {
 					renderCall?: (...a: unknown[]) => { render: (w: number) => string[] };
-					renderResult?: (...a: unknown[]) => { render: (w: number) => string[] };
+					renderResult?: (...a: unknown[]) => {
+						render: (w: number) => string[];
+					};
 				};
 				expect(tool.renderCall).toBeTypeOf("function");
 				expect(tool.renderResult).toBeTypeOf("function");
 
-				const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
+				const theme = {
+					fg: (_c: string, t: string) => t,
+					bold: (t: string) => t,
+				};
 				const ctx = {
 					args: { mode: "all" },
 					toolCallId: "x",
@@ -665,7 +805,10 @@ describe("index.ts extension wiring", () => {
 				expect(callComponent?.render(80)).toEqual([]);
 
 				const resultComponent = tool.renderResult?.(
-					{ content: [], details: { mode: "all", totalBlocking: 0, filesWithIssues: 0 } },
+					{
+						content: [],
+						details: { mode: "all", totalBlocking: 0, filesWithIssues: 0 },
+					},
 					{ expanded: false, isPartial: false },
 					theme,
 					ctx,
@@ -679,7 +822,9 @@ describe("index.ts extension wiring", () => {
 				const pi = createPiMock();
 				extension(pi.asExtensionAPI());
 
-				const spec = LENS_FLAGS.find((s) => s.name === "lens-compact-tool-line");
+				const spec = LENS_FLAGS.find(
+					(s) => s.name === "lens-compact-tool-line",
+				);
 				expect(spec).toBeDefined();
 				expect(pi.flags.get("lens-compact-tool-line")).toEqual({
 					description: spec?.description,
@@ -772,7 +917,11 @@ describe("index.ts extension wiring", () => {
 			removeTempDirSync(tmp);
 		});
 
-		function seedTurnEndFindings(cwd: string, content: string, sessionId: string): void {
+		function seedTurnEndFindings(
+			cwd: string,
+			content: string,
+			sessionId: string,
+		): void {
 			const file = path.join(cwd, "unchanged.ts");
 			fs.writeFileSync(file, "export const unchanged = true;\n");
 			const provenance = snapshotAdvisoryProvenance({
@@ -781,7 +930,11 @@ describe("index.ts extension wiring", () => {
 				generation: 1,
 				files: [{ path: file, role: "affected" }],
 			});
-			new CacheManager().writeCache("turn-end-findings", { content, provenance }, cwd);
+			new CacheManager().writeCache(
+				"turn-end-findings",
+				{ content, provenance },
+				cwd,
+			);
 		}
 
 		it("suppresses injection when --no-lens-context is set, then injects after /lens-context-toggle", async () => {
@@ -789,7 +942,14 @@ describe("index.ts extension wiring", () => {
 			_resetSessionLifecycleForTests();
 			const pi = createPiMock({ "no-lens-context": true });
 			extension(pi.asExtensionAPI());
-			await pi.emit("session_start", { sessionId: "wiring-session" }, makeCtx({ cwd: tmp, sessionId: "wiring-session" }));
+			// #1681: the host never puts sessionId on the session_start event — see
+			// index.ts's own comment at the `stableSessionId` read ("the event
+			// carries none"). It belongs on ctx, via makeCtx below.
+			await pi.emit(
+				"session_start",
+				makeSessionStartEvent(),
+				makeCtx({ cwd: tmp, sessionId: "wiring-session" }),
+			);
 			seedTurnEndFindings(tmp, "TESTFINDINGS_XYZZY", "wiring-session");
 
 			const existing = [{ role: "system", content: "orig" }];
@@ -889,5 +1049,174 @@ describe("index.ts extension wiring", () => {
 			expect(out).toContain("Machine-wide active log window");
 			expect(out).toContain("wiring-fixture: p50 100ms, p99 100ms, n=3");
 		});
+	});
+});
+
+/**
+ * #1925 — class siblings of the `agent_settled` stale-ctx crash (#1924/PR
+ * #1921).
+ *
+ * pi invalidates a captured event ctx when the session is replaced
+ * (`newSession`/`fork`/`switchSession`/`reload`). An event already queued when
+ * that happens still reaches pi-lens, carrying the DEAD ctx. Four handlers read
+ * a ctx property before any guard, so the SDK's `assertActive()` throw escaped
+ * into the host.
+ *
+ * Each test below drives one real registration through `createPiMock` with a
+ * ctx whose every accessor throws the SDK message, and asserts two things: the
+ * handler resolves rather than rejecting, and the skip is VISIBLE in the
+ * degradation ledger. Together they prove the shared wrapper
+ * (`clients/session-event-guard.ts`) is actually applied to each `pi.on` site —
+ * an unwrapped registration reds its own case. The ledger half is what keeps
+ * each guard mutation-proof: a guard that swallowed the throw silently would
+ * still pass the "does not reject" half.
+ */
+describe("stale extension ctx tolerance in event handlers (#1925)", () => {
+	beforeEach(() => {
+		_resetSessionLifecycleForTests();
+		resetBusPublishForTests();
+		resetDegradationLedger();
+	});
+	afterEach(() => {
+		_resetSessionLifecycleForTests();
+		resetBusPublishForTests();
+		resetDegradationLedger();
+	});
+
+	/** The ledger entry a stale-ctx skip must leave behind, for one handler. */
+	function expectStaleSkipRecorded(handler: string): void {
+		const group = getDegradationSummary().find(
+			(entry) => entry.kind === "extension-ctx-stale",
+		);
+		expect(
+			group,
+			`${handler} skipped a stale ctx without recording it in the degradation ledger`,
+		).toBeDefined();
+		expect(group?.latestReasons.map((reason) => reason.subject)).toContain(
+			handler,
+		);
+	}
+
+	const CASES: Array<{ event: string; payload: unknown }> = [
+		{
+			event: "tool_result",
+			payload: { toolName: "edit", input: { path: "a.ts" } },
+		},
+		{ event: "turn_start", payload: {} },
+		{ event: "agent_end", payload: { messages: [] } },
+		{ event: "turn_end", payload: {} },
+		{ event: "agent_settled", payload: {} },
+		// #1929: both of these already SURVIVED a stale ctx before the fix — each
+		// had a total try/catch — so the "resolves" half passes either way. The
+		// ledger half is the whole test. Without the wrapper the skip is logged as
+		// `session_start crashed: …` / `context event error: …` and counted
+		// nowhere, so `expectStaleSkipRecorded` is what reds on pre-fix code.
+		{ event: "session_start", payload: makeSessionStartEvent() },
+		{ event: "context", payload: { messages: [] } },
+	];
+
+	for (const { event, payload } of CASES) {
+		it(`tolerates and records a stale ctx delivered to ${event}`, async () => {
+			const pi = createPiMock();
+			extension(pi.asExtensionAPI());
+
+			await expect(
+				pi.emit(event, payload, makeStaleCtx()),
+			).resolves.not.toThrow();
+
+			expectStaleSkipRecorded(event);
+		});
+	}
+
+	it("hands the host its own message list back when context gets a stale ctx (#1929)", async () => {
+		// `context` is the one wrapped handler whose return value the host
+		// consumes. The stale path must answer `undefined` — pi's "this extension
+		// contributed nothing" — so the host keeps the transcript it already had.
+		// Any other value (a partial injection, an echoed array) would change what
+		// pi builds the request from at the exact moment pi-lens knows least.
+		const pi = createPiMock();
+		extension(pi.asExtensionAPI());
+		const existing = [{ role: "user", content: "keep me" }];
+
+		const result = await pi.emit(
+			"context",
+			{ messages: existing },
+			makeStaleCtx(),
+		);
+
+		expect(result).toBeUndefined();
+		expect(existing).toEqual([{ role: "user", content: "keep me" }]);
+		expectStaleSkipRecorded("context");
+	});
+
+	/**
+	 * A ctx that PASSES the pre-dispatch probe and dies afterwards (#1929).
+	 *
+	 * `makeStaleCtx` is dead on arrival, so the wrapper's probe catches it and
+	 * the handler never runs. The other half of the race is a swap that lands
+	 * while the handler is already inside its own body. `session_start` and
+	 * `context` each wrap their body in a total catch, so without an explicit
+	 * rethrow that catch eats the stale throw and the wrapper never sees it.
+	 */
+	function makeCtxThatDiesMidHandler() {
+		const ctx = makeCtx({ sessionId: "dies-mid-handler" });
+		ctx.isIdle = () => true;
+		Object.defineProperty(ctx, "cwd", {
+			configurable: true,
+			get() {
+				throw new Error(
+					"This extension ctx is stale after session replacement or reload",
+				);
+			},
+		});
+		return ctx;
+	}
+
+	for (const { event, payload } of [
+		{ event: "session_start", payload: makeSessionStartEvent() },
+		{ event: "context", payload: { messages: [] } },
+	]) {
+		it(`hands a MID-handler stale throw to the wrapper from ${event} (#1929)`, async () => {
+			const pi = createPiMock();
+			extension(pi.asExtensionAPI());
+
+			await expect(
+				pi.emit(event, payload, makeCtxThatDiesMidHandler()),
+			).resolves.not.toThrow();
+
+			// Without the rethrow this passes the "resolves" half and records
+			// nothing: the handler's own catch logs `… crashed` / `… event error`
+			// and the class stays invisible.
+			expectStaleSkipRecorded(event);
+			expect(
+				getDegradationSummary().find(
+					(entry) => entry.kind === "extension-ctx-stale",
+				)?.latestReasons[0]?.reason,
+			).toContain("mid-handler");
+		});
+	}
+
+	it("keeps a NON-stale handler failure loud instead of absorbing it", async () => {
+		// The guard classifies by message. An unrelated throw must still escape,
+		// and must never be counted as a stale-ctx skip — that would turn every
+		// handler bug into silence.
+		const pi = createPiMock();
+		extension(pi.asExtensionAPI());
+		const ctx = makeCtx();
+		Object.defineProperty(ctx, "signal", {
+			configurable: true,
+			get() {
+				throw new Error("boom: not a stale ctx");
+			},
+		});
+
+		await expect(
+			pi.emit("tool_result", { toolName: "edit" }, ctx),
+		).rejects.toThrow("boom: not a stale ctx");
+		expect(
+			getDegradationSummary().find(
+				(entry) => entry.kind === "extension-ctx-stale",
+			),
+		).toBeUndefined();
 	});
 });

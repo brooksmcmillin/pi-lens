@@ -45,7 +45,9 @@ describe("LSPService shutdown concurrency (#851)", () => {
 				await shutdownGate.promise;
 			}),
 		}));
-		const state = (service as unknown as { state: { clients: Map<string, unknown> } }).state;
+		const state = (
+			service as unknown as { state: { clients: Map<string, unknown> } }
+		).state;
 		for (const [index, client] of clients.entries()) {
 			state.clients.set(`server-${index}:root-${index}`, client);
 		}
@@ -56,7 +58,11 @@ describe("LSPService shutdown concurrency (#851)", () => {
 		});
 		await allStarted.promise;
 
-		expect(clients.every((client) => client.shutdown.mock.invocationCallOrder.length === 1)).toBe(true);
+		expect(
+			clients.every(
+				(client) => client.shutdown.mock.invocationCallOrder.length === 1,
+			),
+		).toBe(true);
 		expect(settled).toBe(false);
 
 		shutdownGate.resolve();

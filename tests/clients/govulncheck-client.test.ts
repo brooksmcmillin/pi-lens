@@ -35,9 +35,7 @@ describe("parseGovulncheckJson (#132)", () => {
 					affected: [
 						{
 							package: { name: "archive/tar" },
-							ranges: [
-								{ events: [{ introduced: "0" }, { fixed: "1.21.5" }] },
-							],
+							ranges: [{ events: [{ introduced: "0" }, { fixed: "1.21.5" }] }],
 						},
 					],
 				},

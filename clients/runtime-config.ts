@@ -34,7 +34,9 @@ export function getRunnerTimeoutFloorMs(): number {
 	if (_runnerTimeoutFloorCache !== undefined) return _runnerTimeoutFloorCache;
 	const config = loadPiLensGlobalConfig();
 	const configFloor = toPositiveFinite(config?.dispatch?.runnerTimeoutFloorMs);
-	const envFloor = toPositiveFinite(process.env.PI_LENS_RUNNER_TIMEOUT_FLOOR_MS);
+	const envFloor = toPositiveFinite(
+		process.env.PI_LENS_RUNNER_TIMEOUT_FLOOR_MS,
+	);
 	_runnerTimeoutFloorCache = Math.max(configFloor, envFloor, 0);
 	return _runnerTimeoutFloorCache;
 }

@@ -258,9 +258,7 @@ describe("classifyCurrentSessionEmission (#791 agent_end/turn_end read-only clas
 	it("same ctx object as the registered primary -> primary", () => {
 		const ownCtx = activeCtx();
 		registerPrimarySession(ownCtx, "session-a");
-		expect(classifyCurrentSessionEmission(ownCtx, "session-b")).toBe(
-			"primary",
-		);
+		expect(classifyCurrentSessionEmission(ownCtx, "session-b")).toBe("primary");
 	});
 
 	it("same session id as the registered primary -> primary", () => {

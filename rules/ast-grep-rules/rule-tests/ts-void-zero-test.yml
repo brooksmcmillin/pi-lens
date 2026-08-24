@@ -3,6 +3,7 @@ valid:
   - 'undefined'
   - 'void x'
   - 'void 1'
+  - 'function probe(undefined) { return undefined; }'
 invalid:
   - 'void 0'
   - 'const x = void 0'

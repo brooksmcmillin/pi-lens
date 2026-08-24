@@ -3,7 +3,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { CACHE_VERSION, RuleCache } from "../../clients/cache/rule-cache.js";
-import { getGlobalPiLensDir, getProjectDataDir } from "../../clients/file-utils.js";
+import {
+	getGlobalPiLensDir,
+	getProjectDataDir,
+} from "../../clients/file-utils.js";
 import { appendToWorklog, readWorklog } from "../../clients/fix-worklog.js";
 
 const originalDataDir = process.env.PILENS_DATA_DIR;
@@ -138,7 +141,9 @@ describe("getProjectDataDir", () => {
 
 	// #1448: model/provider attribution
 	it("carries model and provider when an identity is supplied", () => {
-		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-worklog-model-"));
+		const cwd = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-worklog-model-"),
+		);
 		process.env.PILENS_DATA_DIR = fs.mkdtempSync(
 			path.join(os.tmpdir(), "pi-lens-global-data-"),
 		);
@@ -170,7 +175,9 @@ describe("getProjectDataDir", () => {
 	});
 
 	it("omits model and provider from the persisted line when identity is unknown", () => {
-		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-worklog-blank-"));
+		const cwd = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-worklog-blank-"),
+		);
 		process.env.PILENS_DATA_DIR = fs.mkdtempSync(
 			path.join(os.tmpdir(), "pi-lens-global-data-"),
 		);

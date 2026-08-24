@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
@@ -9,7 +10,8 @@ import {
 	recordFromCodeQualityDiagnostic,
 } from "../../clients/code-quality-warnings.js";
 import type { Diagnostic } from "../../clients/dispatch/types.js";
-import { setupTestEnvironment } from "./test-utils.js";
+import { normalizeMapKey } from "../../clients/path-utils.js";
+import { removeTempDirSync, setupTestEnvironment } from "./test-utils.js";
 
 function makeQualityWarning(filePath: string): Diagnostic {
 	return {
@@ -39,7 +41,8 @@ describe("code quality warnings", () => {
 			category: "maintainability",
 			line: 10,
 		});
-		expect(record?.id).toMatch(/^cq:[0-9a-f]{10}$/);
+		// #1816: unified onto finding-identity.ts's 12-char hash length (was 10).
+		expect(record?.id).toMatch(/^cq:[0-9a-f]{12}$/);
 	});
 
 	it("excludes fixable diagnostics that belong in actionable warnings", () => {
@@ -184,5 +187,46 @@ describe("code quality warnings", () => {
 		expect(callSites.sort()).toEqual(
 			["clients/code-quality-warnings.ts", "clients/runtime-turn.ts"].sort(),
 		);
+	});
+});
+
+describe("id path-form stability (#1816 — #533 class swept into the warning stores)", () => {
+	// Before #1816, this file's `relativeFile` hashed whichever RAW path form
+	// the caller passed — unlike diagnostic-dispositions.ts, which already
+	// canonicalized both `cwd` and `filePath` through `normalizeMapKey`. A
+	// raw mis-cased path form and its normalizeMapKey'd form of the SAME
+	// on-disk file therefore hashed to two DIFFERENT `cq:` ids. Post-#1816,
+	// both derive the shared `finding-identity.js` id, so they converge.
+	// No persisted-store migration is needed here (unlike
+	// actionable-warnings.ts) — see that id builder's own doc comment for why
+	// `cq:` ids are ephemeral-per-turn.
+	it("computes the same id for a raw mis-cased path form and its normalized form", () => {
+		const projectDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-cq-id-form-"),
+		);
+		try {
+			const subDirOnDisk = path.join(projectDir, "sub");
+			fs.mkdirSync(subDirOnDisk, { recursive: true });
+			const fileOnDisk = path.join(subDirOnDisk, "a.ts");
+			fs.writeFileSync(fileOnDisk, "function fn() {}\n");
+
+			const rawFile = path.join(projectDir, "SUB", "a.ts");
+			// Only aliases on a case-insensitive filesystem — skip honestly on
+			// Linux CI rather than asserting something the FS can't produce.
+			if (!fs.existsSync(rawFile)) return;
+
+			const rawRecord = recordFromCodeQualityDiagnostic(
+				makeQualityWarning(rawFile),
+				projectDir,
+			);
+			const normalizedRecord = recordFromCodeQualityDiagnostic(
+				makeQualityWarning(normalizeMapKey(fileOnDisk)),
+				normalizeMapKey(projectDir),
+			);
+			expect(rawRecord?.id).toBeDefined();
+			expect(rawRecord?.id).toBe(normalizedRecord?.id);
+		} finally {
+			removeTempDirSync(projectDir);
+		}
 	});
 });

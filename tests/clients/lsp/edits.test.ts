@@ -11,7 +11,8 @@ import {
 	mergeWorkspaceTextEditsByPriority,
 } from "../../../clients/lsp/edits.js";
 import { measureMaxSyncBlockMs } from "../../support/perf-harness.js";
-import { normalizeMapKey } from "../../../clients/lsp/path-utils.js";
+import { normalizeMapKey } from "../../../clients/path-utils.js";
+import { RuntimeCoordinator } from "../../../clients/runtime-coordinator.js";
 import { removeTempDirSync } from "../test-utils.js";
 import {
 	recordLspMutation,
@@ -121,18 +122,31 @@ describe("LSP workspace edits", () => {
 	});
 
 	it("merges divergent URI spellings into one conflict bucket", () => {
-		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-uri-bucket-"));
+		const tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-uri-bucket-"),
+		);
 		try {
 			const filePath = path.join(tmpDir, "shared.ts");
 			fs.writeFileSync(filePath, "abcdef", "utf-8");
 			const uri = pathToFileURL(filePath).href;
-			const divergentUri = uri.replace(/\/([^/]+)$/, (_, name: string) =>
-				`/%${name.charCodeAt(0).toString(16).padStart(2, "0")}${name.slice(1)}`,
+			const divergentUri = uri.replace(
+				/\/([^/]+)$/,
+				(_, name: string) =>
+					`/%${name.charCodeAt(0).toString(16).padStart(2, "0")}${name.slice(1)}`,
 			);
-			const edit = (newText: string) => ({ range: { start: { line: 0, character: 1 }, end: { line: 0, character: 4 } }, newText });
+			const edit = (newText: string) => ({
+				range: {
+					start: { line: 0, character: 1 },
+					end: { line: 0, character: 4 },
+				},
+				newText,
+			});
 			const result = mergeWorkspaceTextEditsByPriority([
 				{ serverId: "primary", edit: { changes: { [uri]: [edit("first")] } } },
-				{ serverId: "secondary", edit: { changes: { [divergentUri]: [edit("second")] } } },
+				{
+					serverId: "secondary",
+					edit: { changes: { [divergentUri]: [edit("second")] } },
+				},
 			]);
 			expect(divergentUri).not.toBe(uri);
 			expect(result.droppedConflicts).toBe(1);
@@ -236,12 +250,15 @@ describe("LSP workspace edits", () => {
 	});
 
 	it("records bounded mixed text/resource operations and mutation bookkeeping", async () => {
-		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-observe-"));
+		const tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-observe-"),
+		);
 		const filePath = path.join(tmpDir, "a.ts");
 		const createdPath = path.join(tmpDir, "created.ts");
 		fs.writeFileSync(filePath, "const old = 1;\n", "utf-8");
 		const written: string[] = [];
-		const bumped: string[] = [];
+		const realRuntime = new RuntimeCoordinator();
+		realRuntime.projectRoot = tmpDir;
 		const ranges: Array<{ filePath: string; start: number; end: number }> = [];
 		const context: LspMutationContext = {
 			cwd: tmpDir,
@@ -249,28 +266,31 @@ describe("LSP workspace edits", () => {
 			tool: "lsp_navigation",
 			source: "lsp-edit",
 			readGuard: { recordWritten: (file) => written.push(file) },
-			runtime: {
-				telemetrySessionId: "session",
-				turnIndex: 3,
-				bumpFileSeq: (file) => {
-					bumped.push(file);
-					return { projectSeq: bumped.length, fileSeq: 1 };
-				},
-			},
+			// REAL coordinator (#1742 direction): assert the mutation actually
+			// landed in the one seam's store, not in a test-local spy.
+			runtime: realRuntime,
 			cacheManager: {
-				addModifiedRange: (file, range) => ranges.push({ filePath: file, ...range }),
+				addModifiedRange: (file, range) =>
+					ranges.push({ filePath: file, ...range }),
 			},
 		};
 		try {
 			const result = await applyWorkspaceEdit(
 				{
 					changes: {
-						[pathToFileURL(filePath).href]: [{
-							range: { start: { line: 0, character: 6 }, end: { line: 0, character: 9 } },
-							newText: "new",
-						}],
+						[pathToFileURL(filePath).href]: [
+							{
+								range: {
+									start: { line: 0, character: 6 },
+									end: { line: 0, character: 9 },
+								},
+								newText: "new",
+							},
+						],
 					},
-					documentChanges: [{ kind: "create", uri: pathToFileURL(createdPath).href }],
+					documentChanges: [
+						{ kind: "create", uri: pathToFileURL(createdPath).href },
+					],
 				},
 				tmpDir,
 				{ mutationContext: context },
@@ -279,7 +299,14 @@ describe("LSP workspace edits", () => {
 			expect(result.appliedOperationTotal).toBe(2);
 			expect(result.appliedOperationIndexes).toEqual([0, 1]);
 			expect(written).toEqual([createdPath, filePath]);
-			expect(bumped).toEqual([createdPath, filePath]);
+			const receipts = realRuntime.getMutationsSince(0);
+			expect(receipts.map((r) => r.filePath)).toEqual(
+				[createdPath, filePath].map((p) => normalizeMapKey(p)),
+			);
+			expect(receipts.every((r) => r.source === "lsp-edit")).toBe(true);
+			expect(realRuntime.getFilesChangedSince(0)).toEqual(
+				[createdPath, filePath].map((p) => normalizeMapKey(p)),
+			);
 			expect(ranges).toHaveLength(2);
 			expect(context.summaryEmitted).toBe(true);
 		} finally {
@@ -288,7 +315,9 @@ describe("LSP workspace edits", () => {
 	});
 
 	it("records a failed terminal state without mutating on preflight rejection", async () => {
-		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-partial-"));
+		const tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-partial-"),
+		);
 		const filePath = path.join(tmpDir, "a.ts");
 		fs.writeFileSync(filePath, "const old = 1;\n", "utf-8");
 		const context: LspMutationContext = {
@@ -298,19 +327,32 @@ describe("LSP workspace edits", () => {
 			source: "lsp-edit",
 		};
 		try {
-			await expect(applyWorkspaceEdit({
-				changes: {
-					[pathToFileURL(filePath).href]: [{
-						range: { start: { line: 0, character: 6 }, end: { line: 0, character: 9 } },
-						newText: "new",
-					}],
-				},
-				documentChanges: [{
-					kind: "rename",
-					oldUri: pathToFileURL(path.join(tmpDir, "missing.ts")).href,
-					newUri: pathToFileURL(path.join(tmpDir, "new.ts")).href,
-				}],
-			}, tmpDir, { mutationContext: context })).rejects.toThrow(/rename source does not exist/);
+			await expect(
+				applyWorkspaceEdit(
+					{
+						changes: {
+							[pathToFileURL(filePath).href]: [
+								{
+									range: {
+										start: { line: 0, character: 6 },
+										end: { line: 0, character: 9 },
+									},
+									newText: "new",
+								},
+							],
+						},
+						documentChanges: [
+							{
+								kind: "rename",
+								oldUri: pathToFileURL(path.join(tmpDir, "missing.ts")).href,
+								newUri: pathToFileURL(path.join(tmpDir, "new.ts")).href,
+							},
+						],
+					},
+					tmpDir,
+					{ mutationContext: context },
+				),
+			).rejects.toThrow(/rename source does not exist/);
 			expect(fs.readFileSync(filePath, "utf-8")).toBe("const old = 1;\n");
 			expect(context.summaryEmitted).toBe(true);
 		} finally {
@@ -329,17 +371,29 @@ describe("LSP workspace edits", () => {
 		};
 		const telemetry = recordLspMutation(context, {
 			bookkeep: false,
-			results: [{
-				descriptions: [],
-				files,
-				operationTotal: 120,
-				appliedOperationTotal: 120,
-				appliedOperationIndexes: Array.from({ length: 120 }, (_, index) => index),
-				operationCounts: { textEdits: 100, create: 10, rename: 5, delete: 5 },
-				fileDetails: files.map((filePath) => ({ filePath })),
-			}],
+			results: [
+				{
+					descriptions: [],
+					files,
+					operationTotal: 120,
+					appliedOperationTotal: 120,
+					appliedOperationIndexes: Array.from(
+						{ length: 120 },
+						(_, index) => index,
+					),
+					operationCounts: { textEdits: 100, create: 10, rename: 5, delete: 5 },
+					fileDetails: files.map((filePath) => ({ filePath })),
+				},
+			],
 		});
-		expect(telemetry.operationCounts).toEqual({ requested: 120, applied: 120, textEdits: 100, create: 10, rename: 5, delete: 5 });
+		expect(telemetry.operationCounts).toEqual({
+			requested: 120,
+			applied: 120,
+			textEdits: 100,
+			create: 10,
+			rename: 5,
+			delete: 5,
+		});
 		expect(telemetry.sampledPaths).toHaveLength(100);
 		expect(telemetry.sampledPathsTotal).toBe(120);
 		expect(telemetry.sampledPathsTruncated).toBe(true);
@@ -505,25 +559,30 @@ describe("LSP workspace edits", () => {
 		fs.writeFileSync(oldChild, "old", "utf-8");
 
 		try {
-			const result = await applyWorkspaceEdit({
-				documentChanges: [
-					{
-						kind: "rename",
-						oldUri: pathToFileURL(oldDir).href,
-						newUri: pathToFileURL(newDir).href,
-					},
-					{
-						textDocument: { uri: pathToFileURL(newChild).href },
-						edits: [{
-							range: {
-								start: { line: 0, character: 0 },
-								end: { line: 0, character: 3 },
-							},
-							newText: "new",
-						}],
-					},
-				],
-			}, tmpDir);
+			const result = await applyWorkspaceEdit(
+				{
+					documentChanges: [
+						{
+							kind: "rename",
+							oldUri: pathToFileURL(oldDir).href,
+							newUri: pathToFileURL(newDir).href,
+						},
+						{
+							textDocument: { uri: pathToFileURL(newChild).href },
+							edits: [
+								{
+									range: {
+										start: { line: 0, character: 0 },
+										end: { line: 0, character: 3 },
+									},
+									newText: "new",
+								},
+							],
+						},
+					],
+				},
+				tmpDir,
+			);
 
 			expect(fs.readFileSync(newChild, "utf-8")).toBe("new");
 			expect(result.descriptions).toEqual([
@@ -544,19 +603,37 @@ describe("LSP workspace edits", () => {
 		fs.writeFileSync(path.join(oldDir, "child.ts"), "old", "utf-8");
 
 		try {
-			await expect(applyWorkspaceEdit({
-				documentChanges: [
-					{ kind: "rename", oldUri: pathToFileURL(oldDir).href, newUri: pathToFileURL(newDir).href },
-					{ kind: "delete", uri: pathToFileURL(newDir).href, options: { recursive: true } },
+			await expect(
+				applyWorkspaceEdit(
 					{
-						textDocument: { uri: pathToFileURL(childPath).href },
-						edits: [{
-							range: { start: { line: 0, character: 0 }, end: { line: 0, character: 3 } },
-							newText: "changed",
-						}],
+						documentChanges: [
+							{
+								kind: "rename",
+								oldUri: pathToFileURL(oldDir).href,
+								newUri: pathToFileURL(newDir).href,
+							},
+							{
+								kind: "delete",
+								uri: pathToFileURL(newDir).href,
+								options: { recursive: true },
+							},
+							{
+								textDocument: { uri: pathToFileURL(childPath).href },
+								edits: [
+									{
+										range: {
+											start: { line: 0, character: 0 },
+											end: { line: 0, character: 3 },
+										},
+										newText: "changed",
+									},
+								],
+							},
+						],
 					},
-				],
-			}, tmpDir)).rejects.toThrow(/text edit target is not a file/);
+					tmpDir,
+				),
+			).rejects.toThrow(/text edit target is not a file/);
 			expect(fs.existsSync(oldDir)).toBe(true);
 			expect(fs.existsSync(newDir)).toBe(false);
 		} finally {
@@ -575,20 +652,40 @@ describe("LSP workspace edits", () => {
 		fs.writeFileSync(path.join(oldDir, "sub", "child.ts"), "old", "utf-8");
 
 		try {
-			await applyWorkspaceEdit({
-				documentChanges: [
-					{ kind: "rename", oldUri: pathToFileURL(oldDir).href, newUri: pathToFileURL(newDir).href },
-					{ kind: "rename", oldUri: pathToFileURL(path.join(newDir, "sub")).href, newUri: pathToFileURL(movedDir).href },
-					{ kind: "delete", uri: pathToFileURL(newDir).href, options: { recursive: true } },
-					{
-						textDocument: { uri: pathToFileURL(childPath).href },
-						edits: [{
-							range: { start: { line: 0, character: 0 }, end: { line: 0, character: 3 } },
-							newText: "changed",
-						}],
-					},
-				],
-			}, tmpDir);
+			await applyWorkspaceEdit(
+				{
+					documentChanges: [
+						{
+							kind: "rename",
+							oldUri: pathToFileURL(oldDir).href,
+							newUri: pathToFileURL(newDir).href,
+						},
+						{
+							kind: "rename",
+							oldUri: pathToFileURL(path.join(newDir, "sub")).href,
+							newUri: pathToFileURL(movedDir).href,
+						},
+						{
+							kind: "delete",
+							uri: pathToFileURL(newDir).href,
+							options: { recursive: true },
+						},
+						{
+							textDocument: { uri: pathToFileURL(childPath).href },
+							edits: [
+								{
+									range: {
+										start: { line: 0, character: 0 },
+										end: { line: 0, character: 3 },
+									},
+									newText: "changed",
+								},
+							],
+						},
+					],
+				},
+				tmpDir,
+			);
 
 			expect(fs.readFileSync(childPath, "utf-8")).toBe("changed");
 			expect(fs.existsSync(newDir)).toBe(false);
@@ -667,10 +764,10 @@ describe("LSP workspace edits", () => {
 							],
 						},
 						{
-					kind: "delete",
-					uri: pathToFileURL(doomedDir).href,
-					options: { recursive: true },
-				},
+							kind: "delete",
+							uri: pathToFileURL(doomedDir).href,
+							options: { recursive: true },
+						},
 					],
 				},
 				tmpDir,
@@ -696,21 +793,63 @@ describe("LSP workspace edits", () => {
 		const missingPath = path.join(tmpDir, "missing.ts");
 		fs.writeFileSync(firstPath, "first", "utf-8");
 		try {
-			await expect(applyWorkspaceEdit({ changes: {
-				[pathToFileURL(firstPath).href]: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } }, newText: "changed" }],
-				[pathToFileURL(missingPath).href]: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } }, newText: "missing" }],
-			} }, tmpDir)).rejects.toThrow(/text edit target is not a file/);
+			await expect(
+				applyWorkspaceEdit(
+					{
+						changes: {
+							[pathToFileURL(firstPath).href]: [
+								{
+									range: {
+										start: { line: 0, character: 0 },
+										end: { line: 0, character: 5 },
+									},
+									newText: "changed",
+								},
+							],
+							[pathToFileURL(missingPath).href]: [
+								{
+									range: {
+										start: { line: 0, character: 0 },
+										end: { line: 0, character: 0 },
+									},
+									newText: "missing",
+								},
+							],
+						},
+					},
+					tmpDir,
+				),
+			).rejects.toThrow(/text edit target is not a file/);
 			expect(fs.readFileSync(firstPath, "utf-8")).toBe("first");
-		} finally { removeTempDirSync(tmpDir); }
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
 	});
 
 	it.each([
 		["utf-8", 1, 5],
 		["utf-16", 1, 3],
 		["utf-32", 1, 2],
-	] as const)("applies astral positions in %s encoding", (encoding, start, end) => {
-		expect(applyTextEditsToString("a😀é", [{ range: { start: { line: 0, character: start }, end: { line: 0, character: end } }, newText: "X" }], encoding)).toBe("aXé");
-	});
+	] as const)(
+		"applies astral positions in %s encoding",
+		(encoding, start, end) => {
+			expect(
+				applyTextEditsToString(
+					"a😀é",
+					[
+						{
+							range: {
+								start: { line: 0, character: start },
+								end: { line: 0, character: end },
+							},
+							newText: "X",
+						},
+					],
+					encoding,
+				),
+			).toBe("aXé");
+		},
+	);
 
 	it("rejects malformed, out-of-bounds, and unsupported edits", async () => {
 		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-edits-"));
@@ -718,48 +857,158 @@ describe("LSP workspace edits", () => {
 		fs.writeFileSync(filePath, "abc", "utf-8");
 		const uri = pathToFileURL(filePath).href;
 		try {
-			expect(() => applyTextEditsToString("abc", [{ range: { start: { line: 0.5, character: 0 }, end: { line: 0, character: 0 } }, newText: "x" }])).toThrow(/overlapping|outside|range/);
+			expect(() =>
+				applyTextEditsToString("abc", [
+					{
+						range: {
+							start: { line: 0.5, character: 0 },
+							end: { line: 0, character: 0 },
+						},
+						newText: "x",
+					},
+				]),
+			).toThrow(/overlapping|outside|range/);
 			// Malformed shapes still throw: a negative character is not a spec-clampable
 			// out-of-range position (which now clamps — see the clamp cases below).
-			await expect(applyWorkspaceEdit({ changes: { [uri]: [{ range: { start: { line: 0, character: -1 }, end: { line: 0, character: -1 } }, newText: "x" }] } }, tmpDir)).rejects.toThrow(/malformed text edit/);
-			await expect(applyWorkspaceEdit({ documentChanges: [{ kind: "watch", uri }] }, tmpDir)).rejects.toThrow(/unsupported workspace resource operation/);
-		} finally { removeTempDirSync(tmpDir); }
+			await expect(
+				applyWorkspaceEdit(
+					{
+						changes: {
+							[uri]: [
+								{
+									range: {
+										start: { line: 0, character: -1 },
+										end: { line: 0, character: -1 },
+									},
+									newText: "x",
+								},
+							],
+						},
+					},
+					tmpDir,
+				),
+			).rejects.toThrow(/malformed text edit/);
+			await expect(
+				applyWorkspaceEdit(
+					{ documentChanges: [{ kind: "watch", uri }] },
+					tmpDir,
+				),
+			).rejects.toThrow(/unsupported workspace resource operation/);
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
 	});
 
 	// P2: LSP 3.17 out-of-range clamping (line past EOF → end of document,
 	// character past line end → line length). Regression reintroduced in 3.8.74.
 	it("clamps out-of-range positions instead of throwing (LSP 3.17)", async () => {
-		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-edits-clamp-"));
+		const tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-edits-clamp-"),
+		);
 		try {
 			// Whole-document replace via the (0,0)-(9999,0) sentinel idiom.
 			const wholeDoc = path.join(tmpDir, "whole.ts");
 			fs.writeFileSync(wholeDoc, "line0\nline1", "utf-8");
-			await applyWorkspaceEdit({ changes: { [pathToFileURL(wholeDoc).href]: [{ range: { start: { line: 0, character: 0 }, end: { line: 9999, character: 0 } }, newText: "WHOLE" }] } }, tmpDir);
+			await applyWorkspaceEdit(
+				{
+					changes: {
+						[pathToFileURL(wholeDoc).href]: [
+							{
+								range: {
+									start: { line: 0, character: 0 },
+									end: { line: 9999, character: 0 },
+								},
+								newText: "WHOLE",
+							},
+						],
+					},
+				},
+				tmpDir,
+			);
 			expect(fs.readFileSync(wholeDoc, "utf-8")).toBe("WHOLE");
 
 			// Character past the line end clamps to the line length (append).
 			const charClamp = path.join(tmpDir, "char.ts");
 			fs.writeFileSync(charClamp, "abc", "utf-8");
-			await applyWorkspaceEdit({ changes: { [pathToFileURL(charClamp).href]: [{ range: { start: { line: 0, character: 99 }, end: { line: 0, character: 99 } }, newText: "X" }] } }, tmpDir);
+			await applyWorkspaceEdit(
+				{
+					changes: {
+						[pathToFileURL(charClamp).href]: [
+							{
+								range: {
+									start: { line: 0, character: 99 },
+									end: { line: 0, character: 99 },
+								},
+								newText: "X",
+							},
+						],
+					},
+				},
+				tmpDir,
+			);
 			expect(fs.readFileSync(charClamp, "utf-8")).toBe("abcX");
 
 			// Direct string helper clamps the same way under every encoding.
-			expect(applyTextEditsToString("abc", [{ range: { start: { line: 5, character: 0 }, end: { line: 9, character: 0 } }, newText: "!" }])).toBe("abc!");
+			expect(
+				applyTextEditsToString("abc", [
+					{
+						range: {
+							start: { line: 5, character: 0 },
+							end: { line: 9, character: 0 },
+						},
+						newText: "!",
+					},
+				]),
+			).toBe("abc!");
 
 			// CRLF: clamping a char past the line end must land BEFORE the trailing
 			// `\r`, not between `\r` and `\n` (P2-1). lineTextAt keeps the `\r`, so a
 			// naive clamp to line.length corrupts CRLF files.
-			expect(applyTextEditsToString("abc\r\ndef", [{ range: { start: { line: 0, character: 99 }, end: { line: 0, character: 99 } }, newText: "X" }])).toBe("abcX\r\ndef");
+			expect(
+				applyTextEditsToString("abc\r\ndef", [
+					{
+						range: {
+							start: { line: 0, character: 99 },
+							end: { line: 0, character: 99 },
+						},
+						newText: "X",
+					},
+				]),
+			).toBe("abcX\r\ndef");
 			// The whole-line sentinel replace on a CRLF line must preserve the `\r\n`.
-			expect(applyTextEditsToString("abc\r\ndef", [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 999 } }, newText: "Y" }])).toBe("Y\r\ndef");
-		} finally { removeTempDirSync(tmpDir); }
+			expect(
+				applyTextEditsToString("abc\r\ndef", [
+					{
+						range: {
+							start: { line: 0, character: 0 },
+							end: { line: 0, character: 999 },
+						},
+						newText: "Y",
+					},
+				]),
+			).toBe("Y\r\ndef");
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
 	});
 
 	// P3-1: an insert listed AFTER a replace that starts at the same position is
 	// LSP-legal (VSCode applies it); result is independent of listing order.
 	it("applies an insert at a replace boundary in either listing order", () => {
-		const replace = { range: { start: { line: 0, character: 0 }, end: { line: 0, character: 2 } }, newText: "X" };
-		const insert = { range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } }, newText: "Y" };
+		const replace = {
+			range: {
+				start: { line: 0, character: 0 },
+				end: { line: 0, character: 2 },
+			},
+			newText: "X",
+		};
+		const insert = {
+			range: {
+				start: { line: 0, character: 0 },
+				end: { line: 0, character: 0 },
+			},
+			newText: "Y",
+		};
 		expect(applyTextEditsToString("abc", [replace, insert])).toBe("YXc");
 		expect(applyTextEditsToString("abc", [insert, replace])).toBe("YXc");
 	});
@@ -770,7 +1019,22 @@ describe("LSP workspace edits", () => {
 		fs.writeFileSync(filePath, "old", "utf-8");
 		const versioned = (version: number, current: number) =>
 			applyWorkspaceEdit(
-				{ documentChanges: [{ textDocument: { uri: pathToFileURL(filePath).href, version }, edits: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 3 } }, newText: "new" }] }] },
+				{
+					documentChanges: [
+						{
+							textDocument: { uri: pathToFileURL(filePath).href, version },
+							edits: [
+								{
+									range: {
+										start: { line: 0, character: 0 },
+										end: { line: 0, character: 3 },
+									},
+									newText: "new",
+								},
+							],
+						},
+					],
+				},
 				tmpDir,
 				// Preflight looks the version up via normalizeMapKey; the map MUST be
 				// keyed the same way or the rejection passes vacuously (unknown key →
@@ -779,13 +1043,17 @@ describe("LSP workspace edits", () => {
 			);
 		try {
 			// Genuine mismatch (expected 2, live 1) → reject, no mutation.
-			await expect(versioned(2, 1)).rejects.toThrow(/stale text document version/);
+			await expect(versioned(2, 1)).rejects.toThrow(
+				/stale text document version/,
+			);
 			expect(fs.readFileSync(filePath, "utf-8")).toBe("old");
 			// Positive path: a matching version SUCCEEDS (the missing coverage — the
 			// old test only asserted the rejection, and only vacuously at that).
 			await versioned(1, 1);
 			expect(fs.readFileSync(filePath, "utf-8")).toBe("new");
-		} finally { removeTempDirSync(tmpDir); }
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
 	});
 
 	it("confines file URIs and rejects duplicate resources", async () => {
@@ -794,45 +1062,148 @@ describe("LSP workspace edits", () => {
 		const inside = path.join(tmpDir, "inside.ts");
 		fs.writeFileSync(outside, "outside", "utf-8");
 		try {
-			await expect(applyWorkspaceEdit({ changes: { [pathToFileURL(outside).href]: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } }, newText: "x" }] } }, tmpDir)).rejects.toThrow(/escapes workspace/);
-			await expect(applyWorkspaceEdit({ documentChanges: [{ kind: "create", uri: pathToFileURL(inside).href, options: { ignoreIfExists: true } }, { kind: "create", uri: pathToFileURL(inside).href, options: { ignoreIfExists: true } }] }, tmpDir)).rejects.toThrow(/duplicate workspace resource/);
-			await expect(applyWorkspaceEdit({ changes: { https: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } }, newText: "x" }] } }, tmpDir)).rejects.toThrow(/invalid workspace edit URI/);
-		} finally { removeTempDirSync(tmpDir); removeTempDirSync(outside); }
+			await expect(
+				applyWorkspaceEdit(
+					{
+						changes: {
+							[pathToFileURL(outside).href]: [
+								{
+									range: {
+										start: { line: 0, character: 0 },
+										end: { line: 0, character: 0 },
+									},
+									newText: "x",
+								},
+							],
+						},
+					},
+					tmpDir,
+				),
+			).rejects.toThrow(/escapes workspace/);
+			await expect(
+				applyWorkspaceEdit(
+					{
+						documentChanges: [
+							{
+								kind: "create",
+								uri: pathToFileURL(inside).href,
+								options: { ignoreIfExists: true },
+							},
+							{
+								kind: "create",
+								uri: pathToFileURL(inside).href,
+								options: { ignoreIfExists: true },
+							},
+						],
+					},
+					tmpDir,
+				),
+			).rejects.toThrow(/duplicate workspace resource/);
+			await expect(
+				applyWorkspaceEdit(
+					{
+						changes: {
+							https: [
+								{
+									range: {
+										start: { line: 0, character: 0 },
+										end: { line: 0, character: 0 },
+									},
+									newText: "x",
+								},
+							],
+						},
+					},
+					tmpDir,
+				),
+			).rejects.toThrow(/invalid workspace edit URI/);
+		} finally {
+			removeTempDirSync(tmpDir);
+			removeTempDirSync(outside);
+		}
 	});
 
-	it("rejects symlink escapes during workspace-edit preflight", async ({ skip }) => {
+	it("rejects symlink escapes during workspace-edit preflight", async ({
+		skip,
+	}) => {
 		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-edits-"));
-		const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-outside-"));
+		const outsideDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-outside-"),
+		);
 		const outsideFile = path.join(outsideDir, "outside.ts");
 		const linkDir = path.join(tmpDir, "linked");
 		fs.writeFileSync(outsideFile, "outside", "utf-8");
 		try {
 			try {
-				fs.symlinkSync(outsideDir, linkDir, process.platform === "win32" ? "junction" : "dir");
+				fs.symlinkSync(
+					outsideDir,
+					linkDir,
+					process.platform === "win32" ? "junction" : "dir",
+				);
 			} catch (err) {
-				skip(`symlink/junction setup unavailable: ${err instanceof Error ? err.message : String(err)}`);
+				skip(
+					`symlink/junction setup unavailable: ${err instanceof Error ? err.message : String(err)}`,
+				);
 				return;
 			}
-			await expect(applyWorkspaceEdit({ changes: {
-				[pathToFileURL(path.join(linkDir, "outside.ts")).href]: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 7 } }, newText: "changed" }],
-			} }, tmpDir)).rejects.toThrow(/escapes workspace/);
+			await expect(
+				applyWorkspaceEdit(
+					{
+						changes: {
+							[pathToFileURL(path.join(linkDir, "outside.ts")).href]: [
+								{
+									range: {
+										start: { line: 0, character: 0 },
+										end: { line: 0, character: 7 },
+									},
+									newText: "changed",
+								},
+							],
+						},
+					},
+					tmpDir,
+				),
+			).rejects.toThrow(/escapes workspace/);
 			expect(fs.readFileSync(outsideFile, "utf-8")).toBe("outside");
-		} finally { removeTempDirSync(tmpDir); removeTempDirSync(outsideDir); }
+		} finally {
+			removeTempDirSync(tmpDir);
+			removeTempDirSync(outsideDir);
+		}
 	});
 
 	it("coalesces URI spellings after path canonicalization", () => {
-		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-edits-key-"));
+		const tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-edits-key-"),
+		);
 		const filePath = path.join(tmpDir, "file.ts");
 		fs.writeFileSync(filePath, "old", "utf-8");
 		const uri = pathToFileURL(filePath).href;
 		const encodedUri = uri.replace("file.ts", "%66ile.ts");
 		try {
-			expect(__planWorkspaceEditForTest({
-				changes: {
-					[uri]: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 3 } }, newText: "first" }],
-					[encodedUri]: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 3 } }, newText: "second" }],
-				},
-			})).toBe(1);
+			expect(
+				__planWorkspaceEditForTest({
+					changes: {
+						[uri]: [
+							{
+								range: {
+									start: { line: 0, character: 0 },
+									end: { line: 0, character: 3 },
+								},
+								newText: "first",
+							},
+						],
+						[encodedUri]: [
+							{
+								range: {
+									start: { line: 0, character: 0 },
+									end: { line: 0, character: 3 },
+								},
+								newText: "second",
+							},
+						],
+					},
+				}),
+			).toBe(1);
 		} finally {
 			removeTempDirSync(tmpDir);
 		}
@@ -861,47 +1232,113 @@ describe("LSP workspace edits", () => {
 	// Scaling (Windows, standalone): ~47-78ms at 800 ops, ~0.5-1.2s at 8k,
 	// ~1.6-2.0s at 40k — mostly system time — so an O(1k)-scale synchronous
 	// regression still trips the 200ms CPU budget by a wide margin.
-	it("keeps large text/resource planning occupancy bounded", { timeout: 30_000, retry: 2 }, async () => {
-		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-edits-plan-"));
-		const changes: Record<string, unknown[]> = {};
-		const documentChanges: unknown[] = [];
-		const count = 400;
-		for (let index = 0; index < count; index++) {
-			const filePath = path.join(tmpDir, `file-${index}.ts`);
-			fs.writeFileSync(filePath, "old", "utf-8");
-			const uri = pathToFileURL(filePath).href;
-			changes[uri] = [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 3 } }, newText: "new" }];
-			documentChanges.push({ kind: "create", uri, options: { ignoreIfExists: true } });
-		}
-		try {
-			let planned = 0;
-			let cpuMs = 0;
-			const maxBlock = await measureMaxSyncBlockMs(async () => {
-				const start = process.cpuUsage();
-				planned = __planWorkspaceEditForTest({ changes, documentChanges });
-				const { user, system } = process.cpuUsage(start);
-				cpuMs = (user + system) / 1000;
-			});
-			expect(planned).toBe(count * 2);
-			expect(cpuMs).toBeLessThan(200);
-			expect(maxBlock).toBeLessThan(300);
-			// Criterion-4 evidence: the 4-worker full-suite run passed these occupancy
-			// assertions, so contention did not breach the 200ms CPU or 300ms sync-block budgets.
-		} finally { removeTempDirSync(tmpDir); }
-	});
+	it(
+		"keeps large text/resource planning occupancy bounded",
+		{ timeout: 30_000, retry: 2 },
+		async () => {
+			const tmpDir = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-lsp-edits-plan-"),
+			);
+			const changes: Record<string, unknown[]> = {};
+			const documentChanges: unknown[] = [];
+			const count = 400;
+			for (let index = 0; index < count; index++) {
+				const filePath = path.join(tmpDir, `file-${index}.ts`);
+				fs.writeFileSync(filePath, "old", "utf-8");
+				const uri = pathToFileURL(filePath).href;
+				changes[uri] = [
+					{
+						range: {
+							start: { line: 0, character: 0 },
+							end: { line: 0, character: 3 },
+						},
+						newText: "new",
+					},
+				];
+				documentChanges.push({
+					kind: "create",
+					uri,
+					options: { ignoreIfExists: true },
+				});
+			}
+			try {
+				let planned = 0;
+				let cpuMs = 0;
+				const maxBlock = await measureMaxSyncBlockMs(async () => {
+					const start = process.cpuUsage();
+					planned = __planWorkspaceEditForTest({ changes, documentChanges });
+					const { user, system } = process.cpuUsage(start);
+					cpuMs = (user + system) / 1000;
+				});
+				expect(planned).toBe(count * 2);
+				expect(cpuMs).toBeLessThan(200);
+				expect(maxBlock).toBeLessThan(300);
+				// Criterion-4 evidence: the 4-worker full-suite run passed these occupancy
+				// assertions, so contention did not breach the 200ms CPU or 300ms sync-block budgets.
+			} finally {
+				removeTempDirSync(tmpDir);
+			}
+		},
+	);
 
 	it("honors resource operation options", async () => {
 		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-edits-"));
 		const filePath = path.join(tmpDir, "existing.ts");
 		fs.writeFileSync(filePath, "old", "utf-8");
 		try {
-			const ignored = await applyWorkspaceEdit({ documentChanges: [{ kind: "create", uri: pathToFileURL(filePath).href, options: { ignoreIfExists: true } }] }, tmpDir);
+			const ignored = await applyWorkspaceEdit(
+				{
+					documentChanges: [
+						{
+							kind: "create",
+							uri: pathToFileURL(filePath).href,
+							options: { ignoreIfExists: true },
+						},
+					],
+				},
+				tmpDir,
+			);
 			expect(ignored.descriptions).toEqual([]);
-			await expect(applyWorkspaceEdit({ documentChanges: [{ kind: "create", uri: pathToFileURL(filePath).href }] }, tmpDir)).rejects.toThrow(/already exists/);
-			await expect(applyWorkspaceEdit({ documentChanges: [{ kind: "create", uri: pathToFileURL(filePath).href, options: { recursive: true } }] }, tmpDir)).rejects.toThrow(/invalid create.options.recursive/);
-			await applyWorkspaceEdit({ documentChanges: [{ kind: "create", uri: pathToFileURL(filePath).href, options: { overwrite: true } }] }, tmpDir);
+			await expect(
+				applyWorkspaceEdit(
+					{
+						documentChanges: [
+							{ kind: "create", uri: pathToFileURL(filePath).href },
+						],
+					},
+					tmpDir,
+				),
+			).rejects.toThrow(/already exists/);
+			await expect(
+				applyWorkspaceEdit(
+					{
+						documentChanges: [
+							{
+								kind: "create",
+								uri: pathToFileURL(filePath).href,
+								options: { recursive: true },
+							},
+						],
+					},
+					tmpDir,
+				),
+			).rejects.toThrow(/invalid create.options.recursive/);
+			await applyWorkspaceEdit(
+				{
+					documentChanges: [
+						{
+							kind: "create",
+							uri: pathToFileURL(filePath).href,
+							options: { overwrite: true },
+						},
+					],
+				},
+				tmpDir,
+			);
 			expect(fs.readFileSync(filePath, "utf-8")).toBe("");
-		} finally { removeTempDirSync(tmpDir); }
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
 	});
 });
 
@@ -911,8 +1348,14 @@ describe("LSP workspace edits", () => {
 // same-position inserts ("aBAbc" instead of "aABbc").
 describe("LSP workspace edits — same-position insert ordering (P1-1)", () => {
 	const insertsAt = (line: number, character: number) => [
-		{ range: { start: { line, character }, end: { line, character } }, newText: "A" },
-		{ range: { start: { line, character }, end: { line, character } }, newText: "B" },
+		{
+			range: { start: { line, character }, end: { line, character } },
+			newText: "A",
+		},
+		{
+			range: { start: { line, character }, end: { line, character } },
+			newText: "B",
+		},
 	];
 
 	it("applyTextEditsToString applies same-position inserts in array order", () => {
@@ -922,18 +1365,28 @@ describe("LSP workspace edits — same-position insert ordering (P1-1)", () => {
 	for (const encoding of ["utf-8", "utf-16", "utf-32"] as const) {
 		for (const entry of ["changes", "documentChanges"] as const) {
 			it(`applyWorkspaceEdit keeps array order via ${entry} under ${encoding}`, async () => {
-				const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-order-"));
+				const tmpDir = fs.mkdtempSync(
+					path.join(os.tmpdir(), "pi-lens-lsp-order-"),
+				);
 				const filePath = path.join(tmpDir, "order.ts");
 				fs.writeFileSync(filePath, "abc", "utf-8");
 				const uri = pathToFileURL(filePath).href;
 				const edit =
 					entry === "changes"
 						? { changes: { [uri]: insertsAt(0, 1) } }
-						: { documentChanges: [{ textDocument: { uri }, edits: insertsAt(0, 1) }] };
+						: {
+								documentChanges: [
+									{ textDocument: { uri }, edits: insertsAt(0, 1) },
+								],
+							};
 				try {
-					await applyWorkspaceEdit(edit, tmpDir, { positionEncoding: encoding });
+					await applyWorkspaceEdit(edit, tmpDir, {
+						positionEncoding: encoding,
+					});
 					expect(fs.readFileSync(filePath, "utf-8")).toBe("aABbc");
-				} finally { removeTempDirSync(tmpDir); }
+				} finally {
+					removeTempDirSync(tmpDir);
+				}
 			});
 		}
 	}
@@ -948,14 +1401,26 @@ describe("LSP workspace edits — path casing preservation (P1-2)", () => {
 	it("create preserves mixed-case file names on disk", async () => {
 		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-case-"));
 		try {
-			await applyWorkspaceEdit({ documentChanges: [{ kind: "create", uri: pathToFileURL(path.join(tmpDir, "NewFile.txt")).href }] }, tmpDir);
+			await applyWorkspaceEdit(
+				{
+					documentChanges: [
+						{
+							kind: "create",
+							uri: pathToFileURL(path.join(tmpDir, "NewFile.txt")).href,
+						},
+					],
+				},
+				tmpDir,
+			);
 			const entries = fs.readdirSync(tmpDir);
 			// On BOTH FS kinds the name written must be the mixed-case one — the bug
 			// lowercased it only on a case-insensitive (win32) FS, so a case-sensitive
 			// run asserts the operation still produced exactly the requested name.
 			expect(entries).toContain("NewFile.txt");
 			expect(entries).not.toContain("newfile.txt");
-		} finally { removeTempDirSync(tmpDir); }
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
 	});
 
 	it("rename preserves the destination casing", async () => {
@@ -963,11 +1428,24 @@ describe("LSP workspace edits — path casing preservation (P1-2)", () => {
 		try {
 			const src = path.join(tmpDir, "lower.txt");
 			fs.writeFileSync(src, "x", "utf-8");
-			await applyWorkspaceEdit({ documentChanges: [{ kind: "rename", oldUri: pathToFileURL(src).href, newUri: pathToFileURL(path.join(tmpDir, "MixedCase.txt")).href }] }, tmpDir);
+			await applyWorkspaceEdit(
+				{
+					documentChanges: [
+						{
+							kind: "rename",
+							oldUri: pathToFileURL(src).href,
+							newUri: pathToFileURL(path.join(tmpDir, "MixedCase.txt")).href,
+						},
+					],
+				},
+				tmpDir,
+			);
 			const entries = fs.readdirSync(tmpDir);
 			expect(entries).toContain("MixedCase.txt");
 			expect(entries).not.toContain("mixedcase.txt");
-		} finally { removeTempDirSync(tmpDir); }
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
 	});
 
 	// The FS-identity alias check must FAIL-CLOSED on ino-less filesystems
@@ -976,16 +1454,34 @@ describe("LSP workspace edits — path casing preservation (P1-2)", () => {
 	// compare (dev, 0) === (dev, 0) and a rename would silently clobber.
 	it("treats ino-0 (ino-less FS) entries as DISTINCT, never aliased", () => {
 		// Both sides ino 0 on the same device → must NOT be considered the same entry.
-		expect(isSameFsIdentity({ dev: 5n, ino: 0n }, { dev: 5n, ino: 0n })).toBe(false);
+		expect(isSameFsIdentity({ dev: 5n, ino: 0n }, { dev: 5n, ino: 0n })).toBe(
+			false,
+		);
 		// One side ino 0 → distinct.
-		expect(isSameFsIdentity({ dev: 5n, ino: 0n }, { dev: 5n, ino: 42n })).toBe(false);
+		expect(isSameFsIdentity({ dev: 5n, ino: 0n }, { dev: 5n, ino: 42n })).toBe(
+			false,
+		);
 		// Genuine same-entry (nonzero, equal ino, same dev) → aliased.
-		expect(isSameFsIdentity({ dev: 5n, ino: 42n }, { dev: 5n, ino: 42n })).toBe(true);
+		expect(isSameFsIdentity({ dev: 5n, ino: 42n }, { dev: 5n, ino: 42n })).toBe(
+			true,
+		);
 		// Same nonzero ino but different device → distinct.
-		expect(isSameFsIdentity({ dev: 5n, ino: 42n }, { dev: 6n, ino: 42n })).toBe(false);
+		expect(isSameFsIdentity({ dev: 5n, ino: 42n }, { dev: 6n, ino: 42n })).toBe(
+			false,
+		);
 		// Large 64-bit NTFS file IDs (> 2^53) compare exactly as BigInt.
-		expect(isSameFsIdentity({ dev: 1n, ino: 9007199254740993n }, { dev: 1n, ino: 9007199254740993n })).toBe(true);
-		expect(isSameFsIdentity({ dev: 1n, ino: 9007199254740993n }, { dev: 1n, ino: 9007199254740992n })).toBe(false);
+		expect(
+			isSameFsIdentity(
+				{ dev: 1n, ino: 9007199254740993n },
+				{ dev: 1n, ino: 9007199254740993n },
+			),
+		).toBe(true);
+		expect(
+			isSameFsIdentity(
+				{ dev: 1n, ino: 9007199254740993n },
+				{ dev: 1n, ino: 9007199254740992n },
+			),
+		).toBe(false);
 	});
 
 	it("case-only rename succeeds (foo.txt → Foo.txt)", async () => {
@@ -994,18 +1490,35 @@ describe("LSP workspace edits — path casing preservation (P1-2)", () => {
 			const caseInsensitive = isCaseInsensitiveFs(tmpDir);
 			const src = path.join(tmpDir, "foo.txt");
 			fs.writeFileSync(src, "content", "utf-8");
-			await applyWorkspaceEdit({ documentChanges: [{ kind: "rename", oldUri: pathToFileURL(src).href, newUri: pathToFileURL(path.join(tmpDir, "Foo.txt")).href }] }, tmpDir);
+			await applyWorkspaceEdit(
+				{
+					documentChanges: [
+						{
+							kind: "rename",
+							oldUri: pathToFileURL(src).href,
+							newUri: pathToFileURL(path.join(tmpDir, "Foo.txt")).href,
+						},
+					],
+				},
+				tmpDir,
+			);
 			const entries = fs.readdirSync(tmpDir);
 			// Case-insensitive FS: the entry is renamed IN PLACE to Foo.txt (no throw).
 			// Case-sensitive FS: Foo.txt is a distinct new file; foo.txt is gone.
 			expect(entries).toContain("Foo.txt");
 			if (caseInsensitive) {
-				expect(entries.filter((e) => e.toLowerCase() === "foo.txt")).toEqual(["Foo.txt"]);
+				expect(entries.filter((e) => e.toLowerCase() === "foo.txt")).toEqual([
+					"Foo.txt",
+				]);
 			} else {
 				expect(entries).not.toContain("foo.txt");
 			}
-			expect(fs.readFileSync(path.join(tmpDir, "Foo.txt"), "utf-8")).toBe("content");
-		} finally { removeTempDirSync(tmpDir); }
+			expect(fs.readFileSync(path.join(tmpDir, "Foo.txt"), "utf-8")).toBe(
+				"content",
+			);
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
 	});
 });
 
@@ -1016,7 +1529,10 @@ describe("LSP workspace edits — #1085 P3 bundle", () => {
 	it("P3-2: keeps duplicate zero-width inserts from one server's own edit on the renameFile merge path", () => {
 		const uri = "file:///tmp/rename-merge.ts";
 		const zeroWidthInsert = {
-			range: { start: { line: 0, character: 1 }, end: { line: 0, character: 1 } },
+			range: {
+				start: { line: 0, character: 1 },
+				end: { line: 0, character: 1 },
+			},
 			newText: "Q",
 		};
 		const result = mergeWorkspaceTextEditsByPriority([
@@ -1028,17 +1544,25 @@ describe("LSP workspace edits — #1085 P3 bundle", () => {
 		// Both duplicates from the SAME server's own edit survive (their
 		// multiplicity is meaningful — see the doc above `validateTextEdits`).
 		expect(result.edit.changes[uri]).toHaveLength(2);
-		expect(applyTextEditsToString("abc", result.edit.changes[uri])).toBe("aQQbc");
+		expect(applyTextEditsToString("abc", result.edit.changes[uri])).toBe(
+			"aQQbc",
+		);
 
 		// Cross-server exact duplicates are still collapsed to one (unchanged
 		// invariant): two DIFFERENT servers proposing the identical non-empty
 		// replace should not double-apply.
 		const nonEmptyReplace = {
-			range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+			range: {
+				start: { line: 0, character: 0 },
+				end: { line: 0, character: 1 },
+			},
 			newText: "X",
 		};
 		const crossServer = mergeWorkspaceTextEditsByPriority([
-			{ serverId: "typescript", edit: { changes: { [uri]: [nonEmptyReplace] } } },
+			{
+				serverId: "typescript",
+				edit: { changes: { [uri]: [nonEmptyReplace] } },
+			},
 			{ serverId: "eslint", edit: { changes: { [uri]: [nonEmptyReplace] } } },
 		]);
 		expect(crossServer.edit.changes[uri]).toHaveLength(1);
@@ -1053,11 +1577,23 @@ describe("LSP workspace edits — #1085 P3 bundle", () => {
 			await applyWorkspaceEdit(
 				{
 					documentChanges: [
-						{ kind: "rename", oldUri: pathToFileURL(bPath).href, newUri: pathToFileURL(cPath).href },
+						{
+							kind: "rename",
+							oldUri: pathToFileURL(bPath).href,
+							newUri: pathToFileURL(cPath).href,
+						},
 						{ kind: "create", uri: pathToFileURL(bPath).href },
 						{
 							textDocument: { uri: pathToFileURL(bPath).href },
-							edits: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } }, newText: "new" }],
+							edits: [
+								{
+									range: {
+										start: { line: 0, character: 0 },
+										end: { line: 0, character: 0 },
+									},
+									newText: "new",
+								},
+							],
 						},
 					],
 				},
@@ -1069,7 +1605,9 @@ describe("LSP workspace edits — #1085 P3 bundle", () => {
 			// received the text edit — not rejected as "text edit target does not
 			// exist" (the pre-fix failure mode).
 			expect(fs.readFileSync(bPath, "utf-8")).toBe("new");
-		} finally { removeTempDirSync(tmpDir); }
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
 	});
 
 	it("P3-4: version:null + a numeric version for the same URI adopts the numeric one (LSP: null means don't check)", async () => {
@@ -1082,23 +1620,45 @@ describe("LSP workspace edits — #1085 P3 bundle", () => {
 				documentChanges: [
 					{
 						textDocument: { uri, version: null },
-						edits: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } }, newText: "A" }],
+						edits: [
+							{
+								range: {
+									start: { line: 0, character: 0 },
+									end: { line: 0, character: 0 },
+								},
+								newText: "A",
+							},
+						],
 					},
 					{
 						textDocument: { uri, version: 1 },
-						edits: [{ range: { start: { line: 0, character: 1 }, end: { line: 0, character: 1 } }, newText: "B" }],
+						edits: [
+							{
+								range: {
+									start: { line: 0, character: 1 },
+									end: { line: 0, character: 1 },
+								},
+								newText: "B",
+							},
+						],
 					},
 				],
 			};
 			// Matching numeric version → applies (does NOT throw "conflicting text
 			// document versions", the pre-fix failure mode).
-			await applyWorkspaceEdit(edit, tmpDir, { documentVersions: new Map([[normalizeMapKey(filePath), 1]]) });
+			await applyWorkspaceEdit(edit, tmpDir, {
+				documentVersions: new Map([[normalizeMapKey(filePath), 1]]),
+			});
 			expect(fs.readFileSync(filePath, "utf-8")).toBe("AxB");
-		} finally { removeTempDirSync(tmpDir); }
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
 	});
 
 	it("P3-4: version:null + a STALE numeric version is still rejected, via the numeric", async () => {
-		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-p3-4-stale-"));
+		const tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-p3-4-stale-"),
+		);
 		try {
 			const filePath = path.join(tmpDir, "versioned-null-stale.ts");
 			fs.writeFileSync(filePath, "x", "utf-8");
@@ -1107,43 +1667,95 @@ describe("LSP workspace edits — #1085 P3 bundle", () => {
 				documentChanges: [
 					{
 						textDocument: { uri, version: null },
-						edits: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } }, newText: "A" }],
+						edits: [
+							{
+								range: {
+									start: { line: 0, character: 0 },
+									end: { line: 0, character: 0 },
+								},
+								newText: "A",
+							},
+						],
 					},
 					{
 						textDocument: { uri, version: 1 },
-						edits: [{ range: { start: { line: 0, character: 1 }, end: { line: 0, character: 1 } }, newText: "B" }],
+						edits: [
+							{
+								range: {
+									start: { line: 0, character: 1 },
+									end: { line: 0, character: 1 },
+								},
+								newText: "B",
+							},
+						],
 					},
 				],
 			};
 			await expect(
-				applyWorkspaceEdit(edit, tmpDir, { documentVersions: new Map([[normalizeMapKey(filePath), 2]]) }),
+				applyWorkspaceEdit(edit, tmpDir, {
+					documentVersions: new Map([[normalizeMapKey(filePath), 2]]),
+				}),
 			).rejects.toThrow(/stale text document version/);
 			expect(fs.readFileSync(filePath, "utf-8")).toBe("x");
-		} finally { removeTempDirSync(tmpDir); }
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
 	});
 
 	it("P3-6: importsChanged reflects whether the edit actually changed import lines, not merely their presence", async () => {
 		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-p3-6-"));
 		try {
 			const filePath = path.join(tmpDir, "mod.ts");
-			fs.writeFileSync(filePath, 'import { a } from "./a";\nconsole.log(a);\n', "utf-8");
+			fs.writeFileSync(
+				filePath,
+				'import { a } from "./a";\nconsole.log(a);\n',
+				"utf-8",
+			);
 			const uri = pathToFileURL(filePath).href;
 
 			// Body-only edit: the file HAS an import, but this edit never touches it.
 			const bodyResult = await applyWorkspaceEdit(
-				{ changes: { [uri]: [{ range: { start: { line: 1, character: 0 }, end: { line: 1, character: 999 } }, newText: "console.error(a);" }] } },
+				{
+					changes: {
+						[uri]: [
+							{
+								range: {
+									start: { line: 1, character: 0 },
+									end: { line: 1, character: 999 },
+								},
+								newText: "console.error(a);",
+							},
+						],
+					},
+				},
 				tmpDir,
 			);
 			expect(bodyResult.fileDetails[0]?.importsChanged).toBe(false);
 
 			// Import-line edit: actually changes the imported binding.
 			const importResult = await applyWorkspaceEdit(
-				{ changes: { [uri]: [{ range: { start: { line: 0, character: 9 }, end: { line: 0, character: 10 } }, newText: "b" }] } },
+				{
+					changes: {
+						[uri]: [
+							{
+								range: {
+									start: { line: 0, character: 9 },
+									end: { line: 0, character: 10 },
+								},
+								newText: "b",
+							},
+						],
+					},
+				},
 				tmpDir,
 			);
 			expect(importResult.fileDetails[0]?.importsChanged).toBe(true);
-			expect(fs.readFileSync(filePath, "utf-8")).toBe('import { b } from "./a";\nconsole.error(a);\n');
-		} finally { removeTempDirSync(tmpDir); }
+			expect(fs.readFileSync(filePath, "utf-8")).toBe(
+				'import { b } from "./a";\nconsole.error(a);\n',
+			);
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
 	});
 
 	// P2 (round-2 review): a formatter-wrapped MULTILINE import's specifier
@@ -1157,7 +1769,9 @@ describe("LSP workspace edits — #1085 P3 bundle", () => {
 	// `from "..."`-matching continuation line is compared, not because the
 	// whole file is treated as changed.
 	it("P3-6 continuation: importsChanged detects a specifier change on a multiline import's continuation line", async () => {
-		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-p3-6-multiline-"));
+		const tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-p3-6-multiline-"),
+		);
 		try {
 			const filePath = path.join(tmpDir, "mod.ts");
 			fs.writeFileSync(
@@ -1171,7 +1785,19 @@ describe("LSP workspace edits — #1085 P3 bundle", () => {
 			// "} from ..." line) are touched — still false, not a blanket "file has
 			// a multiline import so report changed" fallback.
 			const bodyResult = await applyWorkspaceEdit(
-				{ changes: { [uri]: [{ range: { start: { line: 5, character: 0 }, end: { line: 5, character: 999 } }, newText: "console.log(bar, foo);" }] } },
+				{
+					changes: {
+						[uri]: [
+							{
+								range: {
+									start: { line: 5, character: 0 },
+									end: { line: 5, character: 999 },
+								},
+								newText: "console.log(bar, foo);",
+							},
+						],
+					},
+				},
 				tmpDir,
 			);
 			expect(bodyResult.fileDetails[0]?.importsChanged).toBe(false);
@@ -1180,14 +1806,28 @@ describe("LSP workspace edits — #1085 P3 bundle", () => {
 			// module-edge change, and the pre-fix regex (anchored on a leading
 			// `import`/`export`) would miss it since this line starts with `}`.
 			const specifierResult = await applyWorkspaceEdit(
-				{ changes: { [uri]: [{ range: { start: { line: 3, character: 8 }, end: { line: 3, character: 13 } }, newText: "./new" }] } },
+				{
+					changes: {
+						[uri]: [
+							{
+								range: {
+									start: { line: 3, character: 8 },
+									end: { line: 3, character: 13 },
+								},
+								newText: "./new",
+							},
+						],
+					},
+				},
 				tmpDir,
 			);
 			expect(specifierResult.fileDetails[0]?.importsChanged).toBe(true);
 			expect(fs.readFileSync(filePath, "utf-8")).toBe(
 				'import {\n\tfoo,\n\tbar,\n} from "./new";\n\nconsole.log(bar, foo);\n',
 			);
-		} finally { removeTempDirSync(tmpDir); }
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
 	});
 
 	// FS-probe-guarded per the #1024/P1-2 lesson (see `isCaseInsensitiveFs`
@@ -1205,7 +1845,11 @@ describe("LSP workspace edits — #1085 P3 bundle", () => {
 				{
 					documentChanges: [
 						{ kind: "create", uri: pathToFileURL(fooPath).href },
-						{ kind: "rename", oldUri: pathToFileURL(fooPath).href, newUri: pathToFileURL(FooPath).href },
+						{
+							kind: "rename",
+							oldUri: pathToFileURL(fooPath).href,
+							newUri: pathToFileURL(FooPath).href,
+						},
 					],
 				},
 				tmpDir,
@@ -1214,8 +1858,12 @@ describe("LSP workspace edits — #1085 P3 bundle", () => {
 			// The rename always removes the source name, regardless of FS case
 			// sensitivity, so exactly one case-folded spelling survives either way.
 			expect(entries).toContain("Foo.txt");
-			expect(entries.filter((e) => e.toLowerCase() === "foo.txt")).toEqual(["Foo.txt"]);
-		} finally { removeTempDirSync(tmpDir); }
+			expect(entries.filter((e) => e.toLowerCase() === "foo.txt")).toEqual([
+				"Foo.txt",
+			]);
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
 	});
 
 	// P3 (round-2 review): rename(b→c); create(b); rename(b→d) re-vacates the
@@ -1227,7 +1875,9 @@ describe("LSP workspace edits — #1085 P3 bundle", () => {
 	it("P3: a re-renamed override-backed entry migrates instead of leaving a stale virtualOverrides entry", async () => {
 		// Cross-product cell 1: the migrated content survives to the FINAL
 		// destination and a trailing text edit there applies correctly (not lost).
-		const tmpDir1 = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-p3-restale-1-"));
+		const tmpDir1 = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-p3-restale-1-"),
+		);
 		try {
 			const bPath = path.join(tmpDir1, "b.txt");
 			const cPath = path.join(tmpDir1, "c.txt");
@@ -1236,12 +1886,28 @@ describe("LSP workspace edits — #1085 P3 bundle", () => {
 			await applyWorkspaceEdit(
 				{
 					documentChanges: [
-						{ kind: "rename", oldUri: pathToFileURL(bPath).href, newUri: pathToFileURL(cPath).href },
+						{
+							kind: "rename",
+							oldUri: pathToFileURL(bPath).href,
+							newUri: pathToFileURL(cPath).href,
+						},
 						{ kind: "create", uri: pathToFileURL(bPath).href },
-						{ kind: "rename", oldUri: pathToFileURL(bPath).href, newUri: pathToFileURL(dPath).href },
+						{
+							kind: "rename",
+							oldUri: pathToFileURL(bPath).href,
+							newUri: pathToFileURL(dPath).href,
+						},
 						{
 							textDocument: { uri: pathToFileURL(dPath).href },
-							edits: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } }, newText: "hello" }],
+							edits: [
+								{
+									range: {
+										start: { line: 0, character: 0 },
+										end: { line: 0, character: 0 },
+									},
+									newText: "hello",
+								},
+							],
 						},
 					],
 				},
@@ -1253,7 +1919,9 @@ describe("LSP workspace edits — #1085 P3 bundle", () => {
 			// not lost) received the trailing text edit.
 			expect(fs.readFileSync(dPath, "utf-8")).toBe("hello");
 			expect(fs.existsSync(bPath)).toBe(false);
-		} finally { removeTempDirSync(tmpDir1); }
+		} finally {
+			removeTempDirSync(tmpDir1);
+		}
 
 		// Cross-product cell 2: after the second rename re-vacates b, b is
 		// genuinely gone — proven via `delete` (not `create`, which would trip
@@ -1261,7 +1929,9 @@ describe("LSP workspace edits — #1085 P3 bundle", () => {
 		// at the same URI within one edit): a stale `virtualOverrides[b]` would
 		// make this `delete` (no `ignoreIfNotExists`) wrongly succeed; the fix
 		// makes it correctly throw "delete target does not exist".
-		const tmpDir2 = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-p3-restale-2-"));
+		const tmpDir2 = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-p3-restale-2-"),
+		);
 		try {
 			const bPath = path.join(tmpDir2, "b.txt");
 			const cPath = path.join(tmpDir2, "c.txt");
@@ -1271,16 +1941,26 @@ describe("LSP workspace edits — #1085 P3 bundle", () => {
 				applyWorkspaceEdit(
 					{
 						documentChanges: [
-							{ kind: "rename", oldUri: pathToFileURL(bPath).href, newUri: pathToFileURL(cPath).href },
+							{
+								kind: "rename",
+								oldUri: pathToFileURL(bPath).href,
+								newUri: pathToFileURL(cPath).href,
+							},
 							{ kind: "create", uri: pathToFileURL(bPath).href },
-							{ kind: "rename", oldUri: pathToFileURL(bPath).href, newUri: pathToFileURL(dPath).href },
+							{
+								kind: "rename",
+								oldUri: pathToFileURL(bPath).href,
+								newUri: pathToFileURL(dPath).href,
+							},
 							{ kind: "delete", uri: pathToFileURL(bPath).href },
 						],
 					},
 					tmpDir2,
 				),
 			).rejects.toThrow(/delete target does not exist/);
-		} finally { removeTempDirSync(tmpDir2); }
+		} finally {
+			removeTempDirSync(tmpDir2);
+		}
 	});
 });
 
@@ -1295,7 +1975,10 @@ describe("LSP workspace edits — CRLF boundary class, general (#1147 P3-5)", ()
 		const content = "line1\r\nline2\r\n";
 		const result = applyTextEditsToString(content, [
 			{
-				range: { start: { line: 0, character: 5 }, end: { line: 0, character: 5 } },
+				range: {
+					start: { line: 0, character: 5 },
+					end: { line: 0, character: 5 },
+				},
 				newText: "\nEXTRA",
 			},
 		]);
@@ -1308,7 +1991,10 @@ describe("LSP workspace edits — CRLF boundary class, general (#1147 P3-5)", ()
 		const content = "line1\nline2\n";
 		const result = applyTextEditsToString(content, [
 			{
-				range: { start: { line: 0, character: 5 }, end: { line: 0, character: 5 } },
+				range: {
+					start: { line: 0, character: 5 },
+					end: { line: 0, character: 5 },
+				},
 				newText: "\nEXTRA",
 			},
 		]);
@@ -1325,7 +2011,10 @@ describe("LSP workspace edits — CRLF boundary class, general (#1147 P3-5)", ()
 		// CRLF pair.
 		const result = applyTextEditsToString(content, [
 			{
-				range: { start: { line: 0, character: 6 }, end: { line: 0, character: 6 } },
+				range: {
+					start: { line: 0, character: 6 },
+					end: { line: 0, character: 6 },
+				},
 				newText: "X",
 			},
 		]);
@@ -1345,7 +2034,10 @@ describe("LSP workspace edits — CRLF boundary class, general (#1147 P3-5)", ()
 					changes: {
 						[pathToFileURL(filePath).href]: [
 							{
-								range: { start: { line: 0, character: 12 }, end: { line: 0, character: 12 } },
+								range: {
+									start: { line: 0, character: 12 },
+									end: { line: 0, character: 12 },
+								},
 								newText: "\nconst z = 0;",
 							},
 						],
@@ -1354,9 +2046,7 @@ describe("LSP workspace edits — CRLF boundary class, general (#1147 P3-5)", ()
 				tmpDir,
 			);
 			const written = fs.readFileSync(filePath, "utf-8");
-			expect(written).toBe(
-				"const a = 1;\r\nconst z = 0;\r\nconst b = 2;\r\n",
-			);
+			expect(written).toBe("const a = 1;\r\nconst z = 0;\r\nconst b = 2;\r\n");
 			expect(/(?<!\r)\n/.test(written)).toBe(false);
 		} finally {
 			removeTempDirSync(tmpDir);

@@ -75,7 +75,12 @@ export interface ReviewGraphEdge {
 	 * definite external target (`callee.includes(".")` with no in-project
 	 * receiver hint, in builder.ts).
 	 */
-	resolution?: "exact" | "import" | "receiver-type" | "name-only" | "unresolved";
+	resolution?:
+		| "exact"
+		| "import"
+		| "receiver-type"
+		| "name-only"
+		| "unresolved";
 }
 
 export interface ReviewGraph {
@@ -107,6 +112,12 @@ export interface ReviewGraph {
 	buildGeneration?: number;
 }
 
+// #1961: revision-drift evidence lives in its own import-free module, so the
+// consumers that load the builder dynamically can still share one wording.
+// Re-exported here because `types.ts` is where review-graph types are looked
+// for.
+export type { ReviewGraphRevisionDrift } from "./revision-drift.js";
+
 export interface ReviewGraphPersistCoverage {
 	partial: boolean;
 	cap: number;
@@ -135,15 +146,17 @@ export interface ReviewGraphPersistCoverage {
 
 /**
  * #1023: why a cascade impact compute could NOT be trusted as a complete
- * dependent set — as opposed to a genuinely-empty one. Only ever set on a
- * DEGRADED/COLD/ERRORED/MISSING-NODE compute; a healthy graph with a real
- * leaf file (node present, zero incoming edges) never carries this and stays
- * silent (the over-correction guard: a true clean edit must not cry wolf).
+ * dependent set — as opposed to a genuinely-empty one. This also covers the
+ * deliberate partial coverage reported by `budget_truncated`; a healthy graph
+ * with a real leaf file (node present, zero incoming edges) never carries this
+ * and stays silent (the over-correction guard: a true clean edit must not cry
+ * wolf).
  */
 export type CascadeIndeterminateReason =
 	| "graph_degraded" // review graph skipped (too_many_files / unsafe_root)
 	| "missing_node" // changed file has no node in the (otherwise-built) graph, and the graph SHOULD know it — a real gap
 	| "excluded_by_role" // #1445: changed file has no node because its role (test, #260) is excluded from the graph BY DESIGN — not a gap, never agent-facing
+	| "budget_truncated" // the selected neighbor budget omitted otherwise-eligible dependents
 	| "error" // the deferred compute threw before producing a result
 	| "lsp_binding_rejected"; // #1104: every degraded-fallback display candidate was binding-rejected (stale/pre-fix-edit snapshot) and withheld
 
@@ -171,6 +184,14 @@ export interface CascadeMissingNodeDiagnostic {
 	nearestFile?: string;
 }
 
+export interface CascadeBudgetCoverage {
+	candidateCount: number;
+	eligibleCount: number;
+	selectedCount: number;
+	truncatedCount: number;
+	transitiveTruncated?: boolean;
+}
+
 export interface CascadeIndeterminate {
 	reason: CascadeIndeterminateReason;
 	/** Short human detail for the honest turn-end advisory. */
@@ -178,6 +199,8 @@ export interface CascadeIndeterminate {
 	/** Populated for `graph_degraded` from getLastGraphBuildInfo(). */
 	sourceFileCount?: number;
 	maxFileCount?: number;
+	/** Populated when the selected neighbor budget omits eligible dependents. */
+	budget?: CascadeBudgetCoverage;
 	/** #1550: log-only evidence for `missing_node` — never agent-facing. */
 	diagnostic?: CascadeMissingNodeDiagnostic;
 }
@@ -190,10 +213,10 @@ export interface ImpactCascadeResult {
 	neighborFiles: string[];
 	riskFlags: string[];
 	/**
-	 * #1023: present ONLY when impact could not be computed (degraded/cold/
-	 * errored graph, or the changed file has no graph node). Absent means the
-	 * dependent set below is TRUSTWORTHY — an empty `neighborFiles` then means a
-	 * genuine clean leaf, not a silent under-report.
+	 * #1023: present when impact is incomplete (degraded/cold/errored graph, a
+	 * missing graph node, or deliberate partial coverage from `budget_truncated`).
+	 * Absent means the dependent set below is TRUSTWORTHY — an empty
+	 * `neighborFiles` then means a genuine clean leaf, not a silent under-report.
 	 */
 	indeterminate?: CascadeIndeterminate;
 }

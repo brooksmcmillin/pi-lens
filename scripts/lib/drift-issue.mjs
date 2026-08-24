@@ -29,22 +29,25 @@ export const DRIFT_ISSUE_TITLE = "nightly: silentOnClean drift detected";
  * @returns {string}
  */
 export function buildDriftIssueBody(summary, opts = {}) {
-  const warnings = Array.isArray(summary?.warnings) ? summary.warnings : [];
-  const count = warnings.length;
-  const lines = [
-    "Auto-filed/updated by the nightly `tool-smoke` workflow's `probe-clean-signal.mjs` step (#529/#594).",
-    "",
-    "This is **telemetry only** — the probe never gates CI. It compares each measured LSP server's observed clean-scan behavior against the hand-set `silentOnClean` marker in `clients/lsp/wait-policy/strategies.ts`; a mismatch here means a human should consider updating that marker (or investigating why the server's observed behavior changed).",
-    "",
-    `Last observed: ${summary?.generatedAt ?? "unknown"} (${count} finding${count === 1 ? "" : "s"})`,
-    "",
-    ...warnings.map((w) => `- **[${w.kind}]** \`${w.lang}\` — ${w.detail}`),
-  ];
-  if (opts.runUrl) {
-    lines.push("", `Workflow run: ${opts.runUrl}`);
-  }
-  lines.push("", "This issue is closed automatically once a nightly run finds no drift.");
-  return lines.join("\n");
+	const warnings = Array.isArray(summary?.warnings) ? summary.warnings : [];
+	const count = warnings.length;
+	const lines = [
+		"Auto-filed/updated by the nightly `tool-smoke` workflow's `probe-clean-signal.mjs` step (#529/#594).",
+		"",
+		"This is **telemetry only** — the probe never gates CI. It compares each measured LSP server's observed clean-scan behavior against the hand-set `silentOnClean` marker in `clients/lsp/wait-policy/strategies.ts`; a mismatch here means a human should consider updating that marker (or investigating why the server's observed behavior changed).",
+		"",
+		`Last observed: ${summary?.generatedAt ?? "unknown"} (${count} finding${count === 1 ? "" : "s"})`,
+		"",
+		...warnings.map((w) => `- **[${w.kind}]** \`${w.lang}\` — ${w.detail}`),
+	];
+	if (opts.runUrl) {
+		lines.push("", `Workflow run: ${opts.runUrl}`);
+	}
+	lines.push(
+		"",
+		"This issue is closed automatically once a nightly run finds no drift.",
+	);
+	return lines.join("\n");
 }
 
 /**
@@ -57,5 +60,5 @@ export function buildDriftIssueBody(summary, opts = {}) {
  * @returns {{number: number, title: string} | null}
  */
 export function findDriftTrackingIssue(issues) {
-  return (issues ?? []).find((i) => i.title === DRIFT_ISSUE_TITLE) ?? null;
+	return (issues ?? []).find((i) => i.title === DRIFT_ISSUE_TITLE) ?? null;
 }

@@ -41,9 +41,11 @@ jobs:
             SHOULD_RELEASE=true
           fi
 
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "should_release=$SHOULD_RELEASE" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+            echo "should_release=$SHOULD_RELEASE"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Verify bump PR rolled up changelog entries
         if: steps.meta.outputs.should_release == 'true'
@@ -86,12 +88,18 @@ jobs:
         if: steps.meta.outputs.should_release == 'true'
         shell: bash
         run: |
+          # This job ran a full `npm install`, so the host-provided packages are
+          # present as devDependencies and the entry loads. The allowlist still
+          # derives from scripts/lib/host-provided-deps.mjs rather than naming a
+          # package here, so it cannot drift from the dependency shape (#1926).
+          ALLOW=$(node scripts/supply-host-provided-deps.mjs --allow-pattern)
           ENTRY=$(node -p "require('./package.json').pi.extensions[0]")
           echo "Loading entry: $ENTRY"
+          echo "Host-provided allowlist: $ALLOW"
           node "$ENTRY" 2>&1 | tee /tmp/load-output.txt || true
           if grep -q "ERR_MODULE_NOT_FOUND\|Cannot find module" \
                /tmp/load-output.txt \
-             && ! grep -q "pi-coding-agent" /tmp/load-output.txt; then
+             && ! grep -Eq "$ALLOW" /tmp/load-output.txt; then
             echo "FAILED: missing module dependency in compiled entry"
             cat /tmp/load-output.txt
             exit 1

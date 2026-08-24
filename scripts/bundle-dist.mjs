@@ -14,11 +14,13 @@
  * time. Runs after `tsc` (build:dist) has produced `dist/`; bundles in place.
  *
  * KEPT EXTERNAL (not inlined)
- *   - Host-provided packages pi resolves from its own embedded runtime:
- *       typebox, @earendil-works/pi-coding-agent, @earendil-works/pi-tui
- *   - Native addon / wasm loaded lazily by absolute path at call time:
- *       @ast-grep/napi (native .node), web-tree-sitter (wasm)
- *   - node: builtins
+ *   The list lives in ./lib/host-provided-deps.mjs, which is also what
+ *   package.json's dependency shape and tests/packaging.test.ts are pinned to
+ *   (#1926). Two reasons a package is external:
+ *   - Host-provided: pi resolves it from its own embedded runtime, so the
+ *     extension must NOT declare it as a runtime dependency.
+ *   - Native addon / wasm loaded lazily by absolute path at call time.
+ *   node: builtins are external by default.
  *
  * esbuild is run through `npm exec` (resolved from npm's own CLI so there is no
  * npx `.cmd` shim and no shell), the same resolve-your-own-toolchain approach
@@ -35,6 +37,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { BUNDLE_EXTERNALS } from "./lib/host-provided-deps.mjs";
 
 const ESBUILD_VERSION = "0.28.1";
 
@@ -44,13 +47,8 @@ const tmpOut = path.join(root, "dist", "index.bundled.mjs");
 
 // Packages the bundle must NOT inline: host-provided ones resolve from pi's
 // embedded runtime; native/wasm ones are dynamic-imported by absolute path.
-const EXTERNAL = [
-	"typebox",
-	"@earendil-works/pi-coding-agent",
-	"@earendil-works/pi-tui",
-	"@ast-grep/napi",
-	"web-tree-sitter",
-];
+// Single source of truth — see ./lib/host-provided-deps.mjs (#1926).
+const EXTERNAL = BUNDLE_EXTERNALS;
 
 // esbuild's ESM output wraps bundled CommonJS modules (e.g. vscode-jsonrpc) in a
 // shim that throws on any dynamic require(); a pure-ESM Node process has no

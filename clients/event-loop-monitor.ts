@@ -187,11 +187,18 @@ export function resetEventLoopMonitor(): void {
 }
 
 /**
- * Decide whether a freeze is worth persisting to `latency.log`. Pure so the
- * threshold logic is testable without the (vitest-flaky) native histogram.
- * Logs only a *new* worst block (`maxMs > lastLoggedMs + deltaMs`) above a
- * floor (`minMs`), so a turn that froze worse than ever before is recorded
- * once — not the same growing max every turn.
+ * Decide whether THIS block beats the session's running high-water. Pure so
+ * the threshold logic is testable without the (vitest-flaky) native
+ * histogram. Requires `maxMs > lastLoggedMs + deltaMs` above a floor
+ * (`minMs`) so noise near the current max doesn't keep re-triggering the
+ * high-water bookkeeping.
+ *
+ * NOTE (#1723): this is no longer the logging gate — see
+ * `shouldLogLoopBlock` for that. This function now answers a narrower
+ * question ("is this a new session worst?", used for the `worstSoFar`
+ * metadata flag and for deciding whether to advance the high-water), because
+ * gating the LOG on it hid every sub-maximum block after a session's first
+ * large one, which made loop_block-vs-pull-timeout correlation undecidable.
  */
 export function shouldLogWorstBlock(
 	maxMs: number,
@@ -200,6 +207,23 @@ export function shouldLogWorstBlock(
 	deltaMs = 25,
 ): boolean {
 	return maxMs >= minMs && maxMs > lastLoggedMs + deltaMs;
+}
+
+/**
+ * Decide whether a block is worth persisting to `latency.log` AT ALL (#1723).
+ * Every block at or above the floor (`minMs`) qualifies — not only a new
+ * session worst — because a session's later blocks can be smaller than an
+ * early spike yet still be exactly the ones that starved an LSP pull
+ * (#1549/#1713) and are otherwise invisible to the correlation.
+ *
+ * Volume is bounded by CALL CADENCE, not by this gate: the `turn_end` caller
+ * invokes this at most once per turn (the histogram window is reset every
+ * turn), so the natural cap is one `loop_block` record per turn — a jittery
+ * session cannot flood the log because there is nowhere for a second sample
+ * to come from within the same turn.
+ */
+export function shouldLogLoopBlock(maxMs: number, minMs = 60): boolean {
+	return maxMs >= minMs;
 }
 
 /** Test-only: stop and clear the monitor so cases don't leak into each other. */

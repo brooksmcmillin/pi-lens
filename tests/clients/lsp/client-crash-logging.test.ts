@@ -30,8 +30,18 @@ const FAKE_SERVER_PATH = path.join(
 );
 
 describe("LSP client — crash exit is logged, not silently swallowed", () => {
-	let client: Awaited<ReturnType<typeof import("../../../clients/lsp/client.js").createLSPClient>> | undefined;
-	let proc: Awaited<ReturnType<typeof import("../../../clients/lsp/launch.js").launchLSP>> | undefined;
+	let client:
+		| Awaited<
+				ReturnType<
+					typeof import("../../../clients/lsp/client.js").createLSPClient
+				>
+		  >
+		| undefined;
+	let proc:
+		| Awaited<
+				ReturnType<typeof import("../../../clients/lsp/launch.js").launchLSP>
+		  >
+		| undefined;
 
 	beforeEach(() => {
 		(logLatency as ReturnType<typeof vi.fn>).mockReset();
@@ -127,7 +137,13 @@ describe("LSP client — crash exit is logged, not silently swallowed", () => {
 		});
 		const sendNotification = vi.spyOn(client.connection, "sendNotification");
 
-		await client.notify.open(filePath, "const broken = true;", "typescript", false, true);
+		await client.notify.open(
+			filePath,
+			"const broken = true;",
+			"typescript",
+			false,
+			true,
+		);
 		await client.notify.change(filePath, "const changed = true;");
 		await client.waitForDiagnostics(filePath, 1_000, { pullOnly: true });
 		expect(client.isDocumentOpen(filePath)).toBe(true);
@@ -143,7 +159,13 @@ describe("LSP client — crash exit is logged, not silently swallowed", () => {
 		expect(client.getDiagnostics(filePath)).toEqual([]);
 		expect(client.getTrackedDiagnosticPaths()).not.toContain(filePath);
 
-		await client.notify.open(filePath, "const reopened = true;", "typescript", false, true);
+		await client.notify.open(
+			filePath,
+			"const reopened = true;",
+			"typescript",
+			false,
+			true,
+		);
 		const reopenCalls = sendNotification.mock.calls.filter(
 			([method]) => method === "textDocument/didOpen",
 		);

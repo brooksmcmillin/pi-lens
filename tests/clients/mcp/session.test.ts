@@ -152,10 +152,14 @@ describe("runTurnEnd", () => {
 		// in-process context hook; omitting this argument made legacy/stale data
 		// look current on one transport only.
 		expect(runtimeContext.consumeTurnEndFindings).toHaveBeenCalledWith(
-			expect.anything(), tmpDir, expect.anything(),
+			expect.anything(),
+			tmpDir,
+			expect.anything(),
 		);
 		expect(runtimeContext.consumeTestFindings).toHaveBeenCalledWith(
-			expect.anything(), tmpDir, expect.anything(),
+			expect.anything(),
+			tmpDir,
+			expect.anything(),
 		);
 	});
 

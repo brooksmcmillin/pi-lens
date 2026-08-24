@@ -644,7 +644,9 @@ describe("SOURCE_PRECEDENCE completeness", () => {
 				]),
 			),
 		).toEqual(expectedPrecedence);
-		for (const [compiledExt, sourceExts] of Object.entries(expectedByCompiledExtension)) {
+		for (const [compiledExt, sourceExts] of Object.entries(
+			expectedByCompiledExtension,
+		)) {
 			expect(
 				sourceTwinCandidates(`fixture${compiledExt}`).map((candidate) =>
 					path.extname(candidate),
@@ -652,8 +654,8 @@ describe("SOURCE_PRECEDENCE completeness", () => {
 			).toEqual(sourceExts);
 
 			const { dir, cleanup } = createTempDir({
-			[`fixture${compiledExt}`]: "// compiled",
-			[`fixture${sourceExts[0]}`]: "// source",
+				[`fixture${compiledExt}`]: "// compiled",
+				[`fixture${sourceExts[0]}`]: "// source",
 			});
 			expect(findSourceSibling(path.join(dir, `fixture${compiledExt}`))).toBe(
 				path.join(dir, `fixture${sourceExts[0]}`),

@@ -107,6 +107,42 @@ describe("writeFileAtomic (sync)", () => {
 	});
 });
 
+/**
+ * #1609 review F4: `WriteFileAtomicOptions.mode` (added so the installer's
+ * downloaded binaries keep their executable bit across the staged-file
+ * rename) had zero coverage on any OS — the install-test CI matrix never
+ * runs the installer itself. POSIX-only: Windows' `fs` mode support does not
+ * carry a POSIX permission-bit meaning (`statSync(...).mode` on Windows
+ * reflects the read-only attribute only, not `0o750`-style bits), so this
+ * would either vacuously pass or need a separate Windows-specific assertion
+ * that tests something else entirely — skip there rather than assert
+ * something not actually being verified (defect shape 7).
+ */
+describe.skipIf(process.platform === "win32")(
+	"writeFileAtomic mode option (#1609 review F4)",
+	() => {
+		it("writeFileAtomic (sync) applies the requested mode to the published file", () => {
+			const target = path.join(dir, "tool-binary");
+			writeFileAtomic(target, "#!/bin/sh\necho hi\n", { mode: 0o750 });
+			expect(fs.statSync(target).mode & 0o777).toBe(0o750);
+		});
+
+		it("writeFileAtomicAsync applies the requested mode to the published file", async () => {
+			const target = path.join(dir, "tool-binary-async");
+			await writeFileAtomicAsync(target, "#!/bin/sh\necho hi\n", {
+				mode: 0o750,
+			});
+			expect(fs.statSync(target).mode & 0o777).toBe(0o750);
+		});
+
+		it("omitting mode falls back to the umask-governed default (does not force 0o750)", () => {
+			const target = path.join(dir, "plain-file");
+			writeFileAtomic(target, "no mode option here");
+			expect(fs.statSync(target).mode & 0o111).toBe(0); // not executable
+		});
+	},
+);
+
 describe("writeFileAtomicAsync", () => {
 	it("replaces the target's content atomically on success", async () => {
 		const target = path.join(dir, "state.json");

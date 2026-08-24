@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { removeTempDirSync } from "../test-utils.js";
+import { withEnv } from "../../support/with-env.js";
 
 // The repair announces itself through `logSessionStart` — capture the real
 // production call rather than reading the rotated log file, so the assertion
@@ -32,8 +33,15 @@ const REPAIR_LOG = /managed compiler resolved to TypeScript 7\./;
 
 const tempDirs: string[] = [];
 const originalCwd = process.cwd();
-const originalHome = process.env.PI_LENS_HOME;
-const originalDisableInstall = process.env.PI_LENS_DISABLE_TOOL_INSTALL;
+// `importServerBoundTo` mutates both vars repeatedly across the suite (once
+// per case); capture-now/restore-once-in-afterAll is deliberate here, not a
+// per-test hook — `withEnv` still owns the save/restore correctness (the
+// undefined-handling), it's just invoked as a no-op override so it only
+// records the pre-suite values instead of changing them yet.
+const restoreClassicRepairEnv = withEnv({
+	PI_LENS_HOME: process.env.PI_LENS_HOME,
+	PI_LENS_DISABLE_TOOL_INSTALL: process.env.PI_LENS_DISABLE_TOOL_INSTALL,
+});
 
 /** Set by `beforeAll` when npm or the registry is unavailable (§5: skip, never fail). */
 let skipReason = "";
@@ -235,11 +243,7 @@ describe.skipIf(!RUN_LIVE_CLASSIC_REPAIR)(
 		afterAll(async () => {
 			for (const stop of running.splice(0)) await stop().catch(() => {});
 			process.chdir(originalCwd);
-			if (originalHome === undefined) delete process.env.PI_LENS_HOME;
-			else process.env.PI_LENS_HOME = originalHome;
-			if (originalDisableInstall === undefined)
-				delete process.env.PI_LENS_DISABLE_TOOL_INSTALL;
-			else process.env.PI_LENS_DISABLE_TOOL_INSTALL = originalDisableInstall;
+			restoreClassicRepairEnv();
 			for (const dir of tempDirs.splice(0)) removeTempDirSync(dir);
 		});
 

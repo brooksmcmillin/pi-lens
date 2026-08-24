@@ -33,7 +33,12 @@ function isWithin(root: string, candidate: string): boolean {
 		normalizeMapKey(root),
 		normalizeMapKey(candidate),
 	);
-	return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+	return (
+		relative === "" ||
+		(!relative.startsWith(`..${path.sep}`) &&
+			relative !== ".." &&
+			!path.isAbsolute(relative))
+	);
 }
 
 function diagnosticLocation(
@@ -56,7 +61,10 @@ function diagnosticLocation(
 	};
 }
 
-export function parseHelmLintOutput(raw: string, chartRoot: string): Diagnostic[] {
+export function parseHelmLintOutput(
+	raw: string,
+	chartRoot: string,
+): Diagnostic[] {
 	const diagnostics: Diagnostic[] = [];
 	for (const line of raw.split(/\r?\n/)) {
 		const match = line.trim().match(/^\[(INFO|WARNING|ERROR)\]\s*(.+)$/);
@@ -73,7 +81,8 @@ ${line.trim()}`;
 		}
 		const level = match[1];
 		const location = diagnosticLocation(match[2].trim(), chartRoot);
-		const severity = level === "ERROR" ? "error" : level === "WARNING" ? "warning" : "info";
+		const severity =
+			level === "ERROR" ? "error" : level === "WARNING" ? "warning" : "info";
 		diagnostics.push({
 			id: `helm-lint-${diagnostics.length + 1}-${level.toLowerCase()}`,
 			message: location.message,
@@ -100,7 +109,10 @@ function failedResult(kind: string, message: string): RunnerResult {
 	};
 }
 
-async function lintChart(chartRoot: string, cwd: string): Promise<RunnerResult> {
+async function lintChart(
+	chartRoot: string,
+	cwd: string,
+): Promise<RunnerResult> {
 	const cmd = await resolveAvailableOrInstall(helm, "helm", cwd);
 	if (!cmd) {
 		const outcome: AvailabilityOutcome | null = helm.getOutcome(cwd);

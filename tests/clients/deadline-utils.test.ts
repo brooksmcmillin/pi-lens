@@ -24,7 +24,9 @@ const slowReject = (message: string, ms: number): Promise<never> =>
 describe("withDeadline", () => {
 	describe("reject-on-timeout mode (default)", () => {
 		it("resolves the value when the promise wins", async () => {
-			await expect(withDeadline(slow("ok", 5), { ms: 1000 })).resolves.toBe("ok");
+			await expect(withDeadline(slow("ok", 5), { ms: 1000 })).resolves.toBe(
+				"ok",
+			);
 		});
 		it("rejects with a Timeout error when the timer wins", async () => {
 			await expect(withDeadline(slow("x", 1000), { ms: 10 })).rejects.toThrow(
@@ -56,7 +58,10 @@ describe("withDeadline", () => {
 		});
 		it("still propagates the promise's own rejection (onReject default)", async () => {
 			await expect(
-				withDeadline(slowReject("boom", 5), { ms: 1000, onTimeout: "undefined" }),
+				withDeadline(slowReject("boom", 5), {
+					ms: 1000,
+					onTimeout: "undefined",
+				}),
 			).rejects.toThrow("boom");
 		});
 	});
@@ -100,7 +105,10 @@ describe("late-rejection suppression (#366 bug fix)", () => {
 
 	it.each([
 		["reject mode", { ms: 10 } as const],
-		["undefined mode (withBudget's fixed bug)", { ms: 10, onTimeout: "undefined" } as const],
+		[
+			"undefined mode (withBudget's fixed bug)",
+			{ ms: 10, onTimeout: "undefined" } as const,
+		],
 	])(
 		"does not surface the loser promise's late rejection in %s",
 		async (_label, opts) => {
@@ -116,27 +124,67 @@ describe("late-rejection suppression (#366 bug fix)", () => {
 			).toBe(false);
 		},
 	);
+
+	// #1621 F3: the ms<=0 early return settles WITHOUT ever entering the race
+	// below, so it never got the loser-leg's `promise.catch(() => {})` either.
+	// A non-positive budget (e.g. a negative env override surviving parsing)
+	// left the caller's own promise uncaught — an unhandled rejection once it
+	// eventually settled, on top of silently disabling whatever the promise
+	// was doing since nothing ever awaited its result.
+	it.each([
+		["reject mode", { ms: 0 } as const],
+		["undefined mode", { ms: 0, onTimeout: "undefined" } as const],
+		["negative ms (clamped the same as 0)", { ms: -100 } as const],
+	])(
+		"does not surface a non-positive-budget promise's later rejection in %s",
+		async (_label, opts) => {
+			reasons = [];
+			process.on("unhandledRejection", onUnhandled);
+			const race = withDeadline(slowReject("late-loser-nonpositive", 40), opts);
+			await race.catch(() => undefined);
+			await new Promise((r) => setTimeout(r, 80));
+			expect(
+				reasons.some(
+					(r) => r instanceof Error && r.message === "late-loser-nonpositive",
+				),
+			).toBe(false);
+		},
+	);
 });
 
 describe("named adapters preserve their exact semantics", () => {
 	it("withTimeout: rejects on timeout, propagates rejection, resolves value", async () => {
 		await expect(withTimeout(slow("v", 5), 1000)).resolves.toBe("v");
-		await expect(withTimeout(slow("v", 1000), 10)).rejects.toThrow(/Timeout after 10ms/);
-		await expect(withTimeout(slowReject("boom", 5), 1000)).rejects.toThrow("boom");
+		await expect(withTimeout(slow("v", 1000), 10)).rejects.toThrow(
+			/Timeout after 10ms/,
+		);
+		await expect(withTimeout(slowReject("boom", 5), 1000)).rejects.toThrow(
+			"boom",
+		);
 	});
 
 	it("withBudget: undefined on timeout, undefined for <=0, propagates rejection", async () => {
 		await expect(withBudget(slow("v", 1000), 10)).resolves.toBeUndefined();
 		await expect(withBudget(slow("v", 50), 0)).resolves.toBeUndefined();
 		await expect(withBudget(slow("v", 5), 1000)).resolves.toBe("v");
-		await expect(withBudget(slowReject("boom", 5), 1000)).rejects.toThrow("boom");
+		await expect(withBudget(slowReject("boom", 5), 1000)).rejects.toThrow(
+			"boom",
+		);
 	});
 
 	it("withinRemaining: undefined on timeout, swallows rejection, undefined once past deadline", async () => {
-		await expect(withinRemaining(slow("v", 5), Date.now() + 1000)).resolves.toBe("v");
-		await expect(withinRemaining(slow("v", 1000), Date.now() + 10)).resolves.toBeUndefined();
-		await expect(withinRemaining(slowReject("boom", 5), Date.now() + 1000)).resolves.toBeUndefined();
-		await expect(withinRemaining(slow("v", 50), Date.now() - 1)).resolves.toBeUndefined();
+		await expect(
+			withinRemaining(slow("v", 5), Date.now() + 1000),
+		).resolves.toBe("v");
+		await expect(
+			withinRemaining(slow("v", 1000), Date.now() + 10),
+		).resolves.toBeUndefined();
+		await expect(
+			withinRemaining(slowReject("boom", 5), Date.now() + 1000),
+		).resolves.toBeUndefined();
+		await expect(
+			withinRemaining(slow("v", 50), Date.now() - 1),
+		).resolves.toBeUndefined();
 	});
 });
 

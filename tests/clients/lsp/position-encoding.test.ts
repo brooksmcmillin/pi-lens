@@ -14,7 +14,9 @@ import {
 
 describe("negotiatePositionEncoding (#269)", () => {
 	it("returns the server's advertised encoding", () => {
-		expect(negotiatePositionEncoding({ positionEncoding: "utf-8" })).toBe("utf-8");
+		expect(negotiatePositionEncoding({ positionEncoding: "utf-8" })).toBe(
+			"utf-8",
+		);
 		expect(negotiatePositionEncoding({ positionEncoding: "utf-16" })).toBe(
 			"utf-16",
 		);

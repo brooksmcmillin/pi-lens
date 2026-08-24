@@ -50,9 +50,17 @@ import {
 	type Disposition,
 } from "../clients/diagnostic-dispositions.js";
 import { insertSuppressComment } from "../clients/dispatch/suppress-writer.js";
-import { getFileDiagnostics, type WidgetDiagnostic } from "../clients/widget-state.js";
+import {
+	getFileDiagnostics,
+	type WidgetDiagnostic,
+} from "../clients/widget-state.js";
 
-const DISPOSITIONS = ["false-positive", "suppress", "defer", "flagged"] as const;
+const DISPOSITIONS = [
+	"false-positive",
+	"suppress",
+	"defer",
+	"flagged",
+] as const;
 
 // How far ± the caller's line the fuzzy fallback searches for a plausible
 // (non-blank) line when there's no widget-state match to reanchor from.
@@ -99,7 +107,10 @@ function widgetCrossCheck(
 	if (matches.length === 0) return undefined;
 	if (matches.length === 1) return { line: matches[0].line, ambiguous: false };
 	const closest = matches.reduce(
-		(best, d) => (Math.abs(d.line - callerLine) < Math.abs(best.line - callerLine) ? d : best),
+		(best, d) =>
+			Math.abs(d.line - callerLine) < Math.abs(best.line - callerLine)
+				? d
+				: best,
 		matches[0],
 	);
 	return { line: closest.line, ambiguous: true };
@@ -169,7 +180,9 @@ function verifyLine(
 			reanchored,
 			note: reanchored
 				? `reanchored from line ${callerLine} to ${widgetResult.line}` +
-					(widgetResult.ambiguous ? " (multiple live matches, chose nearest)" : "") +
+					(widgetResult.ambiguous
+						? " (multiple live matches, chose nearest)"
+						: "") +
 					" against current diagnostics"
 				: undefined,
 		};
@@ -222,13 +235,15 @@ export function createLensDiagnosticMarkTool(
 			"Use lens_diagnostic_mark to dismiss a false-positive, suppress a won't-fix, defer, or flag a finding to fix later",
 		parameters: Type.Object({
 			filePath: Type.String({
-				description: "The file the diagnostic was reported on (relative or absolute).",
+				description:
+					"The file the diagnostic was reported on (relative or absolute).",
 			}),
 			line: Type.Number({
 				description: "The 1-based line the diagnostic was reported at.",
 			}),
 			message: Type.String({
-				description: "The diagnostic's message, exactly as lens_diagnostics reported it.",
+				description:
+					"The diagnostic's message, exactly as lens_diagnostics reported it.",
 			}),
 			rule: Type.Optional(
 				Type.String({
@@ -237,7 +252,9 @@ export function createLensDiagnosticMarkTool(
 				}),
 			),
 			tool: Type.Optional(
-				Type.String({ description: "The tool that produced the diagnostic, if known." }),
+				Type.String({
+					description: "The tool that produced the diagnostic, if known.",
+				}),
 			),
 			disposition: Type.String({
 				enum: DISPOSITIONS,
@@ -245,7 +262,9 @@ export function createLensDiagnosticMarkTool(
 					"false-positive = the rule misfired. suppress = real finding, won't fix (writes an inline ignore comment). defer = fix later, this session only. flagged = mark for you to fix.",
 			}),
 			reason: Type.Optional(
-				Type.String({ description: "Optional short reason, kept alongside the disposition." }),
+				Type.String({
+					description: "Optional short reason, kept alongside the disposition.",
+				}),
 			),
 		}),
 		async execute(
@@ -323,7 +342,14 @@ export function createLensDiagnosticMarkTool(
 			let verifiedLine = line;
 			let reanchorNote: string | undefined;
 			try {
-				const verification = verifyLine(content, absPath, tool, rule, message, line);
+				const verification = verifyLine(
+					content,
+					absPath,
+					tool,
+					rule,
+					message,
+					line,
+				);
 				if ("error" in verification) {
 					if (disposition === "suppress") {
 						return {
@@ -362,8 +388,13 @@ export function createLensDiagnosticMarkTool(
 			if (disposition === "suppress") {
 				let updated: string;
 				try {
-					// biome-ignore lint/style/noNonNullAssertion: validated above
-					updated = insertSuppressComment(content, absPath, verifiedLine, rule!);
+					updated = insertSuppressComment(
+						content,
+						absPath,
+						verifiedLine,
+						// biome-ignore lint/style/noNonNullAssertion: validated above
+						rule!,
+					);
 				} catch (err) {
 					return {
 						content: [

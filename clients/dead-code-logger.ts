@@ -16,8 +16,10 @@ const LOG_FILE = path.join(LOG_DIR, "dead-code.log");
 const LOG_BACKUP_FILE = path.join(LOG_DIR, "dead-code.log.1");
 const MAX_LOG_BYTES = Math.max(
 	128 * 1024,
-	Number.parseInt(process.env.PI_LENS_DEAD_CODE_LOG_MAX_BYTES ?? "1048576", 10) ||
-		1048576,
+	Number.parseInt(
+		process.env.PI_LENS_DEAD_CODE_LOG_MAX_BYTES ?? "1048576",
+		10,
+	) || 1048576,
 );
 const writer = createNdjsonLogger({
 	filePath: LOG_FILE,

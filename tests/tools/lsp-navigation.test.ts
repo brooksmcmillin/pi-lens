@@ -197,9 +197,7 @@ describe("lsp_navigation tool", () => {
 			{ cwd: "/some/other/project" },
 		);
 
-		expect(calls).toEqual([
-			{ name: "no-lsp", cwd: "/some/other/project" },
-		]);
+		expect(calls).toEqual([{ name: "no-lsp", cwd: "/some/other/project" }]);
 	});
 
 	it("allows incomingCalls without path when callHierarchyItem exists", async () => {
@@ -257,7 +255,7 @@ describe("lsp_navigation tool", () => {
 		expect(
 			(mocked.service as { workspaceSymbol: ReturnType<typeof vi.fn> })
 				.workspaceSymbol,
-		).toHaveBeenCalledWith("ReportProcessor", undefined);
+		).toHaveBeenCalledWith("ReportProcessor", undefined, expect.any(Object));
 	});
 
 	it("executeCommand dry-runs by default and does NOT execute", async () => {
@@ -602,6 +600,124 @@ describe("lsp_navigation tool", () => {
 		]);
 	});
 
+	// #1803 fix round F1: needsFilePath is false for call-hierarchy traversal,
+	// so the shared capability pre-check (which every path-based operation
+	// gets) never ran for incomingCalls/outgoingCalls — a server that never
+	// advertised callHierarchyProvider produced an INDISTINGUISHABLE-from-
+	// "no callers found" empty array, an error swallowed into a false clean
+	// signal (the empty-distinguishes-clean-from-errored screen). This probe
+	// pair proves both directions: unsupported reports the discriminator,
+	// and a genuinely supporting server with zero callers still reports a
+	// clean empty (not a false "unsupported").
+	it.each(["incomingCalls", "outgoingCalls"] as const)(
+		"reports the unsupported discriminator for %s when the server never advertised callHierarchyProvider",
+		async (operation) => {
+			const tool = createLspNavigationTool((flag) => flag === "lens-lsp");
+			(
+				mocked.service as { getOperationSupport: ReturnType<typeof vi.fn> }
+			).getOperationSupport = vi.fn().mockResolvedValue({
+				definition: false,
+				typeDefinition: false,
+				declaration: false,
+				references: false,
+				hover: false,
+				signatureHelp: false,
+				documentSymbol: false,
+				workspaceSymbol: false,
+				codeAction: false,
+				rename: false,
+				implementation: false,
+				callHierarchy: false,
+			});
+			const operationSpy = (
+				mocked.service as Record<typeof operation, ReturnType<typeof vi.fn>>
+			)[operation];
+			const callHierarchyItem = {
+				name: "foo",
+				kind: 12,
+				uri: tmpFileUrl("unsupported.py"),
+				range: {
+					start: { line: 1, character: 0 },
+					end: { line: 1, character: 3 },
+				},
+				selectionRange: {
+					start: { line: 1, character: 0 },
+					end: { line: 1, character: 3 },
+				},
+			};
+
+			const result = await tool.execute(
+				`unsupported-${operation}`,
+				{ operation, callHierarchyItem },
+				new AbortController().signal,
+				null,
+				{ cwd: "." },
+			);
+
+			expect(operationSpy).not.toHaveBeenCalled();
+			expect(result.isError).toBe(true);
+			expect(result.details?.emptyReason).toBe("unsupported");
+			expect(String(result.content[0]?.text)).toContain(
+				`does not advertise support for ${operation}`,
+			);
+		},
+	);
+
+	it.each(["incomingCalls", "outgoingCalls"] as const)(
+		"reports a clean empty (not unsupported) when %s finds zero calls",
+		async (operation) => {
+			const tool = createLspNavigationTool((flag) => flag === "lens-lsp");
+			(
+				mocked.service as { getOperationSupport: ReturnType<typeof vi.fn> }
+			).getOperationSupport = vi.fn().mockResolvedValue({
+				definition: false,
+				typeDefinition: false,
+				declaration: false,
+				references: false,
+				hover: false,
+				signatureHelp: false,
+				documentSymbol: false,
+				workspaceSymbol: false,
+				codeAction: false,
+				rename: false,
+				implementation: false,
+				callHierarchy: true,
+			});
+			(mocked.service as Record<typeof operation, ReturnType<typeof vi.fn>>)[
+				operation
+			] = vi.fn().mockResolvedValue([]);
+			const callHierarchyItem = {
+				name: "leaf",
+				kind: 12,
+				uri: tmpFileUrl("supported.py"),
+				range: {
+					start: { line: 1, character: 0 },
+					end: { line: 1, character: 3 },
+				},
+				selectionRange: {
+					start: { line: 1, character: 0 },
+					end: { line: 1, character: 3 },
+				},
+			};
+
+			const result = await tool.execute(
+				`supported-empty-${operation}`,
+				{ operation, callHierarchyItem },
+				new AbortController().signal,
+				null,
+				{ cwd: "." },
+			);
+
+			expect(
+				(mocked.service as Record<typeof operation, ReturnType<typeof vi.fn>>)[
+					operation
+				],
+			).toHaveBeenCalledWith(callHierarchyItem);
+			expect(result.isError).toBeUndefined();
+			expect(result.details?.emptyReason).toBe("no-call-hierarchy-results");
+		},
+	);
+
 	it("opens scoped file before workspaceSymbol query", async () => {
 		const tool = createLspNavigationTool((flag) => flag === "lens-lsp");
 		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-nav-"));
@@ -614,7 +730,11 @@ describe("lsp_navigation tool", () => {
 		try {
 			const result = await tool.execute(
 				"3",
-				{ operation: "workspaceSymbol", path: filePath, query: "normalizeMapKey" },
+				{
+					operation: "workspaceSymbol",
+					path: filePath,
+					query: "normalizeMapKey",
+				},
 				new AbortController().signal,
 				null,
 				{ cwd: "." },
@@ -762,7 +882,12 @@ describe("lsp_navigation tool", () => {
 		try {
 			await tool.execute(
 				"symbol-occurrence",
-				{ operation: "references", path: filePath, line: 1, symbol: "myFunc#2" },
+				{
+					operation: "references",
+					path: filePath,
+					line: 1,
+					symbol: "myFunc#2",
+				},
 				new AbortController().signal,
 				null,
 				{ cwd: "." },
@@ -1103,23 +1228,25 @@ describe("lsp_navigation tool", () => {
 
 	it("returns an error and terminal failed mutation outcome when apply is true cannot write", async () => {
 		const tool = createLspNavigationTool((flag) => flag === "lens-lsp");
-		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-nav-fail-"));
+		const tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-nav-fail-"),
+		);
 		const filePath = path.join(tmpDir, "missing.ts");
-		(
-			mocked.service as { rename: ReturnType<typeof vi.fn> }
-		).rename = vi.fn().mockResolvedValue({
-			changes: {
-				[pathToFileURL(filePath).href]: [
-					{
-						range: {
-							start: { line: 0, character: 0 },
-							end: { line: 0, character: 0 },
+		(mocked.service as { rename: ReturnType<typeof vi.fn> }).rename = vi
+			.fn()
+			.mockResolvedValue({
+				changes: {
+					[pathToFileURL(filePath).href]: [
+						{
+							range: {
+								start: { line: 0, character: 0 },
+								end: { line: 0, character: 0 },
+							},
+							newText: "new",
 						},
-						newText: "new",
-					},
-				],
-			},
-		});
+					],
+				},
+			});
 		try {
 			const result = await tool.execute(
 				"rename-fail",

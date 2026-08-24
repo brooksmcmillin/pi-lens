@@ -34,7 +34,9 @@ function makeCtx(filePath: string, cwd = process.cwd()) {
 }
 
 function goResult(stdout = "", status = 0, stderr = "") {
-	return { status, stdout, stderr } as Awaited<ReturnType<typeof safeSpawnAsync>>;
+	return { status, stdout, stderr } as Awaited<
+		ReturnType<typeof safeSpawnAsync>
+	>;
 }
 
 describe("go-vet runner", () => {
@@ -43,9 +45,7 @@ describe("go-vet runner", () => {
 	beforeEach(async () => {
 		goExePath.current = "/usr/local/bin/go";
 		safeSpawnAsync.mockReset();
-		runner = await import(
-			"../../../../clients/dispatch/runners/go-vet.js"
-		);
+		runner = await import("../../../../clients/dispatch/runners/go-vet.js");
 	});
 
 	it("skips when go is not available", async () => {

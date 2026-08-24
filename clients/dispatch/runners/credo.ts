@@ -62,8 +62,10 @@ export function parseCredoJson(
 					: fallbackPath,
 			line: issue.line_no,
 			column: issue.column ?? 1,
-			severity: issue.priority <= 10 ? ("error" as const) : ("warning" as const),
-			semantic: issue.priority <= 10 ? ("blocking" as const) : ("warning" as const),
+			severity:
+				issue.priority <= 10 ? ("error" as const) : ("warning" as const),
+			semantic:
+				issue.priority <= 10 ? ("blocking" as const) : ("warning" as const),
 			tool: "credo",
 			rule: issue.check,
 			fixable: false,

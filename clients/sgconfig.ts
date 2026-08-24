@@ -71,13 +71,7 @@ export function getAstGrepRuleSources(
 				tier: "primary",
 			},
 			{
-				dir: path.join(
-					root,
-					"rules",
-					"ast-grep-rules",
-					"coderabbit",
-					"rules",
-				),
+				dir: path.join(root, "rules", "ast-grep-rules", "coderabbit", "rules"),
 				origin: "project",
 				tier: "secondary",
 			},
@@ -319,8 +313,9 @@ function cleanupStaleBaselines(dir: string, keep: Set<string>): void {
 	try {
 		const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
 		for (const name of fs.readdirSync(dir)) {
-			const isConfig =
-				/^baseline(?:-\d+(?:-[a-f0-9]+)?)?\.sgconfig\.yml$/.test(name);
+			const isConfig = /^baseline(?:-\d+(?:-[a-f0-9]+)?)?\.sgconfig\.yml$/.test(
+				name,
+			);
 			const isMergedDir = /^baseline-\d+(?:-[a-f0-9]+)?\.rules$/.test(name);
 			if (!isConfig && !isMergedDir) continue;
 			const full = path.join(dir, name);

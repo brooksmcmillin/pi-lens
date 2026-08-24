@@ -5,11 +5,11 @@ import type { DispatchContext } from "./types.js";
 const providers: FactProvider[] = [];
 
 export function registerProvider(p: FactProvider): void {
-  providers.push(p);
+	providers.push(p);
 }
 
 export function clearProviders(): void {
-  providers.length = 0;
+	providers.length = 0;
 }
 
 /**
@@ -24,16 +24,16 @@ export function clearProviders(): void {
  * so the old lazy-import-with-degrade indirection (#285/#335) is gone.
  */
 export async function runProviders(ctx: DispatchContext): Promise<void> {
-  const applicable = providers.filter((p) => p.appliesTo(ctx));
-  const ordered = scheduleProviders(applicable);
+	const applicable = providers.filter((p) => p.appliesTo(ctx));
+	const ordered = scheduleProviders(applicable);
 
-  for (const provider of ordered) {
-    // Skip if all provided facts are already present
-    const allPresent = provider.provides.every((key) =>
-      ctx.facts.hasFileFact(ctx.filePath, key),
-    );
-    if (allPresent) continue;
+	for (const provider of ordered) {
+		// Skip if all provided facts are already present
+		const allPresent = provider.provides.every((key) =>
+			ctx.facts.hasFileFact(ctx.filePath, key),
+		);
+		if (allPresent) continue;
 
-    await provider.run(ctx, ctx.facts);
-  }
+		await provider.run(ctx, ctx.facts);
+	}
 }

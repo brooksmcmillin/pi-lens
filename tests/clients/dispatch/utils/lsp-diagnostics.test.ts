@@ -60,7 +60,9 @@ describe("convertLspDiagnostics — scan-provenance identity (#692)", () => {
 
 	it("falls back to `tool` for `rule` when the diagnostic has no own source, regardless of scanOrigin", () => {
 		const diag = astGrepDiag({ source: undefined });
-		const perEdit = convertLspDiagnostics([diag], "/repo/a.ts", { tool: "lsp" });
+		const perEdit = convertLspDiagnostics([diag], "/repo/a.ts", {
+			tool: "lsp",
+		});
 		const scanned = convertLspDiagnostics([diag], "/repo/a.ts", {
 			tool: "lsp",
 			scanOrigin: "lens_diagnostics_full",

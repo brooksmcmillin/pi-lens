@@ -92,7 +92,14 @@ export interface DiagnosticBinding extends StoredDiagnosticBinding {
  * cut off by the aux grace timer (#1470), or silent with no stored publication for this
  * content (#1493) — and `unconfirmedServerIds` names it. A partial touch
  * is deliberately NOT `inconclusive`: the primary answered and its findings stand;
- * only the claim of full coverage is withdrawn. It is required
+ * only the claim of full coverage is withdrawn.
+ *
+ * #1549 makes that separation total: an auxiliary can NEVER make a touch
+ * `inconclusive`, whichever deadline it missed. Only a primary can, and
+ * `inconclusiveServerIds`/`inconclusiveReason` name which one and why. See
+ * {@link resolveTouchVerdict}, which owns the rule.
+ *
+ * `confirmation` is required
  * before treating an empty result from a known silent-on-clean server as clean, but is
  * not a substitute for a consumer's stricter scope-specific fallback — notably, an
  * all-scope classic TypeScript touch still needs the tool's synchronous tsserver check.
@@ -115,6 +122,23 @@ export interface TouchFileResult {
 	diags: import("./client.js").LSPDiagnostic[];
 	confirmation?: "confirmed" | "partial";
 	inconclusive?: boolean;
+	/**
+	 * #1549: WHICH servers made this touch inconclusive. Present only alongside
+	 * `inconclusive: true`, and only ever naming PRIMARY-role servers — an
+	 * auxiliary that never reported narrows the verdict to `"partial"` via
+	 * {@link touchCoverageGap} instead, so it can never appear here. Empty/absent
+	 * on an inconclusive touch means the attribution could not be derived (a
+	 * client without the per-path publication stamp), which fails closed to the
+	 * pre-#1549 "the touch is inconclusive, cause unattributed" state.
+	 */
+	inconclusiveServerIds?: string[];
+	/**
+	 * #1549: which deadline produced the verdict — the notify write that never
+	 * landed, the diagnostics wait that lapsed, or both. Named so a forensic sweep
+	 * of `latency.log`/`cascade.log` reads the cause instead of inferring it from
+	 * duration histograms.
+	 */
+	inconclusiveReason?: TouchInconclusiveReason;
 	/**
 	 * #1470/#1493: server ids this touch carries NO evidence for. Populated (and
 	 * `confirmation` narrowed to `"partial"`) for every auxiliary that never
@@ -141,6 +165,85 @@ export interface TouchFileResult {
 	 */
 	unconfirmedServerIds?: string[];
 	binding?: DiagnosticBinding;
+}
+
+/**
+ * #1549: which deadline made a touch inconclusive. `"mixed"` means both a
+ * primary's notify write and the diagnostics wait lapsed on this touch.
+ */
+export type TouchInconclusiveReason =
+	| "notify-write"
+	| "diagnostics-wait"
+	| "mixed";
+
+/** The inputs {@link resolveTouchVerdict} decides a touch's honesty verdict from. */
+export interface TouchVerdictInput {
+	/**
+	 * PRIMARY-role servers whose `didOpen`/`didChange` write did not land inside
+	 * the notify budget (timed out or rejected). Auxiliary write failures are
+	 * deliberately NOT passed here — they are coverage gaps.
+	 */
+	primaryNotifyWriteTimedOutServerIds: readonly string[];
+	/** Did the diagnostics wait lapse in a way attributable to a primary? */
+	diagnosticsTimedOut: boolean;
+	/**
+	 * PRIMARY-role servers that produced no publication evidence for this touch
+	 * when the wait lapsed. May be empty when the attribution is unknowable
+	 * (a client with no per-path publication stamp) — the verdict then still
+	 * stands on `diagnosticsTimedOut`, just unattributed.
+	 */
+	diagnosticsUnansweredServerIds: readonly string[];
+}
+
+/** The verdict fields {@link resolveTouchVerdict} produces. */
+export interface TouchVerdict {
+	inconclusive: boolean;
+	inconclusiveServerIds?: string[];
+	inconclusiveReason?: TouchInconclusiveReason;
+}
+
+/**
+ * #1549: the ONE rule that decides whether a touch is inconclusive, and who is
+ * responsible.
+ *
+ * The rule this replaced was `notifyWriteTimedOut || diagnosticsTimedOut` with
+ * both flags TOUCH-WIDE over every spawned server, so one slow auxiliary
+ * discarded every good answer in the touch: a clean typescript reply beside an
+ * opengrep scan that needed 2s read as "nothing is known about this file". Over
+ * 6,079 cascade neighbour sweeps that produced a 97.6% inconclusive rate
+ * (ordinary edit-time touches in the same window: 15%).
+ *
+ * The verdict is therefore decided from the PRIMARY population only. An
+ * auxiliary that never reported is a named COVERAGE GAP — `confirmation:
+ * "partial"` plus {@link touchCoverageGap} — which withdraws the claim of full
+ * coverage while the primary's findings still flow. That is the #533 honesty
+ * doctrine cutting both ways: overclaiming ("confirmed" while a scanner was
+ * silent) and underclaiming ("inconclusive" while the language server answered)
+ * are both dishonest.
+ *
+ * Keep this a pure function: it is the single place a consumer's reading of
+ * `inconclusive` can be audited against, and it is unit-tested directly.
+ */
+export function resolveTouchVerdict(input: TouchVerdictInput): TouchVerdict {
+	const notifyIds = [...new Set(input.primaryNotifyWriteTimedOutServerIds)];
+	const waitIds = input.diagnosticsTimedOut
+		? [...new Set(input.diagnosticsUnansweredServerIds)]
+		: [];
+	if (notifyIds.length === 0 && !input.diagnosticsTimedOut) {
+		return { inconclusive: false };
+	}
+	const serverIds = [...new Set([...notifyIds, ...waitIds])];
+	const reason: TouchInconclusiveReason =
+		notifyIds.length > 0 && input.diagnosticsTimedOut
+			? "mixed"
+			: notifyIds.length > 0
+				? "notify-write"
+				: "diagnostics-wait";
+	return {
+		inconclusive: true,
+		...(serverIds.length > 0 && { inconclusiveServerIds: serverIds }),
+		inconclusiveReason: reason,
+	};
 }
 
 /**
@@ -264,8 +367,7 @@ export function auxiliaryCoverageGap(
 ): string[] {
 	return evidence
 		.filter(
-			(aux) =>
-				aux.outcome !== "answered" && aux.publishedThisContent !== true,
+			(aux) => aux.outcome !== "answered" && aux.publishedThisContent !== true,
 		)
 		.map((aux) => aux.serverId);
 }

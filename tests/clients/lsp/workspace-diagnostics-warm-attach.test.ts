@@ -88,13 +88,20 @@ describe("runWorkspaceDiagnostics warm attach sweeps (#822)", () => {
 		expect(warmup).not.toHaveBeenCalled();
 	});
 
-	// #1470: the sweep's own honesty gate. `runWorkspaceDiagnostics` persists
-	// every `!timedOut` result into the workspace-diagnostics cache, and it read
-	// only `inconclusive` — which a partially covered touch deliberately is not.
-	// The incumbent touches with `clientScope: "with-auxiliary"`, so it is the one
-	// route into this sweep that can produce a coverage gap today, and the gap has
-	// to reach the `timedOut` computation or the sweep caches a partial answer as
-	// a confirmed clean and replays it on every later sweep.
+	// #1470: the sweep's own honesty gate. The incumbent touches with
+	// `clientScope: "with-auxiliary"`, so it is the one route into this sweep
+	// that can produce a coverage gap today. A partially covered answer must
+	// never be persisted as a confirmed clean and replayed on every later sweep.
+	//
+	// #1549 remapped HOW the gap is carried, not WHETHER it blocks the cache.
+	// Before, the gap collapsed the whole file to `timedOut: true`, which also
+	// discarded the primary's usable answer. #1470's own "suggested direction"
+	// rejects that collapse: a primary that answered stays trustworthy when only
+	// an auxiliary was cut off. The gap now rides on `unconfirmedServerIds`, the
+	// sweep's cache write requires an empty `unconfirmedServerIds` as well as
+	// `!timedOut`, and `timedOut` is reserved for primary-scoped failures. This
+	// test asserts the same protection through the new state: the uncovered lane
+	// is named on the result, and the file stays out of the cache.
 	it("does not cache a sweep result whose auxiliary the incumbent could not cover (#1470)", async () => {
 		fs.mkdirSync(path.join(tmp, ".pi-lens"));
 		const file = path.join(tmp, "a.ts");
@@ -113,19 +120,16 @@ describe("runWorkspaceDiagnostics warm attach sweeps (#822)", () => {
 			files: [file],
 		});
 
-		expect(results[0]?.timedOut).toBe(true);
-		const { cacheKeyFor, loadWorkspaceDiagnosticsCache } = await import(
-			"../../../clients/lsp/workspace-diagnostics-cache.js"
-		);
+		expect(results[0]?.unconfirmedServerIds).toEqual(["typos"]);
+		const { cacheKeyFor, loadWorkspaceDiagnosticsCache } =
+			await import("../../../clients/lsp/workspace-diagnostics-cache.js");
 		expect(
 			loadWorkspaceDiagnosticsCache(tmp)?.entries[cacheKeyFor(file)],
 		).toBeUndefined();
 	});
 
 	it("promotes after an IPC failure and completes that file and the remainder locally", async () => {
-		const files = ["a.ts", "b.ts", "c.ts"].map((name) =>
-			path.join(tmp, name),
-		);
+		const files = ["a.ts", "b.ts", "c.ts"].map((name) => path.join(tmp, name));
 		for (const file of files) fs.writeFileSync(file, "const x = 1;\n");
 		let attachedCalls = 0;
 		tryWarmAttachedDiagnostics.mockImplementation(async (file: string) => {

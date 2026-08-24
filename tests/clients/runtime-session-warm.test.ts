@@ -192,7 +192,11 @@ describe("warmFiles session start", () => {
 
 		// TypeScript dominates (3 files) over Python (1) in a real project root —
 		// exactly one server should be warmed, via a representative .ts file.
-		createTempFile(env.tmpDir, "package.json", JSON.stringify({ type: "module" }));
+		createTempFile(
+			env.tmpDir,
+			"package.json",
+			JSON.stringify({ type: "module" }),
+		);
 		createTempFile(env.tmpDir, "src/a.ts", "export const a = 1;");
 		createTempFile(env.tmpDir, "src/b.ts", "export const b = 2;");
 		createTempFile(env.tmpDir, "src/c.ts", "export const c = 3;");
@@ -232,7 +236,11 @@ describe("warmFiles session start", () => {
 		// json/yaml have builtin LSP servers — but the dominant-language warm
 		// must still pick tsserver, or the first .ts edit pays the cold-spawn
 		// stall (#203) this warm exists to prevent.
-		createTempFile(env.tmpDir, "package.json", JSON.stringify({ type: "module" }));
+		createTempFile(
+			env.tmpDir,
+			"package.json",
+			JSON.stringify({ type: "module" }),
+		);
 		for (let i = 0; i < 4; i++) {
 			createTempFile(env.tmpDir, `locales/l${i}.json`, `{"n": ${i}}`);
 		}

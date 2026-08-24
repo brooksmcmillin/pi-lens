@@ -45,12 +45,12 @@
  *   3  = engine / page error
  */
 
-import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { load as yamlLoad } from "js-yaml";
+import { safeSpawnAsync } from "../clients/safe-spawn.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // Use os.tmpdir() — the TMP/TEMP env vars differ across shells
@@ -78,6 +78,14 @@ const LANG_ALIASES = {
 };
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+// Bounded wait for the helper child processes (playground-cdp.mjs /
+// playground-chrome.mjs) themselves — separate from DEFAULT_TIMEOUT_MS,
+// which bounds the in-page playground poll. Each CDP call already
+// self-bounds around 30-40s internally (playground-cdp.mjs's own
+// per-message TIMEOUT_MS + nav's 10s hard cap), so 45s here is headroom
+// for a wedged/daemonized child that never emits 'close' at all — the
+// #1679 hang this constant exists to bound.
+const CHILD_SPAWN_TIMEOUT_MS = 45_000;
 const PORT = Number(process.env.PILENS_PLAYGROUND_PORT) || 9224;
 const CHROME_SCRIPT = join(__dirname, "playground-chrome.mjs");
 const CDP_SCRIPT = join(__dirname, "playground-cdp.mjs");
@@ -156,43 +164,47 @@ function readStdin() {
 	});
 }
 
-function runCdp(args) {
-	return new Promise((resolve, reject) => {
-		const proc = spawn(process.execPath, [CDP_SCRIPT, ...args], {
-			stdio: ["ignore", "pipe", "pipe"],
-			windowsHide: true,
-			env: { ...process.env, PILENS_PLAYGROUND_PORT: String(PORT) },
-		});
-		let stdout = "";
-		let stderr = "";
-		proc.stdout.on("data", (c) => (stdout += c));
-		proc.stderr.on("data", (c) => (stderr += c));
-		proc.on("close", (code) => {
-			if (code === 0) resolve(stdout.trim());
-			else
-				reject(
-					new Error(
-						`cdp ${args[0]} failed (exit ${code}): ${stderr.trim() || stdout.trim() || "no output"}`,
-					),
-				);
-		});
-		proc.on("error", reject);
+// #1679: was a hand-rolled `spawn(...)` + `proc.on("close", ...)` wait with
+// NO timeout — a wedged/daemonized child (e.g. Chrome/CDP left in a state
+// that never emits 'close') hung this script forever. safeSpawnAsync
+// (shared with production, clients/safe-spawn.ts) already does bounded
+// timeout+kill, stdout/stderr accumulation, and spawn-error surfacing —
+// reusing it here instead of a second, hand-rolled wait (single source of
+// truth, #883).
+//
+// `scriptPath`/`timeoutMs` are overridable (default to the real CDP/Chrome
+// helper scripts and CHILD_SPAWN_TIMEOUT_MS) purely so tests can point at a
+// never-closing fixture with a short timeout instead of the real helpers —
+// production call sites never pass them.
+export async function runCdp(
+	args,
+	{ scriptPath = CDP_SCRIPT, timeoutMs = CHILD_SPAWN_TIMEOUT_MS } = {},
+) {
+	const result = await safeSpawnAsync(process.execPath, [scriptPath, ...args], {
+		env: { ...process.env, PILENS_PLAYGROUND_PORT: String(PORT) },
+		timeout: timeoutMs,
 	});
+	if (result.status === 0) return result.stdout.trim();
+	const detail = result.error
+		? result.error.message
+		: result.stderr.trim() || result.stdout.trim() || "no output";
+	throw new Error(`cdp ${args[0]} failed (exit ${result.status}): ${detail}`);
 }
 
-function runChrome(cmd) {
-	return new Promise((resolve, reject) => {
-		const proc = spawn(process.execPath, [CHROME_SCRIPT, cmd], {
-			stdio: ["ignore", "ignore", "inherit"],
-			windowsHide: true,
-			env: { ...process.env, PILENS_PLAYGROUND_PORT: String(PORT) },
-		});
-		proc.on("close", (code) => {
-			if (code === 0) resolve();
-			else reject(new Error(`chrome ${cmd} failed (exit ${code})`));
-		});
-		proc.on("error", reject);
+export async function runChrome(
+	cmd,
+	{ scriptPath = CHROME_SCRIPT, timeoutMs = CHILD_SPAWN_TIMEOUT_MS } = {},
+) {
+	const result = await safeSpawnAsync(process.execPath, [scriptPath, cmd], {
+		env: { ...process.env, PILENS_PLAYGROUND_PORT: String(PORT) },
+		timeout: timeoutMs,
 	});
+	// The original spawn inherited stderr so launch/kill diagnostics streamed
+	// live; safeSpawnAsync captures instead, so surface it here on failure.
+	if (result.status === 0) return;
+	if (result.stderr) process.stderr.write(result.stderr);
+	const detail = result.error ? result.error.message : `exit ${result.status}`;
+	throw new Error(`chrome ${cmd} failed (${detail})`);
 }
 
 async function ensureChrome() {
@@ -415,10 +427,19 @@ async function main() {
 	}
 }
 
-main().then(
-	() => process.exit(0),
-	(e) => {
-		console.error(JSON.stringify({ ok: false, error: e.message }));
-		process.exit(2);
-	},
-);
+// #1679: only run the CLI when this file is executed directly (`node
+// scripts/playground-verify-rule.mjs ...`), not when it's imported as a
+// module — tests import `runCdp`/`runChrome` directly to exercise the
+// bounded-wait fix without also parsing CLI args / spawning Chrome / calling
+// process.exit as a side effect of the import.
+const isMain =
+	process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMain) {
+	main().then(
+		() => process.exit(0),
+		(e) => {
+			console.error(JSON.stringify({ ok: false, error: e.message }));
+			process.exit(2);
+		},
+	);
+}

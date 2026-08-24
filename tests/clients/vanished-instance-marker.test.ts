@@ -40,10 +40,20 @@ function alivePids(...pids: number[]): (pid: number) => boolean {
 
 describe("detectVanishedInstances (pure)", () => {
 	it("flags a registry entry whose pid is confirmed dead", () => {
-		const reg = [instance({ pid: 42, rssBytes: 600 * 1024 * 1024, heartbeatAt: "2026-08-07T01:23:00.000Z" })];
+		const reg = [
+			instance({
+				pid: 42,
+				rssBytes: 600 * 1024 * 1024,
+				heartbeatAt: "2026-08-07T01:23:00.000Z",
+			}),
+		];
 		const vanished = detectVanishedInstances(reg, alivePids());
 		expect(vanished).toEqual([
-			{ pid: 42, lastSeenAt: "2026-08-07T01:23:00.000Z", rssBytes: 600 * 1024 * 1024 },
+			{
+				pid: 42,
+				lastSeenAt: "2026-08-07T01:23:00.000Z",
+				rssBytes: 600 * 1024 * 1024,
+			},
 		]);
 	});
 
@@ -88,7 +98,11 @@ describe("logVanishedInstances (fail-then-pass wiring)", () => {
 		// FAILS on code with no marker at all (nothing calls logSessionStart here);
 		// PASSES once logVanishedInstances is wired to detect + log.
 		const reg = [
-			instance({ pid: 4242, heartbeatAt: "2026-08-06T23:00:00.000Z", rssBytes: 734003200 }),
+			instance({
+				pid: 4242,
+				heartbeatAt: "2026-08-06T23:00:00.000Z",
+				rssBytes: 734003200,
+			}),
 		];
 		logVanishedInstances(reg, alivePids());
 

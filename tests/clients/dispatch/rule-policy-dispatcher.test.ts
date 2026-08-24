@@ -36,10 +36,7 @@ function makeContext(cwd: string, facts: FactStore): DispatchContext {
 	);
 }
 
-function mockRunner(
-	id: string,
-	diagnostics: Diagnostic[],
-): RunnerDefinition {
+function mockRunner(id: string, diagnostics: Diagnostic[]): RunnerDefinition {
 	return {
 		id,
 		appliesTo: ["jsts"],
@@ -103,9 +100,7 @@ describe("dispatcher filter — rules.<id>.disable", () => {
 		registry.register(mockRunner("ast-grep", diagnostics));
 
 		const ctx = makeContext(tmpDir, new FactStore());
-		const groups: RunnerGroup[] = [
-			{ mode: "all", runnerIds: ["ast-grep"] },
-		];
+		const groups: RunnerGroup[] = [{ mode: "all", runnerIds: ["ast-grep"] }];
 
 		const result = await dispatchForFile(ctx, groups, registry);
 		expect(result.diagnostics.map((d) => d.rule)).toEqual(["no-debugger"]);
@@ -137,9 +132,7 @@ describe("dispatcher filter — rules.<id>.disable", () => {
 		registry.register(mockRunner("ast-grep", diagnostics));
 
 		const ctx = makeContext(tmpDir, new FactStore());
-		const groups: RunnerGroup[] = [
-			{ mode: "all", runnerIds: ["ast-grep"] },
-		];
+		const groups: RunnerGroup[] = [{ mode: "all", runnerIds: ["ast-grep"] }];
 
 		const result = await dispatchForFile(ctx, groups, registry);
 		expect(result.diagnostics).toHaveLength(0);
@@ -170,9 +163,7 @@ describe("dispatcher filter — rules.<id>.disable", () => {
 		registry.register(mockRunner("ast-grep", diagnostics));
 
 		const ctx = makeContext(tmpDir, new FactStore());
-		const groups: RunnerGroup[] = [
-			{ mode: "all", runnerIds: ["ast-grep"] },
-		];
+		const groups: RunnerGroup[] = [{ mode: "all", runnerIds: ["ast-grep"] }];
 
 		const result = await dispatchForFile(ctx, groups, registry);
 		expect(result.diagnostics).toHaveLength(1);
@@ -198,9 +189,7 @@ describe("dispatcher filter — rules.<id>.disable", () => {
 		registry.register(mockRunner("ast-grep", diagnostics));
 
 		const ctx = makeContext(tmpDir, new FactStore());
-		const groups: RunnerGroup[] = [
-			{ mode: "all", runnerIds: ["ast-grep"] },
-		];
+		const groups: RunnerGroup[] = [{ mode: "all", runnerIds: ["ast-grep"] }];
 
 		const result = await dispatchForFile(ctx, groups, registry);
 		expect(result.diagnostics).toHaveLength(1);
@@ -247,9 +236,7 @@ describe("dispatcher filter — rules.<id>.select", () => {
 		registry.register(mockRunner("ast-grep", diagnostics));
 
 		const ctx = makeContext(tmpDir, new FactStore());
-		const groups: RunnerGroup[] = [
-			{ mode: "all", runnerIds: ["ast-grep"] },
-		];
+		const groups: RunnerGroup[] = [{ mode: "all", runnerIds: ["ast-grep"] }];
 
 		const result = await dispatchForFile(ctx, groups, registry);
 		// Only `no-eval` survives — it's the sole entry in the project-wide
@@ -285,9 +272,7 @@ describe("dispatcher filter — rules.<id>.select", () => {
 		registry.register(mockRunner("ast-grep", diagnostics));
 
 		const ctx = makeContext(tmpDir, new FactStore());
-		const groups: RunnerGroup[] = [
-			{ mode: "all", runnerIds: ["ast-grep"] },
-		];
+		const groups: RunnerGroup[] = [{ mode: "all", runnerIds: ["ast-grep"] }];
 
 		const result = await dispatchForFile(ctx, groups, registry);
 		expect(result.diagnostics).toHaveLength(0);
@@ -320,9 +305,7 @@ describe("dispatcher filter — rules.<id>.select", () => {
 		registry.register(mockRunner("ast-grep", diagnostics));
 
 		const ctx = makeContext(tmpDir, new FactStore());
-		const groups: RunnerGroup[] = [
-			{ mode: "all", runnerIds: ["ast-grep"] },
-		];
+		const groups: RunnerGroup[] = [{ mode: "all", runnerIds: ["ast-grep"] }];
 
 		const result = await dispatchForFile(ctx, groups, registry);
 		expect(result.diagnostics).toHaveLength(0);
@@ -357,9 +340,7 @@ describe("dispatcher filter — threshold-only entries", () => {
 		registry.register(mockRunner("ast-grep", diagnostics));
 
 		const ctx = makeContext(tmpDir, new FactStore());
-		const groups: RunnerGroup[] = [
-			{ mode: "all", runnerIds: ["ast-grep"] },
-		];
+		const groups: RunnerGroup[] = [{ mode: "all", runnerIds: ["ast-grep"] }];
 
 		const result = await dispatchForFile(ctx, groups, registry);
 		expect(result.diagnostics).toHaveLength(1);
@@ -392,9 +373,7 @@ describe("dispatcher filter — blockers and warnings", () => {
 		registry.register(mockRunner("ast-grep", diagnostics));
 
 		const ctx = makeContext(tmpDir, new FactStore());
-		const groups: RunnerGroup[] = [
-			{ mode: "all", runnerIds: ["ast-grep"] },
-		];
+		const groups: RunnerGroup[] = [{ mode: "all", runnerIds: ["ast-grep"] }];
 
 		const result = await dispatchForFile(ctx, groups, registry);
 		expect(result.diagnostics).toHaveLength(0);
@@ -563,8 +542,7 @@ describe("dispatcher filter — delta baseline integrity", () => {
 		const facts = new FactStore();
 		const filePath = path.join(tmpDir, "a.ts");
 		// no-eval fires on line 1 and is suppressed there; no-debugger on line 2.
-		const content =
-			"doEval(y); // pi-lens-ignore: no-eval\nconst y = 1;\n";
+		const content = "doEval(y); // pi-lens-ignore: no-eval\nconst y = 1;\n";
 
 		facts.setFileFact(filePath, "file.content", content);
 		const first = await dispatchForFile(

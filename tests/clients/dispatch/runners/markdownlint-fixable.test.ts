@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { FactStore } from "../../../../clients/dispatch/fact-store.js";
+import { makeRunnerCtx } from "../../../support/runner-ctx.js";
 import { setupTestEnvironment } from "../../test-utils.js";
 
 const safeSpawnAsync = vi.fn();
@@ -32,25 +32,12 @@ vi.mock("../../../../clients/tool-policy.js", async (importOriginal) => {
 		// the predicate module-internally — route the builder through the mock
 		// so "config present → no --config" still holds (#1247 review P1b).
 		markdownlintConfigArgs: (cwd: string) =>
-			hasMarkdownlintConfigMock()
-				? []
-				: actual.markdownlintConfigArgs(cwd),
+			hasMarkdownlintConfigMock() ? [] : actual.markdownlintConfigArgs(cwd),
 	};
 });
 
 function createCtx(filePath: string, cwd: string) {
-	return {
-		filePath,
-		cwd,
-		kind: "markdown" as const,
-		fileRole: "source" as const,
-		pi: { getFlag: () => undefined },
-		autofix: false,
-		deltaMode: true,
-		facts: new FactStore(),
-		hasTool: async () => true,
-		log: () => {},
-	};
+	return makeRunnerCtx(filePath, cwd, { kind: "markdown" });
 }
 
 describe("markdownlint runner — fixable metadata", () => {
@@ -78,7 +65,7 @@ describe("markdownlint runner — fixable metadata", () => {
 			});
 
 			const runner = (
-				await import("../../../../clients/dispatch/runners/markdownlint.ts")
+				await import("../../../../clients/dispatch/runners/markdownlint.js")
 			).default;
 			const result = await runner.run(createCtx(filePath, env.tmpDir) as never);
 
@@ -113,7 +100,7 @@ describe("markdownlint runner — fixable metadata", () => {
 			});
 
 			const runner = (
-				await import("../../../../clients/dispatch/runners/markdownlint.ts")
+				await import("../../../../clients/dispatch/runners/markdownlint.js")
 			).default;
 			await runner.run(createCtx(filePath, env.tmpDir) as never);
 
@@ -162,7 +149,7 @@ describe("markdownlint runner — fixable metadata", () => {
 			});
 
 			const runner = (
-				await import("../../../../clients/dispatch/runners/markdownlint.ts")
+				await import("../../../../clients/dispatch/runners/markdownlint.js")
 			).default;
 			const result = await runner.run(createCtx(filePath, env.tmpDir) as never);
 

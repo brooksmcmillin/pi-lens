@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import { safeSpawnAsync } from "../../safe-spawn.js";
+import { hasJavaBuildDescriptor } from "../../tool-policy.js";
 import { PRIORITY } from "../priorities.js";
 import type {
 	Diagnostic,
@@ -34,7 +35,9 @@ function parseJavacOutput(raw: string, filePath: string): Diagnostic[] {
 			line: lineNum,
 			column: 1,
 			severity,
-			semantic: severity === "error" ? "blocking" : "warning",
+			// A standalone single-file javac run has no project classpath. It can
+			// report useful syntax/type evidence, but it cannot prove a blocker.
+			semantic: "warning",
 			tool: "javac",
 			rule: "compile",
 			fixable: false,
@@ -53,7 +56,24 @@ const javacRunner: RunnerDefinition = {
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
 		const cwd = ctx.cwd || process.cwd();
-		if (!(await (javac.isAvailableAsync(cwd)))) {
+		const absPath = path.resolve(cwd, ctx.filePath);
+
+		// Inside a Maven/Gradle project a classpath-less single-file compile
+		// cannot produce a valid verdict: every non-JDK import becomes a
+		// "package does not exist" error, and the fallback turns those into
+		// false blocking diagnostics (#1877). jdtls owns those projects; this
+		// runner keeps its value for standalone files with no build descriptor.
+		// Same shared descriptor walk the SpotBugs gate uses.
+		if (
+			hasJavaBuildDescriptor(path.dirname(absPath), ctx.projectRoot ?? ctx.cwd)
+		) {
+			ctx.log?.(
+				"javac: skipped — file is inside a Maven/Gradle project; a classpath-less compile would emit false positives",
+			);
+			return { status: "skipped", diagnostics: [], semantic: "none" };
+		}
+
+		if (!(await javac.isAvailableAsync(cwd))) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
@@ -61,8 +81,6 @@ const javacRunner: RunnerDefinition = {
 		if (!cmd) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
-
-		const absPath = path.resolve(cwd, ctx.filePath);
 		const result = await safeSpawnAsync(
 			cmd,
 			["-Xlint:none", "-proc:none", absPath],
@@ -91,7 +109,7 @@ const javacRunner: RunnerDefinition = {
 		return {
 			status: hasErrors ? "failed" : "succeeded",
 			diagnostics,
-			semantic: hasErrors ? "blocking" : "warning",
+			semantic: "warning",
 		};
 	},
 };

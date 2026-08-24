@@ -58,7 +58,10 @@ describe("spotbugs runner — cache + skip (#133)", () => {
 		env = setupTestEnvironment("pi-lens-spotbugs-");
 		classesDir = path.join(env.tmpDir, "target", "classes");
 		fs.mkdirSync(classesDir, { recursive: true });
-		fs.writeFileSync(path.join(classesDir, "Foo.class"), Buffer.from([0xca, 0xfe]));
+		fs.writeFileSync(
+			path.join(classesDir, "Foo.class"),
+			Buffer.from([0xca, 0xfe]),
+		);
 	});
 
 	it("scans the compiled tree and maps the bug to a diagnostic", async () => {
@@ -76,7 +79,8 @@ describe("spotbugs runner — cache + skip (#133)", () => {
 
 	it("returns cached diagnostics without re-invoking SpotBugs when .class tree is unchanged", async () => {
 		try {
-			const mod = await import("../../../../clients/dispatch/runners/spotbugs.js");
+			const mod =
+				await import("../../../../clients/dispatch/runners/spotbugs.js");
 			mod._resetSpotbugsCacheForTests();
 			const runner = mod.default;
 			const first = await runner.run(ctx(env.tmpDir) as never);
@@ -94,7 +98,8 @@ describe("spotbugs runner — cache + skip (#133)", () => {
 
 	it("re-invokes SpotBugs after a rebuild (the .class tree changed)", async () => {
 		try {
-			const mod = await import("../../../../clients/dispatch/runners/spotbugs.js");
+			const mod =
+				await import("../../../../clients/dispatch/runners/spotbugs.js");
 			mod._resetSpotbugsCacheForTests();
 			const runner = mod.default;
 			await runner.run(ctx(env.tmpDir) as never);

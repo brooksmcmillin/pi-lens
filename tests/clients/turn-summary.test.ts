@@ -76,9 +76,7 @@ describe("TurnSummaryCollector (#484)", () => {
 		let tmpDir: string;
 
 		beforeEach(() => {
-			tmpDir = fs.mkdtempSync(
-				path.join(os.tmpdir(), "pi-lens-turn-summary-"),
-			);
+			tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-turn-summary-"));
 		});
 
 		afterEach(() => {
@@ -164,7 +162,9 @@ describe("formatTurnSummaryLine (#484)", () => {
 	it("falls back to an empty-turn label for an empty details payload", () => {
 		const collector = new TurnSummaryCollector();
 		const details = collector.consume(1);
-		expect(formatTurnSummaryLine(details)).toBe("pi-lens: turn summary (empty)");
+		expect(formatTurnSummaryLine(details)).toBe(
+			"pi-lens: turn summary (empty)",
+		);
 	});
 });
 

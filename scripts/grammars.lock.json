@@ -40,5 +40,14 @@
       "version": "0.7.1",
       "url": "https://unpkg.com/@tree-sitter-grammars/tree-sitter-yaml@0.7.1/tree-sitter-yaml.wasm"
     }
+  },
+  "vendored": {
+    "tree-sitter-cue.wasm": {
+      "repo": "https://github.com/eonpatapon/tree-sitter-cue",
+      "commit": "dd7b90e0770ff18070c515937ba3c3d6d93db00e",
+      "license": "MIT",
+      "buildCommand": "npx tree-sitter-cli build --wasm",
+      "sha256": "sha256:751f8cc8ccf72da760133e3d365562ff7bbf5b951e0b73568576fd159db7d601"
+    }
   }
 }

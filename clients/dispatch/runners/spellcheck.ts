@@ -28,8 +28,14 @@ import type {
 	RunnerResult,
 } from "../types.js";
 import { createAvailabilityChecker } from "./utils/runner-helpers.js";
+import type { ToolExitCodes } from "./utils/spawn-outcome.js";
+import { parseToolRun } from "./utils/tool-failure.js";
 
 const typos = createAvailabilityChecker("typos", ".exe");
+
+// typos-cli exit codes: 0 = no typos, 2 = typos found, 1 = an error that
+// stopped the scan. Anything nonzero outside {2} is a rejected invocation.
+const TYPOS_EXIT_CODES: ToolExitCodes = { ran: [2] };
 
 /**
  * Parse typos-cli JSON output (JSON Lines format)
@@ -119,16 +125,24 @@ const spellcheckRunner: RunnerDefinition = {
 			},
 		);
 
-		// typos-cli exits with code 2 if typos found, 0 if clean
-		const hasTypos = result.status === 2 || result.stdout?.trim();
+		// #1816: typos-cli exits 0 clean, 2 with typos found, and 1 on an ERROR
+		// (unreadable config, bad argument). The `status === 2 || stdout` test
+		// below is false for exit 1 with an empty stdout, so a failed run was
+		// reported as a clean file. Only 0 and 2 are runs.
+		//
+		// #1948: parse through the shared seam so an exit-2 run whose JSON lines
+		// yield nothing leaves a record. `parseOutput` keeps the historical
+		// split: the gate judges "did it run" on stdout, the parser reads both
+		// streams.
+		const run = parseToolRun(
+			"spellcheck",
+			{ result, exitCodes: TYPOS_EXIT_CODES },
+			(out) => parseTyposOutput(out, ctx.filePath),
+			{ parseOutput: `${result.stdout ?? ""}${result.stderr ?? ""}` },
+		);
+		if (run.skipped) return run.skipped;
 
-		if (!hasTypos) {
-			return { status: "succeeded", diagnostics: [], semantic: "none" };
-		}
-
-		// Parse diagnostics
-		const raw = result.stdout + result.stderr;
-		const diagnostics = parseTyposOutput(raw, ctx.filePath);
+		const diagnostics = run.diagnostics;
 
 		if (diagnostics.length === 0) {
 			return { status: "succeeded", diagnostics: [], semantic: "none" };

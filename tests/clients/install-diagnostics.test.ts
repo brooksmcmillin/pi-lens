@@ -30,7 +30,11 @@ describe("install-diagnostics", () => {
 	it("flags a missing dep as FAIL in the rendered block", () => {
 		const diag = collectInstallDiagnostics();
 		diag.deps = [
-			{ name: "typescript", resolved: false, error: "ERR_MODULE_NOT_FOUND ..." },
+			{
+				name: "typescript",
+				resolved: false,
+				error: "ERR_MODULE_NOT_FOUND ...",
+			},
 		];
 		diag.notes = ["unresolved deps note"];
 		const out = formatInstallDiagnostics(diag);

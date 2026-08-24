@@ -39,7 +39,10 @@ export interface CoverageSummary {
 	blockPct: number;
 }
 
-export function fileFromScriptUrl(url: string, root: string): string | undefined {
+export function fileFromScriptUrl(
+	url: string,
+	root: string,
+): string | undefined {
 	if (!url.startsWith("file:")) return undefined;
 	try {
 		const absolute = fileURLToPath(url);
@@ -64,7 +67,12 @@ export function summarizePreciseCoverage(
 	const wanted = new Map(options.include.map((file) => [toPosix(file), true]));
 	const byFile = new Map<
 		string,
-		{ functionCount: number; functionsHit: number; blockCount: number; blocksHit: number }
+		{
+			functionCount: number;
+			functionsHit: number;
+			blockCount: number;
+			blocksHit: number;
+		}
 	>();
 	for (const file of wanted.keys()) {
 		byFile.set(file, {
@@ -133,7 +141,9 @@ export async function withPreciseCoverage<T>(
 			detailed: true,
 		});
 		const result = await work();
-		const { result: scripts } = await session.post("Profiler.takePreciseCoverage");
+		const { result: scripts } = await session.post(
+			"Profiler.takePreciseCoverage",
+		);
 		return { result, scripts };
 	} finally {
 		try {

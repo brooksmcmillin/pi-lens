@@ -6,13 +6,15 @@ const { launchLSP } = vi.hoisted(() => ({ launchLSP: vi.fn() }));
 const { logLatency } = vi.hoisted(() => ({ logLatency: vi.fn() }));
 vi.mock("../../../clients/lsp/launch.js", () => ({ launchLSP }));
 vi.mock("../../../clients/latency-logger.js", () => ({ logLatency }));
-const { ensureTool } = vi.hoisted(() => ({ ensureTool: vi.fn(async () => null) }));
+const { ensureTool } = vi.hoisted(() => ({
+	ensureTool: vi.fn(async () => null),
+}));
 vi.mock("../../../clients/installer/index.js", () => ({
 	ensureTool,
 	getToolEnvironment: () => ({}),
 }));
 
-import { resolveAndLaunch } from "../../../clients/lsp/server.ts";
+import { resolveAndLaunch } from "../../../clients/lsp/server.js";
 import { SpawnFailureError } from "../../../clients/safe-spawn.js";
 
 const fakeProc = { stdout: {}, stderr: {} } as never;
@@ -62,18 +64,27 @@ describe("resolveAndLaunch — fallback failures are deferred", () => {
 	});
 
 	it("does not install when a present tool fails because cwd is unresolvable", async () => {
-		const cause = Object.assign(new Error("spawn node ENOENT"), { code: "ENOENT" });
+		const cause = Object.assign(new Error("spawn node ENOENT"), {
+			code: "ENOENT",
+		});
 		launchLSP.mockRejectedValue(
-			new SpawnFailureError("cwd-unresolvable", "working directory missing", cause),
+			new SpawnFailureError(
+				"cwd-unresolvable",
+				"working directory missing",
+				cause,
+			),
 		);
 
 		await expect(
-			resolveAndLaunch({
-				candidates: [process.execPath],
-				args: ["--version"],
-				cwd: "/definitely/missing/pi-lens-cwd",
-				managedToolId: "typescript-language-server",
-			}, true),
+			resolveAndLaunch(
+				{
+					candidates: [process.execPath],
+					args: ["--version"],
+					cwd: "/definitely/missing/pi-lens-cwd",
+					managedToolId: "typescript-language-server",
+				},
+				true,
+			),
 		).rejects.toMatchObject({ kind: "cwd-unresolvable" });
 
 		expect(ensureTool).not.toHaveBeenCalled();

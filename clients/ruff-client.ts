@@ -11,7 +11,10 @@
 import { createSubsystemLogger } from "./extension-log.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { createAvailabilityChecker, resolveAvailableOrInstall } from "./dispatch/runners/utils/runner-helpers.js";
+import {
+	createAvailabilityChecker,
+	resolveAvailableOrInstall,
+} from "./dispatch/runners/utils/runner-helpers.js";
 import { isFileKind } from "./file-kinds.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
 import { ruffConfigArgs } from "./tool-policy.js";
@@ -49,9 +52,7 @@ export class RuffClient {
 	private log: (msg: string) => void;
 
 	constructor(verbose = false) {
-		this.log = verbose
-			? createSubsystemLogger("ruff")
-			: () => {};
+		this.log = verbose ? createSubsystemLogger("ruff") : () => {};
 	}
 
 	/**
@@ -120,7 +121,10 @@ export class RuffClient {
 			// set when the project lacks its own config and the package-owned
 			// core.toml fallback applies.
 			const configArgs = ruffConfigArgs(cwd ?? path.dirname(absolutePath));
-			const spawnOpts = { timeout: 10000, cwd: cwd ?? path.dirname(absolutePath) };
+			const spawnOpts = {
+				timeout: 10000,
+				cwd: cwd ?? path.dirname(absolutePath),
+			};
 
 			const pre = await safeSpawnAsync(
 				this.ruffCommand,

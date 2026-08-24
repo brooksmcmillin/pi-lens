@@ -19,12 +19,9 @@ Deliberately thin. The canonical engineering contract for this repo lives in
   met; otherwise `refs` plus an issue comment naming the remainder. After any
   push, verify Unit tests and Lint actually execute on the new head — a
   merge-conflicted (DIRTY) PR silently skips them.
-- Availability/probe code: an unspawnable prober is never a durable verdict;
-  state that must re-arm at `session_start` cannot hide behind a
-  process-lifetime latch; cooldown ladders must respect the caller's retry
-  cadence; repeated degradations use `recordDegradationOnce` /
-  `incrementDegradationCount`; an empty result must distinguish clean from
-  errored.
+- Availability/probe code: apply the recurring-defect catalog in `AGENTS.md`,
+  especially shapes 10, 13, 17, and 18. Repeated degradations use
+  `recordDegradationOnce` / `incrementDegradationCount`.
 
 ## Orchestration assets
 
@@ -32,4 +29,6 @@ Deliberately thin. The canonical engineering contract for this repo lives in
   from an issue spec.
 - `.claude/agents/pi-lens-reviewer.md` — role playbook for adversarial
   pre-merge review.
+- `.claude/agents/pi-lens-investigator.md` — role playbook for log forensics
+  and root-causing runtime behavior.
 - `.claude/skills/merge-train/SKILL.md` — the review → verify → merge policy.

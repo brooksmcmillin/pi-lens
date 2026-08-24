@@ -143,7 +143,14 @@ function runPiRpc({ piBin, extensionPath, cwd, env, timeoutMs = 45000 }) {
 	return new Promise((resolve, reject) => {
 		const child = spawn(
 			piBin,
-			["--mode", "rpc", "--no-session", "--no-extensions", "--extension", extensionPath],
+			[
+				"--mode",
+				"rpc",
+				"--no-session",
+				"--no-extensions",
+				"--extension",
+				extensionPath,
+			],
 			{
 				cwd,
 				shell: isWindows,
@@ -151,7 +158,8 @@ function runPiRpc({ piBin, extensionPath, cwd, env, timeoutMs = 45000 }) {
 				env: {
 					...process.env,
 					...env,
-					ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || "sk-ant-dummy-compat-smoke",
+					ANTHROPIC_API_KEY:
+						process.env.ANTHROPIC_API_KEY || "sk-ant-dummy-compat-smoke",
 				},
 			},
 		);
@@ -225,23 +233,33 @@ function runPiRpc({ piBin, extensionPath, cwd, env, timeoutMs = 45000 }) {
 // --- Process snapshot (Windows CIM / POSIX ps), narrow LSP markers only ---
 
 function windowsExe(name) {
-	return path.join(process.env.SystemRoot ?? String.raw`C:\Windows`, "System32", name);
+	return path.join(
+		process.env.SystemRoot ?? String.raw`C:\Windows`,
+		"System32",
+		name,
+	);
 }
 
 async function snapshotProcesses() {
 	if (isWindows) {
 		return new Promise((resolve) => {
 			try {
-				const powershell = windowsExe("WindowsPowerShell\\v1.0\\powershell.exe");
+				const powershell = windowsExe(
+					"WindowsPowerShell\\v1.0\\powershell.exe",
+				);
 				const script =
 					"Get-CimInstance Win32_Process " +
 					`| Where-Object { $_.ProcessId -ne ${process.pid} } ` +
 					'| ForEach-Object { "$($_.ProcessId)`t$($_.CommandLine)" }';
-				const child = spawn(powershell, ["-NoProfile", "-NonInteractive", "-Command", script], {
-					shell: false,
-					windowsHide: true,
-					stdio: ["ignore", "pipe", "ignore"],
-				});
+				const child = spawn(
+					powershell,
+					["-NoProfile", "-NonInteractive", "-Command", script],
+					{
+						shell: false,
+						windowsHide: true,
+						stdio: ["ignore", "pipe", "ignore"],
+					},
+				);
 				let out = "";
 				child.stdout.on("data", (d) => (out += d.toString()));
 				child.once("error", () => resolve([]));
@@ -301,7 +319,12 @@ function readLatencyLogEntries() {
 
 async function main() {
 	const opts = parseArgs(process.argv.slice(2));
-	const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "..");
+	const repoRoot = path.resolve(
+		path.dirname(
+			new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"),
+		),
+		"..",
+	);
 	const scratchRoot = fs.mkdtempSync(
 		path.join(os.tmpdir(), "pi-lens-compat-smoke-behavioral-"),
 	);
@@ -363,8 +386,16 @@ async function main() {
 				env: { PI_SUBAGENT_CHILD: "1", PI_LENS_STARTUP_MODE: "full" },
 			});
 			const entries = readLatencyLogEntries();
-			const lightModeLogged = phaseWasLogged(entries, "subagent_light_mode", sinceIso);
-			const heavyweightSkipped = noPhasesLogged(entries, HEAVYWEIGHT_SCAN_PHASES, sinceIso);
+			const lightModeLogged = phaseWasLogged(
+				entries,
+				"subagent_light_mode",
+				sinceIso,
+			);
+			const heavyweightSkipped = noPhasesLogged(
+				entries,
+				HEAVYWEIGHT_SCAN_PHASES,
+				sinceIso,
+			);
 			results.push({
 				id: "subagent-light-mode-engages",
 				pass: lightModeLogged && heavyweightSkipped,
@@ -394,7 +425,11 @@ async function main() {
 				},
 			});
 			const entries = readLatencyLogEntries();
-			const lightModeAbsent = !phaseWasLogged(entries, "subagent_light_mode", sinceIso);
+			const lightModeAbsent = !phaseWasLogged(
+				entries,
+				"subagent_light_mode",
+				sinceIso,
+			);
 			results.push({
 				id: "subagent-full-override",
 				pass: lightModeAbsent,
@@ -458,8 +493,16 @@ async function main() {
 				},
 			});
 			const entries = readLatencyLogEntries();
-			const lightModeLogged = phaseWasLogged(entries, "subagent_light_mode", sinceIso);
-			const heavyweightSkipped = noPhasesLogged(entries, HEAVYWEIGHT_SCAN_PHASES, sinceIso);
+			const lightModeLogged = phaseWasLogged(
+				entries,
+				"subagent_light_mode",
+				sinceIso,
+			);
+			const heavyweightSkipped = noPhasesLogged(
+				entries,
+				HEAVYWEIGHT_SCAN_PHASES,
+				sinceIso,
+			);
 			results.push({
 				id: "avtc-pair-engages-light-mode",
 				pass: lightModeLogged && heavyweightSkipped,
@@ -489,7 +532,11 @@ async function main() {
 				},
 			});
 			const entries = readLatencyLogEntries();
-			const lightModeAbsent = !phaseWasLogged(entries, "subagent_light_mode", sinceIso);
+			const lightModeAbsent = !phaseWasLogged(
+				entries,
+				"subagent_light_mode",
+				sinceIso,
+			);
 			results.push({
 				id: "avtc-lone-var-does-not-engage-light-mode",
 				pass: lightModeAbsent,

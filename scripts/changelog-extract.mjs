@@ -18,33 +18,35 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const CHANGELOG_PATH = join(__dirname, "..", "CHANGELOG.md");
 
 function parseArgs(argv) {
-  const args = { version: undefined, out: undefined, summary: false };
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (a === "-o" || a === "--out") args.out = argv[++i];
-    else if (a === "--summary") args.summary = true;
-    else if (!args.version) args.version = a;
-  }
-  return args;
+	const args = { version: undefined, out: undefined, summary: false };
+	for (let i = 0; i < argv.length; i++) {
+		const a = argv[i];
+		if (a === "-o" || a === "--out") args.out = argv[++i];
+		else if (a === "--summary") args.summary = true;
+		else if (!args.version) args.version = a;
+	}
+	return args;
 }
 
 function main() {
-  const { version, out, summary } = parseArgs(process.argv.slice(2));
-  if (!version) {
-    console.error("usage: changelog-extract.mjs <version> [--summary] [-o <file>]");
-    process.exit(2);
-  }
-  const text = readFileSync(CHANGELOG_PATH, "utf8");
-  const full = extractSection(text, version);
-  if (full === null || full.trim().length === 0) {
-    console.error(`No CHANGELOG section for version "${version}".`);
-    process.exit(1);
-  }
-  // The release body is a scannable summary (bold titles, grouped) — the full
-  // prose stays in CHANGELOG.md. `--summary` is what release.yml passes.
-  const body = summary ? summarizeSection(full) : full;
-  if (out) writeFileSync(out, body + "\n", "utf8");
-  else process.stdout.write(body + "\n");
+	const { version, out, summary } = parseArgs(process.argv.slice(2));
+	if (!version) {
+		console.error(
+			"usage: changelog-extract.mjs <version> [--summary] [-o <file>]",
+		);
+		process.exit(2);
+	}
+	const text = readFileSync(CHANGELOG_PATH, "utf8");
+	const full = extractSection(text, version);
+	if (full === null || full.trim().length === 0) {
+		console.error(`No CHANGELOG section for version "${version}".`);
+		process.exit(1);
+	}
+	// The release body is a scannable summary (bold titles, grouped) — the full
+	// prose stays in CHANGELOG.md. `--summary` is what release.yml passes.
+	const body = summary ? summarizeSection(full) : full;
+	if (out) writeFileSync(out, body + "\n", "utf8");
+	else process.stdout.write(body + "\n");
 }
 
 main();

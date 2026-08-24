@@ -258,9 +258,7 @@ describe("Dispatch Flow", () => {
 			const result = await dispatchForFile(ctx, groups);
 
 			expect(result.hasBlockers).toBe(false);
-			expect(result.output).toContain(
-				"Pi-lens go analysis unavailable",
-			);
+			expect(result.output).toContain("Pi-lens go analysis unavailable");
 
 			const secondResult = await dispatchForFile(ctx, groups);
 			expect(secondResult.output).not.toContain(
@@ -304,9 +302,7 @@ describe("Dispatch Flow", () => {
 
 			const result = await dispatchForFile(ctx, groups);
 
-			expect(result.output).toContain(
-				"Pi-lens go analysis unavailable",
-			);
+			expect(result.output).toContain("Pi-lens go analysis unavailable");
 		});
 
 		it("should execute multiple runners in group", async () => {

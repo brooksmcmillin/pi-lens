@@ -17,8 +17,16 @@ describe("bus-events-logger session-end rollup (S2d gap 5, #1432 review)", () =>
 	});
 
 	it("counts emitted, skipped_stale_session, and emit_failed per event name", () => {
-		logBusEvent({ event: "pilens:files:touched", outcome: "emitted", cwd: "/repo" });
-		logBusEvent({ event: "pilens:files:touched", outcome: "emitted", cwd: "/repo" });
+		logBusEvent({
+			event: "pilens:files:touched",
+			outcome: "emitted",
+			cwd: "/repo",
+		});
+		logBusEvent({
+			event: "pilens:files:touched",
+			outcome: "emitted",
+			cwd: "/repo",
+		});
 		logBusEvent({
 			event: "pilens:files:touched",
 			outcome: "skipped_stale_session",
@@ -47,22 +55,43 @@ describe("bus-events-logger session-end rollup (S2d gap 5, #1432 review)", () =>
 	});
 
 	it("ignores outcomes outside the three rolled-up ones", () => {
-		logBusEvent({ event: "pilens:files:touched", outcome: "skipped_unwired", cwd: "/repo" });
-		logBusEvent({ event: "pilens:files:touched", outcome: "skipped_disabled", cwd: "/repo" });
+		logBusEvent({
+			event: "pilens:files:touched",
+			outcome: "skipped_unwired",
+			cwd: "/repo",
+		});
+		logBusEvent({
+			event: "pilens:files:touched",
+			outcome: "skipped_disabled",
+			cwd: "/repo",
+		});
 
 		expect(getBusEventRollupCounts()).toEqual({});
 	});
 
 	it("resetBusEventRollupCounts clears the rollup", () => {
-		logBusEvent({ event: "pilens:files:touched", outcome: "emitted", cwd: "/repo" });
+		logBusEvent({
+			event: "pilens:files:touched",
+			outcome: "emitted",
+			cwd: "/repo",
+		});
 		expect(getBusEventRollupCounts()).not.toEqual({});
 		resetBusEventRollupCounts();
 		expect(getBusEventRollupCounts()).toEqual({});
 	});
 
 	it("emitBusEventRollupAtSessionEnd logs one row per active event name, then resets", () => {
-		logBusEvent({ event: "pilens:files:touched", outcome: "emitted", cwd: "/repo" });
-		logBusEvent({ event: "pilens:diagnostics", outcome: "emit_failed", cwd: "/repo", error: "x" });
+		logBusEvent({
+			event: "pilens:files:touched",
+			outcome: "emitted",
+			cwd: "/repo",
+		});
+		logBusEvent({
+			event: "pilens:diagnostics",
+			outcome: "emit_failed",
+			cwd: "/repo",
+			error: "x",
+		});
 
 		emitBusEventRollupAtSessionEnd("/repo");
 

@@ -133,7 +133,9 @@ export function wireDiagnosticsBusEmitter(emitFn: BusEmitFn | undefined): void {
 	liveEmitter.wire(emitFn);
 }
 
-export function wireDiagnosticsBusEmitterGetter(getter: BusEmitGetter | undefined): void {
+export function wireDiagnosticsBusEmitterGetter(
+	getter: BusEmitGetter | undefined,
+): void {
 	liveEmitter.wireGetter(getter);
 }
 

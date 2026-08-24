@@ -11,6 +11,8 @@ import {
 	createAvailabilityChecker,
 	resolveToolCommandWithInstallFallback,
 } from "./utils/runner-helpers.js";
+import { parseToolRun } from "./utils/tool-failure.js";
+import { finishParsedRun } from "./utils/tool-failure.js";
 
 const yamllint = createAvailabilityChecker("yamllint", ".exe");
 
@@ -60,7 +62,7 @@ const yamllintRunner: RunnerDefinition = {
 		}
 
 		let cmd: string | null = null;
-		if (await (yamllint.isAvailableAsync(cwd))) {
+		if (await yamllint.isAvailableAsync(cwd)) {
 			cmd = yamllint.getCommand(cwd);
 		} else {
 			cmd = await resolveToolCommandWithInstallFallback(cwd, "yamllint");
@@ -72,20 +74,33 @@ const yamllintRunner: RunnerDefinition = {
 			timeout: 15000,
 		});
 
-		const diagnostics = parseYamllintParsable(
-			`${result.stdout ?? ""}${result.stderr ?? ""}`,
-			ctx.filePath,
+		// #1816: this runner read `result.status` zero times, so a yamllint
+		// that rejected its config reported a clean YAML file.
+		//
+		// No exit-code table: yamllint returns 2 both for "warnings only" and
+		// for an argparse usage error, so declaring 2 a rejection would discard
+		// real warnings. The discriminator is the STREAM instead. `-f parsable`
+		// writes findings to stdout and nothing else; stderr carries usage text
+		// and tracebacks. So the gate judges "nothing to parse" on stdout alone,
+		// while the parser still reads both streams.
+		const raw = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+		// #1948: classify on stdout as before, parse both streams as before, and
+		// record when a failing run yields nothing.
+		const run = parseToolRun(
+			"yamllint",
+			{ result, output: result.stdout },
+			(out) => parseYamllintParsable(out, ctx.filePath),
+			{ parseOutput: raw },
 		);
-		if (diagnostics.length === 0) {
-			return { status: "succeeded", diagnostics: [], semantic: "none" };
-		}
+		if (run.skipped) return run.skipped;
 
-		const hasBlocking = diagnostics.some((d) => d.semantic === "blocking");
-		return {
-			status: hasBlocking ? "failed" : "succeeded",
+		const diagnostics = run.diagnostics;
+		return finishParsedRun({
+			tool: "yamllint",
+			ctx,
+			result,
 			diagnostics,
-			semantic: hasBlocking ? "blocking" : "warning",
-		};
+		});
 	},
 };
 

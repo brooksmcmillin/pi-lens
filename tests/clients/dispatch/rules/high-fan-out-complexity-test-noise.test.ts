@@ -197,9 +197,9 @@ describe("uses the tangled fixture builder", () => {
 
 		const { complexity } = await evaluateBoth(filePath, content);
 		expect(complexity.length).toBeGreaterThan(0);
-		expect(complexity.some((d) => d.message.includes("buildComplexFixture"))).toBe(
-			true,
-		);
+		expect(
+			complexity.some((d) => d.message.includes("buildComplexFixture")),
+		).toBe(true);
 	});
 
 	it("does not affect production (non-test) files — high-fan-out still flags real coordination smell", async () => {
@@ -265,7 +265,7 @@ describe("isTestFrameworkNoiseCall", () => {
 
 	it("recognizes mock-library call prefixes", () => {
 		expect(isTestFrameworkNoiseCall("vi.fn")).toBe(true);
-		expect(isTestFrameworkNoiseCall("vi.spyOn(obj, \"m\").mockReturnValue")).toBe(
+		expect(isTestFrameworkNoiseCall('vi.spyOn(obj, "m").mockReturnValue')).toBe(
 			true,
 		);
 		expect(isTestFrameworkNoiseCall("jest.mock")).toBe(true);
@@ -285,7 +285,9 @@ describe("isTestSuiteOrganizer", () => {
 	});
 
 	it("does not flag helper functions with no it/describe/test calls", () => {
-		expect(isTestSuiteOrganizer(["riskyStep", "buildComplexFixture"])).toBe(false);
+		expect(isTestSuiteOrganizer(["riskyStep", "buildComplexFixture"])).toBe(
+			false,
+		);
 		expect(isTestSuiteOrganizer([])).toBe(false);
 	});
 });

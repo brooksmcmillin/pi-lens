@@ -53,20 +53,15 @@ describe("parseClippyOutput — fixable propagation (#112 slice)", () => {
 	});
 
 	it("does not mark fixable when applicability is MaybeIncorrect", () => {
-		const raw = clippyMessage(
-			"redundant_clone",
-			"redundant clone",
-			"warning",
-			[
-				{
-					file: "src/main.rs",
-					line_start: 5,
-					column_start: 3,
-					suggested_replacement: "x",
-					suggestion_applicability: "MaybeIncorrect",
-				},
-			],
-		);
+		const raw = clippyMessage("redundant_clone", "redundant clone", "warning", [
+			{
+				file: "src/main.rs",
+				line_start: 5,
+				column_start: 3,
+				suggested_replacement: "x",
+				suggestion_applicability: "MaybeIncorrect",
+			},
+		]);
 		const diags = parseClippyOutput(raw, "src/main.rs");
 		expect(diags).toHaveLength(1);
 		expect(diags[0].fixable).toBe(false);

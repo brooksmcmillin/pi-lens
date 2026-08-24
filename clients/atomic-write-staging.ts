@@ -36,28 +36,51 @@ export async function sweepOwnStagingFiles(
 	options: { maxEntries: number; isPidAlive: (pid: number) => boolean },
 ): Promise<AtomicStageSweepResult> {
 	const uniqueDirectories = [...new Set(directories)].filter(Boolean);
-	const result: AtomicStageSweepResult = { directories: uniqueDirectories.length, scanned: 0, removed: 0, liveSkipped: 0, truncated: false };
+	const result: AtomicStageSweepResult = {
+		directories: uniqueDirectories.length,
+		scanned: 0,
+		removed: 0,
+		liveSkipped: 0,
+		truncated: false,
+	};
 	for (const directory of uniqueDirectories) {
 		let handle: fs.Dir;
-		try { handle = await fs.promises.opendir(directory); } catch { continue; }
+		try {
+			handle = await fs.promises.opendir(directory);
+		} catch {
+			continue;
+		}
 		try {
 			let reachedEntryCap = true;
 			for (let i = 0; i < options.maxEntries; i++) {
 				const entry = await handle.read();
-				if (entry === null) { reachedEntryCap = false; break; }
+				if (entry === null) {
+					reachedEntryCap = false;
+					break;
+				}
 				result.scanned++;
 				if (!entry.isFile()) continue;
 				const pid = stageOwnerPidFromName(entry.name);
 				if (pid === undefined) continue;
-				if (pid === process.pid || options.isPidAlive(pid)) { result.liveSkipped++; continue; }
+				if (pid === process.pid || options.isPidAlive(pid)) {
+					result.liveSkipped++;
+					continue;
+				}
 				try {
-					await fs.promises.rm(path.join(directory, entry.name), { force: true });
+					await fs.promises.rm(path.join(directory, entry.name), {
+						force: true,
+					});
 					result.removed++;
-				} catch { /* leave it for the next bounded sweep */ }
+				} catch {
+					/* leave it for the next bounded sweep */
+				}
 			}
 			result.truncated ||= reachedEntryCap;
-		} catch { /* best-effort directory scan */ }
-		finally { await handle.close().catch(() => {}); }
+		} catch {
+			/* best-effort directory scan */
+		} finally {
+			await handle.close().catch(() => {});
+		}
 	}
 	return result;
 }

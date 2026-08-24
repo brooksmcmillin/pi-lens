@@ -176,9 +176,8 @@ describe("govulncheck install ceiling, end to end (#1497 review F1/F3/F7)", () =
 		// simulated session) on the same spawn mock.
 		const before = totalInstalls();
 		const installCount = (): number => totalInstalls() - before;
-		const { GovulncheckClient } = await import(
-			"../../clients/govulncheck-client.js"
-		);
+		const { GovulncheckClient } =
+			await import("../../clients/govulncheck-client.js");
 		const client = new GovulncheckClient(false);
 		for (const cooldown of [0, ...INSTALL_TRANSIENT_COOLDOWNS_MS]) {
 			vi.setSystemTime(new Date(Date.now() + cooldown + 1));

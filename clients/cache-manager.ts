@@ -103,9 +103,7 @@ export class CacheManager {
 	private log: (msg: string) => void;
 
 	constructor(verbose = false) {
-		this.log = verbose
-			? createSubsystemLogger("cache")
-			: () => {};
+		this.log = verbose ? createSubsystemLogger("cache") : () => {};
 	}
 
 	/**
@@ -339,13 +337,12 @@ export class CacheManager {
 			// stale-session eviction behavior for this legacy shape.
 			return "available";
 		}
-		if (
-			state.owner.kind === owner.kind &&
-			state.owner.id === owner.id
-		) {
+		if (state.owner.kind === owner.kind && state.owner.id === owner.id) {
 			return "owned";
 		}
-		return this.isTurnStateOwnerStale(state.owner) ? "available" : "foreign-live";
+		return this.isTurnStateOwnerStale(state.owner)
+			? "available"
+			: "foreign-live";
 	}
 
 	private isTurnStateOwnerStale(owner: TurnStateOwner): boolean {
@@ -358,7 +355,9 @@ export class CacheManager {
 			}
 		}
 		const lastSeen = Date.parse(owner.lastSeen);
-		return !Number.isFinite(lastSeen) || Date.now() - lastSeen > TURN_OWNER_STALE_MS;
+		return (
+			!Number.isFinite(lastSeen) || Date.now() - lastSeen > TURN_OWNER_STALE_MS
+		);
 	}
 
 	/**
@@ -418,8 +417,10 @@ export class CacheManager {
 		owner: Pick<TurnStateOwner, "kind" | "id">,
 	): boolean {
 		const currentState = this.readTurnState(cwd);
-		const isCurrentOwner = this.getTurnStateAccess(cwd, owner) !== "foreign-live";
-		if (!isCurrentOwner && process.pid !== currentState.owner?.pid) return false;
+		const isCurrentOwner =
+			this.getTurnStateAccess(cwd, owner) !== "foreign-live";
+		if (!isCurrentOwner && process.pid !== currentState.owner?.pid)
+			return false;
 		const state: TurnState = {
 			...DEFAULT_TURN_STATE,
 			files: {}, // fresh object — DEFAULT_TURN_STATE.files can be polluted by addModifiedRange
@@ -437,7 +438,8 @@ export class CacheManager {
 		owner: Pick<TurnStateOwner, "kind" | "id">,
 	): TurnState {
 		const state = this.readTurnState(cwd);
-		const isCurrentOwner = this.getTurnStateAccess(cwd, owner) !== "foreign-live";
+		const isCurrentOwner =
+			this.getTurnStateAccess(cwd, owner) !== "foreign-live";
 		if (!isCurrentOwner && process.pid !== state.owner?.pid) return state;
 		state.turnCycles++;
 		this.writeTurnState(state, cwd);

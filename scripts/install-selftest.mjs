@@ -19,6 +19,20 @@
  * build-script-provided assets (ast-grep CLI binary + tree-sitter grammars)
  * that pnpm/bun skip by default. It runs no model and needs no credentials.
  *
+ * WHAT IT NO LONGER COVERS (#1926)
+ * pi supplies `typebox` and `@earendil-works/pi-tui` from its own runtime, so
+ * they are optional peers and no install vendors them. This probe is not pi, so
+ * those specifiers cannot resolve here, and `dist/index.js` throws on the FIRST
+ * one it imports. A host-provided miss is therefore recorded as EXPECTED rather
+ * than failed. The cost is real and stated plainly: evaluation stops there, so
+ * the entry probe no longer proves the whole bundled graph resolves, which is
+ * what #285 and #335 asked it to prove. Any OTHER unresolved specifier still
+ * fails hard, and the per-module probes below (file-utils, complexity-client,
+ * bootstrap) still cover that graph directly. The surviving POSITIVE proof that
+ * the entry loads in full is the install-smoke `pi-load` job: it installs pi,
+ * installs pi-lens through pi, and confirms over RPC that pi-lens registered
+ * its commands.
+ *
  * USAGE
  *   bun  scripts/install-selftest.mjs     # faithful: pi's runtime is bun
  *   node scripts/install-selftest.mjs     # also works
@@ -28,10 +42,11 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { createRequire } from "node:module";
-import { fileURLToPath } from "node:url";
-import * as path from "node:path";
 import * as fs from "node:fs";
+import { createRequire } from "node:module";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import { HOST_PROVIDED_PACKAGES } from "./lib/host-provided-deps.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const pkgRoot = path.resolve(here, "..");
@@ -42,6 +57,26 @@ const results = [];
 const record = (name, kind, ok, detail = "") =>
 	results.push({ name, kind, ok, detail });
 
+/**
+ * Which host-provided package, if any, a resolution error is about. Returns
+ * undefined for every other error, so an unrelated missing package still fails.
+ */
+function hostProvidedMiss(err) {
+	const text = `${err?.code || ""} ${err?.message || err}`;
+	if (
+		!/ERR_MODULE_NOT_FOUND|Cannot find (package|module)|ResolveMessage/.test(
+			text,
+		)
+	) {
+		return undefined;
+	}
+	return HOST_PROVIDED_PACKAGES.find((name) =>
+		new RegExp(
+			`['"\`]${name.replace(/[/\\^$*+?.()|[\]{}]/g, "\\$&")}['"\`]`,
+		).test(text),
+	);
+}
+
 /** Import a module by URL and record whether its (eager) dep graph resolved. */
 async function probeImport(name, relPath) {
 	const url = new URL(
@@ -51,7 +86,24 @@ async function probeImport(name, relPath) {
 		await import(url.href);
 		record(name, "resolve", true);
 	} catch (err) {
-		record(name, "resolve", false, `${err?.code || ""} ${err?.message || err}`.trim());
+		// #1926: pi supplies these; outside pi they cannot resolve, and the entry
+		// throws on the first one. Expected, not a regression. Anything else is.
+		const host = hostProvidedMiss(err);
+		if (host) {
+			record(
+				name,
+				"expected",
+				true,
+				`stopped at host-provided '${host}' — pi supplies it; graph beyond this point unproven here (#1926)`,
+			);
+			return;
+		}
+		record(
+			name,
+			"resolve",
+			false,
+			`${err?.code || ""} ${err?.message || err}`.trim(),
+		);
 	}
 }
 
@@ -61,27 +113,53 @@ function probeResolve(spec) {
 		require.resolve(spec);
 		record(spec, "resolve", true);
 	} catch (err) {
-		record(spec, "resolve", false, `${err?.code || ""} ${err?.message || err}`.trim());
+		record(
+			spec,
+			"resolve",
+			false,
+			`${err?.code || ""} ${err?.message || err}`.trim(),
+		);
 	}
 }
 
 // --- 1. The documented failure-point modules (eager bare imports) ----------
 await probeImport("dist/index.js (entry)", "dist/index.js");
-await probeImport("clients/file-utils.js (→ minimatch)", "dist/clients/file-utils.js");
-await probeImport("clients/complexity-client.js (→ tree-sitter)", "dist/clients/complexity-client.js");
-await probeImport("clients/bootstrap.js (→ all analyzers)", "dist/clients/bootstrap.js");
+await probeImport(
+	"clients/file-utils.js (→ minimatch)",
+	"dist/clients/file-utils.js",
+);
+await probeImport(
+	"clients/complexity-client.js (→ tree-sitter)",
+	"dist/clients/complexity-client.js",
+);
+await probeImport(
+	"clients/bootstrap.js (→ all analyzers)",
+	"dist/clients/bootstrap.js",
+);
 
 // --- 2. Direct bare-specifier resolution -----------------------------------
-for (const spec of [
+// Host-provided packages are subtracted, not listed as exceptions: pi resolves
+// them from its own runtime, so nothing installs them and probing one here is
+// guaranteed to fail (#1926). The subtraction reads the same list the bundler
+// and the packaging tests use, so it cannot drift.
+const BARE_SPECIFIERS = [
 	"minimatch",
 	"typebox",
 	"js-yaml",
 	"vscode-jsonrpc",
 	"web-tree-sitter",
 	"@ast-grep/napi",
-]) {
+].filter((spec) => !HOST_PROVIDED_PACKAGES.includes(spec));
+
+for (const spec of BARE_SPECIFIERS) {
 	probeResolve(spec);
 }
+record(
+	"host-provided specifiers skipped",
+	"expected",
+	true,
+	`${HOST_PROVIDED_PACKAGES.join(", ")} — pi supplies these (#1926)`,
+);
 
 // --- 3. Spawned-binary tools (the universal net) ----------------------------
 // For every tool that ships its binary in a per-platform npm package
@@ -121,11 +199,21 @@ try {
 			});
 			record(label, "tool", true, bin);
 		} catch (err) {
-			record(label, "tool", false, `${bin} failed to run: ${err?.message || err}`);
+			record(
+				label,
+				"tool",
+				false,
+				`${bin} failed to run: ${err?.message || err}`,
+			);
 		}
 	}
 } catch (err) {
-	record("spawned-tool probe", "tool", false, `installer load failed: ${err?.message || err}`);
+	record(
+		"spawned-tool probe",
+		"tool",
+		false,
+		`installer load failed: ${err?.message || err}`,
+	);
 }
 
 // tree-sitter grammars — download-grammars.js postinstall writes them into

@@ -267,10 +267,7 @@ describe("tree-sitter security gap rules", () => {
 	it("still flags fetch of a member expression (unchanged broad net)", async () => {
 		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("ts-ssrf");
-		const filePath = writeTempFile(
-			"ts",
-			`await fetch(settings.endpoint);\n`,
-		);
+		const filePath = writeTempFile("ts", `await fetch(settings.endpoint);\n`);
 		const matches = await client.runQueryOnFile(query, filePath, "typescript");
 		expect(matches.length).toBeGreaterThan(0);
 	});
@@ -295,7 +292,7 @@ describe("tree-sitter security gap rules", () => {
 		const filePath = writeTempFile(
 			"ts",
 			'const BASE = "https://api.example.com";\n' +
-				"const authUrl = new URL(\"auth/authorize\", `${BASE}/`);\n" +
+				'const authUrl = new URL("auth/authorize", `${BASE}/`);\n' +
 				'authUrl.searchParams.set("callback_url", cb);\n' +
 				"await fetch(authUrl.toString());\n",
 		);
@@ -310,7 +307,7 @@ describe("tree-sitter security gap rules", () => {
 			"ts",
 			'import { URL as NodeURL } from "node:url";\n' +
 				'import { BASE_URL_CLINE } from "../../constants.ts";\n' +
-				"const authUrl = new NodeURL(\"auth/authorize\", `${BASE_URL_CLINE}/`);\n" +
+				'const authUrl = new NodeURL("auth/authorize", `${BASE_URL_CLINE}/`);\n' +
 				'authUrl.searchParams.set("callback_url", cb);\n' +
 				"await fetch(authUrl.toString());\n",
 		);
@@ -339,7 +336,7 @@ describe("tree-sitter security gap rules", () => {
 		const filePath = writeTempFile(
 			"ts",
 			"function f(base) {\n" +
-				"  const u = new URL(\"auth\", `${base}/`);\n" +
+				'  const u = new URL("auth", `${base}/`);\n' +
 				"  return fetch(u.toString());\n" +
 				"}\n",
 		);
@@ -365,7 +362,7 @@ describe("tree-sitter security gap rules", () => {
 		const filePath = writeTempFile(
 			"ts",
 			"const BASE = process.env.API_BASE;\n" +
-				"const u = new URL(\"auth\", `${BASE}/`);\n" +
+				'const u = new URL("auth", `${BASE}/`);\n' +
 				"await fetch(u.toString());\n",
 		);
 		const matches = await client.runQueryOnFile(query, filePath, "typescript");
@@ -439,7 +436,7 @@ describe("tree-sitter security gap rules", () => {
 			"ts",
 			'const base = "https://api.example.com";\n' +
 				"function proxy(base) {\n" +
-				"  const u = new URL(\"/x\", `${base}/`);\n" +
+				'  const u = new URL("/x", `${base}/`);\n' +
 				"  return fetch(u.toString());\n" +
 				"}\n",
 		);

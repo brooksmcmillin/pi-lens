@@ -23,12 +23,14 @@ vi.mock("../../clients/read-guard-logger.js", () => ({
 	getReadGuardLogPath: vi.fn(() => "/dev/null"),
 }));
 
+const fileTimeState = vi.hoisted(() => ({ hasChanged: false }));
+
 // Mock FileTime so range coverage (not mtime) decides the verdict — same as
 // read-guard.test.ts.
 vi.mock("../../clients/file-time.js", () => ({
 	createFileTime: () => ({
 		read: vi.fn(),
-		hasChanged: vi.fn(() => false),
+		hasChanged: vi.fn(() => fileTimeState.hasChanged),
 		assert: vi.fn(),
 		get: vi.fn(),
 	}),
@@ -76,6 +78,7 @@ function applyBashAccess(
 }
 
 beforeEach(() => {
+	fileTimeState.hasChanged = false;
 	tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-brgi-"));
 });
 afterEach(() => {
@@ -103,6 +106,18 @@ describe("bash file access → read-guard", () => {
 		const f = fileWithLines("a.ts", 100);
 		applyBashAccess(guard, `echo "x" > ${f}`, tmp);
 		expect(guard.checkEdit(f, [40, 40]).action).toBe("allow");
+	});
+
+	it("a byte-identical npx biome format write refreshes the read stamp (#1903 B1)", () => {
+		const guard = createReadGuard("s");
+		const f = fileWithLines("plane.ts", 100);
+		applyBashAccess(guard, `cat ${f}`, tmp);
+		// The formatter rewrites the inode/mtime but produces identical bytes.
+		fs.writeFileSync(f, fs.readFileSync(f));
+		fileTimeState.hasChanged = true;
+		applyBashAccess(guard, `npx biome format --write ${f}`, tmp);
+
+		expect(guard.checkEdit(f).action).toBe("allow");
 	});
 
 	it("ls (no content) does NOT unblock an edit", () => {

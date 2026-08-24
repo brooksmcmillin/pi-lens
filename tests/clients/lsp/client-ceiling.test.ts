@@ -54,7 +54,9 @@ describe("LSP per-session client ceiling (#1325)", () => {
 		const inUse = fakeClient(true);
 		service.state.clients.set("kotlin:/active", inUse);
 
-		await expect(service.makeCapacityForClient("json:/next")).resolves.toBe(false);
+		await expect(service.makeCapacityForClient("json:/next")).resolves.toBe(
+			false,
+		);
 		expect(vi.mocked(inUse.shutdown)).not.toHaveBeenCalled();
 		expect(service.state.clients.has("kotlin:/active")).toBe(true);
 	});

@@ -40,10 +40,9 @@ vi.mock("../../clients/lsp/config.js", () => ({
 // is faked. Using the real scheduling primitives is the whole point: a fake
 // scheduler would trivially satisfy the property under test either way.
 vi.mock("../../clients/lsp/index.js", async () => {
-	const actual =
-		await vi.importActual<typeof import("../../clients/lsp/index.js")>(
-			"../../clients/lsp/index.js",
-		);
+	const actual = await vi.importActual<
+		typeof import("../../clients/lsp/index.js")
+	>("../../clients/lsp/index.js");
 	return {
 		...actual,
 		getLSPService: () => mocked.service,
@@ -70,7 +69,9 @@ describe("lsp_diagnostics batch — per-server serialization (#631)", () => {
 	let touchFile: ReturnType<typeof vi.fn>;
 
 	beforeEach(() => {
-		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-diag-pergroup-"));
+		tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-diag-pergroup-"),
+		);
 		getServersForFileWithConfig.mockReset();
 		getServersForFileWithConfig.mockImplementation((fp: string) => {
 			const id = serverIdForFile(fp);

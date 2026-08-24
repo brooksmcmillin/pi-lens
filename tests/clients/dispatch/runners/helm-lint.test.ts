@@ -15,9 +15,8 @@ vi.mock("../../../../clients/dispatch/runners/utils/runner-helpers.js", () => ({
 	resolveAvailableOrInstall,
 }));
 
-const { default: helmLintRunner, parseHelmLintOutput } = await import(
-	"../../../../clients/dispatch/runners/helm-lint.js"
-);
+const { default: helmLintRunner, parseHelmLintOutput } =
+	await import("../../../../clients/dispatch/runners/helm-lint.js");
 
 function context(filePath: string, projectRoot: string): DispatchContext {
 	return {
@@ -109,7 +108,11 @@ describe("helm-lint runner", () => {
 	it("deduplicates concurrent edits by canonical chart root", async () => {
 		const first = createChart(workspace, "templates/first.yaml");
 		const second = createChart(workspace, "templates/second.yaml");
-		let settle!: (value: { status: number; stdout: string; stderr: string }) => void;
+		let settle!: (value: {
+			status: number;
+			stdout: string;
+			stderr: string;
+		}) => void;
 		safeSpawnAsync.mockReturnValue(
 			new Promise((resolve) => {
 				settle = resolve;
@@ -133,10 +136,14 @@ describe("helm-lint runner", () => {
 			status: "skipped",
 		});
 
-		const outside = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-helm-outside-"));
+		const outside = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-helm-outside-"),
+		);
 		try {
 			const outsideFile = createChart(outside, "values.yaml");
-			expect(await helmLintRunner.run(context(outsideFile, workspace))).toMatchObject({
+			expect(
+				await helmLintRunner.run(context(outsideFile, workspace)),
+			).toMatchObject({
 				status: "skipped",
 			});
 		} finally {
@@ -149,22 +156,25 @@ describe("helm-lint runner", () => {
 		["tool-not-found", "unavailable"],
 		["timeout", "timeout"],
 		["killed", "aborted"],
-	])("classifies typed %s spawn failures without errno text", async (kind, failureKind) => {
-		const filePath = createChart(workspace, "values.yaml");
-		safeSpawnAsync.mockResolvedValue({
-			status: null,
-			stdout: "",
-			stderr: "",
-			failure: kind === "timeout" ? "timeout" : "aborted",
-			spawnFailure: { kind },
-			error: new Error("opaque failure"),
-		});
+	])(
+		"classifies typed %s spawn failures without errno text",
+		async (kind, failureKind) => {
+			const filePath = createChart(workspace, "values.yaml");
+			safeSpawnAsync.mockResolvedValue({
+				status: null,
+				stdout: "",
+				stderr: "",
+				failure: kind === "timeout" ? "timeout" : "aborted",
+				spawnFailure: { kind },
+				error: new Error("opaque failure"),
+			});
 
-		const result = await helmLintRunner.run(context(filePath, workspace));
+			const result = await helmLintRunner.run(context(filePath, workspace));
 
-		expect(result).toMatchObject({ status: "failed", failureKind });
-		expect(result.diagnostics).toEqual([]);
-	});
+			expect(result).toMatchObject({ status: "failed", failureKind });
+			expect(result.diagnostics).toEqual([]);
+		},
+	);
 
 	it("reports nonzero unparseable output as parser failure, never clean", async () => {
 		const filePath = createChart(workspace, "Chart.yaml");
@@ -174,7 +184,9 @@ describe("helm-lint runner", () => {
 			stderr: "",
 		});
 
-		expect(await helmLintRunner.run(context(filePath, workspace))).toMatchObject({
+		expect(
+			await helmLintRunner.run(context(filePath, workspace)),
+		).toMatchObject({
 			status: "failed",
 			failureKind: "parser_error",
 			diagnostics: [],
@@ -188,7 +200,9 @@ describe("helm-lint runner", () => {
 			stdout: "[WARNING] values.yaml: suspicious value",
 			stderr: "helm crashed after warning",
 		});
-		expect(await helmLintRunner.run(context(filePath, workspace))).toMatchObject({
+		expect(
+			await helmLintRunner.run(context(filePath, workspace)),
+		).toMatchObject({
 			status: "failed",
 			failureKind: "parser_error",
 		});
@@ -199,7 +213,9 @@ describe("helm-lint runner", () => {
 			stderr: "",
 			outputTruncated: true,
 		});
-		expect(await helmLintRunner.run(context(filePath, workspace))).toMatchObject({
+		expect(
+			await helmLintRunner.run(context(filePath, workspace)),
+		).toMatchObject({
 			status: "failed",
 			failureKind: "parser_error",
 		});
@@ -236,4 +252,3 @@ describe("parseHelmLintOutput continuations", () => {
 		expect(diagnostics[1].message).not.toContain("mapping values");
 	});
 });
-

@@ -101,9 +101,9 @@ describe("AgentBehaviorClient reset", () => {
 		client.recordToolCall("edit", OTHER_A);
 		client.recordToolCall("edit", OTHER_B);
 
-		expect(blindWriteWarnings(client.recordToolCall("edit", OTHER_C))).toHaveLength(
-			1,
-		);
+		expect(
+			blindWriteWarnings(client.recordToolCall("edit", OTHER_C)),
+		).toHaveLength(1);
 	});
 });
 

@@ -158,6 +158,71 @@ describe("SgRunner", () => {
 			await runner.ensureAvailable();
 			expect(safeSpawnAsync).toHaveBeenCalledTimes(1);
 		});
+
+		it("does not re-serve a retained ast-grep winner this sweep just proved durably missing (#1593)", async () => {
+			try {
+				vi.useFakeTimers({ toFake: ["Date"] });
+				vi.setSystemTime(new Date(1_700_000_000_000));
+
+				const { SgRunner } = await import("../../clients/sg-runner.js");
+				const runner = new SgRunner();
+
+				// Sweep 1: the direct candidates (ast-grep, sg) stall (transient);
+				// the npx fallback answers, so the win is provisional and memoized
+				// as the npx command.
+				safeSpawnAsync.mockImplementation(async (cmd: string) => {
+					if (cmd === "npx") {
+						return {
+							status: 0,
+							error: null,
+							stdout: "ast-grep 0.42.1",
+							stderr: "",
+						};
+					}
+					return {
+						status: null,
+						error: undefined,
+						stdout: "",
+						stderr: "",
+						failure: "timeout" as const,
+						spawnFailure: { kind: "timeout" as const },
+					};
+				});
+				expect(await runner.ensureAvailable()).toBe(true);
+
+				// Let the provisional cooldown expire so the next call re-sweeps
+				// instead of serving the memoized verdict straight from the latch.
+				vi.setSystemTime(new Date(Date.now() + 301_000));
+
+				// Sweep 2: the memoized winner (npx) now ENOENTs — durably missing —
+				// while ast-grep/sg merely stall again. The retained arm must NOT
+				// re-serve the dead `npx` command just because a sibling stalled in
+				// the same sweep.
+				safeSpawnAsync.mockImplementation(async (cmd: string) => {
+					if (cmd === "npx") {
+						return {
+							status: null,
+							error: Object.assign(new Error("npx ENOENT"), { code: "ENOENT" }),
+							stdout: "",
+							stderr: "",
+							failure: "spawn" as const,
+							spawnFailure: { kind: "tool-not-found" as const },
+						};
+					}
+					return {
+						status: null,
+						error: undefined,
+						stdout: "",
+						stderr: "",
+						failure: "timeout" as const,
+						spawnFailure: { kind: "timeout" as const },
+					};
+				});
+				expect(await runner.ensureAvailable()).toBe(false);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
 	});
 
 	describe("tempScanAsync()", () => {
@@ -242,7 +307,8 @@ describe("SgRunner", () => {
 					status: 1,
 					error: undefined,
 					stdout: matchJson,
-					stderr: "Error: 1 error(s) found in code.\nHelp: Scan succeeded and found error level diagnostics in the codebase.",
+					stderr:
+						"Error: 1 error(s) found in code.\nHelp: Scan succeeded and found error level diagnostics in the codebase.",
 				});
 				const { SgRunner } = await import("../../clients/sg-runner.js");
 				const result = await new SgRunner().tempScanDetailedAsync(
@@ -263,9 +329,7 @@ describe("SgRunner", () => {
 		it("rejects a status-1 JSON scalar/null stdout as a failure (no phantom match)", async () => {
 			// tryParseSgMatches only accepts an array or object — a JSON scalar
 			// (e.g. an error report serialized as `null`) must not become a match.
-			const root = fs.mkdtempSync(
-				path.join(os.tmpdir(), "pi-lens-sg-scalar-"),
-			);
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-sg-scalar-"));
 			try {
 				safeSpawnAsync.mockResolvedValueOnce({
 					status: 1,

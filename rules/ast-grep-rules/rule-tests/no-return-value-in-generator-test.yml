@@ -11,6 +11,12 @@ valid:
   - |
     def regular():
         return 42
+  - |
+    @asynccontextmanager
+    async def lifespan(app):
+        def handler():
+            return 42
+        yield
 invalid:
   - |
     def gen():
@@ -20,3 +26,9 @@ invalid:
     def gen():
         yield from iter([1, 2])
         return result
+  - |
+    def outer():
+        def inner_gen():
+            yield 1
+            return 99
+        return inner_gen

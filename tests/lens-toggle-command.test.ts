@@ -28,7 +28,9 @@ afterEach(() => {
 	}
 });
 
-function installLens(flagValues: Record<string, boolean | string> = {}): PiMock {
+function installLens(
+	flagValues: Record<string, boolean | string> = {},
+): PiMock {
 	const pi = createPiMock(flagValues);
 	piLens(pi.asExtensionAPI());
 	return pi;

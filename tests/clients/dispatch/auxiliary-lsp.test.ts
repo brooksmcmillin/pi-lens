@@ -40,9 +40,9 @@ describe("auxiliary LSP enablement", () => {
 
 	it("zizmor is default-on and the no-zizmor kill switch disables it (#272)", () => {
 		expect(enabledAuxiliaryLspServerIds(() => undefined)).toContain("zizmor");
-		expect(enabledAuxiliaryLspServerIds((f) => f === "no-zizmor")).not.toContain(
-			"zizmor",
-		);
+		expect(
+			enabledAuxiliaryLspServerIds((f) => f === "no-zizmor"),
+		).not.toContain("zizmor");
 	});
 
 	it("typos is default-on and the no-typos kill switch disables it (#283)", () => {
@@ -204,7 +204,10 @@ describe("zizmor semantic policy (#272)", () => {
 
 	it("derives a defect class from the rule id", () => {
 		const dc = zizmor?.defectClass?.(
-			diag({ code: "template-injection", message: "code injection via template" }),
+			diag({
+				code: "template-injection",
+				message: "code injection via template",
+			}),
 		);
 		expect(typeof dc === "string" || dc === undefined).toBe(true);
 	});
@@ -233,9 +236,9 @@ describe("typos semantic policy (#283)", () => {
 	});
 
 	it("classifies a misspelling as a style (docs/quality) defect — not security", () => {
-		expect(typos?.defectClass?.(diag({ message: "`recieve` should be `receive`" }))).toBe(
-			"style",
-		);
+		expect(
+			typos?.defectClass?.(diag({ message: "`recieve` should be `receive`" })),
+		).toBe("style");
 	});
 });
 
@@ -244,14 +247,18 @@ describe("typos semantic policy (#283)", () => {
 // should use instead of re-deriving "find the profile by source, then check
 // isSuppressed" independently.
 describe("isAuxiliaryDiagnosticSuppressed / applyAuxiliarySuppressions (#586)", () => {
-	const RULE = "python.lang.security.audit.subprocess-shell-true.subprocess-shell-true";
+	const RULE =
+		"python.lang.security.audit.subprocess-shell-true.subprocess-shell-true";
 
 	it("drops an opengrep (Semgrep-sourced) diagnostic suppressed by `// nosemgrep`", () => {
 		const content = "subprocess.run('ls', shell=True)  // nosemgrep\n";
 		const d = diag({
 			source: "Semgrep",
 			code: RULE,
-			range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+			range: {
+				start: { line: 0, character: 0 },
+				end: { line: 0, character: 1 },
+			},
 		});
 		expect(isAuxiliaryDiagnosticSuppressed(d, content)).toBe(true);
 		expect(applyAuxiliarySuppressions([d], content)).toEqual([]);
@@ -262,7 +269,10 @@ describe("isAuxiliaryDiagnosticSuppressed / applyAuxiliarySuppressions (#586)", 
 		const d = diag({
 			source: "Semgrep",
 			code: RULE,
-			range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+			range: {
+				start: { line: 0, character: 0 },
+				end: { line: 0, character: 1 },
+			},
 		});
 		expect(isAuxiliaryDiagnosticSuppressed(d, content)).toBe(false);
 		expect(applyAuxiliarySuppressions([d], content)).toEqual([d]);
@@ -272,7 +282,10 @@ describe("isAuxiliaryDiagnosticSuppressed / applyAuxiliarySuppressions (#586)", 
 		const content = "anything\n";
 		const astGrepDiag = diag({
 			source: "ast-grep",
-			range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+			range: {
+				start: { line: 0, character: 0 },
+				end: { line: 0, character: 1 },
+			},
 		});
 		expect(isAuxiliaryDiagnosticSuppressed(astGrepDiag, content)).toBe(false);
 		expect(applyAuxiliarySuppressions([astGrepDiag], content)).toEqual([
@@ -284,7 +297,10 @@ describe("isAuxiliaryDiagnosticSuppressed / applyAuxiliarySuppressions (#586)", 
 		const content = "anything\n";
 		const tsDiag = diag({
 			source: "typescript",
-			range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+			range: {
+				start: { line: 0, character: 0 },
+				end: { line: 0, character: 1 },
+			},
 		});
 		expect(isAuxiliaryDiagnosticSuppressed(tsDiag, content)).toBe(false);
 		expect(applyAuxiliarySuppressions([tsDiag], content)).toEqual([tsDiag]);
@@ -298,12 +314,18 @@ describe("isAuxiliaryDiagnosticSuppressed / applyAuxiliarySuppressions (#586)", 
 		const suppressed = diag({
 			source: "Semgrep",
 			code: RULE,
-			range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+			range: {
+				start: { line: 0, character: 0 },
+				end: { line: 0, character: 1 },
+			},
 		});
 		const kept = diag({
 			source: "Semgrep",
 			code: RULE,
-			range: { start: { line: 1, character: 0 }, end: { line: 1, character: 1 } },
+			range: {
+				start: { line: 1, character: 0 },
+				end: { line: 1, character: 1 },
+			},
 		});
 		expect(applyAuxiliarySuppressions([suppressed, kept], content)).toEqual([
 			kept,
@@ -322,7 +344,10 @@ describe("applyAuxiliarySuppressions fileRole gate (#692)", () => {
 	it("drops an ast-grep-sourced diagnostic when fileRole is 'test'", () => {
 		const astGrepDiag = diag({
 			source: "ast-grep",
-			range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+			range: {
+				start: { line: 0, character: 0 },
+				end: { line: 0, character: 1 },
+			},
 		});
 		expect(
 			applyAuxiliarySuppressions([astGrepDiag], content, { fileRole: "test" }),
@@ -332,15 +357,24 @@ describe("applyAuxiliarySuppressions fileRole gate (#692)", () => {
 	it("keeps opengrep/zizmor/typos findings on a test file (no skipTestFiles on those profiles)", () => {
 		const opengrepDiag = diag({
 			source: "Semgrep",
-			range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+			range: {
+				start: { line: 0, character: 0 },
+				end: { line: 0, character: 1 },
+			},
 		});
 		const zizmorDiag = diag({
 			source: "zizmor",
-			range: { start: { line: 1, character: 0 }, end: { line: 1, character: 1 } },
+			range: {
+				start: { line: 1, character: 0 },
+				end: { line: 1, character: 1 },
+			},
 		});
 		const typosDiag = diag({
 			source: "typos",
-			range: { start: { line: 2, character: 0 }, end: { line: 2, character: 1 } },
+			range: {
+				start: { line: 2, character: 0 },
+				end: { line: 2, character: 1 },
+			},
 		});
 		expect(
 			applyAuxiliarySuppressions(
@@ -354,17 +388,25 @@ describe("applyAuxiliarySuppressions fileRole gate (#692)", () => {
 	it("keeps ast-grep findings when fileRole is not 'test'", () => {
 		const astGrepDiag = diag({
 			source: "ast-grep",
-			range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+			range: {
+				start: { line: 0, character: 0 },
+				end: { line: 0, character: 1 },
+			},
 		});
 		expect(
-			applyAuxiliarySuppressions([astGrepDiag], content, { fileRole: "source" }),
+			applyAuxiliarySuppressions([astGrepDiag], content, {
+				fileRole: "source",
+			}),
 		).toEqual([astGrepDiag]);
 	});
 
 	it("without the third arg, behaves exactly as before (no test-file gating)", () => {
 		const astGrepDiag = diag({
 			source: "ast-grep",
-			range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+			range: {
+				start: { line: 0, character: 0 },
+				end: { line: 0, character: 1 },
+			},
 		});
 		expect(applyAuxiliarySuppressions([astGrepDiag], content)).toEqual([
 			astGrepDiag,
@@ -384,7 +426,10 @@ describe("retagAuxiliaryDiagnostics (#692)", () => {
 				source: "ast-grep",
 				code: "no-eval",
 				severity: 1,
-				range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+				range: {
+					start: { line: 0, character: 0 },
+					end: { line: 0, character: 1 },
+				},
 			}),
 		];
 		const converted = convertLspDiagnostics(raw, "/repo/a.ts");
@@ -402,11 +447,17 @@ describe("retagAuxiliaryDiagnostics (#692)", () => {
 		const raw: LSPDiagnostic[] = [
 			diag({
 				source: "ast-grep",
-				range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+				range: {
+					start: { line: 0, character: 0 },
+					end: { line: 0, character: 1 },
+				},
 			}),
 			diag({
 				source: "Semgrep",
-				range: { start: { line: 1, character: 0 }, end: { line: 1, character: 1 } },
+				range: {
+					start: { line: 1, character: 0 },
+					end: { line: 1, character: 1 },
+				},
 			}),
 		];
 		const converted = convertLspDiagnostics(raw, "/repo/a.test.ts");
@@ -424,7 +475,10 @@ describe("retagAuxiliaryDiagnostics (#692)", () => {
 			diag({
 				source: "Semgrep",
 				code: "python.lang.security.audit.subprocess-shell-true.subprocess-shell-true",
-				range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+				range: {
+					start: { line: 0, character: 0 },
+					end: { line: 0, character: 1 },
+				},
 			}),
 		];
 		const converted = convertLspDiagnostics(raw, "/repo/a.py");
@@ -439,7 +493,10 @@ describe("retagAuxiliaryDiagnostics (#692)", () => {
 		const raw: LSPDiagnostic[] = [
 			diag({
 				source: "typescript",
-				range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+				range: {
+					start: { line: 0, character: 0 },
+					end: { line: 0, character: 1 },
+				},
 			}),
 		];
 		const converted = convertLspDiagnostics(raw, "/repo/a.ts");

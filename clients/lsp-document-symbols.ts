@@ -85,11 +85,7 @@ export function findDocumentSymbolAtLine(
 	const visit = (items: LSPSymbol[], ancestry: LSPSymbol[]) => {
 		for (const symbol of items) {
 			const range = symbolRange(symbol);
-			if (
-				range &&
-				range.start.line <= line &&
-				range.end.line >= line
-			) {
+			if (range && range.start.line <= line && range.end.line >= line) {
 				const nextAncestry = [...ancestry, symbol];
 				const span = range.end.line - range.start.line;
 				if (span <= bestSpan) {

@@ -146,7 +146,10 @@ export function probeCtxActive(ctx: unknown): boolean | undefined {
  * `primary` and `sequential-replacement` classifications — a sequential
  * replacement re-registers itself as the (new) primary, matching today's
  * one-active-session-at-a-time behavior. */
-export function registerPrimarySession(ctx: unknown, sessionId: string | undefined): void {
+export function registerPrimarySession(
+	ctx: unknown,
+	sessionId: string | undefined,
+): void {
 	activeCtx = ctx;
 	activeSessionId = sessionId;
 	secondarySessionCount = 0;
@@ -237,12 +240,15 @@ export function classifyCurrentSessionEmission(
 	sessionId: string | undefined,
 ): "primary" | "concurrent-secondary" {
 	if (!guardEnabled()) return "primary";
-	if (activeCtx === undefined && activeSessionId === undefined) return "primary";
+	if (activeCtx === undefined && activeSessionId === undefined)
+		return "primary";
 	if (ctx !== undefined && ctx === activeCtx) return "primary";
-	if (sessionId !== undefined && sessionId === activeSessionId) return "primary";
+	if (sessionId !== undefined && sessionId === activeSessionId)
+		return "primary";
 	// Uncertainty guard: if EITHER side's session id is unknown we cannot
 	// positively establish "different session", so never classify secondary.
-	if (sessionId === undefined || activeSessionId === undefined) return "primary";
+	if (sessionId === undefined || activeSessionId === undefined)
+		return "primary";
 	const primaryStillActive = probeCtxActive(activeCtx);
 	if (primaryStillActive === true) return "concurrent-secondary";
 	return "primary";
@@ -264,7 +270,8 @@ export function decrementSecondarySessionCount(): void {
 export function classifySessionStartGuarded(
 	input: ClassifySessionStartInput,
 ): SessionStartClassification {
-	if (!guardEnabled()) return input.hasPrior ? "sequential-replacement" : "primary";
+	if (!guardEnabled())
+		return input.hasPrior ? "sequential-replacement" : "primary";
 	return classifySessionStart(input);
 }
 

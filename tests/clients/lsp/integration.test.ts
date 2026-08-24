@@ -335,7 +335,8 @@ describe("LSP Client Integration — stale navigation drop (#276)", () => {
 		}
 		client = undefined;
 		proc = undefined;
-		if (prevDelay === undefined) delete process.env.FAKE_LSP_DEFINITION_DELAY_MS;
+		if (prevDelay === undefined)
+			delete process.env.FAKE_LSP_DEFINITION_DELAY_MS;
 		else process.env.FAKE_LSP_DEFINITION_DELAY_MS = prevDelay;
 		if (prevFlag === undefined) delete process.env.PI_LENS_LSP_NAV_STALE_DROP;
 		else process.env.PI_LENS_LSP_NAV_STALE_DROP = prevFlag;

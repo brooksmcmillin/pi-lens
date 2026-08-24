@@ -53,15 +53,15 @@ describe("spawnFailedWithNoOutput", () => {
 	// to parse, so "nothing to parse" means both streams.
 	it("honors an explicit output string over stdout", () => {
 		const result = spawnResult({ status: 1, stderr: "error: boom" });
-		expect(spawnFailedWithNoOutput(result, `${result.stdout}${result.stderr}`)).toBe(
-			false,
-		);
+		expect(
+			spawnFailedWithNoOutput(result, `${result.stdout}${result.stderr}`),
+		).toBe(false);
 	});
 
 	it("is true when the explicit output string is empty", () => {
 		const result = spawnResult({ status: 1 });
-		expect(spawnFailedWithNoOutput(result, `${result.stdout}${result.stderr}`)).toBe(
-			true,
-		);
+		expect(
+			spawnFailedWithNoOutput(result, `${result.stdout}${result.stderr}`),
+		).toBe(true);
 	});
 });

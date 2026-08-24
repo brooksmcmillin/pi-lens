@@ -73,10 +73,10 @@ describe("TypeScript config-aware roots (#1412)", () => {
 		write(file, "export {};\n");
 
 		const service = new LSPService() as unknown as RootPolicyHarness;
-		service.state.clients.set(
-			`typescript:${normalizeMapKey(project)}`,
-			{ root: project, isAlive: () => true } as unknown as LSPClientInfo,
-		);
+		service.state.clients.set(`typescript:${normalizeMapKey(project)}`, {
+			root: project,
+			isAlive: () => true,
+		} as unknown as LSPClientInfo);
 		await expect(
 			service.resolveServerRoot(TypeScriptServer, file),
 		).resolves.toBe(nested);

@@ -254,9 +254,8 @@ describe("lsp server policy", () => {
 	});
 
 	it("resolves csharp roots from real .csproj/.sln filenames (#201)", async () => {
-		const { CSharpServer, OmniSharpServer } = await import(
-			"../../../clients/lsp/server.js"
-		);
+		const { CSharpServer, OmniSharpServer } =
+			await import("../../../clients/lsp/server.js");
 		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-csharp-root-"));
 		dirs.push(tmp);
 
@@ -289,7 +288,9 @@ describe("lsp server policy", () => {
 
 	it("does not treat a directory named like a project marker as a root (#201)", async () => {
 		const { CSharpServer } = await import("../../../clients/lsp/server.js");
-		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-csharp-dirmarker-"));
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-csharp-dirmarker-"),
+		);
 		dirs.push(tmp);
 
 		const project = path.join(tmp, "App");
@@ -304,7 +305,9 @@ describe("lsp server policy", () => {
 
 	it("matches csharp project markers case-insensitively on win32 (#201)", async () => {
 		const { CSharpServer } = await import("../../../clients/lsp/server.js");
-		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-csharp-nocase-"));
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-csharp-nocase-"),
+		);
 		dirs.push(tmp);
 
 		const project = path.join(tmp, "App");
@@ -351,9 +354,8 @@ describe("lsp server policy", () => {
 
 	it("tries pi-lens managed csharp candidates before legacy global dotnet tools", async () => {
 		const { CSharpServer } = await import("../../../clients/lsp/server.js");
-		const { getGlobalPiLensDir } = await import(
-			"../../../clients/file-utils.js"
-		);
+		const { getGlobalPiLensDir } =
+			await import("../../../clients/file-utils.js");
 		const tmp = fs.mkdtempSync(
 			path.join(os.tmpdir(), "pi-lens-csharp-candidates-"),
 		);
@@ -368,15 +370,14 @@ describe("lsp server policy", () => {
 		// Asserts against the actual machine-global root (respects #525's
 		// PI_LENS_HOME test override) rather than hardcoding ".pi-lens".
 		const managedBinDir = path.join(getGlobalPiLensDir(), "bin", "csharp-ls");
-		expect(
-			commands.some((command) => command.includes(managedBinDir)),
-		).toBe(true);
+		expect(commands.some((command) => command.includes(managedBinDir))).toBe(
+			true,
+		);
 	});
 
 	it("falls back to file directory for standalone cpp/zig/elixir/gleam files", async () => {
-		const { CppServer, ZigServer, ElixirServer, GleamServer } = await import(
-			"../../../clients/lsp/server.js"
-		);
+		const { CppServer, ZigServer, ElixirServer, GleamServer } =
+			await import("../../../clients/lsp/server.js");
 		const tmp = fs.mkdtempSync(
 			path.join(os.tmpdir(), "pi-lens-secondary-roots-"),
 		);
@@ -467,7 +468,9 @@ describe("lsp server policy", () => {
 
 	it("does not classify a testdata substring as a fixture segment (#1328)", async () => {
 		const { NearestRoot } = await import("../../../clients/lsp/server.js");
-		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-testdata-segment-"));
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-testdata-segment-"),
+		);
 		dirs.push(tmp);
 
 		const project = path.join(tmp, "testdata-tools");
@@ -483,7 +486,8 @@ describe("lsp server policy", () => {
 
 	it("memoizes project ignore globs until .gitignore changes (#1328)", async () => {
 		const { NearestRoot } = await import("../../../clients/lsp/server.js");
-		const { isPathIgnoredByProject } = await import("../../../clients/file-utils.js");
+		const { isPathIgnoredByProject } =
+			await import("../../../clients/file-utils.js");
 		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-ignore-cache-"));
 		dirs.push(tmp);
 
@@ -523,8 +527,11 @@ describe("lsp server policy", () => {
 	});
 
 	it("caches empty project ignore globs when .gitignore is absent (#1328)", async () => {
-		const { getProjectIgnoreGlobs } = await import("../../../clients/file-utils.js");
-		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-no-gitignore-cache-"));
+		const { getProjectIgnoreGlobs } =
+			await import("../../../clients/file-utils.js");
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-no-gitignore-cache-"),
+		);
 		dirs.push(tmp);
 		const gitignore = path.join(tmp, ".gitignore");
 
@@ -679,9 +686,8 @@ describe("lsp server policy", () => {
 	});
 
 	it("matches Dockerfile by basename in configured server lookup", async () => {
-		const { getServersForFileWithConfig } = await import(
-			"../../../clients/lsp/config.js"
-		);
+		const { getServersForFileWithConfig } =
+			await import("../../../clients/lsp/config.js");
 		const servers = getServersForFileWithConfig("infra/Dockerfile").map(
 			(server) => server.id,
 		);
@@ -780,9 +786,8 @@ describe("lsp server policy", () => {
 	});
 
 	it("repairs an incompatible managed TypeScript compiler for the classic fallback", async () => {
-		const { TypeScriptServer, _resetClassicTsRepairForTests } = await import(
-			"../../../clients/lsp/server.js"
-		);
+		const { TypeScriptServer, _resetClassicTsRepairForTests } =
+			await import("../../../clients/lsp/server.js");
 		_resetClassicTsRepairForTests();
 		const tree = createManagedTypeScriptTree("managed-repair");
 		tree.writeCompiler("7.0.2");
@@ -822,9 +827,8 @@ describe("lsp server policy", () => {
 	// next spawn. ensureTool caches successful installs, so only the FAILING
 	// path can loop — three call sites, each with a 120 s install timeout.
 	it("attempts the classic TypeScript repair at most once per process", async () => {
-		const { TypeScriptServer, _resetClassicTsRepairForTests } = await import(
-			"../../../clients/lsp/server.js"
-		);
+		const { TypeScriptServer, _resetClassicTsRepairForTests } =
+			await import("../../../clients/lsp/server.js");
 		_resetClassicTsRepairForTests();
 		const tree = createManagedTypeScriptTree("repair-once");
 		tree.writeCompiler("7.0.2");
@@ -855,9 +859,8 @@ describe("lsp server policy", () => {
 	// discovered TypeScript 7 compiler is present. This reaches the repair
 	// branch's gate rather than short-circuiting on an undefined ensureTool.
 	it("never reinstalls the classic TypeScript compiler when install is disabled", async () => {
-		const { TypeScriptServer, _resetClassicTsRepairForTests } = await import(
-			"../../../clients/lsp/server.js"
-		);
+		const { TypeScriptServer, _resetClassicTsRepairForTests } =
+			await import("../../../clients/lsp/server.js");
 		_resetClassicTsRepairForTests();
 		const tree = createManagedTypeScriptTree("repair-disabled");
 		tree.writeCompiler("7.0.2");
@@ -882,9 +885,8 @@ describe("lsp server policy", () => {
 	// A bare `tsc` from PATH has no readable version and no adjacent package
 	// layout. Repairing there would force-reinstall over a healthy global 5.x.
 	it("skips the classic TypeScript repair for a bare PATH compiler", async () => {
-		const { TypeScriptServer, _resetClassicTsRepairForTests } = await import(
-			"../../../clients/lsp/server.js"
-		);
+		const { TypeScriptServer, _resetClassicTsRepairForTests } =
+			await import("../../../clients/lsp/server.js");
 		_resetClassicTsRepairForTests();
 		const tree = createManagedTypeScriptTree("repair-path-hit");
 		ensureTool.mockImplementation(async (toolId: string) => {
@@ -966,9 +968,8 @@ describe("lsp server policy", () => {
 	});
 
 	it("keeps custom LSP config scoped per workspace", async () => {
-		const { getServersForFileWithConfig, initLSPConfig } = await import(
-			"../../../clients/lsp/config.js"
-		);
+		const { getServersForFileWithConfig, initLSPConfig } =
+			await import("../../../clients/lsp/config.js");
 
 		const workspaceA = fs.mkdtempSync(
 			path.join(os.tmpdir(), "pi-lens-lsp-config-a-"),
@@ -1102,9 +1103,7 @@ describe("lsp server policy", () => {
 		expect(
 			launchLSP.mock.calls.some(
 				([command, args]) =>
-					command === "ty" &&
-					Array.isArray(args) &&
-					args[0] === "server",
+					command === "ty" && Array.isArray(args) && args[0] === "server",
 			),
 		).toBe(true);
 	});
@@ -1133,9 +1132,9 @@ describe("lsp server policy", () => {
 
 		expect(spawned).toBeDefined();
 		expect(ensureTool).not.toHaveBeenCalled();
-		expect(
-			launchLSP.mock.calls.some(([command]) => command === "ty"),
-		).toBe(false);
+		expect(launchLSP.mock.calls.some(([command]) => command === "ty")).toBe(
+			false,
+		);
 	});
 
 	it("falls back to the file directory for standalone python files", async () => {
@@ -1269,9 +1268,8 @@ describe("lsp server policy", () => {
 		process.env.USERPROFILE = fakeHome;
 		vi.resetModules();
 		try {
-			const { TypeScriptServer } = await import(
-				"../../../clients/lsp/server.js"
-			);
+			const { TypeScriptServer } =
+				await import("../../../clients/lsp/server.js");
 			const file = path.join(
 				fakeHome,
 				".pi",
@@ -1577,6 +1575,370 @@ describe("heavy workspace servers do not fall back to per-file dirs (#201)", () 
 	// depends on the FileDirRoot fallback. See the standalone-csharp test above.
 });
 
+describe("monorepo root hoisting (#1671)", () => {
+	const originalCwd = process.cwd();
+
+	afterEach(() => {
+		process.chdir(originalCwd);
+	});
+
+	it("RustServer.root hoists every crate in a Cargo workspace to the shared workspace root", async () => {
+		const { RustServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-cargo-ws-"));
+		dirs.push(tmp);
+
+		fs.writeFileSync(
+			path.join(tmp, "Cargo.toml"),
+			'[workspace]\nmembers = ["crate-a", "crate-b", "crate-c"]\n',
+		);
+		const crateFiles: string[] = [];
+		for (const crate of ["crate-a", "crate-b", "crate-c"]) {
+			const crateDir = path.join(tmp, crate);
+			fs.mkdirSync(path.join(crateDir, "src"), { recursive: true });
+			fs.writeFileSync(
+				path.join(crateDir, "Cargo.toml"),
+				`[package]\nname = "${crate}"\n`,
+			);
+			const file = path.join(crateDir, "src", "lib.rs");
+			fs.writeFileSync(file, "pub fn x() {}\n");
+			crateFiles.push(file);
+		}
+
+		const roots = await Promise.all(crateFiles.map((f) => RustServer.root(f)));
+		// N heavy servers where 1 suffices is exactly the memory/process cost #1671
+		// is closing: every crate must resolve to the same workspace root.
+		expect(new Set(roots).size).toBe(1);
+		expect(roots[0]).toBe(tmp);
+	});
+
+	it("RustServer.root leaves a crate outside the workspace's members table crate-rooted", async () => {
+		const { RustServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-cargo-nonmember-"),
+		);
+		dirs.push(tmp);
+
+		fs.writeFileSync(
+			path.join(tmp, "Cargo.toml"),
+			'[workspace]\nmembers = ["crate-a"]\n',
+		);
+		const memberDir = path.join(tmp, "crate-a");
+		fs.mkdirSync(path.join(memberDir, "src"), { recursive: true });
+		fs.writeFileSync(
+			path.join(memberDir, "Cargo.toml"),
+			'[package]\nname = "crate-a"\n',
+		);
+		const memberFile = path.join(memberDir, "src", "lib.rs");
+		fs.writeFileSync(memberFile, "pub fn x() {}\n");
+
+		// standalone-tool sits next to the workspace but is never listed in
+		// `members` — cargo itself does not build it as part of the workspace, so
+		// pi-lens must not spawn a shared rust-analyzer root that merges it in.
+		const nonMemberDir = path.join(tmp, "standalone-tool");
+		fs.mkdirSync(path.join(nonMemberDir, "src"), { recursive: true });
+		fs.writeFileSync(
+			path.join(nonMemberDir, "Cargo.toml"),
+			'[package]\nname = "standalone-tool"\n',
+		);
+		const nonMemberFile = path.join(nonMemberDir, "src", "lib.rs");
+		fs.writeFileSync(nonMemberFile, "pub fn y() {}\n");
+
+		await expect(RustServer.root(memberFile)).resolves.toBe(tmp);
+		await expect(RustServer.root(nonMemberFile)).resolves.toBe(nonMemberDir);
+	});
+
+	it("RustServer.root does not hoist a workspace root above the session cwd", async () => {
+		const { RustServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-cargo-ceil-"));
+		dirs.push(tmp);
+
+		const workspaceDir = path.join(tmp, "workspace");
+		fs.mkdirSync(workspaceDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(workspaceDir, "Cargo.toml"),
+			'[workspace]\nmembers = ["crates/foo"]\n',
+		);
+		const crateDir = path.join(workspaceDir, "crates", "foo");
+		fs.mkdirSync(path.join(crateDir, "src"), { recursive: true });
+		fs.writeFileSync(
+			path.join(crateDir, "Cargo.toml"),
+			'[package]\nname = "foo"\n',
+		);
+		const file = path.join(crateDir, "src", "main.rs");
+		fs.writeFileSync(file, "fn main() {}\n");
+
+		// Session started narrower than the workspace: cwd IS the crate root, so
+		// there is no room to hoist upward without crossing the session boundary.
+		process.chdir(crateDir);
+
+		await expect(RustServer.root(file)).resolves.toBe(crateDir);
+	});
+
+	it("JavaServer.root hoists declared Maven modules to the parent pom, but leaves an undeclared sibling crate-rooted", async () => {
+		const { JavaServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-maven-ws-"));
+		dirs.push(tmp);
+
+		fs.writeFileSync(
+			path.join(tmp, "pom.xml"),
+			[
+				"<project>",
+				"  <modules>",
+				"    <module>module-a</module>",
+				"    <module>module-b</module>",
+				"  </modules>",
+				"</project>",
+			].join("\n"),
+		);
+
+		const moduleFiles: string[] = [];
+		for (const mod of ["module-a", "module-b"]) {
+			const modDir = path.join(tmp, mod, "src", "main", "java");
+			fs.mkdirSync(modDir, { recursive: true });
+			fs.writeFileSync(
+				path.join(tmp, mod, "pom.xml"),
+				`<project><parent><artifactId>${mod}</artifactId></parent></project>`,
+			);
+			const file = path.join(modDir, "Main.java");
+			fs.writeFileSync(file, "class Main {}\n");
+			moduleFiles.push(file);
+		}
+
+		const siblingDir = path.join(tmp, "sibling", "src", "main", "java");
+		fs.mkdirSync(siblingDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(tmp, "sibling", "pom.xml"),
+			"<project><artifactId>sibling</artifactId></project>",
+		);
+		const siblingFile = path.join(siblingDir, "Sibling.java");
+		fs.writeFileSync(siblingFile, "class Sibling {}\n");
+
+		const moduleRoots = await Promise.all(
+			moduleFiles.map((f) => JavaServer.root(f)),
+		);
+		expect(new Set(moduleRoots).size).toBe(1);
+		expect(moduleRoots[0]).toBe(tmp);
+
+		// The sibling pom is never declared in the parent's <modules>, so it stays
+		// its own independent root instead of being swept into the parent's server.
+		await expect(JavaServer.root(siblingFile)).resolves.toBe(
+			path.join(tmp, "sibling"),
+		);
+	});
+
+	it("JavaServer.root does not hoist a declared module chain above the session cwd", async () => {
+		const { JavaServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-maven-ceil-"));
+		dirs.push(tmp);
+
+		const parentDir = path.join(tmp, "parent");
+		fs.mkdirSync(parentDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(parentDir, "pom.xml"),
+			"<project><modules><module>module-a</module></modules></project>",
+		);
+		const moduleDir = path.join(parentDir, "module-a", "src", "main", "java");
+		fs.mkdirSync(moduleDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(parentDir, "module-a", "pom.xml"),
+			"<project><artifactId>module-a</artifactId></project>",
+		);
+		const file = path.join(moduleDir, "Main.java");
+		fs.writeFileSync(file, "class Main {}\n");
+
+		// Session cwd is the module itself: no room to hoist to the parent without
+		// crossing the session boundary.
+		process.chdir(path.join(parentDir, "module-a"));
+
+		await expect(JavaServer.root(file)).resolves.toBe(
+			path.join(parentDir, "module-a"),
+		);
+	});
+
+	it("RustServer.root hoists a nested crate whose members entry spans a gap directory (exact path)", async () => {
+		const { RustServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-cargo-nested-"));
+		dirs.push(tmp);
+
+		fs.writeFileSync(
+			path.join(tmp, "Cargo.toml"),
+			'[workspace]\nmembers = ["crates/foo"]\n',
+		);
+		// "crates" is a gap directory: it holds no Cargo.toml of its own, so the
+		// walk cursor climbs through it before reaching the workspace root. The
+		// `members` entry is relative to the WORKSPACE root, not to that gap
+		// directory (#1671 F1).
+		const crateDir = path.join(tmp, "crates", "foo");
+		fs.mkdirSync(path.join(crateDir, "src"), { recursive: true });
+		fs.writeFileSync(
+			path.join(crateDir, "Cargo.toml"),
+			'[package]\nname = "foo"\n',
+		);
+		const file = path.join(crateDir, "src", "lib.rs");
+		fs.writeFileSync(file, "pub fn x() {}\n");
+
+		await expect(RustServer.root(file)).resolves.toBe(tmp);
+	});
+
+	it("RustServer.root hoists a nested crate whose members entry spans a gap directory (glob)", async () => {
+		const { RustServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-cargo-nested-glob-"),
+		);
+		dirs.push(tmp);
+
+		fs.writeFileSync(
+			path.join(tmp, "Cargo.toml"),
+			'[workspace]\nmembers = ["crates/*"]\n',
+		);
+		const crateDir = path.join(tmp, "crates", "foo");
+		fs.mkdirSync(path.join(crateDir, "src"), { recursive: true });
+		fs.writeFileSync(
+			path.join(crateDir, "Cargo.toml"),
+			'[package]\nname = "foo"\n',
+		);
+		const file = path.join(crateDir, "src", "lib.rs");
+		fs.writeFileSync(file, "pub fn x() {}\n");
+
+		await expect(RustServer.root(file)).resolves.toBe(tmp);
+	});
+
+	it("RustServer.root treats a bare `*` members entry as claiming every direct workspace subdirectory", async () => {
+		const { RustServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-cargo-star-"));
+		dirs.push(tmp);
+
+		fs.writeFileSync(
+			path.join(tmp, "Cargo.toml"),
+			'[workspace]\nmembers = ["*"]\n',
+		);
+		const crateDir = path.join(tmp, "foo");
+		fs.mkdirSync(path.join(crateDir, "src"), { recursive: true });
+		fs.writeFileSync(
+			path.join(crateDir, "Cargo.toml"),
+			'[package]\nname = "foo"\n',
+		);
+		const file = path.join(crateDir, "src", "lib.rs");
+		fs.writeFileSync(file, "pub fn x() {}\n");
+
+		await expect(RustServer.root(file)).resolves.toBe(tmp);
+	});
+
+	it("RustServer.root matches a two-segment glob members entry (crates/*/*)", async () => {
+		const { RustServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-cargo-deepglob-"),
+		);
+		dirs.push(tmp);
+
+		fs.writeFileSync(
+			path.join(tmp, "Cargo.toml"),
+			'[workspace]\nmembers = ["crates/*/*"]\n',
+		);
+		const crateDir = path.join(tmp, "crates", "group-a", "foo");
+		fs.mkdirSync(path.join(crateDir, "src"), { recursive: true });
+		fs.writeFileSync(
+			path.join(crateDir, "Cargo.toml"),
+			'[package]\nname = "foo"\n',
+		);
+		const file = path.join(crateDir, "src", "lib.rs");
+		fs.writeFileSync(file, "pub fn x() {}\n");
+
+		await expect(RustServer.root(file)).resolves.toBe(tmp);
+	});
+
+	it("RustServer.root does not read a [package] exclude key above [workspace] as workspace membership", async () => {
+		const { RustServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-cargo-pkg-exclude-"),
+		);
+		dirs.push(tmp);
+
+		// The root crate's OWN [package] has a publish-time `exclude` key (a
+		// completely different concept from workspace membership) written above
+		// [workspace]. A whole-file regex would misread it as the workspace's
+		// exclude list and wrongly reject "crate-a" as excluded (#1671 F4).
+		fs.writeFileSync(
+			path.join(tmp, "Cargo.toml"),
+			[
+				"[package]",
+				'name = "root"',
+				'exclude = ["crate-a"]',
+				"",
+				"[workspace]",
+				'members = ["crate-a"]',
+			].join("\n"),
+		);
+		const crateDir = path.join(tmp, "crate-a");
+		fs.mkdirSync(path.join(crateDir, "src"), { recursive: true });
+		fs.writeFileSync(
+			path.join(crateDir, "Cargo.toml"),
+			'[package]\nname = "crate-a"\n',
+		);
+		const file = path.join(crateDir, "src", "lib.rs");
+		fs.writeFileSync(file, "pub fn x() {}\n");
+
+		await expect(RustServer.root(file)).resolves.toBe(tmp);
+	});
+
+	it("JavaServer.root hoists a module declared with a multi-segment path spanning a gap directory", async () => {
+		const { JavaServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-maven-nested-"));
+		dirs.push(tmp);
+
+		fs.writeFileSync(
+			path.join(tmp, "pom.xml"),
+			"<project><modules><module>sub/dir</module></modules></project>",
+		);
+		// "sub" is a gap directory with no pom.xml of its own — the declared
+		// module path spans it in one hop (#1671 F2).
+		const moduleDir = path.join(tmp, "sub", "dir", "src", "main", "java");
+		fs.mkdirSync(moduleDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(tmp, "sub", "dir", "pom.xml"),
+			"<project><artifactId>dir</artifactId></project>",
+		);
+		const file = path.join(moduleDir, "Main.java");
+		fs.writeFileSync(file, "class Main {}\n");
+
+		await expect(JavaServer.root(file)).resolves.toBe(tmp);
+	});
+
+	it("JavaServer.root does not hoist through a commented-out <module> entry", async () => {
+		const { JavaServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-maven-commented-"),
+		);
+		dirs.push(tmp);
+
+		fs.writeFileSync(
+			path.join(tmp, "pom.xml"),
+			[
+				"<project>",
+				"  <modules>",
+				"    <!-- <module>module-a</module> -->",
+				"  </modules>",
+				"</project>",
+			].join("\n"),
+		);
+		const moduleDir = path.join(tmp, "module-a", "src", "main", "java");
+		fs.mkdirSync(moduleDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(tmp, "module-a", "pom.xml"),
+			"<project><artifactId>module-a</artifactId></project>",
+		);
+		const file = path.join(moduleDir, "Main.java");
+		fs.writeFileSync(file, "class Main {}\n");
+
+		// The <module> entry is commented out — cargo/maven itself would not
+		// build it as part of the reactor, so pi-lens must not hoist to it
+		// either (#1671 F5).
+		await expect(JavaServer.root(file)).resolves.toBe(
+			path.join(tmp, "module-a"),
+		);
+	});
+});
+
 describe("zizmor LSP candidacy path gate (#636)", () => {
 	// zizmor's extension match is "any YAML" — the real filter that keeps it out
 	// of the candidate list for a guaranteed-no-op file (measured directly
@@ -1584,9 +1946,8 @@ describe("zizmor LSP candidacy path gate (#636)", () => {
 	// non-workflow YAML, so `waitForDiagnostics` would otherwise burn its full
 	// budget for zero signal) is `getServersForFileWithConfig`'s pathFilter gate.
 	it("includes zizmor as a candidate for a real GitHub Actions workflow file", async () => {
-		const { getServersForFileWithConfig } = await import(
-			"../../../clients/lsp/config.js"
-		);
+		const { getServersForFileWithConfig } =
+			await import("../../../clients/lsp/config.js");
 		const tmp = fs.mkdtempSync(
 			path.join(os.tmpdir(), "pi-lens-zizmor-candidacy-"),
 		);
@@ -1600,9 +1961,8 @@ describe("zizmor LSP candidacy path gate (#636)", () => {
 	});
 
 	it("excludes zizmor as a candidate for a plain, non-workflow YAML file", async () => {
-		const { getServersForFileWithConfig } = await import(
-			"../../../clients/lsp/config.js"
-		);
+		const { getServersForFileWithConfig } =
+			await import("../../../clients/lsp/config.js");
 		const tmp = fs.mkdtempSync(
 			path.join(os.tmpdir(), "pi-lens-zizmor-candidacy-"),
 		);

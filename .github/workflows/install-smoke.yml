@@ -123,9 +123,11 @@ jobs:
           esac
           # Record the installed layout for debugging (hoisted vs symlink store)
           echo "--- node_modules/pi-lens ---"
-          ls -la node_modules/pi-lens >/dev/null 2>&1 && \
-            { readlink node_modules/pi-lens || echo "(real dir)"; } || \
+          if ls -la node_modules/pi-lens >/dev/null 2>&1; then
+            readlink node_modules/pi-lens || echo "(real dir)"
+          else
             find . -maxdepth 4 -name pi-lens -type d | head
+          fi
 
       - name: Selftest under bun (strictest resolver)
         shell: bash

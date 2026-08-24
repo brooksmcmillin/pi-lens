@@ -10,7 +10,10 @@ export const asyncUnnecessaryWrapperRule: FactRule = {
 	},
 	evaluate(ctx, store) {
 		const fns =
-			store.getFileFact<FunctionSummary[]>(ctx.filePath, "file.functionSummaries") ?? [];
+			store.getFileFact<FunctionSummary[]>(
+				ctx.filePath,
+				"file.functionSummaries",
+			) ?? [];
 
 		const diagnostics: Diagnostic[] = [];
 

@@ -18,9 +18,9 @@ describe("hasStructuralIntent", () => {
 
 	it("returns true for nodeKind and recursive descendant intent", () => {
 		expect(hasStructuralIntent({ nodeKind: "call_expression" })).toBe(true);
-		expect(
-			hasStructuralIntent({ hasDescendantKind: "await_expression" }),
-		).toBe(true);
+		expect(hasStructuralIntent({ hasDescendantKind: "await_expression" })).toBe(
+			true,
+		);
 	});
 
 	it("returns true for hasKind", () => {

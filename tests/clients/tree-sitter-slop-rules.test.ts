@@ -37,7 +37,10 @@ describe("slop detection rules", () => {
 		it("flags JSONResponse imported from requests", async () => {
 			const client = getSharedTreeSitterClient()!;
 			const query = await getQuery("python-hallucinated-import");
-			const filePath = writeTempFile("py", `from requests import JSONResponse\n`);
+			const filePath = writeTempFile(
+				"py",
+				`from requests import JSONResponse\n`,
+			);
 			const matches = await client.runQueryOnFile(query, filePath, "python");
 			expect(matches.length).toBeGreaterThan(0);
 		});
@@ -69,7 +72,10 @@ describe("slop detection rules", () => {
 		it("does not flag correct dataclass import", async () => {
 			const client = getSharedTreeSitterClient()!;
 			const query = await getQuery("python-hallucinated-import");
-			const filePath = writeTempFile("py", `from dataclasses import dataclass\n`);
+			const filePath = writeTempFile(
+				"py",
+				`from dataclasses import dataclass\n`,
+			);
 			const matches = await client.runQueryOnFile(query, filePath, "python");
 			expect(matches.length).toBe(0);
 		});
@@ -103,7 +109,10 @@ describe("slop detection rules", () => {
 		it("flags .forEach() (JavaScript idiom)", async () => {
 			const client = getSharedTreeSitterClient()!;
 			const query = await getQuery("python-cross-language-method");
-			const filePath = writeTempFile("py", `items.forEach(lambda x: print(x))\n`);
+			const filePath = writeTempFile(
+				"py",
+				`items.forEach(lambda x: print(x))\n`,
+			);
 			const matches = await client.runQueryOnFile(query, filePath, "python");
 			expect(matches.length).toBeGreaterThan(0);
 		});
@@ -129,40 +138,75 @@ describe("slop detection rules", () => {
 		it("flags useRouter imported from react", async () => {
 			const client = getSharedTreeSitterClient()!;
 			const query = await getQuery("ts-hallucinated-react-import");
-			const filePath = writeTempFile("ts", `import { useRouter } from 'react';\n`);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const filePath = writeTempFile(
+				"ts",
+				`import { useRouter } from 'react';\n`,
+			);
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBeGreaterThan(0);
 		});
 
 		it("flags Link imported from react", async () => {
 			const client = getSharedTreeSitterClient()!;
 			const query = await getQuery("ts-hallucinated-react-import");
-			const filePath = writeTempFile("ts", `import { Link, Image } from 'react';\n`);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const filePath = writeTempFile(
+				"ts",
+				`import { Link, Image } from 'react';\n`,
+			);
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBeGreaterThan(0);
 		});
 
 		it("flags getServerSideProps imported from react", async () => {
 			const client = getSharedTreeSitterClient()!;
 			const query = await getQuery("ts-hallucinated-react-import");
-			const filePath = writeTempFile("ts", `import { getServerSideProps } from 'react';\n`);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const filePath = writeTempFile(
+				"ts",
+				`import { getServerSideProps } from 'react';\n`,
+			);
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBeGreaterThan(0);
 		});
 
 		it("does not flag useState imported from react", async () => {
 			const client = getSharedTreeSitterClient()!;
 			const query = await getQuery("ts-hallucinated-react-import");
-			const filePath = writeTempFile("ts", `import { useState, useEffect } from 'react';\n`);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const filePath = writeTempFile(
+				"ts",
+				`import { useState, useEffect } from 'react';\n`,
+			);
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBe(0);
 		});
 
 		it("does not flag useRouter from next/navigation", async () => {
 			const client = getSharedTreeSitterClient()!;
 			const query = await getQuery("ts-hallucinated-react-import");
-			const filePath = writeTempFile("ts", `import { useRouter } from 'next/navigation';\n`);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const filePath = writeTempFile(
+				"ts",
+				`import { useRouter } from 'next/navigation';\n`,
+			);
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBe(0);
 		});
 	});
@@ -171,16 +215,30 @@ describe("slop detection rules", () => {
 		it("flags setState inside a for-of loop", async () => {
 			const client = getSharedTreeSitterClient()!;
 			const query = await getQuery("ts-react-antipatterns");
-			const filePath = writeTempFile("ts", `for (const item of items) {\n  setCount(count + 1);\n}\n`);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const filePath = writeTempFile(
+				"ts",
+				`for (const item of items) {\n  setCount(count + 1);\n}\n`,
+			);
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBeGreaterThan(0);
 		});
 
 		it("flags setState inside a while loop", async () => {
 			const client = getSharedTreeSitterClient()!;
 			const query = await getQuery("ts-react-antipatterns");
-			const filePath = writeTempFile("ts", `while (i < items.length) {\n  setItems([...items, i]);\n  i++;\n}\n`);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const filePath = writeTempFile(
+				"ts",
+				`while (i < items.length) {\n  setItems([...items, i]);\n  i++;\n}\n`,
+			);
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBeGreaterThan(0);
 		});
 
@@ -188,7 +246,11 @@ describe("slop detection rules", () => {
 			const client = getSharedTreeSitterClient()!;
 			const query = await getQuery("ts-react-antipatterns");
 			const filePath = writeTempFile("ts", `setCount(items.length);\n`);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBe(0);
 		});
 
@@ -199,7 +261,11 @@ describe("slop detection rules", () => {
 				"ts",
 				`while (writing) { await new Promise(r => setTimeout(r, 10)); }`,
 			);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBe(0);
 		});
 
@@ -210,12 +276,16 @@ describe("slop detection rules", () => {
 				"ts",
 				`for (const x of items) { setInterval(() => {}, 100); }`,
 			);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBe(0);
 		});
 	});
 
-		describe("unsafe-regex", () => {
+	describe("unsafe-regex", () => {
 		it("is advisory rather than blocking", async () => {
 			const query = await getQuery("unsafe-regex");
 			expect(query.severity).toBe("warning");
@@ -230,7 +300,11 @@ describe("slop detection rules", () => {
 				`const alternation = markers.map((m) => escapeRegExp(m).replace(/\\\\s+/g, "\\\\s+")).join("|");
 				const r = new RegExp(\`\\\\b(\${alternation})\\\\b\`, "gi");`,
 			);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches).toHaveLength(0);
 		});
 
@@ -242,7 +316,11 @@ describe("slop detection rules", () => {
 				`const alternation: string = markers.map((m) => escapeRegExp(m)).join("|");
 				const r = new RegExp(\`\b(\${alternation})\b\`, "gi");`,
 			);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches).toHaveLength(0);
 		});
 
@@ -255,7 +333,11 @@ describe("slop detection rules", () => {
 				alternation = req.query.q;
 				const r = new RegExp(\`\${alternation}\`, "gi");`,
 			);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBeGreaterThan(0);
 		});
 
@@ -267,7 +349,11 @@ describe("slop detection rules", () => {
 				`function build(pat: string) { return new RegExp(\`\${pat}\`); }
 				const pat = escapeRegExp(seed);`,
 			);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBeGreaterThan(0);
 		});
 
@@ -279,7 +365,11 @@ describe("slop detection rules", () => {
 				`const pat = userInput.replace("a", "b");
 				const r = new RegExp(\`\${pat}\`);`,
 			);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBeGreaterThan(0);
 		});
 
@@ -290,7 +380,11 @@ describe("slop detection rules", () => {
 				"ts",
 				"const r = new RegExp(`\\\\b${userInput}\\\\b`, 'gi');",
 			);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBeGreaterThan(0);
 		});
 
@@ -301,7 +395,11 @@ describe("slop detection rules", () => {
 				"ts",
 				"const r = new RegExp(`^${escapeRegExp(sep)}$`);",
 			);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBe(0);
 		});
 
@@ -312,7 +410,11 @@ describe("slop detection rules", () => {
 				"ts",
 				"const r = new RegExp(`^${escaped}$`, 'i');",
 			);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBe(0);
 		});
 
@@ -323,7 +425,11 @@ describe("slop detection rules", () => {
 				"ts",
 				"const r = new RegExp(`^${pat.replace(/\\./g, '\\\\.').replace(/\\*/g, '.*')}$`);",
 			);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBe(0);
 		});
 	});
@@ -336,7 +442,11 @@ describe("slop detection rules", () => {
 				"ts",
 				`function makeD(id: string, rule: string, filePath: string, line: number, col: number, message: string) {}`,
 			);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBeGreaterThan(0);
 		});
 
@@ -347,7 +457,11 @@ describe("slop detection rules", () => {
 				"ts",
 				`function open(state: S, file: string, content: string, lang: string, preserveDiags?: boolean, silent?: boolean): void {}`,
 			);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBe(0);
 		});
 
@@ -358,7 +472,11 @@ describe("slop detection rules", () => {
 				"ts",
 				`function create(path: string, cwd: string, api: API, facts: F, blocking = false, ranges = []) {}`,
 			);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBe(0);
 		});
 	});
@@ -368,7 +486,11 @@ describe("slop detection rules", () => {
 			const client = getSharedTreeSitterClient()!;
 			const query = await getQuery("ts-xss-dom-sink");
 			const filePath = writeTempFile("ts", `el.innerHTML = userInput;\n`);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBeGreaterThan(0);
 		});
 
@@ -376,7 +498,11 @@ describe("slop detection rules", () => {
 			const client = getSharedTreeSitterClient()!;
 			const query = await getQuery("ts-xss-dom-sink");
 			const filePath = writeTempFile("ts", `el.outerHTML = getData();\n`);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBeGreaterThan(0);
 		});
 
@@ -384,7 +510,11 @@ describe("slop detection rules", () => {
 			const client = getSharedTreeSitterClient()!;
 			const query = await getQuery("ts-xss-dom-sink");
 			const filePath = writeTempFile("ts", `document.write(content);\n`);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBeGreaterThan(0);
 		});
 
@@ -392,7 +522,11 @@ describe("slop detection rules", () => {
 			const client = getSharedTreeSitterClient()!;
 			const query = await getQuery("ts-xss-dom-sink");
 			const filePath = writeTempFile("ts", `el.innerHTML = "<b>safe</b>";\n`);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBe(0);
 		});
 
@@ -400,7 +534,11 @@ describe("slop detection rules", () => {
 			const client = getSharedTreeSitterClient()!;
 			const query = await getQuery("ts-xss-dom-sink");
 			const filePath = writeTempFile("ts", `el.textContent = userInput;\n`);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBe(0);
 		});
 	});
@@ -409,16 +547,30 @@ describe("slop detection rules", () => {
 		it("flags require(identifier)", async () => {
 			const client = getSharedTreeSitterClient()!;
 			const query = await getQuery("ts-dynamic-require");
-			const filePath = writeTempFile("ts", `const mod = require(pluginName);\n`);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const filePath = writeTempFile(
+				"ts",
+				`const mod = require(pluginName);\n`,
+			);
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBeGreaterThan(0);
 		});
 
 		it("flags require(member expression)", async () => {
 			const client = getSharedTreeSitterClient()!;
 			const query = await getQuery("ts-dynamic-require");
-			const filePath = writeTempFile("ts", `const lib = require(config.libPath);\n`);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const filePath = writeTempFile(
+				"ts",
+				`const lib = require(config.libPath);\n`,
+			);
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBeGreaterThan(0);
 		});
 
@@ -426,7 +578,11 @@ describe("slop detection rules", () => {
 			const client = getSharedTreeSitterClient()!;
 			const query = await getQuery("ts-dynamic-require");
 			const filePath = writeTempFile("ts", `const mod = require("./utils");\n`);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBe(0);
 		});
 	});
@@ -435,24 +591,45 @@ describe("slop detection rules", () => {
 		it("flags res.redirect(variable)", async () => {
 			const client = getSharedTreeSitterClient()!;
 			const query = await getQuery("ts-open-redirect");
-			const filePath = writeTempFile("ts", `res.redirect(req.query.returnUrl);\n`);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const filePath = writeTempFile(
+				"ts",
+				`res.redirect(req.query.returnUrl);\n`,
+			);
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBeGreaterThan(0);
 		});
 
 		it("flags response.redirect(call expression)", async () => {
 			const client = getSharedTreeSitterClient()!;
 			const query = await getQuery("ts-open-redirect");
-			const filePath = writeTempFile("ts", `response.redirect(getRedirectUrl());\n`);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const filePath = writeTempFile(
+				"ts",
+				`response.redirect(getRedirectUrl());\n`,
+			);
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBeGreaterThan(0);
 		});
 
 		it("flags window.location.href = variable", async () => {
 			const client = getSharedTreeSitterClient()!;
 			const query = await getQuery("ts-open-redirect");
-			const filePath = writeTempFile("ts", `window.location.href = userInput;\n`);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const filePath = writeTempFile(
+				"ts",
+				`window.location.href = userInput;\n`,
+			);
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBeGreaterThan(0);
 		});
 
@@ -460,7 +637,11 @@ describe("slop detection rules", () => {
 			const client = getSharedTreeSitterClient()!;
 			const query = await getQuery("ts-open-redirect");
 			const filePath = writeTempFile("ts", `res.redirect("/home");\n`);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBe(0);
 		});
 	});
@@ -473,7 +654,11 @@ describe("slop detection rules", () => {
 				"ts",
 				`db.users.find({ $where: "this.name == '" + name + "'" });\n`,
 			);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBeGreaterThan(0);
 		});
 
@@ -484,7 +669,11 @@ describe("slop detection rules", () => {
 				"ts",
 				`collection.find({ "$where": \`this.credits > 0\` });\n`,
 			);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBeGreaterThan(0);
 		});
 
@@ -495,7 +684,11 @@ describe("slop detection rules", () => {
 				"ts",
 				`db.users.find({ name: userName, active: true });\n`,
 			);
-			const matches = await client.runQueryOnFile(query, filePath, "typescript");
+			const matches = await client.runQueryOnFile(
+				query,
+				filePath,
+				"typescript",
+			);
 			expect(matches.length).toBe(0);
 		});
 	});

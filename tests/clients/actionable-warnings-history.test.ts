@@ -104,8 +104,7 @@ function makeReport(args: {
 			files: warningFiles.size,
 			actions: args.warnings.reduce((n, w) => n + (w.actions?.length ?? 0), 0),
 			autoFixEligible: args.warnings.reduce(
-				(n, w) =>
-					n + (w.actions ?? []).filter((a) => a.autoFixEligible).length,
+				(n, w) => n + (w.actions ?? []).filter((a) => a.autoFixEligible).length,
 				0,
 			),
 		},
@@ -188,9 +187,7 @@ describe("appendActionableWarningsHistory (#1 — actionable warnings rolling js
 		expect(path.dirname(aw).endsWith(".pi-lens")).toBe(false);
 		// Both jsonls share the project data dir.
 		expect(path.dirname(aw)).toBe(
-			path.dirname(
-				path.join(path.dirname(aw), "code-quality-warnings.jsonl"),
-			),
+			path.dirname(path.join(path.dirname(aw), "code-quality-warnings.jsonl")),
 		);
 	});
 });

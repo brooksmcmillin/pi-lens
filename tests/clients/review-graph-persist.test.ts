@@ -168,11 +168,7 @@ describe("review-graph persist circuit-breaker (#260)", () => {
 
 	it("size cap: persists an honestly-marked useful partial graph", async () => {
 		const env = makeEnv();
-		createTempFile(
-			env.tmpDir,
-			"a.test.ts",
-			"export const fixtureOnly = 1;\n",
-		);
+		createTempFile(env.tmpDir, "a.test.ts", "export const fixtureOnly = 1;\n");
 		createTempFile(
 			env.tmpDir,
 			"a.ts",

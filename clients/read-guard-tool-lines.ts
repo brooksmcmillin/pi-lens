@@ -101,14 +101,21 @@ function tokenSimilarity(a: string, b: string): number {
 function findSimilarLines(
 	content: string,
 	target: string,
-	options: { nearLine?: number; window?: number; max?: number; minScore?: number } = {},
+	options: {
+		nearLine?: number;
+		window?: number;
+		max?: number;
+		minScore?: number;
+	} = {},
 ): Array<{ line: number; score: number }> {
 	const { nearLine, window = 60, max = 3, minScore = 0.5 } = options;
 	const needle = target.trim();
 	if (needle.length < 4) return [];
 	const lines = content.split("\n");
 	const start = nearLine ? Math.max(0, nearLine - 1 - window) : 0;
-	const end = nearLine ? Math.min(lines.length, nearLine - 1 + window) : lines.length;
+	const end = nearLine
+		? Math.min(lines.length, nearLine - 1 + window)
+		: lines.length;
 	const scored: Array<{ line: number; score: number }> = [];
 	for (let i = start; i < end; i += 1) {
 		const text = lines[i];
@@ -138,7 +145,8 @@ function formatSimilarLines(
 	const rawLines = rawLineAligned.split("\n");
 	const pad = (n: number) => String(n).padStart(4, " ");
 	const rows = suggestions.map(
-		({ line }) => `      ${pad(line)} │ ${(rawLines[line - 1] ?? "").trimEnd()}`,
+		({ line }) =>
+			`      ${pad(line)} │ ${(rawLines[line - 1] ?? "").trimEnd()}`,
 	);
 	return `\n\nDid you mean one of these current lines?\n${rows.join("\n")}`;
 }
@@ -252,10 +260,12 @@ function resolveHashlineEditInput(
 		const editBatchSummary = createReadGuardEditBatchSummary({
 			requestedIndexes: boundedIndexesForCount(operations.length),
 			requestedTotal: operations.length,
-			rejectedReasons: boundedIndexesForCount(operations.length).map((index) => ({
-				index,
-				code: "preflight_blocked" as const,
-			})),
+			rejectedReasons: boundedIndexesForCount(operations.length).map(
+				(index) => ({
+					index,
+					code: "preflight_blocked" as const,
+				}),
+			),
 			rejectedTotal: operations.length,
 			durationMs: 0,
 			terminalStatus: "blocked",
@@ -340,22 +350,28 @@ function formatOccurrenceContext(
 	const blocks = shown.map((startLine) => {
 		const endLine = startLine + matchSpanLines - 1;
 		const before = startLine > 1 ? fileLines[startLine - 2] : undefined;
-		const after =
-			endLine < fileLines.length ? fileLines[endLine] : undefined;
+		const after = endLine < fileLines.length ? fileLines[endLine] : undefined;
 		const lines: string[] = [`  • Line ${startLine}:`];
 		if (before !== undefined)
 			lines.push(`      ${pad(startLine - 1)} │ ${before}`);
 		if (matchSpanLines === 1) {
-			lines.push(`      ${pad(startLine)} │ ${fileLines[startLine - 1] ?? ""}  ← match`);
+			lines.push(
+				`      ${pad(startLine)} │ ${fileLines[startLine - 1] ?? ""}  ← match`,
+			);
 		} else {
-			lines.push(`      ${pad(startLine)} │ ${fileLines[startLine - 1] ?? ""}  ← match start`);
+			lines.push(
+				`      ${pad(startLine)} │ ${fileLines[startLine - 1] ?? ""}  ← match start`,
+			);
 			if (matchSpanLines > 2) {
-				lines.push(`      ${pad(0)} │ … (${matchSpanLines - 2} more line${matchSpanLines - 2 === 1 ? "" : "s"})`);
+				lines.push(
+					`      ${pad(0)} │ … (${matchSpanLines - 2} more line${matchSpanLines - 2 === 1 ? "" : "s"})`,
+				);
 			}
-			lines.push(`      ${pad(endLine)} │ ${fileLines[endLine - 1] ?? ""}  ← match end`);
+			lines.push(
+				`      ${pad(endLine)} │ ${fileLines[endLine - 1] ?? ""}  ← match end`,
+			);
 		}
-		if (after !== undefined)
-			lines.push(`      ${pad(endLine + 1)} │ ${after}`);
+		if (after !== undefined) lines.push(`      ${pad(endLine + 1)} │ ${after}`);
 		return lines.join("\n");
 	});
 	const tail =
@@ -966,7 +982,10 @@ function findBlankLineInsensitiveCandidate(
 		let end = start;
 		let ok = true;
 		while (oldIdx < oldNonBlank.length) {
-			while (contentIdx < contentLines.length && isBlank(contentLines[contentIdx]))
+			while (
+				contentIdx < contentLines.length &&
+				isBlank(contentLines[contentIdx])
+			)
 				contentIdx += 1;
 			if (
 				contentIdx >= contentLines.length ||

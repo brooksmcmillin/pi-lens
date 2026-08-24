@@ -140,7 +140,10 @@ export function _resetUntrackedIgnoredCacheForTests(): void {
  * to today's pattern-only behavior for that root, consistent with the
  * fail-open contract elsewhere in this module.
  */
-export function parseTrackedFilesOutput(stdout: string, cwd: string): Set<string> {
+export function parseTrackedFilesOutput(
+	stdout: string,
+	cwd: string,
+): Set<string> {
 	const ids = new Set<string>();
 	const base = normalizeMapKey(cwd);
 	for (const line of stdout.split(/\r?\n/)) {
@@ -200,7 +203,8 @@ export function collectTrackedFiles(
 	const key = normalizeEphemeralMapKey(cwd);
 	const now = Date.now();
 	for (const [snapshotKey, entry] of _trackedCache) {
-		if (now - entry.fetchedAtMs >= CACHE_TTL_MS) _trackedSnapshot.delete(snapshotKey);
+		if (now - entry.fetchedAtMs >= CACHE_TTL_MS)
+			_trackedSnapshot.delete(snapshotKey);
 	}
 	const cached = _trackedCache.get(key);
 	if (cached && now - cached.fetchedAtMs < CACHE_TTL_MS) return cached.promise;
@@ -222,7 +226,9 @@ export function collectTrackedFiles(
  * (file-utils.ts's `isTrackedAndRescued`), so this key MUST stay the cheap
  * `normalizeEphemeralMapKey` fold, not a realpath.
  */
-export function getTrackedFilesSnapshot(cwd: string): ReadonlySet<string> | undefined {
+export function getTrackedFilesSnapshot(
+	cwd: string,
+): ReadonlySet<string> | undefined {
 	return _trackedSnapshot.get(normalizeEphemeralMapKey(cwd));
 }
 

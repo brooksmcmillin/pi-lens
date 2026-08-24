@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { withEnv } from "../../support/with-env.js";
 
-vi.unmock("../../../clients/installer/index.ts");
+vi.unmock("../../../clients/installer/index.js");
 
 // This file deliberately exercises the REAL getGlobalPiLensDir() resolver
 // (via the node:os mock below forcing TEST_HOME) rather than #525's
@@ -110,6 +111,19 @@ vi.mock("node:fs/promises", () => ({
 	rm: mockFsRm,
 }));
 
+// #1609: the installer's npm-tool package.json bootstrap now goes through
+// the shared atomic tmp+rename seam instead of a raw `fs.writeFile`, so it
+// must be mocked here too — otherwise it falls through to the REAL node:fs
+// (atomic-write.ts imports `node:fs` directly, not this mocked
+// `node:fs/promises`), which fails writing into this test's mocked,
+// non-existent-on-disk tools directory.
+const mockWriteFileAtomicAsync = vi.hoisted(() =>
+	vi.fn().mockResolvedValue(undefined),
+);
+vi.mock("../../../clients/atomic-write.js", () => ({
+	writeFileAtomicAsync: mockWriteFileAtomicAsync,
+}));
+
 // ── child_process spawn mock ────────────────────────────────────────────
 const spawnCalls = vi.hoisted(
 	() => [] as Array<{ cmd: string; args: string[] }>,
@@ -138,6 +152,20 @@ const mockSpawn = vi.hoisted(() =>
 
 vi.mock("node:child_process", () => ({ spawn: mockSpawn }));
 
+// #2015: verifyToolBinary probes (and installNpmTool's npm-install spawn)
+// route through `safeSpawnAsync`, so this file mocks that seam directly and
+// records every invocation into the same `spawnCalls` log the raw-spawn mock
+// above feeds. Probes and installs both answer success; tests that need a
+// failure simulate it at their own seams (network, fs access).
+vi.mock("../../../clients/safe-spawn.js", () => ({
+	safeSpawn: vi.fn(() => ({ stdout: "", stderr: "", status: 0 })),
+	safeSpawnAsync: async (command: string, args: string[]) => {
+		spawnCalls.push({ cmd: String(command), args: args ?? [] });
+		return { stdout: "", stderr: "", status: 0 };
+	},
+	resetSafeSpawnWindowsCommandCache: vi.fn(),
+}));
+
 // ── https mock ──────────────────────────────────────────────────────────
 // Keep the suite hermetic: installTool's github path does a real GitHub API
 // fetch via node:https. Without this mock the install tests depend on the
@@ -164,7 +192,10 @@ const mockHttpsGet = vi.hoisted(() => (url: unknown) => {
 	};
 	return req;
 });
-vi.mock("node:https", () => ({ default: { get: mockHttpsGet }, get: mockHttpsGet }));
+vi.mock("node:https", () => ({
+	default: { get: mockHttpsGet },
+	get: mockHttpsGet,
+}));
 
 // #1276: `finishInstallAttempt` calls this on a successful install, mirroring
 // `resetSafeSpawnWindowsCommandCache` right above it. Mocked so the wiring
@@ -182,7 +213,7 @@ import {
 	ensureTool,
 	getToolPath,
 	resetProbeCacheStateForTesting,
-} from "../../../clients/installer/index.ts";
+} from "../../../clients/installer/index.js";
 
 // ── helpers ─────────────────────────────────────────────────────────────
 
@@ -227,8 +258,16 @@ async function withEmptyPath<T>(fn: () => Promise<T>): Promise<T> {
 // against the mocked TEST_HOME as originally intended.
 const savedPiLensHome = process.env.PI_LENS_HOME;
 
+// #1816: this file's `afterEach` used to hard-restore the literal "1"
+// instead of whatever was ambient before the file ran — correct only by
+// coincidence (vitest-setup.ts's own default). `withEnv` restores the real
+// prior value.
+let restoreDisableToolInstall: () => void;
+
 beforeEach(() => {
-	delete process.env.PI_LENS_DISABLE_TOOL_INSTALL;
+	restoreDisableToolInstall = withEnv({
+		PI_LENS_DISABLE_TOOL_INSTALL: undefined,
+	});
 	delete process.env.PI_LENS_HOME;
 	vi.clearAllMocks();
 	spawnCalls.length = 0;
@@ -241,7 +280,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-	process.env.PI_LENS_DISABLE_TOOL_INSTALL = "1";
+	restoreDisableToolInstall();
 	delete process.env.PI_LENS_TEST_PLATFORM;
 	delete process.env.PI_LENS_TEST_MODE;
 	delete process.env.PI_LENS_TEST_NPM_SCRIPT;
@@ -455,9 +494,8 @@ describe("ensureTool allowInstall policy", () => {
 
 describe("ensureTool force-reinstall", () => {
 	it("does not return the stale cached path after forceReinstall", async () => {
-		const { updateProbeCache } = await import(
-			"../../../clients/installer/index.ts"
-		);
+		const { updateProbeCache } =
+			await import("../../../clients/installer/index.js");
 		// Use a path that can't collide with a real tool on PATH
 		const stalePath = "/fake/stale/rust-analyzer";
 

@@ -98,7 +98,8 @@ export function suspendAt<T extends (...args: any[]) => any>(
 		}
 		calls++;
 		const callNumber = calls;
-		if (callNumber <= (options.calls ?? Number.POSITIVE_INFINITY)) await released;
+		if (callNumber <= (options.calls ?? Number.POSITIVE_INFINITY))
+			await released;
 		try {
 			return implementation ? await implementation(...args) : undefined;
 		} finally {

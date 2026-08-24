@@ -6,50 +6,50 @@ import type { DispatchContext } from "../../../../clients/dispatch/types.js";
 import type { FileKind } from "../../../../clients/file-kinds.js";
 
 function makeCtx(filePath: string, facts: FactStore): DispatchContext {
-  return {
-    filePath,
-    cwd: "/tmp",
-    kind: "jsts" as FileKind,
+	return {
+		filePath,
+		cwd: "/tmp",
+		kind: "jsts" as FileKind,
 		fileRole: "source",
 		pi: { getFlag: () => undefined },
 		autofix: false,
 		deltaMode: false,
 		facts,
-    hasTool: async () => false,
-    log: () => {},
-  };
+		hasTool: async () => false,
+		log: () => {},
+	};
 }
 
 describe("placeholderCommentsRule", () => {
-  it("flags placeholder AI-style comments", async () => {
-    const filePath = "/tmp/comments.ts";
-    const content = `
+	it("flags placeholder AI-style comments", async () => {
+		const filePath = "/tmp/comments.ts";
+		const content = `
 // add more validation here
 const x = 1;
 `;
-    const facts = new FactStore();
-    const ctx = makeCtx(filePath, facts);
-    facts.setFileFact(filePath, "file.content", content);
-    await commentFactProvider.run(ctx, facts);
+		const facts = new FactStore();
+		const ctx = makeCtx(filePath, facts);
+		facts.setFileFact(filePath, "file.content", content);
+		await commentFactProvider.run(ctx, facts);
 
-    const diagnostics = placeholderCommentsRule.evaluate(ctx, facts);
-    expect(diagnostics).toHaveLength(1);
-    expect(diagnostics[0].rule).toBe("placeholder-comments");
-  });
+		const diagnostics = placeholderCommentsRule.evaluate(ctx, facts);
+		expect(diagnostics).toHaveLength(1);
+		expect(diagnostics[0].rule).toBe("placeholder-comments");
+	});
 
-  it("does not flag ordinary TODO or descriptive comments", async () => {
-    const filePath = "/tmp/comments-ok.ts";
-    const content = `
+	it("does not flag ordinary TODO or descriptive comments", async () => {
+		const filePath = "/tmp/comments-ok.ts";
+		const content = `
 // TODO: fix later
 // Processes payment batches.
 const y = 2;
 `;
-    const facts = new FactStore();
-    const ctx = makeCtx(filePath, facts);
-    facts.setFileFact(filePath, "file.content", content);
-    await commentFactProvider.run(ctx, facts);
+		const facts = new FactStore();
+		const ctx = makeCtx(filePath, facts);
+		facts.setFileFact(filePath, "file.content", content);
+		await commentFactProvider.run(ctx, facts);
 
-    const diagnostics = placeholderCommentsRule.evaluate(ctx, facts);
-    expect(diagnostics).toHaveLength(0);
-  });
+		const diagnostics = placeholderCommentsRule.evaluate(ctx, facts);
+		expect(diagnostics).toHaveLength(0);
+	});
 });

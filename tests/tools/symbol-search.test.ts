@@ -6,7 +6,10 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { FactStore } from "../../clients/dispatch/fact-store.js";
-import { PROJECT_SNAPSHOT_VERSION, saveProjectSnapshot } from "../../clients/project-snapshot.js";
+import {
+	PROJECT_SNAPSHOT_VERSION,
+	saveProjectSnapshot,
+} from "../../clients/project-snapshot.js";
 import {
 	buildOrUpdateGraph,
 	clearReviewGraphWorkspaceCache,
@@ -44,7 +47,6 @@ function warmWordIndexSnapshot(
 		cachedExports: [],
 		wordIndex: serializeWordIndex(index),
 	});
-
 }
 
 describe("symbol_search tool", () => {
@@ -94,13 +96,19 @@ describe("symbol_search tool", () => {
 				{ cwd: env.tmpDir },
 			);
 			expect(result.isError).toBe(true);
-			expect(result.details).toMatchObject({ available: false, query: "authenticate user" });
-			expect(String((result.details as { hint?: string }).hint)).toMatch(/background|retry/i);
+			expect(result.details).toMatchObject({
+				available: false,
+				query: "authenticate user",
+			});
+			expect(String((result.details as { hint?: string }).hint)).toMatch(
+				/background|retry/i,
+			);
 			expect(String(result.content[0]?.text)).toMatch(/background|retry/i);
 
 			// The cold query kicked off a bounded background build (#348 decision 3) —
 			// never blocking THIS call, but the index should show up shortly after.
-			const { loadProjectSnapshot } = await import("../../clients/project-snapshot.js");
+			const { loadProjectSnapshot } =
+				await import("../../clients/project-snapshot.js");
 			await vi.waitFor(
 				() => {
 					const snapshot = loadProjectSnapshot(env.tmpDir);
@@ -117,7 +125,11 @@ describe("symbol_search tool", () => {
 		const env = setupTestEnvironment("pi-lens-symbolsearch-failed-");
 		const previousDataDir = process.env.PILENS_DATA_DIR;
 		try {
-			createTempFile(env.tmpDir, "src/auth.ts", "export const authenticate = true;");
+			createTempFile(
+				env.tmpDir,
+				"src/auth.ts",
+				"export const authenticate = true;",
+			);
 			process.env.PILENS_DATA_DIR = createTempFile(
 				env.tmpDir,
 				"occupied-data-root",
@@ -140,7 +152,9 @@ describe("symbol_search tool", () => {
 				available: false,
 				unavailableReason: "last-build-failed",
 			});
-			expect(String(result.content[0]?.text)).toMatch(/last word index build failed/i);
+			expect(String(result.content[0]?.text)).toMatch(
+				/last word index build failed/i,
+			);
 		} finally {
 			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
 			else process.env.PILENS_DATA_DIR = previousDataDir;
@@ -157,7 +171,10 @@ describe("symbol_search tool", () => {
 				"export function authenticateUser(id) {\n  return id;\n}\n",
 			);
 			const index = buildWordIndex([
-				{ path: authFile, content: "export function authenticateUser(id) {\n  return id;\n}\n" },
+				{
+					path: authFile,
+					content: "export function authenticateUser(id) {\n  return id;\n}\n",
+				},
 			]);
 			saveProjectSnapshot(env.tmpDir, {
 				version: PROJECT_SNAPSHOT_VERSION,
@@ -259,7 +276,10 @@ describe("symbol_search tool", () => {
 				"def authenticate_user(id):\n    return id\n",
 			);
 			warmWordIndexSnapshot(env.tmpDir, [
-				{ path: tsFile, content: "export function authenticateUser(id) { return id; }" },
+				{
+					path: tsFile,
+					content: "export function authenticateUser(id) { return id; }",
+				},
 				{
 					path: pyFile,
 					content: "def authenticate_user(id):\n    return id\n",
@@ -284,9 +304,9 @@ describe("symbol_search tool", () => {
 				const payload = JSON.parse(text.slice(text.indexOf("{"))) as {
 					results: Array<{ file: string }>;
 				};
-				expect(payload.results.map((r) => r.file.replace(/\\/g, "/")).sort()).toEqual(
-					["scripts/authenticate.py", "src/auth/login.ts"].sort(),
-				);
+				expect(
+					payload.results.map((r) => r.file.replace(/\\/g, "/")).sort(),
+				).toEqual(["scripts/authenticate.py", "src/auth/login.ts"].sort());
 			} finally {
 				env.cleanup();
 			}
@@ -334,7 +354,9 @@ describe("symbol_search tool", () => {
 					results: Array<{ file: string }>;
 				};
 				expect(payload.results).toHaveLength(1);
-				expect(payload.results[0].file.replace(/\\/g, "/")).toBe("src/auth/login.ts");
+				expect(payload.results[0].file.replace(/\\/g, "/")).toBe(
+					"src/auth/login.ts",
+				);
 			} finally {
 				env.cleanup();
 			}
@@ -389,7 +411,10 @@ describe("symbol_search tool", () => {
 				"def authenticate_user(id):\n    return id\n",
 			);
 			warmWordIndexSnapshot(env.tmpDir, [
-				{ path: tsFile, content: "export function authenticateUser(id) { return id; }" },
+				{
+					path: tsFile,
+					content: "export function authenticateUser(id) { return id; }",
+				},
 				{
 					path: pyFile,
 					content: "def authenticate_user(id):\n    return id\n",
@@ -493,9 +518,9 @@ describe("symbol_search tool", () => {
 				const payload = JSON.parse(text.slice(text.indexOf("{"))) as {
 					results: Array<{ file: string }>;
 				};
-				expect(payload.results.map((r) => r.file.replace(/\\/g, "/")).sort()).toEqual(
-					["scripts/authenticate.py", "src/auth/login.ts"].sort(),
-				);
+				expect(
+					payload.results.map((r) => r.file.replace(/\\/g, "/")).sort(),
+				).toEqual(["scripts/authenticate.py", "src/auth/login.ts"].sort());
 			} finally {
 				env.cleanup();
 			}
@@ -587,7 +612,9 @@ describe("symbol_search tool", () => {
 				);
 				const text = String(result.content[0]?.text);
 				const payload = JSON.parse(text.slice(text.indexOf("{"))) as {
-					results: Array<{ annotations?: { fanIn: number; complexity?: number } }>;
+					results: Array<{
+						annotations?: { fanIn: number; complexity?: number };
+					}>;
 				};
 				expect(payload.results.length).toBeGreaterThan(0);
 				const hit = payload.results[0];

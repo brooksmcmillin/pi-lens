@@ -378,7 +378,9 @@ describe("Windows command resolution against a child environment (#1199)", () =>
 			fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-safe-spawn-cache-first-")),
 		);
 		const secondCwd = fs.realpathSync(
-			fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-safe-spawn-cache-second-")),
+			fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-safe-spawn-cache-second-"),
+			),
 		);
 		const command = "tools\\cache-tool.exe";
 		const firstResolvedPath = path.win32.resolve(firstCwd, command);

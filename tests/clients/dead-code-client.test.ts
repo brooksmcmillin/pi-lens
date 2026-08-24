@@ -10,7 +10,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
 	PythonDeadCodeClient,
 	parseVultureOutput,
@@ -22,13 +22,17 @@ import {
 	type DeadCodeResult,
 } from "../../clients/dead-code-client.js";
 import { safeSpawn } from "../../clients/safe-spawn.js";
+import { gatedPromise } from "../support/fault-injection.js";
 import { removeTempDirSync, setupTestEnvironment } from "./test-utils.js";
 
 const REPO_ROOT = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
 	"../..",
 );
-const PY_FIXTURE = path.join(REPO_ROOT, "tests/fixtures/dead-code/python-project");
+const PY_FIXTURE = path.join(
+	REPO_ROOT,
+	"tests/fixtures/dead-code/python-project",
+);
 
 // Real vulture 2.16 output (Windows + POSIX path forms both covered).
 const VULTURE_OUTPUT = [
@@ -117,7 +121,8 @@ describe("PythonDeadCodeClient resolveProjectRoot (pin, refs #625)", () => {
 			const nested = path.join(tmpDir, "src", "pkg");
 			fs.mkdirSync(nested, { recursive: true });
 
-			const client = new PythonDeadCodeClient() as unknown as ResolveProjectRoot;
+			const client =
+				new PythonDeadCodeClient() as unknown as ResolveProjectRoot;
 			expect(client.resolveProjectRoot(nested)).toBe(tmpDir);
 		} finally {
 			cleanup();
@@ -135,7 +140,8 @@ describe("PythonDeadCodeClient resolveProjectRoot (pin, refs #625)", () => {
 			fs.mkdirSync(nested, { recursive: true });
 			fs.writeFileSync(path.join(ancestor, "setup.py"), "");
 
-			const client = new PythonDeadCodeClient() as unknown as ResolveProjectRoot;
+			const client =
+				new PythonDeadCodeClient() as unknown as ResolveProjectRoot;
 			expect(client.resolveProjectRoot(nested, home)).toBeNull();
 		} finally {
 			removeTempDirSync(tmpRoot);
@@ -151,7 +157,8 @@ describe("PythonDeadCodeClient resolveProjectRoot (pin, refs #625)", () => {
 			fs.mkdirSync(home, { recursive: true });
 			fs.writeFileSync(path.join(home, "tox.ini"), "");
 
-			const client = new PythonDeadCodeClient() as unknown as ResolveProjectRoot;
+			const client =
+				new PythonDeadCodeClient() as unknown as ResolveProjectRoot;
 			expect(client.resolveProjectRoot(home, home)).toBeNull();
 		} finally {
 			removeTempDirSync(tmpRoot);
@@ -169,7 +176,8 @@ describe("PythonDeadCodeClient resolveProjectRoot (pin, refs #625)", () => {
 			fs.mkdirSync(path.join(repoRoot, ".git"), { recursive: true });
 			fs.mkdirSync(nested, { recursive: true });
 
-			const client = new PythonDeadCodeClient() as unknown as ResolveProjectRoot;
+			const client =
+				new PythonDeadCodeClient() as unknown as ResolveProjectRoot;
 			expect(client.resolveProjectRoot(nested)).toBeNull();
 		} finally {
 			cleanup();
@@ -184,7 +192,8 @@ describe("PythonDeadCodeClient resolveProjectRoot (pin, refs #625)", () => {
 			const nested = path.join(tmpRoot, "deep", "nowhere");
 			fs.mkdirSync(nested, { recursive: true });
 
-			const client = new PythonDeadCodeClient() as unknown as ResolveProjectRoot;
+			const client =
+				new PythonDeadCodeClient() as unknown as ResolveProjectRoot;
 			const resolved = client.resolveProjectRoot(nested);
 			expect(resolved).not.toBe(nested);
 		} finally {
@@ -242,7 +251,9 @@ describe("dead-code turn delta helpers", () => {
 
 	it("keys an issue by category/file/name so a moved symbol is not new", () => {
 		expect(deadCodeIssueKey(issue("a", 1))).toBe("export:mod.py:a");
-		expect(deadCodeIssueKey(issue("a", 1))).toBe(deadCodeIssueKey(issue("a", 2)));
+		expect(deadCodeIssueKey(issue("a", 1))).toBe(
+			deadCodeIssueKey(issue("a", 2)),
+		);
 	});
 });
 
@@ -289,4 +300,88 @@ describe("PythonDeadCodeClient.analyze (integration, real vulture)", () => {
 		},
 		20_000,
 	);
+});
+
+/**
+ * In-flight ABA release (#1968, kit-driven white-box probe).
+ *
+ * The race needs a SECOND WRITER replacing the map entry mid-flight (a future
+ * force-refresh/eviction path) — public API alone cannot produce it (single
+ * set site; microtask FIFO orders every observer after A's cleanup). So the
+ * test simulates that writer directly, exactly the mechanism the #1838
+ * reachability probe established. Red on the pre-fix bare `.finally` delete:
+ * A's cleanup evicted B and the third caller started a duplicate build.
+ */
+describe("in-flight ABA release (#1968)", () => {
+	const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+	interface Internals {
+		resolveProjectRoot: (cwd: string) => string | null;
+		ensureAvailable: (root?: string) => Promise<boolean>;
+		runAnalyze: (key: string) => Promise<DeadCodeResult>;
+		inFlight: Map<string, Promise<DeadCodeResult>>;
+	}
+
+	function emptyResult(): DeadCodeResult {
+		return {
+			success: true,
+			language: "python",
+			unusedExports: [],
+			unusedFiles: [],
+			unusedDeps: [],
+			unlistedDeps: [],
+			summary: "",
+		};
+	}
+
+	it("a late-settling build does not evict its mid-flight successor", async () => {
+		const client = new PythonDeadCodeClient(false);
+		const internals = client as unknown as Internals;
+		vi.spyOn(internals, "resolveProjectRoot").mockReturnValue("/probe-root");
+		vi.spyOn(internals, "ensureAvailable").mockResolvedValue(true);
+		const gateA = gatedPromise<DeadCodeResult>();
+		let analyzeCalls = 0;
+		vi.spyOn(internals, "runAnalyze").mockImplementation(() => {
+			analyzeCalls += 1;
+			return analyzeCalls === 1
+				? gateA.promise
+				: gatedPromise<DeadCodeResult>().promise;
+		});
+
+		void client.analyze("/probe-root"); // build A in flight
+		await tick();
+		expect(internals.inFlight.size).toBe(1);
+		const key = [...internals.inFlight.keys()][0]!;
+
+		// B replaces the entry under the same key while A is still in flight.
+		const successor = gatedPromise<DeadCodeResult>();
+		internals.inFlight.set(key, successor.promise);
+
+		gateA.resolve(emptyResult()); // A settles late
+		await tick();
+		await tick();
+
+		// B's entry survived A's cleanup...
+		expect(internals.inFlight.get(key)).toBe(successor.promise);
+		// ...and a third caller SHARES B instead of starting a duplicate build.
+		void client.analyze("/probe-root");
+		await tick();
+		// Only build A ever ran: B was registered by the simulated second
+		// writer, and the third caller shared it instead of starting a build.
+		expect(analyzeCalls).toBe(1);
+
+		successor.resolve(emptyResult());
+	});
+
+	it("a normally-settling build still cleans up its own entry", async () => {
+		const client = new PythonDeadCodeClient(false);
+		const internals = client as unknown as Internals;
+		vi.spyOn(internals, "resolveProjectRoot").mockReturnValue("/probe-root");
+		vi.spyOn(internals, "ensureAvailable").mockResolvedValue(true);
+		vi.spyOn(internals, "runAnalyze").mockResolvedValue(emptyResult());
+
+		await client.analyze("/probe-root");
+		await tick();
+		expect(internals.inFlight.size).toBe(0);
+	});
 });

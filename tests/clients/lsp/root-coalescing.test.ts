@@ -87,7 +87,9 @@ describe("LSP per-server nested-root coalescing (#1373)", () => {
 	});
 
 	it("coalesces a config-only TypeScript root with an already-hosted ancestor", async () => {
-		const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-ts-config-coalesce-"));
+		const project = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-ts-config-coalesce-"),
+		);
 		dirs.push(project);
 		vi.spyOn(process, "cwd").mockReturnValue(project);
 		const nested = path.join(project, "packages", "configured");
@@ -132,7 +134,9 @@ describe("LSP per-server nested-root coalescing (#1373)", () => {
 	});
 
 	it("preserves a nested Git project without a manifest", async () => {
-		const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-git-boundary-"));
+		const project = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-git-boundary-"),
+		);
 		dirs.push(project);
 		const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(project);
 		const nested = path.join(project, "vendor", "child-repo");
@@ -157,7 +161,10 @@ describe("LSP per-server nested-root coalescing (#1373)", () => {
 		const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(project);
 		const shapes = [
 			...Array.from({ length: 5 }, (_, i) => `skills/pi-lens-${i}`),
-			...Array.from({ length: 7 }, (_, i) => `rules/coderabbit/rules/lang-${i}/security`),
+			...Array.from(
+				{ length: 7 },
+				(_, i) => `rules/coderabbit/rules/lang-${i}/security`,
+			),
 			".github",
 			".github/workflows",
 			...Array.from({ length: 5 }, (_, i) => `cases/${i}/workspace`),
@@ -176,7 +183,11 @@ describe("LSP per-server nested-root coalescing (#1373)", () => {
 			for (const relative of shapes) {
 				const root = await service.resolveServerRoot(
 					server,
-					path.join(project, relative, `fixture.${id === "yaml" ? "yml" : "md"}`),
+					path.join(
+						project,
+						relative,
+						`fixture.${id === "yaml" ? "yml" : "md"}`,
+					),
 				);
 				roots.add(`${id}:${normalizeMapKey(root!)}`);
 			}

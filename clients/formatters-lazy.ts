@@ -1,10 +1,13 @@
 /** Shared lazy formatter catalog seam (#1394). */
+import { createLazyImport } from "./lazy-import.js";
 
 type FormatterModule = typeof import("./formatters.js");
-let formatterPromise: Promise<FormatterModule> | undefined;
+const lazyFormatters = createLazyImport<FormatterModule>(
+	() => import("./formatters.js"),
+);
 
 export function warmFormatters(): Promise<FormatterModule> {
-	return (formatterPromise ??= import("./formatters.js"));
+	return lazyFormatters.get();
 }
 
 export function loadFormatters(): Promise<FormatterModule> {

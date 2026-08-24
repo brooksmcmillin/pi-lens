@@ -122,7 +122,8 @@ export function quoteForWindowsCmd(arg) {
 function runCommand(commandArgs) {
 	return new Promise((resolve, reject) => {
 		const isWin32 = process.platform === "win32";
-		const vitestEntry = commandArgs[0] === "vitest" ? resolveVitestEntry() : null;
+		const vitestEntry =
+			commandArgs[0] === "vitest" ? resolveVitestEntry() : null;
 
 		let child;
 		if (vitestEntry) {
@@ -171,7 +172,9 @@ function runCommand(commandArgs) {
 async function main() {
 	const commandArgs = parseCommandArgs(process.argv.slice(2));
 	if (commandArgs.length === 0) {
-		console.error("Usage: node scripts/with-test-lock.mjs -- <command> [args...]");
+		console.error(
+			"Usage: node scripts/with-test-lock.mjs -- <command> [args...]",
+		);
 		process.exitCode = 2;
 		return;
 	}
@@ -213,7 +216,9 @@ function isEntryPoint() {
 	// silently no-op, fall back to a basename match and warn loudly — a
 	// false positive here (running when we technically shouldn't) is far
 	// safer than the alternative (silently not running at all).
-	if (path.basename(invoked).toLowerCase() === path.basename(self).toLowerCase()) {
+	if (
+		path.basename(invoked).toLowerCase() === path.basename(self).toLowerCase()
+	) {
 		console.error(
 			"[with-test-lock] warning: argv[1] did not exactly match this file's " +
 				"resolved path (possible Windows 8.3 short-name or casing mismatch) " +

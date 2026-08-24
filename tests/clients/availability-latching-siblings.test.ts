@@ -18,7 +18,7 @@ import {
 	HOST_STALL_COOLDOWN_MS,
 	INSTALL_TRANSIENT_BASE_COOLDOWN_MS,
 	TRANSIENT_BASE_COOLDOWN_MS,
-} from "../../clients/dispatch/runners/utils/availability-policy.ts";
+} from "../../clients/dispatch/runners/utils/availability-policy.js";
 
 /**
  * Reset through the SAME module instance the clients load (the compiled `.js`),
@@ -26,18 +26,19 @@ import {
  * reset applied to a second instance of the module silently resets nothing.
  */
 async function resetDispatchAvailabilityState(): Promise<void> {
-	const helpers = await import(
-		"../../clients/dispatch/runners/utils/runner-helpers.js"
-	);
+	const helpers =
+		await import("../../clients/dispatch/runners/utils/runner-helpers.js");
 	helpers.resetDispatchAvailabilityState();
 }
 
-const { safeSpawnAsync, safeSpawn, ensureTool, logLatency } = vi.hoisted(() => ({
-	safeSpawnAsync: vi.fn(),
-	safeSpawn: vi.fn(),
-	ensureTool: vi.fn(),
-	logLatency: vi.fn(),
-}));
+const { safeSpawnAsync, safeSpawn, ensureTool, logLatency } = vi.hoisted(
+	() => ({
+		safeSpawnAsync: vi.fn(),
+		safeSpawn: vi.fn(),
+		ensureTool: vi.fn(),
+		logLatency: vi.fn(),
+	}),
+);
 
 // Spread the real module: only `logLatency` is intercepted, so the rest of the
 // import graph keeps working.
@@ -236,9 +237,8 @@ describe("SgRunner availability (#1476)", () => {
 describe("shared ast-grep availability (#1476)", () => {
 	it("pins a genuine absence: latched false for the session", async () => {
 		safeSpawnAsync.mockResolvedValue(missingResult);
-		const { isSgAvailableAsync } = await import(
-			"../../clients/dispatch/runners/utils/runner-helpers.js"
-		);
+		const { isSgAvailableAsync } =
+			await import("../../clients/dispatch/runners/utils/runner-helpers.js");
 
 		expect(await isSgAvailableAsync()).toBe(false);
 		const probes = safeSpawnAsync.mock.calls.length;
@@ -249,9 +249,8 @@ describe("shared ast-grep availability (#1476)", () => {
 
 	it("a timed-out sweep expires and re-probes after the cooldown", async () => {
 		safeSpawnAsync.mockResolvedValue(timeoutResult);
-		const { isSgAvailableAsync } = await import(
-			"../../clients/dispatch/runners/utils/runner-helpers.js"
-		);
+		const { isSgAvailableAsync } =
+			await import("../../clients/dispatch/runners/utils/runner-helpers.js");
 
 		expect(await isSgAvailableAsync()).toBe(false);
 		const probes = safeSpawnAsync.mock.calls.length;
@@ -290,9 +289,8 @@ describe("govulncheck availability (#1476)", () => {
 			govulncheck: [missingResult, okResult("govulncheck v1.1.3")],
 			install: okResult(""),
 		});
-		const { GovulncheckClient } = await import(
-			"../../clients/govulncheck-client.js"
-		);
+		const { GovulncheckClient } =
+			await import("../../clients/govulncheck-client.js");
 		const client = new GovulncheckClient();
 
 		expect(await client.ensureAvailable()).toBe(true);
@@ -303,9 +301,8 @@ describe("govulncheck availability (#1476)", () => {
 			govulncheck: [missingResult],
 			install: { stdout: "", stderr: "no matching versions", status: 1 },
 		});
-		const { GovulncheckClient } = await import(
-			"../../clients/govulncheck-client.js"
-		);
+		const { GovulncheckClient } =
+			await import("../../clients/govulncheck-client.js");
 		const client = new GovulncheckClient();
 
 		expect(await client.ensureAvailable()).toBe(false);
@@ -316,9 +313,8 @@ describe("govulncheck availability (#1476)", () => {
 
 	it("a timed-out `go install` does not latch, and recovers", async () => {
 		route({ govulncheck: [missingResult], install: timeoutResult });
-		const { GovulncheckClient } = await import(
-			"../../clients/govulncheck-client.js"
-		);
+		const { GovulncheckClient } =
+			await import("../../clients/govulncheck-client.js");
 		const client = new GovulncheckClient();
 
 		expect(await client.ensureAvailable()).toBe(false);
@@ -368,7 +364,10 @@ describe("SgRunner: a slow npx must not veto the install (#1489 review)", () => 
 	it("still refuses to install when a DIRECT candidate timed out", async () => {
 		// The #1476 guarantee, unchanged: `ast-grep` itself failing to answer is a
 		// statement about the host, not about the tool.
-		route({ "ast-grep": timeoutResult, sg: missingResult, npx: missingResult }, missingResult);
+		route(
+			{ "ast-grep": timeoutResult, sg: missingResult, npx: missingResult },
+			missingResult,
+		);
 		const { SgRunner } = await import("../../clients/sg-runner.js");
 		const runner = new SgRunner();
 
@@ -377,7 +376,10 @@ describe("SgRunner: a slow npx must not veto the install (#1489 review)", () => 
 	});
 
 	it("does not latch 'missing' when the install fails after an npx timeout", async () => {
-		route({ "ast-grep": missingResult, sg: missingResult, npx: timeoutResult }, missingResult);
+		route(
+			{ "ast-grep": missingResult, sg: missingResult, npx: timeoutResult },
+			missingResult,
+		);
 		ensureTool.mockResolvedValue(null);
 		const { SgRunner } = await import("../../clients/sg-runner.js");
 		const runner = new SgRunner();
@@ -427,9 +429,8 @@ describe("govulncheck records a real duration (#1489 review)", () => {
 			}
 			return missingResult;
 		});
-		const { GovulncheckClient } = await import(
-			"../../clients/govulncheck-client.js"
-		);
+		const { GovulncheckClient } =
+			await import("../../clients/govulncheck-client.js");
 
 		expect(await new GovulncheckClient().ensureAvailable()).toBe(false);
 		const reprobe = decisionsFor("govulncheck").at(-1);
@@ -449,7 +450,10 @@ describe("dispatch hasTool availability (#1476)", () => {
 	async function load() {
 		const dispatcher = await import("../../clients/dispatch/dispatcher.js");
 		const { FactStore } = await import("../../clients/dispatch/fact-store.js");
-		return { checkToolAvailability: dispatcher.checkToolAvailability, facts: new FactStore() };
+		return {
+			checkToolAvailability: dispatcher.checkToolAvailability,
+			facts: new FactStore(),
+		};
 	}
 
 	it("pins a successful probe: available, and cached for the session", async () => {

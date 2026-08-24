@@ -265,10 +265,13 @@ function makeSourceCountVisitor(
 			}
 			return recurse ? "recurse" : "skip";
 		}
+		// #1974: extension-pattern gate before isIgnored — isIgnored recompiles
+		// minimatch patterns per ancestor dir per call, so it should only run for
+		// entries the cheap regex already flags as source.
 		if (
 			entry.isFile() &&
-			!ignoreMatcher.isIgnored(fullPath, false) &&
-			SOURCE_FILE_PATTERN.test(entry.name)
+			SOURCE_FILE_PATTERN.test(entry.name) &&
+			!ignoreMatcher.isIgnored(fullPath, false)
 		) {
 			state.count += 1;
 			if (state.count > limit) return "stop";
@@ -323,7 +326,9 @@ export function countSourceFilesWithinLimit(
 // depends only on the file tree shape and ignore rules — both of which
 // are also captured by the project snapshot freshness check upstream —
 // in-process memoisation is safe for the duration of a single pi process.
-const startupScanContextCache = new BoundedLruCache<string, StartupScanContext>(32);
+const startupScanContextCache = new BoundedLruCache<string, StartupScanContext>(
+	32,
+);
 
 function startupScanCacheKey(cwd: string, options: StartupScanOptions): string {
 	return [
@@ -343,7 +348,10 @@ export function resolveStartupScanContext(
 	const cacheKey = startupScanCacheKey(cwd, options);
 	const cached = startupScanContextCache.get(cacheKey);
 	if (cached) return cached;
-	const result = { ...computeStartupScanContext(cwd, options), computedAt: Date.now() };
+	const result = {
+		...computeStartupScanContext(cwd, options),
+		computedAt: Date.now(),
+	};
 	startupScanContextCache.set(cacheKey, result);
 	return result;
 }

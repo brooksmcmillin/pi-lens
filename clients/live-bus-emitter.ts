@@ -1,9 +1,6 @@
 import { recordDegradation } from "./degradation-ledger.js";
 import { probeCtxActive } from "./session-lifecycle.js";
-import {
-	logBusEvent,
-	type BusEventLogEntry,
-} from "./bus-events-logger.js";
+import { logBusEvent, type BusEventLogEntry } from "./bus-events-logger.js";
 
 /** Resolve a pi event-bus emitter and its ctx at delivery time, not
  * subscription time. */
@@ -34,7 +31,8 @@ export interface LiveBusEmitter {
 	reset(): void;
 }
 
-const STALE_CTX_MESSAGE = "This extension ctx is stale after session replacement";
+const STALE_CTX_MESSAGE =
+	"This extension ctx is stale after session replacement";
 
 /** Ledger a dead activation once, at the publisher's occurrence-window guard. */
 export function recordStaleBusFailure(subject: string, error: unknown): void {

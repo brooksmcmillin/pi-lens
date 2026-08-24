@@ -85,15 +85,21 @@ function lintPullRequest() {
 		process.exitCode = 1;
 		return;
 	}
-	console.log(`Close-keyword syntax OK (${result.issues.length} issue${result.issues.length === 1 ? "" : "s"} referenced).`);
+	console.log(
+		`Close-keyword syntax OK (${result.issues.length} issue${result.issues.length === 1 ? "" : "s"} referenced).`,
+	);
 }
 
 function issueState(repository, number) {
 	try {
-		return execFileSync("gh", ["api", `repos/${repository}/issues/${number}`, "--jq", ".state"], {
-			encoding: "utf8",
-			stdio: ["ignore", "pipe", "pipe"],
-		}).trim();
+		return execFileSync(
+			"gh",
+			["api", `repos/${repository}/issues/${number}`, "--jq", ".state"],
+			{
+				encoding: "utf8",
+				stdio: ["ignore", "pipe", "pipe"],
+			},
+		).trim();
 	} catch {
 		return "not found";
 	}
@@ -103,18 +109,23 @@ function verifyMergedPullRequest() {
 	const event = eventPayload();
 	const pullRequest = event.pull_request;
 	const repository = process.env.GITHUB_REPOSITORY;
-	if (!pullRequest || !repository) throw new Error("Pull request event and GITHUB_REPOSITORY are required");
+	if (!pullRequest || !repository)
+		throw new Error("Pull request event and GITHUB_REPOSITORY are required");
 
 	const { issues } = parseCloseKeywords(pullRequest.body ?? "");
 	const unresolved = issues
 		.map((number) => ({ number, state: issueState(repository, number) }))
 		.filter(({ state }) => state !== "closed");
 	if (unresolved.length === 0) {
-		console.log(`Post-merge close verification OK (${issues.length} issue${issues.length === 1 ? "" : "s"} closed).`);
+		console.log(
+			`Post-merge close verification OK (${issues.length} issue${issues.length === 1 ? "" : "s"} closed).`,
+		);
 		return;
 	}
 
-	const details = unresolved.map(({ number, state }) => `#${number} (${state})`).join(", ");
+	const details = unresolved
+		.map(({ number, state }) => `#${number} (${state})`)
+		.join(", ");
 	const marker = "<!-- close-keyword-verifier -->";
 	const message = `${marker}
 Post-merge close verification found issue(s) that were not closed: ${details}. GitHub only applies the first issue in a comma-separated close list; use one close keyword per issue (for example, "Closes #123. Closes #456.").`;
@@ -124,7 +135,17 @@ Post-merge close verification found issue(s) that were not closed: ${details}. G
 	try {
 		const existing = execFileSync(
 			"gh",
-			["pr", "view", String(pullRequest.number), "--repo", repository, "--json", "comments", "--jq", ".comments[].body"],
+			[
+				"pr",
+				"view",
+				String(pullRequest.number),
+				"--repo",
+				repository,
+				"--json",
+				"comments",
+				"--jq",
+				".comments[].body",
+			],
 			{ encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
 		);
 		alreadyCommented = existing.includes(marker);
@@ -132,9 +153,21 @@ Post-merge close verification found issue(s) that were not closed: ${details}. G
 		// listing failed -- fall through and comment rather than stay silent
 	}
 	if (!alreadyCommented) {
-		execFileSync("gh", ["pr", "comment", String(pullRequest.number), "--repo", repository, "--body", message], {
-			stdio: "inherit",
-		});
+		execFileSync(
+			"gh",
+			[
+				"pr",
+				"comment",
+				String(pullRequest.number),
+				"--repo",
+				repository,
+				"--body",
+				message,
+			],
+			{
+				stdio: "inherit",
+			},
+		);
 	}
 	process.exitCode = 1;
 }
@@ -143,7 +176,10 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
 	try {
 		if (process.argv[2] === "--lint-pr") lintPullRequest();
 		else if (process.argv[2] === "--verify-merged") verifyMergedPullRequest();
-		else throw new Error("Usage: node scripts/check-close-keywords.mjs --lint-pr|--verify-merged");
+		else
+			throw new Error(
+				"Usage: node scripts/check-close-keywords.mjs --lint-pr|--verify-merged",
+			);
 	} catch (error) {
 		console.error(error instanceof Error ? error.message : error);
 		process.exitCode = 1;

@@ -208,45 +208,49 @@ describe("review-graph seq fast path (#451)", () => {
 	// contention that many sequential real builds can tip past 5s. Give it
 	// the same kind of generous headroom as `tests/index-integration.test.ts`'s
 	// `INTEGRATION_TIMEOUT_MS` — a genuine hang still fails, just later.
-	it("periodic re-verify (every 20th build) resumes the full sweep", {
-		timeout: 30_000,
-	}, async () => {
-		const env = setupTestEnvironment("pi-lens-seqfp-verify-");
-		try {
-			const aPath = createTempFile(
-				env.tmpDir,
-				"src/a.ts",
-				["export function alpha() { return 1; }", ""].join("\n"),
-			);
-			const facts = new FactStore();
-			const hint = makeSeqHint();
-
-			clearGraphCache();
-			await buildOrUpdateGraph(env.tmpDir, [aPath], facts, hint);
-			expect(getLastGraphBuildInfo().mode).toBe("full");
-
-			// 20 fast-path builds (each a distinct edit+bump) should trip the counter
-			// on the 20th, forcing a full re-verify.
-			let sawVerifyDue = false;
-			for (let i = 0; i < 21; i++) {
-				fs.writeFileSync(
-					aPath,
-					[`export function alpha() { return ${i + 10}; }`, ""].join("\n"),
+	it(
+		"periodic re-verify (every 20th build) resumes the full sweep",
+		{
+			timeout: 30_000,
+		},
+		async () => {
+			const env = setupTestEnvironment("pi-lens-seqfp-verify-");
+			try {
+				const aPath = createTempFile(
+					env.tmpDir,
+					"src/a.ts",
+					["export function alpha() { return 1; }", ""].join("\n"),
 				);
-				hint.bump(aPath);
+				const facts = new FactStore();
+				const hint = makeSeqHint();
+
 				clearGraphCache();
 				await buildOrUpdateGraph(env.tmpDir, [aPath], facts, hint);
-				const info = getLastGraphBuildInfo();
-				if (info.seqFastpathFallback === "verify-due") {
-					sawVerifyDue = true;
-					break;
+				expect(getLastGraphBuildInfo().mode).toBe("full");
+
+				// 20 fast-path builds (each a distinct edit+bump) should trip the counter
+				// on the 20th, forcing a full re-verify.
+				let sawVerifyDue = false;
+				for (let i = 0; i < 21; i++) {
+					fs.writeFileSync(
+						aPath,
+						[`export function alpha() { return ${i + 10}; }`, ""].join("\n"),
+					);
+					hint.bump(aPath);
+					clearGraphCache();
+					await buildOrUpdateGraph(env.tmpDir, [aPath], facts, hint);
+					const info = getLastGraphBuildInfo();
+					if (info.seqFastpathFallback === "verify-due") {
+						sawVerifyDue = true;
+						break;
+					}
 				}
+				expect(sawVerifyDue).toBe(true);
+			} finally {
+				env.cleanup();
 			}
-			expect(sawVerifyDue).toBe(true);
-		} finally {
-			env.cleanup();
-		}
-	});
+		},
+	);
 
 	it("no hint ⇒ mode is unchanged from today (never seq-fastpath)", async () => {
 		const env = setupTestEnvironment("pi-lens-seqfp-nohint-");

@@ -44,9 +44,8 @@ type EnsureGrammarClient = {
 };
 
 async function makeClient(writeDir: string): Promise<EnsureGrammarClient> {
-	const { TreeSitterClient } = await import(
-		"../../clients/tree-sitter-client.js"
-	);
+	const { TreeSitterClient } =
+		await import("../../clients/tree-sitter-client.js");
 	const client = new TreeSitterClient() as unknown as EnsureGrammarClient;
 	// Force ensureGrammar past the "already on disk" short-circuit and give it
 	// a real write dir to fetch into, instead of the real (junctioned)
@@ -187,9 +186,8 @@ describe("grammar download retry after failure (#1536)", () => {
 	});
 
 	it("gives the 'no writable directory' arm the same cooldown + one-time notification as a download failure (F2)", async () => {
-		const { TreeSitterClient } = await import(
-			"../../clients/tree-sitter-client.js"
-		);
+		const { TreeSitterClient } =
+			await import("../../clients/tree-sitter-client.js");
 		const client = new TreeSitterClient() as unknown as EnsureGrammarClient;
 		const grammarFile = "tree-sitter-no-write-dir.wasm";
 		client.grammarsDir = "";

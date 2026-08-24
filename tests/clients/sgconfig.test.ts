@@ -172,10 +172,7 @@ describe("ast-grep baseline sgconfig", () => {
 					),
 				);
 			expect(matches.length).toBe(1);
-			const content = fs.readFileSync(
-				path.join(mergedDir, matches[0]),
-				"utf8",
-			);
+			const content = fs.readFileSync(path.join(mergedDir, matches[0]), "utf8");
 			expect(content).toContain("PROJECT OVERRIDE");
 		});
 
@@ -234,9 +231,7 @@ describe("ast-grep baseline sgconfig", () => {
 			const configPath1 = resolveBaselineSgconfig();
 			if (!configPath1) throw new Error("expected baseline sgconfig");
 			const mergedDir1 = soleRuleDir(configPath1);
-			expect(idsInMergedDir(mergedDir1)).toContain(
-				"array-callback-return-js",
-			);
+			expect(idsInMergedDir(mergedDir1)).toContain("array-callback-return-js");
 			const beforeOverride = fs
 				.readdirSync(mergedDir1)
 				.find((f) =>
@@ -246,7 +241,10 @@ describe("ast-grep baseline sgconfig", () => {
 				);
 			expect(beforeOverride).toBeDefined();
 			expect(
-				fs.readFileSync(path.join(mergedDir1, beforeOverride as string), "utf8"),
+				fs.readFileSync(
+					path.join(mergedDir1, beforeOverride as string),
+					"utf8",
+				),
 			).not.toContain("PROJECT OVERRIDE");
 
 			// Mid-session: project adds a rule shadowing a bundled id.

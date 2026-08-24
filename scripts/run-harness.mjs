@@ -505,9 +505,13 @@ const timing = {
 	finalAssistantTimestamp,
 	slowestTurn:
 		turnTimeline.length > 0
-			? turnTimeline.reduce((slowest, turn) =>
-					(slowest?.durationMs || 0) >= (turn.durationMs || 0) ? slowest : turn,
-				turnTimeline[0])
+			? turnTimeline.reduce(
+					(slowest, turn) =>
+						(slowest?.durationMs || 0) >= (turn.durationMs || 0)
+							? slowest
+							: turn,
+					turnTimeline[0],
+				)
 			: null,
 };
 

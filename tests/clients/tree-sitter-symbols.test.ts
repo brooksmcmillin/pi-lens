@@ -70,6 +70,12 @@ const CASES: Record<string, SymbolCase> = {
 	zig: { file: "a.zig", src: "fn foo() void {}\n", expect: ["foo"] },
 	bash: { file: "a.sh", src: "foo() { :; }\n", expect: ["foo"] },
 	elixir: { file: "a.ex", src: "defmodule M do\nend\n", expect: ["M"] },
+	// #1522: `#Definition` → type, plain field → property, `let` → variable.
+	cue: {
+		file: "a.cue",
+		src: "package a\n\n#Service: {\n\tname: string\n}\n\nlet helper = 1\n",
+		expect: ["#Service", "name", "helper"],
+	},
 };
 
 let client: TreeSitterClient;

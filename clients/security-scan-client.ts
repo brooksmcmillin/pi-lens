@@ -13,6 +13,7 @@
  * Refs: #130, #131, #132
  */
 
+import * as path from "node:path";
 import { createSubsystemLogger } from "./extension-log.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
 import {
@@ -81,10 +82,7 @@ export abstract class SecurityScanClient<TResult> {
 	 * `elapsedMs` is whatever the caller measured (an install attempt's duration);
 	 * there is no probe here, so it is 0 unless the caller has something real.
 	 */
-	private logDurableAbsence(
-		evidence?: ProbeEvidence,
-		elapsedMs = 0,
-	): void {
+	private logDurableAbsence(evidence?: ProbeEvidence, elapsedMs = 0): void {
 		logAvailabilityDecision({
 			tool: this.toolName,
 			verdict: "unavailable",
@@ -113,9 +111,7 @@ export abstract class SecurityScanClient<TResult> {
 		protected readonly toolName: string,
 		verbose = false,
 	) {
-		this.log = verbose
-			? createSubsystemLogger(toolName)
-			: () => {};
+		this.log = verbose ? createSubsystemLogger(toolName) : () => {};
 	}
 
 	/**
@@ -251,6 +247,29 @@ export abstract class SecurityScanClient<TResult> {
 	}
 
 	/**
+	 * #1623: public window onto the availability verdict for callers OUTSIDE
+	 * the dispatch graph (mode=full's fresh-fetch) that need to say WHY
+	 * `ensureAvailable()` most recently returned false — using the SAME
+	 * `AvailabilityOutcome`/`AvailabilityCause` taxonomy every dispatch-side
+	 * message is built from, rather than a re-guessed "binary unavailable"
+	 * that can't tell a transient retry-cooldown probe from a durable absence.
+	 * `latchedCause()`/`lastProbeOutcome` above stay `protected` for
+	 * dispatch-internal callers; this is the one public seam for everyone
+	 * else.
+	 */
+	getAvailabilityVerdict(): {
+		outcome: AvailabilityOutcome | null;
+		cause: AvailabilityCause | null;
+		retryAtMs: number;
+	} {
+		return {
+			outcome: this.availabilityLatch.getOutcome(),
+			cause: this.availabilityLatch.getCause(),
+			retryAtMs: this.availabilityLatch.getRetryAtMs(),
+		};
+	}
+
+	/**
 	 * Standard availability path for the GitHub-release tools (gitleaks, trivy):
 	 * PATH probe first, then fall back to the pi-lens installer's `ensureTool`.
 	 * Records the resolved binary path and sets `this.available`.
@@ -271,9 +290,8 @@ export abstract class SecurityScanClient<TResult> {
 			return false;
 		}
 		this.log(`${this.toolName} not found, attempting auto-install`);
-		const { ensureTool, getInstallAttempt } = await import(
-			"./installer/index.js"
-		);
+		const { ensureTool, getInstallAttempt } =
+			await import("./installer/index.js");
 		const installStartedAt = Date.now();
 		const installed = await ensureTool(this.toolName);
 		if (!installed) {
@@ -302,6 +320,25 @@ export abstract class SecurityScanClient<TResult> {
 		this.binaryPath = installed;
 		this.available = true;
 		this.log(`${this.toolName} auto-installed at ${installed}`);
+		// The probe already wrote a latched `unavailable` row (#1500's durable
+		// assertion doesn't fire here — install SUCCEEDED — but probeVersion's
+		// verdict still did, before this call ever ran). Without a compensating
+		// row, the durable record says the lane is off when it just came back
+		// on: the exact defect #1606 was filed over.
+		logAvailabilityDecision({
+			tool: this.toolName,
+			verdict: "available",
+			outcome: "success",
+			cause: "ok",
+			elapsedMs: Date.now() - installStartedAt,
+			latched: true,
+			classifiedBy: "caller",
+			evidence: {
+				install: "succeeded",
+				binary: path.basename(installed),
+				source: "managed-dir",
+			},
+		});
 		return true;
 	}
 

@@ -374,19 +374,17 @@ describe("touchFile capability-aware AGGREGATE wait (#814)", () => {
 				},
 				source: "typos",
 			};
-			createLSPClient.mockImplementation(
-				async (opts: { serverId: string }) => {
-					if (opts.serverId === "typos") {
-						return makePublishingClient("typos", tmp, filePath, [finding]);
-					}
-					// marksman's notify.open never resolves — the write itself
-					// never lands, so its silence has no basis to be read as
-					// "saw the file and stayed quiet because it's clean".
-					const { client } = makeSilentPushOnlyClient("marksman", tmp);
-					client.notify.open = vi.fn(() => new Promise(() => {}));
-					return client;
-				},
-			);
+			createLSPClient.mockImplementation(async (opts: { serverId: string }) => {
+				if (opts.serverId === "typos") {
+					return makePublishingClient("typos", tmp, filePath, [finding]);
+				}
+				// marksman's notify.open never resolves — the write itself
+				// never lands, so its silence has no basis to be read as
+				// "saw the file and stayed quiet because it's clean".
+				const { client } = makeSilentPushOnlyClient("marksman", tmp);
+				client.notify.open = vi.fn(() => new Promise(() => {}));
+				return client;
+			});
 
 			const { LSPService } = await import("../../../clients/lsp/index.js");
 			const service = new LSPService();
@@ -433,7 +431,8 @@ describe("touchFile capability-aware AGGREGATE wait (#814)", () => {
 		});
 
 		expect((result as { inconclusive?: boolean }).inconclusive).toBe(true);
-		const { getDegradationSummary } = await import("../../../clients/degradation-ledger.js");
+		const { getDegradationSummary } =
+			await import("../../../clients/degradation-ledger.js");
 		expect(getDegradationSummary()).toEqual([
 			expect.objectContaining({
 				kind: "lsp-diagnostics-timeout",

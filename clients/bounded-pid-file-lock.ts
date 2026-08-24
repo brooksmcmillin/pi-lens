@@ -52,10 +52,8 @@ async function releaseQuarantineLock(
 			renamed = true;
 			break;
 		} catch (error) {
-			if (
-				(error as NodeJS.ErrnoException).code !== "ENOENT" ||
-				attempt === 2
-			) return;
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT" || attempt === 2)
+				return;
 			await new Promise<void>((resolve) => setImmediate(resolve));
 		}
 	}
@@ -78,9 +76,19 @@ function quarantineOwnerIsStale(
 	owner: QuarantineLockOwner,
 	staleMs: number,
 ): boolean {
-	return Number.isInteger(owner.pid) && owner.pid > 0 &&
-		Number.isFinite(owner.createdAt) &&
-		(!ownerPidIsLive(owner.pid) || Date.now() - owner.createdAt > staleMs);
+	// #1816: the two staleness signals are INDEPENDENT, and the original
+	// conjunction made the dead-PID one unreachable. An `owner.json` with a
+	// valid PID but a missing or non-numeric `createdAt` (an older writer, a
+	// half-written file, a hand-edited one) short-circuited on the
+	// `Number.isFinite` guard, so a dead owner never reclaimed and the lock
+	// stayed poisoned for the life of the directory. This is
+	// `installer/index.ts:173`'s predicate: a dead PID reclaims regardless of
+	// `createdAt`, and an aged lock reclaims regardless of what the PID says.
+	const pidUsable = Number.isInteger(owner.pid) && owner.pid > 0;
+	if (pidUsable && !ownerPidIsLive(owner.pid)) return true;
+	return (
+		Number.isFinite(owner.createdAt) && Date.now() - owner.createdAt > staleMs
+	);
 }
 
 async function reclaimQuarantineLock(
@@ -136,7 +144,9 @@ async function tryAcquireQuarantineLock(
 					"utf8",
 				);
 			} catch (error) {
-				await fsp.rm(lockPath, { recursive: true, force: true }).catch(() => {});
+				await fsp
+					.rm(lockPath, { recursive: true, force: true })
+					.catch(() => {});
 				throw error;
 			}
 			return () => releaseQuarantineLock(lockPath, owner.token);
@@ -156,7 +166,8 @@ async function tryAcquireQuarantineLock(
 				stale = true;
 			}
 		}
-		if (!stale || !(await reclaimQuarantineLock(lockPath, staleMs))) return null;
+		if (!stale || !(await reclaimQuarantineLock(lockPath, staleMs)))
+			return null;
 	}
 	return null;
 }
@@ -179,10 +190,11 @@ export async function acquireQuarantinePidFileLock(
 ): Promise<(() => Promise<void>) | null>;
 export async function acquireQuarantinePidFileLock(
 	lockPath: string,
-	options: QuarantinePidFileLockOptions & (
-		| { onContention?: "throw" }
-		| { onContention: "skip-log"; logContention: () => void }
-	),
+	options: QuarantinePidFileLockOptions &
+		(
+			| { onContention?: "throw" }
+			| { onContention: "skip-log"; logContention: () => void }
+		),
 ): Promise<(() => Promise<void>) | null> {
 	const deadline = Date.now() + options.waitMs;
 	for (;;) {
@@ -230,10 +242,11 @@ export function acquireBoundedPidFileLock(
 ): (() => void) | null;
 export function acquireBoundedPidFileLock(
 	lockPath: string,
-	options: BoundedPidFileLockOptions & (
-		| { onContention?: "throw" }
-		| { onContention: "skip-log"; logContention: () => void }
-	),
+	options: BoundedPidFileLockOptions &
+		(
+			| { onContention?: "throw" }
+			| { onContention: "skip-log"; logContention: () => void }
+		),
 ): (() => void) | null {
 	const token = `${process.pid}:${Date.now()}:${randomUUID()}`;
 	const deadline = Date.now() + options.waitMs;

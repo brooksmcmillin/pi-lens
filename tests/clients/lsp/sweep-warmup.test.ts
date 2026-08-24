@@ -197,7 +197,8 @@ describe("runWorkspaceDiagnostics sweep-level warm-up behavior (#667)", () => {
 
 	it("a cold sweep pays exactly one extra warm-up round trip before the per-file loop, on top of the normal per-file touches", async () => {
 		const names = ["a.ts", "b.ts", "c.ts"];
-		for (const n of names) fs.writeFileSync(path.join(tmp, n), "const z = 1;\n");
+		for (const n of names)
+			fs.writeFileSync(path.join(tmp, n), "const z = 1;\n");
 		const tsServer = makeTsServer(tmp);
 		getServersForFileWithConfig.mockImplementation((fp: string) =>
 			fp.endsWith(".ts") ? [tsServer] : [],
@@ -222,7 +223,8 @@ describe("runWorkspaceDiagnostics sweep-level warm-up behavior (#667)", () => {
 
 	it("a sweep against an already-warm server (demonstrated ready from a prior touch this session) skips the warm-up round trip entirely — no added latency", async () => {
 		const names = ["a.ts", "b.ts", "c.ts"];
-		for (const n of names) fs.writeFileSync(path.join(tmp, n), "const z = 1;\n");
+		for (const n of names)
+			fs.writeFileSync(path.join(tmp, n), "const z = 1;\n");
 		const tsServer = makeTsServer(tmp);
 		getServersForFileWithConfig.mockImplementation((fp: string) =>
 			fp.endsWith(".ts") ? [tsServer] : [],
@@ -408,7 +410,9 @@ describe("LSPService.ensureWarmForSweep warm-up retry/skip (#744)", () => {
 		expect(waitCalls.length).toBe(2); // initial timeout + successful retry
 
 		// The retry confirmed the server ready, so a later warm-check is a no-op.
-		const again = await service.ensureWarmForSweep(filePath, { timeoutMs: 500 });
+		const again = await service.ensureWarmForSweep(filePath, {
+			timeoutMs: 500,
+		});
 		expect(again.performedWarmup).toBe(false);
 		expect(again.failedServerIds).toEqual([]);
 		expect(waitCalls.length).toBe(2); // unchanged — no extra round trip
@@ -508,7 +512,9 @@ describe("LSPService.ensureWarmForSweep negative cache (#799)", () => {
 		const { LSPService } = await import("../../../clients/lsp/index.js");
 		const service = new LSPService();
 
-		const first = await service.ensureWarmForSweep(filePath, { timeoutMs: 500 });
+		const first = await service.ensureWarmForSweep(filePath, {
+			timeoutMs: 500,
+		});
 		expect(first.performedWarmup).toBe(true);
 		expect(first.failedServerIds).toEqual(["workspace-indexer-generic"]);
 		expect(waitCalls.length).toBe(2); // initial attempt + retry
@@ -541,7 +547,9 @@ describe("LSPService.ensureWarmForSweep negative cache (#799)", () => {
 		const { LSPService } = await import("../../../clients/lsp/index.js");
 		const service = new LSPService();
 
-		const first = await service.ensureWarmForSweep(filePath, { timeoutMs: 500 });
+		const first = await service.ensureWarmForSweep(filePath, {
+			timeoutMs: 500,
+		});
 		expect(first.failedServerIds).toEqual(["workspace-indexer-generic"]);
 
 		// An ordinary confirmed touch (e.g. a real per-edit dispatch) proves the
@@ -684,10 +692,12 @@ describe("LSP warm-up telemetry pairing (#1374)", () => {
 		let phases = logLatency.mock.calls
 			.map(([entry]) => entry.phase)
 			.filter((phase) => phase?.startsWith("lsp_sweep_warmup_"));
-		expect(phases.filter((phase) => phase === "lsp_sweep_warmup_start")).toHaveLength(1);
-		expect(phases.filter((phase) => phase !== "lsp_sweep_warmup_start")).toEqual([
-			"lsp_sweep_warmup_done",
-		]);
+		expect(
+			phases.filter((phase) => phase === "lsp_sweep_warmup_start"),
+		).toHaveLength(1);
+		expect(
+			phases.filter((phase) => phase !== "lsp_sweep_warmup_start"),
+		).toEqual(["lsp_sweep_warmup_done"]);
 
 		logLatency.mockReset();
 		const failed = makeControlledClient(server.id, tmp, ["timeout"]);
@@ -697,8 +707,12 @@ describe("LSP warm-up telemetry pairing (#1374)", () => {
 		phases = logLatency.mock.calls
 			.map(([entry]) => entry.phase)
 			.filter((phase) => phase?.startsWith("lsp_sweep_warmup_"));
-		expect(phases.filter((phase) => phase === "lsp_sweep_warmup_start")).toHaveLength(2);
-		expect(phases.filter((phase) => phase !== "lsp_sweep_warmup_start")).toHaveLength(2);
+		expect(
+			phases.filter((phase) => phase === "lsp_sweep_warmup_start"),
+		).toHaveLength(2);
+		expect(
+			phases.filter((phase) => phase !== "lsp_sweep_warmup_start"),
+		).toHaveLength(2);
 		expect(phases).toContain("lsp_sweep_warmup_failed");
 
 		logLatency.mockReset();
@@ -720,9 +734,11 @@ describe("LSP warm-up telemetry pairing (#1374)", () => {
 		phases = logLatency.mock.calls
 			.map(([entry]) => entry.phase)
 			.filter((phase) => phase?.startsWith("lsp_sweep_warmup_"));
-		expect(phases.filter((phase) => phase === "lsp_sweep_warmup_start")).toHaveLength(1);
-		expect(phases.filter((phase) => phase !== "lsp_sweep_warmup_start")).toEqual([
-			"lsp_sweep_warmup_aborted",
-		]);
+		expect(
+			phases.filter((phase) => phase === "lsp_sweep_warmup_start"),
+		).toHaveLength(1);
+		expect(
+			phases.filter((phase) => phase !== "lsp_sweep_warmup_start"),
+		).toEqual(["lsp_sweep_warmup_aborted"]);
 	});
 });

@@ -28,34 +28,37 @@ function makeEnv() {
 }
 
 describe("module_report — native-grammar callback slices (Swift/C++)", () => {
-	it.skipIf(swiftBlocked)("flags Swift strong vs weak self capture in closures", async () => {
-		const env = makeEnv();
-		const sw = createTempFile(
-			env.tmpDir,
-			"lifecycle.swift",
-			[
-				"class C {",
-				"  func run() {",
-				"    DispatchQueue.main.async {",
-				"      self.refresh()",
-				"    }",
-				"  }",
-				"  func safe() { api.fetch { [weak self] in self?.done() } }",
-				"}",
-			].join("\n"),
-		);
+	it.skipIf(swiftBlocked)(
+		"flags Swift strong vs weak self capture in closures",
+		async () => {
+			const env = makeEnv();
+			const sw = createTempFile(
+				env.tmpDir,
+				"lifecycle.swift",
+				[
+					"class C {",
+					"  func run() {",
+					"    DispatchQueue.main.async {",
+					"      self.refresh()",
+					"    }",
+					"  }",
+					"  func safe() { api.fetch { [weak self] in self?.done() } }",
+					"}",
+				].join("\n"),
+			);
 
-		const report = await moduleReport(sw, env.tmpDir);
-		expect(report.callbackSupport).toBe("tuned");
-		// Strong self capture across an async boundary = retain-cycle risk.
-		expect(
-			report.callbacks.find((c) => c.flags?.includes("captures self")),
-		).toBeDefined();
-		// The [weak self] closure is the safe variant.
-		expect(
-			report.callbacks.find((c) => c.flags?.includes("weak self")),
-		).toBeDefined();
-	});
+			const report = await moduleReport(sw, env.tmpDir);
+			expect(report.callbackSupport).toBe("tuned");
+			// Strong self capture across an async boundary = retain-cycle risk.
+			expect(
+				report.callbacks.find((c) => c.flags?.includes("captures self")),
+			).toBeDefined();
+			// The [weak self] closure is the safe variant.
+			expect(
+				report.callbacks.find((c) => c.flags?.includes("weak self")),
+			).toBeDefined();
+		},
+	);
 
 	it("flags C++ by-reference lambda capture and thread launches", async () => {
 		const env = makeEnv();

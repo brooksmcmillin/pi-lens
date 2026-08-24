@@ -5,6 +5,7 @@
  * with the existing index.ts tool_result handler.
  */
 
+import { CASCADE_DIAGNOSTICS_TTL_MS } from "../cascade-types.js";
 import { getDiagnosticLogger, type LogContext } from "../diagnostic-logger.js";
 import type { FileKind } from "../file-kinds.js";
 import { detectFileKind } from "../file-kinds.js";
@@ -45,6 +46,11 @@ export { clearLatencyReports, formatLatencyReport, getLatencyReports };
 import * as nodeFs from "node:fs";
 import * as nodePath from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+	CASCADE_NEIGHBOUR_BUDGET,
+	type CascadeBudgetZone,
+	deriveCascadeNeighbourBudget,
+} from "../cascade-budget.js";
 import { formatCascadeNeighborDiagnostics } from "../cascade-format.js";
 import { logCascade } from "../cascade-logger.js";
 import type {
@@ -68,7 +74,11 @@ import { getServersForFileWithConfig } from "../lsp/config.js";
 import { getLSPService } from "../lsp/index.js";
 import { isExternalOrVendorFile, normalizeMapKey } from "../path-utils.js";
 import { getProjectIgnoreMatcher } from "../file-utils.js";
-import { resetAstGrepUnsupportedLanguageLog } from "./runners/ast-grep-napi.js";
+import {
+	resetAstGrepNapiLoadState,
+	resetAstGrepUnsupportedLanguageLog,
+} from "./runners/ast-grep-napi.js";
+import { resetTreeSitterClientLoadState } from "../tree-sitter-shared.js";
 import { isTestRoleCollateral } from "../collateral-test-role.js";
 import {
 	clearReviewGraphWorkspaceCache,
@@ -419,13 +429,18 @@ export function getDispatchGroupsForKind(
 export function resetDispatchBaselines(cwd?: string): void {
 	if (cwd) applyProjectLensConfig(cwd);
 	resetAstGrepUnsupportedLanguageLog();
+	// #1567: a genuine-failure verdict or a live transient cooldown on the
+	// napi load latch is session-scoped state, not process-lifetime state.
+	resetAstGrepNapiLoadState();
+	// #1592: same shape for the web-tree-sitter load latch — an evaluation-
+	// shaped rejection is session-scoped state, not process-lifetime state.
+	resetTreeSitterClientLoadState();
 	sessionFacts.clearAll();
 	resetSessionSlopScore();
 	clearCoverageNoticeState();
 	clearReviewGraphWorkspaceCache();
 	clearReverseDepsIndexCache();
 	clearModuleGraphCache();
-	neighborTouchCache.clear();
 	recentlyCleanNeighborCache.clear();
 	primaryFilesThisTurn.clear();
 	cascadeDiagnosticBaselines.clear();
@@ -452,15 +467,21 @@ export function getCascadeSessionStats(): {
 	return { ...cascadeSessionStats };
 }
 
-// A5: per-turn neighbor-touch cache keyed by normalized path.
-// Avoids re-touching the same neighbor on every write in a multi-file refactor.
-// Invalidated when writeSeq advances (i.e. a new write starts a new pipeline run).
-type NeighborCacheEntry = {
-	turnSeq: number;
-	writeSeq: number;
-	diagnostics: import("./types.js").Diagnostic[];
-};
-const neighborTouchCache = new Map<string, NeighborCacheEntry>();
+// #1899: the A5 per-write `neighborTouchCache` used to live here. It was
+// removed as dead BY CONSTRUCTION, not merely unused. Its read gate required
+// `cached.turnSeq === turnSeq && cached.writeSeq === writeSeq`, and `writeSeq`
+// is pi's per-write index (`ctx.telemetry.writeIndex`, clients/pipeline.ts),
+// which advances on every write. One write starts one cascade, so a hit needed
+// two cascade computations inside a SINGLE write — a shape the pipeline never
+// produces. Dogfooding measured 0 hits across 236 cold touches.
+//
+// Broadening it was considered and rejected. Dropping the `writeSeq` equality
+// to make it turn-scoped would serve a neighbour's diagnostics from BEFORE a
+// later write in the same turn, which is the stale-answer trap #1092/#1095
+// closed. The two caches that remain already cover the safe reuse: the
+// passive-snapshot path (TTL plus content binding) and
+// `recentlyCleanNeighborCache` (clean answers only, with a fresh-passive-error
+// override).
 
 // Cross-turn clean cache: neighbor touches that recently returned no errors can
 // be skipped for a few turns. LSP servers push diagnostics proactively when a
@@ -471,14 +492,12 @@ const recentlyCleanNeighborCache = new Map<
 	RecentlyCleanNeighborEntry
 >();
 
-/** O(1) entry counts of this module's turn-bounded caches (#1123 item 2
- *  memory attribution) — both are `Map.size` reads, never iterated. */
+/** O(1) entry count of this module's turn-bounded cache (#1123 item 2
+ *  memory attribution) — a `Map.size` read, never iterated. */
 export function getDispatchCascadeCacheStats(): {
-	neighborTouchCacheSize: number;
 	recentlyCleanNeighborCacheSize: number;
 } {
 	return {
-		neighborTouchCacheSize: neighborTouchCache.size,
 		recentlyCleanNeighborCacheSize: recentlyCleanNeighborCache.size,
 	};
 }
@@ -494,7 +513,6 @@ function ensureCascadeTurnScope(turnSeq: number): void {
 	if (turnSeq === cascadeTurnScope) return;
 	cascadeTurnScope = turnSeq;
 	primaryFilesThisTurn.clear();
-	neighborTouchCache.clear();
 	for (const [key, entry] of recentlyCleanNeighborCache) {
 		if (turnSeq - entry.turnSeq > RECENTLY_CLEAN_TTL_TURNS) {
 			recentlyCleanNeighborCache.delete(key);
@@ -502,7 +520,6 @@ function ensureCascadeTurnScope(turnSeq: number): void {
 	}
 }
 
-const CASCADE_TTL_MS = 240_000;
 const MAX_PER_FILE = RUNTIME_CONFIG.pipeline.cascadeMaxDiagnosticsPerFile;
 const MAX_FILES = RUNTIME_CONFIG.pipeline.cascadeMaxFiles;
 
@@ -573,6 +590,10 @@ function readBoundToCurrentDisk(
  * a future flag cannot be silently missed at just one of the several gate sites:
  *  - `inconclusive` (#1093/#571): the notify/diagnostics wait lapsed its deadline,
  *    so a resolved `[]` is NOT a confirmed clean (the #533 false-clean trap).
+ *    #1549: this now means a PRIMARY's deadline lapsed. A slow auxiliary lands in
+ *    the coverage-gap bullet below instead of collapsing the whole touch, so this
+ *    predicate still fails closed for it while the primary's findings survive —
+ *    which is the point: the two disqualifiers were doing one job for two causes.
  *  - a COVERAGE GAP (#1470/#1493): an auxiliary never reported — its push wait was
  *    cut off by the aux grace timer (#1470), or it stayed silent with no stored
  *    publication for this content (#1493) — so the merged result is missing whatever
@@ -592,6 +613,32 @@ function readBoundToCurrentDisk(
  */
 function readInconclusive(rawDiags: unknown): boolean {
 	return (rawDiags as { inconclusive?: boolean })?.inconclusive === true;
+}
+
+/**
+ * #1549: an inconclusive `neighbor_touch` row used to carry NO attribution, so a
+ * forensic sweep could only infer the cause from duration histograms. `touchFile`
+ * now names the PRIMARY server(s) whose deadline produced the verdict and which
+ * deadline it was (`notify-write` vs `diagnostics-wait`, or `mixed`) — carry both
+ * into cascade.log so the record stands on its own. Read off the wrapper, like
+ * every other flag here (#1179).
+ */
+function readInconclusiveAttribution(rawDiags: unknown): {
+	inconclusiveServerIds?: string[];
+	inconclusiveReason?: string;
+} {
+	const wrapper = rawDiags as {
+		inconclusiveServerIds?: string[];
+		inconclusiveReason?: string;
+	};
+	return {
+		...(wrapper?.inconclusiveServerIds?.length && {
+			inconclusiveServerIds: [...wrapper.inconclusiveServerIds],
+		}),
+		...(wrapper?.inconclusiveReason && {
+			inconclusiveReason: wrapper.inconclusiveReason,
+		}),
+	};
 }
 
 function isConfirmedTouch(rawDiags: TouchFileResult): boolean {
@@ -622,8 +669,13 @@ const REVERSE_DEPS_MAX_WARM_ROOTS = 8;
 const REVERSE_DEPS_IDLE_EVICT_MS_DEFAULT = 20 * 60_000;
 
 function reverseDepsIdleEvictMs(): number {
-	const value = Number.parseInt(process.env.PI_LENS_REVERSE_DEPS_IDLE_EVICT_MS ?? "", 10);
-	return Number.isSafeInteger(value) && value > 0 ? value : REVERSE_DEPS_IDLE_EVICT_MS_DEFAULT;
+	const value = Number.parseInt(
+		process.env.PI_LENS_REVERSE_DEPS_IDLE_EVICT_MS ?? "",
+		10,
+	);
+	return Number.isSafeInteger(value) && value > 0
+		? value
+		: REVERSE_DEPS_IDLE_EVICT_MS_DEFAULT;
 }
 
 function deleteReverseDepsEntry(key: string): void {
@@ -644,7 +696,8 @@ function touchReverseDepsEntry(
 	if (!armIdleTimer) return;
 	const stamp = entry.lastUsedAt;
 	entry.idleTimer = setTimeout(() => {
-		if (reverseDepsIndexCache.get(key) !== entry || entry.lastUsedAt !== stamp) return;
+		if (reverseDepsIndexCache.get(key) !== entry || entry.lastUsedAt !== stamp)
+			return;
 		deleteReverseDepsEntry(key);
 	}, reverseDepsIdleEvictMs());
 	entry.idleTimer.unref?.();
@@ -659,7 +712,9 @@ function setReverseDepsEntry(
 	reverseDepsIndexCache.set(key, resident);
 	touchReverseDepsEntry(key, resident, armIdleTimer);
 	while (reverseDepsIndexCache.size > REVERSE_DEPS_MAX_WARM_ROOTS) {
-		const victim = [...reverseDepsIndexCache.entries()].sort(([, a], [, b]) => a.lastUsedAt - b.lastUsedAt)[0];
+		const victim = [...reverseDepsIndexCache.entries()].sort(
+			([, a], [, b]) => a.lastUsedAt - b.lastUsedAt,
+		)[0];
 		if (!victim) break;
 		deleteReverseDepsEntry(victim[0]);
 	}
@@ -700,11 +755,9 @@ const CASCADE_TRANSITIVE_DEPTH = Math.max(
 	1,
 	Number.parseInt(process.env.PI_LENS_CASCADE_TRANSITIVE_DEPTH ?? "2", 10) || 2,
 );
-const CASCADE_NEIGHBOUR_BUDGET = Math.max(
-	MAX_FILES,
-	Number.parseInt(process.env.PI_LENS_CASCADE_NEIGHBOUR_BUDGET ?? "40", 10) ||
-		40,
-);
+// #1462: the cap itself, and the derivation that narrows it when this run has
+// already spent the settle window, live in clients/cascade-budget.ts alongside
+// `cascadeSettleWaitMs` — the two knobs only make sense read together.
 // Exported (not just module-local) so the MCP warm-analyze seam
 // (clients/mcp/analyze.ts, #536) can gate its own buildOrUpdateGraph call on
 // the SAME file-kind eligibility this cascade path uses — one source of truth
@@ -829,6 +882,8 @@ export async function computeCascadeForFile(
 			projectSeq: () => number;
 			getFilesChangedSince: (seq: number) => string[];
 		};
+		/** Current turn_end cascade settle start, or undefined outside that wait. */
+		turnEndCascadeSettleStart?: () => number | undefined;
 		/**
 		 * Post-format/post-fix file content, already read by the pipeline before
 		 * this deferred cascade runs (#348 phase 2). Reused here to update the
@@ -854,1210 +909,1367 @@ export async function computeCascadeForFile(
 ): Promise<CascadeRun> {
 	const reverseDepsTimersToRelease = new Set<string>();
 	const reverseDepsEntriesAtStart = new Set(reverseDepsIndexCache.values());
+	// #1462: legacy callers use this run's age when sizing the neighbour walk.
+	// The pipeline supplies a live turn_end clock so deferred work does not charge
+	// time that elapsed before turn_end began waiting.
+	const cascadeStart = Date.now();
 	try {
-	const {
-		hasBlockers = false,
-		dbg,
-		turnSeq = 0,
-		writeSeq,
-		seqState,
-		fileContent,
-		wordIndex,
-		onWordIndexUpdated,
-	} = options;
-
-	ensureCascadeTurnScope(turnSeq);
-
-	if (hasBlockers) {
-		logCascade({
-			phase: "cascade_skip",
-			filePath,
-			reason: "primary_has_blockers",
-		});
-		return {
-			filePath,
-			result: undefined,
-			neighborCount: 0,
-			diagnosticCount: 0,
-			skipReason: "blockers" as CascadeSkipReason,
-		};
-	}
-
-	const fileKind = detectFileKind(filePath);
-	if (!fileKind) {
-		logCascade({ phase: "cascade_skip", filePath, reason: "non_code_file" });
-		return {
-			filePath,
-			result: undefined,
-			neighborCount: 0,
-			diagnosticCount: 0,
-			skipReason: "non_code" as CascadeSkipReason,
-		};
-	}
-
-	const normalizedFile = resolveRunnerPath(cwd, filePath);
-	const normalizedFileKey = normalizeMapKey(normalizedFile);
-
-	// B10: record this file as a primary edit so later cascade calls in the same
-	// turn won't show it as a neighbor.
-	primaryFilesThisTurn.add(normalizedFileKey);
-
-	// #348 phase 2: warm per-edit word-index maintenance, review-graph style —
-	// update at the SAME seam as the graph rebuild below, using content the
-	// pipeline already read (no extra I/O). See computeCascadeForFile's
-	// `wordIndex`/`fileContent` doc comments for the cold/no-forward-index
-	// no-op rules.
-	//
-	// Keyed by `path.resolve(filePath)` (native separators, tool-input casing).
-	// Since #1025 the word index's path maps are `PathKeyedMap`s that fold every
-	// key through `wordIndexKey` (`normalizeEphemeralMapKey` — slash-fold +
-	// win32-lowercase) INTERNALLY, so this per-edit key and the build path's own
-	// walk-derived key (`collectWordIndexDocs` → `collectSourceFilesAsync`)
-	// collapse to the same entry regardless of on-disk-vs-input casing/separator.
-	// The old hazard — this update silently orphaning a SECOND entry next to the
-	// walker's original-cased one — is now structurally impossible at the map
-	// layer, so this seam no longer has to hand-match the build path's key shape.
-	updateWordIndexForCascade({
-		wordIndex,
-		filePath: nodePath.resolve(filePath),
-		content: fileContent,
-		onUpdated: onWordIndexUpdated,
-		dbg,
-	});
-
-	let impact: ReturnType<typeof computeImpactCascade> = {
-		filePath: normalizedFile,
-		changedSymbols: [],
-		directImporters: [],
-		directCallers: [],
-		neighborFiles: [],
-		riskFlags: [],
-	};
-	let sortedNeighbors: string[] = [];
-	let importerSet = new Set<string>();
-	let callerSet = new Set<string>();
-	let referenceCount = 0;
-	// #1446 item 4: how many eligible neighbors the flat CASCADE_NEIGHBOUR_BUDGET
-	// cut off, distinct from candidates dropped by the filters above it
-	// (missing on disk, vendor, ignored, already-primary-this-turn) — those are
-	// never actionable regardless of budget, so counting them as "truncated"
-	// would overstate what a larger budget could actually recover.
-	let cascadeBudgetTruncated = 0;
-
-	if (CASCADE_GRAPH_KINDS.has(fileKind)) {
-		const graphStart = Date.now();
-		const graph = await buildOrUpdateGraph(
-			cwd,
-			[normalizedFile],
-			sessionFacts,
+		const {
+			hasBlockers = false,
+			dbg,
+			turnSeq = 0,
+			writeSeq,
 			seqState,
-		);
-		const graphMs = Date.now() - graphStart;
-		// #459: the reuse decision keys on graph.buildGeneration — a stamp that
-		// travels WITH the graph instance this cascade holds. Deliberately NOT the
-		// global last-build-info slot: post-#450 cascades overlap, and another
-		// cascade's cache-hit build can overwrite that slot (graphChanged:false)
-		// between this build mutating the graph and this read — which would turn a
-		// changed graph into a spurious reuse of a stale index that steady-state
-		// cache hits then never heal. Generation equality can't be clobbered into
-		// a false positive: a graph-mutating build always mints a new generation.
-		// An unstamped graph (mode "skipped") always rebuilds.
-		const graphBuildInfo = getGraphBuildInfoForGraph(graph);
-		// #1179 fail-closed: `getGraphBuildInfoForGraph` falls back to the global
-		// last-build slot on a WeakMap identity miss, which — once some real build
-		// has stamped — could carry a SIBLING graph's healthy `mode: "cached"`. The
-		// degraded-marker gate below must not read a sibling's state, so it checks
-		// trustworthiness and, when the slot cannot be trusted for THIS graph, treats
-		// coverage as unknown (degraded) rather than clean. Always trustworthy on the
-		// live path — every `_doBuildGraph` return stamps the graph before the cascade
-		// reads it — so this is inert today and only hardens a future unstamped graph.
-		const graphBuildInfoTrustworthy = graphBuildInfoIsTrustworthy(graph);
-		const workspaceKey = normalizeMapKey(cwd);
-		const cachedReverseDeps = reverseDepsIndexCache.get(workspaceKey);
-		if (cachedReverseDeps) {
-			touchReverseDepsEntry(workspaceKey, cachedReverseDeps, false);
-			reverseDepsTimersToRelease.add(workspaceKey);
-		}
-		const importDelta = getGraphImportChanges(graph);
-		// A one-step delta is only usable against an index cached at exactly the
-		// delta's predecessor generation. Builds minted elsewhere (mcp analyze,
-		// lens-map, session warm) advance generations whose import changes this
-		// delta does not cover — reusing/patching across that gap stamps a stale
-		// index as current, and generation equality then hides the loss forever
-		// (#939 review finding 1).
-		const deltaContiguous =
-			importDelta !== undefined &&
-			importDelta.fromGeneration !== undefined &&
-			cachedReverseDeps !== undefined &&
-			cachedReverseDeps.generation === importDelta.fromGeneration;
-		const importChanges = deltaContiguous ? importDelta.changes : undefined;
-		const importsChanged = importChanges?.some(
-			(change) =>
-				change.existedBefore !== change.existsAfter ||
-				change.priorTargets.length !== change.newTargets.length ||
-				change.priorTargets.some(
-					(target, index) => target !== change.newTargets[index],
-				),
-		);
-		const canReuse =
-			reverseDepsReuseEnabled() &&
-			cachedReverseDeps !== undefined &&
-			((graph.buildGeneration !== undefined &&
-				cachedReverseDeps.generation === graph.buildGeneration) ||
-				(importChanges !== undefined && !importsChanged));
+			turnEndCascadeSettleStart,
+			fileContent,
+			wordIndex,
+			onWordIndexUpdated,
+		} = options;
 
-		let reverseDepsIndex: ReverseDependencyIndex;
-		let reverseDepsSaved: boolean;
-		if (canReuse && cachedReverseDeps) {
-			reverseDepsIndex = cachedReverseDeps.index;
-			reverseDepsSaved = cachedReverseDeps.savedToSnapshot;
-			cachedReverseDeps.generation = graph.buildGeneration;
+		ensureCascadeTurnScope(turnSeq);
+
+		if (hasBlockers) {
 			logCascade({
-				phase: "reverse_deps_cache",
+				phase: "cascade_skip",
 				filePath,
-				durationMs: Date.now() - graphStart,
-				metadata: {
-					action: "reused_unchanged",
-					savedToSnapshot: reverseDepsSaved,
-					importsFileCount: Object.keys(reverseDepsIndex.imports).length,
-					importedByFileCount: Object.keys(reverseDepsIndex.importedBy).length,
-				},
+				reason: "primary_has_blockers",
 			});
-		} else if (cachedReverseDeps && importChanges && importsChanged) {
-			reverseDepsIndex = patchReverseDependencyIndex(
-				cachedReverseDeps.index,
-				importChanges,
-			);
-			reverseDepsSaved = writeReverseDependencyIndexToSnapshot({
-				cwd,
-				index: reverseDepsIndex,
-				dbg,
-			});
-			setReverseDepsEntry(workspaceKey, {
-				index: reverseDepsIndex,
-				savedToSnapshot: reverseDepsSaved,
-				generation: graph.buildGeneration,
-			}, false);
-			reverseDepsTimersToRelease.add(workspaceKey);
-			logCascade({
-				phase: "reverse_deps_cache",
+			return {
 				filePath,
-				durationMs: Date.now() - graphStart,
-				metadata: {
-					action: "patched_import_changes",
-					changedFileCount: importChanges.length,
-					savedToSnapshot: reverseDepsSaved,
-				},
-			});
-		} else {
-			reverseDepsIndex = buildReverseDependencyIndexFromGraph({
-				cwd,
-				graph,
-			});
-			reverseDepsSaved = writeReverseDependencyIndexToSnapshot({
-				cwd,
-				index: reverseDepsIndex,
-				dbg,
-			});
-			setReverseDepsEntry(workspaceKey, {
-				index: reverseDepsIndex,
-				savedToSnapshot: reverseDepsSaved,
-				generation: graph.buildGeneration,
-			}, false);
-			reverseDepsTimersToRelease.add(workspaceKey);
-			logCascade({
-				phase: "reverse_deps_cache",
-				filePath,
-				durationMs: Date.now() - graphStart,
-				metadata: {
-					action: "refresh_from_review_graph",
-					savedToSnapshot: reverseDepsSaved,
-					importsFileCount: Object.keys(reverseDepsIndex.imports).length,
-					importedByFileCount: Object.keys(reverseDepsIndex.importedBy).length,
-					importEdgeCount: Object.values(reverseDepsIndex.imports).reduce(
-						(total, imports) => total + imports.length,
-						0,
-					),
-				},
-			});
-		}
-
-		// Count files represented in the graph (nodes with a filePath).
-		const graphFileCount = new Set(
-			[...graph.nodes.values()].flatMap((n) =>
-				n.filePath ? [n.filePath] : [],
-			),
-		).size;
-
-		logCascade({
-			phase: "graph_build",
-			filePath,
-			graphBuiltMs: graphMs,
-			graphReused: graphBuildInfo.reused,
-			graphNodeCount: graph.nodes.size,
-			graphFileCount,
-			graphChangedSymbolCount: (
-				graph.changedSymbolsByFile.get(normalizedFileKey) ?? []
-			).length,
-			metadata: {
-				graphBuildMode: graphBuildInfo.mode,
-				skipReason: graphBuildInfo.skipReason,
-				sourceFileCount: graphBuildInfo.sourceFileCount,
-				maxFileCount: graphBuildInfo.maxFileCount,
-				// #451: when the seq fast path fell back (or was skipped), why — so
-				// cascade.log surfaces the fast-path hit/miss rate.
-				seqFastpathFallback: graphBuildInfo.seqFastpathFallback,
-			},
-		});
-
-		impact = computeImpactCascade(graph, normalizedFile, cwd);
-		// #1023: buildOrUpdateGraph returns an EMPTY graph (seeded only with the
-		// changed file's own symbols) when the repo is over
-		// PI_LENS_REVIEW_GRAPH_MAX_FILES (`too_many_files`) or the root is unsafe
-		// (`unsafe_root`) — both stamp mode "skipped" on the already-read
-		// graphBuildInfo. A capped or entry-budget-truncated graph is also not a
-		// complete dependent set even though it has nodes, so it must not look like
-		// a clean leaf. Thread the ALREADY-KNOWN degraded state (never re-derived)
-		// onto the result so the turn-end seam surfaces an honest advisory instead
-		// of a silent all-clear (#533). Keyed strictly off the graph's explicit
-		// degraded marker, NOT off `neighborFiles.length === 0`.
-		if (
-			(graphBuildInfo.mode === "skipped" ||
-				graph.persistCoverage?.partial === true ||
-				!graphBuildInfoTrustworthy) &&
-			!impact.indeterminate
-		) {
-			const coverage = graph.persistCoverage;
-			impact.indeterminate = {
-				reason: "graph_degraded",
-				detail: !graphBuildInfoTrustworthy
-					? // #1179 fail-closed: the graph's own build-info was not found under
-						// its identity and the global slot may be a sibling build's — don't
-						// trust its mode. Surface an honest "unknown" advisory rather than a
-						// (possibly sibling-derived) all-clear.
-						"review graph coverage unknown — build state unavailable for this graph"
-					: graphBuildInfo.mode === "skipped"
-						? graphBuildInfo.skipReason === "too_many_files"
-							? graphBuildInfo.sourceFileCountTruncated
-								? `review graph disabled — more than ${graphBuildInfo.maxFileCount ?? "?"} files (cap ${graphBuildInfo.maxFileCount ?? "?"})`
-								: `review graph disabled — ${graphBuildInfo.sourceFileCount ?? "?"} files over the ${graphBuildInfo.maxFileCount ?? "?"} cap`
-							: graphBuildInfo.skipReason === "unsafe_root"
-								? "review graph skipped — workspace root is at/above home dir"
-								: `review graph unavailable (${graphBuildInfo.skipReason ?? "skipped"})`
-						: coverage?.sourceFilesTruncated
-							? "review graph partial — source walk stopped at its visited-entry budget"
-							: "review graph partial — persisted graph coverage is incomplete",
-				sourceFileCount: graphBuildInfo.sourceFileCount,
-				maxFileCount: graphBuildInfo.maxFileCount,
+				result: undefined,
+				neighborCount: 0,
+				diagnosticCount: 0,
+				skipReason: "blockers" as CascadeSkipReason,
 			};
 		}
-		const reverseDepNeighbors = getAffectedFilesFromIndex(
-			reverseDepsIndex,
-			normalizedFile,
-			1,
-			MAX_FILES * 2,
-		);
-		logCascade({
-			phase: "reverse_deps_cache",
-			filePath,
-			metadata: {
-				action: "merge_neighbors",
-				depth: 1,
-				neighborCount: reverseDepNeighbors.length,
-				neighbors: reverseDepNeighbors.slice(0, 10),
-			},
-		});
-		if (reverseDepNeighbors.length > 0) {
-			impact.directImporters = [
-				...new Set([...impact.directImporters, ...reverseDepNeighbors]),
-			];
-			impact.neighborFiles = [
-				...new Set([...impact.neighborFiles, ...reverseDepNeighbors]),
-			];
-			logCascade({
-				phase: "neighbor_snapshot",
+
+		const fileKind = detectFileKind(filePath);
+		if (!fileKind) {
+			logCascade({ phase: "cascade_skip", filePath, reason: "non_code_file" });
+			return {
 				filePath,
-				neighborFile: "[reverse-deps-cache]",
-				diagnosticCount: reverseDepNeighbors.length,
-				autoPropagate: false,
-				metadata: { reverseDepsCache: true },
-			});
+				result: undefined,
+				neighborCount: 0,
+				diagnosticCount: 0,
+				skipReason: "non_code" as CascadeSkipReason,
+			};
 		}
 
-		// Symbol-level blast radius via LSP references (precision upgrade over
-		// file-level import edges). Only when changed symbols are detected.
-		// Keep the budget tight: 750ms per symbol, 1200ms total, max 3 symbols.
-		if (impact.changedSymbols.length > 0) {
-			const lspService = getLSPService();
-			const symbolNodeIds =
-				graph.symbolNodesByFile.get(normalizedFileKey) ?? [];
-			const refFiles = new Set<string>();
-			const refsStart = Date.now();
-			for (const symbolName of impact.changedSymbols.slice(0, 3)) {
-				const symbolNodeId = symbolNodeIds.find((id) => {
-					const node = graph.nodes.get(id);
-					return node?.symbolName === symbolName;
-				});
-				if (!symbolNodeId) continue;
-				const node = graph.nodes.get(symbolNodeId);
-				const line = Number(node?.metadata?.line ?? 0);
-				const column = Number(node?.metadata?.column ?? 0);
-				if (line <= 0) continue;
-				// #1109: store the timer and clear it once the race settles. Without
-				// this, when `references()` wins (the common case), the losing
-				// `setTimeout` stays a REF'D pending timer for the remaining 750ms —
-				// harmless in a long-lived session, but a keep-alive tail in a
-				// one-shot `pi --print` process (same uncleared-race-timeout class
-				// fixed for the LSP client-wait leak in clients/lsp/index.ts, #1097).
-				let refsTimer: ReturnType<typeof setTimeout> | undefined;
-				try {
-					const refs = await Promise.race([
-						lspService.references(normalizedFile, line - 1, column - 1, false),
-						new Promise<never>((_, reject) => {
-							refsTimer = setTimeout(() => reject(new Error("timeout")), 750);
-						}),
-					]);
-					for (const ref of refs) {
-						let resolved: string;
-						try {
-							resolved = ref.uri.startsWith("file://")
-								? fileURLToPath(ref.uri)
-								: ref.uri;
-						} catch {
-							continue;
-						}
-						if (
-							normalizeMapKey(resolved) !== normalizedFileKey &&
-							nodeFs.existsSync(resolved)
-						) {
-							refFiles.add(normalizeMapKey(resolved));
-						}
-					}
-				} catch {
-					// Timeout or LSP error — fall back to import-graph neighbors
-				} finally {
-					if (refsTimer !== undefined) clearTimeout(refsTimer);
-				}
-				if (Date.now() - refsStart > 1200) break; // Hard ceiling
+		const normalizedFile = resolveRunnerPath(cwd, filePath);
+		const normalizedFileKey = normalizeMapKey(normalizedFile);
+
+		// B10: record this file as a primary edit so later cascade calls in the same
+		// turn won't show it as a neighbor.
+		primaryFilesThisTurn.add(normalizedFileKey);
+
+		// #348 phase 2: warm per-edit word-index maintenance, review-graph style —
+		// update at the SAME seam as the graph rebuild below, using content the
+		// pipeline already read (no extra I/O). See computeCascadeForFile's
+		// `wordIndex`/`fileContent` doc comments for the cold/no-forward-index
+		// no-op rules.
+		//
+		// Keyed by `path.resolve(filePath)` (native separators, tool-input casing).
+		// Since #1025 the word index's path maps are `PathKeyedMap`s that fold every
+		// key through `wordIndexKey` (`normalizeEphemeralMapKey` — slash-fold +
+		// win32-lowercase) INTERNALLY, so this per-edit key and the build path's own
+		// walk-derived key (`collectWordIndexDocs` → `collectSourceFilesAsync`)
+		// collapse to the same entry regardless of on-disk-vs-input casing/separator.
+		// The old hazard — this update silently orphaning a SECOND entry next to the
+		// walker's original-cased one — is now structurally impossible at the map
+		// layer, so this seam no longer has to hand-match the build path's key shape.
+		updateWordIndexForCascade({
+			wordIndex,
+			filePath: nodePath.resolve(filePath),
+			content: fileContent,
+			onUpdated: onWordIndexUpdated,
+			dbg,
+		});
+
+		let impact: ReturnType<typeof computeImpactCascade> = {
+			filePath: normalizedFile,
+			changedSymbols: [],
+			directImporters: [],
+			directCallers: [],
+			neighborFiles: [],
+			riskFlags: [],
+		};
+		let sortedNeighbors: string[] = [];
+		let importerSet = new Set<string>();
+		let callerSet = new Set<string>();
+		let referenceCount = 0;
+		let cascadeCandidateCount = 0;
+		let cascadeEligibleCount = 0;
+		let cascadeFilterDroppedCount = 0;
+		// #1446 item 4: how many eligible neighbors the flat CASCADE_NEIGHBOUR_BUDGET
+		// cut off, distinct from candidates dropped by the filters above it
+		// (missing on disk, vendor, ignored, already-primary-this-turn) — those are
+		// never actionable regardless of budget, so counting them as "truncated"
+		// would overstate what a larger budget could actually recover.
+		let cascadeBudgetTruncated = 0;
+		let transitiveTruncated = false;
+		// #1462: the budget actually in force for THIS run and the settle time left
+		// when it was sized. Both are overwritten inside the graph branch below,
+		// which is the only path that reaches `cascade_result` — the other branch
+		// returns a `non_code` skip before any of this is logged.
+		let cascadeNeighbourBudget = CASCADE_NEIGHBOUR_BUDGET;
+		let cascadeBudgetRemainingMs = 0;
+		let cascadeBudgetZone: CascadeBudgetZone = "fits";
+		let cascadeDeliveryWindowMs = 0;
+
+		if (CASCADE_GRAPH_KINDS.has(fileKind)) {
+			const graphStart = Date.now();
+			const graph = await buildOrUpdateGraph(
+				cwd,
+				[normalizedFile],
+				sessionFacts,
+				seqState,
+			);
+			const graphMs = Date.now() - graphStart;
+			// #459: the reuse decision keys on graph.buildGeneration — a stamp that
+			// travels WITH the graph instance this cascade holds. Deliberately NOT the
+			// global last-build-info slot: post-#450 cascades overlap, and another
+			// cascade's cache-hit build can overwrite that slot (graphChanged:false)
+			// between this build mutating the graph and this read — which would turn a
+			// changed graph into a spurious reuse of a stale index that steady-state
+			// cache hits then never heal. Generation equality can't be clobbered into
+			// a false positive: a graph-mutating build always mints a new generation.
+			// An unstamped graph (mode "skipped") always rebuilds.
+			const graphBuildInfo = getGraphBuildInfoForGraph(graph);
+			// #1179 fail-closed: `getGraphBuildInfoForGraph` falls back to the global
+			// last-build slot on a WeakMap identity miss, which — once some real build
+			// has stamped — could carry a SIBLING graph's healthy `mode: "cached"`. The
+			// degraded-marker gate below must not read a sibling's state, so it checks
+			// trustworthiness and, when the slot cannot be trusted for THIS graph, treats
+			// coverage as unknown (degraded) rather than clean. Always trustworthy on the
+			// live path — every `_doBuildGraph` return stamps the graph before the cascade
+			// reads it — so this is inert today and only hardens a future unstamped graph.
+			const graphBuildInfoTrustworthy = graphBuildInfoIsTrustworthy(graph);
+			const workspaceKey = normalizeMapKey(cwd);
+			const cachedReverseDeps = reverseDepsIndexCache.get(workspaceKey);
+			if (cachedReverseDeps) {
+				touchReverseDepsEntry(workspaceKey, cachedReverseDeps, false);
+				reverseDepsTimersToRelease.add(workspaceKey);
 			}
-			if (refFiles.size > 0) {
+			const importDelta = getGraphImportChanges(graph);
+			// A one-step delta is only usable against an index cached at exactly the
+			// delta's predecessor generation. Builds minted elsewhere (mcp analyze,
+			// lens-map, session warm) advance generations whose import changes this
+			// delta does not cover — reusing/patching across that gap stamps a stale
+			// index as current, and generation equality then hides the loss forever
+			// (#939 review finding 1).
+			const deltaContiguous =
+				importDelta !== undefined &&
+				importDelta.fromGeneration !== undefined &&
+				cachedReverseDeps !== undefined &&
+				cachedReverseDeps.generation === importDelta.fromGeneration;
+			const importChanges = deltaContiguous ? importDelta.changes : undefined;
+			const importsChanged = importChanges?.some(
+				(change) =>
+					change.existedBefore !== change.existsAfter ||
+					change.priorTargets.length !== change.newTargets.length ||
+					change.priorTargets.some(
+						(target, index) => target !== change.newTargets[index],
+					),
+			);
+			const canReuse =
+				reverseDepsReuseEnabled() &&
+				cachedReverseDeps !== undefined &&
+				((graph.buildGeneration !== undefined &&
+					cachedReverseDeps.generation === graph.buildGeneration) ||
+					(importChanges !== undefined && !importsChanged));
+
+			let reverseDepsIndex: ReverseDependencyIndex;
+			let reverseDepsSaved: boolean;
+			if (canReuse && cachedReverseDeps) {
+				reverseDepsIndex = cachedReverseDeps.index;
+				reverseDepsSaved = cachedReverseDeps.savedToSnapshot;
+				cachedReverseDeps.generation = graph.buildGeneration;
+				logCascade({
+					phase: "reverse_deps_cache",
+					filePath,
+					durationMs: Date.now() - graphStart,
+					metadata: {
+						action: "reused_unchanged",
+						savedToSnapshot: reverseDepsSaved,
+						importsFileCount: Object.keys(reverseDepsIndex.imports).length,
+						importedByFileCount: Object.keys(reverseDepsIndex.importedBy)
+							.length,
+					},
+				});
+			} else if (cachedReverseDeps && importChanges && importsChanged) {
+				reverseDepsIndex = patchReverseDependencyIndex(
+					cachedReverseDeps.index,
+					importChanges,
+				);
+				reverseDepsSaved = writeReverseDependencyIndexToSnapshot({
+					cwd,
+					index: reverseDepsIndex,
+					dbg,
+				});
+				setReverseDepsEntry(
+					workspaceKey,
+					{
+						index: reverseDepsIndex,
+						savedToSnapshot: reverseDepsSaved,
+						generation: graph.buildGeneration,
+					},
+					false,
+				);
+				reverseDepsTimersToRelease.add(workspaceKey);
+				logCascade({
+					phase: "reverse_deps_cache",
+					filePath,
+					durationMs: Date.now() - graphStart,
+					metadata: {
+						action: "patched_import_changes",
+						changedFileCount: importChanges.length,
+						savedToSnapshot: reverseDepsSaved,
+					},
+				});
+			} else {
+				reverseDepsIndex = buildReverseDependencyIndexFromGraph({
+					cwd,
+					graph,
+				});
+				reverseDepsSaved = writeReverseDependencyIndexToSnapshot({
+					cwd,
+					index: reverseDepsIndex,
+					dbg,
+				});
+				setReverseDepsEntry(
+					workspaceKey,
+					{
+						index: reverseDepsIndex,
+						savedToSnapshot: reverseDepsSaved,
+						generation: graph.buildGeneration,
+					},
+					false,
+				);
+				reverseDepsTimersToRelease.add(workspaceKey);
+				logCascade({
+					phase: "reverse_deps_cache",
+					filePath,
+					durationMs: Date.now() - graphStart,
+					metadata: {
+						action: "refresh_from_review_graph",
+						savedToSnapshot: reverseDepsSaved,
+						importsFileCount: Object.keys(reverseDepsIndex.imports).length,
+						importedByFileCount: Object.keys(reverseDepsIndex.importedBy)
+							.length,
+						importEdgeCount: Object.values(reverseDepsIndex.imports).reduce(
+							(total, imports) => total + imports.length,
+							0,
+						),
+					},
+				});
+			}
+
+			// Count files represented in the graph (nodes with a filePath).
+			const graphFileCount = new Set(
+				[...graph.nodes.values()].flatMap((n) =>
+					n.filePath ? [n.filePath] : [],
+				),
+			).size;
+
+			logCascade({
+				phase: "graph_build",
+				filePath,
+				graphBuiltMs: graphMs,
+				graphReused: graphBuildInfo.reused,
+				graphNodeCount: graph.nodes.size,
+				graphFileCount,
+				graphChangedSymbolCount: (
+					graph.changedSymbolsByFile.get(normalizedFileKey) ?? []
+				).length,
+				metadata: {
+					graphBuildMode: graphBuildInfo.mode,
+					skipReason: graphBuildInfo.skipReason,
+					sourceFileCount: graphBuildInfo.sourceFileCount,
+					maxFileCount: graphBuildInfo.maxFileCount,
+					// #451: when the seq fast path fell back (or was skipped), why — so
+					// cascade.log surfaces the fast-path hit/miss rate.
+					seqFastpathFallback: graphBuildInfo.seqFastpathFallback,
+				},
+			});
+
+			impact = computeImpactCascade(graph, normalizedFile, cwd);
+			// #1023: buildOrUpdateGraph returns an EMPTY graph (seeded only with the
+			// changed file's own symbols) when the repo is over
+			// PI_LENS_REVIEW_GRAPH_MAX_FILES (`too_many_files`) or the root is unsafe
+			// (`unsafe_root`) — both stamp mode "skipped" on the already-read
+			// graphBuildInfo. A capped or entry-budget-truncated graph is also not a
+			// complete dependent set even though it has nodes, so it must not look like
+			// a clean leaf. Thread the ALREADY-KNOWN degraded state (never re-derived)
+			// onto the result so the turn-end seam surfaces an honest advisory instead
+			// of a silent all-clear (#533). Keyed strictly off the graph's explicit
+			// degraded marker, NOT off `neighborFiles.length === 0`.
+			if (
+				(graphBuildInfo.mode === "skipped" ||
+					graph.persistCoverage?.partial === true ||
+					!graphBuildInfoTrustworthy) &&
+				!impact.indeterminate
+			) {
+				const coverage = graph.persistCoverage;
+				impact.indeterminate = {
+					reason: "graph_degraded",
+					detail: !graphBuildInfoTrustworthy
+						? // #1179 fail-closed: the graph's own build-info was not found under
+							// its identity and the global slot may be a sibling build's — don't
+							// trust its mode. Surface an honest "unknown" advisory rather than a
+							// (possibly sibling-derived) all-clear.
+							"review graph coverage unknown — build state unavailable for this graph"
+						: graphBuildInfo.mode === "skipped"
+							? graphBuildInfo.skipReason === "too_many_files"
+								? graphBuildInfo.sourceFileCountTruncated
+									? `review graph disabled — more than ${graphBuildInfo.maxFileCount ?? "?"} files (cap ${graphBuildInfo.maxFileCount ?? "?"})`
+									: `review graph disabled — ${graphBuildInfo.sourceFileCount ?? "?"} files over the ${graphBuildInfo.maxFileCount ?? "?"} cap`
+								: graphBuildInfo.skipReason === "unsafe_root"
+									? "review graph skipped — workspace root is at/above home dir"
+									: `review graph unavailable (${graphBuildInfo.skipReason ?? "skipped"})`
+							: coverage?.sourceFilesTruncated
+								? "review graph partial — source walk stopped at its visited-entry budget"
+								: "review graph partial — persisted graph coverage is incomplete",
+					sourceFileCount: graphBuildInfo.sourceFileCount,
+					maxFileCount: graphBuildInfo.maxFileCount,
+				};
+			}
+			const reverseDepNeighbors = getAffectedFilesFromIndex(
+				reverseDepsIndex,
+				normalizedFile,
+				1,
+				MAX_FILES * 2,
+			);
+			logCascade({
+				phase: "reverse_deps_cache",
+				filePath,
+				metadata: {
+					action: "merge_neighbors",
+					depth: 1,
+					neighborCount: reverseDepNeighbors.length,
+					neighbors: reverseDepNeighbors.slice(0, 10),
+				},
+			});
+			if (reverseDepNeighbors.length > 0) {
+				impact.directImporters = [
+					...new Set([...impact.directImporters, ...reverseDepNeighbors]),
+				];
 				impact.neighborFiles = [
-					...new Set([...impact.neighborFiles, ...refFiles]),
+					...new Set([...impact.neighborFiles, ...reverseDepNeighbors]),
 				];
 				logCascade({
 					phase: "neighbor_snapshot",
 					filePath,
-					neighborFile: "[lsp-references]",
-					diagnosticCount: refFiles.size,
-					durationMs: Date.now() - refsStart,
+					neighborFile: "[reverse-deps-cache]",
+					diagnosticCount: reverseDepNeighbors.length,
 					autoPropagate: false,
-					metadata: { lspReferences: true },
+					metadata: { reverseDepsCache: true },
 				});
 			}
-		}
 
-		// Bounded transitive expansion: add depth>1 dependents (indirect
-		// importers/callers/referencers) so the blast radius isn't limited to one
-		// hop. The one-hop sets above remain the floor (they sort first); these
-		// fill the remaining budget. Graph BFS is in-memory + capped.
-		if (CASCADE_TRANSITIVE_DEPTH > 1) {
-			const transitive = computeTransitiveImpact(graph, normalizedFile, {
-				maxDepth: CASCADE_TRANSITIVE_DEPTH,
-				maxHits: CASCADE_NEIGHBOUR_BUDGET,
-			});
-			const added = [
-				...new Set(
-					transitive.hits
-						.map((hit) => hit.file)
-						.filter(
-							(file) => file && normalizeMapKey(file) !== normalizedFileKey,
-						),
-				),
-			].filter((file) => !impact.neighborFiles.includes(file));
-			if (added.length > 0) {
-				impact.neighborFiles = [...impact.neighborFiles, ...added];
-				logCascade({
-					phase: "neighbor_snapshot",
-					filePath,
-					neighborFile: "[transitive-impact]",
-					diagnosticCount: added.length,
-					autoPropagate: false,
-					metadata: {
-						transitive: true,
-						maxDepth: CASCADE_TRANSITIVE_DEPTH,
-						maxDepthReached: transitive.maxDepthReached,
-						truncated: transitive.truncated,
-					},
-				});
-			}
-		}
-
-		// #1080: exclude KNOWN test-role files from every collateral impact
-		// surface — the formatted header (formatImpactCascade reads `impact`
-		// directly for `Direct importers`/`Direct callers`/`Check next` counts and
-		// names), the active-touch/passive-snapshot neighbor set (sortedNeighbors is
-		// derived from `impact.neighborFiles` below), and the returned `impact`
-		// object. Applied HERE — after graph neighbors, reverse-deps, LSP reference
-		// expansion, and transitive expansion have all been merged in — so it covers
-		// every neighbor source (incl. module-level downstream files that entered via
-		// computeImpactCascade and reference URIs pointing at `*.test.*`). Filtering
-		// upstream of `sortedNeighbors` also means a test URI is never actively
-		// touched solely for cascade diagnostics. Composes the shared `detectFileRole`
-		// seam; a classifier failure RETAINS the candidate (honest — never a false
-		// clean). The project ignore filter below is separate and unchanged (#297).
-		impact.directImporters = impact.directImporters.filter(
-			(f) => !isTestRoleCollateral(f),
-		);
-		impact.directCallers = impact.directCallers.filter(
-			(f) => !isTestRoleCollateral(f),
-		);
-		impact.neighborFiles = impact.neighborFiles.filter(
-			(f) => !isTestRoleCollateral(f),
-		);
-
-		// Sort by relationship strength (B6) then cap to the neighbour budget.
-		// directImporters are most impactful, then callers, then reference edges.
-		importerSet = new Set(impact.directImporters);
-		callerSet = new Set(impact.directCallers);
-		// neighbors that are neither direct importers nor callers are reference-edge neighbors
-		const importerOrCallerSet = new Set([
-			...impact.directImporters,
-			...impact.directCallers,
-		]);
-		referenceCount = impact.neighborFiles.filter(
-			(n) => !importerOrCallerSet.has(n),
-		).length;
-		const eligibleNeighbors = [...impact.neighborFiles]
-			.filter((n) => nodeFs.existsSync(n))
-			.filter((n) => !isExternalOrVendorFile(n, cwd))
-			// Honour the project's ignore config: a user-ignored neighbour (e.g.
-			// `**/*.test.ts`) must not surface as collateral cascade noise (#297).
-			.filter((n) => !isIgnoredCascadeNeighbor(n, cwd))
-			// B10: exclude files already edited as primary this turn — their own pipeline
-			// run is the authoritative diagnostic source; showing them as neighbors is noise.
-			.filter((n) => !primaryFilesThisTurn.has(normalizeMapKey(n)))
-			.sort((a, b) => {
-				const rank = (p: string) =>
-					importerSet.has(p) ? 0 : callerSet.has(p) ? 1 : 2;
-				return rank(a) - rank(b);
-			});
-		cascadeBudgetTruncated = Math.max(
-			0,
-			eligibleNeighbors.length - CASCADE_NEIGHBOUR_BUDGET,
-		);
-		sortedNeighbors = eligibleNeighbors.slice(0, CASCADE_NEIGHBOUR_BUDGET);
-	} else {
-		logCascade({
-			phase: "cascade_skip",
-			filePath,
-			reason: "unsupported_graph_kind",
-			metadata: { fileKind },
-		});
-		return {
-			filePath,
-			result: undefined,
-			neighborCount: 0,
-			diagnosticCount: 0,
-			skipReason: "non_code" as CascadeSkipReason,
-		};
-	}
-
-	logCascade({
-		phase: "neighbors_computed",
-		filePath,
-		neighborCount: sortedNeighbors.length,
-		totalNeighborCount: impact.neighborFiles.length,
-		importerCount: impact.directImporters.length,
-		callerCount: impact.directCallers.length,
-		referenceCount: Math.max(0, referenceCount),
-		riskFlags: impact.riskFlags,
-		metadata: { neighbors: sortedNeighbors.slice(0, 10) },
-	});
-
-	const lspService = getLSPService();
-
-	// Hoist passive snapshot once — used for auto-propagating LSPs and fallback path.
-	// #1095 memo-freeze caveat: each getAllDiagnostics() result attaches `.binding`
-	// as a LAZY getter that memoizes its disk verdict PER RESULT OBJECT. This cascade
-	// re-calls getAllDiagnostics() every run and never retains the Map across turns,
-	// so every run reads a FRESH verdict against current disk. If cross-turn retention
-	// of this Map is ever introduced, the memoized binding would freeze stale — re-read
-	// a fresh getAllDiagnostics() result at binding-read time instead of caching it.
-	const allDiags = await lspService.getAllDiagnostics();
-
-	const neighbors: CascadeResult["neighbors"] = [];
-	let producedLspData = false;
-	let coldSnapshotPaths: string[] = [];
-	// #1104: did any DEGRADED-fallback display path (touch-error fallback,
-	// appendFallbackNeighbors) withhold a TTL-fresh entry solely because its
-	// content binding was rejected (`boundToCurrentDisk === false` — computed
-	// against a diverged/pre-fix-edit disk state)? Tracked separately from
-	// `producedLspData` so the HONESTY check below can tell "genuinely nothing to
-	// show" apart from "something existed but was untrustworthy and was hidden" —
-	// the latter must not collapse into a clean-looking result (#1104 honesty
-	// rule, same doctrine as #1023's graph-degraded indeterminate marker).
-	let fallbackBindingRejected = false;
-	// #1444: neighbours whose in-lane wait was skipped for the quiet-window
-	// reconcile to answer later. Logged on `cascade_result` so a cascade that
-	// deferred EVERY neighbour is distinguishable from a genuine leaf (both are
-	// `neighborCount: 0` with no output otherwise).
-	let collectLaterSkipped = 0;
-	// #1446 item 5: `recentlyCleanNeighborCache` and `neighborTouchCache` hits
-	// are the whole point of both caches, but neither was ever counted — the
-	// only visible signal was 267s/day of touch wall time with no way to tell
-	// whether the caches were absorbing repeat work or every touch was cold.
-	let recentlyCleanHits = 0;
-	let cacheHits = 0;
-	// F1 (#1446 follow-up): `coldTouches` must be counted at the point each
-	// neighbour's OUTCOME is actually known, not derived from `coldSnapshotPaths`
-	// (finalized earlier, before the cache-hit checks below run against it). Using
-	// the pre-outcome list let a neighbour double-count (cold-snapshot AND cache/
-	// recently-clean hit) or vanish from every bucket (an `activePaths` neighbour —
-	// e.g. Python/Go — that misses both caches). These four counters partition the
-	// touched-neighbour set `[...activePaths, ...coldSnapshotPaths]` exactly once
-	// each: a neighbour with no LSP server configured is the only outcome
-	// deliberately excluded (never attempted, no bucket).
-	let deferredTouches = 0;
-	let coldTouches = 0;
-
-	if (sortedNeighbors.length > 0) {
-		const snapshotPaths = sortedNeighbors.filter(shouldReadCascadeFromSnapshot);
-		const activePaths = sortedNeighbors.filter(
-			(n) => !shouldReadCascadeFromSnapshot(n),
-		);
-
-		// Auto-propagating LSPs (TypeScript/Deno) — read passive snapshot with normalized key.
-		// When the snapshot is valid, use it immediately (no touch needed — server already has
-		// fresh data from auto-propagation). When missing or stale, fall through to the active
-		// touch pool below so we get real diagnostics instead of silently returning zero.
-		coldSnapshotPaths = [];
-		for (const neighborPath of snapshotPaths) {
-			const neighborStart = Date.now();
-			const entry = allDiags.get(normalizeMapKey(neighborPath));
-			const snapshotAgeSec = entry
-				? Math.round((Date.now() - entry.ts) / 1000)
-				: undefined;
-			const ttlFresh =
-				entry != null && Date.now() - entry.ts < CASCADE_TTL_MS;
-			// #1095: content binding is the INNER gate; TTL stays the outer bound.
-			//   false     → the server's diagnostics were computed against a DIFFERENT
-			//               disk state (e.g. the PRE-fix content) — don't trust or
-			//               reconcile this snapshot; fall through to an active touch on
-			//               the same (cold-snapshot) budget as a TTL-stale entry. This
-			//               kills the window where the first cascade after a fix-edit
-			//               replays the neighbor's pre-fix snapshot.
-			//   "unknown" → version-less/unreadable: keep EXACTLY the pre-#1095 TTL-only
-			//               behavior (reconcile if TTL-fresh).
-			//   true      → bound to current disk: reconcile (TTL still the outer bound).
-			// Reading `.binding` triggers the lazy disk verify on the getAllDiagnostics
-			// result — done ONLY when TTL-fresh so a doomed (stale) entry never pays the
-			// stat+hash.
-			const boundToDisk: BoundToCurrentDisk | undefined = ttlFresh
-				? readBoundToCurrentDisk(entry)
-				: undefined;
-			const bindingRejected = boundToDisk === false;
-			const snapshotValid = ttlFresh && !bindingRejected;
-
-			if (!snapshotValid) {
-				// No usable snapshot — queue for active touch alongside non-jsts neighbors.
-				logCascade({
-					phase: "neighbor_snapshot",
-					filePath,
-					neighborFile: neighborPath,
-					diagnosticCount: 0,
-					durationMs: Date.now() - neighborStart,
-					autoPropagate: true,
-					snapshotMissing: entry == null,
-					snapshotAgeSec,
-					coldSnapshot: true,
-					// #1095: distinguish a binding-rejected fall-through (TTL-fresh but the
-					// server's view diverged from disk) from a plain TTL-stale/missing one.
-					...(bindingRejected && {
-						metadata: { bindingState: bindingStateLabel(boundToDisk) },
-					}),
-				});
-				coldSnapshotPaths.push(neighborPath);
-				continue;
+			// Symbol-level blast radius via LSP references (precision upgrade over
+			// file-level import edges). Only when changed symbols are detected.
+			// Keep the budget tight: 750ms per symbol, 1200ms total, max 3 symbols.
+			if (impact.changedSymbols.length > 0) {
+				const lspService = getLSPService();
+				const symbolNodeIds =
+					graph.symbolNodesByFile.get(normalizedFileKey) ?? [];
+				const refFiles = new Set<string>();
+				const refsStart = Date.now();
+				for (const symbolName of impact.changedSymbols.slice(0, 3)) {
+					const symbolNodeId = symbolNodeIds.find((id) => {
+						const node = graph.nodes.get(id);
+						return node?.symbolName === symbolName;
+					});
+					if (!symbolNodeId) continue;
+					const node = graph.nodes.get(symbolNodeId);
+					const line = Number(node?.metadata?.line ?? 0);
+					const column = Number(node?.metadata?.column ?? 0);
+					if (line <= 0) continue;
+					// #1109: store the timer and clear it once the race settles. Without
+					// this, when `references()` wins (the common case), the losing
+					// `setTimeout` stays a REF'D pending timer for the remaining 750ms —
+					// harmless in a long-lived session, but a keep-alive tail in a
+					// one-shot `pi --print` process (same uncleared-race-timeout class
+					// fixed for the LSP client-wait leak in clients/lsp/index.ts, #1097).
+					let refsTimer: ReturnType<typeof setTimeout> | undefined;
+					try {
+						const refs = await Promise.race([
+							lspService.references(
+								normalizedFile,
+								line - 1,
+								column - 1,
+								false,
+							),
+							new Promise<never>((_, reject) => {
+								refsTimer = setTimeout(() => reject(new Error("timeout")), 750);
+							}),
+						]);
+						for (const ref of refs) {
+							let resolved: string;
+							try {
+								resolved = ref.uri.startsWith("file://")
+									? fileURLToPath(ref.uri)
+									: ref.uri;
+							} catch {
+								continue;
+							}
+							if (
+								normalizeMapKey(resolved) !== normalizedFileKey &&
+								nodeFs.existsSync(resolved)
+							) {
+								refFiles.add(normalizeMapKey(resolved));
+							}
+						}
+					} catch {
+						// Timeout or LSP error — fall back to import-graph neighbors
+					} finally {
+						if (refsTimer !== undefined) clearTimeout(refsTimer);
+					}
+					if (Date.now() - refsStart > 1200) break; // Hard ceiling
+				}
+				if (refFiles.size > 0) {
+					impact.neighborFiles = [
+						...new Set([...impact.neighborFiles, ...refFiles]),
+					];
+					logCascade({
+						phase: "neighbor_snapshot",
+						filePath,
+						neighborFile: "[lsp-references]",
+						diagnosticCount: refFiles.size,
+						durationMs: Date.now() - refsStart,
+						autoPropagate: false,
+						metadata: { lspReferences: true },
+					});
+				}
 			}
 
-			// #692: `source: "cascade"` used to be passed here to label `rule`
-			// (`cascade:<code>`) — that override is gone (identity must come from
-			// the diagnostic's own source; see `scanOrigin`'s doc comment), and
-			// cascade neighbor diagnostics are ephemeral display-only output
-			// (never reconciled into persisted widget/dedup state), so the label
-			// had no remaining purpose and is simply dropped rather than migrated.
-			const diags = convertLspDiagnostics(
-				entry.diags.filter((d) => d.severity === 1).slice(0, MAX_PER_FILE),
-				neighborPath,
+			// #1462: size the rest of this run against the on-time window it has NOT
+			// already spent. Derived HERE — after the graph build, the reverse-deps
+			// refresh and the LSP-reference expansion, which is where the measured
+			// overruns were bought — and used for both the transitive BFS cap and the
+			// final slice, so a rescued run expands less as well as walking less.
+			// Narrowing happens ONLY inside the rescue band (see cascade-budget.ts):
+			// a run that is merely late keeps the whole set and is delivered complete
+			// by #1443's carry-over, because a dropped neighbour is lost for good
+			// while a late one is not. A wired callback that cannot observe an active
+			// turn_end wait uses zero elapsed time rather than charging pre-turn age.
+			{
+				const settleStart = turnEndCascadeSettleStart?.();
+				const elapsedMs = turnEndCascadeSettleStart
+					? settleStart !== undefined && Number.isFinite(settleStart)
+						? Math.max(0, Date.now() - settleStart)
+						: 0
+					: Date.now() - cascadeStart;
+				const decision = deriveCascadeNeighbourBudget({ elapsedMs });
+				cascadeNeighbourBudget = decision.budget;
+				cascadeBudgetRemainingMs = decision.remainingMs;
+				cascadeBudgetZone = decision.zone;
+				cascadeDeliveryWindowMs = decision.deliveryWindowMs;
+			}
+
+			// Bounded transitive expansion: add depth>1 dependents (indirect
+			// importers/callers/referencers) so the blast radius isn't limited to one
+			// hop. The one-hop sets above remain the floor (they sort first); these
+			// fill the remaining budget. Graph BFS is in-memory + capped.
+			if (CASCADE_TRANSITIVE_DEPTH > 1) {
+				const transitive = computeTransitiveImpact(graph, normalizedFile, {
+					maxDepth: CASCADE_TRANSITIVE_DEPTH,
+					maxHits: cascadeNeighbourBudget,
+				});
+				transitiveTruncated = transitive.truncated;
+				const added = [
+					...new Set(
+						transitive.hits
+							.map((hit) => hit.file)
+							.filter(
+								(file) => file && normalizeMapKey(file) !== normalizedFileKey,
+							),
+					),
+				].filter((file) => !impact.neighborFiles.includes(file));
+				if (added.length > 0) {
+					impact.neighborFiles = [...impact.neighborFiles, ...added];
+					logCascade({
+						phase: "neighbor_snapshot",
+						filePath,
+						neighborFile: "[transitive-impact]",
+						diagnosticCount: added.length,
+						autoPropagate: false,
+						metadata: {
+							transitive: true,
+							maxDepth: CASCADE_TRANSITIVE_DEPTH,
+							maxDepthReached: transitive.maxDepthReached,
+							truncated: transitive.truncated,
+						},
+					});
+				}
+			}
+
+			// #1080: exclude KNOWN test-role files from every collateral impact
+			// surface — the formatted header (formatImpactCascade reads `impact`
+			// directly for `Direct importers`/`Direct callers`/`Check next` counts and
+			// names), the active-touch/passive-snapshot neighbor set (sortedNeighbors is
+			// derived from `impact.neighborFiles` below), and the returned `impact`
+			// object. Applied HERE — after graph neighbors, reverse-deps, LSP reference
+			// expansion, and transitive expansion have all been merged in — so it covers
+			// every neighbor source (incl. module-level downstream files that entered via
+			// computeImpactCascade and reference URIs pointing at `*.test.*`). Filtering
+			// upstream of `sortedNeighbors` also means a test URI is never actively
+			// touched solely for cascade diagnostics. Composes the shared `detectFileRole`
+			// seam; a classifier failure RETAINS the candidate (honest — never a false
+			// clean). The project ignore filter below is separate and unchanged (#297).
+			cascadeCandidateCount = impact.neighborFiles.length;
+			impact.directImporters = impact.directImporters.filter(
+				(f) => !isTestRoleCollateral(f),
 			);
-			producedLspData = true;
-			const durationMs = Date.now() - neighborStart;
+			impact.directCallers = impact.directCallers.filter(
+				(f) => !isTestRoleCollateral(f),
+			);
+			impact.neighborFiles = impact.neighborFiles.filter(
+				(f) => !isTestRoleCollateral(f),
+			);
 
+			// Sort by relationship strength (B6) then cap to the neighbour budget.
+			// directImporters are most impactful, then callers, then reference edges.
+			importerSet = new Set(impact.directImporters);
+			callerSet = new Set(impact.directCallers);
+			// neighbors that are neither direct importers nor callers are reference-edge neighbors
+			const importerOrCallerSet = new Set([
+				...impact.directImporters,
+				...impact.directCallers,
+			]);
+			referenceCount = impact.neighborFiles.filter(
+				(n) => !importerOrCallerSet.has(n),
+			).length;
+			const eligibleNeighbors = [...impact.neighborFiles]
+				.filter((n) => nodeFs.existsSync(n))
+				.filter((n) => !isExternalOrVendorFile(n, cwd))
+				// Honour the project's ignore config: a user-ignored neighbour (e.g.
+				// `**/*.test.ts`) must not surface as collateral cascade noise (#297).
+				.filter((n) => !isIgnoredCascadeNeighbor(n, cwd))
+				// B10: exclude files already edited as primary this turn — their own pipeline
+				// run is the authoritative diagnostic source; showing them as neighbors is noise.
+				.filter((n) => !primaryFilesThisTurn.has(normalizeMapKey(n)))
+				.sort((a, b) => {
+					const rank = (p: string) =>
+						importerSet.has(p) ? 0 : callerSet.has(p) ? 1 : 2;
+					return rank(a) - rank(b);
+				});
+			cascadeEligibleCount = eligibleNeighbors.length;
+			cascadeFilterDroppedCount = Math.max(
+				0,
+				cascadeCandidateCount - cascadeEligibleCount,
+			);
+			cascadeBudgetTruncated = Math.max(
+				0,
+				eligibleNeighbors.length - cascadeNeighbourBudget,
+			);
+			sortedNeighbors = eligibleNeighbors.slice(0, cascadeNeighbourBudget);
+			if (cascadeBudgetTruncated > 0 || transitiveTruncated) {
+				const budget = {
+					candidateCount: cascadeCandidateCount,
+					eligibleCount: cascadeEligibleCount,
+					selectedCount: sortedNeighbors.length,
+					truncatedCount: cascadeBudgetTruncated,
+					...(transitiveTruncated && { transitiveTruncated: true }),
+				};
+				const detailParts = [
+					...(cascadeBudgetTruncated > 0
+						? [
+								`cascade neighbor budget checked ${budget.selectedCount} of ${budget.eligibleCount} eligible dependents ` +
+									`(${budget.truncatedCount} omitted)`,
+							]
+						: []),
+					...(transitiveTruncated
+						? [
+								"transitive expansion was capped before all eligible dependents were enumerated",
+							]
+						: []),
+				];
+				const detail = detailParts.join("; ");
+				impact.indeterminate = impact.indeterminate
+					? {
+							...impact.indeterminate,
+							detail: impact.indeterminate.detail
+								? `${impact.indeterminate.detail}; ${detail}`
+								: detail,
+							budget,
+						}
+					: { reason: "budget_truncated", detail, budget };
+			}
+		} else {
 			logCascade({
-				phase: "neighbor_snapshot",
+				phase: "cascade_skip",
 				filePath,
-				neighborFile: neighborPath,
-				diagnosticCount: diags.length,
-				durationMs,
-				autoPropagate: true,
-				snapshotMissing: false,
-				snapshotAgeSec,
+				reason: "unsupported_graph_kind",
+				metadata: { fileKind },
 			});
-
-			// #1093: a valid passive snapshot IS a confirmed observation of this
-			// neighbor's current LSP-error state (#571 semantics) — reconcile it into
-			// the footer widget, INCLUDING the confirmed-clean `[]` case, so a
-			// fix-edit to the primary that resolves a cross-file error in this
-			// neighbor clears the neighbor's now-stale footer entry (the #1092
-			// defect). MERGE (genuine LSP errors only — auxiliary findings excluded,
-			// see `cascadeReconcilableLspErrors`) so a live biome/ruff/aux finding or
-			// LSP warning on the neighbor is preserved. Keyed by the primary edit's
-			// `writeSeq` so a genuinely newer per-edit write still wins the
-			// WriteOrderingGuard. `observedAt = entry.ts` (the snapshot's own publish
-			// time, up to CASCADE_TTL_MS old) — NOT now() — so replaying an aging
-			// snapshot never re-arms the mtime-staleness gate (the same #1092
-			// re-arming defect this PR fixes for cache hits).
-			//
-			// #1186: `observedAt` here stamps only the INCOMING LSP-error entries.
-			// PRESERVED entries keep their own (possibly fresher) per-entry
-			// `observedAt`, and `reconcileStaleWidgetFiles` now gates per ENTRY — so
-			// if the neighbor's mtime later falls between this `entry.ts` and a
-			// preserved entry's real observation time, only the stale incoming entry
-			// drops and the fresher preserved finding survives (previously the whole
-			// record was over-cleared; that residual is now fixed).
-			reconcileCascadeNeighborLspErrors(
-				neighborPath,
-				cascadeReconcilableLspErrors(entry.diags, neighborPath),
-				writeSeq,
-				entry.ts,
-			);
-
-			neighbors.push({
-				filePath: neighborPath,
-				reason: neighborReason(importerSet, callerSet, neighborPath),
-				diagnostics: diags,
-				lspTouched: false,
-				durationMs,
-			});
+			return {
+				filePath,
+				result: undefined,
+				neighborCount: 0,
+				diagnosticCount: 0,
+				skipReason: "non_code" as CascadeSkipReason,
+			};
 		}
 
-		// fan-out active touches in parallel (A3):
-		// - non-jsts neighbors (always touched)
-		// - autoPropagate neighbors whose snapshot was missing/stale (coldSnapshotPaths)
-		//   use a tighter 1000ms budget since the server is expected to be warm already.
-		const touchResults = await Promise.allSettled(
-			[...activePaths, ...coldSnapshotPaths].map(async (neighborPath) => {
-				const isColdSnapshot = coldSnapshotPaths.includes(neighborPath);
-				const neighborStart = Date.now();
-				const cacheKey = normalizeMapKey(neighborPath);
+		logCascade({
+			phase: "neighbors_computed",
+			filePath,
+			neighborCount: sortedNeighbors.length,
+			totalNeighborCount: impact.neighborFiles.length,
+			importerCount: impact.directImporters.length,
+			callerCount: impact.directCallers.length,
+			referenceCount: Math.max(0, referenceCount),
+			riskFlags: impact.riskFlags,
+			metadata: {
+				neighbors: sortedNeighbors.slice(0, 10),
+				candidateNeighborCount: cascadeCandidateCount,
+				eligibleNeighborCount: cascadeEligibleCount,
+				filterDroppedCount: cascadeFilterDroppedCount,
+				budgetTrimmedCount: cascadeBudgetTruncated,
+			},
+		});
 
-				const passiveEntry = allDiags.get(cacheKey);
-				const hasFreshPassiveErrors =
-					passiveEntry != null &&
-					Date.now() - passiveEntry.ts < CASCADE_TTL_MS &&
-					passiveEntry.diags.some((d) => d.severity === 1);
-				const recentlyClean = recentlyCleanNeighborCache.get(cacheKey);
-				if (
-					recentlyClean &&
-					turnSeq - recentlyClean.turnSeq <= RECENTLY_CLEAN_TTL_TURNS &&
-					!hasFreshPassiveErrors
-				) {
-					producedLspData = true;
-					recentlyCleanHits++;
-					const durationMs = Date.now() - neighborStart;
+		const lspService = getLSPService();
+
+		// Hoist passive snapshot once — used for auto-propagating LSPs and fallback path.
+		// #1095 memo-freeze caveat: each getAllDiagnostics() result attaches `.binding`
+		// as a LAZY getter that memoizes its disk verdict PER RESULT OBJECT. This cascade
+		// re-calls getAllDiagnostics() every run and never retains the Map across turns,
+		// so every run reads a FRESH verdict against current disk. If cross-turn retention
+		// of this Map is ever introduced, the memoized binding would freeze stale — re-read
+		// a fresh getAllDiagnostics() result at binding-read time instead of caching it.
+		const allDiags = await lspService.getAllDiagnostics();
+
+		const neighbors: CascadeResult["neighbors"] = [];
+		let producedLspData = false;
+		let coldSnapshotPaths: string[] = [];
+		// #1104: did any DEGRADED-fallback display path (touch-error fallback,
+		// appendFallbackNeighbors) withhold a TTL-fresh entry solely because its
+		// content binding was rejected (`boundToCurrentDisk === false` — computed
+		// against a diverged/pre-fix-edit disk state)? Tracked separately from
+		// `producedLspData` so the HONESTY check below can tell "genuinely nothing to
+		// show" apart from "something existed but was untrustworthy and was hidden" —
+		// the latter must not collapse into a clean-looking result (#1104 honesty
+		// rule, same doctrine as #1023's graph-degraded indeterminate marker).
+		let fallbackBindingRejected = false;
+		const noLspCandidatePaths = new Set<string>();
+		// #1444: neighbours whose in-lane wait was skipped for the quiet-window
+		// reconcile to answer later. Logged on `cascade_result` so a cascade that
+		// deferred EVERY neighbour is distinguishable from a genuine leaf (both are
+		// `neighborCount: 0` with no output otherwise).
+		let collectLaterSkipped = 0;
+		// #1446 item 5: `recentlyCleanNeighborCache` hits are the whole point of the
+		// cache, but they were never counted — the only visible signal was 267s/day
+		// of touch wall time with no way to tell whether the cache was absorbing
+		// repeat work or every touch was cold. (#1899 removed the sibling
+		// `cacheHits` counter along with the dead `neighborTouchCache`.)
+		let recentlyCleanHits = 0;
+		// F1 (#1446 follow-up): `coldTouches` must be counted at the point each
+		// neighbour's OUTCOME is actually known, not derived from `coldSnapshotPaths`
+		// (finalized earlier, before the cache-hit checks below run against it). Using
+		// the pre-outcome list let a neighbour double-count (cold-snapshot AND cache/
+		// recently-clean hit) or vanish from every bucket (an `activePaths` neighbour —
+		// e.g. Python/Go — that misses both caches). These counters partition the
+		// selected-neighbour outcomes; passive snapshots and no-server selections are
+		// tracked separately instead of silently disappearing from the denominator.
+		// `coldTouches` includes every genuine active touch attempt, while
+		// `touchFailures` is its separate bounded failure subtype.
+		let deferredTouches = 0;
+		let coldTouches = 0;
+		let passiveSnapshotHits = 0;
+		let noLspConfigured = 0;
+		let touchFailures = 0;
+
+		if (sortedNeighbors.length > 0) {
+			const snapshotPaths = sortedNeighbors.filter(
+				shouldReadCascadeFromSnapshot,
+			);
+			const activePaths = sortedNeighbors.filter(
+				(n) => !shouldReadCascadeFromSnapshot(n),
+			);
+
+			// Auto-propagating LSPs (TypeScript/Deno) — read passive snapshot with normalized key.
+			// When the snapshot is valid, use it immediately (no touch needed — server already has
+			// fresh data from auto-propagation). When missing or stale, fall through to the active
+			// touch pool below so we get real diagnostics instead of silently returning zero.
+			coldSnapshotPaths = [];
+			for (const neighborPath of snapshotPaths) {
+				const neighborStart = Date.now();
+				const entry = allDiags.get(normalizeMapKey(neighborPath));
+				const snapshotAgeSec = entry
+					? Math.round((Date.now() - entry.ts) / 1000)
+					: undefined;
+				const ttlFresh =
+					entry != null && Date.now() - entry.ts < CASCADE_DIAGNOSTICS_TTL_MS;
+				// #1095: content binding is the INNER gate; TTL stays the outer bound.
+				//   false     → the server's diagnostics were computed against a DIFFERENT
+				//               disk state (e.g. the PRE-fix content) — don't trust or
+				//               reconcile this snapshot; fall through to an active touch on
+				//               the same (cold-snapshot) budget as a TTL-stale entry. This
+				//               kills the window where the first cascade after a fix-edit
+				//               replays the neighbor's pre-fix snapshot.
+				//   "unknown" → version-less/unreadable: keep EXACTLY the pre-#1095 TTL-only
+				//               behavior (reconcile if TTL-fresh).
+				//   true      → bound to current disk: reconcile (TTL still the outer bound).
+				// Reading `.binding` triggers the lazy disk verify on the getAllDiagnostics
+				// result — done ONLY when TTL-fresh so a doomed (stale) entry never pays the
+				// stat+hash.
+				const boundToDisk: BoundToCurrentDisk | undefined = ttlFresh
+					? readBoundToCurrentDisk(entry)
+					: undefined;
+				const bindingRejected = boundToDisk === false;
+				const snapshotValid = ttlFresh && !bindingRejected;
+
+				if (!snapshotValid) {
+					// No usable snapshot — queue for active touch alongside non-jsts neighbors.
 					logCascade({
 						phase: "neighbor_snapshot",
 						filePath,
 						neighborFile: neighborPath,
 						diagnosticCount: 0,
-						durationMs,
-						autoPropagate: false,
-						snapshotMissing: false,
-						metadata: {
-							recentlyClean: true,
-							cleanTurnSeq: recentlyClean.turnSeq,
-						},
+						durationMs: Date.now() - neighborStart,
+						autoPropagate: true,
+						snapshotMissing: entry == null,
+						snapshotAgeSec,
+						coldSnapshot: true,
+						// #1095: distinguish a binding-rejected fall-through (TTL-fresh but the
+						// server's view diverged from disk) from a plain TTL-stale/missing one.
+						...(bindingRejected && {
+							metadata: { bindingState: bindingStateLabel(boundToDisk) },
+						}),
 					});
-					return {
-						filePath: neighborPath,
-						reason: neighborReason(importerSet, callerSet, neighborPath),
-						diagnostics: [],
-						lspTouched: false,
-						durationMs,
-					} satisfies CascadeResult["neighbors"][number];
+					coldSnapshotPaths.push(neighborPath);
+					continue;
 				}
 
-				// A5: skip re-touch if this neighbor was already diagnosed at the current
-				// write sequence. A new write (higher writeSeq) invalidates the cache entry.
-				const cached =
-					writeSeq != null ? neighborTouchCache.get(cacheKey) : undefined;
-				if (cached?.turnSeq === turnSeq && cached?.writeSeq === writeSeq) {
-					producedLspData = true;
-					cacheHits++;
-					const durationMs = Date.now() - neighborStart;
-					logCascade({
-						phase: "neighbor_snapshot",
-						filePath,
-						neighborFile: neighborPath,
-						diagnosticCount: cached.diagnostics.length,
-						durationMs,
-						autoPropagate: false,
-						snapshotMissing: false,
-						metadata: { cachedWriteSeq: writeSeq },
-					});
-					return {
-						filePath: neighborPath,
-						reason: neighborReason(importerSet, callerSet, neighborPath),
-						diagnostics: cached.diagnostics,
-						lspTouched: false,
-						durationMs,
-					} satisfies CascadeResult["neighbors"][number];
-				}
-
-				const configuredServerCount =
-					getServersForFileWithConfig(neighborPath).length;
-				if (configuredServerCount === 0) {
-					logCascade({
-						phase: "neighbor_fallback",
-						filePath,
-						neighborFile: neighborPath,
-						fallbackUsed: false,
-						error: "no_lsp_server_configured",
-					});
-					return undefined;
-				}
-
-				// A6: async read to avoid blocking event loop on network-mounted drives
-				const content = await nodeFs.promises.readFile(neighborPath, "utf8");
-
-				// #458/#1444: tier-aware cascade-lane wait. A Tier-3 silent server
-				// cannot give this wait an affirmative clean signal. Native TS7 does
-				// publish, but not inside the cold-snapshot budget. In both cases the
-				// in-lane budget is pure cost. Fire the touch (didOpen/
-				// didChange still happens — the server starts real work) and record
-				// it as outstanding for the agent_settled quiet window to reconcile
-				// instead of waiting here. Ambiguous/missing capability data always
-				// classifies as "waits" (today's behavior) — see cascade-tier.ts.
-				// The whole attempt is try/caught: any surprise (a service shape
-				// that doesn't expose getCapabilitySnapshots/getClientForFile, a
-				// thrown rejection) falls through to the existing full-wait path
-				// below rather than skip the wait on a failure.
-				if (isTierAwareCascadeEnabled()) {
-					try {
-						const snapshots =
-							(await lspService.getCapabilitySnapshots?.(neighborPath)) ?? [];
-						const tier = classifyCascadeWaitTier(
-							lspService,
-							neighborPath,
-							snapshots,
-						);
-						if (tier === "tier3-silent" || tier === "collect-later") {
-							const spawnedForTouch =
-								await lspService.getClientForFile(neighborPath);
-							if (spawnedForTouch) {
-								// Sampled BEFORE the touchFile notify: a publish landing
-								// in the notify→record gap must read as post-touch at
-								// reconcile time, never be misclassified as pre-touch
-								// (the reconcile compares this against the client's
-								// PER-FILE publish timestamp — see cascade-tier.ts).
-								const touchedAt = Date.now();
-								await lspService.touchFile(neighborPath, content, {
-									diagnostics: "none",
-									collectDiagnostics: false,
-									silent: true,
-									source: "cascade",
-									clientScope: "primary",
-								});
-								recordOutstandingCascadeTouch({
-									filePath: neighborPath,
-									serverId: spawnedForTouch.client.serverId,
-									touchedAt,
-								});
-								const durationMs = Date.now() - neighborStart;
-								if (tier === "collect-later") collectLaterSkipped++;
-								// F1: both tier3-silent and collect-later skip the in-lane
-								// wait and record an outstanding touch for the quiet-window
-								// reconcile — neither a cache hit nor a genuine completed
-								// cold touch, so both share this explicit "deferred" bucket
-								// instead of falling out of the partition uncounted.
-								deferredTouches++;
-								logCascade({
-									phase: "cascade_tier3_skip",
-									filePath,
-									neighborFile: neighborPath,
-									durationMs,
-									lspServerCount: configuredServerCount,
-									coldSnapshot: isColdSnapshot,
-									metadata: {
-										serverId: spawnedForTouch.client.serverId,
-										waitTier: tier,
-									},
-								});
-								// Deliberately NOT cached as clean/diagnosed — the wait was
-								// skipped, not resolved, so neither neighborTouchCache nor
-								// recentlyCleanNeighborCache may treat this as a real answer
-								// (#240 doctrine). Return undefined: the degraded-fallback
-								// path below still has a chance to surface a passive/stale
-								// snapshot, same as any other "no fresh data this touch" case.
-								return undefined;
-							}
-						}
-					} catch (tierErr) {
-						dbg?.(
-							`cascade tier-aware skip attempt failed for ${neighborPath}, falling back to full wait: ${tierErr}`,
-						);
-					}
-				}
-
-				// Open with silent=true (suppresses didChangeWatchedFiles rechecks, C2)
-				// and collect diagnostics from the same touched clients.
-				// Cold-snapshot neighbors (autoPropagate LSP, server warm) use a tighter
-				// 1000ms budget — they should respond quickly; we'd rather return zero
-				// than block cascade for 2s on a slow open.
-				// F1: this is the ONE remaining outcome after cache hit, recently-clean
-				// hit, and tier-aware deferral have all been ruled out — a genuine
-				// active LSP touch is being issued right now. Count it here (an
-				// attempt, whether it resolves, times out, or the promise rejects
-				// below in the allSettled catch) rather than from `coldSnapshotPaths`,
-				// which is finalized before any of the above checks run and includes
-				// neighbours that resolve via cache/recently-clean instead.
-				coldTouches++;
-				const rawDiags = await lspService.touchFile(neighborPath, content, {
-					diagnostics: "document",
-					collectDiagnostics: true,
-					maxClientWaitMs: isColdSnapshot ? 1000 : 2000,
-					silent: true,
-					source: "cascade",
-					clientScope: "all",
-				});
-				if (!rawDiags) return undefined;
-				// #1093/#571/#1095: a touch result is only a CONFIRMED observation of the
-				// neighbor's current on-disk state when it is neither `inconclusive` (the
-				// notify/diagnostics wait lapsed — e.g. the tight 1000ms cold-snapshot
-				// budget on a slow server) NOR bound-false (`binding.boundToCurrentDisk
-				// === false` — the diagnostics were computed against a different disk state
-				// than what's on disk now). Either disqualifier means a resolved `[]` is
-				// NOT a confirmed clean: treating it as one would WIPE a live footer finding
-				// (the #533 false-clean trap, worse than the stale-display bug). Both flags
-				// are folded into `isConfirmedTouch` so no gate below can miss one. A
-				// confirmed result reconciles and may seed the recently-clean cache; an
-				// unconfirmed one does neither (else the short-circuit on the next cascade
-				// would make the wipe self-sustain).
-				const confirmed = isConfirmedTouch(rawDiags);
-				const bindingRejected = readBoundToCurrentDisk(rawDiags) === false;
-				const inconclusive = readInconclusive(rawDiags);
-				// #1470/#1493: the third, independent reason a touch is unconfirmed — an
-				// auxiliary that never reported, cut off by our grace timer or silent
-				// with nothing published for this content. Logged alongside the other two
-				// so cascade.log alone still tells the three apart.
-				const unconfirmedServerIds = touchCoverageGap(rawDiags);
-				// #692: `source: "cascade"` no longer overrides `rule` (see the
-				// doc comment on the sibling call above) — dropped rather than
-				// migrated to `scanOrigin` since cascade output never touches
-				// persisted widget/dedup state.
-				// #1179: `.filter()` here operates on `rawDiags.diags`; the
-				// `inconclusive`/`binding` flags read above stay on the `rawDiags`
-				// wrapper and are unaffected by this copy (the shape-5 fix).
+				// #692: `source: "cascade"` used to be passed here to label `rule`
+				// (`cascade:<code>`) — that override is gone (identity must come from
+				// the diagnostic's own source; see `scanOrigin`'s doc comment), and
+				// cascade neighbor diagnostics are ephemeral display-only output
+				// (never reconciled into persisted widget/dedup state), so the label
+				// had no remaining purpose and is simply dropped rather than migrated.
 				const diags = convertLspDiagnostics(
-					rawDiags.diags.filter((d) => d.severity === 1).slice(0, MAX_PER_FILE),
+					entry.diags.filter((d) => d.severity === 1).slice(0, MAX_PER_FILE),
 					neighborPath,
 				);
+				producedLspData = true;
+				passiveSnapshotHits++;
 				const durationMs = Date.now() - neighborStart;
 
-				// Cache only a confirmed answer. An inconclusive or binding-rejected
-				// result must not become a confirmed cache hit on the next cascade.
-				if (writeSeq != null && confirmed) {
-					neighborTouchCache.set(cacheKey, {
-						turnSeq,
-						writeSeq,
-						diagnostics: diags,
-					});
-				}
-				if (diags.length === 0) {
-					// Only a CONFIRMED clean touch may seed the recently-clean cache
-					// (#1095: a bound-false touch is unconfirmed, exactly like inconclusive).
-					if (confirmed) {
-						recentlyCleanNeighborCache.set(cacheKey, {
-							turnSeq,
-							checkedAt: Date.now(),
-						});
-					}
-				} else {
-					recentlyCleanNeighborCache.delete(cacheKey);
-				}
-				producedLspData = true;
-
 				logCascade({
-					phase: "neighbor_touch",
+					phase: "neighbor_snapshot",
 					filePath,
 					neighborFile: neighborPath,
 					diagnosticCount: diags.length,
 					durationMs,
-					lspTouched: true,
-					lspServerCount: configuredServerCount,
-					coldSnapshot: isColdSnapshot,
-					// #1104: an unconfirmed touch has two independent, otherwise
-					// indistinguishable causes — `inconclusive` (the notify/diagnostics
-					// wait lapsed its deadline) and bound-false (`bindingState`, #1095 —
-					// diagnostics computed against a diverged disk state). Surface
-					// `inconclusive` unconditionally so cascade.log alone (no
-					// cross-referencing latency.log) tells them apart; `bindingState`
-					// stays conditional since "bound" carries no extra signal.
-					metadata: {
-						inconclusive,
-						...(bindingRejected && { bindingState: bindingStateLabel(false) }),
-						...(unconfirmedServerIds.length > 0 && {
-							unconfirmedServerIds: [...unconfirmedServerIds],
-						}),
-					},
+					autoPropagate: true,
+					snapshotMissing: false,
+					snapshotAgeSec,
 				});
 
-				// #1093/#1095: a completed, CONFIRMED active touch is a confirmed
-				// observation of this neighbor's current LSP-error state (#571) —
-				// reconcile it into the footer widget, INCLUDING the confirmed-clean `[]`
-				// case, so a fix-edit to the primary that resolves a cross-file error in
-				// this neighbor clears the neighbor's now-stale footer entry (the #1092
+				// #1093: a valid passive snapshot IS a confirmed observation of this
+				// neighbor's current LSP-error state (#571 semantics) — reconcile it into
+				// the footer widget, INCLUDING the confirmed-clean `[]` case, so a
+				// fix-edit to the primary that resolves a cross-file error in this
+				// neighbor clears the neighbor's now-stale footer entry (the #1092
 				// defect). MERGE (genuine LSP errors only — auxiliary findings excluded,
 				// see `cascadeReconcilableLspErrors`) so a live biome/ruff/aux finding or
-				// LSP warning survives this errors-only re-check. Keyed by the primary
-				// edit's `writeSeq` so a genuinely newer per-edit write still wins the
-				// WriteOrderingGuard. `observedAt` stays now (a fresh touch). The
-				// inconclusive touch, the BOUND-FALSE touch (#1095 — computed against a
-				// diverged disk state), the tier-3-silent skip, the recently-clean
-				// short-circuit, the within-turn cache hit, and the rejected-touch
-				// fallback are all deliberately NOT reconciled — none is a confirmed
-				// observation.
-				if (confirmed) {
-					reconcileCascadeNeighborLspErrors(
-						neighborPath,
-						cascadeReconcilableLspErrors(rawDiags.diags, neighborPath),
-						writeSeq,
-					);
-				}
+				// LSP warning on the neighbor is preserved. Keyed by the primary edit's
+				// `writeSeq` so a genuinely newer per-edit write still wins the
+				// WriteOrderingGuard. `observedAt = entry.ts` (the snapshot's own publish
+				// time, up to CASCADE_DIAGNOSTICS_TTL_MS old) — NOT now() — so replaying an aging
+				// snapshot never re-arms the mtime-staleness gate (the same #1092
+				// re-arming defect this PR fixes for cache hits).
+				//
+				// #1186: `observedAt` here stamps only the INCOMING LSP-error entries.
+				// PRESERVED entries keep their own (possibly fresher) per-entry
+				// `observedAt`, and `reconcileStaleWidgetFiles` now gates per ENTRY — so
+				// if the neighbor's mtime later falls between this `entry.ts` and a
+				// preserved entry's real observation time, only the stale incoming entry
+				// drops and the fresher preserved finding survives (previously the whole
+				// record was over-cleared; that residual is now fixed).
+				reconcileCascadeNeighborLspErrors(
+					neighborPath,
+					cascadeReconcilableLspErrors(entry.diags, neighborPath),
+					writeSeq,
+					entry.ts,
+				);
 
-				return {
+				neighbors.push({
 					filePath: neighborPath,
 					reason: neighborReason(importerSet, callerSet, neighborPath),
 					diagnostics: diags,
-					lspTouched: true as const,
-					...(inconclusive && { inconclusive: true as const }),
-					// #1459: carry the coverage gap to the agent-facing surface. A
-					// scanner whose breaker was open, whose resync the fan-out gate
-					// deferred, or whom the aux grace timer cut off never looked at this
-					// file — without this the neighbour reaches the agent as
-					// `{ diagnostics: [] }` with no marker, which is the false-clean the
-					// touch already refuses to claim for itself.
-					...(unconfirmedServerIds.length > 0 && {
-						unconfirmedServerIds: [...unconfirmedServerIds],
-					}),
+					lspTouched: false,
 					durationMs,
-				} satisfies CascadeResult["neighbors"][number];
-			}),
-		);
+				});
+			}
 
-		const allTouchPaths = [...activePaths, ...coldSnapshotPaths];
-		for (let i = 0; i < touchResults.length; i++) {
-			const result = touchResults[i];
-			const neighborPath = allTouchPaths[i];
-			if (result.status === "fulfilled") {
-				if (result.value) neighbors.push(result.value);
-			} else {
-				// A3: one failed LSP doesn't kill the rest — fall back to passive snapshot
-				dbg?.(
-					`cascade neighbor touch error for ${neighborPath}: ${result.reason}`,
-				);
-				const entry = allDiags.get(normalizeMapKey(neighborPath));
-				const ttlFresh =
-					entry != null && Date.now() - entry.ts < CASCADE_TTL_MS;
-				// #1104: consult binding before trusting a TTL-fresh fallback snapshot —
-				// MATCH #1100/#1095 semantics (false → skip, "unknown" → keep the
-				// pre-#1104 TTL-only behavior, true → use). Without this, a failed
-				// active touch could still re-display a bound-false (pre-fix-edit)
-				// snapshot even though the reconcile path (#1100) already refuses to
-				// trust it for the widget — the widget is protected but the display
-				// wasn't. Reading `.binding` triggers the lazy disk verify — done ONLY
-				// when TTL-fresh, same discipline as the snapshot-tier gate above.
-				const boundToDisk: BoundToCurrentDisk | undefined = ttlFresh
-					? readBoundToCurrentDisk(entry)
-					: undefined;
-				const bindingRejected = boundToDisk === false;
-				if (bindingRejected) fallbackBindingRejected = true;
+			// fan-out active touches in parallel (A3):
+			// - non-jsts neighbors (always touched)
+			// - autoPropagate neighbors whose snapshot was missing/stale (coldSnapshotPaths)
+			//   use a tighter 1000ms budget since the server is expected to be warm already.
+			const touchResults = await Promise.allSettled(
+				[...activePaths, ...coldSnapshotPaths].map(async (neighborPath) => {
+					const isColdSnapshot = coldSnapshotPaths.includes(neighborPath);
+					const neighborStart = Date.now();
+					const cacheKey = normalizeMapKey(neighborPath);
+
+					const passiveEntry = allDiags.get(cacheKey);
+					const hasFreshPassiveErrors =
+						passiveEntry != null &&
+						Date.now() - passiveEntry.ts < CASCADE_DIAGNOSTICS_TTL_MS &&
+						passiveEntry.diags.some((d) => d.severity === 1);
+					const recentlyClean = recentlyCleanNeighborCache.get(cacheKey);
+					if (
+						recentlyClean &&
+						turnSeq - recentlyClean.turnSeq <= RECENTLY_CLEAN_TTL_TURNS &&
+						!hasFreshPassiveErrors
+					) {
+						producedLspData = true;
+						recentlyCleanHits++;
+						const durationMs = Date.now() - neighborStart;
+						logCascade({
+							phase: "neighbor_snapshot",
+							filePath,
+							neighborFile: neighborPath,
+							diagnosticCount: 0,
+							durationMs,
+							autoPropagate: false,
+							snapshotMissing: false,
+							metadata: {
+								recentlyClean: true,
+								cleanTurnSeq: recentlyClean.turnSeq,
+							},
+						});
+						return {
+							filePath: neighborPath,
+							reason: neighborReason(importerSet, callerSet, neighborPath),
+							diagnostics: [],
+							lspTouched: false,
+							durationMs,
+						} satisfies CascadeResult["neighbors"][number];
+					}
+
+					// #1899: the A5 same-write cache read stood here. See the removal note
+					// at the module's cache declarations — the gate could only pass inside
+					// a single write, which never runs two cascades.
+
+					const configuredServerCount =
+						getServersForFileWithConfig(neighborPath).length;
+					if (configuredServerCount === 0) {
+						noLspConfigured++;
+						noLspCandidatePaths.add(cacheKey);
+						logCascade({
+							phase: "neighbor_fallback",
+							filePath,
+							neighborFile: neighborPath,
+							fallbackUsed: false,
+							error: "no_lsp_server_configured",
+						});
+						return undefined;
+					}
+
+					// A6: async read to avoid blocking event loop on network-mounted drives
+					const content = await nodeFs.promises.readFile(neighborPath, "utf8");
+
+					// #458/#1444: tier-aware cascade-lane wait. A Tier-3 silent server
+					// cannot give this wait an affirmative clean signal. Native TS7 does
+					// publish, but not inside the cold-snapshot budget. In both cases the
+					// in-lane budget is pure cost. Fire the touch (didOpen/
+					// didChange still happens — the server starts real work) and record
+					// it as outstanding for the agent_settled quiet window to reconcile
+					// instead of waiting here. Ambiguous/missing capability data always
+					// classifies as "waits" (today's behavior) — see cascade-tier.ts.
+					// The whole attempt is try/caught: any surprise (a service shape
+					// that doesn't expose getCapabilitySnapshots/getClientForFile, a
+					// thrown rejection) falls through to the existing full-wait path
+					// below rather than skip the wait on a failure.
+					if (isTierAwareCascadeEnabled()) {
+						try {
+							const snapshots =
+								(await lspService.getCapabilitySnapshots?.(neighborPath)) ?? [];
+							const tier = classifyCascadeWaitTier(
+								lspService,
+								neighborPath,
+								snapshots,
+							);
+							if (tier === "tier3-silent" || tier === "collect-later") {
+								const spawnedForTouch =
+									await lspService.getClientForFile(neighborPath);
+								if (spawnedForTouch) {
+									// Sampled BEFORE the touchFile notify: a publish landing
+									// in the notify→record gap must read as post-touch at
+									// reconcile time, never be misclassified as pre-touch
+									// (the reconcile compares this against the client's
+									// PER-FILE publish timestamp — see cascade-tier.ts).
+									const touchedAt = Date.now();
+									await lspService.touchFile(neighborPath, content, {
+										diagnostics: "none",
+										collectDiagnostics: false,
+										silent: true,
+										source: "cascade",
+										clientScope: "primary",
+									});
+									recordOutstandingCascadeTouch({
+										filePath: neighborPath,
+										serverId: spawnedForTouch.client.serverId,
+										touchedAt,
+									});
+									const durationMs = Date.now() - neighborStart;
+									if (tier === "collect-later") collectLaterSkipped++;
+									// F1: both tier3-silent and collect-later skip the in-lane
+									// wait and record an outstanding touch for the quiet-window
+									// reconcile — neither a cache hit nor a genuine completed
+									// cold touch, so both share this explicit "deferred" bucket
+									// instead of falling out of the partition uncounted.
+									deferredTouches++;
+									logCascade({
+										phase: "cascade_tier3_skip",
+										filePath,
+										neighborFile: neighborPath,
+										durationMs,
+										lspServerCount: configuredServerCount,
+										coldSnapshot: isColdSnapshot,
+										metadata: {
+											serverId: spawnedForTouch.client.serverId,
+											waitTier: tier,
+										},
+									});
+									// Deliberately NOT cached as clean/diagnosed — the wait was
+									// skipped, not resolved, so recentlyCleanNeighborCache must
+									// not treat this as a real answer
+									// (#240 doctrine). Return undefined: the degraded-fallback
+									// path below still has a chance to surface a passive/stale
+									// snapshot, same as any other "no fresh data this touch" case.
+									return undefined;
+								}
+							}
+						} catch (tierErr) {
+							dbg?.(
+								`cascade tier-aware skip attempt failed for ${neighborPath}, falling back to full wait: ${tierErr}`,
+							);
+						}
+					}
+
+					// Open with silent=true (suppresses didChangeWatchedFiles rechecks, C2)
+					// and collect diagnostics from the same touched clients.
+					// Cold-snapshot neighbors (autoPropagate LSP, server warm) use a tighter
+					// 1000ms budget — they should respond quickly; we'd rather return zero
+					// than block cascade for 2s on a slow open.
+					// F1: this is the ONE remaining outcome after cache hit, recently-clean
+					// hit, and tier-aware deferral have all been ruled out — a genuine
+					// active LSP touch is being issued right now. Count it here (an
+					// attempt, whether it resolves, times out, or the promise rejects
+					// below in the allSettled catch) rather than from `coldSnapshotPaths`,
+					// which is finalized before any of the above checks run and includes
+					// neighbours that resolve via cache/recently-clean instead.
+					coldTouches++;
+					// #1720: language-server scope only, matching the tier-aware touch
+					// above (`clientScope: "primary"`, integration.ts:1826). A neighbor's
+					// content did not change — only its import target did — so an
+					// auxiliary scanner's (ast-grep/opengrep/typos) file-local verdict for
+					// it cannot have changed; only cross-file type semantics (the
+					// language server) can. `reconcileCascadeNeighborLspErrors` already
+					// merges errors-only and preserves the neighbor's existing aux
+					// findings by construction (see its doc comment and
+					// `cascadeReconcilableLspErrors` above), so an `"all"`-scope touch
+					// paid full aux notify traffic and aux confirmation-wait latency for
+					// a re-derivation nothing downstream ever reads. `"primary"` resolves
+					// per `neighborPath` (`getClientForFile` → `getServersForFileWithConfig`),
+					// so a multi-language neighbor still gets its OWN language server,
+					// not the primary edit's.
+					const rawDiags = await lspService.touchFile(neighborPath, content, {
+						diagnostics: "document",
+						collectDiagnostics: true,
+						maxClientWaitMs: isColdSnapshot ? 1000 : 2000,
+						silent: true,
+						source: "cascade",
+						clientScope: "primary",
+					});
+					if (!rawDiags) return undefined;
+					// #1093/#571/#1095: a touch result is only a CONFIRMED observation of the
+					// neighbor's current on-disk state when it is neither `inconclusive` (the
+					// notify/diagnostics wait lapsed — e.g. the tight 1000ms cold-snapshot
+					// budget on a slow server) NOR bound-false (`binding.boundToCurrentDisk
+					// === false` — the diagnostics were computed against a different disk state
+					// than what's on disk now). Either disqualifier means a resolved `[]` is
+					// NOT a confirmed clean: treating it as one would WIPE a live footer finding
+					// (the #533 false-clean trap, worse than the stale-display bug). Both flags
+					// are folded into `isConfirmedTouch` so no gate below can miss one. A
+					// confirmed result reconciles and may seed the recently-clean cache; an
+					// unconfirmed one does neither (else the short-circuit on the next cascade
+					// would make the wipe self-sustain).
+					const confirmed = isConfirmedTouch(rawDiags);
+					const bindingRejected = readBoundToCurrentDisk(rawDiags) === false;
+					const inconclusive = readInconclusive(rawDiags);
+					// #1470/#1493: the third, independent reason a touch is unconfirmed — an
+					// auxiliary that never reported, cut off by our grace timer or silent
+					// with nothing published for this content. Logged alongside the other two
+					// so cascade.log alone still tells the three apart.
+					const unconfirmedServerIds = touchCoverageGap(rawDiags);
+					// #692: `source: "cascade"` no longer overrides `rule` (see the
+					// doc comment on the sibling call above) — dropped rather than
+					// migrated to `scanOrigin` since cascade output never touches
+					// persisted widget/dedup state.
+					// #1179: `.filter()` here operates on `rawDiags.diags`; the
+					// `inconclusive`/`binding` flags read above stay on the `rawDiags`
+					// wrapper and are unaffected by this copy (the shape-5 fix).
+					const diags = convertLspDiagnostics(
+						rawDiags.diags
+							.filter((d) => d.severity === 1)
+							.slice(0, MAX_PER_FILE),
+						neighborPath,
+					);
+					const durationMs = Date.now() - neighborStart;
+
+					// #1899: the A5 same-write cache write stood here.
+					if (diags.length === 0) {
+						// Only a CONFIRMED clean touch may seed the recently-clean cache
+						// (#1095: a bound-false touch is unconfirmed, exactly like inconclusive).
+						if (confirmed) {
+							recentlyCleanNeighborCache.set(cacheKey, {
+								turnSeq,
+								checkedAt: Date.now(),
+							});
+						}
+					} else {
+						recentlyCleanNeighborCache.delete(cacheKey);
+					}
+					producedLspData = true;
+
+					logCascade({
+						phase: "neighbor_touch",
+						filePath,
+						neighborFile: neighborPath,
+						diagnosticCount: diags.length,
+						durationMs,
+						lspTouched: true,
+						lspServerCount: configuredServerCount,
+						coldSnapshot: isColdSnapshot,
+						// #1104: an unconfirmed touch has two independent, otherwise
+						// indistinguishable causes — `inconclusive` (the notify/diagnostics
+						// wait lapsed its deadline) and bound-false (`bindingState`, #1095 —
+						// diagnostics computed against a diverged disk state). Surface
+						// `inconclusive` unconditionally so cascade.log alone (no
+						// cross-referencing latency.log) tells them apart; `bindingState`
+						// stays conditional since "bound" carries no extra signal.
+						metadata: {
+							inconclusive,
+							// #1549: WHICH primary and WHICH deadline, present only when the
+							// touch actually reported itself inconclusive.
+							...(inconclusive && readInconclusiveAttribution(rawDiags)),
+							...(bindingRejected && {
+								bindingState: bindingStateLabel(false),
+							}),
+							...(unconfirmedServerIds.length > 0 && {
+								unconfirmedServerIds: [...unconfirmedServerIds],
+							}),
+						},
+					});
+
+					// #1093/#1095: a completed, CONFIRMED active touch is a confirmed
+					// observation of this neighbor's current LSP-error state (#571) —
+					// reconcile it into the footer widget, INCLUDING the confirmed-clean `[]`
+					// case, so a fix-edit to the primary that resolves a cross-file error in
+					// this neighbor clears the neighbor's now-stale footer entry (the #1092
+					// defect). MERGE (genuine LSP errors only — auxiliary findings excluded,
+					// see `cascadeReconcilableLspErrors`) so a live biome/ruff/aux finding or
+					// LSP warning survives this errors-only re-check. Keyed by the primary
+					// edit's `writeSeq` so a genuinely newer per-edit write still wins the
+					// WriteOrderingGuard. `observedAt` stays now (a fresh touch). The
+					// inconclusive touch, the BOUND-FALSE touch (#1095 — computed against a
+					// diverged disk state), the tier-3-silent skip, the recently-clean
+					// short-circuit, the within-turn cache hit, and the rejected-touch
+					// fallback are all deliberately NOT reconciled — none is a confirmed
+					// observation.
+					if (confirmed) {
+						reconcileCascadeNeighborLspErrors(
+							neighborPath,
+							cascadeReconcilableLspErrors(rawDiags.diags, neighborPath),
+							writeSeq,
+						);
+					}
+
+					return {
+						filePath: neighborPath,
+						reason: neighborReason(importerSet, callerSet, neighborPath),
+						diagnostics: diags,
+						lspTouched: true as const,
+						...(inconclusive && { inconclusive: true as const }),
+						// #1459: carry the coverage gap to the agent-facing surface. A
+						// scanner whose breaker was open, whose resync the fan-out gate
+						// deferred, or whom the aux grace timer cut off never looked at this
+						// file — without this the neighbour reaches the agent as
+						// `{ diagnostics: [] }` with no marker, which is the false-clean the
+						// touch already refuses to claim for itself.
+						...(unconfirmedServerIds.length > 0 && {
+							unconfirmedServerIds: [...unconfirmedServerIds],
+						}),
+						durationMs,
+					} satisfies CascadeResult["neighbors"][number];
+				}),
+			);
+
+			const allTouchPaths = [...activePaths, ...coldSnapshotPaths];
+			for (let i = 0; i < touchResults.length; i++) {
+				const result = touchResults[i];
+				const neighborPath = allTouchPaths[i];
+				if (result.status === "fulfilled") {
+					if (result.value) neighbors.push(result.value);
+				} else {
+					touchFailures++;
+					// A3: one failed LSP doesn't kill the rest — fall back to passive snapshot
+					dbg?.(
+						`cascade neighbor touch error for ${neighborPath}: ${result.reason}`,
+					);
+					const entry = allDiags.get(normalizeMapKey(neighborPath));
+					const ttlFresh =
+						entry != null && Date.now() - entry.ts < CASCADE_DIAGNOSTICS_TTL_MS;
+					// #1104: consult binding before trusting a TTL-fresh fallback snapshot —
+					// MATCH #1100/#1095 semantics (false → skip, "unknown" → keep the
+					// pre-#1104 TTL-only behavior, true → use). Without this, a failed
+					// active touch could still re-display a bound-false (pre-fix-edit)
+					// snapshot even though the reconcile path (#1100) already refuses to
+					// trust it for the widget — the widget is protected but the display
+					// wasn't. Reading `.binding` triggers the lazy disk verify — done ONLY
+					// when TTL-fresh, same discipline as the snapshot-tier gate above.
+					const boundToDisk: BoundToCurrentDisk | undefined = ttlFresh
+						? readBoundToCurrentDisk(entry)
+						: undefined;
+					const bindingRejected = boundToDisk === false;
+					if (bindingRejected) fallbackBindingRejected = true;
+					logCascade({
+						phase: "neighbor_fallback",
+						filePath,
+						neighborFile: neighborPath,
+						fallbackUsed: true,
+						error: String(result.reason),
+						// #1104: distinguish a binding-rejected fallback (TTL-fresh but the
+						// server's view diverged from disk) from a plain TTL-stale/missing
+						// one — same conditional pattern as the neighbor_touch/neighbor_snapshot
+						// phases above.
+						...(bindingRejected && {
+							metadata: { bindingState: bindingStateLabel(boundToDisk) },
+						}),
+					});
+					// #692: `source: "cascade"` dropped (see the doc comment above the
+					// first cascade call site in this file) — no longer affects `rule`
+					// and cascade output never touches persisted widget/dedup state.
+					const diags =
+						ttlFresh && !bindingRejected
+							? convertLspDiagnostics(
+									entry.diags
+										.filter((d) => d.severity === 1)
+										.slice(0, MAX_PER_FILE),
+									neighborPath,
+								)
+							: [];
+					neighbors.push({
+						filePath: neighborPath,
+						reason: "fallback",
+						diagnostics: diags,
+						lspTouched: false,
+					});
+				}
+			}
+		}
+
+		// CR-3/A2: degraded fallback when no neighbor produced trustworthy LSP data —
+		// not merely when the graph returned zero neighbors. In a mixed run, only
+		// candidates that had no configured LSP may use passive fallback; broadening
+		// to unrelated cache entries would make the partial active result misleading.
+		if (producedLspData && noLspCandidatePaths.size > 0) {
+			const bindingRejected = appendFallbackNeighbors(
+				neighbors,
+				allDiags,
+				normalizedFileKey,
+				cwd,
+				filePath,
+				noLspCandidatePaths,
+			);
+			if (bindingRejected) fallbackBindingRejected = true;
+		} else if (!producedLspData) {
+			const bindingRejected = appendFallbackNeighbors(
+				neighbors,
+				allDiags,
+				normalizedFileKey,
+				cwd,
+				filePath,
+			);
+			if (bindingRejected) fallbackBindingRejected = true;
+			if (neighbors.some((n) => n.reason === "fallback")) {
 				logCascade({
 					phase: "neighbor_fallback",
 					filePath,
-					neighborFile: neighborPath,
 					fallbackUsed: true,
-					error: String(result.reason),
-					// #1104: distinguish a binding-rejected fallback (TTL-fresh but the
-					// server's view diverged from disk) from a plain TTL-stale/missing
-					// one — same conditional pattern as the neighbor_touch/neighbor_snapshot
-					// phases above.
-					...(bindingRejected && {
-						metadata: { bindingState: bindingStateLabel(boundToDisk) },
-					}),
-				});
-				// #692: `source: "cascade"` dropped (see the doc comment above the
-				// first cascade call site in this file) — no longer affects `rule`
-				// and cascade output never touches persisted widget/dedup state.
-				const diags =
-					ttlFresh && !bindingRejected
-						? convertLspDiagnostics(
-								entry.diags
-									.filter((d) => d.severity === 1)
-									.slice(0, MAX_PER_FILE),
-								neighborPath,
-							)
-						: [];
-				neighbors.push({
-					filePath: neighborPath,
-					reason: "fallback",
-					diagnostics: diags,
-					lspTouched: false,
+					neighborCount: neighbors.length,
 				});
 			}
 		}
-	}
 
-	// CR-3/A2: degraded fallback when no neighbor produced trustworthy LSP data —
-	// not merely when the graph returned zero neighbors.
-	if (!producedLspData) {
-		const bindingRejected = appendFallbackNeighbors(
-			neighbors,
-			allDiags,
-			normalizedFileKey,
+		const visibleNeighbors = applyCascadeDeltaBaselines(neighbors);
+
+		const formatted = formatCascadeResult(
 			cwd,
-			filePath,
+			impact,
+			visibleNeighbors,
+			impact.neighborFiles.length,
 		);
-		if (bindingRejected) fallbackBindingRejected = true;
-		if (neighbors.some((n) => n.reason === "fallback")) {
-			logCascade({
-				phase: "neighbor_fallback",
-				filePath,
-				fallbackUsed: true,
-				neighborCount: neighbors.length,
-			});
+
+		// #1104 HONESTY: filtering a bound-false display candidate must not turn a
+		// degraded/indeterminate cascade into a clean-looking one (same doctrine as
+		// #1023's graph-degraded marker). If every candidate the degraded-fallback
+		// paths considered this run was binding-rejected and nothing else produced
+		// output, thread the SAME indeterminate marker #1023 built so the turn-end
+		// advisory (clients/runtime-turn.ts) surfaces an honest note instead of
+		// silence — never let a withheld-stale-snapshot run look like a genuine
+		// clean leaf. `!impact.indeterminate` preserves a graph-degraded marker that
+		// already exists (never overwritten).
+		if (!formatted && fallbackBindingRejected && !impact.indeterminate) {
+			impact.indeterminate = {
+				reason: "lsp_binding_rejected",
+				detail:
+					"cascade fallback diagnostics were withheld — stale snapshot content did not match current disk (binding rejected)",
+			};
 		}
-	}
 
-	const visibleNeighbors = applyCascadeDeltaBaselines(neighbors);
+		const filesWithErrors = visibleNeighbors.filter(
+			(n) => n.diagnostics.length > 0,
+		).length;
+		const selectedOutcomeCount =
+			passiveSnapshotHits +
+			recentlyCleanHits +
+			deferredTouches +
+			coldTouches +
+			noLspConfigured;
+		const selectedOutcomeGap = Math.max(
+			0,
+			sortedNeighbors.length - selectedOutcomeCount,
+		);
+		logCascade({
+			phase: "cascade_result",
+			filePath,
+			neighborCount: visibleNeighbors.length,
+			diagnosticCount: visibleNeighbors.reduce(
+				(sum, n) => sum + n.diagnostics.length,
+				0,
+			),
+			metadata: {
+				filesWithErrors,
+				hasOutput: formatted.length > 0,
+				indeterminateReason: impact.indeterminate?.reason,
+				candidateNeighborCount: cascadeCandidateCount,
+				eligibleNeighborCount: cascadeEligibleCount,
+				filterDroppedCount: cascadeFilterDroppedCount,
+				selectedNeighborCount: sortedNeighbors.length,
+				selectedOutcomeCount,
+				selectedOutcomeGap,
+				passiveSnapshotHits,
+				noLspConfigured,
+				touchFailures,
+				// #1444: >0 means "answers are still outstanding", not "nothing found".
+				collectLaterSkipped,
+				// Log when cascade ran but found nothing — distinguishes "clean" from "no signal"
+				noNeighbors: visibleNeighbors.length === 0,
+				noErrors: visibleNeighbors.length > 0 && filesWithErrors === 0,
+				// #1446 item 5: cache effectiveness as a number instead of an inference
+				// from `coldSnapshot`/`snapshotMissing` flags scattered across
+				// per-neighbor `neighbor_touch`/`neighbor_snapshot` rows.
+				// F1: recentlyCleanHits + deferredTouches + coldTouches
+				// retain their outcome semantics. Passive snapshots and no-server selections
+				// complete the selected-neighbor denominator; touchFailures is a bounded
+				// subtype of coldTouches, not an additional outcome.
+				recentlyCleanHits,
+				deferredTouches,
+				coldTouches,
+				// #1446 item 4: the budget in force and how many eligible candidates
+				// it cut off this run — the correctness half (a truncated run being
+				// silently discarded) is #1443.
+				// #1462: `neighborBudget` is now the DERIVED budget (still "the one in
+				// force"); `neighborBudgetCeiling` is the flat cap, `budgetRemainingMs`
+				// the on-time window left when it was sized, and `budgetZone` the rule
+				// that decided it. Only `budgetZone: "narrowed"` shortens a walk — the
+				// other three keep the flat cap, so a row where budget < ceiling is a
+				// deliberate rescue, never a cold-start stub. `budgetDeliveryWindowMs`
+				// records how long the pipeline (turn_end settle + quiet-window drain)
+				// keeps a slow run alive, which is why the other zones can afford to
+				// stay wide.
+				//
+				// NOTE for whoever reads these rows: `budgetTruncated` INVERTS under a
+				// narrowed budget — it is `eligible - budget`, so a smaller budget
+				// mechanically raises it. Compare truncation WITHIN a zone, never
+				// across one.
+				neighborBudget: cascadeNeighbourBudget,
+				neighborBudgetCeiling: CASCADE_NEIGHBOUR_BUDGET,
+				budgetRemainingMs: cascadeBudgetRemainingMs,
+				budgetZone: cascadeBudgetZone,
+				budgetDeliveryWindowMs: cascadeDeliveryWindowMs,
+				budgetTruncated: cascadeBudgetTruncated,
+				transitiveTruncated,
+				budgetTrimmedCount: cascadeBudgetTruncated,
+				budgetDerivationDisabled: cascadeBudgetZone === "no-rescue-window",
+				budgetDerivationDisabledReason:
+					cascadeBudgetZone === "no-rescue-window"
+						? "no-rescue-window"
+						: undefined,
+				neighbors: visibleNeighbors.slice(0, 10).map((n) => ({
+					file: n.filePath.replace(/\\/g, "/").split("/").slice(-2).join("/"),
+					diagnostics: n.diagnostics.length,
+				})),
+			},
+		});
 
-	const formatted = formatCascadeResult(
-		cwd,
-		impact,
-		visibleNeighbors,
-		impact.neighborFiles.length,
-	);
-
-	// #1104 HONESTY: filtering a bound-false display candidate must not turn a
-	// degraded/indeterminate cascade into a clean-looking one (same doctrine as
-	// #1023's graph-degraded marker). If every candidate the degraded-fallback
-	// paths considered this run was binding-rejected and nothing else produced
-	// output, thread the SAME indeterminate marker #1023 built so the turn-end
-	// advisory (clients/runtime-turn.ts) surfaces an honest note instead of
-	// silence — never let a withheld-stale-snapshot run look like a genuine
-	// clean leaf. `!impact.indeterminate` preserves a graph-degraded marker that
-	// already exists (never overwritten).
-	if (!formatted && fallbackBindingRejected && !impact.indeterminate) {
-		impact.indeterminate = {
-			reason: "lsp_binding_rejected",
-			detail:
-				"cascade fallback diagnostics were withheld — stale snapshot content did not match current disk (binding rejected)",
-		};
-	}
-
-	const filesWithErrors = visibleNeighbors.filter(
-		(n) => n.diagnostics.length > 0,
-	).length;
-	logCascade({
-		phase: "cascade_result",
-		filePath,
-		neighborCount: visibleNeighbors.length,
-		diagnosticCount: visibleNeighbors.reduce(
+		const diagCount = visibleNeighbors.reduce(
 			(sum, n) => sum + n.diagnostics.length,
 			0,
-		),
-		metadata: {
-			filesWithErrors,
-			hasOutput: formatted.length > 0,
-			// #1444: >0 means "answers are still outstanding", not "nothing found".
-			collectLaterSkipped,
-			// Log when cascade ran but found nothing — distinguishes "clean" from "no signal"
-			noNeighbors: visibleNeighbors.length === 0,
-			noErrors: visibleNeighbors.length > 0 && filesWithErrors === 0,
-			// #1446 item 5: cache effectiveness as a number instead of an inference
-			// from `coldSnapshot`/`snapshotMissing` flags scattered across
-			// per-neighbor `neighbor_touch`/`neighbor_snapshot` rows.
-			// F1: cacheHits + recentlyCleanHits + deferredTouches + coldTouches
-			// partition `[...activePaths, ...coldSnapshotPaths]` exactly — each
-			// counter increments at the point its neighbour's outcome is actually
-			// decided, not from `coldSnapshotPaths` (a pre-outcome list finalized
-			// before the cache-hit checks run). A neighbour with no LSP server
-			// configured is the one deliberately uncounted outcome (never touched).
-			cacheHits,
-			recentlyCleanHits,
-			deferredTouches,
-			coldTouches,
-			// #1446 item 4: the budget in force and how many eligible candidates
-			// it cut off this run — the correctness half (a truncated run being
-			// silently discarded) is #1443; this is observability only.
-			neighborBudget: CASCADE_NEIGHBOUR_BUDGET,
-			budgetTruncated: cascadeBudgetTruncated,
-			neighbors: visibleNeighbors.slice(0, 10).map((n) => ({
-				file: n.filePath.replace(/\\/g, "/").split("/").slice(-2).join("/"),
-				diagnostics: n.diagnostics.length,
-			})),
-		},
-	});
+		);
 
-	const diagCount = visibleNeighbors.reduce(
-		(sum, n) => sum + n.diagnostics.length,
-		0,
-	);
+		cascadeSessionStats.runs += 1;
+		cascadeSessionStats.diagnosticsSurfaced += diagCount;
+		cascadeSessionStats.coldSnapshotTouches += coldSnapshotPaths.length;
 
-	cascadeSessionStats.runs += 1;
-	cascadeSessionStats.diagnosticsSurfaced += diagCount;
-	cascadeSessionStats.coldSnapshotTouches += coldSnapshotPaths.length;
-
-	if (!formatted) {
-		// #1023: an indeterminate compute (degraded/cold/missing-node graph) must
-		// NOT collapse into "no_neighbors" — that is the exact silent all-clear the
-		// bug is about. Distinguish it by the marker threaded onto `impact`, never
-		// by `visibleNeighbors.length === 0` alone (a healthy leaf is also empty).
-		if (impact.indeterminate) {
+		if (!formatted) {
+			// #1023: an indeterminate compute (degraded/cold/missing-node graph) must
+			// NOT collapse into "no_neighbors" — that is the exact silent all-clear the
+			// bug is about. Distinguish it by the marker threaded onto `impact`, never
+			// by `visibleNeighbors.length === 0` alone (a healthy leaf is also empty).
+			if (impact.indeterminate) {
+				return {
+					filePath,
+					result: undefined,
+					neighborCount: visibleNeighbors.length,
+					diagnosticCount: diagCount,
+					skipReason: "indeterminate",
+					indeterminate: impact.indeterminate,
+					selectedNeighborPaths: sortedNeighbors.slice(),
+				};
+			}
+			const skipReason: CascadeSkipReason =
+				visibleNeighbors.length === 0 ? "no_neighbors" : "clean";
 			return {
 				filePath,
 				result: undefined,
 				neighborCount: visibleNeighbors.length,
 				diagnosticCount: diagCount,
-				skipReason: "indeterminate",
-				indeterminate: impact.indeterminate,
+				skipReason,
 			};
 		}
-		const skipReason: CascadeSkipReason =
-			visibleNeighbors.length === 0 ? "no_neighbors" : "clean";
+
+		getDiagnosticTracker().trackShown(
+			visibleNeighbors.flatMap((n) => n.diagnostics),
+		);
+
 		return {
 			filePath,
-			result: undefined,
+			result: { filePath, impact, neighbors: visibleNeighbors, formatted },
 			neighborCount: visibleNeighbors.length,
 			diagnosticCount: diagCount,
-			skipReason,
+			// #1023: even when some fallback neighbors surfaced, a degraded graph means
+			// the dependent set is INCOMPLETE — carry the marker so the turn-end seam
+			// still notes downstream impact was under-computed this turn.
+			...(impact.indeterminate && { indeterminate: impact.indeterminate }),
 		};
-	}
-
-	getDiagnosticTracker().trackShown(
-		visibleNeighbors.flatMap((n) => n.diagnostics),
-	);
-
-	return {
-		filePath,
-		result: { filePath, impact, neighbors: visibleNeighbors, formatted },
-		neighborCount: visibleNeighbors.length,
-		diagnosticCount: diagCount,
-		// #1023: even when some fallback neighbors surfaced, a degraded graph means
-		// the dependent set is INCOMPLETE — carry the marker so the turn-end seam
-		// still notes downstream impact was under-computed this turn.
-		...(impact.indeterminate && { indeterminate: impact.indeterminate }),
-	};
 	} finally {
 		// Keep the cache entry warm, but do not let a one-shot cascade leave an
 		// idle handle behind. The next consumer re-arms it through touch.
@@ -2069,7 +2281,10 @@ export async function computeCascadeForFile(
 		for (const [key, entry] of reverseDepsIndexCache) {
 			if (entry.idleTimer !== undefined) clearTimeout(entry.idleTimer);
 			entry.idleTimer = undefined;
-			if (!reverseDepsTimersToRelease.has(key) && reverseDepsEntriesAtStart.has(entry)) {
+			if (
+				!reverseDepsTimersToRelease.has(key) &&
+				reverseDepsEntriesAtStart.has(entry)
+			) {
 				reverseDepsTimersToRelease.add(key);
 			}
 		}
@@ -2128,6 +2343,7 @@ function appendFallbackNeighbors(
 	normalizedFileKey: string,
 	cwd: string,
 	filePath: string,
+	allowedPaths?: ReadonlySet<string>,
 ): boolean {
 	const now = Date.now();
 	const seen = new Set(neighbors.map((n) => normalizeMapKey(n.filePath)));
@@ -2136,6 +2352,7 @@ function appendFallbackNeighbors(
 		const { diags, ts } = entry;
 		const diagKey = normalizeMapKey(diagPath);
 		if (diagKey === normalizedFileKey || seen.has(diagKey)) continue;
+		if (allowedPaths && !allowedPaths.has(diagKey)) continue;
 		if (primaryFilesThisTurn.has(diagKey)) continue;
 		if (isExternalOrVendorFile(diagPath, cwd)) continue;
 		if (isIgnoredCascadeNeighbor(diagPath, cwd)) continue;
@@ -2144,7 +2361,7 @@ function appendFallbackNeighbors(
 		// above never reach). Ignore filtering (#297) stays separate and above.
 		if (isTestRoleCollateral(diagPath)) continue;
 		if (!nodeFs.existsSync(diagPath)) continue;
-		if (now - ts > CASCADE_TTL_MS) continue;
+		if (now - ts > CASCADE_DIAGNOSTICS_TTL_MS) continue;
 		// #1104: a TTL-fresh entry is not automatically trustworthy — consult
 		// binding the same way the reconcile path (#1100) and the touch-error
 		// fallback above do. `false` → skip (a stale/pre-fix-edit snapshot whose

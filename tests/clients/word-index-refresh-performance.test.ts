@@ -50,4 +50,3 @@ describe("word-index incremental refresh performance (#958)", () => {
 		}
 	});
 });
-

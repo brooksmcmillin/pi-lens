@@ -19,7 +19,10 @@
 
 import { describe, expect, it } from "vitest";
 import { scanProjectDiagnostics } from "../../clients/project-diagnostics/scanner.js";
-import { projectScan, scanTruncationNotice } from "../../clients/lens-engine.js";
+import {
+	projectScan,
+	scanTruncationNotice,
+} from "../../clients/lens-engine.js";
 import { makeMonorepo, type MonorepoPackageSpec } from "./fixture.js";
 
 function fileMap(count: number): Record<string, string> {

@@ -21,7 +21,7 @@ function ctx(filePath: string, cwd: string) {
 		cwd,
 		kind: "shell" as const,
 		pi: { getFlag: () => false },
-		facts: { },
+		facts: {},
 		log: () => {},
 	};
 }
@@ -48,7 +48,12 @@ describe("shfmt runner — format-diff warning is .editorconfig-gated (#211)", (
 	}
 
 	it("does NOT warn on an unformatted file when no .editorconfig exists", async () => {
-		safeSpawnAsync.mockResolvedValue({ error: null, status: 1, stdout: "@@ -1 +1 @@\n-x\n+x\n", stderr: "" });
+		safeSpawnAsync.mockResolvedValue({
+			error: null,
+			status: 1,
+			stdout: "@@ -1 +1 @@\n-x\n+x\n",
+			stderr: "",
+		});
 		try {
 			const result = await run();
 			expect(result.diagnostics).toHaveLength(0);
@@ -59,8 +64,16 @@ describe("shfmt runner — format-diff warning is .editorconfig-gated (#211)", (
 	});
 
 	it("warns on an unformatted file when .editorconfig opts in", async () => {
-		fs.writeFileSync(path.join(env.tmpDir, ".editorconfig"), "[*.sh]\nindent_size = 2\n");
-		safeSpawnAsync.mockResolvedValue({ error: null, status: 1, stdout: "@@ -3 +3 @@\n", stderr: "" });
+		fs.writeFileSync(
+			path.join(env.tmpDir, ".editorconfig"),
+			"[*.sh]\nindent_size = 2\n",
+		);
+		safeSpawnAsync.mockResolvedValue({
+			error: null,
+			status: 1,
+			stdout: "@@ -3 +3 @@\n",
+			stderr: "",
+		});
 		try {
 			const result = await run();
 			expect(result.diagnostics).toHaveLength(1);
@@ -72,7 +85,12 @@ describe("shfmt runner — format-diff warning is .editorconfig-gated (#211)", (
 	});
 
 	it("ALWAYS reports parse errors, even without .editorconfig", async () => {
-		safeSpawnAsync.mockResolvedValue({ error: null, status: 2, stdout: "", stderr: "script.sh:2:1: syntax error\n" });
+		safeSpawnAsync.mockResolvedValue({
+			error: null,
+			status: 2,
+			stdout: "",
+			stderr: "script.sh:2:1: syntax error\n",
+		});
 		try {
 			const result = await run();
 			expect(result.status).toBe("failed");

@@ -220,12 +220,14 @@ export function aggregateGraphToFiles(
 		const canonical = canonicalOf.get(raw) ?? raw;
 		if (raw !== canonical) continue;
 		const key = `${node.symbolName}\u0000${node.symbolKind ?? ""}`;
-		const byName = sourceSymbolsByFile.get(canonical) ?? new Map<string, string[]>();
+		const byName =
+			sourceSymbolsByFile.get(canonical) ?? new Map<string, string[]>();
 		const ids = byName.get(key) ?? [];
 		ids.push(node.id);
 		byName.set(key, ids);
 		sourceSymbolsByFile.set(canonical, byName);
-		const bySymbolName = sourceSymbolsByName.get(canonical) ?? new Map<string, string[]>();
+		const bySymbolName =
+			sourceSymbolsByName.get(canonical) ?? new Map<string, string[]>();
 		const nameIds = bySymbolName.get(node.symbolName) ?? [];
 		nameIds.push(node.id);
 		bySymbolName.set(node.symbolName, nameIds);
@@ -245,16 +247,19 @@ export function aggregateGraphToFiles(
 		if (raw === canonical) continue;
 		const key = `${node.symbolName}\u0000${node.symbolKind ?? ""}`;
 		const exactSourceIds = sourceSymbolsByFile.get(canonical)?.get(key) ?? [];
-		const nameSourceIds = sourceSymbolsByName.get(canonical)?.get(node.symbolName) ?? [];
+		const nameSourceIds =
+			sourceSymbolsByName.get(canonical)?.get(node.symbolName) ?? [];
 		// Prefer the kind-qualified mapping. Fall back only when the source name
 		// is unique; never guess among overloads or same-name declarations.
-		const sourceIds = exactSourceIds.length > 0
-			? exactSourceIds
-			: nameSourceIds.length === 1
-				? nameSourceIds
-				: [];
+		const sourceIds =
+			exactSourceIds.length > 0
+				? exactSourceIds
+				: nameSourceIds.length === 1
+					? nameSourceIds
+					: [];
 		const occurrenceKey = exactSourceIds.length > 0 ? key : node.symbolName;
-		const occurrences = twinOccurrencesByFile.get(raw) ?? new Map<string, number>();
+		const occurrences =
+			twinOccurrencesByFile.get(raw) ?? new Map<string, number>();
 		const occurrence = occurrences.get(occurrenceKey) ?? 0;
 		occurrences.set(occurrenceKey, occurrence + 1);
 		twinOccurrencesByFile.set(raw, occurrences);
@@ -287,7 +292,12 @@ export function aggregateGraphToFiles(
 					existing.language = node.language || "";
 				}
 			} else {
-				files.set(id, { id, path: id, language: node.language || "", symbolCount: 0 });
+				files.set(id, {
+					id,
+					path: id,
+					language: node.language || "",
+					symbolCount: 0,
+				});
 			}
 			continue;
 		}
@@ -380,8 +390,10 @@ export function aggregateGraphToFiles(
 		const fullEdges = buildEdgeList(undefined);
 		const { inNeighbors, outNeighbors } = degreesFor(fullEdges);
 		const ranked = [...files.keys()].sort((a, b) => {
-			const degA = (inNeighbors.get(a)?.size ?? 0) + (outNeighbors.get(a)?.size ?? 0);
-			const degB = (inNeighbors.get(b)?.size ?? 0) + (outNeighbors.get(b)?.size ?? 0);
+			const degA =
+				(inNeighbors.get(a)?.size ?? 0) + (outNeighbors.get(a)?.size ?? 0);
+			const degB =
+				(inNeighbors.get(b)?.size ?? 0) + (outNeighbors.get(b)?.size ?? 0);
 			if (degA !== degB) return degB - degA;
 			return a.localeCompare(b);
 		});
@@ -482,8 +494,8 @@ function seededPosition(
 	const hx = fnv1a(id);
 	const hy = fnv1a(`${id}\u0000y`);
 	return {
-		x: (hx % 10000) / 10000 * width,
-		y: (hy % 10000) / 10000 * height,
+		x: ((hx % 10000) / 10000) * width,
+		y: ((hy % 10000) / 10000) * height,
 	};
 }
 

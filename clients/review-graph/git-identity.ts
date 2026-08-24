@@ -66,7 +66,11 @@ function resolveGitDir(cwd: string): ResolvedGitDir | null {
 			continue;
 		}
 		if (stat.isDirectory()) {
-			return { gitDir: gitPath, commonDir: readCommonDir(gitPath), worktreeRoot: dir };
+			return {
+				gitDir: gitPath,
+				commonDir: readCommonDir(gitPath),
+				worktreeRoot: dir,
+			};
 		}
 		if (stat.isFile()) {
 			// Linked worktree: ".git" is a file with a single "gitdir: <path>" line.
@@ -116,9 +120,13 @@ function resolveRefToSha(commonDir: string, ref: string): string | null {
 		/* fall through to packed-refs */
 	}
 	try {
-		const packed = fs.readFileSync(path.join(commonDir, "packed-refs"), "utf-8");
+		const packed = fs.readFileSync(
+			path.join(commonDir, "packed-refs"),
+			"utf-8",
+		);
 		for (const line of packed.split("\n")) {
-			if (line.startsWith("#") || line.startsWith("^") || !line.trim()) continue;
+			if (line.startsWith("#") || line.startsWith("^") || !line.trim())
+				continue;
 			const [sha, packedRef] = line.trim().split(/\s+/, 2);
 			if (packedRef === ref) return sha;
 		}
@@ -138,7 +146,9 @@ export function resolveGitIdentity(cwd: string): GitIdentity | undefined {
 	try {
 		const resolved = getResolvedGitDir(cwd);
 		if (!resolved) return undefined;
-		const headRaw = fs.readFileSync(path.join(resolved.gitDir, "HEAD"), "utf-8").trim();
+		const headRaw = fs
+			.readFileSync(path.join(resolved.gitDir, "HEAD"), "utf-8")
+			.trim();
 		const refMatch = headRaw.match(/^ref:\s*(.+)$/);
 		let headCommit: string | null;
 		if (refMatch) {

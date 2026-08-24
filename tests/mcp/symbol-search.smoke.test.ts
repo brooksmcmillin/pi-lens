@@ -99,8 +99,18 @@ describe("pilens_symbol_search over MCP (tiny project, pre-seeded index)", () =>
 	afterAll(() => {
 		harness.dispose();
 		try {
-			rmSync(projectDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
-			rmSync(snapshotDataRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+			rmSync(projectDir, {
+				recursive: true,
+				force: true,
+				maxRetries: 5,
+				retryDelay: 200,
+			});
+			rmSync(snapshotDataRoot, {
+				recursive: true,
+				force: true,
+				maxRetries: 5,
+				retryDelay: 200,
+			});
 		} catch {
 			// OS reclaims the temp dir eventually.
 		}
@@ -137,17 +147,27 @@ describe("pilens_symbol_search over MCP (tiny project, pre-seeded index)", () =>
 	}, 30_000);
 
 	it("returns available:false with an actionable hint when no index exists for cwd", async () => {
-		const coldDir = mkdtempSync(path.join(tmpdir(), "pi-lens-symbolsearch-cold-mcp-"));
+		const coldDir = mkdtempSync(
+			path.join(tmpdir(), "pi-lens-symbolsearch-cold-mcp-"),
+		);
 		try {
 			const res = await harness.request(11, "tools/call", {
 				name: "pilens_symbol_search",
 				arguments: { query: "anything", cwd: coldDir },
 			});
-			const payload = parseTrailer(res) as { available: boolean; hint?: string };
+			const payload = parseTrailer(res) as {
+				available: boolean;
+				hint?: string;
+			};
 			expect(payload.available).toBe(false);
 			expect(String(payload.hint)).toMatch(/background|retry|session_start/i);
 		} finally {
-			rmSync(coldDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+			rmSync(coldDir, {
+				recursive: true,
+				force: true,
+				maxRetries: 5,
+				retryDelay: 200,
+			});
 		}
 	}, 30_000);
 });

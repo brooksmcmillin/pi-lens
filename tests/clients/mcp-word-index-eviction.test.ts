@@ -150,18 +150,24 @@ describe("MCP warm word-index lifecycle (#1370)", () => {
 		_resetProjectSnapshotParseCacheForTests();
 		resetSnapshotBodyReadCountForTests();
 
-		expect((await symbolSearch("snapshot symbol", cwd)).results).toHaveLength(1);
+		expect((await symbolSearch("snapshot symbol", cwd)).results).toHaveLength(
+			1,
+		);
 		// acquireWarmWordIndex performs the sole full-body read; symbolSearch's
 		// metadata load shares the postings-stripped cached body.
 		expect(getSnapshotBodyReadCountForTests()).toBe(1);
 		expect(_projectSnapshotParseCacheRetainsWordIndexForTests()).toBe(false);
 
-		expect((await symbolSearch("snapshot symbol", cwd)).results).toHaveLength(1);
+		expect((await symbolSearch("snapshot symbol", cwd)).results).toHaveLength(
+			1,
+		);
 		expect(getSnapshotBodyReadCountForTests()).toBe(1);
 
 		await vi.advanceTimersByTimeAsync(20);
 		expect(_getWarmWordIndexCacheStateForTests().size).toBe(0);
-		expect((await symbolSearch("snapshot symbol", cwd)).results).toHaveLength(1);
+		expect((await symbolSearch("snapshot symbol", cwd)).results).toHaveLength(
+			1,
+		);
 		expect(getSnapshotBodyReadCountForTests()).toBe(2);
 		expect(_projectSnapshotParseCacheRetainsWordIndexForTests()).toBe(false);
 	});

@@ -33,7 +33,12 @@ import {
 	downloadGrammarDetailed,
 	fileHasWasmMagic,
 	grammarBlockReason,
+	grammarFileSha256,
+	isVendoredGrammar,
 	LANGUAGE_TO_GRAMMAR,
+	pinnedGrammarHash,
+	vendoredGrammarRefusal,
+	vendoredGrammarsDir,
 } from "./grammar-source.js";
 import { resolvePackagePath } from "./package-root.js";
 import {
@@ -47,6 +52,7 @@ const _require = createRequire(import.meta.url);
 
 import {
 	createTreeCacheCounters,
+	deriveScanTreeCacheCapacity,
 	TreeCache,
 	type TreeCacheCounters,
 	type TreeCacheStats,
@@ -128,8 +134,7 @@ export interface TreeSitterParserCounters {
 }
 
 export interface TreeSitterParseCacheStats
-	extends TreeCacheStats,
-		TreeSitterParserCounters {}
+	extends TreeCacheStats, TreeSitterParserCounters {}
 
 type ParseCacheMeasurement = TreeCacheCounters & TreeSitterParserCounters;
 
@@ -186,11 +191,107 @@ export function isTreeSitterWasmAbortError(error: unknown): boolean {
 	return message.includes("Aborted") || message.includes("abort()");
 }
 
+/**
+ * Positively-identified RESOLUTION-failure codes for a dynamic `import()`:
+ * the specifier couldn't be found/resolved, or a transient fs error hit
+ * before `import()` got as far as evaluating the target module. All of
+ * these recover once whatever was missing/busy appears — they say nothing
+ * durable about the module itself (mirrors the errno allowlist in
+ * clients/dispatch/runners/ast-grep-napi.ts's `classifyAstGrepLoadFailure`,
+ * kept local here rather than shared because that file is owned by an
+ * in-flight PR, #1701, at the time of writing).
+ */
+const RESOLUTION_ERROR_CODES = new Set([
+	"ERR_MODULE_NOT_FOUND",
+	"MODULE_NOT_FOUND",
+	"ERR_INVALID_MODULE_SPECIFIER",
+	"ERR_UNSUPPORTED_DIR_IMPORT",
+	"ENOENT",
+	"EMFILE",
+	"EBUSY",
+	"EAGAIN",
+	"EPERM",
+	"ETXTBSY",
+]);
+
+/** Walk an error's `.cause` chain, collecting every `code` seen along the
+ * way — a resolution failure's `code` can be wrapped in a cause rather than
+ * sitting on the top-level thrown Error. */
+function collectErrorCodes(err: unknown): string[] {
+	const codes: string[] = [];
+	let current: unknown = err;
+	const seen = new Set<unknown>();
+	while (current instanceof Error && !seen.has(current)) {
+		seen.add(current);
+		const code = (current as Error & { code?: unknown }).code;
+		if (typeof code === "string") codes.push(code);
+		current = (current as Error & { cause?: unknown }).cause;
+	}
+	return codes;
+}
+
+/**
+ * Classify a `loadWebTreeSitter()` rejection (#1592). RESOLUTION failures
+ * (a positively-identified code above) are recoverable: the module gets a
+ * fresh `import()` attempt on the very next `init()` call, same as before
+ * this fix, because whatever blocked resolution can plausibly clear on its
+ * own. Everything else is treated as EVALUATION-shaped and latches — an
+ * unrecognized error is far more likely to be the target module's own
+ * top-level code throwing (which Node's ESM loader then memoizes as a
+ * permanently-rejected module record for that URL) than an unclassified
+ * resolution hiccup, so "unknown" defaults to the case a retry cannot fix.
+ */
+function classifyWebTreeSitterLoadFailure(
+	err: unknown,
+): "resolution" | "evaluation" {
+	const codes = collectErrorCodes(err);
+	return codes.some((code) => RESOLUTION_ERROR_CODES.has(code))
+		? "resolution"
+		: "evaluation";
+}
+
 // --- Parser Manager ---
 
 export class TreeSitterClient {
 	private initialized = false;
 	private initPromise: Promise<boolean> | null = null;
+	/**
+	 * Set when `loadWebTreeSitter()` itself rejects with an EVALUATION-shaped
+	 * error (#1592, review round 2 F1/F2) — `classifyWebTreeSitterLoadFailure`
+	 * above draws that line. That call is a dynamic `import()` of a fixed
+	 * resolved URL, and Node's ESM loader permanently memoizes a module
+	 * record that threw during evaluation — a later `import()` of the SAME
+	 * URL from a later `init()` call would just replay the cached rejection,
+	 * not re-attempt the load. Without this latch, every `withTreeSitterRoot()`
+	 * call (one per file parse) would re-invoke `init()`, see `initPromise`
+	 * cleared by the previous attempt's `finally`, and dynamically re-import —
+	 * a dead retry on the hot path. A RESOLUTION-shaped rejection does NOT
+	 * set this: it leaves `initPromise` cleared as before, so the next
+	 * `init()` call retries for real, because that class of failure can
+	 * plausibly clear before the next call arrives.
+	 *
+	 * SESSION-scoped, not process-lifetime (round 2 F2, the #1567/#1575
+	 * `sgSessionHold` precedent): re-armed by `resetLoadStateForSession()`,
+	 * wired into `resetDispatchBaselines()` via `tree-sitter-shared.ts`'s
+	 * `resetTreeSitterClientLoadState()`. Re-arming does not guarantee the
+	 * next attempt succeeds — if the process itself didn't restart between
+	 * sessions, Node's module cache is unchanged and the replay will just
+	 * fail fast again — but it gives a fresh degradation record for the new
+	 * session (the ledger's own `onceKeys` are cleared at session_start too)
+	 * instead of silently reusing a stale verdict forever, and it does let a
+	 * genuinely fixed install (process WAS restarted) recover.
+	 *
+	 * Distinct from `wasmAborted`, which stays process-lifetime and is
+	 * deliberately NOT included in the session reset: that flag means the
+	 * Emscripten WASM heap itself aborted mid-use — a runtime that DID load
+	 * and then corrupted its own memory. Reusing that heap after a "session"
+	 * boundary that isn't an actual process restart is not a retry, it's
+	 * operating on data already documented (tree-sitter-shared.ts) as
+	 * requiring a real restart to recover. `webTreeSitterLoadFailed` only
+	 * ever covers a runtime that never loaded in the first place, so nothing
+	 * corrupted survives a re-arm.
+	 */
+	private webTreeSitterLoadFailed = false;
 	private languages: Map<string, TreeSitterLanguage> = new Map();
 	private parsers: Map<string, TreeSitterParserInstance> = new Map();
 	private treeCache: TreeCache;
@@ -218,6 +319,48 @@ export class TreeSitterClient {
 	 * re-download over it is picked up immediately.
 	 */
 	private verifiedGrammarPaths = new Map<string, string>();
+	/**
+	 * Grammar path → the `size:mtimeMs` stamp at which `Language.load` failed
+	 * on it despite passing the wasm-preamble check (#1564) — e.g. a truncated
+	 * download whose first four bytes are a genuine `\0asm` preamble but whose
+	 * body decodes short ("Code section extends past end of the module"). The
+	 * preamble check alone can't see this; only a real decode attempt can.
+	 * `resolveGrammarFile` treats a path recorded here (at the SAME stamp) as
+	 * absent, so the next demand re-fetches instead of reusing the same broken
+	 * file forever. Stamped so a fresh download (new mtime) is re-examined
+	 * rather than permanently distrusted — same shape as `verifiedGrammarPaths`.
+	 */
+	private decodeFailedGrammarPaths = new Map<string, string>();
+	/**
+	 * Grammar path → the `size:mtimeMs` stamp at which its bytes were verified
+	 * to match the CURRENTLY PINNED sha256 manifest (#1760). Positive-only,
+	 * same discipline as `verifiedGrammarPaths`: the hash is computed once per
+	 * stamp (not per parse), and a stamp change — a fresh download — forces a
+	 * re-check rather than trusting a memo made for different bytes.
+	 */
+	private verifiedGrammarVersionAt = new Map<string, string>();
+	/**
+	 * Grammar path → the `size:mtimeMs` stamp at which it was found to no
+	 * longer match the pinned manifest hash — a version bump
+	 * (`TREE_SITTER_WASMS_VERSION`, or a `SOURCE_OVERRIDES` entry), or on-disk
+	 * corruption (#1760). `resolveGrammarFile` treats a path recorded here (at
+	 * the SAME stamp) as absent, exactly like `decodeFailedGrammarPaths`, so
+	 * the next demand re-fetches instead of serving the stale/corrupt file for
+	 * the rest of the process's life. A fresh download (new stamp) is
+	 * re-examined rather than permanently distrusted.
+	 */
+	private staleGrammarVersionAt = new Map<string, string>();
+	/**
+	 * Paths already reported as version-stale THIS SESSION, to log/record them
+	 * once each (#1801 review F1). Deliberately separate from
+	 * `staleGrammarVersionAt`: that map is a pure hash-verdict memo whose whole
+	 * point is to persist for the process's life (re-hashing an unchanged file
+	 * is exactly what it exists to avoid), so it must never double as a report
+	 * gate — a gate riding on process-lifetime state can't re-arm at a session
+	 * boundary. Cleared in `refreshGrammarSessionLatches`, mirroring
+	 * `poisonedGrammarPaths`.
+	 */
+	private staleReportedGrammarPaths = new Set<string>();
 	/** Paths already reported as non-wasm, to log/record them once each. */
 	private poisonedGrammarPaths = new Set<string>();
 	/** Consecutive download failures per grammar, for the exponential
@@ -257,20 +400,32 @@ export class TreeSitterClient {
 	private static readonly QUERY_BATCH_CACHE_MAX_ENTRIES = 256;
 
 	private queryCacheCap(): number {
-		const value = Number.parseInt(process.env.PI_LENS_TREE_SITTER_QUERY_CACHE_CAP ?? "", 10);
-		return Number.isSafeInteger(value) && value > 0 ? value : TreeSitterClient.QUERY_CACHE_MAX_ENTRIES;
+		const value = Number.parseInt(
+			process.env.PI_LENS_TREE_SITTER_QUERY_CACHE_CAP ?? "",
+			10,
+		);
+		return Number.isSafeInteger(value) && value > 0
+			? value
+			: TreeSitterClient.QUERY_CACHE_MAX_ENTRIES;
 	}
 
 	private queryBatchCacheCap(): number {
-		const value = Number.parseInt(process.env.PI_LENS_TREE_SITTER_QUERY_BATCH_CACHE_CAP ?? "", 10);
-		return Number.isSafeInteger(value) && value > 0 ? value : TreeSitterClient.QUERY_BATCH_CACHE_MAX_ENTRIES;
+		const value = Number.parseInt(
+			process.env.PI_LENS_TREE_SITTER_QUERY_BATCH_CACHE_CAP ?? "",
+			10,
+		);
+		return Number.isSafeInteger(value) && value > 0
+			? value
+			: TreeSitterClient.QUERY_BATCH_CACHE_MAX_ENTRIES;
 	}
 
 	private cacheQuery(key: string, value: any): void {
 		this.queryCache.delete(key);
 		this.queryCache.set(key, value);
 		while (this.queryCache.size > this.queryCacheCap()) {
-			const oldest = this.queryCache.entries().next().value as [string, any] | undefined;
+			const oldest = this.queryCache.entries().next().value as
+				| [string, any]
+				| undefined;
 			if (!oldest) break;
 			this.queryCache.delete(oldest[0]);
 			oldest[1]?.query?.delete?.();
@@ -281,7 +436,9 @@ export class TreeSitterClient {
 		this.queryBatchCache.delete(key);
 		this.queryBatchCache.set(key, value);
 		while (this.queryBatchCache.size > this.queryBatchCacheCap()) {
-			const oldest = this.queryBatchCache.entries().next().value as [string, QueryBatch | null] | undefined;
+			const oldest = this.queryBatchCache.entries().next().value as
+				| [string, QueryBatch | null]
+				| undefined;
 			if (!oldest) break;
 			this.queryBatchCache.delete(oldest[0]);
 			oldest[1]?.query?.delete?.();
@@ -373,6 +530,22 @@ export class TreeSitterClient {
 			...this.treeCache.getStats(),
 			...this.parserCounters,
 		};
+	}
+
+	/**
+	 * Grow the tree cache to span a full-project scan's working set (#1715).
+	 * The interactive default (50 entries) can't hold a mid/large project's
+	 * file count, so a second scan re-parses everything the first scan's LRU
+	 * evicted — live dogfood evidence showed every miss on a second 110-file
+	 * scan was a `capacityMisses` one. Bounded by
+	 * `TREE_CACHE_SCAN_CAPACITY_CEILING` (see `deriveScanTreeCacheCapacity`'s
+	 * heap-cost note) and monotonic — a smaller scan never shrinks a capacity
+	 * an earlier, larger one already grew.
+	 */
+	ensureTreeCacheCapacity(fileCount: number): void {
+		this.treeCache.setMaxSize(
+			deriveScanTreeCacheCapacity(fileCount, this.treeCache.getMaxSize()),
+		);
 	}
 
 	async withParseCacheMeasurement<T>(
@@ -486,16 +659,38 @@ export class TreeSitterClient {
 		}
 	}
 
+	private _vendoredGrammarsDir?: string;
+	/**
+	 * The committed `vendor/grammars` dir, if it exists. Cached only on a hit,
+	 * mirroring `bundledGrammarsDir`.
+	 */
+	private vendoredGrammarsDir(): string | undefined {
+		if (this._vendoredGrammarsDir) return this._vendoredGrammarsDir;
+		try {
+			const dir = vendoredGrammarsDir();
+			if (fs.existsSync(dir)) this._vendoredGrammarsDir = dir;
+			return this._vendoredGrammarsDir;
+		} catch {
+			return undefined;
+		}
+	}
+
 	/**
 	 * All directories that may hold grammar wasms, in precedence order: the
-	 * bundled core dir, the resolved `this.grammarsDir`, and the web-tree-sitter
-	 * grammars dir (the lazy-fetch write target). Deduped.
+	 * committed vendor dir, the bundled core dir, the resolved
+	 * `this.grammarsDir`, and the web-tree-sitter grammars dir (the lazy-fetch
+	 * write target). Deduped.
+	 *
+	 * `vendor/grammars` comes first because it is the ONLY source for a grammar
+	 * we build ourselves (`VENDORED_GRAMMARS`) — nothing downloads into the
+	 * later dirs for it, so a miss here is a miss everywhere.
 	 */
 	private grammarSourceDirs(): string[] {
 		const dirs: string[] = [];
 		const push = (d: string | undefined): void => {
 			if (d && !dirs.includes(d)) dirs.push(d);
 		};
+		push(this.vendoredGrammarsDir());
 		push(this.bundledGrammarsDir());
 		push(this.grammarsDir || undefined);
 		push(this.resolveWebTreeSitterAsset("grammars"));
@@ -518,10 +713,24 @@ export class TreeSitterClient {
 			const candidate = path.join(dir, grammarFile);
 			const stamp = grammarFileStamp(candidate);
 			if (!stamp) continue;
-			if (this.verifiedGrammarPaths.get(candidate) === stamp) return candidate;
+			// #1564: a file that passed the preamble check but failed
+			// `Language.load` at this exact stamp is known-bad — treat it as
+			// absent so `ensureGrammar` re-fetches over it, same as the
+			// non-wasm-magic case below. A stamp mismatch (the file changed —
+			// re-downloaded) falls through to re-examine it fresh.
+			if (this.decodeFailedGrammarPaths.get(candidate) === stamp) continue;
+			if (this.verifiedGrammarPaths.get(candidate) === stamp) {
+				if (this.isGrammarVersionCurrent(candidate, grammarFile, stamp)) {
+					return candidate;
+				}
+				continue;
+			}
 			if (fileHasWasmMagic(candidate)) {
 				this.verifiedGrammarPaths.set(candidate, stamp);
-				return candidate;
+				if (this.isGrammarVersionCurrent(candidate, grammarFile, stamp)) {
+					return candidate;
+				}
+				continue;
 			}
 			this.verifiedGrammarPaths.delete(candidate);
 			this.reportPoisonedGrammarFile(candidate, grammarFile);
@@ -545,6 +754,7 @@ export class TreeSitterClient {
 		this.grammarNotificationsLedgerGen = ledgerGen;
 		this.grammarLastNotifiedDelayMs.clear();
 		this.poisonedGrammarPaths.clear();
+		this.staleReportedGrammarPaths.clear();
 	}
 
 	/**
@@ -579,6 +789,97 @@ export class TreeSitterClient {
 			subject: grammarFile,
 			reason:
 				"on-disk grammar file is not a wasm module — ignored, re-fetching",
+		});
+	}
+
+	/**
+	 * Is the cached grammar at `candidate` (whose wasm preamble already passed)
+	 * still current against the pinned sha256 manifest (#1760)?
+	 *
+	 * A grammar downloaded once is never revisited when this repo bumps
+	 * `TREE_SITTER_WASMS_VERSION` or changes a `SOURCE_OVERRIDES` entry — the
+	 * cached file's name carries no version, so a stale build serves forever.
+	 * The check is cheap and NEVER touches the network: it compares the
+	 * on-disk sha256 (hashed once per `size:mtimeMs` stamp, memoized exactly
+	 * like `verifiedGrammarPaths` above so a hot parse loop never re-hashes an
+	 * unchanged file) against `pinnedGrammarHash`, which itself is a pure
+	 * in-memory manifest lookup. A mismatch also catches on-disk corruption,
+	 * which nothing detected before this.
+	 *
+	 * Vendored grammars (`VENDORED_GRAMMARS`) are skipped: they have no CDN
+	 * pin to drift against, and their bytes are already guarded by the
+	 * separate build-provenance check (`scripts/check-grammar-provenance.mjs`).
+	 * No pinned hash for this filename (manifest missing, or a grammar added
+	 * before `--write-manifest` was re-run) is treated as "can't verify" and
+	 * trusted, the same fallback `downloadGrammarDetailed`'s own hash check
+	 * already uses — never as a forced, unbounded refetch loop.
+	 */
+	private isGrammarVersionCurrent(
+		candidate: string,
+		grammarFile: string,
+		stamp: string,
+	): boolean {
+		if (isVendoredGrammar(grammarFile)) return true;
+		if (this.staleGrammarVersionAt.get(candidate) === stamp) {
+			// #1801 review F1: the hash-verdict memo above is process-lifetime by
+			// design (re-hashing an unchanged file on every resolve is the exact
+			// cost this whole check exists to avoid), so an early return here must
+			// NOT skip the report — a still-stale grammar has to keep showing up
+			// in every NEW session's ledger, not just the session that first
+			// discovered the mismatch.
+			this.reportStaleGrammarVersion(candidate, grammarFile);
+			return false;
+		}
+		if (this.verifiedGrammarVersionAt.get(candidate) === stamp) return true;
+
+		const pinnedHash = pinnedGrammarHash(grammarFile);
+		if (!pinnedHash) {
+			this.verifiedGrammarVersionAt.set(candidate, stamp);
+			return true;
+		}
+		const actualHash = grammarFileSha256(candidate);
+		if (actualHash === pinnedHash) {
+			this.verifiedGrammarVersionAt.set(candidate, stamp);
+			return true;
+		}
+
+		this.verifiedGrammarVersionAt.delete(candidate);
+		this.staleGrammarVersionAt.set(candidate, stamp);
+		this.reportStaleGrammarVersion(candidate, grammarFile);
+		return false;
+	}
+
+	/**
+	 * Log + record a version-stale (or corrupt) cached grammar, once per path
+	 * per SESSION (#1801 review F1). Called from BOTH the memoized-stale path
+	 * and the fresh-mismatch path in `isGrammarVersionCurrent`, so the report
+	 * gate is independent of `staleGrammarVersionAt`'s own process-lifetime
+	 * memo — a grammar that is STILL stale in a later session must still emit
+	 * a fresh record into that session's ledger, exactly like
+	 * `reportPoisonedGrammarFile` already does for the non-wasm case.
+	 */
+	private reportStaleGrammarVersion(
+		candidate: string,
+		grammarFile: string,
+	): void {
+		this.refreshGrammarSessionLatches();
+		if (this.staleReportedGrammarPaths.has(candidate)) return;
+		this.staleReportedGrammarPaths.add(candidate);
+		logTreeSitterDiagnostic({
+			subsystem: "tree-sitter-client",
+			level: "warn",
+			message:
+				`ignoring ${candidate}: its sha256 no longer matches the pinned grammar ` +
+				`manifest — the pinned tree-sitter-wasms version (or a SOURCE_OVERRIDES entry) ` +
+				`moved since this file was downloaded. pi-lens will treat the grammar as ` +
+				`missing and re-fetch the current build (#1760).`,
+			metadata: { grammarFile, path: candidate, outcome: "stale-version" },
+		});
+		incrementDegradationCount({
+			kind: "grammar-blocked",
+			subject: grammarFile,
+			reason:
+				"cached grammar no longer matches the pinned manifest hash — ignored, re-fetching",
 		});
 	}
 
@@ -745,6 +1046,22 @@ export class TreeSitterClient {
 	 * try/catch that funnels any throw into `recordGrammarFailure` (#1548).
 	 */
 	private async fetchGrammar(grammarFile: string): Promise<boolean> {
+		// BEFORE resolving a write directory: a vendored grammar is never
+		// downloaded, so the write dir has no bearing on its verdict. Resolving
+		// first let the "no writable grammars directory" branch below answer
+		// RETRYABLE for a missing vendored wasm on any host where
+		// web-tree-sitter isn't locatable — reporting a packaging fault as a
+		// transient download failure, and arming a cooldown for a fetch that can
+		// never happen.
+		if (isVendoredGrammar(grammarFile)) {
+			const { reason } = vendoredGrammarRefusal(grammarFile);
+			this.recordGrammarFailure(
+				grammarFile,
+				reason ?? `${grammarFile} is missing from vendor/grammars/.`,
+				/* retryable */ false,
+			);
+			return false;
+		}
 		const dir =
 			this.grammarsDir && fs.existsSync(this.grammarsDir)
 				? this.grammarsDir
@@ -887,15 +1204,94 @@ export class TreeSitterClient {
 		}
 	}
 
+	/**
+	 * Record a `Language.load` failure on a file `resolveGrammarFile` had just
+	 * vouched for (#1564) — the diagnosis gap #1548 left open: the preamble
+	 * check proves the first four bytes are `\0asm`, not that the whole body
+	 * decodes. A decode error here (a truncated download, on-disk corruption)
+	 * is evidence the FILE is bad, so it gets the exact same treatment as an
+	 * ensure-time download failure: invalidate the resolve memo so the next
+	 * demand re-fetches instead of reusing the same broken file forever, and
+	 * reuse `recordGrammarFailure`'s cooldown/degradation/notification
+	 * machinery rather than hand-rolling a parallel one — a persistently
+	 * truncated CDN response would otherwise re-download and re-fail on every
+	 * single parse.
+	 *
+	 * A DURABLE decode failure (the bytes are complete and correct, but ABI-
+	 * incompatible with the installed `web-tree-sitter` — a version drift, not
+	 * a truncation) is classified `retryable` here too, same as everything
+	 * else this method sees: there is no way to tell "truncated" from "wrong
+	 * ABI" from the error message alone, so it re-downloads and re-fails once
+	 * per cooldown tier instead of latching forever. That is bounded by the
+	 * cooldown ladder (this never re-fetches faster than #1536's backoff) and
+	 * by `BLOCKED_GRAMMARS` for the narrower case that's fatal to the process
+	 * rather than just wrong (`grammar-source.ts`). The redownload only helps
+	 * if a fresh fetch could actually be a DIFFERENT (compatible) build,
+	 * which is exactly what the `grammar-source.test.ts` version/lock sync
+	 * guard (`lock.version === TREE_SITTER_WASMS_VERSION`) exists to keep
+	 * true — without it, a version bump with a stale lock would make every
+	 * redownload land the identical bytes and spin the ladder against a file
+	 * that can never pass.
+	 */
+	private recordGrammarLoadFailure(
+		grammarPath: string,
+		grammarFile: string,
+		err: unknown,
+	): void {
+		const stamp = grammarFileStamp(grammarPath);
+		this.verifiedGrammarPaths.delete(grammarPath);
+		if (stamp) this.decodeFailedGrammarPaths.set(grammarPath, stamp);
+		const message = err instanceof Error ? err.message : String(err);
+		logTreeSitterDiagnostic({
+			subsystem: "tree-sitter-client",
+			level: "warn",
+			message:
+				`Language.load failed for ${grammarPath} even though the wasm preamble check ` +
+				`passed (${message}) — most likely a truncated download (#1564). Treating the ` +
+				`grammar as missing so the next demand re-fetches it.`,
+			metadata: { grammarFile, path: grammarPath, outcome: "load-failed" },
+		});
+		this.recordGrammarFailure(
+			grammarFile,
+			`Language.load failed on a resolved grammar file (${message}).`,
+			/* retryable */ true,
+		);
+	}
+
 	/** Initialize tree-sitter WASM runtime */
 	async init(): Promise<boolean> {
 		if (this.wasmAborted) return false;
 		if (this.initialized) return true;
+		if (this.webTreeSitterLoadFailed) return false;
 		if (this.initPromise) return this.initPromise;
 
 		this.initPromise = (async () => {
 			try {
-				const mod = await loadWebTreeSitter();
+				let mod: Awaited<ReturnType<typeof loadWebTreeSitter>>;
+				try {
+					mod = await loadWebTreeSitter();
+				} catch (err) {
+					// See webTreeSitterLoadFailed's doc: an EVALUATION-shaped
+					// rejection is a dead retry, so latch instead of leaving
+					// initPromise clearable (the finally below would otherwise let
+					// the very next parse call re-import the same doomed URL). A
+					// RESOLUTION-shaped rejection is left alone — initPromise still
+					// clears below, so the next init() call retries for real.
+					const classification = classifyWebTreeSitterLoadFailure(err);
+					if (classification === "evaluation") {
+						this.webTreeSitterLoadFailed = true;
+					}
+					recordDegradationOnce({
+						kind: "web-tree-sitter-load-failed",
+						subject: "web-tree-sitter",
+						reason:
+							(err instanceof Error ? err.message : String(err)) +
+							(classification === "resolution"
+								? " (resolution failure — retryable)"
+								: " (evaluation failure — latched for the session)"),
+					});
+					throw err;
+				}
 				// biome-ignore lint/suspicious/noExplicitAny: web-tree-sitter module shape varies (Parser direct / default-wrapped)
 				const anyMod = mod as any;
 				const ParserClass = anyMod.Parser || anyMod.default || anyMod;
@@ -940,6 +1336,18 @@ export class TreeSitterClient {
 		})();
 
 		return this.initPromise;
+	}
+
+	/**
+	 * Re-arm the web-tree-sitter load latch for a new session (#1592 review
+	 * round 2 F2). Deliberately does NOT touch `wasmAborted` or `initialized`
+	 * — see `webTreeSitterLoadFailed`'s doc for why the abort case stays
+	 * process-lifetime, and a successful init has nothing to re-arm. Called
+	 * from `resetTreeSitterClientLoadState()` (tree-sitter-shared.ts), wired
+	 * into `resetDispatchBaselines()` beside `resetAstGrepNapiLoadState()`.
+	 */
+	resetLoadStateForSession(): void {
+		this.webTreeSitterLoadFailed = false;
 	}
 
 	/** Load language grammar */
@@ -1013,7 +1421,16 @@ export class TreeSitterClient {
 			}
 			return language;
 		} catch (err) {
-			this.reportWasmAbort(err);
+			// An uncatchable-shaped WASM abort poisons the whole process (#402) —
+			// `reportWasmAbort` already records + handles it. Everything else
+			// (#1564) is a DECODE failure on a file `resolveGrammarFile` just
+			// vouched for — e.g. "Code section extends past end of the module" on
+			// a truncated-but-magic-valid download. That is evidence the file
+			// itself is bad, not the runtime, so record it and stop vouching for
+			// this exact file so the next demand can re-fetch it.
+			if (!this.reportWasmAbort(err)) {
+				this.recordGrammarLoadFailure(grammarPath, grammarFile, err);
+			}
 			this.dbg(`Language load error: ${err}`);
 			return null;
 		}
@@ -1899,9 +2316,7 @@ export class TreeSitterClient {
 			}
 		}
 		// JavaScript attaches it to the switch body as the case's next sibling.
-		const siblings = (caseNode.parent?.children ?? []).filter(
-			(c) => c.isNamed,
-		);
+		const siblings = (caseNode.parent?.children ?? []).filter((c) => c.isNamed);
 		const index = siblings.findIndex(
 			(c) => c.startIndex === caseNode.startIndex,
 		);
@@ -1984,9 +2399,7 @@ export class TreeSitterClient {
 				(c) => c.type === "finally_clause",
 			);
 			if (tryTerminates) {
-				return catches.every((c) =>
-					this.statementTerminates(c, depth + 1),
-				);
+				return catches.every((c) => this.statementTerminates(c, depth + 1));
 			}
 			return !!fin && this.statementTerminates(fin, depth + 1);
 		}
@@ -2203,7 +2616,11 @@ export class TreeSitterClient {
 
 		// Ambiguous (shadowed/duplicated), reassigned anywhere, or backed by a
 		// non-const binding somewhere in the file: refuse to resolve.
-		if (hasNonConstBinding || hasReassignment || constDeclarators.length !== 1) {
+		if (
+			hasNonConstBinding ||
+			hasReassignment ||
+			constDeclarators.length !== 1
+		) {
 			return null;
 		}
 		return constDeclarators[0].childForFieldName?.("value") ?? null;
@@ -2428,9 +2845,9 @@ export class TreeSitterClient {
 				this.importedAs(ctorName, rootNode) === "URL");
 		if (!isUrlCtor) return false;
 
-		const args = (value.childForFieldName?.("arguments")?.children ?? []).filter(
-			(c) => c.isNamed && c.type !== "comment",
-		);
+		const args = (
+			value.childForFieldName?.("arguments")?.children ?? []
+		).filter((c) => c.isNamed && c.type !== "comment");
 		if (args.length === 0) return false;
 		// First arg (relative path / full URL) must be a literal.
 		if (!this.isFixedUrlLiteralExpr(args[0])) return false;
@@ -2571,9 +2988,7 @@ export class TreeSitterClient {
 							);
 						const name =
 							opening?.childForFieldName?.("name") ??
-							opening?.children?.find(
-								(child) => child.type === "identifier",
-							);
+							opening?.children?.find((child) => child.type === "identifier");
 						return name?.text === "a";
 					};
 
@@ -2607,8 +3022,7 @@ export class TreeSitterClient {
 					}
 					return false;
 				} catch (error) {
-					const reason =
-						error instanceof Error ? error.message : String(error);
+					const reason = error instanceof Error ? error.message : String(error);
 					this.reportPostFilterFailure(
 						postFilter,
 						`tree walk failed${reason ? `: ${reason}` : ""}`,
@@ -2663,7 +3077,11 @@ export class TreeSitterClient {
 					const method = captures.METHOD?.text ?? "";
 					if (!body || !method) return true;
 					const stack = [body];
-					for (let visited = 0; stack.length > 0 && visited < 10_000; visited++) {
+					for (
+						let visited = 0;
+						stack.length > 0 && visited < 10_000;
+						visited++
+					) {
 						const node = stack.pop();
 						if (!node) break;
 						if (
@@ -2687,7 +3105,11 @@ export class TreeSitterClient {
 					const assertionNames =
 						/^(?:assert\w*|fail|verify|expect|check|assume\w*)$/i;
 					const stack = [body];
-					for (let visited = 0; stack.length > 0 && visited < 10_000; visited++) {
+					for (
+						let visited = 0;
+						stack.length > 0 && visited < 10_000;
+						visited++
+					) {
 						const node = stack.pop();
 						if (!node) break;
 						if (node.type === "method_invocation") {
@@ -2723,11 +3145,13 @@ export class TreeSitterClient {
 					// (U+0008), not a regex word-boundary escape — that requires
 					// the literal two-character sequence `\\b`. The identifier
 					// itself must also be regex-escaped (#1089 P2).
-					const resourceWord = new RegExp(
-						`\\b${escapeRegExp(resource)}\\b`,
-					);
+					const resourceWord = new RegExp(`\\b${escapeRegExp(resource)}\\b`);
 					const stack = [scope];
-					for (let visited = 0; stack.length > 0 && visited < 10_000; visited++) {
+					for (
+						let visited = 0;
+						stack.length > 0 && visited < 10_000;
+						visited++
+					) {
 						const node = stack.pop();
 						if (!node) break;
 						if (
@@ -2760,7 +3184,11 @@ export class TreeSitterClient {
 						: undefined;
 					if (!declaration) return true;
 					const stack = [declaration];
-					for (let visited = 0; stack.length > 0 && visited < 10_000; visited++) {
+					for (
+						let visited = 0;
+						stack.length > 0 && visited < 10_000;
+						visited++
+					) {
 						const node = stack.pop();
 						if (!node) break;
 						// Any conditional or loop construct is a plausible base-case
@@ -3053,9 +3481,7 @@ export class TreeSitterClient {
 				// biome-ignore lint/suspicious/noExplicitAny: AST iteration
 				const hasExceptionSpec = clauseNode.children.some((c: any) => {
 					if (!c.isNamed) return false;
-					return (
-						c.type !== "block"
-					);
+					return c.type !== "block";
 				});
 				// Fire ONLY when bare (no exception spec)
 				return !hasExceptionSpec;

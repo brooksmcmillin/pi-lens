@@ -15,7 +15,7 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { TRANSIENT_BASE_COOLDOWN_MS } from "../../clients/dispatch/runners/utils/availability-policy.ts";
+import { TRANSIENT_BASE_COOLDOWN_MS } from "../../clients/dispatch/runners/utils/availability-policy.js";
 
 const { safeSpawnAsync } = vi.hoisted(() => ({ safeSpawnAsync: vi.fn() }));
 
@@ -75,7 +75,9 @@ beforeEach(() => {
 describe("package-manager availability (#1496)", () => {
 	it("pins a successful probe: the declared manager resolves", async () => {
 		safeSpawnAsync.mockImplementation(async (cmd: string, args: string[]) =>
-			cmd === finder() && args[0] === "pnpm" ? okResult("pnpm") : notFoundResult,
+			cmd === finder() && args[0] === "pnpm"
+				? okResult("pnpm")
+				: notFoundResult,
 		);
 		const { resolveNodePackageManager, _resetPackageManagerCache } =
 			await import("../../clients/package-manager.js");
@@ -142,7 +144,9 @@ describe("package-manager availability (#1496)", () => {
 		// Now pnpm is reachable again (the stall passed) and the cooldown expires.
 		advancePastCooldown();
 		safeSpawnAsync.mockImplementation(async (cmd: string, args: string[]) =>
-			cmd === finder() && args[0] === "pnpm" ? okResult("pnpm") : notFoundResult,
+			cmd === finder() && args[0] === "pnpm"
+				? okResult("pnpm")
+				: notFoundResult,
 		);
 
 		// Pre-fix: the timeout latched `false` for pnpm for the life of the
@@ -169,5 +173,82 @@ describe("package-manager availability (#1496)", () => {
 			([cmd, args]) => cmd === finder() && args[0] === "npm",
 		).length;
 		expect(npmProbes).toBe(1);
+	});
+
+	/**
+	 * #1653 review F1 — `isAvailable`'s in-flight probe cleared its map entry
+	 * unconditionally: `.finally(() => inFlightProbes.delete(pm))`. A probe
+	 * started BEFORE a session reset that settles AFTER the next session's own
+	 * probe for the same manager has already started deletes that NEWER probe's
+	 * entry by key, not by identity — so a third caller arriving in the gap
+	 * finds no in-flight probe and spawns a duplicate. Reachable in production
+	 * via quick-mode's ~2s warmup racing a `/new` inside the 5s probe budget.
+	 * The fix is the identity guard `dependency-checker.ts`'s `resolveMadge`
+	 * already uses for the same race: only delete the entry if it is still the
+	 * promise this call created.
+	 */
+	it("a pre-reset probe settling late must not evict the new session's in-flight probe", async () => {
+		let pnpmCalls = 0;
+		const releasers: Array<(value: unknown) => void> = [];
+		safeSpawnAsync.mockImplementation(async (cmd: string, args: string[]) => {
+			if (cmd !== finder() || args[0] !== "pnpm") return notFoundResult;
+			const idx = pnpmCalls++;
+			// The first two pnpm probes (session A's, session B's) are held open
+			// under test control; anything past that is the regression itself and
+			// must resolve on its own so the test cannot hang either way.
+			if (idx < 2) {
+				return new Promise((resolve) => {
+					releasers[idx] = resolve;
+				});
+			}
+			return notFoundResult;
+		});
+
+		const { resolveNodePackageManager, _resetPackageManagerCache } =
+			await import("../../clients/package-manager.js");
+		_resetPackageManagerCache();
+		const dir = await emptyProjectDir();
+		const fs = await import("node:fs");
+		const path = await import("node:path");
+		fs.writeFileSync(path.join(dir, "pnpm-lock.yaml"), "");
+
+		// Session A's probe starts and hangs (call #0).
+		const callA = resolveNodePackageManager(dir);
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(releasers[0]).toBeDefined();
+
+		// The session boundary: quick-mode's warmup races a fresh session_start.
+		_resetPackageManagerCache();
+
+		// Session B's probe starts fresh (its latch and in-flight map were just
+		// cleared) and also hangs (call #1).
+		const callB = resolveNodePackageManager(dir);
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(releasers[1]).toBeDefined();
+
+		// Session A's spawn settles first. Flush real macrotasks (fake timers
+		// here only fake `Date`, so `setTimeout` still runs) so A's PREFERENCE
+		// fallback can reach its second pnpm check BEFORE B's spawn resolves —
+		// the exact window the race depends on. If B resolved first, B's own
+		// latch would answer A's recheck directly and the in-flight map would
+		// never be consulted at all, hiding the bug this test exists to catch.
+		releasers[0](notFoundResult);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		// Now release B. Post-fix, A's recheck already joined B's still-pending
+		// probe (awaiting `callA` alone would hang without this); pre-fix, A's
+		// recheck already spawned its own third probe and does not need B at
+		// all — either way, this unblocks whichever of A/B is still waiting.
+		releasers[1](notFoundResult);
+		await Promise.all([callA, callB]);
+
+		// Pre-fix: A's unconditional `.finally` deleted B's still-in-flight entry
+		// out from under it, so A's own PREFERENCE fallback loop (checking pnpm a
+		// second time after the declared manager comes back false) found nothing
+		// in-flight and spawned a third probe.
+		expect(pnpmCalls).toBe(2);
 	});
 });

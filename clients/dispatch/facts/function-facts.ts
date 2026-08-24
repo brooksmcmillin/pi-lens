@@ -158,7 +158,9 @@ function parameterName(param: TsNode): string {
 	// JavaScript's grammar keeps a leaf parameter as the identifier itself;
 	// there is no named child to unwrap. TypeScript parameter wrapper nodes still
 	// use their first named child (type annotation/default/rest target).
-	return param.type === "identifier" ? param.text : firstNamedChild(param)?.text ?? "";
+	return param.type === "identifier"
+		? param.text
+		: (firstNamedChild(param)?.text ?? "");
 }
 
 function getFunctionName(node: TsNode): string {
@@ -375,8 +377,11 @@ export const functionFactProvider: FactProvider = {
 				// `symbol-containment.ts`'s doc comment for why this can't literally
 				// share code with module-report.ts's tree-sitter-symbol-extractor path
 				// (different tree-sitter integration), only the same algorithm.
-				const containers: { name: string; startLine: number; endLine: number }[] =
-					[];
+				const containers: {
+					name: string;
+					startLine: number;
+					endLine: number;
+				}[] = [];
 
 				const addSummary = (node: TsNode): void => {
 					const body = getBody(node);
@@ -440,10 +445,10 @@ export const functionFactProvider: FactProvider = {
 
 				for (const summary of summaries) {
 					const owner = findOwnerName(
-					containers,
-					summary.line,
-					summary.endLine ?? summary.line,
-				);
+						containers,
+						summary.line,
+						summary.endLine ?? summary.line,
+					);
 					if (owner) summary.owner = owner;
 				}
 

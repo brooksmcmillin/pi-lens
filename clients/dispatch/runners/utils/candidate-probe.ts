@@ -108,5 +108,11 @@ export async function probeAvailabilityCandidates(
 		}
 	}
 
-	return { foundPath: null, sawTransient, transientCause, hostStallMs, evidence };
+	return {
+		foundPath: null,
+		sawTransient,
+		transientCause,
+		hostStallMs,
+		evidence,
+	};
 }

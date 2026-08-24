@@ -95,7 +95,10 @@ describe("debug-heap: pruneOldSnapshots (bounded on-disk axis, shape 9)", () => 
 		// Five snapshots with strictly increasing mtimes; oldest → newest.
 		const created: string[] = [];
 		for (let i = 0; i < 5; i++) {
-			const full = path.join(dir, `heap-999-2026-08-08T00-00-0${i}-000Z.heapsnapshot`);
+			const full = path.join(
+				dir,
+				`heap-999-2026-08-08T00-00-0${i}-000Z.heapsnapshot`,
+			);
 			fs.writeFileSync(full, "x");
 			const t = new Date(2026, 0, 1, 0, 0, i).getTime() / 1000;
 			fs.utimesSync(full, t, t);
@@ -112,7 +115,8 @@ describe("debug-heap: pruneOldSnapshots (bounded on-disk axis, shape 9)", () => 
 			expect(removed.sort()).toEqual([created[0], created[1]].sort());
 			expect(listSnapshots().length).toBe(3);
 			// The three newest survive.
-			for (const full of created.slice(2)) expect(fs.existsSync(full)).toBe(true);
+			for (const full of created.slice(2))
+				expect(fs.existsSync(full)).toBe(true);
 			// The breadcrumb log is untouched.
 			expect(fs.readFileSync(bystander, "utf-8")).toBe("keep-me");
 		});

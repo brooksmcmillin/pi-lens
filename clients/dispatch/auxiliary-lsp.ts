@@ -81,9 +81,14 @@ export function isNosemgrepSuppressed(
 	if (startLine == null) return false;
 	const lines = content.split("\n");
 	const ruleId = String(d.code ?? "");
-	const checkLine = (text: string | undefined, standaloneOnly: boolean): boolean => {
+	const checkLine = (
+		text: string | undefined,
+		standaloneOnly: boolean,
+	): boolean => {
 		if (!text) return false;
-		const m = (standaloneOnly ? NOSEMGREP_STANDALONE_RE : NOSEMGREP_RE).exec(text);
+		const m = (standaloneOnly ? NOSEMGREP_STANDALONE_RE : NOSEMGREP_RE).exec(
+			text,
+		);
 		if (!m) return false;
 		if (m[1] === undefined) return true; // bare nosemgrep → suppress the line
 		return m[1]
@@ -94,8 +99,7 @@ export function isNosemgrepSuppressed(
 	};
 	// The finding's own line (inline OK), then the line above (standalone comment only).
 	return (
-		checkLine(lines[startLine], false) ||
-		checkLine(lines[startLine - 1], true)
+		checkLine(lines[startLine], false) || checkLine(lines[startLine - 1], true)
 	);
 }
 
@@ -136,7 +140,8 @@ export function isZizmorIgnoreSuppressed(
 const blockOnErrorWhenAllowed = (
 	d: LSPDiagnostic,
 	{ blockingAllowed }: { blockingAllowed: boolean },
-): OutputSemantic => (blockingAllowed && d.severity === 1 ? "blocking" : "warning");
+): OutputSemantic =>
+	blockingAllowed && d.severity === 1 ? "blocking" : "warning";
 
 export const AUXILIARY_LSP_PROFILES: readonly AuxiliaryLspProfile[] = [
 	{
@@ -256,7 +261,10 @@ export function enabledAuxiliaryLspServerIds(getFlag: GetFlag): string[] {
 // O(profiles) regex scan per diagnostic into one scan per distinct source seen
 // — safe because `AUXILIARY_LSP_PROFILES` is a fixed module-level const, never
 // mutated at runtime, so a source's matching profile never changes.
-const profileForSourceCache = new Map<string, AuxiliaryLspProfile | undefined>();
+const profileForSourceCache = new Map<
+	string,
+	AuxiliaryLspProfile | undefined
+>();
 
 /** Find the profile whose server emitted a diagnostic with this `source`. */
 export function findAuxiliaryProfileForSource(

@@ -19,7 +19,8 @@ import {
 import { removeTempDirSync } from "../clients/test-utils.js";
 
 const FILE = "tree-sitter-example.wasm";
-const HASH = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+const HASH =
+	"sha256:1111111111111111111111111111111111111111111111111111111111111111";
 
 const manifest: GrammarManifest = {
 	package: "tree-sitter-wasms",

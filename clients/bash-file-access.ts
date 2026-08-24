@@ -4,7 +4,8 @@
  *
  *   - VIEW commands (cat/head/tail/sed -n) → reads, recorded with the exact line
  *     range shown (like the Read tool's delivered range).
- *   - WRITE commands (redirects, tee, sed -i, cp/mv dest, touch) → the agent
+ *   - WRITE commands (redirects, tee, sed -i, cp/mv dest, touch, and explicit
+ *     in-place formatter/fixer targets) → the agent
  *     authored/owns the resulting file, exactly like the Write tool — these are
  *     registered via noteCreatedFile + recordWritten so a follow-up edit is not
  *     blocked.
@@ -47,6 +48,14 @@ function stripAnsi(value: string): string {
 export interface ShellCommandSegment {
 	tokens: string[];
 	unsupported: boolean;
+	/**
+	 * Set to "pipe" when this segment's output feeds the NEXT segment via an
+	 * unquoted `|` (used by #1908 to detect a truncating pipe tail after
+	 * grep). Undefined for every other terminator (`;`, `&&`, `||`, `&`, EOF)
+	 * — those consumers don't need it and adding cases here is a no-op for
+	 * them.
+	 */
+	terminator?: "pipe";
 }
 
 export function tokenizeShellCommand(command: string): ShellCommandSegment[] {
@@ -62,9 +71,10 @@ export function tokenizeShellCommand(command: string): ShellCommandSegment[] {
 		word = "";
 		atTokenStart = true;
 	};
-	const flushSegment = () => {
+	const flushSegment = (terminator?: "pipe") => {
 		flushWord();
-		if (tokens.length > 0 || unsupported) segments.push({ tokens, unsupported });
+		if (tokens.length > 0 || unsupported)
+			segments.push({ tokens, unsupported, terminator });
 		tokens = [];
 		unsupported = false;
 		atTokenStart = true;
@@ -100,7 +110,7 @@ export function tokenizeShellCommand(command: string): ShellCommandSegment[] {
 			// Windows routinely contain native paths (C:\\src\\file.ts). Preserve
 			// backslashes before ordinary path characters while still honoring
 			// shell escapes and line continuations.
-			if (next === "\n" || /[\s\\'\";$|&<>]/.test(next ?? "")) {
+			if (next === "\n" || /[\s\\'";$|&<>]/.test(next ?? "")) {
 				escaped = true;
 			} else {
 				word += ch;
@@ -129,10 +139,14 @@ export function tokenizeShellCommand(command: string): ShellCommandSegment[] {
 		}
 		if (ch === ";" || ch === "\n" || ch === "|" || ch === "&") {
 			flushWord();
+			let terminator: "pipe" | undefined;
 			if (ch === "|" && next === "|") i++;
 			else if (ch === "&" && next === "&") i++;
-			else if (ch === "|" || ch === "&") unsupported = true;
-			flushSegment();
+			else if (ch === "|") {
+				unsupported = true;
+				terminator = "pipe";
+			} else if (ch === "&") unsupported = true;
+			flushSegment(terminator);
 			continue;
 		}
 		if (ch === "<" || ch === ">") {
@@ -167,6 +181,41 @@ function parseCountFlag(token: string): number | undefined {
 
 function commandSegments(command: string): string[][] {
 	return tokenizeShellCommand(command).map((segment) => segment.tokens);
+}
+
+/** Unwrap the common agent-authored `npx <tool>` launcher form. */
+function unwrapCommand(tokens: string[]): { verb: string; args: string[] } {
+	let verb = path.basename(tokens[0] ?? "");
+	let args = tokens.slice(1);
+	if (verb === "npx") {
+		while (args[0] === "-y" || args[0] === "--yes") args = args.slice(1);
+		verb = path.basename(args[0] ?? "");
+		args = args.slice(1);
+	}
+	return { verb, args };
+}
+
+/**
+ * Return source-file operands while excluding values consumed by known options.
+ * This stays deliberately narrower than a general CLI parser: only formatter
+ * options whose values can themselves look like source files belong here.
+ */
+function formatterFileArgs(
+	args: string[],
+	start = 0,
+	valueOptions: ReadonlySet<string> = new Set(),
+): string[] {
+	const files: string[] = [];
+	for (let i = start; i < args.length; i += 1) {
+		const arg = args[i] ?? "";
+		if (valueOptions.has(arg)) {
+			i += 1;
+			continue;
+		}
+		if (arg === "--" || arg.startsWith("-")) continue;
+		files.push(arg);
+	}
+	return files;
 }
 
 /** Find redirect targets without treating quoted `>` characters as syntax. */
@@ -337,6 +386,80 @@ const GREP_OPTIONS_WITH_VALUE = new Set([
 	"--context",
 ]);
 
+export interface GrepContextLines {
+	before: number;
+	after: number;
+}
+
+function parseContextValue(
+	inline: string,
+	next: string | undefined,
+): number | undefined {
+	const raw = inline !== "" ? inline : next;
+	if (raw === undefined) return undefined;
+	const n = Number.parseInt(raw, 10);
+	if (!Number.isFinite(n) || n < 0) return undefined;
+	// Bound the credit: a huge -C would credit a whole file from one hit.
+	return Math.min(n, 100);
+}
+
+/**
+ * Read the context lines a `grep` invocation actually PRINTS around each hit
+ * (#1904 item 2). Only these lines were delivered to the model, so only these
+ * may be credited as read. Handles `-A N`, `-A3`, clustered short flags such as
+ * `-rnA3`, `--after-context=N`, the `-B`/`--before-context` mirror, `-C`
+ * (both sides), and the bare `-NUM` form.
+ */
+export function parseGrepContextLines(args: string[]): GrepContextLines {
+	let before = 0;
+	let after = 0;
+	for (let i = 0; i < args.length; i++) {
+		const token = stripQuotes(args[i]);
+		if (token === "--") break;
+		const nextToken =
+			args[i + 1] === undefined ? undefined : stripQuotes(args[i + 1]);
+
+		const long = /^--(after|before)-context(?:=(\d+))?$/.exec(token);
+		if (long) {
+			const value = parseContextValue(long[2] ?? "", nextToken);
+			if (value === undefined) continue;
+			if (long[1] === "after") after = Math.max(after, value);
+			else before = Math.max(before, value);
+			continue;
+		}
+		const longBoth = /^--context(?:=(\d+))?$/.exec(token);
+		if (longBoth) {
+			const value = parseContextValue(longBoth[1] ?? "", nextToken);
+			if (value === undefined) continue;
+			before = Math.max(before, value);
+			after = Math.max(after, value);
+			continue;
+		}
+		// Bare numeric context form: `grep -3 pattern file`.
+		const bare = /^-(\d+)$/.exec(token);
+		if (bare) {
+			const value = parseContextValue(bare[1], undefined);
+			if (value === undefined) continue;
+			before = Math.max(before, value);
+			after = Math.max(after, value);
+			continue;
+		}
+		// Short flags, possibly clustered: the context flag must be LAST in the
+		// cluster because it consumes the remaining characters as its value.
+		const short = /^-[A-Za-z]*([ABC])(\d*)$/.exec(token);
+		if (!short) continue;
+		const value = parseContextValue(short[2], nextToken);
+		if (value === undefined) continue;
+		if (short[1] === "A") after = Math.max(after, value);
+		else if (short[1] === "B") before = Math.max(before, value);
+		else {
+			before = Math.max(before, value);
+			after = Math.max(after, value);
+		}
+	}
+	return { before, after };
+}
+
 function extractGrepSearchFiles(args: string[], cwd: string): string[] {
 	const files: string[] = [];
 	let patternSeen = false;
@@ -398,21 +521,128 @@ function parseGrepLineWithoutFile(
 	return { file, startLine: lineNumber, endLine: lineNumber };
 }
 
+/**
+ * Verbs that DROP printed lines from a piped stream (#1908, review F4): a
+ * hit that survives such a tail cannot be trusted to still carry the
+ * -A/-B/-C context grep's flags declared, because that context may have
+ * been among the dropped lines. `head`/`tail` drop by position (even bare,
+ * since both default to a 10-line window); `sed` with a `q` command drops
+ * everything after the addressed line; `uniq` drops adjacent duplicate
+ * lines, which can include a context line that happens to repeat.
+ *
+ * The criterion is DROPPING, not "changes grep's output shape" — a review
+ * finding (#1913 F4) caught this file previously conflating the two:
+ *   - `head`/`tail`/`sed q`/`uniq` downstream of a matching grep → some
+ *     printed lines are genuinely gone, so credit falls back to
+ *     match-line-only (the same conservative default already used for
+ *     unparseable commands) rather than trusting the declared flags.
+ *   - `sort` and other REORDER-ONLY filters keep every line grep printed,
+ *     just in a different order — a surviving `file:line:` match still
+ *     carries the full context grep actually printed, so no special case is
+ *     needed (proven by the "still credits full context through a
+ *     non-truncating pipe tail" test below).
+ *   - `wc` and similar filters that REPLACE grep's output entirely (with a
+ *     count, say) leave no `file:line:`-shaped line at all, so
+ *     `parseGrepOutputSearchReads` already finds zero matches in the real
+ *     captured stdout. Also no special case needed, but for the OPPOSITE
+ *     reason from `sort`: nothing survives to credit, rather than
+ *     everything surviving intact.
+ *   - A pass-through filter (`cat`, `grep -v`, ...) between grep and a
+ *     dropping tail still counts: the walk below follows the whole pipe
+ *     chain, not just the immediate next segment.
+ *   - Out of scope, deliberately: `sed -n 'Np'` range-address filtering
+ *     without `q`, and `sort -u`, also drop lines but aren't in #1908's
+ *     stated scope — revisit if they recur in the field. Also out of
+ *     scope: a truncating tail hidden inside a subshell/brace-group
+ *     (`( ... )`, `{ ...; }`) or reimplemented in `awk`/`perl` — the shared
+ *     tokenizer this file uses doesn't parse inside those, matching its
+ *     documented "small conservative shell lexer" scope.
+ */
+const LINE_DROPPING_TAIL_VERBS = new Set(["head", "tail", "uniq"]);
+
+function isSedQuitCommand(args: string[]): boolean {
+	for (const arg of args) {
+		const token = stripQuotes(arg);
+		if (token.startsWith("-")) continue;
+		// A `q` command anchored at the start of the script or after a `;`/
+		// newline separator, optionally preceded by a numeric/`$` address
+		// (`q`, `1q`, `$q`, `1,3p;q`). Deliberately not a full sed parser.
+		if (/(^|[;\n])\s*(\d+|\$)?\s*q\b/.test(token)) return true;
+	}
+	return false;
+}
+
+function isLineDroppingTailCommand(tokens: string[]): boolean {
+	const verb = path.basename(stripQuotes(tokens[0] ?? ""));
+	if (LINE_DROPPING_TAIL_VERBS.has(verb)) return true;
+	if (verb === "sed") return isSedQuitCommand(tokens.slice(1));
+	return false;
+}
+
+/**
+ * True when the grep segment starting at `index` feeds — directly or through
+ * a chain of pipes — into a line-dropping tail (#1908). Only an unquoted `|`
+ * counts: a `;`/`&&`/`&`-separated command downstream never receives grep's
+ * stdout, so it must not downgrade credit (#1913 F2 — this was previously
+ * unverified by any test that could tell a real pipe from mere adjacency).
+ */
+function grepPipesIntoTruncatingTail(
+	segments: ShellCommandSegment[],
+	index: number,
+): boolean {
+	if (segments[index]?.terminator !== "pipe") return false;
+	for (let j = index + 1; j < segments.length; j++) {
+		if (isLineDroppingTailCommand(segments[j].tokens)) return true;
+		if (segments[j].terminator !== "pipe") return false;
+	}
+	return false;
+}
+
 function collectGrepCommandFiles(
 	command: string,
 	cwd: string,
-): { hasLineNumberGrep: boolean; files: Set<string> } {
+): {
+	hasLineNumberGrep: boolean;
+	files: Set<string>;
+	context: GrepContextLines;
+} {
 	const files = new Set<string>();
 	let hasLineNumberGrep = false;
-	for (const tokens of commandSegments(command)) {
+	// A command can chain several greps whose output all reaches the model, but
+	// the parsed hits carry no segment identity. Credit the SMALLEST context any
+	// contributing grep printed, so no line is credited that a hit from the
+	// narrowest grep never delivered.
+	let context: GrepContextLines | undefined;
+	// #1908: if ANY contributing grep pipes into a truncating tail, fall back
+	// to match-line-only credit for the whole command — the parsed hits carry
+	// no segment identity, so a per-segment override isn't representable in
+	// the aggregate `context` this function returns.
+	let truncated = false;
+	const segments = tokenizeShellCommand(command);
+	for (let i = 0; i < segments.length; i++) {
+		const tokens = segments[i].tokens;
 		const verb = path.basename(stripQuotes(tokens[0] ?? ""));
 		if (verb !== "grep" && verb !== "egrep" && verb !== "fgrep") continue;
 		const args = tokens.slice(1);
 		if (!grepHasLineNumbers(args)) continue;
 		hasLineNumberGrep = true;
+		const segmentContext = parseGrepContextLines(args);
+		context = context
+			? {
+					before: Math.min(context.before, segmentContext.before),
+					after: Math.min(context.after, segmentContext.after),
+				}
+			: segmentContext;
 		for (const file of extractGrepSearchFiles(args, cwd)) files.add(file);
+		if (grepPipesIntoTruncatingTail(segments, i)) truncated = true;
 	}
-	return { hasLineNumberGrep, files };
+	return {
+		hasLineNumberGrep,
+		files,
+		context: truncated
+			? { before: 0, after: 0 }
+			: (context ?? { before: 0, after: 0 }),
+	};
 }
 
 function dedupePushSearchRead(
@@ -458,17 +688,28 @@ export function extractGrepSearchReadsFromOutput(
 	cwd: string,
 	output: string,
 ): SearchReadLocation[] {
-	const { hasLineNumberGrep, files } = collectGrepCommandFiles(command, cwd);
+	const { hasLineNumberGrep, files, context } = collectGrepCommandFiles(
+		command,
+		cwd,
+	);
 	if (!hasLineNumberGrep) return [];
 	const singleFile = files.size === 1 ? [...files][0] : undefined;
-	return parseGrepOutputSearchReads(output, cwd, singleFile);
+	const locations = parseGrepOutputSearchReads(output, cwd, singleFile);
+	// Only the printed context lines were delivered to the model, so only they
+	// are credited. A bare grep credits its match line alone (#1904 item 2).
+	for (const loc of locations) {
+		loc.contextBefore = context.before;
+		loc.contextAfter = context.after;
+	}
+	return locations;
 }
 
 /**
  * Extract files a bash command WROTE/created, so the read-guard can treat them
  * as authored by the agent (mirrors the Write tool). Handles:
  *   redirects: `> FILE`, `>> FILE`, `N> FILE`, `&> FILE` (with or without space)
- *   tee [-a] FILE...,  sed -i ... FILE,  cp/mv/install ... DEST,  touch FILE...
+ *   tee [-a] FILE..., sed -i ... FILE, cp/mv/install ... DEST, touch FILE...,
+ *   and common in-place formatter/fixer invocations with explicit file targets.
  *
  * Returns absolute paths. The file need not exist yet (it may be created) —
  * existence is confirmed later by recordWritten at tool_result time.
@@ -494,20 +735,116 @@ export function extractWrittenPathsFromCommand(
 		// attach redirects, otherwise targets would be duplicated harmlessly but
 		// needlessly rescanned.
 		break;
-
 	}
 	for (const tokens of commandSegments(command)) {
 		if (tokens.length === 0) continue;
-		const verb = path.basename(tokens[0] ?? "");
-		const args = tokens.slice(1);
+		const { verb, args } = unwrapCommand(tokens);
 
 		if (verb === "tee" || verb === "touch") {
 			for (const a of args) if (!a.startsWith("-")) add(a);
 		} else if (verb === "sed" && args.includes("-i")) {
 			for (const a of args) add(a);
 		} else if (verb === "cp" || verb === "mv" || verb === "install") {
+			// Known miss (#1668 review F3): the GNU `-t DEST`/`--target-directory`
+			// form puts the destination BEFORE the sources — this always treats
+			// the LAST non-flag argument as the destination, so `-t DEST SRC` and
+			// multi-source `-t DEST SRC1 SRC2...` are misread. Rare in agent-
+			// authored bash (source-before-dest is the common form); documented
+			// rather than fixed, since correctly parsing `-t` means recognizing it
+			// takes a value while telling it apart from every other single-letter
+			// flag this same branch already ignores.
 			const files = args.filter((a) => !a.startsWith("-"));
 			if (files.length >= 1) add(files[files.length - 1]); // destination
+		} else if (verb === "biome") {
+			const sub = args[0];
+			if ((sub === "format" || sub === "check") && args.includes("--write")) {
+				for (const file of formatterFileArgs(
+					args,
+					1,
+					new Set(["--config-path"]),
+				))
+					add(file);
+			}
+		} else if (verb === "prettier" && args.includes("--write")) {
+			for (const file of formatterFileArgs(
+				args,
+				0,
+				new Set(["--config", "--ignore-path", "--parser", "--plugin"]),
+			))
+				add(file);
+		} else if (verb === "eslint" && args.includes("--fix")) {
+			for (const file of formatterFileArgs(
+				args,
+				0,
+				new Set(["--config", "--ignore-path", "--parser", "--plugin"]),
+			))
+				add(file);
+		} else if (verb === "ruff") {
+			const sub = args[0];
+			if (sub === "format" || args.includes("--fix")) {
+				const start = sub === "format" || sub === "check" ? 1 : 0;
+				for (const file of formatterFileArgs(
+					args,
+					start,
+					new Set(["--config"]),
+				))
+					add(file);
+			}
+		} else if (verb === "gofmt" && args.includes("-w")) {
+			for (const file of formatterFileArgs(args)) add(file);
+		} else if (verb === "cargo" && args[0] === "fmt") {
+			// Bare cargo fmt is project-scoped and cannot be enumerated without a
+			// filesystem walk. Only explicit rustfmt operands after `--` are safe.
+			const separator = args.indexOf("--");
+			if (separator >= 0) {
+				for (const file of formatterFileArgs(
+					args,
+					separator + 1,
+					new Set(["--edition", "--config-path"]),
+				))
+					add(file);
+			}
+		} else if (verb === "rustfmt") {
+			for (const file of formatterFileArgs(
+				args,
+				0,
+				new Set(["--edition", "--config-path"]),
+			))
+				add(file);
+		} else if (verb === "black") {
+			for (const file of formatterFileArgs(
+				args,
+				0,
+				new Set([
+					"--config",
+					"--exclude",
+					"--include",
+					"--line-length",
+					"--target-version",
+				]),
+			))
+				add(file);
+		} else if (verb === "clang-format" && args.includes("-i")) {
+			for (const file of formatterFileArgs(
+				args,
+				0,
+				new Set(["--style", "--fallback-style", "--assume-filename"]),
+			))
+				add(file);
+		} else if (verb === "dotnet" && args[0] === "format") {
+			// dotnet format is normally solution-scoped. `--include` is the one
+			// invocation form that provides attributable source paths.
+			for (let i = 1; i < args.length; i += 1) {
+				if (args[i] === "--include" && args[i + 1]) {
+					for (const file of (args[i + 1] ?? "").split(",")) add(file);
+					i += 1;
+				} else if (args[i]?.startsWith("--include=")) {
+					for (const file of (args[i] ?? "")
+						.slice("--include=".length)
+						.split(","))
+						add(file);
+				}
+			}
 		} else if (verb === "git") {
 			// git ops that REWRITE working-tree files with explicit paths:
 			//   git checkout [<ref>] -- <files>   git restore [opts] <files>
@@ -525,7 +862,73 @@ export function extractWrittenPathsFromCommand(
 							? args.slice(1).filter((a) => !a.startsWith("-"))
 							: []; // `git checkout` without `--` is ambiguous (ref vs path)
 				for (const a of fileArgs) add(a);
+			} else if (sub === "mv") {
+				// git mv SRC... DEST — the destination is a write, exactly like
+				// plain `mv` above (#1668 review F2). The source side is a delete,
+				// handled by extractDeletedPathsFromCommand.
+				const files = args.slice(1).filter((a) => !a.startsWith("-"));
+				if (files.length >= 1) add(files[files.length - 1]);
 			}
+		}
+	}
+
+	return Array.from(out);
+}
+
+/**
+ * Extract files a bash command likely DELETED, for the type-3 (Deleted)
+ * watched-files gap (#1668): `rm FILE...`, `git rm FILE...`, and the SOURCE
+ * side of `mv SRC DEST` / `git mv SRC DEST` (the destination is a write,
+ * covered by `extractWrittenPathsFromCommand` — including for `git mv`,
+ * #1668 review F2).
+ *
+ * Deliberately narrow: only commands naming an explicit file target are
+ * handled. A bare directory op (`rm -rf dir/`, `git clean`) is skipped —
+ * resolving what vanished inside a directory would mean listing it before
+ * and after, the "stat the world" cost this module exists to avoid. The
+ * caller confirms each candidate by checking it no longer exists on disk;
+ * this function only proposes what the command named.
+ */
+export function extractDeletedPathsFromCommand(
+	command: string,
+	cwd: string,
+): string[] {
+	const out = new Set<string>();
+	const add = (token: string) => {
+		const abs = resolveCandidate(token, cwd);
+		if (abs) out.add(abs);
+	};
+	// mv SRC... DEST / git mv SRC... DEST — every argument except the last is
+	// a source that vanishes from its original path once the move lands.
+	// Known miss (#1668 review F3): the same `-t DEST`/`--target-directory`
+	// form documented in `extractWrittenPathsFromCommand` misreads here too —
+	// this assumes source-before-destination order.
+	const addMoveSources = (args: string[]) => {
+		const files = args.filter((a) => !a.startsWith("-"));
+		if (files.length >= 2) {
+			for (const src of files.slice(0, -1)) add(src);
+		}
+	};
+
+	for (const tokens of commandSegments(command)) {
+		if (tokens.length === 0) continue;
+		const verb = path.basename(tokens[0] ?? "");
+		const args = tokens.slice(1);
+
+		if (verb === "rm") {
+			for (const a of args) if (!a.startsWith("-")) add(a);
+		} else if (verb === "git" && args[0] === "rm") {
+			const rmArgs = args.slice(1);
+			const dashDash = rmArgs.indexOf("--");
+			const fileArgs =
+				dashDash >= 0
+					? rmArgs.slice(dashDash + 1)
+					: rmArgs.filter((a) => !a.startsWith("-"));
+			for (const a of fileArgs) add(a);
+		} else if (verb === "git" && args[0] === "mv") {
+			addMoveSources(args.slice(1));
+		} else if (verb === "mv") {
+			addMoveSources(args);
 		}
 	}
 

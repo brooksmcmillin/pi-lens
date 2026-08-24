@@ -226,7 +226,12 @@ export interface ModuleCallGraphRelation {
 	kind?: string;
 	line?: number;
 	evidenceKind?: "calls" | "references" | "mixed";
-	resolution?: "exact" | "import" | "receiver-type" | "name-only" | "unresolved";
+	resolution?:
+		| "exact"
+		| "import"
+		| "receiver-type"
+		| "name-only"
+		| "unresolved";
 	evidenceCount?: number;
 	weight?: number;
 }
@@ -555,6 +560,14 @@ async function extractFile(
 				let callbacks: ModuleCallbackEntry[] = [];
 				let callbackError: string | undefined;
 				try {
+					// SAFETY: `ModuleReportNode` is this module's own structural
+					// subset of a tree-sitter node: `type`, `text`, `children`,
+					// `parent`, `isNamed`, and the two positions. A real node
+					// implements all of it, but the two types are declared in
+					// unrelated packages so TypeScript sees no relation. The cast
+					// asserts only that structural subset; widen
+					// `ModuleReportNode` past what tree-sitter nodes provide and
+					// it stops holding.
 					callbacks = extractCallbacks(
 						tree.rootNode as unknown as ModuleReportNode,
 						owners,
@@ -794,7 +807,12 @@ function toEntry(
 	// usedBy/fanout for every TS/JS method. Every other language builds its graph
 	// node with THIS SAME extractor, so `sym.kind` matches there.
 	const idKind = fileKind === "jsts" ? "function" : sym.kind;
-	const symbolNodeId = buildSymbolId(normalizedPath, sym.name, idKind, sym.line);
+	const symbolNodeId = buildSymbolId(
+		normalizedPath,
+		sym.name,
+		idKind,
+		sym.line,
+	);
 	const node = graph?.nodes.get(symbolNodeId);
 	const metadata = node?.metadata ?? {};
 
@@ -1740,9 +1758,9 @@ function callGraphCoverage(
 	coverage: CallGraphEvidenceCoverage,
 ): ModuleCallGraphCoverage {
 	const languages = coverage.languages;
-	const complete = coverage.complete && Object.values(languages ?? {}).every(
-		(status) => status === "complete",
-	);
+	const complete =
+		coverage.complete &&
+		Object.values(languages ?? {}).every((status) => status === "complete");
 	return {
 		status: complete ? "complete" : "partial",
 		complete,
@@ -1769,7 +1787,10 @@ function callGraphRelation(
 	return {
 		symbolId: caller ? edge.callerKey : edge.calleeKey,
 		targetSymbolId: caller ? edge.calleeKey : edge.callerKey,
-		file: toDisplayPath(caller ? edge.callerFile : edge.calleeFile, projectRoot),
+		file: toDisplayPath(
+			caller ? edge.callerFile : edge.calleeFile,
+			projectRoot,
+		),
 		...(caller
 			? {
 					symbol: edge.callerSymbol,
@@ -1780,7 +1801,7 @@ function callGraphRelation(
 					symbol: edge.calleeSymbol,
 					kind: edge.calleeKind,
 					line: edge.calleeLine,
-			}),
+				}),
 		...(edge.evidenceKind ? { evidenceKind: edge.evidenceKind } : {}),
 		...(edge.resolution ? { resolution: edge.resolution } : {}),
 		...(edge.evidenceCount && edge.evidenceCount > 1
@@ -1808,11 +1829,15 @@ function readCallGraph(
 	// The canonical review graph is the only freshness authority. This path is
 	// read-only: do not walk source files or compare an independent mtime map.
 	if (!reviewGraph) return unavailableCallGraph("review-graph-missing");
-	if (reviewGraph.persistCoverage?.partial || reviewGraph.persistCoverage?.inProgress) {
+	if (
+		reviewGraph.persistCoverage?.partial ||
+		reviewGraph.persistCoverage?.inProgress
+	) {
 		return unavailableCallGraph("partial");
 	}
 	if (!identity) return unavailableCallGraph("identity-missing");
-	if (!reviewGraph.fileNodes.has(normalizedPath)) return unavailableCallGraph("stale");
+	if (!reviewGraph.fileNodes.has(normalizedPath))
+		return unavailableCallGraph("stale");
 	const cached = loadCallGraph(projectRoot, identity);
 	if (!cached) return unavailableCallGraph("stale");
 
@@ -1826,7 +1851,10 @@ function readCallGraph(
 			callees.push(callGraphRelation(edge, "callee", projectRoot));
 		}
 	}
-	const stable = (left: ModuleCallGraphRelation, right: ModuleCallGraphRelation) =>
+	const stable = (
+		left: ModuleCallGraphRelation,
+		right: ModuleCallGraphRelation,
+	) =>
 		left.targetSymbolId.localeCompare(right.targetSymbolId) ||
 		(left.line ?? 0) - (right.line ?? 0) ||
 		left.symbolId.localeCompare(right.symbolId);
@@ -1837,19 +1865,21 @@ function readCallGraph(
 		callers: callers.slice(0, maxEntries),
 		callees: callees.slice(0, maxEntries),
 		truncated: callers.length > maxEntries || callees.length > maxEntries,
-		coverage: callGraphCoverage(cached.graph.coverage ?? {
-			totalEvidence: cached.graph.totalRefs,
-			callsEvidence: cached.graph.totalRefs,
-			referencesEvidence: 0,
-			eligibleEvidence: cached.graph.totalRefs,
-			resolvedEvidence: cached.graph.totalRefs,
-			unresolvedEvidence: cached.graph.unresolvedRefs,
-			typeOnlyEvidence: 0,
-			unsupportedEvidence: 0,
-			sameFileEvidence: 0,
-			duplicateEvidence: 0,
-			complete: false,
-		}),
+		coverage: callGraphCoverage(
+			cached.graph.coverage ?? {
+				totalEvidence: cached.graph.totalRefs,
+				callsEvidence: cached.graph.totalRefs,
+				referencesEvidence: 0,
+				eligibleEvidence: cached.graph.totalRefs,
+				resolvedEvidence: cached.graph.totalRefs,
+				unresolvedEvidence: cached.graph.unresolvedRefs,
+				typeOnlyEvidence: 0,
+				unsupportedEvidence: 0,
+				sameFileEvidence: 0,
+				duplicateEvidence: 0,
+				complete: false,
+			},
+		),
 	};
 }
 
@@ -1886,7 +1916,10 @@ export async function moduleReport(
 	const maxRefs = normalizeMaxRefsPerSymbol(options?.maxRefsPerSymbol);
 	const maxCallGraphEntries = Math.min(
 		CALL_GRAPH_MAX_ENTRY_CAP,
-		Math.max(1, Math.floor(options?.maxCallGraphEntries ?? CALL_GRAPH_DEFAULT_ENTRY_CAP)),
+		Math.max(
+			1,
+			Math.floor(options?.maxCallGraphEntries ?? CALL_GRAPH_DEFAULT_ENTRY_CAP),
+		),
 	);
 	const absPath = path.resolve(cwd, file);
 	const normalizedPath = normalizeMapKey(absPath);
@@ -1929,24 +1962,34 @@ export async function moduleReport(
 	let graph: ReviewGraph | undefined;
 	let graphFileCap: number | undefined;
 	let callGraphIdentity: CallGraphCacheIdentity | undefined;
+	// #1961 review F4: the blind read now serves a snapshot stamped at a
+	// different commit. project_report says so in its trust notes; this report
+	// reads through the SAME accessor, so without this it would present the
+	// other branch's importers and call edges as current, under a builtAt that
+	// looks fresh. Computed per call, never cached.
+	let revisionDriftNote: string | undefined;
 	try {
 		const {
 			getCachedReviewGraph,
 			getReviewGraphCacheIdentity,
 			getReviewGraphSizeSkipVerdict,
+			getReviewGraphRevisionDrift,
+			formatReviewGraphRevisionDriftNote,
 		} = await import("./review-graph/builder.js");
 		graph = getCachedReviewGraph(cwd);
 		graphFileCap = getReviewGraphSizeSkipVerdict(cwd)?.maxFileCount;
+		const drift = graph ? getReviewGraphRevisionDrift(cwd) : undefined;
+		if (drift) revisionDriftNote = formatReviewGraphRevisionDriftNote(drift);
 		callGraphIdentity = graph
 			? (() => {
 					const identity = getReviewGraphCacheIdentity(cwd, graph);
 					return identity
 						? {
-							reviewGraphVersion: identity.version,
-							reviewGraphSignature: identity.signature,
-						}
+								reviewGraphVersion: identity.version,
+								reviewGraphSignature: identity.signature,
+							}
 						: undefined;
-			  })()
+				})()
 			: undefined;
 	} catch {
 		graph = undefined;
@@ -1974,6 +2017,9 @@ export async function moduleReport(
 	const api = topLevel.filter((entry) => entry.exported);
 	const internal = topLevel.filter((entry) => !entry.exported);
 	const warnings: string[] = [...(extractionWarnings ?? [])];
+	// Every graph-derived section below (who-uses-this, blast radius, call
+	// edges) came from the served snapshot, so the caveat belongs with them.
+	if (revisionDriftNote) warnings.push(revisionDriftNote);
 	if (callbackError) {
 		warnings.push(`Failed to extract callbacks: ${callbackError}`);
 		logLatency({
@@ -2061,15 +2107,15 @@ export async function moduleReport(
 	// so it only needs to echo back on the report; it never gates section content
 	// the way summaryView does.
 	const compactView = view === "compact";
-	let importsProvenance: NonNullable<ModuleReport["provenance"]>["imports"] = "none";
+	let importsProvenance: NonNullable<ModuleReport["provenance"]>["imports"] =
+		"none";
 	if (coldImportResult) {
 		importsProvenance = "syntax";
 	} else if (graph) {
 		importsProvenance = "cached-review-graph";
 	}
-	const unavailableGraphProvenance = graphFileCap !== undefined
-		? "unavailable:file-cap"
-		: "none";
+	const unavailableGraphProvenance =
+		graphFileCap !== undefined ? "unavailable:file-cap" : "none";
 	const blastRadiusProvenance = blastRadius
 		? "cached-review-graph"
 		: unavailableGraphProvenance;
@@ -2109,13 +2155,9 @@ export async function moduleReport(
 		provenance: {
 			symbols: languageId ? "syntax" : "none",
 			imports: importsProvenance,
-			usedBy: hasGraphNode
-				? "cached-review-graph"
-				: unavailableGraphProvenance,
+			usedBy: hasGraphNode ? "cached-review-graph" : unavailableGraphProvenance,
 			callbacks: languageId && !summaryView ? "heuristic-tree-sitter" : "none",
-			...(options?.blastRadius
-				? { blastRadius: blastRadiusProvenance }
-				: {}),
+			...(options?.blastRadius ? { blastRadius: blastRadiusProvenance } : {}),
 			...(options?.callGraph ? { callGraph: callGraphProvenance } : {}),
 		},
 		semantic: {
@@ -2188,7 +2230,9 @@ function compactEntryLine(entry: ModuleSymbolEntry, width: number): string {
 	const kind = compactKind(entry.kind).padEnd(6);
 	const sig = entry.signature ? `${entry.name}${entry.signature}` : entry.name;
 	const flagsSuffix =
-		entry.flags && entry.flags.length > 0 ? `  [${entry.flags.join(", ")}]` : "";
+		entry.flags && entry.flags.length > 0
+			? `  [${entry.flags.join(", ")}]`
+			: "";
 	const docSuffix = entry.doc ? `  — ${entry.doc}` : "";
 	const usedBySuffix = compactUsedBySuffix(entry.usedBy);
 	return `  ${range}${kind}${sig}${flagsSuffix}${usedBySuffix}${docSuffix}`;
@@ -2200,10 +2244,15 @@ function compactMemberLines(
 	indent: string,
 ): string[] {
 	if (!entry.members || entry.members.length === 0) return [];
-	return entry.members.map((m) => `${indent}${compactEntryLine(m, width).slice(2)}`);
+	return entry.members.map(
+		(m) => `${indent}${compactEntryLine(m, width).slice(2)}`,
+	);
 }
 
-function compactCallbackLine(callback: ModuleCallbackEntry, width: number): string {
+function compactCallbackLine(
+	callback: ModuleCallbackEntry,
+	width: number,
+): string {
 	const range = padRange(callback.startLine, callback.endLine, width);
 	const kind = callback.kind.padEnd(20);
 	const flagsSuffix =
@@ -2237,10 +2286,7 @@ export function renderCompactModuleReport(report: ModuleReport): string {
 		return `${report.path} — unavailable${report.error ? `: ${report.error}` : ""}`;
 	}
 	const allEntries = [...report.api, ...report.internal];
-	const allRanges = allEntries.flatMap((e) => [
-		e,
-		...(e.members ?? []),
-	]);
+	const allRanges = allEntries.flatMap((e) => [e, ...(e.members ?? [])]);
 	const width =
 		Math.max(
 			5,
@@ -2293,7 +2339,7 @@ export function renderCompactModuleReport(report: ModuleReport): string {
 		} else {
 			lines.push(
 				`  callers: ${callGraph.callers.length} · callees: ${callGraph.callees.length}` +
-				` · coverage: ${callGraph.coverage.status}${suffix}`,
+					` · coverage: ${callGraph.coverage.status}${suffix}`,
 			);
 		}
 	}
@@ -2331,7 +2377,9 @@ function selectMatch(
 	kind: string | undefined,
 ): SymbolSelection {
 	if (candidates.length === 0) return {};
-	const filtered = kind ? candidates.filter((c) => c.kind === kind) : candidates;
+	const filtered = kind
+		? candidates.filter((c) => c.kind === kind)
+		: candidates;
 	const pool = filtered.length > 0 ? filtered : candidates;
 	const match = pool[0];
 	if (pool.length <= 1) return { match };
@@ -2495,11 +2543,16 @@ export async function readSymbol(
 	// unqualified lookup using the FULL requested name (so an unresolved
 	// qualifier or a non-dotted name both flow through the same miss/did-you-
 	// mean path below rather than a separate branch).
-	const qualified = resolveQualifiedMatch(symbols, symbolName, symbolKindFilter);
+	const qualified = resolveQualifiedMatch(
+		symbols,
+		symbolName,
+		symbolKindFilter,
+	);
 	const unqualifiedMatches = symbols.filter(
 		(candidate) => candidate.name === symbolName,
 	);
-	const selection = qualified ?? selectMatch(unqualifiedMatches, symbolKindFilter);
+	const selection =
+		qualified ?? selectMatch(unqualifiedMatches, symbolKindFilter);
 
 	if (selection.match) {
 		const sym = selection.match;

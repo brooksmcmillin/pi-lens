@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-vi.unmock("../../../clients/installer/index.ts");
+vi.unmock("../../../clients/installer/index.js");
 
 const MANAGED_LSP_TOOL_IDS = [
 	"pyright",
@@ -21,13 +21,16 @@ const MANAGED_LSP_TOOL_IDS = [
 
 describe("installer managed tool coverage", () => {
 	it("has installer definitions for all managed LSP tool IDs", async () => {
-		const { isKnownToolId } = await import("../../../clients/installer/index.ts");
-		const missing = MANAGED_LSP_TOOL_IDS.filter((toolId) => !isKnownToolId(toolId));
+		const { isKnownToolId } =
+			await import("../../../clients/installer/index.js");
+		const missing = MANAGED_LSP_TOOL_IDS.filter(
+			(toolId) => !isKnownToolId(toolId),
+		);
 		expect(missing).toEqual([]);
 	});
 
 	it("pins the managed classic TypeScript compiler below TypeScript 7", async () => {
-		const { TOOLS } = await import("../../../clients/installer/index.ts");
+		const { TOOLS } = await import("../../../clients/installer/index.js");
 		const typescript = TOOLS.find((tool) => tool.id === "typescript");
 		expect(typescript?.packageName).toBe("typescript@5.9.3");
 	});

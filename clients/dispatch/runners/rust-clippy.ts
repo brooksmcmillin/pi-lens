@@ -9,7 +9,14 @@ import { findNearestContaining } from "../../path-utils.js";
 import { RustClient } from "../../rust-client.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import { stripAnsi } from "../../sanitize.js";
-import { tryLazyInstall } from "./utils/lazy-installer.js";
+import {
+	getLazyInstallAttempt,
+	tryLazyInstall,
+} from "./utils/lazy-installer.js";
+import {
+	describeInstallAttempt,
+	logAvailabilityDecision,
+} from "./utils/availability-policy.js";
 import type {
 	Diagnostic,
 	DispatchContext,
@@ -50,7 +57,9 @@ const clippyAvailabilityByCargo = new Map<
 	ReturnType<typeof makeClippyProbe>
 >();
 function getClippyProbe(cargoExe: string) {
-	return clippyAvailabilityByCargo.get(cargoExe) ?? refreshClippyProbe(cargoExe);
+	return (
+		clippyAvailabilityByCargo.get(cargoExe) ?? refreshClippyProbe(cargoExe)
+	);
 }
 
 /** Replace the cached probe so a post-install state is observed. */
@@ -83,8 +92,30 @@ const rustClippyRunner: RunnerDefinition = {
 				return { status: "skipped", diagnostics: [], semantic: "none" };
 			}
 			await tryLazyInstall("rust-clippy", ctx.cwd);
-			// Bust the cwd-keyed cache so the post-install state is observed.
-			if (!(await refreshClippyProbe(cargoExe)(ctx.cwd))) {
+			// Bust the cwd-keyed cache so the post-install state is observed. Held in
+			// a local: `refreshClippyProbe` REPLACES the cached probe, so calling it
+			// again to read the verdict would spend a second probe.
+			const refreshedProbe = refreshClippyProbe(cargoExe);
+			if (!(await refreshedProbe(ctx.cwd))) {
+				// #1537: clippy is still absent, and the interesting question is WHY —
+				// "we tried `rustup component add` and the network failed" is a
+				// different fact from "this machine has no rustup", and until now the
+				// lazy installers recorded neither. Put the attempt beside the verdict
+				// it produced (#1500), so a reader does not have to infer the install
+				// from a runner that silently skipped.
+				const verdict = refreshedProbe.getVerdict(ctx.cwd);
+				logAvailabilityDecision({
+					tool: "rust-clippy",
+					verdict: "unavailable",
+					outcome: verdict.outcome ?? "missing",
+					cause: verdict.cause ?? "not-found",
+					classifiedBy: "caller",
+					evidence: describeInstallAttempt(
+						getLazyInstallAttempt("rust-clippy", ctx.cwd),
+					),
+					elapsedMs: 0,
+					latched: false,
+				});
 				return { status: "skipped", diagnostics: [], semantic: "none" };
 			}
 		}
@@ -174,6 +205,51 @@ interface ClippyMessage {
 }
 
 /**
+ * #1802 fix round: the original review claimed rustc/clippy's top-level
+ * `compiler-message.level` is genuinely two-valued (error/warning). A live
+ * `cargo clippy --message-format=json` repro falsified that: rustc_errors's
+ * `Level` serializes SIX values, and top-level messages with a real primary
+ * span are NOT limited to error/warning —
+ *
+ *   - `"error"` — a hard compiler/lint error.
+ *   - `"warning"` — the common clippy-lint case.
+ *   - `"note"` — DOES appear as a top-level message with a non-empty primary
+ *     span (repro: an erroneous-constant note pointing at the offending
+ *     expression), not only as a `message.children[].level` annotation.
+ *   - `"help"` — a top-level suggestion-carrying message.
+ *   - `"failure-note"` — observed with an empty `spans` array, so it is
+ *     already filtered out by the `if (!span) continue` guard below; no
+ *     diagnostic is ever built from it. Verified, not assumed.
+ *   - `"error: internal compiler error"` — an ICE. The old `level === "error"`
+ *     exact-match ternary silently mapped this to `"warning"`, because the
+ *     string doesn't equal `"error"` — an ICE must never be under-reported,
+ *     so it is normalized to `"error"` here explicitly.
+ *
+ * `note`/`help` don't have a `"blocking"`-worthy tier of their own in the
+ * four-valued `Diagnostic.severity`, so they land on the two quiet tiers:
+ * `note` → `hint`, `help` → `info`. Blocking stays derived from the
+ * *normalized* severity (not the raw string), which is what makes the ICE
+ * case blocking too instead of silently passing.
+ */
+export function normalizeClippyLevel(
+	raw: string | undefined,
+): Diagnostic["severity"] {
+	if (raw === "error") return "error";
+	if (
+		typeof raw === "string" &&
+		raw.startsWith("error: internal compiler error")
+	) {
+		return "error";
+	}
+	if (raw === "note") return "hint";
+	if (raw === "help") return "info";
+	// "warning", "failure-note" (unreachable here, see above), and anything
+	// unrecognized fall back to "warning" — the tier every clippy diagnostic
+	// reported at before this fix.
+	return "warning";
+}
+
+/**
  * Find a machine-applicable suggested replacement across the message's spans.
  * Clippy emits one diagnostic per warning but can attach the auto-fix to a
  * span other than the primary one (e.g. a fix that rewrites a use-site AND
@@ -224,14 +300,21 @@ export function parseClippyOutput(
 					: rawFile
 				: fallbackPath;
 
+			// #1802: preserve clippy's real six-level vocabulary instead of
+			// collapsing it. See `normalizeClippyLevel` above for the verified
+			// mapping and the repro that falsified the original "two-valued"
+			// claim. Blocking is derived from the NORMALIZED severity so an ICE
+			// (`"error: internal compiler error"`) is blocking too, not just an
+			// exact-match `"error"` string.
+			const normalizedSeverity = normalizeClippyLevel(message.level);
 			diagnostics.push({
 				id: `clippy-${message.code?.code || "unknown"}`,
 				message: message.message || "Clippy warning",
 				filePath,
 				line: span.line_start || 0,
 				column: span.column_start || 0,
-				severity: message.level === "error" ? "error" : "warning",
-				semantic: message.level === "error" ? "blocking" : "warning",
+				severity: normalizedSeverity,
+				semantic: normalizedSeverity === "error" ? "blocking" : "warning",
 				tool: "rust-clippy",
 				rule: message.code?.code,
 				defectClass: "correctness",

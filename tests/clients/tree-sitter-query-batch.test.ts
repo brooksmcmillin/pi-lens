@@ -62,7 +62,11 @@ describe("runQueriesOnFile", () => {
 
 		const perRule: Array<{ id: string; line: number; text: string }> = [];
 		for (const def of RULES) {
-			for (const match of await client.runQueryOnFile(def, file, "typescript")) {
+			for (const match of await client.runQueryOnFile(
+				def,
+				file,
+				"typescript",
+			)) {
 				perRule.push({ id: def.id, line: match.line, text: match.matchedText });
 			}
 		}
@@ -115,10 +119,13 @@ describe("runQueriesOnFile", () => {
 			// RULES was evicted and its Query was disposed; this call must compile a
 			// fresh batch rather than use the deleted Query object.
 			const rebuilt = await client.runQueriesOnFile(RULES, file, "typescript");
-			expect(rebuilt.some(({ queryDef }) => queryDef.id === "calls")).toBe(true);
+			expect(rebuilt.some(({ queryDef }) => queryDef.id === "calls")).toBe(
+				true,
+			);
 			expect(rebuilt.length).toBe(first.length);
 		} finally {
-			if (previous === undefined) delete process.env.PI_LENS_TREE_SITTER_QUERY_BATCH_CACHE_CAP;
+			if (previous === undefined)
+				delete process.env.PI_LENS_TREE_SITTER_QUERY_BATCH_CACHE_CAP;
 			else process.env.PI_LENS_TREE_SITTER_QUERY_BATCH_CACHE_CAP = previous;
 		}
 	});
@@ -204,10 +211,22 @@ describe("runQueriesOnFile", () => {
 				.flat()
 				.find((candidate) => candidate.id === testCase.id);
 			expect(query, testCase.id).toBeDefined();
-			const badFile = createTempFile(env.tmpDir, `bad.${testCase.ext}`, testCase.bad);
-			const goodFile = createTempFile(env.tmpDir, `good.${testCase.ext}`, testCase.good);
-			expect(await client.runQueryOnFile(query!, badFile, testCase.language)).not.toEqual([]);
-			expect(await client.runQueryOnFile(query!, goodFile, testCase.language)).toEqual([]);
+			const badFile = createTempFile(
+				env.tmpDir,
+				`bad.${testCase.ext}`,
+				testCase.bad,
+			);
+			const goodFile = createTempFile(
+				env.tmpDir,
+				`good.${testCase.ext}`,
+				testCase.good,
+			);
+			expect(
+				await client.runQueryOnFile(query!, badFile, testCase.language),
+			).not.toEqual([]);
+			expect(
+				await client.runQueryOnFile(query!, goodFile, testCase.language),
+			).toEqual([]);
 		}
 	});
 

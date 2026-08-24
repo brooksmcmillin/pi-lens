@@ -92,9 +92,7 @@ function buildFixture(root: string): void {
 }
 
 function relFiles(root: string, files: string[]): string[] {
-	return files
-		.map((f) => path.relative(root, f).replace(/\\/g, "/"))
-		.sort();
+	return files.map((f) => path.relative(root, f).replace(/\\/g, "/")).sort();
 }
 
 beforeEach(() => {

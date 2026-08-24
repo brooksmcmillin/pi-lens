@@ -27,10 +27,9 @@ const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
 
 vi.mock("../../clients/lsp/config.js", async () => {
-	const actual =
-		await vi.importActual<typeof import("../../clients/lsp/config.js")>(
-			"../../clients/lsp/config.js",
-		);
+	const actual = await vi.importActual<
+		typeof import("../../clients/lsp/config.js")
+	>("../../clients/lsp/config.js");
 	return {
 		...actual,
 		getServersForFileWithConfig: (filePath: string) =>
@@ -48,19 +47,17 @@ vi.mock("../../clients/lsp/config.js", async () => {
 });
 
 vi.mock("../../clients/lsp/client.js", async () => {
-	const actual =
-		await vi.importActual<typeof import("../../clients/lsp/client.js")>(
-			"../../clients/lsp/client.js",
-		);
+	const actual = await vi.importActual<
+		typeof import("../../clients/lsp/client.js")
+	>("../../clients/lsp/client.js");
 	return { ...actual, createLSPClient };
 });
 
 const reconcileScanDiagnosticsMock = vi.fn();
 vi.mock("../../clients/widget-state.js", async () => {
-	const actual =
-		await vi.importActual<typeof import("../../clients/widget-state.js")>(
-			"../../clients/widget-state.js",
-		);
+	const actual = await vi.importActual<
+		typeof import("../../clients/widget-state.js")
+	>("../../clients/widget-state.js");
 	return {
 		...actual,
 		reconcileScanDiagnostics: (...args: unknown[]) =>
@@ -70,10 +67,9 @@ vi.mock("../../clients/widget-state.js", async () => {
 
 let service: unknown;
 vi.mock("../../clients/lsp/index.js", async () => {
-	const actual =
-		await vi.importActual<typeof import("../../clients/lsp/index.js")>(
-			"../../clients/lsp/index.js",
-		);
+	const actual = await vi.importActual<
+		typeof import("../../clients/lsp/index.js")
+	>("../../clients/lsp/index.js");
 	return { ...actual, getLSPService: () => service };
 });
 
@@ -186,9 +182,8 @@ async function runTool(
 	args: Record<string, unknown>,
 	cwd: string,
 ): Promise<any> {
-	const { createLspDiagnosticsTool } = await import(
-		"../../tools/lsp-diagnostics.js"
-	);
+	const { createLspDiagnosticsTool } =
+		await import("../../tools/lsp-diagnostics.js");
 	return (await createLspDiagnosticsTool().execute(
 		"diag-1253",
 		args,
@@ -318,7 +313,12 @@ describe("#1253 lsp_diagnostics end-to-end silent-clean confirmation", () => {
 		);
 
 		const result = await runTool(
-			{ paths: [file], severity: "all", serverScope: "primary", waitMs: 10_000 },
+			{
+				paths: [file],
+				severity: "all",
+				serverScope: "primary",
+				waitMs: 10_000,
+			},
 			tmp,
 		);
 

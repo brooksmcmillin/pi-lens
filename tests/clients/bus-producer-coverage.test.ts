@@ -58,7 +58,9 @@ const SANCTIONED_EMIT_CALLERS = new Set(["resolution"]);
  * preceding token isn't a simple identifier (e.g. `().emit(`) — those are
  * always violations since no allowlisted caller can produce that shape.
  */
-function findEmitCallSites(source: string): Array<{ caller: string | null; index: number }> {
+function findEmitCallSites(
+	source: string,
+): Array<{ caller: string | null; index: number }> {
 	const sites: Array<{ caller: string | null; index: number }> = [];
 	const pattern = /\.emit\(/g;
 	let match: RegExpExecArray | null;
@@ -66,7 +68,10 @@ function findEmitCallSites(source: string): Array<{ caller: string | null; index
 	while ((match = pattern.exec(source))) {
 		const before = source.slice(0, match.index);
 		const callerMatch = before.match(/([A-Za-z_$][A-Za-z0-9_$]*)$/);
-		sites.push({ caller: callerMatch ? callerMatch[1] : null, index: match.index });
+		sites.push({
+			caller: callerMatch ? callerMatch[1] : null,
+			index: match.index,
+		});
 	}
 	return sites;
 }
@@ -89,16 +94,22 @@ describe("bus producer guarded-seam coverage", () => {
 			const source = fs.readFileSync(path.join(clientsDir, file), "utf8");
 			expect(source, file).toContain("resolveLiveBusEmitter(");
 			expect(source, file).not.toMatch(/liveEmitter\.resolve\s*\(/);
-			expect(source, file).not.toMatch(/(?:lensEventBusGetter|busEmitterGetter)\?\.\(/);
+			expect(source, file).not.toMatch(
+				/(?:lensEventBusGetter|busEmitterGetter)\?\.\(/,
+			);
 		}
 
 		const productionSources = fs
 			.readdirSync(clientsDir)
 			.filter((file) => file.endsWith(".ts"))
-			.map((file) => [file, fs.readFileSync(path.join(clientsDir, file), "utf8")] as const);
+			.map(
+				(file) =>
+					[file, fs.readFileSync(path.join(clientsDir, file), "utf8")] as const,
+			);
 		const directResolvers = productionSources.filter(
 			([file, source]) =>
-				file !== "live-bus-emitter.ts" && /liveEmitter\.resolve\s*\(/.test(source),
+				file !== "live-bus-emitter.ts" &&
+				/liveEmitter\.resolve\s*\(/.test(source),
 		);
 		expect(directResolvers).toEqual([]);
 	});
@@ -111,7 +122,9 @@ describe("bus producer guarded-seam coverage", () => {
 			for (const { caller, index } of findEmitCallSites(source)) {
 				if (caller && SANCTIONED_EMIT_CALLERS.has(caller)) continue;
 				const line = source.slice(0, index).split("\n").length;
-				violations.push(`${file}:${line} — unsanctioned \`.emit(\` call (caller: ${caller ?? "<non-identifier>"})`);
+				violations.push(
+					`${file}:${line} — unsanctioned \`.emit(\` call (caller: ${caller ?? "<non-identifier>"})`,
+				);
 			}
 		}
 		expect(violations).toEqual([]);
@@ -127,9 +140,15 @@ describe("bus producer guarded-seam coverage", () => {
 		for (const file of producers) {
 			const source = fs.readFileSync(path.join(clientsDir, file), "utf8");
 			const failedIndex = source.indexOf('outcome: "emit_failed"');
-			expect(failedIndex, `${file}: no emit_failed outcome found`).toBeGreaterThanOrEqual(0);
+			expect(
+				failedIndex,
+				`${file}: no emit_failed outcome found`,
+			).toBeGreaterThanOrEqual(0);
 			const blockEnd = source.indexOf("});", failedIndex);
-			const block = source.slice(failedIndex, blockEnd === -1 ? undefined : blockEnd);
+			const block = source.slice(
+				failedIndex,
+				blockEnd === -1 ? undefined : blockEnd,
+			);
 			expect(block, `${file}: emit_failed row missing ctxSource`).toMatch(
 				/ctxSource:\s*resolution\.ctxSource/,
 			);

@@ -48,7 +48,7 @@ const h = vi.hoisted(() => {
 			once: (ev, cb) => {
 				// Resolve every sweep promise: fire `close` with empty output so
 				// enumerate/query resolve to "nothing found" and the sweep returns.
-				if (ev === "close") setImmediate(() => cb(0));
+				if (ev === "close") setImmediate(() => cb(0, null));
 				return child;
 			},
 		};

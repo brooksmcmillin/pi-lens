@@ -72,16 +72,20 @@ describe("bus-publish — pilens:files:touched (#482)", () => {
 
 		expect(oldEmit).not.toHaveBeenCalled();
 		expect(newEmit).toHaveBeenCalledTimes(1);
-		expect(logBusEvent.mock.calls.some(([entry]) =>
-			(entry as { outcome?: string }).outcome === "emit_failed",
-		)).toBe(false);
+		expect(
+			logBusEvent.mock.calls.some(
+				([entry]) => (entry as { outcome?: string }).outcome === "emit_failed",
+			),
+		).toBe(false);
 	});
 
 	it("skips a resolved emitter whose session ctx is stale", () => {
 		const emit = vi.fn();
 		const staleCtx = {
 			isIdle: () => {
-				throw new Error("This extension ctx is stale after session replacement or reload");
+				throw new Error(
+					"This extension ctx is stale after session replacement or reload",
+				);
 			},
 		};
 		wireBusEmitterGetter(() => ({ emit, ctx: staleCtx }));
@@ -101,9 +105,11 @@ describe("bus-publish — pilens:files:touched (#482)", () => {
 				ctxSource: "own",
 			}),
 		);
-		expect(logBusEvent.mock.calls.some(([entry]) =>
-			(entry as { outcome?: string }).outcome === "emit_failed",
-		)).toBe(false);
+		expect(
+			logBusEvent.mock.calls.some(
+				([entry]) => (entry as { outcome?: string }).outcome === "emit_failed",
+			),
+		).toBe(false);
 	});
 
 	it("fails open when the probe cannot classify the ctx", () => {
@@ -115,7 +121,11 @@ describe("bus-publish — pilens:files:touched (#482)", () => {
 		// odd-shaped ctx.
 		for (const oddCtx of [
 			{},
-			{ isIdle: () => { throw new Error("boom, not the stale fragment"); } },
+			{
+				isIdle: () => {
+					throw new Error("boom, not the stale fragment");
+				},
+			},
 		]) {
 			const emit = vi.fn();
 			wireBusEmitterGetter(() => ({ emit, ctx: oddCtx }));
@@ -125,9 +135,12 @@ describe("bus-publish — pilens:files:touched (#482)", () => {
 				cwd: "/repo",
 			});
 			expect(emit).toHaveBeenCalledTimes(1);
-			expect(logBusEvent.mock.calls.some(([entry]) =>
-				(entry as { outcome?: string }).outcome === "skipped_stale_session",
-			)).toBe(false);
+			expect(
+				logBusEvent.mock.calls.some(
+					([entry]) =>
+						(entry as { outcome?: string }).outcome === "skipped_stale_session",
+				),
+			).toBe(false);
 			vi.clearAllMocks();
 		}
 	});
@@ -142,7 +155,9 @@ describe("bus-publish — pilens:files:touched (#482)", () => {
 			emit: staleEmit,
 			ctx: {
 				isIdle: () => {
-					throw new Error("This extension ctx is stale after session replacement or reload");
+					throw new Error(
+						"This extension ctx is stale after session replacement or reload",
+					);
 				},
 			},
 		};
@@ -170,7 +185,10 @@ describe("bus-publish — pilens:files:touched (#482)", () => {
 		});
 
 		expect(emit).toHaveBeenCalledTimes(1);
-		const [channel, payload] = emit.mock.calls[0] as [string, Record<string, unknown>];
+		const [channel, payload] = emit.mock.calls[0] as [
+			string,
+			Record<string, unknown>,
+		];
 		expect(channel).toBe(BUS_FILES_TOUCHED_EVENT);
 		expect(payload).toMatchObject({
 			v: BUS_FILES_TOUCHED_VERSION,
@@ -207,7 +225,9 @@ describe("bus-publish — pilens:files:touched (#482)", () => {
 		});
 
 		expect(emit).toHaveBeenCalledTimes(1);
-		expect((emit.mock.calls[0][1] as { paths: string[] }).paths).toHaveLength(3);
+		expect((emit.mock.calls[0][1] as { paths: string[] }).paths).toHaveLength(
+			3,
+		);
 	});
 
 	it("does not emit for an empty paths batch", () => {
@@ -287,14 +307,21 @@ describe("bus-publish — pilens:files:touched (#482)", () => {
 
 	it("logs and ledgers each stale occurrence after a successful recovery", () => {
 		const stale = vi.fn(() => {
-			throw new Error("This extension ctx is stale after session replacement or reload");
+			throw new Error(
+				"This extension ctx is stale after session replacement or reload",
+			);
 		});
 		const recovered = vi.fn();
 		let currentEmit: (channel: string, data: unknown) => void = stale;
 		wireBusEmitterGetter(() => currentEmit);
 		const dbg = vi.fn();
 		const publish = (path: string) =>
-			publishFilesTouched({ reason: "autofix", paths: [path], cwd: "/repo", dbg });
+			publishFilesTouched({
+				reason: "autofix",
+				paths: [path],
+				cwd: "/repo",
+				dbg,
+			});
 
 		publish("/repo/a.ts");
 		publish("/repo/b.ts");
@@ -320,7 +347,11 @@ describe("bus-publish — pilens:files:touched (#482)", () => {
 			const emit = vi.fn();
 			wireBusEmitter(emit);
 
-			publishFilesTouched({ reason: "format", paths: ["/repo/a.ts"], cwd: "/repo" });
+			publishFilesTouched({
+				reason: "format",
+				paths: ["/repo/a.ts"],
+				cwd: "/repo",
+			});
 
 			const payload = emit.mock.calls[0][1] as Record<string, unknown>;
 			expect(payload.fixes).toBeUndefined();
@@ -487,8 +518,16 @@ describe("bus-publish — pilens:files:touched (#482)", () => {
 		});
 
 		it("logs 'skipped_unwired' once when busEmit was never wired", () => {
-			publishFilesTouched({ reason: "autofix", paths: ["/repo/a.ts"], cwd: "/repo" });
-			publishFilesTouched({ reason: "autofix", paths: ["/repo/b.ts"], cwd: "/repo" });
+			publishFilesTouched({
+				reason: "autofix",
+				paths: ["/repo/a.ts"],
+				cwd: "/repo",
+			});
+			publishFilesTouched({
+				reason: "autofix",
+				paths: ["/repo/b.ts"],
+				cwd: "/repo",
+			});
 
 			const unwiredCalls = logBusEvent.mock.calls.filter(
 				(c) => (c[0] as { outcome: string }).outcome === "skipped_unwired",
@@ -503,8 +542,16 @@ describe("bus-publish — pilens:files:touched (#482)", () => {
 			const emit = vi.fn();
 			wireBusEmitter(emit);
 
-			publishFilesTouched({ reason: "autofix", paths: ["/repo/a.ts"], cwd: "/repo" });
-			publishFilesTouched({ reason: "autofix", paths: ["/repo/b.ts"], cwd: "/repo" });
+			publishFilesTouched({
+				reason: "autofix",
+				paths: ["/repo/a.ts"],
+				cwd: "/repo",
+			});
+			publishFilesTouched({
+				reason: "autofix",
+				paths: ["/repo/b.ts"],
+				cwd: "/repo",
+			});
 
 			const disabledCalls = logBusEvent.mock.calls.filter(
 				(c) => (c[0] as { outcome: string }).outcome === "skipped_disabled",
@@ -518,7 +565,11 @@ describe("bus-publish — pilens:files:touched (#482)", () => {
 			});
 			wireBusEmitter(emit);
 
-			publishFilesTouched({ reason: "autofix", paths: ["/repo/a.ts"], cwd: "/repo" });
+			publishFilesTouched({
+				reason: "autofix",
+				paths: ["/repo/a.ts"],
+				cwd: "/repo",
+			});
 
 			expect(logBusEvent).toHaveBeenCalledWith(
 				expect.objectContaining({

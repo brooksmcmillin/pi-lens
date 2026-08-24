@@ -1,10 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { ALL_FORMATTERS } from "../../clients/formatters.ts";
+import {
+	ALL_FORMATTERS,
+	FORMATTERS_WITH_EXPLICIT_CONFIG_CHECK,
+} from "../../clients/formatters.js";
+import type { FormatterPolicy } from "../../clients/tool-policy.js";
 import {
 	AUTO_INSTALLABLE_DEFAULT_FORMATTERS,
 	FORMATTER_POLICY_BY_EXTENSION,
 	FORMATTER_POLICY_BY_FILENAME,
-} from "../../clients/tool-policy.ts";
+} from "../../clients/tool-policy.js";
 
 // Bidirectional drift guard binding the two hand-maintained INVERSE mappings of
 // the formatter↔extension relation (#1135, the #883/#209 single-source-of-truth
@@ -57,7 +61,8 @@ const extensionPolicyNamePairs = [...FORMATTER_POLICY_BY_EXTENSION].flatMap(
 	([ext, policy]) => policy.formatterNames.map((name) => ({ ext, name })),
 );
 const filenamePolicyNamePairs = [...FORMATTER_POLICY_BY_FILENAME].flatMap(
-	([filename, policy]) => policy.formatterNames.map((name) => ({ filename, name })),
+	([filename, policy]) =>
+		policy.formatterNames.map((name) => ({ filename, name })),
 );
 const defaultFormatterEntries = [
 	...[...FORMATTER_POLICY_BY_EXTENSION].map(([key, policy]) => ({
@@ -156,7 +161,8 @@ describe("formatter ↔ policy consistency (#1135)", () => {
 
 	it("every policy defaultFormatter maps to a real formatter definition (extension + filename policies; #1135 comment: terragrunt-hcl)", () => {
 		expectClean(defaultFormatterEntries, ({ kind, key, defaultFormatter }) => {
-			if (!defaultFormatter || formatterByName.has(defaultFormatter)) return null;
+			if (!defaultFormatter || formatterByName.has(defaultFormatter))
+				return null;
 			return `${kind} policy ${key} has defaultFormatter "${defaultFormatter}" with no formatter definition`;
 		});
 	});
@@ -203,7 +209,10 @@ describe("formatter ↔ policy consistency (#1135)", () => {
 			if (!policy) {
 				return `exclusion "${pair}" is decorative: there is no ${ext} policy to exclude ${name} from`;
 			}
-			if (policy.formatterNames.length === 0 || policy.formatterNames.includes(name)) {
+			if (
+				policy.formatterNames.length === 0 ||
+				policy.formatterNames.includes(name)
+			) {
 				return `exclusion "${pair}" is unnecessary: the ${ext} policy [${policy.formatterNames.join(", ")}] already offers ${name} — remove the exclusion`;
 			}
 			return null;
@@ -218,6 +227,132 @@ describe("formatter ↔ policy consistency (#1135)", () => {
 		for (const { ext } of definitionExtensionPairs) {
 			if (!FORMATTER_POLICY_BY_EXTENSION.has(ext)) actualNoPolicy.add(ext);
 		}
-		expect([...actualNoPolicy].sort()).toEqual([...NO_POLICY_FALLBACK_EXTS].sort());
+		expect([...actualNoPolicy].sort()).toEqual(
+			[...NO_POLICY_FALLBACK_EXTS].sort(),
+		);
+	});
+});
+
+// --- Every registered formatter is selectable under SOME configuration (#1572) ---
+//
+// `getFormattersForFile` (clients/formatters.ts) has exactly two ways to pick a
+// formatter once a policy applies:
+//   1. explicit-config branch: any candidate `hasExplicitFormatterConfig` says
+//      yes to (works regardless of `defaultWhenUnconfigured`);
+//   2. smart-default branch, reached ONLY when nothing matched (1): picks
+//      `policy.defaultFormatter`, but ONLY if `policy.defaultWhenUnconfigured`
+//      is true.
+// A formatter is unselectable if it can win NEITHER branch under any policy
+// that names it: it's not `hasExplicitFormatterConfig`-aware AND (it isn't the
+// policy's `defaultFormatter`, or `defaultWhenUnconfigured` is false).
+// `psscriptanalyzer-format` was exactly this: `.ps1`'s policy set
+// `defaultWhenUnconfigured: false` and the formatter had no explicit-config
+// check, so no configuration of a `.ps1` project could ever select it.
+//
+// #1595 found 8 more formatters unreachable by this same check, root-caused to
+// the same commit (038cd1df) but out of #1572's scope to fix there. 7 are now
+// wired into EXPLICIT_FORMATTER_CONFIG_CHECKS (csharpier, ormolu, taplo,
+// terraform, swiftformat, fantomas, mix — see tool-policy.ts for each one's
+// config-file convention or manifest marker) and removed from this list.
+//
+// nixfmt stays: it is deliberately unconfigurable (opinionated by design, no
+// rc file, no CLI settings surface) and has no project-level manifest marker
+// analogous to `terraform init`'s `.terraform.lock.hcl` — there is no honest
+// "this project opted in" signal to gate an explicit-config check on. Listing
+// it here (rather than silently narrowing the guard) keeps that judgment call
+// checked: the guard below still verifies nixfmt is ACTUALLY unreachable, so a
+// future config-surface addition to nixfmt would be caught as a stale entry.
+const KNOWN_UNREACHABLE_FORMATTERS = new Set<string>([
+	"nixfmt", // #1595 — see comment above: no config surface, no manifest marker
+]);
+
+/** True iff `name` can win EITHER selection branch under `policy`. */
+function isFormatterSelectable(name: string, policy: FormatterPolicy): boolean {
+	if (FORMATTERS_WITH_EXPLICIT_CONFIG_CHECK.has(name)) return true;
+	return name === policy.defaultFormatter && policy.defaultWhenUnconfigured;
+}
+
+/** Every (policy-location, formatterName) pair to check, across both maps. */
+function allPolicyFormatterPairs(): {
+	where: string;
+	name: string;
+	policy: FormatterPolicy;
+}[] {
+	const pairs: { where: string; name: string; policy: FormatterPolicy }[] = [];
+	for (const [ext, policy] of FORMATTER_POLICY_BY_EXTENSION) {
+		for (const name of policy.formatterNames) {
+			pairs.push({ where: `extension ${ext}`, name, policy });
+		}
+	}
+	for (const [filename, policy] of FORMATTER_POLICY_BY_FILENAME) {
+		for (const name of policy.formatterNames) {
+			pairs.push({ where: `filename ${filename}`, name, policy });
+		}
+	}
+	return pairs;
+}
+
+describe("every registered formatter is selectable (#1572)", () => {
+	it("the checker itself flags an unreachable synthetic entry (red-first proof)", () => {
+		// A formatter with NO explicit-config check, named as a policy's
+		// defaultFormatter, under a policy with defaultWhenUnconfigured: false —
+		// exactly psscriptanalyzer-format's pre-fix shape. Neither branch can ever
+		// pick it; the checker must say so.
+		const unreachablePolicy: FormatterPolicy = {
+			formatterNames: ["totally-synthetic-formatter"],
+			defaultFormatter: "totally-synthetic-formatter",
+			defaultWhenUnconfigured: false,
+			gate: "smart-default",
+		};
+		expect(
+			isFormatterSelectable("totally-synthetic-formatter", unreachablePolicy),
+		).toBe(false);
+
+		// Sanity check the checker doesn't just always say no: the same name is
+		// selectable once defaultWhenUnconfigured flips true, or once it gains an
+		// explicit-config check.
+		expect(
+			isFormatterSelectable("totally-synthetic-formatter", {
+				...unreachablePolicy,
+				defaultWhenUnconfigured: true,
+			}),
+		).toBe(true);
+		expect(
+			isFormatterSelectable("biome", {
+				formatterNames: ["biome"],
+				defaultFormatter: "biome",
+				defaultWhenUnconfigured: false,
+				gate: "config-first",
+			}),
+		).toBe(true);
+	});
+
+	it("every real formatter policy names only selectable formatters, or a documented #1595 exception", () => {
+		const violations = allPolicyFormatterPairs()
+			.filter(({ name, policy }) => !isFormatterSelectable(name, policy))
+			.filter(({ name }) => !KNOWN_UNREACHABLE_FORMATTERS.has(name))
+			.map(
+				({ where, name }) =>
+					`${name} (policy: ${where}) has no explicit-config check and is not a defaultWhenUnconfigured default — unselectable under any configuration`,
+			);
+		expect(violations, violations.join("\n")).toEqual([]);
+	});
+
+	it("KNOWN_UNREACHABLE_FORMATTERS names only formatters that are ACTUALLY unreachable (no stale entries)", () => {
+		const pairs = allPolicyFormatterPairs();
+		const stillUnreachable = new Set(
+			pairs
+				.filter(({ name, policy }) => !isFormatterSelectable(name, policy))
+				.map(({ name }) => name),
+		);
+		const stale = [...KNOWN_UNREACHABLE_FORMATTERS].filter(
+			(name) => !stillUnreachable.has(name),
+		);
+		expect(
+			stale,
+			stale.length
+				? `${stale.join(", ")} is/are now selectable — remove from KNOWN_UNREACHABLE_FORMATTERS (#1595 progress)`
+				: "",
+		).toEqual([]);
 	});
 });

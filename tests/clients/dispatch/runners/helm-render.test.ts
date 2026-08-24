@@ -38,15 +38,12 @@ vi.mock(
 	}),
 );
 
-const { resetProjectLensConfigCache } = await import(
-	"../../../../clients/project-lens-config.js"
-);
-const { resetProjectTrust, setProjectTrustState } = await import(
-	"../../../../clients/project-trust.js"
-);
-const { resetWorkspaceTopology } = await import(
-	"../../../../clients/workspace-topology.js"
-);
+const { resetProjectLensConfigCache } =
+	await import("../../../../clients/project-lens-config.js");
+const { resetProjectTrust, setProjectTrustState } =
+	await import("../../../../clients/project-trust.js");
+const { resetWorkspaceTopology } =
+	await import("../../../../clients/workspace-topology.js");
 const {
 	default: helmRenderRunner,
 	checkManifestShape,
@@ -85,8 +82,11 @@ function chartContentFingerprint(chartRoot: string): string[] {
 	});
 	const rows: string[] = [];
 	for (const entry of entries) {
-		const parent = (entry as unknown as { parentPath?: string; path?: string });
-		const full = path.join(parent.parentPath ?? parent.path ?? chartRoot, entry.name);
+		const parent = entry as unknown as { parentPath?: string; path?: string };
+		const full = path.join(
+			parent.parentPath ?? parent.path ?? chartRoot,
+			entry.name,
+		);
 		if (!entry.isFile()) {
 			rows.push(`dir ${path.relative(chartRoot, full)}`);
 			continue;
@@ -108,7 +108,8 @@ function optIn(config: Record<string, unknown>): void {
 
 function outputDirFrom(args: string[]): string {
 	const index = args.indexOf("--output-dir");
-	if (index < 0) throw new Error("helm template was called without --output-dir");
+	if (index < 0)
+		throw new Error("helm template was called without --output-dir");
 	return args[index + 1];
 }
 
@@ -361,9 +362,7 @@ describe("helm-render failure semantics", () => {
 
 		expect(result.semantic).toBe("blocking");
 		expect(result.diagnostics).toHaveLength(1);
-		expect(result.diagnostics[0].filePath).toBe(
-			path.join(chart, "Chart.yaml"),
-		);
+		expect(result.diagnostics[0].filePath).toBe(path.join(chart, "Chart.yaml"));
 		expect(result.diagnostics[0].message).toContain("something went wrong");
 	});
 
@@ -586,7 +585,9 @@ describe("helm-render rendered-manifest checks", () => {
 
 		expect(result).toMatchObject({ status: "succeeded", semantic: "none" });
 		expect(
-			safeSpawnAsync.mock.calls.map((call: unknown[]) => (call[1] as string[])[0]),
+			safeSpawnAsync.mock.calls.map(
+				(call: unknown[]) => (call[1] as string[])[0],
+			),
 		).toEqual(["template"]);
 	});
 
@@ -898,9 +899,7 @@ describe("helm-render rendered-manifest checks", () => {
 		expect(result.diagnostics[0].filePath).toBe(
 			path.join(chart, "templates", "deployment.yaml"),
 		);
-		expect(result.diagnostics[1].filePath).toBe(
-			path.join(chart, "Chart.yaml"),
-		);
+		expect(result.diagnostics[1].filePath).toBe(path.join(chart, "Chart.yaml"));
 	});
 
 	it("runs for a .tpl helper under the helm-template file kind", async () => {
@@ -1015,7 +1014,9 @@ describe("helm-render source mapping", () => {
 			resolveTemplateSource("chart/../outside-secret.yaml", chart),
 		).toBeNull();
 
-		expect(resolveTemplateSource("chart/templates/absent.yaml", chart)).toBeNull();
+		expect(
+			resolveTemplateSource("chart/templates/absent.yaml", chart),
+		).toBeNull();
 	});
 
 	it("refuses a template that is a symlink out of the chart", (ctx) => {
@@ -1036,7 +1037,10 @@ describe("helm-render source mapping", () => {
 		// the lstat check is what stops a chart-authored `# Source:` from pointing
 		// a diagnostic at a file outside the chart tree.
 		expect(
-			resolveTemplateSource("pi-lens-render-valid/templates/linked.yaml", chart),
+			resolveTemplateSource(
+				"pi-lens-render-valid/templates/linked.yaml",
+				chart,
+			),
 		).toBeNull();
 	});
 

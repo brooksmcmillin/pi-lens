@@ -204,7 +204,9 @@ function hasGeneratedArtifactContent(content: string): boolean {
 // an edited file misses the cache and is re-read. A single stat replaces the
 // open/read/close on a hit. Bounded to avoid unbounded growth on giant repos.
 const HEADER_VERDICT_MEMO_CAP = 50_000;
-const headerVerdictMemo = new BoundedLruCache<string, boolean>(HEADER_VERDICT_MEMO_CAP);
+const headerVerdictMemo = new BoundedLruCache<string, boolean>(
+	HEADER_VERDICT_MEMO_CAP,
+);
 
 /** Test-only: drop the header-verdict memo so fixtures don't leak across cases. */
 export function _resetGeneratedArtifactCaches(): void {
@@ -250,8 +252,7 @@ function fileHeaderLooksGenerated(filePath: string, maxBytes: number): boolean {
 	const cached = headerVerdictMemo.get(key);
 	if (cached !== undefined) return cached;
 	const header = readFileHeader(filePath, maxBytes);
-	const verdict =
-		header !== undefined && hasGeneratedArtifactContent(header);
+	const verdict = header !== undefined && hasGeneratedArtifactContent(header);
 	headerVerdictMemo.set(key, verdict);
 	return verdict;
 }

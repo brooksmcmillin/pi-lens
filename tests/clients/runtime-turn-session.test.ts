@@ -17,6 +17,7 @@ import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { SESSION_START_GUIDANCE } from "../../clients/runtime-session.js";
 import {
 	cancelLSPIdleReset,
+	getEffectiveLspIdleResetMs,
 	handleTurnEnd,
 } from "../../clients/runtime-turn.js";
 import {
@@ -102,7 +103,11 @@ describe("LSP idle reset", () => {
 				}),
 			);
 
-			await vi.advanceTimersByTimeAsync(59_999);
+			// #1618: the budget-shortened delay is now derived (Math.max against
+			// the sweep's own wall-clock ceiling + margin), so assert against the
+			// REAL computed value rather than a hand-derived literal.
+			const expectedMs = getEffectiveLspIdleResetMs();
+			await vi.advanceTimersByTimeAsync(expectedMs - 1);
 			expect(resetLSPService).not.toHaveBeenCalled();
 			await vi.advanceTimersByTimeAsync(1);
 			expect(resetLSPService).toHaveBeenCalledTimes(1);
@@ -135,7 +140,7 @@ describe("LSP idle reset", () => {
 			);
 
 			runtime.resetForSession();
-			await vi.advanceTimersByTimeAsync(240_000);
+			await vi.advanceTimersByTimeAsync(getEffectiveLspIdleResetMs());
 
 			expect(resetLSPService).not.toHaveBeenCalled();
 		} finally {
@@ -165,7 +170,7 @@ describe("LSP idle reset", () => {
 				}),
 			);
 
-			await vi.advanceTimersByTimeAsync(240_000);
+			await vi.advanceTimersByTimeAsync(getEffectiveLspIdleResetMs());
 
 			expect(resetLSPService).toHaveBeenCalledTimes(1);
 			expect(dbg).toHaveBeenCalledWith(`lsp idle reset failed: ${resetError}`);
@@ -204,7 +209,7 @@ describe("LSP idle reset", () => {
 				}),
 			);
 
-			await vi.advanceTimersByTimeAsync(240_000);
+			await vi.advanceTimersByTimeAsync(getEffectiveLspIdleResetMs());
 
 			expect(resetLSPService).toHaveBeenCalledTimes(1);
 			expect(emitWarning).toHaveBeenCalledWith(
@@ -424,14 +429,16 @@ describe("stale turn state eviction", () => {
 		const foreignState = cacheManager.readTurnState(env.tmpDir);
 		foreignState.owner!.pid = process.pid + 1;
 		cacheManager.writeTurnState(foreignState, env.tmpDir);
-		const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true as never);
+		const killSpy = vi
+			.spyOn(process, "kill")
+			.mockImplementation(() => true as never);
 		try {
 			await handleTurnEnd(
 				makeTurnEndDeps(runtime, cacheManager, { ctxCwd: env.tmpDir }),
 			);
-			expect(Object.keys(cacheManager.readTurnState(env.tmpDir).files)).toEqual([
-				"src/foreign.ts",
-			]);
+			expect(Object.keys(cacheManager.readTurnState(env.tmpDir).files)).toEqual(
+				["src/foreign.ts"],
+			);
 		} finally {
 			killSpy.mockRestore();
 			env.cleanup();
@@ -1072,7 +1079,12 @@ describe("turn_end call-graph impact — persists to the delta report", () => {
 			});
 			const cacheManager = new CacheManager(false);
 			const filePath = seedEditedFoo(env);
-			cacheManager.addModifiedRange(filePath, { start: 1, end: 1 }, false, env.tmpDir);
+			cacheManager.addModifiedRange(
+				filePath,
+				{ start: 1, end: 1 },
+				false,
+				env.tmpDir,
+			);
 
 			await handleTurnEnd(
 				makeTurnEndDeps(runtime, cacheManager, { ctxCwd: env.tmpDir }),
@@ -1081,7 +1093,9 @@ describe("turn_end call-graph impact — persists to the delta report", () => {
 			const report = loadProjectDiagnosticsDeltaReport(env.tmpDir);
 			expect(report?.sources ?? []).not.toContain("call-graph");
 			expect(report?.diagnostics ?? []).not.toEqual(
-				expect.arrayContaining([expect.objectContaining({ runner: "call-graph" })]),
+				expect.arrayContaining([
+					expect.objectContaining({ runner: "call-graph" }),
+				]),
 			);
 		} finally {
 			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
@@ -1463,7 +1477,12 @@ describe("turn_end gitleaks findings for deleted files", () => {
 	function writeGitleaksCache(
 		cacheManager: CacheManager,
 		cwd: string,
-		findings: Array<{ ruleId: string; file: string; startLine: number; description: string }>,
+		findings: Array<{
+			ruleId: string;
+			file: string;
+			startLine: number;
+			description: string;
+		}>,
 	) {
 		cacheManager.writeCache(
 			"gitleaks",
@@ -1473,7 +1492,8 @@ describe("turn_end gitleaks findings for deleted files", () => {
 	}
 
 	it("does NOT deliver a cached finding whose file was deleted after the scan", async () => {
-		const { env, runtime, cacheManager } = setupSecretTurn("pi-lens-dead-path-");
+		const { env, runtime, cacheManager } =
+			setupSecretTurn("pi-lens-dead-path-");
 		try {
 			const deletedDir = path.join(env.tmpDir, ".pi/smoke-research/data");
 			const deletedFile = path.join(deletedDir, "sources.json");
@@ -1506,7 +1526,9 @@ describe("turn_end gitleaks findings for deleted files", () => {
 	});
 
 	it("delivers live-path findings unchanged and drops only the dead ones", async () => {
-		const { env, runtime, cacheManager } = setupSecretTurn("pi-lens-mixed-path-");
+		const { env, runtime, cacheManager } = setupSecretTurn(
+			"pi-lens-mixed-path-",
+		);
 		try {
 			const liveFile = path.join(env.tmpDir, "src/config.ts");
 			fs.writeFileSync(liveFile, "const k = 'AKIA...';\n");
@@ -1598,6 +1620,137 @@ describe("turn_end license-risk surfacing", () => {
 					?.content ?? "";
 			expect(content).toContain("Dependency license risk");
 			expect(content).toContain("leftpad — GPL-3.0 (HIGH, restricted)");
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+// ── #1634: trivy CRITICAL/advisory/license reports carry an explicit cache
+// age — package-pinned findings have no cited file:line to freshness-gate,
+// so the session_start cache's age is stated instead of presenting a
+// (possibly hours-old) 🔴 STOP blocker as current. See
+// clients/finding-delivery-gate.ts for the shared rationale/formatter.
+
+describe("turn_end trivy dependency-CVE/license reports — explicit cache age (#1634)", () => {
+	it("states the trivy scan age on a CRITICAL blocker, a non-critical advisory, and the license advisory", async () => {
+		const env = setupTestEnvironment("pi-lens-trivy-age-");
+		try {
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId: "trivy-age-session" });
+			const cacheManager = new CacheManager(false);
+
+			const file = path.join(env.tmpDir, "src/a.ts");
+			fs.mkdirSync(path.dirname(file), { recursive: true });
+			fs.writeFileSync(file, "export const x = 1;\n");
+			cacheManager.addModifiedRange(
+				file,
+				{ start: 1, end: 1 },
+				false,
+				env.tmpDir,
+				"trivy-age-session",
+			);
+
+			const scannedAt = new Date(Date.now() - 45 * 60_000).toISOString();
+			cacheManager.writeCache(
+				"trivy",
+				{
+					success: true,
+					scannedAt,
+					findings: [
+						{
+							vulnerabilityId: "CVE-2026-0001",
+							pkgName: "left-pad",
+							installedVersion: "1.0.0",
+							fixedVersion: "1.0.1",
+							severity: "CRITICAL",
+						},
+						{
+							vulnerabilityId: "CVE-2026-0002",
+							pkgName: "right-pad",
+							installedVersion: "2.0.0",
+							severity: "MEDIUM",
+						},
+					],
+					secrets: [],
+					licenses: [
+						{
+							license: "GPL-3.0",
+							pkgName: "leftpad",
+							severity: "HIGH",
+							category: "restricted",
+						},
+					],
+				},
+				env.tmpDir,
+			);
+
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, { ctxCwd: env.tmpDir }),
+			);
+
+			const content =
+				consumeTurnEndFindings(cacheManager, env.tmpDir)?.messages?.[0]
+					?.content ?? "";
+			expect(content).toContain(
+				"CRITICAL dependency CVEs (trivy, scanned 45m ago)",
+			);
+			expect(content).toContain("Dependency CVEs (trivy, scanned 45m ago)");
+			expect(content).toContain(
+				"Dependency license risk (trivy, scanned 45m ago)",
+			);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("degrades to an honest unknown-age label rather than fabricating one from a missing scannedAt", async () => {
+		const env = setupTestEnvironment("pi-lens-trivy-age-unknown-");
+		try {
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId: "trivy-age-unknown-session" });
+			const cacheManager = new CacheManager(false);
+
+			const file = path.join(env.tmpDir, "src/a.ts");
+			fs.mkdirSync(path.dirname(file), { recursive: true });
+			fs.writeFileSync(file, "export const x = 1;\n");
+			cacheManager.addModifiedRange(
+				file,
+				{ start: 1, end: 1 },
+				false,
+				env.tmpDir,
+				"trivy-age-unknown-session",
+			);
+
+			cacheManager.writeCache(
+				"trivy",
+				{
+					success: true,
+					scannedAt: "",
+					findings: [
+						{
+							vulnerabilityId: "CVE-2026-0003",
+							pkgName: "up-pad",
+							installedVersion: "3.0.0",
+							severity: "CRITICAL",
+						},
+					],
+					secrets: [],
+					licenses: [],
+				},
+				env.tmpDir,
+			);
+
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, { ctxCwd: env.tmpDir }),
+			);
+
+			const content =
+				consumeTurnEndFindings(cacheManager, env.tmpDir)?.messages?.[0]
+					?.content ?? "";
+			expect(content).toContain(
+				"CRITICAL dependency CVEs (trivy, scan age unknown)",
+			);
 		} finally {
 			env.cleanup();
 		}
@@ -1706,21 +1859,49 @@ describe("turn_end test runner — stale results are cached, not discarded", () 
 			fs.mkdirSync(path.dirname(srcFile), { recursive: true });
 			fs.writeFileSync(srcFile, "export const x = 1;\n");
 			fs.writeFileSync(testFile, "test('x', () => {});\n");
-			cacheManager.addModifiedRange(srcFile, { start: 1, end: 1 }, false, env.tmpDir, "rewrite-session");
+			cacheManager.addModifiedRange(
+				srcFile,
+				{ start: 1, end: 1 },
+				false,
+				env.tmpDir,
+				"rewrite-session",
+			);
 			let resolveRun!: (value: any) => void;
-			const run = new Promise<any>((resolve) => { resolveRun = resolve; });
-			await handleTurnEnd(makeTurnEndDeps(runtime, cacheManager, {
-				ctxCwd: env.tmpDir,
-				testRunnerClient: {
-					getTestRunTarget: () => ({ testFile, runner: "vitest", config: {}, strategy: "related" as const }),
-					runTestFileAsync: () => run,
-					formatResult: () => "rewrite failure",
-				},
-			}));
+			const run = new Promise<any>((resolve) => {
+				resolveRun = resolve;
+			});
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, {
+					ctxCwd: env.tmpDir,
+					testRunnerClient: {
+						getTestRunTarget: () => ({
+							testFile,
+							runner: "vitest",
+							config: {},
+							strategy: "related" as const,
+						}),
+						runTestFileAsync: () => run,
+						formatResult: () => "rewrite failure",
+					},
+				}),
+			);
 			fs.writeFileSync(srcFile, "export const x = 2;\n");
-			resolveRun({ file: testFile, sourceFile: srcFile, runner: "vitest", passed: 0, failed: 1, skipped: 0, failures: [], duration: 1 });
+			resolveRun({
+				file: testFile,
+				sourceFile: srcFile,
+				runner: "vitest",
+				passed: 0,
+				failed: 1,
+				skipped: 0,
+				failures: [],
+				duration: 1,
+			});
 			await new Promise((resolve) => setImmediate(resolve));
-			const cached = cacheManager.readCache<{ superseded?: boolean; launchedFrom?: unknown; publishedAgainst?: unknown }>("test-runner-findings", env.tmpDir)?.data;
+			const cached = cacheManager.readCache<{
+				superseded?: boolean;
+				launchedFrom?: unknown;
+				publishedAgainst?: unknown;
+			}>("test-runner-findings", env.tmpDir)?.data;
 			expect(runtime.turnIndex).toBe(0);
 			expect(cached).toMatchObject({ superseded: true });
 			expect(cached?.launchedFrom).toBeDefined();
@@ -1743,22 +1924,64 @@ describe("turn_end test runner — stale results are cached, not discarded", () 
 			fs.writeFileSync(testFile, "test('x', () => {});\n");
 			const resolvers: Array<(value: any) => void> = [];
 			const runner = {
-				getTestRunTarget: () => ({ testFile, runner: "vitest", config: {}, strategy: "related" as const }),
-				runTestFileAsync: () => new Promise<any>((resolve) => resolvers.push(resolve)),
-				formatResult: (result: { duration: number }) => `generation-${result.duration}`,
+				getTestRunTarget: () => ({
+					testFile,
+					runner: "vitest",
+					config: {},
+					strategy: "related" as const,
+				}),
+				runTestFileAsync: () =>
+					new Promise<any>((resolve) => resolvers.push(resolve)),
+				formatResult: (result: { duration: number }) =>
+					`generation-${result.duration}`,
 			};
 			const fire = async () => {
-				cacheManager.addModifiedRange(srcFile, { start: 1, end: 1 }, false, env.tmpDir, "generation-session");
-				await handleTurnEnd(makeTurnEndDeps(runtime, cacheManager, { ctxCwd: env.tmpDir, testRunnerClient: runner }));
+				cacheManager.addModifiedRange(
+					srcFile,
+					{ start: 1, end: 1 },
+					false,
+					env.tmpDir,
+					"generation-session",
+				);
+				await handleTurnEnd(
+					makeTurnEndDeps(runtime, cacheManager, {
+						ctxCwd: env.tmpDir,
+						testRunnerClient: runner,
+					}),
+				);
 			};
 			await fire();
 			await fire();
-			resolvers[1]!({ file: testFile, sourceFile: srcFile, runner: "vitest", passed: 0, failed: 1, skipped: 0, failures: [], duration: 2 });
+			resolvers[1]!({
+				file: testFile,
+				sourceFile: srcFile,
+				runner: "vitest",
+				passed: 0,
+				failed: 1,
+				skipped: 0,
+				failures: [],
+				duration: 2,
+			});
 			await new Promise((resolve) => setImmediate(resolve));
-			resolvers[0]!({ file: testFile, sourceFile: srcFile, runner: "vitest", passed: 0, failed: 1, skipped: 0, failures: [], duration: 1 });
+			resolvers[0]!({
+				file: testFile,
+				sourceFile: srcFile,
+				runner: "vitest",
+				passed: 0,
+				failed: 1,
+				skipped: 0,
+				failures: [],
+				duration: 1,
+			});
 			await new Promise((resolve) => setImmediate(resolve));
-			const cached = cacheManager.readCache<{ content: string; testRunGeneration: number }>("test-runner-findings", env.tmpDir)?.data;
-			expect(cached).toMatchObject({ content: "generation-2", testRunGeneration: 2 });
+			const cached = cacheManager.readCache<{
+				content: string;
+				testRunGeneration: number;
+			}>("test-runner-findings", env.tmpDir)?.data;
+			expect(cached).toMatchObject({
+				content: "generation-2",
+				testRunGeneration: 2,
+			});
 		} finally {
 			env.cleanup();
 		}
@@ -1775,22 +1998,52 @@ describe("turn_end test runner — stale results are cached, not discarded", () 
 			fs.mkdirSync(path.dirname(srcFile), { recursive: true });
 			fs.writeFileSync(srcFile, "export const x = 1;\n");
 			fs.writeFileSync(testFile, "test('x', () => {});\n");
-			cacheManager.addModifiedRange(srcFile, { start: 1, end: 1 }, false, env.tmpDir, "empty-consume-session");
+			cacheManager.addModifiedRange(
+				srcFile,
+				{ start: 1, end: 1 },
+				false,
+				env.tmpDir,
+				"empty-consume-session",
+			);
 			let resolveRun!: (value: any) => void;
-			const run = new Promise<any>((resolve) => { resolveRun = resolve; });
-			await handleTurnEnd(makeTurnEndDeps(runtime, cacheManager, {
-				ctxCwd: env.tmpDir,
-				testRunnerClient: {
-					getTestRunTarget: () => ({ testFile, runner: "vitest", config: {}, strategy: "related" as const }),
-					runTestFileAsync: () => run,
-					formatResult: () => "late failure",
-				},
-			}));
-			expect(consumeTestFindings(cacheManager, env.tmpDir, runtime)).toBeUndefined();
-			resolveRun({ file: testFile, sourceFile: srcFile, runner: "vitest", passed: 0, failed: 1, skipped: 0, failures: [], duration: 1 });
+			const run = new Promise<any>((resolve) => {
+				resolveRun = resolve;
+			});
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, {
+					ctxCwd: env.tmpDir,
+					testRunnerClient: {
+						getTestRunTarget: () => ({
+							testFile,
+							runner: "vitest",
+							config: {},
+							strategy: "related" as const,
+						}),
+						runTestFileAsync: () => run,
+						formatResult: () => "late failure",
+					},
+				}),
+			);
+			expect(
+				consumeTestFindings(cacheManager, env.tmpDir, runtime),
+			).toBeUndefined();
+			resolveRun({
+				file: testFile,
+				sourceFile: srcFile,
+				runner: "vitest",
+				passed: 0,
+				failed: 1,
+				skipped: 0,
+				failures: [],
+				duration: 1,
+			});
 			await new Promise((resolve) => setImmediate(resolve));
-			expect(cacheManager.readCache<{ content: string }>("test-runner-findings", env.tmpDir)?.data?.content)
-				.toBe("late failure");
+			expect(
+				cacheManager.readCache<{ content: string }>(
+					"test-runner-findings",
+					env.tmpDir,
+				)?.data?.content,
+			).toBe("late failure");
 		} finally {
 			env.cleanup();
 		}
@@ -1901,7 +2154,9 @@ describe("turn_end test runner — a runner-error result does not clear a real g
 				"[Tests] ✗ 0/1 passed — go",
 				[goTestFile],
 			);
-			expect(evaluateGitGuard(runtime, cacheManager, env.tmpDir).block).toBe(true);
+			expect(evaluateGitGuard(runtime, cacheManager, env.tmpDir).block).toBe(
+				true,
+			);
 
 			const runnerErrorResult = {
 				file: goTestFile,
@@ -1926,7 +2181,11 @@ describe("turn_end test runner — a runner-error result does not clear a real g
 							strategy: "related" as const,
 						}),
 						runTestFileAsync: async () => runnerErrorResult,
-						formatResult: (r: { error?: string; passed: number; failed: number }) =>
+						formatResult: (r: {
+							error?: string;
+							passed: number;
+							failed: number;
+						}) =>
 							r.error && r.passed === 0 && r.failed === 0
 								? `[Tests] ⚠ Could not run tests: ${r.error}`
 								: "",
@@ -1937,7 +2196,9 @@ describe("turn_end test runner — a runner-error result does not clear a real g
 
 			// The prior real test-failure blocker must still be in force — a
 			// suite that never started must not read as a pass that clears it.
-			expect(evaluateGitGuard(runtime, cacheManager, env.tmpDir).block).toBe(true);
+			expect(evaluateGitGuard(runtime, cacheManager, env.tmpDir).block).toBe(
+				true,
+			);
 		} finally {
 			env.cleanup();
 		}
@@ -2055,7 +2316,10 @@ describe("turn_end test runner — cascade neighbors get their own test companio
 			const neighborFile = path.join(env.tmpDir, "src/bar.ts");
 			fs.mkdirSync(path.dirname(editedFile), { recursive: true });
 			fs.writeFileSync(editedFile, "export const x = 1;\n");
-			fs.writeFileSync(neighborFile, "import { x } from './foo'; export const y = x;\n");
+			fs.writeFileSync(
+				neighborFile,
+				"import { x } from './foo'; export const y = x;\n",
+			);
 
 			cacheManager.addModifiedRange(
 				editedFile,

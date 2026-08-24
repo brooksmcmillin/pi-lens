@@ -17,23 +17,34 @@ import {
 	anchorsForDiagnostic,
 	applyDispositions,
 	applyWeakDispositions,
+	hasAnyDispositionMarks,
+	hasStrictDispositionMarks,
 	getDisposition,
 	type DispositionCandidate,
 } from "../clients/diagnostic-dispositions.js";
+import { freshnessFromMtime } from "../clients/freshness.js";
 import { applyInlineSuppressions } from "../clients/dispatch/inline-suppressions.js";
+import { gateFindingsByPathFreshness } from "../clients/advisory-provenance.js";
 import { normalizeRuleId } from "../clients/dispatch/rule-id-normalize.js";
-import { applyRulePolicy, rulePolicyMapFromConfig } from "../clients/dispatch/rule-policy.js";
+import {
+	applyRulePolicy,
+	rulePolicyMapFromConfig,
+} from "../clients/dispatch/rule-policy.js";
 import { loadPiLensProjectConfig } from "../clients/project-lens-config.js";
 import { compactRenderResult } from "./render-compact.js";
 import { combineAbortSignals } from "../clients/deadline-utils.js";
 import { getProjectIgnoreMatcher } from "../clients/file-utils.js";
 import {
 	isAtOrAboveHomeDir,
+	normalizeEphemeralMapKey,
 	normalizeFilePath,
 } from "../clients/path-utils.js";
 import { getLSPService } from "../clients/lsp/index.js";
 import { primaryServerId } from "../clients/lsp/config.js";
 import type { LSPDiagnostic } from "../clients/lsp/client.js";
+import type { LSPWorkspaceUnconfirmedReason } from "../clients/lsp/index.js";
+import { getFullScanWallClockMs } from "../clients/lsp/workspace-sweep-hold.js";
+import { demoteInferredProjectSweepResults } from "../clients/lsp/inferred-project.js";
 import {
 	hashDiagnosticContent,
 	type BoundToCurrentDisk,
@@ -45,9 +56,15 @@ import {
 	PROJECT_DIAGNOSTICS_CACHE_VERSION,
 	reconcileProjectDiagnosticsSnapshot,
 } from "../clients/project-diagnostics/cache.js";
-import { warmTriggerFor } from "../clients/project-diagnostics/extractors.js";
+import {
+	formatCacheAgeOld,
+	formatNotRunEntry,
+} from "../clients/project-diagnostics/extractors.js";
 import type { FreshProjectDiagnosticsResult } from "../clients/project-diagnostics/fresh-fetch.js";
-import { fetchFreshProjectDiagnostics } from "../clients/project-diagnostics/fresh-fetch.js";
+import {
+	ANALYZER_IDS,
+	fetchFreshProjectDiagnostics,
+} from "../clients/project-diagnostics/fresh-fetch.js";
 import { loadBootstrapClients } from "../clients/bootstrap.js";
 import {
 	generatedSkipNotice,
@@ -64,14 +81,24 @@ import type { CodeQualityWarningsReport } from "../clients/code-quality-warnings
 import {
 	getFileDiagnosticSummaries,
 	type FileDiagnosticSummary,
+	reconcileCorrelatedScanDiagnostics,
 	reconcileScanDiagnostics,
+	reconcileStaleWidgetDependencyBlockers,
 	reconcileStaleWidgetFiles,
 	type WidgetDiagnostic,
+	widgetDiagnosticUri,
 } from "../clients/widget-state.js";
+import { logLatency } from "../clients/latency-logger.js";
 import { convertLspDiagnostics } from "../clients/dispatch/utils/lsp-diagnostics.js";
 import { retagAuxiliaryDiagnostics } from "../clients/dispatch/auxiliary-lsp.js";
 import { detectFileRole } from "../clients/file-role.js";
+import { STALE_LINE_MARKER } from "../clients/stale-marker.js";
 import { makeProgressReporter, scanningSummaryLine } from "./scan-progress.js";
+import {
+	demotePastEofDiagnostics,
+	PAST_EOF_STALE_MARKER,
+	resyncDocumentOnPastEof,
+} from "../clients/diagnostic-line-freshness.js";
 
 // The widget state exposes the full per-file diagnostic set; this is the tool's
 // own generous display budget per file (independent of the TUI's 12 cap), to
@@ -84,6 +111,15 @@ const MAX_DIAGNOSTICS_PER_FILE = 50;
 // caller can never believe it checked files it didn't (issue's stated
 // invariant).
 const MAX_PATHS_ENTRIES = 200;
+
+// #1623: the reason rendered for every heavyweight-analyzer lane (gitleaks,
+// trivy, govulncheck, dead-code, knip, jscpd, madge, opengrep, test-runner)
+// when mode=full is called without refreshRunners=cheap/all/cached — the
+// "quick mode" gate that skips the expensive fresh-fetch entirely (see
+// `formatFullMode`'s `analyzersPromise`). One shared string so it renders
+// identically everywhere it's used.
+const NOT_REQUESTED_REASON =
+	"refreshRunners not requested this call (quick mode) — pass refreshRunners=cheap/all/cached to lens_diagnostics mode=full to run it";
 
 type LSPServiceLike = ReturnType<typeof getLSPService> & {
 	runWorkspaceDiagnostics?: (
@@ -99,7 +135,6 @@ type LSPServiceLike = ReturnType<typeof getLSPService> & {
 	) => Promise<WorkspaceLspDiagnosticResult[]>;
 };
 
-
 type WorkspaceLspDiagnosticResult = {
 	filePath: string;
 	diagnostics: LSPDiagnostic[];
@@ -109,6 +144,11 @@ type WorkspaceLspDiagnosticResult = {
 	// file's per-file check didn't complete within budget (or threw), so
 	// `diagnostics` is a default-empty placeholder, not a confirmed result.
 	timedOut?: boolean;
+	// #1618: WHY `timedOut` is true — see LSPWorkspaceUnconfirmedReason.
+	unconfirmedReason?: LSPWorkspaceUnconfirmedReason;
+	// Auxiliary lanes that did not answer. Other servers' diagnostics remain
+	// usable, but this result must not replace fully-covered cached/widget state.
+	unconfirmedServerIds?: string[];
 	// #1093: set only for cache-hit results (a replay of an older scan) — the
 	// wall-clock time the diagnostics were originally observed. Threaded into the
 	// footer reconcile so a cache-served mode=full doesn't re-arm the widget's
@@ -124,10 +164,11 @@ type WorkspaceLspDiagnosticResult = {
 // spawn/initialize across many files) could otherwise stall the tool
 // indefinitely — an unattended session was observed hung for ~8h. This hard cap
 // aborts the scan so it always returns (partial) rather than never. Env-tunable.
-const FULL_SCAN_WALL_CLOCK_MS = (() => {
-	const raw = Number(process.env.PI_LENS_LENS_DIAGNOSTICS_FULL_TIMEOUT_MS);
-	return Number.isFinite(raw) && raw > 0 ? raw : 300_000; // 5 min default
-})();
+// #1618: single source with `clients/runtime-turn.ts`'s idle-reset base delay
+// (see `getBaseLspIdleResetMs`), which derives itself from this value so the
+// two constants can no longer drift back into the idle-reset-fires-mid-sweep
+// relationship that caused #1618 in the first place.
+const FULL_SCAN_WALL_CLOCK_MS = getFullScanWallClockMs();
 
 // Binding verification is a fallback for result producers that supplied a
 // content hash without an already-computed disk verdict. Keep it one-file-at-a-
@@ -278,6 +319,17 @@ export function createLensDiagnosticsTool(
 					return `lens_diagnostics delta — clean${coldSuffix}${failedSuffix}`;
 				return `lens_diagnostics delta — ${aw} actionable · ${cq} quality · ${pd} project${coldSuffix}${failedSuffix}`;
 			}
+			// #1799: `semantic === "blocking"` iff `severity === "error"` holds for
+			// RAW classification, but not for the rendered counts — a
+			// dependency-drift demotion (#1631, widget-state.ts `isBlocking` vs
+			// `countDiagnostics`) revokes an error's blocking authority (stale)
+			// while the finding itself stays real evidence, so it lands in
+			// `totalErrors` with `totalBlocking` unchanged. That is the one case
+			// where the two totals genuinely disagree, and it must still render —
+			// otherwise a file with drift-demoted errors reads as "clean". What
+			// must NOT happen is printing both terms for the SAME findings (the
+			// actual #1799 bug), so `errors` renders only when `blocking === 0`,
+			// mirroring the per-file row's own guard below.
 			const b = details?.totalBlocking ?? 0;
 			const e = details?.totalErrors ?? 0;
 			const w = details?.totalWarnings ?? 0;
@@ -285,7 +337,10 @@ export function createLensDiagnosticsTool(
 			if (b + e + w === 0) {
 				return `lens_diagnostics ${mode} — clean (${files} files)${coldSuffix}${failedSuffix}`;
 			}
-			return `lens_diagnostics ${mode} — ${b} blocking · ${e} errors · ${w} warnings (${files} files)${coldSuffix}${failedSuffix}`;
+			const parts = [`${b} blocking`];
+			if (b === 0 && e > 0) parts.push(`${e} errors`);
+			parts.push(`${w} warnings`);
+			return `lens_diagnostics ${mode} — ${parts.join(" · ")} (${files} files)${coldSuffix}${failedSuffix}`;
 		}),
 		parameters: Type.Object({
 			mode: Type.Optional(
@@ -340,7 +395,7 @@ export function createLensDiagnosticsTool(
 						`Restrict any mode to an explicit file/directory list (max ${MAX_PATHS_ENTRIES} entries; ` +
 						"more errors instead of silently truncating). Entries may be relative " +
 						"(resolved against cwd) or absolute, and a directory entry matches all " +
-						"files under it (e.g. \"src/\"). mode=delta/all are a pure post-filter " +
+						'files under it (e.g. "src/"). mode=delta/all are a pure post-filter ' +
 						"of cached/session state — they can only show findings for files pi-lens " +
 						"has already dispatched, so an unseen file shows nothing (use mode=full " +
 						"for an active scan). mode=full actively scans exactly these paths (LSP " +
@@ -408,6 +463,28 @@ export function createLensDiagnosticsTool(
 			const staleDropped = await reconcileStaleWidgetFiles();
 
 			if (mode === "all") {
+				// #1631 dependency-axis gate for the mode=all store. `reconcileStaleWidgetFiles`
+				// (above) only sees the diagnosed file's OWN mtime; this demotes blocking
+				// findings whose forward imports drifted out-of-band. Paired reconciles, one
+				// read site — the same gate that covers the turn-end inline-blocker store.
+				const dependencyGateStart = Date.now();
+				const { demoted: dependencyDemoted, truncatedImports } =
+					await reconcileStaleWidgetDependencyBlockers(
+						cwd,
+						getRuntime?.()?.turnIndex,
+					);
+				logLatency({
+					type: "phase",
+					toolName: "lens_diagnostics",
+					filePath: cwd,
+					phase: "blocker_freshness_widget_gate",
+					durationMs: Date.now() - dependencyGateStart,
+					metadata: {
+						demoted: dependencyDemoted,
+						truncatedImports,
+						surface: "mode=all",
+					},
+				});
 				return formatAllMode(
 					cwd,
 					severity,
@@ -415,6 +492,7 @@ export function createLensDiagnosticsTool(
 					undefined,
 					staleDropped,
 					pathsScope,
+					dependencyDemoted,
 				);
 			}
 			if (mode === "full") {
@@ -447,15 +525,36 @@ export function createLensDiagnosticsTool(
 
 // ── delta mode ────────────────────────────────────────────────────────────────
 
-function formatProjectDeltaDiagnostic(diagnostic: ProjectDiagnostic): string {
-	const marker =
-		diagnostic.semantic === "blocking" || diagnostic.severity === "error"
+function formatProjectDeltaDiagnostic(
+	diagnostic: ProjectDiagnostic,
+	stale: boolean,
+): string {
+	// #1944: a demoted row loses the authority marker along with its
+	// coordinate. It kept the 🔴 while its line was replaced by the stale
+	// marker, which is the same "changed the channel, not the body" defect the
+	// turn-end advisory carried — `formatFullMode` (this file, the `d.stale`
+	// arm of its marker) already drops the marker for exactly this reason.
+	const marker = stale
+		? "○"
+		: diagnostic.semantic === "blocking" || diagnostic.severity === "error"
 			? "🔴"
 			: "ℹ";
 	const rule = diagnostic.rule ?? diagnostic.code ?? diagnostic.runner;
-	return `  ${marker} L${diagnostic.line ?? "?"}  ${rule}  ${diagnostic.message}`;
+	const where = stale ? STALE_LINE_MARKER : `L${diagnostic.line ?? "?"}`;
+	return `  ${marker} ${where}  ${rule}  ${diagnostic.message}`;
 }
 
+/**
+ * #1634 review round R3: `appendProjectDiagnosticsDeltaLines` re-serves the
+ * persisted project-diagnostics DELTA report verbatim — the third of
+ * `mode=delta`'s three arms (the other two, actionable/quality warnings, were
+ * gated in the F3 pass above), and it carried the identical unfixed shape:
+ * cited `file:line` findings from a report with its own `generatedAt`, no
+ * freshness check. Same gate, same policy as `applyDeltaFreshnessGate`:
+ * missing file -> DROP, edited-since -> DEMOTE (loses its line, keeps
+ * rule/message), live -> unchanged. See `clients/finding-delivery-gate.ts`
+ * surface `lens-diagnostics:mode-delta`.
+ */
 function appendProjectDiagnosticsDeltaLines(
 	lines: string[],
 	cwd: string,
@@ -463,11 +562,27 @@ function appendProjectDiagnosticsDeltaLines(
 	severity: string,
 	includeFile: (filePath: string) => boolean,
 ): number {
-	const diagnostics = (report?.diagnostics ?? []).filter(
+	const scoped = (report?.diagnostics ?? []).filter(
 		(diagnostic) =>
 			includeFile(diagnostic.filePath) &&
-			matchesSeverity(projectDiagnosticToWidget(diagnostic), severity),
+			matchesSeverity(
+				projectDiagnosticToWidget(diagnostic, diagnostic.filePath),
+				severity,
+			),
 	);
+	const gated = gateFindingsByPathFreshness({
+		store: "lens-diagnostics-delta-project",
+		findings: scoped,
+		cwd,
+		scannedAt: report?.generatedAt,
+		citedPath: (d) => d.filePath,
+		onMissing: "drop",
+	});
+	const staleSet = new Set(gated.stale);
+	// Concatenating live-then-stale reorders a file's demoted rows to the end
+	// of its bucket below (rather than each diagnostic's original report
+	// order) — cosmetic only, findings are neither dropped nor duplicated.
+	const diagnostics = [...gated.live, ...gated.stale];
 	const byFile = new Map<string, ProjectDiagnostic[]>();
 	for (const diagnostic of diagnostics) {
 		const filePath = path.resolve(diagnostic.filePath);
@@ -479,10 +594,118 @@ function appendProjectDiagnosticsDeltaLines(
 		const rel = path.relative(cwd, filePath);
 		if (!lines.includes(rel)) lines.push(rel);
 		for (const diagnostic of fileDiagnostics) {
-			lines.push(formatProjectDeltaDiagnostic(diagnostic));
+			lines.push(
+				formatProjectDeltaDiagnostic(diagnostic, staleSet.has(diagnostic)),
+			);
 		}
 	}
 	return diagnostics.length;
+}
+
+/**
+ * Bounded content memo for {@link applyCachedDispositions}' strict-immediate
+ * path: one read per (file revision), not per query. Keyed through
+ * `normalizeEphemeralMapKey` (cheap slash-fold + win32-lowercase — these keys
+ * are produced and consumed inside this process only) and validated against a
+ * fresh stat's mtimeMs+size on every hit, so an edit invalidates without a
+ * TTL. Insertion-ordered LRU cap bounds resident source bytes; repeated
+ * queries and multi-file reports that cite the same file reuse one read.
+ */
+const CACHED_CONTENT_MEMO_CAP = 64;
+const cachedContentMemo = new Map<
+	string,
+	{ mtimeMs: number; size: number; content: string }
+>();
+
+function readContentForAnchors(
+	filePath: string,
+	stat: fsSync.Stats,
+): string | undefined {
+	const key = normalizeEphemeralMapKey(filePath);
+	const hit = cachedContentMemo.get(key);
+	if (hit && hit.mtimeMs === stat.mtimeMs && hit.size === stat.size) {
+		// Refresh LRU position.
+		cachedContentMemo.delete(key);
+		cachedContentMemo.set(key, hit);
+		return hit.content;
+	}
+	let content: string;
+	try {
+		content = fsSync.readFileSync(filePath, "utf-8");
+	} catch {
+		return undefined;
+	}
+	if (cachedContentMemo.size >= CACHED_CONTENT_MEMO_CAP) {
+		const oldest = cachedContentMemo.keys().next().value;
+		if (oldest !== undefined) cachedContentMemo.delete(oldest);
+	}
+	cachedContentMemo.set(key, {
+		mtimeMs: stat.mtimeMs,
+		size: stat.size,
+		content,
+	});
+	return content;
+}
+
+/**
+ * ONE disposition seam for every cache-only lens_diagnostics surface —
+ * mode=all summaries, mode=delta's actionable/quality warnings, the delta
+ * project-diagnostics report, and the empty-delta carried-over note. Cached
+ * findings predate any lens_diagnostic_mark, so each surface must re-apply
+ * dispositions at query time; before this seam each site hand-picked its own
+ * variant and three of them served stale STRICT false-positive marks via the
+ * weak-only filter (a weak filter can never drop a strict-anchored mark, nor
+ * any blocking finding — #1625 F1).
+ *
+ * Strict-immediate path: stat the file once, then compare its mtime against
+ * the newest cached diagnostic's own observation stamp through the freshness
+ * kernel (`freshnessFromMtime`). Fresh or stamp-less means the current bytes
+ * still describe what these findings were observed against, so the content is
+ * read (memoized per revision above) and the FULL applyDispositions filter
+ * runs — a fresh false-positive mark converges immediately, including on
+ * blocking findings.
+ *
+ * Weak fallback (zero further I/O): a file that is gone/unreadable, or whose
+ * mtime moved AFTER these diagnostics were observed. Stale-content edge: the
+ * cached findings describe a superseded revision, so their line numbers may no
+ * longer align with the lines a mark hashed; deriving strict anchors from the
+ * new content could match a DIFFERENT occurrence that merely shares the line
+ * number and identical text, so the mark waits for the next real dispatch to
+ * re-derive both sides against matching revisions. Weak suppress/defer marks
+ * are intent-level and never look at content, so they keep applying here.
+ */
+function applyCachedDispositions<
+	T extends DispositionCandidate & { observedAt?: number },
+>(cachedDiagnostics: T[], cwd: string, filePath: string): T[] {
+	// Zero-I/O fast paths (#1625 F2 precedent): with no marks at all there is
+	// nothing to filter; with only weak suppress/defer marks a strict anchor
+	// can never match, so the weak filter serves them without any stat/read.
+	if (!hasAnyDispositionMarks(cwd)) return cachedDiagnostics;
+	if (!hasStrictDispositionMarks(cwd)) {
+		return applyWeakDispositions(cachedDiagnostics, cwd, filePath);
+	}
+	let stat: fsSync.Stats;
+	try {
+		stat = fsSync.statSync(filePath);
+	} catch {
+		return applyWeakDispositions(cachedDiagnostics, cwd, filePath);
+	}
+	const referenceMs = cachedDiagnostics.reduce<number>(
+		(latest, d) => Math.max(latest, d.observedAt ?? 0),
+		0,
+	);
+	if (
+		referenceMs > 0 &&
+		freshnessFromMtime({ mtimeMs: stat.mtimeMs, referenceMs }).verdict ===
+			"stale"
+	) {
+		return applyWeakDispositions(cachedDiagnostics, cwd, filePath);
+	}
+	const content = readContentForAnchors(filePath, stat);
+	if (content === undefined) {
+		return applyWeakDispositions(cachedDiagnostics, cwd, filePath);
+	}
+	return applyDispositions(cachedDiagnostics, cwd, filePath, content);
 }
 
 /**
@@ -490,7 +713,9 @@ function appendProjectDiagnosticsDeltaLines(
  * delta mode re-serves them. Anchored via `projectDiagnosticToWidget` so the
  * (tool, rule) an agent's mark binds to matches mode=full's own project-runner
  * filter (`applyInlineSuppressionsToSummaries`), keeping the two paths in
- * agreement. Weak-anchored → no file read. Also applies the project's
+ * agreement. Goes through the shared {@link applyCachedDispositions} seam so
+ * strict false-positive anchors apply immediately, like every other cache-only
+ * surface. Also applies the project's
  * `.pi-lens.json` `rules.<id>.disable`/`select` policy so a project's policy
  * overlays the same delta report cache; the cache is otherwise insensitive to
  * a project-config edit (the per-edit path picks it up immediately, but a
@@ -504,8 +729,11 @@ function filterDeltaReportDispositions(
 	if (!report?.diagnostics.length) return report;
 	const kept = report.diagnostics.filter(
 		(d) =>
-			applyWeakDispositions([projectDiagnosticToWidget(d)], cwd, d.filePath)
-				.length === 1,
+			applyCachedDispositions(
+				[projectDiagnosticToWidget(d, d.filePath)],
+				cwd,
+				d.filePath,
+			).length === 1,
 	);
 	const policyKept = applyRulePolicy(kept, policyMap);
 	if (policyKept.length === report.diagnostics.length) return report;
@@ -524,6 +752,61 @@ function loadProjectRulePolicyMap(cwd: string) {
 	return rulePolicyMapFromConfig(loadPiLensProjectConfig(cwd).rules);
 }
 
+/**
+ * #1634 review round: `formatDeltaMode` re-serves the `actionable-warnings`/
+ * `code-quality-warnings` caches verbatim — each cited `file:line`, no
+ * freshness check — the SAME shape #1622 fixed for gitleaks/trivy-secrets,
+ * unfixed here because `mode=delta` is the tool's DEFAULT and easy to miss
+ * in a per-store sweep. Both reports carry a report-level `generatedAt`; a
+ * warning is gated against it exactly like a scanner finding against
+ * `scannedAt`: missing file → DROP (nothing to fix in a file that's gone),
+ * edited-since → DEMOTE (loses its line, keeps its rule/message, marked
+ * `STALE_LINE_MARKER`), live → unchanged. See
+ * `clients/finding-delivery-gate.ts` surface `lens-diagnostics:mode-delta`.
+ */
+function applyDeltaFreshnessGate<W extends DispositionCandidate>(
+	files: Array<{ filePath: string; warnings: W[] }>,
+	cwd: string,
+	generatedAt: string | undefined,
+): Array<{ filePath: string; warnings: Array<W & { stale?: boolean }> }> {
+	if (!generatedAt) return files;
+	const flat: Array<{ filePath: string; warning: W }> = [];
+	for (const file of files) {
+		for (const warning of file.warnings)
+			flat.push({ filePath: file.filePath, warning });
+	}
+	if (flat.length === 0) return files;
+	const gated = gateFindingsByPathFreshness({
+		store: "lens-diagnostics-delta",
+		findings: flat,
+		cwd,
+		scannedAt: generatedAt,
+		citedPath: (f) => f.filePath,
+		onMissing: "drop",
+	});
+	// Two passes (live, then stale) reorder a file's demoted rows to the end
+	// of its warnings array rather than the original report order — cosmetic
+	// only, nothing is dropped or duplicated.
+	const byFile = new Map<string, Array<W & { stale?: boolean }>>();
+	for (const f of gated.live) {
+		const arr = byFile.get(f.filePath) ?? [];
+		arr.push(f.warning);
+		byFile.set(f.filePath, arr);
+	}
+	for (const f of gated.stale) {
+		const arr = byFile.get(f.filePath) ?? [];
+		arr.push({ ...f.warning, stale: true, line: undefined });
+		byFile.set(f.filePath, arr);
+	}
+	return files
+		.map((file) => ({
+			filePath: file.filePath,
+			warnings: byFile.get(file.filePath) ?? [],
+		}))
+		.filter((file) => file.warnings.length > 0);
+}
+
+// @delivery-surface: lens-diagnostics:mode-delta
 function formatDeltaMode(
 	cacheManager: CacheManager,
 	cwd: string,
@@ -557,10 +840,12 @@ function formatDeltaMode(
 		ignoreFile(filePath) && (!pathsScope || pathsScope.includeFile(filePath));
 	// #755: delta re-serves the actionable/quality caches verbatim, but those
 	// were filtered at DISPATCH time — before any lens_diagnostic_mark. Re-apply
-	// the weak disposition filter (suppress/defer) here so a mark converges
-	// immediately, not only on the next edit. Weak-anchored → zero file I/O, so
-	// this stays "instant" (see applyWeakDispositions).
-	const visibleWarningFiles = <W extends DispositionCandidate>(
+	// dispositions here so a mark converges immediately, not only on the next
+	// edit — through the shared {@link applyCachedDispositions} seam, so strict
+	// false-positive marks land as fast as suppress/defer.
+	const visibleWarningFiles = <
+		W extends DispositionCandidate & { observedAt?: number },
+	>(
 		files: Array<{ filePath: string; warnings?: W[] }> | undefined,
 	) =>
 		(files ?? [])
@@ -568,13 +853,21 @@ function formatDeltaMode(
 			.map((file) => ({
 				filePath: file.filePath,
 				warnings: applyRulePolicy(
-					applyWeakDispositions(file.warnings ?? [], cwd, file.filePath),
+					applyCachedDispositions(file.warnings ?? [], cwd, file.filePath),
 					policyMap,
 				),
 			}))
 			.filter((file) => file.warnings.length > 0);
-	const actionableFiles = visibleWarningFiles(actionable?.files);
-	const qualityFiles = visibleWarningFiles(quality?.files);
+	const actionableFiles = applyDeltaFreshnessGate(
+		visibleWarningFiles(actionable?.files),
+		cwd,
+		actionable?.generatedAt,
+	);
+	const qualityFiles = applyDeltaFreshnessGate(
+		visibleWarningFiles(quality?.files),
+		cwd,
+		quality?.generatedAt,
+	);
 
 	const lines: string[] = [];
 
@@ -584,9 +877,8 @@ function formatDeltaMode(
 			const rel = path.relative(cwd, file.filePath);
 			lines.push(`${rel}`);
 			for (const w of file.warnings) {
-				lines.push(
-					`  ⚠ L${w.line ?? "?"}  ${w.rule ?? w.code ?? w.tool}  ${w.message}`,
-				);
+				const where = w.stale ? STALE_LINE_MARKER : `L${w.line ?? "?"}`;
+				lines.push(`  ⚠ ${where}  ${w.rule ?? w.code ?? w.tool}  ${w.message}`);
 			}
 		}
 	}
@@ -597,9 +889,8 @@ function formatDeltaMode(
 			const rel = path.relative(cwd, file.filePath);
 			if (!lines.includes(rel)) lines.push(rel);
 			for (const w of file.warnings) {
-				lines.push(
-					`  ℹ L${w.line ?? "?"}  ${w.rule ?? w.code ?? w.tool}  ${w.message}`,
-				);
+				const where = w.stale ? STALE_LINE_MARKER : `L${w.line ?? "?"}`;
+				lines.push(`  ℹ ${where}  ${w.rule ?? w.code ?? w.tool}  ${w.message}`);
 			}
 		}
 	}
@@ -631,7 +922,7 @@ function formatDeltaMode(
 			.map((f) => ({
 				...f,
 				diagnostics: applyRulePolicy(
-					applyWeakDispositions(f.diagnostics, cwd, f.filePath),
+					applyCachedDispositions(f.diagnostics, cwd, f.filePath),
 					policyMap,
 				),
 			}))
@@ -837,11 +1128,17 @@ function applyProjectRulePolicy<T extends { diagnostics: ProjectDiagnostic[] }>(
 	policyMap: ReturnType<typeof rulePolicyMapFromConfig>,
 ): T | undefined {
 	if (!value) return undefined;
-	return { ...value, diagnostics: applyRulePolicy(value.diagnostics, policyMap) };
+	return {
+		...value,
+		diagnostics: applyRulePolicy(value.diagnostics, policyMap),
+	};
 }
 
-/** A diagnostic counts as error-like when it blocks or has error severity. */
+/** A diagnostic counts as error-like when it blocks or has error severity.
+ * A `stale` (#1641 past-EOF) entry is excluded — its cited line no longer
+ * exists in the current file, so it can no longer count toward a hard stop. */
 function isErrorLike(d: WidgetDiagnostic): boolean {
+	if (d.stale) return false;
 	return d.semantic === "blocking" || d.severity === "error";
 }
 
@@ -893,6 +1190,7 @@ function lspDiagnosticToWidget(diagnostic: LSPDiagnostic): WidgetDiagnostic {
 
 function projectDiagnosticToWidget(
 	diagnostic: ProjectDiagnostic,
+	filePath: string,
 ): WidgetDiagnostic {
 	return {
 		severity: diagnostic.severity,
@@ -902,6 +1200,7 @@ function projectDiagnosticToWidget(
 		col: diagnostic.column,
 		rule: diagnostic.rule ?? diagnostic.code,
 		tool: diagnostic.runner || diagnostic.tool,
+		uri: widgetDiagnosticUri(filePath, diagnostic.line, diagnostic.column),
 	};
 }
 
@@ -933,9 +1232,23 @@ function summarizeDiagnostics(
 	let errors = 0;
 	let warnings = 0;
 	for (const diagnostic of diagnostics) {
+		// #1641: a demoted past-EOF entry keeps its severity for display but
+		// drops out of the tallies — same reasoning as widget-state's `isBlocking`.
+		if (diagnostic.stale) continue;
 		if (diagnostic.semantic === "blocking") blocking++;
 		if (diagnostic.severity === "error") errors++;
-		else if (diagnostic.severity === "warning") warnings++;
+		// #1777: `hint` and `info` tally alongside `warning`, matching
+		// `countDiagnostics` in `clients/widget-state.ts` — mode=all reads that
+		// tally and mode=full reads this one, so the two must agree. An exact
+		// `=== "warning"` test scored a hint-only file 0/0/0, the `withIssues`
+		// filter below then dropped it, and mode=full rendered "No issues" for a
+		// file whose own `details` still carried the diagnostic.
+		else if (
+			diagnostic.severity === "warning" ||
+			diagnostic.severity === "hint" ||
+			diagnostic.severity === "info"
+		)
+			warnings++;
 	}
 	return {
 		filePath,
@@ -945,6 +1258,105 @@ function summarizeDiagnostics(
 		hasFinalSnapshot,
 		diagnostics,
 	};
+}
+
+// #1618: sentence form used when exactly one reason accounts for every
+// unconfirmed file — mirrors the pre-#1618 two-case ternary's phrasing so
+// existing single-reason callers see unchanged text.
+const UNCONFIRMED_REASON_SENTENCE: Record<
+	LSPWorkspaceUnconfirmedReason,
+	string
+> = {
+	budget: "check didn't complete within budget",
+	inconclusive:
+		"check was inconclusive (notify-write or diagnostics wait timed out)",
+	coverage_gap: "an auxiliary scanner coverage gap",
+	service_destroyed: "the LSP service was reset mid-sweep",
+	error: "check errored",
+	// #1618 review round 2: the LSP layer considered this touch CONFIRMED —
+	// the file's content changed under it (stale binding), which is a
+	// completely different failure from a timeout. Must never collapse into
+	// "within budget", the exact string this PR exists to stop misrendering.
+	binding_mismatch: "the file changed on disk since this result was computed",
+};
+
+// Short per-reason label used only when MORE than one reason is present, so
+// the note can still say "N timed out, M errored" instead of collapsing to
+// one sentence that can't carry two counts.
+const UNCONFIRMED_REASON_COUNT_LABEL: Record<
+	LSPWorkspaceUnconfirmedReason,
+	string
+> = {
+	budget: "timed out",
+	inconclusive: "inconclusive",
+	coverage_gap: "coverage gap",
+	service_destroyed: "service reset mid-sweep",
+	error: "errored",
+	binding_mismatch: "stale binding",
+};
+
+/**
+ * #1618: a result predating the `unconfirmedReason` field (a legacy/test
+ * double, or `LSPWorkspaceDiagnosticResult`'s own pre-#1618 shape) is
+ * classified from its OTHER fields exactly the way the dead
+ * `unconfirmedErrored = length - unconfirmedTimedOut` subtraction meant to,
+ * before that subtraction was structurally always 0 (the sweep's catch
+ * block sets both `error` and `timedOut`, so `unconfirmedErrored` never had
+ * a way to become nonzero). An explicit `result.error` now wins even when
+ * `unconfirmedReason` is absent, so an errored file is never rendered as
+ * "within budget".
+ *
+ * #1618 review round 2: `mismatched` MUST be checked first. A binding
+ * mismatch is discovered HERE, after the sweep already returned the result
+ * as confirmed (`!timedOut`, no `.error`, no `.unconfirmedReason`) — the
+ * `?? "budget"` fallback below would otherwise silently claim a
+ * stale-binding file as "within budget", the exact string this PR exists to
+ * stop misrendering.
+ */
+function classifyUnconfirmedReason(
+	result: WorkspaceLspDiagnosticResult,
+	mismatched: WeakSet<WorkspaceLspDiagnosticResult>,
+): LSPWorkspaceUnconfirmedReason {
+	if (mismatched.has(result)) return "binding_mismatch";
+	return result.unconfirmedReason ?? (result.error ? "error" : "budget");
+}
+
+/**
+ * #1618: replaces the `unconfirmedTimedOut`/`unconfirmedErrored` dead
+ * subtraction with a real per-reason tally read off each result's own
+ * `unconfirmedReason` (falling back to `classifyUnconfirmedReason` for a
+ * legacy result that predates the field). `mismatched` is threaded through
+ * so a stale-binding file is never counted under a fallback reason it
+ * doesn't have (review round 2).
+ */
+function tallyUnconfirmedReasons(
+	results: readonly WorkspaceLspDiagnosticResult[],
+	mismatched: WeakSet<WorkspaceLspDiagnosticResult>,
+): Map<LSPWorkspaceUnconfirmedReason, number> {
+	const tally = new Map<LSPWorkspaceUnconfirmedReason, number>();
+	for (const result of results) {
+		const reason = classifyUnconfirmedReason(result, mismatched);
+		tally.set(reason, (tally.get(reason) ?? 0) + 1);
+	}
+	return tally;
+}
+
+/** Render `tallyUnconfirmedReasons`' output as the clause inside the
+ *  "unconfirmed (...)" note — a single sentence when one reason accounts for
+ *  everything, else a comma-joined "N label" breakdown. */
+function formatUnconfirmedReasonClause(
+	tally: Map<LSPWorkspaceUnconfirmedReason, number>,
+): string {
+	const entries = [...tally.entries()].filter(([, count]) => count > 0);
+	if (entries.length === 0) return "";
+	if (entries.length === 1) {
+		return UNCONFIRMED_REASON_SENTENCE[entries[0][0]];
+	}
+	return entries
+		.map(
+			([reason, count]) => `${count} ${UNCONFIRMED_REASON_COUNT_LABEL[reason]}`,
+		)
+		.join(", ");
 }
 
 /**
@@ -1013,9 +1425,10 @@ function formatLspServerBreakdown(
  * down `formatFullMode`) so it doesn't disturb the existing merge/dedup
  * logic those summaries feed into.
  */
-function tallyLspPrimaryVsAuxiliary(
-	results: WorkspaceLspDiagnosticResult[],
-): { primary: number; auxiliary: number } {
+function tallyLspPrimaryVsAuxiliary(results: WorkspaceLspDiagnosticResult[]): {
+	primary: number;
+	auxiliary: number;
+} {
 	let primary = 0;
 	let auxiliary = 0;
 	for (const result of results) {
@@ -1028,17 +1441,34 @@ function tallyLspPrimaryVsAuxiliary(
 	return { primary, auxiliary };
 }
 
-function mergeDiagnosticsWithWidgetSummaries(
+export function mergeDiagnosticsWithWidgetSummaries(
 	widgetSummaries: FileDiagnosticSummary[],
 	lspResults: WorkspaceLspDiagnosticResult[],
 	projectSnapshot?: ProjectDiagnosticsSnapshot,
 	projectDelta?: ProjectDiagnosticsDeltaReport,
+	/**
+	 * #1993: resolved paths covered by a CONFIRMED, fully-covered LSP result
+	 * in `lspResults`. The fresh sweep is AUTHORITATIVE for these files - any
+	 * widget-store diagnostics seeded for them predate the sweep and must not
+	 * survive it (an additive-only merge let mid-edit stale 🔴 entries render
+	 * forever beside a clean sweep). Files absent from this set keep today's
+	 * additive behavior (fail-open: unconfirmed/timed-out sweeps never retire
+	 * widget state they did not actually re-check).
+	 */
+	authoritativeLspFiles?: ReadonlySet<string>,
 ): FileDiagnosticSummary[] {
 	const byFile = new Map<string, FileDiagnosticSummary>();
 	const seen = new Set<string>();
 
 	for (const summary of widgetSummaries) {
 		const filePath = path.resolve(summary.filePath);
+		// NOTE (#1993 review): dispositions recorded against a CACHED copy's
+		// message text may not match this file's fresh sweep copy (weak
+		// anchors key on message). Both copies derive from the same LSP
+		// diagnostic via convertLspDiagnostics, so identity is stable in
+		// practice; inline pi-lens-ignore comments are the primary
+		// suppression mechanism.
+		if (authoritativeLspFiles?.has(filePath)) continue;
 		const diagnostics = (summary.diagnostics ?? []).map((d) => ({ ...d }));
 		byFile.set(filePath, { ...summary, filePath, diagnostics });
 		for (const diagnostic of diagnostics) {
@@ -1076,13 +1506,13 @@ function mergeDiagnosticsWithWidgetSummaries(
 	for (const diagnostic of projectSnapshot?.diagnostics ?? []) {
 		addDiagnostic(
 			path.resolve(diagnostic.filePath),
-			projectDiagnosticToWidget(diagnostic),
+			projectDiagnosticToWidget(diagnostic, diagnostic.filePath),
 		);
 	}
 	for (const diagnostic of projectDelta?.diagnostics ?? []) {
 		addDiagnostic(
 			path.resolve(diagnostic.filePath),
-			projectDiagnosticToWidget(diagnostic),
+			projectDiagnosticToWidget(diagnostic, diagnostic.filePath),
 		);
 	}
 
@@ -1133,7 +1563,12 @@ async function applyInlineSuppressionsToSummaries(
 			// per-edit dispatch path applies (dispatcher.ts) — mode=full merges in
 			// diagnostics from a fresh LSP sweep/project scan that never went
 			// through that path, so without this a disposed finding reappears here.
-			const kept = applyDispositions(inlineKept, cwd, summary.filePath, content);
+			const kept = applyDispositions(
+				inlineKept,
+				cwd,
+				summary.filePath,
+				content,
+			);
 			// Project rule policy (`.pi-lens.json` `rules.<id>.disable`/`select`).
 			// Applied after inline suppression / disposition so the policy's
 			// output-only filtering affects the same surface the per-edit path
@@ -1146,7 +1581,12 @@ async function applyInlineSuppressionsToSummaries(
 			for (const d of policyKept) {
 				// flagged is weak-anchored (module doc, diagnostic-dispositions.ts) so
 				// the tag survives incidental edits to the flagged line itself.
-				const { weak } = anchorsForDiagnostic(cwd, summary.filePath, d, content);
+				const { weak } = anchorsForDiagnostic(
+					cwd,
+					summary.filePath,
+					d,
+					content,
+				);
 				if (getDisposition(cwd, weak)?.disposition === "flagged") {
 					(d as { flagged?: boolean }).flagged = true;
 				}
@@ -1238,6 +1678,7 @@ async function getProjectDiagnosticsSnapshotForFullMode(
 	return undefined;
 }
 
+// @delivery-surface: lens-diagnostics:mode-full
 async function formatFullMode(
 	cwd: string,
 	severity: string,
@@ -1302,14 +1743,30 @@ async function formatFullMode(
 	// could complete. Building its promise here, alongside the sweep and cheap
 	// scan, makes it genuinely concurrent — all three phases now race the SAME
 	// signal from the same starting point instead of stacking.
-	const analyzersPromise = shouldIncludeProjectRunners(options.refreshRunners)
+	const projectRunnersRequested = shouldIncludeProjectRunners(
+		options.refreshRunners,
+	);
+	const analyzersPromise = projectRunnersRequested
 		? loadBootstrapClients().then((clients) =>
-				fetchFreshProjectDiagnostics(cacheManager, cwd, clients, signal, { runtime: options.runtime }),
+				fetchFreshProjectDiagnostics(cacheManager, cwd, clients, signal, {
+					runtime: options.runtime,
+				}),
 			)
 		: Promise.resolve<FreshProjectDiagnosticsResult>({
 				diagnostics: [],
 				runners: [],
-				cold: [],
+				// #1623: every heavyweight analyzer is ELIGIBLE for this project but
+				// this call never asked for it (refreshRunners wasn't cheap/all/
+				// cached) — the expensive fetch below deliberately never runs in
+				// that case (see the comment above), but rendering total silence
+				// here reads exactly as "ran clean", the false-empty #1623 exists to
+				// close. `ANALYZER_IDS` (fresh-fetch.ts) is the single source of
+				// truth for which lanes this covers — reuse it rather than
+				// hand-listing ids here.
+				cold: [...ANALYZER_IDS],
+				coldReasons: Object.fromEntries(
+					ANALYZER_IDS.map((id) => [id, NOT_REQUESTED_REASON]),
+				),
 				failed: [],
 				timings: {},
 			});
@@ -1329,8 +1786,17 @@ async function formatFullMode(
 		analyzersPromise,
 	]);
 	const aborted = signal?.aborted ?? false;
-	const lspResults = rawLspResults.filter((result) =>
-		includeFile(result.filePath),
+	// #1640: before ANY consumer sees them — the footer reconcile, the widget
+	// merge, the rendered counts — demote TypeScript errors on files tsserver
+	// checked in its INFERRED project. Applied once, here, so a single seam
+	// governs the whole sweep instead of each renderer learning the rule.
+	const lspResults = await demoteInferredProjectSweepResults(
+		rawLspResults.filter((result) => includeFile(result.filePath)),
+		cwd,
+		lspService,
+		// #1645 review F1: the sweep that produced these results is signal-bounded,
+		// so the probe loop that post-processes them must be too.
+		signal,
 	);
 	// A result bound to a different document must not replace the current
 	// widget state, even when it contains real diagnostics. Pull results may carry
@@ -1351,20 +1817,22 @@ async function formatFullMode(
 	// output (#630).
 	const confirmedLspResults = lspResults.filter(
 		(result) =>
-			!result.timedOut &&
-			!result.error &&
-			!mismatchedLspResults.has(result),
+			!result.timedOut && !result.error && !mismatchedLspResults.has(result),
+	);
+	const fullyCoveredLspResults = confirmedLspResults.filter(
+		(result) => (result.unconfirmedServerIds?.length ?? 0) === 0,
+	);
+	const partiallyCoveredLspResults = confirmedLspResults.filter(
+		(result) => (result.unconfirmedServerIds?.length ?? 0) > 0,
 	);
 	const unconfirmedLspResults = lspResults.filter(
 		(result) =>
-			result.timedOut ||
-			result.error ||
-			mismatchedLspResults.has(result),
+			result.timedOut || result.error || mismatchedLspResults.has(result),
 	);
 	// #571: reconcile this scan's fresh, CONFIRMED per-file results into the
 	// footer cache. A footer write is never allowed to fail the tool call, so
 	// any unexpected throw is swallowed.
-	for (const result of confirmedLspResults) {
+	for (const result of fullyCoveredLspResults) {
 		try {
 			// #692: provenance label ONLY — must never affect `rule`/identity (see
 			// `ConvertLspDiagnosticsOptions.scanOrigin`'s doc comment).
@@ -1458,6 +1926,29 @@ async function formatFullMode(
 	// read as "0 issues, clean" via its LSP contribution. It can still
 	// legitimately show diagnostics from widgetSummaries/project-runner state
 	// below if those independently have entries for it.
+	// #1993: files with a CONFIRMED, fully-covered LSP result are authoritative
+	// - the fresh sweep replaces their widget-store state instead of merging
+	// additively beside it.
+	const authoritativeLspFiles = new Set(
+		fullyCoveredLspResults.map((result) => path.resolve(result.filePath)),
+	);
+	// #1993 review: retirement must be observable - if a future regression
+	// makes the set falsely authoritative, findings would vanish silently.
+	const authoritativeRetiredCount = getFileDiagnosticSummaries().filter(
+		(summary) =>
+			includeFile(summary.filePath) &&
+			authoritativeLspFiles.has(path.resolve(summary.filePath)) &&
+			(summary.diagnostics?.length ?? 0) > 0,
+	).length;
+	if (authoritativeRetiredCount > 0) {
+		logLatency({
+			type: "phase",
+			phase: "lsp_authoritative_widget_retire",
+			filePath: "",
+			durationMs: 0,
+			metadata: { files: authoritativeRetiredCount },
+		});
+	}
 	const summaries = await applyInlineSuppressionsToSummaries(
 		mergeDiagnosticsWithWidgetSummaries(
 			getFileDiagnosticSummaries().filter((summary) =>
@@ -1466,10 +1957,33 @@ async function formatFullMode(
 			confirmedLspResults,
 			projectSnapshot,
 			projectDelta,
+			authoritativeLspFiles,
 		),
 		cwd,
 		policyMap,
 	);
+	// #1888: the full-mode summary above is the first seam where every
+	// producing lane is correlated. The earlier footer loop intentionally writes
+	// only CONFIRMED LSP results, so an ast-grep backpressure failure left
+	// project-scan (`ast-grep-napi`) findings visible to lens_diagnostics but
+	// absent from the widget. Commit this same post-policy, post-suppression set
+	// to the widget so its human-facing count cannot silently become single-lane.
+	const parsedProjectScanObservedAt = projectSnapshot?.scannedAt
+		? Date.parse(projectSnapshot.scannedAt)
+		: undefined;
+	const projectScanObservedAt =
+		parsedProjectScanObservedAt !== undefined &&
+		Number.isFinite(parsedProjectScanObservedAt)
+			? parsedProjectScanObservedAt
+			: undefined;
+	for (const summary of summaries) {
+		reconcileCorrelatedScanDiagnostics(
+			summary.filePath,
+			summary.diagnostics,
+			nextWriteIndex?.(),
+			projectScanObservedAt,
+		);
+	}
 	const result = formatAllMode(cwd, severity, summaries, {
 		mode: "full",
 		lspFilesChecked: rawLspResults.length,
@@ -1502,10 +2016,10 @@ async function formatFullMode(
 	// as "0 diagnostics" — say explicitly which files the LSP sweep could not
 	// confirm and why, distinguishing a hard error from a soft timeout the
 	// same way #570 does upstream.
-	const unconfirmedTimedOut = unconfirmedLspResults.filter(
-		(result) => result.timedOut,
-	).length;
-	const unconfirmedErrored = unconfirmedLspResults.length - unconfirmedTimedOut;
+	const unconfirmedByReason = tallyUnconfirmedReasons(
+		unconfirmedLspResults,
+		mismatchedLspResults,
+	);
 	// #646: per-primary-server breakdown of the same confirmed/unconfirmed
 	// tally — lets an agent see AT A GLANCE which server is responsible for
 	// any unconfirmed files (e.g. "marksman: 0/34") instead of having to
@@ -1525,18 +2039,29 @@ async function formatFullMode(
 	const unconfirmedLspNote =
 		unconfirmedLspResults.length > 0
 			? `\n\n⚠ LSP sweep: ${confirmedLspResults.length} file(s) confirmed via LSP, ` +
-				`${unconfirmedLspResults.length} unconfirmed (${
-					unconfirmedTimedOut > 0 && unconfirmedErrored > 0
-						? `${unconfirmedTimedOut} timed out, ${unconfirmedErrored} errored`
-						: unconfirmedTimedOut > 0
-							? "check didn't complete within budget"
-							: "check errored"
-				})${serverBreakdownClause} — NOT the same as 0 diagnostics for: ${unconfirmedLspResults
+				`${unconfirmedLspResults.length} unconfirmed (${formatUnconfirmedReasonClause(
+					unconfirmedByReason,
+				)})${serverBreakdownClause} — NOT the same as 0 diagnostics for: ${unconfirmedLspResults
 					.slice(0, 20)
 					.map((result) => result.filePath)
 					.join(
 						", ",
 					)}${unconfirmedLspResults.length > 20 ? ", …" : ""}. These files' LSP contribution is excluded from this result; re-run mode=full to retry them (they may still show findings above from cached/project-runner state).`
+			: "";
+	// Code-unit comparator (#1883): this list ships as the
+	// `unconfirmedLspServerIds` structured field and as the lane names in the
+	// agent-visible coverage note, so its order must be deterministic across
+	// locales — localeCompare is deliberately avoided.
+	const uncoveredScannerIds = [
+		...new Set(
+			partiallyCoveredLspResults.flatMap(
+				(result) => result.unconfirmedServerIds ?? [],
+			),
+		),
+	].sort((a, b) => Number(a > b) - Number(a < b));
+	const auxiliaryCoverageNote =
+		uncoveredScannerIds.length > 0
+			? `\n\n⚠ Auxiliary coverage incomplete: ${uncoveredScannerIds.join(", ")} did not answer for ${partiallyCoveredLspResults.length} file(s). Findings from answering servers are included; this is not a clean verdict for the named scanner lane(s).`
 			: "";
 	// #646: primary-vs-auxiliary split of the raw LSP-sweep findings (before
 	// they're merged into the widget-state summaries below), mirroring
@@ -1570,15 +2095,33 @@ async function formatFullMode(
 	// analyzers before anything spawns — rendering that as the per-analyzer
 	// "not applicable / unavailable" list would send the caller chasing seven
 	// wrong reasons. One note with the real one instead.
+	// #1623: prefer the SPECIFIC reason captured at each gate
+	// (`extracted.coldReasons`) over a generic guess — `formatNotRunEntry`
+	// falls back to `warmTriggerFor` only for an id this call's `coldReasons`
+	// doesn't cover (e.g. a caller-supplied `cold` list from an older cache
+	// shape). Single formatter (extractors.ts) so this note's wording can't
+	// drift from any other caller that renders the same `cold` list.
+	// #1623 fix-round F5: the "not requested" (quick-mode) batch shares ONE
+	// reason (`NOT_REQUESTED_REASON`) across every id — `formatNotRunEntry`
+	// repeating that same ~130-char sentence per id makes the note nearly
+	// unreadable, and the "not applicable / unavailable this run" header
+	// below is a dishonest label for it: these lanes ARE applicable and
+	// available, this call just never asked for them. Render that batch as
+	// its own compact note — bare ids, the shared reason stated once — and
+	// keep the detailed per-id format for genuinely cold lanes, where each
+	// id's reason really does differ (not a git repo vs binary unavailable
+	// vs retry cooldown, ...).
 	const coldNote = extracted.unsafeRoot
 		? `\n\nheavyweight analyzers skipped: the working directory resolves at or above the home directory, so a fresh knip/jscpd/madge/gitleaks/govulncheck/trivy/dead-code scan would walk every unrelated tree under it. Re-run from inside a project directory. Absence of their findings is NOT a clean verdict.`
-		: genuinelyColdIds.length > 0
-			? `\n\ncold (not applicable / unavailable this run): ${genuinelyColdIds
-					.map((id) => `${id} — ${warmTriggerFor(id)}`)
-					.join(
-						", ",
-					)}. These analyzers have not contributed to this result — absence of their findings is NOT a clean verdict.`
-			: "";
+		: !projectRunnersRequested && genuinelyColdIds.length > 0
+			? `\n\nnot run this call (quick mode): ${genuinelyColdIds.join(", ")}. ${NOT_REQUESTED_REASON}. Absence of their findings is NOT a clean verdict.`
+			: genuinelyColdIds.length > 0
+				? `\n\ncold (not applicable / unavailable this run): ${genuinelyColdIds
+						.map((id) => formatNotRunEntry(id, extracted.coldReasons))
+						.join(
+							", ",
+						)}. These analyzers have not contributed to this result — absence of their findings is NOT a clean verdict.`
+				: "";
 	// #1004: unlike every other analyzer above (knip/jscpd/madge/gitleaks/
 	// govulncheck/opengrep/trivy/dead-code all run a FRESH whole-project scan
 	// per the fresh-fetch.ts header, so "clean" there really does mean "the
@@ -1602,7 +2145,27 @@ async function formatFullMode(
 		failedAnalyzers.length > 0
 			? `\n\nfailed (ran, but no trustworthy result): ${failedAnalyzers
 					.map(({ id, summary }) => `${id} — ${summary}`)
-					.join(", ")}. These analyzers were not cached and will be retried; absence of their findings is NOT a clean verdict.`
+					.join(
+						", ",
+					)}. These analyzers were not cached and will be retried; absence of their findings is NOT a clean verdict.`
+			: "";
+	// #1617: the #1616 suppressed-bucket rule applied to mode=full — a finding
+	// an agent/user marked false-positive/won't-fix now drops out of
+	// `diagnostics` (fresh-fetch.ts's `record()`), but that drop must stay
+	// visible as a count rather than reading as "nothing was wrong here".
+	// Review-round F4 (#1625): per-lane attribution — "gitleaks 2, knip 1" says
+	// WHICH analyzer's marks are doing the suppressing, not just a bare total.
+	// A lane that's 100% suppressed still won't appear in `runners`/`cold` as
+	// distinct from "ran clean" — that gap is #1623's lane-status territory,
+	// not fixed here.
+	const dispositionSuppressedByLaneText = Object.entries(
+		extracted.dispositionSuppressedByLane ?? {},
+	)
+		.map(([id, count]) => `${id} ${count}`)
+		.join(", ");
+	const dispositionSuppressedNote =
+		(extracted.dispositionSuppressed ?? 0) > 0
+			? `\n\nsuppressed by disposition: ${extracted.dispositionSuppressed} finding(s) dropped from this result because they're marked false-positive or won't-fix (${dispositionSuppressedByLaneText}). Not a clean verdict for those locations — they were found, then intentionally hidden.`
 			: "";
 	// #747/#250: the cheap project-diagnostics scan (scanProjectDiagnostics) and
 	// the LSP workspace sweep (collectWorkspaceDiagnosticFiles) both refuse to
@@ -1633,6 +2196,31 @@ async function formatFullMode(
 	const generatedSkipNote = generatedSkipNoticeText
 		? `\n\n${generatedSkipNoticeText}`
 		: "";
+	// #1623: the cheap in-process project scan (tree-sitter/fact-rules/
+	// ast-grep) is a THIRD lane `coldNote` never covers (it isn't one of
+	// `ANALYZER_IDS` — that list is fetch-fetch.ts's heavyweight analyzers
+	// only). It has three distinct states, all of which must render — the
+	// fix-round F2 finding: with `refreshRunners=cached` and no snapshot ever
+	// written yet, BOTH of the two notes below used to stay empty (one gated
+	// on `scannedAt` being present, the other on the "not requested" branch
+	// this call isn't in), so the original #1623 silence survived in exactly
+	// this mode. `cheapScanScannedAtMs` centralizes the one bit every branch
+	// needs: whether the stored snapshot has a usable timestamp (#1623
+	// fix-round F4 — a corrupt/missing `scannedAt` must not compute a NaN
+	// age, mirroring `./cache.ts`'s `Number.isFinite` guard).
+	const cheapScanScannedAtMs = rawProjectSnapshot?.scannedAt
+		? Date.parse(rawProjectSnapshot.scannedAt)
+		: undefined;
+	const cheapScanStatusNote = !projectRunnersRequested
+		? `\n\ncheap project scan (tree-sitter/fact-rules/ast-grep): not run this call (${NOT_REQUESTED_REASON}).`
+		: options.refreshRunners === "cached"
+			? cheapScanScannedAtMs !== undefined &&
+				Number.isFinite(cheapScanScannedAtMs)
+				? `\n\ncheap project scan (tree-sitter/fact-rules/ast-grep): served from cache, ${formatCacheAgeOld(
+						Date.now() - cheapScanScannedAtMs,
+					)} — not re-run this call.`
+				: `\n\ncheap project scan (tree-sitter/fact-rules/ast-grep): not run (no cached scan; refresh with refreshRunners=cheap/all to populate).`
+			: "";
 	const abortedNote =
 		abortedIds.size > 0
 			? `\n\nstopped mid-scan (still running in the background, not reflected in this result): ${[
@@ -1645,11 +2233,27 @@ async function formatFullMode(
 	// possibly-stale session_start cache — say so honestly, with per-analyzer
 	// elapsed time, since this can legitimately take a while (trivy's own
 	// ~180s ceiling).
-	const timingEntries = Object.entries(extracted.timings ?? {});
+	// #1623: `extracted.cachedAgeMs` marks ids that are a cache-read BY DESIGN
+	// (today, only test-runner — see fresh-fetch.ts) rather than a fresh
+	// execution this call. Exclude those from "fetched fresh" below — folding
+	// a cache replay into the same list as a genuine run is exactly the
+	// misread the second #1623 dogfood pass reported (a cached result read as
+	// "just ran"). They get their own note with an actual age instead.
+	const cachedAgeMs = extracted.cachedAgeMs ?? {};
+	const timingEntries = Object.entries(extracted.timings ?? {}).filter(
+		([id]) => !(id in cachedAgeMs),
+	);
 	const freshNote =
 		timingEntries.length > 0
 			? `\n\nfetched fresh this call: ${timingEntries
 					.map(([id, ms]) => `${id} (${Math.round(ms)}ms)`)
+					.join(", ")}.`
+			: "";
+	const cachedAgeEntries = Object.entries(cachedAgeMs);
+	const cachedAgeNote =
+		cachedAgeEntries.length > 0
+			? `\n\nserved from cache this call (not re-run): ${cachedAgeEntries
+					.map(([id, ms]) => `${id} (${formatCacheAgeOld(ms)})`)
 					.join(", ")}.`
 			: "";
 	// coldRunners always lands in details (even when empty) so a caller can
@@ -1662,8 +2266,19 @@ async function formatFullMode(
 		details: {
 			...result.details,
 			coldRunners: extracted.cold,
+			// #1623: the specific reason each cold id was skipped (single source
+			// of truth: extractors.ts's `formatNotRunEntry` renders the same map
+			// into the text note above) — lets a caller check WHY without parsing
+			// text.
+			coldReasons: extracted.coldReasons ?? {},
 			failedAnalyzers,
 			analyzerTimingsMs: extracted.timings,
+			dispositionSuppressed: extracted.dispositionSuppressed ?? 0,
+			dispositionSuppressedByLane: extracted.dispositionSuppressedByLane ?? {},
+			// #1623: ms-old each cache-read-by-design lane's data was (today, only
+			// test-runner) — lets a caller distinguish "just ran" from "served
+			// from cache" without parsing the text note.
+			analyzersCachedAgeMs: cachedAgeMs,
 			analyzersAborted: extracted.aborted ?? false,
 			analyzersAbortedIds: extracted.abortedIds ?? [],
 			// #747: true when the fresh fetch refused an at-or-above-$HOME root —
@@ -1679,6 +2294,8 @@ async function formatFullMode(
 			// any files unconfirmed" without re-deriving it from the text.
 			lspFilesConfirmed: confirmedLspResults.length,
 			lspFilesUnconfirmed: unconfirmedLspResults.length,
+			lspFilesPartiallyCovered: partiallyCoveredLspResults.length,
+			unconfirmedLspServerIds: uncoveredScannerIds,
 			unconfirmedLspFiles: unconfirmedLspResults.map(
 				(result) => result.filePath,
 			),
@@ -1730,15 +2347,19 @@ async function formatFullMode(
 						result.content[0].text +
 						note +
 						unconfirmedLspNote +
+						auxiliaryCoverageNote +
 						lspPrimaryVsAuxiliaryNote +
 						coldNote +
 						testRunnerEditScopedNote +
 						failedNote +
+						dispositionSuppressedNote +
 						walkUnsafeRootNote +
 						scanTruncatedNote +
 						generatedSkipNote +
 						abortedNote +
 						freshNote +
+						cachedAgeNote +
+						cheapScanStatusNote +
 						missingNote,
 				},
 			],
@@ -1750,12 +2371,16 @@ async function formatFullMode(
 		coldNote ||
 		testRunnerEditScopedNote ||
 		failedNote ||
+		dispositionSuppressedNote ||
 		walkUnsafeRootNote ||
 		scanTruncatedNote ||
 		generatedSkipNote ||
 		abortedNote ||
 		freshNote ||
+		cachedAgeNote ||
+		cheapScanStatusNote ||
 		unconfirmedLspNote ||
+		auxiliaryCoverageNote ||
 		lspPrimaryVsAuxiliaryNote
 	) {
 		return {
@@ -1765,15 +2390,19 @@ async function formatFullMode(
 					text:
 						result.content[0].text +
 						unconfirmedLspNote +
+						auxiliaryCoverageNote +
 						lspPrimaryVsAuxiliaryNote +
 						coldNote +
 						testRunnerEditScopedNote +
 						failedNote +
+						dispositionSuppressedNote +
 						walkUnsafeRootNote +
 						scanTruncatedNote +
 						generatedSkipNote +
 						abortedNote +
 						freshNote +
+						cachedAgeNote +
+						cheapScanStatusNote +
 						missingNote,
 				},
 			],
@@ -1783,6 +2412,7 @@ async function formatFullMode(
 	return resultWithCold;
 }
 
+// @delivery-surface: lens-diagnostics:mode-all
 function formatAllMode(
 	cwd: string,
 	severity: string,
@@ -1790,14 +2420,18 @@ function formatAllMode(
 	detailOverrides: Record<string, unknown> = { mode: "all" },
 	staleDropped = 0,
 	pathsScope?: PathsScope,
+	dependencyDemoted = 0,
 ): { content: [{ type: "text"; text: string }]; details: object } {
 	// Files changed/deleted since their diagnostics were recorded have already
 	// been dropped by reconcileStaleWidgetFiles; note them so the agent knows
 	// those aren't "clean", just un-rescanned (use mode=full to refresh).
 	const staleNote =
-		staleDropped > 0
+		(staleDropped > 0
 			? ` (${staleDropped} changed file${staleDropped === 1 ? "" : "s"} omitted as stale — use mode=full to rescan)`
-			: "";
+			: "") +
+		(dependencyDemoted > 0
+			? ` (${dependencyDemoted} blocking finding${dependencyDemoted === 1 ? "" : "s"} demoted to [stale] — an imported file changed since; re-run to confirm)`
+			: "");
 
 	// mode=full already actively scanned exactly the requested paths, so a zero
 	// result there IS a legitimate clean read — the cache-only note only applies
@@ -1807,36 +2441,61 @@ function formatAllMode(
 	const ignoreFile = createCurrentIgnoreFilter(cwd);
 	const includeFile = (filePath: string) =>
 		ignoreFile(filePath) && (!pathsScope || pathsScope.includeFile(filePath));
-	// #755: mode=full already ran the full disposition + inline-suppression
-	// filter (applyInlineSuppressionsToSummaries, file content in hand); mode=all
-	// re-serves the widget summaries verbatim from dispatch time, so a
-	// post-dispatch lens_diagnostic_mark (suppress/defer) would otherwise still
-	// show here. Re-apply the weak filter (zero I/O) for the cache-only path and
-	// re-summarize so blocking/error/warning counts reflect the drop.
-	// Same project rule policy (`.pi-lens.json` `rules.<id>.disable`/`select`)
-	// overlays both modes: mode=full re-applies it after inline suppression /
-	// disposition (zero I/O), mode=all applies it here on the cache-only path.
-	// The full path's policyMover is loaded below in `applyInlineSuppressionsToSummaries`.
+	// Cached summaries predate marks. Every cache-only surface re-applies
+	// dispositions through the shared applyCachedDispositions seam — strict
+	// false-positive anchors against current content when the file is
+	// unchanged since observation, weak-only fallback otherwise.
 	const policyMap = loadProjectRulePolicyMap(cwd);
 	const dispositioned = isFullMode
 		? summaries
 		: summaries.map((s) => {
-				const kept = applyWeakDispositions(s.diagnostics ?? [], cwd, s.filePath);
+				const diagnostics = s.diagnostics ?? [];
+				const kept = applyCachedDispositions(diagnostics, cwd, s.filePath);
 				const policyKept = applyRulePolicy(kept, policyMap);
 				if (
 					policyKept.length === kept.length &&
-					kept.length === (s.diagnostics?.length ?? 0)
+					kept.length === diagnostics.length
 				)
 					return s;
 				return summarizeDiagnostics(s.filePath, policyKept, s.hasFinalSnapshot);
 			});
-	const visibleSummaries = dispositioned.filter((s) => includeFile(s.filePath));
+	// #1641: the single chokepoint both mode=all (cache-only `summaries`) and
+	// mode=full (widget cache merged with a FRESH LSP sweep, above) converge
+	// through — a fresh sweep's server can still be citing its own stale
+	// in-memory document, so gating only the cached half would miss exactly
+	// the live incident this issue reports. Runs AFTER dispositions/rule
+	// policy (not before): a finding a mark or a `.pi-lens.json` rule policy
+	// already dropped is not being served, so it must never trigger a resync
+	// or a `diagnostic_past_eof` telemetry record on this call.
+	const eofGated = dispositioned.map((s) => {
+		const { diagnostics, demotedCount } = demotePastEofDiagnostics({
+			store: "lens_diagnostics",
+			cwd,
+			filePath: s.filePath,
+			diagnostics: s.diagnostics ?? [],
+			resync: resyncDocumentOnPastEof,
+		});
+		if (demotedCount === 0) return s;
+		return summarizeDiagnostics(s.filePath, diagnostics, s.hasFinalSnapshot);
+	});
+	const visibleSummaries = eofGated.filter((s) => includeFile(s.filePath));
 
-	// Filter to files with actual issues
+	// Filter to files with actual issues. A file whose only findings were
+	// demoted by the #1641 past-EOF gate has blocking/errors/warnings at 0 —
+	// counting it as "issue-free" would tell the agent the file is CLEAN when
+	// it actually has an unconfirmed finding waiting on a rescan. Surface it
+	// under `severity: "all"` (the gate's own advisory tier) so it stays
+	// visible; a narrower `error`/`warning` filter still excludes it, matching
+	// how those filters already treat any other non-matching severity.
 	const withIssues = visibleSummaries.filter((s) => {
 		if (severity === "error") return s.blocking > 0 || s.errors > 0;
 		if (severity === "warning") return s.warnings > 0;
-		return s.blocking > 0 || s.errors > 0 || s.warnings > 0;
+		return (
+			s.blocking > 0 ||
+			s.errors > 0 ||
+			s.warnings > 0 ||
+			(s.diagnostics ?? []).some((d) => d.stale)
+		);
 	});
 
 	const pathsNote = isFullMode ? "" : pathsScopeCacheOnlyNote(pathsScope);
@@ -1876,6 +2535,10 @@ function formatAllMode(
 		if (s.errors > 0 && s.blocking === 0) parts.push(`${s.errors}E`);
 		if (s.warnings > 0) parts.push(`${s.warnings}W`);
 		if (!s.hasFinalSnapshot) parts.push(`(pending)`);
+		const staleCount = (s.diagnostics ?? []).filter((d) => d.stale).length;
+		if (staleCount > 0) {
+			parts.push(`${staleCount} stale — re-run to confirm`);
+		}
 		lines.push(`${rel}  ${parts.join("  ")}`);
 
 		// List the actual diagnostics (not just counts) so the agent can act on
@@ -1888,16 +2551,27 @@ function formatAllMode(
 			.sort(bySeverityThenLine);
 		const shown = matching.slice(0, MAX_DIAGNOSTICS_PER_FILE);
 		for (const d of shown) {
-			const marker = isErrorLike(d)
-				? d.semantic === "blocking"
-					? "🔴 "
-					: ""
-				: "";
+			const marker = d.stale
+				? ""
+				: isErrorLike(d)
+					? d.semantic === "blocking"
+						? "🔴 "
+						: ""
+					: "";
 			const label = d.rule ?? d.tool;
 			const tag = label ? ` [${label}]` : "";
 			const flaggedTag = d.flagged ? " 📌 flagged-to-fix" : "";
 			const msg = d.message.replace(/\s+/g, " ").trim();
-			lines.push(`  ${marker}L${d.line ?? "?"}: ${msg}${tag}${flaggedTag}`);
+			// #1641: a demoted past-EOF entry no longer has a trustworthy line —
+			// show the marker instead of a coordinate that doesn't exist in the
+			// current file, matching the #1622/#1627 stale-line render convention.
+			// Past-EOF demotions replace the untrustworthy coordinate; other
+			// demotions (#1631 drift) keep their in-bounds line and append the
+			// shared stale marker instead.
+			const pastEof = d.stale && (d.staleReason ?? "past-eof") === "past-eof";
+			const loc = pastEof ? PAST_EOF_STALE_MARKER : `L${d.line ?? "?"}`;
+			const staleTag = d.stale && !pastEof ? ` ${STALE_LINE_MARKER}` : "";
+			lines.push(`  ${marker}${loc}: ${msg}${tag}${flaggedTag}${staleTag}`);
 		}
 		if (matching.length > shown.length) {
 			lines.push(
@@ -1910,12 +2584,20 @@ function formatAllMode(
 		totalWarnings += s.warnings;
 	}
 
+	// #1799: `totalBlocking` and `totalErrors` count the same findings UNLESS a
+	// dependency-drift demotion (#1631) has revoked blocking authority from an
+	// error while leaving it in the error tally (widget-state.ts `isBlocking`
+	// vs `countDiagnostics`) — that's a real, live disagreement between the two
+	// totals, not double-counting. So `errors` renders only when
+	// `blocking === 0`, same guard as the per-file row above: it shows the
+	// drift-demoted findings the blocking line can't, without ever printing the
+	// same findings twice under two labels when blocking > 0.
 	const summary = [
 		`\nSummary (${visibleSummaries.length} files diagnosed this session):`,
 		totalBlocking > 0
 			? `  🔴 ${totalBlocking} blocking error${totalBlocking === 1 ? "" : "s"}`
 			: null,
-		totalErrors > 0
+		totalBlocking === 0 && totalErrors > 0
 			? `  ${totalErrors} error${totalErrors === 1 ? "" : "s"}`
 			: null,
 		totalWarnings > 0

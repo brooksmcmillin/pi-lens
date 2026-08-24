@@ -103,7 +103,10 @@ function surfaces(): Surface[] {
 			collect: () =>
 				// collectFiles is private; the walk needs no grammars loaded.
 				// biome-ignore lint/suspicious/noExplicitAny: private method under test
-				(getSharedTreeSitterClient()! as any).collectFiles(tmpDir, "typescript"),
+				(getSharedTreeSitterClient()! as any).collectFiles(
+					tmpDir,
+					"typescript",
+				),
 			// Language-scoped by design — only the requested language's files.
 			mustInclude: ["src/real.ts"],
 			excludesTests: false,

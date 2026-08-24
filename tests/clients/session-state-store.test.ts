@@ -53,10 +53,22 @@ beforeEach(() => clearWidgetState());
 
 function seedDiagnostics() {
 	recordDiagnostics("/proj/example/a.ts", [
-		{ tool: "tsc", severity: "error", semantic: "blocking", message: "boom", line: 5 },
+		{
+			tool: "tsc",
+			severity: "error",
+			semantic: "blocking",
+			message: "boom",
+			line: 5,
+		},
 	]);
 	recordDiagnostics("/proj/example/b.ts", [
-		{ tool: "eslint", severity: "warning", message: "meh", line: 2, rule: "no-x" },
+		{
+			tool: "eslint",
+			severity: "warning",
+			message: "meh",
+			line: 2,
+			rule: "no-x",
+		},
 	]);
 }
 
@@ -219,7 +231,9 @@ describe("sessionStartMode — reason → action mapping (#190)", () => {
 
 describe("dropStaleFiles — freshness reconciliation (#190/#180)", () => {
 	let fsDir: string;
-	const fileEntry = (filePath: string): PersistedWidgetState["files"][number] => ({
+	const fileEntry = (
+		filePath: string,
+	): PersistedWidgetState["files"][number] => ({
 		filePath,
 		runners: [],
 		formatters: [],
@@ -246,7 +260,11 @@ describe("dropStaleFiles — freshness reconciliation (#190/#180)", () => {
 		// fresh: last modified well before the snapshot → unchanged → keep
 		utimesSync(fresh, new Date(savedAt - 60_000), new Date(savedAt - 60_000));
 		// modified: touched after the snapshot → stale → drop
-		utimesSync(modified, new Date(savedAt + 60_000), new Date(savedAt + 60_000));
+		utimesSync(
+			modified,
+			new Date(savedAt + 60_000),
+			new Date(savedAt + 60_000),
+		);
 
 		const widget: PersistedWidgetState = {
 			version: 1,
@@ -298,8 +316,16 @@ describe("reconcileStaleWidgetFiles — live widget freshness (lens_diagnostics)
 		// Simulate the agent fixing `fixed` AFTER it was last recorded: its mtime
 		// now postdates touchedAt. `unchanged` keeps an older mtime.
 		const recordedAt = Date.now();
-		utimesSync(unchanged, new Date(recordedAt - 60_000), new Date(recordedAt - 60_000));
-		utimesSync(fixed, new Date(recordedAt + 60_000), new Date(recordedAt + 60_000));
+		utimesSync(
+			unchanged,
+			new Date(recordedAt - 60_000),
+			new Date(recordedAt - 60_000),
+		);
+		utimesSync(
+			fixed,
+			new Date(recordedAt + 60_000),
+			new Date(recordedAt + 60_000),
+		);
 
 		const dropped = await reconcileStaleWidgetFiles();
 		expect(dropped).toBe(1);

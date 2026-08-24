@@ -43,12 +43,10 @@ afterEach(() => {
 // that misses (or mistypes) a marker, the corresponding iteration fails here.
 describe("dotnet root markers single source of truth (#895)", () => {
 	it("every csharp marker is honored by the LSP root detectors and the language-profile resolver", async () => {
-		const { CSharpServer, OmniSharpServer } = await import(
-			"../../clients/lsp/server.js"
-		);
-		const { resolveLanguageRootForFile } = await import(
-			"../../clients/language-profile.js"
-		);
+		const { CSharpServer, OmniSharpServer } =
+			await import("../../clients/lsp/server.js");
+		const { resolveLanguageRootForFile } =
+			await import("../../clients/language-profile.js");
 
 		for (const pattern of DOTNET_CSHARP_ROOT_MARKERS) {
 			const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-dotnet-sst-"));
@@ -57,20 +55,24 @@ describe("dotnet root markers single source of truth (#895)", () => {
 			const project = path.join(workspace, "nested");
 			const file = path.join(project, "src", "Program.cs");
 			fs.mkdirSync(path.dirname(file), { recursive: true });
-			fs.writeFileSync(path.join(project, pattern.replaceAll("*", "App")), "\n");
+			fs.writeFileSync(
+				path.join(project, pattern.replaceAll("*", "App")),
+				"\n",
+			);
 			fs.writeFileSync(file, "// test\n");
 
 			await expect(CSharpServer.root(file), pattern).resolves.toBe(project);
 			await expect(OmniSharpServer.root(file), pattern).resolves.toBe(project);
-			expect(resolveLanguageRootForFile(file, workspace), pattern).toBe(project);
+			expect(resolveLanguageRootForFile(file, workspace), pattern).toBe(
+				project,
+			);
 		}
 	});
 
 	it("every fsharp marker is honored by the LSP root detector and the language-profile resolver", async () => {
 		const { FSharpServer } = await import("../../clients/lsp/server.js");
-		const { resolveLanguageRootForFile } = await import(
-			"../../clients/language-profile.js"
-		);
+		const { resolveLanguageRootForFile } =
+			await import("../../clients/language-profile.js");
 
 		for (const pattern of DOTNET_FSHARP_ROOT_MARKERS) {
 			const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-dotnet-sst-"));
@@ -79,11 +81,16 @@ describe("dotnet root markers single source of truth (#895)", () => {
 			const project = path.join(workspace, "nested");
 			const file = path.join(project, "src", "Program.fs");
 			fs.mkdirSync(path.dirname(file), { recursive: true });
-			fs.writeFileSync(path.join(project, pattern.replaceAll("*", "App")), "\n");
+			fs.writeFileSync(
+				path.join(project, pattern.replaceAll("*", "App")),
+				"\n",
+			);
 			fs.writeFileSync(file, "// test\n");
 
 			await expect(FSharpServer.root(file), pattern).resolves.toBe(project);
-			expect(resolveLanguageRootForFile(file, workspace), pattern).toBe(project);
+			expect(resolveLanguageRootForFile(file, workspace), pattern).toBe(
+				project,
+			);
 		}
 	});
 });

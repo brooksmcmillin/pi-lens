@@ -93,7 +93,9 @@ export function queriesForLanguage(
 	languageId: string,
 ): TreeSitterQuery[] {
 	const enabled = (langId: string): TreeSitterQuery[] =>
-		(queries.get(langId) ?? []).filter((q) => !isDisabledQueryFilePath(q.filePath));
+		(queries.get(langId) ?? []).filter(
+			(q) => !isDisabledQueryFilePath(q.filePath),
+		);
 	return ruleSourceLanguages(languageId).flatMap((langId) => enabled(langId));
 }
 
@@ -125,8 +127,7 @@ export interface TreeSitterQuery {
 	query: string;
 	metavars: string[];
 	post_filter?: string;
-	// biome-ignore lint/suspicious/noExplicitAny: Flexible filter params
-	post_filter_params?: Record<string, any>;
+	post_filter_params?: Record<string, unknown>;
 	/**
 	 * Native tree-sitter predicates for filtering (#eq?, #match?)
 	 * These run in WASM and are faster than post-filters
@@ -511,7 +512,9 @@ export class TreeSitterQueryLoader {
 			);
 			for (let i = 0; i < valueLines.length; i++) {
 				if (valueLines[i].trim().length === 0) continue; // leave blank lines alone
-				valueLines[i] = valueLines[i].slice(startIndent + Math.max(0, minExtraIndent));
+				valueLines[i] = valueLines[i].slice(
+					startIndent + Math.max(0, minExtraIndent),
+				);
 			}
 		}
 

@@ -15,6 +15,22 @@ vi.mock("../../../clients/lsp/ruby-drive-dirs.js", () => ({
 	getRubyVersionDirNamesAsync: async () => [],
 }));
 
+// Single parameterized fake for the six near-identical `MockChildProcess`
+// classes this file used to declare inline, one per `vi.doMock("node:child_
+// process", ...)` factory. `vi.doMock` (unlike `vi.mock`) isn't hoisted, so
+// its factory can close over a module-scope class like this one.
+class MockStream extends EventEmitter {}
+class MockChildProcess extends EventEmitter {
+	stdin = new MockStream();
+	stdout = new MockStream();
+	stderr = new MockStream();
+	exitCode: number | null = null;
+	killed = false;
+	constructor(public pid: number) {
+		super();
+	}
+}
+
 describe("lsp launch", () => {
 	afterEach(() => {
 		vi.useRealTimers();
@@ -25,18 +41,7 @@ describe("lsp launch", () => {
 	it.runIf(process.platform !== "win32")(
 		"spawns LSP servers in their own process group on POSIX",
 		async () => {
-			const spawnMock = vi.fn(() => {
-				class MockStream extends EventEmitter {}
-				class MockChildProcess extends EventEmitter {
-					stdin = new MockStream();
-					stdout = new MockStream();
-					stderr = new MockStream();
-					pid = 2468;
-					exitCode: number | null = null;
-					killed = false;
-				}
-				return new MockChildProcess();
-			});
+			const spawnMock = vi.fn(() => new MockChildProcess(2468));
 
 			vi.doMock("node:child_process", () => ({
 				execSync: vi.fn(() => ""),
@@ -66,19 +71,9 @@ describe("lsp launch", () => {
 			process.platform === "win32" ? "server.exe" : "server",
 		);
 
-		class MockStream extends EventEmitter {}
-		class MockChildProcess extends EventEmitter {
-			stdin = new MockStream();
-			stdout = new MockStream();
-			stderr = new MockStream();
-			pid = 8642;
-			exitCode: number | null = null;
-			killed = false;
-		}
-
 		vi.doMock("node:child_process", () => ({
 			execFileSync: vi.fn(() => ""),
-			spawn: vi.fn(() => new MockChildProcess()),
+			spawn: vi.fn(() => new MockChildProcess(8642)),
 		}));
 		vi.doMock("../../../clients/env-utils.js", () => ({
 			isTestMode: () => false,
@@ -113,20 +108,10 @@ describe("lsp launch", () => {
 			vi.useFakeTimers();
 
 			vi.doMock("node:child_process", () => {
-				class MockStream extends EventEmitter {}
-				class MockChildProcess extends EventEmitter {
-					stdin = new MockStream();
-					stdout = new MockStream();
-					stderr = new MockStream();
-					pid = 4321;
-					exitCode: number | null = null;
-					killed = false;
-				}
-
 				return {
 					execSync: vi.fn(() => ""),
 					spawn: vi.fn(() => {
-						const proc = new MockChildProcess();
+						const proc = new MockChildProcess(4321);
 						setTimeout(() => {
 							proc.exitCode = 1;
 							proc.emit("exit", 1, null);
@@ -162,16 +147,6 @@ describe("lsp launch", () => {
 			const resolvedBinary = path.join(tempDir, "taplo.exe");
 			fs.writeFileSync(resolvedBinary, "");
 			vi.doMock("node:child_process", () => {
-				class MockStream extends EventEmitter {}
-				class MockChildProcess extends EventEmitter {
-					stdin = new MockStream();
-					stdout = new MockStream();
-					stderr = new MockStream();
-					pid = 9876;
-					exitCode: number | null = null;
-					killed = false;
-				}
-
 				return {
 					execSync: vi.fn((command: string) => {
 						if (command === "where taplo") {
@@ -179,7 +154,7 @@ describe("lsp launch", () => {
 						}
 						return "";
 					}),
-					spawn: vi.fn(() => new MockChildProcess()),
+					spawn: vi.fn(() => new MockChildProcess(9876)),
 				};
 			});
 
@@ -290,21 +265,11 @@ describe("lsp launch", () => {
 
 			let spawnedCommand: string | undefined;
 			vi.doMock("node:child_process", () => {
-				class MockStream extends EventEmitter {}
-				class MockChildProcess extends EventEmitter {
-					stdin = new MockStream();
-					stdout = new MockStream();
-					stderr = new MockStream();
-					pid = 1234;
-					exitCode: number | null = null;
-					killed = false;
-				}
-
 				return {
 					execSync: vi.fn(() => ""),
 					spawn: vi.fn((command: string) => {
 						spawnedCommand = command;
-						return new MockChildProcess();
+						return new MockChildProcess(1234);
 					}),
 				};
 			});
@@ -333,22 +298,12 @@ describe("lsp launch", () => {
 			let spawnedCommand: string | undefined;
 			let spawnedArgs: string[] | undefined;
 			vi.doMock("node:child_process", () => {
-				class MockStream extends EventEmitter {}
-				class MockChildProcess extends EventEmitter {
-					stdin = new MockStream();
-					stdout = new MockStream();
-					stderr = new MockStream();
-					pid = 5678;
-					exitCode: number | null = null;
-					killed = false;
-				}
-
 				return {
 					execSync: vi.fn(() => ""),
 					spawn: vi.fn((command: string, args: string[]) => {
 						spawnedCommand = command;
 						spawnedArgs = args;
-						return new MockChildProcess();
+						return new MockChildProcess(5678);
 					}),
 				};
 			});

@@ -24,9 +24,10 @@ function hasHintToken(value: string, tokens: readonly string[]): boolean {
 	// substring. The second expression preserves camelCase names such as
 	// authStore and DatabaseClient without making `adb` match `db`.
 	return (
-		new RegExp(`(?:^|[/_.\\-\\s])(?:${alternatives})(?=[/_.\\-\\s]|$)`, "i").test(
-			value,
-		) ||
+		new RegExp(
+			`(?:^|[/_.\\-\\s])(?:${alternatives})(?=[/_.\\-\\s]|$)`,
+			"i",
+		).test(value) ||
 		new RegExp(
 			`(?:^|(?<=[a-z0-9]))(?:${tokens
 				.flatMap((token) => [
@@ -115,7 +116,16 @@ export function inferTrustBoundaries(nameOrPath: string): TrustBoundary[] {
 		boundaries.add("user-input");
 		boundaries.add("process-exec");
 	}
-	if (hasHintToken(normalized, ["auth", "login", "token", "session", "oauth", "jwt"])) {
+	if (
+		hasHintToken(normalized, [
+			"auth",
+			"login",
+			"token",
+			"session",
+			"oauth",
+			"jwt",
+		])
+	) {
 		boundaries.add("auth");
 		boundaries.add("user-input");
 	}

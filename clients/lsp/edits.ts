@@ -15,10 +15,7 @@ import {
 	lineTextAt,
 	type PositionEncoding,
 } from "./position-encoding.js";
-import {
-	recordLspMutation,
-	type LspMutationContext,
-} from "../lsp-mutation.js";
+import { recordLspMutation, type LspMutationContext } from "../lsp-mutation.js";
 import {
 	detectLineEnding,
 	normalizeToLF,
@@ -113,12 +110,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function isPosition(value: unknown): value is LSPPosition {
 	return (
 		isRecord(value) &&
-	Number.isFinite(value.line) &&
-	Number.isInteger(value.line) &&
-	(value.line as number) >= 0 &&
-	Number.isFinite(value.character) &&
-	Number.isInteger(value.character) &&
-	(value.character as number) >= 0
+		Number.isFinite(value.line) &&
+		Number.isInteger(value.line) &&
+		(value.line as number) >= 0 &&
+		Number.isFinite(value.character) &&
+		Number.isInteger(value.character) &&
+		(value.character as number) >= 0
 	);
 }
 
@@ -134,24 +131,38 @@ function isRange(value: unknown): value is LSPRange {
 }
 
 function isTextEdit(value: unknown): value is LSPTextEdit {
-	return isRecord(value) && isRange(value.range) && typeof value.newText === "string";
+	return (
+		isRecord(value) && isRange(value.range) && typeof value.newText === "string"
+	);
 }
 
 function parseTextEdits(value: unknown, context: string): LSPTextEdit[] {
-	if (!Array.isArray(value)) throw new Error(`${context}.edits must be an array`);
-	if (!value.every(isTextEdit)) throw new Error(`malformed text edit in ${context}`);
+	if (!Array.isArray(value))
+		throw new Error(`${context}.edits must be an array`);
+	if (!value.every(isTextEdit))
+		throw new Error(`malformed text edit in ${context}`);
 	return value;
 }
 
-function parseVersion(value: unknown, context: string): number | null | undefined {
+function parseVersion(
+	value: unknown,
+	context: string,
+): number | null | undefined {
 	if (value === undefined || value === null) return value;
-	if (!Number.isFinite(value) || !Number.isInteger(value) || (value as number) < 0) {
+	if (
+		!Number.isFinite(value) ||
+		!Number.isInteger(value) ||
+		(value as number) < 0
+	) {
 		throw new Error(`${context}.version must be a nonnegative integer or null`);
 	}
 	return value as number;
 }
 
-function parseResourceOptions(value: unknown, kind: string): ResourceOptions | undefined {
+function parseResourceOptions(
+	value: unknown,
+	kind: string,
+): ResourceOptions | undefined {
 	if (value === undefined) return undefined;
 	if (!isRecord(value)) throw new Error(`${kind}.options must be an object`);
 	const allowed = new Set(
@@ -176,12 +187,18 @@ function parseResourceOptions(value: unknown, kind: string): ResourceOptions | u
 	return value as ResourceOptions;
 }
 
-function parseTextDocumentEdit(value: unknown, context: string): TextDocumentEdit | null {
+function parseTextDocumentEdit(
+	value: unknown,
+	context: string,
+): TextDocumentEdit | null {
 	if (!isRecord(value) || !isRecord(value.textDocument)) return null;
 	if (typeof value.textDocument.uri !== "string") {
 		throw new Error(`${context}.textDocument.uri must be a string`);
 	}
-	const version = parseVersion(value.textDocument.version, `${context}.textDocument`);
+	const version = parseVersion(
+		value.textDocument.version,
+		`${context}.textDocument`,
+	);
 	return {
 		textDocument: { uri: value.textDocument.uri, version },
 		edits: parseTextEdits(value.edits, context),
@@ -194,13 +211,18 @@ function parseWorkspaceEdit(edit: {
 }): void {
 	if (!isRecord(edit)) throw new Error("workspace edit must be an object");
 	if (edit.changes !== undefined) {
-		if (!isRecord(edit.changes)) throw new Error("workspace edit changes must be an object");
+		if (!isRecord(edit.changes))
+			throw new Error("workspace edit changes must be an object");
 		for (const [uri, edits] of Object.entries(edit.changes)) {
-			if (typeof uri !== "string") throw new Error("workspace edit URI must be a string");
+			if (typeof uri !== "string")
+				throw new Error("workspace edit URI must be a string");
 			parseTextEdits(edits, `changes[${uri}]`);
 		}
 	}
-	if (edit.documentChanges !== undefined && !Array.isArray(edit.documentChanges)) {
+	if (
+		edit.documentChanges !== undefined &&
+		!Array.isArray(edit.documentChanges)
+	) {
 		throw new Error("workspace edit documentChanges must be an array");
 	}
 	for (const [index, change] of (edit.documentChanges ?? []).entries()) {
@@ -211,21 +233,28 @@ function parseWorkspaceEdit(edit: {
 		}
 		switch (change.kind) {
 			case "create":
-				if (typeof change.uri !== "string") throw new Error("create.uri must be a string");
+				if (typeof change.uri !== "string")
+					throw new Error("create.uri must be a string");
 				parseResourceOptions(change.options, "create");
 				break;
 			case "rename":
-				if (typeof change.oldUri !== "string" || typeof change.newUri !== "string") {
+				if (
+					typeof change.oldUri !== "string" ||
+					typeof change.newUri !== "string"
+				) {
 					throw new Error("rename requires oldUri and newUri strings");
 				}
 				parseResourceOptions(change.options, "rename");
 				break;
 			case "delete":
-				if (typeof change.uri !== "string") throw new Error("delete.uri must be a string");
+				if (typeof change.uri !== "string")
+					throw new Error("delete.uri must be a string");
 				parseResourceOptions(change.options, "delete");
 				break;
 			default:
-				throw new Error(`unsupported workspace resource operation: ${change.kind}`);
+				throw new Error(
+					`unsupported workspace resource operation: ${change.kind}`,
+				);
 		}
 	}
 }
@@ -235,7 +264,9 @@ function formatRange(range: LSPRange): string {
 }
 
 export function rangesOverlap(a: LSPRange, b: LSPRange): boolean {
-	return comparePosition(a.start, b.end) < 0 && comparePosition(b.start, a.end) < 0;
+	return (
+		comparePosition(a.start, b.end) < 0 && comparePosition(b.start, a.end) < 0
+	);
 }
 
 function positionsEqual(a: LSPPosition, b: LSPPosition): boolean {
@@ -267,7 +298,10 @@ function sortEditsForApplication(edits: LSPTextEdit[]): LSPTextEdit[] {
 	return edits
 		.map((edit, index) => ({ edit, index }))
 		.sort((a, b) => {
-			const startDelta = comparePosition(b.edit.range.start, a.edit.range.start);
+			const startDelta = comparePosition(
+				b.edit.range.start,
+				a.edit.range.start,
+			);
 			if (startDelta !== 0) return startDelta;
 			const endDelta = comparePosition(b.edit.range.end, a.edit.range.end);
 			if (endDelta !== 0) return endDelta;
@@ -299,13 +333,19 @@ function validateTextEdits(edits: LSPTextEdit[]): LSPTextEdit[] {
 		const later = ordered[index]?.range;
 		const earlier = ordered[index + 1]?.range;
 		if (later && earlier && comparePosition(earlier.end, later.start) > 0) {
-			throw new Error(`overlapping LSP edits: ${formatRange(earlier)} conflicts with ${formatRange(later)}`);
+			throw new Error(
+				`overlapping LSP edits: ${formatRange(earlier)} conflicts with ${formatRange(later)}`,
+			);
 		}
 	}
 	return unique;
 }
 
-function utf16Position(content: string, position: LSPPosition, encoding: PositionEncoding): LSPPosition {
+function utf16Position(
+	content: string,
+	position: LSPPosition,
+	encoding: PositionEncoding,
+): LSPPosition {
 	const line = lineTextAt(content, position.line);
 	const wireLength = convertCharacterOffset(encoding, line, line.length);
 	// `lineTextAt` splits on `\n` only and keeps a trailing `\r`, so the "real"
@@ -341,16 +381,28 @@ function utf16Position(content: string, position: LSPPosition, encoding: Positio
 		if (encoding === "utf-32" && offset > 0 && offset < line.length) {
 			const previous = line.charCodeAt(offset - 1);
 			const current = line.charCodeAt(offset);
-			if (previous >= 0xd800 && previous <= 0xdbff && current >= 0xdc00 && current <= 0xdfff) continue;
+			if (
+				previous >= 0xd800 &&
+				previous <= 0xdbff &&
+				current >= 0xdc00 &&
+				current <= 0xdfff
+			)
+				continue;
 		}
 		if (convertCharacterOffset(encoding, line, offset) === position.character) {
 			return { line: position.line, character: offset };
 		}
 	}
-	throw new Error(`text edit character ${position.character} is not a ${encoding} boundary`);
+	throw new Error(
+		`text edit character ${position.character} is not a ${encoding} boundary`,
+	);
 }
 
-function normalizeTextEditsForContent(content: string, edits: LSPTextEdit[], encoding: PositionEncoding): LSPTextEdit[] {
+function normalizeTextEditsForContent(
+	content: string,
+	edits: LSPTextEdit[],
+	encoding: PositionEncoding,
+): LSPTextEdit[] {
 	const lines = content.split("\n");
 	const lastLine = Math.max(0, lines.length - 1);
 	// The target file's dominant EOL style, detected the same way the host edit
@@ -374,7 +426,8 @@ function normalizeTextEditsForContent(content: string, edits: LSPTextEdit[], enc
 	const converted = edits.map((edit) => {
 		const start = clamp(edit.range.start);
 		const end = clamp(edit.range.end);
-		if (comparePosition(start, end) > 0) throw new Error("text edit range is out of order");
+		if (comparePosition(start, end) > 0)
+			throw new Error("text edit range is out of order");
 		return {
 			...edit,
 			range: { start, end },
@@ -386,7 +439,11 @@ function normalizeTextEditsForContent(content: string, edits: LSPTextEdit[], enc
 	return validateTextEdits(converted);
 }
 
-export function applyTextEditsToString(content: string, edits: LSPTextEdit[], positionEncoding: PositionEncoding = "utf-16"): string {
+export function applyTextEditsToString(
+	content: string,
+	edits: LSPTextEdit[],
+	positionEncoding: PositionEncoding = "utf-16",
+): string {
 	const lines = content.split("\n");
 	// normalizeTextEditsForContent returns array order; sort for reverse
 	// application exactly once, here, at the single string-write site.
@@ -397,13 +454,23 @@ export function applyTextEditsToString(content: string, edits: LSPTextEdit[], po
 		const { start, end } = edit.range;
 		if (start.line === end.line) {
 			const line = lines[start.line] ?? "";
-			lines[start.line] = line.slice(0, start.character) + edit.newText + line.slice(end.character);
+			lines[start.line] =
+				line.slice(0, start.character) +
+				edit.newText +
+				line.slice(end.character);
 			continue;
 		}
 		const startLine = lines[start.line] ?? "";
 		const endLine = lines[end.line] ?? "";
-		const replacement = startLine.slice(0, start.character) + edit.newText + endLine.slice(end.character);
-		lines.splice(start.line, end.line - start.line + 1, ...replacement.split("\n"));
+		const replacement =
+			startLine.slice(0, start.character) +
+			edit.newText +
+			endLine.slice(end.character);
+		lines.splice(
+			start.line,
+			end.line - start.line + 1,
+			...replacement.split("\n"),
+		);
 	}
 	return lines.join("\n");
 }
@@ -412,7 +479,10 @@ export async function normalizeWorkspaceEditToUtf16(
 	edit: { changes?: Record<string, unknown[]>; documentChanges?: unknown[] },
 	positionEncoding: PositionEncoding,
 	cwd: string,
-): Promise<{ changes?: Record<string, unknown[]>; documentChanges?: unknown[] }> {
+): Promise<{
+	changes?: Record<string, unknown[]>;
+	documentChanges?: unknown[];
+}> {
 	parseWorkspaceEdit(edit);
 	if (positionEncoding === "utf-16") return edit;
 
@@ -421,7 +491,9 @@ export async function normalizeWorkspaceEditToUtf16(
 	// followed by a text edit at newDir/file.ts: the destination is not on disk
 	// yet, but its content is available through the virtual move.
 	const planned = planWorkspaceEdit(edit, true);
-	const prepared = await preflightWorkspaceEdit(planned, cwd, { positionEncoding });
+	const prepared = await preflightWorkspaceEdit(planned, cwd, {
+		positionEncoding,
+	});
 	const normalizedByOrigin = new Map<string, LSPTextEdit[]>();
 	for (const op of planned) {
 		if (op.kind !== "text") continue;
@@ -435,7 +507,10 @@ export async function normalizeWorkspaceEditToUtf16(
 
 	const changes: Record<string, unknown[]> = {};
 	for (const uri of Object.keys(edit.changes ?? {})) {
-		changes[uri] = normalizedByOrigin.get(textEditOriginKey({ kind: "changes", uri, edits: [] })) ?? [];
+		changes[uri] =
+			normalizedByOrigin.get(
+				textEditOriginKey({ kind: "changes", uri, edits: [] }),
+			) ?? [];
 	}
 	const documentChanges: unknown[] = [];
 	for (const [index, change] of (edit.documentChanges ?? []).entries()) {
@@ -446,7 +521,10 @@ export async function normalizeWorkspaceEditToUtf16(
 		}
 		documentChanges.push({
 			...(change as Record<string, unknown>),
-			edits: normalizedByOrigin.get(textEditOriginKey({ kind: "documentChanges", index, edits: [] })) ?? [],
+			edits:
+				normalizedByOrigin.get(
+					textEditOriginKey({ kind: "documentChanges", index, edits: [] }),
+				) ?? [],
 		});
 	}
 	return {
@@ -455,7 +533,10 @@ export async function normalizeWorkspaceEditToUtf16(
 	};
 }
 
-export function flattenWorkspaceTextEdits(edit: { changes?: Record<string, unknown[]>; documentChanges?: unknown[] }): Map<string, LSPTextEdit[]> {
+export function flattenWorkspaceTextEdits(edit: {
+	changes?: Record<string, unknown[]>;
+	documentChanges?: unknown[];
+}): Map<string, LSPTextEdit[]> {
 	parseWorkspaceEdit(edit);
 	const buckets = new Map<string, { uri: string; edits: LSPTextEdit[] }>();
 	const push = (uri: string, edits: unknown[]) => {
@@ -466,7 +547,8 @@ export function flattenWorkspaceTextEdits(edit: { changes?: Record<string, unkno
 		if (existing) existing.edits.push(...textEdits);
 		else buckets.set(key, { uri, edits: [...textEdits] });
 	};
-	for (const [uri, edits] of Object.entries(edit.changes ?? {})) push(uri, edits);
+	for (const [uri, edits] of Object.entries(edit.changes ?? {}))
+		push(uri, edits);
 	for (const change of edit.documentChanges ?? []) {
 		const text = parseTextDocumentEdit(change, "documentChanges");
 		if (text) push(text.textDocument.uri, text.edits);
@@ -475,7 +557,14 @@ export function flattenWorkspaceTextEdits(edit: { changes?: Record<string, unkno
 }
 
 function textEditKey(uri: string, edit: LSPTextEdit): string {
-	return [pathIndexKey(uri), edit.range.start.line, edit.range.start.character, edit.range.end.line, edit.range.end.character, edit.newText].join(":");
+	return [
+		pathIndexKey(uri),
+		edit.range.start.line,
+		edit.range.start.character,
+		edit.range.end.line,
+		edit.range.end.character,
+		edit.newText,
+	].join(":");
 }
 
 export interface MergeWorkspaceEditsResult {
@@ -485,7 +574,15 @@ export interface MergeWorkspaceEditsResult {
 	serverIds: string[];
 }
 
-export function mergeWorkspaceTextEditsByPriority(entries: Array<{ serverId: string; edit: { changes?: Record<string, unknown[]>; documentChanges?: unknown[] } | null | undefined }>): MergeWorkspaceEditsResult {
+export function mergeWorkspaceTextEditsByPriority(
+	entries: Array<{
+		serverId: string;
+		edit:
+			| { changes?: Record<string, unknown[]>; documentChanges?: unknown[] }
+			| null
+			| undefined;
+	}>,
+): MergeWorkspaceEditsResult {
 	const merged = new Map<string, { uri: string; edits: LSPTextEdit[] }>();
 	// Exact-duplicate dedup is a CROSS-SERVER concern only: two servers proposing
 	// the identical non-empty replace should collapse to one. Zero-width inserts
@@ -509,9 +606,13 @@ export function mergeWorkspaceTextEditsByPriority(entries: Array<{ serverId: str
 			const kept = bucket.edits;
 			for (const edit of edits) {
 				inputEditCount += 1;
-				const exactKey = isEmptyRange(edit.range) ? undefined : textEditKey(uri, edit);
+				const exactKey = isEmptyRange(edit.range)
+					? undefined
+					: textEditKey(uri, edit);
 				if (exactKey !== undefined && seenExact.has(exactKey)) continue;
-				if (kept.some((existing) => rangesOverlap(existing.range, edit.range))) {
+				if (
+					kept.some((existing) => rangesOverlap(existing.range, edit.range))
+				) {
 					droppedConflicts += 1;
 					continue;
 				}
@@ -537,7 +638,7 @@ type WorkspaceEditOp =
 			edits: LSPTextEdit[];
 			version?: number | null;
 			origins?: TextEditOrigin[];
-		}
+	  }
 	| CreateFileOp
 	| RenameFileOp
 	| DeleteFileOp;
@@ -562,9 +663,25 @@ function textEditOriginKey(origin: TextEditOrigin): string {
 
 function parseResource(change: Record<string, unknown>): WorkspaceEditOp {
 	const kind = change.kind;
-	if (kind === "create") return { kind, uri: change.uri as string, options: parseResourceOptions(change.options, kind) };
-	if (kind === "rename") return { kind, oldUri: change.oldUri as string, newUri: change.newUri as string, options: parseResourceOptions(change.options, kind) };
-	if (kind === "delete") return { kind, uri: change.uri as string, options: parseResourceOptions(change.options, kind) };
+	if (kind === "create")
+		return {
+			kind,
+			uri: change.uri as string,
+			options: parseResourceOptions(change.options, kind),
+		};
+	if (kind === "rename")
+		return {
+			kind,
+			oldUri: change.oldUri as string,
+			newUri: change.newUri as string,
+			options: parseResourceOptions(change.options, kind),
+		};
+	if (kind === "delete")
+		return {
+			kind,
+			uri: change.uri as string,
+			options: parseResourceOptions(change.options, kind),
+		};
 	throw new Error(`unsupported workspace resource operation: ${String(kind)}`);
 }
 
@@ -574,12 +691,15 @@ function planWorkspaceEdit(
 ): WorkspaceEditOp[] {
 	parseWorkspaceEdit(edit);
 	const ops: WorkspaceEditOp[] = [];
-	const pending = new Map<string, {
-		uri: string;
-		edits: LSPTextEdit[];
-		version?: number | null;
-		origins?: TextEditOrigin[];
-	}>();
+	const pending = new Map<
+		string,
+		{
+			uri: string;
+			edits: LSPTextEdit[];
+			version?: number | null;
+			origins?: TextEditOrigin[];
+		}
+	>();
 	const descendants = new Map<string, Set<string>>();
 	const indexedAncestors = new Map<string, string[]>();
 	const seenResources = new Set<string>();
@@ -609,7 +729,8 @@ function planWorkspaceEdit(
 		indexedAncestors.set(key, ancestors);
 	};
 	const removeIndex = (key: string): void => {
-		for (const ancestor of indexedAncestors.get(key) ?? []) descendants.get(ancestor)?.delete(key);
+		for (const ancestor of indexedAncestors.get(key) ?? [])
+			descendants.get(ancestor)?.delete(key);
 		indexedAncestors.delete(key);
 	};
 	const queue = (
@@ -627,14 +748,20 @@ function planWorkspaceEdit(
 			// adopted over a `null`/`undefined` counterpart from another edit container
 			// for the same document, so the later preflight version check (which only
 			// fires for numeric `op.version`) still validates it.
-			const existingNumeric = typeof existing.version === "number" ? existing.version : undefined;
+			const existingNumeric =
+				typeof existing.version === "number" ? existing.version : undefined;
 			const incomingNumeric = typeof version === "number" ? version : undefined;
-			if (existingNumeric !== undefined && incomingNumeric !== undefined && existingNumeric !== incomingNumeric) {
+			if (
+				existingNumeric !== undefined &&
+				incomingNumeric !== undefined &&
+				existingNumeric !== incomingNumeric
+			) {
 				throw new Error(`conflicting text document versions for ${uri}`);
 			}
 			existing.edits.push(...edits);
 			if (origin) (existing.origins ??= []).push(origin);
-			if (existingNumeric === undefined && incomingNumeric !== undefined) existing.version = version;
+			if (existingNumeric === undefined && incomingNumeric !== undefined)
+				existing.version = version;
 			return;
 		}
 		if (origin) {
@@ -659,7 +786,12 @@ function planWorkspaceEdit(
 				origins: item.origins,
 			});
 		} else {
-			ops.push({ kind: "text", uri: item.uri, edits: item.edits, version: item.version });
+			ops.push({
+				kind: "text",
+				uri: item.uri,
+				edits: item.edits,
+				version: item.version,
+			});
 		}
 	};
 	const flushSubtree = (uri: string): void => {
@@ -687,19 +819,21 @@ function planWorkspaceEdit(
 				text.textDocument.version,
 				trackOrigins
 					? {
-						kind: "documentChanges",
-						index,
-						edits: text.edits as LSPTextEdit[],
-					}
+							kind: "documentChanges",
+							index,
+							edits: text.edits as LSPTextEdit[],
+						}
 					: undefined,
 			);
 			continue;
 		}
 		const resource = parseResource(change as Record<string, unknown>);
-		const resourceKey = resource.kind === "rename"
-			? `rename:${indexKey(resource.oldUri)}:${indexKey(resource.newUri)}`
-			: `${resource.kind}:${indexKey(resource.uri)}`;
-		if (seenResources.has(resourceKey)) throw new Error(`duplicate workspace resource operation: ${resourceKey}`);
+		const resourceKey =
+			resource.kind === "rename"
+				? `rename:${indexKey(resource.oldUri)}:${indexKey(resource.newUri)}`
+				: `${resource.kind}:${indexKey(resource.uri)}`;
+		if (seenResources.has(resourceKey))
+			throw new Error(`duplicate workspace resource operation: ${resourceKey}`);
 		seenResources.add(resourceKey);
 		if (resource.kind === "create") flushUri(resource.uri);
 		else if (resource.kind === "rename") {
@@ -713,7 +847,10 @@ function planWorkspaceEdit(
 }
 
 /** Test-only planning probe used by the scaled occupancy regression. */
-export function __planWorkspaceEditForTest(edit: { changes?: Record<string, unknown[]>; documentChanges?: unknown[] }): number {
+export function __planWorkspaceEditForTest(edit: {
+	changes?: Record<string, unknown[]>;
+	documentChanges?: unknown[];
+}): number {
 	return planWorkspaceEdit(edit).length;
 }
 
@@ -735,7 +872,8 @@ function relativeToCwd(filePath: string, cwd: string): string {
 // (e.g. a string literal), but that only risks over-reporting `importsChanged`
 // (the safe direction — master's prior /^import\s/m heuristic over-invalidated
 // too), never under-reporting a real specifier change.
-const IMPORT_RELEVANT_LINE = /^\s*import\b|^\s*export\s[^;]*\bfrom\s|\bfrom\s+['"]/;
+const IMPORT_RELEVANT_LINE =
+	/^\s*import\b|^\s*export\s[^;]*\bfrom\s|\bfrom\s+['"]/;
 
 /**
  * A stable signature of the import/re-export-from lines in `text`, order-
@@ -761,14 +899,29 @@ function importsSignature(text: string): string {
 		.join("\n");
 }
 
-export function summarizeWorkspaceEdit(edit: { changes?: Record<string, unknown[]>; documentChanges?: unknown[] }, cwd: string): string[] {
+export function summarizeWorkspaceEdit(
+	edit: { changes?: Record<string, unknown[]>; documentChanges?: unknown[] },
+	cwd: string,
+): string[] {
 	const lines: string[] = [];
-	for (const [uri, edits] of flattenWorkspaceTextEdits(edit)) lines.push(`Apply ${edits.length} edit(s) to ${relativeToCwd(uriToPath(uri), cwd)}`);
+	for (const [uri, edits] of flattenWorkspaceTextEdits(edit))
+		lines.push(
+			`Apply ${edits.length} edit(s) to ${relativeToCwd(uriToPath(uri), cwd)}`,
+		);
 	for (const change of edit.documentChanges ?? []) {
 		if (!isRecord(change) || typeof change.kind !== "string") continue;
-		if (change.kind === "create" && typeof change.uri === "string") lines.push(`Create ${relativeToCwd(uriToPath(change.uri), cwd)}`);
-		else if (change.kind === "rename" && typeof change.oldUri === "string" && typeof change.newUri === "string") lines.push(`Rename ${relativeToCwd(uriToPath(change.oldUri), cwd)} → ${relativeToCwd(uriToPath(change.newUri), cwd)}`);
-		else if (change.kind === "delete" && typeof change.uri === "string") lines.push(`Delete ${relativeToCwd(uriToPath(change.uri), cwd)}`);
+		if (change.kind === "create" && typeof change.uri === "string")
+			lines.push(`Create ${relativeToCwd(uriToPath(change.uri), cwd)}`);
+		else if (
+			change.kind === "rename" &&
+			typeof change.oldUri === "string" &&
+			typeof change.newUri === "string"
+		)
+			lines.push(
+				`Rename ${relativeToCwd(uriToPath(change.oldUri), cwd)} → ${relativeToCwd(uriToPath(change.newUri), cwd)}`,
+			);
+		else if (change.kind === "delete" && typeof change.uri === "string")
+			lines.push(`Delete ${relativeToCwd(uriToPath(change.uri), cwd)}`);
 	}
 	return lines;
 }
@@ -805,7 +958,9 @@ export function isSameFsIdentity(
 	return a.dev === b.dev && a.ino !== 0n && b.ino !== 0n && a.ino === b.ino;
 }
 
-async function bigintLstatOrMissing(filePath: string): Promise<BigIntStats | undefined> {
+async function bigintLstatOrMissing(
+	filePath: string,
+): Promise<BigIntStats | undefined> {
 	try {
 		return await fs.lstat(filePath, { bigint: true });
 	} catch (err) {
@@ -838,11 +993,13 @@ async function assertParentIsUsable(
 	while (true) {
 		const known = await stateFor(current);
 		if (known.exists) {
-			if (!known.directory) throw new Error(`resource parent is not a directory: ${current}`);
+			if (!known.directory)
+				throw new Error(`resource parent is not a directory: ${current}`);
 			return;
 		}
 		const parent = path.dirname(current);
-		if (parent === current) throw new Error(`resource parent does not exist: ${filePath}`);
+		if (parent === current)
+			throw new Error(`resource parent does not exist: ${filePath}`);
 		current = parent;
 	}
 }
@@ -873,14 +1030,22 @@ async function createWorkspaceUriConfiner(
 		let filePath = "";
 		try {
 			const parsed = new URL(uri);
-			if (parsed.protocol !== "file:" || (parsed.host !== "" && parsed.hostname !== "localhost")) throw new Error("URI must be a local file URI");
+			if (
+				parsed.protocol !== "file:" ||
+				(parsed.host !== "" && parsed.hostname !== "localhost")
+			)
+				throw new Error("URI must be a local file URI");
 			filePath = uriToPath(uri);
 		} catch (err) {
-			throw new Error(`invalid workspace edit URI ${uri}: ${err instanceof Error ? err.message : String(err)}`);
+			throw new Error(
+				`invalid workspace edit URI ${uri}: ${err instanceof Error ? err.message : String(err)}`,
+			);
 		}
-		if (!path.isAbsolute(filePath)) throw new Error(`workspace edit path escapes workspace: ${uri}`);
+		if (!path.isAbsolute(filePath))
+			throw new Error(`workspace edit path escapes workspace: ${uri}`);
 		const resolved = await resolveExistingAncestor(filePath);
-		if (!isUnderDir(resolved, root)) throw new Error(`workspace edit path escapes workspace: ${uri}`);
+		if (!isUnderDir(resolved, root))
+			throw new Error(`workspace edit path escapes workspace: ${uri}`);
 		return filePath;
 	};
 }
@@ -926,14 +1091,18 @@ async function preflightWorkspaceEdit(
 		let resolved = filePath;
 		for (let index = virtualMoves.length - 1; index >= 0; index--) {
 			const move = virtualMoves[index];
-			if (isUnderDir(resolved, move.to) &&
-				(move.directory || pathsEqual(resolved, move.to))) {
+			if (
+				isUnderDir(resolved, move.to) &&
+				(move.directory || pathsEqual(resolved, move.to))
+			) {
 				const suffix = path.relative(move.to, resolved);
 				resolved = suffix ? path.join(move.from, suffix) : move.from;
 				continue;
 			}
-			if (isUnderDir(resolved, move.from) &&
-				(move.directory || pathsEqual(resolved, move.from))) {
+			if (
+				isUnderDir(resolved, move.from) &&
+				(move.directory || pathsEqual(resolved, move.from))
+			) {
 				return undefined;
 			}
 		}
@@ -948,7 +1117,10 @@ async function preflightWorkspaceEdit(
 	const clearTombstonesUnder = (filePath: string): void => {
 		for (let index = virtualTombstones.length - 1; index >= 0; index--) {
 			const tombstone = virtualTombstones[index];
-			if (pathsEqual(tombstone.path, filePath) || isUnderDir(tombstone.path, filePath)) {
+			if (
+				pathsEqual(tombstone.path, filePath) ||
+				isUnderDir(tombstone.path, filePath)
+			) {
 				virtualTombstones.splice(index, 1);
 			}
 		}
@@ -957,21 +1129,34 @@ async function preflightWorkspaceEdit(
 		if (isTombstoned(filePath)) return { exists: false, directory: false };
 		const physicalPath = resolveVirtualPath(filePath);
 		if (!physicalPath) {
-			return virtualOverrides.get(normalizeMapKey(filePath)) ?? { exists: false, directory: false };
+			return (
+				virtualOverrides.get(normalizeMapKey(filePath)) ?? {
+					exists: false,
+					directory: false,
+				}
+			);
 		}
 		const key = normalizeMapKey(physicalPath);
 		const known = virtual.get(key);
 		if (known) return known;
 		const stat = await lstatOrMissing(physicalPath);
-		const value = { exists: Boolean(stat), directory: stat?.isDirectory() ?? false };
+		const value = {
+			exists: Boolean(stat),
+			directory: stat?.isDirectory() ?? false,
+		};
 		virtual.set(key, value);
 		return value;
 	};
-	const contentFor = async (filePath: string, state: VirtualFile): Promise<string> => {
-		if (!state.exists || state.directory) throw new Error(`text edit target is not a file: ${filePath}`);
+	const contentFor = async (
+		filePath: string,
+		state: VirtualFile,
+	): Promise<string> => {
+		if (!state.exists || state.directory)
+			throw new Error(`text edit target is not a file: ${filePath}`);
 		if (state.content !== undefined) return state.content;
 		const physicalPath = resolveVirtualPath(filePath);
-		if (!physicalPath) throw new Error(`text edit target does not exist: ${filePath}`);
+		if (!physicalPath)
+			throw new Error(`text edit target does not exist: ${filePath}`);
 		const content = await fs.readFile(physicalPath, "utf-8");
 		state.content = content;
 		return content;
@@ -981,12 +1166,21 @@ async function preflightWorkspaceEdit(
 			const filePath = await confine(op.uri);
 			const state = await stateFor(filePath);
 			if (op.version !== undefined && op.version !== null) {
-				const current = options.documentVersions?.get(normalizeMapKey(filePath));
-				if (current === undefined || current !== op.version) throw new Error(`stale text document version for ${filePath}: expected ${op.version}, current ${current ?? "unknown"}`);
+				const current = options.documentVersions?.get(
+					normalizeMapKey(filePath),
+				);
+				if (current === undefined || current !== op.version)
+					throw new Error(
+						`stale text document version for ${filePath}: expected ${op.version}, current ${current ?? "unknown"}`,
+					);
 			}
 			const content = await contentFor(filePath, state);
 			const encoding = options.positionEncoding ?? "utf-16";
-			const normalized = normalizeTextEditsForContent(content, op.edits, encoding);
+			const normalized = normalizeTextEditsForContent(
+				content,
+				op.edits,
+				encoding,
+			);
 			text.set(op, normalized);
 
 			// Keep the normalized edits attached to their original LSP containers.
@@ -1010,8 +1204,12 @@ async function preflightWorkspaceEdit(
 			const state = await stateFor(filePath);
 			await assertParentIsUsable(filePath, stateFor);
 			if (state.exists) {
-				if (op.options?.ignoreIfExists) { ignored.add(op); continue; }
-				if (!op.options?.overwrite || state.directory) throw new Error(`create target already exists: ${filePath}`);
+				if (op.options?.ignoreIfExists) {
+					ignored.add(op);
+					continue;
+				}
+				if (!op.options?.overwrite || state.directory)
+					throw new Error(`create target already exists: ${filePath}`);
 				state.content = "";
 			} else {
 				clearTombstonesUnder(filePath);
@@ -1040,11 +1238,15 @@ async function preflightWorkspaceEdit(
 			// treat a same-key-different-case pair as a real rename below.
 			const oldDisk = uriToDiskPath(op.oldUri);
 			const newDisk = uriToDiskPath(op.newUri);
-			if (path.resolve(oldDisk).replace(/\\/g, "/") === path.resolve(newDisk).replace(/\\/g, "/")) {
+			if (
+				path.resolve(oldDisk).replace(/\\/g, "/") ===
+				path.resolve(newDisk).replace(/\\/g, "/")
+			) {
 				throw new Error("rename source and destination must differ");
 			}
 			const source = await stateFor(oldPath);
-			if (!source.exists) throw new Error(`rename source does not exist: ${oldPath}`);
+			if (!source.exists)
+				throw new Error(`rename source does not exist: ${oldPath}`);
 			// Captured BEFORE this rename's own `virtualMoves`/override mutations
 			// below, so it reflects how `source` was actually resolved: `true` when
 			// `oldPath` is itself shadowed by an earlier rename in this edit and the
@@ -1073,10 +1275,15 @@ async function preflightWorkspaceEdit(
 				// that keying — the same virtual entry (a case-insensitive-FS alias);
 				// checked as a fast, disk-free first branch before falling back to the
 				// physical probe (which remains untouched for genuinely-physical paths).
-				const aliasesSource = destination === source || (await isSameFsEntry(oldDisk, newDisk));
+				const aliasesSource =
+					destination === source || (await isSameFsEntry(oldDisk, newDisk));
 				if (!aliasesSource) {
-					if (op.options?.ignoreIfExists) { ignored.add(op); continue; }
-					if (!op.options?.overwrite) throw new Error(`rename destination already exists: ${newPath}`);
+					if (op.options?.ignoreIfExists) {
+						ignored.add(op);
+						continue;
+					}
+					if (!op.options?.overwrite)
+						throw new Error(`rename destination already exists: ${newPath}`);
 				}
 			}
 			clearTombstonesUnder(newPath);
@@ -1097,14 +1304,19 @@ async function preflightWorkspaceEdit(
 				// resolves to a physical path.
 				virtualOverrides.delete(normalizeMapKey(oldPath));
 				const destinationPhysicalPath = resolveVirtualPath(newPath);
-				if (destinationPhysicalPath) virtual.set(normalizeMapKey(destinationPhysicalPath), source);
+				if (destinationPhysicalPath)
+					virtual.set(normalizeMapKey(destinationPhysicalPath), source);
 				else virtualOverrides.set(normalizeMapKey(newPath), source);
 			} else {
 				// Keep descendants lazy: a later text edit under a renamed directory
 				// resolves through this virtual move to the original physical path.
 				// This preserves ordered workspace-edit semantics without walking the
 				// entire subtree during preflight.
-				virtualMoves.push({ from: oldPath, to: newPath, directory: source.directory });
+				virtualMoves.push({
+					from: oldPath,
+					to: newPath,
+					directory: source.directory,
+				});
 			}
 			continue;
 		}
@@ -1114,7 +1326,8 @@ async function preflightWorkspaceEdit(
 			if (op.options?.ignoreIfNotExists) ignored.add(op);
 			else throw new Error(`delete target does not exist: ${filePath}`);
 		} else {
-			if (state.directory && !op.options?.recursive) throw new Error(`delete directory requires recursive: ${filePath}`);
+			if (state.directory && !op.options?.recursive)
+				throw new Error(`delete directory requires recursive: ${filePath}`);
 			state.exists = false;
 			state.content = undefined;
 			virtualTombstones.push({ path: filePath, directory: state.directory });
@@ -1195,12 +1408,21 @@ export async function applyWorkspaceEdit(
 				const content = await fs.readFile(diskPath, "utf-8");
 				const updated = applyTextEditsToString(content, edits, "utf-16");
 				await fs.writeFile(diskPath, updated, "utf-8");
-				const start = Math.min(...edits.map((item) => item.range.start.line + 1));
+				const start = Math.min(
+					...edits.map((item) => item.range.start.line + 1),
+				);
 				const end = Math.max(...edits.map((item) => item.range.end.line + 1));
 				touchedFiles.add(filePath);
-				fileDetails.push({ filePath, range: { start, end }, importsChanged: importsSignature(content) !== importsSignature(updated) });
+				fileDetails.push({
+					filePath,
+					range: { start, end },
+					importsChanged:
+						importsSignature(content) !== importsSignature(updated),
+				});
 				markApplied(op);
-				descriptions.push(`Applied ${edits.length} edit(s) to ${relativeToCwd(filePath, cwd)}`);
+				descriptions.push(
+					`Applied ${edits.length} edit(s) to ${relativeToCwd(filePath, cwd)}`,
+				);
 			} else if (op.kind === "create") {
 				// Create on the decoded path so `NewFile.txt` is not lowercased on win32;
 				// report/key on the normalized path.
@@ -1210,7 +1432,11 @@ export async function applyWorkspaceEdit(
 				if (op.options?.overwrite) await fs.writeFile(diskPath, "", "utf-8");
 				else await fs.writeFile(diskPath, "", { flag: "wx" });
 				touchedFiles.add(filePath);
-				fileDetails.push({ filePath, range: { start: 1, end: 1 }, importsChanged: false });
+				fileDetails.push({
+					filePath,
+					range: { start: 1, end: 1 },
+					importsChanged: false,
+				});
 				markApplied(op);
 				descriptions.push(`Created ${relativeToCwd(filePath, cwd)}`);
 			} else if (op.kind === "rename") {
@@ -1221,22 +1447,40 @@ export async function applyWorkspaceEdit(
 				const oldDisk = uriToDiskPath(op.oldUri);
 				const newDisk = uriToDiskPath(op.newUri);
 				await fs.mkdir(path.dirname(newDisk), { recursive: true });
-				if (op.options?.overwrite) await fs.rm(newDisk, { recursive: true, force: true });
+				if (op.options?.overwrite)
+					await fs.rm(newDisk, { recursive: true, force: true });
 				await fs.rename(oldDisk, newDisk);
 				touchedFiles.add(oldPath);
 				touchedFiles.add(newPath);
 				fileDetails.push(
-					{ filePath: oldPath, range: { start: 1, end: 1 }, importsChanged: true },
-					{ filePath: newPath, range: { start: 1, end: 1 }, importsChanged: true },
+					{
+						filePath: oldPath,
+						range: { start: 1, end: 1 },
+						importsChanged: true,
+					},
+					{
+						filePath: newPath,
+						range: { start: 1, end: 1 },
+						importsChanged: true,
+					},
 				);
 				markApplied(op);
-				descriptions.push(`Renamed ${relativeToCwd(oldPath, cwd)} → ${relativeToCwd(newPath, cwd)}`);
+				descriptions.push(
+					`Renamed ${relativeToCwd(oldPath, cwd)} → ${relativeToCwd(newPath, cwd)}`,
+				);
 			} else {
 				const filePath = uriToPath(op.uri);
 				const diskPath = uriToDiskPath(op.uri);
-				await fs.rm(diskPath, { recursive: op.options?.recursive === true, force: false });
+				await fs.rm(diskPath, {
+					recursive: op.options?.recursive === true,
+					force: false,
+				});
 				touchedFiles.add(filePath);
-				fileDetails.push({ filePath, range: { start: 1, end: 1 }, importsChanged: true });
+				fileDetails.push({
+					filePath,
+					range: { start: 1, end: 1 },
+					importsChanged: true,
+				});
 				markApplied(op);
 				descriptions.push(`Deleted ${relativeToCwd(filePath, cwd)}`);
 			}
@@ -1244,11 +1488,16 @@ export async function applyWorkspaceEdit(
 	} catch (err) {
 		const partial = makeResult();
 		if (options.mutationContext && options.observe !== false) {
-			recordLspMutation(options.mutationContext, { results: [partial], status: "failed" });
+			recordLspMutation(options.mutationContext, {
+				results: [partial],
+				status: "failed",
+			});
 		}
 		const already = [...touchedFiles];
 		if (already.length > 0) {
-			const alreadyList = already.map((f) => `  • ${relativeToCwd(f, cwd)}`).join("\n");
+			const alreadyList = already
+				.map((f) => `  • ${relativeToCwd(f, cwd)}`)
+				.join("\n");
 			const failure = new Error(
 				`Workspace edit failed mid-application — ${already.length} file(s) already written, no rollback performed:\n${alreadyList}\nCause: ${err instanceof Error ? err.message : String(err)}`,
 			) as Error & { appliedWorkspaceEdit?: AppliedWorkspaceEdit };

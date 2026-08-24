@@ -3,10 +3,16 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { buildCallGraph, saveCallGraph } from "../../clients/call-graph.js";
-import { grammarBlockReason, LANGUAGE_TO_GRAMMAR } from "../../clients/grammar-source.js";
+import {
+	grammarBlockReason,
+	LANGUAGE_TO_GRAMMAR,
+} from "../../clients/grammar-source.js";
 import { getSharedTreeSitterClient } from "../../clients/tree-sitter-shared.js";
 import { FactStore } from "../../clients/dispatch/fact-store.js";
-import { moduleReport, renderCompactModuleReport } from "../../clients/module-report.js";
+import {
+	moduleReport,
+	renderCompactModuleReport,
+} from "../../clients/module-report.js";
 import {
 	buildOrUpdateGraph,
 	clearReviewGraphWorkspaceCache,
@@ -38,25 +44,234 @@ interface FixtureCase {
 // These are committed, multi-file fixtures. The test copies them to an isolated
 // project only so the production graph builder can treat them as a workspace.
 const CALL_FIXTURES: FixtureCase[] = [
-	{ language: "typescript", directory: "typescript", target: "callee.ts", callerFile: "caller.ts", caller: "caller", callee: "helper", callerKind: "function", calleeKind: "function", callerLine: 3, calleeLine: 1 },
-	{ language: "tsx", directory: "tsx", target: "callee.tsx", callerFile: "caller.tsx", caller: "caller", callee: "helper", callerKind: "function", calleeKind: "function", callerLine: 3, calleeLine: 1 },
-	{ language: "javascript", directory: "javascript", target: "callee.js", callerFile: "caller.cjs", caller: "caller", callee: "helper", callerKind: "function", calleeKind: "function", callerLine: 1, calleeLine: 1 },
-	{ language: "python", directory: "python", target: "callee.py", callerFile: "caller.py", caller: "caller", callee: "helper", callerKind: "function", calleeKind: "function", callerLine: 1, calleeLine: 1 },
-	{ language: "go", directory: "go", target: "callee.go", callerFile: "caller.go", caller: "caller", callee: "helper", callerKind: "function", calleeKind: "function", callerLine: 3, calleeLine: 3 },
-	{ language: "rust", directory: "rust", target: "callee.rs", callerFile: "caller.rs", caller: "caller", callee: "helper", callerKind: "function", calleeKind: "function", callerLine: 1, calleeLine: 1 },
-	{ language: "ruby", directory: "ruby", target: "callee.rb", callerFile: "caller.rb", caller: "caller", callee: "helper", callerKind: "method", calleeKind: "method", callerLine: 1, calleeLine: 1 },
-	{ language: "c", directory: "c", target: "callee.c", callerFile: "caller.c", caller: "caller", callee: "helper", callerKind: "function", calleeKind: "function", callerLine: 1, calleeLine: 1 },
-	{ language: "cpp", directory: "cpp", target: "callee.cpp", callerFile: "caller.cpp", caller: "caller", callee: "helper", callerKind: "function", calleeKind: "function", callerLine: 1, calleeLine: 1 },
-	{ language: "csharp", directory: "csharp", target: "callee.cs", callerFile: "caller.cs", caller: "Call", callee: "helper", callerKind: "method", calleeKind: "method", callerLine: 2, calleeLine: 2 },
-	{ language: "php", directory: "php", target: "callee.php", callerFile: "caller.php", caller: "caller", callee: "helper", callerKind: "function", calleeKind: "function", callerLine: 2, calleeLine: 2 },
-	{ language: "lua", directory: "lua", target: "callee.lua", callerFile: "caller.lua", caller: "caller", callee: "helper", callerKind: "function", calleeKind: "function", callerLine: 1, calleeLine: 1 },
-	{ language: "ocaml", directory: "ocaml", target: "callee.ml", callerFile: "caller.ml", caller: "caller", callee: "helper", callerKind: "function", calleeKind: "function", callerLine: 1, calleeLine: 1 },
-	{ language: "zig", directory: "zig", target: "callee.zig", callerFile: "caller.zig", caller: "caller", callee: "helper", callerKind: "function", calleeKind: "function", callerLine: 1, calleeLine: 1 },
-	{ language: "bash", directory: "bash", target: "callee.sh", callerFile: "caller.sh", caller: "caller", callee: "helper", callerKind: "function", calleeKind: "function", callerLine: 1, calleeLine: 1 },
-	{ language: "elixir", directory: "elixir", target: "callee.ex", callerFile: "caller.ex", caller: "caller", callee: "helper", callerKind: "function", calleeKind: "function", callerLine: 2, calleeLine: 2 },
-	{ language: "swift", directory: "swift", target: "callee.swift", callerFile: "caller.swift", caller: "caller", callee: "helper", callerKind: "function", calleeKind: "function", callerLine: 1, calleeLine: 1 },
-	{ language: "java", directory: "java-call", target: "Callee.java", callerFile: "Caller.java", caller: "caller", callee: "helper", callerKind: "method", calleeKind: "method", callerLine: 2, calleeLine: 2 },
-	{ language: "kotlin", directory: "kotlin-call", target: "Callee.kt", callerFile: "Caller.kt", caller: "caller", callee: "helper", callerKind: "function", calleeKind: "function", callerLine: 2, calleeLine: 2 },
+	{
+		language: "typescript",
+		directory: "typescript",
+		target: "callee.ts",
+		callerFile: "caller.ts",
+		caller: "caller",
+		callee: "helper",
+		callerKind: "function",
+		calleeKind: "function",
+		callerLine: 3,
+		calleeLine: 1,
+	},
+	{
+		language: "tsx",
+		directory: "tsx",
+		target: "callee.tsx",
+		callerFile: "caller.tsx",
+		caller: "caller",
+		callee: "helper",
+		callerKind: "function",
+		calleeKind: "function",
+		callerLine: 3,
+		calleeLine: 1,
+	},
+	{
+		language: "javascript",
+		directory: "javascript",
+		target: "callee.js",
+		callerFile: "caller.cjs",
+		caller: "caller",
+		callee: "helper",
+		callerKind: "function",
+		calleeKind: "function",
+		callerLine: 1,
+		calleeLine: 1,
+	},
+	{
+		language: "python",
+		directory: "python",
+		target: "callee.py",
+		callerFile: "caller.py",
+		caller: "caller",
+		callee: "helper",
+		callerKind: "function",
+		calleeKind: "function",
+		callerLine: 1,
+		calleeLine: 1,
+	},
+	{
+		language: "go",
+		directory: "go",
+		target: "callee.go",
+		callerFile: "caller.go",
+		caller: "caller",
+		callee: "helper",
+		callerKind: "function",
+		calleeKind: "function",
+		callerLine: 3,
+		calleeLine: 3,
+	},
+	{
+		language: "rust",
+		directory: "rust",
+		target: "callee.rs",
+		callerFile: "caller.rs",
+		caller: "caller",
+		callee: "helper",
+		callerKind: "function",
+		calleeKind: "function",
+		callerLine: 1,
+		calleeLine: 1,
+	},
+	{
+		language: "ruby",
+		directory: "ruby",
+		target: "callee.rb",
+		callerFile: "caller.rb",
+		caller: "caller",
+		callee: "helper",
+		callerKind: "method",
+		calleeKind: "method",
+		callerLine: 1,
+		calleeLine: 1,
+	},
+	{
+		language: "c",
+		directory: "c",
+		target: "callee.c",
+		callerFile: "caller.c",
+		caller: "caller",
+		callee: "helper",
+		callerKind: "function",
+		calleeKind: "function",
+		callerLine: 1,
+		calleeLine: 1,
+	},
+	{
+		language: "cpp",
+		directory: "cpp",
+		target: "callee.cpp",
+		callerFile: "caller.cpp",
+		caller: "caller",
+		callee: "helper",
+		callerKind: "function",
+		calleeKind: "function",
+		callerLine: 1,
+		calleeLine: 1,
+	},
+	{
+		language: "csharp",
+		directory: "csharp",
+		target: "callee.cs",
+		callerFile: "caller.cs",
+		caller: "Call",
+		callee: "helper",
+		callerKind: "method",
+		calleeKind: "method",
+		callerLine: 2,
+		calleeLine: 2,
+	},
+	{
+		language: "php",
+		directory: "php",
+		target: "callee.php",
+		callerFile: "caller.php",
+		caller: "caller",
+		callee: "helper",
+		callerKind: "function",
+		calleeKind: "function",
+		callerLine: 2,
+		calleeLine: 2,
+	},
+	{
+		language: "lua",
+		directory: "lua",
+		target: "callee.lua",
+		callerFile: "caller.lua",
+		caller: "caller",
+		callee: "helper",
+		callerKind: "function",
+		calleeKind: "function",
+		callerLine: 1,
+		calleeLine: 1,
+	},
+	{
+		language: "ocaml",
+		directory: "ocaml",
+		target: "callee.ml",
+		callerFile: "caller.ml",
+		caller: "caller",
+		callee: "helper",
+		callerKind: "function",
+		calleeKind: "function",
+		callerLine: 1,
+		calleeLine: 1,
+	},
+	{
+		language: "zig",
+		directory: "zig",
+		target: "callee.zig",
+		callerFile: "caller.zig",
+		caller: "caller",
+		callee: "helper",
+		callerKind: "function",
+		calleeKind: "function",
+		callerLine: 1,
+		calleeLine: 1,
+	},
+	{
+		language: "bash",
+		directory: "bash",
+		target: "callee.sh",
+		callerFile: "caller.sh",
+		caller: "caller",
+		callee: "helper",
+		callerKind: "function",
+		calleeKind: "function",
+		callerLine: 1,
+		calleeLine: 1,
+	},
+	{
+		language: "elixir",
+		directory: "elixir",
+		target: "callee.ex",
+		callerFile: "caller.ex",
+		caller: "caller",
+		callee: "helper",
+		callerKind: "function",
+		calleeKind: "function",
+		callerLine: 2,
+		calleeLine: 2,
+	},
+	{
+		language: "swift",
+		directory: "swift",
+		target: "callee.swift",
+		callerFile: "caller.swift",
+		caller: "caller",
+		callee: "helper",
+		callerKind: "function",
+		calleeKind: "function",
+		callerLine: 1,
+		calleeLine: 1,
+	},
+	{
+		language: "java",
+		directory: "java-call",
+		target: "Callee.java",
+		callerFile: "Caller.java",
+		caller: "caller",
+		callee: "helper",
+		callerKind: "method",
+		calleeKind: "method",
+		callerLine: 2,
+		calleeLine: 2,
+	},
+	{
+		language: "kotlin",
+		directory: "kotlin-call",
+		target: "Callee.kt",
+		callerFile: "Caller.kt",
+		caller: "caller",
+		callee: "helper",
+		callerKind: "function",
+		calleeKind: "function",
+		callerLine: 2,
+		calleeLine: 2,
+	},
 ];
 
 const TYPE_ONLY_FIXTURES = [
@@ -65,7 +280,10 @@ const TYPE_ONLY_FIXTURES = [
 	{ language: "dart", directory: "dart", target: "callee.dart" },
 ] as const;
 
-const grammarStatus = new Map<string, { available: boolean; blockReason?: string }>();
+const grammarStatus = new Map<
+	string,
+	{ available: boolean; blockReason?: string }
+>();
 const testedLanguages = new Set([
 	...CALL_FIXTURES.map((fixture) => fixture.language),
 	...TYPE_ONLY_FIXTURES.map((fixture) => fixture.language),
@@ -74,7 +292,8 @@ const testedLanguages = new Set([
 beforeAll(async () => {
 	const client = getSharedTreeSitterClient();
 	if (!client || !(await client.init())) {
-		for (const language of testedLanguages) grammarStatus.set(language, { available: false });
+		for (const language of testedLanguages)
+			grammarStatus.set(language, { available: false });
 		return;
 	}
 	for (const language of testedLanguages) {
@@ -153,7 +372,9 @@ async function warmCallGraph(cwd: string) {
 
 describe("module_report derived callGraph (#1073)", () => {
 	for (const fixture of CALL_FIXTURES) {
-		it(`exposes production callers/callees with identity and source locations for ${fixture.language}`, async ({ skip }) => {
+		it(`exposes production callers/callees with identity and source locations for ${fixture.language}`, async ({
+			skip,
+		}) => {
 			skipUnavailable(fixture.language, skip);
 			const env = makeFixtureProject(fixture.directory);
 			const { reviewGraph } = await warmCallGraph(env.project);
@@ -166,11 +387,13 @@ describe("module_report derived callGraph (#1073)", () => {
 				truncated: false,
 				coverage: { status: "complete", complete: true },
 			});
-			const caller = report.callGraph!.callers.find(
-				(entry) => entry.symbol === fixture.caller,
-			) ?? report.callGraph!.callers.find(
-				(entry) => entry.file === fixture.callerFile,
-			);
+			const caller =
+				report.callGraph!.callers.find(
+					(entry) => entry.symbol === fixture.caller,
+				) ??
+				report.callGraph!.callers.find(
+					(entry) => entry.file === fixture.callerFile,
+				);
 			const callerFileId = `file:${normalizeMapKey(path.join(env.project, fixture.callerFile))}`;
 			const callerSymbolId = `${normalizeMapKey(path.join(env.project, fixture.callerFile))}:${fixture.caller}:${fixture.callerKind}:${fixture.callerLine}`;
 			const calleeSymbolId = `${normalizeMapKey(path.join(env.project, path.basename(fixture.target)))}:${fixture.callee}:${fixture.calleeKind}:${fixture.calleeLine}`;
@@ -186,7 +409,8 @@ describe("module_report derived callGraph (#1073)", () => {
 							targetSymbolId: calleeSymbolId,
 						},
 			);
-			if (fixture.language === "elixir") expect(caller?.symbolId).toBe(callerFileId);
+			if (fixture.language === "elixir")
+				expect(caller?.symbolId).toBe(callerFileId);
 			expect(caller?.targetSymbolId).toBe(calleeSymbolId);
 			const calleeReport = await moduleReport(
 				path.join(env.project, fixture.callerFile),
@@ -217,10 +441,14 @@ describe("module_report derived callGraph (#1073)", () => {
 	it("keeps callers/callees bounded and preserves usedBy separately", async () => {
 		const env = makeFixtureProject("javascript");
 		await warmCallGraph(env.project);
-		const report = await moduleReport(path.join(env.project, "callee.js"), env.project, {
-			callGraph: true,
-			maxCallGraphEntries: 2,
-		});
+		const report = await moduleReport(
+			path.join(env.project, "callee.js"),
+			env.project,
+			{
+				callGraph: true,
+				maxCallGraphEntries: 2,
+			},
+		);
 
 		expect(report.callGraph?.callers.length).toBeLessThanOrEqual(2);
 		expect(report.callGraph?.callees).toHaveLength(0);
@@ -230,9 +458,9 @@ describe("module_report derived callGraph (#1073)", () => {
 		// callers/callees. It has the reference shape and no call-graph identity.
 		const helper = report.api.find((entry) => entry.name === "helper");
 		expect(helper?.usedBy?.length).toBeGreaterThan(0);
-		expect(
-			helper?.usedBy?.every((entry) => !("targetSymbolId" in entry)),
-		).toBe(true);
+		expect(helper?.usedBy?.every((entry) => !("targetSymbolId" in entry))).toBe(
+			true,
+		);
 		expect(report.provenance?.callGraph).toBe("cached-call-graph");
 	});
 
@@ -244,7 +472,10 @@ describe("module_report derived callGraph (#1073)", () => {
 			callGraph: true,
 			view: "summary",
 		});
-		expect(summary.callGraph).toMatchObject({ available: true, truncated: false });
+		expect(summary.callGraph).toMatchObject({
+			available: true,
+			truncated: false,
+		});
 		expect(summary.api[0]?.usedBy).toBeUndefined();
 		expect(summary.callbacks).toHaveLength(0);
 
@@ -274,7 +505,9 @@ describe("module_report derived callGraph (#1073)", () => {
 			},
 		);
 
-		const report = await moduleReport(env.target, env.project, { callGraph: true });
+		const report = await moduleReport(env.target, env.project, {
+			callGraph: true,
+		});
 		expect(report.callGraph).toMatchObject({
 			available: true,
 			coverage: { status: "partial", complete: false },
@@ -283,11 +516,15 @@ describe("module_report derived callGraph (#1073)", () => {
 	});
 
 	for (const fixture of TYPE_ONLY_FIXTURES) {
-		it(`keeps type-only references out of concrete calls for ${fixture.language}`, async ({ skip }) => {
+		it(`keeps type-only references out of concrete calls for ${fixture.language}`, async ({
+			skip,
+		}) => {
 			skipUnavailable(fixture.language, skip);
 			const env = makeFixtureProject(fixture.directory);
 			await warmCallGraph(env.project);
-			const report = await moduleReport(env.target, env.project, { callGraph: true });
+			const report = await moduleReport(env.target, env.project, {
+				callGraph: true,
+			});
 
 			expect(report.callGraph).toMatchObject({ available: true });
 			expect(report.callGraph?.callers).toHaveLength(0);
@@ -299,7 +536,9 @@ describe("module_report derived callGraph (#1073)", () => {
 	it("is read-only and honest on a cold cache", async () => {
 		const env = makeFixtureProject("typescript");
 		const before = getCachedReviewGraph(env.project);
-		const report = await moduleReport(env.target, env.project, { callGraph: true });
+		const report = await moduleReport(env.target, env.project, {
+			callGraph: true,
+		});
 		const after = getCachedReviewGraph(env.project);
 
 		expect(before).toBeUndefined();
@@ -309,7 +548,9 @@ describe("module_report derived callGraph (#1073)", () => {
 			reason: "review-graph-missing",
 			coverage: { status: "unavailable", complete: false },
 		});
-		expect(renderCompactModuleReport(report)).toContain("unavailable (review-graph-missing)");
+		expect(renderCompactModuleReport(report)).toContain(
+			"unavailable (review-graph-missing)",
+		);
 	});
 
 	it("rejects a derived cache with an identity mismatch without hiding the graph", async () => {
@@ -321,7 +562,9 @@ describe("module_report derived callGraph (#1073)", () => {
 			reviewGraphSignature: `${identity.signature}-stale`,
 		});
 
-		const report = await moduleReport(env.target, env.project, { callGraph: true });
+		const report = await moduleReport(env.target, env.project, {
+			callGraph: true,
+		});
 		expect(report.graphBuiltAt).toBe(reviewGraph.builtAt);
 		expect(report.callGraph).toMatchObject({
 			available: false,

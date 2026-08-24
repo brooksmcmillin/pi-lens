@@ -32,9 +32,7 @@ afterEach(() => {
 });
 
 function mkTempDir(): string {
-	const dir = fs.mkdtempSync(
-		path.join(os.tmpdir(), "source-filter-skip-obs-"),
-	);
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "source-filter-skip-obs-"));
 	cleanups.push(() => removeTempDirSync(dir));
 	return dir;
 }

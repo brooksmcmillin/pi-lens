@@ -165,12 +165,18 @@ describe("parseOpengrepReport (#584)", () => {
 			],
 		});
 		const findings = parseOpengrepReport(raw);
-		expect(findings.map((f) => f.checkId)).toEqual(["rule-a", "rule-b", "rule-c"]);
+		expect(findings.map((f) => f.checkId)).toEqual([
+			"rule-a",
+			"rule-b",
+			"rule-c",
+		]);
 	});
 
 	it("falls back endLine/endCol to start when `end` is absent", () => {
 		const raw = JSON.stringify({
-			results: [{ check_id: "no-end", path: "x.py", start: { line: 5, col: 3 } }],
+			results: [
+				{ check_id: "no-end", path: "x.py", start: { line: 5, col: 3 } },
+			],
 		});
 		const findings = parseOpengrepReport(raw);
 		expect(findings[0]).toMatchObject({ endLine: 5, endCol: 1, startCol: 3 });

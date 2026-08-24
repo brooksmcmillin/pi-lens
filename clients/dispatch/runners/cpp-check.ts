@@ -119,7 +119,11 @@ async function resolveCompiler(
 	const clCmd = clChecker.getCommand(cwd);
 	if (clCmd) {
 		// Already probed in a previous turn and resolved.
-		return { command: clCmd, args: ["/nologo", "/Zs", absPath], flavor: "msvc" };
+		return {
+			command: clCmd,
+			args: ["/nologo", "/Zs", absPath],
+			flavor: "msvc",
+		};
 	}
 	const clProbe = await safeSpawnAsync("cl", [], { timeout: 5000 });
 	if (!clProbe.error && clProbe.status !== null) {
@@ -155,7 +159,9 @@ function parseGccLikeOutput(raw: string, filePath: string): Diagnostic[] {
 			line: Number.parseInt(lineStr, 10) || 1,
 			column: Number.parseInt(colStr || "1", 10) || 1,
 			severity,
-			semantic: severity === "error" ? "blocking" : "warning",
+			// This single-file syntax check has no compile database, include path,
+			// or build flags. It can inform, but cannot prove a project blocker.
+			semantic: "warning",
 			tool: "cpp-check",
 			rule: severityLabel.toLowerCase(),
 			fixable: false,
@@ -186,7 +192,8 @@ function parseMsvcOutput(raw: string, filePath: string): Diagnostic[] {
 			line: Number.parseInt(lineStr, 10) || 1,
 			column: Number.parseInt(colStr || "1", 10) || 1,
 			severity,
-			semantic: severity === "error" ? "blocking" : "warning",
+			// MSVC is invoked with the same context-free single-file contract.
+			semantic: "warning",
 			tool: "cpp-check",
 			rule,
 			fixable: false,
@@ -258,7 +265,7 @@ const cppCheckRunner: RunnerDefinition = {
 		return {
 			status: hasErrors ? "failed" : "succeeded",
 			diagnostics,
-			semantic: hasErrors ? "blocking" : "warning",
+			semantic: "warning",
 			rawOutput: raw,
 		};
 	},

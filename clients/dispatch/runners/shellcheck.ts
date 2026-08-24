@@ -35,6 +35,7 @@ import {
 	lspPrimaryCoversFile,
 	resolveAvailableOrInstall,
 } from "./utils/runner-helpers.js";
+import { finishParsedRun } from "./utils/tool-failure.js";
 
 const shellcheck = createAvailabilityChecker("shellcheck", ".exe");
 
@@ -157,7 +158,7 @@ const shellcheckRunner: RunnerDefinition = {
 		}
 
 		let cmd: string | null = null;
-		if (await (shellcheck.isAvailableAsync(cwd))) {
+		if (await shellcheck.isAvailableAsync(cwd)) {
 			cmd = shellcheck.getCommand(cwd);
 		} else {
 			const managed = await resolveAvailableOrInstall(
@@ -201,17 +202,12 @@ const shellcheckRunner: RunnerDefinition = {
 		const raw = result.stdout + result.stderr;
 		const diagnostics = parseShellcheckOutput(raw, ctx.filePath);
 
-		if (diagnostics.length === 0) {
-			return { status: "succeeded", diagnostics: [], semantic: "none" };
-		}
-
-		const hasBlocking = diagnostics.some((d) => d.semantic === "blocking");
-
-		return {
-			status: hasBlocking ? "failed" : "succeeded",
+		return finishParsedRun({
+			tool: "shellcheck",
+			ctx,
+			result,
 			diagnostics,
-			semantic: hasBlocking ? "blocking" : "warning",
-		};
+		});
 	},
 };
 

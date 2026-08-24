@@ -21,6 +21,26 @@ jobs:
       - name: Validate per-issue close keywords
         run: node scripts/check-close-keywords.mjs --lint-pr
 
+  # #1844: the changelog-fragment format error hit four PRs in one day, each
+  # costing a full ~4-minute Unit-tests lap to discover. This job runs ONLY
+  # the fragment parser (no `npm install`, no `npm run build` -- it is pure
+  # Node against .changelog/*.md) so a bad fragment fails in seconds. It is
+  # additive early signal, not a replacement for the Unit-tests job below,
+  # which still runs the full changelog-entries.test.ts as part of the suite.
+  changelog-fragment-fastfail:
+    name: Changelog fragment (fast-fail)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Validate changelog fragments
+        run: node scripts/check-changelog-fragments.mjs
+
   lint-and-typecheck:
     name: Lint & type-check
     runs-on: ubuntu-latest
@@ -95,6 +115,16 @@ jobs:
       - name: Build
         run: npm run build
 
+      # #1718: dogfoods the pi-lens-self-scan ast-grep rule subset (recurring
+      # AI-authorship defect shapes from #1158) against pi-lens's own
+      # clients/ + tests/ trees. ~3.5s on 1073 files — cheap enough for every
+      # PR rather than nightly. Fails on any finding not already triaged into
+      # the committed rules/ast-grep-rules/self-scan-baseline.json. The
+      # registered-or-fail proof that this scan mechanism actually executes
+      # lives in tests/support/astgrep-self-scan.test.ts (Run tests, below).
+      - name: Ast-grep self-scan
+        run: npm run astgrep:self-scan
+
       - name: Run tests
         env:
           # Spawn-heavy MCP smokes retain a 20s local deadline but need room
@@ -149,16 +179,39 @@ jobs:
       - name: Build dist from source under --omit=dev (the prepare path)
         run: npm run build:dist
 
+      # #1926: pi supplies the host-provided packages from its own runtime, so a
+      # production install must not vendor a private second copy. One vendored
+      # copy cost the git install 760ms of extra module evaluation at load.
+      - name: Verify no host-provided package was vendored (#1926)
+        run: node scripts/check-prod-install-shape.mjs
+
+      # ...and now put them there. `node dist/index.js` is not pi, so without
+      # these two the entry throws on the FIRST one it imports and the load
+      # check below never reaches a genuinely missing dep like minimatch —
+      # which is the regression this job exists to catch (#1926).
+      - name: Supply host-provided packages the way pi does (#1926)
+        run: | # zizmor: ignore[adhoc-packages]
+          SUPPLY=scripts/supply-host-provided-deps.mjs
+          read -ra HOST_PKGS <<< "$(node "$SUPPLY" --install-args)"
+          echo "Supplying: ${HOST_PKGS[*]}"
+          npm install --no-save --no-audit --no-fund "${HOST_PKGS[@]}"
+
       - name: Verify dist built and the compiled entry loads
         run: |
           test -f dist/index.js || \
             (echo "ERROR: dist/index.js not built under --omit=dev (TS2688? prepare/build:dist failed)" && exit 1)
-          node dist/index.js 2>&1 | tee /tmp/load.txt || true
           # ERR_MODULE_NOT_FOUND = a runtime dep was wrongly in devDependencies.
-          # pi-coding-agent is a host-provided peer; its absence is expected here.
+          # Only the TYPE-ONLY host SDK may be missing here: the step above
+          # supplied the runtime ones, so if one of THOSE is still missing the
+          # grep must fail. That is what keeps this check able to fail at all.
+          # The allowlist derives from scripts/lib/host-provided-deps.mjs, so it
+          # cannot drift from the dependency shape (#1926).
+          ALLOW=$(node scripts/supply-host-provided-deps.mjs --allow-pattern)
+          node dist/index.js 2>&1 | tee /tmp/load.txt || true
           if grep -q "ERR_MODULE_NOT_FOUND\|Cannot find module" /tmp/load.txt \
-             && ! grep -q "pi-coding-agent" /tmp/load.txt; then
+             && ! grep -Eq "$ALLOW" /tmp/load.txt; then
             echo "FAILED: missing runtime module under --omit=dev"
+            echo "(host-provided allowlist: $ALLOW)"
             cat /tmp/load.txt
             exit 1
           fi
@@ -179,9 +232,19 @@ jobs:
           npm install --omit=dev --no-audit --no-fund
           test -f dist/index.js || \
             (echo "ERROR: dist/index.js not built from a clean clone under --omit=dev" && exit 1)
+          # #1926: the clean clone is the shape real users get. Assert pi's
+          # host-provided packages were not vendored into it.
+          node scripts/check-prod-install-shape.mjs
+          # Then supply them, as pi does, so the load check can still see a
+          # genuinely missing dep instead of stopping at the first host package.
+          SUPPLY=scripts/supply-host-provided-deps.mjs
+          read -ra HOST_PKGS <<< "$(node "$SUPPLY" --install-args)"
+          echo "Supplying: ${HOST_PKGS[*]}"
+          npm install --no-save --no-audit --no-fund "${HOST_PKGS[@]}"
+          ALLOW=$(node scripts/supply-host-provided-deps.mjs --allow-pattern)
           node dist/index.js 2>&1 | tee /tmp/gh-load.txt || true
           if grep -q "ERR_MODULE_NOT_FOUND\|Cannot find module" /tmp/gh-load.txt \
-             && ! grep -q "pi-coding-agent" /tmp/gh-load.txt; then
+             && ! grep -Eq "$ALLOW" /tmp/gh-load.txt; then
             echo "FAILED: missing runtime module from a clean GitHub-style install"
             cat /tmp/gh-load.txt
             exit 1
@@ -343,21 +406,49 @@ jobs:
           INSTALL_DIR=$(npm root -g)/pi-lens
           node scripts/check-extensions.mjs "$INSTALL_DIR"
 
+      # #1926: the tarball must not vendor a package pi already supplies. This
+      # runs from the checkout against the GLOBAL install the earlier step made,
+      # so it inspects what a real `pi install npm:pi-lens` produces.
+      - name: Verify no host-provided package shipped in the tarball (#1926)
+        shell: bash
+        run: node scripts/check-prod-install-shape.mjs "$(npm root -g)/pi-lens"
+
+      # ...and having proved they are absent, put them there, because the next
+      # step is a bare `node` and bare node is not pi. pi resolves these two
+      # specifiers from its own runtime; without them the entry throws at import
+      # and neither the load check nor the #182 dist check below proves
+      # anything. Names and ranges come from scripts/lib/host-provided-deps.mjs,
+      # never hardcoded here. The type-only host SDK is deliberately NOT
+      # installed (Windows MAX_PATH, #1334 S6).
+      - name: Supply host-provided packages the way pi does (#1926)
+        shell: bash
+        run: | # zizmor: ignore[adhoc-packages]
+          INSTALL_DIR=$(npm root -g)/pi-lens
+          SUPPLY=scripts/supply-host-provided-deps.mjs
+          read -ra HOST_PKGS <<< "$(node "$SUPPLY" --install-args)"
+          echo "Supplying: ${HOST_PKGS[*]}"
+          npm install --no-save --no-audit --no-fund \
+            --prefix "$INSTALL_DIR" "${HOST_PKGS[@]}"
+
       - name: Verify extension entry loads (catches missing node_modules deps)
         shell: bash
         run: |
+          # Build the allowlist BEFORE leaving the checkout: the global install
+          # ships no scripts/, so the module is only reachable from here.
+          ALLOW=$(node scripts/supply-host-provided-deps.mjs --allow-pattern)
           INSTALL_DIR=$(npm root -g)/pi-lens
           cd "$INSTALL_DIR"
           # Simulate how pi loads the extension: compiled entry, loaded by node.
-          # ERR_MODULE_NOT_FOUND = missing dep (e.g. 'minimatch') → fail.
-          # Any other error is expected in CI (no pi API available) → pass.
-          # pi-coding-agent is host-provided; absence is expected.
+          # ERR_MODULE_NOT_FOUND = missing dep (e.g. 'minimatch') → fail. That
+          # is this check's whole job, so a miss OUTSIDE the host-provided list
+          # still fails. Any other error is expected in CI (no pi API) → pass.
           ENTRY=$(node -p "require('./package.json').pi.extensions[0]")
           echo "Loading entry: $ENTRY"
+          echo "Host-provided allowlist: $ALLOW"
           node "$ENTRY" 2>&1 | tee /tmp/load-output.txt || true
           if grep -q "ERR_MODULE_NOT_FOUND\|Cannot find module" \
                /tmp/load-output.txt \
-             && ! grep -q "pi-coding-agent" /tmp/load-output.txt; then
+             && ! grep -Eq "$ALLOW" /tmp/load-output.txt; then
             echo "FAILED: missing module dependency detected"
             cat /tmp/load-output.txt
             exit 1

@@ -24,7 +24,7 @@ const TYPES_FILE = path.resolve(
 	"node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/types.d.ts",
 );
 
-/** Strip `/* */` and `// ...` comments so they cannot confuse brace counting. */
+/** Strip `/* */ ` and `; // ...` comments so they cannot confuse brace counting. */
 function stripComments(source: string): string {
 	return source
 		.replace(/\/\*[\s\S]*?\*\//g, "")
@@ -36,7 +36,9 @@ function extractInterfaceBody(source: string, interfaceName: string): string {
 	const marker = `interface ${interfaceName} {`;
 	const markerStart = source.indexOf(marker);
 	if (markerStart === -1) {
-		throw new Error(`could not find "interface ${interfaceName} {" in ${TYPES_FILE}`);
+		throw new Error(
+			`could not find "interface ${interfaceName} {" in ${TYPES_FILE}`,
+		);
 	}
 	let i = markerStart + marker.length;
 	let depth = 1;
@@ -46,7 +48,8 @@ function extractInterfaceBody(source: string, interfaceName: string): string {
 		else if (source[i] === "}") depth--;
 		i++;
 	}
-	if (depth !== 0) throw new Error("unbalanced braces while scanning interface body");
+	if (depth !== 0)
+		throw new Error("unbalanced braces while scanning interface body");
 	return source.slice(bodyStart, i - 1);
 }
 
@@ -116,7 +119,11 @@ describe("withConsoleCaptureWindows proxy behavior (#1434)", () => {
 
 	beforeEach(() => {
 		tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-1434-coverage-"));
-		for (const key of ["PI_LENS_TEST_MODE", "PI_LENS_HOME", "PI_LENS_CONSOLE_GUARD"]) {
+		for (const key of [
+			"PI_LENS_TEST_MODE",
+			"PI_LENS_HOME",
+			"PI_LENS_CONSOLE_GUARD",
+		]) {
 			savedEnv[key] = process.env[key];
 		}
 		process.env.PI_LENS_TEST_MODE = "0";
@@ -168,10 +175,7 @@ describe("withConsoleCaptureWindows proxy behavior (#1434)", () => {
 					schema: bulkyUnrelatedProp,
 				};
 
-				(proxy[member] as (...a: unknown[]) => unknown)(
-					topLevelFn,
-					optionsArg,
-				);
+				(proxy[member] as (...a: unknown[]) => unknown)(topLevelFn, optionsArg);
 
 				expect(calls).toHaveLength(1);
 				const [passedTopFn, passedOptions] = calls[0] as [

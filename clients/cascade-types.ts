@@ -33,12 +33,12 @@ export interface CascadeResult {
 
 /** Why a cascade run produced no formatted output. */
 export type CascadeSkipReason =
-	| "blockers"    // primary file had blocking diagnostics
-	| "non_code"    // file kind not eligible for cascade
+	| "blockers" // primary file had blocking diagnostics
+	| "non_code" // file kind not eligible for cascade
 	| "no_neighbors" // reverse-dep lookup found no importing files
-	| "clean"       // neighbors found but none had new diagnostics
+	| "clean" // neighbors found but none had new diagnostics
 	| "indeterminate" // #1023: impact could NOT be computed (degraded/cold/missing-node graph) — surfaced as an honest advisory, never as a silent all-clear
-	| "error";      // the deferred compute rejected (never surfaced inline)
+	| "error"; // the deferred compute rejected (never surfaced inline)
 
 /**
  * Always-present result of one computeCascadeForFile invocation.
@@ -51,12 +51,15 @@ export interface CascadeRun {
 	result: CascadeResult | undefined;
 	neighborCount: number;
 	diagnosticCount: number;
+	/** Preserves selected paths for result-less indeterminate runs; bounded to the selected slice. */
+	selectedNeighborPaths?: string[];
 	skipReason?: CascadeSkipReason;
 	/**
-	 * #1023: set when the impact compute was DEGRADED/COLD/ERRORED (see
+	 * #1023: set when the impact compute was DEGRADED/COLD/ERRORED or its
+	 * selected neighbor budget omitted eligible dependents (see
 	 * {@link CascadeIndeterminate}). Carries the detail the turn-end seam renders
-	 * into an honest "downstream impact not computed" advisory. Decoupled from
-	 * `skipReason` so a thrown compute (`skipReason: "error"`) can surface too.
+	 * into an honest advisory. Decoupled from `skipReason` so a thrown compute
+	 * (`skipReason: "error"`) can surface too.
 	 */
 	indeterminate?: CascadeIndeterminate;
 	/**
@@ -72,3 +75,13 @@ export interface CascadeRun {
 	 */
 	carriedTurns?: number;
 }
+
+/**
+ * How long a cascade neighbour's diagnostics stay usable (#1816).
+ *
+ * One constant for two consumers that each declared their own `240_000`:
+ * `clients/lsp/index.ts` (the neighbour-diagnostics cache) and
+ * `clients/dispatch/integration.ts` (the cascade turn scope). They must move
+ * together — a split pair reads as two independent policies and drifts.
+ */
+export const CASCADE_DIAGNOSTICS_TTL_MS = 240_000;

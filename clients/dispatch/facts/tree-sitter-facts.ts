@@ -17,12 +17,7 @@ import {
 import type { FactStore } from "../fact-store.js";
 import type { DispatchContext } from "../types.js";
 
-export {
-	childrenOfType,
-	firstChildOfType,
-	type TsNode,
-	walk,
-};
+export { childrenOfType, firstChildOfType, type TsNode, walk };
 
 export const withFactTree = withTreeSitterRoot;
 
@@ -40,15 +35,25 @@ export async function extractFactsFromTree(
 	extract: (root: TsNode, content: string) => Record<string, unknown[]>,
 	coverageFact?: string,
 ): Promise<void> {
-	const writeAll = (facts: Record<string, unknown[]>, complete: boolean): void => {
+	const writeAll = (
+		facts: Record<string, unknown[]>,
+		complete: boolean,
+	): void => {
 		for (const key of Object.keys(defaults)) {
 			store.setFileFact(ctx.filePath, key, facts[key] ?? defaults[key]);
 		}
 		if (coverageFact) {
-			store.setFileFact(ctx.filePath, coverageFact, complete ? "complete" : "unavailable");
+			store.setFileFact(
+				ctx.filePath,
+				coverageFact,
+				complete ? "complete" : "unavailable",
+			);
 		}
 	};
-	const content = store.getFileFact<string | null>(ctx.filePath, "file.content");
+	const content = store.getFileFact<string | null>(
+		ctx.filePath,
+		"file.content",
+	);
 	if (content == null) return writeAll(defaults, false);
 	const parsed = await withFactTree(ctx.filePath, content, (root) =>
 		extract(root, content),

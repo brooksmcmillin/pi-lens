@@ -36,7 +36,8 @@ describe("parseSwiftLintOutput — fixable propagation (#112 slice)", () => {
 			},
 			{
 				rule_id: "colon",
-				reason: "Colons should be next to the identifier when specifying a type.",
+				reason:
+					"Colons should be next to the identifier when specifying a type.",
 				line: 8,
 			},
 			{

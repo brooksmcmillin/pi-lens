@@ -55,51 +55,47 @@ const body = (i: number, tag: string) =>
 	).join("\n");
 
 describe("word-index incremental refresh at the file-count cap (#1227)", () => {
-	it(
-		"selects a full rebuild for a dense-stale refresh AT the cap, honoring truncation",
-		async () => {
-			const env = setupTestEnvironment("pi-lens-word-cap-bound-");
-			try {
-				process.env.PI_LENS_MAX_PROJECT_FILES = "300";
-				_resetProjectScaleBaseForTests();
+	it("selects a full rebuild for a dense-stale refresh AT the cap, honoring truncation", async () => {
+		const env = setupTestEnvironment("pi-lens-word-cap-bound-");
+		try {
+			process.env.PI_LENS_MAX_PROJECT_FILES = "300";
+			_resetProjectScaleBaseForTests();
 
-				// 100 files beyond the cap — must be walked-and-truncated away, not
-				// counted toward the corpus or the stale ratio.
-				const files = Array.from({ length: CAP + 100 }, (_, i) =>
-					createTempFile(env.tmpDir, `src/f${i}.ts`, body(i, "Original")),
-				);
+			// 100 files beyond the cap — must be walked-and-truncated away, not
+			// counted toward the corpus or the stale ratio.
+			const files = Array.from({ length: CAP + 100 }, (_, i) =>
+				createTempFile(env.tmpDir, `src/f${i}.ts`, body(i, "Original")),
+			);
 
-				const docs = await collectWordIndexDocs(env.tmpDir);
-				expect(docs.truncated).toBe(true);
-				expect(docs.length).toBe(CAP);
+			const docs = await collectWordIndexDocs(env.tmpDir);
+			expect(docs.truncated).toBe(true);
+			expect(docs.length).toBe(CAP);
 
-				const index = buildWordIndex(docs);
-				expect(index.docCount).toBe(CAP);
-				expect(index.truncated).toBe(true);
-				const before = serializeWordIndex(index);
+			const index = buildWordIndex(docs);
+			expect(index.docCount).toBe(CAP);
+			expect(index.truncated).toBe(true);
+			const before = serializeWordIndex(index);
 
-				// 25% of the CAPPED corpus — comfortably under the 30% ratio
-				// threshold (the shape the old ratio-only gate would have waved
-				// through), at cap-bound absolute scale.
-				const staleCount = Math.round(CAP * 0.25);
-				const future = new Date(Date.now() + 2_000);
-				for (const [i, file] of files.slice(0, staleCount).entries()) {
-					fs.writeFileSync(file, body(i, "Refreshed"), "utf8");
-					fs.utimesSync(file, future, future);
-				}
-
-				const result = await refreshWordIndexIncrementally(index, env.tmpDir);
-
-				expect(result).toMatchObject({
-					mode: "full-required",
-					reason: "stale-document-churn",
-				});
-				// Atomic: the old index is untouched, cap-bound or not.
-				expect(serializeWordIndex(index)).toEqual(before);
-			} finally {
-				env.cleanup();
+			// 25% of the CAPPED corpus — comfortably under the 30% ratio
+			// threshold (the shape the old ratio-only gate would have waved
+			// through), at cap-bound absolute scale.
+			const staleCount = Math.round(CAP * 0.25);
+			const future = new Date(Date.now() + 2_000);
+			for (const [i, file] of files.slice(0, staleCount).entries()) {
+				fs.writeFileSync(file, body(i, "Refreshed"), "utf8");
+				fs.utimesSync(file, future, future);
 			}
-		},
-		30_000,
-	);
+
+			const result = await refreshWordIndexIncrementally(index, env.tmpDir);
+
+			expect(result).toMatchObject({
+				mode: "full-required",
+				reason: "stale-document-churn",
+			});
+			// Atomic: the old index is untouched, cap-bound or not.
+			expect(serializeWordIndex(index)).toEqual(before);
+		} finally {
+			env.cleanup();
+		}
+	}, 30_000);
 });

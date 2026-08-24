@@ -18,9 +18,8 @@ type FakeClient = { serverId: string; isAlive: () => boolean };
 
 function serviceWith(clients: Array<{ key: string } & FakeClient>): LSPService {
 	const svc = new LSPService();
-	const map = (
-		svc as unknown as { state: { clients: Map<string, unknown> } }
-	).state.clients;
+	const map = (svc as unknown as { state: { clients: Map<string, unknown> } })
+		.state.clients;
 	for (const { key, ...client } of clients) map.set(key, client);
 	return svc;
 }

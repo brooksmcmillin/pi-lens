@@ -81,28 +81,36 @@ function shape(graph: ReviewGraph, root: string): unknown {
 
 describe("scanner to review-graph structural IR (#939)", () => {
 	for (const seed of [93911, 93912, 93913]) {
-		it(`is graph-equivalent to a cold parse for seed ${seed}`, {
-			timeout: 120_000,
-		}, async () => {
-			const coldRoot = fixture(seed);
-			const sharedRoot = fixture(seed);
-			const cold = await buildOrUpdateGraph(coldRoot, [], new FactStore());
+		it(
+			`is graph-equivalent to a cold parse for seed ${seed}`,
+			{
+				timeout: 120_000,
+			},
+			async () => {
+				const coldRoot = fixture(seed);
+				const sharedRoot = fixture(seed);
+				const cold = await buildOrUpdateGraph(coldRoot, [], new FactStore());
 
-			clearGraphCache();
-			await scanProjectDiagnostics({
-				cwd: sharedRoot,
-				tier: "cheap",
-				files: fs
-					.readdirSync(path.join(sharedRoot, "src"))
-					.map((name) => path.join(sharedRoot, "src", name)),
-				maxFiles: 100,
-			});
-			resetReviewGraphIrStats();
-			const shared = await buildOrUpdateGraph(sharedRoot, [], new FactStore());
+				clearGraphCache();
+				await scanProjectDiagnostics({
+					cwd: sharedRoot,
+					tier: "cheap",
+					files: fs
+						.readdirSync(path.join(sharedRoot, "src"))
+						.map((name) => path.join(sharedRoot, "src", name)),
+					maxFiles: 100,
+				});
+				resetReviewGraphIrStats();
+				const shared = await buildOrUpdateGraph(
+					sharedRoot,
+					[],
+					new FactStore(),
+				);
 
-			expect(shape(shared, sharedRoot)).toEqual(shape(cold, coldRoot));
-			expect(getReviewGraphIrStats().accepted).toBe(9);
-		});
+				expect(shape(shared, sharedRoot)).toEqual(shape(cold, coldRoot));
+				expect(getReviewGraphIrStats().accepted).toBe(9);
+			},
+		);
 	}
 
 	it("rejects stale IR for an edited file and reparses its new content", async () => {

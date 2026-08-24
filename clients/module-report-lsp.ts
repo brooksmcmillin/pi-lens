@@ -119,7 +119,13 @@ function lspLocationsToUsedBy(
 		const key = `${file}:${line}`;
 		if (seen.has(key)) continue;
 		seen.add(key);
-		out.push({ file, symbol: "", line, relation: "references", provenance: "lsp" });
+		out.push({
+			file,
+			symbol: "",
+			line,
+			relation: "references",
+			provenance: "lsp",
+		});
 		if (out.length >= cap) break;
 	}
 	return out;
@@ -141,7 +147,6 @@ async function runWithExclusiveLspSweep<T>(work: () => Promise<T>): Promise<T> {
 		release();
 	}
 }
-
 
 /**
  * Best-effort live-LSP enrichment for the requested file's exported symbols.

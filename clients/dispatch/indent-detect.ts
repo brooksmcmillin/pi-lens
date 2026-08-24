@@ -31,9 +31,10 @@ export function detectIndentation(content: string): Indentation {
 				}
 			}
 		}
-		const inferredWidth = [...counts.entries()].sort(
-			(a, b) => b[1] - a[1] || a[0] - b[0],
-		)[0]?.[0] ?? Math.min(...spaceCounts);
+		const inferredWidth =
+			[...counts.entries()].sort(
+				(a, b) => b[1] - a[1] || a[0] - b[0],
+			)[0]?.[0] ?? Math.min(...spaceCounts);
 		return { style: "space", width: inferredWidth <= 8 ? inferredWidth : 2 };
 	}
 

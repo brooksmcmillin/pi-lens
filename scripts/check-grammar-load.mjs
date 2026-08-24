@@ -60,9 +60,8 @@ async function main() {
 		return;
 	}
 
-	const { LANGUAGE_TO_GRAMMAR, grammarBlockReason } = await import(
-		"../clients/grammar-source.js"
-	);
+	const { LANGUAGE_TO_GRAMMAR, grammarBlockReason } =
+		await import("../clients/grammar-source.js");
 	const languages = Object.keys(LANGUAGE_TO_GRAMMAR).sort();
 
 	console.error(
@@ -108,7 +107,9 @@ async function main() {
 	}
 
 	console.error("\n[grammar-load-check] summary:");
-	console.error(`  crashed:     ${crashed.map((c) => c.lang).join(", ") || "none"}`);
+	console.error(
+		`  crashed:     ${crashed.map((c) => c.lang).join(", ") || "none"}`,
+	);
 	console.error(`  unavailable: ${unavailable.join(", ") || "none"}`);
 	console.error(`  blocked:     ${blocked.join(", ") || "none"}`);
 	if (crashed.length > 0) {

@@ -10,6 +10,7 @@ import {
 	saveProjectDiagnosticsSnapshot,
 	writeProjectDiagnosticsDeltaReport,
 } from "../../clients/project-diagnostics/cache.js";
+import { MTIME_DRIFT_TOLERANCE_MS } from "../../clients/blocker-freshness.js";
 import { knipIssuesToProjectDiagnostics } from "../../clients/project-diagnostics/runner-adapters/knip.js";
 import { jscpdResultToProjectDiagnostics } from "../../clients/project-diagnostics/runner-adapters/jscpd.js";
 import { circularDepsToProjectDiagnostics } from "../../clients/project-diagnostics/runner-adapters/madge.js";
@@ -141,6 +142,11 @@ describe("project diagnostics cache", () => {
 	});
 });
 
+function setMtime(file: string, ms: number): void {
+	const when = new Date(ms);
+	fs.utimesSync(file, when, when);
+}
+
 describe("reconcileProjectDiagnosticsSnapshot (#298 staleness)", () => {
 	function diag(filePath: string) {
 		return {
@@ -214,6 +220,46 @@ describe("reconcileProjectDiagnosticsSnapshot (#298 staleness)", () => {
 		expect(reconciled.diagnostics).toHaveLength(1);
 		expect(staleDropped).toBe(0);
 	});
+
+	// #1711: fabricates the mtime/scannedAt pair directly, rather than relying
+	// on a real write race, so the boundary is deterministic. A bare +1ms
+	// tolerance did not cover the measured Windows host skew between a file's
+	// mtime and the `Date.now()` read that produces `scannedAt` (up to
+	// ~11.4ms, #1491/#1498) — a same-tick write-then-scan silently DROPPED a
+	// live diagnostic here, the worse sibling of #1708's demote-only gate.
+	it("keeps a diagnostic whose mtime lands within MTIME_DRIFT_TOLERANCE_MS of scannedAt", () => {
+		const f = path.join(tmp, "same-tick.ts");
+		fs.writeFileSync(f, "export const a = 1;\n");
+		const scannedAtMs = Date.UTC(2026, 7, 18, 7, 0, 0);
+		setMtime(f, scannedAtMs + MTIME_DRIFT_TOLERANCE_MS);
+		const snap = snapshot({
+			scannedAt: new Date(scannedAtMs).toISOString(),
+			diagnostics: [diag(f)],
+			filesScanned: 1,
+		});
+		const { snapshot: reconciled, staleDropped } =
+			reconcileProjectDiagnosticsSnapshot(snap);
+		expect(reconciled.diagnostics).toHaveLength(1);
+		expect(staleDropped).toBe(0);
+	});
+
+	// Pins the far edge so a deleted or widened tolerance cannot survive:
+	// one millisecond past MTIME_DRIFT_TOLERANCE_MS still drops.
+	it("still drops a diagnostic whose mtime lands past MTIME_DRIFT_TOLERANCE_MS of scannedAt", () => {
+		const f = path.join(tmp, "genuine-edit.ts");
+		fs.writeFileSync(f, "export const a = 1;\n");
+		const scannedAtMs = Date.UTC(2026, 7, 18, 7, 0, 0);
+		setMtime(f, scannedAtMs + MTIME_DRIFT_TOLERANCE_MS + 1);
+		const snap = snapshot({
+			scannedAt: new Date(scannedAtMs).toISOString(),
+			diagnostics: [diag(f)],
+			filesScanned: 1,
+		});
+		const { snapshot: reconciled, staleDropped } =
+			reconcileProjectDiagnosticsSnapshot(snap);
+		expect(reconciled.diagnostics).toHaveLength(0);
+		expect(staleDropped).toBe(1);
+	});
 });
 
 describe("project diagnostics adapters", () => {
@@ -247,7 +293,14 @@ describe("project diagnostics adapters", () => {
 			totalLines: 100,
 			percentage: 18,
 			clones: [
-				{ fileA: "src/a.ts", startA: 42, fileB: "src/b.ts", startB: 80, lines: 18, tokens: 120 },
+				{
+					fileA: "src/a.ts",
+					startA: 42,
+					fileB: "src/b.ts",
+					startB: 80,
+					lines: 18,
+					tokens: 120,
+				},
 			],
 		});
 
@@ -322,8 +375,16 @@ describe("project diagnostics adapters", () => {
 			{
 				calleeKey: "src/b.ts:changedFn",
 				results: [
-					{ symbolKey: "src/a.ts:directCaller", depth: 1, severity: "WillBreak" },
-					{ symbolKey: "src/c.ts:indirectCaller", depth: 2, severity: "MayBreak" },
+					{
+						symbolKey: "src/a.ts:directCaller",
+						depth: 1,
+						severity: "WillBreak",
+					},
+					{
+						symbolKey: "src/c.ts:indirectCaller",
+						depth: 2,
+						severity: "MayBreak",
+					},
 					{ symbolKey: "src/d.ts:farCaller", depth: 3, severity: "Review" },
 				],
 			},
@@ -365,13 +426,21 @@ describe("project diagnostics adapters", () => {
 			{
 				calleeKey: "src/b.ts:changedFnOne",
 				results: [
-					{ symbolKey: "src/a.ts:sharedCaller", depth: 2, severity: "MayBreak" },
+					{
+						symbolKey: "src/a.ts:sharedCaller",
+						depth: 2,
+						severity: "MayBreak",
+					},
 				],
 			},
 			{
 				calleeKey: "src/b.ts:changedFnTwo",
 				results: [
-					{ symbolKey: "src/a.ts:sharedCaller", depth: 1, severity: "WillBreak" },
+					{
+						symbolKey: "src/a.ts:sharedCaller",
+						depth: 1,
+						severity: "WillBreak",
+					},
 				],
 			},
 		]);
@@ -465,7 +534,10 @@ describe("project diagnostics adapters", () => {
 				},
 			],
 		});
-		expect(diags[0]).toMatchObject({ severity: "warning", semantic: "warning" });
+		expect(diags[0]).toMatchObject({
+			severity: "warning",
+			semantic: "warning",
+		});
 		expect(diags[1]).toMatchObject({ severity: "info", semantic: "warning" });
 	});
 
@@ -535,9 +607,64 @@ describe("project diagnostics adapters", () => {
 			severity: "warning",
 			runner: "trivy",
 			rule: "trivy:CVE-2024-9",
-			message: "HIGH vulnerability CVE-2024-9 in lodash@4.17.20 (fixed in 4.17.21)",
+			message:
+				"HIGH vulnerability CVE-2024-9 in lodash@4.17.20 (fixed in 4.17.21)",
 		});
 		expect(diag.line).toBeUndefined();
+	});
+
+	// #1628: trivy's `secrets` findings (`TrivyResult.secrets`) had no adapter
+	// at all before this — the CVE lane (`findings`) was the only trivy lane
+	// `lens_diagnostics mode=full` surfaced. A trivy-only secret (no gitleaks/
+	// ast-grep corroboration) was invisible there, so an agent had nothing to
+	// anchor a `lens_diagnostic_mark` call against.
+	it("anchors a trivy secret at its file:line, namespaced apart from the CVE rule id", () => {
+		const [diag] = trivyResultToProjectDiagnostics(tmp, {
+			success: true,
+			scannedAt: "",
+			findings: [],
+			licenses: [],
+			secrets: [
+				{
+					ruleId: "aws-access-key-id",
+					file: ".env",
+					line: 3,
+					title: "AWS Access Key ID",
+				},
+			],
+		});
+		expect(diag).toMatchObject({
+			filePath: path.join(tmp, ".env"),
+			line: 3,
+			severity: "error",
+			semantic: "blocking",
+			tool: "trivy",
+			runner: "trivy",
+			rule: "trivy-secret:aws-access-key-id",
+			message: "Potential secret: AWS Access Key ID",
+		});
+	});
+
+	it("surfaces both a CVE and a secret from the same trivy scan pass", () => {
+		const diags = trivyResultToProjectDiagnostics(tmp, {
+			success: true,
+			scannedAt: "",
+			licenses: [],
+			findings: [
+				{
+					vulnerabilityId: "CVE-2024-9",
+					pkgName: "lodash",
+					severity: "HIGH",
+					target: "package-lock.json",
+				},
+			],
+			secrets: [{ ruleId: "generic-api-key", file: "a.ts", line: 5 }],
+		});
+		expect(diags).toHaveLength(2);
+		expect(diags.map((d) => d.rule)).toEqual([
+			"trivy:CVE-2024-9",
+			"trivy-secret:generic-api-key",
+		]);
 	});
 
 	it("flattens dead-code buckets; unlisted deps are blocking", () => {
@@ -546,12 +673,24 @@ describe("project diagnostics adapters", () => {
 			language: "python",
 			summary: "",
 			unusedExports: [
-				{ category: "export", kind: "function", name: "foo", file: "a.py", line: 4 },
+				{
+					category: "export",
+					kind: "function",
+					name: "foo",
+					file: "a.py",
+					line: 4,
+				},
 			],
 			unusedFiles: [],
 			unusedDeps: [],
 			unlistedDeps: [
-				{ category: "unlisted", kind: "import", name: "requests", file: "b.py", line: 1 },
+				{
+					category: "unlisted",
+					kind: "import",
+					name: "requests",
+					file: "b.py",
+					line: 1,
+				},
 			],
 		});
 		expect(diags).toHaveLength(2);

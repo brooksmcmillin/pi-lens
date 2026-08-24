@@ -95,7 +95,12 @@ async function runTurn(opts: {
 			const abs = path.join(env.tmpDir, rel);
 			fs.mkdirSync(path.dirname(abs), { recursive: true });
 			fs.writeFileSync(abs, "x = 1\n");
-			cacheManager.addModifiedRange(abs, { start: 1, end: 1 }, false, env.tmpDir);
+			cacheManager.addModifiedRange(
+				abs,
+				{ start: 1, end: 1 },
+				false,
+				env.tmpDir,
+			);
 		}
 
 		await handleTurnEnd({
@@ -117,8 +122,8 @@ async function runTurn(opts: {
 		} as any);
 
 		const advisory =
-			consumeTurnEndFindings(cacheManager, env.tmpDir)?.messages?.[0]?.content ??
-			"";
+			consumeTurnEndFindings(cacheManager, env.tmpDir)?.messages?.[0]
+				?.content ?? "";
 		const entry = cacheManager.readCache<DeadCodeResult>(CACHE_KEY, env.tmpDir);
 		return {
 			advisory,
@@ -144,7 +149,9 @@ describe("turn_end dead-code delta", () => {
 			edited: ["mod.py"],
 		});
 		expect(analyzeCalls).toBe(1);
-		expect(advisory).toContain("Newly unused Python symbols in files you edited");
+		expect(advisory).toContain(
+			"Newly unused Python symbols in files you edited",
+		);
 		// Pushed the delta at all.
 		expect(advisory).toContain("fresh");
 		// Diffed against the previous scan.
@@ -217,7 +224,12 @@ describe("turn_end dead-code delta", () => {
 			const cacheManager = new CacheManager(false);
 			const abs = path.join(env.tmpDir, "mod.py");
 			fs.writeFileSync(abs, "x = 1\n");
-			cacheManager.addModifiedRange(abs, { start: 1, end: 1 }, false, env.tmpDir);
+			cacheManager.addModifiedRange(
+				abs,
+				{ start: 1, end: 1 },
+				false,
+				env.tmpDir,
+			);
 
 			await expect(
 				handleTurnEnd({

@@ -111,7 +111,9 @@ describe("review graph service", () => {
 
 			const graph = await buildOrUpdateGraph(env.tmpDir, [], new FactStore());
 			const helperNode = [...graph.nodes.values()].find(
-				(node) => node.symbolName === "helper" && node.filePath === normalizeMapKey(calleePath),
+				(node) =>
+					node.symbolName === "helper" &&
+					node.filePath === normalizeMapKey(calleePath),
 			);
 			expect(helperNode).toBeDefined();
 			for (const [index, [, name]] of callers.entries()) {
@@ -129,7 +131,9 @@ describe("review graph service", () => {
 					),
 				).toBe(true);
 				const fileNode = graph.nodes.get(`file:${callerPath}`);
-				expect(fileNode?.metadata?.extractionCoverage).toMatchObject({ calls: "complete" });
+				expect(fileNode?.metadata?.extractionCoverage).toMatchObject({
+					calls: "complete",
+				});
 			}
 		} finally {
 			clearReviewGraphWorkspaceCache();
@@ -179,7 +183,11 @@ describe("review graph service", () => {
 		try {
 			const sourcePath = createTempFile(env.tmpDir, "src/source.ts", "x");
 			const testPath = createTempFile(env.tmpDir, "src/source.test.ts", "x");
-			const oversizedPath = createTempFile(env.tmpDir, "src/oversized.ts", "this file is deliberately oversized\n");
+			const oversizedPath = createTempFile(
+				env.tmpDir,
+				"src/oversized.ts",
+				"this file is deliberately oversized\n",
+			);
 			process.env.PI_LENS_REVIEW_GRAPH_MAX_FILE_BYTES = "2";
 
 			const result = await getGraphSourceFiles(env.tmpDir);
@@ -187,7 +195,8 @@ describe("review graph service", () => {
 			expect(result.files).not.toContain(normalizeMapKey(testPath));
 			expect(result.files).not.toContain(normalizeMapKey(oversizedPath));
 		} finally {
-			if (previousMaxBytes === undefined) delete process.env.PI_LENS_REVIEW_GRAPH_MAX_FILE_BYTES;
+			if (previousMaxBytes === undefined)
+				delete process.env.PI_LENS_REVIEW_GRAPH_MAX_FILE_BYTES;
 			else process.env.PI_LENS_REVIEW_GRAPH_MAX_FILE_BYTES = previousMaxBytes;
 			env.cleanup();
 		}
@@ -303,9 +312,8 @@ describe("review graph service", () => {
 
 			// getCachedReviewGraph's blind read must also reject it outright (never
 			// hand back a v3-shaped graph to a v4-ID-aware caller like module-report).
-			const { getCachedReviewGraph } = await import(
-				"../../clients/review-graph/builder.js"
-			);
+			const { getCachedReviewGraph } =
+				await import("../../clients/review-graph/builder.js");
 			expect(getCachedReviewGraph(env.tmpDir)).toBeUndefined();
 
 			// A real build produces a fresh v8 graph with the new ID shape, not the
@@ -371,9 +379,8 @@ describe("review graph service", () => {
 			);
 			expect(isReviewGraphMigrationNeeded(env.tmpDir)).toBe(true);
 
-			const { getCachedReviewGraph } = await import(
-				"../../clients/review-graph/builder.js"
-			);
+			const { getCachedReviewGraph } =
+				await import("../../clients/review-graph/builder.js");
 			expect(getCachedReviewGraph(env.tmpDir)).toBeUndefined();
 
 			createTempFile(
@@ -753,7 +760,9 @@ describe("review graph service", () => {
 				);
 			}
 			await buildOrUpdateGraph(env.tmpDir, [], new FactStore());
-			const nearMissCall = (logLatency as ReturnType<typeof vi.fn>).mock.calls.find(
+			const nearMissCall = (
+				logLatency as ReturnType<typeof vi.fn>
+			).mock.calls.find(
 				(args) => args[0]?.phase === "review_graph_size_near_miss",
 			);
 			expect(nearMissCall?.[0]).toMatchObject({

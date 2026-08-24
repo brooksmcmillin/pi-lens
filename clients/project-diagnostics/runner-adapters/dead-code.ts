@@ -1,8 +1,5 @@
 import * as path from "node:path";
-import type {
-	DeadCodeIssue,
-	DeadCodeResult,
-} from "../../dead-code-client.js";
+import type { DeadCodeIssue, DeadCodeResult } from "../../dead-code-client.js";
 import type { ProjectDiagnostic } from "../types.js";
 
 function deadCodeMessage(issue: DeadCodeIssue): string {

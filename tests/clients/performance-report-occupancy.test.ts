@@ -44,24 +44,28 @@ afterAll(() => {
 	removeTempDirSync(tempDir);
 });
 
-it("keeps /lens-perf log parsing below the event-loop occupancy budget", {
-	retry: 2,
-	timeout: 30_000,
-}, async () => {
-	let retainedSamples = 0;
-	const maxBlock = await measureMaxSyncBlockMs(async () => {
-		const report = await collectLatencyPerformance({
-			logPath,
-			processId: 7,
-			sessionStartedAt: 0,
+it(
+	"keeps /lens-perf log parsing below the event-loop occupancy budget",
+	{
+		retry: 2,
+		timeout: 30_000,
+	},
+	async () => {
+		let retainedSamples = 0;
+		const maxBlock = await measureMaxSyncBlockMs(async () => {
+			const report = await collectLatencyPerformance({
+				logPath,
+				processId: 7,
+				sessionStartedAt: 0,
+			});
+			retainedSamples = report.logWindow.sampleCount;
+			// Fail loudly if the fixture no longer fills the window — otherwise this
+			// keeps passing while measuring a parse it was never meant to.
+			expect(report.windowBytes).toBe(WINDOW_BYTES);
+			expect(report.windowTruncated).toBe(true);
 		});
-		retainedSamples = report.logWindow.sampleCount;
-		// Fail loudly if the fixture no longer fills the window — otherwise this
-		// keeps passing while measuring a parse it was never meant to.
-		expect(report.windowBytes).toBe(WINDOW_BYTES);
-		expect(report.windowTruncated).toBe(true);
-	});
 
-	expect(retainedSamples).toBe(MAX_PERF_PHASE_SAMPLES);
-	expect(maxBlock).toBeLessThan(MAX_SYNC_BLOCK_MS);
-});
+		expect(retainedSamples).toBe(MAX_PERF_PHASE_SAMPLES);
+		expect(maxBlock).toBeLessThan(MAX_SYNC_BLOCK_MS);
+	},
+);

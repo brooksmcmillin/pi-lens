@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { suspendAt } from "../interleaving-kit.js";
 const recordDegradation = vi.hoisted(() => vi.fn());
-vi.mock("../../../clients/degradation-ledger.js", () => ({ recordDegradation }));
+vi.mock("../../../clients/degradation-ledger.js", () => ({
+	recordDegradation,
+}));
 
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
@@ -79,7 +81,9 @@ describe("TypeScript language-service idle eviction (#1332 b2)", () => {
 		const { LSPService } = await import("../../../clients/lsp/index.js");
 		const service = new LSPService();
 
-		expect((await service.getClientForFile("/repo/main.ts"))?.client).toBe(first);
+		expect((await service.getClientForFile("/repo/main.ts"))?.client).toBe(
+			first,
+		);
 		await vi.advanceTimersByTimeAsync(20);
 
 		// This is the release assertion: the manager has dropped the only strong
@@ -90,11 +94,13 @@ describe("TypeScript language-service idle eviction (#1332 b2)", () => {
 		});
 		expect(recordDegradation).toHaveBeenCalledWith({
 			kind: "ts-idle-eviction",
-		subject: expect.stringMatching(/^typescript:.*repo$/),
+			subject: expect.stringMatching(/^typescript:.*repo$/),
 			reason: "idle TypeScript client released to bound memory",
 		});
 
-		expect((await service.getClientForFile("/repo/main.ts"))?.client).toBe(rebuilt);
+		expect((await service.getClientForFile("/repo/main.ts"))?.client).toBe(
+			rebuilt,
+		);
 		expect(spawn).toHaveBeenCalledTimes(2);
 		expect(createLSPClient).toHaveBeenCalledTimes(2);
 		await service.shutdown();

@@ -32,12 +32,9 @@ function write(rel: string, content = "x\n"): string {
 
 /** Resolve and return paths relative to root, unix-slashed, for stable asserts. */
 function resolveRel(lang: string, fileRel: string, source: string): string[] {
-	return resolveImportToFiles(
-		root,
-		path.join(root, fileRel),
-		lang,
-		source,
-	).map((p) => path.relative(root, p).replace(/\\/g, "/"));
+	return resolveImportToFiles(root, path.join(root, fileRel), lang, source).map(
+		(p) => path.relative(root, p).replace(/\\/g, "/"),
+	);
 }
 
 describe("relative-path resolvers (ruby/zig/bash/dart)", () => {
@@ -79,7 +76,9 @@ describe("relative-path resolvers (ruby/zig/bash/dart)", () => {
 
 	it("never resolves outside cwd", () => {
 		write("lib/a.rb");
-		expect(resolveRel("ruby", "lib/a.rb", "../../../../etc/passwd")).toEqual([]);
+		expect(resolveRel("ruby", "lib/a.rb", "../../../../etc/passwd")).toEqual(
+			[],
+		);
 	});
 });
 
@@ -237,7 +236,10 @@ describe("jsts resolver — workspace-package bare specifiers (#775)", () => {
 		);
 		write("packages/b/package.json", JSON.stringify({ name: "@scope/b" }));
 		write("packages/b/src/utils.ts", "export const util = 1;\n");
-		write("packages/a/src/index.ts", "import { util } from '@scope/b/src/utils';\n");
+		write(
+			"packages/a/src/index.ts",
+			"import { util } from '@scope/b/src/utils';\n",
+		);
 
 		expect(
 			resolveRel("jsts", "packages/a/src/index.ts", "@scope/b/src/utils"),

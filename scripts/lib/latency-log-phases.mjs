@@ -19,18 +19,18 @@
  * @returns {Array<Record<string, unknown>>}
  */
 export function parseNdjsonEntries(text) {
-  const entries = [];
-  for (const line of text.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    try {
-      const parsed = JSON.parse(trimmed);
-      if (parsed && typeof parsed === "object") entries.push(parsed);
-    } catch {
-      // partial/corrupt line — skip
-    }
-  }
-  return entries;
+	const entries = [];
+	for (const line of text.split(/\r?\n/)) {
+		const trimmed = line.trim();
+		if (!trimmed) continue;
+		try {
+			const parsed = JSON.parse(trimmed);
+			if (parsed && typeof parsed === "object") entries.push(parsed);
+		} catch {
+			// partial/corrupt line — skip
+		}
+	}
+	return entries;
 }
 
 /**
@@ -44,13 +44,13 @@ export function parseNdjsonEntries(text) {
  * @param {string} [sinceIso] ISO timestamp lower bound (inclusive)
  */
 export function findPhaseEntries(entries, phase, sinceIso) {
-  const sinceMs = sinceIso ? Date.parse(sinceIso) : undefined;
-  return entries.filter((e) => {
-    if (e.type !== "phase" || e.phase !== phase) return false;
-    if (sinceMs === undefined) return true;
-    const ts = typeof e.ts === "string" ? Date.parse(e.ts) : Number.NaN;
-    return Number.isFinite(ts) && ts >= sinceMs;
-  });
+	const sinceMs = sinceIso ? Date.parse(sinceIso) : undefined;
+	return entries.filter((e) => {
+		if (e.type !== "phase" || e.phase !== phase) return false;
+		if (sinceMs === undefined) return true;
+		const ts = typeof e.ts === "string" ? Date.parse(e.ts) : Number.NaN;
+		return Number.isFinite(ts) && ts >= sinceMs;
+	});
 }
 
 /**
@@ -61,7 +61,7 @@ export function findPhaseEntries(entries, phase, sinceIso) {
  * @param {string} [sinceIso]
  */
 export function phaseWasLogged(entries, phase, sinceIso) {
-  return findPhaseEntries(entries, phase, sinceIso).length > 0;
+	return findPhaseEntries(entries, phase, sinceIso).length > 0;
 }
 
 /**
@@ -74,5 +74,5 @@ export function phaseWasLogged(entries, phase, sinceIso) {
  * @param {string} [sinceIso]
  */
 export function noPhasesLogged(entries, phases, sinceIso) {
-  return phases.every((phase) => !phaseWasLogged(entries, phase, sinceIso));
+	return phases.every((phase) => !phaseWasLogged(entries, phase, sinceIso));
 }

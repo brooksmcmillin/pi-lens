@@ -46,7 +46,10 @@ function setStartupMode(mode: "full" | "quick"): () => void {
 	};
 }
 
-function makeDeps(ctxCwd: string, notify: (msg: string, level: string) => void) {
+function makeDeps(
+	ctxCwd: string,
+	notify: (msg: string, level: string) => void,
+) {
 	return {
 		ctxCwd,
 		getFlag: () => false,
@@ -62,11 +65,26 @@ function makeDeps(ctxCwd: string, notify: (msg: string, level: string) => void) 
 			ensureAvailable: async () => false,
 			scanExports: async () => new Map(),
 		},
-		biomeClient: { isAvailable: () => false, ensureAvailable: async () => false },
-		ruffClient: { isAvailable: () => false, ensureAvailable: async () => false },
-		knipClient: { isAvailable: () => false, ensureAvailable: async () => false },
-		jscpdClient: { isAvailable: () => false, ensureAvailable: async () => false },
-		depChecker: { isAvailable: () => false, ensureAvailable: async () => false },
+		biomeClient: {
+			isAvailable: () => false,
+			ensureAvailable: async () => false,
+		},
+		ruffClient: {
+			isAvailable: () => false,
+			ensureAvailable: async () => false,
+		},
+		knipClient: {
+			isAvailable: () => false,
+			ensureAvailable: async () => false,
+		},
+		jscpdClient: {
+			isAvailable: () => false,
+			ensureAvailable: async () => false,
+		},
+		depChecker: {
+			isAvailable: () => false,
+			ensureAvailable: async () => false,
+		},
 		testRunnerClient: {
 			detectRunner: () => null,
 			runTestFile: () => ({ failed: 0, error: false }),

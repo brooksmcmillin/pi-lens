@@ -109,7 +109,9 @@ describe("format-smoke fixtures honor the style-preserving contract (#1144)", ()
 		// which are ALSO fixture rows and also lenient. A `continue` when a name is
 		// absent would make this self-skipping — instead, assert the intersection
 		// is non-empty so a fixture-set change cannot empty the guard unnoticed.
-		const fixtureFormatters = new Set(FORMAT_FIXTURES.map((fx) => fx.formatter));
+		const fixtureFormatters = new Set(
+			FORMAT_FIXTURES.map((fx) => fx.formatter),
+		);
 		const lenientRows = ALL_FORMATTERS.filter(
 			(f) => f.lenientExitCode && fixtureFormatters.has(f.name),
 		);

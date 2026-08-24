@@ -8,6 +8,7 @@ import astGrepNapiRunner from "./ast-grep-napi.js";
 import biomeCheckJsonRunner from "./biome-check.js";
 import cppCheckRunner from "./cpp-check.js";
 import credoRunner from "./credo.js";
+import cueVetRunner from "./cue-vet.js";
 import dartAnalyzeRunner from "./dart-analyze.js";
 import detektRunner from "./detekt.js";
 import dotnetBuildRunner from "./dotnet-build.js";
@@ -108,4 +109,5 @@ export function registerDefaultRunners(registry: RunnerRegistry): void {
 	registry.register(credoRunner); // Elixir static analysis via credo (priority 20, mix.exs-gated)
 	registry.register(elixirCheckRunner); // Elixir compile/syntax diagnostics via mix/elixirc (priority 20)
 	registry.register(phpstanRunner); // PHP static analysis via phpstan (priority 20, config-gated)
+	registry.register(cueVetRunner); // CUE evaluation-error validation via cue vet (priority 20) — covers the class cuelsp doesn't publish
 }

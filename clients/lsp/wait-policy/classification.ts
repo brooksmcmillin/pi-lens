@@ -64,7 +64,9 @@ export function classifyServerWaitTier(
 export function resolvePrimaryServerForWaitPolicy(
 	filePath: string,
 	snapshots: Awaited<ReturnType<LSPService["getCapabilitySnapshots"]>>,
-): { serverId: string; snapshot: LSPCapabilitySnapshot | undefined } | undefined {
+):
+	| { serverId: string; snapshot: LSPCapabilitySnapshot | undefined }
+	| undefined {
 	const servers = getServersForFileWithConfig(filePath).filter(
 		(s) => s.role !== "auxiliary",
 	);

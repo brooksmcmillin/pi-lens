@@ -50,7 +50,10 @@ export class AgentBehaviorClient {
 	private lastToolTimestamp = 0;
 
 	// Per-file tracking
-	private fileEditCount = new Map<string, { count: number; lastUsedAt: number }>();
+	private fileEditCount = new Map<
+		string,
+		{ count: number; lastUsedAt: number }
+	>();
 	private static readonly FILE_EDIT_IDLE_MS = 30 * 60_000;
 
 	/**

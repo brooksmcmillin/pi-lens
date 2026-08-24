@@ -5,13 +5,36 @@
  * directly with mock LSPClientState to avoid spawning real language servers.
  */
 
-import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
-import type { MessageConnection } from "vscode-jsonrpc";
+// #1639: capture `lsp_typescript_diagnostic_sequence` phase records so the
+// pull-settle regression tests below can assert on durationMs/version/
+// settleSource without spinning up a real logging sink.
+//
+// #1641 F4: ALSO record every logLatency call (any phase) into
+// `logLatencyMock` so `recordSentContent`'s `lsp_document_send` calls are
+// inspectable too, without needing the real (test-mode-suppressed) writer.
+const { pullSequenceEvents, logLatencyMock } = vi.hoisted(() => ({
+	pullSequenceEvents: [] as Array<Record<string, unknown>>,
+	logLatencyMock: vi.fn(),
+}));
+vi.mock("../../../clients/latency-logger.js", async (importOriginal) => {
+	const actual =
+		await importOriginal<typeof import("../../../clients/latency-logger.js")>();
+	return {
+		...actual,
+		logLatency: vi.fn((event: Record<string, unknown>) => {
+			logLatencyMock(event);
+			if (event.phase === "lsp_typescript_diagnostic_sequence") {
+				pullSequenceEvents.push(event);
+			}
+		}),
+	};
+});
+
 import {
 	applyDynamicCapabilities,
 	bumpDiagnosticsVersion,
@@ -24,6 +47,7 @@ import {
 	diagnosticsVersionForPath,
 	normalizeClientWorkspaceEdit,
 	handleNotifyChange,
+	handleNotifyExternalChange,
 	navRequest,
 	resolveConfigurationSection,
 	runServerCommand,
@@ -35,8 +59,10 @@ import {
 } from "../../../clients/lsp/client.js";
 import { normalizeMapKey } from "../../../clients/path-utils.js";
 import { hashDiagnosticContent } from "../../../clients/lsp/diagnostic-binding.js";
-import { WatchedFilesQueue } from "../../../clients/lsp/watch-queue.js";
 import { applyWorkspaceEdit } from "../../../clients/lsp/edits.js";
+// #1667: the LSPClientState fixture moved to a shared module so the
+// multi-identifier pull tests reuse it instead of maintaining a copy.
+import { createMockLspProcess, createMockState } from "./mock-client-state.js";
 
 const TEST_FILE = "/project/app.ts";
 const TEST_KEY = normalizeMapKey(TEST_FILE);
@@ -71,8 +97,11 @@ describe("CLIENT_CAPABILITIES (#278 regression)", () => {
 		expect(sync).not.toHaveProperty("didChange");
 		// Version-aware diagnostics (#240/#276) must stay advertised.
 		expect(
-			(CLIENT_CAPABILITIES.textDocument.publishDiagnostics as { versionSupport?: boolean })
-				.versionSupport,
+			(
+				CLIENT_CAPABILITIES.textDocument.publishDiagnostics as {
+					versionSupport?: boolean;
+				}
+			).versionSupport,
 		).toBe(true);
 	});
 });
@@ -96,20 +125,28 @@ describe("client workspace edit normalization", () => {
 				},
 				{
 					textDocument: { uri: pathToFileURL(newFile).href },
-					edits: [{
-						range: {
-							start: { line: 0, character: 14 },
-							end: { line: 0, character: 15 },
+					edits: [
+						{
+							range: {
+								start: { line: 0, character: 14 },
+								end: { line: 0, character: 15 },
+							},
+							newText: "2",
 						},
-						newText: "2",
-					}],
+					],
 				},
 			],
 		};
 
 		try {
 			const normalized = await normalizeClientWorkspaceEdit(state, edit);
-			const textChange = (normalized.documentChanges?.[1] as { edits: Array<{ range: { start: { character: number }; end: { character: number } } }> }).edits[0];
+			const textChange = (
+				normalized.documentChanges?.[1] as {
+					edits: Array<{
+						range: { start: { character: number }; end: { character: number } };
+					}>;
+				}
+			).edits[0];
 			expect(textChange.range.start.character).toBe(13);
 			expect(textChange.range.end.character).toBe(14);
 			await applyWorkspaceEdit(normalized, root);
@@ -123,21 +160,39 @@ describe("client workspace edit normalization", () => {
 	it.each(["utf-8", "utf-32"] as const)(
 		"preserves duplicate zero-width edits during %s normalization",
 		async (positionEncoding) => {
-			const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-client-edit-"));
+			const root = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-client-edit-"),
+			);
 			const filePath = path.join(root, "file.ts");
 			fs.writeFileSync(filePath, "a\n", "utf-8");
 			const state = createMockState({ root, positionEncoding });
 			try {
 				const normalized = await normalizeClientWorkspaceEdit(state, {
-					documentChanges: [{
-						textDocument: { uri: pathToFileURL(filePath).href },
-						edits: [
-							{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } }, newText: "x" },
-							{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } }, newText: "x" },
-						],
-					}],
+					documentChanges: [
+						{
+							textDocument: { uri: pathToFileURL(filePath).href },
+							edits: [
+								{
+									range: {
+										start: { line: 0, character: 0 },
+										end: { line: 0, character: 0 },
+									},
+									newText: "x",
+								},
+								{
+									range: {
+										start: { line: 0, character: 0 },
+										end: { line: 0, character: 0 },
+									},
+									newText: "x",
+								},
+							],
+						},
+					],
 				});
-				const textChange = normalized.documentChanges?.[0] as { edits: unknown[] };
+				const textChange = normalized.documentChanges?.[0] as {
+					edits: unknown[];
+				};
 				expect(textChange.edits).toHaveLength(2);
 				await applyWorkspaceEdit(normalized, root);
 				expect(fs.readFileSync(filePath, "utf-8")).toBe("xxa\n");
@@ -150,7 +205,9 @@ describe("client workspace edit normalization", () => {
 	it.each(["utf-8", "utf-32"] as const)(
 		"supports delete-create-text ordering during %s normalization",
 		async (positionEncoding) => {
-			const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-client-edit-"));
+			const root = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-client-edit-"),
+			);
 			const filePath = path.join(root, "file.ts");
 			fs.writeFileSync(filePath, "old\n", "utf-8");
 			const state = createMockState({ root, positionEncoding });
@@ -161,10 +218,15 @@ describe("client workspace edit normalization", () => {
 						{ kind: "create", uri: pathToFileURL(filePath).href },
 						{
 							textDocument: { uri: pathToFileURL(filePath).href },
-							edits: [{
-								range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } },
-								newText: "new\n",
-							}],
+							edits: [
+								{
+									range: {
+										start: { line: 0, character: 0 },
+										end: { line: 0, character: 0 },
+									},
+									newText: "new\n",
+								},
+							],
 						},
 					],
 				});
@@ -189,12 +251,26 @@ describe("client workspace edit normalization", () => {
 		state.documentVersions.set(normalizeMapKey(filePath), 7);
 		try {
 			const normalized = await normalizeClientWorkspaceEdit(state, {
-				documentChanges: [{
-					textDocument: { uri: pathToFileURL(filePath).href, version: 7 },
-					edits: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 3 } }, newText: "new" }],
-				}],
+				documentChanges: [
+					{
+						textDocument: { uri: pathToFileURL(filePath).href, version: 7 },
+						edits: [
+							{
+								range: {
+									start: { line: 0, character: 0 },
+									end: { line: 0, character: 3 },
+								},
+								newText: "new",
+							},
+						],
+					},
+				],
 			});
-			const textDocument = (normalized.documentChanges?.[0] as { textDocument: { version: unknown } }).textDocument;
+			const textDocument = (
+				normalized.documentChanges?.[0] as {
+					textDocument: { version: unknown };
+				}
+			).textDocument;
 			expect(textDocument.version).toBeNull();
 			// No documentVersions passed — mirrors the real tool apply sites.
 			await applyWorkspaceEdit(normalized, root);
@@ -211,12 +287,24 @@ describe("client workspace edit normalization", () => {
 		const state = createMockState({ root, positionEncoding: "utf-16" });
 		state.documentVersions.set(normalizeMapKey(filePath), 1);
 		try {
-			await expect(normalizeClientWorkspaceEdit(state, {
-				documentChanges: [{
-					textDocument: { uri: pathToFileURL(filePath).href, version: 9 },
-					edits: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 3 } }, newText: "new" }],
-				}],
-			})).rejects.toThrow(/stale workspace edit document version/);
+			await expect(
+				normalizeClientWorkspaceEdit(state, {
+					documentChanges: [
+						{
+							textDocument: { uri: pathToFileURL(filePath).href, version: 9 },
+							edits: [
+								{
+									range: {
+										start: { line: 0, character: 0 },
+										end: { line: 0, character: 3 },
+									},
+									newText: "new",
+								},
+							],
+						},
+					],
+				}),
+			).rejects.toThrow(/stale workspace edit document version/);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -238,21 +326,29 @@ describe("client workspace edit normalization", () => {
 			// (A position merely PAST the line end now clamps per LSP 3.17 — see the
 			// clamp coverage in edits.test.ts — so this exercises the boundary check,
 			// not the removed past-end throw.)
-			await expect(normalizeClientWorkspaceEdit(state, {
-				documentChanges: [
-					{ kind: "rename", oldUri: pathToFileURL(oldDir).href, newUri: pathToFileURL(newDir).href },
-					{
-						textDocument: { uri: pathToFileURL(newFile).href },
-						edits: [{
-							range: {
-								start: { line: 0, character: 10 },
-								end: { line: 0, character: 10 },
-							},
-							newText: "x",
-						}],
-					},
-				],
-			})).rejects.toThrow(/boundary/);
+			await expect(
+				normalizeClientWorkspaceEdit(state, {
+					documentChanges: [
+						{
+							kind: "rename",
+							oldUri: pathToFileURL(oldDir).href,
+							newUri: pathToFileURL(newDir).href,
+						},
+						{
+							textDocument: { uri: pathToFileURL(newFile).href },
+							edits: [
+								{
+									range: {
+										start: { line: 0, character: 10 },
+										end: { line: 0, character: 10 },
+									},
+									newText: "x",
+								},
+							],
+						},
+					],
+				}),
+			).rejects.toThrow(/boundary/);
 			expect(fs.existsSync(oldFile)).toBe(true);
 			expect(fs.existsSync(newFile)).toBe(false);
 		} finally {
@@ -278,27 +374,28 @@ describe("solicited workspace/applyEdit observability", () => {
 			readGuard: { recordWritten: (file) => written.push(file) },
 		};
 		setupIncomingHandlers(state, {});
-		const calls = vi.mocked(state.connection.onRequest).mock.calls as unknown as Array<
-			[string, (...args: unknown[]) => unknown]
-		>;
-		const handler = calls.find((call) => call[0] === "workspace/applyEdit")?.[1];
+		const calls = vi.mocked(state.connection.onRequest).mock
+			.calls as unknown as Array<[string, (...args: unknown[]) => unknown]>;
+		const handler = calls.find(
+			(call) => call[0] === "workspace/applyEdit",
+		)?.[1];
 		expect(handler).toBeDefined();
 		await expect(
 			handler!({
-			edit: {
-				changes: {
-					[pathToFileURL(filePath).href]: [
-						{
-							range: {
-								start: { line: 0, character: 6 },
-								end: { line: 0, character: 9 },
+				edit: {
+					changes: {
+						[pathToFileURL(filePath).href]: [
+							{
+								range: {
+									start: { line: 0, character: 6 },
+									end: { line: 0, character: 9 },
+								},
+								newText: "new",
 							},
-							newText: "new",
-						},
-					],
+						],
+					},
 				},
-			},
-		}),
+			}),
 		).resolves.toMatchObject({ applied: true });
 		expect(fs.readFileSync(filePath, "utf8")).toBe("const new = 1;\n");
 		expect(written).toEqual([filePath]);
@@ -323,7 +420,9 @@ describe("solicited workspace/applyEdit observability", () => {
 				},
 			},
 		});
-		await expect(Promise.resolve(second)).resolves.toMatchObject({ applied: true });
+		await expect(Promise.resolve(second)).resolves.toMatchObject({
+			applied: true,
+		});
 		expect(fs.readFileSync(filePath, "utf8")).toBe("const second = 1;\n");
 		expect(state.activeMutationContext?.summaryCount).toBe(2);
 
@@ -336,7 +435,10 @@ describe("solicited workspace/applyEdit observability", () => {
 				},
 			},
 		});
-		expect(refused).toEqual({ applied: false, failureReason: "edit not solicited" });
+		expect(refused).toEqual({
+			applied: false,
+			failureReason: "edit not solicited",
+		});
 		expect(fs.readFileSync(filePath, "utf8")).toBe("const old = 1;\n");
 		fs.rmSync(root, { recursive: true, force: true });
 	});
@@ -371,112 +473,6 @@ describe("workDoneProgress capability (#974)", () => {
 		).resolves.toBeUndefined();
 	});
 });
-
-function createMockConnection(): MessageConnection {
-	return {
-		sendNotification: vi.fn().mockResolvedValue(undefined),
-		sendRequest: vi.fn().mockResolvedValue(undefined),
-		onNotification: vi.fn(),
-		onRequest: vi.fn().mockResolvedValue(undefined),
-		onError: vi.fn(),
-		onClose: vi.fn(),
-		listen: vi.fn(),
-		dispose: vi.fn(),
-	} as unknown as MessageConnection;
-}
-
-function createMockLspProcess() {
-	return {
-		pid: 12345,
-		process: { killed: false, kill: vi.fn() } as unknown as NodeJS.Process,
-		stdin: {
-			on: vi.fn(),
-			off: vi.fn(),
-			write: vi.fn(),
-		} as unknown as NodeJS.WritableStream,
-		stdout: {
-			on: vi.fn(),
-			off: vi.fn(),
-			pipe: vi.fn(),
-		} as unknown as NodeJS.ReadableStream,
-		stderr: { on: vi.fn(), off: vi.fn() } as unknown as NodeJS.ReadableStream,
-	};
-}
-
-function createMockState(overrides?: Partial<LSPClientState>): LSPClientState {
-	const diagnosticEmitter = new EventEmitter();
-	diagnosticEmitter.setMaxListeners(50);
-	const state: LSPClientState = {
-		isConnected: true,
-		isDestroyed: false,
-		shutdownRequested: false,
-		exitedAt: undefined,
-		connectionDisposed: false,
-		lastError: undefined,
-		connection: createMockConnection(),
-		pushDiagnostics: new Map(),
-		pushDiagnosticTimestamps: new Map(),
-		documentPullDiagnostics: new Map(),
-		documentPullDiagnosticTimestamps: new Map(),
-		pullFailureHistory: [],
-		pendingDiagnostics: new Map(),
-		diagnosticPublicationCounts: new Map(),
-		documentOpenedAt: new Map(),
-		diagnosticEmitter,
-		diagnosticsVersion: 0,
-		diagnosticsVersionsByPath: new Map(),
-		documentVersions: new Map(),
-		diagnosticDocVersions: new Map(),
-		documentContentHashes: new Map(),
-		diagnosticBindings: new Map(),
-		pullResultIds: new Map(),
-		workspacePullResultCache: new Map(),
-		openDocuments: new Set(),
-		closedDocuments: new Set(),
-		pendingOpens: new Set(),
-		workspaceDiagnosticsSupport: {
-			advertised: false,
-			mode: "push-only",
-			workspaceDiagnostics: false,
-			diagnosticProviderKind: "none",
-		},
-		operationSupport: {
-			definition: false,
-			typeDefinition: false,
-			declaration: false,
-			references: false,
-			hover: false,
-			signatureHelp: false,
-			documentSymbol: false,
-			workspaceSymbol: false,
-			codeAction: false,
-			rename: false,
-			implementation: false,
-			callHierarchy: false,
-		},
-		staticDiagnosticsMode: "push-only",
-		positionEncoding: "utf-16",
-		dynamicRegistrations: new Map(),
-		advertisedCommands: new Set(),
-		serverEditsAllowed: 0,
-		serverId: "test-server",
-		root: "/project",
-		lspProcess: createMockLspProcess() as any,
-		watchQueue: undefined as unknown as WatchedFilesQueue,
-		...overrides,
-	};
-	// #271: mirror production — the queue flushes a batched didChangeWatchedFiles
-	// through the (mock) connection. Tests drive it via state.watchQueue.flush().
-	if (!state.watchQueue) {
-		state.watchQueue = new WatchedFilesQueue((changes) => {
-			void state.connection.sendNotification(
-				"workspace/didChangeWatchedFiles",
-				{ changes },
-			);
-		});
-	}
-	return state;
-}
 
 describe("resolveConfigurationSection (#983)", () => {
 	const initialization = {
@@ -529,9 +525,7 @@ describe("workspace/configuration handler (#983)", () => {
 		const calls = onRequest.mock.calls as unknown as Array<
 			[string, (params: unknown) => Promise<unknown[]>]
 		>;
-		const registered = calls.find(
-			(c) => c[0] === "workspace/configuration",
-		);
+		const registered = calls.find((c) => c[0] === "workspace/configuration");
 		expect(registered).toBeDefined();
 		const handler = registered![1];
 
@@ -544,12 +538,7 @@ describe("workspace/configuration handler (#983)", () => {
 			],
 		});
 
-		expect(result).toEqual([
-			{ jobs: 16 },
-			false,
-			null,
-			initialization,
-		]);
+		expect(result).toEqual([{ jobs: 16 }, false, null, initialization]);
 	});
 
 	it("returns an empty array when the server requests zero items", async () => {
@@ -560,9 +549,7 @@ describe("workspace/configuration handler (#983)", () => {
 		const calls = onRequest.mock.calls as unknown as Array<
 			[string, (params: unknown) => Promise<unknown[]>]
 		>;
-		const registered = calls.find(
-			(c) => c[0] === "workspace/configuration",
-		);
+		const registered = calls.find((c) => c[0] === "workspace/configuration");
 		const handler = registered![1];
 
 		expect(await handler({ items: [] })).toEqual([]);
@@ -653,6 +640,30 @@ describe("handleNotifyOpen", () => {
 		expect(state.openDocuments.has(TEST_KEY)).toBe(true);
 	});
 
+	it("#1641 F4: lsp_document_send's contentLineCount matches the gate's LSP-addressable convention (newlines + 1), not wc -l", async () => {
+		logLatencyMock.mockClear();
+		const state = createMockState();
+		await handleNotifyOpen(state, TEST_FILE, "a\nb\nc\n", "typescript"); // 3 newlines
+
+		const sendCall = logLatencyMock.mock.calls.find(
+			(c) => c[0]?.phase === "lsp_document_send",
+		);
+		expect(sendCall).toBeDefined();
+		expect(sendCall?.[0].metadata.contentLineCount).toBe(4);
+		expect(sendCall?.[0].metadata.contentLength).toBe(6);
+	});
+
+	it("#1641 F4: an empty document logs contentLineCount 1, not 0 (a doc always has ≥1 addressable line)", async () => {
+		logLatencyMock.mockClear();
+		const state = createMockState();
+		await handleNotifyOpen(state, TEST_FILE, "", "typescript");
+
+		const sendCall = logLatencyMock.mock.calls.find(
+			(c) => c[0]?.phase === "lsp_document_send",
+		);
+		expect(sendCall?.[0].metadata.contentLineCount).toBe(1);
+	});
+
 	it("detaches the classic TypeScript projectInfo probe after didOpen", async () => {
 		const state = createMockState({
 			serverId: "typescript",
@@ -741,19 +752,20 @@ describe("handleNotifyOpen", () => {
 		const realGate = new Promise((resolve) => {
 			resolveReal = resolve;
 		});
-		vi.mocked(state.connection.sendRequest).mockImplementation(
-			((method: string, params: { command?: string }) => {
-				if (method === "workspace/executeCommand") {
-					if (params?.command === "typescript.tsserverRequest") {
-						return probeGate;
-					}
-					if (params?.command === "real.command") {
-						return realGate;
-					}
+		vi.mocked(state.connection.sendRequest).mockImplementation(((
+			method: string,
+			params: { command?: string },
+		) => {
+			if (method === "workspace/executeCommand") {
+				if (params?.command === "typescript.tsserverRequest") {
+					return probeGate;
 				}
-				return Promise.resolve({ ok: true });
-			}) as never,
-		);
+				if (params?.command === "real.command") {
+					return realGate;
+				}
+			}
+			return Promise.resolve({ ok: true });
+		}) as never);
 
 		await handleNotifyOpen(state, TEST_FILE, "const x = 1;", "typescript");
 		await vi.waitFor(() => {
@@ -856,9 +868,9 @@ describe("handleNotifyOpen", () => {
 			.mock.calls.filter((c) => c[0] === "workspace/didChangeWatchedFiles");
 		// one notification for the whole burst, carrying both URIs
 		expect(watchedCalls).toHaveLength(1);
-		expect(
-			(watchedCalls[0][1] as { changes: unknown[] }).changes,
-		).toHaveLength(2);
+		expect((watchedCalls[0][1] as { changes: unknown[] }).changes).toHaveLength(
+			2,
+		);
 	});
 
 	it("sends didChange on re-open", async () => {
@@ -907,6 +919,84 @@ describe("handleNotifyOpen", () => {
 		await handleNotifyOpen(state, TEST_FILE, "const x = 1;", "typescript");
 
 		expect(state.pushDiagnostics.has(TEST_KEY)).toBe(false);
+	});
+});
+
+/**
+ * #1668 — external (bash-authored) file changes that never went through
+ * textDocument/didOpen/didChange. Reproduces the server-side stale view: a
+ * bash-deleted file left NO trace in the fixture client's outbound traffic
+ * before this fix (`handleNotifyExternalChange` did not exist), so a server
+ * given only didOpen/didChange would keep the file in its index/vfs forever.
+ */
+describe("handleNotifyExternalChange (#1668)", () => {
+	it("queues a type-3 (Deleted) change and flushes it as one notification", () => {
+		const state = createMockState();
+		handleNotifyExternalChange(state, TEST_FILE, 3);
+
+		// Not on the wire yet — routed through the #271 debounce queue.
+		let calls = vi.mocked(state.connection.sendNotification).mock.calls;
+		expect(calls.some((c) => c[0] === "workspace/didChangeWatchedFiles")).toBe(
+			false,
+		);
+		expect(state.watchQueue.size).toBe(1);
+
+		state.watchQueue.flush();
+		calls = vi.mocked(state.connection.sendNotification).mock.calls;
+		const watched = calls.find(
+			(c) => c[0] === "workspace/didChangeWatchedFiles",
+		);
+		expect(watched).toBeDefined();
+		const changes = (
+			watched?.[1] as { changes: Array<{ uri: string; type: number }> }
+		).changes;
+		expect(changes).toEqual([{ uri: pathToFileURL(TEST_FILE).href, type: 3 }]);
+	});
+
+	it("a burst of N distinct external deletes coalesces into ONE flush (flood control)", () => {
+		const state = createMockState();
+		const files = Array.from({ length: 25 }, (_, i) => `/project/gen-${i}.ts`);
+		for (const f of files) handleNotifyExternalChange(state, f, 3);
+
+		expect(state.watchQueue.size).toBe(25);
+		expect(state.connection.sendNotification).not.toHaveBeenCalledWith(
+			"workspace/didChangeWatchedFiles",
+			expect.anything(),
+		);
+
+		state.watchQueue.flush();
+		const watchedCalls = vi
+			.mocked(state.connection.sendNotification)
+			.mock.calls.filter((c) => c[0] === "workspace/didChangeWatchedFiles");
+		expect(watchedCalls).toHaveLength(1);
+		expect((watchedCalls[0][1] as { changes: unknown[] }).changes).toHaveLength(
+			25,
+		);
+	});
+
+	it("uses the tracked open-document URI when the path is already open", () => {
+		const state = createMockState({ openDocumentUris: new Map() });
+		const uri = "file:///project/app.ts?variant=1";
+		state.openDocumentUris?.set(TEST_KEY, uri);
+
+		handleNotifyExternalChange(state, TEST_FILE, 1);
+		state.watchQueue.flush();
+
+		const calls = vi.mocked(state.connection.sendNotification).mock.calls;
+		const watched = calls.find(
+			(c) => c[0] === "workspace/didChangeWatchedFiles",
+		);
+		expect(
+			(watched?.[1] as { changes: Array<{ uri: string }> }).changes,
+		).toEqual([{ uri, type: 1 }]);
+	});
+
+	it("does nothing when the client is not alive", () => {
+		const state = createMockState({ isConnected: false });
+		handleNotifyExternalChange(state, TEST_FILE, 3);
+
+		expect(state.watchQueue.size).toBe(0);
+		expect(state.connection.sendNotification).not.toHaveBeenCalled();
 	});
 });
 
@@ -1243,7 +1333,9 @@ describe("publishDiagnostics handler — superseded push guard (cache-poisoning 
 		}
 
 		await wait;
-		expect(state.pushDiagnostics.get(TEST_KEY)?.[0]?.message).toBe("real error");
+		expect(state.pushDiagnostics.get(TEST_KEY)?.[0]?.message).toBe(
+			"real error",
+		);
 	});
 
 	it("settles a single native TS7 publication within the bounded quiet window", async () => {
@@ -1260,7 +1352,9 @@ describe("publishDiagnostics handler — superseded push guard (cache-poisoning 
 		await wait;
 
 		expect(Date.now() - startedAt).toBeLessThan(300);
-		expect(state.pushDiagnostics.get(TEST_KEY)?.[0]?.message).toBe("single result");
+		expect(state.pushDiagnostics.get(TEST_KEY)?.[0]?.message).toBe(
+			"single result",
+		);
 	});
 
 	it("cancels a pending native TS7 quiet-window timer on clear/resync", async () => {
@@ -1552,6 +1646,145 @@ describe("publishDiagnostics handler — superseded push guard (cache-poisoning 
 		expect(state.pushDiagnostics.has(TEST_KEY)).toBe(false);
 		expect(state.diagnosticBindings.has(TEST_KEY)).toBe(false);
 	});
+
+	// #1639: `logSequence` — the PUSH-path producer of
+	// `lsp_typescript_diagnostic_sequence` — is the actual source of the
+	// issue's cited evidence. It had the same durationMs-as-document-age and
+	// version:null bugs as the pull path, PLUS its raw per-publication receipt
+	// (`logSequence(false)`) logged with no `settleSource` at all — the
+	// "unsettled-then-settled" pair (~61ms apart, near-identical document age)
+	// the issue described as a double-emit is this function's own designed
+	// shape, not `ensureWarmForSweep`'s pull path.
+	describe("logSequence — push-path pull-settle record shape (#1639)", () => {
+		it("a quiet-window settle's durationMs times the debounce wait, not document age", async () => {
+			const { state, emitPublishDiagnostics } = createCapturingState();
+			// native-ts7 → seedFirstPush false, so every publish goes through the
+			// debounce/quiet-window path (never the immediate first-push seed).
+			Object.defineProperty(state, "serverId", { value: "typescript" });
+			Object.defineProperty(state, "launchVariant", { value: "native-ts7" });
+			// Document opened 90s ago — pre-fix, durationMs on the SETTLED record
+			// was hardcoded to this age.
+			state.documentOpenedAt.set(TEST_KEY, Date.now() - 90_000);
+
+			pullSequenceEvents.length = 0;
+			emitPublishDiagnostics({
+				uri: pathToFileURL(TEST_FILE).href,
+				diagnostics: [diagnostic("real error", "2322")],
+			});
+			await new Promise((resolve) => setTimeout(resolve, DEBOUNCE_WAIT_MS));
+
+			const settled = pullSequenceEvents.find(
+				(event) =>
+					event.metadata &&
+					(event.metadata as Record<string, unknown>).settledReturn === true,
+			);
+			expect(settled).toBeDefined();
+			// The debounce wait is ~50ms (typescript's own debounceMs) — nowhere
+			// near the 90s document age.
+			expect(settled!.durationMs as number).toBeLessThan(1000);
+			const metadata = settled!.metadata as Record<string, unknown>;
+			expect(metadata.elapsedSinceDidOpenMs as number).toBeGreaterThanOrEqual(
+				89_000,
+			);
+			expect(metadata.settleSource).toBe("quiet-window");
+		});
+
+		it("tags the raw per-publication receipt distinctly from the settle it precedes", async () => {
+			const { state, emitPublishDiagnostics } = createCapturingState();
+			Object.defineProperty(state, "serverId", { value: "typescript" });
+			Object.defineProperty(state, "launchVariant", { value: "native-ts7" });
+
+			pullSequenceEvents.length = 0;
+			emitPublishDiagnostics({
+				uri: pathToFileURL(TEST_FILE).href,
+				diagnostics: [diagnostic("real error", "2322")],
+			});
+			await new Promise((resolve) => setTimeout(resolve, DEBOUNCE_WAIT_MS));
+
+			// The exact "double-emit" pair the issue described: one unsettled
+			// receipt immediately followed by one settle, for the same file.
+			expect(pullSequenceEvents).toHaveLength(2);
+			const [unsettled, settled] = pullSequenceEvents.map(
+				(event) => event.metadata as Record<string, unknown>,
+			);
+			expect(unsettled.settledReturn).toBe(false);
+			expect(unsettled.settleSource).toBe("publication");
+			expect(unsettled).toMatchObject({
+				serverId: "typescript",
+				outcome: "published",
+			});
+			expect(pullSequenceEvents[0].durationMs).toBe(0);
+			expect(settled.settledReturn).toBe(true);
+			expect(settled.settleSource).toBe("quiet-window");
+			expect(settled).toMatchObject({
+				serverId: "typescript",
+				outcome: "settled",
+			});
+		});
+
+		it("a first-push settle's durationMs is 0 (no debounce wait), not document age", async () => {
+			const { state, emitPublishDiagnostics } = createCapturingState();
+			// serverId "typescript" alone (no native-ts7 launchVariant) →
+			// seedFirstPush true — the very first publish settles immediately.
+			Object.defineProperty(state, "serverId", { value: "typescript" });
+			state.documentOpenedAt.set(TEST_KEY, Date.now() - 90_000);
+
+			pullSequenceEvents.length = 0;
+			emitPublishDiagnostics({
+				uri: pathToFileURL(TEST_FILE).href,
+				diagnostics: [diagnostic("first push", "2322")],
+			});
+
+			expect(pullSequenceEvents).toHaveLength(1);
+			expect(pullSequenceEvents[0].durationMs).toBe(0);
+			const metadata = pullSequenceEvents[0].metadata as Record<
+				string,
+				unknown
+			>;
+			expect(metadata.settleSource).toBe("first-push");
+			expect(metadata.elapsedSinceDidOpenMs as number).toBeGreaterThanOrEqual(
+				89_000,
+			);
+		});
+
+		it("marks a settle with no server-reported version as push-unversioned, never null", async () => {
+			const { state, emitPublishDiagnostics } = createCapturingState();
+			Object.defineProperty(state, "serverId", { value: "typescript" });
+
+			pullSequenceEvents.length = 0;
+			emitPublishDiagnostics({
+				uri: pathToFileURL(TEST_FILE).href,
+				diagnostics: [diagnostic("no version", "2322")],
+				// version omitted — the server never reported one.
+			});
+
+			expect(pullSequenceEvents).toHaveLength(1);
+			const metadata = pullSequenceEvents[0].metadata as Record<
+				string,
+				unknown
+			>;
+			expect(metadata.version).toBe("push-unversioned");
+		});
+
+		it("keeps the real server-reported version when present", async () => {
+			const { state, emitPublishDiagnostics } = createCapturingState();
+			Object.defineProperty(state, "serverId", { value: "typescript" });
+
+			pullSequenceEvents.length = 0;
+			emitPublishDiagnostics({
+				uri: pathToFileURL(TEST_FILE).href,
+				version: 7,
+				diagnostics: [diagnostic("versioned", "2322")],
+			});
+
+			expect(pullSequenceEvents).toHaveLength(1);
+			const metadata = pullSequenceEvents[0].metadata as Record<
+				string,
+				unknown
+			>;
+			expect(metadata.version).toBe(7);
+		});
+	});
 });
 
 describe("clientWaitForDiagnostics — pull mode (#240)", () => {
@@ -1631,6 +1864,119 @@ describe("clientWaitForDiagnostics — pull mode (#240)", () => {
 		expect(elapsed).toBeGreaterThanOrEqual(100);
 		// ...and did NOT hang on the never-resolving request.
 		expect(elapsed).toBeLessThan(2000);
+	});
+});
+
+// #1639: `logTypeScriptPullSettle` (the `lsp_typescript_diagnostic_sequence`
+// phase's pull-path producer) misused durationMs as document age, hardcoded
+// version:null, and double-emitted indistinguishably for two legitimate call
+// paths (a real touch vs `ensureWarmForSweep`'s warm-up probe). Mirrors the
+// "pull mode (#240)" describe block's state shape.
+describe("logTypeScriptPullSettle — pull-settle record shape (#1639)", () => {
+	const pullState = (): LSPClientState =>
+		createMockState({
+			serverId: "typescript",
+			workspaceDiagnosticsSupport: {
+				advertised: true,
+				mode: "pull",
+				workspaceDiagnostics: false,
+				diagnosticProviderKind: "object",
+			},
+		});
+
+	it("durationMs measures the settle operation, not time-since-didOpen (document age stays in metadata)", async () => {
+		const state = pullState();
+		// Document opened 90s ago — pre-fix, durationMs was hardcoded to this
+		// age, so a settle that actually took milliseconds read as a >60s
+		// "duration" (the session evidence: 147/239 records read this way).
+		state.documentOpenedAt.set(TEST_KEY, Date.now() - 90_000);
+		state.connection.sendRequest = vi
+			.fn()
+			.mockResolvedValue({ kind: "full", items: [] });
+
+		pullSequenceEvents.length = 0;
+		await clientWaitForDiagnostics(state, TEST_FILE, 1000);
+
+		expect(pullSequenceEvents).toHaveLength(1);
+		const event = pullSequenceEvents[0];
+		// The settle itself took milliseconds (an in-memory mocked reply) —
+		// nowhere near the 90s document age.
+		expect(event.durationMs as number).toBeLessThan(1000);
+		const metadata = event.metadata as Record<string, unknown>;
+		expect(metadata).toMatchObject({
+			serverId: "typescript",
+			outcome: "settled",
+		});
+		// The document age is still recorded, honestly named, in metadata.
+		expect(metadata.elapsedSinceDidOpenMs as number).toBeGreaterThanOrEqual(
+			89_000,
+		);
+	});
+
+	it("carries the real tracked version instead of a hardcoded null", async () => {
+		const state = pullState();
+		state.connection.sendRequest = vi
+			.fn()
+			.mockResolvedValue({ kind: "full", items: [] });
+		// Mirror production: a prior publication already bumped the per-path
+		// version stamp before this pull settles.
+		bumpDiagnosticsVersion(state, TEST_KEY);
+		bumpDiagnosticsVersion(state, TEST_KEY);
+
+		pullSequenceEvents.length = 0;
+		await clientWaitForDiagnostics(state, TEST_FILE, 1000);
+
+		expect(pullSequenceEvents).toHaveLength(1);
+		const metadata = pullSequenceEvents[0].metadata as Record<string, unknown>;
+		expect(metadata.version).toBe(diagnosticsVersionForPath(state, TEST_KEY));
+		expect(metadata.version).not.toBeNull();
+	});
+
+	it("marks a settle with no tracked version as pull-unversioned, never null", async () => {
+		const state = pullState();
+		// A "kind: unchanged" report never calls `bumpDiagnosticsVersion` (see
+		// the #1104 comment on that branch) — it inherits the PRIOR resultId
+		// basis unchanged. Pre-populate that basis directly (rather than via a
+		// real prior pull) so this settle is the first thing to ever touch
+		// `diagnosticsVersionsByPath` for this path: nothing is tracked yet.
+		state.pullResultIds.set(TEST_KEY, "r1");
+		state.documentPullDiagnostics.set(TEST_KEY, []);
+		state.connection.sendRequest = vi
+			.fn()
+			.mockResolvedValue({ kind: "unchanged" });
+
+		pullSequenceEvents.length = 0;
+		await clientWaitForDiagnostics(state, TEST_FILE, 1000);
+
+		expect(pullSequenceEvents).toHaveLength(1);
+		const metadata = pullSequenceEvents[0].metadata as Record<string, unknown>;
+		expect(diagnosticsVersionForPath(state, TEST_KEY)).toBe(0);
+		expect(metadata.version).toBe("pull-unversioned");
+	});
+
+	it("tags a warm-up-only settle distinctly from a real touch's settle (double-emit fix)", async () => {
+		// #1639: `ensureWarmForSweep`'s readiness probe and the sweep's real
+		// touch both run a genuine pull round trip for the SAME file, close
+		// together — two legitimate settle observations, not a duplicate.
+		// Pre-fix both logged identically as settleSource "pull" (239 records
+		// vs 145 touches in the session evidence); the fix must tag them
+		// distinctly so a consumer can tell them apart.
+		const state = pullState();
+		state.connection.sendRequest = vi
+			.fn()
+			.mockResolvedValue({ kind: "full", items: [] });
+
+		pullSequenceEvents.length = 0;
+		await clientWaitForDiagnostics(state, TEST_FILE, 1000, {
+			pullSettleSource: "pull-warmup",
+		});
+		await clientWaitForDiagnostics(state, TEST_FILE, 1000);
+
+		expect(pullSequenceEvents).toHaveLength(2);
+		const sources = pullSequenceEvents.map(
+			(event) => (event.metadata as Record<string, unknown>).settleSource,
+		);
+		expect(sources).toEqual(["pull-warmup", "pull"]);
 	});
 });
 
@@ -1851,11 +2197,15 @@ describe("pull fallback honesty + failure telemetry (#1292)", () => {
 		]);
 		state.connection.sendRequest = vi
 			.fn()
-			.mockRejectedValue(Object.assign(new Error("server unavailable"), { code: 500 }));
+			.mockRejectedValue(
+				Object.assign(new Error("server unavailable"), { code: 500 }),
+			);
 
 		await clientWaitForDiagnostics(state, TEST_FILE, 50);
 
-		expect(state.pushDiagnostics.get(TEST_KEY)?.[0]?.message).toBe("push result");
+		expect(state.pushDiagnostics.get(TEST_KEY)?.[0]?.message).toBe(
+			"push result",
+		);
 		expect(state.pullFailureHistory.length).toBeGreaterThanOrEqual(1);
 		expect(state.pullFailureHistory[0]).toMatchObject({
 			method: "textDocument/diagnostic",
@@ -1867,23 +2217,26 @@ describe("pull fallback honesty + failure telemetry (#1292)", () => {
 	it.each([
 		[-32601, "server-specific text"],
 		[undefined, "Method not found: textDocument/diagnostic"],
-	])("does not record an unsupported-method response as an operational failure (%s)", async (code, message) => {
-		const state = createMockState({
-			workspaceDiagnosticsSupport: {
-				advertised: true,
-				mode: "pull",
-				workspaceDiagnostics: false,
-				diagnosticProviderKind: "boolean",
-			},
-		});
-		const error = new Error(message);
-		if (code !== undefined) Object.assign(error, { code });
-		state.connection.sendRequest = vi.fn().mockRejectedValue(error);
+	])(
+		"does not record an unsupported-method response as an operational failure (%s)",
+		async (code, message) => {
+			const state = createMockState({
+				workspaceDiagnosticsSupport: {
+					advertised: true,
+					mode: "pull",
+					workspaceDiagnostics: false,
+					diagnosticProviderKind: "boolean",
+				},
+			});
+			const error = new Error(message);
+			if (code !== undefined) Object.assign(error, { code });
+			state.connection.sendRequest = vi.fn().mockRejectedValue(error);
 
-		await clientWaitForDiagnostics(state, TEST_FILE, 20);
+			await clientWaitForDiagnostics(state, TEST_FILE, 20);
 
-		expect(state.pullFailureHistory).toHaveLength(0);
-	});
+			expect(state.pullFailureHistory).toHaveLength(0);
+		},
+	);
 
 	it.each([
 		[new Error("Timeout after 20ms")],
@@ -1910,17 +2263,18 @@ describe("shutdown protocol race fixture (#1292)", () => {
 		const state = createMockState();
 		state.openDocuments.add(TEST_KEY);
 		state.documentVersions.set(TEST_KEY, 1);
-		state.diagnosticBindings.set(TEST_KEY, { version: 1, contentHash: "existing" });
+		state.diagnosticBindings.set(TEST_KEY, {
+			version: 1,
+			contentHash: "existing",
+		});
 		setupIncomingHandlers(state, {});
-		const notifications = vi.mocked(state.connection.onNotification).mock.calls as unknown as Array<
-			[string, (...args: unknown[]) => unknown]
-		>;
+		const notifications = vi.mocked(state.connection.onNotification).mock
+			.calls as unknown as Array<[string, (...args: unknown[]) => unknown]>;
 		const publish = notifications.find(
 			([method]) => method === "textDocument/publishDiagnostics",
 		)?.[1] as ((params: unknown) => void) | undefined;
-		const requests = vi.mocked(state.connection.onRequest).mock.calls as unknown as Array<
-			[string, (...args: unknown[]) => unknown]
-		>;
+		const requests = vi.mocked(state.connection.onRequest).mock
+			.calls as unknown as Array<[string, (...args: unknown[]) => unknown]>;
 		const register = requests.find(
 			([method]) => method === "client/registerCapability",
 		)?.[1] as ((params: unknown) => Promise<void>) | undefined;
@@ -1987,7 +2341,13 @@ describe("navRequest — per-request timeout ceiling (#365)", () => {
 		const payload = [{ name: "sym", kind: 12 }];
 		state.connection.sendRequest = vi.fn().mockResolvedValue(payload);
 
-		const result = await navRequest(state, "workspace/symbol", {}, undefined, 120);
+		const result = await navRequest(
+			state,
+			"workspace/symbol",
+			{},
+			undefined,
+			120,
+		);
 		expect(result).toEqual(payload);
 	});
 
@@ -2038,7 +2398,9 @@ describe("navRequest — $/cancelRequest on abort (#238 Item 1)", () => {
 
 		await navRequest(state, "workspace/symbol", {}, undefined, 120);
 		// No ambient signal in tests → third arg (token) is undefined.
-		expect(vi.mocked(state.connection.sendRequest).mock.calls[0]?.[2]).toBeUndefined();
+		expect(
+			vi.mocked(state.connection.sendRequest).mock.calls[0]?.[2],
+		).toBeUndefined();
 
 		await navRequest(
 			state,
@@ -2049,7 +2411,8 @@ describe("navRequest — $/cancelRequest on abort (#238 Item 1)", () => {
 			new AbortController().signal,
 		);
 		// Signal provided → a real CancellationToken is threaded to the server.
-		const token = vi.mocked(state.connection.sendRequest).mock.calls[1]?.[2] as {
+		const token = vi.mocked(state.connection.sendRequest).mock
+			.calls[1]?.[2] as {
 			onCancellationRequested?: unknown;
 		};
 		expect(token?.onCancellationRequested).toBeTypeOf("function");
@@ -2222,7 +2585,9 @@ describe("runServerCommand — executeCommand timeout backstop (#365)", () => {
 describe("applyDynamicCapabilities", () => {
 	it("upgrades to pull mode when textDocument/diagnostic is registered", () => {
 		const state = createMockState();
-		state.dynamicRegistrations.set("diag-1", "textDocument/diagnostic");
+		state.dynamicRegistrations.set("diag-1", {
+			method: "textDocument/diagnostic",
+		});
 
 		applyDynamicCapabilities(state);
 
@@ -2235,7 +2600,9 @@ describe("applyDynamicCapabilities", () => {
 
 	it("upgrades to pull mode when workspace/diagnostic is registered", () => {
 		const state = createMockState();
-		state.dynamicRegistrations.set("ws-diag-1", "workspace/diagnostic");
+		state.dynamicRegistrations.set("ws-diag-1", {
+			method: "workspace/diagnostic",
+		});
 
 		applyDynamicCapabilities(state);
 
@@ -2244,7 +2611,9 @@ describe("applyDynamicCapabilities", () => {
 
 	it("reverts to push-only when dynamic pull registration is removed", () => {
 		const state = createMockState();
-		state.dynamicRegistrations.set("diag-1", "textDocument/diagnostic");
+		state.dynamicRegistrations.set("diag-1", {
+			method: "textDocument/diagnostic",
+		});
 		applyDynamicCapabilities(state);
 		expect(state.workspaceDiagnosticsSupport.mode).toBe("pull");
 
@@ -2276,9 +2645,15 @@ describe("applyDynamicCapabilities", () => {
 
 	it("upgrades operation capabilities when methods are registered", () => {
 		const state = createMockState();
-		state.dynamicRegistrations.set("def-1", "textDocument/definition");
-		state.dynamicRegistrations.set("ref-1", "textDocument/references");
-		state.dynamicRegistrations.set("hover-1", "textDocument/hover");
+		state.dynamicRegistrations.set("def-1", {
+			method: "textDocument/definition",
+		});
+		state.dynamicRegistrations.set("ref-1", {
+			method: "textDocument/references",
+		});
+		state.dynamicRegistrations.set("hover-1", {
+			method: "textDocument/hover",
+		});
 
 		applyDynamicCapabilities(state);
 
@@ -2313,7 +2688,9 @@ describe("applyDynamicCapabilities", () => {
 
 	it("ignores unknown registration methods without throwing", () => {
 		const state = createMockState();
-		state.dynamicRegistrations.set("unknown-1", "some/unknownMethod");
+		state.dynamicRegistrations.set("unknown-1", {
+			method: "some/unknownMethod",
+		});
 
 		expect(() => applyDynamicCapabilities(state)).not.toThrow();
 		expect(state.workspaceDiagnosticsSupport.mode).toBe("push-only");
@@ -2358,6 +2735,7 @@ describe("clientRequestWorkspaceDiagnostics — real report parsing", () => {
 		expect(state.connection.sendRequest).toHaveBeenCalledWith(
 			"workspace/diagnostic",
 			{ previousResultIds: [] },
+			expect.anything(),
 		);
 		expect(out).toBeDefined();
 		const byName = (name: string) =>
@@ -2384,7 +2762,9 @@ describe("clientRequestWorkspaceDiagnostics — real report parsing", () => {
 			},
 		});
 		vi.mocked(state.connection.sendRequest).mockResolvedValue({ nope: true });
-		expect(await clientRequestWorkspaceDiagnostics(state, 1000)).toBeUndefined();
+		expect(
+			await clientRequestWorkspaceDiagnostics(state, 1000),
+		).toBeUndefined();
 	});
 
 	it("returns undefined when the request throws or yields nothing (dead/timeout)", async () => {
@@ -2396,8 +2776,12 @@ describe("clientRequestWorkspaceDiagnostics — real report parsing", () => {
 				diagnosticProviderKind: "object",
 			},
 		});
-		vi.mocked(state.connection.sendRequest).mockRejectedValue(new Error("dead"));
-		expect(await clientRequestWorkspaceDiagnostics(state, 1000)).toBeUndefined();
+		vi.mocked(state.connection.sendRequest).mockRejectedValue(
+			new Error("dead"),
+		);
+		expect(
+			await clientRequestWorkspaceDiagnostics(state, 1000),
+		).toBeUndefined();
 	});
 });
 

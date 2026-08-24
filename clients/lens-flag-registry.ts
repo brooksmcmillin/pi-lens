@@ -290,7 +290,9 @@ export const PROJECT_FOREIGN_CONFIG_NAMESPACES: readonly string[] = [
  * recognized-key catalogs from this rather than restating flag sections, so a
  * new flag never needs an unknown-key-scan edit (#166/#883).
  */
-export function flagConfigSectionKeys(flags: readonly LensFlagSpec[]): string[] {
+export function flagConfigSectionKeys(
+	flags: readonly LensFlagSpec[],
+): string[] {
 	return [...new Set(flags.map((spec) => spec.configKey.split(".")[0]))];
 }
 

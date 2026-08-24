@@ -94,15 +94,25 @@ interface DirCacheEntry {
 const dirMarkerCache = new Map<string, DirCacheEntry>();
 
 /** Cache for upward marker-walk results, keyed by `${startDir}\0${markerKey}`. */
-type WalkCacheEntry = { dir: string | undefined; dirMtimes: Array<{ dir: string; mtimeMs: number }>; lastUsedAt: number; idleTimer?: ReturnType<typeof setTimeout> };
+type WalkCacheEntry = {
+	dir: string | undefined;
+	dirMtimes: Array<{ dir: string; mtimeMs: number }>;
+	lastUsedAt: number;
+	idleTimer?: ReturnType<typeof setTimeout>;
+};
 const walkCache = new Map<string, WalkCacheEntry>();
 const TOPOLOGY_MAX_DIR_ENTRIES = 256;
 const TOPOLOGY_MAX_WALK_ENTRIES = 512;
 const TOPOLOGY_IDLE_EVICT_MS_DEFAULT = 20 * 60_000;
 
 function topologyIdleEvictMs(): number {
-	const value = Number.parseInt(process.env.PI_LENS_WORKSPACE_TOPOLOGY_IDLE_EVICT_MS ?? "", 10);
-	return Number.isSafeInteger(value) && value > 0 ? value : TOPOLOGY_IDLE_EVICT_MS_DEFAULT;
+	const value = Number.parseInt(
+		process.env.PI_LENS_WORKSPACE_TOPOLOGY_IDLE_EVICT_MS ?? "",
+		10,
+	);
+	return Number.isSafeInteger(value) && value > 0
+		? value
+		: TOPOLOGY_IDLE_EVICT_MS_DEFAULT;
 }
 
 function deleteDirMarker(key: string): void {
@@ -122,7 +132,8 @@ function touchDirMarker(key: string, entry: DirCacheEntry): void {
 	if (entry.idleTimer) clearTimeout(entry.idleTimer);
 	const stamp = entry.lastUsedAt;
 	entry.idleTimer = setTimeout(() => {
-		if (dirMarkerCache.get(key) === entry && entry.lastUsedAt === stamp) deleteDirMarker(key);
+		if (dirMarkerCache.get(key) === entry && entry.lastUsedAt === stamp)
+			deleteDirMarker(key);
 	}, topologyIdleEvictMs());
 	entry.idleTimer.unref?.();
 }
@@ -132,7 +143,8 @@ function touchWalk(key: string, entry: WalkCacheEntry): void {
 	if (entry.idleTimer) clearTimeout(entry.idleTimer);
 	const stamp = entry.lastUsedAt;
 	entry.idleTimer = setTimeout(() => {
-		if (walkCache.get(key) === entry && entry.lastUsedAt === stamp) deleteWalk(key);
+		if (walkCache.get(key) === entry && entry.lastUsedAt === stamp)
+			deleteWalk(key);
 	}, topologyIdleEvictMs());
 	entry.idleTimer.unref?.();
 }
@@ -235,7 +247,9 @@ export function getDirectoryMarkers(dir: string): DirectoryMarkers {
 	dirMarkerCache.set(resolvedDir, entry);
 	touchDirMarker(resolvedDir, entry);
 	while (dirMarkerCache.size > TOPOLOGY_MAX_DIR_ENTRIES) {
-		const victim = [...dirMarkerCache.entries()].sort(([, a], [, b]) => a.lastUsedAt - b.lastUsedAt)[0];
+		const victim = [...dirMarkerCache.entries()].sort(
+			([, a], [, b]) => a.lastUsedAt - b.lastUsedAt,
+		)[0];
 		if (!victim) break;
 		deleteDirMarker(victim[0]);
 	}
@@ -246,7 +260,9 @@ function walkCacheKey(startDir: string, markerKey: string): string {
 	return `${path.resolve(startDir)}\0${markerKey}`;
 }
 
-function walkStillFresh(dirMtimes: Array<{ dir: string; mtimeMs: number }>): boolean {
+function walkStillFresh(
+	dirMtimes: Array<{ dir: string; mtimeMs: number }>,
+): boolean {
 	return dirMtimes.every(({ dir, mtimeMs }) => safeDirMtimeMs(dir) === mtimeMs);
 }
 
@@ -297,11 +313,17 @@ function walkToNearestMatch(
 		depth += 1;
 	}
 
-	const entry: WalkCacheEntry = { dir: found, dirMtimes, lastUsedAt: Date.now() };
+	const entry: WalkCacheEntry = {
+		dir: found,
+		dirMtimes,
+		lastUsedAt: Date.now(),
+	};
 	walkCache.set(key, entry);
 	touchWalk(key, entry);
 	while (walkCache.size > TOPOLOGY_MAX_WALK_ENTRIES) {
-		const victim = [...walkCache.entries()].sort(([, a], [, b]) => a.lastUsedAt - b.lastUsedAt)[0];
+		const victim = [...walkCache.entries()].sort(
+			([, a], [, b]) => a.lastUsedAt - b.lastUsedAt,
+		)[0];
 		if (!victim) break;
 		deleteWalk(victim[0]);
 	}
@@ -348,7 +370,10 @@ export function findNearestDirWithMarker(
  * cover a grandchild, so this still costs one syscall for that shape, same
  * as the pre-#807 hand-rolled loops it replaces.
  */
-function hasBasenameMarker(markers: DirectoryMarkers, basename: string): boolean {
+function hasBasenameMarker(
+	markers: DirectoryMarkers,
+	basename: string,
+): boolean {
 	if (basename.includes("/") || basename.includes("\\")) {
 		return fs.existsSync(path.join(markers.dir, basename));
 	}
@@ -387,7 +412,8 @@ export function findNearestDirWithAnyBasename(
 	return walkToNearestMatch(
 		startDir,
 		`any:${basenames.join(String.fromCodePoint(1))}`,
-		(markers) => basenames.some((basename) => hasBasenameMarker(markers, basename)),
+		(markers) =>
+			basenames.some((basename) => hasBasenameMarker(markers, basename)),
 		{ basenames },
 		homeDir,
 	);
@@ -413,7 +439,9 @@ export interface PiLensConfigMarker {
  * shared-index equivalent of `project-lens-config.ts`'s old private
  * `findPiLensConfigInDir` probe loop.
  */
-export function findPiLensConfigMarkerInDir(dir: string): PiLensConfigMarker | undefined {
+export function findPiLensConfigMarkerInDir(
+	dir: string,
+): PiLensConfigMarker | undefined {
 	const markers = getDirectoryMarkers(dir);
 	if (!markers.piLensConfigPath) return undefined;
 	const stat = (() => {
@@ -460,7 +488,9 @@ export interface WorkspaceManifestMarkers {
  * themselves (workspace globs, `[workspace]` section, `workspaces` field) —
  * this only answers "is the marker file present".
  */
-export function getWorkspaceManifestMarkers(dir: string): WorkspaceManifestMarkers {
+export function getWorkspaceManifestMarkers(
+	dir: string,
+): WorkspaceManifestMarkers {
 	const markers = getDirectoryMarkers(dir);
 	return {
 		hasPnpmWorkspaceYaml: markers.pnpmWorkspaceYamlPath !== undefined,

@@ -14,11 +14,7 @@ import { getProjectDataDir } from "./file-utils.js";
 import { writeFileAtomic } from "./atomic-write.js";
 import { parseSymbolKey as parseCanonicalSymbolKey } from "./review-graph/symbol-id.js";
 import { normalizeMapKey, toProjectRelativePath } from "./path-utils.js";
-import type {
-	Symbol,
-	SymbolRef,
-	SymbolResolution,
-} from "./symbol-types.js";
+import type { Symbol, SymbolRef, SymbolResolution } from "./symbol-types.js";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -155,7 +151,9 @@ export function impact(
 ): ImpactResult[] {
 	const results: ImpactResult[] = [];
 	const visited = new Set<SymbolKey>([startKey]);
-	const queue: Array<{ key: SymbolKey; depth: number }> = [{ key: startKey, depth: 0 }];
+	const queue: Array<{ key: SymbolKey; depth: number }> = [
+		{ key: startKey, depth: 0 },
+	];
 
 	// Build a weight lookup from edges for filtering
 	const edgeWeightMap = new Map<string, number>();
@@ -182,13 +180,19 @@ export function impact(
 
 			visited.add(callerKey);
 			const depth = item.depth + 1;
-			results.push({ symbolKey: callerKey, depth, severity: severityForDepth(depth) });
+			results.push({
+				symbolKey: callerKey,
+				depth,
+				severity: severityForDepth(depth),
+			});
 			queue.push({ key: callerKey, depth });
 		}
 	}
 
 	// Sort by depth then symbolKey for stable output
-	return results.sort((a, b) => a.depth - b.depth || a.symbolKey.localeCompare(b.symbolKey));
+	return results.sort(
+		(a, b) => a.depth - b.depth || a.symbolKey.localeCompare(b.symbolKey),
+	);
 }
 
 /**
@@ -201,7 +205,10 @@ export function impact(
  * `"file:"` fallback is matched as a literal prefix first so it isn't
  * misparsed by the same last-colon rule.
  */
-export function parseSymbolKey(key: SymbolKey, knownFilePath?: string): {
+export function parseSymbolKey(
+	key: SymbolKey,
+	knownFilePath?: string,
+): {
 	filePath: string;
 	symbolName?: string;
 	kind?: string;
@@ -214,7 +221,10 @@ export function parseSymbolKey(key: SymbolKey, knownFilePath?: string): {
  * Format an impact result set as a compact human-readable summary.
  * Example: "handleToolResult (WillBreak) → handleAgentEnd (MayBreak) → 3 Review callers"
  */
-export function formatImpact(results: ImpactResult[], projectRoot: string): string {
+export function formatImpact(
+	results: ImpactResult[],
+	projectRoot: string,
+): string {
 	if (results.length === 0) return "";
 
 	const willBreak = results.filter((r) => r.severity === "WillBreak");
@@ -231,13 +241,25 @@ export function formatImpact(results: ImpactResult[], projectRoot: string): stri
 	};
 
 	if (willBreak.length > 0) {
-		parts.push(willBreak.slice(0, 3).map((r) => `${label(r)} ⚠ WillBreak`).join(", "));
+		parts.push(
+			willBreak
+				.slice(0, 3)
+				.map((r) => `${label(r)} ⚠ WillBreak`)
+				.join(", "),
+		);
 	}
 	if (mayBreak.length > 0) {
-		parts.push(mayBreak.slice(0, 2).map((r) => `${label(r)} MayBreak`).join(", "));
+		parts.push(
+			mayBreak
+				.slice(0, 2)
+				.map((r) => `${label(r)} MayBreak`)
+				.join(", "),
+		);
 	}
 	if (review.length > 0) {
-		parts.push(`${review.length} Review caller${review.length === 1 ? "" : "s"}`);
+		parts.push(
+			`${review.length} Review caller${review.length === 1 ? "" : "s"}`,
+		);
 	}
 
 	return parts.join(" → ");
@@ -251,25 +273,106 @@ export function formatImpact(results: ImpactResult[], projectRoot: string): stri
  */
 const STDLIB_NAMES = new Set([
 	// JS/TS
-	"console", "Math", "Object", "Array", "String", "Number", "Boolean",
-	"Promise", "Error", "Map", "Set", "WeakMap", "WeakSet", "JSON", "Date",
-	"RegExp", "Symbol", "BigInt", "parseInt", "parseFloat", "isNaN",
-	"isFinite", "setTimeout", "clearTimeout", "setInterval", "clearInterval",
-	"fetch", "URL", "URLSearchParams", "Buffer", "process", "require",
+	"console",
+	"Math",
+	"Object",
+	"Array",
+	"String",
+	"Number",
+	"Boolean",
+	"Promise",
+	"Error",
+	"Map",
+	"Set",
+	"WeakMap",
+	"WeakSet",
+	"JSON",
+	"Date",
+	"RegExp",
+	"Symbol",
+	"BigInt",
+	"parseInt",
+	"parseFloat",
+	"isNaN",
+	"isFinite",
+	"setTimeout",
+	"clearTimeout",
+	"setInterval",
+	"clearInterval",
+	"fetch",
+	"URL",
+	"URLSearchParams",
+	"Buffer",
+	"process",
+	"require",
 	// Python
-	"print", "len", "range", "list", "dict", "str", "int", "float", "bool",
-	"open", "isinstance", "issubclass", "type", "super", "hasattr", "getattr",
-	"setattr", "enumerate", "zip", "map", "filter", "sorted", "reversed",
+	"print",
+	"len",
+	"range",
+	"list",
+	"dict",
+	"str",
+	"int",
+	"float",
+	"bool",
+	"open",
+	"isinstance",
+	"issubclass",
+	"type",
+	"super",
+	"hasattr",
+	"getattr",
+	"setattr",
+	"enumerate",
+	"zip",
+	"map",
+	"filter",
+	"sorted",
+	"reversed",
 	// Go
-	"fmt", "log", "os", "io", "err", "make", "append", "cap", "copy",
-	"close", "delete", "panic", "recover", "new",
+	"fmt",
+	"log",
+	"os",
+	"io",
+	"err",
+	"make",
+	"append",
+	"cap",
+	"copy",
+	"close",
+	"delete",
+	"panic",
+	"recover",
+	"new",
 	// Rust
-	"eprintln", "eprint", "vec", "Some", "None", "Ok", "Err",
-	"Box", "Rc", "Arc", "Vec", "HashMap", "HashSet", "format",
+	"eprintln",
+	"eprint",
+	"vec",
+	"Some",
+	"None",
+	"Ok",
+	"Err",
+	"Box",
+	"Rc",
+	"Arc",
+	"Vec",
+	"HashMap",
+	"HashSet",
+	"format",
 	// Java/Kotlin
-	"System", "toString", "equals", "hashCode", "Objects",
+	"System",
+	"toString",
+	"equals",
+	"hashCode",
+	"Objects",
 	// Generic
-	"this", "self", "nil", "null", "undefined", "true", "false",
+	"this",
+	"self",
+	"nil",
+	"null",
+	"undefined",
+	"true",
+	"false",
 ]);
 
 // ── Core resolution ────────────────────────────────────────────────────────────
@@ -279,9 +382,10 @@ const STDLIB_NAMES = new Set([
  * Exported symbols and all symbols are indexed; the ambiguity weight
  * discounts edges when many files define the same name.
  */
-function buildDefIndex(
-	allSymbols: Map<string, Symbol[]>,
-): { byName: Map<string, SymbolKey[]>; byId: Map<SymbolKey, Symbol> } {
+function buildDefIndex(allSymbols: Map<string, Symbol[]>): {
+	byName: Map<string, SymbolKey[]>;
+	byId: Map<SymbolKey, Symbol>;
+} {
 	const byName = new Map<string, SymbolKey[]>();
 	const byId = new Map<SymbolKey, Symbol>();
 	for (const [, symbols] of allSymbols) {
@@ -342,7 +446,8 @@ export function buildCallGraph(
 	// supplies TWO raw spellings of the same file gets last-writer-wins here —
 	// raw compatibility is best-effort tolerance, not a merge contract.
 	const canonicalSymbols = new Map<string, Symbol[]>();
-	for (const [filePath, symbols] of allSymbols) canonicalSymbols.set(normalizeMapKey(filePath), symbols);
+	for (const [filePath, symbols] of allSymbols)
+		canonicalSymbols.set(normalizeMapKey(filePath), symbols);
 	const defIndex = buildDefIndex(canonicalSymbols);
 	const callees = new Map<SymbolKey, Set<SymbolKey>>();
 	const callers = new Map<SymbolKey, Set<SymbolKey>>();
@@ -365,7 +470,7 @@ export function buildCallGraph(
 				sameFileEvidence: 0,
 				duplicateEvidence: 0,
 				complete: false,
-			 };
+			};
 
 	for (const [callerFile, refs] of allRefs) {
 		const callerFileKey = normalizeMapKey(callerFile);
@@ -376,7 +481,8 @@ export function buildCallGraph(
 				// Legacy callers do not carry an evidenceKind, but each ref is still
 				// raw call-graph evidence and must contribute to coverage totals.
 				coverage.totalEvidence++;
-				if (ref.evidenceKind === "references" || ref.referenceKind === "type") coverage.referencesEvidence++;
+				if (ref.evidenceKind === "references" || ref.referenceKind === "type")
+					coverage.referencesEvidence++;
 				else coverage.callsEvidence++;
 			}
 			if (ref.referenceKind === "type") {
@@ -397,7 +503,11 @@ export function buildCallGraph(
 				// Canonical graph identity is authoritative. Never recover a name by
 				// splitting an id: symbol ids contain kind and line components.
 				const callee = defIndex.byId.get(ref.targetId);
-				if (!callee || ref.resolution === "name-only" || ref.resolution === "unresolved") {
+				if (
+					!callee ||
+					ref.resolution === "name-only" ||
+					ref.resolution === "unresolved"
+				) {
 					if (!hasInputCoverage) {
 						unresolvedRefs++;
 						coverage.unresolvedEvidence++;
@@ -414,7 +524,10 @@ export function buildCallGraph(
 				// There is no typed/import evidence to select one definition, so retain
 				// every cross-file candidate and discount each edge. Picking [0] made
 				// graph iteration order decide which caller was reported.
-				const refName = ref.symbolName ?? parseSymbolKey(ref.symbolId, callerFile).symbolName ?? "";
+				const refName =
+					ref.symbolName ??
+					parseSymbolKey(ref.symbolId, callerFile).symbolName ??
+					"";
 				if (STDLIB_NAMES.has(refName) || !refName) {
 					if (!hasInputCoverage) coverage.unsupportedEvidence++;
 					continue;
@@ -429,20 +542,30 @@ export function buildCallGraph(
 				}
 				const crossFileDefs = defs
 					.map((id) => defIndex.byId.get(id))
-					.filter((candidate): candidate is Symbol =>
-						candidate !== undefined && normalizeMapKey(candidate.filePath) !== callerFileKey,
+					.filter(
+						(candidate): candidate is Symbol =>
+							candidate !== undefined &&
+							normalizeMapKey(candidate.filePath) !== callerFileKey,
 					);
 				if (crossFileDefs.length === 0) {
 					if (!hasInputCoverage) coverage.unsupportedEvidence++;
 					continue;
 				}
-				const resolution: SymbolResolution = crossFileDefs.length === 1 ? "exact" : "name-only";
+				const resolution: SymbolResolution =
+					crossFileDefs.length === 1 ? "exact" : "name-only";
 				for (const callee of crossFileDefs) {
-					candidates.push({ callee, resolution, candidateCount: crossFileDefs.length });
+					candidates.push({
+						callee,
+						resolution,
+						candidateCount: crossFileDefs.length,
+					});
 				}
 			}
 
-			if (ref.evidenceKind && candidates.some(({ resolution }) => resolution === "name-only")) {
+			if (
+				ref.evidenceKind &&
+				candidates.some(({ resolution }) => resolution === "name-only")
+			) {
 				if (!hasInputCoverage) {
 					unresolvedRefs++;
 					coverage.unresolvedEvidence++;
@@ -475,9 +598,10 @@ export function buildCallGraph(
 				const existing = edgeByPair.get(pairKey);
 				if (existing) {
 					existing.evidenceCount = (existing.evidenceCount ?? 1) + 1;
-					existing.evidenceKind = existing.evidenceKind === ref.evidenceKind
-						? existing.evidenceKind
-						: "mixed";
+					existing.evidenceKind =
+						existing.evidenceKind === ref.evidenceKind
+							? existing.evidenceKind
+							: "mixed";
 					// Duplicate evidence is a property of the logical pair, not of
 					// whether the producer happened to tag the record. Keep the edge,
 					// coverage, and centrality views consistent for legacy refs too.
@@ -523,7 +647,8 @@ export function buildCallGraph(
 				coverage.resolvedEvidence++;
 				if (duplicateRef) coverage.duplicateEvidence++;
 			}
-			if (hasInputCoverage && producedEdge && duplicateRef) coverage.duplicateEvidence++;
+			if (hasInputCoverage && producedEdge && duplicateRef)
+				coverage.duplicateEvidence++;
 		}
 	}
 
@@ -534,8 +659,11 @@ export function buildCallGraph(
 	const languagesKnownComplete = Object.values(coverage.languages ?? {}).every(
 		(status) => status === "complete",
 	);
-	coverage.complete = coverage.complete && hasInputCoverage &&
-		coverage.unsupportedEvidence === 0 && languagesKnownComplete &&
+	coverage.complete =
+		coverage.complete &&
+		hasInputCoverage &&
+		coverage.unsupportedEvidence === 0 &&
+		languagesKnownComplete &&
 		(allSymbols.size > 0 || coverage.totalEvidence > 0);
 
 	return {
@@ -543,7 +671,9 @@ export function buildCallGraph(
 		callers,
 		inDegree,
 		edges: [...edgeByPair.values()],
-		unresolvedRefs: hasInputCoverage ? coverage.unresolvedEvidence : unresolvedRefs,
+		unresolvedRefs: hasInputCoverage
+			? coverage.unresolvedEvidence
+			: unresolvedRefs,
 		totalRefs,
 		coverage,
 		builtAt: new Date().toISOString(),
@@ -590,28 +720,39 @@ export function saveCallGraph(
 		writeFileAtomic(cacheFile, JSON.stringify(persisted));
 		writeFileAtomic(
 			metaFile,
-			JSON.stringify({ savedAt: new Date().toISOString(), edgeCount: graph.edges.length }),
+			JSON.stringify({
+				savedAt: new Date().toISOString(),
+				edgeCount: graph.edges.length,
+			}),
 		);
 	} catch {
 		// Non-fatal — next session rebuilds from scratch.
 	}
 }
 
-function inferLegacyCoverage(edges: ResolvedCallEdge[]): CallGraphEvidenceCoverage {
+function inferLegacyCoverage(
+	edges: ResolvedCallEdge[],
+): CallGraphEvidenceCoverage {
 	let weightedTotalEvidence = 0;
 	let weightedReferencesEvidence = 0;
 	let weightedDuplicateEvidence = 0;
 	for (const edge of edges) {
-		const count = Number.isFinite(edge.evidenceCount) && (edge.evidenceCount ?? 0) > 0
-			? Math.floor(edge.evidenceCount as number)
-			: 1;
-		const weight = Number.isFinite(edge.weight) && edge.weight >= 0 ? edge.weight : 1;
+		const count =
+			Number.isFinite(edge.evidenceCount) && (edge.evidenceCount ?? 0) > 0
+				? Math.floor(edge.evidenceCount as number)
+				: 1;
+		const weight =
+			Number.isFinite(edge.weight) && edge.weight >= 0 ? edge.weight : 1;
 		weightedTotalEvidence += count * weight;
 		weightedDuplicateEvidence += Math.max(0, count - 1) * weight;
-		if (edge.evidenceKind === "references") weightedReferencesEvidence += count * weight;
+		if (edge.evidenceKind === "references")
+			weightedReferencesEvidence += count * weight;
 	}
 	const totalEvidence = Math.max(0, Math.round(weightedTotalEvidence));
-	const referencesEvidence = Math.max(0, Math.round(weightedReferencesEvidence));
+	const referencesEvidence = Math.max(
+		0,
+		Math.round(weightedReferencesEvidence),
+	);
 	const duplicateEvidence = Math.max(0, Math.round(weightedDuplicateEvidence));
 	return {
 		totalEvidence,
@@ -648,7 +789,10 @@ function finiteCount(value: unknown): value is number {
 }
 
 function countsMatch(left: number, right: number): boolean {
-	return Math.abs(left - right) <= 1e-9 * Math.max(1, Math.abs(left), Math.abs(right));
+	return (
+		Math.abs(left - right) <=
+		1e-9 * Math.max(1, Math.abs(left), Math.abs(right))
+	);
 }
 
 function validatePersistedCallGraph(
@@ -657,15 +801,43 @@ function validatePersistedCallGraph(
 ): boolean {
 	const nonEmptyString = (value: unknown): value is string =>
 		typeof value === "string" && value.trim().length > 0;
-	const enumValue = <T extends string>(value: unknown, values: readonly T[]): value is T =>
-		typeof value === "string" && values.includes(value as T);
+	const enumValue = <T extends string>(
+		value: unknown,
+		values: readonly T[],
+	): value is T => typeof value === "string" && values.includes(value as T);
 	const edgeKinds = ["calls", "references", "mixed"] as const;
-	const resolutions = ["exact", "import", "receiver-type", "name-only", "unresolved"] as const;
-	if (!raw || raw.version !== CALL_GRAPH_CACHE_VERSION || !nonEmptyString(raw.builtAt)) return false;
-	if (!nonEmptyString(raw.reviewGraphVersion) || !nonEmptyString(raw.reviewGraphSignature)) return false;
-	if (raw.coverage !== undefined &&
-		(!raw.coverage || typeof raw.coverage !== "object" || Array.isArray(raw.coverage))) return false;
-	if (!Array.isArray(raw.edges) || !Array.isArray(raw.callees) || !Array.isArray(raw.callers) || !Array.isArray(raw.inDegree)) return false;
+	const resolutions = [
+		"exact",
+		"import",
+		"receiver-type",
+		"name-only",
+		"unresolved",
+	] as const;
+	if (
+		!raw ||
+		raw.version !== CALL_GRAPH_CACHE_VERSION ||
+		!nonEmptyString(raw.builtAt)
+	)
+		return false;
+	if (
+		!nonEmptyString(raw.reviewGraphVersion) ||
+		!nonEmptyString(raw.reviewGraphSignature)
+	)
+		return false;
+	if (
+		raw.coverage !== undefined &&
+		(!raw.coverage ||
+			typeof raw.coverage !== "object" ||
+			Array.isArray(raw.coverage))
+	)
+		return false;
+	if (
+		!Array.isArray(raw.edges) ||
+		!Array.isArray(raw.callees) ||
+		!Array.isArray(raw.callers) ||
+		!Array.isArray(raw.inDegree)
+	)
+		return false;
 	const coverageValues = [
 		coverage.totalEvidence,
 		coverage.callsEvidence,
@@ -678,17 +850,47 @@ function validatePersistedCallGraph(
 		coverage.sameFileEvidence,
 		coverage.duplicateEvidence,
 	];
-	if (typeof coverage.complete !== "boolean" || coverageValues.some((value) => !finiteCount(value))) return false;
-	if (coverage.languages !== undefined &&
-		(!coverage.languages || typeof coverage.languages !== "object" || Array.isArray(coverage.languages) ||
-		Object.entries(coverage.languages).some(([language, status]) =>
-			!nonEmptyString(language) || !enumValue(status, ["complete", "partial", "unavailable"] as const)))) return false;
-	if (coverage.callsEvidence + coverage.referencesEvidence !== coverage.totalEvidence) return false;
+	if (
+		typeof coverage.complete !== "boolean" ||
+		coverageValues.some((value) => !finiteCount(value))
+	)
+		return false;
+	if (
+		coverage.languages !== undefined &&
+		(!coverage.languages ||
+			typeof coverage.languages !== "object" ||
+			Array.isArray(coverage.languages) ||
+			Object.entries(coverage.languages).some(
+				([language, status]) =>
+					!nonEmptyString(language) ||
+					!enumValue(status, ["complete", "partial", "unavailable"] as const),
+			))
+	)
+		return false;
+	if (
+		coverage.callsEvidence + coverage.referencesEvidence !==
+		coverage.totalEvidence
+	)
+		return false;
 	if (coverage.resolvedEvidence > coverage.eligibleEvidence) return false;
 	if (coverage.eligibleEvidence !== coverage.resolvedEvidence) return false;
-	if (coverage.resolvedEvidence + coverage.unresolvedEvidence + coverage.typeOnlyEvidence + coverage.unsupportedEvidence + coverage.sameFileEvidence !== coverage.totalEvidence) return false;
+	if (
+		coverage.resolvedEvidence +
+			coverage.unresolvedEvidence +
+			coverage.typeOnlyEvidence +
+			coverage.unsupportedEvidence +
+			coverage.sameFileEvidence !==
+		coverage.totalEvidence
+	)
+		return false;
 	if (coverage.complete && coverage.unsupportedEvidence > 0) return false;
-	if (coverage.complete && Object.values(coverage.languages ?? {}).some((status) => status !== "complete")) return false;
+	if (
+		coverage.complete &&
+		Object.values(coverage.languages ?? {}).some(
+			(status) => status !== "complete",
+		)
+	)
+		return false;
 
 	const expectedCallees = new Map<string, Set<string>>();
 	const expectedCallers = new Map<string, Set<string>>();
@@ -697,22 +899,62 @@ function validatePersistedCallGraph(
 	let weightedEdgeEvidence = 0;
 	let weightedDuplicateEvidence = 0;
 	for (const edge of raw.edges) {
-		if (!edge || typeof edge !== "object" || !nonEmptyString(edge.callerKey) || !nonEmptyString(edge.calleeKey) ||
-			!nonEmptyString(edge.callerFile) || !nonEmptyString(edge.calleeFile) ||
-			!nonEmptyString(edge.calleeSymbol) || typeof edge.weight !== "number" || !Number.isFinite(edge.weight) || edge.weight <= 0 || edge.weight > 1) return false;
-		if (edge.callerSymbol !== undefined && !nonEmptyString(edge.callerSymbol)) return false;
-		if (edge.callerKind !== undefined && !nonEmptyString(edge.callerKind)) return false;
-		if (edge.calleeKind !== undefined && !nonEmptyString(edge.calleeKind)) return false;
-		if (edge.evidenceKind !== undefined && !enumValue(edge.evidenceKind, edgeKinds)) return false;
-		if (edge.resolution !== undefined && !enumValue(edge.resolution, resolutions)) return false;
-		if (edge.evidenceCount !== undefined && (!finiteCount(edge.evidenceCount) || edge.evidenceCount < 1)) return false;
+		if (
+			!edge ||
+			typeof edge !== "object" ||
+			!nonEmptyString(edge.callerKey) ||
+			!nonEmptyString(edge.calleeKey) ||
+			!nonEmptyString(edge.callerFile) ||
+			!nonEmptyString(edge.calleeFile) ||
+			!nonEmptyString(edge.calleeSymbol) ||
+			typeof edge.weight !== "number" ||
+			!Number.isFinite(edge.weight) ||
+			edge.weight <= 0 ||
+			edge.weight > 1
+		)
+			return false;
+		if (edge.callerSymbol !== undefined && !nonEmptyString(edge.callerSymbol))
+			return false;
+		if (edge.callerKind !== undefined && !nonEmptyString(edge.callerKind))
+			return false;
+		if (edge.calleeKind !== undefined && !nonEmptyString(edge.calleeKind))
+			return false;
+		if (
+			edge.evidenceKind !== undefined &&
+			!enumValue(edge.evidenceKind, edgeKinds)
+		)
+			return false;
+		if (
+			edge.resolution !== undefined &&
+			!enumValue(edge.resolution, resolutions)
+		)
+			return false;
+		if (
+			edge.evidenceCount !== undefined &&
+			(!finiteCount(edge.evidenceCount) || edge.evidenceCount < 1)
+		)
+			return false;
 		const evidenceCount = edge.evidenceCount ?? 1;
-		const callerIdentity = parseCanonicalSymbolKey(edge.callerKey, edge.callerFile);
-		const calleeIdentity = parseCanonicalSymbolKey(edge.calleeKey, edge.calleeFile);
-		if (normalizeMapKey(callerIdentity.filePath) !== normalizeMapKey(edge.callerFile) ||
-			normalizeMapKey(calleeIdentity.filePath) !== normalizeMapKey(edge.calleeFile) ||
-			(calleeIdentity.symbolName !== undefined && calleeIdentity.symbolName !== edge.calleeSymbol) ||
-			(callerIdentity.symbolName !== undefined && edge.callerSymbol !== undefined && callerIdentity.symbolName !== edge.callerSymbol)) return false;
+		const callerIdentity = parseCanonicalSymbolKey(
+			edge.callerKey,
+			edge.callerFile,
+		);
+		const calleeIdentity = parseCanonicalSymbolKey(
+			edge.calleeKey,
+			edge.calleeFile,
+		);
+		if (
+			normalizeMapKey(callerIdentity.filePath) !==
+				normalizeMapKey(edge.callerFile) ||
+			normalizeMapKey(calleeIdentity.filePath) !==
+				normalizeMapKey(edge.calleeFile) ||
+			(calleeIdentity.symbolName !== undefined &&
+				calleeIdentity.symbolName !== edge.calleeSymbol) ||
+			(callerIdentity.symbolName !== undefined &&
+				edge.callerSymbol !== undefined &&
+				callerIdentity.symbolName !== edge.callerSymbol)
+		)
+			return false;
 		const pair = `${edge.callerKey}\u0000${edge.calleeKey}`;
 		if (pairKeys.has(pair)) return false;
 		pairKeys.add(pair);
@@ -727,44 +969,97 @@ function validatePersistedCallGraph(
 		const callers = expectedCallers.get(edge.calleeKey) ?? new Set<string>();
 		callers.add(edge.callerKey);
 		expectedCallers.set(edge.calleeKey, callers);
-		expectedInDegree.set(edge.calleeKey, (expectedInDegree.get(edge.calleeKey) ?? 0) + edge.weight);
+		expectedInDegree.set(
+			edge.calleeKey,
+			(expectedInDegree.get(edge.calleeKey) ?? 0) + edge.weight,
+		);
 	}
-	if (!countsMatch(weightedEdgeEvidence, coverage.resolvedEvidence)) return false;
-	if (!countsMatch(weightedDuplicateEvidence, coverage.duplicateEvidence)) return false;
-	if (!countsMatch(
-		coverage.totalEvidence,
-		weightedEdgeEvidence + coverage.unresolvedEvidence + coverage.typeOnlyEvidence + coverage.unsupportedEvidence + coverage.sameFileEvidence,
-	)) return false;
+	if (!countsMatch(weightedEdgeEvidence, coverage.resolvedEvidence))
+		return false;
+	if (!countsMatch(weightedDuplicateEvidence, coverage.duplicateEvidence))
+		return false;
+	if (
+		!countsMatch(
+			coverage.totalEvidence,
+			weightedEdgeEvidence +
+				coverage.unresolvedEvidence +
+				coverage.typeOnlyEvidence +
+				coverage.unsupportedEvidence +
+				coverage.sameFileEvidence,
+		)
+	)
+		return false;
 	if (raw.totalRefs !== undefined && !finiteCount(raw.totalRefs)) return false;
-	if (raw.unresolvedRefs !== undefined && !finiteCount(raw.unresolvedRefs)) return false;
-	if (raw.totalRefs !== undefined && raw.totalRefs !== coverage.totalEvidence) return false;
-	if (raw.unresolvedRefs !== undefined && raw.unresolvedRefs !== coverage.unresolvedEvidence) return false;
+	if (raw.unresolvedRefs !== undefined && !finiteCount(raw.unresolvedRefs))
+		return false;
+	if (raw.totalRefs !== undefined && raw.totalRefs !== coverage.totalEvidence)
+		return false;
+	if (
+		raw.unresolvedRefs !== undefined &&
+		raw.unresolvedRefs !== coverage.unresolvedEvidence
+	)
+		return false;
 
-	const readAdjacency = (entries: unknown): Map<string, Set<string>> | undefined => {
+	const readAdjacency = (
+		entries: unknown,
+	): Map<string, Set<string>> | undefined => {
 		const result = new Map<string, Set<string>>();
 		if (!Array.isArray(entries)) return undefined;
 		for (const entry of entries) {
-			if (!Array.isArray(entry) || !nonEmptyString(entry[0]) || !Array.isArray(entry[1]) || entry[1].some((key) => !nonEmptyString(key))) return undefined;
+			if (
+				!Array.isArray(entry) ||
+				!nonEmptyString(entry[0]) ||
+				!Array.isArray(entry[1]) ||
+				entry[1].some((key) => !nonEmptyString(key))
+			)
+				return undefined;
 			const keys = entry[1] as string[];
-			if (new Set(keys).size !== keys.length || result.has(entry[0])) return undefined;
+			if (new Set(keys).size !== keys.length || result.has(entry[0]))
+				return undefined;
 			result.set(entry[0], new Set(keys));
 		}
 		return result;
 	};
 	const actualCallees = readAdjacency(raw.callees);
 	const actualCallers = readAdjacency(raw.callers);
-	if (!actualCallees || !actualCallers || actualCallees.size !== expectedCallees.size || actualCallers.size !== expectedCallers.size) return false;
-	const sameSets = (actual: Map<string, Set<string>>, expected: Map<string, Set<string>>): boolean => {
+	if (
+		!actualCallees ||
+		!actualCallers ||
+		actualCallees.size !== expectedCallees.size ||
+		actualCallers.size !== expectedCallers.size
+	)
+		return false;
+	const sameSets = (
+		actual: Map<string, Set<string>>,
+		expected: Map<string, Set<string>>,
+	): boolean => {
 		for (const [key, values] of expected) {
 			const got = actual.get(key);
-			if (!got || got.size !== values.size || [...values].some((value) => !got.has(value))) return false;
+			if (
+				!got ||
+				got.size !== values.size ||
+				[...values].some((value) => !got.has(value))
+			)
+				return false;
 		}
 		return true;
 	};
-	if (!sameSets(actualCallees, expectedCallees) || !sameSets(actualCallers, expectedCallers)) return false;
+	if (
+		!sameSets(actualCallees, expectedCallees) ||
+		!sameSets(actualCallers, expectedCallers)
+	)
+		return false;
 	const actualInDegree = new Map<string, number>();
 	for (const entry of raw.inDegree) {
-		if (!Array.isArray(entry) || !nonEmptyString(entry[0]) || typeof entry[1] !== "number" || !Number.isFinite(entry[1]) || entry[1] < 0 || actualInDegree.has(entry[0])) return false;
+		if (
+			!Array.isArray(entry) ||
+			!nonEmptyString(entry[0]) ||
+			typeof entry[1] !== "number" ||
+			!Number.isFinite(entry[1]) ||
+			entry[1] < 0 ||
+			actualInDegree.has(entry[0])
+		)
+			return false;
 		actualInDegree.set(entry[0], entry[1]);
 	}
 	if (actualInDegree.size !== expectedInDegree.size) return false;
@@ -781,21 +1076,33 @@ function validatePersistedCallGraph(
 export function loadCallGraph(
 	cwd: string,
 	expectedIdentity?: CallGraphCacheIdentity,
-): {
-	graph: FunctionCallGraph;
-	identity: CallGraphCacheIdentity;
-} | undefined {
+):
+	| {
+			graph: FunctionCallGraph;
+			identity: CallGraphCacheIdentity;
+	  }
+	| undefined {
 	const cacheFile = cacheFilePath(cwd);
 	try {
-		const raw = JSON.parse(fs.readFileSync(cacheFile, "utf-8")) as PersistedCallGraph;
+		const raw = JSON.parse(
+			fs.readFileSync(cacheFile, "utf-8"),
+		) as PersistedCallGraph;
 		if (raw.version !== CALL_GRAPH_CACHE_VERSION) return undefined;
-		if (typeof raw.reviewGraphVersion !== "string" || typeof raw.reviewGraphSignature !== "string") return undefined;
+		if (
+			typeof raw.reviewGraphVersion !== "string" ||
+			typeof raw.reviewGraphSignature !== "string"
+		)
+			return undefined;
 		const identity: CallGraphCacheIdentity = {
 			reviewGraphVersion: raw.reviewGraphVersion,
 			reviewGraphSignature: raw.reviewGraphSignature,
 		};
-		if (expectedIdentity && (identity.reviewGraphVersion !== expectedIdentity.reviewGraphVersion ||
-			identity.reviewGraphSignature !== expectedIdentity.reviewGraphSignature)) return undefined;
+		if (
+			expectedIdentity &&
+			(identity.reviewGraphVersion !== expectedIdentity.reviewGraphVersion ||
+				identity.reviewGraphSignature !== expectedIdentity.reviewGraphSignature)
+		)
+			return undefined;
 
 		const coverage = loadCoverage(raw.coverage, raw.edges);
 		if (!validatePersistedCallGraph(raw, coverage)) return undefined;

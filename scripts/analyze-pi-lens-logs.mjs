@@ -25,7 +25,11 @@ import { minimatch } from "minimatch";
 const DEFAULT_ROOT = path.join(os.homedir(), ".pi-lens");
 const DEFAULT_SINCE = "2d";
 const DEFAULT_LIMIT = 12;
-const DEFAULT_EXCLUDE_GLOBS = ["**/AppData/Local/Temp/claude/**", "**/heap-corpus*/**", "**/.plegma/work/**"];
+const DEFAULT_EXCLUDE_GLOBS = [
+	"**/AppData/Local/Temp/claude/**",
+	"**/heap-corpus*/**",
+	"**/.plegma/work/**",
+];
 
 const args = parseArgs(process.argv.slice(2));
 const root = path.resolve(expandHome(args.root ?? DEFAULT_ROOT));
@@ -36,7 +40,11 @@ const outputJson = Boolean(args.json);
 const includeArchived = Boolean(args.archived);
 const excludeGlobs = [
 	...DEFAULT_EXCLUDE_GLOBS,
-	...(Array.isArray(args.exclude) ? args.exclude : args.exclude ? [args.exclude] : []),
+	...(Array.isArray(args.exclude)
+		? args.exclude
+		: args.exclude
+			? [args.exclude]
+			: []),
 ];
 
 const thresholds = {
@@ -202,6 +210,13 @@ function createState(files) {
 				aborted: 0,
 				timedOutSweeps: 0,
 				timedOutFilesTotal: 0,
+				// #1618: per-reason breakdown of the same total. Populated from each
+				// sweep's `unconfirmedByReason` metadata when present; a sweep logged
+				// by a pre-#1618 build carries no such field, so its files are
+				// bucketed under "budget (pre-#1618 build)" — the ABSENT field is
+				// itself the vintage signal, not an assumption that every one of
+				// those files really was a budget timeout.
+				unconfirmedByReason: counter(),
 				sweeps: [],
 				progress: [],
 			},
@@ -367,6 +382,24 @@ async function analyzeLatency(files, state) {
 					if (timedOut > 0) {
 						ws.timedOutSweeps += 1;
 						ws.timedOutFilesTotal += timedOut;
+						// #1618: attribute by the REAL per-reason tally when the build
+						// that wrote this log line has it — a service-destroyed file
+						// must never count toward "hit the per-file budget" the way it
+						// used to (the forensics tool that found #1618 in the first
+						// place read this exact field and mis-blamed budget exhaustion
+						// for what were mostly service-destroyed files).
+						const byReason = entry.metadata?.unconfirmedByReason;
+						if (byReason && typeof byReason === "object") {
+							for (const [reason, count] of Object.entries(byReason)) {
+								const n = Number(count) || 0;
+								if (n > 0) ws.unconfirmedByReason.inc(reason, n);
+							}
+						} else {
+							// Vintage-attribution fallback: no `unconfirmedByReason` means
+							// this line predates #1618 — the absent field IS the signal,
+							// not proof every file here was really a budget timeout.
+							ws.unconfirmedByReason.inc("budget (pre-#1618 build)", timedOut);
+						}
 						state.smellTotals.inc("lsp-workspace-file-timeouts");
 						pushTop(
 							ws.sweeps,
@@ -680,7 +713,9 @@ async function analyzeActionableWarnings(files, state) {
 				state.actionable.reports++;
 				const summary = meta.summary ?? {};
 				state.actionable.suppressed += Number(summary.suppressed ?? 0);
-				state.actionable.autoFixEligible += Number(summary.autoFixEligible ?? 0);
+				state.actionable.autoFixEligible += Number(
+					summary.autoFixEligible ?? 0,
+				);
 			}
 			if (event === "advisory_injected") {
 				state.actionable.injected++;
@@ -730,8 +765,12 @@ async function analyzeAstGrepTools(files, state) {
 						tool,
 						errorKind: entry.errorKind,
 						durationMs: entry.durationMs,
-						message: String(entry.errorRaw ?? "").replace(/\s+/g, " ").slice(0, 180),
-						pattern: String(entry.pattern ?? "").replace(/\s+/g, " ").slice(0, 80),
+						message: String(entry.errorRaw ?? "")
+							.replace(/\s+/g, " ")
+							.slice(0, 180),
+						pattern: String(entry.pattern ?? "")
+							.replace(/\s+/g, " ")
+							.slice(0, 80),
 					},
 					limit * 3,
 					(a, b) => String(b.ts).localeCompare(String(a.ts)),
@@ -745,7 +784,9 @@ async function analyzeAstGrepTools(files, state) {
 						tool,
 						durationMs: entry.durationMs,
 						matchCount: entry.matchCount,
-						pattern: String(entry.pattern ?? "").replace(/\s+/g, " ").slice(0, 80),
+						pattern: String(entry.pattern ?? "")
+							.replace(/\s+/g, " ")
+							.slice(0, 80),
 					},
 					limit * 3,
 					byDuration,
@@ -782,7 +823,8 @@ async function analyzeWorklog(files, state) {
 			if (entry.autoFixed) row.autoFixed += 1;
 			state.worklog.byRuleModel.set(key, row);
 			state.worklog.byModel.inc(model || "(unknown)");
-			if (entry.autoFixed) state.worklog.byModelAutoFixed.inc(model || "(unknown)");
+			if (entry.autoFixed)
+				state.worklog.byModelAutoFixed.inc(model || "(unknown)");
 			state.worklog.byProvider.inc(provider || "(unknown)");
 		});
 	}
@@ -814,7 +856,9 @@ function isExcludedEntry(entry) {
 
 function pathValues(value, key = "") {
 	if (typeof value === "string") {
-		return /(file|path|cwd|root|project)/i.test(key) ? [normalizePath(value)] : [];
+		return /(file|path|cwd|root|project)/i.test(key)
+			? [normalizePath(value)]
+			: [];
 	}
 	if (!value || typeof value !== "object") return [];
 	return Object.entries(value).flatMap(([childKey, child]) =>
@@ -1217,11 +1261,23 @@ function buildReport(state) {
 		"Full LSP workspace sweeps that logged a start but never a completion (hang/kill signature — the 8h-hang class #383 hardened)",
 		ws.progress.slice(0, limit),
 	);
+	// #1618: "hit the per-file budget" used to be this smell's blanket
+	// description regardless of WHY a file was unconfirmed — the exact
+	// mislabeling the forensics pass on this class found (81/111 "budget"
+	// files were actually service-destroyed). Render the real breakdown when
+	// available.
+	const unconfirmedReasonBreakdown = ws.unconfirmedByReason
+		.top(limit)
+		.map(({ key, count }) => `${key}=${count}`)
+		.join(", ");
 	addSmell(
 		smells,
 		"lsp-workspace-file-timeouts",
 		smellCount("lsp-workspace-file-timeouts"),
-		`Full LSP sweeps where files hit the per-file budget (${ws.timedOutFilesTotal} files across ${ws.timedOutSweeps} sweeps)`,
+		`Full LSP sweeps produced an unconfirmed file (${ws.timedOutFilesTotal} files across ${ws.timedOutSweeps} sweeps)` +
+			(unconfirmedReasonBreakdown
+				? ` — by reason: ${unconfirmedReasonBreakdown}`
+				: ""),
 		ws.sweeps.slice(0, limit),
 	);
 
@@ -1257,6 +1313,11 @@ function buildReport(state) {
 				aborted: ws.aborted,
 				timedOutSweeps: ws.timedOutSweeps,
 				timedOutFilesTotal: ws.timedOutFilesTotal,
+				// #1618: the real per-reason breakdown of `timedOutFilesTotal`.
+				// "budget (pre-#1618 build)" means those log lines predate the
+				// per-reason tally entirely — an older build's absence of the field,
+				// not a claim those files really timed out.
+				unconfirmedByReason: ws.unconfirmedByReason.toJSON(),
 			},
 		},
 		cascade: {
@@ -1458,6 +1519,15 @@ function printReport(report) {
 		console.log(
 			`  started=${ws.started} completed=${ws.completed} incomplete=${ws.incomplete} aborted=${ws.aborted} fileTimeouts=${ws.timedOutFilesTotal} (in ${ws.timedOutSweeps} sweeps)`,
 		);
+		// #1618: never let a flat count alone read as "budget exhaustion" —
+		// print the real per-reason split (or its absence, which itself means
+		// every line here predates the tally).
+		const reasons = Object.entries(ws.unconfirmedByReason ?? {});
+		if (reasons.length) {
+			console.log(
+				`  by reason: ${reasons.map(([reason, count]) => `${reason}=${count}`).join(", ")}`,
+			);
+		}
 	}
 	const wl = report.worklog;
 	if (wl && (wl.byModel.length || wl.byRuleModel.length)) {

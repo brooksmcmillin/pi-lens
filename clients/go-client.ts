@@ -57,9 +57,7 @@ export class GoClient {
 	private log: (msg: string) => void;
 
 	constructor(verbose = false) {
-		this.log = verbose
-			? createSubsystemLogger("go")
-			: () => {};
+		this.log = verbose ? createSubsystemLogger("go") : () => {};
 		this.availability = createToolchainAvailability({
 			tool: "go",
 			label: "Go",
@@ -91,5 +89,4 @@ export class GoClient {
 	isGoFile(filePath: string): boolean {
 		return path.extname(filePath).toLowerCase() === ".go";
 	}
-
 }

@@ -132,7 +132,17 @@ export interface ReviewGraphLogEntry {
 		| "checkpoint_discarded"
 		// An offloaded/sync checkpoint WRITE failed — resume won't be available
 		// next session; `reason` carries the cause.
-		| "checkpoint_write_failed";
+		| "checkpoint_write_failed"
+		// #1961: the BLIND read path (`getCachedReviewGraph`) dropped a persisted
+		// snapshot. `reason` names why — today only a worktree-identity mismatch,
+		// since a HEAD move no longer drops anything. Bounded: rising edge per
+		// (verdict, cwd) off the `review-graph-snapshot-read` ledger kind.
+		| "snapshot_read_dropped"
+		// #1961: the blind read SERVED a snapshot stamped at a different HEAD.
+		// Not a drop and not a failure — the verdict that used to be a silent
+		// drop, now recorded so "why is my graph from yesterday's commit?" is
+		// answerable. Same bound as `snapshot_read_dropped`.
+		| "snapshot_read_drifted";
 	cwd: string;
 	/** Additive, bounded lifecycle metadata; never contains source contents/paths. */
 	observability?: ReviewGraphOperationalMetadata;

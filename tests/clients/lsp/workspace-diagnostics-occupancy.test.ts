@@ -53,9 +53,7 @@ describe(`LSP workspace-diagnostics walk occupancy (~${TREE_SIZE} files)`, () =>
 		async () => {
 			let count = 0;
 			const maxBlock = await measureMaxSyncBlockMs(async () => {
-				count = (
-					await __collectWorkspaceDiagnosticFilesForTest(tmpDir)
-				).length;
+				count = (await __collectWorkspaceDiagnosticFilesForTest(tmpDir)).length;
 			});
 			// The fixture writes .ts/.tsx/.py/.js files — all LSP-supported, so the
 			// walk must find a non-trivial set (proves it actually walked).

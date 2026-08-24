@@ -8,7 +8,10 @@
 
 import * as path from "node:path";
 import { Type } from "../clients/deps/typebox.js";
-import { symbolSearch, type SymbolSearchResult } from "../clients/lens-engine.js";
+import {
+	symbolSearch,
+	type SymbolSearchResult,
+} from "../clients/lens-engine.js";
 import { baseName, compactRenderResult } from "./render-compact.js";
 
 /**
@@ -18,7 +21,10 @@ import { baseName, compactRenderResult } from "./render-compact.js";
  * the discovery funnel's next step (module_report explains the file; from
  * there read_symbol reads a body).
  */
-function suggestedNext(relPath: string): { tool: "module_report"; path: string } {
+function suggestedNext(relPath: string): {
+	tool: "module_report";
+	path: string;
+} {
 	return { tool: "module_report", path: relPath };
 }
 
@@ -28,7 +34,8 @@ export function createSymbolSearchTool(getProjectRoot: () => string) {
 		label: "Symbol Search",
 		description:
 			"Ranked identifier search over the persisted word index (BM25 + priors demoting tests/vendor/docs) — answers 'which files are most relevant to <query>' by identifier. First step of the discovery funnel: symbol_search finds candidates, module_report explains the file, read_symbol reads the body. Complements grep (raw substrings) and lsp_navigation (exact references). Each hit's startLine/endLine mark its best-matching line (offset=startLine, limit=endLine-startLine+1 for a one-line peek); use module_report on `file` for the real outline. Returns available:false with a retry hint if the index isn't built yet — it self-builds in the background (never blocks this call).",
-		promptSnippet: "Ranked identifier search — find relevant files by name/usage",
+		promptSnippet:
+			"Ranked identifier search — find relevant files by name/usage",
 		renderResult: compactRenderResult<{
 			available?: boolean;
 			query?: string;
@@ -66,7 +73,12 @@ export function createSymbolSearchTool(getProjectRoot: () => string) {
 		}),
 		async execute(
 			_toolCallId: string,
-			params: { query: string; limit?: number; paths?: string[]; lang?: string },
+			params: {
+				query: string;
+				limit?: number;
+				paths?: string[];
+				lang?: string;
+			},
 			_signal: AbortSignal | undefined,
 			_onUpdate: unknown,
 			ctx: { cwd?: string },
@@ -164,7 +176,10 @@ export function createSymbolSearchTool(getProjectRoot: () => string) {
 			};
 			return {
 				content: [
-					{ type: "text" as const, text: `${lines.join("\n")}\n\n${JSON.stringify(payload)}` },
+					{
+						type: "text" as const,
+						text: `${lines.join("\n")}\n\n${JSON.stringify(payload)}`,
+					},
 				],
 				details: {
 					available: true,

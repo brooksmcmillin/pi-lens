@@ -158,8 +158,13 @@ export function makeMonorepo(spec: MonorepoSpec): Monorepo {
 	}
 
 	if (spec.padFiles) {
-		const { dir, count, extension = ".ts", prefix = "pad", content } =
-			spec.padFiles;
+		const {
+			dir,
+			count,
+			extension = ".ts",
+			prefix = "pad",
+			content,
+		} = spec.padFiles;
 		for (let i = 0; i < count; i++) {
 			writeFile(
 				root,

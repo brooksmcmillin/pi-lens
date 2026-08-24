@@ -85,7 +85,15 @@ describe("buildOrUpdateGraph — Promise dedup cache", () => {
 	});
 
 	it("evicts an idle workspace and rebuilds it", async () => {
-		vi.useFakeTimers();
+		// #1656: `buildOrUpdateGraph` does a real `git ls-files` spawn under the
+		// hood (clients/git-tracked-ignore.ts), and safeSpawnAsync's post-exit
+		// pipe-idle wait now genuinely depends on `setTimeout` to settle (not
+		// just Node's native "close" event, which bare `vi.useFakeTimers()`
+		// can't touch). `shouldAdvanceTime` lets fake timers tick forward in
+		// real time automatically so that real spawn still resolves, while
+		// `vi.advanceTimersByTime` below can still jump the clock forward for
+		// the idle-eviction check itself.
+		vi.useFakeTimers({ shouldAdvanceTime: true });
 		vi.stubEnv("PI_LENS_REVIEW_GRAPH_IDLE_EVICT_MS", "1000");
 		const cwd = tmpDir();
 		const facts = new FactStore();
@@ -185,7 +193,10 @@ describe("buildOrUpdateGraph — Promise dedup cache", () => {
 		const facts = new FactStore();
 		const cwd = tmpDir();
 		const file = path.join(cwd, "drift.ts");
-		fs.writeFileSync(file, "export function driftExample() {\n\treturn 1;\n}\n");
+		fs.writeFileSync(
+			file,
+			"export function driftExample() {\n\treturn 1;\n}\n",
+		);
 
 		await buildOrUpdateGraph(cwd, [file], facts);
 		expect(getLastGraphBuildInfo().reused).toBe(false); // full build

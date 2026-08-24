@@ -13,8 +13,11 @@
  */
 
 import { createSubsystemLogger } from "./extension-log.js";
+import { incrementDegradationCount } from "./degradation-ledger.js";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { findNearestMarkerRoot } from "./path-utils.js";
+import { getScratchTreeFnmatchPatterns } from "./scratch-tree-policy.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
 import {
 	type ProbeEvidence,
@@ -23,6 +26,11 @@ import {
 	logAvailabilityDecision,
 	startHostStallSampler,
 } from "./dispatch/runners/utils/availability-policy.js";
+import {
+	firstOutputLine,
+	spawnFailedWithNoOutput,
+} from "./dispatch/runners/utils/spawn-outcome.js";
+import { formatToolFailure } from "./dispatch/runners/utils/tool-failure.js";
 
 // --- Types ---
 
@@ -61,8 +69,8 @@ export interface DeadCodeClient {
 	detect(cwd: string): boolean;
 	/** Is this file one this client analyzes? Gates the per-turn delta re-scan. */
 	owns(filePath: string): boolean;
-	/** Resolve the binary (PATH first, then auto-install). */
-	ensureAvailable(): Promise<boolean>;
+	/** Resolve the binary (project venv first, then PATH; no auto-install). */
+	ensureAvailable(root?: string): Promise<boolean>;
 	/** Project-wide scan. Never throws; failures come back as success:false. */
 	analyze(cwd: string): Promise<DeadCodeResult>;
 }
@@ -81,17 +89,18 @@ function emptyResult(language: string): Omit<DeadCodeResult, "summary"> {
 const ANALYSIS_TIMEOUT_MS = 30_000;
 
 // Directories never worth scanning for the user's own dead code.
+//
+// Single-sourced from `scratch-tree-policy.ts`'s `EXCLUDED_DIRS`-derived list
+// (#1562 sweep finding: this array had hand-drifted from `EXCLUDED_DIRS` —
+// missing `.pi`/`.claude`/`.next`/`.turbo`/etc, the same single-source-of-
+// truth defect #883 named for per-language lists). `site-packages`/`.eggs`
+// are Python-packaging-specific and have no `EXCLUDED_DIRS` counterpart (no
+// other scanner needs them), so they stay as a small local addition rather
+// than polluting the shared cross-tool list.
+const VULTURE_PYTHON_ONLY_EXCLUDES = ["*/site-packages/*", "*/.eggs/*"];
 const VULTURE_EXCLUDES = [
-	"*/.venv/*",
-	"*/venv/*",
-	"*/.tox/*",
-	"*/build/*",
-	"*/dist/*",
-	"*/node_modules/*",
-	"*/.git/*",
-	"*/site-packages/*",
-	"*/__pycache__/*",
-	"*/.eggs/*",
+	...getScratchTreeFnmatchPatterns(),
+	...VULTURE_PYTHON_ONLY_EXCLUDES,
 ];
 
 // Decorators whose target is called by a framework, never by name in the tree.
@@ -174,9 +183,7 @@ export class PythonDeadCodeClient implements DeadCodeClient {
 	private log: (msg: string) => void;
 
 	constructor(verbose = false) {
-		this.log = verbose
-			? createSubsystemLogger("dead-code:python")
-			: () => {};
+		this.log = verbose ? createSubsystemLogger("dead-code:python") : () => {};
 	}
 
 	private get minConfidence(): number {
@@ -221,11 +228,11 @@ export class PythonDeadCodeClient implements DeadCodeClient {
 		);
 	}
 
-	async ensureAvailable(): Promise<boolean> {
+	async ensureAvailable(root?: string): Promise<boolean> {
 		const memo = this.availabilityLatch.read();
 		if (memo !== null) return memo;
 		if (this.ensureInFlight) return this.ensureInFlight;
-		this.ensureInFlight = this.doEnsureAvailable();
+		this.ensureInFlight = this.doEnsureAvailable(root);
 		try {
 			return await this.ensureInFlight;
 		} finally {
@@ -233,15 +240,45 @@ export class PythonDeadCodeClient implements DeadCodeClient {
 		}
 	}
 
-	private async doEnsureAvailable(): Promise<boolean> {
+	/**
+	 * `<root>/.venv/bin/vulture` (and `venv`/Windows `Scripts` equivalents),
+	 * checked by existence only — no spawn. A project's own venv is the vulture
+	 * that project's own config and dependency set were written against; the
+	 * bare `vulture`/`python -m vulture` PATH probes below only ever see
+	 * whatever happens to be active in the CALLING shell, not the project's
+	 * (#1731, discipline B — the same venv-first shape sqlfluff's binary
+	 * resolution already uses, `runner-helpers.ts` `createVenvFinder`).
+	 */
+	private venvCandidates(
+		root: string,
+	): Array<{ cmd: string; prefix: string[] }> {
+		const isWin = process.platform === "win32";
+		const relPaths = isWin
+			? [
+					path.join(".venv", "Scripts", "vulture.exe"),
+					path.join("venv", "Scripts", "vulture.exe"),
+				]
+			: [
+					path.join(".venv", "bin", "vulture"),
+					path.join("venv", "bin", "vulture"),
+				];
+		return relPaths
+			.map((rel) => path.join(root, rel))
+			.filter((full) => fs.existsSync(full))
+			.map((full) => ({ cmd: full, prefix: [] }));
+	}
+
+	private async doEnsureAvailable(root?: string): Promise<boolean> {
 		// Presence-gated, NOT auto-installed. vulture is a pure-Python package
 		// with no standalone binary, so "auto-install" would mean `pip install`
 		// into whatever Python environment happens to be active — wrong and
 		// intrusive for uv / poetry / conda / pipx users. So we only use vulture
-		// when the user already has it, probing both the `vulture` console script
-		// and `python -m vulture` (the script dir is frequently not on PATH even
-		// when the package is installed). Mirrors govulncheck's no-install gating.
+		// when the user already has it, probing the project's own venv first
+		// (#1731), then the `vulture` console script and `python -m vulture` on
+		// PATH (the script dir is frequently not on PATH even when the package
+		// is installed). Mirrors govulncheck's no-install gating.
 		const candidates: Array<{ cmd: string; prefix: string[] }> = [
+			...(root ? this.venvCandidates(root) : []),
 			{ cmd: "vulture", prefix: [] },
 			{ cmd: "python", prefix: ["-m", "vulture"] },
 			{ cmd: "python3", prefix: ["-m", "vulture"] },
@@ -349,7 +386,7 @@ export class PythonDeadCodeClient implements DeadCodeClient {
 				summary: "No Python project root found; vulture skipped",
 			};
 		}
-		if (!(await this.ensureAvailable())) {
+		if (!(await this.ensureAvailable(root))) {
 			return {
 				...emptyResult(this.language),
 				success: true,
@@ -360,21 +397,50 @@ export class PythonDeadCodeClient implements DeadCodeClient {
 		const key = path.resolve(root);
 		const existing = this.inFlight.get(key);
 		if (existing) return existing;
-		const promise = this.runAnalyze(key).finally(() =>
-			this.inFlight.delete(key),
-		);
-		this.inFlight.set(key, promise);
-		return promise;
+		const promise = this.runAnalyze(key);
+		const wrapped = promise.finally(() => {
+			// Identity-guarded release (#1968, #1967's pattern): delete only if
+			// THIS build is still the registered one. A bare delete-by-key lets
+			// a late-settling build A evict a live build B that replaced the
+			// entry mid-flight, and the next caller starts a duplicate.
+			if (this.inFlight.get(key) === wrapped) this.inFlight.delete(key);
+		});
+		this.inFlight.set(key, wrapped);
+		return wrapped;
+	}
+
+	/**
+	 * True when `<root>/pyproject.toml` carries a `[tool.vulture]` table.
+	 * vulture's own config discovery reads that table, but CLI flags override
+	 * it — passing `--min-confidence`/`--exclude` unconditionally silently
+	 * overrode a project's own thresholds and ignore list (#1731, discipline A).
+	 * Same shape as `hasSqlfluffConfig`/`hasMypyConfig` in `tool-policy.ts`: a
+	 * plain string search, no TOML parser, matching the section header only.
+	 */
+	private hasProjectVultureConfig(root: string): boolean {
+		try {
+			const content = fs.readFileSync(
+				path.join(root, "pyproject.toml"),
+				"utf-8",
+			);
+			return content.includes("[tool.vulture]");
+		} catch {
+			return false;
+		}
 	}
 
 	private async runAnalyze(root: string): Promise<DeadCodeResult> {
 		const startMs = Date.now();
 		const invocation = this.resolved ?? { cmd: "vulture", prefix: [] };
+		// Let the project's own [tool.vulture] config win (#1731, discipline A):
+		// vulture discovers it unaided, but these two flags override it when
+		// passed, so they are omitted whenever the project ships that table.
+		const hasConfig = this.hasProjectVultureConfig(root);
 		const args = [
 			...invocation.prefix,
 			".",
-			`--min-confidence=${this.minConfidence}`,
-			`--exclude=${VULTURE_EXCLUDES.join(",")}`,
+			...(hasConfig ? [] : [`--min-confidence=${this.minConfidence}`]),
+			...(hasConfig ? [] : [`--exclude=${VULTURE_EXCLUDES.join(",")}`]),
 			`--ignore-decorators=${VULTURE_IGNORE_DECORATORS.join(",")}`,
 		];
 		const result = await safeSpawnAsync(invocation.cmd, args, {
@@ -394,14 +460,38 @@ export class PythonDeadCodeClient implements DeadCodeClient {
 		}
 		// vulture writes parse/usage errors to stderr and exits 1 with no
 		// stdout findings; distinguish that from "found dead code" (exit 1 WITH
-		// findings on stdout).
+		// findings on stdout). #1736 sweep: the ORIGINAL guard here required
+		// non-empty stderr to call it an error, so a nonzero exit with BOTH
+		// empty stdout and empty stderr (a silent crash) still fell through to
+		// "No dead code found" -- the same empty-distinguishes-clean-from-errored
+		// gap the knip fix closes. A nonzero exit with no findings on stdout is
+		// never clean now, regardless of whether stderr said anything.
 		const output = result.stdout || "";
 		if (!output.trim()) {
 			const stderr = (result.stderr || "").trim();
-			if (result.status !== 0 && stderr) {
+			// Same discriminator every dispatch/runners linter uses
+			// (`spawnFailedWithNoOutput`) rather than a parallel hand-rolled
+			// check (result.error is already handled above, so this reduces to
+			// the `status !== 0` half).
+			if (spawnFailedWithNoOutput(result, output)) {
+				// #1816: one shared wording, one truncation, signal named.
+				const reason = formatToolFailure({
+					tool: "vulture",
+					status: result.status,
+					signal: result.signal,
+					stderr: result.stderr,
+				});
+				this.log(reason);
+				incrementDegradationCount({
+					kind: "runner-empty-result",
+					subject: "vulture",
+					reason,
+				});
 				return {
 					...emptyResult(this.language),
-					summary: `vulture error: ${stderr.split("\n")[0]}`,
+					summary: stderr
+						? `vulture error: ${firstOutputLine(stderr)}`
+						: reason,
 					durationMs,
 				};
 			}
@@ -470,9 +560,7 @@ export function deadCodeIssues(result: DeadCodeResult): DeadCodeIssue[] {
  * one real finding produced four false ones (#1477, #1483). Shared by
  * knip's per-turn delta in runtime-turn.ts so the rule lives in one place.
  */
-export function stableFindingKey(
-	...parts: Array<string | undefined>
-): string {
+export function stableFindingKey(...parts: Array<string | undefined>): string {
 	return parts.map((part) => part ?? "").join(":");
 }
 

@@ -77,7 +77,12 @@ describe("module_report + read_symbol over MCP (tiny project)", () => {
 	afterAll(() => {
 		harness.dispose();
 		try {
-			rmSync(projectDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+			rmSync(projectDir, {
+				recursive: true,
+				force: true,
+				maxRetries: 5,
+				retryDelay: 200,
+			});
 		} catch {
 			// OS reclaims the temp dir eventually.
 		}

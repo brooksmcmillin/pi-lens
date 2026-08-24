@@ -110,7 +110,8 @@ export function createAstGrepOutlineTool(astGrepClient: AstGrepClient) {
 			),
 			match: Type.Optional(
 				Type.String({
-					description: "Keep only top-level items whose name matches this regex.",
+					description:
+						"Keep only top-level items whose name matches this regex.",
 				}),
 			),
 			pubMembers: Type.Optional(

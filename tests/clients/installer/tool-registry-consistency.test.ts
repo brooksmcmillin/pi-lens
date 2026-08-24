@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import { GITHUB_TOOLS, TOOLS } from "../../../clients/installer/index.ts";
+import { GITHUB_TOOLS, TOOLS } from "../../../clients/installer/index.js";
 
 // Use the real installer module, not any mock another test file registered.
-vi.unmock("../../../clients/installer/index.ts");
+vi.unmock("../../../clients/installer/index.js");
 
 /**
  * Deterministic, network-free guard on the auto-install registry wiring.
@@ -49,27 +49,43 @@ describe("TOOLS registry consistency", () => {
 			expect(typeof t.name, `name on ${t.id}`).toBe("string");
 			expect(t.name.length, `non-empty name on ${t.id}`).toBeGreaterThan(0);
 			expect(typeof t.checkCommand, `checkCommand on ${t.id}`).toBe("string");
-			expect(t.checkCommand.length, `non-empty checkCommand on ${t.id}`).toBeGreaterThan(0);
-			expect(Array.isArray(t.checkArgs), `checkArgs array on ${t.id}`).toBe(true);
+			expect(
+				t.checkCommand.length,
+				`non-empty checkCommand on ${t.id}`,
+			).toBeGreaterThan(0);
+			expect(Array.isArray(t.checkArgs), `checkArgs array on ${t.id}`).toBe(
+				true,
+			);
 			for (const arg of t.checkArgs) {
 				expect(typeof arg, `checkArgs entry on ${t.id}`).toBe("string");
 			}
-			expect(STRATEGIES.has(t.installStrategy), `valid strategy on ${t.id}: ${t.installStrategy}`).toBe(true);
+			expect(
+				STRATEGIES.has(t.installStrategy),
+				`valid strategy on ${t.id}: ${t.installStrategy}`,
+			).toBe(true);
 		}
 	});
 
 	it("tool ids are globally unique", () => {
 		const seen = new Map<string, number>();
 		for (const t of TOOLS) seen.set(t.id, (seen.get(t.id) ?? 0) + 1);
-		const dupes = [...seen.entries()].filter(([, n]) => n > 1).map(([id]) => id);
+		const dupes = [...seen.entries()]
+			.filter(([, n]) => n > 1)
+			.map(([id]) => id);
 		expect(dupes, `duplicate tool ids: ${dupes.join(", ")}`).toEqual([]);
 	});
 
 	it("checkCommand and binaryName are clean executable tokens (no path separators/whitespace)", () => {
 		for (const t of TOOLS) {
-			expect(isCleanToken(t.checkCommand), `${t.id} checkCommand "${t.checkCommand}"`).toBe(true);
+			expect(
+				isCleanToken(t.checkCommand),
+				`${t.id} checkCommand "${t.checkCommand}"`,
+			).toBe(true);
 			if (t.binaryName !== undefined) {
-				expect(isCleanToken(t.binaryName), `${t.id} binaryName "${t.binaryName}"`).toBe(true);
+				expect(
+					isCleanToken(t.binaryName),
+					`${t.id} binaryName "${t.binaryName}"`,
+				).toBe(true);
 			}
 		}
 	});
@@ -81,7 +97,10 @@ describe("TOOLS registry consistency", () => {
 			for (const t of TOOLS.filter((x) => x.installStrategy === "npm")) {
 				expect(t.packageName, `${t.id} packageName`).toBeTruthy();
 				expect(t.binaryName, `${t.id} binaryName`).toBeTruthy();
-				expect(t.github, `${t.id} should not carry a github spec`).toBeUndefined();
+				expect(
+					t.github,
+					`${t.id} should not carry a github spec`,
+				).toBeUndefined();
 			}
 		});
 
@@ -90,17 +109,27 @@ describe("TOOLS registry consistency", () => {
 				(x) => x.installStrategy === "pip" || x.installStrategy === "gem",
 			)) {
 				expect(t.packageName, `${t.id} packageName`).toBeTruthy();
-				expect(t.github, `${t.id} should not carry a github spec`).toBeUndefined();
+				expect(
+					t.github,
+					`${t.id} should not carry a github spec`,
+				).toBeUndefined();
 			}
 		});
 
 		it("github tools declare a github spec (owner/repo + assetMatch), binaryName, and no packageName", () => {
 			for (const t of TOOLS.filter((x) => x.installStrategy === "github")) {
 				expect(t.github, `${t.id} github spec`).toBeDefined();
-				expect(typeof t.github?.assetMatch, `${t.id} assetMatch fn`).toBe("function");
-				expect(t.github?.repo, `${t.id} repo "owner/repo"`).toMatch(/^[\w.-]+\/[\w.-]+$/);
+				expect(typeof t.github?.assetMatch, `${t.id} assetMatch fn`).toBe(
+					"function",
+				);
+				expect(t.github?.repo, `${t.id} repo "owner/repo"`).toMatch(
+					/^[\w.-]+\/[\w.-]+$/,
+				);
 				expect(t.binaryName, `${t.id} binaryName`).toBeTruthy();
-				expect(t.packageName, `${t.id} github tool should not carry packageName`).toBeUndefined();
+				expect(
+					t.packageName,
+					`${t.id} github tool should not carry packageName`,
+				).toBeUndefined();
 			}
 		});
 
@@ -109,10 +138,18 @@ describe("TOOLS registry consistency", () => {
 				expect(t.maven, `${t.id} maven spec`).toBeDefined();
 				expect(t.maven?.groupId, `${t.id} groupId`).toMatch(/^[\w.-]+$/);
 				expect(t.maven?.artifactId, `${t.id} artifactId`).toMatch(/^[\w.-]+$/);
-				expect(t.maven?.version, `${t.id} pinned version`).toMatch(/^[\w.+-]+$/);
+				expect(t.maven?.version, `${t.id} pinned version`).toMatch(
+					/^[\w.+-]+$/,
+				);
 				expect(t.binaryName, `${t.id} binaryName`).toBeTruthy();
-				expect(t.packageName, `${t.id} maven tool should not carry packageName`).toBeUndefined();
-				expect(t.github, `${t.id} maven tool should not carry a github spec`).toBeUndefined();
+				expect(
+					t.packageName,
+					`${t.id} maven tool should not carry packageName`,
+				).toBeUndefined();
+				expect(
+					t.github,
+					`${t.id} maven tool should not carry a github spec`,
+				).toBeUndefined();
 			}
 		});
 
@@ -161,9 +198,18 @@ describe("TOOLS registry consistency", () => {
 					).toBe("number");
 				}
 				expect(t.binaryName, `${t.id} binaryName`).toBeTruthy();
-				expect(t.packageName, `${t.id} archive tool should not carry packageName`).toBeUndefined();
-				expect(t.github, `${t.id} archive tool should not carry a github spec`).toBeUndefined();
-				expect(t.maven, `${t.id} archive tool should not carry a maven spec`).toBeUndefined();
+				expect(
+					t.packageName,
+					`${t.id} archive tool should not carry packageName`,
+				).toBeUndefined();
+				expect(
+					t.github,
+					`${t.id} archive tool should not carry a github spec`,
+				).toBeUndefined();
+				expect(
+					t.maven,
+					`${t.id} archive tool should not carry a maven spec`,
+				).toBeUndefined();
 			}
 		});
 	});
@@ -190,14 +236,20 @@ describe("TOOLS registry consistency", () => {
 				const supported = PLATFORMS.flatMap((p) =>
 					ARCHES.map((a) => t.github?.assetMatch(p, a)),
 				).some((asset) => typeof asset === "string" && asset.length > 0);
-				expect(supported, `${t.id} resolves no asset on any supported platform`).toBe(true);
+				expect(
+					supported,
+					`${t.id} resolves no asset on any supported platform`,
+				).toBe(true);
 			}
 		});
 
 		it("rejects unsupported platforms", () => {
 			for (const t of githubTools) {
 				for (const platform of UNSUPPORTED_PLATFORMS) {
-					expect(t.github?.assetMatch(platform, "x64"), `${t.id} ${platform}`).toBeUndefined();
+					expect(
+						t.github?.assetMatch(platform, "x64"),
+						`${t.id} ${platform}`,
+					).toBeUndefined();
 				}
 			}
 		});
@@ -207,9 +259,9 @@ describe("TOOLS registry consistency", () => {
 		// declare extraAssets to fetch the dependency alongside it.
 		it("github tools whose win32 asset is a .bat/.cmd wrapper declare extraAssets", () => {
 			for (const t of githubTools) {
-				const winAsset = ARCHES.map((a) => t.github?.assetMatch("win32", a)).find(
-					(x): x is string => typeof x === "string",
-				);
+				const winAsset = ARCHES.map((a) =>
+					t.github?.assetMatch("win32", a),
+				).find((x): x is string => typeof x === "string");
 				if (winAsset && /\.(bat|cmd)$/i.test(winAsset)) {
 					const extras = t.github?.extraAssets?.("win32", "x64") ?? [];
 					expect(
@@ -239,7 +291,9 @@ describe("TOOLS registry consistency", () => {
 
 		it("every GITHUB_TOOLS id is a real github-strategy tool", () => {
 			const bogus = GITHUB_TOOLS.filter((id) => !githubStrategyIds.has(id));
-			expect(bogus, `not github-strategy tools: ${bogus.join(", ")}`).toEqual([]);
+			expect(bogus, `not github-strategy tools: ${bogus.join(", ")}`).toEqual(
+				[],
+			);
 		});
 
 		it("GITHUB_TOOLS has no duplicates", () => {
@@ -248,15 +302,21 @@ describe("TOOLS registry consistency", () => {
 
 		it("contains exactly the github tools with full platform/arch coverage", () => {
 			const fullMatrix = new Set(
-				TOOLS.filter((t) => t.installStrategy === "github" && resolvesFullMatrix(t)).map(
-					(t) => t.id,
-				),
+				TOOLS.filter(
+					(t) => t.installStrategy === "github" && resolvesFullMatrix(t),
+				).map((t) => t.id),
 			);
 			const curated = new Set<string>(GITHUB_TOOLS);
 			const missing = [...fullMatrix].filter((id) => !curated.has(id));
 			const extra = [...curated].filter((id) => !fullMatrix.has(id));
-			expect(missing, `full-matrix tools absent from GITHUB_TOOLS: ${missing.join(", ")}`).toEqual([]);
-			expect(extra, `GITHUB_TOOLS entries lacking full matrix: ${extra.join(", ")}`).toEqual([]);
+			expect(
+				missing,
+				`full-matrix tools absent from GITHUB_TOOLS: ${missing.join(", ")}`,
+			).toEqual([]);
+			expect(
+				extra,
+				`GITHUB_TOOLS entries lacking full matrix: ${extra.join(", ")}`,
+			).toEqual([]);
 		});
 	});
 });

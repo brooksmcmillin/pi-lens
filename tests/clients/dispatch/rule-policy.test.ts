@@ -50,11 +50,15 @@ describe("rule-policy.matchesRule", () => {
 		// Neither the key nor the list names `no-eval`. Matching is list-based,
 		// so the unrelated `unused-vars` key is irrelevant either way.
 		const policyMap = { "unused-vars": { disable: ["no-unused-vars"] } };
-		expect(evaluateRulePolicy("no-eval", policyMap)).toEqual({ dropped: false });
+		expect(evaluateRulePolicy("no-eval", policyMap)).toEqual({
+			dropped: false,
+		});
 	});
 
 	it("keeps a rule with no policy (empty policyMap)", () => {
-		expect(evaluateRulePolicy("no-eval", undefined)).toEqual({ dropped: false });
+		expect(evaluateRulePolicy("no-eval", undefined)).toEqual({
+			dropped: false,
+		});
 		expect(evaluateRulePolicy("no-eval", {})).toEqual({ dropped: false });
 	});
 
@@ -76,7 +80,9 @@ describe("rule-policy.select", () => {
 
 	it("keeps when an entry matches in select", () => {
 		const policyMap = { "no-eval": { select: ["no-eval", "no-debugger"] } };
-		expect(evaluateRulePolicy("no-eval", policyMap)).toEqual({ dropped: false });
+		expect(evaluateRulePolicy("no-eval", policyMap)).toEqual({
+			dropped: false,
+		});
 	});
 
 	it("matches normalized rule ids in select", () => {
@@ -89,7 +95,9 @@ describe("rule-policy.select", () => {
 	it("treats an empty select list as 'no restriction' (does NOT drop)", () => {
 		// No `select` entries at all → no allowlist filter → keep everything.
 		const policyMap = { "no-eval": { select: [] } };
-		expect(evaluateRulePolicy("no-eval", policyMap)).toEqual({ dropped: false });
+		expect(evaluateRulePolicy("no-eval", policyMap)).toEqual({
+			dropped: false,
+		});
 	});
 });
 
@@ -100,12 +108,16 @@ describe("rule-policy.-js suffix conflation (documented, not a bug)", () => {
 		// deliberate side effect of the shared napi/LSP-variant normalization,
 		// documented in rule-id-normalize.ts and docs/globalconfig.md.
 		const policyMap = { prefer: { disable: ["prefer"] } };
-		expect(evaluateRulePolicy("prefer-js", policyMap)).toEqual({ dropped: true });
+		expect(evaluateRulePolicy("prefer-js", policyMap)).toEqual({
+			dropped: true,
+		});
 	});
 
 	it("a select naming the stem also keeps a distinct rule literally named '<stem>-js'", () => {
 		const policyMap = { prefer: { select: ["prefer"] } };
-		expect(evaluateRulePolicy("prefer-js", policyMap)).toEqual({ dropped: false });
+		expect(evaluateRulePolicy("prefer-js", policyMap)).toEqual({
+			dropped: false,
+		});
 	});
 
 	it("a disable naming the -js-suffixed rule also drops the unrelated stem rule (conflation is symmetric)", () => {
@@ -117,7 +129,9 @@ describe("rule-policy.-js suffix conflation (documented, not a bug)", () => {
 		// The conflation above is one-way noise, not a hole: listing the -js id
 		// verbatim still drops the rule that carries that exact id.
 		const policyMap = { prefer: { disable: ["prefer-js"] } };
-		expect(evaluateRulePolicy("prefer-js", policyMap)).toEqual({ dropped: true });
+		expect(evaluateRulePolicy("prefer-js", policyMap)).toEqual({
+			dropped: true,
+		});
 	});
 });
 
@@ -219,10 +233,7 @@ describe("rule-policy.applyRulePolicy", () => {
 	});
 
 	it("uses a code-only diagnostic as its policy key", () => {
-		const diagnostics = [
-			{ code: "no-eval" },
-			{ code: "no-debugger" },
-		];
+		const diagnostics = [{ code: "no-eval" }, { code: "no-debugger" }];
 		const policyMap = { "no-eval": { disable: ["no-eval"] } };
 		const result = applyRulePolicy(diagnostics, policyMap);
 		expect(result).toEqual([{ code: "no-debugger" }]);

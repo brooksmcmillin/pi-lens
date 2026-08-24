@@ -31,15 +31,15 @@ function writeFakeNpm(dir: string): {
 			'fs.appendFileSync(process.env.FAKE_NPM_COUNTER, "install\\n");',
 			'if (process.env.FAKE_NPM_SLOW === "1") {',
 			' const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });',
-			' fs.writeFileSync(process.env.FAKE_NPM_CHILD_PID, String(child.pid));',
-			' setInterval(() => {}, 1000);',
-			'} else {',
+			" fs.writeFileSync(process.env.FAKE_NPM_CHILD_PID, String(child.pid));",
+			" setInterval(() => {}, 1000);",
+			"} else {",
 			' const bin = path.join(process.env.PI_LENS_HOME, "tools", "node_modules", ".bin");',
-			' fs.mkdirSync(bin, { recursive: true });',
+			" fs.mkdirSync(bin, { recursive: true });",
 			process.platform === "win32"
 				? ' fs.writeFileSync(path.join(bin, "oxlint.cmd"), "@echo off\\r\\necho oxlint 1.0.0\\r\\n");'
 				: ' fs.writeFileSync(path.join(bin, "oxlint"), "#!/bin/sh\\necho oxlint 1.0.0\\n", { mode: 0o750 });',
-			'}',
+			"}",
 		].join("\n"),
 	);
 	if (process.platform === "win32") {
@@ -89,7 +89,16 @@ function testEnv(
 	script: string,
 ): NodeJS.ProcessEnv {
 	const nodeDir = path.dirname(process.execPath);
-	const toolPath = nodeDir;
+	// #2015: verifyToolBinary routes through safeSpawnAsync, whose Windows
+	// .cmd/.bat wrapper runs `chcp ... & <shim>` (clients/safe-spawn.ts).
+	// Since #2023 chcp is invoked via its pinned System32 absolute path, so
+	// System32 no longer HAS to be on PATH; keeping it here exercises the
+	// restricted-PATH scenario without depending on the pin. Node's dir stays
+	// first so the restricted PATH still cannot collide with a real oxlint.
+	const toolPath =
+		process.platform === "win32"
+			? `${nodeDir};${process.env.SystemRoot ?? "C:\\Windows"}\\System32`
+			: nodeDir;
 	const env: NodeJS.ProcessEnv = {
 		...process.env,
 		PI_LENS_HOME: home,
@@ -120,6 +129,15 @@ afterEach(() => {
 });
 
 describe("installer process lifecycle (#945)", () => {
+	// These tests spawn REAL child node processes that run the full ensureTool
+	// flow (discovery probes, the install lock, the package-manager spawn, and
+	// — since #2015 routes verifyToolBinary through safeSpawnAsync — the
+	// cmd.exe-wrapped shim verification). Under parallel vitest workers a
+	// single run can legitimately take several seconds, so the 5s default
+	// test budget is too tight (same reasoning as tool-discovery.test.ts's
+	// 30s installTool budget). 15s still catches a true hang.
+	const REAL_PROCESS_TIMEOUT_MS = 15_000;
+
 	it.skipIf(process.platform !== "win32")(
 		"kills a fake npm's complete Windows process tree on timeout",
 		async () => {
@@ -139,35 +157,48 @@ describe("installer process lifecycle (#945)", () => {
 			await new Promise((resolve) => setTimeout(resolve, 250));
 			expect(pidAlive(childPid)).toBe(false);
 		},
+		REAL_PROCESS_TIMEOUT_MS,
 	);
 
-	it("serializes two processes so exactly one package-manager install runs", async () => {
-		const root = tempDir();
-		const home = path.join(root, "home");
-		const { counter, script } = writeFakeNpm(root);
-		const env = testEnv(home, counter, script);
-		const results = await Promise.all([runEnsure(env), runEnsure(env)]);
-		expect(results.map((result) => result.code)).toEqual([0, 0]);
-		expect(fs.existsSync(counter), JSON.stringify(results)).toBe(true);
-		expect(fs.readFileSync(counter, "utf8").trim().split(/\r?\n/)).toHaveLength(1);
-		expect(results.every((result) => /oxlint/.test(result.stdout))).toBe(true);
-	});
+	it(
+		"serializes two processes so exactly one package-manager install runs",
+		async () => {
+			const root = tempDir();
+			const home = path.join(root, "home");
+			const { counter, script } = writeFakeNpm(root);
+			const env = testEnv(home, counter, script);
+			const results = await Promise.all([runEnsure(env), runEnsure(env)]);
+			expect(results.map((result) => result.code)).toEqual([0, 0]);
+			expect(fs.existsSync(counter), JSON.stringify(results)).toBe(true);
+			expect(
+				fs.readFileSync(counter, "utf8").trim().split(/\r?\n/),
+			).toHaveLength(1);
+			expect(results.every((result) => /oxlint/.test(result.stdout))).toBe(
+				true,
+			);
+		},
+		REAL_PROCESS_TIMEOUT_MS,
+	);
 
-	it("reports disabled installation and never spawns the package manager", async () => {
-		const root = tempDir();
-		const home = path.join(root, "home");
-		const { counter, script } = writeFakeNpm(root);
-		const result = await runEnsure({
-			...testEnv(home, counter, script),
-			PI_LENS_DISABLE_TOOL_INSTALL: "1",
-		});
-		expect(result.code).toBe(0);
-		const payload = JSON.parse(result.stdout) as { reason?: string };
-		expect(payload.reason).toBe(
-			"installation disabled by PI_LENS_DISABLE_TOOL_INSTALL=1",
-		);
-		expect(fs.existsSync(counter)).toBe(false);
-	});
+	it(
+		"reports disabled installation and never spawns the package manager",
+		async () => {
+			const root = tempDir();
+			const home = path.join(root, "home");
+			const { counter, script } = writeFakeNpm(root);
+			const result = await runEnsure({
+				...testEnv(home, counter, script),
+				PI_LENS_DISABLE_TOOL_INSTALL: "1",
+			});
+			expect(result.code).toBe(0);
+			const payload = JSON.parse(result.stdout) as { reason?: string };
+			expect(payload.reason).toBe(
+				"installation disabled by PI_LENS_DISABLE_TOOL_INSTALL=1",
+			);
+			expect(fs.existsSync(counter)).toBe(false);
+		},
+		REAL_PROCESS_TIMEOUT_MS,
+	);
 
 	it("ordinary Vitest execution has tool installation disabled", () => {
 		expect(process.env.PI_LENS_DISABLE_TOOL_INSTALL).toBe("1");

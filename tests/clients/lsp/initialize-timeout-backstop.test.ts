@@ -46,43 +46,38 @@ const describeOrSkip = process.platform === "win32" ? describe.skip : describe;
 describeOrSkip(
 	"createLSPClient — initialize-timeout 2s SIGKILL backstop (#1114)",
 	() => {
-		it(
-			"does not re-send SIGKILL once killProcessTree's own SIGTERM has already ended the process",
-			async () => {
-				const { createLSPClient } = await import(
-					"../../../clients/lsp/client.js"
-				);
-				const { launchLSP } = await import("../../../clients/lsp/launch.js");
+		it("does not re-send SIGKILL once killProcessTree's own SIGTERM has already ended the process", async () => {
+			const { createLSPClient } =
+				await import("../../../clients/lsp/client.js");
+			const { launchLSP } = await import("../../../clients/lsp/launch.js");
 
-				const proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
-					cwd: process.cwd(),
-					env: { ...process.env, FAKE_LSP_IGNORE_INITIALIZE: "1" },
-				});
-				const killSpy = vi.spyOn(proc.process, "kill");
+			const proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+				cwd: process.cwd(),
+				env: { ...process.env, FAKE_LSP_IGNORE_INITIALIZE: "1" },
+			});
+			const killSpy = vi.spyOn(proc.process, "kill");
 
-				await expect(
-					createLSPClient({
-						serverId: "fake-init-hang",
-						process: proc,
-						root: process.cwd(),
-						initializeTimeoutMs: 50,
-					}),
-				).rejects.toThrow();
+			await expect(
+				createLSPClient({
+					serverId: "fake-init-hang",
+					process: proc,
+					root: process.cwd(),
+					initializeTimeoutMs: 50,
+				}),
+			).rejects.toThrow();
 
-				// Wait past BOTH killProcessTree's own 1.5s non-fast escalation
-				// window and this backstop's 2s window. The real (non-ignoring)
-				// fake server dies from the initial SIGTERM well under either.
-				await new Promise((resolve) => setTimeout(resolve, 2500));
+			// Wait past BOTH killProcessTree's own 1.5s non-fast escalation
+			// window and this backstop's 2s window. The real (non-ignoring)
+			// fake server dies from the initial SIGTERM well under either.
+			await new Promise((resolve) => setTimeout(resolve, 2500));
 
-				expect(
-					proc.process.exitCode !== null || proc.process.signalCode !== null,
-				).toBe(true);
-				// The core assertion: no redundant SIGKILL once death was already
-				// observed. Pre-fix (`!lspProcess.process.killed`), this always
-				// fired regardless.
-				expect(killSpy).not.toHaveBeenCalledWith("SIGKILL");
-			},
-			8_000,
-		);
+			expect(
+				proc.process.exitCode !== null || proc.process.signalCode !== null,
+			).toBe(true);
+			// The core assertion: no redundant SIGKILL once death was already
+			// observed. Pre-fix (`!lspProcess.process.killed`), this always
+			// fired regardless.
+			expect(killSpy).not.toHaveBeenCalledWith("SIGKILL");
+		}, 8_000);
 	},
 );

@@ -65,9 +65,7 @@ describe("word-index build/update key convergence (#1025 item #2)", () => {
 		expect(index.postings.get("beta")).toBeDefined();
 		// All postings normalize to the one file key (no split across two forms).
 		const distinctKeys = new Set(
-			[...index.postings.values()]
-				.flat()
-				.map((hit) => wordIndexKey(hit.file)),
+			[...index.postings.values()].flat().map((hit) => wordIndexKey(hit.file)),
 		);
 		expect(distinctKeys.size).toBe(1);
 	});

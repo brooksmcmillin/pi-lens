@@ -96,7 +96,10 @@ describe("safeSpawnAsync resource-usage bracketing (#620)", () => {
 			expect.objectContaining({
 				type: "phase",
 				phase: "spawn_resource_usage",
-				metadata: expect.objectContaining({ command: "fake-runner", ...summary }),
+				metadata: expect.objectContaining({
+					command: "fake-runner",
+					...summary,
+				}),
 			}),
 		);
 	});

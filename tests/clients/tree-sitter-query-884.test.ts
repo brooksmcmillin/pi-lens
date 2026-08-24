@@ -17,17 +17,70 @@ afterEach(() => {
 });
 
 const cases = [
-	["infinite-loop-java", "java", "java", "class C { void f() { while (true) {} for (;;) {} } }", "class C { void f(boolean b) { while (b) {} } }"],
-	["no-double-checked-locking", "java", "java", "class C { void f() { if (x == null) { synchronized (x) { if (x == null) {} } } } }", "class C { void f() { if (x == null) { synchronized (x) { work(); } } } }"],
-	["no-field-shadowing", "java", "java", "class Parent { protected int value; } class Child extends Parent { int value; }", "class Parent { protected int value; } class Child extends Parent { int childValue; }"],
-	["switch-fall-through", "java", "java", "class C { void f(int x) { switch (x) { case 1: work(); case 2: break; } } }", "class C { void f(int x) { switch (x) { case 1: work(); break; } } }"],
-	["switch-non-case-labels", "java", "java", "class C { void f(int x) { switch (x) { case 1: label: work(); } } }", "class C { void f(int x) { switch (x) { case 1: work(); } } }"],
-	["no-scoped-lock-without-args", "cpp", "cpp", "void f() { std::scoped_lock lock; }", "void f(std::mutex& m) { std::scoped_lock lock(m); }"],
-	["calc-spacing", "css", "css", "a { width: calc(100%-20px); }", "a { width: calc(100% - 20px); }"],
-	["this-in-static-context", "php", "php", "<?php class C { public static function f() { return $this->x; } }", "<?php class C { public function f() { return $this->x; } }"],
+	[
+		"infinite-loop-java",
+		"java",
+		"java",
+		"class C { void f() { while (true) {} for (;;) {} } }",
+		"class C { void f(boolean b) { while (b) {} } }",
+	],
+	[
+		"no-double-checked-locking",
+		"java",
+		"java",
+		"class C { void f() { if (x == null) { synchronized (x) { if (x == null) {} } } } }",
+		"class C { void f() { if (x == null) { synchronized (x) { work(); } } } }",
+	],
+	[
+		"no-field-shadowing",
+		"java",
+		"java",
+		"class Parent { protected int value; } class Child extends Parent { int value; }",
+		"class Parent { protected int value; } class Child extends Parent { int childValue; }",
+	],
+	[
+		"switch-fall-through",
+		"java",
+		"java",
+		"class C { void f(int x) { switch (x) { case 1: work(); case 2: break; } } }",
+		"class C { void f(int x) { switch (x) { case 1: work(); break; } } }",
+	],
+	[
+		"switch-non-case-labels",
+		"java",
+		"java",
+		"class C { void f(int x) { switch (x) { case 1: label: work(); } } }",
+		"class C { void f(int x) { switch (x) { case 1: work(); } } }",
+	],
+	[
+		"no-scoped-lock-without-args",
+		"cpp",
+		"cpp",
+		"void f() { std::scoped_lock lock; }",
+		"void f(std::mutex& m) { std::scoped_lock lock(m); }",
+	],
+	[
+		"calc-spacing",
+		"css",
+		"css",
+		"a { width: calc(100%-20px); }",
+		"a { width: calc(100% - 20px); }",
+	],
+	[
+		"this-in-static-context",
+		"php",
+		"php",
+		"<?php class C { public static function f() { return $this->x; } }",
+		"<?php class C { public function f() { return $this->x; } }",
+	],
 ] as const;
 
-const EXT: Record<string, string> = { java: "java", cpp: "cpp", css: "css", php: "php" };
+const EXT: Record<string, string> = {
+	java: "java",
+	cpp: "cpp",
+	css: "css",
+	php: "php",
+};
 
 describe("issue #884 tree-sitter queries (java/cpp/css/php)", () => {
 	for (const [id, language, _kind, positive, negative] of cases) {
@@ -43,14 +96,27 @@ describe("issue #884 tree-sitter queries (java/cpp/css/php)", () => {
 			const rule = loaded.get(language)?.find((q) => q.id === id);
 			expect(rule, `rule ${language}/${id} must exist`).toBeTruthy();
 
-			const posFile = createTempFile(env.tmpDir, `pos.${EXT[language]}`, positive);
-			const negFile = createTempFile(env.tmpDir, `neg.${EXT[language]}`, negative);
+			const posFile = createTempFile(
+				env.tmpDir,
+				`pos.${EXT[language]}`,
+				positive,
+			);
+			const negFile = createTempFile(
+				env.tmpDir,
+				`neg.${EXT[language]}`,
+				negative,
+			);
 
 			const posMatches = await client!.runQueryOnFile(rule!, posFile, language);
 			const negMatches = await client!.runQueryOnFile(rule!, negFile, language);
 
-			expect(posMatches.length, `${id} should flag the buggy snippet`).toBeGreaterThan(0);
-			expect(negMatches.length, `${id} should leave correct code alone`).toBe(0);
+			expect(
+				posMatches.length,
+				`${id} should flag the buggy snippet`,
+			).toBeGreaterThan(0);
+			expect(negMatches.length, `${id} should leave correct code alone`).toBe(
+				0,
+			);
 		});
 	}
 });

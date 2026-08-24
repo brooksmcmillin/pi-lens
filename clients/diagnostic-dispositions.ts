@@ -54,13 +54,17 @@
  * layered on later without changing the store shape.
  */
 
-import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { commitDurableStore } from "./durable-store.js";
 import { logDispositionEvent } from "./disposition-logger.js";
 import { publishDisposition } from "./disposition-publish.js";
 import { getProjectDataDir } from "./file-utils.js";
+import {
+	normalizeMessage as sharedNormalizeMessage,
+	relativeFile as sharedRelativeFile,
+	stableFindingId,
+} from "./finding-identity.js";
 import { normalizeMapKey } from "./path-utils.js";
 import { lineContentHash } from "./read-guard.js";
 
@@ -72,6 +76,26 @@ export interface DispositionCandidate {
 	rule?: string;
 	message: string;
 	line?: number;
+	/**
+	 * Output tier, when the caller has one to give (mirrors dispatch's
+	 * `Diagnostic.semantic` / `ProjectDiagnostic.semantic`). Review-round F1
+	 * (#1625): a `"blocking"` finding may be dropped ONLY by a STRICT,
+	 * content-bound anchor match (false-positive) — never by a WEAK-anchored
+	 * suppress/defer. Two distinct secrets sharing the same rule/message (e.g.
+	 * two different AWS keys) collapse onto the SAME weak anchor
+	 * (`relativeFile|tool|rule|normalizedMessage`, no line-content hash), so a
+	 * weak suppress on one silently silenced the other too — unacceptable for
+	 * a STOP-tier finding, where "silenced" means "shipped." A missing/
+	 * undefined `semantic` is treated as NOT blocking (today's behavior,
+	 * unchanged) — this is an opt-in tightening for callers that know their
+	 * tier, not a default lockdown of every existing caller. Typed as a plain
+	 * `string` (checked against the literal `"blocking"` at the call site)
+	 * rather than a narrow union so this interface stays compatible with every
+	 * caller's own wider semantic type (dispatch's `OutputSemantic`,
+	 * `WidgetDiagnostic`'s `string | undefined`, `ProjectDiagnostic`'s
+	 * `ProjectDiagnosticSemantic`) without a cast at every call site.
+	 */
+	semantic?: string;
 }
 
 export type Disposition = "false-positive" | "suppress" | "defer" | "flagged";
@@ -98,14 +122,29 @@ interface DispositionStateFile {
 // resurfaces for free on the next process run, with no expiry/pruning logic
 // needed. Stores WEAK anchors (see module doc) so a deferred finding stays
 // hidden all session even if the flagged line itself is edited.
+//
+// Review-round F3 (#1625): this Set is process-GLOBAL, but a weak anchor
+// itself only encodes a RELATIVE path (`relativeFile` derives it from
+// `path.relative(cwd, filePath)`, never the cwd's own identity) plus
+// tool/rule/normalizedMessage — two unrelated projects sharing the same
+// relative path/tool/rule/message (e.g. "src/auth.ts" flagged by the same
+// eslint rule in project A and project B) collapse onto the IDENTICAL weak
+// anchor string. A defer in project A therefore silently suppressed the same
+// finding in project B for the rest of the process's life. Every read/write
+// below goes through `deferredKey`, which folds the resolved cwd into the Set
+// key, so the two projects can no longer collide.
 const deferredThisSession = new Set<string>();
+
+function deferredKey(cwd: string, anchor: string): string {
+	return `${normalizeMapKey(cwd)}::${anchor}`;
+}
 
 /** Exported (#802) so lens-diagnostic-mark's cross-check against live widget
  * diagnostics matches a message the same way anchor derivation does — a
- * second, slightly different normalizer would make a real match invisible. */
-export function normalizeMessage(message: string): string {
-	return message.replace(/\s+/g, " ").trim().toLowerCase();
-}
+ * second, slightly different normalizer would make a real match invisible.
+ * Re-exports the shared `finding-identity.js` normalizer (#1816) so this
+ * module keeps its existing public surface. */
+export const normalizeMessage = sharedNormalizeMessage;
 
 // Anchor derivation chokepoint (#1024, #210 class): the `dd:`/`ddw:` id builders
 // (computeStrictAnchor/computeWeakAnchor) both derive their path component here,
@@ -125,12 +164,13 @@ export function normalizeMessage(message: string): string {
 // widget hot path, and the read side already pays exactly this cost. Semantics
 // are unchanged: the `..`-escape fallback still returns the canonical filePath,
 // only now in the same canonical form the non-escape branch uses.
-function relativeFile(filePath: string, cwd: string): string {
-	const canonicalCwd = normalizeMapKey(cwd);
-	const canonicalFile = normalizeMapKey(filePath);
-	const rel = path.relative(canonicalCwd, canonicalFile).replace(/\\/g, "/");
-	return rel && !rel.startsWith("..") ? rel : canonicalFile;
-}
+//
+// #1816: this used to be a local copy; it is now `finding-identity.js`'s
+// `relativeFile` (identical body — canonicalize both inputs through
+// `normalizeMapKey` before relativizing), re-exported so the rest of this
+// file, and the module doc/comments above referencing `relativeFile`, keep
+// working unchanged.
+const relativeFile = sharedRelativeFile;
 
 export interface DispositionAnchorArgs {
 	cwd: string;
@@ -152,25 +192,25 @@ export function computeStrictAnchor(args: DispositionAnchorArgs): string {
 	const lines = args.content?.split(/\r?\n/);
 	const lineText =
 		args.line !== undefined && lines ? (lines[args.line - 1] ?? "") : "";
-	const parts = [
-		relativeFile(args.filePath, args.cwd),
-		args.tool ?? "",
-		args.rule ?? "",
-		normalizeMessage(args.message),
-		lineContentHash(lineText),
-	];
-	return `dd:${createHash("sha256").update(parts.join("|")).digest("hex").slice(0, 12)}`;
+	return stableFindingId("dd:", {
+		cwd: args.cwd,
+		filePath: args.filePath,
+		parts: [
+			args.tool ?? "",
+			args.rule ?? "",
+			normalizeMessage(args.message),
+			lineContentHash(lineText),
+		],
+	});
 }
 
 /** Intent-level anchor — see module doc. Used for defer/flagged/suppress. */
 export function computeWeakAnchor(args: DispositionAnchorArgs): string {
-	const parts = [
-		relativeFile(args.filePath, args.cwd),
-		args.tool ?? "",
-		args.rule ?? "",
-		normalizeMessage(args.message),
-	];
-	return `ddw:${createHash("sha256").update(parts.join("|")).digest("hex").slice(0, 12)}`;
+	return stableFindingId("ddw:", {
+		cwd: args.cwd,
+		filePath: args.filePath,
+		parts: [args.tool ?? "", args.rule ?? "", normalizeMessage(args.message)],
+	});
 }
 
 /** Both anchors a stored/filtered diagnostic would compute — the one shared
@@ -245,6 +285,48 @@ export function _setDispositionStatForTests(
 ): void {
 	dispositionStatSync = statSync ?? fs.statSync;
 }
+
+/**
+ * Zero-I/O guard for cache-only callers (lens_diagnostics delta/all): true
+ * when ANY disposition mark or session defer exists, so a caller can skip its
+ * whole strict/weak filter — including every file stat/read the strict branch
+ * would need — in the overwhelmingly common no-marks case. Same hoist shape as
+ * applyDispositionsMultiFile's #1625 F2 empty-store early return; `readState`
+ * is mtime+size stat-cached, so repeated calls cost one stat.
+ */
+export function hasAnyDispositionMarks(cwd: string): boolean {
+	return Boolean(readState(cwd).dispositions) || deferredThisSession.size > 0;
+}
+
+/**
+ * True when the project's disposition store holds at least one STRICT-anchored
+ * `false-positive` mark — the only disposition kind whose immediate application
+ * needs file content. A store with only weak suppress/defer marks can never
+ * produce a strict-anchor match, so cache-only callers can serve them through
+ * the zero-I/O weak filter and skip every stat/read the strict path would
+ * charge.
+ */
+export function hasStrictDispositionMarks(cwd: string): boolean {
+	const dispositions = readState(cwd).dispositions;
+	if (!dispositions) return false;
+	for (const key of Object.keys(dispositions)) {
+		if (dispositions[key]?.disposition === "false-positive") return true;
+	}
+	return false;
+}
+
+// Test seam for `applyDispositionsMultiFile`'s per-group content read (#1625
+// F2) — Vitest can't `vi.spyOn` a bare ESM `node:fs` named export directly
+// ("Module namespace is not configurable in ESM"), so the F2 regression test
+// (proving the empty-store hoist means zero reads, not just fast ones)
+// swaps this indirection instead, mirroring `dispositionStatSync` above.
+let multiFileReadFileSync: typeof fs.readFileSync = fs.readFileSync;
+
+export function _setMultiFileReadForTests(
+	readFileSync: typeof fs.readFileSync | null,
+): void {
+	multiFileReadFileSync = readFileSync ?? fs.readFileSync;
+}
 function readState(cwd: string): DispositionStateFile {
 	const p = statePath(cwd);
 	let stat: fs.Stats;
@@ -255,7 +337,13 @@ function readState(cwd: string): DispositionStateFile {
 			return stateCache.state;
 		}
 		const empty: DispositionStateFile = {};
-		stateCache = { path: p, missing: true, mtimeMs: -1, size: -1, state: empty };
+		stateCache = {
+			path: p,
+			missing: true,
+			mtimeMs: -1,
+			size: -1,
+			state: empty,
+		};
 		return empty;
 	}
 	if (
@@ -271,7 +359,9 @@ function readState(cwd: string): DispositionStateFile {
 	try {
 		const parsed = JSON.parse(fs.readFileSync(p, "utf-8")) as unknown;
 		state =
-			parsed && typeof parsed === "object" ? (parsed as DispositionStateFile) : {};
+			parsed && typeof parsed === "object"
+				? (parsed as DispositionStateFile)
+				: {};
 	} catch {
 		// Now that writeState is tmp+rename atomic, a torn read (another process
 		// mid-write) can no longer land here — this only fires on genuine
@@ -446,17 +536,27 @@ export function markDisposition(
 	// mark) — the log should record what this mark shadowed either way.
 	const existing = readState(cwd).dispositions?.[anchor];
 	if (disposition === "defer") {
-		deferredThisSession.add(anchor);
-		emitMarkTelemetry(cwd, target, disposition, anchor, reason, existing, identity);
+		deferredThisSession.add(deferredKey(cwd, anchor));
+		emitMarkTelemetry(
+			cwd,
+			target,
+			disposition,
+			anchor,
+			reason,
+			existing,
+			identity,
+		);
 		return anchor;
 	}
 
 	const now = new Date().toISOString();
 	const capturesFixContext = disposition === "flagged";
 	const lineText = capturesFixContext
-		? (target.content?.split(/\r?\n/)[
-				target.line !== undefined ? target.line - 1 : -1
-			] ?? existing?.lineText)?.trim()
+		? (
+				target.content?.split(/\r?\n/)[
+					target.line !== undefined ? target.line - 1 : -1
+				] ?? existing?.lineText
+			)?.trim()
 		: existing?.lineText;
 	const entry: DispositionEntry = {
 		disposition,
@@ -467,7 +567,15 @@ export function markDisposition(
 		lineText,
 	};
 	commitDisposition(cwd, anchor, entry);
-	emitMarkTelemetry(cwd, target, disposition, anchor, reason, existing, identity);
+	emitMarkTelemetry(
+		cwd,
+		target,
+		disposition,
+		anchor,
+		reason,
+		existing,
+		identity,
+	);
 	return anchor;
 }
 
@@ -478,8 +586,12 @@ export function getDisposition(
 	return readState(cwd).dispositions?.[anchor];
 }
 
-export function isDeferredThisSession(anchor: string): boolean {
-	return deferredThisSession.has(anchor);
+/** #1625 F3: `anchor` alone is ambiguous across projects — a weak anchor
+ * encodes only a RELATIVE path plus tool/rule/message, never the project's
+ * own identity, so `cwd` must be supplied to disambiguate which project's
+ * defer is being checked. */
+export function isDeferredThisSession(cwd: string, anchor: string): boolean {
+	return deferredThisSession.has(deferredKey(cwd, anchor));
 }
 
 /** Test-only escape hatch — defer state is module-level (one process = one
@@ -497,6 +609,14 @@ export function _resetDeferredForTests(): void {
  * Computes both anchors per diagnostic (cheap — same hash primitive, twice)
  * since false-positive is keyed strict while defer/suppress are keyed weak;
  * see module doc for why each disposition binds the way it does.
+ *
+ * Review-round F1 (#1625): a `d.semantic === "blocking"` diagnostic can be
+ * dropped ONLY by the STRICT (false-positive) branch — never by a WEAK-
+ * anchored suppress or defer. Two distinct secrets sharing the same
+ * rule/message (e.g. two different AWS keys on different lines) collapse
+ * onto the SAME weak anchor, so a weak suppress/defer on one would silently
+ * silence the other too; unacceptable for a STOP-tier finding. `flagged` is
+ * unaffected either way — it never drops anything, blocking or not.
  */
 export function applyDispositions<T extends DispositionCandidate>(
 	diagnostics: T[],
@@ -509,13 +629,20 @@ export function applyDispositions<T extends DispositionCandidate>(
 	if (!dispositions && deferredThisSession.size === 0) return diagnostics;
 	return diagnostics.filter((d) => {
 		const { strict, weak } = anchorsForDiagnostic(cwd, filePath, d, content);
-		if (deferredThisSession.has(weak)) return false;
+		const isBlocking = d.semantic === "blocking";
+		if (!isBlocking && deferredThisSession.has(deferredKey(cwd, weak))) {
+			return false;
+		}
 		if (dispositions?.[strict]?.disposition === "false-positive") return false;
 		// Belt-and-braces: the inline `pi-lens-ignore` comment is the real
 		// suppress enforcement (see suppress-writer.ts) and normally already
 		// dropped this finding upstream via applyInlineSuppressions. This is a
-		// harmless second cover for the store-only audit trail case.
-		if (dispositions?.[weak]?.disposition === "suppress") return false;
+		// harmless second cover for the store-only audit trail case — gated
+		// off blocking findings per F1 above (the inline comment, unaffected
+		// by this gate, remains the real suppress mechanism for those too).
+		if (!isBlocking && dispositions?.[weak]?.disposition === "suppress") {
+			return false;
+		}
 		return true;
 	});
 }
@@ -536,6 +663,13 @@ export function applyDispositions<T extends DispositionCandidate>(
  * content-based filter). suppress/defer, being intent-level and weak-anchored,
  * are the marks that must apply the instant a query re-serves cached findings,
  * and they do so here without any read.
+ *
+ * Review-round F1 (#1625): this filter is ENTIRELY weak-anchored — it has no
+ * strict-anchor branch to fall back to — so a `d.semantic === "blocking"`
+ * diagnostic is never dropped here at all, regardless of any suppress/defer
+ * mark. The full `applyDispositions` (content in hand, at the next per-edit
+ * dispatch or mode=full merge) is the only place a blocking finding can ever
+ * be suppressed, and only via its STRICT branch.
  */
 export function applyWeakDispositions<T extends DispositionCandidate>(
 	diagnostics: T[],
@@ -546,6 +680,7 @@ export function applyWeakDispositions<T extends DispositionCandidate>(
 	const dispositions = readState(cwd).dispositions;
 	if (!dispositions && deferredThisSession.size === 0) return diagnostics;
 	return diagnostics.filter((d) => {
+		if (d.semantic === "blocking") return true;
 		const weak = computeWeakAnchor({
 			cwd,
 			filePath,
@@ -554,8 +689,72 @@ export function applyWeakDispositions<T extends DispositionCandidate>(
 			message: d.message,
 			line: d.line,
 		});
-		if (deferredThisSession.has(weak)) return false;
+		if (deferredThisSession.has(deferredKey(cwd, weak))) return false;
 		if (dispositions?.[weak]?.disposition === "suppress") return false;
 		return true;
 	});
+}
+
+/**
+ * Multi-file variant of {@link applyDispositions} for lanes whose findings
+ * span many files in ONE report — gitleaks/trivy/govulncheck/opengrep
+ * project-wide scans (#1617), unlike the dispatch path's one-`ctx.filePath`-
+ * at-a-time shape. Groups by `filePathOf(diagnostic)`, reads each file's
+ * CURRENT content once, then delegates to `applyDispositions` per group —
+ * same anchor derivation, same strict/weak split, no cloned logic (#1617's
+ * single-source-of-truth requirement).
+ *
+ * Content read is best-effort: a file that no longer exists, or that this
+ * process can't read, degrades to `content: ""` for that group rather than
+ * dropping its diagnostics outright. `applyDispositions` already treats a
+ * missing/empty content argument safely — the STRICT (false-positive) anchor
+ * hashes the diagnostic's own line, so an empty content can't collide with a
+ * mark made against the file's real content and the finding simply isn't
+ * matched (fails OPEN — still reported); the WEAK anchor (suppress/defer)
+ * never looks at content at all, so those marks keep applying regardless.
+ * This is a deliberate choice, not an oversight: a security finding must
+ * never silently vanish just because its file went unreadable at filter
+ * time (a security finding staying VISIBLE on a read failure is the safe
+ * default; a stale mark quietly reappearing is recoverable, a leaked secret
+ * quietly disappearing is not).
+ *
+ * Review-round F2 (#1625): the empty-store early return is checked HERE,
+ * before any per-group file read — not left to `applyDispositions` to notice
+ * once already inside the per-group loop. Every mode=full analyzer call
+ * (9 lanes) runs through this on every scan, and the overwhelmingly common
+ * case is zero marks in the project; measured ~270ms of synchronous
+ * `fs.readFileSync` per analyzer per run for that common case before this
+ * hoist (reading every finding's file just to discover there was nothing to
+ * filter), ~0-1ms after.
+ */
+export function applyDispositionsMultiFile<T extends DispositionCandidate>(
+	diagnostics: T[],
+	cwd: string,
+	filePathOf: (diagnostic: T) => string,
+): T[] {
+	if (!diagnostics.length) return diagnostics;
+	const dispositions = readState(cwd).dispositions;
+	if (!dispositions && deferredThisSession.size === 0) return diagnostics;
+	const groups = new Map<string, T[]>();
+	for (const d of diagnostics) {
+		const filePath = filePathOf(d);
+		const group = groups.get(filePath);
+		if (group) group.push(d);
+		else groups.set(filePath, [d]);
+	}
+	const kept = new Set<T>();
+	for (const [filePath, group] of groups) {
+		let content = "";
+		try {
+			content = multiFileReadFileSync(filePath, "utf-8");
+		} catch {
+			// Unreadable/missing — fail open, see doc above.
+		}
+		for (const d of applyDispositions(group, cwd, filePath, content)) {
+			kept.add(d);
+		}
+	}
+	// Preserve the caller's original order/dedup by reference rather than the
+	// per-group insertion order above.
+	return diagnostics.filter((d) => kept.has(d));
 }

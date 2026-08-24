@@ -93,7 +93,10 @@ describe("review-graph stale stage sweep scoping (#1206)", () => {
 			path.join(cacheDir, `review-graph.json.gz.stage-${deadPid}-1`),
 			path.join(cacheDir, `review-graph.json.stage-${deadPid}-1`),
 			path.join(cacheDir, `review-graph.checkpoint.json.gz.stage-${deadPid}-2`),
-			path.join(cacheDir, `review-graph.json.gz.stage-${deadPid}-3.tmp-${deadPid}`),
+			path.join(
+				cacheDir,
+				`review-graph.json.gz.stage-${deadPid}-3.tmp-${deadPid}`,
+			),
 		];
 		for (const p of ownStale) fs.writeFileSync(p, "leftover");
 

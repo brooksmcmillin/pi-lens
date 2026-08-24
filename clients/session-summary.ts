@@ -46,7 +46,9 @@ export function formatSlopScoreSummary(summary: SlopScoreSummary): string {
 	const topRules = summary.ruleCounts.slice(0, 3);
 	const detail =
 		topRules.length > 0
-			? "  (" + topRules.map((entry) => entry.ruleId + " ×" + entry.count).join(", ") + ")"
+			? "  (" +
+				topRules.map((entry) => entry.ruleId + " ×" + entry.count).join(", ") +
+				")"
 			: "";
 
 	return `Slop score: ${summary.scorePerKloc.toFixed(1)}/KLOC${detail}`;

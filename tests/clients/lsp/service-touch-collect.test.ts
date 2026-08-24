@@ -62,10 +62,8 @@ describe("LSPService.touchFile collectDiagnostics", () => {
 
 	it("uses pull-only diagnostics for a pull-capable server under budget pressure", async () => {
 		const { LSPService } = await import("../../../clients/lsp/index.js");
-		const {
-			checkCrossProcessLspBudget,
-			_resetLspBudgetDecisionForTests,
-		} = await import("../../../clients/lsp-budget.js");
+		const { checkCrossProcessLspBudget, _resetLspBudgetDecisionForTests } =
+			await import("../../../clients/lsp-budget.js");
 		const previousCeiling = process.env.PI_LENS_LSP_BUDGET_CEILING;
 		process.env.PI_LENS_LSP_BUDGET_CEILING = "1";
 		const service = new LSPService();
@@ -565,6 +563,50 @@ describe("LSPService.touchFile collectDiagnostics", () => {
 
 		// Unchanged from the pre-#573 behavior: primary/single-server still gets
 		// its own strategy budget (1500), capped by the caller ceiling (2500).
+		expect(client.waitForDiagnostics).toHaveBeenCalledWith(FILE, 1500);
+	});
+
+	// #1639: `ensureWarmForSweep`'s readiness probe touches with `source:
+	// "lsp_sweep_warmup"` and runs a real pull round trip that can settle
+	// `lsp_typescript_diagnostic_sequence` independently of the sweep's real
+	// touch right after it. The per-server wait must tag that settle
+	// `pullSettleSource: "pull-warmup"` so the two observations are
+	// distinguishable — this is the only test exercising that plumbing on the
+	// PRODUCTION `touchFile` path (client-internals.test.ts only drives
+	// `clientWaitForDiagnostics` directly with the option already set).
+	it("tags a warm-up touch's wait with pullSettleSource pull-warmup (#1639)", async () => {
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+		const client = makeBudgetClient();
+		createLSPClient.mockResolvedValue(client);
+		getServersForFileWithConfig.mockReturnValue([makeServer("python")]);
+
+		await service.touchFile(FILE, "print('x')\n", {
+			clientScope: "primary",
+			diagnostics: "document",
+			collectDiagnostics: false,
+			source: "lsp_sweep_warmup",
+		});
+
+		expect(client.waitForDiagnostics).toHaveBeenCalledWith(FILE, 1500, {
+			pullSettleSource: "pull-warmup",
+		});
+	});
+
+	it("does NOT tag a real touch's wait with pullSettleSource (#1639 regression guard)", async () => {
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+		const client = makeBudgetClient();
+		createLSPClient.mockResolvedValue(client);
+		getServersForFileWithConfig.mockReturnValue([makeServer("python")]);
+
+		await service.touchFile(FILE, "print('x')\n", {
+			clientScope: "primary",
+			diagnostics: "document",
+			collectDiagnostics: true,
+			source: "dispatch-lsp-runner",
+		});
+
 		expect(client.waitForDiagnostics).toHaveBeenCalledWith(FILE, 1500);
 	});
 

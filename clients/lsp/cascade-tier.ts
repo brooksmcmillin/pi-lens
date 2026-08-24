@@ -63,6 +63,7 @@
  */
 
 import { logCascade } from "../cascade-logger.js";
+import { incrementDegradationCount } from "../degradation-ledger.js";
 import { logLatency } from "../latency-logger.js";
 import { normalizeMapKey } from "../path-utils.js";
 import { registerQuietWindowTask } from "../quiet-window.js";
@@ -154,7 +155,47 @@ interface OutstandingTouch {
 // replaces the earlier entry (only the most recent touch matters — an
 // older touch's diagnostics, if they ever arrive, are still a strict superset
 // concern the newer touch already re-supersedes via didOpen/didChange).
+//
+// #1899: the registry is drained in full by every reconcile sweep, but nothing
+// bounded it BETWEEN sweeps. The sweep runs on pi's `agent_settled` quiet
+// window, and a session can go a long time without one — dogfood logs show
+// sweeps up to 52 minutes apart. So the two bounds below are the registry's
+// own, independent of when a sweep arrives:
+//
+//   - `MAX_OUTSTANDING_TOUCHES` caps the entry count. Entries are held in
+//     touch order (see `recordOutstandingCascadeTouch`), so eviction takes the
+//     oldest touch at O(1).
+//   - `OUTSTANDING_TOUCH_MAX_AGE_MS` caps how long a touch stays reconcilable.
+//     Past it, the touch is discarded rather than answered: re-injecting a
+//     neighbour error, or clearing a footer entry, from a touch fired that
+//     long ago reports a state the agent has already moved past.
+//
+// Both constants are sized from the 2026-08-09..20 dogfood window (cascade.log,
+// 67 sweeps / 756 entries): the largest single sweep held 53 entries, and a
+// 15-minute age bound retains 72 of the 80 outcomes that ever resolved (90%)
+// while discarding the tail that resolved after ~26-52 minutes.
+const MAX_OUTSTANDING_TOUCHES = 256;
+const OUTSTANDING_TOUCH_MAX_AGE_MS = 15 * 60_000;
+
 const _outstandingTouches = new Map<string, OutstandingTouch>();
+
+/** Entries dropped by the age bound since the last sweep reported. */
+let _expiredSinceLastSweep = 0;
+/** Entries dropped by the size cap since the last sweep reported. */
+let _evictedSinceLastSweep = 0;
+
+/**
+ * Drop every entry older than `OUTSTANDING_TOUCH_MAX_AGE_MS`. The map is held
+ * in touch order, so the expired entries are a prefix and the walk stops at
+ * the first live one.
+ */
+function pruneExpiredOutstandingTouches(now: number): void {
+	for (const [key, touch] of _outstandingTouches) {
+		if (now - touch.touchedAt <= OUTSTANDING_TOUCH_MAX_AGE_MS) break;
+		_outstandingTouches.delete(key);
+		_expiredSinceLastSweep++;
+	}
+}
 
 /**
  * Record a Tier-3 cascade touch that skipped its in-lane wait. Called right
@@ -162,14 +203,60 @@ const _outstandingTouches = new Map<string, OutstandingTouch>();
  * without waiting. `touchedAt` must be sampled BEFORE the notify (see the
  * field doc) so the reconcile comparison can never misread a publish that
  * raced the record as pre-touch.
+ *
+ * #1899: also enforces the registry's two bounds. The `delete` before the
+ * `set` is load-bearing — `Map.set` on an existing key keeps the key's
+ * ORIGINAL insertion position, so without it a re-touched file would keep a
+ * stale position and both the age prefix walk and the oldest-first eviction
+ * would pick the wrong entry.
  */
 export function recordOutstandingCascadeTouch(entry: OutstandingTouch): void {
-	_outstandingTouches.set(normalizeMapKey(entry.filePath), entry);
+	const key = normalizeMapKey(entry.filePath);
+	_outstandingTouches.delete(key);
+	// `Date.now()`, not `entry.touchedAt`: the caller samples `touchedAt` before
+	// its notify, so it trails real time, and the age bound is a statement about
+	// the clock rather than about the newest touch's own stamp.
+	pruneExpiredOutstandingTouches(Date.now());
+	_outstandingTouches.set(key, entry);
+	while (_outstandingTouches.size > MAX_OUTSTANDING_TOUCHES) {
+		const oldest = _outstandingTouches.keys().next();
+		if (oldest.done) break;
+		_outstandingTouches.delete(oldest.value);
+		_evictedSinceLastSweep++;
+		// Bounded by construction: one ledger tally per session, not per
+		// eviction event. The subject is the cap itself rather than the evicted
+		// path — the discriminating fact is "this session overflowed the tier-3
+		// backlog", and per-path subjects would unbound the ledger group.
+		incrementDegradationCount({
+			kind: "cascade-tier3-backlog-evicted",
+			subject: `cap=${MAX_OUTSTANDING_TOUCHES}`,
+			reason:
+				"tier-3 outstanding-touch registry hit its cap before a quiet-window reconcile drained it; the oldest touch was dropped unanswered",
+		});
+	}
+}
+
+/**
+ * #1910: session-boundary reset for the outstanding-touch registry and its
+ * sweep-scoped `_expiredSinceLastSweep`/`_evictedSinceLastSweep` counters.
+ * Both predate #1899 and were never wired into `handleSessionStart` — a
+ * session replacement inherited the prior session's outstanding touches, and
+ * a stray eviction/expiry landing between a sweep and the boundary attributed
+ * its count to the NEXT session's first reconcile gauge. Wired primary-only,
+ * same as every other entry in that reset block: a concurrently-live
+ * secondary never reaches `handleSessionStart` at all (the #473 guard in
+ * index.ts), so it can never race this reset against the still-live
+ * primary's outstanding touches.
+ */
+export function resetCascadeTierSessionState(): void {
+	_outstandingTouches.clear();
+	_expiredSinceLastSweep = 0;
+	_evictedSinceLastSweep = 0;
 }
 
 /** Test-only: clear the outstanding-touch registry between test cases. */
 export function _resetOutstandingCascadeTouchesForTests(): void {
-	_outstandingTouches.clear();
+	resetCascadeTierSessionState();
 }
 
 /** Test-only: peek at the registry without mutating it. */
@@ -177,10 +264,47 @@ export function _getOutstandingCascadeTouchesForTests(): OutstandingTouch[] {
 	return [...(_outstandingTouches.values() as Iterable<OutstandingTouch>)];
 }
 
+/**
+ * Test-only: peek at the sweep-scoped expired/evicted counters without
+ * mutating them. Exists so a probe of `resetCascadeTierSessionState` can
+ * assert on THESE counters directly, rather than only on the registry map —
+ * a future counter added here and left out of the reset would otherwise
+ * stay invisible to any probe that only checks the map went empty.
+ */
+export function _getCascadeTierSweepCountersForTests(): {
+	expired: number;
+	evicted: number;
+} {
+	return { expired: _expiredSinceLastSweep, evicted: _evictedSinceLastSweep };
+}
+
+/**
+ * #1899: WHY a touch stayed unresolved. Five distinct causes used to collapse
+ * into the single word `unresolved`, which is what made the dogfood backlog
+ * unreadable: 676 of 756 outcomes were `unresolved` with no way to tell the
+ * EXPECTED case (a `silentOnClean` server has nothing to say about a clean
+ * neighbour) from a real degradation (the server went cold, or the lookup
+ * threw). Same doctrine as the repo's empty-result rule — an absent answer
+ * must still say which kind of absence it is.
+ */
+export type UnresolvedReason =
+	/** No warm client for the file — the server was idle-reaped since the touch. */
+	| "warm-miss"
+	/** A warm client exists, but it is a different server than the one touched. */
+	| "server-mismatch"
+	/** The client holds no diagnostics entry for this file at all. */
+	| "no-publish"
+	/** An entry exists, but its publish predates the touch — nothing new landed. */
+	| "no-publish-since-touch"
+	/** The client lookup threw. */
+	| "error";
+
 export interface ReconcileOutcome {
 	filePath: string;
 	serverId: string;
 	outcome: "resolved-found" | "resolved-clean" | "unresolved";
+	/** Present only for `unresolved`. */
+	unresolvedReason?: UnresolvedReason;
 	ageMs: number;
 	diagnosticCount?: number;
 	/**
@@ -226,6 +350,10 @@ export async function reconcileOutstandingCascadeTouches(
 	lspService: Pick<LSPService, "getWarmClientForFile">,
 ): Promise<ReconcileOutcome[]> {
 	const outcomes: ReconcileOutcome[] = [];
+	// #1899: the age bound applies at sweep time too, not only at record time —
+	// a registry that received no further touches would otherwise hand the sweep
+	// entries of unbounded age.
+	pruneExpiredOutstandingTouches(Date.now());
 	const entries = [..._outstandingTouches.entries()];
 	_outstandingTouches.clear();
 
@@ -238,6 +366,7 @@ export async function reconcileOutstandingCascadeTouches(
 					filePath: touch.filePath,
 					serverId: touch.serverId,
 					outcome: "unresolved",
+					unresolvedReason: spawned ? "server-mismatch" : "warm-miss",
 					ageMs,
 				});
 				continue;
@@ -252,6 +381,7 @@ export async function reconcileOutstandingCascadeTouches(
 					filePath: touch.filePath,
 					serverId: touch.serverId,
 					outcome: "unresolved",
+					unresolvedReason: entry ? "no-publish-since-touch" : "no-publish",
 					ageMs,
 				});
 				continue;
@@ -272,6 +402,7 @@ export async function reconcileOutstandingCascadeTouches(
 				filePath: touch.filePath,
 				serverId: touch.serverId,
 				outcome: "unresolved",
+				unresolvedReason: "error",
 				ageMs,
 			});
 			logLatency({
@@ -334,9 +465,7 @@ export function registerCascadeTierReconcileTask(
 
 	registerQuietWindowTask("cascade_tier3_reconcile", async () => {
 		if (!isTierAwareCascadeEnabled()) return;
-		if (_outstandingTouches.size === 0) return;
 		const outcomes = await reconcileOutstandingCascadeTouches(getLspService());
-		if (outcomes.length === 0) return;
 
 		// #1023: re-inject each resolved-found neighbor error so it reaches the
 		// agent (previously logs-only). #1444: hand each resolved-CLEAN outcome to
@@ -369,14 +498,29 @@ export function registerCascadeTierReconcileTask(
 		let resolvedClean = 0;
 		let unresolved = 0;
 		let ageSumMs = 0;
+		let maxAgeMs = 0;
+		const unresolvedByReason: Partial<Record<UnresolvedReason, number>> = {};
 		for (const o of outcomes) {
 			if (o.outcome === "resolved-found") resolvedFound++;
 			else if (o.outcome === "resolved-clean") resolvedClean++;
-			else unresolved++;
+			else {
+				unresolved++;
+				const reason = o.unresolvedReason ?? "no-publish";
+				unresolvedByReason[reason] = (unresolvedByReason[reason] ?? 0) + 1;
+			}
 			ageSumMs += o.ageMs;
+			if (o.ageMs > maxAgeMs) maxAgeMs = o.ageMs;
 		}
-		const avgAgeMs = Math.round(ageSumMs / outcomes.length);
+		const avgAgeMs = outcomes.length
+			? Math.round(ageSumMs / outcomes.length)
+			: 0;
 
+		// #1899: emitted on EVERY sweep, including the empty one. The backlog's
+		// size was previously observable only when it was non-empty, so "the
+		// queue is drained" and "the sweep never ran" read identically in
+		// cascade.log. This record is the backlog gauge: what the sweep drained,
+		// what the two bounds dropped since the last sweep, and what the bounds
+		// are, so a reader never has to know the constants to judge the numbers.
 		logCascade({
 			phase: "cascade_tier3_reconcile",
 			filePath: "<quiet-window>",
@@ -385,10 +529,18 @@ export function registerCascadeTierReconcileTask(
 				resolvedFound,
 				resolvedClean,
 				unresolved,
+				unresolvedByReason,
 				avgAgeMs,
+				maxAgeMs,
+				expired: _expiredSinceLastSweep,
+				evicted: _evictedSinceLastSweep,
+				capacity: MAX_OUTSTANDING_TOUCHES,
+				maxAgeCapMs: OUTSTANDING_TOUCH_MAX_AGE_MS,
 				outcomes,
 			},
 		});
+		_expiredSinceLastSweep = 0;
+		_evictedSinceLastSweep = 0;
 	});
 }
 

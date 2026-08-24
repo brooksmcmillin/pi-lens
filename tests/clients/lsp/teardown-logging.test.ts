@@ -70,7 +70,11 @@ describe("LSPService.shutdown() — lsp_service_reset phase", () => {
 	it("writes lsp_service_reset with processExiting=true when processExiting is set", async () => {
 		const { LSPService } = await import("../../../clients/lsp/index.js");
 		const svc = new LSPService();
-		await svc.shutdown({ reason: "session_shutdown", fast: true, processExiting: true });
+		await svc.shutdown({
+			reason: "session_shutdown",
+			fast: true,
+			processExiting: true,
+		});
 
 		const calls = (logLatency as ReturnType<typeof vi.fn>).mock.calls;
 		const hit = calls.find(([e]) => e?.phase === "lsp_service_reset");

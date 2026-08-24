@@ -139,11 +139,15 @@ let hasLoggedAutofixStartDisabled = false;
  * `wireDiagnosticsBusEmitter` (#502) — all three producers share the
  * identical `pi.events.emit` binding, wired separately per producer.
  */
-export function wireFormatEventsBusEmitter(emitFn: BusEmitFn | undefined): void {
+export function wireFormatEventsBusEmitter(
+	emitFn: BusEmitFn | undefined,
+): void {
 	liveEmitter.wire(emitFn);
 }
 
-export function wireFormatEventsBusEmitterGetter(getter: BusEmitGetter | undefined): void {
+export function wireFormatEventsBusEmitterGetter(
+	getter: BusEmitGetter | undefined,
+): void {
 	liveEmitter.wireGetter(getter);
 }
 

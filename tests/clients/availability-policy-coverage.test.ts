@@ -399,6 +399,69 @@ const EVASIONS: ReadonlyArray<{ name: string; source: string }> = [
 		`,
 	},
 	{
+		// #1566 (NE1). The whitelist's handle-name check was a bare `\bname\b`
+		// substring test over the memo's declared type, so a type that merely
+		// MENTIONS the wrapper's name still passed even after unwrapping it all
+		// the way down to a plain boolean. `ReturnType<ReturnType<typeof
+		// makeToolProbe>>` takes the wrapper's own return type apart twice, and
+		// `Awaited<...>` strips the outer promise, landing on the same bare
+		// `boolean` the blacklist used to catch by word alone — the handle's
+		// name is present in the text, but the memo does not hold the handle.
+		name: "a boolean latch typed by unwrapping the wrapper's own return type",
+		source: `
+			import { createCwdCachedProbe } from "./dispatch/runners/utils/runner-helpers.js";
+			import { safeSpawnAsync } from "./safe-spawn.js";
+			function makeToolProbe(cmd: string) {
+				return createCwdCachedProbe(
+					(cwd) => safeSpawnAsync(cmd, ["--version"], { timeout: 5000, cwd }),
+					{ tool: "newtool" },
+				);
+			}
+			const toolAvailableByCwd = new Map<
+				string,
+				Awaited<ReturnType<ReturnType<typeof makeToolProbe>>>
+			>();
+			export async function getToolProbe(cmd: string, cwd: string): Promise<boolean> {
+				const hit = toolAvailableByCwd.get(cwd);
+				if (hit !== undefined) return hit;
+				const verdict = await makeToolProbe(cmd)(cwd);
+				toolAvailableByCwd.set(cwd, verdict);
+				return verdict;
+			}
+		`,
+	},
+	{
+		// #1566 (NE2). Same laundering as NE1, from the other direction: the
+		// handle's name shows up only as a bare CALL ARGUMENT to an unrelated
+		// helper, never as the memo's own type. `emptyCache<boolean>` is what
+		// actually shapes the memo — a boolean map — and `makeToolProbe` is
+		// merely handed to it, the way a probe factory might be handed to a
+		// scheduler. Master's blacklist caught this one by luck (the word
+		// "boolean" in the call's own type argument); the whitelist has no
+		// such luck to fall back on and must refuse on shape, not on which
+		// names appear in the text.
+		name: "a boolean cache from a helper that merely takes the wrapper as an argument",
+		source: `
+			import { createCwdCachedProbe } from "./dispatch/runners/utils/runner-helpers.js";
+			import { safeSpawnAsync } from "./safe-spawn.js";
+			import { emptyCache } from "./cache-utils.js";
+			function makeToolProbe(cmd: string) {
+				return createCwdCachedProbe(
+					(cwd) => safeSpawnAsync(cmd, ["--version"], { timeout: 5000, cwd }),
+					{ tool: "newtool" },
+				);
+			}
+			const cache = emptyCache<boolean>(makeToolProbe);
+			export async function getToolProbe(cmd: string, cwd: string): Promise<boolean> {
+				const hit = cache.get(cwd);
+				if (hit !== undefined) return hit;
+				const verdict = await makeToolProbe(cmd)(cwd);
+				cache.set(cwd, verdict);
+				return verdict;
+			}
+		`,
+	},
+	{
 		name: "the defect shape plus a comment that names availability-policy.js",
 		source: `
 			import { safeSpawnAsync } from "./safe-spawn.js";
@@ -539,12 +602,12 @@ describe("availability policy coverage (#1476)", () => {
 			`,
 			"clients/two-latches.ts",
 		);
-		expect(units.filter((unit) => !unit.governed).map((unit) => unit.unit)).toEqual(
-			["isSecondToolAvailable"],
-		);
-		expect(units.filter((unit) => unit.governed).map((unit) => unit.unit)).toEqual(
-			["MigratedClient"],
-		);
+		expect(
+			units.filter((unit) => !unit.governed).map((unit) => unit.unit),
+		).toEqual(["isSecondToolAvailable"]);
+		expect(
+			units.filter((unit) => unit.governed).map((unit) => unit.unit),
+		).toEqual(["MigratedClient"]);
 	});
 
 	it("follows a probe that lives one helper away from the latch", async () => {

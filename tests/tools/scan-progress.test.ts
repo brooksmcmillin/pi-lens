@@ -39,7 +39,9 @@ describe("scanningSummaryLine", () => {
 	});
 
 	it("returns null for a normal (non-progress) result so the caller falls through", () => {
-		expect(scanningSummaryLine({ mode: "full", filesChecked: 40 }, "x")).toBeNull();
+		expect(
+			scanningSummaryLine({ mode: "full", filesChecked: 40 }, "x"),
+		).toBeNull();
 		expect(scanningSummaryLine(undefined, "x")).toBeNull();
 		expect(scanningSummaryLine({ phase: "done" }, "x")).toBeNull();
 	});

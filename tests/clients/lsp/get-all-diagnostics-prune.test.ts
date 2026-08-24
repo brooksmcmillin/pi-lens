@@ -24,7 +24,11 @@ function makeFakeClient(initial: Map<string, Entry>) {
 		store,
 		getTrackedDiagnosticPaths: () => [...store.keys()],
 		pruneDiagnostics: (
-			predicate: (filePath: string, ts: number, diags: LSPDiagnostic[]) => boolean,
+			predicate: (
+				filePath: string,
+				ts: number,
+				diags: LSPDiagnostic[],
+			) => boolean,
 		) => {
 			let removed = 0;
 			for (const [key, value] of [...store]) {
@@ -64,10 +68,9 @@ describe("LSPService.getAllDiagnostics prune (#197 async existence)", () => {
 
 		const svc = new LSPService();
 		// state is private; inject the fake client to drive the real prune path.
-		(svc as unknown as { state: { clients: Map<string, unknown> } }).state.clients.set(
-			"fake:root",
-			fake,
-		);
+		(
+			svc as unknown as { state: { clients: Map<string, unknown> } }
+		).state.clients.set("fake:root", fake);
 
 		await svc.getAllDiagnostics();
 
@@ -84,10 +87,9 @@ describe("LSPService.getAllDiagnostics prune (#197 async existence)", () => {
 		);
 
 		const svc = new LSPService();
-		(svc as unknown as { state: { clients: Map<string, unknown> } }).state.clients.set(
-			"fake:root",
-			fake,
-		);
+		(
+			svc as unknown as { state: { clients: Map<string, unknown> } }
+		).state.clients.set("fake:root", fake);
 
 		await svc.getAllDiagnostics();
 

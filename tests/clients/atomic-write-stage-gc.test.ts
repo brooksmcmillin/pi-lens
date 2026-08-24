@@ -60,10 +60,7 @@ describe("sweepAtomicWriteStages (#1228)", () => {
 			stage(dir, "state.json.tmp-41002"),
 			stage(dir, "state.json.tmp-41002-7"),
 		];
-		const currentProcess = stage(
-			dir,
-			`state.json.tmp-${process.pid}-0-99`,
-		);
+		const currentProcess = stage(dir, `state.json.tmp-${process.pid}-0-99`);
 		const unrelated = stage(dir, "state.json.tmp-42001-3-9-extra");
 		const ordinary = stage(dir, "state.json");
 
@@ -127,10 +124,9 @@ describe("sweepAtomicWriteStages (#1228)", () => {
 		const hugePid = stage(dir, "state.tmp-999999999999999999999");
 
 		await expect(
-			sweepAtomicWriteStages(
-				[path.join(dir, "missing"), dir],
-				{ isPidAlive: () => false },
-			),
+			sweepAtomicWriteStages([path.join(dir, "missing"), dir], {
+				isPidAlive: () => false,
+			}),
 		).resolves.toMatchObject({ directories: 2, removed: 0 });
 		expect(fs.existsSync(zeroPid)).toBe(true);
 		expect(fs.existsSync(hugePid)).toBe(true);

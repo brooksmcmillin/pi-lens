@@ -30,7 +30,9 @@ afterEach(() => {
 });
 
 async function buildRealGraph(): Promise<{ graph: ReviewGraph; root: string }> {
-	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-graph-failclosed-"));
+	const root = fs.mkdtempSync(
+		path.join(os.tmpdir(), "pi-lens-graph-failclosed-"),
+	);
 	roots.push(root);
 	const file = path.join(root, "a.ts");
 	fs.writeFileSync(file, "export const a = 1;\n");

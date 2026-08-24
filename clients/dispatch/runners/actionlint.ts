@@ -35,7 +35,10 @@ function toDiagnostic(issue: ActionlintIssue, filePath: string): Diagnostic {
 	const column = issue.column && issue.column > 0 ? issue.column : 1;
 	const rule = issue.kind || "actionlint";
 	const message = issue.message || "GitHub Actions workflow issue";
-	const idMessage = message.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 80);
+	const idMessage = message
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.slice(0, 80);
 
 	return {
 		id: `actionlint-${rule}-${line}-${column}-${idMessage}`,
@@ -52,7 +55,10 @@ function toDiagnostic(issue: ActionlintIssue, filePath: string): Diagnostic {
 	};
 }
 
-export function parseActionlintJson(raw: string, filePath: string): Diagnostic[] {
+export function parseActionlintJson(
+	raw: string,
+	filePath: string,
+): Diagnostic[] {
 	const trimmed = raw.trim();
 	if (!trimmed) return [];
 
@@ -92,7 +98,7 @@ const actionlintRunner: RunnerDefinition = {
 		const cwd = ctx.cwd || process.cwd();
 		let cmd: string | null = null;
 
-		if (await (actionlint.isAvailableAsync(cwd))) {
+		if (await actionlint.isAvailableAsync(cwd)) {
 			cmd = actionlint.getCommand(cwd);
 		} else {
 			cmd = await resolveToolCommandWithInstallFallback(cwd, "actionlint");

@@ -15,7 +15,10 @@
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
 import type { PiLensFlagSource } from "./lens-config.js";
-import { findNearestContaining } from "./path-utils.js";
+import {
+	findNearestContaining,
+	normalizeEphemeralMapKey,
+} from "./path-utils.js";
 import {
 	recordFromDispatchDiagnostic,
 	type ActionableWarningRecord,
@@ -51,8 +54,10 @@ import {
 	getProjectIgnoreMatcher,
 	isExcludedDirName,
 } from "./file-utils.js";
+import { isInSpawnTimeoutCooldown } from "./spawn-timeout-cooldown.js";
 import type { FormatService } from "./format-service.js";
 import { logLatency } from "./latency-logger.js";
+import type { PostAutofixNotice } from "./post-autofix-notice.js";
 import { emitLensAnalysisComplete } from "./lens-events.js";
 import { publishFilesTouched } from "./bus-publish.js";
 import {
@@ -70,6 +75,7 @@ import type { WordIndex } from "./word-index.js";
 import { getAmbientAbortSignal, safeSpawnAsync } from "./safe-spawn.js";
 import { combineAbortSignals } from "./deadline-utils.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
+import { dropFindingsForMissingPaths } from "./advisory-provenance.js";
 import {
 	getAutofixPolicyForFile,
 	getPreferredAutofixTools,
@@ -168,7 +174,9 @@ async function snapshotDirInto(
 // Exported for the event-loop occupancy guard (#361/#368): an O(files) walk on
 // the tool_result autofix path, bounded by AUTOFIX_CHANGED_FILE_SCAN_LIMIT and
 // chunk-yielding every SNAPSHOT_YIELD_EVERY files so it never blocks the TUI.
-export async function snapshotProjectFiles(root: string): Promise<FileSnapshot> {
+export async function snapshotProjectFiles(
+	root: string,
+): Promise<FileSnapshot> {
 	const snapshot: FileSnapshot = new Map();
 	const projectRoot = path.resolve(root);
 	const ignoreMatcher = getProjectIgnoreMatcher(projectRoot);
@@ -179,7 +187,13 @@ export async function snapshotProjectFiles(root: string): Promise<FileSnapshot> 
 	const stack = [projectRoot];
 	const counter = { n: 0 };
 	while (stack.length > 0 && snapshot.size < AUTOFIX_CHANGED_FILE_SCAN_LIMIT) {
-		await snapshotDirInto(stack.pop()!, ignoreMatcher, stack, snapshot, counter);
+		await snapshotDirInto(
+			stack.pop()!,
+			ignoreMatcher,
+			stack,
+			snapshot,
+			counter,
+		);
 	}
 	return snapshot;
 }
@@ -273,6 +287,8 @@ export interface PipelineContext {
 		projectSeq: () => number;
 		getFilesChangedSince: (seq: number) => string[];
 	};
+	/** Current turn_end cascade settle start, or undefined outside that wait. */
+	turnEndCascadeSettleStart?: () => number | undefined;
 	/**
 	 * Live reference to `runtime.wordIndex` (#348 phase 2), threaded to the
 	 * deferred cascade so it can update the warm in-memory word index at the
@@ -314,6 +330,25 @@ export interface PipelineResult {
 	changedFiles?: string[];
 	/** Blocking-only formatted output for turn_end re-surfacing if agent didn't fix */
 	inlineBlockerSummary?: string;
+	/**
+	 * #1561 F1: the distinct `tool` ids that raised the blockers in
+	 * `inlineBlockerSummary`. Blockers span every runner, not just the language
+	 * server, so a later verdict has to prove it covers these before it may
+	 * retire the record (see `retireInlineBlockerOnConfirmedClean`).
+	 */
+	inlineBlockerSources?: string[];
+	/**
+	 * #1641 remainder: the 1-based cited lines of the blockers behind
+	 * `inlineBlockerSummary`, carried structurally instead of re-parsed from the
+	 * rendered text later. Cheap here — `dispatchResult.blockers` already has
+	 * `.line` on each diagnostic from this same dispatch; re-deriving it by
+	 * regexing the summary string at turn end would be the re-derivation-vs-
+	 * correlation screen's exact failure shape (a line embedded in prose is not
+	 * reliably parseable, and dispatcher-side rendering changes would silently
+	 * break it). Omits entries with no line (a blocker that doesn't cite one,
+	 * e.g. a whole-file secret finding).
+	 */
+	inlineBlockerLines?: number[];
 	/** Fixable warning diagnostics introduced by this pipeline run. */
 	actionableWarnings?: ActionableWarningRecord[];
 	/** Non-fixable code-quality warnings introduced/touched by this pipeline run. */
@@ -332,6 +367,18 @@ export interface PipelineResult {
 	autofixTools?: string[];
 	/** Authoritative bytes after an immediate mutation of the target file. */
 	postMutation?: { filePath: string; content: string; source: "autofix" };
+	/**
+	 * Data for the post-autofix "the file on disk changed" notice (#1590).
+	 *
+	 * The pipeline renders no sentence of its own here. Whether the
+	 * authoritative bytes actually shipped is decided one layer up, in
+	 * `handleToolResult`, which is the only place that sees the per-file
+	 * attachment cap and the per-command aggregate budget. The pipeline
+	 * therefore emits the DATA (display paths it already resolved) and
+	 * `renderPostAutofixNotice` turns it into exactly one sentence under that
+	 * one decision. Present when auto-format or autofix changed content.
+	 */
+	postAutofixNotice?: PostAutofixNotice;
 }
 
 // --- Phase timing helpers ---
@@ -544,7 +591,10 @@ async function tryKtlintFix(filePath: string, cwd: string): Promise<number> {
 
 // golangci-lint/detekt/ktfmt have no TOOL_COMMAND_SPEC; resolve via availability
 // checkers like their runners do.
-const golangciAutofixChecker = createAvailabilityChecker("golangci-lint", ".exe");
+const golangciAutofixChecker = createAvailabilityChecker(
+	"golangci-lint",
+	".exe",
+);
 const detektAutofixChecker = createAvailabilityChecker("detekt", ".bat");
 const ktfmtAutofixChecker = createAvailabilityChecker("ktfmt", ".bat");
 
@@ -552,13 +602,20 @@ async function tryKtfmtFix(filePath: string, cwd: string): Promise<number> {
 	// Config-first: the autofix policy only reaches here when the project opted
 	// into ktfmt, so resolveAvailableOrInstall honors that gate. ktfmt writes the
 	// formatted file in place and exits 0; treat any byte change as the fix.
-	const cmd = await resolveAvailableOrInstall(ktfmtAutofixChecker, "ktfmt", cwd);
+	const cmd = await resolveAvailableOrInstall(
+		ktfmtAutofixChecker,
+		"ktfmt",
+		cwd,
+	);
 	if (!cmd) return 0;
 	const absPath = path.resolve(cwd, filePath);
 	return detectFileChangedAfterCommand(filePath, cmd, [absPath], cwd, [0]);
 }
 
-async function tryGolangciLintFix(filePath: string, cwd: string): Promise<number> {
+async function tryGolangciLintFix(
+	filePath: string,
+	cwd: string,
+): Promise<number> {
 	// Config-first: the autofix policy only reaches here when a .golangci.* config
 	// exists. resolveAvailableOrInstall honors that gate (won't auto-install a
 	// config-first tool). golangci-lint exits non-zero when issues remain after
@@ -594,9 +651,18 @@ async function tryDetektFix(filePath: string, cwd: string): Promise<number> {
 	);
 }
 
-async function tryMarkdownlintFix(filePath: string, cwd: string): Promise<number> {
+// Exported for #1995 cooldown wiring tests: the guard on this lane is
+// one of three mutation-proof surfaces.
+export async function tryMarkdownlintFix(
+	filePath: string,
+	cwd: string,
+): Promise<number> {
 	const cmd = await resolveToolCommandWithInstallFallback(cwd, "markdownlint");
 	if (!cmd) return 0;
+	// #1995: skip the spawn entirely when the command is cooling down after a
+	// timeout — detectFileChangedAfterCommand also self-guards, but a wedged
+	// command should not even reach a second budget in the hot loop.
+	if (isInSpawnTimeoutCooldown(cmd)) return 0;
 	// Shared config-args seam (#1247): the lint runner consumes the same
 	// builder, so the bare --fix here can never fall back to markdownlint's
 	// default all-rules-on config again (the whole-file CHANGELOG/AGENTS
@@ -614,7 +680,13 @@ async function tryMarkdownlintFix(filePath: string, cwd: string): Promise<number
 async function tryOxlintFix(filePath: string, cwd: string): Promise<number> {
 	const cmd = await resolveToolCommandWithInstallFallback(cwd, "oxlint");
 	if (!cmd) return 0;
-	return detectFileChangedAfterCommand(filePath, cmd, ["--fix", filePath], cwd, [1]);
+	return detectFileChangedAfterCommand(
+		filePath,
+		cmd,
+		["--fix", filePath],
+		cwd,
+		[1],
+	);
 }
 
 async function tryRustClippyFix(filePath: string): Promise<string[]> {
@@ -1034,6 +1106,25 @@ export async function resyncLspFile(
 			if (outcome === "bailed") {
 				// Abandon the still-pending write; the edit continues. Log it so this
 				// stall — previously an invisible hang — is queryable in latency.log.
+				//
+				// #1766: a resync deadline can expire while the target server's FIRST
+				// spawn is still in flight (cold spawn > budget). That is not the same
+				// state as a running server that stalled on a write — the server the
+				// old wording blamed as "slow/wedged" did not exist yet. Distinguish
+				// the two via a fresh, synchronous inFlight lookup so the record keeps
+				// the discriminating identity (which server, which lifecycle state).
+				// Guarded: a test double or future service shape lacking the method
+				// must degrade to the old "timeout"/slow-wedged wording, not throw
+				// into the catch below and suppress this record entirely (#1766 F3).
+				const spawnInFlight =
+					!abort?.aborted &&
+					typeof lspService.isSpawnInFlight === "function" &&
+					lspService.isSpawnInFlight(filePath);
+				const reason = abort?.aborted
+					? "aborted"
+					: spawnInFlight
+						? "spawn-in-flight"
+						: "timeout";
 				logLatency({
 					type: "phase",
 					phase: "lsp_sync_abandoned",
@@ -1041,13 +1132,16 @@ export async function resyncLspFile(
 					durationMs: Date.now() - startedAt,
 					metadata: {
 						source: "lsp_sync",
-						reason: abort?.aborted ? "aborted" : "timeout",
+						reason,
 						budgetMs,
 					},
 				});
-				dbg(
-					`LSP resync ${abort?.aborted ? "aborted (Escape)" : `timed out after ${budgetMs}ms`}; server slow/wedged for ${filePath}`,
-				);
+				const cause = abort?.aborted
+					? "aborted (Escape)"
+					: spawnInFlight
+						? `timed out after ${budgetMs}ms; reason: spawn-in-flight (server still cold-spawning)`
+						: `timed out after ${budgetMs}ms; server slow/wedged`;
+				dbg(`LSP resync ${cause} for ${filePath}`);
 			}
 		}
 	} catch (err) {
@@ -1069,11 +1163,11 @@ function toPilensDiagnosticEntry(d: Diagnostic): PilensDiagnosticEntry {
 	return entry;
 }
 
-	type DispatchResult = Awaited<
-		ReturnType<
-			(typeof import("./dispatch/integration.js"))["dispatchLintWithResult"]
-		>
-	>;
+type DispatchResult = Awaited<
+	ReturnType<
+		(typeof import("./dispatch/integration.js"))["dispatchLintWithResult"]
+	>
+>;
 function buildAllClearOutput(
 	_dispatchResult: DispatchResult,
 	elapsed: number,
@@ -1174,9 +1268,11 @@ export async function runFormatPhase(
  */
 function buildEnrichedBlockerOutput(
 	blockers: Diagnostic[],
-	fileContent: string,
+	fileContent = "",
 ): string {
-	const fileLines = fileContent.split("\n");
+	// Empty fileContent (readback failed, e.g. deleted-file race) still
+	// renders the gated blocker list - just without per-line snippets.
+	const fileLines = fileContent ? fileContent.split("\n") : [];
 	const MAX_SNIPPET = 120; // chars — keep it tight in context
 
 	let out = `\n\n🔴 STOP — ${blockers.length} issue(s) must be fixed:\n`;
@@ -1282,14 +1378,15 @@ export async function runPipeline(
 	if (ctx.autofixMode === "deferred") {
 		autofixSkipReason = "deferred_to_agent_end";
 		dbg(`autofix: deferred until agent_end for ${filePath}`);
-	} else ({
-		fixedCount,
-		autofixTools,
-		attemptedTools,
-		changedFiles: autofixChangedFiles,
-		needsContentRefresh: fixRefresh,
-		skipReason: autofixSkipReason,
-	} = await runAutofix(filePath, cwd, getFlag, dbg, deps, getFlagSource));
+	} else
+		({
+			fixedCount,
+			autofixTools,
+			attemptedTools,
+			changedFiles: autofixChangedFiles,
+			needsContentRefresh: fixRefresh,
+			skipReason: autofixSkipReason,
+		} = await runAutofix(filePath, cwd, getFlag, dbg, deps, getFlagSource));
 	for (const changedFile of autofixChangedFiles) {
 		piChangedFiles.add(path.resolve(changedFile));
 	}
@@ -1386,7 +1483,9 @@ export async function runPipeline(
 				files: [
 					{
 						path: absPath,
-						diagnostics: dispatchResult.diagnostics.map(toPilensDiagnosticEntry),
+						diagnostics: dispatchResult.diagnostics.map(
+							toPilensDiagnosticEntry,
+						),
 					},
 				],
 				dbg,
@@ -1436,10 +1535,27 @@ export async function runPipeline(
 		getDiagnosticTracker().trackAgentFixed(dispatchResult.resolvedCount);
 
 	let output = "";
+	// #2028: the 🔴 STOP block is an agent-facing delivery surface
+	// (finding-delivery-gate.ts's `tool-call:stop-blocker`), so it routes through
+	// the shared deleted-path gate before rendering: a blocker whose cited file
+	// no longer exists has no remediation the agent can perform (the finding IS
+	// the deleted file's content), so it is dropped here rather than re-asserted.
+	// One bounded stat per unique cited path, only when blockers exist — zero
+	// cost on the clean/fast paths.
+	const deliverableBlockers = dispatchResult.hasBlockers
+		? dropFindingsForMissingPaths({
+				store: "stop-blocker",
+				findings: dispatchResult.blockers,
+				cwd,
+				citedPath: (b) => b.filePath || undefined,
+			})
+		: dispatchResult.blockers;
 	if (dispatchResult.hasBlockers && fileContent) {
 		// Enrich blocker output with a code snippet so the agent can see the
 		// exact line it wrote that caused each violation — no re-read needed.
-		output += buildEnrichedBlockerOutput(dispatchResult.blockers, fileContent);
+		if (deliverableBlockers.length > 0) {
+			output += buildEnrichedBlockerOutput(deliverableBlockers, fileContent);
+		}
 		// Append fixed/coverage parts from the original output (slice off the
 		// blocker section we're replacing).
 		const rest = dispatchResult.output.slice(
@@ -1447,7 +1563,22 @@ export async function runPipeline(
 		);
 		if (rest) output += rest;
 	} else if (dispatchResult.output) {
-		output += `\n\n${dispatchResult.output}`;
+		// #2028 review P3: this path fires when readback FAILED - raw output
+		// still cites possibly-deleted files. Re-render from the gated set
+		// (no snippets without fileContent) and keep the post-blocker slice.
+		if (
+			dispatchResult.hasBlockers &&
+			deliverableBlockers.length !== dispatchResult.blockers.length
+		) {
+			let gatedOut = buildEnrichedBlockerOutput(deliverableBlockers);
+			const rest = dispatchResult.output.slice(
+				dispatchResult.blockerOutput.length,
+			);
+			if (rest) gatedOut += rest;
+			output += `\n\n${gatedOut}`;
+		} else {
+			output += `\n\n${dispatchResult.output}`;
+		}
 	}
 	if (fixedCount > 0) {
 		const detail =
@@ -1462,30 +1593,19 @@ export async function runPipeline(
 				: "";
 		output += `\n\n⚠️ Auto-format failed: ${details}${suffix}`;
 	}
-	if (formatChanged || fixedCount > 0) {
-		const changedList = [...piChangedFiles].map((changedFile) =>
-			toRunnerDisplayPath(cwd, changedFile),
-		);
-		const topFiles = changedList
-			.slice(0, 8)
-			.map((f) => "  - " + f)
-			.join("\n");
-		const overflow =
-			changedList.length > 8
-				? "\n  - ... and " + (changedList.length - 8) + " more"
-				: "";
-		const fileList = changedList.length
-			? "\nModified files:\n" + topFiles + overflow
-			: "";
-		const targetHasAuthoritativeAttachment =
-			ctx.autofixMode !== "deferred" &&
-			autofixChangedFiles.some(
-				(changedFile) => path.resolve(changedFile) === path.resolve(filePath),
-			);
-		output += targetHasAuthoritativeAttachment
-			? `\n\n⚠️ **The attached full content for ${toRunnerDisplayPath(cwd, filePath)} is authoritative after autofix. You MUST re-read any other modified side-effect files before editing them.**${fileList}`
-			: `\n\n⚠️ **File was modified by auto-format/fix. You MUST re-read modified file(s) before making any further edits — the content on disk has changed (whitespace, indentation, quotes, or code). Editing from memory will produce mismatches.**${fileList}`;
-	}
+	// #1590: the notice sentence itself is NOT rendered here. This layer cannot
+	// see the attachment cap or the aggregate budget, so it hands the display
+	// paths to `handleToolResult`, which owns the decision and renders the one
+	// sentence with `renderPostAutofixNotice`.
+	const postAutofixNotice: PostAutofixNotice | undefined =
+		formatChanged || fixedCount > 0
+			? {
+					targetPath: toRunnerDisplayPath(cwd, filePath),
+					changedFiles: [...piChangedFiles].map((changedFile) =>
+						toRunnerDisplayPath(cwd, changedFile),
+					),
+				}
+			: undefined;
 	phase.end("dispatch_lint", {
 		hasOutput: !!dispatchResult.output,
 		diagnosticCount: dispatchResult.diagnostics.length,
@@ -1510,12 +1630,13 @@ export async function runPipeline(
 				turnSeq: ctx.telemetry?.turnIndex,
 				writeSeq: ctx.telemetry?.writeIndex,
 				seqState: ctx.seqState,
+				turnEndCascadeSettleStart: ctx.turnEndCascadeSettleStart,
 				fileContent,
 				wordIndex: ctx.wordIndex,
 				onWordIndexUpdated: ctx.onWordIndexUpdated,
-			}).then((run) => ({ ...run, origin: cascadeOrigin }))
-			.catch(
-				(err): import("./cascade-types.js").CascadeRun => {
+			})
+				.then((run) => ({ ...run, origin: cascadeOrigin }))
+				.catch((err): import("./cascade-types.js").CascadeRun => {
 					dbg(`cascade compute failed for ${filePath}: ${err}`);
 					return {
 						filePath,
@@ -1532,12 +1653,14 @@ export async function runPipeline(
 							detail: "cascade computation failed",
 						},
 					};
-				},
-			);
+				});
 
 	// --- Final timing + all-clear ---
 	const elapsed = Date.now() - pipelineStart;
-	if (!output) {
+	// #1590: `postAutofixNotice` is output this run produces, just rendered a
+	// layer up. Treat it as output here, or a format-only change would newly
+	// gain an "all clear" line it never had while the sentence lived inline.
+	if (!output && !postAutofixNotice) {
 		output = buildAllClearOutput(dispatchResult, elapsed, filePath);
 	}
 
@@ -1574,15 +1697,71 @@ export async function runPipeline(
 		inlineBlockerSummary: dispatchResult.hasBlockers
 			? dispatchResult.blockerOutput.trim() || undefined
 			: undefined,
+		// #1561 F1: taken from the very diagnostics `blockerOutput` was rendered
+		// from, so the provenance can never disagree with the text it guards. An
+		// untagged diagnostic contributes the literal "unknown", which no verdict
+		// claims coverage for — it pins the entry rather than silently widening
+		// what an LSP check is allowed to clear.
+		inlineBlockerSources: dispatchResult.hasBlockers
+			? [
+					...new Set(
+						dispatchResult.blockers.map((d) => d.tool?.trim() || "unknown"),
+					),
+				]
+			: undefined,
+		inlineBlockerLines: dispatchResult.hasBlockers
+			? dispatchResult.blockers
+					// #1641 review F2: `dispatchResult.blockers` is NOT guaranteed to be
+					// scoped to THIS file — a chart-wide runner (helm-lint, helm-render)
+					// reports blocking diagnostics against other files in the chart
+					// (e.g. `values.yaml`) alongside `ctx.filePath`. The precedent every
+					// per-file runner already follows (dotnet-build.ts, javac.ts) is to
+					// drop cross-file rows before they reach a per-file record; this is
+					// that same filter applied at the aggregation point instead, since
+					// `blockers` is pooled across every runner dispatched for this file.
+					// Without it, a cross-file line count gets attributed to THIS
+					// file's past-EOF check and can demote an in-bounds, fully valid
+					// blocker for content the diagnostic never described.
+					//
+					// #1641 review round 2 (LOW): `path.resolve` equality doesn't fold
+					// case, and an LSP-sourced diagnostic's `filePath` is stamped with
+					// realpath canonical casing (dispatch/runners/lsp.ts ->
+					// normalizeMapKey) while `ctx.filePath` can arrive lowercase-drive
+					// on Windows — the drive-letter class from #1139/#1150. A bare
+					// `path.resolve` equality then drops EVERY LSP blocker line and
+					// this record silently skips the past-EOF gate (fail-open, but
+					// exactly the pre-fix behavior on the surface #1641 targets).
+					// `normalizeEphemeralMapKey` slash-folds and (on win32)
+					// lowercase-folds both sides with no filesystem I/O — cheap enough
+					// for this per-blocker hot-path filter. `pathsEqual` was
+					// deliberately NOT used here: it calls `realpathSync` per
+					// comparison, which this filter cannot afford per blocker.
+					.filter(
+						(d) =>
+							normalizeEphemeralMapKey(d.filePath) ===
+							normalizeEphemeralMapKey(filePath),
+					)
+					.map((d) => d.line)
+					.filter((line): line is number => typeof line === "number")
+			: undefined,
 		actionableWarnings,
 		codeQualityWarnings,
 		diagnostics: dispatchResult.diagnostics,
 		formattersUsed,
 		fixedCount,
 		autofixTools,
+		postAutofixNotice,
 		postMutation:
-			ctx.autofixMode !== "deferred" && autofixChangedFiles.some((f) => path.resolve(f) === path.resolve(filePath)) && fileContent !== undefined
-				? { filePath: path.resolve(filePath), content: fileContent, source: "autofix" }
+			ctx.autofixMode !== "deferred" &&
+			autofixChangedFiles.some(
+				(f) => path.resolve(f) === path.resolve(filePath),
+			) &&
+			fileContent !== undefined
+				? {
+						filePath: path.resolve(filePath),
+						content: fileContent,
+						source: "autofix",
+					}
 				: undefined,
 	};
 }

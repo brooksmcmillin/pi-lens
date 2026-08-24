@@ -76,13 +76,14 @@ describe("wrapToolForCompactLine — representative tools", () => {
 		async execute() {
 			return { content: [] };
 		},
-		renderResult: compactRenderResult<{ mode?: string; totalBlocking?: number }>(
-			({ details, isError, text }) => {
-				const mode = details?.mode ?? "delta";
-				if (isError) return `lens_diagnostics ${mode} — ${text.split("\n")[0]}`;
-				return `lens_diagnostics ${mode} — ${details?.totalBlocking ?? 0} blocking`;
-			},
-		),
+		renderResult: compactRenderResult<{
+			mode?: string;
+			totalBlocking?: number;
+		}>(({ details, isError, text }) => {
+			const mode = details?.mode ?? "delta";
+			if (isError) return `lens_diagnostics ${mode} — ${text.split("\n")[0]}`;
+			return `lens_diagnostics ${mode} — ${details?.totalBlocking ?? 0} blocking`;
+		}),
 	};
 
 	// lsp_diagnostics: mirrors tools/lsp-diagnostics.ts's "toolname — detail"
@@ -114,11 +115,17 @@ describe("wrapToolForCompactLine — representative tools", () => {
 		async execute() {
 			return { content: [] };
 		},
-		renderResult: compactRenderResult<{ lang?: string }>(({ details, isError, lineCount, text }) => {
-			const lang = details?.lang ?? "";
-			if (isError) return `ast_grep_dump ${lang} — ${text.split("\n")[0]}`.trim();
-			return `ast_grep_dump ${lang} — ${lineCount} AST nodes`.replace(/\s+/g, " ");
-		}),
+		renderResult: compactRenderResult<{ lang?: string }>(
+			({ details, isError, lineCount, text }) => {
+				const lang = details?.lang ?? "";
+				if (isError)
+					return `ast_grep_dump ${lang} — ${text.split("\n")[0]}`.trim();
+				return `ast_grep_dump ${lang} — ${lineCount} AST nodes`.replace(
+					/\s+/g,
+					" ",
+				);
+			},
+		),
 	};
 
 	for (const [label, tool, result, expectSubstring] of [
@@ -137,12 +144,17 @@ describe("wrapToolForCompactLine — representative tools", () => {
 		[
 			"ast_grep_dump",
 			astGrepDumpTool,
-			{ content: [{ type: "text", text: "(program)\n" }], details: { lang: "ts" } },
+			{
+				content: [{ type: "text", text: "(program)\n" }],
+				details: { lang: "ts" },
+			},
 			"ast_grep_dump ts",
 		],
 	] as const) {
 		it(`${label}: collapsed result becomes a single combined line reusing its own summary`, () => {
-			const wrapped = wrapToolForCompactLine(tool as unknown as ToolDefinition<any, any, any>);
+			const wrapped = wrapToolForCompactLine(
+				tool as unknown as ToolDefinition<any, any, any>,
+			);
 			const theme = makeFakeTheme();
 			const ctx = fakeContext();
 
@@ -169,7 +181,9 @@ describe("wrapToolForCompactLine — representative tools", () => {
 	}
 
 	it("expanded view falls through to the tool's own renderResult (full output preserved)", () => {
-		const wrapped = wrapToolForCompactLine(diagnosticsTool as unknown as ToolDefinition<any, any, any>);
+		const wrapped = wrapToolForCompactLine(
+			diagnosticsTool as unknown as ToolDefinition<any, any, any>,
+		);
 		const theme = makeFakeTheme();
 		const ctx = fakeContext({ expanded: true });
 		const result = {
@@ -188,7 +202,9 @@ describe("wrapToolForCompactLine — representative tools", () => {
 	});
 
 	it("expanded call row shows the tool name (call row is only blanked when collapsed)", () => {
-		const wrapped = wrapToolForCompactLine(diagnosticsTool as unknown as ToolDefinition<any, any, any>);
+		const wrapped = wrapToolForCompactLine(
+			diagnosticsTool as unknown as ToolDefinition<any, any, any>,
+		);
 		const theme = makeFakeTheme();
 		const component = wrapped.renderCall?.(
 			{},
@@ -200,7 +216,9 @@ describe("wrapToolForCompactLine — representative tools", () => {
 	});
 
 	it("call row stays visible (not blanked) while the tool is still running (isPartial)", () => {
-		const wrapped = wrapToolForCompactLine(diagnosticsTool as unknown as ToolDefinition<any, any, any>);
+		const wrapped = wrapToolForCompactLine(
+			diagnosticsTool as unknown as ToolDefinition<any, any, any>,
+		);
 		const theme = makeFakeTheme();
 		const component = wrapped.renderCall?.(
 			{},
@@ -212,9 +230,15 @@ describe("wrapToolForCompactLine — representative tools", () => {
 	});
 
 	it("errors flow through with the error glyph and error token", () => {
-		const wrapped = wrapToolForCompactLine(diagnosticsTool as unknown as ToolDefinition<any, any, any>);
+		const wrapped = wrapToolForCompactLine(
+			diagnosticsTool as unknown as ToolDefinition<any, any, any>,
+		);
 		const theme = makeFakeTheme();
-		const result = { content: [{ type: "text", text: "boom" }], isError: true, details: {} };
+		const result = {
+			content: [{ type: "text", text: "boom" }],
+			isError: true,
+			details: {},
+		};
 		const component = wrapped.renderResult?.(
 			result as never,
 			{ expanded: false, isPartial: false },
@@ -228,7 +252,9 @@ describe("wrapToolForCompactLine — representative tools", () => {
 	// #1341 review: pi passes results as {content, details} -- failure arrives
 	// on context.isError. A failed tool must not render a success glyph.
 	it("error status comes from context.isError when the result omits isError", () => {
-		const wrapped = wrapToolForCompactLine(diagnosticsTool as unknown as ToolDefinition<any, any, any>);
+		const wrapped = wrapToolForCompactLine(
+			diagnosticsTool as unknown as ToolDefinition<any, any, any>,
+		);
 		const theme = makeFakeTheme();
 		const component = wrapped.renderResult?.(
 			{ content: [{ type: "text", text: "boom" }], details: {} } as never,
@@ -251,7 +277,9 @@ describe("wrapToolForCompactLine — representative tools", () => {
 				return { content: [] };
 			},
 		};
-		const wrapped = wrapToolForCompactLine(bare as unknown as ToolDefinition<any, any, any>);
+		const wrapped = wrapToolForCompactLine(
+			bare as unknown as ToolDefinition<any, any, any>,
+		);
 		expect(wrapped).toBe(bare);
 		expect(wrapped.renderCall).toBeUndefined();
 		expect(wrapped.renderResult).toBeUndefined();
@@ -285,9 +313,13 @@ describe("wrapToolForCompactLine — representative tools", () => {
 				throw new Error("boom");
 			},
 		};
-		const wrapped = wrapToolForCompactLine(throwing as unknown as ToolDefinition<any, any, any>);
+		const wrapped = wrapToolForCompactLine(
+			throwing as unknown as ToolDefinition<any, any, any>,
+		);
 		const theme = makeFakeTheme();
-		const result = { content: [{ type: "text", text: "raw first line\nsecond" }] };
+		const result = {
+			content: [{ type: "text", text: "raw first line\nsecond" }],
+		};
 		const component = wrapped.renderResult?.(
 			result as never,
 			{ expanded: false, isPartial: false },

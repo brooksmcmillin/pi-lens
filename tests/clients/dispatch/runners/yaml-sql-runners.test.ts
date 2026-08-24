@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { FactStore } from "../../../../clients/dispatch/fact-store.js";
+import { makeRunnerCtx } from "../../../support/runner-ctx.js";
 import { setupTestEnvironment } from "../../test-utils.js";
 
 const safeSpawn = vi.fn((..._args: unknown[]) => ({
@@ -35,17 +35,7 @@ function createCtx(
 	filePath: string,
 	cwd = process.cwd(),
 ) {
-	return {
-		filePath,
-		cwd,
-		kind,
-		pi: { getFlag: () => false },
-		autofix: false,
-		deltaMode: true,
-		facts: new FactStore(),
-		hasTool: async () => true,
-		log: () => {},
-	};
+	return makeRunnerCtx(filePath, cwd, { kind });
 }
 
 describe("yaml/sql runners", () => {
@@ -131,6 +121,48 @@ describe("yaml/sql runners", () => {
 			expect(result.status).toBe("failed");
 			expect(result.semantic).toBe("warning");
 			expect(result.diagnostics[0]?.rule).toBe("LT01");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	// #1731: the runner spawned sqlfluff with no `cwd`, so it resolved
+	// `.sqlfluff`/`pyproject.toml` and any relative path against
+	// `process.cwd()` (the pi-lens extension host's cwd) instead of `ctx.cwd`
+	// (the project being linted) — taplo and biome-check both pass `cwd`.
+	it("sqlfluff runner spawns with the dispatch context's cwd, not the host's (#1731)", async () => {
+		const env = setupTestEnvironment("pi-lens-sqlfluff-cwd-");
+		try {
+			const runner = (
+				await import("../../../../clients/dispatch/runners/sqlfluff.js")
+			).default;
+			const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
+			fs.writeFileSync(
+				path.join(env.tmpDir, ".sqlfluff"),
+				"[sqlfluff]\ndialect = postgres\n",
+			);
+			vi.mocked(safeSpawnMod.safeSpawn).mockReturnValue({
+				error: undefined,
+				status: 0,
+				stdout: "[]",
+				stderr: "",
+			});
+
+			await runner.run(
+				createCtx(
+					"sql",
+					path.join(env.tmpDir, "query.sql"),
+					env.tmpDir,
+				) as never,
+			);
+
+			expect(safeSpawn).toHaveBeenCalled();
+			const [, , options] = safeSpawn.mock.calls[0] as [
+				string,
+				string[],
+				{ cwd?: string } | undefined,
+			];
+			expect(options?.cwd).toBe(env.tmpDir);
 		} finally {
 			env.cleanup();
 		}

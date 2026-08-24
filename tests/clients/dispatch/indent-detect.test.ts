@@ -16,10 +16,13 @@ describe("indentation detection", () => {
 	});
 
 	it("chooses the majority style in mixed content", () => {
-		expect(detectIndentation("  one\n    two\n\tthree\n")).toEqual({ style: "space", width: 2 });
+		expect(detectIndentation("  one\n    two\n\tthree\n")).toEqual({
+			style: "space",
+			width: 2,
+		});
 	});
 
-	it.each(["", "const x = 1;\n"]) ("uses a safe default for %s", (content) => {
+	it.each(["", "const x = 1;\n"])("uses a safe default for %s", (content) => {
 		expect(detectIndentation(content)).toEqual({ style: "space", width: 2 });
 		expect(hasDetectableIndentation(content)).toBe(false);
 	});

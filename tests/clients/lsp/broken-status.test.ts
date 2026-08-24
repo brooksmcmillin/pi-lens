@@ -1,10 +1,6 @@
 import { describe, expect, it } from "vitest";
-import {
-	LSPService,
-} from "../../../clients/lsp/index.js";
-import {
-	renderLspBrokenStatusLines,
-} from "../../../clients/lens-engine.js";
+import { LSPService } from "../../../clients/lsp/index.js";
+import { renderLspBrokenStatusLines } from "../../../clients/lens-engine.js";
 
 describe("LSP circuit-breaker health (#927)", () => {
 	it("exposes permanently disabled servers even without a live client", () => {

@@ -77,7 +77,9 @@ describe("parseSpotbugsXml (#133)", () => {
 		const np = byRule.get("NP_ALWAYS_NULL");
 		expect(np?.tool).toBe("spotbugs");
 		expect(np?.rule).toBe("NP_ALWAYS_NULL");
-		expect(np?.fixSuggestion).toBe("Null pointer dereference of x in Foo.bar().");
+		expect(np?.fixSuggestion).toBe(
+			"Null pointer dereference of x in Foo.bar().",
+		);
 		expect(np?.fixKind).toBe("suggestion");
 	});
 

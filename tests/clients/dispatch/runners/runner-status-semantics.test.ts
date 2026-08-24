@@ -346,6 +346,105 @@ describe("runner status/semantic edge cases", () => {
 		}
 	});
 
+	it("renders a silenced scanner coverage marker once without claiming an empty touch is clean (#1867)", async () => {
+		const runner = (await import("../../../../clients/dispatch/runners/lsp.js"))
+			.default;
+		const { clearCoverageNoticeState, dispatchForFile, RunnerRegistry } =
+			await import("../../../../clients/dispatch/dispatcher.js");
+		const env = setupTestEnvironment("pi-lens-lsp-agent-coverage-");
+		try {
+			const filePath = path.join(env.tmpDir, "main.ts");
+			fs.writeFileSync(filePath, "const x = 1;\n");
+			clearCoverageNoticeState();
+			touchFile
+				.mockResolvedValueOnce(
+					diagsResult([], {
+						confirmation: "partial",
+						unconfirmedServerIds: ["opengrep"],
+					}),
+				)
+				.mockResolvedValueOnce(
+					diagsResult([], {
+						confirmation: "partial",
+						unconfirmedServerIds: ["opengrep"],
+					}),
+				)
+				.mockResolvedValueOnce(
+					diagsResult([], {
+						confirmation: "partial",
+						unconfirmedServerIds: ["ast-grep"],
+					}),
+				);
+			const registry = new RunnerRegistry();
+			registry.register(runner);
+			const groups = [{ mode: "all" as const, runnerIds: ["lsp"] }];
+
+			const first = await dispatchForFile(
+				ctx(filePath, env.tmpDir) as never,
+				groups,
+				registry,
+			);
+			expect(first.output).toContain("coverage: opengrep silent");
+			expect(first.output).toContain("not a clean result");
+
+			const repeated = await dispatchForFile(
+				ctx(filePath, env.tmpDir) as never,
+				groups,
+				registry,
+			);
+			expect(repeated.output).not.toContain("coverage: opengrep silent");
+
+			const changed = await dispatchForFile(
+				ctx(filePath, env.tmpDir) as never,
+				groups,
+				registry,
+			);
+			expect(changed.output).toContain("coverage: ast-grep silent");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("renders a primary diagnostic and its scanner coverage marker together (#1867 F2)", async () => {
+		const runner = (await import("../../../../clients/dispatch/runners/lsp.js"))
+			.default;
+		const { clearCoverageNoticeState, dispatchForFile, RunnerRegistry } =
+			await import("../../../../clients/dispatch/dispatcher.js");
+		const env = setupTestEnvironment("pi-lens-lsp-agent-coverage-primary-");
+		try {
+			const filePath = path.join(env.tmpDir, "main.ts");
+			fs.writeFileSync(filePath, "const x = 1;\n");
+			clearCoverageNoticeState();
+			codeAction.mockResolvedValue([]);
+			touchFile.mockResolvedValue(
+				diagsResult(
+					[
+						{
+							severity: 1,
+							message: "Type error",
+							range: {
+								start: { line: 0, character: 0 },
+								end: { line: 0, character: 5 },
+							},
+						},
+					],
+					{ confirmation: "partial", unconfirmedServerIds: ["opengrep"] },
+				),
+			);
+			const registry = new RunnerRegistry();
+			registry.register(runner);
+			const result = await dispatchForFile(
+				ctx(filePath, env.tmpDir) as never,
+				[{ mode: "all" as const, runnerIds: ["lsp"] }],
+				registry,
+			);
+			expect(result.output).toContain("Type error");
+			expect(result.output).toContain("coverage: opengrep silent");
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("lsp runner still reports the PRIMARY's findings when only an auxiliary was cut off (#1470)", async () => {
 		// The other half of the narrowing: collapsing a partial touch to
 		// skipped/inconclusive across the board would discard a trustworthy
@@ -448,17 +547,19 @@ describe("runner status/semantic edge cases", () => {
 
 			hasLSP.mockResolvedValue(true);
 			openFile.mockResolvedValue(undefined);
-			touchFile.mockResolvedValue(diagsResult([
-				{
-					severity: 1,
-					message: "Type 'number' is not assignable to type 'string'.",
-					range: {
-						start: { line: 0, character: 6 },
-						end: { line: 0, character: 7 },
+			touchFile.mockResolvedValue(
+				diagsResult([
+					{
+						severity: 1,
+						message: "Type 'number' is not assignable to type 'string'.",
+						range: {
+							start: { line: 0, character: 6 },
+							end: { line: 0, character: 7 },
+						},
+						code: "2322",
 					},
-					code: "2322",
-				},
-			])); 
+				]),
+			);
 			codeAction.mockResolvedValue([
 				{ title: "Change type of 'a' to 'number'", kind: "quickfix" },
 				{ title: "Convert number to string", kind: "quickfix" },
@@ -565,28 +666,30 @@ describe("runner status/semantic edge cases", () => {
 			fs.writeFileSync(filePath, "const x = 1;\n");
 
 			supportsLSP.mockReturnValue(true);
-			touchFile.mockResolvedValue(diagsResult([
-				{
-					severity: 2,
-					message: "ast-grep finding",
-					range: {
-						start: { line: 0, character: 0 },
-						end: { line: 0, character: 1 },
+			touchFile.mockResolvedValue(
+				diagsResult([
+					{
+						severity: 2,
+						message: "ast-grep finding",
+						range: {
+							start: { line: 0, character: 0 },
+							end: { line: 0, character: 1 },
+						},
+						code: "no-javascript-url",
+						source: "ast-grep",
 					},
-					code: "no-javascript-url",
-					source: "ast-grep",
-				},
-				{
-					severity: 2,
-					message: "opengrep finding",
-					range: {
-						start: { line: 0, character: 0 },
-						end: { line: 0, character: 1 },
+					{
+						severity: 2,
+						message: "opengrep finding",
+						range: {
+							start: { line: 0, character: 0 },
+							end: { line: 0, character: 1 },
+						},
+						code: "some-rule",
+						source: "Semgrep",
 					},
-					code: "some-rule",
-					source: "Semgrep",
-				},
-			])); 
+				]),
+			);
 
 			const result = await runner.run(
 				ctx(filePath, env.tmpDir, { fileRole: "test" }) as never,
@@ -607,18 +710,20 @@ describe("runner status/semantic edge cases", () => {
 			fs.writeFileSync(filePath, "const x = 1;\n");
 
 			supportsLSP.mockReturnValue(true);
-			touchFile.mockResolvedValue(diagsResult([
-				{
-					severity: 2,
-					message: "ast-grep finding",
-					range: {
-						start: { line: 0, character: 0 },
-						end: { line: 0, character: 1 },
+			touchFile.mockResolvedValue(
+				diagsResult([
+					{
+						severity: 2,
+						message: "ast-grep finding",
+						range: {
+							start: { line: 0, character: 0 },
+							end: { line: 0, character: 1 },
+						},
+						code: "no-javascript-url",
+						source: "ast-grep",
 					},
-					code: "no-javascript-url",
-					source: "ast-grep",
-				},
-			])); 
+				]),
+			);
 
 			const result = await runner.run(ctx(filePath, env.tmpDir) as never);
 			expect(result.diagnostics).toHaveLength(1);
@@ -638,17 +743,19 @@ describe("runner status/semantic edge cases", () => {
 
 			hasLSP.mockResolvedValue(true);
 			openFile.mockResolvedValue(undefined);
-			touchFile.mockResolvedValue(diagsResult([
-				{
-					severity: 1,
-					message: "Type 'number' is not assignable to type 'string'.",
-					range: {
-						start: { line: 0, character: 6 },
-						end: { line: 0, character: 7 },
+			touchFile.mockResolvedValue(
+				diagsResult([
+					{
+						severity: 1,
+						message: "Type 'number' is not assignable to type 'string'.",
+						range: {
+							start: { line: 0, character: 6 },
+							end: { line: 0, character: 7 },
+						},
+						code: "2322",
 					},
-					code: "2322",
-				},
-			])); 
+				]),
+			);
 			codeAction.mockResolvedValue([
 				{ title: "Move to a new file", kind: "refactor.move.newFile" },
 			]);
@@ -677,16 +784,18 @@ describe("runner status/semantic edge cases", () => {
 			hasLSP.mockResolvedValue(true);
 			openFile.mockResolvedValue(undefined);
 			touchFile.mockResolvedValue(
-				diagsResult([0, 1, 2].map((line) => ({
-					severity: 1,
-					message: "Type 'number' is not assignable to type 'string'.",
-					range: {
-						start: { line, character: 6 },
-						end: { line, character: 7 },
-					},
-					code: "2322",
-				})),
-			)); 
+				diagsResult(
+					[0, 1, 2].map((line) => ({
+						severity: 1,
+						message: "Type 'number' is not assignable to type 'string'.",
+						range: {
+							start: { line, character: 6 },
+							end: { line, character: 7 },
+						},
+						code: "2322",
+					})),
+				),
+			);
 			// Assert concurrency by observed overlap (max in-flight lookups), not
 			// wall-clock — elapsed-time bounds flake under parallel vitest load.
 			// Sequential awaits would never have more than 1 lookup in flight.

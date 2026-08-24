@@ -1,22 +1,12 @@
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { FactStore } from "../../../../clients/dispatch/fact-store.js";
+import { makeRunnerCtx } from "../../../support/runner-ctx.js";
 
 function createCtx(filePath: string, cwdOverride?: string) {
-	return {
-		filePath,
-		cwd: cwdOverride ?? path.dirname(filePath),
-		kind: "jsts",
-		fileRole: "source",
-		pi: { getFlag: () => undefined },
-		autofix: false,
-		deltaMode: true,
+	return makeRunnerCtx(filePath, cwdOverride ?? path.dirname(filePath), {
 		blockingOnly: false,
 		modifiedRanges: undefined,
-		facts: new FactStore(),
-		hasTool: async () => true,
-		log: () => {},
-	};
+	});
 }
 
 async function loadRunnerWithClient(isAvailable: boolean, initResult: boolean) {
@@ -68,9 +58,8 @@ async function loadRunnerWithClient(isAvailable: boolean, initResult: boolean) {
 		return { TreeSitterClient: MockTreeSitterClient };
 	});
 
-	const mod = await import(
-		"../../../../clients/dispatch/runners/tree-sitter.js"
-	);
+	const mod =
+		await import("../../../../clients/dispatch/runners/tree-sitter.js");
 	return mod.default;
 }
 
@@ -137,9 +126,8 @@ async function loadRunnerWithQueries(queries: unknown[]) {
 		return { TreeSitterClient: MockTreeSitterClient };
 	});
 
-	const mod = await import(
-		"../../../../clients/dispatch/runners/tree-sitter.js"
-	);
+	const mod =
+		await import("../../../../clients/dispatch/runners/tree-sitter.js");
 	return {
 		runner: mod.default,
 		recordEntitySnapshotDiff,
@@ -174,8 +162,10 @@ describe("tree-sitter runner — metadata", () => {
 				getQueriesForLanguage: vi.fn().mockReturnValue([]),
 				getAllQueries: vi.fn().mockReturnValue([]),
 			},
-			queriesForLanguage: (queries: Map<string, unknown[]>, languageId: string) =>
-				queries.get(languageId) ?? [],
+			queriesForLanguage: (
+				queries: Map<string, unknown[]>,
+				languageId: string,
+			) => queries.get(languageId) ?? [],
 			isDisabledQueryFilePath: () => false,
 			ruleFilesForLanguage: () => [],
 			ruleSourceLanguages: (languageId: string) => [languageId],
@@ -189,9 +179,8 @@ describe("tree-sitter runner — metadata", () => {
 			},
 		}));
 
-		const mod = await import(
-			"../../../../clients/dispatch/runners/tree-sitter.js"
-		);
+		const mod =
+			await import("../../../../clients/dispatch/runners/tree-sitter.js");
 		const runner = mod.default;
 		expect(runner.id).toBe("tree-sitter");
 		expect(runner.appliesTo).toContain("jsts");

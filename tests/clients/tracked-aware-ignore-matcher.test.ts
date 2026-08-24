@@ -294,9 +294,12 @@ describe("tracked-aware ignore matcher (#703)", () => {
 	it("parseTrackedFilesOutput parses repo-relative lines into normalized ids, skipping blanks and excluded dirs", () => {
 		const cwd = process.cwd();
 		const ids = parseTrackedFilesOutput(
-			["clients/tracked.ts", "", "node_modules/dep/index.js", "scripts/tmp.mjs"].join(
-				"\n",
-			),
+			[
+				"clients/tracked.ts",
+				"",
+				"node_modules/dep/index.js",
+				"scripts/tmp.mjs",
+			].join("\n"),
 			cwd,
 		);
 		expect(ids.size).toBe(2);

@@ -100,9 +100,9 @@ describe("biome's failed-install row (#1500)", () => {
 		});
 
 		expect(await (await biome()).ensureAvailable()).toBe(false);
-		expect(
-			decisions()[decisions().length - 1]?.evidence,
-		).toMatchObject({ install: "not-attempted" });
+		expect(decisions()[decisions().length - 1]?.evidence).toMatchObject({
+			install: "not-attempted",
+		});
 	});
 
 	it("never emits an empty evidence object", async () => {

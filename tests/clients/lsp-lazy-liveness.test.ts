@@ -12,21 +12,59 @@ describe("LSP session warm/first-use liveness (#1394)", () => {
 		vi.resetModules();
 		const touchFile = vi.fn(async () => []);
 		vi.doMock("../../clients/lsp/index.js", () => ({
-			getLSPService: () => ({ touchFile, supportsLSP: () => true, getStatus: () => [], getAliveServerIds: () => [] }),
+			getLSPService: () => ({
+				touchFile,
+				supportsLSP: () => true,
+				getStatus: () => [],
+				getAliveServerIds: () => [],
+			}),
 			resetLSPService: () => {},
 		}));
-		vi.doMock("../../clients/dispatch/integration.js", async (importOriginal) => ({
-			...await importOriginal<typeof import("../../clients/dispatch/integration.js")>(),
-			dispatchLintWithResult: async () => ({ diagnostics: [], blockers: [], warnings: [], baselineWarningCount: 0, fixed: [], resolvedCount: 0, output: "lsp pipeline output", blockerOutput: "", hasBlockers: false }),
+		vi.doMock(
+			"../../clients/dispatch/integration.js",
+			async (importOriginal) => ({
+				...(await importOriginal<
+					typeof import("../../clients/dispatch/integration.js")
+				>()),
+				dispatchLintWithResult: async () => ({
+					diagnostics: [],
+					blockers: [],
+					warnings: [],
+					baselineWarningCount: 0,
+					fixed: [],
+					resolvedCount: 0,
+					output: "lsp pipeline output",
+					blockerOutput: "",
+					hasBlockers: false,
+				}),
+			}),
+		);
+		vi.doMock("../../clients/bootstrap.js", () => ({
+			loadBootstrapClients: async () => ({
+				metricsClient: { reset: () => {} },
+				todoScanner: {},
+				biomeClient: { isAvailable: () => false, isSupportedFile: () => false },
+				ruffClient: { isAvailable: () => false, isSupportedFile: () => false },
+				knipClient: {
+					isAvailable: () => false,
+					analyze: async () => ({ issues: [] }),
+				},
+				jscpdClient: { isAvailable: () => false },
+				depChecker: { isAvailable: () => false },
+				testRunnerClient: { detectRunner: () => null },
+				goClient: { isGoAvailableAsync: async () => false },
+				rustClient: { isAvailableAsync: async () => false },
+				agentBehaviorClient: {
+					recordToolCall: () => [],
+					formatWarnings: () => "",
+				},
+				complexityClient: {
+					isSupportedFile: () => false,
+					analyzeFile: () => null,
+				},
+			}),
 		}));
-		vi.doMock("../../clients/bootstrap.js", () => ({ loadBootstrapClients: async () => ({
-			metricsClient: { reset: () => {} }, todoScanner: {},
-			biomeClient: { isAvailable: () => false, isSupportedFile: () => false }, ruffClient: { isAvailable: () => false, isSupportedFile: () => false },
-			knipClient: { isAvailable: () => false, analyze: async () => ({ issues: [] }) }, jscpdClient: { isAvailable: () => false }, depChecker: { isAvailable: () => false },
-			testRunnerClient: { detectRunner: () => null }, goClient: { isGoAvailableAsync: async () => false }, rustClient: { isAvailableAsync: async () => false },
-			agentBehaviorClient: { recordToolCall: () => [], formatWarnings: () => "" }, complexityClient: { isSupportedFile: () => false, analyzeFile: () => null },
-		}) }));
-		const { default: registerExtension } = await import("../../index.ts");
+		const { default: registerExtension } = await import("../../index.js");
 		const pi = createPiMock({ "no-autoformat": true });
 		registerExtension(pi.asExtensionAPI());
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-live-"));
@@ -35,9 +73,20 @@ describe("LSP session warm/first-use liveness (#1394)", () => {
 		try {
 			await pi.emit("session_start", {}, makeCtx({ cwd }));
 			await pi.emit("turn_start", {}, makeCtx({ cwd }));
-			const result = await pi.emit("tool_result", { toolName: "edit", input: { path: filePath }, details: { diff: "+ 1 export const live = 2;" }, content: [{ type: "text", text: "ok" }] }, makeCtx({ cwd }));
+			const result = await pi.emit(
+				"tool_result",
+				{
+					toolName: "edit",
+					input: { path: filePath },
+					details: { diff: "+ 1 export const live = 2;" },
+					content: [{ type: "text", text: "ok" }],
+				},
+				makeCtx({ cwd }),
+			);
 			expect(touchFile).toHaveBeenCalled();
 			expect(JSON.stringify(result)).toContain("lsp pipeline output");
-		} finally { removeTempDirSync(cwd); }
+		} finally {
+			removeTempDirSync(cwd);
+		}
 	}, 30_000);
 });

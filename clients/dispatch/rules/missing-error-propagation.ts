@@ -21,9 +21,15 @@ export const missingErrorPropagationRule: FactRule = {
 	},
 	evaluate(ctx, store) {
 		const fns =
-			store.getFileFact<FunctionSummary[]>(ctx.filePath, "file.functionSummaries") ?? [];
+			store.getFileFact<FunctionSummary[]>(
+				ctx.filePath,
+				"file.functionSummaries",
+			) ?? [];
 		const catches =
-			store.getFileFact<TryCatchSummary[]>(ctx.filePath, "file.tryCatchSummaries") ?? [];
+			store.getFileFact<TryCatchSummary[]>(
+				ctx.filePath,
+				"file.tryCatchSummaries",
+			) ?? [];
 
 		const diagnostics: Diagnostic[] = [];
 

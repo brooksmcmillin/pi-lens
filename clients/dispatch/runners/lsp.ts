@@ -13,6 +13,7 @@
  */
 
 import { logExtension } from "../../extension-log.js";
+import { getLspCapableKinds } from "../../language-policy.js";
 import { touchCoverageGap } from "../../lsp/diagnostic-binding.js";
 import { getLSPService } from "../../lsp/index.js";
 import { RUNTIME_CONFIG } from "../../runtime-config.js";
@@ -25,6 +26,7 @@ import type {
 	RunnerResult,
 } from "../types.js";
 import { convertLspDiagnostics } from "../utils/lsp-diagnostics.js";
+import { demoteInferredProjectDiagnostics } from "../../lsp/inferred-project.js";
 import {
 	enabledAuxiliaryLspServerIds,
 	retagAuxiliaryDiagnostics,
@@ -34,10 +36,7 @@ import {
 	tryWarmAttachedCodeActions,
 	tryWarmAttachedDiagnostics,
 } from "../../warm-attach.js";
-import {
-	contentHash,
-	WARM_CODE_ACTION_LOOKUP_LIMIT,
-} from "../../mcp/ipc.js";
+import { contentHash, WARM_CODE_ACTION_LOOKUP_LIMIT } from "../../mcp/ipc.js";
 
 const LSP_MAX_FILE_BYTES = RUNTIME_CONFIG.pipeline.lspMaxFileBytes;
 const LSP_MAX_FILE_LINES = RUNTIME_CONFIG.pipeline.lspMaxFileLines;
@@ -78,41 +77,11 @@ function buildCodeActionSuggestion(
 
 const lspRunner: RunnerDefinition = {
 	id: "lsp",
-	appliesTo: [
-		"jsts",
-		"python",
-		"go",
-		"rust",
-		"ruby",
-		"cxx",
-		"cmake",
-		"shell",
-		"json",
-		"markdown",
-		"css",
-		"yaml",
-		"html",
-		"docker",
-		"php",
-		"powershell",
-		"prisma",
-		"csharp",
-		"fsharp",
-		"java",
-		"kotlin",
-		"swift",
-		"dart",
-		"lua",
-		"zig",
-		"haskell",
-		"elixir",
-		"gleam",
-		"ocaml",
-		"clojure",
-		"terraform",
-		"nix",
-		"toml",
-	],
+	// Derived from LANGUAGE_POLICY, never hand-maintained: the copy this
+	// replaced had drifted (fish was lspCapable but absent, so getForKind
+	// answered that no LSP runs on fish). Registering a language as lspCapable
+	// is now the only step this seam needs (#1545).
+	appliesTo: getLspCapableKinds(),
 	priority: PRIORITY.LSP_PRIMARY,
 	enabledByDefault: true,
 
@@ -198,14 +167,15 @@ const lspRunner: RunnerDefinition = {
 						}),
 					}
 				: await lspService.touchFile(ctx.filePath, content, {
-				diagnostics: "document",
-				collectDiagnostics: true,
-				clientScope: auxiliaryServerIds.length > 0 ? "with-auxiliary" : "primary",
-				auxiliaryServerIds,
-				maxClientWaitMs: LSP_SPAWN_BUDGET_MS,
-				maxDiagnosticsWaitMs: LSP_DIAGNOSTICS_WAIT_MS,
-				source: "dispatch-lsp-runner",
-			});
+						diagnostics: "document",
+						collectDiagnostics: true,
+						clientScope:
+							auxiliaryServerIds.length > 0 ? "with-auxiliary" : "primary",
+						auxiliaryServerIds,
+						maxClientWaitMs: LSP_SPAWN_BUDGET_MS,
+						maxDiagnosticsWaitMs: LSP_DIAGNOSTICS_WAIT_MS,
+						source: "dispatch-lsp-runner",
+					});
 			if (touched === undefined) {
 				lspClientReady = false;
 			} else {
@@ -279,15 +249,18 @@ const lspRunner: RunnerDefinition = {
 				// timer, or silent with nothing published for this content — so this
 				// empty merged result is missing whatever that scanner would have said.
 				// A hung OR silent opengrep must not read as a clean bill of health on
-				// the security lane. `RunnerResult` has no channel for "clean for these servers,
-				// unknown for those", so the only honest verdict this seam can express
-				// for an EMPTY result is "not checked" — which is what "skipped" means
-				// here, and it lets the coverage notice say so once. Nothing is thrown
-				// away: the primary answered with zero findings, so there is nothing to
+				// the security lane. The empty result remains skipped, while the correlated
+				// server ids let the coverage notice name the missing scanners once. Nothing
+				// is thrown away: the primary answered with zero findings, so there is nothing to
 				// report; when it DOES have findings the branches below still report
 				// them (see the non-empty path), which is how a trustworthy primary
 				// stays trustworthy under an auxiliary that never reported.
-				return { status: "skipped", diagnostics: [], semantic: "none" };
+				return {
+					status: "skipped",
+					diagnostics: [],
+					semantic: "none",
+					unconfirmedServerIds: [...unconfirmedServerIds],
+				};
 			}
 			return {
 				status: "succeeded",
@@ -299,12 +272,37 @@ const lspRunner: RunnerDefinition = {
 
 		// Convert LSP diagnostics to our format
 		// Defensive: filter out malformed diagnostics that may lack range
-		const validLspDiags = lspDiags.filter(
+		const rawValidLspDiags = lspDiags.filter(
 			(d) => d.range?.start?.line !== undefined,
 		);
+		// #1640: the per-edit path renders the same authority as the mode=full
+		// sweep, so it applies the same demotion. Costs one bounded `projectInfo`
+		// request, and only when the file already has a TypeScript ERROR — an edit
+		// that type-checks clean pays nothing.
+		//
+		// #1645 review F2: NOT under warm attach. There, diagnostics came from an
+		// already-running remote session over IPC and no local client exists — so
+		// the probe would have to spawn a whole tsserver fleet to answer, breaking
+		// this branch's spawn-free contract (see the comment below), and the
+		// answer it spawned for would be the NEW server's project resolution, not
+		// the warm session's. A meaningless answer bought with a process is worse
+		// than no answer, so the warm-attach path keeps pre-#1640 rendering. This
+		// is a known gap, recorded on the issue rather than papered over with an
+		// "unverified" label that would fire on every warm-attach file including
+		// the properly configured majority.
+		const validLspDiags = usedWarmAttach
+			? rawValidLspDiags
+			: await demoteInferredProjectDiagnostics(rawValidLspDiags, {
+					filePath: diagnosticPath,
+					cwd: ctx.cwd,
+					service: lspService,
+				});
 		const fixSuggestionByIndex = new Map<number, string>();
 
-		const blockingDiagIndexes = validLspDiags
+		// #1640: read severity off the RAW list. A demoted diagnostic is still
+		// worth a quick-fix suggestion — the demotion changes its authority, not
+		// whether tsserver can offer a fix. Indexes align 1:1 with `validLspDiags`.
+		const blockingDiagIndexes = rawValidLspDiags
 			.map((d, idx) => ({ d, idx }))
 			.filter(({ d }) => d.severity === 1)
 			.slice(0, WARM_CODE_ACTION_LOOKUP_LIMIT);
@@ -333,25 +331,27 @@ const lspRunner: RunnerDefinition = {
 				});
 			}
 		} else {
-			await Promise.all(blockingDiagIndexes.map(async ({ d, idx }) => {
-				try {
-					const start = d.range.start;
-					const end = d.range.end ?? d.range.start;
-					const actions = await lspService.codeAction(
-						ctx.filePath,
-						start.line,
-						start.character,
-						end.line,
-						end.character,
-					);
-					const suggestion = buildCodeActionSuggestion(actions);
-					if (suggestion) {
-						fixSuggestionByIndex.set(idx, suggestion);
+			await Promise.all(
+				blockingDiagIndexes.map(async ({ d, idx }) => {
+					try {
+						const start = d.range.start;
+						const end = d.range.end ?? d.range.start;
+						const actions = await lspService.codeAction(
+							ctx.filePath,
+							start.line,
+							start.character,
+							end.line,
+							end.character,
+						);
+						const suggestion = buildCodeActionSuggestion(actions);
+						if (suggestion) {
+							fixSuggestionByIndex.set(idx, suggestion);
+						}
+					} catch {
+						// Best-effort enrichment only; base diagnostics remain authoritative.
 					}
-				} catch {
-					// Best-effort enrichment only; base diagnostics remain authoritative.
-				}
-			}));
+				}),
+			);
 		}
 
 		const diagnostics: Diagnostic[] = convertLspDiagnostics(
@@ -387,6 +387,9 @@ const lspRunner: RunnerDefinition = {
 			failureKind: hasErrors ? "blocking_diagnostics" : undefined,
 			diagnostics: keptDiagnostics,
 			semantic: resultSemantic,
+			...(unconfirmedServerIds.length > 0 && {
+				unconfirmedServerIds: [...unconfirmedServerIds],
+			}),
 		};
 	},
 };

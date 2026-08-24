@@ -14,7 +14,11 @@ import {
 	getQueryLanguageKey,
 	isDisabledQueryDirectoryName,
 } from "../../../clients/tree-sitter-query-loader.js";
-import { EXT_TO_LANG } from "../../../clients/tree-sitter-shared.js";
+import {
+	_resetSharedTreeSitterClientForTests,
+	EXT_TO_LANG,
+	getSharedTreeSitterClient,
+} from "../../../clients/tree-sitter-shared.js";
 import { removeTempDirSync } from "../test-utils.js";
 
 let tmp: string;
@@ -242,4 +246,33 @@ describe("scanProjectDiagnostics FactStore lifecycle (#886, #939)", () => {
 		expect(peakOccupiedFiles).toBe(1);
 		expect(occupiedFiles.size).toBe(0);
 	});
+});
+
+describe("scanProjectDiagnostics tree-cache reuse across scans (#1715)", () => {
+	afterEach(() => _resetSharedTreeSitterClientForTests());
+
+	it("grows the tree cache past the 110-file working set so a second identical scan hits, not re-parses", async () => {
+		const fileCount = 110;
+		const files = Array.from({ length: fileCount }, (_, i) => {
+			const filePath = path.join(tmp, `f${i}.ts`);
+			fs.writeFileSync(filePath, `export const v${i} = ${i};\n`);
+			return filePath;
+		});
+
+		await scanProjectDiagnostics({ cwd: tmp, tier: "all", files });
+		const client = getSharedTreeSitterClient();
+		expect(client).not.toBeNull();
+		// First scan is necessarily cold — this is the pre-condition, not the
+		// claim under test.
+		const afterFirst = client?.getParseCacheStats();
+		expect(afterFirst?.size).toBe(fileCount);
+
+		await scanProjectDiagnostics({ cwd: tmp, tier: "all", files });
+		const afterSecond = client?.getParseCacheStats();
+
+		// The live dogfood measurement behind #1715: a fixed 50-entry cache
+		// makes EVERY second-scan miss a capacityMiss. Fixed, the second scan
+		// should find every file still resident — zero capacity misses.
+		expect(afterSecond?.capacityMisses).toBe(0);
+	}, 30000);
 });

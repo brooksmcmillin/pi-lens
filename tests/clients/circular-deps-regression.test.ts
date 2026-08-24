@@ -9,9 +9,8 @@ import { describe, expect, it } from "vitest";
  */
 describe("circular dependency regression - diagnostic taxonomy", () => {
 	it("can import from diagnostic-taxonomy.ts without circular errors", async () => {
-		const { classifyDefect, classifyDiagnostic } = await import(
-			"../../clients/dispatch/diagnostic-taxonomy.js"
-		);
+		const { classifyDefect, classifyDiagnostic } =
+			await import("../../clients/dispatch/diagnostic-taxonomy.js");
 
 		expect(classifyDefect).toBeDefined();
 		expect(classifyDiagnostic).toBeDefined();
@@ -94,9 +93,8 @@ describe("circular dependency regression - language policy", () => {
 	});
 
 	it("getDefaultStartupTools respects heavyScansRequireConfig", async () => {
-		const { getDefaultStartupTools } = await import(
-			"../../clients/language-profile.js"
-		);
+		const { getDefaultStartupTools } =
+			await import("../../clients/language-profile.js");
 
 		// Create a profile where jsts is present but NOT configured
 		// jsts has heavyScansRequireConfig: true

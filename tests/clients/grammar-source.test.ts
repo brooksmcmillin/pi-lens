@@ -29,13 +29,40 @@ const scriptVersion = scriptSrc.match(
 )?.[1];
 const scriptGrammars = [
 	...new Set(
-		[...scriptSrc.matchAll(/"(tree-sitter-[a-z0-9_]+\.wasm)"/g)].map((m) => m[1]),
+		[...scriptSrc.matchAll(/"(tree-sitter-[a-z0-9_]+\.wasm)"/g)].map(
+			(m) => m[1],
+		),
 	),
 ];
+
+// #1564 G1: scripts/grammars.lock.json pins the sha256 the runtime path now
+// verifies downloads against (grammar-source.ts's downloadGrammarDetailed).
+// A TREE_SITTER_WASMS_VERSION bump without re-running
+// `download-grammars.ts --write-manifest` leaves the lock holding the OLD
+// release's hashes, silently — the type checker can't catch a stale JSON
+// literal, and `npm test` was fully green on that exact mutation (31/31):
+// every runtime download of the NEW release would then sha-mismatch against
+// the stale pinned hash and retry forever, bricking every lazy-fetched
+// grammar for pnpm/bun users (who skip the postinstall that regenerates the
+// bundled core set).
+const lockManifest = JSON.parse(
+	readFileSync(
+		path.resolve(
+			path.dirname(fileURLToPath(import.meta.url)),
+			"../../scripts/grammars.lock.json",
+		),
+		"utf8",
+	),
+) as { package: string; version: string };
 
 describe("grammar-source ↔ download-grammars stay in sync", () => {
 	it("pins the same tree-sitter-wasms version", () => {
 		expect(scriptVersion).toBe(TREE_SITTER_WASMS_VERSION);
+	});
+
+	it("pins scripts/grammars.lock.json to the same release the runtime downloads (#1564 G1)", () => {
+		expect(lockManifest.version).toBe(TREE_SITTER_WASMS_VERSION);
+		expect(lockManifest.package).toBe("tree-sitter-wasms");
 	});
 
 	it("downloads exactly the grammars the runtime maps", () => {

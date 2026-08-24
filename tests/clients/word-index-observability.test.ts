@@ -26,13 +26,16 @@ vi.mock("../../clients/word-index-logger.js", () => ({
 }));
 
 vi.mock("../../clients/project-snapshot.js", async (importOriginal) => {
-	const actual = await importOriginal<typeof import("../../clients/project-snapshot.js")>();
+	const actual =
+		await importOriginal<typeof import("../../clients/project-snapshot.js")>();
 	return {
 		...actual,
 		default: actual,
 		saveProjectSnapshot: (...args: unknown[]) => {
 			if (failPersist.value) throw new Error("ENOSPC: no space left on device");
-			return (actual.saveProjectSnapshot as (...a: unknown[]) => unknown)(...args);
+			return (actual.saveProjectSnapshot as (...a: unknown[]) => unknown)(
+				...args,
+			);
 		},
 	};
 });
@@ -65,9 +68,8 @@ describe("word-index observability (#958)", () => {
 	it("L1: collectWordIndexDocs counts oversized + unreadable files as skipped, keeping coverage honest", async () => {
 		const env = setupTestEnvironment("pi-lens-word-skip-");
 		try {
-			const { collectWordIndexDocs, WORD_INDEX_MAX_BYTES } = await import(
-				"../../clients/word-index.js"
-			);
+			const { collectWordIndexDocs, WORD_INDEX_MAX_BYTES } =
+				await import("../../clients/word-index.js");
 			createTempFile(env.tmpDir, "src/small.ts", "export const kept = 1;");
 			createTempFile(
 				env.tmpDir,
@@ -90,8 +92,11 @@ describe("word-index observability (#958)", () => {
 	it("M3: a swallowed persist failure emits a persist_failed record (every later query would read stale)", async () => {
 		const env = setupTestEnvironment("pi-lens-word-persist-fail-");
 		try {
-			const { buildWordIndex, scheduleWordIndexPersist, flushWordIndexPersistsForTests } =
-				await import("../../clients/word-index.js");
+			const {
+				buildWordIndex,
+				scheduleWordIndexPersist,
+				flushWordIndexPersistsForTests,
+			} = await import("../../clients/word-index.js");
 			const index = buildWordIndex([
 				{ path: "a.ts", content: "export const alpha = 1;" },
 			]);
@@ -158,10 +163,13 @@ describe("word-index observability (#958)", () => {
 	it("M2: the cold-query background build logs its decision + honest coverage", async () => {
 		const env = setupTestEnvironment("pi-lens-word-cold-");
 		try {
-			createTempFile(env.tmpDir, "src/widget.ts", "export const renderWidget = 1;");
-			const { triggerBackgroundWordIndexBuild } = await import(
-				"../../clients/word-index.js"
+			createTempFile(
+				env.tmpDir,
+				"src/widget.ts",
+				"export const renderWidget = 1;",
 			);
+			const { triggerBackgroundWordIndexBuild } =
+				await import("../../clients/word-index.js");
 
 			triggerBackgroundWordIndexBuild(env.tmpDir);
 			await flushMicrotasks();
@@ -187,9 +195,8 @@ describe("word-index observability (#958)", () => {
 	it("records the safety refusal when the root is at/above $HOME", async () => {
 		const env = setupTestEnvironment("pi-lens-word-refused-");
 		try {
-			const { triggerBackgroundWordIndexBuild } = await import(
-				"../../clients/word-index.js"
-			);
+			const { triggerBackgroundWordIndexBuild } =
+				await import("../../clients/word-index.js");
 			// homeDir == the build root ⇒ isAtOrAboveHomeDir refuses.
 			const status = triggerBackgroundWordIndexBuild(env.tmpDir, undefined, {
 				homeDir: env.tmpDir,

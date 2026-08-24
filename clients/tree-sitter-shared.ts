@@ -43,6 +43,18 @@ export function isTreeSitterWasmAborted(): boolean {
 	return _wasmAborted;
 }
 
+/**
+ * Re-arm the singleton's web-tree-sitter load latch for a new session
+ * (#1592 review round 2 F2 — the same shape as #1567/#1575's
+ * `resetAstGrepNapiLoadState()`). A no-op if the singleton hasn't been
+ * created yet, or if the WASM runtime already aborted (that case is
+ * process-lifetime by design, see `markTreeSitterWasmAborted` above — a
+ * session boundary is not a process restart, so it stays poisoned).
+ */
+export function resetTreeSitterClientLoadState(): void {
+	_shared?.resetLoadStateForSession();
+}
+
 /** Machine-readable process-wide runtime health for status/reporting surfaces. */
 export function getTreeSitterRuntimeStatus(): TreeSitterRuntimeStatus {
 	return {

@@ -50,6 +50,7 @@ const PROJECT_MARKERS_BY_KIND: Partial<Record<FileKind, readonly string[]>> = {
 	swift: ["Package.swift"],
 	dart: ["pubspec.yaml"],
 	elixir: ["mix.exs"],
+	cue: ["cue.mod"],
 	gleam: ["gleam.toml"],
 	terraform: [".terraform.lock.hcl"],
 	terragrunt: TERRAGRUNT_FILENAMES,
@@ -96,6 +97,7 @@ const ROOT_MARKERS_BY_KIND: Partial<Record<FileKind, readonly string[]>> = {
 	swift: ["Package.swift"],
 	dart: ["pubspec.yaml"],
 	elixir: ["mix.exs"],
+	cue: ["cue.mod", ".git"],
 	gleam: ["gleam.toml"],
 	terraform: [".terraform.lock.hcl"],
 	terragrunt: TERRAGRUNT_FILENAMES,
@@ -106,7 +108,8 @@ const ROOT_MARKERS_BY_KIND: Partial<Record<FileKind, readonly string[]>> = {
 };
 
 function hasProjectMarker(projectRoot: string, marker: string): boolean {
-	if (!marker.includes("*")) return fs.existsSync(path.join(projectRoot, marker));
+	if (!marker.includes("*"))
+		return fs.existsSync(path.join(projectRoot, marker));
 	try {
 		return direntsHaveMarkerGlobMatch(
 			fs.readdirSync(projectRoot, { withFileTypes: true }),
@@ -123,7 +126,10 @@ function hasProjectMarker(projectRoot: string, marker: string): boolean {
 // must not pollute the no-arg cache. The synchronous getSourceFiles() call
 // inside this function does the same expensive ignoreMatcher-driven walk
 // as resolveStartupScanContext, so the same memo strategy applies.
-const languageProfileCache = new BoundedLruCache<string, ProjectLanguageProfile>(32);
+const languageProfileCache = new BoundedLruCache<
+	string,
+	ProjectLanguageProfile
+>(32);
 
 export function detectProjectLanguageProfile(
 	projectRoot: string,
@@ -349,14 +355,24 @@ export async function collectSourceFilesForWarmup(
 			if (entry.isDirectory()) {
 				// Never checked symlinks — always follows them (unlike
 				// source-filter.ts's collectSourceFiles*, refs #191).
-				if (!shouldRecurseIntoDir(entry, fullPath, { ignoreMatcher, followSymlinks: true })) {
+				if (
+					!shouldRecurseIntoDir(entry, fullPath, {
+						ignoreMatcher,
+						followSymlinks: true,
+					})
+				) {
 					continue;
 				}
 				stack.push(fullPath);
 			} else if (entry.isFile()) {
-				if (ignoreMatcher.isIgnored(fullPath, false)) continue;
+				// #1974: cheap extension gate before the ignore matcher — isIgnored is
+				// O(ancestorDirs x patterns) with a per-call minimatch regex compile
+				// (0.68-0.93ms/file, measured), so pay it only for files that already
+				// pass the extension check. A large ignored-but-not-dir-prunable pile
+				// (e.g. wal/*.log) otherwise pays the full isIgnored cost per file.
 				const ext = path.extname(entry.name).toLowerCase();
 				if (!WARMUP_SOURCE_EXTS.has(ext)) continue;
+				if (ignoreMatcher.isIgnored(fullPath, false)) continue;
 				matchedSeen += 1;
 				const bucket = WARMUP_CODE_EXTS.has(ext) ? codeOut : nonCodeOut;
 				// Per-category hard cap — language detection only needs

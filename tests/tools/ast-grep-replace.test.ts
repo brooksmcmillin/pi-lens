@@ -1,11 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
 import { createAstGrepReplaceTool } from "../../tools/ast-grep-replace.js";
 
-function makeClient(overrides: Partial<Parameters<typeof createAstGrepReplaceTool>[0]> = {}) {
+function makeClient(
+	overrides: Partial<Parameters<typeof createAstGrepReplaceTool>[0]> = {},
+) {
 	return {
 		ensureAvailable: async () => true,
 		replace: vi.fn().mockResolvedValue({ matches: [] }),
-		replaceWithRule: vi.fn().mockResolvedValue({ matches: [], totalMatches: 0, applied: false }),
+		replaceWithRule: vi
+			.fn()
+			.mockResolvedValue({ matches: [], totalMatches: 0, applied: false }),
 		formatMatches: () => "",
 		...overrides,
 	} as Parameters<typeof createAstGrepReplaceTool>[0];
@@ -15,7 +19,9 @@ describe("ast_grep_replace tool", () => {
 	describe("schema shape", () => {
 		it("lang uses enum not anyOf/const so LLMs do not double-quote it", () => {
 			const tool = createAstGrepReplaceTool(makeClient());
-			const langSchema = (tool.parameters as { properties: Record<string, unknown> }).properties.lang as Record<string, unknown>;
+			const langSchema = (
+				tool.parameters as { properties: Record<string, unknown> }
+			).properties.lang as Record<string, unknown>;
 			expect(langSchema.type).toBe("string");
 			expect(Array.isArray(langSchema.enum)).toBe(true);
 			expect(langSchema.anyOf).toBeUndefined();
@@ -24,7 +30,9 @@ describe("ast_grep_replace tool", () => {
 
 		it("lang enum includes common languages", () => {
 			const tool = createAstGrepReplaceTool(makeClient());
-			const langSchema = (tool.parameters as { properties: Record<string, unknown> }).properties.lang as { enum: string[] };
+			const langSchema = (
+				tool.parameters as { properties: Record<string, unknown> }
+			).properties.lang as { enum: string[] };
 			expect(langSchema.enum).toContain("typescript");
 			expect(langSchema.enum).toContain("python");
 			expect(langSchema.enum).toContain("rust");
@@ -32,18 +40,28 @@ describe("ast_grep_replace tool", () => {
 
 		it("hasKind description describes immediate-child semantics, not descendant (#1423)", () => {
 			const tool = createAstGrepReplaceTool(makeClient());
-			const properties = (tool.parameters as { properties: Record<string, unknown> }).properties;
+			const properties = (
+				tool.parameters as { properties: Record<string, unknown> }
+			).properties;
 			const hasKindSchema = properties.hasKind as { description: string };
 			expect(hasKindSchema.description).not.toContain("descendant");
-			expect(hasKindSchema.description.toLowerCase()).toContain("immediate child");
+			expect(hasKindSchema.description.toLowerCase()).toContain(
+				"immediate child",
+			);
 		});
 
 		it("advertises hasDescendantKind alongside hasKind (#1423)", () => {
 			const tool = createAstGrepReplaceTool(makeClient());
-			const properties = (tool.parameters as { properties: Record<string, unknown> }).properties;
+			const properties = (
+				tool.parameters as { properties: Record<string, unknown> }
+			).properties;
 			expect(properties).toHaveProperty("hasDescendantKind");
-			const hasDescendantKindSchema = properties.hasDescendantKind as { description: string };
-			expect(hasDescendantKindSchema.description.toLowerCase()).toContain("descendant");
+			const hasDescendantKindSchema = properties.hasDescendantKind as {
+				description: string;
+			};
+			expect(hasDescendantKindSchema.description.toLowerCase()).toContain(
+				"descendant",
+			);
 		});
 	});
 
@@ -111,12 +129,21 @@ describe("ast_grep_replace tool", () => {
 
 	describe("structural-intent parameters (Phase 3)", () => {
 		it("routes to replaceWithRule when insideKind is set", async () => {
-			const replaceWithRule = vi.fn().mockResolvedValue({ matches: [], totalMatches: 0, applied: false });
+			const replaceWithRule = vi
+				.fn()
+				.mockResolvedValue({ matches: [], totalMatches: 0, applied: false });
 			const replace = vi.fn();
-			const tool = createAstGrepReplaceTool(makeClient({ replaceWithRule, replace }));
+			const tool = createAstGrepReplaceTool(
+				makeClient({ replaceWithRule, replace }),
+			);
 			await tool.execute(
 				"r1",
-				{ pattern: "var $X", rewrite: "let $X", lang: "typescript", insideKind: "function_declaration" },
+				{
+					pattern: "var $X",
+					rewrite: "let $X",
+					lang: "typescript",
+					insideKind: "function_declaration",
+				},
 				new AbortController().signal,
 				null,
 				{ cwd: "." },
@@ -126,11 +153,18 @@ describe("ast_grep_replace tool", () => {
 		});
 
 		it("synthesized YAML includes fix field", async () => {
-			const replaceWithRule = vi.fn().mockResolvedValue({ matches: [], totalMatches: 0, applied: false });
+			const replaceWithRule = vi
+				.fn()
+				.mockResolvedValue({ matches: [], totalMatches: 0, applied: false });
 			const tool = createAstGrepReplaceTool(makeClient({ replaceWithRule }));
 			await tool.execute(
 				"r2",
-				{ pattern: "var $X", rewrite: "let $X", lang: "javascript", insideKind: "function_declaration" },
+				{
+					pattern: "var $X",
+					rewrite: "let $X",
+					lang: "javascript",
+					insideKind: "function_declaration",
+				},
 				new AbortController().signal,
 				null,
 				{ cwd: "." },
@@ -144,7 +178,9 @@ describe("ast_grep_replace tool", () => {
 		it("routes to normal replace when no structural params", async () => {
 			const replaceWithRule = vi.fn();
 			const replace = vi.fn().mockResolvedValue({ matches: [] });
-			const tool = createAstGrepReplaceTool(makeClient({ replaceWithRule, replace }));
+			const tool = createAstGrepReplaceTool(
+				makeClient({ replaceWithRule, replace }),
+			);
 			await tool.execute(
 				"r3",
 				{ pattern: "var $X", rewrite: "let $X", lang: "typescript" },
@@ -157,12 +193,21 @@ describe("ast_grep_replace tool", () => {
 		});
 
 		it("routes to replaceWithRule when hasDescendantKind is set, producing stopBy: end (#1423)", async () => {
-			const replaceWithRule = vi.fn().mockResolvedValue({ matches: [], totalMatches: 0, applied: false });
+			const replaceWithRule = vi
+				.fn()
+				.mockResolvedValue({ matches: [], totalMatches: 0, applied: false });
 			const replace = vi.fn();
-			const tool = createAstGrepReplaceTool(makeClient({ replaceWithRule, replace }));
+			const tool = createAstGrepReplaceTool(
+				makeClient({ replaceWithRule, replace }),
+			);
 			await tool.execute(
 				"r4",
-				{ pattern: "var $X", rewrite: "let $X", lang: "typescript", hasDescendantKind: "await_expression" },
+				{
+					pattern: "var $X",
+					rewrite: "let $X",
+					lang: "typescript",
+					hasDescendantKind: "await_expression",
+				},
 				new AbortController().signal,
 				null,
 				{ cwd: "." },

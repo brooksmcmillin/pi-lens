@@ -63,13 +63,15 @@ function severityFor(
 	if (severity === "WillBreak") {
 		return {
 			severity: "warning",
-			message: "Direct caller of a symbol edited this turn — verify this call site still matches its new signature/behavior.",
+			message:
+				"Direct caller of a symbol edited this turn — verify this call site still matches its new signature/behavior.",
 		};
 	}
 	if (severity === "MayBreak") {
 		return {
 			severity: "info",
-			message: "Indirect caller (one hop) of a symbol edited this turn — worth a quick check.",
+			message:
+				"Indirect caller (one hop) of a symbol edited this turn — worth a quick check.",
 		};
 	}
 	return null;
@@ -125,7 +127,10 @@ export function callGraphImpactToProjectDiagnostics(
 
 			const dedupeKey = `${resolvedFile}:${result.symbolKey}`;
 			const existing = byKey.get(dedupeKey);
-			if (existing && SEVERITY_RANK[existing.severity] >= SEVERITY_RANK[mapped.severity]) {
+			if (
+				existing &&
+				SEVERITY_RANK[existing.severity] >= SEVERITY_RANK[mapped.severity]
+			) {
 				continue;
 			}
 

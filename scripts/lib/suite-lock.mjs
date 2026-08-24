@@ -112,7 +112,9 @@ function registerExitCleanup() {
  */
 export function getLockPath() {
 	const override = process.env.PI_LENS_HOME?.trim();
-	const home = override ? path.resolve(override) : path.join(os.homedir(), ".pi-lens");
+	const home = override
+		? path.resolve(override)
+		: path.join(os.homedir(), ".pi-lens");
 	return path.join(home, "test-suite.lock");
 }
 
@@ -194,12 +196,14 @@ async function removeLockWithRetry(lockPath, opts = {}) {
 export async function acquireTestLock(options = {}) {
 	const lockPath = options.lockPath || getLockPath();
 	const pollIntervalMs =
-		options.pollIntervalMs ?? (Number(process.env.PI_LENS_TEST_LOCK_POLL_MS) || 500);
+		options.pollIntervalMs ??
+		(Number(process.env.PI_LENS_TEST_LOCK_POLL_MS) || 500);
 	const heartbeatIntervalMs =
 		options.heartbeatIntervalMs ??
 		(Number(process.env.PI_LENS_TEST_LOCK_HEARTBEAT_MS) || 15_000);
 	const timeoutMs =
-		options.timeoutMs ?? (Number(process.env.PI_LENS_TEST_LOCK_TIMEOUT_MS) || 0);
+		options.timeoutMs ??
+		(Number(process.env.PI_LENS_TEST_LOCK_TIMEOUT_MS) || 0);
 	const staleMaxAgeMs = options.staleMaxAgeMs ?? 5 * 60_000;
 	const log = options.log || ((message) => console.error(message));
 
@@ -214,7 +218,10 @@ export async function acquireTestLock(options = {}) {
 			const handle = await fsp.open(lockPath, "wx");
 			try {
 				await handle.writeFile(
-					JSON.stringify({ pid: process.pid, startedIso: new Date().toISOString() }),
+					JSON.stringify({
+						pid: process.pid,
+						startedIso: new Date().toISOString(),
+					}),
 				);
 			} finally {
 				await handle.close();
@@ -248,7 +255,11 @@ export async function acquireTestLock(options = {}) {
 			// exactly like EEXIST — contended, retry — rather than throwing;
 			// otherwise a real two-waiter release/re-acquire handoff can
 			// randomly crash the second waiter instead of letting it proceed.
-			if (error.code !== "EEXIST" && error.code !== "EBUSY" && error.code !== "EPERM") {
+			if (
+				error.code !== "EEXIST" &&
+				error.code !== "EBUSY" &&
+				error.code !== "EPERM"
+			) {
 				throw error;
 			}
 
@@ -265,7 +276,12 @@ export async function acquireTestLock(options = {}) {
 			}
 
 			let stale = false;
-			if (owner && typeof owner.pid === "number" && Number.isInteger(owner.pid) && owner.pid > 0) {
+			if (
+				owner &&
+				typeof owner.pid === "number" &&
+				Number.isInteger(owner.pid) &&
+				owner.pid > 0
+			) {
 				// Immediate takeover as soon as the recorded PID is confirmed
 				// dead — no age/timeout wait required (point 3 above).
 				stale = !isProcessAlive(owner.pid);
@@ -310,6 +326,12 @@ export async function acquireTestLock(options = {}) {
 
 			const now = Date.now();
 			if (timeoutMs > 0 && now - start > timeoutMs) {
+				// Message shape is pinned: tests/scripts/suite-lock.test.ts:233
+				// asserts against it directly, and scripts/pre-push-targeted-tests.mjs
+				// greps a caller's stderr for "timed out after \d+ms waiting for
+				// test-suite lock" to tell a lock timeout (push proceeds, #1804 F2)
+				// apart from a real test failure (push blocks). Reword both call
+				// sites together with this string.
 				throw new Error(
 					`timed out after ${timeoutMs}ms waiting for test-suite lock held by ${describeOwner(owner)}`,
 				);

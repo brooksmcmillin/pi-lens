@@ -79,9 +79,7 @@ afterEach(() => {
  * the mount under test.
  */
 describe("widget mounting is mode-derived (#1334 S2)", () => {
-	async function toggleTwice(
-		mode: "tui" | "rpc" | "json" | "print" | null,
-	) {
+	async function toggleTwice(mode: "tui" | "rpc" | "json" | "print" | null) {
 		const pi = createPiMock();
 		extension(pi.asExtensionAPI());
 		const ctx = makeCtx({ cwd: tmpProject(), mode });
@@ -139,8 +137,16 @@ describe("widget mounting is mode-derived (#1334 S2)", () => {
 		await pi.runCommand("lens-widget-toggle", "", ctxA);
 		await pi.emit("turn_start", {}, ctxB);
 
-		expect(setWidgetA.mock.calls.filter(([, content]) => typeof content === "function")).toHaveLength(1);
-		expect(setWidgetB.mock.calls.filter(([, content]) => typeof content === "function")).toHaveLength(1);
+		expect(
+			setWidgetA.mock.calls.filter(
+				([, content]) => typeof content === "function",
+			),
+		).toHaveLength(1);
+		expect(
+			setWidgetB.mock.calls.filter(
+				([, content]) => typeof content === "function",
+			),
+		).toHaveLength(1);
 	});
 
 	it("does not resurrect a widget toggled off before a UI replacement (#1381)", async () => {
@@ -165,8 +171,12 @@ describe("widget mounting is mode-derived (#1334 S2)", () => {
 		const ctx = makeCtx({ cwd: tmpProject(), mode: "tui" });
 		delete (ctx.ui as { setWidget?: unknown }).setWidget;
 
-		await expect(pi.runCommand("lens-widget-toggle", "", ctx)).resolves.toBeUndefined();
-		await expect(pi.runCommand("lens-widget-toggle", "", ctx)).resolves.toBeUndefined();
+		await expect(
+			pi.runCommand("lens-widget-toggle", "", ctx),
+		).resolves.toBeUndefined();
+		await expect(
+			pi.runCommand("lens-widget-toggle", "", ctx),
+		).resolves.toBeUndefined();
 		await expect(pi.emit("turn_start", {}, ctx)).resolves.toBeUndefined();
 
 		expect(

@@ -5,7 +5,7 @@ import type { ExtensionRunMode } from "./extension-mode.js";
 import type { ProjectTrustState } from "./project-trust.js";
 import type { UserNotifyLevel } from "./user-notify.js";
 
-export type HostLogSink = (entry: object) => void;
+export type HostLogSink = (entry: Record<string, unknown>) => void;
 
 export interface HostPorts {
 	readonly notify: {
@@ -92,6 +92,14 @@ export function createDefaultHostPorts(
 		flags: { get: () => undefined },
 		tools: { has: async () => false, getActive: () => [], setActive: () => {} },
 	};
+	// SAFETY: `Object.fromEntries` is typed `Record<string, T>` — it cannot
+	// carry the key literals or the per-group value types through. The keys
+	// come from `Object.entries(defaults)`, and `defaults` is declared as a
+	// complete `HostPorts`, so every group is present; each value is that
+	// group's default spread-merged with the same group's override, so no
+	// group's member set shrinks. Add a group to `HostPorts` without adding it
+	// to `defaults` and this cast becomes a lie, which is why `defaults` is
+	// annotated rather than inferred.
 	return Object.fromEntries(
 		Object.entries(defaults).map(([group, value]) => [
 			group,

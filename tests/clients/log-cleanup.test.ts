@@ -142,7 +142,9 @@ describe("getManagedLogFiles — auto-derivation", () => {
 	});
 
 	it("does not leak a registration made against a different directory", () => {
-		const otherDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-logclean-other-"));
+		const otherDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-logclean-other-"),
+		);
 		try {
 			createNdjsonLogger({ filePath: path.join(otherDir, "elsewhere.log") });
 			expect(getManagedLogFiles(dir)).not.toContain("elsewhere.log");

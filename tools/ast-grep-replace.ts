@@ -12,7 +12,10 @@ import {
 	logAstGrepToolEvent,
 	type AstGrepToolOutcome,
 } from "../clients/ast-grep-tool-logger.js";
-import { hasStructuralIntent, synthesizeReplaceRule } from "../clients/ast-grep-yaml-synth.js";
+import {
+	hasStructuralIntent,
+	synthesizeReplaceRule,
+} from "../clients/ast-grep-yaml-synth.js";
 import { compactRenderResult } from "./render-compact.js";
 
 /**
@@ -82,7 +85,10 @@ export function createAstGrepReplaceTool(astGrepClient: AstGrepClient) {
 				Type.Array(Type.String(), { description: "Specific files/folders" }),
 			),
 			insideKind: Type.Optional(
-				Type.String({ description: "Restrict matches to nodes inside an ancestor of this AST node kind. Synthesizes a YAML rule." }),
+				Type.String({
+					description:
+						"Restrict matches to nodes inside an ancestor of this AST node kind. Synthesizes a YAML rule.",
+				}),
 			),
 			hasKind: Type.Optional(
 				Type.String({
@@ -97,10 +103,16 @@ export function createAstGrepReplaceTool(astGrepClient: AstGrepClient) {
 				}),
 			),
 			follows: Type.Optional(
-				Type.String({ description: "Restrict matches to nodes that immediately follow a sibling matching this pattern." }),
+				Type.String({
+					description:
+						"Restrict matches to nodes that immediately follow a sibling matching this pattern.",
+				}),
 			),
 			precedes: Type.Optional(
-				Type.String({ description: "Restrict matches to nodes that immediately precede a sibling matching this pattern." }),
+				Type.String({
+					description:
+						"Restrict matches to nodes that immediately precede a sibling matching this pattern.",
+				}),
 			),
 			apply: Type.Optional(
 				Type.Boolean({ description: "Apply changes (default: false)" }),
@@ -121,8 +133,18 @@ export function createAstGrepReplaceTool(astGrepClient: AstGrepClient) {
 			ctx: { cwd?: string },
 		) {
 			const startedAt = Date.now();
-			const { pattern, rewrite, paths, apply, strictness,
-				insideKind, hasKind, hasDescendantKind, follows, precedes } = params as {
+			const {
+				pattern,
+				rewrite,
+				paths,
+				apply,
+				strictness,
+				insideKind,
+				hasKind,
+				hasDescendantKind,
+				follows,
+				precedes,
+			} = params as {
 				pattern: string;
 				rewrite: string;
 				lang: string;
@@ -191,26 +213,86 @@ export function createAstGrepReplaceTool(astGrepClient: AstGrepClient) {
 			const searchPaths = paths?.length ? paths : [ctx.cwd || "."];
 
 			// Phase 3: structural-intent params → synthesize YAML with fix: field
-			if (hasStructuralIntent({ insideKind, hasKind, hasDescendantKind, follows, precedes })) {
+			if (
+				hasStructuralIntent({
+					insideKind,
+					hasKind,
+					hasDescendantKind,
+					follows,
+					precedes,
+				})
+			) {
 				let ruleYaml: string;
 				try {
-					ruleYaml = synthesizeReplaceRule({ pattern, lang, rewrite, insideKind, hasKind, hasDescendantKind, follows, precedes });
+					ruleYaml = synthesizeReplaceRule({
+						pattern,
+						lang,
+						rewrite,
+						insideKind,
+						hasKind,
+						hasDescendantKind,
+						follows,
+						precedes,
+					});
 				} catch (err) {
 					logOutcome("error", { errorRaw: String(err) });
-					return { content: [{ type: "text" as const, text: `Error synthesizing rule: ${err}` }], isError: true, details: {} };
+					return {
+						content: [
+							{
+								type: "text" as const,
+								text: `Error synthesizing rule: ${err}`,
+							},
+						],
+						isError: true,
+						details: {},
+					};
 				}
-				const ruleResult = await astGrepClient.replaceWithRule(ruleYaml, searchPaths, applyFlag);
+				const ruleResult = await astGrepClient.replaceWithRule(
+					ruleYaml,
+					searchPaths,
+					applyFlag,
+				);
 				if (ruleResult.stalePreview) {
 					logOutcome("error", { errorRaw: "stale_preview" });
-					return { content: [{ type: "text" as const, text: "Stale preview — pattern no longer matches. Re-run with apply: false." }], isError: true, details: { stalePreview: true } };
+					return {
+						content: [
+							{
+								type: "text" as const,
+								text: "Stale preview — pattern no longer matches. Re-run with apply: false.",
+							},
+						],
+						isError: true,
+						details: { stalePreview: true },
+					};
 				}
 				if (ruleResult.error) {
 					logOutcome("error", { errorRaw: ruleResult.error });
-					return { content: [{ type: "text" as const, text: errorTextWithHint(ruleResult.error) }], isError: true, details: {} };
+					return {
+						content: [
+							{
+								type: "text" as const,
+								text: errorTextWithHint(ruleResult.error),
+							},
+						],
+						isError: true,
+						details: {},
+					};
 				}
-				const output = astGrepClient.formatMatches(ruleResult.matches, !applyFlag, true);
-				logOutcome(ruleResult.matches.length === 0 ? "no_matches" : "success", { matchCount: ruleResult.matches.length });
-				return { content: [{ type: "text" as const, text: output }], details: { matchCount: ruleResult.matches.length, applied: applyFlag } };
+				const output = astGrepClient.formatMatches(
+					ruleResult.matches,
+					!applyFlag,
+					true,
+				);
+				logOutcome(ruleResult.matches.length === 0 ? "no_matches" : "success", {
+					matchCount: ruleResult.matches.length,
+				});
+				return {
+					content: [{ type: "text" as const, text: output }],
+					details: {
+						matchCount: ruleResult.matches.length,
+						applied: applyFlag,
+					},
+				};
 			}
 
 			const result = await astGrepClient.replace(

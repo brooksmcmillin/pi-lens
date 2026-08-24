@@ -215,7 +215,9 @@ describe("ignore-matcher cache freshness (#1105 mtime+size)", () => {
 		);
 		fs.utimesSync(configPath, pinned, pinned);
 		const first = getProjectIgnoreMatcher(tmpDir);
-		expect(first.isIgnored(path.join(tmpDir, "skip-old/x.ts"), false)).toBe(true);
+		expect(first.isIgnored(path.join(tmpDir, "skip-old/x.ts"), false)).toBe(
+			true,
+		);
 
 		// Shorter, different config; restore the SAME mtime.
 		fs.writeFileSync(

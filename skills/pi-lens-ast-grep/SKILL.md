@@ -62,6 +62,8 @@ Use these instead of writing raw YAML:
 
 `hasKind` and `hasDescendantKind` are mutually exclusive on both tools — combining them errors.
 
+⚠ `insideKind` searches ALL ancestors (`stopBy: end`) with no boundary of its own — on a deeply nested file it can escalate past the enclosing function you meant and match against an unrelated outer scope; scope with `paths` or a raw YAML `rule:` with its own `stopBy` boundary if that matters.
+
 ```
 # console.log only inside functions
 ast_grep_search pattern="console.log($MSG)" lang="typescript" insideKind="function_declaration"

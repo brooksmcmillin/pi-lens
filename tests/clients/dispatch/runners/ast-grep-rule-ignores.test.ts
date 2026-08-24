@@ -42,19 +42,15 @@ describe("no-console-except-error ignores CLI scripts and logger sinks (#965)", 
 			'console.log("benchmark result: 12ms");\n',
 		);
 		const result = await astGrepNapiRunner.run(ctx);
-		expect(linesFor(result.diagnostics, "no-console-except-error")).toEqual(
-			[],
-		);
+		expect(linesFor(result.diagnostics, "no-console-except-error")).toEqual([]);
 	});
 
 	it("does not flag console output inside a logger.ts implementation", async () => {
 		const { ctx } = env.addFile(
 			"lib/logger.ts",
-			'export function warn(msg: string) { console.warn(msg); }\n',
+			"export function warn(msg: string) { console.warn(msg); }\n",
 		);
 		const result = await astGrepNapiRunner.run(ctx);
-		expect(linesFor(result.diagnostics, "no-console-except-error")).toEqual(
-			[],
-		);
+		expect(linesFor(result.diagnostics, "no-console-except-error")).toEqual([]);
 	});
 });

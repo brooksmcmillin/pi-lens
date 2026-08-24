@@ -59,6 +59,16 @@ export const TREE_CACHE_COUNTER_KEYS = [
 ] as const satisfies readonly (keyof TreeCacheCounters)[];
 
 export function createTreeCacheCounters(): TreeCacheCounters {
+	// SAFETY: `Object.fromEntries` returns `Record<string, number>` — it cannot
+	// prove the key set. `TREE_CACHE_COUNTER_KEYS` is declared `as const
+	// satisfies readonly (keyof TreeCacheCounters)[]`, so the compiler already
+	// rejects a key that is not a counter; every counter is a `number` and
+	// every key gets 0, so the result has the full shape. The `satisfies`
+	// clause does NOT check the reverse direction: add a counter to
+	// `TreeCacheCounters` without adding its key here and this cast becomes a
+	// lie. `tests/clients/tree-sitter-cache.test.ts` closes that direction with
+	// a compile-time `[Exclude<keyof TreeCacheCounters, …>] extends [never]`
+	// assertion, so a missing key fails `tsc`, not just the suite.
 	return Object.fromEntries(
 		TREE_CACHE_COUNTER_KEYS.map((key) => [key, 0]),
 	) as unknown as TreeCacheCounters;
@@ -77,6 +87,55 @@ export type TreeCacheCounterObserver = (
 	amount: number,
 ) => void;
 
+/** Interactive-editing default: safe LRU footprint for per-edit locality. */
+export const TREE_CACHE_DEFAULT_MAX_SIZE = 50;
+
+/**
+ * Hard ceiling on how far a full-project scan may grow the tree cache
+ * (#1715). Entry count is not the resource that matters — WASM heap is
+ * (#417/#418, the leak this cache was fixed for once already) — so growing
+ * capacity to fit a scan's working set must still cap the heap's worst case,
+ * not just stop counting entries.
+ *
+ * Measured empirically on a fresh process (`heap-measure.mjs`, dropped from
+ * this PR — see the PR body): parsing 800 synthetic ~3.6KB TypeScript files
+ * with all 800 trees held resident (no eviction) grows `process.memoryUsage()
+ * .external` by ~254MB over the same run with only 1 tree resident at a
+ * time — about 330KB of non-V8 (WASM-backed) heap per resident tree on that
+ * sample. At the interactive default of 50 entries that is a ~16MB
+ * worst case; at this 500-entry ceiling it is a ~165MB worst case — bounded
+ * and stated, not unbounded growth.
+ */
+export const TREE_CACHE_SCAN_CAPACITY_CEILING = 500;
+
+/**
+ * Derive the capacity a full-project scan should grow the tree cache to
+ * (#1715): span the scan's file count so a second scan over the same files
+ * reuses every tree instead of re-parsing files the LRU evicted at the
+ * interactive default — bounded by `TREE_CACHE_SCAN_CAPACITY_CEILING` (or
+ * its `PI_LENS_TREE_SITTER_CACHE_SCAN_CAP` override) so the heap cost stated
+ * above stays a real ceiling. Never shrinks a capacity the cache already
+ * has — a later, smaller scan (or an unrelated caller) must not undo an
+ * earlier grow.
+ */
+export function deriveScanTreeCacheCapacity(
+	fileCount: number,
+	currentMaxSize: number,
+): number {
+	const envRaw = process.env.PI_LENS_TREE_SITTER_CACHE_SCAN_CAP;
+	const envValue =
+		envRaw !== undefined ? Number.parseInt(envRaw, 10) : Number.NaN;
+	const ceiling =
+		Number.isSafeInteger(envValue) && envValue > 0
+			? envValue
+			: TREE_CACHE_SCAN_CAPACITY_CEILING;
+	const target = Math.min(
+		Math.max(fileCount, TREE_CACHE_DEFAULT_MAX_SIZE),
+		ceiling,
+	);
+	return Math.max(currentMaxSize, target);
+}
+
 export class TreeCache {
 	private cache = new Map<string, CachedTree>();
 	private recentlyEvicted = new Map<string, string>();
@@ -88,7 +147,7 @@ export class TreeCache {
 	private treeErrorObserver: ((error: unknown) => void) | undefined;
 
 	constructor(
-		maxSize = 50,
+		maxSize = TREE_CACHE_DEFAULT_MAX_SIZE,
 		debug = false,
 		evictionHistoryMax = 4096,
 		counterObserver?: TreeCacheCounterObserver,
@@ -111,6 +170,32 @@ export class TreeCache {
 	private recordCounter(key: keyof TreeCacheCounters, amount = 1): void {
 		this.counters[key] += amount;
 		this.counterObserver?.(key, amount);
+	}
+
+	/** Current capacity ceiling (entry count, not bytes — see class docstring). */
+	getMaxSize(): number {
+		return this.maxSize;
+	}
+
+	/**
+	 * Resize the capacity ceiling (#1715). Growing only changes the bound —
+	 * existing entries are untouched. Shrinking evicts the LRU tail down to
+	 * the new size through the same `removeEntry` path eviction uses, so a
+	 * shrink still frees every dropped tree's WASM heap (#417) instead of
+	 * silently orphaning it. `n` is floored at 1: a cache that can hold zero
+	 * entries can never record a hit.
+	 */
+	setMaxSize(n: number): void {
+		const next = Math.max(1, Math.floor(n));
+		this.maxSize = next;
+		while (this.cache.size > this.maxSize) {
+			const firstKey = this.cache.keys().next().value;
+			if (firstKey === undefined) break;
+			const evicted = this.cache.get(firstKey);
+			if (evicted) this.rememberEviction(firstKey, evicted);
+			this.recordCounter("evictions");
+			this.removeEntry(firstKey);
+		}
 	}
 
 	/**

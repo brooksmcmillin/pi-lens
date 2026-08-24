@@ -11,8 +11,21 @@ import {
 	createAvailabilityChecker,
 	resolveToolCommandWithInstallFallback,
 } from "./utils/runner-helpers.js";
+import type { ToolExitCodes } from "./utils/spawn-outcome.js";
+import { parseToolRun } from "./utils/tool-failure.js";
+import { finishParsedRun } from "./utils/tool-failure.js";
 
 const sqlfluff = createAvailabilityChecker("sqlfluff", ".exe");
+
+// sqlfluff exit codes (its CLI docs): 0 = clean, 1 = violations found, 2 = a
+// user error that stopped the lint (unknown dialect, unreadable config).
+// Only 2 is a rejected invocation.
+//
+// The exit TABLE is what protects this runner, not the nothing-to-parse rule:
+// sqlfluff writes its user errors to STDOUT, not stderr (live: an unknown
+// dialect prints the error there), so stdout is non-empty and the fallback
+// rule would read the failed run as a run that found nothing.
+const SQLFLUFF_EXIT_CODES: ToolExitCodes = { ran: [1] };
 
 export { hasSqlfluffConfig };
 
@@ -141,7 +154,7 @@ const sqlfluffRunner: RunnerDefinition = {
 		}
 
 		let cmd: string | null = null;
-		if (await (sqlfluff.isAvailableAsync(cwd))) {
+		if (await sqlfluff.isAvailableAsync(cwd)) {
 			cmd = sqlfluff.getCommand(cwd);
 		} else {
 			cmd = await resolveToolCommandWithInstallFallback(cwd, "sqlfluff");
@@ -149,25 +162,46 @@ const sqlfluffRunner: RunnerDefinition = {
 
 		if (!cmd) return { status: "skipped", diagnostics: [], semantic: "none" };
 
-		const args = ["lint", "--format", "json", ctx.filePath];
+		// #1937: this used to be `args.splice(2, 0, "--dialect", "ansi")` on
+		// `["lint", "--format", "json", file]`, which inserts BETWEEN the flag
+		// and its value and yields `lint --format --dialect ansi json file`.
+		// sqlfluff rejects `--dialect` as the value of `--format` and exits 2,
+		// so every SQL project WITHOUT a .sqlfluff — exactly the case this
+		// dialect default exists to serve — was never linted. Built in order
+		// rather than patched by index, and pinned by the argv-tie assertion
+		// in runners/captured-real-output.test.ts.
+		const args = ["lint", "--format", "json"];
 		if (!hasConfig) {
-			args.splice(2, 0, "--dialect", "ansi");
+			args.push("--dialect", "ansi");
 		}
+		args.push(ctx.filePath);
 
 		const result = await safeSpawnAsync(cmd, args, {
 			timeout: 20000,
+			cwd,
 		});
 
-		const diagnostics = parseSqlfluffOutput(result.stdout ?? "", ctx.filePath);
-		if (diagnostics.length === 0) {
-			return { status: "succeeded", diagnostics: [], semantic: "none" };
-		}
+		// #1816: this runner read `result.status` zero times, so a user error
+		// fell through `parseSqlfluffOutput`'s JSON catch to zero violations and
+		// reported the SQL file as clean.
+		// #1948: sqlfluff exit 1 with a JSON report we read nothing out of is a
+		// parser break, not a clean file.
+		const run = parseToolRun(
+			"sqlfluff",
+			{ result, exitCodes: SQLFLUFF_EXIT_CODES },
+			(out) => parseSqlfluffOutput(out, ctx.filePath),
+			{ parseOutput: result.stdout ?? "" },
+		);
+		if (run.skipped) return run.skipped;
 
-		return {
-			status: "failed",
+		const diagnostics = run.diagnostics;
+		return finishParsedRun({
+			tool: "sqlfluff",
+			ctx,
+			result,
 			diagnostics,
-			semantic: "warning",
-		};
+			classify: () => ({ status: "failed", semantic: "warning" }),
+		});
 	},
 };
 

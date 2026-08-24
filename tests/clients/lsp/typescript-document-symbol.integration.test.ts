@@ -88,9 +88,10 @@ describe.skipIf(!RUN_REAL_TS_DOCUMENT_SYMBOL)(
 			console.info(`TS documentSymbol grounding: ${JSON.stringify(result)}`);
 
 			expect(result.launchVariant).toBe("native-ts7");
-			expect(["hierarchical DocumentSymbol[]", "flat SymbolInformation[]"]).toContain(
-				result.responseShape,
-			);
+			expect([
+				"hierarchical DocumentSymbol[]",
+				"flat SymbolInformation[]",
+			]).toContain(result.responseShape);
 			expect(result.classSymbol).toMatchObject({
 				name: "TreeSitterClient",
 				kind: 5,

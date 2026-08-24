@@ -30,10 +30,9 @@ vi.mock("../../clients/warm-attach.js", () => ({
 // the property under test (never >1 in-flight touch per server group),
 // rather than a mock that would trivially satisfy it either way.
 vi.mock("../../clients/lsp/index.js", async () => {
-	const actual =
-		await vi.importActual<typeof import("../../clients/lsp/index.js")>(
-			"../../clients/lsp/index.js",
-		);
+	const actual = await vi.importActual<
+		typeof import("../../clients/lsp/index.js")
+	>("../../clients/lsp/index.js");
 	return {
 		...actual,
 		getLSPService: () => mocked.service,
@@ -163,8 +162,11 @@ describe("lsp_diagnostics tool", () => {
 				(mocked.service as { openFile: ReturnType<typeof vi.fn> }).openFile,
 			).toHaveBeenCalledTimes(2);
 			expect(
-				(mocked.service as { runWorkspaceDiagnostics: ReturnType<typeof vi.fn> })
-					.runWorkspaceDiagnostics,
+				(
+					mocked.service as {
+						runWorkspaceDiagnostics: ReturnType<typeof vi.fn>;
+					}
+				).runWorkspaceDiagnostics,
 			).not.toHaveBeenCalled();
 		} finally {
 			removeTempDirSync(tmpDir);
@@ -186,7 +188,9 @@ describe("lsp_diagnostics tool", () => {
 				null,
 				{ cwd: tmpDir },
 			)) as any;
-			expect(normalized.details?.outcomes?.[0]?.file).toBe(path.normalize(file));
+			expect(normalized.details?.outcomes?.[0]?.file).toBe(
+				path.normalize(file),
+			);
 
 			const overCap = (await tool.execute(
 				"diag-over-cap",
@@ -233,7 +237,9 @@ describe("lsp_diagnostics tool", () => {
 				unsupported: 1,
 				unavailable: 1,
 			});
-			expect(result.details?.outcomes.map((entry: any) => entry.file)).toEqual(files);
+			expect(result.details?.outcomes.map((entry: any) => entry.file)).toEqual(
+				files,
+			);
 			expect(String(result.content[0]?.text)).toContain("Outcomes:");
 		} finally {
 			removeTempDirSync(tmpDir);
@@ -371,9 +377,11 @@ describe("lsp_diagnostics tool", () => {
 			expect(result.details?.totalDiagnostics).toBe(0);
 			expect(String(result.content[0]?.text)).toContain("Files scanned: 1");
 
-			const openFile = (mocked.service as {
-				openFile: ReturnType<typeof vi.fn>;
-			}).openFile;
+			const openFile = (
+				mocked.service as {
+					openFile: ReturnType<typeof vi.fn>;
+				}
+			).openFile;
 			const opened = openFile.mock.calls.map(([filePath]) =>
 				path.relative(tmpDir, String(filePath)).replace(/\\/g, "/"),
 			);
@@ -616,7 +624,10 @@ describe("lsp_diagnostics tool", () => {
 	describe("#611 tsserver sync escape hatch", () => {
 		function mockExecuteCommand(
 			bodies: Partial<
-				Record<"semanticDiagnosticsSync" | "syntacticDiagnosticsSync", unknown[]>
+				Record<
+					"semanticDiagnosticsSync" | "syntacticDiagnosticsSync",
+					unknown[]
+				>
 			>,
 		) {
 			return vi
@@ -1017,10 +1028,7 @@ describe("lsp_diagnostics tool", () => {
 	});
 
 	describe("silent-clean confirmation provenance", () => {
-		async function runMarkdown(
-			args: Record<string, unknown>,
-			files: string[],
-		) {
+		async function runMarkdown(args: Record<string, unknown>, files: string[]) {
 			const tool = createLspDiagnosticsTool();
 			return (await tool.execute(
 				"diag-marksman-confirmation",
@@ -1078,11 +1086,17 @@ describe("lsp_diagnostics tool", () => {
 			const files = ["a.md", "b.md", "c.md", "d.md"].map((name) =>
 				path.join(tmpDir, name),
 			);
-			for (const file of files) fs.writeFileSync(file, `# ${path.basename(file)}\n`);
+			for (const file of files)
+				fs.writeFileSync(file, `# ${path.basename(file)}\n`);
 
 			try {
 				const result = await runMarkdown(
-					{ paths: files, severity: "all", serverScope: "primary", waitMs: 500 },
+					{
+						paths: files,
+						severity: "all",
+						serverScope: "primary",
+						waitMs: 500,
+					},
 					files,
 				);
 				expect(result.details?.cleanFiles).toBe(4);
@@ -1110,10 +1124,9 @@ describe("lsp_diagnostics tool", () => {
 			fs.writeFileSync(file, "# Example\n");
 
 			try {
-				const result = await runMarkdown(
-					{ paths: [file], severity: "all" },
-					[file],
-				);
+				const result = await runMarkdown({ paths: [file], severity: "all" }, [
+					file,
+				]);
 				expect(touchFile).toHaveBeenCalledWith(
 					file,
 					"# Example\n",
@@ -1311,7 +1324,9 @@ describe("lsp_diagnostics tool", () => {
 			const executeCommand = vi.fn();
 			(mocked.service as any).getAdvertisedCommands = getAdvertisedCommands;
 			(mocked.service as any).executeCommand = executeCommand;
-			(mocked.service as any).touchFile = vi.fn().mockResolvedValue({ diags: [] });
+			(mocked.service as any).touchFile = vi
+				.fn()
+				.mockResolvedValue({ diags: [] });
 			const tmpDir = fs.mkdtempSync(
 				path.join(os.tmpdir(), "pi-lens-marksman-unconfirmed-"),
 			);
@@ -1615,10 +1630,9 @@ describe("lsp_diagnostics tool", () => {
 				// tokens directly: clean settled first with token 2, while the old
 				// blocker settled second with token 1 and is dropped by the real
 				// reconcile guard.
-				expect(reconcileScanDiagnosticsMock.mock.calls.map((call) => call[3])).toEqual([
-					2,
-					1,
-				]);
+				expect(
+					reconcileScanDiagnosticsMock.mock.calls.map((call) => call[3]),
+				).toEqual([2, 1]);
 				expect(reconcileScanDiagnosticsMock.mock.calls[0]?.[1]).toEqual([]);
 			} finally {
 				removeTempDirSync(tmpDir);
@@ -1701,7 +1715,9 @@ describe("lsp_diagnostics tool", () => {
 		it("does NOT reconcile a NON-EMPTY result whose binding mismatches disk (T2 headline #1092)", async () => {
 			const touchFile = vi
 				.fn()
-				.mockResolvedValue(staleTouchResult(["stale error from a pre-fix view"], false));
+				.mockResolvedValue(
+					staleTouchResult(["stale error from a pre-fix view"], false),
+				);
 			(mocked.service as any).touchFile = touchFile;
 			const tmpDir = fs.mkdtempSync(
 				path.join(os.tmpdir(), "pi-lens-lsp-diag-binding-mismatch-"),
@@ -1907,7 +1923,11 @@ describe("lsp_diagnostics tool", () => {
 			try {
 				const result = (await tool.execute(
 					"diag-nosemgrep-batch",
-					{ paths: [suppressed, unsuppressed], severity: "all", concurrency: 2 },
+					{
+						paths: [suppressed, unsuppressed],
+						severity: "all",
+						concurrency: 2,
+					},
 					new AbortController().signal,
 					null,
 					{ cwd: "." },
@@ -2035,7 +2055,9 @@ describe("lsp_diagnostics tool", () => {
 				},
 				source: "typescript",
 			};
-			const touchFile = vi.fn().mockResolvedValue({ diags: [primaryOnlyDiagnostic] });
+			const touchFile = vi
+				.fn()
+				.mockResolvedValue({ diags: [primaryOnlyDiagnostic] });
 			(mocked.service as any).touchFile = touchFile;
 			// If the bug regresses (a second, unscoped getDiagnostics() call feeds
 			// the actual content) this mock would return an aux-scanner finding

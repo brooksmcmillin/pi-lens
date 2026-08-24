@@ -123,7 +123,11 @@ export interface PiMock {
 	/** Run every handler registered for `event`; return the last defined result. */
 	emit(event: string, payload?: unknown, ctx?: unknown): Promise<unknown>;
 	/** Invoke a registered command's handler. */
-	runCommand(name: string, args?: string, ctx?: ExtensionCommandContext): Promise<void>;
+	runCommand(
+		name: string,
+		args?: string,
+		ctx?: ExtensionCommandContext,
+	): Promise<void>;
 	/** Cast to the host type for `extension(pi.asExtensionAPI())`. */
 	asExtensionAPI(): ExtensionAPI;
 }
@@ -278,6 +282,14 @@ export function makeCtx(
 		 * pi-lens must then behave exactly as it did before mode awareness.
 		 */
 		mode: "tui" | "rpc" | "json" | "print" | null;
+		/**
+		 * #1655 item 2: the host's live `Model` behind `ctx.model`
+		 * (`ExtensionContext.model` → `AgentSession.model`). pi-lens reads its
+		 * telemetry identity from HERE, not from any event field — pi sets none
+		 * of `provider`/`model`/`sessionId` on a `session_start` or a
+		 * `tool_result` payload. Omit to simulate a host with no model selected.
+		 */
+		model: { id: string; provider: string } | undefined;
 	}> = {},
 ): MockCtx {
 	const notifications: CapturedNotification[] = [];
@@ -315,7 +327,7 @@ export function makeCtx(
 		sessionManager: {
 			getSessionId: () => overrides.sessionId,
 		},
-		model: undefined,
+		model: overrides.model,
 		signal: undefined,
 		isIdle: () => true,
 		hasPendingMessages: () => false,
@@ -342,5 +354,62 @@ export function makeCtx(
 		(ctx as Record<string, unknown>).mode = overrides.mode;
 	}
 
+	return ctx as unknown as MockCtx;
+}
+
+/**
+ * The exact message the pi SDK's `assertActive()` throws from every accessor
+ * on a context invalidated by `ctx.newSession()`, `ctx.fork()`,
+ * `ctx.switchSession()`, or `ctx.reload()`
+ * (`core/extensions/loader.js` in the installed
+ * `@earendil-works/pi-coding-agent`).
+ */
+export const STALE_CTX_MESSAGE =
+	"This extension ctx is stale after session replacement or reload. " +
+	"Do not use a captured pi or command ctx after ctx.newSession(), " +
+	"ctx.fork(), ctx.switchSession(), or ctx.reload().";
+
+/**
+ * A context the SDK has invalidated (#1925). Every accessor pi wraps in
+ * `assertActive()` throws `STALE_CTX_MESSAGE`; nothing else is defined, so a
+ * handler that reads any of them without a guard rejects exactly the way it
+ * does in production after a session replacement.
+ *
+ * Modelled as throwing GETTERS rather than a throw-everything Proxy on
+ * purpose: the real ctx is a class instance, so an undeclared property
+ * (`then`, `Symbol.toPrimitive`) reads `undefined` instead of throwing, and a
+ * Proxy would make `await`ing or interpolating the object throw in ways the
+ * SDK never does.
+ */
+export function makeStaleCtx(): MockCtx {
+	const ctx = {} as Record<string | symbol, unknown>;
+	// Every `assertActive()`-wrapped accessor on ExtensionContext.
+	const guarded = [
+		"ui",
+		"cwd",
+		"mode",
+		"hasUI",
+		"signal",
+		"sessionManager",
+		"model",
+		"isProjectTrusted",
+		"isIdle",
+		"hasPendingMessages",
+		"abort",
+		"shutdown",
+		"getContextUsage",
+		"compact",
+		"getSystemPrompt",
+		"waitForIdle",
+	];
+	for (const name of guarded) {
+		Object.defineProperty(ctx, name, {
+			configurable: true,
+			enumerable: true,
+			get() {
+				throw new Error(STALE_CTX_MESSAGE);
+			},
+		});
+	}
 	return ctx as unknown as MockCtx;
 }

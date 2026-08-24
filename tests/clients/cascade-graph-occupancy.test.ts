@@ -98,47 +98,65 @@ describe(`cascade graph rebuild event-loop occupancy (~${TREE_SIZE} files)`, () 
 		},
 	);
 
-	it("main-thread reverse-dependency delta patch stays under the sync-block budget", { retry: 2, timeout: 60_000 }, async () => {
-		const index = {
-			projectRoot: tmpDir,
-			generatedAt: new Date().toISOString(),
-			imports: Object.fromEntries(
-				Array.from({ length: 200 }, (_, i) => [`file-${i}.ts`, []]),
-			),
-			importedBy: {},
-			source: "review-graph" as const,
-		};
-		const changes = Array.from({ length: 200 }, (_, i) => ({
-			filePath: path.join(tmpDir, `file-${i}.ts`),
-			priorTargets: [],
-			newTargets: [path.join(tmpDir, `dependency-${i}.ts`)],
-			existedBefore: true,
-			existsAfter: true,
-		}));
-		const maxBlock = await measureMaxSyncBlockMs(async () => {
-			patchReverseDependencyIndex(index, changes);
-		});
-		expect(maxBlock).toBeLessThan(MAX_SYNC_BLOCK_MS);
-	});
+	it(
+		"main-thread reverse-dependency delta patch stays under the sync-block budget",
+		{ retry: 2, timeout: 60_000 },
+		async () => {
+			const index = {
+				projectRoot: tmpDir,
+				generatedAt: new Date().toISOString(),
+				imports: Object.fromEntries(
+					Array.from({ length: 200 }, (_, i) => [`file-${i}.ts`, []]),
+				),
+				importedBy: {},
+				source: "review-graph" as const,
+			};
+			const changes = Array.from({ length: 200 }, (_, i) => ({
+				filePath: path.join(tmpDir, `file-${i}.ts`),
+				priorTargets: [],
+				newTargets: [path.join(tmpDir, `dependency-${i}.ts`)],
+				existedBefore: true,
+				existsAfter: true,
+			}));
+			const maxBlock = await measureMaxSyncBlockMs(async () => {
+				patchReverseDependencyIndex(index, changes);
+			});
+			expect(maxBlock).toBeLessThan(MAX_SYNC_BLOCK_MS);
+		},
+	);
 
-	it("main-thread impact-cascade traversal stays under the sync-block budget", { retry: 2, timeout: 60_000 }, async () => {
-		const graph = emptyGraph();
-		const seed = path.join(tmpDir, "seed.ts");
-		const seedNode = "file:seed";
-		graph.nodes.set(seedNode, { id: seedNode, kind: "file", language: "typescript", filePath: seed });
-		graph.fileNodes.set(seed, seedNode);
-		for (let i = 0; i < 10_000; i++) {
-			const nodeId = `file:dependent-${i}`;
-			const file = path.join(tmpDir, `dependent-${i}.ts`);
-			graph.nodes.set(nodeId, { id: nodeId, kind: "file", language: "typescript", filePath: file });
-			graph.edges.push({ from: nodeId, to: seedNode, kind: "imports" });
-		}
-		graph.edgesByTo.set(seedNode, graph.edges);
-		const maxBlock = await measureMaxSyncBlockMs(async () => {
-			computeImpactCascade(graph, seed);
-		});
-		expect(maxBlock).toBeLessThan(MAX_SYNC_BLOCK_MS);
-	});
+	it(
+		"main-thread impact-cascade traversal stays under the sync-block budget",
+		{ retry: 2, timeout: 60_000 },
+		async () => {
+			const graph = emptyGraph();
+			const seed = path.join(tmpDir, "seed.ts");
+			const seedNode = "file:seed";
+			graph.nodes.set(seedNode, {
+				id: seedNode,
+				kind: "file",
+				language: "typescript",
+				filePath: seed,
+			});
+			graph.fileNodes.set(seed, seedNode);
+			for (let i = 0; i < 10_000; i++) {
+				const nodeId = `file:dependent-${i}`;
+				const file = path.join(tmpDir, `dependent-${i}.ts`);
+				graph.nodes.set(nodeId, {
+					id: nodeId,
+					kind: "file",
+					language: "typescript",
+					filePath: file,
+				});
+				graph.edges.push({ from: nodeId, to: seedNode, kind: "imports" });
+			}
+			graph.edgesByTo.set(seedNode, graph.edges);
+			const maxBlock = await measureMaxSyncBlockMs(async () => {
+				computeImpactCascade(graph, seed);
+			});
+			expect(maxBlock).toBeLessThan(MAX_SYNC_BLOCK_MS);
+		},
+	);
 });
 
 function emptyGraph(): ReviewGraph {

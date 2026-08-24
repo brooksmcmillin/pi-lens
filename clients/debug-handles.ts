@@ -172,6 +172,11 @@ export function flushDebugHandlesLog(): Promise<void> {
 
 function safeGetActiveResourcesInfo(): string[] {
 	try {
+		// SAFETY: `process.getActiveResourcesInfo` is a real Node API (>=17.3)
+		// that @types/node does not declare on `Process`. The cast only widens
+		// the type to say the method MIGHT be there; the `typeof fn ===
+		// "function"` guard on the next line is what actually decides, so a
+		// runtime without it returns [] rather than throwing.
 		const fn = (
 			process as unknown as { getActiveResourcesInfo?: () => string[] }
 		).getActiveResourcesInfo;

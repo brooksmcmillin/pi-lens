@@ -262,7 +262,11 @@ function subtreeCyclomatic(root: TsNode, nodes: LangNodes): number {
 }
 
 /** Cognitive complexity (SonarSource-style: base + nesting penalty). */
-function subtreeCognitive(node: TsNode, nesting: number, nodes: LangNodes): number {
+function subtreeCognitive(
+	node: TsNode,
+	nesting: number,
+	nodes: LangNodes,
+): number {
 	let complexity = 0;
 	if (nodes.cognitive.has(node.type)) complexity += 1 + nesting;
 	// Labeled break/continue add complexity.
@@ -299,7 +303,10 @@ function subtreeMaxNesting(
 	}
 	for (const child of node.children ?? []) {
 		if (child) {
-			maxDepth = Math.max(maxDepth, subtreeMaxNesting(child, currentDepth, nodes));
+			maxDepth = Math.max(
+				maxDepth,
+				subtreeMaxNesting(child, currentDepth, nodes),
+			);
 		}
 	}
 	return maxDepth;
@@ -313,7 +320,10 @@ function functionName(fnNode: TsNode, nodes: LangNodes): string | undefined {
 	return undefined;
 }
 
-function collectFunctionMetrics(root: TsNode, nodes: LangNodes): FunctionMetrics[] {
+function collectFunctionMetrics(
+	root: TsNode,
+	nodes: LangNodes,
+): FunctionMetrics[] {
 	const functions: FunctionMetrics[] = [];
 	const visit = (node: TsNode, nestingLevel: number): void => {
 		if (nodes.functionLike.has(node.type)) {
@@ -471,9 +481,7 @@ export class ComplexityClient {
 	private log: (msg: string) => void;
 
 	constructor(verbose = false) {
-		this.log = verbose
-			? createSubsystemLogger("complexity")
-			: () => {};
+		this.log = verbose ? createSubsystemLogger("complexity") : () => {};
 	}
 
 	/** True if the file's grammar has a complexity node mapping. */

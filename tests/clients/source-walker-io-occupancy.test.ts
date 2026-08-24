@@ -24,7 +24,16 @@
 
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterAll, afterEach, beforeAll, describe, expect, it, type Mock, vi } from "vitest";
+import {
+	afterAll,
+	afterEach,
+	beforeAll,
+	describe,
+	expect,
+	it,
+	type Mock,
+	vi,
+} from "vitest";
 
 // `vi.spyOn(fs, "readdirSync"/"promises")` cannot redefine node:fs's ESM
 // namespace exports directly, so wrap the module via vi.mock — keeps the real
@@ -93,9 +102,9 @@ function installStallingSyncReaddir(): void {
 			while (Date.now() < until) {
 				/* busy-wait: the loop is held for the whole stall */
 			}
-			return (
-				actualFs.readdirSync as unknown as (...a: unknown[]) => unknown
-			)(...args);
+			return (actualFs.readdirSync as unknown as (...a: unknown[]) => unknown)(
+				...args,
+			);
 		},
 	);
 }

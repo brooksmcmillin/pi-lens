@@ -44,9 +44,8 @@ describe("recent-touches (#492 cross-process touched-files record)", () => {
 	});
 
 	it("appendRecentTouches creates the record with this process's pid", async () => {
-		const { appendRecentTouches } = await import(
-			"../../clients/recent-touches.js"
-		);
+		const { appendRecentTouches } =
+			await import("../../clients/recent-touches.js");
 		await appendRecentTouches({
 			cwd: FAKE_CWD,
 			reason: "autofix",
@@ -61,9 +60,8 @@ describe("recent-touches (#492 cross-process touched-files record)", () => {
 	});
 
 	it("writes atomically via tmp-<pid> + rename (no tmp file left behind)", async () => {
-		const { appendRecentTouches } = await import(
-			"../../clients/recent-touches.js"
-		);
+		const { appendRecentTouches } =
+			await import("../../clients/recent-touches.js");
 		await appendRecentTouches({
 			cwd: FAKE_CWD,
 			reason: "format",
@@ -76,9 +74,8 @@ describe("recent-touches (#492 cross-process touched-files record)", () => {
 	});
 
 	it("ring buffer caps at RECENT_TOUCHES_MAX_ENTRIES, dropping oldest first", async () => {
-		const { appendRecentTouches, RECENT_TOUCHES_MAX_ENTRIES } = await import(
-			"../../clients/recent-touches.js"
-		);
+		const { appendRecentTouches, RECENT_TOUCHES_MAX_ENTRIES } =
+			await import("../../clients/recent-touches.js");
 		for (let i = 0; i < RECENT_TOUCHES_MAX_ENTRIES + 10; i++) {
 			await appendRecentTouches({
 				cwd: FAKE_CWD,
@@ -103,9 +100,8 @@ describe("recent-touches (#492 cross-process touched-files record)", () => {
 		fs.mkdirSync(dir, { recursive: true });
 		fs.writeFileSync(recordFilePath(), "{not valid json!!", "utf-8");
 
-		const { appendRecentTouches } = await import(
-			"../../clients/recent-touches.js"
-		);
+		const { appendRecentTouches } =
+			await import("../../clients/recent-touches.js");
 		await expect(
 			appendRecentTouches({
 				cwd: FAKE_CWD,
@@ -119,9 +115,8 @@ describe("recent-touches (#492 cross-process touched-files record)", () => {
 	});
 
 	it("missing record file on first read does not throw", async () => {
-		const { readCrossProcessTouchesForSessionStart } = await import(
-			"../../clients/recent-touches.js"
-		);
+		const { readCrossProcessTouchesForSessionStart } =
+			await import("../../clients/recent-touches.js");
 		expect(fs.existsSync(recordFilePath())).toBe(false);
 		await expect(
 			readCrossProcessTouchesForSessionStart({ cwd: FAKE_CWD }),
@@ -130,10 +125,8 @@ describe("recent-touches (#492 cross-process touched-files record)", () => {
 
 	describe("child at session_start", () => {
 		it("excludes entries from this process's own pid (self-exclusion)", async () => {
-			const {
-				appendRecentTouches,
-				readCrossProcessTouchesForSessionStart,
-			} = await import("../../clients/recent-touches.js");
+			const { appendRecentTouches, readCrossProcessTouchesForSessionStart } =
+				await import("../../clients/recent-touches.js");
 			// Own pid write.
 			await appendRecentTouches({
 				cwd: FAKE_CWD,
@@ -149,16 +142,20 @@ describe("recent-touches (#492 cross-process touched-files record)", () => {
 		});
 
 		it("surfaces a foreign pid's fresh entry whose file exists", async () => {
-			const { readCrossProcessTouchesForSessionStart } = await import(
-				"../../clients/recent-touches.js"
-			);
+			const { readCrossProcessTouchesForSessionStart } =
+				await import("../../clients/recent-touches.js");
 			// Simulate a write from a different pid by writing the file directly
 			// (appendRecentTouches always stamps process.pid).
 			fs.writeFileSync(
 				recordFilePath(),
 				JSON.stringify({
 					entries: [
-						{ path: __filename, reason: "autofix", ts: Date.now(), pid: 999999 },
+						{
+							path: __filename,
+							reason: "autofix",
+							ts: Date.now(),
+							pid: 999999,
+						},
 					],
 				}),
 				"utf-8",
@@ -173,9 +170,8 @@ describe("recent-touches (#492 cross-process touched-files record)", () => {
 		});
 
 		it("drops entries older than the freshness window", async () => {
-			const { readCrossProcessTouchesForSessionStart } = await import(
-				"../../clients/recent-touches.js"
-			);
+			const { readCrossProcessTouchesForSessionStart } =
+				await import("../../clients/recent-touches.js");
 			const now = Date.now();
 			fs.writeFileSync(
 				recordFilePath(),
@@ -201,9 +197,8 @@ describe("recent-touches (#492 cross-process touched-files record)", () => {
 		});
 
 		it("drops entries whose file no longer exists on disk", async () => {
-			const { readCrossProcessTouchesForSessionStart } = await import(
-				"../../clients/recent-touches.js"
-			);
+			const { readCrossProcessTouchesForSessionStart } =
+				await import("../../clients/recent-touches.js");
 			fs.writeFileSync(
 				recordFilePath(),
 				JSON.stringify({
@@ -227,9 +222,8 @@ describe("recent-touches (#492 cross-process touched-files record)", () => {
 		});
 
 		it("cross-form paths: an alternate-but-genuine alias of the same file still passes the existsSync probe", async () => {
-			const { readCrossProcessTouchesForSessionStart } = await import(
-				"../../clients/recent-touches.js"
-			);
+			const { readCrossProcessTouchesForSessionStart } =
+				await import("../../clients/recent-touches.js");
 			// __filename is the real absolute path to this test file. Record it in
 			// an alternate form that is a GENUINE alias of the same file ON THIS
 			// PLATFORM (the #491 postmortem rule: cross-form tests must only use
@@ -269,18 +263,16 @@ describe("recent-touches (#492 cross-process touched-files record)", () => {
 
 	describe("parent at turn_start (mtime-gated hot path)", () => {
 		it("returns [] with no record file yet (no stat throw)", async () => {
-			const { readCrossProcessTouchesForTurnStart } = await import(
-				"../../clients/recent-touches.js"
-			);
+			const { readCrossProcessTouchesForTurnStart } =
+				await import("../../clients/recent-touches.js");
 			await expect(
 				readCrossProcessTouchesForTurnStart({ cwd: FAKE_CWD }),
 			).resolves.toEqual([]);
 		});
 
 		it("surfaces a foreign pid's entry on first read after the file appears", async () => {
-			const { readCrossProcessTouchesForTurnStart } = await import(
-				"../../clients/recent-touches.js"
-			);
+			const { readCrossProcessTouchesForTurnStart } =
+				await import("../../clients/recent-touches.js");
 			fs.writeFileSync(
 				recordFilePath(),
 				JSON.stringify({
@@ -300,9 +292,8 @@ describe("recent-touches (#492 cross-process touched-files record)", () => {
 		});
 
 		it("second read with unchanged mtime returns [] without re-parsing (dedup)", async () => {
-			const { readCrossProcessTouchesForTurnStart } = await import(
-				"../../clients/recent-touches.js"
-			);
+			const { readCrossProcessTouchesForTurnStart } =
+				await import("../../clients/recent-touches.js");
 			fs.writeFileSync(
 				recordFilePath(),
 				JSON.stringify({
@@ -328,9 +319,8 @@ describe("recent-touches (#492 cross-process touched-files record)", () => {
 		});
 
 		it("a new append after a prior consume only surfaces the NEW entry (cursor dedup, not full re-read)", async () => {
-			const { readCrossProcessTouchesForTurnStart } = await import(
-				"../../clients/recent-touches.js"
-			);
+			const { readCrossProcessTouchesForTurnStart } =
+				await import("../../clients/recent-touches.js");
 			// Real files on disk — the turn_start reader applies the shared
 			// existence filter, so fabricated paths would be (correctly) dropped.
 			const firstFile = path.join(dir, "first.ts");
@@ -430,9 +420,8 @@ describe("recent-touches (#492 cross-process touched-files record)", () => {
 		});
 
 		it("excludes entries from this process's own pid (self-exclusion)", async () => {
-			const { readCrossProcessTouchesForTurnStart } = await import(
-				"../../clients/recent-touches.js"
-			);
+			const { readCrossProcessTouchesForTurnStart } =
+				await import("../../clients/recent-touches.js");
 			fs.writeFileSync(
 				recordFilePath(),
 				JSON.stringify({

@@ -129,19 +129,16 @@ describe("ast-grep NAPI utils: block passthrough (#663)", () => {
 				"astgrep_napi_unsupported_rules_skipped",
 		);
 		expect(entries).toHaveLength(2);
-		const python = (
-			(entries[0][0] as { metadata: any }).metadata.skippedByLanguage
-				.python
-		);
+		const python = (entries[0][0] as { metadata: any }).metadata
+			.skippedByLanguage.python;
 		expect(python.count).toBeGreaterThan(python.ruleIds.length);
 		expect(python.ruleIds).toHaveLength(5);
 	});
 
 	it("logs each unsupported rule once for a shared dedup set", async () => {
 		const { filePath } = env.addFile("sample.py", "value = 1\n");
-		const { evaluateAstGrepRules } = await import(
-			"../../../../clients/dispatch/runners/ast-grep-napi.js"
-		);
+		const { evaluateAstGrepRules } =
+			await import("../../../../clients/dispatch/runners/ast-grep-napi.js");
 		logLatency.mockClear();
 		const logs: string[] = [];
 		const options = {
@@ -193,9 +190,8 @@ describe("ast-grep NAPI utils: block passthrough (#663)", () => {
 	});
 
 	it("preserves utils when parsing the Rust rule covered by the CLI suite", async () => {
-		const { loadYamlRulesUncached } = await import(
-			"../../../../clients/dispatch/runners/yaml-rule-parser.js"
-		);
+		const { loadYamlRulesUncached } =
+			await import("../../../../clients/dispatch/runners/yaml-rule-parser.js");
 		const rule = loadYamlRulesUncached(RULES_DIR).find(
 			(candidate) => candidate.id === "rust-2024-let-chain-candidate",
 		);

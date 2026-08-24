@@ -14,8 +14,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	INSTALL_TRANSIENT_BASE_COOLDOWN_MS,
 	TRANSIENT_BASE_COOLDOWN_MS,
-} from "../../clients/dispatch/runners/utils/availability-policy.ts";
-import { resetDispatchAvailabilityState } from "../../clients/dispatch/runners/utils/runner-helpers.ts";
+} from "../../clients/dispatch/runners/utils/availability-policy.js";
+import { resetDispatchAvailabilityState } from "../../clients/dispatch/runners/utils/runner-helpers.js";
 import { removeTempDirSync } from "./test-utils.js";
 
 const { piLensDirHolder } = vi.hoisted(() => ({
@@ -107,7 +107,9 @@ describe("knip availability (#1467)", () => {
 
 		const { KnipClient } = await import("../../clients/knip-client.js");
 		const client = new KnipClient(false);
-		const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-1467-proj-"));
+		const projectDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-1467-proj-"),
+		);
 		try {
 			fs.writeFileSync(path.join(projectDir, "package.json"), '{"name":"d"}');
 
@@ -172,7 +174,9 @@ describe("knip availability (#1467)", () => {
 
 		const { KnipClient } = await import("../../clients/knip-client.js");
 		const client = new KnipClient(false);
-		const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-1467-miss-"));
+		const projectDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-1467-miss-"),
+		);
 		try {
 			fs.writeFileSync(path.join(projectDir, "package.json"), '{"name":"d"}');
 			const result = await client.analyze(projectDir);
@@ -191,7 +195,8 @@ describe("madge availability (#1467)", () => {
 		const spawn = await spawnMock();
 		spawn.mockResolvedValue(timeoutResult as never);
 
-		const { DependencyChecker } = await import("../../clients/dependency-checker.js");
+		const { DependencyChecker } =
+			await import("../../clients/dependency-checker.js");
 		const checker = new DependencyChecker(false);
 		expect(await checker.ensureAvailable(process.cwd())).toBe(false);
 
@@ -206,7 +211,8 @@ describe("govulncheck availability (#1467)", () => {
 		const spawn = await spawnMock();
 		spawn.mockResolvedValue(timeoutResult as never);
 
-		const { GovulncheckClient } = await import("../../clients/govulncheck-client.js");
+		const { GovulncheckClient } =
+			await import("../../clients/govulncheck-client.js");
 		const client = new GovulncheckClient(false);
 		expect(await client.ensureAvailable()).toBe(false);
 		// One probe only: the install path must not be entered on a host hiccup.
@@ -232,12 +238,11 @@ describe("govulncheck availability (#1467)", () => {
 		const installCount = () =>
 			spawn.mock.calls.filter(
 				([cmd, args]) =>
-					String(cmd) === "go" &&
-					Array.isArray(args) &&
-					args[0] === "install",
+					String(cmd) === "go" && Array.isArray(args) && args[0] === "install",
 			).length;
 
-		const { GovulncheckClient } = await import("../../clients/govulncheck-client.js");
+		const { GovulncheckClient } =
+			await import("../../clients/govulncheck-client.js");
 		const client = new GovulncheckClient(false);
 
 		// Each attempt is a fresh 60s compile; the install-class schedule spaces
@@ -269,7 +274,8 @@ describe("vulture availability (#1467)", () => {
 		const spawn = await spawnMock();
 		spawn.mockResolvedValue(timeoutResult as never);
 
-		const { PythonDeadCodeClient } = await import("../../clients/dead-code-client.js");
+		const { PythonDeadCodeClient } =
+			await import("../../clients/dead-code-client.js");
 		const client = new PythonDeadCodeClient(false);
 		expect(await client.ensureAvailable()).toBe(false);
 		const probesAfterTransient = spawn.mock.calls.length;

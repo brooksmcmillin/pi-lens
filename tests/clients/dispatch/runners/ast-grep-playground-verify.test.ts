@@ -54,9 +54,13 @@ async function runVerify(
 	args: string[] = [],
 	timeoutMs = 60_000,
 ): Promise<VerifyResult> {
-	const result = await safeSpawnAsync(process.execPath, [SCRIPT, ruleFile, ...args], {
-		timeout: timeoutMs,
-	});
+	const result = await safeSpawnAsync(
+		process.execPath,
+		[SCRIPT, ruleFile, ...args],
+		{
+			timeout: timeoutMs,
+		},
+	);
 	if (result.error) throw result.error;
 	// Result is always on stdout (JSON) — stderr is diagnostic noise.
 	const last = result.stdout.trim().split("\n").pop() || "";

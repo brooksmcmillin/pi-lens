@@ -42,7 +42,12 @@
  * So `opengrepResultToProjectDiagnostics` deliberately applies NO suppression
  * filtering of its own — doing so would be redundant at best.
  *
- * Refs: #584, #111 (opengrep adoption), #387 (workspace-sweep serialization)
+ * Scope note (#1562 class fix): the CLI scan is handed `--exclude` per shared
+ * scratch/cache tree (`scratch-tree-policy.ts`) so a directory that isn't
+ * gitignored (opengrep's own default exclusion) still doesn't reach the
+ * agent as a finding — same `EXCLUDED_DIRS`-derived list gitleaks/trivy use.
+ *
+ * Refs: #584, #111 (opengrep adoption), #387 (workspace-sweep serialization), #1562
  */
 
 import * as fs from "node:fs";
@@ -50,6 +55,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { mkdtempSync } from "node:fs";
 import { resolveOpengrepConfig } from "./opengrep-config.js";
+import { getScratchTreeDirNames } from "./scratch-tree-policy.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
 import { SecurityScanClient } from "./security-scan-client.js";
 
@@ -162,6 +168,14 @@ export class OpengrepClient extends SecurityScanClient<OpengrepResult> {
 					"--no-error",
 					"--quiet",
 					"--disable-version-check",
+					// #1562 class fix: opengrep's own `.gitignore` respect covers the
+					// common case (scratch trees are usually gitignored), but not a
+					// scratch/cache tree that ISN'T (e.g. an un-gitignored worktree
+					// cache) — `--exclude` is semgrep-compatible, so a slash-free
+					// pattern matches that directory name anywhere in the tree,
+					// independent of gitignore. Same `EXCLUDED_DIRS`-derived list
+					// gitleaks/trivy use, so the three scanners can't drift apart.
+					...getScratchTreeDirNames().flatMap((name) => ["--exclude", name]),
 					cwd,
 				],
 				{ cwd, timeout: SCAN_TIMEOUT_MS },
@@ -185,7 +199,9 @@ export class OpengrepClient extends SecurityScanClient<OpengrepResult> {
 				};
 			}
 
-			const findings = parseOpengrepReport(fs.readFileSync(reportPath, "utf-8"));
+			const findings = parseOpengrepReport(
+				fs.readFileSync(reportPath, "utf-8"),
+			);
 			return {
 				success: true,
 				findings,

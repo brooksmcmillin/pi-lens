@@ -400,7 +400,9 @@ describe("requestWarmTurnEnd", () => {
 	});
 
 	it("does not report delivery success when the receipt acknowledgement times out (#1218)", async () => {
-		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-ipc-turn-ack-timeout-"));
+		const cwd = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-ipc-turn-ack-timeout-"),
+		);
 		let connections = 0;
 		await listenOnWorkspaceEndpoint(cwd, (socket) => {
 			connections++;
@@ -417,7 +419,7 @@ describe("requestWarmTurnEnd", () => {
 								},
 							})}\n`,
 						)
-						: undefined;
+					: undefined;
 				// Never answer the acknowledgement connection: the client deadline
 				// must report timeout while the server retains its delivery.
 			});

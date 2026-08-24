@@ -12,8 +12,23 @@ import {
 	createAvailabilityChecker,
 	resolveToolCommandWithInstallFallback,
 } from "./utils/runner-helpers.js";
+import type { ToolExitCodes } from "./utils/spawn-outcome.js";
+import { parseToolRun } from "./utils/tool-failure.js";
+import { finishParsedRun } from "./utils/tool-failure.js";
 
 const mypy = createAvailabilityChecker("mypy", "");
+
+// mypy exit codes: 0 = no type errors, 1 = type errors found, 2 = a blocking
+// error. 2 is NOT a rejected invocation on its own — mypy reports a source
+// SYNTAX error under 2 and still writes a normal parsable diagnostic to stdout
+// (verified live against mypy 2.3.1: `syn.py:1: error: Invalid syntax
+// [syntax]`). A bad flag or unreadable config also exits 2, but writes its
+// message to STDERR and leaves stdout empty.
+//
+// So the exit code cannot separate the two, and the STREAM does: the gate below
+// judges "nothing to parse" on stdout alone, while the parser still reads both.
+// The table's remaining job is to reject any OTHER nonzero status.
+const MYPY_EXIT_CODES: ToolExitCodes = { ran: [1, 2] };
 
 // mypy output: file.py:10: error: Incompatible types [assignment]
 //
@@ -74,7 +89,7 @@ const mypyRunner: RunnerDefinition = {
 		}
 
 		let cmd: string | null = null;
-		if (await (mypy.isAvailableAsync(cwd))) {
+		if (await mypy.isAvailableAsync(cwd)) {
 			cmd = mypy.getCommand(cwd);
 		} else {
 			cmd = await resolveToolCommandWithInstallFallback(cwd, "mypy");
@@ -88,18 +103,30 @@ const mypyRunner: RunnerDefinition = {
 			{ timeout: 30000, cwd },
 		);
 
+		// #1816: this runner read `result.status` zero times, so an exit-2
+		// config error reported the file as cleanly type-checked. The gate reads
+		// stdout only (see MYPY_EXIT_CODES) so an exit-2 SYNTAX error, which
+		// does write a diagnostic there, still reaches the parser.
 		const raw = `${result.stdout ?? ""}${result.stderr ?? ""}`;
-		const diagnostics = parseMypyOutput(raw, ctx.filePath, cwd);
-		if (diagnostics.length === 0) {
-			return { status: "succeeded", diagnostics: [], semantic: "none" };
-		}
+		// #1948: `parseOutput` keeps the split this runner already had — the gate
+		// judges "did it run" on stdout alone, the parser still reads both
+		// streams — so adding the parsed-nothing record does not widen the
+		// did-it-run verdict.
+		const run = parseToolRun(
+			"mypy",
+			{ result, output: result.stdout, exitCodes: MYPY_EXIT_CODES },
+			(out) => parseMypyOutput(out, ctx.filePath, cwd),
+			{ parseOutput: raw },
+		);
+		if (run.skipped) return run.skipped;
 
-		const hasBlocking = diagnostics.some((d) => d.semantic === "blocking");
-		return {
-			status: hasBlocking ? "failed" : "succeeded",
+		const diagnostics = run.diagnostics;
+		return finishParsedRun({
+			tool: "mypy",
+			ctx,
+			result,
 			diagnostics,
-			semantic: hasBlocking ? "blocking" : "warning",
-		};
+		});
 	},
 };
 

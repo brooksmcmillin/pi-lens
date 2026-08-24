@@ -72,9 +72,13 @@ describe("walkTreeStackSync / walkTreeStackAsync", () => {
 		const syncSeen: string[] = [];
 		walkTreeStackSync(root, recordingVisitor(syncSeen));
 		const asyncSeen: string[] = [];
-		const stopped = await walkTreeStackAsync(root, recordingVisitor(asyncSeen), {
-			budgetMs: 0,
-		});
+		const stopped = await walkTreeStackAsync(
+			root,
+			recordingVisitor(asyncSeen),
+			{
+				budgetMs: 0,
+			},
+		);
 		expect(stopped).toBe(false);
 		expect(asyncSeen.sort()).toEqual(syncSeen.sort());
 	});

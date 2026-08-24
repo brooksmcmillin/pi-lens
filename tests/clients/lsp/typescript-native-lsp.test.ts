@@ -17,7 +17,7 @@ vi.mock("../../../clients/installer/index.js", () => ({
 vi.mock("../../../clients/lsp/launch.js", () => ({ launchLSP }));
 vi.mock("../../../clients/latency-logger.js", () => ({ logLatency: vi.fn() }));
 
-import { TypeScriptServer } from "../../../clients/lsp/server.ts";
+import { TypeScriptServer } from "../../../clients/lsp/server.js";
 
 const dirs: string[] = [];
 const fakeProcess = { kill: vi.fn() } as never;

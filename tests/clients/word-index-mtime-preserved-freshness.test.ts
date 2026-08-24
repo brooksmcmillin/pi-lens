@@ -100,11 +100,7 @@ describe("word-index freshness: mtime preserved, content changed (#1105)", () =>
 			const index = deserializeWordIndex(serializeWordIndex(built));
 			if (!index) throw new Error("deserialize returned null");
 
-			fs.writeFileSync(
-				a,
-				"export const quokkaOmegaDistinct = 1;",
-				"utf8",
-			);
+			fs.writeFileSync(a, "export const quokkaOmegaDistinct = 1;", "utf8");
 			fs.utimesSync(a, PINNED_MTIME, PINNED_MTIME);
 			const after = fs.statSync(a);
 			expect(after.mtimeMs).toBe(recorded.mtimeMs);

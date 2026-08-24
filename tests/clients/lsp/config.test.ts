@@ -12,13 +12,13 @@ import { removeTempDirSync } from "../test-utils.js";
 // "no raw terminal write" half of the invariant is enforced repo-wide by
 // tests/clients/extension-terminal-silence.test.ts.
 vi.mock("../../../clients/extension-log.js", async (importOriginal) => {
-	const actual = await importOriginal<typeof import("../../../clients/extension-log.js")>();
+	const actual =
+		await importOriginal<typeof import("../../../clients/extension-log.js")>();
 	return {
 		...actual,
 		logExtension: (entry: { message: string }) => console.error(entry.message),
 	};
 });
-
 
 const dirs: string[] = [];
 const defaultGlobalDir = process.env.PI_LENS_HOME;
@@ -122,9 +122,9 @@ describe("loadLSPConfig global configuration (#870)", () => {
 			"nix",
 			"rust",
 		]);
-		expect(
-			config.serverOverrides?.rust.initializationOptions,
-		).toEqual({ check: { command: "clippy" } });
+		expect(config.serverOverrides?.rust.initializationOptions).toEqual({
+			check: { command: "clippy" },
+		});
 		expect(config.disabledServers).toEqual([]);
 		expect(config.warmFiles).toEqual(["project.ts"]);
 	});

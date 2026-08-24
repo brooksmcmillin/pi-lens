@@ -65,7 +65,14 @@ function renderRow(cells) {
  *   hand, not appended by a probe). Default appends new keys.
  * @returns {string[][]}          merged rows
  */
-export function mergeRows(existing, header, measured, keyCol, ownedCols, opts = {}) {
+export function mergeRows(
+	existing,
+	header,
+	measured,
+	keyCol,
+	ownedCols,
+	opts = {},
+) {
 	const idx = (name) => header.indexOf(name);
 	const keyIdx = idx(keyCol);
 	const byKey = new Map();
@@ -216,14 +223,20 @@ export function parseBulletSection(text, heading) {
  * @param {string[]} keysToCarry               keys (servers) to pull from `priorBullets`
  * @returns {string}
  */
-export function mergeBulletSection(newText, heading, priorBullets, keysToCarry) {
+export function mergeBulletSection(
+	newText,
+	heading,
+	priorBullets,
+	keysToCarry,
+) {
 	const lines = newText.split("\n");
 	const headingIdx = lines.findIndex((l) => l.trim() === heading.trim());
 	if (headingIdx < 0) return newText;
 	// The section body starts after the heading, skipping a single blank line
 	// (the generator always emits one), and runs up to the next `## ` heading
 	// or EOF.
-	const bodyStart = lines[headingIdx + 1] === "" ? headingIdx + 2 : headingIdx + 1;
+	const bodyStart =
+		lines[headingIdx + 1] === "" ? headingIdx + 2 : headingIdx + 1;
 	let bodyEnd = lines.length;
 	for (let i = bodyStart; i < lines.length; i++) {
 		if (/^##\s/.test(lines[i])) {
@@ -301,7 +314,9 @@ export function mergeServerCapabilitiesDoc(priorText, freshText) {
 		return { text: freshText, preservedCount: 0 };
 	}
 	const capturedKeys = new Set(newTbl.rows.map((c) => c[keyIdx]));
-	const notCapturedPriorRows = priorTbl.rows.filter((c) => !capturedKeys.has(c[priorKeyIdx]));
+	const notCapturedPriorRows = priorTbl.rows.filter(
+		(c) => !capturedKeys.has(c[priorKeyIdx]),
+	);
 	const reshaped = reshapeRowsByName(
 		notCapturedPriorRows,
 		priorTbl.header,
@@ -311,12 +326,21 @@ export function mergeServerCapabilitiesDoc(priorText, freshText) {
 	const mergedRows = [...newTbl.rows, ...reshaped].sort((a, b) =>
 		a[keyIdx].localeCompare(b[keyIdx]),
 	);
-	let text = replaceTable(freshText, SERVER_CAPS_TABLE_MARKER, newTbl.header, newTbl.sep, mergedRows);
+	let text = replaceTable(
+		freshText,
+		SERVER_CAPS_TABLE_MARKER,
+		newTbl.header,
+		newTbl.sep,
+		mergedRows,
+	);
 	if (!text) {
 		return { text: freshText, preservedCount: 0 };
 	}
 	const preservedServers = notCapturedPriorRows.map((c) => c[priorKeyIdx]);
-	for (const heading of [SERVER_CAPS_RAW_KEYS_HEADING, SERVER_CAPS_EXEC_CMDS_HEADING]) {
+	for (const heading of [
+		SERVER_CAPS_RAW_KEYS_HEADING,
+		SERVER_CAPS_EXEC_CMDS_HEADING,
+	]) {
 		const priorBullets = parseBulletSection(priorText, heading);
 		text = mergeBulletSection(text, heading, priorBullets, preservedServers);
 	}

@@ -28,7 +28,7 @@ vi.mock("../../../clients/installer/index.js", () => ({
 	getToolEnvironment: () => ({}),
 }));
 
-import { LuaServer } from "../../../clients/lsp/server.ts";
+import { LuaServer } from "../../../clients/lsp/server.js";
 
 const fakeProc = { stdout: {}, stderr: {} } as never;
 const ROOT = "/tmp/lua-project";
@@ -62,7 +62,9 @@ describe("LuaServer.spawn — tree-binary resolution (#564)", () => {
 		launchLSP
 			.mockRejectedValueOnce(new Error("ENOENT")) // PATH candidate fails
 			.mockResolvedValueOnce(fakeProc); // managed bin launches
-		getToolPath.mockResolvedValueOnce("/home/user/.pi-lens/tools/lua-language-server");
+		getToolPath.mockResolvedValueOnce(
+			"/home/user/.pi-lens/tools/lua-language-server",
+		);
 
 		const result = await LuaServer.spawn(ROOT, { allowInstall: true });
 
@@ -87,7 +89,9 @@ describe("LuaServer.spawn — tree-binary resolution (#564)", () => {
 			.mockRejectedValueOnce(new Error("ENOENT"))
 			.mockResolvedValueOnce(fakeProc);
 		getToolPath.mockResolvedValueOnce(undefined); // not yet extracted
-		ensureTool.mockResolvedValueOnce("/home/user/.pi-lens/tools/lua-language-server");
+		ensureTool.mockResolvedValueOnce(
+			"/home/user/.pi-lens/tools/lua-language-server",
+		);
 
 		const result = await LuaServer.spawn(ROOT, { allowInstall: true });
 

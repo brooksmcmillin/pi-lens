@@ -57,7 +57,11 @@ function alivePids(...pids: number[]): (pid: number) => boolean {
 	return (pid) => set.has(pid);
 }
 
-function childrenOfCount(n: number, serverId: string, startPid: number): LspChildEntry[] {
+function childrenOfCount(
+	n: number,
+	serverId: string,
+	startPid: number,
+): LspChildEntry[] {
 	return Array.from({ length: n }, (_, i) =>
 		lspChild({ pid: startPid + i, serverId }),
 	);
@@ -69,7 +73,11 @@ describe("decideLspBudget", () => {
 			instance({ pid: 1, lspChildren: childrenOfCount(3, "typescript", 100) }),
 			instance({ pid: 2, lspChildren: childrenOfCount(2, "pyright", 200) }),
 		];
-		const decision = decideLspBudget(reg, alivePids(1, 2, 100, 101, 102, 200, 201), 16);
+		const decision = decideLspBudget(
+			reg,
+			alivePids(1, 2, 100, 101, 102, 200, 201),
+			16,
+		);
 
 		expect(decision.totalLiveLspServers).toBe(5);
 		expect(decision.overBudget).toBe(false);
@@ -90,7 +98,9 @@ describe("decideLspBudget", () => {
 	});
 
 	it("exactly at ceiling counts as over budget (>=, not >)", () => {
-		const reg = [instance({ pid: 1, lspChildren: childrenOfCount(16, "typescript", 100) })];
+		const reg = [
+			instance({ pid: 1, lspChildren: childrenOfCount(16, "typescript", 100) }),
+		];
 		const decision = decideLspBudget(reg, () => true, 16);
 
 		expect(decision.totalLiveLspServers).toBe(16);
@@ -123,9 +133,7 @@ describe("decideLspBudget", () => {
 				pid: 1,
 				heartbeatAt: new Date(now).toISOString(),
 				rssBytes: 40 * 1024 * 1024,
-				lspChildren: [
-					lspChild({ pid: 100, rssBytes: 70 * 1024 * 1024 }),
-				],
+				lspChildren: [lspChild({ pid: 100, rssBytes: 70 * 1024 * 1024 })],
 			}),
 		];
 		const decision = decideLspBudget(
@@ -161,13 +169,7 @@ describe("decideLspBudget", () => {
 				}),
 			],
 		]) {
-			const decision = decideLspBudget(
-				reg,
-				() => true,
-				16,
-				1,
-				now,
-			);
+			const decision = decideLspBudget(reg, () => true, 16, 1, now);
 			expect(decision.totalRssBytes).toBeUndefined();
 			expect(decision.rssPressure).toBe(false);
 			expect(decision.overBudget).toBe(false);
@@ -219,7 +221,9 @@ describe("getLspBudgetCeiling / isCrossProcessBudgetEnabled (env config)", () =>
 
 	it("uses a 60s pressure idle default and honors a positive override", () => {
 		delete process.env.PI_LENS_LSP_BUDGET_IDLE_TIMEOUT_MS;
-		expect(getLspBudgetIdleTimeoutMs()).toBe(DEFAULT_LSP_BUDGET_IDLE_TIMEOUT_MS);
+		expect(getLspBudgetIdleTimeoutMs()).toBe(
+			DEFAULT_LSP_BUDGET_IDLE_TIMEOUT_MS,
+		);
 		process.env.PI_LENS_LSP_BUDGET_IDLE_TIMEOUT_MS = "30000";
 		expect(getLspBudgetIdleTimeoutMs()).toBe(30_000);
 	});
@@ -235,7 +239,9 @@ describe("shouldDegradeAuxiliaryLsp (module-scope decision cache)", () => {
 	});
 
 	it("caches pressure from a fabricated registry file at the boundary", async () => {
-		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-budget-registry-"));
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-budget-registry-"),
+		);
 		const previousHome = process.env.PI_LENS_HOME;
 		const previousCeiling = process.env.PI_LENS_LSP_BUDGET_CEILING;
 		process.env.PI_LENS_HOME = tmp;

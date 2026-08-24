@@ -4,6 +4,7 @@ import {
 	getEventLoopStats,
 	isSuspendSuspectedBlock,
 	resetEventLoopMonitor,
+	shouldLogLoopBlock,
 	shouldLogWorstBlock,
 	startEventLoopMonitor,
 } from "../../clients/event-loop-monitor.js";
@@ -84,6 +85,30 @@ describe("shouldLogWorstBlock", () => {
 
 	it("logs a clearly worse block beyond the delta", () => {
 		expect(shouldLogWorstBlock(300, 200)).toBe(true); // 300 > 225
+	});
+});
+
+describe("shouldLogLoopBlock (#1723: log every block over the floor, not just a new worst)", () => {
+	it("logs a block above the floor even when it is far below a prior worst", () => {
+		// This is the load-bearing #1723 case: shouldLogWorstBlock(5000, 15000)
+		// would be false (5000 is nowhere near the 15000 high-water), so gating
+		// the LOG on it — as pre-fix code did — silently drops this block. The
+		// floor-only gate must still log it.
+		expect(shouldLogLoopBlock(5000)).toBe(true);
+		expect(shouldLogWorstBlock(5000, 15000)).toBe(false);
+	});
+
+	it("does not log a block below the floor", () => {
+		expect(shouldLogLoopBlock(40)).toBe(false);
+	});
+
+	it("logs a block exactly at the floor", () => {
+		expect(shouldLogLoopBlock(60)).toBe(true);
+	});
+
+	it("respects a custom floor", () => {
+		expect(shouldLogLoopBlock(90, 100)).toBe(false);
+		expect(shouldLogLoopBlock(110, 100)).toBe(true);
 	});
 });
 

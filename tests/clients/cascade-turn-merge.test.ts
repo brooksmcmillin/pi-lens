@@ -183,7 +183,9 @@ describe("cascade turn-end merge", () => {
 
 			// Turn 1: the 38-neighbour compute is still running at the cap.
 			runtime.beginTurn();
-			let release!: (r: import("../../clients/cascade-types.js").CascadeRun) => void;
+			let release!: (
+				r: import("../../clients/cascade-types.js").CascadeRun,
+			) => void;
 			runtime.appendCascadePromise(
 				new Promise((res) => {
 					release = res;
@@ -211,8 +213,8 @@ describe("cascade turn-end merge", () => {
 			);
 			await turnEnd();
 			const content =
-				consumeTurnEndFindings(cacheManager, env.tmpDir)?.messages[0]?.content ??
-				"";
+				consumeTurnEndFindings(cacheManager, env.tmpDir)?.messages[0]
+					?.content ?? "";
 			expect(content).toContain("consumer.ts");
 			expect(content).toContain("late high-fanout error");
 		} finally {
@@ -239,9 +241,8 @@ describe("cascade turn-end merge", () => {
 			recordOutstandingCascadeTouch,
 			reconcileOutstandingCascadeTouches,
 		} = await import("../../clients/lsp/cascade-tier.js");
-		const { buildResolvedFoundCascadeRun } = await import(
-			"../../clients/cascade-format.js"
-		);
+		const { buildResolvedFoundCascadeRun } =
+			await import("../../clients/cascade-format.js");
 		const { normalizeMapKey } = await import("../../clients/path-utils.js");
 		_resetOutstandingCascadeTouchesForTests();
 		try {
@@ -283,8 +284,8 @@ describe("cascade turn-end merge", () => {
 			);
 			await turnEnd();
 			expect(
-				consumeTurnEndFindings(cacheManager, env.tmpDir)?.messages[0]?.content ??
-					"",
+				consumeTurnEndFindings(cacheManager, env.tmpDir)?.messages[0]
+					?.content ?? "",
 			).not.toContain("neighbor.ts");
 
 			// --- Quiet window after turn 1: the pull result finally lands.
@@ -340,8 +341,8 @@ describe("cascade turn-end merge", () => {
 			);
 			await turnEnd();
 			const content =
-				consumeTurnEndFindings(cacheManager, env.tmpDir)?.messages[0]?.content ??
-				"";
+				consumeTurnEndFindings(cacheManager, env.tmpDir)?.messages[0]
+					?.content ?? "";
 			expect(content).toContain("neighbor.ts");
 			expect(content).toContain("late native TS7 error");
 
@@ -355,8 +356,8 @@ describe("cascade turn-end merge", () => {
 			);
 			await turnEnd();
 			expect(
-				consumeTurnEndFindings(cacheManager, env.tmpDir)?.messages[0]?.content ??
-					"",
+				consumeTurnEndFindings(cacheManager, env.tmpDir)?.messages[0]
+					?.content ?? "",
 			).not.toContain("late native TS7 error");
 		} finally {
 			_resetOutstandingCascadeTouchesForTests();
@@ -450,8 +451,8 @@ describe("cascade turn-end merge", () => {
 			);
 			await turnEnd();
 			expect(
-				consumeTurnEndFindings(cacheManager, env.tmpDir)?.messages[0]?.content ??
-					"",
+				consumeTurnEndFindings(cacheManager, env.tmpDir)?.messages[0]
+					?.content ?? "",
 			).not.toContain("neighbor.ts");
 
 			runtime.appendCascadeRun({
@@ -467,8 +468,8 @@ describe("cascade turn-end merge", () => {
 			runtime.beginTurn();
 			await turnEnd();
 			const turn2Content =
-				consumeTurnEndFindings(cacheManager, env.tmpDir)?.messages[0]?.content ??
-				"";
+				consumeTurnEndFindings(cacheManager, env.tmpDir)?.messages[0]
+					?.content ?? "";
 
 			// --- Turn 3 (edit): if turn 2 already delivered it, turn 3 must NOT
 			// see it again (exactly-once). If turn 2 did not deliver it, turn 3
@@ -483,8 +484,8 @@ describe("cascade turn-end merge", () => {
 			);
 			await turnEnd();
 			const turn3Content =
-				consumeTurnEndFindings(cacheManager, env.tmpDir)?.messages[0]?.content ??
-				"";
+				consumeTurnEndFindings(cacheManager, env.tmpDir)?.messages[0]
+					?.content ?? "";
 
 			const deliveredOnce =
 				(turn2Content.includes("late carried error") ? 1 : 0) +
@@ -548,8 +549,8 @@ describe("cascade turn-end merge", () => {
 			} as any);
 
 			const content =
-				consumeTurnEndFindings(cacheManager, env.tmpDir)?.messages[0]?.content ??
-				"";
+				consumeTurnEndFindings(cacheManager, env.tmpDir)?.messages[0]
+					?.content ?? "";
 			expect(content).toContain("unrelated-write-survives");
 		} finally {
 			env.cleanup();
@@ -606,8 +607,8 @@ describe("cascade turn-end merge", () => {
 			} as any);
 
 			const content =
-				consumeTurnEndFindings(cacheManager, env.tmpDir)?.messages[0]?.content ??
-				"";
+				consumeTurnEndFindings(cacheManager, env.tmpDir)?.messages[0]
+					?.content ?? "";
 			expect(content).not.toContain("superseded-by-own-write");
 			expect(logCascadeMock).toHaveBeenCalledWith(
 				expect.objectContaining({
@@ -616,6 +617,82 @@ describe("cascade turn-end merge", () => {
 					metadata: expect.objectContaining({
 						changedFiles: expect.arrayContaining([
 							expect.stringContaining("logger.ts"),
+						]),
+					}),
+				}),
+			);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("drops a budget carry-over when a selected neighbor was rewritten", async () => {
+		const env = setupTestEnvironment("cascade-budget-carry-over-drop-");
+		logCascadeMock.mockClear();
+		try {
+			const runtime = new RuntimeCoordinator();
+			const cacheManager = new CacheManager(false);
+			const primary = path.join(env.tmpDir, "logger.ts");
+			const neighbor = path.join(env.tmpDir, "consumer.ts");
+			fs.writeFileSync(primary, "export const log = 1;\n");
+			fs.writeFileSync(neighbor, "import { log } from './logger';\n");
+			cacheManager.addModifiedRange(
+				primary,
+				{ start: 1, end: 1 },
+				false,
+				env.tmpDir,
+			);
+
+			const originProjectSeq = runtime.bumpFileSeq(primary).projectSeq;
+			runtime.appendCascadeRun({
+				filePath: primary,
+				origin: { turnSeq: runtime.turnIndex, projectSeq: originProjectSeq },
+				result: undefined,
+				neighborCount: 1,
+				diagnosticCount: 0,
+				skipReason: "indeterminate",
+				selectedNeighborPaths: [neighbor],
+				indeterminate: {
+					reason: "budget_truncated",
+					detail: "budget detail",
+					budget: {
+						candidateCount: 2,
+						eligibleCount: 2,
+						selectedCount: 1,
+						truncatedCount: 1,
+					},
+				},
+			});
+
+			runtime.bumpFileSeq(neighbor);
+			await handleTurnEnd({
+				ctxCwd: env.tmpDir,
+				getFlag: () => false,
+				dbg: () => {},
+				runtime,
+				cacheManager,
+				knipClient: {
+					ensureAvailable: async () => false,
+					analyze: async () => EMPTY_KNIP_RESULT,
+				},
+				deadCodeClients: [],
+				depChecker: { ensureAvailable: async () => false },
+				testRunnerClient: { getTestRunTarget: () => null },
+				resetLSPService: () => {},
+				resetFormatService: () => {},
+			} as any);
+
+			const content =
+				consumeTurnEndFindings(cacheManager, env.tmpDir)?.messages[0]
+					?.content ?? "";
+			expect(content).not.toContain("budget detail");
+			expect(logCascadeMock).toHaveBeenCalledWith(
+				expect.objectContaining({
+					phase: "cascade_carry_over_drop",
+					reason: "superseded_by_later_write",
+					metadata: expect.objectContaining({
+						changedFiles: expect.arrayContaining([
+							expect.stringContaining("consumer.ts"),
 						]),
 					}),
 				}),
@@ -684,6 +761,69 @@ describe("cascade turn-end merge", () => {
 			// must NOT read as a hard blocker imperative.
 			expect(content).toContain("Advisory — no action required this turn");
 			expect(content).not.toContain("review dependents manually");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("uses the selected-neighbor frame for a budget-truncated cascade", async () => {
+		const env = setupTestEnvironment("cascade-budget-truncated-");
+		try {
+			const runtime = new RuntimeCoordinator();
+			const cacheManager = new CacheManager(false);
+			const primary = path.join(env.tmpDir, "budget-truncated.ts");
+			fs.writeFileSync(primary, "export const x = 1;\n");
+			cacheManager.addModifiedRange(
+				primary,
+				{ start: 1, end: 1 },
+				false,
+				env.tmpDir,
+			);
+
+			runtime.appendCascadeRun({
+				filePath: primary,
+				result: undefined,
+				neighborCount: 0,
+				diagnosticCount: 0,
+				skipReason: "indeterminate",
+				indeterminate: {
+					reason: "budget_truncated",
+					detail:
+						"cascade budget checked 10 of 40 eligible dependents (30 omitted)",
+					budget: {
+						candidateCount: 40,
+						eligibleCount: 40,
+						selectedCount: 10,
+						truncatedCount: 30,
+					},
+				},
+			});
+
+			await handleTurnEnd({
+				ctxCwd: env.tmpDir,
+				getFlag: () => false,
+				dbg: () => {},
+				runtime,
+				cacheManager,
+				knipClient: {
+					ensureAvailable: async () => false,
+					analyze: async () => EMPTY_KNIP_RESULT,
+				},
+				deadCodeClients: [],
+				depChecker: { ensureAvailable: async () => false },
+				testRunnerClient: { getTestRunTarget: () => null },
+				resetLSPService: () => {},
+				resetFormatService: () => {},
+			} as any);
+
+			const findings = consumeTurnEndFindings(cacheManager, env.tmpDir);
+			const content = findings?.messages[0]?.content ?? "";
+			expect(content).toContain("Cascade checked the selected neighbors");
+			expect(content).toContain(
+				"cascade budget checked 10 of 40 eligible dependents (30 omitted)",
+			);
+			expect(content).toContain("a clean cascade result does not cover them");
+			expect(content).not.toContain("the review graph was unavailable");
 		} finally {
 			env.cleanup();
 		}
@@ -822,9 +962,7 @@ describe("cascade turn-end merge", () => {
 			const indeterminateLog = logCascadeMock.mock.calls
 				.map((args) => args[0])
 				.find((entry) => entry?.phase === "cascade_indeterminate");
-			expect(indeterminateLog?.metadata?.reasons).toContain(
-				"excluded_by_role",
-			);
+			expect(indeterminateLog?.metadata?.reasons).toContain("excluded_by_role");
 		} finally {
 			env.cleanup();
 		}
@@ -874,7 +1012,9 @@ describe("cascade turn-end merge", () => {
 
 			const findings = consumeTurnEndFindings(cacheManager, env.tmpDir);
 			const content = findings?.messages[0]?.content ?? "";
-			expect(content).not.toContain("Cascade could not compute downstream impact");
+			expect(content).not.toContain(
+				"Cascade could not compute downstream impact",
+			);
 		} finally {
 			env.cleanup();
 		}
@@ -928,8 +1068,8 @@ describe("cascade turn-end merge", () => {
 			// The record fired means the section reached blockerParts — confirm
 			// the text was actually queued, the precondition the record proves.
 			const content =
-				consumeTurnEndFindings(cacheManager, env.tmpDir)?.messages[0]?.content ??
-				"";
+				consumeTurnEndFindings(cacheManager, env.tmpDir)?.messages[0]
+					?.content ?? "";
 			expect(content).toContain("injected error");
 
 			expect(logCascadeMock).toHaveBeenCalledWith(
@@ -1001,7 +1141,11 @@ describe("cascade turn-end merge", () => {
 			await turnEnd({
 				getTestRunTarget: () => null,
 				suggestTestFiles: () => [
-					{ testFile: neighborTestFile, sourceFile: neighbor, runner: "vitest" },
+					{
+						testFile: neighborTestFile,
+						sourceFile: neighbor,
+						runner: "vitest",
+					},
 				],
 			});
 			expect(logCascadeMock).toHaveBeenCalledWith(

@@ -120,16 +120,14 @@ function warnInvalidLSPConfig(configPath: string, error: unknown): void {
 	notifyUserDegradation(`pi-lens: ${message}`);
 }
 
-async function readLSPConfig(configPath: string): Promise<LSPConfig | undefined> {
+async function readLSPConfig(
+	configPath: string,
+): Promise<LSPConfig | undefined> {
 	let content: string;
 	try {
 		content = await fs.readFile(configPath, "utf-8");
 	} catch (error) {
-		if (
-			error instanceof Error &&
-			"code" in error &&
-			error.code === "ENOENT"
-		) {
+		if (error instanceof Error && "code" in error && error.code === "ENOENT") {
 			return undefined;
 		}
 		warnInvalidLSPConfig(configPath, error);
@@ -294,7 +292,8 @@ export async function initLSPConfig(cwd: string): Promise<void> {
 		if (config.serverOverrides) {
 			for (const [id, entry] of Object.entries(config.serverOverrides)) {
 				if (entry && typeof entry === "object" && !Array.isArray(entry)) {
-					const initOpts = (entry as Record<string, unknown>).initializationOptions;
+					const initOpts = (entry as Record<string, unknown>)
+						.initializationOptions;
 					if (
 						initOpts !== undefined &&
 						typeof initOpts === "object" &&
@@ -348,7 +347,8 @@ export function getServersForFileWithConfig(filePath: string): LSPServerInfo[] {
 	const base = path.basename(filePath).toLowerCase();
 	return getAllServers(filePath).filter((server) => {
 		const extensions = server.extensions.map((value) => value.toLowerCase());
-		const extensionMatch = extensions.includes(ext) || extensions.includes(base);
+		const extensionMatch =
+			extensions.includes(ext) || extensions.includes(base);
 		if (!extensionMatch) return false;
 		// #636: a server's extension match can be intentionally broader than what
 		// it can usefully act on (zizmor attaches to "yaml" but only ever reports
@@ -374,8 +374,9 @@ export function getServersForFileWithConfig(filePath: string): LSPServerInfo[] {
  * now report the same primary-vs-auxiliary split for the same file.
  */
 export function primaryServerId(filePath: string): string | undefined {
-	return getServersForFileWithConfig(filePath).find((s) => s.role !== "auxiliary")
-		?.id;
+	return getServersForFileWithConfig(filePath).find(
+		(s) => s.role !== "auxiliary",
+	)?.id;
 }
 
 /**

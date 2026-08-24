@@ -24,6 +24,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { writeFileAtomic, writeFileAtomicAsync } from "./atomic-write.js";
+import { recordDegradationOnce } from "./degradation-ledger.js";
 import { getGlobalPiLensDir } from "./file-utils.js";
 // #735: reuse the #449/#525 reaper's exact conservative liveness check
 // (`process.kill(pid, 0)`, ESRCH-only-means-dead) rather than inventing a
@@ -36,10 +37,7 @@ import { getGlobalPiLensDir } from "./file-utils.js";
 // import is actually invoked.
 import { realIsPidAlive } from "./instance-reaper.js";
 import { normalizeFilePath } from "./path-utils.js";
-import {
-	getSubagentIdentity,
-	isSubagentSession,
-} from "./subagent-mode.js";
+import { getSubagentIdentity, isSubagentSession } from "./subagent-mode.js";
 
 export interface LspChildEntry {
 	pid: number;
@@ -112,6 +110,31 @@ export function _resetInstanceRegistryEnabledForTests(): void {
 
 // --- Read ---
 
+/**
+ * Distinguishes "no registry yet" (ENOENT — a genuinely clean start, never
+ * recorded) from "a registry file exists but couldn't be trusted" (corrupt
+ * JSON, wrong shape, or another read error — e.g. a torn write left behind by
+ * a killed process, #1609 layer b). Both degrade to `{ instances: [] }`
+ * either way (this store is purely observational, per the module docstring),
+ * but only the latter is worth recording — a clean empty start must never
+ * read the same as a corrupt one, or a genuine torn-file regression would be
+ * invisible.
+ *
+ * `readRegistrySync`/`readRegistryAsync` are called from many sites across a
+ * session (register/heartbeat/reap/footprint — not only session_start), so
+ * this goes through `recordDegradationOnce` (#1609 review, the small fix)
+ * rather than a plain log call: the ledger's own per-kind/subject dedup caps
+ * it at one record for the session regardless of how many times the same
+ * torn file gets re-read, instead of re-logging on every call.
+ */
+function recordCorruptRegistryRead(reasonCode: string): void {
+	recordDegradationOnce({
+		kind: "instance-registry-corrupt",
+		subject: "instances.json",
+		reason: `read failed (${reasonCode}); treating as empty`,
+	});
+}
+
 function readRegistrySync(): RegistryFile {
 	try {
 		const raw = fs.readFileSync(registryPath(), "utf-8");
@@ -119,9 +142,14 @@ function readRegistrySync(): RegistryFile {
 		if (parsed && Array.isArray(parsed.instances)) {
 			return parsed as RegistryFile;
 		}
+		recordCorruptRegistryRead("invalid shape");
 		return { instances: [] };
-	} catch {
-		// Missing file, corrupt JSON, or wrong shape — treat as empty, never throw.
+	} catch (err) {
+		// Missing file, corrupt JSON, or a read error — treat as empty, never
+		// throw. Missing (ENOENT) is a clean start and stays silent; anything
+		// else is recorded so a corrupt/torn file is distinguishable from one.
+		const code = (err as NodeJS.ErrnoException | undefined)?.code;
+		if (code !== "ENOENT") recordCorruptRegistryRead(code ?? "invalid");
 		return { instances: [] };
 	}
 }
@@ -133,8 +161,11 @@ async function readRegistryAsync(): Promise<RegistryFile> {
 		if (parsed && Array.isArray(parsed.instances)) {
 			return parsed as RegistryFile;
 		}
+		recordCorruptRegistryRead("invalid shape");
 		return { instances: [] };
-	} catch {
+	} catch (err) {
+		const code = (err as NodeJS.ErrnoException | undefined)?.code;
+		if (code !== "ENOENT") recordCorruptRegistryRead(code ?? "invalid");
 		return { instances: [] };
 	}
 }
@@ -225,7 +256,9 @@ export interface HeartbeatPatch {
 
 /** Update this process's heartbeat/rss (and, since #620, host CPU% + live
  *  LSP children's rss/CPU%). Cheap — safe to call every turn end. */
-export async function updateHeartbeat(patch: HeartbeatPatch = {}): Promise<void> {
+export async function updateHeartbeat(
+	patch: HeartbeatPatch = {},
+): Promise<void> {
 	if (!isInstanceRegistryEnabled()) return;
 	const pid = process.pid;
 	const file = await readRegistryAsync();
@@ -267,8 +300,35 @@ export interface RecordLspChildInput {
 	marker?: string;
 }
 
+// Every mutation below (`recordLspChild`, `removeLspChild`) reads the WHOLE
+// registry file, edits this process's own `lspChildren`, and writes the whole
+// file back. Two such mutations from the SAME process — e.g. a client-ceiling
+// eviction's `removeLspChild(victimPid)` racing the replacement spawn's
+// `recordLspChild(newChild)` that follows it — are ordinary concurrent async
+// calls with no ordering guarantee between them. Without serialization, the
+// later WRITE can be built from a read taken before the earlier write landed,
+// silently reverting it (last-writer-wins losing a same-process update, not
+// just the already-accepted cross-process one — see the module docstring).
+// #1724: this is why a forced LSP shutdown's deregistration could get
+// clobbered by a concurrent respawn's registration. One shared tail
+// serializes every same-process registry mutation of this shape so "record"
+// and "remove" can never interleave their read-modify-write against each
+// other — the single seam both the forced-shutdown and self-crash
+// deregistration paths route through.
+let registryChildMutationTail: Promise<void> = Promise.resolve();
+
+function queueRegistryChildMutation(op: () => Promise<void>): Promise<void> {
+	const run = registryChildMutationTail.then(op);
+	registryChildMutationTail = run.catch(() => {});
+	return run;
+}
+
 /** Append/replace (by pid) an LSP child under this process's entry. */
-export async function recordLspChild(entry: RecordLspChildInput): Promise<void> {
+export function recordLspChild(entry: RecordLspChildInput): Promise<void> {
+	return queueRegistryChildMutation(() => recordLspChildNow(entry));
+}
+
+async function recordLspChildNow(entry: RecordLspChildInput): Promise<void> {
 	if (!isInstanceRegistryEnabled()) return;
 	const pid = process.pid;
 	const file = await readRegistryAsync();
@@ -308,28 +368,45 @@ export async function recordLspChild(entry: RecordLspChildInput): Promise<void> 
 	await writeRegistryAsync(file);
 }
 
-// LSP client shutdown intentionally does not await registry removal (the
-// process-exiting path must stay non-blocking), but concurrent removals still
-// need to serialize their read-modify-write sequence or siblings can be lost
-// to last-writer-wins. Process kills remain fully concurrent; this queue only
-// covers the small best-effort registry mutation.
-let lspChildRemovalTail: Promise<void> = Promise.resolve();
-
-/** Remove an LSP child (by pid) from this process's entry. */
-export function removeLspChild(pid: number): Promise<void> {
-	const removal = lspChildRemovalTail.then(() => removeLspChildNow(pid));
-	lspChildRemovalTail = removal.catch(() => {});
-	return removal;
+/**
+ * Remove an LSP child (by pid) from this process's entry. `expectedMarker`,
+ * when supplied, guards against the pid-recycling window between this
+ * child's death and this call landing: if the recorded entry for `pid` now
+ * carries a DIFFERENT marker than the one this caller spawned, some other
+ * child has already claimed that pid (recycled) and must not be removed on
+ * this caller's behalf — same asymmetric-safety contract as the reaper's
+ * `buildIdentityMatcher` (never remove on an unverifiable/mismatched
+ * identity). Omit `expectedMarker` for a server this process never derived a
+ * marker for (pid-only match, unchanged pre-#1724 behavior) — safe because
+ * this call fires synchronously off THIS process's own just-confirmed exit
+ * of that exact pid, well inside the OS's pid-reuse latency.
+ */
+export function removeLspChild(
+	pid: number,
+	expectedMarker?: string,
+): Promise<void> {
+	return queueRegistryChildMutation(() =>
+		removeLspChildNow(pid, expectedMarker),
+	);
 }
 
-async function removeLspChildNow(pid: number): Promise<void> {
+async function removeLspChildNow(
+	pid: number,
+	expectedMarker?: string,
+): Promise<void> {
 	if (!isInstanceRegistryEnabled()) return;
 	const selfPid = process.pid;
 	const file = await readRegistryAsync();
 	const idx = file.instances.findIndex((inst) => inst.pid === selfPid);
 	if (idx === -1) return;
 	const current = file.instances[idx];
-	const filtered = current.lspChildren.filter((child) => child.pid !== pid);
+	const filtered = current.lspChildren.filter((child) => {
+		if (child.pid !== pid) return true; // keep — different pid
+		if (expectedMarker && child.marker && child.marker !== expectedMarker) {
+			return true; // keep — pid recycled onto a differently-marked child
+		}
+		return false; // drop — this is the child we're deregistering
+	});
 	if (filtered.length === current.lspChildren.length) return; // nothing removed
 	file.instances[idx] = {
 		...current,
@@ -480,7 +557,9 @@ export async function getResourceFootprint(
 ): Promise<ResourceFootprint> {
 	const instances = await readInstanceRegistry();
 	const deadPids = new Set(
-		instances.filter((instance) => !isPidAlive(instance.pid)).map((instance) => instance.pid),
+		instances
+			.filter((instance) => !isPidAlive(instance.pid))
+			.map((instance) => instance.pid),
 	);
 	if (deadPids.size > 0) {
 		// Fire-and-forget: a health-report read must never block on, or fail

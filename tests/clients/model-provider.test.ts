@@ -9,7 +9,9 @@ describe("deriveProviderFromModelId (#1448)", () => {
 	});
 
 	it("splits a provider/model id on a single slash separator", () => {
-		expect(deriveProviderFromModelId("anthropic/claude-sonnet-4-5")).toBe("anthropic");
+		expect(deriveProviderFromModelId("anthropic/claude-sonnet-4-5")).toBe(
+			"anthropic",
+		);
 	});
 
 	it("splits a provider:model id on a single colon separator", () => {
@@ -17,7 +19,9 @@ describe("deriveProviderFromModelId (#1448)", () => {
 	});
 
 	it("lowercases the derived provider", () => {
-		expect(deriveProviderFromModelId("Anthropic/Claude-Sonnet-4-5")).toBe("anthropic");
+		expect(deriveProviderFromModelId("Anthropic/Claude-Sonnet-4-5")).toBe(
+			"anthropic",
+		);
 	});
 
 	it("matches known vendor prefixes when there is no separator", () => {

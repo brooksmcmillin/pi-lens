@@ -3,7 +3,10 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+const root = path.resolve(
+	path.dirname(fileURLToPath(import.meta.url)),
+	"../..",
+);
 
 // Third-party deps that must be imported ONLY through clients/deps/* accessors,
 // never bare elsewhere — so each external dep has a single resolution/degrade/

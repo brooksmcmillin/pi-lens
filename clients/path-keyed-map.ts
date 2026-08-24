@@ -67,7 +67,8 @@ export class PathKeyedMap<V> {
 	}
 
 	*entries(): IterableIterator<[string, V]> {
-		for (const entry of this.store.values()) yield [entry.displayPath, entry.value];
+		for (const entry of this.store.values())
+			yield [entry.displayPath, entry.value];
 	}
 
 	forEach(callback: (value: V, path: string, map: this) => void): void {

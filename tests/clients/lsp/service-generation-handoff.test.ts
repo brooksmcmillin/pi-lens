@@ -43,9 +43,8 @@ describe("LSP singleton generation handoff (#850)", () => {
 	});
 
 	it("blocks replacement spawn until the retiring generation finishes shutdown", async () => {
-		const { getLSPService, resetLSPService } = await import(
-			"../../../clients/lsp/index.js"
-		);
+		const { getLSPService, resetLSPService } =
+			await import("../../../clients/lsp/index.js");
 		const retiringShutdown = deferred();
 		const secondSpawned = deferred();
 		let spawnCount = 0;
@@ -111,9 +110,8 @@ describe("LSP singleton generation handoff (#850)", () => {
 	});
 
 	it("never revives an intermediate generation reset while waiting for handoff", async () => {
-		const { getLSPService, resetLSPService } = await import(
-			"../../../clients/lsp/index.js"
-		);
+		const { getLSPService, resetLSPService } =
+			await import("../../../clients/lsp/index.js");
 		const retiringShutdown = deferred();
 		let spawnCount = 0;
 		const spawn = vi.fn(async () => {

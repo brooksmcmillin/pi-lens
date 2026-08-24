@@ -34,7 +34,9 @@ function parseZigOutput(raw: string, filePath: string): Diagnostic[] {
 			line: Number.parseInt(lineStr, 10) || 1,
 			column: Number.parseInt(colStr, 10) || 1,
 			severity,
-			semantic: severity === "error" ? "blocking" : "warning",
+			// `zig build-exe <file>` does not load build.zig module/import context.
+			// Its findings are useful evidence, but cannot prove a project blocker.
+			semantic: "warning",
 			tool: "zig",
 			rule: `zig-${level}`,
 			fixable: false,
@@ -59,7 +61,7 @@ const zigCheckRunner: RunnerDefinition = {
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
 		const cwd = ctx.cwd || process.cwd();
-		if (!(await (zig.isAvailableAsync(cwd)))) {
+		if (!(await zig.isAvailableAsync(cwd))) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
@@ -107,7 +109,7 @@ const zigCheckRunner: RunnerDefinition = {
 		return {
 			status: hasErrors ? "failed" : "succeeded",
 			diagnostics,
-			semantic: hasErrors ? "blocking" : "warning",
+			semantic: "warning",
 		};
 	},
 };

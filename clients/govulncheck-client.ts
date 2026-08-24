@@ -308,6 +308,27 @@ export class GovulncheckClient extends SecurityScanClient<GovulncheckResult> {
 		if (!reprobe.error && reprobe.status === 0) {
 			this.log("govulncheck auto-installed and found on PATH");
 			this.available = true;
+			// The initial PATH probe already wrote a latched `unavailable` row
+			// (#1500's own assertion doesn't fire here — the reprobe SUCCEEDED —
+			// but that first probe's verdict still logged, before `go install`
+			// ever ran). Without a compensating row here, the durable record says
+			// govulncheck is off when `go install` just put it on PATH (#1606).
+			logAvailabilityDecision({
+				tool: "govulncheck",
+				verdict: "available",
+				outcome: "success",
+				cause: "ok",
+				elapsedMs: Date.now() - reprobeStartedAt,
+				latched: true,
+				hostStallMs: reprobeHostStallMs,
+				budgetMs: 5000,
+				classifiedBy: "caller",
+				evidence: {
+					install: "succeeded",
+					binary: "govulncheck",
+					source: "go-install",
+				},
+			});
 			return true;
 		}
 
@@ -329,6 +350,24 @@ export class GovulncheckClient extends SecurityScanClient<GovulncheckResult> {
 					this.binaryPath = candidate;
 					this.available = true;
 					this.log(`govulncheck auto-installed at ${candidate}`);
+					// Same compensating row as the on-PATH reprobe arm above (#1606):
+					// the initial probe already latched `unavailable`, and this arm
+					// is the OTHER way to recover — the canonical $GOBIN/$GOPATH walk
+					// found it after the on-PATH reprobe missed.
+					logAvailabilityDecision({
+						tool: "govulncheck",
+						verdict: "available",
+						outcome: "success",
+						cause: "ok",
+						elapsedMs: Date.now() - installStartedAt,
+						latched: true,
+						classifiedBy: "caller",
+						evidence: {
+							install: "succeeded",
+							binary: path.basename(candidate),
+							source: "go-install",
+						},
+					});
 					return true;
 				}
 			} catch {
@@ -366,7 +405,9 @@ export class GovulncheckClient extends SecurityScanClient<GovulncheckResult> {
 		// is nowhere the re-probe or the canonical bin dirs could find it. That is a
 		// durable, actionable fact — and until now it latched with no record at all,
 		// so a $GOBIN misconfiguration was indistinguishable from govulncheck simply
-		// not being installed. `install: "succeeded"` appears here and nowhere else.
+		// not being installed. `install: "succeeded"` also appears on the two success
+		// arms above (#1606's compensating `available` rows) — this is the durable
+		// FAILURE counterpart, an install that worked but left nothing locatable.
 		this.log(
 			"govulncheck auto-install succeeded but binary not locatable — check $GOBIN / $GOPATH",
 		);
@@ -374,7 +415,8 @@ export class GovulncheckClient extends SecurityScanClient<GovulncheckResult> {
 			{
 				...describeProbeEvidence(reprobe, "govulncheck"),
 				install: "succeeded",
-				installReason: "installed binary not found on PATH, $GOBIN or $GOPATH/bin",
+				installReason:
+					"installed binary not found on PATH, $GOBIN or $GOPATH/bin",
 			},
 			{ elapsedMs: Date.now() - reprobeStartedAt },
 		);
@@ -445,8 +487,7 @@ export class GovulncheckClient extends SecurityScanClient<GovulncheckResult> {
 			return {
 				...EMPTY_RESULT,
 				scannedAt,
-				summary:
-					err instanceof Error ? err.message.slice(0, 200) : String(err),
+				summary: err instanceof Error ? err.message.slice(0, 200) : String(err),
 			};
 		}
 	}
@@ -501,7 +542,8 @@ export function parseGovulncheckJson(stream: string): GovulncheckFinding[] {
 				module: packageName,
 				fixedVersion,
 				summary: asOsv.osv.summary ?? asOsv.osv.details,
-				url: asOsv.osv.database_specific?.url ?? affected?.database_specific?.url,
+				url:
+					asOsv.osv.database_specific?.url ?? affected?.database_specific?.url,
 			});
 		}
 	}

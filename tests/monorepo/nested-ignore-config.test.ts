@@ -40,9 +40,7 @@
 
 import { describe, expect, it } from "vitest";
 import { getProjectIgnoreMatcher } from "../../clients/file-utils.js";
-import {
-	resetProjectLensConfigCache,
-} from "../../clients/project-lens-config.js";
+import { resetProjectLensConfigCache } from "../../clients/project-lens-config.js";
 import { getProjectScaleBase } from "../../clients/project-scale.js";
 import { makeMonorepo, type MonorepoPackageSpec } from "./fixture.js";
 
@@ -69,10 +67,7 @@ describe("nested .gitignore + .pi-lens.json layering in a monorepo (#775 item 5)
 			// it — that's how a non-"/**"-suffixed pattern like "**/generated"
 			// excludes an entire subtree without matching every file inside it.
 			expect(
-				matcher.isIgnored(
-					repo.filePath("@scope/a", "generated"),
-					true,
-				),
+				matcher.isIgnored(repo.filePath("@scope/a", "generated"), true),
 			).toBe(true);
 			expect(
 				matcher.isIgnored(repo.filePath("@scope/a", "local-secret.ts"), false),
@@ -109,48 +104,45 @@ describe("nested .gitignore + .pi-lens.json layering in a monorepo (#775 item 5)
 			}
 		});
 
-		it(
-			"FIXED (#783): a package-local .pi-lens.json's `ignore` field IS consulted, alongside the root .pi-lens.json's ignore patterns",
-			() => {
-				const pkg: MonorepoPackageSpec = {
-					name: "@scope/a",
-					dir: "packages/a",
-					files: {
-						"src/package-local-ignored.ts": "export const x = 1;\n",
-						"src/root-ignored.ts": "export const y = 1;\n",
-					},
-					// This package asks pi-lens to ignore its own generated-ish file...
-					piLensConfig: { ignore: ["src/package-local-ignored.ts"] },
-				};
-				const repo = makeMonorepo({
-					packages: [pkg],
-					// ...and the root asks for a DIFFERENT file to be ignored.
-					rootPiLensConfig: { ignore: ["packages/a/src/root-ignored.ts"] },
-				});
-				try {
-					resetProjectLensConfigCache();
-					const matcher = getProjectIgnoreMatcher(repo.root);
-					// The root's ignore rule reaches into the package fine...
-					expect(
-						matcher.isIgnored(
-							repo.filePath("@scope/a", "src/root-ignored.ts"),
-							false,
-						),
-					).toBe(true);
-					// ...and the package's OWN .pi-lens.json ignore rule for a file
-					// inside itself is now also honored (#783).
-					expect(
-						matcher.isIgnored(
-							repo.filePath("@scope/a", "src/package-local-ignored.ts"),
-							false,
-						),
-					).toBe(true);
-				} finally {
-					resetProjectLensConfigCache();
-					repo.cleanup();
-				}
-			},
-		);
+		it("FIXED (#783): a package-local .pi-lens.json's `ignore` field IS consulted, alongside the root .pi-lens.json's ignore patterns", () => {
+			const pkg: MonorepoPackageSpec = {
+				name: "@scope/a",
+				dir: "packages/a",
+				files: {
+					"src/package-local-ignored.ts": "export const x = 1;\n",
+					"src/root-ignored.ts": "export const y = 1;\n",
+				},
+				// This package asks pi-lens to ignore its own generated-ish file...
+				piLensConfig: { ignore: ["src/package-local-ignored.ts"] },
+			};
+			const repo = makeMonorepo({
+				packages: [pkg],
+				// ...and the root asks for a DIFFERENT file to be ignored.
+				rootPiLensConfig: { ignore: ["packages/a/src/root-ignored.ts"] },
+			});
+			try {
+				resetProjectLensConfigCache();
+				const matcher = getProjectIgnoreMatcher(repo.root);
+				// The root's ignore rule reaches into the package fine...
+				expect(
+					matcher.isIgnored(
+						repo.filePath("@scope/a", "src/root-ignored.ts"),
+						false,
+					),
+				).toBe(true);
+				// ...and the package's OWN .pi-lens.json ignore rule for a file
+				// inside itself is now also honored (#783).
+				expect(
+					matcher.isIgnored(
+						repo.filePath("@scope/a", "src/package-local-ignored.ts"),
+						false,
+					),
+				).toBe(true);
+			} finally {
+				resetProjectLensConfigCache();
+				repo.cleanup();
+			}
+		});
 
 		it("root .pi-lens.json ignore patterns still apply project-wide when there is no nested config at all", () => {
 			const pkg: MonorepoPackageSpec = {

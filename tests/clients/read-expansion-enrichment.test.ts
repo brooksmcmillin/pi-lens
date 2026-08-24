@@ -116,7 +116,10 @@ describe("read-expansion LSP enrichment (#158)", () => {
 				{
 					name: "ReviewManager",
 					kind: 5,
-					range: { start: { line: 0, column: 0 }, end: { line: 12, column: 1 } },
+					range: {
+						start: { line: 0, column: 0 },
+						end: { line: 12, column: 1 },
+					},
 					children: [
 						{
 							name: "runSynthesis",
@@ -154,7 +157,10 @@ describe("read-expansion LSP enrichment (#158)", () => {
 					kind: 3,
 					containerName: undefined,
 					location: {
-						range: { start: { line: 0, column: 0 }, end: { line: 12, column: 1 } },
+						range: {
+							start: { line: 0, column: 0 },
+							end: { line: 12, column: 1 },
+						},
 					},
 				},
 				{
@@ -162,7 +168,10 @@ describe("read-expansion LSP enrichment (#158)", () => {
 					kind: 5,
 					containerName: "Outer",
 					location: {
-						range: { start: { line: 1, column: 0 }, end: { line: 12, column: 1 } },
+						range: {
+							start: { line: 1, column: 0 },
+							end: { line: 12, column: 1 },
+						},
 					},
 				},
 				{
@@ -170,7 +179,10 @@ describe("read-expansion LSP enrichment (#158)", () => {
 					kind: 6,
 					containerName: "Inner",
 					location: {
-						range: { start: { line: 4, column: 0 }, end: { line: 11, column: 1 } },
+						range: {
+							start: { line: 4, column: 0 },
+							end: { line: 11, column: 1 },
+						},
 					},
 				},
 			]);

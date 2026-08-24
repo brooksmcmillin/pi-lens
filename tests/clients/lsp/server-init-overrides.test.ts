@@ -43,32 +43,28 @@ afterEach(() => {
 
 describe("mergeInitializationOptions", () => {
 	it("returns undefined when both sides are undefined", async () => {
-		const { mergeInitializationOptions } = await import(
-			"../../../clients/lsp/index.js"
-		);
+		const { mergeInitializationOptions } =
+			await import("../../../clients/lsp/index.js");
 		expect(mergeInitializationOptions(undefined, undefined)).toBeUndefined();
 	});
 
 	it("returns base when override is undefined", async () => {
-		const { mergeInitializationOptions } = await import(
-			"../../../clients/lsp/index.js"
-		);
+		const { mergeInitializationOptions } =
+			await import("../../../clients/lsp/index.js");
 		const base = { cargo: { buildScripts: { enable: true } } };
 		expect(mergeInitializationOptions(base, undefined)).toBe(base);
 	});
 
 	it("returns override when base is undefined", async () => {
-		const { mergeInitializationOptions } = await import(
-			"../../../clients/lsp/index.js"
-		);
+		const { mergeInitializationOptions } =
+			await import("../../../clients/lsp/index.js");
 		const override = { nixpkgs: { expr: "import <nixpkgs> {}" } };
 		expect(mergeInitializationOptions(undefined, override)).toBe(override);
 	});
 
 	it("deep-merges override onto base — user wins on conflicts", async () => {
-		const { mergeInitializationOptions } = await import(
-			"../../../clients/lsp/index.js"
-		);
+		const { mergeInitializationOptions } =
+			await import("../../../clients/lsp/index.js");
 		const base = {
 			cargo: { buildScripts: { enable: true } },
 			procMacro: { enable: true },
@@ -80,7 +76,9 @@ describe("mergeInitializationOptions", () => {
 		};
 		const result = mergeInitializationOptions(base, override);
 		// Override keys are added
-		expect(result).toMatchObject({ check: { command: "clippy", allTargets: true } });
+		expect(result).toMatchObject({
+			check: { command: "clippy", allTargets: true },
+		});
 		// Deep merge: cargo.features added, cargo.buildScripts preserved
 		expect(result?.cargo).toEqual({
 			buildScripts: { enable: true },
@@ -93,9 +91,8 @@ describe("mergeInitializationOptions", () => {
 	});
 
 	it("override wins when both sides have the same leaf key", async () => {
-		const { mergeInitializationOptions } = await import(
-			"../../../clients/lsp/index.js"
-		);
+		const { mergeInitializationOptions } =
+			await import("../../../clients/lsp/index.js");
 		const base = { diagnostics: { enable: false } };
 		const override = { diagnostics: { enable: true } };
 		const result = mergeInitializationOptions(base, override);
@@ -103,9 +100,8 @@ describe("mergeInitializationOptions", () => {
 	});
 
 	it("replaces arrays rather than merging them", async () => {
-		const { mergeInitializationOptions } = await import(
-			"../../../clients/lsp/index.js"
-		);
+		const { mergeInitializationOptions } =
+			await import("../../../clients/lsp/index.js");
 		const base = { files: { exclude: ["**/target/**"] } };
 		const override = { files: { exclude: ["**/target/**", "**/dist/**"] } };
 		const result = mergeInitializationOptions(base, override);
@@ -113,9 +109,8 @@ describe("mergeInitializationOptions", () => {
 	});
 
 	it("does not mutate the base object", async () => {
-		const { mergeInitializationOptions } = await import(
-			"../../../clients/lsp/index.js"
-		);
+		const { mergeInitializationOptions } =
+			await import("../../../clients/lsp/index.js");
 		const base = { cargo: { buildScripts: { enable: true } } };
 		const baseCopy = JSON.parse(JSON.stringify(base)) as typeof base;
 		mergeInitializationOptions(base, { cargo: { features: "all" } });
@@ -129,17 +124,25 @@ describe("mergeInitializationOptions", () => {
 
 describe("getServerInitOverride", () => {
 	it("returns undefined when no config file exists", async () => {
-		const { initLSPConfig, getServerInitOverride, resetLSPConfigStateForTests } =
-			await import("../../../clients/lsp/config.js");
+		const {
+			initLSPConfig,
+			getServerInitOverride,
+			resetLSPConfigStateForTests,
+		} = await import("../../../clients/lsp/config.js");
 		const dir = tmpDir();
 		resetLSPConfigStateForTests();
 		await initLSPConfig(dir);
-		expect(getServerInitOverride("rust", path.join(dir, "src/main.rs"))).toBeUndefined();
+		expect(
+			getServerInitOverride("rust", path.join(dir, "src/main.rs")),
+		).toBeUndefined();
 	});
 
 	it("returns undefined for an unrecognised server ID even when config exists", async () => {
-		const { initLSPConfig, getServerInitOverride, resetLSPConfigStateForTests } =
-			await import("../../../clients/lsp/config.js");
+		const {
+			initLSPConfig,
+			getServerInitOverride,
+			resetLSPConfigStateForTests,
+		} = await import("../../../clients/lsp/config.js");
 		const dir = tmpDir();
 		fs.mkdirSync(path.join(dir, ".pi-lens"), { recursive: true });
 		fs.writeFileSync(
@@ -158,8 +161,11 @@ describe("getServerInitOverride", () => {
 	});
 
 	it("returns override for a named server when .pi-lens/lsp.json is present", async () => {
-		const { initLSPConfig, getServerInitOverride, resetLSPConfigStateForTests } =
-			await import("../../../clients/lsp/config.js");
+		const {
+			initLSPConfig,
+			getServerInitOverride,
+			resetLSPConfigStateForTests,
+		} = await import("../../../clients/lsp/config.js");
 		const dir = tmpDir();
 		fs.mkdirSync(path.join(dir, ".pi-lens"), { recursive: true });
 		fs.writeFileSync(
@@ -177,7 +183,10 @@ describe("getServerInitOverride", () => {
 		);
 		resetLSPConfigStateForTests();
 		await initLSPConfig(dir);
-		const override = getServerInitOverride("rust", path.join(dir, "src/main.rs"));
+		const override = getServerInitOverride(
+			"rust",
+			path.join(dir, "src/main.rs"),
+		);
 		expect(override?.initializationOptions).toEqual({
 			check: { command: "clippy", allTargets: true },
 			cargo: { features: "all" },
@@ -185,8 +194,11 @@ describe("getServerInitOverride", () => {
 	});
 
 	it("resolves override from a parent directory (.pi-lens.json format)", async () => {
-		const { initLSPConfig, getServerInitOverride, resetLSPConfigStateForTests } =
-			await import("../../../clients/lsp/config.js");
+		const {
+			initLSPConfig,
+			getServerInitOverride,
+			resetLSPConfigStateForTests,
+		} = await import("../../../clients/lsp/config.js");
 		const dir = tmpDir();
 		const subdir = path.join(dir, "src", "nested");
 		fs.mkdirSync(subdir, { recursive: true });
@@ -205,15 +217,21 @@ describe("getServerInitOverride", () => {
 		);
 		resetLSPConfigStateForTests();
 		await initLSPConfig(subdir);
-		const override = getServerInitOverride("nix", path.join(subdir, "flake.nix"));
+		const override = getServerInitOverride(
+			"nix",
+			path.join(subdir, "flake.nix"),
+		);
 		expect(override?.initializationOptions?.nixpkgs).toEqual({
 			expr: "import <nixpkgs> {}",
 		});
 	});
 
 	it("silently ignores a serverOverrides entry whose initializationOptions is not a plain object", async () => {
-		const { initLSPConfig, getServerInitOverride, resetLSPConfigStateForTests } =
-			await import("../../../clients/lsp/config.js");
+		const {
+			initLSPConfig,
+			getServerInitOverride,
+			resetLSPConfigStateForTests,
+		} = await import("../../../clients/lsp/config.js");
 		const dir = tmpDir();
 		fs.mkdirSync(path.join(dir, ".pi-lens"), { recursive: true });
 		fs.writeFileSync(
@@ -228,8 +246,14 @@ describe("getServerInitOverride", () => {
 		);
 		resetLSPConfigStateForTests();
 		await initLSPConfig(dir);
-		expect(getServerInitOverride("rust", path.join(dir, "main.rs"))).toBeUndefined();
-		expect(getServerInitOverride("go", path.join(dir, "main.go"))).toBeUndefined();
-		expect(getServerInitOverride("nix", path.join(dir, "flake.nix"))).toBeUndefined();
+		expect(
+			getServerInitOverride("rust", path.join(dir, "main.rs")),
+		).toBeUndefined();
+		expect(
+			getServerInitOverride("go", path.join(dir, "main.go")),
+		).toBeUndefined();
+		expect(
+			getServerInitOverride("nix", path.join(dir, "flake.nix")),
+		).toBeUndefined();
 	});
 });

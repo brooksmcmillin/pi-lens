@@ -25,11 +25,12 @@ import {
 	oxfmtFormatter,
 	phpCsFixerFormatter,
 	prettierFormatter,
+	psscriptanalyzerFormatFormatter,
 	rubocopFormatter,
 	ruffFormatter,
 	standardrbFormatter,
 	shfmtFormatter,
-} from "../../clients/formatters.ts";
+} from "../../clients/formatters.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 import { _getSpotlessGradleReadCountForTests } from "../../clients/tool-policy.js";
 
@@ -490,7 +491,9 @@ describe("getFormattersForFile — policy selection", () => {
 		const filePath = fileIn(tmpDir, "README.md");
 		expect(await getFormattersForFile(filePath, tmpDir)).toEqual([]);
 		createTempFile(tmpDir, ".prettierrc", "{}\n");
-		expect((await getFormattersForFile(filePath, tmpDir)).map((f) => f.name)).toEqual(["prettier"]);
+		expect(
+			(await getFormattersForFile(filePath, tmpDir)).map((f) => f.name),
+		).toEqual(["prettier"]);
 	});
 
 	it("does not force a formatter for unconfigured SQL files", async () => {
@@ -550,7 +553,9 @@ describe("getFormattersForFile — policy selection", () => {
 		for (let invocation = 0; invocation < 5; invocation += 1) {
 			const formatters = await getFormattersForFile(filePath, fixtureRoot);
 			expect(formatters.map((formatter) => formatter.name)).toEqual(["ktlint"]);
-			expect(formatters.some((formatter) => formatter.name === "ktfmt")).toBe(false);
+			expect(formatters.some((formatter) => formatter.name === "ktfmt")).toBe(
+				false,
+			);
 		}
 	});
 
@@ -586,7 +591,10 @@ describe("getFormattersForFile — policy selection", () => {
 			"build.gradle.kts",
 			"spotless {\n  kotlin {\n    ktfmt()\n  }\n}\n",
 		);
-		const formatters = await getFormattersForFile(fileIn(tmpDir, "App.kt"), tmpDir);
+		const formatters = await getFormattersForFile(
+			fileIn(tmpDir, "App.kt"),
+			tmpDir,
+		);
 		expect(formatters.map((formatter) => formatter.name)).toEqual(["ktfmt"]);
 	});
 
@@ -856,6 +864,60 @@ describe("getFormattersForFile — policy selection", () => {
 				configFile: ".cmake-format",
 				content: "# cmake-format config\n",
 			},
+			{
+				// #1572: psscriptanalyzer-format had no hasExplicitFormatterConfig
+				// case at all, so no project configuration could ever select it.
+				name: "psscriptanalyzer-format",
+				ext: ".ps1",
+				configFile: "PSScriptAnalyzerSettings.psd1",
+				content: "@{}\n",
+			},
+			// #1595: same shape as #1572 for 7 more formatters left unreachable by
+			// 038cd1df (defaultWhenUnconfigured flipped to false, no explicit-config
+			// check added). nixfmt (the 8th) has no config surface at all and stays
+			// unreachable — see tool-policy.ts's comment above hasCsharpierConfig.
+			{
+				name: "csharpier",
+				ext: ".cs",
+				configFile: ".csharpierrc",
+				content: "{}\n",
+			},
+			{
+				name: "ormolu",
+				ext: ".hs",
+				configFile: ".ormolu",
+				content: "\n",
+			},
+			{
+				name: "taplo",
+				ext: ".toml",
+				configFile: "taplo.toml",
+				content: "[formatting]\n",
+			},
+			{
+				name: "terraform",
+				ext: ".tf",
+				configFile: ".terraform.lock.hcl",
+				content: "\n",
+			},
+			{
+				name: "swiftformat",
+				ext: ".swift",
+				configFile: ".swiftformat",
+				content: "--indent 4\n",
+			},
+			{
+				name: "fantomas",
+				ext: ".fs",
+				configFile: ".fantomasignore",
+				content: "\n",
+			},
+			{
+				name: "mix",
+				ext: ".ex",
+				configFile: ".formatter.exs",
+				content: '[inputs: ["{mix,.formatter}.exs"]]\n',
+			},
 		];
 
 		for (const testCase of cases) {
@@ -887,6 +949,14 @@ describe("getFormattersForFile — policy selection", () => {
 			["Main.java", ".java"],
 			["core.clj", ".clj"],
 			["CMakeLists.cmake", ".cmake"],
+			["script.ps1", ".ps1"],
+			["Program.cs", ".cs"],
+			["Main.hs", ".hs"],
+			["config.toml", ".toml"],
+			["main.tf", ".tf"],
+			["Main.swift", ".swift"],
+			["Program.fs", ".fs"],
+			["mix.ex", ".ex"],
 		];
 
 		for (const [fileName] of cases) {
@@ -945,6 +1015,290 @@ describe("getFormattersForFile — policy selection", () => {
 		});
 	});
 
+	// #1572: `.ps1`'s policy sets defaultWhenUnconfigured: false, and
+	// psscriptanalyzer-format had no hasExplicitFormatterConfig case — so
+	// neither branch of getFormattersForFile could ever select it, regardless
+	// of project configuration. These two tests are the direct reproduction.
+	it("does not force psscriptanalyzer-format without config", async () => {
+		const filePath = fileIn(tmpDir, "script.ps1");
+		const formatters = await getFormattersForFile(filePath, tmpDir);
+		expect(formatters).toEqual([]);
+	});
+
+	it("enables psscriptanalyzer-format when PSScriptAnalyzerSettings.psd1 is present", async () => {
+		createTempFile(tmpDir, "PSScriptAnalyzerSettings.psd1", "@{}\n");
+		const filePath = fileIn(tmpDir, "script.ps1");
+		const formatters = await getFormattersForFile(filePath, tmpDir);
+		expect(formatters.map((f) => f.name)).toEqual(["psscriptanalyzer-format"]);
+	});
+
+	it("enables psscriptanalyzer-format when ScriptAnalyzerSettings.psd1 is present", async () => {
+		createTempFile(tmpDir, "ScriptAnalyzerSettings.psd1", "@{}\n");
+		const filePath = fileIn(tmpDir, "script.psm1");
+		const formatters = await getFormattersForFile(filePath, tmpDir);
+		expect(formatters.map((f) => f.name)).toEqual(["psscriptanalyzer-format"]);
+	});
+
+	// #1595 — same shape as #1572, 7 more formatters (038cd1df flipped
+	// defaultWhenUnconfigured to false without adding an explicit-config check).
+	it("does not force csharpier without config", async () => {
+		const filePath = fileIn(tmpDir, "Program.cs");
+		const formatters = await getFormattersForFile(filePath, tmpDir);
+		expect(formatters).toEqual([]);
+	});
+
+	it("enables csharpier when .csharpierrc is present", async () => {
+		createTempFile(tmpDir, ".csharpierrc", "{}\n");
+		const filePath = fileIn(tmpDir, "Program.cs");
+		const formatters = await getFormattersForFile(filePath, tmpDir);
+		expect(formatters.map((f) => f.name)).toEqual(["csharpier"]);
+	});
+
+	it("does not force ormolu without config", async () => {
+		const filePath = fileIn(tmpDir, "Main.hs");
+		const formatters = await getFormattersForFile(filePath, tmpDir);
+		expect(formatters).toEqual([]);
+	});
+
+	it("enables ormolu when .ormolu is present", async () => {
+		createTempFile(tmpDir, ".ormolu", "\n");
+		const filePath = fileIn(tmpDir, "Main.hs");
+		const formatters = await getFormattersForFile(filePath, tmpDir);
+		expect(formatters.map((f) => f.name)).toEqual(["ormolu"]);
+	});
+
+	it("does not force taplo without config", async () => {
+		const filePath = fileIn(tmpDir, "config.toml");
+		const formatters = await getFormattersForFile(filePath, tmpDir);
+		expect(formatters).toEqual([]);
+	});
+
+	it("enables taplo when taplo.toml is present", async () => {
+		createTempFile(tmpDir, "taplo.toml", "[formatting]\n");
+		const filePath = fileIn(tmpDir, "config.toml");
+		const formatters = await getFormattersForFile(filePath, tmpDir);
+		expect(formatters.map((f) => f.name)).toEqual(["taplo"]);
+	});
+
+	it("does not force terraform without config", async () => {
+		const filePath = fileIn(tmpDir, "main.tf");
+		const formatters = await getFormattersForFile(filePath, tmpDir);
+		expect(formatters).toEqual([]);
+	});
+
+	it("enables terraform when .terraform.lock.hcl is present (terraform init marker)", async () => {
+		createTempFile(tmpDir, ".terraform.lock.hcl", "\n");
+		const filePath = fileIn(tmpDir, "main.tf");
+		const formatters = await getFormattersForFile(filePath, tmpDir);
+		expect(formatters.map((f) => f.name)).toEqual(["terraform"]);
+	});
+
+	it("does not force swiftformat without config", async () => {
+		const filePath = fileIn(tmpDir, "Main.swift");
+		const formatters = await getFormattersForFile(filePath, tmpDir);
+		expect(formatters).toEqual([]);
+	});
+
+	it("enables swiftformat when .swiftformat is present", async () => {
+		createTempFile(tmpDir, ".swiftformat", "--indent 4\n");
+		const filePath = fileIn(tmpDir, "Main.swift");
+		const formatters = await getFormattersForFile(filePath, tmpDir);
+		expect(formatters.map((f) => f.name)).toEqual(["swiftformat"]);
+	});
+
+	it("does not force fantomas without config", async () => {
+		const filePath = fileIn(tmpDir, "Program.fs");
+		const formatters = await getFormattersForFile(filePath, tmpDir);
+		expect(formatters).toEqual([]);
+	});
+
+	it("enables fantomas when .fantomasignore is present", async () => {
+		createTempFile(tmpDir, ".fantomasignore", "\n");
+		const filePath = fileIn(tmpDir, "Program.fs");
+		const formatters = await getFormattersForFile(filePath, tmpDir);
+		expect(formatters.map((f) => f.name)).toEqual(["fantomas"]);
+	});
+
+	it("enables fantomas when .editorconfig is present", async () => {
+		createTempFile(
+			tmpDir,
+			".editorconfig",
+			"[*.fs]\nfsharp_space_before_uppercase_invocation = true\n",
+		);
+		const filePath = fileIn(tmpDir, "Program.fs");
+		const formatters = await getFormattersForFile(filePath, tmpDir);
+		expect(formatters.map((f) => f.name)).toEqual(["fantomas"]);
+	});
+
+	it("does not force mix without config", async () => {
+		const filePath = fileIn(tmpDir, "mix.ex");
+		const formatters = await getFormattersForFile(filePath, tmpDir);
+		expect(formatters).toEqual([]);
+	});
+
+	it("enables mix when .formatter.exs is present", async () => {
+		createTempFile(
+			tmpDir,
+			".formatter.exs",
+			'[inputs: ["{mix,.formatter}.exs"]]\n',
+		);
+		const filePath = fileIn(tmpDir, "mix.ex");
+		const formatters = await getFormattersForFile(filePath, tmpDir);
+		expect(formatters.map((f) => f.name)).toEqual(["mix"]);
+	});
+
+	// #1572 review F1: `getFormattersForFile` caches its answer per cwd, keyed
+	// by `formatterConfigSignature` — a hash over `FORMATTER_CONFIG_FILES`'
+	// mtimes/sizes. A filename an explicit-config CHECK reads but that list
+	// OMITS is invisible to the signature: adding the file after the first
+	// call for a cwd never invalidates the cache, so the stale (pre-opt-in)
+	// answer sticks for the rest of the session. These tests call
+	// `getFormattersForFile` once with no config (caching `[]`), THEN create
+	// the config, THEN call again in the SAME test/cwd — unlike every test
+	// above, which pre-creates its config in a fresh tmpDir and so can never
+	// observe a signature that fails to move. `stylua` (whose `stylua.toml`
+	// was already listed) is the positive control proving the shape of the
+	// test itself is sound.
+	describe("formatter config signature reacts to config created after the first call", () => {
+		it("control: stylua.toml created after the first call is picked up", async () => {
+			const filePath = fileIn(tmpDir, "init.lua");
+			expect(await getFormattersForFile(filePath, tmpDir)).toEqual([]);
+			createTempFile(tmpDir, "stylua.toml", "column_width = 100\n");
+			const formatters = await getFormattersForFile(filePath, tmpDir);
+			expect(formatters.map((f) => f.name)).toEqual(["stylua"]);
+		});
+
+		it("psscriptanalyzer-format: PSScriptAnalyzerSettings.psd1 created after the first call is picked up", async () => {
+			const filePath = fileIn(tmpDir, "script.ps1");
+			expect(await getFormattersForFile(filePath, tmpDir)).toEqual([]);
+			createTempFile(tmpDir, "PSScriptAnalyzerSettings.psd1", "@{}\n");
+			const formatters = await getFormattersForFile(filePath, tmpDir);
+			expect(formatters.map((f) => f.name)).toEqual([
+				"psscriptanalyzer-format",
+			]);
+		});
+
+		it("google-java-format: .google-java-format created after the first call is picked up", async () => {
+			const filePath = fileIn(tmpDir, "Main.java");
+			expect(await getFormattersForFile(filePath, tmpDir)).toEqual([]);
+			createTempFile(tmpDir, ".google-java-format", "{}\n");
+			await withPathShim("google-java-format", async () => {
+				const formatters = await getFormattersForFile(filePath, tmpDir);
+				expect(formatters.map((f) => f.name)).toEqual(["google-java-format"]);
+			});
+		});
+
+		it("cmake-format: .cmake-format created after the first call is picked up", async () => {
+			const filePath = fileIn(tmpDir, "CMakeLists.cmake");
+			expect(await getFormattersForFile(filePath, tmpDir)).toEqual([]);
+			createTempFile(tmpDir, ".cmake-format", "# cmake-format config\n");
+			await withPathShim("cmake-format", async () => {
+				const formatters = await getFormattersForFile(filePath, tmpDir);
+				expect(formatters.map((f) => f.name)).toEqual(["cmake-format"]);
+			});
+		});
+
+		it("sqlfluff: setup.cfg's [sqlfluff] section created after the first call is picked up", async () => {
+			const filePath = fileIn(tmpDir, "query.sql");
+			expect(await getFormattersForFile(filePath, tmpDir)).toEqual([]);
+			createTempFile(tmpDir, "setup.cfg", "[sqlfluff]\ndialect = postgres\n");
+			const formatters = await getFormattersForFile(filePath, tmpDir);
+			expect(formatters.map((f) => f.name)).toEqual(["sqlfluff"]);
+		});
+
+		it("oxfmt: vite-plus.json created after the first call is picked up", async () => {
+			// .css's policy smart-defaults to biome when nothing has explicit
+			// config; oxfmt only outranks it once oxfmt's OWN explicit-config
+			// check (hasVitePlusConfig) goes true. So the observable signal here
+			// isn't "was anything selected" (biome always is) but "did the WINNER
+			// change" — which only happens if the cache actually re-reads
+			// vite-plus.json after it's created.
+			const filePath = fileIn(tmpDir, "index.css");
+			expect(
+				(await getFormattersForFile(filePath, tmpDir)).map((f) => f.name),
+			).toEqual(["biome"]);
+			createTempFile(tmpDir, "vite-plus.json", "{}\n");
+			const formatters = await getFormattersForFile(filePath, tmpDir);
+			expect(formatters.map((f) => f.name)).toEqual(["oxfmt"]);
+		});
+
+		it("ktfmt: build.gradle.kts's Spotless ktfmt() block created after the first call is picked up", async () => {
+			const filePath = fileIn(tmpDir, "Main.kt");
+			expect(await getFormattersForFile(filePath, tmpDir)).toEqual([]);
+			createTempFile(
+				tmpDir,
+				"build.gradle.kts",
+				"spotless {\n  kotlin {\n    ktfmt()\n  }\n}\n",
+			);
+			const formatters = await getFormattersForFile(filePath, tmpDir);
+			expect(formatters.map((f) => f.name)).toEqual(["ktfmt"]);
+		});
+
+		// #1595 sweep: each of these filenames must be in FORMATTER_CONFIG_FILES
+		// (clients/formatters.ts) or the cache signature never moves when the
+		// file is created after the first call — the exact #1572 review F1 class
+		// of bug, now proven per formatter via one parameterized table rather
+		// than seven near-identical `it` blocks (Sonar CPD; #1661's
+		// bad-duplicate-parameterized-rows shape).
+		it.each([
+			["csharpier", "Program.cs", ".csharpierrc", "{}\n"],
+			["ormolu", "Main.hs", ".ormolu", "\n"],
+			["taplo", "config.toml", "taplo.toml", "[formatting]\n"],
+			["terraform", "main.tf", ".terraform.lock.hcl", "\n"],
+			["swiftformat", "Main.swift", ".swiftformat", "--indent 4\n"],
+			["fantomas", "Program.fs", ".fantomasignore", "\n"],
+			[
+				"mix",
+				"mix.ex",
+				".formatter.exs",
+				'[inputs: ["{mix,.formatter}.exs"]]\n',
+			],
+		] as const)(
+			"%s: %s created after the first call is picked up",
+			async (formatterName, fileName, configFile, configContent) => {
+				const filePath = fileIn(tmpDir, fileName);
+				expect(await getFormattersForFile(filePath, tmpDir)).toEqual([]);
+				createTempFile(tmpDir, configFile, configContent);
+				const formatters = await getFormattersForFile(filePath, tmpDir);
+				expect(formatters.map((f) => f.name)).toEqual([formatterName]);
+			},
+		);
+	});
+
+	// #1572 review F2: the gate DETECTED the settings file but the command
+	// never PASSED it to `Invoke-Formatter`, so an opted-in project silently
+	// got the stock `CodeFormatting` ruleset instead of its declared one — the
+	// exact stock-style imposition #1144 banned in this same file.
+	describe("psscriptanalyzer-format resolveCommand wires -Settings through", () => {
+		it("passes -Settings with the resolved config path when one exists", async () => {
+			createTempFile(tmpDir, "PSScriptAnalyzerSettings.psd1", "@{}\n");
+			await withPathShim("pwsh", async () => {
+				const cmd = await psscriptanalyzerFormatFormatter.resolveCommand!(
+					fileIn(tmpDir, "script.ps1"),
+					tmpDir,
+				);
+				expect(cmd).not.toBeNull();
+				const script = cmd![cmd!.length - 1];
+				expect(script).toContain("-Settings");
+				expect(script).toContain(
+					path.join(tmpDir, "PSScriptAnalyzerSettings.psd1"),
+				);
+			});
+		});
+
+		it("omits -Settings when no config file exists", async () => {
+			await withPathShim("pwsh", async () => {
+				const cmd = await psscriptanalyzerFormatFormatter.resolveCommand!(
+					fileIn(tmpDir, "script.ps1"),
+					tmpDir,
+				);
+				expect(cmd).not.toBeNull();
+				const script = cmd![cmd!.length - 1];
+				expect(script).not.toContain("-Settings");
+			});
+		});
+	});
+
 	it("taplo resolveCommand falls back to managed install when not on PATH", async () => {
 		const managedPath = isWin
 			? path.join(tmpDir, "managed", "taplo.exe")
@@ -955,7 +1309,7 @@ describe("getFormattersForFile — policy selection", () => {
 			.spyOn(installer, "ensureTool")
 			.mockResolvedValue(managedPath);
 		try {
-			const formatters = await import("../../clients/formatters.ts");
+			const formatters = await import("../../clients/formatters.js");
 			const cmd = await formatters.taploFormatter.resolveCommand!(
 				fileIn(tmpDir, "config.toml"),
 				tmpDir,
@@ -1134,8 +1488,10 @@ describe("oxfmt formatter — detection and policy selection", () => {
 		makeFakeExe(bin);
 		const filePath = fileIn(tmpDir, "index.ts");
 		const cmd = await oxfmtFormatter.resolveCommand!(filePath, tmpDir);
-		expect(cmd?.[0]).toBe(bin);
-		expect(cmd?.[1]).toBe(filePath);
+		// #1844 F1: the unmatched-pattern flag sits between the binary and the
+		// path, so a file the oxfmt config ignores is a clean no-op rather than
+		// an exit-2 formatting failure.
+		expect(cmd).toEqual([bin, "--no-error-on-unmatched-pattern", filePath]);
 	});
 
 	it("detected via vite-plus in devDependencies", async () => {
@@ -1185,14 +1541,17 @@ describe("oxfmt formatter — detection and policy selection", () => {
 			[f, "oxfmt.toml", "# oxfmt config\n"] as const,
 			[f, ".oxfmtrc.json", "{}\n"] as const,
 		]),
-	)("includes oxfmt for %s when %s is present", async (fileName, configFile, configContent) => {
-		createTempFile(tmpDir, configFile, configContent);
-		const formatters = await getFormattersForFile(
-			fileIn(tmpDir, fileName),
-			tmpDir,
-		);
-		expect(formatters.map((f) => f.name)).toContain("oxfmt");
-	});
+	)(
+		"includes oxfmt for %s when %s is present",
+		async (fileName, configFile, configContent) => {
+			createTempFile(tmpDir, configFile, configContent);
+			const formatters = await getFormattersForFile(
+				fileIn(tmpDir, fileName),
+				tmpDir,
+			);
+			expect(formatters.map((f) => f.name)).toContain("oxfmt");
+		},
+	);
 });
 
 // ---------------------------------------------------------------------------
@@ -1214,18 +1573,17 @@ describe("oxfmt formatter — .svelte conditional gate (#1134)", () => {
 		dir: string,
 		devDependencies: Record<string, string>,
 	): void {
-		createTempFile(
-			dir,
-			"package.json",
-			JSON.stringify({ devDependencies }),
-		);
+		createTempFile(dir, "package.json", JSON.stringify({ devDependencies }));
 	}
 
 	it("offers oxfmt for Component.svelte with the issue's exact fixture shape", async () => {
 		writePackageJson(tmpDir, { oxfmt: "^0.54.0", svelte: "^5.0.0" });
 		createTempFile(tmpDir, ".oxfmtrc.json", JSON.stringify({ svelte: true }));
 
-		const formatters = await getFormattersForFile(svelteComponent(tmpDir), tmpDir);
+		const formatters = await getFormattersForFile(
+			svelteComponent(tmpDir),
+			tmpDir,
+		);
 		expect(formatters.map((f) => f.name)).toEqual(["oxfmt"]);
 	});
 
@@ -1233,7 +1591,10 @@ describe("oxfmt formatter — .svelte conditional gate (#1134)", () => {
 		writePackageJson(tmpDir, { oxfmt: "^0.54.0", svelte: "^5.0.0" });
 		createTempFile(tmpDir, "oxfmt.toml", "svelte = true\n");
 
-		const formatters = await getFormattersForFile(svelteComponent(tmpDir), tmpDir);
+		const formatters = await getFormattersForFile(
+			svelteComponent(tmpDir),
+			tmpDir,
+		);
 		expect(formatters.map((f) => f.name)).toEqual(["oxfmt"]);
 	});
 
@@ -1241,7 +1602,10 @@ describe("oxfmt formatter — .svelte conditional gate (#1134)", () => {
 		writePackageJson(tmpDir, { oxfmt: "^0.54.0" });
 		createTempFile(tmpDir, ".oxfmtrc.json", JSON.stringify({ svelte: true }));
 
-		const formatters = await getFormattersForFile(svelteComponent(tmpDir), tmpDir);
+		const formatters = await getFormattersForFile(
+			svelteComponent(tmpDir),
+			tmpDir,
+		);
 		expect(formatters.map((f) => f.name)).not.toContain("oxfmt");
 	});
 
@@ -1249,7 +1613,10 @@ describe("oxfmt formatter — .svelte conditional gate (#1134)", () => {
 		writePackageJson(tmpDir, { oxfmt: "^0.54.0", svelte: "^5.0.0" });
 		createTempFile(tmpDir, ".oxfmtrc.json", "{}\n");
 
-		const formatters = await getFormattersForFile(svelteComponent(tmpDir), tmpDir);
+		const formatters = await getFormattersForFile(
+			svelteComponent(tmpDir),
+			tmpDir,
+		);
 		expect(formatters.map((f) => f.name)).not.toContain("oxfmt");
 	});
 
@@ -1257,7 +1624,10 @@ describe("oxfmt formatter — .svelte conditional gate (#1134)", () => {
 		writePackageJson(tmpDir, { oxfmt: "^0.54.0", svelte: "^5.0.0" });
 		createTempFile(tmpDir, ".oxfmtrc.json", JSON.stringify({ svelte: false }));
 
-		const formatters = await getFormattersForFile(svelteComponent(tmpDir), tmpDir);
+		const formatters = await getFormattersForFile(
+			svelteComponent(tmpDir),
+			tmpDir,
+		);
 		expect(formatters.map((f) => f.name)).not.toContain("oxfmt");
 	});
 
@@ -1265,14 +1635,20 @@ describe("oxfmt formatter — .svelte conditional gate (#1134)", () => {
 		writePackageJson(tmpDir, { oxfmt: "^0.54.0", svelte: "^5.0.0" });
 		createTempFile(tmpDir, "oxfmt.toml", "# oxfmt config\n");
 
-		const formatters = await getFormattersForFile(svelteComponent(tmpDir), tmpDir);
+		const formatters = await getFormattersForFile(
+			svelteComponent(tmpDir),
+			tmpDir,
+		);
 		expect(formatters.map((f) => f.name)).not.toContain("oxfmt");
 	});
 
 	it("does NOT offer oxfmt for Component.svelte with neither the package nor the config flag", async () => {
 		writePackageJson(tmpDir, { oxfmt: "^0.54.0" });
 
-		const formatters = await getFormattersForFile(svelteComponent(tmpDir), tmpDir);
+		const formatters = await getFormattersForFile(
+			svelteComponent(tmpDir),
+			tmpDir,
+		);
 		expect(formatters.map((f) => f.name)).not.toContain("oxfmt");
 	});
 
@@ -1280,7 +1656,10 @@ describe("oxfmt formatter — .svelte conditional gate (#1134)", () => {
 		writePackageJson(tmpDir, { oxfmt: "^0.54.0" });
 		createTempFile(tmpDir, "oxfmt.toml", "# oxfmt config\n");
 
-		const formatters = await getFormattersForFile(fileIn(tmpDir, "index.ts"), tmpDir);
+		const formatters = await getFormattersForFile(
+			fileIn(tmpDir, "index.ts"),
+			tmpDir,
+		);
 		expect(formatters.map((f) => f.name)).toContain("oxfmt");
 	});
 });
@@ -1294,9 +1673,8 @@ describe("oxfmt formatter — .svelte conditional gate (#1134)", () => {
 
 describe("oxfmt extension registries stay in sync (#1134)", () => {
 	it("oxfmtFormatter.extensions matches tool-policy's OXFMT_SUPPORTED_EXTENSIONS exactly", async () => {
-		const { OXFMT_SUPPORTED_EXTENSIONS } = await import(
-			"../../clients/tool-policy.ts"
-		);
+		const { OXFMT_SUPPORTED_EXTENSIONS } =
+			await import("../../clients/tool-policy.js");
 		expect(new Set(oxfmtFormatter.extensions)).toEqual(
 			OXFMT_SUPPORTED_EXTENSIONS,
 		);

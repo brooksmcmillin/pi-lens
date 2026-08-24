@@ -76,9 +76,8 @@ describe("DependencyChecker shared-state generation guard (#766)", () => {
 	}
 
 	it("drops a slow older batch's publish once a newer batch has published", async () => {
-		const { DependencyChecker } = await import(
-			"../../clients/dependency-checker.js"
-		);
+		const { DependencyChecker } =
+			await import("../../clients/dependency-checker.js");
 		const x = writeSource("x.ts", ["./b.js"]);
 		const gate = makeGate();
 		let spawns = 0;
@@ -125,9 +124,8 @@ describe("DependencyChecker shared-state generation guard (#766)", () => {
 	});
 
 	it("lets an older publish land when the newer batch learned nothing", async () => {
-		const { DependencyChecker } = await import(
-			"../../clients/dependency-checker.js"
-		);
+		const { DependencyChecker } =
+			await import("../../clients/dependency-checker.js");
 		const x = writeSource("x.ts", ["./b.js"]);
 		const unchanged = writeSource("h.ts", ["./k.js"]);
 		const gate = makeGate();
@@ -165,9 +163,8 @@ describe("DependencyChecker shared-state generation guard (#766)", () => {
 	});
 
 	it("makes a slow project scan lose to a newer batch too", async () => {
-		const { DependencyChecker } = await import(
-			"../../clients/dependency-checker.js"
-		);
+		const { DependencyChecker } =
+			await import("../../clients/dependency-checker.js");
 		const y = writeSource("y.ts", ["./z.js"]);
 		const x = writeSource("x.ts", ["./b.js"]);
 		const gate = makeGate();

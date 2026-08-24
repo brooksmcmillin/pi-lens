@@ -138,15 +138,23 @@ const eslintRunner: RunnerDefinition = {
 			{ timeout: 30000, cwd },
 		);
 
-		// ESLint exits 1 when there are lint errors, 2 on fatal/config error
+		// ESLint exits 2 on fatal/config errors — nothing was linted, so this
+		// is an unavailable run, not a clean or failed one.
 		if (result.status === 2) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
-		const raw = result.stdout || result.stderr || "";
-
-		if (result.status === 0) {
-			return { status: "succeeded", diagnostics: [], semantic: "none" };
+		// ESLint exits 0 whenever nothing reached ERROR severity — that
+		// includes a run that found only warnings (#1954), which also prints a
+		// full JSON report. So parse stdout unconditionally and branch on the
+		// parsed diagnostic count instead of letting the exit code discard the
+		// warning case. Stderr is only a fallback for a failing run whose
+		// stdout went missing; parsing stderr noise on a healthy exit-0 run
+		// would turn deprecation chatter into spurious parse-error findings.
+		const stdout = result.stdout ?? "";
+		let raw = stdout;
+		if (raw.length === 0 && result.status !== 0) {
+			raw = result.stderr || "";
 		}
 
 		const parsed = parseEslintJson(raw, ctx.filePath);
@@ -157,7 +165,10 @@ const eslintRunner: RunnerDefinition = {
 				diagnostics: [
 					{
 						id: "eslint:parse-error:1",
-						message: "ESLint JSON parse failed: " + parsed.parseError + (preview ? " (output preview: " + preview + ")" : ""),
+						message:
+							"ESLint JSON parse failed: " +
+							parsed.parseError +
+							(preview ? " (output preview: " + preview + ")" : ""),
 						filePath: ctx.filePath,
 						line: 1,
 						column: 1,
@@ -176,8 +187,16 @@ const eslintRunner: RunnerDefinition = {
 		}
 
 		const hasErrors = diagnostics.some((d) => d.semantic === "blocking");
+		// A warning-only result on exit 0 is ESLint's normal outcome, not a
+		// failure: exit 0 means nothing hit ERROR severity. Keying status off
+		// blocking severity plus exit code (the sibling convention from oxlint,
+		// biome-check, golangci-lint, rubocop) keeps plan.ts's fallback group
+		// ["eslint", "oxlint", "biome-check-json"] stopping at eslint instead
+		// of re-running oxlint and biome-check-json on every warning-only save.
+		// The findings reach delivery regardless of status — dispatcher.ts
+		// buckets by each diagnostic's own `semantic`.
 		return {
-			status: "failed",
+			status: !hasErrors && result.status === 0 ? "succeeded" : "failed",
 			diagnostics,
 			semantic: hasErrors ? "blocking" : "warning",
 		};

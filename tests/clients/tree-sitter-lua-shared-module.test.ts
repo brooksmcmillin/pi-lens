@@ -45,7 +45,11 @@ describe("lua survives the shared WASM Module (#255)", () => {
 				["go", "a.go", "package main\nfunc main() {}\n"],
 				["javascript", "a.js", "const x = 1;\n"],
 			] as const) {
-				await client.parseFile(createTempFile(env.tmpDir, file, src), lang, src);
+				await client.parseFile(
+					createTempFile(env.tmpDir, file, src),
+					lang,
+					src,
+				);
 			}
 
 			const luaSrc =

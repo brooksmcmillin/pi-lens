@@ -14,19 +14,27 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { TRANSIENT_BASE_COOLDOWN_MS } from "../../../../clients/dispatch/runners/utils/availability-policy.ts";
+import { TRANSIENT_BASE_COOLDOWN_MS } from "../../../../clients/dispatch/runners/utils/availability-policy.js";
 import {
 	createCwdCachedProbe,
 	resetDispatchAvailabilityState,
-} from "../../../../clients/dispatch/runners/utils/runner-helpers.ts";
+} from "../../../../clients/dispatch/runners/utils/runner-helpers.js";
 
-const { logLatencySpy, safeSpawnAsync, tryLazyInstall, findCargoPathAsync } =
-	vi.hoisted(() => ({
-		logLatencySpy: vi.fn(),
-		safeSpawnAsync: vi.fn(),
-		tryLazyInstall: vi.fn(async () => false),
-		findCargoPathAsync: vi.fn(async () => "cargo"),
-	}));
+const {
+	logLatencySpy,
+	safeSpawnAsync,
+	tryLazyInstall,
+	getLazyInstallAttempt,
+	findCargoPathAsync,
+} = vi.hoisted(() => ({
+	logLatencySpy: vi.fn(),
+	safeSpawnAsync: vi.fn(),
+	tryLazyInstall: vi.fn(async () => false),
+	getLazyInstallAttempt: vi.fn(
+		() => undefined as { outcome: string; reason?: string } | undefined,
+	),
+	findCargoPathAsync: vi.fn(async () => "cargo"),
+}));
 
 vi.mock("../../../../clients/latency-logger.js", () => ({
 	logLatency: logLatencySpy,
@@ -40,6 +48,7 @@ vi.mock("../../../../clients/safe-spawn.js", () => ({
 
 vi.mock("../../../../clients/dispatch/runners/utils/lazy-installer.js", () => ({
 	tryLazyInstall,
+	getLazyInstallAttempt,
 }));
 
 vi.mock("../../../../clients/rust-client.js", () => ({
@@ -268,8 +277,9 @@ describe("eslint runner: a stalled probe does not disable the runner (#1494)", (
 		safeSpawnAsync.mockImplementation(async (_cmd: string, args: string[]) =>
 			args.includes("--version") ? timeoutResult() : okResult("[]"),
 		);
-		const runner = (await import("../../../../clients/dispatch/runners/eslint.ts"))
-			.default;
+		const runner = (
+			await import("../../../../clients/dispatch/runners/eslint.js")
+		).default;
 		const ctx = { cwd, filePath } as never;
 
 		expect((await runner.run(ctx)).status).toBe("skipped");
@@ -300,8 +310,9 @@ describe("credo runner: a stalled probe does not disable the runner (#1494)", ()
 				? timeoutResult()
 				: okResult(JSON.stringify({ issues: [] })),
 		);
-		const runner = (await import("../../../../clients/dispatch/runners/credo.ts"))
-			.default;
+		const runner = (
+			await import("../../../../clients/dispatch/runners/credo.js")
+		).default;
 		const ctx = { cwd, filePath } as never;
 
 		expect((await runner.run(ctx)).status).toBe("skipped");
@@ -330,7 +341,7 @@ describe("rust-clippy runner: a stalled probe does not disable the runner (#1494
 			args.includes("--version") ? timeoutResult() : okResult(""),
 		);
 		const runner = (
-			await import("../../../../clients/dispatch/runners/rust-clippy.ts")
+			await import("../../../../clients/dispatch/runners/rust-clippy.js")
 		).default;
 		const ctx = { cwd, filePath } as never;
 
@@ -347,5 +358,68 @@ describe("rust-clippy runner: a stalled probe does not disable the runner (#1494
 		);
 		expect((await runner.run(ctx)).status).toBe("succeeded");
 		expect(versionProbeCalls()).toHaveLength(1);
+	});
+
+	it("records the failed lazy install beside the verdict it produced (#1537)", async () => {
+		// #1537 gave the lazy installers an attempt record; this is the production
+		// consumer that makes it observable. Without it, "we ran `rustup component
+		// add clippy` and the network failed" and "this machine has no rustup" both
+		// look like a silent skip in latency.log.
+		const cwd = tempDir("pi-lens-clippy-install-evidence-");
+		fs.writeFileSync(path.join(cwd, "Cargo.toml"), "[package]\nname='a'\n");
+		const filePath = path.join(cwd, "a.rs");
+		fs.writeFileSync(filePath, "fn main() {}\n");
+
+		// A GENUINE absence, so the runner is allowed to attempt the install.
+		safeSpawnAsync.mockImplementation(async (_cmd: string, args: string[]) =>
+			args.includes("--version") ? notFoundResult() : okResult(""),
+		);
+		tryLazyInstall.mockResolvedValue(false);
+		getLazyInstallAttempt.mockReturnValue({
+			outcome: "failed",
+			reason: "network is unreachable",
+		});
+
+		const runner = (
+			await import("../../../../clients/dispatch/runners/rust-clippy.js")
+		).default;
+		expect((await runner.run({ cwd, filePath } as never)).status).toBe(
+			"skipped",
+		);
+		expect(tryLazyInstall).toHaveBeenCalledWith("rust-clippy", cwd);
+
+		const decision = decisions().find(
+			(entry) => entry.metadata?.tool === "rust-clippy",
+		);
+		expect(decision?.metadata).toMatchObject({
+			verdict: "unavailable",
+			classifiedBy: "caller",
+			evidence: { install: "failed", installReason: "network is unreachable" },
+		});
+	});
+
+	it("says not-attempted when no install was tried (#1537)", async () => {
+		// The other half: an empty attempt record must read as "nothing was tried",
+		// not as a fabricated failure.
+		const cwd = tempDir("pi-lens-clippy-no-install-");
+		fs.writeFileSync(path.join(cwd, "Cargo.toml"), "[package]\nname='a'\n");
+		const filePath = path.join(cwd, "a.rs");
+		fs.writeFileSync(filePath, "fn main() {}\n");
+
+		safeSpawnAsync.mockImplementation(async (_cmd: string, args: string[]) =>
+			args.includes("--version") ? notFoundResult() : okResult(""),
+		);
+		tryLazyInstall.mockResolvedValue(false);
+		getLazyInstallAttempt.mockReturnValue(undefined);
+
+		const runner = (
+			await import("../../../../clients/dispatch/runners/rust-clippy.js")
+		).default;
+		await runner.run({ cwd, filePath } as never);
+
+		expect(
+			decisions().find((entry) => entry.metadata?.tool === "rust-clippy")
+				?.metadata?.evidence,
+		).toMatchObject({ install: "not-attempted" });
 	});
 });

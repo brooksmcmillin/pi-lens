@@ -16,17 +16,41 @@ import type { TryCatchSummary } from "../facts/try-catch-facts.js";
 // All other entries are exact callee names — prevents e.g. "spawn" matching "spawned.map"
 // or "fetch" matching "fetchWithRetry".
 const IO_NAMESPACE_PREFIXES = [
-	"db.", "prisma.", "knex.", "mongoose.", "sequelize.",
-	"http.", "https.", "net.", "dns.",
-	"redis.", "mongo.", "pg.", "mysql.",
-	"s3.", "storage.", "bucket.",
+	"db.",
+	"prisma.",
+	"knex.",
+	"mongoose.",
+	"sequelize.",
+	"http.",
+	"https.",
+	"net.",
+	"dns.",
+	"redis.",
+	"mongo.",
+	"pg.",
+	"mysql.",
+	"s3.",
+	"storage.",
+	"bucket.",
 	"fs.promises.",
 ];
 
 const IO_EXACT_CALLEES = new Set([
-	"fetch", "axios", "got", "request",
-	"spawn", "exec", "execSync", "spawnSync",
-	"readFile", "writeFile", "appendFile", "readdir", "mkdir", "unlink", "stat",
+	"fetch",
+	"axios",
+	"got",
+	"request",
+	"spawn",
+	"exec",
+	"execSync",
+	"spawnSync",
+	"readFile",
+	"writeFile",
+	"appendFile",
+	"readdir",
+	"mkdir",
+	"unlink",
+	"stat",
 ]);
 
 const CC_THRESHOLD = 6; // raised from 4 — avoids flagging simple async wrappers with one IO call
@@ -40,7 +64,10 @@ function callsToBoundary(outgoingCalls: string[]): string | undefined {
 	return undefined;
 }
 
-function hasCatchCoverage(fn: FunctionSummary, catches: TryCatchSummary[]): boolean {
+function hasCatchCoverage(
+	fn: FunctionSummary,
+	catches: TryCatchSummary[],
+): boolean {
 	// A catch block is considered covering if it is non-empty and does one of:
 	// - rethrows the error
 	// - logs it (console.error / logger.*)
@@ -49,7 +76,8 @@ function hasCatchCoverage(fn: FunctionSummary, catches: TryCatchSummary[]): bool
 	//   This handles the common "return structured error" pattern in IO helpers.
 	// Also handles Promise-executor pattern: if the function body itself resolves/rejects
 	// via new Promise((resolve) => {...}) we treat it as covered at the call site.
-	if (fn.outgoingCalls.some((c) => c === "resolve" || c === "reject")) return true;
+	if (fn.outgoingCalls.some((c) => c === "resolve" || c === "reject"))
+		return true;
 
 	return catches.some((c) => {
 		if (c.line < fn.line) return false;
@@ -75,9 +103,15 @@ export const unsafeBoundaryRule: FactRule = {
 	},
 	evaluate(ctx, store) {
 		const fns =
-			store.getFileFact<FunctionSummary[]>(ctx.filePath, "file.functionSummaries") ?? [];
+			store.getFileFact<FunctionSummary[]>(
+				ctx.filePath,
+				"file.functionSummaries",
+			) ?? [];
 		const catches =
-			store.getFileFact<TryCatchSummary[]>(ctx.filePath, "file.tryCatchSummaries") ?? [];
+			store.getFileFact<TryCatchSummary[]>(
+				ctx.filePath,
+				"file.tryCatchSummaries",
+			) ?? [];
 
 		const diagnostics: Diagnostic[] = [];
 
@@ -100,8 +134,7 @@ export const unsafeBoundaryRule: FactRule = {
 				column: f.column,
 				severity: "warning",
 				semantic: "warning",
-				message:
-					`'${f.name}' is async, calls '${boundaryCalle}', has complexity ${f.cyclomaticComplexity}, but no try/catch — unhandled rejection risk`,
+				message: `'${f.name}' is async, calls '${boundaryCalle}', has complexity ${f.cyclomaticComplexity}, but no try/catch — unhandled rejection risk`,
 			});
 		}
 

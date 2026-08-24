@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FactStore } from "../../../clients/dispatch/fact-store.js";
 import {
 	_readReviewGraphCheckpointForTests,
@@ -14,7 +14,9 @@ import {
 	reviewGraphCachePath,
 	waitForReviewGraphPersistsForTests,
 } from "../../../clients/review-graph/builder.js";
+import { _resetGitIdentityCacheForTests } from "../../../clients/review-graph/git-identity.js";
 import type { ReviewGraph } from "../../../clients/review-graph/types.js";
+import * as reviewGraphLogger from "../../../clients/review-graph-logger.js";
 import { removeTempDirSync } from "../test-utils.js";
 
 // #936 limit 2: a full build must be resumable across sessions from a mid-build
@@ -32,6 +34,8 @@ afterEach(() => {
 	delete process.env.PI_LENS_GRAPH_CHECKPOINT_EVERY_FILES;
 	delete process.env.PI_LENS_GRAPH_CHECKPOINT_MIN_INTERVAL_MS;
 	for (const root of roots.splice(0)) removeTempDirSync(root);
+	_resetGitIdentityCacheForTests();
+	vi.restoreAllMocks();
 });
 
 beforeEach(() => {
@@ -45,9 +49,7 @@ function canonicalize(value: unknown, root: string): unknown {
 	return JSON.parse(
 		JSON.stringify(value, (_key, nested) =>
 			typeof nested === "string"
-				? nested
-						.replaceAll(root, "<root>")
-						.replaceAll(normalizedRoot, "<root>")
+				? nested.replaceAll(root, "<root>").replaceAll(normalizedRoot, "<root>")
 				: nested,
 		),
 	) as unknown;
@@ -86,7 +88,8 @@ function makeRoot(prefix: string, files: Record<string, string>): string {
 const SOURCES: Record<string, string> = {
 	"src/a.ts": "export const alpha = 1;\n",
 	"src/b.ts": "import { alpha } from './a';\nexport const beta = alpha;\n",
-	"src/c.ts": "import { beta } from './b';\nexport function gamma() { return beta; }\n",
+	"src/c.ts":
+		"import { beta } from './b';\nexport function gamma() { return beta; }\n",
 	"src/d.ts": "export function delta() { return 4; }\n",
 	"src/e.ts": "import { gamma } from './c';\nexport const eps = gamma();\n",
 	"src/f.ts": "import { delta } from './d';\nexport const zeta = delta();\n",
@@ -123,11 +126,7 @@ describe("review-graph resumable checkpoint (#936 limit 2)", () => {
 		delete process.env.PI_LENS_GRAPH_CHECKPOINT_TEST_STOP_AFTER;
 		clearReviewGraphWorkspaceCache(resumeRoot);
 		clearGraphCache();
-		const resumed = await buildOrUpdateGraph(
-			resumeRoot,
-			[],
-			new FactStore(),
-		);
+		const resumed = await buildOrUpdateGraph(resumeRoot, [], new FactStore());
 
 		const cold = await coldBuild(SOURCES);
 		expect(graphShape(resumed, resumeRoot)).toEqual(
@@ -211,6 +210,45 @@ describe("review-graph resumable checkpoint (#936 limit 2)", () => {
 		// generation, so any stage still in flight at completion is gated out.
 		await waitFor(() => _readReviewGraphCheckpointForTests(root) === null);
 		expect(_readReviewGraphCheckpointForTests(root)).toBeNull();
+	});
+
+	it("resumes across a HEAD-only move instead of discarding the checkpoint (#1961)", async () => {
+		const resumeRoot = makeRoot("pi-lens-ckpt-headmove-", SOURCES);
+		// Minimal hand-built `.git` — no git binary needed. Same fixture shape as
+		// tests/clients/review-graph-git-stamp.test.ts.
+		const gitDir = path.join(resumeRoot, ".git");
+		fs.mkdirSync(path.join(gitDir, "refs", "heads"), { recursive: true });
+		fs.writeFileSync(path.join(gitDir, "HEAD"), "ref: refs/heads/main\n");
+		const headRef = path.join(gitDir, "refs", "heads", "main");
+		fs.writeFileSync(headRef, `${"a".repeat(40)}\n`);
+		_resetGitIdentityCacheForTests();
+
+		process.env.PI_LENS_GRAPH_CHECKPOINT_TEST_STOP_AFTER = "2";
+		await expect(
+			buildOrUpdateGraph(resumeRoot, [], new FactStore()),
+		).rejects.toThrow(/checkpoint_test_abort/);
+		expect(_readReviewGraphCheckpointForTests(resumeRoot)).not.toBeNull();
+
+		// A plain `git commit`: HEAD moves, no file content changes. The resume
+		// path hashes every processed file anyway, so revision equality proves
+		// nothing the hashes do not — discarding here threw away a whole
+		// resumable partial build after each commit.
+		fs.writeFileSync(headRef, `${"b".repeat(40)}\n`);
+		_resetGitIdentityCacheForTests();
+
+		delete process.env.PI_LENS_GRAPH_CHECKPOINT_TEST_STOP_AFTER;
+		clearReviewGraphWorkspaceCache(resumeRoot);
+		clearGraphCache();
+		const spy = vi.spyOn(reviewGraphLogger, "logReviewGraph");
+		const resumed = await buildOrUpdateGraph(resumeRoot, [], new FactStore());
+
+		const phases = spy.mock.calls.map(([entry]) => entry.phase);
+		expect(phases).toContain("checkpoint_resumed");
+		expect(phases).not.toContain("checkpoint_discarded");
+		const cold = await coldBuild(SOURCES);
+		expect(graphShape(resumed, resumeRoot)).toEqual(
+			graphShape(cold.graph, cold.root),
+		);
 	});
 
 	it("never serves a mid-build checkpoint as a complete graph", async () => {

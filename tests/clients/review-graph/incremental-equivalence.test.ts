@@ -24,9 +24,7 @@ function canonicalize(value: unknown, root: string): unknown {
 	return JSON.parse(
 		JSON.stringify(value, (_key, nested) =>
 			typeof nested === "string"
-				? nested
-						.replaceAll(root, "<root>")
-						.replaceAll(normalizedRoot, "<root>")
+				? nested.replaceAll(root, "<root>").replaceAll(normalizedRoot, "<root>")
 				: nested,
 		),
 	) as unknown;
@@ -131,124 +129,129 @@ describe("review-graph incremental/full-build equivalence (#939)", () => {
 	});
 
 	for (const seed of [93901, 93902, 93903]) {
-		it(`matches nodes, edges, indexes, and signatures for seed ${seed}`, {
-			timeout: 120_000,
-		}, async () => {
-			let randomState = seed;
-			const random = () => {
-				randomState =
-					(Math.imul(randomState, 1_103_515_245) + 12_345) >>> 0;
-				return randomState / 0x1_0000_0000;
-			};
-			// Both arms share ONE mkdtemp'd parent with fixed subpaths (rather
-			// than two independent mkdtemp roots) so their absolute paths can
-			// never diverge in length/shape — cheap defense-in-depth against any
-			// future path-derived metadata leaking a difference between the
-			// incremental and full-rebuild arms. The actual root cause (a
-			// feature-hint classifier reading the absolute temp path) is already
-			// fixed at the source (#962/#972); this only guards against a
-			// regression reintroducing that class of bug.
-			const pairRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-inc-eq-"));
-			const incrementalRoot = path.join(pairRoot, "incremental");
-			const fullRoot = path.join(pairRoot, "full");
-			fs.mkdirSync(incrementalRoot, { recursive: true });
-			fs.mkdirSync(fullRoot, { recursive: true });
-			roots.push(pairRoot);
-			const state = new Map<string, string>([
-				["src/a.ts", "export const alpha = 1;\n"],
-				[
-					"src/b.ts",
-					"import { alpha } from './a';\nexport const beta = alpha;\n",
-				],
-				[
-					"src/c.ts",
-					"import { beta } from './b';\nexport const gamma = beta;\n",
-				],
-				["src/d.ts", "export function delta() { return 4; }\n"],
-			]);
-			let seq = 0;
-			let changed = [...state.keys()];
-			const mtimeBase = 1_900_000_000_000 + seed * 1_000;
-			writeState(incrementalRoot, state, mtimeBase);
-			writeState(fullRoot, state, mtimeBase);
-			const seqHint = {
-				projectSeq: () => seq,
-				getFilesChangedSince: () =>
-					changed.map((relative) => path.join(incrementalRoot, relative)),
-			};
-			clearGraphCache();
-			await buildOrUpdateGraph(
-				incrementalRoot,
-				changed.map((relative) => path.join(incrementalRoot, relative)),
-				new FactStore(),
-				seqHint,
-			);
-			clearGraphCache();
-			await buildOrUpdateGraph(
-				fullRoot,
-				changed.map((relative) => path.join(fullRoot, relative)),
-				new FactStore(),
-			);
-
-			for (let step = 0; step < 10; step++) {
-				const operation = step % 5;
-				const active = [...state.keys()].sort();
-				if (operation === 0) {
-					const relative = active[Math.floor(random() * active.length)];
-					state.set(
-						relative,
-						`${state.get(relative)}\nexport const body${step} = ${step};\n`,
-					);
-					changed = [relative];
-				} else if (operation === 1) {
-					const relative = `src/added-${step}.ts`;
-					state.set(
-						relative,
-						"import { alpha } from './a';\nexport const added = alpha;\n",
-					);
-					changed = [relative];
-				} else if (operation === 2) {
-					const relative = active.find((file) => file.includes("added-"));
-					if (relative) state.delete(relative);
-					changed = relative ? [relative] : ["src/d.ts"];
-				} else if (operation === 3) {
-					state.set(
-						"src/c.ts",
-						"import { alpha } from './a';\nexport function gamma() { return alpha; }\n",
-					);
-					changed = ["src/c.ts"];
-				} else {
-					state.set("src/a.ts", `export const alpha${step} = ${step};\n`);
-					state.set(
+		it(
+			`matches nodes, edges, indexes, and signatures for seed ${seed}`,
+			{
+				timeout: 120_000,
+			},
+			async () => {
+				let randomState = seed;
+				const random = () => {
+					randomState = (Math.imul(randomState, 1_103_515_245) + 12_345) >>> 0;
+					return randomState / 0x1_0000_0000;
+				};
+				// Both arms share ONE mkdtemp'd parent with fixed subpaths (rather
+				// than two independent mkdtemp roots) so their absolute paths can
+				// never diverge in length/shape — cheap defense-in-depth against any
+				// future path-derived metadata leaking a difference between the
+				// incremental and full-rebuild arms. The actual root cause (a
+				// feature-hint classifier reading the absolute temp path) is already
+				// fixed at the source (#962/#972); this only guards against a
+				// regression reintroducing that class of bug.
+				const pairRoot = fs.mkdtempSync(
+					path.join(os.tmpdir(), "pi-lens-inc-eq-"),
+				);
+				const incrementalRoot = path.join(pairRoot, "incremental");
+				const fullRoot = path.join(pairRoot, "full");
+				fs.mkdirSync(incrementalRoot, { recursive: true });
+				fs.mkdirSync(fullRoot, { recursive: true });
+				roots.push(pairRoot);
+				const state = new Map<string, string>([
+					["src/a.ts", "export const alpha = 1;\n"],
+					[
 						"src/b.ts",
-						`import { alpha${step} } from './a';\nexport const beta${step} = alpha${step};\n`,
-					);
-					changed = ["src/a.ts", "src/b.ts"];
-				}
-				seq++;
-				const mtime = mtimeBase + seq * 2_000;
-				writeChanges(incrementalRoot, state, changed, mtime);
-				writeChanges(fullRoot, state, changed, mtime);
-
+						"import { alpha } from './a';\nexport const beta = alpha;\n",
+					],
+					[
+						"src/c.ts",
+						"import { beta } from './b';\nexport const gamma = beta;\n",
+					],
+					["src/d.ts", "export function delta() { return 4; }\n"],
+				]);
+				let seq = 0;
+				let changed = [...state.keys()];
+				const mtimeBase = 1_900_000_000_000 + seed * 1_000;
+				writeState(incrementalRoot, state, mtimeBase);
+				writeState(fullRoot, state, mtimeBase);
+				const seqHint = {
+					projectSeq: () => seq,
+					getFilesChangedSince: () =>
+						changed.map((relative) => path.join(incrementalRoot, relative)),
+				};
 				clearGraphCache();
-				const incremental = await buildOrUpdateGraph(
+				await buildOrUpdateGraph(
 					incrementalRoot,
 					changed.map((relative) => path.join(incrementalRoot, relative)),
 					new FactStore(),
 					seqHint,
 				);
-				clearReviewGraphWorkspaceCache(fullRoot);
-				const rebuilt = await buildOrUpdateGraph(
+				clearGraphCache();
+				await buildOrUpdateGraph(
 					fullRoot,
 					changed.map((relative) => path.join(fullRoot, relative)),
 					new FactStore(),
 				);
 
-				expect(graphShape(incremental, incrementalRoot)).toEqual(
-					graphShape(rebuilt, fullRoot),
-				);
-				expect(cacheShape(incrementalRoot)).toEqual(cacheShape(fullRoot));
-			}
-		});
+				for (let step = 0; step < 10; step++) {
+					const operation = step % 5;
+					const active = [...state.keys()].sort();
+					if (operation === 0) {
+						const relative = active[Math.floor(random() * active.length)];
+						state.set(
+							relative,
+							`${state.get(relative)}\nexport const body${step} = ${step};\n`,
+						);
+						changed = [relative];
+					} else if (operation === 1) {
+						const relative = `src/added-${step}.ts`;
+						state.set(
+							relative,
+							"import { alpha } from './a';\nexport const added = alpha;\n",
+						);
+						changed = [relative];
+					} else if (operation === 2) {
+						const relative = active.find((file) => file.includes("added-"));
+						if (relative) state.delete(relative);
+						changed = relative ? [relative] : ["src/d.ts"];
+					} else if (operation === 3) {
+						state.set(
+							"src/c.ts",
+							"import { alpha } from './a';\nexport function gamma() { return alpha; }\n",
+						);
+						changed = ["src/c.ts"];
+					} else {
+						state.set("src/a.ts", `export const alpha${step} = ${step};\n`);
+						state.set(
+							"src/b.ts",
+							`import { alpha${step} } from './a';\nexport const beta${step} = alpha${step};\n`,
+						);
+						changed = ["src/a.ts", "src/b.ts"];
+					}
+					seq++;
+					const mtime = mtimeBase + seq * 2_000;
+					writeChanges(incrementalRoot, state, changed, mtime);
+					writeChanges(fullRoot, state, changed, mtime);
+
+					clearGraphCache();
+					const incremental = await buildOrUpdateGraph(
+						incrementalRoot,
+						changed.map((relative) => path.join(incrementalRoot, relative)),
+						new FactStore(),
+						seqHint,
+					);
+					clearReviewGraphWorkspaceCache(fullRoot);
+					const rebuilt = await buildOrUpdateGraph(
+						fullRoot,
+						changed.map((relative) => path.join(fullRoot, relative)),
+						new FactStore(),
+					);
+
+					expect(graphShape(incremental, incrementalRoot)).toEqual(
+						graphShape(rebuilt, fullRoot),
+					);
+					expect(cacheShape(incrementalRoot)).toEqual(cacheShape(fullRoot));
+				}
+			},
+		);
 	}
 });

@@ -42,10 +42,10 @@ describe("classic TypeScript project-identity telemetry (#1412)", () => {
 		});
 		await probeTsserverProjectIdentity(options(executeCommand));
 
-		expect(executeCommand).toHaveBeenCalledWith(
-			"typescript.tsserverRequest",
-			["projectInfo", { file: "/repo/src/app.ts", needFileNameList: false }],
-		);
+		expect(executeCommand).toHaveBeenCalledWith("typescript.tsserverRequest", [
+			"projectInfo",
+			{ file: "/repo/src/app.ts", needFileNameList: false },
+		]);
 		expect(logLatency).toHaveBeenCalledWith(
 			expect.objectContaining({
 				phase: "lsp_typescript_project_identity",
@@ -83,18 +83,39 @@ describe("classic TypeScript project-identity telemetry (#1412)", () => {
 	});
 
 	it.each([
-		["error", "threw", vi.fn().mockRejectedValue(new Error("projectInfo failed"))],
-		["timeout", "not-executed", vi.fn().mockResolvedValue({ executed: false, reason: "timed out" })],
-		["no response", "no-response", vi.fn().mockResolvedValue({ executed: true })],
-		["unsuccessful", "unsuccessful", vi.fn().mockResolvedValue({ executed: true, result: { success: false } })],
-	])("logs a bounded outcome for a command %s", async (_name, expectedOutcome, executeCommand) => {
-		await expect(
-			probeTsserverProjectIdentity(options(executeCommand)),
-		).resolves.toBeUndefined();
-		expect(logLatency).toHaveBeenCalledWith(expect.objectContaining({
-			metadata: expect.objectContaining({ outcome: expectedOutcome }),
-		}));
-	});
+		[
+			"error",
+			"threw",
+			vi.fn().mockRejectedValue(new Error("projectInfo failed")),
+		],
+		[
+			"timeout",
+			"not-executed",
+			vi.fn().mockResolvedValue({ executed: false, reason: "timed out" }),
+		],
+		[
+			"no response",
+			"no-response",
+			vi.fn().mockResolvedValue({ executed: true }),
+		],
+		[
+			"unsuccessful",
+			"unsuccessful",
+			vi.fn().mockResolvedValue({ executed: true, result: { success: false } }),
+		],
+	])(
+		"logs a bounded outcome for a command %s",
+		async (_name, expectedOutcome, executeCommand) => {
+			await expect(
+				probeTsserverProjectIdentity(options(executeCommand)),
+			).resolves.toBeUndefined();
+			expect(logLatency).toHaveBeenCalledWith(
+				expect.objectContaining({
+					metadata: expect.objectContaining({ outcome: expectedOutcome }),
+				}),
+			);
+		},
+	);
 
 	it("deduplicates normalized aliases once per client and file, without logging the dedupe", async () => {
 		const executeCommand = vi.fn().mockResolvedValue({
@@ -103,7 +124,10 @@ describe("classic TypeScript project-identity telemetry (#1412)", () => {
 		});
 		const first = { ...options(executeCommand), file: "C:\\Repo\\src\\app.ts" };
 		await probeTsserverProjectIdentity(first);
-		await probeTsserverProjectIdentity({ ...first, file: "c:\\repo\\src\\APP.ts" });
+		await probeTsserverProjectIdentity({
+			...first,
+			file: "c:\\repo\\src\\APP.ts",
+		});
 
 		expect(executeCommand).toHaveBeenCalledTimes(1);
 		// Dedupe is a routine, high-volume no-op — it must NOT write a second

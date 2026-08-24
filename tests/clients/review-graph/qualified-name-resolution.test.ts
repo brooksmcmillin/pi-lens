@@ -143,7 +143,7 @@ describe("qualified symbol names in usedBy (refs #655 phase 2)", () => {
 });
 
 describe('"import" resolution tier (refs #655 phase 2)', () => {
-	it("upgrades a bare-name callee to \"import\" when the caller's import names exactly which file it comes from", async () => {
+	it('upgrades a bare-name callee to "import" when the caller\'s import names exactly which file it comes from', async () => {
 		const env = makeEnv();
 		createTempFile(
 			env.tmpDir,

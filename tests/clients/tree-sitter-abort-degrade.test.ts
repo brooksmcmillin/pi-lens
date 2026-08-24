@@ -7,7 +7,10 @@ import {
 	markTreeSitterWasmAborted,
 } from "../../clients/tree-sitter-shared.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
-import { getDegradationSummary, resetDegradationLedger } from "../../clients/degradation-ledger.js";
+import {
+	getDegradationSummary,
+	resetDegradationLedger,
+} from "../../clients/degradation-ledger.js";
 import { TreeSitterClient } from "../../clients/tree-sitter-client.js";
 
 /**
@@ -34,7 +37,16 @@ describe("tree-sitter wasm-abort degradation (shared client)", () => {
 		client.reportWasmAbort(new Error("Aborted(native code called abort())"));
 		client.reportWasmAbort(new Error("Aborted(second symptom)"));
 		expect(getDegradationSummary()).toEqual([
-			expect.objectContaining({ kind: "wasm-abort", count: 1, latestReasons: [{ subject: "web-tree-sitter", reason: "Aborted(native code called abort())" }] }),
+			expect.objectContaining({
+				kind: "wasm-abort",
+				count: 1,
+				latestReasons: [
+					{
+						subject: "web-tree-sitter",
+						reason: "Aborted(native code called abort())",
+					},
+				],
+			}),
 		]);
 	});
 	it("module_report returns an unavailable report instead of throwing", async () => {

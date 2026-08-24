@@ -136,8 +136,16 @@ describe("applyPartiallyApplicableEdits", () => {
 					rejectedReasons: [{ index: 0, code: "oldtext_not_found" }],
 				}),
 				edits: [
-					{ oldText: "const b = 2;", newText: "const b = 20;", originalIndex: 1 },
-					{ oldText: "const b = 20;", newText: "const b = 200;", originalIndex: 2 },
+					{
+						oldText: "const b = 2;",
+						newText: "const b = 20;",
+						originalIndex: 1,
+					},
+					{
+						oldText: "const b = 20;",
+						newText: "const b = 200;",
+						originalIndex: 2,
+					},
 					{ oldText: "not present", newText: "never", originalIndex: 0 },
 				],
 			});
@@ -168,7 +176,10 @@ describe("applyPartiallyApplicableEdits", () => {
 			requestedIndexes: Array.from({ length: 150 }, (_, index) => index),
 			resolvedIndexes: Array.from({ length: 150 }, (_, index) => index),
 			appliedIndexes: Array.from({ length: 150 }, (_, index) => index),
-			participantIds: Array.from({ length: 150 }, (_, index) => `call-${index}`),
+			participantIds: Array.from(
+				{ length: 150 },
+				(_, index) => `call-${index}`,
+			),
 			requestedTotal: 150,
 			resolvedTotal: 150,
 			appliedTotal: 150,
@@ -195,7 +206,13 @@ describe("applyPartiallyApplicableEdits", () => {
 					requestedIndexes: [0],
 					resolvedIndexes: [0],
 				}),
-				edits: [{ oldText: "const a = 1;", newText: "const a = 2;", originalIndex: 0 }],
+				edits: [
+					{
+						oldText: "const a = 1;",
+						newText: "const a = 2;",
+						originalIndex: 0,
+					},
+				],
 				afterWrite: async () => {
 					throw new Error("pipeline failure with source content");
 				},

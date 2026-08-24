@@ -39,11 +39,23 @@ describe("mypy attribution (#265 A2)", () => {
 
 describe("phpstan attribution (#265 A3)", () => {
 	it("uses the files-map key per error, not the edited file", () => {
+		// Real phpstan shape (#1937): `errors` is the COUNT, the findings are in
+		// `messages`. This literal used to spell `errors: [...]`, agreeing with a
+		// parser that read the same wrong field, so test and code were wrong
+		// together — the #1933 vale failure mode. The real envelope is pinned by
+		// tests/fixtures/runner-output/phpstan/real.captured.json.
 		const raw = JSON.stringify({
 			files: {
-				"src/Edited.php": { errors: [{ message: "bad", line: 4 }] },
-				"src/Dep.php": { errors: [{ message: "cross-file", line: 9 }] },
+				"src/Edited.php": {
+					errors: 1,
+					messages: [{ message: "bad", line: 4, identifier: "return.type" }],
+				},
+				"src/Dep.php": {
+					errors: 1,
+					messages: [{ message: "cross-file", line: 9 }],
+				},
 			},
+			totals: { errors: 0, file_errors: 2 },
 			errors: [],
 		});
 		const editedPhp = path.resolve(cwd, "src/Edited.php");

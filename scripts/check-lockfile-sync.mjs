@@ -54,7 +54,9 @@ for (const section of SECTIONS) {
 if (problems.length > 0) {
 	console.error("package-lock.json is out of sync with package.json:\n");
 	for (const p of problems) console.error(`  • ${p}`);
-	console.error("\nRun `npm install` and commit the updated package-lock.json.");
+	console.error(
+		"\nRun `npm install` and commit the updated package-lock.json.",
+	);
 	process.exit(1);
 }
 

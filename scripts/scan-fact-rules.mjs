@@ -15,9 +15,11 @@ const scanDir = resolve(root, process.argv[2] ?? "clients");
 
 // --- Bootstrap the dispatch system (registers all providers + rules) ---
 // Import integration.ts compiled output
-const { createDispatchContext } = await import("../clients/dispatch/dispatcher.js");
+const { createDispatchContext } =
+	await import("../clients/dispatch/dispatcher.js");
 const { runProviders } = await import("../clients/dispatch/fact-runner.js");
-const { evaluateRules } = await import("../clients/dispatch/fact-rule-runner.js");
+const { evaluateRules } =
+	await import("../clients/dispatch/fact-rule-runner.js");
 const { FactStore } = await import("../clients/dispatch/fact-store.js");
 
 // Side-effect import — registers all providers and rules
@@ -31,13 +33,16 @@ function walk(dir) {
 		const full = join(dir, entry);
 		const stat = statSync(full);
 		if (stat.isDirectory()) results.push(...walk(full));
-		else if (entry.endsWith(".ts") && !entry.endsWith(".d.ts")) results.push(full);
+		else if (entry.endsWith(".ts") && !entry.endsWith(".d.ts"))
+			results.push(full);
 	}
 	return results;
 }
 
 const files = walk(scanDir);
-console.log(`Scanning ${files.length} TypeScript files in ${relative(root, scanDir)}/\n`);
+console.log(
+	`Scanning ${files.length} TypeScript files in ${relative(root, scanDir)}/\n`,
+);
 
 // --- Stub PiAgentAPI ---
 const pi = { getFlag: () => undefined };
@@ -75,10 +80,14 @@ for (const d of allDiagnostics) {
 
 for (const [rule, diags] of [...byRule.entries()].sort()) {
 	console.log(`\n── ${rule} (${diags.length}) ──`);
-	for (const d of diags.sort((a, b) => (a.filePath + a.line) < (b.filePath + b.line) ? -1 : 1)) {
+	for (const d of diags.sort((a, b) =>
+		a.filePath + a.line < b.filePath + b.line ? -1 : 1,
+	)) {
 		const rel = relative(root, d.filePath);
 		console.log(`  ${rel}:${d.line ?? "?"} — ${d.message}`);
 	}
 }
 
-console.log(`\nTotal: ${allDiagnostics.length} diagnostic(s) across ${byRule.size} rule(s)`);
+console.log(
+	`\nTotal: ${allDiagnostics.length} diagnostic(s) across ${byRule.size} rule(s)`,
+);

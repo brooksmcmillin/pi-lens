@@ -36,17 +36,15 @@ function makeCtx(filePath: string, cwd = process.cwd()) {
 
 describe("isGitHubWorkflowFile", () => {
 	it("matches standard workflow files", async () => {
-		const { isGitHubWorkflowFile } = await import(
-			"../../../../clients/dispatch/runners/actionlint.js"
-		);
+		const { isGitHubWorkflowFile } =
+			await import("../../../../clients/dispatch/runners/actionlint.js");
 		expect(isGitHubWorkflowFile(".github/workflows/ci.yml")).toBe(true);
 		expect(isGitHubWorkflowFile(".github/workflows/ci.yaml")).toBe(true);
 	});
 
 	it("matches with an absolute or project-root prefix", async () => {
-		const { isGitHubWorkflowFile } = await import(
-			"../../../../clients/dispatch/runners/actionlint.js"
-		);
+		const { isGitHubWorkflowFile } =
+			await import("../../../../clients/dispatch/runners/actionlint.js");
 		expect(
 			isGitHubWorkflowFile("/home/user/project/.github/workflows/ci.yml"),
 		).toBe(true);
@@ -56,37 +54,31 @@ describe("isGitHubWorkflowFile", () => {
 	});
 
 	it("normalises Windows backslashes", async () => {
-		const { isGitHubWorkflowFile } = await import(
-			"../../../../clients/dispatch/runners/actionlint.js"
-		);
+		const { isGitHubWorkflowFile } =
+			await import("../../../../clients/dispatch/runners/actionlint.js");
 		expect(isGitHubWorkflowFile(".github\\workflows\\ci.yml")).toBe(true);
-		expect(
-			isGitHubWorkflowFile("C:\\repo\\.github\\workflows\\ci.yml"),
-		).toBe(true);
+		expect(isGitHubWorkflowFile("C:\\repo\\.github\\workflows\\ci.yml")).toBe(
+			true,
+		);
 	});
 
 	it("rejects files outside .github/workflows", async () => {
-		const { isGitHubWorkflowFile } = await import(
-			"../../../../clients/dispatch/runners/actionlint.js"
-		);
+		const { isGitHubWorkflowFile } =
+			await import("../../../../clients/dispatch/runners/actionlint.js");
 		expect(isGitHubWorkflowFile("src/config.yml")).toBe(false);
 		expect(isGitHubWorkflowFile(".github/other/ci.yml")).toBe(false);
 		expect(isGitHubWorkflowFile(".github/ci.yml")).toBe(false);
 	});
 
 	it("rejects YAML files nested deeper than workflows/", async () => {
-		const { isGitHubWorkflowFile } = await import(
-			"../../../../clients/dispatch/runners/actionlint.js"
-		);
-		expect(
-			isGitHubWorkflowFile(".github/workflows/subdir/ci.yml"),
-		).toBe(false);
+		const { isGitHubWorkflowFile } =
+			await import("../../../../clients/dispatch/runners/actionlint.js");
+		expect(isGitHubWorkflowFile(".github/workflows/subdir/ci.yml")).toBe(false);
 	});
 
 	it("rejects non-YAML extensions", async () => {
-		const { isGitHubWorkflowFile } = await import(
-			"../../../../clients/dispatch/runners/actionlint.js"
-		);
+		const { isGitHubWorkflowFile } =
+			await import("../../../../clients/dispatch/runners/actionlint.js");
 		expect(isGitHubWorkflowFile(".github/workflows/ci.json")).toBe(false);
 		expect(isGitHubWorkflowFile(".github/workflows/ci.txt")).toBe(false);
 	});
@@ -98,20 +90,23 @@ describe("parseActionlintJson", () => {
 	const filePath = "/repo/.github/workflows/ci.yml";
 
 	it("returns empty array for empty input", async () => {
-		const { parseActionlintJson } = await import(
-			"../../../../clients/dispatch/runners/actionlint.js"
-		);
+		const { parseActionlintJson } =
+			await import("../../../../clients/dispatch/runners/actionlint.js");
 		expect(parseActionlintJson("", filePath)).toEqual([]);
 		expect(parseActionlintJson("   ", filePath)).toEqual([]);
 	});
 
 	it("parses a JSON array of issues", async () => {
-		const { parseActionlintJson } = await import(
-			"../../../../clients/dispatch/runners/actionlint.js"
-		);
+		const { parseActionlintJson } =
+			await import("../../../../clients/dispatch/runners/actionlint.js");
 		const raw = JSON.stringify([
 			{ message: "unknown workflow key", line: 5, column: 3, kind: "syntax" },
-			{ message: "invalid expression", line: 12, column: 7, kind: "expression" },
+			{
+				message: "invalid expression",
+				line: 12,
+				column: 7,
+				kind: "expression",
+			},
 		]);
 		const result = parseActionlintJson(raw, filePath);
 		expect(result).toHaveLength(2);
@@ -126,9 +121,8 @@ describe("parseActionlintJson", () => {
 	});
 
 	it("parses a single JSON object (non-array)", async () => {
-		const { parseActionlintJson } = await import(
-			"../../../../clients/dispatch/runners/actionlint.js"
-		);
+		const { parseActionlintJson } =
+			await import("../../../../clients/dispatch/runners/actionlint.js");
 		const raw = JSON.stringify({
 			message: "bad step id",
 			line: 10,
@@ -141,9 +135,8 @@ describe("parseActionlintJson", () => {
 	});
 
 	it("falls back to NDJSON (one object per line)", async () => {
-		const { parseActionlintJson } = await import(
-			"../../../../clients/dispatch/runners/actionlint.js"
-		);
+		const { parseActionlintJson } =
+			await import("../../../../clients/dispatch/runners/actionlint.js");
 		const line1 = JSON.stringify({
 			message: "err one",
 			line: 1,
@@ -163,9 +156,8 @@ describe("parseActionlintJson", () => {
 	});
 
 	it("skips non-JSON lines in NDJSON fallback", async () => {
-		const { parseActionlintJson } = await import(
-			"../../../../clients/dispatch/runners/actionlint.js"
-		);
+		const { parseActionlintJson } =
+			await import("../../../../clients/dispatch/runners/actionlint.js");
 		const validLine = JSON.stringify({
 			message: "real error",
 			line: 3,
@@ -179,9 +171,8 @@ describe("parseActionlintJson", () => {
 	});
 
 	it("uses fallback values for missing fields", async () => {
-		const { parseActionlintJson } = await import(
-			"../../../../clients/dispatch/runners/actionlint.js"
-		);
+		const { parseActionlintJson } =
+			await import("../../../../clients/dispatch/runners/actionlint.js");
 		const raw = JSON.stringify([{ message: "" }]);
 		const result = parseActionlintJson(raw, filePath);
 		expect(result[0].line).toBe(1);
@@ -191,9 +182,8 @@ describe("parseActionlintJson", () => {
 	});
 
 	it("attaches snippet as matchedText", async () => {
-		const { parseActionlintJson } = await import(
-			"../../../../clients/dispatch/runners/actionlint.js"
-		);
+		const { parseActionlintJson } =
+			await import("../../../../clients/dispatch/runners/actionlint.js");
 		const raw = JSON.stringify([
 			{ message: "bad key", line: 1, column: 1, snippet: "on: push" },
 		]);
@@ -266,9 +256,7 @@ describe("actionlintRunner.run", () => {
 		const runner = (
 			await import("../../../../clients/dispatch/runners/actionlint.js")
 		).default;
-		const ctx = makeCtx(
-			path.join(process.cwd(), ".github/workflows/ci.yml"),
-		);
+		const ctx = makeCtx(path.join(process.cwd(), ".github/workflows/ci.yml"));
 		const result = await runner.run(ctx as never);
 		expect(result.status).toBe("failed");
 		expect(result.diagnostics[0].message).toBe(

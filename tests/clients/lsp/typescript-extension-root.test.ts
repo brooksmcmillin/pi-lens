@@ -89,8 +89,8 @@ describe("TypeScriptRoot — extension files (#123)", () => {
 		// The chosen root must NOT escape the extensions boundary — i.e. it
 		// must contain `.pi/agent/extensions/` somewhere in its path so the
 		// LSP doesn't workspace-scan all of pi.
-		expect(
-			path.resolve(root as string).replace(/\\/g, "/"),
-		).toContain("/.pi/agent/extensions/");
+		expect(path.resolve(root as string).replace(/\\/g, "/")).toContain(
+			"/.pi/agent/extensions/",
+		);
 	});
 });

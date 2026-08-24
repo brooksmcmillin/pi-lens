@@ -59,7 +59,8 @@ describe("LSP server install actions (#197)", () => {
 	});
 
 	it("tryDotnetToolInstall: install success → true, no update attempt", async () => {
-		const { tryDotnetToolInstall } = await import("../../clients/lsp/server.js");
+		const { tryDotnetToolInstall } =
+			await import("../../clients/lsp/server.js");
 
 		expect(await tryDotnetToolInstall("csharp-ls")).toBe(true);
 		expect(mockSafeSpawnAsync).toHaveBeenCalledTimes(1);
@@ -71,7 +72,8 @@ describe("LSP server install actions (#197)", () => {
 	});
 
 	it("tryDotnetToolInstall: missing NuGet sources → false, no update attempt", async () => {
-		const { tryDotnetToolInstall } = await import("../../clients/lsp/server.js");
+		const { tryDotnetToolInstall } =
+			await import("../../clients/lsp/server.js");
 
 		mockSafeSpawnAsync.mockResolvedValueOnce(
 			ok({ status: 1, stderr: "No NuGet sources are defined or enabled" }),
@@ -82,7 +84,8 @@ describe("LSP server install actions (#197)", () => {
 	});
 
 	it("tryDotnetToolInstall: other install failure → falls back to `tool update`", async () => {
-		const { tryDotnetToolInstall } = await import("../../clients/lsp/server.js");
+		const { tryDotnetToolInstall } =
+			await import("../../clients/lsp/server.js");
 
 		mockSafeSpawnAsync
 			.mockResolvedValueOnce(ok({ status: 1, stderr: "already installed" }))
@@ -100,9 +103,8 @@ describe("LSP server install actions (#197)", () => {
 		const originalPath = process.env.PATH;
 		try {
 			const { tryGemInstall } = await import("../../clients/lsp/server.js");
-			const { getGlobalPiLensDir } = await import(
-				"../../clients/file-utils.js"
-			);
+			const { getGlobalPiLensDir } =
+				await import("../../clients/file-utils.js");
 
 			expect(await tryGemInstall("ruby-lsp")).toBe(true);
 			const [cmd, args, opts] = mockSafeSpawnAsync.mock.calls[0];
@@ -133,9 +135,8 @@ describe("formatter lazy-install actions (#197)", () => {
 	});
 
 	it("rubocop: spawns `gem install rubocop`, uncancellable, true on exit 0", async () => {
-		const { tryLazyInstallFormatterTool } = await import(
-			"../../clients/formatters.js"
-		);
+		const { tryLazyInstallFormatterTool } =
+			await import("../../clients/formatters.js");
 
 		expect(await tryLazyInstallFormatterTool("rubocop", freshCwd())).toBe(true);
 		const [cmd, args, opts] = mockSafeSpawnAsync.mock.calls[0];
@@ -145,9 +146,8 @@ describe("formatter lazy-install actions (#197)", () => {
 	});
 
 	it("rustfmt: spawns `rustup component add rustfmt`, uncancellable", async () => {
-		const { tryLazyInstallFormatterTool } = await import(
-			"../../clients/formatters.js"
-		);
+		const { tryLazyInstallFormatterTool } =
+			await import("../../clients/formatters.js");
 
 		expect(await tryLazyInstallFormatterTool("rustfmt", freshCwd())).toBe(true);
 		const [cmd, args, opts] = mockSafeSpawnAsync.mock.calls[0];
@@ -157,19 +157,19 @@ describe("formatter lazy-install actions (#197)", () => {
 	});
 
 	it("returns false on a failed install and does not throw", async () => {
-		const { tryLazyInstallFormatterTool } = await import(
-			"../../clients/formatters.js"
-		);
+		const { tryLazyInstallFormatterTool } =
+			await import("../../clients/formatters.js");
 		vi.spyOn(console, "error").mockImplementation(() => {});
 		mockSafeSpawnAsync.mockResolvedValueOnce(ok({ status: 1, stderr: "boom" }));
 
-		expect(await tryLazyInstallFormatterTool("rubocop", freshCwd())).toBe(false);
+		expect(await tryLazyInstallFormatterTool("rubocop", freshCwd())).toBe(
+			false,
+		);
 	});
 
 	it("dedupes repeated attempts for the same tool+cwd (no second spawn)", async () => {
-		const { tryLazyInstallFormatterTool } = await import(
-			"../../clients/formatters.js"
-		);
+		const { tryLazyInstallFormatterTool } =
+			await import("../../clients/formatters.js");
 		const cwd = freshCwd();
 
 		expect(await tryLazyInstallFormatterTool("rubocop", cwd)).toBe(true);

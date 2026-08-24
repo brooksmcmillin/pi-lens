@@ -80,7 +80,9 @@ function isTypeStub(content: string): boolean {
  */
 export function detectFileRole(filePath: string, content?: string): FileRole {
 	const windowsShaped = isWindowsPath(filePath);
-	const base = (windowsShaped ? win32.basename(filePath) : basename(filePath)).toLowerCase();
+	const base = (
+		windowsShaped ? win32.basename(filePath) : basename(filePath)
+	).toLowerCase();
 	const dir = (windowsShaped ? win32.dirname(filePath) : dirname(filePath))
 		.replace(/\\/g, "/")
 		.toLowerCase();

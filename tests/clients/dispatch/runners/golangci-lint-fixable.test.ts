@@ -8,17 +8,15 @@ interface IssueOpts {
 	line?: number;
 	column?: number;
 	severity?: string;
-	replacement?:
-		| {
-				NeedOnlyDelete?: boolean;
-				NewLines?: string[];
-				Inline?: {
-					StartCol?: number;
-					Length?: number;
-					NewString?: string;
-				};
-		  }
-		| null;
+	replacement?: {
+		NeedOnlyDelete?: boolean;
+		NewLines?: string[];
+		Inline?: {
+			StartCol?: number;
+			Length?: number;
+			NewString?: string;
+		};
+	} | null;
 }
 
 function issueJson(...issues: IssueOpts[]): string {
@@ -68,7 +66,7 @@ describe("parseGolangciJson — fixable propagation (#112 slice)", () => {
 			line: 10,
 			column: 1,
 			replacement: {
-				NewLines: ["package main", "", "import \"fmt\""],
+				NewLines: ["package main", "", 'import "fmt"'],
 			},
 		});
 		const diags = parseGolangciJson(raw, "main.go");
@@ -142,8 +140,8 @@ describe("parseGolangciJson — fixable propagation (#112 slice)", () => {
 	it("handles empty / malformed output gracefully", () => {
 		expect(parseGolangciJson("", "main.go")).toEqual([]);
 		expect(parseGolangciJson("not json", "main.go")).toEqual([]);
-		expect(parseGolangciJson(JSON.stringify({ Issues: null }), "main.go")).toEqual(
-			[],
-		);
+		expect(
+			parseGolangciJson(JSON.stringify({ Issues: null }), "main.go"),
+		).toEqual([]);
 	});
 });

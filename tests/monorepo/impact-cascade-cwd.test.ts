@@ -25,7 +25,10 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 import { FactStore } from "../../clients/dispatch/fact-store.js";
-import { buildOrUpdateGraph, computeImpactCascade } from "../../clients/review-graph/service.js";
+import {
+	buildOrUpdateGraph,
+	computeImpactCascade,
+} from "../../clients/review-graph/service.js";
 import { clearReviewGraphWorkspaceCache } from "../../clients/review-graph/builder.js";
 import { clearModuleGraphCache } from "../../clients/review-graph/workspace-modules.js";
 import { makeMonorepo } from "./fixture.js";
@@ -75,37 +78,34 @@ describe("computeImpactCascade's module-graph fallback requires cwd (#775 item 7
 		}
 	});
 
-	it(
-		"fixed (#781): dispatch/runners/tree-sitter.ts's runBlastRadiusInBackground now calls computeImpactCascade WITH cwd, so the module-graph fallback engages — reproduced here by calling the service function the same way that call site does",
-		async () => {
-			const repo = makeMonorepo({
-				packages: [
-					{
-						name: "@scope/a",
-						dir: "packages/a",
-						deps: ["@scope/b"],
-						files: { "src/index.ts": "export const a = 1;\n" },
-					},
-					{
-						name: "@scope/b",
-						dir: "packages/b",
-						files: { "src/index.ts": "export const b = 1;\n" },
-					},
-				],
-			});
-			try {
-				const bEntry = repo.filePath("@scope/b", "src/index.ts");
-				const graph = await buildOrUpdateGraph(repo.root, [], new FactStore());
-				// Mirrors dispatch/runners/tree-sitter.ts:54's exact call shape post-#781
-				// (`computeImpactCascade(graph, filePath, cwd)`, cwd now threaded
-				// through from the enclosing scope).
-				const impact = computeImpactCascade(graph, bEntry, repo.root);
-				expect(
-					impact.riskFlags.some((f) => f.includes("downstream module")),
-				).toBe(true);
-			} finally {
-				repo.cleanup();
-			}
-		},
-	);
+	it("fixed (#781): dispatch/runners/tree-sitter.ts's runBlastRadiusInBackground now calls computeImpactCascade WITH cwd, so the module-graph fallback engages — reproduced here by calling the service function the same way that call site does", async () => {
+		const repo = makeMonorepo({
+			packages: [
+				{
+					name: "@scope/a",
+					dir: "packages/a",
+					deps: ["@scope/b"],
+					files: { "src/index.ts": "export const a = 1;\n" },
+				},
+				{
+					name: "@scope/b",
+					dir: "packages/b",
+					files: { "src/index.ts": "export const b = 1;\n" },
+				},
+			],
+		});
+		try {
+			const bEntry = repo.filePath("@scope/b", "src/index.ts");
+			const graph = await buildOrUpdateGraph(repo.root, [], new FactStore());
+			// Mirrors dispatch/runners/tree-sitter.ts:54's exact call shape post-#781
+			// (`computeImpactCascade(graph, filePath, cwd)`, cwd now threaded
+			// through from the enclosing scope).
+			const impact = computeImpactCascade(graph, bEntry, repo.root);
+			expect(
+				impact.riskFlags.some((f) => f.includes("downstream module")),
+			).toBe(true);
+		} finally {
+			repo.cleanup();
+		}
+	});
 });

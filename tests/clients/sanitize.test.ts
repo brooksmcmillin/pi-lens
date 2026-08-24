@@ -151,7 +151,8 @@ describe("sanitizeRustOutput", () => {
 	});
 
 	it("keeps error lines", () => {
-		const output = "error[E0308]: mismatched types\n  --> src/main.rs:5:10\nnote: ignored";
+		const output =
+			"error[E0308]: mismatched types\n  --> src/main.rs:5:10\nnote: ignored";
 		const result = sanitizeRustOutput(output);
 		expect(result).toContain("mismatched types");
 		expect(result).toContain("src/main.rs");
@@ -178,7 +179,10 @@ describe("sanitizeBiomeOutput", () => {
 	it("parses JSON diagnostics format", () => {
 		const json = JSON.stringify({
 			diagnostics: [
-				{ message: "unused variable", location: { path: "a.ts", span: { start: { line: 0 } } } },
+				{
+					message: "unused variable",
+					location: { path: "a.ts", span: { start: { line: 0 } } },
+				},
 			],
 		});
 		const result = sanitizeBiomeOutput(json);
@@ -199,7 +203,11 @@ describe("sanitizeRuffOutput", () => {
 
 	it("parses JSON array format", () => {
 		const json = JSON.stringify([
-			{ location: { row: 5, column: 3 }, code: "E501", message: "line too long" },
+			{
+				location: { row: 5, column: 3 },
+				code: "E501",
+				message: "line too long",
+			},
 		]);
 		const result = sanitizeRuffOutput(json);
 		expect(result).toContain("E501");
@@ -227,7 +235,10 @@ describe("sanitizeToolOutput", () => {
 	});
 
 	it("sets truncated flag when output exceeds 20 lines", () => {
-		const manyLines = Array.from({ length: 25 }, (_, i) => `error: line ${i}`).join("\n");
+		const manyLines = Array.from(
+			{ length: 25 },
+			(_, i) => `error: line ${i}`,
+		).join("\n");
 		const r = sanitizeToolOutput(manyLines);
 		expect(r.truncated).toBe(true);
 		expect(r.details).toContain("more lines");

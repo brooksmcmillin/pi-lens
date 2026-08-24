@@ -53,7 +53,7 @@ const turnCtx = {
 };
 
 async function driveTurns(count: number) {
-	const { default: registerExtension } = await import("../index.ts");
+	const { default: registerExtension } = await import("../index.js");
 	const mock = createPiMock({ "lens-lsp": true });
 	registerExtension(mock.asExtensionAPI() as never);
 	const turnStart = mock.getHandlers("turn_start")[0];
@@ -73,61 +73,79 @@ function smellNotifyCalls() {
 	);
 }
 
-describe("index turn_end smells-rollup wiring (#1123 item 3)", () => {
-	beforeEach(async () => {
-		vi.resetModules();
-		notify.mockClear();
-		countRecentSmells.mockClear();
-		mockedCounts = { staleCtxEmitFailed: 0, opengrepRespawn: 0 };
-		const { resetSmellsSessionState } = await import(
-			"../clients/smells-rollup.js"
-		);
-		resetSmellsSessionState();
-	});
-	afterEach(() => {
-		vi.clearAllMocks();
-	});
+// #1778: each case drives `driveTurns`, which pays a COLD
+// `import("../index.js")` after `vi.resetModules()` in `beforeEach` —
+// deliberate, not accidental. index.ts carries turn-scoped module state
+// (the smells-rollup once-per-session gate, reset via
+// resetSmellsSessionState), which is exactly what this wiring guard checks.
+// Sharing one import across cases would defeat the isolation the tests exist
+// to prove, so the fix is a timeout budget, not a hoisted import (matching
+// #1772/#1779's index-loop-block-wiring fix and this repo's
+// HEAVY_IO_TIMEOUT_MS convention,
+// tests/clients/ast-grep-rule-precedence-followups.test.ts:210). Reproduced
+// red pre-fix at 5222ms (over the 5000ms default) — see #1778.
+const SMELLS_ROLLUP_WIRING_TIMEOUT_MS = 30_000;
 
-	it("checks nothing before the interval (turn 19)", async () => {
-		mockedCounts = { staleCtxEmitFailed: 99, opengrepRespawn: 99 };
-		await driveTurns(19);
-		expect(smellNotifyCalls()).toHaveLength(0);
-	});
+describe(
+	"index turn_end smells-rollup wiring (#1123 item 3)",
+	{
+		timeout: SMELLS_ROLLUP_WIRING_TIMEOUT_MS,
+	},
+	() => {
+		beforeEach(async () => {
+			vi.resetModules();
+			notify.mockClear();
+			countRecentSmells.mockClear();
+			mockedCounts = { staleCtxEmitFailed: 0, opengrepRespawn: 0 };
+			const { resetSmellsSessionState } =
+				await import("../clients/smells-rollup.js");
+			resetSmellsSessionState();
+		});
+		afterEach(() => {
+			vi.clearAllMocks();
+		});
 
-	it("notifies once when a smell is at/above threshold on the check turn (20)", async () => {
-		mockedCounts = { staleCtxEmitFailed: 5, opengrepRespawn: 0 };
-		await driveTurns(20);
-		const calls = smellNotifyCalls();
-		expect(calls).toHaveLength(1);
-		expect(String(calls[0][0])).toContain("stale-ctx emit_failed");
-		expect(calls[0][1]).toBe("warning");
-	});
+		it("checks nothing before the interval (turn 19)", async () => {
+			mockedCounts = { staleCtxEmitFailed: 99, opengrepRespawn: 99 };
+			await driveTurns(19);
+			expect(smellNotifyCalls()).toHaveLength(0);
+		});
 
-	it("passes the in-process session start, not the 24h fallback (S3c, #1432 review)", async () => {
-		mockedCounts = { staleCtxEmitFailed: 5, opengrepRespawn: 0 };
-		const before = Date.now();
-		await driveTurns(20);
-		const after = Date.now();
-		expect(countRecentSmells).toHaveBeenCalled();
-		const [rootArg, sessionStartArg] = countRecentSmells.mock.calls.at(-1)!;
-		expect(rootArg).toBeUndefined();
-		expect(sessionStartArg).toBeTypeOf("number");
-		// The session (and thus its recorded start) is created inside
-		// driveTurns, so it falls within [before, after] — nowhere near a
-		// 24h-ago fallback value.
-		expect(sessionStartArg as number).toBeGreaterThanOrEqual(before);
-		expect(sessionStartArg as number).toBeLessThanOrEqual(after);
-	});
+		it("notifies once when a smell is at/above threshold on the check turn (20)", async () => {
+			mockedCounts = { staleCtxEmitFailed: 5, opengrepRespawn: 0 };
+			await driveTurns(20);
+			const calls = smellNotifyCalls();
+			expect(calls).toHaveLength(1);
+			expect(String(calls[0][0])).toContain("stale-ctx emit_failed");
+			expect(calls[0][1]).toBe("warning");
+		});
 
-	it("does not notify again on turn 40 for a smell already notified this session", async () => {
-		mockedCounts = { staleCtxEmitFailed: 5, opengrepRespawn: 0 };
-		await driveTurns(40);
-		expect(smellNotifyCalls()).toHaveLength(1);
-	});
+		it("passes the in-process session start, not the 24h fallback (S3c, #1432 review)", async () => {
+			mockedCounts = { staleCtxEmitFailed: 5, opengrepRespawn: 0 };
+			const before = Date.now();
+			await driveTurns(20);
+			const after = Date.now();
+			expect(countRecentSmells).toHaveBeenCalled();
+			const [rootArg, sessionStartArg] = countRecentSmells.mock.calls.at(-1)!;
+			expect(rootArg).toBeUndefined();
+			expect(sessionStartArg).toBeTypeOf("number");
+			// The session (and thus its recorded start) is created inside
+			// driveTurns, so it falls within [before, after] — nowhere near a
+			// 24h-ago fallback value.
+			expect(sessionStartArg as number).toBeGreaterThanOrEqual(before);
+			expect(sessionStartArg as number).toBeLessThanOrEqual(after);
+		});
 
-	it("does not notify when every count stays below threshold", async () => {
-		mockedCounts = { staleCtxEmitFailed: 1, opengrepRespawn: 1 };
-		await driveTurns(20);
-		expect(smellNotifyCalls()).toHaveLength(0);
-	});
-});
+		it("does not notify again on turn 40 for a smell already notified this session", async () => {
+			mockedCounts = { staleCtxEmitFailed: 5, opengrepRespawn: 0 };
+			await driveTurns(40);
+			expect(smellNotifyCalls()).toHaveLength(1);
+		});
+
+		it("does not notify when every count stays below threshold", async () => {
+			mockedCounts = { staleCtxEmitFailed: 1, opengrepRespawn: 1 };
+			await driveTurns(20);
+			expect(smellNotifyCalls()).toHaveLength(0);
+		});
+	},
+);

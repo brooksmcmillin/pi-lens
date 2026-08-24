@@ -17,12 +17,32 @@ import { removeTempDirSync } from "./test-utils.js";
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
-function sym(filePath: string, name: string, kind: Symbol["kind"] = "function", line = 1, endLine?: number): Symbol {
-	return { id: `${filePath}:${name}`, name, kind, filePath, line, ...(endLine === undefined ? {} : { endLine }), column: 1, isExported: true };
+function sym(
+	filePath: string,
+	name: string,
+	kind: Symbol["kind"] = "function",
+	line = 1,
+	endLine?: number,
+): Symbol {
+	return {
+		id: `${filePath}:${name}`,
+		name,
+		kind,
+		filePath,
+		line,
+		...(endLine === undefined ? {} : { endLine }),
+		column: 1,
+		isExported: true,
+	};
 }
 
 function ref(callerFile: string, refName: string, line = 5): SymbolRef {
-	return { symbolId: `${callerFile}:${refName}`, filePath: callerFile, line, column: 1 };
+	return {
+		symbolId: `${callerFile}:${refName}`,
+		filePath: callerFile,
+		line,
+		column: 1,
+	};
 }
 
 function validPersistedCallGraph(): Record<string, unknown> {
@@ -35,18 +55,20 @@ function validPersistedCallGraph(): Record<string, unknown> {
 		builtAt: "2026-08-04T00:00:00.000Z",
 		reviewGraphVersion: "v9",
 		reviewGraphSignature: "sig-valid",
-		edges: [{
-			callerFile,
-			callerSymbol: "caller",
-			callerKey,
-			calleeFile,
-			calleeSymbol: "callee",
-			calleeKey,
-			evidenceKind: "calls",
-			resolution: "exact",
-			evidenceCount: 1,
-			weight: 1,
-		}],
+		edges: [
+			{
+				callerFile,
+				callerSymbol: "caller",
+				callerKey,
+				calleeFile,
+				calleeSymbol: "callee",
+				calleeKey,
+				evidenceKind: "calls",
+				resolution: "exact",
+				evidenceCount: 1,
+				weight: 1,
+			},
+		],
 		callees: [[callerKey, [calleeKey]]],
 		callers: [[calleeKey, [callerKey]]],
 		inDegree: [[calleeKey, 1]],
@@ -70,8 +92,12 @@ function validPersistedCallGraph(): Record<string, unknown> {
 }
 
 let tmpDir: string;
-beforeEach(() => { tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-cg-")); });
-afterEach(() => { removeTempDirSync(tmpDir); });
+beforeEach(() => {
+	tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-cg-"));
+});
+afterEach(() => {
+	removeTempDirSync(tmpDir);
+});
 
 // ── buildCallGraph ─────────────────────────────────────────────────────────────
 
@@ -132,11 +158,21 @@ describe("buildCallGraph", () => {
 		const allSymbols = new Map([
 			[divergent, [sym(canonical, "caller"), sym(canonical, "helper")]],
 		]);
-		const graph = buildCallGraph(allSymbols, new Map([[divergent, [{
-			...ref(divergent, "helper"),
-			targetId: `${canonical}:helper`,
-			resolution: "exact",
-		}]]]));
+		const graph = buildCallGraph(
+			allSymbols,
+			new Map([
+				[
+					divergent,
+					[
+						{
+							...ref(divergent, "helper"),
+							targetId: `${canonical}:helper`,
+							resolution: "exact",
+						},
+					],
+				],
+			]),
+		);
 		expect(graph.callees.size).toBe(0);
 		expect(graph.callers.size).toBe(0);
 		expect(graph.coverage?.sameFileEvidence).toBe(1);
@@ -146,7 +182,10 @@ describe("buildCallGraph", () => {
 		const fileA = "/proj/a.ts";
 		const fileB = "/proj/b.ts";
 		const graph = buildCallGraph(
-			new Map([[fileA, [sym(fileA, "done", "function", 1, 3)]], [fileB, [sym(fileB, "init")]]]),
+			new Map([
+				[fileA, [sym(fileA, "done", "function", 1, 3)]],
+				[fileB, [sym(fileB, "init")]],
+			]),
 			new Map([[fileA, [ref(fileA, "init", 5)]]]),
 		);
 		expect(graph.callees.has(`file:${fileA}`)).toBe(true);
@@ -157,8 +196,26 @@ describe("buildCallGraph", () => {
 		const fileA = "/proj/a.ts";
 		const fileB = "/proj/b.ts";
 		const graph = buildCallGraph(
-			new Map([[fileA, [sym(fileA, "outer", "function", 1, 10), sym(fileA, "inner", "function", 3, 5)]], [fileB, [sym(fileB, "target")]]]),
-			new Map([[fileA, [ref(fileA, "target", 4), ref(fileA, "target", 7), ref(fileA, "target", 12)]]]),
+			new Map([
+				[
+					fileA,
+					[
+						sym(fileA, "outer", "function", 1, 10),
+						sym(fileA, "inner", "function", 3, 5),
+					],
+				],
+				[fileB, [sym(fileB, "target")]],
+			]),
+			new Map([
+				[
+					fileA,
+					[
+						ref(fileA, "target", 4),
+						ref(fileA, "target", 7),
+						ref(fileA, "target", 12),
+					],
+				],
+			]),
 		);
 		expect(graph.callees.has(`${fileA}:inner`)).toBe(true);
 		expect(graph.callees.has(`${fileA}:outer`)).toBe(true);
@@ -175,9 +232,7 @@ describe("buildCallGraph", () => {
 			[fileB, [sym(fileB, "shared")]],
 			[fileC, [sym(fileC, "shared")]],
 		]);
-		const allRefs = new Map([
-			[fileA, [ref(fileA, "shared", 3)]],
-		]);
+		const allRefs = new Map([[fileA, [ref(fileA, "shared", 3)]]]);
 
 		const graph = buildCallGraph(allSymbols, allRefs);
 
@@ -214,7 +269,10 @@ describe("buildCallGraph", () => {
 				new Map([[fileA, [ref(fileA, "shared")]]]),
 			);
 
-			saveCallGraph("/proj", graph, { reviewGraphVersion: "v7", reviewGraphSignature: "sig-ambiguous" });
+			saveCallGraph("/proj", graph, {
+				reviewGraphVersion: "v7",
+				reviewGraphSignature: "sig-ambiguous",
+			});
 			expect(loadCallGraph("/proj")?.graph.coverage).toMatchObject({
 				totalEvidence: 1,
 				resolvedEvidence: 1,
@@ -234,22 +292,79 @@ describe("buildCallGraph", () => {
 			const callerId = `${fileA}:caller:function:10`;
 			const graph = buildCallGraph(
 				new Map([
-					[fileA, [{ ...sym(fileA, "target", "function", 3), id: sameFileId }, { ...sym(fileA, "caller", "function", 10), id: callerId }]],
-					[fileB, [{ ...sym(fileB, "remote", "function", 3), id: crossFileId }]],
+					[
+						fileA,
+						[
+							{ ...sym(fileA, "target", "function", 3), id: sameFileId },
+							{ ...sym(fileA, "caller", "function", 10), id: callerId },
+						],
+					],
+					[
+						fileB,
+						[{ ...sym(fileB, "remote", "function", 3), id: crossFileId }],
+					],
 				]),
-				new Map([[fileA, [
-					{ ...ref(fileA, "target", 4), targetId: sameFileId, evidenceKind: "calls", referenceKind: "call", resolution: "exact" },
-					{ ...ref(fileA, "remote", 11), targetId: crossFileId, callerSymbolId: callerId, evidenceKind: "calls", referenceKind: "call", resolution: "exact" },
-				]]]),
-				{ totalEvidence: 2, callsEvidence: 2, referencesEvidence: 0, eligibleEvidence: 2, resolvedEvidence: 2, unresolvedEvidence: 0, typeOnlyEvidence: 0, unsupportedEvidence: 0, sameFileEvidence: 0, duplicateEvidence: 0, complete: true },
+				new Map([
+					[
+						fileA,
+						[
+							{
+								...ref(fileA, "target", 4),
+								targetId: sameFileId,
+								evidenceKind: "calls",
+								referenceKind: "call",
+								resolution: "exact",
+							},
+							{
+								...ref(fileA, "remote", 11),
+								targetId: crossFileId,
+								callerSymbolId: callerId,
+								evidenceKind: "calls",
+								referenceKind: "call",
+								resolution: "exact",
+							},
+						],
+					],
+				]),
+				{
+					totalEvidence: 2,
+					callsEvidence: 2,
+					referencesEvidence: 0,
+					eligibleEvidence: 2,
+					resolvedEvidence: 2,
+					unresolvedEvidence: 0,
+					typeOnlyEvidence: 0,
+					unsupportedEvidence: 0,
+					sameFileEvidence: 0,
+					duplicateEvidence: 0,
+					complete: true,
+				},
 			);
 			expect(graph.edges).toHaveLength(1);
-			expect(graph.coverage).toMatchObject({ resolvedEvidence: 1, eligibleEvidence: 1, sameFileEvidence: 1, unsupportedEvidence: 0, complete: true });
-			saveCallGraph("/proj", graph, { reviewGraphVersion: "v7", reviewGraphSignature: "sig-same-file" });
+			expect(graph.coverage).toMatchObject({
+				resolvedEvidence: 1,
+				eligibleEvidence: 1,
+				sameFileEvidence: 1,
+				unsupportedEvidence: 0,
+				complete: true,
+			});
+			saveCallGraph("/proj", graph, {
+				reviewGraphVersion: "v7",
+				reviewGraphSignature: "sig-same-file",
+			});
 			const loaded = loadCallGraph("/proj");
-			expect(loaded?.graph.callees.get(callerId)).toEqual(new Set([crossFileId]));
-			expect(loaded?.graph.callers.get(crossFileId)).toEqual(new Set([callerId]));
-			expect(loaded?.graph.coverage).toMatchObject({ resolvedEvidence: 1, sameFileEvidence: 1, unsupportedEvidence: 0, complete: true });
+			expect(loaded?.graph.callees.get(callerId)).toEqual(
+				new Set([crossFileId]),
+			);
+			expect(loaded?.graph.callers.get(crossFileId)).toEqual(
+				new Set([callerId]),
+			);
+			expect(loaded?.graph.coverage).toMatchObject({
+				resolvedEvidence: 1,
+				sameFileEvidence: 1,
+				unsupportedEvidence: 0,
+				complete: true,
+			});
 		} finally {
 			delete process.env.PILENS_DATA_DIR;
 		}
@@ -279,25 +394,37 @@ describe("buildCallGraph", () => {
 			const callerId = `${callerFileForwardSlash}:caller:function:10`;
 
 			const allSymbols = new Map<string, Symbol[]>([
-				[callerFileForwardSlash, [
-					{ ...sym(callerFileForwardSlash, "target", "function", 3), id: targetId },
-					{ ...sym(callerFileForwardSlash, "caller", "function", 10), id: callerId },
-				]],
+				[
+					callerFileForwardSlash,
+					[
+						{
+							...sym(callerFileForwardSlash, "target", "function", 3),
+							id: targetId,
+						},
+						{
+							...sym(callerFileForwardSlash, "caller", "function", 10),
+							id: callerId,
+						},
+					],
+				],
 			]);
 			// The ref's OWN filePath/callerFile is spelled with backslashes —
 			// divergent from the symbol's forward-slash filePath above, but the
 			// same file on disk.
 			const allRefs = new Map<string, SymbolRef[]>([
-				[callerFileBackslash, [
-					{
-						...ref(callerFileBackslash, "target", 4),
-						targetId,
-						callerSymbolId: callerId,
-						evidenceKind: "calls",
-						referenceKind: "call",
-						resolution: "exact",
-					},
-				]],
+				[
+					callerFileBackslash,
+					[
+						{
+							...ref(callerFileBackslash, "target", 4),
+							targetId,
+							callerSymbolId: callerId,
+							evidenceKind: "calls",
+							referenceKind: "call",
+							resolution: "exact",
+						},
+					],
+				],
 			]);
 
 			const graph = buildCallGraph(allSymbols, allRefs, {
@@ -322,8 +449,11 @@ describe("buildCallGraph", () => {
 			if (!c) throw new Error("expected coverage on a freshly built graph");
 			expect(c.sameFileEvidence).toBe(1);
 			expect(
-				c.resolvedEvidence + c.unresolvedEvidence + c.typeOnlyEvidence +
-					c.unsupportedEvidence + c.sameFileEvidence,
+				c.resolvedEvidence +
+					c.unresolvedEvidence +
+					c.typeOnlyEvidence +
+					c.unsupportedEvidence +
+					c.sameFileEvidence,
 			).toBe(c.totalEvidence);
 
 			// And the round trip through the real persistence path survives the
@@ -350,20 +480,43 @@ describe("buildCallGraph", () => {
 			[fileB, [{ ...sym(fileB, "callee"), id: calleeId }]],
 		]);
 		const allRefs = new Map<string, SymbolRef[]>([
-			[fileA, [
-				{ ...ref(fileA, "callee"), targetId: calleeId, callerSymbolId: callerId, evidenceKind: "calls", referenceKind: "call" },
-				{ ...ref(fileA, "callee", 6), targetId: calleeId, callerSymbolId: callerId, evidenceKind: "calls", referenceKind: "call" },
-			]],
+			[
+				fileA,
+				[
+					{
+						...ref(fileA, "callee"),
+						targetId: calleeId,
+						callerSymbolId: callerId,
+						evidenceKind: "calls",
+						referenceKind: "call",
+					},
+					{
+						...ref(fileA, "callee", 6),
+						targetId: calleeId,
+						callerSymbolId: callerId,
+						evidenceKind: "calls",
+						referenceKind: "call",
+					},
+				],
+			],
 		]);
 
 		const graph = buildCallGraph(allSymbols, allRefs);
 		expect(graph.edges).toHaveLength(1);
 		expect(graph.edges[0].evidenceCount).toBe(2);
-		expect(graph.coverage).toMatchObject({ totalEvidence: 2, duplicateEvidence: 1, eligibleEvidence: 2, resolvedEvidence: 2 });
+		expect(graph.coverage).toMatchObject({
+			totalEvidence: 2,
+			duplicateEvidence: 1,
+			eligibleEvidence: 2,
+			resolvedEvidence: 2,
+		});
 		expect(graph.inDegree.get(calleeId)).toBe(1);
 		process.env.PILENS_DATA_DIR = tmpDir;
 		try {
-			saveCallGraph("/proj", graph, { reviewGraphVersion: "v7", reviewGraphSignature: "sig-duplicate" });
+			saveCallGraph("/proj", graph, {
+				reviewGraphVersion: "v7",
+				reviewGraphSignature: "sig-duplicate",
+			});
 			const loaded = loadCallGraph("/proj");
 			expect(loaded?.graph.edges[0].evidenceCount).toBe(2);
 			expect(loaded?.graph.coverage?.duplicateEvidence).toBe(1);
@@ -401,9 +554,7 @@ describe("buildCallGraph", () => {
 			[fileA, []],
 			[fileB, [sym(fileB, "init")]],
 		]);
-		const allRefs = new Map([
-			[fileA, [ref(fileA, "init", 1)]],
-		]);
+		const allRefs = new Map([[fileA, [ref(fileA, "init", 1)]]]);
 
 		const graph = buildCallGraph(allSymbols, allRefs);
 
@@ -461,10 +612,21 @@ function makeGraph(
 		const cr = callers.get(edge.calleeKey) ?? new Set();
 		cr.add(edge.callerKey);
 		callers.set(edge.calleeKey, cr);
-		inDegree.set(edge.calleeKey, (inDegree.get(edge.calleeKey) ?? 0) + edge.weight!);
+		inDegree.set(
+			edge.calleeKey,
+			(inDegree.get(edge.calleeKey) ?? 0) + edge.weight!,
+		);
 	}
 
-	return { callees, callers, inDegree, edges: resolvedEdges, unresolvedRefs: 0, totalRefs: 0, builtAt: "" };
+	return {
+		callees,
+		callers,
+		inDegree,
+		edges: resolvedEdges,
+		unresolvedRefs: 0,
+		totalRefs: 0,
+		builtAt: "",
+	};
 }
 
 describe("impact()", () => {
@@ -477,7 +639,11 @@ describe("impact()", () => {
 		const g = makeGraph([{ callerKey: "a:caller", calleeKey: "b:callee" }]);
 		const results = impact(g, "b:callee");
 		expect(results).toHaveLength(1);
-		expect(results[0]).toMatchObject({ symbolKey: "a:caller", depth: 1, severity: "WillBreak" });
+		expect(results[0]).toMatchObject({
+			symbolKey: "a:caller",
+			depth: 1,
+			severity: "WillBreak",
+		});
 	});
 
 	it("classifies depth-2 as MayBreak", () => {
@@ -546,7 +712,12 @@ describe("formatImpact()", () => {
 	});
 
 	it("formats WillBreak callers", () => {
-		const g = makeGraph([{ callerKey: "/proj/a.ts:handleRequest", calleeKey: "/proj/b.ts:changed" }]);
+		const g = makeGraph([
+			{
+				callerKey: "/proj/a.ts:handleRequest",
+				calleeKey: "/proj/b.ts:changed",
+			},
+		]);
 		const results = impact(g, "/proj/b.ts:changed");
 		const summary = formatImpact(results, "/proj");
 		expect(summary).toContain("WillBreak");
@@ -556,11 +727,13 @@ describe("formatImpact()", () => {
 	it("formats Windows-style paths relative to the project root", () => {
 		const root = path.join(tmpDir, "Repo");
 		const caller = path.join(root, "src", "caller.ts").replace(/\\/g, "\\\\");
-		const result = [{
-			symbolKey: `${caller}:caller`,
-			depth: 1,
-			severity: "WillBreak" as const,
-		}];
+		const result = [
+			{
+				symbolKey: `${caller}:caller`,
+				depth: 1,
+				severity: "WillBreak" as const,
+			},
+		];
 		expect(formatImpact(result, root.toLowerCase())).toContain("src/caller.ts");
 	});
 
@@ -592,7 +765,10 @@ describe("saveCallGraph / loadCallGraph", () => {
 
 		const graph = buildCallGraph(allSymbols, allRefs);
 
-		saveCallGraph("/proj", graph, { reviewGraphVersion: "v7", reviewGraphSignature: "sig-roundtrip" });
+		saveCallGraph("/proj", graph, {
+			reviewGraphVersion: "v7",
+			reviewGraphSignature: "sig-roundtrip",
+		});
 		const loaded = loadCallGraph("/proj");
 
 		expect(loaded).toBeDefined();
@@ -610,22 +786,39 @@ describe("saveCallGraph / loadCallGraph", () => {
 		const fileB = "/proj/b.ts";
 		const callerKey = `${fileA}:caller`;
 		const calleeKey = `${fileB}:callee`;
-		const cacheFile = path.join(getProjectDataDir("/proj"), "cache", "call-graph.json");
+		const cacheFile = path.join(
+			getProjectDataDir("/proj"),
+			"cache",
+			"call-graph.json",
+		);
 		fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
 		// Deliberately pinned to the literal 4, one below CALL_GRAPH_CACHE_VERSION, to
 		// exercise the legacy-format rejection path itself. If CALL_GRAPH_CACHE_VERSION
 		// is ever bumped to 4 this assertion fails loudly instead of the test
 		// silently testing nothing (the #1082/#1106 vacuous-fixture class).
 		expect(CALL_GRAPH_CACHE_VERSION).not.toBe(4);
-		fs.writeFileSync(cacheFile, JSON.stringify({
-			version: 4,
-			builtAt: "legacy",
-			fileMtimes: {},
-			edges: [{ callerFile: fileA, callerKey, calleeFile: fileB, calleeSymbol: "callee", calleeKey, weight: 1 }],
-			callees: [[callerKey, [calleeKey]]],
-			callers: [[calleeKey, [callerKey]]],
-			inDegree: [[calleeKey, 1]],
-		}), "utf-8");
+		fs.writeFileSync(
+			cacheFile,
+			JSON.stringify({
+				version: 4,
+				builtAt: "legacy",
+				fileMtimes: {},
+				edges: [
+					{
+						callerFile: fileA,
+						callerKey,
+						calleeFile: fileB,
+						calleeSymbol: "callee",
+						calleeKey,
+						weight: 1,
+					},
+				],
+				callees: [[callerKey, [calleeKey]]],
+				callers: [[calleeKey, [callerKey]]],
+				inDegree: [[calleeKey, 1]],
+			}),
+			"utf-8",
+		);
 
 		// v4 is legacy: no canonical review-graph identity means unavailable,
 		// rather than a seemingly clean migrated projection.
@@ -640,21 +833,54 @@ describe("saveCallGraph / loadCallGraph", () => {
 		const callerId = `${fileA}:caller:function:4`;
 		const calleeId = `${fileB}:target:method:27`;
 		const allSymbols = new Map<string, Symbol[]>([
-			[fileA, [{ id: callerId, name: "caller", kind: "function", filePath: fileA, line: 4, column: 2, isExported: true }]],
-			[fileB, [{ id: calleeId, name: "target", kind: "method", filePath: fileB, line: 27, column: 3, isExported: true }]],
+			[
+				fileA,
+				[
+					{
+						id: callerId,
+						name: "caller",
+						kind: "function",
+						filePath: fileA,
+						line: 4,
+						column: 2,
+						isExported: true,
+					},
+				],
+			],
+			[
+				fileB,
+				[
+					{
+						id: calleeId,
+						name: "target",
+						kind: "method",
+						filePath: fileB,
+						line: 27,
+						column: 3,
+						isExported: true,
+					},
+				],
+			],
 		]);
-		const allRefs = new Map<string, SymbolRef[]>([[fileA, [{
-			symbolId: `${fileA}:target`,
-			symbolName: "target",
-			filePath: fileA,
-			line: 9,
-			column: 7,
-			evidenceKind: "calls",
-			referenceKind: "call",
-			targetId: calleeId,
-			callerSymbolId: callerId,
-			resolution: "import",
-		}]]]);
+		const allRefs = new Map<string, SymbolRef[]>([
+			[
+				fileA,
+				[
+					{
+						symbolId: `${fileA}:target`,
+						symbolName: "target",
+						filePath: fileA,
+						line: 9,
+						column: 7,
+						evidenceKind: "calls",
+						referenceKind: "call",
+						targetId: calleeId,
+						callerSymbolId: callerId,
+						resolution: "import",
+					},
+				],
+			],
+		]);
 		const coverage = {
 			totalEvidence: 1,
 			callsEvidence: 1,
@@ -669,7 +895,10 @@ describe("saveCallGraph / loadCallGraph", () => {
 			complete: true,
 		};
 		const graph = buildCallGraph(allSymbols, allRefs, coverage);
-		saveCallGraph("/proj", graph, { reviewGraphVersion: "v8", reviewGraphSignature: "sig-evidence" });
+		saveCallGraph("/proj", graph, {
+			reviewGraphVersion: "v8",
+			reviewGraphSignature: "sig-evidence",
+		});
 		const loaded = loadCallGraph("/proj");
 		expect(loaded?.graph.edges[0]).toMatchObject({
 			calleeKey: calleeId,
@@ -678,7 +907,10 @@ describe("saveCallGraph / loadCallGraph", () => {
 			evidenceKind: "calls",
 			resolution: "import",
 		});
-		expect(loaded?.graph.coverage).toMatchObject({ callsEvidence: 1, complete: true });
+		expect(loaded?.graph.coverage).toMatchObject({
+			callsEvidence: 1,
+			complete: true,
+		});
 		delete process.env.PILENS_DATA_DIR;
 	});
 
@@ -691,9 +923,16 @@ describe("saveCallGraph / loadCallGraph", () => {
 	// fail pre-fix by temporarily disabling it (see #1089 fix commit).
 	it("rejects parseable JSON with inconsistent adjacency and centrality", () => {
 		process.env.PILENS_DATA_DIR = tmpDir;
-		const cacheFile = path.join(getProjectDataDir("/proj"), "cache", "call-graph.json");
+		const cacheFile = path.join(
+			getProjectDataDir("/proj"),
+			"cache",
+			"call-graph.json",
+		);
 		fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
-		const raw = validPersistedCallGraph() as { edges: Array<{ calleeKey: string }>; inDegree: unknown };
+		const raw = validPersistedCallGraph() as {
+			edges: Array<{ calleeKey: string }>;
+			inDegree: unknown;
+		};
 		// The persisted inDegree for the callee (2) disagrees with what the single
 		// edge actually implies (1) — exercises the actualInDegree/expectedInDegree
 		// cross-check (call-graph.ts ~767-769), not just adjacency shape.
@@ -705,9 +944,16 @@ describe("saveCallGraph / loadCallGraph", () => {
 
 	it("rejects complete coverage that contains unsupported evidence", () => {
 		process.env.PILENS_DATA_DIR = tmpDir;
-		const cacheFile = path.join(getProjectDataDir("/proj"), "cache", "call-graph.json");
+		const cacheFile = path.join(
+			getProjectDataDir("/proj"),
+			"cache",
+			"call-graph.json",
+		);
 		fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
-		const raw = validPersistedCallGraph() as { coverage: Record<string, unknown>; totalRefs: number };
+		const raw = validPersistedCallGraph() as {
+			coverage: Record<string, unknown>;
+			totalRefs: number;
+		};
 		// complete: true with unsupportedEvidence > 0 exercises the honesty check
 		// at call-graph.ts ~686 ("complete" must mean nothing was unsupported) —
 		// keep every other coverage identity/sum invariant (incl. raw.totalRefs,
@@ -734,15 +980,60 @@ describe("saveCallGraph / loadCallGraph", () => {
 
 	it("rejects malformed v5 semantic fields instead of serving a partial graph", () => {
 		const mutations: Array<[string, (raw: Record<string, any>) => void]> = [
-			["non-boolean coverage.complete", (raw) => { raw.coverage.complete = "true"; }],
-			["unknown evidence enum", (raw) => { raw.edges[0].evidenceKind = "not-an-evidence-kind"; }],
-			["unknown resolution enum", (raw) => { raw.edges[0].resolution = "guessed"; }],
-			["empty graph identity", (raw) => { raw.reviewGraphSignature = ""; }],
-			["empty edge identity", (raw) => { raw.edges[0].calleeSymbol = ""; }],
-			["edge/file identity mismatch", (raw) => { raw.edges[0].calleeFile = "/proj/other.ts"; }],
-			["duplicate logical edges", (raw) => { raw.edges.push({ ...raw.edges[0] }); }],
-			["duplicate adjacency targets", (raw) => { raw.callees[0][1].push(raw.callees[0][1][0]); }],
-			["duplicate adjacency entries", (raw) => { raw.callers.push([...raw.callers[0]]); }],
+			[
+				"non-boolean coverage.complete",
+				(raw) => {
+					raw.coverage.complete = "true";
+				},
+			],
+			[
+				"unknown evidence enum",
+				(raw) => {
+					raw.edges[0].evidenceKind = "not-an-evidence-kind";
+				},
+			],
+			[
+				"unknown resolution enum",
+				(raw) => {
+					raw.edges[0].resolution = "guessed";
+				},
+			],
+			[
+				"empty graph identity",
+				(raw) => {
+					raw.reviewGraphSignature = "";
+				},
+			],
+			[
+				"empty edge identity",
+				(raw) => {
+					raw.edges[0].calleeSymbol = "";
+				},
+			],
+			[
+				"edge/file identity mismatch",
+				(raw) => {
+					raw.edges[0].calleeFile = "/proj/other.ts";
+				},
+			],
+			[
+				"duplicate logical edges",
+				(raw) => {
+					raw.edges.push({ ...raw.edges[0] });
+				},
+			],
+			[
+				"duplicate adjacency targets",
+				(raw) => {
+					raw.callees[0][1].push(raw.callees[0][1][0]);
+				},
+			],
+			[
+				"duplicate adjacency entries",
+				(raw) => {
+					raw.callers.push([...raw.callers[0]]);
+				},
+			],
 		];
 
 		for (const [label, mutate] of mutations) {
@@ -750,7 +1041,11 @@ describe("saveCallGraph / loadCallGraph", () => {
 			try {
 				const raw = validPersistedCallGraph();
 				mutate(raw);
-				const cacheFile = path.join(getProjectDataDir("/proj"), "cache", "call-graph.json");
+				const cacheFile = path.join(
+					getProjectDataDir("/proj"),
+					"cache",
+					"call-graph.json",
+				);
 				fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
 				fs.writeFileSync(cacheFile, JSON.stringify(raw), "utf-8");
 				expect(loadCallGraph("/proj"), label).toBeUndefined();
@@ -764,10 +1059,17 @@ describe("saveCallGraph / loadCallGraph", () => {
 		process.env.PILENS_DATA_DIR = tmpDir;
 		try {
 			const raw = validPersistedCallGraph();
-			const cacheFile = path.join(getProjectDataDir("/proj"), "cache", "call-graph.json");
+			const cacheFile = path.join(
+				getProjectDataDir("/proj"),
+				"cache",
+				"call-graph.json",
+			);
 			fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
 			fs.writeFileSync(cacheFile, JSON.stringify(raw), "utf-8");
-			expect(loadCallGraph("/proj")?.graph.coverage).toMatchObject({ complete: true, totalEvidence: 1 });
+			expect(loadCallGraph("/proj")?.graph.coverage).toMatchObject({
+				complete: true,
+				totalEvidence: 1,
+			});
 		} finally {
 			delete process.env.PILENS_DATA_DIR;
 		}
@@ -790,17 +1092,27 @@ describe("saveCallGraph / loadCallGraph", () => {
 			process.env.PILENS_DATA_DIR = tmpDir;
 			try {
 				const raw = validPersistedCallGraph();
-				const cacheFile = path.join(getProjectDataDir("/proj"), "cache", "call-graph.json");
+				const cacheFile = path.join(
+					getProjectDataDir("/proj"),
+					"cache",
+					"call-graph.json",
+				);
 				fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
 				fs.writeFileSync(cacheFile, JSON.stringify(raw), "utf-8");
 				// Sanity: loads fine with no expectation, or a matching one.
 				expect(loadCallGraph("/proj")).toBeDefined();
 				expect(
-					loadCallGraph("/proj", { reviewGraphVersion: "v9", reviewGraphSignature: "sig-valid" }),
+					loadCallGraph("/proj", {
+						reviewGraphVersion: "v9",
+						reviewGraphSignature: "sig-valid",
+					}),
 				).toBeDefined();
 				// A different reviewGraphVersion is a stale-replay: reject.
 				expect(
-					loadCallGraph("/proj", { reviewGraphVersion: "v10", reviewGraphSignature: "sig-valid" }),
+					loadCallGraph("/proj", {
+						reviewGraphVersion: "v10",
+						reviewGraphSignature: "sig-valid",
+					}),
 				).toBeUndefined();
 			} finally {
 				delete process.env.PILENS_DATA_DIR;
@@ -811,13 +1123,20 @@ describe("saveCallGraph / loadCallGraph", () => {
 			process.env.PILENS_DATA_DIR = tmpDir;
 			try {
 				const raw = validPersistedCallGraph();
-				const cacheFile = path.join(getProjectDataDir("/proj"), "cache", "call-graph.json");
+				const cacheFile = path.join(
+					getProjectDataDir("/proj"),
+					"cache",
+					"call-graph.json",
+				);
 				fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
 				fs.writeFileSync(cacheFile, JSON.stringify(raw), "utf-8");
 				// Same version, but the source content signature moved on — this is
 				// exactly the case a changed file must invalidate.
 				expect(
-					loadCallGraph("/proj", { reviewGraphVersion: "v9", reviewGraphSignature: "sig-newer" }),
+					loadCallGraph("/proj", {
+						reviewGraphVersion: "v9",
+						reviewGraphSignature: "sig-newer",
+					}),
 				).toBeUndefined();
 			} finally {
 				delete process.env.PILENS_DATA_DIR;
@@ -828,7 +1147,11 @@ describe("saveCallGraph / loadCallGraph", () => {
 			process.env.PILENS_DATA_DIR = tmpDir;
 			try {
 				const raw = validPersistedCallGraph();
-				const cacheFile = path.join(getProjectDataDir("/proj"), "cache", "call-graph.json");
+				const cacheFile = path.join(
+					getProjectDataDir("/proj"),
+					"cache",
+					"call-graph.json",
+				);
 				fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
 				fs.writeFileSync(cacheFile, JSON.stringify(raw), "utf-8");
 				const loaded = loadCallGraph("/proj", {

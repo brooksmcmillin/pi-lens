@@ -10,7 +10,10 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ReviewGraph } from "../../clients/review-graph/types.js";
-import { buildWordIndex, WORD_INDEX_MAX_BYTES } from "../../clients/word-index.js";
+import {
+	buildWordIndex,
+	WORD_INDEX_MAX_BYTES,
+} from "../../clients/word-index.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
 const mocks = vi.hoisted(() => ({
@@ -79,9 +82,8 @@ describe("computeCascadeForFile — word-index per-edit seam (#348 phase 2)", ()
 			touchFile: vi.fn(),
 			getDiagnostics: vi.fn(),
 		});
-		const { resetDispatchBaselines } = await import(
-			"../../clients/dispatch/integration.js"
-		);
+		const { resetDispatchBaselines } =
+			await import("../../clients/dispatch/integration.js");
 		resetDispatchBaselines();
 	}, 30_000);
 
@@ -100,9 +102,8 @@ describe("computeCascadeForFile — word-index per-edit seam (#348 phase 2)", ()
 			expect(wordIndex.postings.has("renderwidget")).toBe(false);
 
 			const onWordIndexUpdated = vi.fn();
-			const { computeCascadeForFile } = await import(
-				"../../clients/dispatch/integration.js"
-			);
+			const { computeCascadeForFile } =
+				await import("../../clients/dispatch/integration.js");
 			await computeCascadeForFile(filePath, env.tmpDir, {
 				turnSeq: 1,
 				writeSeq: 1,
@@ -113,7 +114,9 @@ describe("computeCascadeForFile — word-index per-edit seam (#348 phase 2)", ()
 
 			expect(wordIndex.postings.has("oldwidget")).toBe(false);
 			expect(
-				wordIndex.postings.get("renderwidget")?.some((h) => h.file === filePath),
+				wordIndex.postings
+					.get("renderwidget")
+					?.some((h) => h.file === filePath),
 			).toBe(true);
 			expect(onWordIndexUpdated).toHaveBeenCalledWith(wordIndex);
 		} finally {
@@ -130,9 +133,8 @@ describe("computeCascadeForFile — word-index per-edit seam (#348 phase 2)", ()
 			fs.writeFileSync(filePath, content);
 
 			const onWordIndexUpdated = vi.fn();
-			const { computeCascadeForFile } = await import(
-				"../../clients/dispatch/integration.js"
-			);
+			const { computeCascadeForFile } =
+				await import("../../clients/dispatch/integration.js");
 			// wordIndex omitted entirely (undefined), matching a cold session where
 			// runtime.wordIndex is still null and nothing is threaded through.
 			await computeCascadeForFile(filePath, env.tmpDir, {
@@ -162,9 +164,8 @@ describe("computeCascadeForFile — word-index per-edit seam (#348 phase 2)", ()
 			delete wordIndex.forward; // simulate a pre-phase-2 index shape
 
 			const onWordIndexUpdated = vi.fn();
-			const { computeCascadeForFile } = await import(
-				"../../clients/dispatch/integration.js"
-			);
+			const { computeCascadeForFile } =
+				await import("../../clients/dispatch/integration.js");
 			await computeCascadeForFile(filePath, env.tmpDir, {
 				turnSeq: 1,
 				writeSeq: 1,
@@ -192,9 +193,8 @@ describe("computeCascadeForFile — word-index per-edit seam (#348 phase 2)", ()
 				{ path: filePath, content: "export function oldWidget() {}" },
 			]);
 			const onWordIndexUpdated = vi.fn();
-			const { computeCascadeForFile } = await import(
-				"../../clients/dispatch/integration.js"
-			);
+			const { computeCascadeForFile } =
+				await import("../../clients/dispatch/integration.js");
 			await computeCascadeForFile(filePath, env.tmpDir, {
 				turnSeq: 1,
 				writeSeq: 1,
@@ -224,9 +224,8 @@ describe("computeCascadeForFile — word-index per-edit seam (#348 phase 2)", ()
 			expect(wordIndex.docLengths.has(filePath)).toBe(true);
 
 			const onWordIndexUpdated = vi.fn();
-			const { computeCascadeForFile } = await import(
-				"../../clients/dispatch/integration.js"
-			);
+			const { computeCascadeForFile } =
+				await import("../../clients/dispatch/integration.js");
 			await computeCascadeForFile(filePath, env.tmpDir, {
 				turnSeq: 1,
 				writeSeq: 1,

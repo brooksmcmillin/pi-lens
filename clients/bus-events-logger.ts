@@ -99,10 +99,19 @@ export interface BusEventLogEntry {
 // touching each producer individually. In-memory only — bounded by the fixed
 // set of event names in `BusEventName`, reset at session_shutdown after the
 // rollup row is logged (see index.ts) so counts never leak across sessions.
-type BusEventRollupOutcome = "emitted" | "skipped_stale_session" | "emit_failed";
-const eventRollupCounts = new Map<BusEventName, Record<BusEventRollupOutcome, number>>();
+type BusEventRollupOutcome =
+	| "emitted"
+	| "skipped_stale_session"
+	| "emit_failed";
+const eventRollupCounts = new Map<
+	BusEventName,
+	Record<BusEventRollupOutcome, number>
+>();
 
-function bumpRollupCount(event: BusEventName, outcome: BusEventRollupOutcome): void {
+function bumpRollupCount(
+	event: BusEventName,
+	outcome: BusEventRollupOutcome,
+): void {
 	const existing = eventRollupCounts.get(event) ?? {
 		emitted: 0,
 		skipped_stale_session: 0,

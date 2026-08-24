@@ -56,9 +56,7 @@ describe("python tree-sitter rules", () => {
 		it("flags a bare except", async () => {
 			const client = getSharedTreeSitterClient()!;
 			const query = await getQuery("bare-except");
-			const filePath = writeTempFile(
-				`try:\n    risky()\nexcept:\n    pass\n`,
-			);
+			const filePath = writeTempFile(`try:\n    risky()\nexcept:\n    pass\n`);
 
 			const matches = await client.runQueryOnFile(query, filePath, "python");
 
@@ -112,7 +110,9 @@ describe("python tree-sitter rules", () => {
 		])("does not flag %s exception specs", async (_label, clause) => {
 			const client = getSharedTreeSitterClient()!;
 			const query = await getQuery("bare-except");
-			const filePath = writeTempFile(`try:\n    risky()\n${clause}\n    pass\n`);
+			const filePath = writeTempFile(
+				`try:\n    risky()\n${clause}\n    pass\n`,
+			);
 
 			const matches = await client.runQueryOnFile(query, filePath, "python");
 

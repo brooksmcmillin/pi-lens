@@ -65,18 +65,12 @@ describe("findUniqueMatchLineRange (#118 autopatch → synthetic-read bridge)", 
 	});
 
 	it("tolerates CRLF in the needle by normalizing both sides", () => {
-		const range = findUniqueMatchLineRange(
-			normalized,
-			"\treturn a + b;\r\n}",
-		);
+		const range = findUniqueMatchLineRange(normalized, "\treturn a + b;\r\n}");
 		expect(range).toEqual({ startLine: 2, endLine: 3 });
 	});
 
 	it("tolerates trailing whitespace in the needle (autopatch's normal input shape)", () => {
-		const range = findUniqueMatchLineRange(
-			normalized,
-			"\treturn a * b;   ",
-		);
+		const range = findUniqueMatchLineRange(normalized, "\treturn a * b;   ");
 		expect(range).toEqual({ startLine: 10, endLine: 10 });
 	});
 
@@ -91,10 +85,7 @@ describe("findUniqueMatchLineRange (#118 autopatch → synthetic-read bridge)", 
 	it("locates a match on the last line of the file", () => {
 		// "}" appears on lines 3, 7, 11 — ambiguous. Use a unique multi-line
 		// needle that anchors to the end of the file instead.
-		const range = findUniqueMatchLineRange(
-			normalized,
-			"\treturn a * b;\n}",
-		);
+		const range = findUniqueMatchLineRange(normalized, "\treturn a * b;\n}");
 		expect(range).toEqual({ startLine: 10, endLine: 11 });
 	});
 });

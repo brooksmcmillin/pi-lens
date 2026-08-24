@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { FactStore } from "../../../../clients/dispatch/fact-store.js";
+import { makeRunnerCtx } from "../../../support/runner-ctx.js";
 import { setupTestEnvironment } from "../../test-utils.js";
 
 const safeSpawnAsync = vi.fn();
@@ -30,17 +30,7 @@ function createCtx(
 	filePath: string,
 	cwd: string,
 ) {
-	return {
-		filePath,
-		cwd,
-		kind,
-		pi: { getFlag: () => false },
-		autofix: false,
-		deltaMode: true,
-		facts: new FactStore(),
-		hasTool: async () => true,
-		log: () => {},
-	};
+	return makeRunnerCtx(filePath, cwd, { kind });
 }
 
 describe("terraform/kotlin runners", () => {
@@ -93,7 +83,10 @@ describe("terraform/kotlin runners", () => {
 		const env = setupTestEnvironment("pi-lens-tflint-runner-");
 		try {
 			const configPath = path.join(env.tmpDir, ".tflint.hcl");
-			fs.writeFileSync(configPath, 'plugin "terraform" {\n  enabled = true\n}\n');
+			fs.writeFileSync(
+				configPath,
+				'plugin "terraform" {\n  enabled = true\n}\n',
+			);
 			const nestedDir = path.join(env.tmpDir, "infra", "stack");
 			fs.mkdirSync(nestedDir, { recursive: true });
 			const filePath = path.join(nestedDir, "main.tf");
@@ -193,7 +186,10 @@ describe("terraform/kotlin runners", () => {
 				stdout: JSON.stringify({
 					issues: [
 						{
-							rule: { name: "terraform_deprecated_interpolation", severity: "warning" },
+							rule: {
+								name: "terraform_deprecated_interpolation",
+								severity: "warning",
+							},
 							message: "Interpolation-only expressions are deprecated",
 							range: { filename: "main.tf", start: { line: 1, column: 1 } },
 						},

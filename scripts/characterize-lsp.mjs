@@ -15,15 +15,25 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { mergeRows, mergeSrc, parseTable, replaceTable } from "./lib/md-matrix.mjs";
+import {
+	mergeRows,
+	mergeSrc,
+	parseTable,
+	replaceTable,
+} from "./lib/md-matrix.mjs";
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const repoRoot = path.resolve(
+	path.dirname(fileURLToPath(import.meta.url)),
+	"..",
+);
 const argv = process.argv.slice(2);
 const install = argv.includes("--install");
 const langs = argv.filter((a) => !a.startsWith("--"));
 const imp = (rel) => import(pathToFileURL(path.join(repoRoot, rel)).href);
 const { LSP_FIXTURES } = await imp("scripts/smoke-tools.mjs");
-const { getLSPService, resetLSPService } = await imp("dist/clients/lsp/index.js");
+const { getLSPService, resetLSPService } = await imp(
+	"dist/clients/lsp/index.js",
+);
 const { initLSPConfig } = await imp("dist/clients/lsp/config.js");
 let ensureTool;
 if (install) ({ ensureTool } = await imp("dist/clients/installer/index.js"));
@@ -39,7 +49,9 @@ for (const fx of fixtures) {
 	fs.cpSync(path.join(repoRoot, fx.dir), dst, { recursive: true });
 	const absFile = path.join(dst, fx.file);
 	if (fx.gitInit) {
-		try { execFileSync("git", ["init", "-q"], { cwd: dst, stdio: "ignore" }); } catch {}
+		try {
+			execFileSync("git", ["init", "-q"], { cwd: dst, stdio: "ignore" });
+		} catch {}
 	}
 	if (fx.disableServers) {
 		fs.mkdirSync(path.join(dst, ".pi-lens"), { recursive: true });
@@ -69,24 +81,40 @@ for (const fx of fixtures) {
 			source: "characterize",
 		});
 		const support = await lsp.getWorkspaceDiagnosticsSupport(absFile);
-		rows.push({ lang: fx.lang, server: fx.serverHint, mode: support?.mode ?? "unknown" });
+		rows.push({
+			lang: fx.lang,
+			server: fx.serverHint,
+			mode: support?.mode ?? "unknown",
+		});
 		console.error(`[${fx.lang}] mode=${support?.mode ?? "unknown"}`);
 	} catch (e) {
-		rows.push({ lang: fx.lang, server: fx.serverHint, mode: `error: ${e?.message ?? e}` });
+		rows.push({
+			lang: fx.lang,
+			server: fx.serverHint,
+			mode: `error: ${e?.message ?? e}`,
+		});
 	} finally {
-		try { fs.rmSync(dst, { recursive: true, force: true }); } catch {}
+		try {
+			fs.rmSync(dst, { recursive: true, force: true });
+		} catch {}
 	}
 }
 
 console.log("\nDiagnostic-mode matrix (affirmative-clean-signal first cut)\n");
 console.log(`  ${"LANG".padEnd(16)} ${"MODE".padEnd(12)} SERVER`);
-for (const r of rows.sort((a, b) => String(a.mode).localeCompare(String(b.mode)))) {
-	console.log(`  ${r.lang.padEnd(16)} ${String(r.mode).padEnd(12)} ${r.server}`);
+for (const r of rows.sort((a, b) =>
+	String(a.mode).localeCompare(String(b.mode)),
+)) {
+	console.log(
+		`  ${r.lang.padEnd(16)} ${String(r.mode).padEnd(12)} ${r.server}`,
+	);
 }
 const pull = rows.filter((r) => r.mode === "pull").length;
 const push = rows.filter((r) => r.mode === "push-only").length;
 console.log(`\n  pull-capable (clean confirmable via pull): ${pull}`);
-console.log(`  push-only (needs re-publish-empty, else silent → budget-bound): ${push}`);
+console.log(
+	`  push-only (needs re-publish-empty, else silent → budget-bound): ${push}`,
+);
 
 // Merge the measured `mode` (and derived tier for pull servers) into
 // docs/lsp-capability-matrix.md — MERGE, don't overwrite: a row we couldn't
@@ -101,14 +129,18 @@ try {
 	console.error(`matrix update skipped: ${e?.message ?? e}`);
 }
 
-try { await resetLSPService?.({ fast: true }); } catch {}
+try {
+	await resetLSPService?.({ fast: true });
+} catch {}
 process.exit(0);
 
 function updateMatrix(measuredRows) {
 	const src = process.env.CI ? "ci" : "dev";
 	const docPath = path.join(repoRoot, "docs", "lsp-capability-matrix.md");
 	if (!fs.existsSync(docPath)) {
-		console.error(`matrix update skipped: ${docPath} not found (gitignored — nothing to merge)`);
+		console.error(
+			`matrix update skipped: ${docPath} not found (gitignored — nothing to merge)`,
+		);
 		return;
 	}
 	const text = fs.readFileSync(docPath, "utf8");

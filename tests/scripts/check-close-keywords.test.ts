@@ -7,11 +7,16 @@ import {
 
 describe("close-keyword parser (#1320)", () => {
 	it("parses one close keyword", () => {
-		expect(parseCloseKeywords("Closes #123")).toMatchObject({ issues: [123], commaLists: [] });
+		expect(parseCloseKeywords("Closes #123")).toMatchObject({
+			issues: [123],
+			commaLists: [],
+		});
 	});
 
 	it("parses multiple correctly separated close keywords", () => {
-		expect(parseCloseKeywords("Fixes #1. resolves #2; CLOSED #3")).toMatchObject({
+		expect(
+			parseCloseKeywords("Fixes #1. resolves #2; CLOSED #3"),
+		).toMatchObject({
 			issues: [1, 2, 3],
 			commaLists: [],
 		});
@@ -30,15 +35,22 @@ describe("close-keyword parser (#1320)", () => {
 	});
 
 	it("does not treat refs as close keywords", () => {
-		expect(parseCloseKeywords("Refs #123, relates to #456")).toMatchObject({ issues: [], commaLists: [] });
+		expect(parseCloseKeywords("Refs #123, relates to #456")).toMatchObject({
+			issues: [],
+			commaLists: [],
+		});
 	});
 
 	it("handles case variants and optional colon", () => {
-		expect(parseCloseKeywords("CLOSES: #7; FiXeD #8; ResolveD #9").issues).toEqual([7, 8, 9]);
+		expect(
+			parseCloseKeywords("CLOSES: #7; FiXeD #8; ResolveD #9").issues,
+		).toEqual([7, 8, 9]);
 	});
 
 	it("ignores cross-repository references", () => {
-		expect(parseCloseKeywords("Closes owner/repo#123; fixes #456")).toMatchObject({
+		expect(
+			parseCloseKeywords("Closes owner/repo#123; fixes #456"),
+		).toMatchObject({
 			issues: [456],
 			commaLists: [],
 		});
@@ -65,7 +77,9 @@ describe("close-keyword parser (#1320)", () => {
 
 	it("ignores close keywords in blockquotes and inline code", () => {
 		expect(lintCloseKeywords("> Closes #1, #2\nCloses #99.").valid).toBe(true);
-		expect(lintCloseKeywords("Use `Closes #1, #2` never. Closes #7.").valid).toBe(true);
+		expect(
+			lintCloseKeywords("Use `Closes #1, #2` never. Closes #7.").valid,
+		).toBe(true);
 	});
 
 	it("reports the offending line for a comma list", () => {
@@ -74,4 +88,3 @@ describe("close-keyword parser (#1320)", () => {
 		expect(result.offendingLines).toEqual(["Closes #12, #13"]);
 	});
 });
-

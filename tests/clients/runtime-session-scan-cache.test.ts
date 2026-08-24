@@ -54,7 +54,9 @@ vi.mock("../../clients/latency-logger.js", async (importOriginal) => {
 vi.mock("../../clients/startup-scan.js", async (importOriginal) => {
 	const actual =
 		await importOriginal<typeof import("../../clients/startup-scan.js")>();
-	resolveStartupScanContextSpy.mockImplementation(actual.resolveStartupScanContext);
+	resolveStartupScanContextSpy.mockImplementation(
+		actual.resolveStartupScanContext,
+	);
 	resolveStartupScanContextAsyncSpy.mockImplementation(
 		actual.resolveStartupScanContextAsync,
 	);
@@ -92,11 +94,26 @@ function makeDeps(ctxCwd: string, dbg: (msg: string) => void = () => {}) {
 			ensureAvailable: async () => false,
 			scanExports: async () => new Map(),
 		},
-		biomeClient: { isAvailable: () => false, ensureAvailable: async () => false },
-		ruffClient: { isAvailable: () => false, ensureAvailable: async () => false },
-		knipClient: { isAvailable: () => false, ensureAvailable: async () => false },
-		jscpdClient: { isAvailable: () => false, ensureAvailable: async () => false },
-		depChecker: { isAvailable: () => false, ensureAvailable: async () => false },
+		biomeClient: {
+			isAvailable: () => false,
+			ensureAvailable: async () => false,
+		},
+		ruffClient: {
+			isAvailable: () => false,
+			ensureAvailable: async () => false,
+		},
+		knipClient: {
+			isAvailable: () => false,
+			ensureAvailable: async () => false,
+		},
+		jscpdClient: {
+			isAvailable: () => false,
+			ensureAvailable: async () => false,
+		},
+		depChecker: {
+			isAvailable: () => false,
+			ensureAvailable: async () => false,
+		},
 		testRunnerClient: {
 			detectRunner: () => null,
 			runTestFile: () => ({ failed: 0, error: false }),
@@ -325,7 +342,8 @@ describe("startup-scan verdict cache in session_start (#699)", () => {
 		} finally {
 			vi.useRealTimers();
 			globals.__piLensWarmupScheduled = previousWarmup;
-			if (previousDelay === undefined) delete process.env.PI_LENS_WARMUP_DELAY_MS;
+			if (previousDelay === undefined)
+				delete process.env.PI_LENS_WARMUP_DELAY_MS;
 			else process.env.PI_LENS_WARMUP_DELAY_MS = previousDelay;
 			env.cleanup();
 		}

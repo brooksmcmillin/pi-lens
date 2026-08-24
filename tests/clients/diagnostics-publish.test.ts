@@ -18,7 +18,9 @@ import {
 	type PilensDiagnosticsPayload,
 } from "../../clients/diagnostics-publish.js";
 
-function diag(overrides: Partial<PilensDiagnosticEntry> = {}): PilensDiagnosticEntry {
+function diag(
+	overrides: Partial<PilensDiagnosticEntry> = {},
+): PilensDiagnosticEntry {
 	return {
 		severity: "error",
 		message: "boom",
@@ -61,11 +63,19 @@ describe("diagnostics-publish — pilens:diagnostics (#502)", () => {
 
 		publishDiagnostics({
 			cwd: "/repo",
-			files: [{ path: "/repo/a.ts", diagnostics: [diag({ ruleId: "no-unused-vars" })] }],
+			files: [
+				{
+					path: "/repo/a.ts",
+					diagnostics: [diag({ ruleId: "no-unused-vars" })],
+				},
+			],
 		});
 
 		expect(emit).toHaveBeenCalledTimes(1);
-		const [channel, payload] = emit.mock.calls[0] as [string, PilensDiagnosticsPayload];
+		const [channel, payload] = emit.mock.calls[0] as [
+			string,
+			PilensDiagnosticsPayload,
+		];
 		expect(channel).toBe(BUS_DIAGNOSTICS_EVENT);
 		expect(payload.v).toBe(BUS_DIAGNOSTICS_VERSION);
 		expect(payload.source).toBe("pi-lens");
@@ -131,7 +141,9 @@ describe("diagnostics-publish — pilens:diagnostics (#502)", () => {
 		});
 		expect(emit).toHaveBeenCalledTimes(2);
 		const cleanPayload = emit.mock.calls[1][1] as PilensDiagnosticsPayload;
-		expect(cleanPayload.files).toEqual([{ path: expect.any(String), diagnostics: [] }]);
+		expect(cleanPayload.files).toEqual([
+			{ path: expect.any(String), diagnostics: [] },
+		]);
 		expect(wasPreviouslyReportedDirty("/repo/a.ts")).toBe(false);
 	});
 
@@ -162,11 +174,22 @@ describe("diagnostics-publish — pilens:diagnostics (#502)", () => {
 		const emit = vi.fn();
 		wireDiagnosticsBusEmitter(emit);
 
-		publishDiagnostics({ cwd: "/repo", files: [{ path: "/repo/a.ts", diagnostics: [diag()] }] });
-		publishDiagnostics({ cwd: "/repo", files: [{ path: "/repo/b.ts", diagnostics: [diag()] }] });
-		publishDiagnostics({ cwd: "/repo", files: [{ path: "/repo/c.ts", diagnostics: [diag()] }] });
+		publishDiagnostics({
+			cwd: "/repo",
+			files: [{ path: "/repo/a.ts", diagnostics: [diag()] }],
+		});
+		publishDiagnostics({
+			cwd: "/repo",
+			files: [{ path: "/repo/b.ts", diagnostics: [diag()] }],
+		});
+		publishDiagnostics({
+			cwd: "/repo",
+			files: [{ path: "/repo/c.ts", diagnostics: [diag()] }],
+		});
 
-		const seqs = emit.mock.calls.map((c) => (c[1] as PilensDiagnosticsPayload).seq);
+		const seqs = emit.mock.calls.map(
+			(c) => (c[1] as PilensDiagnosticsPayload).seq,
+		);
 		expect(seqs).toEqual([1, 2, 3]);
 	});
 
@@ -174,13 +197,23 @@ describe("diagnostics-publish — pilens:diagnostics (#502)", () => {
 		const emit = vi.fn();
 		wireDiagnosticsBusEmitter(emit);
 
-		const many = Array.from({ length: MAX_DIAGNOSTICS_PER_FILE_EVENT + 5 }, (_, i) =>
-			diag({ message: `issue ${i}`, severity: i % 2 === 0 ? "error" : "warning" }),
+		const many = Array.from(
+			{ length: MAX_DIAGNOSTICS_PER_FILE_EVENT + 5 },
+			(_, i) =>
+				diag({
+					message: `issue ${i}`,
+					severity: i % 2 === 0 ? "error" : "warning",
+				}),
 		);
-		publishDiagnostics({ cwd: "/repo", files: [{ path: "/repo/a.ts", diagnostics: many }] });
+		publishDiagnostics({
+			cwd: "/repo",
+			files: [{ path: "/repo/a.ts", diagnostics: many }],
+		});
 
 		const payload = emit.mock.calls[0][1] as PilensDiagnosticsPayload;
-		expect(payload.files[0].diagnostics.length).toBe(MAX_DIAGNOSTICS_PER_FILE_EVENT);
+		expect(payload.files[0].diagnostics.length).toBe(
+			MAX_DIAGNOSTICS_PER_FILE_EVENT,
+		);
 		expect(payload.files[0].truncated).toBe(true);
 	});
 
@@ -188,7 +221,10 @@ describe("diagnostics-publish — pilens:diagnostics (#502)", () => {
 		const emit = vi.fn();
 		wireDiagnosticsBusEmitter(emit);
 
-		publishDiagnostics({ cwd: "/repo", files: [{ path: "/repo/a.ts", diagnostics: [diag()] }] });
+		publishDiagnostics({
+			cwd: "/repo",
+			files: [{ path: "/repo/a.ts", diagnostics: [diag()] }],
+		});
 
 		const payload = emit.mock.calls[0][1] as PilensDiagnosticsPayload;
 		expect(payload.files[0].truncated).toBeUndefined();
@@ -201,7 +237,10 @@ describe("diagnostics-publish — pilens:diagnostics (#502)", () => {
 		const emit = vi.fn();
 		wireDiagnosticsBusEmitter(emit);
 
-		publishDiagnostics({ cwd: "/repo", files: [{ path: "/repo/a.ts", diagnostics: [diag()] }] });
+		publishDiagnostics({
+			cwd: "/repo",
+			files: [{ path: "/repo/a.ts", diagnostics: [diag()] }],
+		});
 
 		expect(emit).not.toHaveBeenCalled();
 	});
@@ -292,8 +331,14 @@ describe("diagnostics-publish — pilens:diagnostics (#502)", () => {
 		});
 
 		it("logs 'skipped_unwired' once when busEmit was never wired", () => {
-			publishDiagnostics({ cwd: "/repo", files: [{ path: "/repo/a.ts", diagnostics: [diag()] }] });
-			publishDiagnostics({ cwd: "/repo", files: [{ path: "/repo/b.ts", diagnostics: [diag()] }] });
+			publishDiagnostics({
+				cwd: "/repo",
+				files: [{ path: "/repo/a.ts", diagnostics: [diag()] }],
+			});
+			publishDiagnostics({
+				cwd: "/repo",
+				files: [{ path: "/repo/b.ts", diagnostics: [diag()] }],
+			});
 
 			const unwiredCalls = logBusEvent.mock.calls.filter(
 				(c) => (c[0] as { outcome: string }).outcome === "skipped_unwired",
@@ -309,8 +354,14 @@ describe("diagnostics-publish — pilens:diagnostics (#502)", () => {
 			const emit = vi.fn();
 			wireDiagnosticsBusEmitter(emit);
 
-			publishDiagnostics({ cwd: "/repo", files: [{ path: "/repo/a.ts", diagnostics: [diag()] }] });
-			publishDiagnostics({ cwd: "/repo", files: [{ path: "/repo/b.ts", diagnostics: [diag()] }] });
+			publishDiagnostics({
+				cwd: "/repo",
+				files: [{ path: "/repo/a.ts", diagnostics: [diag()] }],
+			});
+			publishDiagnostics({
+				cwd: "/repo",
+				files: [{ path: "/repo/b.ts", diagnostics: [diag()] }],
+			});
 
 			const disabledCalls = logBusEvent.mock.calls.filter(
 				(c) => (c[0] as { outcome: string }).outcome === "skipped_disabled",
@@ -324,7 +375,10 @@ describe("diagnostics-publish — pilens:diagnostics (#502)", () => {
 			});
 			wireDiagnosticsBusEmitter(emit);
 
-			publishDiagnostics({ cwd: "/repo", files: [{ path: "/repo/a.ts", diagnostics: [diag()] }] });
+			publishDiagnostics({
+				cwd: "/repo",
+				files: [{ path: "/repo/a.ts", diagnostics: [diag()] }],
+			});
 
 			expect(logBusEvent).toHaveBeenCalledWith(
 				expect.objectContaining({

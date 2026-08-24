@@ -42,8 +42,8 @@ function hasDep(pkg: PackageJsonShape | undefined, name: string): boolean {
 	if (!pkg) return false;
 	return Boolean(
 		pkg.dependencies?.[name] ??
-			pkg.devDependencies?.[name] ??
-			pkg.peerDependencies?.[name],
+		pkg.devDependencies?.[name] ??
+		pkg.peerDependencies?.[name],
 	);
 }
 
@@ -101,8 +101,7 @@ function detectNext(
 	else if (dirExists(cwd, "app")) signals.push("app/");
 	if (signals.length === 0) return undefined;
 	const confidence: FrameworkConfidence =
-		hasDep(pkg, "next") &&
-		signals.some((s) => s.startsWith("next.config."))
+		hasDep(pkg, "next") && signals.some((s) => s.startsWith("next.config."))
 			? "high"
 			: hasDep(pkg, "next")
 				? "medium"
@@ -187,15 +186,12 @@ export function detectProjectConventions(cwd: string): ProjectConventions {
 	}
 
 	const pkg = readPackageJson(cwd);
-	const detectors: Array<(
-		cwd: string,
-		pkg: PackageJsonShape | undefined,
-	) => FrameworkDetection | undefined> = [
-		detectReact,
-		detectNext,
-		detectVite,
-		detectVitest,
-	];
+	const detectors: Array<
+		(
+			cwd: string,
+			pkg: PackageJsonShape | undefined,
+		) => FrameworkDetection | undefined
+	> = [detectReact, detectNext, detectVite, detectVitest];
 	const frameworks: FrameworkDetection[] = [];
 	for (const detector of detectors) {
 		const detection = detector(cwd, pkg);

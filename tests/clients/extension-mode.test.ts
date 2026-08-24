@@ -4,7 +4,7 @@ import {
 	readExtensionMode,
 	suppressesUserNotify,
 	supportsTuiWidget,
-} from "../../clients/extension-mode.ts";
+} from "../../clients/extension-mode.js";
 
 describe("readExtensionMode (#1334 S2)", () => {
 	it("passes through the four documented host modes", () => {

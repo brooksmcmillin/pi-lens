@@ -118,7 +118,10 @@ export class StalenessGate {
 	private lastCheckedAt: number | undefined;
 	private lastVerdict = false;
 
-	constructor(stamp: BuildStamp | undefined, options: StalenessGateOptions = {}) {
+	constructor(
+		stamp: BuildStamp | undefined,
+		options: StalenessGateOptions = {},
+	) {
 		this.stamp = stamp;
 		this.checkIntervalMs = options.checkIntervalMs ?? 1000;
 		this.stat = options.stat ?? realStat;

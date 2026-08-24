@@ -5,9 +5,11 @@ import { Worker } from "node:worker_threads";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { writeFileAtomic } from "./atomic-write.js";
 import { getProjectDataDir } from "./file-utils.js";
+import { incrementDegradationCount } from "./degradation-ledger.js";
 import { readJsonCache } from "./json-cache-read.js";
 import { logLatency } from "./latency-logger.js";
 import { normalizeMapKey } from "./path-utils.js";
+import { fingerprintProjectSnapshotJson } from "./project-snapshot-fingerprint.js";
 import type {
 	ProjectSnapshotPersistWorkerRequest,
 	ProjectSnapshotPersistWorkerResult,
@@ -170,6 +172,16 @@ export interface ProjectSnapshotMeta {
 	timestamp: string;
 	version: number;
 	seq: number;
+	/** SHA-256 of the snapshot body with volatile `generatedAt` omitted (#1997). */
+	fingerprint?: string;
+	/**
+	 * #2008: on-disk byte length of the gz body at the last successful persist.
+	 * The dedupe skip decision compares it against a live stat so a torn or
+	 * truncated gzip under an intact meta cannot keep winning unchanged-skip.
+	 * Absent on legacy metas → dedupe is withheld (always publish) until the
+	 * next successful write populates it.
+	 */
+	gzBytes?: number;
 	/**
 	 * The derived sequence index as of `seq` (#1019), MIRRORED here from the
 	 * snapshot body so session-start can bound the change-log replay WITHOUT
@@ -188,6 +200,17 @@ function parseSnapshotMeta(value: unknown): ProjectSnapshotMeta | null {
 		timestamp: typeof meta.timestamp === "string" ? meta.timestamp : "",
 		version: meta.version,
 		seq: meta.seq,
+		fingerprint:
+			typeof meta.fingerprint === "string" &&
+			/^[a-f0-9]{64}$/.test(meta.fingerprint)
+				? meta.fingerprint
+				: undefined,
+		gzBytes:
+			typeof meta.gzBytes === "number" &&
+			Number.isInteger(meta.gzBytes) &&
+			meta.gzBytes > 0
+				? meta.gzBytes
+				: undefined,
 		sequenceIndex: parseSequenceIndex(meta.sequenceIndex),
 	};
 }
@@ -260,7 +283,9 @@ const SNAPSHOT_PARSE_CACHE_MAX = 4;
 const SNAPSHOT_PARSE_CACHE_MAX_BYTES = 24 * 1024 * 1024;
 const snapshotParseCache = new Map<string, SnapshotParseCacheEntry>();
 
-function withoutWordIndex(snapshot: ProjectSnapshot | null): ProjectSnapshot | null {
+function withoutWordIndex(
+	snapshot: ProjectSnapshot | null,
+): ProjectSnapshot | null {
 	if (!snapshot?.wordIndex) return snapshot;
 	const { wordIndex: _releasedPostings, ...stripped } = snapshot;
 	return stripped;
@@ -313,11 +338,18 @@ const PROJECT_SNAPSHOT_MAX_WARM_ROOTS = 8;
 const PROJECT_SNAPSHOT_IDLE_EVICT_MS_DEFAULT = 20 * 60_000;
 
 function projectSnapshotIdleEvictMs(): number {
-	const value = Number.parseInt(process.env.PI_LENS_PROJECT_SNAPSHOT_IDLE_EVICT_MS ?? "", 10);
-	return Number.isSafeInteger(value) && value > 0 ? value : PROJECT_SNAPSHOT_IDLE_EVICT_MS_DEFAULT;
+	const value = Number.parseInt(
+		process.env.PI_LENS_PROJECT_SNAPSHOT_IDLE_EVICT_MS ?? "",
+		10,
+	);
+	return Number.isSafeInteger(value) && value > 0
+		? value
+		: PROJECT_SNAPSHOT_IDLE_EVICT_MS_DEFAULT;
 }
 
-function clearAuthoritativeSnapshotTimer(entry: AuthoritativeSnapshotEntry): void {
+function clearAuthoritativeSnapshotTimer(
+	entry: AuthoritativeSnapshotEntry,
+): void {
 	if (entry.idleTimer) clearTimeout(entry.idleTimer);
 	entry.idleTimer = undefined;
 }
@@ -328,25 +360,37 @@ function deleteAuthoritativeSnapshot(key: string): void {
 	authoritativeSnapshots.delete(key);
 }
 
-function scheduleAuthoritativeSnapshotEviction(key: string, entry: AuthoritativeSnapshotEntry): void {
+function scheduleAuthoritativeSnapshotEviction(
+	key: string,
+	entry: AuthoritativeSnapshotEntry,
+): void {
 	clearAuthoritativeSnapshotTimer(entry);
 	const generation = entry.lastUsedAt;
 	entry.idleTimer = setTimeout(() => {
 		entry.idleTimer = undefined;
-		if (authoritativeSnapshots.get(key) !== entry || entry.lastUsedAt !== generation) return;
+		if (
+			authoritativeSnapshots.get(key) !== entry ||
+			entry.lastUsedAt !== generation
+		)
+			return;
 		deleteAuthoritativeSnapshot(key);
 	}, projectSnapshotIdleEvictMs());
 	entry.idleTimer.unref?.();
 }
 
-function touchAuthoritativeSnapshot(key: string, entry: AuthoritativeSnapshotEntry): void {
+function touchAuthoritativeSnapshot(
+	key: string,
+	entry: AuthoritativeSnapshotEntry,
+): void {
 	entry.lastUsedAt = Date.now();
 	scheduleAuthoritativeSnapshotEviction(key, entry);
 }
 
 function enforceAuthoritativeSnapshotCap(): void {
 	while (authoritativeSnapshots.size > PROJECT_SNAPSHOT_MAX_WARM_ROOTS) {
-		const victim = [...authoritativeSnapshots.entries()].sort(([, a], [, b]) => a.lastUsedAt - b.lastUsedAt)[0];
+		const victim = [...authoritativeSnapshots.entries()].sort(
+			([, a], [, b]) => a.lastUsedAt - b.lastUsedAt,
+		)[0];
 		if (!victim) return;
 		clearAuthoritativeSnapshotTimer(victim[1]);
 		deleteAuthoritativeSnapshot(victim[0]);
@@ -363,7 +407,8 @@ export function _getAuthoritativeSnapshotCacheKeysForTests(): string[] {
 /** Test hook: drop all cached parses + authoritative writes (per-worker isolation). */
 export function _resetProjectSnapshotParseCacheForTests(): void {
 	snapshotParseCache.clear();
-	for (const entry of authoritativeSnapshots.values()) clearAuthoritativeSnapshotTimer(entry);
+	for (const entry of authoritativeSnapshots.values())
+		clearAuthoritativeSnapshotTimer(entry);
 	authoritativeSnapshots.clear();
 }
 
@@ -463,6 +508,300 @@ function readSnapshotBody(
 	}
 }
 
+/**
+ * Scan a JSON value starting at `start` (skipping any leading whitespace)
+ * and return the index one past its end. Handles strings, objects, arrays,
+ * and bare scalars (numbers/`true`/`false`/`null`) — correctly skipping
+ * nested strings/braces/brackets (respecting `\"` escapes) WITHOUT ever
+ * constructing a JS value for them. This is the primitive
+ * `stripTopLevelJsonKeys` (#1785 F5) is built on: `JSON.parse` has no way to
+ * skip a subtree's construction cost — a reviver only prunes the
+ * already-built result — so avoiding a field's parse cost requires never
+ * handing its text to `JSON.parse` in the first place.
+ */
+function skipJsonValue(text: string, start: number): number {
+	let i = start;
+	while (i < text.length && /\s/.test(text[i]!)) i++;
+	const ch = text[i];
+	if (ch === '"') {
+		i++;
+		while (i < text.length) {
+			if (text[i] === "\\") {
+				i += 2;
+				continue;
+			}
+			if (text[i] === '"') {
+				i++;
+				break;
+			}
+			i++;
+		}
+		return i;
+	}
+	if (ch === "{" || ch === "[") {
+		const open = ch;
+		const close = open === "{" ? "}" : "]";
+		let depth = 0;
+		let inString = false;
+		for (; i < text.length; i++) {
+			const c = text[i];
+			if (inString) {
+				if (c === "\\") {
+					i++;
+					continue;
+				}
+				if (c === '"') inString = false;
+				continue;
+			}
+			if (c === '"') {
+				inString = true;
+				continue;
+			}
+			if (c === open) depth++;
+			else if (c === close) {
+				depth--;
+				if (depth === 0) {
+					i++;
+					break;
+				}
+			}
+		}
+		return i;
+	}
+	// A bare scalar (number/true/false/null): scan to the next structural
+	// character. Every snapshot value is one of the five JSON kinds above, so
+	// this branch only ever fires for those scalars.
+	while (i < text.length && !",}]".includes(text[i]!)) i++;
+	return i;
+}
+
+/**
+ * Reconstruct a JSON object literal with the given top-level keys removed,
+ * without ever materializing their values as JS objects (#1785 F5). Used to
+ * excise the expensive fields — `wordIndex`'s postings graph above all,
+ * `files`/`symbols`/`reverseDeps` too — before `JSON.parse` ever sees them,
+ * so a caller that only needs a few small top-level fields (`seq`,
+ * `cachedExports`, `projectRulesScan`, …) doesn't pay to construct the
+ * fields it's about to discard. Correctness relies only on the writer
+ * (`JSON.stringify(snapshot)`, `clients/gzip-stage-write.ts`) never emitting
+ * pretty-printed/indented output — compact `JSON.stringify` output is what
+ * every persist path in this file produces.
+ */
+function stripTopLevelJsonKeys(
+	text: string,
+	keysToStrip: ReadonlySet<string>,
+): string {
+	const objStart = text.indexOf("{");
+	if (objStart === -1) return text;
+	let out = text.slice(0, objStart + 1);
+	let i = objStart + 1;
+	let wroteField = false;
+	while (i < text.length) {
+		while (i < text.length && /\s/.test(text[i]!)) i++;
+		if (text[i] === "}" || i >= text.length) {
+			out += text.slice(i);
+			break;
+		}
+		if (text[i] === ",") {
+			i++;
+			continue;
+		}
+		const keyStart = i;
+		const keyTextEnd = skipJsonValue(text, keyStart);
+		let key: string;
+		try {
+			key = JSON.parse(text.slice(keyStart, keyTextEnd)) as string;
+		} catch {
+			// Malformed key text — bail out to the untouched original rather
+			// than risk producing invalid JSON; the caller's own JSON.parse
+			// on the result will then fail loudly instead of silently.
+			return text;
+		}
+		let j = keyTextEnd;
+		while (j < text.length && /\s/.test(text[j]!)) j++;
+		// text[j] is ':' for a well-formed object.
+		const valueStart = j + 1;
+		const valueEnd = skipJsonValue(text, valueStart);
+		if (!keysToStrip.has(key)) {
+			out += (wroteField ? "," : "") + text.slice(keyStart, valueEnd);
+			wroteField = true;
+		}
+		i = valueEnd;
+	}
+	return out;
+}
+
+/**
+ * Test-only direct access to the raw-text stripper (#1785 F5). Unlike
+ * asserting on `loadProjectSnapshotExportsAndRules`'s RETURN shape — which
+ * only proves the output omits the heavy fields, not that their parse cost
+ * was ever avoided (the function could strip nothing and still hand-pick 4
+ * fields out of a fully-parsed object) — this lets a test inspect the
+ * INTERMEDIATE text `JSON.parse` actually receives, which is the only way to
+ * prove the expensive fields' text never reached `JSON.parse` at all.
+ */
+export function _stripTopLevelJsonKeysForTests(
+	text: string,
+	keysToStrip: readonly string[],
+): string {
+	return stripTopLevelJsonKeys(text, new Set(keysToStrip));
+}
+
+// A fixed, 4-entry, import-time constant — not per-session accumulating
+// state, so it needs no session_start reset (counted in
+// tests/support/session-state-registry.ts's SESSION_STATE_SYMBOL_COUNTS
+// pin for "project-snapshot.ts", alongside the bounded digest hook below).
+//
+// Adding a key here? Add it to `NARROW_DIGEST_HEAVY_KEY_LITERALS` too (~40
+// lines down) — it's a DELIBERATELY separate, independent list (#1785 F7: a
+// digest that reads its own containsHeavyKey answer off THIS set can't
+// detect this set failing/emptying, so it must not).
+const HEAVY_SNAPSHOT_KEYS: ReadonlySet<string> = new Set([
+	"wordIndex",
+	"files",
+	"symbols",
+	"reverseDeps",
+]);
+
+/** The subset of `ProjectSnapshot` the retroactive-hydration path needs. */
+export interface ProjectSnapshotExportsAndRules {
+	version: typeof PROJECT_SNAPSHOT_VERSION;
+	seq: number;
+	cachedExports: Array<[name: string, filePath: string]>;
+	projectRulesScan?: RuleScanResult;
+}
+
+/**
+ * Test-observable DIGEST of the text `parseExportsAndRulesOnly` hands to
+ * `JSON.parse` — never the text itself. #1785 F6 (review round 4): an
+ * earlier version of this hook retained the full narrowed text at module
+ * scope, unconditionally, with no cap and no reset on the hot path — the
+ * EXACT retention class the narrow loader exists to close, reintroduced by
+ * its own observability hook (measured: 28.2MB retained on a production
+ * body). `session-state-conformance.test.ts`'s registry didn't catch it
+ * because `project-snapshot.ts` carries a file-level exemption written for
+ * the bounded parse caches elsewhere in this file — this variable rode that
+ * exemption instead of declaring its own bound. A length + a "does the text
+ * still contain a heavy key" boolean is everything a test needs to prove the
+ * strip ran, without ever holding the (potentially many-MB) text itself.
+ */
+interface NarrowParseDigest {
+	length: number;
+	containsHeavyKey: boolean;
+}
+// #1785 F7 (review round 5): a FIXED LITERAL list, independent of
+// `HEAVY_SNAPSHOT_KEYS` — the digest below exists to detect a broken/emptied
+// `HEAVY_SNAPSHOT_KEYS`, so deriving `containsHeavyKey` from that same
+// constant makes the check vacuous by construction: empty the set and the
+// stripper strips nothing AND `[...HEAVY_SNAPSHOT_KEYS].some(...)` iterates
+// zero entries and reports `false` — the exact failure mode this hook exists
+// to catch, silently passing. Verified: with the shared-constant version,
+// emptying `HEAVY_SNAPSHOT_KEYS` left 38 tests green instead of red.
+const NARROW_DIGEST_HEAVY_KEY_LITERALS = [
+	"wordIndex",
+	"files",
+	"symbols",
+	"reverseDeps",
+] as const;
+
+let _lastNarrowParseDigestForTests: NarrowParseDigest | undefined;
+export function getLastNarrowParseDigestForTests():
+	| NarrowParseDigest
+	| undefined {
+	return _lastNarrowParseDigestForTests;
+}
+export function resetLastNarrowParseDigestForTests(): void {
+	_lastNarrowParseDigestForTests = undefined;
+}
+
+function parseExportsAndRulesOnly(
+	json: string,
+): ProjectSnapshotExportsAndRules | null {
+	const narrowed = stripTopLevelJsonKeys(json, HEAVY_SNAPSHOT_KEYS);
+	_lastNarrowParseDigestForTests = {
+		length: narrowed.length,
+		containsHeavyKey: NARROW_DIGEST_HEAVY_KEY_LITERALS.some((key) =>
+			narrowed.includes(`"${key}":`),
+		),
+	};
+	const parsed = JSON.parse(narrowed) as Partial<ProjectSnapshot>;
+	if (parsed.version !== PROJECT_SNAPSHOT_VERSION) return null;
+	if (typeof parsed.seq !== "number") return null;
+	if (!Array.isArray(parsed.cachedExports)) return null;
+	return {
+		version: PROJECT_SNAPSHOT_VERSION,
+		seq: parsed.seq,
+		cachedExports: parsed.cachedExports.filter(
+			(entry): entry is [string, string] =>
+				Array.isArray(entry) &&
+				typeof entry[0] === "string" &&
+				typeof entry[1] === "string",
+		),
+		projectRulesScan: parsed.projectRulesScan,
+	};
+}
+
+function readSnapshotExportsAndRulesBody(
+	bodyPath: string,
+	gz: boolean,
+): ProjectSnapshotExportsAndRules | null {
+	try {
+		const json = gz
+			? gunzipSync(fs.readFileSync(bodyPath)).toString("utf-8")
+			: fs.readFileSync(bodyPath, "utf-8");
+		return parseExportsAndRulesOnly(json);
+	} catch (err) {
+		logLatency({
+			type: "phase",
+			phase: "project_snapshot_body_corrupt",
+			filePath: bodyPath,
+			durationMs: 0,
+			metadata: {
+				error: err instanceof Error ? err.message : String(err),
+				narrow: true,
+			},
+		});
+		return null;
+	}
+}
+
+/**
+ * #1785 F5: a narrow counterpart to `loadProjectSnapshot` for callers that
+ * only need `seq`/`version`/`cachedExports`/`projectRulesScan` — critically,
+ * NOT `wordIndex`, `files`, `symbols`, or `reverseDeps`. The full
+ * `loadProjectSnapshot` (even `loadProjectSnapshotWithoutWordIndex`, which
+ * only strips the RETAINED copy AFTER a full parse) pays `gunzip` +
+ * `JSON.parse` for the ENTIRE body regardless — dominated by `wordIndex`'s
+ * postings graph (measured: +200ms warm / +700ms cold on a 29MB body,
+ * 209-278ms on this repo's own 16.7MB snapshot). This function excises the
+ * heavy fields from the raw text BEFORE parsing (`stripTopLevelJsonKeys`),
+ * so their construction cost is never paid at all; the remaining cost is
+ * dominated by `cachedExports` (typically a small array), not the postings.
+ *
+ * Consults the same in-process authoritative-write cache
+ * `loadProjectSnapshotInternal` does, for the same read-your-own-write
+ * reason — a save's in-memory object is cheap to narrow (no parse needed at
+ * all) and must win over a possibly-stale on-disk body exactly like the full
+ * loader.
+ */
+export function loadProjectSnapshotExportsAndRules(
+	cwd: string,
+): ProjectSnapshotExportsAndRules | null {
+	const key = normalizeMapKey(cwd);
+	const body = resolveSnapshotBodyPath(cwd);
+	const authoritative = authoritativeSnapshots.get(key);
+	if (authoritative) {
+		const diskMtime = body ? body.mtimeMs : Number.NEGATIVE_INFINITY;
+		if (diskMtime <= authoritative.knownMtime) {
+			const { version, seq, cachedExports, projectRulesScan } =
+				authoritative.snapshot;
+			return { version, seq, cachedExports, projectRulesScan };
+		}
+	}
+	if (!body) return null;
+	return readSnapshotExportsAndRulesBody(body.path, body.gz);
+}
+
 function loadProjectSnapshotInternal(
 	cwd: string,
 	requireWordIndex: boolean,
@@ -552,8 +891,37 @@ interface PendingSnapshotBody {
 	stagePath: string;
 	snapshot: ProjectSnapshot;
 	generation: number;
+	durablePersist?: SnapshotPersistRecord;
+	dedupeFingerprints: string[];
 }
-const _snapshotGenerations = new Map<string, number>();
+
+interface SnapshotPersistRecord {
+	seq: number;
+	fingerprint: string;
+	generatedAt: string;
+	generation: number;
+	rawBytes?: number;
+	gzBytes?: number;
+}
+
+interface SnapshotPersistStats {
+	rawBytes: number;
+	gzBytes: number;
+	serializeMs: number;
+	writeMs: number;
+	offloaded: boolean;
+}
+const _snapshotGenerationStates = new Map<
+	string,
+	{ generation: number; seq: number }
+>();
+const _successfulSnapshotPersists = new Map<string, SnapshotPersistRecord>();
+const _failedSnapshotPersists = new Map<
+	string,
+	{ seq: number; generation: number }
+>();
+const _activeSnapshotPersists = new Map<string, PendingSnapshotBody>();
+const _queuedSnapshotPersists = new Map<string, PendingSnapshotBody>();
 const _snapshotWorkerRequests = new Map<number, PendingSnapshotBody>();
 let _snapshotPersistWorker: Worker | undefined;
 let _snapshotWorkerRequestId = 0;
@@ -561,6 +929,8 @@ let _snapshotWorkerDisabled = false;
 let _snapshotGenerationGateEnabledForTests = true;
 let _snapshotPromotionSeamForTests: (() => Promise<void>) | undefined;
 let _lastSnapshotPersistErrorForTests: string | undefined;
+let _snapshotExiting = false;
+let _snapshotWorkerBodyWritesForTests = 0;
 
 function snapshotWorkerEnabled(): boolean {
 	// The synchronous fallback writer is a legitimate degraded mode (hosts that
@@ -570,20 +940,253 @@ function snapshotWorkerEnabled(): boolean {
 	return !(raw === "1" || raw === "true");
 }
 
-function recordSnapshotPersistFailure(cwd: string, error: string): void {
+function pendingSnapshotIsCurrent(pending: PendingSnapshotBody): boolean {
+	return (
+		!_snapshotGenerationGateEnabledForTests ||
+		_snapshotGenerationStates.get(pending.key)?.generation ===
+			pending.generation
+	);
+}
+
+function rememberSuccessfulSnapshotPersist(
+	key: string,
+	record: SnapshotPersistRecord,
+): void {
+	_successfulSnapshotPersists.delete(key);
+	_successfulSnapshotPersists.set(key, record);
+	while (_successfulSnapshotPersists.size > PROJECT_SNAPSHOT_MAX_WARM_ROOTS) {
+		const oldest = _successfulSnapshotPersists.keys().next().value;
+		if (oldest === undefined) break;
+		_successfulSnapshotPersists.delete(oldest);
+	}
+}
+
+/**
+ * #2008 verdict on the durable meta+body pair. Absent from the baselines when
+ * there is no evidence to judge (no meta fingerprint or no body on disk).
+ * Anything other than `"ok"` means a same-fingerprint skip must NOT be
+ * trusted: the persisted body may be torn under an intact meta.
+ */
+type SnapshotBodyIntegrity = "ok" | "legacy-meta" | "size-mismatch";
+
+interface SnapshotPersistBaselines {
+	durable?: SnapshotPersistRecord;
+	fingerprints: string[];
+	integrity?: SnapshotBodyIntegrity;
+}
+
+function assessSnapshotBodyIntegrity(
+	meta: ProjectSnapshotMeta,
+	body: { gz: boolean; size: number },
+): {
+	outcome: SnapshotBodyIntegrity;
+	expectedGzBytes?: number;
+	actualBytes: number;
+} {
+	if (meta.gzBytes === undefined) {
+		// Legacy meta (pre-#2008): nothing to compare against, so the evidence is
+		// untrusted until the next successful persist populates gzBytes.
+		return { outcome: "legacy-meta", actualBytes: body.size };
+	}
+	if (!body.gz || body.size !== meta.gzBytes) {
+		return {
+			outcome: "size-mismatch",
+			expectedGzBytes: meta.gzBytes,
+			actualBytes: body.size,
+		};
+	}
+	return {
+		outcome: "ok",
+		expectedGzBytes: meta.gzBytes,
+		actualBytes: body.size,
+	};
+}
+
+/**
+ * Bounded observability for #2008: the degradation ledger keeps one entry per
+ * corrupted subject with the exact detection count for the session; every
+ * detection also emits one `project_snapshot_body_integrity` latency row
+ * naming expected vs actual bytes, so an operator can confirm both the
+ * detection and the forced republish from logs alone.
+ */
+function noteSnapshotBodyIntegrityWithheld(args: {
+	gzPath: string;
+	verdict: Exclude<SnapshotBodyIntegrity, "ok">;
+	seq?: number;
+	expectedGzBytes?: number;
+	actualBytes: number;
+}): void {
+	incrementDegradationCount({
+		kind: "snapshot-integrity",
+		subject: args.gzPath,
+		reason: args.verdict,
+	});
+	logLatency({
+		type: "phase",
+		phase: "project_snapshot_body_integrity",
+		filePath: args.gzPath,
+		durationMs: 0,
+		metadata: {
+			outcome: "dedupe_withheld",
+			reason: args.verdict,
+			...(args.seq !== undefined ? { seq: args.seq } : {}),
+			...(args.expectedGzBytes === undefined
+				? {}
+				: { expectedGzBytes: args.expectedGzBytes }),
+			actualBytes: args.actualBytes,
+		},
+	});
+}
+
+/** Log one row naming a skip that was refused because integrity regressed. */
+function noteSnapshotSkipRefused(args: {
+	gzPath: string;
+	verdict: Exclude<SnapshotBodyIntegrity, "ok">;
+	seq: number;
+}): void {
+	logLatency({
+		type: "phase",
+		phase: "project_snapshot_body_integrity",
+		filePath: args.gzPath,
+		durationMs: 0,
+		metadata: {
+			outcome: "skip_refused_rewrite",
+			reason: args.verdict,
+			seq: args.seq,
+		},
+	});
+}
+
+/**
+ * PURE READ of the durable meta+body evidence for a snapshot key (#2008
+ * refactor): it must never mutate {@link _successfulSnapshotPersists}. This
+ * runs up to three times per persist — admission in saveProjectSnapshot, the
+ * dispatch-time refresh, and the skip-honor re-read — including on results
+ * whose fingerprints are only partially used, so the seeding write lives in
+ * {@link seedSnapshotPersistBaselineFromDurable} and is called only by the
+ * seam that owns the persist lifecycle (dispatchSnapshotPersist).
+ */
+function snapshotPersistBaselinesFor(
+	cwd: string,
+	key: string,
+): SnapshotPersistBaselines {
+	const local = _successfulSnapshotPersists.get(key);
+	const meta = readProjectSnapshotMeta(cwd);
+	const body = resolveSnapshotBodyPath(cwd);
+	// No body means no dedupe evidence. This keeps same-seq deletion repair live.
+	if (!meta?.fingerprint || !body) {
+		if (!body) _successfulSnapshotPersists.delete(key);
+		return { fingerprints: [] };
+	}
+	// #2008: a meta whose recorded gz size no longer matches the on-disk body
+	// describes evidence we cannot trust — a truncated/torn gzip under an
+	// intact meta used to win same-fingerprint dedupe forever, keeping the
+	// corrupt body canonical until seq advanced. Withhold the fingerprints so
+	// the pending save republishes (and rewrites) the body.
+	const integrity = assessSnapshotBodyIntegrity(meta, body);
+	if (integrity.outcome !== "ok") {
+		noteSnapshotBodyIntegrityWithheld({
+			gzPath: getProjectSnapshotPath(cwd),
+			verdict: integrity.outcome,
+			seq: meta.seq,
+			expectedGzBytes: integrity.expectedGzBytes,
+			actualBytes: integrity.actualBytes,
+		});
+		return { fingerprints: [] };
+	}
+	const durable: SnapshotPersistRecord = {
+		seq: meta.seq,
+		fingerprint: meta.fingerprint,
+		generatedAt: meta.timestamp,
+		generation: _snapshotGenerationStates.get(key)?.generation ?? 0,
+		gzBytes: meta.gzBytes,
+	};
+	const fingerprints = [durable.fingerprint];
+	// A sibling process may have advanced durable state from local A to B. An
+	// unchanged replay of A is stale work and must not overwrite B. A third
+	// semantic state C matches neither fingerprint and still publishes.
+	if (local && local.fingerprint !== durable.fingerprint) {
+		fingerprints.push(local.fingerprint);
+	}
+	return { durable, fingerprints, integrity: "ok" };
+}
+
+/**
+ * Seed the in-process baseline for `key` from freshly-read durable state.
+ * Deliberately separate from {@link snapshotPersistBaselinesFor} so the read
+ * stays pure; called only at the dispatch seam where the persist lifecycle
+ * begins.
+ */
+function seedSnapshotPersistBaselineFromDurable(
+	key: string,
+	durable: SnapshotPersistRecord | undefined,
+): void {
+	if (!durable || _successfulSnapshotPersists.has(key)) return;
+	rememberSuccessfulSnapshotPersist(key, durable);
+}
+
+function writeProjectSnapshotMeta(
+	metaPath: string,
+	snapshot: ProjectSnapshot,
+	bodyRecord?: Pick<
+		SnapshotPersistRecord,
+		"fingerprint" | "generatedAt" | "gzBytes"
+	>,
+): void {
+	writeFileAtomic(
+		metaPath,
+		JSON.stringify({
+			timestamp: bodyRecord?.generatedAt ?? snapshot.generatedAt,
+			version: snapshot.version,
+			seq: snapshot.seq,
+			...(bodyRecord
+				? {
+						fingerprint: bodyRecord.fingerprint,
+						...(bodyRecord.gzBytes === undefined
+							? {}
+							: { gzBytes: bodyRecord.gzBytes }),
+					}
+				: {}),
+			...(snapshot.sequenceIndex
+				? { sequenceIndex: snapshot.sequenceIndex }
+				: {}),
+		}),
+		{ bestEffort: false },
+	);
+}
+
+function recordSnapshotPersistFailure(
+	pending: PendingSnapshotBody,
+	error: string,
+	bodyPersisted = false,
+): void {
 	// Honesty (#533): a failed async body write must be surfaced, never left to
 	// masquerade as a saved snapshot. The meta gate is already self-healing (an
 	// old body under a newer-seq meta is rejected on the body's own embedded
 	// seq), and dropping the authoritative entry means the next load reflects
 	// what is ACTUALLY on disk rather than the object we failed to persist.
 	_lastSnapshotPersistErrorForTests = error;
-	deleteAuthoritativeSnapshot(normalizeMapKey(cwd));
+	_failedSnapshotPersists.set(pending.key, {
+		seq: pending.snapshot.seq,
+		generation: pending.generation,
+	});
+	while (_failedSnapshotPersists.size > PROJECT_SNAPSHOT_MAX_WARM_ROOTS) {
+		const oldest = _failedSnapshotPersists.keys().next().value;
+		if (oldest === undefined) break;
+		_failedSnapshotPersists.delete(oldest);
+	}
+	deleteAuthoritativeSnapshot(pending.key);
 	logLatency({
 		type: "phase",
 		phase: "project_snapshot_persist_failed",
-		filePath: getProjectSnapshotPath(cwd),
+		filePath: pending.gzPath,
 		durationMs: 0,
-		metadata: { error },
+		metadata: {
+			error,
+			seq: pending.snapshot.seq,
+			outcome: bodyPersisted ? "metadata_repair_required" : "failed",
+			...(bodyPersisted ? { bodyPersisted: true } : {}),
+		},
 	});
 	// #1333: the logLatency call above already carries this failure to
 	// latency.log — the console.error was a duplicate RAW write into pi's frame.
@@ -591,20 +1194,53 @@ function recordSnapshotPersistFailure(cwd: string, error: string): void {
 
 function logSnapshotPersistSuccess(
 	pending: PendingSnapshotBody,
-	stats: {
-		rawBytes: number;
-		gzBytes: number;
-		serializeMs: number;
-		writeMs: number;
-		offloaded: boolean;
-	},
+	fingerprint: string,
+	stats: SnapshotPersistStats,
 ): void {
+	rememberSuccessfulSnapshotPersist(pending.key, {
+		seq: pending.snapshot.seq,
+		fingerprint,
+		generatedAt: pending.snapshot.generatedAt,
+		generation: pending.generation,
+		rawBytes: stats.rawBytes,
+		gzBytes: stats.gzBytes,
+	});
+	_failedSnapshotPersists.delete(pending.key);
 	logLatency({
 		type: "phase",
 		phase: "project_snapshot_persist",
 		filePath: pending.gzPath,
 		durationMs: stats.serializeMs + stats.writeMs,
-		metadata: { seq: pending.snapshot.seq, ...stats },
+		metadata: { seq: pending.snapshot.seq, outcome: "executed", ...stats },
+	});
+}
+
+function logSnapshotPersistDecision(args: {
+	cwd: string;
+	seq: number;
+	fingerprint?: string;
+	decision: "requested" | "coalesced" | "skipped_unchanged" | "retry";
+	avoidedRawBytes?: number;
+	avoidedGzipBytes?: number;
+}): void {
+	logLatency({
+		type: "phase",
+		phase: "project_snapshot_persist_decision",
+		filePath: getProjectSnapshotPath(args.cwd),
+		durationMs: 0,
+		metadata: {
+			seq: args.seq,
+			decision: args.decision,
+			...(args.fingerprint
+				? { fingerprint: args.fingerprint.slice(0, 12) }
+				: {}),
+			...(args.avoidedRawBytes === undefined
+				? {}
+				: { avoidedRawBytes: args.avoidedRawBytes }),
+			...(args.avoidedGzipBytes === undefined
+				? {}
+				: { avoidedGzipBytes: args.avoidedGzipBytes }),
+		},
 	});
 }
 
@@ -669,10 +1305,48 @@ function reconcileAuthoritativeAfterWrite(
 	}
 }
 
+function finalizeProjectSnapshotMeta(
+	pending: PendingSnapshotBody,
+	record: Pick<
+		SnapshotPersistRecord,
+		"fingerprint" | "generatedAt" | "gzBytes"
+	>,
+): boolean {
+	try {
+		writeProjectSnapshotMeta(
+			getProjectSnapshotMetaPath(pending.cwd),
+			pending.snapshot,
+			record,
+		);
+		return true;
+	} catch (err) {
+		recordSnapshotPersistFailure(
+			pending,
+			err instanceof Error ? err.message : String(err),
+			true,
+		);
+		return false;
+	}
+}
+
+function completeSnapshotPersist(pending: PendingSnapshotBody): void {
+	if (_activeSnapshotPersists.get(pending.key) !== pending) return;
+	_activeSnapshotPersists.delete(pending.key);
+	if (_snapshotExiting) return;
+	const queued = _queuedSnapshotPersists.get(pending.key);
+	if (!queued) return;
+	_queuedSnapshotPersists.delete(pending.key);
+	dispatchSnapshotPersist(queued);
+}
+
 function writeSnapshotBodyOnMainThread(
 	pending: PendingSnapshotBody,
 	reason?: string,
 ): void {
+	if (!pendingSnapshotIsCurrent(pending)) {
+		completeSnapshotPersist(pending);
+		return;
+	}
 	if (reason) {
 		// We took the synchronous main-thread gzip path (the +656MB-risk path,
 		// #950) instead of the worker. Surface it rather than burying it in an
@@ -697,13 +1371,56 @@ function writeSnapshotBodyOnMainThread(
 		const json = JSON.stringify(pending.snapshot);
 		const serializeMs = performance.now() - serializeStarted;
 		const rawBytes = Buffer.byteLength(json);
+		const fingerprint = fingerprintProjectSnapshotJson(
+			json,
+			pending.snapshot.generatedAt,
+		);
+		if (pending.dedupeFingerprints.includes(fingerprint)) {
+			// Re-read the tiny durable sidecar before honoring a fingerprint
+			// captured at dispatch time (#2008): a body torn between dispatch and
+			// execution must fall through to the full write, not skip.
+			const current = snapshotPersistBaselinesFor(pending.cwd, pending.key);
+			if (current.integrity === "ok") {
+				const prior = current.durable ?? pending.durablePersist;
+				if (
+					authoritativeSnapshots.get(pending.key)?.snapshot === pending.snapshot
+				) {
+					deleteAuthoritativeSnapshot(pending.key);
+				}
+				logSnapshotPersistDecision({
+					cwd: pending.cwd,
+					seq: pending.snapshot.seq,
+					fingerprint,
+					decision: "skipped_unchanged",
+					avoidedRawBytes: rawBytes,
+					avoidedGzipBytes: prior?.gzBytes,
+				});
+				return;
+			}
+			if (current.integrity !== undefined) {
+				noteSnapshotSkipRefused({
+					gzPath: pending.gzPath,
+					verdict: current.integrity,
+					seq: pending.snapshot.seq,
+				});
+			}
+			// integrity === undefined: the meta/body evidence vanished entirely
+			// since dispatch — falling through to the full write repairs it, the
+			// same contract as deletion-before-dispatch.
+		}
 		const writeStarted = performance.now();
 		const gzip = gzipSync(json);
 		fs.mkdirSync(path.dirname(pending.gzPath), { recursive: true });
 		writeFileAtomic(pending.gzPath, gzip, { bestEffort: false });
 		fs.rmSync(pending.legacyPath, { force: true });
+		const metadataFinalized = finalizeProjectSnapshotMeta(pending, {
+			fingerprint,
+			generatedAt: pending.snapshot.generatedAt,
+			gzBytes: gzip.byteLength,
+		});
+		if (!metadataFinalized) return;
 		reconcileAuthoritativeAfterWrite(pending, rawBytes);
-		logSnapshotPersistSuccess(pending, {
+		logSnapshotPersistSuccess(pending, fingerprint, {
 			rawBytes,
 			gzBytes: gzip.byteLength,
 			serializeMs,
@@ -713,9 +1430,11 @@ function writeSnapshotBodyOnMainThread(
 		if (reason) _lastSnapshotPersistErrorForTests = reason;
 	} catch (err) {
 		recordSnapshotPersistFailure(
-			pending.cwd,
+			pending,
 			err instanceof Error ? err.message : String(err),
 		);
+	} finally {
+		completeSnapshotPersist(pending);
 	}
 }
 
@@ -743,7 +1462,7 @@ function handleSnapshotWorkerResult(
 ): void {
 	const pending = _snapshotWorkerRequests.get(result.id);
 	if (!pending) {
-		fs.rm(result.stagePath, { force: true }, () => {});
+		fs.rmSync(result.stagePath, { force: true });
 		return;
 	}
 	_snapshotWorkerRequests.delete(result.id);
@@ -752,9 +1471,10 @@ function handleSnapshotWorkerResult(
 		result.rawBytes === undefined ||
 		result.gzBytes === undefined ||
 		result.serializeMs === undefined ||
-		result.writeMs === undefined
+		result.writeMs === undefined ||
+		result.semanticFingerprint === undefined
 	) {
-		fs.rm(result.stagePath, { force: true }, () => {});
+		fs.rmSync(result.stagePath, { force: true });
 		dispatchMainThreadWriteThroughSeam(
 			pending,
 			result.error ?? "invalid worker result",
@@ -763,28 +1483,126 @@ function handleSnapshotWorkerResult(
 	}
 	// Generation gate: a newer save already superseded this one — discard the
 	// stale stage file rather than promote it over the fresher body.
+	if (!result.skippedUnchanged) _snapshotWorkerBodyWritesForTests++;
 	if (
 		_snapshotGenerationGateEnabledForTests &&
-		_snapshotGenerations.get(pending.key) !== result.generation
+		_snapshotGenerationStates.get(pending.key)?.generation !== result.generation
 	) {
 		// The stale stage is part of the promotion transaction: remove it before
 		// returning so a superseded save cannot leave an orphan behind.
-		fs.rm(result.stagePath, { force: true }, () => {});
+		fs.rmSync(result.stagePath, { force: true });
+		completeSnapshotPersist(pending);
+		return;
+	}
+	if (result.skippedUnchanged) {
+		// Re-read the tiny durable sidecar at the decision seam. A sibling process
+		// may have advanced B after this request captured A. A stale replay of A
+		// must preserve B's body metadata, not restore the captured A sidecar.
+		const baselines = snapshotPersistBaselinesFor(pending.cwd, pending.key);
+		if (baselines.integrity !== "ok") {
+			// The worker skipped WITHOUT staging a body, trusting the durable
+			// fingerprint captured at dispatch. The re-read says that evidence no
+			// longer passes the #2008 integrity gate — refuse the skip and rewrite
+			// synchronously so a torn/missing body cannot outlive this save. The
+			// sync writer recomputes the same baselines, finds them untrusted, and
+			// performs the full gzip+stage+promote (its finally completes this
+			// pending, so do not complete it twice here).
+			if (baselines.integrity !== undefined) {
+				noteSnapshotSkipRefused({
+					gzPath: pending.gzPath,
+					verdict: baselines.integrity,
+					seq: pending.snapshot.seq,
+				});
+			}
+			dispatchMainThreadWriteThroughSeam(
+				pending,
+				"snapshot body integrity regressed",
+			);
+			return;
+		}
+		const prior = baselines.durable ?? pending.durablePersist;
+		if (
+			authoritativeSnapshots.get(pending.key)?.snapshot === pending.snapshot
+		) {
+			deleteAuthoritativeSnapshot(pending.key);
+		}
+		logSnapshotPersistDecision({
+			cwd: pending.cwd,
+			seq: pending.snapshot.seq,
+			fingerprint: result.semanticFingerprint,
+			decision: "skipped_unchanged",
+			avoidedRawBytes: result.rawBytes,
+			avoidedGzipBytes: prior?.gzBytes,
+		});
+		completeSnapshotPersist(pending);
 		return;
 	}
 	try {
 		fs.renameSync(result.stagePath, pending.gzPath);
 		fs.rmSync(pending.legacyPath, { force: true });
+		const metadataFinalized = finalizeProjectSnapshotMeta(pending, {
+			fingerprint: result.semanticFingerprint,
+			generatedAt: pending.snapshot.generatedAt,
+			gzBytes: result.gzBytes,
+		});
+		if (!metadataFinalized) {
+			completeSnapshotPersist(pending);
+			return;
+		}
 		reconcileAuthoritativeAfterWrite(pending, result.rawBytes);
-		logSnapshotPersistSuccess(pending, {
+		logSnapshotPersistSuccess(pending, result.semanticFingerprint, {
 			rawBytes: result.rawBytes,
 			gzBytes: result.gzBytes,
 			serializeMs: result.serializeMs,
 			writeMs: result.writeMs,
 			offloaded: true,
 		});
+		completeSnapshotPersist(pending);
 	} catch (err) {
 		fs.rm(result.stagePath, { force: true }, () => {});
+		dispatchMainThreadWriteThroughSeam(
+			pending,
+			err instanceof Error ? err.message : String(err),
+		);
+	}
+}
+
+function dispatchSnapshotPersist(pending: PendingSnapshotBody): void {
+	// A queued request may have waited behind the publication that created its
+	// best dedupe evidence. Refresh only the tiny sidecar/body stat here; never
+	// retain the stale admission-time baseline through dispatch.
+	const baselines = snapshotPersistBaselinesFor(pending.cwd, pending.key);
+	pending.durablePersist = baselines.durable;
+	pending.dedupeFingerprints = baselines.fingerprints;
+	seedSnapshotPersistBaselineFromDurable(pending.key, baselines.durable);
+	_activeSnapshotPersists.set(pending.key, pending);
+	if (!snapshotWorkerEnabled()) {
+		dispatchMainThreadWriteThroughSeam(pending, undefined);
+		return;
+	}
+	const worker = getSnapshotPersistWorker();
+	if (!worker) {
+		dispatchMainThreadWriteThroughSeam(pending, "persist worker unavailable");
+		return;
+	}
+	const id = ++_snapshotWorkerRequestId;
+	_snapshotWorkerRequests.set(id, pending);
+	const request: ProjectSnapshotPersistWorkerRequest = {
+		id,
+		generation: pending.generation,
+		stagePath: pending.stagePath,
+		data: pending.snapshot,
+		priorFingerprints: pending.dedupeFingerprints,
+		testDelayMs:
+			process.env.NODE_ENV === "test"
+				? Number(process.env.PI_LENS_TEST_SNAPSHOT_PERSIST_WORKER_DELAY_MS) ||
+					undefined
+				: undefined,
+	};
+	try {
+		worker.postMessage(request);
+	} catch (err) {
+		_snapshotWorkerRequests.delete(id);
 		dispatchMainThreadWriteThroughSeam(
 			pending,
 			err instanceof Error ? err.message : String(err),
@@ -908,12 +1726,29 @@ function ensureSnapshotPersistExitHook(): void {
 	if (_snapshotExitHookInstalled) return;
 	_snapshotExitHookInstalled = true;
 	process.once("exit", () => {
-		const requests = [..._snapshotWorkerRequests.values()];
+		_snapshotExiting = true;
+		const latestByKey = new Map<string, PendingSnapshotBody>();
+		for (const pending of _snapshotWorkerRequests.values()) {
+			latestByKey.set(pending.key, pending);
+		}
+		for (const pending of _queuedSnapshotPersists.values()) {
+			const prior = latestByKey.get(pending.key);
+			// Queued work is later admission order. Equal-seq requests deliberately
+			// share a gate generation, so a tie must still select the queued payload.
+			if (!prior || prior.generation <= pending.generation) {
+				latestByKey.set(pending.key, pending);
+			}
+		}
 		_snapshotWorkerRequests.clear();
-		for (const pending of requests) {
+		_queuedSnapshotPersists.clear();
+		_activeSnapshotPersists.clear();
+		for (const pending of latestByKey.values()) {
 			// Only the newest generation per key still matters; older ones are
 			// superseded and their stage files are swept on next launch.
-			if (_snapshotGenerations.get(pending.key) !== pending.generation)
+			if (
+				_snapshotGenerationStates.get(pending.key)?.generation !==
+				pending.generation
+			)
 				continue;
 			writeSnapshotBodyOnMainThread(pending, "exit_hook");
 		}
@@ -931,9 +1766,19 @@ export function saveProjectSnapshot(
 	const cacheDir = path.dirname(gzPath);
 	const key = normalizeMapKey(cwd);
 	fs.mkdirSync(cacheDir, { recursive: true });
+	const baselines = snapshotPersistBaselinesFor(cwd, key);
+	const priorPersist = baselines.durable;
+	logSnapshotPersistDecision({
+		cwd,
+		seq: snapshot.seq,
+		decision: "requested",
+	});
+	if (_failedSnapshotPersists.delete(key)) {
+		logSnapshotPersistDecision({ cwd, seq: snapshot.seq, decision: "retry" });
+	}
 
-	// #958: meta is written FIRST, body SECOND — the reverse of the original
-	// order. A crash/failure between the two writes can now only produce
+	// #958: for a new seq, meta is written FIRST and body SECOND. A crash or
+	// failure between the two writes can now only produce
 	// "meta already claims the new seq, body hasn't caught up yet" (the meta
 	// races ahead). The meta-first gate (isProjectSnapshotMetaStale) reads
 	// that as *fresh* and falls through to parsing the body, whose own
@@ -945,28 +1790,14 @@ export function saveProjectSnapshot(
 	// away a genuinely fresh snapshot. That direction is not recoverable
 	// until the next save, so it's the one this reorder eliminates.
 	//
-	// The meta write is still SYNCHRONOUS (it is tiny) and uses
-	// `bestEffort: false`: if it fails, the body persist below is skipped
-	// entirely — the save is simply lost this round (fail-open, caught by
-	// `saveRuntimeProjectSnapshot`'s own try/catch) rather than leaving a
-	// stale meta in place while the body writer stampedes ahead.
-	writeFileAtomic(
-		metaPath,
-		JSON.stringify({
-			timestamp: snapshot.generatedAt,
-			version: snapshot.version,
-			seq: snapshot.seq,
-			// #1019: mirror the derived sequence index (kept consistent with `seq`
-			// because both are stamped from the same runtime moment) so the
-			// interactive path can hydrate it from the tiny sidecar. Omitted when
-			// absent so a non-runtime side-write (word-index/reverse-deps) that
-			// carried no index doesn't stamp an empty one.
-			...(snapshot.sequenceIndex
-				? { sequenceIndex: snapshot.sequenceIndex }
-				: {}),
-		}),
-		{ bestEffort: false },
-	);
+	// The new-seq meta write stays synchronous and throwing. Same-seq work does
+	// not need to advance the freshness gate, so it leaves the current sidecar
+	// untouched until the worker has a semantic verdict. This prevents a stale
+	// local request from replacing a
+	// newer sibling process's same-seq fingerprint before it can coalesce.
+	if (priorPersist?.seq !== snapshot.seq) {
+		writeProjectSnapshotMeta(metaPath, snapshot);
+	}
 
 	// Record the authoritative in-process write BEFORE handing the body off, so
 	// a merge-read between now and the worker's promotion sees our own object
@@ -993,8 +1824,12 @@ export function saveProjectSnapshot(
 	// authoritative write once the latter is dropped (oversized bodies).
 	snapshotParseCache.delete(gzPath);
 
-	const generation = (_snapshotGenerations.get(key) ?? 0) + 1;
-	_snapshotGenerations.set(key, generation);
+	const generationState = _snapshotGenerationStates.get(key);
+	const generation =
+		generationState?.seq === snapshot.seq
+			? generationState.generation
+			: (generationState?.generation ?? 0) + 1;
+	_snapshotGenerationStates.set(key, { generation, seq: snapshot.seq });
 	const stagePath = `${gzPath}.stage-${process.pid}-${generation}`;
 	const pending: PendingSnapshotBody = {
 		key,
@@ -1004,33 +1839,22 @@ export function saveProjectSnapshot(
 		stagePath,
 		snapshot,
 		generation,
+		durablePersist: priorPersist,
+		dedupeFingerprints: baselines.fingerprints,
 	};
 	sweepStaleSnapshotStageFiles(cacheDir);
 	ensureSnapshotPersistExitHook();
 
-	if (!snapshotWorkerEnabled()) {
-		dispatchMainThreadWriteThroughSeam(pending, undefined);
+	if (_activeSnapshotPersists.has(key)) {
+		_queuedSnapshotPersists.set(key, pending);
+		logSnapshotPersistDecision({
+			cwd,
+			seq: snapshot.seq,
+			decision: "coalesced",
+		});
 		return;
 	}
-	const worker = getSnapshotPersistWorker();
-	if (!worker) {
-		dispatchMainThreadWriteThroughSeam(pending, "persist worker unavailable");
-		return;
-	}
-	const id = ++_snapshotWorkerRequestId;
-	_snapshotWorkerRequests.set(id, pending);
-	const request: ProjectSnapshotPersistWorkerRequest = {
-		id,
-		generation,
-		stagePath,
-		data: snapshot,
-		testDelayMs:
-			process.env.NODE_ENV === "test"
-				? Number(process.env.PI_LENS_TEST_SNAPSHOT_PERSIST_WORKER_DELAY_MS) ||
-					undefined
-				: undefined,
-	};
-	worker.postMessage(request);
+	dispatchSnapshotPersist(pending);
 }
 
 // --- Test hooks for the worker persist path ---------------------------------
@@ -1039,7 +1863,10 @@ export function saveProjectSnapshot(
 export async function waitForProjectSnapshotPersistsForTests(): Promise<void> {
 	for (
 		let attempts = 0;
-		attempts < 200 && _snapshotWorkerRequests.size > 0;
+		attempts < 200 &&
+		(_snapshotWorkerRequests.size > 0 ||
+			_activeSnapshotPersists.size > 0 ||
+			_queuedSnapshotPersists.size > 0);
 		attempts++
 	) {
 		await new Promise((resolve) => setTimeout(resolve, 10));
@@ -1051,7 +1878,6 @@ export function flushProjectSnapshotPersistsForTests(): void {
 	const requests = [..._snapshotWorkerRequests.values()];
 	_snapshotWorkerRequests.clear();
 	for (const pending of requests) {
-		if (_snapshotGenerations.get(pending.key) !== pending.generation) continue;
 		dispatchMainThreadWriteThroughSeam(pending, undefined);
 	}
 }
@@ -1069,8 +1895,30 @@ export function resetProjectSnapshotPersistWorkerForTests(): void {
 	_snapshotPromotionSeamForTests = undefined;
 	_snapshotPersistWorker = undefined;
 	_snapshotWorkerRequests.clear();
-	_snapshotGenerations.clear();
+	_snapshotGenerationStates.clear();
+	_successfulSnapshotPersists.clear();
+	_failedSnapshotPersists.clear();
+	_activeSnapshotPersists.clear();
+	_queuedSnapshotPersists.clear();
+	_snapshotExiting = false;
+	_snapshotWorkerBodyWritesForTests = 0;
 	_lastSnapshotPersistErrorForTests = undefined;
+}
+
+/** Test-only: expose bounded queue state without retaining snapshot bodies. */
+export function getProjectSnapshotPersistStateForTests(cwd: string): {
+	active: boolean;
+	queued: boolean;
+	successfulFingerprint?: string;
+	workerBodyWrites: number;
+} {
+	const key = normalizeMapKey(cwd);
+	return {
+		active: _activeSnapshotPersists.has(key),
+		queued: _queuedSnapshotPersists.has(key),
+		successfulFingerprint: _successfulSnapshotPersists.get(key)?.fingerprint,
+		workerBodyWrites: _snapshotWorkerBodyWritesForTests,
+	};
 }
 
 /** Test-only mutation switch for proving the supersession invariant. */
@@ -1140,6 +1988,63 @@ export function hydrateRuntimeFromProjectSnapshot(
 		runtime.projectRulesScan = snapshot.projectRulesScan;
 	}
 	runtime.wordIndex = deserializeWordIndex(snapshot.wordIndex);
+}
+
+/**
+ * #1785 F2/F3: additive counterpart to `hydrateRuntimeFromProjectSnapshot`
+ * for a LATE/retroactive hydration attempt — one that runs after other work
+ * may already have populated the runtime for real (e.g. quick mode's
+ * background warmup building a genuine `wordIndex`, docCount > 0). The
+ * unconditional version above is only safe for the FIRST hydration attempt,
+ * made before anything else has run: clearing `cachedExports` is correct
+ * there because there is nothing yet to destroy.
+ *
+ * A late call cannot make that assumption, and `cachedExports` and
+ * `projectRulesScan` are populated by INDEPENDENT tasks from whatever else is
+ * running (nothing else in quick mode touches either), so this guards each
+ * field on its OWN "nothing computed since" check rather than one
+ * all-or-nothing bail-out — the field a concurrent task actually populated is
+ * protected without needlessly withholding the other, still-idle field the
+ * snapshot could still supply. Returns whether it hydrated ANY field, so the
+ * caller can log honestly instead of claiming success when nothing changed.
+ *
+ * #1785 F5: takes ONLY the narrow `{ cachedExports, projectRulesScan }`
+ * shape (see `ProjectSnapshotExportsAndRules`) — deliberately no `wordIndex`
+ * parameter at all, not even an optional one. The retroactive path's
+ * captured/reloaded snapshot always comes from
+ * `loadProjectSnapshotExportsAndRules`, which never parses `wordIndex` in
+ * the first place (avoiding its dominant share of a full body parse's cost —
+ * see that function's doc comment for the measured numbers). This is also
+ * the right behavior, not just a performance shortcut: quick mode's warmup
+ * is the only thing that ever builds a `wordIndex` in this window, and F2's
+ * hazard was this exact late-hydration path nulling that live index from a
+ * disk copy that predated it — removing the parameter removes the hazard by
+ * construction instead of merely guarding against it at runtime.
+ */
+export function hydrateRuntimeFromProjectSnapshotIfIdle(
+	runtime: RuntimeCoordinator,
+	snapshot: Pick<ProjectSnapshot, "cachedExports" | "projectRulesScan">,
+): boolean {
+	let hydratedAnything = false;
+
+	if (runtime.cachedExports.size === 0 && snapshot.cachedExports.length > 0) {
+		runtime.cachedExports.clear();
+		for (const [name, filePath] of snapshot.cachedExports) {
+			runtime.cachedExports.set(name, filePath);
+		}
+		hydratedAnything = true;
+	}
+
+	if (
+		!runtime.projectRulesScan.hasCustomRules &&
+		runtime.projectRulesScan.rules.length === 0 &&
+		snapshot.projectRulesScan
+	) {
+		runtime.projectRulesScan = snapshot.projectRulesScan;
+		hydratedAnything = true;
+	}
+
+	return hydratedAnything;
 }
 
 export function saveRuntimeProjectSnapshot(args: {

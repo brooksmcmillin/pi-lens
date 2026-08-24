@@ -1,35 +1,37 @@
 // Type declarations for compat-contracts.mjs (untyped .mjs imported from .ts tests).
 
 export interface ContractCheckResult {
-  pass: boolean;
-  detail: string;
+	pass: boolean;
+	detail: string;
 }
 
 export function checkNicobailonChildEnv(source: string): ContractCheckResult;
 export function checkAvtcChildEnv(source: string): ContractCheckResult;
 export function checkSdkExtensionCache(source: string): ContractCheckResult;
 export function checkSdkBindExtensionsEmitsSessionStart(
-  source: string,
+	source: string,
 ): ContractCheckResult;
 export function checkSdkInvalidateCalled(source: string): ContractCheckResult;
 export function checkSdkStaleCtxMessage(source: string): ContractCheckResult;
-export function checkTintinwebInProcessBind(source: string): ContractCheckResult;
+export function checkTintinwebInProcessBind(
+	source: string,
+): ContractCheckResult;
 
 export interface ContractCheckEntry extends ContractCheckResult {
-  id: string;
-  package: string;
-  description: string;
+	id: string;
+	package: string;
+	description: string;
 }
 
 export interface ContractCheckInputs {
-  nicobailonPiArgsSource: string;
-  avtcProcessRunnerSource: string;
-  sdkLoaderSource: string;
-  sdkAgentSessionSource: string;
-  tintinwebAgentRunnerSource: string;
+	nicobailonPiArgsSource: string;
+	avtcProcessRunnerSource: string;
+	sdkLoaderSource: string;
+	sdkAgentSessionSource: string;
+	tintinwebAgentRunnerSource: string;
 }
 
 export function runAllContractChecks(inputs: ContractCheckInputs): {
-  results: ContractCheckEntry[];
-  allPass: boolean;
+	results: ContractCheckEntry[];
+	allPass: boolean;
 };

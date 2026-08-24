@@ -208,6 +208,26 @@ const lspSpawnHeavyInclude = [
 	"tests/clients/ast-grep-rule-precedence-followups.test.ts",
 ];
 
+// #1920: files that assert REAL wall-clock elapsed-time budgets (Date.now()
+// deltas around awaited work, or a self-reported span whose window contains
+// deschedulable real work). Unlike the timing-sensitive list above, these do
+// not use the occupancy sampler — the timing-sensitive project's charter
+// deliberately excludes plain wall-clock budgets (see
+// tests/config/timing-sensitive-coverage.test.ts) — but they fail the same
+// way under the default project's fork storm: the budget ends up measuring
+// scheduler contention, not code speed (startup-overhead measured 659–2321ms
+// against a 500ms budget under load, green solo every time). Same cure, one
+// phase later: fully serial, dead last, so each budget window gets a quiet
+// host. Sweep coverage for other members lives in this list; new entries must
+// carry a wall-clock budget assertion, not just slowness.
+const wallClockBudgetInclude = [
+	"tests/clients/startup-overhead.test.ts",
+	"tests/clients/runtime-session-scan-cache.test.ts",
+	"tests/clients/cascade-turn-merge.test.ts",
+	"tests/clients/read-expansion-enrichment.test.ts",
+	"tests/clients/pipeline-lsp-sync.test.ts",
+];
+
 export default defineConfig({
 	test: {
 		exclude: sharedExclude,
@@ -225,6 +245,7 @@ export default defineConfig({
 						...grammarHeavyInclude,
 						...timingSensitiveInclude,
 						...lspSpawnHeavyInclude,
+						...wallClockBudgetInclude,
 					],
 					globalSetup: sharedGlobalSetup,
 					setupFiles: sharedSetupFiles,
@@ -319,6 +340,23 @@ export default defineConfig({
 					// most of its declared ~15s budget twice over (initialize, then
 					// first-document diagnostics) before shutdown; give teardown the
 					// same headroom as the other heavy projects.
+					hookTimeout: 60_000,
+				},
+			},
+			{
+				test: {
+					name: "wall-clock-budget",
+					include: wallClockBudgetInclude,
+					exclude: sharedExclude,
+					globalSetup: sharedGlobalSetup,
+					setupFiles: sharedSetupFiles,
+					execArgv: sharedExecArgv,
+					// Fully serialized (#1920): these files' budgets measure real
+					// elapsed time around awaited work, so even ONE concurrent
+					// sibling can inflate them. One at a time, after every other
+					// project has drained.
+					maxWorkers: 1,
+					sequence: { groupOrder: 4 },
 					hookTimeout: 60_000,
 				},
 			},

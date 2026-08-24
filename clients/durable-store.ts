@@ -61,10 +61,11 @@ export function commitDurableStore<T>(
 	},
 ): T | undefined;
 export function commitDurableStore<T>(
-	options: DurableStoreCommitBase<T> & (
-		| { onContention?: "throw" }
-		| { onContention: "skip-log"; logContention: () => void }
-	),
+	options: DurableStoreCommitBase<T> &
+		(
+			| { onContention?: "throw" }
+			| { onContention: "skip-log"; logContention: () => void }
+		),
 ): T | undefined {
 	const release =
 		options.onContention === "skip-log"
@@ -115,10 +116,11 @@ export async function commitDurableStoreAsync<T>(
 	},
 ): Promise<T | undefined>;
 export async function commitDurableStoreAsync<T>(
-	options: AsyncDurableStoreCommitBase<T> & (
-		| { onContention?: "throw" }
-		| { onContention: "skip-log"; logContention: () => void }
-	),
+	options: AsyncDurableStoreCommitBase<T> &
+		(
+			| { onContention?: "throw" }
+			| { onContention: "skip-log"; logContention: () => void }
+		),
 ): Promise<T | undefined> {
 	const release =
 		options.onContention === "skip-log"

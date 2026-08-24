@@ -40,7 +40,10 @@ function createMixedTree(): string {
 	for (let d = 0; d < 4; d++) {
 		const sub = path.join(dir, `data-${d}`);
 		fs.mkdirSync(sub, { recursive: true });
-		fs.writeFileSync(path.join(sub, `script-${d}.ts`), `export const s${d} = ${d};\n`);
+		fs.writeFileSync(
+			path.join(sub, `script-${d}.ts`),
+			`export const s${d} = ${d};\n`,
+		);
 		for (let i = 0; i < 25; i++) {
 			fs.writeFileSync(path.join(sub, `blob-${i}.dat`), "not source\n");
 		}
@@ -124,7 +127,9 @@ describe("collect walk entry budget (#760)", () => {
 
 		// The plain string[] collectors keep their existing contract verbatim.
 		expect(collectSourceFiles(dir, { maxFiles: 2 }).length).toBe(2);
-		expect((await collectSourceFilesAsync(dir, { maxFiles: 2 })).length).toBe(2);
+		expect((await collectSourceFilesAsync(dir, { maxFiles: 2 })).length).toBe(
+			2,
+		);
 	});
 
 	it("plain collectors return the same (possibly truncated) list as the budget core", async () => {

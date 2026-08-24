@@ -302,10 +302,12 @@ it("captures the startup marker before installing the console guard", () => {
 		path.join(REPO_ROOT, "clients/console-guard-install.ts"),
 		"utf8",
 	);
-	expect(installSrc.indexOf('from "./eval-timestamp.js"'))
-		.toBeLessThan(installSrc.indexOf('from "./extension-log.js"'));
-	expect(installSrc.indexOf('from "./eval-timestamp.js"'))
-		.toBeLessThan(installSrc.indexOf("installConsoleGuard();"));
+	expect(installSrc.indexOf('from "./eval-timestamp.js"')).toBeLessThan(
+		installSrc.indexOf('from "./extension-log.js"'),
+	);
+	expect(installSrc.indexOf('from "./eval-timestamp.js"')).toBeLessThan(
+		installSrc.indexOf("installConsoleGuard();"),
+	);
 	expect(installSrc).not.toContain("startup-marker");
 	// #1374 review P2: strictly pin the marker as the FIRST executable
 	// statement of eval-timestamp.ts -- anything sliding above it re-bills

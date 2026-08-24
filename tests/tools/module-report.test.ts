@@ -442,9 +442,9 @@ describe("read_symbol tool", () => {
 				{ cwd: env.tmpDir },
 			);
 			expect(result.isError).toBe(true);
-			expect((result.details as { suggestions?: string[] }).suggestions).toContain(
-				"isAgentNudgeEnabled",
-			);
+			expect(
+				(result.details as { suggestions?: string[] }).suggestions,
+			).toContain("isAgentNudgeEnabled");
 			expect(String(result.content[0]?.text)).toContain("Did you mean");
 		} finally {
 			env.cleanup();

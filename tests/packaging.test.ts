@@ -2,6 +2,12 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import {
+	HOST_PROVIDED_PACKAGES,
+	HOST_PROVIDED_RUNTIME_PACKAGES,
+	HOST_PROVIDED_TYPE_ONLY_PACKAGES,
+	LAZY_NATIVE_PACKAGES,
+} from "../scripts/lib/host-provided-deps.mjs";
 
 // These tests pin the published-package contract: pi-lens ships a precompiled
 // dist/ and points its entry at compiled JS, so pi does NOT jiti-transpile ~200
@@ -16,6 +22,10 @@ const pkg = JSON.parse(
 	files?: string[];
 	scripts?: Record<string, string>;
 	pi?: { extensions?: string[]; skills?: string[] };
+	dependencies?: Record<string, string>;
+	devDependencies?: Record<string, string>;
+	peerDependencies?: Record<string, string>;
+	peerDependenciesMeta?: Record<string, { optional?: boolean }>;
 };
 
 describe("published package entry points (dist mode, #182)", () => {
@@ -103,6 +113,181 @@ describe("published package entry points (dist mode, #182)", () => {
 	});
 });
 
+// #1926: pi provides these packages from its own runtime. Declaring one in
+// `dependencies` makes `npm install --omit=dev` — the command pi runs for a
+// `git:` install — vendor a private second copy, which Node then evaluates at
+// import. That cost the git install 720ms of an 838ms module import, while the
+// npm path (where the copies are absent) stayed cheap. The declaration shape is
+// the fix, so pin it: optional peer for the runtime contract, devDependency so
+// local builds and CI still type-check, and never a runtime dependency.
+describe("host-provided packages are not vendored (#1926)", () => {
+	const deps = pkg.dependencies ?? {};
+	const devDeps = pkg.devDependencies ?? {};
+	const peers = pkg.peerDependencies ?? {};
+	const peerMeta = pkg.peerDependenciesMeta ?? {};
+
+	it("lists at least one host-provided package to guard", () => {
+		// Guards the guard: an emptied HOST_PROVIDED_PACKAGES would make every
+		// per-package assertion below vacuously pass.
+		expect(HOST_PROVIDED_PACKAGES.length).toBeGreaterThan(0);
+	});
+
+	it("ships the shared list, because install-selftest.mjs imports it", () => {
+		// scripts/install-selftest.mjs runs FROM THE INSTALLED PACKAGE in the
+		// install-smoke job (`require.resolve("pi-lens/scripts/install-selftest.mjs")`)
+		// and imports the list to subtract host-provided specifiers. If the module
+		// is not in files[], that import throws in the tarball and the whole
+		// selftest dies (#1926).
+		const files = pkg.files ?? [];
+		expect(files).toContain("scripts/lib/host-provided-deps.mjs");
+		const selftest = fs.readFileSync(
+			path.join(root, "scripts", "install-selftest.mjs"),
+			"utf8",
+		);
+		expect(selftest).toContain("lib/host-provided-deps.mjs");
+	});
+
+	it("splits host-provided packages into runtime and type-only, with no overlap", () => {
+		// CI installs the RUNTIME half before a bare `node dist/index.js` smoke
+		// check, because bare node is not pi. It must never install the type-only
+		// half: that tree's nested paths exceed Windows MAX_PATH (#1334 S6). A
+		// package landing in both halves, or in neither, breaks that split.
+		expect(HOST_PROVIDED_RUNTIME_PACKAGES.length).toBeGreaterThan(0);
+		expect(HOST_PROVIDED_TYPE_ONLY_PACKAGES.length).toBeGreaterThan(0);
+		const overlap = HOST_PROVIDED_RUNTIME_PACKAGES.filter((name) =>
+			HOST_PROVIDED_TYPE_ONLY_PACKAGES.includes(name),
+		);
+		expect(overlap, "a package cannot be both runtime and type-only").toEqual(
+			[],
+		);
+		expect([...HOST_PROVIDED_PACKAGES].sort()).toEqual(
+			[
+				...HOST_PROVIDED_RUNTIME_PACKAGES,
+				...HOST_PROVIDED_TYPE_ONLY_PACKAGES,
+			].sort(),
+		);
+	});
+
+	it("value-imported host packages are the runtime half, not the type-only half", () => {
+		// Derived from source. A `clients/deps/*.ts` seam that value-imports a
+		// host package proves that package must exist at runtime, so CI has to
+		// supply it. Listing it as type-only instead would make the smoke check
+		// allow a real load failure.
+		const seamDir = path.join(root, "clients", "deps");
+		for (const file of fs.readdirSync(seamDir)) {
+			if (!file.endsWith(".ts")) continue;
+			const text = fs.readFileSync(path.join(seamDir, file), "utf8");
+			for (const line of text.split("\n")) {
+				if (/^\s*(?:import|export)\s+type\b/.test(line)) continue;
+				const m = line.match(
+					/^\s*(?:import|export)\b[^;"']*\bfrom\s*["']([^"'.][^"']*)["']/,
+				);
+				const name = m?.[1];
+				if (!name || !HOST_PROVIDED_PACKAGES.includes(name)) continue;
+				expect(
+					HOST_PROVIDED_TYPE_ONLY_PACKAGES.includes(name),
+					`${name} is value-imported by ${file}, so it cannot be type-only`,
+				).toBe(false);
+				expect(
+					HOST_PROVIDED_RUNTIME_PACKAGES.includes(name),
+					`${name} is value-imported by ${file}, so it belongs in the runtime half`,
+				).toBe(true);
+			}
+		}
+	});
+
+	it("lists every dep seam package that nothing installs", () => {
+		// Derived from source, so dropping an entry from HOST_PROVIDED_PACKAGES
+		// does not quietly drop its guard. Every package a `clients/deps/*.ts`
+		// seam VALUE-imports must be installed by something — a runtime
+		// dependency, an optional dependency — or else supplied by pi. If it is
+		// in neither install list, it can only come from the host, so it belongs
+		// on the host-provided list.
+		const optionalDeps =
+			(pkg as { optionalDependencies?: Record<string, string> })
+				.optionalDependencies ?? {};
+		const seamDir = path.join(root, "clients", "deps");
+		const valueImported = new Set<string>();
+		for (const file of fs.readdirSync(seamDir)) {
+			if (!file.endsWith(".ts")) continue;
+			const text = fs.readFileSync(path.join(seamDir, file), "utf8");
+			for (const line of text.split("\n")) {
+				// `import type` / `export type` are erased at compile time and never
+				// need the package to exist at runtime.
+				if (/^\s*(?:import|export)\s+type\b/.test(line)) continue;
+				const m = line.match(
+					/^\s*(?:import|export)\b[^;"']*\bfrom\s*["']([^"'.][^"']*)["']/,
+				);
+				if (m && !m[1].startsWith("node:")) valueImported.add(m[1]);
+			}
+		}
+		expect(valueImported.size).toBeGreaterThan(0);
+
+		const uninstalled = [...valueImported].filter(
+			(name) =>
+				!Object.hasOwn(deps, name) && !Object.hasOwn(optionalDeps, name),
+		);
+		expect(uninstalled.length).toBeGreaterThan(0);
+		for (const name of uninstalled) {
+			expect(
+				HOST_PROVIDED_PACKAGES.includes(name),
+				`${name} is value-imported by a clients/deps seam but no install ` +
+					"list provides it — declare it host-provided or make it a dependency",
+			).toBe(true);
+		}
+	});
+
+	for (const name of HOST_PROVIDED_PACKAGES) {
+		it(`${name} is never a runtime dependency`, () => {
+			expect(
+				Object.hasOwn(deps, name),
+				`${name} is host-provided: a runtime dependency vendors a second ` +
+					"copy into the git install and re-evaluates it at import (#1926)",
+			).toBe(false);
+		});
+
+		it(`${name} is an optional peer dependency`, () => {
+			expect(
+				Object.hasOwn(peers, name),
+				`${name} missing from peerDependencies`,
+			).toBe(true);
+			// Without `optional: true`, npm 7+ installs the peer anyway and the
+			// second copy comes back.
+			expect(
+				peerMeta[name]?.optional,
+				`${name} must be peerDependenciesMeta.optional`,
+			).toBe(true);
+		});
+
+		it(`${name} is a devDependency so builds and tests resolve it`, () => {
+			expect(
+				Object.hasOwn(devDeps, name),
+				`${name} must be a devDependency (types + local test resolution)`,
+			).toBe(true);
+		});
+	}
+
+	it("native/wasm packages keep shipping with the extension", () => {
+		// The other half of the external list is NOT host-provided: pi does not
+		// ship @ast-grep/napi or web-tree-sitter, so those must keep installing
+		// with the extension, as a runtime or optional dependency. Demoting one to
+		// a host-provided peer would break analysis at runtime.
+		const optionalDeps =
+			(pkg as { optionalDependencies?: Record<string, string> })
+				.optionalDependencies ?? {};
+		for (const name of LAZY_NATIVE_PACKAGES) {
+			expect(
+				Object.hasOwn(deps, name) || Object.hasOwn(optionalDeps, name),
+				`${name} must stay a runtime or optional dependency`,
+			).toBe(true);
+			expect(
+				HOST_PROVIDED_PACKAGES.includes(name),
+				`${name} is not host-provided`,
+			).toBe(false);
+		}
+	});
+});
+
 // Guards the #335 bundle CONTRACT against the built entry: pi's Bun-compiled
 // host cannot resolve a bare specifier from the extension's node_modules, so the
 // bundle must inline the pure-JS deps and keep only host-provided + native/wasm
@@ -125,17 +310,27 @@ describe("bundled dist entry shape (#335)", () => {
 		}
 	});
 
-	it.runIf(built)("carries exactly ONE require banner (bundle is idempotent)", () => {
-		// The banner line mentions __pilensCreateRequire twice (import alias +
-		// call). A doubled banner — the pre-guard artifact of running
-		// `bundle:dist` standalone on an already-bundled entry — would show 4 and
-		// fail to load ("Identifier ... has already been declared").
-		const count = src.match(/__pilensCreateRequire/g)?.length ?? 0;
-		expect(count).toBe(2);
-	});
+	it.runIf(built)(
+		"carries exactly ONE require banner (bundle is idempotent)",
+		() => {
+			// The banner line mentions __pilensCreateRequire twice (import alias +
+			// call). A doubled banner — the pre-guard artifact of running
+			// `bundle:dist` standalone on an already-bundled entry — would show 4 and
+			// fail to load ("Identifier ... has already been declared").
+			const count = src.match(/__pilensCreateRequire/g)?.length ?? 0;
+			expect(count).toBe(2);
+		},
+	);
 
 	it.runIf(built)("keeps host-provided packages external", () => {
-		for (const dep of ["typebox", "@earendil-works/pi-tui"]) {
+		// Derived from the same list bundle-dist.mjs uses (#1926), so the bundle
+		// contract and the dependency contract cannot drift apart. Only the ones
+		// the entry actually imports are asserted; pi-coding-agent is types-only.
+		const imported = HOST_PROVIDED_PACKAGES.filter((dep) =>
+			src.includes(`"${dep}"`),
+		);
+		expect(imported.length).toBeGreaterThan(0);
+		for (const dep of imported) {
 			expect(
 				src.includes(`from "${dep}"`),
 				`${dep} must stay an external import`,

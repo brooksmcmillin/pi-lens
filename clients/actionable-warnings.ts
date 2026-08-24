@@ -3,6 +3,11 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { CacheManager, ModifiedRange } from "./cache-manager.js";
 import type { Diagnostic } from "./dispatch/types.js";
+import {
+	hashText,
+	normalizeMessage,
+	stableFindingId,
+} from "./finding-identity.js";
 import type { LSPCodeAction, LSPDiagnostic } from "./lsp/client.js";
 import { applyWorkspaceEdit } from "./lsp/edits.js";
 import { getLSPService } from "./lsp/index.js";
@@ -44,6 +49,24 @@ export interface ActionableWarningRecord {
 	actions: ActionableWarningAction[];
 	suppressed: boolean;
 	suppressionReason?: string;
+	/** #1816 migration-only, internal to `actionable-warnings.ts`'s own
+	 * suppression-store bookkeeping — not for display. The id this warning
+	 * would have hashed to under the pre-#1816 formula (raw `relativeFile`,
+	 * 10-char hash), computed ONCE by `suppressionFor` at record-construction
+	 * time and carried here (AGENTS.md shape 5: an enumerable field survives
+	 * `mergeWarnings`' spread copies; a WeakMap keyed on object identity would
+	 * not, since merging allocates new record objects). `updateWarningState`
+	 * reads this field directly and never re-derives a legacy id from
+	 * `rule`/`tool`/`source`/`code` — those diverge from the id-construction
+	 * args for LSP-origin records (`recordFromLspDiagnostic` passes no `rule`
+	 * into `createActionableWarningId`, then sets `rule` afterward to
+	 * `${source}:${code}` for display), so re-deriving would silently compute
+	 * the wrong legacy id and bifurcate the store. Optional only because a
+	 * handful of test/consumer sites construct a synthetic
+	 * `ActionableWarningRecord` outside this module's own constructors and
+	 * have no real pre-#1816 id to carry; `writeActionableWarningsReport`'s
+	 * caller strips this field before persisting the report. */
+	legacyId?: string;
 	origin: "dispatch" | "lsp" | "merged";
 }
 
@@ -69,6 +92,25 @@ export interface ActionableWarningsReport {
 		files: number;
 		actions: number;
 		autoFixEligible: number;
+		/**
+		 * Unsuppressed warnings split by tier (#1777). The dispatch path now
+		 * preserves a rule's declared severity, so a hint-tier style opinion is
+		 * countable instead of arriving indistinguishable from a real warning.
+		 *
+		 * OPTIONAL on purpose: this report is persisted to
+		 * `.pi-lens/cache/actionable-warnings.json` and read back by
+		 * `clients/runtime-agent-end.ts` and `tools/lens-diagnostics.ts`, which
+		 * can find a file written by a pi-lens build that predates the field.
+		 * Every reader must tolerate its absence.
+		 *
+		 * No `error` tier here (#1799): `recordFromDispatchDiagnostic` (above)
+		 * routes `severity === "error"` to the blocking path and never admits it
+		 * into `warnings`, so an error-tier count is always 0 and never rendered.
+		 * A reader built against an old cache file that still carries `error` is
+		 * unaffected — the field is simply absent from the parsed object now,
+		 * and nothing here reads it.
+		 */
+		byTier?: { warning: number; info: number; hint: number };
 	};
 }
 
@@ -94,19 +136,13 @@ export function _setBeforeWarningStateLockForTests(
 	beforeWarningStateLockForTests = hook;
 }
 
-function normalizeMessage(message: string): string {
-	return message.replace(/\s+/g, " ").trim().toLowerCase();
-}
-
-function hashText(value: string, length = 10): string {
-	return createHash("sha256").update(value).digest("hex").slice(0, length);
-}
-
-function relativeFile(filePath: string, cwd: string): string {
-	const rel = path.relative(cwd, filePath).replace(/\\/g, "/");
-	return rel && !rel.startsWith("..") ? rel : normalizeMapKey(filePath);
-}
-
+/** #1816: was a local `relativeFile|tool|source|code|rule|normalizedMessage|
+ * line` hash, hand-rolled independently of `diagnostic-dispositions.ts`'s
+ * canonicalizing version — this is now the shared `finding-identity.js`
+ * builder (which DOES canonicalize both `cwd` and `filePath` through
+ * `normalizeMapKey` before relativizing, and hashes to 12 chars, matching
+ * dispositions). See `legacyActionableWarningId` below for the pre-#1816
+ * formula, kept only for on-disk suppression-store migration. */
 export function createActionableWarningId(args: {
 	cwd: string;
 	filePath: string;
@@ -117,8 +153,50 @@ export function createActionableWarningId(args: {
 	message: string;
 	line?: number;
 }): string {
+	return stableFindingId("aw:", {
+		cwd: args.cwd,
+		filePath: args.filePath,
+		parts: [
+			args.tool,
+			args.source,
+			args.code,
+			args.rule,
+			normalizeMessage(args.message),
+			args.line,
+		],
+	});
+}
+
+/** PRE-#1816 id formula (raw, non-canonicalized `relativeFile`; 10-char
+ * hash). `actionable-warning-state.json` is a keyed, persisted store — a
+ * warning suppressed under the old formula must not silently reappear as
+ * unsuppressed just because this module unified onto the canonical,
+ * 12-char id. `suppressionFor`/`updateWarningState` use this ONLY to look up
+ * and migrate a still-pending old entry forward; nothing ever WRITES under
+ * this id. Do not canonicalize this function — that would make it identical
+ * to `createActionableWarningId` and silently defeat the migration lookup
+ * for every path that actually needed canonicalizing (the #533 class this
+ * whole item exists to fix). Review-round F3 (#1816): this guard is only
+ * provable under a MIS-CASED path fixture — a fixture whose raw and
+ * canonical forms coincide (a bare mkdtempSync path) makes canonicalizing
+ * this function a no-op, so the regression test must seed under a mis-cased
+ * segment (see `actionable-warnings.test.ts`'s migration describe block) or
+ * the guard passes vacuously either way. */
+function legacyActionableWarningId(args: {
+	cwd: string;
+	filePath: string;
+	tool?: string;
+	source?: string;
+	code?: string | number;
+	rule?: string;
+	message: string;
+	line?: number;
+}): string {
+	const rel = path.relative(args.cwd, args.filePath).replace(/\\/g, "/");
+	const legacyRelativeFile =
+		rel && !rel.startsWith("..") ? rel : normalizeMapKey(args.filePath);
 	const parts = [
-		relativeFile(args.filePath, args.cwd),
+		legacyRelativeFile,
 		args.tool ?? "",
 		args.source ?? "",
 		String(args.code ?? ""),
@@ -126,7 +204,7 @@ export function createActionableWarningId(args: {
 		normalizeMessage(args.message),
 		String(args.line ?? ""),
 	];
-	return `aw:${hashText(parts.join("|"))}`;
+	return `aw:${hashText(parts.join("|"), 10)}`;
 }
 
 function actionSafety(action: LSPCodeAction): {
@@ -201,7 +279,29 @@ function updateWarningState(
 			const now = new Date().toISOString();
 			state.warnings ??= {};
 			for (const warning of warnings) {
-				const existing = state.warnings[warning.id] ?? {};
+				// #1816 migration: this warning may still be recorded under the
+				// pre-#1816 id (raw relativeFile, 10-char hash) from before this
+				// store unified onto the canonical id. Fold that entry forward
+				// onto the current id and drop the stale key, so a warning
+				// suppressed before the migration stays suppressed, and repeated
+				// re-encounters converge the store onto one id per warning
+				// instead of accumulating both forever.
+				//
+				// Review-round F1: this MUST read `warning.legacyId` — the value
+				// `suppressionFor` already computed from the exact identity args
+				// used at lookup time — and must NEVER re-derive a legacy id from
+				// `warning.rule`/`tool`/`source`/`code`. Those fields hold
+				// DISPLAY values that diverge from the id-construction args for
+				// LSP-origin records (see `ActionableWarningRecord.legacyId`'s
+				// doc comment), so a re-derivation here would compute a
+				// different legacy id than the one `suppressionFor` checked,
+				// permanently bifurcating the store.
+				const legacyId = warning.legacyId;
+				const legacyEntry =
+					legacyId && legacyId !== warning.id
+						? state.warnings[legacyId]
+						: undefined;
+				const existing = state.warnings[warning.id] ?? legacyEntry ?? {};
 				state.warnings[warning.id] = {
 					...existing,
 					status: existing.status ?? "active",
@@ -209,6 +309,7 @@ function updateWarningState(
 					lastSeenAt: now,
 					seenCount: (existing.seenCount ?? 0) + 1,
 				};
+				if (legacyEntry && legacyId) delete state.warnings[legacyId];
 			}
 			return state;
 		},
@@ -225,14 +326,44 @@ function updateWarningState(
 	});
 }
 
+/** Looks up suppression under the current id, falling back to the pre-#1816
+ * id (see `legacyActionableWarningId`) so a warning suppressed before this
+ * migration doesn't silently reappear as unsuppressed. `args` is the exact
+ * identity shape both id builders take.
+ *
+ * Also RETURNS the `legacyId` it computed (review-round F1, #1816): the
+ * caller carries it onto the record's `legacyId` field so
+ * `updateWarningState` can migrate the SAME legacy id this lookup used,
+ * instead of re-deriving one from the record's own `rule`/`tool`/`source`/
+ * `code` fields later. Re-deriving is unsound for LSP-origin records —
+ * `recordFromLspDiagnostic` passes no `rule` into this function (LSP
+ * diagnostics don't have one), then sets `record.rule` afterward to
+ * `${source}:${code}` purely for display. Recomputing from that display
+ * value would silently compute a DIFFERENT legacy id than the one actually
+ * checked here, permanently bifurcating the store: a suppression written
+ * this turn under the current id would never be found again next turn. */
 function suppressionFor(
 	cwd: string,
 	id: string,
-): { suppressed: boolean; reason?: string } {
-	const entry = readSuppressionState(cwd).warnings?.[id];
+	args: {
+		filePath: string;
+		tool?: string;
+		source?: string;
+		code?: string | number;
+		rule?: string;
+		message: string;
+		line?: number;
+	},
+): { suppressed: boolean; reason?: string; legacyId: string } {
+	const state = readSuppressionState(cwd);
+	const legacyId = legacyActionableWarningId({ cwd, ...args });
+	const entry =
+		state.warnings?.[id] ??
+		(legacyId !== id ? state.warnings?.[legacyId] : undefined);
 	return {
 		suppressed: entry?.status === "suppressed",
 		reason: entry?.reason,
+		legacyId,
 	};
 }
 
@@ -240,27 +371,33 @@ export function recordFromDispatchDiagnostic(
 	diagnostic: Diagnostic,
 	cwd: string,
 ): ActionableWarningRecord | undefined {
-	if (diagnostic.semantic !== "warning" || diagnostic.severity !== "warning")
-		return undefined;
+	if (diagnostic.semantic !== "warning") return undefined;
+	// #1777: the old gate demanded `severity === "warning"` exactly, which was
+	// invisible while the ast-grep runner collapsed every non-error tier to
+	// "warning". Now that hint and info survive the dispatch path, admit them:
+	// a fix is a fix, and the tier governs how loudly a finding renders, not
+	// whether its fix is worth offering. `error` still routes to the blocking
+	// path, so it stays out even when a runner leaves `semantic` at "warning".
+	if (diagnostic.severity === "error") return undefined;
 	if (!diagnostic.fixable && !diagnostic.fixSuggestion) return undefined;
 	const filePath = path.resolve(cwd, diagnostic.filePath);
-	const id = createActionableWarningId({
-		cwd,
+	const identityArgs = {
 		filePath,
 		tool: diagnostic.tool,
 		code: diagnostic.code,
 		rule: diagnostic.rule,
 		message: diagnostic.message,
 		line: diagnostic.line,
-	});
-	const suppression = suppressionFor(cwd, id);
+	};
+	const id = createActionableWarningId({ cwd, ...identityArgs });
+	const suppression = suppressionFor(cwd, id, identityArgs);
 	return {
 		id,
 		filePath,
 		displayPath: toRunnerDisplayPath(cwd, filePath),
 		line: diagnostic.line,
 		column: diagnostic.column,
-		severity: "warning",
+		severity: diagnostic.severity,
 		tool: diagnostic.tool,
 		code: diagnostic.code,
 		rule: diagnostic.rule,
@@ -271,6 +408,7 @@ export function recordFromDispatchDiagnostic(
 		actions: [],
 		suppressed: suppression.suppressed,
 		suppressionReason: suppression.reason,
+		legacyId: suppression.legacyId,
 		origin: "dispatch",
 	};
 }
@@ -295,16 +433,16 @@ function recordFromLspDiagnostic(
 	const column = diag.range.start.character + 1;
 	const source = diag.source ?? "lsp";
 	const code = diag.code === undefined ? undefined : String(diag.code);
-	const id = createActionableWarningId({
-		cwd,
+	const identityArgs = {
 		filePath,
 		tool: "lsp",
 		source,
 		code,
 		message: diag.message,
 		line,
-	});
-	const suppression = suppressionFor(cwd, id);
+	};
+	const id = createActionableWarningId({ cwd, ...identityArgs });
+	const suppression = suppressionFor(cwd, id, identityArgs);
 	return {
 		id,
 		filePath,
@@ -320,6 +458,7 @@ function recordFromLspDiagnostic(
 		actions: [],
 		suppressed: suppression.suppressed,
 		suppressionReason: suppression.reason,
+		legacyId: suppression.legacyId,
 		origin: "lsp",
 	};
 }
@@ -489,8 +628,13 @@ export async function buildActionableWarningsReport(args: {
 
 	const merged = mergeWarnings(records);
 	updateWarningState(cwd, merged);
+	// legacyId is #1816 migration bookkeeping for updateWarningState above —
+	// strip it before the report leaves this function, so it never lands in
+	// the `.pi-lens/cache/actionable-warnings.json` cache file or any
+	// agent-facing rendering of a warning record.
+	const reportWarnings = merged.map(({ legacyId: _legacyId, ...rest }) => rest);
 	const byFile = new Map<string, ActionableWarningRecord[]>();
-	for (const warning of merged) {
+	for (const warning of reportWarnings) {
 		const arr = byFile.get(warning.filePath) ?? [];
 		arr.push(warning);
 		byFile.set(warning.filePath, arr);
@@ -502,9 +646,17 @@ export async function buildActionableWarningsReport(args: {
 		warnings,
 	}));
 	const allActions = merged.flatMap((warning) => warning.actions);
+	const unsuppressed = merged.filter((warning) => !warning.suppressed);
+	const countTier = (tier: ActionableWarningRecord["severity"]): number =>
+		unsuppressed.filter((warning) => warning.severity === tier).length;
 	const summary = {
 		warnings: merged.length,
-		unsuppressed: merged.filter((warning) => !warning.suppressed).length,
+		unsuppressed: unsuppressed.length,
+		byTier: {
+			warning: countTier("warning"),
+			info: countTier("info"),
+			hint: countTier("hint"),
+		},
 		suppressed: merged.filter((warning) => warning.suppressed).length,
 		files: files.length,
 		actions: allActions.length,
@@ -714,7 +866,8 @@ export async function applyConservativeActionableWarningFixes(args: {
 		skipped: [],
 	};
 	const changedFiles = new Set<string>();
-	const appliedResults: Array<Awaited<ReturnType<typeof applyWorkspaceEdit>>> = [];
+	const appliedResults: Array<Awaited<ReturnType<typeof applyWorkspaceEdit>>> =
+		[];
 	let failedCount = 0;
 	const lspService = getLSPService();
 	const maxFixes = Math.max(0, args.maxFixes ?? 5);
@@ -776,7 +929,12 @@ export async function applyConservativeActionableWarningFixes(args: {
 					edit,
 					args.cwd,
 					args.mutationContext
-						? { mutationContext: { ...args.mutationContext, emitSummary: false } }
+						? {
+								mutationContext: {
+									...args.mutationContext,
+									emitSummary: false,
+								},
+							}
 						: undefined,
 				);
 				appliedResults.push(applied);
@@ -784,11 +942,17 @@ export async function applyConservativeActionableWarningFixes(args: {
 				summary.applied++;
 			} catch (err) {
 				failedCount++;
-				const partial = (err as { appliedWorkspaceEdit?: Awaited<ReturnType<typeof applyWorkspaceEdit>> })
-					.appliedWorkspaceEdit;
+				const partial = (
+					err as {
+						appliedWorkspaceEdit?: Awaited<
+							ReturnType<typeof applyWorkspaceEdit>
+						>;
+					}
+				).appliedWorkspaceEdit;
 				if (partial) {
 					appliedResults.push(partial);
-					for (const changedFile of partial.files) changedFiles.add(changedFile);
+					for (const changedFile of partial.files)
+						changedFiles.add(changedFile);
 				}
 				const message = err instanceof Error ? err.message : String(err);
 				args.dbg?.(
@@ -799,13 +963,21 @@ export async function applyConservativeActionableWarningFixes(args: {
 		}
 	}
 	summary.changedFiles = [...changedFiles];
-	if (args.mutationContext && (summary.considered > 0 || appliedResults.length > 0)) {
+	if (
+		args.mutationContext &&
+		(summary.considered > 0 || appliedResults.length > 0)
+	) {
 		recordLspMutationBatch(args.mutationContext, {
 			results: appliedResults,
 			considered: summary.considered,
 			completed: summary.applied,
 			failedCount,
-			status: failedCount > 0 ? "failed" : appliedResults.length > 0 ? "success" : "skipped",
+			status:
+				failedCount > 0
+					? "failed"
+					: appliedResults.length > 0
+						? "success"
+						: "skipped",
 			bookkeep: false,
 		});
 	}
@@ -832,8 +1004,18 @@ export function formatActionableWarningsAdvisory(
 		report.summary.autoFixEligible > 0
 			? ` ${report.summary.autoFixEligible} appear to have conservative preferred quickfixes.`
 			: "";
+	// #1777: hint and info are style opinions, so say how much of the count is
+	// opinion. The line appears only when a quiet tier is actually present —
+	// an all-warning turn already says everything in the count above.
+	const byTier = report.summary.byTier;
+	const quiet = byTier ? byTier.hint + byTier.info : 0;
+	const tierLine =
+		quiet > 0
+			? `${quiet} of those are hint/info tier — style opinions, worth fixing only while you are already in that code.`
+			: undefined;
 	return [
 		`🟡 Fixable warnings introduced this turn: ${report.summary.unsuppressed}.${safe}`,
+		tierLine,
 		`Details written to .pi-lens/cache/actionable-warnings.json`,
 		fileList ? `Files:\n${fileList}${more}` : undefined,
 		"If continuing in these files, read that JSON and resolve warnings that are safe and relevant. Do not apply broad refactors unless requested.",

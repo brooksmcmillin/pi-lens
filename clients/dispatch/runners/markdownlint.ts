@@ -14,8 +14,20 @@ import {
 	createAvailabilityChecker,
 	resolveToolCommandWithInstallFallback,
 } from "./utils/runner-helpers.js";
+import type { ToolExitCodes } from "./utils/spawn-outcome.js";
+import { parseToolRun } from "./utils/tool-failure.js";
+import {
+	isInSpawnTimeoutCooldown,
+	noteSpawnTimeout,
+} from "../../spawn-timeout-cooldown.js";
+import { finishParsedRun } from "./utils/tool-failure.js";
 
 const markdownlint = createAvailabilityChecker("markdownlint-cli2", ".cmd");
+
+// markdownlint-cli2 exit codes (its README's "Exit Codes" section): 0 = no
+// findings, 1 = lint findings, 2 = unexpected error (unreadable config, bad
+// glob, crash). Only 2 is a rejected invocation.
+const MARKDOWNLINT_EXIT_CODES: ToolExitCodes = { ran: [1] };
 
 // markdownlint-cli2 text output does not include per-violation fixability,
 // so we keep a static allowlist of MD### rules whose --fix is deterministic.
@@ -110,13 +122,23 @@ const markdownlintRunner: RunnerDefinition = {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 		let cmd: string | null = null;
-		if (await (markdownlint.isAvailableAsync(cwd))) {
+		if (await markdownlint.isAvailableAsync(cwd)) {
 			cmd = markdownlint.getCommand(cwd);
 		} else {
 			cmd = await resolveToolCommandWithInstallFallback(cwd, "markdownlint");
 		}
 
 		if (!cmd) return { status: "skipped", diagnostics: [], semantic: "none" };
+
+		// #1995: a command cooling down after a spawn timeout already consumed
+		// its budget in another lane (availability verify, autofix --fix). Skip
+		// without spawning — "not checked", never re-reported as clean.
+		if (isInSpawnTimeoutCooldown(cmd)) {
+			ctx.log(
+				`markdownlint: ${cmd} is cooling down after a spawn timeout — skipping (one bounded failure budget per edit)`,
+			);
+			return { status: "skipped", diagnostics: [], semantic: "none" };
+		}
 
 		// Shared config-args seam (#1247): the autofix path consumes the same
 		// builder, so the package-owned fallback config can never drift.
@@ -126,13 +148,41 @@ const markdownlintRunner: RunnerDefinition = {
 			cwd,
 		});
 
-		const raw = `${result.stdout ?? ""}${result.stderr ?? ""}`;
-		const diagnostics = parseMarkdownlintOutput(raw, ctx.filePath);
-		if (diagnostics.length === 0) {
-			return { status: "succeeded", diagnostics: [], semantic: "none" };
+		// #1995: a timeout is negative runtime evidence. Arm the cooldown so
+		// the autofix and availability lanes cannot hand this command a second
+		// budget within the same session.
+		if (result.failure === "timeout") {
+			noteSpawnTimeout({
+				tool: "markdownlint",
+				command: cmd,
+				phase: "lint",
+				durationMs: 15000,
+				teardown: result.timeoutTeardown,
+			});
 		}
 
-		return { status: "succeeded", diagnostics, semantic: "warning" };
+		// #1816: this runner read `result.status` zero times, so an exit-2
+		// config error with an empty stdout parsed to zero diagnostics and was
+		// reported as a clean Markdown file. An empty result must distinguish
+		// clean from errored.
+		const raw = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+		// #1948: one seam for both gates — the tool produced nothing, and the
+		// tool produced something the parser could not read.
+		const run = parseToolRun(
+			"markdownlint",
+			{ result, output: raw, exitCodes: MARKDOWNLINT_EXIT_CODES },
+			(out) => parseMarkdownlintOutput(out, ctx.filePath),
+		);
+		if (run.skipped) return run.skipped;
+
+		const diagnostics = run.diagnostics;
+		return finishParsedRun({
+			tool: "markdownlint",
+			ctx,
+			result,
+			diagnostics,
+			classify: () => ({ status: "succeeded", semantic: "warning" }),
+		});
 	},
 };
 

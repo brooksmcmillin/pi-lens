@@ -115,4 +115,33 @@ describe("BiomeClient — per-cwd binary resolution (#121)", () => {
 		).getBiomeBinary(pkgA);
 		expect(resolveAgain.cmd).toBe(aBin);
 	});
+
+	// #1731 discipline B: `getBiomeBinary` returned `autoInstalledBinaryPath`
+	// (set once, session-wide, the first time ANY cwd auto-installs biome)
+	// before it ever looked at THIS cwd's own node_modules/.bin/biome. Once one
+	// project in the session triggered an auto-install, every other project's
+	// own biome install stopped mattering.
+	it("prefers this cwd's own biome over a managed binary auto-installed for a different cwd", async () => {
+		const { subPackageRoot, subBiomeBin } = setupMonorepo();
+
+		const client = new BiomeClient();
+		// Simulate what `doEnsureAvailable()` sets after auto-installing for some
+		// EARLIER cwd this session — a real absolute path, unrelated to
+		// `subPackageRoot`.
+		(
+			client as unknown as { autoInstalledBinaryPath: string | null }
+		).autoInstalledBinaryPath = path.join(
+			os.tmpdir(),
+			"pi-lens-managed-biome",
+			"biome",
+		);
+
+		const resolved = await (
+			client as unknown as {
+				getBiomeBinary(cwd?: string): Promise<{ cmd: string }>;
+			}
+		).getBiomeBinary(subPackageRoot);
+
+		expect(resolved.cmd).toBe(subBiomeBin);
+	});
 });

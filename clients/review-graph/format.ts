@@ -3,7 +3,11 @@ import type { ImpactCascadeResult } from "./types.js";
 
 const MAX_SYMBOLS = 5;
 
-function displayList(items: string[], maxFiles: number, map?: (item: string) => string): string[] {
+function displayList(
+	items: string[],
+	maxFiles: number,
+	map?: (item: string) => string,
+): string[] {
 	return items.slice(0, maxFiles).map((item) => (map ? map(item) : item));
 }
 

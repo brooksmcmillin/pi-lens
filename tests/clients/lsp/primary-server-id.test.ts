@@ -16,8 +16,9 @@ import {
  * all — so `lsp_diagnostics` sees no behavior change from the move.
  */
 function oldInlinePrimaryServerId(filePath: string): string | undefined {
-	return getServersForFileWithConfig(filePath).find((s) => s.role !== "auxiliary")
-		?.id;
+	return getServersForFileWithConfig(filePath).find(
+		(s) => s.role !== "auxiliary",
+	)?.id;
 }
 
 describe("primaryServerId (clients/lsp/config.ts)", () => {

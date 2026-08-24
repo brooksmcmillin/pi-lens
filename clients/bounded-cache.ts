@@ -13,7 +13,9 @@ export class BoundedLruCache<K, V> {
 		return value;
 	}
 
-	has(key: K): boolean { return this.entries.has(key); }
+	has(key: K): boolean {
+		return this.entries.has(key);
+	}
 
 	set(key: K, value: V): void {
 		this.entries.delete(key);
@@ -25,11 +27,25 @@ export class BoundedLruCache<K, V> {
 		}
 	}
 
-	delete(key: K): boolean { return this.entries.delete(key); }
-	clear(): void { this.entries.clear(); }
-	get size(): number { return this.entries.size; }
-	keys(): IterableIterator<K> { return this.entries.keys(); }
-	values(): IterableIterator<V> { return this.entries.values(); }
-	entriesArray(): Array<[K, V]> { return [...this.entries.entries()]; }
-	[Symbol.iterator](): IterableIterator<[K, V]> { return this.entries[Symbol.iterator](); }
+	delete(key: K): boolean {
+		return this.entries.delete(key);
+	}
+	clear(): void {
+		this.entries.clear();
+	}
+	get size(): number {
+		return this.entries.size;
+	}
+	keys(): IterableIterator<K> {
+		return this.entries.keys();
+	}
+	values(): IterableIterator<V> {
+		return this.entries.values();
+	}
+	entriesArray(): Array<[K, V]> {
+		return [...this.entries.entries()];
+	}
+	[Symbol.iterator](): IterableIterator<[K, V]> {
+		return this.entries[Symbol.iterator]();
+	}
 }

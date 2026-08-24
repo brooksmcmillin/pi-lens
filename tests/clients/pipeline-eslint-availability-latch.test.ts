@@ -13,7 +13,7 @@ import { setupTestEnvironment } from "./test-utils.js";
 import {
 	HOST_STALL_COOLDOWN_MS,
 	TRANSIENT_BASE_COOLDOWN_MS,
-} from "../../clients/dispatch/runners/utils/availability-policy.ts";
+} from "../../clients/dispatch/runners/utils/availability-policy.js";
 
 const { safeSpawnAsync, logLatencySpy } = vi.hoisted(() => ({
 	safeSpawnAsync: vi.fn(),
@@ -70,7 +70,13 @@ describe("eslint autofix availability latch (#1494)", () => {
 	}
 
 	const fix = () =>
-		runAutofix(filePath, env.tmpDir, () => undefined, () => {}, deps() as never);
+		runAutofix(
+			filePath,
+			env.tmpDir,
+			() => undefined,
+			() => {},
+			deps() as never,
+		);
 
 	const versionCalls = () =>
 		safeSpawnAsync.mock.calls.filter((call) =>

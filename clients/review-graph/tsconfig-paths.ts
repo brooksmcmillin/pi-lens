@@ -37,7 +37,7 @@ const cache = new BoundedLruCache<string, TsconfigPathMatcher[]>(64);
 const referencesCache = new BoundedLruCache<string, Map<string, string>>(64);
 
 /** Strip JSONC comments and trailing commas without touching string contents. */
-function parseJsonc(content: string): unknown {
+function parseJsonc(content: string): TsconfigJson {
 	let output = "";
 	let inString = false;
 	let escaped = false;
@@ -69,7 +69,7 @@ function parseJsonc(content: string): unknown {
 			output += char;
 		}
 	}
-	return JSON.parse(output.replace(/,\s*([}\]])/g, "$1"));
+	return JSON.parse(output.replace(/,\s*([}\]])/g, "$1")) as TsconfigJson;
 }
 
 function configSignature(configPath: string): string {
@@ -89,7 +89,7 @@ function configDependencyPaths(configPath: string): string[] {
 		paths.add(normalized);
 		let json: TsconfigJson;
 		try {
-			json = parseJsonc(fs.readFileSync(normalized, "utf8")) as TsconfigJson;
+			json = parseJsonc(fs.readFileSync(normalized, "utf8"));
 		} catch {
 			return;
 		}
@@ -143,7 +143,7 @@ function readConfig(
 	const baseUrl =
 		typeof options?.baseUrl === "string"
 			? path.resolve(path.dirname(normalized), options.baseUrl)
-			: inherited?.baseUrl ?? path.dirname(normalized);
+			: (inherited?.baseUrl ?? path.dirname(normalized));
 	const paths =
 		options?.paths && typeof options.paths === "object"
 			? Object.fromEntries(
@@ -173,7 +173,10 @@ function readConfig(
 	return { baseUrl, paths, rootDir, include, references };
 }
 
-function resolveReferenceConfig(configPath: string, value: string): string | undefined {
+function resolveReferenceConfig(
+	configPath: string,
+	value: string,
+): string | undefined {
 	const target = path.resolve(path.dirname(configPath), value);
 	try {
 		if (fs.statSync(target).isDirectory()) {
@@ -195,7 +198,10 @@ function includeRoot(configDir: string, pattern: string): string | undefined {
 	return path.extname(resolved) ? path.dirname(resolved) : resolved;
 }
 
-function firstSourceEntry(configPath: string, parsed: ParsedConfig): string | undefined {
+function firstSourceEntry(
+	configPath: string,
+	parsed: ParsedConfig,
+): string | undefined {
 	const configDir = path.dirname(configPath);
 	const roots = [
 		...(parsed.rootDir ? [parsed.rootDir] : []),
@@ -327,7 +333,9 @@ export function referencedProjectImportTarget(
 ): string | undefined {
 	const normalizedImporterDir = path.resolve(importerDir);
 	const governingDir = findGoverningTsconfigDir(normalizedImporterDir);
-	const governingPath = governingDir ? path.join(governingDir, "tsconfig.json") : "";
+	const governingPath = governingDir
+		? path.join(governingDir, "tsconfig.json")
+		: "";
 	const key = `${normalizedImporterDir}|${governingPath}|${governingPath ? dependencySignature(governingPath) : "missing"}`;
 	let projects = referencesCache.get(key);
 	if (!projects) {

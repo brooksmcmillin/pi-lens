@@ -29,7 +29,10 @@ vi.mock("../../clients/file-time.js", () => ({
 	}),
 }));
 
-function rec(filePath: string, overrides: Partial<ReadRecord> = {}): ReadRecord {
+function rec(
+	filePath: string,
+	overrides: Partial<ReadRecord> = {},
+): ReadRecord {
 	return {
 		filePath,
 		requestedOffset: 1,

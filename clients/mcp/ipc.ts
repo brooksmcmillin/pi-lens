@@ -161,10 +161,10 @@ type WarmIpcOutcome<TResponse> =
  * uniformly to timeout/ipc-error. One transport, N routes — the clients cannot
  * drift apart.
  */
-function requestOverWarmIpc<TResponse>(
+function requestOverWarmIpc<TResponse, TRequest extends object = object>(
 	endpoint: string,
 	timeoutMs: number,
-	buildRequest: (deadlineAt: number) => unknown,
+	buildRequest: (deadlineAt: number) => TRequest,
 	validate: (
 		result: TResponse,
 		deadlineAt: number,

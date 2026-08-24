@@ -59,13 +59,9 @@ function run(
 	params: Record<string, unknown>,
 	cwd = "/proj",
 ): Promise<ToolOut> {
-	return tool.execute(
-		"1",
-		params as never,
-		undefined,
-		null,
-		{ cwd },
-	) as Promise<ToolOut>;
+	return tool.execute("1", params as never, undefined, null, {
+		cwd,
+	}) as Promise<ToolOut>;
 }
 
 function parse(text: string) {
@@ -86,7 +82,9 @@ function parse(text: string) {
 
 describe("ast_grep_outline tool", () => {
 	it("registers as ast_grep_outline", () => {
-		expect(createAstGrepOutlineTool(makeClient()).name).toBe("ast_grep_outline");
+		expect(createAstGrepOutlineTool(makeClient()).name).toBe(
+			"ast_grep_outline",
+		);
 	});
 
 	it("requires at least one path", async () => {
@@ -101,15 +99,15 @@ describe("ast_grep_outline tool", () => {
 		const outline = vi.fn().mockResolvedValue({ output: [] });
 		const tool = createAstGrepOutlineTool(makeClient({ outline }));
 		await run(tool, {
-				paths: ["src/a.ts"],
-				lang: "typescript",
-				items: "all",
-				view: "expanded",
-				type: ["class", "function"],
-				match: "Svc",
-				pubMembers: true,
-				globs: ["*.ts"],
-			});
+			paths: ["src/a.ts"],
+			lang: "typescript",
+			items: "all",
+			view: "expanded",
+			type: ["class", "function"],
+			match: "Svc",
+			pubMembers: true,
+			globs: ["*.ts"],
+		});
 		const [paths, options] = outline.mock.calls[0];
 		// Resolved against cwd to an absolute path (drive-prefixed on Windows).
 		expect(paths[0].replace(/\\/g, "/")).toMatch(/\/proj\/src\/a\.ts$/);

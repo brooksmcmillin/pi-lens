@@ -2,7 +2,10 @@
  * Inline agent nudge for out-of-view file mutations (#485).
  *
  * Autofixes applied DURING a tool call surface in that tool's result — the
- * agent sees those today. Everything that lands AFTER the tool result
+ * agent sees those today, and since #1464 the paths whose post-fix bytes
+ * actually rode along in that result are dropped from the nudge rather than
+ * told to re-read what they already hold (`noteAuthoritativeContentAttachment`
+ * below). Everything that lands AFTER the tool result
  * (deferred-cascade autofixes settling at turn_end, quiet-window work (#483),
  * and — later — writes by other extensions once pi-lens consumes bus events)
  * is invisible to the model. This module closes that gap: it subscribes to
@@ -76,6 +79,15 @@ interface AccumulatedFile {
 	displayPath: string;
 	reasons: Set<FilesTouchedPayload["reason"]>;
 	origin: AccumulatedFileOrigin;
+	/**
+	 * #1464: the write that produced this touch also handed the agent the full
+	 * post-fix bytes in its OWN tool result, so a "re-read before editing"
+	 * nudge would be telling the agent to re-fetch what it already holds. Set
+	 * by `noteAuthoritativeContentAttachment`; cleared by every later touch of
+	 * the same path, because the delivered bytes are stale the moment the file
+	 * changes again.
+	 */
+	contentDelivered: boolean;
 }
 
 // Module-level accumulator: one process/session, so a plain map keyed via
@@ -157,11 +169,16 @@ function recordTouchedEvent(
 			// recorded via the cross-process feed, now also reported by this
 			// session's own bus, upgrades to "local".
 			existing.origin = "local";
+			// #1464: a fresh touch invalidates any content already delivered for
+			// this path (the default deferred format at agent_end, a cascade
+			// autofix) — those bytes no longer describe the file.
+			existing.contentDelivered = false;
 		} else {
 			_touched.set(mapKey, {
 				displayPath: rawPath,
 				reasons: new Set([payload.reason]),
 				origin: "local",
+				contentDelivered: false,
 			});
 		}
 	}
@@ -202,19 +219,55 @@ export function recordCrossProcessTouches(
 			existing.reasons.add(entry.reason);
 			// "local" is sticky (see AccumulatedFileOrigin) — never downgrade an
 			// already-local entry back to cross-process.
+			// #1464: a foreign process touching this file invalidates whatever
+			// content this session's write path already delivered for it.
+			existing.contentDelivered = false;
 		} else {
 			_touched.set(mapKey, {
 				displayPath: entry.path,
 				reasons: new Set([entry.reason]),
 				origin: "cross-process",
+				contentDelivered: false,
 			});
 		}
 	}
 }
 
+/**
+ * Record the write path's authoritative-content attachment outcome for one
+ * path (#1464).
+ *
+ * `attached` is the SAME boolean that drove the attachment in
+ * `handleToolResult` (clients/runtime-tool-result.ts) — this module never
+ * re-derives it from config, byte counts, or the aggregate budget. `true`
+ * means the post-fix bytes went out in the write's own tool result and the
+ * agent already holds them, so "re-read before editing" is noise. `false` is
+ * the size cap and the per-command aggregate budget degrading an attachment
+ * to a re-read warning: there the nudge is the whole signal, and calling this
+ * with `false` re-arms a path an earlier per-file decision had suppressed
+ * (the bash multi-file case, where the outer budget loop overrides the inner
+ * per-file "attached").
+ *
+ * Marks an EXISTING accumulator entry only. `publishFilesTouched` fires
+ * synchronously inside the `runPipeline` call this decision belongs to (pi's
+ * event bus is a plain `EventEmitter`), so the entry is already there for any
+ * path the relevance filter admitted; a path with no entry has nothing to
+ * suppress. Deferred-edit autofix at `agent_end` never reaches here — it
+ * attaches nothing, so it keeps nudging.
+ */
+export function noteAuthoritativeContentAttachment(
+	filePath: string,
+	attached: boolean,
+): void {
+	const entry = _touched.get(normalizeMapKey(filePath));
+	if (entry) entry.contentDelivered = attached;
+}
+
 export interface WireAgentNudgeSubscriberArgs {
 	/** `pi.events` from the extension API, or undefined on older hosts. */
-	events: { on?: (channel: string, handler: (data: unknown) => void) => () => void } | undefined;
+	events:
+		| { on?: (channel: string, handler: (data: unknown) => void) => () => void }
+		| undefined;
 	/** Resolve the live ReadGuard lazily (session-scoped, created on first use). */
 	getReadGuard: () => ReadGuard | undefined;
 	dbg?: (msg: string) => void;
@@ -288,19 +341,31 @@ export function wireAgentNudgeSubscriber(
  * very first call of a fresh `agent_start` — so the accumulator surviving
  * across run boundaries is exactly what makes that cross-run delivery work.
  * Empty accumulator ⇒ returns undefined ⇒ zero bytes injected.
+ *
+ * #1464: paths whose post-fix content the write path already attached to its
+ * OWN tool result are dropped from the batch here (see
+ * `noteAuthoritativeContentAttachment`) — the agent holds those bytes, so
+ * "re-read before editing" would spend context to re-fetch what it has. A
+ * batch that is ENTIRELY such paths injects nothing.
  */
 export function consumeAgentNudge(
 	dbg?: (msg: string) => void,
 ): { messages: Array<{ role: "user"; content: string }> } | undefined {
-	const entries = Array.from(_touched.values());
+	const drained = Array.from(_touched.values());
 	_touched.clear();
 	const filesFiltered = _relevanceFilteredCount;
 	_relevanceFilteredCount = 0;
 
 	if (!isAgentNudgeEnabled()) return undefined;
-	if (entries.length === 0) return undefined;
+	if (drained.length === 0) return undefined;
 
 	try {
+		// #1464: a write whose post-fix bytes were attached to its own tool
+		// result already told the agent everything this nudge would. Drop those
+		// paths from the message but keep counting them, so over-suppression is
+		// visible in telemetry instead of only in the absence of complaints.
+		const entries = drained.filter((e) => !e.contentDelivered);
+		const filesContentDelivered = drained.length - entries.length;
 		const filesTotal = entries.length;
 		const shown = entries.slice(0, MAX_NAMES_SHOWN);
 		const remaining = filesTotal - shown.length;
@@ -331,17 +396,6 @@ export function consumeAgentNudge(
 		).length;
 		const localCount = filesTotal - crossProcessCount;
 
-		// Three-way attribution (see the function doc): never assign a local
-		// file to another instance — a mixed batch keeps the local base framing
-		// and calls out the cross-process portion by exact count.
-		const attribution =
-			localCount === 0
-				? "by an automatic run outside your turn"
-				: crossProcessCount === 0
-					? "after your last turn"
-					: `after your last turn (${crossProcessCount} of them by an automatic run outside it)`;
-		const message = `pi-lens: ${filesTotal} file(s) were ${verbLabel} ${attribution}: ${nameList} — working-tree changes to these are expected; re-read before editing.`;
-
 		logLatency({
 			type: "phase",
 			filePath: "<pi-lens>",
@@ -354,6 +408,10 @@ export function consumeAgentNudge(
 				// never read/edited) — NOT the display overflow, which is
 				// filesTotal - filesShown.
 				filesFiltered,
+				// #1464: drops because the write's own tool result already carried
+				// the post-fix bytes. A third, distinct count: these paths passed
+				// the relevance filter and were accumulated, then suppressed here.
+				filesContentDelivered,
 				reasonMix: Array.from(allReasons),
 				// #492: origin mix so cross-process pickup rate is observable
 				// alongside the existing relevance-filter metric.
@@ -361,6 +419,21 @@ export function consumeAgentNudge(
 				originCrossProcess: crossProcessCount,
 			},
 		});
+
+		// Everything drained was delivered in a write's own tool result — the
+		// row above records that it happened, and zero bytes get injected.
+		if (filesTotal === 0) return undefined;
+
+		// Three-way attribution (see the function doc): never assign a local
+		// file to another instance — a mixed batch keeps the local base framing
+		// and calls out the cross-process portion by exact count.
+		const attribution =
+			localCount === 0
+				? "by an automatic run outside your turn"
+				: crossProcessCount === 0
+					? "after your last turn"
+					: `after your last turn (${crossProcessCount} of them by an automatic run outside it)`;
+		const message = `pi-lens: ${filesTotal} file(s) were ${verbLabel} ${attribution}: ${nameList} — working-tree changes to these are expected; re-read before editing.`;
 
 		return {
 			messages: [

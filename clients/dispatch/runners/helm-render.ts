@@ -716,8 +716,13 @@ function coverageGap(
 /**
  * The Trivy half of the pass. Returns the findings it produced, or a single gap
  * diagnostic when it could not run — never an empty "clean" answer.
+ *
+ * Exported for a real-binary regression test (refs #1757) — this is the ONE
+ * seam that spawns `trivy config` for the rendered-manifest pass, so an
+ * integration test needs to call it directly rather than driving the whole
+ * chart-render pipeline (which additionally requires a real `helm` binary).
  */
-async function runIacPass(options: {
+export async function runIacPass(options: {
 	chartRoot: string;
 	cwd: string;
 	outputDir: string;
@@ -746,8 +751,15 @@ async function runIacPass(options: {
 		trivyCmd,
 		[
 			"config",
+			// `--quiet` alone suppresses both the progress bar and log output.
+			// `--no-progress` is NOT a `config` subcommand flag (unlike `fs`,
+			// which does accept it) — trivy 0.73.0 exits 1 with 7662 bytes of
+			// usage text on stdout ("FATAL unknown flag: --no-progress") when
+			// it's passed here, which the exit-status check below now catches,
+			// but the flag itself made every real invocation of this pass fail
+			// before it ever scanned a rendered manifest (refs #1757; verified
+			// against the real installed binary, not assumed).
 			"--quiet",
-			"--no-progress",
 			"--format",
 			"json",
 			"--severity",
@@ -1072,10 +1084,12 @@ const helmRenderRunner: RunnerDefinition = {
 
 		const existing = inFlightByChartRoot.get(chartRoot);
 		if (existing) return existing;
-		const promise = renderAndValidate(chartRoot, cwd, ctx.filePath).finally(() => {
-			if (inFlightByChartRoot.get(chartRoot) === promise)
-				inFlightByChartRoot.delete(chartRoot);
-		});
+		const promise = renderAndValidate(chartRoot, cwd, ctx.filePath).finally(
+			() => {
+				if (inFlightByChartRoot.get(chartRoot) === promise)
+					inFlightByChartRoot.delete(chartRoot);
+			},
+		);
 		inFlightByChartRoot.set(chartRoot, promise);
 		return promise;
 	},

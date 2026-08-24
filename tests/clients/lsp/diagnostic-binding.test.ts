@@ -116,8 +116,8 @@ describe("#1095 diagnostic-binding — createDiskBindingCache (I5, I6, I8)", () 
 	it("disk stat/read failure with a contentHash present → unknown, never false (T8, #533)", () => {
 		const cache = createDiskBindingCache();
 		const missing = path.join(os.tmpdir(), "pi-lens-does-not-exist-1095.ts");
-		expect(
-			cache.boundToCurrentDisk(missing, { contentHash: "deadbeef" }),
-		).toBe("unknown");
+		expect(cache.boundToCurrentDisk(missing, { contentHash: "deadbeef" })).toBe(
+			"unknown",
+		);
 	});
 });

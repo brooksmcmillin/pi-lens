@@ -1,10 +1,10 @@
-import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { CacheManager, ModifiedRange } from "./cache-manager.js";
 import type { Diagnostic } from "./dispatch/types.js";
 import { toRunnerDisplayPath } from "./dispatch/runner-context.js";
 import { getProjectDataDir } from "./file-utils.js";
+import { normalizeMessage, stableFindingId } from "./finding-identity.js";
 import { normalizeMapKey } from "./path-utils.js";
 
 export interface CodeQualityWarningRecord {
@@ -63,23 +63,48 @@ export interface CodeQualityWarningsReport {
 	summary: {
 		warnings: number;
 		files: number;
+		/**
+		 * Per-tier split of `warnings` (#1777). The dispatch path preserves a
+		 * rule's declared severity, so the quiet tiers are countable instead of
+		 * being folded into `warning`.
+		 *
+		 * OPTIONAL on purpose: this report is persisted to
+		 * `.pi-lens/cache/code-quality-warnings.json` and read back by
+		 * `tools/lens-diagnostics.ts`, which can find a file written by a
+		 * pi-lens build that predates the field. Readers must tolerate absence.
+		 */
+		byTier?: { warning: number; info: number; hint: number };
 		topRules: Array<{ rule: string; count: number }>;
 	};
 }
 
-function normalizeMessage(message: string): string {
-	return message.replace(/\s+/g, " ").trim().toLowerCase();
-}
+/**
+ * Report-budget precedence (#1777). A hint is an opinion; a warning is a
+ * finding. When the report is capped, warnings must be spent first, or an
+ * alphabetically-early file's hints can push every real warning out of the
+ * agent's view — the exact "hints dominate the stream" failure the hint tier
+ * exists to prevent.
+ */
+const TIER_BUDGET_ORDER: Array<CodeQualityWarningRecord["severity"]> = [
+	"warning",
+	"info",
+	"hint",
+];
 
-function hashText(value: string, length = 10): string {
-	return createHash("sha256").update(value).digest("hex").slice(0, length);
-}
-
-function relativeFile(filePath: string, cwd: string): string {
-	const rel = path.relative(cwd, filePath).replace(/\\/g, "/");
-	return rel && !rel.startsWith("..") ? rel : normalizeMapKey(filePath);
-}
-
+/** #1816: was a local `relativeFile|tool|rule|code|normalizedMessage|line`
+ * hash (raw, non-canonicalized `relativeFile`, 10-char hash), independently
+ * hand-rolled from `actionable-warnings.ts`'s twin and
+ * `diagnostic-dispositions.ts`'s canonicalizing original. Now the shared
+ * `finding-identity.js` builder (canonicalizes `cwd`/`filePath` through
+ * `normalizeMapKey`, hashes to 12 chars). No back-compat migration needed
+ * here: `cq:` ids are never a keyed lookup — `buildCodeQualityWarningsReport`
+ * regenerates the whole report fresh every turn, callers only ever cache and
+ * replay the report wholesale (`tools/lens-diagnostics.ts` reads it via
+ * `cacheManager.readCache<CodeQualityWarningsReport>`, never by `id`), and
+ * `appendCodeQualityWarningsHistory` just append-only-logs the id for
+ * observability, never look it back up. Contrast `actionable-warnings.ts`,
+ * whose `actionable-warning-state.json` DOES key a persisted suppression
+ * store on `aw:` — that one migrates. */
 function createCodeQualityWarningId(args: {
 	cwd: string;
 	filePath: string;
@@ -89,15 +114,17 @@ function createCodeQualityWarningId(args: {
 	message: string;
 	line?: number;
 }): string {
-	const parts = [
-		relativeFile(args.filePath, args.cwd),
-		args.tool ?? "",
-		args.rule ?? "",
-		String(args.code ?? ""),
-		normalizeMessage(args.message),
-		String(args.line ?? ""),
-	];
-	return `cq:${hashText(parts.join("|"))}`;
+	return stableFindingId("cq:", {
+		cwd: args.cwd,
+		filePath: args.filePath,
+		parts: [
+			args.tool,
+			args.rule,
+			args.code,
+			normalizeMessage(args.message),
+			args.line,
+		],
+	});
 }
 
 function categorize(
@@ -194,14 +221,25 @@ export function buildCodeQualityWarningsReport(args: {
 		if (!lineInModifiedRanges(warning.line, ranges)) continue;
 		byId.set(warning.id, warning);
 	}
-	const merged = [...byId.values()]
-		.sort(
-			(a, b) =>
-				a.displayPath.localeCompare(b.displayPath) ||
-				(a.line ?? 0) - (b.line ?? 0) ||
-				a.message.localeCompare(b.message),
-		)
-		.slice(0, maxWarnings);
+	const byDisplayOrder = (
+		a: CodeQualityWarningRecord,
+		b: CodeQualityWarningRecord,
+	): number =>
+		a.displayPath.localeCompare(b.displayPath) ||
+		(a.line ?? 0) - (b.line ?? 0) ||
+		a.message.localeCompare(b.message);
+
+	// Spend the budget tier by tier (see TIER_BUDGET_ORDER), then restore
+	// display order so the report still reads file by file, line by line.
+	const candidates = [...byId.values()].sort(byDisplayOrder);
+	const merged: CodeQualityWarningRecord[] = [];
+	for (const tier of TIER_BUDGET_ORDER) {
+		for (const warning of candidates) {
+			if (merged.length >= maxWarnings) break;
+			if (warning.severity === tier) merged.push(warning);
+		}
+	}
+	merged.sort(byDisplayOrder);
 
 	const byFile = new Map<string, CodeQualityWarningRecord[]>();
 	for (const warning of merged) {
@@ -237,6 +275,11 @@ export function buildCodeQualityWarningsReport(args: {
 		summary: {
 			warnings: merged.length,
 			files: files.length,
+			byTier: {
+				warning: merged.filter((w) => w.severity === "warning").length,
+				info: merged.filter((w) => w.severity === "info").length,
+				hint: merged.filter((w) => w.severity === "hint").length,
+			},
 			topRules,
 		},
 	};
@@ -286,26 +329,24 @@ export function appendCodeQualityWarningsHistory(
 	report: CodeQualityWarningsReport,
 ): void {
 	const warnings = report.files.flatMap((file) =>
-		file.warnings.map(
-			(warning): CodeQualityWarningsHistoryEntry => ({
-				timestamp: report.generatedAt,
-				sessionId: report.sessionId,
-				turnIndex: report.turnIndex,
-				projectSeq: report.projectSeqEnd,
-				filePath: warning.filePath,
-				displayPath: warning.displayPath,
-				fileSeq: file.fileSeq,
-				line: warning.line,
-				column: warning.column,
-				severity: warning.severity,
-				tool: warning.tool,
-				rule: warning.rule,
-				code: warning.code,
-				message: warning.message,
-				category: warning.category,
-				warningId: warning.id,
-			}),
-		),
+		file.warnings.map((warning): CodeQualityWarningsHistoryEntry => ({
+			timestamp: report.generatedAt,
+			sessionId: report.sessionId,
+			turnIndex: report.turnIndex,
+			projectSeq: report.projectSeqEnd,
+			filePath: warning.filePath,
+			displayPath: warning.displayPath,
+			fileSeq: file.fileSeq,
+			line: warning.line,
+			column: warning.column,
+			severity: warning.severity,
+			tool: warning.tool,
+			rule: warning.rule,
+			code: warning.code,
+			message: warning.message,
+			category: warning.category,
+			warningId: warning.id,
+		})),
 	);
 	if (warnings.length === 0) return;
 	const historyPath = getCodeQualityWarningsHistoryPath(cwd);
@@ -329,8 +370,27 @@ export function formatCodeQualityWarningsAdvisory(
 		.slice(0, 3)
 		.map((entry) => `${entry.rule}×${entry.count}`)
 		.join(", ");
+	// #1777: name the tiers, in the same descending-loudness order the on-demand
+	// ast-grep surface uses (`formatDiagnostics`, clients/ast-grep-client.ts).
+	// A tier with no findings is omitted rather than printed as zero.
+	const byTier = report.summary.byTier ?? { warning: 0, info: 0, hint: 0 };
+	// The line is worth its space only when a quiet tier is present; an
+	// all-warning turn already says everything in the count above.
+	const tiers =
+		byTier.hint || byTier.info
+			? [
+					byTier.warning ? `${byTier.warning} warning` : undefined,
+					byTier.info ? `${byTier.info} info` : undefined,
+					byTier.hint ? `${byTier.hint} hint` : undefined,
+				]
+					.filter(Boolean)
+					.join(", ")
+			: "";
 	return [
 		`Code-quality warnings introduced/touched this turn: ${report.summary.warnings} across ${report.summary.files} file(s).`,
+		tiers
+			? `By tier: ${tiers}. Hint and info are style opinions, not defects.`
+			: undefined,
 		topRules ? `Top rules: ${topRules}` : undefined,
 		"Details written to .pi-lens/cache/code-quality-warnings.json",
 		"No action required unless you are already refactoring these areas.",

@@ -10,6 +10,11 @@
  * v1 scope — the highest-value, lowest-overlap surface:
  *   - **Kubernetes manifests** (yaml with an `apiVersion:` + `kind:` signature):
  *     zero existing coverage in pi-lens, so no dedup needed.
+ *   - **CloudFormation templates** (yaml OR json with an
+ *     `AWSTemplateFormatVersion` key, or a `Resources` map whose entries carry
+ *     an `AWS::`/`Custom::`-namespaced `Type`; refs #1757): same zero-overlap
+ *     rationale as Kubernetes — trivy's `cloudformation` misconfig scanner is
+ *     the only IaC-misconfig coverage pi-lens has for CFN.
  *   - **Dockerfiles**: overlaps hadolint on a few rules (`:latest`, root, …);
  *     the dispatcher suppresses trivy-config findings that hadolint already
  *     reports at the same line (`suppressTrivyConfigDockerOverlap`), so trivy
@@ -17,12 +22,11 @@
  *
  *   - **Terraform**: the `.tf` language files themselves — trivy evaluates
  *     the Terraform language directly, so no content gate is needed (unlike
- *     the yaml/k8s heuristic above). Terragrunt (`.hcl`) is deliberately
- *     excluded: trivy has no terragrunt support, and terragrunt config is
- *     covered by the terragrunt runner instead.
+ *     the yaml/k8s/CloudFormation heuristics above). Terragrunt (`.hcl`) is
+ *     deliberately excluded: trivy has no terragrunt support, and terragrunt
+ *     config is covered by the terragrunt runner instead.
  *
- * Deferred (tracked on #131): Helm chart rendering, Docker Compose,
- * CloudFormation.
+ * Deferred (tracked on #131): Helm chart rendering, Docker Compose.
  *
  * Gating: the same explicit `trivy.enabled` opt-in as the session-scan modes —
  * trivy is opt-in, period. (Misconfig needs only the small policy bundle, not
@@ -32,8 +36,10 @@
  * Refs: #131 (Mode 2)
  */
 
+import { formatToolFailure } from "./utils/tool-failure.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { incrementDegradationCount } from "../../degradation-ledger.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import {
 	isTrivyEnabled,
@@ -51,7 +57,6 @@ import {
 	createAvailabilityChecker,
 	resolveAvailableOrInstall,
 } from "./utils/runner-helpers.js";
-import { spawnFailedWithNoOutput } from "./utils/spawn-outcome.js";
 
 const trivy = createAvailabilityChecker("trivy", ".exe");
 
@@ -68,6 +73,22 @@ export function looksLikeKubernetesManifest(content: string): boolean {
 		}
 	}
 	return false;
+}
+
+/**
+ * Heuristic: does this file (yaml OR json) look like a CloudFormation
+ * template? The unambiguous signal is the `AWSTemplateFormatVersion` key,
+ * present on the vast majority of real templates; SAM templates instead
+ * declare `Transform: AWS::Serverless-2016-10-31` (or an array containing
+ * it). Templates that skip both still always declare a `Resources` map whose
+ * entries carry a `Type` in the `AWS::`/`Custom::`/`Alexa::` namespaces — the
+ * one field CFN mandates on every resource. Any one signal qualifies (refs
+ * #1757).
+ */
+export function looksLikeCloudFormationTemplate(content: string): boolean {
+	if (/AWSTemplateFormatVersion/.test(content)) return true;
+	if (/Transform:\s*(\[.*)?["']?AWS::Serverless/.test(content)) return true;
+	return /Type["']?\s*:\s*["']?(AWS|Custom|Alexa)::/.test(content);
 }
 
 function normalizeSeverity(raw: unknown): TrivySeverity {
@@ -140,7 +161,7 @@ export function parseTrivyConfigOutput(
 
 const trivyConfigRunner: RunnerDefinition = {
 	id: "trivy-config",
-	appliesTo: ["docker", "yaml", "terraform"],
+	appliesTo: ["docker", "yaml", "terraform", "json"],
 	priority: PRIORITY.GENERAL_ANALYSIS,
 	enabledByDefault: true,
 	skipTestFiles: false,
@@ -155,15 +176,22 @@ const trivyConfigRunner: RunnerDefinition = {
 
 		const absPath = path.resolve(cwd, ctx.filePath);
 
-		// YAML is far broader than k8s; only scan files that look like manifests.
-		if (ctx.kind === "yaml") {
+		// YAML is far broader than k8s/CloudFormation; JSON is far broader than
+		// CloudFormation — only scan files that look like one of the IaC
+		// manifest shapes trivy's misconfig scanners understand (refs #1757).
+		if (ctx.kind === "yaml" || ctx.kind === "json") {
 			let content = "";
 			try {
 				content = fs.readFileSync(absPath, "utf-8");
 			} catch {
 				return { status: "skipped", diagnostics: [], semantic: "none" };
 			}
-			if (!looksLikeKubernetesManifest(content)) {
+			const isManifest =
+				ctx.kind === "yaml"
+					? looksLikeKubernetesManifest(content) ||
+						looksLikeCloudFormationTemplate(content)
+					: looksLikeCloudFormationTemplate(content);
+			if (!isManifest) {
 				return { status: "skipped", diagnostics: [], semantic: "none" };
 			}
 		}
@@ -182,8 +210,18 @@ const trivyConfigRunner: RunnerDefinition = {
 			cmd,
 			[
 				"config",
+				// `--quiet` alone suppresses both the progress bar and log output.
+				// `--no-progress` is NOT a `config` subcommand flag (unlike `fs`,
+				// which does accept it) — trivy 0.73.0 exits 1 on the rejected
+				// flag, but prints its full usage/help text (thousands of bytes)
+				// to STDOUT before the FATAL line on stderr. That stdout is
+				// non-empty, so an empty-output-only guard did not catch it: the
+				// help text failed to JSON-parse, `parseTrivyConfigOutput`
+				// returned `[]`, and this reported `{ status: "succeeded",
+				// diagnostics: [] }` — a clean scan — on every single real
+				// invocation (refs #1757; verified against the real installed
+				// binary, not assumed).
 				"--quiet",
-				"--no-progress",
 				"--format",
 				"json",
 				"--severity",
@@ -193,11 +231,37 @@ const trivyConfigRunner: RunnerDefinition = {
 			{ cwd, timeout: 60_000 },
 		);
 
-		if (spawnFailedWithNoOutput(result)) {
+		// `trivy config` is not given `--exit-code`, so it exits 0 whenever it
+		// completed (findings included — see parseTrivyConfigOutput's severity
+		// mapping for how CRITICAL becomes blocking). ANY nonzero status is
+		// therefore a real error, WITH or WITHOUT something on stdout — mirrors
+		// the model already in clients/dispatch/runners/helm-render.ts's
+		// runIacPass, which has the same "trivy prints usage text on a bad
+		// flag" exposure and already got this right. A bounded ledger record
+		// means a broken trivy invocation can no longer go unnoticed for an
+		// entire lane's lifetime the way this one did (refs #1757).
+		if (result.error || result.status !== 0) {
+			// #1816: one shared wording, one truncation, signal named. `subject`
+			// stays the file path — the discriminating identity a reader needs
+			// is WHICH file trivy stopped covering.
+			incrementDegradationCount({
+				kind: "runner-empty-result",
+				subject: absPath,
+				reason: formatToolFailure({
+					tool: "trivy config",
+					status: result.status,
+					signal: result.signal,
+					stderr: result.stderr || result.error?.message,
+					stdout: result.stdout,
+				}),
+			});
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
-		const diagnostics = parseTrivyConfigOutput(result.stdout || "", ctx.filePath);
+		const diagnostics = parseTrivyConfigOutput(
+			result.stdout || "",
+			ctx.filePath,
+		);
 		if (diagnostics.length === 0) {
 			return { status: "succeeded", diagnostics: [], semantic: "none" };
 		}

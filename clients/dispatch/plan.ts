@@ -242,6 +242,11 @@ export const LANGUAGE_CAPABILITY_MATRIX: Record<
 		capabilities: ["types", "lint"],
 		writeGroups: [primary("clojure")],
 	},
+	cue: {
+		name: "CUE Linting",
+		capabilities: ["types", "lint"],
+		writeGroups: [primary("cue")],
+	},
 	terraform: {
 		name: "Terraform Linting",
 		capabilities: ["types", "lint", "security"],

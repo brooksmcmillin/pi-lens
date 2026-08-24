@@ -115,7 +115,8 @@ describe("parseDetektOutput — fixable propagation (#112 slice)", () => {
 	});
 
 	it("treats a finding with no rule bracket as non-fixable", () => {
-		const raw = "src/Main.kt:1:1: warning: Unrecognised diagnostic without a rule id";
+		const raw =
+			"src/Main.kt:1:1: warning: Unrecognised diagnostic without a rule id";
 		const diags = parseDetektOutput(raw, "src/Main.kt");
 		expect(diags).toHaveLength(1);
 		expect(diags[0].rule).toBe("detekt");

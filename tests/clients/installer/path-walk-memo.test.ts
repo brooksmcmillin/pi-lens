@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.unmock("../../../clients/installer/index.ts");
+vi.unmock("../../../clients/installer/index.js");
 
 const statSyncMock = vi.hoisted(() => vi.fn());
 
@@ -12,7 +12,7 @@ vi.mock("node:fs", async (importOriginal) => ({
 import {
 	isSpawnableCommand,
 	resetPathWalkMemo,
-} from "../../../clients/installer/index.ts";
+} from "../../../clients/installer/index.js";
 
 const savedPath = process.env.PATH;
 

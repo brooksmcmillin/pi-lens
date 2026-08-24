@@ -18,6 +18,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	buildScopeKey,
 	cacheKeyFor,
+	clearAllWorkspaceDiagnosticsCaches,
+	clearWorkspaceDiagnosticsCache,
 	createWorkspaceDiagnosticsCacheContext,
 	isEntryFresh,
 	loadWorkspaceDiagnosticsCache,
@@ -25,7 +27,12 @@ import {
 	WORKSPACE_DIAGNOSTICS_CACHE_VERSION,
 	type WorkspaceDiagnosticsCacheEntry,
 } from "../../../clients/lsp/workspace-diagnostics-cache.js";
+import { MTIME_DRIFT_TOLERANCE_MS } from "../../../clients/blocker-freshness.js";
 import { hashDiagnosticContent } from "../../../clients/lsp/diagnostic-binding.js";
+import {
+	PROJECT_SNAPSHOT_VERSION,
+	saveProjectSnapshot,
+} from "../../../clients/project-snapshot.js";
 import { removeTempDirSync } from "../test-utils.js";
 
 let tmp: string;
@@ -70,7 +77,12 @@ describe("loadWorkspaceDiagnosticsCache / saveWorkspaceDiagnosticsCache (#671)",
 	});
 
 	it("fails open on a corrupt cache file", () => {
-		const cacheFile = path.join(tmp, ".pi-lens", "cache", "lsp-workspace-diagnostics.json");
+		const cacheFile = path.join(
+			tmp,
+			".pi-lens",
+			"cache",
+			"lsp-workspace-diagnostics.json",
+		);
 		fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
 		fs.writeFileSync(cacheFile, "{ not json");
 		expect(loadWorkspaceDiagnosticsCache(tmp)).toBeUndefined();
@@ -85,7 +97,12 @@ describe("loadWorkspaceDiagnosticsCache / saveWorkspaceDiagnosticsCache (#671)",
 	});
 
 	it("fails open when entries is missing/malformed", () => {
-		const cacheFile = path.join(tmp, ".pi-lens", "cache", "lsp-workspace-diagnostics.json");
+		const cacheFile = path.join(
+			tmp,
+			".pi-lens",
+			"cache",
+			"lsp-workspace-diagnostics.json",
+		);
 		fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
 		fs.writeFileSync(
 			cacheFile,
@@ -128,9 +145,7 @@ describe("isEntryFresh (#671)", () => {
 		const scannedAt = Date.now() - 10_000; // entry recorded 10s ago
 		const entry = makeEntry({ mtimeMs, scannedAt });
 		// Dependency's current mtime is "now" — after scannedAt.
-		expect(
-			isEntryFresh(filePath, entry, () => [depPath]),
-		).toBe(false);
+		expect(isEntryFresh(filePath, entry, () => [depPath])).toBe(false);
 	});
 
 	it("stays fresh when every dependency is older than the entry's scannedAt", () => {
@@ -142,6 +157,30 @@ describe("isEntryFresh (#671)", () => {
 		expect(isEntryFresh(filePath, entry, () => [depPath])).toBe(true);
 	});
 
+	// #1708 sweep: same defect shape as `findingPathFreshness` — a strict
+	// `mtimeMs > scannedAt` against a captured scan timestamp. Fabricates the
+	// mtime/scannedAt pair directly (no real write race) so the boundary is
+	// deterministic and pins both edges against a `>` / tolerance-widening
+	// mutation.
+	it("stays fresh when a dependency's mtime lands within MTIME_DRIFT_TOLERANCE_MS of scannedAt", () => {
+		const depPath = path.join(tmp, "dep-tolerance.ts");
+		fs.writeFileSync(depPath, "export const x = 1;\n");
+		const mtimeMs = fs.statSync(filePath).mtimeMs;
+		const scannedAt = fs.statSync(depPath).mtimeMs - MTIME_DRIFT_TOLERANCE_MS;
+		const entry = makeEntry({ mtimeMs, scannedAt });
+		expect(isEntryFresh(filePath, entry, () => [depPath])).toBe(true);
+	});
+
+	it("is stale when a dependency's mtime lands past MTIME_DRIFT_TOLERANCE_MS of scannedAt", () => {
+		const depPath = path.join(tmp, "dep-past-tolerance.ts");
+		fs.writeFileSync(depPath, "export const x = 1;\n");
+		const mtimeMs = fs.statSync(filePath).mtimeMs;
+		const scannedAt =
+			fs.statSync(depPath).mtimeMs - MTIME_DRIFT_TOLERANCE_MS - 1;
+		const entry = makeEntry({ mtimeMs, scannedAt });
+		expect(isEntryFresh(filePath, entry, () => [depPath])).toBe(false);
+	});
+
 	it("is stale when a dependency has been deleted (fail closed)", () => {
 		const mtimeMs = fs.statSync(filePath).mtimeMs;
 		const entry = makeEntry({ mtimeMs, scannedAt: Date.now() });
@@ -149,11 +188,46 @@ describe("isEntryFresh (#671)", () => {
 			isEntryFresh(filePath, entry, () => [path.join(tmp, "gone.ts")]),
 		).toBe(false);
 	});
+
+	// #1793: the one remaining path a stale CLEAN verdict survives #1786's
+	// serve-time expiry gate on — an entry recorded WITH dependency knowledge
+	// (a warm session, reverse-deps index built) replayed on a LATER, cold
+	// session (no index this time) used to fall back to mtime-only, so a
+	// dependency edit that flipped the file from clean to failing stayed
+	// invisible for as long as the file's own bytes were untouched.
+	it("is stale (fails closed) when the entry was recorded WITH dependency knowledge but this session has none", () => {
+		const mtimeMs = fs.statSync(filePath).mtimeMs;
+		const entry = makeEntry({
+			mtimeMs,
+			scannedAt: Date.now(),
+			depIndexAtScan: true,
+		});
+		expect(isEntryFresh(filePath, entry, () => undefined)).toBe(false);
+	});
+
+	it("keeps failing OPEN to mtime-only when the entry itself was recorded without dependency knowledge (unchanged residual)", () => {
+		const mtimeMs = fs.statSync(filePath).mtimeMs;
+		const entry = makeEntry({
+			mtimeMs,
+			scannedAt: Date.now(),
+			depIndexAtScan: false,
+		});
+		expect(isEntryFresh(filePath, entry, () => undefined)).toBe(true);
+	});
+
+	it("keeps failing OPEN to mtime-only for a legacy entry with no depIndexAtScan field at all", () => {
+		const mtimeMs = fs.statSync(filePath).mtimeMs;
+		const entry = makeEntry({ mtimeMs, scannedAt: Date.now() });
+		expect(entry.depIndexAtScan).toBeUndefined();
+		expect(isEntryFresh(filePath, entry, () => undefined)).toBe(true);
+	});
 });
 
 describe("buildScopeKey / cacheKeyFor (#671)", () => {
 	it("produces a stable key independent of exclude-list ordering", () => {
-		expect(buildScopeKey("all", ["b", "a"])).toBe(buildScopeKey("all", ["a", "b"]));
+		expect(buildScopeKey("all", ["b", "a"])).toBe(
+			buildScopeKey("all", ["a", "b"]),
+		);
 	});
 
 	it("distinguishes scopes that differ in clientScope or exclusions", () => {
@@ -210,7 +284,10 @@ describe("WorkspaceDiagnosticsCacheContext (#671)", () => {
 			{
 				severity: 1 as const,
 				message: "boom",
-				range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+				range: {
+					start: { line: 0, character: 0 },
+					end: { line: 0, character: 1 },
+				},
 			},
 		];
 
@@ -299,6 +376,459 @@ describe("WorkspaceDiagnosticsCacheContext (#671)", () => {
 		const third = createWorkspaceDiagnosticsCacheContext(tmp);
 		expect(third.lookup(fileA, "all|")).toBeDefined();
 		expect(third.lookup(fileB, "all|")).toBeDefined();
+	});
+});
+
+// #1793: the #1786 review's F4 residual — a CLEAN entry recorded while a
+// reverse-dependency index was available replayed on a later, index-less
+// session used to fall back to mtime-only with no dependency check at all.
+// Persisting whether dependency knowledge was available AT RECORD TIME lets
+// `isEntryFresh` refuse to serve such an entry via the weaker check just
+// because the CURRENT session happens to be cold.
+describe("dependency-index availability persisted on the entry (#1793)", () => {
+	// A snapshot with `files[key].imports` defined makes
+	// `loadReverseDependencyIndexFromSnapshot` resolve non-null AND puts THIS
+	// key into `index.imports` (see `buildReverseDependencyIndexFromSnapshot`)
+	// — the file is actually covered by the index, not merely "an index of
+	// some kind exists this session".
+	function seedProjectSnapshotCoveringFile(
+		cwd: string,
+		filePath: string,
+	): void {
+		const key = cacheKeyFor(filePath);
+		saveProjectSnapshot(cwd, {
+			version: PROJECT_SNAPSHOT_VERSION,
+			projectRoot: cwd,
+			generatedAt: new Date().toISOString(),
+			seq: 1,
+			files: {
+				[key]: { path: key, mtimeMs: 0, size: 0, imports: [], lastSeq: 0 },
+			},
+			symbols: {},
+			reverseDeps: {},
+			cachedExports: [],
+		});
+	}
+
+	// #1793 review F2: an index exists this session (some OTHER file is
+	// covered), but NOT for the file under test — the out-of-snapshot shape
+	// the review flagged. `getImports` masks this with `?? []`, so a
+	// context-level ("was ANY index loaded") stamp would wrongly claim
+	// dependency knowledge for a file the index never actually saw.
+	function seedProjectSnapshotNotCoveringFile(cwd: string): void {
+		saveProjectSnapshot(cwd, {
+			version: PROJECT_SNAPSHOT_VERSION,
+			projectRoot: cwd,
+			generatedAt: new Date().toISOString(),
+			seq: 1,
+			files: {
+				"/some/other/file.ts": {
+					path: "/some/other/file.ts",
+					mtimeMs: 0,
+					size: 0,
+					imports: [],
+					lastSeq: 0,
+				},
+			},
+			symbols: {},
+			reverseDeps: {},
+			cachedExports: [],
+		});
+	}
+
+	it("record() stamps depIndexAtScan=true when THIS FILE is covered by the reverse-deps index", () => {
+		const filePath = path.join(tmp, "a.ts");
+		fs.writeFileSync(filePath, "const a = 1;\n");
+		seedProjectSnapshotCoveringFile(tmp, filePath);
+
+		const ctx = createWorkspaceDiagnosticsCacheContext(tmp);
+		ctx.record(filePath, "all|", [], fs.statSync(filePath).mtimeMs);
+		ctx.persist();
+
+		const persisted = loadWorkspaceDiagnosticsCache(tmp);
+		expect(persisted?.entries[cacheKeyFor(filePath)]?.depIndexAtScan).toBe(
+			true,
+		);
+	});
+
+	// Red on the context-level-stamp version of the fix (#1793 review F2): a
+	// whole-cwd index existing does NOT mean this specific file's clean claim
+	// was ever cross-checked against dependencies.
+	it("record() stamps depIndexAtScan=false when an index exists but does not cover this file", () => {
+		const filePath = path.join(tmp, "a.ts");
+		fs.writeFileSync(filePath, "const a = 1;\n");
+		seedProjectSnapshotNotCoveringFile(tmp);
+
+		const ctx = createWorkspaceDiagnosticsCacheContext(tmp);
+		ctx.record(filePath, "all|", [], fs.statSync(filePath).mtimeMs);
+		ctx.persist();
+
+		const persisted = loadWorkspaceDiagnosticsCache(tmp);
+		expect(persisted?.entries[cacheKeyFor(filePath)]?.depIndexAtScan).toBe(
+			false,
+		);
+	});
+
+	it("record() stamps depIndexAtScan=false when no reverse-deps index is available this session", () => {
+		const filePath = path.join(tmp, "a.ts");
+		fs.writeFileSync(filePath, "const a = 1;\n");
+		// No project snapshot seeded: this session is cold, same as today.
+
+		const ctx = createWorkspaceDiagnosticsCacheContext(tmp);
+		ctx.record(filePath, "all|", [], fs.statSync(filePath).mtimeMs);
+		ctx.persist();
+
+		const persisted = loadWorkspaceDiagnosticsCache(tmp);
+		expect(persisted?.entries[cacheKeyFor(filePath)]?.depIndexAtScan).toBe(
+			false,
+		);
+	});
+
+	// Red on pre-fix code: a clean entry recorded WITH dependency knowledge
+	// used to serve on a later, index-less session via the mtime-only
+	// fallback with no dependency check at all.
+	it("a CLEAN entry recorded WITH dependency knowledge does not serve on a later dep-index-less session", () => {
+		const filePath = path.join(tmp, "clean.ts");
+		fs.writeFileSync(filePath, "export const a = 1;\n");
+		const mtimeMs = fs.statSync(filePath).mtimeMs;
+		saveWorkspaceDiagnosticsCache(tmp, {
+			version: WORKSPACE_DIAGNOSTICS_CACHE_VERSION,
+			entries: {
+				[cacheKeyFor(filePath)]: {
+					diagnostics: [],
+					count: 0,
+					mtimeMs,
+					scannedAt: Date.now(),
+					scopeKey: "all|",
+					depIndexAtScan: true,
+				},
+			},
+		});
+
+		// This session has no project snapshot: cold, so getImports() is
+		// undefined for every file — the exact state the entry's depIndexAtScan
+		// says it should NOT be trusted to serve through.
+		const ctx = createWorkspaceDiagnosticsCacheContext(tmp);
+		expect(ctx.lookup(filePath, "all|")).toBeUndefined();
+	});
+
+	it("a CLEAN entry recorded WITHOUT dependency knowledge keeps serving via mtime-only (unchanged residual)", () => {
+		const filePath = path.join(tmp, "clean.ts");
+		fs.writeFileSync(filePath, "export const a = 1;\n");
+		const mtimeMs = fs.statSync(filePath).mtimeMs;
+		saveWorkspaceDiagnosticsCache(tmp, {
+			version: WORKSPACE_DIAGNOSTICS_CACHE_VERSION,
+			entries: {
+				[cacheKeyFor(filePath)]: {
+					diagnostics: [],
+					count: 0,
+					mtimeMs,
+					scannedAt: Date.now(),
+					scopeKey: "all|",
+					depIndexAtScan: false,
+				},
+			},
+		});
+
+		const ctx = createWorkspaceDiagnosticsCacheContext(tmp);
+		expect(ctx.lookup(filePath, "all|")).toBeDefined();
+	});
+
+	it("emits a bounded record when a dep-index-cold refusal fires", async () => {
+		vi.resetModules();
+		const logLatency = vi.fn();
+		vi.doMock("../../../clients/latency-logger.js", async (importOriginal) => ({
+			...(await importOriginal<Record<string, unknown>>()),
+			logLatency,
+		}));
+		const cacheModule =
+			await import("../../../clients/lsp/workspace-diagnostics-cache.js");
+
+		const filePath = path.join(tmp, "clean.ts");
+		fs.writeFileSync(filePath, "export const a = 1;\n");
+		const mtimeMs = fs.statSync(filePath).mtimeMs;
+		cacheModule.saveWorkspaceDiagnosticsCache(tmp, {
+			version: cacheModule.WORKSPACE_DIAGNOSTICS_CACHE_VERSION,
+			entries: {
+				[cacheModule.cacheKeyFor(filePath)]: {
+					diagnostics: [],
+					count: 0,
+					mtimeMs,
+					scannedAt: Date.now(),
+					scopeKey: "all|",
+					depIndexAtScan: true,
+				},
+			},
+		});
+
+		const ctx = cacheModule.createWorkspaceDiagnosticsCacheContext(tmp);
+		ctx.lookup(filePath, "all|");
+		ctx.persist();
+		// A second persist() must not double-report.
+		ctx.persist();
+
+		const records = logLatency.mock.calls
+			.map((call) => call[0])
+			.filter(
+				(record: any) =>
+					record?.phase === "lsp_workspace_diagnostics_cache_expiry",
+			);
+		expect(records).toHaveLength(1);
+		expect(records[0].metadata.depIndexColdRefusals).toBe(1);
+		vi.doUnmock("../../../clients/latency-logger.js");
+		vi.resetModules();
+	});
+
+	// #1793 review F3 (Probe D shape): both `record()` call sites
+	// (`clients/lsp/index.ts`, `tools/lsp-diagnostics.ts`) skip recording an
+	// UNCONFIRMED (timed-out/errored) touch result. A refusal that only
+	// REFUSES without evicting the entry would leave that same stale,
+	// depIndexAtScan:true entry sitting in the persisted cache forever, to be
+	// refused (and its file force-re-touched) again on every later cold
+	// sweep — paying the touch's timeout budget every single time, when
+	// pre-fix it served instantly. Simulates that exact caller behavior: look
+	// up (refused), then persist WITHOUT ever calling `record()` for the file
+	// (the caller's `continue` on `timedOut`/`error`).
+	it("deletes a cold-refused entry so an UNCONFIRMED forced re-touch does not leave it to be refused forever", () => {
+		const filePath = path.join(tmp, "clean.ts");
+		fs.writeFileSync(filePath, "export const a = 1;\n");
+		const mtimeMs = fs.statSync(filePath).mtimeMs;
+		saveWorkspaceDiagnosticsCache(tmp, {
+			version: WORKSPACE_DIAGNOSTICS_CACHE_VERSION,
+			entries: {
+				[cacheKeyFor(filePath)]: {
+					diagnostics: [],
+					count: 0,
+					mtimeMs,
+					scannedAt: Date.now(),
+					scopeKey: "all|",
+					depIndexAtScan: true,
+				},
+			},
+		});
+
+		const first = createWorkspaceDiagnosticsCacheContext(tmp);
+		expect(first.lookup(filePath, "all|")).toBeUndefined();
+		// The caller's forced re-touch "times out": it never calls record()
+		// for this file, exactly like the `continue` on `result.timedOut` in
+		// both real call sites.
+		first.persist();
+
+		const persisted = loadWorkspaceDiagnosticsCache(tmp);
+		expect(persisted?.entries[cacheKeyFor(filePath)]).toBeUndefined();
+
+		// A second, later cold sweep sees a plain cache miss (genuinely
+		// uncached), not a refusal — same one-touch-per-sweep cost an
+		// always-uncached file already pays, not a compounding cost.
+		const second = createWorkspaceDiagnosticsCacheContext(tmp);
+		expect(second.lookup(filePath, "all|")).toBeUndefined();
+	});
+
+	it("heals once a re-touch DOES confirm, even under the same cold session", () => {
+		const filePath = path.join(tmp, "clean.ts");
+		fs.writeFileSync(filePath, "export const a = 1;\n");
+		const mtimeMs = fs.statSync(filePath).mtimeMs;
+		saveWorkspaceDiagnosticsCache(tmp, {
+			version: WORKSPACE_DIAGNOSTICS_CACHE_VERSION,
+			entries: {
+				[cacheKeyFor(filePath)]: {
+					diagnostics: [],
+					count: 0,
+					mtimeMs,
+					scannedAt: Date.now(),
+					scopeKey: "all|",
+					depIndexAtScan: true,
+				},
+			},
+		});
+
+		const ctx = createWorkspaceDiagnosticsCacheContext(tmp);
+		expect(ctx.lookup(filePath, "all|")).toBeUndefined();
+		// This time the forced re-touch DOES confirm — the caller calls
+		// record() with a fresh result, same as a successful touchFile.
+		ctx.record(filePath, "all|", [], mtimeMs);
+		ctx.persist();
+
+		const persisted = loadWorkspaceDiagnosticsCache(tmp);
+		// Re-recorded under THIS (still cold) session's own knowledge: false,
+		// not the stale true it replaced — so the next lookup fails open to
+		// mtime-only again instead of refusing, and serves instantly.
+		expect(persisted?.entries[cacheKeyFor(filePath)]?.depIndexAtScan).toBe(
+			false,
+		);
+		expect(
+			createWorkspaceDiagnosticsCacheContext(tmp).lookup(filePath, "all|"),
+		).toBeDefined();
+	});
+});
+
+// #1814: the #1800/#1793 review's probe F — a narrower, per-file gap
+// `isEntryFresh`'s own dependency loop left open, distinct from the
+// whole-session-absent case #1793/#1800 closed. `getImports` used to mask
+// "this file is absent from an otherwise-present reverse-deps index" with
+// `?? []`, so `isEntryFresh`'s loop iterated zero times over the coerced
+// empty array and returned fresh — indistinguishable from a file the index
+// actually confirmed has zero imports. A session WITH a warm index
+// (`hasDepKnowledge` true for SOME file, so #1793's whole-session refusal
+// never fires) could still fail-open per-file for a file outside that
+// index's own coverage, with no signal at all.
+describe("per-file dependency-index coverage in isEntryFresh (#1814)", () => {
+	function seedSnapshotCovering(cwd: string, coveredKey: string): void {
+		saveProjectSnapshot(cwd, {
+			version: PROJECT_SNAPSHOT_VERSION,
+			projectRoot: cwd,
+			generatedAt: new Date().toISOString(),
+			seq: 1,
+			files: {
+				[coveredKey]: {
+					path: coveredKey,
+					mtimeMs: 0,
+					size: 0,
+					imports: [],
+					lastSeq: 0,
+				},
+			},
+			symbols: {},
+			reverseDeps: {},
+			cachedExports: [],
+		});
+	}
+
+	// Probe F shape: a warm session's index covered g.ts, stamping
+	// depIndexAtScan: true. A LATER session's index exists (so
+	// `hasDepKnowledge` is true for other.ts and #1793's whole-session
+	// refusal doesn't fire) but covers only other.ts, not g.ts.
+	it("does not serve a CLEAN entry whose file is absent from an otherwise-present index (probe F)", () => {
+		const gPath = path.join(tmp, "g.ts");
+		fs.writeFileSync(gPath, "export const g = 1;\n");
+		const mtimeMs = fs.statSync(gPath).mtimeMs;
+		saveWorkspaceDiagnosticsCache(tmp, {
+			version: WORKSPACE_DIAGNOSTICS_CACHE_VERSION,
+			entries: {
+				[cacheKeyFor(gPath)]: {
+					diagnostics: [],
+					count: 0,
+					mtimeMs,
+					scannedAt: Date.now(),
+					scopeKey: "all|",
+					depIndexAtScan: true,
+				},
+			},
+		});
+		seedSnapshotCovering(tmp, cacheKeyFor(path.join(tmp, "other.ts")));
+
+		const ctx = createWorkspaceDiagnosticsCacheContext(tmp);
+		expect(ctx.lookup(gPath, "all|")).toBeUndefined();
+	});
+
+	// Mutation-proof the accepted, unchanged case: a file the CURRENT index
+	// actually covers, with zero imports recorded, still serves — the fix
+	// must distinguish "uncovered" from "covered, zero imports", not just
+	// refuse every depIndexAtScan:true entry outright.
+	it("still serves a CLEAN entry whose file the CURRENT index confirms has zero imports", () => {
+		const gPath = path.join(tmp, "g.ts");
+		fs.writeFileSync(gPath, "export const g = 1;\n");
+		const mtimeMs = fs.statSync(gPath).mtimeMs;
+		saveWorkspaceDiagnosticsCache(tmp, {
+			version: WORKSPACE_DIAGNOSTICS_CACHE_VERSION,
+			entries: {
+				[cacheKeyFor(gPath)]: {
+					diagnostics: [],
+					count: 0,
+					mtimeMs,
+					scannedAt: Date.now(),
+					scopeKey: "all|",
+					depIndexAtScan: true,
+				},
+			},
+		});
+		seedSnapshotCovering(tmp, cacheKeyFor(gPath));
+
+		const ctx = createWorkspaceDiagnosticsCacheContext(tmp);
+		expect(ctx.lookup(gPath, "all|")).toBeDefined();
+	});
+
+	// Mutation-proof the eviction extension: a refusal-without-eviction fix
+	// (returning undefined from isEntryFresh alone, without widening the
+	// `lookup` eviction condition) leaves the stale entry on disk to be
+	// refused — and its file force-re-touched — again on every later cold
+	// sweep, exactly the repeat-cost #1793 review F3 flagged for the
+	// whole-session case. This proves the SAME idiom applies here.
+	it("evicts (not just refuses) a per-file-uncovered depIndexAtScan:true entry", () => {
+		const gPath = path.join(tmp, "g.ts");
+		fs.writeFileSync(gPath, "export const g = 1;\n");
+		const mtimeMs = fs.statSync(gPath).mtimeMs;
+		saveWorkspaceDiagnosticsCache(tmp, {
+			version: WORKSPACE_DIAGNOSTICS_CACHE_VERSION,
+			entries: {
+				[cacheKeyFor(gPath)]: {
+					diagnostics: [],
+					count: 0,
+					mtimeMs,
+					scannedAt: Date.now(),
+					scopeKey: "all|",
+					depIndexAtScan: true,
+				},
+			},
+		});
+		seedSnapshotCovering(tmp, cacheKeyFor(path.join(tmp, "other.ts")));
+
+		const ctx = createWorkspaceDiagnosticsCacheContext(tmp);
+		expect(ctx.lookup(gPath, "all|")).toBeUndefined();
+		ctx.persist();
+
+		const persisted = loadWorkspaceDiagnosticsCache(tmp);
+		expect(persisted?.entries[cacheKeyFor(gPath)]).toBeUndefined();
+	});
+
+	// The refusal population widens (same `depIndexColdRefusals` metric,
+	// same latency.log record #1800 introduced) to also count the per-file
+	// case, not just the whole-session-absent one.
+	it("counts a per-file-uncovered refusal in the same depIndexColdRefusals telemetry as a whole-session refusal", async () => {
+		vi.resetModules();
+		const logLatency = vi.fn();
+		vi.doMock("../../../clients/latency-logger.js", async (importOriginal) => ({
+			...(await importOriginal<Record<string, unknown>>()),
+			logLatency,
+		}));
+		const cacheModule =
+			await import("../../../clients/lsp/workspace-diagnostics-cache.js");
+
+		const gPath = path.join(tmp, "g.ts");
+		fs.writeFileSync(gPath, "export const g = 1;\n");
+		const mtimeMs = fs.statSync(gPath).mtimeMs;
+		cacheModule.saveWorkspaceDiagnosticsCache(tmp, {
+			version: cacheModule.WORKSPACE_DIAGNOSTICS_CACHE_VERSION,
+			entries: {
+				[cacheModule.cacheKeyFor(gPath)]: {
+					diagnostics: [],
+					count: 0,
+					mtimeMs,
+					scannedAt: Date.now(),
+					scopeKey: "all|",
+					depIndexAtScan: true,
+				},
+			},
+		});
+		seedSnapshotCovering(
+			tmp,
+			cacheModule.cacheKeyFor(path.join(tmp, "other.ts")),
+		);
+
+		const ctx = cacheModule.createWorkspaceDiagnosticsCacheContext(tmp);
+		ctx.lookup(gPath, "all|");
+		ctx.persist();
+
+		const records = logLatency.mock.calls
+			.map((call) => call[0])
+			.filter(
+				(record: any) =>
+					record?.phase === "lsp_workspace_diagnostics_cache_expiry",
+			);
+		expect(records).toHaveLength(1);
+		expect(records[0].metadata.depIndexColdRefusals).toBe(1);
+		vi.doUnmock("../../../clients/latency-logger.js");
+		vi.resetModules();
 	});
 });
 
@@ -503,5 +1033,100 @@ describe("persist() write-failure retry (#1239)", () => {
 			mtimeMs,
 			scopeKey: "all|",
 		});
+	});
+});
+
+// #1669 review F1: `workspace/diagnostic/refresh` used to clear the cache at
+// the per-LSP-server `state.root`, which a monorepo/multi-root project can
+// nest BELOW the real sweep cwd — the clear missed the actual cache file.
+// `clearAllWorkspaceDiagnosticsCaches` instead drops every cwd this process
+// has ever created a `createWorkspaceDiagnosticsCacheContext` for.
+describe("clearAllWorkspaceDiagnosticsCaches (#1669 review F1)", () => {
+	it("clears every cwd a sweep has registered, not just one", () => {
+		const projectA = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-cache-a-"));
+		const projectB = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-cache-b-"));
+		fs.mkdirSync(path.join(projectA, ".pi-lens"));
+		fs.mkdirSync(path.join(projectB, ".pi-lens"));
+		try {
+			const fileA = path.join(projectA, "a.ts");
+			const fileB = path.join(projectB, "b.ts");
+			// Two independent sweeps, mirroring two projects a single LSP process
+			// might route files through (e.g. two roots resolved by the SAME
+			// language server key in a multi-root workspace).
+			const ctxA = createWorkspaceDiagnosticsCacheContext(projectA);
+			ctxA.record(fileA, "all|", [], 1);
+			ctxA.persist();
+			const ctxB = createWorkspaceDiagnosticsCacheContext(projectB);
+			ctxB.record(fileB, "all|", [], 1);
+			ctxB.persist();
+
+			expect(
+				Object.keys(loadWorkspaceDiagnosticsCache(projectA)?.entries ?? {}),
+			).toHaveLength(1);
+			expect(
+				Object.keys(loadWorkspaceDiagnosticsCache(projectB)?.entries ?? {}),
+			).toHaveLength(1);
+
+			// A refresh at a THIRD root (e.g. `state.root` for a per-server
+			// identity that is neither project's cwd) must still clear both —
+			// clearing only `state.root` (the pre-fix behavior) would clear
+			// nothing here at all.
+			clearAllWorkspaceDiagnosticsCaches();
+
+			expect(
+				Object.keys(loadWorkspaceDiagnosticsCache(projectA)?.entries ?? {}),
+			).toHaveLength(0);
+			expect(
+				Object.keys(loadWorkspaceDiagnosticsCache(projectB)?.entries ?? {}),
+			).toHaveLength(0);
+		} finally {
+			removeTempDirSync(projectA);
+			removeTempDirSync(projectB);
+		}
+	});
+});
+
+// #1669 review F2: `createWorkspaceDiagnosticsCacheContext` loads the cache
+// ONCE at the start of a sweep, and `persist()` blind-overwrites the whole
+// map at the end. A `workspace/diagnostic/refresh` landing mid-sweep used to
+// be silently undone the moment that sweep's own (now-stale) in-memory copy
+// was written back — the exact staleness class #1669 exists to close.
+describe("createWorkspaceDiagnosticsCacheContext persist() vs. a mid-sweep clear (#1669 review F2)", () => {
+	it("drops a stale persist() once clearWorkspaceDiagnosticsCache raced it, instead of resurrecting the cleared entries", () => {
+		const filePath = path.join(tmp, "a.ts");
+		fs.writeFileSync(filePath, "const a = 1;\n");
+		const mtimeMs = fs.statSync(filePath).mtimeMs;
+
+		// A sweep starts and loads the (currently empty) cache.
+		const ctx = createWorkspaceDiagnosticsCacheContext(tmp);
+		// Mid-sweep, a server-initiated refresh clears the on-disk cache —
+		// e.g. because a project-wide config change made everything the sweep
+		// is about to record stale.
+		clearWorkspaceDiagnosticsCache(tmp);
+		// The sweep, unaware of the refresh, finishes and writes back what it
+		// computed BEFORE the refresh landed.
+		ctx.record(filePath, "all|", [], mtimeMs);
+		ctx.persist();
+
+		// The refresh's clear must win: nothing from the stale in-memory copy
+		// may resurrect on disk. Pre-fix, this assertion would see 1 entry —
+		// the sweep's persist() overwrote the clear.
+		expect(
+			Object.keys(loadWorkspaceDiagnosticsCache(tmp)?.entries ?? {}),
+		).toHaveLength(0);
+	});
+
+	it("still persists normally when no clear raced the sweep", () => {
+		const filePath = path.join(tmp, "a.ts");
+		fs.writeFileSync(filePath, "const a = 1;\n");
+		const mtimeMs = fs.statSync(filePath).mtimeMs;
+
+		const ctx = createWorkspaceDiagnosticsCacheContext(tmp);
+		ctx.record(filePath, "all|", [], mtimeMs);
+		ctx.persist();
+
+		expect(
+			Object.keys(loadWorkspaceDiagnosticsCache(tmp)?.entries ?? {}),
+		).toHaveLength(1);
 	});
 });

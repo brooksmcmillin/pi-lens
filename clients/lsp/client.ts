@@ -8,15 +8,15 @@
  * - Request/response handling
  */
 
-import { logExtension } from "../extension-log.js";
 import { spawn as nodeSpawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { access, readFile } from "node:fs/promises";
 import * as os from "node:os";
 import { pathToFileURL } from "node:url";
+import { emitBounded } from "../bounded-telemetry.js";
 import { withTimeout } from "../deadline-utils.js";
+import { incrementDegradationCount } from "../degradation-ledger.js";
 import type { MessageConnection } from "../deps/vscode-jsonrpc.js";
-import { logLatency } from "../latency-logger.js";
 // vscode-jsonrpc v9 ships an `exports` map exposing the Node entry as the
 // `./node` subpath (no `.js`); the old `/node.js` file path no longer resolves.
 import {
@@ -25,24 +25,22 @@ import {
 	StreamMessageReader,
 	StreamMessageWriter,
 } from "../deps/vscode-jsonrpc.js";
+import { logExtension } from "../extension-log.js";
+import { recordLspChild, removeLspChild } from "../instance-registry.js";
+import { logLatency } from "../latency-logger.js";
+import {
+	type LspMutationContext,
+	newLspMutationCorrelationId,
+} from "../lsp-mutation.js";
 import { getAmbientAbortSignal } from "../safe-spawn.js";
+import { raceToCompletion } from "./aggregation.js";
 import {
 	hashDiagnosticContent,
 	type StoredDiagnosticBinding,
 } from "./diagnostic-binding.js";
-import {
-	newLspMutationCorrelationId,
-	type LspMutationContext,
-} from "../lsp-mutation.js";
-
-import {
-	applyWorkspaceEdit,
-	normalizeWorkspaceEditToUtf16,
-} from "./edits.js";
-import { recordLspChild, removeLspChild } from "../instance-registry.js";
+import { applyWorkspaceEdit, normalizeWorkspaceEditToUtf16 } from "./edits.js";
 import type { LSPProcess } from "./launch.js";
 import { normalizeMapKey, uriToPath } from "./path-utils.js";
-import { probeTsserverProjectIdentity } from "./tsserver-sync.js";
 import {
 	ADVERTISED_POSITION_ENCODINGS,
 	convertCharacterOffset,
@@ -50,8 +48,19 @@ import {
 	negotiatePositionEncoding,
 	type PositionEncoding,
 } from "./position-encoding.js";
+import {
+	negotiateSyncKind,
+	TEXT_DOCUMENT_SYNC_KIND_FULL,
+	TEXT_DOCUMENT_SYNC_KIND_INCREMENTAL,
+	type TextDocumentSyncKind,
+} from "./sync-kind.js";
+import { probeTsserverProjectIdentity } from "./tsserver-sync.js";
 import { getStrategy } from "./wait-policy/index.js";
 import { WatchedFilesQueue } from "./watch-queue.js";
+import {
+	clearAllWorkspaceDiagnosticsCaches,
+	clearWorkspaceDiagnosticsCacheAtAndAbove,
+} from "./workspace-diagnostics-cache.js";
 
 // Opt-in publishDiagnostics trace (PILENS_PUB_DEBUG=1) — read once, negligible
 // hot-path cost. Surfaces each server's publish behavior (version + count) to
@@ -73,7 +82,10 @@ const PUB_DEBUG = Boolean(process.env.PILENS_PUB_DEBUG);
  * today, and any other server later launched with a temp-file `--config`/`-c`
  * argument, without new server-specific code.
  */
-function extractSpawnMarker(args: readonly string[]): string | undefined {
+function extractSpawnMarker(
+	args: readonly string[] | undefined,
+): string | undefined {
+	if (!args) return undefined;
 	const tmpDir = os.tmpdir();
 	for (let i = 0; i < args.length - 1; i++) {
 		const flag = args[i];
@@ -291,6 +303,15 @@ export interface LSPClientInfo {
 			silent?: boolean,
 		): Promise<void>;
 		change(filePath: string, content: string): Promise<void>;
+		/**
+		 * #1668: queue a `workspace/didChangeWatchedFiles` entry for a disk
+		 * change this client did not learn about through didOpen/didChange —
+		 * an external bash write/delete outside the open-document sync path.
+		 * `type` is the LSP `FileChangeType` (1 Created, 2 Changed, 3 Deleted).
+		 * Routes through the same #271 debounced queue as a first-time open, so
+		 * a burst of external changes still flushes as one notification.
+		 */
+		watchedFileChange(filePath: string, type: number): void;
 	};
 	getDiagnostics(filePath: string): LSPDiagnostic[];
 	/**
@@ -318,7 +339,18 @@ export interface LSPClientInfo {
 	waitForDiagnostics(
 		filePath: string,
 		timeoutMs?: number,
-		options?: { minVersion?: number; pullOnly?: boolean },
+		options?: {
+			minVersion?: number;
+			pullOnly?: boolean;
+			/** #1639: distinguishes a genuine content-collecting settle from a
+			 *  warm-up-only touch (`ensureWarmForSweep`'s readiness probe, which
+			 *  runs a real pull round trip but never wants the diagnostics
+			 *  content). Both are legitimate `lsp_typescript_diagnostic_sequence`
+			 *  observations for the same file, often seconds or milliseconds
+			 *  apart — tagging the source keeps them distinguishable instead of
+			 *  reading as duplicates. Defaults to "pull". */
+			pullSettleSource?: "pull" | "pull-warmup";
+		},
 	): Promise<void>;
 	/** Get all tracked diagnostics with timestamps (for cascade checking). #1095:
 	 *  each entry also carries the stored content `binding` (absent when no
@@ -347,9 +379,7 @@ export interface LSPClientInfo {
 	 * Issue one project-wide `workspace/diagnostic` pull. Resolves per-file
 	 * reports, or `undefined` when unsupported/dead/timed-out/malformed.
 	 */
-	requestWorkspaceDiagnostics(
-		budgetMs: number,
-	): Promise<
+	requestWorkspaceDiagnostics(budgetMs: number): Promise<
 		| Array<{
 				filePath: string;
 				diagnostics: LSPDiagnostic[];
@@ -383,6 +413,18 @@ export interface LSPClientInfo {
 		command: string,
 		args?: unknown[],
 		mutationContext?: LspMutationContext,
+	): Promise<{ executed: boolean; result?: unknown; reason?: string }>;
+	/**
+	 * #1412/#1640: read-only sibling of `executeCommand` for identity and
+	 * telemetry probes. Same allowlist-by-advertisement hardening, but it never
+	 * touches `serverEditsAllowed` / `activeMutationContext` — so a probe firing
+	 * mid-flight cannot wipe a concurrent real command's mutation context, and
+	 * cannot itself open the `workspace/applyEdit` acceptance window. Carries the
+	 * short probe timeout, not the generous mutation backstop.
+	 */
+	executeReadOnlyCommand(
+		command: string,
+		args?: unknown[],
 	): Promise<{ executed: boolean; result?: unknown; reason?: string }>;
 	/** Go to definition — returns Location[] */
 	definition(
@@ -567,8 +609,35 @@ const PULL_REQUEST_TIMEOUT_MS = positiveIntFromEnv(
 	"PI_LENS_LSP_PULL_REQUEST_TIMEOUT_MS",
 	10_000,
 );
+// #1773: the smallest budget this codebase treats as usable — dispatching
+// BELOW it is not a real attempt. The old clamp (`Math.max(1, ...)`) let an
+// exhausted `budgetMs` (0 or negative) through as a 1ms pull — sent, timed
+// out by construction, and recorded as a genuine `lsp_pull_diagnostic_timeout`
+// with a fabricated `effectiveBudgetMs: 1` (observed live: both pull-timeout
+// records in the 2026-08-20 plegma dogfood session carried exactly that).
+// 5ms sits below the smallest budget this codebase's own regression fixtures
+// already treat as a real dispatch (`tests/clients/lsp/pull-diagnostic-
+// timeout-telemetry.test.ts` exercises 20ms and 30ms as genuinely-attempted-
+// then-timed-out) and above the 1-4ms band that is indistinguishable from
+// "already exhausted" — a local stdio server round trip (write + compute +
+// parse) needs more than a handful of milliseconds even on the fast path.
+// `budgetMs === PULL_MIN_USABLE_BUDGET_MS` dispatches (the comparison below
+// is strict `<`), so the name reads literally: this is the floor value that
+// still gets a real attempt.
+const PULL_MIN_USABLE_BUDGET_MS = 5;
 const SHUTDOWN_REQUEST_TIMEOUT_MS = positiveIntFromEnv(
 	"PI_LENS_LSP_SHUTDOWN_TIMEOUT_MS",
+	1000,
+);
+// #1620: the `exit` NOTIFICATION needs its own ceiling, for the same reason the
+// `shutdown` REQUEST has one. A notification write on a pipe that is not
+// draining neither resolves nor rejects, so `safeSendNotification`'s catch never
+// runs and the await is unbounded. The #1459 wedged-write breaker calls this
+// teardown precisely when that stdin has already been PROVEN wedged, so the
+// unbounded await was the whole mechanism of the leak. Kept equal to the request
+// budget: a healthy server still gets a brief graceful window before the kill.
+const EXIT_NOTIFY_TIMEOUT_MS = positiveIntFromEnv(
+	"PI_LENS_LSP_EXIT_NOTIFY_TIMEOUT_MS",
 	1000,
 );
 // #1277: cheap liveness round-trip for the silent-clean gates (`index.ts`).
@@ -593,6 +662,39 @@ const LIVENESS_PING_QUERY = "__pi_lens_liveness_ping__";
 // cheaply rebuilt by the next full pull, the worst case is just one extra full
 // (non-`unchanged`) report per affected file.
 const WORKSPACE_PULL_RESULT_CACHE_MAX = 4096;
+// #1713: `workspace/diagnostic` has no per-file/per-identifier request to key
+// telemetry identity on — it is one project-wide pull — so timeout/late-answer
+// records use this fixed subject/scope instead of a real path.
+const WORKSPACE_PULL_SCOPE = "*workspace*";
+// #1669 review N2: cap on simultaneous re-pulls the `workspace/diagnostic/
+// refresh` handler fires for open documents. A workspace with hundreds of
+// open documents fanning out one `textDocument/diagnostic` request each,
+// with no cap, floods the server the refresh itself just told us is under
+// load. Small and fixed — this is a background improvement after the
+// protocol reply, never something worth tuning per project.
+const REFRESH_REPULL_CONCURRENCY = 4;
+
+/** Run `mapper` over `items` with at most `concurrency` in flight at once.
+ *  Same shape as `dependency-checker.ts`'s helper of the same name — a
+ *  worker-pool pattern repeated per-file by design in this codebase rather
+ *  than shared, so each caller can keep it un-exported and file-local. */
+async function mapWithConcurrency<T>(
+	items: readonly T[],
+	concurrency: number,
+	mapper: (item: T) => Promise<void>,
+): Promise<void> {
+	if (items.length === 0) return;
+	let nextIndex = 0;
+	const workerCount = Math.max(1, Math.min(concurrency, items.length));
+	const worker = async (): Promise<void> => {
+		while (true) {
+			const index = nextIndex++;
+			if (index >= items.length) return;
+			await mapper(items[index]);
+		}
+	};
+	await Promise.all(Array.from({ length: workerCount }, () => worker()));
+}
 // Anti-deadlock backstop for workspace/executeCommand. Deliberately generous
 // (30s): the command is mutating and legitimately long-running (a real server
 // refactor / organize-imports), so this must not truncate valid work — it only
@@ -653,6 +755,29 @@ function installCrashGuard(): void {
 
 // --- Client State + Module-level helpers ---
 
+/**
+ * #1667: one live `client/registerCapability` entry, with the fields of
+ * `registerOptions` this client actually acts on.
+ *
+ * The map used to store the method name alone. That silently discarded
+ * `identifier` — the diagnostic SOURCE a `textDocument/diagnostic` registration
+ * speaks for. Roslyn registers "syntax", "semantic" and "analyzers" as separate
+ * sources; vtsls does the same. With the identifier gone the pull path issued
+ * one bare request and every other source's findings were never asked for.
+ * `workspaceDiagnostics` was discarded the same way, so workspace-pull support
+ * had to be guessed from the method name.
+ */
+export interface DynamicRegistration {
+	readonly method: string;
+	/** `registerOptions.identifier`. Absent = the server's default/bare source. */
+	readonly identifier?: string;
+	/** `registerOptions.workspaceDiagnostics` — whether THIS registration also
+	 *  serves a workspace-wide pull. Absent = the server did not say. */
+	readonly workspaceDiagnostics?: boolean;
+	/** `registerOptions.commands` for a `workspace/executeCommand` registration. */
+	readonly commands?: readonly string[];
+}
+
 export interface LSPClientState {
 	isConnected: boolean;
 	isDestroyed: boolean;
@@ -662,6 +787,31 @@ export interface LSPClientState {
 	 *  before the process 'exit' event fires (the ordering that previously
 	 *  made every crash silently look "expected"). */
 	shutdownRequested: boolean;
+	/**
+	 * #1620 residual 3: set on the FIRST `clientShutdown()` call and awaited
+	 * by every subsequent one on the same state whose options are no MORE
+	 * aggressive than these (see `shutdownOptions` and
+	 * `isAtLeastAsAggressiveShutdown`), instead of each caller re-running the
+	 * RPC handshake and emitting its own `lsp_client_shutdown` record. Two of
+	 * the 8 call sites can race the same client (e.g. a ceiling eviction and
+	 * a #1459 notify-stall demotion) — the individual teardown steps are
+	 * idempotent, but a duplicated record inflates any
+	 * `shutdownOutcome: "forced"` count read from the log. `undefined` until
+	 * the first call.
+	 *
+	 * #1620 residual review F1: a call whose options ARE more aggressive
+	 * (e.g. a `fast`+`processExiting` session-exit reset racing a graceful
+	 * eviction teardown that is still mid-handshake) does NOT dedupe onto
+	 * this promise — that in-flight teardown may still spawn `taskkill` and
+	 * await its close event, which is exactly what `processExiting` exists
+	 * to forbid during a closing event loop. It starts (and stores) its own
+	 * teardown instead; see `clientShutdown`.
+	 */
+	shutdownPromise: Promise<void> | undefined;
+	/** #1620 residual review F1: the options the current `shutdownPromise`
+	 *  was started with — compared against a new call's options to decide
+	 *  dedupe vs. escalate. `undefined` exactly when `shutdownPromise` is. */
+	shutdownOptions: LSPShutdownOptions | undefined;
 	/**
 	 * #1127: wall-clock time the client FIRST observed its own death (whichever
 	 * of connection close/error or the process 'exit' event fires first — see
@@ -717,10 +867,16 @@ export interface LSPClientState {
 	 *  we sent for a path, tagged with the document version it was sent as.
 	 *  Captured at SEND time on in-memory content (never a disk read on the
 	 *  notification path) so a later `publishDiagnostics` echoing that version can
-	 *  bind its diagnostics to the content they were computed against. */
+	 *  bind its diagnostics to the content they were computed against.
+	 *
+	 *  #1669: `text` additionally retains that same payload's full content, but
+	 *  ONLY when `syncKind` is Incremental — the one case that needs it, to
+	 *  compute the NEXT change's full-range replace against the document as the
+	 *  server last saw it (see `buildContentChanges`). Full/None servers never
+	 *  populate it, so the common case pays no extra retained memory. */
 	readonly documentContentHashes: Map<
 		string,
-		{ version: number; hash: string }
+		{ version: number; hash: string; text?: string }
 	>;
 	/** #1095: the content binding for the diagnostics currently stored for a path
 	 *  — {version, contentHash} of the document those diagnostics were computed
@@ -733,8 +889,45 @@ export interface LSPClientState {
 	 *  pull for a path (primary or a `relatedDocuments` entry), so the NEXT pull
 	 *  can send it as `previousResultId` and receive an `unchanged` report instead
 	 *  of a full recompute. Cleared with the rest of a path's diagnostic state by
-	 *  `clearDiagnosticsForPath` so a resync never inherits a stale basis. */
+	 *  `clearDiagnosticsForPath` so a resync never inherits a stale basis.
+	 *
+	 *  #1667: keyed by (path, diagnostic identifier), not by path alone — result
+	 *  ids are per SOURCE. A server registering several diagnostic sources
+	 *  (Roslyn: syntax/semantic/analyzers) issues an independent id per source,
+	 *  and echoing one source's id to another makes the server answer
+	 *  `unchanged` against a basis it never issued. Build keys with
+	 *  `pullSourceKey`; the bare (identifier-less) source keys on the plain path
+	 *  so single-source servers are byte-identical to before. */
 	readonly pullResultIds: Map<string, string>;
+	/** #1667: per-source pull diagnostics for a path — outer key the normalized
+	 *  path, inner key the diagnostic identifier (`""` for the bare source).
+	 *  `documentPullDiagnostics` holds the DEDUPED UNION of these, recomputed
+	 *  after every source's report, so each source can be replaced independently
+	 *  without one source's answer wiping another's. Optional: a state built
+	 *  before this field existed lazily gains it on first pull. */
+	documentPullDiagnosticsBySource?: Map<string, Map<string, LSPDiagnostic[]>>;
+	/** #1667: per-path pull generation, bumped by `clearDiagnosticsForPath`. The
+	 *  fan-out leaves losing pulls running so their results still merge into the
+	 *  cache; a resync that lands in that window must not be overwritten by a
+	 *  pull computed against the content it just replaced. A late write whose
+	 *  captured generation no longer matches is dropped. */
+	pullGenerations?: Map<string, number>;
+	/** #1667: the sequence number of the NEWEST request issued for each
+	 *  `pullSourceKey(path, identifier)`. The generation counter above only
+	 *  guards against a resync; it says nothing about two overlapping fan-outs
+	 *  for the SAME unchanged content. `ensureWarmForSweep` touches a file and
+	 *  the real touch follows ~60ms later, so touch 2 can re-pull a source and
+	 *  store a fresh answer while touch 1's slow answer for that same source is
+	 *  still in flight - and the late loser would clobber the newer result.
+	 *  Each request stamps its own number here; a write whose stamp is no longer
+	 *  the newest is dropped. */
+	pullRequestSequences?: Map<string, number>;
+	/** #1889: requests whose caller timed out and sent `$/cancelRequest`, but
+	 *  whose server-side request has not settled yet. Cancellation is advisory:
+	 *  a server may accept it and keep computing. A later pull for the same
+	 *  path/source must not be admitted until this promise settles, or repeated
+	 *  caller deadlines can still build an unbounded server queue. */
+	abandonedPullRequests?: Map<string, Promise<unknown>>;
 	/** #1104: per-path cache of the last `workspace/diagnostic` pull's resultId +
 	 *  diagnostics + content binding, so an `unchanged` report in a LATER pull can
 	 *  inherit the prior basis instead of the record site staying stuck at
@@ -768,10 +961,20 @@ export interface LSPClientState {
 	 *  the server advertised otherwise; drives character-offset translation on
 	 *  outgoing navigation requests. */
 	positionEncoding: PositionEncoding;
+	/** #1669: `textDocumentSync.change` kind the server negotiated at initialize
+	 *  — None (0), Full (1) or Incremental (2). Optional so existing state
+	 *  literals across the test suite don't all need updating; every read site
+	 *  falls back to `TEXT_DOCUMENT_SYNC_KIND_FULL`, which is the whole-document
+	 *  `{ text }` shape pi-lens has always sent — an absent value never changes
+	 *  behavior. Set once at initialize, next to `positionEncoding`. */
+	syncKind?: TextDocumentSyncKind;
 	/** Baseline mode from static initResult — used to revert on unregister */
 	staticDiagnosticsMode: "pull" | "push-only";
-	/** Live dynamic registrations from client/registerCapability: id → method */
-	readonly dynamicRegistrations: Map<string, string>;
+	/** Live dynamic registrations from client/registerCapability: id → record.
+	 *  #1667: the record carries the registration's `registerOptions`, not just
+	 *  its method. Dropping `identifier` made every diagnostic source of a
+	 *  multi-source server collapse into one bare pull. */
+	readonly dynamicRegistrations: Map<string, DynamicRegistration>;
 	/**
 	 * Commands the server advertised it can run via workspace/executeCommand
 	 * (initialize `executeCommandProvider.commands` + any dynamically registered
@@ -1041,13 +1244,17 @@ function normalizeLspDiagnostics(
 	return diagnostics.map(normalizeLspDiagnostic);
 }
 
+/**
+ * Union of diagnostic lists, first occurrence wins, exact duplicates dropped.
+ * Variadic since #1667 so the per-identifier pull sources merge through the
+ * SAME key as the push/pull merge rather than growing a second dedupe rule.
+ */
 function mergeDiagnosticLists(
-	push: LSPDiagnostic[] | undefined,
-	pull: LSPDiagnostic[] | undefined,
+	...lists: (LSPDiagnostic[] | undefined)[]
 ): LSPDiagnostic[] {
 	const merged: LSPDiagnostic[] = [];
 	const seen = new Set<string>();
-	for (const diagnostic of [...(push ?? []), ...(pull ?? [])]) {
+	for (const diagnostic of lists.flatMap((list) => list ?? [])) {
 		const key = [
 			diagnostic.range.start.line,
 			diagnostic.range.start.character,
@@ -1068,6 +1275,12 @@ function getMergedDiagnosticsForPath(
 	state: LSPClientState,
 	normalizedPath: string,
 ): LSPDiagnostic[] {
+	// SAFETY: `diagnostics` is the pre-split field name that older states (and
+	// older embedders holding a state built before `pushDiagnostics` existed)
+	// still carry. It is absent from `LSPClientState` on purpose — new code
+	// must not write it. The cast declares it OPTIONAL, so the read below is
+	// still `undefined`-guarded and a state without it falls through to the
+	// current field.
 	const legacy = state as unknown as {
 		diagnostics?: Map<string, LSPDiagnostic[]>;
 	};
@@ -1078,6 +1291,204 @@ function getMergedDiagnosticsForPath(
 	);
 }
 
+/**
+ * #1667: per-source pull-diagnostic bookkeeping.
+ *
+ * A pull-mode server can expose several diagnostic SOURCES, each named by its
+ * registration's `registerOptions.identifier` (Roslyn: syntax, semantic,
+ * analyzers). Each source answers independently, with its own `resultId` and
+ * its own findings, so per-path state that used to be a single slot has to
+ * become one slot per (path, source):
+ *
+ *  - `pullResultIds` keys on `pullSourceKey(path, identifier)`, so an
+ *    `unchanged` report is only ever answered against the id THAT source
+ *    issued (#240/#1104 machinery, now per source).
+ *  - `documentPullDiagnosticsBySource` holds each source's findings, and
+ *    `documentPullDiagnostics` is their deduped union - recomputed whenever a
+ *    source reports, so a fresh answer from one source never wipes another's.
+ *
+ * The bare (identifier-less) source keys on the plain path, so a single-source
+ * server stores exactly what it stored before this change.
+ */
+// NUL is the one byte a filesystem path can never contain, so
+// `path + SEP + identifier` is unambiguous: no path/identifier pair can
+// produce the same key as a different pair, and the bare source's key (the
+// plain path) can never collide with a named source's.
+const PULL_SOURCE_KEY_SEPARATOR = "\u0000";
+const BARE_PULL_SOURCE = "";
+
+function pullSourceKey(
+	normalizedPath: string,
+	identifier: string | undefined,
+): string {
+	return identifier === undefined
+		? normalizedPath
+		: `${normalizedPath}${PULL_SOURCE_KEY_SEPARATOR}${identifier}`;
+}
+
+/** Every `pullResultIds` key belonging to a path - the bare key plus one per
+ *  identifier. Used by the clear path so a resync drops EVERY source's basis. */
+function pullSourceKeysForPath(
+	state: LSPClientState,
+	normalizedPath: string,
+): string[] {
+	const prefix = `${normalizedPath}${PULL_SOURCE_KEY_SEPARATOR}`;
+	return [
+		normalizedPath,
+		...[...(state.pullResultIds?.keys() ?? [])].filter((key) =>
+			key.startsWith(prefix),
+		),
+	];
+}
+
+function pullSourcesFor(
+	state: LSPClientState,
+	normalizedPath: string,
+): Map<string, LSPDiagnostic[]> {
+	if (!state.documentPullDiagnosticsBySource) {
+		state.documentPullDiagnosticsBySource = new Map();
+	}
+	let sources = state.documentPullDiagnosticsBySource.get(normalizedPath);
+	if (!sources) {
+		sources = new Map();
+		state.documentPullDiagnosticsBySource.set(normalizedPath, sources);
+	}
+	return sources;
+}
+
+/** This source's currently stored findings for a path - what an `unchanged`
+ *  report inherits. Falls back to the whole per-path list when the source map
+ *  has no entry yet, so a state that pulled before this change (or a caller
+ *  that seeded `documentPullDiagnostics` directly) still inherits correctly. */
+function pullSourceDiagnostics(
+	state: LSPClientState,
+	normalizedPath: string,
+	identifier: string | undefined,
+): LSPDiagnostic[] {
+	const sources = state.documentPullDiagnosticsBySource?.get(normalizedPath);
+	const stored = sources?.get(identifier ?? BARE_PULL_SOURCE);
+	if (stored) return stored;
+	return sources && sources.size > 0
+		? []
+		: (state.documentPullDiagnostics.get(normalizedPath) ?? []);
+}
+
+/** Store one source's findings and republish the union to
+ *  `documentPullDiagnostics`, which every reader outside this file uses. */
+function storePullSourceDiagnostics(
+	state: LSPClientState,
+	normalizedPath: string,
+	identifier: string | undefined,
+	diagnostics: LSPDiagnostic[],
+): void {
+	const sources = pullSourcesFor(state, normalizedPath);
+	sources.set(identifier ?? BARE_PULL_SOURCE, diagnostics);
+	state.documentPullDiagnostics.set(
+		normalizedPath,
+		mergeDiagnosticLists(...sources.values()),
+	);
+}
+
+/** #1667: the pull generation for a path. The fan-out deliberately lets losing
+ *  pulls run to completion so their findings still reach the cache; a resync
+ *  that lands first must win, so every late write re-checks this. */
+function pullGenerationFor(
+	state: LSPClientState,
+	normalizedPath: string,
+): number {
+	return state.pullGenerations?.get(normalizedPath) ?? 0;
+}
+
+function bumpPullGeneration(
+	state: LSPClientState,
+	normalizedPath: string,
+): void {
+	if (!state.pullGenerations) state.pullGenerations = new Map();
+	state.pullGenerations.set(
+		normalizedPath,
+		(state.pullGenerations.get(normalizedPath) ?? 0) + 1,
+	);
+}
+
+/** #1667: claim the newest-request slot for a source and return the claim.
+ *  Called at REQUEST time; `isNewestPullRequest` re-checks it at WRITE time so
+ *  a slow answer from an earlier fan-out cannot overwrite a newer one's. */
+function claimPullRequestSequence(
+	state: LSPClientState,
+	sourceKey: string,
+): number {
+	if (!state.pullRequestSequences) state.pullRequestSequences = new Map();
+	const next = (state.pullRequestSequences.get(sourceKey) ?? 0) + 1;
+	state.pullRequestSequences.set(sourceKey, next);
+	return next;
+}
+
+function isNewestPullRequest(
+	state: LSPClientState,
+	sourceKey: string,
+	sequence: number,
+): boolean {
+	return (state.pullRequestSequences?.get(sourceKey) ?? 0) === sequence;
+}
+
+/**
+ * #1667: drop every trace of a diagnostic source the server just unregistered.
+ *
+ * `client/unregisterCapability` retires a source, but its findings sit in
+ * `documentPullDiagnosticsBySource` and its resultId in `pullResultIds`, so
+ * without this the union keeps serving a retired source's diagnostics until
+ * something resyncs the file. Roslyn and vtsls re-register their sources on
+ * solution reload, which is exactly when the old source's findings are stale.
+ *
+ * Purges the source's slice from every path and republishes each affected
+ * path's union, so the removal is visible on the next read rather than only
+ * after the next pull.
+ */
+function retirePullSource(state: LSPClientState, identifier: string): void {
+	const suffix = `${PULL_SOURCE_KEY_SEPARATOR}${identifier}`;
+	for (const source of [state.pullResultIds, state.pullRequestSequences]) {
+		if (!source) continue;
+		for (const key of [...source.keys()]) {
+			if (key.endsWith(suffix)) source.delete(key);
+		}
+	}
+	for (const [
+		normalizedPath,
+		sources,
+	] of state.documentPullDiagnosticsBySource ?? []) {
+		if (!sources.delete(identifier)) continue;
+		state.documentPullDiagnostics.set(
+			normalizedPath,
+			mergeDiagnosticLists(...sources.values()),
+		);
+		bumpDiagnosticsVersion(state, normalizedPath);
+		state.diagnosticEmitter.emit("diagnostics", normalizedPath);
+	}
+}
+
+/**
+ * #1667: the diagnostic sources to pull for a document - always the bare
+ * request (a server may answer it even while registering named sources, and it
+ * is the ONLY request a single-source server understands), plus one per
+ * distinct `identifier` on a live `textDocument/diagnostic` registration.
+ *
+ * Derived from `dynamicRegistrations` on every call rather than cached in a
+ * parallel list: the registration map is the single source of truth, and
+ * `client/unregisterCapability` must be able to retire a source immediately.
+ */
+export function pullDiagnosticSources(
+	state: LSPClientState,
+): (string | undefined)[] {
+	const identifiers = new Set<string>();
+	for (const registration of state.dynamicRegistrations?.values() ?? []) {
+		if (registration.method !== "textDocument/diagnostic") continue;
+		if (registration.identifier) identifiers.add(registration.identifier);
+	}
+	// Sorted for a stable, reproducible request order in logs and tests; the
+	// fan-out is parallel, so order carries no priority.
+	return [undefined, ...[...identifiers].sort((a, b) => a.localeCompare(b))];
+}
+
 /** #1531: bump the client-global diagnostics counter and stamp the path it was
  * bumped FOR. The single seam every "fresh diagnostics stored" site goes
  * through, so the per-path stamp can never drift from the global counter. */
@@ -1086,7 +1497,10 @@ export function bumpDiagnosticsVersion(
 	normalizedPath: string,
 ): void {
 	state.diagnosticsVersion += 1;
-	state.diagnosticsVersionsByPath?.set(normalizedPath, state.diagnosticsVersion);
+	state.diagnosticsVersionsByPath?.set(
+		normalizedPath,
+		state.diagnosticsVersion,
+	);
 }
 
 /** #1531: the global counter's value when diagnostics were last stored for
@@ -1107,6 +1521,10 @@ export function clearDiagnosticsForPath(
 	state: LSPClientState,
 	normalizedPath: string,
 ): void {
+	// SAFETY: same pre-split field names as `getMergedDiagnosticsForPath`.
+	// Clearing must cover the legacy maps too, or a state that still carries
+	// them replays a stale diagnostic after the clear. Both are declared
+	// OPTIONAL, so every use below is `?.`-guarded on a state that lacks them.
 	const legacy = state as unknown as {
 		diagnostics?: Map<string, LSPDiagnostic[]>;
 		diagnosticTimestamps?: Map<string, number>;
@@ -1133,15 +1551,65 @@ export function clearDiagnosticsForPath(
 	// #1104: a resync invalidates any `unchanged`-report basis too — the next
 	// pull must not inherit a resultId/contentHash computed against the
 	// content this resync just replaced.
-	state.pullResultIds?.delete(normalizedPath);
+	// #1667: every SOURCE's basis, not just the bare one - a multi-source server
+	// holds one resultId per identifier, and leaving even one behind lets the
+	// next pull inherit against content this resync replaced.
+	for (const key of pullSourceKeysForPath(state, normalizedPath)) {
+		state.pullResultIds?.delete(key);
+	}
+	// `pullRequestSequences` is deliberately NOT cleared here. It is a
+	// monotonic per-source counter, and resetting it would let a request issued
+	// BEFORE this resync claim the same number as one issued after, so the stale
+	// answer would pass the newest-request check. The two guards cover different
+	// cases and neither subsumes the other: the generation bump below invalidates
+	// in-flight work when nothing newer was requested, and the sequence stamp
+	// invalidates it when something newer was.
+	state.documentPullDiagnosticsBySource?.delete(normalizedPath);
+	// #1667: invalidate any pull still in flight for this path. The fan-out lets
+	// losing pulls run to completion so their findings still reach the cache;
+	// without this bump one of them could resurrect what this resync cleared.
+	bumpPullGeneration(state, normalizedPath);
 	state.workspacePullResultCache?.delete(normalizedPath);
 	legacy.diagnostics?.delete(normalizedPath);
 	legacy.diagnosticTimestamps?.delete(normalizedPath);
 }
 
+/**
+ * #1639: `durationMs` measures the PULL SETTLE ITSELF — the caller passes how
+ * long `clientRequestPullDiagnostics` (plus any retries) took to resolve
+ * `found`/`clean` — never time-since-didOpen. Document age is a genuinely
+ * useful signal but a DIFFERENT one; it stays under its own honest name in
+ * `metadata.elapsedSinceDidOpenMs`, exactly like the push-path `logSequence`
+ * above already does. Before this fix the top-level field carried the same
+ * age value pull requests use for retry-budget bookkeeping, so a session's
+ * latency percentiles for this phase read multi-second document lifetimes as
+ * millisecond operation costs (147/239 records read >60s "durations" for
+ * settles that took milliseconds).
+ *
+ * `version` reads the real tracked version from `diagnosticsVersionsByPath`
+ * (bumped by `bumpDiagnosticsVersion` right after this pull's diagnostics
+ * were stored — see the `documentPullDiagnostics.set` call above it) instead
+ * of a hardcoded `null`, which made every pull settle look "unbound" to
+ * staleness forensics even though this codebase already tracks a real
+ * version for the path. Falls back to the explicit `"pull-unversioned"`
+ * marker only when nothing has been stored yet, so "no data" is never
+ * confused with "confirmed no version" (`null`).
+ *
+ * `pullSettleSource` distinguishes the two legitimate call paths that can
+ * both settle a pull for the same file close together: a real
+ * content-collecting touch ("pull") and `ensureWarmForSweep`'s warm-up-only
+ * touch ("pull-warmup"), which runs a real round trip purely to prove the
+ * server answers before the sweep's real touch immediately follows it.
+ * Before this fix both logged identically as settleSource "pull", so a
+ * session with warm-up sweeps double-counted: 239 records against 145
+ * touches, with same-file pairs ~60ms apart and near-identical document
+ * ages — the warm-up settle and the real touch's settle for the same file.
+ */
 function logTypeScriptPullSettle(
 	state: LSPClientState,
 	normalizedPath: string,
+	durationMs: number,
+	pullSettleSource: "pull" | "pull-warmup",
 ): void {
 	if (state.serverId !== "typescript") return;
 	const diagnostics = state.documentPullDiagnostics.get(normalizedPath) ?? [];
@@ -1149,25 +1617,32 @@ function logTypeScriptPullSettle(
 		0,
 		Date.now() - (state.documentOpenedAt.get(normalizedPath) ?? Date.now()),
 	);
-	const diagnosticCodes = [...new Set(diagnostics
-		.map((diagnostic) => diagnostic.code)
-		.filter((code): code is string | number => code !== undefined)
-		.map(String))].slice(0, 8);
+	const diagnosticCodes = [
+		...new Set(
+			diagnostics
+				.map((diagnostic) => diagnostic.code)
+				.filter((code): code is string | number => code !== undefined)
+				.map(String),
+		),
+	].slice(0, 8);
+	const trackedVersion = state.diagnosticsVersionsByPath?.get(normalizedPath);
 	logLatency({
 		type: "phase",
 		phase: "lsp_typescript_diagnostic_sequence",
 		filePath: normalizedPath,
-		durationMs: elapsedSinceDidOpenMs,
+		durationMs,
 		metadata: {
+			serverId: state.serverId,
+			outcome: "settled",
 			launchVariant: state.launchVariant ?? "unknown",
 			publicationIndex:
 				state.diagnosticPublicationCounts.get(normalizedPath) ?? 0,
-			version: null,
+			version: trackedVersion ?? "pull-unversioned",
 			diagnosticCount: diagnostics.length,
 			diagnosticCodes,
 			elapsedSinceDidOpenMs,
 			settledReturn: true,
-			settleSource: "pull",
+			settleSource: pullSettleSource,
 		},
 	});
 }
@@ -1189,7 +1664,107 @@ function recordSentContent(
 	state.documentContentHashes.set(normalizedPath, {
 		version,
 		hash: hashDiagnosticContent(content),
+		// #1669: retain the full text only for Incremental — the sole reader
+		// (`buildContentChanges`) needs it to compute the NEXT change against
+		// what the server last saw; Full/None never read this field.
+		...(state.syncKind === TEXT_DOCUMENT_SYNC_KIND_INCREMENTAL && {
+			text: content,
+		}),
 	});
+	// #1641 criterion 3: the in-memory document's version + content length AT
+	// SEND TIME, so a later "diagnostic cited a line past current disk EOF"
+	// record (`diagnostic_past_eof`, clients/diagnostic-line-freshness.ts) can be
+	// paired with the send that produced the divergent in-memory document —
+	// today only the symptom (the stale citation) is observable; this is the
+	// cause side of the same timeline.
+	//
+	// Review round F4/F1: `contentLineCount` MUST use the same LSP-addressable
+	// convention as the gate itself (newline count + 1 — a trailing `\n` adds
+	// one more, empty, addressable line; an empty document is still 1 line),
+	// or the two records disagree by one at exactly the boundary this counter
+	// exists to help debug. Counted directly (no `.split("\n")`, which
+	// allocates one substring per line — measured at 13.3ms/200k allocations
+	// on a 7MB send) since only the COUNT is needed here, not the lines.
+	let newlineCount = 0;
+	for (let i = 0; i < content.length; i++) {
+		if (content.charCodeAt(i) === 10) newlineCount++;
+	}
+	logLatency({
+		type: "phase",
+		phase: "lsp_document_send",
+		filePath: normalizedPath,
+		durationMs: 0,
+		metadata: {
+			version,
+			contentLength: content.length,
+			contentLineCount: newlineCount + 1,
+		},
+	});
+}
+
+/**
+ * #1669: the `contentChanges` array for a `textDocument/didChange` notification.
+ *
+ * Full/None (or unrecognized/absent) sync kind: unchanged — a single
+ * whole-document `{ text }` event, the shape pi-lens has always sent.
+ *
+ * Incremental: a server registering Incremental-only expects every change
+ * event to carry a `range`; a shapeless whole-document event is out of spec
+ * for it. Rather than hand-roll a real diff, send the SAFEST incremental
+ * representation of a full update — one ranged edit spanning the entire
+ * PREVIOUS document (start of file to its last character), replacing it with
+ * the entire new content. That is spec-valid for any Incremental server and
+ * semantically identical to the Full-sync event it replaces.
+ *
+ * The previous document's end position is computed from the text
+ * `recordSentContent` retained for THIS path the last time content was sent
+ * (reusing that seam rather than a second parallel content store — see its
+ * doc comment). No prior text on record (first change since Incremental was
+ * negotiated, or the path was never sent before) falls back to the
+ * whole-document shape — still spec-valid, and self-heals once the next
+ * change has a retained previous text to diff against.
+ */
+function buildContentChanges(
+	state: LSPClientState,
+	normalizedPath: string,
+	content: string,
+): Array<{
+	range?: {
+		start: { line: number; character: number };
+		end: { line: number; character: number };
+	};
+	text: string;
+}> {
+	if (state.syncKind !== TEXT_DOCUMENT_SYNC_KIND_INCREMENTAL) {
+		return [{ text: content }];
+	}
+	const previousText = state.documentContentHashes.get(normalizedPath)?.text;
+	if (previousText === undefined) {
+		return [{ text: content }];
+	}
+	// #1669 review F6: split on every LSP line terminator (\r\n, lone \r, or
+	// \n), not just \n — a document using CRLF or lone-CR line endings would
+	// otherwise be undercounted, computing a range that ends mid-document
+	// instead of at the real last line.
+	const previousLines = previousText.split(/\r\n|\r|\n/);
+	const lastLine = previousLines.length - 1;
+	const lastLineText = previousLines[lastLine] ?? "";
+	return [
+		{
+			range: {
+				start: { line: 0, character: 0 },
+				end: {
+					line: lastLine,
+					character: convertCharacterOffset(
+						state.positionEncoding,
+						lastLineText,
+						lastLineText.length,
+					),
+				},
+			},
+			text: content,
+		},
+	];
 }
 
 // Methods that can be registered dynamically and map to operationSupport keys
@@ -1210,7 +1785,8 @@ const DYNAMIC_OPERATION_METHOD_MAP: Record<string, keyof LSPOperationSupport> =
 	};
 
 export function applyDynamicCapabilities(state: LSPClientState): void {
-	const registeredMethods = new Set(state.dynamicRegistrations.values());
+	const registrations = [...state.dynamicRegistrations.values()];
+	const registeredMethods = new Set(registrations.map((r) => r.method));
 
 	const hasDynamicPull =
 		registeredMethods.has("textDocument/diagnostic") ||
@@ -1220,7 +1796,16 @@ export function applyDynamicCapabilities(state: LSPClientState): void {
 		state.workspaceDiagnosticsSupport = {
 			advertised: true,
 			mode: "pull",
-			workspaceDiagnostics: registeredMethods.has("workspace/diagnostic"),
+			// #1667: workspace-pull support is what the REGISTRATION declares. The
+			// spec registers workspace pull as `registerOptions.workspaceDiagnostics`
+			// on a `textDocument/diagnostic` registration - `workspace/diagnostic` is
+			// not itself a registrable method - so reading the method name alone
+			// missed every conforming server and this client never issued a
+			// workspace pull for one. The method-name check stays as a fallback for
+			// servers that register it as a method anyway.
+			workspaceDiagnostics:
+				registrations.some((r) => r.workspaceDiagnostics === true) ||
+				registeredMethods.has("workspace/diagnostic"),
 			diagnosticProviderKind: "dynamic",
 		};
 	} else if (
@@ -1252,24 +1837,28 @@ export function applyDynamicCapabilities(state: LSPClientState): void {
  *   for a section it doesn't get must not silently receive unrelated config.
  * Exported for the #983 regression test.
  */
+export type ConfigurationSection =
+	| Record<string, unknown>
+	| unknown[]
+	| string
+	| number
+	| boolean
+	| null;
+
 export function resolveConfigurationSection(
 	initialization: Record<string, unknown> | undefined,
 	section: string | undefined,
-): unknown {
+): ConfigurationSection {
 	if (!initialization) return section ? null : {};
 	if (!section) return initialization;
 	let cur: unknown = initialization;
 	for (const part of section.split(".")) {
-		if (
-			typeof cur !== "object" ||
-			cur === null ||
-			!Object.prototype.hasOwnProperty.call(cur, part)
-		) {
+		if (typeof cur !== "object" || cur === null || !Object.hasOwn(cur, part)) {
 			return null;
 		}
 		cur = (cur as Record<string, unknown>)[part];
 	}
-	return cur;
+	return cur as ConfigurationSection;
 }
 
 // Exported (only) so tests can invoke the publishDiagnostics notification
@@ -1286,6 +1875,12 @@ export function setupIncomingHandlers(
 			diagnostics?: LSPDiagnostic[];
 			version?: number;
 		}) => {
+			// #1639: the settle operation's own clock for THIS publish. A
+			// "quiet-window" settle's durationMs below measures from here (when
+			// this publish arrived and — armed or re-armed — the debounce timer)
+			// to when that timer actually fires, i.e. the real debounce wait, not
+			// time-since-didOpen.
+			const publishReceivedAt = Date.now();
 			const filePath = uriToPath(params.uri);
 			const normalizedPath = normalizeMapKey(filePath);
 			// A server can flush a queued publish after didClose during teardown.
@@ -1314,14 +1909,43 @@ export function setupIncomingHandlers(
 				state.diagnosticPublicationCounts.set(normalizedPath, publicationIndex);
 			}
 			const diagnosticCodes = isTypeScriptTelemetry
-				? [...new Set(newDiags
-					.map((diagnostic) => diagnostic.code)
-					.filter((code): code is string | number => code !== undefined)
-					.map(String))].slice(0, 8)
+				? [
+						...new Set(
+							newDiags
+								.map((diagnostic) => diagnostic.code)
+								.filter((code): code is string | number => code !== undefined)
+								.map(String),
+						),
+					].slice(0, 8)
 				: [];
+			// #1639: `durationMs` measures the settle operation, never
+			// time-since-didOpen — document age keeps its own honest name in
+			// `metadata.elapsedSinceDidOpenMs`, exactly like the pull-path
+			// producer above. Before this fix EVERY call (settled or not) logged
+			// the doc-age value as durationMs, which is what actually produced
+			// the issue's cited evidence: this push-path producer, not the pull
+			// path, emitted all 239 records (147 of them >60s "durations" for
+			// settles that took milliseconds; a 61ms same-file pair is this
+			// function's OWN unsettled-then-settled shape — the
+			// `logSequence(false)` raw-receipt record immediately followed by
+			// the `logSequence(true, ...)` settle record for the same publish).
+			// - "first-push": settles immediately — the seed-first-push strategy
+			//   bypasses the debounce timer entirely, so there is no wait to
+			//   measure; durationMs is 0.
+			// - "quiet-window": the real debounce wait, timed from THIS publish's
+			//   own receipt (a later publish that re-arms the timer captures its
+			//   OWN `publishReceivedAt`, so a re-armed wait is timed from the
+			//   push that actually won the debounce, not the first one that lost
+			//   it).
+			// - "publication": a raw per-publication receipt, never itself a
+			//   settle — durationMs is 0 and `settledReturn` stays false. This
+			//   is the record that used to log with NO settleSource at all;
+			//   giving it one closes AC3 (distinguish, don't silently overload,
+			//   the phase's two shapes) for the pairs that actually occur.
 			const logSequence = (
 				settledReturn: boolean,
-				settleSource?: "first-push" | "quiet-window",
+				settleSource: "first-push" | "quiet-window" | "publication",
+				durationMs: number,
 			): void => {
 				if (state.serverId !== "typescript") return;
 				const elapsedSinceDidOpenMs = Math.max(
@@ -1333,16 +1957,18 @@ export function setupIncomingHandlers(
 					type: "phase",
 					phase: "lsp_typescript_diagnostic_sequence",
 					filePath: normalizedPath,
-					durationMs: elapsedSinceDidOpenMs,
+					durationMs,
 					metadata: {
+						serverId: state.serverId,
+						outcome: settledReturn ? "settled" : "published",
 						launchVariant: state.launchVariant ?? "unknown",
 						publicationIndex,
-						version: docVersion ?? null,
+						version: docVersion ?? "push-unversioned",
 						diagnosticCount: newDiags.length,
 						diagnosticCodes,
 						elapsedSinceDidOpenMs,
 						settledReturn,
-						...(settleSource && { settleSource }),
+						settleSource,
 					},
 				});
 			};
@@ -1416,10 +2042,12 @@ export function setupIncomingHandlers(
 				recordDocVersion();
 				bumpDiagnosticsVersion(state, normalizedPath);
 				state.diagnosticEmitter.emit("diagnostics", normalizedPath);
-				logSequence(true, "first-push");
+				// Immediate settle — no debounce wait to measure.
+				logSequence(true, "first-push", 0);
 				return;
 			}
-			logSequence(false);
+			// A raw per-publication receipt, not itself a settle.
+			logSequence(false, "publication", 0);
 
 			const existingTimer = state.pendingDiagnostics.get(normalizedPath);
 			if (existingTimer) clearTimeout(existingTimer);
@@ -1432,7 +2060,8 @@ export function setupIncomingHandlers(
 				recordDocVersion();
 				bumpDiagnosticsVersion(state, normalizedPath);
 				state.diagnosticEmitter.emit("diagnostics", normalizedPath);
-				logSequence(true, "quiet-window");
+				// The real debounce wait, timed from THIS publish's own receipt.
+				logSequence(true, "quiet-window", Date.now() - publishReceivedAt);
 			}, strategy.debounceMs);
 
 			state.pendingDiagnostics.set(normalizedPath, timer);
@@ -1448,22 +2077,40 @@ export function setupIncomingHandlers(
 			registrations?: Array<{
 				id: string;
 				method: string;
-				registerOptions?: { commands?: unknown };
+				registerOptions?: {
+					commands?: unknown;
+					identifier?: unknown;
+					workspaceDiagnostics?: unknown;
+				};
 			}>;
 		}) => {
 			for (const reg of params?.registrations ?? []) {
+				const options = reg.registerOptions;
+				const commands = Array.isArray(options?.commands)
+					? options.commands.filter(
+							(cmd): cmd is string => typeof cmd === "string",
+						)
+					: undefined;
 				if (reg.id && reg.method) {
-					state.dynamicRegistrations.set(reg.id, reg.method);
+					// #1667: keep the whole registration, not just its method. An empty
+					// `identifier` is treated as absent - it names no source, and
+					// sending `identifier: ""` would be a second, indistinguishable
+					// bare pull.
+					state.dynamicRegistrations.set(reg.id, {
+						method: reg.method,
+						...(typeof options?.identifier === "string" && options.identifier
+							? { identifier: options.identifier }
+							: {}),
+						...(typeof options?.workspaceDiagnostics === "boolean"
+							? { workspaceDiagnostics: options.workspaceDiagnostics }
+							: {}),
+						...(commands ? { commands } : {}),
+					});
 				}
 				// executeCommand commands can arrive dynamically too — merge them
 				// into the allowlist so dynamically-registered commands are runnable.
-				if (
-					reg.method === "workspace/executeCommand" &&
-					Array.isArray(reg.registerOptions?.commands)
-				) {
-					for (const cmd of reg.registerOptions.commands) {
-						if (typeof cmd === "string") state.advertisedCommands.add(cmd);
-					}
+				if (reg.method === "workspace/executeCommand" && commands) {
+					for (const cmd of commands) state.advertisedCommands.add(cmd);
 				}
 			}
 			applyDynamicCapabilities(state);
@@ -1472,9 +2119,30 @@ export function setupIncomingHandlers(
 	state.connection.onRequest(
 		"client/unregisterCapability",
 		async (params: { unregisterations?: Array<{ id: string }> }) => {
+			const retiredIdentifiers = new Set<string>();
 			for (const unreg of params?.unregisterations ?? []) {
-				if (unreg.id) {
-					state.dynamicRegistrations.delete(unreg.id);
+				if (!unreg.id) continue;
+				const registration = state.dynamicRegistrations.get(unreg.id);
+				state.dynamicRegistrations.delete(unreg.id);
+				if (
+					registration?.method === "textDocument/diagnostic" &&
+					registration.identifier
+				) {
+					retiredIdentifiers.add(registration.identifier);
+				}
+			}
+			// #1667: a retired source's cached findings and resultId must go with
+			// it, or the union keeps serving them. Checked after the deletes above,
+			// and only when NO surviving registration still speaks for that
+			// identifier.
+			const stillRegistered = new Set(
+				[...state.dynamicRegistrations.values()]
+					.filter((r) => r.method === "textDocument/diagnostic")
+					.map((r) => r.identifier),
+			);
+			for (const identifier of retiredIdentifiers) {
+				if (!stillRegistered.has(identifier)) {
+					retirePullSource(state, identifier);
 				}
 			}
 			applyDynamicCapabilities(state);
@@ -1497,13 +2165,12 @@ export function setupIncomingHandlers(
 				(state.activeMutationDepth ?? 0) === 1
 					? state.activeMutationContext
 					: undefined;
-			const telemetryContext: LspMutationContext =
-				context ?? {
-					cwd: state.root,
-					correlationId: newLspMutationCorrelationId(),
-					tool: "lsp-workspace-applyEdit",
-					source: "lsp-edit",
-				};
+			const telemetryContext: LspMutationContext = context ?? {
+				cwd: state.root,
+				correlationId: newLspMutationCorrelationId(),
+				tool: "lsp-workspace-applyEdit",
+				source: "lsp-edit",
+			};
 			try {
 				await applyWorkspaceEdit(
 					params.edit as Parameters<typeof applyWorkspaceEdit>[0],
@@ -1539,6 +2206,135 @@ export function setupIncomingHandlers(
 		},
 	);
 	state.connection.onRequest("window/workDoneProgress/create", async () => {});
+	// #1669: a server can send `workspace/diagnostic/refresh` (typically after a
+	// project-wide config change) to say every pull result it has already
+	// reported may be stale. Left unhandled, vscode-jsonrpc replies
+	// MethodNotFound to a server explicitly telling us its results are stale —
+	// this is exactly the signal `workspacePullResultCache` and the persisted
+	// workspace-diagnostics cache want (the #1461 family, server-initiated for
+	// once). Reply null per spec and drop both so the NEXT pull recomputes
+	// instead of replaying — or inheriting an `unchanged` basis from — results
+	// the server just told us to distrust.
+	// #1669 review R1: single-flight coalescing latch for the re-pull pool
+	// below, scoped to THIS client (one `setupIncomingHandlers` call per
+	// connection). A refresh FLOOD — a watch-mode rebuild or a `git checkout`
+	// can legitimately fire many `workspace/diagnostic/refresh` requests in a
+	// tight burst — used to queue one independent capped pool PER refresh:
+	// N refreshes meant N pools running concurrently (peak concurrency N x
+	// the per-pool cap) and N full passes over every open document (N x
+	// redundant pulls for the SAME documents). `refreshRepullRunning` gates a
+	// SECOND pool from ever starting while one is already in flight;
+	// `refreshRepullRerunRequested` remembers that at least one more refresh
+	// arrived meanwhile and coalesces it into exactly ONE trailing rerun
+	// after the current pool finishes, using a FRESH snapshot of open
+	// documents at rerun time (not the stale list from whenever the burst
+	// started) — so an arbitrarily large burst still costs at most 2 passes
+	// and never more than `REFRESH_REPULL_CONCURRENCY` pulls at once.
+	let refreshRepullRunning = false;
+	let refreshRepullRerunRequested = false;
+
+	const runRefreshRepullPool = async (): Promise<void> => {
+		do {
+			refreshRepullRerunRequested = false;
+			const toRepull =
+				state.workspaceDiagnosticsSupport.mode === "pull"
+					? [...state.openDocuments]
+					: [];
+			if (toRepull.length > 0) {
+				try {
+					await mapWithConcurrency(
+						toRepull,
+						REFRESH_REPULL_CONCURRENCY,
+						async (normalizedPath) => {
+							const uri = state.openDocumentUris?.get(normalizedPath);
+							const filePath = uri ? uriToPath(uri) : normalizedPath;
+							await clientRequestPullDiagnostics(state, filePath);
+						},
+					);
+				} catch (err) {
+					// #1669 review N2: rejections are observed, never
+					// `void`-swallowed — `clientRequestPullDiagnostics` itself never
+					// throws (it returns an `unavailable` outcome), so this only
+					// fires on a genuine programming error, but a silent throw
+					// inside `mapWithConcurrency`'s `Promise.all` must not vanish.
+					incrementDegradationCount({
+						kind: "lsp-pull-unconfirmed",
+						subject: state.serverId,
+						reason: `refresh re-pull threw: ${err instanceof Error ? err.message : String(err)}`,
+					});
+				}
+			}
+			// A refresh that arrived WHILE this pool was running gets exactly
+			// one more pass, never a pass per refresh.
+		} while (refreshRepullRerunRequested);
+		refreshRepullRunning = false;
+	};
+
+	state.connection.onRequest("workspace/diagnostic/refresh", async () => {
+		state.workspacePullResultCache.clear();
+		// #1669 review F1: clear every on-disk sweep cache this process has
+		// recorded a cwd for — `state.root` alone is a per-SERVER identity
+		// marker that a monorepo/multi-root project routinely nests BELOW the
+		// real sweep cwd, so clearing ONLY there would miss the cache file the
+		// sweep actually reads/writes. See the doc comment on
+		// `clearAllWorkspaceDiagnosticsCaches`.
+		clearAllWorkspaceDiagnosticsCaches();
+		// #1669 review N3: ALSO clear at `state.root` directly. The registry
+		// above only knows cwds a sweep has already run under IN THIS PROCESS —
+		// a refresh arriving before this project's first sweep this process
+		// (e.g. right after a respawn) would otherwise clear nothing at all,
+		// and a later sweep would load the untouched, now-genuinely-stale
+		// on-disk cache a PRIOR process/session left behind. `state.root` is
+		// the one cwd this handler can always reach regardless of registry
+		// state — a cheap, durable backstop for the common single-root case
+		// where root and sweep cwd coincide. It does NOT cover a monorepo
+		// subproject a sweep hasn't reached yet under a DIFFERENT cwd than
+		// `state.root` — that residual gap is tracked in #1707, not silently
+		// claimed as solved (see `clearAllWorkspaceDiagnosticsCaches`'s doc
+		// comment for the full shape).
+		clearWorkspaceDiagnosticsCacheAtAndAbove(state.root);
+		// #1669 review F3: a server-initiated "everything may be stale" signal
+		// must drop the SAME per-document state a normal resync already drops
+		// via `clearDiagnosticsForPath` (pullResultIds, pushDiagnostics,
+		// documentPullDiagnostics, diagnosticBindings,
+		// diagnosticsVersionsByPath, ...) — dropping only
+		// `workspacePullResultCache` above left every open document's OTHER
+		// pull state intact, so the next pull would echo a disowned
+		// `previousResultId`, get back `kind: "unchanged"`, and re-confirm
+		// stale diagnostics under a fresh timestamp; nothing would ever
+		// re-pull on its own. This clear is cheap and always runs — every
+		// refresh in a burst gets its own, unlike the re-pull pool below.
+		for (const normalizedPath of state.openDocuments) {
+			clearDiagnosticsForPath(state, normalizedPath);
+		}
+		// #1669 review N2: reply to the PROTOCOL request now — every clear
+		// above is synchronous and already complete, so there is nothing left
+		// this reply should wait on. The re-pull below is a background
+		// improvement (so an open document reflects the refresh without
+		// waiting on its next edit), never something worth delaying — or
+		// risking — the required `null` reply over.
+		if (
+			state.workspaceDiagnosticsSupport.mode === "pull" &&
+			state.openDocuments.size > 0
+		) {
+			if (refreshRepullRunning) {
+				// #1669 review R1: a pool is already in flight from an earlier
+				// refresh in this burst — coalesce instead of starting a second
+				// one.
+				refreshRepullRerunRequested = true;
+			} else {
+				refreshRepullRunning = true;
+				// `setImmediate` defers even the SYNCHRONOUS prefix of the pool
+				// (URI lookups, map bookkeeping) to the next tick, so it can
+				// never compete with this reply for the current one regardless
+				// of how many documents are open.
+				setImmediate(() => {
+					void runRefreshRepullPool();
+				});
+			}
+		}
+		return null;
+	});
 }
 
 /**
@@ -1603,6 +2399,41 @@ function setupConnectionLifecycle(
 			});
 		}
 	});
+
+	// #1969: the exit CAUSE, in the degradation ledger.
+	//
+	// The `exit` log above is one latency.log line per death. That line is
+	// necessary but not sufficient: an ast-grep child died 14 times in one day
+	// with `code=1` and empty stderr, and the only thing visible downstream was
+	// 19 `lsp_client_skipped_broken` cooldowns and 32 coverage gaps — fallout
+	// with no cause attached. The ledger is what a session-end health read
+	// looks at, so the cause belongs there too, counted per server.
+	//
+	// `close` rather than `exit`: `close` fires only after the child's stdio
+	// streams have drained, so "stderr was empty" is a statement about the
+	// server rather than a race against the pipe. `exit` can arrive first with
+	// stderr still buffered.
+	//
+	// Gated on `shutdownRequested` exactly as the exit log is — an eviction or
+	// an ordinary teardown is not a degradation and must not be recorded.
+	// `incrementDegradationCount` counts every occurrence and retains the
+	// latest reason per server, so a server dying in a loop shows as one entry
+	// with an honest count rather than N entries.
+	state.lspProcess.process.on("close", (code, signal) => {
+		if (state.shutdownRequested) return;
+		try {
+			const stderrTail = recentStderr(20);
+			incrementDegradationCount({
+				kind: "lsp-server-unexpected-close",
+				subject: state.serverId,
+				reason:
+					`closed unprompted: code=${code ?? "none"} signal=${signal ?? "none"} ` +
+					`stderr=${stderrTail.length > 0 ? `present(${stderrTail.length}b)` : "empty"} root=${state.root}`,
+			});
+		} catch {
+			// Telemetry must never break the observed path.
+		}
+	});
 }
 
 /**
@@ -1617,43 +2448,224 @@ type PullDiagnosticsOutcome =
 	| { status: "clean" }
 	| { status: "unavailable" };
 
+/**
+ * One diagnostic SOURCE's outcome. `primaryCount` is the part of `count` that
+ * belongs to the REQUESTED file — `count` also includes `relatedDocuments`.
+ * The fan-out races on `primaryCount` because "the answer arrived" means the
+ * file the caller asked about has an answer, not that some other document did.
+ */
+type PullSourceOutcome =
+	| { status: "found"; count: number; primaryCount: number }
+	| { status: "clean" }
+	| { status: "unavailable" };
+
+/** Margin between each source's own request timeout and the race's backstop
+ *  deadline, so the natural "all sources settled" path wins over the backstop
+ *  and the race never reports `unavailable` for sources that did answer. */
+const PULL_RACE_BACKSTOP_MARGIN_MS = 25;
+
+/**
+ * #1667: pull EVERY registered diagnostic source for a file, in parallel, and
+ * answer as soon as the first source returns findings for that file.
+ *
+ * Roslyn, vtsls and some Java setups register `textDocument/diagnostic` once
+ * per source (syntax, semantic, analyzers), each named by
+ * `registerOptions.identifier`. One bare request asks only the server's default
+ * source, so whole categories of findings were never requested. The fan-out
+ * asks all of them plus the bare request.
+ *
+ * Timing is deliberate and load-bearing:
+ *  - PARALLEL, never one source after another. Sequencing would add every
+ *    slow source's latency to every touch.
+ *  - The race resolves on the FIRST source with findings for the file, with no
+ *    settle or debounce window after the match. A post-match wait is the exact
+ *    latency shape #1112/#1407 already cost this codebase once.
+ *  - Losing sources are NOT cancelled. Each source writes its own findings into
+ *    the pull cache before it resolves, so a late answer merges in the
+ *    background and the NEXT read of the file sees it. Late answers are not
+ *    dropped, they are just not waited for.
+ *
+ * The race runs inside the existing `raceToCompletion` primitive rather than a
+ * second first-wins helper.
+ */
 async function clientRequestPullDiagnostics(
 	state: LSPClientState,
 	filePath: string,
 	budgetMs: number = PULL_REQUEST_TIMEOUT_MS,
 ): Promise<PullDiagnosticsOutcome> {
 	if (!isClientAlive(state)) return { status: "unavailable" };
-	const uri = pathToFileURL(filePath).href;
+	const sources = pullDiagnosticSources(state);
+	if (sources.length === 1) {
+		// The overwhelmingly common case: no named sources registered. Skip the
+		// race entirely so a single-source server pays nothing for this feature.
+		return aggregatePullOutcomes(state, filePath, [
+			await pullDiagnosticSource(state, filePath, budgetMs, undefined),
+		]);
+	}
+
+	const attempts = sources.map((identifier) =>
+		pullDiagnosticSource(state, filePath, budgetMs, identifier),
+	);
+	const settled = await raceToCompletion(
+		attempts,
+		(results) =>
+			results.some((r) => r.status === "found" && r.primaryCount > 0),
+		{
+			// No graceMs: finalize the instant a source answers for this file.
+			// The per-request `withTimeout` inside each attempt is the real bound;
+			// this deadline is only a backstop, so it sits just past it.
+			timeoutMs:
+				Math.max(1, Math.min(PULL_REQUEST_TIMEOUT_MS, budgetMs)) +
+				PULL_RACE_BACKSTOP_MARGIN_MS,
+		},
+	);
+	return aggregatePullOutcomes(state, filePath, settled);
+}
+
+/**
+ * Collapse the sources that answered into one outcome for the caller.
+ * `found` beats `clean` beats `unavailable`: a source with findings is an
+ * answer, an authoritative empty report is an answer, and only "nobody
+ * answered" is unavailable (#240 — an empty result must distinguish clean
+ * from errored).
+ */
+function aggregatePullOutcomes(
+	state: LSPClientState,
+	filePath: string,
+	outcomes: PullSourceOutcome[],
+): PullDiagnosticsOutcome {
+	const found = outcomes.filter((o) => o.status === "found");
+	if (found.length > 0) {
+		const normalizedPath = normalizeMapKey(filePath);
+		// The union for the requested file, which is what a caller reading the
+		// cache will see. A source that only reported `relatedDocuments` findings
+		// contributes nothing there, so fall back to its own count.
+		const unionCount =
+			state.documentPullDiagnostics.get(normalizedPath)?.length ?? 0;
+		return {
+			status: "found",
+			count: Math.max(unionCount, ...found.map((o) => o.count)),
+		};
+	}
+	// #240, applied across sources: `clean` is an authoritative "this file has no
+	// findings", and one source saying so proves nothing about a source that
+	// FAILED to answer. A fan-out where any source errored is therefore
+	// unavailable, not clean - the caller falls through to the push-wait/timeout
+	// backstop instead of recording a confirmed-clean touch it cannot support.
+	// (`raceToCompletion` drops still-pending promises from its result array, so
+	// "every source settled, none errored" is the only shape that reads clean.)
+	if (outcomes.some((o) => o.status === "unavailable")) {
+		return { status: "unavailable" };
+	}
+	return outcomes.some((o) => o.status === "clean")
+		? { status: "clean" }
+		: { status: "unavailable" };
+}
+
+async function pullDiagnosticSource(
+	state: LSPClientState,
+	filePath: string,
+	budgetMs: number,
+	identifier: string | undefined,
+): Promise<PullSourceOutcome> {
+	if (!isClientAlive(state)) return { status: "unavailable" };
 	const normalizedPath = normalizeMapKey(filePath);
+	// #1773: a budget at or below the usable floor cannot complete a real
+	// round trip. Skip the dispatch entirely — no `safeSendRequest` call, no
+	// generation/sequence claim — and say so with a distinct record, so
+	// `lsp_pull_diagnostic_timeout` only ever means a pull was genuinely
+	// attempted. The caller sees the same `unavailable` outcome a timeout
+	// would have produced (#240: unavailable, never a false clean), so
+	// nothing downstream of this call changes shape.
+	if (budgetMs < PULL_MIN_USABLE_BUDGET_MS) {
+		emitBounded(
+			"lsp_pull_skipped_budget_exhausted",
+			`${state.serverId}::${pullSourceKey(normalizedPath, identifier)}`,
+			{
+				type: "phase",
+				filePath: normalizedPath,
+				durationMs: 0,
+				metadata: {
+					identifier: identifier ?? "bare",
+					remainingBudgetMs: budgetMs,
+					server: state.serverId,
+				},
+			},
+			{
+				ledgerKind: "lsp-pull-skipped-budget-exhausted",
+				reason: `pull skipped on ${state.serverId}: budget already exhausted (${budgetMs}ms remaining)`,
+			},
+		);
+		return { status: "unavailable" };
+	}
+	const uri = pathToFileURL(filePath).href;
 	// #1104: echo the last resultId we hold for this document so a server that
 	// hasn't changed its view can answer `kind: "unchanged"` instead of
 	// recomputing — see the `kind === "unchanged"` branch below for how that's
 	// honored (inherit, never treat an omitted `items` as clean).
-	const previousResultId = state.pullResultIds.get(normalizedPath);
+	// #1667: read THIS source's id, never another source's. Result ids are
+	// issued per source, so echoing a syntax id on a semantic request asks the
+	// server to compare against a basis it never handed out.
+	const sourceKey = pullSourceKey(normalizedPath, identifier);
+	if (state.abandonedPullRequests?.has(sourceKey)) {
+		return { status: "unavailable" };
+	}
+	const previousResultId = state.pullResultIds.get(sourceKey);
+	// #1667: the generation this pull was computed against. A resync landing
+	// while the request is in flight bumps it, and every write below is dropped
+	// rather than resurrecting state the resync cleared.
+	const generation = pullGenerationFor(state, normalizedPath);
+	// #1667: claim the newest-request slot for THIS source. Two fan-outs can
+	// overlap for the same file with no resync between them (`ensureWarmForSweep`
+	// touches, then the real touch follows ~60ms later), so the generation check
+	// alone would let a slow answer from the earlier round land on top of a newer
+	// one. Re-checked at write time below.
+	const requestSequence = claimPullRequestSequence(state, sourceKey);
+	// #1889: give the request a cancellation token. `withTimeout` only abandons
+	// its await; aborting in the timeout branch below also sends `$/cancelRequest`
+	// so repeated touches cannot leave an aging backlog inside the server.
+	const requestStartedAt = Date.now();
+	const effectiveTimeoutMs = Math.max(
+		1,
+		Math.min(PULL_REQUEST_TIMEOUT_MS, budgetMs),
+	);
+	const pullAbort = new AbortController();
+	const pullSettlement = { cancelled: false };
+	const requestPromise = safeSendRequest<{
+		kind?: string;
+		resultId?: string;
+		items?: LSPDiagnostic[];
+		relatedDocuments?: Record<
+			string,
+			{ kind?: string; resultId?: string; items?: LSPDiagnostic[] }
+		>;
+	}>(
+		state.connection,
+		"textDocument/diagnostic",
+		{
+			textDocument: { uri },
+			// #1667: name the source this request is for, so the server answers
+			// from that source instead of its default one.
+			...(identifier !== undefined && { identifier }),
+			...(previousResultId !== undefined && { previousResultId }),
+		},
+		pullAbort.signal,
+		pullSettlement,
+	);
 	try {
 		// withTimeout is the backstop against a hung pull-mode server: without it
 		// this await never settles unless the stream is destroyed. Bounded by the
 		// smaller of the absolute ceiling and the caller's remaining wait budget.
 		// On timeout the caught error yields `unavailable` below (never a false
 		// `clean`), so it falls through to the push-wait/timeout backstop.
-		const report = await withTimeout(
-			safeSendRequest<{
-				kind?: string;
-				resultId?: string;
-				items?: LSPDiagnostic[];
-				relatedDocuments?: Record<
-					string,
-					{ kind?: string; resultId?: string; items?: LSPDiagnostic[] }
-				>;
-			}>(state.connection, "textDocument/diagnostic", {
-				textDocument: { uri },
-				...(previousResultId !== undefined && { previousResultId }),
-			}),
-			Math.max(1, Math.min(PULL_REQUEST_TIMEOUT_MS, budgetMs)),
-		);
+		const report = await withTimeout(requestPromise, effectiveTimeoutMs);
 
 		if (!report) {
-			recordPullFailure(state, "textDocument/diagnostic", new Error("empty response"));
+			recordPullFailure(
+				state,
+				"textDocument/diagnostic",
+				new Error("empty response"),
+			);
 			return { status: "unavailable" };
 		}
 
@@ -1665,29 +2677,58 @@ async function clientRequestPullDiagnostics(
 		// response describes whatever the server had when it answered, which for
 		// a pi-lens-opened document is exactly that last-sent payload.
 		const sentHash = state.documentContentHashes.get(normalizedPath)?.hash;
-		let totalCount: number;
+		// #1667: two ways this answer can already be obsolete, and neither may
+		// write. Report the round trip as unavailable - a superseded answer is not
+		// evidence the file is clean (#240).
+		//  - A resync landed while the request was in flight, so these findings
+		//    describe content that no longer exists.
+		//  - A LATER request for this same source has already been issued (an
+		//    overlapping fan-out), so this answer is the stale loser and would
+		//    clobber the newer result.
+		if (
+			pullGenerationFor(state, normalizedPath) !== generation ||
+			!isNewestPullRequest(state, sourceKey, requestSequence)
+		) {
+			return { status: "unavailable" };
+		}
+		let primaryCount: number;
 		if (report.kind === "unchanged") {
 			// #1104: same resultId basis as last time — an omitted `items` here
 			// means "no change", NOT "clean". Overwriting with `[]` would be the
 			// exact false-clean shape #570/#571 already fixed for the touch path;
 			// keep the previously stored diagnostics and binding as-is.
-			totalCount = state.documentPullDiagnostics.get(normalizedPath)?.length ?? 0;
+			// #1667: "the previously stored diagnostics" means THIS SOURCE's, so
+			// one source reporting unchanged neither inherits nor disturbs another
+			// source's findings for the same file.
+			primaryCount = pullSourceDiagnostics(
+				state,
+				normalizedPath,
+				identifier,
+			).length;
 			// Still a fresh confirmation as of `now` even though the content is
 			// unchanged — bump the timestamp so `getAllDiagnostics()` doesn't read
 			// this entry as aging purely because the server had nothing new to say.
 			state.documentPullDiagnosticTimestamps.set(normalizedPath, now);
 		} else {
 			const primaryItems = normalizeLspDiagnostics(report.items ?? []);
-			state.documentPullDiagnostics.set(normalizedPath, primaryItems);
+			// #1667: replace only this source's slice; `documentPullDiagnostics`
+			// becomes the deduped union of every source that has reported.
+			storePullSourceDiagnostics(
+				state,
+				normalizedPath,
+				identifier,
+				primaryItems,
+			);
 			state.documentPullDiagnosticTimestamps.set(normalizedPath, now);
 			bumpDiagnosticsVersion(state, normalizedPath);
 			state.diagnosticBindings.set(normalizedPath, { contentHash: sentHash });
-			totalCount = primaryItems.length;
+			primaryCount = primaryItems.length;
 		}
+		let totalCount = primaryCount;
 		if (report.resultId !== undefined) {
-			state.pullResultIds.set(normalizedPath, report.resultId);
+			state.pullResultIds.set(sourceKey, report.resultId);
 		} else {
-			state.pullResultIds.delete(normalizedPath);
+			state.pullResultIds.delete(sourceKey);
 		}
 
 		// #1531 note (pre-existing, unchanged): a related document's diagnostics are
@@ -1704,13 +2745,24 @@ async function clientRequestPullDiagnostics(
 			)) {
 				const relatedPath = uriToPath(relatedUri);
 				const relatedNormalized = normalizeMapKey(relatedPath);
+				// #1667: a related document's report belongs to the SAME source as
+				// the request that carried it, so it stores and inherits under that
+				// source's key too.
 				if (related?.kind === "unchanged") {
-					totalCount +=
-						state.documentPullDiagnostics.get(relatedNormalized)?.length ?? 0;
+					totalCount += pullSourceDiagnostics(
+						state,
+						relatedNormalized,
+						identifier,
+					).length;
 					state.documentPullDiagnosticTimestamps.set(relatedNormalized, now);
 				} else {
 					const relatedItems = normalizeLspDiagnostics(related?.items ?? []);
-					state.documentPullDiagnostics.set(relatedNormalized, relatedItems);
+					storePullSourceDiagnostics(
+						state,
+						relatedNormalized,
+						identifier,
+						relatedItems,
+					);
 					state.documentPullDiagnosticTimestamps.set(relatedNormalized, now);
 					// #1104: a related document's diagnostics were NOT computed against
 					// content we independently sent/fingerprinted (we never requested
@@ -1720,19 +2772,225 @@ async function clientRequestPullDiagnostics(
 					totalCount += relatedItems.length;
 				}
 				if (related?.resultId !== undefined) {
-					state.pullResultIds.set(relatedNormalized, related.resultId);
+					state.pullResultIds.set(
+						pullSourceKey(relatedNormalized, identifier),
+						related.resultId,
+					);
 				}
 			}
 		}
 
 		state.diagnosticEmitter.emit("diagnostics", normalizedPath);
 		return totalCount > 0
-			? { status: "found", count: totalCount }
+			? { status: "found", count: totalCount, primaryCount }
 			: { status: "clean" };
 	} catch (err) {
+		if (isPullTimeoutError(err, effectiveTimeoutMs)) {
+			trackAbandonedPullRequest(state, sourceKey, requestPromise);
+			pullAbort.abort();
+			recordPullTimeoutTelemetry({
+				scope: normalizedPath,
+				identifier,
+				effectiveBudgetMs: effectiveTimeoutMs,
+				hadPreviousResultId: previousResultId !== undefined,
+				elapsedMs: Date.now() - requestStartedAt,
+				server: state.serverId,
+			});
+			armLateAnswerTelemetry({
+				requestPromise,
+				scope: normalizedPath,
+				identifier,
+				subject: sourceKey,
+				requestStartedAt,
+				server: state.serverId,
+				settlement: pullSettlement,
+			});
+		}
 		recordPullFailure(state, "textDocument/diagnostic", err);
 		return { status: "unavailable" };
 	}
+}
+
+function trackAbandonedPullRequest(
+	state: LSPClientState,
+	sourceKey: string,
+	requestPromise: Promise<unknown>,
+): void {
+	if (!state.abandonedPullRequests) state.abandonedPullRequests = new Map();
+	state.abandonedPullRequests.set(sourceKey, requestPromise);
+	const release = () => {
+		if (state.abandonedPullRequests?.get(sourceKey) === requestPromise) {
+			state.abandonedPullRequests.delete(sourceKey);
+		}
+	};
+	requestPromise.then(release, release);
+}
+
+/**
+ * #1713: `withTimeout` rejects with this EXACT message (`clients/deadline-utils.ts`)
+ * only when its own timer wins the race — every other rejection is the request
+ * itself failing (bad params, dead connection, thrown by the server). Only the
+ * timer-won case is a "the answer might still be coming" situation worth a
+ * late-answer watch; a request that already failed fast has nothing further to
+ * observe.
+ */
+function isPullTimeoutError(err: unknown, timeoutMs: number): boolean {
+	return err instanceof Error && err.message === `Timeout after ${timeoutMs}ms`;
+}
+
+/**
+ * #1713: every pull timeout emits exactly one bounded latency.log record — the
+ * observability gap the issue names (`withTimeout`'s throw previously skipped
+ * ALL telemetry for this site). Never throws: telemetry must not perturb the
+ * timeout path, which has already decided to return `unavailable` regardless.
+ *
+ * #1743: routed through `emitBounded`. This phase takes NO rising-edge gate
+ * and NO per-turn cap, which is the pre-existing behavior kept exactly: a
+ * pull timeout costs at least the full budget (seconds), so the call cadence
+ * already bounds the volume, unlike `navRequest` below. The helper still
+ * supplies the identity discipline and the registry membership the sweep
+ * checks.
+ */
+function recordPullTimeoutTelemetry(args: {
+	scope: string;
+	identifier: string | undefined;
+	effectiveBudgetMs: number;
+	hadPreviousResultId: boolean;
+	elapsedMs: number;
+	server: string;
+}): void {
+	// #1771: this record is written on a genuine failure path (a dispatched
+	// pull that never answered), so per the bounded-telemetry rule
+	// (`clients/bounded-telemetry.ts`) it needs a `ledgerKind`, not just the
+	// detailed latency.log record. Before this it counted nothing in the
+	// degradation ledger — every occurrence wrote a detail line, but nothing
+	// tallied. No `risingEdgePer`: timeouts repeat and every one should count,
+	// matching the pre-existing "no rising-edge gate" behavior for the
+	// detailed record itself.
+	emitBounded(
+		"lsp_pull_diagnostic_timeout",
+		`${args.server}::${args.scope}::${args.identifier ?? "bare"}`,
+		{
+			type: "phase",
+			filePath: args.scope,
+			durationMs: args.elapsedMs,
+			metadata: {
+				identifier: args.identifier ?? "bare",
+				effectiveBudgetMs: args.effectiveBudgetMs,
+				hadPreviousResultId: args.hadPreviousResultId,
+				server: args.server,
+			},
+		},
+		{
+			ledgerKind: "lsp-pull-diagnostic-timeout",
+			reason: `pull timeout on ${args.server} after ${args.elapsedMs}ms (budget ${args.effectiveBudgetMs}ms)`,
+		},
+	);
+}
+
+/**
+ * #1713: a telemetry-only continuation on the ALREADY-abandoned request
+ * promise. `withTimeout` only raced it against a timer — the request is still
+ * live server-side — so if it eventually resolves, this is the only place that
+ * ever finds out. Purely observational: it runs after the caller has already
+ * moved on with `unavailable`, and it never writes into `state`.
+ *
+ * Bounded via the degradation-ledger convention (`incrementDegradationCount`,
+ * chosen over a hand-rolled per-identity rising-edge Set): the ledger already
+ * caps entries per kind and re-arms at `session_start`
+ * (`resetDegradationLedger`, wired into `handleSessionStart`), so reusing it
+ * avoids a second latch this fix would otherwise have to register and reset
+ * itself. `subject` is the same `pullSourceKey` (path + identifier) the pull
+ * path already uses, so the discriminating identity survives aggregation.
+ *
+ * Attaching `.then` here creates no timer, socket, or other handle — it only
+ * observes a promise the request already created — so it cannot keep the
+ * process alive a moment longer than that pending request already does.
+ */
+function armLateAnswerTelemetry(args: {
+	requestPromise: Promise<unknown>;
+	scope: string;
+	identifier: string | undefined;
+	subject: string;
+	requestStartedAt: number;
+	server: string;
+	settlement: { cancelled: boolean };
+}): void {
+	args.requestPromise.then(
+		() => {
+			if (args.settlement.cancelled) return;
+			try {
+				const elapsedMs = Date.now() - args.requestStartedAt;
+				// #1743: `emitBounded` counts every late answer in the ledger
+				// under the same `pullSourceKey` subject as before, then writes
+				// the record. No rising-edge gate, matching #1713's original
+				// behavior: a late answer arrives at most once per abandoned
+				// request, so the record count cannot exceed the timeout count.
+				emitBounded(
+					"lsp_pull_late_answer_discarded",
+					args.subject,
+					{
+						type: "phase",
+						filePath: args.scope,
+						durationMs: elapsedMs,
+						metadata: { identifier: args.identifier ?? "bare" },
+					},
+					{
+						ledgerKind: "lsp-pull-late-answer",
+						reason: `late pull answer discarded after ${elapsedMs}ms`,
+					},
+				);
+			} catch {
+				// Telemetry must never break the observed path.
+			}
+		},
+		(err: unknown) => {
+			// #1774: the abandoned request eventually REJECTED rather than
+			// answering. Behavior is unchanged — the rejection is still
+			// swallowed here, exactly as before — but "timeout then silence"
+			// and "timeout then server rejection (e.g. ContentModified)" were
+			// previously indistinguishable: `recordPullFailure` at request
+			// time reports the FIRST failure only, and this rejection happens
+			// strictly after that request already timed out, so it needs its
+			// own record. Bounded via the degradation ledger, same shape as
+			// the late-answer branch above, so this rejection cannot outpace
+			// the timeout count that gates it.
+			try {
+				const elapsedMs = Date.now() - args.requestStartedAt;
+				const candidate = err as { code?: unknown; message?: unknown };
+				const code =
+					typeof candidate?.code === "number" ||
+					typeof candidate?.code === "string"
+						? candidate.code
+						: undefined;
+				emitBounded(
+					"lsp_pull_late_rejection",
+					// #1774 review: prefix the server, same reason the timeout kind
+					// does (#1771). The workspace call site's `subject` is the bare
+					// `WORKSPACE_PULL_SCOPE` constant — without the server prefix,
+					// two servers' abandoned-workspace-pull rejections would collapse
+					// into one ledger subject and hide which server is storming.
+					`${args.server}::${args.subject}`,
+					{
+						type: "phase",
+						filePath: args.scope,
+						durationMs: elapsedMs,
+						metadata: {
+							identifier: args.identifier ?? "bare",
+							server: args.server,
+							...(code !== undefined && { code }),
+						},
+					},
+					{
+						ledgerKind: "lsp-pull-late-rejection",
+						reason: `late pull rejection ${elapsedMs}ms after timeout${code !== undefined ? ` (code ${code})` : ""}`,
+					},
+				);
+			} catch {
+				// Telemetry must never break the observed path.
+			}
+		},
+	);
 }
 
 const PULL_FAILURE_HISTORY_LIMIT = 10;
@@ -1743,8 +3001,10 @@ function recordPullFailure(
 	error: unknown,
 ): void {
 	const candidate = error as { code?: unknown; message?: unknown };
-	const message = typeof candidate.message === "string" ? candidate.message : "";
-	const unsupportedMessage = /^(?:method not found|unknown method|unsupported method)(?::|$)/i;
+	const message =
+		typeof candidate.message === "string" ? candidate.message : "";
+	const unsupportedMessage =
+		/^(?:method not found|unknown method|unsupported method)(?::|$)/i;
 	if (
 		candidate.code === -32601 ||
 		candidate.code === "-32601" ||
@@ -1758,9 +3018,7 @@ function recordPullFailure(
 			? { code: candidate.code }
 			: {}),
 		message:
-			typeof candidate.message === "string"
-				? candidate.message
-				: String(error),
+			typeof candidate.message === "string" ? candidate.message : String(error),
 	});
 	if (state.pullFailureHistory.length > PULL_FAILURE_HISTORY_LIMIT) {
 		state.pullFailureHistory.splice(
@@ -1781,28 +3039,75 @@ export async function clientRequestWorkspaceDiagnostics(
 	state: LSPClientState,
 	budgetMs: number,
 ): Promise<
-	| Array<{ filePath: string; diagnostics: LSPDiagnostic[]; contentHash?: string }>
+	| Array<{
+			filePath: string;
+			diagnostics: LSPDiagnostic[];
+			contentHash?: string;
+	  }>
 	| undefined
 > {
 	if (!isClientAlive(state)) return undefined;
 	if (!state.workspaceDiagnosticsSupport.workspaceDiagnostics) return undefined;
+	if (state.abandonedPullRequests?.has(WORKSPACE_PULL_SCOPE)) return undefined;
+	// #1104: echo every resultId we hold from a PRIOR pull so the server can
+	// answer `kind: "unchanged"` for files it hasn't recomputed, instead of
+	// resending (and us re-hashing) every file on every sweep.
+	const previousResultIds = Array.from(
+		state.workspacePullResultCache.values(),
+	).map((entry) => ({ uri: entry.uri, value: entry.resultId }));
+	// #1773: same floor as `pullDiagnosticSource` — an exhausted budget here is
+	// the SAME clamp-then-dispatch defect via a second entry point. Observed
+	// live in the 2026-08-20 plegma dogfood session via
+	// `lsp_workspace_diagnostics_start` (not just the `lens_diagnostics_full`
+	// fan-out `pullDiagnosticSource` covers), so this call site needs its own
+	// skip, not just a shared helper the caller happens to hit.
+	if (budgetMs < PULL_MIN_USABLE_BUDGET_MS) {
+		emitBounded(
+			"lsp_pull_skipped_budget_exhausted",
+			`${state.serverId}::${WORKSPACE_PULL_SCOPE}`,
+			{
+				type: "phase",
+				filePath: WORKSPACE_PULL_SCOPE,
+				durationMs: 0,
+				metadata: {
+					identifier: "bare",
+					remainingBudgetMs: budgetMs,
+					server: state.serverId,
+				},
+			},
+			{
+				ledgerKind: "lsp-pull-skipped-budget-exhausted",
+				reason: `workspace pull skipped on ${state.serverId}: budget already exhausted (${budgetMs}ms remaining)`,
+			},
+		);
+		return undefined;
+	}
+	// #1713: declared OUTSIDE the try so the catch below can still reach them —
+	// same shape as `pullDiagnosticSource` above. Captured outside `withTimeout`
+	// so a timeout still holds a live handle on the request for the late-answer
+	// watch.
+	const workspacePullStartedAt = Date.now();
+	const workspacePullTimeoutMs = Math.max(1, budgetMs);
+	const workspacePullAbort = new AbortController();
+	const workspacePullSettlement = { cancelled: false };
+	const workspaceRequestPromise = safeSendRequest<{
+		items?: Array<{
+			uri?: string;
+			kind?: string;
+			resultId?: string;
+			items?: LSPDiagnostic[];
+		}>;
+	}>(
+		state.connection,
+		"workspace/diagnostic",
+		{ previousResultIds },
+		workspacePullAbort.signal,
+		workspacePullSettlement,
+	);
 	try {
-		// #1104: echo every resultId we hold from a PRIOR pull so the server can
-		// answer `kind: "unchanged"` for files it hasn't recomputed, instead of
-		// resending (and us re-hashing) every file on every sweep.
-		const previousResultIds = Array.from(
-			state.workspacePullResultCache.values(),
-		).map((entry) => ({ uri: entry.uri, value: entry.resultId }));
 		const report = await withTimeout(
-			safeSendRequest<{
-				items?: Array<{
-					uri?: string;
-					kind?: string;
-					resultId?: string;
-					items?: LSPDiagnostic[];
-				}>;
-			}>(state.connection, "workspace/diagnostic", { previousResultIds }),
-			Math.max(1, budgetMs),
+			workspaceRequestPromise,
+			workspacePullTimeoutMs,
 		);
 		if (!report || !Array.isArray(report.items)) return undefined;
 		const out: Array<{
@@ -1810,6 +3115,16 @@ export async function clientRequestWorkspaceDiagnostics(
 			diagnostics: LSPDiagnostic[];
 			contentHash?: string;
 		}> = [];
+		// #1669 review N1: ONE deadline, shared across every "unchanged, no
+		// cached basis" fallback pull this call makes — not a fresh `budgetMs`
+		// grant handed to EACH one. A refresh clears `workspacePullResultCache`,
+		// so the very next sweep after a refresh can route every item down this
+		// path; granting each one the full budget serially turned a bounded call
+		// unbounded (measured: 6 files x 300ms budget = 1844ms; worst case is
+		// the normal case — 2000 files x 30s). Mirrors the shared-budget shape
+		// `runWorkspaceDiagnosticsSwept`'s `perFileMs` bounds each file to,
+		// scoped to fallback pulls made from within THIS one call.
+		const fallbackPullDeadline = Date.now() + Math.max(1, budgetMs);
 		for (const item of report.items) {
 			if (!item?.uri) continue;
 			const filePath = uriToPath(item.uri);
@@ -1820,7 +3135,60 @@ export async function clientRequestWorkspaceDiagnostics(
 				// `items`, so without this a file the server confirmed unchanged
 				// would silently drop out of the sweep result entirely.
 				const prior = state.workspacePullResultCache.get(normalizedPath);
-				if (!prior) continue; // no earlier basis to inherit — nothing to report
+				if (!prior) {
+					// #1669 review F4: no earlier basis to inherit (e.g. right after a
+					// `workspace/diagnostic/refresh` cleared `workspacePullResultCache`)
+					// — the server is answering "unchanged" against a resultId basis we
+					// no longer hold, so there is nothing honest to report for this
+					// file from THIS response. `continue`-ing here would make the file
+					// silently absent from `out`, which the caller reads as "clean" —
+					// a false clean for a file the server just told us it hasn't even
+					// looked at freshly. Treat it as needs-full-pull: request the
+					// per-file diagnostic directly instead.
+					const remainingMs = fallbackPullDeadline - Date.now();
+					if (remainingMs <= 0) {
+						// #1669 review N1: the shared fallback-pull deadline is already
+						// exhausted by earlier files in this same loop — bail WITHOUT
+						// attempting a request (never fabricate clean; this file was
+						// never actually asked about) and surface it as unavailable via
+						// the same degradation ledger path as a real unavailable pull.
+						incrementDegradationCount({
+							kind: "lsp-pull-unconfirmed",
+							subject: state.serverId,
+							reason:
+								"unchanged report with no workspacePullResultCache basis; the shared fallback-pull deadline was already exhausted by earlier files this sweep",
+						});
+						continue;
+					}
+					const outcome = await clientRequestPullDiagnostics(
+						state,
+						filePath,
+						remainingMs,
+					);
+					if (outcome.status === "found") {
+						out.push({
+							filePath,
+							diagnostics:
+								state.documentPullDiagnostics.get(normalizedPath) ?? [],
+							contentHash:
+								state.diagnosticBindings.get(normalizedPath)?.contentHash,
+						});
+					} else if (outcome.status === "unavailable") {
+						// Genuinely unconfirmed — never fabricate a clean result. Recorded
+						// via the shared degradation ledger (AGENTS.md: repeated
+						// degradations use incrementDegradationCount, not a hand-rolled
+						// counter) so a server that keeps racing refresh against sweeps
+						// is visible in aggregate instead of silently absorbed per-file.
+						incrementDegradationCount({
+							kind: "lsp-pull-unconfirmed",
+							subject: state.serverId,
+							reason:
+								"unchanged report with no workspacePullResultCache basis, and the per-file fallback pull was unavailable",
+						});
+					}
+					// "clean": genuinely clean, correctly absent from `out`.
+					continue;
+				}
 				if (item.resultId !== undefined) {
 					state.workspacePullResultCache.set(normalizedPath, {
 						...prior,
@@ -1865,6 +3233,31 @@ export async function clientRequestWorkspaceDiagnostics(
 		}
 		return out;
 	} catch (err) {
+		if (isPullTimeoutError(err, workspacePullTimeoutMs)) {
+			trackAbandonedPullRequest(
+				state,
+				WORKSPACE_PULL_SCOPE,
+				workspaceRequestPromise,
+			);
+			workspacePullAbort.abort();
+			recordPullTimeoutTelemetry({
+				scope: WORKSPACE_PULL_SCOPE,
+				identifier: undefined,
+				effectiveBudgetMs: workspacePullTimeoutMs,
+				hadPreviousResultId: previousResultIds.length > 0,
+				elapsedMs: Date.now() - workspacePullStartedAt,
+				server: state.serverId,
+			});
+			armLateAnswerTelemetry({
+				requestPromise: workspaceRequestPromise,
+				scope: WORKSPACE_PULL_SCOPE,
+				identifier: undefined,
+				subject: WORKSPACE_PULL_SCOPE,
+				requestStartedAt: workspacePullStartedAt,
+				server: state.serverId,
+				settlement: workspacePullSettlement,
+			});
+		}
 		recordPullFailure(state, "workspace/diagnostic", err);
 		return undefined;
 	}
@@ -1874,10 +3267,15 @@ export async function clientWaitForDiagnostics(
 	state: LSPClientState,
 	filePath: string,
 	timeoutMs: number,
-	options: { minVersion?: number; pullOnly?: boolean } = {},
+	options: {
+		minVersion?: number;
+		pullOnly?: boolean;
+		pullSettleSource?: "pull" | "pull-warmup";
+	} = {},
 ): Promise<void> {
 	const normalizedPath = normalizeMapKey(filePath);
 	const minVersion = options.minVersion;
+	const pullSettleSource = options.pullSettleSource ?? "pull";
 	// #1531: the freshness gate is PER PATH. `minVersion` is a reading of the
 	// client-global counter, and `diagnosticsVersionsByPath` stores that same
 	// counter's value at each store — the two are on one axis, so comparing them
@@ -1913,13 +3311,22 @@ export async function clientWaitForDiagnostics(
 		// `hasFreshDiagnostics()`, which is unconditionally true when there is no
 		// version baseline (`minVersion === undefined`), so a failed pull returned
 		// 0 and was read as a fresh clean.
+		// #1639: the settle operation's OWN clock — durationMs on the eventual
+		// log record measures from here, never from didOpen (that stays in
+		// metadata.elapsedSinceDidOpenMs, computed separately below).
+		const pullSettleStartedAt = Date.now();
 		let outcome = await clientRequestPullDiagnostics(
 			state,
 			filePath,
 			timeoutMs,
 		);
 		if (outcome.status === "found") {
-			logTypeScriptPullSettle(state, normalizedPath);
+			logTypeScriptPullSettle(
+				state,
+				normalizedPath,
+				Date.now() - pullSettleStartedAt,
+				pullSettleSource,
+			);
 			return;
 		}
 		let sawClean = outcome.status === "clean";
@@ -1950,12 +3357,22 @@ export async function clientWaitForDiagnostics(
 		}
 		if (options.pullOnly) {
 			if (outcome.status === "found" || sawClean) {
-				logTypeScriptPullSettle(state, normalizedPath);
+				logTypeScriptPullSettle(
+					state,
+					normalizedPath,
+					Date.now() - pullSettleStartedAt,
+					pullSettleSource,
+				);
 			}
 			return;
 		}
 		if (outcome.status === "found" || sawClean) {
-			logTypeScriptPullSettle(state, normalizedPath);
+			logTypeScriptPullSettle(
+				state,
+				normalizedPath,
+				Date.now() - pullSettleStartedAt,
+				pullSettleSource,
+			);
 			return;
 		}
 	}
@@ -2000,6 +3417,26 @@ export async function clientWaitForDiagnostics(
 	});
 }
 
+/**
+ * Queue a watched-files change for a file this client did not learn about
+ * through textDocument/didOpen or didChange — an external bash write/delete,
+ * or any other disk change outside the open-document sync path (#1668).
+ * Shares `handleNotifyOpen`'s per-client debounced queue (#271), so a burst
+ * of external changes coalesces into one notification per debounce window
+ * instead of flooding the server with one per file.
+ */
+export function handleNotifyExternalChange(
+	state: LSPClientState,
+	filePath: string,
+	type: number,
+): void {
+	if (!isClientAlive(state)) return;
+	const normalizedPath = normalizeMapKey(filePath);
+	const uri =
+		state.openDocumentUris?.get(normalizedPath) ?? pathToFileURL(filePath).href;
+	state.watchQueue.enqueue(uri, type);
+}
+
 export async function handleNotifyOpen(
 	state: LSPClientState,
 	filePath: string,
@@ -2010,7 +3447,8 @@ export async function handleNotifyOpen(
 ): Promise<void> {
 	if (!isClientAlive(state)) return;
 	const normalizedPath = normalizeMapKey(filePath);
-	const uri = state.openDocumentUris?.get(normalizedPath) ?? pathToFileURL(filePath).href;
+	const uri =
+		state.openDocumentUris?.get(normalizedPath) ?? pathToFileURL(filePath).href;
 
 	if (
 		state.openDocuments.has(normalizedPath) ||
@@ -2052,19 +3490,28 @@ export async function handleNotifyOpen(
 			state.documentOpenedAt.set(normalizedPath, Date.now());
 			state.diagnosticPublicationCounts.set(normalizedPath, 0);
 			if (!isClientAlive(state)) return;
-			await safeSendNotification(state.connection, "textDocument/didOpen", {
-				textDocument: { uri, languageId, version, text: content },
-			});
-			recordSentContent(state, normalizedPath, version, content);
+			const reopenSent = await safeSendNotification(
+				state.connection,
+				"textDocument/didOpen",
+				{ textDocument: { uri, languageId, version, text: content } },
+			);
+			// #1669 review F7: only mirror the send locally once it actually left
+			// the process — see safeSendNotification's doc comment.
+			if (reopenSent)
+				recordSentContent(state, normalizedPath, version, content);
 			state.openDocuments.add(normalizedPath);
 			state.openDocumentUris?.set(normalizedPath, uri);
 			return;
 		}
-		await safeSendNotification(state.connection, "textDocument/didChange", {
-			textDocument: { uri, version },
-			contentChanges: [{ text: content }],
-		});
-		recordSentContent(state, normalizedPath, version, content);
+		const changeSent = await safeSendNotification(
+			state.connection,
+			"textDocument/didChange",
+			{
+				textDocument: { uri, version },
+				contentChanges: buildContentChanges(state, normalizedPath, content),
+			},
+		);
+		if (changeSent) recordSentContent(state, normalizedPath, version, content);
 		return;
 	}
 
@@ -2099,10 +3546,12 @@ export async function handleNotifyOpen(
 
 	if (!isClientAlive(state)) return;
 
-	await safeSendNotification(state.connection, "textDocument/didOpen", {
-		textDocument: { uri, languageId, version: 0, text: content },
-	});
-	recordSentContent(state, normalizedPath, 0, content);
+	const openSent = await safeSendNotification(
+		state.connection,
+		"textDocument/didOpen",
+		{ textDocument: { uri, languageId, version: 0, text: content } },
+	);
+	if (openSent) recordSentContent(state, normalizedPath, 0, content);
 	state.pendingOpens.delete(normalizedPath);
 	state.openDocuments.add(normalizedPath);
 	state.closedDocuments?.delete(normalizedPath);
@@ -2136,18 +3585,28 @@ export async function handleNotifyChange(
 ): Promise<void> {
 	if (!isClientAlive(state)) return;
 	const normalizedPath = normalizeMapKey(filePath);
-	const uri = state.openDocumentUris?.get(normalizedPath) ?? pathToFileURL(filePath).href;
+	const uri =
+		state.openDocumentUris?.get(normalizedPath) ?? pathToFileURL(filePath).href;
 
 	if (!state.openDocuments.has(normalizedPath)) {
 		// Safety fallback: keep protocol ordering valid even if caller sends
 		// didChange before first didOpen for this document.
-		await safeSendNotification(state.connection, "textDocument/didOpen", {
-			textDocument: { uri, languageId: "plaintext", version: 0, text: content },
-		});
+		const fallbackOpenSent = await safeSendNotification(
+			state.connection,
+			"textDocument/didOpen",
+			{
+				textDocument: {
+					uri,
+					languageId: "plaintext",
+					version: 0,
+					text: content,
+				},
+			},
+		);
 		state.documentVersions.set(normalizedPath, 0);
 		state.documentOpenedAt.set(normalizedPath, Date.now());
 		state.diagnosticPublicationCounts.set(normalizedPath, 0);
-		recordSentContent(state, normalizedPath, 0, content);
+		if (fallbackOpenSent) recordSentContent(state, normalizedPath, 0, content);
 		state.openDocuments.add(normalizedPath);
 		state.openDocumentUris?.set(normalizedPath, uri);
 		return;
@@ -2158,11 +3617,15 @@ export async function handleNotifyChange(
 	// Clear stale diagnostics before sending new content so waitForDiagnostics
 	// doesn't return immediately with the previous edit's results.
 	clearDiagnosticsForPath(state, normalizedPath);
-	await safeSendNotification(state.connection, "textDocument/didChange", {
-		textDocument: { uri, version },
-		contentChanges: [{ text: content }],
-	});
-	recordSentContent(state, normalizedPath, version, content);
+	const changeSent = await safeSendNotification(
+		state.connection,
+		"textDocument/didChange",
+		{
+			textDocument: { uri, version },
+			contentChanges: buildContentChanges(state, normalizedPath, content),
+		},
+	);
+	if (changeSent) recordSentContent(state, normalizedPath, version, content);
 }
 
 /** Close a document through the same lifecycle path exposed by the client. */
@@ -2175,7 +3638,9 @@ export async function closeDocument(
 	if (!state.openDocuments.has(normalizedPath)) return;
 	await safeSendNotification(state.connection, "textDocument/didClose", {
 		textDocument: {
-			uri: state.openDocumentUris?.get(normalizedPath) ?? pathToFileURL(filePath).href,
+			uri:
+				state.openDocumentUris?.get(normalizedPath) ??
+				pathToFileURL(filePath).href,
 		},
 	});
 	state.openDocuments.delete(normalizedPath);
@@ -2192,9 +3657,81 @@ export async function closeDocument(
 	clearDiagnosticsForPath(state, normalizedPath);
 }
 
-export async function clientShutdown(
+/**
+ * #1620 residual review F1: `fast` and `processExiting` only ever escalate —
+ * a `true` demands strictly less work (or none) than a `false`, never more.
+ * `existing` covers `requested` when it is at least as demanding on BOTH
+ * axes, so deduping onto it can't silently downgrade what the new caller
+ * needs (e.g. a `processExiting` caller must never inherit a teardown that
+ * might still spawn `taskkill`).
+ */
+function isAtLeastAsAggressiveShutdown(
+	existing: LSPShutdownOptions,
+	requested: LSPShutdownOptions,
+): boolean {
+	return (
+		!!existing.fast >= !!requested.fast &&
+		!!existing.processExiting >= !!requested.processExiting
+	);
+}
+
+export function clientShutdown(
 	state: LSPClientState,
 	options: LSPShutdownOptions = {},
+): Promise<void> {
+	// #1620 residual 3: idempotent across racing callers — see the doc comment
+	// on `LSPClientState.shutdownPromise`. The FIRST call starts the real
+	// teardown and stores its promise; every subsequent call (any of the 8
+	// call sites, on the same state) whose options are no MORE aggressive
+	// awaits that same promise instead of running the RPC handshake and
+	// emitting `lsp_client_shutdown` again.
+	//
+	// #1620 residual review F1: a call whose options ARE more aggressive does
+	// NOT dedupe — it starts (and takes over as) its own teardown instead.
+	// The concrete failure this closes: `resetLSPService`'s session-exit path
+	// (`index.ts`) calls `shutdown({fast:true, processExiting:true})` — the
+	// event loop is already closing, and `processExiting` exists precisely so
+	// this teardown never spawns `taskkill` (a closing-loop `uv_async_send`
+	// hard-aborts, `src\win\async.c`). If a GRACEFUL teardown (default
+	// options — e.g. `client_ceiling_lru` eviction) is already in flight on
+	// this same client when the exit path arrives, blindly deduping would
+	// make the exit path inherit that graceful run's own `taskkill` spawn and
+	// its close-event wait — the exact hazard `processExiting` forbids, on
+	// top of blocking the closing loop for however long that takes. The
+	// weaker in-flight teardown is left to finish on its own (every step
+	// downstream — dispose, kill, deregister — is already idempotent).
+	if (
+		state.shutdownPromise &&
+		state.shutdownOptions &&
+		isAtLeastAsAggressiveShutdown(state.shutdownOptions, options)
+	) {
+		return state.shutdownPromise;
+	}
+	state.shutdownOptions = options;
+	const attempt = clientShutdownOnce(state, options);
+	state.shutdownPromise = attempt;
+	// #1620 residual review F3: a REJECTED teardown (e.g. `killProcessTree`
+	// throwing something its own internal catches don't cover) must not
+	// latch a permanently-rejected promise here — every later call, even one
+	// with equal or weaker options, would dedupe onto it forever and never
+	// retry, so the child leaks silently with no further kill/dispose/
+	// deregister attempt. Clear the latch on rejection (only if nothing more
+	// aggressive has already superseded it) so the NEXT call starts a fresh
+	// attempt instead of re-handing back the same dead promise. The rejection
+	// itself still propagates to whoever is awaiting `attempt` right now —
+	// this only affects callers that haven't asked yet.
+	attempt.catch(() => {
+		if (state.shutdownPromise === attempt) {
+			state.shutdownPromise = undefined;
+			state.shutdownOptions = undefined;
+		}
+	});
+	return attempt;
+}
+
+async function clientShutdownOnce(
+	state: LSPClientState,
+	options: LSPShutdownOptions,
 ): Promise<void> {
 	const shutdownStart = Date.now();
 	state.shutdownRequested = true;
@@ -2215,54 +3752,125 @@ export async function clientShutdown(
 	state.watchQueue?.cancel();
 	state.diagnosticEmitter.removeAllListeners();
 	let shutdownRequestTimedOut = false;
-	if (!options.fast) {
-		try {
-			await withTimeout(
-				safeSendRequest(state.connection, "shutdown", {}),
-				SHUTDOWN_REQUEST_TIMEOUT_MS,
-			);
-		} catch {
-			/* ignore — proceed to exit/kill so shutdown cannot hang the session */
-			shutdownRequestTimedOut = true;
+	let exitNotifyTimedOut = false;
+	// #1620 residual 1 / residual-review F2: a failure that ISN'T the timer
+	// winning was previously folded into the same "*TimedOut" flag as a real
+	// timeout — honest for the rolled-up `shutdownOutcome` (still "forced"
+	// either way), imprecise about WHICH failure happened. Two shapes land
+	// here, both meaning "no confirmation this reached the server":
+	//   (a) a genuine promise rejection that isn't the timer (an immediate
+	//       protocol error) — reaches the `catch` below.
+	//   (b) `safeSendRequest`/`safeSendNotification` SWALLOW a stream error
+	//       (EPIPE, disposed connection — `isStreamError`) and RESOLVE
+	//       instead of rejecting, so the `catch` never runs at all. A real
+	//       `shutdown` reply is `null`, never `undefined`, and a real `exit`
+	//       notify send returns `true`; `undefined`/`false` is the swallow
+	//       case. Without this, a coded EPIPE reported `shutdownOutcome:
+	//       "graceful"` — nothing was delivered, but the log called it clean.
+	let shutdownRequestUndelivered = false;
+	let exitNotifyUndelivered = false;
+	// #1620: the graceful handshake is BEST-EFFORT and the teardown is not. A
+	// teardown path must not depend on the health of the thing it is tearing
+	// down — the breaker fires exactly when the server is unresponsive. Keep the
+	// handshake inside the `try` and every irreversible teardown step in the
+	// `finally`, so disposal, the record, the deregistration, and the kill run no
+	// matter how the two writes behave, and so a future added await here cannot
+	// reintroduce the class.
+	try {
+		if (!options.fast) {
+			try {
+				const shutdownAck = await withTimeout(
+					safeSendRequest(state.connection, "shutdown", {}),
+					SHUTDOWN_REQUEST_TIMEOUT_MS,
+				);
+				if (shutdownAck === undefined) shutdownRequestUndelivered = true;
+			} catch (err) {
+				/* ignore — proceed to exit/kill so shutdown cannot hang the session */
+				if (isShutdownTimeoutError(err, SHUTDOWN_REQUEST_TIMEOUT_MS)) {
+					shutdownRequestTimedOut = true;
+				} else {
+					shutdownRequestUndelivered = true;
+				}
+			}
+			try {
+				const exitSent = await withTimeout(
+					safeSendNotification(state.connection, "exit", {}),
+					EXIT_NOTIFY_TIMEOUT_MS,
+				);
+				if (exitSent === false) exitNotifyUndelivered = true;
+			} catch (err) {
+				/* ignore — same reason as the request above */
+				if (isShutdownTimeoutError(err, EXIT_NOTIFY_TIMEOUT_MS)) {
+					exitNotifyTimedOut = true;
+				} else {
+					exitNotifyUndelivered = true;
+				}
+			}
 		}
-		try {
-			await safeSendNotification(state.connection, "exit", {});
-		} catch {
-			/* ignore */
-		}
-	}
-	disposeClientConnection(state);
-	const pid = state.lspProcess.pid;
-	logLatency({
-		type: "phase",
-		phase: "lsp_client_shutdown",
-		filePath: state.root,
-		durationMs: Date.now() - shutdownStart,
-		metadata: {
-			serverId: state.serverId,
-			pid,
-			fast: !!options.fast,
-			processExiting: !!options.processExiting,
-			shutdownRequestTimedOut,
-		},
-	});
-	// #449/#472: deregister this LSP child from the instance registry. Fire-
-	// and-forget (async fs, no spawn) — must not add latency/risk to shutdown,
-	// including the `processExiting` path where the event loop is closing
-	// (#234 forbids spawning here, but a plain fs write/rename is fine; even
-	// so, we don't await it to keep this teardown path as fast as before).
-	void removeLspChild(pid).catch((err) => {
+	} finally {
+		disposeClientConnection(state);
+		const pid = state.lspProcess.pid;
 		logLatency({
 			type: "phase",
-			phase: "lsp_registry_write_failed",
-			filePath: "",
-			durationMs: 0,
-			metadata: { op: "remove", pid, error: String(err) },
+			phase: "lsp_client_shutdown",
+			filePath: state.root,
+			durationMs: Date.now() - shutdownStart,
+			metadata: {
+				serverId: state.serverId,
+				pid,
+				fast: !!options.fast,
+				processExiting: !!options.processExiting,
+				shutdownRequestTimedOut,
+				// #1620: `shutdownRequestTimedOut` covered only the request half, so
+				// a hung exit notify was indistinguishable from a clean exit — and
+				// pre-fix no record was emitted at all. Report both halves plus one
+				// rolled-up verdict, so a forced teardown is countable from the log.
+				exitNotifyTimedOut,
+				// #1620 residual 1 / residual-review F2: the *Undelivered pair covers
+				// the failure the *TimedOut pair used to also claim — a rejection
+				// that is NOT the timer winning, OR (the F2 gap) a swallowed stream
+				// error that `safeSendRequest`/`safeSendNotification` resolved
+				// instead of rejecting, so no exception ever reached the catches
+				// above. Both still roll into shutdownOutcome "forced" below — an
+				// undelivered write is never reported as "graceful".
+				shutdownRequestUndelivered,
+				exitNotifyUndelivered,
+				shutdownOutcome: options.fast
+					? "fast"
+					: shutdownRequestTimedOut ||
+						  exitNotifyTimedOut ||
+						  shutdownRequestUndelivered ||
+						  exitNotifyUndelivered
+						? "forced"
+						: "graceful",
+			},
 		});
-	});
-	// On Windows, killing the direct child first can orphan grandchildren before
-	// taskkill can traverse the tree. Kill the full tree first and wait briefly.
-	await killProcessTree(state.lspProcess.process, pid, options);
+		// #449/#472: deregister this LSP child from the instance registry. Fire-
+		// and-forget (async fs, no spawn) — must not add latency/risk to shutdown,
+		// including the `processExiting` path where the event loop is closing
+		// (#234 forbids spawning here, but a plain fs write/rename is fine; even
+		// so, we don't await it to keep this teardown path as fast as before).
+		// #1724: pass this spawn's marker so removeLspChild can guard against a
+		// pid-recycling window (a NEW child claiming this exact pid before this
+		// fire-and-forget write lands) rather than removing whichever child
+		// currently sits at this pid.
+		void removeLspChild(pid, extractSpawnMarker(state.lspProcess.args)).catch(
+			(err) => {
+				logLatency({
+					type: "phase",
+					phase: "lsp_registry_write_failed",
+					filePath: "",
+					durationMs: 0,
+					metadata: { op: "remove", pid, error: String(err) },
+				});
+			},
+		);
+		// On Windows, killing the direct child first can orphan grandchildren before
+		// taskkill can traverse the tree. Kill the full tree first and wait briefly.
+		// Safe and idempotent on an already-exited child: killProcessTree returns
+		// early on an observed exit rather than signalling a possibly-recycled pid.
+		await killProcessTree(state.lspProcess.process, pid, options);
+	}
 }
 
 /**
@@ -2327,15 +3935,42 @@ export async function navRequest<T>(
 		normalizedPath !== undefined
 			? state.documentVersions.get(normalizedPath)
 			: undefined;
-	const result = (await withTimeout(
-		safeSendRequest<T>(state.connection, method, params, signal),
-		timeoutMs,
-	).catch((err: unknown) => {
-		if (err instanceof Error && err.message.startsWith("Timeout after")) {
-			return undefined;
-		}
-		throw err;
-	})) as T | undefined;
+	// #1716: captured OUTSIDE withTimeout, mirroring #1713's pull-diagnostic
+	// fix (`pullDiagnosticSource`), so a timeout's catch below still holds a
+	// live handle on the request for the late-answer watch. `withTimeout`
+	// only races it against a timer — the request keeps running server-side
+	// either way, and without this handle an abandoned answer would settle
+	// into the void with no way to observe it.
+	const requestStartedAt = Date.now();
+	const requestPromise = safeSendRequest<T>(
+		state.connection,
+		method,
+		params,
+		signal,
+	);
+	const result = (await withTimeout(requestPromise, timeoutMs).catch(
+		(err: unknown) => {
+			if (isNavTimeoutError(err, timeoutMs)) {
+				recordNavTimeoutTelemetry({
+					method,
+					scope: normalizedPath,
+					budgetMs: timeoutMs,
+					elapsedMs: Date.now() - requestStartedAt,
+				});
+				armNavLateAnswerTelemetry({
+					requestPromise,
+					method,
+					scope: normalizedPath,
+					requestStartedAt,
+				});
+				return undefined;
+			}
+			if (err instanceof Error && err.message.startsWith("Timeout after")) {
+				return undefined;
+			}
+			throw err;
+		},
+	)) as T | undefined;
 	// requestVersion === undefined (never opened, or version-less) → unaffected,
 	// matching the diagnostics path; the request timeout remains the backstop.
 	if (
@@ -2351,13 +3986,217 @@ export async function navRequest<T>(
 	return result;
 }
 
+/**
+ * #1716: `withTimeout` rejects with this EXACT message (`clients/deadline-
+ * utils.ts`) only when its own timer wins the race — mirrors #1713's
+ * `isPullTimeoutError`. Only the timer-won case is a "the answer might still
+ * be coming" situation worth a late-answer watch; a request that already
+ * failed fast (or a stale-message coincidence) has nothing further to
+ * observe. `navRequest`'s own behavior still falls back to the looser
+ * `startsWith` check afterward, unchanged, so this stricter check only gates
+ * telemetry — never the existing timeout-handling behavior.
+ */
+function isNavTimeoutError(err: unknown, timeoutMs: number): boolean {
+	return err instanceof Error && err.message === `Timeout after ${timeoutMs}ms`;
+}
+
+/**
+ * #1620 residual 1: `withTimeout` rejects with this EXACT message only when
+ * its own timer wins the race — mirrors #1713's `isPullTimeoutError` and
+ * #1716's `isNavTimeoutError`. `clientShutdown`'s two catches previously
+ * treated ANY rejection (a real timeout OR an immediate protocol error) as
+ * "timed out"; honest for the rolled-up `shutdownOutcome` (both are
+ * "forced"), imprecise for the per-field flag a log reader keys on.
+ */
+function isShutdownTimeoutError(err: unknown, timeoutMs: number): boolean {
+	return err instanceof Error && err.message === `Timeout after ${timeoutMs}ms`;
+}
+
+// #1716: subject/scope used when a nav request has no `staleCheckPath` (e.g.
+// workspaceSymbol, call-hierarchy follow-ups) — mirrors WORKSPACE_PULL_SCOPE
+// above for the same reason: telemetry identity needs a stable placeholder
+// where there is no real path.
+const NAV_REQUEST_NO_PATH_SCOPE = "*no-path*";
+
+/**
+ * #1716: `navRequest` is the highest-volume LSP call site — hover,
+ * definition, references, signatureHelp, documentSymbol, workspace/symbol,
+ * call hierarchy all route through it, often several times per turn. A stuck
+ * server can storm timeouts across many methods and files far faster than
+ * the pull-diagnostic path #1713 fixed, so a per-event latency.log write
+ * (that fix's shape) would itself become the flood. Every timeout is still
+ * counted exactly, via the degradation ledger (bounded, in-memory, no I/O),
+ * but only the RISING EDGE — the first occurrence per (method, file) this
+ * session — also pays for a detailed log write. `incrementDegradationCount`'s
+ * return value (`true` on the first occurrence for a kind/subject pair) is
+ * reused as that rising-edge gate instead of a second hand-rolled latch: it
+ * already re-arms at session_start via `resetDegradationLedger`, so this
+ * adds zero new module state. Never throws: telemetry must not perturb a
+ * path that has already decided to return `undefined` regardless.
+ */
+function recordNavTimeoutTelemetry(args: {
+	method: string;
+	scope: string | undefined;
+	budgetMs: number;
+	elapsedMs: number;
+}): void {
+	// #1743: `risingEdgePer: "identity"` is the same gate this site hand-rolled
+	// off `incrementDegradationCount`'s return value, now expressed as an
+	// option. The ledger still counts every timeout exactly, per (method, file).
+	emitBounded(
+		"lsp_nav_request_timeout",
+		`${args.method}:${args.scope ?? NAV_REQUEST_NO_PATH_SCOPE}`,
+		{
+			type: "phase",
+			filePath: args.scope ?? NAV_REQUEST_NO_PATH_SCOPE,
+			durationMs: args.elapsedMs,
+			metadata: { method: args.method, effectiveBudgetMs: args.budgetMs },
+		},
+		{
+			ledgerKind: "lsp-nav-request-timeout",
+			risingEdgePer: "identity",
+			reason: `timeout budget=${args.budgetMs}ms elapsed=${args.elapsedMs}ms`,
+		},
+	);
+}
+
+/**
+ * #1716: nav-request sibling of #1713's `armLateAnswerTelemetry`. A
+ * telemetry-only continuation on the ALREADY-abandoned request promise —
+ * purely observational, never touches `state`, and attaching `.then` here
+ * creates no new timer, socket, or other handle, so it cannot keep the
+ * process alive a moment longer than the pending request already does.
+ *
+ * Bounded the same way as the timeout record above: every late answer is
+ * counted exactly via the ledger, but only the rising edge per (method,
+ * file) also writes an `lsp_nav_late_answer_discarded` record.
+ *
+ * Nav answers are read-once — unlike diagnostics' persistent pull cache,
+ * there is no stale value this could poison — so this exists purely for
+ * observability: telling a dogfood session "truly hung" apart from
+ * "answered late", the same distinction #1713 made possible for pulls.
+ */
+function armNavLateAnswerTelemetry(args: {
+	requestPromise: Promise<unknown>;
+	method: string;
+	scope: string | undefined;
+	requestStartedAt: number;
+}): void {
+	args.requestPromise.then(
+		() => {
+			try {
+				const elapsedMs = Date.now() - args.requestStartedAt;
+				// #1743: same rising-edge gate as the timeout record above, now
+				// carried by the helper instead of hand-rolled here.
+				emitBounded(
+					"lsp_nav_late_answer_discarded",
+					`${args.method}:${args.scope ?? NAV_REQUEST_NO_PATH_SCOPE}`,
+					{
+						type: "phase",
+						filePath: args.scope ?? NAV_REQUEST_NO_PATH_SCOPE,
+						durationMs: elapsedMs,
+						metadata: { method: args.method },
+					},
+					{
+						ledgerKind: "lsp-nav-late-answer",
+						risingEdgePer: "identity",
+						reason: `late nav answer discarded after ${elapsedMs}ms`,
+					},
+				);
+			} catch {
+				// Telemetry must never break the observed path.
+			}
+		},
+		() => {
+			// The abandoned request eventually failed rather than answering —
+			// not an "answer discarded" event. Nothing more to record here; this
+			// handler exists so the request's eventual rejection never surfaces
+			// as an unhandled rejection.
+		},
+	);
+}
+
+/**
+ * #1969: pick the request the liveness probe may send to THIS server.
+ *
+ * The probe only needs a round-trip, so any request works — but it must be one
+ * the server advertised. #1277 originally hardcoded `workspace/symbol` because
+ * it needs no open document, and treated `MethodNotFound` as proof of life.
+ * That rationale is sound for the round-trip, and wrong as a default: a server
+ * that does not implement the method logs an error for every probe. ast-grep's
+ * tower_lsp backend wrote "got a 'workspace/symbol' request, but it is not
+ * implemented" on each one, and its `code=1` deaths clustered after them
+ * (#1969). pi-lens must not keep pushing an unimplemented method at a server
+ * just to learn it is awake.
+ *
+ * The ladder, best first:
+ *  1. `workspace/symbol` when `workspaceSymbolProvider` is advertised — the
+ *     #1277 probe, unchanged, and still needs no open document.
+ *  2. `textDocument/documentSymbol` on an already-open document when
+ *     `documentSymbolProvider` is advertised. Read-only, scoped to a document
+ *     the server already has, and cheap.
+ *  3. `textDocument/hover` at the start of an already-open document when
+ *     `hoverProvider` is advertised. This step is what keeps ast-grep covered:
+ *     `docs/servercapabilities.md:53` records its advertised set as
+ *     codeActionProvider, executeCommandProvider, hoverProvider and
+ *     textDocumentSync — no symbol provider of either kind. #1714's own
+ *     measurement (clients/lsp/index.ts, `paceAuxNotify`) timed hover against
+ *     the real ast-grep binary at 1 ms idle and 2086 ms behind 30 `didOpen`s,
+ *     the same ordering proof it recorded for `workspace/symbol`. So the
+ *     notify throttle keeps a real barrier here, not a hollow one.
+ *  4. Nothing. The caller then reports liveness from process and connection
+ *     state alone, and records that it did.
+ *
+ * `MethodNotFound`-counts-as-alive still holds for every probe: dynamic
+ * registration can retract a capability after `initialize`, and an error reply
+ * is still a reply. What changes is that pi-lens no longer PROVOKES that error
+ * on every probe.
+ */
+function chooseLivenessProbe(
+	state: LSPClientState,
+): { method: string; params: unknown } | undefined {
+	if (state.operationSupport?.workspaceSymbol === true) {
+		return {
+			method: "workspace/symbol",
+			params: { query: LIVENESS_PING_QUERY },
+		};
+	}
+	const openUri = firstOpenDocumentUri(state);
+	if (openUri === undefined) return undefined;
+	if (state.operationSupport?.documentSymbol === true) {
+		return {
+			method: "textDocument/documentSymbol",
+			params: { textDocument: { uri: openUri } },
+		};
+	}
+	if (state.operationSupport?.hover === true) {
+		return {
+			method: "textDocument/hover",
+			params: {
+				textDocument: { uri: openUri },
+				position: { line: 0, character: 0 },
+			},
+		};
+	}
+	return undefined;
+}
+
+/** URI of any document this client currently holds open, if it holds one. */
+function firstOpenDocumentUri(state: LSPClientState): string | undefined {
+	for (const normalizedPath of state.openDocuments) {
+		const uri = state.openDocumentUris?.get(normalizedPath);
+		if (uri !== undefined) return uri;
+	}
+	return undefined;
+}
+
 // #1277: cheap liveness round-trip used by the silent-clean gates in
 // `index.ts`. `isAlive()`/`checkAlive()` only look at process/connection
 // state — a server that accepted the notify write and then wedged (still
 // running, connection still open, just never replying) reads as "alive" by
 // those checks even though it will never answer anything again. This sends a
-// real request (`workspace/symbol`, chosen because it needs no open document)
-// and reports whether the connection round-tripped it — success, a genuine
+// real request (see `chooseLivenessProbe` for which, #1969) and reports
+// whether the connection round-tripped it — success, a genuine
 // protocol-level error (e.g. MethodNotFound), and a stream-destroyed/
 // cancelled response (safeSendRequest swallows those to `undefined`, so the
 // final `isClientAlive` re-check is what catches "died mid-flight") ALL count
@@ -2369,11 +4208,31 @@ async function clientPingLiveness(
 	timeoutMs: number = LIVENESS_PING_TIMEOUT_MS,
 ): Promise<boolean> {
 	if (!isClientAlive(state)) return false;
+	const probe = chooseLivenessProbe(state);
+	if (probe === undefined) {
+		// #1969: no advertised method to probe with, so this answer comes from
+		// process and connection state alone — exactly the checks the probe
+		// exists to strengthen. Say so in the ledger rather than let a weaker
+		// verdict pass as the strong one. Rising edge per server, via the
+		// ledger's own tally; the count carries the repeats.
+		try {
+			incrementDegradationCount({
+				kind: "lsp-liveness-probe-unsupported",
+				subject: state.serverId,
+				reason:
+					"no advertised request method to probe with (no " +
+					"workspaceSymbolProvider, and no open document with " +
+					"documentSymbolProvider or hoverProvider); liveness from " +
+					"process and connection state only",
+			});
+		} catch {
+			// Telemetry must never break the observed path.
+		}
+		return isClientAlive(state);
+	}
 	try {
 		await withTimeout(
-			safeSendRequest(state.connection, "workspace/symbol", {
-				query: LIVENESS_PING_QUERY,
-			}),
+			safeSendRequest(state.connection, probe.method, probe.params),
 			timeoutMs,
 		);
 	} catch (err) {
@@ -2411,7 +4270,8 @@ export async function runServerCommand(
 	}
 	state.serverEditsAllowed += 1;
 	state.activeMutationDepth = (state.activeMutationDepth ?? 0) + 1;
-	if (state.activeMutationDepth === 1) state.activeMutationContext = mutationContext;
+	if (state.activeMutationDepth === 1)
+		state.activeMutationContext = mutationContext;
 	else state.activeMutationContext = undefined;
 	try {
 		let result: unknown;
@@ -2439,8 +4299,12 @@ export async function runServerCommand(
 		return { executed: true, result };
 	} finally {
 		state.serverEditsAllowed -= 1;
-		state.activeMutationDepth = Math.max(0, (state.activeMutationDepth ?? 0) - 1);
-		if (state.activeMutationDepth === 0) state.activeMutationContext = undefined;
+		state.activeMutationDepth = Math.max(
+			0,
+			(state.activeMutationDepth ?? 0) - 1,
+		);
+		if (state.activeMutationDepth === 0)
+			state.activeMutationContext = undefined;
 	}
 }
 
@@ -2494,12 +4358,28 @@ function validateWorkspaceEditVersions(
 	edit: { documentChanges?: unknown[] },
 ): void {
 	for (const change of edit.documentChanges ?? []) {
-		if (typeof change !== "object" || change === null || !("textDocument" in change)) continue;
-		const textDocument = (change as { textDocument?: { uri?: unknown; version?: unknown } }).textDocument;
-		if (!textDocument || typeof textDocument.uri !== "string" || textDocument.version == null) continue;
-		const current = state.documentVersions.get(normalizeMapKey(uriToPath(textDocument.uri)));
+		if (
+			typeof change !== "object" ||
+			change === null ||
+			!("textDocument" in change)
+		)
+			continue;
+		const textDocument = (
+			change as { textDocument?: { uri?: unknown; version?: unknown } }
+		).textDocument;
+		if (
+			!textDocument ||
+			typeof textDocument.uri !== "string" ||
+			textDocument.version == null
+		)
+			continue;
+		const current = state.documentVersions.get(
+			normalizeMapKey(uriToPath(textDocument.uri)),
+		);
 		if (current === undefined || current !== textDocument.version) {
-			throw new Error(`stale workspace edit document version for ${textDocument.uri}`);
+			throw new Error(
+				`stale workspace edit document version for ${textDocument.uri}`,
+			);
 		}
 	}
 }
@@ -2559,7 +4439,10 @@ async function resolveCodeActionBestEffort(
 	if (action.edit) {
 		return {
 			...action,
-			edit: await normalizeClientWorkspaceEdit(state, action.edit as LSPWorkspaceEdit),
+			edit: await normalizeClientWorkspaceEdit(
+				state,
+				action.edit as LSPWorkspaceEdit,
+			),
 		};
 	}
 	let resolved: LSPCodeAction | null | undefined;
@@ -2580,7 +4463,13 @@ async function resolveCodeActionBestEffort(
 	if (!resolved || typeof resolved !== "object") return action;
 	const merged = { ...action, ...resolved };
 	return merged.edit
-		? { ...merged, edit: await normalizeClientWorkspaceEdit(state, merged.edit as LSPWorkspaceEdit) }
+		? {
+				...merged,
+				edit: await normalizeClientWorkspaceEdit(
+					state,
+					merged.edit as LSPWorkspaceEdit,
+				),
+			}
 		: merged;
 }
 
@@ -2737,10 +4626,21 @@ export async function createLSPClient(options: {
 	const diagnosticEmitter = new EventEmitter();
 	diagnosticEmitter.setMaxListeners(50);
 
+	// SAFETY: three fields below are seeded `undefined as unknown as T` because
+	// they cannot be built here. `workspaceDiagnosticsSupport` and
+	// `operationSupport` are derived from the server's `initialize` result, and
+	// `watchQueue`'s flush closure needs `state` itself. Each is assigned
+	// in this same function before `state` reaches any caller:
+	// `state.watchQueue` on the statement immediately after this literal, and
+	// the two capability fields right after the `initialize` handshake
+	// returns. Reorder that and the fields are genuinely `undefined` at their
+	// declared non-optional types.
 	const state: LSPClientState = {
 		isConnected: true,
 		isDestroyed: false,
 		shutdownRequested: false,
+		shutdownPromise: undefined,
+		shutdownOptions: undefined,
 		exitedAt: undefined,
 		connectionDisposed: false,
 		lastError: undefined,
@@ -2761,6 +4661,9 @@ export async function createLSPClient(options: {
 		documentContentHashes: new Map(),
 		diagnosticBindings: new Map(),
 		pullResultIds: new Map(),
+		documentPullDiagnosticsBySource: new Map(),
+		pullGenerations: new Map(),
+		pullRequestSequences: new Map(),
 		workspacePullResultCache: new Map(),
 		openDocuments: new Set(),
 		closedDocuments: new Set(),
@@ -2769,10 +4672,13 @@ export async function createLSPClient(options: {
 		projectIdentityProbedFiles: new Set(),
 		// these are filled in after initialize — cast to avoid two-phase init
 		workspaceDiagnosticsSupport:
+			// SAFETY: initialize fills this capability before any workspace diagnostic request.
 			undefined as unknown as LSPWorkspaceDiagnosticsSupport,
+		// SAFETY: initialize fills this capability before operation dispatch.
 		operationSupport: undefined as unknown as LSPOperationSupport,
 		staticDiagnosticsMode: "push-only",
 		positionEncoding: "utf-16",
+		syncKind: TEXT_DOCUMENT_SYNC_KIND_FULL,
 		dynamicRegistrations: new Map(),
 		advertisedCommands: new Set(),
 		serverEditsAllowed: 0,
@@ -2782,6 +4688,7 @@ export async function createLSPClient(options: {
 		root,
 		lspProcess,
 		// two-phase: the flush closure needs `state` (below)
+		// SAFETY: state construction completes before the flush closure can run.
 		watchQueue: undefined as unknown as WatchedFilesQueue,
 	};
 
@@ -2815,6 +4722,18 @@ export async function createLSPClient(options: {
 			initializeTimeoutMs,
 		);
 	} catch (err) {
+		// #1969: claim this kill BEFORE issuing it. `setupConnectionLifecycle`
+		// ran above, so its `exit` and `close` handlers are already armed on
+		// this child, and both read `state.shutdownRequested` to tell a crash
+		// from a teardown we asked for. The kill below is one we asked for.
+		// Without this line it reported as an unprompted death, fabricating a
+		// `lsp-server-unexpected-close` entry reading
+		// "code=1 signal=none stderr=empty" — character for character the
+		// ast-grep signature this issue exists to make trustworthy — every time
+		// a server merely failed to complete its handshake. It also silenced a
+		// false `lsp_server_unexpected_exit` latency line that this path has
+		// been writing since the #615 follow-up.
+		state.shutdownRequested = true;
 		// Hard-kill the hung process so it doesn't become a zombie.
 		// SIGTERM alone is unreliable on Windows for cmd.exe/PowerShell trees.
 		const pid = lspProcess.pid;
@@ -2822,17 +4741,19 @@ export async function createLSPClient(options: {
 		// A child registered above (recordLspChild) but never reaching a healthy
 		// createLSPClient return must still be deregistered here — otherwise the
 		// registry keeps a stale entry for a process we just killed.
-		void removeLspChild(pid).catch((err) => {
-			// best-effort — a stale registry entry is harmless (the reaper's
-			// liveness check will find it dead on the next sweep regardless)
-			logLatency({
-				type: "phase",
-				phase: "lsp_registry_write_failed",
-				filePath: "",
-				durationMs: 0,
-				metadata: { op: "remove", pid, error: String(err) },
-			});
-		});
+		void removeLspChild(pid, extractSpawnMarker(lspProcess.args)).catch(
+			(err) => {
+				// best-effort — a stale registry entry is harmless (the reaper's
+				// liveness check will find it dead on the next sweep regardless)
+				logLatency({
+					type: "phase",
+					phase: "lsp_registry_write_failed",
+					filePath: "",
+					durationMs: 0,
+					metadata: { op: "remove", pid, error: String(err) },
+				});
+			},
+		);
 		setTimeout(() => {
 			// #1114: gate on the process's own observed `exitCode`/`signalCode`,
 			// not `.killed` — `killProcessTree` above signals the POSIX process
@@ -2889,6 +4810,9 @@ export async function createLSPClient(options: {
 		detectWorkspaceDiagnosticsSupport(initResult);
 	state.operationSupport = detectOperationSupport(initResult);
 	state.positionEncoding = negotiatePositionEncoding(
+		(initResult as { capabilities?: unknown })?.capabilities,
+	);
+	state.syncKind = negotiateSyncKind(
 		(initResult as { capabilities?: unknown })?.capabilities,
 	);
 	state.rawCapabilityKeys = Object.keys(
@@ -2952,6 +4876,9 @@ export async function createLSPClient(options: {
 			async change(filePath, content) {
 				return handleNotifyChange(state, filePath, content);
 			},
+			watchedFileChange(filePath, type) {
+				handleNotifyExternalChange(state, filePath, type);
+			},
 		},
 
 		getDiagnostics(filePath) {
@@ -2969,7 +4896,11 @@ export async function createLSPClient(options: {
 		getAllDiagnostics() {
 			const result = new Map<
 				string,
-				{ diags: LSPDiagnostic[]; ts: number; binding?: StoredDiagnosticBinding }
+				{
+					diags: LSPDiagnostic[];
+					ts: number;
+					binding?: StoredDiagnosticBinding;
+				}
 			>();
 			const keys = new Set([
 				...state.pushDiagnostics.keys(),
@@ -2989,10 +4920,12 @@ export async function createLSPClient(options: {
 		},
 
 		getTrackedDiagnosticPaths() {
-			return [...new Set([
-				...state.pushDiagnostics.keys(),
-				...state.documentPullDiagnostics.keys(),
-			])].map((filePath) =>
+			return [
+				...new Set([
+					...state.pushDiagnostics.keys(),
+					...state.documentPullDiagnostics.keys(),
+				]),
+			].map((filePath) =>
 				process.platform === "win32" ? filePath.replace(/\//g, "\\") : filePath,
 			);
 		},
@@ -3048,6 +4981,10 @@ export async function createLSPClient(options: {
 				EXECUTE_COMMAND_TIMEOUT_MS,
 				mutationContext,
 			);
+		},
+
+		async executeReadOnlyCommand(command, args) {
+			return runReadOnlyServerCommand(state, command, args);
 		},
 
 		get diagnosticsVersion() {
@@ -3310,17 +5247,28 @@ export async function createLSPClient(options: {
 }
 
 // Helper to safely send notifications - catches stream destruction
+/**
+ * Returns `true` once the notification was actually handed to the transport,
+ * `false` when a stream error was swallowed (connection error handlers will
+ * update state separately). #1669 review F7: callers that mirror what they
+ * just told the server locally (`recordSentContent`) MUST gate on this
+ * return value — recording a send that never left the process would desync
+ * the mirror from what the server actually has, with nothing to self-heal
+ * it (the next Incremental range would be computed against content the
+ * server never saw).
+ */
 async function safeSendNotification(
 	connection: MessageConnection,
 	method: string,
 	params: unknown,
-): Promise<void> {
+): Promise<boolean> {
 	try {
 		await connection.sendNotification(method as never, params as never);
+		return true;
 	} catch (err) {
 		if (isStreamError(err)) {
 			// Silently ignore - stream was destroyed, connection error handlers will update state
-			return;
+			return false;
 		}
 		throw err;
 	}
@@ -3338,6 +5286,7 @@ async function safeSendRequest<T>(
 	// so a server stops computing a result the agent has already abandoned (#238
 	// Item 1). The rejection that follows is swallowed (treated as `undefined`).
 	signal?: AbortSignal,
+	settlement?: { cancelled: boolean },
 ): Promise<T | undefined> {
 	// Already abandoned before we even sent — don't bother the server.
 	if (signal?.aborted) return undefined;
@@ -3374,9 +5323,12 @@ async function safeSendRequest<T>(
 			try {
 				return (await send()) as T;
 			} catch (err) {
-				if (isStreamError(err) || isCancellationError(err)) {
-					// Stream destroyed, or we cancelled the request on abort — either
-					// way there is no result to return.
+				if (isCancellationError(err)) {
+					if (settlement) settlement.cancelled = true;
+					return undefined;
+				}
+				if (isStreamError(err)) {
+					// Stream destroyed; connection handlers update client state separately.
 					return undefined;
 				}
 				if (isContentModifiedError(err)) {

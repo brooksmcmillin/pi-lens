@@ -31,7 +31,10 @@ import { McpHarness } from "./harness.js";
 interface ModuleReportShape {
 	available: boolean;
 	semantic: { source: string; references: boolean; implementations: boolean };
-	api: Array<{ name: string; usedBy?: Array<{ file: string; symbol: string }> }>;
+	api: Array<{
+		name: string;
+		usedBy?: Array<{ file: string; symbol: string }>;
+	}>;
 }
 
 function textOf(res: Record<string, unknown>): string {
@@ -95,7 +98,12 @@ describe("pilens_analyze (warm) maintains the review graph over MCP", () => {
 	afterAll(() => {
 		harness.dispose();
 		try {
-			rmSync(projectDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+			rmSync(projectDir, {
+				recursive: true,
+				force: true,
+				maxRetries: 5,
+				retryDelay: 200,
+			});
 		} catch {
 			// OS reclaims the temp dir eventually.
 		}
@@ -114,7 +122,11 @@ describe("pilens_analyze (warm) maintains the review graph over MCP", () => {
 	it("gains a.ts's usedBy(b.ts) after warm-analyzing the importer", async () => {
 		const analyzeRes = await harness.request(11, "tools/call", {
 			name: "pilens_analyze",
-			arguments: { file: path.join(projectDir, "b.ts"), cwd: projectDir, flags: { "no-lsp": true } },
+			arguments: {
+				file: path.join(projectDir, "b.ts"),
+				cwd: projectDir,
+				flags: { "no-lsp": true },
+			},
 		});
 		expect((analyzeRes.result as { isError?: boolean }).isError).toBeFalsy();
 
@@ -129,9 +141,9 @@ describe("pilens_analyze (warm) maintains the review graph over MCP", () => {
 		// "review-graph", proof pilens_analyze maintained the graph, not just read it.
 		expect(report.semantic.source).toBe("review-graph");
 		const foo = report.api.find((entry) => entry.name === "foo");
-		expect(foo?.usedBy?.some((u) => u.file.replace(/\\/g, "/").endsWith("b.ts"))).toBe(
-			true,
-		);
+		expect(
+			foo?.usedBy?.some((u) => u.file.replace(/\\/g, "/").endsWith("b.ts")),
+		).toBe(true);
 	}, 30_000);
 });
 
@@ -153,7 +165,9 @@ describe("pilens_analyze (warm) also maintains the word index over MCP (#536 rid
 	}
 
 	beforeAll(async () => {
-		projectDir = mkdtempSync(path.join(tmpdir(), "pi-lens-analyze-wordindex-mcp-"));
+		projectDir = mkdtempSync(
+			path.join(tmpdir(), "pi-lens-analyze-wordindex-mcp-"),
+		);
 		writeFileSync(
 			path.join(projectDir, "tsconfig.json"),
 			JSON.stringify({ compilerOptions: { strict: true } }, null, 2),
@@ -172,7 +186,9 @@ describe("pilens_analyze (warm) also maintains the word index over MCP (#536 rid
 				content: "export function baseFn(): number {\n  return 1;\n}\n",
 			},
 		]);
-		snapshotDataRoot = mkdtempSync(path.join(tmpdir(), "pi-lens-analyze-wordindex-data-"));
+		snapshotDataRoot = mkdtempSync(
+			path.join(tmpdir(), "pi-lens-analyze-wordindex-data-"),
+		);
 		const previousDataDir = process.env.PILENS_DATA_DIR;
 		process.env.PILENS_DATA_DIR = snapshotDataRoot;
 		try {
@@ -219,8 +235,18 @@ describe("pilens_analyze (warm) also maintains the word index over MCP (#536 rid
 	afterAll(() => {
 		harness.dispose();
 		try {
-			rmSync(projectDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
-			rmSync(snapshotDataRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+			rmSync(projectDir, {
+				recursive: true,
+				force: true,
+				maxRetries: 5,
+				retryDelay: 200,
+			});
+			rmSync(snapshotDataRoot, {
+				recursive: true,
+				force: true,
+				maxRetries: 5,
+				retryDelay: 200,
+			});
 		} catch {
 			// OS reclaims the temp dir eventually.
 		}
@@ -236,7 +262,9 @@ describe("pilens_analyze (warm) also maintains the word index over MCP (#536 rid
 			results: Array<{ file: string }>;
 		};
 		expect(
-			beforePayload.results.some((r) => r.file.replace(/\\/g, "/").endsWith("widget.ts")),
+			beforePayload.results.some((r) =>
+				r.file.replace(/\\/g, "/").endsWith("widget.ts"),
+			),
 		).toBe(false);
 
 		const newFile = path.join(projectDir, "widget.ts");
@@ -262,7 +290,9 @@ describe("pilens_analyze (warm) also maintains the word index over MCP (#536 rid
 			results: Array<{ file: string }>;
 		};
 		expect(
-			afterPayload.results.some((r) => r.file.replace(/\\/g, "/").endsWith("widget.ts")),
+			afterPayload.results.some((r) =>
+				r.file.replace(/\\/g, "/").endsWith("widget.ts"),
+			),
 		).toBe(true);
 	}, 30_000);
 });

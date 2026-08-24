@@ -125,7 +125,12 @@ describe("ReadGuard.recordSymbolRead (#245 tie-in)", () => {
 			const guard = createReadGuard("s-doc-comment");
 			guard.recordSymbolRead(
 				file,
-				{ name: "isAgentNudgeEnabled", kind: "function", startLine: 1, endLine: 6 },
+				{
+					name: "isAgentNudgeEnabled",
+					kind: "function",
+					startLine: 1,
+					endLine: 6,
+				},
 				0,
 				0,
 			);

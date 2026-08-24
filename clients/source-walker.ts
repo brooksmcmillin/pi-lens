@@ -33,10 +33,7 @@ import * as path from "node:path";
 import type { ProjectIgnoreMatcher } from "./file-utils.js";
 import { isExcludedDirName } from "./file-utils.js";
 import { isGeneratedArtifactDirectoryName } from "./generated-artifacts.js";
-import {
-	createDeadline,
-	yieldIfOverBudget,
-} from "./cooperative-budget.js";
+import { createDeadline, yieldIfOverBudget } from "./cooperative-budget.js";
 
 /**
  * Read a directory's entries, returning `[]` for a permission-denied or
@@ -175,7 +172,10 @@ export type WalkDisposition = "recurse" | "skip" | "stop";
  * generalized from `visitCountEntry` (startup-scan) and
  * `chargeEntryBudget`/`classifyEntry` (source-filter).
  */
-export type WalkVisitor = (entry: fs.Dirent, fullPath: string) => WalkDisposition;
+export type WalkVisitor = (
+	entry: fs.Dirent,
+	fullPath: string,
+) => WalkDisposition;
 
 export interface StackWalkOptions {
 	/**

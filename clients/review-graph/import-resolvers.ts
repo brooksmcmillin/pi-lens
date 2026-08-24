@@ -154,7 +154,16 @@ function jsTsExtensionCandidates(
 		`${strippedBase}.mjs`,
 		`${strippedBase}.cjs`,
 	);
-	for (const index of ["index.ts", "index.tsx", "index.mts", "index.cts", "index.js", "index.jsx", "index.mjs", "index.cjs"]) {
+	for (const index of [
+		"index.ts",
+		"index.tsx",
+		"index.mts",
+		"index.cts",
+		"index.js",
+		"index.jsx",
+		"index.mjs",
+		"index.cjs",
+	]) {
 		candidates.push(path.join(base, index));
 	}
 	return [...new Set(candidates)];
@@ -191,7 +200,8 @@ function findWorkspaceModuleForSpecifier(
 		else if (source.startsWith(`${mod.name}/`))
 			subpath = source.slice(mod.name.length + 1);
 		if (subpath === undefined) continue;
-		if (!best || mod.name.length > best.mod.name.length) best = { mod, subpath };
+		if (!best || mod.name.length > best.mod.name.length)
+			best = { mod, subpath };
 	}
 	return best;
 }
@@ -253,7 +263,10 @@ function workspaceEntryCandidates(pkgRoot: string): string[] {
 /** Candidate paths for a workspace-package SUBPATH import (`@scope/pkg/foo`)
  * — same source-twin-preferring extension probe as a relative import, rooted
  * at the package dir instead of the importing file's dir. */
-function workspaceSubpathCandidates(pkgRoot: string, subpath: string): string[] {
+function workspaceSubpathCandidates(
+	pkgRoot: string,
+	subpath: string,
+): string[] {
 	const base = path.join(pkgRoot, subpath);
 	const strippedSubpath = subpath.replace(JS_TS_EXT_RE, "");
 	const strippedBase =

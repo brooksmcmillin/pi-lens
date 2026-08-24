@@ -10,10 +10,7 @@
  * host-neutral.
  */
 
-import {
-	loadPiLensGlobalConfig,
-	resolvePiLensFlag,
-} from "../lens-config.js";
+import { loadPiLensGlobalConfig, resolvePiLensFlag } from "../lens-config.js";
 import type { PiAgentAPI } from "../dispatch/types.js";
 import { loadPiLensProjectConfig } from "../project-lens-config.js";
 

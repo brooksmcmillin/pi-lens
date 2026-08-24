@@ -172,7 +172,9 @@ export class FormatService {
 				});
 
 				const result = await Promise.race([
-					loadFormatters().then(({ formatFile }) => formatFile(filePath, formatter)),
+					loadFormatters().then(({ formatFile }) =>
+						formatFile(filePath, formatter),
+					),
 					timeoutPromise,
 				]);
 				results.push(result);

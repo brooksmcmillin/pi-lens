@@ -15,7 +15,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { TRANSIENT_BASE_COOLDOWN_MS } from "../../clients/dispatch/runners/utils/availability-policy.ts";
+import { TRANSIENT_BASE_COOLDOWN_MS } from "../../clients/dispatch/runners/utils/availability-policy.js";
 
 const { safeSpawnAsync, logLatencySpy } = vi.hoisted(() => ({
 	safeSpawnAsync: vi.fn(),
@@ -182,9 +182,7 @@ describe("formatter PATH probes (#1495)", () => {
 		fs.writeFileSync(shellFile, "echo hi\n");
 
 		safeSpawnAsync.mockImplementation(async (_cmd: string, args: string[]) =>
-			(args as string[])[0] === "shfmt"
-				? foundResult("shfmt")
-				: timeoutResult,
+			(args as string[])[0] === "shfmt" ? foundResult("shfmt") : timeoutResult,
 		);
 
 		// Overlapping passes: the stalled one must not change the healthy one.
@@ -199,8 +197,8 @@ describe("formatter PATH probes (#1495)", () => {
 			.map((call) => call[0])
 			.filter((entry) => entry?.phase === "formatter_selected");
 		expect(
-			selections.find((entry) => entry.metadata?.formatter === "shfmt")?.metadata
-				?.reason,
+			selections.find((entry) => entry.metadata?.formatter === "shfmt")
+				?.metadata?.reason,
 		).not.toBe("probe-timeout");
 		expect(
 			selections.find((entry) => entry.metadata?.reason === "probe-timeout")

@@ -53,12 +53,19 @@ describe("fish-indent runner", () => {
 		try {
 			const filePath = path.join(env.tmpDir, "config.fish");
 			fs.writeFileSync(filePath, "function greet\n    echo hello\nend\n");
-			safeSpawnAsync.mockResolvedValue({ error: null, status: 0, stdout: "", stderr: "" });
+			safeSpawnAsync.mockResolvedValue({
+				error: null,
+				status: 0,
+				stdout: "",
+				stderr: "",
+			});
 
 			const runner = (
 				await import("../../../../clients/dispatch/runners/fish-indent.js")
 			).default;
-			const result = await runner.run(createFishCtx(filePath, env.tmpDir) as never);
+			const result = await runner.run(
+				createFishCtx(filePath, env.tmpDir) as never,
+			);
 
 			expect(result.status).toBe("succeeded");
 			expect(result.diagnostics).toHaveLength(0);
@@ -72,12 +79,19 @@ describe("fish-indent runner", () => {
 		try {
 			const filePath = path.join(env.tmpDir, "config.fish");
 			fs.writeFileSync(filePath, "function greet\necho hello\nend\n");
-			safeSpawnAsync.mockResolvedValue({ error: null, status: 1, stdout: "", stderr: "" });
+			safeSpawnAsync.mockResolvedValue({
+				error: null,
+				status: 1,
+				stdout: "",
+				stderr: "",
+			});
 
 			const runner = (
 				await import("../../../../clients/dispatch/runners/fish-indent.js")
 			).default;
-			const result = await runner.run(createFishCtx(filePath, env.tmpDir) as never);
+			const result = await runner.run(
+				createFishCtx(filePath, env.tmpDir) as never,
+			);
 
 			expect(result.status).toBe("succeeded");
 			expect(result.semantic).toBe("warning");
@@ -103,7 +117,9 @@ describe("fish-indent runner", () => {
 			const runner = (
 				await import("../../../../clients/dispatch/runners/fish-indent.js")
 			).default;
-			const result = await runner.run(createFishCtx(filePath, env.tmpDir) as never);
+			const result = await runner.run(
+				createFishCtx(filePath, env.tmpDir) as never,
+			);
 
 			expect(result.status).toBe("failed");
 			expect(result.semantic).toBe("blocking");
@@ -115,13 +131,16 @@ describe("fish-indent runner", () => {
 	});
 
 	it("skips when fish_indent is not available", async () => {
-		vi.doMock("../../../../clients/dispatch/runners/utils/runner-helpers.js", () => ({
-			createAvailabilityChecker: () => ({
-				isAvailable: () => false,
-				isAvailableAsync: async () => false,
-				getCommand: () => null,
+		vi.doMock(
+			"../../../../clients/dispatch/runners/utils/runner-helpers.js",
+			() => ({
+				createAvailabilityChecker: () => ({
+					isAvailable: () => false,
+					isAvailableAsync: async () => false,
+					getCommand: () => null,
+				}),
 			}),
-		}));
+		);
 		vi.resetModules();
 
 		const runner = (
@@ -131,7 +150,9 @@ describe("fish-indent runner", () => {
 		try {
 			const filePath = path.join(env.tmpDir, "config.fish");
 			fs.writeFileSync(filePath, "echo hello\n");
-			const result = await runner.run(createFishCtx(filePath, env.tmpDir) as never);
+			const result = await runner.run(
+				createFishCtx(filePath, env.tmpDir) as never,
+			);
 			expect(result.status).toBe("skipped");
 			expect(safeSpawnAsync).not.toHaveBeenCalled();
 		} finally {

@@ -60,12 +60,22 @@ describe("safe-spawn typed failure taxonomy", () => {
 	});
 
 	it("classifies errno intent while preserving the original Error as cause", async () => {
-		const missing = Object.assign(new Error("spawn missing ENOENT"), { code: "ENOENT" });
-		const denied = Object.assign(new Error("spawn denied EACCES"), { code: "EACCES" });
-		const other = Object.assign(new Error("spawn busy EBUSY"), { code: "EBUSY" });
+		const missing = Object.assign(new Error("spawn missing ENOENT"), {
+			code: "ENOENT",
+		});
+		const denied = Object.assign(new Error("spawn denied EACCES"), {
+			code: "EACCES",
+		});
+		const other = Object.assign(new Error("spawn busy EBUSY"), {
+			code: "EBUSY",
+		});
 
-		const missingFailure = await classifySpawnFailure(missing, { command: "missing" });
-		const deniedFailure = await classifySpawnFailure(denied, { command: "denied" });
+		const missingFailure = await classifySpawnFailure(missing, {
+			command: "missing",
+		});
+		const deniedFailure = await classifySpawnFailure(denied, {
+			command: "denied",
+		});
 		const otherFailure = await classifySpawnFailure(other, { command: "busy" });
 
 		expect(missingFailure.kind).toBe("tool-not-found");
@@ -78,7 +88,11 @@ describe("safe-spawn typed failure taxonomy", () => {
 		expect(logExtension).toHaveBeenCalledWith(
 			expect.objectContaining({
 				level: "debug",
-				metadata: { kind: "permission-denied", command: "denied", cwd: undefined },
+				metadata: {
+					kind: "permission-denied",
+					command: "denied",
+					cwd: undefined,
+				},
 			}),
 		);
 		expect(getDegradationSummary()).toEqual([

@@ -23,19 +23,44 @@ const CASES: Array<{
 	ctx: AutofixPolicyContext;
 	expect: string;
 }> = [
-	{ label: "js+eslint", file: "a.ts", ctx: { hasEslintConfig: true }, expect: "eslint" },
-	{ label: "js+oxlint", file: "a.ts", ctx: { hasOxlintConfig: true }, expect: "oxlint" },
+	{
+		label: "js+eslint",
+		file: "a.ts",
+		ctx: { hasEslintConfig: true },
+		expect: "eslint",
+	},
+	{
+		label: "js+oxlint",
+		file: "a.ts",
+		ctx: { hasOxlintConfig: true },
+		expect: "oxlint",
+	},
 	{ label: "js default", file: "a.ts", ctx: {}, expect: "biome" },
 	{ label: "python", file: "a.py", ctx: {}, expect: "ruff" },
 	{ label: "css", file: "a.css", ctx: {}, expect: "stylelint" },
 	{ label: "sql", file: "a.sql", ctx: {}, expect: "sqlfluff" },
 	{ label: "ruby", file: "a.rb", ctx: {}, expect: "rubocop" },
 	{ label: "kotlin default", file: "a.kt", ctx: {}, expect: "ktlint" },
-	{ label: "kotlin+detekt", file: "a.kt", ctx: { hasDetektConfig: true }, expect: "detekt" },
-	{ label: "kotlin+ktfmt", file: "a.kt", ctx: { hasKtfmtConfig: true }, expect: "ktfmt" },
+	{
+		label: "kotlin+detekt",
+		file: "a.kt",
+		ctx: { hasDetektConfig: true },
+		expect: "detekt",
+	},
+	{
+		label: "kotlin+ktfmt",
+		file: "a.kt",
+		ctx: { hasKtfmtConfig: true },
+		expect: "ktfmt",
+	},
 	{ label: "rust", file: "a.rs", ctx: {}, expect: "rust-clippy" },
 	{ label: "dart", file: "a.dart", ctx: {}, expect: "dart-analyze" },
-	{ label: "go", file: "a.go", ctx: { hasGolangciConfig: true }, expect: "golangci-lint" },
+	{
+		label: "go",
+		file: "a.go",
+		ctx: { hasGolangciConfig: true },
+		expect: "golangci-lint",
+	},
 	{ label: "markdown", file: "a.md", ctx: {}, expect: "markdownlint" },
 ];
 
@@ -50,8 +75,12 @@ describe("autofix policy ↔ capabilities ↔ lint policy consistency", () => {
 
 	it("every selectable autofix tool is declared safePipelineAutofix capable", () => {
 		for (const c of CASES) {
-			for (const tool of getAutofixPolicyForFile(c.file, c.ctx)?.preferredTools ?? []) {
-				expect(getAutofixCapability(tool)?.safePipelineAutofix, `${c.label}:${tool}`).toBe(true);
+			for (const tool of getAutofixPolicyForFile(c.file, c.ctx)
+				?.preferredTools ?? []) {
+				expect(
+					getAutofixCapability(tool)?.safePipelineAutofix,
+					`${c.label}:${tool}`,
+				).toBe(true);
 			}
 		}
 	});
@@ -59,12 +88,16 @@ describe("autofix policy ↔ capabilities ↔ lint policy consistency", () => {
 	it("every safePipelineAutofix-capable tool is reachable from the policy", () => {
 		const reachable = new Set<string>();
 		for (const c of CASES) {
-			for (const tool of getAutofixPolicyForFile(c.file, c.ctx)?.preferredTools ?? []) {
+			for (const tool of getAutofixPolicyForFile(c.file, c.ctx)
+				?.preferredTools ?? []) {
 				reachable.add(tool);
 			}
 		}
 		for (const tool of listSafePipelineAutofixTools()) {
-			expect(reachable.has(tool), `capability '${tool}' not wired into any autofix policy`).toBe(true);
+			expect(
+				reachable.has(tool),
+				`capability '${tool}' not wired into any autofix policy`,
+			).toBe(true);
 		}
 	});
 
@@ -76,9 +109,10 @@ describe("autofix policy ↔ capabilities ↔ lint policy consistency", () => {
 			const lint = getLinterPolicyForFile(c.file, c.ctx);
 			if (!autofix || !lint) continue; // some langs (rs/dart) have no lint policy
 			if (lint.gate === "mixed") continue;
-			expect(autofix.gate, `${c.label}: autofix ${autofix.gate} vs lint ${lint.gate}`).toBe(
-				lint.gate,
-			);
+			expect(
+				autofix.gate,
+				`${c.label}: autofix ${autofix.gate} vs lint ${lint.gate}`,
+			).toBe(lint.gate);
 		}
 	});
 });

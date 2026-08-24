@@ -31,8 +31,12 @@ function makeGraph(
 }
 
 let tmpDir: string;
-beforeEach(() => { tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-model-")); });
-afterEach(() => { removeTempDirSync(tmpDir); });
+beforeEach(() => {
+	tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-model-"));
+});
+afterEach(() => {
+	removeTempDirSync(tmpDir);
+});
 
 // ── buildCodebaseModel ────────────────────────────────────────────────────────
 
@@ -88,7 +92,9 @@ describe("buildCodebaseModel", () => {
 			"/proj/src/generated/client.ts:generatedClient": 3.0,
 			"/proj/src/real.ts:realFn": 2.0,
 		});
-		const names = buildCodebaseModel(graph, "/proj").entries.map((entry) => entry.name);
+		const names = buildCodebaseModel(graph, "/proj").entries.map(
+			(entry) => entry.name,
+		);
 		expect(names).toEqual(["realFn"]);
 	});
 
@@ -136,7 +142,10 @@ describe("buildCodebaseModel", () => {
 	});
 
 	it("caps calls and calledBy at 10 each", () => {
-		const manyCallers = Array.from({ length: 15 }, (_, i) => `/proj/x${i}.ts:fn${i}`);
+		const manyCallers = Array.from(
+			{ length: 15 },
+			(_, i) => `/proj/x${i}.ts:fn${i}`,
+		);
 		const graph = makeGraph(
 			{ "/proj/b.ts:popular": 15.0 },
 			{ "/proj/b.ts:popular": manyCallers },
@@ -194,7 +203,10 @@ describe("saveCodebaseModel / loadCodebaseModel", () => {
 	it("round-trips the model correctly", () => {
 		process.env.PILENS_DATA_DIR = tmpDir;
 		const graph = makeGraph({ "/proj/src/foo.ts:bar": 3.0 });
-		const identity = { reviewGraphVersion: "v8", reviewGraphSignature: "sig-model" };
+		const identity = {
+			reviewGraphVersion: "v8",
+			reviewGraphSignature: "sig-model",
+		};
 		const keyedModel = buildCodebaseModel(graph, "/proj", 1500, identity);
 		saveCodebaseModel("/proj", keyedModel);
 		const loaded = loadCodebaseModel("/proj", identity);
@@ -207,10 +219,22 @@ describe("saveCodebaseModel / loadCodebaseModel", () => {
 
 	it("invalidates a cache with a mismatched version", () => {
 		process.env.PILENS_DATA_DIR = tmpDir;
-		const identity = { reviewGraphVersion: "v8", reviewGraphSignature: "sig-model" };
-		const model = buildCodebaseModel(makeGraph({ "/proj/src/foo.ts:bar": 3.0 }), "/proj", 1500, identity);
+		const identity = {
+			reviewGraphVersion: "v8",
+			reviewGraphSignature: "sig-model",
+		};
+		const model = buildCodebaseModel(
+			makeGraph({ "/proj/src/foo.ts:bar": 3.0 }),
+			"/proj",
+			1500,
+			identity,
+		);
 		saveCodebaseModel("/proj", model);
-		const cachePath = path.join(getProjectDataDir("/proj"), "cache", "codebase-model.json");
+		const cachePath = path.join(
+			getProjectDataDir("/proj"),
+			"cache",
+			"codebase-model.json",
+		);
 		const oldFixture = { ...model, version: CODEBASE_MODEL_VERSION - 1 };
 		fs.writeFileSync(cachePath, JSON.stringify(oldFixture));
 		expect(loadCodebaseModel("/proj", identity)).toBeUndefined();
@@ -219,17 +243,40 @@ describe("saveCodebaseModel / loadCodebaseModel", () => {
 
 	it("invalidates a cache with a mismatched review-graph identity", () => {
 		process.env.PILENS_DATA_DIR = tmpDir;
-		const savedIdentity = { reviewGraphVersion: "v8", reviewGraphSignature: "sig-model" };
-		const model = buildCodebaseModel(makeGraph({ "/proj/src/foo.ts:bar": 3.0 }), "/proj", 1500, savedIdentity);
+		const savedIdentity = {
+			reviewGraphVersion: "v8",
+			reviewGraphSignature: "sig-model",
+		};
+		const model = buildCodebaseModel(
+			makeGraph({ "/proj/src/foo.ts:bar": 3.0 }),
+			"/proj",
+			1500,
+			savedIdentity,
+		);
 		saveCodebaseModel("/proj", model);
-		expect(loadCodebaseModel("/proj", { reviewGraphVersion: "v9", reviewGraphSignature: "sig-model" })).toBeUndefined();
-		expect(loadCodebaseModel("/proj", { reviewGraphVersion: "v8", reviewGraphSignature: "sig-new" })).toBeUndefined();
+		expect(
+			loadCodebaseModel("/proj", {
+				reviewGraphVersion: "v9",
+				reviewGraphSignature: "sig-model",
+			}),
+		).toBeUndefined();
+		expect(
+			loadCodebaseModel("/proj", {
+				reviewGraphVersion: "v8",
+				reviewGraphSignature: "sig-new",
+			}),
+		).toBeUndefined();
 		delete process.env.PILENS_DATA_DIR;
 	});
 
 	it("returns undefined for missing cache", () => {
 		process.env.PILENS_DATA_DIR = tmpDir;
-		expect(loadCodebaseModel("/nonexistent/path", { reviewGraphVersion: "v8", reviewGraphSignature: "sig-model" })).toBeUndefined();
+		expect(
+			loadCodebaseModel("/nonexistent/path", {
+				reviewGraphVersion: "v8",
+				reviewGraphSignature: "sig-model",
+			}),
+		).toBeUndefined();
 		delete process.env.PILENS_DATA_DIR;
 	});
 });

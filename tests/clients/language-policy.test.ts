@@ -143,6 +143,11 @@ describe("language-policy", () => {
 		const terraform = getPrimaryDispatchGroup("terraform", true);
 		expect(terraform?.runnerIds).toEqual(["lsp", "tflint", "trivy-config"]);
 
+		// #1522: cuelsp (syntax only) + cue-vet (evaluation errors) both run —
+		// same "lsp covers part, a CLI covers the rest" shape as terraform.
+		const cue = getPrimaryDispatchGroup("cue", true);
+		expect(cue?.runnerIds).toEqual(["lsp", "cue-vet"]);
+
 		const terragrunt = getPrimaryDispatchGroup("terragrunt", true);
 		expect(terragrunt?.runnerIds).toEqual(["terragrunt"]);
 

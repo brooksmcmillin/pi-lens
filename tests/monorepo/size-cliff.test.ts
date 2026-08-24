@@ -33,9 +33,7 @@ import {
 	resolveStartupScanContext,
 	resolveStartupScanContextAsync,
 } from "../../clients/startup-scan.js";
-import {
-	buildOrUpdateGraph,
-} from "../../clients/review-graph/service.js";
+import { buildOrUpdateGraph } from "../../clients/review-graph/service.js";
 import {
 	_resetReviewGraphSizeSkipTtlForTests,
 	_resetReviewGraphSizeSkipVerdictsForTests,
@@ -47,7 +45,11 @@ import {
 } from "../../clients/review-graph/builder.js";
 import { clearModuleGraphCache } from "../../clients/review-graph/workspace-modules.js";
 import { moduleReport } from "../../clients/module-report.js";
-import { makeMonorepo, type Monorepo, type MonorepoPackageSpec } from "./fixture.js";
+import {
+	makeMonorepo,
+	type Monorepo,
+	type MonorepoPackageSpec,
+} from "./fixture.js";
 
 function fileMap(count: number): Record<string, string> {
 	const files: Record<string, string> = {};
@@ -181,63 +183,60 @@ describe("monorepo size-cliff behavior (#775 item 2)", () => {
 			}
 		});
 
-		it(
-			"FIXED (#782, was KNOWN GAP): getCachedReviewGraph stops serving a STALE prior graph once the repo grows past the cap",
-			async () => {
-				// Build once while still within budget, warming the in-memory
-				// (tier-1) cache with a real, populated graph.
-				process.env[ENV_REVIEW_GRAPH_MAX] = "10";
-				const repo = fixtureWithSourceFiles(3);
-				try {
-					const firstBuild = await buildOrUpdateGraph(
-						repo.root,
-						[],
-						new FactStore(),
-					);
-					expect(firstBuild.nodes.size).toBeGreaterThan(0);
-					const cachedAfterFirstBuild = getCachedReviewGraph(repo.root);
-					expect(cachedAfterFirstBuild).toBeDefined();
+		it("FIXED (#782, was KNOWN GAP): getCachedReviewGraph stops serving a STALE prior graph once the repo grows past the cap", async () => {
+			// Build once while still within budget, warming the in-memory
+			// (tier-1) cache with a real, populated graph.
+			process.env[ENV_REVIEW_GRAPH_MAX] = "10";
+			const repo = fixtureWithSourceFiles(3);
+			try {
+				const firstBuild = await buildOrUpdateGraph(
+					repo.root,
+					[],
+					new FactStore(),
+				);
+				expect(firstBuild.nodes.size).toBeGreaterThan(0);
+				const cachedAfterFirstBuild = getCachedReviewGraph(repo.root);
+				expect(cachedAfterFirstBuild).toBeDefined();
 
-					// ...then shrink the cap below the (unchanged) file count and rebuild
-					// WITHOUT clearing the tier-1 workspace-graph cache first (mirrors
-					// the real process-lifetime scenario: a repo grows past the cap
-					// between two builds in the same running process; nothing evicts the
-					// prior warm entry). `clearGraphCache()` only clears the (cwd,
-					// changedFiles)-keyed in-flight/completed BUILD-CALL dedup cache —
-					// otherwise this second call, with identical (cwd, []) arguments,
-					// would just return the FIRST call's already-resolved promise
-					// unchanged, never re-evaluating the (now-lowered) cap at all.
-					previousEnv = process.env[ENV_REVIEW_GRAPH_MAX];
-					process.env[ENV_REVIEW_GRAPH_MAX] = "1";
-					clearGraphCache();
+				// ...then shrink the cap below the (unchanged) file count and rebuild
+				// WITHOUT clearing the tier-1 workspace-graph cache first (mirrors
+				// the real process-lifetime scenario: a repo grows past the cap
+				// between two builds in the same running process; nothing evicts the
+				// prior warm entry). `clearGraphCache()` only clears the (cwd,
+				// changedFiles)-keyed in-flight/completed BUILD-CALL dedup cache —
+				// otherwise this second call, with identical (cwd, []) arguments,
+				// would just return the FIRST call's already-resolved promise
+				// unchanged, never re-evaluating the (now-lowered) cap at all.
+				previousEnv = process.env[ENV_REVIEW_GRAPH_MAX];
+				process.env[ENV_REVIEW_GRAPH_MAX] = "1";
+				clearGraphCache();
 
-					const secondBuild = await buildOrUpdateGraph(
-						repo.root,
-						[],
-						new FactStore(),
-					);
-					// This call's own RETURN VALUE is correctly empty (the
-					// too_many_files branch never reads or writes the tier-1 cache)...
-					expect(secondBuild.nodes.size).toBe(0);
+				const secondBuild = await buildOrUpdateGraph(
+					repo.root,
+					[],
+					new FactStore(),
+				);
+				// This call's own RETURN VALUE is correctly empty (the
+				// too_many_files branch never reads or writes the tier-1 cache)...
+				expect(secondBuild.nodes.size).toBe(0);
 
-					// ...and now a READER going through the read-only accessor also sees
-					// the size-skip: the too_many_files branch recorded a fresh verdict,
-					// which getCachedReviewGraph consults before serving either cache
-					// tier — the stale, pre-cap graph is no longer handed out.
-					expect(getCachedReviewGraph(repo.root)).toBeUndefined();
-					const verdict = getReviewGraphSizeSkipVerdict(repo.root);
-					expect(verdict).toBeDefined();
-					// getGraphSourceFiles's walk is capped at maxGraphFiles+1 (#250: an
-					// over-limit repo short-circuits collection instead of enumerating
-					// the whole tree), so the recorded sourceFileCount reflects that
-					// capped collection size, not the repo's true file count.
-					expect(verdict?.sourceFileCount).toBe(2);
-					expect(verdict?.maxFileCount).toBe(1);
-				} finally {
-					repo.cleanup();
-				}
-			},
-		);
+				// ...and now a READER going through the read-only accessor also sees
+				// the size-skip: the too_many_files branch recorded a fresh verdict,
+				// which getCachedReviewGraph consults before serving either cache
+				// tier — the stale, pre-cap graph is no longer handed out.
+				expect(getCachedReviewGraph(repo.root)).toBeUndefined();
+				const verdict = getReviewGraphSizeSkipVerdict(repo.root);
+				expect(verdict).toBeDefined();
+				// getGraphSourceFiles's walk is capped at maxGraphFiles+1 (#250: an
+				// over-limit repo short-circuits collection instead of enumerating
+				// the whole tree), so the recorded sourceFileCount reflects that
+				// capped collection size, not the repo's true file count.
+				expect(verdict?.sourceFileCount).toBe(2);
+				expect(verdict?.maxFileCount).toBe(1);
+			} finally {
+				repo.cleanup();
+			}
+		});
 
 		it("size-skip verdict expires after its TTL, re-enabling reads without a rebuild", async () => {
 			process.env.PI_LENS_REVIEW_GRAPH_SIZE_SKIP_TTL_MS = "50";

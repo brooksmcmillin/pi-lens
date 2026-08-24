@@ -30,7 +30,9 @@ describe("BiomeClient.fixFileAsync — autofix argv order + cwd (#1247 review)",
 	});
 
 	it("spawns `lint --write` with --config-path AFTER the subcommand and forwards cwd", async () => {
-		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-biome-argv-"));
+		const tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-biome-argv-"),
+		);
 		try {
 			const filePath = path.join(tmpDir, "src", "app.ts");
 			fs.mkdirSync(path.dirname(filePath), { recursive: true });

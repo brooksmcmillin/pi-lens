@@ -2,7 +2,10 @@ import { describe, expect, it } from "vitest";
 import type { CascadeRun } from "../../clients/cascade-types.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 
-function run(filePath: string, skipReason?: CascadeRun["skipReason"]): CascadeRun {
+function run(
+	filePath: string,
+	skipReason?: CascadeRun["skipReason"],
+): CascadeRun {
 	return {
 		filePath,
 		result: undefined,
@@ -54,8 +57,8 @@ describe("deferred cascade settle (#450)", () => {
 		const runtime = new RuntimeCoordinator();
 		// The pipeline guarantees the stored promise never rejects; a failed compute
 		// resolves to an "error" skip-run. Model that here.
-		const skip = Promise.reject(new Error("boom")).catch(
-			(): CascadeRun => run("err.ts", "error"),
+		const skip = Promise.reject(new Error("boom")).catch((): CascadeRun =>
+			run("err.ts", "error"),
 		);
 		runtime.appendCascadePromise(skip);
 

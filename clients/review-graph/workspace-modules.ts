@@ -61,9 +61,9 @@ const SOURCE_EXTS = new Set([
 	".hpp",
 ]);
 
-function readJsonSafe(filePath: string): unknown {
+function readJsonSafe(filePath: string): PackageJson | undefined {
 	try {
-		return JSON.parse(fs.readFileSync(filePath, "utf-8"));
+		return JSON.parse(fs.readFileSync(filePath, "utf-8")) as PackageJson;
 	} catch {
 		return undefined;
 	}
@@ -89,9 +89,7 @@ function detectWorkspaceType(cwd: string): WorkspaceType | null {
 		} catch {}
 	}
 	if (markers.hasPackageJson) {
-		const pkgJson = readJsonSafe(path.join(cwd, "package.json")) as
-			| PackageJson
-			| undefined;
+		const pkgJson = readJsonSafe(path.join(cwd, "package.json"));
 		const workspaces = normalizeWorkspacePatterns(pkgJson?.workspaces);
 		if (workspaces.length > 0) return "npm";
 	}
@@ -136,25 +134,27 @@ function expandWorkspacePattern(cwd: string, pattern: string): string[] {
 		return [];
 	}
 	const ignoreMatcher = getProjectIgnoreMatcher(cwd);
-	return entries
-		.filter((entry) => {
-			const fullPath = path.join(baseDir, entry.name);
-			return (
-				entry.isDirectory() &&
-				!isExcludedDirName(entry.name) &&
-				!ignoreMatcher.isIgnored(fullPath, true)
-			);
-		})
-		// Bound the manifest-probe fan-out so a pathological single directory
-		// can't trigger an unbounded existsSync sweep (#262).
-		.slice(0, MAX_WORKSPACE_CANDIDATES)
-		.map((entry) => path.join(baseDir, entry.name))
-		.filter(
-			(root) =>
-				fs.existsSync(path.join(root, "package.json")) ||
-				fs.existsSync(path.join(root, "Cargo.toml")) ||
-				fs.existsSync(path.join(root, "go.mod")),
-		);
+	return (
+		entries
+			.filter((entry) => {
+				const fullPath = path.join(baseDir, entry.name);
+				return (
+					entry.isDirectory() &&
+					!isExcludedDirName(entry.name) &&
+					!ignoreMatcher.isIgnored(fullPath, true)
+				);
+			})
+			// Bound the manifest-probe fan-out so a pathological single directory
+			// can't trigger an unbounded existsSync sweep (#262).
+			.slice(0, MAX_WORKSPACE_CANDIDATES)
+			.map((entry) => path.join(baseDir, entry.name))
+			.filter(
+				(root) =>
+					fs.existsSync(path.join(root, "package.json")) ||
+					fs.existsSync(path.join(root, "Cargo.toml")) ||
+					fs.existsSync(path.join(root, "go.mod")),
+			)
+	);
 }
 
 function depsFromPackageJson(pkgJson: PackageJson): string[] {
@@ -576,10 +576,12 @@ export function getModuleSourceFiles(
 				continue;
 			}
 			if (!entry.isFile()) continue;
+			// #1974: extension gate before isIgnored — isIgnored recompiles
+			// minimatch patterns per ancestor dir per call, so it should only run
+			// for files the cheap extension check already flags as source.
+			if (!SOURCE_EXTS.has(path.extname(entry.name).toLowerCase())) continue;
 			if (ignoreMatcher.isIgnored(fullPath, false)) continue;
-			if (SOURCE_EXTS.has(path.extname(entry.name).toLowerCase())) {
-				files.push(normalizeMapKey(fullPath));
-			}
+			files.push(normalizeMapKey(fullPath));
 		}
 	};
 	visit(root, 0);

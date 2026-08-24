@@ -8,13 +8,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 // "no raw terminal write" half of the invariant is enforced repo-wide by
 // tests/clients/extension-terminal-silence.test.ts.
 vi.mock("../../clients/extension-log.js", async (importOriginal) => {
-	const actual = await importOriginal<typeof import("../../clients/extension-log.js")>();
+	const actual =
+		await importOriginal<typeof import("../../clients/extension-log.js")>();
 	return {
 		...actual,
 		logExtension: (entry: { message: string }) => console.error(entry.message),
 	};
 });
-
 
 // Simulate a runtime that doesn't implement perf_hooks.monitorEventLoopDelay
 // (e.g. Bun < 1.3, which throws ERR_NOT_IMPLEMENTED when it is CALLED). The
@@ -23,14 +23,19 @@ vi.mock("../../clients/extension-log.js", async (importOriginal) => {
 vi.mock("node:perf_hooks", () => ({
 	monitorEventLoopDelay: () => {
 		throw Object.assign(
-			new Error("perf_hooks.monitorEventLoopDelay is not yet implemented in Bun."),
+			new Error(
+				"perf_hooks.monitorEventLoopDelay is not yet implemented in Bun.",
+			),
 			{ code: "ERR_NOT_IMPLEMENTED" },
 		);
 	},
 }));
 
-const { startEventLoopMonitor, getEventLoopStats, _stopEventLoopMonitorForTest } =
-	await import("../../clients/event-loop-monitor.js");
+const {
+	startEventLoopMonitor,
+	getEventLoopStats,
+	_stopEventLoopMonitorForTest,
+} = await import("../../clients/event-loop-monitor.js");
 
 describe("event-loop-monitor — runtime without monitorEventLoopDelay", () => {
 	afterEach(() => _stopEventLoopMonitorForTest());

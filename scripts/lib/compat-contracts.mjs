@@ -21,26 +21,29 @@
  * @returns {{ pass: boolean, detail: string }}
  */
 export function checkNicobailonChildEnv(source) {
-  const setsChildFlag =
-    /env(?:\[[^\]]+\]|\.\w+)\s*=\s*["']1["']/.test(source) &&
-    /SUBAGENT_CHILD_ENV\s*=\s*["']PI_SUBAGENT_CHILD["']/.test(source);
-  const hasRunId = /SUBAGENT_RUN_ID_ENV\s*=\s*["']PI_SUBAGENT_RUN_ID["']/.test(source);
-  const hasChildAgent = /SUBAGENT_CHILD_AGENT_ENV\s*=\s*["']PI_SUBAGENT_CHILD_AGENT["']/.test(
-    source,
-  );
-  const pass = setsChildFlag && hasRunId && hasChildAgent;
-  return {
-    pass,
-    detail: pass
-      ? "PI_SUBAGENT_CHILD='1' set unconditionally; PI_SUBAGENT_RUN_ID + PI_SUBAGENT_CHILD_AGENT present"
-      : `missing: ${[
-          !setsChildFlag && "PI_SUBAGENT_CHILD='1' assignment",
-          !hasRunId && "PI_SUBAGENT_RUN_ID const",
-          !hasChildAgent && "PI_SUBAGENT_CHILD_AGENT const",
-        ]
-          .filter(Boolean)
-          .join(", ")}`,
-  };
+	const setsChildFlag =
+		/env(?:\[[^\]]+\]|\.\w+)\s*=\s*["']1["']/.test(source) &&
+		/SUBAGENT_CHILD_ENV\s*=\s*["']PI_SUBAGENT_CHILD["']/.test(source);
+	const hasRunId = /SUBAGENT_RUN_ID_ENV\s*=\s*["']PI_SUBAGENT_RUN_ID["']/.test(
+		source,
+	);
+	const hasChildAgent =
+		/SUBAGENT_CHILD_AGENT_ENV\s*=\s*["']PI_SUBAGENT_CHILD_AGENT["']/.test(
+			source,
+		);
+	const pass = setsChildFlag && hasRunId && hasChildAgent;
+	return {
+		pass,
+		detail: pass
+			? "PI_SUBAGENT_CHILD='1' set unconditionally; PI_SUBAGENT_RUN_ID + PI_SUBAGENT_CHILD_AGENT present"
+			: `missing: ${[
+					!setsChildFlag && "PI_SUBAGENT_CHILD='1' assignment",
+					!hasRunId && "PI_SUBAGENT_RUN_ID const",
+					!hasChildAgent && "PI_SUBAGENT_CHILD_AGENT const",
+				]
+					.filter(Boolean)
+					.join(", ")}`,
+	};
 }
 
 /**
@@ -58,21 +61,24 @@ export function checkNicobailonChildEnv(source) {
  * @returns {{ pass: boolean, detail: string }}
  */
 export function checkAvtcChildEnv(source) {
-  const setsChildAgent = /\w+\.PI_SUBAGENT_CHILD_AGENT\s*=/.test(source);
-  const setsParentPid =
-    /\w+\.PI_SUBAGENT_PARENT_PID\s*=\s*String\(\s*process\.pid\s*\)/.test(source);
-  const pass = setsChildAgent && setsParentPid;
-  return {
-    pass,
-    detail: pass
-      ? "PI_SUBAGENT_CHILD_AGENT + PI_SUBAGENT_PARENT_PID both assigned on the per-spawn subagent env"
-      : `missing: ${[
-          !setsChildAgent && "PI_SUBAGENT_CHILD_AGENT assignment",
-          !setsParentPid && "PI_SUBAGENT_PARENT_PID = String(process.pid) assignment",
-        ]
-          .filter(Boolean)
-          .join(", ")}`,
-  };
+	const setsChildAgent = /\w+\.PI_SUBAGENT_CHILD_AGENT\s*=/.test(source);
+	const setsParentPid =
+		/\w+\.PI_SUBAGENT_PARENT_PID\s*=\s*String\(\s*process\.pid\s*\)/.test(
+			source,
+		);
+	const pass = setsChildAgent && setsParentPid;
+	return {
+		pass,
+		detail: pass
+			? "PI_SUBAGENT_CHILD_AGENT + PI_SUBAGENT_PARENT_PID both assigned on the per-spawn subagent env"
+			: `missing: ${[
+					!setsChildAgent && "PI_SUBAGENT_CHILD_AGENT assignment",
+					!setsParentPid &&
+						"PI_SUBAGENT_PARENT_PID = String(process.pid) assignment",
+				]
+					.filter(Boolean)
+					.join(", ")}`,
+	};
 }
 
 /**
@@ -85,13 +91,13 @@ export function checkAvtcChildEnv(source) {
  * @param {string} source contents of the extension loader dist file
  */
 export function checkSdkExtensionCache(source) {
-  const pass = /\bextensionCache\s*=\s*new Map\(\)/.test(source);
-  return {
-    pass,
-    detail: pass
-      ? "process-global `extensionCache = new Map()` present"
-      : "no process-global `extensionCache` Map found in the extension loader",
-  };
+	const pass = /\bextensionCache\s*=\s*new Map\(\)/.test(source);
+	return {
+		pass,
+		detail: pass
+			? "process-global `extensionCache = new Map()` present"
+			: "no process-global `extensionCache` Map found in the extension loader",
+	};
 }
 
 /**
@@ -104,35 +110,34 @@ export function checkSdkExtensionCache(source) {
  * @param {string} source contents of agent-session.js
  */
 export function checkSdkBindExtensionsEmitsSessionStart(source) {
-  const bindMatch = source.match(
-    /async bindExtensions\([^)]*\)\s*\{([\s\S]*?)\n\s{4}\}/,
-  );
-  if (!bindMatch) {
-    return { pass: false, detail: "bindExtensions() method not found" };
-  }
-  const body = bindMatch[1];
-  const emitsSomething = /_extensionRunner\.emit\(/.test(body);
-  // The emitted value must resolve to a session_start-typed event — either
-  // inline or via a field that was constructed with `type: "session_start"`
-  // somewhere in the file (covers the `_sessionStartEvent` indirection).
-  const fieldName = body.match(/_extensionRunner\.emit\((this\.\w+)\)/)?.[1];
-  const inlineSessionStart = /_extensionRunner\.emit\(\s*\{\s*type:\s*["']session_start["']/.test(
-    body,
-  );
-  const fieldIsSessionStart =
-    fieldName !== undefined &&
-    new RegExp(
-      `${fieldName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace("this.", "")}\\s*=\\s*config\\.\\w+\\s*\\?\\?\\s*\\{\\s*type:\\s*["']session_start["']`,
-    ).test(source);
-  const pass = emitsSomething && (inlineSessionStart || fieldIsSessionStart);
-  return {
-    pass,
-    detail: pass
-      ? "bindExtensions() unconditionally emits a session_start-typed event"
-      : emitsSomething
-        ? "bindExtensions() emits, but the emitted event could not be confirmed as session_start-typed"
-        : "bindExtensions() does not call _extensionRunner.emit(...)",
-  };
+	const bindMatch = source.match(
+		/async bindExtensions\([^)]*\)\s*\{([\s\S]*?)\n\s{4}\}/,
+	);
+	if (!bindMatch) {
+		return { pass: false, detail: "bindExtensions() method not found" };
+	}
+	const body = bindMatch[1];
+	const emitsSomething = /_extensionRunner\.emit\(/.test(body);
+	// The emitted value must resolve to a session_start-typed event — either
+	// inline or via a field that was constructed with `type: "session_start"`
+	// somewhere in the file (covers the `_sessionStartEvent` indirection).
+	const fieldName = body.match(/_extensionRunner\.emit\((this\.\w+)\)/)?.[1];
+	const inlineSessionStart =
+		/_extensionRunner\.emit\(\s*\{\s*type:\s*["']session_start["']/.test(body);
+	const fieldIsSessionStart =
+		fieldName !== undefined &&
+		new RegExp(
+			`${fieldName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace("this.", "")}\\s*=\\s*config\\.\\w+\\s*\\?\\?\\s*\\{\\s*type:\\s*["']session_start["']`,
+		).test(source);
+	const pass = emitsSomething && (inlineSessionStart || fieldIsSessionStart);
+	return {
+		pass,
+		detail: pass
+			? "bindExtensions() unconditionally emits a session_start-typed event"
+			: emitsSomething
+				? "bindExtensions() emits, but the emitted event could not be confirmed as session_start-typed"
+				: "bindExtensions() does not call _extensionRunner.emit(...)",
+	};
 }
 
 /**
@@ -145,13 +150,13 @@ export function checkSdkBindExtensionsEmitsSessionStart(source) {
  * @param {string} source contents of agent-session.js
  */
 export function checkSdkInvalidateCalled(source) {
-  const pass = /_extensionRunner\.invalidate\(/.test(source);
-  return {
-    pass,
-    detail: pass
-      ? "_extensionRunner.invalidate(...) call site found"
-      : "no _extensionRunner.invalidate(...) call site found",
-  };
+	const pass = /_extensionRunner\.invalidate\(/.test(source);
+	return {
+		pass,
+		detail: pass
+			? "_extensionRunner.invalidate(...) call site found"
+			: "no _extensionRunner.invalidate(...) call site found",
+	};
 }
 
 /**
@@ -164,13 +169,13 @@ export function checkSdkInvalidateCalled(source) {
  * @param {string} source contents of agent-session.js
  */
 export function checkSdkStaleCtxMessage(source) {
-  const pass = source.includes("stale after session replacement");
-  return {
-    pass,
-    detail: pass
-      ? 'stale-ctx message contains "stale after session replacement"'
-      : 'stale-ctx message fragment "stale after session replacement" NOT found — probeCtxActive() in clients/session-lifecycle.ts will silently degrade to inconclusive',
-  };
+	const pass = source.includes("stale after session replacement");
+	return {
+		pass,
+		detail: pass
+			? 'stale-ctx message contains "stale after session replacement"'
+			: 'stale-ctx message fragment "stale after session replacement" NOT found — probeCtxActive() in clients/session-lifecycle.ts will silently degrade to inconclusive',
+	};
 }
 
 /**
@@ -182,20 +187,21 @@ export function checkSdkStaleCtxMessage(source) {
  * @param {string} source contents of agent-runner.ts
  */
 export function checkTintinwebInProcessBind(source) {
-  const usesResourceLoader = /new DefaultResourceLoader\(/.test(source);
-  const callsBindExtensions = /\bbindExtensions\(\{/.test(source) || /\.bindExtensions\(/.test(source);
-  const pass = usesResourceLoader && callsBindExtensions;
-  return {
-    pass,
-    detail: pass
-      ? "constructs DefaultResourceLoader + calls session.bindExtensions() in-process"
-      : `missing: ${[
-          !usesResourceLoader && "`new DefaultResourceLoader(...)`",
-          !callsBindExtensions && "`.bindExtensions(...)` call",
-        ]
-          .filter(Boolean)
-          .join(", ")}`,
-  };
+	const usesResourceLoader = /new DefaultResourceLoader\(/.test(source);
+	const callsBindExtensions =
+		/\bbindExtensions\(\{/.test(source) || /\.bindExtensions\(/.test(source);
+	const pass = usesResourceLoader && callsBindExtensions;
+	return {
+		pass,
+		detail: pass
+			? "constructs DefaultResourceLoader + calls session.bindExtensions() in-process"
+			: `missing: ${[
+					!usesResourceLoader && "`new DefaultResourceLoader(...)`",
+					!callsBindExtensions && "`.bindExtensions(...)` call",
+				]
+					.filter(Boolean)
+					.join(", ")}`,
+	};
 }
 
 /**
@@ -212,50 +218,56 @@ export function checkTintinwebInProcessBind(source) {
  * }} inputs
  */
 export function runAllContractChecks(inputs) {
-  const results = [
-    {
-      id: "nicobailon.child-env",
-      package: "pi-subagents",
-      description: "PI_SUBAGENT_CHILD/RUN_ID/CHILD_AGENT env vars set on every spawned child",
-      ...checkNicobailonChildEnv(inputs.nicobailonPiArgsSource),
-    },
-    {
-      id: "avtc.child-env",
-      package: "avtc-pi-subagent",
-      description: "PI_SUBAGENT_CHILD_AGENT + PI_SUBAGENT_PARENT_PID pair set on every spawned child",
-      ...checkAvtcChildEnv(inputs.avtcProcessRunnerSource),
-    },
-    {
-      id: "sdk.extension-cache",
-      package: "@earendil-works/pi-coding-agent",
-      description: "process-global extensionCache Map in the extension loader",
-      ...checkSdkExtensionCache(inputs.sdkLoaderSource),
-    },
-    {
-      id: "sdk.bind-extensions-session-start",
-      package: "@earendil-works/pi-coding-agent",
-      description: "bindExtensions() unconditionally emits a session_start-typed event",
-      ...checkSdkBindExtensionsEmitsSessionStart(inputs.sdkAgentSessionSource),
-    },
-    {
-      id: "sdk.invalidate-called",
-      package: "@earendil-works/pi-coding-agent",
-      description: "invalidate() called from the sequential session-replacement path",
-      ...checkSdkInvalidateCalled(inputs.sdkAgentSessionSource),
-    },
-    {
-      id: "sdk.stale-ctx-message",
-      package: "@earendil-works/pi-coding-agent",
-      description: 'stale-ctx error message contains "stale after session replacement"',
-      ...checkSdkStaleCtxMessage(inputs.sdkAgentSessionSource),
-    },
-    {
-      id: "tintinweb.in-process-bind",
-      package: "@tintinweb/pi-subagents",
-      description: "constructs DefaultResourceLoader + calls bindExtensions() in-process",
-      ...checkTintinwebInProcessBind(inputs.tintinwebAgentRunnerSource),
-    },
-  ];
-  const allPass = results.every((r) => r.pass);
-  return { results, allPass };
+	const results = [
+		{
+			id: "nicobailon.child-env",
+			package: "pi-subagents",
+			description:
+				"PI_SUBAGENT_CHILD/RUN_ID/CHILD_AGENT env vars set on every spawned child",
+			...checkNicobailonChildEnv(inputs.nicobailonPiArgsSource),
+		},
+		{
+			id: "avtc.child-env",
+			package: "avtc-pi-subagent",
+			description:
+				"PI_SUBAGENT_CHILD_AGENT + PI_SUBAGENT_PARENT_PID pair set on every spawned child",
+			...checkAvtcChildEnv(inputs.avtcProcessRunnerSource),
+		},
+		{
+			id: "sdk.extension-cache",
+			package: "@earendil-works/pi-coding-agent",
+			description: "process-global extensionCache Map in the extension loader",
+			...checkSdkExtensionCache(inputs.sdkLoaderSource),
+		},
+		{
+			id: "sdk.bind-extensions-session-start",
+			package: "@earendil-works/pi-coding-agent",
+			description:
+				"bindExtensions() unconditionally emits a session_start-typed event",
+			...checkSdkBindExtensionsEmitsSessionStart(inputs.sdkAgentSessionSource),
+		},
+		{
+			id: "sdk.invalidate-called",
+			package: "@earendil-works/pi-coding-agent",
+			description:
+				"invalidate() called from the sequential session-replacement path",
+			...checkSdkInvalidateCalled(inputs.sdkAgentSessionSource),
+		},
+		{
+			id: "sdk.stale-ctx-message",
+			package: "@earendil-works/pi-coding-agent",
+			description:
+				'stale-ctx error message contains "stale after session replacement"',
+			...checkSdkStaleCtxMessage(inputs.sdkAgentSessionSource),
+		},
+		{
+			id: "tintinweb.in-process-bind",
+			package: "@tintinweb/pi-subagents",
+			description:
+				"constructs DefaultResourceLoader + calls bindExtensions() in-process",
+			...checkTintinwebInProcessBind(inputs.tintinwebAgentRunnerSource),
+		},
+	];
+	const allPass = results.every((r) => r.pass);
+	return { results, allPass };
 }

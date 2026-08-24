@@ -55,7 +55,12 @@ const INTENTIONAL_FORWARDER_NAME = /adapter|facade|proxy|wrapper|decorator/i;
 
 /** Names that are constructors/destructors (never delegation candidates) in at
  * least one covered language. */
-const CONSTRUCTOR_NAMES = new Set(["constructor", "__init__", "__new__", "initialize"]);
+const CONSTRUCTOR_NAMES = new Set([
+	"constructor",
+	"__init__",
+	"__new__",
+	"initialize",
+]);
 
 /** Below this many real (non-accessor, non-constructor) methods, a delegation
  * ratio isn't a meaningful judgment — a one-method utility class forwarding
@@ -143,17 +148,19 @@ function bodyStatementLines(
 		if (braceIdx === -1 || lastBrace === -1 || lastBrace <= braceIdx) return [];
 		body = raw.slice(braceIdx + 1, lastBrace);
 	}
-	return body
-		.replace(/\/\*[\s\S]*?\*\//g, "")
-		.split("\n")
-		.map((l) => l.replace(/\/\/.*$/, ""))
-		.map((l) => (isPython ? l.replace(/#.*$/, "") : l))
-		.map((l) => l.trim())
-		.filter((l) => l.length > 0)
-		// A lone triple-quoted docstring line in python isn't executable, but
-		// distinguishing it textually is unreliable — treat any leading `"""`/`'''`
-		// line as noise so a documented one-liner forward still qualifies.
-		.filter((l) => !/^("""|''')/.test(l));
+	return (
+		body
+			.replace(/\/\*[\s\S]*?\*\//g, "")
+			.split("\n")
+			.map((l) => l.replace(/\/\/.*$/, ""))
+			.map((l) => (isPython ? l.replace(/#.*$/, "") : l))
+			.map((l) => l.trim())
+			.filter((l) => l.length > 0)
+			// A lone triple-quoted docstring line in python isn't executable, but
+			// distinguishing it textually is unreliable — treat any leading `"""`/`'''`
+			// line as noise so a documented one-liner forward still qualifies.
+			.filter((l) => !/^("""|''')/.test(l))
+	);
 }
 
 /** Detects an accessor (getter/setter) declaration from its raw source line —
@@ -244,9 +251,15 @@ export function analyzeMiddleMan(
  * a legitimate, common reason for a class to be "all delegation" (a typed
  * adapter satisfying an interface). Scans the declaration line plus one
  * continuation line to tolerate simple wraps. */
-function implementsInterface(lines: string[], classEntry: ModuleSymbolEntry): boolean {
+function implementsInterface(
+	lines: string[],
+	classEntry: ModuleSymbolEntry,
+): boolean {
 	const declText = lines
-		.slice(classEntry.startLine - 1, Math.min(classEntry.startLine + 1, lines.length))
+		.slice(
+			classEntry.startLine - 1,
+			Math.min(classEntry.startLine + 1, lines.length),
+		)
 		.join(" ");
 	return /\bimplements\b/.test(declText);
 }

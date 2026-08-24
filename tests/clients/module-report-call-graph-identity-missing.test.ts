@@ -19,7 +19,9 @@ import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 // suite's many real-identity call-graph assertions would be fragile.
 vi.mock("../../clients/review-graph/builder.js", async (importOriginal) => {
 	const actual =
-		await importOriginal<typeof import("../../clients/review-graph/builder.js")>();
+		await importOriginal<
+			typeof import("../../clients/review-graph/builder.js")
+		>();
 	return {
 		...actual,
 		getReviewGraphCacheIdentity: vi.fn(() => undefined),
@@ -36,7 +38,11 @@ describe("moduleReport — call-graph identity-missing (#1089)", () => {
 	it("reports identity-missing (never zero calls) when the graph is warm but its cache identity can't be resolved", async () => {
 		const env = setupTestEnvironment("pi-lens-modreport-identity-");
 		cleanups.push(env.cleanup);
-		createTempFile(env.tmpDir, "a.ts", "export function foo(): number { return 1; }\n");
+		createTempFile(
+			env.tmpDir,
+			"a.ts",
+			"export function foo(): number { return 1; }\n",
+		);
 		await buildOrUpdateGraph(env.tmpDir, [], new FactStore());
 
 		const report = await moduleReport("a.ts", env.tmpDir, { callGraph: true });

@@ -67,7 +67,8 @@ export const CODEBASE_MODEL_VERSION = 1;
 function inferKind(symbolKey: SymbolKey): ModelEntry["kind"] {
 	const parsed = parseSymbolKey(symbolKey);
 	if (parsed.kind === "class") return "class";
-	if (parsed.kind === "method" || parsed.symbolName?.includes(".")) return "method";
+	if (parsed.kind === "method" || parsed.symbolName?.includes("."))
+		return "method";
 	return /^[A-Z]/.test(parsed.symbolName ?? "") ? "class" : "function";
 }
 
@@ -126,8 +127,12 @@ export function buildCodebaseModel(
 		// carries that graph's identity rather than inventing a second freshness
 		// policy.
 		const fileRole = detectFileRole(filePath);
-		if (fileRole === "test" || fileRole === "generated" ||
-			isExternalOrVendorFile(filePath, cwd) || isBuildArtifact(filePath)) {
+		if (
+			fileRole === "test" ||
+			fileRole === "generated" ||
+			isExternalOrVendorFile(filePath, cwd) ||
+			isBuildArtifact(filePath)
+		) {
 			continue;
 		}
 
@@ -200,7 +205,11 @@ export function saveCodebaseModel(cwd: string, model: CodebaseModel): void {
 		writeFileAtomic(cacheFile, JSON.stringify(model));
 		writeFileAtomic(
 			metaFilePath(cwd),
-			JSON.stringify({ savedAt: new Date().toISOString(), entryCount: model.entries.length, totalTokens: model.totalTokens }),
+			JSON.stringify({
+				savedAt: new Date().toISOString(),
+				entryCount: model.entries.length,
+				totalTokens: model.totalTokens,
+			}),
 		);
 	} catch {
 		// Non-fatal — next session rebuilds.
@@ -213,14 +222,24 @@ export function loadCodebaseModel(
 	expectedIdentity: CallGraphCacheIdentity,
 ): CodebaseModel | undefined {
 	try {
-		const raw = JSON.parse(fs.readFileSync(cacheFilePath(cwd), "utf-8")) as Partial<CodebaseModel>;
-		if (raw.version !== CODEBASE_MODEL_VERSION ||
-		typeof raw.reviewGraphVersion !== "string" || raw.reviewGraphVersion.length === 0 ||
-			typeof raw.reviewGraphSignature !== "string" || raw.reviewGraphSignature.length === 0 ||
+		const raw = JSON.parse(
+			fs.readFileSync(cacheFilePath(cwd), "utf-8"),
+		) as Partial<CodebaseModel>;
+		if (
+			raw.version !== CODEBASE_MODEL_VERSION ||
+			typeof raw.reviewGraphVersion !== "string" ||
+			raw.reviewGraphVersion.length === 0 ||
+			typeof raw.reviewGraphSignature !== "string" ||
+			raw.reviewGraphSignature.length === 0 ||
 			typeof raw.generatedAt !== "string" ||
-			!Array.isArray(raw.entries)) return undefined;
-		if (raw.reviewGraphVersion !== expectedIdentity.reviewGraphVersion ||
-			raw.reviewGraphSignature !== expectedIdentity.reviewGraphSignature) return undefined;
+			!Array.isArray(raw.entries)
+		)
+			return undefined;
+		if (
+			raw.reviewGraphVersion !== expectedIdentity.reviewGraphVersion ||
+			raw.reviewGraphSignature !== expectedIdentity.reviewGraphSignature
+		)
+			return undefined;
 		return raw as CodebaseModel;
 	} catch {
 		return undefined;

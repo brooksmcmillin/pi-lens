@@ -1,7 +1,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import { EXPANSION_LIMIT_LINES, tryExpandRead } from "../../clients/read-expansion.ts";
+import {
+	EXPANSION_LIMIT_LINES,
+	tryExpandRead,
+} from "../../clients/read-expansion.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
 function node(
@@ -82,7 +85,8 @@ describe("EXPANSION_LIMIT_LINES", () => {
 	it("expansion fires for reads at the limit (100 lines)", async () => {
 		const env = setupTestEnvironment("pi-lens-read-expansion-limit-");
 		try {
-			const lines = Array.from({ length: 110 }, (_, i) => `line${i + 1}`).join("\n") + "\n";
+			const lines =
+				Array.from({ length: 110 }, (_, i) => `line${i + 1}`).join("\n") + "\n";
 			const filePath = path.join(env.tmpDir, "file.ts");
 			fs.writeFileSync(filePath, lines);
 			const tree = {
@@ -94,7 +98,13 @@ describe("EXPANSION_LIMIT_LINES", () => {
 			};
 			const tsClient = stubClient(tree);
 			// Request exactly EXPANSION_LIMIT_LINES — should expand
-			const result = await tryExpandRead(filePath, 50, 100, 110, tsClient as any);
+			const result = await tryExpandRead(
+				filePath,
+				50,
+				100,
+				110,
+				tsClient as any,
+			);
 			expect(result).toBeDefined();
 		} finally {
 			env.cleanup();
@@ -104,11 +114,18 @@ describe("EXPANSION_LIMIT_LINES", () => {
 	it("expansion does not fire for reads above the limit (101 lines)", async () => {
 		const env = setupTestEnvironment("pi-lens-read-expansion-over-");
 		try {
-			const lines = Array.from({ length: 110 }, (_, i) => `line${i + 1}`).join("\n") + "\n";
+			const lines =
+				Array.from({ length: 110 }, (_, i) => `line${i + 1}`).join("\n") + "\n";
 			const filePath = path.join(env.tmpDir, "file.ts");
 			fs.writeFileSync(filePath, lines);
 			const tsClient = unusedClient("should not be called");
-			const result = await tryExpandRead(filePath, 1, 101, 110, tsClient as any);
+			const result = await tryExpandRead(
+				filePath,
+				1,
+				101,
+				110,
+				tsClient as any,
+			);
 			expect(result).toBeUndefined();
 		} finally {
 			env.cleanup();

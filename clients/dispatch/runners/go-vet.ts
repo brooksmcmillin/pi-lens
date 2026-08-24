@@ -9,6 +9,7 @@ import { relative, resolve, sep, posix } from "node:path";
 import { GoClient } from "../../go-client.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import { stripAnsi } from "../../sanitize.js";
+import { skipUnlessToolRan } from "./utils/tool-failure.js";
 import { parseGoVetOutput } from "./utils/diagnostic-parsers.js";
 import type {
 	DispatchContext,
@@ -58,6 +59,23 @@ const goVetRunner: RunnerDefinition = {
 		});
 
 		const raw = stripAnsi(result.stdout + result.stderr);
+
+		// #1816: `go vet` exits nonzero both for "found problems" and for a
+		// toolchain failure it never got past — `go.mod file not found in
+		// current directory or any parent directory` is the one that bit us
+		// (#263). That prose carries no `file:line:col:` prefix, so it parsed to
+		// zero diagnostics and the file was reported CLEAN by a vet that never
+		// ran. The exit code cannot separate the two cases; the presence of a
+		// parsable diagnostic line can, so that is what the gate is handed.
+		const parsableLines = raw
+			.split("\n")
+			.filter((line) => /^.+?:\d+:\d+:/.test(line))
+			.join("\n");
+		const skipped = skipUnlessToolRan("go-vet", {
+			result,
+			output: parsableLines,
+		});
+		if (skipped) return skipped;
 
 		if (result.status === 0 && !raw.trim()) {
 			return { status: "succeeded", diagnostics: [], semantic: "none" };

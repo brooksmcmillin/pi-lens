@@ -16,6 +16,7 @@ import {
 import { getProjectIgnoreGlobs } from "./file-utils.js";
 import { findGlobalBinary } from "./package-manager.js";
 import { safeSpawnAsync, type SpawnResult } from "./safe-spawn.js";
+import { createSingleFlight } from "./single-flight.js";
 import {
 	type AvailabilityCause,
 	type ProbeEvidence,
@@ -191,7 +192,11 @@ export class SgRunner {
 	 * restart and paid for an install nobody needed.
 	 */
 	private readonly availabilityLatch = createAvailabilityLatch();
-	private ensureInFlight: Promise<boolean> | null = null;
+	/**
+	 * At-most-one sweep in flight, via the shared primitive (#1753). One
+	 * instance owns one question, so the key is a constant.
+	 */
+	private readonly ensureFlight = createSingleFlight<boolean>();
 	/**
 	 * Whether a DIRECT candidate — one that would have been ast-grep itself —
 	 * failed for a transient reason in the current sweep. Only these block the
@@ -202,48 +207,66 @@ export class SgRunner {
 	 */
 	private sweepSawTransient = false;
 	private sweepTransientCause: AvailabilityCause = "probe-timeout";
+	/**
+	 * The DIRECT candidates that were unreachable, in ask order (#1568).
+	 *
+	 * The sweep returns at the first candidate that answers, so at the moment of
+	 * a win this is exactly the set of preferred tiers the winner did not beat on
+	 * the merits. Fallbacks are excluded on purpose: `npx` is asked before the
+	 * global-bin and platform-package tiers, and a slow `npx` says nothing about
+	 * a winner that is a real binary.
+	 *
+	 * Basenames, because a candidate can be an absolute global-bin or
+	 * platform-package path and this list is written to latency.log (#1568
+	 * review F3).
+	 */
+	private sweepUnreachable: string[] = [];
 	/** A transient on the npx fallback: not evidence, but not nothing either. */
 	private sweepFallbackTransient = false;
 	private sweepFallbackCause: AvailabilityCause = "probe-timeout";
 	/** Host stall summed over every probe of the current sweep, ms. */
 	private sweepHostStallMs = 0;
+	/**
+	 * Candidates — direct or fallback — that this sweep probed and found
+	 * DURABLY missing (real ENOENT/non-installable, not a stall) (#1593). The
+	 * retained-arm fallback below only sees whether SOME candidate stalled; this
+	 * list lets it also check whether the memoized winner itself is one of the
+	 * candidates this very sweep just disproved, rather than re-serving a
+	 * command that ENOENTed a moment ago because an unrelated sibling stalled.
+	 */
+	private sweepDurablyMissing: string[] = [];
 
 	constructor(verbose = false) {
-		this.log = verbose
-			? createSubsystemLogger("sg-runner")
-			: () => {};
+		this.log = verbose ? createSubsystemLogger("sg-runner") : () => {};
 	}
 
 	/**
 	 * Check if ast-grep CLI is available, auto-install if not.
 	 *
-	 * Re-entrancy safe: concurrent first-time callers share a single
-	 * `ensureInFlight` promise so probing/auto-install isn't duplicated
-	 * across session-start tasks. Mirrors the dedupe pattern in
-	 * `KnipClient.ensureAvailable` and `DependencyChecker.ensureAvailable`.
+	 * Re-entrancy safe: concurrent first-time callers share one flight, so
+	 * probing/auto-install isn't duplicated across session-start tasks. The
+	 * share and the clear-in-finally belong to `singleFlight` (#1753); this
+	 * method owns only the latch short-circuit above it. The sweep-local
+	 * bookkeeping `doEnsureAvailable` resets on entry is untouched — it is
+	 * per-sweep state, not concurrency state.
 	 */
 	async ensureAvailable(): Promise<boolean> {
 		// Fast path: already decided. `read()` returns null when the last verdict
 		// was transient and its cooldown expired, which re-enters the sweep.
 		const memo = this.availabilityLatch.read();
 		if (memo !== null) return memo;
-		if (this.ensureInFlight) return this.ensureInFlight;
-
-		this.ensureInFlight = this.doEnsureAvailable();
-		try {
-			return await this.ensureInFlight;
-		} finally {
-			this.ensureInFlight = null;
-		}
+		return this.ensureFlight.run("ast-grep", () => this.doEnsureAvailable());
 	}
 
 	private async doEnsureAvailable(): Promise<boolean> {
 		const startedAt = Date.now();
 		this.sweepSawTransient = false;
 		this.sweepTransientCause = "probe-timeout";
+		this.sweepUnreachable = [];
 		this.sweepFallbackTransient = false;
 		this.sweepFallbackCause = "probe-timeout";
 		this.sweepHostStallMs = 0;
+		this.sweepDurablyMissing = [];
 
 		// Step 1: PATH — canonical binary names + npx fallback.
 		// Prefer ast-grep over sg on Linux: /usr/bin/sg is util-linux, not ast-grep.
@@ -258,7 +281,10 @@ export class SgRunner {
 		if (pathCommand) {
 			this.sgPath = pathCommand.cmd;
 			this.sgArgsPrefix = pathCommand.argsPrefix;
-			this.noteAvailable(startedAt, `ast-grep found on PATH: ${pathCommand.cmd}`);
+			this.noteAvailable(
+				startedAt,
+				`ast-grep found on PATH: ${pathCommand.cmd}`,
+			);
 			return true;
 		}
 
@@ -271,7 +297,10 @@ export class SgRunner {
 			if (globalBin && (await this.probeCommand(globalBin, []))) {
 				this.sgPath = globalBin;
 				this.sgArgsPrefix = [];
-				this.noteAvailable(startedAt, `ast-grep found in global bin: ${globalBin}`);
+				this.noteAvailable(
+					startedAt,
+					`ast-grep found in global bin: ${globalBin}`,
+				);
 				return true;
 			}
 		}
@@ -296,7 +325,10 @@ export class SgRunner {
 			if (brewBinary) {
 				this.sgPath = brewBinary;
 				this.sgArgsPrefix = [];
-				this.noteAvailable(startedAt, `ast-grep found via Homebrew: ${brewBinary}`);
+				this.noteAvailable(
+					startedAt,
+					`ast-grep found via Homebrew: ${brewBinary}`,
+				);
 				return true;
 			}
 		}
@@ -312,6 +344,25 @@ export class SgRunner {
 		// install below was never reached and the slow npx was re-spawned on each
 		// escalating retry instead — worse than the latch it replaced.
 		if (this.sweepSawTransient) {
+			// Nothing answered, transiently, while we are still holding a command a
+			// previous provisional sweep proved working. Discarding it here would
+			// run #1476 backwards — a timeout erasing a positive result — and it
+			// would send the sweep on to Step 4 to install a tool that is already
+			// runnable. Keep the winner and re-arm the cooldown (#1568 review F1).
+			// #1593: a sibling tier stalling this sweep is not license to re-serve
+			// a winner that THIS SAME sweep just proved durably missing.
+			if (
+				this.availabilityLatch.isProvisional() &&
+				this.sgPath &&
+				!this.sweepDurablyMissing.includes(this.sgPath)
+			) {
+				this.noteAvailable(
+					startedAt,
+					`ast-grep re-probe stalled; keeping ${this.sgPath}`,
+					{ retained: true },
+				);
+				return true;
+			}
 			this.log(
 				"ast-grep availability probe timed out; will retry (not installing)",
 			);
@@ -335,7 +386,10 @@ export class SgRunner {
 		if (installed.outcome === "success") {
 			this.sgPath = installed.value;
 			this.sgArgsPrefix = [];
-			this.noteAvailable(startedAt, `ast-grep auto-installed: ${installed.value}`);
+			this.noteAvailable(
+				startedAt,
+				`ast-grep auto-installed: ${installed.value}`,
+			);
 			return true;
 		}
 
@@ -366,19 +420,55 @@ export class SgRunner {
 		);
 	}
 
-	/** Record a successful sweep: available, latched, one decision record. */
-	private noteAvailable(startedAt: number, message: string): void {
-		this.availabilityLatch.noteAvailable();
+	/**
+	 * Record a successful sweep, with one decision record.
+	 *
+	 * The win is latched for the session UNLESS a direct candidate ahead of it
+	 * was unreachable (#1568). `sweepSawTransient` is set only by candidates the
+	 * sweep already asked, and the sweep returns at the first one that answers,
+	 * so at this point the flag means "a tier the winner is supposed to lose to
+	 * never got a fair hearing". Latching that pinned the session to
+	 * `npx --no -- ast-grep` — a Node start per invocation — over a healthy
+	 * ast-grep on PATH, until the next restart. Provisional instead: served now,
+	 * re-swept once the stalled tier's cooldown expires.
+	 *
+	 * The install arm cannot reach here provisionally: `doEnsureAvailable`
+	 * returns before Step 4 whenever `sweepSawTransient` is set.
+	 *
+	 * `retained` marks the other provisional case (#1568 review F1): no candidate
+	 * answered at all, and the winner being reported is the one the previous
+	 * sweep found, kept rather than discarded on a timeout.
+	 */
+	private noteAvailable(
+		startedAt: number,
+		message: string,
+		opts: { retained?: boolean } = {},
+	): void {
+		const provisional = this.sweepSawTransient;
+		let retryAfterMs = 0;
+		if (provisional) {
+			retryAfterMs = this.availabilityLatch.noteProvisionallyAvailable(
+				this.sweepTransientCause,
+			);
+		} else {
+			this.availabilityLatch.noteAvailable();
+		}
 		this.log(message);
 		logAvailabilityDecision({
 			tool: "ast-grep",
 			verdict: "available",
 			outcome: "success",
-			cause: "ok",
+			cause: provisional ? this.sweepTransientCause : "ok",
 			elapsedMs: Date.now() - startedAt,
-			latched: true,
+			latched: !provisional,
 			hostStallMs: this.sweepHostStallMs,
 			budgetMs: PROBE_TIMEOUT_MS,
+			...(provisional && {
+				provisional: true,
+				unreachablePreferred: [...this.sweepUnreachable],
+				...(opts.retained === true && { retained: true }),
+				...(retryAfterMs > 0 && { retryAfterMs }),
+			}),
 		});
 	}
 
@@ -541,13 +631,23 @@ export class SgRunner {
 			} else {
 				this.sweepSawTransient = true;
 				this.sweepTransientCause = cause;
+				const name = path.basename(cmd);
+				if (!this.sweepUnreachable.includes(name)) {
+					this.sweepUnreachable.push(name);
+				}
 			}
+		} else if (!this.sweepDurablyMissing.includes(cmd)) {
+			this.sweepDurablyMissing.push(cmd);
 		}
 		return false;
 	}
 
 	private async probeCommandCandidates(
-		candidates: Array<{ cmd: string; argsPrefix: string[]; fallback?: boolean }>,
+		candidates: Array<{
+			cmd: string;
+			argsPrefix: string[];
+			fallback?: boolean;
+		}>,
 	): Promise<{ cmd: string; argsPrefix: string[] } | undefined> {
 		for (const candidate of candidates) {
 			if (

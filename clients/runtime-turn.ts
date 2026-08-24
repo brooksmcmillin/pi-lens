@@ -20,6 +20,7 @@ import {
 	writeGitGuardRecord,
 	type TurnEndFindingsCache,
 } from "./git-guard.js";
+import { cascadeSettleWaitMs } from "./cascade-budget.js";
 import { logCascade } from "./cascade-logger.js";
 import { normalizeMapKey } from "./path-utils.js";
 import type {
@@ -31,6 +32,13 @@ import {
 	toRunnerDisplayPath,
 } from "./dispatch/runner-context.js";
 import { getKnipIgnorePatterns } from "./file-utils.js";
+import { formatCacheAgeLabel } from "./finding-delivery-gate.js";
+import {
+	getFullScanWallClockMs,
+	isWorkspaceSweepActive,
+	runWhenWorkspaceSweepIdle,
+	SWEEP_IDLE_SAFETY_MARGIN_MS,
+} from "./lsp/workspace-sweep-hold.js";
 import { isTestRoleCollateral } from "./collateral-test-role.js";
 import type { GitleaksResult } from "./gitleaks-client.js";
 import type { GovulncheckResult } from "./govulncheck-client.js";
@@ -57,8 +65,15 @@ import {
 	writeProjectDiagnosticsDeltaReport,
 } from "./project-diagnostics/cache.js";
 import { deadCodeIssueToProjectDiagnostic } from "./project-diagnostics/runner-adapters/dead-code.js";
+import { gitleaksFindingToProjectDiagnostic } from "./project-diagnostics/runner-adapters/gitleaks.js";
+import { govulncheckFindingToProjectDiagnostic } from "./project-diagnostics/runner-adapters/govulncheck.js";
+import {
+	trivyFindingToProjectDiagnostic,
+	trivySecretFindingToProjectDiagnostic,
+} from "./project-diagnostics/runner-adapters/trivy.js";
 import { knipIssuesToProjectDiagnostics } from "./project-diagnostics/runner-adapters/knip.js";
 import type { ProjectDiagnostic } from "./project-diagnostics/types.js";
+import { applyDispositionsMultiFile } from "./diagnostic-dispositions.js";
 import { logLatency } from "./latency-logger.js";
 import {
 	getLspBudgetIdleTimeoutMs,
@@ -74,9 +89,33 @@ import { formatRunDurationMs } from "./run-duration.js";
 import type { TestResult, TestRunnerClient } from "./test-runner-client.js";
 import {
 	MAX_ADVISORY_AFFECTED_FILES,
-	dropFindingsForMissingPaths,
+	gateFindingsByPathFreshness,
 	snapshotAdvisoryProvenance,
 } from "./advisory-provenance.js";
+import { sweepInlineBlockerFreshness } from "./blocker-freshness.js";
+import { sweepInlineBlockerPastEof } from "./blocker-past-eof.js";
+// #2001/#2002: collect-later delivery for slow auxiliary LSP servers.
+import { getLSPService } from "./lsp/index.js";
+import {
+	drainPendingAuxiliaryCoverage,
+	isPendingAuxiliaryPastRearmTtl,
+	markPendingAuxiliaryCoverage,
+} from "./lsp/pending-aux-coverage.js";
+import type { LSPDiagnostic } from "./lsp/client.js";
+import { convertLspDiagnostics } from "./dispatch/utils/lsp-diagnostics.js";
+// #1631 review V2: moved to its own leaf module so a low-level store
+// (widget-state.ts) can use the marker without importing this orchestrator —
+// see clients/stale-marker.ts's doc comment.
+import { incrementDegradationCount } from "./degradation-ledger.js";
+import {
+	degradeDemotedFindingBody,
+	formatRetirementNote,
+} from "./demoted-finding-render.js";
+import { STALE_LINE_MARKER } from "./stale-marker.js";
+import {
+	getWidgetBlockingFilesForSweep,
+	markWidgetFileBlockersStale,
+} from "./widget-state.js";
 import type { TestRunnerFindingsCache } from "./project-diagnostics/runner-adapters/runner-findings.js";
 
 interface TurnEndDeps {
@@ -96,6 +135,50 @@ interface TurnEndDeps {
 }
 
 /**
+ * #1617: turn_end reads gitleaks/govulncheck/trivy straight from their
+ * session-scan caches and formats them into advisory/blocker text — a
+ * reporting lane parallel to (and, before this fix, entirely bypassing)
+ * `dispatcher.ts:924`'s `applyDispositions` filter. An agent-marked
+ * false-positive/won't-fix on one of these findings never suppressed it
+ * here, so it re-reported on every turn.
+ *
+ * Filters `findings` through the SAME anchor derivation the dispatch path
+ * and `lens_diagnostics mode=full` use (`applyDispositionsMultiFile` in
+ * `diagnostic-dispositions.ts`), keyed off each lane's own canonical
+ * `ProjectDiagnostic` adapter (`toDiagnostic`) — the exact tool/rule/message
+ * identity `lens_diagnostics` already surfaces and `lens_diagnostic_mark`
+ * already anchors a mark against, not a second, cloned identity that would
+ * silently diverge from what the agent actually marked.
+ *
+ * Returns the surviving findings plus how many were dropped, so a caller can
+ * still surface a "suppressed by disposition: N" trace (the #1616
+ * suppressed-bucket rule — a security finding must never vanish with no
+ * trace, even when the disposition that dropped it is working as intended).
+ */
+function filterFindingsByDisposition<F>(
+	findings: F[],
+	cwd: string,
+	toDiagnostic: (finding: F) => ProjectDiagnostic,
+): { kept: F[]; suppressed: number } {
+	if (findings.length === 0) return { kept: findings, suppressed: 0 };
+	const candidates = findings.map((finding) => ({
+		finding,
+		diagnostic: toDiagnostic(finding),
+	}));
+	const survivors = new Set(
+		applyDispositionsMultiFile(
+			candidates.map((c) => c.diagnostic),
+			cwd,
+			(d) => d.filePath,
+		),
+	);
+	const kept = candidates
+		.filter((c) => survivors.has(c.diagnostic))
+		.map((c) => c.finding);
+	return { kept, suppressed: findings.length - kept.length };
+}
+
+/**
  * Would writing `next` over `prev` throw away a good scan for a failed one?
  *
  * A failed run carries no findings. Writing it evicts the last good result, and
@@ -112,6 +195,13 @@ function wouldPoisonCache(
 
 // LSP idle reset scheduling — prevents thrashing by delaying shutdown
 let lspIdleResetTimeout: ReturnType<typeof setTimeout> | null = null;
+// #1618: set while this timer's fire is deferred behind an in-flight
+// workspace sweep (see `scheduleLSPIdleReset`'s `isWorkspaceSweepActive`
+// branch). `cancelLSPIdleReset` must be able to cancel THIS too — otherwise
+// an active-editing turn that cancels idle reset while a sweep is still
+// running would have it silently resurrected once the sweep finishes, even
+// though the session is no longer idle.
+let pendingSweepRearm: { cancelled: boolean } | null = null;
 
 function emitIdleResetReporterWarning(reportErr: unknown): void {
 	try {
@@ -144,12 +234,38 @@ function scheduleLSPIdleReset(
 		onError?: (err: unknown) => void;
 	} = {},
 ): void {
-	// Clear any pending reset to avoid multiple timers
+	// Clear any pending reset to avoid multiple timers. #1618: also cancel a
+	// rearm still waiting on a prior sweep's hold — otherwise re-scheduling
+	// here (this call) leaves that OLD waiter armed too, and the sweep's
+	// eventual release would fire a SECOND, independent `scheduleLSPIdleReset`
+	// alongside this fresh one.
 	if (lspIdleResetTimeout) {
 		clearTimeout(lspIdleResetTimeout);
 	}
+	if (pendingSweepRearm) {
+		pendingSweepRearm.cancelled = true;
+		pendingSweepRearm = null;
+	}
 	lspIdleResetTimeout = setTimeout(() => {
 		lspIdleResetTimeout = null;
+		// #1618: a full workspace sweep (`lens_diagnostics mode=full`) grants
+		// itself a wall-clock ceiling that can outlive this timer's delay — this
+		// used to fire straight into an in-flight sweep and destroy the very
+		// service the sweep was actively touching, mislabeling every file the
+		// sweep had not yet reached as budget exhaustion. Defer instead of
+		// firing: re-arm a FRESH `delayMs` timer once the sweep releases its
+		// hold, rather than resuming a countdown that's already elapsed (which
+		// would fire the instant the hold releases) or destroying mid-sweep.
+		if (isWorkspaceSweepActive()) {
+			const rearmToken = { cancelled: false };
+			pendingSweepRearm = rearmToken;
+			runWhenWorkspaceSweepIdle(() => {
+				if (rearmToken.cancelled) return;
+				if (pendingSweepRearm === rearmToken) pendingSweepRearm = null;
+				scheduleLSPIdleReset(resetFn, delayMs, options);
+			});
+			return;
+		}
 		try {
 			if (options.isCurrentSession && !options.isCurrentSession()) {
 				return;
@@ -168,18 +284,63 @@ function scheduleLSPIdleReset(
 	lspIdleResetTimeout.unref();
 }
 
+// #1618 acceptance criterion 6: FULL_SCAN_WALL_CLOCK_MS (the full-sweep wall
+// clock ceiling, `tools/lens-diagnostics.ts`) must stay under EVERY idle
+// reset delay this module can arm — derived, not asserted, so the constants
+// can't drift back into a relationship where a still-running sweep can
+// outlive the timer. The AC1 hold above already makes a mid-sweep fire
+// impossible regardless of this margin; this is defense in depth against a
+// future caller that touches the LSP service outside
+// `runWorkspaceDiagnostics`' hold. `SWEEP_IDLE_SAFETY_MARGIN_MS` is
+// single-sourced from `workspace-sweep-hold.ts`, which also uses it for its
+// own max-hold-age failsafe — one tunable, not two.
+const DEFAULT_LSP_IDLE_RESET_MS = 240_000;
+
+function sweepDerivedFloorMs(): number {
+	return getFullScanWallClockMs() + SWEEP_IDLE_SAFETY_MARGIN_MS;
+}
+
+/** The normal (non-subagent, non-budget-pressured) idle-reset delay. */
+function getBaseLspIdleResetMs(): number {
+	return Math.max(DEFAULT_LSP_IDLE_RESET_MS, sweepDerivedFloorMs());
+}
+
+/**
+ * #1618 (R4): the subagent-light (#713) and cross-process-budget-pressured
+ * (#449) paths used to arm a flat, much SHORTER delay (60s default) than the
+ * sweep's own 300s ceiling — a 5:1 inversion covered only by the AC1 hold.
+ * Deriving this path too means AC6 ("the sweep's ceiling stays under every
+ * idle-reset delay") holds universally, not just for the common path, and an
+ * env override to either constant can never invert it (`Math.max` floors at
+ * the derived value no matter how small the override pushes the other side).
+ *
+ * Accepted cost (deliberate, not incidental — see R6 in the PR body): under
+ * default settings this now ALSO arms the ~360s derived floor rather than a
+ * true 60s teardown, trading some of #713's "release a short-lived
+ * subagent's fleet fast" benefit for AC6 holding without exceptions.
+ */
+function getShortenedLspIdleResetMs(): number {
+	return Math.max(getLspBudgetIdleTimeoutMs(), sweepDerivedFloorMs());
+}
+
+/** The idle-reset delay `handleTurnEnd` actually arms on a file-less turn —
+ *  exported so tests assert against the REAL computed value instead of a
+ *  hand-derived literal that can silently drift from this function. */
+export function getEffectiveLspIdleResetMs(): number {
+	return isSubagentSession() || shouldShortenLspIdleTimeout()
+		? getShortenedLspIdleResetMs()
+		: getBaseLspIdleResetMs();
+}
+
 export function cancelLSPIdleReset(): void {
 	if (lspIdleResetTimeout) {
 		clearTimeout(lspIdleResetTimeout);
 		lspIdleResetTimeout = null;
 	}
-}
-
-// Bounded wait for the turn's deferred cascade computes (#450) to settle before
-// they are merged below. A late compute is carried over to the next turn_end.
-function cascadeSettleWaitMs(): number {
-	const raw = Number(process.env.PI_LENS_CASCADE_SETTLE_WAIT_MS);
-	return Number.isFinite(raw) && raw >= 0 ? raw : 5000;
+	if (pendingSweepRearm) {
+		pendingSweepRearm.cancelled = true;
+		pendingSweepRearm = null;
+	}
 }
 
 function capTurnEndMessage(content: string): string {
@@ -256,7 +417,10 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		);
 		return;
 	}
-	if (access === "available" && (turnState.files || turnState.owner || turnState.sessionId)) {
+	if (
+		access === "available" &&
+		(turnState.files || turnState.owner || turnState.sessionId)
+	) {
 		dbg("turn_end: evicting stale turn-state owner");
 		cacheManager.clearTurnState(cwd, currentOwner);
 		turnState = cacheManager.readTurnState(cwd);
@@ -287,15 +451,15 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				cacheManager.clearCache("turn-end-findings", cwd);
 			}
 		}
-		// #713: subagent sessions use a shorter idle reset (60s) — a short-lived
-		// task agent holding a warm fleet for 4 minutes after its last turn is
-		// pure waste under fan-out. Classify ONCE here so every tick in this call
-		// path shares the same answer. PI_LENS_SUBAGENT_FULL=1 restores 240s via
-		// isSubagentSession() returning false.
-		const idleResetMs =
-			isSubagentSession() || shouldShortenLspIdleTimeout()
-				? getLspBudgetIdleTimeoutMs()
-				: 240_000;
+		// #713: subagent sessions use a shorter idle reset (nominally 60s) — a
+		// short-lived task agent holding a warm fleet for 4 minutes after its
+		// last turn is pure waste under fan-out. Classify ONCE here so every
+		// tick in this call path shares the same answer. PI_LENS_SUBAGENT_FULL=1
+		// restores the base delay via isSubagentSession() returning false.
+		// #1618: both branches route through `getEffectiveLspIdleResetMs` so
+		// AC6's derivation applies universally — see that function's doc for
+		// why the "shorter" path is not always literally 60s anymore.
+		const idleResetMs = getEffectiveLspIdleResetMs();
 		dbg(
 			`turn_end: no modified files, scheduling LSP idle reset (${idleResetMs / 1000}s)`,
 		);
@@ -310,8 +474,14 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		return;
 	}
 
-	// Cancel any pending idle reset since we're actively working
-	if (lspIdleResetTimeout) {
+	// Cancel any pending idle reset since we're actively working. #1618: also
+	// checks `pendingSweepRearm` — a timer deferred behind an in-flight
+	// workspace sweep already nulled `lspIdleResetTimeout` (the setTimeout
+	// callback clears it before checking the hold), so this guard used to
+	// read "nothing pending" and skip the cancel while a rearm was still
+	// queued to fire the instant the sweep released its hold — resurrecting
+	// idle reset on a session that had since gone back to active editing.
+	if (lspIdleResetTimeout || pendingSweepRearm) {
 		cancelLSPIdleReset();
 		dbg("turn_end: cancelled pending LSP idle reset (active editing)");
 	}
@@ -330,18 +500,117 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 
 	const turnEndStart = Date.now();
 	const blockerParts: string[] = [];
+	/**
+	 * #1622 review M2: findings the freshness gate demoted. A third tier between
+	 * blockers and advisories — not a blocker, because the cached coordinate is
+	 * untrustworthy; not an advisory, because the advisory label reads "no action
+	 * required this turn" and these DO require a re-scan. Each part carries its
+	 * own imperative preamble rather than inheriting that label.
+	 */
+	const staleSecretParts: string[] = [];
 	const advisoryParts: string[] = [];
 	const projectDiagnosticsDelta: ProjectDiagnostic[] = [];
 	const projectDiagnosticsSources = new Set<string>();
 
+	// #1641: past-EOF gate. Runs BEFORE the dependency-drift sweep below — a
+	// cheap statSync per cited file is worth paying first so the pricier
+	// import-parsing sweep can skip anything already taken out of the
+	// authoritative channel this turn (see blocker-past-eof.ts's module doc
+	// for the full composition rule with #1631's gate).
+	const blockerPastEofStart = Date.now();
+	const blockerPastEof = sweepInlineBlockerPastEof(runtime, cwd);
+	logLatency({
+		type: "phase",
+		toolName: "turn_end",
+		filePath: cwd,
+		phase: "blocker_past_eof_sweep",
+		durationMs: Date.now() - blockerPastEofStart,
+		metadata: {
+			total: blockerPastEof.total,
+			checked: blockerPastEof.checked,
+			demoted: blockerPastEof.demoted,
+			// #1944 review F3: `healed` is gone. Retirement makes the falling edge
+			// unreachable on this store, so the field could only ever log zero —
+			// see `BlockerPastEofCounts`.
+		},
+	});
+
+	// #1631: freshness gate. A cached blocker is a verdict about the file AND
+	// everything it imports; before re-serving it, sweep for out-of-band drift of
+	// the file or its forward imports and demote drifted entries to a
+	// `[stale — re-run to confirm]` advisory instead of re-asserting them at full
+	// authority (#1419 demote-not-drop).
+	const blockerFreshnessStart = Date.now();
+	// #1790: widen the sweep's population with widget-store rows a cache-served
+	// replay populated without ever touching RuntimeCoordinator's inline-blocker
+	// map — see blocker-freshness.ts's `WidgetSweepBlockerEntry` doc for why this
+	// is injected here rather than imported by blocker-freshness.ts itself.
+	const blockerFreshness = await sweepInlineBlockerFreshness(runtime, cwd, {
+		additionalEntries: getWidgetBlockingFilesForSweep().map((row) => ({
+			filePath: row.filePath,
+			recordedAtMs: row.recordedAtMs,
+			demote: () =>
+				markWidgetFileBlockersStale(row.filePath, "dependency-drift"),
+		})),
+	});
+	logLatency({
+		type: "phase",
+		toolName: "turn_end",
+		filePath: cwd,
+		phase: "blocker_freshness_sweep",
+		durationMs: Date.now() - blockerFreshnessStart,
+		metadata: {
+			total: blockerFreshness.total,
+			kept: blockerFreshness.kept,
+			revalidated: blockerFreshness.revalidated,
+			alreadyStale: blockerFreshness.alreadyStale,
+			truncatedImports: blockerFreshness.truncatedImports,
+		},
+	});
+
 	// Re-surface inline blockers from this turn that the agent didn't fix.
 	// These were shown inline during write/edit but the agent moved on without resolving them.
 	const unresolvedBlockers = runtime.getInlineBlockersSnapshot();
-	for (const { filePath: bPath, summary } of unresolvedBlockers) {
+	/** #1944: past-EOF demotions retired after their single degraded delivery. */
+	let demotedFindingsRetired = 0;
+	for (const { filePath: bPath, summary, stale } of unresolvedBlockers) {
 		const displayPath = toRunnerDisplayPath(cwd, bPath);
-		blockerParts.push(
-			`Unresolved from this turn — ${displayPath}:\n${summary}`,
-		);
+		if (stale) {
+			// #1631: demoted — out of the authoritative blocker channel and into the
+			// advisory channel with a stale marker, so the agent is told to re-run
+			// rather than pressured by a verdict that may already be resolved.
+			//
+			// #1944: the CHANNEL change is not enough. Until this call the advisory
+			// embedded the blocker body verbatim, so the agent read "🔴 STOP — 11
+			// issue(s) must be fixed" with dead line numbers under a hedge line it
+			// ignored. Degrade the body itself, and — when the file shrank past the
+			// cited lines, so no re-run can ever confirm it — retire the record
+			// after this ONE delivery instead of re-serving it for the rest of the
+			// session.
+			const deadLines = blockerPastEof.deadLinesByPath.get(bPath) ?? [];
+			const degraded = degradeDemotedFindingBody(summary, { deadLines });
+			const retired = runtime.retireDemotedPastEofBlocker(bPath, deadLines);
+			if (retired) {
+				demotedFindingsRetired += 1;
+				// Bounded by the ledger's own per-kind/subject tally, and the subject
+				// keeps the discriminating identity (which store, which file).
+				incrementDegradationCount({
+					kind: "demoted-finding-retired",
+					subject: `inline-blocker:${displayPath}`,
+					reason: `file shrank past cited line(s) ${deadLines.join(", ")}; retired after one degraded delivery`,
+				});
+			}
+			// @delivery-surface: runtime-turn:unresolved-inline-blocker
+			advisoryParts.push(
+				`${STALE_LINE_MARKER} ${displayPath}:\n${degraded.body}` +
+					(retired ? `\n${formatRetirementNote(deadLines)}` : ""),
+			);
+		} else {
+			// @delivery-surface: runtime-turn:unresolved-inline-blocker
+			blockerParts.push(
+				`Unresolved from this turn — ${displayPath}:\n${summary}`,
+			);
+		}
 	}
 
 	// Drain the deferred cascade computes kicked off this turn (#450). They ran
@@ -351,6 +620,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	const cascadeSettleStart = Date.now();
 	const { settled, timedOut } = await runtime.settleCascadeRuns(
 		cascadeSettleWaitMs(),
+		{ trackTurnEndClock: true },
 	);
 	logLatency({
 		type: "phase",
@@ -398,9 +668,10 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			if (changedSince.length > 0) {
 				const changedSet = new Set(changedSince);
 				const primaryKey = normalizeMapKey(path.resolve(run.filePath));
-				const neighborKeys = (run.result?.neighbors ?? []).map((n) =>
-					normalizeMapKey(path.resolve(n.filePath)),
-				);
+				const neighborKeys = [
+					...(run.result?.neighbors ?? []).map((n) => n.filePath),
+					...(run.selectedNeighborPaths ?? []),
+				].map((filePath) => normalizeMapKey(path.resolve(filePath)));
 				const supersededByOwnFile =
 					changedSet.has(primaryKey) ||
 					neighborKeys.some((k) => changedSet.has(k));
@@ -503,7 +774,9 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				neighborCount: uniqueNeighborFiles.length,
 				metadata: {
 					neighborFiles: uniqueNeighborFiles.slice(0, 10),
-					suggestedTestFiles: testSuggestions.slice(0, 10).map((s) => s.testFile),
+					suggestedTestFiles: testSuggestions
+						.slice(0, 10)
+						.map((s) => s.testFile),
 					runner: testSuggestions[0]?.runner,
 					truncated: testSuggestions.length > 10,
 					zeroSuggestions: testSuggestions.length === 0,
@@ -524,6 +797,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		}
 		if (parts.length > 0) {
 			const section = parts.join("\n\n");
+			// @delivery-surface: runtime-turn:cascade-blocker
 			blockerParts.push(section);
 			// #1446 item 1: proves the cascade section reached `blockerParts` —
 			// i.e. it was QUEUED for persistence into the turn-end advisory — not
@@ -562,8 +836,9 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		});
 	}
 	// #1023: surface an HONEST note whenever a cascade run could not compute
-	// downstream impact (degraded/over-cap graph, missing node, or a thrown
-	// compute) — never a silent all-clear (#533). This goes to the ADVISORY tier,
+	// downstream impact (degraded/over-cap graph, missing node, a thrown compute,
+	// or a deliberately budget-truncated neighbor set) — never a silent all-clear
+	// (#533). This goes to the ADVISORY tier,
 	// NOT the blocker tier: in an over-cap monorepo the graph is `skipped` on
 	// every edit, so a blocker would fire hard and never clear turn state every
 	// turn (over-escalation — the mirror of the silent-all-clear bug). Advisory
@@ -587,9 +862,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			runs: typeof indeterminateRuns,
 			frame: {
 				lead: (fileCount: number, reasons: string) => string;
-				fallbackDetail: (
-					r: (typeof indeterminateRuns)[number],
-				) => string;
+				fallbackDetail: (r: (typeof indeterminateRuns)[number]) => string;
 			},
 		): string | undefined => {
 			if (runs.length === 0) return undefined;
@@ -607,9 +880,8 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				const more = files.length > 5 ? ` (+${files.length - 5} more)` : "";
 				lines.push(`  • ${detail}: ${shown}${more}`);
 			}
-			const fileCount = new Set(
-				runs.map((r) => normalizeMapKey(r.filePath)),
-			).size;
+			const fileCount = new Set(runs.map((r) => normalizeMapKey(r.filePath)))
+				.size;
 			const reasons = [...byDetail.keys()].join("; ");
 			return `${frame.lead(fileCount, reasons)}\n${lines.join("\n")}`;
 		};
@@ -624,10 +896,21 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		const graphRuns = indeterminateRuns.filter(
 			(r) =>
 				r.indeterminate?.reason !== "lsp_binding_rejected" &&
-				r.indeterminate?.reason !== "excluded_by_role",
+				r.indeterminate?.reason !== "excluded_by_role" &&
+				r.indeterminate?.reason !== "budget_truncated" &&
+				r.indeterminate?.budget === undefined,
 		);
 		const bindingRuns = indeterminateRuns.filter(
-			(r) => r.indeterminate?.reason === "lsp_binding_rejected",
+			(r) =>
+				r.indeterminate?.reason === "lsp_binding_rejected" &&
+				r.indeterminate?.budget === undefined,
+		);
+		// Budget coverage can be merged into a graph or binding marker, so its
+		// advisory bucket follows the evidence rather than replacing that reason.
+		const budgetRuns = indeterminateRuns.filter(
+			(r) =>
+				r.indeterminate?.reason === "budget_truncated" ||
+				r.indeterminate?.budget !== undefined,
 		);
 
 		// Factual/informational phrasing — the advisory tier wraps this with an
@@ -644,6 +927,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					? "changed file not in the review graph"
 					: "review graph unavailable",
 		});
+		// @delivery-surface: runtime-turn:cascade-coverage-advisory
 		if (graphAdvisory) advisoryParts.push(graphAdvisory);
 
 		const bindingAdvisory = buildAdvisory(bindingRuns, {
@@ -653,7 +937,25 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				`cascade result does not cover them.`,
 			fallbackDetail: () => "cascade diagnostics withheld (binding rejected)",
 		});
+		// @delivery-surface: runtime-turn:cascade-coverage-advisory
 		if (bindingAdvisory) advisoryParts.push(bindingAdvisory);
+
+		const budgetAdvisory = buildAdvisory(budgetRuns, {
+			lead: (fileCount, reasons) =>
+				`Cascade checked the selected neighbors for ${fileCount} edited file(s) this turn, ` +
+				`but some eligible dependents were not checked because the cascade budget ` +
+				`was exhausted (${reasons}); a clean cascade result does not cover them.`,
+			fallbackDetail: (r) => {
+				const budget = r.indeterminate?.budget;
+				if (!budget) return "cascade budget omitted eligible dependents";
+				const detail = `cascade budget checked ${budget.selectedCount} of ${budget.eligibleCount} eligible dependents (${budget.truncatedCount} omitted)`;
+				return budget.transitiveTruncated
+					? `${detail}; transitive expansion was capped before all eligible dependents were enumerated`
+					: detail;
+			},
+		});
+		// @delivery-surface: runtime-turn:cascade-coverage-advisory
+		if (budgetAdvisory) advisoryParts.push(budgetAdvisory);
 
 		const fileCount = new Set(
 			indeterminateRuns.map((r) => normalizeMapKey(r.filePath)),
@@ -673,6 +975,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			file: toRunnerDisplayPath(cwd, r.filePath),
 			reason: r.indeterminate?.reason,
 			...(r.indeterminate?.detail && { detail: r.indeterminate.detail }),
+			...(r.indeterminate?.budget && { budget: r.indeterminate.budget }),
 			...(r.indeterminate?.diagnostic && {
 				diagnostic: r.indeterminate.diagnostic,
 			}),
@@ -721,6 +1024,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	const t2 = Date.now();
 	let knipMeta: {
 		skipped?: boolean;
+		execution?: "executed" | "cache";
 		success?: boolean;
 		totalIssues?: number;
 		newIssues?: number;
@@ -755,7 +1059,13 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			);
 			knipMeta = { skipped: true, reason: prevKnip.data.summary };
 		} else {
-			const knipResult = await knipClient.analyze(cwd, getKnipIgnorePatterns());
+			const knipResult = await knipClient.analyze(
+				cwd,
+				getKnipIgnorePatterns(),
+				{
+					projectSeq: runtime.projectSeq,
+				},
+			);
 			// Never overwrite a good scan with a failure (#925, #1467): the last
 			// good result stays until a new successful scan replaces it.
 			const knipWouldPoison = wouldPoisonCache(prevKnip, knipResult);
@@ -767,6 +1077,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				cacheManager.writeCache("knip", knipResult, cwd);
 			}
 			knipMeta = {
+				execution: knipResult.execution ?? "executed",
 				success: knipResult.success,
 				totalIssues: knipResult.issues.length,
 				newIssues: 0,
@@ -818,6 +1129,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					if (firstPath) {
 						report += `  First location: ${firstPath}\n`;
 					}
+					// @delivery-surface: runtime-turn:knip-blocker
 					blockerParts.push(report);
 				}
 
@@ -841,6 +1153,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 							: "(unknown)";
 						report += `  ${display}${issue.line ? `:${issue.line}` : ""} — ${issue.name}\n`;
 					}
+					// @delivery-surface: runtime-turn:knip-advisory
 					advisoryParts.push(report);
 				}
 			}
@@ -982,6 +1295,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 						),
 					);
 					projectDiagnosticsSources.add("dead-code");
+					// @delivery-surface: runtime-turn:dead-code-advisory
 					advisoryParts.push(formatDeadCodeDelta(newIssues, result.language));
 				} catch (err) {
 					dbg(`turn_end: dead-code(${client.id}) failed: ${err}`);
@@ -1004,29 +1318,79 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		metadata: deadCodeMeta,
 	});
 
+	// #1617: running total of findings this turn's advisory/blocker sections
+	// dropped because an agent/user marked them false-positive/won't-fix —
+	// the #1616 suppressed-bucket rule applied to turn_end's own reporting
+	// lanes, so a mark's effect stays visible even though the finding itself
+	// no longer appears above. Review-round F4 (#1625): kept per-lane, not
+	// just a bare total, so the eventual trace says WHICH lane's marks did
+	// the suppressing.
+	let dispositionSuppressedTotal = 0;
+	const dispositionSuppressedByLane: Record<string, number> = {};
+	function recordDispositionSuppressed(lane: string, count: number): void {
+		if (count <= 0) return;
+		dispositionSuppressedTotal += count;
+		dispositionSuppressedByLane[lane] =
+			(dispositionSuppressedByLane[lane] ?? 0) + count;
+	}
+
 	// govulncheck — surface session_start-cached Go CVE findings as advisory.
 	// No per-turn re-run in this slice; the cache refreshes at next session_start.
 	const govCacheEntry = cacheManager.readCache<GovulncheckResult>(
 		"govulncheck",
 		cwd,
 	);
-	if (govCacheEntry?.data?.findings?.length) {
-		const findings = govCacheEntry.data.findings.slice(0, 5);
+	// #1622: govulncheck renders a call site as `file:line`, and the cache is a
+	// session_start snapshot — the same stale-line shape as gitleaks, one tier
+	// lower. A CVE is pinned by go.mod, NOT by the call site, so neither an edit
+	// nor a deletion may drop it: `onMissing: "demote"` routes a vanished traced
+	// file into the same arm as an edited one. This gate only ever decides
+	// whether the cited LINE is still worth printing. (Review round H1: the first
+	// cut let a deleted trace file drop the CVE, contradicting this comment, and
+	// `citedPath` reads only the FIRST filename frame — so one deleted file in a
+	// long trace silently killed a CVE that go.mod still pins.)
+	const govGate = gateFindingsByPathFreshness({
+		store: "govulncheck",
+		findings: govCacheEntry?.data?.findings ?? [],
+		cwd,
+		scannedAt: govCacheEntry?.data?.scannedAt,
+		citedPath: (finding) => finding.trace.find((t) => t.filename)?.filename,
+		onMissing: "demote",
+	});
+	const govStale = new Set(govGate.stale);
+	// #1625 review round: the #1622 freshness gate runs FIRST — the disposition
+	// filter's anchor is derived from each finding's post-demotion identity
+	// (this array is already the gate's live+stale partition, never the raw
+	// pre-gate cache). #1627's own post-gate guard (`if (govFindings.length)`)
+	// and this round's disposition guard are the SAME guard — compose them,
+	// never fall back to a raw-cache-length check (that would print the header
+	// with zero rows beneath it whenever either filter empties the list).
+	const govFiltered = filterFindingsByDisposition(
+		[...govGate.live, ...govGate.stale],
+		cwd,
+		(f) => govulncheckFindingToProjectDiagnostic(cwd, f),
+	);
+	recordDispositionSuppressed("govulncheck", govFiltered.suppressed);
+	const govFindings = govFiltered.kept;
+	if (govFindings.length) {
+		const findings = govFindings.slice(0, 5);
 		let report =
 			"🛡️ Go CVEs reachable from this code (govulncheck) — upgrade where possible:\n";
 		for (const f of findings) {
 			const callSite = f.trace.find((t) => t.filename);
+			const stale = govStale.has(f);
 			const where = callSite?.filename
-				? `${toRunnerDisplayPath(cwd, callSite.filename)}${callSite.line ? `:${callSite.line}` : ""}`
+				? `${toRunnerDisplayPath(cwd, callSite.filename)}${!stale && callSite.line ? `:${callSite.line}` : ""}${stale ? ` ${STALE_LINE_MARKER}` : ""}`
 				: (f.module ?? f.packageName ?? "(module)");
 			const fix = f.fixedVersion
 				? ` — upgrade to ${f.fixedVersion} or later`
 				: " — no fix yet, track upstream";
 			report += `  ${f.osv} (${where})${fix}\n`;
 		}
-		if (govCacheEntry.data.findings.length > findings.length) {
-			report += `  … and ${govCacheEntry.data.findings.length - findings.length} more\n`;
+		if (govFindings.length > findings.length) {
+			report += `  … and ${govFindings.length - findings.length} more\n`;
 		}
+		// @delivery-surface: runtime-turn:govulncheck-advisory
 		advisoryParts.push(report);
 	}
 
@@ -1041,6 +1405,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		"gitleaks",
 		cwd,
 	)?.data;
+	const trivySecretsData = trivyCacheEntry?.data;
 	// #1461 slice 1 (#1460): the gitleaks cache is TTL-only, so a finding for a
 	// file deleted after the scan is still served as a 🔴 blocker for the rest
 	// of the 30-minute window — the live case, and 119 of 126 findings in
@@ -1048,20 +1413,109 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	// store (session_start's read only decides whether to re-scan; the
 	// project-diagnostics path re-scans fresh and reconciles at load), so the
 	// drop belongs here, before the findings enter the shared secret pipeline.
-	// gitleaks only in this slice — trivy secrets are slice 1's sibling store.
-	const gitleaksFindings = dropFindingsForMissingPaths({
+	// #1622 extends that gate from existence to freshness, and adds trivy
+	// secrets — the sibling store with the identical shape. A cited file edited
+	// after the scan keeps its finding but loses its line number: the credential
+	// may still be there, just not where the snapshot says. Dropping instead
+	// would let any edit — malicious or accidental — mute a real secret.
+	const gitleaksGate = gateFindingsByPathFreshness({
 		store: "gitleaks",
 		findings: gitleaksData?.findings ?? [],
 		cwd,
+		scannedAt: gitleaksData?.scannedAt,
 		citedPath: (finding) => finding.file,
 	});
+	const trivySecretsGate = gateFindingsByPathFreshness({
+		store: "trivy-secrets",
+		findings: trivySecretsData?.secrets ?? [],
+		cwd,
+		scannedAt: trivySecretsData?.scannedAt,
+		citedPath: (finding) => finding.file,
+	});
+	// #1617: THE bug this issue exists for — gitleaks findings never passed
+	// through `applyDispositions`, so an agent-marked false-positive/won't-fix
+	// re-reported as a 🔴 STOP blocker on every turn. Filter through the SAME
+	// `gitleaksFindingToProjectDiagnostic` identity `lens_diagnostics
+	// mode=full` surfaces (tool="gitleaks", rule="gitleaks:<ruleId>", the
+	// exact "Potential secret: …" message) so a mark made against what the
+	// agent was shown is honored here too.
+	//
+	// #1625 review round: filtered AFTER the #1622 freshness gate above — the
+	// anchor is derived from each finding's post-demotion identity, never the
+	// raw pre-gate cache. Applied to BOTH `gitleaksGate.live` AND
+	// `gitleaksGate.stale`: `staleSecretEntries` below derives from the stale
+	// arm, and an fp-marked finding that later goes stale must not reappear
+	// there — a suppression escape (and a double count against
+	// `dispositionSuppressedTotal`) that a live-only filter would have missed.
+	//
+	// #1628: trivy-secret findings get the SAME treatment, now that
+	// `trivySecretFindingToProjectDiagnostic` (project-diagnostics/runner-
+	// adapters/trivy.ts) gives them a `lens_diagnostics`-surfaced identity
+	// (tool="trivy", rule="trivy-secret:<ruleId>") to anchor a mark against —
+	// same pattern as gitleaks above, applied to both the live and stale arms
+	// for the same reason.
+	//
+	// ast-grep secret findings need no filtering here — they already went
+	// through dispatch's applyDispositions before reaching
+	// `peekActionableWarnings()`.
+	const gitleaksLiveFiltered = filterFindingsByDisposition(
+		gitleaksGate.live,
+		cwd,
+		(f) => gitleaksFindingToProjectDiagnostic(cwd, f),
+	);
+	const gitleaksStaleFiltered = filterFindingsByDisposition(
+		gitleaksGate.stale,
+		cwd,
+		(f) => gitleaksFindingToProjectDiagnostic(cwd, f),
+	);
+	recordDispositionSuppressed(
+		"gitleaks",
+		gitleaksLiveFiltered.suppressed + gitleaksStaleFiltered.suppressed,
+	);
+	const trivySecretsLiveFiltered = filterFindingsByDisposition(
+		trivySecretsGate.live,
+		cwd,
+		(f) => trivySecretFindingToProjectDiagnostic(cwd, f),
+	);
+	const trivySecretsStaleFiltered = filterFindingsByDisposition(
+		trivySecretsGate.stale,
+		cwd,
+		(f) => trivySecretFindingToProjectDiagnostic(cwd, f),
+	);
+	recordDispositionSuppressed(
+		"trivy-secrets",
+		trivySecretsLiveFiltered.suppressed + trivySecretsStaleFiltered.suppressed,
+	);
 	const astSecretWarnings = runtime
 		.peekActionableWarnings()
 		.filter(isSecretWarning);
 	const sessionSecrets = dedupeSecretFindings([
-		...fromGitleaks(gitleaksFindings),
-		...fromTrivySecrets(trivyCacheEntry?.data?.secrets ?? []),
+		...fromGitleaks(gitleaksLiveFiltered.kept),
+		...fromTrivySecrets(trivySecretsLiveFiltered.kept),
 	]);
+	// Demoted secrets are addressed by FILE, never by line — the line is the one
+	// field the edit invalidated. Rule id and source survive it and must be
+	// carried through (review round M1): an agent triages an `aws-access-token`
+	// differently from a low-confidence `generic-api-key`, and cannot do that
+	// from a bare path. Deduped on file+rule+source so a file with twenty stale
+	// hits of one rule is named once.
+	const staleSecretEntries = [
+		...gitleaksStaleFiltered.kept.map((f) => ({
+			file: toRunnerDisplayPath(cwd, f.file),
+			rule: f.ruleId,
+			source: "gitleaks",
+		})),
+		...trivySecretsStaleFiltered.kept.map((f) => ({
+			file: toRunnerDisplayPath(cwd, f.file),
+			rule: f.ruleId,
+			source: "trivy",
+		})),
+	];
+	const staleSecrets = [
+		...new Map(
+			staleSecretEntries.map((e) => [`${e.file}|${e.rule}|${e.source}`, e]),
+		).values(),
+	];
 	// Locations already surfaced as session-scan secret blockers — used to enrich
 	// provenance where ast-grep agrees and to suppress the duplicate ast-grep copy
 	// from the actionable-warnings advisory below.
@@ -1087,15 +1541,54 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		if (enriched.length > shown.length) {
 			report += `  … and ${enriched.length - shown.length} more\n`;
 		}
+		// @delivery-surface: runtime-turn:secrets-gitleaks,runtime-turn:secrets-trivy
 		blockerParts.push(report);
+	}
+	if (staleSecrets.length) {
+		// Its OWN tier, never `advisoryParts` (review round M2). The advisory tier
+		// is labelled "no action required this turn", which would sit directly
+		// above copy telling the agent to re-scan — a section that contradicts its
+		// own heading. This preamble is imperative because the action is real: the
+		// finding is unverified, not dismissed.
+		const shown = staleSecrets.slice(0, 5);
+		let report =
+			`🔑 ACTION NEEDED — secrets were flagged in files that changed after the scan. ${STALE_LINE_MARKER}\n` +
+			"The cached line numbers are no longer trustworthy, so they are withheld. Re-run a secrets scan to confirm or clear these:\n";
+		for (const entry of shown) {
+			report += `  ${entry.file} — ${entry.rule} [${entry.source}]\n`;
+		}
+		if (staleSecrets.length > shown.length) {
+			report += `  … and ${staleSecrets.length - shown.length} more\n`;
+		}
+		// @delivery-surface: runtime-turn:stale-secrets-tier
+		staleSecretParts.push(report);
 	}
 
 	// trivy — surface session_start-cached dependency CVEs (#131, Phase 1).
 	// CRITICAL is a blocker (a known-exploitable CVE in a shipped dep is real
 	// production risk); HIGH/MEDIUM/LOW are advisory. The agent gets the upgrade
 	// target as a hint and decides — we never auto-edit lockfiles.
-	if (trivyCacheEntry?.data?.findings?.length) {
-		const all = trivyCacheEntry.data.findings;
+	//
+	// #1634: these three trivy reports (critical blocker, non-critical
+	// advisory, license advisory below) name a PACKAGE, not a file:line — there
+	// is no cited path for `gateFindingsByPathFreshness` to stat, so unlike the
+	// secrets/govulncheck stores above this store cannot be freshness-GATED.
+	// It is the delivery gate's explicit-label escape hatch instead
+	// (`clients/finding-delivery-gate.ts`, surfaces `runtime-turn:trivy-*`):
+	// the session_start cache can be arbitrarily old, so its age is stated
+	// plainly rather than presenting a CRITICAL blocker as if it were current.
+	// This runs on top of (not instead of) #1625's disposition filter below —
+	// a suppressed finding never reaches this render at all, so the two only
+	// ever compose.
+	const trivyAgeLabel = formatCacheAgeLabel(trivyCacheEntry?.data?.scannedAt);
+	const trivyFindingsFiltered = filterFindingsByDisposition(
+		trivyCacheEntry?.data?.findings ?? [],
+		cwd,
+		(f) => trivyFindingToProjectDiagnostic(cwd, f),
+	);
+	recordDispositionSuppressed("trivy", trivyFindingsFiltered.suppressed);
+	if (trivyFindingsFiltered.kept.length) {
+		const all = trivyFindingsFiltered.kept;
 		const critical = all.filter((f) => f.severity === "CRITICAL");
 		const advisory = all.filter((f) => f.severity !== "CRITICAL");
 		const fmt = (f: TrivyResult["findings"][number]): string => {
@@ -1109,33 +1602,34 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		};
 		if (critical.length) {
 			const shown = critical.slice(0, 5);
-			let report =
-				"🔴 STOP — CRITICAL dependency CVEs (trivy). Upgrade before shipping:\n";
+			let report = `🔴 STOP — CRITICAL dependency CVEs (trivy, ${trivyAgeLabel}). Upgrade before shipping:\n`;
 			for (const f of shown) report += fmt(f);
 			if (critical.length > shown.length) {
 				report += `  … and ${critical.length - shown.length} more\n`;
 			}
+			// @delivery-surface: runtime-turn:trivy-critical-blocker
 			blockerParts.push(report);
 		}
 		if (advisory.length) {
 			const shown = advisory.slice(0, 5);
-			let report = "🛡️ Dependency CVEs (trivy) — upgrade where possible:\n";
+			let report = `🛡️ Dependency CVEs (trivy, ${trivyAgeLabel}) — upgrade where possible:\n`;
 			for (const f of shown) report += fmt(f);
 			if (advisory.length > shown.length) {
 				report += `  … and ${advisory.length - shown.length} more\n`;
 			}
+			// @delivery-surface: runtime-turn:trivy-cve-advisory
 			advisoryParts.push(report);
 		}
 	}
 
 	// trivy — dependency license risk (#131 Mode 4). Advisory only: a copyleft /
 	// restricted license in a proprietary tree is a compliance signal, not a
-	// build break. Surfaced from the same cached `trivy fs` pass.
+	// build break. Surfaced from the same cached `trivy fs` pass — same #1634
+	// explicit-label rationale as the CVE reports above (no cited path to gate).
 	const licenses = trivyCacheEntry?.data?.licenses ?? [];
 	if (licenses.length) {
 		const shown = licenses.slice(0, 5);
-		let report =
-			"📜 Dependency license risk (trivy) — review for compliance:\n";
+		let report = `📜 Dependency license risk (trivy, ${trivyAgeLabel}) — review for compliance:\n`;
 		for (const l of shown) {
 			const cat = l.category ? `, ${l.category}` : "";
 			report += `  ${l.pkgName} — ${l.license} (${l.severity}${cat})\n`;
@@ -1143,7 +1637,25 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		if (licenses.length > shown.length) {
 			report += `  … and ${licenses.length - shown.length} more\n`;
 		}
+		// @delivery-surface: runtime-turn:trivy-license-advisory
 		advisoryParts.push(report);
+	}
+
+	// #1616 suppressed-bucket rule: surface the running disposition-drop total
+	// as its own advisory line so a mark's effect is visible, not a silent
+	// absence — trace, not a vanish.
+	if (dispositionSuppressedTotal > 0) {
+		// Review-round F4 (#1625): per-lane attribution, e.g.
+		// "gitleaks 2, govulncheck 1" — not just a bare total.
+		const byLane = Object.entries(dispositionSuppressedByLane)
+			.map(([lane, count]) => `${lane} ${count}`)
+			.join(", ");
+		// @delivery-surface: runtime-turn:disposition-suppressed-notice
+		advisoryParts.push(
+			`suppressed by disposition: ${dispositionSuppressedTotal} finding(s) ` +
+				`dropped from this turn's gitleaks/govulncheck/trivy sections (${byLane}) ` +
+				"(marked false-positive or won't-fix).",
+		);
 	}
 
 	const t3 = Date.now();
@@ -1215,8 +1727,11 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		// LSP cascade-diagnostics merge — no second reverse-dependency walk, and the
 		// neighbor set inherits whatever budget the cascade compute already applied
 		// (CASCADE_NEIGHBOUR_BUDGET), so this can't turn into unbounded per-edit work.
-		const candidates: Array<{ display: string; abs: string; isNeighbor: boolean }> =
-			[];
+		const candidates: Array<{
+			display: string;
+			abs: string;
+			isNeighbor: boolean;
+		}> = [];
 		const seenCandidateKeys = new Set<string>();
 		for (const file of files) {
 			const abs = resolveRunnerPath(cwd, file);
@@ -1263,8 +1778,14 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			)?.data;
 			const testRunGeneration = (priorTestCache?.testRunGeneration ?? 0) + 1;
 			const provenanceFiles = [
-				...candidates.map((candidate) => ({ path: candidate.abs, role: "source" as const })),
-				...targets.map((target) => ({ path: target.testFile, role: "test" as const })),
+				...candidates.map((candidate) => ({
+					path: candidate.abs,
+					role: "source" as const,
+				})),
+				...targets.map((target) => ({
+					path: target.testFile,
+					role: "test" as const,
+				})),
 			];
 			const launchedFrom = snapshotAdvisoryProvenance({
 				cwd,
@@ -1294,12 +1815,17 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 						generation: testRunGeneration,
 						files: provenanceFiles,
 					});
-					const superseded = launchedFrom.revision.sessionId !== publishedAgainst.revision.sessionId ||
-						launchedFrom.revision.projectSeq !== publishedAgainst.revision.projectSeq ||
-						launchedFrom.revision.turnIndex !== publishedAgainst.revision.turnIndex ||
-						launchedFrom.files.some((file, index) =>
-							publishedAgainst.files[index]?.sha256 !== file.sha256 ||
-							publishedAgainst.files[index]?.path !== file.path
+					const superseded =
+						launchedFrom.revision.sessionId !==
+							publishedAgainst.revision.sessionId ||
+						launchedFrom.revision.projectSeq !==
+							publishedAgainst.revision.projectSeq ||
+						launchedFrom.revision.turnIndex !==
+							publishedAgainst.revision.turnIndex ||
+						launchedFrom.files.some(
+							(file, index) =>
+								publishedAgainst.files[index]?.sha256 !== file.sha256 ||
+								publishedAgainst.files[index]?.path !== file.path,
 						);
 					// #628: the turn advancing while tests ran no longer means the
 					// results are thrown away — a late result is still real
@@ -1354,17 +1880,32 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 						// git-guard blocker. `formatResult` already renders the
 						// error-only case as "Could not run tests: ...".
 						if (failed > 0 || error) {
+							// #2028: "Test file not found" is an expected skip
+							// (conventional test path without an actual file),
+							// not an actionable failure. Don't surface it.
+							if (
+								error &&
+								String(r.value?.error ?? "").includes("Test file not found")
+							) {
+								continue;
+							}
 							const formatted = testRunnerClient.formatResult(r.value);
 							if (formatted) failures.push(formatted);
 						}
 					}
 					if (failures.length > 0) {
-						const currentGeneration = cacheManager.readCache<TestRunnerFindingsCache>(
-							"test-runner-findings",
-							cwd,
-						)?.data?.testRunGeneration;
-						if (currentGeneration !== undefined && currentGeneration > testRunGeneration) {
-							dbg(`turn_end: test generation ${testRunGeneration} superseded by ${currentGeneration}`);
+						const currentGeneration =
+							cacheManager.readCache<TestRunnerFindingsCache>(
+								"test-runner-findings",
+								cwd,
+							)?.data?.testRunGeneration;
+						if (
+							currentGeneration !== undefined &&
+							currentGeneration > testRunGeneration
+						) {
+							dbg(
+								`turn_end: test generation ${testRunGeneration} superseded by ${currentGeneration}`,
+							);
 							return;
 						}
 						const content = stale
@@ -1384,7 +1925,10 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 							},
 							cwd,
 						);
-						if (getFlag("lens-guard") && firedSessionId === runtime.telemetrySessionId) {
+						if (
+							getFlag("lens-guard") &&
+							firedSessionId === runtime.telemetrySessionId
+						) {
 							// #1524: `&& !value.error` — a runner-error result has
 							// `failed === 0` (the suite never ran, so nothing could
 							// fail), but it is not a pass. Without the filter it
@@ -1402,7 +1946,12 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 								.filter((value) => value.failed === 0 && !value.error)
 								.map((value) => value.file);
 							if (cleanFiles.length > 0) {
-								clearGitGuardTestFailure(cacheManager, cwd, runtime, cleanFiles);
+								clearGitGuardTestFailure(
+									cacheManager,
+									cwd,
+									runtime,
+									cleanFiles,
+								);
 							}
 							mergeGitGuardTestFailure(
 								cacheManager,
@@ -1418,8 +1967,16 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 							`turn_end: ${failures.length} test failure(s) cached for next context injection${stale ? " (stale — turn advanced while tests ran)" : ""}`,
 						);
 					} else if (results.length > 0) {
-						if (getFlag("lens-guard") && firedSessionId === runtime.telemetrySessionId) {
-							clearGitGuardTestFailure(cacheManager, cwd, runtime, resultValues.map((value) => value.file));
+						if (
+							getFlag("lens-guard") &&
+							firedSessionId === runtime.telemetrySessionId
+						) {
+							clearGitGuardTestFailure(
+								cacheManager,
+								cwd,
+								runtime,
+								resultValues.map((value) => value.file),
+							);
 						}
 						dbg(
 							`turn_end: all tests passed${stale ? " (stale — turn advanced while tests ran)" : ""}`,
@@ -1460,71 +2017,84 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			// into an authoritative-looking clean result for the rest of the file.
 			// Keep the limitation visible and require a complete graph for this
 			// user-facing impact surface (#1070).
+			// @delivery-surface: runtime-turn:call-graph-advisory
 			advisoryParts.push(
 				"Call-graph impact was not emitted because call-graph extraction coverage is incomplete; " +
 					"the affected files may have unreported callers.",
 			);
 		} else {
 			try {
-				const { impact, formatImpact, parseSymbolKey } = await import("./call-graph.js");
-				const { callGraphImpactToProjectDiagnostics } = await import(
-					"./project-diagnostics/runner-adapters/call-graph-impact.js"
-				);
-			const impactLines: string[] = [];
-			const impactFindings: { calleeKey: string; results: ReturnType<typeof impact> }[] =
-				[];
-			for (const filePath of files.slice(0, 5)) {
-				// Turn-state files may be cwd-relative while graph keys are absolute,
-				// and persisted graphs can contain either slash style/casing. Compare
-				// through the shared normalized path seam; keep the original filePath
-				// only for display and diagnostics.
-				const changedFileKey = normalizeMapKey(resolveRunnerPath(cwd, filePath));
-				const fileCallerKeys = [...runtime.callGraph.callers.keys()].filter((k) => {
-					const graphFilePath = parseSymbolKey(k).filePath;
-					return normalizeMapKey(resolveRunnerPath(cwd, graphFilePath)) === changedFileKey;
-				});
-				for (const calleeKey of fileCallerKeys.slice(0, 3)) {
-					// #1080: drop KNOWN test-role callers BEFORE both the human advisory
-					// (formatImpact below) and the persisted delta (impactFindings →
-					// callGraphImpactToProjectDiagnostics) — the advisory is rendered
-					// first, so the filter must reach the shared `results` set that feeds
-					// both. A test caller supplied by an old/fixture/expanded graph must
-					// appear in neither surface. Fail-open: an unparseable/unclassifiable
-					// key is retained (the adapter re-applies the same predicate).
-					const results = impact(runtime.callGraph, calleeKey).filter((r) => {
-						const callerFile = parseSymbolKey(r.symbolKey).filePath;
-						return (
-							!callerFile ||
-							!isTestRoleCollateral(resolveRunnerPath(cwd, callerFile))
-						);
-					});
-					if (results.length > 0) {
-						impactFindings.push({ calleeKey, results });
-						const summary = formatImpact(results, cwd);
-						if (summary)
-							impactLines.push(`  ${parseSymbolKey(calleeKey).symbolName ?? calleeKey}: ${summary}`);
+				const { impact, formatImpact, parseSymbolKey } =
+					await import("./call-graph.js");
+				const { callGraphImpactToProjectDiagnostics } =
+					await import("./project-diagnostics/runner-adapters/call-graph-impact.js");
+				const impactLines: string[] = [];
+				const impactFindings: {
+					calleeKey: string;
+					results: ReturnType<typeof impact>;
+				}[] = [];
+				for (const filePath of files.slice(0, 5)) {
+					// Turn-state files may be cwd-relative while graph keys are absolute,
+					// and persisted graphs can contain either slash style/casing. Compare
+					// through the shared normalized path seam; keep the original filePath
+					// only for display and diagnostics.
+					const changedFileKey = normalizeMapKey(
+						resolveRunnerPath(cwd, filePath),
+					);
+					const fileCallerKeys = [...runtime.callGraph.callers.keys()].filter(
+						(k) => {
+							const graphFilePath = parseSymbolKey(k).filePath;
+							return (
+								normalizeMapKey(resolveRunnerPath(cwd, graphFilePath)) ===
+								changedFileKey
+							);
+						},
+					);
+					for (const calleeKey of fileCallerKeys.slice(0, 3)) {
+						// #1080: drop KNOWN test-role callers BEFORE both the human advisory
+						// (formatImpact below) and the persisted delta (impactFindings →
+						// callGraphImpactToProjectDiagnostics) — the advisory is rendered
+						// first, so the filter must reach the shared `results` set that feeds
+						// both. A test caller supplied by an old/fixture/expanded graph must
+						// appear in neither surface. Fail-open: an unparseable/unclassifiable
+						// key is retained (the adapter re-applies the same predicate).
+						const results = impact(runtime.callGraph, calleeKey).filter((r) => {
+							const callerFile = parseSymbolKey(r.symbolKey).filePath;
+							return (
+								!callerFile ||
+								!isTestRoleCollateral(resolveRunnerPath(cwd, callerFile))
+							);
+						});
+						if (results.length > 0) {
+							impactFindings.push({ calleeKey, results });
+							const summary = formatImpact(results, cwd);
+							if (summary)
+								impactLines.push(
+									`  ${parseSymbolKey(calleeKey).symbolName ?? calleeKey}: ${summary}`,
+								);
+						}
 					}
 				}
-			}
-			if (impactLines.length > 0) {
-				advisoryParts.push(
-					`📊 Call-graph impact (changed symbols have callers):\n${impactLines.join("\n")}`,
-				);
-			}
-			if (impactFindings.length > 0) {
-				const impactDiagnostics = callGraphImpactToProjectDiagnostics(
-					cwd,
-					impactFindings,
-				);
-				if (impactDiagnostics.length > 0) {
-					projectDiagnosticsDelta.push(...impactDiagnostics);
-					projectDiagnosticsSources.add("call-graph");
+				if (impactLines.length > 0) {
+					// @delivery-surface: runtime-turn:call-graph-advisory
+					advisoryParts.push(
+						`📊 Call-graph impact (changed symbols have callers):\n${impactLines.join("\n")}`,
+					);
 				}
+				if (impactFindings.length > 0) {
+					const impactDiagnostics = callGraphImpactToProjectDiagnostics(
+						cwd,
+						impactFindings,
+					);
+					if (impactDiagnostics.length > 0) {
+						projectDiagnosticsDelta.push(...impactDiagnostics);
+						projectDiagnosticsSources.add("call-graph");
+					}
+				}
+				// Non-fatal — call graph is best-effort
+			} catch {
+				// Non-fatal — call graph is best-effort
 			}
-			// Non-fatal — call graph is best-effort
-		} catch {
-			// Non-fatal — call graph is best-effort
-		}
 		}
 	}
 
@@ -1592,6 +2162,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			writeActionableWarningsReport(cacheManager, cwd, report);
 			appendActionableWarningsHistory(cwd, report);
 			const advisory = formatActionableWarningsAdvisory(report);
+			// @delivery-surface: runtime-turn:actionable-warnings-advisory
 			if (advisory) advisoryParts.push(advisory);
 			logActionableWarningsEvent({
 				event: advisory ? "advisory_injected" : "advisory_skipped",
@@ -1640,6 +2211,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		writeCodeQualityWarningsReport(cacheManager, cwd, qualityReport);
 		appendCodeQualityWarningsHistory(cwd, qualityReport);
 		const advisory = formatCodeQualityWarningsAdvisory(qualityReport);
+		// @delivery-surface: runtime-turn:code-quality-warnings-advisory
 		if (advisory) advisoryParts.push(advisory);
 		logLatency({
 			type: "phase",
@@ -1666,10 +2238,155 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 
 	cacheManager.incrementTurnCycle(cwd, currentOwner);
 
+	// #2001/#2002: collect-later delivery for auxiliary LSP servers whose
+	// aux-grace window expired without a publication (opengrep on Windows:
+	// ~8s per scan against a 2s grace — the scanner's eventual findings sat
+	// in its client cache, agent-invisible). Probe each pending pair through
+	// the read-only cache seam (never spawns), freshness-gate the result
+	// against when the pair was marked, and deliver survivors as an advisory.
+	// A pair whose client is alive but has STILL published nothing re-arms
+	// (baseline preserved, TTL anchor advanced) until the re-arm TTL; a dead
+	// client drops silently.
+	const lateAuxStart = Date.now();
+	const drainedPairs = drainPendingAuxiliaryCoverage();
+	let lateAuxDelivered = 0;
+	let lateAuxStale = 0;
+	let lateAuxMissing = 0;
+	let lateAuxRearmed = 0;
+	let lateAuxClientGone = 0;
+	let lateAuxProbeFailed = 0;
+	if (drainedPairs.length > 0) {
+		const byFile = new Map<string, typeof drainedPairs>();
+		for (const pair of drainedPairs) {
+			const list = byFile.get(pair.filePath);
+			if (list) list.push(pair);
+			else byFile.set(pair.filePath, [pair]);
+		}
+		try {
+			const service = getLSPService();
+			for (const [lateAuxPath, pairs] of byFile) {
+				let cached: Map<string, LSPDiagnostic[]>;
+				try {
+					cached = await service.readCachedDiagnosticsForServers(
+						lateAuxPath,
+						new Set(pairs.map((p) => p.serverId)),
+					);
+				} catch {
+					// #2027 round-1 P3-2: count dropped pairs — never silent.
+					lateAuxProbeFailed += pairs.length;
+					for (const pair of pairs) {
+						markPendingAuxiliaryCoverage(
+							pair.filePath,
+							[pair.serverId],
+							Date.now(),
+						);
+					}
+					continue;
+				}
+				const displayLateAuxPath = toRunnerDisplayPath(cwd, lateAuxPath);
+				for (const pair of pairs) {
+					const rawDiags = cached.get(pair.serverId);
+					if (rawDiags === undefined) {
+						// No live client for this server any more — best-effort probe,
+						// drop the pair silently.
+						lateAuxClientGone += 1;
+						continue;
+					}
+					if (rawDiags.length === 0) {
+						// Still scanning (or published nothing yet) — keep waiting
+						// so a scan finishing before the NEXT turn end still
+						// delivers. Two clocks, deliberately decoupled: the
+						// freshness baseline (`markedAtMs`) NEVER moves — it is what
+						// the delivery gate stats against — while the re-arm TTL is
+						// anchored on `lastRearmedAtMs`, advanced by every successful
+						// empty probe: the scanner is demonstrably alive, just slow.
+						if (!isPendingAuxiliaryPastRearmTtl(pair)) {
+							markPendingAuxiliaryCoverage(
+								lateAuxPath,
+								[pair.serverId],
+								pair.markedAtMs,
+								Date.now(),
+							);
+							lateAuxRearmed += 1;
+						}
+						continue;
+					}
+					const converted = convertLspDiagnostics(rawDiags, lateAuxPath, {
+						tool: "lsp",
+					});
+					if (converted.length === 0) continue;
+					// Freshness kernel (#1634 gated surface): stat the cited file
+					// against the mark timestamp. Missing → drop (no remediation for
+					// a deleted file); mtime drifted past the mark → drop too, NOT
+					// demote — unlike the cached-blocker gates these findings were
+					// NEVER delivered before, and the edit that drifted the file
+					// already re-touched it (a fresh pending pair supersedes this
+					// one), so a stale-arm replay would double-report old content.
+					// Both drops are COUNTED here and in the latency record below —
+					// never silent (shape 10).
+					const gate = gateFindingsByPathFreshness({
+						store: "late-auxiliary-findings",
+						findings: converted,
+						cwd,
+						scannedAt: pair.markedAtMs,
+						citedPath: () => lateAuxPath,
+					});
+					lateAuxStale += gate.stale.length;
+					lateAuxMissing +=
+						converted.length - gate.live.length - gate.stale.length;
+					if (gate.stale.length > 0) {
+						// Stale findings mean the scan predates the last edit.
+						// Re-arm with a REFRESHED baseline so the next turn probes
+						// the newer revision (#2027 round-1 P2-1).
+						markPendingAuxiliaryCoverage(
+							lateAuxPath,
+							[pair.serverId],
+							Date.now(),
+						);
+					}
+					if (gate.live.length === 0) continue;
+					const lines = gate.live.map(
+						(f) =>
+							`  ${displayLateAuxPath}:${f.line}:${f.column} [${f.rule}] ${f.message}`,
+					);
+					lateAuxDelivered += gate.live.length;
+					// @delivery-surface: runtime-turn:late-auxiliary-findings
+					advisoryParts.push(
+						`🕐 Late auxiliary diagnostics (${pair.serverId} answered after its grace window):\n${lines.join("\n")}`,
+					);
+				}
+			}
+		} catch (err) {
+			dbg(`turn_end: late-auxiliary probe failed: ${err}`);
+		}
+		logLatency({
+			type: "phase",
+			toolName: "turn_end",
+			filePath: cwd,
+			phase: "late_auxiliary_findings",
+			durationMs: Date.now() - lateAuxStart,
+			metadata: {
+				pending: drainedPairs.length,
+				delivered: lateAuxDelivered,
+				stale: lateAuxStale,
+				missing: lateAuxMissing,
+				rearmed: lateAuxRearmed,
+				clientGone: lateAuxClientGone,
+				probeFailed: lateAuxProbeFailed,
+			},
+		});
+	}
+
 	const labeledAdvisoryParts = advisoryParts.map(
 		(p) => `ℹ️ Advisory — no action required this turn:\n${p}`,
 	);
-	const findingParts = [...blockerParts, ...labeledAdvisoryParts];
+	// Stale-secret parts sit between the two tiers and are NOT relabelled — they
+	// ship the imperative preamble they were built with (#1622 review M2).
+	const findingParts = [
+		...blockerParts,
+		...staleSecretParts,
+		...labeledAdvisoryParts,
+	];
 	if (findingParts.length > 0) {
 		dbg(
 			`turn_end: ${blockerParts.length} blocker section(s), ${advisoryParts.length} advisory section(s) found, persisting for next context`,
@@ -1691,23 +2408,30 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				"turn_end: duplicate findings detected (same session), suppressing re-prompt",
 			);
 			if (getFlag("lens-guard")) {
-				const existingGuard = cacheManager.readCache<Partial<TurnEndFindingsCache>>(
-					"turn-end-findings",
-					cwd,
-				)?.data;
+				const existingGuard = cacheManager.readCache<
+					Partial<TurnEndFindingsCache>
+				>("turn-end-findings", cwd)?.data;
 				if (existingGuard) {
 					writeGitGuardRecord(cacheManager, runtime, cwd, {
 						...(existingGuard as TurnEndFindingsCache),
 						content,
-						blockerContent: blockerParts.length > 0
-							? capTurnEndMessage(blockerParts.join("\n\n"))
-							: undefined,
-						hasBlockers: blockerParts.length > 0 || existingGuard.testFailures === true,
-						blockingFiles: blockerParts.length > 0 ? existingGuard.affectedFiles : undefined,
+						blockerContent:
+							blockerParts.length > 0
+								? capTurnEndMessage(blockerParts.join("\n\n"))
+								: undefined,
+						hasBlockers:
+							blockerParts.length > 0 || existingGuard.testFailures === true,
+						blockingFiles:
+							blockerParts.length > 0 ? existingGuard.affectedFiles : undefined,
 						projectSeqStart: runtime.turnStartProjectSeq,
 						projectSeqEnd: runtime.projectSeq,
 						fileSeqByPath: Object.fromEntries(
-								runtime.getFileSeqEntries().map(([filePath, seq]) => [normalizeMapKey(path.resolve(filePath)), seq]),
+							runtime
+								.getFileSeqEntries()
+								.map(([filePath, seq]) => [
+									normalizeMapKey(path.resolve(filePath)),
+									seq,
+								]),
 						),
 						fileContentHashes: {},
 						consumed: false,
@@ -1724,13 +2448,13 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			fileSeqByPath[normalizeMapKey(path.resolve(filePath))] = seq;
 		}
 		if (getFlag("lens-guard")) {
-			const existingGuard = cacheManager.readCache<Partial<TurnEndFindingsCache>>(
-				"turn-end-findings",
-				cwd,
-			)?.data;
-			const blockingContent = blockerParts.length > 0
-				? capTurnEndMessage(blockerParts.join("\n\n"))
-				: undefined;
+			const existingGuard = cacheManager.readCache<
+				Partial<TurnEndFindingsCache>
+			>("turn-end-findings", cwd)?.data;
+			const blockingContent =
+				blockerParts.length > 0
+					? capTurnEndMessage(blockerParts.join("\n\n"))
+					: undefined;
 			const affectedFiles = [
 				...(existingGuard?.affectedFiles ?? []),
 				...files.map((file) => resolveRunnerPath(cwd, file)),
@@ -1761,25 +2485,37 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		} else {
 			const allAffectedFiles = [
 				...files.map((file) => resolveRunnerPath(cwd, file)),
-				...cascadeResults.flatMap((result) => result.neighbors
-					.filter((neighbor) => neighbor.diagnostics.length > 0)
-					.map((neighbor) => resolveRunnerPath(cwd, neighbor.filePath))),
+				...cascadeResults.flatMap((result) =>
+					result.neighbors
+						.filter((neighbor) => neighbor.diagnostics.length > 0)
+						.map((neighbor) => resolveRunnerPath(cwd, neighbor.filePath)),
+				),
 			];
-			const affectedFiles = [...new Set(allAffectedFiles)]
-				.slice(0, MAX_ADVISORY_AFFECTED_FILES);
-			const affectedFilesTruncated = new Set(allAffectedFiles).size > affectedFiles.length;
-			cacheManager.writeCache("turn-end-findings", {
-				content,
-				affectedFiles,
-				affectedFilesTruncated,
-				provenance: snapshotAdvisoryProvenance({
-					cwd,
-					runtime,
-					generation: 0,
-					files: affectedFiles.map((file) => ({ path: file, role: "affected" as const })),
-					truncated: affectedFilesTruncated,
-				}),
-			}, cwd);
+			const affectedFiles = [...new Set(allAffectedFiles)].slice(
+				0,
+				MAX_ADVISORY_AFFECTED_FILES,
+			);
+			const affectedFilesTruncated =
+				new Set(allAffectedFiles).size > affectedFiles.length;
+			cacheManager.writeCache(
+				"turn-end-findings",
+				{
+					content,
+					affectedFiles,
+					affectedFilesTruncated,
+					provenance: snapshotAdvisoryProvenance({
+						cwd,
+						runtime,
+						generation: 0,
+						files: affectedFiles.map((file) => ({
+							path: file,
+							role: "affected" as const,
+						})),
+						truncated: affectedFilesTruncated,
+					}),
+				},
+				cwd,
+			);
 		}
 		cacheManager.writeCache(
 			"turn-end-findings-last",
@@ -1803,7 +2539,15 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	}
 	if (blockerParts.length === 0) {
 		cacheManager.clearTurnState(cwd, currentOwner);
-		if (getFlag("lens-guard") && advisoryParts.length === 0 && !runtime.gitGuardHasBlockers) {
+		// `staleSecretParts` counts here too (#1622 review M2): clearing the
+		// findings record while a stale secret is still unverified would drop the
+		// only surviving trace of it.
+		if (
+			getFlag("lens-guard") &&
+			advisoryParts.length === 0 &&
+			staleSecretParts.length === 0 &&
+			!runtime.gitGuardHasBlockers
+		) {
 			const guardRecord = cacheManager.readCache<Partial<TurnEndFindingsCache>>(
 				"turn-end-findings",
 				cwd,
@@ -1820,16 +2564,42 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	runtime.fixedThisTurn.clear();
 	runtime.clearActionableWarnings();
 	runtime.clearCodeQualityWarnings();
+	if (demotedFindingsRetired > 0) {
+		// #1944: the retired payload must not survive as a SUPPRESSION key.
+		// `turn-end-findings-last` holds a content signature used to silence a
+		// duplicate re-prompt; live evidence found the demoted payload still on
+		// disk 80+ minutes after the file shrank. It is not a delivery source —
+		// `runtime-context.ts` never reads it, and the read at the top of this
+		// function is gated on the current `sessionId`, so it cannot resurrect
+		// the finding in a later session. It CAN, however, silence a genuinely
+		// new report of content the store no longer holds. Drop it with the
+		// record it describes.
+		cacheManager.clearCache("turn-end-findings-last", cwd);
+	}
 	logLatency({
 		type: "tool_result",
 		toolName: "turn_end",
 		filePath: cwd,
 		durationMs: Date.now() - turnEndStart,
-		result: blockerParts.length > 0 ? "blockers_found" : "clean",
+		// #1622 review M2: a pending stale secret is NOT a clean turn. It gets its
+		// own result rather than being promoted to `blockers_found`, which would
+		// undo the demotion the freshness gate just made.
+		result:
+			blockerParts.length > 0
+				? "blockers_found"
+				: staleSecretParts.length > 0
+					? "stale_secrets_pending"
+					: "clean",
 		metadata: {
 			fileCount: files.length,
 			blockerSections: blockerParts.length,
+			staleSecretSections: staleSecretParts.length,
 			advisorySections: advisoryParts.length,
+			// #1944 AC3: an empty advisory section on its own cannot say whether
+			// the turn had nothing to report or dropped something. This counter
+			// answers that from latency.log even when the payload is empty, and
+			// the payload itself carries the retirement note when it is not.
+			demotedFindingsRetired,
 		},
 	});
 	resetFormatService();

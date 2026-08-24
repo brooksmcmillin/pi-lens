@@ -2,17 +2,22 @@ import * as nodeFs from "node:fs";
 import * as path from "node:path";
 import type { AstGrepClient } from "./ast-grep-client.js";
 import type { BiomeClient } from "./biome-client.js";
+import { resetBoundedTelemetry } from "./bounded-telemetry.js";
 import type { CacheManager } from "./cache-manager.js";
 import { createDeadline, yieldIfOverBudget } from "./cooperative-budget.js";
 import type { DeadCodeClient, DeadCodeResult } from "./dead-code-client.js";
 import { deadCodeIssueCount } from "./dead-code-client.js";
 import { logDeadCodeScan } from "./dead-code-logger.js";
-import { resetDegradationLedger } from "./degradation-ledger.js";
+import {
+	incrementDegradationCount,
+	resetDegradationLedger,
+} from "./degradation-ledger.js";
 import type { DependencyChecker } from "./dependency-checker.js";
 import { getDiagnosticTracker } from "./diagnostic-tracker.js";
-import { resetDispatchAvailabilityState } from "./dispatch/runners/utils/runner-helpers.js";
-import { resetInstallRetryLatches } from "./dispatch/runners/utils/availability-policy.js";
 import { resetPsScriptAnalyzerAvailability } from "./dispatch/runners/psscriptanalyzer.js";
+import { resetInstallRetryLatches } from "./dispatch/runners/utils/availability-policy.js";
+import { resetLazyInstallAttempts } from "./dispatch/runners/utils/lazy-installer.js";
+import { resetDispatchAvailabilityState } from "./dispatch/runners/utils/runner-helpers.js";
 import type { FileKind } from "./file-kinds.js";
 import { clearAllSessions as clearFileTimeSessions } from "./file-time.js";
 import {
@@ -36,11 +41,18 @@ import {
 } from "./language-profile.js";
 import { logLatency } from "./latency-logger.js";
 import { runLogCleanup } from "./log-cleanup.js";
+import { resetCascadeTierSessionState } from "./lsp/cascade-tier.js";
 import type { LSPShutdownOptions } from "./lsp/client.js";
 import { initLSPConfig, loadLSPConfig } from "./lsp/config.js";
+import { resetWorkspaceDiagnosticsCacheSession } from "./lsp/workspace-diagnostics-session.js";
+import { resetDirectLspCommandAvailability } from "./lsp/server.js";
 import { loadLspService } from "./lsp-lazy.js";
 import type { MetricsClient } from "./metrics-client.js";
 import type { OpengrepClient, OpengrepResult } from "./opengrep-client.js";
+import { resetManagedToolRefreshSession } from "./installer/managed-tool-refresh-session.js";
+import { resetResolvedPathCache } from "./installer/index.js";
+import { _resetPackageManagerCache } from "./package-manager.js";
+import { clearFormatterCache } from "./formatters.js";
 import { isAtOrAboveHomeDir } from "./path-utils.js";
 import { isPrintMode } from "./print-mode.js";
 import {
@@ -51,12 +63,16 @@ import {
 } from "./project-changes.js";
 import {
 	getProjectSnapshotPath,
+	getProjectSnapshotLegacyPath,
 	hydrateRuntimeFromProjectSnapshot,
+	hydrateRuntimeFromProjectSnapshotIfIdle,
 	isProjectSnapshotFresh,
 	isProjectSnapshotMetaStale,
 	loadProjectSnapshot,
+	loadProjectSnapshotExportsAndRules,
 	PROJECT_SNAPSHOT_VERSION,
 	type ProjectSnapshot,
+	type ProjectSnapshotExportsAndRules,
 	readProjectSnapshotMeta,
 	saveRuntimeProjectSnapshot,
 } from "./project-snapshot.js";
@@ -94,13 +110,22 @@ import { TrivyClient, type TrivyResult } from "./trivy-client.js";
 import { isWarmAttached } from "./warm-attach.js";
 import { setSessionLanguages } from "./widget-state.js";
 import { logWordIndex } from "./word-index-logger.js";
+import { resetOpaqueMutationState } from "./opaque-mutation-scan.js";
+import { resetPendingAuxiliaryCoverage } from "./lsp/pending-aux-coverage.js";
 import { resetWorkspaceTopology } from "./workspace-topology.js";
 import { resetZizmorTokenAvailability } from "./zizmor-config.js";
+import { resetSpawnTimeoutCooldowns } from "./spawn-timeout-cooldown.js";
 
 interface SessionStartDeps {
 	ctxCwd?: string;
 	/** Host hook timestamp, so total includes work before this handler is entered. */
 	sessionStartFiredAt?: number;
+	/** Monotonic host hook timestamp for the extension-loaded → session_start span. */
+	sessionStartMonotonicAt?: number;
+	/** Monotonic instant when the extension finished loading. */
+	extensionLoadedAt?: number;
+	/** True only for the process's first session_start with a load anchor. */
+	emitHostReadyDelay?: boolean;
 	sessionReason?: string;
 	handlerEnteredAt?: number;
 	bootstrapClientsStartedAt?: number;
@@ -146,6 +171,33 @@ interface SessionStartDeps {
 }
 
 type StartupMode = "full" | "minimal" | "quick";
+
+const HOST_STALL_THRESHOLD_MS = 30_000;
+
+function logHostReadyDelay(deps: SessionStartDeps, cwd: string): void {
+	if (
+		!deps.emitHostReadyDelay ||
+		deps.sessionStartMonotonicAt === undefined ||
+		deps.extensionLoadedAt === undefined
+	) {
+		return;
+	}
+	const durationMs = Math.max(
+		0,
+		deps.sessionStartMonotonicAt - deps.extensionLoadedAt,
+	);
+	logLatency({
+		type: "phase",
+		filePath: cwd,
+		phase: "host_ready_delay",
+		durationMs,
+		metadata: {
+			hostStallSuspected: durationMs > HOST_STALL_THRESHOLD_MS,
+			sessionStart: "first-process-session",
+			reason: deps.sessionReason,
+		},
+	});
+}
 
 function resolveSnapshotRoot(cwd: string): string {
 	const resolvedCwd = path.resolve(cwd);
@@ -193,6 +245,112 @@ function snapshotSequenceBase(root: string): ProjectSequenceBase | undefined {
 	};
 }
 
+/**
+ * #1785: one bounded ledger record per timed-out sequence read, so a real
+ * occurrence is diagnosable from the ledger alone rather than only from a
+ * `dbg` line that most hosts never surface. Carries the project root and the
+ * on-disk snapshot's age/size (when one exists) — the identity AC1 asks for:
+ * which project, how stale/large the snapshot that got skipped was.
+ */
+function recordSnapshotSequenceTimeout(args: {
+	snapshotRoot: string;
+	snapshotPath: string;
+}): void {
+	let reason = "sequence read timed out; no snapshot on disk";
+	try {
+		const stat = nodeFs.statSync(args.snapshotPath);
+		reason = `sequence read timed out; snapshot age=${Math.round(Date.now() - stat.mtimeMs)}ms size=${stat.size}b`;
+	} catch {
+		// No snapshot on disk yet — the reason above already covers it.
+	}
+	incrementDegradationCount({
+		kind: "snapshot-sequence-read-timeout",
+		subject: args.snapshotRoot,
+		reason,
+	});
+}
+
+/**
+ * #1785: the synchronous freshness check made a conservative call with the
+ * `UNKNOWN_PROJECT_SEQ` sentinel (never hydrate when the real sequence is
+ * unknown). Once the deferred read resolves — a deterministic completion
+ * signal, not a sleep — this re-checks freshness against the now-known
+ * sequence and hydrates late when the snapshot really was current, instead of
+ * leaving the runtime without `cachedExports`/`projectRulesScan` for the rest
+ * of the session.
+ *
+ * #1785 review round F5 (design (a), replacing rounds 1-3's synchronous
+ * capture entirely): quick mode's own cold-start warmup ALREADY loads the
+ * on-disk snapshot for its own purposes — `cachedSnapshot` at the top of the
+ * warmup body, used to reuse a still-fresh `startupScan` verdict — strictly
+ * BEFORE the warmup's own possible save (`saveRuntimeProjectSnapshot`, only
+ * reached when that verdict was NOT fresh). Reusing THAT already-loaded
+ * value costs nothing new: the read was always going to happen regardless of
+ * this fix, and it is guaranteed to predate any overwrite the SAME warmup
+ * invocation might go on to make — a read-before-write invariant of the
+ * warmup's own code, not something this function has to defend against with
+ * a race window of its own. `getWarmupOwnSnapshotRead` is a closure over a
+ * per-`handleSessionStart`-call LOCAL variable (never module-scope — #1785
+ * F6 is exactly the class of bug a module-scope holder here would
+ * reintroduce) that the warmup publishes into once its own read completes.
+ *
+ * When the getter still returns `undefined` — the deferred read resolved
+ * before the warmup got that far (or no warmup was ever armed by this call:
+ * a later quick-mode call in the same process, print mode, full mode) —
+ * there is nothing published yet, so this falls back to a live re-load via
+ * `loadProjectSnapshotExportsAndRules`. That fallback is exactly as safe as
+ * the primary path: if the warmup hasn't reached its own read yet, it
+ * certainly hasn't saved yet either (same invariant), so disk still holds
+ * whatever was there before any warmup activity.
+ *
+ * Both the published value and the fallback re-load are the narrow,
+ * postings-free `ProjectSnapshotExportsAndRules` shape — never the full
+ * `loadProjectSnapshot`. This path only ever hydrates
+ * `cachedExports`/`projectRulesScan`; it can NOT hydrate `wordIndex` even
+ * when the underlying snapshot would otherwise have one, because the narrow
+ * type never carries it. That is intentional, not a regression: F2's hazard
+ * was this exact path nulling a `wordIndex` that quick mode's warmup had, in
+ * the meantime, built for real — the warmup remains the sole source of a
+ * late-arriving `wordIndex` for the interactive path.
+ */
+function retroactivelyHydrateAfterDeferredSequence(args: {
+	getWarmupOwnSnapshotRead: () =>
+		| ProjectSnapshotExportsAndRules
+		| null
+		| undefined;
+	snapshotRoot: string;
+	runtime: RuntimeCoordinator;
+	dbg: (msg: string) => void;
+}): (latestSeq: ProjectSequenceIndex) => void {
+	return (latestSeq) => {
+		const published = args.getWarmupOwnSnapshotRead();
+		const snapshot =
+			published !== undefined
+				? published
+				: loadProjectSnapshotExportsAndRules(args.snapshotRoot);
+		if (
+			!snapshot ||
+			snapshot.version !== PROJECT_SNAPSHOT_VERSION ||
+			snapshot.seq !== latestSeq.projectSeq
+		) {
+			return;
+		}
+		const hydrated = hydrateRuntimeFromProjectSnapshotIfIdle(
+			args.runtime,
+			snapshot,
+		);
+		if (hydrated) {
+			args.dbg(
+				`session_start: deferred sequence read confirmed snapshot freshness — hydrating cachedExports/projectRulesScan late (seq=${snapshot.seq})`,
+			);
+		} else {
+			args.dbg(
+				`session_start: deferred sequence read confirmed snapshot freshness (seq=${snapshot.seq}), but the runtime already has live state (warmup or another task got there first) — skipping late hydration to avoid clobbering it`,
+			);
+		}
+	};
+}
+
 function loadSnapshotBodyUnlessStale(args: {
 	root: string;
 	currentProjectSeq: number;
@@ -214,11 +372,16 @@ function loadSnapshotBodyUnlessStale(args: {
 function describeSnapshotMiss(
 	snapshot: ProjectSnapshot | null,
 	currentProjectSeq: number,
+	args: { skippedStale: boolean; bodyPresent: boolean },
 ): string {
-	if (!snapshot) return "missing";
+	if (args.skippedStale) return "stale-meta-gate";
+	if (!snapshot) return args.bodyPresent ? "invalid-body" : "missing";
 	if (snapshot.seq !== currentProjectSeq) {
 		return `stale(seq=${snapshot.seq}, current=${currentProjectSeq})`;
 	}
+	// Defensive-only arm: parseSnapshot rejects incompatible versions, and a
+	// same-sequence parsed snapshot is fresh. Keep this classification explicit
+	// so a future loader change cannot collapse it into a generic miss.
 	return "incompatible";
 }
 
@@ -227,6 +390,7 @@ function logProjectSnapshotProbe(args: {
 	root: string;
 	currentProjectSeq: number;
 	snapshot: ProjectSnapshot | null;
+	missReason: string;
 }): void {
 	args.dbg(
 		`project_snapshot: probe root=${args.root} path=${getProjectSnapshotPath(args.root)} currentSeq=${args.currentProjectSeq}`,
@@ -236,9 +400,7 @@ function logProjectSnapshotProbe(args: {
 			`project_snapshot: loaded seq=${args.snapshot.seq} exports=${args.snapshot.cachedExports.length} files=${Object.keys(args.snapshot.files ?? {}).length} reverseDeps=${Object.keys(args.snapshot.reverseDeps ?? {}).length} startupScan=${Boolean(args.snapshot.startupScan)} languageProfile=${Boolean(args.snapshot.languageProfile)}`,
 		);
 	} else {
-		args.dbg(
-			`project_snapshot: miss reason=${describeSnapshotMiss(args.snapshot, args.currentProjectSeq)}`,
-		);
+		args.dbg(`project_snapshot: miss reason=${args.missReason}`);
 	}
 }
 
@@ -318,8 +480,31 @@ async function readSequenceWithBudget(args: {
 	runtime: RuntimeCoordinator;
 	sessionGeneration: number;
 	dbg: (msg: string) => void;
+	/**
+	 * #1785: the sequence read that timed out is still running in the
+	 * background (see below) and, once it lands, is the FIRST point this
+	 * session ever learns the real project sequence. Without this hook the
+	 * only thing the deferred completion did was reseed `runtime.projectSeq`
+	 * — the snapshot hydration decision made synchronously (with the
+	 * `UNKNOWN_PROJECT_SEQ` sentinel, which can never match) stood for the
+	 * rest of the session even once the real sequence proved the snapshot
+	 * WAS fresh. Called with the resolved sequence so the caller can
+	 * retroactively hydrate; skipped whenever the reseed itself is skipped
+	 * (cross-session move-on or an in-window edit already advanced
+	 * `runtime.projectSeq` — hydrating from the pre-edit snapshot over that
+	 * would silently regress the edit).
+	 */
+	onDeferredSequenceResolved?: (latestSeq: ProjectSequenceIndex) => void;
 }): Promise<{ latestSeq: ProjectSequenceIndex; timedOut: boolean }> {
-	const { snapshotRoot, base, cwd, runtime, sessionGeneration, dbg } = args;
+	const {
+		snapshotRoot,
+		base,
+		cwd,
+		runtime,
+		sessionGeneration,
+		dbg,
+		onDeferredSequenceResolved,
+	} = args;
 	const readPromise = readLatestProjectSequenceAsync(snapshotRoot, base);
 
 	let timeoutHandle: NodeJS.Timeout | undefined;
@@ -387,6 +572,7 @@ async function readSequenceWithBudget(args: {
 				dbg(
 					`session_start: deferred sequence read completed — reseeded projectSeq=${latestSeq.projectSeq} fileSeqEntries=${latestSeq.fileSeqByPath.size}`,
 				);
+				onDeferredSequenceResolved?.(latestSeq);
 			})
 			.catch((err) => {
 				dbg(`session_start: deferred sequence read failed: ${err}`);
@@ -563,6 +749,55 @@ function firePreinstallDefaults(
 				);
 			});
 	}
+}
+
+/**
+ * Default delay before the managed-tool version refresh runs (#1730). Long
+ * enough that `session_start`, the startup scans, and the tool preinstalls have
+ * all settled — the refresh may spawn one `npm update`, and that must never
+ * compete with the work the user is waiting on.
+ */
+const MANAGED_TOOL_REFRESH_DELAY_MS = 30_000;
+
+/**
+ * Schedule the periodic managed-tool refresh (#1730) on an unref'd background
+ * timer.
+ *
+ * `session_start`'s own cost here is a single `setTimeout` registration: the
+ * refresh module is not even imported until the timer fires. The timer is
+ * unref'd so a one-shot process exits without waiting for it, matching the
+ * warmup timer above. Whether a refresh actually runs is decided inside
+ * `runManagedToolRefresh` against a PERSISTED per-tool stamp, so a launch loop
+ * cannot escalate the weekly cadence.
+ */
+function scheduleManagedToolRefresh(dbg: SessionStartDeps["dbg"]): void {
+	const delayMs = Number(
+		process.env.PI_LENS_TOOL_REFRESH_DELAY_MS ?? MANAGED_TOOL_REFRESH_DELAY_MS,
+	);
+	const timer = setTimeout(
+		() => {
+			void (async () => {
+				try {
+					const refresh = await import("./installer/managed-tool-refresh.js");
+					const outcome = await refresh.runManagedToolRefresh();
+					if (outcome.skipped) {
+						dbg(`session_start tool-refresh: skipped (${outcome.skipped})`);
+						return;
+					}
+					for (const result of outcome.refreshed) {
+						dbg(
+							`session_start tool-refresh: ${result.toolId} ${result.ok ? "ok" : "failed"}` +
+								`${result.changed ? ` ${result.previousVersion ?? "unknown"} → ${result.currentVersion}` : " (unchanged)"}`,
+						);
+					}
+				} catch (err) {
+					dbg(`session_start tool-refresh: error ${err}`);
+				}
+			})();
+		},
+		Number.isFinite(delayMs) ? delayMs : MANAGED_TOOL_REFRESH_DELAY_MS,
+	);
+	timer.unref?.();
 }
 
 async function probePrettierInstall(
@@ -794,9 +1029,8 @@ async function buildOrRefreshWordIndex(args: {
 	// implementation backs this task, the quick-mode warmup call below, AND the
 	// stateless cold-query background trigger in word-index.ts — a bound/skip
 	// -rule change lands once, not in three copies.
-	const { buildWordIndexAsync, collectWordIndexDocs } = await import(
-		"./word-index.js"
-	);
+	const { buildWordIndexAsync, collectWordIndexDocs } =
+		await import("./word-index.js");
 	const docs = await collectWordIndexDocs(
 		analysisRoot,
 		() => runtime.isCurrentSession(sessionGeneration),
@@ -1018,6 +1252,7 @@ function scheduleStartupScans(
 			const knipResult = await knipClient.analyze(
 				analysisRoot,
 				getKnipIgnorePatterns(),
+				{ projectSeq: runtime.projectSeq },
 			);
 			if (!runtime.isCurrentSession(sessionGeneration)) return;
 			if (knipResult.success) {
@@ -1318,9 +1553,8 @@ function scheduleStartupScans(
 			extractSymbolsAndRefsFromGraph,
 			getReviewGraphCacheIdentity,
 		} = await import("./review-graph/builder.js");
-		const { buildCallGraph, saveCallGraph, loadCallGraph } = await import(
-			"./call-graph.js"
-		);
+		const { buildCallGraph, saveCallGraph, loadCallGraph } =
+			await import("./call-graph.js");
 		if (!runtime.isCurrentSession(sessionGeneration)) return;
 		const startMs = Date.now();
 		// Build (or hydrate) the canonical review graph first. The call graph is a
@@ -1499,6 +1733,12 @@ export async function handleSessionStart(
 	deps: SessionStartDeps,
 ): Promise<void> {
 	resetDegradationLedger();
+	// #1743: the bounded-telemetry per-turn counters. The rising-edge state is
+	// NOT here — it is the ledger's own tally, reset on the line above. These
+	// counters are keyed by turn index, and a new session restarts turn
+	// numbering at 0, so without this a stale count could survive a session
+	// boundary that happened to land on the same index.
+	resetBoundedTelemetry();
 	const handlerEnteredAt = Date.now();
 	const sessionStartMs = deps.sessionStartFiredAt ?? handlerEnteredAt;
 	const cwdForTelemetry = deps.ctxCwd ?? process.cwd();
@@ -1556,6 +1796,11 @@ export async function handleSessionStart(
 	//   (an explicit env var still takes highest precedence).
 	// Tunable: PI_LENS_WARMUP_DELAY_MS adjusts the warmup delay.
 	let startupMode = resolveStartupMode();
+	// SAFETY: these two flags are process-lifetime state pi-lens stashes on
+	// `globalThis` so a second extension instance in the same process sees the
+	// first one's warmup. There is no ambient declaration for them, and adding
+	// one would let any module write them. Both are declared OPTIONAL here, so
+	// the reads below are `undefined`-safe on a process where nothing set them.
 	const processGlobals = globalThis as unknown as {
 		__piLensFirstSessionDone?: boolean;
 		__piLensWarmupScheduled?: boolean;
@@ -1571,6 +1816,21 @@ export async function handleSessionStart(
 		startupMode = deps.startupModeOverride ?? "quick";
 	}
 	processGlobals.__piLensFirstSessionDone = true;
+
+	// #1785 F5 (round 4, design (a)): the warmup timer body below ALREADY
+	// loads the on-disk snapshot for its own purposes (`cachedSnapshot`,
+	// reused for the `startupScan` verdict cache) strictly BEFORE any save it
+	// might go on to make. This LOCAL variable — per-`handleSessionStart`-call,
+	// deliberately NOT module-scope (see #1785 F6) — lets the warmup publish
+	// that already-loaded read (narrowed to exports+rules, never the full
+	// object with `wordIndex`) for `retroactivelyHydrateAfterDeferredSequence`
+	// to reuse at zero additional cost, instead of this call paying for its
+	// own separate synchronous capture (rounds 1-3's approach, reverted here:
+	// see that function's doc comment for the full history). `undefined`
+	// means the warmup hasn't reached its own read yet (or was never armed by
+	// this call at all) — the quick-mode block's retroactive-hydration
+	// callback then falls back to a live re-load instead.
+	let warmupOwnSnapshotRead: ProjectSnapshotExportsAndRules | null | undefined;
 
 	// #1154: quick mode is entered on BOTH `pi -p`/`--print` (a one-shot that
 	// exits right after this turn) and an interactive process's first
@@ -1622,6 +1882,23 @@ export async function handleSessionStart(
 					// reuse it instead of re-walking a possibly huge tree from
 					// scratch on every single startup.
 					const cachedSnapshot = loadProjectSnapshot(warmupSnapshotRoot);
+					// #1785 F5 (round 4): publish this ALREADY-loaded read — narrowed
+					// to exports+rules, never a reference to `cachedSnapshot` itself
+					// (which carries `wordIndex`/`files`/`symbols`/`reverseDeps`) — for
+					// `retroactivelyHydrateAfterDeferredSequence` to reuse. This read
+					// strictly precedes the warmup's own possible save a few lines
+					// below, so it is guaranteed to reflect disk as it stood before
+					// THIS warmup could have touched it. Zero marginal cost: this read
+					// already happens unconditionally for the `startupScan` verdict
+					// cache below, with or without this fix.
+					warmupOwnSnapshotRead = cachedSnapshot
+						? {
+								version: cachedSnapshot.version,
+								seq: cachedSnapshot.seq,
+								cachedExports: cachedSnapshot.cachedExports,
+								projectRulesScan: cachedSnapshot.projectRulesScan,
+							}
+						: null;
 					const cachedVerdict = cachedSnapshot?.startupScan;
 					let scan: StartupScanContext;
 					if (
@@ -1800,6 +2077,7 @@ export async function handleSessionStart(
 		log,
 		runtime,
 		metricsClient,
+		knipClient,
 		cacheManager,
 		testRunnerClient,
 		goClient,
@@ -1831,6 +2109,12 @@ export async function handleSessionStart(
 	// previously session-lived with no reset hook at all).
 	resetWorkspaceTopology();
 	clearTsconfigPathsCache();
+	// #2000: opaque-recovery baselines are keyed cwd:generation (unreachable
+	// after reset) and the git-worktree memo must re-probe after a session
+	// that may have seen a non-git dir become one.
+	resetOpaqueMutationState();
+	// #2026: pending auxiliary baselines are unreachable after generation bump.
+	resetPendingAuxiliaryCoverage();
 	// #817/#1199: Windows command resolution is cached per (command, canonical
 	// effective child PATH/PATHEXT/cwd/per-drive provenance); drop it each
 	// session so environment changes (e.g.
@@ -1844,14 +2128,29 @@ export async function handleSessionStart(
 	// the tool for the rest of the process lifetime. Clear it here, same
 	// boundary as the other per-session caches on this line.
 	resetDispatchAvailabilityState();
+	// #1995: a command that TIMED OUT (not merely failed a probe) cools down
+	// for the rest of the session so a hot loop of edits cannot hand the same
+	// wedged .cmd shim a second budget. A new session may retry: the executable
+	// or its environment may have changed.
+	resetSpawnTimeoutCooldowns();
+	// #1895: formatter PATH verdicts are session-scoped, but they live in
+	// formatters.ts and are not covered by the dispatch generation. Re-arm them
+	// here so a formatter installed or removed between sessions is observed by
+	// the next session. `clearFormatterCache` drops the per-cwd selection cache
+	// as well as the which latches, which is what a real re-probe needs: the
+	// selection cache answers a same-cwd lookup before any probe runs, so
+	// clearing the latches alone would leave the stale verdict standing in the
+	// one directory the user is working in.
+	clearFormatterCache();
 	// #1535: same #1266 pattern, one caller earlier — the `gh auth token` latch
 	// zizmor's spawn reads is process-lived storage whose durability contract is
 	// per SESSION, not per process. Without this, a user who runs `gh auth
 	// login` and starts a fresh session still reads the previous session's
 	// stale "no token" verdict until the cooldown (if any) happens to expire.
 	resetZizmorTokenAvailability();
-	// psscriptanalyzer's two latches are module-local, so the generation counter
-	// above does not reach them (#1490).
+	// psscriptanalyzer's three latches (interpreter, module, -File exec) are
+	// module-local, so the generation counter above does not reach them
+	// (#1490, #1540).
 	resetPsScriptAnalyzerAvailability();
 	// #1497: the install-class retry ceiling is terminal for a SESSION, but the
 	// latches holding it live on process-lived client instances (bootstrap builds
@@ -1859,9 +2158,49 @@ export async function handleSessionStart(
 	// the session" is terminal for the process, and a repaired network never
 	// re-earns its `go install`.
 	resetInstallRetryLatches();
+	// #1537: the lazy-install seam's hold (`gem install rubocop`, `rustup
+	// component add`) is durable for a SESSION. Its map is module-local, so the
+	// generation counter above does not reach it — same #1490/#1497 shape. It
+	// belongs on THIS line and not on the turn_end path: the first cut cleared it
+	// from `clearFormatterRuntimeState()`, which runs every turn, so a failing
+	// install re-spawned every turn instead of once per session.
+	resetLazyInstallAttempts();
+	// #1897: direct-LSP negative availability and bare installer paths are
+	// session facts. A command or PATH entry can appear between sessions.
+	resetDirectLspCommandAvailability();
+	resetResolvedPathCache();
+	// #1653: pnpm/yarn/bun/npm's availability latches (package-manager.ts) are
+	// module-local, same #1490/#1535 shape as the two lines above — the
+	// generation counter above does not reach them. Without this line, a
+	// pnpm/yarn/bun install done mid-day stayed invisible: a genuine "missing"
+	// verdict from one session latched into the next until a process restart.
+	_resetPackageManagerCache();
+	// #1730: the managed-tool refresh budget is a per-SESSION allowance (at most
+	// one `npm update` per session). Left process-lived, one long-running pi
+	// would refresh a single tool at launch and never look at the other 21
+	// again — the same latch shape as the two lines above. The weekly cadence
+	// itself is NOT reset here: it lives in the persisted per-tool stamp, so
+	// re-arming the budget only restores the session's right to ask.
+	resetManagedToolRefreshSession();
 	// #1123 item 3: a fresh session can re-report smells that a prior session
 	// already surfaced once (see `checkSmellsAndNoteOnce`'s once-per-session gate).
 	resetSmellsSessionState();
+	// #1782: re-arm the workspace-diagnostics cache session clock. Entries
+	// written before this instant assert findings from a session that is over,
+	// so they must revalidate before they can be served as current again.
+	resetWorkspaceDiagnosticsCacheSession(sessionStartMs);
+	// Some embedders inject a capability-shaped Knip client rather than the
+	// concrete KnipClient. Session reset is an optional lifecycle capability;
+	// its absence must not make session_start fail.
+	knipClient.resetSessionState?.();
+	// #1910: the tier-3 cascade outstanding-touch registry and its
+	// sweep-scoped expired/evicted counters (clients/lsp/cascade-tier.ts) are
+	// a per-SESSION claim about touches THIS session fired. #1899 bounded the
+	// registry between sweeps but, by its own review, left the session
+	// boundary unwired — a session replacement inherited the prior session's
+	// outstanding touches and misattributed a stray expiry/eviction to the
+	// next session's first reconcile gauge.
+	resetCascadeTierSessionState();
 	runtime.resetForSession(sessionStartMs);
 	logLatency({
 		type: "phase",
@@ -1919,11 +2258,21 @@ export async function handleSessionStart(
 	// project data roots and machine-global registry root once per session start;
 	// this is fire-and-forget and bounded so it never delays startup.
 	const projectDataDir = getProjectDataDir(cwd);
+	// #1609 review F1: sweepOwnStagingFiles does not recurse, so the installer's
+	// bin/ and tools/ subdirectories (clients/installer/index.ts's
+	// GITHUB_BIN_DIR / TOOLS_DIR, now atomic-write.js writers too) need their
+	// own entries — otherwise an orphaned staging file from a kill mid-install
+	// (this PR's own motivating scenario) never gets reaped, and unique
+	// pid-thread-seq staging names mean repeated kills ACCUMULATE full-size
+	// orphan binaries instead of being cleaned up.
+	const globalDir = getGlobalPiLensDir();
 	void sweepAtomicWriteStages([
 		projectDataDir,
 		path.join(projectDataDir, "cache"),
 		path.join(projectDataDir, "sessions"),
-		getGlobalPiLensDir(),
+		globalDir,
+		path.join(globalDir, "bin"),
+		path.join(globalDir, "tools"),
 	]).catch(() => {
 		// best-effort lifecycle cleanup — never fail session_start
 	});
@@ -1931,6 +2280,12 @@ export async function handleSessionStart(
 		runtime.projectRoot = cwd;
 		const sequenceReadStartedAt = Date.now();
 		const snapshotRoot = resolveSnapshotRoot(cwd);
+		// #1785 F5 (round 4): the getter closes over `warmupOwnSnapshotRead`
+		// directly (a `let` in this same `handleSessionStart` invocation's
+		// scope), so it reads whatever value is current AT DEFERRED-RESOLVE
+		// TIME — not whatever it was at this wiring instant. See
+		// `retroactivelyHydrateAfterDeferredSequence`'s doc comment for the
+		// full design.
 		const { latestSeq, timedOut } = await readSequenceWithBudget({
 			snapshotRoot,
 			base: snapshotSequenceBase(snapshotRoot),
@@ -1938,6 +2293,12 @@ export async function handleSessionStart(
 			runtime,
 			sessionGeneration: runtime.sessionGeneration,
 			dbg,
+			onDeferredSequenceResolved: retroactivelyHydrateAfterDeferredSequence({
+				getWarmupOwnSnapshotRead: () => warmupOwnSnapshotRead,
+				snapshotRoot,
+				runtime,
+				dbg,
+			}),
 		});
 		logLatency({
 			type: "phase",
@@ -1947,6 +2308,12 @@ export async function handleSessionStart(
 			durationMs: Date.now() - sequenceReadStartedAt,
 			metadata: { entries: latestSeq.fileSeqByPath.size, timedOut },
 		});
+		if (timedOut) {
+			recordSnapshotSequenceTimeout({
+				snapshotRoot,
+				snapshotPath: getProjectSnapshotPath(snapshotRoot),
+			});
+		}
 		runtime.seedProjectSequence?.(
 			latestSeq.projectSeq,
 			latestSeq.fileSeqByPath,
@@ -1974,6 +2341,9 @@ export async function handleSessionStart(
 		} catch {
 			// Missing snapshots are the normal cold-start case.
 		}
+		const snapshotBodyPresent =
+			nodeFs.existsSync(snapshotPath) ||
+			nodeFs.existsSync(getProjectSnapshotLegacyPath(snapshotRoot));
 		const snapshotGate = loadSnapshotBodyUnlessStale({
 			root: snapshotRoot,
 			currentProjectSeq: freshnessSeq,
@@ -1981,6 +2351,10 @@ export async function handleSessionStart(
 		});
 		const snapshot = snapshotGate.snapshot;
 		const snapshotFresh = isProjectSnapshotFresh(snapshot, freshnessSeq);
+		const snapshotMissReason = describeSnapshotMiss(snapshot, freshnessSeq, {
+			skippedStale: snapshotGate.skippedStale,
+			bodyPresent: snapshotBodyPresent,
+		});
 		logLatency({
 			type: "phase",
 			phase: "session_start_snapshot_load",
@@ -1991,6 +2365,7 @@ export async function handleSessionStart(
 				bytes: snapshotBytes,
 				fresh: snapshotFresh,
 				seq: snapshot?.seq ?? null,
+				reason: snapshotFresh ? undefined : snapshotMissReason,
 				...(snapshotGate.skippedStale ? { skippedStale: true } : {}),
 				...(timedOut ? { sequenceUnknown: true } : {}),
 			},
@@ -2000,6 +2375,7 @@ export async function handleSessionStart(
 			root: snapshotRoot,
 			currentProjectSeq: freshnessSeq,
 			snapshot,
+			missReason: snapshotMissReason,
 		});
 		if (snapshotFresh) {
 			hydrateRuntimeFromProjectSnapshot(runtime, snapshot);
@@ -2015,6 +2391,38 @@ export async function handleSessionStart(
 		dbg(
 			"session_start: quick mode active - skipping slow tool probes, language profiling, preinstall, scans, and error debt baseline",
 		);
+		// #1911: the debug line above says WHICH steps were skipped, but nothing
+		// bounded or structured said so — quick mode's absence of work and an
+		// absent LOGGER read identically in latency.log. This record is that
+		// line's structured twin: one bounded gauge per quick-mode session_start,
+		// naming exactly the step set skipped, so a reader can tell "quick mode
+		// correctly skipped these" from "the probes silently never ran".
+		logLatency({
+			type: "phase",
+			phase: "session_start_skipped_steps",
+			filePath: cwd,
+			durationMs: 0,
+			metadata: {
+				mode: startupMode,
+				reason: deps.sessionReason,
+				// #1911 review F3: this `if (quickMode)` branch is an early return —
+				// the whole quick path — so there is no enumerable list of "steps
+				// run vs. skipped" this array could be derived from mechanically. It
+				// is DESCRIPTIVE documentation of what the early return skips,
+				// matching the `dbg()` line above word for word; keep both in sync by
+				// hand if either changes. It also does NOT narrow under
+				// `getFlag("no-lsp")` — quick mode skips the same five steps either
+				// way; the LSP flag instead affects `quickTools` above, a separate
+				// record.
+				steps: [
+					"slow_tool_probes",
+					"language_profiling",
+					"tool_preinstall",
+					"startup_scans",
+					"error_debt_baseline",
+				],
+			},
+		});
 		const totalDurationMs = Date.now() - sessionStartMs;
 		dbg(`session_start total: ${totalDurationMs}ms (interactive path)`);
 		logLatency({
@@ -2025,6 +2433,7 @@ export async function handleSessionStart(
 			durationMs: totalDurationMs,
 			metadata: { mode: startupMode, reason: deps.sessionReason },
 		});
+		logHostReadyDelay(deps, cwd);
 		emitSmellsSessionStartLine(dbg, sessionStartMs);
 		return;
 	}
@@ -2066,6 +2475,20 @@ export async function handleSessionStart(
 		durationMs: Date.now() - sequenceReadStartedAt,
 		metadata: { entries: latestSeq.fileSeqByPath.size, timedOut },
 	});
+	if (timedOut) {
+		// #1785: instrumentation only here, deliberately no
+		// `onDeferredSequenceResolved` — unlike quick mode's cold path (which
+		// does nothing when the snapshot isn't trusted), full mode's cold path
+		// actively kicks off a real rescan below to rebuild this same state.
+		// Retroactively hydrating from the on-disk snapshot once the deferred
+		// read lands could overwrite that fresher, actively-computed state with
+		// the stale disk copy — a regression, not a fix. See the PR body for the
+		// full reasoning.
+		recordSnapshotSequenceTimeout({
+			snapshotRoot,
+			snapshotPath: getProjectSnapshotPath(snapshotRoot),
+		});
+	}
 	runtime.seedProjectSequence?.(latestSeq.projectSeq, latestSeq.fileSeqByPath);
 	const effectiveSeq = runtime.projectSeq ?? latestSeq.projectSeq;
 	dbg(
@@ -2087,6 +2510,9 @@ export async function handleSessionStart(
 	} catch {
 		// Missing snapshots are the normal cold-start case.
 	}
+	const snapshotBodyPresent =
+		nodeFs.existsSync(snapshotPath) ||
+		nodeFs.existsSync(getProjectSnapshotLegacyPath(snapshotRoot));
 	const snapshotGate = loadSnapshotBodyUnlessStale({
 		root: snapshotRoot,
 		currentProjectSeq: freshnessSeq,
@@ -2094,6 +2520,10 @@ export async function handleSessionStart(
 	});
 	const snapshot = snapshotGate.snapshot;
 	const snapshotFresh = isProjectSnapshotFresh(snapshot, freshnessSeq);
+	const snapshotMissReason = describeSnapshotMiss(snapshot, freshnessSeq, {
+		skippedStale: snapshotGate.skippedStale,
+		bodyPresent: snapshotBodyPresent,
+	});
 	logLatency({
 		type: "phase",
 		phase: "session_start_snapshot_load",
@@ -2104,6 +2534,7 @@ export async function handleSessionStart(
 			bytes: snapshotBytes,
 			fresh: snapshotFresh,
 			seq: snapshot?.seq ?? null,
+			reason: snapshotFresh ? undefined : snapshotMissReason,
 			...(snapshotGate.skippedStale ? { skippedStale: true } : {}),
 			...(timedOut ? { sequenceUnknown: true } : {}),
 		},
@@ -2113,6 +2544,7 @@ export async function handleSessionStart(
 		root: snapshotRoot,
 		currentProjectSeq: freshnessSeq,
 		snapshot,
+		missReason: snapshotMissReason,
 	});
 	const freshSnapshot = snapshotFresh ? snapshot : null;
 	if (freshSnapshot) {
@@ -2271,6 +2703,7 @@ export async function handleSessionStart(
 			jstsHeavyScansWillRun,
 			dbg,
 		);
+		scheduleManagedToolRefresh(dbg);
 	}
 
 	if (allowBootstrapTasks) {
@@ -2427,6 +2860,7 @@ export async function handleSessionStart(
 		durationMs: totalDurationMs,
 		metadata: { mode: startupMode, reason: deps.sessionReason },
 	});
+	logHostReadyDelay(deps, cwd);
 	emitSmellsSessionStartLine(dbg, sessionStartMs);
 }
 

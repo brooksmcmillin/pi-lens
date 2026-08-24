@@ -16,10 +16,10 @@ import {
 	wordIndexKey,
 	_resetWordIndexBuildGuardForTests,
 	triggerBackgroundWordIndexBuild,
-} from "../../clients/word-index.ts";
-import { KIND_EXTENSIONS } from "../../clients/file-kinds.ts";
-import { loadProjectSnapshot } from "../../clients/project-snapshot.ts";
-import { createTempFile, setupTestEnvironment } from "./test-utils.ts";
+} from "../../clients/word-index.js";
+import { KIND_EXTENSIONS } from "../../clients/file-kinds.js";
+import { loadProjectSnapshot } from "../../clients/project-snapshot.js";
+import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 
 describe("splitIdentifier", () => {
 	it("splits camelCase and keeps the whole identifier", () => {
@@ -84,7 +84,9 @@ describe("parseWordIndexQuery (#1450)", () => {
 	it("extracts a lang: filter", () => {
 		const parsed = parseWordIndexQuery("lang:jsts rank");
 		expect(parsed.terms.trim()).toBe("rank");
-		expect(parsed.filters).toEqual([{ key: "lang", value: "jsts", negated: false }]);
+		expect(parsed.filters).toEqual([
+			{ key: "lang", value: "jsts", negated: false },
+		]);
 	});
 
 	it("extracts a file: filter", () => {
@@ -98,7 +100,9 @@ describe("parseWordIndexQuery (#1450)", () => {
 	it("extracts an ext: filter", () => {
 		const parsed = parseWordIndexQuery("ext:ts rank");
 		expect(parsed.terms.trim()).toBe("rank");
-		expect(parsed.filters).toEqual([{ key: "ext", value: "ts", negated: false }]);
+		expect(parsed.filters).toEqual([
+			{ key: "ext", value: "ts", negated: false },
+		]);
 	});
 
 	it("extracts a negated filter with a leading -", () => {
@@ -185,7 +189,9 @@ describe("buildWordIndexQueryFilter (#1450)", () => {
 
 	it("lang: throws for an unrecognized kind, listing known kinds", () => {
 		expect(() =>
-			buildWordIndexQueryFilter([{ key: "lang", value: "klingon", negated: false }]),
+			buildWordIndexQueryFilter([
+				{ key: "lang", value: "klingon", negated: false },
+			]),
 		).toThrow(WordIndexQueryError);
 	});
 
@@ -422,7 +428,10 @@ describe("searchWordIndex inline query filters (#1450)", () => {
 
 	it("combined lang:/file:/-file: filters from the issue's own example", () => {
 		const index = buildWordIndex(files);
-		const results = searchWordIndex(index, "lang:jsts file:src/ -file:test user");
+		const results = searchWordIndex(
+			index,
+			"lang:jsts file:src/ -file:test user",
+		);
 		expect(results.map((r) => r.file).sort()).toEqual(
 			["src/auth/login.ts", "src/user/profile.ts"].sort(),
 		);
@@ -762,9 +771,8 @@ describe("triggerBackgroundWordIndexBuild (#348 cold-query stampede guard)", () 
 		try {
 			createTempFile(env.tmpDir, "src/a.ts", "export function helperA() {}");
 			// Seed a snapshot (as a real session would) with unrelated data.
-			const { saveProjectSnapshot, PROJECT_SNAPSHOT_VERSION } = await import(
-				"../../clients/project-snapshot.ts"
-			);
+			const { saveProjectSnapshot, PROJECT_SNAPSHOT_VERSION } =
+				await import("../../clients/project-snapshot.js");
 			saveProjectSnapshot(env.tmpDir, {
 				version: PROJECT_SNAPSHOT_VERSION,
 				projectRoot: env.tmpDir,

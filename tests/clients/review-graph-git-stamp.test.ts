@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { gunzipSync } from "node:zlib";
+import { gunzipSync, gzipSync } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FactStore } from "../../clients/dispatch/fact-store.js";
 import { getProjectDataDir } from "../../clients/file-utils.js";
@@ -11,6 +11,7 @@ import {
 	flushReviewGraphPersistsForTests,
 	getCachedReviewGraph,
 	getLastGraphBuildInfo,
+	getReviewGraphRevisionDrift,
 	_resetCwdWorktreeMismatchLogForTests,
 } from "../../clients/review-graph/builder.js";
 import {
@@ -18,6 +19,11 @@ import {
 	resolveGitIdentity,
 } from "../../clients/review-graph/git-identity.js";
 import * as latencyLogger from "../../clients/latency-logger.js";
+import * as reviewGraphLogger from "../../clients/review-graph-logger.js";
+import {
+	getDegradationSummary,
+	resetDegradationLedger,
+} from "../../clients/degradation-ledger.js";
 import { removeTempDirSync } from "./test-utils.js";
 
 // Mock out the expensive file system scanning — we only care about persist/
@@ -69,6 +75,9 @@ beforeEach(() => {
 	clearReviewGraphWorkspaceCache();
 	_resetGitIdentityCacheForTests();
 	_resetCwdWorktreeMismatchLogForTests();
+	// The #1961 read-verdict record is bounded on the degradation ledger's own
+	// rising edge, so each test needs a clean tally.
+	resetDegradationLedger();
 	previousDataDir = process.env.PILENS_DATA_DIR;
 });
 
@@ -95,9 +104,15 @@ describe("review-graph snapshot git stamp (#300)", () => {
 		const identity = resolveGitIdentity(cwd);
 		expect(identity?.headCommit).toBe("a".repeat(40));
 
-		const cachePath = path.join(getProjectDataDir(cwd), "cache", "review-graph.json.gz");
+		const cachePath = path.join(
+			getProjectDataDir(cwd),
+			"cache",
+			"review-graph.json.gz",
+		);
 		await waitForFile(cachePath);
-		const raw = JSON.parse(gunzipSync(fs.readFileSync(cachePath)).toString("utf-8"));
+		const raw = JSON.parse(
+			gunzipSync(fs.readFileSync(cachePath)).toString("utf-8"),
+		);
 		expect(raw.gitStamp).toBeDefined();
 		expect(raw.gitStamp.headCommit).toBe("a".repeat(40));
 		expect(raw.gitStamp.worktreeRoot).toBe(identity?.worktreeRoot);
@@ -106,11 +121,13 @@ describe("review-graph snapshot git stamp (#300)", () => {
 		// "cached" for an unchanged empty file set), not dropped.
 		clearReviewGraphWorkspaceCache();
 		await buildOrUpdateGraph(cwd, [], facts);
-		const raw2 = JSON.parse(gunzipSync(fs.readFileSync(cachePath)).toString("utf-8"));
+		const raw2 = JSON.parse(
+			gunzipSync(fs.readFileSync(cachePath)).toString("utf-8"),
+		);
 		expect(raw2.gitStamp.headCommit).toBe("a".repeat(40));
 	});
 
-	it("read path drops the snapshot when HEAD changed (reused-worktree-path simulation)", async () => {
+	it("read path SERVES the snapshot after a HEAD-only move, marked drifted (#1961)", async () => {
 		const cwd = tmpDir();
 		const dataDir = path.join(cwd, "data");
 		process.env.PILENS_DATA_DIR = dataDir;
@@ -120,23 +137,175 @@ describe("review-graph snapshot git stamp (#300)", () => {
 		await buildOrUpdateGraph(cwd, [], facts);
 		flushReviewGraphPersistsForTests();
 
-		const cachePath = path.join(getProjectDataDir(cwd), "cache", "review-graph.json.gz");
+		const cachePath = path.join(
+			getProjectDataDir(cwd),
+			"cache",
+			"review-graph.json.gz",
+		);
 		await waitForFile(cachePath);
-		const before = JSON.parse(gunzipSync(fs.readFileSync(cachePath)).toString("utf-8"));
+		const before = JSON.parse(
+			gunzipSync(fs.readFileSync(cachePath)).toString("utf-8"),
+		);
 		expect(before.gitStamp.headCommit).toBe("a".repeat(40));
 
-		// Simulate `git worktree remove` + `add` at the SAME path for a different
-		// branch: same data-dir slug, but HEAD is now a different commit. No git
-		// binary involved — just rewrite the ref file by hand.
+		// A plain `git commit`: HEAD moves, files are untouched. No git binary
+		// involved — just rewrite the ref file by hand.
 		_resetGitIdentityCacheForTests();
 		setHead(cwd, "b".repeat(40));
 
-		// The BLIND read path (getCachedReviewGraph → loadPersistedGraph with
-		// verifyGitStamp) must drop the stamped-mismatched snapshot instead of
-		// serving the previous branch's graph — the caller degrades to
-		// outline-only / triggers a rebuild.
+		// #1961: the blind read used to drop here, which cost every reader its
+		// snapshot after each commit (measured stamp lifetime: 737s-1562s median
+		// across four workspaces). It now serves the snapshot and records the
+		// revision difference, which `computeTrust` turns into a note.
 		clearReviewGraphWorkspaceCache();
+		const served = getCachedReviewGraph(cwd);
+		expect(served).toBeDefined();
+		expect(getReviewGraphRevisionDrift(cwd)).toEqual({
+			stampedHead: "a".repeat(40),
+			currentHead: "b".repeat(40),
+		});
+	});
+
+	it("recomputes drift per call as HEAD keeps moving (#1961 review F3)", async () => {
+		const cwd = tmpDir();
+		process.env.PILENS_DATA_DIR = path.join(cwd, "data");
+		makeFakeRepo(cwd, "a".repeat(40));
+
+		await buildOrUpdateGraph(cwd, [], new FactStore());
+		flushReviewGraphPersistsForTests();
+		await waitForFile(
+			path.join(getProjectDataDir(cwd), "cache", "review-graph.json.gz"),
+		);
+
+		_resetGitIdentityCacheForTests();
+		setHead(cwd, "b".repeat(40));
+		clearReviewGraphWorkspaceCache();
+		expect(getCachedReviewGraph(cwd)).toBeDefined();
+		expect(getReviewGraphRevisionDrift(cwd)?.currentHead).toBe("b".repeat(40));
+
+		// HEAD moves AGAIN while the same snapshot stays warm in the workspace
+		// cache. A pair cached beside the graph would still name bbb — a commit
+		// that stopped being HEAD.
+		_resetGitIdentityCacheForTests();
+		setHead(cwd, "c".repeat(40));
+		expect(getCachedReviewGraph(cwd)).toBeDefined();
+		expect(getReviewGraphRevisionDrift(cwd)).toEqual({
+			stampedHead: "a".repeat(40),
+			currentHead: "c".repeat(40),
+		});
+	});
+
+	it("clears the drift once HEAD returns to the stamped commit (#1961 review F3)", async () => {
+		const cwd = tmpDir();
+		process.env.PILENS_DATA_DIR = path.join(cwd, "data");
+		makeFakeRepo(cwd, "a".repeat(40));
+
+		await buildOrUpdateGraph(cwd, [], new FactStore());
+		flushReviewGraphPersistsForTests();
+		await waitForFile(
+			path.join(getProjectDataDir(cwd), "cache", "review-graph.json.gz"),
+		);
+
+		_resetGitIdentityCacheForTests();
+		setHead(cwd, "b".repeat(40));
+		clearReviewGraphWorkspaceCache();
+		expect(getCachedReviewGraph(cwd)).toBeDefined();
+		expect(getReviewGraphRevisionDrift(cwd)).toBeDefined();
+
+		// `git checkout -` back to the stamped commit resolves the drift. A stored
+		// pair would keep claiming it for the life of the cache entry.
+		_resetGitIdentityCacheForTests();
+		setHead(cwd, "a".repeat(40));
+		expect(getCachedReviewGraph(cwd)).toBeDefined();
+		expect(getReviewGraphRevisionDrift(cwd)).toBeUndefined();
+	});
+
+	it("reports no drift for a graph built in-process (#1961)", async () => {
+		const cwd = tmpDir();
+		process.env.PILENS_DATA_DIR = path.join(cwd, "data");
+		makeFakeRepo(cwd, "a".repeat(40));
+
+		await buildOrUpdateGraph(cwd, [], new FactStore());
+		// A warm in-process entry has no stamped snapshot behind it, so a HEAD
+		// move says nothing and must not manufacture a caveat.
+		_resetGitIdentityCacheForTests();
+		setHead(cwd, "b".repeat(40));
+		expect(getReviewGraphRevisionDrift(cwd)).toBeUndefined();
+	});
+
+	it("read path DROPS a snapshot stamped for a different worktree (#300)", async () => {
+		const cwd = tmpDir();
+		process.env.PILENS_DATA_DIR = path.join(cwd, "data");
+		makeFakeRepo(cwd, "a".repeat(40));
+
+		await buildOrUpdateGraph(cwd, [], new FactStore());
+		flushReviewGraphPersistsForTests();
+		const cachePath = path.join(
+			getProjectDataDir(cwd),
+			"cache",
+			"review-graph.json.gz",
+		);
+		await waitForFile(cachePath);
+
+		// Rewrite the persisted stamp so it names ANOTHER tree, the way a reused
+		// data-dir slug would. Nothing downstream of this read content-verifies,
+		// so serving it would hand back a different project's graph.
+		const data = JSON.parse(
+			gunzipSync(fs.readFileSync(cachePath)).toString("utf-8"),
+		);
+		data.gitStamp.worktreeRoot = `${data.gitStamp.worktreeRoot}-other`;
+		fs.writeFileSync(
+			cachePath,
+			gzipSync(Buffer.from(JSON.stringify(data), "utf-8")),
+		);
+
+		const spy = vi.spyOn(reviewGraphLogger, "logReviewGraph");
+		clearReviewGraphWorkspaceCache();
+		_resetGitIdentityCacheForTests();
 		expect(getCachedReviewGraph(cwd)).toBeUndefined();
+
+		// #1961: the drop used to be silent, which is why it hid for weeks.
+		const dropped = spy.mock.calls.filter(
+			([entry]) => entry.phase === "snapshot_read_dropped",
+		);
+		expect(dropped.length).toBe(1);
+		expect(dropped[0][0].reason).toBe("worktree_mismatch");
+		// The ledger keeps the exact tally and the discriminating identity.
+		const group = getDegradationSummary().find(
+			(g) => g.kind === "review-graph-snapshot-read",
+		);
+		expect(group?.count).toBe(1);
+		expect(group?.latestReasons[0]?.subject).toContain("dropped:");
+	});
+
+	it("records each read verdict once per workspace, not per read (#1961)", async () => {
+		const cwd = tmpDir();
+		process.env.PILENS_DATA_DIR = path.join(cwd, "data");
+		makeFakeRepo(cwd, "a".repeat(40));
+
+		await buildOrUpdateGraph(cwd, [], new FactStore());
+		flushReviewGraphPersistsForTests();
+		await waitForFile(
+			path.join(getProjectDataDir(cwd), "cache", "review-graph.json.gz"),
+		);
+
+		_resetGitIdentityCacheForTests();
+		setHead(cwd, "b".repeat(40));
+		const spy = vi.spyOn(reviewGraphLogger, "logReviewGraph");
+
+		// Two cold reads over the same drifted snapshot. The accessor runs on
+		// every module_report / lens-engine / project_report call, so the record
+		// is bounded on the ledger's rising edge per (verdict, cwd).
+		clearReviewGraphWorkspaceCache();
+		expect(getCachedReviewGraph(cwd)).toBeDefined();
+		clearReviewGraphWorkspaceCache();
+		expect(getCachedReviewGraph(cwd)).toBeDefined();
+
+		const drifted = spy.mock.calls.filter(
+			([entry]) => entry.phase === "snapshot_read_drifted",
+		);
+		expect(drifted.length).toBe(1);
+		expect(drifted[0][0].reason).toBe("head_moved");
 	});
 
 	it("read path serves the snapshot from disk when HEAD is unchanged", async () => {
@@ -219,9 +388,15 @@ describe("review-graph snapshot git stamp (#300)", () => {
 		await expect(buildOrUpdateGraph(cwd, [], facts)).resolves.toBeDefined();
 		flushReviewGraphPersistsForTests();
 
-		const cachePath = path.join(getProjectDataDir(cwd), "cache", "review-graph.json.gz");
+		const cachePath = path.join(
+			getProjectDataDir(cwd),
+			"cache",
+			"review-graph.json.gz",
+		);
 		await waitForFile(cachePath);
-		const raw = JSON.parse(gunzipSync(fs.readFileSync(cachePath)).toString("utf-8"));
+		const raw = JSON.parse(
+			gunzipSync(fs.readFileSync(cachePath)).toString("utf-8"),
+		);
 		expect(raw.gitStamp).toBeUndefined();
 
 		clearReviewGraphWorkspaceCache();

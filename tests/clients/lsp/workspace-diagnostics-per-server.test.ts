@@ -14,7 +14,10 @@ import { removeTempDirSync } from "../test-utils.js";
 
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
-vi.mock("../../../clients/lsp/config.js", () => ({ getServersForFileWithConfig, getServerInitOverride: vi.fn().mockReturnValue(undefined) }));
+vi.mock("../../../clients/lsp/config.js", () => ({
+	getServersForFileWithConfig,
+	getServerInitOverride: vi.fn().mockReturnValue(undefined),
+}));
 vi.mock("../../../clients/lsp/client.js", () => ({ createLSPClient }));
 
 function makeServer(id: string, ext: string) {
@@ -47,11 +50,7 @@ describe("runWorkspaceDiagnostics — per-server serialization (#387)", () => {
 		const pyServer = makeServer("python", ".py");
 		const tsServer = makeServer("typescript", ".ts");
 		getServersForFileWithConfig.mockImplementation((fp: string) =>
-			fp.endsWith(".py")
-				? [pyServer]
-				: fp.endsWith(".ts")
-					? [tsServer]
-					: [],
+			fp.endsWith(".py") ? [pyServer] : fp.endsWith(".ts") ? [tsServer] : [],
 		);
 
 		const live = new Map<string, number>();
@@ -87,10 +86,12 @@ describe("runWorkspaceDiagnostics — per-server serialization (#387)", () => {
 		});
 
 		const clients = new Map<string, ReturnType<typeof mkClient>>();
-		createLSPClient.mockImplementation(async ({ serverId }: { serverId: string }) => {
-			if (!clients.has(serverId)) clients.set(serverId, mkClient(serverId));
-			return clients.get(serverId);
-		});
+		createLSPClient.mockImplementation(
+			async ({ serverId }: { serverId: string }) => {
+				if (!clients.has(serverId)) clients.set(serverId, mkClient(serverId));
+				return clients.get(serverId);
+			},
+		);
 
 		const progress: Array<[number, number]> = [];
 		const { LSPService } = await import("../../../clients/lsp/index.js");
@@ -122,7 +123,10 @@ describe("runWorkspaceDiagnostics — per-server serialization (#387)", () => {
 			const notifyOpen = vi.fn(async () => {});
 			const requestWorkspaceDiagnostics = vi.fn(async () => [
 				// a.py has a diagnostic; b.py/c.py are absent → reported clean.
-				{ filePath: path.join(tmp, "a.py"), diagnostics: [{ message: "boom" }] },
+				{
+					filePath: path.join(tmp, "a.py"),
+					diagnostics: [{ message: "boom" }],
+				},
 			]);
 			createLSPClient.mockResolvedValue({
 				isAlive: () => true,

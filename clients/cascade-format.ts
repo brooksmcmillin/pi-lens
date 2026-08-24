@@ -31,9 +31,10 @@ export function formatCascadeNeighborDiagnostics(
 	}
 
 	const noun = options.noun ?? "neighbor";
-	let out = withErrors.length > 0
-		? `📐 Cascade errors in ${withErrors.length} ${noun} file(s) — fix before finishing turn:`
-		: "";
+	let out =
+		withErrors.length > 0
+			? `📐 Cascade errors in ${withErrors.length} ${noun} file(s) — fix before finishing turn:`
+			: "";
 	for (const neighbor of withErrors) {
 		const display = toRunnerDisplayPath(cwd, neighbor.filePath);
 		const reason = options.includeReason ? ` reason="${neighbor.reason}"` : "";

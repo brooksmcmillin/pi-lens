@@ -27,13 +27,13 @@ import { removeTempDirSync } from "./test-utils.js";
 // "no raw terminal write" half of the invariant is enforced repo-wide by
 // tests/clients/extension-terminal-silence.test.ts.
 vi.mock("../../clients/extension-log.js", async (importOriginal) => {
-	const actual = await importOriginal<typeof import("../../clients/extension-log.js")>();
+	const actual =
+		await importOriginal<typeof import("../../clients/extension-log.js")>();
 	return {
 		...actual,
 		logExtension: (entry: { message: string }) => console.error(entry.message),
 	};
 });
-
 
 const tmpDirs: string[] = [];
 let previousConfigPath: string | undefined;
@@ -162,7 +162,9 @@ describe("global pi-lens config", () => {
 			}),
 		);
 
-		expect(loadPiLensGlobalConfig(configPath)).toEqual({ lsp: { enabled: false } });
+		expect(loadPiLensGlobalConfig(configPath)).toEqual({
+			lsp: { enabled: false },
+		});
 		expect(console.error).toHaveBeenCalledWith(
 			expect.stringContaining('unknown key "lps"'),
 		);
@@ -171,22 +173,23 @@ describe("global pi-lens config", () => {
 			.flat()
 			.some(
 				(arg) =>
-					typeof arg === "string" &&
-					arg.includes('unknown key "lsp"') === true,
+					typeof arg === "string" && arg.includes('unknown key "lsp"') === true,
 			);
 		expect(warnedForLsp).toBe(false);
-		const warnedForSchema = (console.error as ReturnType<typeof vi.fn>).mock.calls
+		const warnedForSchema = (
+			console.error as ReturnType<typeof vi.fn>
+		).mock.calls
 			.flat()
 			.some((arg) => typeof arg === "string" && arg.includes("$schema"));
 		expect(warnedForSchema).toBe(false);
 
 		// Warn-once: repeated loads do not add further warnings for the same key.
-		const callsAfterFirst = (console.error as ReturnType<typeof vi.fn>).mock.calls
-			.length;
+		const callsAfterFirst = (console.error as ReturnType<typeof vi.fn>).mock
+			.calls.length;
 		loadPiLensGlobalConfig(configPath);
-		expect(
-			(console.error as ReturnType<typeof vi.fn>).mock.calls.length,
-		).toBe(callsAfterFirst);
+		expect((console.error as ReturnType<typeof vi.fn>).mock.calls.length).toBe(
+			callsAfterFirst,
+		);
 	});
 
 	it("ignores invalid format modes", () => {
@@ -324,7 +327,11 @@ describe("global pi-lens config", () => {
 			contextInjection: { enabled: false },
 		});
 		expect(
-			resolvePiLensFlag("no-lens-context", false, loadPiLensGlobalConfig(configPath)),
+			resolvePiLensFlag(
+				"no-lens-context",
+				false,
+				loadPiLensGlobalConfig(configPath),
+			),
 		).toBe(true);
 
 		// no-lens-context flag is true (i.e. "disable") when config disables injection
@@ -353,7 +360,11 @@ describe("global pi-lens config", () => {
 		const configPath = writeConfig(home, JSON.stringify({ widget: {} }));
 		// context injection default-on → no-lens-context resolves off (false).
 		expect(
-			resolvePiLensFlag("no-lens-context", false, loadPiLensGlobalConfig(configPath)),
+			resolvePiLensFlag(
+				"no-lens-context",
+				false,
+				loadPiLensGlobalConfig(configPath),
+			),
 		).toBe(false);
 		// missing config file → still default-on
 		expect(
@@ -376,7 +387,11 @@ describe("global pi-lens config", () => {
 		).toBe(false);
 		const configPath = writeConfig(home, JSON.stringify({ widget: {} }));
 		expect(
-			resolvePiLensFlag("lens-turn-summary", false, loadPiLensGlobalConfig(configPath)),
+			resolvePiLensFlag(
+				"lens-turn-summary",
+				false,
+				loadPiLensGlobalConfig(configPath),
+			),
 		).toBe(false);
 		expect(resolvePiLensFlag("lens-turn-summary", false, {})).toBe(false);
 	});
@@ -391,7 +406,11 @@ describe("global pi-lens config", () => {
 			turnSummary: { enabled: true },
 		});
 		expect(
-			resolvePiLensFlag("lens-turn-summary", false, loadPiLensGlobalConfig(configPath)),
+			resolvePiLensFlag(
+				"lens-turn-summary",
+				false,
+				loadPiLensGlobalConfig(configPath),
+			),
 		).toBe(true);
 		expect(
 			resolvePiLensFlag("lens-turn-summary", false, {
@@ -475,7 +494,11 @@ describe("global pi-lens config", () => {
 			});
 			// autofix.enabled:false → --no-autofix resolves on (true).
 			expect(
-				resolvePiLensFlag("no-autofix", false, loadPiLensGlobalConfig(configPath)),
+				resolvePiLensFlag(
+					"no-autofix",
+					false,
+					loadPiLensGlobalConfig(configPath),
+				),
 			).toBe(true);
 		});
 
@@ -491,7 +514,11 @@ describe("global pi-lens config", () => {
 			).toBe(false);
 			const configPath = writeConfig(home, JSON.stringify({ widget: {} }));
 			expect(
-				resolvePiLensFlag("no-autofix", false, loadPiLensGlobalConfig(configPath)),
+				resolvePiLensFlag(
+					"no-autofix",
+					false,
+					loadPiLensGlobalConfig(configPath),
+				),
 			).toBe(false);
 		});
 
@@ -539,7 +566,9 @@ describe("global pi-lens config", () => {
 				JSON.stringify({ autofix: { enabled: "no" } }),
 			);
 
-			expect(loadPiLensGlobalConfig(configPath)?.autofix?.enabled).toBeUndefined();
+			expect(
+				loadPiLensGlobalConfig(configPath)?.autofix?.enabled,
+			).toBeUndefined();
 			expect(console.error).toHaveBeenCalledWith(
 				expect.stringContaining("autofix.enabled must be a boolean"),
 			);
@@ -609,7 +638,10 @@ describe("global pi-lens config", () => {
 
 			// Absent visible → no warn (false-positive guard).
 			const silentHome = makeTempHome();
-			const silentPath = writeConfig(silentHome, JSON.stringify({ widget: {} }));
+			const silentPath = writeConfig(
+				silentHome,
+				JSON.stringify({ widget: {} }),
+			);
 			loadPiLensGlobalConfig(silentPath);
 			expect(warnedFor("widget.visible")).toBe(true);
 			(console.error as ReturnType<typeof vi.fn>).mockClear();
@@ -621,13 +653,15 @@ describe("global pi-lens config", () => {
 			const home = makeTempHome();
 			const badPath = writeConfig(
 				home,
-				JSON.stringify({ format: { mode: "immedaite" } }),
+				JSON.stringify({ format: { mode: "immedaite" } }), // spellchecker:disable-line
 			);
 			expect(loadPiLensGlobalConfig(badPath)).toEqual({
 				format: { mode: undefined },
 			});
 			expect(console.error).toHaveBeenCalledWith(
-				expect.stringContaining('format.mode must be "immediate" or "deferred"'),
+				expect.stringContaining(
+					'format.mode must be "immediate" or "deferred"',
+				),
 			);
 
 			// A config with only format.enabled (no mode) must NOT warn about mode.
@@ -674,7 +708,12 @@ describe("global pi-lens config", () => {
 				resolvePiLensFlagWithSource("no-autofix", true, undefined, undefined),
 			).toEqual({ value: true, source: "cli" });
 			expect(
-				resolvePiLensFlagWithSource("no-autoformat", true, undefined, undefined),
+				resolvePiLensFlagWithSource(
+					"no-autoformat",
+					true,
+					undefined,
+					undefined,
+				),
 			).toEqual({ value: true, source: "cli" });
 		});
 
@@ -725,9 +764,13 @@ describe("global pi-lens config", () => {
 				}),
 			).toEqual({ value: true, source: "global" });
 			expect(
-				resolvePiLensFlagWithSource("lens-actionable-warning-autofix", undefined, {
-					actionableWarnings: { autoFix: { enabled: true } },
-				}),
+				resolvePiLensFlagWithSource(
+					"lens-actionable-warning-autofix",
+					undefined,
+					{
+						actionableWarnings: { autoFix: { enabled: true } },
+					},
+				),
 			).toEqual({ value: true, source: "global" });
 		});
 
@@ -736,7 +779,12 @@ describe("global pi-lens config", () => {
 				resolvePiLensFlagWithSource("no-autofix", false, undefined, undefined),
 			).toEqual({ value: false, source: "default" });
 			expect(
-				resolvePiLensFlagWithSource("no-autoformat", false, undefined, undefined),
+				resolvePiLensFlagWithSource(
+					"no-autoformat",
+					false,
+					undefined,
+					undefined,
+				),
 			).toEqual({ value: false, source: "default" });
 			expect(
 				resolvePiLensFlagWithSource(
@@ -761,9 +809,9 @@ describe("global pi-lens config", () => {
 			).toEqual({ value: true, source: "env" });
 
 			process.env.PI_LENS_NO_CONTEXT_INJECTION = "0";
-			expect(
-				resolvePiLensFlagWithSource("no-lens-context", false, {}),
-			).toEqual({ value: false, source: "default" });
+			expect(resolvePiLensFlagWithSource("no-lens-context", false, {})).toEqual(
+				{ value: false, source: "default" },
+			);
 		});
 
 		it("resolvePiLensFlag delegates to resolvePiLensFlagWithSource with zero behavior change", () => {
@@ -772,7 +820,9 @@ describe("global pi-lens config", () => {
 				...EMPTY_PROJECT_CONFIG,
 				autofix: { enabled: true },
 			};
-			expect(resolvePiLensFlag("no-autofix", false, globalConfig, projectConfig)).toBe(
+			expect(
+				resolvePiLensFlag("no-autofix", false, globalConfig, projectConfig),
+			).toBe(
 				resolvePiLensFlagWithSource(
 					"no-autofix",
 					false,
@@ -791,9 +841,10 @@ describe("global pi-lens config", () => {
 			"%s is settable from config.json and reports source=global",
 			(_name, spec) => {
 				const config = configFor(spec.configKey, enablingConfigValue(spec));
-				expect(
-					resolvePiLensFlagWithSource(spec.name, false, config),
-				).toEqual({ value: true, source: "global" });
+				expect(resolvePiLensFlagWithSource(spec.name, false, config)).toEqual({
+					value: true,
+					source: "global",
+				});
 			},
 		);
 
@@ -999,12 +1050,7 @@ describe("global pi-lens config", () => {
 				raw: { lsp: { enabled: false } },
 			};
 			expect(
-				resolvePiLensFlagWithSource(
-					"no-lsp",
-					false,
-					undefined,
-					projectConfig,
-				),
+				resolvePiLensFlagWithSource("no-lsp", false, undefined, projectConfig),
 			).toEqual({ value: false, source: "default" });
 		});
 	});

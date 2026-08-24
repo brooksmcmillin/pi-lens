@@ -40,7 +40,12 @@ function makeServer(id: string, ext = ".ts") {
 		root: async () => "C:/repo",
 		spawn: vi.fn(async () => ({
 			process: {
-				process: { killed: false, kill: vi.fn(), on: vi.fn(), removeListener: vi.fn() },
+				process: {
+					killed: false,
+					kill: vi.fn(),
+					on: vi.fn(),
+					removeListener: vi.fn(),
+				},
 				stdin: { on: vi.fn(), off: vi.fn(), write: vi.fn() },
 				stdout: { on: vi.fn(), off: vi.fn(), pipe: vi.fn() },
 				stderr: { on: vi.fn(), off: vi.fn() },
@@ -66,7 +71,10 @@ function makeDiagnostic(message: string) {
  * diagnostics wait itself never times out — the touch's only timeout source is
  * the notify write, which is exactly what these tests isolate.
  */
-function makeClient(stallWrite: boolean, diags: ReturnType<typeof makeDiagnostic>[] = []) {
+function makeClient(
+	stallWrite: boolean,
+	diags: ReturnType<typeof makeDiagnostic>[] = [],
+) {
 	return {
 		isAlive: () => true,
 		shutdown: vi.fn(async () => {}),
@@ -109,7 +117,9 @@ describe("#743 — per-server notify-write deadlines", () => {
 		const service = new LSPService();
 
 		const stalledClient = makeClient(true, [makeDiagnostic("stalled finding")]);
-		const healthyClient = makeClient(false, [makeDiagnostic("healthy finding")]);
+		const healthyClient = makeClient(false, [
+			makeDiagnostic("healthy finding"),
+		]);
 
 		const stalledServer = makeServer("stalled");
 		const healthyServer = makeServer("healthy");
@@ -138,17 +148,25 @@ describe("#743 — per-server notify-write deadlines", () => {
 		expect(healthyClient.notify.open).toHaveBeenCalledTimes(1);
 
 		// The healthy server is marked demonstratedReady; the stalled one is not.
-		const ready = [...(service as unknown as {
-			state: { demonstratedReady: Set<string> };
-		}).state.demonstratedReady];
+		const ready = [
+			...(
+				service as unknown as {
+					state: { demonstratedReady: Set<string> };
+				}
+			).state.demonstratedReady,
+		];
 		expect(ready.some((k) => k.startsWith("healthy:"))).toBe(true);
 		expect(ready.some((k) => k.startsWith("stalled:"))).toBe(false);
 
 		// The stalled server did not get demoted after a single timeout.
-		const broken = (service as unknown as {
-			state: { broken: Map<string, number> };
-		}).state.broken;
-		expect([...broken.keys()].some((k) => k.startsWith("stalled:"))).toBe(false);
+		const broken = (
+			service as unknown as {
+				state: { broken: Map<string, number> };
+			}
+		).state.broken;
+		expect([...broken.keys()].some((k) => k.startsWith("stalled:"))).toBe(
+			false,
+		);
 	});
 
 	it("repeated write timeouts trip the broken cooldown and evict the client", async () => {
@@ -162,9 +180,11 @@ describe("#743 — per-server notify-write deadlines", () => {
 		// Only spawned once — reused warm on the following touches until eviction.
 		createLSPClient.mockResolvedValue(stalledClient);
 
-		const brokenMap = (service as unknown as {
-			state: { broken: Map<string, number> };
-		}).state.broken;
+		const brokenMap = (
+			service as unknown as {
+				state: { broken: Map<string, number> };
+			}
+		).state.broken;
 
 		// Three consecutive timing-out writes (distinct content so the notify is
 		// never debounced/skipped) — the third hits NOTIFY_BACKPRESSURE_BROKEN_AFTER.
@@ -186,12 +206,18 @@ describe("#743 — per-server notify-write deadlines", () => {
 		}
 
 		// Demoted via the existing broken map, and the wedged client was evicted.
-		expect([...brokenMap.keys()].some((k) => k.startsWith("wedged:"))).toBe(true);
+		expect([...brokenMap.keys()].some((k) => k.startsWith("wedged:"))).toBe(
+			true,
+		);
 		expect(stalledClient.shutdown).toHaveBeenCalled();
-		const clients = (service as unknown as {
-			state: { clients: Map<string, unknown> };
-		}).state.clients;
-		expect([...clients.keys()].some((k) => k.startsWith("wedged:"))).toBe(false);
+		const clients = (
+			service as unknown as {
+				state: { clients: Map<string, unknown> };
+			}
+		).state.clients;
+		expect([...clients.keys()].some((k) => k.startsWith("wedged:"))).toBe(
+			false,
+		);
 	});
 
 	it("a successful write resets the consecutive-timeout streak so demotion needs a fresh run", async () => {
@@ -224,9 +250,11 @@ describe("#743 — per-server notify-write deadlines", () => {
 		getServersForFileWithConfig.mockReturnValue([server]);
 		createLSPClient.mockResolvedValue(client);
 
-		const brokenMap = (service as unknown as {
-			state: { broken: Map<string, number> };
-		}).state.broken;
+		const brokenMap = (
+			service as unknown as {
+				state: { broken: Map<string, number> };
+			}
+		).state.broken;
 
 		const runTouch = async (content: string) => {
 			const p = service.touchFile(FILE, content, {
@@ -250,7 +278,9 @@ describe("#743 — per-server notify-write deadlines", () => {
 		await runTouch("c3"); // timeout (streak 1)
 		await runTouch("c4"); // timeout (streak 2)
 
-		expect([...brokenMap.keys()].some((k) => k.startsWith("flaky:"))).toBe(false);
+		expect([...brokenMap.keys()].some((k) => k.startsWith("flaky:"))).toBe(
+			false,
+		);
 	});
 
 	/**

@@ -25,7 +25,8 @@ function cwdArg(): string {
 	const index = process.argv.indexOf("--cwd");
 	if (index >= 0) {
 		const value = process.argv[index + 1];
-		if (!value || value.startsWith("-")) throw new Error("--cwd requires a directory");
+		if (!value || value.startsWith("-"))
+			throw new Error("--cwd requires a directory");
 		return value;
 	}
 	return process.cwd();

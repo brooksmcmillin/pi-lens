@@ -81,7 +81,9 @@ describe("tool_result debounce (#115)", () => {
 			const first = handleToolResult(makeDeps(filePath, runtime, cacheManager));
 			// Mutate file to change state before the second call.
 			fs.writeFileSync(filePath, "export const x = 2;\n");
-			const second = handleToolResult(makeDeps(filePath, runtime, cacheManager));
+			const second = handleToolResult(
+				makeDeps(filePath, runtime, cacheManager),
+			);
 
 			await Promise.all([first, second]);
 
@@ -129,7 +131,9 @@ describe("tool_result debounce (#115)", () => {
 			runtime.setTelemetryIdentity({ sessionId: "debounce-flush" });
 			runtime.beginTurn();
 
-			const pending = handleToolResult(makeDeps(filePath, runtime, cacheManager));
+			const pending = handleToolResult(
+				makeDeps(filePath, runtime, cacheManager),
+			);
 			// Without the flush, the 5s debounce would keep the pipeline pending.
 			await flushDebouncedToolResults();
 			await pending;

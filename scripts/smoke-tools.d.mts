@@ -7,6 +7,11 @@ export interface SmokeFixture {
 	targets?: string[];
 	tools?: string[];
 	expectDiagnostic?: boolean;
+	/**
+	 * In the tier-1 parser lane (#1937): the tool installs as a pip/npm package
+	 * or a single GitHub-release binary, with no language toolchain step.
+	 */
+	tier1?: boolean;
 }
 export interface LspFixture {
 	lang: string;
@@ -21,6 +26,10 @@ export interface LspFixture {
 	clean?: boolean;
 	lombokJar?: boolean;
 	expectNoMessageMatch?: string;
+	/** A diagnostic message that MUST arrive. The lane's default verdict passes
+	 * on zero diagnostics, which is backwards for a fixture whose purpose is to
+	 * prove a defect is seen; setting this makes zero diagnostics a FAILURE. */
+	expectMessageMatch?: string;
 	disableServers?: string[];
 	expectServerId?: string;
 	expectSourceMatch?: string;
@@ -55,6 +64,35 @@ export interface AutofixFixture {
 	tool: string;
 	tools?: string[];
 }
+/** One LSP diagnostic, as far as the harness's verdicts are concerned. */
+export interface SmokeDiagnostic {
+	message?: string;
+	source?: string;
+	severity?: number;
+}
+/**
+ * Diagnostics whose `message` matches `pattern` (case-insensitive). Exported so
+ * an `expectMessageMatch` fixture's pass/fail decision is testable without a
+ * live language server.
+ */
+export function matchDiagnosticMessages(
+	pattern: string,
+	diags: readonly SmokeDiagnostic[] | undefined,
+): SmokeDiagnostic[];
+/** One reported row from a smoke lane, as far as the pass floor is concerned. */
+export interface SmokeRow {
+	state: "pass" | "fail" | "skip" | "setup-failed";
+}
+/**
+ * The message for a run that passed fewer than `minPass` rows, or null when the
+ * floor holds. Exported so the floor is testable without a live tool install.
+ */
+export function passFloorBreach(
+	rows: readonly SmokeRow[],
+	minPass: number | null | undefined,
+): string | null;
+/** Fixtures flagged `tier1` — the scheduled parser lane's selection. */
+export function tier1Fixtures(): SmokeFixture[];
 export const FIXTURES: SmokeFixture[];
 export const LSP_FIXTURES: LspFixture[];
 export const FORMAT_FIXTURES: FormatFixture[];

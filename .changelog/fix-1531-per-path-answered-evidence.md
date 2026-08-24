@@ -1,5 +1,0 @@
----
-section: Fixed
----
-
-- **Auxiliary diagnostic waits and their outcome rows are now decided per file (closes [#1531](https://github.com/apmantza/pi-lens/issues/1531))** — `diagnosticsVersion` is a per-client counter that any file's publication advances, so on a client shared by two files in flight an unrelated publication both ended this file's wait early and read as evidence that the scanner had answered for it. Every store of fresh diagnostics now also stamps the path it was stored for (`diagnosticsVersionsByPath`, written by the new `bumpDiagnosticsVersion` seam and cleared with the rest of a path's state in `clearDiagnosticsForPath`), and both the `minVersion` freshness gate and the auxiliary evidence check read that per-path stamp. Direction was under-detection — a false `answered`, never a false finding — but it also skewed `lsp_aux_wait_outcome`, the rows used to reason about auxiliary health. Interleavings that used to record a false `answered` now record `silent` and demote the touch's confirmation to `partial`, so sweeps that touch several files against one auxiliary report a higher (and honest) partial rate.

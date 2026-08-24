@@ -11,7 +11,7 @@ vi.mock("../../clients/safe-spawn.js", () => ({
 }));
 
 async function loadFormatFile() {
-	const mod = await import("../../clients/formatters.ts");
+	const mod = await import("../../clients/formatters.js");
 	return {
 		formatFile: mod.formatFile,
 		formatter: mod.terragruntHclFormatter,
@@ -157,7 +157,7 @@ describe("formatFile honors SKIP_FORMATTING (#1144)", () => {
 			const filePath = path.join(env.tmpDir, "bundle.js");
 			fs.writeFileSync(filePath, "const a=1;const b=2;const c=a+b;\n");
 
-			const mod = await import("../../clients/formatters.ts");
+			const mod = await import("../../clients/formatters.js");
 			const result = await mod.formatFile(filePath, mod.prettierFormatter);
 
 			expect(result).toEqual({ success: true, changed: false });
@@ -212,7 +212,7 @@ describe("formatFile honors SKIP_FORMATTING (#1144)", () => {
 		try {
 			const filePath = path.join(env.tmpDir, "bundle.js");
 			fs.writeFileSync(filePath, "const a=1;const b=2;const c=a+b;\n");
-			const mod = await import("../../clients/formatters.ts");
+			const mod = await import("../../clients/formatters.js");
 			const formatter = {
 				...mod.prettierFormatter,
 				resolveCommand: async () => mod.SKIP_FORMATTING,
@@ -236,7 +236,7 @@ describe("formatFile honors SKIP_FORMATTING (#1144)", () => {
 		try {
 			const filePath = path.join(env.tmpDir, "formatted.js");
 			fs.writeFileSync(filePath, "const value = 1;\n");
-			const mod = await import("../../clients/formatters.ts");
+			const mod = await import("../../clients/formatters.js");
 			const formatter = {
 				...mod.prettierFormatter,
 				resolveCommand: async () => null,

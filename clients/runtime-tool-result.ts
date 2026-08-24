@@ -1,8 +1,17 @@
 import * as nodeCrypto from "node:crypto";
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
+import { noteAuthoritativeContentAttachment } from "./agent-nudge.js";
+import {
+	captureFileStats,
+	diffFileStats,
+	getOpaqueBaselineStore,
+	recoverOpaqueChangesViaGit,
+} from "./opaque-mutation-scan.js";
+import { normalizeMapKey } from "./path-utils.js";
 import {
 	extractReadPathsFromCommand,
+	extractDeletedPathsFromCommand,
 	extractGrepSearchReadsFromOutput,
 	extractWrittenPathsFromCommand,
 } from "./bash-file-access.js";
@@ -17,10 +26,15 @@ import { publishFormatQueued } from "./format-events-publish.js";
 import { isPathIgnoredByProject } from "./file-utils.js";
 import type { ReadGuard } from "./read-guard.js";
 import { getFormatService } from "./format-service.js";
-import { isExternalOrVendorFile, normalizeEphemeralMapKey } from "./path-utils.js";
+import {
+	isExternalOrVendorFile,
+	normalizeEphemeralMapKey,
+	pathsEqual,
+} from "./path-utils.js";
 import { PathKeyedMap } from "./path-keyed-map.js";
 import { resolveLanguageRootForFile } from "./language-profile.js";
 import { logLatency } from "./latency-logger.js";
+import { resolveToolCallCorrelationId } from "./tool-event.js";
 import {
 	boundedIndexesForCount,
 	createReadGuardEditBatchSummary,
@@ -30,10 +44,14 @@ import {
 import type { PiLensFlagSource } from "./lens-config.js";
 import type { EditToolDetails } from "@earendil-works/pi-coding-agent";
 import type { LSPShutdownOptions } from "./lsp/client.js";
+import { notifyExternalFileChange } from "./lsp/index.js";
 import type { MetricsClient } from "./metrics-client.js";
-import { runPipeline, type PipelineResult } from "./pipeline.js";
+import { type PipelineResult, runPipeline } from "./pipeline.js";
 import {
-	appendProjectChange,
+	type AuthoritativeAttachmentDecision,
+	renderPostAutofixNotice,
+} from "./post-autofix-notice.js";
+import {
 	type ProjectChangeRange,
 	type ProjectChangeSource,
 } from "./project-changes.js";
@@ -45,21 +63,35 @@ import { RUNTIME_CONFIG } from "./runtime-config.js";
 
 const AUTHORITATIVE_CONTENT_MAX_BYTES = RUNTIME_CONFIG.pipeline.lspMaxFileBytes;
 
+/**
+ * The `tool_result` payload pi-lens actually receives.
+ *
+ * Kept aligned with what pi BUILDS, not with what a payload might plausibly
+ * carry. `AgentSession._installAgentToolHooks`'s `afterToolCall` constructs the
+ * event literal with exactly eight keys —
+ * `type`/`toolName`/`toolCallId`/`input`/`content`/`details`/`isError`/`usage`
+ * (`@earendil-works/pi-coding-agent/dist/core/agent-session.js:243-256`, source
+ * `src/core/agent-session.ts:502-516`) — and `ExtensionRunner.emitToolResult`
+ * forwards that same object to every handler
+ * (`dist/core/extensions/runner.js:649-651`, source `runner.ts:877-880`).
+ *
+ * #1655 item 2 removed seven fields this interface used to declare that pi
+ * never sets on the wire: `id`, `callId`, `requestId`, `provider`, `model`,
+ * `sessionId`, and `session`. They made a telemetry-identity branch here
+ * unreachable against a real host. Identity is read from the runtime instead —
+ * see the `telemetry:` block handed to `runPipeline` below, which already
+ * sources `model`/`sessionId`/`provider` from `RuntimeCoordinator`.
+ *
+ * Do not re-add a field here without a pi source line that assigns it.
+ */
 interface ToolResultEvent {
 	toolName: string;
-	id?: string | number;
 	toolCallId?: string | number;
-	callId?: string | number;
-	requestId?: string | number;
 	/** Host tool_result status; distinct from pi-lens PipelineResult.isError. */
 	isError?: boolean;
 	input: unknown;
 	details?: unknown;
 	content: Array<{ type: string; text?: string }>;
-	provider?: string;
-	model?: string;
-	sessionId?: string;
-	session?: { id?: string };
 }
 
 interface ToolResultDeps {
@@ -90,11 +122,24 @@ interface ToolResultDeps {
 	 * Do not pass from external callers.
 	 */
 	_bypassDebounce?: boolean;
+	/** #2000: overrides the change-log source for this synthetic dispatch. */
+	_mutationSourceOverride?: ProjectChangeSource;
 	/** Internal bounded provenance carried through debounce/coalescing. */
 	_telemetryParticipantIds?: string[];
 	_telemetryParticipantTotal?: number;
 	/** Receipt-time decision preserved across debounce replacement. */
 	_autofixMode?: "immediate" | "deferred";
+	/**
+	 * Internal: authoritative-content bytes still available to this tool result.
+	 *
+	 * A multi-file bash write drives one synthetic `handleToolResult` call per
+	 * written path, and all of those attachments land in ONE tool result. The
+	 * outer call therefore hands every synthetic call the same mutable budget
+	 * object so the attachment decision below reads the per-file cap and the
+	 * shared budget in one expression (#1590). Absent means "no shared budget"
+	 * — a direct write, bounded by the per-file cap alone.
+	 */
+	_attachmentBudget?: { remaining: number };
 }
 
 function parseDiffRanges(diff: string): { start: number; end: number }[] {
@@ -240,7 +285,8 @@ function scheduleDebounced(
 	if (existing) {
 		clearTimeout(existing.timer);
 		const incomingId =
-			deps._telemetryParticipantIds?.[0] ?? getReadGuardCorrelationId(deps.event);
+			deps._telemetryParticipantIds?.[0] ??
+			getReadGuardCorrelationId(deps.event);
 		const priorIds = existing.latestDeps._telemetryParticipantIds ?? [];
 		existing.latestDeps = {
 			...deps,
@@ -273,8 +319,9 @@ function scheduleDebounced(
 		resolveFn = res;
 		rejectFn = rej;
 	});
-	const initialParticipantIds =
-		deps._telemetryParticipantIds ?? [getReadGuardCorrelationId(deps.event)];
+	const initialParticipantIds = deps._telemetryParticipantIds ?? [
+		getReadGuardCorrelationId(deps.event),
+	];
 	const entry: DebouncedEntry = {
 		timer: setTimeout(() => {
 			debouncedPipelines.delete(filePath);
@@ -346,23 +393,17 @@ function recordProjectChange(args: {
 	changedRange?: ProjectChangeRange;
 	dbg: (msg: string) => void;
 }): void {
-	const bump = (args.runtime as Partial<RuntimeCoordinator>).bumpFileSeq;
-	if (!bump) return;
-	const { projectSeq, fileSeq } = bump.call(args.runtime, args.filePath);
-	try {
-		appendProjectChange(args.cwd, {
-			seq: projectSeq,
-			timestamp: new Date().toISOString(),
-			sessionId: args.runtime.telemetrySessionId,
-			turnIndex: args.runtime.turnIndex,
-			source: args.source,
-			filePath: path.resolve(args.filePath),
-			fileSeq,
-			changedRange: args.changedRange,
-		});
-	} catch (err) {
-		args.dbg(`project change log append failed for ${args.filePath}: ${err}`);
-	}
+	// One mutation seam (#2000 phase 1): bump + receipt + change-log live in
+	// RuntimeCoordinator.recordProjectMutation; this wrapper only carries the
+	// legacy dbg shape.
+	(args.runtime as Partial<RuntimeCoordinator>).recordProjectMutation?.({
+		filePath: args.filePath,
+		source: args.source,
+		cwd: args.cwd,
+		changedRange: args.changedRange,
+		onAppendError: (err) =>
+			args.dbg(`project change log append failed for ${args.filePath}: ${err}`),
+	});
 }
 
 export async function handleToolResult(deps: ToolResultDeps): Promise<{
@@ -386,14 +427,114 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 
 	const rawFilePath = (event.input as { path?: string }).path;
 	const workspaceRoot = runtime.projectRoot || process.cwd();
+
+	// #1642: a gitignored worktree edit got re-attributed onto a
+	// same-relative-path file in the parent checkout because this handler
+	// used to always resolve a relative path against `workspaceRoot`
+	// (`runtime.projectRoot`), with no idea the call actually ran under a
+	// different cwd/worktree.
+	//
+	// Source-level correction (pi host audit, earendil-works/pi): tool_call's
+	// own resolved path is NOT authoritative for what executed —
+	// `agent-session.ts:914-919`'s extension-handler contract lets a LATER
+	// `tool_call` handler mutate `event.input` in place with no
+	// re-validation, and edit's `prepareArguments` rewrites args before the
+	// event fires at all. `tool_result.input`, by contrast, is populated
+	// from the EXECUTED args (`agent-session.ts:502-516`) — it is the
+	// authoritative path source. So the correlation record's job is narrower
+	// than "the path": it is the RESOLUTION BASIS (the cwd/worktree the call
+	// actually ran under). Every tool_result resolves ITS OWN authoritative
+	// `rawFilePath` against that basis, rather than trusting a call-time path
+	// that a later handler may have superseded.
+	const toolCallId = resolveToolCallCorrelationId(event);
+	const attribution =
+		toolCallId !== undefined
+			? runtime.takeToolCallAttribution(toolCallId)
+			: undefined;
+
+	let resolutionBasis: string;
+	if (attribution) {
+		resolutionBasis = attribution.originCwd;
+	} else if (
+		toolCallId !== undefined &&
+		rawFilePath &&
+		!path.isAbsolute(rawFilePath)
+	) {
+		// A real correlation id existed (the host DOES support one) but no
+		// attribution was recorded under it — evicted, cleared because the
+		// call was blocked before it could execute, or simply never seen by
+		// `handleToolCall`. A RELATIVE path here is ambiguous: we have no
+		// idea which cwd it is relative to, and guessing `workspaceRoot` is
+		// exactly the #1642 collapse. Fail CLOSED instead of guessing — no
+		// turn state, no deferred work — and log it so a real incident is
+		// countable rather than silently mis-attributed.
+		const guessedPath = path.resolve(workspaceRoot, rawFilePath);
+		// Existence is not execution evidence: a same-named file can exist in
+		// the workspace while the tool ran in another cwd. Without the recorded
+		// call target and origin cwd there is no comparison to make, so retain the
+		// full record and fail closed.
+		dbg(
+			`path_attribution_missing: no recorded resolution basis for toolCallId=${toolCallId}, refusing relative path ${rawFilePath} (would have guessed ${guessedPath})`,
+		);
+		logLatency({
+			type: "phase",
+			toolName: event.toolName,
+			filePath: guessedPath,
+			phase: "path_attribution_missing",
+			durationMs: 0,
+			metadata: { toolCallId, rawFilePath, guessedPath },
+		});
+		return;
+	} else {
+		// Either an ABSOLUTE path (bash-synthetic writes always pass one —
+		// unambiguous regardless of any basis, see the bash-write dispatch
+		// below) or a host that supplies NO correlation id at all under any
+		// known field name. The latter cannot be correlated by identity full
+		// stop; this is the SAME exposure every host had before this fix,
+		// not a regression introduced by it.
+		resolutionBasis = workspaceRoot;
+	}
 	const filePath = rawFilePath
 		? path.isAbsolute(rawFilePath)
 			? rawFilePath
-			: path.resolve(workspaceRoot, rawFilePath)
+			: path.resolve(resolutionBasis, rawFilePath)
 		: rawFilePath;
+
+	// Purely diagnostic: tool_call's call-time verdict (computed on ITS OWN
+	// resolved path, which may since have been superseded) disagreed with
+	// what actually executed. This does NOT gate anything by itself — the
+	// ignore re-check below, running on the freshly & correctly resolved
+	// `filePath`, is the real decision — but a divergence is exactly the
+	// shape of the reported incident, so it is named legibly.
+	if (
+		attribution?.skipped &&
+		filePath &&
+		attribution.resolvedPath &&
+		!pathsEqual(filePath, attribution.resolvedPath)
+	) {
+		const message = `path_attribution_refused: call target ${attribution.resolvedPath} (originCwd=${attribution.originCwd}) vs tool_result resolved ${filePath}`;
+		dbg(message);
+		logLatency({
+			type: "phase",
+			toolName: event.toolName,
+			filePath,
+			phase: "path_attribution_refused",
+			durationMs: 0,
+			metadata: {
+				callTarget: attribution.resolvedPath,
+				resolvedPath: filePath,
+				originCwd: attribution.originCwd,
+			},
+		});
+	}
 	const behaviorWarnings = agentBehaviorRecord(event.toolName, filePath);
 	const syntheticWriteContent: Array<{ type: string; text?: string }> = [];
-	let syntheticAttachmentBytes = 0;
+	// #1590: one shared authoritative-content budget for every path this bash
+	// command wrote. It is handed DOWN to each synthetic call so the single
+	// attachment decision there sees both limits; nothing re-decides out here.
+	const syntheticAttachmentBudget = {
+		remaining: AUTHORITATIVE_CONTENT_MAX_BYTES,
+	};
 
 	// Bash writes (redirects, tee, sed -i, cp/mv, touch, git checkout/restore) —
 	// these change file content but never go through the edit tool, so bash
@@ -408,81 +549,151 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		typeof (event.input as { command?: unknown }).command === "string"
 	) {
 		const command = (event.input as { command: string }).command;
-		const written = extractWrittenPathsFromCommand(
-			command,
-			workspaceRoot,
-		).filter(
-			(wp) =>
-				event.isError !== true &&
-				!isExternalOrVendorFile(wp, workspaceRoot) &&
-				!isPathIgnoredByProject(wp, workspaceRoot, false),
-		);
+		const recognized = extractWrittenPathsFromCommand(command, workspaceRoot);
+		// The SURVIVING recognized set: what will actually dispatch. Failure
+		// atomicity (#2000 invariant 5) means opaque recovery must subtract
+		// THIS set, not raw recognized - otherwise a redirect target dropped
+		// by the isError filter would be subtracted from recovery AND
+		// excluded here, attributed nowhere.
+		const recognizedWritten =
+			event.isError !== true
+				? recognized.filter(
+						(wp) =>
+							!isExternalOrVendorFile(wp, workspaceRoot) &&
+							!isPathIgnoredByProject(wp, workspaceRoot, false),
+					)
+				: [];
+		// #2000 phase 2: when the extractor recognizes NOTHING, the command is
+		// opaque-candidate — recover its actual changed set by diffing the pre
+		// snapshot taken at tool_call. Partial writes that landed before a
+		// nonzero exit ARE attributed (the files changed and the agent authored
+		// them) — a deliberate divergence from the isError filter above, which
+		// exists for restore semantics where attribution would lie.
+		let opaquePaths: string[] = [];
+		// Recovery runs for EVERY bash command with a pending baseline - not
+		// only recognized-empty ones. A mixed command (`python x.py > out.ts`
+		// plus script-internal writes) previously skipped observation entirely
+		// with zero telemetry; git-first recovery is cheap enough (~60ms) to
+		// close that gap, subtracting already-recognized paths so nothing
+		// double-dispatches.
+		if (workspaceRoot && !getFlag("no-read-guard")) {
+			const scanRoot = workspaceRoot;
+			const started = Date.now();
+			const pending = getOpaqueBaselineStore().take(
+				`${normalizeMapKey(path.resolve(scanRoot))}:${runtime.sessionGeneration}`,
+			);
+			let unknownReason: string | undefined;
+			if (!pending && recognized.length > 0) {
+				// Partial coverage without observation: the explicit verdict
+				// invariant 1 demands (never silently imply no change).
+				unknownReason = "partial-recognition-no-baseline";
+			} else if (!pending) {
+				unknownReason = "no-pending-snapshot";
+			} else if (pending.strategy === "git") {
+				// Git-first: no universe cap - works on any repo size.
+				const recovery = await recoverOpaqueChangesViaGit(
+					scanRoot,
+					pending.startedAt,
+				);
+				if (recovery.verdict === "recovered") {
+					opaquePaths = recovery.paths.filter(
+						(p) =>
+							!isExternalOrVendorFile(p, scanRoot) &&
+							!isPathIgnoredByProject(p, scanRoot, false),
+					);
+				} else if (recovery.verdict === "unknown" && recognized.length > 0) {
+					// Git hiccup on a partially-recognized command: the
+					// remainder's coverage is unknown, never clean-by-default.
+					unknownReason = recovery.unknownReason;
+				}
+			} else if (pending.stats) {
+				const outcome = await captureFileStats(scanRoot, {
+					withHashes: true,
+				});
+				if (outcome.snapshot && !outcome.unknownReason) {
+					opaquePaths = diffFileStats(pending.stats, outcome.snapshot);
+				} else {
+					unknownReason =
+						outcome.unknownReason ??
+						pending.statsUnknownReason ??
+						"walk-failed";
+				}
+			} else {
+				unknownReason = pending.statsUnknownReason ?? "walk-failed";
+			}
+			if (opaquePaths.length > 0 && recognizedWritten.length > 0) {
+				const survivingKeys = new Set(
+					recognizedWritten.map((p) => normalizeMapKey(path.resolve(p))),
+				);
+				opaquePaths = opaquePaths.filter((p) => !survivingKeys.has(p));
+			}
+			if (unknownReason) {
+				logLatency({
+					type: "phase",
+					phase: "opaque_mutation_coverage_unknown",
+					filePath: command.slice(0, 80),
+					durationMs: Date.now() - started,
+					result: unknownReason,
+				});
+			}
+			if (opaquePaths.length > 0) {
+				logLatency({
+					type: "phase",
+					phase: "opaque_mutation_recovered",
+					filePath: opaquePaths.slice(0, 5).join(","),
+					durationMs: Date.now() - started,
+					result: `changed:${opaquePaths.length}`,
+				});
+			}
+		}
+		// wp iterates opaquePaths VERBATIM (already normalizeMapKey keys), so the
+		// set must hold those exact strings - no re-resolution.
+		const opaqueSet = new Set(opaquePaths);
+		const written = [...recognizedWritten, ...opaquePaths];
 		for (const wp of written) {
 			if (!getFlag("no-read-guard")) deps.readGuard?.recordWritten(wp);
-			const receipt = (runtime as Partial<RuntimeCoordinator>).recordMutationToolReceipt;
+			const receipt = (runtime as Partial<RuntimeCoordinator>)
+				.recordMutationToolReceipt;
 			const autofixMode = receipt
 				? receipt.call(runtime, wp, "write").autofixMode
 				: "immediate";
+			// Recovered opaque writes carry their own source so the change log
+			// distinguishes them from parsed writes (auditable in production).
+			const isOpaque = opaqueSet.has(wp);
+			// Failure atomicity: an opaque-recovered file VERIFIABLY exists on
+			// disk, so its synthetic event must not inherit isError - the main
+			// path early-returns on failed host results before attribution,
+			// which would silently drop exactly the partial writes invariant 5
+			// says to attribute.
+			const syntheticEvent = {
+				...event,
+				toolName: "write",
+				input: { path: wp },
+				isError: false,
+			};
 			const syntheticResult = await handleToolResult({
 				...deps,
-				event: { ...event, toolName: "write", input: { path: wp } },
+				event: syntheticEvent,
 				_bypassDebounce: true,
 				_autofixMode: autofixMode,
+				_attachmentBudget: syntheticAttachmentBudget,
+				_mutationSourceOverride: isOpaque ? "opaque-script" : undefined,
 			});
 			if (syntheticResult) {
-				// The per-attachment cap bounds each file, but a multi-file bash
-				// write (`sed -i` over globs, `;`-chained rewrites) appends one
-				// attachment per path — share ONE authoritative-content budget
-				// across the whole command so the aggregate tool result stays
-				// bounded too. Past the budget, degrade to the re-read warning.
-				for (const block of syntheticResult.content.slice(
-					event.content.length,
-				)) {
-					const blockBytes =
-						typeof block.text === "string"
-							? Buffer.byteLength(block.text, "utf-8")
-							: 0;
-					const isAuthoritativeAttachment =
-						typeof block.text === "string" &&
-						block.text.startsWith("pi-lens applied autofix to ");
-					if (
-						isAuthoritativeAttachment &&
-						syntheticAttachmentBytes + blockBytes >
-							AUTHORITATIVE_CONTENT_MAX_BYTES
-					) {
-						// S3e (#1432 review): this is the SECOND
-						// `authoritative_content_attachment_decision` row for `wp` —
-						// the synthetic `handleToolResult` call above already logged
-						// an "attached" row for the same path under its per-file
-						// cap. This outer, aggregate-budget row is logged later and
-						// is the one that matches what the caller actually sees
-						// (the re-read warning below, not the attachment), so it
-						// wins for `wp`; the inner "attached" row is a stale
-						// per-file view superseded by this shared-budget decision.
-						logLatency({
-							type: "phase",
-							phase: "authoritative_content_attachment_decision",
-							filePath: wp,
-							durationMs: 0,
-							metadata: { path: wp, bytes: blockBytes, decision: "aggregate-budget-degraded" },
-						});
-						syntheticWriteContent.push({
-							type: "text",
-							text: `⚠️ **File was modified by auto-format/fix. You MUST re-read ${wp} before making any further edits — the aggregate authoritative content for this command is too large to attach.**`,
-						});
-						continue;
-					}
-					if (isAuthoritativeAttachment) {
-						syntheticAttachmentBytes += blockBytes;
-					}
-					syntheticWriteContent.push(block);
-				}
+				// #1590: forward verbatim. The synthetic call already charged the
+				// shared budget above and phrased its own notice from the decision
+				// it made, so a second verdict out here could only contradict it —
+				// which is exactly the defect this shape produced before.
+				syntheticWriteContent.push(
+					...syntheticResult.content.slice(event.content.length),
+				);
 			}
 		}
 		if (event.isError !== true && !getFlag("no-read-guard")) {
 			for (const span of extractReadPathsFromCommand(command, workspaceRoot)) {
 				if (isExternalOrVendorFile(span.filePath, workspaceRoot)) continue;
-				if (isPathIgnoredByProject(span.filePath, workspaceRoot, false)) continue;
+				if (isPathIgnoredByProject(span.filePath, workspaceRoot, false))
+					continue;
 				deps.readGuard?.recordRead({
 					filePath: span.filePath,
 					requestedOffset: span.offset,
@@ -493,6 +704,41 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 					turnIndex: runtime.turnIndex,
 					writeIndex: runtime.peekWriteIndex(),
 					timestamp: Date.now(),
+				});
+			}
+		}
+
+		// #1668: bash-deleted files never go through the edit tool, so nothing
+		// else tells an LSP server one of its watched files is gone — the ONLY
+		// existing enqueue site fires on first open and can only emit type 1/2.
+		// Extract the command's likely delete targets, confirm each by existence
+		// (never scan the workspace — only the paths the command named), and only
+		// act on paths pi-lens already knows about (a read or a write this
+		// session) so an `rm` on something pi-lens never touched is not treated
+		// as a signal. Each match is routed to already-active LSP clients as a
+		// type-3 watched-files event through the same #271 coalescing queue a
+		// burst of deletes still flushes as one notification per server.
+		if (
+			event.isError !== true &&
+			!getFlag("no-lsp") &&
+			!getFlag("no-read-guard")
+		) {
+			for (const dp of extractDeletedPathsFromCommand(command, workspaceRoot)) {
+				if (isExternalOrVendorFile(dp, workspaceRoot)) continue;
+				if (isPathIgnoredByProject(dp, workspaceRoot, false)) continue;
+				if (!deps.readGuard || !deps.readGuard.hasKnownPath(dp)) continue;
+				// #1668 review F4: this is the ONLY gate standing between a merely
+				// NAMED path and an actual confirmed delete — extractDeletedPathsFromCommand
+				// only proposes candidates from parsing the command text, so it can't
+				// tell `git rm --cached f` (index-only, file still on disk) from a
+				// real delete, can't see a short-circuited `rm f && false` that never
+				// ran, and can't resolve a relative path run from a `cd`-ed subdirectory
+				// against the wrong cwd. Every one of those is caught here, and only
+				// here — do not remove or reorder this check relative to the loop body.
+				if (nodeFs.existsSync(dp)) continue; // still there — not a real delete
+				deps.readGuard.forgetPath(dp);
+				void notifyExternalFileChange(dp, 3).catch((err) => {
+					dbg(`tool_result: external-delete notify failed for ${dp}: ${err}`);
 				});
 			}
 		}
@@ -592,9 +838,11 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 
 	// Must happen before debounce admission: latestDeps intentionally retains only
 	// the latest event, but write -> edit is a sticky turn transition.
-	const receipt = (runtime as Partial<RuntimeCoordinator>).recordMutationToolReceipt;
+	const receipt = (runtime as Partial<RuntimeCoordinator>)
+		.recordMutationToolReceipt;
 	const autofixMode = deps._bypassDebounce
-		? (deps._autofixMode ?? (event.toolName === "edit" ? "deferred" : "immediate"))
+		? (deps._autofixMode ??
+			(event.toolName === "edit" ? "deferred" : "immediate"))
 		: receipt
 			? receipt.call(runtime, filePath, event.toolName).autofixMode
 			: event.toolName === "edit"
@@ -699,13 +947,15 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	dbg(
 		`tool_result: resolved dispatch cwd ${dispatchCwd} for ${filePath} (turnState cwd ${turnStateCwd})`,
 	);
-	if (event.model || event.provider || event.sessionId || event.session?.id) {
-		runtime.setTelemetryIdentity({
-			model: event.model,
-			provider: event.provider,
-			sessionId: event.sessionId ?? event.session?.id,
-		});
-	}
+	// #1655 item 2: a `setTelemetryIdentity` call used to sit here, gated on
+	// `event.model`/`provider`/`sessionId`/`session.id`. pi sets none of those on
+	// a `tool_result` — `afterToolCall` builds the event with exactly
+	// `type`/`toolName`/`toolCallId`/`input`/`content`/`details`/`isError`/`usage`
+	// (`@earendil-works/pi-coding-agent/dist/core/agent-session.js:243-256`,
+	// source `src/core/agent-session.ts:502-516`), so the gate was always false
+	// against a real host and the branch never ran. Identity for this dispatch
+	// comes from the runtime, which `message_start`/`session_start` populate —
+	// see the `telemetry:` block handed to `runPipeline` below.
 	const writeIndex = runtime.nextWriteIndex();
 	let modifiedRanges: Array<{ start: number; end: number }> | undefined;
 	try {
@@ -768,7 +1018,9 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		runtime,
 		cwd: turnStateCwd,
 		filePath,
-		source: sourceForToolName(event.toolName, event.details),
+		source:
+			deps._mutationSourceOverride ??
+			sourceForToolName(event.toolName, event.details),
 		changedRange: singleRange(modifiedRanges),
 		dbg,
 	});
@@ -812,6 +1064,9 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 				getFilesChangedSince: (seq: number) =>
 					runtime.getFilesChangedSince(seq),
 			},
+			// The settle clock is live because the deferred cascade may reach its
+			// budget derivation before or after turn_end starts waiting.
+			turnEndCascadeSettleStart: () => runtime.getTurnEndCascadeSettleStart(),
 			// #348 phase 2: live reference so the deferred cascade can update the
 			// warm word index in place at the same seam as the graph rebuild.
 			// `runtime.wordIndex` is read fresh (not captured) via this closure-free
@@ -972,11 +1227,21 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	}
 
 	let autofixNewlyQueued = false;
-	if (!result.isError && autofixMode === "deferred" && nodeFs.existsSync(filePath)) {
+	if (
+		!result.isError &&
+		autofixMode === "deferred" &&
+		nodeFs.existsSync(filePath)
+	) {
 		autofixNewlyQueued =
 			(runtime as Partial<RuntimeCoordinator>).deferMutation?.call(
-				runtime, filePath, dispatchCwd, event.toolName, turnStateCwd,
-				"autofix", deps.sessionId,
+				runtime,
+				filePath,
+				dispatchCwd,
+				event.toolName,
+				turnStateCwd,
+				"autofix",
+				deps.sessionId,
+				resolutionBasis,
 			) ?? false;
 		dbg(`tool_result: queued deferred autofix for ${filePath}`);
 	}
@@ -994,6 +1259,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			event.toolName,
 			turnStateCwd,
 			deps.sessionId,
+			resolutionBasis,
 		);
 		formatQueued = true;
 		dbg(`tool_result: queued deferred format for ${filePath}`);
@@ -1018,7 +1284,13 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		}
 	}
 	if (autofixNewlyQueued && !formatQueued) {
-		publishFormatQueued({ filePath, cwd: dispatchCwd, tool: event.toolName, kinds: ["autofix"], dbg });
+		publishFormatQueued({
+			filePath,
+			cwd: dispatchCwd,
+			tool: event.toolName,
+			kinds: ["autofix"],
+			dbg,
+		});
 	}
 
 	for (const changedFile of result.changedFiles ?? []) {
@@ -1100,7 +1372,16 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	}
 
 	if (result.inlineBlockerSummary) {
-		runtime.recordInlineBlockers(filePath, result.inlineBlockerSummary);
+		// #1561: stamp the verdict with THIS dispatch's write token — the same
+		// counter `lsp_diagnostics`' reconciliation seam draws from — so a later
+		// confirmed-clean result can be ordered against it instead of racing it.
+		runtime.recordInlineBlockers(
+			filePath,
+			result.inlineBlockerSummary,
+			writeIndex,
+			result.inlineBlockerSources,
+			result.inlineBlockerLines,
+		);
 	} else {
 		runtime.clearInlineBlockers(filePath);
 	}
@@ -1136,39 +1417,75 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 
 	runtime.reportedThisTurn.add(filePath);
 
+	// --- The ONE authoritative-attachment decision (#1590) ---
+	// Everything downstream — the attached block, the telemetry row, the nudge
+	// suppression, and the notice sentence — reads this single verdict. It is
+	// the only place that sees both limits: the per-file cap and the shared
+	// per-command budget a multi-file bash write threads in.
 	const postMutation = result.postMutation;
-	const attachAuthoritativeContent = postMutation !== undefined &&
-		Buffer.byteLength(postMutation.content, "utf-8") <= AUTHORITATIVE_CONTENT_MAX_BYTES;
-	if (postMutation) {
-		const bytes = Buffer.byteLength(postMutation.content, "utf-8");
-		// S3e (#1432 review): when this call is the synthetic per-file
-		// `handleToolResult` recursion a multi-file bash write drives (see the
-		// bash branch above), the OUTER aggregate-budget loop may log a SECOND
-		// `authoritative_content_attachment_decision` row for this same
-		// `filePath` right after this one, downgrading an "attached" here to
-		// "aggregate-budget-degraded" once the shared budget is exhausted.
-		// Both rows are intentional (this one reflects the per-file cap
-		// decision; the outer one reflects the aggregate-budget decision that
-		// can override it) — the outer row, logged later, wins for that path.
+	const attachmentText = postMutation
+		? `pi-lens applied autofix to ${postMutation.filePath}. The following full content is authoritative for subsequent edits:\n\n${postMutation.content}`
+		: "";
+	const contentBytes = postMutation
+		? Buffer.byteLength(postMutation.content, "utf-8")
+		: 0;
+	const withinPerFileCap = contentBytes <= AUTHORITATIVE_CONTENT_MAX_BYTES;
+	const budget = deps._attachmentBudget;
+	const withinSharedBudget =
+		!budget || Buffer.byteLength(attachmentText, "utf-8") <= budget.remaining;
+	const attachAuthoritativeContent =
+		postMutation !== undefined && withinPerFileCap && withinSharedBudget;
+	const attachmentDecision: AuthoritativeAttachmentDecision = !postMutation
+		? "none"
+		: attachAuthoritativeContent
+			? "attached"
+			: withinPerFileCap
+				? "aggregate-budget-degraded"
+				: "size-capped";
+	// #1590: the pipeline hands up the changed-file data and this layer renders
+	// the sentence, so a size-capped write can no longer carry both "attached
+	// content is authoritative" and "too large to attach". The fallback covers
+	// a post-mutation with no notice data, which must still say re-read.
+	const notice =
+		result.postAutofixNotice ??
+		(postMutation
+			? { targetPath: postMutation.filePath, changedFiles: [] }
+			: undefined);
+	if (postMutation && attachAuthoritativeContent && budget) {
+		budget.remaining -= Buffer.byteLength(attachmentText, "utf-8");
+	}
+	// #1590 review F1: every mutation that produced a notice logs a row,
+	// INCLUDING the `none` decision a format-only change makes. Gating the row
+	// on `postMutation` made a legitimate "nothing was attachable here" verdict
+	// indistinguishable from missing instrumentation, which is the same
+	// empty-vs-errored confusion the read paths already guard against.
+	if (postMutation || notice) {
 		logLatency({
 			type: "phase",
 			phase: "authoritative_content_attachment_decision",
-			filePath: postMutation.filePath,
+			filePath: postMutation?.filePath ?? filePath,
 			durationMs: 0,
-			metadata: { path: postMutation.filePath, bytes, decision: attachAuthoritativeContent ? "attached" : "size-capped" },
+			metadata: {
+				path: postMutation?.filePath ?? filePath,
+				bytes: contentBytes,
+				decision: attachmentDecision,
+			},
 		});
 	}
+	if (postMutation) {
+		// #1464: the nudge suppresses exactly the paths this decision
+		// delivered. Same boolean the attachment below reads — the nudge layer
+		// never re-derives the cap or the budget for itself.
+		noteAuthoritativeContentAttachment(
+			postMutation.filePath,
+			attachAuthoritativeContent,
+		);
+	}
 	const returnedContent = attachAuthoritativeContent
-		? [
-				...event.content,
-				{
-					type: "text",
-					text: `pi-lens applied autofix to ${postMutation!.filePath}. The following full content is authoritative for subsequent edits:\n\n${postMutation!.content}`,
-				},
-			]
+		? [...event.content, { type: "text", text: attachmentText }]
 		: event.content;
-	if (postMutation && !attachAuthoritativeContent) {
-		output = `${output ? `${output}\n\n` : ""}⚠️ **File was modified by auto-format/fix. You MUST re-read ${postMutation.filePath} before making any further edits — the authoritative content is too large to attach.**`;
+	if (notice) {
+		output = `${output ? `${output}\n\n` : ""}${renderPostAutofixNotice(notice, attachmentDecision)}`;
 	}
 
 	if (!output && !result.postMutation) return;

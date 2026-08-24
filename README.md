@@ -34,6 +34,112 @@ pi-lens gives AI coding agents fast, language-aware feedback while they write/ed
 - MCP server (experimental) so Claude Code or any MCP client can drive the
   same diagnostics/read-substitute tools pi-lens exposes to pi
 
+## Architecture
+
+Most lifecycle events enter through one wrapper, which drops and counts events
+that arrive on a replaced session. `tool_call` registers raw: it delegates
+straight to a handler that owns its own total guard. Events fan out into the
+edit-time lane and the LSP lane. Both lanes write into the findings stores.
+Nothing reaches the agent from those stores until a freshness gate or an
+explicit age label clears it.
+
+```mermaid
+flowchart TD
+    subgraph host["pi host"]
+        HOST["Host events<br/>tool_call, tool_result, turn_start/end,<br/>session_start/shutdown, agent_end, context"]
+        WRAP["Stale-ctx wrapper<br/>skips and counts events on a replaced session<br/>tool_result, turn_start, turn_end, agent_end,<br/>agent_settled, session_start, context"]
+    end
+
+    subgraph guards["Guards"]
+        RG["Read-guard<br/>blocks edits that lack prior reading"]
+        GG["Git-guard<br/>holds commit/push while findings stay unresolved"]
+    end
+
+    subgraph edit["Edit-time lane"]
+        PIPE["Post-write pipeline<br/>secrets, format, autofix, sync, lint, tests"]
+        PLAN["Dispatch plan<br/>per file kind, per capability group"]
+        RUN["Runners<br/>format, lint, types, security, smells, docs"]
+        STRUCT["Structural rules<br/>tree-sitter queries and ast-grep"]
+        BUS["files-touched bus<br/>tells extensions which paths moved"]
+    end
+
+    subgraph lsp["LSP lane"]
+        POOL["Client pool<br/>warm reuse, idle eviction"]
+        DIAGS["File and workspace diagnostics"]
+        CASC["Impact cascade<br/>tiered wait policy"]
+    end
+
+    STORES["Findings stores<br/>widget state, warning caches, project snapshot"]
+
+    subgraph gate["Freshness gating"]
+        FRESH["Path freshness<br/>mtime vs scan time, past-EOF, dependency drift"]
+        DISPO["Dispositions<br/>false-positive, suppress, defer, flagged"]
+        LABEL["Explicit age label<br/>for findings no path gate can check"]
+    end
+
+    subgraph deliver["Delivery surfaces"]
+        TURN["Turn-end findings injection"]
+        WIDGET["Widget and footer tally"]
+        TOOLS["lens_diagnostics tool"]
+        NUDGE["Agent nudges"]
+    end
+
+    SESSION["Session lifecycle<br/>primary, sequential replacement, concurrent secondary"]
+    SINKS["Observability sinks<br/>latency.log, degradation ledger, bounded telemetry,<br/>cache observability, cascade and tree-sitter logs"]
+
+    HOST --> WRAP
+    HOST -->|tool_call, raw| RG
+    HOST -->|tool_call, raw| GG
+    WRAP -->|session_start| SESSION
+    WRAP -->|tool_result| PIPE
+    WRAP -->|tool_result, records reads and writes| RG
+    SESSION --> POOL
+    SESSION --> STORES
+    PIPE --> PLAN
+    PLAN --> RUN
+    PLAN --> STRUCT
+    PIPE --> POOL
+    PIPE --> BUS
+    POOL --> DIAGS
+    DIAGS --> CASC
+    RUN --> STORES
+    STRUCT --> STORES
+    DIAGS --> STORES
+    CASC --> STORES
+    BUS --> NUDGE
+    RG -->|read and edit history filter| NUDGE
+    STORES --> FRESH
+    STORES --> LABEL
+    FRESH --> DISPO
+    DISPO --> TURN
+    DISPO --> WIDGET
+    DISPO --> TOOLS
+    LABEL --> TURN
+    TURN --> GG
+    WRAP --> SINKS
+    PIPE --> SINKS
+    RUN --> SINKS
+    STRUCT --> SINKS
+    POOL --> SINKS
+    CASC --> SINKS
+    RG --> SINKS
+    GG --> SINKS
+    FRESH --> SINKS
+```
+
+Architecture-level view, updated when a lane changes. Per-tool inventories live
+in [features](docs/features.md) and
+[language coverage](docs/language-coverage.md). Today the edit-time lane carries
+45+ runner modules over 35+ file kinds, and the LSP lane speaks to a dozen-plus
+language servers.
+
+The gating box is an abstraction, not a call order. Freshness covers several
+independent mechanisms: path freshness against scan time, past-EOF line checks,
+and forward-import dependency drift. Dispositions are one more filter alongside
+them, not a second stage every finding walks through. Read the box as "a finding
+passes the gates that apply to it", and see `clients/finding-delivery-gate.ts`
+for the per-surface contract.
+
 ## Install
 
 ```bash
@@ -213,11 +319,19 @@ Thanks goes to these wonderful people:
     </tr>
     <tr>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/pppobear"><img src="https://avatars.githubusercontent.com/u/21952175?v=4" width="100px;" alt=""/><br /><sub><b>pppobear</b></sub></a><br /><a href="#bug-pppobear" title="Bug reports">🐛</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/bcachet"><img src="https://avatars.githubusercontent.com/u/45542?v=4" width="100px;" alt=""/><br /><sub><b>Bertrand Cachet</b></sub></a><br /><a href="#code-bcachet" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/EarthChen"><img src="https://avatars.githubusercontent.com/u/20179425?v=4" width="100px;" alt=""/><br /><sub><b>earthchen</b></sub></a><br /><a href="#code-EarthChen" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/Don-Yin"><img src="https://avatars.githubusercontent.com/u/65135356?v=4" width="100px;" alt=""/><br /><sub><b>Don Yin</b></sub></a><br /><a href="#code-Don-Yin" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/ELA718"><img src="https://avatars.githubusercontent.com/u/193304463?v=4" width="100px;" alt=""/><br /><sub><b>ELA718</b></sub></a><br /><a href="#doc-ELA718" title="Documentation">📖</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/sujeito-operator/pilot"><img src="https://avatars.githubusercontent.com/u/313599463?v=4" width="100px;" alt=""/><br /><sub><b>Sujeito Operator</b></sub></a><br /><a href="#code-sujeito-operator" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="http://www.blahs.life/"><img src="https://avatars.githubusercontent.com/u/620336?v=4" width="100px;" alt=""/><br /><sub><b>Dan Blah</b></sub></a><br /><a href="#bug-danblah" title="Bug reports">🐛</a></td>
+    </tr>
+    <tr>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/3choBoomer"><img src="https://avatars.githubusercontent.com/u/521828?v=4" width="100px;" alt=""/><br /><sub><b>Nathan Cooke</b></sub></a><br /><a href="#code-3choBoomer" title="Code">💻</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/white-hat"><img src="https://avatars.githubusercontent.com/u/922988?v=4" width="100px;" alt=""/><br /><sub><b>Eli Stark</b></sub></a><br /><a href="#code-white-hat" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/marvtub"><img src="https://avatars.githubusercontent.com/u/33159023?v=4" width="100px;" alt=""/><br /><sub><b>Marvin Aziz</b></sub></a><br /><a href="#code-marvtub" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/mjfaga"><img src="https://avatars.githubusercontent.com/u/7584015?v=4" width="100px;" alt=""/><br /><sub><b>Mark Faga</b></sub></a><br /><a href="#code-mjfaga" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/aeturnal"><img src="https://avatars.githubusercontent.com/u/219271200?v=4" width="100px;" alt=""/><br /><sub><b>aeturnal</b></sub></a><br /><a href="#code-aeturnal" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://marvinaziz.de/"><img src="https://avatars.githubusercontent.com/u/33159023?v=4" width="100px;" alt=""/><br /><sub><b>Marvin Aziz</b></sub></a><br /><a href="#code-marvtub" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/mjfaga"><img src="https://avatars.githubusercontent.com/u/7584015?v=4" width="100px;" alt=""/><br /><sub><b>Mark</b></sub></a><br /><a href="#code-mjfaga" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://aeturnal.io/"><img src="https://avatars.githubusercontent.com/u/219271200?v=4" width="100px;" alt=""/><br /><sub><b>aeturnal</b></sub></a><br /><a href="#code-aeturnal" title="Code">💻</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/floatGray"><img src="https://avatars.githubusercontent.com/u/44295302?v=4" width="100px;" alt=""/><br /><sub><b>floatGray</b></sub></a><br /><a href="#code-floatGray" title="Code">💻</a></td>
     </tr>
   </tbody>

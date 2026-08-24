@@ -11,9 +11,10 @@
  */
 
 import * as fs from "node:fs";
+import { incrementDegradationCount } from "./degradation-ledger.js";
 import { createFileTime, type FileTime } from "./file-time.js";
 import { hashDiagnosticContent } from "./lsp/diagnostic-binding.js";
-import { normalizeFilePath } from "./path-utils.js";
+import { normalizeEphemeralMapKey, normalizeFilePath } from "./path-utils.js";
 import { logReadGuardEvent } from "./read-guard-logger.js";
 
 // --- Types ---
@@ -36,6 +37,12 @@ export interface ReadRecord {
 	/** 1-indexed line → content hash captured at read time, used to ignore no-op mtime staleness. */
 	lineHashes?: Record<number, string>;
 	contentBinding?: ReadContentBinding;
+	/**
+	 * Set when the record came from a search hit rather than a real read (#1904).
+	 * States how many context lines were credited around the hit and why, so the
+	 * ledger shows whether coverage rests on lines the model saw or on slack.
+	 */
+	searchCredit?: SearchCredit;
 	turnIndex: number;
 	writeIndex: number;
 	timestamp: number;
@@ -46,6 +53,38 @@ export interface ReadRecord {
 	 */
 	source?: string;
 }
+
+/**
+ * Why a search-hit read credited the lines it did.
+ *  - `match-lines-only`: bare hit; only the printed match lines are credited.
+ *  - `delivered-context-flags`: the search command printed context (grep
+ *    `-A`/`-B`/`-C`), so those lines were delivered and are credited.
+ *  - `caller-margin`: the caller asked for explicit extra slack.
+ */
+export type SearchCreditReason =
+	| "match-lines-only"
+	| "delivered-context-flags"
+	| "caller-margin";
+
+export interface SearchCredit {
+	marginBefore: number;
+	marginAfter: number;
+	reason: SearchCreditReason;
+}
+
+/**
+ * The caller's actual handling of a range-snapshot verdict (#1904 item 1).
+ *  - `enforced-block`: the verdict blocked the edit.
+ *  - `bypassed-content-match`: the verdict said block, but the caller passed
+ *    `skipSnapshotCheck` because the edit was content-validated (oldText).
+ *  - `enforced-pass`: a hash-checked read matched, so the edit passed the gate.
+ *  - `not-decidable`: no candidate read could be hash-checked.
+ */
+export type RangeSnapshotOutcome =
+	| "enforced-block"
+	| "bypassed-content-match"
+	| "enforced-pass"
+	| "not-decidable";
 
 export interface ReadContentBinding {
 	hash: string;
@@ -159,6 +198,96 @@ const READ_HASH_MAX_LINES = Math.max(
  */
 const READ_BINDING_MAX_BYTES = 4 * 1024 * 1024;
 const READ_GUARD_MAX_FILES = 256;
+/**
+ * #1904 item 3: `enforceFileCap` bounds how many FILES the store holds, not how
+ * many records each file holds. One hot file reached 268 hash-bearing records in
+ * 75 minutes, and every record carries a `lineHashes` map, so a long session on
+ * a few files grows without bound. Cap records per file and drop oldest-first.
+ *
+ * Eviction is safe in the blocking direction: it narrows the staleness-rescue
+ * path — a stale edit rescued by an older snapshot that still matches — and can
+ * turn an allow into a "re-read and retry" block. It never turns a block into
+ * an allow. See `enforceRecordCapForFile` for which records go first, and why
+ * age alone is the wrong order.
+ */
+const READ_GUARD_MAX_RECORDS_PER_FILE = 128;
+
+/**
+ * Session-lifetime running totals for one file's record-cap trims (#1913
+ * review F1). Owned per-`ReadGuard`-instance, so it re-arms automatically at
+ * `session_start` along with `this.reads`/`this.edits` — no separate reset to
+ * wire and forget. Queryable via `getTrimStats` even after logging stops
+ * re-emitting (see `recordRead`'s trim block).
+ */
+export interface FileTrimStats {
+	totalEvicted: number;
+	evictedCreditCount: number;
+	evictedGenuineCount: number;
+	trimEventCount: number;
+}
+
+/**
+ * Trim a single file's read list to the per-file cap. Returns how many records
+ * were dropped so the ledger can show the trim.
+ *
+ * Eviction is NOT purely by age. The shape that overflows this cap is
+ * read-once-then-grep-often: one whole-file read followed by hundreds of cheap
+ * search credits. Pure age order evicts that whole-file read first, and it is
+ * the record `canIgnoreStalenessByHashes` needs to rescue an edit after an
+ * unrelated mtime touch. So spend the search credits first, oldest among them
+ * first, and only fall through to genuine reads when the credits run out.
+ * Genuine reads are then evicted oldest-first as before.
+ *
+ * Records are trimmed IN PLACE: `EditRecord.precedingReads` holds a reference
+ * to this same array, so a replacement array would silently detach it.
+ */
+interface RecordCapTrimResult {
+	evictedCount: number;
+	/** Of `evictedCount`, how many were search-credit records (spent first). */
+	evictedCreditCount: number;
+	/** Of `evictedCount`, how many were genuine (non-credit) reads. */
+	evictedGenuineCount: number;
+}
+
+const NO_TRIM: RecordCapTrimResult = {
+	evictedCount: 0,
+	evictedCreditCount: 0,
+	evictedGenuineCount: 0,
+};
+
+function enforceRecordCapForFile(records: ReadRecord[]): RecordCapTrimResult {
+	if (records.length <= READ_GUARD_MAX_RECORDS_PER_FILE) return NO_TRIM;
+	const excess = records.length - READ_GUARD_MAX_RECORDS_PER_FILE;
+	const evicted = new Set<number>();
+	let evictedCreditCount = 0;
+	for (let i = 0; i < records.length && evicted.size < excess; i++) {
+		if (records[i].searchCredit !== undefined) {
+			evicted.add(i);
+			evictedCreditCount++;
+		}
+	}
+	for (let i = 0; i < records.length && evicted.size < excess; i++) {
+		evicted.add(i);
+	}
+	const kept = records.filter((_, i) => !evicted.has(i));
+	records.length = 0;
+	for (const record of kept) records.push(record);
+	return {
+		evictedCount: excess,
+		evictedCreditCount,
+		evictedGenuineCount: excess - evictedCreditCount,
+	};
+}
+
+/**
+ * #1904 class sweep: `this.edits` is the same shape as `this.reads` — a
+ * per-file array that only ever grows. Its cap sits far above every consumer's
+ * reach, so trimming is inert: `canTreatStalenessAsOwnPriorEdit` reads only the
+ * last record, and `findRelocation`'s window saturates at
+ * RELOCATION_WINDOW_MAX / RELOCATION_WINDOW_PER_EDIT (20) applied edits. Only
+ * `getStats`, a debug surface, sees the older records at all.
+ */
+const READ_GUARD_MAX_EDITS_PER_FILE = 256;
 // Unconsumed reads remain valid until edit or session end, but this high
 // sanity cap prevents a read-only session from growing without bound.
 const READ_GUARD_MAX_UNCONSUMED_FILES = 4096;
@@ -385,7 +514,10 @@ export class ReadGuard {
 	private readonly reads = new Map<string, ReadRecord[]>();
 	private readonly edits = new Map<string, EditRecord[]>();
 	private readonly fileLastUsed = new Map<string, number>();
-	private readonly fileIdleTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	private readonly fileIdleTimers = new Map<
+		string,
+		ReturnType<typeof setTimeout>
+	>();
 	/** Reads remain behavior-gating until the corresponding edit is published. */
 	private readonly consumedReadFiles = new Set<string>();
 	private readonly fileTime: FileTime;
@@ -399,6 +531,25 @@ export class ReadGuard {
 	// pi Write tool authored, independent of filesystem mtime granularity
 	// or clock skew (NFS, FAT32, etc.).
 	private readonly writtenThisSession = new Set<string>();
+	// Existence-independent index for hasKnownPath/forgetPath (#1668 review
+	// F1). `this.key()` (normalizeFilePath) branches on whether `filePath`
+	// currently exists on disk: an existing file resolves to realpathSync
+	// canonical casing, a missing one to a lowercased tail. recordRead/
+	// recordWritten always key while the file is still on disk (real
+	// casing); hasKnownPath/forgetPath are queried AFTER an external delete
+	// already landed, when the path no longer exists — recomputing
+	// `this.key()` at that point returns a DIFFERENT string for any
+	// mixed-case basename (`MyModule.ts` → `mymodule.ts`), so a lookup
+	// against `reads`/`writtenThisSession` silently misses. This index maps
+	// a purely syntactic key (`normalizeEphemeralMapKey` — slash-fold +
+	// lowercase, no filesystem access, so it never depends on current disk
+	// state) to the REAL key `reads`/`writtenThisSession` used at record
+	// time, so a post-delete lookup finds the same entry regardless of what
+	// happened to the file since. Pruned inside `evictFile` so it never
+	// outlives the record it points at.
+	private readonly knownPathIndex = new Map<string, string>();
+	/** Running per-file record-cap trim totals for this session (#1913 F1). */
+	private readonly trimAccumulators = new Map<string, FileTrimStats>();
 	private readonly sessionId: string;
 	private readonly sessionStartMs: number;
 
@@ -424,8 +575,13 @@ export class ReadGuard {
 	}
 
 	private idleEvictMs(): number {
-		const value = Number.parseInt(process.env.PI_LENS_READ_GUARD_IDLE_EVICT_MS ?? "", 10);
-		return Number.isSafeInteger(value) && value > 0 ? value : READ_GUARD_IDLE_EVICT_MS_DEFAULT;
+		const value = Number.parseInt(
+			process.env.PI_LENS_READ_GUARD_IDLE_EVICT_MS ?? "",
+			10,
+		);
+		return Number.isSafeInteger(value) && value > 0
+			? value
+			: READ_GUARD_IDLE_EVICT_MS_DEFAULT;
 	}
 
 	private clearFileTimer(filePath: string): void {
@@ -441,6 +597,11 @@ export class ReadGuard {
 		this.fileLastUsed.delete(filePath);
 		this.consumedReadFiles.delete(filePath);
 		this.writtenThisSession.delete(filePath);
+		// #1668 review F1: prune the reverse-pointing knownPathIndex entries
+		// too, so it never outlives the record it points at.
+		for (const [syntacticKey, stored] of this.knownPathIndex) {
+			if (stored === filePath) this.knownPathIndex.delete(syntacticKey);
+		}
 	}
 
 	private touchFile(filePath: string): void {
@@ -449,13 +610,15 @@ export class ReadGuard {
 		this.clearFileTimer(filePath);
 		// An outstanding read is enforcement state, not a rebuildable cache entry.
 		// It must survive idle time and file-cap pressure until the edit consumes it.
-		if (this.reads.has(filePath) && !this.consumedReadFiles.has(filePath)) return;
+		if (this.reads.has(filePath) && !this.consumedReadFiles.has(filePath))
+			return;
 		const stamp = now;
 		const timer = setTimeout(() => {
 			if (this.fileLastUsed.get(filePath) !== stamp) return;
 			// Never turn an outstanding read into a zero-read block through idle
 			// eviction. Only consumed reads and rebuildable edit history may expire.
-			if (this.reads.has(filePath) && !this.consumedReadFiles.has(filePath)) return;
+			if (this.reads.has(filePath) && !this.consumedReadFiles.has(filePath))
+				return;
 			this.evictFile(filePath);
 		}, this.idleEvictMs());
 		timer.unref?.();
@@ -466,7 +629,10 @@ export class ReadGuard {
 		while (this.reads.size > READ_GUARD_MAX_FILES) {
 			const victim = [...this.reads.keys()]
 				.filter((filePath) => this.consumedReadFiles.has(filePath))
-				.sort((a, b) => (this.fileLastUsed.get(a) ?? 0) - (this.fileLastUsed.get(b) ?? 0))[0];
+				.sort(
+					(a, b) =>
+						(this.fileLastUsed.get(a) ?? 0) - (this.fileLastUsed.get(b) ?? 0),
+				)[0];
 			if (!victim) break;
 			this.evictFile(victim);
 		}
@@ -475,8 +641,7 @@ export class ReadGuard {
 				.filter((filePath) => !this.consumedReadFiles.has(filePath))
 				.sort(
 					(a, b) =>
-						(this.fileLastUsed.get(a) ?? 0) -
-						(this.fileLastUsed.get(b) ?? 0),
+						(this.fileLastUsed.get(a) ?? 0) - (this.fileLastUsed.get(b) ?? 0),
 				)[0];
 			if (!victim) break;
 			// This is a normal read miss: a later edit must require a fresh read,
@@ -493,6 +658,14 @@ export class ReadGuard {
 	 */
 	recordRead(record: ReadRecord): void {
 		const filePath = this.key(record.filePath);
+		// #1668 review F1: index by the existence-independent syntactic key
+		// while the file is (presumably) still on disk, so a later
+		// hasKnownPath/forgetPath lookup after an external delete can still
+		// find this entry's real key.
+		this.knownPathIndex.set(
+			normalizeEphemeralMapKey(record.filePath),
+			filePath,
+		);
 		const storedRecord: ReadRecord = {
 			...record,
 			filePath,
@@ -508,6 +681,15 @@ export class ReadGuard {
 		this.consumedReadFiles.delete(storedRecord.filePath);
 		arr.push(storedRecord);
 		this.reads.set(storedRecord.filePath, arr);
+		// Capture BEFORE the trim: `readCountForFile` saturates at the cap once
+		// eviction starts, so it stops showing growth. `rawReadCountForFile` keeps
+		// the real arrival count observable alongside `evictedRecordCount`.
+		const rawReadCountForFile = arr.length;
+		const {
+			evictedCount: evictedRecordCount,
+			evictedCreditCount,
+			evictedGenuineCount,
+		} = enforceRecordCapForFile(arr);
 		this.touchFile(storedRecord.filePath);
 		this.enforceFileCap();
 
@@ -532,8 +714,76 @@ export class ReadGuard {
 				...(storedRecord.source !== undefined && {
 					source: storedRecord.source,
 				}),
+				...(storedRecord.searchCredit !== undefined && {
+					searchCreditReason: storedRecord.searchCredit.reason,
+					searchCreditMarginBefore: storedRecord.searchCredit.marginBefore,
+					searchCreditMarginAfter: storedRecord.searchCredit.marginAfter,
+				}),
+				...(evictedRecordCount > 0 && {
+					evictedRecordCount,
+					rawReadCountForFile,
+				}),
 			},
 		});
+
+		// #1913: the eviction counters above ride `read_recorded`, which is
+		// gated behind PI_LENS_READ_GUARD_VERBOSE — off by default. That left a
+		// live eviction regression with no trace at default verbosity.
+		//
+		// review F1: a naive "emit every trim" fix floods read-guard.log once a
+		// hot file sits past the cap — every later push trims exactly 1 record
+		// (the array is always AT the cap before the push, so `excess` is
+		// always exactly 1), so 300 recordRead calls on one file is ~172
+		// identical always-on lines, and can rotate `edit_blocked` records out
+		// of the 1MB cap. `rawReadCountForFile` also freezes at cap+1 forever,
+		// so a raw per-trim record can't even discriminate thrash severity.
+		//
+		// Fix: emit the read-guard.log line ONCE per file per session, on the
+		// FIRST trim only. `trimAccumulators` still updates on every trim,
+		// queryable via `getTrimStats` — the running totals a health surface or
+		// a future emission point would need are never lost, even though
+		// read-guard.log stops re-announcing them. "Have we already logged
+		// this file's first trim" routes through the degradation ledger's own
+		// rising-edge tally (`incrementDegradationCount` — the pattern
+		// CLAUDE.md names for repeated degradations) instead of a hand-rolled
+		// per-file Set; subsequent trims still call it, so the ledger's own
+		// entry for this (kind, subject) keeps its reason text and count
+		// current for the health/degradation summary even after read-guard.log
+		// goes quiet.
+		if (evictedRecordCount > 0) {
+			const key = storedRecord.filePath;
+			const acc = this.trimAccumulators.get(key) ?? {
+				totalEvicted: 0,
+				evictedCreditCount: 0,
+				evictedGenuineCount: 0,
+				trimEventCount: 0,
+			};
+			acc.totalEvicted += evictedRecordCount;
+			acc.evictedCreditCount += evictedCreditCount;
+			acc.evictedGenuineCount += evictedGenuineCount;
+			acc.trimEventCount += 1;
+			this.trimAccumulators.set(key, acc);
+
+			const isRisingEdge = incrementDegradationCount({
+				kind: "read-guard-record-cap-trim",
+				subject: key,
+				reason: `trim #${acc.trimEventCount}: evicted ${evictedRecordCount} (credit ${evictedCreditCount}, genuine ${evictedGenuineCount})`,
+			});
+			if (isRisingEdge) {
+				logReadGuardEvent({
+					event: "read_cap_trimmed",
+					sessionId: this.sessionId,
+					filePath: storedRecord.filePath,
+					metadata: {
+						trimEventCount: acc.trimEventCount,
+						evictedRecordCount: acc.totalEvicted,
+						evictedCreditCount: acc.evictedCreditCount,
+						evictedGenuineCount: acc.evictedGenuineCount,
+						rawReadCountForFile,
+					},
+				});
+			}
+		}
 
 		// Also update FileTime stamp for this file
 		this.fileTime.read(storedRecord.filePath);
@@ -592,7 +842,8 @@ export class ReadGuard {
 		// Canonicalize once: every map lookup below (and every private helper this
 		// passes filePath to) must agree with how recordRead keyed the read.
 		filePath = this.key(filePath);
-		if (this.reads.has(filePath) || this.edits.has(filePath)) this.touchFile(filePath);
+		if (this.reads.has(filePath) || this.edits.has(filePath))
+			this.touchFile(filePath);
 
 		// Check exemptions
 		if (this.exemptions.has(filePath)) {
@@ -671,9 +922,18 @@ export class ReadGuard {
 		// 2. FileTime check (actual staleness)
 		let ignoredOwnEditStaleness = false;
 		let ignoredHashStaleness = false;
+		let ignoredOldTextResolvedStaleness = false;
 		if (this.fileTime.hasChanged(filePath)) {
 			const lastRead = fileReads[fileReads.length - 1];
-			if (this.canTreatStalenessAsOwnPriorEdit(filePath, lastRead.timestamp)) {
+			if (options?.oldTextResolved === true) {
+				// The host-facing preflight sets this only after oldText resolves to
+				// exactly one span in the live bytes. That content evidence is newer
+				// and stronger than FileTime's coarse external-write signal, matching
+				// the skipSnapshotCheck exception at the later range-stale gate.
+				ignoredOldTextResolvedStaleness = true;
+			} else if (
+				this.canTreatStalenessAsOwnPriorEdit(filePath, lastRead.timestamp)
+			) {
 				ignoredOwnEditStaleness = true;
 			} else if (
 				this.canIgnoreStalenessByHashes(
@@ -717,7 +977,11 @@ export class ReadGuard {
 
 		let viaSymbol = false;
 		for (const range of rangesToCheck) {
-			const snapshotValidation = this.validateRangeSnapshot(filePath, range);
+			const snapshotValidation = this.validateRangeSnapshot(
+				filePath,
+				range,
+				!!options?.skipSnapshotCheck,
+			);
 			const coverage = this.checkCoverage(filePath, range);
 			if (!coverage.covered) {
 				const lastRead = fileReads[fileReads.length - 1];
@@ -823,10 +1087,15 @@ export class ReadGuard {
 
 		const verdict = this.allow();
 		this.recordVerdict(filePath, "edit", touchedLines, verdict, {
-			reasonKind: viaSymbol ? "symbol_coverage" : "range_coverage",
+			reasonKind: ignoredOldTextResolvedStaleness
+				? "file_modified_oldtext_unique"
+				: viaSymbol
+					? "symbol_coverage"
+					: "range_coverage",
 			viaSymbol,
 			ignoredOwnEditStaleness,
 			ignoredHashStaleness,
+			oldTextResolved: ignoredOldTextResolvedStaleness,
 		});
 		return verdict;
 	}
@@ -841,6 +1110,48 @@ export class ReadGuard {
 		} catch {
 			return true; // Assume new if we can't stat
 		}
+	}
+
+	/**
+	 * Whether pi-lens has any record of this path from a read or write this
+	 * session (#1668). Gates external-delete detection: a path pi-lens never
+	 * read or wrote is one no LSP server's cache was ever told about through
+	 * us, so an `rm` naming it carries no signal worth checking disk for —
+	 * this is a lookup against state already being tracked, never a fresh
+	 * filesystem stat over an unbounded path set.
+	 *
+	 * MUST go through `knownPathIndex`, not `this.key(filePath)` directly
+	 * (#1668 review F1): this is called AFTER a bash delete has already
+	 * landed, when `filePath` no longer exists — `this.key()` at that point
+	 * returns a lowercased-tail key, not the real-casing key `recordRead`/
+	 * `recordWritten` stored while the file was still on disk. For a
+	 * mixed-case basename (`MyModule.ts`) the two keys differ and a direct
+	 * `this.key()` lookup always misses.
+	 */
+	hasKnownPath(filePath: string): boolean {
+		const stored = this.knownPathIndex.get(normalizeEphemeralMapKey(filePath));
+		return (
+			stored !== undefined &&
+			(this.reads.has(stored) || this.writtenThisSession.has(stored))
+		);
+	}
+
+	/**
+	 * Drop all record of a path pi-lens confirmed no longer exists on disk
+	 * (#1668, external delete). Without this a later write reusing the same
+	 * path would inherit a stale writtenThisSession/reads entry from before
+	 * the delete, and a repeat `rm` of the same already-gone path would keep
+	 * matching {@link hasKnownPath} and re-emitting a type-3 notification.
+	 *
+	 * MUST evict through `knownPathIndex`, not `this.key(filePath)` directly
+	 * (#1668 review F1) — same reasoning as {@link hasKnownPath}: `filePath`
+	 * is already gone from disk by the time this runs, so recomputing
+	 * `this.key()` targets the wrong (lowercased-tail) key for a mixed-case
+	 * basename and leaves the real entry behind un-evicted.
+	 */
+	forgetPath(filePath: string): void {
+		const stored = this.knownPathIndex.get(normalizeEphemeralMapKey(filePath));
+		this.evictFile(stored ?? this.key(filePath));
 	}
 
 	/**
@@ -862,8 +1173,12 @@ export class ReadGuard {
 	 * Call this from the tool_result handler so the next checkEdit on the same
 	 * file doesn't see "file_modified" caused by our own previous edit.
 	 */
-	recordWritten(filePath: string): void {
-		filePath = this.key(filePath);
+	recordWritten(rawFilePath: string): void {
+		const filePath = this.key(rawFilePath);
+		// #1668 review F1: index by the existence-independent syntactic key
+		// (see `knownPathIndex`) so a later hasKnownPath/forgetPath lookup
+		// after an external delete can still find this entry's real key.
+		this.knownPathIndex.set(normalizeEphemeralMapKey(rawFilePath), filePath);
 		this.fileTime.read(filePath);
 		this.writtenThisSession.add(filePath);
 		if (this.reads.has(filePath)) this.consumedReadFiles.add(filePath);
@@ -953,6 +1268,19 @@ export class ReadGuard {
 		const key = this.key(filePath);
 		if (this.reads.has(key)) this.touchFile(key);
 		return this.reads.get(key) ?? [];
+	}
+
+	/**
+	 * Session-lifetime record-cap trim totals for a file (#1913 review F1).
+	 * `recordRead` only writes ONE `read_cap_trimmed` read-guard.log line per
+	 * file per session (on the first trim), so this is the running-totals
+	 * surface for everything after that — the exact split this class already
+	 * computes on every trim, not re-derivable from `getReadHistory` alone
+	 * (which only shows the SURVIVING records, not what was evicted).
+	 */
+	getTrimStats(filePath: string): FileTrimStats | undefined {
+		const stats = this.trimAccumulators.get(this.key(filePath));
+		return stats ? { ...stats } : undefined;
 	}
 
 	/**
@@ -1145,6 +1473,12 @@ export class ReadGuard {
 	private validateRangeSnapshot(
 		filePath: string,
 		range: [number, number],
+		/**
+		 * What the CALLER will do with the verdict. `checkEdit` honours
+		 * `skipSnapshotCheck` for content-validated (oldText) edits, so a
+		 * `shouldBlock` verdict may never reach the gate (#1904 item 1).
+		 */
+		snapshotCheckSkipped: boolean,
 	): {
 		status: "match" | "mismatch" | "unavailable";
 		matchingReadIndex: number;
@@ -1217,6 +1551,18 @@ export class ReadGuard {
 			checkedCandidateCount > 0 &&
 			hashUnavailableCandidateCount === 0;
 
+		// `enforced` below states INTENT — whether this validation reached a
+		// decidable verdict. It says nothing about what the caller did with it.
+		// `outcome` states the caller's actual behaviour, which is what an
+		// enforcement rate must be computed from (#1904 item 1).
+		const outcome: RangeSnapshotOutcome = shouldBlock
+			? snapshotCheckSkipped
+				? "bypassed-content-match"
+				: "enforced-block"
+			: status === "match"
+				? "enforced-pass"
+				: "not-decidable";
+
 		logReadGuardEvent({
 			event: "range_snapshot_validation",
 			sessionId: this.sessionId,
@@ -1234,6 +1580,7 @@ export class ReadGuard {
 				missingLines: missingLines.slice(0, 20),
 				mismatchedLines: mismatchedLines.slice(0, 20),
 				enforced: shouldBlock || status === "match",
+				outcome,
 			},
 		});
 
@@ -1503,6 +1850,9 @@ export class ReadGuard {
 			reason: verdict.reason,
 			timestamp: Date.now(),
 		});
+		if (arr.length > READ_GUARD_MAX_EDITS_PER_FILE) {
+			arr.splice(0, arr.length - READ_GUARD_MAX_EDITS_PER_FILE);
+		}
 		this.edits.set(filePath, arr);
 	}
 

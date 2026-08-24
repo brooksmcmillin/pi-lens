@@ -55,9 +55,10 @@ function failureMessage(failure: TestFailure): string {
  */
 const LOCATION_LINE_COL_RE = /:(\d+)(?::(\d+))?$/;
 
-function parseLocation(
-	location: string | undefined,
-): { line?: number; column?: number } {
+function parseLocation(location: string | undefined): {
+	line?: number;
+	column?: number;
+} {
 	if (!location) return {};
 	const match = LOCATION_LINE_COL_RE.exec(location);
 	if (!match) return {};
@@ -135,16 +136,23 @@ export function testRunnerFindingsToProjectDiagnostics(
 			.filter((file) => !fs.existsSync(path.resolve(root, file.path)))
 			.map((file) => advisoryPathKey(file.path, root)),
 	);
-	const historical = cache.superseded === true || cache.stale === true || validation.status !== "current";
+	const historical =
+		cache.superseded === true ||
+		cache.stale === true ||
+		validation.status !== "current";
 	return cache.results
 		.filter((result) => !missingKeys.has(advisoryPathKey(result.file, root)))
 		.flatMap((result) => testResultToProjectDiagnostics(result, historical))
-		.map((diagnostic) => historical ? {
-			...diagnostic,
-			severity: "info" as const,
-			semantic: "none" as const,
-			message: diagnostic.message.startsWith("[stale")
-				? diagnostic.message
-				: `[historical — re-run to confirm] ${diagnostic.message}`,
-		} : diagnostic);
+		.map((diagnostic) =>
+			historical
+				? {
+						...diagnostic,
+						severity: "info" as const,
+						semantic: "none" as const,
+						message: diagnostic.message.startsWith("[stale")
+							? diagnostic.message
+							: `[historical — re-run to confirm] ${diagnostic.message}`,
+					}
+				: diagnostic,
+		);
 }

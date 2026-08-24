@@ -59,10 +59,13 @@ vi.mock("node:fs", async (importOriginal) => {
 	};
 });
 vi.mock("../../clients/source-filter.js", async (importOriginal) => {
-	const actual = await importOriginal<typeof import("../../clients/source-filter.js")>();
+	const actual =
+		await importOriginal<typeof import("../../clients/source-filter.js")>();
 	return {
 		...actual,
-		collectSourceFilesAsync: async (...args: Parameters<typeof actual.collectSourceFilesAsync>) => {
+		collectSourceFilesAsync: async (
+			...args: Parameters<typeof actual.collectSourceFilesAsync>
+		) => {
 			walkCounter.calls += 1;
 			return actual.collectSourceFilesAsync(...args);
 		},
@@ -85,7 +88,11 @@ describe("session-start incremental word-index refresh (#958)", () => {
 	it("reads and refreshes exactly one stale file while reusing the rest", async () => {
 		const env = setupTestEnvironment("pi-lens-word-refresh-stale-");
 		try {
-			const a = createTempFile(env.tmpDir, "src/a.ts", "export const oldZephyr = 1;");
+			const a = createTempFile(
+				env.tmpDir,
+				"src/a.ts",
+				"export const oldZephyr = 1;",
+			);
 			createTempFile(env.tmpDir, "src/b.ts", "export const stableBeta = 2;");
 			createTempFile(env.tmpDir, "src/c.ts", "export const stableGamma = 3;");
 			const index = buildWordIndex(await collectWordIndexDocs(env.tmpDir));
@@ -172,7 +179,9 @@ describe("session-start incremental word-index refresh (#958)", () => {
 			const index = buildWordIndex(await collectWordIndexDocs(env.tmpDir));
 			fs.unlinkSync(deleted);
 
-			expect(await refreshWordIndexIncrementally(index, env.tmpDir)).toMatchObject({
+			expect(
+				await refreshWordIndexIncrementally(index, env.tmpDir),
+			).toMatchObject({
 				refreshed: 0,
 				dropped: 1,
 				reused: 3,
@@ -228,7 +237,11 @@ describe("session-start incremental word-index refresh (#958)", () => {
 			process.env.PI_LENS_MAX_PROJECT_FILES = "2"; // word-index ratio => cap 6
 			_resetProjectScaleBaseForTests();
 			for (let i = 0; i < 5; i++) {
-				createTempFile(env.tmpDir, `src/f${i}.ts`, `export const value${i} = ${i};`);
+				createTempFile(
+					env.tmpDir,
+					`src/f${i}.ts`,
+					`export const value${i} = ${i};`,
+				);
 			}
 			const index = buildWordIndex(await collectWordIndexDocs(env.tmpDir));
 			expect(index.truncated).toBe(false);
@@ -253,7 +266,11 @@ describe("session-start incremental word-index refresh (#958)", () => {
 	// stays far from its own crossover and cannot mask either direction.
 	function makeRatioBoundaryFixture(tmpDir: string): string[] {
 		return Array.from({ length: 200 }, (_, i) =>
-			createTempFile(tmpDir, `src/f${i}.ts`, `export const original${i} = ${i};`),
+			createTempFile(
+				tmpDir,
+				`src/f${i}.ts`,
+				`export const original${i} = ${i};`,
+			),
 		);
 	}
 
@@ -419,7 +436,11 @@ describe("session-start incremental word-index refresh (#958)", () => {
 		const env = setupTestEnvironment("pi-lens-word-refresh-reuse-preflight-");
 		try {
 			const files = Array.from({ length: 100 }, (_, i) =>
-				createTempFile(env.tmpDir, `src/f${i}.ts`, `export const original${i} = ${i};`),
+				createTempFile(
+					env.tmpDir,
+					`src/f${i}.ts`,
+					`export const original${i} = ${i};`,
+				),
 			);
 			const index = buildWordIndex(await collectWordIndexDocs(env.tmpDir));
 			const future = new Date(Date.now() + 2_000);
@@ -431,7 +452,11 @@ describe("session-start incremental word-index refresh (#958)", () => {
 			expect(result.mode).toBe("full-required");
 			if (result.mode !== "full-required") throw new Error("expected rebuild");
 			const afterPreflightWalks = walkCounter.calls;
-			const docs = await collectWordIndexDocs(env.tmpDir, () => true, result.preflightFiles);
+			const docs = await collectWordIndexDocs(
+				env.tmpDir,
+				() => true,
+				result.preflightFiles,
+			);
 			expect(docs).toHaveLength(100);
 			expect(walkCounter.calls).toBe(afterPreflightWalks);
 		} finally {
@@ -443,7 +468,11 @@ describe("session-start incremental word-index refresh (#958)", () => {
 		const env = setupTestEnvironment("pi-lens-word-refresh-stale-window-");
 		try {
 			const files = Array.from({ length: 100 }, (_, i) =>
-				createTempFile(env.tmpDir, `src/f${i}.ts`, `export const original${i} = ${i};`),
+				createTempFile(
+					env.tmpDir,
+					`src/f${i}.ts`,
+					`export const original${i} = ${i};`,
+				),
 			);
 			const index = buildWordIndex(await collectWordIndexDocs(env.tmpDir));
 			const preflightMtime = new Date(Date.now() + 2_000);
@@ -461,14 +490,20 @@ describe("session-start incremental word-index refresh (#958)", () => {
 			fs.writeFileSync(target, "export const changedAfterWalk = 1;\n", "utf8");
 			fs.utimesSync(target, readMtime, readMtime);
 			const rebuilt = buildWordIndex(
-				await collectWordIndexDocs(env.tmpDir, () => true, result.preflightFiles),
+				await collectWordIndexDocs(
+					env.tmpDir,
+					() => true,
+					result.preflightFiles,
+				),
 			);
 			expect(rebuilt.fileMtimes?.get(target)).toBe(fs.statSync(target).mtimeMs);
 
 			const nextMtime = new Date(readMtime.getTime() + 2_000);
 			fs.writeFileSync(target, "export const changedAgain = 2;\n", "utf8");
 			fs.utimesSync(target, nextMtime, nextMtime);
-			await expect(refreshWordIndexIncrementally(rebuilt, env.tmpDir)).resolves.toMatchObject({
+			await expect(
+				refreshWordIndexIncrementally(rebuilt, env.tmpDir),
+			).resolves.toMatchObject({
 				mode: "incremental",
 				refreshed: 1,
 			});

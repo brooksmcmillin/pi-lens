@@ -67,6 +67,27 @@ const x = risky();
 This is the same convention every runner/profile honors, so a suppression is
 portable, git-tracked, and visible in review — not private pi-lens metadata.
 
+## Dual-scanner secrets need two marks
+
+gitleaks and trivy scan for secrets independently. When both flag the same
+credential on the same line, each finding gets its own anchor (`tool` +
+`rule` differ: `gitleaks:<ruleId>` vs `trivy-secret:<ruleId>`), so one
+`lens_diagnostic_mark` call clears only one of the two copies. The 🔴 STOP
+blocker stays up, citing the still-unmarked copy, until both are marked
+false-positive.
+
+This is deliberate defense-in-depth, not a bug: a real credential that one
+scanner misses still blocks. It is also strictly better than before #1691,
+when the trivy copy of a corroborated finding had no anchor at all and could
+never be cleared. Expect to call `lens_diagnostic_mark` twice — once per
+`tool` — when `lens_diagnostics` shows the same line flagged under both
+`gitleaks` and `trivy`.
+
+The 🔴 STOP line's own bracket names which scanners still hold the finding —
+`[gitleaks + trivy]` before either mark, narrowing to `[trivy]` after the
+gitleaks copy clears — so a shrinking bracket, not a vanished blocker, is the
+signal that one copy remains.
+
 ## Telemetry
 
 Every mark (including in-memory `defer`) is appended as NDJSON to

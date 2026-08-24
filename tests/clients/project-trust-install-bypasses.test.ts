@@ -1,7 +1,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { setProjectTrustState, resetProjectTrust } from "../../clients/project-trust.js";
+import {
+	setProjectTrustState,
+	resetProjectTrust,
+} from "../../clients/project-trust.js";
 import { setupTestEnvironment } from "./test-utils.js";
 import {
 	getDegradationSummary,
@@ -27,13 +30,22 @@ afterEach(() => resetProjectTrust());
 
 describe("central project-trust install gate (#1334 review)", () => {
 	it("gates formatter gem/rustup lazy installs and permits them when trusted", async () => {
-		const { tryLazyInstallFormatterTool } = await import("../../clients/formatters.js");
+		const { tryLazyInstallFormatterTool } =
+			await import("../../clients/formatters.js");
 		setProjectTrustState("untrusted");
-		expect(await tryLazyInstallFormatterTool("rubocop", "/trust/fmt-blocked")).toBe(false);
+		expect(
+			await tryLazyInstallFormatterTool("rubocop", "/trust/fmt-blocked"),
+		).toBe(false);
 		expect(safeSpawnAsync).not.toHaveBeenCalled();
 		setProjectTrustState("trusted");
-		expect(await tryLazyInstallFormatterTool("rubocop", "/trust/fmt-allowed")).toBe(true);
-		expect(safeSpawnAsync).toHaveBeenCalledWith("gem", expect.any(Array), expect.any(Object));
+		expect(
+			await tryLazyInstallFormatterTool("rubocop", "/trust/fmt-allowed"),
+		).toBe(true);
+		expect(safeSpawnAsync).toHaveBeenCalledWith(
+			"gem",
+			expect.any(Array),
+			expect.any(Object),
+		);
 	});
 
 	it("treats an install-capable formatter npx fallback as unavailable", async () => {
@@ -42,9 +54,19 @@ describe("central project-trust install gate (#1334 review)", () => {
 			const file = path.join(env.tmpDir, "x.ts");
 			fs.writeFileSync(file, "const x = 1;\n");
 			const { formatFile } = await import("../../clients/formatters.js");
-			const formatter = { name: "npx-test", command: ["npx", "pkg", "$FILE"], extensions: [".ts"], async detect() { return true; } };
+			const formatter = {
+				name: "npx-test",
+				command: ["npx", "pkg", "$FILE"],
+				extensions: [".ts"],
+				async detect() {
+					return true;
+				},
+			};
 			setProjectTrustState("untrusted");
-			expect(await formatFile(file, formatter)).toEqual({ success: true, changed: false });
+			expect(await formatFile(file, formatter)).toEqual({
+				success: true,
+				changed: false,
+			});
 			// #1366 review: ONE ledger entry per user-visible degradation — the
 			// trust seam records it (with the formatter context); the formatter
 			// site must not add a second kind for the same event.
@@ -58,25 +80,42 @@ describe("central project-trust install gate (#1334 review)", () => {
 			expect(safeSpawnAsync).not.toHaveBeenCalled();
 			setProjectTrustState("trusted");
 			await formatFile(file, formatter);
-			expect(safeSpawnAsync).toHaveBeenCalledWith("npx", expect.any(Array), expect.any(Object));
-		} finally { env.cleanup(); }
+			expect(safeSpawnAsync).toHaveBeenCalledWith(
+				"npx",
+				expect.any(Array),
+				expect.any(Object),
+			);
+		} finally {
+			env.cleanup();
+		}
 	});
 
 	it("gates the runner lazy-installer seam and permits it when trusted", async () => {
-		const { tryLazyInstall } = await import("../../clients/dispatch/runners/utils/lazy-installer.js");
+		const { tryLazyInstall } =
+			await import("../../clients/dispatch/runners/utils/lazy-installer.js");
 		setProjectTrustState("untrusted");
-		expect(await tryLazyInstall("rust-clippy", "/trust/lazy-blocked")).toBe(false);
+		expect(await tryLazyInstall("rust-clippy", "/trust/lazy-blocked")).toBe(
+			false,
+		);
 		expect(safeSpawnAsync).not.toHaveBeenCalled();
 		setProjectTrustState("trusted");
-		expect(await tryLazyInstall("rust-clippy", "/trust/lazy-allowed")).toBe(true);
-		expect(safeSpawnAsync).toHaveBeenCalledWith("rustup", expect.any(Array), expect.any(Object));
+		expect(await tryLazyInstall("rust-clippy", "/trust/lazy-allowed")).toBe(
+			true,
+		);
+		expect(safeSpawnAsync).toHaveBeenCalledWith(
+			"rustup",
+			expect.any(Array),
+			expect.any(Object),
+		);
 	});
 
 	// #1350 delta review: trust denial must NOT latch available=false -- a
 	// later grant (turn_start re-adoption) retries the install.
 	it("govulncheck retries after a trust grant (denial is not sticky)", async () => {
-		const { GovulncheckClient } = await import("../../clients/govulncheck-client.js");
-		const { setProjectTrustState } = await import("../../clients/project-trust.js");
+		const { GovulncheckClient } =
+			await import("../../clients/govulncheck-client.js");
+		const { setProjectTrustState } =
+			await import("../../clients/project-trust.js");
 		const client = new GovulncheckClient() as any;
 		vi.spyOn(client, "probeVersion").mockResolvedValue(false);
 		setProjectTrustState("untrusted");
@@ -86,11 +125,16 @@ describe("central project-trust install gate (#1334 review)", () => {
 		// later trust grant (turn_start re-adoption) re-attempts the install.
 		setProjectTrustState("trusted");
 		await client.ensureAvailable();
-		expect(safeSpawnAsync).toHaveBeenCalledWith("go", ["version"], expect.any(Object));
+		expect(safeSpawnAsync).toHaveBeenCalledWith(
+			"go",
+			["version"],
+			expect.any(Object),
+		);
 	});
 
 	it("gates govulncheck go install and permits it when trusted", async () => {
-		const { GovulncheckClient } = await import("../../clients/govulncheck-client.js");
+		const { GovulncheckClient } =
+			await import("../../clients/govulncheck-client.js");
 		const blocked = new GovulncheckClient() as any;
 		vi.spyOn(blocked, "probeVersion").mockResolvedValue(false);
 		setProjectTrustState("untrusted");
@@ -100,16 +144,27 @@ describe("central project-trust install gate (#1334 review)", () => {
 		vi.spyOn(allowed, "probeVersion").mockResolvedValue(false);
 		setProjectTrustState("trusted");
 		await allowed.doEnsureAvailable();
-		expect(safeSpawnAsync).toHaveBeenCalledWith("go", ["version"], expect.any(Object));
+		expect(safeSpawnAsync).toHaveBeenCalledWith(
+			"go",
+			["version"],
+			expect.any(Object),
+		);
 	});
 
 	it("gates missing grammar fetches and notifies, while trusted reaches fetch", async () => {
-		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("no", { status: 404 }));
-		const { TreeSitterClient } = await import("../../clients/tree-sitter-client.js");
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValue(new Response("no", { status: 404 }));
+		const { TreeSitterClient } =
+			await import("../../clients/tree-sitter-client.js");
 		const client = new TreeSitterClient() as any;
 		setProjectTrustState("untrusted");
-		expect(await client.ensureGrammar("tree-sitter-trust-missing.wasm")).toBe(false);
-		expect(await client.ensureGrammar("tree-sitter-trust-missing.wasm")).toBe(false);
+		expect(await client.ensureGrammar("tree-sitter-trust-missing.wasm")).toBe(
+			false,
+		);
+		expect(await client.ensureGrammar("tree-sitter-trust-missing.wasm")).toBe(
+			false,
+		);
 		expect(notifyUserDegradation).toHaveBeenCalledTimes(1);
 		expect(getDegradationSummary()).toEqual(
 			expect.arrayContaining([
@@ -121,7 +176,9 @@ describe("central project-trust install gate (#1334 review)", () => {
 		// TRANSITION re-arms the notification for the same grammar.
 		setProjectTrustState("trusted");
 		setProjectTrustState("untrusted");
-		expect(await client.ensureGrammar("tree-sitter-trust-missing.wasm")).toBe(false);
+		expect(await client.ensureGrammar("tree-sitter-trust-missing.wasm")).toBe(
+			false,
+		);
 		expect(notifyUserDegradation).toHaveBeenCalledTimes(2);
 		setProjectTrustState("trusted");
 		await client.ensureGrammar("tree-sitter-trust-allowed.wasm");

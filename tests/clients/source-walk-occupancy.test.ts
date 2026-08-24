@@ -18,7 +18,10 @@ import { _resetGeneratedArtifactCaches } from "../../clients/generated-artifacts
 import { detectProjectLanguageProfileAsync } from "../../clients/language-profile.js";
 import { collectSourceFilesAsync } from "../../clients/source-filter.js";
 import { countSourceFilesWithinLimitAsync } from "../../clients/startup-scan.js";
-import { generateSourceTree, measureMaxSyncBlockMs } from "../support/perf-harness.js";
+import {
+	generateSourceTree,
+	measureMaxSyncBlockMs,
+} from "../support/perf-harness.js";
 import { removeTempDirSync } from "./test-utils.js";
 
 // Generous trip-wire: the walkers yield in ~tens of ms; the regression we guard
@@ -48,29 +51,41 @@ beforeEach(() => {
 });
 
 describe(`source-walk event-loop occupancy (~${TREE_SIZE} files)`, () => {
-	it("collectSourceFilesAsync stays under the sync-block budget", { retry: 2, timeout: 30_000 }, async () => {
-		let count = 0;
-		const maxBlock = await measureMaxSyncBlockMs(async () => {
-			count = (await collectSourceFilesAsync(tmpDir)).length;
-		});
-		expect(count).toBeGreaterThan(0);
-		expect(maxBlock).toBeLessThan(MAX_SYNC_BLOCK_MS);
-	});
+	it(
+		"collectSourceFilesAsync stays under the sync-block budget",
+		{ retry: 2, timeout: 30_000 },
+		async () => {
+			let count = 0;
+			const maxBlock = await measureMaxSyncBlockMs(async () => {
+				count = (await collectSourceFilesAsync(tmpDir)).length;
+			});
+			expect(count).toBeGreaterThan(0);
+			expect(maxBlock).toBeLessThan(MAX_SYNC_BLOCK_MS);
+		},
+	);
 
-	it("detectProjectLanguageProfileAsync stays under the sync-block budget", { retry: 2, timeout: 30_000 }, async () => {
-		const maxBlock = await measureMaxSyncBlockMs(async () => {
-			await detectProjectLanguageProfileAsync(tmpDir);
-		});
-		expect(maxBlock).toBeLessThan(MAX_SYNC_BLOCK_MS);
-	});
+	it(
+		"detectProjectLanguageProfileAsync stays under the sync-block budget",
+		{ retry: 2, timeout: 30_000 },
+		async () => {
+			const maxBlock = await measureMaxSyncBlockMs(async () => {
+				await detectProjectLanguageProfileAsync(tmpDir);
+			});
+			expect(maxBlock).toBeLessThan(MAX_SYNC_BLOCK_MS);
+		},
+	);
 
-	it("countSourceFilesWithinLimitAsync stays under the sync-block budget", { retry: 2, timeout: 30_000 }, async () => {
-		let n = 0;
-		const maxBlock = await measureMaxSyncBlockMs(async () => {
-			// Huge limit so it walks the whole tree (no early-exit short-circuit).
-			n = await countSourceFilesWithinLimitAsync(tmpDir, 1_000_000);
-		});
-		expect(n).toBeGreaterThan(0);
-		expect(maxBlock).toBeLessThan(MAX_SYNC_BLOCK_MS);
-	});
+	it(
+		"countSourceFilesWithinLimitAsync stays under the sync-block budget",
+		{ retry: 2, timeout: 30_000 },
+		async () => {
+			let n = 0;
+			const maxBlock = await measureMaxSyncBlockMs(async () => {
+				// Huge limit so it walks the whole tree (no early-exit short-circuit).
+				n = await countSourceFilesWithinLimitAsync(tmpDir, 1_000_000);
+			});
+			expect(n).toBeGreaterThan(0);
+			expect(maxBlock).toBeLessThan(MAX_SYNC_BLOCK_MS);
+		},
+	);
 });

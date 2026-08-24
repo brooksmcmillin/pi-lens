@@ -12,7 +12,10 @@ import { gunzipSync } from "node:zlib";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { removeTempDirSync } from "../clients/test-utils.js";
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+const repoRoot = path.resolve(
+	path.dirname(fileURLToPath(import.meta.url)),
+	"../..",
+);
 const binJs = path.join(repoRoot, "mcp", "cli.js");
 
 function runCli(
@@ -37,9 +40,7 @@ function runCli(
 		child.stdout.on("data", (chunk: string) => (stdout += chunk));
 		child.stderr.on("data", (chunk: string) => (stderr += chunk));
 		child.on("error", reject);
-		child.on("close", (code) =>
-			resolve({ stdout, stderr, code: code ?? -1 }),
-		);
+		child.on("close", (code) => resolve({ stdout, stderr, code: code ?? -1 }));
 	});
 }
 
@@ -66,10 +67,7 @@ afterAll(() => removeTempDirSync(tempRoot));
 
 describe("pi-lens build-graph CLI", () => {
 	it("builds and persists a small project with a stats line", async () => {
-		const result = await runCli(
-			["build-graph", "--cwd", projectDir],
-			dataDir,
-		);
+		const result = await runCli(["build-graph", "--cwd", projectDir], dataDir);
 		expect(result.code).toBe(0);
 		expect(result.stdout.trim()).toMatch(
 			/^pi-lens build-graph: files=\d+ nodes=\d+ edges=\d+ elements=\d+ jsonBytes=\d+ durationMs=\d+$/,

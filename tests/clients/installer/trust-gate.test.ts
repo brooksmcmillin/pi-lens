@@ -13,6 +13,7 @@ vi.mock("../../../clients/sessionstart-logger.js", () => ({
 }));
 
 import { ensureTool } from "../../../clients/installer/index.js";
+import { withEnv } from "../../support/with-env.js";
 import {
 	resetProjectTrust,
 	setProjectTrustState,
@@ -23,22 +24,17 @@ import {
 // network, the package managers, or the real tools directory.
 const UNKNOWN_TOOL = "pi-lens-trust-gate-fixture-tool";
 
-let previousDisable: string | undefined;
+let restoreDisableToolInstall: () => void;
 
 beforeEach(() => {
 	logLines.length = 0;
-	previousDisable = process.env.PI_LENS_DISABLE_TOOL_INSTALL;
 	// Belt-and-braces: even the "trusted" case must not be able to install.
-	process.env.PI_LENS_DISABLE_TOOL_INSTALL = "1";
+	restoreDisableToolInstall = withEnv({ PI_LENS_DISABLE_TOOL_INSTALL: "1" });
 });
 
 afterEach(() => {
 	resetProjectTrust();
-	if (previousDisable === undefined) {
-		delete process.env.PI_LENS_DISABLE_TOOL_INSTALL;
-	} else {
-		process.env.PI_LENS_DISABLE_TOOL_INSTALL = previousDisable;
-	}
+	restoreDisableToolInstall();
 });
 
 const gateLines = () => logLines.filter((l) => l.includes("install gated"));

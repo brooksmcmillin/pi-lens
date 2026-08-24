@@ -73,8 +73,7 @@ describe("elixir-check output parser (parseElixirOutput)", () => {
 	});
 
 	it("still parses the legacy single-line compile-error format", () => {
-		const raw =
-			"** (SyntaxError) lib/app.ex:1:1: unexpected end of file";
+		const raw = "** (SyntaxError) lib/app.ex:1:1: unexpected end of file";
 
 		const diagnostics = parseElixirOutput(raw, target, cwd);
 
@@ -91,7 +90,9 @@ describe("elixir-check output parser (parseElixirOutput)", () => {
 	it("matches paths case-insensitively on win32 (lowercase drive letter)", () => {
 		if (process.platform !== "win32") return;
 		// Elixir lowercases the drive letter and uses forward slashes.
-		const lowerDrive = target.replace(/^[A-Z]:/, (m) => m.toLowerCase()).replace(/\\/g, "/");
+		const lowerDrive = target
+			.replace(/^[A-Z]:/, (m) => m.toLowerCase())
+			.replace(/\\/g, "/");
 		const raw = [
 			"    error: undefined function foo/0",
 			`    └─ ${lowerDrive}:4:5: App.greet/0`,

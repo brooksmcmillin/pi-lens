@@ -101,6 +101,11 @@ export function createSubsystemLogger(
 
 /** No-op with the `SubsystemLogger` shape, for the verbose-off branch. */
 export function noopSubsystemLogger(): SubsystemLogger {
+	// SAFETY: `SubsystemLogger` is a callable with `error`/`warn`/`debug`
+	// properties. TypeScript cannot type a function literal that gains its
+	// properties on the following lines, so the cast runs ahead of the three
+	// assignments that complete the shape. Every member of the interface is
+	// assigned before `noop` escapes this function.
 	const noop = (() => {}) as unknown as SubsystemLogger;
 	noop.error = () => {};
 	noop.warn = () => {};
@@ -191,9 +196,7 @@ let moduleLoadWindowOpen = false;
  * the same as an empty store, so it reads as "no window" rather than throwing.
  */
 export function isConsoleCaptureActive(): boolean {
-	return (
-		moduleLoadWindowOpen || consoleCaptureStorage?.getStore() === true
-	);
+	return moduleLoadWindowOpen || consoleCaptureStorage?.getStore() === true;
 }
 
 /**
@@ -240,10 +243,17 @@ export function runInConsoleCaptureWindow<T>(fn: () => T): T {
 function inCaptureWindow<T extends ConsoleFn | ((...args: never[]) => unknown)>(
 	fn: T,
 ): T {
-	return function (this: unknown, ...args: unknown[]): unknown {
+	// SAFETY: the wrapper forwards `this` and every argument to `fn` unchanged
+	// and returns its result unchanged, so it is call-compatible with `T` at
+	// runtime. TypeScript cannot prove that for a generic `T` it did not
+	// construct, because a variadic `(...args: unknown[]) => unknown` is not
+	// assignable to an arbitrary function type. The invariant is the
+	// pass-through itself: change the body to alter arguments or the return
+	// value and this cast stops being true.
+	return function (this: unknown, ...args: unknown[]): ReturnType<T> {
 		return runInConsoleCaptureWindow(() =>
 			(fn as (...a: unknown[]) => unknown).apply(this, args),
-		);
+		) as ReturnType<T>;
 	} as unknown as T;
 }
 
@@ -263,7 +273,9 @@ function inCaptureWindow<T extends ConsoleFn | ((...args: never[]) => unknown)>(
  * the terminal.
  */
 function isCaptureSeam(prop: PropertyKey): boolean {
-	return prop === "on" || (typeof prop === "string" && prop.startsWith("register"));
+	return (
+		prop === "on" || (typeof prop === "string" && prop.startsWith("register"))
+	);
 }
 
 /**
@@ -294,9 +306,9 @@ function isCaptureSeam(prop: PropertyKey): boolean {
  * shape 5), and these definitions are pi-lens's own, built just above the
  * register call.
  */
-function wrapFunctionsInPlace(value: unknown): unknown {
+function wrapFunctionsInPlace<T>(value: T): T {
 	if (typeof value === "function") {
-		return inCaptureWindow(value as ConsoleFn);
+		return inCaptureWindow(value as ConsoleFn) as T;
 	}
 	if (value === null || typeof value !== "object" || Array.isArray(value)) {
 		return value;
@@ -366,14 +378,18 @@ function assignWrapped(
 export function withConsoleCaptureWindows<T extends object>(api: T): T {
 	const wrapperCache = new Map<PropertyKey, unknown>();
 	const proxy: T = new Proxy(api, {
-		get(target, prop): unknown {
+		get(target, prop) {
 			// A non-configurable, non-writable OWN data property is a proxy
 			// invariant: the get trap MUST return the exact value the target
 			// holds, or the engine throws a TypeError on read. Degrade to the raw
 			// value instead of tripping that invariant (S2a) — a frozen host API
 			// loses the capture window for that member, but keeps working.
 			const descriptor = Reflect.getOwnPropertyDescriptor(target, prop);
-			if (descriptor && descriptor.writable === false && descriptor.configurable === false) {
+			if (
+				descriptor &&
+				descriptor.writable === false &&
+				descriptor.configurable === false
+			) {
 				return descriptor.value;
 			}
 			const cached = wrapperCache.get(prop);
@@ -384,8 +400,8 @@ export function withConsoleCaptureWindows<T extends object>(api: T): T {
 			// A host that returns `this` for chaining would hand back the raw API,
 			// so a chained `on(...).on(...)` would register an unwrapped handler.
 			// Keep the proxy on the chain.
-			const keepProxy = (result: unknown): unknown =>
-				result === target ? proxy : result;
+			const keepProxy = <TResult>(result: TResult): TResult | T =>
+				Object.is(result, target) ? proxy : result;
 			// Pass-through members are cached too (S3a/S3b: `proxy.getFlag ===
 			// proxy.getFlag`), but the cached wrapper re-reads `target[prop]` on
 			// EVERY call rather than closing over `method` -- a plain
@@ -395,11 +411,11 @@ export function withConsoleCaptureWindows<T extends object>(api: T): T {
 			// Re-reading keeps the cached wrapper's identity stable while staying
 			// live to whatever `target[prop]` currently is.
 			const wrapper = isCaptureSeam(prop)
-				? (...args: unknown[]): unknown => {
+				? (...args: unknown[]) => {
 						const wrapped = args.map((arg) => wrapFunctionsInPlace(arg));
 						return keepProxy(method.apply(target, wrapped));
 					}
-				: (...args: unknown[]): unknown => {
+				: (...args: unknown[]) => {
 						const current = Reflect.get(target, prop, target) as (
 							...a: unknown[]
 						) => unknown;
@@ -449,6 +465,11 @@ export function installConsoleGuard(): boolean {
 	if (isTestMode()) return false;
 	if (process.env.PI_LENS_CONSOLE_GUARD === "0") return false;
 	consoleGuardInstalled = true;
+	// SAFETY: re-views `console` as a string-keyed record so the loop below can
+	// read and replace methods by name. `ConsoleMethod` is the union of keys
+	// that exist on `Console`, and each read is guarded by `typeof original ===
+	// "function"` before use, so a host whose console lacks a method is skipped
+	// rather than patched with undefined.
 	const target = console as unknown as Record<ConsoleMethod, unknown>;
 	for (const method of CONSOLE_METHODS) {
 		const original = target[method];
@@ -483,6 +504,10 @@ export function installConsoleGuard(): boolean {
 export function uninstallConsoleGuard(): boolean {
 	if (!consoleGuardInstalled) return false;
 	consoleGuardInstalled = false;
+	// SAFETY: same re-view as `installConsoleGuard`. Only keys this module
+	// recorded in `originalConsoleMethods` at install time are written back,
+	// and only when the current value is still the replacement this module
+	// installed, so a method someone else patched afterwards is left alone.
 	const target = console as unknown as Record<ConsoleMethod, unknown>;
 	for (const [method, original] of originalConsoleMethods) {
 		if (target[method] === installedConsoleMethods.get(method)) {

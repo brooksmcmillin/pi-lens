@@ -43,7 +43,8 @@ import {
 const argv = process.argv.slice(2);
 const dryRun = argv.includes("--dry-run");
 const summaryFlagIdx = argv.indexOf("--summary");
-const summaryPath = summaryFlagIdx >= 0 ? argv[summaryFlagIdx + 1] : DRIFT_SUMMARY_PATH;
+const summaryPath =
+	summaryFlagIdx >= 0 ? argv[summaryFlagIdx + 1] : DRIFT_SUMMARY_PATH;
 
 function gh(args) {
 	return execFileSync("gh", args, { encoding: "utf8" });
@@ -59,7 +60,9 @@ function readSummary() {
 	try {
 		return JSON.parse(fs.readFileSync(summaryPath, "utf8"));
 	} catch (e) {
-		console.error(`[notify-drift] summary unreadable, skipping: ${e?.message ?? e}`);
+		console.error(
+			`[notify-drift] summary unreadable, skipping: ${e?.message ?? e}`,
+		);
 		return null;
 	}
 }
@@ -73,15 +76,22 @@ function workflowRunUrl() {
 function findTrackingIssue() {
 	try {
 		const out = gh([
-			"issue", "list",
-			"--label", DRIFT_ISSUE_LABEL,
-			"--state", "open",
-			"--json", "number,title",
-			"--limit", "20",
+			"issue",
+			"list",
+			"--label",
+			DRIFT_ISSUE_LABEL,
+			"--state",
+			"open",
+			"--json",
+			"number,title",
+			"--limit",
+			"20",
 		]);
 		return findDriftTrackingIssue(JSON.parse(out));
 	} catch (e) {
-		console.error(`[notify-drift] gh issue list failed, treating as "no existing issue": ${e?.message ?? e}`);
+		console.error(
+			`[notify-drift] gh issue list failed, treating as "no existing issue": ${e?.message ?? e}`,
+		);
 		return null;
 	}
 }
@@ -91,13 +101,19 @@ function findTrackingIssue() {
 function ensureLabel() {
 	try {
 		gh([
-			"label", "create", DRIFT_ISSUE_LABEL,
-			"--color", "B60205",
-			"--description", "Nightly automated silentOnClean drift finding (#529/#594)",
+			"label",
+			"create",
+			DRIFT_ISSUE_LABEL,
+			"--color",
+			"B60205",
+			"--description",
+			"Nightly automated silentOnClean drift finding (#529/#594)",
 			"--force",
 		]);
 	} catch (e) {
-		console.error(`[notify-drift] label ensure skipped (best-effort): ${e?.message ?? e}`);
+		console.error(
+			`[notify-drift] label ensure skipped (best-effort): ${e?.message ?? e}`,
+		);
 	}
 }
 
@@ -114,10 +130,15 @@ function main() {
 
 	const warnings = Array.isArray(summary.warnings) ? summary.warnings : [];
 	const count = warnings.length;
-	const body = buildDriftIssueBody({ ...summary, warnings }, { runUrl: workflowRunUrl() });
+	const body = buildDriftIssueBody(
+		{ ...summary, warnings },
+		{ runUrl: workflowRunUrl() },
+	);
 
 	if (dryRun) {
-		console.log(`[notify-drift] DRY RUN — ${count} drift warning(s). Plan body:\n`);
+		console.log(
+			`[notify-drift] DRY RUN — ${count} drift warning(s). Plan body:\n`,
+		);
 		console.log(body);
 		return;
 	}
@@ -130,13 +151,28 @@ function main() {
 		try {
 			if (existing) {
 				gh(["issue", "edit", String(existing.number), "--body-file", bodyFile]);
-				console.log(`[notify-drift] updated tracking issue #${existing.number} (${count} finding(s)).`);
+				console.log(
+					`[notify-drift] updated tracking issue #${existing.number} (${count} finding(s)).`,
+				);
 			} else {
-				gh(["issue", "create", "--title", DRIFT_ISSUE_TITLE, "--label", DRIFT_ISSUE_LABEL, "--body-file", bodyFile]);
-				console.log(`[notify-drift] filed a new tracking issue (${count} finding(s)).`);
+				gh([
+					"issue",
+					"create",
+					"--title",
+					DRIFT_ISSUE_TITLE,
+					"--label",
+					DRIFT_ISSUE_LABEL,
+					"--body-file",
+					bodyFile,
+				]);
+				console.log(
+					`[notify-drift] filed a new tracking issue (${count} finding(s)).`,
+				);
 			}
 		} catch (e) {
-			console.error(`[notify-drift] gh issue create/edit failed: ${e?.message ?? e}`);
+			console.error(
+				`[notify-drift] gh issue create/edit failed: ${e?.message ?? e}`,
+			);
 		}
 		return;
 	}
@@ -144,17 +180,24 @@ function main() {
 	if (existing) {
 		try {
 			gh([
-				"issue", "close", String(existing.number),
-				"--comment", "Nightly drift check found no mismatches — self-resolved, closing (#529/#594).",
+				"issue",
+				"close",
+				String(existing.number),
+				"--comment",
+				"Nightly drift check found no mismatches — self-resolved, closing (#529/#594).",
 			]);
-			console.log(`[notify-drift] closed tracking issue #${existing.number} (drift resolved).`);
+			console.log(
+				`[notify-drift] closed tracking issue #${existing.number} (drift resolved).`,
+			);
 		} catch (e) {
 			console.error(`[notify-drift] gh issue close failed: ${e?.message ?? e}`);
 		}
 		return;
 	}
 
-	console.log("[notify-drift] no drift, no open tracking issue — nothing to do.");
+	console.log(
+		"[notify-drift] no drift, no open tracking issue — nothing to do.",
+	);
 }
 
 try {
@@ -164,6 +207,8 @@ try {
 	// only" contract — this step's continue-on-error already covers a nonzero
 	// exit, but an internal bug here must not even look like a step failure in
 	// the log if we can help it.
-	console.error(`[notify-drift] unexpected error (never fails the job): ${e?.message ?? e}`);
+	console.error(
+		`[notify-drift] unexpected error (never fails the job): ${e?.message ?? e}`,
+	);
 }
 process.exit(0);

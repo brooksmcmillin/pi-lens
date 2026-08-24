@@ -146,7 +146,8 @@ export const importFactProvider: FactProvider = {
 			}
 
 			// --- dynamic import() / require() / module.exports (anywhere in the tree) ---
-			const dynamicRaw: Array<{ source: string; kind: "import" | "require" }> = [];
+			const dynamicRaw: Array<{ source: string; kind: "import" | "require" }> =
+				[];
 			walk(root, (node) => {
 				if (node.type === "call_expression") {
 					const callee = node.children?.[0];
@@ -156,7 +157,10 @@ export const importFactProvider: FactProvider = {
 					const source = stripQuotes(strArg.text);
 					if (callee?.type === "import") {
 						dynamicRaw.push({ source, kind: "import" });
-					} else if (callee?.type === "identifier" && callee.text === "require") {
+					} else if (
+						callee?.type === "identifier" &&
+						callee.text === "require"
+					) {
 						dynamicRaw.push({ source, kind: "require" });
 						hasCjs = true;
 					}
@@ -226,6 +230,7 @@ export const importFactProvider: FactProvider = {
 			}
 		});
 		if (!parsed.parsed) setEmpty();
-		else store.setFileFact(ctx.filePath, "file.importFactsCoverage", "complete");
+		else
+			store.setFileFact(ctx.filePath, "file.importFactsCoverage", "complete");
 	},
 };

@@ -26,6 +26,7 @@
 
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { makeFakeChild } from "../support/fake-child.js";
 
 const statSyncMock = vi.hoisted(() => vi.fn());
 vi.mock("node:fs", async (importOriginal) => {
@@ -72,28 +73,6 @@ vi.mock("node:child_process", async (importOriginal) => {
 const { safeSpawnAsync, safeSpawn, resetSafeSpawnWindowsCommandCache } =
 	await import("../../clients/safe-spawn.js");
 
-type Listener = (...args: unknown[]) => void;
-
-function makeFakeChild(pid = 4242) {
-	const listeners: Record<string, Listener[]> = {};
-	const child = {
-		pid,
-		killed: false,
-		kill: vi.fn(),
-		on: vi.fn((event: string, listener: Listener) => {
-			(listeners[event] ??= []).push(listener);
-			return child;
-		}),
-		removeListener: vi.fn(),
-		stdout: { setEncoding: vi.fn(), on: vi.fn() },
-		stderr: { setEncoding: vi.fn(), on: vi.fn() },
-		emit(event: string, ...args: unknown[]) {
-			for (const l of listeners[event] ?? []) l(...args);
-		},
-	};
-	return child;
-}
-
 function markFilesAsPresent(...files: string[]): void {
 	const present = new Set(files);
 	statSyncMock.mockImplementation((candidate: unknown) => {
@@ -127,7 +106,7 @@ describe("Windows resolution honors the CALLER's env, not just ambient process.e
 		const managedBin = "C:\\__pi_lens_env_plumbing__\\managed\\bin";
 		const managedTool = path.win32.join(managedBin, "widget-tool.cmd");
 		markFilesAsPresent(managedTool);
-		spawnMock.mockReturnValue(makeFakeChild());
+		spawnMock.mockReturnValue(makeFakeChild(4242));
 
 		// If safeSpawnAsync fed ambient `process.env` (which almost certainly
 		// doesn't contain this fabricated directory) into the resolver instead
@@ -172,6 +151,10 @@ describe("Windows resolution honors the CALLER's env, not just ambient process.e
 		const child = spawnMock.mock.results[0]?.value as ReturnType<
 			typeof makeFakeChild
 		>;
+		// #1656: safeSpawnAsync now finalizes off "exit" (then waits for the
+		// pipes to go idle), not "close" — a real Node child always emits both
+		// (exit first), so the fixture must too.
+		child.emit("exit", 0, null);
 		child.emit("close", 0, null);
 		await resultPromise;
 	});

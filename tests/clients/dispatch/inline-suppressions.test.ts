@@ -93,7 +93,10 @@ describe("applyInlineSuppressions (#442 — shared by mode=all + mode=full)", ()
 		const content = "eval(x)  # pi-lens-ignore: no-eval\n";
 		const raw: LSPDiagnostic[] = [
 			{
-				range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+				range: {
+					start: { line: 0, character: 0 },
+					end: { line: 0, character: 1 },
+				},
 				message: "no-eval finding",
 				severity: 2,
 				source: "ast-grep",

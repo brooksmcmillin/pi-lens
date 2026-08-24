@@ -51,9 +51,12 @@ export class McpHarness {
 		// write project/global pi-lens state. Explicit cwd values in these tests are
 		// already temp fixtures; the default gets one too.
 		this.workspaceDir =
-			options.cwd ?? fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-mcp-workspace-"));
+			options.cwd ??
+			fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-mcp-workspace-"));
 		if (path.resolve(this.workspaceDir) === path.resolve(repoRoot)) {
-			throw new Error("MCP smoke harness refuses the real workspace IPC endpoint");
+			throw new Error(
+				"MCP smoke harness refuses the real workspace IPC endpoint",
+			);
 		}
 		this.isolationDir = fs.mkdtempSync(
 			path.join(os.tmpdir(), "pi-lens-mcp-isolation-"),
@@ -66,7 +69,10 @@ export class McpHarness {
 				options.env?.PI_LENS_HOME ?? path.join(this.isolationDir, "home"),
 			...options.env,
 		};
-		if (path.resolve(env.PILENS_DATA_DIR) === path.join(path.resolve(repoRoot), ".pi-lens")) {
+		if (
+			path.resolve(env.PILENS_DATA_DIR) ===
+			path.join(path.resolve(repoRoot), ".pi-lens")
+		) {
 			throw new Error("MCP smoke harness refuses the real project data root");
 		}
 		this.child = spawn(

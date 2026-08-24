@@ -26,6 +26,8 @@ export const PI_LENS_LOADED_FROM: "dist" | "source" = import.meta.url.endsWith(
 	: "source";
 
 let loadMs: number | undefined;
+let loadedAtMs: number | undefined;
+let hostReadyDelayAnchorConsumed = false;
 
 /**
  * Record the load-complete time. Call once, as the first statement in the
@@ -35,9 +37,27 @@ let loadMs: number | undefined;
  */
 export function markPiLensLoaded(): number {
 	if (loadMs === undefined) {
-		loadMs = Math.round(performance.now());
+		loadedAtMs = performance.now();
+		loadMs = Math.round(loadedAtMs);
 	}
 	return loadMs;
+}
+
+/** Monotonic instant when pi-lens finished loading, for cross-hook spans. */
+export function getPiLensLoadedAtMs(): number | undefined {
+	return loadedAtMs;
+}
+
+/** Consume the process-lifetime first-session host-ready anchor exactly once. */
+export function consumeHostReadyDelayAnchor(): boolean {
+	if (hostReadyDelayAnchorConsumed) return false;
+	hostReadyDelayAnchorConsumed = true;
+	return true;
+}
+
+/** Test seam for the process-lifetime session-state registry probe boundary. */
+export function resetHostReadyDelayAnchorForTests(): void {
+	hostReadyDelayAnchorConsumed = false;
 }
 
 /** ms from pi process start to pi-lens load-complete, or undefined if unmarked. */

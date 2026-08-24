@@ -12,7 +12,10 @@
 
 import { describe, expect, it } from "vitest";
 import * as path from "node:path";
-import { findNearestProjectRoot, resolveStartupScanContext } from "../../clients/startup-scan.js";
+import {
+	findNearestProjectRoot,
+	resolveStartupScanContext,
+} from "../../clients/startup-scan.js";
 import {
 	findPiLensProjectConfig,
 	loadPiLensProjectConfig,

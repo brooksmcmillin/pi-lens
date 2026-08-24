@@ -27,7 +27,7 @@ import {
 	PythonServer,
 	RustServer,
 	TypeScriptServer,
-} from "../../../clients/lsp/server.ts";
+} from "../../../clients/lsp/server.js";
 import { ensureTool } from "../../../clients/installer/index.js";
 
 const isWin = process.platform === "win32";

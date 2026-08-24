@@ -8,7 +8,9 @@
  * Docs: https://github.com/kucherenko/jscpd
  */
 
+import { formatToolFailure } from "./dispatch/runners/utils/tool-failure.js";
 import { createSubsystemLogger } from "./extension-log.js";
+import { incrementDegradationCount } from "./degradation-ledger.js";
 import * as fs from "node:fs";
 import { mkdtempSync } from "node:fs";
 import * as os from "node:os";
@@ -58,11 +60,42 @@ const EMPTY_RESULT: JscpdResult = {
 
 const SCAN_TIMEOUT_MS = 30_000;
 
-const jscpdAvailability = createAvailabilityChecker("jscpd", "", ["--version"], {
-	probeTimeout: 1500,
-	// One definition of the managed-shim fast path, shared with knip (#1476).
-	fastPath: () => findManagedNodeToolBinary("jscpd"),
-});
+/** jscpd's own config-file names, in its discovery order, checked at `cwd` only
+ * (jscpd does not walk up). */
+const JSCPD_CONFIG_FILENAMES = [".jscpd.json", "jscpd.json"];
+
+/**
+ * True when the project ships its own jscpd config: a `.jscpd.json`/
+ * `jscpd.json` file, or a `package.json` `jscpd` field. jscpd discovers either
+ * unaided, but `--min-lines`/`--min-tokens`/`--ignore` on the CLI override
+ * whatever the config sets — passing them unconditionally silently discarded a
+ * project's own thresholds and ignore list (#1731, discipline A).
+ */
+function hasProjectJscpdConfig(cwd: string): boolean {
+	for (const name of JSCPD_CONFIG_FILENAMES) {
+		if (fs.existsSync(path.join(cwd, name))) return true;
+	}
+	try {
+		const pkg = JSON.parse(
+			fs.readFileSync(path.join(cwd, "package.json"), "utf-8"),
+		);
+		if (pkg && typeof pkg === "object" && pkg.jscpd !== undefined) return true;
+	} catch {
+		// No/malformed package.json — "no project config" is the honest answer.
+	}
+	return false;
+}
+
+const jscpdAvailability = createAvailabilityChecker(
+	"jscpd",
+	"",
+	["--version"],
+	{
+		probeTimeout: 1500,
+		// One definition of the managed-shim fast path, shared with knip (#1476).
+		fastPath: () => findManagedNodeToolBinary("jscpd"),
+	},
+);
 
 // --- Client ---
 
@@ -124,13 +157,16 @@ export class JscpdClient {
 						: "skip";
 				}
 				if (!entry.isFile()) return "skip";
-				if (ignoreMatcher.isIgnored(fullPath, false)) return "skip";
+				// #1974: extension gate before isIgnored — the regex test is cheap
+				// per-call; isIgnored recompiles minimatch patterns per ancestor dir
+				// and should only run for files that already look like source.
 				if (
 					/\.(ts|tsx|js|jsx|mjs|cjs|py|pyi|java|go|rs|rb|php|swift|kt|kts|dart|lua|scala|c|h|cpp|cc|cxx|hpp|hxx|cs|m|mm)$/.test(
 						entry.name,
 					)
 				) {
 					if (entry.name.endsWith(".d.ts")) return "skip";
+					if (ignoreMatcher.isIgnored(fullPath, false)) return "skip";
 					return "stop";
 				}
 				return "skip";
@@ -151,6 +187,27 @@ export class JscpdClient {
 		if (!resolved) return false;
 		if (isFullyQualified(resolved)) this.jscpdManagedPath = resolved;
 		return true;
+	}
+
+	/**
+	 * #1623: public availability verdict for callers outside the dispatch
+	 * graph (mode=full's fresh-fetch) that need to say WHY `ensureAvailable()`
+	 * most recently returned false, using the SAME outcome/cause the shared
+	 * `jscpdAvailability` checker already tracks — not a re-guessed "jscpd
+	 * binary unavailable" that can't tell a transient retry-cooldown probe
+	 * from a durable absence.
+	 */
+	getAvailabilityVerdict(): {
+		outcome: ReturnType<typeof jscpdAvailability.getOutcome>;
+		cause: ReturnType<typeof jscpdAvailability.getVerdict>["cause"];
+		retryAtMs: number;
+	} {
+		const verdict = jscpdAvailability.getVerdict(process.cwd());
+		return {
+			outcome: verdict.outcome,
+			cause: verdict.cause,
+			retryAtMs: verdict.retryAtMs,
+		};
 	}
 
 	/**
@@ -251,21 +308,28 @@ export class JscpdClient {
 				: this.jscpdManagedPath
 					? { cmd: this.jscpdManagedPath, prefix: [] as string[] }
 					: { cmd: "npx", prefix: ["jscpd"] };
+			// A project's own jscpd config wins outright (#1731, discipline A):
+			// these three flags all override whatever it sets, so none are passed
+			// when the project ships one — jscpd discovers it unaided.
+			const hasConfig = hasProjectJscpdConfig(cwd);
 			const result = await safeSpawnAsync(
 				cmd,
 				[
 					...prefix,
 					".",
-					"--min-lines",
-					String(minLines),
-					"--min-tokens",
-					String(minTokens),
+					...(hasConfig
+						? []
+						: [
+								"--min-lines",
+								String(minLines),
+								"--min-tokens",
+								String(minTokens),
+							]),
 					"--reporters",
 					"json",
 					"--output",
 					outDir,
-					"--ignore",
-					ignorePattern,
+					...(hasConfig ? [] : ["--ignore", ignorePattern]),
 				],
 				{
 					timeout: SCAN_TIMEOUT_MS,
@@ -278,8 +342,39 @@ export class JscpdClient {
 				return { ...EMPTY_RESULT };
 			}
 
+			// Empirical exit-code table (jscpd 3.5.10, verified live for #1736's
+			// sweep): a genuinely clean run (no clones) exits 0 and writes NO
+			// report file — jscpd only writes `jscpd-report.json` when it has
+			// something to report. A crashed run (uncaught exception, e.g. a bad
+			// scan path) ALSO writes no report file, but exits nonzero. The
+			// missing-file check alone can't tell those apart, so a nonzero exit
+			// with no report file is reported as errored, never as "0 clones".
+			// (Not `spawnFailedWithNoOutput` — the parsed artifact here is a
+			// report FILE, not stdout, so the shared stdout-based discriminator
+			// doesn't apply; the underlying "nonzero exit -> not clean" rule is
+			// the same one.)
 			const reportPath = path.join(outDir, "jscpd-report.json");
 			if (!fs.existsSync(reportPath)) {
+				if (result.status !== 0) {
+					// #1816: one shared wording, one truncation, signal named.
+					// `reportMissing` is the artifact-tool arm of the same
+					// primitive — the parsed artifact here is a report FILE.
+					const reason = formatToolFailure({
+						tool: "jscpd",
+						status: result.status,
+						signal: result.signal,
+						stderr: result.stderr,
+						reportMissing: true,
+						fields: { command: cmd },
+					});
+					this.log(reason);
+					incrementDegradationCount({
+						kind: "runner-empty-result",
+						subject: "jscpd",
+						reason,
+					});
+					return { ...EMPTY_RESULT };
+				}
 				return { ...EMPTY_RESULT, success: true };
 			}
 

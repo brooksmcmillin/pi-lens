@@ -80,7 +80,10 @@ function candidateRoots(): string[] {
 			process.env.ProgramFiles,
 			process.env["ProgramFiles(x86)"],
 			process.env.ProgramW6432,
-			path.join(process.env.LOCALAPPDATA ?? path.join(home, "AppData", "Local"), "Programs"),
+			path.join(
+				process.env.LOCALAPPDATA ?? path.join(home, "AppData", "Local"),
+				"Programs",
+			),
 		].filter((p): p is string => Boolean(p));
 		for (const base of progFiles) {
 			roots.push(path.join(base, "Eclipse Adoptium"));
@@ -122,14 +125,18 @@ export function discoverJdkHome(
 	if (javaHome) {
 		const resolved = jdkHomeFrom(javaHome);
 		// Trust an explicit JAVA_HOME regardless of how its name parses.
-		if (resolved) found.push({ home: resolved, major: Number.MAX_SAFE_INTEGER });
+		if (resolved)
+			found.push({ home: resolved, major: Number.MAX_SAFE_INTEGER });
 	}
 
 	for (const root of roots) {
 		for (const dir of childDirs(root)) {
 			const resolved = jdkHomeFrom(dir);
 			if (!resolved) continue;
-			found.push({ home: resolved, major: parseMajorVersion(path.basename(dir)) });
+			found.push({
+				home: resolved,
+				major: parseMajorVersion(path.basename(dir)),
+			});
 		}
 	}
 

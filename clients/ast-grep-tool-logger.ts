@@ -149,10 +149,7 @@ export function astGrepRemediationHint(kind: AstGrepErrorKind): string | null {
 }
 
 export function logAstGrepToolEvent(
-	event: Omit<
-		AstGrepToolEvent,
-		"pattern" | "rewrite" | "errorRaw"
-	> & {
+	event: Omit<AstGrepToolEvent, "pattern" | "rewrite" | "errorRaw"> & {
 		pattern: string;
 		rewrite?: string;
 		errorRaw?: string;

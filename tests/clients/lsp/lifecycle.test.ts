@@ -32,67 +32,95 @@ describe("LSP Launch", () => {
 		},
 	);
 
-	it("spawns a real Node.js process and returns LSPProcess handle", { timeout: SPAWN_TEST_TIMEOUT_MS }, async () => {
-		// Write a temp script that keeps running (avoids shell escaping issues)
-		const scriptPath = path.join(os.tmpdir(), `pi-lens-test-${Date.now()}.js`);
-		fs.writeFileSync(scriptPath, "setInterval(() => {}, 60000);");
+	it(
+		"spawns a real Node.js process and returns LSPProcess handle",
+		{ timeout: SPAWN_TEST_TIMEOUT_MS },
+		async () => {
+			// Write a temp script that keeps running (avoids shell escaping issues)
+			const scriptPath = path.join(
+				os.tmpdir(),
+				`pi-lens-test-${Date.now()}.js`,
+			);
+			fs.writeFileSync(scriptPath, "setInterval(() => {}, 60000);");
 
-		const proc = await launchLSP(process.execPath, [scriptPath]);
+			const proc = await launchLSP(process.execPath, [scriptPath]);
 
-		expect(proc.pid).toBeGreaterThan(0);
-		expect(proc.process).toBeDefined();
-		expect(proc.stdin).toBeDefined();
-		expect(proc.stdout).toBeDefined();
-		expect(proc.stderr).toBeDefined();
+			expect(proc.pid).toBeGreaterThan(0);
+			expect(proc.process).toBeDefined();
+			expect(proc.stdin).toBeDefined();
+			expect(proc.stdout).toBeDefined();
+			expect(proc.stderr).toBeDefined();
 
-		// Clean up
-		await stopLSP(proc);
-		fs.unlinkSync(scriptPath);
-	});
+			// Clean up
+			await stopLSP(proc);
+			fs.unlinkSync(scriptPath);
+		},
+	);
 
-	it("detects immediate exit of a bad binary", { timeout: SPAWN_TEST_TIMEOUT_MS }, async () => {
-		const scriptPath = path.join(os.tmpdir(), `pi-lens-test-${Date.now()}.js`);
-		fs.writeFileSync(scriptPath, "process.exit(1);");
+	it(
+		"detects immediate exit of a bad binary",
+		{ timeout: SPAWN_TEST_TIMEOUT_MS },
+		async () => {
+			const scriptPath = path.join(
+				os.tmpdir(),
+				`pi-lens-test-${Date.now()}.js`,
+			);
+			fs.writeFileSync(scriptPath, "process.exit(1);");
 
-		await expect(
-			launchLSP(process.execPath, [scriptPath], {
-				startupFailureWindowMs: 500,
-			}),
-		).rejects.toThrow(/exited immediately/);
+			await expect(
+				launchLSP(process.execPath, [scriptPath], {
+					startupFailureWindowMs: 500,
+				}),
+			).rejects.toThrow(/exited immediately/);
 
-		fs.unlinkSync(scriptPath);
-	});
+			fs.unlinkSync(scriptPath);
+		},
+	);
 
-	it("stopLSP kills the process", { timeout: SPAWN_TEST_TIMEOUT_MS }, async () => {
-		const scriptPath = path.join(os.tmpdir(), `pi-lens-test-${Date.now()}.js`);
-		fs.writeFileSync(scriptPath, "setInterval(() => {}, 60000);");
+	it(
+		"stopLSP kills the process",
+		{ timeout: SPAWN_TEST_TIMEOUT_MS },
+		async () => {
+			const scriptPath = path.join(
+				os.tmpdir(),
+				`pi-lens-test-${Date.now()}.js`,
+			);
+			fs.writeFileSync(scriptPath, "setInterval(() => {}, 60000);");
 
-		const proc = await launchLSP(process.execPath, [scriptPath]);
+			const proc = await launchLSP(process.execPath, [scriptPath]);
 
-		expect(proc.process.killed).toBe(false);
-		await stopLSP(proc);
-		expect(
-			proc.process.killed ||
-				proc.process.exitCode !== null ||
-				proc.process.signalCode !== null,
-		).toBe(true);
+			expect(proc.process.killed).toBe(false);
+			await stopLSP(proc);
+			expect(
+				proc.process.killed ||
+					proc.process.exitCode !== null ||
+					proc.process.signalCode !== null,
+			).toBe(true);
 
-		fs.unlinkSync(scriptPath);
-	});
+			fs.unlinkSync(scriptPath);
+		},
+	);
 
-	it("stopLSP returns when the process already exited", { timeout: SPAWN_TEST_TIMEOUT_MS }, async () => {
-		const scriptPath = path.join(os.tmpdir(), `pi-lens-test-${Date.now()}.js`);
-		fs.writeFileSync(scriptPath, "setTimeout(() => process.exit(0), 250);");
+	it(
+		"stopLSP returns when the process already exited",
+		{ timeout: SPAWN_TEST_TIMEOUT_MS },
+		async () => {
+			const scriptPath = path.join(
+				os.tmpdir(),
+				`pi-lens-test-${Date.now()}.js`,
+			);
+			fs.writeFileSync(scriptPath, "setTimeout(() => process.exit(0), 250);");
 
-		const proc = await launchLSP(process.execPath, [scriptPath], {
-			startupFailureWindowMs: 10,
-		});
-		await new Promise<void>((resolve) =>
-			proc.process.once("exit", () => resolve()),
-		);
+			const proc = await launchLSP(process.execPath, [scriptPath], {
+				startupFailureWindowMs: 10,
+			});
+			await new Promise<void>((resolve) =>
+				proc.process.once("exit", () => resolve()),
+			);
 
-		await expect(stopLSP(proc)).resolves.toBeUndefined();
+			await expect(stopLSP(proc)).resolves.toBeUndefined();
 
-		fs.unlinkSync(scriptPath);
-	});
+			fs.unlinkSync(scriptPath);
+		},
+	);
 });

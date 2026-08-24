@@ -15,23 +15,28 @@ function diag(line0Based: number, code?: string): LSPDiagnostic {
 	} as unknown as LSPDiagnostic;
 }
 
-const RULE = "python.lang.security.audit.subprocess-shell-true.subprocess-shell-true";
+const RULE =
+	"python.lang.security.audit.subprocess-shell-true.subprocess-shell-true";
 
 describe("isNosemgrepSuppressed (#441)", () => {
 	it("bare `# nosemgrep` on the finding's line suppresses it", () => {
-		const content = "import subprocess\nsubprocess.run('ls', shell=True)  # nosemgrep\n";
+		const content =
+			"import subprocess\nsubprocess.run('ls', shell=True)  # nosemgrep\n";
 		expect(isNosemgrepSuppressed(diag(1, RULE), content)).toBe(true);
 	});
 
 	it("`# nosemgrep` on the line above suppresses the finding", () => {
-		const content = "import subprocess\n# nosemgrep\nsubprocess.run('ls', shell=True)\n";
+		const content =
+			"import subprocess\n# nosemgrep\nsubprocess.run('ls', shell=True)\n";
 		expect(isNosemgrepSuppressed(diag(2, RULE), content)).toBe(true);
 	});
 
 	it("`# nosemgrep: <rule-id>` suppresses only that rule", () => {
 		const content = `subprocess.run('ls', shell=True)  # nosemgrep: ${RULE}\n`;
 		expect(isNosemgrepSuppressed(diag(0, RULE), content)).toBe(true);
-		expect(isNosemgrepSuppressed(diag(0, "some.other.rule"), content)).toBe(false);
+		expect(isNosemgrepSuppressed(diag(0, "some.other.rule"), content)).toBe(
+			false,
+		);
 	});
 
 	it("supports comma-separated rule ids", () => {

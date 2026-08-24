@@ -232,7 +232,7 @@ export function loadPiLensGlobalConfig(
 			if (format.mode === "immediate" || format.mode === "deferred") {
 				formatSection.mode = format.mode;
 			} else {
-				// #533: a present-but-invalid mode (e.g. "immedaite") warns and
+				// #533: a present-but-invalid mode (e.g. "immedaite") warns and // spellchecker:disable-line
 				// falls back; an absent mode stays silent.
 				if ("mode" in format) {
 					warnInvalid('format.mode must be "immediate" or "deferred"');

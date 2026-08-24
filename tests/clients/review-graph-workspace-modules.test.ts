@@ -7,7 +7,7 @@ import {
 	findModuleForPath,
 	getDownstreamModules,
 	getModuleSourceFiles,
-} from "../../clients/review-graph/workspace-modules.ts";
+} from "../../clients/review-graph/workspace-modules.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
 // Counts readdirSync calls made through the module under test so memo-hit
@@ -226,10 +226,7 @@ describe("getModuleSourceFiles memo (#1137)", () => {
 			// the matcher's tracked input (existsSync(".git") is the only check).
 			fs.mkdirSync(path.join(env.tmpDir, ".git"));
 			const libRoot = makeWorkspace(env);
-			write(
-				path.join(libRoot, "ignored/skip.ts"),
-				"export const skip = 1;\n",
-			);
+			write(path.join(libRoot, "ignored/skip.ts"), "export const skip = 1;\n");
 			clearModuleGraphCache();
 			const first = getModuleSourceFiles(libRoot);
 			expect(first.some((f) => f.includes("/ignored/"))).toBe(true);

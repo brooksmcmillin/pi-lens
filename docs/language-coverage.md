@@ -9,7 +9,7 @@ Dispatch is diagnostics-oriented: automatic formatting and safe autofix happen i
 | Language              | LSP | Dispatch Runners                                                                                               | Formatter               |
 | --------------------- | --- | -------------------------------------------------------------------------------------------------------------- | ----------------------- |
 | JavaScript/TypeScript | ✓   | lsp, ts-lsp, biome-check-json, tree-sitter, ast-grep-napi, type-safety, similarity, fact-rules, eslint, oxlint | biome, prettier         |
-| Python                | ✓   | lsp, pyright, ruff-lint, tree-sitter                                                                           | ruff, black             |
+| Python                | ✓   | lsp, pyright, mypy (config-first), ruff-lint, tree-sitter                                                      | ruff, black             |
 | Go                    | ✓   | lsp, go-vet, golangci-lint, tree-sitter                                                                        | gofmt                   |
 | Rust                  | ✓   | lsp, rust-clippy, tree-sitter                                                                                  | rustfmt                 |
 | Ruby                  | ✓   | lsp, rubocop, tree-sitter                                                                                      | rubocop, standardrb     |
@@ -18,13 +18,13 @@ Dispatch is diagnostics-oriented: automatic formatting and safe autofix happen i
 | Fish                  | ✓ (fish-lsp) | lsp, fish-indent                                                                                      | fish_indent             |
 | CSS/SCSS/Less         | ✓   | lsp, stylelint                                                                                                 | biome, prettier         |
 | HTML                  | ✓   | lsp, htmlhint                                                                                                  | prettier                |
-| YAML                  | ✓   | lsp, yamllint, actionlint (GitHub workflows)                                                                   | prettier                |
-| JSON                  | ✓   | lsp                                                                                                            | biome, prettier         |
+| YAML                  | ✓   | lsp, yamllint, actionlint (GitHub workflows), trivy-config (opt-in; Kubernetes manifests, CloudFormation)      | prettier                |
+| JSON                  | ✓   | lsp, trivy-config (opt-in; CloudFormation templates only)                                                      | biome, prettier         |
 | Svelte                | ✓   | lsp                                                                                                            | oxfmt (needs `svelte` pkg installed + config `svelte: true`) |
 | Vue                   | ✓   | lsp                                                                                                            | prettier, oxfmt         |
 | SQL                   | —   | sqlfluff                                                                                                       | sqlfluff                |
 | Markdown              | —   | spellcheck, markdownlint, vale                                                                                 | prettier                |
-| Docker                | ✓   | lsp, hadolint                                                                                                  | —                       |
+| Docker                | ✓   | lsp, hadolint, trivy-config (opt-in)                                                                           | —                       |
 | PHP                   | ✓   | lsp, php-lint, phpstan                                                                                         | php-cs-fixer            |
 | PowerShell            | ✓   | lsp, psscriptanalyzer                                                                                          | psscriptanalyzer-format |
 | Prisma                | ✓   | lsp, prisma-validate                                                                                           | —                       |
@@ -46,4 +46,70 @@ Dispatch is diagnostics-oriented: automatic formatting and safe autofix happen i
 | Terragrunt            | —   | terragrunt                                                                                                     | terragrunt hcl fmt      |
 | Nix                   | ✓   | lsp                                                                                                            | nixfmt                  |
 | TOML                  | ✓   | lsp, taplo                                                                                                     | taplo                   |
-| CMake                 | ✓ (cmake-language-server) | lsp                                                                                           | cmake-format            |
+| CMake                 | ✓ (cmake-language-server) | lsp                                                                                      | cmake-format            |
+| CUE                   | ✓ (syntax via cue lsp, evaluation via cue vet) | lsp, cue-vet                                                              | cue fmt                 |
+
+`cue lsp` reports load and parse errors as you type but leaves conflicting
+values and failed constraints to `cue vet` — the `cue-vet` auxiliary runner
+(#1522) covers that gap, so together they give full coverage: syntax/parse
+diagnostics, hover, definition, completion, code actions, and formatting from
+the language server, plus evaluation-error validation from `cue vet` on every
+edit (vetted at the PACKAGE level — the touched file's directory — with the
+result filtered back to that file, since CUE packages are directory-scoped).
+`.cue` files parse under tree-sitter with symbol (`#Definition`s, fields,
+`let` bindings) and import queries (#1522), giving CUE the same structural
+symbol search and import extraction as any other language, with two known
+rough edges inherited from the young `tree-sitter-cue` grammar itself (not
+this repo's queries):
+
+- **Multi-hash raw strings** (`` ##"..."## ``, two or more `#` delimiters)
+  mis-parse regardless of content — the field's value becomes a bare
+  `identifier` node instead of a `string`, and the parser emits stray
+  top-level nodes outside the field entirely. Because the broken value node
+  can carry `#`-prefixed text, this can surface as a spurious symbol
+  reference in the extracted refs. Single-hash raw strings (`` #"..."# ``)
+  are unaffected.
+- **Aliased field labels** (`X=name: value`) emit the alias identifier (`X`)
+  as its own spurious `property` symbol alongside the real field's correct
+  symbol, because the grammar exposes both identifiers as untagged siblings
+  under the same `label` node with no way to tell them apart structurally.
+
+Both are upstream grammar limitations (tracked among
+[eonpatapon/tree-sitter-cue](https://github.com/eonpatapon/tree-sitter-cue)'s
+open issues), not something a query change here can fix.
+
+## Considered and skipped (2026-08-20 survey, closed out by #1757)
+
+Recorded so these are not re-litigated. The 2026-08-20 survey's first pass
+rejected `bandit` and `checkov` as duplicates of existing lanes; #1752's
+review disproved both "already covered" claims against the actual code, and
+#1757 closed the resulting gaps:
+
+- **bandit** (Python SAST) — RESOLVED. ruff's `S` ruleset implements Bandit's
+  checks; `config/ruff/core.toml` now selects `S`, with `S101` (assert),
+  `S311` (non-cryptographic random), `S603`/`S607` (subprocess without
+  `shell=True` / partial executable path) excluded as over-firing on real
+  code (measured against the `requests` and `pip` packages — see the config
+  file's comments for the exclusion reasoning and hit counts). `C90`
+  (mccabe complexity) was evaluated and NOT enabled: it is a maintainability
+  metric, not a Bandit-equivalent security check, and its hit volume on a
+  large pre-existing codebase (379 in `pandas`) would drown the security
+  signal `S` adds. As always, a project-local ruff config overrides the
+  bundled one outright.
+- **checkov** (IaC security) — the `trivy config` lane pi-lens's own dispatch
+  registry already carries (`clients/dispatch/runners/trivy-config.ts`,
+  opt-in via `trivy.enabled`) makes checkov a duplicate, not a gap: no
+  second full-scan tool is needed. That lane covers Kubernetes manifests,
+  Dockerfiles, and Terraform; #1757 added CloudFormation (yaml and json
+  templates, detected via `AWSTemplateFormatVersion` / SAM `Transform` /
+  `Type: AWS::*` heuristics) and fixed a real bug found while verifying
+  against the installed binary: the runner passed `--no-progress` to `trivy
+  config`, a flag that subcommand rejects (only `trivy fs` accepts it) —
+  every real invocation exited 1 and, because trivy prints its usage text to
+  stdout on a rejected flag, was misreported as a clean `succeeded` scan
+  rather than an errored one. Dropping the flag was the fix.
+- **radon / lizard** (complexity) — still not enabled; see the C90 note
+  above. Unchanged conclusion, now backed by measurement rather than
+  assumption.
+
+Known coverage holes with no tool currently clearing the adoption bar: Rust and Java dead-code detection, Ruby type checking (sorbet judged too heavy and idiosyncratic for a default lane).

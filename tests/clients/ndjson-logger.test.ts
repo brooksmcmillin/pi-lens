@@ -2,9 +2,33 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// `vi.spyOn(fs, "appendFileSync")` cannot redefine node:fs's ESM namespace
+// export directly (see workspace-topology.test.ts) — wrap it via vi.mock
+// instead, keeping the real implementation by default so every other test in
+// this file is unaffected; the #1970 flushSync tests override it per-call via
+// mockImplementationOnce. `fsMockState` is `vi.hoisted` so the factory below
+// (itself hoisted above this file's imports) can stash the real
+// implementation somewhere `afterEach` can reach it to fully reset the mock
+// (see `afterEach` below) — a `mockClear()` alone leaves queued
+// `mockImplementationOnce` entries from a test whose retry path never
+// consumed them (e.g. after the retry-removal mutation probe) to leak into
+// whichever test runs next.
+const fsMockState = vi.hoisted(() => ({
+	realAppendFileSync:
+		undefined as unknown as typeof import("node:fs").appendFileSync,
+}));
+vi.mock("node:fs", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:fs")>();
+	fsMockState.realAppendFileSync = actual.appendFileSync;
+	return { ...actual, appendFileSync: vi.fn(actual.appendFileSync) };
+});
+
 import {
 	_exitFlushersForTest,
 	createNdjsonLogger,
+	getSinkWriteFailures,
+	resetSinkWriteFailures,
 } from "../../clients/ndjson-logger.js";
 import { removeTempDirSync } from "./test-utils.js";
 
@@ -18,7 +42,21 @@ beforeEach(() => {
 
 afterEach(() => {
 	vi.restoreAllMocks();
+	// `fs.appendFileSync` is a module-scope `vi.fn()` (see the `vi.mock` above),
+	// not a per-test `vi.spyOn` — `restoreAllMocks()` doesn't touch it at all.
+	// `mockReset()` (not `mockClear()`) also drops any QUEUED
+	// `mockImplementationOnce` entries a test left unconsumed, then the real
+	// implementation is restored as the default so every other test's writes
+	// still land on disk.
+	const appendFileSync = fs.appendFileSync as unknown as ReturnType<
+		typeof vi.fn
+	>;
+	appendFileSync.mockReset();
+	if (fsMockState.realAppendFileSync) {
+		appendFileSync.mockImplementation(fsMockState.realAppendFileSync);
+	}
 	removeTempDirSync(tmpDir);
+	resetSinkWriteFailures();
 });
 
 function readLines(file: string): string[] {
@@ -453,9 +491,9 @@ describe("createNdjsonLogger", () => {
 			vi.resetModules();
 			const freshModule = await import("../../clients/ndjson-logger.js");
 			expect(freshModule._exitFlushersForTest()).toContain(legacyFlusher);
-			expect(() => freshModule.createNdjsonLogger({ filePath: logFile })).toThrow(
-				/pre-7e4b9120.*private queues/,
-			);
+			expect(() =>
+				freshModule.createNdjsonLogger({ filePath: logFile }),
+			).toThrow(/pre-7e4b9120.*private queues/);
 		} finally {
 			globalHost[key] = previous;
 			vi.resetModules();
@@ -503,5 +541,254 @@ describe("createNdjsonLogger", () => {
 		});
 		logger.log({ nope: true });
 		await expect(logger.flush()).resolves.toBeUndefined();
+	});
+
+	describe("reopen-and-retry on write failure (#1970)", () => {
+		it("recovers a write that fails once (e.g. a destroyed sink), no loss recorded", async () => {
+			const realAppendFile = fs.promises.appendFile.bind(fs.promises);
+			const appendFile = vi
+				.spyOn(fs.promises, "appendFile")
+				.mockImplementationOnce(async () => {
+					const err = new Error(
+						"Cannot call write after a stream was destroyed",
+					) as NodeJS.ErrnoException;
+					err.code = "ERR_STREAM_DESTROYED";
+					throw err;
+				})
+				.mockImplementation(realAppendFile);
+
+			const logger = createNdjsonLogger({ filePath: logFile });
+			logger.log({ recovered: true });
+			await logger.flush();
+
+			// The retry landed the line — nothing was lost.
+			expect(readLines(logFile).map((line) => JSON.parse(line))).toEqual([
+				{ recovered: true },
+			]);
+			expect(appendFile).toHaveBeenCalledTimes(2);
+			expect(getSinkWriteFailures()).toEqual([]);
+		});
+
+		it("counts an unrecoverable write as a loss instead of throwing or dropping silently", async () => {
+			const err = new Error(
+				"Cannot call write after a stream was destroyed",
+			) as NodeJS.ErrnoException;
+			err.code = "ERR_STREAM_DESTROYED";
+			const appendFile = vi
+				.spyOn(fs.promises, "appendFile")
+				.mockRejectedValue(err);
+
+			const logger = createNdjsonLogger({ filePath: logFile });
+			logger.log({ lost: true });
+
+			// Never throws or rejects — the write is dropped, not fatal.
+			await expect(logger.flush()).resolves.toBeUndefined();
+			// Exactly one retry (two attempts total), not an unbounded loop.
+			expect(appendFile).toHaveBeenCalledTimes(2);
+			expect(fs.existsSync(logFile)).toBe(false);
+
+			const failures = getSinkWriteFailures();
+			expect(failures).toHaveLength(1);
+			expect(failures[0]?.file).toContain("test.log");
+			expect(failures[0]?.droppedCount).toBe(1);
+		});
+
+		it("flushSync (the exit-handler path) recovers a write that fails once, no loss recorded", () => {
+			const err = new Error(
+				"Cannot call write after a stream was destroyed",
+			) as NodeJS.ErrnoException;
+			err.code = "ERR_STREAM_DESTROYED";
+			const appendFileSync = fs.appendFileSync as unknown as ReturnType<
+				typeof vi.fn
+			>;
+			// Only the FIRST attempt fails; the retry (2nd call) falls through to
+			// the real implementation the mock was created with — proving the
+			// sync path's reopen-and-retry actually recovers, not just counts.
+			appendFileSync.mockImplementationOnce(() => {
+				throw err;
+			});
+
+			const logger = createNdjsonLogger({ filePath: logFile });
+			logger.log({ recovered: true });
+			expect(() => logger.flushSync()).not.toThrow();
+
+			expect(readLines(logFile).map((line) => JSON.parse(line))).toEqual([
+				{ recovered: true },
+			]);
+			expect(appendFileSync).toHaveBeenCalledTimes(2);
+			expect(getSinkWriteFailures()).toEqual([]);
+		});
+
+		it("flushSync (the exit-handler path) also reopens-and-retries, and counts an unrecoverable loss", () => {
+			const err = new Error(
+				"Cannot call write after a stream was destroyed",
+			) as NodeJS.ErrnoException;
+			err.code = "ERR_STREAM_DESTROYED";
+			const appendFileSync = fs.appendFileSync as unknown as ReturnType<
+				typeof vi.fn
+			>;
+			// Both attempts (initial write + the one reopen-retry) fail; further
+			// calls (there should be none) fall back to the real implementation.
+			appendFileSync
+				.mockImplementationOnce(() => {
+					throw err;
+				})
+				.mockImplementationOnce(() => {
+					throw err;
+				});
+
+			const logger = createNdjsonLogger({ filePath: logFile });
+			logger.log({ lost: true });
+			// Must not throw out of the process-exit path.
+			expect(() => logger.flushSync()).not.toThrow();
+
+			const failures = getSinkWriteFailures();
+			expect(failures).toHaveLength(1);
+			expect(failures[0]?.droppedCount).toBe(1);
+		});
+
+		it("a lost write's loss is observable through the degradation ledger (pilens_health)", async () => {
+			const { getDegradationSummary, resetDegradationLedger } =
+				await import("../../clients/degradation-ledger.js");
+			resetDegradationLedger();
+			const err = new Error(
+				"Cannot call write after a stream was destroyed",
+			) as NodeJS.ErrnoException;
+			err.code = "ERR_STREAM_DESTROYED";
+			vi.spyOn(fs.promises, "appendFile").mockRejectedValue(err);
+
+			const logger = createNdjsonLogger({ filePath: logFile });
+			logger.log({ lost: true });
+			await logger.flush();
+
+			const summary = getDegradationSummary();
+			const group = summary.find((g) => g.kind === "log-sink-write-failure");
+			expect(group).toBeDefined();
+			expect(group?.count).toBeGreaterThanOrEqual(1);
+			expect(
+				group?.latestReasons.some((entry) =>
+					entry.subject.includes("test.log"),
+				),
+			).toBe(true);
+
+			resetDegradationLedger();
+		});
+
+		it("does not recurse: reporting a loss never itself performs I/O through the failing sink", async () => {
+			// Regression for the stated recursion hazard: recording a dropped
+			// write must never enqueue another write against the same dying sink
+			// (which would itself fail, be recorded, enqueue again, ... forever).
+			const err = new Error(
+				"Cannot call write after a stream was destroyed",
+			) as NodeJS.ErrnoException;
+			err.code = "ERR_STREAM_DESTROYED";
+			const appendFile = vi
+				.spyOn(fs.promises, "appendFile")
+				.mockRejectedValue(err);
+
+			const logger = createNdjsonLogger({ filePath: logFile });
+			for (let i = 0; i < 10; i++) logger.log({ i });
+			await logger.flush();
+
+			// 10 lines batched into one write attempt (plus its one retry) = 2
+			// calls, not an ever-growing chain of self-reporting writes.
+			expect(appendFile).toHaveBeenCalledTimes(2);
+			expect(getSinkWriteFailures()[0]?.droppedCount).toBe(10);
+		});
+
+		// applyQueueItemAsync (the single-item write helper) is only reachable in
+		// production through drainLoop's `syncRepairItems` replay — the same race
+		// "repairs a late append that would otherwise reintroduce pre-truncate
+		// data" above exercises: an in-flight append is still pending when
+		// flushSync races ahead of it across a truncate, so the truncate and
+		// whatever followed it get replayed through applyQueueItemAsync once the
+		// late append settles, to guarantee they land AFTER it.
+		describe("applyQueueItemAsync's reopen-and-retry (the syncRepairItems replay path)", () => {
+			interface RepairReplaySetup {
+				logger: ReturnType<typeof createNdjsonLogger>;
+				release: () => void;
+			}
+
+			async function triggerRepairReplay(): Promise<RepairReplaySetup> {
+				let releaseAppend: (() => void) | undefined;
+				const realAppendFile = fs.promises.appendFile.bind(fs.promises);
+				vi.spyOn(fs.promises, "appendFile").mockImplementationOnce(
+					async (file, data, options) => {
+						await new Promise<void>((resolve) => {
+							releaseAppend = resolve;
+						});
+						return realAppendFile(file, data, options);
+					},
+				);
+				const logger = createNdjsonLogger({ filePath: logFile });
+				logger.log({ before: true });
+				await vi.waitFor(() => expect(releaseAppend).toBeDefined());
+				logger.truncate();
+				logger.log({ after: true });
+				logger.flushSync();
+				// Same assertion as the un-mocked repair test: flushSync already
+				// wrote the post-truncate state synchronously.
+				expect(readLines(logFile).map((line) => JSON.parse(line))).toEqual([
+					{ after: true },
+				]);
+				return { logger, release: () => releaseAppend?.() };
+			}
+
+			it("recovers a repair-replay write that fails once, no loss recorded", async () => {
+				const { logger, release } = await triggerRepairReplay();
+				// Call 1 (already consumed) was the hung-then-real "before" write.
+				// Call 2 is the repair replay's first attempt at "after" — fails.
+				// Call 3 is applyQueueItemAsync's own retry — falls through to real.
+				const appendFile = vi
+					.spyOn(fs.promises, "appendFile")
+					.mockImplementationOnce(async () => {
+						const err = new Error(
+							"Cannot call write after a stream was destroyed",
+						) as NodeJS.ErrnoException;
+						err.code = "ERR_STREAM_DESTROYED";
+						throw err;
+					});
+
+				release();
+				await logger.flush();
+
+				expect(readLines(logFile).map((line) => JSON.parse(line))).toEqual([
+					{ after: true },
+				]);
+				// vi.spyOn returns the SAME spy across repeated calls on an
+				// already-mocked property, so this count includes the earlier
+				// hung-then-real "before" write too: 1 (before) + 1 (repair attempt,
+				// fails) + 1 (repair retry, recovers) = 3.
+				expect(appendFile).toHaveBeenCalledTimes(3);
+				expect(getSinkWriteFailures()).toEqual([]);
+			});
+
+			it("counts a repair-replay write that never recovers as a loss, without throwing", async () => {
+				const { logger, release } = await triggerRepairReplay();
+				const err = new Error(
+					"Cannot call write after a stream was destroyed",
+				) as NodeJS.ErrnoException;
+				err.code = "ERR_STREAM_DESTROYED";
+				// Both the repair replay's initial attempt and its one retry fail.
+				const appendFile = vi
+					.spyOn(fs.promises, "appendFile")
+					.mockImplementationOnce(async () => {
+						throw err;
+					})
+					.mockImplementationOnce(async () => {
+						throw err;
+					});
+
+				release();
+				await expect(logger.flush()).resolves.toBeUndefined();
+
+				// 1 (before) + 1 (repair attempt) + 1 (repair retry) = 3, same
+				// accumulation as the recovery test above.
+				expect(appendFile).toHaveBeenCalledTimes(3);
+				const failures = getSinkWriteFailures();
+				expect(failures).toHaveLength(1);
+				expect(failures[0]?.droppedCount).toBe(1);
+			});
+		});
 	});
 });

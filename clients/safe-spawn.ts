@@ -70,15 +70,83 @@ export function hasSpawnFailureKind(
 	);
 }
 
+/**
+ * #2010: derive teardown evidence from observed timestamps.
+ *
+ * Pure by design so every branch is deterministically unit-testable,
+ * including the natural-exit-at-budget-expiry race where the timeout
+ * callback arms a kill against an already-dead child.
+ *
+ * - No recorded kill start (the guard saw the child already dying), no
+ *   observed death at all, or death PREDATING the kill start: the child
+ *   left on its own -> "exited", ms 0. Claiming a kill we cannot
+ *   distinguish from a natural exit would be invented evidence.
+ * - Death observed after the kill started: "escalate-kill" when the
+ *   SIGKILL escalation fired, otherwise "killed-by-signal"; ms is the
+ *   observed gap (floor 0 - clock jitter must never produce a negative).
+ */
+export function resolveTeardownOutcome(input: {
+	killStartedAtMs?: number;
+	deathObservedAtMs?: number;
+	escalated: boolean;
+}):
+	| {
+			ms: number;
+			outcome: "exited" | "killed-by-signal" | "escalate-kill";
+	  }
+	| undefined {
+	// Another path (abort / output-limit) owns this death: emitting teardown
+	// evidence here would describe a kill this timeout didn't perform.
+	if (
+		input.killStartedAtMs === undefined ||
+		input.deathObservedAtMs === undefined
+	) {
+		return undefined;
+	}
+	// True natural-exit race: the child beat the budget-expired kill by a
+	// hair - death observed before (or exactly at) the kill start.
+	if (input.deathObservedAtMs <= input.killStartedAtMs) {
+		return { ms: 0, outcome: "exited" };
+	}
+	return {
+		ms: Math.max(0, input.deathObservedAtMs - input.killStartedAtMs),
+		outcome: input.escalated ? "escalate-kill" : "killed-by-signal",
+	};
+}
+
 export interface SpawnResult {
 	stdout: string;
 	stderr: string;
 	status: number | null;
+	/**
+	 * The signal that killed the child, when one did (#1816). Before this the
+	 * signal name lived only inside `error.message`, so no caller could name it
+	 * and every ledger reason rendered a SIGKILLed tool indistinguishably from
+	 * a clean exit. Absent for a normally-exited process.
+	 */
+	signal?: NodeJS.Signals;
 	error?: Error;
 	/** Typed spawn-boundary failure; nonzero tool exits do not populate it. */
 	spawnFailure?: SpawnFailureError;
 	/** Structured failure reason; nonzero exit statuses are not spawn failures. */
 	failure?: SpawnFailureKind;
+	/**
+	 * #2010: how the process tree died after the spawn's OWN timeout budget
+	 * expired - present on that path only. `ms` is wall-clock from budget
+	 * expiry to observed tree death, measured separately from the budget so
+	 * a slow teardown is visible rather than folded into "how long the tool
+	 * ran". `outcome`: the child beat the signal ("exited"), the first
+	 * signal ended it ("killed-by-signal"), or the SIGKILL escalation fired
+	 * ("escalate-kill"). Platform note: on Windows taskkill /F is always
+	 * forceful and arms no escalation timer, so "escalate-kill" is
+	 * POSIX-only; forced Windows kills report "killed-by-signal" despite no
+	 * signal being delivered - the name describes the semantic tier
+	 * (first-tier vs escalated force), not the OS mechanism.
+	 */
+	timeoutTeardown?: {
+		ms: number;
+		outcome: "exited" | "killed-by-signal" | "escalate-kill";
+	};
 	/** True when stdout or stderr was capped before process completion. */
 	outputTruncated?: boolean;
 	/** Peak/average CPU%+RSS sampled across this spawn's lifetime (#620).
@@ -114,7 +182,6 @@ function cwdIsUnresolvableSync(cwd: string | undefined): boolean {
 	}
 }
 
-
 /**
  * Best-effort presence probe used ONLY to disambiguate ENOENT when the cwd is
  * ALSO unresolvable (#1340 review): a genuinely missing tool must classify as
@@ -127,7 +194,12 @@ function cwdIsUnresolvableSync(cwd: string | undefined): boolean {
 function commandProbablyPresent(command: string): boolean | "ambiguous" {
 	const exts =
 		process.platform === "win32"
-			? ["", ...(process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean)]
+			? [
+					"",
+					...(process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD")
+						.split(";")
+						.filter(Boolean),
+				]
 			: [""];
 	const existsWithExt = (base: string): boolean => {
 		for (const ext of exts) {
@@ -232,7 +304,8 @@ export async function classifySpawnFailure(
 ): Promise<SpawnFailureError> {
 	const cause = toError(error);
 	const needsCwdProbe = errorCode(cause) === "ENOENT";
-	const cwdUnresolvable = needsCwdProbe && (await cwdIsUnresolvable(options.cwd));
+	const cwdUnresolvable =
+		needsCwdProbe && (await cwdIsUnresolvable(options.cwd));
 	return classifyWithCwdFlag(cause, options, cwdUnresolvable);
 }
 
@@ -316,7 +389,14 @@ function killPidTreeSync(pid: number): void {
 		return;
 	}
 	try {
-		process.kill(pid, "SIGKILL");
+		// #2026: negative pid = whole process group (POSIX children spawn
+		// detached), reaching grandchildren too. Any failure (ESRCH = already
+		// gone, EPERM = raced) falls through to the direct-child attempt.
+		try {
+			process.kill(-pid, "SIGKILL");
+		} catch {
+			process.kill(pid, "SIGKILL");
+		}
 	} catch {
 		// Child already exited.
 	}
@@ -395,13 +475,19 @@ function cmdEscapeArg(arg: string): string {
  * that already worked. The `chcp 65001` prefix forces the UTF-8 code page (so
  * tool output isn't mangled by the system code page) and, as a side benefit,
  * keeps the (possibly quoted) command off the front of the line, avoiding
- * cmd.exe's `/s` outer-quote-stripping quirk.
+ * cmd.exe's `/s` outer-quote-stripping quirk. #2023: chcp is invoked via its
+ * absolute `%SystemRoot%\System32\chcp.com` path and chained with `&`, not
+ * `&&` — a child environment whose PATH cannot resolve System32 used to fail
+ * the bare `chcp` lookup, and `&&` then short-circuited EVERY .cmd/.bat spawn
+ * into exit 1 with empty output. With the pin plus `&`, even a chcp failure
+ * can never suppress the real command.
  */
 export function buildWindowsShellCommand(
 	command: string,
 	args: string[],
 ): string {
-	return `chcp 65001 >nul 2>&1 && ${[command, ...args].map(cmdEscapeArg).join(" ")}`;
+	const chcp = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\chcp.com`;
+	return `${chcp} 65001 >nul 2>&1 & ${[command, ...args].map(cmdEscapeArg).join(" ")}`;
 }
 
 // ============================================================================
@@ -990,6 +1076,22 @@ export function resetUtf8ConsoleCodePageStateForTests(): void {
 	utf8ConsoleCodePageApplied = false;
 }
 
+// #1656: post-exit pipe-idle wait constants. Node's "close" event only fires
+// once every stdio fd referencing the child has been released — a
+// daemonized descendant that inherited our stdout/stderr pipe (the Windows
+// no-job-object case) can hold that fd open forever, hanging "close" even
+// though the child we spawned is long dead. A fixed post-exit deadline
+// avoids that hang but truncates a legitimately still-streaming child. The
+// idle-grace construction (adopted from pi's `waitForChildProcess`) does
+// neither: after "exit", wait for the pipes to go quiet — no data for
+// EXIT_PIPE_IDLE_GRACE_MS, re-armed on every chunk — so a quiet inherited
+// handle still releases after one grace window while an actively-writing
+// descendant keeps being read. EXIT_PIPE_IDLE_MAX_WAIT_MS caps the total
+// extra wait so a pathological, never-quiet descendant can't extend the
+// caller's overall budget unboundedly.
+const EXIT_PIPE_IDLE_GRACE_MS = 100;
+const EXIT_PIPE_IDLE_MAX_WAIT_MS = 2000;
+
 // ============================================================================
 // ASYNC VERSION (Recommended - Non-blocking)
 // ============================================================================
@@ -1062,7 +1164,18 @@ export async function safeSpawnAsync(
 		let aborted = false;
 		let killed = false;
 		let outputTruncated = false;
-		let spawnErrored = false;
+		// #1651 review: a single boolean the close/error handlers both check
+		// AND set, so whichever one decides the outcome first wins outright —
+		// the DECISION itself is shape-based (see the `close` handler below),
+		// this flag only stops the loser from resolving a second time.
+		let resolved = false;
+		// The most recent 'error' Error, captured the instant the event fires
+		// regardless of whether that handler goes on to resolve. The `close`
+		// handler's shape-based branch (code === null || code < 0) reads this
+		// when it decides FIRST, so a genuinely informative ENOENT/EACCES/etc.
+		// Error is used when it happens to already be available, instead of
+		// always falling back to a generic synthesized one.
+		let pendingSpawnError: Error | undefined;
 		// #1109: the non-Windows SIGTERM→SIGKILL escalation timer (armed in
 		// killTree below). Stored per-call (never shared) so the close/error
 		// handlers can clear it if the child exits before it fires — same
@@ -1070,6 +1183,15 @@ export async function safeSpawnAsync(
 		// a ref'd 1s timer that outlives the child it was escalating against
 		// would keep a one-shot `pi --print` process alive for up to 1s.
 		let escalationTimer: ReturnType<typeof setTimeout> | undefined;
+		let teardownStartedAtMs: number | undefined;
+		let teardownEscalated = false;
+		// #2010: teardown evidence for the spawn's OWN timeout. The wall clock
+		// starts when the budget expires and the tree-kill is issued, and stops
+		// when the process tree is observed dead (`await killPromise` settles)
+		// - measured SEPARATELY from the budget itself, so a slow teardown is
+		// visible instead of silently inflating "how long the tool ran".
+		// `teardownEscalated` names whether SIGTERM sufficed or the SIGKILL
+		// escalation fired (POSIX; Windows taskkill /F is always forceful).
 		// #1114: `child.killed` is set by Node the moment `kill()` successfully
 		// SENDS a signal, not when the child actually dies — so gating the
 		// escalation on `!child.killed` right after a successful `SIGTERM` send
@@ -1078,6 +1200,11 @@ export async function safeSpawnAsync(
 		// any `await`, so a timer firing during the close handler's `await
 		// killPromise` still observes the flag correctly).
 		let closed = false;
+		// #1656: set only while the post-exit idle-pipe wait is active (see
+		// waitForPipeIdle below); the stdout/stderr "data" handlers call this to
+		// re-arm the grace timer on every chunk. `undefined` before exit / after
+		// the wait settles, so the calls below are no-ops outside that window.
+		let rearmIdleGrace: (() => void) | undefined;
 		const maxOutputBytes =
 			options?.maxOutputBytes !== undefined &&
 			Number.isFinite(options.maxOutputBytes) &&
@@ -1204,6 +1331,14 @@ export async function safeSpawnAsync(
 		}
 
 		let child: ChildProcess;
+		// #2026: on POSIX, run the child in its OWN process group (detached).
+		// killTree/killPidTreeSync then signal the whole GROUP (-pid), which
+		// makes grandchildren (npm -> node, sh -> sleep, etc.) die with their
+		// tool instead of surviving every timeout as orphans. Detachment stops
+		// direct terminal-signal delivery, so EVERY POSIX pid registers for
+		// lifetime cleanup - pi's signal/exit handlers forward the kill,
+		// preserving die-with-host semantics.
+		const posixProcessGroup = process.platform !== "win32";
 		try {
 			child = spawn(spawnCmd, spawnArgs, {
 				cwd: spawnCwd,
@@ -1211,6 +1346,7 @@ export async function safeSpawnAsync(
 				windowsHide: true,
 				shell: false,
 				windowsVerbatimArguments,
+				detached: posixProcessGroup,
 			});
 		} catch (err) {
 			// A SYNCHRONOUS spawn throw (Windows `spawn UNKNOWN`/EINVAL — the
@@ -1224,23 +1360,26 @@ export async function safeSpawnAsync(
 			void classifySpawnFailure(cause, { command, cwd: options?.cwd }).then(
 				(spawnFailure) =>
 					resolve({
-				stdout: "",
-				stderr: "",
-				status: null,
-				error: cause,
-				failure: "spawn",
-				spawnFailure,
+						stdout: "",
+						stderr: "",
+						status: null,
+						error: cause,
+						failure: "spawn",
+						spawnFailure,
 					}),
 			);
 			return;
 		}
-		if (options?.lifetimeCoupled && child.pid) {
+		if (child.pid && (posixProcessGroup || options?.lifetimeCoupled)) {
+			// #2026: POSIX registers unconditionally - detached children no
+			// longer receive terminal signals directly, so the lifetime
+			// cleanup's signal forwarding IS their die-with-host path.
 			installLifetimeCleanup();
 			lifetimeState.pids.add(child.pid);
 		}
 
 		// #620: bracket this spawn's lifetime with a short-interval CPU/RSS poll
-		// (started right here, stopped in the "close" handler below) so transient
+		// (started right here, stopped in finalize() below) so transient
 		// analyzer children (jscpd, knip, madge, gitleaks, etc.) — which live too
 		// briefly for heartbeat-cadence sampling to reliably catch — still get a
 		// peak/average resource reading. `startSpawnUsageSampler` itself is
@@ -1281,10 +1420,51 @@ export async function safeSpawnAsync(
 				} catch {
 					child.kill("SIGKILL");
 				}
+			} else if (posixProcessGroup && child.pid && child.pid > 0) {
+				// #2026: signal the whole process group. Grandchildren spawned
+				// by the tool share its group, so one signal reaches the whole
+				// tree; a negative-pid ESRCH means it already exited.
+				const pgid = -child.pid;
+				try {
+					process.kill(pgid, "SIGTERM");
+				} catch {
+					child.kill("SIGTERM");
+				}
+				// #2027 round-1: gate the SIGKILL escalation on GROUP liveness,
+				// not direct-child death - a tool can exit instantly on SIGTERM
+				// while a SIGTERM-hardy grandchild keeps the group alive. The
+				// timer stays REF'D for group mode (max 1s tail after resolve):
+				// it is the only backstop for this group once finalize deletes
+				// the pid from lifetimeState.
+				escalationTimer = setTimeout(() => {
+					let groupAlive = true;
+					try {
+						process.kill(pgid, 0);
+					} catch {
+						groupAlive = false;
+					}
+					if (!groupAlive) return;
+					teardownEscalated = true;
+					logLatency({
+						type: "phase",
+						phase: "spawn_group_kill_escalation",
+						filePath: "",
+						durationMs: 0,
+						metadata: { pgid: child.pid },
+					});
+					try {
+						process.kill(pgid, "SIGKILL");
+					} catch {
+						// Raced with group exit.
+					}
+				}, 1000);
 			} else {
 				child.kill("SIGTERM");
 				escalationTimer = setTimeout(() => {
-					if (!closed) child.kill("SIGKILL");
+					if (!closed) {
+						teardownEscalated = true;
+						child.kill("SIGKILL");
+					}
 				}, 1000);
 			}
 		};
@@ -1299,7 +1479,7 @@ export async function safeSpawnAsync(
 		};
 		abortSignal?.addEventListener("abort", onAbort, { once: true });
 
-		// Output-cap kills are awaited by the close handler below, just like
+		// Output-cap kills are awaited by finalize() below, just like
 		// timeout/abort kills. This keeps a noisy CLI from continuing in the
 		// background after its retained output has been bounded.
 		let killPromise: Promise<void> | undefined;
@@ -1316,10 +1496,35 @@ export async function safeSpawnAsync(
 		child.stdout?.on("data", (data) => {
 			stdout = appendOutput(stdout, data);
 			stopForOutputLimit();
+			rearmIdleGrace?.();
 		});
 		child.stderr?.on("data", (data) => {
 			stderr = appendOutput(stderr, data);
 			stopForOutputLimit();
+			rearmIdleGrace?.();
+		});
+
+		// #1673 review round 3 (F2): registered HERE, at spawn time, alongside
+		// the other handlers above — not inside `waitForPipeIdle`. Real Node
+		// emits `close` a fraction of a millisecond after `exit` (both fire in
+		// the same "process exit" turn, well before any microtask), so a
+		// listener attached inside `waitForPipeIdle` — which `finalize` only
+		// reaches after `await killPromise`, at least one microtask later — is
+		// always attaching to an event that has already happened. That's why
+		// the round-2 `child.on("close", finish)` placed inside
+		// `waitForPipeIdle` never actually caught a real spawn's `close` early:
+		// every real call still paid the full grace window. Capturing the
+		// boolean here, before any await, means `waitForPipeIdle` can check
+		// "did close already happen" synchronously the moment it runs.
+		let closeSeen = false;
+		// #2010: WHEN death was observed - the stop-clock for teardown evidence
+		// and the discriminator for its outcome. A close that predates the
+		// budget-expired kill means the child exited on its own ("exited"), no
+		// matter that the timer callback raced and armed a kill anyway.
+		let closedAtMs: number | undefined;
+		child.on("close", () => {
+			closeSeen = true;
+			closedAtMs ??= Date.now();
 		});
 
 		// Timeout handling - KILL the process, don't just abandon it
@@ -1327,6 +1532,7 @@ export async function safeSpawnAsync(
 			timedOut = true;
 			if (!killed && !child.killed) {
 				killed = true;
+				teardownStartedAtMs = Date.now();
 				killPromise = killTree();
 			}
 		}, timeout);
@@ -1354,31 +1560,169 @@ export async function safeSpawnAsync(
 			return summary;
 		};
 
+		// #1656: wait for stdout/stderr to fall idle after exit instead of
+		// waiting for Node's "close" event (see the constants' doc comment
+		// above). Resolves immediately if the child has no pipes to drain.
+		//
+		// These timers stay REF'D, matching `timeoutId`/`escalationTimer`
+		// elsewhere in this function: the caller's own settlement depends on
+		// them firing, so unref'ing would let a short-lived host process (a
+		// one-shot CLI whose only other in-flight work was this spawn) exit
+		// the event loop before `finish` ever runs — silently abandoning this
+		// promise instead of merely leaking a handle. Both paths to `finish`
+		// clear both timers, so nothing outlives settlement either way.
+		const waitForPipeIdle = (): Promise<void> => {
+			if (!child.stdout && !child.stderr) return Promise.resolve();
+			// #1673 review round 3 (F2): `close` fires a fraction of a
+			// millisecond after `exit` for a real Node child — well before
+			// `finalize`'s `await killPromise` ever yields, i.e. before this
+			// function is even called. By the time we get here, `closeSeen`
+			// (set by the listener registered at spawn time, above) already
+			// reflects reality for the overwhelming majority of real spawns:
+			// nothing is holding this child's stdio open, so don't pay out the
+			// 100ms grace window for a signal that already arrived.
+			if (closeSeen) return Promise.resolve();
+			return new Promise((finishIdleWait) => {
+				let settled = false;
+				let graceTimer: ReturnType<typeof setTimeout> | undefined;
+				const capTimer: ReturnType<typeof setTimeout> = setTimeout(() => {
+					finish();
+				}, EXIT_PIPE_IDLE_MAX_WAIT_MS);
+				const finish = (): void => {
+					if (settled) return;
+					settled = true;
+					rearmIdleGrace = undefined;
+					if (graceTimer) clearTimeout(graceTimer);
+					clearTimeout(capTimer);
+					// Optional chaining, not a bare call: `child` is a real Node
+					// ChildProcess (always an EventEmitter, always has this) in
+					// production, but several existing test doubles across the
+					// suite fake stdio-bearing children as plain objects with only
+					// the handful of methods (`on`, `kill`, ...) their scenario
+					// needs — no `removeListener`. Skipping cleanup on those is
+					// harmless (the fake is torn down with the test either way);
+					// crashing here from inside a timer callback is not: it would
+					// throw before `finishIdleWait()` runs, hanging every caller's
+					// `safeSpawnAsync` promise (#1673 review round 2 caught this
+					// live in tests/clients/installer/version-drift.test.ts).
+					child.removeListener?.("close", finish);
+					finishIdleWait();
+				};
+				// The `closeSeen` fast-path above catches the common case (close
+				// already happened by the time we get here). This listener is
+				// the fallback for the rare case where `close` genuinely lands
+				// DURING the wait — e.g. a child whose stdio takes a beat
+				// longer than usual to release, but still well under the grace
+				// window. `close` is a stronger signal than "no data for
+				// EXIT_PIPE_IDLE_GRACE_MS", so finishing on it here still beats
+				// waiting out the timer. The anti-hang property is untouched
+				// either way: a daemonized descendant holding the pipe open is
+				// EXACTLY the case where `close` never fires at all, so the
+				// grace/cap timers still bound that case as before.
+				child.on("close", finish);
+				rearmIdleGrace = (): void => {
+					if (graceTimer) clearTimeout(graceTimer);
+					graceTimer = setTimeout(finish, EXIT_PIPE_IDLE_GRACE_MS);
+				};
+				rearmIdleGrace();
+			});
+		};
+
 		// Process completion
-		child.on("close", async (code, signal) => {
-			if (spawnErrored) return;
+		//
+		// #1656 x #1651/#1670: finalize off BOTH `exit` and `close`, not just
+		// one — each covers a shape the other misses.
+		//   - `exit` is what unblocks the #1656 hang: a daemonized descendant
+		//     that inherited our stdout/stderr pipe can hold that fd open
+		//     forever, so `close` (which waits for every fd referencing the
+		//     child to release) never fires even though the child we spawned
+		//     is long dead. `exit` always fires once the child itself exits,
+		//     independent of who still holds its pipes.
+		//   - `close` is still wired because a child that never actually
+		//     launched (bad binary, EACCES, ...) gets NO `exit` event at all —
+		//     Node only emits `error` then `close(code<0, null)` for that
+		//     shape (#1651/#1670's shape guard below decides from exactly
+		//     this). `exit`-only would make that guard unreachable.
+		// Whichever fires first drives `finalize`; `settled` (distinct from
+		// `resolved`, which `finalize` itself owns) stops the second event
+		// from dispatching a redundant, concurrently-racing `finalize` call —
+		// double-invoking it would double-run `waitForPipeIdle` and
+		// `finishResourceUsage` against the same child.
+		let settled = false;
+		const onChildSettle = (
+			code: number | null,
+			signal: NodeJS.Signals | null,
+		): void => {
+			if (settled || resolved) return;
+			settled = true;
 			closed = true;
 			clearTimeout(timeoutId);
 			abortSignal?.removeEventListener("abort", onAbort);
 			if (child.pid) lifetimeState.pids.delete(child.pid);
+			void finalize(code, signal);
+		};
+
+		const finalize = async (
+			code: number | null,
+			signal: NodeJS.Signals | null,
+		): Promise<void> => {
+			// Belt, not the decision: whichever path settles `resolved` FIRST
+			// wins. A healthy run's outcome must never be discarded by a late,
+			// unrelated 'error' (e.g. a post-exit kill() that itself failed
+			// with EPERM, #1651 review F4) — so this only bails when something
+			// else has ALREADY resolved, never on `error` merely having fired.
 			await killPromise;
-			// #1109: the child has exited — if killTree armed the non-Windows
-			// SIGTERM→SIGKILL escalation timer and it hasn't fired yet, clear it
-			// so it doesn't linger as a ref'd handle after this promise resolves.
-			if (escalationTimer) clearTimeout(escalationTimer);
+			if (resolved) return;
+			// #1109: the child has exited - clear the non-Windows escalation
+			// timer so it doesn't linger as a ref'd handle. #2027 EXCEPTION:
+			// in POSIX group mode the timer is the liveness-gated SIGKILL
+			// backstop for SIGTERM-hardy grandchildren; it stays armed and
+			// self-cleans within 1s of firing (max 1s ref'd tail).
+			if (escalationTimer && !posixProcessGroup) {
+				clearTimeout(escalationTimer);
+			}
+			// #1673 review F1: latch the verdict as DECIDED here, before the
+			// idle-pipe wait — not after it. `code`/`signal`/`timedOut`/`aborted`
+			// are already fixed by this point (they don't change during the
+			// wait), so nothing below depends on staying unresolved across it.
+			// Leaving `resolved` false across the wait would reopen the exact
+			// race #1651 review F4 closed: a late, unrelated 'error' (e.g. a
+			// post-exit kill() failing with EPERM) landing inside the
+			// idle-grace window (bounded, but up to EXIT_PIPE_IDLE_MAX_WAIT_MS)
+			// would steal an already-decided healthy verdict. Pre-#1656 that
+			// race window was one microtask — the gap between `close` firing
+			// and `resolve()` being called synchronously in the same handler.
+			// This closes the window back down to that same shape instead of
+			// widening it to the whole wait.
+			resolved = true;
+			await waitForPipeIdle();
 			const resourceUsage = finishResourceUsage();
 
 			const outputInfo = outputTruncated ? { outputTruncated: true } : {};
+			// #1816: surface the signal name as a field on every path where one
+			// exists, so callers can NAME it instead of scraping `error.message`.
+			const signalInfo = signal ? { signal } : {};
 			if (timedOut) {
 				const cause = new Error(
 					`Process timed out after ${timeout}ms (killed with ${signal || "SIGTERM"})`,
 				);
+				// #2010: teardown evidence lives ONLY on the timeout path - it
+				// describes how long the tree took to die after the budget
+				// expired, and how it died ("exited" = the child beat the signal;
+				// "killed-by-signal" / "escalate-kill" = how WE ended it).
+				const timeoutTeardown = resolveTeardownOutcome({
+					killStartedAtMs: teardownStartedAtMs,
+					deathObservedAtMs: closedAtMs,
+					escalated: teardownEscalated,
+				});
 				resolve({
 					stdout,
 					stderr,
 					status: null,
 					error: cause,
 					failure: "timeout",
+					...signalInfo,
+					...(timeoutTeardown && { timeoutTeardown }),
 					spawnFailure: new SpawnFailureError("timeout", cause.message, cause),
 					...outputInfo,
 					resourceUsage,
@@ -1391,6 +1735,7 @@ export async function safeSpawnAsync(
 					status: null,
 					error: cause,
 					failure: "aborted",
+					...signalInfo,
 					spawnFailure: new SpawnFailureError("killed", cause.message, cause),
 					...outputInfo,
 					resourceUsage,
@@ -1403,21 +1748,64 @@ export async function safeSpawnAsync(
 					status: null,
 					error: cause,
 					failure: "signal",
+					...signalInfo,
 					spawnFailure: new SpawnFailureError("killed", cause.message, cause),
+					...outputInfo,
+					resourceUsage,
+				});
+			} else if (code === null || code < 0) {
+				// #1651 review F3: a real completed process never exits with a
+				// null or negative code (Node reports the negated libuv/errno for
+				// a child that never launched — e.g. ENOENT: -2 on Linux, -4058
+				// on Windows). This decides from that SHAPE alone, independent of
+				// whether/when 'error' has fired — Node's docs leave the
+				// 'error'/'close' ordering for a failed spawn unspecified, and a
+				// same-microtask re-check (the #1651 first-round fix) still loses
+				// if 'error' lands a tick later via setImmediate/nextTick.
+				// Reuse `pendingSpawnError` when 'error' already landed (a more
+				// informative Error — ENOENT vs EACCES vs other); otherwise
+				// synthesize an ENOENT-shaped one so a genuinely missing tool is
+				// never read as a clean, answered run.
+				const cause = pendingSpawnError ?? synthesizeEnoentError(command);
+				const spawnFailure = await classifySpawnFailure(cause, {
+					command,
+					cwd: options?.cwd,
+				});
+				resolve({
+					stdout,
+					stderr,
+					status: code,
+					error: cause,
+					failure: "spawn",
+					spawnFailure,
 					...outputInfo,
 					resourceUsage,
 				});
 			} else {
 				resolve({ stdout, stderr, status: code, ...outputInfo, resourceUsage });
 			}
-		});
+		};
+
+		child.on("exit", onChildSettle);
+		child.on("close", onChildSettle);
 
 		child.on("error", (err) => {
-			spawnErrored = true;
+			// Capture unconditionally — even when `close` already resolved, this
+			// keeps the most recent Error available for anyone reading state
+			// mid-flight, and costs nothing (the assignment, not a resolve).
+			pendingSpawnError = err;
+			// A completed run's own verdict must never be downgraded by an
+			// unrelated LATE error (#1651 review F4 — e.g. a post-exit kill()
+			// failing with EPERM after `close(0, null)` already answered).
+			if (resolved) return;
+			resolved = true;
 			closed = true;
 			clearTimeout(timeoutId);
 			abortSignal?.removeEventListener("abort", onAbort);
-			if (escalationTimer) clearTimeout(escalationTimer);
+			// #2027: group-mode timer stays armed as the grandchild backstop.
+			if (escalationTimer && !posixProcessGroup) {
+				clearTimeout(escalationTimer);
+			}
 			if (child.pid) lifetimeState.pids.delete(child.pid);
 			const resourceUsage = finishResourceUsage();
 			let failure: SpawnFailureKind = "spawn";
@@ -1441,7 +1829,9 @@ export async function safeSpawnAsync(
 				});
 			if (controlFailure) finish(controlFailure);
 			else {
-				void classifySpawnFailure(err, { command, cwd: options?.cwd }).then(finish);
+				void classifySpawnFailure(err, { command, cwd: options?.cwd }).then(
+					finish,
+				);
 			}
 		});
 	});

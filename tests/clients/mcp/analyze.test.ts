@@ -360,19 +360,42 @@ describe("analyzeFile", () => {
 		const second = path.join(tmpDir, "second.ts");
 		fs.writeFileSync(first, "export const first = 1;\n");
 		fs.writeFileSync(second, "export const second = 2;\n");
-		cache.addModifiedRange(first, { start: 1, end: 1 }, false, tmpDir, "mcp-live-a", "mcp");
+		cache.addModifiedRange(
+			first,
+			{ start: 1, end: 1 },
+			false,
+			tmpDir,
+			"mcp-live-a",
+			"mcp",
+		);
 		const foreignState = cache.readTurnState(tmpDir);
 		foreignState.owner!.pid = process.pid + 1;
 		cache.writeTurnState(foreignState, tmpDir);
-		const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true as never);
+		const killSpy = vi
+			.spyOn(process, "kill")
+			.mockImplementation(() => true as never);
 		try {
-			cache.addModifiedRange(second, { start: 1, end: 1 }, false, tmpDir, "mcp-live-b", "mcp");
+			cache.addModifiedRange(
+				second,
+				{ start: 1, end: 1 },
+				false,
+				tmpDir,
+				"mcp-live-b",
+				"mcp",
+			);
 			const state = cache.readTurnState(tmpDir);
 			expect(Object.keys(state.files)).toEqual(["first.ts"]);
-			expect(cache.getTurnStateAccess(tmpDir, { kind: "mcp", id: "mcp-live-b" })).toBe("foreign-live");
+			expect(
+				cache.getTurnStateAccess(tmpDir, { kind: "mcp", id: "mcp-live-b" }),
+			).toBe("foreign-live");
 			const beforeCycle = state.turnCycles;
-			expect(cache.clearTurnState(tmpDir, { kind: "mcp", id: "mcp-live-b" })).toBe(false);
-			expect(cache.incrementTurnCycle(tmpDir, { kind: "mcp", id: "mcp-live-b" }).turnCycles).toBe(beforeCycle);
+			expect(
+				cache.clearTurnState(tmpDir, { kind: "mcp", id: "mcp-live-b" }),
+			).toBe(false);
+			expect(
+				cache.incrementTurnCycle(tmpDir, { kind: "mcp", id: "mcp-live-b" })
+					.turnCycles,
+			).toBe(beforeCycle);
 			expect(cache.readTurnState(tmpDir).files).toHaveProperty("first.ts");
 		} finally {
 			killSpy.mockRestore();
@@ -383,12 +406,21 @@ describe("analyzeFile", () => {
 		const cache = new CacheManager();
 		const file = path.join(tmpDir, "same-process.ts");
 		fs.writeFileSync(file, "export const value = 1;\n");
-		cache.addModifiedRange(file, { start: 1, end: 1 }, false, tmpDir, "pi-old", "pi");
+		cache.addModifiedRange(
+			file,
+			{ start: 1, end: 1 },
+			false,
+			tmpDir,
+			"pi-old",
+			"pi",
+		);
 
 		expect(
 			cache.incrementTurnCycle(tmpDir, { kind: "pi", id: "pi-new" }).turnCycles,
 		).toBe(1);
-		expect(cache.clearTurnState(tmpDir, { kind: "pi", id: "pi-new" })).toBe(true);
+		expect(cache.clearTurnState(tmpDir, { kind: "pi", id: "pi-new" })).toBe(
+			true,
+		);
 		expect(cache.readTurnState(tmpDir).files).toEqual({});
 	});
 
@@ -401,25 +433,66 @@ describe("analyzeFile", () => {
 			fs.writeFileSync(file, "export const value = 1;\n");
 		}
 
-		cache.addModifiedRange(piFile, { start: 1, end: 1 }, false, tmpDir, "pi-a", "pi");
+		cache.addModifiedRange(
+			piFile,
+			{ start: 1, end: 1 },
+			false,
+			tmpDir,
+			"pi-a",
+			"pi",
+		);
 		// A live MCP writer cannot consume or claim the pi worklist.
-		cache.addModifiedRange(mcpFile, { start: 1, end: 1 }, false, tmpDir, "mcp-a", "mcp");
+		cache.addModifiedRange(
+			mcpFile,
+			{ start: 1, end: 1 },
+			false,
+			tmpDir,
+			"mcp-a",
+			"mcp",
+		);
 		expect(cache.readTurnState(tmpDir).files).not.toHaveProperty("mcp.ts");
 
 		// A repeated PostToolUse from the same MCP session extends its own worklist.
-		cache.addModifiedRange(sameSessionFile, { start: 1, end: 1 }, false, tmpDir, "pi-a", "pi");
+		cache.addModifiedRange(
+			sameSessionFile,
+			{ start: 1, end: 1 },
+			false,
+			tmpDir,
+			"pi-a",
+			"pi",
+		);
 		expect(cache.readTurnState(tmpDir).files).toHaveProperty("same-session.ts");
 
 		// sessionId:null is non-claiming: it may append a file but never erases owner.
-		cache.addModifiedRange(mcpFile, { start: 1, end: 1 }, false, tmpDir, null, "mcp");
-		expect(cache.readTurnState(tmpDir).owner).toMatchObject({ kind: "pi", id: "pi-a" });
+		cache.addModifiedRange(
+			mcpFile,
+			{ start: 1, end: 1 },
+			false,
+			tmpDir,
+			null,
+			"mcp",
+		);
+		expect(cache.readTurnState(tmpDir).owner).toMatchObject({
+			kind: "pi",
+			id: "pi-a",
+		});
 
 		// A different pi session can replace the owner only after its heartbeat is stale.
 		const stale = cache.readTurnState(tmpDir);
 		stale.owner!.lastSeen = new Date(Date.now() - 31 * 60_000).toISOString();
 		cache.writeTurnState(stale, tmpDir);
-		cache.addModifiedRange(mcpFile, { start: 1, end: 1 }, false, tmpDir, "mcp-b", "mcp");
-		expect(cache.readTurnState(tmpDir).owner).toMatchObject({ kind: "mcp", id: "mcp-b" });
+		cache.addModifiedRange(
+			mcpFile,
+			{ start: 1, end: 1 },
+			false,
+			tmpDir,
+			"mcp-b",
+			"mcp",
+		);
+		expect(cache.readTurnState(tmpDir).owner).toMatchObject({
+			kind: "mcp",
+			id: "mcp-b",
+		});
 	});
 
 	it("leaves turn-state untouched by default (#A)", async () => {

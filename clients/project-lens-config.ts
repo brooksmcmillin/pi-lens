@@ -326,7 +326,11 @@ export function loadPiLensConfigInDir(dir: string): PiLensProjectConfig {
 	}
 
 	const config = parseConfigFile(info.path);
-	configCache.set(info.path, { mtimeMs: info.mtimeMs, size: info.size, config });
+	configCache.set(info.path, {
+		mtimeMs: info.mtimeMs,
+		size: info.size,
+		config,
+	});
 	return config;
 }
 
@@ -378,7 +382,12 @@ function discoverPiLensProjectConfig(startDir: string): DiscoveryCacheEntry {
 			const stat = safeFileStat(candidate);
 			if (stat?.isFile()) {
 				return {
-					info: { path: candidate, dir, mtimeMs: stat.mtimeMs, size: stat.size },
+					info: {
+						path: candidate,
+						dir,
+						mtimeMs: stat.mtimeMs,
+						size: stat.size,
+					},
 					dirMtimes,
 				};
 			}
@@ -525,11 +534,7 @@ function parseConfigFile(configPath: string): PiLensProjectConfig {
 			// `only` rather than `select`, and that typo must not fail silent.
 			if (entry.threshold !== undefined || entry.disable || entry.select) {
 				rules[ruleId] = entry;
-			} else if (
-				!("threshold" in r) &&
-				!("disable" in r) &&
-				!("select" in r)
-			) {
+			} else if (!("threshold" in r) && !("disable" in r) && !("select" in r)) {
 				warnInvalidConfigOnce(
 					configPath,
 					`rules.${ruleId} has no recognized setting (threshold, disable, select); ignored`,

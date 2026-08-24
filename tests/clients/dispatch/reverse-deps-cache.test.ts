@@ -31,7 +31,8 @@ describe("reverse-dependency Tier-2 cache bounds (#1389)", () => {
 			_seedReverseDepsIndexCacheForTests("root-a", index, 1);
 			expect(_getReverseDepsIndexCacheKeysForTests()).toEqual(["root-a"]);
 		} finally {
-			if (previous === undefined) delete process.env.PI_LENS_REVERSE_DEPS_IDLE_EVICT_MS;
+			if (previous === undefined)
+				delete process.env.PI_LENS_REVERSE_DEPS_IDLE_EVICT_MS;
 			else process.env.PI_LENS_REVERSE_DEPS_IDLE_EVICT_MS = previous;
 		}
 	});

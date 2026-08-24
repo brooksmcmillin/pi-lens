@@ -21,7 +21,9 @@ import { setupTestEnvironment } from "./test-utils.js";
 function readSnapshotBody(snapshotPath: string): {
 	wordIndex: { files: string[] };
 } {
-	return JSON.parse(gunzipSync(fs.readFileSync(snapshotPath)).toString("utf-8"));
+	return JSON.parse(
+		gunzipSync(fs.readFileSync(snapshotPath)).toString("utf-8"),
+	);
 }
 
 const cleanups: Array<() => void> = [];
@@ -85,12 +87,12 @@ describe("word-index debounced persist (#348 phase 2)", () => {
 		expect(await waitForFile(snapshotPath)).toBe(true);
 		const raw = readSnapshotBody(snapshotPath);
 		// Only the LAST scheduled index should have been written (coalesced).
-		expect(
-			raw.wordIndex.files.some((f: string) => f.includes("a4.ts")),
-		).toBe(true);
-		expect(
-			raw.wordIndex.files.some((f: string) => f.includes("a0.ts")),
-		).toBe(false);
+		expect(raw.wordIndex.files.some((f: string) => f.includes("a4.ts"))).toBe(
+			true,
+		);
+		expect(raw.wordIndex.files.some((f: string) => f.includes("a0.ts"))).toBe(
+			false,
+		);
 	});
 
 	it("respects the PI_LENS_WORD_INDEX_PERSIST_DEBOUNCE_MS override", async () => {

@@ -113,12 +113,18 @@ function captureComponentText(component: Component): string {
  * is what keeps the off path byte-identical to today rather than this
  * function branching on a live flag read per render.
  */
-export function wrapToolForCompactLine<T extends ToolDefinition<any, any, any>>(tool: T): T {
+export function wrapToolForCompactLine<T extends ToolDefinition<any, any, any>>(
+	tool: T,
+): T {
 	const originalRenderResult = tool.renderResult;
 	if (!originalRenderResult) return tool;
 	const originalRenderCall = tool.renderCall;
 
-	const renderCall: ToolDefinition<any, any, any>["renderCall"] = (args, theme, context) => {
+	const renderCall: ToolDefinition<any, any, any>["renderCall"] = (
+		args,
+		theme,
+		context,
+	) => {
 		// Only blank the call row once a settled (non-partial) result exists —
 		// `renderResult` is about to paint the single combined line. While the
 		// tool is still running/streaming, keep showing the normal call row
@@ -163,12 +169,15 @@ export function wrapToolForCompactLine<T extends ToolDefinition<any, any, any>>(
 		}
 		const resultLike = result as CompactLineResultLike;
 		if (!summaryText) {
-			summaryText = stripAnsi(fullTextOf(resultLike).split("\n")[0] ?? "").trim();
+			summaryText = stripAnsi(
+				fullTextOf(resultLike).split("\n")[0] ?? "",
+			).trim();
 		}
 		// pi invokes tool renderers with `{ content, details }` -- the failure
 		// bit lives on `context.isError`, not the result (#1341 review). Keep
 		// `result.isError` as a fallback for direct/legacy callers.
-		const contextIsError = (context as { isError?: boolean } | undefined)?.isError;
+		const contextIsError = (context as { isError?: boolean } | undefined)
+			?.isError;
 		const isError = contextIsError ?? resultLike.isError === true;
 		const line = buildCompactToolLine(summaryText, isError === true, theme);
 		return {
@@ -183,8 +192,8 @@ export function wrapToolForCompactLine<T extends ToolDefinition<any, any, any>>(
 /** Wrap every tool in an array — tools without `renderResult` pass through
  * unchanged. Used by index.ts's registerTool loop, only when the
  * `ui.compactToolLine` flag resolved on for this session. */
-export function wrapToolsForCompactLine<T extends ToolDefinition<any, any, any>>(
-	tools: readonly T[],
-): T[] {
+export function wrapToolsForCompactLine<
+	T extends ToolDefinition<any, any, any>,
+>(tools: readonly T[]): T[] {
 	return tools.map((tool) => wrapToolForCompactLine(tool));
 }

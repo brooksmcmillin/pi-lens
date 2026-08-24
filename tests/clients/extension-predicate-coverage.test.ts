@@ -13,12 +13,12 @@ describe("extension predicate coverage", () => {
 	it("keeps both JS/TS fact providers bound to the canonical jsts extensions", () => {
 		for (const extension of KIND_EXTENSIONS.jsts) {
 			const appliesToFacts = isJstsFactFile(`fixture${extension}`);
-			expect(functionFactProvider.appliesTo(contextFor(`fixture${extension}`))).toBe(
-				appliesToFacts,
-			);
-			expect(importFactProvider.appliesTo(contextFor(`fixture${extension}`))).toBe(
-				appliesToFacts,
-			);
+			expect(
+				functionFactProvider.appliesTo(contextFor(`fixture${extension}`)),
+			).toBe(appliesToFacts);
+			expect(
+				importFactProvider.appliesTo(contextFor(`fixture${extension}`)),
+			).toBe(appliesToFacts);
 		}
 
 		// The pre-#1388 regex `\.(?:c|m)?(?:js|jsx|ts|tsx)$` also matched these

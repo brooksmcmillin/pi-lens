@@ -88,7 +88,9 @@ describe("quiet-window", () => {
 		expect(secondTaskRan).toBe(true);
 		expect(
 			dbg.mock.calls.some((call) =>
-				String(call[0]).includes("skipping — a previous run is still in progress"),
+				String(call[0]).includes(
+					"skipping — a previous run is still in progress",
+				),
 			),
 		).toBe(true);
 	});
@@ -123,7 +125,9 @@ describe("quiet-window", () => {
 
 		expect(order).toEqual(["throws", "after"]);
 		expect(
-			dbg.mock.calls.some((call) => String(call[0]).includes('task "throws" failed')),
+			dbg.mock.calls.some((call) =>
+				String(call[0]).includes('task "throws" failed'),
+			),
 		).toBe(true);
 	});
 

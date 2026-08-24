@@ -8,6 +8,13 @@ const findNodeToolBinary = vi.fn();
 
 vi.mock("../../clients/installer/index.js", () => ({
 	ensureTool,
+	// #1612: resolveAvailableOrInstallUnshared reads these on the install-
+	// success path to derive honest evidence rather than asserting "succeeded".
+	getInstallAttempt: vi.fn(() => undefined),
+	// #1636: read alongside getInstallAttempt for the compensating row's
+	// `resolved` tag. Undefined falls back to "cache".
+	getLastEnsureResolutionSource: vi.fn(() => undefined),
+	getToolInstallStrategy: vi.fn(() => undefined),
 	resetPathWalkMemo: vi.fn(),
 	// Seam probes route through this on cached hits (#1203); default spawnable.
 	isSpawnableCommand: vi.fn(async () => true),
@@ -27,10 +34,16 @@ describe("jscpd-client", () => {
 	beforeEach(async () => {
 		const safeSpawnMod = await import("../../clients/safe-spawn.js");
 		vi.mocked(safeSpawnMod.safeSpawnAsync).mockClear();
-		vi.mocked(safeSpawnMod.safeSpawnAsync).mockResolvedValue({ error: undefined, status: 0, stdout: "", stderr: "" });
+		vi.mocked(safeSpawnMod.safeSpawnAsync).mockResolvedValue({
+			error: undefined,
+			status: 0,
+			stdout: "",
+			stderr: "",
+		});
 		ensureTool.mockReset();
 		findNodeToolBinary.mockReset();
-		const helpers = await import("../../clients/dispatch/runners/utils/runner-helpers.js");
+		const helpers =
+			await import("../../clients/dispatch/runners/utils/runner-helpers.js");
 		helpers.resetDispatchAvailabilityState();
 		findNodeToolBinary.mockResolvedValue(null);
 	});
@@ -45,9 +58,10 @@ describe("jscpd-client", () => {
 		// a bare "/fake/managed/jscpd" silently fails the client's
 		// `isFullyQualified(resolved)` gate and the client falls through to
 		// npx instead of the managed path (#1491).
-		const managed = process.platform === "win32"
-			? String.raw`C:\fake\managed\jscpd.exe`
-			: "/fake/managed/jscpd";
+		const managed =
+			process.platform === "win32"
+				? String.raw`C:\fake\managed\jscpd.exe`
+				: "/fake/managed/jscpd";
 		try {
 			fs.writeFileSync(path.join(tmpDir, "src.ts"), "const x = 1;\n");
 			ensureTool.mockResolvedValue(managed);
@@ -60,7 +74,12 @@ describe("jscpd-client", () => {
 					stdout: "",
 					stderr: "",
 				})
-				.mockResolvedValue({ error: undefined, status: 0, stdout: "", stderr: "" });
+				.mockResolvedValue({
+					error: undefined,
+					status: 0,
+					stdout: "",
+					stderr: "",
+				});
 			const result = await new JscpdClient().scan(tmpDir);
 			expect(result.success).toBe(true);
 			expect(vi.mocked(safeSpawnMod.safeSpawnAsync).mock.calls[1]?.[0]).toBe(
@@ -87,7 +106,8 @@ describe("jscpd-client", () => {
 		expect(ensureTool).toHaveBeenCalledTimes(1);
 		await client.ensureAvailable();
 		expect(ensureTool).toHaveBeenCalledTimes(1);
-		const helpers = await import("../../clients/dispatch/runners/utils/runner-helpers.js");
+		const helpers =
+			await import("../../clients/dispatch/runners/utils/runner-helpers.js");
 		helpers.resetDispatchAvailabilityState();
 		ensureTool.mockResolvedValue("jscpd");
 		expect(await client.ensureAvailable()).toBe(true);
@@ -133,6 +153,47 @@ describe("jscpd-client", () => {
 			expect(ignorePattern).toContain("**/.turbo/**");
 			expect(ignorePattern).toContain("**/.cache/**");
 			expect(ignorePattern).toContain("**/*.js");
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("reports a nonzero exit with no report file as errored, never clean (#1736 sweep)", async () => {
+		// jscpd (verified live, 3.5.10) writes NO report file both when it's
+		// genuinely clean (exit 0) and when it crashes (nonzero exit, uncaught
+		// exception). The missing-file check alone can't tell those apart --
+		// the fix must also look at the exit status.
+		const { JscpdClient } = await import("../../clients/jscpd-client.js");
+		const safeSpawnMod = await import("../../clients/safe-spawn.js");
+
+		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-jscpd-crash-");
+		try {
+			const srcFile = path.join(tmpDir, "src", "feature", "index.ts");
+			fs.mkdirSync(path.dirname(srcFile), { recursive: true });
+			fs.writeFileSync(srcFile, "export const x = 1;\n");
+
+			const client = new JscpdClient(false) as unknown as {
+				scan: (
+					cwd: string,
+					minLines: number,
+					minTokens: number,
+					isTsProject: boolean,
+				) => Promise<{ success: boolean; clones: unknown[] }>;
+				ensureAvailable: () => Promise<boolean>;
+			};
+			await client.ensureAvailable();
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mockClear();
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mockResolvedValue({
+				error: undefined,
+				status: 1,
+				stdout: "",
+				stderr: "Error: ENOENT: no such file or directory\n",
+			});
+
+			const result = await client.scan(tmpDir, 5, 50, true);
+
+			expect(result.success).toBe(false);
+			expect(result.clones).toHaveLength(0);
 		} finally {
 			cleanup();
 		}
@@ -232,7 +293,9 @@ describe("jscpd-client", () => {
 			vi.mocked(safeSpawnMod.safeSpawnAsync).mockClear();
 
 			// cwd IS the home directory.
-			const result = await client.scan(tmpDir, 5, 50, true, { homeDir: tmpDir });
+			const result = await client.scan(tmpDir, 5, 50, true, {
+				homeDir: tmpDir,
+			});
 
 			expect(result.success).toBe(false);
 			expect(result.clones).toEqual([]);
@@ -362,6 +425,52 @@ describe("jscpd-client", () => {
 			const patterns = String(args[ignoreIndex + 1] ?? "").split(",");
 			expect(patterns).toContain("**/*.js");
 			expect(patterns).toContain("**/*.jsx");
+		} finally {
+			cleanup();
+		}
+	});
+
+	// #1731 discipline A: jscpd discovers `.jscpd.json` unaided, but
+	// `--min-lines`/`--min-tokens`/`--ignore` on the CLI override whatever it
+	// sets — passing them unconditionally silently discarded a project's own
+	// thresholds and ignore list.
+	it("omits --min-lines/--min-tokens/--ignore when the project ships .jscpd.json (#1731)", async () => {
+		const { JscpdClient } = await import("../../clients/jscpd-client.js");
+		const safeSpawnMod = await import("../../clients/safe-spawn.js");
+
+		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-jscpd-config-");
+		try {
+			const srcFile = path.join(tmpDir, "src", "feature.ts");
+			fs.mkdirSync(path.dirname(srcFile), { recursive: true });
+			fs.writeFileSync(srcFile, "export const x = 1;\n");
+			fs.writeFileSync(
+				path.join(tmpDir, ".jscpd.json"),
+				JSON.stringify({
+					minLines: 10,
+					minTokens: 100,
+					ignore: ["**/vendor/**"],
+				}),
+			);
+
+			const client = new JscpdClient(false) as unknown as {
+				scan: (
+					cwd: string,
+					minLines: number,
+					minTokens: number,
+					isTsProject: boolean,
+				) => Promise<unknown>;
+				ensureAvailable: () => Promise<boolean>;
+			};
+			await client.ensureAvailable();
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mockClear();
+
+			await client.scan(tmpDir, 5, 50, true);
+
+			const args =
+				vi.mocked(safeSpawnMod.safeSpawnAsync).mock.calls[0]?.[1] ?? [];
+			expect(args).not.toContain("--min-lines");
+			expect(args).not.toContain("--min-tokens");
+			expect(args).not.toContain("--ignore");
 		} finally {
 			cleanup();
 		}

@@ -18,7 +18,7 @@ vi.mock("../../clients/safe-spawn.js", async (importOriginal) => ({
 	isCommandAvailableAsync: vi.fn(),
 	safeSpawnAsync: vi.fn(),
 }));
-import { safeSpawnAsync } from "../../clients/safe-spawn.js";
+import { SpawnFailureError, safeSpawnAsync } from "../../clients/safe-spawn.js";
 import {
 	_resetPackageManagerCache,
 	allAvailableGlobalBinDirs,
@@ -32,6 +32,7 @@ import {
 	pmBinary,
 	resolveNodePackageManager,
 	runScriptArgs,
+	updateArgs,
 } from "../../clients/package-manager.js";
 
 const dirs: string[] = [];
@@ -56,7 +57,15 @@ function projectWith(files: Record<string, string>): string {
  * to `queryResponder`, which individual tests set to answer those queries.
  */
 let queryResponder:
-	| ((cmd: string, args: string[]) => Promise<{ stdout: string; stderr: string; status: number | null; error?: Error }>)
+	| ((
+			cmd: string,
+			args: string[],
+	  ) => Promise<{
+			stdout: string;
+			stderr: string;
+			status: number | null;
+			error?: Error;
+	  }>)
 	| null = null;
 /** Every non-probe (query) call `onlyAvailable`'s mock forwarded — asserts on this, not on `safeSpawnAsync` overall, since the availability probe itself now spawns too. */
 let queryCalls: Array<{ cmd: string; args: string[] }> = [];
@@ -65,7 +74,12 @@ function setQueryResponder(
 	responder: (
 		cmd: string,
 		args: string[],
-	) => Promise<{ stdout: string; stderr: string; status: number | null; error?: Error }>,
+	) => Promise<{
+		stdout: string;
+		stderr: string;
+		status: number | null;
+		error?: Error;
+	}>,
 ): void {
 	queryResponder = responder;
 }
@@ -209,27 +223,71 @@ describe("command builders", () => {
 
 	it("installArgs threads ignore-scripts and npm-only legacy-peer-deps", () => {
 		expect(
-			installArgs("npm", "biome", { ignoreScripts: true, legacyPeerDeps: true }),
+			installArgs("npm", "biome", {
+				ignoreScripts: true,
+				legacyPeerDeps: true,
+			}),
 		).toEqual(["install", "--ignore-scripts", "--legacy-peer-deps", "biome"]);
 		// legacy-peer-deps is silently dropped for non-npm managers.
 		expect(
-			installArgs("bun", "biome", { ignoreScripts: true, legacyPeerDeps: true }),
+			installArgs("bun", "biome", {
+				ignoreScripts: true,
+				legacyPeerDeps: true,
+			}),
 		).toEqual(["add", "--ignore-scripts", "biome"]);
+	});
+
+	it("updateArgs re-resolves a dependency per manager", () => {
+		// The command that moves a dependency the lockfile already satisfies.
+		// `install`/`add` is a no-op there, which is why pi-lens's managed tools
+		// tree froze on its first-install versions (#1730).
+		expect(updateArgs("npm", "knip")).toEqual(["update", "knip"]);
+		expect(updateArgs("pnpm", "knip")).toEqual(["update", "knip"]);
+		expect(updateArgs("bun", "knip")).toEqual(["update", "knip"]);
+		// yarn classic spells it `upgrade`; `yarn update` is not a command.
+		expect(updateArgs("yarn", "knip")).toEqual(["upgrade", "knip"]);
+	});
+
+	it("updateArgs threads ignore-scripts", () => {
+		expect(updateArgs("npm", "knip", { ignoreScripts: true })).toEqual([
+			"update",
+			"--ignore-scripts",
+			"knip",
+		]);
+		expect(updateArgs("yarn", "knip", { ignoreScripts: true })).toEqual([
+			"upgrade",
+			"--ignore-scripts",
+			"knip",
+		]);
+		// Omitted by default: a package whose postinstall fetches its native
+		// binary has to run that postinstall on update too.
+		expect(updateArgs("npm", "@biomejs/biome")).toEqual([
+			"update",
+			"@biomejs/biome",
+		]);
 	});
 
 	it("globalInstallArgs spells the global install per manager", () => {
 		expect(globalInstallArgs("npm", "typescript-language-server")).toEqual([
-			"install", "-g", "typescript-language-server",
+			"install",
+			"-g",
+			"typescript-language-server",
 		]);
 		expect(globalInstallArgs("pnpm", "typescript-language-server")).toEqual([
-			"add", "-g", "typescript-language-server",
+			"add",
+			"-g",
+			"typescript-language-server",
 		]);
 		expect(globalInstallArgs("bun", "typescript-language-server")).toEqual([
-			"add", "-g", "typescript-language-server",
+			"add",
+			"-g",
+			"typescript-language-server",
 		]);
 		// yarn classic uses `global add`.
 		expect(globalInstallArgs("yarn", "typescript-language-server")).toEqual([
-			"global", "add", "typescript-language-server",
+			"global",
+			"add",
+			"typescript-language-server",
 		]);
 	});
 
@@ -307,6 +365,97 @@ describe("allAvailableGlobalBinDirs", () => {
 		expect(await allAvailableGlobalBinDirs()).toEqual([]);
 		// No manager passed its probe, so no query spawn was ever reached.
 		expect(queryCalls).toEqual([]);
+	});
+
+	/**
+	 * #1585 — `isAvailable`'s boolean collapse. pnpm's `where`/`which` probe
+	 * stalls (a transient host failure, not a genuine absence). Pre-fix,
+	 * `allAvailableGlobalBinDirs` had no way to tell its caller the `false` it
+	 * got back for pnpm was a stall, not a fact — the tool-path resolver's
+	 * `onTransient` plumbing (#1569) was never invoked, so the resulting
+	 * bin-dir list (missing pnpm) could get cached untainted for 24h. Must
+	 * FAIL on pre-fix code, where `allAvailableGlobalBinDirs` takes no
+	 * `onTransient` parameter at all (a TS compile error) — verified red by
+	 * reverting the fix and confirming the build fails.
+	 */
+	it("reports a stalled manager probe as transient, not a clean miss", async () => {
+		setPlatform("linux");
+		vi.mocked(safeSpawnAsync).mockImplementation(async (cmd, args) => {
+			const probeFinder = process.platform === "win32" ? "where" : "which";
+			if (cmd === probeFinder) {
+				const target = (args ?? [])[0];
+				if (target === "npm") return { stdout: "npm\n", stderr: "", status: 0 };
+				if (target === "pnpm") {
+					const cause = new Error("Process timed out after 5000ms");
+					return {
+						stdout: "",
+						stderr: "",
+						status: null,
+						error: cause,
+						failure: "timeout" as const,
+						spawnFailure: new SpawnFailureError(
+							"timeout",
+							cause.message,
+							cause,
+						),
+					};
+				}
+				// yarn, bun: genuinely absent.
+				return { stdout: "", stderr: "", status: 1 };
+			}
+			// npm's "config get prefix" query.
+			return { stdout: "/usr/local\n", stderr: "", status: 0 };
+		});
+
+		let transientCalls = 0;
+		const dirs = await allAvailableGlobalBinDirs(() => {
+			transientCalls += 1;
+		});
+
+		// pnpm's stall drops it from the result (npm still resolves normally) —
+		// but the caller must have been told the result may be incomplete.
+		expect(dirs).toEqual([path.resolve(path.join("/usr/local", "bin"))]);
+		expect(transientCalls).toBeGreaterThan(0);
+
+		// The stall latches transiently for its cooldown: a second call within
+		// that window serves the cached `false` for pnpm without re-probing.
+		// The regression is specifically that this MEMO path also loses the
+		// transient signal — assert it still fires here, not just on the
+		// fresh-probe path above.
+		transientCalls = 0;
+		await allAvailableGlobalBinDirs(() => {
+			transientCalls += 1;
+		});
+		expect(transientCalls).toBeGreaterThan(0);
+	});
+
+	/**
+	 * #1585 review — the precision half of the fix. A manager that fails its
+	 * probe cleanly (`where`/`which` runs fine and exits 1: a real "not
+	 * installed") must NOT call `onTransient`. Without this case, a broken
+	 * implementation that fires `onTransient` on every `false` — transient or
+	 * not — would pass the "stalled" test above just as well, defeating the
+	 * whole point: distinguishing a stall from a genuine absence, not just
+	 * noticing SOME `false`.
+	 */
+	it("does not report a genuinely absent manager as transient", async () => {
+		setPlatform("linux");
+		onlyAvailable("npm");
+
+		let transientCalls = 0;
+		const dirs = await allAvailableGlobalBinDirs(() => {
+			transientCalls += 1;
+		});
+
+		expect(dirs).toEqual([]);
+		expect(transientCalls).toBe(0);
+
+		// The genuine absence latches: a second call re-reads the same durable
+		// memo, still no transient report.
+		await allAvailableGlobalBinDirs(() => {
+			transientCalls += 1;
+		});
+		expect(transientCalls).toBe(0);
 	});
 });
 

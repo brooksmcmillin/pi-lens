@@ -40,9 +40,7 @@ describe("review-graph builder — file.content release ownership", () => {
 		const { cwd, file } = tmpProject();
 		const facts = new FactStore();
 		await buildOrUpdateGraph(cwd, [file], facts);
-		expect(
-			facts.getFileFact<string>(file, "file.content"),
-		).toBeUndefined();
+		expect(facts.getFileFact<string>(file, "file.content")).toBeUndefined();
 	});
 
 	it("keeps content the dispatch seeded (live dispatch store)", async () => {

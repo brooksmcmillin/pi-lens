@@ -50,8 +50,7 @@ describe("retargetReplacementIndentation", () => {
 		// Both "    " and "        " appear in oldText → direct map hits for both.
 		const oldText =
 			"function foo() {\n    if (cond) {\n        return 1;\n    }\n}";
-		const corrected =
-			"function foo() {\n\tif (cond) {\n\t\treturn 1;\n\t}\n}";
+		const corrected = "function foo() {\n\tif (cond) {\n\t\treturn 1;\n\t}\n}";
 		const newText =
 			"function foo() {\n    if (cond) {\n        return 2;\n    }\n}";
 		expect(retargetReplacementIndentation(newText, oldText, corrected)).toBe(
@@ -65,8 +64,7 @@ describe("retargetReplacementIndentation", () => {
 		// baseFrom = "    " (4 spaces); newText has a 3-space indent — not a multiple.
 		const oldText = "function foo() {\n    const x = 1;\n}";
 		const corrected = "function foo() {\n\tconst x = 1;\n}";
-		const newText =
-			"function foo() {\n   if (x) {\n    const x = 2;\n   }\n}";
+		const newText = "function foo() {\n   if (x) {\n    const x = 2;\n   }\n}";
 		expect(
 			retargetReplacementIndentation(newText, oldText, corrected),
 		).toBeUndefined();

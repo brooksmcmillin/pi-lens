@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { withEnv } from "../../support/with-env.js";
 
-vi.unmock("../../../clients/installer/index.ts");
+vi.unmock("../../../clients/installer/index.js");
 
 // This file deliberately exercises the REAL getGlobalPiLensDir() resolver
 // (mirrors tool-discovery.test.ts's setup) so TOOLS_DIR paths resolve
@@ -106,6 +107,19 @@ vi.mock("node:fs/promises", () => ({
 	chmod: mockFsChmod,
 }));
 
+// #1609: the installer's npm-tool package.json bootstrap now goes through
+// the shared atomic tmp+rename seam instead of a raw `fs.writeFile`, so it
+// must be mocked here too — otherwise it falls through to the REAL node:fs
+// (atomic-write.ts imports `node:fs` directly, not this mocked
+// `node:fs/promises`), which fails writing into this test's mocked,
+// non-existent-on-disk tools directory.
+const mockWriteFileAtomicAsync = vi.hoisted(() =>
+	vi.fn().mockResolvedValue(undefined),
+);
+vi.mock("../../../clients/atomic-write.js", () => ({
+	writeFileAtomicAsync: mockWriteFileAtomicAsync,
+}));
+
 // child_process spawn mock: `--version` probes resolve to a configurable
 // stdout string so tests can simulate an installed binary reporting an old
 // (drifted) or current (matching) version. Non-`--version` spawns (npm
@@ -160,13 +174,53 @@ vi.mock("node:child_process", () => ({
 	spawnSync: mockSpawnSync,
 }));
 
+// #2015: verifyToolBinary probes (and installNpmTool's npm-install spawn)
+// route through `safeSpawnAsync`, so that seam is mocked here too and every
+// invocation is recorded into the same `spawnCalls` log. `--version` probes
+// resolve to the configurable `versionOutput` string so tests can simulate an
+// installed binary reporting a drifted or matching version; everything else
+// resolves success with no output, so the reinstall path exercised by the
+// drift tests doesn't need a real npm.
+vi.mock("../../../clients/safe-spawn.js", () => ({
+	safeSpawn: vi.fn(() => ({ stdout: "", stderr: "", status: 0 })),
+	safeSpawnAsync: async (command: string, args: string[]) => {
+		const cmd = String(command);
+		const argv = args ?? [];
+		spawnCalls.push({ cmd, args: argv });
+		if (argv.includes("--version") || cmd.includes("--version")) {
+			return versionOutput.value
+				? { stdout: versionOutput.value, stderr: "", status: 0 }
+				: { stdout: "", stderr: "cannot execute", status: 126 };
+		}
+		return { stdout: "", stderr: "", status: 0 };
+	},
+	resetSafeSpawnWindowsCommandCache: vi.fn(),
+}));
+
+// isCommandAvailable (the PATH-walk used to resolve a BARE checkCommand, e.g.
+// "madge") reads `node:fs`'s statSync directly — it never touches the
+// `node:fs/promises` mock above. Mirrors path-walk-memo.test.ts's pattern.
+// Default behavior delegates to the REAL statSync: safeSpawnAsync (used by
+// installTool's npm-install spawn) also calls statSync(cwd) as a preflight,
+// against a real, existing directory — overriding it wholesale would break
+// every install-spawning test in this file, not just the new PATH-walk one.
+const mockStatSync = vi.hoisted(() => vi.fn());
+vi.mock("node:fs", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:fs")>();
+	mockStatSync.mockImplementation(
+		(...args: Parameters<typeof actual.statSync>) => actual.statSync(...args),
+	);
+	return { ...actual, statSync: mockStatSync };
+});
+
 import * as path from "node:path";
 import {
 	ensureTool,
 	getToolPath,
+	resetResolvedPathCache,
 	resetProbeCacheStateForTesting,
 	TOOLS,
-} from "../../../clients/installer/index.ts";
+} from "../../../clients/installer/index.js";
 
 const TOOLS_DIR = path.join(TEST_HOME, ".pi-lens", "tools");
 const JSCPD_BIN = path.join(
@@ -210,20 +264,33 @@ function fakeAccess(...allowed: string[]): void {
 
 const savedPiLensHome = process.env.PI_LENS_HOME;
 
+// #1816: this file's `afterEach` used to hard-restore the literal "1"
+// instead of whatever was ambient before the file ran — correct only by
+// coincidence (vitest-setup.ts's own default). `withEnv` restores the real
+// prior value.
+let restoreDisableToolInstall: () => void;
+
 beforeEach(() => {
-	delete process.env.PI_LENS_DISABLE_TOOL_INSTALL;
+	restoreDisableToolInstall = withEnv({
+		PI_LENS_DISABLE_TOOL_INSTALL: undefined,
+	});
 	delete process.env.PI_LENS_HOME;
 	vi.clearAllMocks();
 	spawnCalls.length = 0;
 	versionOutput.value = "";
 	resetProbeCacheStateForTesting();
+	// A bare-command positive (no fs.access, no probe-cache fallback) does not
+	// self-heal like a fully-qualified one does when fakeAccess() below denies
+	// everything — it would otherwise leak from one test into the next.
+	resetResolvedPathCache();
 	mockFsReadFile.mockRejectedValue(new Error("ENOENT"));
 	mockFsStat.mockResolvedValue({ mtimeMs: Date.now() });
 	fakeAccess(/* nothing */);
+	mockStatSync.mockClear();
 });
 
 afterEach(() => {
-	process.env.PI_LENS_DISABLE_TOOL_INSTALL = "1";
+	restoreDisableToolInstall();
 	if (savedPiLensHome === undefined) delete process.env.PI_LENS_HOME;
 	else process.env.PI_LENS_HOME = savedPiLensHome;
 	vi.useRealTimers();
@@ -280,6 +347,66 @@ describe("version-pin drift detection (#589)", () => {
 		expect(second).toBe(JSCPD_BIN);
 		// In-memory resolvedPathCache fast path — no new spawn on the second call.
 		expect(spawnCalls).toHaveLength(0);
+	});
+
+	it("clears the positive path cache so the next ensure rechecks the tool", async () => {
+		fakeAccess(JSCPD_BIN);
+		versionOutput.value = `${JSCPD_PINNED_VERSION}\n`;
+		expect(await ensureTool("jscpd")).toBe(JSCPD_BIN);
+		spawnCalls.length = 0;
+
+		resetResolvedPathCache();
+		expect(await ensureTool("jscpd")).toBe(JSCPD_BIN);
+		expect(mockFsAccess).toHaveBeenCalledTimes(2);
+	});
+
+	// #1902 review: the test above only proves the reset works for a FULLY
+	// QUALIFIED cached path, which takes the fs.access branch at
+	// installer/index.ts:5015-5018 — a branch that never needed the reset,
+	// because a stale fully-qualified positive is already evicted on its own
+	// the next time fs.access rejects it. resetResolvedPathCache's actual
+	// reason to exist is the BARE-command branch at :5011-5014, where a
+	// checkCommand resolved off PATH (madge here — unpinned npm tool, no
+	// version-drift complication) is cached and returned from the in-memory
+	// session cache with NO fs.access, NO re-probe, and NO way to self-heal
+	// mid-session. Neutering resetResolvedPathCache's body leaves the test
+	// above green but must turn this one red.
+	it("clears the positive path cache for a bare, PATH-resolved tool so the next ensure re-discovers it", async () => {
+		const savedPath = process.env.PATH;
+		process.env.PATH = TEST_HOME;
+		const realStatSync = mockStatSync.getMockImplementation();
+		try {
+			mockStatSync.mockImplementation(
+				() => ({ isFile: () => true, size: 1 }) as never,
+			);
+
+			const first = await ensureTool("madge");
+			expect(first).toBe("madge");
+			const statCallsAfterFirst = mockStatSync.mock.calls.length;
+			expect(statCallsAfterFirst).toBeGreaterThan(0);
+
+			// Same-session re-ensure: fast path 1 (session-cache) returns the bare
+			// cached command directly — no fs.access, no fresh PATH walk.
+			const second = await ensureTool("madge");
+			expect(second).toBe("madge");
+			expect(mockStatSync.mock.calls.length).toBe(statCallsAfterFirst);
+
+			resetResolvedPathCache();
+
+			// A fresh session must not trust the stale bare positive — it has to
+			// re-walk PATH, because a bare command has no persistent probe-cache
+			// fallback (updateProbeCache stats the resolved path and swallows a
+			// bare command's ENOENT).
+			const third = await ensureTool("madge");
+			expect(third).toBe("madge");
+			expect(mockStatSync.mock.calls.length).toBeGreaterThan(
+				statCallsAfterFirst,
+			);
+		} finally {
+			if (realStatSync) mockStatSync.mockImplementation(realStatSync);
+			if (savedPath === undefined) delete process.env.PATH;
+			else process.env.PATH = savedPath;
+		}
 	});
 
 	it("evicts a cached positive when the resolved binary is deleted", async () => {

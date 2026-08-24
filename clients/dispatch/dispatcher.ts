@@ -24,7 +24,7 @@ import { detectFileRole } from "../file-role.js";
 import { isTestFile } from "../file-utils.js";
 import { getPrimaryDispatchGroup } from "../language-policy.js";
 import { resolveLanguageRootForFile } from "../language-profile.js";
-import { logLatency } from "../latency-logger.js";
+import { logLatency, phaseFinished, phaseStarted } from "../latency-logger.js";
 import { isSpawnableCommand } from "../installer/index.js";
 import { normalizeMapKey } from "../path-utils.js";
 import { loadPiLensProjectConfig } from "../project-lens-config.js";
@@ -44,6 +44,7 @@ import { getToolPlan } from "./plan.js";
 import { resolveRunnerPath } from "./runner-context.js";
 import { applyRulePolicy, rulePolicyMapFromConfig } from "./rule-policy.js";
 import { getToolProfile } from "./tool-profile.js";
+import { isRunnerSkipReason } from "./types.js";
 import type {
 	Diagnostic,
 	DispatchContext,
@@ -54,6 +55,7 @@ import type {
 	RunnerGroup,
 	RunnerRegistry as RunnerRegistryContract,
 	RunnerResult,
+	RunnerSkipReason,
 } from "./types.js";
 import { formatDiagnostics } from "./utils/format-utils.js";
 
@@ -205,7 +207,10 @@ export async function checkToolAvailability(
 				(facts.getSessionFact<number>(transientAttemptsKey(command)) ?? 0) + 1;
 			facts.setSessionFact(transientAttemptsKey(command), attempts);
 			retryAfterMs = transientRetryDelayMs(attempts, cause);
-			facts.setSessionFact(transientRetryKey(command), Date.now() + retryAfterMs);
+			facts.setSessionFact(
+				transientRetryKey(command),
+				Date.now() + retryAfterMs,
+			);
 		} else {
 			facts.setSessionFact(key, false);
 			facts.setSessionFact(transientAttemptsKey(command), 0);
@@ -375,7 +380,6 @@ function dedupeOverlappingDiagnostics(diagnostics: Diagnostic[]): Diagnostic[] {
 	return [...byKey.values()];
 }
 
-
 function suppressLintOverlapsWithLsp(diagnostics: Diagnostic[]): Diagnostic[] {
 	const lspBySpanClass = new Set<string>();
 	const lspByLine = new Set<string>();
@@ -491,6 +495,8 @@ export interface RunnerLatency {
 	status: "succeeded" | "failed" | "skipped" | "when_skipped";
 	diagnosticCount: number;
 	semantic: string;
+	skipReason?: RunnerSkipReason;
+	unconfirmedServerIds?: readonly string[];
 }
 
 export interface DispatchLatencyReport {
@@ -519,6 +525,38 @@ function buildCoverageNotice(
 		primary.runnerIds.includes(r.runnerId),
 	);
 	if (relevant.length === 0) return undefined;
+
+	// #1867 catalog shape 4: this is correlation, not classification. The LSP
+	// touch already decided which scanner publications were absent for these
+	// bytes; the runner and latency assembly only preserve that exact set.
+	const unconfirmedServerIds = [
+		...new Set(relevant.flatMap((r) => r.unconfirmedServerIds ?? [])),
+	];
+	if (unconfirmedServerIds.length > 0) {
+		// The marker describes this exact silent-scanner set. A scanner can
+		// recover while another goes dark on the same file, so the set belongs
+		// in the session dedupe identity rather than only kind and path.
+		const silentScannerSet = [...new Set(unconfirmedServerIds)]
+			.map(normalizeMapKey)
+			// Code-unit comparator: the sorted set is a dedupe KEY, so ordering
+			// must be deterministic across locales — localeCompare is not.
+			.sort((a, b) => Number(a > b) - Number(a < b))
+			.join(",");
+		const onceKey = `${ctx.kind}:${normalizeMapKey(ctx.filePath)}:${silentScannerSet}`;
+		if (coverageNoticeSeen.has(onceKey)) return undefined;
+		coverageNoticeSeen.add(onceKey);
+		const shown = unconfirmedServerIds.slice(0, 4);
+		const remainder = unconfirmedServerIds.length - shown.length;
+		const marker = `${shown.join(", ")}${remainder > 0 ? ` +${remainder}` : ""}`;
+		return {
+			id: `coverage-partial:${ctx.kind}:${path.basename(ctx.filePath)}`,
+			message: `coverage: ${marker} silent — diagnostics are incomplete (not a clean result).`,
+			filePath: ctx.filePath,
+			severity: "warning",
+			semantic: "warning",
+			tool: "pi-lens",
+		};
+	}
 
 	// Check primary runners first
 	const primaryHasCoverage = relevant.some(
@@ -742,6 +780,13 @@ async function runGroup(
 		onRunnerResult?.(runnerId, result);
 		const runnerEnd = Date.now();
 		const duration = runnerEnd - runnerStart;
+		// Runner definitions are a typed API, but embedders/plugins can still
+		// return untyped objects at runtime. Admit only the closed taxonomy and
+		// only on actual skips so free text cannot enter durable latency metadata.
+		const skipReason =
+			result.status === "skipped" && isRunnerSkipReason(result.skipReason)
+				? result.skipReason
+				: undefined;
 
 		latencies.push({
 			runnerId,
@@ -751,6 +796,12 @@ async function runGroup(
 			status: result.status,
 			diagnosticCount: result.diagnostics.length,
 			semantic: result.semantic ?? semantic,
+			...(skipReason !== undefined && {
+				skipReason,
+			}),
+			...(result.unconfirmedServerIds !== undefined && {
+				unconfirmedServerIds: result.unconfirmedServerIds,
+			}),
 		});
 		logLatency({
 			type: "runner",
@@ -776,7 +827,9 @@ async function runGroup(
 							failureKind: result.failureKind,
 							failureMessage: result.failureMessage,
 						}
-					: undefined,
+					: skipReason
+						? { skipReason }
+						: undefined,
 		});
 		recordRunner(
 			ctx.filePath,
@@ -1108,6 +1161,16 @@ async function runRunner(
 		getRunnerTimeoutFloorMs(),
 	);
 	let timer: ReturnType<typeof setTimeout> | undefined;
+	// #1723: mark this runner as the in-flight phase for the WHOLE race below,
+	// not just the runner's own promise — a synchronous CPU hog inside
+	// `runner.run` (ast-grep-napi, tree-sitter, …) blocks the event loop before
+	// it ever gets to log its own completion, so `recentPhases` (which only
+	// records FINISHED phases) can't name it. `phaseFinished` clears on every
+	// exit from this race (success, runner error, or timeout) via try/finally,
+	// so a `loop_block` sampled after this call returns never sees a stale
+	// pointer. See `phaseStarted`'s doc comment for the identity-token
+	// reasoning and the cost note (negligible next to a runner invocation).
+	const phaseToken = phaseStarted(runner.id);
 	try {
 		const result = await Promise.race([
 			runner.run(ctx).finally(() => clearTimeout(timer)),
@@ -1143,6 +1206,8 @@ async function runRunner(
 			failureKind: message.includes("timed out") ? "timeout" : "exception",
 			failureMessage: message.slice(0, 200),
 		};
+	} finally {
+		phaseFinished(phaseToken);
 	}
 }
 

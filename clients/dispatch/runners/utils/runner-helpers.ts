@@ -12,6 +12,10 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { logSessionStart } from "../../../sessionstart-logger.js";
 import { getGlobalPiLensDir } from "../../../file-utils.js";
+import {
+	createGenerationSource,
+	type GenerationHandle,
+} from "../../../generation-guard.js";
 import { PathKeyedMap } from "../../../path-keyed-map.js";
 import {
 	normalizeEphemeralMapKey,
@@ -19,8 +23,12 @@ import {
 } from "../../../path-utils.js";
 import {
 	ensureTool,
+	getInstallAttempt,
+	getLastEnsureResolutionSource,
+	getToolInstallStrategy,
 	isSpawnableCommand,
 	resetPathWalkMemo,
+	type InstallAttempt,
 } from "../../../installer/index.js";
 import {
 	getServersForFileWithConfig,
@@ -33,6 +41,7 @@ import {
 	shouldAutoInstallTool,
 } from "../../../tool-policy.js";
 import type { DispatchContext } from "../../types.js";
+import { isInSpawnTimeoutCooldown } from "../../../spawn-timeout-cooldown.js";
 import {
 	type AvailabilityCause,
 	type AvailabilityLatch,
@@ -41,6 +50,7 @@ import {
 	type ProbeFailureShape,
 	classifyProbeFailure,
 	createAvailabilityLatch,
+	describeInstallAttempt,
 	describeProbeEvidence,
 	isLatchingOutcome,
 	logAvailabilityDecision,
@@ -117,19 +127,14 @@ if (typeof __dirname !== "undefined") {
 const _managedToolsDir = path.join(getGlobalPiLensDir(), "tools");
 
 /**
- * The managed shim for a Node CLI tool (`~/.pi-lens/tools/node_modules/.bin/<tool>`),
- * or null when it is not on disk.
- *
- * When the shim exists the tool IS installed, so availability needs no spawn at
- * all — and a spawn that cannot happen cannot time out (#1467). knip and jscpd
- * each carried a line-for-line copy of this resolver; #1476 folds them into one
- * definition so the next managed tool inherits the fast path instead of a
- * fourth copy.
+ * Managed-shim candidates for a Node CLI tool, in the installer's own
+ * preference order (`getToolPath`'s managed-first branch: `.cmd`, then `.exe`,
+ * then extensionless on Windows; extensionless elsewhere).
  *
  * The pi-lens dir is read per call, never memoized at module load, so tests that
  * point `getGlobalPiLensDir` at a temp home still see their own tree.
  */
-export function findManagedNodeToolBinary(tool: string): string | null {
+function managedNodeToolCandidates(tool: string): string[] {
 	const base = path.join(
 		getGlobalPiLensDir(),
 		"tools",
@@ -137,13 +142,188 @@ export function findManagedNodeToolBinary(tool: string): string | null {
 		".bin",
 		tool,
 	);
-	const candidates =
-		process.platform === "win32" ? [`${base}.cmd`, `${base}.exe`, base] : [base];
+	return process.platform === "win32"
+		? [`${base}.cmd`, `${base}.exe`, base]
+		: [base];
+}
+
+type ManagedVerdict = "absent" | "ok" | "broken" | "unverified";
+
+type ManagedVerdictMemo =
+	| { verdict: "ok" | "broken" }
+	/**
+	 * A probe that never got a fair run. Held under a cooldown, not forever: a
+	 * cold-cache host can blow the budget on a perfectly good shim, and one slow
+	 * first touch must not pin "cannot verify" for the whole session.
+	 */
+	| { verdict: "unverified"; retryAtMs: number; attempts: number };
+
+/**
+ * Verification verdicts for managed shims, keyed by path + mtime + size, so a
+ * reinstall re-verifies and a session start re-arms.
+ *
+ * A plain `Map`, not a `PathKeyedMap`: `managedNodeToolCandidates` is the ONLY
+ * producer of these paths, so the write and read forms are the same string by
+ * construction and cannot diverge on case or separator.
+ */
+const managedBinaryVerdicts = new Map<string, ManagedVerdictMemo>();
+/**
+ * Verifications in progress, keyed the same way. Concurrent first touches of
+ * one shim share the single probe instead of each spawning their own — the
+ * same in-flight-share shape `resolveInstallInFlightByCwd` uses for installs
+ * (#1674 review F2).
+ */
+const managedVerifyInFlight = new Map<string, Promise<ManagedVerdict>>();
+
+/**
+ * Budget for the managed-shim verification spawn.
+ *
+ * 5s, not the checker's default probe budget: a cold npm shim on a cold file
+ * cache measured just over 2s in the #1674 review, so a tighter budget spends
+ * the whole wait and still learns nothing. This runs once per shim per session
+ * on the success path, and the installer's own verification keeps its more
+ * generous 10s.
+ */
+const MANAGED_VERIFY_TIMEOUT_MS = 5000;
+/** First cooldown after a verification that never got a fair run. */
+const MANAGED_VERIFY_COOLDOWN_MS = 60_000;
+/**
+ * Ceiling for the cooldown ladder — a shim that keeps stalling is still
+ * re-probed every 15 minutes.
+ */
+const MANAGED_VERIFY_COOLDOWN_MAX_MS = 15 * 60_000;
+
+function managedVerifyCooldownMs(attempts: number): number {
+	return Math.min(
+		MANAGED_VERIFY_COOLDOWN_MAX_MS,
+		MANAGED_VERIFY_COOLDOWN_MS * 2 ** (attempts - 1),
+	);
+}
+
+async function runManagedVerification(
+	candidate: string,
+	stamp: string,
+	priorAttempts: number,
+	generation: GenerationHandle,
+): Promise<ManagedVerdict> {
+	let transient = false;
+	let ok: boolean;
 	try {
-		return candidates.find((candidate) => fs.existsSync(candidate)) ?? null;
+		const { verifyToolBinary } = await import("../../../installer/index.js");
+		ok = await verifyToolBinary(
+			candidate,
+			undefined,
+			() => {
+				transient = true;
+			},
+			MANAGED_VERIFY_TIMEOUT_MS,
+		);
 	} catch {
-		return null;
+		// The verifier itself could not run — installer-isolated unit tests mock
+		// this module without it, and a throw here says nothing about the shim.
+		// "Cannot verify" is not "broken": keep the on-disk answer.
+		transient = true;
+		ok = false;
 	}
+	// An unspawnable prober is never a durable verdict (#1569): a timeout or a
+	// spawn-boundary failure says nothing about the shim, so it never demotes
+	// the candidate. It IS remembered, under a cooldown, so the wait is paid
+	// once per window rather than on every resolve (#1674 review F1).
+	// A verification that straddles a session boundary answers ITS caller, but
+	// its verdict belongs to the session that asked. Writing it into the fresh
+	// session would hand the new session the old one's cooldown — the exact
+	// re-arm this state clears at `session_start` (#1674 review F5). Same guard
+	// the install seam's in-flight share uses.
+	if (!ok && transient) {
+		const attempts = priorAttempts + 1;
+		generation.guardedWrite(stamp, () => {
+			managedBinaryVerdicts.set(stamp, {
+				verdict: "unverified",
+				attempts,
+				retryAtMs: Date.now() + managedVerifyCooldownMs(attempts),
+			});
+		});
+		return "unverified";
+	}
+	generation.guardedWrite(stamp, () => {
+		managedBinaryVerdicts.set(stamp, { verdict: ok ? "ok" : "broken" });
+	});
+	if (!ok) {
+		// Once per shim per session, at the moment the verdict is reached — the
+		// memo answers every later call, so this cannot become per-dispatch spam.
+		logSessionStart(
+			`dispatch availability: managed shim ${candidate} exists but does not run; falling through to PATH`,
+		);
+	}
+	return ok ? "ok" : "broken";
+}
+
+async function verifyManagedCandidate(
+	candidate: string,
+): Promise<ManagedVerdict> {
+	let stamp: string;
+	try {
+		const stat = fs.statSync(candidate);
+		stamp = `${candidate}:${stat.mtimeMs}:${stat.size}`;
+	} catch {
+		return "absent";
+	}
+	const memo = managedBinaryVerdicts.get(stamp);
+	let priorAttempts = 0;
+	if (memo) {
+		if (memo.verdict !== "unverified") return memo.verdict;
+		if (Date.now() < memo.retryAtMs) return "unverified";
+		priorAttempts = memo.attempts;
+	}
+	const existing = managedVerifyInFlight.get(stamp);
+	if (existing) return existing;
+	const generation = availabilityGeneration.capture();
+	const probe = runManagedVerification(
+		candidate,
+		stamp,
+		priorAttempts,
+		generation,
+	).finally(() => {
+		// A settling old-session probe must not evict the live entry a new
+		// session already started for the same shim (#1674 review F5).
+		generation.guardedWrite(stamp, () => {
+			if (managedVerifyInFlight.get(stamp) === probe) {
+				managedVerifyInFlight.delete(stamp);
+			}
+		});
+	});
+	managedVerifyInFlight.set(stamp, probe);
+	return probe;
+}
+
+/**
+ * The managed shim for a Node CLI tool (`~/.pi-lens/tools/node_modules/.bin/<tool>`),
+ * or null when no candidate on disk actually runs.
+ *
+ * Verification uses the installer's own `verifyToolBinary`, the same check its
+ * managed-first branch runs before returning a managed path. A bare
+ * `existsSync` let a broken shim shadow a working PATH binary — the on-disk
+ * file wins the race and then fails every spawn behind it (#1657). knip and
+ * jscpd each carried a line-for-line copy of this resolver; #1476 folds them
+ * into one definition so the next managed tool inherits the fast path instead
+ * of a fourth copy.
+ *
+ * A settled verdict is memoized per file identity for the session, so the fast
+ * path answers without a spawn after the first call (#1467). A probe that
+ * cannot run keeps the optimistic answer rather than turning a stall into a
+ * "missing tool", and is memoized under a bounded cooldown ladder so the wait
+ * is paid once per window instead of on every resolve — while a shim that
+ * stalls on a cold cache still gets re-probed later (#1674 review F1).
+ * Concurrent first touches share one probe (#1674 review F2).
+ */
+export async function findManagedNodeToolBinary(
+	tool: string,
+): Promise<string | null> {
+	for (const candidate of managedNodeToolCandidates(tool)) {
+		const verdict = await verifyManagedCandidate(candidate);
+		if (verdict === "ok" || verdict === "unverified") return candidate;
+	}
+	return null;
 }
 
 // =============================================================================
@@ -161,8 +341,8 @@ export function findManagedNodeToolBinary(tool: string): string | null {
 export function createVenvFinder(
 	command: string,
 	windowsExt = "",
-): (cwd: string) => string {
-	return (cwd: string): string => {
+): (cwd: string) => Promise<string> {
+	return async (cwd: string): Promise<string> => {
 		const venvPaths = [
 			`.venv/bin/${command}`,
 			`venv/bin/${command}`,
@@ -176,6 +356,19 @@ export function createVenvFinder(
 				return fullPath;
 			}
 		}
+
+		// Managed-dir install (~/.pi-lens/tools/node_modules/.bin/<command>) — the
+		// same shim `ensureTool()` installs npm-strategy tools into. Checked BEFORE
+		// the bare-name PATH fallback (#1638): without this, a tool that only
+		// exists in the managed dir never resolves here, so `resolveAvailableOrInstall`
+		// clears the checker's cache on every install recovery for nothing — the
+		// very next probe misses PATH again, spawns a doomed `--version` process,
+		// and only THEN falls through to `ensureTool`'s own cache. One managed-dir
+		// check settles it without a spawn — after one verification per shim per
+		// session, so a shim that cannot run falls through to PATH instead of
+		// shadowing a working binary (#1657).
+		const managed = await findManagedNodeToolBinary(command);
+		if (managed) return managed;
 
 		// Fall back to global
 		return command;
@@ -231,7 +424,7 @@ type AvailabilityCache = {
 
 export interface AvailabilityCheckerOptions {
 	probeTimeout?: number;
-	fastPath?: () => string | null;
+	fastPath?: () => string | null | Promise<string | null>;
 	/** Environment used by both the availability probe and later client spawns. */
 	environment?: (cwd: string) => Promise<NodeJS.ProcessEnv>;
 	/** Compatibility for legacy probes whose test doubles carry no failure kind. */
@@ -269,7 +462,9 @@ export async function getManagedToolEnvironment(
 }
 
 /** Read-only managed/PATH discovery for spawn-time resolution memos. */
-export async function discoverManagedTool(toolId: string): Promise<string | null> {
+export async function discoverManagedTool(
+	toolId: string,
+): Promise<string | null> {
 	return (await ensureTool(toolId, { allowInstall: false })) ?? null;
 }
 
@@ -287,10 +482,48 @@ const installAttemptsByCwd = new PathKeyedMap<Map<string, InstallAttemptState>>(
 const resolveInstallInFlightByCwd = new PathKeyedMap<
 	Map<string, Promise<string | null>>
 >(normalizeEphemeralMapKey);
+// Which (cwd, toolId) pairs already got their ONE compensating `available`
+// row this session for a GENUINE correction (#1612 review F2).
+// `checker.reset()` clears the checker's own cache on every install recovery,
+// so the NEXT call re-probes PATH from scratch — and that probe keeps missing
+// for a managed-dir-only install (createVenvFinder never searches the managed
+// tools dir; tracked separately as its own bug). Without this memo, every one
+// of those repeat probe failures looks like a fresh correction and re-logs
+// "available", even though only the first call actually ran an install.
+//
+// A correction is genuine only when a latched `unavailable` row for the same
+// pair stood before it. `verifyOrInstallCommand` also emits through this seam
+// with NO prior latch behind it (biome-check and oxlint reach it with no
+// checker probe at all), and burning this memo on such a row silences the
+// LATER genuine latch-then-recover for the same pair — the #1606 defect back
+// through the #1612 seam (#1657). Those rows dedupe against
+// `uncorrectedEmissionsByCwd` instead, so repeats stay suppressed without
+// pre-empting the real correction.
+const correctedAvailabilityByCwd = new PathKeyedMap<Set<string>>(
+	normalizeMapKey,
+);
+// Which (cwd, toolId) pairs already emitted an `available` row that corrected
+// nothing (no latched `unavailable` stood before it). Same one-row-per-session
+// bound as the memo above, kept in a SEPARATE scope so it cannot answer for a
+// correction that has not happened yet (#1657).
+const uncorrectedEmissionsByCwd = new PathKeyedMap<Set<string>>(
+	normalizeMapKey,
+);
+// Which (cwd, tool) pairs currently stand latched `unavailable` in the durable
+// log. Recorded where such a row is actually written, so "was there anything
+// to correct" is read from the log's own history rather than assumed by the
+// caller. Session-scoped: `resetDispatchAvailabilityState` clears it, so a new
+// session re-arms instead of inheriting the last one's latches (#1657).
+const latchedUnavailableByCwd = new PathKeyedMap<Set<string>>(normalizeMapKey);
 // Checkers are created by runner modules and may also be created dynamically.
 // Keep the session reset as a generation rather than retaining every checker
 // reset closure forever.
-let availabilityStateGeneration = 0;
+//
+// #1754: the counter itself is now the shared `GenerationSource` primitive, so
+// the capture-before-await/check-after guards below are one implementation
+// instead of five hand-rolled ones, and a dropped straddling write is visible
+// in the degradation ledger instead of silent.
+const availabilityGeneration = createGenerationSource("dispatch-availability");
 
 function installStateFor(cwd: string, toolId: string): InstallAttemptState {
 	let states = installAttemptsByCwd.get(cwd);
@@ -321,12 +554,238 @@ function noteInstallSuccess(toolId: string, cwd: string): void {
 	if (states?.size === 0) installAttemptsByCwd.delete(cwd);
 }
 
+function hasId(
+	map: PathKeyedMap<Set<string>>,
+	cwd: string,
+	id: string,
+): boolean {
+	return map.get(cwd)?.has(id) ?? false;
+}
+
+function addId(map: PathKeyedMap<Set<string>>, cwd: string, id: string): void {
+	let ids = map.get(cwd);
+	if (!ids) {
+		ids = new Set();
+		map.set(cwd, ids);
+	}
+	ids.add(id);
+}
+
+function deleteIds(
+	map: PathKeyedMap<Set<string>>,
+	cwd: string,
+	ids: string[],
+): void {
+	const existing = map.get(cwd);
+	if (!existing) return;
+	for (const id of ids) existing.delete(id);
+	if (existing.size === 0) map.delete(cwd);
+}
+
+/**
+ * True once a compensating `available` row has already fired for this
+ * (cwd, toolId) pair this session; `noteAvailabilityCorrected` records it the
+ * first time. #1612 review F2's "once per correction" — see
+ * `correctedAvailabilityByCwd`'s comment for why repeats need suppressing.
+ */
+function hasCorrectedAvailability(cwd: string, toolId: string): boolean {
+	return hasId(correctedAvailabilityByCwd, cwd, toolId);
+}
+
+function noteAvailabilityCorrected(cwd: string, toolId: string): void {
+	addId(correctedAvailabilityByCwd, cwd, toolId);
+}
+
+/**
+ * Record that a latched `unavailable` row now stands for this pair. Called
+ * from each seam that writes one (the availability checker and the shared
+ * probe latch), so a later compensating row can tell a genuine correction
+ * from a no-op emission (#1657).
+ */
+function noteLatchedUnavailable(cwd: string, tool: string): void {
+	addId(latchedUnavailableByCwd, cwd, tool);
+}
+
+/**
+ * Drop the latch record for a pair, because the row it described no longer
+ * stands. Called on every `available` verdict as well as on the compensating
+ * row itself, so a latch cannot outlive the state it describes and later back
+ * a "correction" that corrects nothing (#1674 review F3).
+ */
+function clearLatchedUnavailable(cwd: string, ...tools: string[]): void {
+	deleteIds(latchedUnavailableByCwd, cwd, tools);
+}
+
+/**
+ * Every name a latched row for this pair could have been written under. A
+ * checker logs its COMMAND (sometimes a resolved absolute path), the install
+ * seam knows a toolId, and the two are not always the same string. One
+ * derivation feeds BOTH the lookup and the clear, so the two can never
+ * disagree about which key the latch lives under (#1674 review F3).
+ */
+function latchKeysFor(toolId: string, command?: string): string[] {
+	const keys = [toolId];
+	if (command) keys.push(command, path.basename(command));
+	return keys;
+}
+
+/**
+ * True when a latched `unavailable` row stands for any of these keys. A false
+ * positive only restores the pre-#1657 behavior (the row emits and burns the
+ * correction memo); a false negative still emits the row, under the
+ * uncorrected scope. Neither can swallow a genuine correction.
+ */
+function hasLatchedUnavailable(cwd: string, tools: string[]): boolean {
+	return tools.some((tool) => hasId(latchedUnavailableByCwd, cwd, tool));
+}
+
+/**
+ * Which installer family resolved a tool, for the compensating row's
+ * `evidence.source` (#1612 review F1). Reads the registry's own
+ * `installStrategy` rather than hand-mapping per toolId — the two cannot
+ * drift apart because there is only one list.
+ */
+function sourceTagForToolId(toolId: string): ProbeEvidence["source"] {
+	switch (getToolInstallStrategy(toolId)) {
+		case "npm":
+			return "managed-dir";
+		case "pip":
+			return "pip-user";
+		case "github":
+			return "github-release";
+		case "archive":
+			return "archive-dist";
+		case "maven":
+			return "maven-jar";
+		default:
+			// "gem" has no CLI runner behind this seam yet, and an unknown toolId
+			// means the registry lookup itself missed — either way, no tag beats
+			// a guessed one.
+			return undefined;
+	}
+}
+
+/**
+ * How to tag a not-fresh install resolution in the compensating row's
+ * evidence (#1636 review, carried over from #1615's verify). `getInstallAttempt`
+ * answers `undefined` for BOTH a genuine cache hit and a plain PATH/managed-dir
+ * discovery, and answers `declined`/`skipped` for a policy refusal that still
+ * hands back whatever discovery found — three different facts a single
+ * `"cache"` tag used to flatten into one. `declined`/`skipped` take priority
+ * over the source map: a project-trust decline overwrites whatever the
+ * discovery pass underneath it found (see `ensureTool`'s trust-gate branch in
+ * installer/index.ts), so by the time this reads it, "declined" is the honest
+ * answer regardless of how the binary was actually found.
+ */
+function resolvedTagForAttempt(
+	toolId: string,
+	attempt: InstallAttempt | undefined,
+): "cache" | "path" | "declined" {
+	if (attempt?.outcome === "declined" || attempt?.outcome === "skipped") {
+		return "declined";
+	}
+	return getLastEnsureResolutionSource(toolId) === "path" ? "path" : "cache";
+}
+
+/**
+ * Emit the ONE compensating `available` row for a (cwd, toolId) correction,
+ * after a latched unavailable probe recovers via `ensureTool`. This is the
+ * SINGLE row constructor for every caller behind this seam —
+ * `resolveAvailableOrInstallUnshared` (#1612) and `verifyOrInstallCommand`
+ * (#1636) both call it rather than each hand-rolling their own, which is
+ * exactly the drift #1610's own review caught the first time this shape
+ * shipped twice.
+ *
+ * Gated on the once-per-correction memo (`correctedAvailabilityByCwd`,
+ * #1612 review F2): `checker.reset()` / a cleared probe cache means the NEXT
+ * call for the same (cwd, toolId) can resolve the same tool again with no
+ * fresh attempt behind it, and that must not re-log a "fresh correction"
+ * every time.
+ *
+ * `latchKeys` are every name a latched `unavailable` row for this pair could
+ * carry. A row that clears one of them is a genuine correction and burns the
+ * correction memo; a row with nothing to correct dedupes in its own scope, so
+ * it cannot silence the genuine latch-then-recover that follows it for the
+ * same pair (#1657).
+ */
+function emitCompensatingAvailableRow(
+	cwd: string,
+	toolId: string,
+	installStartedAt: number,
+	installedPath: string,
+	latchKeys: string[],
+): void {
+	if (hasCorrectedAvailability(cwd, toolId)) return;
+	const correctsLatchedRow = hasLatchedUnavailable(cwd, latchKeys);
+	if (correctsLatchedRow) {
+		noteAvailabilityCorrected(cwd, toolId);
+		// Clear every key the latch could live under, not just the toolId: the
+		// checker records the row under its COMMAND, and a leftover entry would
+		// later back a "correction" with nothing behind it (#1674 review F3).
+		clearLatchedUnavailable(cwd, ...latchKeys);
+	} else {
+		if (hasId(uncorrectedEmissionsByCwd, cwd, toolId)) return;
+		addId(uncorrectedEmissionsByCwd, cwd, toolId);
+	}
+	// `installed`/`installedPath` can come back truthy WITHOUT ensureTool
+	// running an install this call — its in-memory cache, its on-disk probe
+	// cache, getToolPath finding it already present, or a concurrent peer's
+	// install all return a path with no fresh attempt recorded. Deriving from
+	// `getInstallAttempt` (rather than asserting "succeeded" because the path
+	// is truthy, or hand-rolling a second mapping) is what #1610's OWN
+	// failure-path mirror bug was caught on review; read the REAL outcome
+	// through the one function that already knows how, don't assume it. Hard
+	// import, no `typeof` guard (#1636 review): a genuinely removed export
+	// must throw here, not silently read as "not attempted".
+	const attempt = getInstallAttempt(toolId);
+	const installEvidence = describeInstallAttempt(attempt);
+	const evidence: ProbeEvidence = {
+		...installEvidence,
+		binary: path.basename(installedPath),
+		source: sourceTagForToolId(toolId),
+		// Set alongside any non-"succeeded" outcome: the path is truthy but
+		// nothing ran this call, so it came from an already-known-good answer
+		// rather than a fresh attempt (#1612 review F2).
+		...(installEvidence.install !== "succeeded" && {
+			resolved: resolvedTagForAttempt(toolId, attempt),
+		}),
+		// The whole point of the memo split, on the record: a reader can tell a
+		// row that cleared a latched `unavailable` from one that corrected
+		// nothing, without re-deriving it from the surrounding rows (#1674
+		// review F4).
+		correctsLatchedRow,
+	};
+	logAvailabilityDecision(
+		{
+			tool: toolId,
+			verdict: "available",
+			outcome: "success",
+			cause: "ok",
+			elapsedMs: Date.now() - installStartedAt,
+			// `checker.reset()`/a fresh probe just cleared whatever cache stood
+			// behind this call, so nothing is actually held pinned the instant
+			// this row is written — the very next probe starts fresh
+			// (#1612 review F3). Writing `true` here would claim a durability
+			// this call doesn't have.
+			latched: false,
+			classifiedBy: "caller",
+			evidence,
+		},
+		cwd,
+	);
+}
+
 /** Reset availability/install suppression at the session boundary. */
 export function resetDispatchAvailabilityState(): void {
 	installAttemptsByCwd.clear();
 	resolveInstallInFlightByCwd.clear();
+	correctedAvailabilityByCwd.clear();
+	uncorrectedEmissionsByCwd.clear();
+	latchedUnavailableByCwd.clear();
+	managedBinaryVerdicts.clear();
+	managedVerifyInFlight.clear();
 	resetPathWalkMemo();
-	availabilityStateGeneration += 1;
+	availabilityGeneration.bump();
 }
 
 /** What the last probe for a cwd decided, for messaging and telemetry (#1467). */
@@ -375,21 +834,21 @@ export function createAvailabilityChecker(
 	const inFlightByCwd = new PathKeyedMap<Promise<boolean>>(
 		normalizeEphemeralMapKey,
 	);
-	let checkerGeneration = availabilityStateGeneration;
+	let checkerGeneration = availabilityGeneration.current();
 
 	const findCommand = createVenvFinder(command, windowsExt);
 
 	function ensureCurrentGeneration(): void {
-		if (checkerGeneration === availabilityStateGeneration) return;
+		if (checkerGeneration === availabilityGeneration.current()) return;
 		cacheByCwd.clear();
 		inFlightByCwd.clear();
-		checkerGeneration = availabilityStateGeneration;
+		checkerGeneration = availabilityGeneration.current();
 	}
 
 	const reset = (): void => {
 		cacheByCwd.clear();
 		inFlightByCwd.clear();
-		checkerGeneration = availabilityStateGeneration;
+		checkerGeneration = availabilityGeneration.current();
 	};
 
 	function getCache(cwd: string): AvailabilityCache {
@@ -444,6 +903,19 @@ export function createAvailabilityChecker(
 			);
 			cache.retryAtMs = Date.now() + retryAfterMs;
 		}
+		const latched = verdict.available || isLatchingOutcome(verdict.outcome);
+		// Remember the pair whose durable row now says "unavailable and staying
+		// that way" — that is the row a later compensating `available` row
+		// corrects, and the only thing that makes such a row a correction
+		// (#1657).
+		if (!verdict.available && latched) {
+			noteLatchedUnavailable(resolvedCwd, command);
+		} else if (verdict.available) {
+			// The latched row this pair carried no longer stands: THIS row says
+			// the tool is back. Dropping the record here keeps a stale latch from
+			// backing a later "correction" that corrects nothing (#1674 F3).
+			clearLatchedUnavailable(resolvedCwd, ...latchKeysFor(command));
+		}
 		logAvailabilityDecision(
 			{
 				tool: command,
@@ -451,7 +923,7 @@ export function createAvailabilityChecker(
 				outcome: verdict.outcome,
 				cause: verdict.cause,
 				elapsedMs: verdict.elapsedMs,
-				latched: verdict.available || isLatchingOutcome(verdict.outcome),
+				latched,
 				...(verdict.classifiedBy !== undefined && {
 					classifiedBy: verdict.classifiedBy,
 				}),
@@ -496,7 +968,7 @@ export function createAvailabilityChecker(
 		const promiseGeneration = checkerGeneration;
 		let promise: Promise<boolean>;
 		promise = (async () => {
-			const fastPath = options.fastPath?.();
+			const fastPath = await options.fastPath?.();
 			if (fastPath) {
 				cache.command = fastPath;
 				noteDecision(cache, resolvedCwd, {
@@ -539,7 +1011,28 @@ export function createAvailabilityChecker(
 				return false;
 			}
 
-			const cmd = findCommand(resolvedCwd);
+			const cmd = await findCommand(resolvedCwd);
+			// #1995: a command cooling down after a RUNTIME timeout (lint or
+			// autofix lane blew its real budget) must not re-probe on every
+			// edit - the positive verdict is effectively cooled. Consult-only:
+			// probe timeouts do NOT arm the cooldown here, because a single
+			// slow --version under host stall (#1467) is transient evidence,
+			// and session-long suppression from it would contradict the
+			// #1494 retry ladder this classification exists for.
+			if (isInSpawnTimeoutCooldown(cmd)) {
+				noteDecision(cache, resolvedCwd, {
+					available: false,
+					outcome: "transient",
+					cause: "probe-timeout",
+					elapsedMs: 0,
+					classifiedBy: "caller",
+					evidence: {
+						command: cmd,
+						status: null,
+					},
+				});
+				return false;
+			}
 			const env = await options.environment?.(resolvedCwd);
 			// The probe budget is enforced by a HOST-side timer, so host event-loop
 			// stalls are charged to the child. Measure the stall that overlapped the
@@ -625,7 +1118,8 @@ export function createAvailabilityChecker(
 			cause: cache.cause,
 			elapsedMs: cache.elapsedMs,
 			latched:
-				cache.available !== false || isLatchingOutcome(cache.outcome ?? "missing"),
+				cache.available !== false ||
+				isLatchingOutcome(cache.outcome ?? "missing"),
 			retryAtMs: cache.retryAtMs,
 		};
 	}
@@ -685,7 +1179,7 @@ export function createCwdCachedProbe(
 	const inFlightByCwd = new PathKeyedMap<Promise<boolean>>(
 		normalizeEphemeralMapKey,
 	);
-	let probeGeneration = availabilityStateGeneration;
+	let probeGeneration = availabilityGeneration.current();
 
 	function clear(): void {
 		latchByCwd.clear();
@@ -693,9 +1187,9 @@ export function createCwdCachedProbe(
 	}
 
 	function ensureCurrentGeneration(): void {
-		if (probeGeneration === availabilityStateGeneration) return;
+		if (probeGeneration === availabilityGeneration.current()) return;
 		clear();
-		probeGeneration = availabilityStateGeneration;
+		probeGeneration = availabilityGeneration.current();
 	}
 
 	function latchFor(key: string): AvailabilityLatch {
@@ -726,6 +1220,13 @@ export function createCwdCachedProbe(
 			const delay = latch.noteUnavailable(verdict.outcome, verdict.cause);
 			if (delay > 0) retryAfterMs = delay;
 		}
+		const latched = verdict.available || isLatchingOutcome(verdict.outcome);
+		// Same correction bookkeeping as the checker seam above (#1657).
+		if (!verdict.available && latched) {
+			noteLatchedUnavailable(key, options.tool);
+		} else if (verdict.available) {
+			clearLatchedUnavailable(key, ...latchKeysFor(options.tool));
+		}
 		logAvailabilityDecision(
 			{
 				tool: options.tool,
@@ -733,7 +1234,7 @@ export function createCwdCachedProbe(
 				outcome: verdict.outcome,
 				cause: verdict.cause,
 				elapsedMs: verdict.elapsedMs,
-				latched: verdict.available || isLatchingOutcome(verdict.outcome),
+				latched,
 				hostStallMs: verdict.hostStallMs,
 				...(retryAfterMs !== undefined && { retryAfterMs }),
 				...(options.budgetMs !== undefined && { budgetMs: options.budgetMs }),
@@ -839,7 +1340,7 @@ export function createCwdCachedProbe(
 	};
 	cached.reset = (): void => {
 		clear();
-		probeGeneration = availabilityStateGeneration;
+		probeGeneration = availabilityGeneration.current();
 	};
 	return cached;
 }
@@ -931,9 +1432,26 @@ async function verifyOrInstallCommand(
 
 	const state = installStateFor(cwd, toolId);
 	if (state.suppressed) return null;
+	const installStartedAt = Date.now();
 	const installed = await ensureTool(toolId);
 	if (installed) {
 		noteInstallSuccess(toolId, cwd);
+		// A latched `unavailable` row MAY stand here, written by whatever probe
+		// the caller ran first — but not always. The on-disk pre-check above
+		// logs nothing, and two runners reach this seam with no checker probe at
+		// all (biome-check and oxlint call
+		// `resolveToolCommandWithInstallFallback` directly, #1657). So the row is
+		// emitted either way, and only a call that really clears a latched row is
+		// recorded as a correction. Without the row, the durable log keeps saying
+		// the tool is off after the installer just brought it back — the third
+		// seam of #1606/#1610/#1612 (#1636).
+		emitCompensatingAvailableRow(
+			cwd,
+			toolId,
+			installStartedAt,
+			installed,
+			latchKeysFor(toolId, command),
+		);
 		return installed;
 	}
 	noteInstallFailure(toolId, cwd);
@@ -1005,10 +1523,42 @@ async function resolveAvailableOrInstallUnshared(
 	if (state.suppressed) {
 		return null;
 	}
+	const installStartedAt = Date.now();
 	const installed = await ensureTool(toolId);
 	if (installed) {
 		noteInstallSuccess(toolId, cwd);
 		checker.reset?.();
+		// The PATH probe above already wrote a latched `unavailable` row via
+		// `checker.isAvailableAsync`. Without a compensating row here, the durable
+		// log keeps saying the tool is off after the installer just brought it
+		// back — the shape #1606/PR #1610 fixed in `ensureViaInstaller`, shared
+		// here by ~16 runners behind this helper (#1612), and by
+		// `verifyOrInstallCommand` for the third seam (#1636).
+		//
+		// `checker.reset()` above clears the checker's cache, so the NEXT call
+		// re-probes PATH from scratch — and for a managed-dir-only install that
+		// probe misses again unless `createVenvFinder` finds it first (#1638).
+		// Left unguarded, every one of those repeat misses would re-fire this
+		// row, claiming a fresh install each time — `emitCompensatingAvailableRow`
+		// gates on the once-per-correction memo to prevent that.
+		//
+		// The probe above returned the latching `missing` outcome, so a latched
+		// `unavailable` row stands for this pair right now — recorded under the
+		// checker's own command name. Record it under the toolId too, so the
+		// emitter can READ that a correction is happening from the same ledger
+		// every other caller reads, instead of being told so by an argument
+		// (#1674 review F3).
+		noteLatchedUnavailable(cwd, toolId);
+		// This IS a genuine correction: the probe above returned the latching
+		// `missing` outcome, so a latched `unavailable` row stands for this pair
+		// right now (#1657).
+		emitCompensatingAvailableRow(
+			cwd,
+			toolId,
+			installStartedAt,
+			installed,
+			latchKeysFor(toolId, checker.getCommand(cwd) ?? undefined),
+		);
 		return installed;
 	}
 	noteInstallFailure(toolId, cwd);
@@ -1035,17 +1585,23 @@ export function resolveAvailableOrInstall(
 	const existing = byTool.get(toolId);
 	if (existing) return existing;
 
-	const generation = availabilityStateGeneration;
-	const promise = resolveAvailableOrInstallUnshared(checker, toolId, cwd).finally(
-		() => {
-			if (generation !== availabilityStateGeneration) return;
+	// Same capture-before-await guard as the managed-verify seam, via the same
+	// primitive (#1754): a settling old-session transaction must not evict the
+	// entry a NEW session already installed for this (cwd, tool).
+	const generation = availabilityGeneration.capture();
+	const promise = resolveAvailableOrInstallUnshared(
+		checker,
+		toolId,
+		cwd,
+	).finally(() => {
+		generation.guardedWrite(`${toolId}@${key}`, () => {
 			const current = resolveInstallInFlightByCwd.get(key);
 			if (current?.get(toolId) === promise) {
 				current.delete(toolId);
 				if (current.size === 0) resolveInstallInFlightByCwd.delete(key);
 			}
-		},
-	);
+		});
+	});
 	byTool.set(toolId, promise);
 	return promise;
 }
@@ -1067,6 +1623,26 @@ let sgCmdArgs: string[] = [];
 let sgSweepSawTransient = false;
 let sgSweepTransientCause: AvailabilityCause = "probe-timeout";
 let sgSweepHostStallMs = 0;
+/**
+ * Candidates that were UNREACHABLE, in ask order (#1568).
+ *
+ * The sweep stops at the first candidate that answers, so at the moment of a
+ * win this list is exactly the set of candidates ahead of the winner that never
+ * got a fair hearing — i.e. the preferred tiers the winner did not really beat.
+ *
+ * Basenames, because tier 1 is an absolute `node_modules/.bin` path and this
+ * list is written to latency.log (#1568 review F3).
+ */
+let sgSweepUnreachable: string[] = [];
+/**
+ * Candidates that were probed and answered DURABLY missing this sweep — a
+ * real ENOENT/non-installable verdict, not a stall (#1593). The retained-arm
+ * fallback below only knows the sweep saw SOME transient candidate; without
+ * this list it cannot tell "the memoized winner itself just proved absent"
+ * from "an unrelated sibling merely stalled", and re-serves a command this
+ * very sweep disproved.
+ */
+let sgSweepDurablyMissing: string[] = [];
 
 function isAstGrepVersionOutput(output: string): boolean {
 	return /\bast[- ]grep\b/i.test(output);
@@ -1098,6 +1674,10 @@ async function probeAstGrepCommandAsync(
 	if (outcome === "transient") {
 		sgSweepSawTransient = true;
 		sgSweepTransientCause = cause;
+		const name = path.basename(cmd);
+		if (!sgSweepUnreachable.includes(name)) sgSweepUnreachable.push(name);
+	} else if (!sgSweepDurablyMissing.includes(cmd)) {
+		sgSweepDurablyMissing.push(cmd);
 	}
 	return false;
 }
@@ -1134,15 +1714,15 @@ function buildSgLocalBins(): string[] {
 }
 
 let sgAvailableInFlight: Promise<boolean> | null = null;
-let sgAvailabilityGeneration = availabilityStateGeneration;
+let sgAvailabilityGeneration = availabilityGeneration.current();
 
 function ensureCurrentSgGeneration(): void {
-	if (sgAvailabilityGeneration === availabilityStateGeneration) return;
+	if (sgAvailabilityGeneration === availabilityGeneration.current()) return;
 	sgLatch.reset();
 	sgCmd = null;
 	sgCmdArgs = [];
 	sgAvailableInFlight = null;
-	sgAvailabilityGeneration = availabilityStateGeneration;
+	sgAvailabilityGeneration = availabilityGeneration.current();
 }
 
 export async function isSgAvailableAsync(): Promise<boolean> {
@@ -1158,10 +1738,14 @@ export async function isSgAvailableAsync(): Promise<boolean> {
 		sgSweepSawTransient = false;
 		sgSweepTransientCause = "probe-timeout";
 		sgSweepHostStallMs = 0;
+		sgSweepUnreachable = [];
+		sgSweepDurablyMissing = [];
 		// 1. Local node_modules/.bin
 		for (const localBin of buildSgLocalBins()) {
 			if (await probeAstGrepCommandAsync(localBin)) {
-				sgCmd = localBin; sgCmdArgs = []; noteSgAvailable(startedAt);
+				sgCmd = localBin;
+				sgCmdArgs = [];
+				noteSgAvailable(startedAt);
 				return true;
 			}
 		}
@@ -1169,7 +1753,9 @@ export async function isSgAvailableAsync(): Promise<boolean> {
 		// 2. Global PATH
 		for (const cmd of ["ast-grep", "sg"]) {
 			if (await probeAstGrepCommandAsync(cmd)) {
-				sgCmd = cmd; sgCmdArgs = []; noteSgAvailable(startedAt);
+				sgCmd = cmd;
+				sgCmdArgs = [];
+				noteSgAvailable(startedAt);
 				return true;
 			}
 		}
@@ -1179,14 +1765,36 @@ export async function isSgAvailableAsync(): Promise<boolean> {
 		for (const name of ["ast-grep", "sg"]) {
 			const globalBin = await findGlobalBinary(name);
 			if (globalBin && (await probeAstGrepCommandAsync(globalBin))) {
-				sgCmd = globalBin; sgCmdArgs = []; noteSgAvailable(startedAt);
+				sgCmd = globalBin;
+				sgCmdArgs = [];
+				noteSgAvailable(startedAt);
 				return true;
 			}
 		}
 
 		// 3. npx --no (cache-only, no silent download).
 		if (await probeAstGrepCommandAsync("npx", ["--no", "--", "ast-grep"])) {
-			sgCmd = "npx"; sgCmdArgs = ["--no", "--", "ast-grep"]; noteSgAvailable(startedAt);
+			sgCmd = "npx";
+			sgCmdArgs = ["--no", "--", "ast-grep"];
+			noteSgAvailable(startedAt);
+			return true;
+		}
+
+		// Nothing answered, and nothing answered TRANSIENTLY, while the verdict we
+		// are about to overwrite is a provisional win whose command we still hold.
+		// #1476's principle applies to the result as much as to the probe: a
+		// timeout says nothing about the tool, so it cannot erase a command this
+		// process proved working one cooldown ago. Keep serving it and re-arm
+		// (#1568 review F1) — UNLESS this very sweep just proved the memoized
+		// command durably missing (#1593): a sibling tier stalling is not license
+		// to re-serve a winner that ENOENTed a moment ago in the same pass.
+		if (
+			sgSweepSawTransient &&
+			sgLatch.isProvisional() &&
+			sgCmd !== null &&
+			!sgSweepDurablyMissing.includes(sgCmd)
+		) {
+			noteSgAvailable(startedAt, { retained: true });
 			return true;
 		}
 
@@ -1204,18 +1812,46 @@ export async function isSgAvailableAsync(): Promise<boolean> {
 	return sgAvailableInFlight;
 }
 
-/** Record a successful shared-ast-grep sweep, with one decision record. */
-function noteSgAvailable(startedAt: number): void {
-	sgLatch.noteAvailable();
+/**
+ * Record a successful shared-ast-grep sweep, with one decision record.
+ *
+ * A win reached while an EARLIER candidate was unreachable is provisional
+ * (#1568). The sweep stops at the first candidate that answers, so
+ * `sgSweepSawTransient` at this point means precisely "a tier this one is
+ * supposed to lose to never got a fair hearing" — the winner is used now, but
+ * caching it for the session would pin a healthy PATH ast-grep behind `npx`
+ * until the next restart.
+ *
+ * `retained` marks the other provisional case (#1568 review F1): no candidate
+ * answered at all, so the winner being reported is the one the previous sweep
+ * found, kept rather than discarded on a timeout.
+ */
+function noteSgAvailable(
+	startedAt: number,
+	opts: { retained?: boolean } = {},
+): void {
+	const provisional = sgSweepSawTransient;
+	let retryAfterMs = 0;
+	if (provisional) {
+		retryAfterMs = sgLatch.noteProvisionallyAvailable(sgSweepTransientCause);
+	} else {
+		sgLatch.noteAvailable();
+	}
 	logAvailabilityDecision({
 		tool: "ast-grep",
 		verdict: "available",
 		outcome: "success",
-		cause: "ok",
+		cause: provisional ? sgSweepTransientCause : "ok",
 		elapsedMs: Date.now() - startedAt,
-		latched: true,
+		latched: !provisional,
 		hostStallMs: sgSweepHostStallMs,
 		budgetMs: 5000,
+		...(provisional && {
+			provisional: true,
+			unreachablePreferred: [...sgSweepUnreachable],
+			...(opts.retained === true && { retained: true }),
+			...(retryAfterMs > 0 && { retryAfterMs }),
+		}),
 	});
 }
 

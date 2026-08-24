@@ -104,7 +104,12 @@ const ENCLOSING_TYPES: Record<string, string[]> = {
 		"enum_declaration",
 	],
 	kotlin: ["function_declaration", "class_declaration", "object_declaration"],
-	dart: ["function_declaration", "method_declaration", "class_definition", "mixin_declaration"],
+	dart: [
+		"function_declaration",
+		"method_declaration",
+		"class_definition",
+		"mixin_declaration",
+	],
 	elixir: ["call"],
 	c: ["function_definition"],
 	cpp: ["function_definition", "class_specifier", "struct_specifier"],
@@ -116,7 +121,12 @@ const ENCLOSING_TYPES: Record<string, string[]> = {
 		"struct_declaration",
 	],
 	php: ["function_definition", "method_declaration", "class_declaration"],
-	swift: ["function_declaration", "class_declaration", "protocol_declaration", "init_declaration"],
+	swift: [
+		"function_declaration",
+		"class_declaration",
+		"protocol_declaration",
+		"init_declaration",
+	],
 	lua: ["function_declaration", "function_definition"],
 	ocaml: ["value_definition", "module_definition"],
 	zig: ["function_declaration"],
@@ -204,7 +214,6 @@ function buildAncestryChain(node: any, types: string[]): AncestorSymbol[] {
 	}
 	return chain.reverse(); // outermost first
 }
-
 
 function tryExpandMarkdownSection(
 	content: string,
@@ -362,8 +371,7 @@ export async function tryExpandRead(
 				startLine: symbolStart,
 				endLine: symbolEnd,
 			},
-			ancestry:
-				enclosing.ancestry.length > 0 ? enclosing.ancestry : undefined,
+			ancestry: enclosing.ancestry.length > 0 ? enclosing.ancestry : undefined,
 			durationMs: Date.now() - startedAt,
 		};
 	} catch {

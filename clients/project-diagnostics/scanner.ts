@@ -15,7 +15,8 @@ import { isTestFile } from "../file-utils.js";
 import { isAtOrAboveHomeDir } from "../path-utils.js";
 import { getProjectDiagnosticsScannerMaxFiles } from "../project-scale.js";
 import { captureReviewGraphStructuralIr } from "../review-graph/builder.js";
-import { publishReviewGraphFileIr,
+import {
+	publishReviewGraphFileIr,
 	reviewGraphIrContentHash,
 } from "../review-graph/shared-extraction-ir.js";
 import {
@@ -68,7 +69,7 @@ const FACT_RULE_EXTENSIONS = new Set([
 // The base is the shared per-edit resolver (EXT_TO_LANG — the single
 // ext→grammar-id authority), so c/cpp/csharp/php/css and the .tsx→tsx /
 // .jsx→javascript nuances can never drift from the per-edit path. `.tsx` resolves
-// to the tsx grammar (not typescript: the typescript grammar ERRORs on JSX);
+// to the tsx grammar (not typescript: the typescript grammar ERRORs on JSX); // spellchecker:disable-line
 // typescript RULES still apply because `queriesForLanguage(...)` below merges the
 // typescript rule set onto tsx.
 //
@@ -140,6 +141,11 @@ async function scanFileMajorRules(
 	signal?: AbortSignal,
 ): Promise<FileMajorScan> {
 	const client = getSharedTreeSitterClient();
+	// #1715: grow the tree cache to span this scan's working set BEFORE
+	// parsing starts, so a project bigger than the interactive default (50
+	// entries) still gets cross-scan reuse instead of every file re-parsing
+	// on every scan.
+	client?.ensureTreeCacheCapacity(files.length);
 	const treeSitterReady =
 		!!client && client.isAvailable() && (await client.init());
 	// Same singleton the dispatch runner uses (tree-sitter.ts:444) — memoized
@@ -365,20 +371,29 @@ async function scanFileMajorRules(
 			// phase-major scans.
 			durationMs: Date.now() - startedAt - astGrepDurationMs,
 			stats,
+			// #1935 review: ast-grep's own cost is often a scan's most expensive
+			// phase (production evidence: 13168ms over 86 files, the single
+			// biggest contributor). Its duration is subtracted above so it stays
+			// comparable to the historical phase-major scans; carry it here too
+			// so it stays visible SOMEWHERE instead of disappearing when the
+			// vacuous `project_diagnostics_ast_grep_scan` cache_stats record
+			// (below) was removed.
+			astGrep: {
+				durationMs: astGrepDurationMs,
+				fileCount: astGrepFilesScanned,
+			},
 		});
 	});
-	await client.withParseCacheMeasurement(
-		async () => {},
-		(stats) => {
-			logTreeSitterCacheStats({
-				scope: "project_diagnostics_ast_grep_scan",
-				filePath: cwd,
-				fileCount: astGrepFilesScanned,
-				durationMs: astGrepDurationMs,
-				stats,
-			});
-		},
-	);
+	// #1935: no `project_diagnostics_ast_grep_scan` cache_stats record here.
+	// `scanAstGrepFile` parses through ast-grep-napi's own `lang.parse()` — a
+	// separate native engine, not `TreeSitterClient`'s WASM `TreeCache` — so a
+	// cache_stats record for this scope would always read all-zero (0
+	// lookups, 0 hits, every counter 0) no matter how the scan behaves. That
+	// was a vacuous observability record, not a real one: it looked like a
+	// signal but could never carry information. `astGrepDurationMs` and
+	// `astGrepFilesScanned` still feed the `project_diagnostics_scan` record
+	// above (`astGrep` sub-field), so this cost stays observable without a
+	// second, always-zero record to carry it.
 	return { treeSitter, factRules, astGrep, filesScanned, wasmAborted };
 }
 

@@ -21,16 +21,18 @@ describe("terragrunt filenames single source of truth", () => {
 	it("every name is detected as the terragrunt kind, case-insensitively", () => {
 		for (const name of TERRAGRUNT_FILENAMES) {
 			expect(detectFileKind(`/repo/infra/${name}`), name).toBe("terragrunt");
-			expect(
-				detectFileKind(`/repo/infra/${name.toUpperCase()}`),
-				name,
-			).toBe("terragrunt");
+			expect(detectFileKind(`/repo/infra/${name.toUpperCase()}`), name).toBe(
+				"terragrunt",
+			);
 		}
 	});
 
 	it("every name selects the terragrunt runner", () => {
 		for (const name of TERRAGRUNT_FILENAMES) {
-			expect(getLinterPolicyForFile(`/repo/infra/${name}`, {}), name).toMatchObject({
+			expect(
+				getLinterPolicyForFile(`/repo/infra/${name}`, {}),
+				name,
+			).toMatchObject({
 				preferredRunners: ["terragrunt"],
 				defaultRunner: "terragrunt",
 			});
@@ -39,7 +41,10 @@ describe("terragrunt filenames single source of truth", () => {
 
 	it("every name selects the terragrunt-hcl formatter policy", () => {
 		for (const name of TERRAGRUNT_FILENAMES) {
-			expect(getFormatterPolicyForFile(`/repo/infra/${name}`), name).toMatchObject({
+			expect(
+				getFormatterPolicyForFile(`/repo/infra/${name}`),
+				name,
+			).toMatchObject({
 				defaultFormatter: "terragrunt-hcl",
 			});
 		}
@@ -54,7 +59,9 @@ describe("terragrunt filenames single source of truth", () => {
 				const filePath = path.join(unit, name);
 				fs.writeFileSync(filePath, "locals {}\n");
 
-				expect(resolveLanguageRootForFile(filePath, env.tmpDir), name).toBe(unit);
+				expect(resolveLanguageRootForFile(filePath, env.tmpDir), name).toBe(
+					unit,
+				);
 			}
 		} finally {
 			env.cleanup();

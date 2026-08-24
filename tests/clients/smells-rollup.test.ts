@@ -183,10 +183,14 @@ describe("countRecentSmells", () => {
 		const after = "2026-08-14T10:00:00.001Z";
 
 		writeLines(path.join(tmpDir, "bus-events.log"), [staleCtxLine(before)]);
-		expect(countRecentSmells(tmpDir, sessionStartMs).staleCtxEmitFailed).toBe(0);
+		expect(countRecentSmells(tmpDir, sessionStartMs).staleCtxEmitFailed).toBe(
+			0,
+		);
 
 		writeLines(path.join(tmpDir, "bus-events.log"), [staleCtxLine(after)]);
-		expect(countRecentSmells(tmpDir, sessionStartMs).staleCtxEmitFailed).toBe(1);
+		expect(countRecentSmells(tmpDir, sessionStartMs).staleCtxEmitFailed).toBe(
+			1,
+		);
 	});
 
 	it("excludes pre-window rows and counts rows inside the rolling fallback window", () => {
@@ -204,7 +208,9 @@ describe("countRecentSmells", () => {
 		// machine equals the Date.now() boundary below to the millisecond and is
 		// wrongly admitted, making this a timing flake instead of the
 		// missing-timestamp case it names).
-		writeLines(path.join(tmpDir, "bus-events.log"), [staleCtxLine("not-a-timestamp")]);
+		writeLines(path.join(tmpDir, "bus-events.log"), [
+			staleCtxLine("not-a-timestamp"),
+		]);
 		writeLines(path.join(tmpDir, "latency.log"), [
 			JSON.stringify({
 				phase: "lsp_server_respawn",

@@ -117,7 +117,9 @@ for (const rule of parsed) {
 
 	const bodiesMatch = base.ruleBody === rule.ruleBody;
 	if (!bodiesMatch) {
-		notes.push(`${baseFile} / ${rule.file}: rule bodies differ (expected — leave alone)`);
+		notes.push(
+			`${baseFile} / ${rule.file}: rule bodies differ (expected — leave alone)`,
+		);
 		continue;
 	}
 
@@ -140,12 +142,15 @@ for (const rule of parsed) {
 		continue;
 	}
 
-	notes.push(`${baseFile} / ${rule.file}: identical rule body — intentional TS/JS twin (#657, dispatch-scoped by file extension in ast-grep-napi.ts)`);
+	notes.push(
+		`${baseFile} / ${rule.file}: identical rule body — intentional TS/JS twin (#657, dispatch-scoped by file extension in ast-grep-napi.ts)`,
+	);
 }
 
 const report = {
 	rulesScanned: parsed.length,
-	twinsAudited: notes.filter((n) => n.includes("intentional TS/JS twin")).length,
+	twinsAudited: notes.filter((n) => n.includes("intentional TS/JS twin"))
+		.length,
 	errors: errors.length,
 	notes: notes.length,
 	strict: STRICT,

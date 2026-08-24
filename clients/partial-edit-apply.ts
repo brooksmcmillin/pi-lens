@@ -151,7 +151,8 @@ export async function applyPartiallyApplicableEdits(args: {
 			postEditOutput,
 		};
 	}
-	const baseSummary = args.summary ??
+	const baseSummary =
+		args.summary ??
 		createReadGuardEditBatchSummary({
 			requestedIndexes: boundedEditIndexes(
 				args.edits.slice(0, 100).map((edit) => edit.originalIndex),
@@ -171,8 +172,7 @@ export async function applyPartiallyApplicableEdits(args: {
 				code: "replace_once_skipped" as const,
 			})),
 		],
-		rejectedTotal:
-			baseSummary.rejectedTotal + skipped.length,
+		rejectedTotal: baseSummary.rejectedTotal + skipped.length,
 		appliedIndexes: applied,
 		appliedTotal: applied.length,
 		participantIds: args.correlationId

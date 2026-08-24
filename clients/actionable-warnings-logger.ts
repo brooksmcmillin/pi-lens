@@ -8,10 +8,8 @@ const AW_LOG_FILE = path.join(AW_LOG_DIR, "actionable-warnings.log");
 const AW_LOG_BACKUP_FILE = path.join(AW_LOG_DIR, "actionable-warnings.log.1");
 const MAX_LOG_BYTES = Math.max(
 	128 * 1024,
-	Number.parseInt(
-		process.env.PI_LENS_AW_LOG_MAX_BYTES ?? "1048576",
-		10,
-	) || 1048576,
+	Number.parseInt(process.env.PI_LENS_AW_LOG_MAX_BYTES ?? "1048576", 10) ||
+		1048576,
 );
 const writer = createNdjsonLogger({
 	filePath: AW_LOG_FILE,

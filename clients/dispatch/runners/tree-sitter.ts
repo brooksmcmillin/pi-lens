@@ -364,7 +364,9 @@ const ENTITY_EXTRACTION_LINE_THRESHOLD = 5;
  */
 function relativeForIgnoreGlob(filePath: string, root: string): string {
 	const rel = path.relative(root, filePath);
-	const normalized = (rel.startsWith("..") ? filePath : rel).split(path.sep).join("/");
+	const normalized = (rel.startsWith("..") ? filePath : rel)
+		.split(path.sep)
+		.join("/");
 	return normalized;
 }
 
@@ -380,7 +382,17 @@ function matchesIgnorePaths(
 
 const treeSitterRunner: RunnerDefinition = {
 	id: "tree-sitter",
-	appliesTo: ["jsts", "python", "go", "rust", "ruby", "cxx", "csharp", "php", "css"],
+	appliesTo: [
+		"jsts",
+		"python",
+		"go",
+		"rust",
+		"ruby",
+		"cxx",
+		"csharp",
+		"php",
+		"css",
+	],
 	priority: PRIORITY.STRUCTURAL_ANALYSIS,
 	enabledByDefault: true,
 	skipTestFiles: false, // Run on test files too (structural issues matter there)
@@ -393,7 +405,9 @@ const treeSitterRunner: RunnerDefinition = {
 			logTreeSitter({
 				phase: "runner_skip",
 				filePath: ctx.filePath,
-				reason: isTreeSitterWasmAborted() ? "wasm_aborted" : "client_unavailable",
+				reason: isTreeSitterWasmAborted()
+					? "wasm_aborted"
+					: "client_unavailable",
 				status: "skipped",
 			});
 			return { status: "skipped", diagnostics: [], semantic: "none" };

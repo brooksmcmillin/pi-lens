@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.unmock("../../../clients/installer/index.ts");
+vi.unmock("../../../clients/installer/index.js");
 
 const mockFsReadFile = vi.hoisted(() => vi.fn());
 const mockFsAccess = vi.hoisted(() => vi.fn());
@@ -49,13 +49,16 @@ import {
 	flushProbeCache,
 	resetProbeCacheStateForTesting,
 	updateProbeCache,
-} from "../../../clients/installer/index.ts";
+} from "../../../clients/installer/index.js";
 
 const TOOL_ID = "typescript-language-server";
-const TOOL_PATH = "/home/user/.pi-lens/tools/node_modules/.bin/typescript-language-server";
+const TOOL_PATH =
+	"/home/user/.pi-lens/tools/node_modules/.bin/typescript-language-server";
 const MTIME_MS = 1_700_000_000_000;
 
-function makeCacheJson(overrides: Partial<{ cachedAt: number; mtimeMs: number }> = {}) {
+function makeCacheJson(
+	overrides: Partial<{ cachedAt: number; mtimeMs: number }> = {},
+) {
 	return JSON.stringify({
 		[TOOL_ID]: {
 			path: TOOL_PATH,
@@ -103,7 +106,9 @@ describe("checkProbeCache", () => {
 
 	it("returns undefined and evicts when the binary is gone", async () => {
 		mockFsReadFile.mockResolvedValue(makeCacheJson());
-		mockFsAccess.mockRejectedValue(Object.assign(new Error("ENOENT"), { code: "ENOENT" }));
+		mockFsAccess.mockRejectedValue(
+			Object.assign(new Error("ENOENT"), { code: "ENOENT" }),
+		);
 
 		const result = await checkProbeCache(TOOL_ID);
 
@@ -180,9 +185,15 @@ describe("updateProbeCache", () => {
 		await vi.advanceTimersByTimeAsync(400);
 
 		expect(mockWriteFileAtomicAsync).toHaveBeenCalledOnce();
-		const [, content] = mockWriteFileAtomicAsync.mock.calls[0] as [string, string];
+		const [, content] = mockWriteFileAtomicAsync.mock.calls[0] as [
+			string,
+			string,
+		];
 		const written = JSON.parse(content) as Record<string, unknown>;
-		expect(written[TOOL_ID]).toMatchObject({ path: TOOL_PATH, mtimeMs: MTIME_MS });
+		expect(written[TOOL_ID]).toMatchObject({
+			path: TOOL_PATH,
+			mtimeMs: MTIME_MS,
+		});
 	});
 
 	it("uses a cryptographically secure UUID in the lock owner token", async () => {
@@ -263,7 +274,9 @@ describe("updateProbeCache", () => {
 
 	it("recovers a stale lock using its owner age", async () => {
 		mockFsMkdir
-			.mockRejectedValueOnce(Object.assign(new Error("busy"), { code: "EEXIST" }))
+			.mockRejectedValueOnce(
+				Object.assign(new Error("busy"), { code: "EEXIST" }),
+			)
 			.mockResolvedValue(undefined);
 		mockFsReadFile
 			.mockResolvedValueOnce(JSON.stringify({}))
@@ -322,7 +335,11 @@ describe("updateProbeCache", () => {
 	it("does not wait on a busy lock and retries later while the process remains live", async () => {
 		vi.useFakeTimers();
 		mockFsReadFile.mockResolvedValue(
-			JSON.stringify({ pid: process.pid, createdAt: Date.now(), token: "owner" }),
+			JSON.stringify({
+				pid: process.pid,
+				createdAt: Date.now(),
+				token: "owner",
+			}),
 		);
 		mockFsMkdir.mockRejectedValue(
 			Object.assign(new Error("busy"), { code: "EEXIST" }),
@@ -374,7 +391,11 @@ describe("updateProbeCache", () => {
 		// flush: the locked authoritative read returns their payload.
 		mockFsReadFile.mockResolvedValue(
 			JSON.stringify({
-				"other-tool": { path: "/managed/other-tool", mtimeMs: MTIME_MS, cachedAt: Date.now() },
+				"other-tool": {
+					path: "/managed/other-tool",
+					mtimeMs: MTIME_MS,
+					cachedAt: Date.now(),
+				},
 			}),
 		);
 
@@ -385,6 +406,45 @@ describe("updateProbeCache", () => {
 			(mockWriteFileAtomicAsync.mock.calls[0] as [string, string])[1],
 		) as Record<string, unknown>;
 		expect(written[TOOL_ID]).toBeDefined();
-		expect(written["other-tool"]).toMatchObject({ path: "/managed/other-tool" });
+		expect(written["other-tool"]).toMatchObject({
+			path: "/managed/other-tool",
+		});
+	});
+
+	// #1609 layer b: a process SIGKILLed mid-write can leave a torn
+	// probe-cache.json behind. The ordinary session-lookup read path
+	// (`checkProbeCache`) already degrades a parse failure to "no cache"; this
+	// pins the WRITE-side authoritative read the locked commit performs before
+	// merging its own update. Pre-fix, `deserializeProbeCache` re-threw on a
+	// parse failure instead of degrading like `checkProbeCache` does, so the
+	// locked commit's `merge` step never ran and every flush attempt re-threw
+	// on the same torn bytes forever — the corrupt file was never repaired.
+	it.each([
+		["mid-JSON torn tail", '{"other-tool":{"path":"/x","mtimeMs":1,'],
+		["zero-byte file", ""],
+		["truncated to an opening brace", "{"],
+	])("self-heals a torn write-side read (%s)", async (_label, torn) => {
+		mockFsReadFile
+			.mockResolvedValueOnce(JSON.stringify({})) // ordinary session read
+			.mockResolvedValueOnce(torn); // locked authoritative read, mid-crash torn
+		mockFsStat.mockResolvedValue({ mtimeMs: MTIME_MS });
+
+		await updateProbeCache(TOOL_ID, TOOL_PATH);
+		const result = await flushProbeCache();
+
+		// No throw escaped, and the flush actually published a repaired file
+		// instead of giving up (or looping) on the torn bytes forever.
+		expect(result).toBe("written");
+		expect(mockWriteFileAtomicAsync).toHaveBeenCalledOnce();
+		const [, content] = mockWriteFileAtomicAsync.mock.calls[0] as [
+			string,
+			string,
+		];
+		const written = JSON.parse(content) as Record<string, unknown>;
+		expect(written[TOOL_ID]).toMatchObject({ path: TOOL_PATH });
+		// The torn entry must not survive as a half-trusted partial parse —
+		// deserializeProbeCache degrades the whole disk snapshot to `{}` on any
+		// parse failure, it does not attempt to salvage partial keys.
+		expect(Object.keys(written)).toEqual([TOOL_ID]);
 	});
 });

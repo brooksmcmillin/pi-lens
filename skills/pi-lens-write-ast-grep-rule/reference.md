@@ -92,6 +92,47 @@ grammars, and precision-over-recall heuristics for denylist-shaped rules.
    the partition unique; flag only a single quantified atom inside the group).
 ```
 
+## Scoping to the nearest enclosing X (#1794 F1)
+
+`stopBy` controls how far the ancestor/descendant walk searches. It is not a
+stop CONDITION. An `any:` kind list inside `inside`/`has` decides which
+nodes the walk is ALLOWED to match — it does not tell the walk where to
+halt. `stopBy: end` alone searches every ancestor up to the file root, so a
+guard several scopes out can suppress a finding inside an unrelated closure.
+
+To scope a relation to the nearest enclosing function (or any other
+boundary), give `stopBy` its OWN rule — the same kind list used as the
+match target — so the walk stops at the first satisfying ancestor and can
+never escalate past it:
+
+```yaml
+inside:
+  stopBy:                       # the BOUNDARY: halts the walk here
+    any:
+      - kind: function_declaration
+      - kind: method_definition
+      - kind: arrow_function
+      - kind: function_expression
+  any:                          # the MATCH TARGET: same list, different job
+    - kind: function_declaration
+    - kind: method_definition
+    - kind: arrow_function
+    - kind: function_expression
+  has:
+    stopBy: end
+    pattern: $M.has($K)
+```
+
+This is the fix for #1794 F1: an earlier `no-non-null-assertion` exclusion
+used `stopBy: end` with only the `any:` kind list as the match target, so a
+`.has()`/`.length` guard in an OUTER function suppressed a closure's `!`
+several scopes in. The same defect shape — `stopBy: end` mistaken for a
+boundary — shipped twice in the same 2026-08-20 window: once here, and once
+in `redundant-unsafe-function`'s `# Safety` valve (an unbounded backward
+comment scan, fixed in `00284bcc`). See
+`rules/ast-grep-rules/rules/no-non-null-assertion.yml` for the full working
+rule.
+
 ## Matching things a pattern can't express (#305)
 
 ```

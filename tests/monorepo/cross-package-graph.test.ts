@@ -131,14 +131,18 @@ describe("monorepo cross-package graph edges (#775 item 1)", () => {
 			await buildOrUpdateGraph(repo.root, [], new FactStore());
 			expect(getCachedReviewGraph(repo.root)).toBeDefined();
 
-			const report = await moduleReport(bEntry, repo.root, { blastRadius: true });
+			const report = await moduleReport(bEntry, repo.root, {
+				blastRadius: true,
+			});
 			expect(report.provenance?.usedBy).toBe("cached-review-graph");
 			// b's blast radius must include a's file — the reader-facing "who uses
 			// this" surface actually sees the cross-package import edge that #777
 			// added, not just the raw graph.
 			const blastFiles = (report.blastRadius?.files ?? []).map((f) => f.file);
 			expect(
-				blastFiles.some((p) => p.replace(/\\/g, "/").endsWith("packages/a/src/index.ts")),
+				blastFiles.some((p) =>
+					p.replace(/\\/g, "/").endsWith("packages/a/src/index.ts"),
+				),
 			).toBe(true);
 			void aEntry;
 		} finally {
@@ -173,7 +177,10 @@ describe("monorepo cross-package graph edges (#775 item 1)", () => {
 	});
 });
 
-function projectReferenceFixture(withReferences: boolean, cycle = false): Monorepo {
+function projectReferenceFixture(
+	withReferences: boolean,
+	cycle = false,
+): Monorepo {
 	return makeMonorepo({
 		// Deliberately exclude lib from npm workspaces: only the tsconfig reference
 		// can turn @scope/lib into a file edge.
@@ -249,8 +256,7 @@ describe("monorepo tsconfig project-reference edges (#819)", () => {
 			expect(
 				graph.edges.some(
 					(edge) =>
-						edge.from === `file:${app}` &&
-						edge.to === "external:@scope/lib",
+						edge.from === `file:${app}` && edge.to === "external:@scope/lib",
 				),
 			).toBe(true);
 		} finally {

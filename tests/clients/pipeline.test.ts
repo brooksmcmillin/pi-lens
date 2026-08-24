@@ -20,10 +20,14 @@ import {
 	type PipelineDeps,
 	runPipeline,
 } from "../../clients/pipeline.js";
+import { renderPostAutofixNotice } from "../../clients/post-autofix-notice.js";
 import { loadPiLensProjectConfig } from "../../clients/project-lens-config.js";
 import type { RuffClient } from "../../clients/ruff-client.js";
 import { TestRunnerClient } from "../../clients/test-runner-client.js";
-import { getDegradationSummary, resetDegradationLedger } from "../../clients/degradation-ledger.js";
+import {
+	getDegradationSummary,
+	resetDegradationLedger,
+} from "../../clients/degradation-ledger.js";
 import { createTempFile, setupTestEnvironment } from "../clients/test-utils.js";
 import {
 	_resetForTests as resetBusPublish,
@@ -60,9 +64,8 @@ describe("Pipeline", () => {
 		mockLSPService = createMockLSPService();
 		vi.mocked(getLSPService).mockReturnValue(mockLSPService as any);
 		vi.mocked(dispatchLintWithResult).mockReset();
-		const { resetFormatService } = await import(
-			"../../clients/format-service.js"
-		);
+		const { resetFormatService } =
+			await import("../../clients/format-service.js");
 		resetFormatService();
 	});
 
@@ -293,7 +296,26 @@ describe("Pipeline", () => {
 			);
 
 			expect(result.fileModified).toBe(true);
-			expect(result.output).toContain("File was modified by auto-format/fix");
+			// #1590: the pipeline hands up the notice DATA and renders no sentence
+			// of its own — it cannot see whether the authoritative bytes shipped.
+			// `handleToolResult` renders it; the neutral wording is what a
+			// format-only change (no attachment) produces there.
+			expect(result.output).not.toContain(
+				"File was modified by auto-format/fix",
+			);
+			expect(result.postAutofixNotice?.changedFiles).toContain(
+				path.basename(filePath),
+			);
+			expect(
+				renderPostAutofixNotice(result.postAutofixNotice as never, "none"),
+			).toContain("File was modified by auto-format/fix");
+			// #1590 review F2: a run that changed the file must NOT also report
+			// itself clean. The notice moved a layer up, so the all-clear gate now
+			// has to account for it; without that, `output` falls through to
+			// `buildAllClearOutput` and the same result says "clean" and
+			// "modified".
+			expect(result.output).not.toContain("clean");
+			expect(result.output).toBe("");
 		});
 
 		it("surfaces formatter failures instead of plain clean output", async () => {
@@ -342,7 +364,9 @@ describe("Pipeline", () => {
 				expect.objectContaining({
 					kind: "formatter-failure",
 					count: 1,
-					latestReasons: [{ subject: "prettier:format-fails.ts", reason: "timed out" }],
+					latestReasons: [
+						{ subject: "prettier:format-fails.ts", reason: "timed out" },
+					],
 				}),
 			]);
 			expect(result.output).not.toMatch(/^✓ .*clean/);
@@ -378,7 +402,7 @@ describe("Pipeline", () => {
 			resetBusPublish();
 		});
 
-		it("publishes reason:\"format\" with the fixed file's path when immediate format changes content", async () => {
+		it('publishes reason:"format" with the fixed file\'s path when immediate format changes content', async () => {
 			const filePath = createTempFile(tmpDir, "unformatted.ts", "const x=1");
 			vi.mocked(dispatchLintWithResult).mockResolvedValue({
 				diagnostics: [],
@@ -431,7 +455,7 @@ describe("Pipeline", () => {
 			);
 		});
 
-		it("publishes reason:\"autofix\" with the fixed file's path when an autofix tool changes content", async () => {
+		it('publishes reason:"autofix" with the fixed file\'s path when an autofix tool changes content', async () => {
 			const filePath = createTempFile(tmpDir, "messy.ts", "const x=1");
 			vi.mocked(dispatchLintWithResult).mockResolvedValue({
 				diagnostics: [],
@@ -618,7 +642,11 @@ describe("Pipeline", () => {
 		});
 
 		it("does not publish when there are no diagnostics and the file was never dirty", async () => {
-			const filePath = createTempFile(tmpDir, "clean-diag.ts", "const x = 1;\n");
+			const filePath = createTempFile(
+				tmpDir,
+				"clean-diag.ts",
+				"const x = 1;\n",
+			);
 			vi.mocked(dispatchLintWithResult).mockResolvedValue({
 				diagnostics: [],
 				blockers: [],
@@ -919,6 +947,245 @@ describe("Pipeline", () => {
 			expect(result.output).toContain("✓");
 			expect(result.hasBlockers).toBe(false);
 			expect(result.isError).toBe(false);
+		});
+	});
+
+	// #1641 review F1/F2: `inlineBlockerLines` is the structured field the
+	// turn-end past-EOF gate (`clients/blocker-past-eof.ts`) reads. It has
+	// exactly one production writer (`runPipeline`, here) — a test that calls
+	// `RuntimeCoordinator.recordInlineBlockers` directly proves nothing about
+	// whether the pipeline actually populates it.
+	describe("inlineBlockerLines (#1641)", () => {
+		it("captures the cited lines from dispatch's blocking diagnostics", async () => {
+			const filePath = createTempFile(tmpDir, "app.ts", "const x = 1;");
+			vi.mocked(dispatchLintWithResult).mockResolvedValue({
+				diagnostics: [],
+				blockers: [
+					{
+						id: "err-1",
+						message: "Type error",
+						filePath,
+						line: 7,
+						severity: "error",
+						semantic: "blocking",
+						tool: "tsc",
+					},
+					{
+						id: "err-2",
+						message: "Another error",
+						filePath,
+						line: 12,
+						severity: "error",
+						semantic: "blocking",
+						tool: "tsc",
+					},
+				],
+				warnings: [],
+				baselineWarningCount: 0,
+				fixed: [],
+				resolvedCount: 0,
+				output: "errors",
+				blockerOutput: "errors",
+				hasBlockers: true,
+			});
+
+			const result = await runPipeline(
+				createMockContext(filePath),
+				createMockDeps(),
+			);
+
+			expect(result.inlineBlockerLines).toEqual([7, 12]);
+		});
+
+		it("does NOT harvest a line from a blocker reported against a different file", async () => {
+			// A chart-wide runner (helm-lint, helm-render) reports blocking
+			// diagnostics against OTHER files in the chart alongside the edited
+			// one — e.g. editing a 4-line template but the blocker is really
+			// against `values.yaml:150`. That line describes different content
+			// than the file this record's past-EOF gate will check, so it must
+			// never be attributed to THIS file's record (#1641 review F2).
+			const filePath = createTempFile(
+				tmpDir,
+				"templates/deploy.yaml",
+				"a: 1\n",
+			);
+			const otherChartFile = path.join(tmpDir, "values.yaml");
+			vi.mocked(dispatchLintWithResult).mockResolvedValue({
+				diagnostics: [],
+				blockers: [
+					{
+						id: "helm-1",
+						message: "nil pointer evaluating interface {}.replicas",
+						filePath: otherChartFile,
+						line: 150,
+						severity: "error",
+						semantic: "blocking",
+						tool: "helm-lint",
+					},
+				],
+				warnings: [],
+				baselineWarningCount: 0,
+				fixed: [],
+				resolvedCount: 0,
+				output: "helm error",
+				blockerOutput: "helm error",
+				hasBlockers: true,
+			});
+
+			const result = await runPipeline(
+				createMockContext(filePath),
+				createMockDeps(),
+			);
+
+			expect(result.inlineBlockerLines).toEqual([]);
+		});
+
+		// #1641 review round 2 (LOW, win32-only — the dogfood host): an
+		// LSP-sourced diagnostic's `filePath` is stamped with realpath canonical
+		// casing (dispatch/runners/lsp.ts -> normalizeMapKey), but the pipeline's
+		// OWN `ctx.filePath` can arrive with a lowercase drive letter — the same
+		// drive-letter class as #1139/#1150. A bare `path.resolve` equality does
+		// not fold that case difference, so it drops EVERY LSP blocker line and
+		// this record silently skips the past-EOF gate — fail-open, but exactly
+		// the pre-fix behavior on the surface #1641 targets. Guarded like this
+		// repo's other win32-casing probes (see `normalizeEphemeralMapKey`'s own
+		// tests in `path-utils.test.ts`) since CI's Unit tests job runs on
+		// ubuntu-latest and case-folding is a no-op there.
+		it("still captures lines when the blocker's path differs from ctx.filePath only by drive-letter case (win32)", async () => {
+			if (process.platform !== "win32") return;
+			const filePath = createTempFile(tmpDir, "app.ts", "const x = 1;");
+			const lowerDriveFilePath =
+				filePath.charAt(0).toLowerCase() + filePath.slice(1);
+			// The diagnostic's path is the OPPOSITE case from `ctx.filePath` —
+			// simulating an LSP-stamped realpath-canonical path colliding with a
+			// pipeline call site that received a lowercase-drive path.
+			const canonicalCaseFilePath =
+				filePath.charAt(0).toUpperCase() + filePath.slice(1);
+			vi.mocked(dispatchLintWithResult).mockResolvedValue({
+				diagnostics: [],
+				blockers: [
+					{
+						id: "lsp-1",
+						message: "Type error",
+						filePath: canonicalCaseFilePath,
+						line: 3,
+						severity: "error",
+						semantic: "blocking",
+						tool: "lsp",
+					},
+				],
+				warnings: [],
+				baselineWarningCount: 0,
+				fixed: [],
+				resolvedCount: 0,
+				output: "type error",
+				blockerOutput: "type error",
+				hasBlockers: true,
+			});
+
+			const result = await runPipeline(
+				createMockContext(lowerDriveFilePath),
+				createMockDeps(),
+			);
+
+			expect(result.inlineBlockerLines).toEqual([3]);
+		});
+	});
+
+	// #2028: the 🔴 STOP block is a registered agent-facing delivery surface
+	// (finding-delivery-gate.ts's `tool-call:stop-blocker`), so blockers whose
+	// cited file no longer exists are dropped before rendering — there is no
+	// remediation for content in a deleted file.
+	describe("#2028 stop-blocker deleted-path gate", () => {
+		it("drops blockers whose cited file was deleted from the rendered STOP block", async () => {
+			const filePath = createTempFile(
+				tmpDir,
+				"live.ts",
+				"const x = 1;\nconst y = 2;\n",
+			);
+			const deletedPath = path.join(tmpDir, "deleted-by-agent.ts");
+			vi.mocked(dispatchLintWithResult).mockResolvedValue({
+				diagnostics: [],
+				blockers: [
+					{
+						id: "dead-1",
+						message: "DELETED-FILE-BLOCKER-MARKER secret in removed file",
+						filePath: deletedPath,
+						line: 1,
+						severity: "error",
+						semantic: "blocking",
+						tool: "gitleaks",
+					},
+					{
+						id: "live-1",
+						message: "LIVE-FILE-BLOCKER-MARKER unused var",
+						filePath,
+						line: 1,
+						severity: "error",
+						semantic: "blocking",
+						tool: "lsp",
+					},
+				],
+				warnings: [],
+				baselineWarningCount: 0,
+				fixed: [],
+				resolvedCount: 0,
+				output:
+					"DELETED-FILE-BLOCKER-MARKER secret in removed file\nLIVE-FILE-BLOCKER-MARKER unused var\ncoverage: ok",
+				blockerOutput:
+					"DELETED-FILE-BLOCKER-MARKER secret in removed file\nLIVE-FILE-BLOCKER-MARKER unused var\n",
+				hasBlockers: true,
+			});
+
+			const result = await runPipeline(
+				createMockContext(filePath),
+				createMockDeps(),
+			);
+
+			expect(result.hasBlockers).toBe(true);
+			// The live blocker renders at full authority…
+			expect(result.output).toContain("LIVE-FILE-BLOCKER-MARKER");
+			expect(result.output).toContain("🔴 STOP");
+			// …the deleted-file blocker does not render at all.
+			expect(result.output).not.toContain("DELETED-FILE-BLOCKER-MARKER");
+			// The surviving blocker's count is the LIVE one, not the raw total.
+			expect(result.output).toContain("1 issue(s)");
+		});
+
+		it("renders no STOP header when every blocker cites a deleted file", async () => {
+			const filePath = createTempFile(tmpDir, "clean-now.ts", "const x = 1;");
+			const deletedPath = path.join(tmpDir, "also-deleted.ts");
+			vi.mocked(dispatchLintWithResult).mockResolvedValue({
+				diagnostics: [],
+				blockers: [
+					{
+						id: "dead-2",
+						message: "GHOST-BLOCKER-MARKER finding in removed file",
+						filePath: deletedPath,
+						line: 1,
+						severity: "error",
+						semantic: "blocking",
+						tool: "gitleaks",
+					},
+				],
+				warnings: [],
+				baselineWarningCount: 0,
+				fixed: [],
+				resolvedCount: 0,
+				output: "GHOST-BLOCKER-MARKER finding in removed file",
+				blockerOutput: "GHOST-BLOCKER-MARKER finding in removed file",
+				hasBlockers: true,
+			});
+
+			const result = await runPipeline(
+				createMockContext(filePath),
+				createMockDeps(),
+			);
+
+			// No "🔴 STOP — 0 issue(s)" ghost header, and no replay of the raw
+			// blocker text either.
+			expect(result.output).not.toContain("🔴 STOP");
+			expect(result.output).not.toContain("GHOST-BLOCKER-MARKER");
 		});
 	});
 });

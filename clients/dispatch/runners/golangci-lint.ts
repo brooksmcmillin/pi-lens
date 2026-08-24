@@ -72,7 +72,9 @@ function describeReplacement(
 	if (replacement.NewLines && replacement.NewLines.length > 0) {
 		const preview = replacement.NewLines[0].trim();
 		const hint =
-			replacement.NewLines.length > 1 ? ` (+${replacement.NewLines.length - 1} more lines)` : "";
+			replacement.NewLines.length > 1
+				? ` (+${replacement.NewLines.length - 1} more lines)`
+				: "";
 		return `Replace with: ${preview}${hint}`;
 	}
 	return "Apply golangci-lint suggested fix";

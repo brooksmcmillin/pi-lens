@@ -112,7 +112,10 @@ describe("analyzeFileFresh", () => {
 	});
 
 	it("reports invalid JSON output", async () => {
-		const worker = writeWorker("garbage.mjs", `process.stdout.write("not json");`);
+		const worker = writeWorker(
+			"garbage.mjs",
+			`process.stdout.write("not json");`,
+		);
 		const outcome = await analyzeFileFresh(worker, "/x/app.ts", "/x");
 		expect(outcome.result).toBeUndefined();
 		expect(outcome.error).toContain("invalid JSON");

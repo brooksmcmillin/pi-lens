@@ -3,7 +3,11 @@ import * as path from "node:path";
 import { TERRAGRUNT_FILENAMES } from "./file-kinds.js";
 import { logLatency } from "./latency-logger.js";
 import { resolvePackagePath } from "./package-root.js";
-import { findNearestContaining, walkUpDirs } from "./path-utils.js";
+import {
+	findNearestContaining,
+	normalizeMapKey,
+	walkUpDirs,
+} from "./path-utils.js";
 import type { ProjectConventions } from "./project-conventions.js";
 import { loadProjectSnapshotWithoutWordIndex } from "./project-snapshot.js";
 
@@ -283,7 +287,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 			formatterNames: ["swiftformat"],
 			defaultFormatter: "swiftformat",
 			defaultWhenUnconfigured: false,
-			gate: "smart-default",
+			gate: "config-first",
 		},
 	],
 	[
@@ -292,7 +296,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 			formatterNames: ["fantomas"],
 			defaultFormatter: "fantomas",
 			defaultWhenUnconfigured: false,
-			gate: "smart-default",
+			gate: "config-first",
 		},
 	],
 	[
@@ -301,7 +305,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 			formatterNames: ["fantomas"],
 			defaultFormatter: "fantomas",
 			defaultWhenUnconfigured: false,
-			gate: "smart-default",
+			gate: "config-first",
 		},
 	],
 	[
@@ -310,7 +314,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 			formatterNames: ["fantomas"],
 			defaultFormatter: "fantomas",
 			defaultWhenUnconfigured: false,
-			gate: "smart-default",
+			gate: "config-first",
 		},
 	],
 	[
@@ -328,7 +332,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 			formatterNames: ["mix"],
 			defaultFormatter: "mix",
 			defaultWhenUnconfigured: false,
-			gate: "smart-default",
+			gate: "config-first",
 		},
 	],
 	[
@@ -337,7 +341,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 			formatterNames: ["mix"],
 			defaultFormatter: "mix",
 			defaultWhenUnconfigured: false,
-			gate: "smart-default",
+			gate: "config-first",
 		},
 	],
 	[
@@ -346,7 +350,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 			formatterNames: ["mix"],
 			defaultFormatter: "mix",
 			defaultWhenUnconfigured: false,
-			gate: "smart-default",
+			gate: "config-first",
 		},
 	],
 	[
@@ -355,7 +359,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 			formatterNames: ["mix"],
 			defaultFormatter: "mix",
 			defaultWhenUnconfigured: false,
-			gate: "smart-default",
+			gate: "config-first",
 		},
 	],
 	[
@@ -364,7 +368,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 			formatterNames: ["mix"],
 			defaultFormatter: "mix",
 			defaultWhenUnconfigured: false,
-			gate: "smart-default",
+			gate: "config-first",
 		},
 	],
 	[
@@ -454,7 +458,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 			formatterNames: ["csharpier"],
 			defaultFormatter: "csharpier",
 			defaultWhenUnconfigured: false,
-			gate: "smart-default",
+			gate: "config-first",
 		},
 	],
 	[
@@ -472,7 +476,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 			formatterNames: ["ormolu"],
 			defaultFormatter: "ormolu",
 			defaultWhenUnconfigured: false,
-			gate: "smart-default",
+			gate: "config-first",
 		},
 	],
 	[
@@ -481,7 +485,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 			formatterNames: ["ormolu"],
 			defaultFormatter: "ormolu",
 			defaultWhenUnconfigured: false,
-			gate: "smart-default",
+			gate: "config-first",
 		},
 	],
 	[
@@ -544,7 +548,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 			formatterNames: ["taplo"],
 			defaultFormatter: "taplo",
 			defaultWhenUnconfigured: false,
-			gate: "smart-default",
+			gate: "config-first",
 		},
 	],
 	[
@@ -553,7 +557,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 			formatterNames: ["terraform"],
 			defaultFormatter: "terraform",
 			defaultWhenUnconfigured: false,
-			gate: "smart-default",
+			gate: "config-first",
 		},
 	],
 	[
@@ -562,7 +566,7 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 			formatterNames: ["terraform"],
 			defaultFormatter: "terraform",
 			defaultWhenUnconfigured: false,
-			gate: "smart-default",
+			gate: "config-first",
 		},
 	],
 	[
@@ -664,6 +668,15 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 			gate: "smart-default",
 		},
 	],
+	[
+		".cue",
+		{
+			formatterNames: ["cue"],
+			defaultFormatter: "cue",
+			defaultWhenUnconfigured: true,
+			gate: "smart-default",
+		},
+	],
 ]);
 
 // oxfmt supports these extensions — registered as a candidate formatter for each.
@@ -674,16 +687,29 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 // imports and spreads this same Set (#1134; previously two parallel hand-maintained
 // lists, the #883 single-source-of-truth class).
 export const OXFMT_SUPPORTED_EXTENSIONS = new Set([
-	".js", ".jsx", ".mjs", ".cjs",
-	".ts", ".tsx", ".mts", ".cts",
+	".js",
+	".jsx",
+	".mjs",
+	".cjs",
+	".ts",
+	".tsx",
+	".mts",
+	".cts",
 	".vue",
 	".svelte",
-	".css", ".scss", ".less",
-	".html", ".htm",
-	".json", ".jsonc",
-	".yaml", ".yml",
-	".md", ".mdx",
-	".graphql", ".gql",
+	".css",
+	".scss",
+	".less",
+	".html",
+	".htm",
+	".json",
+	".jsonc",
+	".yaml",
+	".yml",
+	".md",
+	".mdx",
+	".graphql",
+	".gql",
 	".toml",
 ]);
 
@@ -713,7 +739,10 @@ FORMATTER_POLICY_BY_EXTENSION.set(".svelte", {
 });
 
 for (const [ext, policy] of FORMATTER_POLICY_BY_EXTENSION) {
-	if (OXFMT_SUPPORTED_EXTENSIONS.has(ext) && !policy.formatterNames.includes("oxfmt")) {
+	if (
+		OXFMT_SUPPORTED_EXTENSIONS.has(ext) &&
+		!policy.formatterNames.includes("oxfmt")
+	) {
 		policy.formatterNames.push("oxfmt");
 	}
 }
@@ -1908,7 +1937,7 @@ export function hasNearestPackageJsonDependency(
 		};
 		return Boolean(
 			pkg.dependencies?.[dependencyName] ??
-				pkg.devDependencies?.[dependencyName],
+			pkg.devDependencies?.[dependencyName],
 		);
 	} catch {}
 	return false;
@@ -2290,10 +2319,17 @@ export function ruffConfigArgs(cwd: string): string[] {
  * `config/biome/core.jsonc` fallback — applies on `lint --write` too.
  */
 export function biomeConfigArgs(cwd: string): string[] {
+	// A project config wins outright (#1731, discipline A): passing
+	// `--config-path` even when the project ships `biome.json(c)` pinned
+	// biome's config resolution to that ONE file, so a monorepo package
+	// underneath `cwd` with its own `biome.json` never got to extend/override
+	// the root config the way biome's own nested-config resolution allows. No
+	// flag at all lets biome discover it unaided, exactly like the ruff/
+	// markdownlint fallbacks above skip `--config` under the same condition.
+	if (getBiomeConfigPath(cwd)) return [];
 	return [
 		"--config-path=" +
-			(getBiomeConfigPath(cwd) ??
-				resolvePackagePath(import.meta.url, "config/biome/core.jsonc")),
+			resolvePackagePath(import.meta.url, "config/biome/core.jsonc"),
 	];
 }
 
@@ -2364,6 +2400,107 @@ export function hasCmakeFormatConfig(cwd: string): boolean {
 			"cmake-format.yml",
 		]) !== undefined
 	);
+}
+
+// PSScriptAnalyzerSettings.psd1 is the conventional settings file PowerShell
+// projects use to configure `Invoke-Formatter`/`Invoke-ScriptAnalyzer` (passed
+// via `-Settings`); `ScriptAnalyzerSettings.psd1` is the same convention minus
+// the "PS" prefix and shows up in some repos too. Either one opting a project
+// into explicit PSScriptAnalyzer config is enough to select the formatter
+// (#1572 — `psscriptanalyzer-format` had no case here at all, so it could
+// never be selected regardless of project config).
+const PSSCRIPTANALYZER_SETTINGS_FILES = [
+	"PSScriptAnalyzerSettings.psd1",
+	"ScriptAnalyzerSettings.psd1",
+];
+
+/**
+ * The nearest PSScriptAnalyzer settings file's full path, or `undefined`.
+ * `formatters.ts`'s `resolveCommand` passes this straight to
+ * `Invoke-Formatter -Settings` (#1572 review F2) — gating on the file's
+ * PRESENCE without ever reading its RULES would run the project's file
+ * through the stock `CodeFormatting` ruleset regardless of what it declared,
+ * the same stock-style imposition #1144 banned for the other formatters.
+ */
+export function findPSScriptAnalyzerConfigPath(
+	cwd: string,
+): string | undefined {
+	for (const dir of walkUpDirs(cwd)) {
+		for (const name of PSSCRIPTANALYZER_SETTINGS_FILES) {
+			const candidate = path.join(dir, name);
+			if (fs.existsSync(candidate)) return candidate;
+		}
+	}
+	return undefined;
+}
+
+export function hasPSScriptAnalyzerConfig(cwd: string): boolean {
+	return findPSScriptAnalyzerConfigPath(cwd) !== undefined;
+}
+
+// #1595 sweep — 7 of the 8 formatters #1572 left unreachable (038cd1df flipped
+// defaultWhenUnconfigured to false for these without adding an explicit-config
+// check; see EXPLICIT_FORMATTER_CONFIG_CHECKS in formatters.ts). nixfmt is the
+// 8th and stays unreachable: it is deliberately unconfigurable (no rc file,
+// no CLI flag surface) and has no project-level manifest marker analogous to
+// `terraform init`'s lock file, so there is no honest "explicit opt-in" signal
+// to gate on — see the KNOWN_UNREACHABLE_FORMATTERS comment in
+// formatter-policy-consistency.test.ts.
+
+export function hasCsharpierConfig(cwd: string): boolean {
+	return (
+		findNearestContaining(cwd, [
+			".csharpierrc",
+			".csharpierrc.json",
+			".csharpierrc.yaml",
+			".csharpierrc.yml",
+		]) !== undefined
+	);
+}
+
+// Ormolu has no general settings file, but it does read a project `.ormolu`
+// file for custom operator fixity declarations (the only file-based config
+// surface Ormolu supports) — real, if narrow, per its own docs.
+export function hasOrmoluConfig(cwd: string): boolean {
+	return findNearestContaining(cwd, [".ormolu"]) !== undefined;
+}
+
+export function hasTaploConfig(cwd: string): boolean {
+	return (
+		findNearestContaining(cwd, ["taplo.toml", ".taplo.toml"]) !== undefined
+	);
+}
+
+// `terraform fmt` itself is deliberately unconfigurable (no rc file, no
+// per-project options — HashiCorp's own docs call this out). The nearest
+// thing to an explicit per-project opt-in is `.terraform.lock.hcl`, written
+// only by `terraform init`: it marks a directory the user has deliberately
+// set up as a Terraform root, as opposed to a stray `.tf`/`.tfvars` file
+// dropped into an unrelated repo. A manifest marker, per #1595's own guidance
+// for formatters with no dedicated config-file convention.
+export function hasTerraformConfig(cwd: string): boolean {
+	return findNearestContaining(cwd, [".terraform.lock.hcl"]) !== undefined;
+}
+
+export function hasSwiftformatConfig(cwd: string): boolean {
+	return findNearestContaining(cwd, [".swiftformat"]) !== undefined;
+}
+
+// Fantomas has no dedicated rc file; its documented config surface is
+// `.editorconfig` (fsharp_*-prefixed keys) or a `.fantomasignore` file (the
+// one Fantomas-specific marker it does ship). Mirrors hasGoogleJavaFormatConfig's
+// precedent for formatters whose only config surface is .editorconfig.
+export function hasFantomasConfig(cwd: string): boolean {
+	return (
+		findNearestContaining(cwd, [".fantomasignore", ".editorconfig"]) !==
+		undefined
+	);
+}
+
+// `.formatter.exs` is THE convention `mix format` reads project config from
+// (inputs, line_length, plugins) — universal in Elixir projects that use it.
+export function hasMixFormatConfig(cwd: string): boolean {
+	return findNearestContaining(cwd, [".formatter.exs"]) !== undefined;
 }
 
 export function hasPhpstanConfig(cwd: string): boolean {
@@ -2528,12 +2665,15 @@ export function getSpotlessKotlinFormatter(
 						fs.readFileSync(filePath, "utf-8"),
 					);
 					spotlessGradleReadCount += 1;
-					const kotlinBodies = namedGradleBlockBodies(source, "spotless").flatMap(
-						(spotless) => namedGradleBlockBodies(spotless, "kotlin"),
-					);
+					const kotlinBodies = namedGradleBlockBodies(
+						source,
+						"spotless",
+					).flatMap((spotless) => namedGradleBlockBodies(spotless, "kotlin"));
 					config = {
 						mtime,
-						ktlintConfig: kotlinBodies.some((body) => /\bktlint\s*\(/.test(body)),
+						ktlintConfig: kotlinBodies.some((body) =>
+							/\bktlint\s*\(/.test(body),
+						),
 						ktfmtConfig: kotlinBodies.some((body) => /\bktfmt\s*\(/.test(body)),
 					};
 					spotlessKotlinConfigCache.set(filePath, config);
@@ -2589,10 +2729,18 @@ const COMPILED_CLASSES_DIRS = [
 	path.join("bin", "main"),
 ];
 
-export function hasJavaBuildDescriptor(cwd: string): boolean {
+export function hasJavaBuildDescriptor(cwd: string, ceiling?: string): boolean {
+	const normalizedCeiling = ceiling
+		? normalizeMapKey(path.resolve(ceiling))
+		: undefined;
 	for (const dir of walkUpDirs(cwd)) {
 		if (JAVA_BUILD_DESCRIPTORS.some((d) => fs.existsSync(path.join(dir, d))))
 			return true;
+		if (
+			normalizedCeiling &&
+			normalizeMapKey(path.resolve(dir)) === normalizedCeiling
+		)
+			break;
 	}
 	return false;
 }

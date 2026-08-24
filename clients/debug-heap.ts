@@ -121,7 +121,8 @@ export function pruneOldSnapshots(
 	}
 	const snapshots = names
 		.filter(
-			(name) => name.startsWith(SNAPSHOT_PREFIX) && name.endsWith(SNAPSHOT_SUFFIX),
+			(name) =>
+				name.startsWith(SNAPSHOT_PREFIX) && name.endsWith(SNAPSHOT_SUFFIX),
 		)
 		.map((name) => {
 			const full = path.join(dir, name);
@@ -187,6 +188,13 @@ export function writeHeapSnapshotNow(label: string): HeapSnapshotResult | null {
 	}
 	const durationMs = Date.now() - start;
 	pruneOldSnapshots(dir);
-	writer?.log({ ts, label, path: written, pid: process.pid, rssBytes, durationMs });
+	writer?.log({
+		ts,
+		label,
+		path: written,
+		pid: process.pid,
+		rssBytes,
+		durationMs,
+	});
 	return { path: written, rssBytes, durationMs };
 }

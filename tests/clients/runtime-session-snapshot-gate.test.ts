@@ -79,11 +79,26 @@ function makeDeps(ctxCwd: string, dbg: (msg: string) => void = () => {}) {
 			ensureAvailable: async () => false,
 			scanExports: async () => new Map(),
 		},
-		biomeClient: { isAvailable: () => false, ensureAvailable: async () => false },
-		ruffClient: { isAvailable: () => false, ensureAvailable: async () => false },
-		knipClient: { isAvailable: () => false, ensureAvailable: async () => false },
-		jscpdClient: { isAvailable: () => false, ensureAvailable: async () => false },
-		depChecker: { isAvailable: () => false, ensureAvailable: async () => false },
+		biomeClient: {
+			isAvailable: () => false,
+			ensureAvailable: async () => false,
+		},
+		ruffClient: {
+			isAvailable: () => false,
+			ensureAvailable: async () => false,
+		},
+		knipClient: {
+			isAvailable: () => false,
+			ensureAvailable: async () => false,
+		},
+		jscpdClient: {
+			isAvailable: () => false,
+			ensureAvailable: async () => false,
+		},
+		depChecker: {
+			isAvailable: () => false,
+			ensureAvailable: async () => false,
+		},
 		testRunnerClient: {
 			detectRunner: () => null,
 			runTestFile: () => ({ failed: 0, error: false }),
@@ -109,7 +124,10 @@ function seedSnapshot(cwd: string, seq: number): void {
 	const seedRuntime = new RuntimeCoordinator();
 	seedRuntime.seedProjectSequence(seq);
 	seedRuntime.cachedExports.set("makeThing", path.join(cwd, "src", "a.ts"));
-	saveProjectSnapshot(cwd, buildProjectSnapshotFromRuntime({ cwd, runtime: seedRuntime }));
+	saveProjectSnapshot(
+		cwd,
+		buildProjectSnapshotFromRuntime({ cwd, runtime: seedRuntime }),
+	);
 }
 
 function snapshotBodyReads(): number {
@@ -130,6 +148,29 @@ function snapshotLoadRecord(): Record<string, unknown> | undefined {
 		([entry]) => entry.phase === "session_start_snapshot_load",
 	);
 	return call?.[0]?.metadata as Record<string, unknown> | undefined;
+}
+
+async function assertMissReasonInMode(
+	mode: "quick" | "full",
+	reason: string,
+	prepare: (cwd: string) => void,
+): Promise<void> {
+	const env = setupTestEnvironment(`pi-lens-meta-gate-${mode}-${reason}-`);
+	process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+	process.env.PI_LENS_STARTUP_MODE = mode;
+	const dbgLog: string[] = [];
+	try {
+		const cwd = makeProject(env);
+		prepare(cwd);
+		await handleSessionStart(makeDeps(cwd, (msg) => dbgLog.push(msg)));
+		expect(snapshotLoadRecord()).toMatchObject({
+			fresh: false,
+			reason,
+		});
+		expect(dbgLog).toContainEqual(`project_snapshot: miss reason=${reason}`);
+	} finally {
+		env.cleanup();
+	}
 }
 
 describe("session_start snapshot meta-gate (#947)", () => {
@@ -219,9 +260,13 @@ describe("session_start snapshot meta-gate (#947)", () => {
 			expect(snapshotLoadRecord()).toMatchObject({
 				fresh: false,
 				skippedStale: true,
+				reason: "stale-meta-gate",
 			});
 			expect(dbgLog).toContainEqual(
 				expect.stringContaining("project_snapshot: meta gate stale"),
+			);
+			expect(dbgLog).toContainEqual(
+				"project_snapshot: miss reason=stale-meta-gate",
 			);
 		} finally {
 			env.cleanup();
@@ -283,11 +328,12 @@ describe("session_start snapshot meta-gate (#947)", () => {
 		const env = setupTestEnvironment("pi-lens-meta-gate-full-");
 		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
 		process.env.PI_LENS_STARTUP_MODE = "full";
+		const dbgLog: string[] = [];
 		try {
 			const cwd = makeProject(env);
 			seedSnapshot(cwd, 5); // stale vs effectiveSeq 0
 
-			const deps = makeDeps(cwd);
+			const deps = makeDeps(cwd, (msg) => dbgLog.push(msg));
 			await handleSessionStart(deps);
 
 			// (Full mode later re-parses the body inside
@@ -296,10 +342,49 @@ describe("session_start snapshot meta-gate (#947)", () => {
 			expect(snapshotLoadRecord()).toMatchObject({
 				fresh: false,
 				skippedStale: true,
+				reason: "stale-meta-gate",
 			});
+			expect(dbgLog).toContainEqual(
+				"project_snapshot: miss reason=stale-meta-gate",
+			);
 			expect(fs.existsSync(getProjectSnapshotPath(cwd))).toBe(true);
 		} finally {
 			env.cleanup();
 		}
 	});
+
+	it.each(["quick", "full"] as const)(
+		"%s mode classifies a missing body on both delivery surfaces",
+		async (mode) => {
+			await assertMissReasonInMode(mode, "missing", () => {});
+		},
+	);
+
+	it.each(["quick", "full"] as const)(
+		"%s mode classifies a corrupt present body on both delivery surfaces",
+		async (mode) => {
+			await assertMissReasonInMode(mode, "invalid-body", (cwd) => {
+				const bodyPath = getProjectSnapshotPath(cwd);
+				fs.mkdirSync(path.dirname(bodyPath), { recursive: true });
+				fs.writeFileSync(bodyPath, "not a gzip project snapshot");
+			});
+		},
+	);
+
+	it.each(["quick", "full"] as const)(
+		"%s mode classifies a parsed different-sequence body on both delivery surfaces",
+		async (mode) => {
+			await assertMissReasonInMode(mode, "stale(seq=5, current=0)", (cwd) => {
+				seedSnapshot(cwd, 5);
+				const metaPath = getProjectSnapshotMetaPath(cwd);
+				const meta = JSON.parse(fs.readFileSync(metaPath, "utf8")) as {
+					seq: number;
+					sequenceIndex?: { projectSeq?: number };
+				};
+				meta.seq = 0;
+				if (meta.sequenceIndex) meta.sequenceIndex.projectSeq = 0;
+				fs.writeFileSync(metaPath, JSON.stringify(meta));
+			});
+		},
+	);
 });

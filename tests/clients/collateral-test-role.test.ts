@@ -11,9 +11,8 @@ describe("isTestRoleCollateral — classifier-positive coverage", () => {
 	});
 
 	it("recognizes the same test names/locations detectFileRole already classifies", async () => {
-		const { isTestRoleCollateral } = await import(
-			"../../clients/collateral-test-role.js"
-		);
+		const { isTestRoleCollateral } =
+			await import("../../clients/collateral-test-role.js");
 		// name-based
 		expect(isTestRoleCollateral("/repo/src/foo.test.ts")).toBe(true);
 		expect(isTestRoleCollateral("/repo/src/foo.spec.ts")).toBe(true);
@@ -36,9 +35,8 @@ describe("isTestRoleCollateral — classifier-positive coverage", () => {
 	});
 
 	it("retains ordinary source / init files (non-test roles)", async () => {
-		const { isTestRoleCollateral } = await import(
-			"../../clients/collateral-test-role.js"
-		);
+		const { isTestRoleCollateral } =
+			await import("../../clients/collateral-test-role.js");
 		expect(isTestRoleCollateral("/repo/src/foo.ts")).toBe(false);
 		expect(isTestRoleCollateral("/repo/src/index.ts")).toBe(false);
 		expect(isTestRoleCollateral("/repo/pkg/widget.py")).toBe(false);
@@ -52,9 +50,8 @@ describe("isTestRoleCollateral — classifier-positive coverage", () => {
 				throw new Error("role classification unavailable");
 			},
 		}));
-		const { isTestRoleCollateral } = await import(
-			"../../clients/collateral-test-role.js"
-		);
+		const { isTestRoleCollateral } =
+			await import("../../clients/collateral-test-role.js");
 		// Even a path that "looks" like a test is RETAINED when the role decision
 		// cannot be obtained — #1080 honesty rule (no false clean, no invented
 		// heuristic).

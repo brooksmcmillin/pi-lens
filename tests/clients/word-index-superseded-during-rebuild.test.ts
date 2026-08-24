@@ -18,7 +18,9 @@ const yieldPoint = vi.hoisted(() => vi.fn());
 
 vi.mock("../../clients/cooperative-budget.js", async (importOriginal) => {
 	const actual =
-		await importOriginal<typeof import("../../clients/cooperative-budget.js")>();
+		await importOriginal<
+			typeof import("../../clients/cooperative-budget.js")
+		>();
 	return {
 		...actual,
 		// Keep the test deterministic: every long-line checkpoint yields, without

@@ -55,7 +55,10 @@ function historicalPrefix(provenance: AdvisoryProvenance | undefined): string {
 	return `Historical finding; workspace changed since capture; re-run to confirm. (${provenanceStamp(provenance)})`;
 }
 
-function historicalTestContent(content: string, provenance?: AdvisoryProvenance): string {
+function historicalTestContent(
+	content: string,
+	provenance?: AdvisoryProvenance,
+): string {
 	return content.startsWith("[from a prior turn")
 		? content
 		: `${historicalPrefix(provenance)}\n\n${content}`;
@@ -87,14 +90,22 @@ export function peekTurnEndFindings(
 	);
 	if (!findings?.data?.content || findings.data.consumed === true) return;
 	const validation = validateAdvisoryProvenance(findings.data, cwd, runtime);
-	if (logDelivery) logProvenanceDecision(validation, findings.data.provenance, "turn-end", cwd);
+	if (logDelivery)
+		logProvenanceDecision(
+			validation,
+			findings.data.provenance,
+			"turn-end",
+			cwd,
+		);
 	if (validation.allFilesDeleted) return;
 	return {
-		messages: [turnEndMessage(
-			findings.data.content,
-			validation.status === "current",
-			findings.data.provenance,
-		)],
+		messages: [
+			turnEndMessage(
+				findings.data.content,
+				validation.status === "current",
+				findings.data.provenance,
+			),
+		],
 	};
 }
 
@@ -128,11 +139,13 @@ export function consumeTurnEndFindings(
 	}
 	if (validation.allFilesDeleted) return;
 	return {
-		messages: [turnEndMessage(
-			findings.data.content,
-			validation.status === "current",
-			findings.data.provenance,
-		)],
+		messages: [
+			turnEndMessage(
+				findings.data.content,
+				validation.status === "current",
+				findings.data.provenance,
+			),
+		],
 	};
 }
 
@@ -149,7 +162,13 @@ export function peekTestFindings(
 	);
 	if (!findings?.data?.content) return;
 	const validation = validateAdvisoryProvenance(findings.data, cwd, runtime);
-	if (logDelivery) logProvenanceDecision(validation, findings.data.provenance, "test-findings", cwd);
+	if (logDelivery)
+		logProvenanceDecision(
+			validation,
+			findings.data.provenance,
+			"test-findings",
+			cwd,
+		);
 	if (validation.allFilesDeleted) return;
 	const current = validation.status === "current";
 	return {
@@ -169,7 +188,10 @@ export function consumeTestFindings(
 	cwd: string,
 	runtime?: RuntimeCoordinator,
 ): ContextResult | undefined {
-	const record = cacheManager.readCache<TestRunnerFindingsCache>("test-runner-findings", cwd);
+	const record = cacheManager.readCache<TestRunnerFindingsCache>(
+		"test-runner-findings",
+		cwd,
+	);
 	if (!record?.data?.content) return;
 	const findings = peekTestFindings(cacheManager, cwd, runtime, true);
 	if (!findings) return;
@@ -184,25 +206,47 @@ export function consumeTestFindings(
 	)?.data?.testRunGeneration;
 	cacheManager.writeCache(
 		"test-runner-findings",
-		{ content: "", testRunGeneration: priorGeneration } as TestRunnerFindingsCache,
+		{
+			content: "",
+			testRunGeneration: priorGeneration,
+		} as TestRunnerFindingsCache,
 		cwd,
 	);
 	return findings;
 }
 
 /** Complete an acknowledged MCP delivery without re-validating or re-rendering it. */
-export function acknowledgeTurnEndFindings(cacheManager: CacheManager, cwd: string): void {
-	const findings = cacheManager.readCache<Partial<TurnEndFindingsCache>>("turn-end-findings", cwd);
+export function acknowledgeTurnEndFindings(
+	cacheManager: CacheManager,
+	cwd: string,
+): void {
+	const findings = cacheManager.readCache<Partial<TurnEndFindingsCache>>(
+		"turn-end-findings",
+		cwd,
+	);
 	if (!findings?.data?.content || findings.data.consumed === true) return;
-	if (findings.data.hasBlockers === true && typeof findings.data.sessionId === "string") {
-		cacheManager.writeCache("turn-end-findings", { ...findings.data, consumed: true }, cwd);
+	if (
+		findings.data.hasBlockers === true &&
+		typeof findings.data.sessionId === "string"
+	) {
+		cacheManager.writeCache(
+			"turn-end-findings",
+			{ ...findings.data, consumed: true },
+			cwd,
+		);
 	} else {
 		cacheManager.clearCache("turn-end-findings", cwd);
 	}
 }
 
-export function acknowledgeTestFindings(cacheManager: CacheManager, cwd: string): void {
-	const findings = cacheManager.readCache<TestRunnerFindingsCache>("test-runner-findings", cwd);
+export function acknowledgeTestFindings(
+	cacheManager: CacheManager,
+	cwd: string,
+): void {
+	const findings = cacheManager.readCache<TestRunnerFindingsCache>(
+		"test-runner-findings",
+		cwd,
+	);
 	if (!findings?.data?.content) return;
 	// Same high-water-mark preservation as consumeTestFindings.
 	cacheManager.writeCache(
@@ -225,11 +269,14 @@ export function consumeSessionStartGuidance(
 	);
 	if (!guidance?.data?.content) return;
 
-	cacheManager.writeCache(
-		"session-start-guidance",
-		null as unknown as { content: string },
-		cwd,
-	);
+	// Consume by writing empty guidance, not by casting `null` into the entry's
+	// own type. `writeCache` infers its type parameter from `data`, so the cast
+	// bought nothing and claimed the file held a `{ content: string }` when it
+	// held JSON `null`. The producer (`runtime-session.ts`) always writes
+	// `{ content }`, and this reader gates on `data?.content` being non-empty,
+	// so an empty string is the same "already consumed" signal with the type
+	// the entry actually has. Same idiom as `acknowledgeTestFindings` above.
+	cacheManager.writeCache("session-start-guidance", { content: "" }, cwd);
 
 	return {
 		messages: [

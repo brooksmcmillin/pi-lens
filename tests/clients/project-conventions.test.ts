@@ -4,10 +4,7 @@ import { describe, expect, it } from "vitest";
 import { detectProjectConventions } from "../../clients/project-conventions.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 
-function writePkg(
-	tmpDir: string,
-	pkg: Record<string, unknown>,
-): void {
+function writePkg(tmpDir: string, pkg: Record<string, unknown>): void {
 	createTempFile(tmpDir, "package.json", JSON.stringify(pkg, null, 2));
 }
 

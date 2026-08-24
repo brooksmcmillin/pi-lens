@@ -32,7 +32,13 @@
  * secrets (pending dedup vs gitleaks), and license compliance are follow-ups
  * tracked on #131.
  *
- * Refs: #131
+ * Scope note (#1562 class fix): `fs`'s own tree walk is handed
+ * `--skip-dirs` per shared scratch/cache tree (`scratch-tree-policy.ts`,
+ * derived from the same `EXCLUDED_DIRS` gitleaks/opengrep use) so its
+ * `secret` scanner doesn't repeat gitleaks's `.pi/greedysearch-sources/`
+ * false-positive shape.
+ *
+ * Refs: #131, #1562
  */
 
 import * as fs from "node:fs";
@@ -40,6 +46,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { mkdtempSync } from "node:fs";
 import { loadPiLensProjectConfig } from "./project-lens-config.js";
+import { getScratchTreeGlobPatterns } from "./scratch-tree-policy.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
 import { SecurityScanClient } from "./security-scan-client.js";
 import type { TrivySecretFinding } from "./secret-findings.js";
@@ -83,12 +90,7 @@ export interface TrivyResult {
 	summary?: string;
 }
 
-export type TrivySeverity =
-	| "CRITICAL"
-	| "HIGH"
-	| "MEDIUM"
-	| "LOW"
-	| "UNKNOWN";
+export type TrivySeverity = "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" | "UNKNOWN";
 
 const EMPTY_RESULT: Omit<TrivyResult, "scannedAt"> = {
 	success: false,
@@ -287,6 +289,13 @@ export class TrivyClient extends SecurityScanClient<TrivyResult> {
 			// both the vuln and the license results; secret findings are
 			// severity-independent (trivy always emits them) and collapsed
 			// downstream against gitleaks / ast-grep.
+			//
+			// `--skip-dirs` (#1562 class fix): trivy's `fs` scan walks `cwd`
+			// ITSELF (unlike knip/jscpd, which pi-lens's own `EXCLUDED_DIRS`-aware
+			// walker feeds a pre-filtered file list). Without this, its `secret`
+			// scanner is exactly as exposed to `.pi/greedysearch-sources/`-style
+			// scratch trees as gitleaks was — same doublestar-glob patterns
+			// `scratch-tree-policy.ts` derives from the SAME `EXCLUDED_DIRS` list.
 			const result = await safeSpawnAsync(
 				bin,
 				[
@@ -301,6 +310,10 @@ export class TrivyClient extends SecurityScanClient<TrivyResult> {
 					reportPath,
 					"--quiet",
 					"--no-progress",
+					...getScratchTreeGlobPatterns().flatMap((glob) => [
+						"--skip-dirs",
+						glob,
+					]),
 					cwd,
 				],
 				{ cwd, timeout: SCAN_TIMEOUT_MS },
@@ -402,8 +415,7 @@ export function parseTrivyReport(raw: string): TrivyFinding[] {
 						: undefined,
 				severity: normalizeSeverity(v.Severity),
 				title: typeof v.Title === "string" ? v.Title : undefined,
-				primaryUrl:
-					typeof v.PrimaryURL === "string" ? v.PrimaryURL : undefined,
+				primaryUrl: typeof v.PrimaryURL === "string" ? v.PrimaryURL : undefined,
 				target,
 			});
 		}

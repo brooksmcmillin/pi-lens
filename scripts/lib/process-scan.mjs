@@ -13,11 +13,11 @@
  * unrelated node processes on a shared CI runner.
  */
 export const LSP_PROCESS_MARKERS = [
-  "typescript-language-server",
-  "ast-grep lsp",
-  "ast-grep-lsp",
-  "pyright-langserver",
-  "vscode-json-languageserver",
+	"typescript-language-server",
+	"ast-grep lsp",
+	"ast-grep-lsp",
+	"pyright-langserver",
+	"vscode-json-languageserver",
 ];
 
 /**
@@ -30,8 +30,10 @@ export const LSP_PROCESS_MARKERS = [
  * @param {string} command
  */
 export function isLspServerCommand(command) {
-  const lower = command.toLowerCase();
-  return LSP_PROCESS_MARKERS.some((marker) => lower.includes(marker.toLowerCase()));
+	const lower = command.toLowerCase();
+	return LSP_PROCESS_MARKERS.some((marker) =>
+		lower.includes(marker.toLowerCase()),
+	);
 }
 
 /**
@@ -46,6 +48,8 @@ export function isLspServerCommand(command) {
  * @returns {ProcessRow[]}
  */
 export function diffSurvivingLspProcesses(before, after) {
-  const beforePids = new Set(before.map((r) => r.pid));
-  return after.filter((row) => !beforePids.has(row.pid) && isLspServerCommand(row.command));
+	const beforePids = new Set(before.map((r) => r.pid));
+	return after.filter(
+		(row) => !beforePids.has(row.pid) && isLspServerCommand(row.command),
+	);
 }

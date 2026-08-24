@@ -80,19 +80,13 @@ describe("collectSourceFilesAsync — correctness", () => {
 
 describe("Dart source enumeration (#880)", () => {
 	it("collectSourceFiles keeps .dart files", () => {
-		fs.writeFileSync(
-			path.join(tmpDir, "main.dart"),
-			"void main() {}\n",
-		);
+		fs.writeFileSync(path.join(tmpDir, "main.dart"), "void main() {}\n");
 		const files = collectSourceFiles(tmpDir);
 		expect(files.some((f) => f.endsWith("main.dart"))).toBe(true);
 	});
 
 	it("collectSourceFilesAsync keeps .dart files", async () => {
-		fs.writeFileSync(
-			path.join(tmpDir, "main.dart"),
-			"void main() {}\n",
-		);
+		fs.writeFileSync(path.join(tmpDir, "main.dart"), "void main() {}\n");
 		const files = await collectSourceFilesAsync(tmpDir);
 		expect(files.some((f) => f.endsWith("main.dart"))).toBe(true);
 	});
@@ -106,21 +100,25 @@ describe("collectSourceFilesAsync — event-loop budget", () => {
 	// sampler also picks up ambient load when the suite runs files in parallel.
 	const MAX_SYNC_CHUNK_MS = 300;
 
-	it("never blocks the loop longer than the budget between yields", { retry: 2 }, async () => {
-		generateSourceTree(tmpDir, 600);
-		_resetGeneratedArtifactCaches(); // force cold header reads (worst case)
+	it(
+		"never blocks the loop longer than the budget between yields",
+		{ retry: 2 },
+		async () => {
+			generateSourceTree(tmpDir, 600);
+			_resetGeneratedArtifactCaches(); // force cold header reads (worst case)
 
-		// Independent loop-lag sampler (perf-harness): unlike wrapping the
-		// collector's own setImmediate, this still catches a regression that
-		// stops yielding entirely (the catastrophic case) — that would surface
-		// as one large block, not a missed measurement.
-		const maxBlock = await measureMaxSyncBlockMs(async () => {
-			const files = await collectSourceFilesAsync(tmpDir, { budgetMs: 8 });
-			expect(files.length).toBeGreaterThan(0);
-		});
+			// Independent loop-lag sampler (perf-harness): unlike wrapping the
+			// collector's own setImmediate, this still catches a regression that
+			// stops yielding entirely (the catastrophic case) — that would surface
+			// as one large block, not a missed measurement.
+			const maxBlock = await measureMaxSyncBlockMs(async () => {
+				const files = await collectSourceFilesAsync(tmpDir, { budgetMs: 8 });
+				expect(files.length).toBeGreaterThan(0);
+			});
 
-		expect(maxBlock).toBeLessThan(MAX_SYNC_CHUNK_MS);
-	});
+			expect(maxBlock).toBeLessThan(MAX_SYNC_CHUNK_MS);
+		},
+	);
 });
 
 describe("maxFiles cap (#250) — bounds the walk", () => {

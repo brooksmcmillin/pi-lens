@@ -58,9 +58,8 @@ afterEach(() => {
 
 describe("DependencyChecker instance registry (#1276 P2)", () => {
 	it("wraps instances in WeakRef instead of retaining them directly", async () => {
-		const { DependencyChecker } = await import(
-			"../../clients/dependency-checker.js"
-		);
+		const { DependencyChecker } =
+			await import("../../clients/dependency-checker.js");
 		void new DependencyChecker();
 
 		// Pre-fix: `instances` is `Set<DependencyChecker>` and the constructor
@@ -69,9 +68,8 @@ describe("DependencyChecker instance registry (#1276 P2)", () => {
 	});
 
 	it("prunes a collected instance instead of resetting/retaining it forever", async () => {
-		const { DependencyChecker, resetMadgeManagedPathMemo } = await import(
-			"../../clients/dependency-checker.js"
-		);
+		const { DependencyChecker, resetMadgeManagedPathMemo } =
+			await import("../../clients/dependency-checker.js");
 
 		const checkerA = new DependencyChecker() as unknown as {
 			resetMadgeMemo: () => void;

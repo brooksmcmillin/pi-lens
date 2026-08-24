@@ -26,7 +26,10 @@ import * as path from "node:path";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const repoRoot = path.resolve(
+	path.dirname(fileURLToPath(import.meta.url)),
+	"..",
+);
 const argv = process.argv.slice(2);
 const install = argv.includes("--install");
 const langs = argv.filter((a) => !a.startsWith("--"));
@@ -38,9 +41,14 @@ if (!fs.existsSync(distLsp)) {
 	console.error("dist missing — run `npm run build:dist` first.");
 	process.exit(1);
 }
-const { getLSPService, resetLSPService } = await imp("dist/clients/lsp/index.js");
-const { initLSPConfig, getServersForFileWithConfig, resetLSPConfigStateForTests } =
-	await imp("dist/clients/lsp/config.js");
+const { getLSPService, resetLSPService } = await imp(
+	"dist/clients/lsp/index.js",
+);
+const {
+	initLSPConfig,
+	getServersForFileWithConfig,
+	resetLSPConfigStateForTests,
+} = await imp("dist/clients/lsp/config.js");
 let ensureTool;
 if (install) {
 	({ ensureTool } = await imp("dist/clients/installer/index.js"));
@@ -118,7 +126,12 @@ for (const fx of fixtures) {
 	}
 
 	if (!lsp.supportsLSP(absFile)) {
-		results.push({ lang: fx.lang, server: fx.serverHint, role, status: "no-lsp" });
+		results.push({
+			lang: fx.lang,
+			server: fx.serverHint,
+			role,
+			status: "no-lsp",
+		});
 		continue;
 	}
 	let content = fs.readFileSync(absFile, "utf8");
@@ -189,7 +202,9 @@ for (const fx of fixtures) {
 }
 
 // --- report ---------------------------------------------------------------
-const ok = results.filter((r) => r.status === "ok").sort((a, b) => a.warmMs - b.warmMs);
+const ok = results
+	.filter((r) => r.status === "ok")
+	.sort((a, b) => a.warmMs - b.warmMs);
 const other = results.filter((r) => r.status !== "ok");
 
 console.log("\nLSP latency benchmark (sorted by warm/edit)\n");
@@ -217,7 +232,8 @@ if (ok.length) {
 }
 if (other.length) {
 	console.log("\n  not measured:");
-	for (const r of other) console.log(`    ${r.lang.padEnd(12)} ${r.status}  (${r.server})`);
+	for (const r of other)
+		console.log(`    ${r.lang.padEnd(12)} ${r.status}  (${r.server})`);
 }
 
 try {

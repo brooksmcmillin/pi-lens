@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { FactStore } from "../../../../clients/dispatch/fact-store.js";
+import { makeRunnerCtx } from "../../../support/runner-ctx.js";
 import { setupTestEnvironment } from "../../test-utils.js";
 
 const safeSpawnAsync = vi.fn();
@@ -10,7 +10,9 @@ const getLinterPolicyForCwd = vi.fn();
 
 vi.mock("../../../../clients/safe-spawn.js", () => ({ safeSpawnAsync }));
 vi.mock("../../../../clients/installer/index.js", () => ({ ensureTool }));
-vi.mock("../../../../clients/tool-policy.js", () => ({ getLinterPolicyForCwd }));
+vi.mock("../../../../clients/tool-policy.js", () => ({
+	getLinterPolicyForCwd,
+}));
 
 vi.mock("../../../../clients/dispatch/runners/utils/runner-helpers.js", () => ({
 	createAvailabilityChecker: (command: string) => ({
@@ -20,17 +22,7 @@ vi.mock("../../../../clients/dispatch/runners/utils/runner-helpers.js", () => ({
 }));
 
 function createCtx(filePath: string, cwd: string) {
-	return {
-		filePath,
-		cwd,
-		kind: "terraform" as const,
-		pi: { getFlag: () => false },
-		autofix: false,
-		deltaMode: true,
-		facts: new FactStore(),
-		hasTool: async () => true,
-		log: () => {},
-	};
+	return makeRunnerCtx(filePath, cwd, { kind: "terraform" });
 }
 
 describe("tflint runner — linter policy", () => {

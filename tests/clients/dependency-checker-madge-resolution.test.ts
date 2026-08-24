@@ -35,18 +35,28 @@ const MANAGED_TOOLS_DIR = path.join(os.tmpdir(), "pilens-fake-home", "tools");
 // a bare "/usr/..." literal is ambient-drive-relative, not fully qualified,
 // so `classifyMadgeKind`'s `isFullyQualified(resolved)` gate silently
 // classifies it as "path" instead of "global" (same defect shape as #1491).
-const GLOBAL_BIN_1 = process.platform === "win32"
-	? String.raw`C:\fake-global\local\bin\madge`
-	: "/usr/local/bin/madge";
-const GLOBAL_BIN_2 = process.platform === "win32"
-	? String.raw`C:\fake-global\bin\madge`
-	: "/usr/bin/madge";
+const GLOBAL_BIN_1 =
+	process.platform === "win32"
+		? String.raw`C:\fake-global\local\bin\madge`
+		: "/usr/local/bin/madge";
+const GLOBAL_BIN_2 =
+	process.platform === "win32"
+		? String.raw`C:\fake-global\bin\madge`
+		: "/usr/bin/madge";
 
 vi.mock("../../clients/safe-spawn.js", () => ({ safeSpawnAsync, safeSpawn }));
 vi.mock("../../clients/package-manager.js", () => ({ findNodeToolBinary }));
 vi.mock("../../clients/installer/index.js", () => ({
 	ensureTool,
 	getManagedToolsDir: () => MANAGED_TOOLS_DIR,
+	// #1612: resolveAvailableOrInstallUnshared reads these on the install-
+	// success path to derive honest evidence rather than asserting "succeeded".
+	getInstallAttempt: vi.fn(() => undefined),
+	// #1636: read alongside getInstallAttempt when deriving the compensating
+	// row's `resolved` tag. Undefined falls back to "cache", matching this
+	// suite's existing not-attempted expectations.
+	getLastEnsureResolutionSource: vi.fn(() => undefined),
+	getToolInstallStrategy: vi.fn(() => undefined),
 	isSpawnableCommand,
 }));
 
@@ -63,7 +73,12 @@ describe("DependencyChecker madge resolution (#766)", () => {
 		isSpawnableCommand.mockResolvedValue(true);
 		safeSpawnAsync.mockImplementation(async (_cmd: string, args: string[]) => {
 			if (args[0] === "--version") {
-				return { status: 0, error: undefined, stdout: "madge 8.0.0", stderr: "" };
+				return {
+					status: 0,
+					error: undefined,
+					stdout: "madge 8.0.0",
+					stderr: "",
+				};
 			}
 			return { status: 0, error: undefined, stdout: "[]", stderr: "" };
 		});
@@ -99,9 +114,8 @@ describe("DependencyChecker madge resolution (#766)", () => {
 	}
 
 	it("keeps a project-pinned binary winning (#375), without consulting the installer", async () => {
-		const { DependencyChecker } = await import(
-			"../../clients/dependency-checker.js"
-		);
+		const { DependencyChecker } =
+			await import("../../clients/dependency-checker.js");
 		const bin = installFakeBinary(tmp);
 		findNodeToolBinary.mockResolvedValue(bin);
 
@@ -116,9 +130,8 @@ describe("DependencyChecker madge resolution (#766)", () => {
 	});
 
 	it("reports a global-bin hit as `global`, not `local`", async () => {
-		const { DependencyChecker } = await import(
-			"../../clients/dependency-checker.js"
-		);
+		const { DependencyChecker } =
+			await import("../../clients/dependency-checker.js");
 		// findNodeToolBinary probes npm/pnpm/yarn/bun GLOBAL bins too, so the step
 		// that answered says nothing about where the binary lives.
 		findNodeToolBinary.mockResolvedValue(GLOBAL_BIN_1);
@@ -132,9 +145,8 @@ describe("DependencyChecker madge resolution (#766)", () => {
 	});
 
 	it("uses the managed install instead of npx when nothing local is found", async () => {
-		const { DependencyChecker } = await import(
-			"../../clients/dependency-checker.js"
-		);
+		const { DependencyChecker } =
+			await import("../../clients/dependency-checker.js");
 		const managed = path.join(
 			MANAGED_TOOLS_DIR,
 			"node_modules",
@@ -144,11 +156,10 @@ describe("DependencyChecker madge resolution (#766)", () => {
 		ensureTool.mockResolvedValue(managed);
 		// Exercise the off-PATH auto-install path: ensureAvailable's bare-name
 		// probe fails, then resolution must reuse the installed absolute path.
-		safeSpawnAsync.mockImplementation(
-			async (_cmd: string, args: string[]) =>
-				args[0] === "--version"
-					? { status: 1, error: new Error("not found"), stdout: "", stderr: "" }
-					: { status: 0, error: undefined, stdout: "[]", stderr: "" },
+		safeSpawnAsync.mockImplementation(async (_cmd: string, args: string[]) =>
+			args[0] === "--version"
+				? { status: 1, error: new Error("not found"), stdout: "", stderr: "" }
+				: { status: 0, error: undefined, stdout: "[]", stderr: "" },
 		);
 
 		const { stats } = await new DependencyChecker().checkFilesBatch(
@@ -164,9 +175,8 @@ describe("DependencyChecker madge resolution (#766)", () => {
 	});
 
 	it("classifies the resolved STRING, not the step that produced it", async () => {
-		const { DependencyChecker } = await import(
-			"../../clients/dependency-checker.js"
-		);
+		const { DependencyChecker } =
+			await import("../../clients/dependency-checker.js");
 
 		// The installer's discovery can hand back a bare PATH name...
 		ensureTool.mockResolvedValue("madge");
@@ -186,9 +196,8 @@ describe("DependencyChecker madge resolution (#766)", () => {
 	});
 
 	it("falls back to `npx madge` only when nothing is discoverable", async () => {
-		const { DependencyChecker } = await import(
-			"../../clients/dependency-checker.js"
-		);
+		const { DependencyChecker } =
+			await import("../../clients/dependency-checker.js");
 
 		const { stats } = await new DependencyChecker().checkFilesBatch(
 			[writeSource("a.ts", ["./b.js"])],
@@ -202,9 +211,8 @@ describe("DependencyChecker madge resolution (#766)", () => {
 	});
 
 	it("never installs from the spawn path", async () => {
-		const { DependencyChecker } = await import(
-			"../../clients/dependency-checker.js"
-		);
+		const { DependencyChecker } =
+			await import("../../clients/dependency-checker.js");
 
 		await new DependencyChecker().checkFilesBatch(
 			[writeSource("a.ts", ["./b.js"])],
@@ -217,9 +225,8 @@ describe("DependencyChecker madge resolution (#766)", () => {
 	});
 
 	it("resolves once per project root — not per file, per batch, or for every root", async () => {
-		const { DependencyChecker } = await import(
-			"../../clients/dependency-checker.js"
-		);
+		const { DependencyChecker } =
+			await import("../../clients/dependency-checker.js");
 		const bin = installFakeBinary(tmp);
 		// The probe chain this memo exists to avoid is genuinely slow (uncached
 		// `npm config get prefix` / `pnpm bin -g` spawns), so make it cost time.
@@ -263,9 +270,8 @@ describe("DependencyChecker madge resolution (#766)", () => {
 	});
 
 	it("re-resolves after a resolved binary disappears", async () => {
-		const { DependencyChecker } = await import(
-			"../../clients/dependency-checker.js"
-		);
+		const { DependencyChecker } =
+			await import("../../clients/dependency-checker.js");
 		const bin = installFakeBinary(tmp);
 		findNodeToolBinary.mockResolvedValue(bin);
 		const file = writeSource("a.ts", ["./b.js"]);
@@ -291,9 +297,8 @@ describe("DependencyChecker madge resolution (#766)", () => {
 	});
 
 	it("coalesces concurrent stale-entry recovery into one probe", async () => {
-		const { DependencyChecker } = await import(
-			"../../clients/dependency-checker.js"
-		);
+		const { DependencyChecker } =
+			await import("../../clients/dependency-checker.js");
 		const bin = installFakeBinary(tmp);
 		findNodeToolBinary.mockResolvedValue(bin);
 		const firstFile = writeSource("first.ts", ["./b.js"]);
@@ -326,9 +331,8 @@ describe("DependencyChecker madge resolution (#766)", () => {
 	});
 
 	it("survives a throwing installer probe and re-attempts on the next batch", async () => {
-		const { DependencyChecker } = await import(
-			"../../clients/dependency-checker.js"
-		);
+		const { DependencyChecker } =
+			await import("../../clients/dependency-checker.js");
 		ensureTool.mockRejectedValue(new Error("installer exploded"));
 		const file = writeSource("a.ts", ["./b.js"]);
 
@@ -339,7 +343,12 @@ describe("DependencyChecker madge resolution (#766)", () => {
 
 		// npx is never pinned, so one transient installer failure must not disable
 		// managed resolution for the rest of the session.
-		const managed = path.join(MANAGED_TOOLS_DIR, "node_modules", ".bin", "madge");
+		const managed = path.join(
+			MANAGED_TOOLS_DIR,
+			"node_modules",
+			".bin",
+			"madge",
+		);
 		ensureTool.mockResolvedValue(managed);
 		fs.writeFileSync(
 			file,
@@ -352,9 +361,8 @@ describe("DependencyChecker madge resolution (#766)", () => {
 	});
 
 	it("revalidates a cached bare-command resolution's spawnability once, not per checkFile call (#1276 P2)", async () => {
-		const { DependencyChecker, resetMadgeManagedPathMemo } = await import(
-			"../../clients/dependency-checker.js"
-		);
+		const { DependencyChecker, resetMadgeManagedPathMemo } =
+			await import("../../clients/dependency-checker.js");
 		// Nothing local/global; installer discovery hands back a bare `madge` on
 		// PATH (kind "path" — not absolute, so classifyMadgeKind's existsSync
 		// shortcut never applies and every cache hit goes through

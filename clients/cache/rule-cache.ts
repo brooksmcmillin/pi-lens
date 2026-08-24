@@ -77,8 +77,7 @@ export interface QueryCacheEntry {
 		query: string;
 		metavars: string[];
 		post_filter?: string;
-		// biome-ignore lint/suspicious/noExplicitAny: Flexible filter params
-		post_filter_params?: Record<string, any>;
+		post_filter_params?: Record<string, unknown>;
 		defect_class?: string;
 		inline_tier?: "blocking" | "warning" | "review";
 		skip_test_files?: boolean;

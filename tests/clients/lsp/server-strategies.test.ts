@@ -16,7 +16,23 @@ describe("TypeScript diagnostic strategies (#1412)", () => {
 	it("keeps classic first-push seeding but stabilizes native TS7 pushes", () => {
 		expect(getStrategy("typescript", "classic").seedFirstPush).toBe(true);
 		expect(getStrategy("typescript", "native-ts7").seedFirstPush).toBe(false);
-		expect(getStrategy("typescript", "native-ts7").debounceMs).toBeGreaterThan(0);
+		expect(getStrategy("typescript", "native-ts7").debounceMs).toBeGreaterThan(
+			0,
+		);
+	});
+});
+
+describe("cue diagnostic strategy (#1522) — measured against the real v0.17.1 binary", () => {
+	it("is push-only, seeds the first push, and is silent on a clean cold open", () => {
+		const strategy = getStrategy("cue");
+		expect(strategy.pullRetryBudgetMs).toBe(0);
+		expect(strategy.seedFirstPush).toBe(true);
+		// The load-bearing measurement: a clean file's cold didOpen publishes
+		// nothing at all, so the shared push-only clean-confirm gate needs this
+		// flag to read "no publish, notify succeeded" as confirmed clean rather
+		// than inconclusive (#1520's original review concern).
+		expect(strategy.silentOnClean).toBe(true);
+		expect(strategy.reopenOnResync).toBeFalsy();
 	});
 });
 
@@ -35,7 +51,9 @@ describe("resolveAstGrepNativeExe", () => {
 	});
 
 	it("returns undefined for an unsupported platform", () => {
-		expect(resolveAstGrepNativeExe("aix" as NodeJS.Platform, "x64")).toBeUndefined();
+		expect(
+			resolveAstGrepNativeExe("aix" as NodeJS.Platform, "x64"),
+		).toBeUndefined();
 	});
 
 	it("returns undefined for an unsupported arch on a supported platform", () => {

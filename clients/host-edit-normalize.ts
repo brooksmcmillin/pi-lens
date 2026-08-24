@@ -158,9 +158,7 @@ export function hostWouldApplyOldText(
 	const fuzzyOldText = normalizeForFuzzyMatch(o);
 	const fuzzyFound = fuzzyContent.indexOf(fuzzyOldText) !== -1;
 	const occurrences =
-		fuzzyOldText.length === 0
-			? 0
-			: fuzzyContent.split(fuzzyOldText).length - 1;
+		fuzzyOldText.length === 0 ? 0 : fuzzyContent.split(fuzzyOldText).length - 1;
 	return {
 		wouldApply: (exactFound || fuzzyFound) && occurrences === 1,
 		occurrences,

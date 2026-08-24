@@ -25,11 +25,19 @@ import {
 } from "./clients/extension-mode.js";
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
+import { performance } from "node:perf_hooks";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createDefaultHostPorts, type HostPorts } from "./clients/host-ports.js";
+import {
+	createDefaultHostPorts,
+	type HostPorts,
+} from "./clients/host-ports.js";
 import { AstGrepClient } from "./clients/ast-grep-client.js";
 import { loadBootstrapClients } from "./clients/bootstrap.js";
 import { CacheManager } from "./clients/cache-manager.js";
+// #1561 F2: the retire hook re-syncs the gate latch and the persisted record
+// the same way the per-dispatch path does, so a retired blocker stops gating
+// the commit.
+import { retireInlineBlockerAndResyncGuard } from "./clients/git-guard.js";
 import { resolvePackagePath } from "./clients/package-root.js";
 import {
 	clearWidgetState,
@@ -55,7 +63,10 @@ import {
 	sessionStartMode,
 } from "./clients/session-state-store.js";
 import { getDiagnosticTracker } from "./clients/diagnostic-tracker.js";
-import { warmDispatchIntegration, loadDispatchIntegration } from "./clients/dispatch/lazy.js";
+import {
+	warmDispatchIntegration,
+	loadDispatchIntegration,
+} from "./clients/dispatch/lazy.js";
 import {
 	getFormatService,
 	resetFormatService,
@@ -76,6 +87,10 @@ import { wireDispositionBusEmitterGetter } from "./clients/disposition-publish.j
 import { wireFormatEventsBusEmitterGetter } from "./clients/format-events-publish.js";
 import { emitBusEventRollupAtSessionEnd } from "./clients/bus-events-logger.js";
 import {
+	emitVerifiedPathAttributionRollup,
+	resetVerifiedPathAttributionGuessCount,
+} from "./clients/path-attribution-telemetry.js";
+import {
 	consumeAgentNudge,
 	recordCrossProcessTouches,
 	wireAgentNudgeSubscriber,
@@ -91,7 +106,7 @@ import { getLSPService, resetLSPService } from "./clients/lsp/index.js";
 import { warmLspService } from "./clients/lsp-lazy.js";
 import {
 	sweepOrphans,
-	sweepUntrackedOrphans,
+	scheduleUntrackedOrphanSweep,
 } from "./clients/instance-reaper.js";
 import {
 	deregisterInstance,
@@ -102,7 +117,9 @@ import { logVanishedInstances } from "./clients/vanished-instance-marker.js";
 import {
 	buildMemorySample,
 	formatMemoryHealthLine,
-	shouldEmitMemorySample,
+	recordMemorySampleOutcome,
+	resetMemorySamplerCadence,
+	shouldEmitMemorySampleAdaptive,
 } from "./clients/memory-sampler.js";
 import { dumpActiveHandles } from "./clients/debug-handles.js";
 import {
@@ -123,9 +140,17 @@ import {
 	consumeTestFindings,
 	consumeTurnEndFindings,
 } from "./clients/runtime-context.js";
-import { RuntimeCoordinator } from "./clients/runtime-coordinator.js";
+import {
+	readHostModelIdentity,
+	RuntimeCoordinator,
+} from "./clients/runtime-coordinator.js";
 import { handleSessionStart } from "./clients/runtime-session.js";
 import { handleToolCall } from "./clients/runtime-tool-call.js";
+import {
+	isStaleExtensionCtxError,
+	wrapSessionEventHandler,
+	wrapSessionEventHandlerWithResult,
+} from "./clients/session-event-guard.js";
 import {
 	classifyCurrentSessionEmission,
 	decideSessionStart,
@@ -164,7 +189,22 @@ import {
 } from "./tools/module-report.js";
 import { createProjectReportTool } from "./tools/project-report.js";
 import { createSymbolSearchTool } from "./tools/symbol-search.js";
-import { getLastLoggedPhase, logLatency } from "./clients/latency-logger.js";
+import {
+	getLastLoggedPhase,
+	getPhaseForWindow,
+	getRecentLoggedPhases,
+	logLatency,
+	resetCurrentPhaseForSession,
+} from "./clients/latency-logger.js";
+import { emitBounded } from "./clients/bounded-telemetry.js";
+
+/**
+ * Identity for the `loop_block` record (#1743). An event-loop block is a
+ * process-wide fact — there is no file, tool, or request to discriminate on —
+ * so the identity is this fixed marker, the same value the record's
+ * `filePath` has carried since #192.
+ */
+const LOOP_BLOCK_IDENTITY = "<pi-lens>";
 import {
 	isFreshSessionStart,
 	planToolSet,
@@ -172,7 +212,9 @@ import {
 	supportsDeferredTools,
 } from "./clients/tool-set-policy.js";
 import {
+	type CacheContextInjectionSlice,
 	clearCachePrefixSession,
+	emitCacheUsageSummaryAtSessionEnd,
 	logCacheUsage,
 	observeCacheContext,
 	observeCachePrefix,
@@ -180,6 +222,8 @@ import {
 import {
 	getPiLensEvalMs,
 	markPiLensLoaded,
+	getPiLensLoadedAtMs,
+	consumeHostReadyDelayAnchor,
 	PI_LENS_HOST_BOOT_MS,
 	PI_LENS_LOADED_FROM,
 } from "./clients/startup-timing.js";
@@ -192,11 +236,13 @@ import { renderTurnSummaryMessage } from "./clients/turn-summary-render.js";
 import {
 	getEventLoopStats,
 	resetEventLoopMonitor,
+	shouldLogLoopBlock,
 	shouldLogWorstBlock,
 	startEventLoopMonitor,
 } from "./clients/event-loop-monitor.js";
 import { logSessionStart } from "./clients/sessionstart-logger.js";
 import { logConcurrentSessionBind } from "./clients/session-start-observability.js";
+import { normalizeToolDefinition } from "./clients/tool-definition.js";
 import { warmFormatters } from "./clients/formatters-lazy.js";
 import { filterInactivePiLensSkills } from "./clients/conditional-skills.js";
 
@@ -204,11 +250,17 @@ type DispatchIntegration = Awaited<ReturnType<typeof loadDispatchIntegration>>;
 let loadedDispatchIntegration: DispatchIntegration | undefined;
 
 function warmDispatchAtSessionStart(): void {
-	void warmDispatchIntegration().then((integration) => {
-		loadedDispatchIntegration = integration;
-	}).catch((err) => {
-		logExtension({ subsystem: "dispatch", level: "warn", message: `dispatch warm failed: ${err}` });
-	});
+	void warmDispatchIntegration()
+		.then((integration) => {
+			loadedDispatchIntegration = integration;
+		})
+		.catch((err) => {
+			logExtension({
+				subsystem: "dispatch",
+				level: "warn",
+				message: `dispatch warm failed: ${err}`,
+			});
+		});
 }
 
 function resetDispatchBaselines(cwd?: string): void {
@@ -220,6 +272,7 @@ function resetDispatchBaselines(cwd?: string): void {
 // First executable statement: every import above has been evaluated, so the
 // full load/transpile cost has been paid. Capture it now.
 const PI_LENS_LOAD_MS = markPiLensLoaded();
+const PI_LENS_LOADED_AT_MS = getPiLensLoadedAtMs();
 const PI_LENS_EVAL_MS = getPiLensEvalMs() ?? 0;
 // Start the event-loop occupancy monitor as early as possible so startup
 // blocks are captured. Native histogram — no per-event overhead. (#192)
@@ -358,17 +411,31 @@ export function createHostPorts(
 			// their per-subsystem files, NOT extension.log) is S4 scope; this
 			// placeholder exists so the interface is complete for contract tests.
 			sink: (subsystem) => (entry) =>
-				logExtension({ subsystem, level: "debug", message: "host sink entry", metadata: { entry } }),
+				logExtension({
+					subsystem,
+					level: "debug",
+					message: "host sink entry",
+					metadata: { entry },
+				}),
 		},
 		emit: { bus: emit },
 		status: { set: (name, value) => context()?.ui?.setStatus?.(name, value) },
-		spawn: { abortSignal: () => context()?.signal, isAllowed: assertInstallAllowed },
+		spawn: {
+			abortSignal: () => context()?.signal,
+			isAllowed: assertInstallAllowed,
+		},
 		render: { invalidate: () => options.getRenderInvalidator?.()?.() },
 		session: { id: () => getStableSessionId(context()) },
-		workspace: { cwd: () => context()?.cwd, projectRoot: () => options.getProjectRoot?.() },
+		workspace: {
+			cwd: () => context()?.cwd,
+			projectRoot: () => options.getProjectRoot?.(),
+		},
 		flags: { get: (name) => pi.getFlag(name) },
 		tools: {
-			has: async (name) => typeof (pi as unknown as { getTool?: (tool: string) => unknown }).getTool?.(name) !== "undefined",
+			has: async (name) =>
+				typeof (
+					pi as unknown as { getTool?: (tool: string) => unknown }
+				).getTool?.(name) !== "undefined",
 			getActive: () => activeTools.getActiveTools?.() ?? [],
 			setActive: (names) => activeTools.setActiveTools?.(names),
 		},
@@ -408,23 +475,6 @@ function log(_msg: string) {
 	// Previously tied to --lens-verbose flag, now disabled
 }
 
-/**
- * The pi SDK invalidates a captured `pi`/command ctx after a session
- * replacement or reload (ctx.newSession/fork/switchSession/reload); every later
- * `pi.*` call then throws with this signature (installed SDK:
- * core/extensions/loader.js `assertActive`). We match by message — not `===` a
- * captured instance — so a fire-and-forget task that races a session swap can
- * recognise the benign stale-ctx throw and degrade to a no-op. Substring-matched
- * on the stable "stale after session replacement or reload" phrase so it
- * survives incidental wording changes around it.
- */
-function isStaleExtensionCtxError(err: unknown): boolean {
-	return (
-		err instanceof Error &&
-		err.message.includes("stale after session replacement or reload")
-	);
-}
-
 // --- State ---
 
 const runtime = new RuntimeCoordinator();
@@ -435,7 +485,9 @@ const runtime = new RuntimeCoordinator();
 // have it read the CURRENT activation's pi/flag closures through this
 // holder, refreshed on every activation — never a stale captured `pi`.
 let _readBridgeRegistered = false;
-let _readBridgeGetFlag: ((name: string) => boolean | string | undefined) | undefined;
+let _readBridgeGetFlag:
+	| ((name: string) => boolean | string | undefined)
+	| undefined;
 let _turnSummaryEmitRegistered = false;
 let _turnSummaryEmitCtx:
 	| {
@@ -459,19 +511,34 @@ async function ensureLSPConfigInitialized(cwd: string): Promise<void> {
 	}
 }
 
-function updateRuntimeIdentityFromEvent(event: unknown): void {
-	const raw = event as {
-		provider?: string;
-		model?: string;
-		sessionId?: string;
-		session?: { id?: string };
-		id?: string;
-	};
-	runtime.setTelemetryIdentity({
-		provider: raw.provider,
-		model: raw.model,
-		sessionId: raw.sessionId ?? raw.session?.id ?? raw.id,
-	});
+/**
+ * Adopt this activation's telemetry identity from the host CONTEXT (#1655
+ * item 2).
+ *
+ * This used to read `provider`/`model`/`sessionId`/`session.id`/`id` off the
+ * EVENT. pi sets none of them on either event that called it: `session_start`
+ * is `{ type, reason }`
+ * (`@earendil-works/pi-coding-agent/dist/core/agent-session.js:152`,
+ * `:2072`), and `tool_result` is exactly
+ * `type`/`toolName`/`toolCallId`/`input`/`content`/`details`/`isError`/`usage`
+ * (`dist/core/agent-session.js:243-256`, source
+ * `src/core/agent-session.ts:502-516`). So every call passed all-undefined,
+ * `setTelemetryIdentity` ignored it, and `runtime.telemetryModel` stayed
+ * `"unknown"` for the whole session against a real host.
+ *
+ * The ctx DOES carry the model. `ExtensionContext.model` is the live `Model`
+ * (`dist/core/extensions/runner.js:488-491` → `AgentSession.model`, `:580-582`)
+ * with `id` and `provider` (`@earendil-works/pi-ai/dist/types.d.ts:661-667`).
+ *
+ * SESSION ID IS DELIBERATELY NOT SET HERE. `runtime.setSessionLifecycle`
+ * already pins it from `ctx.sessionManager.getSessionId()` inside
+ * `session_start`, behind the #473 concurrent-secondary guard. Adopting it
+ * again from a `tool_result` ctx would let a concurrent in-process secondary
+ * session overwrite the parent's identity on every tool result — the exact
+ * clobber that guard exists to prevent.
+ */
+function updateRuntimeIdentityFromCtx(ctx: unknown): void {
+	runtime.setTelemetryIdentity(readHostModelIdentity(ctx));
 }
 
 function normalizeCommandArgs(args: unknown): string[] {
@@ -531,6 +598,26 @@ function activateExtension(hostPi: ExtensionAPI) {
 	// The process-global latest ctx remains only a boot-window fallback.
 	// biome-ignore lint/suspicious/noExplicitAny: heterogeneous pi event ctx shapes
 	let ownEventCtx: any;
+	// #1996 review: role belongs to THIS extension activation. A secondary can
+	// be positively identified at session_start even when its stable id is
+	// unavailable later; recomputing from process-global primary state would then
+	// misclassify its context/message_end/shutdown as primary. Closure ownership
+	// avoids a shared mutable "last session" race between sibling activations.
+	let ownedSessionRole: "primary" | "concurrent-secondary" | undefined;
+	const classifyOwnedSessionEmission = (
+		ctx: unknown,
+		sessionId: string | undefined,
+	): "primary" | "concurrent-secondary" =>
+		ownedSessionRole ?? classifyCurrentSessionEmission(ctx, sessionId);
+	const classifyOwnedSessionShutdown = (
+		ctx: unknown,
+		sessionId: string | undefined,
+	): "primary" | "secondary" =>
+		ownedSessionRole === "concurrent-secondary"
+			? "secondary"
+			: ownedSessionRole === "primary"
+				? "primary"
+				: noteSessionShutdown(ctx, sessionId);
 	// biome-ignore lint/suspicious/noExplicitAny: heterogeneous pi event ctx shapes
 	const rememberOwnEventCtx = (ctx: any): void => {
 		if (!ctx) return;
@@ -738,7 +825,8 @@ function activateExtension(hostPi: ExtensionAPI) {
 			peekWriteIndex: () => runtime.peekWriteIndex(),
 			isRecordable(filePath: string): boolean {
 				if (_readBridgeGetFlag?.("no-read-guard")) return false;
-				if (isPathIgnoredByProject(filePath, runtime.projectRoot, false)) return false;
+				if (isPathIgnoredByProject(filePath, runtime.projectRoot, false))
+					return false;
 				if (isExternalOrVendorFile(filePath, runtime.projectRoot)) return false;
 				return true;
 			},
@@ -935,9 +1023,8 @@ function activateExtension(hostPi: ExtensionAPI) {
 		description:
 			"Show Technical Debt Index (TDI) and project health trend. Usage: /lens-tdi",
 		handler: async (_args, ctx) => {
-			const { loadHistory, computeTDI } = await import(
-				"./clients/metrics-history.js"
-			);
+			const { loadHistory, computeTDI } =
+				await import("./clients/metrics-history.js");
 			const history = loadHistory();
 			const tdi = computeTDI(history);
 
@@ -1407,6 +1494,28 @@ function activateExtension(hostPi: ExtensionAPI) {
 			// #571: same reconciliation wiring as lens_diagnostics mode=full, for
 			// the standalone on-demand check.
 			() => runtime.nextWriteIndex(),
+			// #1561: and the same confirmed result must retire this file's stale
+			// inline blocker, not only correct the footer. The eviction is logged so
+			// it is confirmable from the runtime log rather than from the absence of
+			// complaints (#1432 Gap 1).
+			// #1561 F2: the retire also recomputes the commit-gate latch and the
+			// persisted record — see `retireInlineBlockerAndResyncGuard`.
+			({ filePath, writeIndex, coveredSources, cwd }) => {
+				const retired = retireInlineBlockerAndResyncGuard({
+					runtime,
+					cacheManager,
+					cwd,
+					filePath,
+					writeIndex,
+					coveredSources,
+					lensGuardEnabled: getLensFlag("lens-guard") === true,
+				});
+				if (retired) {
+					dbg(
+						`inline_blocker: retired for ${filePath} — lsp_diagnostics confirmed clean (writeIndex ${writeIndex ?? "none"}, covered ${coveredSources.join(",") || "none"})`,
+					);
+				}
+			},
 		),
 		createSymbolSearchTool(() => runtime.projectRoot),
 		createProjectReportTool(() => runtime.projectRoot),
@@ -1452,10 +1561,13 @@ function activateExtension(hostPi: ExtensionAPI) {
 			readGuard: runtime.readGuard,
 			dbg,
 		}),
-		createLensDiagnosticMarkTool(() => runtime.projectRoot, () => ({
-			model: runtime.telemetryModelId,
-			provider: runtime.telemetryProviderId,
-		})),
+		createLensDiagnosticMarkTool(
+			() => runtime.projectRoot,
+			() => ({
+				model: runtime.telemetryModelId,
+				provider: runtime.telemetryProviderId,
+			}),
+		),
 	];
 	const skillsDir = resolvePackagePath(import.meta.url, "skills");
 	const astGrepSkillPath = path.join(skillsDir, "pi-lens-ast-grep", "SKILL.md");
@@ -1517,7 +1629,8 @@ function activateExtension(hostPi: ExtensionAPI) {
 			deferredToolSupport: (ctx) => {
 				try {
 					return supportsDeferredTools(
-						(ctx as { model?: Parameters<typeof supportsDeferredTools>[0] })?.model,
+						(ctx as { model?: Parameters<typeof supportsDeferredTools>[0] })
+							?.model,
 					);
 				} catch {
 					return false;
@@ -1544,7 +1657,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 		? wrapToolsForCompactLine(toolsToRegister as any)
 		: toolsToRegister) {
 		try {
-			pi.registerTool(tool as any);
+			pi.registerTool(normalizeToolDefinition(tool) as any);
 		} catch {
 			// another extension already registered a tool with this name
 		}
@@ -1590,384 +1703,465 @@ function activateExtension(hostPi: ExtensionAPI) {
 
 	// --- Events ---
 
-	pi.on("session_start", async (event, ctx) => {
-		warmDispatchAtSessionStart();
-		void warmLspService().catch((err) =>
-			logExtension({ subsystem: "lsp", level: "warn", message: `LSP warm failed: ${err}` }),
-		);
-		void warmFormatters().catch((err) =>
-			logExtension({ subsystem: "format", level: "warn", message: `formatter warm failed: ${err}` }),
-		);
-		rememberOwnEventCtx(ctx);
-		refreshCtxDerivedPlumbing();
-		const sessionStartFiredAt = Date.now();
-		try {
-			dbg("session_start fired");
-			const sessionReason = (event as { reason?: string }).reason;
-
-			// #1334 S5: adopt the HOST's project-trust decision before anything
-			// below can auto-install a tool or spawn an LSP server. pi-lens is a
-			// CONSUMER of trust (`ctx.isProjectTrusted()`), never a handler of the
-			// `project_trust` event — answering that question on the user's behalf
-			// is the host's/user's job. Re-read here and on every turn_start because
-			// fork/reload/resume can change cwd and trust can change mid-session.
-			// Feature-detected:
-			// a host without the accessor yields "unknown" and nothing is gated.
-			const trustState = adoptProjectTrustFromPorts(hostPorts);
-			if (trustState !== "unknown") {
-				dbg(`session_start: project trust = ${trustState}`);
-			}
-			if (trustState === "untrusted") {
-				dbg(
-					"session_start: untrusted project — tool auto-install and LSP spawns are disabled for this session",
+	// #1929: wrapped like the other reachable handlers. The ctx delivered here
+	// is USUALLY the announced session's own, built moments earlier, so the
+	// probe answers `true` and nothing changes. It is not always: a session
+	// replacement can land while this event sits in the queue, and then every
+	// ctx read below throws. Before the wrapper that arrived as
+	// `session_start crashed: …`, indistinguishable from a real handler bug,
+	// and it counted nothing. Now it is one bounded `extension-ctx-stale`
+	// record subject-keyed to `session_start`.
+	//
+	// Skipping the whole handler is the right stale-path answer, not a loss:
+	// `rememberOwnEventCtx` would otherwise store the DEAD ctx as pi-lens's
+	// own, and the warms plus per-session resets above all re-run when the
+	// replacement session fires its own live `session_start`.
+	pi.on(
+		"session_start",
+		wrapSessionEventHandler(
+			"session_start",
+			async (event, ctx) => {
+				const sessionStartMonotonicAt = performance.now();
+				resetVerifiedPathAttributionGuessCount();
+				warmDispatchAtSessionStart();
+				void warmLspService().catch((err) =>
+					logExtension({
+						subsystem: "lsp",
+						level: "warn",
+						message: `LSP warm failed: ${err}`,
+					}),
 				);
-			}
-
-			// #190: pi's session lifecycle. `reason` distinguishes new/resume/fork/
-			// reload/startup; the STABLE session id comes from the session manager
-			// (the event carries none), and is what lets a resumed session rehydrate.
-			const stableSessionId = (() => {
+				void warmFormatters().catch((err) =>
+					logExtension({
+						subsystem: "format",
+						level: "warn",
+						message: `formatter warm failed: ${err}`,
+					}),
+				);
+				rememberOwnEventCtx(ctx);
+				refreshCtxDerivedPlumbing();
+				const sessionStartFiredAt = Date.now();
 				try {
-					return (
-						ctx as { sessionManager?: { getSessionId?: () => string } }
-					)?.sessionManager?.getSessionId?.();
-				} catch {
-					return undefined;
-				}
-			})();
+					dbg("session_start fired");
+					const sessionReason = (event as { reason?: string }).reason;
 
-			// #473: distinguish a concurrently-live in-process subagent bind
-			// (tintinweb/pi-subagents-style) from a real sequential session
-			// replacement BEFORE touching any process-shared singleton. A
-			// concurrent secondary must not run handleSessionStart (which resets
-			// the shared LSP fleet + runtime generation out from under the still
-			// -live parent) or updateRuntimeIdentityFromEvent (which would
-			// overwrite the parent's telemetry identity).
-			const sessionStartDecision = decideSessionStart(ctx, stableSessionId);
-			if (!sessionStartDecision.runFullSessionStart) {
-				dbg(
-					`session_start: concurrent secondary detected (count=${sessionStartDecision.secondaryCount}) — skipping handleSessionStart`,
-				);
-				logConcurrentSessionBind({
-					secondaryCount: sessionStartDecision.secondaryCount,
-					sessionReason,
-					sameCwd: (ctx as { cwd?: string })?.cwd === process.cwd(),
-				});
-				return;
-			}
-
-			// Dynamic tooling (#pi 0.80.x+): put the active tool set back to the
-			// posture this logical conversation had — the always-active baseline
-			// plus exactly the lazy tools (LAZY_TOOL_CATALOG) the model activated
-			// via pi_lens_activate_tools. session_start is the correct lifecycle
-			// point for this call (#643; see the comment left at the old call site
-			// above, right after tool registration, for why it can never succeed
-			// there).
-			//
-			// #1453: this RESTORES, it does not merely shrink. Every session_start
-			// reason arrives with all registered pi-lens tools active, because the
-			// host builds a fresh AgentSession with `includeAllExtensionTools: true`
-			// on fork/reload/resume just as it does on startup, and never persists
-			// an active-tool set per session. Skipping the call on those reasons
-			// would therefore leave every lazy tool active forever AND change the
-			// advertised tool list relative to the parent's cached prompt prefix.
-			// Rebuilding the same set instead keeps the prefix identical and
-			// genuinely preserves the model's activations, because pi-lens's own
-			// closure state (`rememberedLazyTools`) survives the rebuild.
-			//
-			// Deliberately BELOW the #473 concurrent-secondary guard: the active
-			// tool set is shared runtime state (one loader per process), so a
-			// secondary's session_start must never rewrite the still-live
-			// primary's set — last writer would win.
-			//
-			// Feature-detected the same way as elsewhere in this handler:
-			// `pi.getActiveTools`/`setActiveTools` aren't guaranteed present on
-			// every host the broad `@earendil-works/pi-coding-agent` peer
-			// dependency allows, so probe with typeof rather than assuming the
-			// pinned devDependency version's API exists at runtime. Under
-			// `--no-lazy-tools` nothing is touched at all: all-active IS the
-			// requested posture.
-			try {
-				const piWithActiveTools = pi as unknown as {
-					getActiveTools?: () => string[];
-					setActiveTools?: (names: string[]) => void;
-				};
-				if (
-					getLensFlag("no-lazy-tools") !== true &&
-					typeof piWithActiveTools.getActiveTools === "function" &&
-					typeof piWithActiveTools.setActiveTools === "function"
-				) {
-					// A fresh conversation starts with no activation memory; a
-					// rebuild inherits the parent's.
-					if (isFreshSessionStart(sessionReason)) rememberedLazyTools.clear();
-					const lazyNames = new Set(LAZY_TOOL_CATALOG.map((t) => t.name));
-					const plan = planToolSet(
-						piWithActiveTools.getActiveTools(),
-						lazyNames,
-						rememberedLazyTools,
-					);
-					if (plan.changed) {
-						piWithActiveTools.setActiveTools(plan.desired);
-						recordToolSetMutation({
-							addedCount: plan.addedCount,
-							removedCount: plan.removedCount,
-							reason: isFreshSessionStart(sessionReason)
-								? "fresh_session_lazy_deactivation"
-								: "session_rebuild_restore",
-							deferralApplies: supportsDeferredTools(
-								(ctx as { model?: Parameters<typeof supportsDeferredTools>[0] })
-									?.model,
-							),
-						});
+					// #1334 S5: adopt the HOST's project-trust decision before anything
+					// below can auto-install a tool or spawn an LSP server. pi-lens is a
+					// CONSUMER of trust (`ctx.isProjectTrusted()`), never a handler of the
+					// `project_trust` event — answering that question on the user's behalf
+					// is the host's/user's job. Re-read here and on every turn_start because
+					// fork/reload/resume can change cwd and trust can change mid-session.
+					// Feature-detected:
+					// a host without the accessor yields "unknown" and nothing is gated.
+					const trustState = adoptProjectTrustFromPorts(hostPorts);
+					if (trustState !== "unknown") {
+						dbg(`session_start: project trust = ${trustState}`);
 					}
-				}
-			} catch (toolSetErr) {
-				dbg(
-					`dynamic tool set restore failed (older pi host lacking getActiveTools/setActiveTools, or a genuine host error): ${toolSetErr}`,
-				);
-			}
-
-			// #449 slice 1 / #472: register this process in the cross-process
-			// instance registry and fire-and-forget an orphan-LSP sweep. Below the
-			// #473 guard deliberately: a concurrent secondary neither re-registers
-			// (the pid's entry already exists) nor re-sweeps (a fan-out would run
-			// up to maxConcurrent redundant sweeps). Neither call is awaited —
-			// registry I/O and the reaper must never delay session start; both are
-			// internally best-effort (never throw).
-			await configureWarmAttach(ctx.cwd ?? process.cwd());
-			void registerInstance(ctx.cwd ?? process.cwd()).catch(() => {
-				// best-effort observability — never fail session_start over this
-			});
-			// #1123 item 2: log a sessionstart.log marker for any registry entry
-			// whose owning pid is confirmed dead — this instance vanished without
-			// reaching deregisterInstance()'s clean-shutdown removal. MUST read the
-			// registry and log BEFORE sweepOrphans (below) prunes exactly these same
-			// dead-pid entries out from under it, or the vanished set would already
-			// be empty by the time this runs — hence the explicit read here rather
-			// than letting sweepOrphans's own internal read race it.
-			void readInstanceRegistry()
-				.then((registry) => logVanishedInstances(registry))
-				.catch(() => {
-					// best-effort observability — never fail session_start over this
-				})
-				.finally(() => {
-					void sweepOrphans();
-				});
-			// #658: registry-INDEPENDENT backstop sweep, running alongside the
-			// registry-driven one above. `sweepOrphans` can only ever see pids
-			// still listed in some instance's `lspChildren[]`; once that trace is
-			// lost (stale-heartbeat entry removal, or a silently-failed
-			// `killPidTree`), the child becomes permanently invisible to it. This
-			// backstop instead scans the OS process table directly for known
-			// pi-lens-managed binary names and only acts on ones that are BOTH
-			// untracked by the current registry snapshot AND have a
-			// confirmed-dead parent — never on name alone. Fire-and-forget, same
-			// non-blocking/never-throws contract as `sweepOrphans`.
-			void sweepUntrackedOrphans();
-			// #449 slice 2 (prototype): machine-wide LSP budget check. Reads the
-			// same registry, decides locally whether THIS session should skip
-			// spawning auxiliary LSP servers, and caches the decision for
-			// clients/dispatch/auxiliary-lsp.ts to read on later dispatch calls.
-			// Never awaited — a registry read must not delay session start, and
-			// dispatch doesn't happen until later in the turn anyway, so the cache
-			// is populated well before it's first read in practice.
-			void checkCrossProcessLspBudget();
-			// #492: child-at-session_start cross-process nudge consumer. Reads
-			// `recent-touches.json` (clients/recent-touches.ts) for entries from
-			// OTHER pi-lens instances (pid-excluded) within the 15-minute
-			// freshness window whose file still exists, and feeds them into the
-			// same #485 accumulator a bus event would use — the first `context`
-			// call this session makes (clients/agent-nudge.ts, wired below) then
-			// injects one batched provenance message. This is the "child blind to
-			// parent" direction from #492: a subagent asked to `git status` right
-			// after spawn otherwise sees unexplained `M` files with no
-			// explanation. Never awaited-to-block session_start; internally
-			// best-effort (recent-touches.ts never throws).
-			void readCrossProcessTouchesForSessionStart({
-				cwd: ctx.cwd ?? process.cwd(),
-			})
-				.then((entries) => {
-					if (entries.length === 0) return;
-					recordCrossProcessTouches(
-						entries.map((e) => ({ path: e.path, reason: e.reason })),
-					);
-					dbg(
-						`session_start: cross-process nudge — ${entries.length} file(s) from other instance(s)`,
-					);
-				})
-				.catch((err) => {
-					dbg(`session_start: cross-process nudge read failed: ${err}`);
-				});
-			updateRuntimeIdentityFromEvent(event);
-			try {
-				await ensureLSPConfigInitialized(ctx.cwd ?? process.cwd());
-			} catch (cfgErr) {
-				dbg(`lsp config init failed: ${cfgErr}`);
-			}
-
-			const bootstrapClientsStartedAt = Date.now();
-			const {
-				metricsClient,
-				todoScanner,
-				biomeClient,
-				ruffClient,
-				knipClient,
-				jscpdClient,
-				govulncheckClient,
-				gitleaksClient,
-				trivyClient,
-				opengrepClient,
-				depChecker,
-				testRunnerClient,
-				goClient,
-				rustClient,
-				deadCodeClients,
-			} = await loadBootstrapClients();
-			const bootstrapClientsDurationMs = Date.now() - bootstrapClientsStartedAt;
-			const handlerEnteredAt = Date.now();
-			await handleSessionStart({
-				ctxCwd: ctx.cwd,
-				sessionStartFiredAt,
-				sessionReason,
-				handlerEnteredAt,
-				bootstrapClientsStartedAt,
-				bootstrapClientsDurationMs,
-				getFlag: (name: string) => getLensFlag(name),
-				notify: (msg, level) => notifyUi(ctx, msg, level),
-				dbg,
-				log,
-				runtime,
-				metricsClient,
-				cacheManager,
-				todoScanner,
-				astGrepClient,
-				biomeClient,
-				ruffClient,
-				knipClient,
-				jscpdClient,
-				deadCodeClients,
-				govulncheckClient,
-				gitleaksClient,
-				trivyClient,
-				opengrepClient,
-				depChecker,
-				testRunnerClient,
-				goClient,
-				rustClient,
-				ensureTool: async (name: string) =>
-					(await import("./clients/installer/index.js")).ensureTool(name),
-				cleanStaleTsBuildInfo,
-				resetDispatchBaselines,
-				resetLSPService,
-			});
-			ctx.ui && updateLspStatus(ctx.ui.setStatus, ctx.ui.theme);
-
-			// Pin the stable identity + reason AFTER handleSessionStart (which ran
-			// resetForSession → a fresh random id); the stable id now wins (#190).
-			runtime.setSessionLifecycle({
-				sessionId: stableSessionId,
-				reason: sessionReason,
-			});
-
-			// Lifecycle-aware widget state (#190). The "should I rehydrate" signal is
-			// NOT the reason — it's whether a persisted snapshot exists for this
-			// STABLE session id. A `pi --session <id>` launch fires reason="startup"
-			// (not "resume" — that's only an in-process switchSession), so gating on
-			// "resume" alone missed the common resume path. So: fork branches from
-			// the in-memory stash; reload keeps state; new starts clean; everything
-			// else (resume / startup / default) rehydrates IFF a snapshot exists —
-			// a brand-new session has a fresh id with no file (→ clean), a
-			// resumed/launched one has its prior file (→ rehydrate).
-			const reasonLabel = sessionReason ?? "startup";
-			const startMode = sessionStartMode(sessionReason, !!pendingForkSnapshot);
-			if (startMode === "fork" && pendingForkSnapshot) {
-				// Branch the forked session from the source's in-memory snapshot, then
-				// persist it under the new session id so the fork owns its own copy.
-				clearWidgetState();
-				importWidgetState(pendingForkSnapshot);
-				const forkedFileCount = pendingForkSnapshot.files.length;
-				pendingForkSnapshot = undefined;
-				// #1041: adopt the source session's read history (staleness-reconciled
-				// against current disk) so the fork isn't zero-read-blocked on files
-				// the parent already read.
-				let forkReadImport: { imported: number; dropped: number } | undefined;
-				if (pendingForkReadGuard) {
-					forkReadImport = runtime.readGuard.importState(pendingForkReadGuard);
-					pendingForkReadGuard = undefined;
-				}
-				if (stableSessionId) {
-					void saveSessionState(
-						ctx.cwd ?? process.cwd(),
-						stableSessionId,
-						exportWidgetState(),
-						runtime.readGuard.exportState(),
-					);
-				}
-				dbg(
-					`session_start: fork — branched ${forkedFileCount} file(s) from source` +
-						(forkReadImport
-							? `, read-guard +${forkReadImport.imported} (dropped ${forkReadImport.dropped})`
-							: ""),
-				);
-			} else if (startMode === "keep") {
-				dbg("session_start: reload — keeping widget state");
-			} else if (startMode === "clean") {
-				pendingForkSnapshot = undefined;
-				pendingForkReadGuard = undefined;
-				clearWidgetState();
-				dbg("session_start: new — clean widget");
-			} else {
-				// maybe-rehydrate: covers resume AND startup (e.g. `pi --session <id>`)
-				pendingForkSnapshot = undefined;
-				pendingForkReadGuard = undefined;
-				clearWidgetState();
-				if (stableSessionId) {
-					const persisted = await loadSessionState(
-						ctx.cwd ?? process.cwd(),
-						stableSessionId,
-					);
-					if (persisted?.widget) {
-						// #180/#190: drop files changed on disk since the snapshot so a
-						// resume never surfaces stale diagnostics; they re-scan on edit.
-						const fresh = await dropStaleFiles(
-							persisted.widget,
-							persisted.savedAt,
-						);
-						const dropped = persisted.widget.files.length - fresh.files.length;
-						importWidgetState(fresh);
-						// #1041: rehydrate the read-before-edit guard's read-set on the
-						// SAME path so the first post-resume edit of a previously-read
-						// file isn't falsely zero-read-blocked. importState reconciles
-						// each read against current disk (drops changed/missing files),
-						// so a resume never masks a real staleness.
-						const readImport = runtime.readGuard.importState(
-							persisted.readGuard,
-						);
+					if (trustState === "untrusted") {
 						dbg(
-							`session_start: ${reasonLabel} ${stableSessionId} — rehydrated ${fresh.files.length} file(s)` +
-								(dropped > 0 ? `, dropped ${dropped} stale` : "") +
-								(readImport.imported > 0 || readImport.dropped > 0
-									? `; read-guard +${readImport.imported} read(s) (dropped ${readImport.dropped} stale)`
+							"session_start: untrusted project — tool auto-install and LSP spawns are disabled for this session",
+						);
+					}
+
+					// #190: pi's session lifecycle. `reason` distinguishes new/resume/fork/
+					// reload/startup; the STABLE session id comes from the session manager
+					// (the event carries none), and is what lets a resumed session rehydrate.
+					const stableSessionId = (() => {
+						try {
+							return (
+								ctx as { sessionManager?: { getSessionId?: () => string } }
+							)?.sessionManager?.getSessionId?.();
+						} catch {
+							return undefined;
+						}
+					})();
+
+					// #473: distinguish a concurrently-live in-process subagent bind
+					// (tintinweb/pi-subagents-style) from a real sequential session
+					// replacement BEFORE touching any process-shared singleton. A
+					// concurrent secondary must not run handleSessionStart (which resets
+					// the shared LSP fleet + runtime generation out from under the still
+					// -live parent) or updateRuntimeIdentityFromCtx (which would
+					// overwrite the parent's telemetry identity).
+					const sessionStartDecision = decideSessionStart(ctx, stableSessionId);
+					ownedSessionRole = sessionStartDecision.runFullSessionStart
+						? "primary"
+						: "concurrent-secondary";
+					if (!sessionStartDecision.runFullSessionStart) {
+						dbg(
+							`session_start: concurrent secondary detected (count=${sessionStartDecision.secondaryCount}) — skipping handleSessionStart`,
+						);
+						logConcurrentSessionBind({
+							secondaryCount: sessionStartDecision.secondaryCount,
+							sessionReason,
+							sameCwd: (ctx as { cwd?: string })?.cwd === process.cwd(),
+						});
+						return;
+					}
+
+					// #1723 review F4: the in-flight-phase live-bracket map/closed-ring
+					// (clients/latency-logger.ts) is process-shared state, exactly like
+					// the LSP fleet / runtime generation the #473 gate above already
+					// protects — so this reset belongs BEHIND that gate, not before it.
+					// A concurrent secondary's session_start must not wipe brackets a
+					// still-live PARENT activation genuinely has open; only a confirmed
+					// full session start (this line has already returned otherwise) may
+					// assume no sibling activation still owns live brackets in this
+					// process. See `resetCurrentPhaseForSession`'s doc comment for the
+					// accepted cost on the other side (a torn-down secondary's own
+					// bracket goes stale until the next full session start).
+					resetCurrentPhaseForSession();
+
+					// Dynamic tooling (#pi 0.80.x+): put the active tool set back to the
+					// posture this logical conversation had — the always-active baseline
+					// plus exactly the lazy tools (LAZY_TOOL_CATALOG) the model activated
+					// via pi_lens_activate_tools. session_start is the correct lifecycle
+					// point for this call (#643; see the comment left at the old call site
+					// above, right after tool registration, for why it can never succeed
+					// there).
+					//
+					// #1453: this RESTORES, it does not merely shrink. Every session_start
+					// reason arrives with all registered pi-lens tools active, because the
+					// host builds a fresh AgentSession with `includeAllExtensionTools: true`
+					// on fork/reload/resume just as it does on startup, and never persists
+					// an active-tool set per session. Skipping the call on those reasons
+					// would therefore leave every lazy tool active forever AND change the
+					// advertised tool list relative to the parent's cached prompt prefix.
+					// Rebuilding the same set instead keeps the prefix identical and
+					// genuinely preserves the model's activations, because pi-lens's own
+					// closure state (`rememberedLazyTools`) survives the rebuild.
+					//
+					// Deliberately BELOW the #473 concurrent-secondary guard: the active
+					// tool set is shared runtime state (one loader per process), so a
+					// secondary's session_start must never rewrite the still-live
+					// primary's set — last writer would win.
+					//
+					// Feature-detected the same way as elsewhere in this handler:
+					// `pi.getActiveTools`/`setActiveTools` aren't guaranteed present on
+					// every host the broad `@earendil-works/pi-coding-agent` peer
+					// dependency allows, so probe with typeof rather than assuming the
+					// pinned devDependency version's API exists at runtime. Under
+					// `--no-lazy-tools` nothing is touched at all: all-active IS the
+					// requested posture.
+					try {
+						const piWithActiveTools = pi as unknown as {
+							getActiveTools?: () => string[];
+							setActiveTools?: (names: string[]) => void;
+						};
+						if (
+							getLensFlag("no-lazy-tools") !== true &&
+							typeof piWithActiveTools.getActiveTools === "function" &&
+							typeof piWithActiveTools.setActiveTools === "function"
+						) {
+							// A fresh conversation starts with no activation memory; a
+							// rebuild inherits the parent's.
+							if (isFreshSessionStart(sessionReason))
+								rememberedLazyTools.clear();
+							const lazyNames = new Set(LAZY_TOOL_CATALOG.map((t) => t.name));
+							const plan = planToolSet(
+								piWithActiveTools.getActiveTools(),
+								lazyNames,
+								rememberedLazyTools,
+							);
+							if (plan.changed) {
+								piWithActiveTools.setActiveTools(plan.desired);
+								recordToolSetMutation({
+									addedCount: plan.addedCount,
+									removedCount: plan.removedCount,
+									reason: isFreshSessionStart(sessionReason)
+										? "fresh_session_lazy_deactivation"
+										: "session_rebuild_restore",
+									deferralApplies: supportsDeferredTools(
+										(
+											ctx as {
+												model?: Parameters<typeof supportsDeferredTools>[0];
+											}
+										)?.model,
+									),
+								});
+							}
+						}
+					} catch (toolSetErr) {
+						dbg(
+							`dynamic tool set restore failed (older pi host lacking getActiveTools/setActiveTools, or a genuine host error): ${toolSetErr}`,
+						);
+					}
+
+					// #449 slice 1 / #472: register this process in the cross-process
+					// instance registry and fire-and-forget an orphan-LSP sweep. Below the
+					// #473 guard deliberately: a concurrent secondary neither re-registers
+					// (the pid's entry already exists) nor re-sweeps (a fan-out would run
+					// up to maxConcurrent redundant sweeps). Neither call is awaited —
+					// registry I/O and the reaper must never delay session start; both are
+					// internally best-effort (never throw).
+					await configureWarmAttach(ctx.cwd ?? process.cwd());
+					void registerInstance(ctx.cwd ?? process.cwd()).catch(() => {
+						// best-effort observability — never fail session_start over this
+					});
+					// #1123 item 2: log a sessionstart.log marker for any registry entry
+					// whose owning pid is confirmed dead — this instance vanished without
+					// reaching deregisterInstance()'s clean-shutdown removal. MUST read the
+					// registry and log BEFORE sweepOrphans (below) prunes exactly these same
+					// dead-pid entries out from under it, or the vanished set would already
+					// be empty by the time this runs — hence the explicit read here rather
+					// than letting sweepOrphans's own internal read race it.
+					void readInstanceRegistry()
+						.then((registry) => logVanishedInstances(registry))
+						.catch(() => {
+							// best-effort observability — never fail session_start over this
+						})
+						.finally(() => {
+							void sweepOrphans();
+						});
+					// #658: registry-INDEPENDENT backstop sweep, running alongside the
+					// registry-driven one above. `sweepOrphans` can only ever see pids
+					// still listed in some instance's `lspChildren[]`; once that trace is
+					// lost (stale-heartbeat entry removal, or a silently-failed
+					// `killPidTree`), the child becomes permanently invisible to it. This
+					// backstop instead scans the OS process table directly for known
+					// pi-lens-managed binary names and only acts on ones that are BOTH
+					// untracked by the current registry snapshot AND have a
+					// confirmed-dead parent — never on name alone. Fire-and-forget, same
+					// non-blocking/never-throws contract as `sweepOrphans`.
+					//
+					// #1857: SCHEDULED, not called. The sweep's OS-process enumeration was
+					// measured at 9344ms on the session_start critical path, exactly
+					// overlapping and starving `warmup_language_profile`. It now fires on
+					// an unref'd timer well after warmup, under a machine-wide cooldown.
+					scheduleUntrackedOrphanSweep();
+					// #449 slice 2 (prototype): machine-wide LSP budget check. Reads the
+					// same registry, decides locally whether THIS session should skip
+					// spawning auxiliary LSP servers, and caches the decision for
+					// clients/dispatch/auxiliary-lsp.ts to read on later dispatch calls.
+					// Never awaited — a registry read must not delay session start, and
+					// dispatch doesn't happen until later in the turn anyway, so the cache
+					// is populated well before it's first read in practice.
+					void checkCrossProcessLspBudget();
+					// #492: child-at-session_start cross-process nudge consumer. Reads
+					// `recent-touches.json` (clients/recent-touches.ts) for entries from
+					// OTHER pi-lens instances (pid-excluded) within the 15-minute
+					// freshness window whose file still exists, and feeds them into the
+					// same #485 accumulator a bus event would use — the first `context`
+					// call this session makes (clients/agent-nudge.ts, wired below) then
+					// injects one batched provenance message. This is the "child blind to
+					// parent" direction from #492: a subagent asked to `git status` right
+					// after spawn otherwise sees unexplained `M` files with no
+					// explanation. Never awaited-to-block session_start; internally
+					// best-effort (recent-touches.ts never throws).
+					void readCrossProcessTouchesForSessionStart({
+						cwd: ctx.cwd ?? process.cwd(),
+					})
+						.then((entries) => {
+							if (entries.length === 0) return;
+							recordCrossProcessTouches(
+								entries.map((e) => ({ path: e.path, reason: e.reason })),
+							);
+							dbg(
+								`session_start: cross-process nudge — ${entries.length} file(s) from other instance(s)`,
+							);
+						})
+						.catch((err) => {
+							dbg(`session_start: cross-process nudge read failed: ${err}`);
+						});
+					updateRuntimeIdentityFromCtx(ctx);
+					try {
+						await ensureLSPConfigInitialized(ctx.cwd ?? process.cwd());
+					} catch (cfgErr) {
+						dbg(`lsp config init failed: ${cfgErr}`);
+					}
+
+					const bootstrapClientsStartedAt = Date.now();
+					const {
+						metricsClient,
+						todoScanner,
+						biomeClient,
+						ruffClient,
+						knipClient,
+						jscpdClient,
+						govulncheckClient,
+						gitleaksClient,
+						trivyClient,
+						opengrepClient,
+						depChecker,
+						testRunnerClient,
+						goClient,
+						rustClient,
+						deadCodeClients,
+					} = await loadBootstrapClients();
+					const bootstrapClientsDurationMs =
+						Date.now() - bootstrapClientsStartedAt;
+					const handlerEnteredAt = Date.now();
+					// Consume the process-lifetime measurement at the first real session
+					// start. Concurrent secondary starts never reach this handler.
+					const emitHostReadyDelay = consumeHostReadyDelayAnchor();
+					// #1999: rising-edge sampler state is session-scoped module state —
+					// reset beside the primary session-start reset block so a tightened
+					// sampling window cannot leak across sessions.
+					resetMemorySamplerCadence();
+					await handleSessionStart({
+						ctxCwd: ctx.cwd,
+						sessionStartFiredAt,
+						sessionStartMonotonicAt,
+						extensionLoadedAt: PI_LENS_LOADED_AT_MS,
+						emitHostReadyDelay,
+						sessionReason,
+						handlerEnteredAt,
+						bootstrapClientsStartedAt,
+						bootstrapClientsDurationMs,
+						getFlag: (name: string) => getLensFlag(name),
+						notify: (msg, level) => notifyUi(ctx, msg, level),
+						dbg,
+						log,
+						runtime,
+						metricsClient,
+						cacheManager,
+						todoScanner,
+						astGrepClient,
+						biomeClient,
+						ruffClient,
+						knipClient,
+						jscpdClient,
+						deadCodeClients,
+						govulncheckClient,
+						gitleaksClient,
+						trivyClient,
+						opengrepClient,
+						depChecker,
+						testRunnerClient,
+						goClient,
+						rustClient,
+						ensureTool: async (name: string) =>
+							(await import("./clients/installer/index.js")).ensureTool(name),
+						cleanStaleTsBuildInfo,
+						resetDispatchBaselines,
+						resetLSPService,
+					});
+					ctx.ui && updateLspStatus(ctx.ui.setStatus, ctx.ui.theme);
+
+					// Pin the stable identity + reason AFTER handleSessionStart (which ran
+					// resetForSession → a fresh random id); the stable id now wins (#190).
+					runtime.setSessionLifecycle({
+						sessionId: stableSessionId,
+						reason: sessionReason,
+					});
+
+					// Lifecycle-aware widget state (#190). The "should I rehydrate" signal is
+					// NOT the reason — it's whether a persisted snapshot exists for this
+					// STABLE session id. A `pi --session <id>` launch fires reason="startup"
+					// (not "resume" — that's only an in-process switchSession), so gating on
+					// "resume" alone missed the common resume path. So: fork branches from
+					// the in-memory stash; reload keeps state; new starts clean; everything
+					// else (resume / startup / default) rehydrates IFF a snapshot exists —
+					// a brand-new session has a fresh id with no file (→ clean), a
+					// resumed/launched one has its prior file (→ rehydrate).
+					const reasonLabel = sessionReason ?? "startup";
+					const startMode = sessionStartMode(
+						sessionReason,
+						!!pendingForkSnapshot,
+					);
+					if (startMode === "fork" && pendingForkSnapshot) {
+						// Branch the forked session from the source's in-memory snapshot, then
+						// persist it under the new session id so the fork owns its own copy.
+						clearWidgetState();
+						importWidgetState(pendingForkSnapshot);
+						const forkedFileCount = pendingForkSnapshot.files.length;
+						pendingForkSnapshot = undefined;
+						// #1041: adopt the source session's read history (staleness-reconciled
+						// against current disk) so the fork isn't zero-read-blocked on files
+						// the parent already read.
+						let forkReadImport:
+							| { imported: number; dropped: number }
+							| undefined;
+						if (pendingForkReadGuard) {
+							forkReadImport =
+								runtime.readGuard.importState(pendingForkReadGuard);
+							pendingForkReadGuard = undefined;
+						}
+						if (stableSessionId) {
+							void saveSessionState(
+								ctx.cwd ?? process.cwd(),
+								stableSessionId,
+								exportWidgetState(),
+								runtime.readGuard.exportState(),
+							);
+						}
+						dbg(
+							`session_start: fork — branched ${forkedFileCount} file(s) from source` +
+								(forkReadImport
+									? `, read-guard +${forkReadImport.imported} (dropped ${forkReadImport.dropped})`
 									: ""),
 						);
+					} else if (startMode === "keep") {
+						dbg("session_start: reload — keeping widget state");
+					} else if (startMode === "clean") {
+						pendingForkSnapshot = undefined;
+						pendingForkReadGuard = undefined;
+						clearWidgetState();
+						dbg("session_start: new — clean widget");
 					} else {
-						dbg(
-							`session_start: ${reasonLabel} ${stableSessionId} — no persisted state (clean)`,
-						);
+						// maybe-rehydrate: covers resume AND startup (e.g. `pi --session <id>`)
+						pendingForkSnapshot = undefined;
+						pendingForkReadGuard = undefined;
+						clearWidgetState();
+						if (stableSessionId) {
+							const persisted = await loadSessionState(
+								ctx.cwd ?? process.cwd(),
+								stableSessionId,
+							);
+							if (persisted?.widget) {
+								// #180/#190: drop files changed on disk since the snapshot so a
+								// resume never surfaces stale diagnostics; they re-scan on edit.
+								const fresh = await dropStaleFiles(
+									persisted.widget,
+									persisted.savedAt,
+								);
+								const dropped =
+									persisted.widget.files.length - fresh.files.length;
+								importWidgetState(fresh);
+								// #1041: rehydrate the read-before-edit guard's read-set on the
+								// SAME path so the first post-resume edit of a previously-read
+								// file isn't falsely zero-read-blocked. importState reconciles
+								// each read against current disk (drops changed/missing files),
+								// so a resume never masks a real staleness.
+								const readImport = runtime.readGuard.importState(
+									persisted.readGuard,
+								);
+								dbg(
+									`session_start: ${reasonLabel} ${stableSessionId} — rehydrated ${fresh.files.length} file(s)` +
+										(dropped > 0 ? `, dropped ${dropped} stale` : "") +
+										(readImport.imported > 0 || readImport.dropped > 0
+											? `; read-guard +${readImport.imported} read(s) (dropped ${readImport.dropped} stale)`
+											: ""),
+								);
+							} else {
+								dbg(
+									`session_start: ${reasonLabel} ${stableSessionId} — no persisted state (clean)`,
+								);
+							}
+						} else {
+							dbg(
+								`session_start: ${reasonLabel} — no stable session id (clean)`,
+							);
+						}
 					}
-				} else {
-					dbg(`session_start: ${reasonLabel} — no stable session id (clean)`);
-				}
-			}
 
-			if (lensWidgetVisible) {
-				mountLensWidget(ctx.ui, readExtensionMode(ctx));
-			}
-		} catch (sessionErr) {
-			dbg(`session_start crashed: ${sessionErr}`);
-			dbg(`session_start crash stack: ${(sessionErr as Error).stack}`);
-		}
-	});
+					if (lensWidgetVisible) {
+						mountLensWidget(ctx.ui, readExtensionMode(ctx));
+					}
+				} catch (sessionErr) {
+					// The stale-ctx class has ONE classifier and one record, in
+					// clients/session-event-guard.ts. Rethrow so the wrapper around
+					// this registration owns it, instead of this catch logging a
+					// session swap as a pi-lens crash (#1929, same shape as the
+					// agent_end and turn_end catches).
+					if (isStaleExtensionCtxError(sessionErr)) throw sessionErr;
+					dbg(`session_start crashed: ${sessionErr}`);
+					dbg(`session_start crash stack: ${(sessionErr as Error).stack}`);
+				}
+			},
+			{ dbg },
+		),
+	);
 
 	// #190 Phase 2: capture the source session's diagnostics just before a fork,
 	// so the forked session (its `session_start` fires with reason="fork") can
@@ -2005,10 +2199,10 @@ function activateExtension(hostPi: ExtensionAPI) {
 
 	// Real-time feedback on file writes/edits
 	// biome-ignore lint/suspicious/noExplicitAny: pi.on overload mismatch for tool_result event type
-	(pi as any).on("tool_result", async (event: any, ctx: any) => {
+	const onToolResult = async (event: any, ctx: any) => {
 		rememberOwnEventCtx(ctx);
 		if (!lensEnabled) return;
-		updateRuntimeIdentityFromEvent(event);
+		updateRuntimeIdentityFromCtx(ctx);
 		// Publish this turn's abort signal so the dispatch's linter/type-check
 		// child processes are killed if the agent is interrupted (#197 ctx.signal).
 		setAmbientAbortSignal(ctx?.signal);
@@ -2059,11 +2253,17 @@ function activateExtension(hostPi: ExtensionAPI) {
 		} finally {
 			setAmbientAbortSignal(undefined);
 		}
-	});
+	};
+	// biome-ignore lint/suspicious/noExplicitAny: pi.on overload mismatch for tool_result event type
+	(pi as any).on(
+		"tool_result",
+		wrapSessionEventHandler("tool_result", onToolResult, { dbg }),
+	);
 
 	// --- Turn end: batch jscpd/madge on collected files, then clear state ---
 	// Clear cascade snapshot at start of each new turn so stale data never leaks
-	pi.on("turn_start", (_event: any, ctx) => {
+	// biome-ignore lint/suspicious/noExplicitAny: heterogeneous pi event ctx shapes
+	const onTurnStart = (_event: any, ctx: any) => {
 		rememberOwnEventCtx(ctx);
 		// Trust can change without a new session. Re-adopt before this turn can
 		// reach any install-capable or LSP-spawn path.
@@ -2114,108 +2314,252 @@ function activateExtension(hostPi: ExtensionAPI) {
 			.catch((err) => {
 				dbg(`turn_start: cross-process nudge read failed: ${err}`);
 			});
-	});
+	};
+	pi.on(
+		"turn_start",
+		wrapSessionEventHandler("turn_start", onTurnStart, { dbg }),
+	);
 
-	pi.on("agent_end", async (_event, ctx) => {
+	// #1654: `agent_end` fires every time pi's internal `_runAgentPrompt` loop
+	// finishes A run — including a run that is about to auto-retry or resume
+	// after overflow-compaction. pi computes `willRetry` only AFTER emitting
+	// this event and never exposes it to extensions (source-level audit:
+	// `AgentEndEvent` is `{type, messages}` only, pi agent-session.ts:643-645;
+	// see node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/types.d.ts).
+	// The #1387 deferred-format/autofix drain below therefore used to be able
+	// to fire MID-RUN, between retries — formatting files the agent is still
+	// actively working on, which can shift lines under queued work and stale
+	// in-flight content bindings (the #1642 harm family).
+	//
+	// `agent_settled` is the documented once-per-run signal — "fired after an
+	// agent run has fully settled and no automatic retry, compaction, or
+	// queued continuation will run" (AgentSettledEvent, same types.d.ts) — so
+	// the drain moves there (see the `agent_settled` registration below) and
+	// is no longer run from `agent_end` at all.
+	//
+	// There is deliberately no capability-detection fallback back onto
+	// `agent_end` for a host that never fires `agent_settled`: `pi.on`
+	// registration is a silent no-op push onto a plain Map regardless of
+	// whether the host will ever emit the event (see quiet-window.ts's module
+	// doc), so "registration succeeded" proves nothing about whether the
+	// event will actually fire — a heuristic built on that would be as
+	// unreliable as no heuristic at all, and a timer-based "drain if settled
+	// hasn't fired within N ms" watchdog would reintroduce this exact bug on
+	// a SUPPORTED host whenever a retry/compaction cycle legitimately takes
+	// longer than the watchdog window.
+	//
+	// There is also deliberately no separate "drain at session_shutdown"
+	// safety net (review round 1, F2/F3/F4/F5): `agent_settled` is
+	// documented to fire from `_runAgentPrompt`'s `finally` on normal
+	// completion, on an aborted run, AND on a throw — the only way to miss it
+	// is the process itself dying (a hard kill, an OOM, a host crash before
+	// the finally runs), and a `session_shutdown`-based net cannot help with
+	// that case either (the process is gone before any handler could run). A
+	// run that dies without settling therefore strands its queued records in
+	// this session's in-memory `_pendingDeferredMutations` map — but not
+	// permanently: `claimDeferredMutations`'s existing staleness fallback
+	// (`DEFERRED_FORMAT_STALE_AFTER_MS`, 10 minutes — the same mechanism
+	// #791 already uses to recover a concurrent-secondary session's orphaned
+	// records) lets the NEXT session in this process claim them as orphaned
+	// once they've aged out. That is a real, honestly-documented behavior
+	// change from pre-#1654 (deferred format used to run every `agent_end`,
+	// so it never truly stranded), traded for correctness: it beats
+	// formatting files the agent is still actively working on mid-retry.
+	type DeferredDrainCtx = {
+		cwd?: string;
+		signal?: AbortSignal;
+		ui?: {
+			setStatus?: (id: string, text: string | undefined) => void;
+			theme?: LspStatusTheme;
+		};
+	};
+
+	async function runDeferredMutationDrain(
+		ctx: DeferredDrainCtx,
+	): Promise<void> {
+		const currentSessionId = getStableSessionId(ctx);
+		// #791 defense-in-depth: mirrors how session_start already skips
+		// handleSessionStart for a concurrent in-process secondary
+		// (subagent) — if THIS firing is positively identified as belonging
+		// to a live sibling secondary session rather than the registered
+		// primary, skip the deferred-format flush entirely rather than
+		// relying only on the per-record ownership filter inside
+		// handleAgentEnd. Fail-safe: any inconclusive signal classifies
+		// "primary" and runs as before.
+		const emission = classifyOwnedSessionEmission(ctx, currentSessionId);
+		if (emission === "concurrent-secondary") {
+			dbg(
+				`deferred_mutation_drain: concurrent secondary session detected — skipping (sessionId=${currentSessionId})`,
+			);
+			logLatency({
+				type: "phase",
+				filePath: ctx.cwd ?? "<pi-lens>",
+				phase: "agent_end_concurrent_secondary_skip",
+				durationMs: 0,
+				metadata: { sessionId: currentSessionId },
+			});
+			return;
+		}
+		await handleAgentEnd({
+			ctxCwd: ctx.cwd,
+			getFlag: (name: string, filePath?: string) => getLensFlag(name, filePath),
+			getFlagSource: (name: string, filePath?: string) =>
+				getLensFlagSource(name, filePath),
+			notify: (msg, level) => notifyUi(ctx, msg, level),
+			dbg,
+			runtime,
+			cacheManager,
+			getFormatService: () =>
+				getFormatService(runtime.telemetrySessionId, true),
+			getAutofixClients: async () => {
+				const { biomeClient, ruffClient } = await loadBootstrapClients();
+				return { biomeClient, ruffClient };
+			},
+			currentSessionId,
+		});
+		if (ctx.ui?.setStatus && ctx.ui.theme) {
+			updateLspStatus(ctx.ui.setStatus, ctx.ui.theme);
+		}
+	}
+
+	// biome-ignore lint/suspicious/noExplicitAny: heterogeneous pi event ctx shapes
+	const onAgentEnd = async (_event: any, ctx: any) => {
 		if (!lensEnabled) return;
-		// Esc/abort during the deferred format + flush kills in-flight children.
-		setAmbientAbortSignal((ctx as { signal?: AbortSignal })?.signal);
+		// Esc/abort during the debounce flush kills in-flight children. The
+		// deferred-format/autofix drain no longer runs from this handler at
+		// all (#1654 — see the module comment above); its own abort/requeue
+		// handling is wired at the `agent_settled` registration below instead.
 		try {
-			const currentSessionId = getStableSessionId(ctx);
-			// #791 defense-in-depth: mirrors how session_start already skips
-			// handleSessionStart for a concurrent in-process secondary
-			// (subagent) — if THIS agent_end firing is positively identified as
-			// belonging to a live sibling secondary session rather than the
-			// registered primary, skip the deferred-format flush entirely
-			// rather than relying only on the per-record ownership filter
-			// inside handleAgentEnd. Fail-safe: any inconclusive signal
-			// classifies "primary" and runs as before.
-			const emission = classifyCurrentSessionEmission(ctx, currentSessionId);
-			if (emission === "concurrent-secondary") {
-				dbg(
-					`agent_end: concurrent secondary session detected — skipping deferred-format flush (sessionId=${currentSessionId})`,
-				);
-				logLatency({
-					type: "phase",
-					filePath: ctx.cwd ?? "<pi-lens>",
-					phase: "agent_end_concurrent_secondary_skip",
-					durationMs: 0,
-					metadata: { sessionId: currentSessionId },
-				});
-				return;
-			}
+			// Inside the try so the `finally` below covers it: reading
+			// `ctx.signal` is itself a guarded SDK accessor that can throw when a
+			// session replacement lands after the guard's pre-dispatch probe
+			// (#1925).
+			setAmbientAbortSignal((ctx as { signal?: AbortSignal })?.signal);
 			// Ensure any pipeline still queued in the debounce window finishes
 			// before agent_end runs — otherwise project change-log entries and
-			// modified ranges this turn produced may not be reflected yet.
+			// modified ranges this turn produced may not be reflected yet. This
+			// is per-turn bookkeeping for edits the agent already made, not the
+			// once-per-run deferred-format/autofix drain (#1654: that moved to
+			// `agent_settled` below, since — unlike this flush — running it here
+			// can fire mid-run, between auto-retries).
 			await flushDebouncedToolResults();
-			await handleAgentEnd({
-				ctxCwd: ctx.cwd,
-				getFlag: (name: string, filePath?: string) =>
-					getLensFlag(name, filePath),
-				getFlagSource: (name: string, filePath?: string) =>
-					getLensFlagSource(name, filePath),
-				notify: (msg, level) => notifyUi(ctx, msg, level),
-				dbg,
-				runtime,
-				cacheManager,
-				getFormatService: () =>
-					getFormatService(runtime.telemetrySessionId, true),
-				getAutofixClients: async () => {
-					const { biomeClient, ruffClient } = await loadBootstrapClients();
-					return { biomeClient, ruffClient };
-				},
-				currentSessionId,
-			});
 			ctx.ui && updateLspStatus(ctx.ui.setStatus, ctx.ui.theme);
 		} catch (agentEndErr) {
+			// The stale-ctx class has ONE classifier and one record, in
+			// clients/session-event-guard.ts. Rethrow so the wrapper around this
+			// registration owns it, instead of a second copy here logging it as a
+			// crash (#1925).
+			if (isStaleExtensionCtxError(agentEndErr)) throw agentEndErr;
 			dbg(`agent_end crashed: ${agentEndErr}`);
 			dbg(`agent_end crash stack: ${(agentEndErr as Error).stack}`);
 		} finally {
 			setAmbientAbortSignal(undefined);
 		}
-	});
+	};
+	pi.on("agent_end", wrapSessionEventHandler("agent_end", onAgentEnd, { dbg }));
 
-	pi.on("turn_end", async (_event: any, ctx) => {
+	// biome-ignore lint/suspicious/noExplicitAny: heterogeneous pi event ctx shapes
+	const onTurnEnd = async (_event: any, ctx: any) => {
 		if (!lensEnabled) return;
 		// Esc/abort during the turn-end flush (knip/madge/tests + debounced
 		// dispatch) kills in-flight children instead of waiting out their timeout.
-		setAmbientAbortSignal((ctx as { signal?: AbortSignal })?.signal);
 		try {
+			// Inside the try for the same reason as `agent_end` above (#1925).
+			setAmbientAbortSignal((ctx as { signal?: AbortSignal })?.signal);
 			const repaintLspStatus = captureLspStatusRepaint(ctx);
-			// Persist a new worst event-loop block to latency.log, attributed to
-			// this turn, so freezes are queryable across sessions (#192). The
-			// window is per-turn (#1122): the probe cannot itself see machine
-			// sleep or commit-charge paging, both of which freeze the process and
-			// masquerade as huge synchronous blocks, so we tag samples the turn's
-			// CPU budget can't account for as `suspectSystemStall` and keep them
-			// out of the genuine-block high-waters. `lastPhase` is cheap block
-			// attribution (#1123 item 1) — the last phase that ran before the
-			// block was detected.
+			// Persist every event-loop block over the floor to latency.log,
+			// attributed to this turn, so freezes are queryable across sessions
+			// (#192). Logging used to gate on "new session worst" alone, which
+			// hid every sub-maximum block after a session's first large one —
+			// exactly the blocks that need to be checked against LSP pull
+			// timeouts (#1549/#1713), so #1723 widened the gate to the floor and
+			// kept "new worst" only as metadata / high-water bookkeeping. Volume
+			// stays bounded because this runs at most once per turn (the window
+			// is per-turn, #1122): one `loop_block` record per turn, not one per
+			// sample. The window is per-turn also so the probe cannot itself see
+			// machine sleep or commit-charge paging, both of which freeze the
+			// process and masquerade as huge synchronous blocks — samples the
+			// turn's CPU budget can't account for are tagged
+			// `suspectSystemStall` and excluded from the genuine-block
+			// high-waters. `lastPhase`/`recentPhases` are cheap block attribution
+			// (#1123 item 1, widened #1723 item 2) — the phases that ran before
+			// the block was detected; a bounded ring rather than one pointer,
+			// because the phase actually causing a synchronous block is often
+			// still in flight (and so unlogged) when the block fires, so the
+			// single last-COMPLETED phase can point at unrelated prior work.
 			const elStats = getEventLoopStats();
 			const loopMaxMs = elStats?.maxMs ?? 0;
 			const suspectSystemStall = elStats?.suspectSystemStall ?? false;
-			if (shouldLogWorstBlock(loopMaxMs, lastLoggedLoopWorstMs)) {
+			if (shouldLogLoopBlock(loopMaxMs)) {
 				const lastPhase = getLastLoggedPhase();
-				logLatency({
+				const recentPhases = getRecentLoggedPhases(3);
+				// #1723 residual, redesigned after review (F1/F2/F3): `lastPhase`/
+				// `recentPhases` above only ever name a phase that already
+				// FINISHED. The motivating case — an 18s synchronous full-scan
+				// block — had no attribution because the phase burning the CPU was
+				// still running when the probe sampled, so it hadn't logged a
+				// completion yet. `getPhaseForWindow` (clients/latency-logger.ts)
+				// checks the block's own time window against both the still-live
+				// brackets dispatcher.ts's `runRunner` keeps open AND a short ring
+				// of recently CLOSED ones — the latter is load-bearing, not
+				// redundant: `phaseFinished` resumes as a microtask, `turn_end` is
+				// scheduled as a macrotask, and microtasks always drain first, so a
+				// genuinely synchronous phase has typically ALREADY closed by the
+				// time this line runs. Checking live brackets alone would read
+				// empty for exactly the case this exists to catch. NOT wired into
+				// the LSP workspace-diagnostics sweep's own touch loop
+				// (clients/lsp/index.ts) — that remains a named, deferred gap (see
+				// the PR body / issue comment), not a silent one.
+				//
+				// #1723 review round 3: this window — [now - loopMaxMs, now] —
+				// assumes the block ENDED right at this sample, which is a
+				// reasonable approximation, not a measured fact (getEventLoopStats
+				// reports the window's max delay, not its precise end instant). A
+				// human reader has `inFlightPhaseStartedAt`/`inFlightPhaseElapsedMs`/
+				// `inFlightPhaseStillRunning` on the record below to judge that
+				// assumption per-block; an automated correlation (#1549) should
+				// account for the same slack rather than treating these window
+				// edges as exact.
+				const blockSampledAtMs = Date.now();
+				const inFlight = getPhaseForWindow(
+					blockSampledAtMs - loopMaxMs,
+					blockSampledAtMs,
+				);
+				const isNewSessionWorst = shouldLogWorstBlock(
+					loopMaxMs,
+					lastLoggedLoopWorstMs,
+				);
+				// #1743: routed through the bounded-telemetry helper. No
+				// `capPerTurn` here, deliberately: this site's bound is its CALL
+				// CADENCE (#1723) — `turn_end` runs it at most once per turn
+				// because the histogram window resets every turn — so a
+				// `capPerTurn: 1` would be a second, redundant guard that could
+				// only ever fire in a harness that drives two `turn_end`s without
+				// an intervening `turn_start`. The helper still supplies the
+				// registry membership the sweep checks.
+				emitBounded("loop_block", LOOP_BLOCK_IDENTITY, {
 					type: "phase",
-					filePath: "<pi-lens>",
-					phase: "loop_block",
 					durationMs: Math.round(loopMaxMs),
 					metadata: {
-						worstSoFar: true,
+						worstSoFar: isNewSessionWorst,
 						turnIndex: runtime.turnIndex,
 						suspectSystemStall,
 						windowCpuMs: elStats?.windowCpuMs,
 						windowWallMs: elStats?.windowWallMs,
 						lastPhase: lastPhase?.phase,
 						lastPhaseAt: lastPhase?.ts,
+						recentPhases,
+						inFlightPhase: inFlight?.phase,
+						inFlightPhaseStartedAt: inFlight?.startedAt,
+						inFlightPhaseElapsedMs: inFlight?.elapsedMs,
+						inFlightPhaseStillRunning: inFlight?.stillRunning,
 					},
 				});
 				// A system stall must not raise the "new worst genuine block"
 				// bar, or it would silence every real block that follows it.
 				if (suspectSystemStall) {
 					sessionSuspectedStalls += 1;
-				} else {
+				} else if (isNewSessionWorst) {
 					lastLoggedLoopWorstMs = loopMaxMs;
 					sessionWorstRealBlockMs = Math.max(
 						sessionWorstRealBlockMs,
@@ -2228,13 +2572,24 @@ function activateExtension(hostPi: ExtensionAPI) {
 			// over the same span (#1122).
 			resetEventLoopMonitor();
 
-			// #1123 item 2: periodic memory-attribution sample, every
-			// MEMORY_SAMPLE_TURN_INTERVAL turns — cheap (O(1)/O(bounded-cache-size)
-			// reads only, see clients/memory-sampler.ts) so no extra throttling is
-			// needed beyond the turn cadence itself.
-			if (shouldEmitMemorySample(runtime.turnIndex)) {
+			// #1123 item 2 + #1999: periodic memory-attribution sample. Base cadence
+			// is every MEMORY_SAMPLE_TURN_INTERVAL turns; when heapUsed grew >20%
+			// between samples the gate tightens to every turn until growth stabilizes
+			// (see clients/memory-sampler.ts). Session age + turn count ride along so
+			// growth-vs-age curves are plottable from logs alone. Still cheap:
+			// O(1)/O(bounded-cache-size) reads only, no extra throttling needed.
+			if (shouldEmitMemorySampleAdaptive(runtime.turnIndex)) {
 				try {
-					const sample = buildMemorySample(runtime.wordIndex);
+					const sample = buildMemorySample(
+						runtime.wordIndex,
+						undefined,
+						undefined,
+						{
+							sessionAgeMs: Math.max(0, Date.now() - runtime.sessionStartedAt),
+							sessionStartedAt: runtime.sessionStartedAt,
+							turnCount: runtime.turnIndex,
+						},
+					);
 					logLatency({
 						type: "phase",
 						filePath: "<pi-lens>",
@@ -2242,6 +2597,10 @@ function activateExtension(hostPi: ExtensionAPI) {
 						durationMs: 0,
 						metadata: { turnIndex: runtime.turnIndex, ...sample },
 					});
+					recordMemorySampleOutcome(
+						sample.process.heapUsedBytes,
+						runtime.turnIndex,
+					);
 				} catch {
 					// best-effort observability — never fail turn_end over this
 				}
@@ -2258,7 +2617,9 @@ function activateExtension(hostPi: ExtensionAPI) {
 					// window — turn_end already knows exactly when this session
 					// began, so admitted rows are scoped to it, not to a day-wide
 					// guess that could straddle multiple sessions.
-					for (const note of checkSmellsAndNoteOnce(countRecentSmells(undefined, runtime.sessionStartedAt))) {
+					for (const note of checkSmellsAndNoteOnce(
+						countRecentSmells(undefined, runtime.sessionStartedAt),
+					)) {
 						notifyUi(ctx, note, "warning");
 					}
 				} catch {
@@ -2323,12 +2684,15 @@ function activateExtension(hostPi: ExtensionAPI) {
 			// is idle and sendMessage takes the safe append branch. The
 			// collector accumulates across the run's turns until then.
 		} catch (turnEndErr) {
+			// One classifier for the stale-ctx class — see `agent_end` above.
+			if (isStaleExtensionCtxError(turnEndErr)) throw turnEndErr;
 			dbg(`turn_end crashed: ${turnEndErr}`);
 			dbg(`turn_end crash stack: ${(turnEndErr as Error).stack}`);
 		} finally {
 			setAmbientAbortSignal(undefined);
 		}
-	});
+	};
+	pi.on("turn_end", wrapSessionEventHandler("turn_end", onTurnEnd, { dbg }));
 
 	// --- Quiet window (#483): pi 0.80.6 agent_settled — fires once the whole
 	// agent run (incl. any retry/continue loop) is fully idle, on both normal
@@ -2479,24 +2843,67 @@ function activateExtension(hostPi: ExtensionAPI) {
 			});
 		});
 	}
+	const onAgentSettled = async (_event: unknown, ctx: DeferredDrainCtx) => {
+		if (!lensEnabled) return;
+		// #1654: the #1387 deferred-format/autofix drain runs HERE, not at
+		// agent_end — see `runDeferredMutationDrain`'s doc comment above.
+		// Awaited (unlike the quiet-window tasks below): this mirrors the
+		// user-facing latency the drain already had pre-#1654 (it used to
+		// block `agent_end` the same way), just correctly gated on true
+		// settlement instead of firing mid-retry. A throw here must not
+		// skip the quiet window below.
+		//
+		// Review round 1 (F1): `agent_settled` fires on an ABORTED run too
+		// (ESC), and `ctx.signal` on that firing still reflects the
+		// aborted controller. `handleAgentEnd`'s abort/requeue branches
+		// (clients/runtime-agent-end.ts) read the ambient signal via
+		// `getAmbientAbortSignal()`, not a parameter — exactly like
+		// `agent_end`/`turn_end` already do around their own work — so an
+		// ESC-aborted settle must set it here too, or every queued record
+		// gets FORMATTED instead of requeued (an inversion of the #1642
+		// harm this issue exists to fix) and the requeue branches become
+		// production-unreachable.
+		try {
+			setAmbientAbortSignal(ctx?.signal);
+			try {
+				await runDeferredMutationDrain(ctx);
+			} catch (drainErr) {
+				// #1924 classified the stale-ctx case inline here. #1925 moved the
+				// classifier and its record to clients/session-event-guard.ts, so
+				// this site only declines to swallow it: rethrow, and the wrapper
+				// around the registration skips the run and counts it.
+				if (isStaleExtensionCtxError(drainErr)) throw drainErr;
+				dbg(`agent_settled deferred_mutation_drain crashed: ${drainErr}`);
+			} finally {
+				setAmbientAbortSignal(undefined);
+			}
+			const cwd = ctx?.cwd;
+			void runQuietWindow({
+				runtime,
+				dbg,
+				cwd,
+			}).catch((err) => {
+				dbg(`quiet_window crashed: ${err}`);
+			});
+			// #1123 item 4: dump active handles AFTER the quiet-window work is
+			// scheduled — the #1097-class leak (a stray ref'd timer surviving
+			// past settle) is only visible once whatever settle itself queued is
+			// already in flight. No-op unless PI_LENS_DEBUG_HANDLES=1.
+			dumpActiveHandles("agent_settled");
+		} catch (settledErr) {
+			setAmbientAbortSignal(undefined);
+			throw settledErr;
+		}
+	};
 	try {
+		// #1925: #1924's inline stale-ctx guard moved onto the shared wrapper
+		// (clients/session-event-guard.ts), so `agent_settled` is a consumer of
+		// the central path rather than the one handler with its own copy of the
+		// policy. Behavior is unchanged — the run is skipped and nothing throws
+		// into the host — and the skip is now counted in the degradation ledger.
 		(pi as any).on(
 			"agent_settled",
-			(_event: unknown, ctx: { cwd?: string }) => {
-				if (!lensEnabled) return;
-				void runQuietWindow({
-					runtime,
-					dbg,
-					cwd: ctx?.cwd,
-				}).catch((err) => {
-					dbg(`quiet_window crashed: ${err}`);
-				});
-				// #1123 item 4: dump active handles AFTER the quiet-window work is
-				// scheduled — the #1097-class leak (a stray ref'd timer surviving
-				// past settle) is only visible once whatever settle itself queued is
-				// already in flight. No-op unless PI_LENS_DEBUG_HANDLES=1.
-				dumpActiveHandles("agent_settled");
-			},
+			wrapSessionEventHandler("agent_settled", onAgentSettled, { dbg }),
 		);
 	} catch (registerErr) {
 		dbg(`agent_settled registration failed (older pi host?): ${registerErr}`);
@@ -2509,10 +2916,9 @@ function activateExtension(hostPi: ExtensionAPI) {
 		// #473: a concurrently-live in-process subagent session shutting down
 		// (its sibling primary — the real parent — still active) must NOT run
 		// the shared-infra teardown below: no LSP fleet shutdown, no idle-timer
-		// cancel that the parent still relies on. Only cheap/idempotent work
-		// (none here) would be safe to keep; everything in this handler today
-		// is destructive shared-infra teardown, so a secondary skips the whole
-		// body.
+		// cancel that the parent still relies on. Role-local cache observability
+		// summary/cleanup is safe before the return; all shared-infra teardown
+		// remains below and is skipped by a secondary.
 		const stableSessionId = (() => {
 			try {
 				return (
@@ -2522,8 +2928,16 @@ function activateExtension(hostPi: ExtensionAPI) {
 				return undefined;
 			}
 		})();
-		const shutdownClassification = noteSessionShutdown(ctx, stableSessionId);
+		const shutdownClassification = classifyOwnedSessionShutdown(
+			ctx,
+			stableSessionId,
+		);
 		if (shutdownClassification === "secondary") {
+			emitCacheUsageSummaryAtSessionEnd(
+				stableSessionId,
+				"concurrent-secondary",
+			);
+			clearCachePrefixSession(stableSessionId, "concurrent-secondary");
 			decrementSecondarySessionCount();
 			dbg(
 				"session_shutdown: concurrent secondary — skipping shared-infra teardown",
@@ -2531,11 +2945,16 @@ function activateExtension(hostPi: ExtensionAPI) {
 			return;
 		}
 
-		// #1018: drop this (primary) session's prefix baseline now it has ended,
-		// so its entry is reclaimed promptly instead of lingering until the LRU
-		// evicts it. Respects the #473 guard above (a concurrent-secondary
-		// shutdown returned already, so its entry is left for the LRU backstop).
-		clearCachePrefixSession(stableSessionId);
+		// #1654: no drain runs here — see the module comment above
+		// `runDeferredMutationDrain` (review round 1, F2/F3/F4/F5) for why a
+		// session_shutdown-based safety net was deliberately dropped rather
+		// than kept.
+
+		// #1018/#1996: emit the bounded primary cache summary, then drop this
+		// session's prefix/attribution state. The secondary path did the same for
+		// its role-local bucket before returning above.
+		emitCacheUsageSummaryAtSessionEnd(stableSessionId, "primary");
+		clearCachePrefixSession(stableSessionId, "primary");
 
 		cancelLSPIdleReset();
 		// #449 slice 1: SYNC-only deregistration (no child spawns — see the
@@ -2560,6 +2979,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 		// returned before reaching here), since the rollup counters are
 		// process-wide module state a live secondary would still need.
 		emitBusEventRollupAtSessionEnd(runtime.projectRoot);
+		emitVerifiedPathAttributionRollup(runtime.projectRoot);
 		// #1123 item 4: dump active handles AFTER teardown — whatever is still
 		// alive at this point is exactly what would keep a --print/--no-session
 		// process from exiting (the #1097 lesson: what survives IS the leak).
@@ -2581,7 +3001,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 				const sessionId = getStableSessionId(ctx);
 				logCacheUsage((event as { message?: unknown })?.message, dbg, {
 					sessionId,
-					sessionRole: classifyCurrentSessionEmission(ctx, sessionId),
+					sessionRole: classifyOwnedSessionEmission(ctx, sessionId),
 					turnIndex: runtime.turnIndex,
 				});
 			} catch (err) {
@@ -2633,142 +3053,168 @@ function activateExtension(hostPi: ExtensionAPI) {
 	// biome-ignore lint/suspicious/noExplicitAny: pi.on("context") overload has TS resolution bug
 	(pi as any).on(
 		"context",
-		async (
-			event: { messages?: Array<{ role: string; content: unknown }> } | unknown,
-			ctx: { cwd?: string },
-		) => {
-			// #1018: context telemetry deliberately runs even when the lens or its
-			// injection toggle is off, so an A/B run has a no-injection observation.
-			const existingMessages =
-				(event as { messages?: Array<{ role: string; content: unknown }> })
-					?.messages ?? [];
-			const prefixSessionId = getStableSessionId(ctx);
-			const sessionRole = classifyCurrentSessionEmission(ctx, prefixSessionId);
-			const prefixObservation = observeCachePrefix(
-				existingMessages,
-				runtime.turnIndex,
-				prefixSessionId,
-				sessionRole,
-				dbg,
-			);
-			const effectiveInjectionEnabled = lensEnabled && contextInjectionEnabled;
-			let telemetryLogged = false;
-			const logContextObservation = (
-				resultMessages: Array<{ role: string; content: unknown }>,
-				placement: "prepend" | "insert-before-final" | "append" | "none",
-				injectionSources: Array<
-					"session-guidance" | "turn-findings" | "test-findings" | "agent-nudge"
-				>,
-				injectedMessages: Array<{ role: string; content: unknown }>,
+		// #1929: `context` is reachable with a ctx the SDK already invalidated,
+		// exactly like the five handlers #1925 wrapped. It could not use the void
+		// wrapper because the host CONSUMES its return value on the live path, so
+		// it uses the value-returning variant and states its own stale-path answer
+		// below. Before this, a stale ctx surfaced as `context event error: …`,
+		// indistinguishable from a real handler bug, and counted nothing.
+		wrapSessionEventHandlerWithResult(
+			"context",
+			async (
+				event:
+					| { messages?: Array<{ role: string; content: unknown }> }
+					| unknown,
+				ctx: { cwd?: string },
 			) => {
-				if (telemetryLogged) return;
-				telemetryLogged = true;
-				observeCacheContext({
+				// #1018: context telemetry deliberately runs even when the lens or its
+				// injection toggle is off, so an A/B run has a no-injection observation.
+				const existingMessages =
+					(event as { messages?: Array<{ role: string; content: unknown }> })
+						?.messages ?? [];
+				const prefixSessionId = getStableSessionId(ctx);
+				const sessionRole = classifyOwnedSessionEmission(ctx, prefixSessionId);
+				// #1938: `observeCachePrefix` still owns the unbounded, always-accurate
+				// `cache_prefix_break` signal below. Its return value used to be threaded
+				// into `observeCacheContext` as `prefixObservation`, but that field was
+				// removed there (see the cache-observability.ts module doc) — the call
+				// stays for its `cache_prefix_break` side effect only.
+				observeCachePrefix(
 					existingMessages,
-					resultMessages,
-					sessionId: prefixSessionId,
+					runtime.turnIndex,
+					prefixSessionId,
 					sessionRole,
-					turnIndex: runtime.turnIndex,
-					injectionEnabled: effectiveInjectionEnabled,
-					injectionSources,
-					injectedMessages,
-					placement,
-					prefixObservation,
 					dbg,
-				});
-			};
-			try {
-				const cwd = ctx.cwd ?? process.cwd();
-
-				if (!effectiveInjectionEnabled) {
-					logContextObservation(existingMessages, "none", [], []);
-					return;
-				}
-
-				const turnEndFindings = consumeTurnEndFindings(cacheManager, cwd, runtime);
-				const sessionGuidance = consumeSessionStartGuidance(cacheManager, cwd);
-				const testFindings = consumeTestFindings(cacheManager, cwd, runtime);
-				const agentNudge = consumeAgentNudge(dbg);
-				const sourceMessages = [
-					{
-						source: "session-guidance" as const,
-						messages: sessionGuidance?.messages ?? [],
-					},
-					{
-						source: "turn-findings" as const,
-						messages: turnEndFindings?.messages ?? [],
-					},
-					{
-						source: "test-findings" as const,
-						messages: testFindings?.messages ?? [],
-					},
-					{
-						source: "agent-nudge" as const,
-						messages: agentNudge?.messages ?? [],
-					},
-				].filter((source) => source.messages.length > 0);
-				const injectedMessages = sourceMessages.flatMap(
-					(source) => source.messages,
 				);
-				const injectionSources = sourceMessages.map((source) => source.source);
-				if (injectedMessages.length === 0) {
-					logContextObservation(existingMessages, "none", [], []);
-					return;
-				}
+				const effectiveInjectionEnabled =
+					lensEnabled && contextInjectionEnabled;
+				let telemetryLogged = false;
+				const logContextObservation = (
+					resultMessages: Array<{ role: string; content: unknown }>,
+					placement: "prepend" | "insert-before-final" | "append" | "none",
+					// #1071: the per-source slices ARE the telemetry input. The source
+					// name list and the flat message list are both derived from them
+					// inside observeCacheContext, so this call site cannot report a
+					// source that contributed nothing.
+					injectionSlices: ReadonlyArray<CacheContextInjectionSlice>,
+				) => {
+					if (telemetryLogged) return;
+					telemetryLogged = true;
+					observeCacheContext({
+						existingMessages,
+						resultMessages,
+						sessionId: prefixSessionId,
+						sessionRole,
+						turnIndex: runtime.turnIndex,
+						injectionEnabled: effectiveInjectionEnabled,
+						injectionSlices,
+						placement,
+						dbg,
+					});
+				};
+				try {
+					const cwd = ctx.cwd ?? process.cwd();
 
-				// Empty transcript (no turns yet): fall back to prepend semantics —
-				// there is no trailing user message to sit before, and we must never
-				// emit empty input (fe0ed5da: OpenAI Responses fails on empty input).
-				if (existingMessages.length === 0) {
-					const resultMessages = [...injectedMessages];
+					if (!effectiveInjectionEnabled) {
+						logContextObservation(existingMessages, "none", []);
+						return;
+					}
+
+					const turnEndFindings = consumeTurnEndFindings(
+						cacheManager,
+						cwd,
+						runtime,
+					);
+					const sessionGuidance = consumeSessionStartGuidance(
+						cacheManager,
+						cwd,
+					);
+					const testFindings = consumeTestFindings(cacheManager, cwd, runtime);
+					const agentNudge = consumeAgentNudge(dbg);
+					const sourceMessages = [
+						{
+							source: "session-guidance" as const,
+							messages: sessionGuidance?.messages ?? [],
+						},
+						{
+							source: "turn-findings" as const,
+							messages: turnEndFindings?.messages ?? [],
+						},
+						{
+							source: "test-findings" as const,
+							messages: testFindings?.messages ?? [],
+						},
+						{
+							source: "agent-nudge" as const,
+							messages: agentNudge?.messages ?? [],
+						},
+					].filter((source) => source.messages.length > 0);
+					const injectedMessages = sourceMessages.flatMap(
+						(source) => source.messages,
+					);
+					if (injectedMessages.length === 0) {
+						logContextObservation(existingMessages, "none", []);
+						return;
+					}
+
+					// Empty transcript (no turns yet): fall back to prepend semantics —
+					// there is no trailing user message to sit before, and we must never
+					// emit empty input (fe0ed5da: OpenAI Responses fails on empty input).
+					if (existingMessages.length === 0) {
+						const resultMessages = [...injectedMessages];
+						logContextObservation(resultMessages, "prepend", sourceMessages);
+						return { messages: resultMessages };
+					}
+
+					const lastMessage = existingMessages[existingMessages.length - 1];
+
+					// Mid-loop the tail can be a tool_result (or assistant/tool) message;
+					// inserting before it would break tool_use↔tool_result adjacency. Only
+					// splice before the last message when it is a plain user prompt.
+					if (!isPlainUserPrompt(lastMessage)) {
+						// Append after the whole transcript — pure append preserves the
+						// adjacency AND leaves the entire prior transcript as an untouched
+						// cache prefix.
+						const resultMessages = [...existingMessages, ...injectedMessages];
+						logContextObservation(resultMessages, "append", sourceMessages);
+						return { messages: resultMessages };
+					}
+
+					// Insert the injected block just before the final message so
+					// messages[0] stays stable and the real user prompt stays trailing.
+					const resultMessages = [
+						...existingMessages.slice(0, -1),
+						...injectedMessages,
+						lastMessage,
+					];
 					logContextObservation(
 						resultMessages,
-						"prepend",
-						injectionSources,
-						injectedMessages,
+						"insert-before-final",
+						sourceMessages,
 					);
 					return { messages: resultMessages };
+				} catch (err) {
+					// The stale-ctx class has ONE classifier and one record, in
+					// clients/session-event-guard.ts. Rethrow BEFORE the fallback
+					// observation (#1929): a session that no longer exists must not
+					// leave a "no injection" cache-context row behind, and the
+					// wrapper's own record is the accurate one.
+					if (isStaleExtensionCtxError(err)) throw err;
+					if (!telemetryLogged)
+						logContextObservation(existingMessages, "none", []);
+					dbg(`context event error: ${err}`);
 				}
-
-				const lastMessage = existingMessages[existingMessages.length - 1];
-
-				// Mid-loop the tail can be a tool_result (or assistant/tool) message;
-				// inserting before it would break tool_use↔tool_result adjacency. Only
-				// splice before the last message when it is a plain user prompt.
-				if (!isPlainUserPrompt(lastMessage)) {
-					// Append after the whole transcript — pure append preserves the
-					// adjacency AND leaves the entire prior transcript as an untouched
-					// cache prefix.
-					const resultMessages = [...existingMessages, ...injectedMessages];
-					logContextObservation(
-						resultMessages,
-						"append",
-						injectionSources,
-						injectedMessages,
-					);
-					return { messages: resultMessages };
-				}
-
-				// Insert the injected block just before the final message so
-				// messages[0] stays stable and the real user prompt stays trailing.
-				const resultMessages = [
-					...existingMessages.slice(0, -1),
-					...injectedMessages,
-					lastMessage,
-				];
-				logContextObservation(
-					resultMessages,
-					"insert-before-final",
-					injectionSources,
-					injectedMessages,
-				);
-				return { messages: resultMessages };
-			} catch (err) {
-				if (!telemetryLogged)
-					logContextObservation(existingMessages, "none", [], []);
-				dbg(`context event error: ${err}`);
-			}
-		},
+			},
+			{
+				dbg,
+				// #1929: a dead ctx means pi-lens contributes NOTHING to this
+				// request. `undefined` is that answer, and is what the four
+				// non-injecting paths above already return, so the host keeps its
+				// own message list byte-for-byte. Never a half-built injection: the
+				// consume* calls that feed one have side effects and may not have run.
+				onStaleResult: () => undefined,
+			},
+		),
 	);
 }
 

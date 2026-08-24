@@ -95,7 +95,7 @@ not clean**:
 | **`unconfirmed`** | A push-only/silent-on-clean LSP server returned empty; emptiness could not be *proven* clean. | Don't report the file as clean. |
 | **`cold` (not applicable / unavailable this run)** | A heavyweight analyzer (knip/jscpd/madge/gitleaks/govulncheck/trivy/dead-code) didn't contribute. | Don't fold its silence into "no issues." |
 | **`partial` / `truncated` / file-cap** | A walk/scan hit a file cap or coverage limit; results are a partial view. | Don't treat as whole-project coverage. |
-| **`stale`** | A cached diagnostic's file changed on disk since the scan. | Don't trust the stale value. |
+| **`stale`** | A cached diagnostic's file changed on disk since the scan. Secrets findings demote to `🔑 ACTION NEEDED` advisory with the line number withheld, never silently dropped; govulncheck keeps the CVE and drops only the cached line. | Don't trust the stale value or its line number. Re-scan to confirm. |
 | **cold-LSP `0` (e.g. MCP `fresh` mode)** | LSP cold-spawned and under-reported; a `0` carries an explicit `lsp` signal. | Don't read the `0` as "clean." |
 | **unsafe root** | cwd resolved at/above `$HOME`, so scanners were skipped. | Re-run from inside the project. |
 
@@ -113,6 +113,11 @@ is blocking when `semantic === "blocking"`, else it falls back to severity):
 
 - **🔴 Blocking** — a hard stop. Secrets, CRITICAL CVEs, unresolved errors, etc.
   **Resolve every blocker before you consider the work complete.**
+- **🔑 ACTION NEEDED** — a third tier, distinct from both: a secrets finding
+  whose cached file changed since the scan. It does not gate commit-guard like
+  a blocker does, but it is not "no action required" like an advisory either —
+  the finding is unverified, not dismissed. Re-run a secrets scan to confirm
+  or clear it.
 - **Advisory** — informational (🟡 warnings, 📜 license notes, style/hygiene).
   Address when relevant; they do not gate completion.
 

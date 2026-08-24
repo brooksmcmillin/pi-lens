@@ -7,12 +7,14 @@ import {
 	relocateEditRange,
 	stripOldTextTrailingWhitespace,
 	tryCorrectIndentationMismatch,
-} from "../../clients/read-guard-tool-lines.ts";
+} from "../../clients/read-guard-tool-lines.js";
 import { logReadGuardEvent } from "../../clients/read-guard-logger.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
 vi.mock("../../clients/read-guard-logger.js", async (importOriginal) => ({
-	...(await importOriginal<typeof import("../../clients/read-guard-logger.js")>()),
+	...(await importOriginal<
+		typeof import("../../clients/read-guard-logger.js")
+	>()),
 	logReadGuardEvent: vi.fn(),
 }));
 
@@ -374,7 +376,10 @@ describe("read-guard tool line helpers", () => {
 		try {
 			const filePath = path.join(env.tmpDir, "file.ts");
 			const block = ["  return value;", ""];
-			fs.writeFileSync(filePath, block.concat(block, block, block, block, block, block).join("\n"));
+			fs.writeFileSync(
+				filePath,
+				block.concat(block, block, block, block, block, block).join("\n"),
+			);
 
 			const event = {
 				toolName: "edit",
@@ -453,9 +458,9 @@ describe("read-guard tool line helpers", () => {
 			);
 
 			expect(result.preflightError).toBeDefined();
-			const summaryCall = vi.mocked(logReadGuardEvent).mock.calls.find(
-				([entry]) => entry.event === "edit_batch_summary",
-			);
+			const summaryCall = vi
+				.mocked(logReadGuardEvent)
+				.mock.calls.find(([entry]) => entry.event === "edit_batch_summary");
 			expect(summaryCall?.[0]).toMatchObject({
 				correlationId: "host-call-7",
 				metadata: {
@@ -947,10 +952,9 @@ describe("tryCorrectIndentationMismatch — interior whitespace drift (Tier B)",
 			fs.writeFileSync(filePath, `${body}\n`);
 			// oldText collapsed the interior spacing the earlier tiers can't bridge
 			// (they only trim the outer edges), and used 4-space outer indent.
-			const oldText = [
-				"    const sum = a+b;",
-				"    const product = a*b;",
-			].join("\n");
+			const oldText = ["    const sum = a+b;", "    const product = a*b;"].join(
+				"\n",
+			);
 			const result = tryCorrectIndentationMismatch(oldText, filePath);
 			expect(result).toBe(
 				["\tconst sum = a + b;", "\tconst product = a * b;"].join("\n"),
@@ -1043,30 +1047,23 @@ describe("tryCorrectIndentationMismatch — Unicode punctuation drift (Tier C)",
 	}
 
 	it("recovers the verbatim span when oldText uses smart double quotes", () => {
-		const oldText = [
-			"const label = “open”;",
-			"const total = a - b;",
-		].join("\n");
+		const oldText = ["const label = “open”;", "const total = a - b;"].join(
+			"\n",
+		);
 		expect(recover(oldText)).toBe(
 			['const label = "open";', "const total = a - b;"].join("\n"),
 		);
 	});
 
 	it("recovers the verbatim span when oldText uses an em-dash for a hyphen", () => {
-		const oldText = [
-			"const total = a — b;",
-			"const note = a + b;",
-		].join("\n");
+		const oldText = ["const total = a — b;", "const note = a + b;"].join("\n");
 		expect(recover(oldText)).toBe(
 			["const total = a - b;", "const note = a + b;"].join("\n"),
 		);
 	});
 
 	it("recovers the verbatim span when oldText uses a non-breaking space", () => {
-		const oldText = [
-			"const total = a - b;",
-			"const note = a + b;",
-		].join("\n");
+		const oldText = ["const total = a - b;", "const note = a + b;"].join("\n");
 		expect(recover(oldText)).toBe(
 			["const total = a - b;", "const note = a + b;"].join("\n"),
 		);
@@ -1093,10 +1090,9 @@ describe("tryCorrectIndentationMismatch — Unicode punctuation drift (Tier C)",
 				"const note = a + b;",
 			].join("\n");
 			fs.writeFileSync(filePath, `${body}\n`);
-			const oldText = [
-				"const total = a — b;",
-				"const note = a + b;",
-			].join("\n");
+			const oldText = ["const total = a — b;", "const note = a + b;"].join(
+				"\n",
+			);
 			expect(tryCorrectIndentationMismatch(oldText, filePath)).toBeUndefined();
 		} finally {
 			env.cleanup();
@@ -1223,8 +1219,12 @@ describe("getTouchedLinesForGuard — did-you-mean suggestions", () => {
 			const filePath = path.join(env.tmpDir, "crlf.md");
 			// BOM + a lone CR before the target line: both shift line indices in
 			// the match space relative to a naive raw split.
-			const target = "const findModelByHint = (名前：string) => 登録.参照(名前);";
-			fs.writeFileSync(filePath, `\ufeffheader\rsecond line\n${target}\ntail\n`);
+			const target =
+				"const findModelByHint = (名前：string) => 登録.参照(名前);";
+			fs.writeFileSync(
+				filePath,
+				`\ufeffheader\rsecond line\n${target}\ntail\n`,
+			);
 			const result = getTouchedLinesForGuard(
 				{
 					toolName: "edit",

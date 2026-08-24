@@ -19,36 +19,31 @@ describe("isZizmorIgnoreSuppressed (#971)", () => {
 	it("`# zizmor: ignore[artipacked]` suppresses a checkout-only job's finding", () => {
 		const content =
 			"steps:\n  - uses: actions/checkout@11bd719 # zizmor: ignore[artipacked]\n";
-		expect(isZizmorIgnoreSuppressed(diag(1, "artipacked"), content)).toBe(
-			true,
-		);
+		expect(isZizmorIgnoreSuppressed(diag(1, "artipacked"), content)).toBe(true);
 	});
 
 	it("`# zizmor: ignore[adhoc-packages]` suppresses a local-tarball install", () => {
-		const content = 'run: npm install -g "$TARBALL" # zizmor: ignore[adhoc-packages]\n';
-		expect(
-			isZizmorIgnoreSuppressed(diag(0, "adhoc-packages"), content),
-		).toBe(true);
+		const content =
+			'run: npm install -g "$TARBALL" # zizmor: ignore[adhoc-packages]\n';
+		expect(isZizmorIgnoreSuppressed(diag(0, "adhoc-packages"), content)).toBe(
+			true,
+		);
 	});
 
 	it("only suppresses the named audit id, not an unrelated one", () => {
 		const content = "run: foo # zizmor: ignore[artipacked]\n";
-		expect(isZizmorIgnoreSuppressed(diag(0, "artipacked"), content)).toBe(
-			true,
+		expect(isZizmorIgnoreSuppressed(diag(0, "artipacked"), content)).toBe(true);
+		expect(isZizmorIgnoreSuppressed(diag(0, "adhoc-packages"), content)).toBe(
+			false,
 		);
-		expect(
-			isZizmorIgnoreSuppressed(diag(0, "adhoc-packages"), content),
-		).toBe(false);
 	});
 
 	it("supports comma-separated audit ids", () => {
 		const content = "run: foo # zizmor: ignore[artipacked, adhoc-packages]\n";
-		expect(isZizmorIgnoreSuppressed(diag(0, "artipacked"), content)).toBe(
+		expect(isZizmorIgnoreSuppressed(diag(0, "artipacked"), content)).toBe(true);
+		expect(isZizmorIgnoreSuppressed(diag(0, "adhoc-packages"), content)).toBe(
 			true,
 		);
-		expect(
-			isZizmorIgnoreSuppressed(diag(0, "adhoc-packages"), content),
-		).toBe(true);
 	});
 
 	it("does NOT suppress a finding on an unrelated line", () => {
@@ -59,9 +54,9 @@ describe("isZizmorIgnoreSuppressed (#971)", () => {
 	});
 
 	it("is a no-op with no zizmor ignore comment", () => {
-		const content = "run: npm install -g \"$TARBALL\"\n";
-		expect(
-			isZizmorIgnoreSuppressed(diag(0, "adhoc-packages"), content),
-		).toBe(false);
+		const content = 'run: npm install -g "$TARBALL"\n';
+		expect(isZizmorIgnoreSuppressed(diag(0, "adhoc-packages"), content)).toBe(
+			false,
+		);
 	});
 });

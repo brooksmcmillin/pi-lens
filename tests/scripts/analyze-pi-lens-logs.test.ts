@@ -70,7 +70,10 @@ describe("analyze-pi-lens-logs.mjs", () => {
 				status: "failed",
 				durationMs: 9000,
 				diagnosticCount: 1,
-				metadata: { failureKind: "server_error", failureMessage: "spawn ENOENT" },
+				metadata: {
+					failureKind: "server_error",
+					failureMessage: "spawn ENOENT",
+				},
 			},
 			// genuine infra failure (explicit)
 			{
@@ -133,7 +136,12 @@ describe("analyze-pi-lens-logs.mjs", () => {
 				phase: "lsp_workspace_diagnostics_progress",
 				filePath: "/proj/b",
 				durationMs: 10000,
-				metadata: { completed: 18, total: 120, timedOutFiles: 2, aborted: false },
+				metadata: {
+					completed: 18,
+					total: 120,
+					timedOutFiles: 2,
+					aborted: false,
+				},
 			},
 			{
 				type: "phase",
@@ -156,7 +164,11 @@ describe("analyze-pi-lens-logs.mjs", () => {
 			},
 			{ ts: NOW, event: "advisory_injected", metadata: { unsuppressed: 5 } },
 			{ ts: NOW, event: "lsp_file_checked", metadata: { lspSource: "fresh" } },
-			{ ts: NOW, event: "lsp_file_skipped", metadata: { reason: "no_lsp_support" } },
+			{
+				ts: NOW,
+				event: "lsp_file_skipped",
+				metadata: { reason: "no_lsp_support" },
+			},
 		]
 			.map((e) => JSON.stringify(e))
 			.join("\n");
@@ -175,7 +187,12 @@ describe("analyze-pi-lens-logs.mjs", () => {
 				truncated: false,
 				durationMs: 40,
 			},
-			{ ts: NOW, tool: "ast_grep_search", outcome: "no_matches", durationMs: 20 },
+			{
+				ts: NOW,
+				tool: "ast_grep_search",
+				outcome: "no_matches",
+				durationMs: 20,
+			},
 			{
 				ts: NOW,
 				tool: "ast_grep_replace",
@@ -309,7 +326,9 @@ describe("analyze-pi-lens-logs.mjs", () => {
 		const smell = report.smells.find((s: any) => s.id === "runner-failures");
 		// server_error + timeout = 2; the two found-errors are excluded.
 		expect(smell?.count).toBe(2);
-		const kinds = smell.examples.map((e: any) => e.metadata?.failureKind).sort();
+		const kinds = smell.examples
+			.map((e: any) => e.metadata?.failureKind)
+			.sort();
 		expect(kinds).toEqual(["server_error", "timeout"]);
 	});
 
@@ -341,6 +360,12 @@ describe("analyze-pi-lens-logs.mjs", () => {
 		expect(wd.timedOutFilesTotal).toBe(4);
 		expect(report.latency.phaseTimeouts.lsp_diagnostics_timeout).toBe(1);
 
+		// #1618: the /proj/a sweep's `lsp_workspace_diagnostics` line above has
+		// NO `unconfirmedByReason` field — vintage-attribution fallback buckets
+		// its 4 files under a distinctly-labeled "pre-#1618 build" reason
+		// instead of asserting they really were budget timeouts.
+		expect(wd.unconfirmedByReason).toEqual({ "budget (pre-#1618 build)": 4 });
+
 		const incomplete = report.smells.find(
 			(s: any) => s.id === "lsp-workspace-diagnostics-incomplete",
 		);
@@ -361,8 +386,12 @@ describe("analyze-pi-lens-logs.mjs", () => {
 		});
 
 		it("groups rule x model counts, bucketing unattributed entries as blank", () => {
-			const rows: { rule: string; model: string; total: number; autoFixed: number }[] =
-				report.worklog.byRuleModel;
+			const rows: {
+				rule: string;
+				model: string;
+				total: number;
+				autoFixed: number;
+			}[] = report.worklog.byRuleModel;
 			const attributed = rows.find(
 				(r) => r.rule === "no-unused-vars" && r.model === "claude-sonnet-4-5",
 			);
@@ -370,7 +399,9 @@ describe("analyze-pi-lens-logs.mjs", () => {
 			expect(attributed?.total).toBe(2);
 			expect(attributed?.autoFixed).toBe(1);
 
-			const blank = rows.find((r) => r.rule === "no-unused-vars" && r.model === "");
+			const blank = rows.find(
+				(r) => r.rule === "no-unused-vars" && r.model === "",
+			);
 			expect(blank).toBeDefined();
 			expect(blank?.total).toBe(1);
 			expect(blank?.autoFixed).toBe(1);
@@ -384,14 +415,20 @@ describe("analyze-pi-lens-logs.mjs", () => {
 
 		it("rolls up totals by model and by provider, with an (unknown) bucket", () => {
 			const byModel = Object.fromEntries(
-				report.worklog.byModel.map((x: { key: string; count: number }) => [x.key, x.count]),
+				report.worklog.byModel.map((x: { key: string; count: number }) => [
+					x.key,
+					x.count,
+				]),
 			);
 			expect(byModel["claude-sonnet-4-5"]).toBe(2);
 			expect(byModel["gpt-5"]).toBe(1);
 			expect(byModel["(unknown)"]).toBe(1);
 
 			const byProvider = Object.fromEntries(
-				report.worklog.byProvider.map((x: { key: string; count: number }) => [x.key, x.count]),
+				report.worklog.byProvider.map((x: { key: string; count: number }) => [
+					x.key,
+					x.count,
+				]),
 			);
 			expect(byProvider.anthropic).toBe(2);
 			expect(byProvider.openai).toBe(1);
@@ -407,5 +444,68 @@ describe("analyze-pi-lens-logs.mjs", () => {
 		);
 		expect(smell?.count).toBe(1);
 		expect(smell.examples[0].errorKind).toBe("multiple_ast_nodes");
+	});
+});
+
+// #1618 review round 5: the forensics tool that FOUND #1618 read the flat
+// `timedOutFiles` count and reported every unconfirmed file as "hit the
+// per-file budget" — 81 of the 111 it counted were actually
+// service-destroyed. This isolated fixture (a post-#1618-build log line
+// carrying the new `unconfirmedByReason` field) proves the analyzer now
+// attributes by the real reason instead of collapsing everyone into budget.
+describe("analyze-pi-lens-logs.mjs — unconfirmedByReason attribution (#1618 R5)", () => {
+	let root: string;
+	let report: any;
+
+	beforeAll(() => {
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-loganalyze-1618-"));
+		const latency = [
+			{
+				type: "phase",
+				ts: NOW,
+				phase: "lsp_workspace_diagnostics",
+				filePath: "/proj/c",
+				durationMs: 2000,
+				metadata: {
+					filesChecked: 225,
+					diagnosticCount: 5,
+					timedOutFiles: 111,
+					unconfirmedByReason: {
+						service_destroyed: 81,
+						coverage_gap: 28,
+						budget: 0,
+						inconclusive: 0,
+						error: 2,
+					},
+				},
+			},
+		]
+			.map((e) => JSON.stringify(e))
+			.join("\n");
+		fs.writeFileSync(path.join(root, "latency.log"), `${latency}\n`);
+		report = runReport(root);
+	});
+
+	afterAll(() => removeTempDirSync(root));
+
+	it("attributes the real per-reason breakdown instead of the flat budget count", () => {
+		const wd = report.latency.workspaceDiagnostics;
+		expect(wd.timedOutFilesTotal).toBe(111);
+		// The whole point: this is NOT "budget (pre-#1618 build)": 111 — the
+		// per-reason field is present, so it's read directly, and a zero-count
+		// reason contributes nothing (never a manufactured "budget: 0" that
+		// could read as though budget exhaustion happened at all).
+		expect(wd.unconfirmedByReason).toEqual({
+			service_destroyed: 81,
+			coverage_gap: 28,
+			error: 2,
+		});
+		expect(wd.unconfirmedByReason["budget (pre-#1618 build)"]).toBeUndefined();
+
+		const smell = report.smells.find(
+			(s: any) => s.id === "lsp-workspace-file-timeouts",
+		);
+		expect(smell?.description).toContain("service_destroyed=81");
+		expect(smell?.description).not.toContain("hit the per-file budget");
 	});
 });

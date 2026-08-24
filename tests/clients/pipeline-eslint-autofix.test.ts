@@ -34,8 +34,14 @@ describe("runAutofix — eslint single-spawn --fix (#453)", () => {
 
 	function deps() {
 		return {
-			biomeClient: { isSupportedFile: () => false, ensureAvailable: async () => false },
-			ruffClient: { isPythonFile: () => false, ensureAvailable: async () => false },
+			biomeClient: {
+				isSupportedFile: () => false,
+				ensureAvailable: async () => false,
+			},
+			ruffClient: {
+				isPythonFile: () => false,
+				ensureAvailable: async () => false,
+			},
 			fixedThisTurn: new Set<string>(),
 		};
 	}

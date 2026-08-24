@@ -28,29 +28,33 @@ describe.skipIf(!enabled)("review-graph incremental micro-benchmark", () => {
 		removeTempDirSync(cwd);
 	});
 
-	it("logs single-file update latency without a CI timing assertion", {
-		timeout: 120_000,
-	}, async () => {
-		const changed = path.join(cwd, "src", "file0.ts");
-		let seq = 0;
-		const seqHint = {
-			projectSeq: () => seq,
-			getFilesChangedSince: () => [changed],
-		};
-		await buildOrUpdateGraph(cwd, [changed], new FactStore(), seqHint);
-		const samples: number[] = [];
-		for (let run = 0; run < RUNS; run++) {
-			seq++;
-			fs.appendFileSync(changed, `\n// benchmark edit ${run}\n`);
-			clearGraphCache();
-			const startedAt = performance.now();
+	it(
+		"logs single-file update latency without a CI timing assertion",
+		{
+			timeout: 120_000,
+		},
+		async () => {
+			const changed = path.join(cwd, "src", "file0.ts");
+			let seq = 0;
+			const seqHint = {
+				projectSeq: () => seq,
+				getFilesChangedSince: () => [changed],
+			};
 			await buildOrUpdateGraph(cwd, [changed], new FactStore(), seqHint);
-			samples.push(performance.now() - startedAt);
-		}
-		samples.sort((a, b) => a - b);
-		const median = samples[Math.floor(samples.length / 2)];
-		console.log(
-			`review-graph incremental ${FILE_COUNT} files: median=${median.toFixed(2)}ms samples=${samples.map((value) => value.toFixed(2)).join(",")}`,
-		);
-	});
+			const samples: number[] = [];
+			for (let run = 0; run < RUNS; run++) {
+				seq++;
+				fs.appendFileSync(changed, `\n// benchmark edit ${run}\n`);
+				clearGraphCache();
+				const startedAt = performance.now();
+				await buildOrUpdateGraph(cwd, [changed], new FactStore(), seqHint);
+				samples.push(performance.now() - startedAt);
+			}
+			samples.sort((a, b) => a - b);
+			const median = samples[Math.floor(samples.length / 2)];
+			console.log(
+				`review-graph incremental ${FILE_COUNT} files: median=${median.toFixed(2)}ms samples=${samples.map((value) => value.toFixed(2)).join(",")}`,
+			);
+		},
+	);
 });

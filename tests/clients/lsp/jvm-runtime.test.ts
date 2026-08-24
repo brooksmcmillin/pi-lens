@@ -66,7 +66,9 @@ vi.mock("node:fs", async (importOriginal) => {
 					options,
 				);
 			}
-			const error = new Error(`ENOENT: fenced for tests: ${base}`) as NodeJS.ErrnoException;
+			const error = new Error(
+				`ENOENT: fenced for tests: ${base}`,
+			) as NodeJS.ErrnoException;
 			error.code = "ENOENT";
 			throw error;
 		},
@@ -115,9 +117,8 @@ describe("jvm-runtime — JDK discovery (#241)", () => {
 	}
 
 	beforeEach(async () => {
-		const { _resetJvmRuntimeCacheForTests } = await import(
-			"../../../clients/lsp/jvm-runtime.js"
-		);
+		const { _resetJvmRuntimeCacheForTests } =
+			await import("../../../clients/lsp/jvm-runtime.js");
 		_resetJvmRuntimeCacheForTests();
 		safeSpawnAsync.mockReset();
 		// Passing `undefined` for the javaHome arg re-activates its
@@ -137,18 +138,16 @@ describe("jvm-runtime — JDK discovery (#241)", () => {
 	});
 
 	it("finds a JDK under a scanned root", async () => {
-		const { discoverJdkHome } = await import(
-			"../../../clients/lsp/jvm-runtime.js"
-		);
+		const { discoverJdkHome } =
+			await import("../../../clients/lsp/jvm-runtime.js");
 		const root = tmpDir();
 		const home = fakeJdk(root, "jdk-21.0.11.10-hotspot");
 		expect(discoverJdkHome([root], undefined)).toBe(home);
 	});
 
 	it("picks the highest version among several", async () => {
-		const { discoverJdkHome } = await import(
-			"../../../clients/lsp/jvm-runtime.js"
-		);
+		const { discoverJdkHome } =
+			await import("../../../clients/lsp/jvm-runtime.js");
 		const root = tmpDir();
 		fakeJdk(root, "jdk-17.0.9");
 		const newer = fakeJdk(root, "jdk-21.0.11");
@@ -157,9 +156,8 @@ describe("jvm-runtime — JDK discovery (#241)", () => {
 	});
 
 	it("ignores JDKs below the minimum major (17)", async () => {
-		const { discoverJdkHome } = await import(
-			"../../../clients/lsp/jvm-runtime.js"
-		);
+		const { discoverJdkHome } =
+			await import("../../../clients/lsp/jvm-runtime.js");
 		const root = tmpDir();
 		fakeJdk(root, "jdk1.8.0_402"); // legacy 8 — too old for jdtls
 		fakeJdk(root, "jdk-11.0.20"); // 11 — too old
@@ -167,9 +165,8 @@ describe("jvm-runtime — JDK discovery (#241)", () => {
 	});
 
 	it("honours an explicit JAVA_HOME over scanned roots", async () => {
-		const { discoverJdkHome } = await import(
-			"../../../clients/lsp/jvm-runtime.js"
-		);
+		const { discoverJdkHome } =
+			await import("../../../clients/lsp/jvm-runtime.js");
 		const root = tmpDir();
 		fakeJdk(root, "jdk-21.0.11");
 		const javaHomeRoot = tmpDir();
@@ -178,16 +175,14 @@ describe("jvm-runtime — JDK discovery (#241)", () => {
 	});
 
 	it("returns undefined when no JDK exists", async () => {
-		const { discoverJdkHome } = await import(
-			"../../../clients/lsp/jvm-runtime.js"
-		);
+		const { discoverJdkHome } =
+			await import("../../../clients/lsp/jvm-runtime.js");
 		expect(discoverJdkHome([tmpDir()], undefined)).toBeUndefined();
 	});
 
 	it("returns undefined when JAVA_HOME points at a non-JDK", async () => {
-		const { discoverJdkHome } = await import(
-			"../../../clients/lsp/jvm-runtime.js"
-		);
+		const { discoverJdkHome } =
+			await import("../../../clients/lsp/jvm-runtime.js");
 		const bogus = tmpDir(); // no bin/java
 		expect(discoverJdkHome([tmpDir()], bogus)).toBeUndefined();
 	});
@@ -205,9 +200,8 @@ describe("jvm-runtime — resolveJavaRuntimeEnv (#241)", () => {
 	}
 
 	beforeEach(async () => {
-		const { _resetJvmRuntimeCacheForTests } = await import(
-			"../../../clients/lsp/jvm-runtime.js"
-		);
+		const { _resetJvmRuntimeCacheForTests } =
+			await import("../../../clients/lsp/jvm-runtime.js");
 		_resetJvmRuntimeCacheForTests();
 		safeSpawnAsync.mockReset();
 		logLatencySpy.mockReset();
@@ -233,9 +227,8 @@ describe("jvm-runtime — resolveJavaRuntimeEnv (#241)", () => {
 		safeSpawnAsync.mockImplementation(async (cmd: string, args: string[]) =>
 			cmd === finder() && args[0] === "java" ? okResult : notFoundResult,
 		);
-		const { resolveJavaRuntimeEnv } = await import(
-			"../../../clients/lsp/jvm-runtime.js"
-		);
+		const { resolveJavaRuntimeEnv } =
+			await import("../../../clients/lsp/jvm-runtime.js");
 		expect(await resolveJavaRuntimeEnv()).toBeUndefined();
 	});
 
@@ -243,13 +236,16 @@ describe("jvm-runtime — resolveJavaRuntimeEnv (#241)", () => {
 		safeSpawnAsync.mockImplementation(async (cmd: string, args: string[]) =>
 			cmd === finder() && args[0] === "java" ? notFoundResult : notFoundResult,
 		);
-		const { resolveJavaRuntimeEnv } = await import(
-			"../../../clients/lsp/jvm-runtime.js"
-		);
+		const { resolveJavaRuntimeEnv } =
+			await import("../../../clients/lsp/jvm-runtime.js");
 		const home = path.join(tmpDir(), "jdk-21");
 		fs.mkdirSync(path.join(home, "bin"), { recursive: true });
 		fs.writeFileSync(
-			path.join(home, "bin", process.platform === "win32" ? "java.exe" : "java"),
+			path.join(
+				home,
+				"bin",
+				process.platform === "win32" ? "java.exe" : "java",
+			),
 			"",
 		);
 		// JAVA_HOME has top discovery priority, so this exercises the env overlay
@@ -267,9 +263,8 @@ describe("jvm-runtime — resolveJavaRuntimeEnv (#241)", () => {
 		safeSpawnAsync.mockImplementation(async (cmd: string, args: string[]) =>
 			cmd === finder() && args[0] === "java" ? okResult : notFoundResult,
 		);
-		const { resolveJavaRuntimeEnv } = await import(
-			"../../../clients/lsp/jvm-runtime.js"
-		);
+		const { resolveJavaRuntimeEnv } =
+			await import("../../../clients/lsp/jvm-runtime.js");
 		await resolveJavaRuntimeEnv();
 		await resolveJavaRuntimeEnv();
 		const javaProbes = safeSpawnAsync.mock.calls.filter(
@@ -306,9 +301,8 @@ describe("jvm-runtime — resolveJavaRuntimeEnv (#241)", () => {
 		safeSpawnAsync.mockImplementation(async (cmd: string, args: string[]) =>
 			cmd === finder() && args[0] === "java" ? timeoutResult : notFoundResult,
 		);
-		const { resolveJavaRuntimeEnv } = await import(
-			"../../../clients/lsp/jvm-runtime.js"
-		);
+		const { resolveJavaRuntimeEnv } =
+			await import("../../../clients/lsp/jvm-runtime.js");
 
 		expect(await resolveJavaRuntimeEnv()).toBeUndefined();
 
@@ -351,9 +345,8 @@ describe("jvm-runtime — resolveJavaRuntimeEnv (#241)", () => {
 		safeSpawnAsync.mockImplementation(async (cmd: string, args: string[]) =>
 			cmd === finder() && args[0] === "java" ? notFoundResult : notFoundResult,
 		);
-		const { resolveJavaRuntimeEnv } = await import(
-			"../../../clients/lsp/jvm-runtime.js"
-		);
+		const { resolveJavaRuntimeEnv } =
+			await import("../../../clients/lsp/jvm-runtime.js");
 
 		expect(await resolveJavaRuntimeEnv()).toBeUndefined();
 		expect(await resolveJavaRuntimeEnv()).toBeUndefined();
@@ -373,9 +366,8 @@ describe("jvm-runtime — resolveJavaRuntimeEnv (#241)", () => {
 			}
 			return notFoundResult;
 		});
-		const { resolveJavaRuntimeEnv } = await import(
-			"../../../clients/lsp/jvm-runtime.js"
-		);
+		const { resolveJavaRuntimeEnv } =
+			await import("../../../clients/lsp/jvm-runtime.js");
 
 		// First call: probe stalls, no JDK discoverable — falls back to
 		// undefined (no override) for THIS call, but must not cache it.
@@ -426,9 +418,8 @@ describe("jvm-runtime — resolveJavaRuntimeEnv (#241)", () => {
 			}
 			return notFoundResult;
 		});
-		const { resolveJavaRuntimeEnv } = await import(
-			"../../../clients/lsp/jvm-runtime.js"
-		);
+		const { resolveJavaRuntimeEnv } =
+			await import("../../../clients/lsp/jvm-runtime.js");
 
 		const results = await Promise.all([
 			resolveJavaRuntimeEnv(),

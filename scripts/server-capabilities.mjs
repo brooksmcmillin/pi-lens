@@ -23,13 +23,18 @@ import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { mergeServerCapabilitiesDoc } from "./lib/md-matrix.mjs";
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const repoRoot = path.resolve(
+	path.dirname(fileURLToPath(import.meta.url)),
+	"..",
+);
 const argv = process.argv.slice(2);
 const install = argv.includes("--install");
 const langs = argv.filter((a) => !a.startsWith("--"));
 const imp = (rel) => import(pathToFileURL(path.join(repoRoot, rel)).href);
 const { LSP_FIXTURES } = await imp("scripts/smoke-tools.mjs");
-const { getLSPService, resetLSPService } = await imp("dist/clients/lsp/index.js");
+const { getLSPService, resetLSPService } = await imp(
+	"dist/clients/lsp/index.js",
+);
 const { initLSPConfig } = await imp("dist/clients/lsp/config.js");
 let ensureTool;
 if (install) ({ ensureTool } = await imp("dist/clients/installer/index.js"));
@@ -103,7 +108,8 @@ for (const fx of fixtures) {
 		// All alive clients (primary + auxiliary + alternates), merged first-wins —
 		// the warm service keeps every spawned client alive across fixtures.
 		const allSnaps = await lsp.getCapabilitySnapshots();
-		for (const s of allSnaps) if (!caps.has(s.serverId)) caps.set(s.serverId, s);
+		for (const s of allSnaps)
+			if (!caps.has(s.serverId)) caps.set(s.serverId, s);
 		console.error(
 			`[${fx.lang}] file-servers=${fileSnaps.map((s) => s.serverId).join(",") || "(none)"} total=${caps.size}`,
 		);
@@ -180,7 +186,9 @@ if (withCmds.length) {
 	for (const s of withCmds) {
 		const cmds = s.advertisedCommands.slice(0, 40).join(", ");
 		const more = s.advertisedCommands.length > 40 ? ", …" : "";
-		lines.push(`- **${s.serverId}** (${s.advertisedCommands.length}): ${cmds}${more}`);
+		lines.push(
+			`- **${s.serverId}** (${s.advertisedCommands.length}): ${cmds}${more}`,
+		);
 	}
 }
 if (unavailable.size) {
@@ -211,7 +219,10 @@ let output = fresh;
 try {
 	if (fs.existsSync(docPath)) {
 		const prior = fs.readFileSync(docPath, "utf8");
-		const { text: merged, preservedCount } = mergeServerCapabilitiesDoc(prior, fresh);
+		const { text: merged, preservedCount } = mergeServerCapabilitiesDoc(
+			prior,
+			fresh,
+		);
 		output = merged;
 		if (preservedCount > 0) {
 			console.error(

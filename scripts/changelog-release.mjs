@@ -18,29 +18,33 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const PKG_PATH = join(__dirname, "..", "package.json");
 
 function parseArgs(argv) {
-  const args = { version: undefined, date: undefined };
-  for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i];
-    if (arg === "--date") args.date = argv[++i];
-    else if (!args.version) args.version = arg;
-  }
-  return args;
+	const args = { version: undefined, date: undefined };
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i];
+		if (arg === "--date") args.date = argv[++i];
+		else if (!args.version) args.version = arg;
+	}
+	return args;
 }
 
 function main() {
-  const args = parseArgs(process.argv.slice(2));
-  const version = args.version ?? JSON.parse(readFileSync(PKG_PATH, "utf8")).version;
-  const date = args.date ?? new Date().toISOString().slice(0, 10);
+	const args = parseArgs(process.argv.slice(2));
+	const version =
+		args.version ?? JSON.parse(readFileSync(PKG_PATH, "utf8")).version;
+	const date = args.date ?? new Date().toISOString().slice(0, 10);
 
-  try {
-    const result = rollupChangelog(version, { rootDir: join(__dirname, ".."), date });
-    console.log(
-      `Rolled [Unreleased] and ${result.files.length} per-entry changelog file${result.files.length === 1 ? "" : "s"} into [${version}] - ${date}.`,
-    );
-  } catch (error) {
-    console.error(String(error.message || error));
-    process.exit(1);
-  }
+	try {
+		const result = rollupChangelog(version, {
+			rootDir: join(__dirname, ".."),
+			date,
+		});
+		console.log(
+			`Rolled [Unreleased] and ${result.files.length} per-entry changelog file${result.files.length === 1 ? "" : "s"} into [${version}] - ${date}.`,
+		);
+	} catch (error) {
+		console.error(String(error.message || error));
+		process.exit(1);
+	}
 }
 
 main();

@@ -84,10 +84,17 @@ describe("shared lint/autofix config-args builders (#1247)", () => {
 			]);
 		});
 
-		it("prefers the user's biome.json over the package fallback", () => {
+		// #1731 discipline A: `--config-path` pins biome's config resolution to
+		// ONE file, so passing it even when the project ships its own
+		// `biome.json` blocked biome's own nested-config resolution (a
+		// monorepo package under `cwd` with its own `biome.json` could never
+		// extend/override the root config). No flag at all lets biome discover
+		// it unaided — the same "omit the flag" shape `ruffConfigArgs` and
+		// `markdownlintConfigArgs` already use above.
+		it("passes no flag at all when the project ships its own biome.json (#1731)", () => {
 			const userConfig = path.join(tmpDir, "biome.json");
 			fs.writeFileSync(userConfig, "{}");
-			expect(biomeConfigArgs(tmpDir)).toEqual([`--config-path=${userConfig}`]);
+			expect(biomeConfigArgs(tmpDir)).toEqual([]);
 		});
 	});
 });

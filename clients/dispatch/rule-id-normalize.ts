@@ -37,7 +37,9 @@ const bundledCodeRabbitRules = getAstGrepRuleSources().find(
 );
 const RULE_ID_LANGUAGE_SUFFIXES = new Set(["js"]);
 if (bundledCodeRabbitRules) {
-	for (const suffix of deriveRuleIdLanguageSuffixes(bundledCodeRabbitRules.dir)) {
+	for (const suffix of deriveRuleIdLanguageSuffixes(
+		bundledCodeRabbitRules.dir,
+	)) {
 		RULE_ID_LANGUAGE_SUFFIXES.add(suffix);
 	}
 }

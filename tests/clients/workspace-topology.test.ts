@@ -97,7 +97,9 @@ describe("getDirectoryMarkers — marker index correctness", () => {
 	});
 
 	it("tolerates a directory that does not exist", () => {
-		const markers = getDirectoryMarkers(path.join(root, "does", "not", "exist"));
+		const markers = getDirectoryMarkers(
+			path.join(root, "does", "not", "exist"),
+		);
 		expect(markers.piLensConfigPath).toBeUndefined();
 		expect(markers.dirMtimeMs).toBe(-1);
 	});
@@ -164,7 +166,9 @@ describe("findNearestDirWithMarker / findGoverningTsconfigDir", () => {
 	it("returns undefined when no ancestor carries the marker", () => {
 		const sub = path.join(root, "src", "lib");
 		fs.mkdirSync(sub, { recursive: true });
-		expect(findGoverningTsconfigDir(sub, "/nonexistent-home-zzz")).toBeUndefined();
+		expect(
+			findGoverningTsconfigDir(sub, "/nonexistent-home-zzz"),
+		).toBeUndefined();
 	});
 
 	it("never resolves a marker at or above the home-dir ceiling", () => {
@@ -251,7 +255,11 @@ describe("findNearestDirWithAnyBasename (#807)", () => {
 		const sub = path.join(root, "apps", "svc");
 		fs.mkdirSync(sub, { recursive: true });
 		expect(
-			findNearestDirWithAnyBasename(sub, ["Cargo.toml"], "/nonexistent-home-zzz"),
+			findNearestDirWithAnyBasename(
+				sub,
+				["Cargo.toml"],
+				"/nonexistent-home-zzz",
+			),
 		).toBeUndefined();
 	});
 
@@ -280,7 +288,9 @@ describe("findNearestDirWithAnyBasename (#807)", () => {
 	it("returns undefined immediately for an empty basenames list", () => {
 		const sub = path.join(root, "src");
 		fs.mkdirSync(sub, { recursive: true });
-		expect(findNearestDirWithAnyBasename(sub, [], "/nonexistent-home-zzz")).toBeUndefined();
+		expect(
+			findNearestDirWithAnyBasename(sub, [], "/nonexistent-home-zzz"),
+		).toBeUndefined();
 	});
 
 	it("shares the per-directory readdir cache with findNearestDirWithMarker (no re-listing)", () => {
@@ -293,7 +303,11 @@ describe("findNearestDirWithAnyBasename (#807)", () => {
 
 		vi.mocked(fs.readdirSync).mockClear();
 		expect(
-			findNearestDirWithAnyBasename(sub, ["tsconfig.json"], "/nonexistent-home-zzz"),
+			findNearestDirWithAnyBasename(
+				sub,
+				["tsconfig.json"],
+				"/nonexistent-home-zzz",
+			),
 		).toBe(root);
 		// Same directories, same cache — no fresh readdir needed.
 		expect(fs.readdirSync).not.toHaveBeenCalled();
@@ -388,7 +402,8 @@ describe("workspace-topology Tier-2 idle recovery (#1389)", () => {
 			expect(fs.readdirSync).toHaveBeenCalledTimes(1);
 		} finally {
 			vi.useRealTimers();
-			if (previous === undefined) delete process.env.PI_LENS_WORKSPACE_TOPOLOGY_IDLE_EVICT_MS;
+			if (previous === undefined)
+				delete process.env.PI_LENS_WORKSPACE_TOPOLOGY_IDLE_EVICT_MS;
 			else process.env.PI_LENS_WORKSPACE_TOPOLOGY_IDLE_EVICT_MS = previous;
 		}
 	});

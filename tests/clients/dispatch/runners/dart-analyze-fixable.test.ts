@@ -43,7 +43,8 @@ describe("parseDartMachineOutput — fixable propagation (#112 slice)", () => {
 				file: "lib/main.dart",
 				line: 8,
 				col: 1,
-				message: "Prefer single quotes where they won't require escape sequences.",
+				message:
+					"Prefer single quotes where they won't require escape sequences.",
 			}),
 			dartLine({
 				severity: "WARNING",

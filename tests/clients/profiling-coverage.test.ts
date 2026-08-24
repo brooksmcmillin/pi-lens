@@ -57,7 +57,10 @@ import {
 } from "../support/v8-coverage.js";
 import { removeTempDirSync } from "./test-utils.js";
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+const repoRoot = path.resolve(
+	path.dirname(fileURLToPath(import.meta.url)),
+	"../..",
+);
 const TREE_SIZE = 400;
 
 /** Compiled in-place clients the walk/profile workload must reach. */
@@ -85,7 +88,9 @@ const MIN_FILES_TOUCHED = HOT_PATH.length;
  * `clients/path-utils.js`: see the file header — platform-branched, so a
  * Windows-measured absolute floor does not hold on Linux CI.
  */
-const FLOOR_EXEMPT = new Set<(typeof HOT_PATH)[number]>(["clients/path-utils.js"]);
+const FLOOR_EXEMPT = new Set<(typeof HOT_PATH)[number]>([
+	"clients/path-utils.js",
+]);
 
 /**
  * Absolute per-module function-count floors (#1521), measured against a
@@ -100,7 +105,10 @@ const FLOOR_EXEMPT = new Set<(typeof HOT_PATH)[number]>(["clients/path-utils.js"
  * enough that dropping even one meaningfully-sized module's function trips
  * its own floor instead of hiding in an aggregate.
  */
-const MIN_FUNCTIONS_HIT: Record<Exclude<(typeof HOT_PATH)[number], "clients/path-utils.js">, number> = {
+const MIN_FUNCTIONS_HIT: Record<
+	Exclude<(typeof HOT_PATH)[number], "clients/path-utils.js">,
+	number
+> = {
 	"clients/file-kinds.js": 2,
 	"clients/file-utils.js": 29,
 	"clients/generated-artifacts.js": 16,
@@ -119,15 +127,21 @@ const MIN_FUNCTIONS_HIT: Record<Exclude<(typeof HOT_PATH)[number], "clients/path
  */
 function assertFloorCoverageIsExhaustive(): void {
 	const floored = new Set(Object.keys(MIN_FUNCTIONS_HIT));
-	const uncovered = HOT_PATH.filter((file) => !floored.has(file) && !FLOOR_EXEMPT.has(file));
+	const uncovered = HOT_PATH.filter(
+		(file) => !floored.has(file) && !FLOOR_EXEMPT.has(file),
+	);
 	if (uncovered.length > 0) {
 		throw new Error(
 			`HOT_PATH entries with neither a MIN_FUNCTIONS_HIT floor nor a FLOOR_EXEMPT entry: ${uncovered.join(", ")}`,
 		);
 	}
-	const both = HOT_PATH.filter((file) => floored.has(file) && FLOOR_EXEMPT.has(file));
+	const both = HOT_PATH.filter(
+		(file) => floored.has(file) && FLOOR_EXEMPT.has(file),
+	);
 	if (both.length > 0) {
-		throw new Error(`HOT_PATH entries both floored and exempt (pick one): ${both.join(", ")}`);
+		throw new Error(
+			`HOT_PATH entries both floored and exempt (pick one): ${both.join(", ")}`,
+		);
 	}
 }
 assertFloorCoverageIsExhaustive();
@@ -166,7 +180,9 @@ const MUST_EXECUTE_FUNCTIONS: Record<string, readonly string[]> = {
 let tmpDir: string;
 
 beforeAll(() => {
-	tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-profiling-coverage-"));
+	tmpDir = fs.mkdtempSync(
+		path.join(os.tmpdir(), "pi-lens-profiling-coverage-"),
+	);
 	generateSourceTree(tmpDir, TREE_SIZE);
 }, 60_000);
 
@@ -187,7 +203,10 @@ describe(`profiling coverage of walk/profile hot path (~${TREE_SIZE} files)`, ()
 				const syncFiles = collectSourceFiles(tmpDir);
 				const asyncFiles = await collectSourceFilesAsync(tmpDir);
 				const profile = await detectProjectLanguageProfileAsync(tmpDir);
-				const counted = await countSourceFilesWithinLimitAsync(tmpDir, 1_000_000);
+				const counted = await countSourceFilesWithinLimitAsync(
+					tmpDir,
+					1_000_000,
+				);
 				return { syncFiles, asyncFiles, profile, counted };
 			});
 
@@ -201,7 +220,10 @@ describe(`profiling coverage of walk/profile hot path (~${TREE_SIZE} files)`, ()
 				include: HOT_PATH,
 			});
 			const missing = HOT_PATH.filter(
-				(file) => !summary.files.some((entry) => entry.file === file && entry.functionsHit > 0),
+				(file) =>
+					!summary.files.some(
+						(entry) => entry.file === file && entry.functionsHit > 0,
+					),
 			);
 			expect(
 				missing,
@@ -226,7 +248,8 @@ describe(`profiling coverage of walk/profile hot path (~${TREE_SIZE} files)`, ()
 				for (const script of scripts) {
 					if (fileFromScriptUrl(script.url, repoRoot) !== file) continue;
 					for (const fn of script.functions) {
-						if (fn.ranges.some((range) => range.count > 0)) hit.add(fn.functionName);
+						if (fn.ranges.some((range) => range.count > 0))
+							hit.add(fn.functionName);
 					}
 				}
 				for (const name of names) {

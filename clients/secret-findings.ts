@@ -77,7 +77,9 @@ export function fromGitleaks(findings: GitleaksFinding[]): SecretFinding[] {
 	}));
 }
 
-export function fromTrivySecrets(findings: TrivySecretFinding[]): SecretFinding[] {
+export function fromTrivySecrets(
+	findings: TrivySecretFinding[],
+): SecretFinding[] {
 	return findings.map((f) => ({
 		file: f.file,
 		line: f.line,

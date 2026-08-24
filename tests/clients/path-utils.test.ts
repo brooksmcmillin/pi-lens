@@ -37,9 +37,8 @@ describe("isWindowsPath (#1213 review pins)", () => {
 
 describe("isFullyQualified matrix additions (#1213 review pins)", () => {
 	it("classifies long-path and embedded-backslash forms", async () => {
-		const { isFullyQualifiedWin32, isFullyQualifiedPosix } = await import(
-			"../../clients/path-utils.js"
-		);
+		const { isFullyQualifiedWin32, isFullyQualifiedPosix } =
+			await import("../../clients/path-utils.js");
 		expect(isFullyQualifiedWin32("\\\\?\\C:\\very\\long\\path")).toBe(true);
 		expect(isFullyQualifiedPosix("/ordinary\\name")).toBe(true);
 	});
@@ -56,18 +55,32 @@ describe("path-utils", () => {
 		["relative", "rel/path", false, false],
 		["dot-relative", "./rel", false, false],
 	] as const;
-	it.each(fullyQualifiedMatrix)("isFullyQualifiedPosix: %s", (_label, value, expected) => {
-		expect(isFullyQualifiedPosix(value)).toBe(expected);
-	});
-	it.each(fullyQualifiedMatrix)("isFullyQualifiedWin32: %s", (_label, value, _posix, expected) => {
-		expect(isFullyQualifiedWin32(value)).toBe(expected);
-	});
+	it.each(fullyQualifiedMatrix)(
+		"isFullyQualifiedPosix: %s",
+		(_label, value, expected) => {
+			expect(isFullyQualifiedPosix(value)).toBe(expected);
+		},
+	);
+	it.each(fullyQualifiedMatrix)(
+		"isFullyQualifiedWin32: %s",
+		(_label, value, _posix, expected) => {
+			expect(isFullyQualifiedWin32(value)).toBe(expected);
+		},
+	);
 	it("classifies /foo according to explicit platform semantics", () => {
-		expect(isFullyQualifiedWin32(path.posix.join(path.posix.sep, "foo"))).toBe(false);
-		expect(isFullyQualifiedPosix(path.posix.join(path.posix.sep, "foo"))).toBe(true);
+		expect(isFullyQualifiedWin32(path.posix.join(path.posix.sep, "foo"))).toBe(
+			false,
+		);
+		expect(isFullyQualifiedPosix(path.posix.join(path.posix.sep, "foo"))).toBe(
+			true,
+		);
 	});
 	it("classifies ordinary host-native paths through the ambient helper", () => {
-		const hostNative = path.join(path.parse(process.cwd()).root, "ordinary", "host-native");
+		const hostNative = path.join(
+			path.parse(process.cwd()).root,
+			"ordinary",
+			"host-native",
+		);
 		expect(isFullyQualified(hostNative)).toBe(true);
 		if (process.platform === "win32") {
 			expect(isFullyQualifiedWin32(hostNative)).toBe(true);
@@ -118,7 +131,9 @@ describe("normalizeFilePath: Windows-shaped path is OS-coherent (refs #1150, cla
 	const structuralTail = "/__pi_lens_1150_nonexistent__/sub/file.ts";
 
 	it("forward-slash and backslash forms normalize to the same key (coherence)", () => {
-		expect(normalizeFilePath(nonExistent)).toBe(normalizeFilePath(nonExistentBack));
+		expect(normalizeFilePath(nonExistent)).toBe(
+			normalizeFilePath(nonExistentBack),
+		);
 	});
 
 	it("preserves the path structure and drive-letter shape — never collapses to a cwd-relative key", () => {
@@ -134,7 +149,9 @@ describe("normalizeFilePath: Windows-shaped path is OS-coherent (refs #1150, cla
 		expect(/^[A-Za-z]:/.test(key)).toBe(true);
 		// Explicitly cwd-independent: the process working directory must not
 		// appear in the key.
-		expect(key.toLowerCase()).not.toContain(process.cwd().replace(/\\/g, "/").toLowerCase());
+		expect(key.toLowerCase()).not.toContain(
+			process.cwd().replace(/\\/g, "/").toLowerCase(),
+		);
 	});
 
 	it("normalizeMapKey (the map-key entry point) yields the same stable key", () => {
@@ -154,15 +171,15 @@ describe("toProjectRelativePath: Windows-shaped path relativizes on ANY OS (refs
 	// fed as literals; the expectation is derived structurally, not hardcoded to a
 	// normalized key (the #1139/#1150 vacuous-fixture trap).
 	it("backslash form under a backslash root → forward-slashed project-relative path", () => {
-		expect(
-			toProjectRelativePath("C:\\repo\\src\\x.ts", "C:\\repo"),
-		).toBe("src/x.ts");
+		expect(toProjectRelativePath("C:\\repo\\src\\x.ts", "C:\\repo")).toBe(
+			"src/x.ts",
+		);
 	});
 
 	it("forward-slash win32 form under a win32 root → project-relative path", () => {
-		expect(
-			toProjectRelativePath("C:/repo/src/nested/y.ts", "C:/repo"),
-		).toBe("src/nested/y.ts");
+		expect(toProjectRelativePath("C:/repo/src/nested/y.ts", "C:/repo")).toBe(
+			"src/nested/y.ts",
+		);
 	});
 
 	it("UNC-shaped path under a UNC root relativizes rather than returning the whole path", () => {
@@ -176,9 +193,9 @@ describe("toProjectRelativePath: Windows-shaped path relativizes on ANY OS (refs
 	it("a win32 file OUTSIDE the win32 root keeps the (slash-folded) absolute path", () => {
 		// Not under the root → not relativized; must stay the full path, never a
 		// "../"-prefixed escape.
-		expect(
-			toProjectRelativePath("C:\\other\\a.ts", "C:\\repo"),
-		).toBe("C:/other/a.ts");
+		expect(toProjectRelativePath("C:\\other\\a.ts", "C:\\repo")).toBe(
+			"C:/other/a.ts",
+		);
 	});
 });
 
@@ -238,7 +255,10 @@ describe("walkUpDirs / findNearestContaining (#122)", () => {
 			fs.mkdirSync(inner, { recursive: true });
 			// Put a marker at BOTH levels. Nearest wins.
 			fs.writeFileSync(path.join(env.tmpDir, "outer", "package.json"), "{}");
-			fs.writeFileSync(path.join(env.tmpDir, "outer", "inner", "package.json"), "{}");
+			fs.writeFileSync(
+				path.join(env.tmpDir, "outer", "inner", "package.json"),
+				"{}",
+			);
 
 			const startDir = path.join(inner, "src");
 			fs.mkdirSync(startDir, { recursive: true });
@@ -510,15 +530,21 @@ describe("isExternalOrVendorFile", () => {
 	});
 
 	it("returns true for a file outside the project root", () => {
-		expect(isExternalOrVendorFile("/home/user/other-project/foo.ts", root)).toBe(true);
+		expect(
+			isExternalOrVendorFile("/home/user/other-project/foo.ts", root),
+		).toBe(true);
 	});
 
 	it("returns true for node_modules", () => {
-		expect(isExternalOrVendorFile(`${root}/node_modules/lodash/index.js`, root)).toBe(true);
+		expect(
+			isExternalOrVendorFile(`${root}/node_modules/lodash/index.js`, root),
+		).toBe(true);
 	});
 
 	it("returns true for vendor/", () => {
-		expect(isExternalOrVendorFile(`${root}/vendor/dep/file.go`, root)).toBe(true);
+		expect(isExternalOrVendorFile(`${root}/vendor/dep/file.go`, root)).toBe(
+			true,
+		);
 	});
 
 	it("returns true for vendors/", () => {
@@ -526,15 +552,21 @@ describe("isExternalOrVendorFile", () => {
 	});
 
 	it("returns true for third_party/", () => {
-		expect(isExternalOrVendorFile(`${root}/third_party/sherpa/api.h`, root)).toBe(true);
+		expect(
+			isExternalOrVendorFile(`${root}/third_party/sherpa/api.h`, root),
+		).toBe(true);
 	});
 
 	it("returns true for third-party/", () => {
-		expect(isExternalOrVendorFile(`${root}/third-party/lib/src.cpp`, root)).toBe(true);
+		expect(
+			isExternalOrVendorFile(`${root}/third-party/lib/src.cpp`, root),
+		).toBe(true);
 	});
 
 	it("returns false for a dir that merely contains 'vendor' as a substring", () => {
-		expect(isExternalOrVendorFile(`${root}/src/vendor_utils/helper.ts`, root)).toBe(false);
+		expect(
+			isExternalOrVendorFile(`${root}/src/vendor_utils/helper.ts`, root),
+		).toBe(false);
 	});
 });
 
@@ -563,13 +595,22 @@ describe("toPosix (refs #1193)", () => {
 
 describe("splitPathSegments (refs #1193, #1161/#1163)", () => {
 	it("splits on EITHER separator regardless of host, dropping empties", () => {
-		expect(splitPathSegments("C:\\repo\\src\\x.ts")).toEqual(["C:", "repo", "src", "x.ts"]);
+		expect(splitPathSegments("C:\\repo\\src\\x.ts")).toEqual([
+			"C:",
+			"repo",
+			"src",
+			"x.ts",
+		]);
 		expect(splitPathSegments("/home/u/x.ts")).toEqual(["home", "u", "x.ts"]);
 		expect(splitPathSegments("a/b\\c")).toEqual(["a", "b", "c"]); // mixed separators
 	});
 
 	it("collapses doubled separators and drops leading/trailing empties", () => {
-		expect(splitPathSegments("//host\\\\share//a")).toEqual(["host", "share", "a"]);
+		expect(splitPathSegments("//host\\\\share//a")).toEqual([
+			"host",
+			"share",
+			"a",
+		]);
 		expect(splitPathSegments("src/")).toEqual(["src"]);
 	});
 

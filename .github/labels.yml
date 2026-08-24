@@ -72,3 +72,9 @@
 - name: breaking
   color: b60205
   description: Breaking change
+- name: conflict
+  color: e11d21
+  description: Merge-train warden - mergeStateStatus is DIRTY; required checks are silently skipped until resolved
+- name: red-ci
+  color: e11d21
+  description: Merge-train warden - a required check is failing on the current head

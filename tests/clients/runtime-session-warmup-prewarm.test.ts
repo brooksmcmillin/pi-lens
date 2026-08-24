@@ -72,11 +72,26 @@ function makeDeps(ctxCwd: string, overrides: Record<string, unknown> = {}) {
 			ensureAvailable: async () => false,
 			scanExports: async () => new Map(),
 		},
-		biomeClient: { isAvailable: () => false, ensureAvailable: async () => false },
-		ruffClient: { isAvailable: () => false, ensureAvailable: async () => false },
-		knipClient: { isAvailable: () => false, ensureAvailable: async () => false },
-		jscpdClient: { isAvailable: () => false, ensureAvailable: async () => false },
-		depChecker: { isAvailable: () => false, ensureAvailable: async () => false },
+		biomeClient: {
+			isAvailable: () => false,
+			ensureAvailable: async () => false,
+		},
+		ruffClient: {
+			isAvailable: () => false,
+			ensureAvailable: async () => false,
+		},
+		knipClient: {
+			isAvailable: () => false,
+			ensureAvailable: async () => false,
+		},
+		jscpdClient: {
+			isAvailable: () => false,
+			ensureAvailable: async () => false,
+		},
+		depChecker: {
+			isAvailable: () => false,
+			ensureAvailable: async () => false,
+		},
 		testRunnerClient: {
 			detectRunner: () => null,
 			runTestFile: () => ({ failed: 0, error: false }),
@@ -245,7 +260,9 @@ describe("quick-mode warmup LSP pre-warm (#947)", () => {
 			const cwd = makeWarmableProject(env);
 			_setWarmAttachForTests(cwd, process.pid + 1);
 			const dbgLog: string[] = [];
-			await handleSessionStart(makeDeps(cwd, { dbg: (msg: string) => dbgLog.push(msg) }));
+			await handleSessionStart(
+				makeDeps(cwd, { dbg: (msg: string) => dbgLog.push(msg) }),
+			);
 
 			await vi.waitFor(
 				() => {

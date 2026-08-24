@@ -1,7 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { FactStore } from "../../../../clients/dispatch/fact-store.js";
+import { makeRunnerCtx } from "../../../support/runner-ctx.js";
+import type { FileKind } from "../../../../clients/file-kinds.js";
 import { setupTestEnvironment } from "../../test-utils.js";
 
 const safeSpawnAsync = vi.fn();
@@ -29,17 +30,7 @@ vi.mock("../../../../clients/dispatch/runners/utils/runner-helpers.js", () => ({
 }));
 
 function createCtx(kind: string, filePath: string, cwd: string) {
-	return {
-		filePath,
-		cwd,
-		kind,
-		pi: { getFlag: () => false },
-		autofix: false,
-		deltaMode: true,
-		facts: new FactStore(),
-		hasTool: async () => true,
-		log: () => {},
-	};
+	return makeRunnerCtx(filePath, cwd, { kind: kind as FileKind });
 }
 
 // A nonzero exit is not a spawn failure, so `SpawnResult.error` is unset and

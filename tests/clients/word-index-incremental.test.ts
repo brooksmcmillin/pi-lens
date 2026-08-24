@@ -86,8 +86,7 @@ describe("updateWordIndexDocument / removeWordIndexDocument", () => {
 
 		updateWordIndexDocument(index, {
 			path: "a.ts",
-			content:
-				"export function alpha() {}\nexport function alphaHelper() {}",
+			content: "export function alpha() {}\nexport function alphaHelper() {}",
 		});
 
 		expect(index.postings.get("alphahelper")?.[0]?.file).toBe("a.ts");
@@ -173,9 +172,9 @@ describe("updateWordIndexDocument / removeWordIndexDocument", () => {
 		expect(restored).not.toBeNull();
 		expect(restored?.forward).toBeUndefined();
 		// Fallback contract: caller must rebuild rather than incrementally update.
-		expect(updateWordIndexDocument(restored!, { path: "b.ts", content: "x" })).toBe(
-			false,
-		);
+		expect(
+			updateWordIndexDocument(restored!, { path: "b.ts", content: "x" }),
+		).toBe(false);
 	});
 });
 
@@ -199,9 +198,26 @@ function pick<T>(rng: () => number, arr: T[]): T {
 }
 
 const WORDS = [
-	"alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
-	"handler", "controller", "service", "client", "manager", "builder",
-	"parse", "resolve", "validate", "compute", "render", "dispatch",
+	"alpha",
+	"beta",
+	"gamma",
+	"delta",
+	"epsilon",
+	"zeta",
+	"eta",
+	"theta",
+	"handler",
+	"controller",
+	"service",
+	"client",
+	"manager",
+	"builder",
+	"parse",
+	"resolve",
+	"validate",
+	"compute",
+	"render",
+	"dispatch",
 ];
 
 function randomContent(rng: () => number, lineCount: number): string {
@@ -209,7 +225,7 @@ function randomContent(rng: () => number, lineCount: number): string {
 	for (let i = 0; i < lineCount; i += 1) {
 		const wordCount = 1 + Math.floor(rng() * 4);
 		const words: string[] = [];
-        for (let w = 0; w < wordCount; w += 1) words.push(pick(rng, WORDS));
+		for (let w = 0; w < wordCount; w += 1) words.push(pick(rng, WORDS));
 		lines.push(`function ${words.join("")}Fn() { return ${words[0]}; }`);
 	}
 	return lines.join("\n");
@@ -320,7 +336,10 @@ describe("equivalence property: k incremental edits == from-scratch rebuild (#34
 
 	it("matches for a doc shrinking to empty and a doc growing from empty", () => {
 		const initial = buildWordIndex([
-			{ path: "shrink.ts", content: "function alphaBeta() {}\nfunction gammaDelta() {}" },
+			{
+				path: "shrink.ts",
+				content: "function alphaBeta() {}\nfunction gammaDelta() {}",
+			},
 			{ path: "grow.ts", content: "" },
 			{ path: "stable.ts", content: "function stableFn() {}" },
 		]);
@@ -333,7 +352,10 @@ describe("equivalence property: k incremental edits == from-scratch rebuild (#34
 
 		const rebuilt = buildWordIndex([
 			{ path: "shrink.ts", content: "" },
-			{ path: "grow.ts", content: "function newlyAddedFn() { return epsilonZeta; }" },
+			{
+				path: "grow.ts",
+				content: "function newlyAddedFn() { return epsilonZeta; }",
+			},
 			{ path: "stable.ts", content: "function stableFn() {}" },
 		]);
 

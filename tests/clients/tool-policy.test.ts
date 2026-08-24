@@ -54,7 +54,7 @@ import {
 	isSafePipelineAutofixTool,
 	shouldAutoInstallTool,
 	_getSpotlessGradleReadCountForTests,
-} from "../../clients/tool-policy.ts";
+} from "../../clients/tool-policy.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 
 describe("tool-policy", () => {
@@ -525,7 +525,9 @@ describe("tool-policy", () => {
 		".markdownlint.cjs",
 		".markdownlint.mjs",
 	])("detects markdownlint-cli2 config filename %s", (configName) => {
-		const env = setupTestEnvironment(`pi-lens-markdownlint-config-${configName}`);
+		const env = setupTestEnvironment(
+			`pi-lens-markdownlint-config-${configName}`,
+		);
 		try {
 			createTempFile(env.tmpDir, configName, "{}\n");
 			expect(hasMarkdownlintConfig(env.tmpDir)).toBe(true);
@@ -853,7 +855,9 @@ describe("tool-policy", () => {
 	});
 
 	it("hasOxlintConfig detects .oxlintrc.jsonc in a parent directory", () => {
-		const env = setupTestEnvironment("pi-lens-tool-policy-oxlint-jsonc-walkup-");
+		const env = setupTestEnvironment(
+			"pi-lens-tool-policy-oxlint-jsonc-walkup-",
+		);
 		try {
 			createTempFile(env.tmpDir, ".oxlintrc.jsonc", "{\n// comment\n}\n");
 			const subDir = path.join(env.tmpDir, "src");
@@ -865,7 +869,9 @@ describe("tool-policy", () => {
 	});
 
 	it("hasOxlintConfig detects oxlint.config.ts in a parent directory", () => {
-		const env = setupTestEnvironment("pi-lens-tool-policy-oxlint-config-ts-walkup-");
+		const env = setupTestEnvironment(
+			"pi-lens-tool-policy-oxlint-config-ts-walkup-",
+		);
 		try {
 			createTempFile(
 				env.tmpDir,
@@ -881,7 +887,9 @@ describe("tool-policy", () => {
 	});
 
 	it("hasOxlintConfig detects oxlint.config.mts in a parent directory", () => {
-		const env = setupTestEnvironment("pi-lens-tool-policy-oxlint-config-mts-walkup-");
+		const env = setupTestEnvironment(
+			"pi-lens-tool-policy-oxlint-config-mts-walkup-",
+		);
 		try {
 			createTempFile(
 				env.tmpDir,
@@ -920,8 +928,10 @@ describe("tool-policy", () => {
 	// PR #1134 body for the full four-cell matrix). Both the `svelte` package
 	// AND the config's `svelte` flag are required; either alone always fails.
 	describe("hasOxfmtSvelteConfig (#1134)", () => {
-		it("is true with the svelte package and {\"svelte\": true} in .oxfmtrc.json", () => {
-			const env = setupTestEnvironment("pi-lens-tool-policy-oxfmt-svelte-json-");
+		it('is true with the svelte package and {"svelte": true} in .oxfmtrc.json', () => {
+			const env = setupTestEnvironment(
+				"pi-lens-tool-policy-oxfmt-svelte-json-",
+			);
 			try {
 				createTempFile(
 					env.tmpDir,
@@ -942,7 +952,9 @@ describe("tool-policy", () => {
 		});
 
 		it("is true with the svelte package and `svelte = true` in oxfmt.toml", () => {
-			const env = setupTestEnvironment("pi-lens-tool-policy-oxfmt-svelte-toml-");
+			const env = setupTestEnvironment(
+				"pi-lens-tool-policy-oxfmt-svelte-toml-",
+			);
 			try {
 				createTempFile(
 					env.tmpDir,
@@ -957,7 +969,9 @@ describe("tool-policy", () => {
 		});
 
 		it("is false without the svelte package, even with the config flag on", () => {
-			const env = setupTestEnvironment("pi-lens-tool-policy-oxfmt-svelte-nopackage-");
+			const env = setupTestEnvironment(
+				"pi-lens-tool-policy-oxfmt-svelte-nopackage-",
+			);
 			try {
 				createTempFile(
 					env.tmpDir,
@@ -971,7 +985,9 @@ describe("tool-policy", () => {
 		});
 
 		it("is false with the svelte package but no config flag", () => {
-			const env = setupTestEnvironment("pi-lens-tool-policy-oxfmt-svelte-noflag-");
+			const env = setupTestEnvironment(
+				"pi-lens-tool-policy-oxfmt-svelte-noflag-",
+			);
 			try {
 				createTempFile(
 					env.tmpDir,
@@ -985,7 +1001,9 @@ describe("tool-policy", () => {
 		});
 
 		it("is false when the config flag is explicitly false", () => {
-			const env = setupTestEnvironment("pi-lens-tool-policy-oxfmt-svelte-false-");
+			const env = setupTestEnvironment(
+				"pi-lens-tool-policy-oxfmt-svelte-false-",
+			);
 			try {
 				createTempFile(
 					env.tmpDir,
@@ -1004,7 +1022,9 @@ describe("tool-policy", () => {
 		});
 
 		it("is false for a generic oxfmt.toml that doesn't set the svelte key", () => {
-			const env = setupTestEnvironment("pi-lens-tool-policy-oxfmt-svelte-generic-toml-");
+			const env = setupTestEnvironment(
+				"pi-lens-tool-policy-oxfmt-svelte-generic-toml-",
+			);
 			try {
 				createTempFile(
 					env.tmpDir,
@@ -1022,7 +1042,9 @@ describe("tool-policy", () => {
 		// used to false-negative because the line-match regex required the value
 		// to be immediately followed by end-of-line/end-of-file.
 		it("is true with `svelte = true  # comment` in oxfmt.toml (tail 1 — trailing comment)", () => {
-			const env = setupTestEnvironment("pi-lens-tool-policy-oxfmt-svelte-toml-comment-");
+			const env = setupTestEnvironment(
+				"pi-lens-tool-policy-oxfmt-svelte-toml-comment-",
+			);
 			try {
 				createTempFile(
 					env.tmpDir,
@@ -1094,7 +1116,11 @@ describe("tool-policy", () => {
 	it("pins Spotless kotlin ktlint and excludes ktfmt (#1306)", () => {
 		const env = setupTestEnvironment("pi-lens-tool-policy-spotless-ktlint-");
 		try {
-			createTempFile(env.tmpDir, "build.gradle", "spotless {\n  kotlin {\n    ktlint()\n  }\n}\n");
+			createTempFile(
+				env.tmpDir,
+				"build.gradle",
+				"spotless {\n  kotlin {\n    ktlint()\n  }\n}\n",
+			);
 			expect(getSpotlessKotlinFormatter(env.tmpDir)).toBe("ktlint");
 			expect(hasKtlintConfig(env.tmpDir)).toBe(true);
 			expect(hasKtfmtConfig(env.tmpDir)).toBe(false);
@@ -1106,7 +1132,11 @@ describe("tool-policy", () => {
 	it("pins Spotless kotlin ktfmt and excludes ktlint (#1306)", () => {
 		const env = setupTestEnvironment("pi-lens-tool-policy-spotless-ktfmt-");
 		try {
-			createTempFile(env.tmpDir, "build.gradle.kts", "spotless {\n  kotlin {\n    ktfmt()\n  }\n}\n");
+			createTempFile(
+				env.tmpDir,
+				"build.gradle.kts",
+				"spotless {\n  kotlin {\n    ktfmt()\n  }\n}\n",
+			);
 			expect(getSpotlessKotlinFormatter(env.tmpDir)).toBe("ktfmt");
 			expect(hasKtlintConfig(env.tmpDir)).toBe(false);
 			expect(hasKtfmtConfig(env.tmpDir)).toBe(true);
@@ -1118,7 +1148,10 @@ describe("tool-policy", () => {
 	it.each([
 		["line comment", "spotless {\n  kotlin {\n    // ktlint()\n  }\n}\n"],
 		["block comment", "spotless {\n  kotlin {\n    /* ktlint() */\n  }\n}\n"],
-		["string literal", 'spotless {\n  kotlin {\n    val example = "ktlint()"\n  }\n}\n'],
+		[
+			"string literal",
+			'spotless {\n  kotlin {\n    val example = "ktlint()"\n  }\n}\n',
+		],
 	])("ignores ktlint() in a %s (#1306)", (_kind, source) => {
 		const env = setupTestEnvironment("pi-lens-tool-policy-spotless-lexical-");
 		try {

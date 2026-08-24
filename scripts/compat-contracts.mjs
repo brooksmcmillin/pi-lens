@@ -34,144 +34,171 @@ import * as path from "node:path";
 import { runAllContractChecks } from "./lib/compat-contracts.mjs";
 
 const PACKAGES = {
-  sdk: "@earendil-works/pi-coding-agent",
-  nicobailon: "pi-subagents",
-  avtc: "avtc-pi-subagent",
-  tintinweb: "@tintinweb/pi-subagents",
+	sdk: "@earendil-works/pi-coding-agent",
+	nicobailon: "pi-subagents",
+	avtc: "avtc-pi-subagent",
+	tintinweb: "@tintinweb/pi-subagents",
 };
 
 function parseArgs(argv) {
-  const opts = { keep: false, dir: undefined };
-  for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === "--keep") opts.keep = true;
-    else if (argv[i] === "--dir") opts.dir = argv[++i];
-  }
-  return opts;
+	const opts = { keep: false, dir: undefined };
+	for (let i = 0; i < argv.length; i++) {
+		if (argv[i] === "--keep") opts.keep = true;
+		else if (argv[i] === "--dir") opts.dir = argv[++i];
+	}
+	return opts;
 }
 
 function installPackages(dir) {
-  fs.mkdirSync(dir, { recursive: true });
-  const pkgJsonPath = path.join(dir, "package.json");
-  if (!fs.existsSync(pkgJsonPath)) {
-    fs.writeFileSync(
-      pkgJsonPath,
-      JSON.stringify({ name: "pi-lens-compat-contracts-scratch", private: true }, null, 2),
-    );
-  }
-  const specs = Object.values(PACKAGES);
-  console.log(`installing ${specs.join(", ")} into ${dir} ...`);
-  // Windows `npm` is a `.cmd` shim that only runs under shell mode (same
-  // reasoning as safeSpawnAsync — see AGENTS.md "Runner process model").
-  const isWindows = process.platform === "win32";
-  execFileSync("npm", ["install", "--no-audit", "--no-fund", "--no-save", ...specs], {
-    cwd: dir,
-    stdio: "inherit",
-    shell: isWindows,
-  });
+	fs.mkdirSync(dir, { recursive: true });
+	const pkgJsonPath = path.join(dir, "package.json");
+	if (!fs.existsSync(pkgJsonPath)) {
+		fs.writeFileSync(
+			pkgJsonPath,
+			JSON.stringify(
+				{ name: "pi-lens-compat-contracts-scratch", private: true },
+				null,
+				2,
+			),
+		);
+	}
+	const specs = Object.values(PACKAGES);
+	console.log(`installing ${specs.join(", ")} into ${dir} ...`);
+	// Windows `npm` is a `.cmd` shim that only runs under shell mode (same
+	// reasoning as safeSpawnAsync — see AGENTS.md "Runner process model").
+	const isWindows = process.platform === "win32";
+	execFileSync(
+		"npm",
+		["install", "--no-audit", "--no-fund", "--no-save", ...specs],
+		{
+			cwd: dir,
+			stdio: "inherit",
+			shell: isWindows,
+		},
+	);
 }
 
 function installedVersion(dir, pkgName) {
-  try {
-    const pkgJsonPath = path.join(dir, "node_modules", pkgName, "package.json");
-    return JSON.parse(fs.readFileSync(pkgJsonPath, "utf8")).version;
-  } catch {
-    return "(unknown)";
-  }
+	try {
+		const pkgJsonPath = path.join(dir, "node_modules", pkgName, "package.json");
+		return JSON.parse(fs.readFileSync(pkgJsonPath, "utf8")).version;
+	} catch {
+		return "(unknown)";
+	}
 }
 
 function readSource(dir, ...segments) {
-  return fs.readFileSync(path.join(dir, "node_modules", ...segments), "utf8");
+	return fs.readFileSync(path.join(dir, "node_modules", ...segments), "utf8");
 }
 
 async function main() {
-  const opts = parseArgs(process.argv.slice(2));
-  const dir = opts.dir ?? fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-compat-contracts-"));
+	const opts = parseArgs(process.argv.slice(2));
+	const dir =
+		opts.dir ??
+		fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-compat-contracts-"));
 
-  let infraFailure = null;
-  try {
-    installPackages(dir);
-  } catch (err) {
-    // Our own install failing (network/registry down) is an infra error, not
-    // a contract drift — the workflow should tell these apart in its summary.
-    infraFailure = err instanceof Error ? err.message : String(err);
-  }
+	let infraFailure = null;
+	try {
+		installPackages(dir);
+	} catch (err) {
+		// Our own install failing (network/registry down) is an infra error, not
+		// a contract drift — the workflow should tell these apart in its summary.
+		infraFailure = err instanceof Error ? err.message : String(err);
+	}
 
-  const versions = {
-    "@earendil-works/pi-coding-agent": installedVersion(dir, "@earendil-works/pi-coding-agent"),
-    "pi-subagents": installedVersion(dir, "pi-subagents"),
-    "avtc-pi-subagent": installedVersion(dir, "avtc-pi-subagent"),
-    "@tintinweb/pi-subagents": installedVersion(dir, "@tintinweb/pi-subagents"),
-  };
-  console.log("\nversions installed:");
-  for (const [name, version] of Object.entries(versions)) {
-    console.log(`  ${name}@${version}`);
-  }
-  // Surface the ACTUALLY-INSTALLED versions to the workflow (GITHUB_OUTPUT)
-  // so the drift-alert issue states ground truth — the doc's "verified
-  // against" versions go stale as nightlies silently pass on newer releases.
-  if (process.env.GITHUB_OUTPUT) {
-    const line = Object.entries(versions)
-      .map(([name, version]) => `${name}@${version}`)
-      .join(" ");
-    try {
-      fs.appendFileSync(process.env.GITHUB_OUTPUT, `versions=${line}\n`);
-    } catch {
-      // output plumbing is best-effort; stdout above already has the versions
-    }
-  }
+	const versions = {
+		"@earendil-works/pi-coding-agent": installedVersion(
+			dir,
+			"@earendil-works/pi-coding-agent",
+		),
+		"pi-subagents": installedVersion(dir, "pi-subagents"),
+		"avtc-pi-subagent": installedVersion(dir, "avtc-pi-subagent"),
+		"@tintinweb/pi-subagents": installedVersion(dir, "@tintinweb/pi-subagents"),
+	};
+	console.log("\nversions installed:");
+	for (const [name, version] of Object.entries(versions)) {
+		console.log(`  ${name}@${version}`);
+	}
+	// Surface the ACTUALLY-INSTALLED versions to the workflow (GITHUB_OUTPUT)
+	// so the drift-alert issue states ground truth — the doc's "verified
+	// against" versions go stale as nightlies silently pass on newer releases.
+	if (process.env.GITHUB_OUTPUT) {
+		const line = Object.entries(versions)
+			.map(([name, version]) => `${name}@${version}`)
+			.join(" ");
+		try {
+			fs.appendFileSync(process.env.GITHUB_OUTPUT, `versions=${line}\n`);
+		} catch {
+			// output plumbing is best-effort; stdout above already has the versions
+		}
+	}
 
-  if (infraFailure) {
-    console.error(`\nINFRA FAILURE — could not install packages: ${infraFailure}`);
-    if (!opts.keep) fs.rmSync(dir, { recursive: true, force: true });
-    process.exit(2);
-  }
+	if (infraFailure) {
+		console.error(
+			`\nINFRA FAILURE — could not install packages: ${infraFailure}`,
+		);
+		if (!opts.keep) fs.rmSync(dir, { recursive: true, force: true });
+		process.exit(2);
+	}
 
-  let inputs;
-  try {
-    inputs = {
-      nicobailonPiArgsSource: readSource(dir, "pi-subagents", "src/runs/shared/pi-args.ts"),
-      avtcProcessRunnerSource: readSource(dir, "avtc-pi-subagent", "src/process-runner.ts"),
-      sdkLoaderSource: readSource(
-        dir,
-        "@earendil-works/pi-coding-agent",
-        "dist/core/extensions/loader.js",
-      ),
-      sdkAgentSessionSource: readSource(
-        dir,
-        "@earendil-works/pi-coding-agent",
-        "dist/core/agent-session.js",
-      ),
-      tintinwebAgentRunnerSource: readSource(
-        dir,
-        "@tintinweb/pi-subagents",
-        "src/agent-runner.ts",
-      ),
-    };
-  } catch (err) {
-    // A source file moved/renamed entirely — itself a drift signal worth
-    // surfacing distinctly from an individual contract regex not matching.
-    console.error(
-      `\nINFRA FAILURE — expected source file not found (package layout changed?): ${err instanceof Error ? err.message : err}`,
-    );
-    if (!opts.keep) fs.rmSync(dir, { recursive: true, force: true });
-    process.exit(2);
-  }
+	let inputs;
+	try {
+		inputs = {
+			nicobailonPiArgsSource: readSource(
+				dir,
+				"pi-subagents",
+				"src/runs/shared/pi-args.ts",
+			),
+			avtcProcessRunnerSource: readSource(
+				dir,
+				"avtc-pi-subagent",
+				"src/process-runner.ts",
+			),
+			sdkLoaderSource: readSource(
+				dir,
+				"@earendil-works/pi-coding-agent",
+				"dist/core/extensions/loader.js",
+			),
+			sdkAgentSessionSource: readSource(
+				dir,
+				"@earendil-works/pi-coding-agent",
+				"dist/core/agent-session.js",
+			),
+			tintinwebAgentRunnerSource: readSource(
+				dir,
+				"@tintinweb/pi-subagents",
+				"src/agent-runner.ts",
+			),
+		};
+	} catch (err) {
+		// A source file moved/renamed entirely — itself a drift signal worth
+		// surfacing distinctly from an individual contract regex not matching.
+		console.error(
+			`\nINFRA FAILURE — expected source file not found (package layout changed?): ${err instanceof Error ? err.message : err}`,
+		);
+		if (!opts.keep) fs.rmSync(dir, { recursive: true, force: true });
+		process.exit(2);
+	}
 
-  const { results, allPass } = runAllContractChecks(inputs);
+	const { results, allPass } = runAllContractChecks(inputs);
 
-  console.log("\ncontract checks:");
-  for (const r of results) {
-    console.log(`  [${r.pass ? "PASS" : "FAIL"}] ${r.id} (${r.package}) — ${r.description}`);
-    console.log(`         ${r.detail}`);
-  }
+	console.log("\ncontract checks:");
+	for (const r of results) {
+		console.log(
+			`  [${r.pass ? "PASS" : "FAIL"}] ${r.id} (${r.package}) — ${r.description}`,
+		);
+		console.log(`         ${r.detail}`);
+	}
 
-  if (!opts.keep) fs.rmSync(dir, { recursive: true, force: true });
+	if (!opts.keep) fs.rmSync(dir, { recursive: true, force: true });
 
-  console.log(`\n${allPass ? "ALL CONTRACT CHECKS PASSED" : "ONE OR MORE CONTRACT CHECKS FAILED"}`);
-  process.exit(allPass ? 0 : 1);
+	console.log(
+		`\n${allPass ? "ALL CONTRACT CHECKS PASSED" : "ONE OR MORE CONTRACT CHECKS FAILED"}`,
+	);
+	process.exit(allPass ? 0 : 1);
 }
 
 main().catch((err) => {
-  console.error("compat-contracts.mjs crashed:", err);
-  process.exit(2);
+	console.error("compat-contracts.mjs crashed:", err);
+	process.exit(2);
 });

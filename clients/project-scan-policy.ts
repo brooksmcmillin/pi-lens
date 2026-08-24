@@ -26,11 +26,12 @@ export interface ProjectPathPolicyOptions {
 	ignoreMatcher?: ProjectIgnoreMatcher;
 }
 
-export interface ProjectSourceFilePolicyOptions
-	extends Omit<ProjectPathPolicyOptions, "isDirectory"> {}
+export interface ProjectSourceFilePolicyOptions extends Omit<
+	ProjectPathPolicyOptions,
+	"isDirectory"
+> {}
 
-export interface ProjectSourceCollectionOptions
-	extends SourceCollectionOptions {}
+export interface ProjectSourceCollectionOptions extends SourceCollectionOptions {}
 
 export function shouldSkipProjectPath(
 	filePath: string,

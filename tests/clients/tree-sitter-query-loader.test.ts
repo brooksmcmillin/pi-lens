@@ -231,7 +231,10 @@ describe("queriesForLanguage", () => {
 			],
 		],
 		["tsx", [rule("tsx-own", "rules/tree-sitter-queries/tsx/own.yml")]],
-		["javascript", [rule("js-own", "rules/tree-sitter-queries/javascript/own.yml")]],
+		[
+			"javascript",
+			[rule("js-own", "rules/tree-sitter-queries/javascript/own.yml")],
+		],
 	]);
 
 	it("never returns a rule from a -disabled directory", () => {
@@ -289,7 +292,9 @@ describe("ruleSourceLanguages / ruleFilesForLanguage (#878)", () => {
 			f.replaceAll("\\", "/"),
 		);
 		expect(files.some((f) => f.endsWith("tsx/own.yml"))).toBe(true);
-		expect(files.some((f) => f.endsWith("typescript/inherited.yml"))).toBe(true);
+		expect(files.some((f) => f.endsWith("typescript/inherited.yml"))).toBe(
+			true,
+		);
 		expect(files.some((f) => f.endsWith("python/unrelated.yml"))).toBe(false);
 		expect(files.some((f) => f.endsWith("notes.txt"))).toBe(false);
 
@@ -298,6 +303,8 @@ describe("ruleSourceLanguages / ruleFilesForLanguage (#878)", () => {
 			f.replaceAll("\\", "/"),
 		);
 		expect(pyFiles.some((f) => f.endsWith("python/unrelated.yml"))).toBe(true);
-		expect(pyFiles.some((f) => f.endsWith("typescript/inherited.yml"))).toBe(false);
+		expect(pyFiles.some((f) => f.endsWith("typescript/inherited.yml"))).toBe(
+			false,
+		);
 	});
 });

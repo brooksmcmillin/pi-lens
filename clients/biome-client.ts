@@ -15,6 +15,7 @@ import { isFileKind } from "./file-kinds.js";
 import { getGlobalPiLensDir } from "./file-utils.js";
 import { findGlobalBinary } from "./package-manager.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
+import { createSingleFlight } from "./single-flight.js";
 import { biomeConfigArgs } from "./tool-policy.js";
 import {
 	type ClientAvailabilityResult,
@@ -80,13 +81,15 @@ export class BiomeClient {
 	// (lives under ~/.pi-lens/tools), so it's stored separately from the
 	// per-cwd cache and used as a final fallback before npx.
 	private autoInstalledBinaryPath: string | null = null;
-	private ensureInFlight: Promise<boolean> | null = null;
+	/**
+	 * At-most-one probe/auto-install in flight, via the shared primitive
+	 * (#1753). One instance owns one question, so the key is a constant.
+	 */
+	private readonly ensureFlight = createSingleFlight<boolean>();
 	private log: (msg: string) => void;
 
 	constructor(verbose = false) {
-		this.log = verbose
-			? createSubsystemLogger("biome")
-			: () => {};
+		this.log = verbose ? createSubsystemLogger("biome") : () => {};
 	}
 
 	/**
@@ -105,14 +108,15 @@ export class BiomeClient {
 		const resolveCwd = cwd ?? process.cwd();
 		const cached = this.localBinaryByCwd.get(resolveCwd);
 		if (cached) return { cmd: cached, args: [] };
-		if (this.autoInstalledBinaryPath) {
-			return { cmd: this.autoInstalledBinaryPath, args: [] };
-		}
 
-		// Walk up from cwd looking for node_modules/.bin/biome.
-		// Also check ~/.pi-lens/tools (where ensureTool("biome") auto-installs),
-		// so we avoid the ~1.5s `npx @biomejs/biome --version` fallback when
-		// the tool is already installed but not in the project's node_modules.
+		// Walk up from cwd looking for node_modules/.bin/biome BEFORE trusting
+		// `autoInstalledBinaryPath` (#1731). That field is set once, the first
+		// time `ensureAvailable()` auto-installs for ANY cwd this session, and
+		// every later call for every OTHER cwd short-circuited on it — so a
+		// project that ships its own biome never won once the session's first
+		// managed install had already happened. Project-local-first (discipline
+		// B, #1721) means the project's pinned version and config resolution
+		// always outrank a managed copy, autoinstalled or not.
 		// On Windows prefer .cmd (native batch) over the sh wrapper — 2x faster.
 		const isWin = process.platform === "win32";
 		const piLensBin = path.join(
@@ -125,15 +129,24 @@ export class BiomeClient {
 			? [
 					path.join(resolveCwd, "node_modules", ".bin", "biome.cmd"),
 					path.join(resolveCwd, "node_modules", ".bin", "biome"),
-					path.join(piLensBin, "biome.cmd"),
-					path.join(piLensBin, "biome"),
 				]
-			: [
-					path.join(resolveCwd, "node_modules", ".bin", "biome"),
-					path.join(resolveCwd, "node_modules", ".bin", "biome.cmd"),
-					path.join(piLensBin, "biome"),
-				];
+			: [path.join(resolveCwd, "node_modules", ".bin", "biome")];
 		for (const p of candidates) {
+			if (fs.existsSync(p)) {
+				this.localBinaryByCwd.set(resolveCwd, p);
+				return { cmd: p, args: [] };
+			}
+		}
+		if (this.autoInstalledBinaryPath) {
+			return { cmd: this.autoInstalledBinaryPath, args: [] };
+		}
+		// Also check ~/.pi-lens/tools (where ensureTool("biome") auto-installs),
+		// so we avoid the ~1.5s `npx @biomejs/biome --version` fallback when the
+		// tool is already installed but not in the project's node_modules.
+		const managedCandidates = isWin
+			? [path.join(piLensBin, "biome.cmd"), path.join(piLensBin, "biome")]
+			: [path.join(piLensBin, "biome")];
+		for (const p of managedCandidates) {
 			if (fs.existsSync(p)) {
 				this.localBinaryByCwd.set(resolveCwd, p);
 				return { cmd: p, args: [] };
@@ -150,11 +163,7 @@ export class BiomeClient {
 		return { cmd: "npx", args: ["@biomejs/biome"] };
 	}
 
-	private async spawnBiomeAsync(
-		args: string[],
-		timeout = 15000,
-		cwd?: string,
-	) {
+	private async spawnBiomeAsync(args: string[], timeout = 15000, cwd?: string) {
 		const { cmd, args: prefix } = await this.getBiomeBinary(cwd);
 		return safeSpawnAsync(cmd, [...prefix, ...args], { timeout, cwd });
 	}
@@ -163,10 +172,11 @@ export class BiomeClient {
 	 * Ensure Biome is available, auto-installing if necessary.
 	 * Prefer this over isAvailable() for auto-install behavior.
 	 *
-	 * Re-entrancy safe: concurrent first-time callers share a single
-	 * `ensureInFlight` promise so probing/auto-install isn't duplicated.
-	 * Mirrors the dedupe pattern in `SgRunner` / `KnipClient` /
-	 * `DependencyChecker`.
+	 * Re-entrancy safe: concurrent first-time callers share one flight, so
+	 * probing/auto-install isn't duplicated. The share and the clear-in-finally
+	 * belong to `singleFlight` (#1753); this method owns only the latch
+	 * short-circuit above it. #1690 exists because the hand-rolled clear here
+	 * was never exercised by a test.
 	 *
 	 * The memo returns `null` when the last verdict was transient and its
 	 * cooldown expired, which re-enters the probe: "biome is not installed" is a
@@ -175,14 +185,7 @@ export class BiomeClient {
 	async ensureAvailable(): Promise<boolean> {
 		const memo = this.availabilityLatch.read();
 		if (memo !== null) return memo;
-		if (this.ensureInFlight) return this.ensureInFlight;
-
-		this.ensureInFlight = this.doEnsureAvailable();
-		try {
-			return await this.ensureInFlight;
-		} finally {
-			this.ensureInFlight = null;
-		}
+		return this.ensureFlight.run("biome", () => this.doEnsureAvailable());
 	}
 
 	/**
@@ -310,7 +313,9 @@ export class BiomeClient {
 			...(Object.keys(evidence).length > 0 && { evidence }),
 		});
 		if (resolved.outcome === "transient") {
-			this.log("biome availability probe timed out; will retry (not installing)");
+			this.log(
+				"biome availability probe timed out; will retry (not installing)",
+			);
 		}
 		return false;
 	}
@@ -393,5 +398,4 @@ export class BiomeClient {
 			};
 		}
 	}
-
 }

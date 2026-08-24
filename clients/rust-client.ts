@@ -58,9 +58,7 @@ export class RustClient {
 	private log: (msg: string) => void;
 
 	constructor(verbose = false) {
-		this.log = verbose
-			? createSubsystemLogger("rust")
-			: () => {};
+		this.log = verbose ? createSubsystemLogger("rust") : () => {};
 		this.availability = createToolchainAvailability({
 			tool: "cargo",
 			label: "Cargo",
@@ -92,5 +90,4 @@ export class RustClient {
 	isRustFile(filePath: string): boolean {
 		return path.extname(filePath).toLowerCase() === ".rs";
 	}
-
 }

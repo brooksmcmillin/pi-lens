@@ -98,19 +98,22 @@ describe("language-profile roots", () => {
 		["csharp", "App.sln", "Program.cs"],
 		["fsharp", "App.fsproj", "Program.fs"],
 		["fsharp", "App.sln", "Program.fs"],
-	])("resolves %s file root to nearest .NET marker", (_kind, marker, source) => {
-		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lang-root-"));
-		dirs.push(tmp);
+	])(
+		"resolves %s file root to nearest .NET marker",
+		(_kind, marker, source) => {
+			const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lang-root-"));
+			dirs.push(tmp);
 
-		const workspace = path.join(tmp, "repo");
-		const projectRoot = path.join(workspace, "services", "dotnet");
-		const file = path.join(projectRoot, "src", source);
-		fs.mkdirSync(path.dirname(file), { recursive: true });
-		fs.writeFileSync(path.join(projectRoot, marker), "\n");
-		fs.writeFileSync(file, "// test\n");
+			const workspace = path.join(tmp, "repo");
+			const projectRoot = path.join(workspace, "services", "dotnet");
+			const file = path.join(projectRoot, "src", source);
+			fs.mkdirSync(path.dirname(file), { recursive: true });
+			fs.writeFileSync(path.join(projectRoot, marker), "\n");
+			fs.writeFileSync(file, "// test\n");
 
-		expect(resolveLanguageRootForFile(file, workspace)).toBe(projectRoot);
-	});
+			expect(resolveLanguageRootForFile(file, workspace)).toBe(projectRoot);
+		},
+	);
 
 	it("resolves a nested C# file to the nearest .csproj, not the solution root (#895)", () => {
 		// The actual #895 monorepo shape: solution file at the workspace root,

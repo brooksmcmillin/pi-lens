@@ -23,7 +23,10 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { contentHash, WARM_DIAGNOSTICS_SCHEMA_VERSION } from "../../clients/mcp/ipc.js";
+import {
+	contentHash,
+	WARM_DIAGNOSTICS_SCHEMA_VERSION,
+} from "../../clients/mcp/ipc.js";
 import type { WarmDiagnosticsResponse } from "../../clients/mcp/ipc.js";
 
 const touchFile = vi.fn();
@@ -49,9 +52,8 @@ function request() {
 }
 
 async function serve() {
-	const { _serveWarmRequestForTests } = await import(
-		"../../clients/warm-attach.js"
-	);
+	const { _serveWarmRequestForTests } =
+		await import("../../clients/warm-attach.js");
 	const served = await _serveWarmRequestForTests(request());
 	expect(served.error).toBeUndefined();
 	return served.result as WarmDiagnosticsResponse;
@@ -110,7 +112,10 @@ describe("#1253 — warm-attach serves the touch confirmation", () => {
 		const diag = {
 			severity: 1,
 			message: "broken link",
-			range: { start: { line: 0, character: 0 }, end: { line: 0, character: 4 } },
+			range: {
+				start: { line: 0, character: 0 },
+				end: { line: 0, character: 4 },
+			},
 		};
 		touchFile.mockResolvedValue({ diags: [diag], confirmation: "confirmed" });
 

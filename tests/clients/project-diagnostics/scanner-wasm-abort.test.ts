@@ -24,6 +24,9 @@ vi.mock("../../../clients/tree-sitter-shared.js", async (importOriginal) => {
 			return [];
 		},
 		withParseCacheMeasurement: async (scan: () => Promise<void>) => scan(),
+		// #1715: scanFileMajorRules calls this unconditionally on every real
+		// client before parsing starts.
+		ensureTreeCacheCapacity: () => {},
 	};
 	return {
 		...actual,

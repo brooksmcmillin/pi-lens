@@ -109,7 +109,8 @@ export function createDiagnosticTracker(): DiagnosticTracker {
 			const rulePaths = new Map<string, Set<string>>();
 			for (const entry of shown.values()) {
 				ruleCounts.set(entry.ruleId, (ruleCounts.get(entry.ruleId) || 0) + 1);
-				if (!rulePaths.has(entry.ruleId)) rulePaths.set(entry.ruleId, new Set());
+				if (!rulePaths.has(entry.ruleId))
+					rulePaths.set(entry.ruleId, new Set());
 				rulePaths.get(entry.ruleId)?.add(entry.filePath);
 			}
 

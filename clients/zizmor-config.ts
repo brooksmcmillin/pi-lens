@@ -5,6 +5,7 @@ import { incrementDegradationCount } from "./degradation-ledger.js";
 import {
 	type AvailabilityCause,
 	type AvailabilityOutcome,
+	type AvailabilityLatch,
 	classifyProbeFailure,
 	createAvailabilityLatch,
 	logAvailabilityDecision,
@@ -106,6 +107,15 @@ export function resetZizmorTokenAvailability(): void {
 	cachedToken = undefined;
 }
 
+/**
+ * Test-only internals access for the session-state registry probe (#1535):
+ * the conformance suite arms a latched "missing" verdict and proves the
+ * session reset forgets it.
+ */
+export function _getZizmorTokenLatchForTests(): AvailabilityLatch {
+	return ghTokenLatch;
+}
+
 /** Test-only alias — kept so existing tests don't need a rename. */
 export function _resetZizmorTokenCacheForTests(): void {
 	resetZizmorTokenAvailability();
@@ -127,7 +137,15 @@ function classifyGhTokenFailure(
 	res: SpawnResult,
 	hostStallMs: number,
 ): { outcome: AvailabilityOutcome; cause: AvailabilityCause } {
-	if (!res.error) {
+	// #1651 review F5: `!res.error` alone is not proof gh ran and answered.
+	// A `null` or negative `status` is Node's OWN signal that the process
+	// never completed a real run — no completed process exits with either —
+	// so this never trusts a bare-`error` check over that shape, regardless
+	// of whether `safeSpawnAsync` happened to attach an `error` for this
+	// particular result. OS-independent by construction: it reads the status
+	// Node reports, not a platform-specific errno.
+	const neverAnswered = res.status === null || (res.status ?? 0) < 0;
+	if (!res.error && !neverAnswered) {
 		// The process ran to completion with a real (nonzero, since the zero
 		// exit is handled before this is ever called) exit code — a genuine
 		// "not authenticated" (or otherwise rejected) answer, safe to cache.
@@ -206,7 +224,10 @@ async function deriveGhCliToken(): Promise<string | undefined> {
  * can't drift on which fields get set.
  */
 function recordGhTokenUnavailable(
-	{ outcome, cause }: { outcome: AvailabilityOutcome; cause: AvailabilityCause },
+	{
+		outcome,
+		cause,
+	}: { outcome: AvailabilityOutcome; cause: AvailabilityCause },
 	elapsedMs: number,
 	hostStallMs: number,
 ): undefined {
@@ -304,7 +325,10 @@ export async function resolveZizmorGitHubToken(): Promise<string | undefined> {
 					"zizmor gh-token latch: transient outcome with no cause (invariant violated)",
 				);
 			}
-			const retryAfterMs = Math.max(0, ghTokenLatch.getRetryAtMs() - Date.now());
+			const retryAfterMs = Math.max(
+				0,
+				ghTokenLatch.getRetryAtMs() - Date.now(),
+			);
 			recordZizmorOfflineDegradation(
 				`gh auth token still cooling down (${cause}); serving cached offline verdict, retry allowed in ${Math.round(retryAfterMs / 1000)}s`,
 			);

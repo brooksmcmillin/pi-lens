@@ -149,9 +149,9 @@ describe("tree-sitter runner — inherited rule-set fingerprint (#878)", () => {
 		// Run 1 (cold): populates the on-disk tsx cache; the project-local
 		// typescript rule fires through the inherited rule set.
 		const cold = env878.addFile("a.tsx", "debugger;\n");
-		expect(
-			firedRuleIds(await treeSitterRunner.run(cold.ctx)),
-		).toContain("proj-marker");
+		expect(firedRuleIds(await treeSitterRunner.run(cold.ctx))).toContain(
+			"proj-marker",
+		);
 
 		// Run 2 (warm): same rules on disk → cache hit.
 		const warm = env878.addFile("b.tsx", "debugger;\n");

@@ -23,17 +23,13 @@ describe("LSP document symbols", () => {
 					name: "ReviewManager",
 					kind: 5,
 					range: range(0, 8),
-					children: [
-						{ name: "runSynthesis", kind: 6, range: range(2, 5) },
-					],
+					children: [{ name: "runSynthesis", kind: 6, range: range(2, 5) }],
 				},
 			],
 			4,
 		);
 		expect(located?.symbol.name).toBe("runSynthesis");
-		expect(qualifiedLspSymbolName(located!)).toBe(
-			"ReviewManager.runSynthesis",
-		);
+		expect(qualifiedLspSymbolName(located!)).toBe("ReviewManager.runSynthesis");
 	});
 
 	it("uses containerName for flat SymbolInformation responses", () => {
@@ -48,9 +44,7 @@ describe("LSP document symbols", () => {
 			],
 			4,
 		);
-		expect(qualifiedLspSymbolName(located!)).toBe(
-			"ReviewManager.runSynthesis",
-		);
+		expect(qualifiedLspSymbolName(located!)).toBe("ReviewManager.runSynthesis");
 	});
 
 	it.each([

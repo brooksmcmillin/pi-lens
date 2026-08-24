@@ -35,8 +35,7 @@ function makeGraph(
 		if (node.kind === "file") fileNodes.set(key, node.id);
 		if (node.kind === "symbol") {
 			(
-				symbolNodesByFile.get(key) ??
-				symbolNodesByFile.set(key, []).get(key)
+				symbolNodesByFile.get(key) ?? symbolNodesByFile.set(key, []).get(key)
 			)?.push(node.id);
 		}
 	}
@@ -57,9 +56,27 @@ function makeGraph(
 // a.ts(file) <-imports- d.ts(file)
 const nodes: ReviewGraphNode[] = [
 	{ id: "a#file", kind: "file", language: "ts", filePath: "a.ts" },
-	{ id: "a#core", kind: "symbol", language: "ts", filePath: "a.ts", symbolName: "core" },
-	{ id: "b#mid", kind: "symbol", language: "ts", filePath: "b.ts", symbolName: "mid" },
-	{ id: "c#top", kind: "symbol", language: "ts", filePath: "c.ts", symbolName: "top" },
+	{
+		id: "a#core",
+		kind: "symbol",
+		language: "ts",
+		filePath: "a.ts",
+		symbolName: "core",
+	},
+	{
+		id: "b#mid",
+		kind: "symbol",
+		language: "ts",
+		filePath: "b.ts",
+		symbolName: "mid",
+	},
+	{
+		id: "c#top",
+		kind: "symbol",
+		language: "ts",
+		filePath: "c.ts",
+		symbolName: "top",
+	},
 	{ id: "d#file", kind: "file", language: "ts", filePath: "d.ts" },
 ];
 const edges: ReviewGraphEdge[] = [
@@ -76,7 +93,10 @@ describe("computeTransitiveImpact", () => {
 		const bySymbol = new Map(result.hits.map((h) => [h.symbol || h.file, h]));
 		expect(bySymbol.get("mid")).toMatchObject({ depth: 1, relation: "calls" });
 		expect(bySymbol.get("top")).toMatchObject({ depth: 2, relation: "calls" });
-		expect(bySymbol.get("d.ts")).toMatchObject({ depth: 1, relation: "imports" });
+		expect(bySymbol.get("d.ts")).toMatchObject({
+			depth: 1,
+			relation: "imports",
+		});
 		expect(result.maxDepthReached).toBe(2);
 		expect(result.truncated).toBe(false);
 	});
@@ -104,6 +124,20 @@ describe("computeTransitiveImpact", () => {
 		const result = computeTransitiveImpact(graph, "a.ts", { maxHits: 1 });
 		expect(result.hits).toHaveLength(1);
 		expect(result.truncated).toBe(true);
+	});
+
+	it("does not truncate when maxHits exactly fits the traversal", () => {
+		const graph = makeGraph(
+			[
+				{ id: "a#file", kind: "file", language: "ts", filePath: "a.ts" },
+				{ id: "b#file", kind: "file", language: "ts", filePath: "b.ts" },
+			],
+			[{ from: "b#file", to: "a#file", kind: "imports" }],
+		);
+		const result = computeTransitiveImpact(graph, "a.ts", { maxHits: 1 });
+
+		expect(result.hits).toHaveLength(1);
+		expect(result.truncated).toBe(false);
 	});
 
 	it("returns no hits for a file nothing depends on", () => {

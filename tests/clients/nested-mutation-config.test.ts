@@ -21,7 +21,9 @@ const dirs: string[] = [];
 const noAutoformat = getLensFlagSpec("no-autoformat") as LensFlagSpec;
 
 function fixture(): { root: string; pkg: string; file: string } {
-	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-nested-mutation-"));
+	const root = fs.mkdtempSync(
+		path.join(os.tmpdir(), "pi-lens-nested-mutation-"),
+	);
 	dirs.push(root);
 	const pkg = path.join(root, "packages", "app");
 	fs.mkdirSync(path.join(pkg, "src"), { recursive: true });

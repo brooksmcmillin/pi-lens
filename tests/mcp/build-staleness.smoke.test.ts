@@ -56,9 +56,9 @@ describe("warm build-staleness guard (real spawn)", { retry: 2 }, () => {
 			capabilities: {},
 			clientInfo: { name: "smoke-test", version: "0" },
 		});
-		expect((res.result as { serverInfo: { name: string } }).serverInfo.name).toBe(
-			"pi-lens-mcp",
-		);
+		expect(
+			(res.result as { serverInfo: { name: string } }).serverInfo.name,
+		).toBe("pi-lens-mcp");
 		harness.notify("notifications/initialized");
 	}, 25_000);
 

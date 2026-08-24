@@ -79,9 +79,8 @@ async function logBootstrapFailures(
 		});
 	}
 	try {
-		const { collectInstallDiagnostics, formatInstallDiagnostics } = await import(
-			"./install-diagnostics.js"
-		);
+		const { collectInstallDiagnostics, formatInstallDiagnostics } =
+			await import("./install-diagnostics.js");
 		logExtension({
 			subsystem: "bootstrap",
 			message: formatInstallDiagnostics(
@@ -95,6 +94,14 @@ async function logBootstrapFailures(
 	}
 }
 
+/**
+ * Every per-client load below is individually fail-soft (`load`/`loadList`
+ * degrade to a stub instead of throwing), so this promise is not expected to
+ * reject in practice. It is still memoized with eviction-on-rejection —
+ * consistent with the other lazy-import memos (#1570) — so a genuinely
+ * unexpected throw (e.g. `logBootstrapFailures`) cannot latch a permanently
+ * rejected bootstrap for the rest of the process.
+ */
 export function loadBootstrapClients(): Promise<BootstrapClients> {
 	bootstrapPromise ??= (async () => {
 		const failures: { name: string; err: unknown }[] = [];
@@ -144,11 +151,26 @@ export function loadBootstrapClients(): Promise<BootstrapClients> {
 			agentBehaviorClient,
 			deadCodeClients,
 		] = await Promise.all([
-			load("ruff", async () => new (await import("./ruff-client.js")).RuffClient()),
-			load("biome", async () => new (await import("./biome-client.js")).BiomeClient()),
-			load("knip", async () => new (await import("./knip-client.js")).KnipClient()),
-			load("todo", async () => new (await import("./todo-scanner.js")).TodoScanner()),
-			load("jscpd", async () => new (await import("./jscpd-client.js")).JscpdClient()),
+			load(
+				"ruff",
+				async () => new (await import("./ruff-client.js")).RuffClient(),
+			),
+			load(
+				"biome",
+				async () => new (await import("./biome-client.js")).BiomeClient(),
+			),
+			load(
+				"knip",
+				async () => new (await import("./knip-client.js")).KnipClient(),
+			),
+			load(
+				"todo",
+				async () => new (await import("./todo-scanner.js")).TodoScanner(),
+			),
+			load(
+				"jscpd",
+				async () => new (await import("./jscpd-client.js")).JscpdClient(),
+			),
 			load(
 				"dependency-checker",
 				async () =>
@@ -178,21 +200,27 @@ export function loadBootstrapClients(): Promise<BootstrapClients> {
 				"gitleaks",
 				async () => new (await import("./gitleaks-client.js")).GitleaksClient(),
 			),
-			load("trivy", async () => new (await import("./trivy-client.js")).TrivyClient()),
+			load(
+				"trivy",
+				async () => new (await import("./trivy-client.js")).TrivyClient(),
+			),
 			load(
 				"opengrep",
-				async () =>
-					new (await import("./opengrep-client.js")).OpengrepClient(),
+				async () => new (await import("./opengrep-client.js")).OpengrepClient(),
 			),
-			load("rust", async () => new (await import("./rust-client.js")).RustClient()),
+			load(
+				"rust",
+				async () => new (await import("./rust-client.js")).RustClient(),
+			),
 			load(
 				"agent-behavior",
 				async () =>
-					new (await import("./agent-behavior-client.js")).AgentBehaviorClient(),
+					new (
+						await import("./agent-behavior-client.js")
+					).AgentBehaviorClient(),
 			),
-			loadList(
-				"dead-code",
-				async () => (await import("./dead-code-client.js")).getDeadCodeClients(),
+			loadList("dead-code", async () =>
+				(await import("./dead-code-client.js")).getDeadCodeClients(),
 			),
 		]);
 
@@ -217,7 +245,10 @@ export function loadBootstrapClients(): Promise<BootstrapClients> {
 			agentBehaviorClient,
 			deadCodeClients,
 		};
-	})();
+	})().catch((err: unknown) => {
+		bootstrapPromise = null;
+		throw err;
+	});
 
 	return bootstrapPromise;
 }

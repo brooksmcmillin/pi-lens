@@ -21,6 +21,7 @@ import {
 	type AvailabilityLatch,
 	classifyProbeFailure,
 	createAvailabilityLatch,
+	isTransientDecision,
 	logAvailabilityDecision,
 	startHostStallSampler,
 } from "./dispatch/runners/utils/availability-policy.js";
@@ -33,7 +34,12 @@ export type NodePackageManager = "npm" | "pnpm" | "yarn" | "bun";
  * missing). npm first for maximum compatibility; bun last. A project lockfile
  * always overrides this order.
  */
-const PREFERENCE: readonly NodePackageManager[] = ["npm", "pnpm", "yarn", "bun"];
+const PREFERENCE: readonly NodePackageManager[] = [
+	"npm",
+	"pnpm",
+	"yarn",
+	"bun",
+];
 
 function onWindows(): boolean {
 	return process.platform === "win32";
@@ -177,24 +183,69 @@ async function probeAvailability(pm: NodePackageManager): Promise<boolean> {
 	return false;
 }
 
-function isAvailable(pm: NodePackageManager): Promise<boolean> {
+/**
+ * Resolve whether `pm` is available. `onTransient`, when given, fires
+ * whenever the resolved `false` came from a probe that never got a fair
+ * hearing (a stall, an abort, a host-level failure classified `transient` by
+ * `classifyProbeFailure`) rather than a genuine absence — including when that
+ * verdict is served from the latch's own cooldown-bounded memo, not just on a
+ * fresh probe (#1585).
+ *
+ * Before this, the return type was a bare boolean: a caller like
+ * `allAvailableGlobalBinDirs` could not tell "pnpm isn't installed" from
+ * "the `where pnpm` probe stalled", so a transient miss silently dropped
+ * pnpm's global bin dir with no way to flag the result as provisional —
+ * exactly the boolean-collapse `getToolPath`'s `onTransient` plumbing (#1569)
+ * was built to avoid, one layer up.
+ */
+function isAvailable(
+	pm: NodePackageManager,
+	onTransient?: () => void,
+): Promise<boolean> {
 	const latch = getLatch(pm);
+
+	const reportIfTransient = (result: boolean): boolean => {
+		if (!result && isTransientDecision({ outcome: latch.getOutcome() })) {
+			onTransient?.();
+		}
+		return result;
+	};
+
 	const memo = latch.read();
-	if (memo !== null) return Promise.resolve(memo);
+	if (memo !== null) return Promise.resolve(reportIfTransient(memo));
 
 	// A verdict can now expire, so concurrent callers arriving just after a
 	// cooldown must share ONE probe rather than each spawning their own.
 	const inFlight = inFlightProbes.get(pm);
-	if (inFlight) return inFlight;
+	if (inFlight) return inFlight.then(reportIfTransient);
 
-	const probe = probeAvailability(pm).finally(() => {
-		inFlightProbes.delete(pm);
+	// #1653 review F1: a probe started before a session reset can settle AFTER
+	// a later session's own probe for the same manager is already in flight.
+	// An unconditional delete-by-key would evict that NEWER entry out from
+	// under it, so a third caller in the gap finds nothing in-flight and
+	// spawns a duplicate. Only remove the entry if it is still THIS call's
+	// promise — the same identity guard `resolveMadge` uses in
+	// dependency-checker.ts for the equivalent race.
+	const probe: Promise<boolean> = probeAvailability(pm).finally(() => {
+		if (inFlightProbes.get(pm) === probe) inFlightProbes.delete(pm);
 	});
 	inFlightProbes.set(pm, probe);
-	return probe;
+	return probe.then(reportIfTransient);
 }
 
-/** Clear the process-wide availability cache. Intended for tests. */
+/**
+ * Clear the process-wide availability cache: pnpm/yarn/bun/npm each sit
+ * behind their own module-local `AvailabilityLatch` in `availabilityLatches`,
+ * so `resetDispatchAvailabilityState`'s generation counter (the mechanism
+ * most dispatch runners inherit) never reaches them — the same shape as
+ * psscriptanalyzer's (#1490) and zizmor's (#1535) module-local latches.
+ * Without this wired into `session_start`, a genuine "pnpm is missing"
+ * verdict from one session stayed latched into the next: install pnpm mid
+ * day, start a fresh session, pi-lens still reports it missing until a
+ * process restart (#1653). Called from `handleSessionStart`'s per-session
+ * reset block beside `resetZizmorTokenAvailability()` /
+ * `resetPsScriptAnalyzerAvailability()`; also used directly by tests.
+ */
 export function _resetPackageManagerCache(): void {
 	availabilityLatches.clear();
 	inFlightProbes.clear();
@@ -238,7 +289,10 @@ export function runScriptArgs(script: string): string[] {
 }
 
 /** Human-readable "run script" command for display (bare manager name). */
-export function formatRunScript(pm: NodePackageManager, script: string): string {
+export function formatRunScript(
+	pm: NodePackageManager,
+	script: string,
+): string {
 	return `${pm} run ${script}`;
 }
 
@@ -266,6 +320,28 @@ export function installArgs(
 }
 
 /**
+ * Args to re-resolve an already-declared dependency to the newest version its
+ * recorded range still permits. npm/pnpm/bun spell this `update`; yarn classic
+ * spells it `upgrade`.
+ *
+ * This is the command that repairs a dependency frozen by its own lockfile.
+ * `installArgs` re-runs the install, and a lockfile entry that already
+ * satisfies the range makes that a no-op: pi-lens's managed tools tree stayed
+ * on the version written at first install for the life of the machine even
+ * though the declared caret range permitted 28 newer minors (#1730).
+ */
+export function updateArgs(
+	pm: NodePackageManager,
+	pkg: string,
+	options: Pick<InstallOptions, "ignoreScripts"> = {},
+): string[] {
+	const args = [pm === "yarn" ? "upgrade" : "update"];
+	if (options.ignoreScripts) args.push("--ignore-scripts");
+	args.push(pkg);
+	return args;
+}
+
+/**
  * Args to install a single package **globally** (`-g`). npm/pnpm/bun spell this
  * `install -g` / `add -g`; yarn uses `global add` (yarn classic — Berry removed
  * global installs, but pi-lens's manager resolution prefers npm/pnpm first, so
@@ -273,7 +349,10 @@ export function installArgs(
  * binary is found again by `allAvailableGlobalBinDirs`, which covers every
  * manager's global bin dir.
  */
-export function globalInstallArgs(pm: NodePackageManager, pkg: string): string[] {
+export function globalInstallArgs(
+	pm: NodePackageManager,
+	pkg: string,
+): string[] {
 	switch (pm) {
 		case "yarn":
 			return ["global", "add", pkg];
@@ -344,12 +423,20 @@ async function globalBinDirsFor(pm: NodePackageManager): Promise<string[]> {
  * Global bin directories for every installed manager, deduped. Used to locate a
  * globally-installed tool binary when PATH is stale (e.g. right after an
  * `install -g`) or when the tool was installed via a non-npm manager.
+ *
+ * `onTransient`, when given, fires once per manager whose `isAvailable` probe
+ * was transient (stalled/unspawnable, not a genuine absence) — the boolean
+ * `allAvailableGlobalBinDirs` returns can't itself distinguish "not
+ * installed" from "couldn't tell", so a caller that persists this result
+ * needs the callback to know the answer may be incomplete (#1585).
  */
-export async function allAvailableGlobalBinDirs(): Promise<string[]> {
+export async function allAvailableGlobalBinDirs(
+	onTransient?: () => void,
+): Promise<string[]> {
 	const dirs: string[] = [];
 	const seen = new Set<string>();
 	for (const pm of PREFERENCE) {
-		if (!(await isAvailable(pm))) continue;
+		if (!(await isAvailable(pm, onTransient))) continue;
 		for (const dir of await globalBinDirsFor(pm)) {
 			const normalized = path.resolve(dir);
 			if (seen.has(normalized)) continue;
@@ -392,11 +479,18 @@ export async function findGlobalBinary(
 	return undefined;
 }
 
-/** Local `node_modules/.bin/<tool>` walking up from `startDir` to the fs root. */
-function findLocalBinUpwards(
+/**
+ * Local `node_modules/.bin/<tool>` walking up from `startDir` to the fs root.
+ *
+ * Exported so callers that must NOT pay for global-bin discovery can reuse this
+ * walk instead of copying it. `findNodeToolBinary` below adds `findGlobalBinary`,
+ * which spawns a probe per package manager; a caller resolving a command on
+ * every run (knip, #1721) needs the filesystem half only.
+ */
+export function findLocalBinUpwards(
 	tool: string,
 	startDir: string,
-	windowsExt: string,
+	windowsExt = ".cmd",
 ): string | undefined {
 	const names = onWindows() ? [`${tool}${windowsExt}`, tool] : [tool];
 	let dir = path.resolve(startDir);

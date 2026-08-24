@@ -13,7 +13,10 @@ import {
 	type ChildToKill,
 	type OsProcessInfo,
 } from "../../clients/instance-reaper.js";
-import type { InstanceEntry, LspChildEntry } from "../../clients/instance-registry.js";
+import type {
+	InstanceEntry,
+	LspChildEntry,
+} from "../../clients/instance-registry.js";
 
 function child(overrides: Partial<LspChildEntry> = {}): LspChildEntry {
 	return {
@@ -45,9 +48,7 @@ function alivePids(...pids: number[]): (pid: number) => boolean {
 
 describe("decideOrphanReaping", () => {
 	it("live parent pid — instance and all its children are left untouched", () => {
-		const reg = [
-			instance({ pid: 1, lspChildren: [child({ pid: 100 })] }),
-		];
+		const reg = [instance({ pid: 1, lspChildren: [child({ pid: 100 })] })];
 		const decision = decideOrphanReaping(reg, alivePids(1, 100));
 
 		expect(decision.deadInstances).toHaveLength(0);
@@ -57,7 +58,10 @@ describe("decideOrphanReaping", () => {
 
 	it("dead parent pid + live child pid — child goes in the kill list", () => {
 		const reg = [
-			instance({ pid: 1, lspChildren: [child({ pid: 100, serverId: "ast-grep" })] }),
+			instance({
+				pid: 1,
+				lspChildren: [child({ pid: 100, serverId: "ast-grep" })],
+			}),
 		];
 		const decision = decideOrphanReaping(reg, alivePids(100)); // 1 is dead
 
@@ -107,8 +111,14 @@ describe("decideOrphanReaping", () => {
 
 	it("multiple dead instances each contribute their own children to the kill list", () => {
 		const reg = [
-			instance({ pid: 1, lspChildren: [child({ pid: 100, serverId: "ast-grep" })] }),
-			instance({ pid: 2, lspChildren: [child({ pid: 200, serverId: "typescript" })] }),
+			instance({
+				pid: 1,
+				lspChildren: [child({ pid: 100, serverId: "ast-grep" })],
+			}),
+			instance({
+				pid: 2,
+				lspChildren: [child({ pid: 200, serverId: "typescript" })],
+			}),
 		];
 		const decision = decideOrphanReaping(reg, alivePids(100, 200)); // both parents dead
 
@@ -216,13 +226,19 @@ describe("decideOrphanReaping", () => {
 			instance({
 				pid: 1, // dead
 				lspChildren: [
-					child({ pid: 100, marker: "C:/temp/pi-lens-ast-grep/baseline-1.sgconfig.yml" }),
+					child({
+						pid: 100,
+						marker: "C:/temp/pi-lens-ast-grep/baseline-1.sgconfig.yml",
+					}),
 				],
 			}),
 			instance({
 				pid: 2, // ALIVE, different marker
 				lspChildren: [
-					child({ pid: 200, marker: "C:/temp/pi-lens-ast-grep/baseline-2.sgconfig.yml" }),
+					child({
+						pid: 200,
+						marker: "C:/temp/pi-lens-ast-grep/baseline-2.sgconfig.yml",
+					}),
 				],
 			}),
 		];
@@ -313,7 +329,12 @@ describe("decideOrphanReaping — heartbeat staleness (#525)", () => {
 		// matchProcess would verify child 100's identity as GENUINE — that must
 		// not matter, because the kill path must never be reached on staleness.
 		const matchProcess = () => true;
-		const decision = decideOrphanReaping(reg, alivePids(1, 100), matchProcess, NOW);
+		const decision = decideOrphanReaping(
+			reg,
+			alivePids(1, 100),
+			matchProcess,
+			NOW,
+		);
 
 		// Idle-but-alive instance: entry removed (record cleanup) but NO kills.
 		expect(decision.staleInstances.map((i) => i.pid)).toEqual([1]);
@@ -372,7 +393,12 @@ describe("decideOrphanReaping — heartbeat staleness (#525)", () => {
 				lspChildren: [child({ pid: 100 })],
 			}),
 		];
-		const decision = decideOrphanReaping(reg, alivePids(1, 100), () => true, NOW);
+		const decision = decideOrphanReaping(
+			reg,
+			alivePids(1, 100),
+			() => true,
+			NOW,
+		);
 
 		expect(decision.staleInstances).toHaveLength(1);
 		expect(decision.deadInstances).toHaveLength(0);
@@ -390,6 +416,10 @@ function osProc(overrides: Partial<OsProcessInfo> = {}): OsProcessInfo {
 		pid: 5000,
 		parentPid: 4000,
 		command: "C:\\tools\\opengrep.exe --lsp",
+		// #1857: past the spawn-grace window by default, so these eligibility
+		// cases keep testing the property they were written for. The grace guard
+		// itself is covered in instance-reaper-backstop.test.ts.
+		ageMs: 10 * 60 * 1000,
 		...overrides,
 	};
 }
@@ -438,8 +468,16 @@ describe("decideBackstopOrphanReaping", () => {
 	});
 
 	it("multiple untracked candidates with mixed parent liveness — only the dead-parent one is selected", () => {
-		const orphan = osProc({ pid: 5000, parentPid: 4000, command: "opengrep.exe" });
-		const legit = osProc({ pid: 6000, parentPid: 7000, command: "opengrep-core.exe" });
+		const orphan = osProc({
+			pid: 5000,
+			parentPid: 4000,
+			command: "opengrep.exe",
+		});
+		const legit = osProc({
+			pid: 6000,
+			parentPid: 7000,
+			command: "opengrep-core.exe",
+		});
 		const decision = decideBackstopOrphanReaping(
 			[orphan, legit],
 			[],

@@ -66,18 +66,22 @@ export function collectInstallDiagnostics(): InstallDiagnostics {
 	// Walk up to the real package root (dir holding our package.json).
 	let root = pkgDir;
 	for (let i = 0; i < 6; i++) {
-		if (safe(() => fs.existsSync(path.join(root, "package.json")), false)) break;
+		if (safe(() => fs.existsSync(path.join(root, "package.json")), false))
+			break;
 		const up = path.dirname(root);
 		if (up === root) break;
 		root = up;
 	}
 
 	const piLensVersion = safe(() => {
-		const pj = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+		const pj = JSON.parse(
+			fs.readFileSync(path.join(root, "package.json"), "utf8"),
+		);
 		return String(pj.version ?? "unknown");
 	}, "unknown");
 
-	const bunVersion = (globalThis as { Bun?: { version?: string } }).Bun?.version;
+	const bunVersion = (globalThis as { Bun?: { version?: string } }).Bun
+		?.version;
 	const runtime = bunVersion
 		? `bun ${bunVersion}`
 		: `node ${process.versions.node}`;
@@ -88,7 +92,12 @@ export function collectInstallDiagnostics(): InstallDiagnostics {
 	let packageManager: InstallDiagnostics["packageManager"] = "unknown";
 	if (pkgRealDir.includes(`${path.sep}.pnpm${path.sep}`) || behindSymlink) {
 		packageManager = "pnpm-symlinked";
-	} else if (safe(() => fs.existsSync(path.join(root, "node_modules", "typescript")), false)) {
+	} else if (
+		safe(
+			() => fs.existsSync(path.join(root, "node_modules", "typescript")),
+			false,
+		)
+	) {
 		packageManager = "nested";
 	} else {
 		packageManager = "npm-hoisted";
@@ -118,10 +127,15 @@ export function collectInstallDiagnostics(): InstallDiagnostics {
 
 	const grammars = safe(() => {
 		let dir = path.dirname(require.resolve("web-tree-sitter"));
-		while (path.basename(dir) !== "web-tree-sitter" && dir !== path.dirname(dir)) {
+		while (
+			path.basename(dir) !== "web-tree-sitter" &&
+			dir !== path.dirname(dir)
+		) {
 			dir = path.dirname(dir);
 		}
-		return fs.existsSync(path.join(dir, "grammars", "tree-sitter-typescript.wasm"));
+		return fs.existsSync(
+			path.join(dir, "grammars", "tree-sitter-typescript.wasm"),
+		);
 	}, false);
 
 	if (deps.some((d) => !d.resolved)) {
@@ -164,14 +178,20 @@ export function formatInstallDiagnostics(
 	lines.push(`pi-lens:   ${diag.piLensVersion}`);
 	lines.push(`runtime:   ${diag.runtime}`);
 	lines.push(`platform:  ${diag.platform}`);
-	lines.push(`install:   ${diag.packageManager}${diag.behindSymlink ? " (behind symlink)" : ""}`);
+	lines.push(
+		`install:   ${diag.packageManager}${diag.behindSymlink ? " (behind symlink)" : ""}`,
+	);
 	lines.push(`pkg dir:   ${diag.pkgDir}`);
 	if (diag.behindSymlink) lines.push(`real dir:  ${diag.pkgRealDir}`);
 	lines.push("deps:");
 	for (const d of diag.deps) {
-		lines.push(`  ${d.resolved ? "ok  " : "FAIL"} ${d.name}${d.error ? ` — ${d.error}` : ""}`);
+		lines.push(
+			`  ${d.resolved ? "ok  " : "FAIL"} ${d.name}${d.error ? ` — ${d.error}` : ""}`,
+		);
 	}
-	lines.push(`assets:    ast-grep-cli=${diag.astGrepCli ? "ok" : "MISSING"} grammars=${diag.grammars ? "ok" : "MISSING"}`);
+	lines.push(
+		`assets:    ast-grep-cli=${diag.astGrepCli ? "ok" : "MISSING"} grammars=${diag.grammars ? "ok" : "MISSING"}`,
+	);
 	for (const n of diag.notes) lines.push(`note: ${n}`);
 	lines.push(`Please paste this into a report at ${ISSUES_URL}`);
 	lines.push("─────────────────────────────────────────────");

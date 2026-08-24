@@ -1,7 +1,11 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { buildCallGraph, CALL_GRAPH_CACHE_VERSION, saveCallGraph } from "../../clients/call-graph.js";
+import {
+	buildCallGraph,
+	CALL_GRAPH_CACHE_VERSION,
+	saveCallGraph,
+} from "../../clients/call-graph.js";
 import { FactStore } from "../../clients/dispatch/fact-store.js";
 import {
 	moduleReport,
@@ -32,7 +36,8 @@ async function warmGraph(cwd: string) {
 async function warmCallGraph(cwd: string): Promise<void> {
 	const graph = await warmGraph(cwd);
 	const identity = getReviewGraphCacheIdentity(cwd, graph);
-	if (!identity) throw new Error("test graph did not expose a canonical identity");
+	if (!identity)
+		throw new Error("test graph did not expose a canonical identity");
 	const normalized = extractSymbolsAndRefsFromGraph(graph);
 	const callGraph = buildCallGraph(
 		normalized.allSymbols,
@@ -594,9 +599,12 @@ describe("moduleReport — doc-comment first line (#512)", () => {
 		const file = createTempFile(
 			env.tmpDir,
 			"doc2.ts",
-			["// Simple line comment doc.", "function bar(): void {", "  return;", "}"].join(
-				"\n",
-			),
+			[
+				"// Simple line comment doc.",
+				"function bar(): void {",
+				"  return;",
+				"}",
+			].join("\n"),
 		);
 		const report = await moduleReport(file, env.tmpDir);
 		const bar = report.internal.find((e) => e.name === "bar");
@@ -642,12 +650,16 @@ describe("moduleReport — doc-comment first line (#512)", () => {
 		const file = createTempFile(
 			env.tmpDir,
 			"doc.py",
-			["# Greets a person by name.", "def greet(name):", "    return f'hi {name}'"].join(
-				"\n",
-			),
+			[
+				"# Greets a person by name.",
+				"def greet(name):",
+				"    return f'hi {name}'",
+			].join("\n"),
 		);
 		const report = await moduleReport(file, env.tmpDir);
-		const greet = [...report.api, ...report.internal].find((e) => e.name === "greet");
+		const greet = [...report.api, ...report.internal].find(
+			(e) => e.name === "greet",
+		);
 		expect(greet?.doc).toBe("Greets a person by name.");
 	});
 });
@@ -841,7 +853,9 @@ describe("moduleReport — review-graph who-uses-this", () => {
 		await warmGraph(env.tmpDir);
 		const report = await moduleReport(file, env.tmpDir);
 		expect(report.graphBuiltAt).toBeDefined();
-		expect(Number.isFinite(Date.parse(report.graphBuiltAt as string))).toBe(true);
+		expect(Number.isFinite(Date.parse(report.graphBuiltAt as string))).toBe(
+			true,
+		);
 	});
 
 	it("#536: omits graphBuiltAt on a genuinely cold cache (no graph at all)", async () => {
@@ -1071,7 +1085,11 @@ describe("moduleReport — call-graph reader surface (#1070)", () => {
 				"export function callsFooAgain(): number { return foo(); }",
 			].join("\n"),
 		);
-		createTempFile(env.tmpDir, "c.ts", "export function helper(): number { return 1; }\n");
+		createTempFile(
+			env.tmpDir,
+			"c.ts",
+			"export function helper(): number { return 1; }\n",
+		);
 
 		await warmCallGraph(env.tmpDir);
 		const report = await moduleReport("a.ts", env.tmpDir, {
@@ -1082,7 +1100,10 @@ describe("moduleReport — call-graph reader surface (#1070)", () => {
 		expect(report.callGraph).toMatchObject({
 			available: true,
 			truncated: true,
-			coverage: { status: expect.any(String), totalEvidence: expect.any(Number) },
+			coverage: {
+				status: expect.any(String),
+				totalEvidence: expect.any(Number),
+			},
 		});
 		expect(report.callGraph?.callers).toHaveLength(1);
 		expect(report.callGraph?.callers[0]).toMatchObject({
@@ -1097,42 +1118,71 @@ describe("moduleReport — call-graph reader surface (#1070)", () => {
 			targetSymbolId: expect.stringContaining("a.ts:foo"),
 		});
 
-		const callerReport = await moduleReport("b.ts", env.tmpDir, { callGraph: true });
+		const callerReport = await moduleReport("b.ts", env.tmpDir, {
+			callGraph: true,
+		});
 		expect(callerReport.callGraph?.available).toBe(true);
 		expect(callerReport.callGraph?.callees).toEqual(
 			expect.arrayContaining([
-				expect.objectContaining({ file: "a.ts", symbol: "foo", evidenceKind: expect.any(String) }),
+				expect.objectContaining({
+					file: "a.ts",
+					symbol: "foo",
+					evidenceKind: expect.any(String),
+				}),
 			]),
 		);
 	});
 
 	it("reports identity mismatch, legacy, and malformed call-graph caches as stale", async () => {
 		const env = makeEnv();
-		createTempFile(env.tmpDir, "a.ts", "export function foo(): number { return 1; }\n");
+		createTempFile(
+			env.tmpDir,
+			"a.ts",
+			"export function foo(): number { return 1; }\n",
+		);
 		await warmGraph(env.tmpDir);
 		const graph = getCachedReviewGraph(env.tmpDir);
 		expect(graph).toBeDefined();
 		const identity = getReviewGraphCacheIdentity(env.tmpDir, graph);
 		expect(identity).toBeDefined();
-		const cacheFile = path.join(getProjectDataDir(env.tmpDir), "cache", "call-graph.json");
+		const cacheFile = path.join(
+			getProjectDataDir(env.tmpDir),
+			"cache",
+			"call-graph.json",
+		);
 		fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
 
-		const write = (raw: unknown) => fs.writeFileSync(cacheFile, JSON.stringify(raw), "utf-8");
+		const write = (raw: unknown) =>
+			fs.writeFileSync(cacheFile, JSON.stringify(raw), "utf-8");
 		const base = {
 			version: CALL_GRAPH_CACHE_VERSION,
 			builtAt: "2026-08-04T00:00:00.000Z",
 			reviewGraphVersion: identity!.version,
 			reviewGraphSignature: "wrong-signature",
-			edges: [], callees: [], callers: [], inDegree: [], totalRefs: 0, unresolvedRefs: 0,
+			edges: [],
+			callees: [],
+			callers: [],
+			inDegree: [],
+			totalRefs: 0,
+			unresolvedRefs: 0,
 			coverage: {
-				totalEvidence: 0, callsEvidence: 0, referencesEvidence: 0, eligibleEvidence: 0,
-				resolvedEvidence: 0, unresolvedEvidence: 0, typeOnlyEvidence: 0,
-				unsupportedEvidence: 0, sameFileEvidence: 0, duplicateEvidence: 0,
+				totalEvidence: 0,
+				callsEvidence: 0,
+				referencesEvidence: 0,
+				eligibleEvidence: 0,
+				resolvedEvidence: 0,
+				unresolvedEvidence: 0,
+				typeOnlyEvidence: 0,
+				unsupportedEvidence: 0,
+				sameFileEvidence: 0,
+				duplicateEvidence: 0,
 				complete: false,
 			},
 		};
 		write(base);
-		expect((await moduleReport("a.ts", env.tmpDir, { callGraph: true })).callGraph).toMatchObject({
+		expect(
+			(await moduleReport("a.ts", env.tmpDir, { callGraph: true })).callGraph,
+		).toMatchObject({
 			available: false,
 			reason: "stale",
 		});
@@ -1143,7 +1193,9 @@ describe("moduleReport — call-graph reader surface (#1070)", () => {
 		// silently testing nothing (the #1082/#1106 vacuous-fixture class).
 		expect(CALL_GRAPH_CACHE_VERSION).not.toBe(4);
 		write({ ...base, version: 4, reviewGraphSignature: identity!.signature });
-		expect((await moduleReport("a.ts", env.tmpDir, { callGraph: true })).callGraph).toMatchObject({
+		expect(
+			(await moduleReport("a.ts", env.tmpDir, { callGraph: true })).callGraph,
+		).toMatchObject({
 			available: false,
 			reason: "stale",
 		});
@@ -1151,23 +1203,39 @@ describe("moduleReport — call-graph reader surface (#1070)", () => {
 
 	it("reports partial persisted review graphs and a cold graph as unavailable", async () => {
 		const env = makeEnv();
-		createTempFile(env.tmpDir, "a.ts", "export function foo(): number { return 1; }\n");
+		createTempFile(
+			env.tmpDir,
+			"a.ts",
+			"export function foo(): number { return 1; }\n",
+		);
 		const previousCap = process.env.PI_LENS_GRAPH_PERSIST_MAX_ELEMENTS;
 		process.env.PI_LENS_GRAPH_PERSIST_MAX_ELEMENTS = "1";
 		try {
 			await warmGraph(env.tmpDir);
 			flushReviewGraphPersistsForExitForTests();
 			clearReviewGraphWorkspaceCache();
-			const partial = await moduleReport("a.ts", env.tmpDir, { callGraph: true });
-			expect(partial.callGraph).toMatchObject({ available: false, reason: "partial" });
+			const partial = await moduleReport("a.ts", env.tmpDir, {
+				callGraph: true,
+			});
+			expect(partial.callGraph).toMatchObject({
+				available: false,
+				reason: "partial",
+			});
 		} finally {
-			if (previousCap === undefined) delete process.env.PI_LENS_GRAPH_PERSIST_MAX_ELEMENTS;
+			if (previousCap === undefined)
+				delete process.env.PI_LENS_GRAPH_PERSIST_MAX_ELEMENTS;
 			else process.env.PI_LENS_GRAPH_PERSIST_MAX_ELEMENTS = previousCap;
 		}
 
 		const coldEnv = makeEnv();
-		createTempFile(coldEnv.tmpDir, "a.ts", "export function foo(): number { return 1; }\n");
-		const cold = await moduleReport("a.ts", coldEnv.tmpDir, { callGraph: true });
+		createTempFile(
+			coldEnv.tmpDir,
+			"a.ts",
+			"export function foo(): number { return 1; }\n",
+		);
+		const cold = await moduleReport("a.ts", coldEnv.tmpDir, {
+			callGraph: true,
+		});
 		expect(cold.callGraph).toMatchObject({
 			available: false,
 			reason: "review-graph-missing",
@@ -1177,7 +1245,11 @@ describe("moduleReport — call-graph reader surface (#1070)", () => {
 
 	it("is read-only: a cold call-graph request never builds a review graph", async () => {
 		const env = makeEnv();
-		const file = createTempFile(env.tmpDir, "a.ts", "export function foo(): number { return 1; }\n");
+		const file = createTempFile(
+			env.tmpDir,
+			"a.ts",
+			"export function foo(): number { return 1; }\n",
+		);
 		clearReviewGraphWorkspaceCache();
 		const report = await moduleReport(file, env.tmpDir, { callGraph: true });
 		expect(report.callGraph?.reason).toBe("review-graph-missing");
@@ -1189,7 +1261,11 @@ describe("moduleReport — call-graph reader surface (#1070)", () => {
 		const previous = process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES;
 		process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES = "2";
 		try {
-			const file = createTempFile(env.tmpDir, "a.ts", "export function foo(): number { return 1; }\n");
+			const file = createTempFile(
+				env.tmpDir,
+				"a.ts",
+				"export function foo(): number { return 1; }\n",
+			);
 			createTempFile(env.tmpDir, "b.ts", "export const b = 2;\n");
 			createTempFile(env.tmpDir, "c.ts", "export const c = 3;\n");
 			await warmGraph(env.tmpDir);
@@ -1207,7 +1283,8 @@ describe("moduleReport — call-graph reader surface (#1070)", () => {
 			expect(report.callGraph?.callees).toEqual([]);
 			expect(report.provenance?.callGraph).toBe("unavailable:file-cap");
 		} finally {
-			if (previous === undefined) delete process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES;
+			if (previous === undefined)
+				delete process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES;
 			else process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES = previous;
 		}
 	});
@@ -1221,7 +1298,9 @@ describe("moduleReport — call-graph reader surface (#1070)", () => {
 		);
 		await warmCallGraph(env.tmpDir);
 
-		const available = await moduleReport("a.ts", env.tmpDir, { callGraph: true });
+		const available = await moduleReport("a.ts", env.tmpDir, {
+			callGraph: true,
+		});
 		expect(available.callGraph?.available).toBe(true);
 		expect(available.provenance?.callGraph).toBe("cached-call-graph");
 
@@ -1235,9 +1314,15 @@ describe("moduleReport — call-graph reader surface (#1070)", () => {
 		// with a "none" provenance — not "cached-call-graph" and not silently
 		// indistinguishable from "unavailable:file-cap".
 		const coldEnv = makeEnv();
-		createTempFile(coldEnv.tmpDir, "a.ts", "export function foo(): number { return 1; }\n");
+		createTempFile(
+			coldEnv.tmpDir,
+			"a.ts",
+			"export function foo(): number { return 1; }\n",
+		);
 		clearReviewGraphWorkspaceCache();
-		const cold = await moduleReport("a.ts", coldEnv.tmpDir, { callGraph: true });
+		const cold = await moduleReport("a.ts", coldEnv.tmpDir, {
+			callGraph: true,
+		});
 		expect(cold.callGraph?.available).toBe(false);
 		expect(cold.callGraph?.reason).toBe("review-graph-missing");
 		expect(cold.provenance?.callGraph).toBe("none");
@@ -1720,7 +1805,11 @@ describe("readSymbol — doc-comment inclusion (#523 item 1)", () => {
 			].join("\n"),
 		);
 
-		const result = await readSymbol("sample.ts", "isAgentNudgeEnabled", env.tmpDir);
+		const result = await readSymbol(
+			"sample.ts",
+			"isAgentNudgeEnabled",
+			env.tmpDir,
+		);
 
 		expect(result.found).toBe(true);
 		expect(result.startLine).toBe(2); // comment start, not the declaration line
@@ -1787,7 +1876,11 @@ describe("readSymbol — did-you-mean on miss (#523 item 2)", () => {
 		);
 
 		// One character short of the real name.
-		const result = await readSymbol("sample.ts", "isAgentNudgeEnable", env.tmpDir);
+		const result = await readSymbol(
+			"sample.ts",
+			"isAgentNudgeEnable",
+			env.tmpDir,
+		);
 
 		expect(result.found).toBe(false);
 		expect(result.suggestions).toBeDefined();
@@ -1800,12 +1893,18 @@ describe("readSymbol — did-you-mean on miss (#523 item 2)", () => {
 		createTempFile(
 			env.tmpDir,
 			"sample.ts",
-			["export function isAgentNudgeEnabled(): boolean {", "  return true;", "}"].join(
-				"\n",
-			),
+			[
+				"export function isAgentNudgeEnabled(): boolean {",
+				"  return true;",
+				"}",
+			].join("\n"),
 		);
 
-		const result = await readSymbol("sample.ts", "zzzzzzzzzzzzzzzz", env.tmpDir);
+		const result = await readSymbol(
+			"sample.ts",
+			"zzzzzzzzzzzzzzzz",
+			env.tmpDir,
+		);
 
 		expect(result.found).toBe(false);
 		expect(result.suggestions ?? []).toHaveLength(0);
@@ -1900,7 +1999,9 @@ describe("readSymbol — duplicate-name disambiguation (#523 item 4)", () => {
 		expect(result.found).toBe(true);
 		expect(result.ambiguous).toBeDefined();
 		expect(result.ambiguous?.count).toBe(2);
-		expect(result.ambiguous?.kinds.sort()).toEqual(["function", "interface"].sort());
+		expect(result.ambiguous?.kinds.sort()).toEqual(
+			["function", "interface"].sort(),
+		);
 		// First match wins — source order (the interface, declared first).
 		expect(result.kind).toBe("interface");
 	});
@@ -1962,9 +2063,7 @@ describe("tsLangForFile — shared grammar resolution (#887)", () => {
 		"resolves jsts %s to %s — identical to the shared resolver",
 		(file, expected) => {
 			expect(tsLangForFile(file, "jsts")).toBe(expected);
-			expect(tsLangForFile(file, "jsts")).toBe(
-				resolveTreeSitterLanguage(file),
-			);
+			expect(tsLangForFile(file, "jsts")).toBe(resolveTreeSitterLanguage(file));
 		},
 	);
 

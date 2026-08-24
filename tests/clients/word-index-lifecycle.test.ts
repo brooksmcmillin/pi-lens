@@ -16,7 +16,10 @@ import {
 } from "../../clients/project-snapshot.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { handleSessionStart } from "../../clients/runtime-session.js";
-import { buildWordIndex, serializeWordIndex } from "../../clients/word-index.js";
+import {
+	buildWordIndex,
+	serializeWordIndex,
+} from "../../clients/word-index.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 
 // Same LSP stub as runtime-session.test.ts / runtime-session-warm.test.ts: the
@@ -67,8 +70,14 @@ function makeDeps(tmpDir: string, runtime: RuntimeCoordinator, dbg = vi.fn()) {
 			ensureAvailable: async () => false,
 			scanExports: async () => new Map(),
 		},
-		biomeClient: { isAvailable: () => false, ensureAvailable: async () => false },
-		ruffClient: { isAvailable: () => false, ensureAvailable: async () => false },
+		biomeClient: {
+			isAvailable: () => false,
+			ensureAvailable: async () => false,
+		},
+		ruffClient: {
+			isAvailable: () => false,
+			ensureAvailable: async () => false,
+		},
 		knipClient: {
 			isAvailable: () => false,
 			ensureAvailable: async () => false,
@@ -82,12 +91,18 @@ function makeDeps(tmpDir: string, runtime: RuntimeCoordinator, dbg = vi.fn()) {
 				summary: "skipped",
 			}),
 		},
-		jscpdClient: { isAvailable: () => false, ensureAvailable: async () => false },
+		jscpdClient: {
+			isAvailable: () => false,
+			ensureAvailable: async () => false,
+		},
 		deadCodeClients: [],
 		govulncheckClient: { ensureAvailable: async () => false },
 		gitleaksClient: { ensureAvailable: async () => false },
 		trivyClient: { ensureAvailable: async () => false },
-		depChecker: { isAvailable: () => false, ensureAvailable: async () => false },
+		depChecker: {
+			isAvailable: () => false,
+			ensureAvailable: async () => false,
+		},
 		testRunnerClient: {
 			detectRunner: () => ({ runner: "vitest", config: null }),
 			runTestFile: () => ({ failed: 1, error: false }),
@@ -137,10 +152,9 @@ describe("word-index lifecycle — full mode (#348)", () => {
 
 			await handleSessionStart(makeDeps(env.tmpDir, runtime, dbg));
 
-			await vi.waitFor(
-				() => expect(runtime.wordIndex).not.toBeNull(),
-				{ timeout: 5000 },
-			);
+			await vi.waitFor(() => expect(runtime.wordIndex).not.toBeNull(), {
+				timeout: 5000,
+			});
 			expect(runtime.wordIndex!.docCount).toBeGreaterThan(0);
 			expect(
 				dbg.mock.calls.some(([msg]) =>
@@ -224,10 +238,9 @@ describe("word-index lifecycle — full mode (#348)", () => {
 			const runtime1 = new RuntimeCoordinator();
 			runtime1.resetForSession();
 			await handleSessionStart(makeDeps(env.tmpDir, runtime1, vi.fn()));
-			await vi.waitFor(
-				() => expect(runtime1.wordIndex).not.toBeNull(),
-				{ timeout: 5000 },
-			);
+			await vi.waitFor(() => expect(runtime1.wordIndex).not.toBeNull(), {
+				timeout: 5000,
+			});
 
 			// Second run against the same cwd/seq should reuse, not rebuild.
 			const runtime2 = new RuntimeCoordinator();
@@ -272,7 +285,11 @@ describe("word-index lifecycle — full mode (#348)", () => {
 				"package.json",
 				JSON.stringify({ type: "module" }),
 			);
-			createTempFile(env.tmpDir, "src/current.ts", "export const currentNeedle = 1;");
+			createTempFile(
+				env.tmpDir,
+				"src/current.ts",
+				"export const currentNeedle = 1;",
+			);
 			const legacy = serializeWordIndex(
 				buildWordIndex([
 					{ path: "ghost-a.ts", content: "const ghostA = 1;" },

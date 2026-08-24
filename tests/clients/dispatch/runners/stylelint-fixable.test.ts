@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { FactStore } from "../../../../clients/dispatch/fact-store.js";
+import { makeRunnerCtx } from "../../../support/runner-ctx.js";
 import { setupTestEnvironment } from "../../test-utils.js";
 
 const safeSpawnAsync = vi.fn();
@@ -21,9 +21,8 @@ vi.mock("../../../../clients/dispatch/runners/utils/runner-helpers.js", () => ({
 }));
 
 vi.mock("../../../../clients/tool-policy.js", async (importOriginal) => {
-	const actual = await importOriginal<
-		typeof import("../../../../clients/tool-policy.js")
-	>();
+	const actual =
+		await importOriginal<typeof import("../../../../clients/tool-policy.js")>();
 	return {
 		...actual,
 		getLinterPolicyForCwd: () => null,
@@ -32,18 +31,7 @@ vi.mock("../../../../clients/tool-policy.js", async (importOriginal) => {
 });
 
 function createCtx(filePath: string, cwd: string) {
-	return {
-		filePath,
-		cwd,
-		kind: "css" as const,
-		fileRole: "source" as const,
-		pi: { getFlag: () => undefined },
-		autofix: false,
-		deltaMode: true,
-		facts: new FactStore(),
-		hasTool: async () => true,
-		log: () => {},
-	};
+	return makeRunnerCtx(filePath, cwd, { kind: "css" });
 }
 
 describe("stylelint runner — fixable metadata", () => {
@@ -86,7 +74,7 @@ describe("stylelint runner — fixable metadata", () => {
 			});
 
 			const runner = (
-				await import("../../../../clients/dispatch/runners/stylelint.ts")
+				await import("../../../../clients/dispatch/runners/stylelint.js")
 			).default;
 			const result = await runner.run(createCtx(filePath, env.tmpDir) as never);
 

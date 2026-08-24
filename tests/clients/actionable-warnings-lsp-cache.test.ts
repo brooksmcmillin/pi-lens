@@ -3,13 +3,16 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { getProjectDataDir } from "../../clients/file-utils.js";
+import type { LSPCodeAction } from "../../clients/lsp/client.js";
+import { normalizeMapKey } from "../../clients/path-utils.js";
 import { removeTempDirSync } from "./test-utils.js";
 
 // LSP service mock — collects which methods were called so we can assert that
 // the slow path is skipped when the cache is hot.
 const openFile = vi.fn(async () => undefined);
 const getDiagnostics = vi.fn(async () => []);
-const codeAction = vi.fn(async () => []);
+const codeAction = vi.fn(async (): Promise<LSPCodeAction[]> => []);
 let lastKnownReturn: unknown[] | undefined = undefined;
 // When set, the mock honours the content-hash guard the way the real service
 // does: it returns the cached value only if the caller's expectedContentHash
@@ -19,7 +22,9 @@ let cachedForHash: string | undefined = undefined;
 const getLastKnownDiagnostics = vi.fn(
 	(_filePath: string, expectedContentHash?: string) => {
 		if (expectedContentHash !== undefined && cachedForHash !== undefined) {
-			return expectedContentHash === cachedForHash ? lastKnownReturn : undefined;
+			return expectedContentHash === cachedForHash
+				? lastKnownReturn
+				: undefined;
 		}
 		return lastKnownReturn;
 	},
@@ -58,9 +63,8 @@ afterEach(() => {
 });
 
 async function buildReport(args: { dispatchWarnings?: never[] } = {}) {
-	const { buildActionableWarningsReport } = await import(
-		"../../clients/actionable-warnings.js"
-	);
+	const { buildActionableWarningsReport } =
+		await import("../../clients/actionable-warnings.js");
 	return buildActionableWarningsReport({
 		cwd: tmpDir,
 		sessionId: "lens-test",
@@ -156,5 +160,112 @@ describe("actionable-warnings LSP cache short-circuit (#fix-1)", () => {
 		expect(getLastKnownDiagnostics).toHaveBeenCalledTimes(1);
 		expect(openFile).toHaveBeenCalledTimes(1);
 		expect(getDiagnostics).toHaveBeenCalledTimes(1);
+	});
+});
+
+// PRE-#1816 id formula, reproduced here (not imported — it no longer exists
+// in source) only so the two-turn probe below can seed a suppression store
+// exactly as it would have been written by a pre-fix build. Mirrors
+// actionable-warnings.test.ts's own copy.
+function legacyActionableWarningIdForTest(args: {
+	cwd: string;
+	filePath: string;
+	tool?: string;
+	source?: string;
+	code?: string | number;
+	rule?: string;
+	message: string;
+	line?: number;
+}): string {
+	const rel = path.relative(args.cwd, args.filePath).replace(/\\/g, "/");
+	const legacyRelativeFile =
+		rel && !rel.startsWith("..") ? rel : normalizeMapKey(args.filePath);
+	const normalized = args.message.replace(/\s+/g, " ").trim().toLowerCase();
+	const parts = [
+		legacyRelativeFile,
+		args.tool ?? "",
+		args.source ?? "",
+		String(args.code ?? ""),
+		args.rule ?? "",
+		normalized,
+		String(args.line ?? ""),
+	];
+	return `aw:${createHash("sha256").update(parts.join("|")).digest("hex").slice(0, 10)}`;
+}
+
+describe("actionable-warning-state.json migration — LSP two-turn probe (review-round F1, #1816)", () => {
+	// F1: updateWarningState used to re-derive the legacy id from the
+	// RECORD's public `rule` field. recordFromLspDiagnostic computes the
+	// current id from identityArgs carrying NO `rule` (LSP diagnostics don't
+	// have one), then sets `record.rule` afterward to `${source}:${code}`
+	// purely for display. Re-deriving from `record.rule` therefore computed
+	// a DIFFERENT legacy id than the one `suppressionFor` actually checked —
+	// so turn 1 correctly reported the warning as suppressed (via
+	// suppressionFor's own correct legacy lookup), but updateWarningState's
+	// mismatched recompute then wrote a FRESH "active" entry under the
+	// current id (since neither `state.warnings[id]` nor its own,
+	// wrongly-computed "legacy" key existed yet). Turn 2 then found that
+	// "active" entry under the current id FIRST — short-circuiting before
+	// ever falling back to the true legacy key — and the warning silently
+	// un-suppressed itself. The fix carries `legacyId` on the record from
+	// `suppressionFor`'s own computation; `updateWarningState` now only
+	// ever reads that field.
+	it("stays suppressed on a second turn for an LSP-origin warning suppressed under the pre-#1816 id", async () => {
+		const diag = {
+			severity: 2,
+			message: "'x' is declared but never used",
+			code: 6133,
+			range: {
+				start: { line: 0, character: 0 },
+				end: { line: 0, character: 5 },
+			},
+			source: "ts",
+		};
+		lastKnownReturn = [diag];
+		codeAction.mockImplementation(async () => [
+			{ title: "Remove unused declaration", kind: "quickfix" },
+		]);
+
+		const filePath = path.join(tmpDir, "src", "main.ts");
+		// The true pre-#1816 write: LSP identity args carry NO `rule` — only
+		// `tool`/`source`/`code`/`message`/`line`.
+		const legacyId = legacyActionableWarningIdForTest({
+			cwd: tmpDir,
+			filePath,
+			tool: "lsp",
+			source: "ts",
+			code: "6133",
+			message: diag.message,
+			line: 1,
+		});
+
+		const statePath = path.join(
+			getProjectDataDir(tmpDir),
+			"cache",
+			"actionable-warning-state.json",
+		);
+		fs.mkdirSync(path.dirname(statePath), { recursive: true });
+		fs.writeFileSync(
+			statePath,
+			JSON.stringify({
+				warnings: {
+					[legacyId]: { status: "suppressed", reason: "pre-#1816 LSP mark" },
+				},
+			}),
+		);
+
+		const findLspWarning = (report: {
+			files: Array<{ warnings: Array<{ tool: string; suppressed: boolean }> }>;
+		}) => report.files.flatMap((f) => f.warnings).find((w) => w.tool === "lsp");
+
+		const turn1 = await buildReport();
+		const turn1Warning = findLspWarning(turn1);
+		expect(turn1Warning).toBeDefined();
+		expect(turn1Warning?.suppressed).toBe(true);
+
+		const turn2 = await buildReport();
+		const turn2Warning = findLspWarning(turn2);
+		expect(turn2Warning).toBeDefined();
+		expect(turn2Warning?.suppressed).toBe(true);
 	});
 });

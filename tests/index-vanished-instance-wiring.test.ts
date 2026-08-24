@@ -30,7 +30,11 @@ vi.mock("../clients/bootstrap.js", () => ({
 		ruffClient: { isAvailable: () => false },
 		knipClient: {
 			isAvailable: () => false,
-			analyze: async () => ({ success: false, summary: "unavailable", issues: [] }),
+			analyze: async () => ({
+				success: false,
+				summary: "unavailable",
+				issues: [],
+			}),
 		},
 		jscpdClient: { isAvailable: () => false },
 		depChecker: { isAvailable: () => false },
@@ -45,9 +49,12 @@ vi.mock("../clients/runtime-session.js", () => ({
 	handleSessionStart: async () => {},
 }));
 
-const { logSessionStartSpy } = vi.hoisted(() => ({ logSessionStartSpy: vi.fn() }));
+const { logSessionStartSpy } = vi.hoisted(() => ({
+	logSessionStartSpy: vi.fn(),
+}));
 vi.mock("../clients/sessionstart-logger.js", async (importActual) => {
-	const actual = await importActual<typeof import("../clients/sessionstart-logger.js")>();
+	const actual =
+		await importActual<typeof import("../clients/sessionstart-logger.js")>();
 	return {
 		...actual,
 		logSessionStart: (msg: string) => logSessionStartSpy(msg),
@@ -134,7 +141,9 @@ describe("index session_start vanished-instance wiring (#1123 item 2)", () => {
 		// The reaper's own dead-pid prune still ran afterward — the marker read
 		// must not have swallowed or blocked it.
 		const raw = JSON.parse(fs.readFileSync(registryFilePath(), "utf-8"));
-		expect(raw.instances.map((i: { pid: number }) => i.pid)).not.toContain(deadPid);
+		expect(raw.instances.map((i: { pid: number }) => i.pid)).not.toContain(
+			deadPid,
+		);
 	});
 
 	it("logs nothing when the registry has no dead entries", async () => {

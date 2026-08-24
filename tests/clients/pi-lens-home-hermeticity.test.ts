@@ -48,9 +48,8 @@ describe("machine-global writers route through PI_LENS_HOME, never the real home
 			? fs.statSync(realRegistryPath).mtimeMs
 			: undefined;
 
-		const { registerInstance } = await import(
-			"../../clients/instance-registry.js"
-		);
+		const { registerInstance } =
+			await import("../../clients/instance-registry.js");
 		await registerInstance("/some/override-routed/project");
 
 		const overriddenPath = path.join(overrideDir, "instances.json");
@@ -81,8 +80,6 @@ describe("machine-global writers route through PI_LENS_HOME, never the real home
 		expect(await readInstanceRegistry()).toHaveLength(0);
 
 		// Confirm it operated under the override, not the real homedir dir.
-		expect(fs.existsSync(path.join(overrideDir, "instances.json"))).toBe(
-			true,
-		);
+		expect(fs.existsSync(path.join(overrideDir, "instances.json"))).toBe(true);
 	});
 });

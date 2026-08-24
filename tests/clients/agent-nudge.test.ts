@@ -3,6 +3,7 @@ import {
 	_resetAgentNudgeForTests,
 	consumeAgentNudge,
 	isAgentNudgeEnabled,
+	noteAuthoritativeContentAttachment,
 	recordCrossProcessTouches,
 	wireAgentNudgeSubscriber,
 } from "../../clients/agent-nudge.js";
@@ -169,7 +170,9 @@ describe("agent-nudge — inline context nudge for out-of-view mutations (#485)"
 
 		expect(consumeAgentNudge()).toBeDefined();
 		const phase = logLatency.mock.calls
-			.map((c) => c[0] as { phase?: string; metadata?: Record<string, unknown> })
+			.map(
+				(c) => c[0] as { phase?: string; metadata?: Record<string, unknown> },
+			)
 			.find((e) => e.phase === "agent_nudge");
 		expect(phase?.metadata).toMatchObject({
 			filesTotal: 1,
@@ -184,7 +187,9 @@ describe("agent-nudge — inline context nudge for out-of-view mutations (#485)"
 		bus.emit(touchedPayload({ paths: ["/repo/src/z.ts"] }));
 		expect(consumeAgentNudge()).toBeDefined();
 		const phase2 = logLatency.mock.calls
-			.map((c) => c[0] as { phase?: string; metadata?: Record<string, unknown> })
+			.map(
+				(c) => c[0] as { phase?: string; metadata?: Record<string, unknown> },
+			)
 			.find((e) => e.phase === "agent_nudge");
 		expect(phase2?.metadata).toMatchObject({ filesFiltered: 0 });
 	});
@@ -234,7 +239,9 @@ describe("agent-nudge — inline context nudge for out-of-view mutations (#485)"
 		const result = consumeAgentNudge();
 		expect(result).toBeDefined();
 		// Exactly one file counted despite three events.
-		expect(result?.messages[0].content).toMatch(/^\[pi-lens automated context.*\] pi-lens: 1 file/);
+		expect(result?.messages[0].content).toMatch(
+			/^\[pi-lens automated context.*\] pi-lens: 1 file/,
+		);
 	});
 
 	it("caps the visible name list at 5 and summarizes the rest as 'and N more'", () => {
@@ -252,7 +259,9 @@ describe("agent-nudge — inline context nudge for out-of-view mutations (#485)"
 		expect(content).toContain("8 file(s)");
 		expect(content).toContain("and 3 more");
 		// Only 5 concrete names should appear before the "and N more" tail.
-		const nameCount = paths.filter((p) => content.includes(p.split("/").pop() as string)).length;
+		const nameCount = paths.filter((p) =>
+			content.includes(p.split("/").pop() as string),
+		).length;
 		expect(nameCount).toBe(5);
 	});
 
@@ -278,8 +287,22 @@ describe("agent-nudge — inline context nudge for out-of-view mutations (#485)"
 		wireAgentNudgeSubscriber({ events: bus, getReadGuard: () => guard });
 
 		expect(() => bus.emit(null)).not.toThrow();
-		expect(() => bus.emit({ v: 2, source: "pi-lens", reason: "autofix", paths: ["/repo/src/a.ts"] })).not.toThrow();
-		expect(() => bus.emit({ v: 1, source: "someone-else", reason: "autofix", paths: ["/repo/src/a.ts"] })).not.toThrow();
+		expect(() =>
+			bus.emit({
+				v: 2,
+				source: "pi-lens",
+				reason: "autofix",
+				paths: ["/repo/src/a.ts"],
+			}),
+		).not.toThrow();
+		expect(() =>
+			bus.emit({
+				v: 1,
+				source: "someone-else",
+				reason: "autofix",
+				paths: ["/repo/src/a.ts"],
+			}),
+		).not.toThrow();
 
 		expect(consumeAgentNudge()).toBeUndefined();
 	});
@@ -323,7 +346,9 @@ describe("agent-nudge — inline context nudge for out-of-view mutations (#485)"
 		expect(result).toBeDefined();
 		expect(result?.messages[0].content).toContain("pi-lens");
 		expect(result?.messages[0].content).toContain("a.ts");
-		expect(result?.messages[0].content).toContain("working-tree changes to these are expected");
+		expect(result?.messages[0].content).toContain(
+			"working-tree changes to these are expected",
+		);
 	});
 
 	it("never publishes back to the bus (read-only subscriber)", () => {
@@ -460,7 +485,9 @@ describe("agent-nudge — inline context nudge for out-of-view mutations (#485)"
 
 			expect(consumeAgentNudge()).toBeDefined();
 			const phase = logLatency.mock.calls
-				.map((c) => c[0] as { phase?: string; metadata?: Record<string, unknown> })
+				.map(
+					(c) => c[0] as { phase?: string; metadata?: Record<string, unknown> },
+				)
 				.find((e) => e.phase === "agent_nudge");
 			expect(phase?.metadata).toMatchObject({
 				originLocal: 1,
@@ -490,6 +517,157 @@ describe("agent-nudge — inline context nudge for out-of-view mutations (#485)"
 			]);
 
 			expect(consumeAgentNudge()).toBeUndefined();
+		});
+	});
+
+	describe("#1464: a write that already handed the agent its post-fix bytes", () => {
+		function seedLocalTouch(paths: string[], reason = "autofix") {
+			const guard = createReadGuard("s1");
+			for (const p of paths) guard.recordRead(createReadRecord(p));
+			const bus = makeBus();
+			wireAgentNudgeSubscriber({ events: bus, getReadGuard: () => guard });
+			bus.emit(touchedPayload({ paths, reason }));
+			return bus;
+		}
+
+		it("suppresses the nudge for a path whose content was attached", () => {
+			seedLocalTouch(["/repo/src/a.ts"]);
+			noteAuthoritativeContentAttachment("/repo/src/a.ts", true);
+
+			expect(consumeAgentNudge()).toBeUndefined();
+		});
+
+		it("still nudges when the attachment was size-capped or budget-degraded", () => {
+			seedLocalTouch(["/repo/src/a.ts"]);
+			// The write path saw a postMutation but did NOT attach it (over the
+			// per-file cap, or the bash aggregate budget overrode the per-file
+			// "attached"). The agent holds only a re-read warning, so the nudge
+			// is the signal — this is the inversion guard against over-suppressing.
+			noteAuthoritativeContentAttachment("/repo/src/a.ts", false);
+
+			const result = consumeAgentNudge();
+			expect(result).toBeDefined();
+			expect(result?.messages[0].content).toContain("a.ts");
+		});
+
+		it("re-arms a suppressed path when the aggregate budget overrides the per-file decision", () => {
+			seedLocalTouch(["/repo/src/a.ts"]);
+			// Inner per-file call attached; the outer bash aggregate-budget loop
+			// degraded the same path afterwards. Last decision wins.
+			noteAuthoritativeContentAttachment("/repo/src/a.ts", true);
+			noteAuthoritativeContentAttachment("/repo/src/a.ts", false);
+
+			expect(consumeAgentNudge()).toBeDefined();
+		});
+
+		it("drops only the delivered path from a batch, never its side-effect siblings", () => {
+			// One autofix run changed the write target AND a side-effect file;
+			// only the target's bytes ride along in the tool result.
+			seedLocalTouch(["/repo/src/a.ts", "/repo/src/side.ts"]);
+			noteAuthoritativeContentAttachment("/repo/src/a.ts", true);
+
+			const result = consumeAgentNudge();
+			expect(result).toBeDefined();
+			expect(result?.messages[0].content).toContain("1 file(s)");
+			expect(result?.messages[0].content).toContain("side.ts");
+			expect(result?.messages[0].content).not.toContain("a.ts");
+		});
+
+		it("a later touch of the same path re-arms the nudge (deferred format at agent_end)", () => {
+			const bus = seedLocalTouch(["/repo/src/a.ts"]);
+			noteAuthoritativeContentAttachment("/repo/src/a.ts", true);
+			// Format is deferred to agent_end by default, so the file changes
+			// again AFTER those authoritative bytes went out — they are stale.
+			bus.emit(touchedPayload({ paths: ["/repo/src/a.ts"], reason: "format" }));
+
+			const result = consumeAgentNudge();
+			expect(result).toBeDefined();
+			expect(result?.messages[0].content).toContain("reformatted");
+		});
+
+		it("a cross-process touch of the same path re-arms the nudge", () => {
+			seedLocalTouch(["/repo/src/a.ts"]);
+			noteAuthoritativeContentAttachment("/repo/src/a.ts", true);
+			recordCrossProcessTouches([
+				{ path: "/repo/src/a.ts", reason: "autofix" },
+			]);
+
+			expect(consumeAgentNudge()).toBeDefined();
+		});
+
+		it("matches the accumulator key across separator forms", () => {
+			const guard = createReadGuard("s1");
+			guard.recordRead(createReadRecord("C:\\repo\\src\\b.ts"));
+			const bus = makeBus();
+			wireAgentNudgeSubscriber({ events: bus, getReadGuard: () => guard });
+			// bus-publish normalizes to forward slashes; the write path hands the
+			// attachment decision its own `path.resolve` form.
+			bus.emit(touchedPayload({ paths: ["C:/repo/src/b.ts"] }));
+			noteAuthoritativeContentAttachment("C:\\repo\\src\\b.ts", true);
+
+			expect(consumeAgentNudge()).toBeUndefined();
+		});
+
+		it("is a no-op for a path the accumulator never admitted", () => {
+			expect(() =>
+				noteAuthoritativeContentAttachment("/repo/src/never-seen.ts", true),
+			).not.toThrow();
+			expect(consumeAgentNudge()).toBeUndefined();
+		});
+
+		it("counts content-delivered drops separately from relevance-filter drops", () => {
+			logLatency.mockClear();
+			const guard = createReadGuard("s1");
+			guard.recordRead(createReadRecord("/repo/src/a.ts"));
+			guard.recordRead(createReadRecord("/repo/src/side.ts"));
+			const bus = makeBus();
+			wireAgentNudgeSubscriber({ events: bus, getReadGuard: () => guard });
+			bus.emit(
+				touchedPayload({
+					paths: ["/repo/src/a.ts", "/repo/src/side.ts", "/repo/src/unread.ts"],
+				}),
+			);
+			noteAuthoritativeContentAttachment("/repo/src/a.ts", true);
+
+			expect(consumeAgentNudge()).toBeDefined();
+			const phase = logLatency.mock.calls
+				.map(
+					(c) => c[0] as { phase?: string; metadata?: Record<string, unknown> },
+				)
+				.find((e) => e.phase === "agent_nudge");
+			expect(phase?.metadata).toMatchObject({
+				filesTotal: 1,
+				filesFiltered: 1,
+				filesContentDelivered: 1,
+			});
+		});
+
+		it("records the suppression even when the whole batch is delivered", () => {
+			logLatency.mockClear();
+			seedLocalTouch(["/repo/src/a.ts"]);
+			noteAuthoritativeContentAttachment("/repo/src/a.ts", true);
+
+			expect(consumeAgentNudge()).toBeUndefined();
+			const phase = logLatency.mock.calls
+				.map(
+					(c) => c[0] as { phase?: string; metadata?: Record<string, unknown> },
+				)
+				.find((e) => e.phase === "agent_nudge");
+			expect(phase?.metadata).toMatchObject({
+				filesTotal: 0,
+				filesContentDelivered: 1,
+			});
+		});
+
+		it("clears the delivered mark with the accumulator, so the next turn starts fresh", () => {
+			seedLocalTouch(["/repo/src/a.ts"]);
+			noteAuthoritativeContentAttachment("/repo/src/a.ts", true);
+			expect(consumeAgentNudge()).toBeUndefined();
+
+			// Next turn-gap: a deferred autofix touches the same file with no
+			// attachment behind it. The stale suppression must not carry over.
+			seedLocalTouch(["/repo/src/a.ts"]);
+			expect(consumeAgentNudge()).toBeDefined();
 		});
 	});
 });

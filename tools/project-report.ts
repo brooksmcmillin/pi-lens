@@ -42,7 +42,8 @@ export function createProjectReportTool(getProjectRoot: () => string) {
 				`${details?.hubs ?? 0} hub(s)`,
 				`${details?.entryPoints ?? 0} entry point(s)`,
 			];
-			const view = details?.view && details.view !== "default" ? ` [${details.view}]` : "";
+			const view =
+				details?.view && details.view !== "default" ? ` [${details.view}]` : "";
 			return `project_report  ${parts.join(" · ")}${view}`;
 		}),
 		parameters: Type.Object({
@@ -62,7 +63,7 @@ export function createProjectReportTool(getProjectRoot: () => string) {
 				Type.String({
 					enum: ["default", "compact"],
 					description:
-						'Payload tier. compact (cheapest) returns a line-oriented TEXT rendering instead of JSON. Default returns JSON.',
+						"Payload tier. compact (cheapest) returns a line-oriented TEXT rendering instead of JSON. Default returns JSON.",
 				}),
 			),
 		}),
@@ -98,7 +99,8 @@ export function createProjectReportTool(getProjectRoot: () => string) {
 					content: [
 						{
 							type: "text" as const,
-							text: report.hint ?? "No review graph cached for this workspace yet.",
+							text:
+								report.hint ?? "No review graph cached for this workspace yet.",
 						},
 					],
 					isError: true,

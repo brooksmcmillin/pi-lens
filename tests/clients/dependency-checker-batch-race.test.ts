@@ -54,7 +54,10 @@ describe("DependencyChecker.checkFilesBatch — concurrency race guard (#766)", 
 		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pilens-madge-batch-"));
 		aPath = path.join(tmp, "a.ts");
 		cPath = path.join(tmp, "c.ts");
-		fs.writeFileSync(aPath, "import { b } from './b.js';\nexport const a = 1;\n");
+		fs.writeFileSync(
+			aPath,
+			"import { b } from './b.js';\nexport const a = 1;\n",
+		);
 		fs.writeFileSync(cPath, "export const c = 1;\n");
 	});
 
@@ -65,34 +68,31 @@ describe("DependencyChecker.checkFilesBatch — concurrency race guard (#766)", 
 	/** Resolve slowly for `a.ts` (reports a circular dep) and fast for `c.ts`
 	 * (reports none) — completion order is REVERSED from array order. */
 	function mockSpawnDeps() {
-		safeSpawnAsync.mockImplementation(
-			async (_cmd: string, args: string[]) => {
-				const target = args[args.length - 1];
-				if (target === aPath) {
-					// Resolves LAST despite being array-FIRST.
-					await new Promise((resolve) => setTimeout(resolve, 40));
-					return {
-						status: 0,
-						error: null,
-						stdout: JSON.stringify([[aPath, path.join(tmp, "b.ts")]]),
-						stderr: "",
-					};
-				}
-				// c.ts resolves immediately with no cycle.
+		safeSpawnAsync.mockImplementation(async (_cmd: string, args: string[]) => {
+			const target = args[args.length - 1];
+			if (target === aPath) {
+				// Resolves LAST despite being array-FIRST.
+				await new Promise((resolve) => setTimeout(resolve, 40));
 				return {
 					status: 0,
 					error: null,
-					stdout: JSON.stringify([]),
+					stdout: JSON.stringify([[aPath, path.join(tmp, "b.ts")]]),
 					stderr: "",
 				};
-			},
-		);
+			}
+			// c.ts resolves immediately with no cycle.
+			return {
+				status: 0,
+				error: null,
+				stdout: JSON.stringify([]),
+				stderr: "",
+			};
+		});
 	}
 
 	it("folds results in ARRAY order, not completion order, matching the sequential loop", async () => {
-		const { DependencyChecker } = await import(
-			"../../clients/dependency-checker.js"
-		);
+		const { DependencyChecker } =
+			await import("../../clients/dependency-checker.js");
 		mockSpawnDeps();
 
 		const checker = new DependencyChecker();
@@ -115,9 +115,8 @@ describe("DependencyChecker.checkFilesBatch — concurrency race guard (#766)", 
 	});
 
 	it("matches a true sequential for…await run of the same files/mocks", async () => {
-		const { DependencyChecker } = await import(
-			"../../clients/dependency-checker.js"
-		);
+		const { DependencyChecker } =
+			await import("../../clients/dependency-checker.js");
 
 		// --- Sequential baseline ---
 		mockSpawnDeps();

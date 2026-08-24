@@ -47,9 +47,8 @@ describe("tool availability async patterns", () => {
 	});
 
 	it("dependency-checker ensureAvailable should return a Promise", async () => {
-		const { DependencyChecker } = await import(
-			"../../clients/dependency-checker.js"
-		);
+		const { DependencyChecker } =
+			await import("../../clients/dependency-checker.js");
 		const client = new DependencyChecker();
 
 		const result = client.ensureAvailable();

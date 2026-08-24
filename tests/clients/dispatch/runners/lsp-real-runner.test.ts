@@ -86,9 +86,7 @@ d("LSP dispatch runner — real server (#873)", () => {
 			line: 1,
 			column: 1,
 		});
-		expect(getLSPService().getAliveServerIds()).toContain(
-			"fake-real-runner",
-		);
+		expect(getLSPService().getAliveServerIds()).toContain("fake-real-runner");
 	}, 30_000);
 
 	it("attaches real quick-fix suggestions to blocking diagnostics", async () => {
@@ -114,9 +112,7 @@ d("LSP dispatch runner — real server (#873)", () => {
 
 		const result = await lspRunner.run(ctx);
 
-		expect(getLSPService().getAliveServerIds()).toContain(
-			"fake-real-runner",
-		);
+		expect(getLSPService().getAliveServerIds()).toContain("fake-real-runner");
 		expect(result).toMatchObject({
 			status: "succeeded",
 			diagnostics: [],

@@ -78,9 +78,9 @@ describe("getProjectScaleBase", () => {
 
 describe("deriveBudget / ratio table reproduces today's five defaults", () => {
 	it("project-diagnostics scanner: 0.25x2000 = 500", () => {
-		expect(
-			deriveBudget(PROJECT_SCALE_RATIOS.projectDiagnosticsScanner),
-		).toBe(500);
+		expect(deriveBudget(PROJECT_SCALE_RATIOS.projectDiagnosticsScanner)).toBe(
+			500,
+		);
 		expect(getProjectDiagnosticsScannerMaxFiles()).toBe(500);
 	});
 
@@ -178,7 +178,9 @@ describe("taperedReviewGraphMaxFiles (#775 R1)", () => {
 	});
 
 	it("is monotonically non-decreasing as the base grows", () => {
-		const bases = [1, 500, 2_000, 4_000, 4_001, 6_000, 12_000, 50_000, 1_000_000];
+		const bases = [
+			1, 500, 2_000, 4_000, 4_001, 6_000, 12_000, 50_000, 1_000_000,
+		];
 		let previous = 0;
 		for (const base of bases) {
 			const value = taperedReviewGraphMaxFiles(base);

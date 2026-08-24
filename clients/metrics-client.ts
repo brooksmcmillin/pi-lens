@@ -39,9 +39,7 @@ export class MetricsClient {
 		new Map();
 
 	constructor(verbose = false) {
-		this.log = verbose
-			? createSubsystemLogger("metrics")
-			: () => {};
+		this.log = verbose ? createSubsystemLogger("metrics") : () => {};
 	}
 
 	/**

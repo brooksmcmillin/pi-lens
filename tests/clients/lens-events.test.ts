@@ -54,7 +54,10 @@ describe("lens inter-extension events", () => {
 			throw new Error("This extension ctx is stale after session replacement");
 		});
 		const newEmit = vi.fn((_event: string, _payload: unknown): void => {});
-		let currentBus: { emit: (event: string, payload: unknown) => void; ctx: undefined } = {
+		let currentBus: {
+			emit: (event: string, payload: unknown) => void;
+			ctx: undefined;
+		} = {
 			emit: oldEmit,
 			ctx: undefined,
 		};
@@ -82,7 +85,9 @@ describe("lens inter-extension events", () => {
 			emit,
 			ctx: {
 				isIdle: () => {
-					throw new Error("This extension ctx is stale after session replacement");
+					throw new Error(
+						"This extension ctx is stale after session replacement",
+					);
 				},
 			},
 		}));

@@ -40,7 +40,10 @@ describe("render-compact", () => {
 	});
 
 	it("errors render in error style for both views", () => {
-		const err = { content: [{ type: "text" as const, text: "boom" }], isError: true };
+		const err = {
+			content: [{ type: "text" as const, text: "boom" }],
+			isError: true,
+		};
 		expect(selectCompactText(err, {}, true, () => "s").style).toBe("error");
 		expect(selectCompactText(err, {}, false, () => "s").style).toBe("error");
 	});

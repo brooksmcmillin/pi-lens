@@ -44,7 +44,12 @@ describe("rule-id-normalize", () => {
 	});
 
 	it("is idempotent (normalize is a fixed point)", () => {
-		const forms = ["no-eval", "ast-grep:no-eval", "no-eval-js", "ast-grep:no-eval-js"];
+		const forms = [
+			"no-eval",
+			"ast-grep:no-eval",
+			"no-eval-js",
+			"ast-grep:no-eval-js",
+		];
 		for (const form of forms) {
 			const once = normalizeRuleId(form);
 			const twice = normalizeRuleId(once);

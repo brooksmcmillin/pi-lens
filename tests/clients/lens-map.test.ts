@@ -125,19 +125,55 @@ describe("aggregateGraphToFiles", () => {
 			{ id: "a.js#file", kind: "file", language: "js", filePath: "a.js" },
 			{ id: "b.ts#file", kind: "file", language: "ts", filePath: "b.ts" },
 			{ id: "b.js#file", kind: "file", language: "js", filePath: "b.js" },
-			{ id: "a.ts#run", kind: "symbol", language: "ts", filePath: "a.ts", symbolName: "run", symbolKind: "function" },
-			{ id: "a.js#run", kind: "symbol", language: "js", filePath: "a.js", symbolName: "run", symbolKind: "function" },
-			{ id: "b.ts#target", kind: "symbol", language: "ts", filePath: "b.ts", symbolName: "target", symbolKind: "function" },
-			{ id: "b.js#target", kind: "symbol", language: "js", filePath: "b.js", symbolName: "target", symbolKind: "function" },
+			{
+				id: "a.ts#run",
+				kind: "symbol",
+				language: "ts",
+				filePath: "a.ts",
+				symbolName: "run",
+				symbolKind: "function",
+			},
+			{
+				id: "a.js#run",
+				kind: "symbol",
+				language: "js",
+				filePath: "a.js",
+				symbolName: "run",
+				symbolKind: "function",
+			},
+			{
+				id: "b.ts#target",
+				kind: "symbol",
+				language: "ts",
+				filePath: "b.ts",
+				symbolName: "target",
+				symbolKind: "function",
+			},
+			{
+				id: "b.js#target",
+				kind: "symbol",
+				language: "js",
+				filePath: "b.js",
+				symbolName: "target",
+				symbolKind: "function",
+			},
 		];
-		const result = aggregateGraphToFiles(makeGraph(nodes, [
-			{ from: "a.ts#run", to: "b.ts#target", kind: "calls" },
-			{ from: "a.js#run", to: "b.js#target", kind: "calls" },
-		]));
+		const result = aggregateGraphToFiles(
+			makeGraph(nodes, [
+				{ from: "a.ts#run", to: "b.ts#target", kind: "calls" },
+				{ from: "a.js#run", to: "b.js#target", kind: "calls" },
+			]),
+		);
 		expect(result.compiledTwinCount).toBe(2);
-		expect(result.nodes.find((node) => node.id === idFor("a.ts"))?.symbolCount).toBe(1);
-		expect(result.nodes.find((node) => node.id === idFor("b.ts"))?.symbolCount).toBe(1);
-		expect(result.edges).toEqual([{ from: idFor("a.ts"), to: idFor("b.ts"), weight: 1 }]);
+		expect(
+			result.nodes.find((node) => node.id === idFor("a.ts"))?.symbolCount,
+		).toBe(1);
+		expect(
+			result.nodes.find((node) => node.id === idFor("b.ts"))?.symbolCount,
+		).toBe(1);
+		expect(result.edges).toEqual([
+			{ from: idFor("a.ts"), to: idFor("b.ts"), weight: 1 },
+		]);
 	});
 
 	it("merges multiple compiled siblings onto one source identity", () => {
@@ -148,23 +184,73 @@ describe("aggregateGraphToFiles", () => {
 			{ id: "dep.ts#file", kind: "file", language: "ts", filePath: "dep.ts" },
 			{ id: "dep.js#file", kind: "file", language: "js", filePath: "dep.js" },
 			{ id: "dep.mjs#file", kind: "file", language: "js", filePath: "dep.mjs" },
-			{ id: "src.ts#run", kind: "symbol", language: "ts", filePath: "src.ts", symbolName: "run", symbolKind: "function" },
-			{ id: "src.js#run", kind: "symbol", language: "js", filePath: "src.js", symbolName: "run", symbolKind: "function" },
-			{ id: "src.mjs#run", kind: "symbol", language: "js", filePath: "src.mjs", symbolName: "run", symbolKind: "function" },
-			{ id: "dep.ts#target", kind: "symbol", language: "ts", filePath: "dep.ts", symbolName: "target", symbolKind: "function" },
-			{ id: "dep.js#target", kind: "symbol", language: "js", filePath: "dep.js", symbolName: "target", symbolKind: "function" },
-			{ id: "dep.mjs#target", kind: "symbol", language: "js", filePath: "dep.mjs", symbolName: "target", symbolKind: "function" },
+			{
+				id: "src.ts#run",
+				kind: "symbol",
+				language: "ts",
+				filePath: "src.ts",
+				symbolName: "run",
+				symbolKind: "function",
+			},
+			{
+				id: "src.js#run",
+				kind: "symbol",
+				language: "js",
+				filePath: "src.js",
+				symbolName: "run",
+				symbolKind: "function",
+			},
+			{
+				id: "src.mjs#run",
+				kind: "symbol",
+				language: "js",
+				filePath: "src.mjs",
+				symbolName: "run",
+				symbolKind: "function",
+			},
+			{
+				id: "dep.ts#target",
+				kind: "symbol",
+				language: "ts",
+				filePath: "dep.ts",
+				symbolName: "target",
+				symbolKind: "function",
+			},
+			{
+				id: "dep.js#target",
+				kind: "symbol",
+				language: "js",
+				filePath: "dep.js",
+				symbolName: "target",
+				symbolKind: "function",
+			},
+			{
+				id: "dep.mjs#target",
+				kind: "symbol",
+				language: "js",
+				filePath: "dep.mjs",
+				symbolName: "target",
+				symbolKind: "function",
+			},
 		];
-		const result = aggregateGraphToFiles(makeGraph(nodes, [
-			{ from: "src.ts#run", to: "dep.ts#target", kind: "calls" },
-			{ from: "src.js#run", to: "dep.js#target", kind: "calls" },
-			{ from: "src.mjs#run", to: "dep.mjs#target", kind: "calls" },
-		]));
+		const result = aggregateGraphToFiles(
+			makeGraph(nodes, [
+				{ from: "src.ts#run", to: "dep.ts#target", kind: "calls" },
+				{ from: "src.js#run", to: "dep.js#target", kind: "calls" },
+				{ from: "src.mjs#run", to: "dep.mjs#target", kind: "calls" },
+			]),
+		);
 		expect(result.compiledTwinCount).toBe(4);
 		expect(result.nodes).toHaveLength(2);
-		expect(result.nodes.find((node) => node.id === idFor("src.ts"))?.symbolCount).toBe(1);
-		expect(result.nodes.find((node) => node.id === idFor("dep.ts"))?.symbolCount).toBe(1);
-		expect(result.edges).toEqual([{ from: idFor("src.ts"), to: idFor("dep.ts"), weight: 1 }]);
+		expect(
+			result.nodes.find((node) => node.id === idFor("src.ts"))?.symbolCount,
+		).toBe(1);
+		expect(
+			result.nodes.find((node) => node.id === idFor("dep.ts"))?.symbolCount,
+		).toBe(1);
+		expect(result.edges).toEqual([
+			{ from: idFor("src.ts"), to: idFor("dep.ts"), weight: 1 },
+		]);
 	});
 
 	it("dedupes absolute multi-twin sets after native path normalization", () => {
@@ -188,7 +274,12 @@ describe("aggregateGraphToFiles", () => {
 			const nodes: ReviewGraphNode[] = [];
 			const edges: ReviewGraphEdge[] = [];
 			const addFile = (file: string, prefix: string, kind: string) => {
-				nodes.push({ id: `${prefix}:file`, kind: "file", language: kind, filePath: file });
+				nodes.push({
+					id: `${prefix}:file`,
+					kind: "file",
+					language: kind,
+					filePath: file,
+				});
 				nodes.push({
 					id: `${prefix}:run`,
 					kind: "symbol",
@@ -200,19 +291,31 @@ describe("aggregateGraphToFiles", () => {
 			};
 			addFile(source, "src-ts", "ts");
 			addFile(dep, "dep-ts", "ts");
-			for (const [index, file] of sourceTwins.entries()) addFile(file, `src-${index}`, "js");
-			for (const [index, file] of depTwins.entries()) addFile(file, `dep-${index}`, "js");
+			for (const [index, file] of sourceTwins.entries())
+				addFile(file, `src-${index}`, "js");
+			for (const [index, file] of depTwins.entries())
+				addFile(file, `dep-${index}`, "js");
 			edges.push({ from: "src-ts:run", to: "dep-ts:run", kind: "calls" });
 			for (let index = 0; index < sourceTwins.length; index += 1) {
-				edges.push({ from: `src-${index}:run`, to: `dep-${index}:run`, kind: "calls" });
+				edges.push({
+					from: `src-${index}:run`,
+					to: `dep-${index}:run`,
+					kind: "calls",
+				});
 			}
 
 			const result = aggregateGraphToFiles(makeGraph(nodes, edges));
 			expect(result.compiledTwinCount).toBe(6);
 			expect(result.nodes).toHaveLength(2);
-			expect(result.nodes.find((node) => node.id === idFor(source))?.symbolCount).toBe(1);
-			expect(result.nodes.find((node) => node.id === idFor(dep))?.symbolCount).toBe(1);
-			expect(result.edges).toEqual([{ from: idFor(source), to: idFor(dep), weight: 1 }]);
+			expect(
+				result.nodes.find((node) => node.id === idFor(source))?.symbolCount,
+			).toBe(1);
+			expect(
+				result.nodes.find((node) => node.id === idFor(dep))?.symbolCount,
+			).toBe(1);
+			expect(result.edges).toEqual([
+				{ from: idFor(source), to: idFor(dep), weight: 1 },
+			]);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -396,9 +499,7 @@ describe("aggregateGraphToFiles", () => {
 
 		const ids = result.nodes.map((n) => n.id).sort();
 		expect(ids).toEqual([idFor("a.ts"), idFor("contest.ts")].sort());
-		expect(result.nodes.some((n) => n.id === idFor("foo.test.ts"))).toBe(
-			false,
-		);
+		expect(result.nodes.some((n) => n.id === idFor("foo.test.ts"))).toBe(false);
 		expect(result.testFileCount).toBe(1);
 
 		// The edge into the excluded test file is gone; only the a->contest
@@ -577,7 +678,7 @@ describe("renderMapHtml", () => {
 	}
 
 	it("escapes a malicious file name so it cannot break out of the JSON script tag", () => {
-		const malicious = '</script><img src=x onerror=alert(1)>';
+		const malicious = "</script><img src=x onerror=alert(1)>";
 		const html = renderMapHtml(
 			payload({
 				nodes: [

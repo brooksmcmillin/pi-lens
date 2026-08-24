@@ -87,6 +87,19 @@ interface NdjsonWriterState {
 	ensuredDir: boolean;
 	/** One canonical exit flusher per file, never one per logger facade. */
 	exitFlusher: () => void;
+	/**
+	 * Writes that failed even after the reopen-and-retry-once recovery below
+	 * (#1970). Process-lifetime, in-memory only — never itself durably logged
+	 * from inside this module, so a sink that is failing cannot recurse into
+	 * writing a record ABOUT its own failure through the same broken sink.
+	 * `degradation-ledger.ts` reads this via `getSinkWriteFailures()` and
+	 * folds it into `getDegradationSummary()` at READ time, so the count
+	 * reaches `pilens_health` without this module ever performing I/O about
+	 * its own I/O failure. Reset at session_start alongside the ledger
+	 * (`resetSinkWriteFailures`, catalog shape 17: a process-lifetime latch
+	 * must re-arm at session_start).
+	 */
+	writeFailures: number;
 }
 
 const NDJSON_GLOBAL_STATE_SCHEMA = "pi-lens.ndjson-logger.state";
@@ -168,14 +181,14 @@ if (isSharedWriterState(existingGlobalState)) {
 	existingGlobalState.version = NDJSON_GLOBAL_STATE_VERSION;
 	ndjsonGlobalState = existingGlobalState;
 } else if (existingGlobalState === undefined) {
-	ndjsonGlobalState = (globalStateHost[NDJSON_GLOBAL_STATE_KEY] = {
+	ndjsonGlobalState = globalStateHost[NDJSON_GLOBAL_STATE_KEY] = {
 		schema: NDJSON_GLOBAL_STATE_SCHEMA,
 		version: NDJSON_GLOBAL_STATE_VERSION,
 		writers: new Map<string, NdjsonWriterState>(),
 		exitFlushers: new Set<() => void>(),
 		exitHandlerRegistered: false,
 		registeredLogFiles: new Set<string>(),
-	});
+	};
 } else if (isLegacyGlobalState(existingGlobalState)) {
 	// Do not mutate or replace this state: its private queues and exit flusher
 	// closures are not observable, so adopting it would falsely claim safety.
@@ -219,6 +232,42 @@ export function _resetRegisteredLogFilesForTest(): void {
 	registeredLogFiles.clear();
 }
 
+export interface SinkWriteFailureSummary {
+	/** Canonicalized absolute path of the sink that lost writes. */
+	file: string;
+	/** Writes that failed even after the reopen-and-retry-once recovery (#1970). */
+	droppedCount: number;
+}
+
+/**
+ * Snapshot of unrecovered write losses, one entry per sink that has any
+ * (#1970). Pure in-memory read — no I/O, so a caller (`degradation-ledger.ts`)
+ * can fold this into a durable ledger entry without this module ever writing
+ * a record about its own failure through the sink that is failing. See
+ * `NdjsonWriterState.writeFailures` for the recursion-hazard rationale.
+ */
+export function getSinkWriteFailures(): SinkWriteFailureSummary[] {
+	if (!ndjsonGlobalState) return [];
+	const result: SinkWriteFailureSummary[] = [];
+	for (const state of ndjsonGlobalState.writers.values()) {
+		if (state.writeFailures > 0) {
+			result.push({ file: state.file, droppedCount: state.writeFailures });
+		}
+	}
+	return result;
+}
+
+/**
+ * Session-boundary reset (catalog shape 17: a process-lifetime latch must
+ * re-arm at session_start). Wired into `resetDegradationLedger()` so both
+ * reset together; also used directly by tests.
+ */
+export function resetSinkWriteFailures(): void {
+	if (!ndjsonGlobalState) return;
+	for (const state of ndjsonGlobalState.writers.values())
+		state.writeFailures = 0;
+}
+
 function requireCurrentGlobalState(): NdjsonGlobalState {
 	if (ndjsonGlobalState) return ndjsonGlobalState;
 	throw new Error(
@@ -248,23 +297,52 @@ function assertCompatibleWriterOptions(
 	maxBytes?: number,
 	backupPath?: string,
 ): void {
-	if (existing.maxBytes === maxBytes && existing.backupPath === backupPath) return;
+	if (existing.maxBytes === maxBytes && existing.backupPath === backupPath)
+		return;
 	throw new Error(
 		`createNdjsonLogger: incompatible options for shared path ${existing.file}; ` +
-		`the first writer's maxBytes/backupPath must be reused`,
+			`the first writer's maxBytes/backupPath must be reused`,
 	);
 }
 
+function writeQueueItemSync(state: NdjsonWriterState, item: QueueItem): void {
+	if (item.kind === "truncate") {
+		fs.writeFileSync(state.file, "");
+	} else {
+		rotateIfNeeded(state);
+		fs.appendFileSync(state.file, item.line);
+	}
+}
+
+/**
+ * The pi-analyze #15 shape (#1970): a write that throws — including the
+ * `ERR_STREAM_DESTROYED` a torn-down sink produces — gets one reopen-and-
+ * retry before it counts as a loss. There is no persistent handle to close
+ * here (every write already opens, writes, and closes in one call), so
+ * "reopen" means dropping the cached `ensuredDir` assumption and
+ * re-verifying the parent directory before the retry — the one piece of
+ * cross-write state this module holds that a destroyed sink could have
+ * invalidated. An unrecovered write is counted, never thrown or retried a
+ * second time (`applyQueueItemSync`, `applyQueueItemAsync`, and the batched
+ * write in `drainLoop` skip DIFFERENT amounts of work per queue item, so
+ * each keeps its own copy of this two-step shape rather than sharing one
+ * generic retry wrapper across sync/async).
+ */
 function applyQueueItemSync(state: NdjsonWriterState, item: QueueItem): void {
 	ensureDirSync(state);
-	runBestEffort(() => {
-		if (item.kind === "truncate") {
-			fs.writeFileSync(state.file, "");
-		} else {
-			rotateIfNeeded(state);
-			fs.appendFileSync(state.file, item.line);
-		}
-	});
+	try {
+		writeQueueItemSync(state, item);
+		return;
+	} catch {
+		// fall through to the one reopen-and-retry
+	}
+	state.ensuredDir = false;
+	ensureDirSync(state);
+	try {
+		writeQueueItemSync(state, item);
+	} catch {
+		state.writeFailures += 1;
+	}
 }
 
 function flushStateSync(state: NdjsonWriterState): void {
@@ -309,6 +387,8 @@ function createWriterState(
 		// be enrolled, but it must never get a second queue or exit flusher.
 		assertCompatibleWriterOptions(existing, maxBytes, backupPath);
 		if (!exitFlushers.has(existing.exitFlusher)) registerWriter(existing);
+		// A state adopted from a pre-#1970 module graph predates this field.
+		if (typeof existing.writeFailures !== "number") existing.writeFailures = 0;
 		return existing;
 	}
 
@@ -322,6 +402,7 @@ function createWriterState(
 	state.syncRepairItems = null;
 	state.ensuredDir = false;
 	state.exitFlusher = () => flushStateSync(state);
+	state.writeFailures = 0;
 	globalState.writers.set(file, state);
 	registerWriter(state);
 	return state;
@@ -358,24 +439,40 @@ function rotateIfNeeded(state: NdjsonWriterState): void {
 	}
 }
 
+async function writeQueueItemAsync(
+	state: NdjsonWriterState,
+	item: QueueItem,
+): Promise<void> {
+	if (item.kind === "truncate") {
+		await fs.promises.writeFile(state.file, "");
+	} else {
+		// Rotation is deliberately synchronous here. This function is only
+		// reached from the already-deferred drain, and keeping stat/rm/rename
+		// in one synchronous section prevents flushSync from racing a late
+		// async rename after it has written new data.
+		rotateIfNeeded(state);
+		await fs.promises.appendFile(state.file, item.line);
+	}
+}
+
+/** See `applyQueueItemSync`'s doc comment for the reopen-and-retry-once shape. */
 async function applyQueueItemAsync(
 	state: NdjsonWriterState,
 	item: QueueItem,
 ): Promise<void> {
 	await ensureDirAsync(state);
 	try {
-		if (item.kind === "truncate") {
-			await fs.promises.writeFile(state.file, "");
-		} else {
-			// Rotation is deliberately synchronous here. This function is only
-			// reached from the already-deferred drain, and keeping stat/rm/rename
-			// in one synchronous section prevents flushSync from racing a late
-			// async rename after it has written new data.
-			rotateIfNeeded(state);
-			await fs.promises.appendFile(state.file, item.line);
-		}
+		await writeQueueItemAsync(state, item);
+		return;
 	} catch {
-		// telemetry is best-effort
+		// fall through to the one reopen-and-retry
+	}
+	state.ensuredDir = false;
+	await ensureDirAsync(state);
+	try {
+		await writeQueueItemAsync(state, item);
+	} catch {
+		state.writeFailures += 1;
 	}
 }
 
@@ -390,13 +487,12 @@ async function drainLoop(state: NdjsonWriterState): Promise<void> {
 			item.kind === "line"
 				? state.queue.findIndex((queued) => queued.kind === "truncate")
 				: 0;
-		const pendingEnd = truncateIndex === -1 ? state.queue.length : truncateIndex;
+		const pendingEnd =
+			truncateIndex === -1 ? state.queue.length : truncateIndex;
 		const pending =
-			item.kind === "truncate"
-				? [item]
-				: state.queue.slice(0, pendingEnd);
+			item.kind === "truncate" ? [item] : state.queue.slice(0, pendingEnd);
 		state.inFlightBatch = pending;
-		try {
+		const writeBatch = async (): Promise<void> => {
 			if (item.kind === "truncate") {
 				await fs.promises.writeFile(state.file, "");
 			} else {
@@ -411,8 +507,23 @@ async function drainLoop(state: NdjsonWriterState): Promise<void> {
 						.join(""),
 				);
 			}
+		};
+		try {
+			await writeBatch();
 		} catch {
-			// telemetry is best-effort
+			// Reopen-and-retry once (#1970, pi-analyze #15 shape): a destroyed
+			// sink (ERR_STREAM_DESTROYED) or a directory that vanished mid-session
+			// gets exactly one recovery attempt before the batch counts as a loss.
+			state.ensuredDir = false;
+			await ensureDirAsync(state);
+			try {
+				await writeBatch();
+			} catch {
+				// Unrecovered: count every line in this batch as dropped. Purely
+				// in-memory — see `writeFailures`'s doc comment for why this must
+				// never itself attempt a durable write through this same sink.
+				state.writeFailures += pending.length;
+			}
 		}
 		for (const written of pending) {
 			// flushSync may have drained this prefix while the append is in

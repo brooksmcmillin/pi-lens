@@ -81,6 +81,7 @@ export const LANGUAGE_POLICY: Record<FileKind, LanguagePolicy> = {
 	gleam: { lspCapable: true },
 	ocaml: { lspCapable: true },
 	clojure: { lspCapable: true },
+	cue: { lspCapable: true },
 	terraform: { lspCapable: true },
 	terragrunt: { lspCapable: false },
 	nix: { lspCapable: true },
@@ -221,6 +222,9 @@ const PRIMARY_DISPATCH_GROUPS: Partial<Record<FileKind, RunnerGroup>> = {
 	},
 	ocaml: { mode: "fallback", runnerIds: ["lsp"], filterKinds: ["ocaml"] },
 	clojure: { mode: "fallback", runnerIds: ["lsp"], filterKinds: ["clojure"] },
+	// #1522: cuelsp reports syntax/parse errors only; cue-vet covers the
+	// evaluation-error class the language server deliberately doesn't publish.
+	cue: { mode: "all", runnerIds: ["lsp", "cue-vet"], filterKinds: ["cue"] },
 	terraform: {
 		mode: "all",
 		runnerIds: ["lsp", "tflint", "trivy-config"],

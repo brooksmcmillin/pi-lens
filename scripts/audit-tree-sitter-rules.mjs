@@ -39,7 +39,10 @@ for (const file of files) {
 	if (!inlineTier) {
 		missingInlineTier++;
 	} else {
-		inlineTierCounts.set(inlineTier, (inlineTierCounts.get(inlineTier) ?? 0) + 1);
+		inlineTierCounts.set(
+			inlineTier,
+			(inlineTierCounts.get(inlineTier) ?? 0) + 1,
+		);
 	}
 }
 

@@ -31,11 +31,11 @@ export function rankFilesByReverseDependencyCentrality(
 		...Object.keys(index.importedBy),
 	]);
 	return [...files].sort((a, b) => {
-		const fanIn = (index.importedBy[b]?.length ?? 0) -
-			(index.importedBy[a]?.length ?? 0);
+		const fanIn =
+			(index.importedBy[b]?.length ?? 0) - (index.importedBy[a]?.length ?? 0);
 		if (fanIn !== 0) return fanIn;
-		const fanOut = (index.imports[b]?.length ?? 0) -
-			(index.imports[a]?.length ?? 0);
+		const fanOut =
+			(index.imports[b]?.length ?? 0) - (index.imports[a]?.length ?? 0);
 		return fanOut || a.localeCompare(b);
 	});
 }
@@ -59,14 +59,32 @@ function addEdge(
 }
 
 function normalizeIndex(index: ReverseDependencyIndex): ReverseDependencyIndex {
-	const fileKeys = new Set([
-		...Object.keys(index.imports),
+	// #1814 F2: `imports[file]` asserts "we know file's complete import
+	// list" — true only when `index.imports` already has a raw entry for
+	// `file` (from a real per-file scan). `importedBy[file]` asserts "we
+	// know SOME importer of file", which holds regardless of whether `file`
+	// itself was ever scanned. Materializing `imports[file] = []` for every
+	// key in their UNION (the pre-fix behavior) fabricated the first claim
+	// for a file that is only an `importedBy` target — imported by
+	// something, never itself scanned — indistinguishable downstream from a
+	// file the scan confirmed has zero imports.
+	// `clients/lsp/workspace-diagnostics-cache.ts`'s `getImports` reads this
+	// map directly and relies on `undefined` meaning "not covered". Only
+	// `importedBy` keeps the union treatment: "who imports me" has no
+	// equivalent "was I scanned" precondition to fabricate.
+	const importFileKeys = [...new Set(Object.keys(index.imports))].sort((a, b) =>
+		a.localeCompare(b),
+	);
+	const allFileKeys = new Set([
+		...importFileKeys,
 		...Object.keys(index.importedBy),
 	]);
 	const imports: Record<string, string[]> = {};
-	const importedBy: Record<string, string[]> = {};
-	for (const file of [...fileKeys].sort((a, b) => a.localeCompare(b))) {
+	for (const file of importFileKeys) {
 		imports[file] = sortedUnique(index.imports[file] ?? []);
+	}
+	const importedBy: Record<string, string[]> = {};
+	for (const file of [...allFileKeys].sort((a, b) => a.localeCompare(b))) {
 		importedBy[file] = sortedUnique(index.importedBy[file] ?? []);
 	}
 	return { ...index, imports, importedBy };
@@ -133,7 +151,10 @@ export function patchReverseDependencyIndex(
 			imports[file] = newTargets;
 			importedBy[file] ??= [];
 			for (const target of newTargets) {
-				importedBy[target] = sortedUnique([...(importedBy[target] ?? []), file]);
+				importedBy[target] = sortedUnique([
+					...(importedBy[target] ?? []),
+					file,
+				]);
 			}
 		} else {
 			delete imports[file];
@@ -171,12 +192,24 @@ export function buildReverseDependencyIndexFromSnapshot(
 
 	for (const [filePath, file] of fileEntries) {
 		const normalized = normalizeMapKey(file.path || filePath);
-		index.imports[normalized] = sortedUnique(file.imports ?? []);
-		index.importedBy[normalized] ??= [];
-		for (const imported of index.imports[normalized]) {
-			index.importedBy[imported] ??= [];
-			index.importedBy[imported].push(normalized);
+		// #1814 F2: only materialize `imports[normalized]` when this
+		// snapshot entry genuinely recorded an import list. `file.imports`
+		// absent means this file was captured in the snapshot (e.g. a
+		// lightweight touch) but never had its own imports scanned —
+		// defaulting to `[]` here fabricated the "covered, zero imports"
+		// claim `getImports` (workspace-diagnostics-cache.ts) distinguishes
+		// from "not covered". `hasFileImports` above already anticipates a
+		// mixed snapshot with entries in both states; this closes the gap
+		// per entry.
+		if (Array.isArray(file.imports)) {
+			const imports = sortedUnique(file.imports);
+			index.imports[normalized] = imports;
+			for (const imported of imports) {
+				index.importedBy[imported] ??= [];
+				index.importedBy[imported].push(normalized);
+			}
 		}
+		index.importedBy[normalized] ??= [];
 	}
 	for (const [filePath, importers] of Object.entries(reverseDeps)) {
 		const normalized = normalizeMapKey(filePath);
@@ -184,9 +217,19 @@ export function buildReverseDependencyIndexFromSnapshot(
 			...(index.importedBy[normalized] ?? []),
 			...importers,
 		]);
-		index.imports[normalized] ??= [];
+		// #1814 F2 (class sweep): do NOT fabricate `imports[normalized] = []`
+		// here — `reverseDeps` records who imports `normalized`, not what
+		// `normalized` itself imports. Leave `imports[normalized]` exactly
+		// as the fileEntries loop above established it: present and real
+		// from a scan, or absent because this file was never scanned.
 		for (const importer of index.importedBy[normalized]) {
-			index.imports[importer] ??= [];
+			// #1814 F2: only record this edge on `importer`'s own imports
+			// list when that list is already genuinely known (a real
+			// per-file scan from the fileEntries loop above) — appending to
+			// an absent list would silently promote "we know ONE edge from
+			// reverseDeps" into "we know importer's COMPLETE import list",
+			// the same false-coverage claim closed above.
+			if (index.imports[importer] === undefined) continue;
 			if (!index.imports[importer].includes(normalized)) {
 				index.imports[importer].push(normalized);
 			}

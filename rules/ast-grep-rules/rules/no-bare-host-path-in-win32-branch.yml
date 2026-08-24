@@ -1,6 +1,8 @@
 id: no-bare-host-path-in-win32-branch
 language: TypeScript
 severity: warning
+metadata:
+  category: pi-lens-self-scan
 message: "Use win32 path operations inside a branch committed to Windows path semantics"
 note: |
   A branch guarded by isWindowsPath/isFullyQualifiedWin32 has committed to

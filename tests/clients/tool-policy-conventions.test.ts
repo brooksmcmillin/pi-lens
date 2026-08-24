@@ -81,42 +81,39 @@ describe("tool-policy × project-conventions wiring (Phase 3 of #118)", () => {
 		const cwd = projectCwd();
 		// Make the linter policy path resolve: drop a package.json so the
 		// JS/TS branch returns a real policy rather than undefined.
-		createTempFile(
-			cwd,
-			"package.json",
-			JSON.stringify({ name: "fixture" }),
-		);
+		createTempFile(cwd, "package.json", JSON.stringify({ name: "fixture" }));
 		saveSnapshotWithConventions(cwd, [
 			{ id: "react", confidence: "high" },
 			{ id: "next", confidence: "high" },
 		]);
 
-		const policy = getLinterPolicyForCwd(path.join(cwd, "src", "main.tsx"), cwd);
+		const policy = getLinterPolicyForCwd(
+			path.join(cwd, "src", "main.tsx"),
+			cwd,
+		);
 		expect(policy).toBeDefined();
 		expect(policy?.frameworkHints?.sort()).toEqual(["next", "react"]);
 	});
 
 	it("leaves frameworkHints undefined when no snapshot exists, even when the policy resolves", () => {
 		const cwd = projectCwd();
-		createTempFile(
+		createTempFile(cwd, "package.json", JSON.stringify({ name: "fixture" }));
+		const policy = getLinterPolicyForCwd(
+			path.join(cwd, "src", "main.tsx"),
 			cwd,
-			"package.json",
-			JSON.stringify({ name: "fixture" }),
 		);
-		const policy = getLinterPolicyForCwd(path.join(cwd, "src", "main.tsx"), cwd);
 		expect(policy).toBeDefined();
 		expect(policy?.frameworkHints).toBeUndefined();
 	});
 
 	it("leaves frameworkHints undefined when the snapshot has no detected frameworks", () => {
 		const cwd = projectCwd();
-		createTempFile(
-			cwd,
-			"package.json",
-			JSON.stringify({ name: "fixture" }),
-		);
+		createTempFile(cwd, "package.json", JSON.stringify({ name: "fixture" }));
 		saveSnapshotWithConventions(cwd, []);
-		const policy = getLinterPolicyForCwd(path.join(cwd, "src", "main.tsx"), cwd);
+		const policy = getLinterPolicyForCwd(
+			path.join(cwd, "src", "main.tsx"),
+			cwd,
+		);
 		expect(policy).toBeDefined();
 		expect(policy?.frameworkHints).toBeUndefined();
 	});

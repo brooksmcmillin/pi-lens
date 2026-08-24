@@ -67,7 +67,9 @@ function findMarkdownFiles(
 		if (collected.count >= RULES_SCAN_MAX_FILES) break;
 		const fullPath = path.join(dir, entry.name);
 		if (entry.isDirectory()) {
-			results.push(...findMarkdownFiles(fullPath, baseDir, depth + 1, collected));
+			results.push(
+				...findMarkdownFiles(fullPath, baseDir, depth + 1, collected),
+			);
 		} else if (entry.isFile() && entry.name.endsWith(".md")) {
 			collected.count += 1;
 			results.push({
@@ -150,7 +152,9 @@ export function formatRulesForPrompt(result: RuleScanResult): string {
 
 		const list = shown.map((r) => `- \`${r.relativePath}\``);
 		if (sortedRules.length > shown.length) {
-			list.push(`- ... and ${sortedRules.length - shown.length} more in ${source}`);
+			list.push(
+				`- ... and ${sortedRules.length - shown.length} more in ${source}`,
+			);
 		}
 		sections.push(`From ${source}/:\n${list.join("\n")}`);
 	}

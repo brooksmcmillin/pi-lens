@@ -1,5 +1,0 @@
----
-section: Fixed
----
-
-- **Cascade "could not compute impact" records now name the file that actually caused it (closes #1550)** — When a cascade run cannot enumerate a file's dependents, pi-lens writes one `cascade_indeterminate` line to `cascade.log`. That line labelled itself with the turn's first edited file and listed its reasons with no file attached — but the runs it summarises carry their own paths, and a run can be carried over from an earlier turn or belong to a file the turn never edited. So the log blamed the wrong file: a Markdown edit was credited with a missing graph node it could never have produced, and a plain source file was credited with the test-file-exclusion reason that only applies to tests. Each reason is now attributed to the file that produced it. A missing graph node also records what was looked up and what the graph held nearest to it — file-node count, surviving symbol nodes, known siblings in the same directory — so a cold graph, an unadmitted file, and a genuine graph inconsistency read differently in the log. Agent-facing advisories were already correct and are unchanged.

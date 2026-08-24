@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -12,8 +13,11 @@ import {
 	getFileDiagnosticSummaries,
 	getSessionLanguages,
 	importWidgetState,
+	isBlocking,
 	reconcileCascadeNeighborLspErrors,
+	reconcileCorrelatedScanDiagnostics,
 	reconcileScanDiagnostics,
+	reconcileStaleWidgetDependencyBlockers,
 	reconcileStaleWidgetFiles,
 	recordDiagnostics,
 	recordFormatter,
@@ -25,7 +29,7 @@ import {
 	setRenderCallback,
 	setSessionLanguages,
 	WIDGET_STATE_VERSION,
-} from "../../clients/widget-state.ts";
+} from "../../clients/widget-state.js";
 
 const e = String.fromCharCode(27);
 const theme = {
@@ -70,39 +74,67 @@ describe("inactive file-record eviction", () => {
 		const files = [
 			{
 				filePath: "displayed.ts",
-				runners: [], formatters: [],
+				runners: [],
+				formatters: [],
 				diagnostics: [{ severity: "error", message: "live", observedAt: old }],
-				allDiagnostics: [{ severity: "error", message: "live", observedAt: old }],
+				allDiagnostics: [
+					{ severity: "error", message: "live", observedAt: old },
+				],
 				diagnosticCounts: { blocking: 1, errors: 1, warnings: 0 },
-				hasFinalDiagnosticsSnapshot: true, touchedAt: old,
+				hasFinalDiagnosticsSnapshot: true,
+				touchedAt: old,
 			},
 			...Array.from({ length: 1024 }, (_, i) => ({
-				filePath: `inactive-${i}.ts`, runners: [], formatters: [],
-				diagnostics: [], allDiagnostics: [],
+				filePath: `inactive-${i}.ts`,
+				runners: [],
+				formatters: [],
+				diagnostics: [],
+				allDiagnostics: [],
 				diagnosticCounts: { blocking: 0, errors: 0, warnings: 0 },
-				hasFinalDiagnosticsSnapshot: false, touchedAt: old + i,
+				hasFinalDiagnosticsSnapshot: false,
+				touchedAt: old + i,
 			})),
 		];
-		expect(importWidgetState({
-			version: WIDGET_STATE_VERSION, sessionLanguages: [], files,
-		} as Parameters<typeof importWidgetState>[0])).toBe(true);
+		expect(
+			importWidgetState({
+				version: WIDGET_STATE_VERSION,
+				sessionLanguages: [],
+				files,
+			} as Parameters<typeof importWidgetState>[0]),
+		).toBe(true);
 		const snapshot = __testing.getWidgetStateSnapshot();
 		expect(snapshot.files).toHaveLength(1024);
-		expect(snapshot.files.some((file) => file.filePath === "displayed.ts")).toBe(true);
-		expect(snapshot.files.some((file) => file.filePath === "inactive-0.ts")).toBe(false);
+		expect(
+			snapshot.files.some((file) => file.filePath === "displayed.ts"),
+		).toBe(true);
+		expect(
+			snapshot.files.some((file) => file.filePath === "inactive-0.ts"),
+		).toBe(false);
 	});
 });
 
 describe("getFileDiagnostics (#502 single-file accessor)", () => {
 	it("returns undefined for a file never recorded", () => {
-		expect(getFileDiagnostics(`${process.cwd()}/never-seen.ts`)).toBeUndefined();
+		expect(
+			getFileDiagnostics(`${process.cwd()}/never-seen.ts`),
+		).toBeUndefined();
 	});
 
 	it("returns the full uncapped set for a recorded file", () => {
 		const filePath = `${process.cwd()}/single.ts`;
 		recordDiagnostics(filePath, [
-			{ severity: "error", rule: "typescript:2322", message: "bad", tool: "tsserver" },
-			{ severity: "warning", rule: "no-console", message: "noisy", tool: "eslint" },
+			{
+				severity: "error",
+				rule: "typescript:2322",
+				message: "bad",
+				tool: "tsserver",
+			},
+			{
+				severity: "warning",
+				rule: "no-console",
+				message: "noisy",
+				tool: "eslint",
+			},
 		]);
 
 		const result = getFileDiagnostics(filePath);
@@ -112,7 +144,9 @@ describe("getFileDiagnostics (#502 single-file accessor)", () => {
 
 	it("returns an explicit empty array when the file was recorded clean", () => {
 		const filePath = `${process.cwd()}/clean.ts`;
-		recordDiagnostics(filePath, [{ severity: "error", message: "bad", tool: "eslint" }]);
+		recordDiagnostics(filePath, [
+			{ severity: "error", message: "bad", tool: "eslint" },
+		]);
 		recordDiagnostics(filePath, []); // transitions to clean
 
 		const result = getFileDiagnostics(filePath);
@@ -216,6 +250,98 @@ describe("getFileDiagnosticSummaries", () => {
 });
 
 describe("widget-state renderWidget", () => {
+	it("preserves stamped rows and stamps new correlated project rows", () => {
+		const filePath = `${process.cwd()}/timestamp-merge.ts`;
+		reconcileCorrelatedScanDiagnostics(
+			filePath,
+			[
+				{
+					severity: "error",
+					semantic: "blocking",
+					message: "old finding",
+					line: 1,
+					tool: "ast-grep",
+					rule: "old",
+					observedAt: 1000,
+				},
+				{
+					severity: "error",
+					semantic: "blocking",
+					message: "new project finding",
+					line: 2,
+					tool: "ast-grep-napi",
+					rule: "new",
+				},
+			],
+			undefined,
+			2000,
+		);
+
+		expect(getFileDiagnostics(filePath)).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ message: "old finding", observedAt: 1000 }),
+				expect.objectContaining({
+					message: "new project finding",
+					observedAt: 2000,
+				}),
+			]),
+		);
+	});
+
+	it("renders the projected project-row URI as an OSC-8 line link", () => {
+		const filePath = `${process.cwd()}/project-row-link.ts`;
+		reconcileCorrelatedScanDiagnostics(filePath, [
+			{
+				severity: "error",
+				semantic: "blocking",
+				message: "project finding",
+				line: 7,
+				tool: "ast-grep-napi",
+				rule: "self-scan",
+				uri: `${pathToFileURL(filePath).href}#L7`,
+			},
+		]);
+
+		const rendered = renderWidget(120, theme).join("\n");
+		expect(rendered).toContain(
+			`\x1b]8;;${pathToFileURL(filePath).href}#L7\x1b\\L7`,
+		);
+	});
+
+	it("counts napi self-scan findings when the correlated LSP lane is unconfirmed (#1888)", () => {
+		const filePath = `${process.cwd()}/coverage-window.ts`;
+		const lspFindings = Array.from({ length: 9 }, (_, index) => ({
+			severity: "error",
+			semantic: "blocking",
+			message: `LSP finding ${index + 1}`,
+			tool: "ast-grep",
+			rule: `lsp-${index + 1}`,
+		}));
+		recordDiagnostics(filePath, lspFindings);
+
+		// This is the real post-correlation widget-state seam used by
+		// lens_diagnostics mode=full. The LSP contribution is retained from the
+		// broken-window state while the independent napi lane contributes three
+		// current findings.
+		reconcileCorrelatedScanDiagnostics(filePath, [
+			...lspFindings,
+			...Array.from({ length: 3 }, (_, index) => ({
+				severity: "error",
+				semantic: "blocking",
+				message: `napi self-scan finding ${index + 1}`,
+				tool: "ast-grep-napi",
+				rule: `napi-${index + 1}`,
+			})),
+		]);
+
+		const header = renderWidget(120, theme)[0] ?? "";
+		expect(header).toContain("12E");
+		expect(getFileDiagnosticSummaries()[0]).toMatchObject({
+			blocking: 12,
+			errors: 12,
+		});
+	});
+
 	it("keeps diagnostic rows within the provided TUI width", () => {
 		const filePath = `${process.cwd()}/index.ts`;
 		recordRunner(filePath, "type-safety", "failed", 2);
@@ -461,7 +587,12 @@ describe("widget-state renderWidget", () => {
 	it("blocking diagnostics outrank a formatter failure (horizontal renderer)", () => {
 		const filePath = `${process.cwd()}/both-failed.ts`;
 		recordDiagnostics(filePath, [
-			{ severity: "error", semantic: "blocking", message: "bad", tool: "tsserver" },
+			{
+				severity: "error",
+				semantic: "blocking",
+				message: "bad",
+				tool: "tsserver",
+			},
 		]);
 		recordFormatter(filePath, "prettier", false, false);
 		// Pin the FILE ROW's leading glyph, not the whole render (the #1348
@@ -477,10 +608,17 @@ describe("widget-state renderWidget", () => {
 	it("blocking diagnostics outrank a formatter failure (vertical renderer)", () => {
 		const filePath = `${process.cwd()}/both-failed-v.ts`;
 		recordDiagnostics(filePath, [
-			{ severity: "error", semantic: "blocking", message: "bad", tool: "tsserver" },
+			{
+				severity: "error",
+				semantic: "blocking",
+				message: "bad",
+				tool: "tsserver",
+			},
 		]);
 		recordFormatter(filePath, "prettier", false, false);
-		const row = renderWidget(40, theme).find((l) => l.includes("both-failed-v"));
+		const row = renderWidget(40, theme).find((l) =>
+			l.includes("both-failed-v"),
+		);
 		expect(row).toBeDefined();
 		const plain = row!.replace(/\[[0-9;]*m/g, "").trimStart();
 		expect(plain.startsWith("●")).toBe(true);
@@ -500,6 +638,120 @@ describe("widget-state renderWidget", () => {
 		const line = renderWidget(120, theme).join("");
 		expect(line).not.toContain("fmt-failed:");
 		expect(line).not.toContain("stale-fail.ts");
+	});
+
+	// #1631 review F3: a dependency-drift `stale` demotion is a verdict about
+	// THIS session's disk state. It must not outlive the session, the same
+	// #1348 shape one field over as the formatter-failure test above. Demotes
+	// through the REAL gate (`reconcileStaleWidgetDependencyBlockers`), not a
+	// hand-built `stale: true` literal, so this proves the actual production
+	// path round-trips correctly.
+	it("a dependency-drift stale demotion does not survive a session restore", async () => {
+		const tmpDir = await fs.mkdtemp(
+			path.join(os.tmpdir(), "pi-lens-stale-restore-"),
+		);
+		try {
+			const consumer = path.join(tmpDir, "consumer.ts");
+			const dep = path.join(tmpDir, "dep.ts");
+			await fs.writeFile(dep, "export const x = 1;\n");
+			await fs.writeFile(
+				consumer,
+				'import { x } from "./dep.js";\nexport const y = x;\n',
+			);
+
+			recordDiagnostics(
+				consumer,
+				[
+					{
+						severity: "error",
+						semantic: "blocking",
+						message: "type error",
+						tool: "lsp",
+					},
+				],
+				1,
+				Date.now() - 60_000,
+			);
+			// Dependency fixed out-of-band after the verdict — demotes for real.
+			const future = new Date(Date.now() + 60_000);
+			await fs.utimes(dep, future, future);
+			const { demoted } = await reconcileStaleWidgetDependencyBlockers(tmpDir);
+			expect(demoted).toBe(1);
+			expect(
+				(getFileDiagnostics(consumer) ?? []).some((d) => isBlocking(d)),
+			).toBe(false);
+
+			const snapshot = exportWidgetState();
+			clearWidgetState();
+			expect(importWidgetState(snapshot)).toBe(true);
+
+			const restored = getFileDiagnostics(consumer) ?? [];
+			expect(restored).toHaveLength(1);
+			expect(restored[0]?.stale).toBeUndefined();
+			expect(isBlocking(restored[0]!)).toBe(true);
+
+			// #1631 review V1: `diagnosticCounts` is DERIVED from the entries, not a
+			// second source of truth. The persisted count was computed while the
+			// entry was still demoted (`blocking: 0`) — restoring it verbatim would
+			// leave `isBlocking(entry) === true` but `diagnosticCounts.blocking === 0`
+			// on the SAME record, inverting the one-predicate invariant every
+			// consumer (getFileDiagnosticSummaries, the record-tier classifier)
+			// trusts instead of re-scanning entries itself.
+			const summary = getFileDiagnosticSummaries().find(
+				(s) => path.resolve(s.filePath) === path.resolve(consumer),
+			);
+			expect(summary?.blocking).toBe(1);
+		} finally {
+			await fs.rm(tmpDir, { recursive: true, force: true });
+		}
+	});
+
+	// #1631 review F10: `isBlocking` answers false for a demoted finding by design
+	// (#1419 demote-not-drop) — but the footer's detail-line render loop used that
+	// SAME predicate to pick what to SHOW, so a demoted finding vanished from the
+	// footer entirely (silently dropped) instead of rendering with a stale marker.
+	it("renders a dependency-drift-demoted finding with a stale marker instead of dropping it", async () => {
+		const tmpDir = await fs.mkdtemp(
+			path.join(os.tmpdir(), "pi-lens-stale-footer-"),
+		);
+		try {
+			const consumer = path.join(tmpDir, "consumer.ts");
+			const dep = path.join(tmpDir, "dep.ts");
+			await fs.writeFile(dep, "export const x = 1;\n");
+			await fs.writeFile(
+				consumer,
+				'import { x } from "./dep.js";\nexport const y = x;\n',
+			);
+
+			recordDiagnostics(
+				consumer,
+				[
+					{
+						severity: "error",
+						semantic: "blocking",
+						message: "type error demoted by drift",
+						tool: "lsp",
+					},
+				],
+				1,
+				Date.now() - 60_000,
+			);
+			const future = new Date(Date.now() + 60_000);
+			await fs.utimes(dep, future, future);
+			const { demoted } = await reconcileStaleWidgetDependencyBlockers(tmpDir);
+			expect(demoted).toBe(1);
+
+			const lines = renderWidget(120, theme).join("\n");
+			// Not silently dropped: the message and a stale marker are still visible.
+			expect(lines).toContain("type error demoted by drift");
+			expect(lines).toContain("re-run to confirm");
+			// And it must not render as an authoritative red-dot blocker.
+			expect(lines.replace(/\x1b\[[0-9;]*m/g, "")).not.toMatch(
+				/●\s*type error demoted/,
+			);
+		} finally {
+			await fs.rm(tmpDir, { recursive: true, force: true });
+		}
 	});
 
 	it("clears a formatter failure after a subsequent success", () => {
@@ -685,7 +937,13 @@ describe("recordDiagnostics — superseded write guard (same race class as #555)
 		// An older, slower edit's pipeline finishes late — must be dropped.
 		recordDiagnostics(
 			filePath,
-			[{ severity: "error", message: "stale diagnostic from edit #1", rule: "X" }],
+			[
+				{
+					severity: "error",
+					message: "stale diagnostic from edit #1",
+					rule: "X",
+				},
+			],
 			1,
 		);
 
@@ -1086,7 +1344,9 @@ describe("scheduleStaleReconcile — widget self-corrects fixed files (#298 foll
 
 	it("keeps a widget entry whose file has NOT changed since the last record (no false-positive drops)", async () => {
 		vi.useFakeTimers();
-		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "stale-reconcile-keep-"));
+		const tmpDir = await fs.mkdtemp(
+			path.join(os.tmpdir(), "stale-reconcile-keep-"),
+		);
 		const filePath = path.join(tmpDir, `stale-reconcile-keep-${Date.now()}.ts`);
 		try {
 			await fs.writeFile(filePath, "const y = 2;\n");
@@ -1208,7 +1468,9 @@ describe("per-entry observation timestamps — the stale gate drops entries, not
 	});
 
 	it("no-regression: a fully-stale record (every entry older than mtime) still drops entirely", async () => {
-		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "per-entry-allstale-"));
+		const tmpDir = await fs.mkdtemp(
+			path.join(os.tmpdir(), "per-entry-allstale-"),
+		);
 		const filePath = path.join(tmpDir, `all-stale-${Date.now()}.ts`);
 		try {
 			await fs.writeFile(filePath, "const z = 3;\n");
@@ -1297,9 +1559,7 @@ describe("PersistedWidgetState v1→v2 migration — per-entry stamps inherit th
 					runners: [],
 					formatters: [],
 					diagnostics: [{ severity: "error", message: "orphan", rule: "X" }],
-					allDiagnostics: [
-						{ severity: "error", message: "orphan", rule: "X" },
-					],
+					allDiagnostics: [{ severity: "error", message: "orphan", rule: "X" }],
 					diagnosticCounts: { blocking: 0, errors: 1, warnings: 0 },
 					hasFinalDiagnosticsSnapshot: true,
 					touchedAt: Date.now(),
@@ -1350,6 +1610,160 @@ describe("PersistedWidgetState v1→v2 migration — per-entry stamps inherit th
 			await fs.utimes(filePath, newer, newer);
 			expect(await reconcileStaleWidgetFiles()).toBe(1);
 			expect(getFileDiagnostics(filePath)).toBeUndefined();
+		} finally {
+			await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+		}
+	});
+});
+
+describe("past-EOF diagnostic gate (#1641)", () => {
+	it("RED CASE: demotes a stored diagnostic whose cited line exceeds the file's current on-disk line count", async () => {
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "past-eof-"));
+		const filePath = path.join(tmpDir, "kilo.ts");
+		try {
+			// A live in-memory-vs-disk desync never touches mtime — the file was
+			// NEVER re-written on disk (#1641's forensic case: 402 lines on disk,
+			// diagnostics served at 407-410). A 5-line file stands in for that
+			// shape here: the cited line is past EOF from the moment it's recorded.
+			await fs.writeFile(filePath, "a\nb\nc\nd\ne\n");
+			recordDiagnostics(
+				filePath,
+				[
+					{ severity: "error", message: "still valid", line: 3, rule: "X" },
+					{
+						severity: "error",
+						message: "stale in-memory citation",
+						line: 407,
+						rule: "Y",
+					},
+				],
+				1,
+			);
+
+			// Pre-fix: both entries re-serve verbatim, including the impossible
+			// line-407 citation on a 5-line file, and both count as blocking.
+			const summaries = getFileDiagnosticSummaries();
+			const rec = summaries.find((s) => s.filePath === filePath);
+			expect(rec).toBeDefined();
+			const stale = rec?.diagnostics.find((d) => d.line === 407);
+			const live = rec?.diagnostics.find((d) => d.line === 3);
+			expect(stale?.stale).toBe(true);
+			expect(live?.stale).toBeFalsy();
+			// Demoted out of the blocking tally — same reasoning as isBlocking.
+			expect(rec?.blocking).toBe(1);
+
+			// getFileDiagnostics (the bus-publish/single-file accessor) sees the
+			// same demotion — one gate, every reader.
+			const single = getFileDiagnostics(filePath);
+			expect(single?.find((d) => d.line === 407)?.stale).toBe(true);
+		} finally {
+			await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+		}
+	});
+
+	it("does not demote a diagnostic whose cited line is still within the current file", async () => {
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "past-eof-ok-"));
+		const filePath = path.join(tmpDir, "fine.ts");
+		try {
+			await fs.writeFile(filePath, "a\nb\nc\nd\ne\n");
+			recordDiagnostics(
+				filePath,
+				[
+					{
+						severity: "error",
+						message: "on the last line",
+						line: 5,
+						rule: "X",
+					},
+				],
+				1,
+			);
+			const rec = getFileDiagnosticSummaries().find(
+				(s) => s.filePath === filePath,
+			);
+			expect(rec?.diagnostics[0]?.stale).toBeFalsy();
+			expect(rec?.blocking).toBe(1);
+		} finally {
+			await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+		}
+	});
+
+	it("the TUI render loop demotes a past-EOF blocker out of the blocking list it shows", async () => {
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "past-eof-render-"));
+		const filePath = path.join(tmpDir, "widget.ts");
+		try {
+			await fs.writeFile(filePath, "a\nb\nc\n");
+			recordDiagnostics(
+				filePath,
+				[
+					{
+						severity: "error",
+						message: "phantom citation",
+						line: 999,
+						rule: "X",
+					},
+				],
+				1,
+			);
+			const out = renderWidget(120, theme).join("\n");
+			expect(out).not.toContain("L999");
+		} finally {
+			await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+		}
+	});
+
+	it("F3 RE-ARM: a transient shrink demotes, restoring the file un-demotes the STORED record", async () => {
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "past-eof-rearm-"));
+		const filePath = path.join(tmpDir, "transient.ts");
+		try {
+			await fs.writeFile(filePath, "a\nb\nc\nd\ne\n"); // 6 addressable lines
+			recordDiagnostics(
+				filePath,
+				[
+					{
+						severity: "error",
+						message: "real blocking error",
+						line: 5,
+						rule: "X",
+					},
+				],
+				1,
+			);
+			expect(
+				getFileDiagnosticSummaries().find((s) => s.filePath === filePath)
+					?.blocking,
+			).toBe(1);
+
+			// Transient shrink (formatter pass / checkout / partial write) —
+			// line 5 no longer exists. Force the mtime forward explicitly:
+			// successive writes within one filesystem timestamp tick can
+			// otherwise land on the SAME mtime, defeating the mtime-keyed cache
+			// for reasons unrelated to what this test verifies.
+			await fs.writeFile(filePath, "a\nb\n"); // 3 addressable lines
+			await fs.utimes(
+				filePath,
+				new Date(Date.now() + 1000),
+				new Date(Date.now() + 1000),
+			);
+			const shrunk = getFileDiagnosticSummaries().find(
+				(s) => s.filePath === filePath,
+			);
+			expect(shrunk?.diagnostics[0]?.stale).toBe(true);
+			expect(shrunk?.blocking).toBe(0);
+
+			// Restored to its original content — the STORE must re-arm, not stay
+			// permanently latched stale (the #1633-V1 lesson: derive, don't latch).
+			await fs.writeFile(filePath, "a\nb\nc\nd\ne\n");
+			await fs.utimes(
+				filePath,
+				new Date(Date.now() + 2000),
+				new Date(Date.now() + 2000),
+			);
+			const restored = getFileDiagnosticSummaries().find(
+				(s) => s.filePath === filePath,
+			);
+			expect(restored?.diagnostics[0]?.stale).toBeFalsy();
+			expect(restored?.blocking).toBe(1);
 		} finally {
 			await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
 		}

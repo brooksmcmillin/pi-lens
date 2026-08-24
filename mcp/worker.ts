@@ -31,7 +31,10 @@ async function main(): Promise<void> {
 	const flagsRaw = arg("flags");
 	if (flagsRaw) {
 		try {
-			flags = JSON.parse(flagsRaw) as Record<string, boolean | string | undefined>;
+			flags = JSON.parse(flagsRaw) as Record<
+				string,
+				boolean | string | undefined
+			>;
 		} catch {
 			process.stderr.write("worker: --flags must be valid JSON\n");
 			process.exit(2);

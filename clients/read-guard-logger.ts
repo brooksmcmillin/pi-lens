@@ -73,7 +73,7 @@ export interface ReadGuardEditBatchSummary {
 
 let generatedCorrelationCounter = 0;
 
-function sanitizeCorrelationId(value: unknown): string | undefined {
+export function sanitizeCorrelationId(value: unknown): string | undefined {
 	if (typeof value !== "string" && typeof value !== "number") return undefined;
 	const sanitized = String(value)
 		.trim()
@@ -97,8 +97,7 @@ export function getReadGuardCorrelationId(event: unknown): string {
 		const sanitized = sanitizeCorrelationId(candidate);
 		if (sanitized) return sanitized;
 	}
-	generatedCorrelationCounter =
-		(generatedCorrelationCounter + 1) % 1_000_000;
+	generatedCorrelationCounter = (generatedCorrelationCounter + 1) % 1_000_000;
 	return `rg-${Date.now().toString(36)}-${generatedCorrelationCounter}`;
 }
 
@@ -142,8 +141,8 @@ export function createReadGuardEditBatchSummary(args: {
 }): ReadGuardEditBatchSummary {
 	const requestedSource = validIndexes(args.requestedIndexes);
 	const resolvedSource = validIndexes(args.resolvedIndexes ?? []);
-	const rejectedSource = (args.rejectedReasons ?? []).filter((entry) =>
-		Number.isInteger(entry.index) && entry.index >= 0,
+	const rejectedSource = (args.rejectedReasons ?? []).filter(
+		(entry) => Number.isInteger(entry.index) && entry.index >= 0,
 	);
 	const appliedSource = validIndexes(args.appliedIndexes ?? []);
 	const requestedIndexes = boundedEditIndexes(requestedSource);
@@ -188,9 +187,11 @@ export function createReadGuardEditBatchSummary(args: {
 		participantIds,
 		participantTotal: args.participantTotal ?? participantSource.length,
 		participantIdsTruncated:
-			(args.participantTotal ?? participantSource.length) > participantIds.length,
+			(args.participantTotal ?? participantSource.length) >
+			participantIds.length,
 		indexesTruncated:
-			(args.requestedTotal ?? requestedSource.length) > requestedIndexes.length ||
+			(args.requestedTotal ?? requestedSource.length) >
+				requestedIndexes.length ||
 			(args.resolvedTotal ?? resolvedSource.length) > resolvedIndexes.length ||
 			(args.rejectedTotal ?? rejectedSource.length) > rejectedIndexes.length ||
 			(args.appliedTotal ?? appliedSource.length) > appliedIndexes.length,
@@ -218,7 +219,7 @@ export interface ReadGuardLogEntry {
 	metadata?: Record<string, unknown>;
 }
 
-function shouldLogEvent(event: string): boolean {
+export function shouldLogEvent(event: string): boolean {
 	if (VERBOSE_READ_GUARD_LOG) return true;
 	if (event === "edit_allowed") return LOG_ALLOWED_EDITS;
 	if (event === "range_snapshot_validation") return LOG_SNAPSHOT_VALIDATION;
@@ -238,7 +239,12 @@ function shouldLogEvent(event: string): boolean {
 		event === "edit_post_edit_pipeline_failed" ||
 		event === "edit_batch_summary" ||
 		event === "edit_batch_summary_overflow" ||
-		event === "touched_lines_missing"
+		event === "touched_lines_missing" ||
+		// #1913: read-guard record-cap evictions are rare by construction (only
+		// READ_GUARD_MAX_RECORDS_PER_FILE overflow triggers one), so this trim
+		// record bypasses the per-read verbosity gate — a live eviction
+		// regression must be visible without PI_LENS_READ_GUARD_VERBOSE=1.
+		event === "read_cap_trimmed"
 	);
 }
 
@@ -291,7 +297,10 @@ function boundTelemetryValue(
 	const output: Record<string, unknown> = {};
 	let truncated = false;
 	const arrayTotals: Record<string, number> = {};
-	for (const [key, child] of Object.entries(value).slice(0, MAX_TELEMETRY_KEYS)) {
+	for (const [key, child] of Object.entries(value).slice(
+		0,
+		MAX_TELEMETRY_KEYS,
+	)) {
 		const bounded = boundTelemetryValue(
 			child,
 			pathName ? `${pathName}.${key}` : key,

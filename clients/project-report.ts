@@ -35,8 +35,13 @@
  */
 
 import * as path from "node:path";
+import type { FactStore } from "./dispatch/fact-store.js";
 import { normalizeMapKey, toProjectRelativePath } from "./path-utils.js";
 import { loadProjectSnapshotWithoutWordIndex } from "./project-snapshot.js";
+import {
+	formatReviewGraphRevisionDriftNote,
+	type ReviewGraphRevisionDrift,
+} from "./review-graph/revision-drift.js";
 import type { ReviewGraph } from "./review-graph/types.js";
 
 export interface ProjectReportOptions {
@@ -79,6 +84,13 @@ export interface ProjectReportTrust {
 	/** True when the graph is older than a "trust this without a refresh"
 	 * threshold. */
 	stale: boolean;
+	/**
+	 * #1961: present when the served snapshot was persisted at a different
+	 * commit than the current HEAD. The read path verifies tree identity, not
+	 * revision, so a revision difference is reported here rather than hiding
+	 * the graph. Absent on an in-process graph and on a matching snapshot.
+	 */
+	revisionDrift?: ReviewGraphRevisionDrift;
 	/** True when coverage is low enough that whole subsystems may be
 	 * invisible to every other section below. */
 	lowCoverage: boolean;
@@ -277,7 +289,14 @@ function buildFileDegrees(graph: ReviewGraph): FileDegrees {
 
 // --- section 1: trust header --------------------------------------------------
 
-function computeTrust(graph: ReviewGraph, cwd: string): ProjectReportTrust {
+function computeTrust(
+	graph: ReviewGraph,
+	cwd: string,
+	// Passed in rather than looked up here: the builder is imported dynamically
+	// by `projectReport` to keep the module graph acyclic, and the value must be
+	// computed per render, never cached (#1961 review F3).
+	drift: ReviewGraphRevisionDrift | undefined,
+): ProjectReportTrust {
 	const filesCovered = graph.fileNodes.size;
 	const snapshot = loadProjectSnapshotWithoutWordIndex(cwd);
 	const snapshotFileCount = snapshot ? Object.keys(snapshot.files).length : 0;
@@ -318,6 +337,10 @@ function computeTrust(graph: ReviewGraph, cwd: string): ProjectReportTrust {
 		graph.persistCoverage?.partial === true;
 
 	const notes: string[] = [];
+	// #1961: the blind read now SERVES a snapshot stamped at a different HEAD
+	// rather than dropping it. Age alone would not catch a branch switch made
+	// minutes ago, so the revision difference gets its own note.
+	if (drift) notes.push(formatReviewGraphRevisionDriftNote(drift));
 	if (stale) {
 		const ageMin = Math.round(ageMs / 60_000);
 		notes.push(
@@ -358,6 +381,7 @@ function computeTrust(graph: ReviewGraph, cwd: string): ProjectReportTrust {
 			sampleSize,
 		},
 		stale,
+		...(drift ? { revisionDrift: drift } : {}),
 		lowCoverage,
 		persistCoverage: graph.persistCoverage?.partial
 			? graph.persistCoverage
@@ -728,22 +752,47 @@ export function _resetProjectReportBuildGuardForTests(): void {
 	inFlightGraphBuilds.clear();
 }
 
-function triggerBackgroundGraphBuild(cwd: string): boolean {
+/**
+ * What the cold-path trigger actually did, so the hint can say it honestly
+ * (#1962). "started" means THIS call began a build; "already_running" means a
+ * build for the same workspace was already in flight and absorbed the call.
+ * Before #1962 the caller only knew whether it had added a key to
+ * `inFlightGraphBuilds`, and reported "a retry was started" on the strength of
+ * that — while the builder's dedupe cache returned a settled promise and no
+ * build ran at all.
+ */
+type BackgroundBuildTrigger = "started" | "already_running";
+
+/**
+ * The builder entry points the trigger needs, taken from the module's own
+ * types rather than re-declared here, so a signature change cannot drift past
+ * this call site. `projectReport` already imports the builder dynamically (to
+ * keep the module graph acyclic) and hands the pair in.
+ */
+type BackgroundBuildDeps = Pick<
+	typeof import("./review-graph/builder.js"),
+	"buildOrUpdateGraph" | "isGraphBuildInFlight"
+> & { FactStore: new () => FactStore };
+
+function triggerBackgroundGraphBuild(
+	cwd: string,
+	deps: BackgroundBuildDeps,
+): BackgroundBuildTrigger {
 	const key = normalizeMapKey(path.resolve(cwd));
-	if (inFlightGraphBuilds.has(key)) return false;
+	if (inFlightGraphBuilds.has(key)) return "already_running";
+	// Ask the builder, not just this module's own guard: a build kicked off by
+	// the edit pipeline or another reader never touches `inFlightGraphBuilds`.
+	// The probe and the call are in ONE synchronous block on purpose — awaiting
+	// between them (the pre-#1962 dynamic imports did) reopens the race.
+	const deduped = deps.isGraphBuildInFlight(key, []);
 	inFlightGraphBuilds.add(key);
-	void (async () => {
-		try {
-			const { buildOrUpdateGraph } = await import("./review-graph/builder.js");
-			const { FactStore } = await import("./dispatch/fact-store.js");
-			await buildOrUpdateGraph(key, [], new FactStore());
-		} catch {
+	const build = deps
+		.buildOrUpdateGraph(key, [], new deps.FactStore())
+		.catch(() => {
 			// buildOrUpdateGraph records the durable failure and surfaced status.
-		} finally {
-			inFlightGraphBuilds.delete(key);
-		}
-	})();
-	return true;
+		});
+	void build.finally(() => inFlightGraphBuilds.delete(key));
+	return deduped ? "already_running" : "started";
 }
 
 // --- entry point ---------------------------------------------------------------
@@ -765,6 +814,9 @@ export async function projectReport(
 		getCachedReviewGraph,
 		getReviewGraphSizeSkipVerdict,
 		getLastReviewGraphBuildAttempt,
+		buildOrUpdateGraph,
+		isGraphBuildInFlight,
+		getReviewGraphRevisionDrift,
 	} = await import("./review-graph/builder.js");
 	let graph: ReviewGraph | undefined;
 	try {
@@ -798,25 +850,50 @@ export async function projectReport(
 			};
 		}
 		const previousAttempt = getLastReviewGraphBuildAttempt(cwd);
-		const kickedOff = triggerBackgroundGraphBuild(cwd);
-		const lastBuildAttempt =
-			previousAttempt ?? getLastReviewGraphBuildAttempt(cwd);
+		const { FactStore } = await import("./dispatch/fact-store.js");
+		const trigger = triggerBackgroundGraphBuild(cwd, {
+			buildOrUpdateGraph,
+			isGraphBuildInFlight,
+			FactStore,
+		});
+		const started = trigger === "started";
+		// #1962: report the attempt that is CURRENT. When this call started a
+		// build, `buildOrUpdateGraph` has already recorded a fresh `running`
+		// attempt synchronously, and the previous outcome belongs in the hint
+		// text, not in a field labelled "last attempt". When no build started,
+		// the earlier attempt genuinely IS the current one.
+		const lastBuildAttempt = started
+			? (getLastReviewGraphBuildAttempt(cwd) ?? previousAttempt)
+			: previousAttempt;
+		// A terminal previous outcome is the useful half of the message: it says
+		// WHY the graph is missing. It is prefixed to whichever verdict follows,
+		// rather than selecting between two parallel sentence pairs — the first
+		// version of this branch did that, and its terminal-plus-deduped arm was
+		// unreachable (#1962 review F1). A pending build always records a
+		// `running` attempt synchronously, so "terminal" and "not started" cannot
+		// both hold for the same key.
+		const terminal =
+			previousAttempt?.outcome === "failed" ||
+			previousAttempt?.outcome === "skipped";
+		const cause = terminal
+			? `Review graph unavailable: ${previousAttempt?.reason ?? previousAttempt?.outcome}. `
+			: "";
 		return {
 			available: false,
-			hint:
-				lastBuildAttempt?.outcome === "failed" ||
-				lastBuildAttempt?.outcome === "skipped"
-					? `Review graph unavailable: ${lastBuildAttempt.reason ?? lastBuildAttempt.outcome}. A retry was ${kickedOff ? "started" : "not started"}.`
-					: kickedOff
-						? "No review graph cached for this workspace yet — a build was kicked off in the background; retry this call shortly."
-						: "No review graph cached for this workspace yet — the background build is still running; retry this call shortly.",
+			hint: started
+				? terminal
+					? `${cause}A retry was started.`
+					: "No review graph cached for this workspace yet — a build was kicked off in the background; retry this call shortly."
+				: `${cause}A build is already running for this workspace; retry this call shortly.`,
 			...(lastBuildAttempt ? { lastBuildAttempt } : {}),
 			...(view ? { view } : {}),
 		};
 	}
 
 	const degrees = buildFileDegrees(graph);
-	const trust = computeTrust(graph, cwd);
+	// Computed on THIS render, from the workspace entry's stamped commit and the
+	// worktree's HEAD right now — never from a value cached beside the graph.
+	const trust = computeTrust(graph, cwd, getReviewGraphRevisionDrift(cwd));
 	const hubs = await computeHubs(graph, degrees, cwd, limit, focusTerms);
 	const { entryPoints, entryPointFiles } = computeEntryPoints(
 		graph,

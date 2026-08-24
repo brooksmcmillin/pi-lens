@@ -5,10 +5,7 @@ import {
 	type InstanceEntry,
 	readInstanceRegistry,
 } from "./instance-registry.js";
-import {
-	realIsPidAlive,
-	STALE_HEARTBEAT_MS,
-} from "./instance-reaper.js";
+import { realIsPidAlive, STALE_HEARTBEAT_MS } from "./instance-reaper.js";
 import { logLatency } from "./latency-logger.js";
 import { touchCoverageGap } from "./lsp/diagnostic-binding.js";
 import { loadLspService } from "./lsp-lazy.js";
@@ -93,13 +90,15 @@ async function serveRequest(
 					if (Date.now() > req.deadlineAt) {
 						throw new Error("deadline exceeded");
 					}
-					return (await loadLspService()).getLSPService().codeAction(
-						req.file,
-						range.start.line,
-						range.start.character,
-						range.end.line,
-						range.end.character,
-					);
+					return (await loadLspService())
+						.getLSPService()
+						.codeAction(
+							req.file,
+							range.start.line,
+							range.start.character,
+							range.end.line,
+							range.end.character,
+						);
 				}),
 			);
 			const servedAt = Date.now();
@@ -123,24 +122,35 @@ async function serveRequest(
 	) {
 		return { error: "schema mismatch" };
 	}
-	if (Date.now() > req.deadlineAt || contentHash(req.content) !== req.contentHash) {
+	if (
+		Date.now() > req.deadlineAt ||
+		contentHash(req.content) !== req.contentHash
+	) {
 		return { error: "stale request" };
 	}
-	const touched = await (await loadLspService()).getLSPService().touchFile(req.file, req.content, {
-		diagnostics: "document",
-		collectDiagnostics: true,
-		clientScope: "with-auxiliary",
-		maxClientWaitMs: Math.max(1, req.deadlineAt - Date.now()),
-		maxDiagnosticsWaitMs: Math.max(1, req.deadlineAt - Date.now()),
-		source: "warm-attach-incumbent",
-	});
+	const touched = await (
+		await loadLspService()
+	)
+		.getLSPService()
+		.touchFile(req.file, req.content, {
+			diagnostics: "document",
+			collectDiagnostics: true,
+			clientScope: "with-auxiliary",
+			maxClientWaitMs: Math.max(1, req.deadlineAt - Date.now()),
+			maxDiagnosticsWaitMs: Math.max(1, req.deadlineAt - Date.now()),
+			source: "warm-attach-incumbent",
+		});
 	const servedAt = Date.now();
 	// #1470: the coverage gap is read through the shared helper, never re-derived
 	// from `confirmation === "partial"`. The two fields are set together today, so
 	// either test passes — which is exactly the coincidence `touchCoverageGap`'s
 	// own doc comment warns against. One reader, one rule.
 	const coverageGap = touchCoverageGap(touched);
-	if (servedAt <= req.deadlineAt && touched !== undefined && !touched.inconclusive) {
+	if (
+		servedAt <= req.deadlineAt &&
+		touched !== undefined &&
+		!touched.inconclusive
+	) {
 		state.servedDiagnosticHashes.set(
 			normalizeFilePath(req.file),
 			req.contentHash,
@@ -319,7 +329,10 @@ export function _resetWarmAttachForTests(): void {
 	state.servedDiagnosticHashes.clear();
 }
 
-export function _setWarmAttachForTests(cwd: string, incumbentPid: number): void {
+export function _setWarmAttachForTests(
+	cwd: string,
+	incumbentPid: number,
+): void {
 	state.cwd = path.resolve(cwd);
 	state.incumbentPid = incumbentPid;
 	state.local = false;

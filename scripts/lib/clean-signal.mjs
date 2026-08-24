@@ -41,8 +41,8 @@ import * as path from "node:path";
 // runner). Living here (not a literal in each script) keeps the two scripts
 // from silently drifting onto different paths.
 export const DRIFT_SUMMARY_PATH = path.join(
-  os.tmpdir(),
-  "pilens-clean-signal-drift-summary.json",
+	os.tmpdir(),
+	"pilens-clean-signal-drift-summary.json",
 );
 
 /**
@@ -67,52 +67,52 @@ export const DRIFT_SUMMARY_PATH = path.join(
  * @returns {{ behavior: "publishes-versioned" | "publishes-unversioned" | "silent" | "unknown", tier: 2 | 3 | 0, tierLabel: "2" | "2*" | "3" | "", reason: string }}
  */
 export function classifyCleanBehavior(obs) {
-  const dirtyPublishes = Number(obs?.dirtyPublishes ?? 0);
-  const cleanPublishes = Number(obs?.cleanTransitionPublishes ?? 0);
-  const cleanVersioned = Number(obs?.cleanTransitionVersioned ?? 0);
+	const dirtyPublishes = Number(obs?.dirtyPublishes ?? 0);
+	const cleanPublishes = Number(obs?.cleanTransitionPublishes ?? 0);
+	const cleanVersioned = Number(obs?.cleanTransitionVersioned ?? 0);
 
-  // Published on a clean transition WITH a version → affirmative clean signal,
-  // currency-proven (correlatable to the live document version).
-  if (cleanPublishes > 0 && cleanVersioned > 0) {
-    return {
-      behavior: "publishes-versioned",
-      tier: 2,
-      tierLabel: "2",
-      reason: `published ${cleanVersioned}/${cleanPublishes} versioned set(s) on clean transitions — affirmative + currency-proven`,
-    };
-  }
+	// Published on a clean transition WITH a version → affirmative clean signal,
+	// currency-proven (correlatable to the live document version).
+	if (cleanPublishes > 0 && cleanVersioned > 0) {
+		return {
+			behavior: "publishes-versioned",
+			tier: 2,
+			tierLabel: "2",
+			reason: `published ${cleanVersioned}/${cleanPublishes} versioned set(s) on clean transitions — affirmative + currency-proven`,
+		};
+	}
 
-  // Published on a clean transition but version-lessly → the wait still
-  // early-returns at runtime (the client accepts a version-less publish as
-  // fresh because it cannot be proven stale), but currency is only temporally
-  // correlated — a staleness-risk caveat, NOT a latency cost.
-  if (cleanPublishes > 0) {
-    return {
-      behavior: "publishes-unversioned",
-      tier: 2,
-      tierLabel: "2*",
-      reason: `published ${cleanPublishes} version-less set(s) on clean transitions — early-returns the wait; currency only temporally correlated`,
-    };
-  }
+	// Published on a clean transition but version-lessly → the wait still
+	// early-returns at runtime (the client accepts a version-less publish as
+	// fresh because it cannot be proven stale), but currency is only temporally
+	// correlated — a staleness-risk caveat, NOT a latency cost.
+	if (cleanPublishes > 0) {
+		return {
+			behavior: "publishes-unversioned",
+			tier: 2,
+			tierLabel: "2*",
+			reason: `published ${cleanPublishes} version-less set(s) on clean transitions — early-returns the wait; currency only temporally correlated`,
+		};
+	}
 
-  // Demonstrably alive (published on the dirty touch) but demonstrably silent
-  // on clean transitions → the budget-wait case (#458's learned-deadline target).
-  if (dirtyPublishes > 0) {
-    return {
-      behavior: "silent",
-      tier: 3,
-      tierLabel: "3",
-      reason: `alive (${dirtyPublishes} dirty publish(es)) but silent on clean transitions — budget-wait bound`,
-    };
-  }
+	// Demonstrably alive (published on the dirty touch) but demonstrably silent
+	// on clean transitions → the budget-wait case (#458's learned-deadline target).
+	if (dirtyPublishes > 0) {
+		return {
+			behavior: "silent",
+			tier: 3,
+			tierLabel: "3",
+			reason: `alive (${dirtyPublishes} dirty publish(es)) but silent on clean transitions — budget-wait bound`,
+		};
+	}
 
-  // Never saw the server publish anything → can't tell silent from slow/absent.
-  return {
-    behavior: "unknown",
-    tier: 0,
-    tierLabel: "",
-    reason: "no publish observed (server slow/absent — not classifiable)",
-  };
+	// Never saw the server publish anything → can't tell silent from slow/absent.
+	return {
+		behavior: "unknown",
+		tier: 0,
+		tierLabel: "",
+		reason: "no publish observed (server slow/absent — not classifiable)",
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -156,39 +156,39 @@ export function classifyCleanBehavior(obs) {
  * @returns {DriftResult}
  */
 export function checkCleanSignalDrift(row, silentOnClean) {
-  const { lang, behavior } = row;
-  if (
-    behavior !== "silent" &&
-    behavior !== "publishes-versioned" &&
-    behavior !== "publishes-unversioned"
-  ) {
-    return {
-      lang,
-      kind: "not-comparable",
-      detail: `observed=${behavior} — not a comparable classification (never collapsed into silent/not-silent)`,
-    };
-  }
-  const observedSilent = behavior === "silent";
-  const marked = Boolean(silentOnClean);
-  if (observedSilent && !marked) {
-    return {
-      lang,
-      kind: "silent-not-marked",
-      detail: `observed silent on clean transitions but wait-policy/strategies.ts has no silentOnClean marker for "${lang}" — cascade is burning the full in-lane wait it could skip (the pre-#458 situation)`,
-    };
-  }
-  if (!observedSilent && marked) {
-    return {
-      lang,
-      kind: "marked-not-silent",
-      detail: `wait-policy/strategies.ts marks "${lang}" silentOnClean:true but this run observed ${behavior} — the marker may be stale (too pessimistic; cascade is skipping a wait the server would have resolved with a real publish)`,
-    };
-  }
-  return {
-    lang,
-    kind: "consistent",
-    detail: `observed=${behavior}, silentOnClean=${marked} — consistent`,
-  };
+	const { lang, behavior } = row;
+	if (
+		behavior !== "silent" &&
+		behavior !== "publishes-versioned" &&
+		behavior !== "publishes-unversioned"
+	) {
+		return {
+			lang,
+			kind: "not-comparable",
+			detail: `observed=${behavior} — not a comparable classification (never collapsed into silent/not-silent)`,
+		};
+	}
+	const observedSilent = behavior === "silent";
+	const marked = Boolean(silentOnClean);
+	if (observedSilent && !marked) {
+		return {
+			lang,
+			kind: "silent-not-marked",
+			detail: `observed silent on clean transitions but wait-policy/strategies.ts has no silentOnClean marker for "${lang}" — cascade is burning the full in-lane wait it could skip (the pre-#458 situation)`,
+		};
+	}
+	if (!observedSilent && marked) {
+		return {
+			lang,
+			kind: "marked-not-silent",
+			detail: `wait-policy/strategies.ts marks "${lang}" silentOnClean:true but this run observed ${behavior} — the marker may be stale (too pessimistic; cascade is skipping a wait the server would have resolved with a real publish)`,
+		};
+	}
+	return {
+		lang,
+		kind: "consistent",
+		detail: `observed=${behavior}, silentOnClean=${marked} — consistent`,
+	};
 }
 
 /**
@@ -202,12 +202,15 @@ export function checkCleanSignalDrift(row, silentOnClean) {
  * @returns {DriftResult[]}
  */
 export function findCleanSignalDrift(rows, lookupSilentOnClean) {
-  const warnings = [];
-  for (const row of rows) {
-    const result = checkCleanSignalDrift(row, lookupSilentOnClean(row.lang));
-    if (result.kind === "silent-not-marked" || result.kind === "marked-not-silent") {
-      warnings.push(result);
-    }
-  }
-  return warnings;
+	const warnings = [];
+	for (const row of rows) {
+		const result = checkCleanSignalDrift(row, lookupSilentOnClean(row.lang));
+		if (
+			result.kind === "silent-not-marked" ||
+			result.kind === "marked-not-silent"
+		) {
+			warnings.push(result);
+		}
+	}
+	return warnings;
 }

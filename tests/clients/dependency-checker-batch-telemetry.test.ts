@@ -73,9 +73,8 @@ describe("DependencyChecker.checkFilesBatch telemetry (#766)", () => {
 	}
 
 	it("spawns nothing for a body-only edit", async () => {
-		const { DependencyChecker } = await import(
-			"../../clients/dependency-checker.js"
-		);
+		const { DependencyChecker } =
+			await import("../../clients/dependency-checker.js");
 		const f = writeSource("a.ts", ["./b.js"]);
 		const checker = new DependencyChecker();
 
@@ -101,9 +100,8 @@ describe("DependencyChecker.checkFilesBatch telemetry (#766)", () => {
 	});
 
 	it("bounds concurrent spawns for a pathological turn", async () => {
-		const { DependencyChecker } = await import(
-			"../../clients/dependency-checker.js"
-		);
+		const { DependencyChecker } =
+			await import("../../clients/dependency-checker.js");
 		const files = Array.from({ length: 8 }, (_, i) =>
 			writeSource(`f${i}.ts`, [`./dep${i}.js`]),
 		);
@@ -128,9 +126,8 @@ describe("DependencyChecker.checkFilesBatch telemetry (#766)", () => {
 	});
 
 	it("counts hits, misses, missing files and failures separately", async () => {
-		const { DependencyChecker } = await import(
-			"../../clients/dependency-checker.js"
-		);
+		const { DependencyChecker } =
+			await import("../../clients/dependency-checker.js");
 		const hit = writeSource("hit.ts", ["./h.js"]);
 		const ok = writeSource("ok.ts", ["./o.js"]);
 		const bad = writeSource("bad.ts", ["./x.js"]);
@@ -173,9 +170,8 @@ describe("DependencyChecker.checkFilesBatch telemetry (#766)", () => {
 	});
 
 	it("counts the whole miss set as failed when madge is unavailable", async () => {
-		const { DependencyChecker } = await import(
-			"../../clients/dependency-checker.js"
-		);
+		const { DependencyChecker } =
+			await import("../../clients/dependency-checker.js");
 		safeSpawnAsync.mockImplementation(async (_cmd: string, args: string[]) => {
 			if (args[0] === "--version") {
 				return {
@@ -214,9 +210,8 @@ describe("DependencyChecker.checkFilesBatch telemetry (#766)", () => {
 	});
 
 	it("does not retain fast per-target timings", async () => {
-		const { DependencyChecker } = await import(
-			"../../clients/dependency-checker.js"
-		);
+		const { DependencyChecker } =
+			await import("../../clients/dependency-checker.js");
 		const files = Array.from({ length: 12 }, (_, i) =>
 			writeSource(`f${i}.ts`, [`./dep${i}.js`]),
 		);
@@ -229,9 +224,8 @@ describe("DependencyChecker.checkFilesBatch telemetry (#766)", () => {
 	});
 
 	it("retains only slow target timings and caps them", async () => {
-		const { DependencyChecker } = await import(
-			"../../clients/dependency-checker.js"
-		);
+		const { DependencyChecker } =
+			await import("../../clients/dependency-checker.js");
 		const files = Array.from({ length: 14 }, (_, i) =>
 			writeSource(`f${i}.ts`, [`./dep${i}.js`]),
 		);
@@ -249,9 +243,8 @@ describe("DependencyChecker.checkFilesBatch telemetry (#766)", () => {
 	});
 
 	it("keeps repeated batch metadata bounded", async () => {
-		const { DependencyChecker } = await import(
-			"../../clients/dependency-checker.js"
-		);
+		const { DependencyChecker } =
+			await import("../../clients/dependency-checker.js");
 		const files = Array.from({ length: 14 }, (_, i) =>
 			writeSource(`repeat${i}.ts`, [`./dep${i}.js`]),
 		);

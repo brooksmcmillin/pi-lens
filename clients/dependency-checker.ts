@@ -21,7 +21,11 @@ import {
 	getManagedToolEnvironment,
 	resolveAvailableOrInstall,
 } from "./dispatch/runners/utils/runner-helpers.js";
-import { createAvailabilityLatch } from "./dispatch/runners/utils/availability-policy.js";
+import {
+	type AvailabilityCause,
+	type AvailabilityOutcome,
+	createAvailabilityLatch,
+} from "./dispatch/runners/utils/availability-policy.js";
 
 // --- Types ---
 
@@ -73,8 +77,10 @@ export function parseMadgeSkips(stderr: string): {
 	const headerIdx = lines.findIndex((l) => /Skipped\s+\d+\s+file/i.test(l));
 	if (headerIdx === -1) return { total: 0, local: [] };
 	const total =
-		Number.parseInt(lines[headerIdx].match(/Skipped\s+(\d+)/i)?.[1] ?? "0", 10) ||
-		0;
+		Number.parseInt(
+			lines[headerIdx].match(/Skipped\s+(\d+)/i)?.[1] ?? "0",
+			10,
+		) || 0;
 	const specifiers = lines
 		.slice(headerIdx + 1)
 		.map((l) => l.trim())
@@ -230,8 +236,15 @@ async function resolvedCommandIsStale(
 	return !spawnable;
 }
 
-/** Run `mapper` over `items` with at most `concurrency` in flight at once. */
-async function mapWithConcurrency<T>(
+/**
+ * Run `mapper` over `items` with at most `concurrency` in flight at once.
+ * Exported (#1810 review F6) so `clients/dispatch/runners/biome-check.ts`'s
+ * `resolveBiomeFixKinds` can reuse this exact worker-pool shape for its
+ * `biome explain` fan-out instead of carrying a second copy — this file
+ * predates that need but is otherwise unrelated to it; a shared home for
+ * this one helper wasn't worth a whole new module for two call sites.
+ */
+export async function mapWithConcurrency<T>(
 	items: T[],
 	concurrency: number,
 	mapper: (item: T) => Promise<void>,
@@ -310,9 +323,7 @@ export class DependencyChecker {
 	private static readonly instances = new Set<WeakRef<DependencyChecker>>();
 
 	constructor(verbose = false) {
-		this.log = verbose
-			? createSubsystemLogger("deps")
-			: () => {};
+		this.log = verbose ? createSubsystemLogger("deps") : () => {};
 		DependencyChecker.instances.add(new WeakRef(this));
 	}
 
@@ -482,6 +493,26 @@ export class DependencyChecker {
 	}
 
 	/**
+	 * #1623: public availability verdict for callers outside the dispatch
+	 * graph (mode=full's fresh-fetch) that need to say WHY `ensureAvailable()`
+	 * most recently returned false, using the SAME outcome/cause this class
+	 * already latched above — not a re-guessed "madge binary unavailable"
+	 * that can't tell a transient retry-cooldown probe from a durable
+	 * absence.
+	 */
+	getAvailabilityVerdict(): {
+		outcome: AvailabilityOutcome | null;
+		cause: AvailabilityCause | null;
+		retryAtMs: number;
+	} {
+		return {
+			outcome: this.availabilityLatch.getOutcome(),
+			cause: this.availabilityLatch.getCause(),
+			retryAtMs: this.availabilityLatch.getRetryAtMs(),
+		};
+	}
+
+	/**
 	 * Check if a file is part of a circular dependency (from cache)
 	 */
 	isInCircular(filePath: string): boolean {
@@ -554,7 +585,11 @@ export class DependencyChecker {
 
 		// Fast path: neither mtime NOR size moved (#1105 — size guards the
 		// mtime-preserving content change that mtime alone would miss).
-		if (cached && cached.timestamp >= stat.mtimeMs && cached.size === stat.size) {
+		if (
+			cached &&
+			cached.timestamp >= stat.mtimeMs &&
+			cached.size === stat.size
+		) {
 			return false;
 		}
 
@@ -742,7 +777,12 @@ export class DependencyChecker {
 				);
 			}
 
-			return { ok: true, circular, circularFiles, localSkips: skips.local.length };
+			return {
+				ok: true,
+				circular,
+				circularFiles,
+				localSkips: skips.local.length,
+			};
 		} catch (err: any) {
 			this.log(`Check error: ${err.message}`);
 			return { ok: false };
@@ -929,8 +969,10 @@ export class DependencyChecker {
 			}
 			const spawnResult = spawnResults.get(entry.normalized);
 			const durationMs = spawnDurations.get(entry.normalized) ?? 0;
-			if (durationMs >= MADGE_STATS_TARGET_MIN_DURATION_MS &&
-				stats.targets.length < MADGE_STATS_TARGET_CAP) {
+			if (
+				durationMs >= MADGE_STATS_TARGET_MIN_DURATION_MS &&
+				stats.targets.length < MADGE_STATS_TARGET_CAP
+			) {
 				stats.targets.push({
 					file: path.relative(projectRoot, entry.normalized),
 					durationMs,

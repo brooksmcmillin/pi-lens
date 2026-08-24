@@ -117,6 +117,18 @@ const CASES: Record<string, ImportCase> = {
 		src: "source ./lib.sh\n. ./other.sh\necho hi\n",
 		expect: ["./lib.sh", "./other.sh"],
 	},
+	// #1522: `import_spec`'s `path:` field, verified against the committed
+	// wasm. Covers both import shapes: a single-line `import "pkg"`
+	// declaration AND the block form `import ( ... )`, which nests each
+	// `import_spec` one level deeper (under `import_spec_list`) than the
+	// single-line form — a real-world CUE file commonly uses the block form
+	// exclusively when importing more than one package (#1522 review round 1,
+	// F2: the single-line-only query extracted zero imports from it).
+	cue: {
+		file: "a.cue",
+		src: 'package a\n\nimport "strings"\n\nimport (\n\t"encoding/json"\n\talias "list"\n)\n',
+		expect: ["strings", "encoding/json", "list"],
+	},
 };
 
 let client: TreeSitterClient;

@@ -113,7 +113,10 @@ export const MAX_BLOCKING_RULE_COMPLEXITY = 8;
 const rulesCache = new BoundedLruCache<string, CachedRules>(64);
 const blockingRulesCache = new BoundedLruCache<string, CachedRules>(64);
 const contentRulesCache = new BoundedLruCache<string, ContentCachedRules>(64);
-const contentBlockingRulesCache = new BoundedLruCache<string, ContentCachedRules>(64);
+const contentBlockingRulesCache = new BoundedLruCache<
+	string,
+	ContentCachedRules
+>(64);
 
 // --- Public API ---
 
@@ -201,9 +204,7 @@ export function loadYamlRulesFresh(
 	}
 	const signature = hash.digest("hex");
 	const cache =
-		severityFilter === "error"
-			? contentBlockingRulesCache
-			: contentRulesCache;
+		severityFilter === "error" ? contentBlockingRulesCache : contentRulesCache;
 	const cached = cache.get(ruleDir);
 	if (cached?.signature === signature) return cached.rules;
 	const rules = loadYamlRuleFiles(files, severityFilter);

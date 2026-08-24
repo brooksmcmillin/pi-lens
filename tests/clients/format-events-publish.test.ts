@@ -58,19 +58,28 @@ describe("format-events-publish — pilens:format:queued / pilens:format:start (
 				emit,
 				ctx: {
 					isIdle: () => {
-						throw new Error("This extension ctx is stale after session replacement or reload");
+						throw new Error(
+							"This extension ctx is stale after session replacement or reload",
+						);
 					},
 				},
 			}));
 
-			publishFormatQueued({ filePath: "/repo/a.ts", cwd: "/repo", tool: "write", kinds: ["format"] });
+			publishFormatQueued({
+				filePath: "/repo/a.ts",
+				cwd: "/repo",
+				tool: "write",
+				kinds: ["format"],
+			});
 
 			expect(emit).not.toHaveBeenCalled();
-			expect(logBusEvent).toHaveBeenCalledWith(expect.objectContaining({
-				event: BUS_FORMAT_QUEUED_EVENT,
-				outcome: "skipped_stale_session",
-				level: "info",
-			}));
+			expect(logBusEvent).toHaveBeenCalledWith(
+				expect.objectContaining({
+					event: BUS_FORMAT_QUEUED_EVENT,
+					outcome: "skipped_stale_session",
+					level: "info",
+				}),
+			);
 		});
 
 		it("emits the exact payload shape: v, source, filePath, cwd, tool", () => {
@@ -187,8 +196,18 @@ describe("format-events-publish — pilens:format:queued / pilens:format:start (
 		});
 
 		it("logs 'skipped_unwired' once when busEmit was never wired", () => {
-			publishFormatQueued({ filePath: "/repo/a.ts", cwd: "/repo", tool: "write", kinds: ["format"] });
-			publishFormatQueued({ filePath: "/repo/b.ts", cwd: "/repo", tool: "write", kinds: ["format"] });
+			publishFormatQueued({
+				filePath: "/repo/a.ts",
+				cwd: "/repo",
+				tool: "write",
+				kinds: ["format"],
+			});
+			publishFormatQueued({
+				filePath: "/repo/b.ts",
+				cwd: "/repo",
+				tool: "write",
+				kinds: ["format"],
+			});
 
 			const unwiredCalls = logBusEvent.mock.calls.filter(
 				(c) => (c[0] as { outcome: string }).outcome === "skipped_unwired",

@@ -55,9 +55,7 @@ describe("dispatch coverage", () => {
 
 	it("every runner id referenced by a plan is actually registered (no phantom runners)", () => {
 		const registered = new Set(registeredRunnerIds());
-		const phantom = [...plannedRunnerIds()].filter(
-			(id) => !registered.has(id),
-		);
+		const phantom = [...plannedRunnerIds()].filter((id) => !registered.has(id));
 		expect(
 			phantom,
 			`plan references unregistered runner id(s): ${phantom.join(", ")}`,

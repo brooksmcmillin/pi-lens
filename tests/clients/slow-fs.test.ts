@@ -35,7 +35,10 @@ function makeTempDir(fileCount = 5): string {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-slow-fs-"));
 	tmpDirs.push(dir);
 	for (let i = 0; i < fileCount; i++) {
-		fs.writeFileSync(path.join(dir, `file${i}.ts`), `export const x${i} = ${i};\n`);
+		fs.writeFileSync(
+			path.join(dir, `file${i}.ts`),
+			`export const x${i} = ${i};\n`,
+		);
 	}
 	return dir;
 }
@@ -85,14 +88,19 @@ describe("probeSlowFs", () => {
 	});
 
 	it("probe failure (missing directory) yields slow:false, not a throw", () => {
-		const missing = path.join(os.tmpdir(), "pi-lens-slow-fs-does-not-exist-xyz");
+		const missing = path.join(
+			os.tmpdir(),
+			"pi-lens-slow-fs-does-not-exist-xyz",
+		);
 		expect(() => probeSlowFs(missing)).not.toThrow();
 		const result = probeSlowFs(missing);
 		expect(result).toEqual({ slow: false, medianStatMicros: 0, samples: 0 });
 	});
 
 	it("returns slow:false with zero samples for an empty directory", () => {
-		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-slow-fs-empty-"));
+		const dir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-slow-fs-empty-"),
+		);
 		tmpDirs.push(dir);
 		const result = probeSlowFs(dir);
 		expect(result).toEqual({ slow: false, medianStatMicros: 0, samples: 0 });

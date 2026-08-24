@@ -183,7 +183,9 @@ describe("parseTrivyReport", () => {
 		expect(parseTrivyReport(JSON.stringify({ Results: null }))).toEqual([]);
 		expect(
 			parseTrivyReport(
-				JSON.stringify({ Results: [{ Target: "go.mod", Vulnerabilities: null }] }),
+				JSON.stringify({
+					Results: [{ Target: "go.mod", Vulnerabilities: null }],
+				}),
 			),
 		).toEqual([]);
 	});
@@ -331,7 +333,11 @@ describe("parseTrivyLicenses", () => {
 					Target: "LICENSE",
 					Class: "license-file",
 					Licenses: [
-						{ Severity: "MEDIUM", Name: "AGPL-3.0", FilePath: "vendor/LICENSE" },
+						{
+							Severity: "MEDIUM",
+							Name: "AGPL-3.0",
+							FilePath: "vendor/LICENSE",
+						},
 					],
 				},
 			],

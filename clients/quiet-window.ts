@@ -38,7 +38,11 @@ import {
 import { logLatency } from "./latency-logger.js";
 import { sampleProcesses } from "./resource-sampler.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
-import { toPositiveFinite } from "./env-utils.js";
+import {
+	_resetQuietWindowEnabledForTests,
+	isQuietWindowEnabled,
+	quietWindowWaitMs,
+} from "./quiet-window-config.js";
 
 export interface QuietWindowTaskResult {
 	name: string;
@@ -74,34 +78,18 @@ export function _resetQuietWindowTasksForTests(): void {
 	_tasks.length = 0;
 }
 
-// --- Kill switch (lazy, memoized — house style per clients/runtime-config.ts) ---
-
-let _enabledCache: boolean | undefined;
-
-/** `PI_LENS_QUIET_WINDOW=0` disables the whole scheduler (no-op, no logging). */
-export function isQuietWindowEnabled(): boolean {
-	if (_enabledCache !== undefined) return _enabledCache;
-	_enabledCache = process.env.PI_LENS_QUIET_WINDOW !== "0";
-	return _enabledCache;
-}
-
-/** Test-only: clear the memoized kill-switch read. */
-export function _resetQuietWindowEnabledForTests(): void {
-	_enabledCache = undefined;
-}
-
-const DEFAULT_QUIET_WINDOW_WAIT_MS = 15_000;
-
-/**
- * Bounded wait for the quiet-window's own settle attempts (currently just
- * the carried-over cascade drain). Lazy env read, `Number.isFinite`-guarded
- * so a malformed value falls back to the default instead of poisoning
- * `Math.max`/`setTimeout` with `NaN` (see PR #109).
- */
-export function quietWindowWaitMs(): number {
-	const raw = toPositiveFinite(process.env.PI_LENS_QUIET_WINDOW_WAIT_MS);
-	return raw > 0 ? raw : DEFAULT_QUIET_WINDOW_WAIT_MS;
-}
+// --- Kill switch and wait budget ---
+//
+// #1462 review (N4): both live in `quiet-window-config.ts` now, so a caller
+// that needs only the numbers (`cascade-budget.ts`, on the dispatch load path)
+// does not drag this module's `resource-sampler` → `pidusage` import in with
+// them. Re-exported here so every existing importer is unaffected and there is
+// still one memo behind `isQuietWindowEnabled`.
+export {
+	isQuietWindowEnabled,
+	quietWindowWaitMs,
+	_resetQuietWindowEnabledForTests,
+};
 
 // Re-entrancy guard: agent_settled can fire multiple times per session
 // (once per completed/aborted run). If a previous quiet-window run is still
@@ -270,8 +258,12 @@ async function buildHeartbeatResourcePatch(): Promise<HeartbeatPatch> {
 		const self = instances.find((instance) => instance.pid === process.pid);
 		const childPids = self?.lspChildren.map((child) => child.pid) ?? [];
 		const usage = await sampleProcesses([process.pid, ...childPids]);
+		if (usage === null) return {};
 
-		const childUsage: Record<number, { rssBytes?: number; cpuPercent?: number }> = {};
+		const childUsage: Record<
+			number,
+			{ rssBytes?: number; cpuPercent?: number }
+		> = {};
 		for (const pid of childPids) {
 			const sample = usage.get(pid);
 			if (sample) childUsage[pid] = sample;

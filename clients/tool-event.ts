@@ -33,13 +33,19 @@
  *    enumerate the built-ins only; pi-lens's `tool_call`/`tool_result` paths
  *    also key off `lsp_navigation` and pi-lens's own registered tools, which no
  *    host discriminator names.
- * 4. **Narrowing to the host union would LOSE fields pi-lens reads.** The host
+ * 4. **The host union is narrower than the events pi-lens handles.** The host
  *    `ToolResultEvent` declares `toolCallId`/`input`/`content`/`isError`/
  *    `details`/`usage`; pi-lens's local `ToolResultEvent`
- *    (`clients/runtime-tool-result.ts`) additionally carries
- *    `id`/`callId`/`requestId`/`provider`/`model`/`sessionId`/`session`, which
- *    the telemetry-identity path reads. A guard that narrowed to
- *    `EditToolResultEvent` would drop them.
+ *    (`clients/runtime-tool-result.ts`) declares the subset it reads. It used
+ *    to additionally carry `id`/`callId`/`requestId`/`provider`/`model`/
+ *    `sessionId`/`session` "for the telemetry-identity path" — #1655 item 2
+ *    deleted all seven, because pi's `afterToolCall` builds the event with
+ *    exactly `type`/`toolName`/`toolCallId`/`input`/`content`/`details`/
+ *    `isError`/`usage` (`dist/core/agent-session.js:243-256`, source
+ *    `src/core/agent-session.ts:502-516`), so the branch reading them was dead
+ *    code. The standing reason not to narrow is point 3: pi-lens also
+ *    synthesizes its OWN `tool_result` payloads (bash-derived writes,
+ *    partial-apply) that no host discriminator would admit.
  *
  * What IS consolidated is the part that costs nothing: the host's `details`
  * SHAPES are type-only exports, so `EditToolDetails` & co. are imported as
@@ -47,6 +53,8 @@
  * payloads (`searchReads`, `piLensPartialApply`) stay hand-declared — no host
  * type describes them.
  */
+import { sanitizeCorrelationId } from "./read-guard-logger.js";
+
 export function isToolCallEventType<T extends string>(
 	toolName: T,
 	event: unknown,
@@ -56,4 +64,50 @@ export function isToolCallEventType<T extends string>(
 		typeof event === "object" &&
 		(event as { toolName?: unknown }).toolName === toolName
 	);
+}
+
+/**
+ * Resolve a STABLE correlation id shared between a `tool_call` and its
+ * paired `tool_result`, checking every field name a host is known to use
+ * (#1642 F4) — the SDK declares `toolCallId` (see the file header above for
+ * why pi-lens can't import the SDK's own type at runtime), but
+ * `read-guard-logger.ts`'s `getReadGuardCorrelationId` already had to widen
+ * to `callId`/`requestId`/`id` for hosts that populate one of those instead.
+ * Single source of truth for that field list — do not hand-roll a narrower
+ * `event.toolCallId` read at a new call site.
+ *
+ * Deliberately does NOT fall back to a generated id the way
+ * `getReadGuardCorrelationId` does: that fallback is minted fresh on EVERY
+ * call (a bare per-invocation counter), which is exactly right for grouping
+ * one call's own log lines but useless — actively misleading — for
+ * correlating two SEPARATE events (a `tool_call` and its `tool_result`)
+ * against each other. `undefined` means the host supplies no stable
+ * identity at all under any known field; callers decide their own safe
+ * default for that case rather than treat a generated id as a match.
+ */
+export function resolveToolCallCorrelationId(
+	event: unknown,
+): string | undefined {
+	const value = (event ?? {}) as Record<string, unknown>;
+	for (const candidate of [
+		value.toolCallId,
+		value.callId,
+		value.requestId,
+		// Widest rung, only reached when toolCallId/callId/requestId are all
+		// absent (#1678 item 2): this assumes a host's `id` field identifies
+		// one TOOL CALL. A host that instead populates `id` per MESSAGE (one
+		// id shared by every tool call in that message) would cross two
+		// parallel calls in the same turn under the same id. Stated plainly:
+		// real pi builds `tool_call`/`tool_result` events with exactly
+		// `toolCallId` and no bare `id` field at all (see the file header
+		// above, #1655 item 2, `src/core/agent-session.ts:502-516`), so this
+		// rung is dead code against today's host — kept only in case a
+		// different host shape needs it; drop it once #1655's audit confirms
+		// none does.
+		value.id,
+	]) {
+		const sanitized = sanitizeCorrelationId(candidate);
+		if (sanitized) return sanitized;
+	}
+	return undefined;
 }

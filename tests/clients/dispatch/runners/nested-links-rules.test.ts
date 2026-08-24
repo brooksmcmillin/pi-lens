@@ -33,10 +33,10 @@ vi.mock(
 
 const NESTED_LINKS = [
 	"const view = (",
-	"  <a href=\"/outer\">",
+	'  <a href="/outer">',
 	"    <span>",
-	"      <a href=\"/middle\">",
-	"        <em><a href=\"/inner\">deep</a></em>",
+	'      <a href="/middle">',
+	'        <em><a href="/inner">deep</a></em>',
 	"      </a>",
 	"    </span>",
 	"  </a>",
@@ -49,8 +49,8 @@ const SAME_LINE_CHAIN =
 const TWO_SAME_LINE_CHAINS =
 	'const chains = <a href="/one"><span><a href="/two"><em><a href="/three">one</a></em></a></span></a><a href="/four"><span><a href="/five"><em><a href="/six">two</a></em></a></span></a>;';
 const SAFE_LINKS = [
-	"const single = <div><a href=\"/single\">single</a></div>;",
-	"const siblings = <div><a href=\"/first\">first</a><a href=\"/second\">second</a></div>;",
+	'const single = <div><a href="/single">single</a></div>;',
+	'const siblings = <div><a href="/first">first</a><a href="/second">second</a></div>;',
 ].join("\n");
 
 let env: RealRunnerEnv;
@@ -79,12 +79,18 @@ describe("no-nested-links real dispatch parity (#1077)", () => {
 			expect.arrayContaining(["ast-grep-napi", "tree-sitter"]),
 		);
 		expect(
-			runners.find(({ runnerId }) => runnerId === "ast-grep-napi")?.result
-				.diagnostics.filter((diagnostic) => diagnostic.rule === "no-nested-links"),
+			runners
+				.find(({ runnerId }) => runnerId === "ast-grep-napi")
+				?.result.diagnostics.filter(
+					(diagnostic) => diagnostic.rule === "no-nested-links",
+				),
 		).toHaveLength(1);
 		expect(
-			runners.find(({ runnerId }) => runnerId === "tree-sitter")?.result
-				.diagnostics.filter((diagnostic) => diagnostic.rule === "no-nested-links"),
+			runners
+				.find(({ runnerId }) => runnerId === "tree-sitter")
+				?.result.diagnostics.filter(
+					(diagnostic) => diagnostic.rule === "no-nested-links",
+				),
 		).toHaveLength(1);
 		expect(nestedDiagnostics).toHaveLength(1);
 		expect(result.blockers).toHaveLength(1);
@@ -150,7 +156,17 @@ describe("no-nested-links real dispatch parity (#1077)", () => {
 			(diagnostic) => diagnostic.rule === "no-nested-links",
 		);
 		expect(twoChainDiagnostics).toHaveLength(2);
-		expect(twoChainsResult.result.blockers).toHaveLength(2);
+		// Scoped to the rule under test, not "every blocker in the file" (#1985
+		// review round 2): TWO_SAME_LINE_CHAINS is two adjacent top-level JSX
+		// elements with no wrapping fragment — real, syntactically invalid TSX
+		// that a JS/TS lint runner (oxlint, once dogfooded on this repo) blocks
+		// on independently of no-nested-links. This test's subject is
+		// no-nested-links, not the fixture's general TSX validity.
+		expect(
+			twoChainsResult.result.blockers.filter(
+				(blocker) => blocker.rule === "no-nested-links",
+			),
+		).toHaveLength(2);
 		expect(twoChainDiagnostics.map((diagnostic) => diagnostic.column)).toEqual([
 			16, 122,
 		]);

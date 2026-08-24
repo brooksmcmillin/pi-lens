@@ -28,10 +28,13 @@ import {
 	_setDispositionStatForTests,
 	anchorsForDiagnostic,
 	applyDispositions,
+	applyDispositionsMultiFile,
 	applyWeakDispositions,
 	computeStrictAnchor,
 	getDisposition,
+	isDeferredThisSession,
 	markDisposition,
+	_setMultiFileReadForTests,
 } from "../../clients/diagnostic-dispositions.js";
 import { getProjectDataDir } from "../../clients/file-utils.js";
 import { normalizeMapKey } from "../../clients/path-utils.js";
@@ -50,6 +53,7 @@ beforeEach(() => {
 	_setBeforeDispositionCommitForTests(null);
 	_setBeforeDispositionCacheRefreshForTests(null);
 	_setDispositionStatForTests(null);
+	_setMultiFileReadForTests(null);
 	_resetDispositionPublishForTests();
 	_resetBusPublishForTests();
 	logDispositionEvent.mockClear();
@@ -59,6 +63,7 @@ afterEach(() => {
 	_setBeforeDispositionCommitForTests(null);
 	_setBeforeDispositionCacheRefreshForTests(null);
 	_setDispositionStatForTests(null);
+	_setMultiFileReadForTests(null);
 	if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
 	else process.env.PILENS_DATA_DIR = previousDataDir;
 	if (originalBusEnv === undefined) delete process.env.PI_LENS_BUS_PUBLISH;
@@ -107,15 +112,15 @@ describe("cross-process disposition commits (#1202)", () => {
 		vi.resetModules();
 		const writerB = await import("../../clients/diagnostic-dispositions.js");
 		_setBeforeDispositionCommitForTests(() => {
-			writerB.markDisposition(
-				cwd(),
-				interleaved,
-				"flagged",
-				"writer B",
-			);
+			writerB.markDisposition(cwd(), interleaved, "flagged", "writer B");
 			maskSiblingReplacement = true;
 		});
-		const firstAnchor = markDisposition(cwd(), first, "false-positive", "first");
+		const firstAnchor = markDisposition(
+			cwd(),
+			first,
+			"false-positive",
+			"first",
+		);
 		_setDispositionStatForTests(null);
 		const persisted = JSON.parse(fs.readFileSync(statePath(), "utf8")) as {
 			dispositions: Record<string, { disposition: string; reason?: string }>;
@@ -365,9 +370,9 @@ describe("markDisposition + applyDispositions (#690)", () => {
 		);
 		expect(applyDispositions([diag], cwd(), filePath(), content)).toEqual([]);
 		const editedContent = "const target = good();\n";
-		expect(
-			applyDispositions([diag], cwd(), filePath(), editedContent),
-		).toEqual([diag]);
+		expect(applyDispositions([diag], cwd(), filePath(), editedContent)).toEqual(
+			[diag],
+		);
 	});
 
 	it("false-positive survives whitespace-only changes and unrelated-lines-above insertions", () => {
@@ -384,7 +389,12 @@ describe("markDisposition + applyDispositions (#690)", () => {
 		const shiftedDiag = { ...diag, line: 2 };
 		const withInsertedLineAbove = "// unrelated\nconst target = bad();\n";
 		expect(
-			applyDispositions([shiftedDiag], cwd(), filePath(), withInsertedLineAbove),
+			applyDispositions(
+				[shiftedDiag],
+				cwd(),
+				filePath(),
+				withInsertedLineAbove,
+			),
 		).toEqual([]);
 	});
 
@@ -395,7 +405,12 @@ describe("markDisposition + applyDispositions (#690)", () => {
 			"flagged",
 		);
 		const editedContent = "const target = bad(1, 2, 3);\n";
-		const { weak } = anchorsForDiagnostic(cwd(), filePath(), diag, editedContent);
+		const { weak } = anchorsForDiagnostic(
+			cwd(),
+			filePath(),
+			diag,
+			editedContent,
+		);
 		expect(getDisposition(cwd(), weak)?.disposition).toBe("flagged");
 	});
 
@@ -438,6 +453,281 @@ describe("markDisposition + applyDispositions (#690)", () => {
 	});
 });
 
+describe("applyDispositionsMultiFile (#1617 — cross-file lanes: gitleaks/trivy/govulncheck)", () => {
+	it("groups by each diagnostic's own filePath and reads each file's own content, not one shared file", () => {
+		const projectDir = cwd();
+		fs.mkdirSync(projectDir, { recursive: true });
+		const fileA = path.join(projectDir, "a.ts");
+		const fileB = path.join(projectDir, "b.ts");
+		fs.writeFileSync(fileA, "const secretA = 'aaa';\n");
+		fs.writeFileSync(fileB, "const secretB = 'bbb';\n");
+
+		const diagA = {
+			filePath: fileA,
+			tool: "gitleaks",
+			rule: "gitleaks:generic",
+			message: "Potential secret: generic",
+			line: 1,
+		};
+		const diagB = {
+			filePath: fileB,
+			tool: "gitleaks",
+			rule: "gitleaks:generic",
+			message: "Potential secret: generic",
+			line: 1,
+		};
+
+		markDisposition(
+			projectDir,
+			{ ...diagA, cwd: projectDir, content: "const secretA = 'aaa';\n" },
+			"false-positive",
+		);
+
+		// diagA is marked fp (dropped); diagB is unmarked (kept) — proves each
+		// group reads its OWN file's content, not fileA's content applied to
+		// both (which would either wrongly drop both or wrongly keep both).
+		const kept = applyDispositionsMultiFile(
+			[diagA, diagB],
+			projectDir,
+			(d) => d.filePath,
+		);
+		expect(kept).toEqual([diagB]);
+	});
+
+	it("F2 (#1625 review round): reads NO file content when the disposition store is empty (hoisted early return)", () => {
+		// The overwhelmingly common case (a scan with zero marks) used to pay
+		// one fs.readFileSync PER FILE GROUP just to discover there was nothing
+		// to filter — measured ~270ms/analyzer/run across 9 mode=full lanes.
+		// The empty-store check must short-circuit before any per-group read.
+		const projectDir = cwd();
+		fs.mkdirSync(projectDir, { recursive: true });
+		const fileA = path.join(projectDir, "a.ts");
+		const fileB = path.join(projectDir, "b.ts");
+		fs.writeFileSync(fileA, "const secretA = 'aaa';\n");
+		fs.writeFileSync(fileB, "const secretB = 'bbb';\n");
+		const diagA = { filePath: fileA, tool: "gitleaks", message: "m", line: 1 };
+		const diagB = { filePath: fileB, tool: "gitleaks", message: "m", line: 1 };
+
+		const readSpy = vi.fn(fs.readFileSync);
+		_setMultiFileReadForTests(readSpy as unknown as typeof fs.readFileSync);
+		try {
+			const kept = applyDispositionsMultiFile(
+				[diagA, diagB],
+				projectDir,
+				(d) => d.filePath,
+			);
+			expect(kept).toEqual([diagA, diagB]);
+			expect(readSpy).not.toHaveBeenCalled();
+		} finally {
+			_setMultiFileReadForTests(null);
+		}
+	});
+
+	it("preserves the caller's original element order across file groups", () => {
+		const projectDir = cwd();
+		fs.mkdirSync(projectDir, { recursive: true });
+		const fileA = path.join(projectDir, "a.ts");
+		const fileB = path.join(projectDir, "b.ts");
+		fs.writeFileSync(fileA, "x\n");
+		fs.writeFileSync(fileB, "y\n");
+		const d1 = { filePath: fileA, message: "m1", line: 1 };
+		const d2 = { filePath: fileB, message: "m2", line: 1 };
+		const d3 = { filePath: fileA, message: "m3", line: 1 };
+		expect(
+			applyDispositionsMultiFile([d1, d2, d3], projectDir, (d) => d.filePath),
+		).toEqual([d1, d2, d3]);
+	});
+
+	it("fails OPEN (still reports) a false-positive check when the file can't be read, but a weak-anchored suppress mark still applies with no content needed", () => {
+		const projectDir = cwd();
+		fs.mkdirSync(projectDir, { recursive: true });
+		const missingFile = path.join(projectDir, "does-not-exist.ts");
+
+		const fpTarget = {
+			filePath: missingFile,
+			tool: "trivy",
+			rule: "trivy:CVE-1",
+			message: "vuln",
+			line: 1,
+		};
+		// A false-positive mark made when the file DID exist (real content) —
+		// simulates the file having since been deleted before the next scan.
+		markDisposition(
+			projectDir,
+			{ ...fpTarget, cwd: projectDir, content: "package foo v1\n" },
+			"false-positive",
+		);
+		// The strict anchor's line-content hash can't be recomputed without the
+		// file, so it can't match the stored mark — fails open (still reported)
+		// rather than silently dropping a security finding on a read failure.
+		expect(
+			applyDispositionsMultiFile([fpTarget], projectDir, (d) => d.filePath),
+		).toEqual([fpTarget]);
+
+		// suppress is WEAK-anchored (never looks at content at all — see module
+		// doc), so it applies unconditionally even though the file is missing.
+		const suppressTarget = {
+			filePath: missingFile,
+			tool: "trivy",
+			rule: "trivy:CVE-2",
+			message: "vuln 2",
+			line: 1,
+		};
+		markDisposition(
+			projectDir,
+			{ ...suppressTarget, cwd: projectDir },
+			"suppress",
+		);
+		expect(
+			applyDispositionsMultiFile(
+				[suppressTarget],
+				projectDir,
+				(d) => d.filePath,
+			),
+		).toEqual([]);
+	});
+});
+
+describe("F1 (#1625 review round): blocking findings require a STRICT anchor to suppress", () => {
+	// Two DISTINCT secrets, same tool/rule/message (the realistic shape: two
+	// different AWS keys flagged by the same gitleaks rule) — they share ONE
+	// weak anchor (`relativeFile|tool|rule|normalizedMessage`, no line-content
+	// hash) but two DIFFERENT strict anchors (each hashes its own line).
+	// `cwd()`/`filePath()` read `tmpDir`, which is only set inside `beforeEach`
+	// — computed lazily per test, not at describe-body evaluation time, or
+	// every one of these would read `tmpDir === undefined`.
+	const content =
+		"const keyA = 'AKIAABCDEFGHIJKLMNOP';\nconst keyB = 'AKIAQRSTUVWXYZ123456';\n";
+	function secret(line: 1 | 2) {
+		return {
+			cwd: cwd(),
+			filePath: filePath(),
+			tool: "gitleaks",
+			rule: "gitleaks:generic-api-key",
+			message: "Potential secret: generic-api-key",
+			line,
+			semantic: "blocking" as const,
+		};
+	}
+
+	it("a WEAK-anchor suppress on one does NOT drop either blocking finding (both still block)", () => {
+		const finding1 = secret(1);
+		const finding2 = secret(2);
+		markDisposition(cwd(), { ...finding1, content }, "suppress");
+		const kept = applyDispositions(
+			[finding1, finding2],
+			cwd(),
+			filePath(),
+			content,
+		);
+		expect(kept).toEqual([finding1, finding2]);
+	});
+
+	it("a WEAK-anchor defer on one does NOT drop either blocking finding (both still block)", () => {
+		const finding1 = secret(1);
+		const finding2 = secret(2);
+		markDisposition(cwd(), { ...finding1, content }, "defer");
+		const kept = applyDispositions(
+			[finding1, finding2],
+			cwd(),
+			filePath(),
+			content,
+		);
+		expect(kept).toEqual([finding1, finding2]);
+	});
+
+	it("a STRICT-anchor (false-positive) mark on one drops ONLY that one", () => {
+		const finding1 = secret(1);
+		const finding2 = secret(2);
+		markDisposition(cwd(), { ...finding1, content }, "false-positive");
+		const kept = applyDispositions(
+			[finding1, finding2],
+			cwd(),
+			filePath(),
+			content,
+		);
+		expect(kept).toEqual([finding2]);
+	});
+
+	it("a non-blocking (warning-tier) finding is still suppressible via weak anchor, unchanged", () => {
+		const warning1 = { ...secret(1), semantic: "warning" as const };
+		const warning2 = { ...secret(2), semantic: "warning" as const };
+		markDisposition(cwd(), { ...warning1, content }, "suppress");
+		const kept = applyDispositions(
+			[warning1, warning2],
+			cwd(),
+			filePath(),
+			content,
+		);
+		// Weak suppress still collapses both non-blocking findings — F1 only
+		// tightens the blocking tier, it doesn't touch existing behavior here.
+		expect(kept).toEqual([]);
+	});
+
+	it("applyWeakDispositions (the cache-only instant filter) never drops a blocking finding, even with a weak suppress mark", () => {
+		const finding1 = secret(1);
+		const finding2 = secret(2);
+		markDisposition(cwd(), { ...finding1, content }, "suppress");
+		const kept = applyWeakDispositions([finding1, finding2], cwd(), filePath());
+		expect(kept).toEqual([finding1, finding2]);
+	});
+});
+
+describe("F3 (#1625 review round): deferredThisSession is scoped per-project, not process-global", () => {
+	// `deferredThisSession` is a single module-level Set — but a WEAK anchor
+	// only encodes a RELATIVE path (`relativeFile` derives it from
+	// `path.relative(cwd, filePath)`) plus tool/rule/normalizedMessage, never
+	// the cwd's own identity. Two unrelated projects sharing the same
+	// relative path/tool/rule/message therefore compute the IDENTICAL weak
+	// anchor string. Uses a non-blocking (no `semantic`) finding so F1's
+	// blocking-tier gate doesn't itself block the drop and mask what F3 is
+	// actually testing (cwd scoping).
+	function projectDirs(): { projectA: string; projectB: string } {
+		return {
+			projectA: path.join(tmpDir, "project-a"),
+			projectB: path.join(tmpDir, "project-b"),
+		};
+	}
+	function finding(projectDir: string) {
+		return {
+			cwd: projectDir,
+			filePath: path.join(projectDir, "a.ts"),
+			tool: "eslint",
+			rule: "no-bad",
+			message: "bad call",
+			line: 1,
+		};
+	}
+	const content = "const target = bad();\n";
+
+	it("a defer in project A does not suppress the identical relative-path finding in project B", () => {
+		const { projectA, projectB } = projectDirs();
+		const findingA = finding(projectA);
+		const findingB = finding(projectB);
+
+		markDisposition(projectA, { ...findingA, content }, "defer");
+
+		// Project A's own finding IS deferred.
+		expect(
+			applyDispositions([findingA], projectA, findingA.filePath, content),
+		).toEqual([]);
+		// Project B's finding — same relative path, tool, rule, message — must
+		// NOT be affected by project A's defer.
+		expect(
+			applyDispositions([findingB], projectB, findingB.filePath, content),
+		).toEqual([findingB]);
+	});
+
+	it("isDeferredThisSession requires the SAME cwd the defer was made under", () => {
+		const { projectA, projectB } = projectDirs();
+		const findingA = finding(projectA);
+		const anchor = markDisposition(projectA, { ...findingA, content }, "defer");
+
+		expect(isDeferredThisSession(projectA, anchor)).toBe(true);
+		expect(isDeferredThisSession(projectB, anchor)).toBe(false);
+	});
+});
+
 describe("anchor path-form stability (#1024 — write raw vs read normalized)", () => {
 	// The mark tool (lens-diagnostic-mark.ts) anchors a disposition under a RAW
 	// cwd / `path.resolve(cwd, arg)` path, while the dispatch read side
@@ -476,7 +766,12 @@ describe("anchor path-form stability (#1024 — write raw vs read normalized)", 
 		// there but never alias — which surfaced as a CI failure on #1024's PR.)
 		if (!fs.existsSync(rawFile)) return;
 
-		const diag = { tool: "eslint", rule: "no-bad", message: "bad call", line: 1 };
+		const diag = {
+			tool: "eslint",
+			rule: "no-bad",
+			message: "bad call",
+			line: 1,
+		};
 		markDisposition(
 			projectDir,
 			{ cwd: projectDir, filePath: rawFile, ...diag, content },
@@ -487,7 +782,12 @@ describe("anchor path-form stability (#1024 — write raw vs read normalized)", 
 		// normalized-form read derives `sub/a.ts`, so the mark is not found and the
 		// diagnostic survives (kept === [diag]). Post-fix both derive the same
 		// canonical anchor, so the mark is found and the diagnostic is suppressed.
-		const kept = applyDispositions([diag], normalizedCwd, normalizedFile, content);
+		const kept = applyDispositions(
+			[diag],
+			normalizedCwd,
+			normalizedFile,
+			content,
+		);
 		expect(kept).toEqual([]);
 	});
 });
@@ -553,7 +853,10 @@ describe("mark telemetry (#690 — NDJSON log + pilens:diagnostic:disposition)",
 	const content = "const target = bad();\n";
 	const diag = { tool: "eslint", rule: "no-bad", message: "bad call", line: 1 };
 
-	function mark(disposition: "false-positive" | "suppress" | "defer" | "flagged", reason?: string) {
+	function mark(
+		disposition: "false-positive" | "suppress" | "defer" | "flagged",
+		reason?: string,
+	) {
 		return markDisposition(
 			cwd(),
 			{ cwd: cwd(), filePath: filePath(), ...diag, content },

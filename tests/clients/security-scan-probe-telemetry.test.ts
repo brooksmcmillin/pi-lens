@@ -13,21 +13,16 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { TRANSIENT_BASE_COOLDOWN_MS } from "../../clients/dispatch/runners/utils/availability-policy.ts";
+import { TRANSIENT_BASE_COOLDOWN_MS } from "../../clients/dispatch/runners/utils/availability-policy.js";
 
-const {
-	safeSpawnAsync,
-	safeSpawn,
-	ensureTool,
-	getInstallAttempt,
-	logLatency,
-} = vi.hoisted(() => ({
-	safeSpawnAsync: vi.fn(),
-	safeSpawn: vi.fn(),
-	ensureTool: vi.fn(),
-	getInstallAttempt: vi.fn(),
-	logLatency: vi.fn(),
-}));
+const { safeSpawnAsync, safeSpawn, ensureTool, getInstallAttempt, logLatency } =
+	vi.hoisted(() => ({
+		safeSpawnAsync: vi.fn(),
+		safeSpawn: vi.fn(),
+		ensureTool: vi.fn(),
+		getInstallAttempt: vi.fn(),
+		logLatency: vi.fn(),
+	}));
 
 // Spread the real module: only `logLatency` is intercepted, so the rest of
 // the import graph (including availability-policy's logAvailabilityDecision,
@@ -250,6 +245,48 @@ describe.each(CONSUMERS)("probeVersion telemetry: %s (#1501)", (tool) => {
 		);
 	});
 });
+
+describe.each(["gitleaks", "trivy", "opengrep"] as const)(
+	"ensureViaInstaller compensating row: %s (#1606)",
+	(tool) => {
+		it("emits a compensating available row when ensureTool recovers a failed probe", async () => {
+			// The PATH probe fails (ENOENT) for every consumer; the installer then
+			// resolves the managed binary. Pre-fix, this leaves exactly one
+			// availability_decision row: the probe's latched `unavailable`. The
+			// installer's success is never recorded.
+			safeSpawnAsync.mockImplementation(async () => missingResult);
+			ensureTool.mockResolvedValue("/managed/bin/" + tool);
+			const client = await makeClient(tool);
+
+			expect(await client.ensureAvailable()).toBe(true);
+			const records = decisionsFor(tool);
+			expect(records).toHaveLength(2);
+
+			expect(metadataOf(records[0])).toMatchObject({
+				tool,
+				verdict: "unavailable",
+				outcome: "missing",
+				cause: "not-found",
+				classifiedBy: "probe",
+			});
+
+			// The compensating row #1606 requires: the installer resolved the
+			// tool after the probe latched it absent, so a second row must say so.
+			expect(metadataOf(records[1])).toMatchObject({
+				tool,
+				verdict: "available",
+				outcome: "success",
+				cause: "ok",
+				classifiedBy: "caller",
+				evidence: {
+					install: "succeeded",
+					binary: tool,
+					source: "managed-dir",
+				},
+			});
+		});
+	},
+);
 
 describe.each(["gitleaks", "govulncheck"] as const)(
 	"probeVersion telemetry: %s cooldown lifecycle (#1501)",

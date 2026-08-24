@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { FactStore } from "../../../../clients/dispatch/fact-store.js";
+import { makeRunnerCtx } from "../../../support/runner-ctx.js";
 import { setupTestEnvironment } from "../../test-utils.js";
 
 const safeSpawn = vi.fn();
@@ -23,17 +23,7 @@ vi.mock("../../../../clients/dispatch/runners/utils/runner-helpers.js", () => ({
 }));
 
 function createCtx(kind: "java" | "csharp", filePath: string, cwd: string) {
-	return {
-		filePath,
-		cwd,
-		kind,
-		pi: { getFlag: () => false },
-		autofix: false,
-		deltaMode: true,
-		facts: new FactStore(),
-		hasTool: async () => true,
-		log: () => {},
-	};
+	return makeRunnerCtx(filePath, cwd, { kind });
 }
 
 describe("java/csharp fallback runners", () => {
@@ -46,7 +36,7 @@ describe("java/csharp fallback runners", () => {
 		);
 	});
 
-	it("parses javac blocking diagnostics for the edited file", async () => {
+	it("keeps standalone javac diagnostics non-blocking", async () => {
 		const env = setupTestEnvironment("pi-lens-javac-runner-");
 		try {
 			const filePath = path.join(env.tmpDir, "src", "App.java");
@@ -65,8 +55,9 @@ describe("java/csharp fallback runners", () => {
 			);
 
 			expect(result.status).toBe("failed");
-			expect(result.semantic).toBe("blocking");
+			expect(result.semantic).toBe("warning");
 			expect(result.diagnostics[0]?.tool).toBe("javac");
+			expect(result.diagnostics[0]?.semantic).toBe("warning");
 			expect(result.diagnostics[0]?.line).toBe(7);
 		} finally {
 			env.cleanup();
@@ -141,8 +132,9 @@ describe("java/csharp fallback runners", () => {
 			} as never);
 
 			expect(result.status).toBe("failed");
-			expect(result.semantic).toBe("blocking");
+			expect(result.semantic).toBe("warning");
 			expect(result.diagnostics[0]?.tool).toBe("cpp-check");
+			expect(result.diagnostics[0]?.semantic).toBe("warning");
 		} finally {
 			env.cleanup();
 		}

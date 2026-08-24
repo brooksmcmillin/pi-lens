@@ -8,7 +8,10 @@ import {
 	getDisposition,
 	isDeferredThisSession,
 } from "../../clients/diagnostic-dispositions.js";
-import { clearWidgetState, recordDiagnostics } from "../../clients/widget-state.js";
+import {
+	clearWidgetState,
+	recordDiagnostics,
+} from "../../clients/widget-state.js";
 import { createLensDiagnosticMarkTool } from "../../tools/lens-diagnostic-mark.js";
 import { removeTempDirSync } from "../clients/test-utils.js";
 
@@ -40,13 +43,7 @@ function writeFile(name: string, content: string): string {
 const tool = createLensDiagnosticMarkTool(() => tmpDir);
 
 async function run(params: Record<string, unknown>) {
-	return tool.execute(
-		"call-1",
-		params,
-		undefined,
-		() => {},
-		{ cwd: tmpDir },
-	);
+	return tool.execute("call-1", params, undefined, () => {}, { cwd: tmpDir });
 }
 
 describe("lens_diagnostic_mark tool (#690)", () => {
@@ -94,7 +91,7 @@ describe("lens_diagnostic_mark tool (#690)", () => {
 		expect(result.isError).toBeFalsy();
 		expect(fs.readFileSync(path.join(tmpDir, "a.ts"), "utf-8")).toBe(content);
 		const anchor = (result.details as { anchor: string }).anchor;
-		expect(isDeferredThisSession(anchor)).toBe(true);
+		expect(isDeferredThisSession(tmpDir, anchor)).toBe(true);
 	});
 
 	it("disposition=flagged records the disposition and getDisposition shows flagged with fix context", async () => {
@@ -150,7 +147,9 @@ describe("lens_diagnostic_mark tool — line verification/reanchoring (#802)", (
 		});
 		expect(result.isError).toBeFalsy();
 		expect(String(result.content[0]?.text)).toContain("a.ts:3");
-		expect(String(result.content[0]?.text)).toMatch(/reanchored from line 2 to 3/);
+		expect(String(result.content[0]?.text)).toMatch(
+			/reanchored from line 2 to 3/,
+		);
 		expect((result.details as { line: number }).line).toBe(3);
 
 		// The stored strict anchor must hash line 3's ("const target = bad();")
@@ -277,7 +276,9 @@ describe("lens_diagnostic_mark tool — line verification/reanchoring (#802)", (
 			disposition: "suppress",
 		});
 		expect(second.isError).toBeFalsy();
-		expect(String(second.content[0]?.text)).toMatch(/reanchored from line 4 to 5/);
+		expect(String(second.content[0]?.text)).toMatch(
+			/reanchored from line 4 to 5/,
+		);
 
 		const finalLines = fs.readFileSync(absPath, "utf-8").split(/\r?\n/);
 		// Comment for finding one directly above "const first = bad1();"

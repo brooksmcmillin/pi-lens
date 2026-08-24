@@ -1,6 +1,14 @@
 import * as fs from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { TreeCache } from "../../clients/tree-sitter-cache.js";
+import {
+	createTreeCacheCounters,
+	deriveScanTreeCacheCapacity,
+	TREE_CACHE_COUNTER_KEYS,
+	TREE_CACHE_DEFAULT_MAX_SIZE,
+	TREE_CACHE_SCAN_CAPACITY_CEILING,
+	TreeCache,
+	type TreeCacheCounters,
+} from "../../clients/tree-sitter-cache.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 
 const cleanups: Array<() => void> = [];
@@ -144,9 +152,13 @@ describe("TreeSitterClient query-cache Tier-2 bounds (#1389)", () => {
 		const previous = process.env.PI_LENS_TREE_SITTER_QUERY_CACHE_CAP;
 		process.env.PI_LENS_TREE_SITTER_QUERY_CACHE_CAP = "8";
 		try {
-			const { TreeSitterClient } = await import("../../clients/tree-sitter-client.js");
+			const { TreeSitterClient } =
+				await import("../../clients/tree-sitter-client.js");
 			const client = new TreeSitterClient() as any;
-			const values = Array.from({ length: 9 }, (_, i) => ({ query: { delete: vi.fn() }, i }));
+			const values = Array.from({ length: 9 }, (_, i) => ({
+				query: { delete: vi.fn() },
+				i,
+			}));
 			for (let i = 0; i < 8; i++) client.cacheQuery(`q${i}`, values[i]);
 			client.queryCache.get("q0");
 			client.queryCache.delete("q0");
@@ -158,7 +170,8 @@ describe("TreeSitterClient query-cache Tier-2 bounds (#1389)", () => {
 			expect(client.queryCache.has("q1")).toBe(true);
 			expect(values[1].query.delete).toHaveBeenCalledTimes(1);
 		} finally {
-			if (previous === undefined) delete process.env.PI_LENS_TREE_SITTER_QUERY_CACHE_CAP;
+			if (previous === undefined)
+				delete process.env.PI_LENS_TREE_SITTER_QUERY_CACHE_CAP;
 			else process.env.PI_LENS_TREE_SITTER_QUERY_CACHE_CAP = previous;
 		}
 	});
@@ -368,5 +381,327 @@ describe("TreeCache statistics (#675)", () => {
 			clears: 1,
 			size: 0,
 		});
+	});
+
+	it("distinguishes cold vs capacity misses (#1715 pin — the measurement #890's stats enable)", () => {
+		// Pinned separately from the #890 test above: this is the exact
+		// distinction #1715's dogfood measurement read off cache_stats to prove
+		// EVERY second-scan miss was capacity-bound, not cold. If this
+		// distinction ever collapsed, that live measurement would stop being
+		// possible.
+		const cache = new TreeCache(1);
+		cache.set("a.ts", "a", "typescript", fakeTree()); // first scan: cold
+		cache.set("b.ts", "b", "typescript", fakeTree()); // evicts a (capacity-bound)
+
+		expect(cache.get("z.ts", "z", "typescript")).toBeNull(); // never seen: cold
+		expect(cache.get("a.ts", "a", "typescript")).toBeNull(); // evicted, same content: capacity
+
+		expect(cache.getStats()).toMatchObject({
+			coldMisses: 1,
+			capacityMisses: 1,
+		});
+	});
+});
+
+describe("TreeCache capacity growth for scan working sets (#1715)", () => {
+	it("cannot span a full-scan working set at the interactive default — every second-scan lookup is a capacityMiss", () => {
+		// Documents the bug this issue reports: a fixed 50-entry cache asked to
+		// hold a 110-file working set evicts the tail, so a second identical
+		// scan re-parses everything the LRU couldn't keep.
+		const env = setupTestEnvironment("pi-lens-tccache-nospan-");
+		cleanups.push(env.cleanup);
+		const cache = new TreeCache(TREE_CACHE_DEFAULT_MAX_SIZE);
+		const fileCount = 110;
+		const files = Array.from({ length: fileCount }, (_, i) =>
+			createTempFile(env.tmpDir, `f${i}.ts`, `content-${i}`),
+		);
+		for (let i = 0; i < fileCount; i++) {
+			cache.set(files[i], `content-${i}`, "typescript", fakeTree());
+		}
+		expect(cache.getStats().size).toBe(TREE_CACHE_DEFAULT_MAX_SIZE);
+
+		let misses = 0;
+		for (let i = 0; i < fileCount; i++) {
+			if (cache.get(files[i], `content-${i}`, "typescript") === null) misses++;
+		}
+		// The first 60 of 110 files were evicted to make room for the last 50 —
+		// EVERY miss on this second pass is capacity-bound, none cold or
+		// stat-failed (all files exist with matching content).
+		expect(misses).toBe(fileCount - TREE_CACHE_DEFAULT_MAX_SIZE);
+		expect(cache.getStats()).toMatchObject({
+			capacityMisses: fileCount - TREE_CACHE_DEFAULT_MAX_SIZE,
+			coldMisses: 0,
+			statFailedMisses: 0,
+		});
+	});
+
+	it("setMaxSize grows capacity without evicting or freeing existing entries", async () => {
+		const env = setupTestEnvironment("pi-lens-tccache-grow-");
+		cleanups.push(env.cleanup);
+		const fileA = createTempFile(env.tmpDir, "a.ts", "a");
+		const fileB = createTempFile(env.tmpDir, "b.ts", "b");
+		const cache = new TreeCache(2);
+		const a = fakeTree();
+		const b = fakeTree();
+		cache.set(fileA, "a", "typescript", a);
+		cache.set(fileB, "b", "typescript", b);
+
+		cache.setMaxSize(10);
+		await flushRetiredTrees();
+
+		expect(cache.getStats().maxSize).toBe(10);
+		expect(a.delete).not.toHaveBeenCalled();
+		expect(b.delete).not.toHaveBeenCalled();
+		expect(cache.get(fileA, "a", "typescript")).toBe(a);
+		expect(cache.get(fileB, "b", "typescript")).toBe(b);
+	});
+
+	it("setMaxSize shrinking evicts the LRU tail AND frees each dropped tree (#417 discipline under the new lifetime)", async () => {
+		const env = setupTestEnvironment("pi-lens-tccache-shrink-");
+		cleanups.push(env.cleanup);
+		const fileA = createTempFile(env.tmpDir, "a.ts", "a");
+		const fileB = createTempFile(env.tmpDir, "b.ts", "b");
+		const fileC = createTempFile(env.tmpDir, "c.ts", "c");
+		const cache = new TreeCache(3);
+		const a = fakeTree();
+		const b = fakeTree();
+		const c = fakeTree();
+		cache.set(fileA, "a", "typescript", a);
+		cache.set(fileB, "b", "typescript", b);
+		cache.set(fileC, "c", "typescript", c);
+
+		cache.setMaxSize(1); // must evict+free a and b (LRU order), keep c
+		await flushRetiredTrees();
+
+		expect(a.delete).toHaveBeenCalledTimes(1);
+		expect(b.delete).toHaveBeenCalledTimes(1);
+		expect(c.delete).not.toHaveBeenCalled();
+		expect(cache.getStats().size).toBe(1);
+		expect(cache.get(fileC, "c", "typescript")).toBe(c);
+	});
+
+	it("after growing to span the working set, a second identical scan sees zero capacityMisses", () => {
+		const env = setupTestEnvironment("pi-lens-tccache-scanreuse-");
+		cleanups.push(env.cleanup);
+		const cache = new TreeCache(TREE_CACHE_DEFAULT_MAX_SIZE);
+		const fileCount = 110;
+		const files = Array.from({ length: fileCount }, (_, i) =>
+			createTempFile(env.tmpDir, `f${i}.ts`, `content-${i}`),
+		);
+		cache.setMaxSize(
+			deriveScanTreeCacheCapacity(fileCount, cache.getMaxSize()),
+		);
+
+		for (let i = 0; i < fileCount; i++) {
+			cache.set(files[i], `content-${i}`, "typescript", fakeTree());
+		}
+		expect(cache.getStats().size).toBe(fileCount);
+
+		let hits = 0;
+		for (let i = 0; i < fileCount; i++) {
+			if (cache.get(files[i], `content-${i}`, "typescript") !== null) hits++;
+		}
+
+		expect(hits).toBe(fileCount);
+		expect(cache.getStats()).toMatchObject({
+			capacityMisses: 0,
+			coldMisses: 0,
+		});
+	});
+
+	describe("deriveScanTreeCacheCapacity", () => {
+		const previousEnv = process.env.PI_LENS_TREE_SITTER_CACHE_SCAN_CAP;
+		afterEach(() => {
+			if (previousEnv === undefined) {
+				delete process.env.PI_LENS_TREE_SITTER_CACHE_SCAN_CAP;
+			} else {
+				process.env.PI_LENS_TREE_SITTER_CACHE_SCAN_CAP = previousEnv;
+			}
+		});
+
+		it("targets the file count when it fits under the ceiling", () => {
+			delete process.env.PI_LENS_TREE_SITTER_CACHE_SCAN_CAP;
+			expect(
+				deriveScanTreeCacheCapacity(110, TREE_CACHE_DEFAULT_MAX_SIZE),
+			).toBe(110);
+		});
+
+		it("never targets below the interactive default, even for a tiny scan", () => {
+			delete process.env.PI_LENS_TREE_SITTER_CACHE_SCAN_CAP;
+			expect(deriveScanTreeCacheCapacity(3, TREE_CACHE_DEFAULT_MAX_SIZE)).toBe(
+				TREE_CACHE_DEFAULT_MAX_SIZE,
+			);
+		});
+
+		it("clamps at the hard ceiling for a huge project (bounds the heap, not just the count)", () => {
+			delete process.env.PI_LENS_TREE_SITTER_CACHE_SCAN_CAP;
+			expect(
+				deriveScanTreeCacheCapacity(50_000, TREE_CACHE_DEFAULT_MAX_SIZE),
+			).toBe(TREE_CACHE_SCAN_CAPACITY_CEILING);
+		});
+
+		it("never shrinks a capacity the cache already has", () => {
+			delete process.env.PI_LENS_TREE_SITTER_CACHE_SCAN_CAP;
+			expect(deriveScanTreeCacheCapacity(10, 300)).toBe(300);
+		});
+
+		it("respects an operator's PI_LENS_TREE_SITTER_CACHE_SCAN_CAP override", () => {
+			process.env.PI_LENS_TREE_SITTER_CACHE_SCAN_CAP = "75";
+			expect(
+				deriveScanTreeCacheCapacity(1000, TREE_CACHE_DEFAULT_MAX_SIZE),
+			).toBe(75);
+		});
+
+		it("ignores a malformed override and falls back to the hard ceiling", () => {
+			process.env.PI_LENS_TREE_SITTER_CACHE_SCAN_CAP = "not-a-number";
+			expect(
+				deriveScanTreeCacheCapacity(50_000, TREE_CACHE_DEFAULT_MAX_SIZE),
+			).toBe(TREE_CACHE_SCAN_CAPACITY_CEILING);
+		});
+	});
+
+	it("N repeated scans at the grown capacity keep the resident tree count bounded and free every superseded tree exactly once (no leak under the new lifetime)", async () => {
+		const cache = new TreeCache(TREE_CACHE_DEFAULT_MAX_SIZE);
+		const fileCount = 110;
+		const scans = 5;
+		cache.setMaxSize(
+			deriveScanTreeCacheCapacity(fileCount, cache.getMaxSize()),
+		);
+
+		const treesByScan: ReturnType<typeof fakeTree>[][] = [];
+		for (let scan = 0; scan < scans; scan++) {
+			const trees: ReturnType<typeof fakeTree>[] = [];
+			for (let i = 0; i < fileCount; i++) {
+				const tree = fakeTree();
+				trees.push(tree);
+				// Content changes every scan so each set() is a genuine
+				// same-key replacement, not a hash-authoritative hit — the
+				// path that must free the superseded tree.
+				cache.set(`f${i}.ts`, `content-${i}-scan${scan}`, "typescript", tree);
+			}
+			treesByScan.push(trees);
+			await flushRetiredTrees();
+			// Bounded: the resident set never grows past the capacity, scan
+			// after scan — the defining property of a leak-free lifetime.
+			expect(cache.getStats().size).toBe(fileCount);
+		}
+
+		// Every superseded scan's trees were freed exactly once...
+		for (let scan = 0; scan < scans - 1; scan++) {
+			for (const tree of treesByScan[scan]) {
+				expect(tree.delete).toHaveBeenCalledTimes(1);
+			}
+		}
+		// ...and the final scan's trees are still live (not double-freed, not
+		// dropped out from under the resident cache).
+		for (const tree of treesByScan[scans - 1]) {
+			expect(tree.delete).not.toHaveBeenCalled();
+		}
+	});
+
+	// #1935: growing the cache to fit a scan's working set trades a bigger
+	// entry-count ceiling for more resident memory — `treeCacheTotalBytes`
+	// (the source-byte sum `memory_sample` reports, `getStats().totalBytes`
+	// here) must stay a bounded number, not climb without limit as a project
+	// grows past the cache's capacity. `TREE_CACHE_SCAN_CAPACITY_CEILING`
+	// (500 entries) is the enforcement point: this test offers far more files
+	// than the ceiling and pins that resident bytes stay bounded by realistic
+	// per-file sizes, proving the entry-count cap also bounds bytes.
+	it("bounds treeCacheTotalBytes at the scan ceiling using realistic, varying per-file sizes (#1935)", () => {
+		const cache = new TreeCache(TREE_CACHE_DEFAULT_MAX_SIZE);
+		// Realistic per-file source sizes observed in production (#1935 review
+		// round): 12.4KB-36KB, not one repeated size. A uniform fixture makes
+		// the byte assertion arithmetically forced by the entry-count
+		// assertion (every entry contributes the same amount, so the total is
+		// just `size * perFileBytes` and can't fail independently) and
+		// understates the real worst case. Cycle through a deterministic,
+		// non-uniform spread so the resident-byte sum carries information the
+		// entry-count assertion above doesn't already give away.
+		const minFileBytes = 12_400;
+		const maxFileBytes = 36_000;
+		const span = maxFileBytes - minFileBytes;
+		const sizeFor = (i: number): number =>
+			minFileBytes + Math.floor((span * ((i * 37) % 101)) / 100);
+
+		// A project many times larger than the hard ceiling — e.g. a 1500-file
+		// monorepo — so the cache must evict, not just grow unboundedly.
+		const totalFilesOffered = TREE_CACHE_SCAN_CAPACITY_CEILING * 3;
+		cache.setMaxSize(
+			deriveScanTreeCacheCapacity(totalFilesOffered, cache.getMaxSize()),
+		);
+		expect(cache.getMaxSize()).toBe(TREE_CACHE_SCAN_CAPACITY_CEILING);
+
+		const sizesOffered: number[] = [];
+		for (let i = 0; i < totalFilesOffered; i++) {
+			const bytes = sizeFor(i);
+			sizesOffered.push(bytes);
+			cache.set(`f${i}.ts`, "x".repeat(bytes), "typescript", fakeTree());
+		}
+
+		const stats = cache.getStats();
+		expect(stats.size).toBe(TREE_CACHE_SCAN_CAPACITY_CEILING);
+
+		// Eviction here is pure FIFO (no `get()` re-insertions reorder
+		// recency), so the resident set is exactly the LAST `ceiling` entries
+		// offered. Sum their sizes independently of the varying-size fixture
+		// above: this fails on its own if eviction keeps the wrong entries,
+		// double-counts, or the cap is missing entirely.
+		const expectedResidentBytes = sizesOffered
+			.slice(-TREE_CACHE_SCAN_CAPACITY_CEILING)
+			.reduce((sum, bytes) => sum + bytes, 0);
+		expect(stats.totalBytes).toBe(expectedResidentBytes);
+
+		// Blast radius (#1935 review): `TreeCache` enforces NO per-entry byte
+		// cap — only the entry-count ceiling (`fileSize` is accounted, never
+		// limited). At these realistic per-file sizes the 500-entry ceiling
+		// means 6-18MB of resident source bytes worst case, not the ~1.8MB a
+		// uniform ~3.6KB fixture would have implied. State the range plainly
+		// rather than let the fixture understate it.
+		const worstCaseFloor = TREE_CACHE_SCAN_CAPACITY_CEILING * minFileBytes;
+		const worstCaseCeiling = TREE_CACHE_SCAN_CAPACITY_CEILING * maxFileBytes;
+		expect(stats.totalBytes).toBeGreaterThanOrEqual(worstCaseFloor);
+		expect(stats.totalBytes).toBeLessThanOrEqual(worstCaseCeiling);
+	});
+});
+
+// #1727/#1777: `createTreeCacheCounters` builds its result with
+// `Object.fromEntries(...) as unknown as TreeCacheCounters`. Its SAFETY
+// comment claims the cast holds because TREE_CACHE_COUNTER_KEYS covers every
+// counter. The `as const satisfies readonly (keyof TreeCacheCounters)[]`
+// clause on that array only checks one direction — that no listed key is
+// bogus. Nothing checked the reverse until now: add a counter to the
+// interface and forget the array, and the cast silently starts lying.
+describe("tree cache counter keys cover the counter type (#1727)", () => {
+	it("has no counter missing from TREE_CACHE_COUNTER_KEYS", () => {
+		// This assertion is COMPILE-TIME only; the `expect` below just gives
+		// vitest a body. `MissingCounterKey` is `never` exactly while every key
+		// of TreeCacheCounters appears in the array.
+		type MissingCounterKey = Exclude<
+			keyof TreeCacheCounters,
+			(typeof TREE_CACHE_COUNTER_KEYS)[number]
+		>;
+		// The `[T] extends [never]` wrapper is load-bearing. The obvious form,
+		// `const missing: MissingCounterKey[] = []`, is VACUOUS: an empty array
+		// literal is assignable to an array of ANY element type, so it compiles
+		// even when MissingCounterKey is a real key. This form resolves to
+		// `never` — which nothing can be assigned to — the moment a counter is
+		// missing, so `tsc` fails with TS2322. Verified by mutation: dropping
+		// `ghostHistoryDrops` from TREE_CACHE_COUNTER_KEYS reds this line and
+		// leaves the vacuous form green.
+		const _noMissing: [MissingCounterKey] extends [never] ? true : never = true;
+		expect(_noMissing).toBe(true);
+	});
+
+	it("seeds every declared key as a numeric zero", () => {
+		// Deliberately NOT a key-coverage check: both sides of a key comparison
+		// would come from TREE_CACHE_COUNTER_KEYS, which proves nothing. Key
+		// coverage is the compile-time assertion above. What this pins is the
+		// part of the cast that is a runtime claim — that `Object.fromEntries`
+		// produced one entry per key and every value is the number 0, not
+		// `undefined` or a string.
+		const counters = createTreeCacheCounters();
+		const values = Object.values(counters);
+		expect(values).toHaveLength(TREE_CACHE_COUNTER_KEYS.length);
+		expect(values.every((v) => typeof v === "number" && v === 0)).toBe(true);
 	});
 });

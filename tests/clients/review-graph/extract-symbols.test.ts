@@ -6,8 +6,18 @@ import type { ReviewGraph } from "../../../clients/review-graph/types.js";
 // ── Minimal ReviewGraph fixture ───────────────────────────────────────────────
 
 function makeGraph(
-	nodes: Array<{ id: string; kind: string; filePath?: string; symbolName?: string }>,
-	edges: Array<{ from: string; to: string; kind: string; metadata?: Record<string, unknown> }>,
+	nodes: Array<{
+		id: string;
+		kind: string;
+		filePath?: string;
+		symbolName?: string;
+	}>,
+	edges: Array<{
+		from: string;
+		to: string;
+		kind: string;
+		metadata?: Record<string, unknown>;
+	}>,
 ): ReviewGraph {
 	const nodeMap = new Map(nodes.map((n) => [n.id, n as any]));
 	return {
@@ -25,9 +35,24 @@ describe("extractSymbolsAndRefsFromGraph", () => {
 	it("extracts symbol nodes into allSymbols map keyed by filePath", () => {
 		const graph = makeGraph(
 			[
-				{ id: "/proj/a.ts:doThing", kind: "symbol", filePath: "/proj/a.ts", symbolName: "doThing" },
-				{ id: "/proj/a.ts:helper", kind: "symbol", filePath: "/proj/a.ts", symbolName: "helper" },
-				{ id: "/proj/b.ts:process", kind: "symbol", filePath: "/proj/b.ts", symbolName: "process" },
+				{
+					id: "/proj/a.ts:doThing",
+					kind: "symbol",
+					filePath: "/proj/a.ts",
+					symbolName: "doThing",
+				},
+				{
+					id: "/proj/a.ts:helper",
+					kind: "symbol",
+					filePath: "/proj/a.ts",
+					symbolName: "helper",
+				},
+				{
+					id: "/proj/b.ts:process",
+					kind: "symbol",
+					filePath: "/proj/b.ts",
+					symbolName: "process",
+				},
 			],
 			[],
 		);
@@ -36,15 +61,24 @@ describe("extractSymbolsAndRefsFromGraph", () => {
 
 		expect(allSymbols.get("/proj/a.ts")).toHaveLength(2);
 		expect(allSymbols.get("/proj/b.ts")).toHaveLength(1);
-		expect(allSymbols.get("/proj/a.ts")?.map((s) => s.name)).toContain("doThing");
-		expect(allSymbols.get("/proj/a.ts")?.map((s) => s.name)).toContain("helper");
+		expect(allSymbols.get("/proj/a.ts")?.map((s) => s.name)).toContain(
+			"doThing",
+		);
+		expect(allSymbols.get("/proj/a.ts")?.map((s) => s.name)).toContain(
+			"helper",
+		);
 	});
 
 	it("ignores non-symbol nodes", () => {
 		const graph = makeGraph(
 			[
 				{ id: "file:/proj/a.ts", kind: "file", filePath: "/proj/a.ts" },
-				{ id: "/proj/a.ts:doThing", kind: "symbol", filePath: "/proj/a.ts", symbolName: "doThing" },
+				{
+					id: "/proj/a.ts:doThing",
+					kind: "symbol",
+					filePath: "/proj/a.ts",
+					symbolName: "doThing",
+				},
 			],
 			[],
 		);
@@ -77,7 +111,13 @@ describe("extractSymbolsAndRefsFromGraph", () => {
 	it("strips symbol-name: prefix from ref target", () => {
 		const graph = makeGraph(
 			[],
-			[{ from: "file:/proj/a.ts", to: "symbol-name:myFunc", kind: "references" }],
+			[
+				{
+					from: "file:/proj/a.ts",
+					to: "symbol-name:myFunc",
+					kind: "references",
+				},
+			],
 		);
 
 		const { allRefs } = extractSymbolsAndRefsFromGraph(graph);
@@ -90,11 +130,26 @@ describe("extractSymbolsAndRefsFromGraph", () => {
 		const targetId = "/proj/b.ts:target:method:27";
 		const graph = makeGraph(
 			[
-				{ id: callerId, kind: "symbol", filePath: "/proj/a.ts", symbolName: "caller" },
-				{ id: targetId, kind: "symbol", filePath: "/proj/b.ts", symbolName: "target" },
+				{
+					id: callerId,
+					kind: "symbol",
+					filePath: "/proj/a.ts",
+					symbolName: "caller",
+				},
+				{
+					id: targetId,
+					kind: "symbol",
+					filePath: "/proj/b.ts",
+					symbolName: "target",
+				},
 			],
 			[
-				{ from: callerId, to: targetId, kind: "calls", metadata: { line: 9, column: 7 } },
+				{
+					from: callerId,
+					to: targetId,
+					kind: "calls",
+					metadata: { line: 9, column: 7 },
+				},
 			],
 		);
 
@@ -108,7 +163,11 @@ describe("extractSymbolsAndRefsFromGraph", () => {
 			targetName: "target",
 		});
 		expect(normalized.allSymbols.get("/proj/b.ts")?.[0].id).toBe(targetId);
-		const callGraph = buildCallGraph(normalized.allSymbols, normalized.allRefs, normalized.coverage);
+		const callGraph = buildCallGraph(
+			normalized.allSymbols,
+			normalized.allRefs,
+			normalized.coverage,
+		);
 		expect(callGraph.edges[0]).toMatchObject({
 			callerKey: callerId,
 			calleeKey: targetId,
@@ -122,18 +181,40 @@ describe("extractSymbolsAndRefsFromGraph", () => {
 		const targetId = "/proj/b.ts:Type:class:27";
 		const graph = makeGraph(
 			[
-				{ id: callerId, kind: "symbol", filePath: "/proj/a.ts", symbolName: "caller" },
-				{ id: targetId, kind: "symbol", filePath: "/proj/b.ts", symbolName: "Type" },
+				{
+					id: callerId,
+					kind: "symbol",
+					filePath: "/proj/a.ts",
+					symbolName: "caller",
+				},
+				{
+					id: targetId,
+					kind: "symbol",
+					filePath: "/proj/b.ts",
+					symbolName: "Type",
+				},
 			],
 			[
-				{ from: "file:/proj/a.ts", to: targetId, kind: "references", metadata: { referenceKind: "type", line: 2 } },
+				{
+					from: "file:/proj/a.ts",
+					to: targetId,
+					kind: "references",
+					metadata: { referenceKind: "type", line: 2 },
+				},
 				{ from: callerId, to: "symbol-name:missing", kind: "calls" },
 			],
 		);
 		const normalized = extractSymbolsAndRefsFromGraph(graph);
-		const callGraph = buildCallGraph(normalized.allSymbols, normalized.allRefs, normalized.coverage);
+		const callGraph = buildCallGraph(
+			normalized.allSymbols,
+			normalized.allRefs,
+			normalized.coverage,
+		);
 		expect(callGraph.edges).toHaveLength(0);
-		expect(callGraph.coverage).toMatchObject({ typeOnlyEvidence: 1, unresolvedEvidence: 1 });
+		expect(callGraph.coverage).toMatchObject({
+			typeOnlyEvidence: 1,
+			unresolvedEvidence: 1,
+		});
 	});
 
 	it("deduplicates calls while counting duplicate evidence", () => {
@@ -141,16 +222,35 @@ describe("extractSymbolsAndRefsFromGraph", () => {
 		const targetId = "/proj/b.ts:target:function:27";
 		const graph = makeGraph(
 			[
-				{ id: callerId, kind: "symbol", filePath: "/proj/a.ts", symbolName: "caller" },
-				{ id: targetId, kind: "symbol", filePath: "/proj/b.ts", symbolName: "target" },
+				{
+					id: callerId,
+					kind: "symbol",
+					filePath: "/proj/a.ts",
+					symbolName: "caller",
+				},
+				{
+					id: targetId,
+					kind: "symbol",
+					filePath: "/proj/b.ts",
+					symbolName: "target",
+				},
 			],
 			[
 				{ from: callerId, to: targetId, kind: "calls" },
-				{ from: "file:/proj/a.ts", to: targetId, kind: "references", metadata: { referenceKind: "call" } },
+				{
+					from: "file:/proj/a.ts",
+					to: targetId,
+					kind: "references",
+					metadata: { referenceKind: "call" },
+				},
 			],
 		);
 		const normalized = extractSymbolsAndRefsFromGraph(graph);
-		const callGraph = buildCallGraph(normalized.allSymbols, normalized.allRefs, normalized.coverage);
+		const callGraph = buildCallGraph(
+			normalized.allSymbols,
+			normalized.allRefs,
+			normalized.coverage,
+		);
 		expect(callGraph.callees.get(callerId)).toEqual(new Set([targetId]));
 		expect(callGraph.edges).toHaveLength(1);
 		expect(callGraph.edges[0].evidenceKind).toBe("mixed");
@@ -162,14 +262,28 @@ describe("extractSymbolsAndRefsFromGraph", () => {
 		const targetId = "/proj/b.ts:run:function:27";
 		const graph = makeGraph(
 			[
-				{ id: callerId, kind: "symbol", filePath: "/proj/a.ts", symbolName: "caller" },
-				{ id: targetId, kind: "symbol", filePath: "/proj/b.ts", symbolName: "run" },
+				{
+					id: callerId,
+					kind: "symbol",
+					filePath: "/proj/a.ts",
+					symbolName: "caller",
+				},
+				{
+					id: targetId,
+					kind: "symbol",
+					filePath: "/proj/b.ts",
+					symbolName: "run",
+				},
 			],
 			[{ from: callerId, to: targetId, kind: "calls" }],
 		);
 		const normalized = extractSymbolsAndRefsFromGraph(graph);
 		expect(normalized.allRefs.get("/proj/a.ts")?.[0].targetName).toBe("run");
-		const callGraph = buildCallGraph(normalized.allSymbols, normalized.allRefs, normalized.coverage);
+		const callGraph = buildCallGraph(
+			normalized.allSymbols,
+			normalized.allRefs,
+			normalized.coverage,
+		);
 		expect(callGraph.edges[0].calleeSymbol).toBe("run");
 	});
 
@@ -189,7 +303,13 @@ describe("extractSymbolsAndRefsFromGraph", () => {
 	it("ignores references edges not from file: nodes", () => {
 		const graph = makeGraph(
 			[],
-			[{ from: "/proj/a.ts:caller", to: "symbol-name:callee", kind: "references" }],
+			[
+				{
+					from: "/proj/a.ts:caller",
+					to: "symbol-name:callee",
+					kind: "references",
+				},
+			],
 		);
 
 		const { allRefs } = extractSymbolsAndRefsFromGraph(graph);
@@ -198,7 +318,8 @@ describe("extractSymbolsAndRefsFromGraph", () => {
 
 	it("returns empty maps and unavailable coverage for an empty graph", () => {
 		const graph = makeGraph([], []);
-		const { allSymbols, allRefs, coverage } = extractSymbolsAndRefsFromGraph(graph);
+		const { allSymbols, allRefs, coverage } =
+			extractSymbolsAndRefsFromGraph(graph);
 		expect(allSymbols.size).toBe(0);
 		expect(allRefs.size).toBe(0);
 		expect(coverage.complete).toBe(false);
@@ -211,8 +332,16 @@ describe("extractSymbolsAndRefsFromGraph", () => {
 		);
 		const normalized = extractSymbolsAndRefsFromGraph(graph);
 		expect(normalized.allRefs.size).toBe(0);
-		expect(normalized.coverage).toMatchObject({ totalEvidence: 1, unsupportedEvidence: 1, complete: false });
-		const callGraph = buildCallGraph(normalized.allSymbols, normalized.allRefs, normalized.coverage);
+		expect(normalized.coverage).toMatchObject({
+			totalEvidence: 1,
+			unsupportedEvidence: 1,
+			complete: false,
+		});
+		const callGraph = buildCallGraph(
+			normalized.allSymbols,
+			normalized.allRefs,
+			normalized.coverage,
+		);
 		expect(callGraph.totalRefs).toBe(1);
 		expect(callGraph.coverage?.totalEvidence).toBe(callGraph.totalRefs);
 		expect(callGraph.unresolvedRefs).toBe(0);
@@ -235,7 +364,14 @@ describe("extractSymbolsAndRefsFromGraph", () => {
 
 	it("symbols have correct id format filePath:name", () => {
 		const graph = makeGraph(
-			[{ id: "/proj/a.ts:doThing", kind: "symbol", filePath: "/proj/a.ts", symbolName: "doThing" }],
+			[
+				{
+					id: "/proj/a.ts:doThing",
+					kind: "symbol",
+					filePath: "/proj/a.ts",
+					symbolName: "doThing",
+				},
+			],
 			[],
 		);
 		const { allSymbols } = extractSymbolsAndRefsFromGraph(graph);

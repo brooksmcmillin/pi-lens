@@ -39,7 +39,9 @@ const TREE_SIZE = 5000;
 let tmpDir: string;
 
 beforeAll(async () => {
-	tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-snapshot-occupancy-"));
+	tmpDir = fs.mkdtempSync(
+		path.join(os.tmpdir(), "pi-lens-snapshot-occupancy-"),
+	);
 	generateSourceTree(tmpDir, TREE_SIZE);
 	// Throwaway warm-up walk: the first walk over a freshly-generated 5k-file
 	// tree pays a cold dirent-cache tax that the measured attempt below isn't

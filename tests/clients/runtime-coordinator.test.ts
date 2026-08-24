@@ -2,26 +2,69 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import { RuntimeCoordinator } from "../../clients/runtime-coordinator.ts";
+import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 
 describe("RuntimeCoordinator", () => {
+	it("resetForSession clears recorded tool-call path attributions (#1642 F5)", () => {
+		// A per-session-numbered host (or a fresh session after a crash) must
+		// never let a new session inherit a dead session's recorded skip
+		// verdict for a reused tool-call id — every sibling correlation/state
+		// map is cleared on resetForSession, and this one must be too.
+		const runtime = new RuntimeCoordinator();
+		runtime.recordToolCallAttribution("call-reused-id", {
+			resolvedPath: path.resolve("src/dead-session-file.ts"),
+			skipped: true,
+			originCwd: path.resolve("."),
+		});
+
+		runtime.resetForSession();
+
+		expect(runtime.takeToolCallAttribution("call-reused-id")).toBeUndefined();
+	});
+
 	it("makes edit autofix deferral sticky after a write until beginTurn", () => {
 		const runtime = new RuntimeCoordinator();
 		const filePath = path.resolve("src/sticky.ts");
 
-		expect(runtime.recordMutationToolReceipt(filePath, "write").autofixMode).toBe("immediate");
-		expect(runtime.recordMutationToolReceipt(filePath, "edit").autofixMode).toBe("deferred");
-		expect(runtime.recordMutationToolReceipt(filePath, "write").autofixMode).toBe("deferred");
+		expect(
+			runtime.recordMutationToolReceipt(filePath, "write").autofixMode,
+		).toBe("immediate");
+		expect(
+			runtime.recordMutationToolReceipt(filePath, "edit").autofixMode,
+		).toBe("deferred");
+		expect(
+			runtime.recordMutationToolReceipt(filePath, "write").autofixMode,
+		).toBe("deferred");
 
 		runtime.beginTurn();
-		expect(runtime.recordMutationToolReceipt(filePath, "write").autofixMode).toBe("immediate");
+		expect(
+			runtime.recordMutationToolReceipt(filePath, "write").autofixMode,
+		).toBe("immediate");
 	});
 
 	it("coalesces autofix and format kinds on one owner-scoped path record", () => {
 		const runtime = new RuntimeCoordinator();
 		const filePath = path.resolve("src/coalesced.ts");
-		expect(runtime.deferMutation(filePath, process.cwd(), "edit", process.cwd(), "autofix", "owner")).toBe(true);
-		expect(runtime.deferMutation(filePath, process.cwd(), "edit", process.cwd(), "format", "owner")).toBe(true);
+		expect(
+			runtime.deferMutation(
+				filePath,
+				process.cwd(),
+				"edit",
+				process.cwd(),
+				"autofix",
+				"owner",
+			),
+		).toBe(true);
+		expect(
+			runtime.deferMutation(
+				filePath,
+				process.cwd(),
+				"edit",
+				process.cwd(),
+				"format",
+				"owner",
+			),
+		).toBe(true);
 
 		const [record] = runtime.consumeDeferredFormatFiles();
 		expect(record.kinds).toEqual(new Set(["autofix", "format"]));
@@ -31,10 +74,24 @@ describe("RuntimeCoordinator", () => {
 	it("merges independently requeued kinds and tool names for one path", () => {
 		const runtime = new RuntimeCoordinator();
 		const filePath = path.resolve("src/requeued.ts");
-		runtime.deferMutation(filePath, process.cwd(), "write", process.cwd(), "autofix");
+		runtime.deferMutation(
+			filePath,
+			process.cwd(),
+			"write",
+			process.cwd(),
+			"autofix",
+		);
 		const [claimed] = runtime.consumeDeferredFormatFiles();
-		runtime.requeueDeferredMutations([{ ...claimed, kinds: new Set(["autofix"]), toolNames: new Set(["write"]) }]);
-		runtime.requeueDeferredMutations([{ ...claimed, kinds: new Set(["format"]), toolNames: new Set(["edit"]) }]);
+		runtime.requeueDeferredMutations([
+			{
+				...claimed,
+				kinds: new Set(["autofix"]),
+				toolNames: new Set(["write"]),
+			},
+		]);
+		runtime.requeueDeferredMutations([
+			{ ...claimed, kinds: new Set(["format"]), toolNames: new Set(["edit"]) },
+		]);
 
 		const [requeued] = runtime.consumeDeferredFormatFiles();
 		expect(requeued.kinds).toEqual(new Set(["autofix", "format"]));
@@ -44,9 +101,23 @@ describe("RuntimeCoordinator", () => {
 	it("merges a requeued phase into a newer record queued during the drain", () => {
 		const runtime = new RuntimeCoordinator();
 		const filePath = path.resolve("src/newer.ts");
-		runtime.deferMutation(filePath, "old-cwd", "write", "old-root", "autofix", "old-owner");
+		runtime.deferMutation(
+			filePath,
+			"old-cwd",
+			"write",
+			"old-root",
+			"autofix",
+			"old-owner",
+		);
 		const [claimed] = runtime.consumeDeferredFormatFiles();
-		runtime.deferMutation(filePath, "new-cwd", "edit", "new-root", "format", "new-owner");
+		runtime.deferMutation(
+			filePath,
+			"new-cwd",
+			"edit",
+			"new-root",
+			"format",
+			"new-owner",
+		);
 		runtime.requeueDeferredMutations([claimed]);
 
 		const [record] = runtime.consumeDeferredFormatFiles();
@@ -93,7 +164,10 @@ describe("RuntimeCoordinator", () => {
 	describe("telemetry model/provider identity (#1448)", () => {
 		it("exposes the raw model id separately from the combined display string", () => {
 			const runtime = new RuntimeCoordinator();
-			runtime.setTelemetryIdentity({ model: "claude-sonnet-4-5", provider: "anthropic" });
+			runtime.setTelemetryIdentity({
+				model: "claude-sonnet-4-5",
+				provider: "anthropic",
+			});
 
 			expect(runtime.telemetryModelId).toBe("claude-sonnet-4-5");
 			expect(runtime.telemetryProviderId).toBe("anthropic");
@@ -142,7 +216,10 @@ describe("RuntimeCoordinator", () => {
 
 		it("resetForSession clears the raw model/provider identity", () => {
 			const runtime = new RuntimeCoordinator();
-			runtime.setTelemetryIdentity({ model: "claude-sonnet-4-5", provider: "anthropic" });
+			runtime.setTelemetryIdentity({
+				model: "claude-sonnet-4-5",
+				provider: "anthropic",
+			});
 
 			runtime.resetForSession();
 
@@ -207,7 +284,9 @@ describe("RuntimeCoordinator", () => {
 	describe("inline blockers reconcile against disk (#1245)", () => {
 		it("drops a blocker whose file no longer exists from the snapshot", () => {
 			const runtime = new RuntimeCoordinator();
-			const dir = mkdtempSync(path.join(tmpdir(), "pi-lens-blocker-reconcile-"));
+			const dir = mkdtempSync(
+				path.join(tmpdir(), "pi-lens-blocker-reconcile-"),
+			);
 			const file = path.join(dir, "stale.ts");
 			writeFileSync(file, "export const x = 1;\n");
 			try {
@@ -249,7 +328,157 @@ describe("RuntimeCoordinator", () => {
 			try {
 				runtime.recordInlineBlockers(file, "blocker A");
 				expect(runtime.getInlineBlockersSnapshot()).toHaveLength(1);
-				expect(runtime.getInlineBlockersSnapshot()[0].summary).toBe("blocker A");
+				expect(runtime.getInlineBlockersSnapshot()[0].summary).toBe(
+					"blocker A",
+				);
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+			}
+		});
+
+		it("keeps re-serving a blocker whose CAUSE was fixed in another file (#1561)", () => {
+			// The live incident: 3 blockers land on a test file, the signature that
+			// caused them is fixed in the provider it imports, and the provider —
+			// not the test file — is what gets re-dispatched. Neither existing
+			// invalidation path (re-dispatch of the SAME path, #1245's existence
+			// check) covers that, so the verdict is never re-taken.
+			const runtime = new RuntimeCoordinator();
+			const dir = mkdtempSync(
+				path.join(tmpdir(), "pi-lens-blocker-crossfile-"),
+			);
+			const testFile = path.join(dir, "provider.test.ts");
+			const provider = path.join(dir, "provider.ts");
+			writeFileSync(testFile, "import './provider.ts';\n");
+			writeFileSync(provider, "export const x = 1;\n");
+			try {
+				runtime.recordInlineBlockers(testFile, "🔴 STOP L320", 1, ["lsp"]);
+				// The fix: the PROVIDER re-dispatches clean. Its own entry clears…
+				runtime.clearInlineBlockers(provider);
+				// …and the test file's stale verdict is still there, by design.
+				expect(runtime.getInlineBlockersSnapshot()).toHaveLength(1);
+
+				// A fresh, confirmed-clean view of the test file must retire it.
+				expect(
+					runtime.retireInlineBlockerOnConfirmedClean(testFile, 2, ["lsp"]),
+				).toBe(true);
+				expect(runtime.getInlineBlockersSnapshot()).toHaveLength(0);
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+			}
+		});
+
+		it("#1561 F1: refuses to retire a source the verdict did not cover", () => {
+			// Inline blockers span every runner, not just the language server —
+			// `dispatcher.ts` filters `semantic === "blocking"` across all of them.
+			// An LSP-only clean must not clear an ast-grep security rule.
+			const runtime = new RuntimeCoordinator();
+			const dir = mkdtempSync(path.join(tmpdir(), "pi-lens-blocker-source-"));
+			const file = path.join(dir, "app.ts");
+			writeFileSync(file, "export const x = 1;\n");
+			try {
+				runtime.recordInlineBlockers(file, "🔴 STOP cors-wildcard", 1, [
+					"ast-grep",
+				]);
+				expect(
+					runtime.retireInlineBlockerOnConfirmedClean(file, 2, ["lsp"]),
+				).toBe(false);
+				expect(runtime.getInlineBlockersSnapshot()).toHaveLength(1);
+
+				// Partial coverage is not coverage.
+				runtime.recordInlineBlockers(file, "🔴 STOP", 1, ["lsp", "eslint"]);
+				expect(
+					runtime.retireInlineBlockerOnConfirmedClean(file, 2, [
+						"lsp",
+						"ast-grep",
+					]),
+				).toBe(false);
+
+				// Full coverage does retire.
+				expect(
+					runtime.retireInlineBlockerOnConfirmedClean(file, 2, [
+						"lsp",
+						"eslint",
+					]),
+				).toBe(true);
+				expect(runtime.getInlineBlockersSnapshot()).toHaveLength(0);
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+			}
+		});
+
+		it("#1561 F1: a record with unknown provenance fails closed", () => {
+			const runtime = new RuntimeCoordinator();
+			const dir = mkdtempSync(path.join(tmpdir(), "pi-lens-blocker-unknown-"));
+			const file = path.join(dir, "app.ts");
+			writeFileSync(file, "export const x = 1;\n");
+			try {
+				// No sources recorded — "we don't know what raised this" must not
+				// resolve to "an LSP check can clear it".
+				runtime.recordInlineBlockers(file, "🔴 STOP", 1);
+				expect(
+					runtime.retireInlineBlockerOnConfirmedClean(file, 2, ["lsp"]),
+				).toBe(false);
+				expect(runtime.getInlineBlockersSnapshot()).toHaveLength(1);
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+			}
+		});
+
+		it("does not let an older confirmed clean erase a newer blocker (#1198 inv. 1-2)", () => {
+			const runtime = new RuntimeCoordinator();
+			const dir = mkdtempSync(path.join(tmpdir(), "pi-lens-blocker-order-"));
+			const file = path.join(dir, "raced.ts");
+			writeFileSync(file, "export const x = 1;\n");
+			try {
+				// A clean check that STARTED at token 4 settles after a dispatch at
+				// token 7 found real blockers. The slow old answer must lose.
+				runtime.recordInlineBlockers(file, "🔴 STOP", 7, ["lsp"]);
+				expect(
+					runtime.retireInlineBlockerOnConfirmedClean(file, 4, ["lsp"]),
+				).toBe(false);
+				expect(runtime.getInlineBlockersSnapshot()).toHaveLength(1);
+				// Equal tokens are the same observation, not a newer one.
+				expect(
+					runtime.retireInlineBlockerOnConfirmedClean(file, 7, ["lsp"]),
+				).toBe(false);
+				expect(runtime.getInlineBlockersSnapshot()).toHaveLength(1);
+				// Strictly newer retires.
+				expect(
+					runtime.retireInlineBlockerOnConfirmedClean(file, 8, ["lsp"]),
+				).toBe(true);
+				expect(runtime.getInlineBlockersSnapshot()).toHaveLength(0);
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+			}
+		});
+
+		it("reports no retire for a path that has no blocker", () => {
+			const runtime = new RuntimeCoordinator();
+			expect(
+				runtime.retireInlineBlockerOnConfirmedClean(
+					path.resolve("never/recorded.ts"),
+					9,
+				),
+			).toBe(false);
+		});
+
+		it("releases the git guard once the blocker is retired (#1561)", () => {
+			const runtime = new RuntimeCoordinator();
+			const dir = mkdtempSync(
+				path.join(tmpdir(), "pi-lens-blocker-retire-guard-"),
+			);
+			const file = path.join(dir, "gated.ts");
+			writeFileSync(file, "export const x = 1;\n");
+			try {
+				runtime.recordInlineBlockers(file, "🔴 STOP", 1, ["lsp"]);
+				runtime.updateGitGuardStatus(false, "");
+				expect(runtime.gitGuardHasBlockers).toBe(true);
+
+				expect(
+					runtime.retireInlineBlockerOnConfirmedClean(file, 2, ["lsp"]),
+				).toBe(true);
+				runtime.updateGitGuardStatus(false, "");
+				expect(runtime.gitGuardHasBlockers).toBe(false);
 			} finally {
 				rmSync(dir, { recursive: true, force: true });
 			}

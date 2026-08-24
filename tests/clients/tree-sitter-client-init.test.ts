@@ -64,9 +64,8 @@ describe("tree-sitter-client wasm resolution", () => {
 	});
 
 	it("TreeSitterClient.isAvailable returns true when grammars are installed", async () => {
-		const { getSharedTreeSitterClient } = await import(
-			"../../clients/tree-sitter-shared.js"
-		);
+		const { getSharedTreeSitterClient } =
+			await import("../../clients/tree-sitter-shared.js");
 		const client = getSharedTreeSitterClient()!;
 		expect(client.isAvailable()).toBe(true);
 	});
@@ -86,9 +85,8 @@ describe("tree-sitter-client wasm resolution", () => {
 			}),
 		}));
 
-		const { getSharedTreeSitterClient } = await import(
-			"../../clients/tree-sitter-shared.js"
-		);
+		const { getSharedTreeSitterClient } =
+			await import("../../clients/tree-sitter-shared.js");
 		const client = getSharedTreeSitterClient()!;
 		// resolvePackagePath fallback should still find the grammars
 		expect(client.isAvailable()).toBe(true);
@@ -255,9 +253,8 @@ describe("tree-sitter-client wasm resolution", () => {
 		// Force that state, then assert isAvailable recovers against the real fs
 		// (bundled grammars/ and/or web-tree-sitter/grammars are present) rather
 		// than staying stuck on the empty cache.
-		const { getSharedTreeSitterClient } = await import(
-			"../../clients/tree-sitter-shared.js"
-		);
+		const { getSharedTreeSitterClient } =
+			await import("../../clients/tree-sitter-shared.js");
 		// biome-ignore lint/suspicious/noExplicitAny: poke privates for the regression
 		const client = getSharedTreeSitterClient() as any;
 		client.grammarsDir = "";

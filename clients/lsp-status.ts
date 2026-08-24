@@ -58,7 +58,8 @@ export function selectLspStatus(
 		if (exts.some((e) => aliveLangExts.has(e))) continue;
 		// (b) still in use this session? else the failure is stale.
 		const kinds = new Set<string>();
-		for (const e of exts) for (const k of getFileKindsForExtension(e)) kinds.add(k);
+		for (const e of exts)
+			for (const k of getFileKindsForExtension(e)) kinds.add(k);
 		if (![...kinds].some((k) => sessionKindSet.has(k))) continue;
 		failedIds.push(id);
 	}

@@ -332,6 +332,49 @@ export const SERVER_DIAGNOSTIC_STRATEGIES: Record<string, DiagnosticStrategy> =
 			// warm-up attempt and its retry, with zero diagnostics either time).
 			silentOnClean: true,
 		},
+		// cue lsp serve (#1522, #1519, #1520). Measured directly against the real
+		// v0.17.1 binary (`getWorkspaceDiagnosticsSupport` reports
+		// `mode: "push-only"`; no pull support advertised).
+		//
+		// It reports load/parse (syntax) errors as you type, but leaves
+		// conflicting-value/constraint-failure (evaluation) errors to `cue vet`
+		// — the #1522 cue-vet auxiliary runner covers that gap. So the syntax
+		// diagnostics this strategy governs are a REAL but PARTIAL signal, not
+		// full CUE validation.
+		//
+		// silentOnClean: true — the load-bearing finding. A cold `didOpen` on an
+		// already-CLEAN file publishes NOTHING inside the wait budget (measured:
+		// `touchFile` returns `inconclusive: true, inconclusiveReason:
+		// "diagnostics-wait"` after the full budget, never an affirmative empty
+		// array). This reproduces the #1520 review's original "reports
+		// conclusively clean while still waiting" concern for the clean-cold-open
+		// case specifically. It is NOT silent on every transition, though: once a
+		// document is open and a `didChange` lands, the server DOES publish —
+		// both the error (edit clean→broken: confirmed, ~930ms warm) and an
+		// explicit empty array clearing it (edit broken→clean: confirmed,
+		// ~320ms warm, `contentHash`-bound). That edit-triggered empty publish is
+		// exactly what the shared push-only clean-confirm gate needs
+		// `silentOnClean` for — it only ever governs the "no publish, notify
+		// succeeded" case, never a case that already got a real publish.
+		//
+		// seedFirstPush: true — the one cold-open case that DOES publish (a
+		// file that is already broken) sends the complete single diagnostic on
+		// its first push; there is no observed partial-then-complete sequence to
+		// wait out.
+		//
+		// aggregateWaitMs: 2000 covers the measured warm edit-to-publish latency
+		// (~930ms, syntax reparse) with margin; a cold spawn's first push (~2.1s
+		// end-to-end including process start) is bounded separately by
+		// maxClientWaitMs, not this per-diagnostics budget.
+		cue: {
+			seedFirstPush: true,
+			pullRetryBudgetMs: 0,
+			debounceMs: 150,
+			aggregateWaitMs: 2000,
+			expectSemanticSecondPush: false,
+			reopenOnResync: false,
+			silentOnClean: true,
+		},
 	};
 
 /** Native TS7 can publish multiple versionless partial-program snapshots for a

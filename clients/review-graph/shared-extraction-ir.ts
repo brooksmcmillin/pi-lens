@@ -7,7 +7,10 @@ import type {
 import { normalizeMapKey } from "../path-utils.js";
 import type { ExtractedSymbols } from "../tree-sitter-symbol-extractor.js";
 
-export type ReviewGraphExtractionStatus = "complete" | "partial" | "unavailable";
+export type ReviewGraphExtractionStatus =
+	| "complete"
+	| "partial"
+	| "unavailable";
 
 export interface ReviewGraphExtractionCoverage {
 	definitions: ReviewGraphExtractionStatus;

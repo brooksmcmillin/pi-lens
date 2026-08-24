@@ -62,7 +62,7 @@ describe("ruff runner", () => {
 				});
 
 			const runner = (
-				await import("../../../../clients/dispatch/runners/ruff.ts")
+				await import("../../../../clients/dispatch/runners/ruff.js")
 			).default;
 
 			await runner.run(createCtx(filePath, env.tmpDir) as never);

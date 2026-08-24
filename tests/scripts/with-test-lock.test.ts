@@ -22,81 +22,81 @@
 
 import { describe, expect, it } from "vitest";
 import {
-  quoteForWindowsCmd,
-  resolveVitestEntry,
+	quoteForWindowsCmd,
+	resolveVitestEntry,
 } from "../../scripts/with-test-lock.mjs";
 
 describe("resolveVitestEntry", () => {
-  it("resolves vitest's bin entry to a real file on disk", async () => {
-    const entry = resolveVitestEntry();
-    expect(typeof entry).toBe("string");
-    expect(entry).not.toBeNull();
+	it("resolves vitest's bin entry to a real file on disk", async () => {
+		const entry = resolveVitestEntry();
+		expect(typeof entry).toBe("string");
+		expect(entry).not.toBeNull();
 
-    const fs = await import("node:fs");
-    expect(fs.existsSync(entry as string)).toBe(true);
-  });
+		const fs = await import("node:fs");
+		expect(fs.existsSync(entry as string)).toBe(true);
+	});
 });
 
 describe("quoteForWindowsCmd — safe cases (what it's FOR)", () => {
-  it("leaves a plain argument with no special characters untouched", () => {
-    expect(quoteForWindowsCmd("run")).toBe("run");
-    expect(quoteForWindowsCmd("tests/foo.test.ts")).toBe("tests/foo.test.ts");
-  });
+	it("leaves a plain argument with no special characters untouched", () => {
+		expect(quoteForWindowsCmd("run")).toBe("run");
+		expect(quoteForWindowsCmd("tests/foo.test.ts")).toBe("tests/foo.test.ts");
+	});
 
-  it("quotes the empty string", () => {
-    expect(quoteForWindowsCmd("")).toBe('""');
-  });
+	it("quotes the empty string", () => {
+		expect(quoteForWindowsCmd("")).toBe('""');
+	});
 
-  it("wraps an argument containing a space in quotes (the bug this exists to fix)", () => {
-    // Without this, `shell:true` + an args array on Windows silently splits
-    // this into TWO argv entries on the far side (confirmed experimentally
-    // — see with-test-lock.mjs's header comment).
-    expect(quoteForWindowsCmd("console.log('A start', Date.now())")).toBe(
-      '"console.log(\'A start\', Date.now())"',
-    );
-  });
+	it("wraps an argument containing a space in quotes (the bug this exists to fix)", () => {
+		// Without this, `shell:true` + an args array on Windows silently splits
+		// this into TWO argv entries on the far side (confirmed experimentally
+		// — see with-test-lock.mjs's header comment).
+		expect(quoteForWindowsCmd("console.log('A start', Date.now())")).toBe(
+			"\"console.log('A start', Date.now())\"",
+		);
+	});
 
-  it("doubles a trailing backslash immediately before the closing quote", () => {
-    // CRT quoting rule: backslashes immediately preceding the closing quote
-    // must be doubled so the parser doesn't read them as escaping the
-    // closing quote itself.
-    expect(quoteForWindowsCmd("C:\\some dir\\")).toBe('"C:\\some dir\\\\"');
-  });
+	it("doubles a trailing backslash immediately before the closing quote", () => {
+		// CRT quoting rule: backslashes immediately preceding the closing quote
+		// must be doubled so the parser doesn't read them as escaping the
+		// closing quote itself.
+		expect(quoteForWindowsCmd("C:\\some dir\\")).toBe('"C:\\some dir\\\\"');
+	});
 
-  it("escapes an embedded double quote", () => {
-    expect(quoteForWindowsCmd('say "hi"')).toBe('"say \\"hi\\""');
-  });
+	it("escapes an embedded double quote", () => {
+		expect(quoteForWindowsCmd('say "hi"')).toBe('"say \\"hi\\""');
+	});
 });
 
 describe("quoteForWindowsCmd — KNOWN LIMITS (documented, not fixed here)", () => {
-  it("does NOT neutralize %VAR% expansion — cmd.exe still expands it despite quoting", () => {
-    const quoted = quoteForWindowsCmd("%TEMP%\\evil");
-    // The raw, unescaped %TEMP% survives verbatim inside the quotes — a
-    // real cmd.exe /c line built from this would still expand %TEMP% to
-    // its value before the quoted argument is even parsed as one token.
-    expect(quoted).toContain("%TEMP%");
-    expect(quoted).toBe('"%TEMP%\\evil"');
-  });
+	it("does NOT neutralize %VAR% expansion — cmd.exe still expands it despite quoting", () => {
+		const quoted = quoteForWindowsCmd("%TEMP%\\evil");
+		// The raw, unescaped %TEMP% survives verbatim inside the quotes — a
+		// real cmd.exe /c line built from this would still expand %TEMP% to
+		// its value before the quoted argument is even parsed as one token.
+		expect(quoted).toContain("%TEMP%");
+		expect(quoted).toBe('"%TEMP%\\evil"');
+	});
 
-  it("does not prevent an embedded quote from flipping cmd's quote parity", () => {
-    // A caller-controlled argument like `foo" & calc.exe & "bar` becomes,
-    // after this function's CRT-style escaping, a token whose escaped
-    // quotes cmd.exe's own /c parser does NOT treat as CRT does — when
-    // concatenated onto a real cmd.exe command line (as with-test-lock.mjs
-    // does via `spawn(fullCommandLine, { shell: true })`), the escaped
-    // quote can still end the quoted region early from cmd's point of
-    // view, and a subsequent `&` is then interpreted as a command
-    // separator, not literal text. This function only fixes CRT-style
-    // argv-boundary splitting (the space bug); it is not a defense against
-    // this. Documented per PR #1112 review; not exploitable via any real
-    // caller today, since commandArgs always comes from this process's own
-    // argv (package.json script definitions), never external input.
-    const quoted = quoteForWindowsCmd('foo" & calc.exe & "bar');
-    expect(quoted).toBe('"foo\\" & calc.exe & \\"bar"');
-    // The escaped quotes are present in the output — proving this function
-    // does not strip/reject/reject-on-detect them — which is exactly the
-    // shape the review flagged as unsafe for untrusted input.
-    expect(quoted).toContain('\\"');
-    expect(quoted).toContain("&");
-  });
+	it("does not prevent an embedded quote from flipping cmd's quote parity", () => {
+		// A caller-controlled argument like `foo" & calc.exe & "bar` becomes,
+		// after this function's CRT-style escaping, a token whose escaped
+		// quotes cmd.exe's own /c parser does NOT treat as CRT does — when
+		// concatenated onto a real cmd.exe command line (as with-test-lock.mjs
+		// does via `spawn(fullCommandLine, { shell: true })`), the escaped
+		// quote can still end the quoted region early from cmd's point of
+		// view, and a subsequent `&` is then interpreted as a command
+		// separator, not literal text. This function only fixes CRT-style
+		// argv-boundary splitting (the space bug); it is not a defense against
+		// this. Documented per PR #1112 review; not exploitable via any real
+		// caller today, since commandArgs always comes from this process's own
+		// argv (package.json script definitions), never external input.
+		const quoted = quoteForWindowsCmd('foo" & calc.exe & "bar');
+		expect(quoted).toBe('"foo\\" & calc.exe & \\"bar"');
+		// The escaped quotes are present in the output — proving this function
+		// does not strip/reject/reject-on-detect them — which is exactly the
+		// shape the review flagged as unsafe for untrusted input.
+		expect(quoted).toContain('\\"');
+		expect(quoted).toContain("&");
+	});
 });

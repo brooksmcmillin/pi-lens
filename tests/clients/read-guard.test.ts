@@ -7,6 +7,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { normalizeFilePath } from "../../clients/path-utils.js";
 import {
 	createReadGuard,
 	currentLinesMatchReadSnapshot,
@@ -14,7 +15,6 @@ import {
 	type ReadRecord,
 } from "../../clients/read-guard.js";
 import { logReadGuardEvent } from "../../clients/read-guard-logger.js";
-import { normalizeFilePath } from "../../clients/path-utils.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
 const fileTimeState = vi.hoisted(() => ({ hasChanged: false }));
@@ -239,6 +239,56 @@ describe("ReadGuard", () => {
 				fileTimeState.hasChanged = true;
 
 				const verdict = guard.checkEdit(filePath, [1, 1]);
+				expect(verdict.action).toBe("block");
+				expect(verdict.reason).toContain("File modified since read");
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("softens file_modified when oldText uniquely resolves against live bytes", () => {
+			const env = setupTestEnvironment("read-guard-oldtext-live-");
+			try {
+				const filePath = path.join(env.tmpDir, "api.ts");
+				fs.writeFileSync(filePath, "alpha\nunique target\nomega\n");
+				const guard = createReadGuard("test-session");
+				guard.recordRead(createReadRecord(filePath, { effectiveLimit: 1 }));
+				fileTimeState.hasChanged = true;
+
+				const verdict = guard.checkEdit(filePath, [2, 2], undefined, {
+					skipSnapshotCheck: true,
+					oldTextResolved: true,
+				});
+
+				expect(verdict.action).toBe("allow");
+				expect(logReadGuardEvent).toHaveBeenCalledWith(
+					expect.objectContaining({
+						event: "edit_allowed",
+						metadata: expect.objectContaining({
+							reasonKind: "file_modified_oldtext_unique",
+							oldTextResolved: true,
+						}),
+					}),
+				);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("keeps file_modified blocked when oldText does not resolve uniquely", () => {
+			const env = setupTestEnvironment("read-guard-oldtext-unresolved-");
+			try {
+				const filePath = path.join(env.tmpDir, "api.ts");
+				fs.writeFileSync(filePath, "alpha\nduplicate\nduplicate\n");
+				const guard = createReadGuard("test-session");
+				guard.recordRead(createReadRecord(filePath, { effectiveLimit: 1 }));
+				fileTimeState.hasChanged = true;
+
+				const verdict = guard.checkEdit(filePath, [2, 2], undefined, {
+					skipSnapshotCheck: false,
+					oldTextResolved: false,
+				});
+
 				expect(verdict.action).toBe("block");
 				expect(verdict.reason).toContain("File modified since read");
 			} finally {
@@ -719,6 +769,414 @@ describe("ReadGuard", () => {
 				env.cleanup();
 			}
 		});
+
+		// ── #1904 item 1: log the caller's outcome, not just the intent ───────
+
+		function lastValidationMetadata(): Record<string, unknown> | undefined {
+			const entry = vi
+				.mocked(logReadGuardEvent)
+				.mock.calls.filter(([e]) => e.event === "range_snapshot_validation")
+				.at(-1)?.[0];
+			return entry?.metadata as Record<string, unknown> | undefined;
+		}
+
+		it("reports bypassed-content-match when the caller skips the gate", () => {
+			const env = setupTestEnvironment("read-guard-snapshot-bypass-");
+			try {
+				const filePath = path.join(env.tmpDir, "api.ts");
+				fs.writeFileSync(filePath, "one\ntwo\nthree\n");
+				const guard = createReadGuard("test-session");
+				guard.recordRead(
+					createReadRecord(filePath, {
+						effectiveOffset: 1,
+						effectiveLimit: 3,
+					}),
+				);
+				fs.writeFileSync(filePath, "one\nTWO\nthree\n");
+				vi.mocked(logReadGuardEvent).mockClear();
+
+				const verdict = guard.checkEdit(filePath, [2, 2], undefined, {
+					skipSnapshotCheck: true,
+				});
+
+				expect(verdict.action).toBe("allow");
+				expect(lastValidationMetadata()).toMatchObject({
+					status: "mismatch",
+					enforced: true,
+					outcome: "bypassed-content-match",
+				});
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("reports enforced-block when the caller honors the gate", () => {
+			const env = setupTestEnvironment("read-guard-snapshot-block-");
+			try {
+				const filePath = path.join(env.tmpDir, "api.ts");
+				fs.writeFileSync(filePath, "one\ntwo\nthree\n");
+				const guard = createReadGuard("test-session");
+				guard.recordRead(
+					createReadRecord(filePath, {
+						effectiveOffset: 1,
+						effectiveLimit: 3,
+					}),
+				);
+				fs.writeFileSync(filePath, "one\nTWO\nthree\n");
+				vi.mocked(logReadGuardEvent).mockClear();
+
+				expect(guard.checkEdit(filePath, [2, 2]).action).toBe("block");
+				expect(lastValidationMetadata()).toMatchObject({
+					enforced: true,
+					outcome: "enforced-block",
+				});
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("reports enforced-pass when a hash-checked read still matches", () => {
+			const env = setupTestEnvironment("read-guard-snapshot-pass-");
+			try {
+				const filePath = path.join(env.tmpDir, "api.ts");
+				fs.writeFileSync(filePath, "one\ntwo\nthree\n");
+				const guard = createReadGuard("test-session");
+				guard.recordRead(
+					createReadRecord(filePath, {
+						effectiveOffset: 1,
+						effectiveLimit: 3,
+					}),
+				);
+				vi.mocked(logReadGuardEvent).mockClear();
+
+				expect(guard.checkEdit(filePath, [2, 2]).action).toBe("allow");
+				expect(lastValidationMetadata()).toMatchObject({
+					status: "match",
+					enforced: true,
+					outcome: "enforced-pass",
+				});
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("reports not-decidable when no candidate carries hashes", () => {
+			const env = setupTestEnvironment("read-guard-snapshot-undecidable-");
+			try {
+				const filePath = path.join(env.tmpDir, "api.ts");
+				fs.writeFileSync(filePath, "one\ntwo\nthree\n");
+				const guard = createReadGuard("test-session");
+				// An empty hash map means the read delivered no checkable snapshot.
+				guard.recordRead(
+					createReadRecord(filePath, {
+						effectiveOffset: 1,
+						effectiveLimit: 3,
+						lineHashes: {},
+					}),
+				);
+				vi.mocked(logReadGuardEvent).mockClear();
+
+				expect(guard.checkEdit(filePath, [2, 2]).action).toBe("allow");
+				expect(lastValidationMetadata()).toMatchObject({
+					status: "unavailable",
+					enforced: false,
+					outcome: "not-decidable",
+				});
+			} finally {
+				env.cleanup();
+			}
+		});
+	});
+
+	// ── #1904 item 3: the per-file read store is bounded ─────────────────────
+
+	describe("per-file read record cap", () => {
+		/**
+		 * #1907 review F1: the shape that overflows the cap is read-once-then-
+		 * grep-often. Under pure age order the whole-file read is evicted first,
+		 * and it is the only record whose hashes can rescue the edit after an
+		 * unrelated mtime touch. Search credits must be spent before it.
+		 */
+		it("spends search credits before a genuine read when trimming", () => {
+			const env = setupTestEnvironment("read-guard-cap-credit-first-");
+			try {
+				const filePath = path.join(env.tmpDir, "hot.ts");
+				fs.writeFileSync(
+					filePath,
+					Array.from({ length: 400 }, (_, i) => `line${i + 1}`).join("\n"),
+				);
+				const guard = createReadGuard("test-session");
+				// 1. One whole-file read — the oldest record on the file.
+				guard.recordRead(
+					createReadRecord(filePath, {
+						effectiveOffset: 1,
+						effectiveLimit: 400,
+						requestedOffset: 1,
+						requestedLimit: 400,
+					}),
+				);
+				// 2. 130 search credits, enough to overflow the 128 cap.
+				for (let i = 1; i <= 130; i++) {
+					guard.recordRead(
+						createReadRecord(filePath, {
+							requestedOffset: i,
+							requestedLimit: 1,
+							effectiveOffset: i,
+							effectiveLimit: 1,
+							searchCredit: {
+								marginBefore: 0,
+								marginAfter: 0,
+								reason: "match-lines-only",
+							},
+						}),
+					);
+				}
+				// 3. An unrelated touch makes the file look stale. The surviving
+				// whole-file read's hashes still match, so the edit is rescued.
+				// Under pure age order that read is gone and this edit BLOCKS.
+				fileTimeState.hasChanged = true;
+				expect(guard.checkEdit(filePath, [200, 200]).action).toBe("allow");
+
+				// The mechanism: the whole-file read is the one surviving non-credit.
+				const stored = guard.getReadHistory(filePath);
+				expect(stored.length).toBeLessThanOrEqual(128);
+				expect(stored.filter((r) => r.searchCredit === undefined)).toHaveLength(
+					1,
+				);
+			} finally {
+				fileTimeState.hasChanged = false;
+				env.cleanup();
+			}
+		});
+
+		it("bounds records per file and keeps the newest", () => {
+			const env = setupTestEnvironment("read-guard-record-cap-");
+			try {
+				const filePath = path.join(env.tmpDir, "hot.ts");
+				fs.writeFileSync(
+					filePath,
+					Array.from({ length: 400 }, (_, i) => `line${i + 1}`).join("\n"),
+				);
+				const guard = createReadGuard("test-session");
+				for (let i = 1; i <= 400; i++) {
+					guard.recordRead(
+						createReadRecord(filePath, {
+							requestedOffset: i,
+							requestedLimit: 1,
+							effectiveOffset: i,
+							effectiveLimit: 1,
+						}),
+					);
+				}
+				const stored = guard.getReadHistory(filePath);
+				expect(stored.length).toBeLessThanOrEqual(128);
+				// Oldest-first eviction: the newest read survives, the oldest is gone.
+				expect(stored.at(-1)?.effectiveOffset).toBe(400);
+				expect(stored.some((r) => r.effectiveOffset === 1)).toBe(false);
+				// #1907 review F5: growth stays observable past the cap.
+				const trimEntry = vi
+					.mocked(logReadGuardEvent)
+					.mock.calls.filter(([e]) => e.event === "read_recorded")
+					.at(-1)?.[0];
+				expect(trimEntry?.metadata).toMatchObject({
+					readCountForFile: 128,
+					rawReadCountForFile: 129,
+					evictedRecordCount: 1,
+				});
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		// ── #1913: eviction telemetry must survive at default verbosity ──────
+
+		it("emits exactly one bounded read_cap_trimmed record across many trims", () => {
+			// #1913 review F1: the array is always AT the cap before each push
+			// once it's past 128, so every push past the cap trims exactly 1
+			// record — 300 reads on one hot file trims ~172 times. A naive
+			// "log every trim" design (this test's pre-fix behavior) emits ~172
+			// identical always-on lines; the fix must emit exactly ONE.
+			const env = setupTestEnvironment("read-guard-cap-trim-event-");
+			try {
+				const filePath = path.join(env.tmpDir, "hot.ts");
+				fs.writeFileSync(
+					filePath,
+					Array.from({ length: 400 }, (_, i) => `line${i + 1}`).join("\n"),
+				);
+				const guard = createReadGuard("test-session");
+				for (let i = 1; i <= 300; i++) {
+					guard.recordRead(
+						createReadRecord(filePath, {
+							requestedOffset: i,
+							requestedLimit: 1,
+							effectiveOffset: i,
+							effectiveLimit: 1,
+						}),
+					);
+				}
+				const trimCalls = vi
+					.mocked(logReadGuardEvent)
+					.mock.calls.filter(([e]) => e.event === "read_cap_trimmed");
+				expect(trimCalls).toHaveLength(1);
+				// The ONE emitted line is the first trim's own snapshot — an
+				// unbounded design can't be reconciled with a single log line
+				// per session (each trim genuinely evicts only 1 record), so
+				// the running total across all 172 trims lives in
+				// `getTrimStats`, checked below, not in this line.
+				expect(trimCalls[0][0]).toMatchObject({
+					event: "read_cap_trimmed",
+					filePath: normalizeFilePath(filePath),
+					metadata: {
+						trimEventCount: 1,
+						evictedRecordCount: 1,
+						evictedGenuineCount: 1,
+						evictedCreditCount: 0,
+					},
+				});
+
+				// The running totals across ALL 172 trims stay observable via
+				// getTrimStats even though logging stopped after the first.
+				const stats = guard.getTrimStats(filePath);
+				expect(stats).toEqual({
+					totalEvicted: 172,
+					evictedCreditCount: 0,
+					evictedGenuineCount: 172,
+					trimEventCount: 172,
+				});
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("splits evicted credit vs. genuine reads in the trim accumulator", () => {
+			// #1913 review F3: `evictedCreditCount`/`evictedGenuineCount` must
+			// actually discriminate — a no-op'd increment would leave this
+			// green only if every trimmed record happened to be genuine (the
+			// prior test's fixture). Mix search-credit and genuine reads so a
+			// trim spends credits first, then genuine reads, and prove both
+			// counters move.
+			const env = setupTestEnvironment("read-guard-cap-trim-split-");
+			try {
+				const filePath = path.join(env.tmpDir, "hot.ts");
+				fs.writeFileSync(
+					filePath,
+					Array.from({ length: 400 }, (_, i) => `line${i + 1}`).join("\n"),
+				);
+				const guard = createReadGuard("test-session");
+				// 3 search-credit reads, then 130 genuine reads: 133 records vs.
+				// a 128 cap. Eviction spends credits first (3), then 2 genuine
+				// reads, across 5 trim events (each push past the cap trims 1).
+				for (let i = 1; i <= 3; i++) {
+					guard.recordRead(
+						createReadRecord(filePath, {
+							requestedOffset: i,
+							requestedLimit: 1,
+							effectiveOffset: i,
+							effectiveLimit: 1,
+							searchCredit: {
+								marginBefore: 0,
+								marginAfter: 0,
+								reason: "match-lines-only",
+							},
+						}),
+					);
+				}
+				for (let i = 4; i <= 133; i++) {
+					guard.recordRead(
+						createReadRecord(filePath, {
+							requestedOffset: i,
+							requestedLimit: 1,
+							effectiveOffset: i,
+							effectiveLimit: 1,
+						}),
+					);
+				}
+				const stats = guard.getTrimStats(filePath);
+				expect(stats).toEqual({
+					totalEvicted: 5,
+					evictedCreditCount: 3,
+					evictedGenuineCount: 2,
+					trimEventCount: 5,
+				});
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("emits no read_cap_trimmed record when the cap is never reached", () => {
+			const env = setupTestEnvironment("read-guard-cap-no-trim-event-");
+			try {
+				const filePath = path.join(env.tmpDir, "warm.ts");
+				fs.writeFileSync(
+					filePath,
+					Array.from({ length: 40 }, (_, i) => `line${i + 1}`).join("\n"),
+				);
+				const guard = createReadGuard("test-session");
+				for (let i = 1; i <= 5; i++) {
+					guard.recordRead(
+						createReadRecord(filePath, {
+							requestedOffset: i,
+							requestedLimit: 1,
+							effectiveOffset: i,
+							effectiveLimit: 1,
+						}),
+					);
+				}
+				const trimCalls = vi
+					.mocked(logReadGuardEvent)
+					.mock.calls.filter(([e]) => e.event === "read_cap_trimmed");
+				expect(trimCalls).toHaveLength(0);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("keeps the newest read usable for coverage after the cap trims", () => {
+			const env = setupTestEnvironment("read-guard-record-cap-cover-");
+			try {
+				const filePath = path.join(env.tmpDir, "hot.ts");
+				fs.writeFileSync(
+					filePath,
+					Array.from({ length: 400 }, (_, i) => `line${i + 1}`).join("\n"),
+				);
+				const guard = createReadGuard("test-session");
+				for (let i = 1; i <= 400; i++) {
+					guard.recordRead(
+						createReadRecord(filePath, {
+							requestedOffset: i,
+							requestedLimit: 1,
+							effectiveOffset: i,
+							effectiveLimit: 1,
+						}),
+					);
+				}
+				expect(guard.checkEdit(filePath, [400, 400]).action).toBe("allow");
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("bounds the per-file edit history too (class sweep)", () => {
+			const env = setupTestEnvironment("read-guard-edit-cap-");
+			try {
+				const filePath = path.join(env.tmpDir, "hot.ts");
+				fs.writeFileSync(
+					filePath,
+					Array.from({ length: 400 }, (_, i) => `line${i + 1}`).join("\n"),
+				);
+				const guard = createReadGuard("test-session");
+				guard.recordRead(
+					createReadRecord(filePath, {
+						effectiveOffset: 1,
+						effectiveLimit: 400,
+					}),
+				);
+				for (let i = 1; i <= 400; i++) guard.checkEdit(filePath, [i, i]);
+				expect(guard.getEditHistory(filePath).length).toBeLessThanOrEqual(256);
+			} finally {
+				env.cleanup();
+			}
+		});
 	});
 
 	describe("Phase 2: Range coverage checks", () => {
@@ -1071,7 +1529,9 @@ describe("ReadGuard Tier-2 idle decay and bounds (#1389)", () => {
 			const guard = createReadGuard("tier2-read-guard");
 			const oldPath = "/tmp/old-tier2.ts";
 			const recentPath = "/tmp/recent-tier2.ts";
-			guard.recordRead(createReadRecord(oldPath, { timestamp: Date.now() - 31 * 60_000 }));
+			guard.recordRead(
+				createReadRecord(oldPath, { timestamp: Date.now() - 31 * 60_000 }),
+			);
 			guard.recordRead(createReadRecord(recentPath));
 			vi.advanceTimersByTime(35 * 60_000 + 1);
 			expect(guard.getReadHistory(oldPath)).toHaveLength(1);
@@ -1210,9 +1670,10 @@ describe("ReadGuard export/import across resume (#1041)", () => {
 		try {
 			const guard = createReadGuard("session-x");
 			expect(guard.importState(undefined)).toEqual({ imported: 0, dropped: 0 });
-			expect(
-				guard.importState({ version: 999, reads: [] }),
-			).toEqual({ imported: 0, dropped: 0 });
+			expect(guard.importState({ version: 999, reads: [] })).toEqual({
+				imported: 0,
+				dropped: 0,
+			});
 		} finally {
 			env.cleanup();
 		}
@@ -1247,6 +1708,108 @@ describe("ReadGuard export/import across resume (#1041)", () => {
 
 			// The map is uncorrupted — nothing was recorded.
 			expect(guard.getReadHistory("/src/x.ts")).toHaveLength(0);
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+describe("ReadGuard.hasKnownPath / forgetPath (#1668)", () => {
+	it("returns false for a path pi-lens never read or wrote", () => {
+		const guard = createReadGuard("test-session");
+		expect(guard.hasKnownPath("/src/never-touched.ts")).toBe(false);
+	});
+
+	it("returns true after a recordRead", () => {
+		const guard = createReadGuard("test-session");
+		guard.recordRead(createReadRecord("/src/api.ts"));
+		expect(guard.hasKnownPath("/src/api.ts")).toBe(true);
+	});
+
+	it("returns true after a recordWritten", () => {
+		const guard = createReadGuard("test-session");
+		guard.recordWritten("/src/api.ts");
+		expect(guard.hasKnownPath("/src/api.ts")).toBe(true);
+	});
+
+	it("forgetPath drops the record so hasKnownPath goes back to false", () => {
+		const guard = createReadGuard("test-session");
+		guard.recordWritten("/src/api.ts");
+		expect(guard.hasKnownPath("/src/api.ts")).toBe(true);
+
+		guard.forgetPath("/src/api.ts");
+		expect(guard.hasKnownPath("/src/api.ts")).toBe(false);
+	});
+
+	it("forgetPath on an unknown path is a no-op, not a throw", () => {
+		const guard = createReadGuard("test-session");
+		expect(() => guard.forgetPath("/src/never-touched.ts")).not.toThrow();
+	});
+
+	/**
+	 * #1668 review F1 (BLOCKING, Windows-only — CI can't see it): a REAL file
+	 * with a mixed-case basename, actually deleted from disk, checked through
+	 * the REAL guard (no stubbed hasKnownPath, no never-existing path — both
+	 * of those hid the defect). `this.key()` (normalizeFilePath) branches on
+	 * whether the path currently exists: real casing via `realpathSync.native`
+	 * while it's on disk, a lowercased tail once it's gone. `recordWritten`/
+	 * `recordRead` key while the file is still there; `hasKnownPath`/
+	 * `forgetPath` run in production AFTER the delete already landed. Before
+	 * the fix, `MyModule.ts` and any other mixed-case basename silently
+	 * dropped its record the moment the file went away — exactly the
+	 * `mymodule.ts` (works) vs `MyModule.ts` (fails) split the review probed.
+	 */
+	it("a real mixed-case file, actually deleted, is still a known path afterward", () => {
+		const env = setupTestEnvironment("read-guard-mixed-case-delete-");
+		try {
+			const filePath = path.join(env.tmpDir, "MyModule.ts");
+			fs.writeFileSync(filePath, "export const x = 1;\n");
+
+			const guard = createReadGuard("test-session");
+			guard.recordWritten(filePath);
+			expect(guard.hasKnownPath(filePath)).toBe(true);
+
+			// The delete this whole feature exists to detect — happens for real,
+			// not simulated by skipping the write.
+			fs.rmSync(filePath);
+
+			expect(guard.hasKnownPath(filePath)).toBe(true);
+			guard.forgetPath(filePath);
+			expect(guard.hasKnownPath(filePath)).toBe(false);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("a real mixed-case file recorded via recordRead survives the same post-delete lookup", () => {
+		const env = setupTestEnvironment("read-guard-mixed-case-read-delete-");
+		try {
+			const filePath = path.join(env.tmpDir, "Button.tsx");
+			fs.writeFileSync(filePath, "export const Button = () => null;\n");
+
+			const guard = createReadGuard("test-session");
+			guard.recordRead(createReadRecord(filePath));
+			expect(guard.hasKnownPath(filePath)).toBe(true);
+
+			fs.rmSync(filePath);
+
+			expect(guard.hasKnownPath(filePath)).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("a lowercase basename (the case the pre-fix code accidentally got right) still works", () => {
+		const env = setupTestEnvironment("read-guard-lowercase-delete-");
+		try {
+			const filePath = path.join(env.tmpDir, "mymodule.ts");
+			fs.writeFileSync(filePath, "export const x = 1;\n");
+
+			const guard = createReadGuard("test-session");
+			guard.recordWritten(filePath);
+			fs.rmSync(filePath);
+
+			expect(guard.hasKnownPath(filePath)).toBe(true);
 		} finally {
 			env.cleanup();
 		}

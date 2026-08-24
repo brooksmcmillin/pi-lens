@@ -76,11 +76,13 @@ describe("runWorkspaceDiagnostics — opengrep excluded from the bulk sweep (#58
 
 		const clients = new Map<string, ReturnType<typeof mkClient>>();
 		const spawnedServerIds: string[] = [];
-		createLSPClient.mockImplementation(async ({ serverId }: { serverId: string }) => {
-			spawnedServerIds.push(serverId);
-			if (!clients.has(serverId)) clients.set(serverId, mkClient(serverId));
-			return clients.get(serverId);
-		});
+		createLSPClient.mockImplementation(
+			async ({ serverId }: { serverId: string }) => {
+				spawnedServerIds.push(serverId);
+				if (!clients.has(serverId)) clients.set(serverId, mkClient(serverId));
+				return clients.get(serverId);
+			},
+		);
 
 		const { LSPService } = await import("../../../clients/lsp/index.js");
 		const results = await new LSPService().runWorkspaceDiagnostics(tmp);

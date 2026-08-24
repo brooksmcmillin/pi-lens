@@ -53,7 +53,10 @@ function eventLine(theme: Theme, event: TurnSummaryEvent): string {
 	return `    ${theme.fg("accent", `[format:${event.tool}]`)}`;
 }
 
-function buildExpandedLines(details: TurnSummaryDetails, theme: Theme): string[] {
+function buildExpandedLines(
+	details: TurnSummaryDetails,
+	theme: Theme,
+): string[] {
 	const lines: string[] = [];
 	lines.push(theme.fg("accent", theme.bold("pi-lens turn summary")));
 	const sortedFiles = [...details.files].sort((a, b) =>

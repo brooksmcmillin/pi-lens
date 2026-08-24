@@ -3,13 +3,13 @@
 export const LSP_PROCESS_MARKERS: string[];
 
 export interface ProcessRow {
-  pid: number;
-  command: string;
+	pid: number;
+	command: string;
 }
 
 export function isLspServerCommand(command: string): boolean;
 
 export function diffSurvivingLspProcesses(
-  before: ProcessRow[],
-  after: ProcessRow[],
+	before: ProcessRow[],
+	after: ProcessRow[],
 ): ProcessRow[];

@@ -70,9 +70,8 @@ type EnsureGrammarClient = {
  * the test controls, instead of the repo's populated grammars dir.
  */
 async function makeClient(dir: string): Promise<EnsureGrammarClient> {
-	const { TreeSitterClient } = await import(
-		"../../clients/tree-sitter-client.js"
-	);
+	const { TreeSitterClient } =
+		await import("../../clients/tree-sitter-client.js");
 	const client = new TreeSitterClient() as unknown as EnsureGrammarClient;
 	client.grammarsDir = dir;
 	vi.spyOn(client, "grammarSourceDirs").mockReturnValue([dir]);

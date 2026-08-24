@@ -33,9 +33,11 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ProjectSequenceIndex } from "../../clients/project-changes.js";
+import { getDegradationSummary } from "../../clients/degradation-ledger.js";
 import {
 	getProjectSnapshotLegacyPath,
 	PROJECT_SNAPSHOT_VERSION,
+	saveProjectSnapshot,
 } from "../../clients/project-snapshot.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { _resetSubagentModeForTests } from "../../clients/subagent-mode.js";
@@ -94,11 +96,26 @@ function makeDeps(
 			ensureAvailable: async () => false,
 			scanExports: async () => new Map(),
 		},
-		biomeClient: { isAvailable: () => false, ensureAvailable: async () => false },
-		ruffClient: { isAvailable: () => false, ensureAvailable: async () => false },
-		knipClient: { isAvailable: () => false, ensureAvailable: async () => false },
-		jscpdClient: { isAvailable: () => false, ensureAvailable: async () => false },
-		depChecker: { isAvailable: () => false, ensureAvailable: async () => false },
+		biomeClient: {
+			isAvailable: () => false,
+			ensureAvailable: async () => false,
+		},
+		ruffClient: {
+			isAvailable: () => false,
+			ensureAvailable: async () => false,
+		},
+		knipClient: {
+			isAvailable: () => false,
+			ensureAvailable: async () => false,
+		},
+		jscpdClient: {
+			isAvailable: () => false,
+			ensureAvailable: async () => false,
+		},
+		depChecker: {
+			isAvailable: () => false,
+			ensureAvailable: async () => false,
+		},
 		testRunnerClient: {
 			detectRunner: () => null,
 			runTestFile: () => ({ failed: 0, error: false }),
@@ -282,6 +299,97 @@ describe("#1162 — bounded session_start sequence read", () => {
 					phase: "session_start_sequence_read_deferred_reseed",
 				}),
 			);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("retroactively hydrates cachedExports/projectRulesScan once the deferred sequence read confirms the snapshot was fresh (#1785)", async () => {
+		const env = setupTestEnvironment("pi-lens-seq-budget-retro-hydrate-");
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			const cwd = makeProject(env);
+			const exportedFile = path.join(cwd, "index.ts");
+			// A snapshot saved with NO changes since (seq 0, matching an empty
+			// change log) — the real answer once the stalled read resolves will
+			// confirm it was fresh all along.
+			saveProjectSnapshot(cwd, {
+				version: PROJECT_SNAPSHOT_VERSION,
+				projectRoot: cwd,
+				generatedAt: new Date().toISOString(),
+				seq: 0,
+				files: {},
+				symbols: {},
+				reverseDeps: {},
+				cachedExports: [["x", exportedFile]],
+				projectRulesScan: { hasCustomRules: true, rules: [] },
+			});
+
+			const slow = deferred<ProjectSequenceIndex>();
+			readLatestProjectSequenceAsyncSpy.mockImplementation(() => slow.promise);
+
+			const runtime = new RuntimeCoordinator();
+			await handleSessionStart(makeDeps(cwd, runtime));
+
+			// Synchronous return: the read hasn't settled yet, so the freshness
+			// gate correctly refuses to trust the snapshot (#1785's reported
+			// symptom — cachedExports.get(...) is undefined right after
+			// handleSessionStart, even though the snapshot really was current).
+			expect(runtime.cachedExports.get("x")).toBeUndefined();
+			expect(
+				getDegradationSummary().find(
+					(group) => group.kind === "snapshot-sequence-read-timeout",
+				)?.count,
+			).toBeGreaterThanOrEqual(1);
+
+			// The stalled read resolves and confirms: no changes since the
+			// snapshot (projectSeq 0, matching its own seq). This is a
+			// deterministic completion signal, not a sleep — the fix hydrates
+			// once THIS promise settles, whenever that turns out to be.
+			slow.resolve({ projectSeq: 0, fileSeqByPath: new Map() });
+			await vi.waitFor(() => {
+				expect(runtime.cachedExports.get("x")).toBe(exportedFile);
+			});
+			expect(runtime.projectRulesScan.hasCustomRules).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("does NOT retroactively hydrate when the deferred read reveals the snapshot is actually stale (#1785 guard is not vacuous)", async () => {
+		const env = setupTestEnvironment("pi-lens-seq-budget-retro-stale-");
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			const cwd = makeProject(env);
+			const exportedFile = path.join(cwd, "index.ts");
+			// Saved at seq 0, but the real log (revealed once the stalled read
+			// resolves) has since moved to seq 5 — a genuinely stale snapshot.
+			saveProjectSnapshot(cwd, {
+				version: PROJECT_SNAPSHOT_VERSION,
+				projectRoot: cwd,
+				generatedAt: new Date().toISOString(),
+				seq: 0,
+				files: {},
+				symbols: {},
+				reverseDeps: {},
+				cachedExports: [["x", exportedFile]],
+				projectRulesScan: { hasCustomRules: true, rules: [] },
+			});
+
+			const slow = deferred<ProjectSequenceIndex>();
+			readLatestProjectSequenceAsyncSpy.mockImplementation(() => slow.promise);
+
+			const runtime = new RuntimeCoordinator();
+			await handleSessionStart(makeDeps(cwd, runtime));
+			expect(runtime.cachedExports.get("x")).toBeUndefined();
+
+			slow.resolve({ projectSeq: 5, fileSeqByPath: new Map() });
+			// Give the deferred continuation a generous window to run (or, per
+			// the guard, to observe the mismatch and correctly skip hydration).
+			await new Promise((resolve) => setTimeout(resolve, 150));
+
+			expect(runtime.cachedExports.get("x")).toBeUndefined();
+			expect(runtime.projectRulesScan.hasCustomRules).toBe(false);
 		} finally {
 			env.cleanup();
 		}

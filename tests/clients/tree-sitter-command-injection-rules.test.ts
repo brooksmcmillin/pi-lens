@@ -36,10 +36,7 @@ describe("tree-sitter command injection rules", () => {
 	it("matches python command injection sink", async () => {
 		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("python-command-injection");
-		const filePath = writeTempFile(
-			"py",
-			`import os\nos.system(user_input)\n`,
-		);
+		const filePath = writeTempFile("py", `import os\nos.system(user_input)\n`);
 
 		const matches = await client.runQueryOnFile(query, filePath, "python");
 		expect(matches.length).toBeGreaterThan(0);
@@ -106,7 +103,10 @@ describe("tree-sitter command injection rules", () => {
 	it("does not match non-child-process exec-like calls", async () => {
 		const client = getSharedTreeSitterClient()!;
 		const query = await getQuery("ts-command-injection");
-		const filePath = writeTempFile("ts", `const tool = { exec: () => {} }; tool.exec();\n`);
+		const filePath = writeTempFile(
+			"ts",
+			`const tool = { exec: () => {} }; tool.exec();\n`,
+		);
 
 		const matches = await client.runQueryOnFile(query, filePath, "typescript");
 		expect(matches.length).toBe(0);

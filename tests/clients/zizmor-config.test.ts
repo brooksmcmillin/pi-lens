@@ -22,9 +22,9 @@ describe("isZizmorAuditTarget (#636)", () => {
 		expect(isZizmorAuditTarget(".github/workflows/ci.yml")).toBe(true);
 		expect(isZizmorAuditTarget(".github/workflows/release.yaml")).toBe(true);
 		expect(isZizmorAuditTarget("repo\\.github\\workflows\\ci.yml")).toBe(true);
-		expect(
-			isZizmorAuditTarget("/abs/path/repo/.github/workflows/ci.yml"),
-		).toBe(true);
+		expect(isZizmorAuditTarget("/abs/path/repo/.github/workflows/ci.yml")).toBe(
+			true,
+		);
 	});
 
 	it("matches action.yml/action.yaml anywhere in the repo (composite actions)", () => {

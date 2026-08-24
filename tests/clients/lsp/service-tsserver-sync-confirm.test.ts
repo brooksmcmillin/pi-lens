@@ -223,15 +223,17 @@ describe("#707 per-edit tsserver sync clean-confirm in touchFile", () => {
 
 		expect(result).toBeDefined();
 		expect(result!.diags.length).toBe(1);
-		expect(result!.diags[0]?.message).toContain("not assignable to type 'string'");
+		expect(result!.diags[0]?.message).toContain(
+			"not assignable to type 'string'",
+		);
 		expect(result?.inconclusive).toBeFalsy();
 		// #1179 shape-5: on the REAL producer result, `binding` is an enumerable OWN
 		// wrapper field (a sync-confirmed touch composes {boundToCurrentDisk}), so it
 		// survives a copy of the result — it would be dropped if it were still the
 		// pre-#1179 non-enumerable array side-channel with a spread intervening (#1096).
-		expect(
-			Object.prototype.propertyIsEnumerable.call(result, "binding"),
-		).toBe(true);
+		expect(Object.prototype.propertyIsEnumerable.call(result, "binding")).toBe(
+			true,
+		);
 		expect({ ...result! }.binding?.boundToCurrentDisk).toBeDefined();
 	});
 
@@ -273,7 +275,10 @@ describe("#707 per-edit tsserver sync clean-confirm in touchFile", () => {
 		const diag = {
 			severity: 1 as const,
 			message: "error from push",
-			range: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } },
+			range: {
+				start: { line: 0, character: 0 },
+				end: { line: 0, character: 5 },
+			},
 		};
 		const client = makeClient({
 			executeCommand,

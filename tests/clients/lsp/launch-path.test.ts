@@ -4,11 +4,7 @@ import { combinePathValuesForPlatform } from "../../../clients/lsp/launch.js";
 describe("combinePathValuesForPlatform", () => {
 	it("merges path-like values case-sensitively on unix platforms", () => {
 		const merged = combinePathValuesForPlatform(
-			[
-				"/usr/bin:/opt/bin",
-				"/USR/BIN:/custom/bin",
-				"/opt/bin:/sbin",
-			],
+			["/usr/bin:/opt/bin", "/USR/BIN:/custom/bin", "/opt/bin:/sbin"],
 			"linux",
 		);
 
@@ -17,11 +13,7 @@ describe("combinePathValuesForPlatform", () => {
 
 	it("deduplicates path-like values case-insensitively on Windows", () => {
 		const merged = combinePathValuesForPlatform(
-			[
-				"C:\\Tools;C:\\Node",
-				"c:\\tools;D:\\Bin",
-				"C:\\NODE",
-			],
+			["C:\\Tools;C:\\Node", "c:\\tools;D:\\Bin", "C:\\NODE"],
 			"win32",
 		);
 
@@ -29,7 +21,10 @@ describe("combinePathValuesForPlatform", () => {
 	});
 
 	it("ignores empty entries", () => {
-		const merged = combinePathValuesForPlatform([" ; C:\\Tools ;; ", "", undefined], "win32");
+		const merged = combinePathValuesForPlatform(
+			[" ; C:\\Tools ;; ", "", undefined],
+			"win32",
+		);
 		expect(merged).toBe("C:\\Tools");
 	});
 });

@@ -1,10 +1,18 @@
 import { stat } from "node:fs/promises";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
+import {
+	demotePastEofDiagnostics,
+	type LineCountCache,
+} from "./diagnostic-line-freshness.js";
 import { visibleWidth } from "./deps/pi-tui.js";
 import { normalizeEphemeralMapKey, normalizeMapKey } from "./path-utils.js";
 import { fitLine } from "./tui-fit.js";
 import { WriteOrderingGuard } from "./write-ordering-guard.js";
+import { collectForwardImportMtimes } from "./blocker-freshness.js";
+import { freshnessFromMtime } from "./freshness.js";
+import { PAST_EOF_STALE_MARKER } from "./diagnostic-line-freshness.js";
+import { STALE_LINE_MARKER } from "./stale-marker.js";
 
 /**
  * Canonical key for the `files` map (and `diagnosticsWriteGuard`) — #1020.
@@ -67,6 +75,27 @@ export interface WidgetDiagnostic {
 	 * inherits the record's `touchedAt` — a safe, over-conservative default.
 	 */
 	observedAt?: number;
+	/**
+	 * Set when a freshness gate demoted this diagnostic. Two gates write it:
+	 * #1641's past-EOF gate (the cited `line` exceeds the file's CURRENT
+	 * on-disk line count) and #1631's dependency-drift gate
+	 * (`reconcileStaleWidgetDependencyBlockers`: a forward import changed on
+	 * disk after this diagnostic was observed). Demoted entries stay in the
+	 * set — the underlying issue may still be real — but are excluded from
+	 * blocking/error/warning tallies (`isBlocking`, `countDiagnostics`) and
+	 * rendered with a stale marker in place of a trusted coordinate (#1419
+	 * demote-not-drop).
+	 *
+	 * The past-EOF gate RE-DERIVES this on every read (`applyPastEofGate`),
+	 * never a one-way latch: a transient shrink that later restores clears it
+	 * back to `false` once the line is back in bounds (#1641 review round F3
+	 * — derive, don't latch). The dependency-drift gate likewise re-derives
+	 * from current import mtimes each sweep.
+	 */
+	stale?: boolean;
+	/** Which freshness gate demoted this entry: "past-eof" (#1641) or
+	 * "dependency-drift" (#1631). Each gate heals only its own demotions. */
+	staleReason?: string;
 }
 
 /**
@@ -74,8 +103,16 @@ export interface WidgetDiagnostic {
  * (`semantic === "blocking"`). Falls back to severity for sources that
  * don't set `semantic` (raw tsc/eslint diagnostics) so the red dot still
  * fires on traditional compile errors.
+ *
+ * #1561: exported so the blocker-retire decision in `tools/lsp-diagnostics.ts`
+ * asks THIS predicate rather than growing a second severity rule that can drift
+ * from what the footer counts.
  */
-function isBlocking(d: WidgetDiagnostic): boolean {
+export function isBlocking(d: WidgetDiagnostic): boolean {
+	// #1631: a dependency-drift-demoted finding is no longer a hard stop. The gate
+	// sets `stale` rather than dropping the entry (#1419 demote-not-drop), so every
+	// tally and render that asks "is this blocking?" must answer no once demoted.
+	if (d.stale) return false;
 	if (d.semantic === "blocking") return true;
 	if (d.semantic == null && d.severity === "error") return true;
 	return false;
@@ -149,8 +186,7 @@ function pruneInactiveFileRecords(now = Date.now()): void {
 	const victims = [...files.entries()]
 		.filter(
 			([, rec]) =>
-				now - rec.touchedAt > ACTIVE_FILE_IDLE_MS &&
-				!hasLiveDiagnostic(rec),
+				now - rec.touchedAt > ACTIVE_FILE_IDLE_MS && !hasLiveDiagnostic(rec),
 		)
 		.sort(([, a], [, b]) => a.touchedAt - b.touchedAt);
 	for (const [key] of victims) {
@@ -188,7 +224,17 @@ export function clearWidgetState(): void {
 // migrates a v1 record by inheriting each entry's `observedAt` from the record's
 // `touchedAt`. A v1 file must never be rejected (that would silently drop resume
 // diagnostics) nor crash.
-export const WIDGET_STATE_VERSION = 2;
+//
+// v2 → v3 (#1631 review F3): a dependency-drift `stale` demotion is a verdict
+// about THIS session's disk state — the next session starts with a fresh (and
+// possibly different) dependency graph, so a demotion from the last session
+// must not outlive it. `exportWidgetState` had been serializing `stale: true`
+// verbatim; on restore, a genuine type error stayed non-blocking across a
+// resume with the dependency pinned back into the past. Same shape as the
+// #1348 failed-formatter precedent one field over: `importWidgetState` strips
+// `stale` on every restored entry so a resumed session re-evaluates from
+// scratch instead of inheriting a possibly-stale-itself verdict.
+export const WIDGET_STATE_VERSION = 3;
 
 /** Serializable snapshot of the per-file diagnostic state (#190). */
 export interface PersistedWidgetState {
@@ -240,17 +286,27 @@ export function exportWidgetState(): PersistedWidgetState {
  * with the record's `touchedAt` (the single stamp the whole record shared under
  * v1). Non-mutating; entries that already carry a stamp (a v2 record) pass
  * through untouched.
+ *
+ * #1631 review F3 (v2→v3): also strips `stale` from every entry. A dependency
+ * drift demotion is scoped to the session that observed the drift; restoring it
+ * verbatim would let a real blocking finding resume as permanently non-blocking
+ * (#1348 precedent — see `WIDGET_STATE_VERSION`'s doc comment).
  */
 function migrateEntryStamps(
 	entries: WidgetDiagnostic[] | undefined,
 	recordTouchedAt: number,
 ): WidgetDiagnostic[] {
-	return (entries ?? []).map((d) =>
-		d.observedAt == null ? { ...d, observedAt: recordTouchedAt } : d,
-	);
+	return (entries ?? []).map((d) => {
+		const { stale: _stale, ...rest } = d;
+		return rest.observedAt == null
+			? { ...rest, observedAt: recordTouchedAt }
+			: rest;
+	});
 }
 
-export function importWidgetState(state: PersistedWidgetState | undefined): boolean {
+export function importWidgetState(
+	state: PersistedWidgetState | undefined,
+): boolean {
 	// Accept any known-or-older version and migrate (#1186): reject a missing
 	// snapshot, a missing/non-numeric `version` (NaN/undefined/null — the
 	// pre-#1186 guard `version !== WIDGET_STATE_VERSION` rejected these, and
@@ -285,6 +341,22 @@ export function importWidgetState(state: PersistedWidgetState | undefined): bool
 		// gate has a concrete observation time and never treats `undefined` as
 		// epoch-0 (which would drop every migrated entry on the first sweep).
 		const recordTouchedAt = f.touchedAt ?? Date.now();
+		// #1631 review V1: `diagnosticCounts` is DERIVED from `allDiagnostics`
+		// everywhere else in this module (see the `countDiagnostics(rec.allDiagnostics)`
+		// call sites) — it must be recomputed here too, from the just-migrated
+		// (stale-stripped) entries, not restored verbatim from the snapshot. The
+		// persisted counts were computed while a finding was still demoted
+		// (`blocking: 0`); once F3 strips `stale` so `isBlocking` reports true
+		// again, a verbatim count would still say `blocking: 0` for a record
+		// whose entries ARE blocking — inverting the one-predicate invariant
+		// `isBlocking` exists to hold. Every consumer (`getFileDiagnosticSummaries`,
+		// the record-tier classifier, the footer) trusts `diagnosticCounts`, not a
+		// live re-scan of the entries, so a derived count out of sync with its own
+		// entries is silently wrong everywhere at once.
+		const migratedAllDiagnostics = migrateEntryStamps(
+			f.allDiagnostics,
+			recordTouchedAt,
+		);
 		files.set(fileMapKey(f.filePath), {
 			filePath: f.filePath,
 			runners: new Map(f.runners ?? []),
@@ -294,15 +366,13 @@ export function importWidgetState(state: PersistedWidgetState | undefined): bool
 			// current session never observed (and same-mtime fixes would never
 			// clear it). Successes rehydrate as before.
 			formatters: new Map(
-				(f.formatters ?? []).filter(([, outcome]) => outcome?.success !== false),
+				(f.formatters ?? []).filter(
+					([, outcome]) => outcome?.success !== false,
+				),
 			),
 			diagnostics: migrateEntryStamps(f.diagnostics, recordTouchedAt),
-			allDiagnostics: migrateEntryStamps(f.allDiagnostics, recordTouchedAt),
-			diagnosticCounts: f.diagnosticCounts ?? {
-				blocking: 0,
-				errors: 0,
-				warnings: 0,
-			},
+			allDiagnostics: migratedAllDiagnostics,
+			diagnosticCounts: countDiagnostics(migratedAllDiagnostics),
 			hasFinalDiagnosticsSnapshot: f.hasFinalDiagnosticsSnapshot ?? false,
 			touchedAt: recordTouchedAt,
 		});
@@ -386,6 +456,18 @@ function toSingleLineMessage(message: string | undefined): string {
 	return (message ?? "").replace(/\s+/g, " ").trim();
 }
 
+/** Build the OSC-8 target used by every stored diagnostic row. */
+export function widgetDiagnosticUri(
+	filePath: string,
+	line?: number,
+	column?: number,
+): string {
+	const base = pathToFileURL(filePath).href;
+	return line != null
+		? `${base}#L${line}${column != null ? `:${column}` : ""}`
+		: base;
+}
+
 export function recordDiagnostics(
 	filePath: string,
 	diagnostics: Array<{
@@ -455,13 +537,8 @@ function normalizeDiagnostics(
 	}>,
 	observedTs: number,
 ): WidgetDiagnostic[] {
-	const base = pathToFileURL(filePath).href;
 	return diagnostics.map((d) => {
 		const rule = d.rule ?? d.id;
-		const uri =
-			d.line != null
-				? `${base}#L${d.line}${d.column != null ? `:${d.column}` : ""}`
-				: base;
 		return {
 			severity: d.severity ?? "info",
 			semantic: d.semantic,
@@ -470,7 +547,7 @@ function normalizeDiagnostics(
 			col: d.column,
 			rule,
 			tool: d.tool,
-			uri,
+			uri: widgetDiagnosticUri(filePath, d.line, d.column),
 			observedAt: observedTs,
 		} satisfies WidgetDiagnostic;
 	});
@@ -513,10 +590,75 @@ function countDiagnostics(diags: WidgetDiagnostic[]): {
 	let warnings = 0;
 	for (const diagnostic of diags) {
 		if (isBlocking(diagnostic)) blocking++;
+		// A past-EOF stale entry keeps its severity for display purposes but is
+		// excluded from the error/warning tallies alongside blocking — its cited
+		// coordinate is no longer trustworthy, same reasoning as `isBlocking`.
+		// A dependency-drift demotion (#1631 criterion 3) is different: the
+		// finding itself is still real evidence, only its BLOCKING authority is
+		// revoked until re-confirmed, so it stays in the error/warning tally.
+		if (
+			diagnostic.stale &&
+			(diagnostic.staleReason ?? "past-eof") === "past-eof"
+		)
+			continue;
 		if (diagnostic.severity === "error") errors++;
-		else if (diagnostic.severity === "warning") warnings++;
+		// #1777: `hint` and `info` tally alongside `warning`. The dispatch path
+		// now preserves all four ast-grep tiers; before, the runner collapsed
+		// them to "warning" here. An exact `=== "warning"` test would drop those
+		// findings out of the footer entirely, so a file with real findings would
+		// render clean. The footer stays a blocking/error/warning summary on
+		// purpose — the tier distinction is rendered by the code-quality-warnings
+		// advisory, not by these counters.
+		else if (
+			diagnostic.severity === "warning" ||
+			diagnostic.severity === "hint" ||
+			diagnostic.severity === "info"
+		)
+			warnings++;
 	}
 	return { blocking, errors, warnings };
+}
+
+/**
+ * Apply the #1641 past-EOF gate to `rec` in place: demote (never drop) any
+ * stored diagnostic whose cited line exceeds the file's CURRENT on-disk line
+ * count, then recompute the capped/full diagnostic lists and the counts so
+ * every reader (the TUI render loop, `getFileDiagnosticSummaries`,
+ * `getFileDiagnostics`) sees one consistent, already-gated record instead of
+ * each re-deriving its own verdict. Cheap on the common case: one memoized
+ * stat per record (see `getCachedLineCount`), a full recount only when the
+ * file's mtime moved since the last check.
+ *
+ * No `resync` callback here deliberately: this gate runs on the TUI's render
+ * path and the bus-publish/mark-tool read accessors, all of which fire far
+ * more often than an agent's own edit/tool cadence. Triggering a document
+ * resync from every one of those reads would storm the LSP with didOpen calls
+ * for a file whose drift hasn't yet been fixed. `tools/lens-diagnostics.ts`'s
+ * `formatAllMode` — an explicit, agent-invoked tool call — is the resync
+ * trigger point (#1641 criterion 2); this gate still demotes/logs on its own.
+ *
+ * The gate RE-DERIVES every entry's `stale` flag on every call — it is never
+ * a one-way latch. A transient shrink that later restores (truncate-then-
+ * write, a formatter pass, a checkout) un-demotes on its own next read, so
+ * this always persists the freshly-derived array back into the record, not
+ * only when `demotedCount` (which counts RISING edges only, for telemetry)
+ * is nonzero.
+ */
+function applyPastEofGate(
+	rec: FileRecord,
+	lineCountCache?: LineCountCache,
+): void {
+	if (rec.allDiagnostics.length === 0) return;
+	const { diagnostics } = demotePastEofDiagnostics({
+		store: "widget-state",
+		cwd: process.cwd(),
+		filePath: rec.filePath,
+		diagnostics: rec.allDiagnostics,
+		lineCountCache,
+	});
+	rec.allDiagnostics = diagnostics;
+	rec.diagnostics = capStoredDiagnostics(diagnostics);
+	rec.diagnosticCounts = countDiagnostics(diagnostics);
 }
 
 /** The newest per-entry `observedAt` in `diags`, or `fallback` when empty (or no
@@ -527,7 +669,10 @@ function freshestObservation(
 ): number {
 	let newest: number | undefined;
 	for (const d of diags) {
-		if (d.observedAt != null && (newest === undefined || d.observedAt > newest)) {
+		if (
+			d.observedAt != null &&
+			(newest === undefined || d.observedAt > newest)
+		) {
 			newest = d.observedAt;
 		}
 	}
@@ -544,7 +689,9 @@ function freshestObservation(
  * errors-only LSP re-check is entitled to replace.
  */
 function isLspErrorEntry(d: WidgetDiagnostic): boolean {
-	return d.tool === "lsp" && (d.semantic === "blocking" || d.severity === "error");
+	return (
+		d.tool === "lsp" && (d.semantic === "blocking" || d.severity === "error")
+	);
 }
 
 /**
@@ -595,7 +742,11 @@ export function reconcileCascadeNeighborLspErrors(
 	// keeping the newer preserved one, instead of dropping the whole record.
 	const observedTs = observedAt ?? Date.now();
 	const rec = getOrCreate(filePath);
-	const incoming = normalizeDiagnostics(filePath, lspErrorDiagnostics, observedTs);
+	const incoming = normalizeDiagnostics(
+		filePath,
+		lspErrorDiagnostics,
+		observedTs,
+	);
 	const preserved = rec.allDiagnostics.filter((d) => !isLspErrorEntry(d));
 	commitDiagnostics(rec, filePath, [...incoming, ...preserved], observedTs);
 }
@@ -656,6 +807,40 @@ export function reconcileScanDiagnostics(
 }
 
 /**
+ * Commit the already-correlated result of a full diagnostics scan.
+ *
+ * Unlike {@link reconcileScanDiagnostics}, this seam accepts widget diagnostics
+ * that have already been merged across producing lanes. `lens_diagnostics`
+ * uses it after correlating the confirmed LSP sweep, the cheap project scan,
+ * and retained widget rows. This prevents a broken LSP lane from hiding
+ * independently-produced `ast-grep-napi` findings in the widget count (#1888).
+ * Existing per-entry observation times survive the merge; newly-added project
+ * rows inherit the scan's observation time.
+ */
+export function reconcileCorrelatedScanDiagnostics(
+	filePath: string,
+	diagnostics: WidgetDiagnostic[],
+	writeIndex?: number,
+	observedAt?: number,
+): void {
+	const key = fileMapKey(filePath);
+	if (!diagnosticsWriteGuard.shouldWrite(key, writeIndex)) return;
+	runnerWriteGuard.shouldWrite(key, writeIndex);
+	const observedTs = observedAt ?? Date.now();
+	const correlated = diagnostics.map((diagnostic) => ({
+		...diagnostic,
+		observedAt: diagnostic.observedAt ?? observedTs,
+	}));
+	commitDiagnostics(
+		getOrCreate(filePath, key),
+		filePath,
+		correlated,
+		observedTs,
+		key,
+	);
+}
+
+/**
  * Drop widget entries whose file changed on disk after pi-lens last recorded
  * them (`mtimeMs > touchedAt` → the recorded diagnostics predate the current
  * content → stale) or that no longer exist. Keeps `lens_diagnostics` from
@@ -680,8 +865,19 @@ export async function reconcileStaleWidgetFiles(): Promise<number> {
 			// A clean record (no findings) has no per-entry stamps to consult —
 			// gate it on the record's own `touchedAt` exactly as before, so a ✓
 			// entry for a file that changed on disk still drops.
+			//
+			// #1631 review F11 follow-up: a THIRD site hitting the same Windows
+			// mtime-vs-`Date.now()` skew F2 named for `blocker-freshness.ts` and
+			// `reconcileStaleWidgetDependencyBlockers` — a file's mtime can lead
+			// `Date.now()` by up to ~11.4ms measured (#1491/#1498 precedent), so a
+			// record touched immediately after its own write dropped here at +1ms
+			// with zero real drift. Found investigating F11: `lens-diagnostics-
+			// mode-all-freshness.test.ts`'s "control" case (and its sibling) failed
+			// under this gate, not from cross-test state. Same tolerance, same
+			// constant, for the same reason.
 			if (rec.allDiagnostics.length === 0) {
-				return mtimeMs > rec.touchedAt + 1
+				return freshnessFromMtime({ mtimeMs, referenceMs: rec.touchedAt })
+					.verdict === "stale"
 					? { mapKey, action: "drop" as const }
 					: { mapKey, action: "keep" as const };
 			}
@@ -690,11 +886,15 @@ export async function reconcileStaleWidgetFiles(): Promise<number> {
 			// preserved entry beside an entry replayed from an aging snapshot, so a
 			// per-RECORD gate over-cleared the whole record (the residual documented
 			// at dispatch/integration.ts). A missing per-entry stamp (a migrated
-			// pre-#1186 record) inherits the record's `touchedAt`. +1ms tolerance:
-			// a freshly-recorded file has observedAt >= mtime.
-			const survivors = rec.allDiagnostics.filter(
-				(d) => !(mtimeMs > (d.observedAt ?? rec.touchedAt) + 1),
-			);
+			// pre-#1186 record) inherits the record's `touchedAt`. Tolerance matches
+			// the Windows host-clock skew rationale above.
+			const survivors = rec.allDiagnostics.filter((d) => {
+				const v = freshnessFromMtime({
+					mtimeMs,
+					referenceMs: d.observedAt ?? rec.touchedAt,
+				});
+				return v.verdict !== "stale";
+			});
 			if (survivors.length === rec.allDiagnostics.length) {
 				return { mapKey, action: "keep" as const }; // nothing stale
 			}
@@ -725,6 +925,191 @@ export async function reconcileStaleWidgetFiles(): Promise<number> {
 	}
 	if (dropped > 0) requestRenderFn?.();
 	return dropped;
+}
+
+/**
+ * Dependency-axis freshness gate for the session diagnostics store that feeds
+ * `lens_diagnostics mode=all` (and the footer widget) — the second #1631 surface.
+ *
+ * `reconcileStaleWidgetFiles` (above) already drops a record whose OWN file changed
+ * on disk after the diagnostic was observed. It cannot see the cross-file case: the
+ * diagnosed file is untouched, but a dependency it imports was fixed out-of-band, so
+ * the recorded blocker is stale yet replays on every `mode=all`. This reconcile
+ * resolves each blocking record's forward imports and, when one drifted after a
+ * blocking diagnostic was observed, demotes that diagnostic (`stale = true`) rather
+ * than dropping it (#1419). Own-file staleness stays `reconcileStaleWidgetFiles`'
+ * job; the two reconciles are paired at the `mode=all` read site.
+ *
+ * Scope (#1631 review F4): only demotes findings with `tool === "lsp"`. An
+ * ast-grep secret, a govulncheck CVE, or any other non-language-server finding is
+ * not invalidated by an import graph changing — its truth doesn't depend on what
+ * the file imports — so it stays fully blocking through a dependency edit.
+ *
+ * Resolution boundary (#1631 review F8): shares `collectForwardImportMtimes` with
+ * the inline-blocker sweep, so it shares that module's static-import-only
+ * boundary too — see `blocker-freshness.ts`'s module doc for the dynamic
+ * `import()`/`require()` gap.
+ *
+ * Returns per-call counts: `demoted` blocking diagnostics and `truncatedImports`
+ * records whose import list exceeded the drift-check cap (#1631 review F7 — see
+ * `blocker-freshness.ts`'s `MAX_DRIFT_CHECK_IMPORTS`). Never throws on a
+ * per-record failure: an unresolvable import list simply leaves the record
+ * untouched.
+ */
+export interface WidgetDependencyBlockerReconcileResult {
+	demoted: number;
+	truncatedImports: number;
+}
+
+export async function reconcileStaleWidgetDependencyBlockers(
+	cwd: string,
+	turnIndex?: number,
+): Promise<WidgetDependencyBlockerReconcileResult> {
+	let demoted = 0;
+	let truncatedImports = 0;
+	for (const [, rec] of files.entries()) {
+		// #1631 review F4: narrow demotion to LSP-sourced findings. The import-closure
+		// drift check only knows how to reason about IMPORT graphs — an ast-grep
+		// hardcoded-secret or a govulncheck CVE finding doesn't stop being true because
+		// a file this diagnostic's file imports changed; only a language-server verdict
+		// (`tool === "lsp"`, the same predicate `isLspErrorEntry` above uses) is actually
+		// invalidated by that shape of drift. Documented trade: a non-LSP blocking
+		// finding on a file with drifted imports stays fully authoritative until its own
+		// content changes or it is explicitly re-run.
+		if (!rec.allDiagnostics.some((d) => isBlocking(d) && d.tool === "lsp"))
+			continue;
+		let importMtimes: Array<{ path: string; mtimeMs: number }> = [];
+		try {
+			const result = await collectForwardImportMtimes(
+				cwd,
+				rec.filePath,
+				undefined,
+				turnIndex,
+			);
+			importMtimes = result.mtimes;
+			if (result.truncated) truncatedImports += 1;
+		} catch {
+			importMtimes = [];
+		}
+		if (importMtimes.length === 0) continue;
+		let changed = false;
+		for (const d of rec.allDiagnostics) {
+			if (!isBlocking(d) || d.tool !== "lsp") continue;
+			const baseline = d.observedAt ?? rec.touchedAt;
+			// +50ms tolerance (#1631 review F2): a whole-millisecond `Date.now()`
+			// baseline vs. sub-millisecond mtime precision only needs +1ms, but on
+			// Windows a file's mtime can LEAD `Date.now()` by up to ~11.4ms (measured
+			// across 200 writes; #1491/#1498 precedent for the same host-clock skew).
+			// +1ms produced 42 false demotions in 50 runs on Windows; +50ms clears the
+			// measured skew while staying far below the gap between real edits.
+			if (
+				importMtimes.some(
+					(im) =>
+						freshnessFromMtime({
+							mtimeMs: im.mtimeMs,
+							referenceMs: baseline,
+						}).verdict === "stale",
+				)
+			) {
+				d.stale = true;
+				d.staleReason = "dependency-drift";
+				changed = true;
+				demoted += 1;
+			}
+		}
+		if (changed) {
+			rec.diagnosticCounts = countDiagnostics(rec.allDiagnostics);
+			rec.diagnostics = capStoredDiagnostics(rec.allDiagnostics);
+		}
+	}
+	if (demoted > 0) requestRenderFn?.();
+	return { demoted, truncatedImports };
+}
+
+/**
+ * #1790: sweep-population feed for `sweepInlineBlockerFreshness` (the turn-end
+ * gate in `clients/blocker-freshness.ts`). That sweep's population was built
+ * solely from `RuntimeCoordinator`'s inline-blocker map — a live-dispatch-only
+ * store. A workspace-diagnostics CACHE HIT never touches that map; it calls
+ * `reconcileScanDiagnostics` straight into `files` here (the cache-serve branch
+ * in `tools/lsp-diagnostics.ts`), so a cache-served blocking row could render in
+ * the widget while the turn-end sweep's `total` count never saw it (the live
+ * 2026-08-20 dogfood: `total:1 kept:1` against five stale cache-served blocking
+ * rows on screen).
+ *
+ * One entry per file with at least one CURRENTLY blocking (non-stale),
+ * LSP-sourced diagnostic — the same provenance narrowing
+ * `reconcileStaleWidgetDependencyBlockers` already applies, so every row this
+ * feeds into the sweep is one its `isLspSourced` gate would keep anyway.
+ * `recordedAtMs` is the EARLIEST `observedAt` among them: the conservative
+ * baseline, since using the latest could hide drift that predates an earlier
+ * diagnostic's own observation.
+ */
+export function getWidgetBlockingFilesForSweep(): Array<{
+	filePath: string;
+	recordedAtMs: number;
+}> {
+	const out: Array<{ filePath: string; recordedAtMs: number }> = [];
+	for (const rec of files.values()) {
+		let earliest: number | undefined;
+		for (const d of rec.allDiagnostics) {
+			if (!isBlocking(d) || d.tool !== "lsp") continue;
+			const observedAt = d.observedAt ?? rec.touchedAt;
+			if (earliest === undefined || observedAt < earliest)
+				earliest = observedAt;
+		}
+		if (earliest !== undefined)
+			out.push({ filePath: rec.filePath, recordedAtMs: earliest });
+	}
+	return out;
+}
+
+/**
+ * #1790: demote every currently-blocking, LSP-sourced diagnostic for `filePath`
+ * to stale (#1419 demote-not-drop). Called by the turn-end sweep once its own
+ * drift check (`detectDrift`/`collectForwardImportMtimes`, shared with the
+ * inline-blocker branch) independently confirms drift for a file that reached
+ * the sweep's population through `getWidgetBlockingFilesForSweep` rather than an
+ * inline blocker. Same store and same write `reconcileStaleWidgetDependencyBlockers`
+ * already performs per-diagnostic — this is the single-file entry point the
+ * sweep drives once ITS check (not a second implementation of the check) says
+ * to. Returns true iff something changed.
+ *
+ * #1790 review F4 (latent): unlike `reconcileStaleWidgetDependencyBlockers`, which
+ * checks drift per-diagnostic against EACH diagnostic's own `observedAt`, this
+ * demotes every currently-blocking LSP diagnostic for the file against the ONE
+ * file-level baseline `getWidgetBlockingFilesForSweep` computed (the earliest
+ * `observedAt` among them) — because the sweep's `detectDrift` contract is
+ * file-level, not per-diagnostic. That is safe ONLY as long as every LSP
+ * diagnostic on a `FileRecord` shares (or is more conservative than) that
+ * earliest stamp, which holds today because every writer that populates
+ * `allDiagnostics` (`recordDiagnostics`, `reconcileCascadeNeighborLspErrors`)
+ * replaces the file's LSP errors wholesale with one `observedAt` per write. If a
+ * future writer ever merges LSP diagnostics with genuinely MIXED per-entry
+ * stamps on one record, this function would over-demote entries observed after
+ * the earliest one drifted — re-derive per-diagnostic (mirroring
+ * `reconcileStaleWidgetDependencyBlockers`) rather than assume the single
+ * baseline still holds.
+ */
+export function markWidgetFileBlockersStale(
+	filePath: string,
+	reason: "dependency-drift",
+): boolean {
+	const rec = files.get(fileMapKey(filePath));
+	if (!rec) return false;
+	let changed = false;
+	for (const d of rec.allDiagnostics) {
+		if (!isBlocking(d) || d.tool !== "lsp") continue;
+		d.stale = true;
+		d.staleReason = reason;
+		changed = true;
+	}
+	if (changed) {
+		rec.diagnosticCounts = countDiagnostics(rec.allDiagnostics);
+		rec.diagnostics = capStoredDiagnostics(rec.allDiagnostics);
+		requestRenderFn?.();
+	}
+	return changed;
 }
 
 /**
@@ -772,14 +1157,17 @@ export interface FileDiagnosticSummary {
  * everything, not just the 12 the TUI keeps for rendering.
  */
 export function getFileDiagnosticSummaries(): FileDiagnosticSummary[] {
-	return [...files.values()].map((rec) => ({
-		filePath: rec.filePath,
-		blocking: rec.diagnosticCounts.blocking,
-		errors: rec.diagnosticCounts.errors,
-		warnings: rec.diagnosticCounts.warnings,
-		hasFinalSnapshot: rec.hasFinalDiagnosticsSnapshot,
-		diagnostics: rec.allDiagnostics.map((d) => ({ ...d })),
-	}));
+	return [...files.values()].map((rec) => {
+		applyPastEofGate(rec);
+		return {
+			filePath: rec.filePath,
+			blocking: rec.diagnosticCounts.blocking,
+			errors: rec.diagnosticCounts.errors,
+			warnings: rec.diagnosticCounts.warnings,
+			hasFinalSnapshot: rec.hasFinalDiagnosticsSnapshot,
+			diagnostics: rec.allDiagnostics.map((d) => ({ ...d })),
+		};
+	});
 }
 
 /**
@@ -800,9 +1188,12 @@ export function getFileDiagnosticSummaries(): FileDiagnosticSummary[] {
  * stay identical to the write-side fold, or a file recorded under one form
  * would silently read as `undefined` under another (e.g. via bus-publish).
  */
-export function getFileDiagnostics(filePath: string): WidgetDiagnostic[] | undefined {
+export function getFileDiagnostics(
+	filePath: string,
+): WidgetDiagnostic[] | undefined {
 	const rec = files.get(fileMapKey(filePath));
 	if (!rec) return undefined;
+	applyPastEofGate(rec);
 	return rec.allDiagnostics.map((d) => ({ ...d }));
 }
 
@@ -916,26 +1307,58 @@ export function renderWidget(
 		}
 	}
 
-	// Diagnostics — blocking only, from the most recently touched file that has them.
-	// Vertical mode keeps the divider/filename context; horizontal already shows the
-	// filename on the packed row above, so we drop the extra header noise there.
+	// Diagnostics — blocking (or dependency-drift-demoted) only, from the most
+	// recently touched file that has them. Vertical mode keeps the divider/filename
+	// context; horizontal already shows the filename on the packed row above, so
+	// we drop the extra header noise there.
+	//
+	// #1631 review F10: `isBlocking` answers false for a demoted (`stale`) finding
+	// by design (#1419 demote-not-drop) — but this render loop used that same
+	// predicate to pick which findings to SHOW, so a demoted finding vanished from
+	// the footer entirely instead of demoting visibly. `isBlockingOrDemoted` keeps
+	// it in the list; the per-entry render below distinguishes the two with a
+	// dimmed marker instead of the red dot.
+	const isBlockingOrDemoted = (d: WidgetDiagnostic) =>
+		isBlocking(d) || d.stale === true;
 	const withBlocking = recencySorted.filter((r) =>
-		r.diagnostics.some(isBlocking),
+		r.diagnostics.some(isBlockingOrDemoted),
 	);
 	if (withBlocking.length > 0) {
 		const rec = withBlocking[0];
+		// #1641: gate only the ONE record whose line numbers are about to be
+		// rendered, not the whole (potentially session-long) `deduped` list the
+		// header counts read — one memoized stat per redraw, never a per-file
+		// scan of every file pi-lens has touched this session. A past-EOF
+		// citation demoted here can leave the header's aggregate blocking count
+		// one turn stale; `reconcileStaleWidgetFiles`'s existing debounced sweep
+		// (scheduleStaleReconcile) already re-derives that aggregate on its own
+		// cadence, so this is a bounded, self-correcting gap, not a silent one.
+		applyPastEofGate(rec);
 		if (!useHorizontal) {
 			lines.push(fitLine(dim("─".repeat(Math.min(w, 60))), w));
 			lines.push(fitLine(` ${dim(path.basename(rec.filePath))}`, w));
 		}
-		const blockers = rec.diagnostics.filter(isBlocking).slice(0, 5);
+		const blockers = rec.diagnostics.filter(isBlockingOrDemoted).slice(0, 5);
 		for (const d of blockers) {
-			const loc = d.line != null ? osc8(d.uri ?? "", `L${d.line}`) : "";
+			// A past-EOF demotion's coordinate is untrustworthy — render the
+			// marker instead of the line (#1641); drift demotions keep theirs.
+			const pastEof = d.stale && (d.staleReason ?? "past-eof") === "past-eof";
+			// No link for a past-EOF demotion: the anchor would carry the same
+			// untrustworthy line the marker exists to replace.
+			const loc = pastEof
+				? PAST_EOF_STALE_MARKER
+				: d.line != null
+					? osc8(d.uri ?? "", `L${d.line}`)
+					: "";
 			const rule = d.rule ? dim(` ${d.rule}`) : "";
-			const prefix = `   ${red("●")} ${loc}${rule}  `;
-			const msgWidth = Math.max(1, w - visibleWidth(prefix));
+			const staleTag = d.stale ? dim(` ${STALE_LINE_MARKER}`) : "";
+			const prefix = `   ${d.stale ? dim("○") : red("●")} ${loc}${rule}  `;
+			const msgWidth = Math.max(
+				1,
+				w - visibleWidth(prefix) - visibleWidth(staleTag),
+			);
 			const msg = fitLine(d.message, msgWidth, "…");
-			lines.push(fitLine(`${prefix}${msg}`, w));
+			lines.push(fitLine(`${prefix}${msg}${staleTag}`, w));
 		}
 	}
 
@@ -1021,7 +1444,9 @@ function formatFileRowVertical(
 		(failedFormatters.length > 0
 			? red(` fmt-failed:${failedFormatters.join(",")}`)
 			: "") +
-		(changedFormatters.length > 0 ? dim(` fmt:${changedFormatters.join(",")}`) : "");
+		(changedFormatters.length > 0
+			? dim(` fmt:${changedFormatters.join(",")}`)
+			: "");
 	return ` ${dot} ${base}  ${dim(runnerNames)}${formatMark}${counts}`;
 }
 
@@ -1174,7 +1599,11 @@ function hasFailedFormatter(rec: FileRecord): boolean {
 }
 
 function shouldRenderFile(rec: FileRecord): boolean {
-	return rec.hasFinalDiagnosticsSnapshot || hasChangedFormatter(rec) || hasFailedFormatter(rec);
+	return (
+		rec.hasFinalDiagnosticsSnapshot ||
+		hasChangedFormatter(rec) ||
+		hasFailedFormatter(rec)
+	);
 }
 
 function hasLiveDiagnostic(rec: FileRecord): boolean {

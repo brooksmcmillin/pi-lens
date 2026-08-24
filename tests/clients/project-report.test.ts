@@ -72,9 +72,9 @@ describe("projectReport — cold path (#773)", () => {
 			const report = await projectReport(env.tmpDir);
 			expect(report.available).toBe(true);
 			expect(report.lastBuildAttempt).toMatchObject({ outcome: "succeeded" });
-		expect(report.lastBuildAttempt?.reason).toContain(
-			"persisted partial review graph",
-		);
+			expect(report.lastBuildAttempt?.reason).toContain(
+				"persisted partial review graph",
+			);
 		} finally {
 			if (previousCap === undefined) {
 				delete process.env.PI_LENS_GRAPH_PERSIST_MAX_ELEMENTS;
@@ -141,11 +141,7 @@ describe("projectReport — warm path section shapes", () => {
 		);
 		// Give main.ts real fan-out so it qualifies as an entry point (near-zero
 		// fan-in, high fan-out) rather than dead weight.
-		createTempFile(
-			cwd,
-			"entry/consumer-alias.ts",
-			"export const alias = 1;\n",
-		);
+		createTempFile(cwd, "entry/consumer-alias.ts", "export const alias = 1;\n");
 		createTempFile(cwd, "isolated/dead.ts", "export const dead = 1;\n");
 		await warmGraph(cwd);
 	}
@@ -170,7 +166,10 @@ describe("projectReport — warm path section shapes", () => {
 		const hub = report.hubs!.find((h) => h.file.endsWith("hub.ts"));
 		expect(hub).toBeDefined();
 		expect(hub!.fanIn).toBe(3);
-		expect(hub!.suggestedNext).toEqual({ tool: "module_report", path: hub!.file });
+		expect(hub!.suggestedNext).toEqual({
+			tool: "module_report",
+			path: hub!.file,
+		});
 		expect(typeof hub!.blastRadius).toBe("number");
 
 		// 3. Entry points — main.ts has zero fan-in, one fan-out.
@@ -207,7 +206,11 @@ describe("projectReport — warm path section shapes", () => {
 		const env = makeEnv();
 		// Every file here either imports or is imported — no dead weight.
 		createTempFile(env.tmpDir, "a.ts", "export const a = 1;\n");
-		createTempFile(env.tmpDir, "b.ts", "import { a } from './a';\nexport const b = a;\n");
+		createTempFile(
+			env.tmpDir,
+			"b.ts",
+			"import { a } from './a';\nexport const b = a;\n",
+		);
 		await warmGraph(env.tmpDir);
 
 		const report = await projectReport(env.tmpDir);
@@ -387,7 +390,9 @@ describe("projectReport — focus re-ranking", () => {
 		// Without a focus hint, widgets.ts (5 importers) outranks payments.ts (2).
 		expect(unfocused.hubs![0].file).toContain("widgets");
 
-		const focused = await projectReport(env.tmpDir, { focus: "payments charge" });
+		const focused = await projectReport(env.tmpDir, {
+			focus: "payments charge",
+		});
 		expect(focused.hubs![0].file).toContain("payments");
 	});
 });
@@ -418,9 +423,9 @@ describe("toDisplayPath delegates to the shape-aware toProjectRelativePath (#119
 	});
 
 	it("relativizes a forward-slash win32-shaped path under a win32-shaped root", () => {
-		expect(
-			_toDisplayPathForTests("C:/repo/src/nested/y.ts", "C:/repo"),
-		).toBe("src/nested/y.ts");
+		expect(_toDisplayPathForTests("C:/repo/src/nested/y.ts", "C:/repo")).toBe(
+			"src/nested/y.ts",
+		);
 	});
 
 	it("relativizes a UNC-shaped path under a UNC-shaped root", () => {
@@ -443,9 +448,9 @@ describe("toDisplayPath delegates to the shape-aware toProjectRelativePath (#119
 			_toDisplayPathForTests("/home/dev/project/src/x.ts", "/home/dev/project"),
 		).toBe("src/x.ts");
 		// Non-absolute input passes through slash-normalized, unchanged.
-		expect(_toDisplayPathForTests("src\\already\\relative.ts", "/anything")).toBe(
-			"src/already/relative.ts",
-		);
+		expect(
+			_toDisplayPathForTests("src\\already\\relative.ts", "/anything"),
+		).toBe("src/already/relative.ts");
 	});
 
 	// Direct fail-then-pass proof, OS-independent (AGENTS.md #1024 discipline:

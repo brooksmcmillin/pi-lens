@@ -34,7 +34,9 @@ vi.mock("../../clients/bootstrap.js", () => ({
 	}),
 }));
 
-function baseDeps(overrides: Partial<Parameters<typeof handleToolCall>[0]> = {}) {
+function baseDeps(
+	overrides: Partial<Parameters<typeof handleToolCall>[0]> = {},
+) {
 	const runtime = new RuntimeCoordinator();
 	return {
 		event: { toolName: "read", input: {} },

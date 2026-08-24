@@ -46,7 +46,25 @@
 
 import * as path from "node:path";
 import pidusage from "pidusage";
-import { spawnCollectStdout } from "./child-unref.js";
+import { spawnCollectStdoutResult } from "./child-unref.js";
+import { recordDegradationOnce } from "./degradation-ledger.js";
+import { terminateScannerChild } from "./instance-reaper.js";
+
+export const RESOURCE_SAMPLE_QUERY_TIMEOUT_MS = 2_000;
+
+function recordQueryFailure(
+	subject: string,
+	status: string,
+	exitCode?: number | null,
+): void {
+	const exitReason =
+		status === "exit-error" ? ` (exit code ${exitCode ?? "unknown"})` : "";
+	recordDegradationOnce({
+		kind: "resource-sampler-query-failed",
+		subject,
+		reason: `process-table query ${status}${exitReason}`,
+	});
+}
 
 // Read the platform live (not a module-load const) so both the Windows and the
 // POSIX sampling paths are exercisable in unit tests regardless of the host OS.
@@ -108,13 +126,16 @@ export function walkDescendantPids(
  * tick lets the sampler aggregate the pids that are actually doing the work.
  * Mirrors the identity-verification CIM queries in clients/instance-reaper.ts.
  */
-async function findDescendantPidsWindows(rootPid: number): Promise<number[]> {
-	if (!runningOnWindows() || !Number.isFinite(rootPid) || rootPid <= 0) return [];
+async function findDescendantPidsWindows(
+	rootPid: number,
+): Promise<number[] | null> {
+	if (!runningOnWindows() || !Number.isFinite(rootPid) || rootPid <= 0)
+		return [];
 	// One WQL query pulls every process's (pid, parentPid) pair; walk the BFS
 	// in JS rather than issuing N queries for N tree levels.
 	const psScript =
 		"Get-CimInstance Win32_Process " +
-		'| Select-Object -Property ProcessId,ParentProcessId ' +
+		"| Select-Object -Property ProcessId,ParentProcessId " +
 		'| ForEach-Object { "$($_.ProcessId),$($_.ParentProcessId)" }';
 	const powershell = path.join(
 		process.env.SystemRoot ?? String.raw`C:\Windows`,
@@ -128,16 +149,27 @@ async function findDescendantPidsWindows(rootPid: number): Promise<number[]> {
 	// reaper's identical spawn→collect plumbing (#1153/#1160). Sampling still
 	// works normally in an interactive/long-lived session: unref only means
 	// "don't hold the loop open FOR this alone," the collected stdout is still
-	// delivered whenever `close` fires. Resolves to `""` on any spawn/`error`
-	// failure, which the parse below turns into an empty pairs list (same
-	// result the old inline `resolve([])` error path produced).
-	const out = await spawnCollectStdout(
+	// delivered whenever `close` fires. The result status keeps a failed query
+	// distinct from a successful empty process table.
+	const result = await spawnCollectStdoutResult(
 		powershell,
 		["-NoProfile", "-NonInteractive", "-Command", psScript],
 		{ shell: false, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] },
+		{
+			timeoutMs: RESOURCE_SAMPLE_QUERY_TIMEOUT_MS,
+			onTimeout: (child) => terminateScannerChild(child, {}),
+		},
 	);
+	if (result.status !== "ok") {
+		recordQueryFailure(
+			"windows-descendant-process-table",
+			result.status,
+			result.exitCode,
+		);
+		return null;
+	}
 	const pairs: Array<[number, number]> = [];
-	for (const line of out.split(/\r?\n/)) {
+	for (const line of result.stdout.split(/\r?\n/)) {
 		const [pidStr, ppidStr] = line.split(",");
 		const pid = Number(pidStr);
 		const ppid = Number(ppidStr);
@@ -178,7 +210,7 @@ export function __resetWindowsCpuHistoryForTests(): void {
  * Windows-only CPU%/RSS sampling via a FULLY GUARDED `Get-CimInstance
  * Win32_Process` query (mirrors `findDescendantPidsWindows`): a synchronous
  * throw from `spawn` (the `spawn UNKNOWN` crash vector, #620), a `child`
- * `error` event, or a non-zero/garbage exit all resolve to a partial/empty
+ * `error` event, or a non-zero/garbage exit all resolve to an errored/absent
  * map — this function can NEVER throw or reject. Deliberately does NOT call
  * `pidusage`, whose unguarded internal `gwmi` spawn is the crash we're fixing.
  *
@@ -190,9 +222,9 @@ export function __resetWindowsCpuHistoryForTests(): void {
  */
 async function sampleProcessesWindows(
 	valid: number[],
-): Promise<Map<number, ProcessUsage>> {
-	const result = new Map<number, ProcessUsage>();
-	if (valid.length === 0) return result;
+): Promise<Map<number, ProcessUsage> | null> {
+	const samples = new Map<number, ProcessUsage>();
+	if (valid.length === 0) return samples;
 
 	// pids are pre-validated finite positive integers, so this WQL filter is
 	// injection-safe. One line per pid: "pid,workingSet,kernel100ns,user100ns".
@@ -214,19 +246,26 @@ async function sampleProcessesWindows(
 	// reaper's identical spawn→collect plumbing (#1153/#1160). It also absorbs
 	// both failure modes this function used to guard inline — a synchronous
 	// `spawn` throw (the `spawn UNKNOWN` crash vector, #620) and an async
-	// `error` event — resolving to `""` either way, which the parse below
-	// turns into the same empty/partial `result` map the old inline handlers
-	// produced. Sampling still works normally in an interactive/long-lived
+	// `error` event, or a non-zero exit — the result status keeps failure distinct
+	// map. Sampling still works normally in an interactive/long-lived
 	// session: unref only means "don't hold the loop open FOR this alone."
-	const out = await spawnCollectStdout(
+	const query = await spawnCollectStdoutResult(
 		powershell,
 		["-NoProfile", "-NonInteractive", "-Command", psScript],
 		{ shell: false, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] },
+		{
+			timeoutMs: RESOURCE_SAMPLE_QUERY_TIMEOUT_MS,
+			onTimeout: (child) => terminateScannerChild(child, {}),
+		},
 	);
+	if (query.status !== "ok") {
+		recordQueryFailure("windows-process-table", query.status, query.exitCode);
+		return null;
+	}
 	try {
 		const now = Date.now();
 		const seen = new Set<number>();
-		for (const line of out.split(/\r?\n/)) {
+		for (const line of query.stdout.split(/\r?\n/)) {
 			const parts = line.split(",");
 			if (parts.length < 4) continue;
 			const pid = Number(parts[0]);
@@ -248,7 +287,7 @@ async function sampleProcessesWindows(
 			}
 			windowsCpuHistory.set(pid, { cpuMs, ts: now });
 			seen.add(pid);
-			result.set(pid, { rssBytes: workingSet, cpuPercent });
+			samples.set(pid, { rssBytes: workingSet, cpuPercent });
 		}
 		// Prune stale history so pids that have gone away don't accumulate.
 		for (const [pid, entry] of windowsCpuHistory) {
@@ -259,7 +298,7 @@ async function sampleProcessesWindows(
 	} catch {
 		// Parsing must never throw into the caller; best-effort.
 	}
-	return result;
+	return samples;
 }
 
 /**
@@ -274,7 +313,7 @@ async function sampleProcessesWindows(
  */
 export async function sampleProcesses(
 	pids: number[],
-): Promise<Map<number, ProcessUsage>> {
+): Promise<Map<number, ProcessUsage> | null> {
 	const result = new Map<number, ProcessUsage>();
 	const valid = [...new Set(pids.filter((p) => Number.isFinite(p) && p > 0))];
 	if (valid.length === 0) return result;
@@ -295,8 +334,10 @@ export async function sampleProcesses(
 			});
 		}
 	} catch {
+		recordQueryFailure("posix-pidusage-process-table", "spawn-error");
 		// Best-effort: sampling failure loses this tick's data for every pid in
 		// the batch, but must never throw into the heartbeat/spawn path.
+		return null;
 	}
 	return result;
 }
@@ -387,10 +428,15 @@ export function startSpawnUsageSampler(
 	const tick = async () => {
 		if (stopped) return;
 		try {
+			const descendants = runningOnWindows()
+				? await findDescendantPidsWindows(targetPid)
+				: [];
+			if (descendants === null) return;
 			const pids = runningOnWindows()
-				? [targetPid, ...(await findDescendantPidsWindows(targetPid))]
+				? [targetPid, ...descendants]
 				: [targetPid];
 			const usageByPid = await sampleProcesses(pids);
+			if (usageByPid === null) return;
 			if (stopped || usageByPid.size === 0) return;
 			let rssBytes = 0;
 			let cpuPercent = 0;

@@ -50,9 +50,17 @@ import {
 	classifyCleanBehavior,
 	DRIFT_SUMMARY_PATH,
 } from "./lib/clean-signal.mjs";
-import { mergeRows, mergeSrc, parseTable, replaceTable } from "./lib/md-matrix.mjs";
+import {
+	mergeRows,
+	mergeSrc,
+	parseTable,
+	replaceTable,
+} from "./lib/md-matrix.mjs";
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const repoRoot = path.resolve(
+	path.dirname(fileURLToPath(import.meta.url)),
+	"..",
+);
 const argv = process.argv.slice(2);
 const install = argv.includes("--install");
 const langs = argv.filter((a) => !a.startsWith("--"));
@@ -66,9 +74,13 @@ const imp = (rel) => import(pathToFileURL(path.join(repoRoot, rel)).href);
 process.env.PILENS_PUB_DEBUG = "1";
 
 const { LSP_FIXTURES } = await imp("scripts/smoke-tools.mjs");
-const { getLSPService, resetLSPService } = await imp("dist/clients/lsp/index.js");
+const { getLSPService, resetLSPService } = await imp(
+	"dist/clients/lsp/index.js",
+);
 const { initLSPConfig } = await imp("dist/clients/lsp/config.js");
-const { SERVER_DIAGNOSTIC_STRATEGIES } = await imp("dist/clients/lsp/wait-policy/strategies.js");
+const { SERVER_DIAGNOSTIC_STRATEGIES } = await imp(
+	"dist/clients/lsp/wait-policy/strategies.js",
+);
 let ensureTool;
 if (install) ({ ensureTool } = await imp("dist/clients/installer/index.js"));
 
@@ -127,11 +139,13 @@ const src = process.env.CI ? "ci" : "dev";
 // The [lsp-pub] trace runs in THIS process (dist is imported), so we intercept
 // console.error, count matching lines per step, and (when PILENS_PUB_DEBUG was
 // already set by the user) still echo them.
-const PUB_RE = /^\[lsp-pub\] server=(\S+) pubVersion=(\S+) docVersion=(\S+) diags=(\d+)/;
+const PUB_RE =
+	/^\[lsp-pub\] server=(\S+) pubVersion=(\S+) docVersion=(\S+) diags=(\d+)/;
 let pubSink = null;
 const realErr = console.error.bind(console);
 console.error = (...args) => {
-	const line = args.length === 1 && typeof args[0] === "string" ? args[0] : args.join(" ");
+	const line =
+		args.length === 1 && typeof args[0] === "string" ? args[0] : args.join(" ");
 	const m = typeof line === "string" ? line.match(PUB_RE) : null;
 	if (m && pubSink) {
 		pubSink.push({
@@ -149,7 +163,21 @@ console.error = (...args) => {
 // unchanged so a re-publish is purely the server's clean-scan behavior.
 function commentFor(file) {
 	const ext = path.extname(file).toLowerCase();
-	if ([".py", ".rb", ".sh", ".yaml", ".yml", ".toml", ".tf", ".ex", ".exs", ".nix", ".ps1"].includes(ext))
+	if (
+		[
+			".py",
+			".rb",
+			".sh",
+			".yaml",
+			".yml",
+			".toml",
+			".tf",
+			".ex",
+			".exs",
+			".nix",
+			".ps1",
+		].includes(ext)
+	)
 		return "#";
 	if ([".lua", ".sql", ".hs"].includes(ext)) return "--";
 	if ([".clj", ".ml", ".mli"].includes(ext)) return ";;"; // best-effort; ocaml uses (* *) but a trailing line is harmless bytes
@@ -188,7 +216,9 @@ for (const fx of fixtures) {
 		row.tierLabel = "";
 		row.detail = `error: ${e?.message ?? e}`;
 	} finally {
-		try { fs.rmSync(dst, { recursive: true, force: true }); } catch {}
+		try {
+			fs.rmSync(dst, { recursive: true, force: true });
+		} catch {}
 	}
 	rows.push(row);
 	console.error(
@@ -200,7 +230,9 @@ async function probeFixture(fx, dst, row) {
 	fs.cpSync(path.join(repoRoot, fx.dir), dst, { recursive: true });
 	const absFile = path.join(dst, fx.file);
 	if (fx.gitInit) {
-		try { execFileSync("git", ["init", "-q"], { cwd: dst, stdio: "ignore" }); } catch {}
+		try {
+			execFileSync("git", ["init", "-q"], { cwd: dst, stdio: "ignore" });
+		} catch {}
 	}
 	if (fx.disableServers) {
 		fs.mkdirSync(path.join(dst, ".pi-lens"), { recursive: true });
@@ -257,7 +289,10 @@ async function probeFixture(fx, dst, row) {
 		await sleep(SETTLE_MS);
 
 		pubSink = cleanPubs;
-		fs.writeFileSync(absFile, `${dirtyContent}\n${commentFor(fx.file)} clean-probe edit\n`);
+		fs.writeFileSync(
+			absFile,
+			`${dirtyContent}\n${commentFor(fx.file)} clean-probe edit\n`,
+		);
 		await sleep(SETTLE_MS);
 		await touch(fs.readFileSync(absFile, "utf8"), STEP_WAIT_MS);
 		await sleep(SETTLE_MS);
@@ -300,9 +335,17 @@ function withTimeout(promise, ms, row) {
 }
 
 // ---- report ---------------------------------------------------------------
-console.log("\nClean-signal matrix (4-way: 2 versioned / 2* unversioned / 3 silent / unknown, among push servers)\n");
-console.log(`  ${"LANG".padEnd(18)} ${"MODE".padEnd(11)} ${"CLEAN-BEHAVIOR".padEnd(22)} ${"TIER".padEnd(5)} ${"SRC".padEnd(4)} SERVER`);
-for (const r of rows.sort((a, b) => String(a.behavior).localeCompare(String(b.behavior)) || a.lang.localeCompare(b.lang))) {
+console.log(
+	"\nClean-signal matrix (4-way: 2 versioned / 2* unversioned / 3 silent / unknown, among push servers)\n",
+);
+console.log(
+	`  ${"LANG".padEnd(18)} ${"MODE".padEnd(11)} ${"CLEAN-BEHAVIOR".padEnd(22)} ${"TIER".padEnd(5)} ${"SRC".padEnd(4)} SERVER`,
+);
+for (const r of rows.sort(
+	(a, b) =>
+		String(a.behavior).localeCompare(String(b.behavior)) ||
+		a.lang.localeCompare(b.lang),
+)) {
 	console.log(
 		`  ${r.lang.padEnd(18)} ${String(r.mode).padEnd(11)} ${String(r.behavior).padEnd(22)} ${String(r.tierLabel || "").padEnd(5)} ${src.padEnd(4)} ${r.server}`,
 	);
@@ -335,12 +378,18 @@ const unk = rows.filter((r) => r.behavior === "unknown").length;
 // — a real signal, not a skipped row.
 const driftWarnings = resolveTargetLangRows(rows)
 	.map((r) => checkCleanSignalDrift(r, lookupSilentOnClean(r.lang)))
-	.filter((d) => d.kind === "silent-not-marked" || d.kind === "marked-not-silent");
+	.filter(
+		(d) => d.kind === "silent-not-marked" || d.kind === "marked-not-silent",
+	);
 if (driftWarnings.length) {
-	console.log(`\n  Drift vs wait-policy/strategies.ts silentOnClean marker (${driftWarnings.length} — telemetry only, never a CI gate):`);
+	console.log(
+		`\n  Drift vs wait-policy/strategies.ts silentOnClean marker (${driftWarnings.length} — telemetry only, never a CI gate):`,
+	);
 	for (const d of driftWarnings) console.log(`    [${d.kind}] ${d.detail}`);
 } else {
-	console.log("\n  Drift vs wait-policy/strategies.ts silentOnClean marker: none.");
+	console.log(
+		"\n  Drift vs wait-policy/strategies.ts silentOnClean marker: none.",
+	);
 }
 
 // #594: also write driftWarnings as a small machine-readable JSON summary so
@@ -366,10 +415,18 @@ try {
 } catch (e) {
 	console.error(`drift summary write skipped: ${e?.message ?? e}`);
 }
-console.log(`\n  Tier 2  (publishes-versioned — affirmative + currency-proven):        ${t2v}`);
-console.log(`  Tier 2* (publishes-unversioned — early-returns, currency correlated): ${t2u}`);
-console.log(`  Tier 3  (silent on clean — budget-wait, the #458 target set):         ${t3}`);
-console.log(`  unknown (slow/absent/ambiguous — conservative, not guessed):          ${unk}`);
+console.log(
+	`\n  Tier 2  (publishes-versioned — affirmative + currency-proven):        ${t2v}`,
+);
+console.log(
+	`  Tier 2* (publishes-unversioned — early-returns, currency correlated): ${t2u}`,
+);
+console.log(
+	`  Tier 3  (silent on clean — budget-wait, the #458 target set):         ${t3}`,
+);
+console.log(
+	`  unknown (slow/absent/ambiguous — conservative, not guessed):          ${unk}`,
+);
 console.log("  n/a (pull) rows are Tier 1 by protocol (#240), not probed.\n");
 
 // Merge classifications into docs/lsp-capability-matrix.md — MERGE, don't
@@ -385,7 +442,9 @@ try {
 }
 
 console.error = realErr;
-try { await resetLSPService?.({ fast: true }); } catch {}
+try {
+	await resetLSPService?.({ fast: true });
+} catch {}
 process.exit(0);
 
 // Resolve a `clean: true` fixture (e.g. typescript-clean) onto its base lang's
@@ -413,7 +472,9 @@ function resolveTargetLangRows(measuredRows) {
 function updateMatrix(measuredRows) {
 	const docPath = path.join(repoRoot, "docs", "lsp-capability-matrix.md");
 	if (!fs.existsSync(docPath)) {
-		console.error(`matrix update skipped: ${docPath} not found (gitignored — nothing to merge)`);
+		console.error(
+			`matrix update skipped: ${docPath} not found (gitignored — nothing to merge)`,
+		);
 		return;
 	}
 	const text = fs.readFileSync(docPath, "utf8");
@@ -462,7 +523,9 @@ function updateMatrix(measuredRows) {
 	// expectation (see the drift-check comment above), not classic's marker.
 	const footnoteWarnings = targetLangRows
 		.map((r) => checkCleanSignalDrift(r, lookupSilentOnClean(r.lang)))
-		.filter((d) => d.kind === "silent-not-marked" || d.kind === "marked-not-silent");
+		.filter(
+			(d) => d.kind === "silent-not-marked" || d.kind === "marked-not-silent",
+		);
 	out = writeDriftFootnote(out, footnoteWarnings);
 
 	if (out !== text) {

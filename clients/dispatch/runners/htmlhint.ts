@@ -12,7 +12,8 @@ import {
 	createAvailabilityChecker,
 	resolveToolCommandWithInstallFallback,
 } from "./utils/runner-helpers.js";
-import { spawnFailedWithNoOutput } from "./utils/spawn-outcome.js";
+import { parseToolRun } from "./utils/tool-failure.js";
+import { finishParsedRun } from "./utils/tool-failure.js";
 
 const htmlhint = createAvailabilityChecker("htmlhint");
 
@@ -73,7 +74,7 @@ const htmlhintRunner: RunnerDefinition = {
 		}
 
 		let cmd: string | null = null;
-		if (await (htmlhint.isAvailableAsync(cwd))) {
+		if (await htmlhint.isAvailableAsync(cwd)) {
 			cmd = htmlhint.getCommand(cwd);
 		} else {
 			cmd = await resolveToolCommandWithInstallFallback(cwd, "htmlhint");
@@ -83,12 +84,22 @@ const htmlhintRunner: RunnerDefinition = {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
-		const rulesJson = JSON.stringify(HTMLHINT_RULES);
+		// htmlhint's --rules flag takes a comma-separated ruleid list
+		// ("tag-pair,id-class-value=underline"), NOT a JSON object. The old JSON
+		// blob parsed as one bogus rule id, leaving ZERO rules enabled — every
+		// file read CLEAN (exit 0, no output) no matter what it contained.
+		// Root-caused live against htmlhint 1.x after the tier-1 parser smoke
+		// caught htmlhint reporting 0 findings on the planted tag-pair defect.
+		// Entries set to false are omitted: under --rules semantics an unlisted
+		// rule is off, which is exactly what `false` means here.
+		const rulesArg = Object.entries(HTMLHINT_RULES)
+			.flatMap(([rule, enabled]) => (enabled === true ? [rule] : []))
+			.join(",");
 		const result = await safeSpawnAsync(
 			cmd,
 			[
 				"--rules",
-				rulesJson,
+				rulesArg,
 				"--format",
 				"unix",
 				path.resolve(cwd, ctx.filePath),
@@ -96,23 +107,28 @@ const htmlhintRunner: RunnerDefinition = {
 			{ cwd },
 		);
 
+		// #1948: htmlhint exits 1 when it finds errors and prints them in `unix`
+		// format on stdout. Zero parsed out of a nonzero exit is a parser break.
 		const output = result.stdout || result.stderr || "";
-		if (spawnFailedWithNoOutput(result, output)) {
-			return { status: "skipped", diagnostics: [], semantic: "none" };
-		}
+		const run = parseToolRun("htmlhint", { result, output }, (out) =>
+			parseHtmlhintOutput(out, ctx.filePath),
+		);
+		if (run.skipped) return run.skipped;
 
-		const diagnostics = parseHtmlhintOutput(output, ctx.filePath);
-
-		if (diagnostics.length === 0) {
-			return { status: "succeeded", diagnostics: [], semantic: "none" };
-		}
-
-		const hasErrors = diagnostics.some((d) => d.severity === "error");
-		return {
-			status: "failed",
+		const diagnostics = run.diagnostics;
+		return finishParsedRun({
+			tool: "htmlhint",
+			ctx,
+			result,
 			diagnostics,
-			semantic: hasErrors ? "blocking" : "warning",
-		};
+			classify: (diagnostics) => {
+				const hasErrors = diagnostics.some((d) => d.severity === "error");
+				return {
+					status: "failed",
+					semantic: hasErrors ? "blocking" : "warning",
+				};
+			},
+		});
 	},
 };
 

@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import { resolveArchiveUrl, TOOLS } from "../../../clients/installer/index.ts";
+import { resolveArchiveUrl, TOOLS } from "../../../clients/installer/index.js";
 
 // Use the real installer module, not any mock another test file registered.
-vi.unmock("../../../clients/installer/index.ts");
+vi.unmock("../../../clients/installer/index.js");
 
 /**
  * Platform-matched archive URLs (#241). `ArchiveSpec.url` may be a resolver
@@ -59,8 +59,12 @@ describe("resolveArchiveUrl (#241 platform-matched archives)", () => {
 		});
 
 		it("has no official build for linux/arm64 or unknown platforms", () => {
-			expect(resolveArchiveUrl(clangd!.archive!, "linux", "arm64")).toBeUndefined();
-			expect(resolveArchiveUrl(clangd!.archive!, "freebsd", "x64")).toBeUndefined();
+			expect(
+				resolveArchiveUrl(clangd!.archive!, "linux", "arm64"),
+			).toBeUndefined();
+			expect(
+				resolveArchiveUrl(clangd!.archive!, "freebsd", "x64"),
+			).toBeUndefined();
 		});
 	});
 
@@ -90,8 +94,12 @@ describe("resolveArchiveUrl (#241 platform-matched archives)", () => {
 		});
 
 		it("has no official win32/arm64 build or support for unknown platforms", () => {
-			expect(resolveArchiveUrl(lua!.archive!, "win32", "arm64")).toBeUndefined();
-			expect(resolveArchiveUrl(lua!.archive!, "freebsd", "x64")).toBeUndefined();
+			expect(
+				resolveArchiveUrl(lua!.archive!, "win32", "arm64"),
+			).toBeUndefined();
+			expect(
+				resolveArchiveUrl(lua!.archive!, "freebsd", "x64"),
+			).toBeUndefined();
 		});
 	});
 });
