@@ -21,7 +21,12 @@ const { getToolPath, ensureTool } = vi.hoisted(() => ({
 }));
 
 vi.mock("../../../clients/lsp/launch.js", () => ({ launchLSP }));
-vi.mock("../../../clients/latency-logger.js", () => ({ logLatency }));
+vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
+	...(await importActual<
+		typeof import("../../../clients/latency-logger.js")
+	>()),
+	logLatency,
+}));
 vi.mock("../../../clients/installer/index.js", () => ({
 	getToolPath,
 	ensureTool,

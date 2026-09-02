@@ -47,7 +47,6 @@ const yamllintRunner: RunnerDefinition = {
 	id: "yamllint",
 	appliesTo: ["yaml"],
 	priority: PRIORITY.YAML_LINT,
-	enabledByDefault: true,
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {

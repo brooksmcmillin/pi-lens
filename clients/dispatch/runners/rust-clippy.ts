@@ -41,15 +41,20 @@ const rustClient = new RustClient();
 // The verdict is governed by the shared availability policy (#1494): a probe
 // timeout expires on a cooldown, so only a genuinely absent clippy latches.
 const CLIPPY_PROBE_BUDGET_MS = 8000;
+let clippyProbeRevision = 0;
 
-const makeClippyProbe = (cargoExe: string) =>
+const makeClippyProbe = (cargoExe: string, flightKeyComponent = cargoExe) =>
 	createCwdCachedProbe(
 		(cwd) =>
 			safeSpawnAsync(cargoExe, ["clippy", "--version"], {
 				timeout: CLIPPY_PROBE_BUDGET_MS,
 				cwd,
 			}),
-		{ tool: "clippy", budgetMs: CLIPPY_PROBE_BUDGET_MS },
+		{
+			tool: "clippy",
+			budgetMs: CLIPPY_PROBE_BUDGET_MS,
+			flightKeyComponent,
+		},
 	);
 
 const clippyAvailabilityByCargo = new Map<
@@ -64,7 +69,10 @@ function getClippyProbe(cargoExe: string) {
 
 /** Replace the cached probe so a post-install state is observed. */
 function refreshClippyProbe(cargoExe: string) {
-	const created = makeClippyProbe(cargoExe);
+	const created = makeClippyProbe(
+		cargoExe,
+		`${cargoExe}#refresh-${++clippyProbeRevision}`,
+	);
 	clippyAvailabilityByCargo.set(cargoExe, created);
 	return created;
 }
@@ -73,7 +81,6 @@ const rustClippyRunner: RunnerDefinition = {
 	id: "rust-clippy",
 	appliesTo: ["rust"],
 	priority: PRIORITY.SPECIALIZED_ANALYSIS,
-	enabledByDefault: true,
 	timeoutMs: 90_000,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {

@@ -17,7 +17,11 @@ process.env.PI_LENS_TEST_MODE = "1";
 vi.mock("../../../clients/lsp/launch.js", () => ({
 	launchLSP: vi.fn(),
 }));
-vi.mock("../../../clients/latency-logger.js", () => ({
+
+vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
+	...(await importActual<
+		typeof import("../../../clients/latency-logger.js")
+	>()),
 	logLatency: vi.fn(),
 	resetLatencyLog: vi.fn(),
 }));

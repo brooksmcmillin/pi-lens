@@ -258,13 +258,17 @@ export class JscpdClient {
 			return existing;
 		}
 
+		// Identity-guarded release (#1968's pattern): delete only if THIS run is
+		// still the registered one. A bare delete-by-key lets a late-settling run
+		// evict a live successor a second writer registered under the same key
+		// mid-flight, after which the next caller starts a duplicate scan.
 		const promise = this.runScan(
 			targetDir,
 			minLines,
 			minTokens,
 			isTsProject,
 		).finally(() => {
-			this.inFlight.delete(key);
+			if (this.inFlight.get(key) === promise) this.inFlight.delete(key);
 		});
 		this.inFlight.set(key, promise);
 		return promise;

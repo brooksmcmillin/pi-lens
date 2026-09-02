@@ -130,6 +130,9 @@ describe("formatter PATH probes (#1495)", () => {
 			cause: "probe-timeout",
 			latched: false,
 			retryAfterMs: TRANSIENT_BASE_COOLDOWN_MS,
+			// classifyProbeFailure already answered "transient" on its own —
+			// nothing here overrode it (#2226 review F1).
+			classifiedBy: "probe",
 		});
 	});
 
@@ -144,6 +147,7 @@ describe("formatter PATH probes (#1495)", () => {
 			outcome: "missing",
 			cause: "not-found",
 			latched: true,
+			classifiedBy: "probe",
 		});
 
 		vi.setSystemTime(new Date(Date.now() + TRANSIENT_BASE_COOLDOWN_MS * 4));
@@ -161,6 +165,10 @@ describe("formatter PATH probes (#1495)", () => {
 			outcome: "transient",
 			cause: "probe-rejected",
 			latched: false,
+			// The prober itself couldn't run, so this call site forced the
+			// outcome/cause — a caller assertion, not classifyProbeFailure's
+			// own answer (#2226 review F1).
+			classifiedBy: "caller",
 		});
 
 		// An unspawnable prober is shared by every which-gated formatter, so a

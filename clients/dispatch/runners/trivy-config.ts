@@ -163,7 +163,6 @@ const trivyConfigRunner: RunnerDefinition = {
 	id: "trivy-config",
 	appliesTo: ["docker", "yaml", "terraform", "json"],
 	priority: PRIORITY.GENERAL_ANALYSIS,
-	enabledByDefault: true,
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {

@@ -318,6 +318,78 @@ describe("recent-touches (#492 cross-process touched-files record)", () => {
 			expect(second).toEqual([]);
 		});
 
+		// #2300: a same-mtime-bucket rewrite (coarse filesystem mtime
+		// granularity; #2287 N1) that changes the file's byte length must not
+		// be masked by the mtime-only equality memo. Varies SIZE, never
+		// same-length content, and never a real timing race — the mtime is
+		// forced back with `utimesSync` so the test is deterministic.
+		it("a same-mtime-bucket rewrite with a different size is not dropped by the mtime-only memo", async () => {
+			const { readCrossProcessTouchesForTurnStart } =
+				await import("../../clients/recent-touches.js");
+			const firstFile = path.join(dir, "first.ts");
+			const secondFile = path.join(dir, "second.ts");
+			fs.writeFileSync(firstFile, "// first", "utf-8");
+			fs.writeFileSync(secondFile, "// second", "utf-8");
+
+			// Pin the mtime up front so the rewrite below can be forced back to
+			// it. The pinned value is read BACK before it is asserted on:
+			// `mtimeMs` is derived from a nanosecond timestamp, so a whole-ms
+			// Date can come back as e.g. 1787865854006.999 on ext4. Only the
+			// round-tripped value is stable across two identical `utimesSync`
+			// calls, and it is what the memo actually caches.
+			const pinnedMtimeMs = Date.now();
+			fs.writeFileSync(
+				recordFilePath(),
+				JSON.stringify({
+					entries: [
+						{ path: firstFile, reason: "autofix", ts: Date.now(), pid: 777 },
+					],
+				}),
+				"utf-8",
+			);
+			fs.utimesSync(
+				recordFilePath(),
+				new Date(pinnedMtimeMs),
+				new Date(pinnedMtimeMs),
+			);
+			const observedMtimeMs = fs.statSync(recordFilePath()).mtimeMs;
+			const first = await readCrossProcessTouchesForTurnStart({
+				cwd: FAKE_CWD,
+				selfPid: process.pid,
+			});
+			expect(first).toHaveLength(1);
+
+			// Real gap so the second entry's `ts` is strictly newer than the
+			// cursor advanced by the first read (avoids a same-millisecond tie).
+			await new Promise((r) => setTimeout(r, 5));
+
+			// A second, strictly LONGER JSON body (an extra entry) forced back to
+			// the SAME mtime the memo already saw. A mtime-only memo would treat
+			// this as "nothing new" and drop the second entry.
+			fs.writeFileSync(
+				recordFilePath(),
+				JSON.stringify({
+					entries: [
+						{ path: firstFile, reason: "autofix", ts: Date.now(), pid: 777 },
+						{ path: secondFile, reason: "format", ts: Date.now(), pid: 777 },
+					],
+				}),
+				"utf-8",
+			);
+			fs.utimesSync(
+				recordFilePath(),
+				new Date(pinnedMtimeMs),
+				new Date(pinnedMtimeMs),
+			);
+			expect(fs.statSync(recordFilePath()).mtimeMs).toBe(observedMtimeMs);
+
+			const second = await readCrossProcessTouchesForTurnStart({
+				cwd: FAKE_CWD,
+				selfPid: process.pid,
+			});
+			expect(second.some((e) => e.path.includes("second.ts"))).toBe(true);
+		});
+
 		it("a new append after a prior consume only surfaces the NEW entry (cursor dedup, not full re-read)", async () => {
 			const { readCrossProcessTouchesForTurnStart } =
 				await import("../../clients/recent-touches.js");

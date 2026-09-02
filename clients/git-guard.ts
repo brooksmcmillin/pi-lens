@@ -273,7 +273,62 @@ function delimitedSubstitutionBody(
 	return undefined;
 }
 
-function containsGuardedSubstitution(command: string, depth: number): boolean {
+/**
+ * Which git verbs a guard cares about (#2007).
+ *
+ * The wrapper, substitution, `$IFS`, PATHEXT, and text-consumer analysis
+ * below took several review rounds to get right. A second guard that needs
+ * the same "is this an actual git invocation, and which verb" answer must
+ * reuse that analysis rather than grow a parallel lexer, so the classifier
+ * takes the verb question as a parameter and keeps everything else shared.
+ */
+export interface GitVerbMatcher {
+	/** Stable id for telemetry and tests. */
+	readonly id: string;
+	/**
+	 * True when `verb` in git command position, with `argsAfterVerb`
+	 * following it, is an operation this guard governs.
+	 */
+	readonly matchesVerb: (
+		verb: string,
+		argsAfterVerb: readonly string[],
+	) => boolean;
+	/**
+	 * True when ANY non-leading (indirect) `git` token matches unconditionally.
+	 * The commit/push guard is a policy gate an agent may want to evade, so
+	 * unknown launchers fail closed there. A guard that protects the agent
+	 * from its own accident sets this false and falls back to "an indirect
+	 * git whose argv also carries a governed verb" — see
+	 * `clients/shared-checkout-guard.ts`.
+	 */
+	readonly indirectAlwaysMatches: boolean;
+	/**
+	 * True when a LEADING post-verb `--help`/`-h` means "print documentation"
+	 * and the invocation should not match (#2007).
+	 *
+	 * FALSE for the commit gate, and that is a contract, not a tuning knob.
+	 * `-h` is a legal option VALUE: `git commit -m -h` creates a commit whose
+	 * message is `-h` (verified against git 2.55 — it exits 0 and the log
+	 * subject reads `-h`), and `git push --repo -h` really pushes. A gate that
+	 * fails closed must not be talked out of a match by a token that might be
+	 * a value. `git commit --help` therefore still classifies as an attempt,
+	 * exactly as it did before this seam existed.
+	 */
+	readonly suppressPostVerbHelp: boolean;
+}
+
+const COMMIT_PUSH_MATCHER: GitVerbMatcher = {
+	id: "commit-push",
+	matchesVerb: (verb) => verb === "commit" || verb === "push",
+	indirectAlwaysMatches: true,
+	suppressPostVerbHelp: false,
+};
+
+function containsGuardedSubstitution(
+	command: string,
+	depth: number,
+	matcher: GitVerbMatcher,
+): boolean {
 	if (depth > 3) return false;
 	let quote: "single" | "double" | undefined;
 	let escaped = false;
@@ -314,9 +369,9 @@ function containsGuardedSubstitution(command: string, depth: number): boolean {
 		if (substitution && substitution.end >= 0) {
 			const nested = canonicalizeGuardCommand(substitution.body);
 			if (
-				containsGuardedSubstitution(nested, depth + 1) ||
+				containsGuardedSubstitution(nested, depth + 1, matcher) ||
 				tokenizeShellCommand(nested).some((segment) =>
-					containsCommitOrPush(segment.tokens, depth + 1),
+					containsGuardedGitVerb(segment.tokens, depth + 1, matcher),
 				)
 			) {
 				return true;
@@ -327,7 +382,202 @@ function containsGuardedSubstitution(command: string, depth: number): boolean {
 	return false;
 }
 
-function containsCommitOrPush(tokens: string[], depth: number): boolean {
+/** Git global options that consume the following token as their value. */
+const GIT_GLOBAL_OPTIONS_WITH_VALUE = new Set([
+	"-C",
+	"-c",
+	"--config-env",
+	"--git-dir",
+	"--work-tree",
+	"--exec-path",
+	"--namespace",
+]);
+
+const GIT_GLOBAL_OPTIONS_WITH_INLINE_VALUE = [
+	"--config-env",
+	"--git-dir",
+	"--work-tree",
+	"--exec-path",
+	"--namespace",
+];
+
+/**
+ * Index of git's subcommand token in `gitTokens` (which starts at the `git`
+ * executable), after skipping global options and their values. Returns
+ * `undefined` when the invocation has no subcommand at all — `git --help`,
+ * `git --version`, or a trailing option with no verb behind it.
+ *
+ * Shared by the direct and indirect paths so both ask the same question about
+ * the same position (#2007).
+ */
+function gitVerbIndex(gitTokens: string[]): number | undefined {
+	let i = 1;
+	while (i < gitTokens.length && gitTokens[i].startsWith("-")) {
+		const option = gitTokens[i];
+		if (["--help", "-h", "--version", "-v", "-V"].includes(option)) {
+			return undefined;
+		}
+		if (option === "--") return i + 1 < gitTokens.length ? i + 1 : undefined;
+		if (
+			["-C", "-c"].some(
+				(prefix) => option.startsWith(prefix) && option.length > prefix.length,
+			)
+		) {
+			i += 1;
+			continue;
+		}
+		if (
+			GIT_GLOBAL_OPTIONS_WITH_INLINE_VALUE.some((prefix) =>
+				option.startsWith(`${prefix}=`),
+			)
+		) {
+			i += 1;
+			continue;
+		}
+		i += GIT_GLOBAL_OPTIONS_WITH_VALUE.has(option) ? 2 : 1;
+	}
+	return i < gitTokens.length ? i : undefined;
+}
+
+/**
+ * True when the subcommand in git's command position is one the matcher
+ * governs. `gitTokens[0]` is the `git` executable token.
+ */
+export function matchGitVerbAtCommandPosition(
+	gitTokens: string[],
+	matcher: GitVerbMatcher,
+): boolean {
+	const index = gitVerbIndex(gitTokens);
+	if (index === undefined) return false;
+	const argsAfterVerb = gitTokens.slice(index + 1);
+	// `git checkout --help` prints documentation and touches nothing, and the
+	// global-option walk above cannot see it, because it sits AFTER the verb.
+	//
+	// Only the FIRST argument counts, and only for matchers that opt in. `-h`
+	// deeper in the argv may be an option VALUE rather than a help request —
+	// `git commit -m -h` commits with the message `-h`, `git clean -e -h`
+	// excludes a pattern named `-h`. Reading any position would need a
+	// per-verb table of value-taking options for every governed verb, which is
+	// exactly the hand-maintained parallel list this repo forbids, and every
+	// gap in it would silently UNDER-block. Leading-position-only needs no
+	// table, covers how help is actually invoked, and every other spelling
+	// falls through to a match, which is the safe direction for a guard.
+	if (
+		matcher.suppressPostVerbHelp &&
+		(argsAfterVerb[0] === "--help" || argsAfterVerb[0] === "-h")
+	) {
+		return false;
+	}
+	const verbs = expandGuardVerbToken(gitTokens[index] ?? "");
+	return verbs.length === 1 && matcher.matchesVerb(verbs[0], argsAfterVerb);
+}
+
+/** Strip one layer of shell quoting the lexer preserved on a value token. */
+function unquoteGuardValue(value: string): string {
+	const trimmed = value.trim();
+	if (trimmed.length >= 2) {
+		const first = trimmed[0];
+		const last = trimmed[trimmed.length - 1];
+		if ((first === '"' || first === "'") && first === last) {
+			return trimmed.slice(1, -1);
+		}
+	}
+	return trimmed;
+}
+
+/**
+ * The directory a git invocation actually targets (#2007).
+ *
+ * `git -C <dir>` and `--work-tree` retarget the command at a DIFFERENT
+ * directory, so a guard that evaluates the caller's cwd would inspect the
+ * wrong working tree and allow a destructive command against a shared one.
+ * `-C` composes cumulatively, exactly as git applies it; `--work-tree` names
+ * the working tree directly and therefore wins.
+ *
+ * Returns the resolved absolute directory, or `cwd` when the invocation
+ * carries no retargeting option.
+ */
+export function resolveGitTargetDirectory(
+	gitTokens: string[],
+	cwd: string,
+): string {
+	let base = cwd;
+	let workTree: string | undefined;
+	let i = 1;
+	while (i < gitTokens.length && gitTokens[i].startsWith("-")) {
+		const option = gitTokens[i];
+		if (["--help", "-h", "--version", "-v", "-V"].includes(option)) break;
+		if (option === "--") break;
+		if (option === "-C" && i + 1 < gitTokens.length) {
+			base = path.resolve(base, unquoteGuardValue(gitTokens[i + 1]));
+			i += 2;
+			continue;
+		}
+		if (option.startsWith("-C") && option.length > 2) {
+			base = path.resolve(base, unquoteGuardValue(option.slice(2)));
+			i += 1;
+			continue;
+		}
+		if (option === "--work-tree" && i + 1 < gitTokens.length) {
+			workTree = unquoteGuardValue(gitTokens[i + 1]);
+			i += 2;
+			continue;
+		}
+		if (option.startsWith("--work-tree=")) {
+			workTree = unquoteGuardValue(option.slice("--work-tree=".length));
+			i += 1;
+			continue;
+		}
+		if (
+			option.startsWith("-c") &&
+			option.length > 2 &&
+			!option.startsWith("--")
+		) {
+			i += 1;
+			continue;
+		}
+		if (
+			GIT_GLOBAL_OPTIONS_WITH_INLINE_VALUE.some((prefix) =>
+				option.startsWith(`${prefix}=`),
+			)
+		) {
+			i += 1;
+			continue;
+		}
+		i += GIT_GLOBAL_OPTIONS_WITH_VALUE.has(option) ? 2 : 1;
+	}
+	return workTree === undefined ? base : path.resolve(base, workTree);
+}
+
+/**
+ * Every git invocation the command contains, as token arrays starting at the
+ * `git` executable. Used by callers that must know WHICH directory a matched
+ * command targets, not merely that it matched (#2007).
+ */
+export function collectGitInvocations(
+	toolName: string,
+	input: unknown,
+): string[][] {
+	if (toolName !== "bash") return [];
+	const command = getShellCommand(input);
+	if (!command) return [];
+	const invocations: string[][] = [];
+	for (const segment of tokenizeShellCommand(
+		canonicalizeGuardCommand(command),
+	)) {
+		const gitIndex = segment.tokens.findIndex((token) =>
+			isGitExecutable(token),
+		);
+		if (gitIndex >= 0) invocations.push(segment.tokens.slice(gitIndex));
+	}
+	return invocations;
+}
+
+function containsGuardedGitVerb(
+	tokens: string[],
+	depth: number,
+	matcher: GitVerbMatcher,
+): boolean {
 	if (depth > 3 || tokens.length === 0) return false;
 	let commandTokens = tokens;
 	while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(commandTokens[0] ?? "")) {
@@ -344,7 +594,7 @@ function containsCommitOrPush(tokens: string[], depth: number): boolean {
 		if (runIndex >= 0 && runIndex + 1 < commandTokens.length) {
 			const nestedCommand = commandTokens.slice(runIndex + 2).join(" ");
 			return tokenizeShellCommand(canonicalizeGuardCommand(nestedCommand)).some(
-				(segment) => containsCommitOrPush(segment.tokens, depth + 1),
+				(segment) => containsGuardedGitVerb(segment.tokens, depth + 1, matcher),
 			);
 		}
 	}
@@ -361,49 +611,16 @@ function containsCommitOrPush(tokens: string[], depth: number): boolean {
 	if (gitIndex >= 0) {
 		// Any non-leading git invocation is indirect. Do not maintain a wrapper
 		// or flag allowlist: unknown launchers are the security boundary here.
-		if (gitIndex > 0) return true;
-		const gitTokens = commandTokens.slice(gitIndex);
-		let i = 1;
-		const takesValue = new Set([
-			"-C",
-			"-c",
-			"--config-env",
-			"--git-dir",
-			"--work-tree",
-			"--exec-path",
-			"--namespace",
-		]);
-		while (i < gitTokens.length && gitTokens[i].startsWith("-")) {
-			const option = gitTokens[i];
-			if (["--help", "-h", "--version", "-v", "-V"].includes(option))
-				return false;
-			if (option === "--")
-				return gitTokens[i + 1] === "commit" || gitTokens[i + 1] === "push";
-			if (
-				["-C", "-c"].some(
-					(prefix) =>
-						option.startsWith(prefix) && option.length > prefix.length,
-				)
-			) {
-				i += 1;
-				continue;
-			}
-			if (
-				[
-					"--config-env",
-					"--git-dir",
-					"--work-tree",
-					"--exec-path",
-					"--namespace",
-				].some((prefix) => option.startsWith(`${prefix}=`))
-			) {
-				i += 1;
-				continue;
-			}
-			i += takesValue.has(option) ? 2 : 1;
-		}
-		const verbs = expandGuardVerbToken(gitTokens[i] ?? "");
-		return verbs.length === 1 && (verbs[0] === "commit" || verbs[0] === "push");
+		if (gitIndex > 0 && matcher.indirectAlwaysMatches) return true;
+		// #2007: a guard that protects the agent from its own accident must not
+		// decline `xargs git status`, so the indirect path stays armed only when
+		// a governed verb sits in git's real COMMAND POSITION. Scanning every
+		// token instead would fire on `find . -name checkout | xargs git add`,
+		// where `checkout` is a positional value and not a subcommand at all.
+		return matchGitVerbAtCommandPosition(
+			commandTokens.slice(gitIndex),
+			matcher,
+		);
 	}
 	const leadingExecutable = commandTokens[0] ?? "";
 	const knownCommandStringWrapper =
@@ -424,7 +641,7 @@ function containsCommitOrPush(tokens: string[], depth: number): boolean {
 		if (commandIndex >= commandTokens.length) return false;
 		const nestedCommand = commandTokens.slice(commandIndex).join(" ");
 		return tokenizeShellCommand(canonicalizeGuardCommand(nestedCommand)).some(
-			(segment) => containsCommitOrPush(segment.tokens, depth + 1),
+			(segment) => containsGuardedGitVerb(segment.tokens, depth + 1, matcher),
 		);
 	}
 	const lower = commandTokens.slice(1).map((token) => token.toLowerCase());
@@ -451,23 +668,39 @@ function containsCommitOrPush(tokens: string[], depth: number): boolean {
 	if (commandTokens[commandIndex] === "--") commandIndex += 1;
 	const nestedCommand = commandTokens.slice(commandIndex).join(" ");
 	return tokenizeShellCommand(canonicalizeGuardCommand(nestedCommand)).some(
-		(segment) => containsCommitOrPush(segment.tokens, depth + 1),
+		(segment) => containsGuardedGitVerb(segment.tokens, depth + 1, matcher),
 	);
 }
 
-/** Analyze actual executable invocations, not substrings in shell text. */
-export function isGitCommitOrPushAttempt(
+/**
+ * Analyze actual executable invocations, not substrings in shell text.
+ *
+ * Shared entry point for every guard that needs "is this bash input really a
+ * git invocation of a verb I govern" (#2007). The verb question is the only
+ * parameter; wrapper, substitution, and text-consumer analysis are identical
+ * for all callers by construction.
+ */
+export function detectGuardedGitVerb(
 	toolName: string,
 	input: unknown,
+	matcher: GitVerbMatcher,
 ): boolean {
 	if (toolName !== "bash") return false;
 	const command = getShellCommand(input);
 	if (!command) return false;
 	const canonical = canonicalizeGuardCommand(command);
-	if (containsGuardedSubstitution(canonical, 0)) return true;
+	if (containsGuardedSubstitution(canonical, 0, matcher)) return true;
 	return tokenizeShellCommand(canonical).some((segment) =>
-		containsCommitOrPush(segment.tokens, 0),
+		containsGuardedGitVerb(segment.tokens, 0, matcher),
 	);
+}
+
+/** The #1063 commit gate's own question. */
+export function isGitCommitOrPushAttempt(
+	toolName: string,
+	input: unknown,
+): boolean {
+	return detectGuardedGitVerb(toolName, input, COMMIT_PUSH_MATCHER);
 }
 
 function isTurnEndFindingsCache(value: unknown): value is TurnEndFindingsCache {

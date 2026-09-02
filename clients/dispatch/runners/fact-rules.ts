@@ -20,7 +20,6 @@ const factRulesRunner: RunnerDefinition = {
 	id: "fact-rules",
 	appliesTo: ["jsts", "python", "go", "rust", "ruby", "shell", "cmake"],
 	priority: PRIORITY.GENERAL_ANALYSIS + 1,
-	enabledByDefault: true,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
 		const diagnostics = evaluateRules(ctx);

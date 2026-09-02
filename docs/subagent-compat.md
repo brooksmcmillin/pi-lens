@@ -99,22 +99,32 @@ Assertions:
    `PI_SUBAGENT_PARENT_PID`), no `subagent_light_mode` phase is logged.
    `subagent-mode.ts`'s doc comment requires the PAIR — a lone var set by
    some unrelated tool must not trigger light mode.
-6. **`concurrent_session_bind` (#473) — NOT asserted, documented TODO.**
+6. **`concurrent_session_bind` (#473) and its `concurrent_session_bind_rollup`
+   session-end summary (#2249) — NOT asserted, documented TODO.**
    The guard is fully wired on master (PR #477): `index.ts`'s `session_start`
    handler calls `decideSessionStart()` and logs a `concurrent_session_bind`
    latency phase for a concurrent-secondary bind — so the phase exists to
-   observe. The blocker is DRIVING it keylessly: reproducing tintinweb's
-   in-process model for real (mirroring `agent-runner.ts`'s
-   `createAgentSession()` + `DefaultResourceLoader` + `bindExtensions()`
-   sequence) requires full session construction, which in turn needs
-   model/provider config — not cheaply stubbable without a real model key,
-   and #476 explicitly asks not to ship something flaky here. The unit +
-   behavioral coverage in `tests/clients/session-lifecycle.test.ts` guards
-   the classifier and the no-reset contract in-repo; what Layer B cannot yet
-   add is the end-to-end SDK-driven variant. **Revisit if the pi SDK grows a
-   model-free session constructor or stub provider** — at that point add a
-   Layer B assertion analogous to 1-3 checking the `concurrent_session_bind`
-   phase and the absence of a second LSP fleet teardown.
+   observe. `clients/session-start-observability.ts` also keeps a bounded,
+   process-singleton-backed tally of declined binds by classification
+   (`concurrent-secondary` / `secondary-root`), which `index.ts`'s
+   `session_shutdown` handler logs as one `concurrent_session_bind_rollup`
+   row (primary sessions only) and clears — same primary-only placement as
+   `session_end_bus_rollup`/`path_attribution_verified_rollup`. The blocker is
+   DRIVING either keylessly: reproducing tintinweb's in-process model for real
+   (mirroring `agent-runner.ts`'s `createAgentSession()` +
+   `DefaultResourceLoader` + `bindExtensions()` sequence) requires full
+   session construction, which in turn needs model/provider config — not
+   cheaply stubbable without a real model key, and #476 explicitly asks not
+   to ship something flaky here. The unit + behavioral coverage in
+   `tests/clients/session-lifecycle.test.ts` guards the classifier and the
+   no-reset contract, and `tests/clients/session-start-observability.test.ts`
+   plus `tests/index-integration.test.ts` guard the rollup's counting,
+   process-singleton survival, and primary-only reset/emit wiring, all
+   in-repo; what Layer B cannot yet add is the end-to-end SDK-driven variant.
+   **Revisit if the pi SDK grows a model-free session constructor or stub
+   provider** — at that point add a Layer B assertion analogous to 1-3
+   checking the `concurrent_session_bind`/`concurrent_session_bind_rollup`
+   phases and the absence of a second LSP fleet teardown.
 
 ## What to do when the nightly alerts
 

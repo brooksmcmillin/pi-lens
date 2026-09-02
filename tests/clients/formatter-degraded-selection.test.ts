@@ -261,10 +261,16 @@ describe("the poison guard sees every binary a detect probed (#1539)", () => {
 		expect(selections()[0]?.metadata?.cached).toBeUndefined();
 		expect(selections()[0]?.metadata?.stalledProbes).toBeUndefined();
 
-		// And it is genuinely cached: a second pass is served from the cache, so it
-		// logs no new selection at all.
+		// And it is genuinely cached: a second pass is served from the cache, so
+		// it logs a cache-hit selection record (#1940).
 		expect(await names(dirB, bareFile)).toEqual([]);
-		expect(selections()).toHaveLength(1);
+		expect(selections()).toHaveLength(2);
+		expect(selections()[1]?.metadata).toMatchObject({
+			formatter: null,
+			reason: "cache",
+			cached: true,
+			outcome: "hit",
+		});
 	});
 });
 

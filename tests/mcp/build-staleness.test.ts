@@ -12,14 +12,18 @@ import {
 	type StatFn,
 } from "../../mcp/build-staleness.js";
 
-function fakeStat(mtimeMs: number | undefined): StatFn {
-	return () => (mtimeMs === undefined ? undefined : { mtimeMs });
+function fakeStat(mtimeMs: number | undefined, size = 100): StatFn {
+	return () => (mtimeMs === undefined ? undefined : { mtimeMs, size });
 }
 
 describe("computeBuildStamp", () => {
-	it("captures the entry path and mtime", () => {
-		const stamp = computeBuildStamp("/repo/mcp/server.js", fakeStat(1000));
-		expect(stamp).toEqual({ entryPath: "/repo/mcp/server.js", mtimeMs: 1000 });
+	it("captures the entry path, mtime, and size", () => {
+		const stamp = computeBuildStamp("/repo/mcp/server.js", fakeStat(1000, 100));
+		expect(stamp).toEqual({
+			entryPath: "/repo/mcp/server.js",
+			mtimeMs: 1000,
+			size: 100,
+		});
 	});
 
 	it("returns undefined when the entry can't be stat'd", () => {
@@ -29,16 +33,16 @@ describe("computeBuildStamp", () => {
 });
 
 describe("checkStaleness", () => {
-	const stamp = { entryPath: "/repo/mcp/server.js", mtimeMs: 1000 };
+	const stamp = { entryPath: "/repo/mcp/server.js", mtimeMs: 1000, size: 100 };
 
-	it("is not stale when the on-disk mtime still matches the startup stamp", () => {
-		const result = checkStaleness(stamp, fakeStat(1000));
+	it("is not stale when the on-disk mtime and size still match the startup stamp", () => {
+		const result = checkStaleness(stamp, fakeStat(1000, 100));
 		expect(result.stale).toBe(false);
 		expect(result.currentMtimeMs).toBe(1000);
 	});
 
 	it("is stale when the on-disk mtime has moved (rebuild/merge landed)", () => {
-		const result = checkStaleness(stamp, fakeStat(2000));
+		const result = checkStaleness(stamp, fakeStat(2000, 100));
 		expect(result.stale).toBe(true);
 		expect(result.currentMtimeMs).toBe(2000);
 	});
@@ -47,6 +51,16 @@ describe("checkStaleness", () => {
 		const result = checkStaleness(stamp, fakeStat(undefined));
 		expect(result.stale).toBe(false);
 		expect(result.currentMtimeMs).toBeUndefined();
+	});
+
+	// #2300: a rebuild landing in the same coarse-granularity mtime bucket as
+	// the startup stamp (NTFS-granularity collision, #2287 N1) changes the
+	// bundle's byte length without moving mtime. Same mtime, different size —
+	// never same-length content — is the regression this class needs.
+	it("is stale when size differs even though mtime is unchanged (same-mtime-bucket rebuild)", () => {
+		const result = checkStaleness(stamp, fakeStat(1000, 250));
+		expect(result.stale).toBe(true);
+		expect(result.currentMtimeMs).toBe(1000);
 	});
 });
 
@@ -68,7 +82,7 @@ describe("StalenessGate", () => {
 		let currentMtime = 1000;
 		const countingStat: StatFn = () => {
 			statCalls++;
-			return { mtimeMs: currentMtime };
+			return { mtimeMs: currentMtime, size: 100 };
 		};
 		let nowMs = 0;
 		const gate = new StalenessGate(stamp, {

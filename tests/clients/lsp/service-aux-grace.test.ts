@@ -21,7 +21,12 @@ const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
 const logLatency = vi.fn();
 
-vi.mock("../../../clients/latency-logger.js", () => ({ logLatency }));
+vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
+	...(await importActual<
+		typeof import("../../../clients/latency-logger.js")
+	>()),
+	logLatency,
+}));
 
 vi.mock("../../../clients/lsp/config.js", () => ({
 	getServersForFileWithConfig,
@@ -157,22 +162,29 @@ function makeClient(
 			close: vi.fn(async () => {}),
 		},
 		waitForDiagnostics: vi.fn(
-			(filePath: string) =>
+			(filePath: string, timeoutMs: number) =>
 				new Promise<void>((resolve) =>
-					setTimeout(() => {
-						waitSettled = true;
-						// A genuine publish is what advances the version on a real
-						// client; a settle with NOTHING published must not, or the
-						// evidence-based outcome check below can't tell the two apart.
-						// #1493: an empty publish is still a publish — opt into it with
-						// `publishesWhenClean` to model a scanner that ran and found
-						// nothing.
-						if (diags.length > 0 || options.publishesWhenClean) {
-							version += 1;
-							stampsByPath.set(filePath, version);
-						}
-						resolve();
-					}, delayMs),
+					setTimeout(
+						() => {
+							const fitWithinBudget = delayMs <= timeoutMs;
+							if (fitWithinBudget) waitSettled = true;
+							// A genuine publish is what advances the version on a real
+							// client; a settle with NOTHING published must not, or the
+							// evidence-based outcome check below can't tell the two apart.
+							// #1493: an empty publish is still a publish — opt into it with
+							// `publishesWhenClean` to model a scanner that ran and found
+							// nothing.
+							if (
+								fitWithinBudget &&
+								(diags.length > 0 || options.publishesWhenClean)
+							) {
+								version += 1;
+								stampsByPath.set(filePath, version);
+							}
+							resolve();
+						},
+						Math.min(delayMs, timeoutMs),
+					),
 				),
 		),
 	};
@@ -444,6 +456,79 @@ describe("R8 — aux grace: touchFile with-auxiliary path", () => {
 		expect(result?.diags.map((diagnostic) => diagnostic.message)).toContain(
 			"aux finding",
 		);
+	});
+
+	it.each([
+		{ observedMs: 1000, expectedFinding: false },
+		{ observedMs: 2500, expectedFinding: true },
+	])(
+		"tracks a cold typos spawn of $observedMs ms instead of using a flat grace",
+		async ({ observedMs, expectedFinding }) => {
+			const { LSPService, auxWaitBudgetMs } =
+				await import("../../../clients/lsp/index.js");
+			const {
+				recordSuccessfulLspSpawn,
+				_clearSuccessfulLspSpawnHistoryForTests,
+			} = await import("../../../clients/lsp/spawn-history.js");
+			_clearSuccessfulLspSpawnHistoryForTests();
+			recordSuccessfulLspSpawn("typos", observedMs);
+			expect(auxWaitBudgetMs("typos", true, undefined, 1500)).toBe(
+				observedMs === 1000 ? 1500 : 3000,
+			);
+			const service = new LSPService();
+			const auxServer = makeAuxServer("typos");
+			auxServer.spawn.mockImplementation(
+				async () =>
+					new Promise((resolve) =>
+						setTimeout(
+							() => resolve({ process: makeFakeProcess(), source: "test" }),
+							observedMs,
+						),
+					),
+			);
+			getServersForFileWithConfig.mockReturnValue([
+				makePrimaryServer("ts-primary"),
+				auxServer,
+			]);
+			const auxClient = makeClient(2500, [makeDiagnostic("cold aux finding")], {
+				serverId: "typos",
+			});
+			createLSPClient
+				.mockResolvedValueOnce(
+					makeClient(100, [makeDiagnostic("primary-only sentinel")], {
+						serverId: "ts-primary",
+					}),
+				)
+				.mockResolvedValueOnce(auxClient);
+
+			const touch = service.touchFile(FILE, "cold-adaptive", {
+				clientScope: "with-auxiliary",
+				auxiliaryServerIds: ["typos"],
+				collectDiagnostics: true,
+				diagnostics: "document",
+			});
+			await vi.advanceTimersByTimeAsync(observedMs + 2600);
+			const result = await touch;
+			expect(auxClient.waitForDiagnostics).toHaveBeenCalledWith(
+				FILE,
+				expectedFinding ? 3000 : 1500,
+				expect.objectContaining({ minVersion: 0 }),
+			);
+			expect(result?.diags.map((diagnostic) => diagnostic.message)).toContain(
+				expectedFinding ? "cold aux finding" : "primary-only sentinel",
+			);
+		},
+	);
+
+	it("clamps a cold auxiliary budget at 8000 ms", async () => {
+		const { auxWaitBudgetMs } = await import("../../../clients/lsp/index.js");
+		const {
+			recordSuccessfulLspSpawn,
+			_clearSuccessfulLspSpawnHistoryForTests,
+		} = await import("../../../clients/lsp/spawn-history.js");
+		_clearSuccessfulLspSpawnHistoryForTests();
+		recordSuccessfulLspSpawn("typos", 9000);
+		expect(auxWaitBudgetMs("typos", true, undefined, 1500)).toBe(8000);
 	});
 
 	it("still waits for slow primary even if aux settles early", async () => {
@@ -1993,5 +2078,169 @@ describe('#1533 — silent auxiliary honesty on clientScope "all"', () => {
 		expect((settledAt ?? Number.POSITIVE_INFINITY) - startedAt).toBeLessThan(
 			1500,
 		);
+	});
+});
+
+/**
+ * #2324 R2-A — the actual production ordering: the ast-grep napi fallback's
+ * Gate-B check is a synchronous map lookup, while the aux-grace wait that
+ * decides whether to mark a pending late-auxiliary pair runs for up to its
+ * own grace budget (here, up to the aux's own wait). By the time this wait
+ * is ready to decide, THIS touch's napi run (if any) has already recorded
+ * its coverage — the wait consults that record before marking. A clear
+ * issued from napi's side (the F3 fix's first attempt) cannot rely on this
+ * ordering: the mark it would race has not been written yet.
+ */
+describe("R8 — aux grace: ast-grep napi/aux-grace mark ordering (#2324 R2-A)", () => {
+	beforeEach(() => {
+		vi.useFakeTimers();
+		vi.resetModules();
+		getServersForFileWithConfig.mockReset();
+		createLSPClient.mockReset();
+		logLatency.mockReset();
+		delete process.env.PI_LENS_AUX_GRACE_MS;
+	});
+
+	afterEach(() => {
+		vi.useRealTimers();
+		vi.restoreAllMocks();
+		delete process.env.PI_LENS_AUX_GRACE_MS;
+	});
+
+	it("does not mark a pending pair when napi already covered this touch before the wait decides", async () => {
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		// Dynamically imported AFTER vi.resetModules() so this is the SAME
+		// module instance LSPService resolves internally — a static top-level
+		// import would bind to a stale pre-reset instance.
+		const pendingAux =
+			await import("../../../clients/lsp/pending-aux-coverage.js");
+		pendingAux.resetPendingAuxiliaryCoverage();
+		const service = new LSPService();
+		getServersForFileWithConfig.mockReturnValue([
+			makePrimaryServer("ts-primary"),
+			makeAuxServer("ast-grep"),
+		]);
+		// ast-grep's own wait settles SILENTLY (no publish) well inside its
+		// budget — the shape that, absent this fix, marks a pending pair.
+		createLSPClient
+			.mockResolvedValueOnce(makeClient(800, [], { serverId: "ts-primary" }))
+			.mockResolvedValueOnce(makeClient(900, [], { serverId: "ast-grep" }));
+		await service.getClientsForFile(FILE);
+
+		const touchPromise = service.touchFile(FILE, "content", {
+			clientScope: "with-auxiliary",
+			auxiliaryServerIds: ["ast-grep"],
+			collectDiagnostics: true,
+			diagnostics: "document",
+		});
+		// Gate B's napi runner is dispatched CONCURRENTLY with this wait
+		// (dispatcher.ts's Promise.all groups) and settles almost immediately
+		// — a synchronous map lookup plus a fast rule evaluation. Reproduced
+		// here by recording napi's coverage right after the touch starts,
+		// well before the aux's own ~900ms wait or the grace ceiling resolve.
+		pendingAux.recordNapiFallbackCoverage(FILE);
+		await vi.advanceTimersByTimeAsync(3000);
+		await touchPromise;
+
+		expect(pendingAux.hasPendingAuxiliaryCoverage(FILE, "ast-grep")).toBe(
+			false,
+		);
+		pendingAux.resetPendingAuxiliaryCoverage();
+	});
+
+	// #2324 R3-A: the issue's own 68ms race, reproduced against the SPECIFIC
+	// baseline the guard uses. Nothing is pre-warmed — `createLSPClient`
+	// itself takes real (fake-timer) time to resolve, modeling the
+	// spawn+handshake `getClientForFile`/`getAuxiliaryClientsForFile` do on a
+	// COLD touch. `waitStartedAt` (clients/lsp/index.ts) is captured only
+	// AFTER that spawn work resolves — well after this touch's own entry —
+	// so a napi record landing in that spawn window predates `waitStartedAt`
+	// even though it postdates `touchFile`'s own start. Baselining on
+	// `startedAt` (stamped at entry, before any spawn) is what lets a
+	// same-touch napi record survive that window.
+	it("does not mark a pending pair when napi's coverage lands during a COLD spawn's handshake window", async () => {
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const pendingAux =
+			await import("../../../clients/lsp/pending-aux-coverage.js");
+		pendingAux.resetPendingAuxiliaryCoverage();
+		const service = new LSPService();
+		getServersForFileWithConfig.mockReturnValue([
+			makePrimaryServer("ts-primary"),
+			makeAuxServer("ast-grep"),
+		]);
+		const COLD_SPAWN_HANDSHAKE_MS = 400;
+		// No pre-warm call here — this IS the cold spawn. `createLSPClient`
+		// itself is delayed, so `waitStartedAt` (captured only after both
+		// spawns resolve) lands ~400ms after touchFile's own entry.
+		createLSPClient.mockImplementation(
+			(options: { serverId?: string }) =>
+				new Promise((resolve) =>
+					setTimeout(
+						() =>
+							resolve(
+								options?.serverId === "ast-grep"
+									? makeClient(900, [], { serverId: "ast-grep" })
+									: makeClient(100, [], { serverId: "ts-primary" }),
+							),
+						COLD_SPAWN_HANDSHAKE_MS,
+					),
+				),
+		);
+
+		const touchPromise = service.touchFile(FILE, "cold-content", {
+			clientScope: "with-auxiliary",
+			auxiliaryServerIds: ["ast-grep"],
+			collectDiagnostics: true,
+			diagnostics: "document",
+		});
+		// Gate B's napi runner is dispatched CONCURRENTLY with the WHOLE
+		// touch (dispatcher.ts's Promise.all groups), not just with the LSP
+		// wait — it settles almost immediately regardless of how long THIS
+		// touch's own client spawn takes. Recording at 10ms lands well
+		// inside the 400ms cold-spawn handshake window, before
+		// `waitStartedAt` is ever captured, but after `touchFile`'s entry.
+		await vi.advanceTimersByTimeAsync(10);
+		pendingAux.recordNapiFallbackCoverage(FILE);
+		await vi.advanceTimersByTimeAsync(5000);
+		await touchPromise;
+
+		expect(pendingAux.hasPendingAuxiliaryCoverage(FILE, "ast-grep")).toBe(
+			false,
+		);
+		pendingAux.resetPendingAuxiliaryCoverage();
+	});
+
+	it("still marks the pair when napi's coverage predates this touch (stale record)", async () => {
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const pendingAux =
+			await import("../../../clients/lsp/pending-aux-coverage.js");
+		pendingAux.resetPendingAuxiliaryCoverage();
+		const service = new LSPService();
+		getServersForFileWithConfig.mockReturnValue([
+			makePrimaryServer("ts-primary"),
+			makeAuxServer("ast-grep"),
+		]);
+		createLSPClient
+			.mockResolvedValueOnce(makeClient(800, [], { serverId: "ts-primary" }))
+			.mockResolvedValueOnce(makeClient(900, [], { serverId: "ast-grep" }));
+		await service.getClientsForFile(FILE);
+
+		// napi covered this file for an EARLIER revision, well before this
+		// touch even starts — a stale record must not suppress a mark this
+		// touch's silent server genuinely needs delivered later.
+		pendingAux.recordNapiFallbackCoverage(FILE);
+		await vi.advanceTimersByTimeAsync(5000);
+
+		const touchPromise = service.touchFile(FILE, "content-2", {
+			clientScope: "with-auxiliary",
+			auxiliaryServerIds: ["ast-grep"],
+			collectDiagnostics: true,
+			diagnostics: "document",
+		});
+		await vi.advanceTimersByTimeAsync(3000);
+		await touchPromise;
+
+		expect(pendingAux.hasPendingAuxiliaryCoverage(FILE, "ast-grep")).toBe(true);
+		pendingAux.resetPendingAuxiliaryCoverage();
 	});
 });

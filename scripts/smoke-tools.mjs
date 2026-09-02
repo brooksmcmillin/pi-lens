@@ -46,6 +46,7 @@ import https from "node:https";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { gitExecFileSync } from "./lib/git-fixture-env.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..");
@@ -815,8 +816,8 @@ const FORMAT_FIXTURES = [
 		tools: ["shfmt"],
 	},
 	{
-		// css/html/yaml carry a smart-default formatter policy, so the formatter
-		// is auto-selected without project config (no .prettierrc/.biome needed).
+		// css keeps a smart-default formatter policy (biome), so the formatter
+		// is auto-selected without project config.
 		lang: "css",
 		dir: "tests/fixtures/format-smoke/css",
 		file: "messy.css",
@@ -824,6 +825,9 @@ const FORMAT_FIXTURES = [
 		tools: ["biome"],
 	},
 	{
+		// html/yaml have NO unconfigured default (#2384: template markers) —
+		// prettier is only selected with explicit config, so the fixtures ship
+		// a `.prettierrc`, like markdown/json below.
 		lang: "html",
 		dir: "tests/fixtures/format-smoke/html",
 		file: "messy.html",
@@ -1562,7 +1566,7 @@ async function runLspHandshake({ langs, install, verbose }) {
 		// temp workspace one so the copied fixture is treated as in-workspace.
 		if (fx.gitInit) {
 			try {
-				execFileSync("git", ["init", "-q"], {
+				gitExecFileSync(["init", "-q"], {
 					cwd: workspace,
 					stdio: "ignore",
 				});
@@ -2023,7 +2027,7 @@ async function runAutofixSmoke({ langs, install, verbose }) {
 		// "no VCS found"). In production the file lives in the user's repo, so
 		// git-init the workspace to mirror that faithfully.
 		try {
-			execFileSync("git", ["init", "-q"], { cwd: workspace, stdio: "ignore" });
+			gitExecFileSync(["init", "-q"], { cwd: workspace, stdio: "ignore" });
 		} catch {
 			// git unavailable — VCS-gated autofixers will just skip
 		}

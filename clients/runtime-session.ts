@@ -3,6 +3,7 @@ import * as path from "node:path";
 import type { AstGrepClient } from "./ast-grep-client.js";
 import type { BiomeClient } from "./biome-client.js";
 import { resetBoundedTelemetry } from "./bounded-telemetry.js";
+import { rotateMessageEndAttribution } from "./message-end-attribution.js";
 import type { CacheManager } from "./cache-manager.js";
 import { createDeadline, yieldIfOverBudget } from "./cooperative-budget.js";
 import type { DeadCodeClient, DeadCodeResult } from "./dead-code-client.js";
@@ -18,6 +19,8 @@ import { resetPsScriptAnalyzerAvailability } from "./dispatch/runners/psscriptan
 import { resetInstallRetryLatches } from "./dispatch/runners/utils/availability-policy.js";
 import { resetLazyInstallAttempts } from "./dispatch/runners/utils/lazy-installer.js";
 import { resetDispatchAvailabilityState } from "./dispatch/runners/utils/runner-helpers.js";
+import { resetObservedRunnerLatency } from "./dispatch/collect-later-tier.js";
+import { resetPendingRunnerFindings } from "./dispatch/pending-runner-findings.js";
 import type { FileKind } from "./file-kinds.js";
 import { clearAllSessions as clearFileTimeSessions } from "./file-time.js";
 import {
@@ -45,7 +48,10 @@ import { resetCascadeTierSessionState } from "./lsp/cascade-tier.js";
 import type { LSPShutdownOptions } from "./lsp/client.js";
 import { initLSPConfig, loadLSPConfig } from "./lsp/config.js";
 import { resetWorkspaceDiagnosticsCacheSession } from "./lsp/workspace-diagnostics-session.js";
-import { resetDirectLspCommandAvailability } from "./lsp/server.js";
+import {
+	resetDirectLspCommandAvailability,
+	resetLSPCaseSensitivityState,
+} from "./lsp/server.js";
 import { loadLspService } from "./lsp-lazy.js";
 import type { MetricsClient } from "./metrics-client.js";
 import type { OpengrepClient, OpengrepResult } from "./opengrep-client.js";
@@ -76,7 +82,6 @@ import {
 	readProjectSnapshotMeta,
 	saveRuntimeProjectSnapshot,
 } from "./project-snapshot.js";
-import { clearTsconfigPathsCache } from "./review-graph/tsconfig-paths.js";
 import type { RuffClient } from "./ruff-client.js";
 import { scanProjectRules } from "./rules-scanner.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
@@ -115,6 +120,11 @@ import { resetPendingAuxiliaryCoverage } from "./lsp/pending-aux-coverage.js";
 import { resetWorkspaceTopology } from "./workspace-topology.js";
 import { resetZizmorTokenAvailability } from "./zizmor-config.js";
 import { resetSpawnTimeoutCooldowns } from "./spawn-timeout-cooldown.js";
+import { resetTestRunnerDelivery } from "./test-runner-delivery.js";
+import type { SessionStartClassification } from "./session-lifecycle.js";
+
+/** Durable root-identity value on `session_start_total` records. */
+export type SessionStartRootTelemetry = boolean | "unknown";
 
 interface SessionStartDeps {
 	ctxCwd?: string;
@@ -146,6 +156,18 @@ interface SessionStartDeps {
 	 * run. Pass `"full"` from `clients/mcp/session.ts`.
 	 */
 	startupModeOverride?: StartupMode;
+	/**
+	 * #2129 observability: the classification `decideSessionStart` already made
+	 * for this start, before this handler ever runs (a declined start never
+	 * reaches here). Logged alongside `session_start_total`'s `mode` field so a
+	 * log reader can tell "sequential-replacement" from "primary" without
+	 * cross-referencing `concurrent_session_bind`, which only fires for the
+	 * declined side.
+	 */
+	sessionStartClassification?: SessionStartClassification;
+	/** The root-identity input that classification consulted (mirrors
+	 *  `ClassifySessionStartInput.sameRoot`). */
+	sessionStartSameRoot?: boolean;
 	runtime: RuntimeCoordinator;
 	metricsClient: MetricsClient;
 	cacheManager: CacheManager;
@@ -926,8 +948,12 @@ async function buildOrRefreshWordIndex(args: {
 	const snapshot = loadProjectSnapshot(snapshotRoot);
 	const snapshotLoadMs = Date.now() - snapshotLoadStartMs;
 	if (snapshot?.wordIndex) {
-		const { deserializeWordIndex, refreshWordIndexIncrementally } =
-			await import("./word-index.js");
+		const {
+			deserializeWordIndex,
+			refreshWordIndexIncrementally,
+			countWordIndexPostingEntries,
+			estimateWordIndexResidentBytes,
+		} = await import("./word-index.js");
 		const deserializeStartMs = Date.now();
 		const index = deserializeWordIndex(snapshot.wordIndex);
 		const deserializeMs = Date.now() - deserializeStartMs;
@@ -988,6 +1014,8 @@ async function buildOrRefreshWordIndex(args: {
 						durationMs: Date.now() - startMs,
 						indexedFileCount: index.docCount,
 						tokens: index.postings.size,
+						postingEntries: countWordIndexPostingEntries(index),
+						residentBytes: estimateWordIndexResidentBytes(index),
 						truncated: index.truncated,
 						phaseDurationsMs: {
 							snapshotLoadMs,
@@ -1029,8 +1057,12 @@ async function buildOrRefreshWordIndex(args: {
 	// implementation backs this task, the quick-mode warmup call below, AND the
 	// stateless cold-query background trigger in word-index.ts — a bound/skip
 	// -rule change lands once, not in three copies.
-	const { buildWordIndexAsync, collectWordIndexDocs } =
-		await import("./word-index.js");
+	const {
+		buildWordIndexAsync,
+		collectWordIndexDocs,
+		countWordIndexPostingEntries,
+		estimateWordIndexResidentBytes,
+	} = await import("./word-index.js");
 	const docs = await collectWordIndexDocs(
 		analysisRoot,
 		() => runtime.isCurrentSession(sessionGeneration),
@@ -1072,6 +1104,8 @@ async function buildOrRefreshWordIndex(args: {
 		durationMs: Date.now() - startMs,
 		indexedFileCount: runtime.wordIndex.docCount,
 		tokens: runtime.wordIndex.postings.size,
+		postingEntries: countWordIndexPostingEntries(runtime.wordIndex),
+		residentBytes: estimateWordIndexResidentBytes(runtime.wordIndex),
 		truncated: runtime.wordIndex.truncated,
 		skipped: docs.skipped,
 	});
@@ -1560,7 +1594,12 @@ function scheduleStartupScans(
 		// Build (or hydrate) the canonical review graph first. The call graph is a
 		// derived projection of that graph, so its freshness is the review graph's
 		// version/signature—not a second source walk and mtime policy.
-		const sessionFacts = new FactStore();
+		// Subject labels this store's capacity-eviction telemetry distinctly
+		// from the other five production FactStore instances (#2243 review
+		// round 3, F1) — this session-start walk runs BEFORE any dispatch and
+		// can visit every file in the project, so a shared subject would let
+		// it consume the dispatch store's once-per-session ledger slot first.
+		const sessionFacts = new FactStore("runtime-session-call-graph");
 		const graph = await buildOrUpdateGraph(analysisRoot, [], sessionFacts);
 		if (!runtime.isCurrentSession(sessionGeneration)) return;
 		const identity = getReviewGraphCacheIdentity(analysisRoot, graph);
@@ -1733,12 +1772,17 @@ export async function handleSessionStart(
 	deps: SessionStartDeps,
 ): Promise<void> {
 	resetDegradationLedger();
+	resetTestRunnerDelivery();
 	// #1743: the bounded-telemetry per-turn counters. The rising-edge state is
 	// NOT here — it is the ledger's own tally, reset on the line above. These
 	// counters are keyed by turn index, and a new session restarts turn
 	// numbering at 0, so without this a stale count could survive a session
 	// boundary that happened to land on the same index.
 	resetBoundedTelemetry();
+	// #1956 R3: stale message_end events drain after replacement. Rotate the
+	// live anchor into one bounded previous slot so the queued event keeps the
+	// replaced session's attribution until a newer live message_end is seen.
+	rotateMessageEndAttribution();
 	const handlerEnteredAt = Date.now();
 	const sessionStartMs = deps.sessionStartFiredAt ?? handlerEnteredAt;
 	const cwdForTelemetry = deps.ctxCwd ?? process.cwd();
@@ -2101,14 +2145,10 @@ export async function handleSessionStart(
 	clearFileTimeSessions();
 	runtime.complexityBaselines.clear();
 	resetDispatchBaselines(ctxCwd);
-	// #806: drop the shared per-directory marker index (and any consumer
-	// cache layered on top, e.g. tsconfig-paths' matcher cache) so a
-	// `.pi-lens.json`/`tsconfig.json`/workspace-manifest edit made between
-	// sessions is picked up fresh instead of only on process restart — this
-	// also fixes #805's mid-session tsconfig staleness (the matcher cache was
-	// previously session-lived with no reset hook at all).
+	// #806: clear the shared per-directory marker index and registered
+	// topology-derived caches only at session start. Mid-session edits are NOT
+	// detected; #805's tsconfig matcher cache follows the same registry reset.
 	resetWorkspaceTopology();
-	clearTsconfigPathsCache();
 	// #2000: opaque-recovery baselines are keyed cwd:generation (unreachable
 	// after reset) and the git-worktree memo must re-probe after a session
 	// that may have seen a non-git dir become one.
@@ -2128,6 +2168,10 @@ export async function handleSessionStart(
 	// the tool for the rest of the process lifetime. Clear it here, same
 	// boundary as the other per-session caches on this line.
 	resetDispatchAvailabilityState();
+	// Runner collect-later observations and their late findings are session
+	// scoped. A new session must re-probe rather than inherit a process latch.
+	resetObservedRunnerLatency();
+	resetPendingRunnerFindings();
 	// #1995: a command that TIMED OUT (not merely failed a probe) cools down
 	// for the rest of the session so a hot loop of edits cannot hand the same
 	// wedged .cmd shim a second budget. A new session may retry: the executable
@@ -2168,6 +2212,9 @@ export async function handleSessionStart(
 	// #1897: direct-LSP negative availability and bare installer paths are
 	// session facts. A command or PATH entry can appear between sessions.
 	resetDirectLspCommandAvailability();
+	// #2052: a root may not exist when the case-sensitivity probe first sees it.
+	// Re-probe it at the next session boundary after the workspace is created.
+	resetLSPCaseSensitivityState();
 	resetResolvedPathCache();
 	// #1653: pnpm/yarn/bun/npm's availability latches (package-manager.ts) are
 	// module-local, same #1490/#1535 shape as the two lines above — the
@@ -2431,7 +2478,18 @@ export async function handleSessionStart(
 			filePath: cwd,
 			startedAt: new Date(sessionStartMs).toISOString(),
 			durationMs: totalDurationMs,
-			metadata: { mode: startupMode, reason: deps.sessionReason },
+			metadata: {
+				mode: startupMode,
+				reason: deps.sessionReason,
+				// #2129: the root-identity input decideSessionStart consulted,
+				// alongside `mode` — every start reaching this line already
+				// classified `primary`/`sequential-replacement` (a `secondary-root`
+				// start returns before `handleSessionStart` is ever called).
+				classification: deps.sessionStartClassification,
+				// `undefined` is omitted by JSON.stringify. Keep unknown explicit so
+				// strict log readers can distinguish it from legacy omission.
+				sameRoot: deps.sessionStartSameRoot ?? "unknown",
+			},
 		});
 		logHostReadyDelay(deps, cwd);
 		emitSmellsSessionStartLine(dbg, sessionStartMs);
@@ -2858,7 +2916,14 @@ export async function handleSessionStart(
 		filePath: cwd,
 		startedAt: new Date(sessionStartMs).toISOString(),
 		durationMs: totalDurationMs,
-		metadata: { mode: startupMode, reason: deps.sessionReason },
+		metadata: {
+			mode: startupMode,
+			reason: deps.sessionReason,
+			// #2129: see the quick-mode session_start_total record above.
+			classification: deps.sessionStartClassification,
+			// Keep the full path's durable shape identical to quick mode.
+			sameRoot: deps.sessionStartSameRoot ?? "unknown",
+		},
 	});
 	logHostReadyDelay(deps, cwd);
 	emitSmellsSessionStartLine(dbg, sessionStartMs);

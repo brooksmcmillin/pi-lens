@@ -255,7 +255,6 @@ const biomeCheckJsonRunner: RunnerDefinition = {
 	id: "biome-check-json",
 	appliesTo: ["jsts"],
 	priority: PRIORITY.FORMAT_AND_LINT_PRIMARY,
-	enabledByDefault: true,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
 		const cwd = ctx.cwd || path.dirname(ctx.filePath);

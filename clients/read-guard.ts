@@ -255,6 +255,19 @@ const NO_TRIM: RecordCapTrimResult = {
 	evictedGenuineCount: 0,
 };
 
+/**
+ * Which of `evictFile`'s four call sites (#1918) dropped a file's tracked
+ * state. Carried in the `read_file_evicted` metadata so a live regression
+ * names not just which file was evicted but which cap/timer fired.
+ * `idle-timeout` never reaches that metadata (#1918 review F2) — designed
+ * housekeeping stays silent by construction; see `evictFile`'s doc comment.
+ */
+type FileEvictionReason =
+	| "file-cap-consumed"
+	| "file-cap-unconsumed"
+	| "idle-timeout"
+	| "external-delete";
+
 function enforceRecordCapForFile(records: ReadRecord[]): RecordCapTrimResult {
 	if (records.length <= READ_GUARD_MAX_RECORDS_PER_FILE) return NO_TRIM;
 	const excess = records.length - READ_GUARD_MAX_RECORDS_PER_FILE;
@@ -590,7 +603,33 @@ export class ReadGuard {
 		this.fileIdleTimers.delete(filePath);
 	}
 
-	private evictFile(filePath: string): void {
+	/**
+	 * #1918: `enforceRecordCapForFile` (the per-file record cap) is the only
+	 * `read-guard.ts` eviction path #1913 gave a bounded record. This whole-file
+	 * evictor has four call sites — `enforceFileCap`'s consumed-file cap, its
+	 * unconsumed-file cap, `touchFile`'s idle timer, and `forgetPath`'s
+	 * external-delete cleanup — and none of them left any trace. A live
+	 * regression in any of the four (e.g. a cap set too low) dropped a file's
+	 * read/edit history with nothing in `~/.pi-lens/read-guard.log` to show it
+	 * happened.
+	 *
+	 * Follows #1913's aggregate-after-first pattern for the three PRESSURE
+	 * reasons (cap exhaustion, external delete): `incrementDegradationCount`
+	 * keeps the exact per-file eviction tally (and its own power-of-two
+	 * milestone rows in latency.log) while the read-guard.log line fires only
+	 * on the rising edge, so a file evicted repeatedly across a session can't
+	 * flood the log.
+	 *
+	 * `idle-timeout` is deliberately excluded from both the ledger tally and
+	 * the log line (#1918 review F2): idle eviction is designed housekeeping,
+	 * not a fault signal — a read-only session that idles out N files is
+	 * healthy, ordinary behavior, and N is unbounded (every distinct file path
+	 * touched that session is its own ledger subject). Recording it here would
+	 * grow the ledger's tally map without bound and spam `pilens_health` in
+	 * every healthy session, unlike the other three reasons, which are rare by
+	 * construction (only real pressure or an explicit delete reaches them).
+	 */
+	private evictFile(filePath: string, reason: FileEvictionReason): void {
 		this.clearFileTimer(filePath);
 		this.reads.delete(filePath);
 		this.edits.delete(filePath);
@@ -601,6 +640,20 @@ export class ReadGuard {
 		// too, so it never outlives the record it points at.
 		for (const [syntacticKey, stored] of this.knownPathIndex) {
 			if (stored === filePath) this.knownPathIndex.delete(syntacticKey);
+		}
+		if (reason === "idle-timeout") return;
+		const isRisingEdge = incrementDegradationCount({
+			kind: "read-guard-file-evicted",
+			subject: filePath,
+			reason: `evicted (${reason})`,
+		});
+		if (isRisingEdge) {
+			logReadGuardEvent({
+				event: "read_file_evicted",
+				sessionId: this.sessionId,
+				filePath,
+				metadata: { reason },
+			});
 		}
 	}
 
@@ -619,7 +672,12 @@ export class ReadGuard {
 			// eviction. Only consumed reads and rebuildable edit history may expire.
 			if (this.reads.has(filePath) && !this.consumedReadFiles.has(filePath))
 				return;
-			this.evictFile(filePath);
+			// #1918 review F2: this reason is intentionally silent inside
+			// evictFile — idle eviction is routine housekeeping, not a fault, and
+			// every distinct file idling out this session is its own ledger
+			// subject, so recording it would grow unbounded and flood
+			// pilens_health on every healthy session. See evictFile's doc comment.
+			this.evictFile(filePath, "idle-timeout");
 		}, this.idleEvictMs());
 		timer.unref?.();
 		this.fileIdleTimers.set(filePath, timer);
@@ -634,7 +692,7 @@ export class ReadGuard {
 						(this.fileLastUsed.get(a) ?? 0) - (this.fileLastUsed.get(b) ?? 0),
 				)[0];
 			if (!victim) break;
-			this.evictFile(victim);
+			this.evictFile(victim, "file-cap-consumed");
 		}
 		while (this.reads.size > READ_GUARD_MAX_UNCONSUMED_FILES) {
 			const victim = [...this.reads.keys()]
@@ -646,7 +704,7 @@ export class ReadGuard {
 			if (!victim) break;
 			// This is a normal read miss: a later edit must require a fresh read,
 			// never silently allow and never become a permanent hard-block.
-			this.evictFile(victim);
+			this.evictFile(victim, "file-cap-unconsumed");
 		}
 	}
 
@@ -888,7 +946,7 @@ export class ReadGuard {
 			}
 			const verdict = this.blockOrWarn(
 				"zero-read",
-				`🔄 RETRYABLE — Edit without read\n\nYou are trying to edit \`${filePath}\` but have not read it in this conversation.\n\nRead the file first, then retry the edit: \`read path="${filePath}"\``,
+				`🔄 RETRYABLE — Edit without read: you have not read \`${filePath}\` in this conversation. Read it first, then retry: \`read path="${filePath}"\`.`,
 				undefined,
 				effectiveMode,
 			);
@@ -1151,7 +1209,7 @@ export class ReadGuard {
 	 */
 	forgetPath(filePath: string): void {
 		const stored = this.knownPathIndex.get(normalizeEphemeralMapKey(filePath));
-		this.evictFile(stored ?? this.key(filePath));
+		this.evictFile(stored ?? this.key(filePath), "external-delete");
 	}
 
 	/**
@@ -1851,7 +1909,28 @@ export class ReadGuard {
 			timestamp: Date.now(),
 		});
 		if (arr.length > READ_GUARD_MAX_EDITS_PER_FILE) {
-			arr.splice(0, arr.length - READ_GUARD_MAX_EDITS_PER_FILE);
+			const trimmedCount = arr.length - READ_GUARD_MAX_EDITS_PER_FILE;
+			arr.splice(0, trimmedCount);
+			// #1918: the #282-289 doc comment argues this trim is inert in
+			// practice (every consumer reads only the last record or a
+			// bounded relocation window), but an argument is not a record —
+			// if that assumption ever breaks, this is the only signal. Same
+			// aggregate-after-first shape as `read_cap_trimmed` (#1913):
+			// `incrementDegradationCount` keeps the exact per-file tally,
+			// the read-guard.log line fires once on the rising edge.
+			const isRisingEdge = incrementDegradationCount({
+				kind: "read-guard-edits-cap-trim",
+				subject: filePath,
+				reason: `trimmed ${trimmedCount} edit record(s) past cap`,
+			});
+			if (isRisingEdge) {
+				logReadGuardEvent({
+					event: "edits_cap_trimmed",
+					sessionId: this.sessionId,
+					filePath,
+					metadata: { trimmedCount, cappedLength: arr.length },
+				});
+			}
 		}
 		this.edits.set(filePath, arr);
 	}

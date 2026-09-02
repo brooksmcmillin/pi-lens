@@ -91,7 +91,6 @@ const rubocopRunner: RunnerDefinition = {
 	id: "rubocop",
 	appliesTo: ["ruby"],
 	priority: PRIORITY.FORMAT_AND_LINT_PRIMARY,
-	enabledByDefault: true,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
 		const cwd = ctx.cwd || process.cwd();

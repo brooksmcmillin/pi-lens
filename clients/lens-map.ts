@@ -1247,7 +1247,9 @@ function toDisplayPath(p: string, projectRoot: string): string {
 export async function generateLensMap(
 	cwd: string,
 ): Promise<GenerateLensMapResult> {
-	const facts = new FactStore();
+	// Subject labels this store's capacity-eviction telemetry distinctly from
+	// the other five production FactStore instances (#2243 review round 3, F1).
+	const facts = new FactStore("lens-map");
 	// Kick off the git ignored-file listing concurrently with the (much
 	// slower) graph build — both are bounded (10s spawn timeout + the ambient
 	// turn abort signal safeSpawnAsync applies by default).

@@ -29,12 +29,12 @@ import { PathKeyedMap } from "../path-keyed-map.js";
 import { normalizeMapKey } from "../path-utils.js";
 import { loadProjectSnapshot } from "../project-snapshot.js";
 import { buildOrUpdateGraph } from "../review-graph/service.js";
-import { recordDiagnostics } from "../widget-state.js";
+import { classifyDiagnosticTier, recordDiagnostics } from "../widget-state.js";
 import {
 	deserializeWordIndex,
-	removeWordIndexDocument,
+	removeWordIndexDocumentAsync,
 	scheduleWordIndexPersist,
-	updateWordIndexDocument,
+	updateWordIndexDocumentForEdit,
 	WORD_INDEX_MAX_BYTES,
 	type WordIndex,
 } from "../word-index.js";
@@ -47,7 +47,9 @@ import { createMcpHost } from "./host-shim.js";
 // tiers key off a stable FactStore instance across calls, so a fresh FactStore
 // per call would defeat that reuse. Scoped separately from integration.ts's
 // singleton since this file has no dependency on that module's internal state.
-const warmGraphFacts = new FactStore();
+// Subject labels this store's capacity-eviction telemetry distinctly from
+// the other five production FactStore instances (#2243 review round 3, F1).
+const warmGraphFacts = new FactStore("mcp-analyze");
 
 // #536 rider (issue body: "when #348 phase 2 lands, the word-index per-edit
 // update should ride the SAME seam so both indexes stay warm together"):
@@ -224,6 +226,30 @@ const WARMUP_CLIENT_WAIT_MS = 10_000;
 const WARMUP_DIAGNOSTICS_WAIT_MS = 6_000;
 
 /** One diagnostic, flattened to the fields an MCP consumer needs. */
+/**
+ * Split the dispatch `warnings` bucket into real warnings vs advisories using
+ * the ONE severity-projection policy ({@link classifyDiagnosticTier}, #2414/
+ * #2417) so the model-facing counts never present a `hint`/`info`-tier finding
+ * as a warning (#2420, remainder of #2414). The dispatch `semantic` axis (which
+ * also drives blocking) is intentionally NOT consulted or mutated here: this is
+ * a display-count split, not a blocking-decision change. `blockers`
+ * (`semantic:"blocking"`) are computed upstream and never enter this bucket, so
+ * nothing that blocks can stop blocking through this seam. A non-advisory entry
+ * in the bucket (an `error`/`warning`-tier finding routed here as
+ * `semantic:"warning"`/`"none"`) stays counted as a warning exactly as before,
+ * so a mixed file's real warning count is unchanged.
+ */
+export function summarizeWarningTiers(warnings: readonly Diagnostic[]): {
+	warnings: number;
+	advisories: number;
+} {
+	let advisories = 0;
+	for (const w of warnings) {
+		if (classifyDiagnosticTier(w) === "advisory") advisories++;
+	}
+	return { warnings: warnings.length - advisories, advisories };
+}
+
 export interface McpAnalyzeDiagnostic {
 	line?: number;
 	column?: number;
@@ -256,6 +282,18 @@ export interface McpAnalyzeResult {
 		diagnostics: number;
 		blockers: number;
 		warnings: number;
+		/**
+		 * `hint`/`info`-tier findings split OUT of `warnings` (#2420) via the one
+		 * severity-projection policy ({@link classifyDiagnosticTier}). Before
+		 * #2420 the dispatch `semantic` axis folded every non-error tier into the
+		 * warnings bucket, so a file whose only findings were style opinions
+		 * (`no-runtime-typeof`, complexity hints) reported "N warning(s)" on every
+		 * model-facing surface. Advisories are counted here — and still listed in
+		 * `diagnostics` under their own severity — so they stay visible without
+		 * being misrepresented as warnings. The `semantic` axis (which drives
+		 * blocking) is deliberately untouched: this is a display-count split only.
+		 */
+		advisories: number;
 		fixed: number;
 	};
 	diagnostics: McpAnalyzeDiagnostic[];
@@ -484,8 +522,9 @@ export async function analyzeFile(
 		// index with no `forward` map (or none loaded) ⇒ no-op (no incremental
 		// primitive available — the eventual full rebuild covers it); an
 		// oversized file is REMOVED, never partially indexed; the update is
-		// synchronous (no interleaving hazard — MCP is single-process, same as
-		// pi); a successful update schedules the SAME debounced persist
+		// cooperative and serialized through the index's own operation queue
+		// (#2067 AC4), so this seam no longer holds the event loop for a whole
+		// replacement either; a successful update schedules the SAME debounced persist
 		// (`scheduleWordIndexPersist`, `PI_LENS_WORD_INDEX_PERSIST_DEBOUNCE_MS`)
 		// pi's path uses — no second persist mechanism.
 		//
@@ -502,9 +541,12 @@ export async function analyzeFile(
 					const content = fs.readFileSync(absPath, "utf8");
 					const byteLength = Buffer.byteLength(content, "utf-8");
 					if (byteLength > WORD_INDEX_MAX_BYTES) {
-						removeWordIndexDocument(warmIndex, absPath);
+						await removeWordIndexDocumentAsync(warmIndex, absPath);
 					} else {
-						updateWordIndexDocument(warmIndex, { path: absPath, content });
+						await updateWordIndexDocumentForEdit(warmIndex, {
+							path: absPath,
+							content,
+						});
 					}
 					scheduleWordIndexPersist(cwd, warmIndex);
 				} catch {
@@ -531,7 +573,9 @@ export async function analyzeFile(
 	const lsp = lspRunner
 		? {
 				ran:
-					lspRunner.status !== "skipped" && lspRunner.status !== "when_skipped",
+					lspRunner.status !== "skipped" &&
+					lspRunner.status !== "when_skipped" &&
+					lspRunner.status !== "test_file_skipped",
 				status: lspRunner.status,
 				diagnosticCount: lspRunner.diagnosticCount,
 				durationMs: lspRunner.durationMs,
@@ -547,7 +591,12 @@ export async function analyzeFile(
 		counts: {
 			diagnostics: result.diagnostics.length,
 			blockers: result.blockers.length,
-			warnings: result.warnings.length,
+			// #2420: `result.warnings` is the dispatch warnings bucket
+			// (`semantic:"warning"|"none"`), which still carries `hint`/`info`-tier
+			// findings folded in by the runner's severity→semantic map. Project
+			// them out through the shared tier policy so the model sees real
+			// warnings and advisories separately.
+			...summarizeWarningTiers(result.warnings),
 			fixed: result.fixed.length,
 		},
 		lsp,

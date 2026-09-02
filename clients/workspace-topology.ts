@@ -93,6 +93,13 @@ interface DirCacheEntry {
 /** Per-directory marker cache — the shared seam every consumer reads through. */
 const dirMarkerCache = new Map<string, DirCacheEntry>();
 
+/** Downstream memo clears that must follow the topology index reset. */
+const topologyDerivedCacheResets: Array<() => void> = [];
+
+export function registerWorkspaceTopologyReset(reset: () => void): void {
+	topologyDerivedCacheResets.push(reset);
+}
+
 /** Cache for upward marker-walk results, keyed by `${startDir}\0${markerKey}`. */
 type WalkCacheEntry = {
 	dir: string | undefined;
@@ -152,6 +159,7 @@ function touchWalk(key: string, entry: WalkCacheEntry): void {
 export function resetWorkspaceTopology(): void {
 	for (const key of dirMarkerCache.keys()) deleteDirMarker(key);
 	for (const key of walkCache.keys()) deleteWalk(key);
+	for (const reset of topologyDerivedCacheResets) reset();
 }
 
 /**
@@ -244,6 +252,11 @@ export function getDirectoryMarkers(dir: string): DirectoryMarkers {
 		chartYamlPath: resolveMarker("Chart.yaml"),
 	};
 	const entry: DirCacheEntry = { dirMtimeMs, markers, lastUsedAt: Date.now() };
+	const outgoing = dirMarkerCache.get(resolvedDir);
+	if (outgoing?.idleTimer !== undefined) {
+		clearTimeout(outgoing.idleTimer);
+		outgoing.idleTimer = undefined;
+	}
 	dirMarkerCache.set(resolvedDir, entry);
 	touchDirMarker(resolvedDir, entry);
 	while (dirMarkerCache.size > TOPOLOGY_MAX_DIR_ENTRIES) {
@@ -318,6 +331,11 @@ function walkToNearestMatch(
 		dirMtimes,
 		lastUsedAt: Date.now(),
 	};
+	const outgoing = walkCache.get(key);
+	if (outgoing?.idleTimer !== undefined) {
+		clearTimeout(outgoing.idleTimer);
+		outgoing.idleTimer = undefined;
+	}
 	walkCache.set(key, entry);
 	touchWalk(key, entry);
 	while (walkCache.size > TOPOLOGY_MAX_WALK_ENTRIES) {

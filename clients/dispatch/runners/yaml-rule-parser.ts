@@ -17,6 +17,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import yaml from "../../deps/js-yaml.js";
 import { BoundedLruCache } from "../../bounded-cache.js";
+import { compareOrdinal } from "../../string-utils.js";
 
 // --- Types ---
 
@@ -77,7 +78,15 @@ export interface YamlRule {
 
 interface CachedRules {
 	rules: YamlRule[];
-	mtime: number;
+	files: RuleFileStamp[];
+	/** `Date.now()` at the last metadata stat sweep (#2262 round 2). */
+	checkedAtMs: number;
+}
+
+interface RuleFileStamp {
+	path: string;
+	mtimeMs: number;
+	size: number;
 }
 
 interface ContentCachedRules {
@@ -108,6 +117,17 @@ export const OVERLY_BROAD_PATTERNS = [
 /** Maximum complexity score for rules in blockingOnly mode */
 export const MAX_BLOCKING_RULE_COMPLEXITY = 8;
 
+/**
+ * `getCachedRules` re-stats a rule directory's files at most once per this
+ * window (#2262 round 2). `scanner.ts:235` calls `loadYamlRules` per file
+ * scanned; a full metadata sweep (readdir + stat every rule file) on every
+ * warmed call measured 250x master's per-call cost on a mid-size catalog.
+ * Same value and same shape as `file-utils.ts`'s
+ * `PROJECT_IGNORE_FRESHNESS_CADENCE_MS` (#2159/#2071): 2s is the accepted
+ * staleness bound for a rule tree pi-lens itself did not just write.
+ */
+export const RULES_CACHE_FRESHNESS_CADENCE_MS = 2_000;
+
 // --- Caches ---
 
 const rulesCache = new BoundedLruCache<string, CachedRules>(64);
@@ -119,13 +139,6 @@ const contentBlockingRulesCache = new BoundedLruCache<
 >(64);
 
 // --- Public API ---
-
-export function clearRulesCache(): void {
-	rulesCache.clear();
-	blockingRulesCache.clear();
-	contentRulesCache.clear();
-	contentBlockingRulesCache.clear();
-}
 
 export function loadYamlRules(
 	ruleDir: string,
@@ -139,7 +152,14 @@ function findYamlRuleFiles(ruleDir: string): string[] {
 	try {
 		entries = fs
 			.readdirSync(ruleDir, { withFileTypes: true })
-			.sort((a, b) => a.name.localeCompare(b.name));
+			// Ordinal (code-unit), not locale, comparison: this order feeds the
+			// index-aligned file-stamp identity compared in `getCachedRules` and
+			// the hash input order in `loadYamlRulesFresh`. `localeCompare` can
+			// order the same file set differently across locales/processes,
+			// which would desync the two and mint spurious cache misses or
+			// (worse) content-hash collisions across differently-ordered runs.
+			// Same reasoning as `rule-cache.ts`'s `computeRuleHash` (#2155/#2165).
+			.sort((a, b) => compareOrdinal(a.name, b.name));
 	} catch {
 		return [];
 	}
@@ -220,21 +240,47 @@ export function getCachedRules(
 		return [];
 	}
 
-	let currentMtime = 0;
-	try {
-		currentMtime = fs.statSync(ruleDir).mtimeMs;
-	} catch {
-		return [];
-	}
-
 	const cache = severityFilter === "error" ? blockingRulesCache : rulesCache;
 	const cached = cache.get(ruleDir);
-	if (cached && cached.mtime === currentMtime) {
+	const now = Date.now();
+	if (cached && now - cached.checkedAtMs < RULES_CACHE_FRESHNESS_CADENCE_MS) {
+		// Inside the cadence window: no stat sweep at all. `getCachedRules` is
+		// the bundled-catalog path only (project rules route through
+		// `loadYamlRulesFresh` — see `ast-grep-napi.ts`'s route split), and
+		// `scanner.ts:235` calls it once per scanned file, so a per-call
+		// `readdirSync`+`statSync*N` sweep is the hot-path cost this window
+		// exists to remove.
 		return cached.rules;
 	}
 
-	const rules = loadYamlRulesUncached(ruleDir, severityFilter);
-	cache.set(ruleDir, { rules, mtime: currentMtime });
+	const files = findYamlRuleFiles(ruleDir);
+	const fileStamps = files.flatMap((file): RuleFileStamp[] => {
+		try {
+			const stat = fs.statSync(file);
+			return [{ path: file, mtimeMs: stat.mtimeMs, size: stat.size }];
+		} catch {
+			return [];
+		}
+	});
+	const metadataMatches =
+		cached?.files.length === fileStamps.length &&
+		cached.files.every(
+			(file, index) =>
+				file.path === fileStamps[index].path &&
+				file.mtimeMs === fileStamps[index].mtimeMs &&
+				file.size === fileStamps[index].size,
+		);
+	if (cached && metadataMatches) {
+		// Nothing drifted. Re-arm the window from *now* regardless — otherwise
+		// the next call re-stats immediately instead of waiting a full cadence
+		// (the #2260/#2071 "checkedAtMs must re-arm on every check, not only on
+		// a miss" lesson).
+		cached.checkedAtMs = now;
+		return cached.rules;
+	}
+
+	const rules = loadYamlRuleFiles(files, severityFilter);
+	cache.set(ruleDir, { rules, files: fileStamps, checkedAtMs: now });
 	return rules;
 }
 

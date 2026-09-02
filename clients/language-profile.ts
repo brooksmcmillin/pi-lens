@@ -17,7 +17,10 @@ import {
 } from "./language-policy.js";
 import { getSourceFiles } from "./scan-utils.js";
 import { readDirEntriesSafe, shouldRecurseIntoDir } from "./source-walker.js";
-import { findNearestDirWithAnyBasename } from "./workspace-topology.js";
+import {
+	findNearestDirWithAnyBasename,
+	registerWorkspaceTopologyReset,
+} from "./workspace-topology.js";
 import { BoundedLruCache } from "./bounded-cache.js";
 
 /** Every registered kind participates in project-language detection (#894). */
@@ -120,7 +123,8 @@ function hasProjectMarker(projectRoot: string, marker: string): boolean {
 	}
 }
 
-// Process-lifetime memo keyed on projectRoot. Only populated when the
+// Session-lifetime memo keyed on projectRoot. The topology-reset registry
+// clears it at session start. Only populated when the
 // caller did not pass an explicit `sourceFiles` array — the explicit-array
 // case is used by the warmup pipeline to inject pre-collected files and
 // must not pollute the no-arg cache. The synchronous getSourceFiles() call
@@ -130,6 +134,7 @@ const languageProfileCache = new BoundedLruCache<
 	string,
 	ProjectLanguageProfile
 >(32);
+registerWorkspaceTopologyReset(() => languageProfileCache.clear());
 
 export function detectProjectLanguageProfile(
 	projectRoot: string,

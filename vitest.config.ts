@@ -1,4 +1,9 @@
+import * as os from "node:os";
 import { defineConfig } from "vitest/config";
+import {
+	formatTestWorkerBudget,
+	resolveTestWorkerBudget,
+} from "./scripts/lib/worker-budget.mjs";
 
 // Applies to globalSetup as well as workers: ordinary tests never install tools.
 process.env.PI_LENS_DISABLE_TOOL_INSTALL ??= "1";
@@ -44,39 +49,64 @@ const sharedGlobalSetup = [
 	"./tests/support/prewarm-grammars.ts",
 	// After check-build-freshness: the seed analyze runs the in-place build.
 	"./tests/support/prewarm-tool-home.ts",
+	"./tests/support/git-config-guard-setup.ts",
 ];
 
 const sharedSetupFiles = ["./tests/support/vitest-setup.ts"];
 
-// Local runs: cap forks at half the cores (measured 2026-07-29 on a
-// 16-core host, post dead-wait removal: 8 forks ≈ 40s / 9-11 GB peak
-// RSS; 6 forks ≈ 44s / 8 GB; the old uncapped 15 forks gave the same
-// memory for a slower wall). CI keeps vitest's default — its 4-core
-// runner has no worker headroom to give back. Memory-constrained runs:
-// PI_LENS_TEST_MAX_WORKERS=6.
-const sharedMaxWorkers = process.env.CI
-	? undefined
-	: Number(process.env.PI_LENS_TEST_MAX_WORKERS) || "50%";
+// Fork concurrency and per-fork heap ceiling both come from ONE resolver
+// (scripts/lib/worker-budget.mjs), which sizes them against the host's
+// real memory. Before #2042 they were two constants tuned on a 32-core / 68 GB
+// dev host and applied verbatim to CI, where `maxWorkers` fell back to
+// vitest's `availableParallelism() - 1` and bounded worker COUNT while per-fork
+// peak RSS — the axis that actually grows, and native rather than V8 heap — was
+// bounded by nothing. That is how the Unit-tests job got SIGKILLed (exit 137)
+// with no failing assertion. Local runs keep the measured 2026-07-29 posture
+// (8 forks ≈ 40s / 9-11 GB peak RSS; 6 forks ≈ 44s / 8 GB); memory-constrained
+// local runs still use PI_LENS_TEST_MAX_WORKERS=6.
+const testHost = {
+	totalMemMb: Math.round(os.totalmem() / (1024 * 1024)),
+	cpus: os.availableParallelism?.() ?? os.cpus().length,
+	ci: Boolean(process.env.CI),
+	workerOverride: Number(process.env.PI_LENS_TEST_MAX_WORKERS) || undefined,
+	heapOverride: Number(process.env.PI_LENS_TEST_WORKER_HEAP_MB) || undefined,
+};
+const testBudget = resolveTestWorkerBudget(testHost);
+if (testHost.ci) {
+	// One line naming the host and the decision. Without it an exit 137 says
+	// nothing about what the run was allowed to use.
+	console.log(formatTestWorkerBudget(testHost, testBudget));
+}
 
-// Worker heap headroom: the full suite occasionally died with a "Worker
+const sharedMaxWorkers = testBudget.maxWorkers;
+
+// Worker heap headroom (#2042 note first: this ceiling is now DERIVED from the
+// host by the budget resolver above, not the flat 4096 that the paragraph below
+// describes — on a 68 GB dev host it still resolves to 4096, so the reasoning
+// stands unchanged there; on a small CI runner it shrinks, and a fork that
+// blows the smaller ceiling dies with Node's own heap-limit report naming the
+// FILE, which is a far better failure than the OS killing the whole run).
+//
+// The full suite occasionally died with a "Worker
 // exited unexpectedly" + a `node::GetNodeReport` dump. That report is emitted
 // by Node's OWN fatal-error handler (V8 heap-limit reached) — an external OS
 // OOM-kill SIGKILLs with no dump — so the crash is a single long-lived worker
 // hitting its own V8 heap ceiling, not system memory exhaustion (32-core /
 // 68 GB host). With `isolate: true` (vitest's default) each worker's module
 // registry is reset per file, so the native addons (the many tree-sitter
-// grammars + @ast-grep/napi) are re-loaded file-after-file and their off- and
-// on-heap buffers accumulate in the reused worker until a heavy worker tips
-// over. `execArgv` passes --max-old-space-size to every spawned worker,
-// giving that headroom WITHOUT capping worker count (no CI slowdown);
-// aggregate risk is negligible (workers never all peak at once, and 4 GB ×
-// workers ≪ host RAM). Tune via PI_LENS_TEST_WORKER_HEAP_MB. NOTE: Vitest 4
+// grammars + @ast-grep/napi) are re-loaded and re-compiled file after file.
+// CORRECTION (#2042, measured 2026-08-25): this paragraph used to say those
+// buffers "accumulate in the reused worker". They do not — Vitest 4's forks
+// pool with `isolate: true` spawns a FRESH child process per test file (20
+// files at `maxWorkers: 1` produced 20 distinct pids), so a fork's peak is its
+// own file's peak and nothing carries over. The cost is per-file, not
+// cumulative; it is simply large for the tail (p99 1405 MB, max 2267 MB).
+// `execArgv` passes --max-old-space-size to every spawned worker.
+// Tune via PI_LENS_TEST_WORKER_HEAP_MB. NOTE: Vitest 4
 // flattened the config — `execArgv` is a direct `test` field (the v3
 // `poolOptions.forks.execArgv` nesting no longer exists and is silently
 // ignored).
-const sharedExecArgv = [
-	`--max-old-space-size=${process.env.PI_LENS_TEST_WORKER_HEAP_MB || 4096}`,
-];
+const sharedExecArgv = [`--max-old-space-size=${testBudget.heapMb}`];
 
 // Tier 1 fix (#902): these files all transitively drive real tree-sitter
 // grammar parses (via clients/review-graph/builder.js or the project-diagnostics
@@ -104,6 +134,12 @@ const grammarHeavyInclude = [
 	// the exact #255/#902 contention shape this project exists to bound.
 	"tests/clients/tree-sitter-call-graph.test.ts",
 	"tests/clients/module-report-call-graph.test.ts",
+	// #2074: builds several synthetic TypeScript projects end-to-end through the
+	// review-graph extractor. Measured peak RSS 1,417 MB — the same class as its
+	// review-graph siblings above (1,394-1,396 MB) — and the CI unit job was
+	// killed at exit 137 the first time this file ran as a default-project
+	// co-resident.
+	"tests/clients/review-graph/rebuild-cost.test.ts",
 ];
 
 // Tier 2 fix (#902): event-loop *occupancy* guards (measureMaxSyncBlockMs —
@@ -128,6 +164,11 @@ const grammarHeavyInclude = [
 // smaller one) has already fully drained, so the sampler only ever
 // contends with (at most) one other file in this group.
 const timingSensitiveInclude = [
+	// Real node child-process barrier race for #2173; process scheduling makes
+	// this unsuitable for the default fork storm.
+	"tests/clients/instance-registry-race.test.ts",
+	"tests/clients/instance-registry-lock.test.ts",
+	"tests/clients/review-graph-retention.test.ts",
 	"tests/clients/source-walk-occupancy.test.ts",
 	"tests/clients/source-filter-async.test.ts",
 	// Workspace-edit planning also uses the independent occupancy sampler; keep
@@ -173,6 +214,7 @@ const timingSensitiveInclude = [
 	"tests/clients/pipeline-snapshot-occupancy.test.ts",
 	"tests/clients/word-index-async-build.test.ts",
 	"tests/clients/word-index-cooperative-occupancy.test.ts",
+	"tests/clients/word-index-persist-occupancy.test.ts",
 	//   - cooperative-budget: #1215 acceptance screens — sampler-based
 	//     occupancy at 800-item scale plus the abort-latency bound.
 	"tests/clients/cooperative-budget.test.ts",
@@ -181,6 +223,24 @@ const timingSensitiveInclude = [
 	// sampler, and its fail-then-pass pair injects a busy-wait stall, so it
 	// must not compete with a fork storm for CPU turns.
 	"tests/clients/source-walker-io-occupancy.test.ts",
+	// #1980: blocks the real event loop twice (a parked-thread futex wait, then
+	// a busy spin of the same length) and asserts the two classify differently
+	// on the CPU axis, reading process.cpuUsage through getEventLoopStats.
+	// Under the default fork storm a busy spin gets descheduled and burns less
+	// CPU than the wall time it held, which would make the compute case read as
+	// a stall — contention, not a regression, so the cure is a quiet host, not
+	// a looser assertion. timing-sensitive-coverage.test.ts derives this
+	// membership from the process.cpuUsage marker and fails if it is absent.
+	//
+	// Read the `maxWorkers: 2` note below together with this entry. That note
+	// says the lane's heavy neighbour is gone; this file is a NEW one — three
+	// cases that busy-spin a core for ~4.8s in total, which is exactly the
+	// shape that starved a sibling's sampler at cap 2 before. Measured rather
+	// than assumed when this landed: the full lane ran clean 4/4 at cap 2 with
+	// this file in it (19 files, 118 tests, ~49s). If a sampler-based sibling
+	// starts flaking here, this file is the first suspect and the cap is the
+	// first lever.
+	"tests/clients/loop-block-stall-discrimination.test.ts",
 ];
 
 // #1022 fix: the "workspace LSP winner" case in this file spawns a REAL
@@ -204,8 +264,24 @@ const timingSensitiveInclude = [
 // file itself, which corrects the timeout values to match ast-grep's own
 // declared budget instead of a shorter invented constant — belt-and-braces,
 // not a substitute for phasing).
+// Membership is enforced, not conventional (#2344): tests/config/
+// lsp-spawn-heavy-coverage.test.ts derives candidates from the real spawn
+// seams (a bare `launchLSP(` call, a `getServerById(` registry spawn, or an
+// import of the fake-LSP fixture) and fails when a spawning test lands
+// outside this list without a documented exemption — or a member here
+// silently goes stale.
 const lspSpawnHeavyInclude = [
 	"tests/clients/ast-grep-rule-precedence-followups.test.ts",
+	// #2344: npm test leaves this real-child integration suite in the default
+	// project unless it is explicitly phased here. `test:integration` still
+	// selects the same file positionally, while `test:unit` excludes it below.
+	"tests/clients/lsp/integration.test.ts",
+	"tests/clients/lsp/workspace-diagnostics-sweep-attribution.integration.test.ts",
+	// #873/#448: the dispatch LSP runner against a real stdio JSON-RPC server
+	// — a real child spawn through the production LSPService plus a
+	// `.pi-lens/lsp.json` custom server, waiting on real first-document
+	// diagnostics. Same #1022/#2332 contention class as its lane siblings.
+	"tests/clients/dispatch/runners/lsp-real-runner.test.ts",
 ];
 
 // #1920: files that assert REAL wall-clock elapsed-time budgets (Date.now()
@@ -226,6 +302,10 @@ const wallClockBudgetInclude = [
 	"tests/clients/cascade-turn-merge.test.ts",
 	"tests/clients/read-expansion-enrichment.test.ts",
 	"tests/clients/pipeline-lsp-sync.test.ts",
+	// #2358: the flat-server discriminator asserts the real outstanding wedge
+	// window. Keep child-process CPU sampling and this wall-clock lower bound in
+	// the fully serialized, dead-last phase.
+	"tests/clients/lsp/service-notify-cpu-liveness.test.ts",
 ];
 
 export default defineConfig({
@@ -272,7 +352,11 @@ export default defineConfig({
 					// concurrency knobs were unified into the top-level
 					// `maxWorkers` (applies to whichever pool is active; this repo
 					// uses the default `forks` pool everywhere).
-					maxWorkers: 2,
+					// #2042: 2 locally, but derived on CI — these files carry the
+					// suite's largest native footprints (measured 3345 MB and 3853 MB
+					// peak RSS), so two at once is a bigger bite than a small runner
+					// has to give.
+					maxWorkers: testBudget.heavyMaxWorkers,
 					// Distinct groupOrder is required whenever projects have
 					// different `maxWorkers` (Vitest 4 throws otherwise). Side
 					// effect: scheduling groups run as sequential PHASES (group 0
@@ -301,10 +385,16 @@ export default defineConfig({
 					globalSetup: sharedGlobalSetup,
 					setupFiles: sharedSetupFiles,
 					execArgv: sharedExecArgv,
-					// Small cap (not full serialization — these files can still
-					// share the phase) so the event-loop-occupancy sampler in each
-					// (measureMaxSyncBlockMs, see perf-harness.ts) isn't competing
-					// with a large fork pool for CPU turns while it's mid-measurement.
+					// At most two at a time so the event-loop-occupancy sampler in each
+					// (measureMaxSyncBlockMs, see perf-harness.ts) contends with at most
+					// one sibling fork for CPU turns while it's mid-measurement, not the
+					// full-suite fork storm. This lane briefly ran at 1 while
+					// word-index-per-edit lived here: that file rebuilt a 401-document
+					// index (~1.2s, retry: 2) and at cap 2 starved
+					// performance-report-occupancy's sampler on a loaded runner (107ms
+					// against a 75ms budget, 3/3 retries). #2254 converted that guard to
+					// a load-invariant clock-read count and moved it out of this lane, so
+					// the heavy neighbour is gone and the cap returns to 2.
 					maxWorkers: 2,
 					// Its own phase, after both "default" and "grammar-heavy" drain
 					// (required anyway once maxWorkers differs from "default" — see
@@ -321,15 +411,14 @@ export default defineConfig({
 				test: {
 					name: "lsp-spawn-heavy",
 					include: lspSpawnHeavyInclude,
-					exclude: sharedExclude,
+					exclude: [...sharedExclude, ...unitOnlyExclude],
 					globalSetup: sharedGlobalSetup,
 					setupFiles: sharedSetupFiles,
 					execArgv: sharedExecArgv,
-					// Full serialization, not just a cap: this is a single file, so
-					// there are no siblings to share the phase with anyway — the
-					// point is to guarantee zero overlap with the "default" project's
-					// fork storm (the actual contention source, see #1022 above), not
-					// to bound intra-project concurrency.
+					// Full serialization, not just a cap: four files, but the point
+					// is to guarantee zero overlap with the "default" project's
+					// fork storm (the actual contention source, see #1022/#2332
+					// above), not to bound intra-project concurrency.
 					maxWorkers: 1,
 					// Last phase: by the time this runs, "default", "grammar-heavy",
 					// and "timing-sensitive" have all fully drained, so the real

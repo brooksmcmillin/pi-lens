@@ -86,6 +86,42 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 // for a wedged/daemonized child that never emits 'close' at all — the
 // #1679 hang this constant exists to bound.
 const CHILD_SPAWN_TIMEOUT_MS = 45_000;
+// #2306: once the source pane has rendered a stable, non-empty
+// `sourceLen` this many CONSECUTIVE polls (250ms apart) while the sentinel
+// still hasn't matched, the mismatch is real — further polling only wastes
+// time up to the full --timeout. Requiring >1 consecutive identical reading
+// tolerates the ordinary one-or-two-poll lag between the match-count and
+// source-editor components mounting (see the poll loop's own comment).
+const STABLE_UNMATCHED_POLLS_REQUIRED = 3;
+
+// #2306: pure poll-to-poll state machine for the fail-fast decision,
+// exported so the "is this a real, stable mismatch?" logic can be unit
+// tested without a live Chrome/CDP harness. `prevState` is the previous
+// call's return value (or the initial state below); returns the next
+// state, including `concludedEarly` once a non-empty `scrape.sourceLen`
+// has repeated for STABLE_UNMATCHED_POLLS_REQUIRED consecutive calls with
+// the sentinel still unmatched.
+export const initialPollStability = {
+	stableUnmatchedPolls: 0,
+	lastUnmatchedSourceLen: null,
+	concludedEarly: false,
+};
+
+export function trackStableUnmatched(scrape, prevState) {
+	if (scrape?.found && !scrape?.sentinelFound && scrape.sourceLen > 0) {
+		const stableUnmatchedPolls =
+			scrape.sourceLen === prevState.lastUnmatchedSourceLen
+				? prevState.stableUnmatchedPolls + 1
+				: 1;
+		return {
+			stableUnmatchedPolls,
+			lastUnmatchedSourceLen: scrape.sourceLen,
+			concludedEarly: stableUnmatchedPolls >= STABLE_UNMATCHED_POLLS_REQUIRED,
+		};
+	}
+	return initialPollStability;
+}
+
 const PORT = Number(process.env.PILENS_PLAYGROUND_PORT) || 9224;
 const CHROME_SCRIPT = join(__dirname, "playground-chrome.mjs");
 const CDP_SCRIPT = join(__dirname, "playground-cdp.mjs");
@@ -226,37 +262,136 @@ async function ensureChrome() {
 	process.stderr.write(`# [playground] chrome launch: ${Date.now() - t0}ms\n`);
 }
 
-function buildPlaygroundUrl(ruleYaml, code, lang) {
+// #2208: the playground's URL-hash state (ast-grep/ast-grep.github.io,
+// website/src/components/astGrep/state.ts) matches rules built from
+// `state.config` against `state.source` — `state.query` only feeds the
+// separate "Pattern" mode and is ignored in Config mode. This harness
+// previously wrote the caller's code into `query`, so the hash carried no
+// `source` field at all; the playground's `{...defaultState, ...parsed}`
+// merge silently fell back to its own hardcoded sample source instead of
+// erroring, so every run graded the rule against that fixed sample and
+// never against the code the caller passed in.
+export function buildPlaygroundUrl(ruleYaml, code, lang) {
 	const payload = {
 		mode: "Config",
 		lang,
-		query: code,
+		query: "",
 		rewrite: "",
 		config: ruleYaml,
+		source: code,
 	};
 	const b64 = Buffer.from(JSON.stringify(payload), "utf8").toString("base64");
 	return `${PLAYGROUND_URL}#${b64}`;
 }
 
 // JS expression evaluated in the page to scrape the playground result.
-// We don't depend on a specific DOM selector (the playground's React
-// internals change between builds); we scan the rendered text.
+// The match-count scan stays selector-free (rendered text), but the
+// SENTINEL check deliberately anchors to the first `.half`'s Monaco
+// editor under `main.playground` — body-wide text let a rule note in
+// the config pane satisfy it (#2253). If the playground's pane layout
+// changes, that selector is the thing to revisit.
 //
 // IMPORTANT: the expression is passed through spawn argv, which on
 // Windows strips backslashes. We avoid regex backslash escapes
 // entirely — character classes with the raw chars, or split string
 // matches, survive the round-trip.
 //
+// The first non-empty line of the caller's `--code`, used as a sentinel
+// (see buildScrapeExpr's `sentinelB64` param). Only the first line: #2208
+// fix-round finding F2 established (via a real 122-line fixture) that the
+// Monaco source editor virtualizes — the top of the document renders, but
+// a line far down the viewport does not. Checking the first non-empty line
+// is the one check that survives virtualization for a source of any length.
+export function firstNonEmptyLine(code) {
+	const line = code.split(/\r?\n/).find((l) => l.trim().length > 0);
+	return line ? line.trim() : null;
+}
+
 // The playground shows one of:
 //   "Found N match(es)."        — the rule fired N times against the
-//                                  default source (the playground uses a
-//                                  hardcoded source; user code via the URL
-//                                  hash is ignored in Config mode)
+//                                  caller's source (state.source, set via
+//                                  the payload above)
 //   "No match found."           — the rule did not fire (0 matches)
 //   an error message             — the rule's YAML/pattern was rejected
-function buildScrapeExpr() {
+//
+// #2208 fix-round finding F2: the 0-match bug this file fixes could recur
+// through upstream schema drift alone — e.g. the playground renaming
+// `state.source` to something else would make our `source: code` write
+// land nowhere, and the playground would again silently grade its own
+// hardcoded sample. That failure mode looks identical to a legitimate
+// {ok:true, matches:0}: nothing here would throw or time out. `sentinelB64`
+// is the caller's first source line (see firstNonEmptyLine), base64-encoded
+// with the same routine ast-grep's own playground uses for its URL hash
+// (utoa: btoa(unescape(encodeURIComponent(text)))) so it survives Windows
+// argv's backslash-stripping (no `\`-containing regex/string literals to
+// mangle) and round-trips non-ASCII. The playground always echoes the
+// source into the DOM (it's the editor's own content), so if that line is
+// genuinely absent from the rendered text, the source never reached the
+// engine — regardless of what "Found N match(es)" says.
+// #2208 fix-round finding F6: the gutter-number filter used to clamp to
+// `n <= count` (the MATCH count), not the source's own line count. A match
+// on line 3 of a 3-line file reported `lines: [1]` — the filter discarded
+// any gutter number above the match count, even though the match count and
+// the line number it occurred on are unrelated quantities (one match can
+// sit on line 200 of a 5-line... no, on line 200 of a 200-line file with
+// only 1 match). `maxLine` is the caller's own source line count — a gutter
+// number can never legitimately exceed it, whereas the match count can be
+// smaller than the line a match falls on.
+export function buildScrapeExpr(sentinelB64, maxLine) {
+	const sentinelExpr = sentinelB64
+		? `decodeURIComponent(escape(atob("${sentinelB64}")))`
+		: "null";
+	const maxLineExpr =
+		Number.isFinite(maxLine) && maxLine > 0
+			? String(Math.floor(maxLine))
+			: "Infinity";
+	// #2208 fix-round F2, verified against the live upstream site: Monaco
+	// renders the space between tokens as U+00A0 (non-breaking space), not
+	// U+0020 — confirmed by dumping charCodes around a rendered "const a = 1"
+	// (codes 99,111,110,115,116,160,97,160,61,160,49 — 160 is nbsp). A
+	// sentinel built from the caller's raw source (regular spaces) would
+	// never match the rendered page for any line containing a space, which
+	// looked exactly like the schema-drift condition this check exists to
+	// catch. Normalize nbsp to a regular space on the page side before
+	// comparing. (`" "` here is resolved to the real character by this
+	// file's own parser, not sent over argv as a `\`-escape, so it survives
+	// Windows argv's backslash-stripping same as the rest of this
+	// function's argv-safety already does.)
+	//
+	// #2306: a tab in the source has the same problem — Monaco does not
+	// render it as U+0009 either, so a sentinel built from the caller's raw
+	// source (a literal tab) never matched the rendered page for any line
+	// containing one, misreporting a genuine run as schema drift exactly
+	// like the nbsp case above. Rather than hand-list every substitution
+	// Monaco happens to use, collapse EVERY run of whitespace-like
+	// characters (tab, nbsp, regular space) to one space on BOTH sides of
+	// the comparison — the decoded sentinel string itself, not just the
+	// page's rendered text — so a difference in run length (one tab vs. a
+	// run of spaces/nbsp) can no longer defeat the match.
 	return `(() => {
-		const text = document.body.innerText || "";
+		const text = (document.body.innerText || "").split(" ").join(" ");
+		const sourceEditor = document.querySelector(
+			".playground > .half:first-child .monaco-editor",
+		);
+		const collapseWhitespace = (s) =>
+			s
+				.split(String.fromCharCode(9))
+				.join(" ")
+				.split(String.fromCharCode(160))
+				.join(" ")
+				.split(" ")
+				.filter(Boolean)
+				.join(" ");
+		const sourceTextNormalized = collapseWhitespace(
+			sourceEditor?.textContent || "",
+		);
+		const sentinel = ${sentinelExpr};
+		const normalizedSentinel =
+			sentinel === null ? null : collapseWhitespace(sentinel);
+		const sentinelFound =
+			normalizedSentinel === null ||
+			sourceTextNormalized.indexOf(normalizedSentinel) !== -1;
+		const maxLine = ${maxLineExpr};
 		const m = text.match(/Found[ \\t]+(\\d+)[ \\t]+match/i);
 		if (m) {
 			const count = parseInt(m[1], 10);
@@ -264,15 +399,27 @@ function buildScrapeExpr() {
 				.map((el) => (el.textContent || "").trim())
 				.filter((t) => /^[0-9]+$/.test(t))
 				.map((t) => parseInt(t, 10))
-				.filter((n) => n >= 1 && n <= count)
+				.filter((n) => n >= 1 && n <= maxLine)
 				.filter((n, i, a) => a.indexOf(n) === i)
 				.sort((a, b) => a - b);
-			return { found: true, count, lines };
+			return {
+				found: true,
+				count,
+				lines,
+				sentinelFound,
+				sourceLen: sourceTextNormalized.length,
+			};
 		}
 		if (/no[ \\t]+match[ \\t]+found/i.test(text)) {
-			return { found: true, count: 0, lines: [] };
+			return {
+				found: true,
+				count: 0,
+				lines: [],
+				sentinelFound,
+				sourceLen: sourceTextNormalized.length,
+			};
 		}
-		return { found: false, text: text.slice(0, 800) };
+		return { found: false, text: text.slice(0, 800), sentinelFound };
 	})()`;
 }
 
@@ -355,18 +502,40 @@ async function main() {
 		log(`targetId: ${tid}`);
 		await runCdp(["nav", targetId, url]);
 		// 5) Poll for the "Found N match(es)" line (or "No match found").
+		const sentinelLine = firstNonEmptyLine(code);
+		const sentinelB64 = sentinelLine
+			? Buffer.from(sentinelLine, "utf8").toString("base64")
+			: null;
+		const maxLine = code.split(/\r?\n/).length;
+		const scrapeExpr = buildScrapeExpr(sentinelB64, maxLine);
 		const deadline = Date.now() + opts.timeoutMs;
 		let scrape = null;
 		let polls = 0;
+		// #2306: distinguishes "the source pane is still mounting" (sourceLen
+		// changing between polls — keep waiting) from "the pane is done
+		// rendering and the sentinel genuinely doesn't match" (sourceLen
+		// stable and non-zero — stop early instead of burning the full
+		// --timeout). trackStableUnmatched resets on any change so a
+		// still-painting pane never counts toward the early exit.
+		let pollStability = initialPollStability;
 		while (Date.now() < deadline) {
 			polls++;
-			const out = await runCdp(["eval", targetId, buildScrapeExpr()]);
+			const out = await runCdp(["eval", targetId, scrapeExpr]);
 			try {
 				scrape = JSON.parse(out);
 			} catch {
 				scrape = null;
 			}
-			if (scrape?.found) break;
+			// On a warm/reused Chrome the match count can render a poll or
+			// two before the source editor paints its own content — `Found
+			// N match(es)` and the source pane are two independently-mounted
+			// Vue components, not one atomic update. Keep polling until the
+			// sentinel also lands, exactly as we already do for the match
+			// text itself; a genuine drift (source never arrives) still
+			// exhausts the deadline and reports below, just slower.
+			if (scrape?.found && scrape?.sentinelFound) break;
+			pollStability = trackStableUnmatched(scrape, pollStability);
+			if (pollStability.concludedEarly) break;
 			if (polls % 10 === 0) log(`poll #${polls}: still waiting…`);
 			await new Promise((r) => setTimeout(r, 250));
 		}
@@ -377,6 +546,35 @@ async function main() {
 				rule_id: rule.id,
 				error: "playground did not render 'Found N match(es)' within timeout",
 				debug_text: scrape?.text || null,
+				engine_ms: Date.now() - startMs,
+			};
+			console.error(JSON.stringify(result));
+			process.exit(3);
+		}
+		// #2208 fix-round F2: a {found:true} scrape only means the page
+		// rendered SOME match-count text — it says nothing about whose
+		// source produced it. If the caller's own first source line never
+		// made it into the rendered page, the playground graded a source
+		// we didn't send (its own default sample, or a stale one from an
+		// upstream field-name change) — never trust the count in that case.
+		if (!scrape.sentinelFound) {
+			// #2306: a stable, non-empty `sourceLen` rules out "the pane is
+			// still mounting" — it does NOT pick between the two remaining
+			// causes. A Monaco whitespace substitution collapseWhitespace
+			// doesn't yet cover and upstream schema drift (state.source
+			// renamed/moved, so the page renders its own default sample)
+			// both render a stable pane the sentinel can't be found in, so
+			// the early-exit message narrows the search without claiming
+			// which one it is.
+			const result = {
+				ok: false,
+				rule_id: rule.id,
+				error: pollStability.concludedEarly
+					? "caller's source did not appear in the playground page after whitespace normalization, and the source pane is stable (done rendering) — either a sentinel-normalization mismatch in this harness (an un-normalized Monaco whitespace substitution) or upstream schema drift (state.source field renamed/moved, leaving the page's own default sample rendered), not a real 0-match result"
+					: "caller's source did not appear in the playground page after whitespace normalization — likely a sentinel-normalization mismatch in this harness (an un-normalized Monaco whitespace substitution) or upstream schema drift (state.source field renamed/moved), not a real 0-match result",
+				matches_reported_by_page: scrape.count,
+				polls,
+				concluded_early: pollStability.concludedEarly,
 				engine_ms: Date.now() - startMs,
 			};
 			console.error(JSON.stringify(result));

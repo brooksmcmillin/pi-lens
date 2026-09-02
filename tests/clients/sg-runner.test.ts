@@ -2,14 +2,28 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { capKilledSpawnResult } from "../support/spawn-shapes.js";
 import { removeTempDirSync } from "./test-utils.js";
 
-const safeSpawnAsync = vi.fn();
-const safeSpawn = vi.fn();
-const getSgCommand = vi.fn();
-const ensureTool = vi.fn();
+// All hoisted: importing `spawn-shapes.js` below reaches the mocked safe-spawn
+// module, so every mock factory here runs during the import phase — a plain
+// `const` would still be in its temporal dead zone when it does.
+const { safeSpawnAsync, safeSpawn, getSgCommand, ensureTool } = vi.hoisted(
+	() => ({
+		safeSpawnAsync: vi.fn(),
+		safeSpawn: vi.fn(),
+		getSgCommand: vi.fn(),
+		ensureTool: vi.fn(),
+	}),
+);
 
-vi.mock("../../clients/safe-spawn.js", () => ({ safeSpawnAsync, safeSpawn }));
+// `importOriginal`, not a bare stub: the cap-kill tests build the REAL
+// truncation result, and that needs safe-spawn's own `SpawnFailureError`.
+vi.mock("../../clients/safe-spawn.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../../clients/safe-spawn.js")>()),
+	safeSpawnAsync,
+	safeSpawn,
+}));
 vi.mock("../../clients/installer/index.js", () => ({
 	ensureTool,
 	// #1500: the durable-absence arm reads the installer's own attempt record to
@@ -644,6 +658,94 @@ describe("SgRunner", () => {
 			const result = await new SgRunner().exec(["scan", "--json", "."]);
 			expect(result.matches).toEqual([]);
 			expect(result.error).toBeDefined();
+		});
+
+		// #2100: the cap kill is OUR SIGTERM, so a truncated run also looks like
+		// a killed spawn. Read after the failure gate, these guards could only
+		// ever describe a tool that exited before the signal reached it.
+		it("names the truncation, not a CLI failure, when the output cap killed the exec", async () => {
+			safeSpawnAsync.mockResolvedValueOnce(
+				capKilledSpawnResult({ stdout: '[{"file":"src/a.js"' }),
+			);
+			const { SgRunner } = await import("../../clients/sg-runner.js");
+
+			const result = await new SgRunner().exec(["scan", "--json", "."]);
+
+			expect(result.matches).toEqual([]);
+			expect(result.error).toContain("truncated");
+		});
+
+		// #2100 review F5: the invariant this PR writes into AGENTS.md says every
+		// maxOutputBytes is pinned by a test. These four are the rest of the tree.
+		it.each([
+			[
+				"execRaw",
+				(runner: { execRaw: (args: string[]) => Promise<unknown> }) =>
+					runner.execRaw(["run", "-p", "x", "--lang", "ts", "."]),
+			],
+			[
+				"exec",
+				(runner: { exec: (args: string[]) => Promise<unknown> }) =>
+					runner.exec(["scan", "--json", "."]),
+			],
+			[
+				"tempScanDetailedAsync",
+				(runner: {
+					tempScanDetailedAsync: (
+						dir: string,
+						id: string,
+						yaml: string,
+					) => Promise<unknown>;
+				}) => runner.tempScanDetailedAsync(os.tmpdir(), "r", "id: r\n"),
+			],
+			[
+				"tempScanWithFixAsync",
+				(runner: {
+					tempScanWithFixAsync: (
+						dir: string,
+						id: string,
+						yaml: string,
+						apply: boolean,
+					) => Promise<unknown>;
+				}) => runner.tempScanWithFixAsync(os.tmpdir(), "r", "id: r\n", false),
+			],
+		])(
+			"caps %s output so its truncation guard can fire",
+			async (_name, call) => {
+				safeSpawnAsync.mockResolvedValue({
+					status: 0,
+					stdout: "[]",
+					stderr: "",
+					error: undefined,
+				});
+				const { SgRunner } = await import("../../clients/sg-runner.js");
+
+				// biome-ignore lint/suspicious/noExplicitAny: one shared arrow per row
+				await call(new SgRunner() as any);
+
+				expect(safeSpawnAsync).toHaveBeenCalledWith(
+					expect.any(String),
+					expect.any(Array),
+					expect.objectContaining({ maxOutputBytes: 8 * 1024 * 1024 }),
+				);
+			},
+		);
+
+		it("names the truncation, not a CLI failure, when the output cap killed a scan", async () => {
+			safeSpawnAsync.mockResolvedValueOnce(
+				capKilledSpawnResult({ stdout: '[{"file":"src/a.js"' }),
+			);
+			const { SgRunner } = await import("../../clients/sg-runner.js");
+
+			const result = await new SgRunner().tempScanDetailedAsync(
+				os.tmpdir(),
+				"agent-rule",
+				"id: x\nlanguage: TypeScript\nrule: { kind: call_expression }",
+			);
+
+			expect(result.matches).toEqual([]);
+			expect(result.failure).toBe("parse-failure");
+			expect(result.error).toContain("truncated");
 		});
 	});
 

@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { fetchLivePrBody } from "./check-pr-body.mjs";
 
 const CLOSE_KEYWORD = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b/gi;
 const CLOSE_ISSUE = /\s*:?[ \t]*#(\d+)/y;
@@ -75,8 +76,29 @@ function eventPayload() {
 	return JSON.parse(readFileSync(eventPath, "utf8"));
 }
 
-function lintPullRequest() {
-	const result = lintCloseKeywords(eventPayload().pull_request?.body ?? "");
+export async function lintPullRequest(
+	fetchImpl = globalThis.fetch,
+	event = eventPayload(),
+) {
+	const pullRequest = event.pull_request;
+	if (!pullRequest || !process.env.GITHUB_REPOSITORY)
+		throw new Error("Pull request event and GITHUB_REPOSITORY are required");
+	// Same fail-closed reporting contract as verifyMergedPullRequest: a fetch
+	// failure states plainly that the check did not run, instead of surfacing
+	// as a bare thrown message that reads like a broken script (worst for
+	// fork PRs hitting a transient 5xx).
+	let body;
+	try {
+		({ body } = await fetchLivePrBody(pullRequest, fetchImpl));
+	} catch (error) {
+		const reason = error instanceof Error ? error.message : String(error);
+		console.error(
+			`::error::Close-keyword syntax check could not fetch the live PR body, so it did not run: ${reason}`,
+		);
+		process.exitCode = 1;
+		return;
+	}
+	const result = lintCloseKeywords(body);
 	if (!result.valid) {
 		console.error(INVALID_CLOSE_KEYWORD_MESSAGE);
 		for (const line of result.offendingLines) {
@@ -105,16 +127,54 @@ function issueState(repository, number) {
 	}
 }
 
-function verifyMergedPullRequest() {
-	const event = eventPayload();
+/**
+ * @param {typeof fetch} [fetchImpl]
+ * @param {object} [event] injectable event payload (tests only; defaults to
+ *   the real GITHUB_EVENT_PATH payload)
+ * @param {(repository: string, number: number) => string} [getIssueState]
+ *   injectable issue-state lookup (tests only; defaults to the real `gh api`
+ *   call)
+ */
+export async function verifyMergedPullRequest(
+	fetchImpl = globalThis.fetch,
+	event = eventPayload(),
+	getIssueState = issueState,
+) {
 	const pullRequest = event.pull_request;
 	const repository = process.env.GITHUB_REPOSITORY;
 	if (!pullRequest || !repository)
 		throw new Error("Pull request event and GITHUB_REPOSITORY are required");
 
-	const { issues } = parseCloseKeywords(pullRequest.body ?? "");
+	// #2086: the closed-event payload's body is a snapshot from when the PR
+	// closed. A rerun of this check after the body was edited post-merge must
+	// see the edit, not replay the stale snapshot. Reuses check-pr-body.mjs's
+	// fetchLivePrBody (PR #2085/#2086's own root-cause sibling) rather than
+	// hand-rolling a second live-body fetch -- same env vars, same request
+	// shape.
+	//
+	// #2267 F2: uses the STRICT fetchLivePrBody here, not resolveLivePrBody's
+	// warn-and-fall-back-to-stale-payload wrapper. That wrapper is right for
+	// the advisory body LINTER (check-pr-body.mjs), where degrading to the
+	// stale body on a fetch hiccup is an acceptable trade. It is wrong for
+	// this post-merge verification GATE: a gate that silently falls back and
+	// reports "OK" on a fetch failure is indistinguishable from a gate that
+	// actually checked and found nothing wrong -- the exact "fails open"
+	// shape #2086 was filed to close, just moved one level up. A fetch
+	// failure here fails the check LOUD instead.
+	let liveBody;
+	try {
+		({ body: liveBody } = await fetchLivePrBody(pullRequest, fetchImpl));
+	} catch (error) {
+		const reason = error instanceof Error ? error.message : String(error);
+		console.error(
+			`::error::Post-merge close verification could not fetch the live PR body, so it did not run: ${reason}`,
+		);
+		process.exitCode = 1;
+		return;
+	}
+	const { issues } = parseCloseKeywords(liveBody);
 	const unresolved = issues
-		.map((number) => ({ number, state: issueState(repository, number) }))
+		.map((number) => ({ number, state: getIssueState(repository, number) }))
 		.filter(({ state }) => state !== "closed");
 	if (unresolved.length === 0) {
 		console.log(
@@ -173,15 +233,16 @@ Post-merge close verification found issue(s) that were not closed: ${details}. G
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
-	try {
-		if (process.argv[2] === "--lint-pr") lintPullRequest();
-		else if (process.argv[2] === "--verify-merged") verifyMergedPullRequest();
+	(async () => {
+		if (process.argv[2] === "--lint-pr") await lintPullRequest();
+		else if (process.argv[2] === "--verify-merged")
+			await verifyMergedPullRequest();
 		else
 			throw new Error(
 				"Usage: node scripts/check-close-keywords.mjs --lint-pr|--verify-merged",
 			);
-	} catch (error) {
+	})().catch((error) => {
 		console.error(error instanceof Error ? error.message : error);
 		process.exitCode = 1;
-	}
+	});
 }

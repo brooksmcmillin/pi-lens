@@ -29,7 +29,11 @@ import { _resetSubagentModeForTests } from "../../../clients/subagent-mode.js";
 import { setupTestEnvironment } from "../test-utils.js";
 
 const logLatencyMock = vi.fn();
-vi.mock("../../../clients/latency-logger.js", () => ({
+
+vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
+	...(await importActual<
+		typeof import("../../../clients/latency-logger.js")
+	>()),
 	logLatency: (entry: unknown) => logLatencyMock(entry),
 }));
 
@@ -134,6 +138,19 @@ describe("workspace sweep hold (#1618 review round 1)", () => {
 
 		releaseOuter();
 		expect(isWorkspaceSweepActive()).toBe(false);
+	});
+
+	it("2b. a second module evaluation sees the first evaluation's hold", async () => {
+		const first = await import("../../../clients/lsp/workspace-sweep-hold.js");
+		vi.resetModules();
+		const second = await import("../../../clients/lsp/workspace-sweep-hold.js");
+		const release = first.acquireWorkspaceSweepHold();
+
+		expect(second).not.toBe(first);
+		expect(second.isWorkspaceSweepActive()).toBe(true);
+
+		release();
+		expect(second.isWorkspaceSweepActive()).toBe(false);
 	});
 
 	it("3. releasing the same hold twice is a no-op — it never affects a later, unrelated hold", () => {

@@ -113,6 +113,35 @@ describe("#1095 diagnostic-binding — createDiskBindingCache (I5, I6, I8)", () 
 		).toBe(false);
 	});
 
+	it("same-mtime-bucket rewrite with a different size is not masked by the mtime-only memo (#2300)", () => {
+		const original = "const x = 1;\n";
+		const file = mkTmpFile("a.ts", original);
+		// Pin the mtime up front so the rewrite below can be forced back to it.
+		// Read the pinned value BACK rather than asserting against the nominal
+		// one: `mtimeMs` is derived from a nanosecond timestamp, so a whole-ms
+		// Date can come back as e.g. 1787865954578.999 on ext4. Only the
+		// round-tripped value is stable across two identical `utimesSync` calls,
+		// and it is what the memo actually caches.
+		const pinnedMtimeMs = Date.now();
+		fs.utimesSync(file, new Date(pinnedMtimeMs), new Date(pinnedMtimeMs));
+		const observedMtimeMs = fs.statSync(file).mtimeMs;
+		const cache = createDiskBindingCache();
+		const stored = { contentHash: hashDiagnosticContent(original) };
+		// Warm the memo: caches {mtimeMs, size} of the original content.
+		expect(cache.boundToCurrentDisk(file, stored)).toBe(true);
+		// External rewrite with DIFFERENT SIZE content, forced back to the SAME
+		// mtime the memo already cached (the NTFS-granularity collision, #2287
+		// N1 — never same-length content, which is why the size axis matters).
+		const rewritten = "const x = 22222222222;\n"; // different length than original
+		fs.writeFileSync(file, rewritten);
+		fs.utimesSync(file, new Date(pinnedMtimeMs), new Date(pinnedMtimeMs));
+		expect(fs.statSync(file).mtimeMs).toBe(observedMtimeMs);
+		// A mtime-only memo would reuse the cached hash of the OLD content and
+		// wrongly report `true`. The size axis forces a re-hash, which correctly
+		// reports `false` against the still-stale `stored` binding.
+		expect(cache.boundToCurrentDisk(file, stored)).toBe(false);
+	});
+
 	it("disk stat/read failure with a contentHash present → unknown, never false (T8, #533)", () => {
 		const cache = createDiskBindingCache();
 		const missing = path.join(os.tmpdir(), "pi-lens-does-not-exist-1095.ts");

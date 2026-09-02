@@ -36,6 +36,8 @@ import {
 } from "../path-utils.js";
 import { collectProjectSourceFilesWithBudgetAsync } from "../project-scan-policy.js";
 import { getReviewGraphMaxFilesDerived } from "../project-scale.js";
+import { compareOrdinal } from "../string-utils.js";
+import { BoundedLruCache } from "../bounded-cache.js";
 import {
 	jsTsCandidatePaths,
 	resolveAliasedImport,
@@ -156,6 +158,59 @@ export const REVIEW_GRAPH_SOURCE_EXTENSIONS: readonly string[] =
 	MAIN_KIND_EXTENSIONS;
 const CHANGED_SYMBOLS_PREFIX = "session.reviewGraph.changedSymbols:";
 const extractorCache = new Map<string, TreeSitterSymbolExtractor | null>();
+const REVIEW_GRAPH_MAX_WARM_WORKSPACES = 8;
+
+// Walker output is raw, so its spelling still needs the canonical path seam.
+// Keep that expensive raw-to-canonical step per project across builds, bounded
+// like TestRunnerClient's instance-lifetime canonicalRootMemo (#2058). A new
+// spelling is resolved once; repeated builds reuse the result. The project
+// memo is bounded and workspace-cache clears provide a freshness boundary.
+const REVIEW_GRAPH_SOURCE_PATH_MEMO_ENTRIES = 16_384;
+interface SourcePathMemo {
+	cache: BoundedLruCache<string, string>;
+	normalizeCalls: { value: number };
+}
+const _sourcePathMemos = new Map<string, SourcePathMemo>();
+
+function sourcePathMemo(cwd: string): SourcePathMemo {
+	const key = normalizeMapKey(path.resolve(cwd));
+	const existing = _sourcePathMemos.get(key);
+	if (existing) {
+		// The workspace map is also bounded LRU; a hit must refresh its recency.
+		_sourcePathMemos.delete(key);
+		_sourcePathMemos.set(key, existing);
+		return existing;
+	}
+	const memo: SourcePathMemo = {
+		cache: new BoundedLruCache<string, string>(
+			REVIEW_GRAPH_SOURCE_PATH_MEMO_ENTRIES,
+		),
+		normalizeCalls: { value: 0 },
+	};
+	_sourcePathMemos.set(key, memo);
+	while (_sourcePathMemos.size > REVIEW_GRAPH_MAX_WARM_WORKSPACES) {
+		const oldest = _sourcePathMemos.keys().next().value;
+		if (oldest === undefined) break;
+		_sourcePathMemos.delete(oldest);
+	}
+	return memo;
+}
+
+function normalizeGraphSourcePath(memo: SourcePathMemo, raw: string): string {
+	const cached = memo.cache.get(raw);
+	if (cached !== undefined) return cached;
+	const normalized = normalizeMapKey(raw);
+	// A missing file is normalized through resolveNonExisting, which lowercases
+	// its tail. It may be recreated with different casing before the next build,
+	// so never make that spelling a process-lifetime memo entry (#2072 F2).
+	if (fs.existsSync(raw)) memo.cache.set(raw, normalized);
+	memo.normalizeCalls.value++;
+	return normalized;
+}
+
+export function _resetReviewGraphSourcePathMemoForTests(): void {
+	_sourcePathMemos.clear();
+}
 
 // IN-FLIGHT Promise cache: deduplicates CONCURRENT buildOrUpdateGraph calls for
 // the same (cwd, changedFiles). A separate workspace cache below preserves the
@@ -205,7 +260,6 @@ interface WorkspaceGraphCacheEntry {
 	idleTimer?: ReturnType<typeof setTimeout>;
 }
 const _workspaceGraphCache = new Map<string, WorkspaceGraphCacheEntry>();
-const REVIEW_GRAPH_MAX_WARM_WORKSPACES = 8;
 const REVIEW_GRAPH_IDLE_EVICT_MS_DEFAULT = 20 * 60_000;
 // A workspace-wide clear must invalidate builds for workspaces that are not
 // resident yet, too. This process-wide component therefore survives cache
@@ -272,6 +326,7 @@ function evictWorkspaceGraph(
 			_buildCache.delete(buildKey);
 		}
 	}
+	_sourcePathMemos.delete(key);
 	_workspaceCacheEpochs.set(key, (_workspaceCacheEpochs.get(key) ?? 0) + 1);
 	_workspaceGraphCache.delete(key);
 }
@@ -307,8 +362,15 @@ function setWorkspaceGraph(
 	epoch?: number,
 ): boolean {
 	if (epoch !== undefined && workspaceCacheEpoch(key) !== epoch) return false;
+	const previous = _workspaceGraphCache.get(key);
+	if (previous) clearWorkspaceGraphTimer(previous);
+	// #2255: bound what the cache RETAINS. The caller keeps its full-graph
+	// reference for the current turn; only the retained copy is trimmed, so an
+	// over-budget repo never accumulates an unbounded graph across the process.
+	const boundedGraph = retainedGraph(key, entry.graph);
 	const resident: WorkspaceGraphCacheEntry = {
 		...entry,
+		graph: boundedGraph,
 		lastUsedAt: Date.now(),
 	};
 	_workspaceGraphCache.set(key, resident);
@@ -365,6 +427,7 @@ export type GraphBuildInfo = {
 	skipReason?: string;
 	sourceFileCount?: number;
 	sourceFileCountTruncated?: boolean;
+	pathNormalizeCalls?: number;
 	maxFileCount?: number;
 	/** Reason the graph was successfully built but persisted only partially. */
 	persistReason?: string;
@@ -392,6 +455,7 @@ function graphLogMetadata(
 		mode?: ReviewGraphBuildMode;
 		sourceFileCount?: number;
 		sourceFileCountTruncated?: boolean;
+		pathNormalizeCalls?: number;
 	} = {},
 ): ReviewGraphBuildMetadata {
 	return makeReviewGraphBuildMetadata(graph, options);
@@ -477,8 +541,14 @@ export function clearReviewGraphWorkspaceCache(cwd?: string): void {
 		for (const entry of _workspaceGraphCache.values())
 			clearWorkspaceGraphTimer(entry);
 		_workspaceGraphCache.clear();
+		_sourcePathMemos.clear();
 		_workspaceCacheEpoch++;
 		_sizeSkipVerdicts.clear();
+		// #2255 review V2: the non-cache retention registry is memory-attribution
+		// state for THIS session's graphs. Without this, a new session's
+		// `memory_sample` kept attributing the previous session's graph, which the
+		// registry still held a live `WeakRef` to.
+		_retainedGraphSites.clear();
 	} else {
 		const normalized = normalizeMapKey(cwd);
 		// Compare the key's WORKSPACE half only, both sides canonicalized the same
@@ -497,6 +567,7 @@ export function clearReviewGraphWorkspaceCache(cwd?: string): void {
 			(_workspaceCacheEpochs.get(normalized) ?? 0) + 1,
 		);
 		_workspaceGraphCache.delete(normalized);
+		_sourcePathMemos.delete(normalized);
 		_sizeSkipVerdicts.delete(normalized);
 	}
 	_lastGraphBuildInfo = { reused: false, mode: "full", graphChanged: true };
@@ -522,26 +593,249 @@ export interface ReviewGraphWorkspaceCacheSnapshot {
 	totalNodes: number;
 	/** Sum of `graph.edges.length` across every resident entry. */
 	totalEdges: number;
+	/** Estimated bytes retained by the graph stores, using bounded counters. */
+	residentBytes: number;
 }
 
 /**
- * O(cache-entries) snapshot of the resident workspace graph cache — NOT
- * O(nodes)/O(edges): only `.size`/`.length` are read per entry, never the
- * graph contents themselves (#1123 item 2 memory-attribution sample). Cache
- * entries are per-cwd and normally number 1 (a session_start clears the
- * cache), so this is cheap enough for a per-N-turn sample.
+ * Measured heap coefficients for the graph's current object shape. An
+ * isolated store of the production node and edge objects was forced through
+ * GC and divided by its census: 450.5 bytes per node and 243.0 bytes per
+ * edge, including the two edge-index references. The measurement used 18,695
+ * nodes and 48,815 edges across three identical runs with --expose-gc.
+ */
+const REVIEW_GRAPH_NODE_RESIDENT_BYTES = 450.5;
+const REVIEW_GRAPH_EDGE_RESIDENT_BYTES = 243.0;
+
+export function estimateReviewGraphStoreBytes(
+	totalNodes: number,
+	totalEdges: number,
+): number {
+	return (
+		totalNodes * REVIEW_GRAPH_NODE_RESIDENT_BYTES +
+		totalEdges * REVIEW_GRAPH_EDGE_RESIDENT_BYTES
+	);
+}
+
+// --- In-memory live-graph byte bound (#2255) ---
+// The persist element cap (`GRAPH_PERSIST_MAX_ELEMENTS_DEFAULT`) guards the
+// synchronous serialize+gzip spike; it trims only the on-disk snapshot. The live
+// `ReviewGraph` had no bound and grew with project size — the second unbounded
+// dispatch store behind the #2240 OOM (FactStore's fileFacts was the first,
+// bounded in #2243). This bound caps the RETAINED live graph by estimated
+// resident bytes, using the same centrality-ranked induced-subgraph selection the
+// snapshot uses (`capGraphForPersist`).
+//
+// A graph has TWO process-lifetime retention sites, not one: the workspace cache,
+// and `session.reviewGraph` on a caller's FactStore — and two of those stores are
+// module-scope (`dispatch/integration.ts`, `mcp/analyze.ts`, the latter never
+// cleared). Bounding only the cache left the full graph resident on the fact, so
+// both sites go through `retainedGraph` below, memoized per graph instance so the
+// two sites share ONE bounded object instead of trimming twice (#2255 review F2).
+export const GRAPH_MAX_IN_MEMORY_BYTES_DEFAULT = 512 * 1024 * 1024;
+
+function graphMaxInMemoryBytes(): number {
+	const raw = Number(process.env.PI_LENS_GRAPH_MAX_IN_MEMORY_BYTES);
+	return Number.isFinite(raw) && raw > 0
+		? raw
+		: GRAPH_MAX_IN_MEMORY_BYTES_DEFAULT;
+}
+
+/**
+ * The graph any process-lifetime holder may RETAIN, bounded to the in-memory byte
+ * budget (#2255). Callers keep the full graph for the current turn; only what
+ * outlives the turn goes through here.
+ *
+ * In budget, this is an O(1) size read returning the same object, so a normal
+ * repository sees no behavior change. Over budget, the byte budget converts to an
+ * element cap using the graph's own node/edge split, then `capGraphForPersist`
+ * runs one centrality selection.
+ *
+ * Deliberately NOT memoized. A memo keyed on the source graph short-circuits the
+ * budget check, so a graph mutated in place after its first trim keeps answering
+ * with the stale earlier result (#2255 review R4). Callers that retain the same
+ * graph at two sites dedupe at the CALL SITE by capping once and sharing the
+ * result, which is both simpler and staleness-free.
+ *
+ * The result is marked `partial` AND `capTrimmed`. `partial` keeps every
+ * coverage-reporting consumer honest; `capTrimmed` records the narrower fact that
+ * the source WALK was complete and only size was cut, which is what lets the two
+ * incremental-base gates rebuild from it instead of forcing a full walk every
+ * turn. `capTrimmed` is process-local and stripped before persist.
+ */
+function retainedGraph(cwd: string, graph: ReviewGraph): ReviewGraph {
+	const nodes = graph.nodes.size;
+	const edges = graph.edges.length;
+	const bytes = estimateReviewGraphStoreBytes(nodes, edges);
+	const budget = graphMaxInMemoryBytes();
+	// Deliberately NOT skipped for an already-partial graph. A full build over the
+	// source-walk entry budget sets `partial: true` on a graph that is still the
+	// full walked set, so skipping partials exempted the exact population this
+	// bound targets (#2255 review F3). The byte check below is the only
+	// idempotence this needs: a graph already under budget is returned as-is.
+	if (bytes <= budget) return graph;
+	// Scale both axes by the same budget/bytes ratio so the element cap preserves
+	// the graph's node/edge split; `capGraphForPersist` re-splits the cap by that
+	// same ratio, landing the capped graph at or under the budget.
+	const elementCap = Math.max(
+		1,
+		Math.floor(((nodes + edges) * budget) / bytes),
+	);
+	let capped = capGraphForPersist(cwd, graph, elementCap);
+	// Floor: a selection that retains NOTHING is never an acceptable answer for a
+	// non-empty input — it silently converts "too big" into "no graph at all", and
+	// every query against it reads as a clean empty result (#2255 review F4).
+	// Fall back to a deterministic head slice, which is still bounded by the same
+	// element cap but cannot be empty, and say so under its own ledger kind so the
+	// two outcomes are never blended into one record.
+	if (capped.nodes.size === 0 && nodes > 0) {
+		capped = headSliceGraph(graph, elementCap);
+		incrementDegradationCount({
+			kind: "review-graph-memory-cap-floor",
+			subject: cwd,
+			reason: `centrality selection retained 0 of ${nodes} nodes at cap ${elementCap}; fell back to a ${capped.nodes.size}-node head slice`,
+		});
+	}
+	const cappedNodes = capped.nodes.size;
+	const cappedEdges = capped.edges.length;
+	capped.persistCoverage = {
+		...(capped.persistCoverage ?? graphCoverage(capped, elementCap)),
+		partial: true,
+		capTrimmed: true,
+	};
+	incrementDegradationCount({
+		kind: "review-graph-memory-cap",
+		subject: cwd,
+		reason: `live graph ${nodes}n/${edges}e ~${Math.round(
+			bytes / (1024 * 1024),
+		)}MiB over ${Math.round(
+			budget / (1024 * 1024),
+		)}MiB budget; trimmed to ${cappedNodes}n/${cappedEdges}e ~${Math.round(
+			estimateReviewGraphStoreBytes(cappedNodes, cappedEdges) / (1024 * 1024),
+		)}MiB`,
+	});
+	return capped;
+}
+
+/**
+ * Deterministic non-empty fallback selection: take whole per-file node groups in
+ * stable path order until the element cap is reached, then the induced edges.
+ * Used only when centrality selection returns nothing (#2255 review F4).
+ */
+function headSliceGraph(graph: ReviewGraph, cap: number): ReviewGraph {
+	const nodeBudget = Math.max(
+		1,
+		Math.floor(
+			(cap * graph.nodes.size) / (graph.nodes.size + graph.edges.length),
+		),
+	);
+	const keptIds = new Set<string>();
+	for (const [id] of graph.nodes) {
+		if (keptIds.size >= nodeBudget) break;
+		keptIds.add(id);
+	}
+	const nodes = new Map([...graph.nodes].filter(([id]) => keptIds.has(id)));
+	const edgeBudget = Math.max(0, cap - nodes.size);
+	const edges = graph.edges
+		.filter((edge) => keptIds.has(edge.from) && keptIds.has(edge.to))
+		.slice(0, edgeBudget);
+	const sliced: ReviewGraph = {
+		...graph,
+		nodes,
+		edges,
+		edgesByFrom: new Map(),
+		edgesByTo: new Map(),
+		fileNodes: new Map(),
+		symbolNodesByFile: new Map(),
+		changedSymbolsByFile: new Map(),
+		persistCoverage: undefined,
+	};
+	rebuildIndexes(sliced);
+	return sliced;
+}
+
+/**
+ * Store the graph on `session.reviewGraph` bounded (#2255 review F2). Two of the
+ * FactStores this reaches are module-scope, so an unbounded value here outlives
+ * every session and defeats the cache bound entirely.
+ *
+ * This bounds the VALUE, not the store, and deliberately adds no second bounding
+ * mechanism to `FactStore` (#2243 owns the store-level discipline).
+ *
+ * `sessionFacts` entry COUNT (a separate #2240 sibling, #2282) is now bounded
+ * too: `session.baseline.${path}` (`dispatch/dispatcher.ts`),
+ * `session.baseline.cascade.${path}` (`dispatch/integration.ts`), and this
+ * module's own `changedSymbols`/`entitySnapshot` per-file keys all go through
+ * `FactStore.setBoundedSessionFact`/`getBoundedSessionFact`, an LRU-count-cap
+ * sibling of the per-file `fileFacts` bound reusing the SAME discipline
+ * (#2243), not a second mechanism. `session.reviewGraph` itself stays on the
+ * plain, unbounded `sessionFacts` map — its key is a fixed singleton, so the
+ * VALUE bound below is what keeps IT small, not an entry-count cap.
+ */
+function setSessionReviewGraphFact(
+	cwd: string,
+	facts: FactStore,
+	graph: ReviewGraph,
+): void {
+	const retained = retainedGraph(cwd, graph);
+	// The raw `cwd` is the registry key on purpose. Folding it here would add a
+	// `realpath` probe to EVERY build, and the key only has to be stable: the
+	// snapshot deduplicates by graph object IDENTITY, so two spellings of one
+	// workspace cost one extra bounded registry slot and never a double count.
+	registerRetainedGraph(`fact:${cwd}`, retained);
+	facts.setSessionFact("session.reviewGraph", retained);
+}
+
+// Retention sites OUTSIDE the workspace cache — today `session.reviewGraph` on a
+// caller's FactStore. Held through `WeakRef` so registering adds no retention of
+// its own: a graph whose only remaining referent is this registry is collectable,
+// and its slot is pruned on the next write or read. Keyed by site, so the map is
+// bounded by the number of distinct workspaces, not by builds (#2255 review F2).
+const _retainedGraphSites = new Map<string, WeakRef<ReviewGraph>>();
+
+function registerRetainedGraph(site: string, graph: ReviewGraph): void {
+	for (const [key, ref] of _retainedGraphSites) {
+		if (ref.deref() === undefined) _retainedGraphSites.delete(key);
+	}
+	_retainedGraphSites.set(site, new WeakRef(graph));
+}
+
+/**
+ * O(retention-sites) snapshot of every resident review graph — NOT
+ * O(nodes)/O(edges): only `.size`/`.length` are read per graph, never the graph
+ * contents themselves (#1123 item 2 memory-attribution sample).
+ *
+ * Counts the workspace cache AND the non-cache retention sites, deduplicated by
+ * object IDENTITY. Reading the cache alone reported zero bytes while a full graph
+ * was still resident on `session.reviewGraph` — the sample read clean during the
+ * exact heap exhaustion it is cited to prove against (#2255 review F2). The
+ * dedupe matters because the bound hands both sites the same bounded object;
+ * summing them would double-count the common case.
  */
 export function getReviewGraphWorkspaceCacheSnapshot(): ReviewGraphWorkspaceCacheSnapshot {
 	let totalNodes = 0;
 	let totalEdges = 0;
-	for (const entry of _workspaceGraphCache.values()) {
-		totalNodes += entry.graph.nodes.size;
-		totalEdges += entry.graph.edges.length;
+	const counted = new Set<ReviewGraph>();
+	const count = (graph: ReviewGraph): void => {
+		if (counted.has(graph)) return;
+		counted.add(graph);
+		totalNodes += graph.nodes.size;
+		totalEdges += graph.edges.length;
+	};
+	for (const entry of _workspaceGraphCache.values()) count(entry.graph);
+	for (const [key, ref] of _retainedGraphSites) {
+		const graph = ref.deref();
+		if (graph === undefined) {
+			_retainedGraphSites.delete(key);
+			continue;
+		}
+		count(graph);
 	}
 	return {
 		cacheEntries: _workspaceGraphCache.size,
 		totalNodes,
 		totalEdges,
+		residentBytes: estimateReviewGraphStoreBytes(totalNodes, totalEdges),
 	};
 }
 
@@ -550,6 +844,41 @@ export function _getReviewGraphWorkspaceCacheKeysForTests(): string[] {
 	return [..._workspaceGraphCache.entries()]
 		.sort(([, a], [, b]) => a.lastUsedAt - b.lastUsedAt)
 		.map(([key]) => key);
+}
+
+/** Test-only replacement seam for the workspace idle-eviction family. */
+export function _setReviewGraphWorkspaceEntryForTests(
+	key: string,
+	graph: ReviewGraph,
+): void {
+	setWorkspaceGraph(key, {
+		signature: "test",
+		fileSignatures: new Map(),
+		graph,
+	});
+}
+
+/** Test-only drive of the session-fact retention seam the build paths use. */
+export function _setSessionReviewGraphFactForTests(
+	cwd: string,
+	facts: FactStore,
+	graph: ReviewGraph,
+): void {
+	setSessionReviewGraphFact(cwd, facts, graph);
+}
+
+/** Test-only view of what a graph's coverage looks like once persisted. */
+export function _persistedCoverageForTests(
+	coverage: ReviewGraphPersistCoverage | undefined,
+): ReviewGraphPersistCoverage | undefined {
+	return stripProcessLocalCoverage(coverage);
+}
+
+/** Test-only read of the exact retained graph for a raw cache key (#2255). */
+export function _getReviewGraphWorkspaceGraphForTests(
+	key: string,
+): ReviewGraph | undefined {
+	return _workspaceGraphCache.get(key)?.graph;
 }
 
 export function _getReviewGraphCacheStateForTests(cwd: string):
@@ -875,7 +1204,7 @@ async function sourceSignatureMapAsync(
 
 function sourceSignatureFromMap(signatures: Map<string, string>): string {
 	return [...signatures.entries()]
-		.sort(([a], [b]) => a.localeCompare(b))
+		.sort(([a], [b]) => compareOrdinal(a, b))
 		.map(([file, signature]) => `${file}:${signature}`)
 		.join("|");
 }
@@ -1184,6 +1513,8 @@ export function getReviewGraphSizeSkipVerdict(
 
 interface GraphSourceFilesResult {
 	files: string[];
+	/** Cache misses in the raw-walker path normalizer for this build. */
+	pathNormalizeCalls: number;
 	/** Number of source files represented by this walk; a lower bound when truncated. */
 	sourceFileCount: number;
 	/** Per-build file cap captured before the asynchronous walk begins. */
@@ -1210,6 +1541,8 @@ export function _setReviewGraphEntryCounterForTests(
 export async function getGraphSourceFiles(
 	cwd: string,
 ): Promise<GraphSourceFilesResult> {
+	const sourceMemo = sourcePathMemo(cwd);
+	const normalizeCallsBefore = sourceMemo.normalizeCalls.value;
 	// Async, chunked-yield walk (identical output to the sync collector) so the
 	// per-edit cascade graph rebuild doesn't block the event loop on a large repo.
 	//
@@ -1250,6 +1583,8 @@ export async function getGraphSourceFiles(
 		// so the caller's `length > maxGraphFiles` check still trips.
 		return {
 			files: collected,
+			pathNormalizeCalls:
+				sourceMemo.normalizeCalls.value - normalizeCallsBefore,
 			sourceFileCount: collected.length,
 			maxFileCount: maxGraphFiles,
 			entryBudgetExceeded,
@@ -1258,7 +1593,7 @@ export async function getGraphSourceFiles(
 	const result: string[] = [];
 	let sinceYield = 0;
 	for (const raw of collected) {
-		const file = normalizeMapKey(raw);
+		const file = normalizeGraphSourcePath(sourceMemo, raw);
 		const kind = detectFileKind(file);
 		// isWithinReviewGraphSizeLimit does a statSync per file — yield periodically
 		// so the size-limit filter (one stat each) can't hold the loop in one burst.
@@ -1280,6 +1615,7 @@ export async function getGraphSourceFiles(
 	}
 	return {
 		files: result,
+		pathNormalizeCalls: sourceMemo.normalizeCalls.value - normalizeCallsBefore,
 		sourceFileCount: result.length,
 		maxFileCount: maxGraphFiles,
 		entryBudgetExceeded,
@@ -1287,20 +1623,97 @@ export async function getGraphSourceFiles(
 }
 
 function addNode(graph: ReviewGraph, node: ReviewGraphNode): void {
+	// #2074: keep symbolNodesByFile live here, not only in rebuildIndexes, so the
+	// incremental path can drop its terminal O(graph) reindex. Re-adding an id
+	// already in the map must not push a duplicate — rebuildIndexes starts from
+	// empty maps, so the two producers stay consistent.
+	const isNew = !graph.nodes.has(node.id);
 	graph.nodes.set(node.id, node);
 	if (node.kind === "file" && node.filePath) {
 		graph.fileNodes.set(node.filePath, node.id);
+		return;
+	}
+	if (isNew && node.kind === "symbol" && node.filePath) {
+		const ids = graph.symbolNodesByFile.get(node.filePath) ?? [];
+		ids.push(node.id);
+		graph.symbolNodesByFile.set(node.filePath, ids);
 	}
 }
 
-function addEdge(graph: ReviewGraph, edge: ReviewGraphEdge): void {
-	graph.edges.push(edge);
+function indexEdge(graph: ReviewGraph, edge: ReviewGraphEdge): void {
 	const from = graph.edgesByFrom.get(edge.from) ?? [];
 	from.push(edge);
 	graph.edgesByFrom.set(edge.from, from);
 	const to = graph.edgesByTo.get(edge.to) ?? [];
 	to.push(edge);
 	graph.edgesByTo.set(edge.to, to);
+}
+
+/**
+ * Drop `edge` from both adjacency buckets. This is kept for the single-edge
+ * dedupe path; multi-file removal uses `unindexEdges` below so a shared hub
+ * bucket is scanned once rather than once per removed edge (#2074).
+ */
+function unindexEdge(graph: ReviewGraph, edge: ReviewGraphEdge): void {
+	const from = graph.edgesByFrom.get(edge.from);
+	if (from) {
+		// Count the full bucket as the linear `indexOf` scan's bounded work.
+		_rebuildCounters.removeOwnedEdgePositions += from.length;
+		const at = from.indexOf(edge);
+		if (at >= 0) from.splice(at, 1);
+		if (from.length === 0) graph.edgesByFrom.delete(edge.from);
+	}
+	const to = graph.edgesByTo.get(edge.to);
+	if (to) {
+		_rebuildCounters.removeOwnedEdgePositions += to.length;
+		const at = to.indexOf(edge);
+		if (at >= 0) to.splice(at, 1);
+		if (to.length === 0) graph.edgesByTo.delete(edge.to);
+	}
+}
+
+/**
+ * Remove a batch of edges from both live adjacency indexes. Each touched
+ * bucket is filtered once, so the work is proportional to the bucket lengths,
+ * not to the product of a hub's fan-in and its removed-edge count (#2074).
+ */
+function unindexEdges(
+	graph: ReviewGraph,
+	removedEdges: ReadonlySet<ReviewGraphEdge>,
+): void {
+	const fromIds = new Set<string>();
+	const toIds = new Set<string>();
+	for (const edge of removedEdges) {
+		fromIds.add(edge.from);
+		toIds.add(edge.to);
+	}
+	for (const fromId of fromIds) {
+		const bucket = graph.edgesByFrom.get(fromId);
+		if (!bucket) continue;
+		const kept: ReviewGraphEdge[] = [];
+		for (const edge of bucket) {
+			_rebuildCounters.removeOwnedEdgePositions++;
+			if (!removedEdges.has(edge)) kept.push(edge);
+		}
+		if (kept.length === 0) graph.edgesByFrom.delete(fromId);
+		else graph.edgesByFrom.set(fromId, kept);
+	}
+	for (const toId of toIds) {
+		const bucket = graph.edgesByTo.get(toId);
+		if (!bucket) continue;
+		const kept: ReviewGraphEdge[] = [];
+		for (const edge of bucket) {
+			_rebuildCounters.removeOwnedEdgePositions++;
+			if (!removedEdges.has(edge)) kept.push(edge);
+		}
+		if (kept.length === 0) graph.edgesByTo.delete(toId);
+		else graph.edgesByTo.set(toId, kept);
+	}
+}
+
+function addEdge(graph: ReviewGraph, edge: ReviewGraphEdge): void {
+	graph.edges.push(edge);
+	indexEdge(graph, edge);
 }
 
 function rebuildIndexes(graph: ReviewGraph): void {
@@ -1637,9 +2050,28 @@ function persistedData(pending: PendingPersist): PersistedGraphData {
 			: undefined,
 		nodes: Array.from(pending.graph.nodes.entries()),
 		edges: pending.graph.edges,
-		coverage: pending.graph.persistCoverage,
+		coverage: stripProcessLocalCoverage(pending.graph.persistCoverage),
 		gitStamp: pending.gitStamp,
 	};
+}
+
+/**
+ * Drop coverage fields that are true only of THIS process's graph before the
+ * snapshot is written (#2255 review F5).
+ *
+ * `capTrimmed` means "this process walked every file, then cut for size", which
+ * is what makes a graph a safe incremental base. A snapshot read back in a later
+ * process carries no such guarantee — the tree may have changed underneath it —
+ * so persisting the marker would let a hydrated graph claim base-eligibility
+ * nobody established, the #936 laundering shape. `partial` itself is preserved,
+ * so the snapshot still reports honestly that it is incomplete.
+ */
+function stripProcessLocalCoverage(
+	coverage: ReviewGraphPersistCoverage | undefined,
+): ReviewGraphPersistCoverage | undefined {
+	if (!coverage?.capTrimmed) return coverage;
+	const { capTrimmed: _capTrimmed, ...persisted } = coverage;
+	return persisted;
 }
 
 function countRetainedSourceFiles(
@@ -1647,10 +2079,7 @@ function countRetainedSourceFiles(
 	sourceFilePaths?: Iterable<string>,
 ): number {
 	if (sourceFilePaths === undefined) return graph.fileNodes.size;
-	const sourceKeys = new Set<string>();
-	for (const filePath of sourceFilePaths) {
-		sourceKeys.add(normalizeMapKey(filePath));
-	}
+	const sourceKeys = new Set(sourceFilePaths);
 	let retained = 0;
 	for (const filePath of sourceKeys) {
 		if (graph.fileNodes.has(filePath)) retained++;
@@ -1703,12 +2132,49 @@ function capGraphForPersist(
 	);
 	const reverseDeps = buildReverseDependencyIndexFromGraph({ cwd, graph });
 	const rankedFiles = rankFilesByReverseDependencyCentrality(reverseDeps);
-	const nodeIdsByFile = new Map<string, string[]>();
-	for (const [id, node] of graph.nodes) {
-		if (!node.filePath) continue;
-		const ids = nodeIdsByFile.get(node.filePath) ?? [];
-		ids.push(id);
-		nodeIdsByFile.set(node.filePath, ids);
+	// Both sides of this lookup must agree on path spelling. `rankedFiles` comes
+	// from the reverse-dependency index, which keys by `normalizeMapKey`
+	// (reverse-deps.ts), while this map keys by the RAW `node.filePath`. They agree
+	// because production paths already arrive folded (normalizeGraphSourcePath), so
+	// the raw pass is both correct and free. An unfolded path missed its lookup and
+	// was dropped from the ranking with no signal (#2255 review F1).
+	//
+	// Folding every node up front would fix that but costs a `realpath` probe PER
+	// NODE — measured at 93.5us per node, about 14 seconds at 150k nodes — on the
+	// pre-existing persist cap that every over-cap build already pays. So fold
+	// LAZILY: index raw first, and pay one folding pass only when the raw index
+	// leaves nodes the ranking cannot reach. Reach, not emptiness, is the trigger:
+	// a PARTIAL raw match would otherwise silently under-select the rest.
+	const indexNodesByFile = (fold: boolean): Map<string, string[]> => {
+		const byFile = new Map<string, string[]>();
+		for (const [id, node] of graph.nodes) {
+			if (!node.filePath) continue;
+			const fileKey = fold ? normalizeMapKey(node.filePath) : node.filePath;
+			const ids = byFile.get(fileKey) ?? [];
+			ids.push(id);
+			byFile.set(fileKey, ids);
+		}
+		return byFile;
+	};
+	// Measure reach in NODES, not files. Counting files is too weak: when only some
+	// of a file's nodes are unfolded, the file still appears covered while its group
+	// is short, and the missing nodes drop out of the ranking with no signal.
+	const reachableNodes = (byFile: Map<string, string[]>): number => {
+		let reached = 0;
+		for (const filePath of rankedFiles)
+			reached += byFile.get(filePath)?.length ?? 0;
+		return reached;
+	};
+	let placeableNodes = 0;
+	for (const node of graph.nodes.values()) if (node.filePath) placeableNodes++;
+	let nodeIdsByFile = indexNodesByFile(false);
+	if (reachableNodes(nodeIdsByFile) < placeableNodes) {
+		const folded = indexNodesByFile(true);
+		// Keep whichever index the ranking can actually reach. Folding repairs
+		// unfolded input; it is never a downgrade for input that was already correct.
+		if (reachableNodes(folded) > reachableNodes(nodeIdsByFile)) {
+			nodeIdsByFile = folded;
+		}
 	}
 
 	const keptIds = new Set<string>();
@@ -1786,6 +2252,7 @@ function logPersistSuccess(
 		gzBytes: number;
 		serializeMs: number;
 		writeMs: number;
+		durationMs: number;
 		offloaded: boolean;
 	},
 	workerState: {
@@ -1798,7 +2265,7 @@ function logPersistSuccess(
 		type: "phase",
 		phase: "review_graph_persist",
 		filePath: pending.cachePath,
-		durationMs: stats.serializeMs + stats.writeMs,
+		durationMs: stats.durationMs,
 		metadata: { elements: pending.elementCount, ...stats },
 	});
 	logReviewGraph({
@@ -1806,6 +2273,7 @@ function logPersistSuccess(
 		phase: "persist_succeeded",
 		elements: pending.elementCount,
 		...stats,
+		durationMs: stats.durationMs,
 		observability: persistObservability(pending, {
 			status: "succeeded",
 			workerStarted: workerState.started,
@@ -1825,6 +2293,7 @@ function writePendingOnMainThread(
 		fallbackReason?: string;
 	} = { started: false, completed: false },
 ): void {
+	const persistStarted = performance.now();
 	const serializeStarted = performance.now();
 	try {
 		const json = JSON.stringify(persistedData(pending));
@@ -1845,6 +2314,7 @@ function writePendingOnMainThread(
 				gzBytes: gzip.byteLength,
 				serializeMs,
 				writeMs: performance.now() - writeStarted,
+				durationMs: performance.now() - persistStarted,
 				offloaded: false,
 			},
 			{
@@ -1941,7 +2411,8 @@ function handleWorkerResult(result: ReviewGraphPersistWorkerResult): void {
 		result.rawBytes === undefined ||
 		result.gzBytes === undefined ||
 		result.serializeMs === undefined ||
-		result.writeMs === undefined
+		result.writeMs === undefined ||
+		result.durationMs === undefined
 	) {
 		fs.rm(result.stagePath, { force: true }, () => {});
 		writePendingOnMainThread(
@@ -1969,6 +2440,7 @@ function handleWorkerResult(result: ReviewGraphPersistWorkerResult): void {
 				gzBytes: result.gzBytes,
 				serializeMs: result.serializeMs,
 				writeMs: result.writeMs,
+				durationMs: result.durationMs,
 				offloaded: true,
 			},
 			{ started: true, completed: true },
@@ -2524,7 +2996,7 @@ function reviewGraphCheckpointPath(cwd: string): string {
 function hashIgnoredIds(ignoredIds: ReadonlySet<string> | undefined): string {
 	if (ignoredIds === undefined) return "unavailable";
 	const joined = [...ignoredIds]
-		.sort((a, b) => a.localeCompare(b))
+		.sort((a, b) => compareOrdinal(a, b))
 		.join("\u0000");
 	return createHash("sha256").update(joined).digest("hex");
 }
@@ -2882,8 +3354,15 @@ async function tryResumeFromCheckpoint(
 	}
 	const graph = loaded.graph;
 	// Evict every stale (content-changed) processed file so its outdated
-	// contribution is replaced by a fresh walk below.
-	for (const file of stale) removeFileOwnedGraphData(graph, file);
+	// contribution is replaced by a fresh walk below. One shared drop set,
+	// compacted once (#2074) — pruneOrphanNonFileNodes reads graph.edges next,
+	// so the compaction must land before it runs.
+	const removedEdges = new Set<ReviewGraphEdge>();
+	for (const file of stale) removeFileOwnedGraphData(graph, file, removedEdges);
+	if (removedEdges.size > 0) {
+		unindexEdges(graph, removedEdges);
+		graph.edges = graph.edges.filter((edge) => !removedEdges.has(edge));
+	}
 	pruneOrphanNonFileNodes(graph);
 	graph.changedSymbolsByFile = new Map();
 	const remaining = filesToBuild.filter((file) => !reusableHashes.has(file));
@@ -3084,6 +3563,7 @@ export function flushReviewGraphPersist(
 		logReviewGraph({
 			cwd,
 			phase: "persist_succeeded",
+			durationMs: performance.now() - startedAt,
 			elements: pending.elementCount,
 			rawBytes,
 			gzBytes: gzip.byteLength,
@@ -3190,7 +3670,7 @@ function upsertChangedSymbols(
 	// #260: tests aren't in the graph, so don't track their changed symbols.
 	if (detectFileRole(filePath) === "test") return;
 	const normalized = normalizeMapKey(filePath);
-	const changed = facts.getSessionFact<string[]>(
+	const changed = facts.getBoundedSessionFact<string[]>(
 		`${CHANGED_SYMBOLS_PREFIX}${normalized}`,
 	);
 	if (changed && changed.length > 0) {
@@ -4049,35 +4529,74 @@ function addCxxIncludeEdges(
 	}
 }
 
+/**
+ * Drop the nodes/edges a changed file owns, and index-maintain as it goes.
+ * `removedEdges` accumulates edges to drop from `graph.edges` — the CALLER
+ * compacts the array once for the whole batch (#2074): before this, each call
+ * ran its own `graph.edges.filter()`, so a batch of N changed files scanned
+ * the whole edge array N times (changedFiles x graph, not changedFiles x
+ * fan-in/out).
+ *
+ * `removedIds` is exactly `fileNodes`/`symbolNodesByFile`'s entries for this
+ * file — `file` and `symbol` are the only node kinds that ever set `filePath`
+ * (`module`/`external` placeholders never do) — so no `graph.nodes` scan is
+ * needed either, and the owned edges are read straight off `edgesByFrom` /
+ * `edgesByTo` instead of scanning `graph.edges`.
+ */
 function removeFileOwnedGraphData(
 	graph: ReviewGraph,
 	filePath: string,
+	removedEdges: Set<ReviewGraphEdge>,
 ): ReviewGraphEdge[] {
 	const normalized = normalizeMapKey(filePath);
-	const fileNodeId = `file:${normalized}`;
-	const removedIds = new Set<string>();
-	const removedSymbolIds = new Set<string>();
-	for (const [id, node] of graph.nodes) {
-		if (node.filePath !== normalized) continue;
-		removedIds.add(id);
-		if (node.kind === "symbol") removedSymbolIds.add(id);
-	}
+	const fileNodeId = graph.fileNodes.get(normalized) ?? `file:${normalized}`;
+	const removedSymbolIds = new Set(graph.symbolNodesByFile.get(normalized));
+	const removedIds = new Set(removedSymbolIds);
 	if (graph.nodes.has(fileNodeId)) removedIds.add(fileNodeId);
 
-	const preservedIncomingSymbolEdges: ReviewGraphEdge[] = [];
-	graph.edges = graph.edges.filter((edge) => {
-		const fromRemoved = removedIds.has(edge.from);
-		const toRemoved = removedIds.has(edge.to);
-		if (fromRemoved) return false;
-		if (removedSymbolIds.has(edge.to)) {
-			preservedIncomingSymbolEdges.push({ ...edge });
-			return false;
+	const candidates = new Set<ReviewGraphEdge>();
+	for (const id of removedIds) {
+		for (const edge of graph.edgesByFrom.get(id) ?? []) {
+			_rebuildCounters.removeOwnedEdgeVisits++;
+			candidates.add(edge);
 		}
-		// Preserve importer edges to the stable file node id; the node is re-added below.
-		if (toRemoved && edge.to === fileNodeId) return true;
-		return !toRemoved;
-	});
-	for (const id of removedIds) graph.nodes.delete(id);
+		for (const edge of graph.edgesByTo.get(id) ?? []) {
+			_rebuildCounters.removeOwnedEdgeVisits++;
+			candidates.add(edge);
+		}
+	}
+
+	const preservedIncomingSymbolEdges: ReviewGraphEdge[] = [];
+	for (const edge of candidates) {
+		// A cross-edge can be discovered from both changed files' adjacency
+		// buckets. Preserve and remove it only once, matching eager unindexing
+		// while the batch indexes remain live until the end.
+		if (removedEdges.has(edge)) continue;
+		const fromRemoved = removedIds.has(edge.from);
+		// Preserve importer edges to the stable file node id; the node is
+		// re-added below.
+		if (!fromRemoved && edge.to === fileNodeId) continue;
+		if (!fromRemoved && removedSymbolIds.has(edge.to)) {
+			preservedIncomingSymbolEdges.push({ ...edge });
+		}
+		removedEdges.add(edge);
+	}
+	for (const id of removedIds) {
+		const node = graph.nodes.get(id);
+		graph.nodes.delete(id);
+		if (!node?.filePath) continue;
+		if (node.kind === "file") {
+			if (graph.fileNodes.get(node.filePath) === id) {
+				graph.fileNodes.delete(node.filePath);
+			}
+		} else if (node.kind === "symbol") {
+			const ids = graph.symbolNodesByFile.get(node.filePath);
+			if (!ids) continue;
+			const at = ids.indexOf(id);
+			if (at >= 0) ids.splice(at, 1);
+			if (ids.length === 0) graph.symbolNodesByFile.delete(node.filePath);
+		}
+	}
 	return preservedIncomingSymbolEdges;
 }
 
@@ -4180,22 +4699,117 @@ async function addFileToGraph(
 	}
 }
 
+/**
+ * #2074 acceptance instrumentation. `restoreComparisons` counts edge-metadata
+ * stringifications inside `restoreValidIncomingEdges`; `importTargetEdgeScans`
+ * counts edges visited by `importTargetsForFile`; `removeOwnedEdgeVisits`
+ * counts edges visited while collecting a changed file's owned edges in
+ * `removeFileOwnedGraphData`. Before this change all three grew with the whole
+ * graph on every one-file rebuild, and `removeOwnedEdgeVisits` grew with
+ * changedFiles x graph on a multi-file batch (one full `graph.edges` scan per
+ * file). `removeOwnedEdgePositions` counts adjacency positions examined while
+ * removing edges; batching keeps a high-fan-in bucket linear instead of
+ * rescanning its prefix for every edge. They are the count-based signal the
+ * issue asks for, because wall time on this hardware is IO-noisy (#1920).
+ */
+const _rebuildCounters = {
+	restoreComparisons: 0,
+	importTargetEdgeScans: 0,
+	removeOwnedEdgeVisits: 0,
+	removeOwnedEdgePositions: 0,
+};
+
+export function _getReviewGraphRebuildCountersForTests(): {
+	restoreComparisons: number;
+	importTargetEdgeScans: number;
+	removeOwnedEdgeVisits: number;
+	removeOwnedEdgePositions: number;
+} {
+	return { ..._rebuildCounters };
+}
+
+export function _resetReviewGraphRebuildCountersForTests(): void {
+	_rebuildCounters.restoreComparisons = 0;
+	_rebuildCounters.importTargetEdgeScans = 0;
+	_rebuildCounters.removeOwnedEdgeVisits = 0;
+	_rebuildCounters.removeOwnedEdgePositions = 0;
+}
+
+/**
+ * Identity of an edge for dedupe purposes, WITHIN one target bucket: the array
+ * form needs no separator sentinel and cannot collide across fields.
+ */
+function edgeIdentityKey(edge: ReviewGraphEdge): string {
+	_rebuildCounters.restoreComparisons++;
+	return JSON.stringify([edge.from, edge.kind, edge.metadata ?? {}]);
+}
+
 function restoreValidIncomingEdges(
 	graph: ReviewGraph,
 	edges: ReviewGraphEdge[],
 ): void {
-	const existing = new Set(
-		graph.edges.map(
-			(edge) =>
-				`${edge.from}\u0000${edge.to}\u0000${edge.kind}\u0000${JSON.stringify(edge.metadata ?? {})}`,
-		),
-	);
+	// #2074: dedupe per TARGET, using `edgesByTo`, instead of building a key set
+	// over every edge in the graph. Preserved incoming edges point at symbols of
+	// the files just re-extracted, and `removeFileOwnedGraphData` has already
+	// dropped those symbols' incoming edges, so each bucket read here is tiny.
+	// The per-target `Set` keeps the restore linear even when one changed file is
+	// a hub with thousands of preserved incoming edges — scanning the bucket per
+	// edge instead would be quadratic in that fan-in.
+	const seenByTarget = new Map<string, Set<string>>();
 	for (const edge of edges) {
 		if (!graph.nodes.has(edge.from) || !graph.nodes.has(edge.to)) continue;
-		const key = `${edge.from}\u0000${edge.to}\u0000${edge.kind}\u0000${JSON.stringify(edge.metadata ?? {})}`;
-		if (existing.has(key)) continue;
-		graph.edges.push(edge);
-		existing.add(key);
+		let seen = seenByTarget.get(edge.to);
+		if (!seen) {
+			seen = new Set<string>();
+			for (const candidate of graph.edgesByTo.get(edge.to) ?? []) {
+				seen.add(edgeIdentityKey(candidate));
+			}
+			seenByTarget.set(edge.to, seen);
+		}
+		const key = edgeIdentityKey(edge);
+		if (seen.has(key)) continue;
+		seen.add(key);
+		addEdge(graph, edge);
+	}
+}
+
+/**
+ * Remove duplicates created when deferred targets converge after restoration.
+ * The scan is limited to resolved edges and their target buckets, not the
+ * complete graph, so same-batch repairs remain proportional to the resolved
+ * edges and the fan-in of their target buckets.
+ */
+function dedupeResolvedEdges(
+	graph: ReviewGraph,
+	replacements: Array<[ReviewGraphEdge, ReviewGraphEdge]>,
+): void {
+	const resolvedEdges = new Set(replacements.map(([, after]) => after));
+	const seenByTarget = new Map<string, Set<string>>();
+	const removed = new Set<ReviewGraphEdge>();
+
+	for (const [, edge] of replacements) {
+		if (removed.has(edge)) continue;
+		let seen = seenByTarget.get(edge.to);
+		if (!seen) {
+			seen = new Set();
+			for (const candidate of graph.edgesByTo.get(edge.to) ?? []) {
+				if (!resolvedEdges.has(candidate)) {
+					seen.add(edgeIdentityKey(candidate));
+				}
+			}
+			seenByTarget.set(edge.to, seen);
+		}
+		const key = edgeIdentityKey(edge);
+		if (seen.has(key)) {
+			removed.add(edge);
+			unindexEdge(graph, edge);
+			continue;
+		}
+		seen.add(key);
+	}
+
+	if (removed.size > 0) {
+		graph.edges = graph.edges.filter((edge) => !removed.has(edge));
 	}
 }
 
@@ -4230,15 +4844,17 @@ function importTargetsForFile(graph: ReviewGraph, filePath: string): string[] {
 	const normalized = normalizeMapKey(filePath);
 	const fileNodeId = graph.fileNodes.get(normalized) ?? `file:${normalized}`;
 	const targets = new Set<string>();
-	// Cached graph snapshots intentionally omit derived indexes; read the
-	// canonical edge collection so the delta is correct before the first rebuild.
-	for (const edge of graph.edges) {
-		if (edge.from !== fileNodeId) continue;
+	// #2074: read this file's own out-edges from `edgesByFrom` rather than
+	// scanning every edge in the graph. The only caller, `updateGraphFiles`,
+	// indexes the graph before its first call and keeps the indexes live for the
+	// rest of the update, so the bucket is always authoritative here.
+	for (const edge of graph.edgesByFrom.get(fileNodeId) ?? []) {
+		_rebuildCounters.importTargetEdgeScans++;
 		if (edge.kind !== "imports") continue;
 		const target = graph.nodes.get(edge.to)?.filePath;
 		if (target) targets.add(normalizeMapKey(target));
 	}
-	return [...targets].sort((a, b) => a.localeCompare(b));
+	return [...targets].sort((a, b) => compareOrdinal(a, b));
 }
 
 async function updateGraphFiles(
@@ -4248,19 +4864,39 @@ async function updateGraphFiles(
 	facts: FactStore,
 	ignoredIds?: ReadonlySet<string>,
 ): Promise<GraphFileImportChange[]> {
+	// #2074: index ONCE, up front, then keep the indexes live through the update.
+	// This is the same single O(graph) pass the terminal `rebuildIndexes` used to
+	// cost, moved to the front, and it buys three things: the two
+	// `importTargetsForFile` calls per changed file become bucket lookups,
+	// `restoreValidIncomingEdges` dedupes against a fan-in bucket instead of the
+	// whole edge list, and `existedBefore` finally reads a POPULATED `fileNodes`.
+	// `cloneGraph` returns empty indexes, so before this the first file's
+	// `existedBefore` was always false on every update path — which forced
+	// `importsChanged` true in `clients/dispatch/integration.ts:1077` and blocked
+	// reverse-dependency index reuse on every incremental build.
+	rebuildIndexes(graph);
 	const prior = files.map((file) => ({
 		filePath: normalizeMapKey(file),
 		existedBefore: graph.fileNodes.has(normalizeMapKey(file)),
 		priorTargets: importTargetsForFile(graph, file),
 	}));
 	const preservedIncoming: ReviewGraphEdge[] = [];
+	// #2074: one shared drop set for the whole batch, compacted into graph.edges
+	// exactly once below — not once per file, which made a multi-file rebuild
+	// scan the edge array changedFiles times over.
+	const removedEdges = new Set<ReviewGraphEdge>();
 	for (const file of files) {
-		preservedIncoming.push(...removeFileOwnedGraphData(graph, file));
+		preservedIncoming.push(
+			...removeFileOwnedGraphData(graph, file, removedEdges),
+		);
 		await addFileToGraph(graph, cwd, file, facts, ignoredIds);
+	}
+	if (removedEdges.size > 0) {
+		unindexEdges(graph, removedEdges);
+		graph.edges = graph.edges.filter((edge) => !removedEdges.has(edge));
 	}
 	restoreValidIncomingEdges(graph, preservedIncoming);
 	resolveDeferredSymbolEdges(graph, false);
-	rebuildIndexes(graph);
 	graph.changedSymbolsByFile.clear();
 	for (const file of files) {
 		upsertChangedSymbols(graph, facts, file);
@@ -4284,6 +4920,12 @@ function resolveDeferredSymbolEdges(graph: ReviewGraph, rebuild = true): void {
 		symbolNameToIds.set(node.symbolName, ids);
 	}
 
+	// #2074: this pass REPLACES edge objects, so the adjacency buckets that hold
+	// the old objects go stale. Callers that keep the indexes live (the
+	// incremental path, which no longer reindexes afterwards) need each
+	// replacement patched into the buckets; collect them here rather than paying
+	// a whole-graph reindex for a handful of newly resolved edges.
+	const replacements: Array<[ReviewGraphEdge, ReviewGraphEdge]> = [];
 	graph.edges = graph.edges.map((edge) => {
 		const targetNode = graph.nodes.get(edge.to);
 		if (!targetNode?.metadata?.unresolvedName) return edge;
@@ -4299,13 +4941,25 @@ function resolveDeferredSymbolEdges(graph: ReviewGraph, rebuild = true): void {
 				(id) => graph.nodes.get(id)?.filePath === importHintFile,
 			);
 			if (scoped.length === 1) {
-				return { ...edge, to: scoped[0], resolution: "import" };
+				const resolved: ReviewGraphEdge = {
+					...edge,
+					to: scoped[0],
+					resolution: "import",
+				};
+				replacements.push([edge, resolved]);
+				return resolved;
 			}
 		}
 		if (candidates.length === 1) {
 			// Exactly one same-named real symbol exists graph-wide: the bare-name
 			// match is provably unambiguous (refs #655 — resolution confidence).
-			return { ...edge, to: candidates[0], resolution: "exact" };
+			const resolved: ReviewGraphEdge = {
+				...edge,
+				to: candidates[0],
+				resolution: "exact",
+			};
+			replacements.push([edge, resolved]);
+			return resolved;
 		}
 		// 0 or 2+ candidates (and no import hint narrowed it): stays on the
 		// unresolved placeholder, resolution stays "name-only" (set at edge
@@ -4313,7 +4967,43 @@ function resolveDeferredSymbolEdges(graph: ReviewGraph, rebuild = true): void {
 		// confirmed graph node.
 		return edge;
 	});
-	if (rebuild) rebuildIndexes(graph);
+	if (rebuild) {
+		rebuildIndexes(graph);
+		return;
+	}
+	if (replacements.length === 0) return;
+	// Bucket ORDER is part of the contract, not just bucket membership:
+	// `resolveUsedBy` in module-report walks `edgesByTo` and truncates at a cap,
+	// so the order decides which callers a reader sees. `rebuildIndexes` orders
+	// every bucket by position in `graph.edges`, and the incremental path must
+	// match it exactly.
+	//
+	// `from` is unchanged by a resolution, so the from-bucket only needs the new
+	// object swapped in at the OLD object's position — order is preserved for
+	// free. `to` moves from the placeholder's bucket to the resolved symbol's,
+	// and appending there would put an early edge behind later ones. Rebuild
+	// exactly the affected to-buckets from `graph.edges`, which restores
+	// canonical order without touching the rest of the index.
+	const affectedTargets = new Set<string>();
+	for (const [before, after] of replacements) {
+		const fromBucket = graph.edgesByFrom.get(before.from);
+		if (fromBucket) {
+			const at = fromBucket.indexOf(before);
+			if (at >= 0) fromBucket[at] = after;
+		}
+		affectedTargets.add(before.to);
+		affectedTargets.add(after.to);
+	}
+	for (const target of affectedTargets) graph.edgesByTo.set(target, []);
+	for (const edge of graph.edges) {
+		if (affectedTargets.has(edge.to)) graph.edgesByTo.get(edge.to)?.push(edge);
+	}
+	for (const target of affectedTargets) {
+		if (graph.edgesByTo.get(target)?.length === 0) {
+			graph.edgesByTo.delete(target);
+		}
+	}
+	dedupeResolvedEdges(graph, replacements);
 }
 
 interface CachedGraphEntry {
@@ -4432,7 +5122,7 @@ async function tryIncrementalFromCache(
 			graphChanged: false,
 		});
 		graph.buildGeneration = generation;
-		ctx.facts.setSessionFact("session.reviewGraph", graph);
+		setSessionReviewGraphFact(ctx.cwd, ctx.facts, graph);
 		return graph;
 	}
 
@@ -4491,7 +5181,7 @@ async function tryIncrementalFromCache(
 		fromGeneration: priorGeneration,
 		changes: importChanges,
 	});
-	ctx.facts.setSessionFact("session.reviewGraph", graph);
+	setSessionReviewGraphFact(ctx.cwd, ctx.facts, graph);
 	return graph;
 }
 
@@ -4524,10 +5214,16 @@ async function trySeqFastpath(
 	cacheEpoch?: number,
 ): Promise<SeqFastpathResult> {
 	const cached = _workspaceGraphCache.get(normalizedCwd);
-	// Condition 2: need an in-process complete entry that recorded a build seq.
-	// A capped or entry-budget-truncated graph is read-only orientation data, not
-	// a safe incremental base; force the next build through a complete walk.
-	if (cached?.graph.persistCoverage?.partial) {
+	// Condition 2: need an in-process entry that recorded a build seq and whose
+	// SOURCE WALK was complete. An entry-budget-truncated or checkpoint graph has
+	// UNSEEN files, so it is read-only orientation data and must force a complete
+	// walk. A `capTrimmed` graph is a different case: this process walked every
+	// file and then cut the graph for size, so rebuilding from it is safe, and
+	// refusing it puts an over-budget repository on a full walk every single turn
+	// (#2255 review F5). The marker is process-local and never hydrated from disk,
+	// so a snapshot-derived partial still takes the refusal above.
+	const cachedCoverage = cached?.graph.persistCoverage;
+	if (cachedCoverage?.partial && cachedCoverage.capTrimmed !== true) {
 		return { fallback: "partial-base" };
 	}
 	if (!cached || cached.builtAtProjectSeq === undefined) {
@@ -4627,7 +5323,7 @@ async function trySeqFastpath(
 			graphChanged: false,
 		});
 		graph.buildGeneration = generation;
-		facts.setSessionFact("session.reviewGraph", graph);
+		setSessionReviewGraphFact(cwd, facts, graph);
 		return { graph };
 	}
 
@@ -4704,7 +5400,7 @@ async function trySeqFastpath(
 		fromGeneration: priorGeneration,
 		changes: importChanges,
 	});
-	facts.setSessionFact("session.reviewGraph", graph);
+	setSessionReviewGraphFact(cwd, facts, graph);
 	return { graph };
 }
 
@@ -4758,7 +5454,7 @@ async function _doBuildGraph(
 			// treat as changed so dependents never trust stale derived state.
 			graphChanged: true,
 		});
-		facts.setSessionFact("session.reviewGraph", graph);
+		setSessionReviewGraphFact(cwd, facts, graph);
 		return graph;
 	}
 
@@ -4798,6 +5494,7 @@ async function _doBuildGraph(
 	const sourceCollection = await getGraphSourceFiles(cwd);
 	const filesToBuild = sourceCollection.files;
 	const sourceFileCount = sourceCollection.sourceFileCount;
+	const pathNormalizeCalls = sourceCollection.pathNormalizeCalls;
 	const sourceFilesTruncated = sourceCollection.entryBudgetExceeded;
 	const ignoredIds = await ignoredIdsPromise;
 	const maxGraphFiles = sourceCollection.maxFileCount;
@@ -4856,6 +5553,7 @@ async function _doBuildGraph(
 			sourceFileCountTruncated:
 				sourceFilesTruncated || filesToBuild.length > maxGraphFiles,
 			maxFileCount: maxGraphFiles,
+			pathNormalizeCalls,
 			seqFastpathFallback,
 			// #459: a fresh empty graph is returned every call on this path (never
 			// persisted/reused) — treat it as changed so dependents never trust stale
@@ -4863,7 +5561,7 @@ async function _doBuildGraph(
 			// with a buildGeneration: absent ⇒ derived caches rebuild every time.
 			graphChanged: true,
 		});
-		facts.setSessionFact("session.reviewGraph", graph);
+		setSessionReviewGraphFact(cwd, facts, graph);
 		return graph;
 	}
 	// #782: the repo is within the cap on this build attempt — drop any
@@ -4884,7 +5582,17 @@ async function _doBuildGraph(
 	// re-persisting it would launder partial coverage onto disk as a complete
 	// snapshot (#936 review). Ignore it here — the disk tier rejects a partial
 	// base too, so the build falls through to a full rebuild.
-	if (memCached?.graph.persistCoverage?.partial) memCached = undefined;
+	//
+	// `capTrimmed` is the one partial cause this does NOT refuse: this process
+	// walked every file and then cut the graph to the memory budget, so no file is
+	// unaccounted for. Refusing it forced a full walk on every turn for exactly
+	// the repositories the memory bound targets (#2255 review F5). The marker is
+	// process-local and stripped at persist, so a snapshot-hydrated partial —
+	// whose completeness this process cannot vouch for — is still refused.
+	const memCoverage = memCached?.graph.persistCoverage;
+	if (memCoverage?.partial && memCoverage.capTrimmed !== true) {
+		memCached = undefined;
+	}
 	if (memCached?.signature === signature) {
 		touchWorkspaceGraph(normalizedCwd);
 		const graph = cloneGraph(memCached.graph);
@@ -4907,7 +5615,7 @@ async function _doBuildGraph(
 			graphChanged: false,
 		});
 		graph.buildGeneration = generation;
-		facts.setSessionFact("session.reviewGraph", graph);
+		setSessionReviewGraphFact(cwd, facts, graph);
 		return graph;
 	}
 	if (memCached) {
@@ -4967,7 +5675,7 @@ async function _doBuildGraph(
 			graphChanged: false,
 		});
 		graph.buildGeneration = generation;
-		facts.setSessionFact("session.reviewGraph", graph);
+		setSessionReviewGraphFact(cwd, facts, graph);
 		return graph;
 	}
 	if (diskCached) {
@@ -5160,8 +5868,16 @@ async function _doBuildGraph(
 	// so change detection does not reread every file after the graph is built.
 	// #459: full rebuild ⇒ new generation.
 	const generation = ++_graphGenerationCounter;
-	const graphSnapshot = cloneGraph(graph);
-	rebuildIndexes(graphSnapshot);
+	// #2255 review R1: cap ONCE and let both retention sites share the result. The
+	// cache took a clone while the session fact took the original, two objects a
+	// `cloneGraph` apart, so each ran its own centrality pass and retained its own
+	// trimmed copy — two budgets resident, not one. Over budget the cap already
+	// returns a fresh, fully-indexed graph, so it IS the snapshot and no clone is
+	// needed. In budget nothing is trimmed and the clone happens exactly as before.
+	const retained = retainedGraph(cwd, graph);
+	const wasCapped = retained !== graph;
+	const graphSnapshot = wasCapped ? retained : cloneGraph(graph);
+	if (!wasCapped) rebuildIndexes(graphSnapshot);
 	// Keep the content generation on the persisted snapshot instance too, so
 	// scheduled persistence logs join the same graph identity as build success.
 	graphSnapshot.buildGeneration = generation;
@@ -5197,12 +5913,15 @@ async function _doBuildGraph(
 		mode: "full",
 		sourceFileCount,
 		sourceFileCountTruncated: sourceFilesTruncated,
+		pathNormalizeCalls,
 		seqFastpathFallback,
 		...(persistReason ? { persistReason } : {}),
 		graphChanged: true,
 	});
 	graph.buildGeneration = generation;
-	facts.setSessionFact("session.reviewGraph", graph);
+	// Share the cache's object, so an over-budget build retains ONE trimmed graph
+	// across both sites. In budget this stores the equivalent clone the cache holds.
+	setSessionReviewGraphFact(cwd, facts, graphSnapshot);
 	return graph;
 }
 
@@ -5225,7 +5944,7 @@ async function _doBuildGraph(
  * rather than by coincidence.
  */
 function buildCacheKey(cwd: string, changedFiles: string[]): string {
-	return `${buildCacheWorkspaceKey(cwd)}|${[...changedFiles].sort((a, b) => a.localeCompare(b)).join(",")}`;
+	return `${buildCacheWorkspaceKey(cwd)}|${[...changedFiles].sort((a, b) => compareOrdinal(a, b)).join(",")}`;
 }
 
 /**
@@ -5293,6 +6012,7 @@ export function buildOrUpdateGraph(
 							mode: buildInfo.mode,
 							sourceFileCount: buildInfo.sourceFileCount,
 							sourceFileCountTruncated: buildInfo.sourceFileCountTruncated,
+							pathNormalizeCalls: buildInfo.pathNormalizeCalls,
 						}),
 					},
 				});
@@ -5314,6 +6034,7 @@ export function buildOrUpdateGraph(
 							mode: buildInfo.mode,
 							sourceFileCount: buildInfo.sourceFileCount,
 							sourceFileCountTruncated: buildInfo.sourceFileCountTruncated,
+							pathNormalizeCalls: buildInfo.pathNormalizeCalls,
 						}),
 					},
 				});

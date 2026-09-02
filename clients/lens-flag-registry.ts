@@ -132,6 +132,15 @@ export const LENS_FLAGS: readonly LensFlagSpec[] = [
 		scope: "global",
 	},
 	{
+		name: "lens-checkout-guard",
+		description:
+			"Experimental: decline git commands that rewrite the working tree when another live pi-lens session shares this dirty checkout. Also via guard.sharedCheckout=true in ~/.pi-lens/config.json.",
+		configKey: "guard.sharedCheckout",
+		negated: false,
+		default: false,
+		scope: "global",
+	},
+	{
 		name: "no-opengrep",
 		description:
 			"Disable the Opengrep security scanner (a default-on auxiliary LSP; auto-installs, uses repo rules if present else the login-free 'auto' ruleset). Also via opengrep.enabled=false in ~/.pi-lens/config.json.",

@@ -14,6 +14,7 @@ import {
 	extractDeletedPathsFromCommand,
 	extractGrepSearchReadsFromOutput,
 	extractWrittenPathsFromCommand,
+	tokenizeShellCommand,
 } from "./bash-file-access.js";
 import type { BiomeClient } from "./biome-client.js";
 import {
@@ -23,7 +24,11 @@ import {
 import type { CacheManager } from "./cache-manager.js";
 import { createFileTime } from "./file-time.js";
 import { publishFormatQueued } from "./format-events-publish.js";
-import { isPathIgnoredByProject } from "./file-utils.js";
+import {
+	invalidateProjectIgnoreMatcherForPath,
+	isPathIgnoredByProject,
+} from "./file-utils.js";
+import { invalidateFormatterCacheForPath } from "./formatters.js";
 import type { ReadGuard } from "./read-guard.js";
 import { getFormatService } from "./format-service.js";
 import {
@@ -60,8 +65,74 @@ import type { RuntimeCoordinator } from "./runtime-coordinator.js";
 import { syncGitGuardRecord } from "./git-guard.js";
 import { scheduleWordIndexPersist } from "./word-index.js";
 import { RUNTIME_CONFIG } from "./runtime-config.js";
+import { getActiveSessionId } from "./session-lifecycle.js";
 
 const AUTHORITATIVE_CONTENT_MAX_BYTES = RUNTIME_CONFIG.pipeline.lspMaxFileBytes;
+
+/**
+ * Git subcommands that import ANOTHER commit's content into the index. The
+ * whole family, with a verdict for each (#2060):
+ * - merge, rebase, cherry-pick, pull, revert, am: IN. Each stages the other
+ *   side's clean files beside the unmerged ones. `pull` is fetch+merge and
+ *   `am --3way` reaches the same unmerged state, both probed on git 2.55.
+ * - stash pop / stash apply: OUT. A conflicted pop leaves `M ` entries too,
+ *   but that content is the agent's OWN stashed work. Excluding it would
+ *   destroy exactly what opaque recovery exists to capture.
+ * - checkout -m: OUT. Its "incoming" side is the agent's local modifications
+ *   carried across the switch, so the same reasoning applies.
+ * - apply -3 / --3way: OUT. The patch is normally one the agent wrote, and
+ *   `apply` is far more often used without conflicts, so the narrower default
+ *   is to keep capturing.
+ * Membership only ARMS the filter; it still needs a real unmerged entry to do
+ * anything, so a non-integration use of a listed subcommand is inert.
+ */
+const GIT_INTEGRATION_SUBCOMMANDS = new Set([
+	"merge",
+	"rebase",
+	"cherry-pick",
+	"pull",
+	"revert",
+	"am",
+]);
+const GIT_GLOBAL_OPTIONS_WITH_VALUE = new Set([
+	"-C",
+	"-c",
+	"--config-env",
+	"--git-dir",
+	"--namespace",
+	"--work-tree",
+]);
+
+/**
+ * Failed integration commands are the one opaque-recovery case where Git's
+ * index contains changes made by the other branch rather than the agent.
+ * Keep this narrow: ordinary scripts and successful Git operations retain the
+ * normal recovery contract.
+ */
+export function isFailedGitIntegrationCommand(
+	command: string,
+	isError: boolean | undefined,
+): boolean {
+	if (isError !== true) return false;
+	return tokenizeShellCommand(command).some(({ tokens, unsupported }) => {
+		if (unsupported) return false;
+		const executable = path.win32
+			.basename(tokens[0] ?? "")
+			.toLowerCase()
+			.replace(/\.(?:cmd|exe)$/, "");
+		if (executable !== "git") return false;
+		for (let index = 1; index < tokens.length; index += 1) {
+			const token = tokens[index] ?? "";
+			if (GIT_GLOBAL_OPTIONS_WITH_VALUE.has(token)) {
+				index += 1;
+				continue;
+			}
+			if (token.startsWith("-")) continue;
+			return GIT_INTEGRATION_SUBCOMMANDS.has(token);
+		}
+		return false;
+	});
+}
 
 /**
  * The `tool_result` payload pi-lens actually receives.
@@ -499,6 +570,10 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			? rawFilePath
 			: path.resolve(resolutionBasis, rawFilePath)
 		: rawFilePath;
+	if (filePath) {
+		invalidateProjectIgnoreMatcherForPath(filePath);
+		invalidateFormatterCacheForPath(filePath);
+	}
 
 	// Purely diagnostic: tool_call's call-time verdict (computed on ITS OWN
 	// resolved path, which may since have been superseded) disagreed with
@@ -594,6 +669,12 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 				const recovery = await recoverOpaqueChangesViaGit(
 					scanRoot,
 					pending.startedAt,
+					{
+						excludeIndexOnlyWhenUnmerged: isFailedGitIntegrationCommand(
+							command,
+							event.isError,
+						),
+					},
 				);
 				if (recovery.verdict === "recovered") {
 					opaquePaths = recovery.paths.filter(
@@ -601,10 +682,33 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 							!isExternalOrVendorFile(p, scanRoot) &&
 							!isPathIgnoredByProject(p, scanRoot, false),
 					);
-				} else if (recovery.verdict === "unknown" && recognized.length > 0) {
-					// Git hiccup on a partially-recognized command: the
-					// remainder's coverage is unknown, never clean-by-default.
+				} else if (recovery.verdict === "unknown") {
+					// #2060: deliberately WIDER than the old `recognized.length > 0`
+					// guard. A fully opaque command whose probe failed is the shape
+					// whose coverage is least knowable, and it used to record
+					// nothing at all.
 					unknownReason = recovery.unknownReason;
+				}
+				// #2060: both counts are bounded (one record per tool_result, no
+				// per-path logging) and exist because filtering is invisible in
+				// production otherwise - the dropped paths simply never appear.
+				if ((recovery.excludedIncomingCount ?? 0) > 0) {
+					logLatency({
+						type: "phase",
+						phase: "opaque_mutation_incoming_excluded",
+						filePath: command.slice(0, 80),
+						durationMs: Date.now() - started,
+						result: `excluded:${recovery.excludedIncomingCount}`,
+					});
+				}
+				if ((recovery.unknownStatusCount ?? 0) > 0) {
+					logLatency({
+						type: "phase",
+						phase: "opaque_mutation_status_pair_unknown",
+						filePath: command.slice(0, 80),
+						durationMs: Date.now() - started,
+						result: `kept:${recovery.unknownStatusCount}`,
+					});
 				}
 			} else if (pending.stats) {
 				const outcome = await captureFileStats(scanRoot, {
@@ -836,6 +940,46 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		return { content: event.content, isError: true };
 	}
 
+	// One post-result raw-byte hash, reused for the applied-edit records below and
+	// for the pipeline dedup key (`initialStateHash`) further down (finding 3):
+	// nothing between here and that point rewrites the file, so a second read
+	// would only re-derive the same digest.
+	const postWriteStateHash = getFileStateHash(filePath);
+
+	// #2402: a fully-applied native edit is also an applied record, so an
+	// identical retry is recognized as already-applied instead of escalating
+	// through the oldText-not-found ladder. `event.input` carries the EXECUTED
+	// args (post-autopatch), the same text the preflight resolves against.
+	const nativeAppliedPairs: Array<{
+		oldText: string;
+		newText: string | undefined;
+	}> = [];
+	if (event.toolName === "edit") {
+		const appliedInput = event.input as {
+			oldText?: string;
+			newText?: string;
+			edits?: Array<{ oldText?: string; newText?: string }>;
+		};
+		const record = (oldText?: string, newText?: string): void => {
+			if (typeof oldText === "string" && oldText.length > 0) {
+				runtime.partialApplyRecords.record(
+					filePath,
+					oldText,
+					newText,
+					postWriteStateHash,
+				);
+				nativeAppliedPairs.push({ oldText, newText });
+			}
+		};
+		if (Array.isArray(appliedInput.edits)) {
+			for (const edit of appliedInput.edits) {
+				record(edit.oldText, edit.newText);
+			}
+		} else {
+			record(appliedInput.oldText, appliedInput.newText);
+		}
+	}
+
 	// Must happen before debounce admission: latestDeps intentionally retains only
 	// the latest event, but write -> edit is a sticky turn transition.
 	const receipt = (runtime as Partial<RuntimeCoordinator>)
@@ -891,7 +1035,9 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		}
 	}
 
-	const initialStateHash = getFileStateHash(filePath);
+	// Reuse the hash taken right after the write landed (finding 3): the file is
+	// unchanged between that read and here, so this is byte-identical.
+	const initialStateHash = postWriteStateHash;
 
 	// Deduplicate concurrent calls for the same final file state (pi can fire one
 	// tool_result per edit hunk). Do not dedupe by file alone: a distinct later
@@ -1138,7 +1284,15 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			},
 		});
 		dbg(`runPipeline crash stack: ${(pipelineErr as Error).stack}`);
-		if (!getFlag("no-lsp")) {
+		// The LSP fleet is process-wide, but a pipeline crash belongs to one
+		// evaluation. A registered primary owns the fleet; a known secondary
+		// must not tear it down. Keep the historical reset when no registration
+		// exists because synthetic callers and early startup have no role evidence.
+		const activePrimarySessionId = getActiveSessionId();
+		const crashBelongsToPrimary =
+			activePrimarySessionId === undefined ||
+			activePrimarySessionId === runtime.telemetrySessionId;
+		if (!getFlag("no-lsp") && crashBelongsToPrimary) {
 			resetLSPService({ fast: true, reason: "pipeline_crash" });
 		}
 
@@ -1204,10 +1358,27 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		});
 	}
 
+	const finalStateHash = getFileStateHash(filePath);
 	lastAnalyzedStateByFile.set(filePath, {
 		turnIndex: runtime.turnIndex,
-		stateHash: getFileStateHash(filePath),
+		stateHash: finalStateHash,
 	});
+
+	// #2402: pi-lens' own immediate format/autofix may have rewritten the file
+	// after the native edit was recorded above. Stamp the post-pipeline state so
+	// an identical retry against the formatted bytes is still recognized as
+	// already-applied. Only the pairs recorded this invocation are stamped, and
+	// only when the pipeline actually changed the bytes.
+	if (finalStateHash !== postWriteStateHash) {
+		for (const pair of nativeAppliedPairs) {
+			runtime.partialApplyRecords.noteAfterWriteHash(
+				filePath,
+				pair.oldText,
+				pair.newText,
+				finalStateHash,
+			);
+		}
+	}
 
 	// The model's write/edit and pi-lens' own immediate format/autofix are now
 	// reflected on disk. Refresh read-guard staleness stamps so a follow-up edit
@@ -1295,6 +1466,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 
 	for (const changedFile of result.changedFiles ?? []) {
 		const resolvedChanged = path.resolve(changedFile);
+		invalidateFormatterCacheForPath(resolvedChanged);
 		if (!nodeFs.existsSync(resolvedChanged)) continue;
 		recordProjectChange({
 			runtime,

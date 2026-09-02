@@ -25,10 +25,19 @@ async function main() {
 		`Merge-train warden: swept ${results.length} record(s) (PR sweep + any list-level errors).`,
 	];
 	for (const r of results) {
-		if (r.applied.length === 0 && r.errors.length === 0) continue;
+		// #2184 AC3: every PR gets a line naming its run-health classification,
+		// even a quiet one. The stall this workflow exists to catch looks exactly
+		// like "nothing needed doing" from the old actions-only summary.
+		const quiet =
+			r.applied.length === 0 && r.errors.length === 0 && r.runHealth === null;
+		if (quiet) continue;
 		lines.push(
 			`- ${r.number === null ? "(list fetch)" : `#${r.number} (${r.mergeStateStatus}) ${r.url}`}`,
 		);
+		if (r.runHealth)
+			lines.push(
+				`  runs: ${r.runHealth.classification}${r.runHealth.detail ? ` — ${r.runHealth.detail}` : ""}`,
+			);
 		if (r.applied.length > 0) lines.push(`  applied: ${r.applied.join(", ")}`);
 		if (r.errors.length > 0) {
 			lines.push(

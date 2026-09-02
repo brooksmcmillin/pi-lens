@@ -25,9 +25,12 @@ import * as fs from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
 	buildWordIndex,
+	countWordIndexPostingEntries,
 	refreshWordIndexIncrementally,
+	serializeWordIndex,
 	updateWordIndexDocument,
 	wordIndexKey,
+	wordIndexPostingHits,
 } from "../../clients/word-index.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 
@@ -35,6 +38,44 @@ import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 const NORMALIZER_FOLDS_CASE = wordIndexKey("A.ts") === wordIndexKey("a.ts");
 
 describe("word-index build/update key convergence (#1025 item #2)", () => {
+	it("serializes postings under a spelling-divergent docLengths key", () => {
+		const index = buildWordIndex([
+			{ path: "walk\\alpha.ts", content: "foldedToken" },
+			{ path: "walk/alpha.ts", content: "foldedToken" },
+		]);
+		// Two walk spellings fold to one path key, so the file table interned ONE
+		// file id, keyed on the FOLDED form. The serializer enumerates files from
+		// `docLengths`, which yields the raw display spelling, so its slot lookup
+		// must fold too. The backslash spelling below differs from its folded form
+		// on every platform, so a raw-string lookup finds nothing and silently
+		// drops every posting — on Linux CI as well as Windows.
+		const divergent = "walk\\alpha.ts";
+		expect(wordIndexKey(divergent)).not.toBe(divergent);
+		expect(wordIndexKey(divergent)).toBe(wordIndexKey("walk/alpha.ts"));
+		index.docLengths.clear();
+		index.docLengths.set(divergent, 1);
+		const serializedEntries = serializeWordIndex(index).postings.reduce(
+			(total, [, flat]) => total + flat.length / 2,
+			0,
+		);
+		expect(serializedEntries).toBeGreaterThan(0);
+		expect(serializedEntries).toBe(countWordIndexPostingEntries(index));
+	});
+
+	it("serializes folded walk spellings with the live file table intact", () => {
+		const index = buildWordIndex([
+			{ path: "walk\\alpha.ts", content: "firstWalkToken" },
+			{ path: "walk/alpha.ts", content: "secondWalkToken" },
+		]);
+		const serialized = serializeWordIndex(index);
+		const tokens = new Set(serialized.postings.map(([token]) => token));
+		expect(tokens.has("firstwalktoken")).toBe(true);
+		expect(tokens.has("secondwalktoken")).toBe(true);
+		expect(
+			serialized.postings.reduce((n, [, flat]) => n + flat.length / 2, 0),
+		).toBe(countWordIndexPostingEntries(index));
+	});
+
 	it("separator-divergent build vs edit forms collapse to one entry (all platforms)", () => {
 		// BUILD keys the doc with a backslash separator (as a Windows walk would).
 		const index = buildWordIndex([
@@ -60,12 +101,14 @@ describe("word-index build/update key convergence (#1025 item #2)", () => {
 
 		// The update REPLACED the doc: `beta` (added) is present, and every `alpha`
 		// posting points at the single current doc — no stale duplicate posting.
-		const alphaPostings = index.postings.get("alpha") ?? [];
+		const alphaPostings = wordIndexPostingHits(index, "alpha");
 		expect(alphaPostings).toHaveLength(1);
 		expect(index.postings.get("beta")).toBeDefined();
 		// All postings normalize to the one file key (no split across two forms).
 		const distinctKeys = new Set(
-			[...index.postings.values()].flat().map((hit) => wordIndexKey(hit.file)),
+			[...index.postings.keys()]
+				.flatMap((token) => wordIndexPostingHits(index, token))
+				.map((hit) => wordIndexKey(hit.file)),
 		);
 		expect(distinctKeys.size).toBe(1);
 	});
@@ -140,7 +183,7 @@ describe("word-index incremental refresh key convergence (#1025 review)", () => 
 			expect(result.reused).toBe(1);
 			expect(index.docCount).toBe(1);
 			// Postings survive untouched — no drop-before-readd regression window.
-			expect(index.postings.get("alpha")).toHaveLength(1);
+			expect(wordIndexPostingHits(index, "alpha")).toHaveLength(1);
 		} finally {
 			env.cleanup();
 		}

@@ -738,7 +738,7 @@ describe("anchor path-form stability (#1024 — write raw vs read normalized)", 
 	// the "resolved" diagnostic kept re-firing (a #533 dropped-signal). The fix
 	// canonicalizes both inputs through `normalizeMapKey` inside `relativeFile`,
 	// so write and read derive identical anchors regardless of the form held.
-	it("finds a false-positive mark written under a raw (mis-cased) path form when applied via the normalizeMapKey form", () => {
+	it("finds a false-positive mark written under a raw (mis-cased) path form when applied via the normalizeMapKey form", (ctx) => {
 		const projectDir = cwd();
 		// Real on-disk casing: lowercase `sub`.
 		const subDirOnDisk = path.join(projectDir, "sub");
@@ -761,10 +761,14 @@ describe("anchor path-form stability (#1024 — write raw vs read normalized)", 
 		// to one anchor. On a case-sensitive FS (Linux CI) they are genuinely
 		// DIFFERENT files: realpath of the non-existent `SUB` can't unify them and
 		// must not, so there is nothing to regress. Probe the actual filesystem (not
-		// the OS name) and skip honestly when mis-casing doesn't alias. (The prior
-		// `rawRel === normRel` guard mis-fired on Linux — the forms differ textually
-		// there but never alias — which surfaced as a CI failure on #1024's PR.)
-		if (!fs.existsSync(rawFile)) return;
+		// the OS name) and skip VISIBLY when mis-casing doesn't alias — a bare
+		// return would report a pass (#2089). (The prior `rawRel === normRel` guard
+		// mis-fired on Linux — the forms differ textually there but never alias —
+		// which surfaced as a CI failure on #1024's PR.)
+		ctx.skip(
+			!fs.existsSync(rawFile),
+			"case-sensitive filesystem: SUB/a.ts does not alias sub/a.ts",
+		);
 
 		const diag = {
 			tool: "eslint",

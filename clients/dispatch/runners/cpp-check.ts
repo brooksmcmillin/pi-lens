@@ -210,7 +210,6 @@ const cppCheckRunner: RunnerDefinition = {
 	id: "cpp-check",
 	appliesTo: ["cxx"],
 	priority: PRIORITY.GENERAL_ANALYSIS,
-	enabledByDefault: true,
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {

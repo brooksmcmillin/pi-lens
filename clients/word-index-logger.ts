@@ -24,6 +24,7 @@ import { isTestMode } from "./env-utils.js";
 import { getGlobalPiLensDir } from "./file-utils.js";
 import { getMaxLogSizeMB } from "./log-cleanup.js";
 import { createNdjsonLogger } from "./ndjson-logger.js";
+import { normalizeFilePath } from "./path-utils.js";
 
 const WORD_INDEX_LOG_FILE = path.join(getGlobalPiLensDir(), "word-index.log");
 
@@ -60,6 +61,9 @@ export interface WordIndexLogEntry {
 	/** Which lifecycle produced this: "session_start" | "cold_query" | "per_edit". */
 	trigger?: string;
 	durationMs?: number;
+	/** Persist split: wire assembly on the host versus snapshot dispatch/write. */
+	serializeMs?: number;
+	writeMs?: number;
 	phaseDurationsMs?: {
 		snapshotLoadMs?: number;
 		deserializeMs?: number;
@@ -74,6 +78,20 @@ export interface WordIndexLogEntry {
 	truncated?: boolean;
 	/** Distinct token count (postings.size) — index breadth at a glance. */
 	tokens?: number;
+	/** Total in-memory posting entries (sum of posting-list lengths). */
+	postingEntries?: number;
+	/**
+	 * Estimated resident bytes of the index’s packed stores (#2069). `tokens`
+	 * and `postingEntries` describe breadth; this is the number that actually
+	 * governs memory, so a heap census can be reconciled against this log
+	 * without taking a snapshot. Divide by `postingEntries` for the per-entry
+	 * cost the #2069 acceptance criterion is written against.
+	 */
+	residentBytes?: number;
+	/** Aggregate per-edit replacement cost for the pending turn/burst. */
+	replacementCount?: number;
+	totalReplacementMs?: number;
+	maxReplacementMs?: number;
 	/** Incremental: docs re-tokenized because their mtime changed. */
 	refreshed?: number;
 	/** Incremental: docs removed because they left the current file set. */
@@ -97,11 +115,22 @@ export interface WordIndexLogEntry {
 	error?: string;
 }
 
+/**
+ * #2141 class sweep: mirrors review-graph-logger.ts's `cwd` normalization.
+ * Call sites here feed both raw roots (`snapshotRoot`, `path.resolve(cwd)`)
+ * and pre-normalized cache keys (`key`), so the same root could show up in
+ * two path forms. Normalizing once at this shared emit seam closes that for
+ * every call site, present and future.
+ */
 export function logWordIndex(entry: WordIndexLogEntry): void {
 	if (isTestMode()) {
 		return;
 	}
-	writer.log({ ts: new Date().toISOString(), ...entry });
+	writer.log({
+		ts: new Date().toISOString(),
+		...entry,
+		cwd: normalizeFilePath(entry.cwd),
+	});
 }
 
 export function getWordIndexLogPath(): string {

@@ -16,6 +16,7 @@ import { logExtension } from "../../extension-log.js";
 import { getLspCapableKinds } from "../../language-policy.js";
 import { touchCoverageGap } from "../../lsp/diagnostic-binding.js";
 import { getLSPService } from "../../lsp/index.js";
+import { LSP_SERVERS } from "../../lsp/server.js";
 import { RUNTIME_CONFIG } from "../../runtime-config.js";
 import { PRIORITY } from "../priorities.js";
 import { resolveRunnerPath } from "../runner-context.js";
@@ -47,8 +48,48 @@ const LSP_SPAWN_BUDGET_MS = RUNTIME_CONFIG.pipeline.lspSpawnBudgetMs;
 // can't dominate the per-edit pipeline budget. Diagnostics that arrive
 // after the cap still land in the client's cache and surface on the
 // next edit. Overridable via PI_LENS_LSP_DIAGNOSTICS_MAX_WAIT_MS.
-const LSP_DIAGNOSTICS_WAIT_MS = 2500;
+export const LSP_DIAGNOSTICS_WAIT_MS = 2500;
 const MAX_CODE_ACTION_TITLES = 3;
+
+/**
+ * Fixed margin above the worst-case cold-spawn-plus-diagnostics wait, so
+ * scheduling jitter alone can't reopen the F2 race below.
+ */
+const LSP_COLD_SPAWN_MARGIN_MS = 5_000;
+
+/**
+ * This runner's own dispatch wall-clock budget. `runRunner` in
+ * `dispatcher.ts` races `runner.timeoutMs ?? RUNNER_TIMEOUT_MS` (30s)
+ * against `runner.run()` for the WHOLE call — reading the file, waiting for
+ * a client (bounded by `LSP_SPAWN_BUDGET_MS`, raised per-server via
+ * `LSPServerInfo.clientWaitTimeoutMs`), then waiting for diagnostics
+ * (`LSP_DIAGNOSTICS_WAIT_MS`).
+ *
+ * Left undeclared, this runner inherited the shared 30s default. A server
+ * whose `clientWaitTimeoutMs` exceeds that — Prisma's 40s, Vue's 30s
+ * (#2169, #2176) — could never actually use its own raised wait: the outer
+ * race always fired first, at 30s, so raising a server's floor without also
+ * raising this ceiling was a no-op on the real dispatch path (fix-round F2,
+ * #2233). Derive the ceiling from the registry instead of a second
+ * hand-picked literal, so the next slow server's `clientWaitTimeoutMs` keeps
+ * this budget correct automatically: the highest declared
+ * `clientWaitTimeoutMs` (or the shared 5s default, whichever is larger),
+ * plus the diagnostics wait that still runs after a cold spawn succeeds,
+ * plus a fixed margin.
+ *
+ * This raises the failure-detection latency for every OTHER language's
+ * hung-server case too (30s -> the value below), not just the five servers
+ * that need the headroom — the tradeoff is stated in PR #2233's body. It
+ * remains well inside the spread other dispatch runners already use
+ * (pyright 75s, golangci-lint/dotnet-build/rust-clippy 90s).
+ */
+export const LSP_RUNNER_TIMEOUT_MS =
+	Math.max(
+		LSP_SPAWN_BUDGET_MS,
+		...LSP_SERVERS.map((server) => server.clientWaitTimeoutMs ?? 0),
+	) +
+	LSP_DIAGNOSTICS_WAIT_MS +
+	LSP_COLD_SPAWN_MARGIN_MS;
 
 function normalizeActionTitle(title: string): string {
 	return title.replace(/\s+/g, " ").trim();
@@ -83,7 +124,7 @@ const lspRunner: RunnerDefinition = {
 	// is now the only step this seam needs (#1545).
 	appliesTo: getLspCapableKinds(),
 	priority: PRIORITY.LSP_PRIMARY,
-	enabledByDefault: true,
+	timeoutMs: LSP_RUNNER_TIMEOUT_MS,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
 		const diagnosticPath = resolveRunnerPath(ctx.cwd, ctx.filePath);

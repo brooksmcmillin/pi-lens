@@ -74,7 +74,6 @@ const ruffRunner: RunnerDefinition = {
 	id: "ruff-lint",
 	appliesTo: ["python"],
 	priority: PRIORITY.FORMAT_AND_LINT_PRIMARY,
-	enabledByDefault: true,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
 		const cwd = ctx.cwd || process.cwd();

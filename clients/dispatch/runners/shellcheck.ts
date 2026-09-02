@@ -138,7 +138,6 @@ const shellcheckRunner: RunnerDefinition = {
 	id: "shellcheck",
 	appliesTo: ["shell"],
 	priority: PRIORITY.GENERAL_ANALYSIS,
-	enabledByDefault: true,
 	skipTestFiles: false, // Shell scripts in test directories should still be checked
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {

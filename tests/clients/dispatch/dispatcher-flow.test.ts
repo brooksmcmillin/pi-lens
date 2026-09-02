@@ -12,7 +12,9 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
 	clearCoverageNoticeState,
+	clearLatencyReports,
 	createDispatchContext,
+	getLatencyReports,
 	RunnerRegistry,
 	dispatchForFile as runDispatchForFile,
 } from "../../../clients/dispatch/dispatcher.js";
@@ -46,6 +48,7 @@ describe("Dispatch Flow", () => {
 	beforeEach(() => {
 		registry = new RunnerRegistry();
 		clearCoverageNoticeState();
+		clearLatencyReports();
 	});
 
 	describe("Runner Registration", () => {
@@ -214,7 +217,6 @@ describe("Dispatch Flow", () => {
 				id: "lsp",
 				appliesTo: ["go"],
 				priority: 4,
-				enabledByDefault: true,
 				async run() {
 					return { status: "skipped", diagnostics: [], semantic: "none" };
 				},
@@ -223,7 +225,6 @@ describe("Dispatch Flow", () => {
 				id: "go-vet",
 				appliesTo: ["go"],
 				priority: 12,
-				enabledByDefault: true,
 				async run() {
 					return { status: "skipped", diagnostics: [], semantic: "none" };
 				},
@@ -232,7 +233,6 @@ describe("Dispatch Flow", () => {
 				id: "golangci-lint",
 				appliesTo: ["go"],
 				priority: 14,
-				enabledByDefault: true,
 				async run() {
 					return { status: "skipped", diagnostics: [], semantic: "none" };
 				},
@@ -241,7 +241,6 @@ describe("Dispatch Flow", () => {
 				id: "tree-sitter",
 				appliesTo: ["go"],
 				priority: 20,
-				enabledByDefault: true,
 				async run() {
 					return { status: "succeeded", diagnostics: [], semantic: "none" };
 				},
@@ -271,7 +270,6 @@ describe("Dispatch Flow", () => {
 				id: "lsp",
 				appliesTo: ["go"],
 				priority: 4,
-				enabledByDefault: true,
 				async run() {
 					return { status: "skipped", diagnostics: [], semantic: "none" };
 				},
@@ -280,7 +278,6 @@ describe("Dispatch Flow", () => {
 				id: "go-vet",
 				appliesTo: ["go"],
 				priority: 12,
-				enabledByDefault: true,
 				async run() {
 					return { status: "skipped", diagnostics: [], semantic: "none" };
 				},
@@ -289,7 +286,6 @@ describe("Dispatch Flow", () => {
 				id: "eslint",
 				appliesTo: ["jsts"],
 				priority: 15,
-				enabledByDefault: true,
 				async run() {
 					return { status: "succeeded", diagnostics: [], semantic: "none" };
 				},
@@ -326,12 +322,90 @@ describe("Dispatch Flow", () => {
 			expect(result.hasBlockers).toBe(true);
 		});
 
+		it("skips runners that do not apply to the file kind in a group", async () => {
+			const calls: string[] = [];
+			registerRunner(
+				createMockRunner({
+					id: "python-only",
+					appliesTo: ["python"],
+					runResult: {
+						status: "succeeded",
+						diagnostics: [
+							{
+								id: "wrong-kind",
+								message: "must not run",
+								filePath: "test.ts",
+								severity: "error",
+								semantic: "blocking",
+								tool: "python-only",
+							},
+						],
+						semantic: "blocking",
+					},
+				}),
+			);
+			registerRunner(
+				createMockRunner({
+					id: "all-kinds",
+					appliesTo: [],
+					runResult: {
+						status: "succeeded",
+						diagnostics: [],
+						semantic: "none",
+					},
+					when: () => {
+						calls.push("all-kinds");
+						return true;
+					},
+				}),
+			);
+			registerRunner(
+				createMockRunner({
+					id: "jsts-only",
+					appliesTo: ["jsts"],
+					runResult: {
+						status: "succeeded",
+						diagnostics: [],
+						semantic: "none",
+					},
+					when: () => {
+						calls.push("jsts-only");
+						return true;
+					},
+				}),
+			);
+
+			const ctx = createMockContext("test.ts");
+			const result = await dispatchForFile(ctx, [
+				{
+					mode: "all",
+					runnerIds: ["python-only", "all-kinds", "jsts-only"],
+					filterKinds: ["jsts"],
+				},
+			]);
+
+			expect(calls).toEqual(["all-kinds", "jsts-only"]);
+			expect(result.diagnostics).toEqual([]);
+			const report = getLatencyReports().at(-1);
+			expect(report?.runners).toContainEqual(
+				expect.objectContaining({
+					runnerId: "python-only",
+					status: "skipped",
+				}),
+			);
+			expect(report?.runners).not.toContainEqual(
+				expect.objectContaining({
+					runnerId: "python-only",
+					status: "failed",
+				}),
+			);
+		});
+
 		it("suppresses overlapping non-blocking lint warnings when LSP reports same span/class", async () => {
 			registerRunner({
 				id: "lsp",
 				appliesTo: ["jsts"],
 				priority: 4,
-				enabledByDefault: true,
 				async run() {
 					return {
 						status: "succeeded",
@@ -356,7 +430,6 @@ describe("Dispatch Flow", () => {
 				id: "eslint",
 				appliesTo: ["jsts"],
 				priority: 12,
-				enabledByDefault: true,
 				async run() {
 					return {
 						status: "succeeded",
@@ -407,7 +480,6 @@ describe("Dispatch Flow", () => {
 				id: "code-path",
 				appliesTo: ["jsts"],
 				priority: 10,
-				enabledByDefault: true,
 				async run() {
 					return {
 						status: "succeeded",
@@ -440,7 +512,6 @@ describe("Dispatch Flow", () => {
 				id: "first-fail",
 				appliesTo: ["jsts"],
 				priority: 10,
-				enabledByDefault: true,
 				async run() {
 					calls.push("first-fail");
 					return {
@@ -464,7 +535,6 @@ describe("Dispatch Flow", () => {
 				id: "second-success",
 				appliesTo: ["jsts"],
 				priority: 11,
-				enabledByDefault: true,
 				async run() {
 					calls.push("second-success");
 					return {
@@ -488,7 +558,6 @@ describe("Dispatch Flow", () => {
 				id: "third-skipped",
 				appliesTo: ["jsts"],
 				priority: 12,
-				enabledByDefault: true,
 				async run() {
 					calls.push("third-skipped");
 					return { status: "succeeded", diagnostics: [], semantic: "none" };
@@ -739,13 +808,148 @@ describe("Dispatch Flow", () => {
 		});
 	});
 
+	// #2337: ast-grep-napi declares skipTestFiles: true, but that flag was only
+	// enforced in RunnerRegistry.getForKind. The jsts write-group path
+	// (clients/dispatch/plan.ts) resolves runners by id via registry.get() and
+	// runs them through runGroup, which never consulted skipTestFiles — so a
+	// runner declaring the flag still ran, and reported findings, on test files.
+	describe("skipTestFiles (dispatcher-level gate, #2337)", () => {
+		const skipRunnerResult = () => ({
+			status: "succeeded" as const,
+			diagnostics: [
+				{
+					id: "napi-finding",
+					message: "should not fire on test files",
+					filePath: "auth.test.ts",
+					severity: "warning" as const,
+					semantic: "warning" as const,
+					tool: "skip-test-runner",
+				},
+			],
+			semantic: "warning" as const,
+		});
+
+		it("skips a skipTestFiles runner via the group/plan path on a test file", async () => {
+			registerRunner(
+				createMockRunner({
+					id: "skip-test-runner",
+					appliesTo: ["jsts"],
+					skipTestFiles: true,
+					runResult: skipRunnerResult(),
+				}),
+			);
+
+			const ctx = createMockContext("auth.test.ts");
+			const groups: RunnerGroup[] = [
+				{
+					mode: "all",
+					runnerIds: ["skip-test-runner"],
+					filterKinds: ["jsts"],
+				},
+			];
+
+			const result = await dispatchForFile(ctx, groups);
+
+			expect(result.diagnostics).toHaveLength(0);
+			const report = getLatencyReports().at(-1);
+			expect(
+				report?.runners.find((r) => r.runnerId === "skip-test-runner")?.status,
+			).toBe("test_file_skipped");
+		});
+
+		it("still runs a skipTestFiles runner on a non-test file", async () => {
+			registerRunner(
+				createMockRunner({
+					id: "skip-test-runner",
+					appliesTo: ["jsts"],
+					skipTestFiles: true,
+					runResult: skipRunnerResult(),
+				}),
+			);
+
+			const ctx = createMockContext("auth.ts");
+			const groups: RunnerGroup[] = [
+				{
+					mode: "all",
+					runnerIds: ["skip-test-runner"],
+					filterKinds: ["jsts"],
+				},
+			];
+
+			const result = await dispatchForFile(ctx, groups);
+
+			expect(result.diagnostics.map((d) => d.id)).toEqual(["napi-finding"]);
+		});
+
+		it("still runs a runner that does not declare skipTestFiles on a test file", async () => {
+			registerRunner(
+				createMockRunner({
+					id: "plain-runner",
+					appliesTo: ["jsts"],
+					runResult: {
+						status: "succeeded",
+						diagnostics: [
+							{
+								id: "plain-finding",
+								message: "runs on test files too",
+								filePath: "auth.test.ts",
+								severity: "warning",
+								semantic: "warning",
+								tool: "plain-runner",
+							},
+						],
+						semantic: "warning",
+					},
+				}),
+			);
+
+			const ctx = createMockContext("auth.test.ts");
+			const groups: RunnerGroup[] = [
+				{
+					mode: "all",
+					runnerIds: ["plain-runner"],
+					filterKinds: ["jsts"],
+				},
+			];
+
+			const result = await dispatchForFile(ctx, groups);
+
+			expect(result.diagnostics.map((d) => d.id)).toEqual(["plain-finding"]);
+			const report = getLatencyReports().at(-1);
+			expect(
+				report?.runners.find((r) => r.runnerId === "plain-runner")?.status,
+			).toBe("succeeded");
+		});
+
+		it("does not fire onRunnerResult for a skipTestFiles runner on a test file", async () => {
+			registerRunner(
+				createMockRunner({
+					id: "skip-test-runner",
+					appliesTo: ["jsts"],
+					skipTestFiles: true,
+					runResult: skipRunnerResult(),
+				}),
+			);
+
+			const ctx = createMockContext("auth.test.ts");
+			const ids: string[] = [];
+			await runDispatchForFile(
+				ctx,
+				[{ mode: "all", runnerIds: ["skip-test-runner"] }],
+				registry,
+				(id) => ids.push(id),
+			);
+
+			expect(ids).toEqual([]);
+		});
+	});
+
 	describe("Per-runner result sink (onRunnerResult)", () => {
 		it("fires once per executed runner with its exact result incl. failureKind", async () => {
 			registerRunner({
 				id: "ok",
 				appliesTo: ["jsts"],
 				priority: 10,
-				enabledByDefault: true,
 				async run() {
 					return {
 						status: "succeeded",
@@ -767,7 +971,6 @@ describe("Dispatch Flow", () => {
 				id: "boom",
 				appliesTo: ["jsts"],
 				priority: 11,
-				enabledByDefault: true,
 				async run() {
 					throw new Error("kaboom");
 				},
@@ -804,7 +1007,6 @@ describe("Dispatch Flow", () => {
 				id: "skipme",
 				appliesTo: ["jsts"],
 				priority: 10,
-				enabledByDefault: true,
 				when: async () => false,
 				async run() {
 					return { status: "succeeded", diagnostics: [], semantic: "none" };
@@ -844,6 +1046,6 @@ function setBaselineFacts(
 ): void {
 	const absKey = `session.baseline.${normalizeMapKey(normalizedFilePath)}`;
 	const relKey = `session.baseline.${normalizeMapKey("test.ts")}`;
-	facts.setSessionFact(absKey, diagnostics);
-	facts.setSessionFact(relKey, diagnostics);
+	facts.setBoundedSessionFact(absKey, diagnostics);
+	facts.setBoundedSessionFact(relKey, diagnostics);
 }

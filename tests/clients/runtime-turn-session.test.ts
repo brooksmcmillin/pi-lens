@@ -1,8 +1,13 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { CacheManager } from "../../clients/cache-manager.js";
 import { snapshotAdvisoryProvenance } from "../../clients/advisory-provenance.js";
+import {
+	_boundedTurnCountForTest,
+	resetBoundedTelemetry,
+} from "../../clients/bounded-telemetry.js";
+import { CacheManager } from "../../clients/cache-manager.js";
+import { resetDegradationLedger } from "../../clients/degradation-ledger.js";
 import {
 	evaluateGitGuard,
 	mergeGitGuardTestFailure,
@@ -13,8 +18,17 @@ import {
 	consumeTurnEndFindings,
 } from "../../clients/runtime-context.js";
 import { loadProjectDiagnosticsDeltaReport } from "../../clients/project-diagnostics/cache.js";
+import {
+	clearLatencyLog,
+	flushLatencyLog,
+	getLatencyLogPath,
+} from "../../clients/latency-logger.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { SESSION_START_GUIDANCE } from "../../clients/runtime-session.js";
+import {
+	registerPrimarySession,
+	releasePrimarySession,
+} from "../../clients/session-lifecycle.js";
 import {
 	cancelLSPIdleReset,
 	getEffectiveLspIdleResetMs,
@@ -24,6 +38,7 @@ import {
 	checkCrossProcessLspBudget,
 	_resetLspBudgetDecisionForTests,
 } from "../../clients/lsp-budget.js";
+import { RUNNERS, TestRunnerClient } from "../../clients/test-runner-client.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
 const EMPTY_KNIP_RESULT = {
@@ -220,6 +235,69 @@ describe("LSP idle reset", () => {
 			cancelLSPIdleReset();
 			vi.useRealTimers();
 			emitWarning.mockRestore();
+			env.cleanup();
+		}
+	});
+
+	// #2157 fix round 2: the idle-reset timer must respect the SAME
+	// primary-registration gate as the `pipeline_crash` reset in
+	// `runtime-tool-result.ts` — a secondary (subagent) evaluation's own idle
+	// timer must not tear down the primary's shared fleet, while the primary's
+	// own idle timer must still reset it (both directions asserted).
+	it("does not let a secondary session's idle timer reset the primary fleet", async () => {
+		const env = setupTestEnvironment("pi-lens-idle-secondary-");
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+		const resetLSPService = vi.fn();
+
+		registerPrimarySession({}, "primary-session", env.tmpDir);
+		runtime.setSessionLifecycle({ sessionId: "secondary-session" });
+
+		vi.useFakeTimers();
+		try {
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, {
+					ctxCwd: env.tmpDir,
+					resetLSPService,
+				}),
+			);
+
+			await vi.advanceTimersByTimeAsync(getEffectiveLspIdleResetMs());
+
+			expect(resetLSPService).not.toHaveBeenCalled();
+		} finally {
+			cancelLSPIdleReset();
+			releasePrimarySession();
+			vi.useRealTimers();
+			env.cleanup();
+		}
+	});
+
+	it("still resets the fleet when the PRIMARY session's own idle timer fires", async () => {
+		const env = setupTestEnvironment("pi-lens-idle-primary-");
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+		const resetLSPService = vi.fn();
+
+		runtime.setSessionLifecycle({ sessionId: "primary-session" });
+		registerPrimarySession({}, "primary-session", env.tmpDir);
+
+		vi.useFakeTimers();
+		try {
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, {
+					ctxCwd: env.tmpDir,
+					resetLSPService,
+				}),
+			);
+
+			await vi.advanceTimersByTimeAsync(getEffectiveLspIdleResetMs());
+
+			expect(resetLSPService).toHaveBeenCalledTimes(1);
+		} finally {
+			cancelLSPIdleReset();
+			releasePrimarySession();
+			vi.useRealTimers();
 			env.cleanup();
 		}
 	});
@@ -2372,16 +2450,22 @@ describe("turn_end test runner — cascade neighbors get their own test companio
 				}
 				return null;
 			});
-			const runTestFileAsync = vi.fn(async (testFile: string) => ({
-				file: testFile,
-				sourceFile: "",
-				runner: "vitest",
-				passed: 1,
-				failed: 0,
-				skipped: 0,
-				failures: [],
-				duration: 1,
-			}));
+			const runTestFileAsync = vi.fn(
+				async (
+					testFile: string,
+					_cwd?: string,
+					_request?: { turnIndex?: number },
+				) => ({
+					file: testFile,
+					sourceFile: "",
+					runner: "vitest",
+					passed: 1,
+					failed: 0,
+					skipped: 0,
+					failures: [],
+					duration: 1,
+				}),
+			);
 
 			await handleTurnEnd(
 				makeTurnEndDeps(runtime, cacheManager, {
@@ -2398,7 +2482,88 @@ describe("turn_end test runner — cascade neighbors get their own test companio
 			const firedTestFiles = runTestFileAsync.mock.calls.map((c) => c[0]);
 			expect(firedTestFiles).toContain(fooTestFile);
 			expect(firedTestFiles).toContain(barTestFile);
+			for (const call of runTestFileAsync.mock.calls) {
+				expect(call[2]).toMatchObject({ turnIndex: runtime.turnIndex });
+			}
 		} finally {
+			env.cleanup();
+		}
+	});
+
+	// #2044 review: the hand-written doubles above cannot prove originating-turn
+	// propagation through REAL selection, REAL recording, and the REAL sink.
+	// This test wires the actual TestRunnerClient into handleTurnEnd.
+	it("retires a deleted failed target through the real client and records real telemetry", async () => {
+		const env = setupTestEnvironment("pi-lens-test-real-2044-");
+		const previousTestMode = process.env.PI_LENS_TEST_MODE;
+		process.env.PI_LENS_TEST_MODE = "0";
+		try {
+			resetDegradationLedger();
+			resetBoundedTelemetry();
+			clearLatencyLog();
+			await flushLatencyLog();
+
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId: "real-2044-session" });
+			const cacheManager = new CacheManager(false);
+
+			fs.writeFileSync(
+				path.join(env.tmpDir, "go.mod"),
+				"module example.com/tmp\n",
+			);
+			const editedFile = path.join(env.tmpDir, "widget.go");
+			const staleTest = path.join(env.tmpDir, "stale_test.go");
+			fs.writeFileSync(editedFile, "package widget\n");
+			fs.writeFileSync(staleTest, "package widget\n");
+			cacheManager.addModifiedRange(
+				editedFile,
+				{ start: 1, end: 1 },
+				false,
+				env.tmpDir,
+				"real-2044-session",
+			);
+
+			const testRunnerClient = new TestRunnerClient(false);
+			const seeded = await testRunnerClient.runTestFileAsync(
+				staleTest,
+				env.tmpDir,
+				{
+					runner: "go",
+					config: {
+						...RUNNERS.go,
+						command: process.execPath,
+						binName: "pi-lens-real-2044-runner",
+						args: (testFile: string) => [
+							"-e",
+							"console.log('--- FAIL: fixture'); process.exitCode = 1;",
+							testFile,
+						],
+					},
+					turnIndex: runtime.turnIndex,
+				},
+			);
+			expect(seeded.failed).toBe(1);
+			fs.rmSync(staleTest);
+
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, {
+					ctxCwd: env.tmpDir,
+					testRunnerClient,
+				}),
+			);
+			await flushLatencyLog();
+
+			// Real selection retired the missing path and the real sink recorded it.
+			const log = fs.readFileSync(getLatencyLogPath(), "utf8");
+			expect(log).toContain('"phase":"test_runner_failed_target_state"');
+			expect(log).toContain('"outcome":"retired-missing"');
+			expect(log).toContain('"runner":"go"');
+		} finally {
+			if (previousTestMode === undefined) {
+				delete process.env.PI_LENS_TEST_MODE;
+			} else {
+				process.env.PI_LENS_TEST_MODE = previousTestMode;
+			}
 			env.cleanup();
 		}
 	});

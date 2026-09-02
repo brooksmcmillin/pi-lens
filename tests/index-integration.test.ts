@@ -4,8 +4,17 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CacheManager } from "../clients/cache-manager.js";
 import { getEffectiveLspIdleResetMs } from "../clients/runtime-turn.js";
-import { createPiMock, makeCtx } from "./support/pi-mock.js";
+import { createPiMock, makeCtx, makeStaleCtx } from "./support/pi-mock.js";
 import { removeTempDirSync } from "./clients/test-utils.js";
+// #2146: process-scope state (the primary-session registration, the instance
+// registry's mutation tail) now lives on `globalThis`, so `vi.resetModules()`
+// no longer clears it — that is the fix, not a regression. This suite gives
+// every case a cold extension graph, so it must reset the process state too.
+import { _resetProcessSingletonsForTests } from "../clients/process-singletons.js";
+
+const r6Mocks = vi.hoisted(() => ({
+	incrementDegradationCount: vi.fn(),
+}));
 
 // This suite predates the consolidated harness and is written against the
 // legacy `{ pi, handlers, commands }` shape. Adapt the canonical createPiMock
@@ -31,6 +40,7 @@ function createMockPi(overrides: Record<string, boolean> = {}) {
 		...overrides,
 	});
 	return {
+		mock,
 		pi: mock.asExtensionAPI(),
 		// #484: raw mock recordings not on the ExtensionAPI type surface
 		// (sentMessages, messageRenderers) — exposed directly for tests that
@@ -129,6 +139,7 @@ describe("index.ts integration", () => {
 	beforeEach(() => {
 		vi.resetModules();
 		vi.clearAllMocks();
+		_resetProcessSingletonsForTests();
 		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-index-int-"));
 		originalStartupMode = process.env.PI_LENS_STARTUP_MODE;
 		process.env.PI_LENS_STARTUP_MODE = "quick";
@@ -376,31 +387,40 @@ describe("index.ts integration", () => {
 			const telemetry =
 				await import("../clients/path-attribution-telemetry.js");
 			const { default: registerExtension } = await import("../index.js");
-			const primary = createMockPi();
-			registerExtension(primary.pi as any);
-			await primary.trigger(
+			const primary = createPiMock({
+				"lens-lsp": true,
+				"no-lsp": false,
+				"lens-guard": false,
+			});
+			registerExtension(primary.asExtensionAPI());
+			await primary.emit(
 				"session_start",
 				{},
 				makeCtx({ cwd: tmpDir, sessionId: "primary" }),
 			);
+			telemetry.recordVerifiedPathAttributionGuess();
 			const lspServer = await import("../clients/lsp/server.js");
 			lspServer._markDirectLspCommandUnavailableForTests(
 				"secondary-must-not-reset",
 			);
-			const secondary = createMockPi();
-			registerExtension(secondary.pi as any);
-			await secondary.trigger(
+			const secondary = createPiMock({
+				"lens-lsp": true,
+				"no-lsp": false,
+				"lens-guard": false,
+			});
+			registerExtension(secondary.asExtensionAPI());
+			await secondary.emit(
 				"session_start",
 				{},
 				makeCtx({ cwd: tmpDir, sessionId: "secondary" }),
 			);
+			expect(telemetry.getVerifiedPathAttributionGuessCount()).toBe(1);
 			expect(
 				lspServer.isDirectLspCommandTemporarilyUnavailable(
 					"secondary-must-not-reset",
 				),
 			).toBe(true);
-			telemetry.recordVerifiedPathAttributionGuess();
-			await secondary.trigger(
+			await secondary.emit(
 				"session_shutdown",
 				{},
 				makeCtx({ cwd: tmpDir, sessionId: "secondary" }),
@@ -413,7 +433,7 @@ describe("index.ts integration", () => {
 				),
 			).toHaveLength(0);
 			expect(telemetry.getVerifiedPathAttributionGuessCount()).toBe(1);
-			await primary.trigger(
+			await primary.emit(
 				"session_shutdown",
 				{},
 				makeCtx({ cwd: tmpDir, sessionId: "primary" }),
@@ -426,6 +446,193 @@ describe("index.ts integration", () => {
 				),
 			).toHaveLength(1);
 			expect(telemetry.getVerifiedPathAttributionGuessCount()).toBe(0);
+		},
+		INTEGRATION_TIMEOUT_MS,
+	);
+
+	// #2249: the declined-bind rollup. Same primary-only reset/emit placement
+	// as the verified-attribution tally above, but process-singleton backed
+	// (AGENTS.md catalog shape 25) rather than a module-scope `let`, and the
+	// counter is driven by the REAL decideSessionStart decline path rather
+	// than a manual record call, so these also exercise the production wiring
+	// end to end.
+	it(
+		"a NEW primary's session_start clears a stale rollup left by a crashed prior primary",
+		async () => {
+			const logLatency = vi.fn();
+			vi.doMock("../clients/latency-logger.js", async (importActual) => ({
+				...(await importActual<
+					typeof import("../clients/latency-logger.js")
+				>()),
+				logLatency,
+			}));
+			const observability =
+				await import("../clients/session-start-observability.js");
+			// Simulates a prior primary session that logged a decline and then
+			// never reached session_shutdown (crash/forced kill) — the counters
+			// are process-wide (globalThis-backed) state that outlives it.
+			observability.logConcurrentSessionBind({
+				secondaryCount: 1,
+				sameCwd: true,
+				classification: "concurrent-secondary",
+			});
+			const { default: registerExtension } = await import("../index.js");
+			const { pi, handlers } = createMockPi();
+			registerExtension(pi as any);
+			await handlers.session_start?.[0]?.(
+				{},
+				makeCtx({ cwd: tmpDir, sessionId: "primary" }),
+			);
+			expect(observability.getConcurrentSessionBindRollupCounts()).toEqual({
+				"concurrent-secondary": 0,
+				"secondary-root": 0,
+				unclassified: 0,
+			});
+			// #2312 review F1: the crashed prior primary never reached
+			// session_shutdown, so its tally would otherwise be silently
+			// discarded by the reset above instead of summarized. The fresh
+			// primary's session_start must emit the stale tally before
+			// clearing it — exactly one row, not zero and not more.
+			const rollups = logLatency.mock.calls.filter(
+				([row]) =>
+					(row as { phase?: string }).phase ===
+					"concurrent_session_bind_rollup",
+			);
+			expect(rollups).toHaveLength(1);
+			expect(rollups[0][0]).toEqual(
+				expect.objectContaining({
+					phase: "concurrent_session_bind_rollup",
+					metadata: {
+						"concurrent-secondary": 1,
+						"secondary-root": 0,
+						unclassified: 0,
+					},
+				}),
+			);
+		},
+		INTEGRATION_TIMEOUT_MS,
+	);
+
+	it(
+		"primary session_shutdown emits one concurrent-session-bind rollup and clears it, while zero stays silent",
+		async () => {
+			const logLatency = vi.fn();
+			vi.doMock("../clients/latency-logger.js", async (importActual) => ({
+				...(await importActual<
+					typeof import("../clients/latency-logger.js")
+				>()),
+				logLatency,
+			}));
+			const observability =
+				await import("../clients/session-start-observability.js");
+			const { default: registerExtension } = await import("../index.js");
+			const { pi, handlers } = createMockPi();
+			registerExtension(pi as any);
+			const shutdown = handlers.session_shutdown?.[0];
+			observability.logConcurrentSessionBind({
+				secondaryCount: 1,
+				sameCwd: true,
+				classification: "concurrent-secondary",
+			});
+			shutdown?.({}, makeCtx({ cwd: tmpDir, sessionId: "primary" }));
+			const rollups = () =>
+				logLatency.mock.calls.filter(
+					([row]) =>
+						(row as { phase?: string }).phase ===
+						"concurrent_session_bind_rollup",
+				);
+			expect(rollups()).toHaveLength(1);
+			expect(rollups()[0][0]).toEqual(
+				expect.objectContaining({
+					phase: "concurrent_session_bind_rollup",
+					metadata: {
+						"concurrent-secondary": 1,
+						"secondary-root": 0,
+						unclassified: 0,
+					},
+				}),
+			);
+			expect(observability.getConcurrentSessionBindRollupCounts()).toEqual({
+				"concurrent-secondary": 0,
+				"secondary-root": 0,
+				unclassified: 0,
+			});
+			logLatency.mockClear();
+			shutdown?.({}, makeCtx({ cwd: tmpDir, sessionId: "primary" }));
+			expect(rollups()).toHaveLength(0);
+		},
+		INTEGRATION_TIMEOUT_MS,
+	);
+
+	it(
+		"secondary session_shutdown does not consume the primary rollup tally",
+		async () => {
+			const logLatency = vi.fn();
+			vi.doMock("../clients/latency-logger.js", async (importActual) => ({
+				...(await importActual<
+					typeof import("../clients/latency-logger.js")
+				>()),
+				logLatency,
+			}));
+			const observability =
+				await import("../clients/session-start-observability.js");
+			const { default: registerExtension } = await import("../index.js");
+			const primary = createMockPi();
+			registerExtension(primary.pi as any);
+			await primary.trigger(
+				"session_start",
+				{},
+				makeCtx({ cwd: tmpDir, sessionId: "primary" }),
+			);
+
+			const secondary = createMockPi();
+			registerExtension(secondary.pi as any);
+			// Same cwd, still-live primary ctx, different session id —
+			// decideSessionStart classifies this concurrent-secondary and
+			// index.ts's session_start handler declines the full start, which is
+			// what actually calls logConcurrentSessionBind (real production path,
+			// not a manual record call).
+			await secondary.trigger(
+				"session_start",
+				{},
+				makeCtx({ cwd: tmpDir, sessionId: "secondary" }),
+			);
+			expect(observability.getConcurrentSessionBindRollupCounts()).toEqual({
+				"concurrent-secondary": 1,
+				"secondary-root": 0,
+				unclassified: 0,
+			});
+
+			const rollups = () =>
+				logLatency.mock.calls.filter(
+					([row]) =>
+						(row as { phase?: string }).phase ===
+						"concurrent_session_bind_rollup",
+				);
+
+			await secondary.trigger(
+				"session_shutdown",
+				{},
+				makeCtx({ cwd: tmpDir, sessionId: "secondary" }),
+			);
+			expect(rollups()).toHaveLength(0);
+			expect(observability.getConcurrentSessionBindRollupCounts()).toEqual({
+				"concurrent-secondary": 1,
+				"secondary-root": 0,
+				unclassified: 0,
+			});
+
+			await primary.trigger(
+				"session_shutdown",
+				{},
+				makeCtx({ cwd: tmpDir, sessionId: "primary" }),
+			);
+			expect(rollups()).toHaveLength(1);
+			expect(observability.getConcurrentSessionBindRollupCounts()).toEqual({
+				"concurrent-secondary": 0,
+				"secondary-root": 0,
+				unclassified: 0,
+			});
 		},
 		INTEGRATION_TIMEOUT_MS,
 	);
@@ -1811,7 +2018,23 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 	// real scheduler (clients/quiet-window.ts) is exercised by its own suite;
 	// here we only need "index.ts registered the task" + "running the task
 	// chain at settle produces the emission".
-	let quietTasks: Array<{ name: string; fn: () => Promise<void> | void }>;
+	let quietTasks: Array<{
+		name: string;
+		fn: (context?: {
+			runtime: unknown;
+			cwd?: string;
+			sessionId?: string;
+			ownerId?: string;
+		}) => Promise<void> | void;
+	}>;
+	let handleTurnEndHook:
+		| ((deps: {
+				onTestRunnerComplete?: (args: any) => void;
+				runtime: any;
+				ctxCwd?: string;
+				sessionId?: string;
+		  }) => void)
+		| undefined;
 
 	beforeEach(() => {
 		vi.resetModules();
@@ -1827,6 +2050,8 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 		vi.doUnmock("../clients/runtime-session.js");
 		vi.doUnmock("../clients/lsp/index.js");
 		quietTasks = [];
+		handleTurnEndHook = undefined;
+		_resetProcessSingletonsForTests();
 		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-turn-summary-"));
 		originalStartupMode = process.env.PI_LENS_STARTUP_MODE;
 		process.env.PI_LENS_STARTUP_MODE = "quick";
@@ -1869,7 +2094,9 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 		// exercises only the #484 seam (collector → quiet-window emit) without
 		// depending on that machinery or its real-filesystem/timer effects.
 		vi.doMock("../clients/runtime-turn.js", () => ({
-			handleTurnEnd: vi.fn(async () => undefined),
+			handleTurnEnd: vi.fn(async (deps: any) => {
+				handleTurnEndHook?.(deps);
+			}),
 			cancelLSPIdleReset: vi.fn(),
 		}));
 		// Light quiet-window stub: record registrations, run them in order on
@@ -1879,15 +2106,25 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 		vi.doMock("../clients/quiet-window.js", () => ({
 			registerQuietWindowTask: (
 				name: string,
-				fn: () => Promise<void> | void,
+				fn: (context?: {
+					runtime: unknown;
+					cwd?: string;
+					sessionId?: string;
+					ownerId?: string;
+				}) => Promise<void> | void,
 			) => {
 				quietTasks.push({ name, fn });
 			},
 			registerBuiltinQuietWindowTasks: () => {},
-			runQuietWindow: async () => {
+			runQuietWindow: async (deps: {
+				runtime: unknown;
+				cwd?: string;
+				sessionId?: string;
+				ownerId?: string;
+			}) => {
 				for (const task of quietTasks) {
 					try {
-						await task.fn();
+						await task.fn(deps);
 					} catch {
 						// mirror the real scheduler: task failures are isolated
 					}
@@ -1966,7 +2203,7 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 	) {
 		const settled = handlers.agent_settled?.[0];
 		expect(settled).toBeTypeOf("function");
-		await settled?.({}, { cwd: tmpDir });
+		await settled?.({}, { cwd: tmpDir, isIdle: () => true });
 		// index.ts kicks runQuietWindow off unawaited (fire-and-forget by
 		// design — the SDK awaits the handler); drain the microtask queue so
 		// the stub's task chain completes before assertions.
@@ -1982,6 +2219,143 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 			registerExtension(pi as any);
 
 			expect(quietTasks.map((t) => t.name)).toContain("turn_summary_emit");
+		},
+		INTEGRATION_TIMEOUT_MS,
+	);
+
+	it(
+		"does not add test-runner failures to a later model context",
+		async () => {
+			mockSuiteDeps();
+			const cache = new CacheManager(false);
+			cache.writeCache(
+				"test-runner-findings",
+				{ content: "FAIL test/app.test.ts:1" },
+				tmpDir,
+			);
+
+			const { default: registerExtension } = await import("../index.js");
+			const { pi, mock } = createMockPi();
+			registerExtension(pi as any);
+
+			const result = await mock.emit(
+				"context",
+				{ messages: [{ role: "user", content: "continue" }] },
+				{ cwd: tmpDir },
+			);
+			expect(result).toBeUndefined();
+		},
+		INTEGRATION_TIMEOUT_MS,
+	);
+
+	it(
+		"delivers staged test failures once through a non-context custom entry",
+		async () => {
+			mockSuiteDeps();
+			const cache = new CacheManager(false);
+			cache.writeCache(
+				"test-runner-findings",
+				{ content: "FAIL test/app.test.ts:1", testRunGeneration: 1 },
+				tmpDir,
+			);
+			const filePath = path.join(tmpDir, "src", "app.ts");
+			fs.mkdirSync(path.dirname(filePath), { recursive: true });
+			fs.writeFileSync(filePath, "export const x = 1;\n");
+			handleTurnEndHook = (deps) =>
+				deps.onTestRunnerComplete?.({
+					cwd: tmpDir,
+					sessionId: deps.runtime.telemetrySessionId,
+					generation: 1,
+					targetCount: 1,
+					hasFindings: true,
+				});
+
+			const { default: registerExtension } = await import("../index.js");
+			const { pi, mock, handlers, sentMessages } = createMockPi();
+			registerExtension(pi as any);
+			await driveEditThenTurnEnd(handlers, filePath);
+
+			await fireAgentSettled(handlers);
+
+			expect(mock.appendedEntries).toHaveLength(1);
+			expect(mock.appendedEntries[0]).toMatchObject({
+				customType: "pilens:test-runner-findings",
+				data: { content: expect.stringContaining("FAIL") },
+			});
+			expect(sentMessages).toHaveLength(0);
+			expect(mock.entryRenderers.has("pilens:test-runner-findings")).toBe(true);
+		},
+		INTEGRATION_TIMEOUT_MS,
+	);
+
+	it(
+		"keeps primary and concurrent secondary test delivery on their owning activation",
+		async () => {
+			mockSuiteDeps();
+			vi.doMock("../clients/runtime-session.js", () => ({
+				handleSessionStart: vi.fn(async () => {}),
+			}));
+			handleTurnEndHook = (deps) =>
+				deps.onTestRunnerComplete?.({
+					cwd: deps.ctxCwd ?? tmpDir,
+					sessionId: deps.sessionId ?? "unknown",
+					generation: 1,
+					targetCount: deps.sessionId === "secondary-delivery" ? 22 : 11,
+					hasFindings: true,
+				});
+			new CacheManager(false).writeCache(
+				"test-runner-findings",
+				{ content: "FAIL cross-session.test.ts:1", testRunGeneration: 1 },
+				tmpDir,
+			);
+
+			const { default: registerExtension } = await import("../index.js");
+			const primary = createMockPi();
+			registerExtension(primary.pi as any);
+			await primary.trigger(
+				"session_start",
+				{},
+				makeCtx({ cwd: tmpDir, sessionId: "primary-delivery" }),
+			);
+			const secondary = createMockPi();
+			registerExtension(secondary.pi as any);
+			await secondary.trigger(
+				"session_start",
+				{},
+				makeCtx({ cwd: tmpDir, sessionId: "secondary-delivery" }),
+			);
+
+			await primary.trigger(
+				"turn_end",
+				{},
+				makeCtx({ cwd: tmpDir, sessionId: "primary-delivery" }),
+			);
+			await secondary.trigger(
+				"turn_end",
+				{},
+				makeCtx({ cwd: tmpDir, sessionId: "secondary-delivery" }),
+			);
+			await primary.trigger(
+				"agent_settled",
+				{},
+				makeCtx({ cwd: tmpDir, sessionId: "primary-delivery" }),
+			);
+			await secondary.trigger(
+				"agent_settled",
+				{},
+				makeCtx({ cwd: tmpDir, sessionId: "secondary-delivery" }),
+			);
+
+			expect(primary.mock.appendedEntries).toHaveLength(1);
+			expect(secondary.mock.appendedEntries).toHaveLength(1);
+			expect(primary.mock.appendedEntries[0]?.data).toMatchObject({
+				sessionId: "primary-delivery",
+				targetCount: 11,
+			});
+			expect(secondary.mock.appendedEntries[0]?.data).toMatchObject({
+				sessionId: "secondary-delivery",
+				targetCount: 22,
+			});
 		},
 		INTEGRATION_TIMEOUT_MS,
 	);
@@ -2382,6 +2756,264 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 				"concurrent-secondary",
 			);
 			expect(resetLSPService).not.toHaveBeenCalled();
+		},
+		INTEGRATION_TIMEOUT_MS,
+	);
+
+	it(
+		"message_end on a stale ctx records the attribution degrade without skipping the cache_usage row (#1956)",
+		async () => {
+			const logCacheUsage = vi.fn();
+			vi.doMock("../clients/cache-observability.js", async (importActual) => ({
+				...(await importActual<
+					typeof import("../clients/cache-observability.js")
+				>()),
+				logCacheUsage,
+			}));
+			const resetLSPService = vi.fn();
+			vi.doMock("../clients/lsp/index.js", () => ({
+				getLSPService: () => ({
+					touchFile: vi.fn(),
+					getAliveClientCount: () => 0,
+					getAliveServerIds: () => [],
+				}),
+				resetLSPService,
+			}));
+
+			const { default: registerExtension } = await import("../index.js");
+			const primary = createMockPi();
+			registerExtension(primary.pi as any);
+
+			// A stale ctx (session replaced/reloaded): `getStableSessionId`
+			// returns undefined, `probeCtxActive` confirms staleness, and the
+			// handler must BOTH keep writing the cache_usage row AND record the
+			// attribution degrade in the ledger.
+			await primary.trigger(
+				"message_end",
+				{
+					message: {
+						role: "assistant",
+						provider: "provider",
+						model: "model",
+						usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+					},
+				},
+				makeStaleCtx(),
+			);
+
+			// The row keeps writing — this is a degrade, not a skip.
+			expect(logCacheUsage).toHaveBeenCalledWith(
+				expect.anything(),
+				expect.any(Function),
+				expect.objectContaining({ sessionId: undefined }),
+			);
+
+			// The attribution loss is recorded: the same degradation-ledger
+			// instance index.ts writes through must now carry the group, keyed
+			// by event name so aggregation answers WHICH handler lost its id.
+			const { getDegradationSummary } =
+				await import("../clients/degradation-ledger.js");
+			const group = getDegradationSummary().find(
+				(g) => g.kind === "cache-usage-attribution-stale",
+			);
+			expect(group).toBeDefined();
+			expect(group?.count).toBe(1);
+			expect(group?.latestReasons[0].subject).toBe("message_end");
+		},
+		INTEGRATION_TIMEOUT_MS,
+	);
+
+	it(
+		"message_end does not record attribution degradation for a live ctx",
+		async () => {
+			const logCacheUsage = vi.fn();
+			vi.doMock("../clients/cache-observability.js", async (importActual) => ({
+				...(await importActual<
+					typeof import("../clients/cache-observability.js")
+				>()),
+				logCacheUsage,
+			}));
+			const { default: registerExtension } = await import("../index.js");
+			const primary = createMockPi();
+			registerExtension(primary.pi as any);
+			await primary.trigger(
+				"message_end",
+				{ message: { role: "assistant" } },
+				makeCtx(),
+			);
+			const { getDegradationSummary } =
+				await import("../clients/degradation-ledger.js");
+			expect(logCacheUsage).toHaveBeenCalledOnce();
+			expect(
+				getDegradationSummary().find(
+					(group) => group.kind === "cache-usage-attribution-stale",
+				),
+			).toBeUndefined();
+		},
+		INTEGRATION_TIMEOUT_MS,
+	);
+
+	it(
+		"message_end does not record attribution degradation for an inconclusive ctx",
+		async () => {
+			const logCacheUsage = vi.fn();
+			vi.doMock("../clients/cache-observability.js", async (importActual) => ({
+				...(await importActual<
+					typeof import("../clients/cache-observability.js")
+				>()),
+				logCacheUsage,
+			}));
+			const { default: registerExtension } = await import("../index.js");
+			const primary = createMockPi();
+			registerExtension(primary.pi as any);
+			await primary.trigger(
+				"message_end",
+				{ message: { role: "assistant" } },
+				{ cwd: "/x" },
+			);
+			const { getDegradationSummary } =
+				await import("../clients/degradation-ledger.js");
+			expect(logCacheUsage).toHaveBeenCalledOnce();
+			expect(
+				getDegradationSummary().find(
+					(group) => group.kind === "cache-usage-attribution-stale",
+				),
+			).toBeUndefined();
+		},
+		INTEGRATION_TIMEOUT_MS,
+	);
+
+	it(
+		"message_end stale attribution uses the last live ctx session, not the replacement",
+		async () => {
+			const logCacheUsage = vi.fn();
+			const incrementDegradationCount = vi.fn();
+			vi.doMock("../clients/cache-observability.js", async (importActual) => ({
+				...(await importActual<
+					typeof import("../clients/cache-observability.js")
+				>()),
+				logCacheUsage,
+			}));
+			vi.doMock("../clients/degradation-ledger.js", async (importActual) => ({
+				...(await importActual<
+					typeof import("../clients/degradation-ledger.js")
+				>()),
+				incrementDegradationCount,
+			}));
+			const { default: registerExtension } = await import("../index.js");
+			const { registerPrimarySession } =
+				await import("../clients/session-lifecycle.js");
+			const primary = createMockPi();
+			registerExtension(primary.pi as any);
+			registerPrimarySession({}, "session-one");
+			const liveCtx = makeCtx({ sessionId: "session-one" });
+			await primary.trigger(
+				"message_end",
+				{ message: { role: "assistant" } },
+				liveCtx,
+			);
+			registerPrimarySession({}, "session-two");
+			await primary.trigger(
+				"message_end",
+				{ message: { role: "assistant" } },
+				makeStaleCtx(),
+			);
+			expect(incrementDegradationCount).toHaveBeenCalledWith(
+				expect.objectContaining({ metadata: { sessionId: "session-one" } }),
+			);
+			expect(incrementDegradationCount).toHaveBeenCalledTimes(1);
+		},
+		INTEGRATION_TIMEOUT_MS,
+	);
+
+	it(
+		"message_end stale attribution survives the real session_start rotation",
+		async () => {
+			const logCacheUsage = vi.fn();
+			r6Mocks.incrementDegradationCount.mockClear();
+			vi.doMock("../clients/cache-observability.js", async (importActual) => ({
+				...(await importActual<
+					typeof import("../clients/cache-observability.js")
+				>()),
+				logCacheUsage,
+			}));
+			vi.doMock("../clients/degradation-ledger.js", async (importActual) => ({
+				...(await importActual<
+					typeof import("../clients/degradation-ledger.js")
+				>()),
+				incrementDegradationCount: r6Mocks.incrementDegradationCount,
+			}));
+			vi.doMock("../clients/lsp/index.js", () => ({
+				getLSPService: () => ({
+					touchFile: vi.fn(),
+					getAliveClientCount: () => 0,
+					getAliveServerIds: () => [],
+				}),
+				resetLSPService: vi.fn(),
+			}));
+
+			const { default: registerExtension } = await import("../index.js");
+			const primary = createMockPi();
+			registerExtension(primary.pi as any);
+			const sessionA = makeCtx({ cwd: tmpDir, sessionId: "SESSION-A" });
+			await primary.trigger("session_start", {}, sessionA);
+			await primary.trigger(
+				"message_end",
+				{ message: { role: "assistant" } },
+				sessionA,
+			);
+
+			// The real session-start guard sees the replaced A context as stale, so
+			// B is a primary replacement and handleSessionStart performs its reset.
+			(sessionA.isIdle as () => unknown) = () => {
+				throw new Error("stale after session replacement");
+			};
+			const sessionB = makeCtx({ cwd: tmpDir, sessionId: "SESSION-B" });
+			await primary.trigger("session_start", {}, sessionB);
+			await primary.trigger(
+				"message_end",
+				{ message: { role: "assistant" } },
+				makeStaleCtx(),
+			);
+
+			expect(r6Mocks.incrementDegradationCount).toHaveBeenCalledWith(
+				expect.objectContaining({
+					metadata: { sessionId: "SESSION-A" },
+				}),
+			);
+			expect(r6Mocks.incrementDegradationCount).toHaveBeenCalledTimes(1);
+			expect(logCacheUsage).toHaveBeenCalledTimes(2);
+		},
+		INTEGRATION_TIMEOUT_MS,
+	);
+
+	it(
+		"message_end still writes cache_usage when ledger counting throws",
+		async () => {
+			const logCacheUsage = vi.fn();
+			vi.doMock("../clients/cache-observability.js", async (importActual) => ({
+				...(await importActual<
+					typeof import("../clients/cache-observability.js")
+				>()),
+				logCacheUsage,
+			}));
+			vi.doMock("../clients/degradation-ledger.js", async (importActual) => ({
+				...(await importActual<
+					typeof import("../clients/degradation-ledger.js")
+				>()),
+				incrementDegradationCount: vi.fn(() => {
+					throw new Error("ledger unavailable");
+				}),
+			}));
+			const { default: registerExtension } = await import("../index.js");
+			const primary = createMockPi();
+			registerExtension(primary.pi as any);
+			await primary.trigger(
+				"message_end",
+				{ message: { role: "assistant", usage: { input: 1, output: 1 } } },
+				makeStaleCtx(),
+			);
+			expect(logCacheUsage).toHaveBeenCalledOnce();
 		},
 		INTEGRATION_TIMEOUT_MS,
 	);

@@ -80,13 +80,17 @@ describe("ReadGuard path-key normalization (zero_read false-block regression)", 
 		expect(guard.checkEdit("\\proj\\b.ts").action).toBe("allow");
 	});
 
-	it("folds Windows path casing so cased read forms match lower-cased edits", () => {
-		if (process.platform !== "win32") return; // case-insensitive only on Windows
-		const guard = createReadGuard("test-session");
-		guard.recordRead(rec("C:/Proj/Src/Api.ts"));
+	// Path casing folds only on Windows, so this declares itself skipped
+	// elsewhere rather than returning early and reporting a PASS (#2089).
+	it.skipIf(process.platform !== "win32")(
+		"folds Windows path casing so cased read forms match lower-cased edits",
+		() => {
+			const guard = createReadGuard("test-session");
+			guard.recordRead(rec("C:/Proj/Src/Api.ts"));
 
-		expect(guard.checkEdit("c:/proj/src/api.ts").action).toBe("allow");
-	});
+			expect(guard.checkEdit("c:/proj/src/api.ts").action).toBe("allow");
+		},
+	);
 
 	it("still blocks a genuinely unread file (guard not weakened)", () => {
 		const guard = createReadGuard("test-session");

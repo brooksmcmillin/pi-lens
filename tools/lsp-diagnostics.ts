@@ -685,6 +685,7 @@ export function createLspDiagnosticsTool(
 
 type DiagnosticsCollectionResult = {
 	diagnostics: LSPDiagnostic[];
+	skipReason?: "outside-project-root";
 	/**
 	 * #570: true when the priming `touchFile` call could not confirm its
 	 * result (notify write and/or diagnostics wait timed out) before the
@@ -876,6 +877,7 @@ async function collectDiagnosticsForFile(
 	return {
 		diagnostics: filtered,
 		timedOut,
+		skipReason: touched?.skipReason,
 		confirmedByTouch,
 		// #1470: only a touch actually contributes a coverage gap; the
 		// openFile+getDiagnostics fallback never reports one, which is honest —
@@ -1256,6 +1258,7 @@ async function collectFileDiagnosticResult(
 		unconfirmedServerIds,
 		content: collectedContent,
 		binding,
+		skipReason,
 	} = await collectDiagnosticsForFile(file, lspService, waitMs, serverScope);
 	const health = lspService.getDiagnosticsHealth?.(file) as
 		| LspHealthLike
@@ -1269,7 +1272,9 @@ async function collectFileDiagnosticResult(
 	// be merged in rather than discarded.
 	let effectiveRawDiags = rawDiags;
 	let confirmation: "clean" | "unconfirmed" | undefined;
-	if (timedOut) {
+	if (skipReason !== undefined) {
+		confirmation = "unconfirmed";
+	} else if (timedOut) {
 		if (applySeverityFilter(rawDiags, severity).length === 0) {
 			confirmation = "unconfirmed";
 		}
@@ -1353,6 +1358,7 @@ async function collectFileDiagnosticResult(
 			collectedContent !== undefined
 				? hashDiagnosticContent(collectedContent)
 				: undefined,
+			stat.size,
 		);
 	}
 	return {
@@ -1361,6 +1367,7 @@ async function collectFileDiagnosticResult(
 		unavailable: lspUnavailableMessage(file, health),
 		confirmation,
 		timedOut: confirmation === "unconfirmed" ? timedOut : undefined,
+		...(skipReason !== undefined && { skipReason }),
 		primaryServerId: primaryServerId(file),
 	};
 }
@@ -1387,6 +1394,7 @@ async function runFileDiagnostics(
 		unconfirmedServerIds,
 		content: collectedContent,
 		binding,
+		skipReason,
 	} = await collectDiagnosticsForFile(absPath, lspService, waitMs, serverScope);
 	const lspHealth = lspService.getDiagnosticsHealth?.(absPath) as
 		| LspHealthLike
@@ -1403,7 +1411,9 @@ async function runFileDiagnostics(
 	// diagnostics it surfaces are merged in, not discarded.
 	let effectiveRawDiags = rawDiags;
 	let confirmation: "clean" | "unconfirmed" | undefined;
-	if (timedOut) {
+	if (skipReason !== undefined) {
+		confirmation = "unconfirmed";
+	} else if (timedOut) {
 		if (applySeverityFilter(rawDiags, severity).length === 0) {
 			confirmation = "unconfirmed";
 		}
@@ -1568,6 +1578,7 @@ async function runFileDiagnostics(
 			truncated,
 			unconfirmed,
 			timedOut: unconfirmed ? timedOut : undefined,
+			...(skipReason !== undefined && { skipReason }),
 			// #1470: which servers this result does NOT speak for. Absent when it
 			// speaks for all of them.
 			...(unconfirmedServerIds.length > 0 && {

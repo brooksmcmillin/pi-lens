@@ -13,6 +13,7 @@ import { collectForwardImportMtimes } from "./blocker-freshness.js";
 import { freshnessFromMtime } from "./freshness.js";
 import { PAST_EOF_STALE_MARKER } from "./diagnostic-line-freshness.js";
 import { STALE_LINE_MARKER } from "./stale-marker.js";
+import type { FormatterOutcomeKind } from "./formatters.js";
 
 /**
  * Canonical key for the `files` map (and `diagnosticsWriteGuard`) — #1020.
@@ -121,7 +122,10 @@ export function isBlocking(d: WidgetDiagnostic): boolean {
 interface FileRecord {
 	filePath: string;
 	runners: Map<string, { status: string; count: number; durationMs?: number }>;
-	formatters: Map<string, { changed: boolean; success: boolean }>;
+	formatters: Map<
+		string,
+		{ changed: boolean; success: boolean; outcome?: FormatterOutcomeKind }
+	>;
 	/** Capped to MAX_STORED_DIAGNOSTICS_PER_FILE — drives the TUI widget. */
 	diagnostics: WidgetDiagnostic[];
 	/**
@@ -245,7 +249,12 @@ export interface PersistedWidgetState {
 		runners: Array<
 			[string, { status: string; count: number; durationMs?: number }]
 		>;
-		formatters: Array<[string, { changed: boolean; success: boolean }]>;
+		formatters: Array<
+			[
+				string,
+				{ changed: boolean; success: boolean; outcome?: FormatterOutcomeKind },
+			]
+		>;
 		diagnostics: WidgetDiagnostic[];
 		allDiagnostics: WidgetDiagnostic[];
 		diagnosticCounts: { blocking: number; errors: number; warnings: number };
@@ -414,9 +423,10 @@ export function recordFormatter(
 	formatter: string,
 	changed: boolean,
 	success: boolean,
+	outcome?: FormatterOutcomeKind,
 ): void {
 	const rec = getOrCreate(filePath);
-	rec.formatters.set(formatter, { changed, success });
+	rec.formatters.set(formatter, { changed, success, outcome });
 	rec.touchedAt = Date.now();
 	files.set(fileMapKey(filePath), rec);
 	requestRender();
@@ -579,7 +589,42 @@ function commitDiagnostics(
 	requestRender();
 }
 
-/** Recompute the {blocking, errors, warnings} tally for a diagnostic set. */
+/**
+ * A diagnostic's compact-count tier (#2414). THE one place every compact
+ * finding-count surface classifies severity into a tally bucket — do not
+ * re-fold tiers per renderer (widget footer, `lens_diagnostics`' `withIssues`
+ * listing/summary, and any future compact surface all import this instead of
+ * hand-rolling the same branch).
+ *
+ * `error`/`warning` are real code defects with a known, bounded
+ * false-positive rate (see "Severity policy" in AGENTS.md, #1777) — they
+ * drive the footer's ●/! chips and block-worthy counts. `advisory` (`hint` +
+ * `info`) is a style opinion: an unaudited authorship rule (complexity,
+ * `no-runtime-typeof`, ...) must never present with the same weight as a
+ * warning. Before #1777 the dispatch path collapsed all three into
+ * `"warning"` at the runner; after #1777 preserved the four LSP/ast-grep
+ * tiers end to end, but this classifier still folded `hint`/`info` into the
+ * `warnings` tally so a file with only style opinions didn't silently vanish
+ * from the footer. #2414 corrects that: advisories no longer inflate
+ * `warnings`, but every consumer must still ask "does this file have ANY
+ * live finding" via `advisories`, not just `warnings`, so a hint-only file
+ * still surfaces in a detailed listing (mode=all's `withIssues`).
+ */
+export type DiagnosticTier = "error" | "warning" | "advisory";
+
+export function classifyDiagnosticTier(
+	d: WidgetDiagnostic,
+): DiagnosticTier | undefined {
+	if (d.severity === "error") return "error";
+	if (d.severity === "warning") return "warning";
+	if (d.severity === "hint" || d.severity === "info") return "advisory";
+	return undefined;
+}
+
+/** Recompute the {blocking, errors, warnings} tally for a diagnostic set.
+ * `hint`/`info` tier findings are tallied separately — see
+ * {@link classifyDiagnosticTier} and {@link countAdvisories} — and never
+ * inflate `warnings` (#2414). */
 function countDiagnostics(diags: WidgetDiagnostic[]): {
 	blocking: number;
 	errors: number;
@@ -601,22 +646,33 @@ function countDiagnostics(diags: WidgetDiagnostic[]): {
 			(diagnostic.staleReason ?? "past-eof") === "past-eof"
 		)
 			continue;
-		if (diagnostic.severity === "error") errors++;
-		// #1777: `hint` and `info` tally alongside `warning`. The dispatch path
-		// now preserves all four ast-grep tiers; before, the runner collapsed
-		// them to "warning" here. An exact `=== "warning"` test would drop those
-		// findings out of the footer entirely, so a file with real findings would
-		// render clean. The footer stays a blocking/error/warning summary on
-		// purpose — the tier distinction is rendered by the code-quality-warnings
-		// advisory, not by these counters.
-		else if (
-			diagnostic.severity === "warning" ||
-			diagnostic.severity === "hint" ||
-			diagnostic.severity === "info"
-		)
-			warnings++;
+		const tier = classifyDiagnosticTier(diagnostic);
+		if (tier === "error") errors++;
+		else if (tier === "warning") warnings++;
+		// tier === "advisory" (hint/info): intentionally excluded from the
+		// footer's warning tally (#2414) — see `countAdvisories` for the
+		// parallel count `getFileDiagnosticSummaries` exposes to
+		// `lens_diagnostics` so a hint-only file still shows up as "has issues".
 	}
 	return { blocking, errors, warnings };
+}
+
+/** Count `hint`/`info` tier findings using the same past-EOF exclusion as
+ * {@link countDiagnostics} (#2414). Kept as a standalone accessor rather than
+ * a new `FileRecord.diagnosticCounts` field — the footer never renders this
+ * number, only `getFileDiagnosticSummaries` (mode=all) needs it, to keep a
+ * hint-only file from being silently dropped from a detailed listing. */
+function countAdvisories(diags: WidgetDiagnostic[]): number {
+	let advisories = 0;
+	for (const diagnostic of diags) {
+		if (
+			diagnostic.stale &&
+			(diagnostic.staleReason ?? "past-eof") === "past-eof"
+		)
+			continue;
+		if (classifyDiagnosticTier(diagnostic) === "advisory") advisories++;
+	}
+	return advisories;
 }
 
 /**
@@ -1140,6 +1196,10 @@ export interface FileDiagnosticSummary {
 	blocking: number;
 	errors: number;
 	warnings: number;
+	/** `hint`/`info` tier findings — style opinions, never folded into
+	 * `warnings` (#2414). A file whose only findings are advisories still has
+	 * `advisories > 0` so it is not silently dropped from a detailed listing. */
+	advisories: number;
 	hasFinalSnapshot: boolean;
 	/**
 	 * The full, uncapped diagnostics for this file (not limited by the TUI's
@@ -1164,6 +1224,7 @@ export function getFileDiagnosticSummaries(): FileDiagnosticSummary[] {
 			blocking: rec.diagnosticCounts.blocking,
 			errors: rec.diagnosticCounts.errors,
 			warnings: rec.diagnosticCounts.warnings,
+			advisories: countAdvisories(rec.allDiagnostics),
 			hasFinalSnapshot: rec.hasFinalDiagnosticsSnapshot,
 			diagnostics: rec.allDiagnostics.map((d) => ({ ...d })),
 		};
@@ -1438,7 +1499,10 @@ function formatFileRowVertical(
 		.filter(([, f]) => f.changed && f.success)
 		.map(([name]) => name);
 	const failedFormatters = [...rec.formatters.entries()]
-		.filter(([, f]) => !f.success)
+		// An `unavailable` tool is not a code failure (#2413): it never earns a red
+		// `fmt-failed` marker. Its result already carries success:true, so this
+		// guard is a belt that keeps the intent explicit at the render seam.
+		.filter(([, f]) => !f.success && f.outcome !== "unavailable")
 		.map(([name]) => name);
 	const formatMark =
 		(failedFormatters.length > 0
@@ -1595,7 +1659,11 @@ function hasChangedFormatter(rec: FileRecord): boolean {
 }
 
 function hasFailedFormatter(rec: FileRecord): boolean {
-	return [...rec.formatters.values()].some((f) => !f.success);
+	// `unavailable` (#2413) is success:true and must never count as a failure —
+	// the explicit guard keeps that true even if a future path mislabels it.
+	return [...rec.formatters.values()].some(
+		(f) => !f.success && f.outcome !== "unavailable",
+	);
 }
 
 function shouldRenderFile(rec: FileRecord): boolean {

@@ -1,5 +1,6 @@
 import { LEDGER_FIELD_MAX } from "../../../ledger-bounds.js";
 import type { SpawnResult } from "../../../safe-spawn.js";
+import { truncatedByOutputCap } from "../../../spawn-output-cap.js";
 
 /**
  * The first non-empty line of a tool's output, bounded.
@@ -44,6 +45,13 @@ export interface RunOutcome {
 	signal: NodeJS.Signals | null;
 	/** First non-empty line of stderr, else stdout, else the spawn error. */
 	firstOutputLine: string;
+	/**
+	 * OUR output cap ended this run (#2100). Evidence only — it never changes
+	 * `kind`, because a cap kill is still a run that produced no usable result.
+	 * What it changes is the WORDING: without it the ledger row reads "killed by
+	 * SIGTERM", blaming the tool for a signal we sent because we stopped reading.
+	 */
+	outputCapped: boolean;
 }
 
 /**
@@ -115,6 +123,9 @@ export function classifyRunOutcome(input: ClassifyRunOutcomeInput): RunOutcome {
 			firstOutputLine(result.stderr) ||
 			firstOutputLine(result.stdout) ||
 			firstOutputLine(result.error?.message),
+		// Evidence carried alongside the verdict, never part of deciding it — the
+		// branches below are byte-for-byte the pre-#2100 rules.
+		outputCapped: truncatedByOutputCap(result),
 	};
 
 	if (result.error || signal) return { kind: "did-not-run", ...base };

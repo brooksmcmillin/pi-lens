@@ -134,7 +134,7 @@ describe("instance-registry", () => {
 		expect(() => decideOrphanReaping(after, () => true)).not.toThrow();
 	});
 
-	it("registerInstance overwrites (not duplicates) this pid's prior entry", async () => {
+	it("registerInstance updates (not duplicates) this pid's prior entry", async () => {
 		const { registerInstance } =
 			await import("../../clients/instance-registry.js");
 		await registerInstance("/first/root");
@@ -142,7 +142,14 @@ describe("instance-registry", () => {
 
 		const parsed = JSON.parse(fs.readFileSync(registryFilePath(), "utf-8"));
 		expect(parsed.instances).toHaveLength(1);
-		expect(parsed.instances[0].projectRoot).toContain("second/root");
+		// #2130 changed this contract deliberately. The second root used to
+		// OVERWRITE `projectRoot`, which is how a host came to advertise a
+		// subagent's temp dir as its own root. Registration is additive now:
+		// the primary is pinned and the second root joins the set. See
+		// tests/clients/instance-registry-multi-root.test.ts.
+		expect(parsed.instances[0].projectRoot).toContain("first/root");
+		expect(parsed.instances[0].projectRoots).toHaveLength(2);
+		expect(parsed.instances[0].projectRoots[1]).toContain("second/root");
 	});
 
 	it("writes atomically via tmp-<pid> + rename (no tmp file left behind, no torn write)", async () => {
@@ -428,11 +435,82 @@ describe("instance-registry", () => {
 	it("recordLspChild works even without a prior registerInstance (synthesizes a minimal entry)", async () => {
 		const { recordLspChild, readInstanceRegistry } =
 			await import("../../clients/instance-registry.js");
-		await recordLspChild({ pid: 333, serverId: "python", command: "d" });
+		await recordLspChild({
+			pid: 333,
+			serverId: "python",
+			command: "d",
+			sessionIdentity: {
+				projectRoot: path.join(dir, "real-session-root"),
+				startedAt: "2026-08-26T14:43:04.335Z",
+				rootSource: "session-cwd",
+			},
+		});
 
 		const instances = await readInstanceRegistry();
 		expect(instances).toHaveLength(1);
 		expect(instances[0].lspChildren).toHaveLength(1);
+		expect(instances[0].projectRoot).toContain("real-session-root");
+		expect(instances[0].rootSource).toBe("session-cwd");
+		expect(instances[0].startedAt).toBe("2026-08-26T14:43:04.335Z");
+	});
+
+	it("preserves subagent identity and records missing-registration recovery", async () => {
+		vi.stubEnv("PI_SUBAGENT_CHILD", "1");
+		vi.stubEnv("PI_SUBAGENT_CHILD_AGENT", "reviewer");
+		vi.stubEnv("PI_SUBAGENT_PARENT_PID", "12345");
+		vi.stubEnv("PI_SUBAGENT_RUN_ID", "run-recovery");
+		const { recordLspChild } =
+			await import("../../clients/instance-registry.js");
+		const { getDegradationSummary } =
+			await import("../../clients/degradation-ledger.js");
+
+		await recordLspChild({
+			pid: 334,
+			serverId: "typescript",
+			command: "d",
+			sessionIdentity: {
+				projectRoot: path.join(dir, "subagent-root"),
+				startedAt: "2026-08-26T14:43:04.335Z",
+			},
+		});
+
+		const entry = JSON.parse(fs.readFileSync(registryFilePath(), "utf8"))
+			.instances[0];
+		expect(entry.subagent).toEqual({
+			marker: "pi-subagents",
+			agentType: "reviewer",
+			parentPid: 12345,
+			runId: "run-recovery",
+		});
+		expect(getDegradationSummary()).toContainEqual(
+			expect.objectContaining({
+				kind: "instance-registry-registration-missing",
+				count: 1,
+			}),
+		);
+	});
+
+	it("records the identity fallback when child-first registration lacks session identity", async () => {
+		const { recordLspChild } =
+			await import("../../clients/instance-registry.js");
+		const { getDegradationSummary } =
+			await import("../../clients/degradation-ledger.js");
+
+		await recordLspChild({
+			pid: 335,
+			serverId: "typescript",
+			command: "d",
+		});
+
+		const entry = JSON.parse(fs.readFileSync(registryFilePath(), "utf8"))
+			.instances[0];
+		expect(entry.rootSource).toBe("lsp-fallback");
+		expect(getDegradationSummary()).toContainEqual(
+			expect.objectContaining({
+				kind: "instance-registry-identity-fallback",
+				count: 1,
+			}),
+		);
 	});
 
 	it("updateHeartbeat refreshes heartbeatAt and rssBytes for this pid", async () => {

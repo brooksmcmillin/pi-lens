@@ -30,6 +30,7 @@ import {
 
 export const BUS_FILES_TOUCHED_EVENT = "pilens:files:touched";
 export const BUS_FILES_TOUCHED_VERSION = 1;
+const BUS_LOG_PATH_CAP = 64;
 
 export type FilesTouchedReason = "autofix" | "format";
 
@@ -217,6 +218,8 @@ export function publishFilesTouched(args: PublishFilesTouchedArgs): void {
 			cwd: payload.cwd,
 			reason: args.reason,
 			fileCount: payload.paths.length,
+			writer: "pi-lens",
+			paths: payload.paths.slice(0, BUS_LOG_PATH_CAP),
 		});
 	} catch (err) {
 		logBusEvent({

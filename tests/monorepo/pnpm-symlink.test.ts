@@ -20,16 +20,18 @@
  *   - The symlinked directory OUTSIDE `node_modules` is NOT walked into by
  *     default (`followSymlinks` defaults to `false`, matching
  *     `DirWalkPolicy`'s documented default).
- *   - `followSymlinks: true` is, on Windows, OBSERVABLY INERT for a
- *     directory symlink created as a junction: `fs.Dirent.isDirectory()` is
- *     `false` for a junction (same classification `startup-scan-symlink-
- *     cycle.test.ts` already documents), so `classifyEntry`'s
- *     `entry.isDirectory()` branch — the only branch that ever calls
- *     `shouldRecurseIntoDir`/consults `followSymlinks` — never runs for it;
- *     the entry falls through to the `entry.isFile()` check (also false) and
- *     is silently skipped either way. Pinned here rather than asserting the
- *     "opt-in follows" behavior, since that behavior does not exist on
- *     Windows for this entry kind.
+ *   - `followSymlinks: true` is OBSERVABLY INERT for a directory symlink on
+ *     EVERY platform, junctions included. `fs.readdirSync(..., {
+ *     withFileTypes: true })` reports a symlink-to-directory as
+ *     `isSymbolicLink() === true` / `isDirectory() === false` — the
+ *     classification `startup-scan-symlink-cycle.test.ts` documents at its
+ *     head and exercises unguarded on POSIX — so `classifyEntry`'s
+ *     `entry.isDirectory()` branch, the only branch that ever calls
+ *     `shouldRecurseIntoDir` and therefore the only branch that consults
+ *     `followSymlinks`, never runs for it. The entry falls through to the
+ *     `entry.isFile()` check (also false) and is silently skipped. Pinned
+ *     here rather than asserting an "opt-in follows" behavior that this
+ *     walker does not have for this entry kind.
  */
 
 import * as fs from "node:fs";
@@ -124,20 +126,14 @@ describe("pnpm-shaped symlink layout (#775 item 8, extends #777 to source-filter
 		expect(files.some((f) => f.endsWith("hidden.ts"))).toBe(false);
 	}, 10_000);
 
-	it("followSymlinks: true is inert for a Windows junction — the symlinked-outside-node_modules dir stays invisible either way", () => {
-		if (process.platform !== "win32") {
-			// eslint/vitest: document the platform boundary rather than silently
-			// passing — a real POSIX symlink (not a junction) DOES report
-			// isDirectory()===true, so followSymlinks:true would behave
-			// differently there; that variant needs no elevation on POSIX and
-			// would be worth its own assertion in a POSIX-only follow-up, not
-			// asserted here to keep this file's behavior platform-uniform.
-			return;
-		}
+	it("followSymlinks: true is inert for a directory symlink — the symlinked-outside-node_modules dir stays invisible either way", () => {
 		const repo = buildFixture();
 		const files = collectSourceFiles(path.join(repo.root, "packages/a"), {
 			followSymlinks: true,
 		}).map(normalize);
+		// Positive control first: a walk that collected nothing at all would
+		// satisfy the absence assertion below without ever reaching the symlink.
+		expect(files.some((f) => f.endsWith("src/index.ts"))).toBe(true);
 		expect(files.some((f) => f.endsWith("hidden.ts"))).toBe(false);
 	}, 10_000);
 });

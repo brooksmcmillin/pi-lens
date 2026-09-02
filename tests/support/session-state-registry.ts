@@ -40,6 +40,12 @@ import {
 	resetBoundedTelemetry,
 } from "../../clients/bounded-telemetry.js";
 import {
+	getLastLiveMessageEndSessionId,
+	noteLiveMessageEndSessionId,
+	resetMessageEndAttribution,
+	rotateMessageEndAttribution,
+} from "../../clients/message-end-attribution.js";
+import {
 	getDegradationSummary,
 	recordDegradationOnce,
 	resetDegradationLedger,
@@ -56,6 +62,11 @@ import {
 	resetCascadeTierSessionState,
 } from "../../clients/lsp/cascade-tier.js";
 import {
+	_getPosixCaseSensitivityCacheSizeForTests,
+	isSameOrWithin,
+	resetLSPCaseSensitivityState,
+} from "../../clients/lsp/server.js";
+import {
 	_resetDeferredForTests,
 	isDeferredThisSession,
 	markDisposition,
@@ -65,6 +76,17 @@ import {
 	_seedReverseDepsIndexCacheForTests,
 	clearReverseDepsIndexCache,
 } from "../../clients/dispatch/integration.js";
+import {
+	classifyObservedRunner,
+	observeRunnerLatency,
+	resetObservedRunnerLatency,
+} from "../../clients/dispatch/collect-later-tier.js";
+import {
+	deferRunnerFindings,
+	pendingRunnerFindingsSize,
+	resetPendingRunnerFindings,
+} from "../../clients/dispatch/pending-runner-findings.js";
+import type { RunnerResult } from "../../clients/dispatch/types.js";
 import {
 	createAvailabilityLatch,
 	resetInstallRetryLatches,
@@ -96,6 +118,11 @@ import {
 	consumeHostReadyDelayAnchor,
 	resetHostReadyDelayAnchorForTests,
 } from "../../clients/startup-timing.js";
+import {
+	isOutsideAllSessionRoots,
+	registerSessionRoot,
+	resetSessionRootsForTests,
+} from "../../clients/lsp/session-roots.js";
 
 /**
  * When a piece of state must return to its initial value.
@@ -136,6 +163,8 @@ export interface SessionStateEntry {
 	 * one the static reachability walk can see.
 	 */
 	resetName: string;
+	/** Optional session-start transition when the full reset is not the boundary operation. */
+	sessionStartResetName?: string;
 	/** Why this policy is the right one. One sentence, in the author's words. */
 	reason: string;
 	/**
@@ -145,12 +174,27 @@ export interface SessionStateEntry {
 	 * so this cannot rot into a false claim after the fix lands.
 	 */
 	gap?: string;
+	/**
+	 * Set when `policy` is `session_start` and `resetName` runs inside
+	 * `index.ts`'s `pi.on("session_start", ...)` CLOSURE rather than inside
+	 * `handleSessionStart`'s reachable call graph — #2319. The conformance test
+	 * checks the reset against {@link sessionStartClosureResetNames} (derived
+	 * from that closure), an exact mirror of the `sessionStartResetNames` walk
+	 * every other entry is checked against. Use ONLY when the reset's placement
+	 * is load-bearing (behind the #473 concurrent-secondary gate but outside
+	 * `handleSessionStart`'s own body, or before it runs): `resetCurrentPhaseForSession`
+	 * is the canonical precedent (#1723 review F4), and the two rollup counters
+	 * that must never self-reset from a declined bind's own `session_start`
+	 * inherit the same gate placement.
+	 */
+	sessionStartClosureReset?: boolean;
 	/** Optional runtime proof that the reset re-arms the state. */
 	probe?: SessionStateProbe;
 }
 
 /** Throwaway cwds a probe created, removed by {@link _resetRegistryProbeState}. */
 const scratchDirs: string[] = [];
+let observedRunnerProbeRoot: string | undefined;
 
 /** Throwaway cwd for probes that need a project root on disk. */
 function scratchCwd(): string {
@@ -160,6 +204,36 @@ function scratchCwd(): string {
 }
 
 export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
+	{
+		id: "test-runner-delivery:pending",
+		module: "test-runner-delivery.ts",
+		state: "pending",
+		policy: "session_start",
+		resetName: "resetTestRunnerDelivery",
+		reason:
+			"#2366: staged test results belong to their owning session and must not cross a primary session replacement; the durable findings cache remains available to pull diagnostics.",
+	},
+	{
+		id: "message-end-attribution:two-slot-anchor",
+		module: "message-end-attribution.ts",
+		state: "lastStableSessionId, previousSessionId",
+		policy: "session_start",
+		resetName: "resetMessageEndAttribution",
+		sessionStartResetName: "rotateMessageEndAttribution",
+		reason:
+			"#1956 R3: session_start rotates the live anchor into one bounded previous slot because a stale message_end can drain after replacement; the full registry reset clears both slots.",
+		probe: {
+			// Arm BOTH slots: the getter's ?? fallback reads previous, so a
+			// reset that leaks previousSessionId fails isArmed (#1956 R9).
+			arm: () => {
+				noteLiveMessageEndSessionId("session-state-probe-prev");
+				rotateMessageEndAttribution();
+				noteLiveMessageEndSessionId("session-state-probe");
+			},
+			isArmed: () => getLastLiveMessageEndSessionId() === undefined,
+			reset: () => resetMessageEndAttribution(),
+		},
+	},
 	// ── #1743 bounded-telemetry helper ───────────────────────────────
 	{
 		id: "bounded-telemetry:turnCounts",
@@ -179,25 +253,95 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 			reset: () => resetBoundedTelemetry(),
 		},
 	},
+	// ── #2319 process-singleton state with closure-located resets ──────────
+	// These resets run inside index.ts's `pi.on("session_start", ...)` closure,
+	// NOT inside handleSessionStart's reachable call graph, so the
+	// `sessionStartResetNames()` walk cannot see them (they would fail the
+	// "not reachable from handleSessionStart" test on line 238). Each carries
+	// `sessionStartClosureReset` and the conformance suite checks it against
+	// `sessionStartClosureResetNames()` instead — the derived evidence, never
+	// a hand-copied claim. The placement is load-bearing in every case: two of
+	// the resets re-arm counters that a DECLINED bind's own session_start
+	// increments (a reset there would erase a live sibling's tally), and the
+	// others must sit inside the #473 gate but before handleSessionStart runs.
+	// Together with widget-state.ts's exemption for `clearWidgetState`, every
+	// reset the closure derivation sees is now accounted for on this registry.
+	{
+		id: "session-start-observability:bindRollupCounters",
+		module: "session-start-observability.ts",
+		state:
+			"the concurrent-session bind rollup counters (process-singleton backed)",
+		policy: "session_start",
+		resetName: "resetConcurrentSessionBindRollupCounts",
+		sessionStartClosureReset: true,
+		reason:
+			"#2319: #2249's declined-bind rollup is process-singleton backed (catalog shape 25), so the module-scope container scan could not see it. Its reset runs in index.ts's session_start closure on the primary-continuation path behind the #473 concurrent-secondary gate - a declined bind's own session_start increments these counters, so resetting there would erase every prior sibling's tally; the closure placement (with the emit-before-reset first line) still lets a primary that crashed before session_shutdown start from zero.",
+	},
+	{
+		id: "path-attribution-telemetry:verifiedGuessCount",
+		module: "path-attribution-telemetry.ts",
+		state: "verifiedGuessCount (process-singleton backed as of #2319)",
+		policy: "session_start",
+		resetName: "resetVerifiedPathAttributionGuessCount",
+		sessionStartClosureReset: true,
+		reason:
+			"#2319: the verified path-attribution guess tally is a per-session counter that emits one path_attribution_verified_rollup row at session end; PR #2312's class sweep flagged the module-scope `let` as the same latent shape as the bind rollup, so it now rides getProcessSingleton (shape 25). Its reset runs in index.ts's session_start closure after the #473 decision and only on the primary path, so a secondary cannot erase the primary's tally; the count is memory-only best-effort observability, so a lost tally is noise, not data.",
+	},
+	// The exemption this entry replaces (#2319): liveBrackets is NOT exempt
+	// any longer - it is real session-scoped process-shared state whose reset
+	// the closure-site derivation now proves. The exemption's text said "the
+	// reset sits in the closure, so the handleSessionStart walk cannot see it;
+	// exempted rather than falsely registered" - the closure site IS that
+	// registration now.
+	{
+		id: "latency-logger:liveBrackets",
+		module: "latency-logger.ts",
+		state:
+			"liveBrackets, closedBrackets (the in-flight-phase bracket map); LAST_PHASE_EXCLUDED is a constant, not state",
+		policy: "session_start",
+		resetName: "resetCurrentPhaseForSession",
+		sessionStartClosureReset: true,
+		reason:
+			"#1723 review F4: the in-flight-phase live-bracket map is process-shared state that only a confirmed full session start may re-arm - the reset must sit INSIDE the #473 concurrent-secondary gate, yet outside handleSessionStart's own body (it runs before handleSessionStart), so it is called directly in index.ts's session_start closure, unreachable from the handleSessionStart walk. #2319 adds the closure-site evidence and this entry replaces the file's exemption. See resetCurrentPhaseForSession's own doc comment for the full placement reasoning.",
+	},
+	// #2319 survey catch: the session_start closure ALSO resets the
+	// #1999 rising-edge memory-sample cadence. Its state is two module-scope
+	// SCALARS, so the container scan cannot flag the file (SWEEP_HEURISTIC_LIMITS
+	// item 1 - the registry covers scalar session state by hand). The module's
+	// own doc calls this session state reset at primary session_start, so it
+	// registers as another closure-site entry and the derived closure set maps
+	// to the registry (or a widget-state exemption) one-to-one.
+	{
+		id: "memory-sampler:cadence",
+		module: "memory-sampler.ts",
+		state:
+			"_lastSampledHeapUsedBytes, _tightenThroughTurn (rising-edge cadence)",
+		policy: "session_start",
+		resetName: "resetMemorySamplerCadence",
+		sessionStartClosureReset: true,
+		reason:
+			"#2319 survey: #1999's rising-edge memory-sample cadence tightens sampling after rapid heap growth until it stabilizes; the latch is module-scope SCALAR session state (SWEEP_HEURISTIC_LIMITS item 1 - the container scan cannot see it, so the registry covers it by hand). Its reset runs in index.ts's session_start closure behind the #473 gate, and the #2319 derivation is what surfaced that it was never registered; see the module's own defect-shape-17 note.",
+	},
 	// ── #2000 phase 2 opaque-recovery baselines ─────────────────────────
 	{
 		id: "opaque-mutation-scan:baselineStore+gitMemo",
 		module: "opaque-mutation-scan.ts",
-		state: "OpaqueBaselineStore byCwd map, gitRepoMemo",
+		state: "OpaqueBaselineStore byCwd map, gitRepoMemo, gitToplevelMemo",
 		policy: "session_start",
 		resetName: "resetOpaqueMutationState",
 		reason:
-			"#2000 phase 2: pending pre-command baselines are keyed cwd:generation and become unreachable when the session generation advances; and the git-worktree memo must re-probe after a session that may have seen a directory become a worktree. Without the reset both leak per session and the memo mis-answers forever.",
+			"#2000 phase 2: pending pre-command baselines are keyed cwd:generation and become unreachable when the session generation advances; and the git-worktree and toplevel memos must re-probe after a session that may have seen a directory become a worktree, or become a LINKED worktree of another (#2007). Without the reset the baselines leak per session and the memos mis-answer forever.",
 	},
 	// ── #2026 pending auxiliary coverage baselines ──────────────────────
 	{
 		id: "lsp:pending-aux-coverage",
 		module: "lsp/pending-aux-coverage.ts",
-		state: "pending Map (filePath,serverId) pairs",
+		state:
+			"pending Map (filePath,serverId) pairs; napiFallbackCoverage Map (filePath) (#2324 R2-A)",
 		policy: "session_start",
 		resetName: "resetPendingAuxiliaryCoverage",
 		reason:
-			"#2026: pending auxiliary baselines are keyed by cwd and become unreachable when the session generation advances.",
+			"#2026: pending auxiliary baselines are keyed by cwd and become unreachable when the session generation advances. #2324 R2-A: napiFallbackCoverage records WHEN the ast-grep napi fallback last covered a file, so the aux-grace wait can skip marking a duplicate pending pair — a cross-session leftover would wrongly suppress a legitimate mark in the new session.",
 	},
 	// ── The named population from #1635 ──────────────────────────────────────
 	{
@@ -224,7 +368,7 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 	{
 		id: "workspace-sweep-hold:holds",
 		module: "lsp/workspace-sweep-hold.ts",
-		state: "holds, idleWaiters, nextHoldId",
+		state: "process-singleton holds, idleWaiters, nextHoldId",
 		policy: "session_start",
 		resetName: "clearWorkspaceSweepHoldForSessionStart",
 		reason:
@@ -355,7 +499,7 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 		id: "dispatch-integration:sessionCaches",
 		module: "dispatch/integration.ts",
 		state:
-			"cascadeDiagnosticBaselines, recentlyCleanNeighborCache, primaryFilesThisTurn, sessionSlopRuleCounts, sessionFacts",
+			"recentlyCleanNeighborCache, primaryFilesThisTurn, sessionSlopRuleCounts, sessionFacts",
 		policy: "session_start",
 		resetName: "resetDispatchBaselines",
 		reason:
@@ -364,11 +508,11 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 	{
 		id: "dispatcher:coverageNoticeSeen",
 		module: "dispatch/dispatcher.ts",
-		state: "coverageNoticeSeen",
+		state: "coverageNoticeSeen, generatedSkipRecorded",
 		policy: "session_start",
 		resetName: "clearCoverageNoticeState",
 		reason:
-			"A once-per-session coverage notice must be sayable again to the next session's agent.",
+			"A once-per-session coverage notice must be sayable again to the next session's agent; `generatedSkipRecorded` (refs #2346) rides the same reset so a generated file's `dispatch_skipped_generated` record is emitted for the new session's dispatches of that file, not silently withheld because an older session already logged it.",
 	},
 	{
 		id: "tree-sitter-shared:webTreeSitterLoadFailed",
@@ -400,7 +544,8 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 	{
 		id: "package-manager:availabilityLatches",
 		module: "package-manager.ts",
-		state: "availabilityLatches, inFlightProbes",
+		state:
+			"availabilityLatches, globalBinDirCache, cache generation, and package-manager probe flights",
 		policy: "session_start",
 		resetName: "_resetPackageManagerCache",
 		reason:
@@ -476,6 +621,33 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 			"Workspace layout is re-derived per session; a new session can open a tree whose markers moved.",
 	},
 	{
+		id: "startup-scan:topology-derived-cache",
+		module: "startup-scan.ts",
+		state: "startupScanContextCache",
+		policy: "session_start",
+		resetName: "resetWorkspaceTopology",
+		reason:
+			"Startup scan context derives its project-root verdict from workspace marker topology, so the memo must re-arm with that index.",
+	},
+	{
+		id: "language-profile:topology-derived-cache",
+		module: "language-profile.ts",
+		state: "languageProfileCache",
+		policy: "session_start",
+		resetName: "resetWorkspaceTopology",
+		reason:
+			"Language profiles derive configured markers from workspace topology, so the memo must re-arm with that index.",
+	},
+	{
+		id: "tsconfig-paths:topology-derived-caches",
+		module: "review-graph/tsconfig-paths.ts",
+		state: "cache, referencesCache",
+		policy: "session_start",
+		resetName: "resetWorkspaceTopology",
+		reason:
+			"Tsconfig path and project-reference resolutions derive from workspace topology, so both memos must re-arm with that index.",
+	},
+	{
 		id: "workspace-modules:moduleSourceFilesMemo",
 		module: "review-graph/workspace-modules.ts",
 		state: "_moduleSourceFilesMemo",
@@ -487,11 +659,12 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 	{
 		id: "review-graph-builder:workspaceGraphCache",
 		module: "review-graph/builder.ts",
-		state: "_workspaceGraphCache, _workspaceCacheEpochs",
+		state:
+			"_workspaceGraphCache, _workspaceCacheEpochs, _sourcePathMemos, _sourcePathNormalizeCalls, _retainedGraphSites",
 		policy: "session_start",
 		resetName: "clearReviewGraphWorkspaceCache",
 		reason:
-			"Same reason as the module graph: a cached workspace graph describes one revision of one tree.",
+			"Same reason as the module graph: a cached workspace graph describes one revision of one tree. #2255 adds one memory-attribution companion on the same seam: _retainedGraphSites (WeakRefs to graphs retained outside the cache, cleared with it so a new session never samples the previous one's graphs).",
 	},
 	{
 		id: "ast-grep-napi:loadState",
@@ -539,6 +712,26 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 			"#1570: a repair that failed transiently in an earlier session must not stay latched for the rest of the extension-host process.",
 	},
 	{
+		id: "lsp-server:posixCaseSensitivityProbe",
+		module: "lsp/server.ts",
+		state: "posixCaseInsensitiveByPath",
+		policy: "session_start",
+		resetName: "resetLSPCaseSensitivityState",
+		reason:
+			"#2052: case-sensitivity answers are cached by root, but a root can be probed before it exists. A new session may create that root, so the process must clear this memo before containment decisions continue.",
+		probe: {
+			arm: () => {
+				resetLSPCaseSensitivityState();
+				const root = "/pi-lens-session-case-probe/Project";
+				isSameOrWithin(root, `${root}/src/app.ts`, {
+					caseInsensitiveProbe: () => false,
+				});
+			},
+			isArmed: () => _getPosixCaseSensitivityCacheSizeForTests() === 0,
+			reset: () => resetLSPCaseSensitivityState(),
+		},
+	},
+	{
 		id: "lsp-workspace-diagnostics-cache:sessionClock",
 		module: "lsp/workspace-diagnostics-session.ts",
 		state: "_sessionStartedAt",
@@ -560,6 +753,15 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 		resetName: "resetLSPService",
 		reason:
 			"The service is torn down and rebuilt per session; this reset is also the seam that carries the sweep hold and TS-repair guard resets.",
+	},
+	{
+		id: "lsp-server:launchAvailabilityGeneration",
+		module: "lsp/server.ts",
+		state: "lspLaunchAvailabilityGeneration",
+		policy: "session_start",
+		resetName: "resetLSPService",
+		reason:
+			"Availability publication shares the LSP service generation. A managed lookup, install, or launch that crosses reset must not publish into the replacement session. #2351.",
 	},
 	{
 		id: "spawn-timeout-cooldown:latches",
@@ -667,6 +869,59 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 			reset: () => resetCascadeTierSessionState(),
 		},
 	},
+	{
+		id: "collect-later-tier:observedRunners",
+		module: "dispatch/collect-later-tier.ts",
+		state: "slowRunners",
+		policy: "session_start",
+		resetName: "resetObservedRunnerLatency",
+		reason:
+			"#2116: observed slow-runner decisions are scoped to the current session because a new session must re-probe its project environment rather than inherit a process-lifetime collect-later latch.",
+		probe: {
+			arm: () => {
+				observedRunnerProbeRoot = scratchCwd();
+				observeRunnerLatency({
+					projectRoot: observedRunnerProbeRoot,
+					runnerId: "session-state-probe",
+					durationMs: 5_001,
+				});
+			},
+			isArmed: () =>
+				classifyObservedRunner(
+					observedRunnerProbeRoot ?? "<missing>",
+					"session-state-probe",
+				) === "inline",
+			reset: () => resetObservedRunnerLatency(),
+		},
+	},
+	{
+		id: "pending-runner-findings:pending",
+		module: "dispatch/pending-runner-findings.ts",
+		state: "pending runner handoff array",
+		policy: "session_start",
+		resetName: "resetPendingRunnerFindings",
+		reason:
+			"#2122: deferred runner results are session-scoped and must not cross a session boundary or accumulate handlers across turn-end drains.",
+		probe: {
+			arm: () => {
+				const result: RunnerResult = {
+					status: "succeeded",
+					diagnostics: [],
+					semantic: "warning",
+				};
+				deferRunnerFindings({
+					filePath: "/probe/session-state-runner.ts",
+					cwd: "/probe",
+					projectRoot: "/probe",
+					runnerId: "session-state-probe",
+					markedAtMs: Date.now(),
+					promise: Promise.resolve(result),
+				});
+			},
+			isArmed: () => pendingRunnerFindingsSize() === 0,
+			reset: () => resetPendingRunnerFindings(),
+		},
+	},
 
 	// ── Deliberately not session_start ───────────────────────────────────────
 	{
@@ -677,6 +932,26 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 		resetName: "_resetBiomeFixKindCacheForTests",
 		reason:
 			"#1810: the cache maps (biome binary path, rule name) to that rule's real fix tier, read live from `biome explain <rule>`. That answer is a static property of the running binary — it cannot change without a different biome install, which is itself a different cache key — so there is nothing for a session boundary to invalidate. No probe: arming it for real requires spawning the actual biome binary, which this generic registry sweep does not do; `tests/clients/dispatch/runners/biome-check-runner.test.ts`'s dedicated cache/reset tests cover the re-arm behavior with a mocked spawn instead.",
+	},
+	{
+		id: "lsp-session-roots:sessionRoots",
+		module: "lsp/session-roots.ts",
+		state: "sessionRoots",
+		policy: "process_lifetime",
+		resetName: "resetSessionRootsForTests",
+		reason:
+			"#2052: the set of project roots this PROCESS serves. A root enters it when `initLSPConfig` runs for that cwd, and that same call warms an LSP client fleet rooted there which stays alive for the process, not the session. Clearing at session_start would decline files for roots that are still being served, and it could not self-heal: `ensureLSPConfigInitialized` (index.ts) dedupes on `_lspConfigInitializedCwds`, so it would not re-run `initLSPConfig` for an already-initialized cwd and the root would never re-register. Accumulating roots is also the SAFE direction here — an extra registered root only means a file is served as it was before #2052, whereas a missing root means a hard refusal to answer.",
+		probe: {
+			arm: () => {
+				resetSessionRootsForTests();
+				registerSessionRoot("/pi-lens-probe/session-root");
+			},
+			// Post-reset shape is an EMPTY registry, which by the fail-open rule
+			// declines nothing — so no path reads as outside-all-roots.
+			isArmed: () =>
+				!isOutsideAllSessionRoots("/pi-lens-probe/elsewhere/file.ts"),
+			reset: () => resetSessionRootsForTests(),
+		},
 	},
 	{
 		id: "startup-timing:hostReadyDelayAnchor",
@@ -792,6 +1067,8 @@ export const EXEMPT_SESSION_STATE_FILES: Readonly<Record<string, string>> = {
 	"lens-config.ts":
 		"global config warn-once set, tied to the config file it warned about",
 	"instance-registry.ts": "instance-registry enablement flag",
+	"process-singletons.ts":
+		"the globalThis-keyed container for process-scope state (#2146). It owns storage, never lifecycle: every family keeps whatever boundary it already had, and each one is a PROCESS boundary rather than a session boundary. session-lifecycle.ts releases its registration at the primary's own session_shutdown (releasePrimarySession), not at session_start. startup-timing.ts's host-ready anchor is registered here as policy process_lifetime with a ForTests-only reset, because resetting it at a session boundary would fabricate host stalls from the original process boot. The instance-registry mutation tail must outlive every session by construction. A reset in this module would therefore wipe state no session boundary owns. Its only module-scope binding is the Symbol.for container key, a constant.",
 	"session-lifecycle.ts":
 		"the session_start decision seam itself — it is the boundary, not state behind it",
 
@@ -805,8 +1082,6 @@ export const EXEMPT_SESSION_STATE_FILES: Readonly<Record<string, string>> = {
 		"diagnostics publisher registration and dirty-path dedupe",
 	"bus-events-logger.ts": "bus event rollup counters, an observability tally",
 	"ndjson-logger.ts": "registered log-file paths",
-	"latency-logger.ts":
-		"the scan's two flagged containers here are LAST_PHASE_EXCLUDED (a fixed, never-mutated Set of phase names — a constant, not state) and, since #1723, liveBrackets (the in-flight-phase bracket map). liveBrackets DOES have a genuine session-boundary reset, resetCurrentPhaseForSession — but it is called from the `pi.on(\"session_start\", ...)` handler in index.ts itself, BEFORE `handleSessionStart(...)` runs (deliberately: #1723 review F4 needs it positioned behind the #473 concurrent-secondary gate but is not part of handleSessionStart's own body), so `sessionStartResetNames()`'s walk — which starts specifically from handleSessionStart — cannot see it. Exempted here rather than added to SESSION_STATE_REGISTRY with a false reachability claim; see resetCurrentPhaseForSession's own doc comment for the full placement reasoning.",
 	"quiet-window.ts": "quiet-window task registration",
 	"quiet-window-config.ts":
 		"the env-derived quiet-window kill switch and wait budget, split out of quiet-window.ts by #1462; a memo of configuration, not of a session verdict",
@@ -826,7 +1101,8 @@ export const EXEMPT_SESSION_STATE_FILES: Readonly<Record<string, string>> = {
 		"the recent-touch cursor, consumed and advanced per read",
 	"widget-state.ts":
 		"widget render state, rebuilt from the sources it displays",
-	"word-index.ts": "word-index build guard, per build",
+	"word-index.ts":
+		"word-index build guard, per build; asyncWordIndexOperations queue is keyed by WordIndex and self-deletes in finally, so it needs no reset",
 	"mcp/analyze.ts":
 		"warm word-index cache keyed by path with its own freshness check",
 	"mcp/session.ts":
@@ -837,7 +1113,7 @@ export const EXEMPT_SESSION_STATE_FILES: Readonly<Record<string, string>> = {
 	"review-graph/shared-extraction-ir.ts":
 		"extraction IR keyed by cwd and file, invalidated by the graph build that produced it",
 	"lsp/client.ts":
-		"per-connection request bookkeeping, torn down with the connection",
+		"per-connection request bookkeeping, torn down with the connection. #2065 fix round 1 added `activeLspClients`, a projection registry (not an independent source of truth — see its doc comment) that lets memory-sampler.ts total retained-text bytes without importing LSPService. It deliberately spans sessions, matching the LSP clients it mirrors, which are themselves kept warm across session boundaries: a session_start reset would desync the projection from live connections rather than protect anything. Its only writers are spawnClient (add) and disposeClientConnection (delete), and disposeClientConnection is the single convergence point every permanent-death path already funnels through, so membership is torn down exactly when the connection it describes is. #2130 round 2 moved it behind getProcessSingleton so it is one Set per PROCESS rather than one per module evaluation: the sampler runs in a single evaluation, and a module-scope Set made every other evaluation's clients — which is where a secondary root's servers live — invisible to it. The lifetime argument above is unchanged; only the number of copies is.",
 	"project-changes.ts":
 		"change-log sequence fold counter, an observability tally",
 	"project-trust.ts":
@@ -885,11 +1161,19 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"diagnostic-dispositions.ts": 1,
 	"diagnostic-line-freshness.ts": 1,
 	"diagnostics-publish.ts": 1,
-	"dispatch/dispatcher.ts": 1,
-	// #1899 removed the dead `neighborTouchCache` (10 → 9).
-	"dispatch/integration.ts": 9,
+	// #2346 added `generatedSkipRecorded` beside `coverageNoticeSeen` (1 → 2);
+	// both are cleared by the same session-start reset seam.
+	"dispatch/dispatcher.ts": 2,
+	"dispatch/collect-later-tier.ts": 1,
+	// #1899 removed the dead `neighborTouchCache` (10 → 9); #2282 removed the
+	// redundant `cascadeDiagnosticBaselines` shadow map (9 → 8).
+	"dispatch/integration.ts": 8,
 	"dispatch/lazy.ts": 0,
-	"dispatch/runners/ast-grep-napi.ts": 5,
+	// #2215 added the language matrix's two derived lookups
+	// (`BINDING_BY_EXTENSION`, `LSP_ONLY_RULE_LANGUAGES`) (5 → 7). Both are
+	// import-time frozen lookups with no session lifetime —
+	// SWEEP_HEURISTIC_LIMITS item 5, not state that must re-arm.
+	"dispatch/runners/ast-grep-napi.ts": 7,
 	"dispatch/runners/biome-check.ts": 1,
 	"dispatch/runners/psscriptanalyzer.ts": 2,
 	"dispatch/runners/spotbugs.ts": 0,
@@ -898,9 +1182,12 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"disposition-publish.ts": 0,
 	"extension-log.ts": 2,
 	"format-events-publish.ts": 0,
-	"formatters.ts": 5,
+	"formatters.ts": 7,
 	"generated-artifacts.ts": 2,
-	"git-guard.ts": 1,
+	// #2007 hoisted git's global-option table to a module-level `new Set`
+	// (1 → 2). It is an import-time frozen lookup with no session lifetime —
+	// SWEEP_HEURISTIC_LIMITS item 5, not state that must re-arm.
+	"git-guard.ts": 2,
 	"git-tracked-ignore.ts": 3,
 	"installer/index.ts": 12,
 	"instance-registry.ts": 0,
@@ -909,24 +1196,50 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"lens-events.ts": 0,
 	"lsp-budget.ts": 0,
 	"lsp/cascade-tier.ts": 1,
+	// #2065 fix round 1: 2 -> 3 for activeLspClients (see
+	// EXEMPT_SESSION_STATE_FILES).
+	// #2130 round 2: 3 -> 2. The `activeLspClients` module-level `new Set` moved
+	// behind `getProcessSingleton`, so the scan no longer sees a module-scope
+	// container here. The state did not disappear — it moved UP, from one copy
+	// per module evaluation to one per process — and it stays exempt from a
+	// session_start reset for exactly the reason recorded above.
 	"lsp/client.ts": 2,
 	"lsp/config.ts": 1,
 	"lsp/index.ts": 2,
 	// #2000 phase 2: the pending-baseline store (one slot per cwd:generation)
 	// plus the process-global Symbol.for slot; cleared via resetOpaqueMutationState.
-	"opaque-mutation-scan.ts": 1,
-	"lsp/pending-aux-coverage.ts": 1,
+	// #2060: 1 -> 3 for UNMERGED_PORCELAIN_STATUSES and
+	// LEGAL_ORDINARY_PORCELAIN_STATUSES. Both are frozen-by-convention lookup
+	// tables of Git's documented porcelain matrix — import-time constants with
+	// no session identity, so they need no reset (SWEEP_HEURISTIC_LIMITS item 5).
+	// #2007 added `gitToplevelMemo`, the worktree-identity cache (3 → 4). It
+	// is registered above and cleared by the same `resetOpaqueMutationState`.
+	"opaque-mutation-scan.ts": 4,
+	// #2324 R2-A added `napiFallbackCoverage`, the napi-run hand-off map
+	// (1 → 2). Registered above and cleared by the same
+	// `resetPendingAuxiliaryCoverage`.
+	"lsp/pending-aux-coverage.ts": 2,
 	"lsp/jvm-runtime.ts": 0,
+	"lsp/session-roots.ts": 1,
 	"lsp/spawn-history.ts": 1,
-	"lsp/server.ts": 5,
+	"lsp/server.ts": 6,
 	"lsp/workspace-diagnostics-cache.ts": 1,
-	"lsp/workspace-sweep-hold.ts": 1,
+	"lsp/workspace-sweep-hold.ts": 0,
 	"mcp/analyze.ts": 1,
 	"mcp/session.ts": 2,
 	"module-report-lsp.ts": 1,
 	"ndjson-logger.ts": 0,
+	// #1602 added `globalBinDirCache` (1 → 2), cleared by the same
+	// `_resetPackageManagerCache` the registry entry above names.
 	"package-manager.ts": 2,
+	// #2319: the verified-guess tally moved behind getProcessSingleton, so the
+	// module-scope scan sees no container here; the getProcessSingleton SIGNAL
+	// is what flags this file now.
+	"path-attribution-telemetry.ts": 0,
 	"project-changes.ts": 0,
+	// #2146: the container key is a Symbol.for constant, so the scan sees no
+	// mutable module-scope container here.
+	"process-singletons.ts": 0,
 	"project-lens-config.ts": 3,
 	"project-report.ts": 1,
 	"project-scale.ts": 0,
@@ -937,24 +1250,36 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"quiet-window-config.ts": 0,
 	"quiet-window.ts": 0,
 	"recent-touches.ts": 1,
-	"review-graph/builder.ts": 17,
+	"review-graph/builder.ts": 19,
 	"review-graph/git-identity.ts": 0,
 	"review-graph/shared-extraction-ir.ts": 1,
 	"review-graph/workspace-modules.ts": 2,
 	"runtime-config.ts": 0,
-	"runtime-tool-result.ts": 3,
+	// #2060: 3 -> 5 for GIT_INTEGRATION_SUBCOMMANDS and
+	// GIT_GLOBAL_OPTIONS_WITH_VALUE — command-shape vocabulary, not state.
+	"runtime-tool-result.ts": 5,
 	"safe-spawn.ts": 3,
+	// #2146 moved the four registration fields onto the process singleton, so the
+	// scan sees no module-scope container here either.
 	"session-lifecycle.ts": 0,
+	// #2319: the bind-rollup counters live behind getProcessSingleton, so the
+	// module-scope scan sees no container here; the getProcessSingleton SIGNAL
+	// is what flags this file now.
+	"session-start-observability.ts": 0,
 	"sgconfig.ts": 2,
 	"slow-fs.ts": 0,
 	"smells-rollup.ts": 1,
 	"startup-timing.ts": 0,
 	"subagent-mode.ts": 0,
 	"tree-sitter-shared.ts": 0,
+	// #2366: one bounded pending-delivery map, cleared at primary session_start.
+	"test-runner-delivery.ts": 1,
 	"tui-fit.ts": 0,
 	"warm-attach.ts": 0,
 	"widget-state.ts": 2,
-	"word-index.ts": 2,
+	// #2068 added the per-index dirty-file set; it is process-local wire-cache
+	// state and is cleared by serialization, so it needs no session reset.
+	"word-index.ts": 4,
 	"workspace-topology.ts": 2,
 	"zizmor-config.ts": 0,
 };

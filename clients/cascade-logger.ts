@@ -3,6 +3,7 @@ import { isTestMode } from "./env-utils.js";
 import { getGlobalPiLensDir } from "./file-utils.js";
 import { createNdjsonLogger } from "./ndjson-logger.js";
 import { getMaxLogSizeMB } from "./log-cleanup.js";
+import { normalizeLoggedPath } from "./path-utils.js";
 
 const CASCADE_LOG_DIR = getGlobalPiLensDir();
 const CASCADE_LOG_FILE = path.join(CASCADE_LOG_DIR, "cascade.log");
@@ -69,11 +70,24 @@ export interface CascadeLogEntry {
 	metadata?: Record<string, unknown>;
 }
 
+/**
+ * #2219 (the #2141 class): call sites across `dispatch/integration.ts`,
+ * `runtime-turn.ts`, and `runtime-coordinator.ts` feed a mix of raw
+ * `filePath`/`cwd` params and (for `lsp/cascade-tier.ts`) the
+ * `"<quiet-window>"` sentinel. Normalize once here, the single emit seam —
+ * same pattern as `review-graph-logger.ts`'s `logReviewGraph`, guarded via
+ * `normalizeLoggedPath` so the non-path sentinel passes through unchanged
+ * instead of being resolved against the process cwd.
+ */
 export function logCascade(entry: CascadeLogEntry): void {
 	if (isTestMode()) {
 		return;
 	}
-	writer.log({ ts: new Date().toISOString(), ...entry });
+	writer.log({
+		ts: new Date().toISOString(),
+		...entry,
+		filePath: normalizeLoggedPath(entry.filePath),
+	});
 }
 
 export function getCascadeLogPath(): string {

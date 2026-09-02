@@ -113,6 +113,52 @@ describe("session degradation ledger", () => {
 		});
 	});
 
+	it("carries record metadata on durable ledger rows", () => {
+		incrementDegradationCount({
+			kind: "cache-usage-attribution-stale",
+			subject: "message_end",
+			reason: "missing session id",
+			metadata: { sessionId: "session-one" },
+		});
+
+		expect(logLatency).toHaveBeenCalledWith({
+			type: "phase",
+			phase: "degradation_ledger",
+			filePath: "message_end",
+			durationMs: 0,
+			metadata: {
+				sessionId: "session-one",
+				kind: "cache-usage-attribution-stale",
+				subject: "message_end",
+				count: 1,
+				ledgerGeneration: getDegradationLedgerGeneration(),
+			},
+		});
+	});
+
+	it("bounds metadata values and key count on durable ledger rows", () => {
+		incrementDegradationCount({
+			kind: "cache-usage-attribution-stale",
+			subject: "message_end",
+			reason: "missing session id",
+			metadata: Object.fromEntries(
+				Array.from({ length: 10 }, (_, index) => [
+					`field${index}`,
+					index === 0 ? "x".repeat(500) : `value-${index}`,
+				]),
+			),
+		});
+
+		expect(logLatency).toHaveBeenCalledWith(
+			expect.objectContaining({
+				metadata: expect.objectContaining({
+					field0: `${"x".repeat(200)}…`,
+					metadataDropped: 2,
+				}),
+			}),
+		);
+	});
+
 	it("writes updated counts without duplicating once-records", () => {
 		const once = {
 			kind: "formatter-failure" as const,

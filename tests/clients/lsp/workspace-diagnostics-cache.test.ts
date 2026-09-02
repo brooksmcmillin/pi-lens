@@ -131,6 +131,36 @@ describe("isEntryFresh (#671)", () => {
 		expect(isEntryFresh(filePath, entry, () => undefined)).toBe(false);
 	});
 
+	// #2300: a same-mtime-bucket external rewrite (coarse mtime granularity;
+	// #2287 N1) that changes the file's byte length must not be masked by the
+	// mtime-only equality check. Varies SIZE, never same-length content.
+	it("is stale when size differs even though mtime is unchanged (entry carries sizeBytes)", () => {
+		const stat = fs.statSync(filePath);
+		const entry = makeEntry({
+			mtimeMs: stat.mtimeMs,
+			sizeBytes: stat.size + 1,
+			scannedAt: Date.now(),
+		});
+		expect(isEntryFresh(filePath, entry, () => undefined)).toBe(false);
+	});
+
+	it("stays fresh when both mtime and size match the entry", () => {
+		const stat = fs.statSync(filePath);
+		const entry = makeEntry({
+			mtimeMs: stat.mtimeMs,
+			sizeBytes: stat.size,
+			scannedAt: Date.now(),
+		});
+		expect(isEntryFresh(filePath, entry, () => undefined)).toBe(true);
+	});
+
+	it("keeps failing OPEN to mtime-only for a legacy entry with no sizeBytes field at all", () => {
+		const mtimeMs = fs.statSync(filePath).mtimeMs;
+		const entry = makeEntry({ mtimeMs, scannedAt: Date.now() });
+		expect(entry.sizeBytes).toBeUndefined();
+		expect(isEntryFresh(filePath, entry, () => undefined)).toBe(true);
+	});
+
 	it("is stale when the file no longer exists", () => {
 		const entry = makeEntry({ mtimeMs: 1 });
 		expect(
@@ -262,6 +292,33 @@ describe("WorkspaceDiagnosticsCacheContext (#671)", () => {
 			count: 0,
 			scannedAt: expect.any(Number),
 		});
+	});
+
+	// #2300: an end-to-end proof that `record`'s sizeBytes reaches
+	// `isEntryFresh` through `lookup` — a same-mtime-bucket external rewrite
+	// that changes the file's length must invalidate a real context's cache.
+	it("a same-mtime-bucket external rewrite with a different size invalidates the recorded entry", () => {
+		const filePath = path.join(tmp, "a.ts");
+		fs.writeFileSync(filePath, "const a = 1;\n");
+		// Pin the mtime up front so the rewrite below can be forced back to it.
+		// `stat.mtimeMs` below is the round-tripped value, not the nominal one:
+		// `mtimeMs` is derived from a nanosecond timestamp, so a whole-ms Date
+		// can come back as e.g. 1787865854006.999 on ext4.
+		const pinnedMtimeMs = Date.now();
+		fs.utimesSync(filePath, new Date(pinnedMtimeMs), new Date(pinnedMtimeMs));
+		const ctx = createWorkspaceDiagnosticsCacheContext(tmp);
+		const stat = fs.statSync(filePath);
+		ctx.record(filePath, "all|", [], stat.mtimeMs, undefined, stat.size);
+		expect(ctx.lookup(filePath, "all|")).toBeDefined();
+
+		// Rewrite with different-length content, forced back to the SAME mtime
+		// the entry was recorded against.
+		fs.writeFileSync(filePath, "const a = 22222222222;\n");
+		fs.utimesSync(filePath, new Date(pinnedMtimeMs), new Date(pinnedMtimeMs));
+		expect(fs.statSync(filePath).mtimeMs).toBe(stat.mtimeMs);
+		expect(fs.statSync(filePath).size).not.toBe(stat.size);
+
+		expect(ctx.lookup(filePath, "all|")).toBeUndefined();
 	});
 
 	it("a lookup under a DIFFERENT scopeKey never sees an entry recorded under another scope", () => {

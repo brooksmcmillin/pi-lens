@@ -6,6 +6,8 @@ All notable changes to pi-lens will be documented in this file.
 
 ### Added
 
+- **Deliver test-runner failures after the agent settles (refs #2366)** — failed test results remain in the pull-diagnostics and commit-guard cache, then appear once through a provenance-validated non-context custom entry after the agent is idle. Automatic delivery no longer injects a synthetic user message into the next model context.
+
 ### Changed
 
 ### Deprecated
@@ -14,9 +16,331 @@ All notable changes to pi-lens will be documented in this file.
 
 ### Fixed
 
+- **Bound re-raised auxiliary coverage-gap detail (#2356)** — notify-stall pairs still count every uncovered server/file in the degradation ledger and turn-end aggregate, while detailed latency rows are capped at 20 per turn. Bounded latest identity records expose their dropped count.
+
 ### Security
 
-## [4.1.1] - 2026-08-21
+## [4.1.3] - 2026-08-28
+
+### Added
+
+- **Record build identity at session start (refs #1775)** — `sessionstart.log` now logs one bounded line per session start with the serving checkout's commit hash, entry-file mtime, and package version, derived from the running build's own files rather than `process.cwd()`. The dirty flag is deferred (would require a spawn on the session-start hot path); see the issue for the remainder.
+
+- **Rerun externally killed CI Unit tests once (refs #2042)** — a completed CI run now classifies the failed Unit-tests log and reruns only failed jobs when the verdict is `infra-kill`. A per-head-SHA marker and the workflow run-attempt gate prevent rerun loops, while classification errors produce an explicit PR comment.
+
+- **Recover starved CI runs and merge train-approved PRs (closes #2184, closes #2185)** — the merge-train warden classifies every open PR head as runs-concluded-normally, starved-run, absent-run, in-progress, or unknown, re-runs a starved run once, and comments when GitHub drops a dispatch; a new label-gated merge lane lands a `train:approved` PR only when both required checks conclude success on its exact current head.
+
+- **Enable Kotlin structural linting (refs #2198)** — Add eight VTCode-derived Kotlin ast-grep rules (`kotlin-no-lateinit`, `kotlin-no-nullable-boolean`, `kotlin-no-println`, `kotlin-no-unnecessary-let`, `kotlin-no-unsafe-cast`, `kotlin-no-var`, `kotlin-prefer-data-class`, `kotlin-prefer-is-empty`). Kotlin delivers through the ast-grep CLI/LSP lane, because `@ast-grep/napi` 0.45.1 ships no Kotlin grammar.
+
+- **Enable C/C++ memory and I/O idiom rules (refs #2201)** — Add three VTCode-derived rules: `c-no-malloc-free`, `cpp-no-malloc-free`, `cpp-no-printf`. All detection-only, at `severity: warning`, and distinct from CodeRabbit's existing C/C++ security rules.
+
+- **Classify a red Unit tests run as infra-kill, infra-net, or real (refs #2103)** — `scripts/classify-ci-failure.mjs` reads a failed job's log, tells a SIGKILL/exit-137 kill (with or without the `with-memory-watch.mjs` wrapper surviving to report it) and a DNS/network failure apart from a genuine assertion failure, posts one sticky PR comment naming the verdict, and reruns the failed jobs once per SHA when the verdict is infra. Every recognized real-failure shape (a FAIL block, an inline test-failure marker, a file-level collection error, or the overall failed-test tally) wins over any infra signal in the same log, and an unrecognized shape defaults to real rather than infra — the classifier is only as good as the shapes it recognizes, so treat "real" as the safe default, not an absolute guarantee against every possible log shape. The "once per SHA" rerun guard is once per SEQUENTIAL invocation, not across concurrency: concurrent invocations for the same SHA may each attempt a rerun (GitHub answers a duplicate with 403, which the marker records as `failed:403` and a later invocation can retry).
+
+- **Port five codemod gallery candidates (refs #2195)** - add Python `Optional` detection, generator-expression, Ruby symbol-to-proc, Rust character-index, and constrained JSX SVG-attribute rules. Semantic rewrites remain detection-only; guarded Python and Ruby rewrites expose fixes.
+
+- **Enable Java structural linting (refs #2197)** — Add four VTCode-derived Java rules to the ast-grep CLI/LSP lane. The NAPI runner stays limited to its bundled grammars, because `@ast-grep/napi` 0.45.1 ships no Java grammar.
+
+- **Port VTCode's `no-important` CSS rule (closes #2199)** — flags `!important` declarations as a detection-only warning; a safe fix would need to know which selector should win, which the rule cannot infer. CSS and HTML roots are scoped in the napi fallback so language-tagged rules do not scan unrelated parsed roots.
+
+- **Port 5 VTCode Go idiom rules (closes #2200)** — `go-no-fmt-println`, `go-no-panic-in-lib`, `go-no-underscore-func-name`, `go-prefer-errors-is`, and `go-prefer-string-builder` flag `fmt.Println`-family calls, library `panic()`, snake_case function names, direct error comparison, and repeated string concatenation. All five ship detection-only at their triaged severity (warning for `no-fmt-println`/`no-panic-in-lib`, hint for the rest) — each rewrite needs project or call-site context ast-grep cannot verify, so no `fix:` ships. The `+=` arm of `go-prefer-string-builder` is limited to string-literal operands because ast-grep has no type information. `go-no-global-variable` is excluded per the #2195 triage: valid package globals (constants, synchronization primitives) make it too noisy without project-specific policy.
+
+- **Guard a shared checkout against branch switches that destroy another session's work (refs #2007)** — a new opt-in `--lens-checkout-guard` (`guard.sharedCheckout=true`) declines `git checkout`, `switch`, `restore`, `reset --hard`, `stash`, `clean`, `merge`, `rebase`, `pull`, `cherry-pick`, and `revert` when the checkout has uncommitted work and another live pi-lens session is registered on the same root. The refusal names the peer pids and tells you to commit or take a dedicated worktree, rather than moving anyone's work behind their back. Command classification reuses the existing git-guard shell analysis; peer liveness reuses the instance registry.
+
+> Refs #2007
+
+### Changed
+
+- **Split `loop_block` into compute and non-CPU stalls, and name the sweep that caused one (refs #1980, #1723)** — every `loop_block` record now carries `stallClass` (`below-floor`, `cpu-accounted`, `non-cpu-stall`, `system-stall`) and `cpuCoverageRatio`, derived from the `windowCpuMs` that has sat unread beside `durationMs` since #1122. Nine of sixteen genuine 5s+ blocks in a 23h window burned less CPU than the block lasted; those now read as parked, not as work. `suspectSystemStall` is unchanged. The LSP workspace-diagnostics sweep's per-file touch is also bracketed now, so a block inside it names `lsp_workspace_diagnostics_touch` instead of arriving anonymous.
+
+- **Cut the word-index per-edit seam's longest synchronous stretch (refs #2067)** — the cascade and MCP-analyze seams now replace a document through the cooperative primitive, serialized through the index's own operation queue, instead of holding the event loop for the whole replacement. On a 2,829-document, 2.38M-posting corpus the longest synchronous stretch on a large document drops about 3x. Cooperative removal staging now filters each token's postings with the same packed primitive the synchronous path uses, dropping a clock read per posting element. Search results and BM25 scores are unchanged.
+
+- **Bound memory accounting (refs #2132, #2114)** — Add measured byte estimates for review-graph and dispatch-cache residency to `memory_sample`, and keep the word-index persistence hook visible in sampler coverage. #2132 criterion 3 remains undelivered; the `runtime.wordIndex` to `memory_sample` seam can still report `wordIndex:null` and remains a named follow-up.
+
+- **Classify merge-train pagination truncation (closes #2134)** — the warden reports GraphQL pull-request pagination truncation instead of treating a partial population as complete.
+
+- **Gate word-index arena recompaction on a share of the vocabulary (refs #2246)** — the flat 64-store recompaction threshold was crossed by every edit, because one document replacement raises the backing-store estimate by the edited document's distinct-token count. The gate is now 10% of the live vocabulary above a 64-store floor, so fragmentation accumulates proportionally to the index. On a 2,844-document, 2.4M-posting corpus, 300 sequential edits recompact 14 times instead of 299, the per-edit cooperative block drops from mean 32.0 ms to 12.4 ms, and peak resident memory is unchanged (the recompaction share of per-edit CPU falls from 23% to 4%). Small corpora keep the pre-change behaviour: the floor governs any index whose vocabulary is under 640 tokens.
+
+- **Convert the word-index per-edit occupancy guard to a load-invariant work count (refs #2254)** — the per-edit seam's occupancy bound was a wall-clock max-block over a 401-document fixture with `retry: 2`, so it was both flaky and a noisy neighbour in the timing-sensitive test lane. It now asserts the seam's cooperative replacement reads the clock a number of times bounded by the old document's distinct tokens, not by the posting elements it walks, which is deterministic and invariant to runner load. The guard leaves the timing-sensitive lane, and that lane returns to `maxWorkers: 2` now that its one heavy neighbour is gone. The shared `countClockReads` helper moves to `tests/support/perf-harness.ts` so the incremental test and the seam test read one implementation.
+
+- **Weekly stale-issue report now flags missing priority labels (refs #1676)** — the scheduled detector's report on #1323 adds a Priority label coverage section, listing open issues with zero `priority:*` labels and open issues with more than one. Advisory only; the job still never edits an issue.
+
+- **Enforce client dependency boundaries and cycles in CI (refs #1844)** — dependency-cruiser now rejects client import cycles, declared leaf imports, and unapproved additions to the session-start eager graph.
+
+- **Add six test-authoring screens to AGENTS.md (refs #1829)** — Contributor doctrine now names the six ways a green test can assert nothing, each with its screen, a real PR example, and a detection step.
+
+- **Reorganize AGENTS.md for retrieval (refs #1829)** — a task-type index and reading modes up front, the scattered invariant paragraphs pooled into a grouped "Standing invariants" section, placement rules that end top-prepend and tail-append conflicts, the stale version section dissolved (CHANGELOG.md owns versions), and a small HISTORY.md for decision-inert records. Every invariant paragraph preserved verbatim.
+
+- **Contributor and reviewer discipline harvested from six external skill sets plus the 2026-08-26 arc** — AGENTS.md gains the minimalism ladder (climb before writing: exists → reuse → stdlib → dep → one line → minimum), a review materiality bar (no stylistic/hypothetical/line-count findings, nothing a required CI check already fails on, spec-vs-standards axes reported separately, restructure insights route to issues), the deletion test on consolidation verdicts, the exit-137 judgment recipe, and the mechanical-versus-intent rule for maintainer trailing commits; the investigator playbook gains a loop-first diagnosis discipline; the fixer playbook gains commit-before-checkout-proofs and the verbatim-evidence rule; the reviewer playbook gains the quoted-evidence audit and treats fix rounds as fresh PRs (refs #2128).
+
+- **PRs touching tests now carry a Test assessment, and the authoring screens grow to ten** — per touched test file, state what it uniquely pins and what became redundant; removal requires a named surviving test to red on the same mutations. The PR body lint enforces the section (advisory) when the PR touches `tests/`; candidates not deleted in-PR go to the corpus value ledger (#2123). AGENTS.md's test-authoring screens gain four classic vacuity shapes: all-mocks, not-throw-as-sole-assertion, implementation mirror, and snapshot-as-behavior (with the characterization-baseline carve-out).
+
+- **Name and pin the files-touched bus seam (closes #1966)** — Document the two publisher modules, the agent-nudge subscriber, payload and delivery contract, and outcome-level observability; add a source conformance test that fails when the bus surface changes without updating the declaration.
+
+- **Unify the pinned npm version across workflows (#2051)** — ci.yml and release.yml both pin npm 11.18.0 so a single lockfile-writer version governs CI and release installs.
+
+- **Single-flight availability probes (refs #2131)** — concurrent consumers now share one tool/root probe, joined decisions are observable, and budget overruns enter the bounded degradation ledger.
+
+- **Concise zero-read recovery (closes #2335)** — The read guard now delivers its edit-without-read instruction as a single paragraph instead of a three-paragraph block. The 🔄 RETRYABLE marker and the "in this conversation" scope are unchanged.
+
+- **Memoize compiled gitignore globs (closes #1976)** — Reuse compiled ignore patterns for each matcher instance, reducing the measured compile count from 500 to ≤6.
+
+- **Persist word-index changes incrementally off the hot path (refs #2068)** — packed posting lanes now reuse cached wire segments for untouched documents, so a per-edit persist rebuilds only dirty document contributions. Dirty files resolve through one wire-slot map, and each affected token lane flattens once per persist while the existing snapshot worker handles stringify and gzip.
+
+- **Shrink the word index's resident footprint by 4.6x (closes #2069)** — Postings and the forward index now live in packed `Int32Array` lanes over a dense file-id space instead of one boxed `{ file, line }` object per posting. On pi-lens's own 2,682-document tree the index measures 32.7 MB, down from 151.6 MB, and 15.1 bytes per posting entry, down from 70.2. Against the 186.6 MB the issue records before posting interning landed, the reduction is 5.7x. Search results, the persisted snapshot format, and incremental refresh behaviour are unchanged. The `full_rebuild`, `incremental_refresh`, `cold_build`, and `persist_succeeded` records in `word-index.log` gained a `residentBytes` field, and `memory_sample` gained `postingEntries` and `residentBytes`, so a heap census can be reconciled from the logs.
+
+- **Review-graph one-file rebuild (refs #2074)** — the incremental rebuild now reads the graph's own adjacency indexes instead of rescanning every edge. Restoring preserved incoming edges and reading a changed file's import targets both became bucket lookups, and the derived indexes stay live through the update instead of being rebuilt at the end. On a 1,600-file fixture a one-file rebuild drops from 48.0 ms to 33.6 ms median, with edge-metadata comparisons down from 9,600 to 4 and edge visits down from 19,200 to 8. The same fix makes `existedBefore` report the truth, which unblocks reverse-dependency index reuse on every incremental build.
+
+### Fixed
+
+- **Identity-guard seven more in-flight promise caches against ABA eviction (refs #1968)** — `SecurityScanClient.dedupeScan` (gitleaks/trivy/govulncheck), `JscpdClient`, `DependencyChecker`'s per-file and per-project caches, the MCP Stop-hook's `runTurnEndForIpc`, `initLSPConfig`, and `ensureTool`'s per-tool install map all cleared their in-flight entry with a bare delete-by-key, same shape as the dead-code/knip sites #1968 already fixed. A late-settling run could evict a live successor a second writer registered under the same key, causing the next caller to start a duplicate scan/check/install. All seven now delete only when the map still holds their own promise. One sibling, `ast-grep`'s shared availability probe (`runner-helpers.ts`), was reachable TODAY (not latent): a session-boundary reset is itself the second writer, so the bug could fire in production, not only after a future code change.
+
+- **Stop the CI kill record from blaming memory it never ran out of (refs #2042)** — the `[mem-watch]` verdict asserted "the OS reclaimed memory" for every exit-137, including three real kills whose own low-water mark showed 13.0-13.3 GB of 16 GB still available. It now classifies from its numbers, emits a distinct `KILLED WITH HEADROOM` verdict when the box had room, and names the pid it was watching. A new failure-gated CI step captures the kernel's own `dmesg` and `systemd-oomd` records, so the next occurrence names the signal's sender.
+
+- **Re-resolve a runner-detection alias probed before its symlink existed (closes #2077)** — `TestRunnerClient` no longer memoizes a project root whose canonicalization failed, so an alias first probed while it was still missing now converges to the real root's runner verdict on the next probe instead of serving the fallback key's stale "no runner" answer for the client's whole life. Resolved spellings are memoized exactly as before, so the hot path is unchanged.
+
+- **Recompact churned word-index arenas (refs #2117)** — incremental replacements now recompact the posting arena once churn passes 64 backing stores. The per-edit gate is O(1) and the cooperative copy is serialized through the index's async queue and safe against a concurrent edit, so it cannot corrupt postings or stall an edit. Resident-byte estimates include abandoned arena slack, and the bounded refresh record carries before-and-after bytes and store counts.
+
+- **Dedupe review-graph edges after deferred symbol resolution (closes #2127)** — same-batch rebuilds no longer retain duplicate calls or references edges when placeholders converge on real symbols.
+
+- **Report every root a host serves in `pilens_health` (refs #2130)** — the resource footprint projected one scalar `projectRoot` per instance, so a host also serving a subagent's temp worktree read as single-rooted there while `instances.json` listed both. Each `resourceFootprint.perInstance` entry now carries `projectRoots`, resolved through `getInstanceRoots` (the single reader the shared-checkout guard already uses), with the pinned primary still in `projectRoot` for existing consumers.
+
+- **Count every LSP client, and stop leaking a subagent's temp root (refs #2130)** — `memory_sample.subsystems.lsp.clients` now counts clients across every module evaluation, so a host serving a secondary root no longer reports `clients: 1` beside `lspChildCount: 2`. `deregisterInstanceRoot` shares the registry mutation tail, so a short-lived subagent can no longer remove its root before its own queued add lands and leave the temp root in `instances.json` for the rest of the host's life. A host entry synthesized from an `lsp-fallback` guess now yields its primary slot to the session's real root instead of pinning the guess forever.
+
+- **Stamp classifiedBy on ok-path availability decisions (refs #2131)** — seven `logAvailabilityDecision` success-arm calls (biome, dead-code, formatters, jvm-runtime, package-manager, zizmor) omitted `classifiedBy`, so a `cause: "ok"` row could not be attributed to a probe or a caller-asserted repair from the log alone. All seven now stamp `"probe"` for a direct probe success or `"caller"` for an install/join-repaired one, matching their sibling failure arms. A sweep test pins every `cause: "ok"` emit site so the gap cannot recur unnoticed.
+
+- **Normalize review-graph.log's cwd to one form (closes #2141)** — `logReviewGraph` and `logWordIndex` now normalize `cwd` at their single emit seam, so the same project root no longer appears as both `C:\...\pi-free` and `C:/.../pi-free` in the same log.
+
+- **Repair escaped-newline flattened PR bodies in body lint (refs #2145)** — a body can arrive with the literal two-character sequence `\n` (or `\r\n`) standing in for a real line break, the sibling of the space-flattening shape #2149 already repairs. `detectEscapedNewlineBody`/`repairEscapedNewlineBody` restore it losslessly, but refuse outright when the body carries a fenced code block: a flattened fence's own delimiters can no longer be told apart from genuine content, so fence-safe repair stays deferred as recorded on the issue.
+
+- **Stop duplicate merge-train warden actions (closes #2150)** — the warden stops on a non-advancing GraphQL cursor and deduplicates PR records before applying actions.
+
+- **Bound language-server verification output (refs #2169)** — verification retains at most 64 KiB of child output with head-and-tail retention, so a late transport-required line can rescue a valid LSP probe. A truncated verification records one bounded degradation.
+
+- **Match the merge lane to live repository state (refs #2185)** — the lane updates a green branch that is behind instead of attempting a merge master protection would refuse, reads the `(advisory)` name suffix this repository actually uses, resolves duplicate check names to the newest run, requires the `train:approved` label to come from an approver, and deduplicates its merge-failure comment.
+
+- **Stop a routine paging repeat from reddening the merge-train warden (refs #2192)** — the warden's PR reader orders by `UPDATED_AT`, so a PR updated mid-pagination lands on the next page too. That boundary repeat was recorded as a fatal error, once per repeated node, so a fully shifted window could emit up to 200 identical red lines in one 10-minute run. It is now one record per page naming the count, classified by cursor: a repeat with an advancing cursor is benign, a repeat with a stalled cursor stays fatal because it is real truncation. `fetchOpenPullRequests` returns `{ message, benign }` records, so the warden and the merge lane read one classification instead of each deciding for itself.
+
+- **Correct the Java rule set's accumulator and raw-type detection (refs #2197)** — `no-string-concat-in-loop` now requires the accumulator to be a String, so it stops firing on numeric accumulation and starts catching `s += x`. `no-raw-types` skips `instanceof` and `.class`, which have no parameterized form, and reports raw types nested in type arguments.
+
+- **Deflake the output-cap tail-retention test (refs #2197)** — Let the child ignore SIGTERM so the cap's kill cannot settle it before it emits its last line. On POSIX a child's pipe writes are asynchronous, so the cap kill could destroy queued output the assertion needed.
+
+- **Move the dirty-fraction word-index guard off wall clock (refs #2202)** — the incremental word-index occupancy test asserted a same-run timing ratio (`dirty=750 ms < fullMs * 1.5`). Review replicated it 20x under 57-94% CPU load and measured a 0.436x-3.863x spread, wider than the 2x regression the guard exists to catch, and found `retry: 2` only escaped a calibrated 2x-work injection about two-thirds of the time. `serializeWordIndex` now records, per call, how many tokens it re-flattened and whether it took the incremental or full-rebuild path (`getLastWordIndexSerializeWork`, test-only). The guard asserts on that count directly: no timer, no retry, no runner-load dependence, and it fails deterministically on a synthetic work-doubling regression.
+
+- **Fix `playground-verify-rule.mjs` matching the wrong source (closes #2208)** — the harness wrote a caller's `--code` into the upstream ast-grep playground's `query` field, which only feeds its Pattern mode. Config mode (what this harness always uses) matches against `state.source` instead, so the URL hash carried no source and the playground silently fell back to its own hardcoded sample. Every run graded that fixed sample, not the caller's code, so `matches` never reflected the fixture under test. `source` now carries the code; a rule + known-matching snippet reports a real match count instead of a silent 0. Also adds a scrape-side sentinel that catches the same failure mode recurring through upstream schema drift alone (e.g. a future `state.source` rename), and fixes the reported match `lines` clamping to the match count instead of the source's own line count.
+
+- **Run the ast-grep in-process fallback on every JS/TS module extension, and record the languages it cannot serve (closes #2215)** — `.mjs`, `.cjs`, `.mts`, and `.cts` files reached the napi fallback and were dropped without running a single rule, because its extension allowlist was hand-maintained beside three other lists that described the same thing. All four now derive from one language matrix, so the ~470-rule catalog reaches those files. The twelve catalog languages `@ast-grep/napi` bundles no grammar for (python, java, go, ruby, cpp, rust, csharp, c, kotlin, swift, php, scala — 247 of the 470 rules) are recorded as ast-grep LSP/CLI-only rather than silently skipped, the skip telemetry now names each language's delivery route, and a file admitted for a grammar the loaded addon turns out not to have leaves an `ast-grep-napi-language-unavailable` degradation record instead of nothing.
+
+- **Derive the project scan's ast-grep kind per file instead of hard-coding jsts (closes #2217)** — The scanner passed the literal `"jsts"` to `evaluateAstGrepRules` for every napi-evaluated file, including `.css` and `.html`, so `suppressLinterOverlap` (and any future kind-gated ast-grep policy) evaluated non-JS files under a JS/TS linter-overlap decision. It also diverged from the per-edit dispatch path, which derives kind from `detectFileKind` — the same file could see two different kinds depending on which path evaluated it. The scan now calls `detectFileKind` (the shared `KIND_EXTENSIONS` resolver), matching the dispatch path exactly.
+
+- **Normalize the remaining NDJSON logger `filePath` fields (refs #2219, the #2141 class)** — `cascade.log`, `latency.log`, `read-guard.log`, `tree-sitter.log`, and `actionable-warnings.log` now normalize `filePath` once at each logger's single emit seam, so the same file no longer appears in two path forms across a log. Non-path sentinels (`"<quiet-window>"`, `"<tree-sitter>"`, shell commands, coarse labels) mixed into the same field are left untouched instead of being resolved against the process cwd.
+
+- **Remove three real-timer races from tests that only pass under CPU contention (refs #2225, #2235, #2182)** — `safe-spawn.ts`'s cap-then-timeout/cap-then-abort tests raced a real child's stdout against a real 300ms timer (5/8 failures under 8 concurrent runs); they now mock the child so the cap trips before the timeout by construction, in a new `safe-spawn-cap-race.test.ts`. `spawn-timeout-cooldown.test.ts`'s markdownlint-fix guard paired real filesystem I/O with a heavy dynamic import inside vitest's 5000ms default, reproduced as a hard timeout under synthetic load; it now carries a 20s budget. `managed-tool-refresh-strategies.test.ts` had more instances of the dangling-promise-contamination shape #2216 first fixed for one test — a file-wide `vi.setConfig({ testTimeout: 20_000 })` replaces per-test patching. A residual shared-mutable-state race in the same file, independent of any timeout, is left open on #2182.
+
+- **Make a stale compiled `.js` beside a `tests/**/*.ts` file fail loudly (refs #2232)** — `tests/` is excluded from `npm run build`, so any `.js` sibling of a test-support `.ts` file is leftover residue from an earlier, differently configured local compile. Vitest's import specifiers end in `.js`, so that residue silently wins module resolution over the real source, running stale code with no warning. The build-freshness `globalSetup` now also flags this residue and aborts the run naming the file.
+
+- **Make the spawn-timeout cooldown regression test load-invariant (closes #2235)** — load the real pipeline during test-module setup so the 5000ms test budget measures cooldown behavior instead of contention during a heavy dynamic import.
+
+- **Bound the dispatch fact store (refs #2240)** — `FactStore`'s per-file records are now capped at 1024 with LRU eviction, so a several-hundred-file batch no longer retains one entry per distinct path until the heap is exhausted. The files being dispatched are pinned, so a background project walk cannot evict facts a live dispatch is still reading.
+
+- **Harden the dispatch fact-store pin against eviction (refs #2240)** — the debounced ast-grep warning scan is a dispatch entry point, but it never pinned its file or re-derived content, so a project walk in its 2-second window could evict `file.content` and make inline `pi-lens-ignore` suppressions silently stop applying. The scan now pins and re-derives like every other dispatch caller, via a new `beginDispatchFor` that pins WITHOUT clearing the file's already-fresh facts (the earlier clear-and-re-derive cost ~51ms of redundant re-parsing for a file already re-derived by the inline dispatch 2 seconds earlier). The pin is also released at dispatch completion, so the pin set tracks dispatches actually in flight rather than the last 16 files touched. Capacity-eviction telemetry is now labeled per store instead of one shared subject across all six production `FactStore` instances, so a session-start review-graph walk can no longer consume the dispatch store's once-per-session degradation record before a real dispatch runs.
+
+- **Bound retained FactStore content bytes (closes #2247)** — file-fact stores now evict least-recently-used records after retaining 64 MiB of UTF-8 `file.content`, as well as after 1,024 records. In-flight dispatch records remain pinned until settlement. A count-axis and a byte-axis eviction on the same store each get their own degradation record instead of sharing one dedupe key, and a pin whose content alone exceeds the byte budget stops evicting unpinned inserts instead of silently discarding every one of them, recording that state through its own degradation kind.
+
+- **Napi runner css/html admission (#2248)** — Route CSS and HTML files to the napi ast-grep runner when its bundled grammars support them.
+
+- **Anchor `.gitignore`'s scratch `test-*` patterns to the repo root (refs #2250)** — the unanchored `test-*.ts`/`.js`/`.py`/`.md`/`.sh`/`.mjs` rules matched the basename of any tracked file at any depth, silently hiding `clients/test-runner-client.ts` and several `tests/` files from `rg` and other ignore-respecting search tools. `git status` never flagged it because git still tracks the files. The patterns now only match scratch files dropped at the repo root, their original intent.
+
+- **Baseline the git-config contamination guard against pre-suite identity (refs #2251)** — the test-teardown guard no longer fails every local run for a maintainer whose real git identity happens to equal a fixture value (`user.name=t`, `user.email=t@t.local`). It snapshots the config before any test runs and flags only fixture values that appear during the run, so real contamination still fails loudly.
+
+- **Scope the playground source sentinel (refs #2253)** — the verifier now checks the caller's fixture inside the source pane's Monaco editor. A matching rule note in the config pane no longer masks upstream source drift.
+
+- **Bound every in-memory review-graph retention site (refs #2255, #2240)** — the live `ReviewGraph` grew with project size and had no size guard; only the persisted snapshot was capped. On a large repository it was the second unbounded dispatch store behind the multi-gigabyte OOM abort (`FactStore.fileFacts` was the first, bounded in #2243). Two sites retained a graph for the life of the process: the workspace cache and `session.reviewGraph` on a caller's FactStore, two of which are module-scope. Both now go through one memoized retention seam capped by estimated resident bytes (`PI_LENS_GRAPH_MAX_IN_MEMORY_BYTES`, default 512 MiB), evicting with the same centrality-ranked selection the snapshot uses. `memory_sample` counts every retention site instead of the cache alone, deduplicated by object identity, so the sample can no longer read clean while a full graph is resident. A trim never yields an empty graph, and a graph trimmed for size is now distinguished from one whose source walk was truncated: both report as partial, but only the size-trimmed one stays usable as an incremental base, so an over-budget repository is not forced into a full project walk every turn. That marker is process-local and never persisted. Each trim emits one bounded degradation record per workspace.
+
+- **Ast-grep YAML rule caches detect edited and nested files (closes #2262)** — the in-memory rules cache snapshots every YAML file with `mtimeMs` and size, re-checked at most once per 2-second cadence window. Editing an existing rule or adding a nested rule invalidates the cache even when the rule directory mtime stays unchanged; pickup lag is bounded by one cadence window.
+
+- **Topology-derived startup scan and language-profile memos re-arm with the workspace marker index at session start (closes #2263)** — `resetWorkspaceTopology()` walks one registered downstream-cache reset list, clearing `startupScanContextCache`, `languageProfileCache`, and tsconfig-path caches with the source index. Caches are cleared only at session start via the topology-reset registry; mid-session edits are not detected.
+
+- **Move three Java rules off an inert `files:` negation glob (fixes #2280)** — `no-raw-types`, `no-string-concat-in-loop`, and `no-system-out-println` used `files: ["**/*.java", "!**/test/**"]` to carve out test files, but ast-grep 0.45.1's `files:` field has no negation support, so the exclusion silently did nothing. All three now use the real `ignores:` field ast-grep's engine honors natively, restoring the test-file carve-out.
+
+- **Preserve latency logger exports in test mocks (refs #2281)**
+
+- **Detect different-size project-snapshot rewrites inside one mtime bucket (closes #2285)** — The authoritative in-process cache now validates both body mtime and size before serving its snapshot, so a hot project root cannot mask a different-length external write indefinitely. Same-size, same-mtime rewrites remain outside this metadata-only hot-path guarantee.
+
+- **Merge-train duplicate classification (#2289)** — The warden now treats a PR number repeated within one GraphQL page as malformed data and a fatal error. Genuine cross-page window slides remain benign notes.
+
+- **Add a size axis to five mtime-only content memos (closes #2300)** — The MCP warm-build staleness gate, the LSP diagnostic-binding content-hash memo, the workspace-diagnostics per-file freshness cache, the cross-process recent-touches watermark, and the installer's tool-path probe cache now all validate byte size alongside mtime, so an external rewrite landing in the same coarse-granularity mtime bucket with a different length is no longer served as unchanged. Every fix reuses a stat call already being made — no added per-edit I/O.
+
+- **Remove the redundant markdownlint autofix cooldown guard (closes #2301)** — `detectFileChangedAfterCommand` remains the single source of truth for autofix cooldowns, and its direct test owns that contract.
+
+- **ast-grep findings survive a silent auxiliary LSP (closes #2324)** — the napi fallback stays active until the ast-grep LSP completes its first diagnostic publication for the SPECIFIC FILE (not just anywhere on its client), closing the race where a sibling file's publication wrongly satisfied the gate. The fallback and the late-auxiliary delivery lane no longer both fire for the same file: a napi run consumes that file's pending late-auxiliary pair. The remaining narrow case — a server that published once but goes silent on a later touch of the same file — is now a bounded `aux-runner-findings-lost` degradation record instead of a silent drop.
+
+- Auto-repair clearly flattened pull request bodies before advisory lint validation. Repair only splits inline headings; duplicate or otherwise structurally inconsistent template headings refuse repair and preserve the original lint errors.
+
+- **Correct the vulture exit-code comment (closes #1765)** — The comment in `clients/dead-code-client.ts` now states the verified vulture 2.16 exit codes: 0 on a clean run, 3 with findings on stdout when dead code is found, and 1 with an error on stderr for invalid input or parse errors.
+
+- **Read-guard eviction paths now leave a trace (#1918)** — Whole-file eviction (file cap, idle timeout, external-delete cleanup) and the per-file edits-cap trim each emit a bounded, always-on `read-guard.log` record naming the file and which path evicted it, closing the gap #1915 left after fixing the record-cap path.
+
+- **Record formatter cache hits (closes #1940)** — Emit `formatter_selected` with `outcome: "hit"`, `reason: "cache"`, and `cached: true` on formatter detection cache hits, providing hit-rate observability with a single denominator in `latency.log`.
+
+- **Cap dependency-drift blocker re-serves (refs #1950)** — A demoted-but-confirmable inline blocker (`clients/blocker-freshness.ts`) now retires after 3 degraded deliveries with no re-run, instead of re-serving indefinitely. The retirement note says the record can still be confirmed by a fresh dispatch, distinct from #1944's past-EOF retirement, which means the finding is provably unconfirmable.
+
+- **Record message_end cache_usage attribution loss (closes #1956)** — A stale extension ctx now records a bounded `cache-usage-attribution-stale` ledger entry instead of silently writing the `cache_usage` row unattributed; the row still writes so provider token and cost data is never dropped.
+
+- **Gate nested LSP requests (closes #1971)** — Skip `workspace/willRenameFiles`, `workspace/didRenameFiles`, and `codeAction/resolve` unless the server registered them, matching each registration's scheme/glob/file-kind filters at the send boundary while preserving supported edits and unresolved-action fallbacks.
+
+- **Stop re-canonicalizing already-normalized dispatch paths (refs #2016)** — the dispatch context's `filePath`, `cwd`, and `projectRoot` are normalized once at construction, and seven downstream sites no longer pay a redundant `realpathSync` per dispatch. Scanner ids and the relative baseline key move to the cheap syntactic normalizer, which also fixes a key that resolved against the process working directory on Windows and stayed relative on Linux.
+
+- **Budget CI test workers against real memory, and name an OOM kill (refs #2042)** — Fork concurrency and the per-fork heap ceiling now come from one resolver that sizes them against the host's memory instead of two constants tuned on a dev host, and the CI suite runs under a memory watch that reports the low-water mark so exit 137 no longer reads as unattributable infrastructure noise.
+
+- **Retire deleted failed-first test targets (closes #2044)** — Test selection retires only confirmed-missing canonical paths with bounded work, then continues with valid failures or normal discovery.
+
+- **Bound markdownlint verification and preserve typed spawn failures (closes #2045)** — markdownlint-cli2 now verifies through its stdin mode without scanning project files, and verifier logs retain the effective check command and typed timeout or spawn failure kind.
+
+- **Canonicalize test-runner cache roots (refs #2048)** — Test-runner availability and Vitest glob caches now share project identity across path aliases, while positive runner verdicts expire when their supporting config disappears.
+
+- **Honor LSP file-operation filters (closes #2049)** — Send file rename requests and notifications only to servers whose validated scheme, glob, file/folder, and case filters match the renamed resource.
+
+- **Decline LSP roots outside every session project root (refs #2052)** — a file outside every initialized session cwd now receives an explicit outside-project-root skip and one bounded record per foreign root, instead of diagnostics computed under the wrong project context. The full sweep carries the skip into the unconfirmed lane, so a declined file is never reported or cached as clean. A process that initializes several project roots keeps serving all of them.
+
+> Refs #2052
+
+- **Cover the whole failed-Git-integration family.** `git pull`, `git revert`, and `git am` now join merge, rebase, and cherry-pick when opaque recovery drops clean incoming index paths. Truncated `git status` output fails closed, and an undocumented porcelain status pair keeps its path instead of voiding recovery for every other file in the command.
+
+- **Make LSP spawn records count truthfully (closes #2064)** — `lsp_client_selected` reported `cold-spawn` for every caller that merely joined another caller's in-flight spawn, so the one metric that looked like a spawn count over-counted 3.0x in a 21.8 h field window, and one 29.3 s TypeScript spawn read as 39 spawns in 2 ms. The record now names the starter (`cold-spawn`, `spawn-failure`) apart from the joiners (`cold-spawn-joined`, `spawn-failure-joined`), on the same record with the same denominator. A new `lsp_server_spawned` latency record fires once per language-server process start for every server, so `latency.log` finally counts TypeScript spawns, which `lsp_launch_candidate_success` never covered.
+
+- **A crashed LSP client no longer pins its retained text forever (refs #2065)** — the client-count Set backing the incremental-text-retention telemetry only deregistered on a graceful shutdown; a crash (connection error, connection close, or an unexpected process exit) never removed the client, so its retained text stayed counted, and reachable, for the rest of the process lifetime. Deregistration now happens in the one place every death path already converges on, so a crash is cleaned up the same way a graceful shutdown is. The eviction scan that runs on every `didChange` past the retention cap no longer spreads and scans the full per-path map; it tracks text-bearing paths in their own recency-ordered auxiliary set instead, so the scan cost stays proportional to the 128-entry cap rather than to the number of open documents. That auxiliary set is now also cleared on `didClose`, closing a second, smaller instance of the same unbounded-per-path-store class: without it, a closed document that was never evicted by the cap left a stale entry behind on every open/close cycle. `pullGenerations`, a per-path pull-fan-out counter, is deliberately left uncleared on close, for the same reason the codebase already leaves `pullRequestSequences` uncleared: resetting it would let a stale in-flight pull's captured generation match the counter again after a close/reopen and be wrongly accepted.
+
+- **Incremental LSP document text is bounded and released on close (refs #2065)** — full text retained for incremental synchronization is capped at 128 paths and 64 MiB of UTF-16 data, evicts least-recently-sent paths, and is removed with the other per-document state on `didClose`. Periodic `memory_sample` records now expose retained entries and bytes.
+
+- **Per-send LSP document sync makes one JavaScript pass over the previous document instead of two, on `didChange` (refs #2066)** — the newline count behind `lsp_document_send`'s `contentLineCount` and the last-line position behind an Incremental `didChange` range now come from a single scan whose result rides on the existing per-path content-binding entry, so a change no longer splits the previous document into one substring per line to read one of them. Line-count semantics are unchanged: `contentLineCount` still counts `\n` only, while the range still treats `\r\n`, lone `\r`, and `\n` as terminators. The remainder of #2066 is its "one pass total" target: the #1095 sha256 content binding is a second, native full-document pass and still runs on every send.
+
+- **Intern word-index posting files (refs #2067)** — Per-edit document replacement now compares shared file identities instead of re-normalizing every posting element; build/refresh telemetry records posting-entry counts and per-edit replacement cost. This is the declared prerequisite for #2069's posting representation work.
+
+- **Nested `.gitignore` edits now refresh ignore verdicts (closes #2071)** —
+  agent writes invalidate every cached project matcher containing the edited
+  path, so its per-path memo cannot serve a verdict from an older ignore file.
+  Root edits rebuild each affected matcher, while nested edits preserve
+  compiled-glob reuse for sibling trees.
+
+- **Give nested ignore rules and path verdicts one freshness clock (closes #2071, closes #1976)** — a nested `.gitignore` edit no longer leaves two paths under the same rule disagreeing, and the ignore matcher stats a nested source once per cadence window instead of once per file. A 2000-file walk drops from 18,064 `statSync` calls (9.03 per file) to 192 (0.10 per file), and from 1,886 ms to 85-92 ms across runs. An externally edited nested ignore file is honored within one cadence window (2 s).
+
+- **Review-graph source-path normalization (refs #2072)** — reuse canonical paths across builds, remove redundant persist coverage normalization, and expose normalization and persist durations in telemetry.
+
+- **Clear outgoing idle-eviction timers on cache replacement (refs #2073)** — Review-graph, reverse-dependency, and authoritative project-snapshot cache replacements now release the prior entry's timer before installing the new entry, preventing one full payload from being retained per rebuild. Regression coverage asserts one live timer after twenty replacements for each cache family.
+
+- **Fail closed on truncated Git file lists.** Truncated `git ls-files` output now reports unavailable tracked and ignored sets instead of presenting partial sets as complete.
+
+- **Opaque-mutation exclusion counter overstated suppression (closes #2081)** — `excludedIncomingCount` incremented for every clean-index-only entry dropped by the failed-integration filter, even when the entry's mtime fell outside the recovery window and it was never going to be dispatched. It now counts an entry only when the mtime-freshness check would otherwise have included it, so the field means what its doc comment claims: dispatches actually prevented. Added a test asserting the `opaque_mutation_status_pair_unknown` latency record's emission and phase identity through the `logLatency` seam, alongside the existing `opaque_mutation_incoming_excluded` coverage — renaming either phase string now reds a test.
+
+- **PR-title checks now validate the live pull-request title (refs #2083)** — rerunning a failed check can recover after the title is fixed without requiring a new pull-request event.
+
+- **PR body lint now rejects unfilled templates and recognizes the fleet's section conventions (refs #1844)** — live body lookup uses the repository API endpoint with a bounded timeout and safe fallback.
+
+- **Read the live PR body in close-keyword syntax checks (refs #2086)** — Reruns now validate the edited PR body instead of replaying a stale event snapshot.
+
+- **Read the live PR body in close-keyword verification (refs #2086)** — a post-merge rerun of `--verify-merged` used to relint the closed-event payload's stale body and, in production, silently kept doing so because the workflow step never carried the `GITHUB_TOKEN` env var the live fetch needs. It now sets that var and fails the check loud on any fetch problem instead of falling back to stale data, so an edit that fixes or introduces a comma-separated close list is reliably seen on rerun.
+
+- **Close two named remainders from the #2088 sweep-floor fix (refs #2088)** — the sweep-floor meta-sweep now recognizes the `expect(x.length).toBe(0)` emptiness spelling (14 test files use it, previously invisible to the census), and `managed-tool-seam-coverage` gained a positive control on its `safeSpawnAsync(` detector so a regex that stops matching fails loud instead of reading as zero violations.
+
+- **Closed the managed-tool seam sweep's vacuous exemption (refs #2088)** — The meta-sweep exempted `managed-tool-seam-coverage.test.ts` with a false reason; the file walks `clients/` from a cwd-relative root and asserted zero violations with no floor, so blinding its walk to an empty array still passed. It now walks from a repo-root-derived path and carries its own scanned-files and detector-signal floors. Reworded two other exemption reasons that wrongly said "not a population sweep" when both carry their own hand-rolled floors. Added the `readdir` named-import spelling to the meta-sweep's enumeration regex, closing an async-walk evasion. Recalibrated the meta-sweep's `minFlagged` to the measured population (55) after the exemption-list growth made the prior figure stale.
+
+- **Governance sweeps now fail on empty populations (refs #2088)** — Added declared scan and finding floors, stale dynamic-runner checks, and a registered meta-sweep for hand-rolled governance scans.
+
+- **Tests that could not run reported as passed (closes #2089)** — Thirteen test bodies bare-returned before their first assertion, so Vitest counted them green while they asserted nothing. Each now skips visibly (`it.skipIf` or `ctx.skip(reason)`), the pnpm symlink case runs unguarded on every platform, and a new sweep over the whole `tests/` tree fails on the shape.
+
+- **Stop metrics-history's git probe from leaking stderr into the TUI (#2095)** — `getCurrentCommit()` now pipes `git rev-parse` stderr instead of inheriting it, so a failing probe reports "unknown" quietly instead of printing a raw `fatal:` line. The same fix applies to the LSP launcher's Windows registry PATH probe, the only other unguarded `execSync`/`execFileSync` call in the runtime.
+
+- Resolve metrics commit attribution against each target file's Git repository. (closes #2099)
+
+- **Truncated tool output is reported as truncated.** Several spawn sites (`git status` opaque recovery, oxlint, `helm lint`, `helm template`, and the shared-checkout working-tree probe) retained unbounded stdout and carried truncation guards that could never fire. Each now caps its output, and every truncation guard in the tree reads `truncatedByOutputCap` before failure or status handling. `safeSpawnAsync` now records `killedForOutputCap`, so callers handle cap termination without guessing from POSIX or Windows exit shapes. A run that hit the cap and then timed out or was interrupted still reports the timeout or abort. Also corrected the trivy scan, `sg` exec/scan, and ast-grep pattern validation. The shared runner ledger now says a tool was stopped at its output cap instead of blaming it for a kill pi-lens sent.
+
+- **Rename the CI classifier's kill label to infra-kill and read kernel evidence (refs #2103)** — every exit-137/SIGKILL kill used to post as `infra-oom` even with memory headroom; the classifier now labels it `infra-kill` and enriches the detail with the kernel kill-evidence step's dmesg/cgroup output already in the log.
+
+- **Fail loudly when the stale open-issues scan is truncated (closes #2104)** — the weekly detector proves exhaustion for the open-issue population, fails loudly when its safety bound is reached, and reports the scanned population. The master commit read remains a deliberately bounded recent window and reports commits beyond its detail cap.
+
+- Serialize overlapping per-path LSP `didChange` sends so Incremental payloads use the latest confirmed document content (closes #2113).
+
+- **Deferred runner results remain visible and actionable (refs #2122)** — Deferred runners now show a pending state at edit time, report failures at turn end, preserve freshness coverage, and bound handoff retention with degradation telemetry.
+
+- **Key session start and the host registry by project root (closes #2129, refs #2130)** — a subagent temp worktree no longer steals the process's primary session. Root identity is now an input to session-start classification, so a start in a different directory takes the reduced path instead of resetting the host's warm LSP fleet and re-running the whole startup battery over unchanged content. Two temp roots in one host previously cost about 50 seconds of opengrep and 53 seconds of word-index rebuild each, and drove host RSS from 290MB to 1.1GB in four minutes. The host registry entry in `instances.json` now holds a set of roots with the primary pinned, instead of one scalar every session start overwrote, so warm attach and the shared-checkout guard can see a peer working under any of its roots. The shared-checkout guard now confirms a peer against every root it serves, so a session working under a secondary root can no longer be missed and have its uncommitted work discarded. `memory_sample` carries the owning root and the distinct-root count of its live LSP clients, which makes a turn index attributable on a multi-root host.
+
+> Refs #2129, #2130
+
+- **Scope availability probe flights per owner (refs #2131, refs #2140)** — Package-manager, dispatch, toolchain, checker, cwd, and security-scan availability owners now hold separate keyed flights, so an owner reset cannot tear down another owner’s probe. Release-managed binaries under `~/.pi-lens/bin` answer before PATH probing, and the resolved path reaches security scans.
+
+- **Resolve LSP-managed release binaries before PATH (refs #2140)** — Every GitHub-release-managed LSP server (clojure-lsp, cue, deno, expert, gleam, marksman, opengrep, rust-analyzer, taplo, terraform-ls, typos-lsp, zizmor, zls) now checks `~/.pi-lens/bin` before walking bare PATH candidates, same as the fast path PR #2148 already gave the CLI-scan side of opengrep/gitleaks/trivy/govulncheck. A managed binary with no PATH entry no longer ENOENTs a launch candidate before the installer step finds the same binary a moment later. For rust-analyzer and deno, this means a pi-lens-managed copy is now preferred over a developer-toolchain-managed one (rustup, `deno upgrade`) when both are present; the managed copy is kept from drifting too far via the existing 7-day managed-tool refresh cadence.
+
+- **Key process-unique state on `globalThis` so it survives a second module evaluation (refs #2146)** — pi evaluates the pi-lens module graph up to nine times per process, so the primary-session registration and the instance-registry mutation tail existed once per evaluation instead of once per process. The concurrent-session guard read an empty registration and ran the full session_start battery per subagent temp root, and concurrent read-modify-write cycles tore `instances.json`. Both now share one versioned process singleton, and `host_boot` records the evaluation ordinal. `session_shutdown` gained the same root discriminator `session_start` has, so a subagent's teardown no longer clears the shared registration and leaves the next subagent to run the full battery.
+
+- **Distinguish clean from absent auxiliary LSP results (closes #2151)** — Turn-end late-auxiliary harvesting now recognizes published clean results and retires stuck coverage pairs with bounded, reconciled telemetry.
+
+- **Adapt the first cold auxiliary wait to observed spawn cost (closes #2152)** — a cold auxiliary touch uses the larger of its declared wait and the server's last successful spawn duration plus a 500ms margin, capped at 8s. Warm touches retain the declared wait capped at 2s, and `PI_LENS_AUX_GRACE_MS` caps the budget (it never raises it).
+
+- **Identity-feeding sorts now use a code-unit comparator, not `localeCompare` (closes #2155, closes #2165)** — the availability-probe cache key in `runner-helpers.ts` sorted env entries with `localeCompare`, a locale-dependent comparator. Two processes (or one process under a changed locale) could order the same env set differently and mint different keys for identical state, causing a silent probe-dedupe miss. Fixed via a new shared `compareOrdinal` helper (`clients/string-utils.ts`), applied to every identity-feeding sort found in the class sweep: dependency-cycle and madge dedupe keys, review-graph signature/hash/cache keys, the Windows spawn cache key, the bounded-hash object-key order, the rule-cache content hash, the workspace-diagnostics scope key, the turn-end-findings signature, and the formatter-config signature. `localeCompare` sorts kept for user-facing display are left untouched.
+
+- **Share one LSP service across module evaluations (refs #2157)** — all evaluations now share one service, its generation handoff, workspace-sweep hold, and classic TypeScript repair guard through versioned process-singleton families. Incompatible live services shut down fast before replacement, and a secondary pipeline crash or a secondary session's idle-reset timer no longer tears down the primary fleet.
+
+- **Consumed `.gitignore` files refresh at matcher lookup (closes #2159)** — pi-lens detects external edits, git restores, and changes under ignored directories with a cadence-bounded freshness probe.
+
+- Use per-file diagnostic publication timestamps to distinguish a fresh clean primary LSP response from an absent response in the tsserver sync racer.
+
+- **Bound the stale-findings re-arm loop and count cap-evicted pairs (closes #2167, closes #2168)** — Late-auxiliary turn-end harvesting now caps a pair that keeps returning stale findings at `MAX_LATE_AUX_REARMS` re-arms, re-arms (instead of dropping) a pair after a transient probe-cache read failure, and counts a pending-coverage cap eviction with a dedicated `capEvicted` counter folded into the turn's reconciliation sum.
+
+- **Bound Svelte and Prisma language-server probes, and Vue's remaining dispatch-side budget (refs #2169, #2176)** — the Svelte and Prisma installer registry entries now carry their own cold-start `--version` verification ceilings (20s and 40s), matching real measured cold runs of 12.4s and up to 27.3s. Separately, Bash, JSON, Prisma, Vue, and Svelte language servers now raise the dispatch lsp-runner's 5-second cold-spawn wait floor to match their installer bounds, so a slow cold spawn cannot still read as unavailable after installer verification would have accepted it.
+
+- PR body repair keeps distinct numbered fix-round headings distinct, so legitimate multi-round bodies can be repaired while duplicate and corrupted headings remain protected.
+
+- **Preserve identity during concurrent instance registration (refs #2173)** — An adjacent O_EXCL lock serializes registry writers, reclaims stale ownership, and preserves session identity during child-first synthesis.
+
+- **Bound the Vue language-server verification probe (refs #2176)** — the managed Vue registry entry now gives its cold-start `--version` probe a 30-second per-tool ceiling, while all other tools retain the 10-second installer default.
+
+- **Migrate remaining Git-using smoke scripts to the scrubbed fixture environment (closes #2177)** — governance now detects fixture identity and path-exemption drift, and the JavaScript helper has direct wrapper coverage.
+
+- **Bound the JSON and Bash language-server verification probes (closes #2194)** — `bash-language-server` and `vscode-json-language-server` measured 9,667ms and 11,047ms cold `--version` starts with closed stdin, close enough to the 10-second installer default that host contention alone could trip a false verification degradation. Both now carry a 20-second `verificationTimeoutMs`, delivered through the managed-local, install, and refresh paths. The refresh delivery for the other five install strategies (pip, gem, github, maven, archive) is now covered by tests too, closing the gap the issue's follow-up comment flagged.
+
+- **Escalate workflow runs stuck queued (closes #2203)** — the merge-train warden classified a run that GitHub queued and never scheduled as `runs-in-progress` on every cycle forever, which read as healthy waiting. A tracked run that has executed zero steps for 60 minutes now classifies `stalled-run`: the warden names it in a PR comment, cancels it on the next cycle, and re-runs it once, bounded by GitHub's own `run_attempt`. A run with executed steps stays in progress however long it takes, and a cancellation the warden did not make is left alone.
+
+- **Stamp classifiedBy on every availability_decision failure arm (refs #2131, #2209)** — 12 call sites across formatters, the JVM runtime probe, zizmor's gh-token latch, PowerShell script analysis, govulncheck, and the shared runner-helpers/ast-grep seams now record whether a probe or the call site itself classified the outcome, closing the failure-arm half of the gap #2205 fixed for successes.
+
+- **Re-check test-runner negative verdicts instead of latching them (refs #2252)** — `TestRunnerClient.detectRunner` and `parseVitestTestGlobs` used to memoize "no runner"/"no config" for the process's whole life once probed. A config file added after the first probe (`vitest.config.ts` appearing, a project scaffolded mid-session) now converges on the same client instance instead of re-serving the earlier miss.
+
+- **Treat a null PR body as empty (closes #2268)** — Let PR-body and close-keyword checks report their actual validation results instead of treating an empty GitHub body as a fetch failure.
+
+- **Make the failed-target cap test load-invariant (closes #2290)** — Seed the real `TestRunnerClient` state with deterministic failed results instead of launching 33 child processes, so the cap assertion is independent of batch contention.
+
+- **Make cross-root eviction coverage load-invariant (closes #2305)** — Seed failed-target eviction state through `TestRunnerClient.recordResult` instead of spawning child processes, while retaining global ordering, root-map reacquisition, and telemetry assertions.
+
+- **Normalize tabs in playground-verify's sentinel comparison, and fail fast on a stable mismatch (closes #2306)** — a first source line with an internal tab (`const\tok\t= arr.indexOf(x) !== -1;`) burned the full 40s poll timeout and reported "likely upstream schema drift": Monaco doesn't render a tab as U+0009, so the raw-tab sentinel never matched, the same failure mode the existing nbsp normalization was added for. `buildScrapeExpr` now collapses every run of tab/nbsp/space to one space on BOTH sides of the comparison instead of hand-listing substitutions. The poll loop also tracks a stable, non-empty rendered-source length across polls and concludes as soon as it repeats unmatched for three consecutive polls, rather than always waiting out the full `--timeout`; the failure message now names both remaining causes (a sentinel-normalization mismatch in this harness, or upstream schema drift leaving the page's default sample rendered) instead of a bare schema-drift verdict.
+
+- **Pin the availability-probe cooldown consult (closes #2309)** — Preserve the transient timeout decision and skip redundant probes while a command is cooling down.
+
+- **Harden the CI classifier's automatic PR comment path (closes #2318, refs #2316)** — escape log-derived HTML comment delimiters, neutralize mentions, and accept only the final anchored classifier marker so failed test output cannot forge rerun suppression or ping users.
+
+- Schedule ast-grep NAPI rules for CSS and HTML edits, restore four sibling structural and IaC runner-kind pairs found by the class sweep, and guard every declared pair against dispatch-plan drift. (#2323; refs #2325)
+
+- **HTML ast-grep catalog coverage (closes #2325)** — Verify that every NAPI-routed language ships enabled rules and that HTML edits report plaintext HTTP links.
+
+- **Avoid unrelated diagnostics after a conflicted Git integration.** Pi Lens now excludes clean incoming index paths from failed Git integration recovery (merge, rebase, cherry-pick, pull, revert, am).
+
+- **Guard package-lock metadata during releases (#2043)** — Detect package identity, dependency, and peer-policy drift at CI, commit, install, and changelog release preflight boundaries.
+
+- **Attribute pi-lens writes and bound review-graph path normalization (refs #2070, closes #2072)** — drift correlation records identify pi-lens writes with bounded normalized paths, while the review-graph scale regression proves warm 8,000-file walks normalize only the changed-file bound.
+
+- **Prove idle-eviction replacements release graph memory (closes #2073)** — Add an enforced forced-GC test for twenty 2,000-node workspace graph replacements. The cache retains under 6 MiB after replacement, proving outgoing eviction timers do not retain prior graphs.
+
+- **Pin diagnostics bus publishers and subscribers (closes #2079)** — Add source-scan conformance coverage for the `pilens:diagnostics` event surface.
+
+- **Test-flakiness and hygiene residuals (refs #2090, closes #2139, refs #2182)** — `project-snapshot.test.ts` now restores its stubbed idle-evict env var so it cannot leak into later tests, and `project-report.test.ts`'s graph-cold assertion checks the cache stayed cold instead of a 22x-loose wall-clock bound. `session-lifecycle.test.ts`'s guard=0 reset test gets a 15s timeout, sized off a measured 5.4-7.2s honest cost under load instead of vitest's tight 5s default. `managed-tool-refresh-strategies.test.ts`'s cross-session re-arm test gets the same budget correction after reproducing its combined-run flake against the degradation-ledger suites.
+
+- **`vi.stubEnv` leak sweep undercount (refs #2090, closes #2223)** — `reverse-deps-cache.test.ts` now unstubs `PI_LENS_REVERSE_DEPS_IDLE_EVICT_MS` in its `afterEach`, the second live instance of the #2090 leak class that the original sweep missed. `check-pr-body.test.ts`'s "renames out of tests/" test unstubbed its GitHub env stubs only after its assertion, so a failing assertion would have left them stubbed for later tests; it now unstubs in `afterEach` like every other describe block in the file.
+
+- **Guard the warmed YAML rules cache with load-invariant work counts (closes #2292)** — assert that repeated cache hits perform no directory, metadata, or content reads inside the freshness cadence, and that the next cadence performs one metadata sweep without reading rule content.
+
+- **Close #2298's rules-cache work-count residuals (refs #2292)** — count the warmed cache's existence and content-open probes, and verify metadata sweeps across nested rule files.
+
+- **Isolate real-Git test fixtures and guard repository config (closes #2163)** — shared fixture environment hygiene, source governance, and a post-suite contamination guard prevent tests from mutating the checkout.
+
+## [4.1.2] - 2026-08-24
 
 ### Added
 
@@ -43,6 +367,52 @@ All notable changes to pi-lens will be documented in this file.
   `npm install` on error.
 
 - **latency.log now says whether the LSP pool reused a client or spawned one (closes #1934)** — `lsp_client_selected` fired 5601 times in a 20.8h dogfood window carrying only `{serverId, candidateCount}`, so nothing in the log said whether the pool served a warm client or paid for a language-server spawn. This is the most expensive cache in pi-lens: a miss costs a process. The only estimate was a cross-record inference against `lsp_launch_candidate_success`, which counts something else, so a regression that halved pool reuse was invisible. The record now carries an `outcome` field with one of three values on the same record and the same denominator. `warm-reuse` means the pool served an already-connected client. `cold-spawn` means this selection waited on a spawn, whether it started that spawn or joined one already in flight, so a session-start burst where many files wait on the same spawn reads as several cold spawns and deflates the apparent reuse rate for that window. `spawn-failure` means a spawn ran and failed. Reuse rate is `warm-reuse / (warm-reuse + cold-spawn)`. A spawn failure is deliberately distinct from a clean decline: no root, a breaker already open, host trust refused, or a binary absent while installs are disabled. Declines emit no outcome record and keep their existing ones, so `lsp_client_unavailable` and the `outcome` field can both describe the same event and are counted separately. `getWarmClientForFile`, the warm-only lookup the cascade quiet window and read expansion call per file, previously returned `undefined` and emitted nothing; it now emits a bounded `lsp_warm_client_missing` record naming the candidate server and root, rising-edge per candidate set with the exact count in the degradation ledger.
+
+- **Dogfood sessions on pi-lens's own repo now activate the oxlint, spellcheck, yamllint, and taplo runner lanes (refs #1844)** — four new root config files (`.oxlintrc.json`, `typos.toml`, `.yamllint`, `taplo.toml`) opt pi-lens's own repository into linters it already ships for every other project. `.oxlintrc.json` pins `oxlint` as a new exact-version devDependency (1.79.0, matching the runner's tested fixture), makes oxlint this repo's sole preferred JS/TS lint runner (dropping the `biome-check-json` fallback — that IS the dogfood intent), and excludes the fixture directories that carry no config override of their own; oxlint's nested-config discovery still finds the two fixture directories that deliberately escalate severity for the runner's own smoke tests, so those stay as they are. The oxlint runner also now tells a config-excluded file (`number_of_files: 0`) apart from a genuinely clean one, reporting `skipped` instead of a false `succeeded`. `typos.toml` allowlists evidenced false positives (a routine "mis-" prefix, HashiCorp's brand abbreviation, and similar); its presence enables typos-lsp's blocking opt-in, but findings stay advisory in practice since typos-lsp's own default diagnostic severity is warning. `.yamllint` scopes yamllint to hand-authored YAML (GitHub Actions workflows, top-level config), downgrades line-length to a warning rather than raising its threshold, and defuses the `on:` truthy false positive. `taplo.toml` activates both the TOML linter and the `taplo fmt` autofix formatter, and this PR runs that formatter once so activation doesn't start the lane red. Markdown linting was already live via the pre-existing `.markdownlint-cli2.jsonc` (since #1917) — confirmed with a real `markdownlint-cli2` run, no new config needed.
+
+- **Memory-sample observability upgrades (refs #1999)** — The periodic
+  `memory_sample` latency.log line gains three fields. `peakWorkingSetBytes`
+  records the OS high-water working set from `process.resourceUsage().maxRSS`,
+  so an idle-moment rss sample can be told apart from true growth (on Windows
+  libuv backs both counters with one `GetProcessMemoryInfo()` call: rss reads
+  current `WorkingSetSize`, maxRSS reads `PeakWorkingSetSize`). A rising-edge
+  cadence tightens sampling from every 10 turns to every turn while heapUsed
+  grows more than 20% between samples, reverting once growth stabilizes; the
+  state resets at each primary session start. Each sample now also carries
+  session age, session start time, and turn count, so growth-vs-age curves are
+  plottable from logs alone. The `/lens-health` memory line shows peak WS when
+  known.
+
+- **Opaque-write recovery for bash commands (refs #2000 phase 2)** — commands the path extractor does not recognize (python/node/perl/PowerShell internal writes) now get a bounded pre/post stat diff of the project source universe. Recovered files are attributed to the read guard as agent-authored and dispatched through the mutation seam, with explicit coverage-unknown telemetry instead of silent gaps.
+
+- **Collect-later delivery for slow auxiliary LSP servers (closes #2001, refs #2002)** —
+  When an auxiliary scanner such as opengrep misses its aux-grace window,
+  pi-lens now marks the file and server pair in a bounded pending store
+  instead of dropping the scanner's eventual findings. The next turn end
+  probes the auxiliary's client cache through a read-only seam,
+  freshness-gates the result against the mark timestamp, and delivers
+  survivors as a `Late auxiliary diagnostics` advisory. A cited file that was
+  edited or deleted since the mark drops its findings, and both drop arms are
+  counted in the new `late_auxiliary_findings` latency record.
+
+- **Freshness kernel: one comparator, one verdict type for staleness gates (closes #1739)** — `clients/freshness.ts` owns the mtime-vs-reference comparison and shared drift tolerance that six stores had independently reimplemented (three copies carried the identical #1710/#1711 tolerance defect). `freshnessFromMtime` returns an explicit verdict (`fresh` / `stale: modified-after-reference` / `indeterminate: no-mtime-evidence`) so each caller keeps its own no-evidence policy while sharing the comparison. A registered-or-fail sweep fails on any new out-of-kernel mtime-vs-reference comparison in `clients/`.
+
+- **Shared fault-injection test kit (closes #1838)** — `tests/support/fault-injection.ts` promotes the bespoke fault probes reviewers kept rebuilding by hand into four one-call primitives: `spawnWedgedChild` (a real child whose stdin pipe is genuinely full — the #1811 fixture generalized, with its fail-fast-instead-of-hang trap asserted against), `delayInside` (deterministic completion delay inside any mocked async seam), `fireResetAt` (fire a lifecycle hook from inside a seam's implementation at a chosen call — the #1746-R2-F1 shape), and `starveBudget` plus `gatedPromise` (the tiny-budget starvation repro). Every primitive carries its own fidelity test in `fault-injection.test.ts`, so a neutered primitive goes red in CI instead of silently weakening every consumer.
+
+- **Adversarial garbage battery for every CLI lint runner (closes #1839)** — Twenty runners now meet a 12-case battery of hostile outputs (truncated JSON, usage prose on the findings stream, unknown severities, hostile numbers) under format-blind invariants: never crash, never emit malformed diagnostics, never report clean on a nonzero exit carrying bytes. The first pass found 79 violations of that last invariant across 14 runners — all fixed by consolidating their identical tails onto one shared `finishParsedRun` seam. Also fixes htmlhint's `--rules` flag being fed JSON (the tool wants a ruleid list), which left zero rules enabled so every file read clean.
+
+### Changed
+
+- **pi-lens formats its own TypeScript with oxfmt (refs #1844)** — The
+  repository now carries an `.oxfmtrc.json` and an `oxfmt` devDependency, and
+  an advisory `oxfmt --check` job runs in CI. Because `hasOxfmtConfig` gates
+  the oxfmt formatter on exactly that config file, a pi-lens session opened on
+  this repository now dispatches oxfmt as the format runner for edited
+  TypeScript and JavaScript files.
+
+- **Opaque-write recovery goes git-first (refs #2000)** — inside a git worktree the pre side records only a timestamp and `git status --porcelain` plus an mtime window answers what changed, with no file-universe cap: recovery now works on any repo size, including large monorepos where the stat-walk previously degraded every command to coverage-unknown. The bounded stat-diff path remains for small non-git trees.
+
+- **ONE mutation seam: `RuntimeCoordinator.recordProjectMutation` (refs #2000 phase 1)** — the triplicated bump+change-log pairing (runtime-tool-result, runtime-agent-end, lsp-mutation) is consolidated onto one seam that bumps the seq store, appends a bounded attributed receipt ring (`getMutationsSince`, cap 512 with a surfaced dropped-count), and appends the durable change-log entry. Consumers derive touched-files answers from one store instead of three hand-copied pairings; phase 2's opaque-write recovery feeds the same seam.
 
 ### Fixed
 
@@ -105,6 +475,55 @@ All notable changes to pi-lens will be documented in this file.
 - **Log writer reopens and retries once on a failed write instead of dropping records silently (refs #1970)** — `ndjson-logger.ts` is the shared write-plumbing behind every NDJSON sink (`latency.log`, `extension.log`, `tree-sitter.log`, `cascade.log`, `word-index.log`, `review-graph.log`, and any other `createNdjsonLogger` caller). This hardens the sink against reachable `appendFile` failures (ENOENT after the parent directory is deleted, EBUSY/EPERM under a syncing OneDrive folder or antivirus lock, EMFILE, ENOSPC) — the specific `ERR_STREAM_DESTROYED` reports that motivated this issue were root-caused to a different process's persistent-stream logger, not this sink, but the reachable-failure classes above land here today with no recovery and no observability. A write that throws now gets one reopen-and-retry (re-verify the parent directory, then retry the write once) before it counts as a loss, matching the `pi-analyze#15` shape. An unrecovered write is counted in a per-sink, in-memory tally (`writeFailures`) rather than thrown or silently discarded, and `degradation-ledger.ts` folds that tally into `getDegradationSummary()` at READ time under a new `log-sink-write-failure` kind — so `pilens_health` names the sink and the dropped-write count. The fold happens by reading ndjson-logger's own tally, never by writing a durable ledger row back through the sink that just failed, so a permanently dead sink cannot recurse into an unbounded chain of self-reporting writes. The tally resets alongside the rest of the ledger at `session_start`.
 
 - **Warmup and workspace-scan walkers gate by file extension before consulting the ignore matcher, cutting a 31.7s stall to sub-second on repos with large ignored file piles (closes #1974, reported by @0xkite)** — `isIgnored` recompiles minimatch patterns per ancestor directory on every call; a runtime-output directory like `wal/` holding tens of thousands of `.log` files, gitignored only by a file-level `*.log` pattern (so the directory itself is never pruned), forced every one of those files through that cost. Six walkers checked `isIgnored` before their own cheap extension gate, paying the expensive check for files the gate would have dropped anyway: `collectSourceFilesForWarmup` (`language-profile.ts`, the reported 31.7s case), `JscpdClient.hasSourceFilesRecursive` (`jscpd-client.ts`), `classifyEntry` (`source-filter.ts`), `makeSourceCountVisitor` (`startup-scan.ts`), `getModuleSourceFiles` (`review-graph/workspace-modules.ts`), and `collectWorkspaceDiagnosticFiles` (`lsp/index.ts`). All six now run their extension (or LSP-server) gate first; output is unchanged, since both gates still have to pass to keep a file — only the order changed. A repo-wide sweep of all 14 files that call `isIgnored` found `tree-sitter-client.ts` and `tools/lsp-diagnostics.ts` already extension-first, and cleared the remaining per-event/no-ext-gate sites by construction; see the PR body for the full per-site table.
+
+- **oxfmt no longer fails on a file its own config ignores (refs #1844)** —
+  pi-lens offers oxfmt for every extension oxfmt supports, so in a project
+  whose oxfmt config carries `ignorePatterns`, oxfmt was selected for files it
+  then refused to touch. It exits 2 with "Expected at least one target file",
+  which the strict exit-code posture read as a formatting failure, so every
+  edit to an ignored file surfaced an error. pi-lens now passes
+  `--no-error-on-unmatched-pattern`, which makes an empty target set a clean
+  no-op. Every other nonzero exit, including an unparseable file, still fails.
+
+- **ESLint warnings are no longer discarded (closes #1954)** — The eslint runner treated every exit 0 as "nothing found". ESLint exits 0 whenever no rule reaches error severity, so a run that produced only warning-severity findings was thrown away silently. The runner now parses stdout unconditionally and surfaces the findings; a clean file still reports clean, and exit 2 stays an unavailable skip.
+
+- **Registered tools now always have descriptions in child/subagent sessions (closes #1988)** — the final registration boundary fills missing, empty, and
+  whitespace-only descriptions for active, lazy, activation, and wrapped tool
+  definitions.
+
+- **mode=full no longer replays stale mid-edit blockers (refs #1993)** — a confirmed, fully-covered LSP sweep is now authoritative for its files: widget-store diagnostics captured from a since-fixed broken intermediate state are retired instead of rendering as current 🔴 blockers beside a clean sweep. Unconfirmed or timed-out sweeps keep the fail-open behavior.
+
+- **Cache-miss attribution stays useful in long sessions (closes #1996)** — classify full model/provider identities and split unexplained or malformed cache evidence by bounded reason, with fail-closed request hashing, activation-owned primary/secondary isolation, sanitized numeric metadata, and a per-session cause summary.
+
+- **Project snapshots no longer rewrite unchanged same-generation bodies (closes #1997)** — Persistence now coalesces concurrent requests and computes semantic identity on its worker before gzip or staging. Same-generation content changes and failed-write repairs still publish.
+
+- **Classify oxlint no-match results as expected skips (closes #1998)**. Oxlint now carries `no-files-matched` through runner telemetry without emitting an extension error or claiming the file is clean. A single fail-closed state machine validates process completion, exit status, stderr, the captured banner, and every JSON summary field's type and range; truncated, malformed, wrong-status, or error-bearing lookalikes retain failure or unconfirmed telemetry.
+
+- **Project-snapshot persistence validates gzip body integrity before skipping (closes #2008)** —
+  The skip decision trusted the meta sidecar and a fingerprint match alone, so a torn or
+  truncated gzip under an intact meta kept winning unchanged-dedupe and stayed canonical until
+  the project sequence advanced. The meta sidecar now records the on-disk gz byte length
+  (`gzBytes`) at every successful persist, and the dedupe baselines compare it against a live
+  stat: a size mismatch, or a legacy meta without the field, withholds the dedupe fingerprints
+  so the pending save republishes and rewrites the body. A skip that would honor evidence
+  failing this gate between dispatch and promotion is refused and rewritten synchronously.
+  Detections emit one `project_snapshot_body_integrity` latency record plus a bounded
+  `snapshot-integrity` degradation-ledger entry per corrupted body path. The baselines read is
+  also now a pure read: its in-process seeding write moved to the single dispatch seam that
+  owns the persist lifecycle.
+
+- **Installer verify loop broken at the root (closes #2015)** — `verifyToolBinary` now spawns through `safeSpawnAsync` (tree-kill on timeout, typed kill-reason) instead of raw spawn whose SIGTERM orphaned grandchild node processes on Windows `.cmd` shims. A killed/inconclusive prober no longer counts as a verdict: the freshly installed binary is KEPT for cheap re-probe instead of deleted, ending the install/verify/reinstall churn (23 SIGTERMs and 4 cleanups observed in one day).
+
+- **Windows `.cmd`/`.bat` spawns no longer fail when System32 is absent from the child PATH (closes #2023)** — The cmd.exe wrapper prefixed every spawn
+  with a bare `chcp 65001 &&`. When the child environment's PATH could not
+  resolve `chcp.com`, the lookup failed and `&&` short-circuited, so the whole
+  spawn exited 1 with empty output. chcp is now invoked via its pinned
+  `%SystemRoot%\System32\chcp.com` absolute path and chained with `&`, so a
+  code-page failure can never suppress the real command.
+
+- **Register remaining agent-facing delivery surfaces (#2028)** — The per-edit 🔴 STOP block now drops blockers whose cited file no longer exists, so a deleted file's stale blocker no longer re-blocks the agent with no remediation. All five previously unregistered surfaces (stop blocker, `lsp_diagnostics` output, git-guard verdicts, read-guard preflight errors, thrashing notices) are registered in the finding-delivery gate registry.
+
+- **Wall-clock budget tests get a quiet serial phase (closes #1920)** — Five test files asserting real elapsed-time budgets ran inside the default project's fork storm, measuring scheduler contention instead of code speed (`startup-overhead` measured 659-2321ms against a 500ms budget under load, green solo every time). They now run in a dedicated fully-serialized `wall-clock-budget` Vitest project that phases dead last on a quiet host. A coverage guard keeps the new include list from silently dropping renamed files.
 
 ## [4.1.0] - 2026-08-20
 

@@ -30,14 +30,21 @@ const RULES_DIR = path.join(process.cwd(), "rules", "ast-grep-rules", "rules");
 interface CatalogRule {
 	id: string;
 	file: string; // file under RULES_DIR
-	language: "go" | "rust" | "typescript" | "javascript" | "tsx" | "cpp";
+	language:
+		| "go"
+		| "rust"
+		| "typescript"
+		| "javascript"
+		| "tsx"
+		| "cpp"
+		| "java";
 	// snippets that should produce a finding (positive) and should NOT
 	// produce a finding (negative). One of each is enough; a finding or
 	// its absence on the negative sample is what we assert.
 	positive: string;
 	negative: string;
 	// file extension for the temp snippet
-	ext: "go" | "rs" | "ts" | "js" | "tsx" | "cpp";
+	ext: "go" | "rs" | "ts" | "js" | "tsx" | "cpp" | "java";
 }
 
 const CATALOG_RULES: CatalogRule[] = [
@@ -219,6 +226,42 @@ import {y} from "package";
     const [value, setValue] = useState(42);
 }
 `,
+	},
+	{
+		id: "no-raw-types",
+		file: "no-raw-types.yml",
+		language: "java",
+		ext: "java",
+		positive: "class App { List values; }\n",
+		negative: "class App { List<String> values; }\n",
+	},
+	{
+		id: "no-string-concat-in-loop",
+		file: "no-string-concat-in-loop.yml",
+		language: "java",
+		ext: "java",
+		positive:
+			'class App { void f(String[] xs) { String s = ""; for (String x : xs) { s += x + " "; } } }\n',
+		negative:
+			"class App { void f(int[] xs) { int total = 0; for (int x : xs) { total += x; } } }\n",
+	},
+	{
+		id: "no-system-out-println",
+		file: "no-system-out-println.yml",
+		language: "java",
+		ext: "java",
+		positive: 'class App { void f() { System.out.println("x"); } }\n',
+		negative: 'class App { void f() { logger.info("x"); } }\n',
+	},
+	{
+		id: "prefer-string-is-empty",
+		file: "prefer-string-is-empty.yml",
+		language: "java",
+		ext: "java",
+		positive:
+			"class App { boolean f(String value) { return value.length() == 0; } }\n",
+		negative:
+			"class App { boolean f(String value) { return value.isEmpty(); } }\n",
 	},
 ];
 

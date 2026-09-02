@@ -35,7 +35,12 @@ import { logLatency } from "../../../clients/latency-logger.js";
 process.env.PI_LENS_LSP_SHUTDOWN_TIMEOUT_MS = "300";
 process.env.PI_LENS_LSP_EXIT_NOTIFY_TIMEOUT_MS = "300";
 
-vi.mock("../../../clients/latency-logger.js", () => ({ logLatency: vi.fn() }));
+vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
+	...(await importActual<
+		typeof import("../../../clients/latency-logger.js")
+	>()),
+	logLatency: vi.fn(),
+}));
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FAKE_SERVER_PATH = path.join(

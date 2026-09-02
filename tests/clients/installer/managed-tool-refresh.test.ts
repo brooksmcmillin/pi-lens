@@ -53,18 +53,27 @@ const TEST_HOME = vi.hoisted(() => {
 	return dir;
 });
 
-const { spawnMock, sessionLogSpy, shimExitCodes } = vi.hoisted(() => ({
-	spawnMock: vi.fn(),
-	sessionLogSpy: vi.fn(),
-	shimExitCodes: new Map<string, number>(),
-}));
+const { spawnMock, sessionLogSpy, shimExitCodes, verifyOptions, verifyCalls } =
+	vi.hoisted(() => ({
+		spawnMock: vi.fn(),
+		sessionLogSpy: vi.fn(),
+		shimExitCodes: new Map<string, number>(),
+		verifyOptions: vi.fn(),
+		verifyCalls: vi.fn(),
+	}));
 
 vi.mock("../../../clients/safe-spawn.js", () => ({
 	safeSpawn: vi.fn(() => ({ stdout: "", stderr: "", status: 0 })),
 	// #2015: verifyToolBinary probes route through safe-spawn too. Answer
 	// --version probes centrally from the fixture exit-code map; everything
 	// else delegates to the scenario-controlled spawnMock.
-	safeSpawnAsync: async (command: string, args: string[]) => {
+	safeSpawnAsync: async (
+		command: string,
+		args: string[],
+		options?: unknown,
+	) => {
+		verifyCalls(command, args);
+		verifyOptions(options);
 		if (args?.includes("--version")) {
 			const name = path
 				.basename(String(command))
@@ -92,9 +101,11 @@ import {
 	getDegradationSummary,
 	resetDegradationLedger,
 } from "../../../clients/degradation-ledger.js";
+import type { ToolDefinition } from "../../../clients/installer/index.js";
 import {
 	checkProbeCache,
 	getRefreshableManagedNpmTools,
+	getToolPath,
 	installTool,
 	resetProbeCacheStateForTesting,
 	TOOLS,
@@ -258,6 +269,8 @@ beforeEach(() => {
 	fs.rmSync(TOOLS_DIR, { recursive: true, force: true });
 	fs.mkdirSync(NODE_MODULES, { recursive: true });
 	shimExitCodes.clear();
+	verifyOptions.mockReset();
+	verifyCalls.mockReset();
 	spawnMock.mockReset();
 	sessionLogSpy.mockReset();
 	resetDegradationLedger();
@@ -899,6 +912,71 @@ describe("observability", () => {
  * a binary the update just replaced or broke.
  */
 describe("post-update verification (review F2)", () => {
+	it("delivers a registry-scoped timeout through npm refresh", async () => {
+		const fixtureTool: ToolDefinition = {
+			id: "refresh-timeout-fixture",
+			name: "Refresh timeout fixture",
+			checkCommand: "refresh-timeout-fixture",
+			checkArgs: ["--version"],
+			verificationTimeoutMs: 30_000,
+			installStrategy: "npm",
+			packageName: "refresh-timeout-fixture",
+			binaryName: "refresh-timeout-fixture",
+		};
+		TOOLS.push(fixtureTool);
+		try {
+			installFixture("refresh-timeout-fixture", "1.0.0");
+			stubSpawn("ok", { "refresh-timeout-fixture": "2.0.0" });
+
+			const outcome = await runManagedToolRefresh(NOW);
+
+			expect(outcome.refreshed[0]).toMatchObject({
+				toolId: "refresh-timeout-fixture",
+				ok: true,
+				verified: true,
+			});
+			expect(verifyOptions).toHaveBeenCalledWith(
+				expect.objectContaining({ timeout: 30_000 }),
+			);
+		} finally {
+			TOOLS.splice(TOOLS.indexOf(fixtureTool), 1);
+		}
+	});
+
+	it("delivers bash-language-server's 20s budget through npm refresh (#2194)", async () => {
+		installFixture("bash-language-server", "4.0.0");
+		stubSpawn("ok", { "bash-language-server": "5.0.0" });
+
+		const outcome = await runManagedToolRefresh(NOW);
+
+		expect(outcome.refreshed[0]).toMatchObject({
+			toolId: "bash-language-server",
+			ok: true,
+			verified: true,
+		});
+		expect(verifyOptions).toHaveBeenCalledWith(
+			expect.objectContaining({ timeout: 20_000 }),
+		);
+	});
+
+	it("delivers vscode-json-language-server's 20s budget through npm refresh (#2194)", async () => {
+		installFixture("vscode-langservers-extracted", "4.0.0", {
+			binaryName: "vscode-json-language-server",
+		});
+		stubSpawn("ok", { "vscode-langservers-extracted": "5.0.0" });
+
+		const outcome = await runManagedToolRefresh(NOW);
+
+		expect(outcome.refreshed[0]).toMatchObject({
+			toolId: "vscode-json-language-server",
+			ok: true,
+			verified: true,
+		});
+		expect(verifyOptions).toHaveBeenCalledWith(
+			expect.objectContaining({ timeout: 20_000 }),
+		);
+	});
+
 	it("fails the refresh when the updated binary cannot run", async () => {
 		installFixture("knip", "6.4.1");
 		spawnMock.mockImplementation(async (_c: string, args: string[]) => {
@@ -951,7 +1029,53 @@ describe("post-update verification (review F2)", () => {
 		const outcome = await runManagedToolRefresh(NOW);
 
 		expect(outcome.refreshed[0]).toMatchObject({ ok: true, verified: true });
+		expect(verifyOptions).toHaveBeenCalledWith(
+			expect.objectContaining({ input: "" }),
+		);
+		expect(verifyCalls.mock.calls.map(([, args]) => args)).toContainEqual([
+			"--version",
+		]);
 		expect(logRows().some((row) => row.includes("verified"))).toBe(true);
+	});
+
+	it("passes the default timeout through npm refresh", async () => {
+		installFixture("knip", "6.4.1");
+		stubSpawn("ok", { knip: "6.32.2" });
+
+		const outcome = await runManagedToolRefresh(NOW);
+
+		expect(outcome.refreshed[0]).toMatchObject({
+			toolId: "knip",
+			ok: true,
+			verified: true,
+		});
+		expect(verifyOptions).toHaveBeenCalledWith(
+			expect.objectContaining({ timeout: 10_000 }),
+		);
+	});
+
+	it("pins the registry argv through public getToolPath", async () => {
+		installFixture("knip", "6.4.1");
+
+		await expect(getToolPath("knip")).resolves.toBe(
+			path.join(NODE_MODULES, ".bin", IS_WINDOWS ? "knip.cmd" : "knip"),
+		);
+		expect(verifyCalls.mock.calls.map(([, args]) => args)).toContainEqual([
+			"--version",
+		]);
+	});
+
+	it("preserves markdownlint's public verification argv", async () => {
+		installFixture("markdownlint-cli2", "0.23.2", {
+			binaryName: "markdownlint-cli2",
+		});
+		spawnMock.mockResolvedValue({ stdout: "", stderr: "", status: 0 });
+
+		await expect(getToolPath("markdownlint")).resolves.toBeTruthy();
+		expect(verifyCalls.mock.calls.map(([, args]) => args)).toContainEqual([
+			"--no-globs",
+			"-",
+		]);
 	});
 
 	it("clears the cached resolution so the next probe sees the new tree", async () => {

@@ -46,6 +46,7 @@ vi.mock("../../clients/tool-policy.js", async (importOriginal) => ({
 	getLinterPolicyForCwd: () => null,
 	markdownlintConfigArgs: () => [],
 }));
+
 import { detectFileChangedAfterCommand } from "../../clients/file-utils.js";
 import { makeRunnerCtx } from "../support/runner-ctx.js";
 import { setupTestEnvironment } from "./test-utils.js";
@@ -148,38 +149,6 @@ describe("detectFileChangedAfterCommand consults the seam", () => {
 	});
 });
 
-describe("tryMarkdownlintFix consults the seam (review P2)", () => {
-	beforeEach(() => {
-		vi.resetModules();
-		safeSpawnAsync.mockReset();
-	});
-
-	it("returns 0 WITHOUT spawning when its resolved command is cooling down", async () => {
-		const env = setupTestEnvironment("pi-lens-timeout-pipeline-guard-");
-		try {
-			const filePath = path.join(env.tmpDir, "notes.md");
-			fs.writeFileSync(filePath, "# hello\n");
-			const { noteSpawnTimeout } = await seam();
-			// The mocked resolver returns the bare tool id; in production both
-			// lanes resolve the same physical binary, and basename-level
-			// keying is what makes different spellings cross-cool.
-			noteSpawnTimeout({
-				tool: "markdownlint",
-				command: "markdownlint",
-				phase: "availability",
-			});
-
-			const pipeline = await import("../../clients/pipeline.js");
-			const fixed = await pipeline.tryMarkdownlintFix(filePath, env.tmpDir);
-
-			expect(fixed).toBe(0);
-			expect(safeSpawnAsync).not.toHaveBeenCalled();
-		} finally {
-			env.cleanup();
-		}
-	});
-});
-
 describe("cross-lane key sharing (review P2)", () => {
 	it("a PATH-resolved absolute timeout cools differently-spelled resolvations", async () => {
 		const {
@@ -257,5 +226,54 @@ describe("markdownlint runner consults the seam", () => {
 		} finally {
 			env.cleanup();
 		}
+	});
+});
+
+/**
+ * #2229 review round 1, F3, reverted in round 3 (R2-F2): `noteSpawnTimeout`
+ * normalizes `filePath` (logLatency's emit-seam display field, no reader)
+ * but must leave `metadata.command` RAW — `safe-spawn-timeout-teardown.test.ts`
+ * reads `metadata.command` back to match a cooldown row against the exact
+ * command string, and `cooldownKey` above deliberately keys on basename
+ * because the same binary arrives in multiple spellings. Normalizing
+ * `metadata.command` would change a correlation key's contents, not just a
+ * display value.
+ */
+describe("noteSpawnTimeout filePath/metadata.command split (#2229 R2-F2)", () => {
+	it("normalizes filePath but leaves metadata.command raw for an absolute-path command", async () => {
+		vi.resetModules();
+		const writerLog = vi.fn();
+		vi.doMock("../../clients/env-utils.js", () => ({
+			isTestMode: () => false,
+		}));
+		vi.doMock("../../clients/ndjson-logger.js", () => ({
+			createNdjsonLogger: () => ({
+				log: writerLog,
+				append: vi.fn(),
+				truncate: vi.fn(),
+				flush: vi.fn().mockResolvedValue(undefined),
+				flushSync: vi.fn(),
+			}),
+		}));
+
+		const { noteSpawnTimeout } = await seam();
+		const { normalizeFilePath } = await import("../../clients/path-utils.js");
+		const raw = "C:\\Users\\dev\\pi-free\\tools\\markdownlint-cli2.cmd";
+
+		noteSpawnTimeout({
+			tool: "markdownlint",
+			command: raw,
+			phase: "lint",
+			durationMs: 15000,
+		});
+
+		expect(writerLog).toHaveBeenCalledTimes(1);
+		const payload = writerLog.mock.calls[0][0];
+		expect(payload.filePath).toBe(normalizeFilePath(raw));
+		expect(payload.metadata.command).toBe(raw);
+
+		vi.doUnmock("../../clients/env-utils.js");
+		vi.doUnmock("../../clients/ndjson-logger.js");
+		vi.resetModules();
 	});
 });

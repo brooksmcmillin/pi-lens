@@ -10,6 +10,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CacheManager } from "../../../clients/cache-manager.js";
+import { gatedPromise } from "../../support/fault-injection.js";
 import { removeTempDirSync } from "../test-utils.js";
 
 const handleSessionStart = vi.hoisted(() =>
@@ -76,6 +77,7 @@ const runtimeContext = vi.hoisted(() => ({
 vi.mock("../../../clients/runtime-context.js", () => runtimeContext);
 
 import {
+	_peekInFlightIpcTurnEnds,
 	_resetMcpSessionContext,
 	_resetTurnEndChain,
 	acknowledgeTurnEnd,
@@ -320,5 +322,45 @@ describe("runTurnEnd", () => {
 
 		expect(handleTurnEnd).toHaveBeenCalledTimes(2);
 		expect(outcome.turnEnd).toBe("TURN ADVISORY");
+	});
+});
+
+/**
+ * In-flight ABA release (#1968, kit-driven white-box probe — sibling of
+ * dead-code-client's/knip-client's bare-`.finally` release, same shape).
+ *
+ * `runTurnEndForIpc`'s in-flight map cleared with a bare delete-by-key. The
+ * race needs a SECOND WRITER replacing the map entry mid-flight — the public
+ * API alone cannot produce it today (single set site; microtask FIFO orders
+ * every observer after A's cleanup) — so this test simulates that writer
+ * directly. `runTurnEndForIpc` registers the map entry synchronously (before
+ * its first internal `await`), so the successor can be installed with zero
+ * awaits between the call and the injection — no tick-based race needed. Red
+ * on the pre-fix bare `.finally` delete: A's cleanup evicted B and the third
+ * caller started a duplicate Stop-hook pass.
+ */
+describe("runTurnEndForIpc in-flight ABA release (#1968)", () => {
+	it("a late-settling pass does not evict its mid-flight successor", async () => {
+		const buildA = runTurnEndForIpc(tmpDir);
+		// Synchronous: the map entry is already registered here, before A's
+		// first internal `await` has had a chance to resolve.
+		expect(_peekInFlightIpcTurnEnds().get(tmpDir)).toBeDefined();
+
+		// B replaces the entry under the same key while A is still in flight.
+		const successor = gatedPromise<Awaited<typeof buildA>>();
+		_peekInFlightIpcTurnEnds().set(tmpDir, successor.promise);
+
+		await buildA; // A settles
+
+		// B's entry survived A's cleanup...
+		expect(_peekInFlightIpcTurnEnds().get(tmpDir)).toBe(successor.promise);
+		// ...and a third caller SHARES B instead of starting a duplicate pass.
+		const third = runTurnEndForIpc(tmpDir);
+		expect(third).toBe(successor.promise);
+
+		successor.resolve({
+			outcome: { turnEnd: "", tests: "", filesRegistered: 0 },
+		});
+		await third;
 	});
 });

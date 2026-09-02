@@ -24,7 +24,12 @@ import { logLatency } from "../../../clients/latency-logger.js";
 // server actually reply, and that reply must win the race.
 process.env.PI_LENS_LSP_SHUTDOWN_TIMEOUT_MS = "250";
 
-vi.mock("../../../clients/latency-logger.js", () => ({ logLatency: vi.fn() }));
+vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
+	...(await importActual<
+		typeof import("../../../clients/latency-logger.js")
+	>()),
+	logLatency: vi.fn(),
+}));
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FAKE_SERVER_PATH = path.join(

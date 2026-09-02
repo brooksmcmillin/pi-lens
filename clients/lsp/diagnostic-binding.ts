@@ -120,6 +120,8 @@ export interface DiagnosticBinding extends StoredDiagnosticBinding {
  */
 export interface TouchFileResult {
 	diags: import("./client.js").LSPDiagnostic[];
+	/** The file was declined because its nearest root is outside the session. */
+	skipReason?: "outside-project-root";
 	confirmation?: "confirmed" | "partial";
 	inconclusive?: boolean;
 	/**
@@ -445,30 +447,39 @@ export function createDiskBindingCache(): DiskBindingCache {
 	// the same path (`SUB\a.ts` vs `sub/a.ts`) can't produce a duplicate memo or a
 	// false miss. Ephemeral (slash-fold + win32-lowercase, no realpath I/O) — the
 	// keys are file paths this process is already stat'ing on the hot read path.
-	const diskHashByPath = new PathKeyedMap<{ mtimeMs: number; hash: string }>(
-		normalizeEphemeralMapKey,
-	);
+	// #2300: the memo guards a CONTENT HASH recompute, so a stale memo serves a
+	// stale hash — `size` is the cheap second axis alongside `mtimeMs`, from the
+	// SAME stat call, so a same-mtime-bucket external rewrite is not masked.
+	const diskHashByPath = new PathKeyedMap<{
+		mtimeMs: number;
+		size: number;
+		hash: string;
+	}>(normalizeEphemeralMapKey);
 	return {
 		boundToCurrentDisk(filePath, stored) {
 			// No fingerprint captured (version-less server) → unknown, never false.
 			if (stored.contentHash === undefined) return "unknown";
-			let mtimeMs: number;
+			let stat: fs.Stats;
 			try {
-				mtimeMs = fs.statSync(filePath).mtimeMs;
+				stat = fs.statSync(filePath);
 			} catch {
 				// Can't stat (deleted/unreadable): can't disprove the binding either,
 				// so stay honest — "unknown", never a manufactured false.
 				return "unknown";
 			}
 			let cached = diskHashByPath.get(filePath);
-			if (!cached || cached.mtimeMs !== mtimeMs) {
+			if (
+				!cached ||
+				cached.mtimeMs !== stat.mtimeMs ||
+				cached.size !== stat.size
+			) {
 				let diskHash: string;
 				try {
 					diskHash = hashDiagnosticContent(fs.readFileSync(filePath, "utf-8"));
 				} catch {
 					return "unknown";
 				}
-				cached = { mtimeMs, hash: diskHash };
+				cached = { mtimeMs: stat.mtimeMs, size: stat.size, hash: diskHash };
 				if (diskHashByPath.size >= DISK_BINDING_MEMO_MAX) {
 					diskHashByPath.clear();
 				}

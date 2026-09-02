@@ -350,7 +350,7 @@ describe("id path-form stability (#1816 — #533 class swept into the warning st
 	// raw mis-cased path form and its normalizeMapKey'd form of the SAME
 	// on-disk file therefore hashed to two DIFFERENT `aw:` ids. Post-#1816,
 	// both derive the shared `finding-identity.js` id, so they converge.
-	it("computes the same id for a raw mis-cased path form and its normalized form", () => {
+	it("computes the same id for a raw mis-cased path form and its normalized form", (ctx) => {
 		const projectDir = fs.mkdtempSync(
 			path.join(os.tmpdir(), "pi-lens-aw-id-form-"),
 		);
@@ -361,9 +361,12 @@ describe("id path-form stability (#1816 — #533 class swept into the warning st
 			fs.writeFileSync(fileOnDisk, "console.log('x');\n");
 
 			const rawFile = path.join(projectDir, "SUB", "a.ts");
-			// Only aliases on a case-insensitive filesystem — skip honestly on
-			// Linux CI rather than asserting something the FS can't produce.
-			if (!fs.existsSync(rawFile)) return;
+			// Only aliases on a case-insensitive filesystem. Skip VISIBLY on Linux
+			// CI rather than returning, which reports a pass (#2089).
+			ctx.skip(
+				!fs.existsSync(rawFile),
+				"case-sensitive filesystem: SUB/a.ts does not alias sub/a.ts",
+			);
 
 			const identity = {
 				tool: "eslint",
@@ -408,7 +411,7 @@ describe("actionable-warning-state.json migration (#1816 — pre-fix id back-com
 	// relative path — canonicalizing `legacyActionableWarningId` shifts its
 	// output onto the canonical form and the lookup below would silently
 	// miss the entry.
-	it("honors and migrates a suppression recorded under the pre-#1816 id for a mis-cased path form", async () => {
+	it("honors and migrates a suppression recorded under the pre-#1816 id for a mis-cased path form", async (ctx) => {
 		const projectDir = fs.mkdtempSync(
 			path.join(os.tmpdir(), "pi-lens-aw-migrate-"),
 		);
@@ -423,9 +426,12 @@ describe("actionable-warning-state.json migration (#1816 — pre-fix id back-com
 			// mis-cased segment, never realpath-canonicalized.
 			const cwd = projectDir;
 			const filePath = path.join(projectDir, "SUB", "a.ts");
-			// Only aliases on a case-insensitive filesystem — skip honestly on
-			// Linux CI rather than asserting something the FS can't produce.
-			if (!fs.existsSync(filePath)) return;
+			// Only aliases on a case-insensitive filesystem. Skip VISIBLY on Linux
+			// CI rather than returning, which reports a pass (#2089).
+			ctx.skip(
+				!fs.existsSync(filePath),
+				"case-sensitive filesystem: SUB/a.ts does not alias sub/a.ts",
+			);
 
 			const diagnostic = makeWarning(filePath);
 			const legacyId = legacyActionableWarningIdForTest({

@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { classifyMachineEmittedLineShape } from "../../clients/generated-artifacts.js";
 import { detectFileRole } from "../../clients/file-role.js";
 
 describe("detectFileRole", () => {
@@ -57,5 +60,26 @@ describe("detectFileRole", () => {
 	it("does not misclassify a native POSIX path as Windows-shaped (no regression for the common case)", () => {
 		expect(detectFileRole("/home/dev/project/tests/foo.ts")).toBe("test");
 		expect(detectFileRole("/home/dev/project/src/foo.ts")).toBe("source");
+	});
+
+	// #2346 negative proof: the longest-line real file in `clients/` that
+	// still classifies as plain SOURCE under the content-shape test. Measured
+	// on 2026-08-28 with the shipped probe algorithm: the overall maximum mean
+	// non-empty line length in `clients/` is 65.1 (`dispatch/runners/index.ts`,
+	// which the role classifier reports as `init` for its basename), and of
+	// the files that classify as `source`, the maximum is `clients/tool-event.ts`
+	// at 52.1 — both far below the 2500 threshold. This test feeds the file's
+	// REAL content so a threshold regression that starts capturing ordinary
+	// source reds here.
+	it("keeps the longest-line source-role file in clients/ as source (refs #2346)", () => {
+		const longestLineFile = path.resolve(
+			process.cwd(),
+			"clients/tool-event.ts",
+		);
+		const content = fs.readFileSync(longestLineFile, "utf8");
+		const measured = classifyMachineEmittedLineShape(content);
+		expect(measured.generated).toBe(false);
+		expect(measured.meanLineLength).toBeLessThan(200);
+		expect(detectFileRole(longestLineFile, content)).toBe("source");
 	});
 });

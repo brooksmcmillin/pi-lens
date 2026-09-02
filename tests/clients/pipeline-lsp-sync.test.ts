@@ -13,7 +13,9 @@ import { gatedPromise, starveBudget } from "../support/fault-injection.js";
 vi.mock("../../clients/lsp/index.js", () => ({ getLSPService: vi.fn() }));
 
 const logLatencyMock = vi.fn();
-vi.mock("../../clients/latency-logger.js", () => ({
+
+vi.mock("../../clients/latency-logger.js", async (importActual) => ({
+	...(await importActual<typeof import("../../clients/latency-logger.js")>()),
 	logLatency: (entry: unknown) => logLatencyMock(entry),
 }));
 

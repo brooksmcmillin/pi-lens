@@ -22,6 +22,53 @@
  * `node:https` and `safeSpawnAsync` are mocked so network calls and spawns can
  * be counted exactly. Everything else — the stamp file, the presence checks,
  * the cadence arithmetic — runs for real against a temp `PI_LENS_HOME`.
+ *
+ * #2182: this file flaked when run combined with the two
+ * `tests/clients/degradation-ledger*.test.ts` files under real machine
+ * contention. Root cause: several tests here await real-shaped async work
+ * (multiple sequential mocked spawns, real filesystem I/O against a temp
+ * `PI_LENS_HOME`) that stays well under vitest's default 5000ms testTimeout
+ * on a quiet host but starves past it under load — and a timed-out test's
+ * promise chain keeps running (vitest doesn't cancel it), so the straggler
+ * resolves later and mutates the shared spawn/degradation mocks mid a LATER,
+ * unrelated test. First diagnosed and fixed for one test ("re-arms across
+ * sessions...") in #2216 with a per-test timeout override; verifying that
+ * fix under heavier synthetic load (14-16 concurrent CPU-load workers,
+ * several rounds) turned up more instances of the same shape — "pip
+ * strategy > upgrades a stale package with -U" (genuine work measured at
+ * 8932ms with the budget temporarily raised to 30s), "pip strategy >
+ * degrades when the upgrade leaves a binary that cannot report a version"
+ * (15086ms — two sequential mocked spawns instead of one), and
+ * "verification-budget delivery ... delivers a pip tool's custom budget to
+ * both version probes" (timed out at 5000ms, then corrupted the very next
+ * gem-budget test's result the same way #2216 first diagnosed).
+ *
+ * The 8932ms/15086ms figures above are LOAD-INDUCED, not this file's normal
+ * cost: on a quiet host the same two tests measure 552ms and 348ms (this
+ * file's full 43-test run completes in 3.3-4.0s of test time). They're the
+ * genuine work observed under sustained 14-16 concurrent CPU-load workers,
+ * which is the scenario this fix has to survive.
+ *
+ * Rather than keep annotating individual tests as each one gets caught by a
+ * heavier load sample, `vi.setConfig` below raises the DEFAULT test timeout
+ * for the WHOLE file once — the single mechanism the next flake report
+ * should point at (#2182 acceptance criterion 2), sized with real margin
+ * over the slowest genuine-work measurement observed (15086ms). No test in
+ * this file carries its own `it(..., N)` override alongside it — a test
+ * that needs more than the file default gets a bigger default, not a second
+ * mechanism. This isn't a phased vitest project: the existing
+ * "timing-sensitive" lane is reserved for `measureMaxSyncBlockMs` sampler
+ * tests (see tests/config/timing-sensitive-coverage.test.ts), and this file
+ * uses neither the sampler nor a real process spawn, so it fits neither that
+ * lane nor "lsp-spawn-heavy".
+ *
+ * One residual symptom did NOT fit this budget-correction shape: "gem
+ * strategy > re-runs the install command" lost a recorded spawn under the
+ * 16-worker run while finishing in ~3s itself — never near any timeout. That
+ * points at a genuinely shared `installSpawns()`/`TEST_HOME` mutable-state
+ * race between concurrent-in-time promise settlement, not a starved budget.
+ * Left uninvestigated and named on the #2182 issue thread as a remaining
+ * item; it needs its own root-cause pass, not a bigger number here.
  */
 
 import { EventEmitter } from "node:events";
@@ -38,6 +85,19 @@ import {
 	vi,
 } from "vitest";
 import { withEnv } from "../../support/with-env.js";
+
+// #2182: raises this FILE's default test timeout from vitest's 5000ms to
+// 25_000ms — see the file header for the measurements this margin is sized
+// against (25000/15086 = 1.66x over the slowest genuine-work run observed).
+// This is the ONLY timeout override in the file — no per-test `it(..., N)`
+// coexists with it; a test that needs a bigger number than this raises the
+// default, it doesn't add a second mechanism next to it (#2182 AC2).
+// `resetConfig` in `afterAll` scopes the change back to this file alone so
+// it can't leak into a later file reusing the same worker.
+vi.setConfig({ testTimeout: 25_000 });
+afterAll(() => {
+	vi.resetConfig();
+});
 
 vi.unmock("../../../clients/installer/index.js");
 
@@ -801,7 +861,10 @@ describe("pip strategy", () => {
 
 		expect(outcome.refreshed[0]).toMatchObject({ ok: false });
 		expect(degradationCount()).toBe(1);
-		expect(readState().ruff).toMatchObject({ failed: true, version: "0.5.0" });
+		expect(readState().ruff).toMatchObject({
+			failed: true,
+			version: "0.5.0",
+		});
 	});
 
 	it("degrades once and keeps the recorded version when pip fails", async () => {
@@ -955,6 +1018,189 @@ describe("archive and maven strategies compare the registry pin", () => {
 			httpsUrls().filter((url) => url.includes("ktfmt-0.63")),
 		).toHaveLength(1);
 		expect(readState().ktfmt).toMatchObject({ resolutionId: KTFMT_PIN });
+	});
+});
+
+// --- verification-budget delivery, all five non-npm strategies (#2194) ----
+
+/**
+ * The #2194 comment flagged that the per-strategy refresh candidate carries
+ * `verificationTimeoutMs` for npm only, and that `probeManagedToolVersion`
+ * (pip/gem) and `verifyRefreshedArtifact` (github/maven/archive) had no red
+ * test proving a registry-scoped budget actually reaches the post-refresh
+ * spawn instead of silently falling back to the shared 10s default. Each
+ * case here temporarily raises an already-fixtured tool's
+ * `verificationTimeoutMs` and asserts the exact value lands in the
+ * `--version` probe's spawn options.
+ */
+describe("verification-budget delivery across non-npm strategies", () => {
+	async function withVerificationTimeout<T>(
+		toolId: string,
+		timeoutMs: number,
+		fn: () => Promise<T>,
+	): Promise<T> {
+		const tool = TOOLS.find((t) => t.id === toolId);
+		if (!tool) throw new Error(`unknown tool ${toolId}`);
+		const original = tool.verificationTimeoutMs;
+		tool.verificationTimeoutMs = timeoutMs;
+		try {
+			// Awaited, not returned bare — a bare `return fn()` would run this
+			// `finally` synchronously right after the promise is created, restoring
+			// the original timeout before the awaited refresh ever reaches its
+			// spawn, and every assertion below would silently see the default.
+			return await fn();
+		} finally {
+			tool.verificationTimeoutMs = original;
+		}
+	}
+
+	/** Every `--version` spawn's `timeout` option, across all calls. */
+	function versionProbeTimeouts(): Array<number | undefined> {
+		return spawnMock.mock.calls
+			.filter(([, args]) => (args ?? []).includes("--version"))
+			.map(([, , options]) => (options as { timeout?: number })?.timeout);
+	}
+
+	/**
+	 * `installArchiveTool` verifies its launcher on real disk after a MOCKED
+	 * `tar` spawn, so the mock has to actually materialize the launcher file
+	 * (into the `-C` destination it was asked to extract to) or the install
+	 * fails before verification is ever reached. Every other spawn — the
+	 * `--version` post-refresh probe included — falls through to the default
+	 * success stub.
+	 */
+	function stubArchiveExtraction(launcherRelPath: string): void {
+		const isWindows = process.platform === "win32";
+		const suffix = isWindows ? ".bat" : "";
+		spawnMock.mockImplementation(async (command: string, args: string[]) => {
+			const argv = args ?? [];
+			if (
+				/tar(\.exe)?$/i.test(command) &&
+				argv.some((a) => a.startsWith("-x"))
+			) {
+				const destIndex = argv.indexOf("-C");
+				const destRel = destIndex >= 0 ? argv[destIndex + 1] : undefined;
+				if (destRel) {
+					const destAbs = path.join(
+						TOOLS_DIR,
+						destRel,
+						...`${launcherRelPath}${suffix}`.split("/"),
+					);
+					fs.mkdirSync(path.dirname(destAbs), { recursive: true });
+					fs.writeFileSync(destAbs, "#!/bin/sh\necho 1.2.3\nexit 0\n");
+				}
+				return { stdout: "", stderr: "", status: 0 };
+			}
+			return { stdout: "1.2.3", stderr: "", status: 0 };
+		});
+	}
+
+	it("delivers a github tool's custom budget to the post-refresh verify (#2194)", async () => {
+		await withVerificationTimeout("shfmt", 45_000, async () => {
+			installManagedBin("shfmt");
+			freshenAllExcept("shfmt", {
+				shfmt: { checkedAt: NOW - 8 * DAY_MS, resolutionId: "v3.7.0" },
+			});
+			routeGitHubRelease("v3.12.0", { etag: 'W/"abc"' });
+
+			const outcome = await runManagedToolRefresh(NOW);
+
+			expect(outcome.refreshed[0]).toMatchObject({
+				toolId: "shfmt",
+				ok: true,
+			});
+			expect(versionProbeTimeouts()).toContain(45_000);
+		});
+	});
+
+	it("delivers a pip tool's custom budget to both version probes (#2194)", async () => {
+		await withVerificationTimeout("ruff", 45_000, async () => {
+			installProbeCached("ruff");
+			freshenAllExcept("ruff", {
+				ruff: { checkedAt: NOW - 8 * DAY_MS, version: "0.5.0" },
+			});
+
+			const outcome = await runManagedToolRefresh(NOW);
+
+			expect(outcome.refreshed[0]).toMatchObject({
+				toolId: "ruff",
+				ok: true,
+			});
+			const timeouts = versionProbeTimeouts();
+			expect(timeouts.length).toBeGreaterThan(0);
+			expect(timeouts.every((t) => t === 45_000)).toBe(true);
+		});
+	});
+
+	it("delivers a gem tool's custom budget to both version probes (#2194)", async () => {
+		await withVerificationTimeout("rubocop", 45_000, async () => {
+			installProbeCached("rubocop");
+			freshenAllExcept("rubocop", {
+				rubocop: { checkedAt: NOW - 8 * DAY_MS, version: "1.60.0" },
+			});
+
+			const outcome = await runManagedToolRefresh(NOW);
+
+			expect(outcome.refreshed[0]).toMatchObject({
+				toolId: "rubocop",
+				ok: true,
+			});
+			const timeouts = versionProbeTimeouts();
+			expect(timeouts.length).toBeGreaterThan(0);
+			expect(timeouts.every((t) => t === 45_000)).toBe(true);
+		});
+	});
+
+	it("delivers an archive tool's custom budget to the post-refresh verify (#2194)", async () => {
+		await withVerificationTimeout("spotbugs", 45_000, async () => {
+			installManagedBin("spotbugs");
+			freshenAllExcept("spotbugs", {
+				spotbugs: {
+					checkedAt: NOW - 8 * DAY_MS,
+					resolutionId: `${SPOTBUGS_PIN}-old`,
+				},
+			});
+			httpsRoutes.push({
+				match: (url) => url.includes("spotbugs"),
+				respond: () => ({
+					statusCode: 200,
+					body: Buffer.from("archive-bytes"),
+				}),
+			});
+			stubArchiveExtraction("bin/spotbugs");
+
+			const outcome = await runManagedToolRefresh(NOW);
+
+			expect(outcome.refreshed[0]).toMatchObject({
+				toolId: "spotbugs",
+				ok: true,
+			});
+			expect(versionProbeTimeouts()).toContain(45_000);
+		});
+	});
+
+	it("delivers a maven tool's custom budget to the post-refresh verify (#2194)", async () => {
+		await withVerificationTimeout("ktfmt", 45_000, async () => {
+			installManagedBin("ktfmt");
+			freshenAllExcept("ktfmt", {
+				ktfmt: {
+					checkedAt: NOW - 8 * DAY_MS,
+					resolutionId: `${KTFMT_PIN}-old`,
+				},
+			});
+			httpsRoutes.push({
+				match: (url) => url.startsWith("https://repo1.maven.org/"),
+				respond: () => ({ statusCode: 200, body: Buffer.from("jar-bytes") }),
+			});
+
+			const outcome = await runManagedToolRefresh(NOW);
+
+			expect(outcome.refreshed[0]).toMatchObject({
+				toolId: "ktfmt",
+				ok: true,
+			});
+			expect(versionProbeTimeouts()).toContain(45_000);
+		});
 	});
 });
 
@@ -1237,6 +1483,19 @@ describe("one budget across all strategies", () => {
 		expect(apiCalls().length + installSpawns().length).toBeLessThanOrEqual(1);
 	});
 
+	// #2182: the two `runManagedToolRefresh` calls below resolve on queued
+	// microtasks (fast on a quiet host), but under the same real
+	// parallel-worker contention #2139 measured, this test's default 5000ms
+	// testTimeout starves and fires — reproduced locally by running this file
+	// combined with tests/clients/degradation-ledger*.test.ts under synthetic
+	// CPU load. The timeout does not stop the underlying refresh promise, so
+	// the straggler resolves later and mutates the shared spawn/degradation
+	// mocks mid-way through an UNRELATED later test (the "declines and
+	// touches nothing when PI_LENS_DISABLE_TOOL_INSTALL=1" case a few tests
+	// down failed the same combined run with degradationCount() 1 instead of
+	// 0 — a side effect of this straggler, not its own bug). Giving this
+	// test enough budget to finish normally removes the straggler at the
+	// source.
 	it("re-arms across sessions rather than latching for the process", async () => {
 		installProbeCached("ruff");
 		installProbeCached("rubocop");

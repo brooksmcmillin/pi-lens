@@ -77,7 +77,6 @@ const mypyRunner: RunnerDefinition = {
 	id: "mypy",
 	appliesTo: ["python"],
 	priority: PRIORITY.GENERAL_ANALYSIS,
-	enabledByDefault: true,
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {

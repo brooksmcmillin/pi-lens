@@ -116,6 +116,131 @@ export interface EventLoopStats {
 	 * commit-charge paging thrash — rather than genuine CPU work (#1122).
 	 */
 	suspectSystemStall: boolean;
+	/**
+	 * Which stall class `maxMs` falls in, read from `windowCpuMs` (#1980). See
+	 * {@link classifyLoopBlock}. `suspectSystemStall` above is unchanged and
+	 * still means exactly what it meant; `stallClass === "system-stall"` is the
+	 * same predicate surfaced in the ladder.
+	 */
+	stallClass: LoopBlockStallClass;
+	/**
+	 * `windowCpuMs / maxMs`, rounded to two decimals — the ratio #1980 had to
+	 * compute by hand over 1221 records. Undefined when `maxMs` is 0 (no block,
+	 * nothing to cover). Values above 1 are normal and not an error:
+	 * `windowCpuMs` is process-wide over the WHOLE window, so it routinely
+	 * exceeds one block inside that window.
+	 */
+	cpuCoverageRatio: number | undefined;
+}
+
+/**
+ * How a `loop_block` sample splits on the CPU axis (#1980).
+ *
+ * - `below-floor` — shorter than {@link STALL_CLASSIFY_FLOOR_MS}. Not
+ *   classified: at this scale timer slop and CPU-accounting granularity are
+ *   the same order as the signal, so any verdict would be noise. Said out
+ *   loud rather than defaulted to the compute label.
+ * - `cpu-accounted` — the window burned enough CPU to account for the block.
+ *   Deliberately NOT named "compute": `windowCpuMs` is process-wide over the
+ *   whole window, so covering the block is consistent with compute but does
+ *   not prove it. Only one direction of this test is sound (see below).
+ * - `non-cpu-stall` — the window's TOTAL CPU cannot cover the block, so the
+ *   block provably was not computing. The loop was parked: synchronous fs on
+ *   a cloud-backed tree, a blocking native call, `spawnSync`, a lock. This is
+ *   the class #1980 found nine of sixteen 5 s+ blocks in.
+ * - `system-stall` — `non-cpu-stall` AND over the suspend floor, i.e. the
+ *   pre-existing {@link isSuspendSuspectedBlock} verdict: machine sleep,
+ *   Modern Standby, or commit-charge paging.
+ */
+export type LoopBlockStallClass =
+	| "below-floor"
+	| "cpu-accounted"
+	| "non-cpu-stall"
+	| "system-stall";
+
+/**
+ * Below this, a block is not classified at all (`below-floor`). #1980 mined
+ * the 5 s+ tier; 1 s is a deliberately conservative floor that still covers
+ * every block that tier cares about while keeping sub-second jitter — where
+ * measurement slop rivals the signal — out of the verdict.
+ */
+export const STALL_CLASSIFY_FLOOR_MS = 1000;
+
+/**
+ * Slack allowed to the CPU budget before a block counts as unaccounted.
+ * `process.cpuUsage()` and the histogram are sampled at slightly different
+ * instants and the histogram quantizes, so a block whose CPU coverage is
+ * within this much of exact is called `cpu-accounted`, not a stall.
+ */
+export const STALL_CLASSIFY_SLOP_MS = 250;
+
+/** What {@link classifyLoopBlock} decides about one sample. */
+export interface LoopBlockClassification {
+	stallClass: LoopBlockStallClass;
+	cpuCoverageRatio: number | undefined;
+}
+
+/**
+ * Split a block into compute-vs-stall from the CPU it could possibly have
+ * burned (#1980). Pure, so the discrimination is testable without the native
+ * histogram or a real machine stall — the same reason
+ * {@link isSuspendSuspectedBlock} is pure.
+ *
+ * ## Why this is sound in exactly one direction
+ *
+ * `windowCpuMs` is the CPU the WHOLE process consumed across the WHOLE window
+ * — every thread, every phase, not just this block. So it is an UPPER BOUND on
+ * the CPU this one block could have burned. A synchronous compute block of D ms
+ * needs ≈ D ms of main-thread CPU. Therefore:
+ *
+ * - `windowCpuMs + slop < maxMs` PROVES the block was not compute. Even if the
+ *   block had been the only thing running, there was not enough CPU in the
+ *   whole window to cover it. This is the `non-cpu-stall` verdict and it is a
+ *   real inference, not a heuristic.
+ * - The converse proves nothing. A window can burn 30 s of CPU in other phases
+ *   and still contain a 5 s I/O park. That is why the label is
+ *   `cpu-accounted` ("the budget covers it") rather than "compute": it reports
+ *   the absence of proof, not the presence of compute.
+ *
+ * The existing 20 s suspend verdict is not re-derived here; this delegates to
+ * {@link isSuspendSuspectedBlock} so there is one definition of a suspend, and
+ * `system-stall` is checked BEFORE `non-cpu-stall` because a suspend is the
+ * strictly more specific case of the same evidence.
+ *
+ * ## Known ambiguity, carried forward not silenced
+ *
+ * `isSuspendSuspectedBlock`'s own doc records that a >20 s synchronous syscall
+ * stall is CPU-indistinguishable from a suspend. Nothing here fixes that. What
+ * this adds is the tier BELOW that floor: a 5-20 s non-CPU block, which used
+ * to read as ordinary compute and now reads as `non-cpu-stall` with the
+ * `inFlightPhase` attribution beside it.
+ */
+export function classifyLoopBlock(
+	maxMs: number,
+	windowCpuMs: number,
+	options: {
+		floorMs?: number;
+		slopMs?: number;
+		suspendFloorMs?: number;
+		suspendSlopMs?: number;
+	} = {},
+): LoopBlockClassification {
+	const {
+		floorMs = STALL_CLASSIFY_FLOOR_MS,
+		slopMs = STALL_CLASSIFY_SLOP_MS,
+		suspendFloorMs,
+		suspendSlopMs,
+	} = options;
+	const cpuCoverageRatio =
+		maxMs > 0 ? Math.round((windowCpuMs / maxMs) * 100) / 100 : undefined;
+	if (maxMs < floorMs) return { stallClass: "below-floor", cpuCoverageRatio };
+	if (
+		isSuspendSuspectedBlock(maxMs, windowCpuMs, suspendFloorMs, suspendSlopMs)
+	)
+		return { stallClass: "system-stall", cpuCoverageRatio };
+	if (windowCpuMs + slopMs < maxMs)
+		return { stallClass: "non-cpu-stall", cpuCoverageRatio };
+	return { stallClass: "cpu-accounted", cpuCoverageRatio };
 }
 
 const safeMs = (ns: number): number =>
@@ -165,13 +290,18 @@ export function getEventLoopStats(): EventLoopStats | undefined {
 	const maxMs = safeMs(histogram.max);
 	const windowWallMs = Math.max(0, Date.now() - windowStartWallMs);
 	const windowCpuMs = Math.max(0, cpuTotalMs() - windowStartCpuMs);
+	// One classification pass feeds both fields, so `suspectSystemStall` and
+	// `stallClass` can never disagree about the same sample (#1980).
+	const classification = classifyLoopBlock(maxMs, windowCpuMs);
 	return {
 		maxMs,
 		p99Ms: safeMs(histogram.percentile(99)),
 		meanMs: safeMs(histogram.mean),
 		windowWallMs: Math.round(windowWallMs),
 		windowCpuMs: Math.round(windowCpuMs),
-		suspectSystemStall: isSuspendSuspectedBlock(maxMs, windowCpuMs),
+		suspectSystemStall: classification.stallClass === "system-stall",
+		stallClass: classification.stallClass,
+		cpuCoverageRatio: classification.cpuCoverageRatio,
 	};
 }
 

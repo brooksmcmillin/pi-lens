@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync } from "../support/git-fixture-env.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -19,6 +19,7 @@ import {
 	flushReviewGraphPersistsForTests,
 	getCachedReviewGraph,
 	getGraphSourceFiles,
+	_resetReviewGraphSourcePathMemoForTests,
 	getLastGraphBuildInfo,
 	_setReviewGraphEntryCounterForTests,
 	isReviewGraphMigrationNeeded,
@@ -63,7 +64,7 @@ describe("review graph service", () => {
 			);
 
 			const facts = new FactStore();
-			facts.setSessionFact(
+			facts.setBoundedSessionFact(
 				`session.reviewGraph.changedSymbols:${normalizeMapKey(aPath)}`,
 				["alpha"],
 			);
@@ -201,6 +202,164 @@ describe("review graph service", () => {
 			env.cleanup();
 		}
 	});
+
+	it("memoizes raw source spellings across consecutive builds (#2072)", async () => {
+		const env = setupTestEnvironment("pi-lens-review-graph-source-memo-");
+		try {
+			createTempFile(env.tmpDir, "src/a.ts", "export const a = 1;\n");
+			createTempFile(env.tmpDir, "src/b.ts", "export const b = 2;\n");
+			_resetReviewGraphSourcePathMemoForTests();
+
+			const first = await getGraphSourceFiles(env.tmpDir);
+			const second = await getGraphSourceFiles(env.tmpDir);
+
+			expect(first.pathNormalizeCalls).toBe(first.files.length);
+			expect(second.pathNormalizeCalls).toBe(0);
+			expect(second.files).toEqual(first.files);
+		} finally {
+			_resetReviewGraphSourcePathMemoForTests();
+			env.cleanup();
+		}
+	});
+
+	it("recomputes a recreated mixed-case spelling after a missing walk entry (#2072 F2/F3)", async () => {
+		const env = setupTestEnvironment("pi-lens-review-graph-source-memo-ghost-");
+		const victim = path.join(env.tmpDir, "src", "MiXeD-victim.ts");
+		let visited = 0;
+		try {
+			for (let i = 0; i < 301; i++) {
+				createTempFile(
+					env.tmpDir,
+					`src/${i === 0 ? "MiXeD-victim" : `file-${String(i).padStart(3, "0")}`}.ts`,
+					`export const value${i} = ${i};\n`,
+				);
+			}
+			_resetReviewGraphSourcePathMemoForTests();
+			_setReviewGraphEntryCounterForTests(() => {
+				visited++;
+				// src/ plus the 301 files: delete the victim after the walker has
+				// collected its raw spelling, but before normalization begins.
+				if (visited === 302) fs.rmSync(victim, { force: true });
+			});
+			await getGraphSourceFiles(env.tmpDir);
+			expect(visited).toBeGreaterThanOrEqual(302);
+			expect(fs.existsSync(victim)).toBe(false);
+			createTempFile(
+				env.tmpDir,
+				"src/MiXeD-victim.ts",
+				"export const value = 1;\n",
+			);
+			_setReviewGraphEntryCounterForTests();
+			const freshSources = await getGraphSourceFiles(env.tmpDir);
+			expect(freshSources.files).toContain(normalizeMapKey(victim));
+			const second = await buildOrUpdateGraph(env.tmpDir, [], new FactStore());
+			expect(second.persistCoverage?.persistedFiles).toBe(
+				second.persistCoverage?.totalFiles,
+			);
+			expect(second.fileNodes.has(normalizeMapKey(victim))).toBe(true);
+		} finally {
+			_setReviewGraphEntryCounterForTests();
+			_resetReviewGraphSourcePathMemoForTests();
+			env.cleanup();
+		}
+	}, 30_000);
+
+	it("keeps an 8,000-file one-file rebuild within the changed-file bound (#2072 AC2)", async () => {
+		const env = setupTestEnvironment("pi-lens-review-graph-source-memo-scale-");
+		const previousMaxFiles = process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES;
+		try {
+			process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES = "8000";
+			for (let i = 0; i < 8000; i++) {
+				createTempFile(
+					env.tmpDir,
+					`src/file-${String(i).padStart(4, "0")}.ts`,
+					`export const value${i} = ${i};\n`,
+				);
+			}
+			_resetReviewGraphSourcePathMemoForTests();
+
+			const cold = await getGraphSourceFiles(env.tmpDir);
+			createTempFile(
+				env.tmpDir,
+				"src/file-0000.ts",
+				"export const value0 = 1;\n",
+			);
+			const warm = await getGraphSourceFiles(env.tmpDir);
+
+			// Cold behavior is O(project-files); the one-file rebuild's warm path
+			// must stay within 2 x changedFiles, and this fixture changes one file.
+			expect(cold.files).toHaveLength(8000);
+			expect(cold.pathNormalizeCalls).toBe(8000);
+			expect(warm.pathNormalizeCalls).toBeLessThanOrEqual(2);
+			expect(warm.files).toEqual(cold.files);
+		} finally {
+			_resetReviewGraphSourcePathMemoForTests();
+			if (previousMaxFiles === undefined)
+				delete process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES;
+			else process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES = previousMaxFiles;
+			env.cleanup();
+		}
+	}, 120_000);
+
+	it("keeps a walk's normalize counter stable across workspace eviction (#2072 F4)", async () => {
+		const env = setupTestEnvironment(
+			"pi-lens-review-graph-source-memo-eviction-",
+		);
+		const evictions: Array<Promise<unknown>> = [];
+		let raced = false;
+		try {
+			for (let i = 0; i < 24; i++) {
+				createTempFile(
+					env.tmpDir,
+					`src/file-${i}.ts`,
+					`export const value${i} = ${i};\n`,
+				);
+			}
+			_setReviewGraphEntryCounterForTests(() => {
+				if (raced) return;
+				raced = true;
+				for (let i = 0; i < 9; i++) {
+					const cwd = path.join(env.tmpDir, `workspace-${i}`);
+					createTempFile(cwd, "src/other.ts", "export const other = 1;\n");
+					evictions.push(getGraphSourceFiles(cwd));
+				}
+			});
+			const warm = await getGraphSourceFiles(env.tmpDir);
+			await Promise.all(evictions);
+			expect(warm.pathNormalizeCalls).toBe(warm.files.length);
+		} finally {
+			_setReviewGraphEntryCounterForTests();
+			_resetReviewGraphSourcePathMemoForTests();
+			env.cleanup();
+		}
+	});
+
+	// The case variant only aliases the same workspace on Windows, so the gate
+	// is declarative: an early return mid-body reported a PASS on every Linux
+	// CI run while asserting nothing (#2089). `it.skipIf` prints no reason, so
+	// the name carries it.
+	it.skipIf(process.platform !== "win32")(
+		"case-variant workspace clears invalidate the source-path memo, on win32 only (#2072 F5)",
+		async () => {
+			const env = setupTestEnvironment(
+				"pi-lens-review-graph-source-memo-clear-",
+			);
+			try {
+				createTempFile(env.tmpDir, "src/a.ts", "export const a = 1;\n");
+				_resetReviewGraphSourcePathMemoForTests();
+				const first = await getGraphSourceFiles(env.tmpDir);
+				const variant = env.tmpDir.replace(/[A-Za-z](?=[^\\/]*$)/, (c) =>
+					c === c.toUpperCase() ? c.toLowerCase() : c.toUpperCase(),
+				);
+				clearReviewGraphWorkspaceCache(variant);
+				const second = await getGraphSourceFiles(env.tmpDir);
+				expect(second.pathNormalizeCalls).toBe(first.files.length);
+			} finally {
+				_resetReviewGraphSourcePathMemoForTests();
+				env.cleanup();
+			}
+		},
+	);
 
 	it("getCachedReviewGraph returns a shared, indexed object — no per-call clone (#260)", async () => {
 		const env = setupTestEnvironment("pi-lens-review-graph-shared-");
@@ -506,7 +665,7 @@ describe("review graph service", () => {
 			);
 
 			const facts = new FactStore();
-			facts.setSessionFact(
+			facts.setBoundedSessionFact(
 				`session.reviewGraph.changedSymbols:${normalizeMapKey(modelsPath)}`,
 				["User"],
 			);
@@ -540,7 +699,7 @@ describe("review graph service", () => {
 			const lonePath = createTempFile(env.tmpDir, "src/lone.py", "value = 1\n");
 
 			const facts = new FactStore();
-			facts.setSessionFact(
+			facts.setBoundedSessionFact(
 				`session.reviewGraph.changedSymbols:${normalizeMapKey(aPath)}`,
 				["alpha"],
 			);
@@ -610,7 +769,7 @@ describe("review graph service", () => {
 			}
 
 			const facts = new FactStore();
-			facts.setSessionFact(
+			facts.setBoundedSessionFact(
 				`session.reviewGraph.changedSymbols:${normalizeMapKey(changedPath)}`,
 				["changed"],
 			);

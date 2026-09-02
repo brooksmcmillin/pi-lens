@@ -117,6 +117,40 @@ describe("runner-helpers availability checker", () => {
 		}
 	});
 
+	it("pins the availability-lane cooldown consult and its transient decision (#2309)", async () => {
+		const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
+		const cooldownMod =
+			await import("../../../../clients/spawn-timeout-cooldown.js");
+		const command = "cooldown-probe-tool";
+
+		// The shared beforeEach does not reset logLatencySpy, so the
+		// toHaveLength(1) below is only valid against a locally cleared
+		// history — the same idiom the two later mockReset sites use.
+		logLatencySpy.mockReset();
+		cooldownMod.resetSpawnTimeoutCooldowns();
+		cooldownMod.noteSpawnTimeout({
+			tool: command,
+			command,
+			phase: "availability",
+		});
+
+		const checker = createAvailabilityChecker(command);
+		expect(await checker.isAvailableAsync(process.cwd())).toBe(false);
+		expect(safeSpawnMod.safeSpawnAsync).not.toHaveBeenCalled();
+		expect(availabilityDecisions()).toHaveLength(1);
+		expect(availabilityDecisions()[0]?.metadata).toMatchObject({
+			tool: command,
+			verdict: "unavailable",
+			outcome: "transient",
+			cause: "probe-timeout",
+			classifiedBy: "caller",
+			evidence: {
+				command,
+				status: null,
+			},
+		});
+	});
+
 	it("falls back to global command when no local node_modules binary exists", () => {
 		const env = setupTestEnvironment("pi-lens-node-bin-global-");
 		try {
@@ -177,6 +211,33 @@ describe("runner-helpers availability checker", () => {
 		);
 
 		expect(resolved).toEqual({ cmd: "bundle", args: ["exec", "rubocop"] });
+		expect(
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mock.calls[0]?.[2],
+		).toMatchObject({
+			input: "",
+		});
+	});
+
+	it("closes stdin on the fallback verification probe", async () => {
+		const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
+		const installerMod = await import("../../../../clients/installer/index.js");
+		vi.mocked(installerMod.isSpawnableCommand).mockResolvedValue(true);
+		vi.mocked(safeSpawnMod.safeSpawnAsync)
+			.mockResolvedValueOnce({ stdout: "", stderr: "rejected", status: 1 })
+			.mockResolvedValueOnce({ stdout: "tool 1.0.0", stderr: "", status: 0 });
+
+		await expect(
+			resolveCommandArgsWithInstallFallback(
+				{ cmd: "tool", args: [] },
+				"tool",
+				process.cwd(),
+			),
+		).resolves.toEqual({ cmd: "tool", args: [] });
+		expect(
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mock.calls[1]?.[2],
+		).toMatchObject({
+			input: "",
+		});
 	});
 
 	it("does not auto-install config-first tools", async () => {
@@ -246,6 +307,110 @@ describe("runner-helpers availability checker", () => {
 		const checker = createAvailabilityChecker("zig", ".exe", ["version"]);
 		expect(await checker.isAvailableAsync(process.cwd())).toBe(true);
 		expect(probedArgs).toEqual(["version"]);
+		expect(
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mock.calls.at(-1)?.[2],
+		).toMatchObject({
+			input: "",
+		});
+	});
+
+	it("forwards custom verification args to managed-shim verification", async () => {
+		const env = setupTestEnvironment("pi-lens-managed-check-args-");
+		try {
+			const managedHome = path.join(env.tmpDir, "managed-home");
+			vi.stubEnv("PI_LENS_HOME", managedHome);
+			fs.mkdirSync(path.join(managedHome, "tools", "node_modules", ".bin"), {
+				recursive: true,
+			});
+			const managedBinary = path.join(
+				managedHome,
+				"tools",
+				"node_modules",
+				".bin",
+				"markdownlint-cli2",
+			);
+			fs.writeFileSync(managedBinary, "#!/bin/sh\nexit 0\n");
+			const installerMod =
+				await import("../../../../clients/installer/index.js");
+			await createVenvFinder("markdownlint-cli2", ".cmd", ["--no-globs", "-"])(
+				env.tmpDir,
+			);
+			expect(installerMod.verifyToolBinary).toHaveBeenCalledWith(
+				managedBinary,
+				undefined,
+				expect.any(Function),
+				expect.any(Number),
+				["--no-globs", "-"],
+			);
+		} finally {
+			vi.unstubAllEnvs();
+			env.cleanup();
+		}
+	});
+
+	it("keys the checker flight by code-unit order, not locale (#2155, #2165)", async () => {
+		const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
+		let releaseProbe!: (value: unknown) => void;
+		const pendingProbe = new Promise((resolve) => {
+			releaseProbe = resolve;
+		});
+		vi.mocked(safeSpawnMod.safeSpawnAsync).mockReturnValue(
+			pendingProbe as never,
+		);
+
+		// Two independent checker instances probing the SAME command in the
+		// SAME cwd with the SAME env content share one flight-registry key
+		// space (module-scoped `checkerProbeFlights`). Their env objects here
+		// carry identical entries, so a locale-independent key must join them
+		// into one physical probe regardless of what `localeCompare` says.
+		const env = { AAA: "1", BBB: "2" };
+		const checkerA = createAvailabilityChecker(
+			"dupe-locale-tool",
+			"",
+			["--version"],
+			{ environment: async () => ({ ...env }) },
+		);
+		const checkerB = createAvailabilityChecker(
+			"dupe-locale-tool",
+			"",
+			["--version"],
+			{ environment: async () => ({ ...env }) },
+		);
+
+		const realLocaleCompare = String.prototype.localeCompare;
+		try {
+			// Simulate "locale 1": AAA sorts before BBB.
+			String.prototype.localeCompare = function (this: string, that: string) {
+				if (this === "AAA" && that === "BBB") return -1;
+				if (this === "BBB" && that === "AAA") return 1;
+				return realLocaleCompare.call(this, that);
+			};
+			const first = checkerA.isAvailableAsync(process.cwd());
+			await vi.waitFor(() =>
+				expect(safeSpawnMod.safeSpawnAsync).toHaveBeenCalledTimes(1),
+			);
+
+			// Simulate "locale 2": the same two keys sort in the OPPOSITE order.
+			// A real second process under a different OS locale can see exactly
+			// this. `env` itself is untouched — only the comparator "moved".
+			String.prototype.localeCompare = function (this: string, that: string) {
+				if (this === "AAA" && that === "BBB") return 1;
+				if (this === "BBB" && that === "AAA") return -1;
+				return realLocaleCompare.call(this, that);
+			};
+			const second = checkerB.isAvailableAsync(process.cwd());
+			// Let the second call's async prefix (findCommand's fs walk) settle
+			// before asserting it did or didn't start a second physical probe.
+			await new Promise((resolve) => setTimeout(resolve, 100));
+
+			expect(safeSpawnMod.safeSpawnAsync).toHaveBeenCalledTimes(1);
+
+			releaseProbe({ stdout: "1.0.0", stderr: "", status: 0 });
+			expect(await first).toBe(true);
+			expect(await second).toBe(true);
+		} finally {
+			String.prototype.localeCompare = realLocaleCompare;
+		}
 	});
 
 	it("does not let an old in-flight probe delete a newer generation", async () => {
@@ -342,6 +507,77 @@ describe("runner-helpers availability checker", () => {
 		});
 		expect(await isSgAvailableAsync()).toBe(true);
 		expect(getSgCommand().cmd).toContain("ast-grep");
+	});
+
+	/**
+	 * In-flight ABA release (#1968, kit-driven white-box probe).
+	 *
+	 * Unlike dead-code-client's/knip-client's LATENT sibling (needs a future
+	 * second writer to reach), this one is LIVE today: `ensureCurrentSgGeneration`
+	 * IS the second writer. A session-boundary reset (`resetDispatchAvailabilityState`)
+	 * bumps the generation; the NEXT caller's `ensureCurrentSgGeneration` nulls
+	 * `sgAvailableInFlight` and starts a fresh flight B. Pre-fix, A's own bare
+	 * `sgAvailableInFlight = null` in its `.finally` clobbers that slot when A
+	 * later settles, even though B is still running — so a caller right after
+	 * shares nothing and starts a redundant THIRD probe.
+	 */
+	it("a late-settling probe does not evict its mid-flight successor across a reset (#1968)", async () => {
+		const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
+		// This worktree's real node_modules/.bin carries local ast-grep/sg
+		// binaries, so each flight probes SEVERAL candidates in sequence, not
+		// just one. A's gated candidate REJECTS rather than resolves, so its
+		// sweep throws immediately instead of trying further candidates and
+		// recording a durable verdict — that write would otherwise race the
+		// shared `sgLatch` ahead of B's own (newer-generation) verdict, which is
+		// a separate concern from the in-flight MAP identity this test pins.
+		const gates: Array<{
+			resolve: (value: {
+				stdout: string;
+				stderr: string;
+				status: number;
+			}) => void;
+			reject: (err: Error) => void;
+		}> = [];
+		let calls = 0;
+		vi.mocked(safeSpawnMod.safeSpawnAsync).mockImplementation((async () => {
+			calls += 1;
+			if (calls <= 2) {
+				return new Promise((resolve, reject) => {
+					gates.push({ resolve, reject });
+				});
+			}
+			return { stdout: "", stderr: "missing", status: 1 };
+		}) as never);
+
+		const buildA = isSgAvailableAsync(); // A in flight, call #1 pending
+		buildA.catch(() => {}); // rejection is asserted below; suppress Node's warning
+		expect(calls).toBe(1);
+
+		// The second writer: a session boundary lands mid-flight.
+		resetDispatchAvailabilityState();
+
+		const buildB = isSgAvailableAsync(); // generation mismatch supersedes A
+		expect(calls).toBe(2); // B started its OWN probe rather than sharing A's
+
+		// A settles late (rejects, never reaching a latch write).
+		gates[0]!.reject(new Error("probe blew up"));
+		await expect(buildA).rejects.toThrow("probe blew up");
+
+		// A THIRD caller in the same (B's) generation must share B's flight —
+		// not start a fresh probe, which is what the bare unconditional clear
+		// breaks (pre-fix: `sgAvailableInFlight` is null here, so this call
+		// starts a THIRD safeSpawnAsync invocation instead of joining B). Every
+		// `isSgAvailableAsync` call gets its OWN promise wrapper (it is an
+		// `async function`, so even `return sgAvailableInFlight` is re-wrapped),
+		// so "shared" is proven by the absence of a new probe call below, not by
+		// promise identity.
+		const buildC = isSgAvailableAsync();
+		expect(calls).toBe(2); // no new call: C joined B's flight
+
+		// Release B's own gated candidate as a match, so its sweep settles true.
+		gates[1]!.resolve({ stdout: "ast-grep 0.40.0", stderr: "", status: 0 });
+		expect(await buildB).toBe(true);
+		expect(await buildC).toBe(true);
 	});
 
 	it("does not re-serve a retained ast-grep winner this sweep just proved durably missing (#1593)", async () => {
@@ -1121,6 +1357,31 @@ describe("compensating row: the memo burns only on a genuine correction (#1657)"
 			(record) => record.metadata.verdict === "available",
 		);
 		expect(available).toHaveLength(2);
+	});
+
+	it("reset starts a fresh flight instead of joining the stale one", async () => {
+		const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
+		const releases: Array<(value: unknown) => void> = [];
+		vi.mocked(safeSpawnMod.safeSpawnAsync).mockImplementation(
+			() =>
+				new Promise((resolve) =>
+					releases.push(resolve as (value: unknown) => void),
+				),
+		);
+		const checker = createAvailabilityChecker("reset-flight-tool");
+		const first = checker.isAvailableAsync(process.cwd());
+		await vi.waitFor(() =>
+			expect(safeSpawnMod.safeSpawnAsync).toHaveBeenCalledTimes(1),
+		);
+		checker.reset();
+		const second = checker.isAvailableAsync(process.cwd());
+		await vi.waitFor(() =>
+			expect(safeSpawnMod.safeSpawnAsync).toHaveBeenCalledTimes(2),
+		);
+
+		releases[0]?.({ stdout: "", stderr: "", status: 0 });
+		releases[1]?.({ stdout: "", stderr: "", status: 0 });
+		expect(await Promise.all([first, second])).toEqual([true, true]);
 	});
 
 	/**

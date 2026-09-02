@@ -136,6 +136,27 @@ describe("AstGrepClient validatePattern/validateRule", () => {
 		expect(args.at(-1)).toMatch(/snippet\.py$/);
 	});
 
+	// #2100: `execRaw` caps its output, and hitting that cap SIGTERMs ast-grep —
+	// so the raw result carries the kill's error message alongside the
+	// truncation flag. Read after the error check, the truncation guard could
+	// only ever describe a run that beat the signal out the door.
+	it("names the truncation, not the kill, when the output cap stopped ast-grep", async () => {
+		const execRaw = vi.fn(async () => ({
+			stdout: "[",
+			stderr: "",
+			status: null,
+			error: "Process killed by signal: SIGTERM",
+			failure: "cli-failure",
+			outputTruncated: true,
+		}));
+		const client = clientWithValidationRunner({ execRaw });
+
+		const result = await client.validatePattern("print($X)", "python");
+
+		expect(result.valid).toBe(false);
+		expect(result.error).toContain("truncated");
+	});
+
 	it("rejects validation inputs with NUL bytes before spawning", async () => {
 		const execRaw = vi.fn();
 		const client = clientWithValidationRunner({ execRaw });

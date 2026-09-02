@@ -90,7 +90,10 @@ describe("lsp_diagnostics batch — workspace-diagnostics cache (#671)", () => {
 	}
 
 	/** The on-disk cache's entry map, or `{}` when nothing was written. */
-	function cacheEntries(): Record<string, { mtimeMs: number }> {
+	function cacheEntries(): Record<
+		string,
+		{ mtimeMs: number; sizeBytes?: number }
+	> {
 		const cacheFile = path.join(
 			tmpDir,
 			".pi-lens",
@@ -101,7 +104,7 @@ describe("lsp_diagnostics batch — workspace-diagnostics cache (#671)", () => {
 		return (
 			(
 				JSON.parse(fs.readFileSync(cacheFile, "utf8")) as {
-					entries?: Record<string, { mtimeMs: number }>;
+					entries?: Record<string, { mtimeMs: number; sizeBytes?: number }>;
 				}
 			).entries ?? {}
 		);
@@ -117,6 +120,23 @@ describe("lsp_diagnostics batch — workspace-diagnostics cache (#671)", () => {
 			{ cwd: tmpDir },
 		) as Promise<any>;
 	}
+
+	// #2300 C1 (verify round): `collectFileDiagnosticResult`'s own `record`
+	// call (`tools/lsp-diagnostics.ts`) wires `stat.size` as the `sizeBytes`
+	// argument. A unit test against the cache primitive alone
+	// (`workspace-diagnostics-cache.test.ts`) cannot see this wiring — it
+	// calls `ctx.record` directly with a hand-supplied size, so neutering the
+	// PRODUCTION argument to `undefined` would leave that test green. This
+	// drives the real tool end to end and reads the persisted entry back.
+	it("persists the touched file's real byte size into the cache entry (#2300)", async () => {
+		const files = writeFiles(["a.ts"]);
+
+		await runBatch(files);
+
+		const entries = cacheEntries();
+		const entry = Object.values(entries)[0];
+		expect(entry?.sizeBytes).toBe(fs.statSync(files[0]!).size);
+	});
 
 	it("a second identical batch call never touches an unchanged file again", async () => {
 		const files = writeFiles(["a.ts", "b.ts"]);

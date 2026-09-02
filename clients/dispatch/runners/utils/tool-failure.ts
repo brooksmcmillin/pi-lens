@@ -24,11 +24,33 @@ export interface ToolFailureInput {
 	/** The tool's report artifact is absent, rather than its stdout empty. */
 	reportMissing?: boolean;
 	/**
+	 * OUR output cap ended the run (#2100). Displaces the signal in the wording
+	 * for the same reason the signal displaces a null exit status: it is the
+	 * strongest available explanation, and it is the only one that names US as
+	 * the cause rather than leaving the tool blamed for a SIGTERM we sent.
+	 */
+	outputCapped?: boolean;
+	/**
 	 * Extra discriminating identity to keep in the record — knip's binary
 	 * source, the resolved command. Rendered as `key=value` inside the
 	 * parenthesis after the tool name. Undefined values are dropped.
 	 */
 	fields?: Record<string, string | number | undefined>;
+}
+
+/**
+ * What ended this run, as one clause, most specific cause first.
+ *
+ * A signal is a stronger explanation than the exit status, so it displaces a
+ * `null` one rather than sitting beside it. Our own output cap is stronger
+ * still: the signal it killed with is a detail of OUR decision, and naming that
+ * signal alone reads as the tool misbehaving (#2100).
+ */
+function describeEnding(input: ToolFailureInput): string {
+	if (input.outputCapped) return "was stopped at its output cap";
+	if (input.signal) return `was killed by ${input.signal}`;
+	if (input.status === null) return "did not run (spawn failure)";
+	return `exited ${input.status}`;
 }
 
 /**
@@ -50,14 +72,7 @@ export function formatToolFailure(input: ToolFailureInput): string {
 		? `${input.tool} (${entries.map(([key, value]) => `${key}=${value}`).join(", ")})`
 		: input.tool;
 
-	// A signal is the strongest available explanation, so it displaces the exit
-	// status rather than sitting beside a `null` one.
-	const what = input.signal
-		? `was killed by ${input.signal}`
-		: input.status === null
-			? "did not run (spawn failure)"
-			: `exited ${input.status}`;
-
+	const what = describeEnding(input);
 	const missing = input.reportMissing ? "no report file" : "no output";
 	const detail =
 		firstOutputLine(input.stderr) ||
@@ -81,6 +96,7 @@ export function formatRunOutcomeFailure(
 		tool,
 		status: outcome.status,
 		signal: outcome.signal,
+		outputCapped: outcome.outputCapped,
 		stderr: outcome.firstOutputLine,
 		reportMissing: outcome.kind === "report-missing",
 		fields: { outcome: outcome.kind, ...fields },

@@ -88,6 +88,7 @@ import { getGlobalPiLensDir } from "./file-utils.js";
 import {
 	type InstanceEntry,
 	isInstanceRegistryEnabled,
+	pruneDeadInstances as pruneDeadRegistryInstances,
 	readInstanceRegistry,
 } from "./instance-registry.js";
 import { logLatency } from "./latency-logger.js";
@@ -346,7 +347,7 @@ export async function sweepAtomicWriteStages(
 	return sweepOwnStagingFiles(directories, { maxEntries, isPidAlive });
 }
 
-function windowsExe(name: string): string {
+export function windowsExe(name: string): string {
 	return path.join(
 		process.env.SystemRoot ?? String.raw`C:\Windows`,
 		"System32",
@@ -1570,8 +1571,8 @@ export async function sweepOrphans(): Promise<void> {
 /** Drop dead-parent AND stale-heartbeat (#525, record-cleanup-only)
  *  instances from the registry. Re-reads immediately before
  *  writing (rather than reusing the earlier `readInstanceRegistry()` snapshot)
- *  to narrow — not eliminate — the last-writer-wins race already accepted for
- *  slice 1's read-modify-write model.
+ *  under the instance-registry lock so the reaper cannot lose a registration
+ *  or heartbeat while pruning.
  *
  *  Exported for the #1217 concurrency regression test; `sweepOrphans` is the
  *  only production caller.
@@ -1588,20 +1589,8 @@ export async function sweepOrphans(): Promise<void> {
  *  rename, which the hand-rolled copy did not, and puts this writer back on
  *  the same scheme as the other writer of this same file. */
 export async function pruneDeadInstances(deadPids: Set<number>): Promise<void> {
-	const target = path.join(getGlobalPiLensDir(), "instances.json");
 	try {
-		const raw = await fs.promises.readFile(target, "utf-8");
-		const parsed = JSON.parse(raw);
-		if (!parsed || !Array.isArray(parsed.instances)) return;
-		const remaining = parsed.instances.filter(
-			(entry: InstanceEntry) => !deadPids.has(entry.pid),
-		);
-		if (remaining.length === parsed.instances.length) return;
-		await fs.promises.mkdir(getGlobalPiLensDir(), { recursive: true });
-		await writeFileAtomicAsync(
-			target,
-			JSON.stringify({ instances: remaining }),
-		);
+		await pruneDeadRegistryInstances(deadPids);
 	} catch {
 		// best-effort
 	}

@@ -30,6 +30,13 @@ reviewed, zero unreviewed merges). Apply it to each PR in the queue.
    If "not up to date", `gh api -X PUT .../pulls/<N>/update-branch`, wait for
    CI, re-gate, merge. On GitHub 503s: retry with backoff, never switch to
    raw-API merge endpoints.
+   Alternative, once the verdict is in: apply the `train:approved` label (add
+   `train:squash` for a squash merge) and let the merge-train lane workflow
+   land it (#2185). The lane merges only when both required checks have
+   CONCLUDED success on the exact current head, so a fix round pushed after
+   labeling re-gates itself. Removing the label aborts. Steps 1 through 4 are
+   unchanged: only the maintainer applies the label, and only after the
+   review verdict.
 6. **After each merge.** Master moved: check other open PRs for BEHIND/DIRTY,
    check in-flight agents for file overlap with the merged diff and nudge
    affected ones to merge origin/master before their next push.

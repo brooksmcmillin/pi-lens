@@ -172,7 +172,7 @@ function validateCatalog(catalog) {
 		}
 
 		if (entry.status === "active" && !entry.allow_overlap) {
-			const key = `${entry.language}::${entry.scope}::${entry.canonical_concept}`;
+			const key = `${(entry.language || "").toLowerCase()}::${entry.scope}::${entry.canonical_concept}`;
 			const prev = activeByConceptScopeLang.get(key);
 			if (prev) {
 				warnings.push(

@@ -142,6 +142,24 @@ export interface ReviewGraphPersistCoverage {
 	 * it. Always accompanied by `partial: true`.
 	 */
 	inProgress?: true;
+	/**
+	 * #2255: this graph was trimmed by THIS process to fit the in-memory byte
+	 * budget, starting from a walk that saw every file. Strictly weaker than the
+	 * other partial causes: the file set was complete, only size was cut.
+	 *
+	 * Always accompanied by `partial: true`, so every coverage-REPORTING consumer
+	 * (module-report, project-report, integration's cascade warning, mcp/cli)
+	 * keeps telling the truth: the graph is incomplete. What this flag adds is the
+	 * narrower fact the two INCREMENTAL-BASE gates need. A cap-trimmed graph is a
+	 * safe base to rebuild from, because nothing about the source walk is unknown.
+	 * A walk-truncated or checkpoint graph has UNSEEN files, so it must still
+	 * force a complete walk.
+	 *
+	 * PROCESS-LOCAL AND NEVER PERSISTED. `persistedData` strips it before the
+	 * snapshot is written, so a graph hydrated from disk can never claim
+	 * base-eligibility this process did not itself establish (#936 laundering).
+	 */
+	capTrimmed?: true;
 }
 
 /**

@@ -131,25 +131,42 @@ function resolvePathValue(env: NodeJS.ProcessEnv): string {
 	return combinePathValuesForPlatform([env.PATH, env.Path, env.path]);
 }
 
-/** Read live system+user PATH from Windows registry (bypasses stale process.env.PATH). */
-function readWindowsRegistryPath(): string {
+/**
+ * Run an `execFileSync` probe with the #2095 stderr guard applied, returning
+ * `""` on any failure. Exported as a small test seam: production always calls
+ * it with the fixed `powershell.exe` command/args below, but a test can pass
+ * a command guaranteed to fail with real stderr output (no real Windows or
+ * powershell.exe required) to prove the guard is actually reached and not
+ * vacuous.
+ */
+export function runStderrGuardedProbe(command: string, args: string[]): string {
 	try {
 		const { execFileSync } =
 			require("node:child_process") as typeof import("node:child_process");
-		const out = execFileSync(
-			"powershell.exe",
-			[
-				"-NoProfile",
-				"-NonInteractive",
-				"-Command",
-				"[System.Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path','User')",
-			],
-			{ timeout: 3000, encoding: "utf8" },
-		);
+		const out = execFileSync(command, args, {
+			timeout: 3000,
+			encoding: "utf8",
+			// #2095 sibling: execFileSync inherits stderr to the parent by
+			// default (only stdout is captured into `out`), so a failed
+			// powershell.exe launch would print raw diagnostics into the pi
+			// TUI even though the surrounding catch already returns "" (read as
+			// "unknown" PATH by every caller). Pipe stderr instead of inheriting it.
+			stdio: ["ignore", "pipe", "ignore"],
+		});
 		return out.trim();
 	} catch {
 		return "";
 	}
+}
+
+/** Read live system+user PATH from Windows registry (bypasses stale process.env.PATH). */
+function readWindowsRegistryPath(): string {
+	return runStderrGuardedProbe("powershell.exe", [
+		"-NoProfile",
+		"-NonInteractive",
+		"-Command",
+		"[System.Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path','User')",
+	]);
 }
 
 let _liveWindowsPath: string | null = null;
@@ -294,6 +311,14 @@ function findBinaryOnPath(
 			encoding: "utf-8",
 			stdio: ["ignore", "pipe", "ignore"],
 			env,
+			// #1980 population sweep: this was the one synchronous
+			// child-process site in the repo with no bound at all. It runs on
+			// the LSP server spawn path, so an unresponsive `where`/`which` — a
+			// stale network PATH entry is the classic cause — parked the event
+			// loop with no ceiling, and read as ordinary compute in
+			// `loop_block`. 5s matches `isCommandAvailable`/`findCommand` in
+			// clients/safe-spawn.ts, which run these same two binaries.
+			timeout: 5000,
 		})
 			.split(/\r?\n/)
 			.map((line) => line.trim())

@@ -907,11 +907,18 @@ describe("#1655 review F3 — the bash-side path source, pinned by use", () => {
 		// `extractDeletedPathsFromCommand` (#1668) is the fourth legitimate
 		// consumer: it proposes rm/git rm/mv-source delete targets from the
 		// same bash command string.
+		// `isFailedGitIntegrationCommand` (#2060) is the fifth, and the only
+		// one that is NOT a path source: it tokenizes the command through
+		// bash-file-access's own `tokenizeShellCommand` and returns a boolean
+		// recovery policy. It proposes no paths, so it needs no workspaceRoot
+		// pin below. Any FUTURE addition here is a path source until proven
+		// otherwise — pin it, then justify it in one line like this.
 		expect([...callees].sort()).toEqual([
 			"extractDeletedPathsFromCommand",
 			"extractGrepSearchReadsFromOutput",
 			"extractReadPathsFromCommand",
 			"extractWrittenPathsFromCommand",
+			"isFailedGitIntegrationCommand",
 		]);
 
 		// ...and each resolves against the project root, never a ctx.cwd the

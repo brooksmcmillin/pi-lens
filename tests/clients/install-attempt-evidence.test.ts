@@ -159,6 +159,27 @@ describe("the installer records what its attempt did (#1500)", () => {
 		);
 	});
 
+	it("keeps the real attempt snapshot distinct from a later cached ensure", async () => {
+		safeSpawnAsync.mockImplementation(async () => {
+			plantFishLspBinary();
+			return npmOk;
+		});
+		const { ensureTool, getInstallAttempt } = await installer();
+
+		expect(await ensureTool("fish-lsp")).toBeDefined();
+		const firstAttempt = getInstallAttempt("fish-lsp");
+		expect(firstAttempt?.outcome).toBe("succeeded");
+
+		// The second real ensure clears the process-global last-attempt slot before
+		// returning its session-cache result. A caller that saved the first result
+		// immediately after its await still reports the correct install.
+		expect(await ensureTool("fish-lsp")).toBeDefined();
+		expect(getInstallAttempt("fish-lsp")).toBeUndefined();
+		expect(describeInstallAttempt(firstAttempt)).toMatchObject({
+			install: "succeeded",
+		});
+	});
+
 	it("project-trust denial records a decline, not a failure", async () => {
 		const trust = await import("../../clients/project-trust.js");
 		vi.mocked(trust.assertInstallAllowed).mockReturnValue(false);

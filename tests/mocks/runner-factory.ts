@@ -15,7 +15,6 @@ export interface MockRunnerConfig {
 	id: string;
 	appliesTo: string[];
 	priority?: number;
-	enabledByDefault?: boolean;
 	skipTestFiles?: boolean;
 	when?: (ctx: DispatchContext) => boolean | Promise<boolean>;
 	runResult: RunnerResult;
@@ -27,7 +26,6 @@ export function createMockRunner(config: MockRunnerConfig): RunnerDefinition {
 		id: config.id,
 		appliesTo: config.appliesTo as any,
 		priority: config.priority ?? 10,
-		enabledByDefault: config.enabledByDefault ?? true,
 		skipTestFiles: config.skipTestFiles ?? false,
 		when: config.when,
 		async run(_ctx: DispatchContext): Promise<RunnerResult> {

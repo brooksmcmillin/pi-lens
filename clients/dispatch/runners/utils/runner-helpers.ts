@@ -11,6 +11,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { logSessionStart } from "../../../sessionstart-logger.js";
+import { incrementDegradationCount } from "../../../degradation-ledger.js";
 import { getGlobalPiLensDir } from "../../../file-utils.js";
 import {
 	createGenerationSource,
@@ -36,12 +37,14 @@ import {
 } from "../../../lsp/config.js";
 import { findGlobalBinary } from "../../../package-manager.js";
 import { safeSpawnAsync } from "../../../safe-spawn.js";
+import { compareOrdinal } from "../../../string-utils.js";
 import {
 	getToolCommandSpec,
 	shouldAutoInstallTool,
 } from "../../../tool-policy.js";
 import type { DispatchContext } from "../../types.js";
 import { isInSpawnTimeoutCooldown } from "../../../spawn-timeout-cooldown.js";
+import { createAvailabilityProbeFlight } from "../../../availability-probe-flight.js";
 import {
 	type AvailabilityCause,
 	type AvailabilityLatch,
@@ -205,6 +208,7 @@ async function runManagedVerification(
 	stamp: string,
 	priorAttempts: number,
 	generation: GenerationHandle,
+	verificationArgs: string[] = ["--version"],
 ): Promise<ManagedVerdict> {
 	let transient = false;
 	let ok: boolean;
@@ -217,6 +221,7 @@ async function runManagedVerification(
 				transient = true;
 			},
 			MANAGED_VERIFY_TIMEOUT_MS,
+			verificationArgs,
 		);
 	} catch {
 		// The verifier itself could not run — installer-isolated unit tests mock
@@ -260,6 +265,7 @@ async function runManagedVerification(
 
 async function verifyManagedCandidate(
 	candidate: string,
+	verificationArgs: string[] = ["--version"],
 ): Promise<ManagedVerdict> {
 	let stamp: string;
 	try {
@@ -283,6 +289,7 @@ async function verifyManagedCandidate(
 		stamp,
 		priorAttempts,
 		generation,
+		verificationArgs,
 	).finally(() => {
 		// A settling old-session probe must not evict the live entry a new
 		// session already started for the same shim (#1674 review F5).
@@ -318,9 +325,10 @@ async function verifyManagedCandidate(
  */
 export async function findManagedNodeToolBinary(
 	tool: string,
+	verificationArgs: string[] = ["--version"],
 ): Promise<string | null> {
 	for (const candidate of managedNodeToolCandidates(tool)) {
-		const verdict = await verifyManagedCandidate(candidate);
+		const verdict = await verifyManagedCandidate(candidate, verificationArgs);
 		if (verdict === "ok" || verdict === "unverified") return candidate;
 	}
 	return null;
@@ -341,6 +349,7 @@ export async function findManagedNodeToolBinary(
 export function createVenvFinder(
 	command: string,
 	windowsExt = "",
+	verificationArgs: string[] = ["--version"],
 ): (cwd: string) => Promise<string> {
 	return async (cwd: string): Promise<string> => {
 		const venvPaths = [
@@ -367,7 +376,7 @@ export function createVenvFinder(
 		// check settles it without a spawn — after one verification per shim per
 		// session, so a shim that cannot run falls through to PATH instead of
 		// shadowing a working binary (#1657).
-		const managed = await findManagedNodeToolBinary(command);
+		const managed = await findManagedNodeToolBinary(command, verificationArgs);
 		if (managed) return managed;
 
 		// Fall back to global
@@ -524,6 +533,28 @@ const latchedUnavailableByCwd = new PathKeyedMap<Set<string>>(normalizeMapKey);
 // instead of five hand-rolled ones, and a dropped straddling write is visible
 // in the degradation ledger instead of silent.
 const availabilityGeneration = createGenerationSource("dispatch-availability");
+export const getDispatchAvailabilityGeneration = (): number =>
+	availabilityGeneration.current();
+
+const checkerProbeFlights = createAvailabilityProbeFlight<
+	Awaited<ReturnType<typeof safeSpawnAsync>>
+>({ generation: getDispatchAvailabilityGeneration });
+
+export function recordAvailabilityProbeOverrun(
+	tool: string,
+	key: string,
+	elapsedMs: number,
+	budgetMs: number | undefined,
+	failure?: ProbeFailureShape["failure"],
+): void {
+	if (budgetMs === undefined || elapsedMs <= budgetMs) return;
+	if (failure === "timeout" && elapsedMs <= budgetMs * 2) return;
+	incrementDegradationCount({
+		kind: "availability-probe-overrun",
+		subject: `${tool}:${key}`,
+		reason: `probe took ${Math.round(elapsedMs)}ms; budget was ${Math.round(budgetMs)}ms`,
+	});
+}
 
 function installStateFor(cwd: string, toolId: string): InstallAttemptState {
 	let states = installAttemptsByCwd.get(cwd);
@@ -786,6 +817,9 @@ export function resetDispatchAvailabilityState(): void {
 	managedVerifyInFlight.clear();
 	resetPathWalkMemo();
 	availabilityGeneration.bump();
+	checkerProbeFlights.clear();
+	cwdProbeFlights.clear();
+	// The generation bump invalidates dispatcherProbeFlights in its owner module.
 }
 
 /** What the last probe for a cwd decided, for messaging and telemetry (#1467). */
@@ -835,20 +869,23 @@ export function createAvailabilityChecker(
 		normalizeEphemeralMapKey,
 	);
 	let checkerGeneration = availabilityGeneration.current();
+	let checkerFlightGeneration = 0;
 
-	const findCommand = createVenvFinder(command, windowsExt);
+	const findCommand = createVenvFinder(command, windowsExt, versionArgs);
 
 	function ensureCurrentGeneration(): void {
 		if (checkerGeneration === availabilityGeneration.current()) return;
 		cacheByCwd.clear();
 		inFlightByCwd.clear();
 		checkerGeneration = availabilityGeneration.current();
+		checkerFlightGeneration++;
 	}
 
 	const reset = (): void => {
 		cacheByCwd.clear();
 		inFlightByCwd.clear();
 		checkerGeneration = availabilityGeneration.current();
+		checkerFlightGeneration++;
 	};
 
 	function getCache(cwd: string): AvailabilityCache {
@@ -880,7 +917,7 @@ export function createAvailabilityChecker(
 			elapsedMs: number;
 			hostStallMs?: number;
 			/** How the outcome was reached, and the facts behind it (#1500). */
-			classifiedBy?: "probe" | "caller";
+			classifiedBy?: "probe" | "caller" | "joined";
 			evidence?: ProbeEvidence;
 		},
 	): void {
@@ -924,9 +961,9 @@ export function createAvailabilityChecker(
 				cause: verdict.cause,
 				elapsedMs: verdict.elapsedMs,
 				latched,
-				...(verdict.classifiedBy !== undefined && {
-					classifiedBy: verdict.classifiedBy,
-				}),
+				// Every caller passes this (#2209); a direct key, not a conditional
+				// spread, keeps it visible to the call-shaped classifiedBy sweep.
+				classifiedBy: verdict.classifiedBy,
 				...(verdict.evidence !== undefined && { evidence: verdict.evidence }),
 				...(verdict.hostStallMs !== undefined && {
 					hostStallMs: verdict.hostStallMs,
@@ -1041,16 +1078,31 @@ export function createAvailabilityChecker(
 			const startedAt = Date.now();
 			let result: Awaited<ReturnType<typeof safeSpawnAsync>>;
 			let hostStallMs: number;
+			let probeJoined = false;
 			try {
-				result = await safeSpawnAsync(cmd, versionArgs, {
-					timeout: options.probeTimeout ?? 5000,
-					cwd: resolvedCwd,
-					env,
-				});
+				const shared = checkerProbeFlights.run(
+					`checker:${command}|${versionArgs.join("|")}|${key}|${checkerFlightGeneration}|${windowsExt}|${cmd}|${JSON.stringify(Object.entries(env ?? {}).sort(([a], [b]) => compareOrdinal(a, b)))}`,
+					() =>
+						safeSpawnAsync(cmd, versionArgs, {
+							timeout: options.probeTimeout ?? 5000,
+							cwd: resolvedCwd,
+							env,
+							input: "",
+						}),
+				);
+				probeJoined = shared.joined;
+				result = await shared.promise;
 			} finally {
 				hostStallMs = stallSampler.stop();
 			}
 			const elapsedMs = Date.now() - startedAt;
+			recordAvailabilityProbeOverrun(
+				command,
+				resolvedCwd,
+				elapsedMs,
+				options.probeTimeout ?? 5000,
+				result.failure,
+			);
 
 			if (!result.error && result.status === 0) {
 				cache.command = cmd;
@@ -1060,7 +1112,7 @@ export function createAvailabilityChecker(
 					cause: "ok",
 					elapsedMs,
 					hostStallMs,
-					classifiedBy: "probe",
+					classifiedBy: probeJoined ? "joined" : "probe",
 					evidence: describeProbeEvidence(result),
 				});
 				return true;
@@ -1080,7 +1132,7 @@ export function createAvailabilityChecker(
 				cause,
 				elapsedMs,
 				hostStallMs,
-				classifiedBy: "probe",
+				classifiedBy: probeJoined ? "joined" : "probe",
 				evidence,
 			});
 			return false;
@@ -1132,10 +1184,16 @@ export interface CwdProbeResult extends ProbeFailureShape {
 	status?: number | null;
 }
 
+const cwdProbeFlights = createAvailabilityProbeFlight<CwdProbeResult>({
+	generation: getDispatchAvailabilityGeneration,
+});
+
 export interface CwdCachedProbeOptions {
 	/** Tool name used in the `availability_decision` record. */
 	tool: string;
-	/** Probe budget the verdict was measured against, ms. Reported, not enforced. */
+	/** Identity of the resolved probe binary, or a caller-owned freshness token. */
+	flightKeyComponent?: string;
+	/** Probe budget the verdict was measured against, ms; overruns enter the bounded ledger. */
 	budgetMs?: number;
 	/** Outcome for a failure the taxonomy cannot classify. Default non-installable. */
 	unclassifiedFailureOutcome?: AvailabilityOutcome;
@@ -1211,6 +1269,7 @@ export function createCwdCachedProbe(
 			hostStallMs: number;
 			/** What the spawn returned, for the record's audit trail (#1500). */
 			evidence?: ProbeEvidence;
+			classifiedBy?: "probe" | "joined";
 		},
 	): void {
 		let retryAfterMs: number | undefined;
@@ -1239,7 +1298,7 @@ export function createCwdCachedProbe(
 				...(retryAfterMs !== undefined && { retryAfterMs }),
 				...(options.budgetMs !== undefined && { budgetMs: options.budgetMs }),
 				// Every verdict here is derived from the probe this seam just ran.
-				classifiedBy: "probe",
+				classifiedBy: verdict.classifiedBy ?? "probe",
 				...(verdict.evidence !== undefined && { evidence: verdict.evidence }),
 			},
 			key,
@@ -1266,19 +1325,32 @@ export function createCwdCachedProbe(
 			const startedAt = Date.now();
 			let result: CwdProbeResult | undefined;
 			let thrown: unknown;
+			let probeJoined = false;
 			try {
-				result = await probe(key);
+				const shared = cwdProbeFlights.run(
+					`cwd:${options.tool}|${options.flightKeyComponent ?? ""}|${key}`,
+					() => probe(key),
+				);
+				probeJoined = shared.joined;
+				result = await shared.promise;
 			} catch (error) {
 				thrown = error;
 			}
 			const hostStallMs = stallSampler.stop();
 			const elapsedMs = Date.now() - startedAt;
-			// A probe that threw carries its errno in the Error, which is exactly
-			// what the taxonomy reads — so a thrown EAGAIN stays transient instead
-			// of collapsing into an untyped `false`.
 			const shape: CwdProbeResult = result ?? {
 				error: thrown instanceof Error ? thrown : new Error(String(thrown)),
 			};
+			recordAvailabilityProbeOverrun(
+				options.tool,
+				key,
+				elapsedMs,
+				options.budgetMs,
+				shape.failure,
+			);
+			// A probe that threw carries its errno in the Error, which is exactly
+			// what the taxonomy reads — so a thrown EAGAIN stays transient instead
+			// of collapsing into an untyped `false`.
 
 			if (result && !result.error && result.status === 0) {
 				note(latch, key, {
@@ -1287,6 +1359,7 @@ export function createCwdCachedProbe(
 					cause: "ok",
 					elapsedMs,
 					hostStallMs,
+					classifiedBy: probeJoined ? "joined" : "probe",
 					evidence: describeProbeEvidence(result, options.tool),
 				});
 				return true;
@@ -1303,6 +1376,7 @@ export function createCwdCachedProbe(
 				cause,
 				elapsedMs,
 				hostStallMs,
+				classifiedBy: probeJoined ? "joined" : "probe",
 				evidence,
 			});
 			return false;
@@ -1420,6 +1494,7 @@ async function verifyOrInstallCommand(
 		const versionCheck = await safeSpawnAsync(command, versionArgs, {
 			timeout,
 			cwd,
+			input: "",
 		});
 		if (!versionCheck.error && versionCheck.status === 0) {
 			return command;
@@ -1468,7 +1543,7 @@ export async function resolveCommandArgsWithInstallFallback(
 	const versionCheck = await safeSpawnAsync(
 		command.cmd,
 		[...command.args, ...versionArgs],
-		{ timeout, cwd },
+		{ timeout, cwd, input: "" },
 	);
 	if (!versionCheck.error && versionCheck.status === 0) {
 		return command;
@@ -1733,7 +1808,7 @@ export async function isSgAvailableAsync(): Promise<boolean> {
 	if (memo !== null) return memo;
 	if (sgAvailableInFlight) return sgAvailableInFlight;
 
-	sgAvailableInFlight = (async () => {
+	const flight: Promise<boolean> = (async () => {
 		const startedAt = Date.now();
 		sgSweepSawTransient = false;
 		sgSweepTransientCause = "probe-timeout";
@@ -1806,10 +1881,19 @@ export async function isSgAvailableAsync(): Promise<boolean> {
 		);
 		return false;
 	})().finally(() => {
-		sgAvailableInFlight = null;
+		// Identity-guarded release (#1968's pattern): clear the slot only if THIS
+		// flight still owns it. `ensureCurrentSgGeneration()` above nulls the slot
+		// on a generation bump (a session reset arriving mid-flight) so the NEXT
+		// caller starts a fresh flight rather than sharing this one's stale-generation
+		// answer — that fresh flight is a live successor. Without the guard, this
+		// flight's own late settlement would stomp the slot back to null out from
+		// under that successor, and the caller after it would start a redundant
+		// THIRD probe instead of sharing the still-running second one.
+		if (sgAvailableInFlight === flight) sgAvailableInFlight = null;
 	});
+	sgAvailableInFlight = flight;
 
-	return sgAvailableInFlight;
+	return flight;
 }
 
 /**
@@ -1844,6 +1928,7 @@ function noteSgAvailable(
 		cause: provisional ? sgSweepTransientCause : "ok",
 		elapsedMs: Date.now() - startedAt,
 		latched: !provisional,
+		classifiedBy: "probe",
 		hostStallMs: sgSweepHostStallMs,
 		budgetMs: 5000,
 		...(provisional && {
@@ -1872,6 +1957,9 @@ function noteSgUnavailable(
 		hostStallMs: sgSweepHostStallMs,
 		...(retryAfterMs > 0 && { retryAfterMs }),
 		budgetMs: 5000,
+		// Sibling of noteSgAvailable's "probe": both report the same
+		// candidate sweep this function ran (#2209).
+		classifiedBy: "probe",
 	});
 }
 

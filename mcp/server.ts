@@ -74,6 +74,7 @@ import { createLensDiagnosticsTool } from "../tools/lens-diagnostics.js";
 import { peekMcpSessionRuntime } from "../clients/mcp/session.js";
 import { createLspDiagnosticsTool } from "../tools/lsp-diagnostics.js";
 import { createLspNavigationTool } from "../tools/lsp-navigation.js";
+import { shouldInitializeSessionRoot } from "../clients/lsp/session-roots.js";
 import {
 	computeBuildStamp,
 	STALE_SERVED_BY_FRESH,
@@ -189,7 +190,12 @@ const REPO_ROOT = process.env.PI_LENS_MCP_REPO_ROOT
 
 async function ensureReady(cwd: string): Promise<void> {
 	const normalized = path.resolve(cwd);
-	if (lspReadyCwds.has(normalized)) return;
+	// #2052 R1: the session-root registry evicts old roots at a fixed cap. The
+	// readiness memo is only a fast path; consult the registry so an evicted
+	// root can initialize again when it is used later.
+	if (!shouldInitializeSessionRoot(normalized, lspReadyCwds)) {
+		return;
+	}
 	try {
 		await ensureLspConfig(normalized);
 		// pi-lens-ignore: missing-error-propagation
@@ -1025,6 +1031,9 @@ function formatAnalyze(
 	const summary =
 		`${path.relative(cwd, result.filePath) || result.filePath} [${mode}] — ` +
 		`${result.counts.blockers} blocking, ${result.counts.warnings} warning(s), ` +
+		// #2420: advisories (hint/info-tier style opinions) are reported under
+		// their own label so they are no longer folded into the warning count.
+		`${result.counts.advisories} advisory(ies), ` +
 		`${result.counts.diagnostics} total` +
 		(result.latency ? ` · ${result.latency.totalDurationMs}ms` : "") +
 		lspNote +

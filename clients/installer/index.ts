@@ -335,6 +335,8 @@ export interface ToolDefinition {
 	name: string;
 	checkCommand: string;
 	checkArgs: string[];
+	/** Verification timeout for this tool's managed-binary probe, in ms. */
+	verificationTimeoutMs?: number;
 	installStrategy: "npm" | "pip" | "gem" | "github" | "maven" | "archive";
 	packageName?: string;
 	binaryName?: string;
@@ -547,6 +549,12 @@ export const TOOLS: ToolDefinition[] = [
 		name: "Bash Language Server",
 		checkCommand: "bash-language-server",
 		checkArgs: ["--version"],
+		// The #2188 sweep measured a 9,667ms cold `--version` start with closed
+		// stdin — close enough to the 10s installer default that modest host
+		// contention pushes it over and emits a false verification degradation.
+		// 20s gives the same kind of headroom Vue's 30s bound gives its own
+		// slower cold start (#2176), without inventing a shared literal (#2194).
+		verificationTimeoutMs: 20_000,
 		installStrategy: "npm",
 		packageName: "bash-language-server",
 		binaryName: "bash-language-server",
@@ -583,6 +591,11 @@ export const TOOLS: ToolDefinition[] = [
 		name: "VSCode JSON Language Server",
 		checkCommand: "vscode-json-language-server",
 		checkArgs: ["--version"],
+		// The #2188 sweep measured an 11,047ms cold `--version` start with closed
+		// stdin — over the 10s installer default, so a cold or contended host can
+		// see a false verification degradation before the binary ever answers.
+		// 20s mirrors the bash-language-server bound above (#2194).
+		verificationTimeoutMs: 20_000,
 		installStrategy: "npm",
 		packageName: "vscode-langservers-extracted",
 		binaryName: "vscode-json-language-server",
@@ -628,7 +641,8 @@ export const TOOLS: ToolDefinition[] = [
 		id: "helm",
 		name: "Helm",
 		checkCommand: "helm",
-		checkArgs: ["version", "--short"],
+		// intended: version --short — unverified against real binary (shape 16), do not wire until probed
+		checkArgs: ["--version"],
 		installStrategy: "github",
 		binaryName: "helm",
 		github: {
@@ -702,6 +716,11 @@ export const TOOLS: ToolDefinition[] = [
 		name: "Prisma Language Server",
 		checkCommand: "prisma-language-server",
 		checkArgs: ["--version"],
+		// #2169: a real closed-stdin cold run measured 27,265ms, and a warm-cache
+		// rerun still took 9,860ms — well past the 10s installer default. 40s
+		// keeps the same margin-over-worst-observed ratio Vue's 30s bound uses
+		// (#2176) rather than trimming it for a slower binary.
+		verificationTimeoutMs: 40_000,
 		installStrategy: "npm",
 		packageName: "@prisma/language-server",
 		binaryName: "prisma-language-server",
@@ -711,6 +730,10 @@ export const TOOLS: ToolDefinition[] = [
 		name: "Vue Language Server",
 		checkCommand: "vue-language-server",
 		checkArgs: ["--version"],
+		// Vue's launcher loads the full language-service bundle before answering
+		// --version. Its cold start exceeds the dispatch probe budget on some hosts
+		// even though warm starts complete quickly (#2176).
+		verificationTimeoutMs: 30_000,
 		installStrategy: "npm",
 		packageName: "@vue/language-server",
 		binaryName: "vue-language-server",
@@ -720,6 +743,10 @@ export const TOOLS: ToolDefinition[] = [
 		name: "Svelte Language Server",
 		checkCommand: "svelteserver",
 		checkArgs: ["--version"],
+		// #2169: a real closed-stdin cold run measured 12,410ms — over the 10s
+		// installer default, matching the bash/JSON class of false verification
+		// degradation from a cold-cache host (#2194). 20s mirrors that bound.
+		verificationTimeoutMs: 20_000,
 		installStrategy: "npm",
 		packageName: "svelte-language-server",
 		binaryName: "svelteserver",
@@ -728,7 +755,9 @@ export const TOOLS: ToolDefinition[] = [
 		id: "markdownlint",
 		name: "markdownlint-cli2",
 		checkCommand: "markdownlint-cli2",
-		checkArgs: ["--version"],
+		// `--version` is interpreted as a file glob by markdownlint-cli2. Use
+		// stdin with globs disabled so verification cannot scan the workspace.
+		checkArgs: ["--no-globs", "-"],
 		installStrategy: "npm",
 		packageName: "markdownlint-cli2",
 		binaryName: "markdownlint-cli2",
@@ -937,7 +966,8 @@ export const TOOLS: ToolDefinition[] = [
 		id: "spotbugs",
 		name: "SpotBugs",
 		checkCommand: "spotbugs",
-		checkArgs: ["-version"],
+		// intended: -version — unverified against real binary (shape 16), do not wire until probed
+		checkArgs: ["--version"],
 		installStrategy: "archive",
 		binaryName: "spotbugs",
 		archive: {
@@ -1181,7 +1211,8 @@ export const TOOLS: ToolDefinition[] = [
 		id: "gitleaks",
 		name: "gitleaks",
 		checkCommand: "gitleaks",
-		checkArgs: ["version"],
+		// intended: version — unverified against real binary (shape 16), do not wire until probed
+		checkArgs: ["--version"],
 		installStrategy: "github",
 		binaryName: "gitleaks",
 		github: {
@@ -1292,7 +1323,8 @@ export const TOOLS: ToolDefinition[] = [
 		id: "terraform-ls",
 		name: "terraform-ls",
 		checkCommand: "terraform-ls",
-		checkArgs: ["version"],
+		// intended: version — unverified against real binary (shape 16), do not wire until probed
+		checkArgs: ["--version"],
 		installStrategy: "github",
 		binaryName: "terraform-ls",
 		github: {
@@ -1363,6 +1395,7 @@ export const TOOLS: ToolDefinition[] = [
 		id: "cue",
 		name: "CUE",
 		checkCommand: "cue",
+		// Probed locally with CUE v0.17.1: `cue version` exits 0.
 		checkArgs: ["version"],
 		installStrategy: "github",
 		binaryName: "cue",
@@ -1467,6 +1500,11 @@ export const TOOLS: ToolDefinition[] = [
 		},
 	},
 ];
+
+/** Return the bounded managed-binary verification budget for a registered tool. */
+export function getToolVerificationTimeout(tool: ToolDefinition): number {
+	return tool.verificationTimeoutMs ?? 10_000;
+}
 
 const ensureInFlight = new Map<string, Promise<string | undefined>>();
 const installFailureReasons = new Map<string, string>();
@@ -1575,6 +1613,16 @@ export function resetResolvedPathCache(): void {
 interface ProbeCacheEntry {
 	path: string;
 	mtimeMs: number;
+	/**
+	 * #2300: byte size at the same stat call as `mtimeMs`. A binary replaced
+	 * in-place (an upgrade landing in the same coarse-granularity mtime tick)
+	 * would otherwise pass the mtime-only freshness check unnoticed. Optional
+	 * so a pre-#2300 persisted entry doesn't need a version bump to stay
+	 * loadable — `checkProbeCache` fails OPEN (mtime-only) when absent; it
+	 * self-heals on the entry's next `updateProbeCache` write or 24h TTL
+	 * expiry, whichever comes first.
+	 */
+	sizeBytes?: number;
 	cachedAt: number;
 	/**
 	 * True when the `getToolPath` resolution that produced `path` saw a
@@ -1893,9 +1941,16 @@ export async function checkProbeCache(
 	try {
 		await fs.access(entry.path);
 		const stat = await fs.stat(entry.path);
-		if (stat.mtimeMs !== entry.mtimeMs) {
+		// #2300: size alongside mtime, from the same stat — a binary replaced
+		// in-place within the same coarse-granularity mtime tick would otherwise
+		// pass this check unnoticed. `entry.sizeBytes` absent (pre-#2300 entry)
+		// fails open to the mtime-only check (see the field's doc comment).
+		if (
+			stat.mtimeMs !== entry.mtimeMs ||
+			(entry.sizeBytes !== undefined && stat.size !== entry.sizeBytes)
+		) {
 			logSessionStart(
-				`auto-install probe-cache ${toolId}: miss (mtime changed)`,
+				`auto-install probe-cache ${toolId}: miss (mtime/size changed)`,
 			);
 			delete cache[toolId];
 			markProbeCacheChange(toolId, null);
@@ -1932,6 +1987,7 @@ export async function updateProbeCache(
 		const entry: ProbeCacheEntry = {
 			path: resolvedPath,
 			mtimeMs: stat.mtimeMs,
+			sizeBytes: stat.size,
 			cachedAt: Date.now(),
 			...(transient && { transient: true }),
 		};
@@ -1962,6 +2018,18 @@ export function resetProbeCacheStateForTesting(): void {
 		clearTimeout(_probeCacheFlushTimer);
 		_probeCacheFlushTimer = null;
 	}
+}
+
+/**
+ * Exported for testing only. Read the `ensureTool` in-flight map directly
+ * (#1968's ABA regression: a second writer replacing an entry mid-flight,
+ * then a late-settling first run evicting it with a bare delete-by-key).
+ */
+export function _peekEnsureInFlightForTesting(): Map<
+	string,
+	Promise<string | undefined>
+> {
+	return ensureInFlight;
 }
 
 // --- Check Functions ---
@@ -2061,6 +2129,9 @@ export function isLspTransportRequiredError(output: string): boolean {
 	);
 }
 
+const lspTransportRequiredMatcher =
+	/Connection (?:input|output) stream is not set|Use arguments of createConnection/i;
+
 /**
  * Parse the exact version pinned in a TOOLS `packageName` spec, e.g.
  * `"jscpd@3.5.10"` -> `"3.5.10"`. Scoped packages (`"@ast-grep/cli"`) have no
@@ -2094,7 +2165,7 @@ function extractVersionToken(output: string): string | undefined {
 const lastManagedInstallVersion = new Map<string, string>();
 
 /**
- * Verify a tool binary actually works by running --version
+ * Verify a tool binary actually works by running its configured checkArgs.
  * This catches broken symlinks, partial installs, and corrupted binaries.
  * `onVersionOutput`, when provided, receives the raw stdout on a successful
  * (exit 0) probe — used to piggyback version-pin drift detection onto this
@@ -2123,6 +2194,7 @@ export async function verifyToolBinary(
 	 * the expiry as transient rather than as a verdict (#1657).
 	 */
 	timeoutMs = 10000,
+	verificationArgs: string[] = ["--version"],
 ): Promise<boolean> {
 	// #2015: safeSpawnAsync instead of raw spawn. Raw spawn's timeout
 	// SIGTERMed only cmd.exe on Windows (.cmd shims run shell:true), orphaning
@@ -2153,16 +2225,31 @@ export async function verifyToolBinary(
 	void useShell;
 
 	try {
-		const result = await safeSpawnAsync(execPath, ["--version"], {
+		const result = await safeSpawnAsync(execPath, verificationArgs, {
 			timeout: timeoutMs,
+			input: "",
+			// A broken or version-blind language server can emit a bundled
+			// megabytes-long diagnostic on stderr. Keep verification bounded even
+			// when the child reaches its normal timeout first.
+			maxOutputBytes: 64 * 1024,
+			matchWhileStreaming: lspTransportRequiredMatcher,
 		});
 		const output = `${result.stdout}\n${result.stderr}`;
+		if (result.outputTruncated) {
+			recordDegradationOnce({
+				kind: "installer-verification-output-truncated",
+				subject: binPath,
+				reason: `verification output exceeded 65536 bytes (${verificationArgs.join(" ")})`,
+			});
+		}
 		if (result.status === 0 && !result.error) {
-			debugLog(`Verified: ${binPath} (version: ${result.stdout.trim()})`);
+			debugLog(
+				`Verified: ${binPath} (${verificationArgs.join(" ")}: ${result.stdout.trim()})`,
+			);
 			onVersionOutput?.(result.stdout);
 			return true;
 		}
-		if (isLspTransportRequiredError(output)) {
+		if (result.streamingMatch || isLspTransportRequiredError(output)) {
 			// Valid stdio LSP server that rejects `--version` (#208) — the
 			// transport-required error proves the binary works.
 			debugLog(`Verified (stdio LSP, transport-required): ${binPath}`);
@@ -2171,8 +2258,15 @@ export async function verifyToolBinary(
 		// A kill (timeout fired) or spawn-boundary failure is a stall, not a
 		// verdict from the binary (#1569 transient semantics).
 		if (result.signal !== undefined || result.spawnFailure) onTransient?.();
+		const kind =
+			result.spawnFailure?.kind ??
+			(result.signal
+				? `killed-signal=${result.signal}`
+				: result.error
+					? "spawn-error"
+					: "exit-nonzero");
 		logSessionStart(
-			`auto-install verify: failed for ${binPath} (kind=${result.signal ? `killed-signal=${result.signal}` : result.error ? "spawn-error" : "exit-nonzero"}${result.status !== null ? `, exit=${result.status}` : ""})`,
+			`auto-install verify: failed for ${binPath} (check=${verificationArgs.join(" ")}, kind=${kind}${result.status !== null ? `, exit=${result.status}` : ""})`,
 		);
 		return false;
 	} catch (err) {
@@ -2271,7 +2365,12 @@ export async function getAllToolStatuses(): Promise<ToolStatus[]> {
 
 		// 2. Check npm global
 		if (tool.installStrategy === "npm") {
-			const npmPath = await findNpmGlobalToolPath(tool.binaryName || tool.id);
+			const npmPath = await findNpmGlobalToolPath(
+				tool.binaryName || tool.id,
+				undefined,
+				tool.checkArgs,
+				getToolVerificationTimeout(tool),
+			);
 			if (npmPath) {
 				status.installed = true;
 				status.source = "npm-global";
@@ -2283,7 +2382,12 @@ export async function getAllToolStatuses(): Promise<ToolStatus[]> {
 
 		// 3. Check pip user install
 		if (tool.installStrategy === "pip") {
-			const pipPath = await findPipUserToolPath(tool.binaryName || tool.id);
+			const pipPath = await findPipUserToolPath(
+				tool.binaryName || tool.id,
+				undefined,
+				tool.checkArgs,
+				getToolVerificationTimeout(tool),
+			);
 			if (pipPath) {
 				status.installed = true;
 				status.source = "pip-user";
@@ -2325,7 +2429,15 @@ export async function getAllToolStatuses(): Promise<ToolStatus[]> {
 			installerPlatform() === "win32" ? `${localBase}.cmd` : localBase;
 		try {
 			await fs.access(localPath);
-			if (await verifyToolBinary(localPath)) {
+			if (
+				await verifyToolBinary(
+					localPath,
+					undefined,
+					undefined,
+					getToolVerificationTimeout(tool),
+					tool.checkArgs,
+				)
+			) {
 				status.installed = true;
 				status.source = "pi-lens-auto";
 				status.path = localPath;
@@ -2515,7 +2627,15 @@ async function getToolPathResolved(
 		const cmdPath = `${localBase}.cmd`;
 		try {
 			await fs.access(cmdPath);
-			if (await verifyToolBinary(cmdPath, recordVersion, onTransient)) {
+			if (
+				await verifyToolBinary(
+					cmdPath,
+					recordVersion,
+					onTransient,
+					getToolVerificationTimeout(tool),
+					tool.checkArgs,
+				)
+			) {
 				return cmdPath;
 			}
 			logSessionStart(
@@ -2529,7 +2649,15 @@ async function getToolPathResolved(
 		const exePath = `${localBase}.exe`;
 		try {
 			await fs.access(exePath);
-			if (await verifyToolBinary(exePath, recordVersion, onTransient)) {
+			if (
+				await verifyToolBinary(
+					exePath,
+					recordVersion,
+					onTransient,
+					getToolVerificationTimeout(tool),
+					tool.checkArgs,
+				)
+			) {
 				return exePath;
 			}
 			logSessionStart(
@@ -2542,7 +2670,15 @@ async function getToolPathResolved(
 	if (installerPlatform() !== "win32") {
 		try {
 			await fs.access(localBase);
-			if (await verifyToolBinary(localBase, recordVersion, onTransient)) {
+			if (
+				await verifyToolBinary(
+					localBase,
+					recordVersion,
+					onTransient,
+					getToolVerificationTimeout(tool),
+					tool.checkArgs,
+				)
+			) {
 				return localBase;
 			}
 			logSessionStart(
@@ -2561,7 +2697,13 @@ async function getToolPathResolved(
 		const platformBin = resolvePlatformPackageBinary(tool);
 		if (
 			platformBin &&
-			(await verifyToolBinary(platformBin, undefined, onTransient))
+			(await verifyToolBinary(
+				platformBin,
+				undefined,
+				onTransient,
+				getToolVerificationTimeout(tool),
+				tool.checkArgs,
+			))
 		) {
 			logSessionStart(
 				`auto-install ${toolId}: resolved platform-package binary at ${platformBin}`,
@@ -2595,6 +2737,8 @@ async function getToolPathResolved(
 		const npmPath = await findNpmGlobalToolPath(
 			tool.binaryName || tool.id,
 			onTransient,
+			tool.checkArgs,
+			getToolVerificationTimeout(tool),
 		);
 		if (npmPath) {
 			return npmPath;
@@ -2606,6 +2750,8 @@ async function getToolPathResolved(
 		const pipPath = await findPipUserToolPath(
 			tool.binaryName || tool.id,
 			onTransient,
+			tool.checkArgs,
+			getToolVerificationTimeout(tool),
 		);
 		if (pipPath) {
 			return pipPath;
@@ -2637,6 +2783,22 @@ async function findGitHubToolPath(
 		}
 	}
 	return undefined;
+}
+
+/** Resolve a release-managed binary without probing PATH first. */
+export async function findManagedToolBinary(
+	toolId: string,
+): Promise<string | undefined> {
+	const tool = TOOLS.find((candidate) => candidate.id === toolId);
+	if (!tool) return undefined;
+	if (
+		tool.installStrategy !== "github" &&
+		tool.installStrategy !== "maven" &&
+		tool.installStrategy !== "archive"
+	) {
+		return undefined;
+	}
+	return findGitHubToolPath(tool.binaryName || tool.id);
 }
 
 function hasExecutableExtension(name: string): boolean {
@@ -2675,6 +2837,8 @@ function getArchiveBinaryCandidates(
 async function findNpmGlobalToolPath(
 	binaryName: string,
 	onTransient?: () => void,
+	verificationArgs: string[] = ["--version"],
+	verificationTimeoutMs = 10_000,
 ): Promise<string | undefined> {
 	const isWindows = process.platform === "win32";
 	const binDirs = await getNpmGlobalBinCandidates(onTransient);
@@ -2690,7 +2854,15 @@ async function findNpmGlobalToolPath(
 		for (const candidate of candidates) {
 			try {
 				await fs.access(candidate);
-				if (await verifyToolBinary(candidate, undefined, onTransient)) {
+				if (
+					await verifyToolBinary(
+						candidate,
+						undefined,
+						onTransient,
+						verificationTimeoutMs,
+						verificationArgs,
+					)
+				) {
 					return candidate;
 				}
 			} catch {
@@ -2738,6 +2910,8 @@ async function getNpmGlobalBinCandidates(
 async function findPipUserToolPath(
 	binaryName: string,
 	onTransient?: () => void,
+	verificationArgs: string[] = ["--version"],
+	verificationTimeoutMs = 10_000,
 ): Promise<string | undefined> {
 	const isWindows = process.platform === "win32";
 	const userBaseCandidates = await getPythonUserBaseCandidates();
@@ -2772,7 +2946,15 @@ async function findPipUserToolPath(
 			for (const candidate of candidates) {
 				try {
 					await fs.access(candidate);
-					if (await verifyToolBinary(candidate, undefined, onTransient)) {
+					if (
+						await verifyToolBinary(
+							candidate,
+							undefined,
+							onTransient,
+							verificationTimeoutMs,
+							verificationArgs,
+						)
+					) {
 						return candidate;
 					}
 				} catch {
@@ -3339,9 +3521,12 @@ export type ManagedToolStrategy = ToolDefinition["installStrategy"];
 export interface RefreshableManagedTool {
 	toolId: string;
 	strategy: ManagedToolStrategy;
+	checkArgs: string[];
 	packageName?: string;
 	/** npm only — what `installNpmTool` verifies after an install or update. */
 	binaryName?: string;
+	/** Registry-scoped ceiling for managed verification probes. */
+	verificationTimeoutMs?: number;
 	/**
 	 * The identity of what the tool's coordinate resolves to TODAY, when that
 	 * identity is knowable without a network call. `archive` and `maven` entries
@@ -3393,8 +3578,10 @@ export function getRefreshableManagedTools(): RefreshableManagedTool[] {
 				refreshable.push({
 					toolId: tool.id,
 					strategy: "npm",
+					checkArgs: tool.checkArgs,
 					packageName: tool.packageName,
 					binaryName: tool.binaryName,
+					verificationTimeoutMs: tool.verificationTimeoutMs,
 				});
 				break;
 			}
@@ -3404,13 +3591,18 @@ export function getRefreshableManagedTools(): RefreshableManagedTool[] {
 				refreshable.push({
 					toolId: tool.id,
 					strategy: tool.installStrategy,
+					checkArgs: tool.checkArgs,
 					packageName: tool.packageName,
 				});
 				break;
 			}
 			case "github": {
 				if (!tool.github) continue;
-				refreshable.push({ toolId: tool.id, strategy: "github" });
+				refreshable.push({
+					toolId: tool.id,
+					strategy: "github",
+					checkArgs: tool.checkArgs,
+				});
 				break;
 			}
 			case "maven": {
@@ -3418,6 +3610,7 @@ export function getRefreshableManagedTools(): RefreshableManagedTool[] {
 				refreshable.push({
 					toolId: tool.id,
 					strategy: "maven",
+					checkArgs: tool.checkArgs,
 					pinnedCoordinate: mavenCoordinate(tool.maven),
 				});
 				break;
@@ -3431,6 +3624,7 @@ export function getRefreshableManagedTools(): RefreshableManagedTool[] {
 				refreshable.push({
 					toolId: tool.id,
 					strategy: "archive",
+					checkArgs: tool.checkArgs,
 					pinnedCoordinate: url,
 				});
 				break;
@@ -3513,7 +3707,8 @@ async function probeManagedToolVersion(
 	if (!cached?.path || !existsSync(cached.path)) return undefined;
 	try {
 		const result = await safeSpawnAsync(cached.path, tool.checkArgs, {
-			timeout: 10_000,
+			timeout: getToolVerificationTimeout(tool),
+			input: "",
 			ignoreAmbientSignal: true,
 			resourceLabel: `tool-refresh-version:${tool.id}`,
 		});
@@ -3816,9 +4011,17 @@ async function verifyRefreshedArtifact(
 		await updateProbeCache(tool.id, installedPath);
 		return true;
 	}
-	if (!(await verifyToolBinary(installedPath))) {
+	if (
+		!(await verifyToolBinary(
+			installedPath,
+			undefined,
+			undefined,
+			getToolVerificationTimeout(tool),
+			tool.checkArgs,
+		))
+	) {
 		logSessionStart(
-			`managed-tool-refresh ${tool.id}: refreshed artifact at ${installedPath} failed its --version check`,
+			`managed-tool-refresh ${tool.id}: refreshed artifact at ${installedPath} failed its verification check`,
 		);
 		return false;
 	}
@@ -4350,6 +4553,8 @@ async function installArchiveTool(
 async function installNpmTool(
 	packageName: string,
 	binaryName: string,
+	verificationArgs: string[] = ["--version"],
+	verificationTimeoutMs = 10_000,
 ): Promise<string | undefined> {
 	try {
 		// Ensure tools directory exists
@@ -4455,9 +4660,15 @@ async function installNpmTool(
 		let lastAttemptTransient = false;
 		for (let attempt = 1; attempt <= 3; attempt++) {
 			lastAttemptTransient = false;
-			isValid = await verifyToolBinary(binPath, undefined, () => {
-				lastAttemptTransient = true;
-			});
+			isValid = await verifyToolBinary(
+				binPath,
+				undefined,
+				() => {
+					lastAttemptTransient = true;
+				},
+				verificationTimeoutMs,
+				verificationArgs,
+			);
 			if (isValid) break;
 			if (attempt < 3) {
 				logSessionStart(
@@ -4809,7 +5020,12 @@ export async function installTool(toolId: string): Promise<boolean> {
 		switch (tool.installStrategy) {
 			case "npm": {
 				if (!tool.packageName || !tool.binaryName) return false;
-				const npmPath = await installNpmTool(tool.packageName, tool.binaryName);
+				const npmPath = await installNpmTool(
+					tool.packageName,
+					tool.binaryName,
+					tool.checkArgs,
+					getToolVerificationTimeout(tool),
+				);
 				if (npmPath !== undefined) {
 					// #1746 review F4: an install just resolved this package's range
 					// against the registry, so record it as freshly checked. Otherwise a
@@ -5197,7 +5413,13 @@ async function ensureToolResolved(
 	try {
 		return await ensurePromise;
 	} finally {
-		ensureInFlight.delete(inFlightKey);
+		// Identity-guarded release (#1968's pattern): delete only if THIS run is
+		// still the registered one. A bare delete-by-key lets a late-settling run
+		// evict a live successor a second writer registered under the same key
+		// mid-flight, after which the next caller starts a duplicate ensure/install.
+		if (ensureInFlight.get(inFlightKey) === ensurePromise) {
+			ensureInFlight.delete(inFlightKey);
+		}
 	}
 }
 

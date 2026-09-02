@@ -29,7 +29,8 @@ import {
 	RunnerRegistry,
 	type RunnerResultSink,
 } from "./dispatcher.js";
-import { FactStore } from "./fact-store.js";
+import { recordDegradationOnce } from "../degradation-ledger.js";
+import { FactStore, setFactStoreEvictionReporter } from "./fact-store.js";
 import { TOOL_PLANS } from "./plan.js";
 import type {
 	DispatchResult,
@@ -107,8 +108,8 @@ import {
 	hasJavaBuildDescriptor,
 } from "../tool-policy.js";
 import {
-	removeWordIndexDocument,
-	updateWordIndexDocument,
+	removeWordIndexDocumentAsync,
+	updateWordIndexDocumentForEdit,
 	WORD_INDEX_MAX_BYTES,
 	type WordIndex,
 } from "../word-index.js";
@@ -180,11 +181,46 @@ export function applyProjectLensConfig(cwd: string): PiLensProjectConfig {
 	return loadPiLensProjectConfig(cwd);
 }
 
-const sessionFacts = new FactStore();
-const cascadeDiagnosticBaselines = new Map<
-	string,
-	import("./types.js").Diagnostic[]
->();
+// "dispatch" labels this store's eviction telemetry (#2243 review round 3,
+// F1) — five other production FactStore instances exist (mcp/analyze.ts,
+// lens-map.ts, project-diagnostics/scanner.ts, runtime-session.ts's
+// session-start call-graph task, mcp/cli.ts); a shared constant subject let
+// runtime-session's session-start review-graph walk consume the once-per-
+// session ledger slot before any dispatch ran, misattributing the record.
+const sessionFacts = new FactStore("dispatch");
+// #2243 item 4: wire the fact-store's capacity-eviction telemetry to the
+// ledger from HERE, not from fact-store.ts. fact-store stays an import leaf so
+// it cannot re-enter the safe-spawn ↔ degradation-ledger cycle (see
+// `setFactStoreEvictionReporter`). The reporter forwards each store's own
+// subject, so the ledger's per-kind+subject dedupe emits exactly ONE record
+// per session PER STORE, re-arming when the ledger resets at session_start.
+//
+// #2247 review F1: the axis was previously dropped here, so
+// `recordDegradationOnce`'s `${kind}\0${subject}` dedupe collapsed a store's
+// count-axis and byte-axis evictions onto the SAME key — whichever axis
+// tripped first (always count, since 1024 typical files land far under 64
+// MiB) silently consumed the once-per-session slot and a later byte-axis
+// eviction on that same store recorded nothing. Fold the axis into the
+// subject (`<store>:<axis>`), matching this ledger's own `<store>:<file>`
+// convention (see `demoted-finding-retired`'s doc comment) rather than
+// growing the `kind` union per axis. `pinned-over-budget` (#2247 review F2)
+// is a distinct condition, not an eviction, so it gets its own kind instead
+// of sharing the eviction kind's subject convention.
+setFactStoreEvictionReporter((subject, axis, reason) => {
+	if (axis === "pinned-over-budget") {
+		recordDegradationOnce({
+			kind: "fact-store-pinned-over-budget",
+			subject,
+			reason,
+		});
+		return;
+	}
+	recordDegradationOnce({
+		kind: "fact-store-capacity-eviction",
+		subject: `${subject}:${axis}`,
+		reason,
+	});
+});
 const sessionRunnerRegistry = new RunnerRegistry();
 registerDefaultRunners(sessionRunnerRegistry);
 const LSP_CAPABLE_KINDS = new Set<FileKind>(getLspCapableKinds());
@@ -232,31 +268,68 @@ function scheduleAstGrepWarningScan(
 	const existing = astGrepWarnDebounceTimers.get(filePath);
 	if (existing) clearTimeout(existing);
 
-	const timer = setTimeout(async () => {
+	const timer = setTimeout(() => {
 		astGrepWarnDebounceTimers.delete(filePath);
-		try {
-			const ctx = createDispatchContext(filePath, cwd, pi, sessionFacts, false);
-			if (ctx.kind !== "jsts") return;
-
-			// Single-runner group: ast-grep only, warning mode (blockingOnly=false)
-			const group: RunnerGroup = {
-				mode: "all",
-				runnerIds: ["ast-grep"],
-				filterKinds: ["jsts"],
-			};
-			const result = await dispatchForFile(ctx, [group], sessionRunnerRegistry);
-			if (result.diagnostics.length === 0) return;
-
-			const logger = getDiagnosticLogger();
-			for (const d of result.diagnostics) {
-				logger.logCaught(d, logContext, false);
-			}
-		} catch {
+		void runAstGrepWarningScan(filePath, cwd, pi, logContext).catch(() => {
 			// Non-critical background scan — swallow errors silently
-		}
+		});
 	}, AST_GREP_WARN_DEBOUNCE_MS);
 
 	astGrepWarnDebounceTimers.set(filePath, timer);
+}
+
+/**
+ * Run the debounced ast-grep warning scan for one jsts file.
+ *
+ * #2243 item 1: this is a dispatch entry point like dispatchLint*, so it must
+ * follow the same discipline. It fires ~2 s after the last write, and in that
+ * window the review-graph project walk (`buildOrUpdateGraph`) seeds facts for
+ * every file into the SAME `sessionFacts`, which can evict this file's
+ * `file.content`. `dispatcher.ts` reads that fact back with `?? ""` for inline
+ * suppressions, so a stale or evicted read silently stops applying
+ * `pi-lens-ignore`. Two guards, matching the other dispatch callers:
+ *   1. `beginDispatchFor` pins the file for the dispatch (released in the
+ *      finally), so a concurrent walk cannot evict it mid-dispatch. This
+ *      does NOT clear the file's existing facts the way `clearFileFactsFor`
+ *      does for the other dispatch callers (#2243 review round 3, F5): this
+ *      scan fires ~2s after the SAME edit's inline dispatch already
+ *      re-derived every fact for this file, so a second clear+re-derive
+ *      here bought nothing but ~51ms of redundant re-parsing across all
+ *      five providers (measured; a warm-cache read is ~1ms).
+ *   2. `runProviders` still re-derives `file.content` when it's actually
+ *      missing (a genuine miss — evicted, or never computed), so the read
+ *      never depends on staleness.
+ * `facts` is injected only for tests; production always uses `sessionFacts`.
+ */
+export async function runAstGrepWarningScan(
+	filePath: string,
+	cwd: string,
+	pi: PiAgentAPI,
+	logContext: LogContext,
+	facts: FactStore = sessionFacts,
+): Promise<void> {
+	const ctx = createDispatchContext(filePath, cwd, pi, facts, false);
+	if (ctx.kind !== "jsts") return;
+
+	facts.beginDispatchFor(ctx.filePath);
+	try {
+		// Single-runner group: ast-grep only, warning mode (blockingOnly=false)
+		const group: RunnerGroup = {
+			mode: "all",
+			runnerIds: ["ast-grep"],
+			filterKinds: ["jsts"],
+		};
+		await runProviders(ctx);
+		const result = await dispatchForFile(ctx, [group], sessionRunnerRegistry);
+		if (result.diagnostics.length === 0) return;
+
+		const logger = getDiagnosticLogger();
+		for (const d of result.diagnostics) {
+			logger.logCaught(d, logContext, false);
+		}
+	} finally {
+		facts.endDispatchFor(ctx.filePath);
+	}
 }
 
 function resetSessionSlopScore(): void {
@@ -443,7 +516,6 @@ export function resetDispatchBaselines(cwd?: string): void {
 	clearModuleGraphCache();
 	recentlyCleanNeighborCache.clear();
 	primaryFilesThisTurn.clear();
-	cascadeDiagnosticBaselines.clear();
 	cascadeSessionStats = {
 		runs: 0,
 		diagnosticsSurfaced: 0,
@@ -493,12 +565,19 @@ const recentlyCleanNeighborCache = new Map<
 >();
 
 /** O(1) entry count of this module's turn-bounded cache (#1123 item 2
- *  memory attribution) — a `Map.size` read, never iterated. */
+ *  memory attribution) — a `Map.size` read, never iterated.
+ *  `sessionFactEntries` (#2282) is the dispatch `FactStore`'s own
+ *  `sessionFacts` footprint: the fixed-vocabulary map (small, unbounded by
+ *  design) plus the bounded per-file map (capped at `MAX_SESSION_FACT_RECORDS`
+ *  — see `fact-store.ts`), so this number is now itself bounded rather than
+ *  invisible growth. */
 export function getDispatchCascadeCacheStats(): {
 	recentlyCleanNeighborCacheSize: number;
+	sessionFactEntries: number;
 } {
 	return {
 		recentlyCleanNeighborCacheSize: recentlyCleanNeighborCache.size,
+		sessionFactEntries: sessionFacts.getSessionFactEntryCount(),
 	};
 }
 const RECENTLY_CLEAN_TTL_TURNS = 5;
@@ -708,6 +787,11 @@ function setReverseDepsEntry(
 	entry: Omit<ReverseDepsCacheEntry, "lastUsedAt" | "idleTimer">,
 	armIdleTimer = true,
 ): void {
+	const previous = reverseDepsIndexCache.get(key);
+	if (previous?.idleTimer !== undefined) {
+		clearTimeout(previous.idleTimer);
+		previous.idleTimer = undefined;
+	}
 	const resident: ReverseDepsCacheEntry = { ...entry, lastUsedAt: Date.now() };
 	reverseDepsIndexCache.set(key, resident);
 	touchReverseDepsEntry(key, resident, armIdleTimer);
@@ -829,36 +913,47 @@ function isIgnoredCascadeNeighbor(filePath: string, cwd: string): boolean {
  *    debounced persist (never a synchronous write per edit — same #260
  *    discipline as the graph).
  *
- * Race safety against a build-in-progress: this function body is entirely
- * synchronous (no `await` anywhere in it) and is called synchronously at
- * `computeCascadeForFile`'s entry, before its own `await buildOrUpdateGraph`.
- * Node is single-threaded, so two overlapping cascades (#450's unawaited
- * concurrency) can never interleave mid-mutation here — each call runs to
- * completion in one turn. The only cross-build hazard is a full session-start
- * rebuild REPLACING `runtime.wordIndex` with a new object between the caller
- * reading `runtime.wordIndex` (in runtime-tool-result.ts, also synchronous)
- * and this function receiving it — in that case this call simply mutates
- * whichever index object it was handed (old or new), and the other one is
- * abandoned/superseded, never corrupted. No queue, no lock: the simplest rule
- * that is still provably correct.
+ * Race safety against a build-in-progress: the update runs cooperatively, on
+ * an 8 ms budget, through the word index's own per-index operation queue
+ * (#2067 AC4). It used to run synchronously here, on the reasoning that two
+ * overlapping cascades (#450's unawaited concurrency) could not interleave
+ * mid-mutation if nothing ever yielded — the reviewer's 300-document probe had
+ * lost 1,719 postings during an 8 ms yield. That hazard is what the queue
+ * closed: every async operation on one index is chained behind the previous
+ * one in call order, so overlapping cascades are ordered rather than
+ * interleaved, and the cooperative arena compactor is separately proof against
+ * a synchronous edit landing mid-copy (#2117 review F2). What the synchronous
+ * variant could not fix is its own cost: one replacement on a 2,600-document
+ * corpus held the event loop for the whole replacement, which is the block
+ * #2067 measured at 1.1 s before interning and still tens of ms after it.
+ *
+ * The only cross-build hazard is a full session-start rebuild REPLACING
+ * `runtime.wordIndex` with a new object between the caller reading
+ * `runtime.wordIndex` (in runtime-tool-result.ts, synchronous) and this
+ * function receiving it — in that case this call simply mutates whichever
+ * index object it was handed (old or new), and the other one is
+ * abandoned/superseded, never corrupted.
  */
-function updateWordIndexForCascade(args: {
+async function updateWordIndexForCascade(args: {
 	wordIndex?: WordIndex | null;
 	filePath: string;
 	content?: string;
 	onUpdated?: (index: WordIndex) => void;
 	dbg?: (msg: string) => void;
-}): void {
+}): Promise<void> {
 	const { wordIndex, filePath, content, onUpdated, dbg } = args;
 	if (!wordIndex || !wordIndex.forward) return;
 	if (content === undefined) return;
 
 	const byteLength = Buffer.byteLength(content, "utf-8");
 	if (byteLength > WORD_INDEX_MAX_BYTES) {
-		removeWordIndexDocument(wordIndex, filePath);
+		await removeWordIndexDocumentAsync(wordIndex, filePath);
 		dbg?.(`word-index per-edit: dropped ${filePath} (over size cap)`);
 	} else {
-		updateWordIndexDocument(wordIndex, { path: filePath, content });
+		await updateWordIndexDocumentForEdit(wordIndex, {
+			path: filePath,
+			content,
+		});
 		dbg?.(`word-index per-edit: updated ${filePath}`);
 	}
 	onUpdated?.(wordIndex);
@@ -977,7 +1072,7 @@ export async function computeCascadeForFile(
 		// The old hazard — this update silently orphaning a SECOND entry next to the
 		// walker's original-cased one — is now structurally impossible at the map
 		// layer, so this seam no longer has to hand-match the build path's key shape.
-		updateWordIndexForCascade({
+		await updateWordIndexForCascade({
 			wordIndex,
 			filePath: nodePath.resolve(filePath),
 			content: fileContent,
@@ -2312,12 +2407,10 @@ function applyCascadeDeltaBaselines(
 	return neighbors.map((neighbor) => {
 		const baselineKey = `session.baseline.cascade.${normalizeMapKey(neighbor.filePath)}`;
 		const previous =
-			cascadeDiagnosticBaselines.get(baselineKey) ??
-			sessionFacts.getSessionFact<import("./types.js").Diagnostic[]>(
+			sessionFacts.getBoundedSessionFact<import("./types.js").Diagnostic[]>(
 				baselineKey,
 			);
-		cascadeDiagnosticBaselines.set(baselineKey, [...neighbor.diagnostics]);
-		sessionFacts.setSessionFact(baselineKey, [...neighbor.diagnostics]);
+		sessionFacts.setBoundedSessionFact(baselineKey, [...neighbor.diagnostics]);
 		if (!previous) return neighbor;
 		const before = new Set(previous.map(diagnosticDeltaKey));
 		return {
@@ -2479,21 +2572,26 @@ export async function dispatchLint(
 		projectRoot,
 	);
 	sessionFacts.clearFileFactsFor(ctx.filePath);
+	// #2243 item 2: release the pin when the dispatch settles, so the pin set
+	// tracks in-flight dispatches rather than the last N files touched.
+	try {
+		const kind = ctx.kind;
+		if (!kind) return "";
 
-	const kind = ctx.kind;
-	if (!kind) return "";
+		const groups = withSpotbugsGroup(
+			kind,
+			getDispatchGroupsForKind(kind, pi),
+			ctx,
+		);
+		if (groups.length === 0) return "";
 
-	const groups = withSpotbugsGroup(
-		kind,
-		getDispatchGroupsForKind(kind, pi),
-		ctx,
-	);
-	if (groups.length === 0) return "";
-
-	await runProviders(ctx);
-	const result = await dispatchForFile(ctx, groups, sessionRunnerRegistry);
-	trackSessionSlopStats(ctx, result.diagnostics);
-	return result.output;
+		await runProviders(ctx);
+		const result = await dispatchForFile(ctx, groups, sessionRunnerRegistry);
+		trackSessionSlopStats(ctx, result.diagnostics);
+		return result.output;
+	} finally {
+		sessionFacts.endDispatchFor(ctx.filePath);
+	}
 }
 
 /**
@@ -2532,53 +2630,57 @@ export async function dispatchLintWithResult(
 		options?.telemetryProvider,
 	);
 	sessionFacts.clearFileFactsFor(ctx.filePath);
+	// #2243 item 2: release the pin when the dispatch settles.
+	try {
+		const kind = ctx.kind;
+		if (!kind) {
+			return {
+				diagnostics: [],
+				blockers: [],
+				warnings: [],
+				baselineWarningCount: 0,
+				fixed: [],
+				resolvedCount: 0,
+				output: "",
+				blockerOutput: "",
+				hasBlockers: false,
+			};
+		}
 
-	const kind = ctx.kind;
-	if (!kind) {
-		return {
-			diagnostics: [],
-			blockers: [],
-			warnings: [],
-			baselineWarningCount: 0,
-			fixed: [],
-			resolvedCount: 0,
-			output: "",
-			blockerOutput: "",
-			hasBlockers: false,
-		};
+		const groups = withSpotbugsGroup(
+			kind,
+			getDispatchGroupsForKind(kind, pi),
+			ctx,
+		);
+		if (groups.length === 0) {
+			return {
+				diagnostics: [],
+				blockers: [],
+				warnings: [],
+				baselineWarningCount: 0,
+				fixed: [],
+				resolvedCount: 0,
+				output: "",
+				blockerOutput: "",
+				hasBlockers: false,
+			};
+		}
+
+		await runProviders(ctx);
+		const result = await dispatchForFile(ctx, groups, sessionRunnerRegistry);
+		trackSessionSlopStats(ctx, result.diagnostics);
+
+		// Schedule debounced ast-grep warning scan for jsts files.
+		// Runs 2s after the last write — collapses rapid sequential edits into one scan.
+		// Results are logged only, never surfaced to the agent.
+		if (kind === "jsts" && logContext) {
+			scheduleAstGrepWarningScan(filePath, cwd, pi, logContext);
+		}
+
+		return result;
+	} finally {
+		sessionFacts.endDispatchFor(ctx.filePath);
 	}
-
-	const groups = withSpotbugsGroup(
-		kind,
-		getDispatchGroupsForKind(kind, pi),
-		ctx,
-	);
-	if (groups.length === 0) {
-		return {
-			diagnostics: [],
-			blockers: [],
-			warnings: [],
-			baselineWarningCount: 0,
-			fixed: [],
-			resolvedCount: 0,
-			output: "",
-			blockerOutput: "",
-			hasBlockers: false,
-		};
-	}
-
-	await runProviders(ctx);
-	const result = await dispatchForFile(ctx, groups, sessionRunnerRegistry);
-	trackSessionSlopStats(ctx, result.diagnostics);
-
-	// Schedule debounced ast-grep warning scan for jsts files.
-	// Runs 2s after the last write — collapses rapid sequential edits into one scan.
-	// Results are logged only, never surfaced to the agent.
-	if (kind === "jsts" && logContext) {
-		scheduleAstGrepWarningScan(filePath, cwd, pi, logContext);
-	}
-
-	return result;
 }
 
 /** Per-runner outcome captured while driving the real dispatch path. */
@@ -2628,32 +2730,36 @@ export async function dispatchLintDetailed(
 		options?.projectRoot,
 	);
 	sessionFacts.clearFileFactsFor(ctx.filePath);
+	// #2243 item 2: release the pin when the dispatch settles.
+	try {
+		const kind = ctx.kind;
+		if (!kind) return { result: empty, runners: [] };
 
-	const kind = ctx.kind;
-	if (!kind) return { result: empty, runners: [] };
+		const groups = withSpotbugsGroup(
+			kind,
+			getDispatchGroupsForKind(kind, pi),
+			ctx,
+		);
+		if (groups.length === 0) return { result: empty, runners: [] };
 
-	const groups = withSpotbugsGroup(
-		kind,
-		getDispatchGroupsForKind(kind, pi),
-		ctx,
-	);
-	if (groups.length === 0) return { result: empty, runners: [] };
+		const runners: RunnerOutcome[] = [];
+		const sink: RunnerResultSink = (runnerId, result) => {
+			runners.push({ runnerId, result });
+		};
 
-	const runners: RunnerOutcome[] = [];
-	const sink: RunnerResultSink = (runnerId, result) => {
-		runners.push({ runnerId, result });
-	};
+		await runProviders(ctx);
+		const result = await dispatchForFile(
+			ctx,
+			groups,
+			sessionRunnerRegistry,
+			sink,
+		);
+		trackSessionSlopStats(ctx, result.diagnostics);
 
-	await runProviders(ctx);
-	const result = await dispatchForFile(
-		ctx,
-		groups,
-		sessionRunnerRegistry,
-		sink,
-	);
-	trackSessionSlopStats(ctx, result.diagnostics);
-
-	return { result, runners };
+		return { result, runners };
+	} finally {
+		sessionFacts.endDispatchFor(ctx.filePath);
+	}
 }
 
 /**

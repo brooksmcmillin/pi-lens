@@ -10,12 +10,16 @@
 
 import { spawn as nodeSpawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { access, readFile } from "node:fs/promises";
+import { access, lstat, readFile } from "node:fs/promises";
 import * as os from "node:os";
 import { pathToFileURL } from "node:url";
 import { emitBounded } from "../bounded-telemetry.js";
 import { withTimeout } from "../deadline-utils.js";
-import { incrementDegradationCount } from "../degradation-ledger.js";
+import { minimatch } from "../deps/minimatch.js";
+import {
+	incrementDegradationCount,
+	recordDegradationOnce,
+} from "../degradation-ledger.js";
 import type { MessageConnection } from "../deps/vscode-jsonrpc.js";
 // vscode-jsonrpc v9 ships an `exports` map exposing the Node entry as the
 // `./node` subpath (no `.js`); the old `/node.js` file path no longer resolves.
@@ -27,11 +31,13 @@ import {
 } from "../deps/vscode-jsonrpc.js";
 import { logExtension } from "../extension-log.js";
 import { recordLspChild, removeLspChild } from "../instance-registry.js";
+import { workspaceDiagnosticsCacheSessionStart } from "./workspace-diagnostics-session.js";
 import { logLatency } from "../latency-logger.js";
 import {
 	type LspMutationContext,
 	newLspMutationCorrelationId,
 } from "../lsp-mutation.js";
+import { getProcessSingleton } from "../process-singletons.js";
 import { getAmbientAbortSignal } from "../safe-spawn.js";
 import { raceToCompletion } from "./aggregation.js";
 import {
@@ -213,7 +219,13 @@ export interface LSPOperationSupport {
 	documentSymbol: boolean;
 	workspaceSymbol: boolean;
 	codeAction: boolean;
+	/** `codeActionProvider.resolveProvider === true` at initialize. */
+	codeActionResolve: boolean;
 	rename: boolean;
+	/** `workspace.fileOperations.willRename` registration options at initialize. */
+	willRenameFiles: boolean;
+	/** #1971: `workspace.fileOperations.didRename` registration options at initialize. */
+	didRenameFiles: boolean;
 	implementation: boolean;
 	callHierarchy: boolean;
 }
@@ -252,6 +264,8 @@ export interface LSPCallHierarchyOutgoingCall {
 export interface LSPClientInfo {
 	serverId: string;
 	root: string;
+	/** Session cwd, distinct from the language-server project root. */
+	sessionCwd?: string;
 	connection: MessageConnection;
 	/** Check if the connection is still alive */
 	isAlive: () => boolean;
@@ -294,6 +308,15 @@ export interface LSPClientInfo {
 	 * capability-accessor pattern (`getRawCapabilityKeys`, `getLaunchVariant`).
 	 */
 	pingLiveness?: (timeoutMs?: number) => Promise<boolean>;
+	/**
+	 * #2358: the OS pid of the server's live process tree (the direct child;
+	 * on Windows a `cmd`/`.cmd` shim's pid, whose real descendant does the
+	 * work). The notify-stall breaker's liveness discriminator samples this
+	 * pid's CPU to tell a busy server from a dead input path before tearing it
+	 * down. Optional because test/mock clients model no real process — a
+	 * client without it keeps the pre-#2358 demote-at-budget behavior.
+	 */
+	getProcessPid?: () => number | undefined;
 	notify: {
 		open(
 			filePath: string,
@@ -393,6 +416,10 @@ export interface LSPClientInfo {
 	>;
 	/** Capability snapshot for navigation/edit operations */
 	getOperationSupport(): LSPOperationSupport;
+	/** File-operation registrations rejected during initialize parsing. */
+	getMalformedFileOperationRegistrations(): ReadonlySet<
+		"willRename" | "didRename"
+	>;
 	/** Commands the server advertised for workspace/executeCommand (the allowlist) */
 	getAdvertisedCommands(): string[];
 	/** Top-level keys of the raw ServerCapabilities advertised at initialize —
@@ -525,9 +552,34 @@ export interface LSPClientInfo {
 	shutdown(options?: LSPShutdownOptions): Promise<void>;
 }
 
+/**
+ * One document-notification queue entry. A queued entry has not started its
+ * transport write yet, so replacing it cannot leave the server with a partial
+ * protocol message. Once `run` starts, the entry is never replaced; a newer
+ * document state waits behind it and supersedes only the still-pending entry.
+ */
+interface PendingDocumentNotify {
+	run: (coalescedCount: number) => Promise<void>;
+	waiters: Array<{
+		resolve: () => void;
+		reject: (error: unknown) => void;
+	}>;
+	coalescedCount: number;
+}
+
+/**
+ * Per-file queue state. The map itself is per LSP client, so the key pair is
+ * effectively (client, normalized path). Different files retain independent
+ * queues and therefore retain the existing parallel-send behavior.
+ */
+interface DocumentNotifyQueue {
+	pending?: PendingDocumentNotify;
+	running: boolean;
+}
+
 // --- Constants ---
 
-const INITIALIZE_TIMEOUT_MS = positiveIntFromEnv(
+export const INITIALIZE_TIMEOUT_MS = positiveIntFromEnv(
 	"PI_LENS_LSP_INIT_TIMEOUT_MS",
 	15_000,
 ); // 15s — npx downloads are handled by ensureTool, not here
@@ -560,6 +612,11 @@ export const CLIENT_CAPABILITIES = {
 		workspaceFolders: true,
 		configuration: true,
 		didChangeWatchedFiles: { dynamicRegistration: true },
+		fileOperations: {
+			dynamicRegistration: false,
+			willRename: true,
+			didRename: true,
+		},
 	},
 	textDocument: {
 		synchronization: {
@@ -579,7 +636,27 @@ export const CLIENT_CAPABILITIES = {
 		implementation: { dynamicRegistration: false },
 		references: { dynamicRegistration: false },
 		documentSymbol: { dynamicRegistration: false },
-		codeAction: { dynamicRegistration: false },
+		codeAction: {
+			dynamicRegistration: false,
+			dataSupport: true,
+			resolveSupport: { properties: ["edit", "command"] },
+			// #1971 review: without literal support, LSP 3.17 constrains
+			// textDocument/codeAction responses to Command[] — resolve of an edit
+			// would then be protocol-invalid. We parse CodeAction objects.
+			codeActionLiteralSupport: {
+				codeActionKind: {
+					valueSet: [
+						"quickfix",
+						"refactor",
+						"refactor.extract",
+						"refactor.inline",
+						"refactor.rewrite",
+						"source",
+						"source.organizeImports",
+					],
+				},
+			},
+		},
 		rename: { dynamicRegistration: false },
 		publishDiagnostics: {
 			relatedInformation: true,
@@ -858,6 +935,8 @@ export interface LSPClientState {
 	 *  above; readers fold their input through `normalizeMapKey`. */
 	readonly diagnosticsVersionsByPath: Map<string, number>;
 	readonly documentVersions: Map<string, number>;
+	/** #2113/#2357: latest-pending same-path document sends; different paths stay parallel. */
+	readonly notifyChangeQueues: Map<string, DocumentNotifyQueue>;
 	/** The LSP document version (`publishDiagnostics.version`) the cached
 	 *  diagnostics for a path were computed against. Only set when the server
 	 *  reports a version; absent entries mean "version unknown" and are treated
@@ -873,11 +952,34 @@ export interface LSPClientState {
 	 *  ONLY when `syncKind` is Incremental — the one case that needs it, to
 	 *  compute the NEXT change's full-range replace against the document as the
 	 *  server last saw it (see `buildContentChanges`). Full/None servers never
-	 *  populate it, so the common case pays no extra retained memory. */
+	 *  populate it, so the common case pays no extra retained memory.
+	 *
+	 *  #2066: `lastLine` is where that same send's `scanSentContent` pass left
+	 *  the end of `text`, so the next change reads two numbers instead of
+	 *  re-walking (and re-splitting) the whole document for them. It travels
+	 *  with `text` and only with `text`: the eviction rewrite below drops both
+	 *  together, and a position describing text that is gone would be a lie. */
 	readonly documentContentHashes: Map<
 		string,
-		{ version: number; hash: string; text?: string }
+		{
+			version: number;
+			hash: string;
+			text?: string;
+			lastLine?: LastLinePosition;
+		}
 	>;
+	/** #2065: full Incremental-sync text is an LRU-like bounded subset of the
+	 * per-path content-binding map. The binding remains after text eviction. */
+	incrementalTextRetainedEntries?: number;
+	incrementalTextRetainedBytes?: number;
+	/** #2065 fix round 1 F5: insertion-ordered set of paths that currently bear
+	 * retained Incremental text, oldest first — a parallel index into
+	 * `documentContentHashes` so eviction can find the oldest text-bearing
+	 * entry in O(1) instead of spreading and scanning every path (including
+	 * already-stripped ones) on every didChange past the cap. Kept in lockstep
+	 * with `documentContentHashes`'s `text` field: added when text is
+	 * (re)written, removed when text is stripped or the path closes. */
+	incrementalTextBearingPaths?: Set<string>;
 	/** #1095: the content binding for the diagnostics currently stored for a path
 	 *  — {version, contentHash} of the document those diagnostics were computed
 	 *  against. Set only when the accepted publish carried a version; a version-
@@ -954,6 +1056,15 @@ export interface LSPClientState {
 	workspaceDiagnosticsSupport: LSPWorkspaceDiagnosticsSupport;
 	/** Mutable: upgraded by applyDynamicCapabilities after registerCapability events */
 	operationSupport: LSPOperationSupport;
+	/** #1971: parsed `FileOperationRegistrationOptions` filters from initialize —
+	 *  the server registered WHICH paths it cares about for willRename/didRename.
+	 *  Sends outside these filters are suppressed at this boundary. */
+	fileOperationFilters?: {
+		willRename?: LSPFileOperationFilter[];
+		didRename?: LSPFileOperationFilter[];
+	};
+	/** Static initialize-time distinction for capability-skip telemetry. */
+	fileOperationMalformedRegistrations?: Set<"willRename" | "didRename">;
 	/** Top-level keys of the raw ServerCapabilities from initialize (sorted) —
 	 *  captured once; the full advertised surface for diagnostics/documentation. */
 	rawCapabilityKeys?: string[];
@@ -1007,6 +1118,103 @@ export interface LSPClientState {
 	watchQueue: WatchedFilesQueue;
 }
 
+/** #2065: bound both the path count and UTF-16 heap represented by retained
+ * Incremental-sync text. The map keeps the newest sent paths when evicting. */
+export const MAX_INCREMENTAL_TEXT_RETAINED_ENTRIES = 128;
+export const MAX_INCREMENTAL_TEXT_RETAINED_BYTES = 64 * 1024 * 1024;
+
+/**
+ * #2065 fix round 1: a PROJECTION registry, not a second source of truth for
+ * "which clients are live" — its only job is letting `memory-sampler.ts`
+ * total retained-text bytes across clients without importing `LSPService`.
+ * Considered projecting straight off `LSPService.state.clients` (the
+ * manager's own client map, `clients/lsp/index.ts`) instead of keeping this
+ * Set at all, and rejected it for two reasons:
+ *   1. Import direction: `clients/lsp/index.ts` imports THIS file, not the
+ *      reverse, so reading `LSPService.state.clients` from here (or from
+ *      `memory-sampler.ts`, which every other snapshot in that module reaches
+ *      by importing the owning subsystem directly, e.g.
+ *      `getReviewGraphWorkspaceCacheSnapshot`, `getDispatchCascadeCacheStats`)
+ *      means importing the higher-level manager from the lower-level client
+ *      module — a layering inversion, not a cycle fix.
+ *   2. `LSPService.state.clients` is ITSELF only lazily reconciled against
+ *      real client death — a crashed client's slot is noticed and evicted on
+ *      the next `getClientForFile` attach, not at crash time (see
+ *      `markExitedIfUnset`'s docstring above). Projecting off it would not
+ *      give memory-sampler any more real-time accuracy than this Set; it
+ *      would just move the same "who deregisters, and when" question onto a
+ *      larger, higher-risk surface (the manager's routing map) for no gain.
+ *
+ * What makes this safe to keep as a second collection: it has exactly ONE
+ * lifecycle seam. `spawnClient` is the only writer that adds (below), and
+ * `disposeClientConnection` is the only writer that removes — and that
+ * function is itself the single convergence point every permanent-death path
+ * (`connection.onError`, `connection.onClose`, the process `exit` handler,
+ * and `clientShutdownOnce`'s `finally`) already funnels through, guarded by
+ * the same `connectionDisposed` idempotency flag that gates the connection
+ * teardown itself. Membership can therefore never drift from "has this
+ * client's connection been torn down" — there is nowhere else in the file
+ * that can flip a client from alive to permanently dead without going
+ * through `disposeClientConnection`.
+ *
+ * PROCESS-SCOPED, not module-scoped (#2130 criterion 2). This Set is what
+ * `memory_sample.subsystems.lsp.clients` counts, and a module-scope Set counted
+ * only the clients this MODULE EVALUATION spawned. pi evaluates the pi-lens
+ * graph up to nine times per process (#2146, measured `host_boot` = 9) and each
+ * evaluation builds its own `LSPService` and fleet (#2157 item 1), so a
+ * secondary root's servers — spawned by a later evaluation — were invisible to
+ * the sampler running in the first. That is the reported symptom exactly:
+ * `clients: 1` in `memory_sample` beside `lspChildCount: 2` in `instances.json`,
+ * with two tsservers alive. Sharing the Set through `getProcessSingleton` makes
+ * both the count and `roots` span every root the process serves.
+ *
+ * Both seams share it, which is the whole requirement: sharing only the add
+ * site would build a Set that never shrinks, a worse leak than the undercount.
+ */
+const ACTIVE_CLIENTS_FAMILY = "lsp-client.active-clients";
+/** Bump when the cell's shape changes. */
+const ACTIVE_CLIENTS_VERSION = 1;
+
+function activeLspClientSet(): Set<LSPClientState> {
+	return getProcessSingleton(
+		ACTIVE_CLIENTS_FAMILY,
+		ACTIVE_CLIENTS_VERSION,
+		() => new Set<LSPClientState>(),
+	);
+}
+
+export function getLspDocumentTextRetentionSnapshot(): {
+	clients: number;
+	entries: number;
+	bytes: number;
+	/**
+	 * #2130: how many DISTINCT project roots the live clients are spread
+	 * across. `clients` alone cannot answer "are two tsservers up because one
+	 * root needs two servers, or because this host is serving two roots" —
+	 * which is the exact question the multi-root host raised, and the reason a
+	 * `clients` count with no root discriminator is not enough to reconcile
+	 * `memory_sample` against `instances.json`'s `lspChildCount`.
+	 *
+	 * A COUNT, not a path list: this rides on a per-turn record, so it must
+	 * stay bounded (one small integer) no matter how many roots a host serves.
+	 * The paths themselves live in `instances.json`'s `projectRoots`.
+	 */
+	roots: number;
+} {
+	let entries = 0;
+	let bytes = 0;
+	const roots = new Set<string>();
+	const active = activeLspClientSet();
+	for (const state of active) {
+		entries += state.incrementalTextRetainedEntries ?? 0;
+		bytes += state.incrementalTextRetainedBytes ?? 0;
+		if (typeof state.root === "string" && state.root.length > 0) {
+			roots.add(state.root);
+		}
+	}
+	return { clients: active.size, entries, bytes, roots: roots.size };
+}
+
 function isClientAlive(state: LSPClientState): boolean {
 	return (
 		state.isConnected && !state.isDestroyed && !state.lspProcess.process.killed
@@ -1016,6 +1224,13 @@ function isClientAlive(state: LSPClientState): boolean {
 function disposeClientConnection(state: LSPClientState): void {
 	if (state.connectionDisposed) return;
 	state.connectionDisposed = true;
+	// #2065 fix round 1: this is the ONE place every permanent-death path
+	// converges (onError, onClose, the process 'exit' handler, and
+	// clientShutdownOnce's finally) — see setupConnectionLifecycle below and
+	// clientShutdownOnce. Deregistering here, guarded by the idempotency flag
+	// above, means a crash that never re-attaches still frees its retained
+	// text instead of pinning it for the rest of the process lifetime.
+	activeLspClientSet().delete(state);
 	try {
 		state.connection.dispose();
 	} catch {
@@ -1647,6 +1862,63 @@ function logTypeScriptPullSettle(
 	});
 }
 
+/** Where a document's last LSP-addressable line begins (#2066). */
+interface LastLinePosition {
+	/** Its 0-based line index. */
+	index: number;
+	/** Its first character's offset into the document. */
+	start: number;
+}
+
+interface SentContentScan {
+	/** `\n` count — `contentLineCount` is this + 1. */
+	lfNewlineCount: number;
+	lastLine: LastLinePosition;
+}
+
+/**
+ * #2066: the ONE full-document walk a send needs, replacing the two that used
+ * to run independently — a `charCodeAt` loop counting `\n` for the
+ * `lsp_document_send` line count, and a `.split(/\r\n|\r|\n/)` in
+ * `buildContentChanges` that materialized one substring per line to read the
+ * last one. The #1095 sha256 is a third walk and stays; it is native, and it
+ * is load-bearing.
+ *
+ * The two counts here are deliberately NOT the same number and must not be
+ * collapsed into one. `lfNewlineCount` counts `\n` only, because its consumer
+ * pairs against `diagnostic_past_eof`, whose gate counts LF BYTES
+ * (`clients/diagnostic-line-freshness.ts`); merging the conventions would put
+ * the two records one apart on exactly the mixed-ending documents the pairing
+ * exists to debug. `lastLine` uses the full LSP terminator set (`\r\n`, lone
+ * `\r`, `\n` — #1669 review F6), because a CRLF or classic-Mac document whose
+ * terminators went uncounted computes a range ending mid-document.
+ */
+function scanSentContent(content: string): SentContentScan {
+	let lfNewlineCount = 0;
+	let index = 0;
+	let start = 0;
+	// `charCodeAt`, not `codePointAt` (typescript:S7758, accepted): both are
+	// compared against 10/13, which no surrogate unit or astral code point can
+	// equal, so they are interchangeable here — but `codePointAt` measured 8%
+	// slower on a 400 KiB LF document (0.716 vs 0.663 ms/scan), because every
+	// ordinary character pays a surrogate-pair check this loop never uses.
+	for (let i = 0; i < content.length; i++) {
+		const code = content.charCodeAt(i);
+		if (code !== 10 && code !== 13) continue;
+		if (code === 10) {
+			lfNewlineCount++;
+		} else if (content.charCodeAt(i + 1) === 10) {
+			// `\r\n` is ONE line terminator, and still carries the `\n` the
+			// LF-only count wants.
+			lfNewlineCount++;
+			i++;
+		}
+		index++;
+		start = i + 1;
+	}
+	return { lfNewlineCount, lastLine: { index, start } };
+}
+
 /**
  * #1095: fingerprint the EXACT didOpen/didChange payload text at SEND time and
  * tag it with the document version it was sent as, so a later
@@ -1660,17 +1932,98 @@ function recordSentContent(
 	normalizedPath: string,
 	version: number,
 	content: string,
+	coalescedCount = 0,
 ): void {
+	const scan = scanSentContent(content);
+	const previous = state.documentContentHashes.get(normalizedPath);
+	if (previous && previous.version > version) {
+		incrementDegradationCount({
+			kind: "lsp-document-send-order",
+			subject: `${state.serverId}:${normalizedPath}`,
+			reason: `recorded version ${version} after newer version ${previous.version}`,
+		});
+		return;
+	}
+	if (previous?.text !== undefined) {
+		state.incrementalTextRetainedEntries = Math.max(
+			0,
+			(state.incrementalTextRetainedEntries ?? 1) - 1,
+		);
+		state.incrementalTextRetainedBytes = Math.max(
+			0,
+			(state.incrementalTextRetainedBytes ?? previous.text.length * 2) -
+				previous.text.length * 2,
+		);
+		// #2065 fix round 1 F5: the path is about to be rewritten below (and
+		// possibly re-marked text-bearing) — drop the stale membership first so
+		// the reinsert further down lands at the END of the recency order
+		// instead of leaving a duplicate-free but stale position.
+		state.incrementalTextBearingPaths?.delete(normalizedPath);
+	}
+	// #2065 fix round 1 F5: eviction recency now lives in
+	// `incrementalTextBearingPaths` (above/below), not this map's own
+	// insertion order — no remaining reader iterates `documentContentHashes`
+	// for order (every other site below is a keyed `.get`/`.delete`). The
+	// reinsert is kept anyway so a log or future debug dump that DOES walk
+	// this map in insertion order still reads "most recently sent last",
+	// matching the aux set it mirrors, rather than a stale mixed order.
+	state.documentContentHashes.delete(normalizedPath);
 	state.documentContentHashes.set(normalizedPath, {
 		version,
 		hash: hashDiagnosticContent(content),
 		// #1669: retain the full text only for Incremental — the sole reader
 		// (`buildContentChanges`) needs it to compute the NEXT change against
 		// what the server last saw; Full/None never read this field.
+		// #2066: `lastLine` is that reader's answer, already computed by the
+		// scan above — it rides along with the text it describes.
 		...(state.syncKind === TEXT_DOCUMENT_SYNC_KIND_INCREMENTAL && {
 			text: content,
+			lastLine: scan.lastLine,
 		}),
 	});
+	if (state.syncKind === TEXT_DOCUMENT_SYNC_KIND_INCREMENTAL) {
+		state.incrementalTextRetainedEntries =
+			(state.incrementalTextRetainedEntries ?? 0) + 1;
+		state.incrementalTextRetainedBytes =
+			(state.incrementalTextRetainedBytes ?? 0) + content.length * 2;
+		// #2065 fix round 1 F5: track membership in the same insertion (=
+		// recency) order as `documentContentHashes` itself, so eviction below
+		// never needs to spread and scan the full content-binding map —
+		// including paths whose text was already stripped — just to find the
+		// oldest text-bearing one.
+		if (!state.incrementalTextBearingPaths) {
+			state.incrementalTextBearingPaths = new Set();
+		}
+		state.incrementalTextBearingPaths.add(normalizedPath);
+		while (
+			(state.incrementalTextRetainedEntries ?? 0) >
+				MAX_INCREMENTAL_TEXT_RETAINED_ENTRIES ||
+			(state.incrementalTextRetainedBytes ?? 0) >
+				MAX_INCREMENTAL_TEXT_RETAINED_BYTES
+		) {
+			const oldestPath = state.incrementalTextBearingPaths
+				?.values()
+				.next().value;
+			if (oldestPath === undefined) break;
+			const binding = state.documentContentHashes.get(oldestPath);
+			state.incrementalTextBearingPaths.delete(oldestPath);
+			if (!binding || binding.text === undefined) continue;
+			// #2066: `lastLine` is dropped here with the text it describes. The
+			// #1095 version/hash binding is what must survive the strip.
+			state.documentContentHashes.set(oldestPath, {
+				version: binding.version,
+				hash: binding.hash,
+			});
+			state.incrementalTextRetainedEntries = Math.max(
+				0,
+				(state.incrementalTextRetainedEntries ?? 1) - 1,
+			);
+			state.incrementalTextRetainedBytes = Math.max(
+				0,
+				(state.incrementalTextRetainedBytes ?? 0) - binding.text.length * 2,
+			);
+		}
+	}
 	// #1641 criterion 3: the in-memory document's version + content length AT
 	// SEND TIME, so a later "diagnostic cited a line past current disk EOF"
 	// record (`diagnostic_past_eof`, clients/diagnostic-line-freshness.ts) can be
@@ -1682,13 +2035,9 @@ function recordSentContent(
 	// convention as the gate itself (newline count + 1 — a trailing `\n` adds
 	// one more, empty, addressable line; an empty document is still 1 line),
 	// or the two records disagree by one at exactly the boundary this counter
-	// exists to help debug. Counted directly (no `.split("\n")`, which
-	// allocates one substring per line — measured at 13.3ms/200k allocations
-	// on a 7MB send) since only the COUNT is needed here, not the lines.
-	let newlineCount = 0;
-	for (let i = 0; i < content.length; i++) {
-		if (content.charCodeAt(i) === 10) newlineCount++;
-	}
+	// exists to help debug. #2066: the count comes from `scanSentContent`
+	// above, which folded this loop into the walk `buildContentChanges` was
+	// already paying for; the LF-only convention is unchanged.
 	logLatency({
 		type: "phase",
 		phase: "lsp_document_send",
@@ -1697,7 +2046,8 @@ function recordSentContent(
 		metadata: {
 			version,
 			contentLength: content.length,
-			contentLineCount: newlineCount + 1,
+			contentLineCount: scan.lfNewlineCount + 1,
+			...(coalescedCount > 0 && { coalescedCount }),
 		},
 	});
 }
@@ -1738,23 +2088,24 @@ function buildContentChanges(
 	if (state.syncKind !== TEXT_DOCUMENT_SYNC_KIND_INCREMENTAL) {
 		return [{ text: content }];
 	}
-	const previousText = state.documentContentHashes.get(normalizedPath)?.text;
-	if (previousText === undefined) {
+	const previous = state.documentContentHashes.get(normalizedPath);
+	if (previous?.text === undefined) {
 		return [{ text: content }];
 	}
-	// #1669 review F6: split on every LSP line terminator (\r\n, lone \r, or
-	// \n), not just \n — a document using CRLF or lone-CR line endings would
-	// otherwise be undercounted, computing a range that ends mid-document
-	// instead of at the real last line.
-	const previousLines = previousText.split(/\r\n|\r|\n/);
-	const lastLine = previousLines.length - 1;
-	const lastLineText = previousLines[lastLine] ?? "";
+	const previousText = previous.text;
+	// #2066: `recordSentContent` scanned this exact text when it sent it, so
+	// read where it left the last line instead of walking (and splitting) the
+	// document a second time. An entry carrying text without that position was
+	// written by something else — resolve it through the SAME scanner, never a
+	// second convention that can drift from it.
+	const lastLine = previous.lastLine ?? scanSentContent(previousText).lastLine;
+	const lastLineText = previousText.slice(lastLine.start);
 	return [
 		{
 			range: {
 				start: { line: 0, character: 0 },
 				end: {
-					line: lastLine,
+					line: lastLine.index,
 					character: convertCharacterOffset(
 						state.positionEncoding,
 						lastLineText,
@@ -3437,13 +3788,14 @@ export function handleNotifyExternalChange(
 	state.watchQueue.enqueue(uri, type);
 }
 
-export async function handleNotifyOpen(
+async function handleNotifyOpenOnce(
 	state: LSPClientState,
 	filePath: string,
 	content: string,
 	languageId: string,
 	preserveDiagnostics = false,
 	silent = false,
+	coalescedCount = 0,
 ): Promise<void> {
 	if (!isClientAlive(state)) return;
 	const normalizedPath = normalizeMapKey(filePath);
@@ -3498,7 +3850,13 @@ export async function handleNotifyOpen(
 			// #1669 review F7: only mirror the send locally once it actually left
 			// the process — see safeSendNotification's doc comment.
 			if (reopenSent)
-				recordSentContent(state, normalizedPath, version, content);
+				recordSentContent(
+					state,
+					normalizedPath,
+					version,
+					content,
+					coalescedCount,
+				);
 			state.openDocuments.add(normalizedPath);
 			state.openDocumentUris?.set(normalizedPath, uri);
 			return;
@@ -3511,7 +3869,14 @@ export async function handleNotifyOpen(
 				contentChanges: buildContentChanges(state, normalizedPath, content),
 			},
 		);
-		if (changeSent) recordSentContent(state, normalizedPath, version, content);
+		if (changeSent)
+			recordSentContent(
+				state,
+				normalizedPath,
+				version,
+				content,
+				coalescedCount,
+			);
 		return;
 	}
 
@@ -3551,7 +3916,8 @@ export async function handleNotifyOpen(
 		"textDocument/didOpen",
 		{ textDocument: { uri, languageId, version: 0, text: content } },
 	);
-	if (openSent) recordSentContent(state, normalizedPath, 0, content);
+	if (openSent)
+		recordSentContent(state, normalizedPath, 0, content, coalescedCount);
 	state.pendingOpens.delete(normalizedPath);
 	state.openDocuments.add(normalizedPath);
 	state.closedDocuments?.delete(normalizedPath);
@@ -3578,13 +3944,106 @@ export async function handleNotifyOpen(
 	});
 }
 
-export async function handleNotifyChange(
+/**
+ * Replace only notifications that have not started a transport write. A
+ * microtask starts the first entry so a synchronous burst of callers installs
+ * one latest entry before any bytes are handed to vscode-jsonrpc. Once an
+ * entry starts, it runs to completion; LSP has no cancellation/acknowledgement
+ * for notifications, so dropping a started write could violate didOpen before
+ * didChange ordering or leave a partial message in the pipe.
+ */
+function enqueueDocumentNotify(
+	state: LSPClientState,
+	normalizedPath: string,
+	run: (coalescedCount: number) => Promise<void>,
+): Promise<void> {
+	let queue = state.notifyChangeQueues.get(normalizedPath);
+	if (!queue) {
+		queue = { running: false };
+		state.notifyChangeQueues.set(normalizedPath, queue);
+	}
+	return new Promise<void>((resolve, reject) => {
+		const previous = queue?.pending;
+		// Keep superseded callers attached to the replacement's completion. The
+		// notification is dropped, but callers such as the auxiliary backlog
+		// ledger must not observe completion before the newest content is sent.
+		const waiters = previous?.waiters ?? [];
+		waiters.push({ resolve, reject });
+		queue!.pending = {
+			run,
+			waiters,
+			coalescedCount: (previous?.coalescedCount ?? 0) + (previous ? 1 : 0),
+		};
+		if (queue!.running) return;
+		queue!.running = true;
+		// Let same-turn callers replace the unwritten entry before the runner
+		// invokes the transport. Different path queues still start independently.
+		void Promise.resolve().then(async () => {
+			try {
+				for (;;) {
+					const next = queue!.pending;
+					if (!next) break;
+					queue!.pending = undefined;
+					try {
+						await next.run(next.coalescedCount);
+						for (const waiter of next.waiters) waiter.resolve();
+					} catch (error) {
+						for (const waiter of next.waiters) waiter.reject(error);
+					}
+				}
+			} finally {
+				queue!.running = false;
+				if (
+					!queue!.pending &&
+					state.notifyChangeQueues.get(normalizedPath) === queue
+				) {
+					state.notifyChangeQueues.delete(normalizedPath);
+				}
+			}
+		});
+	});
+}
+
+/** Drop unwritten document notifications when a client is torn down. */
+function cancelDocumentNotifyQueues(state: LSPClientState): void {
+	for (const queue of state.notifyChangeQueues.values()) {
+		for (const waiter of queue.pending?.waiters ?? []) waiter.resolve();
+		queue.pending = undefined;
+	}
+	state.notifyChangeQueues.clear();
+}
+
+export function handleNotifyOpen(
 	state: LSPClientState,
 	filePath: string,
 	content: string,
+	languageId: string,
+	preserveDiagnostics = false,
+	silent = false,
+): Promise<void> {
+	if (!isClientAlive(state)) return Promise.resolve();
+	const normalizedPath = normalizeMapKey(filePath);
+	return enqueueDocumentNotify(state, normalizedPath, (coalescedCount) =>
+		handleNotifyOpenOnce(
+			state,
+			filePath,
+			content,
+			languageId,
+			preserveDiagnostics,
+			silent,
+			coalescedCount,
+		),
+	);
+}
+
+async function handleNotifyChangeOnce(
+	state: LSPClientState,
+	filePath: string,
+	content: string,
+	normalizedPath: string,
+	coalescedCount = 0,
 ): Promise<void> {
 	if (!isClientAlive(state)) return;
-	const normalizedPath = normalizeMapKey(filePath);
 	const uri =
 		state.openDocumentUris?.get(normalizedPath) ?? pathToFileURL(filePath).href;
 
@@ -3606,7 +4065,8 @@ export async function handleNotifyChange(
 		state.documentVersions.set(normalizedPath, 0);
 		state.documentOpenedAt.set(normalizedPath, Date.now());
 		state.diagnosticPublicationCounts.set(normalizedPath, 0);
-		if (fallbackOpenSent) recordSentContent(state, normalizedPath, 0, content);
+		if (fallbackOpenSent)
+			recordSentContent(state, normalizedPath, 0, content, coalescedCount);
 		state.openDocuments.add(normalizedPath);
 		state.openDocumentUris?.set(normalizedPath, uri);
 		return;
@@ -3625,7 +4085,31 @@ export async function handleNotifyChange(
 			contentChanges: buildContentChanges(state, normalizedPath, content),
 		},
 	);
-	if (changeSent) recordSentContent(state, normalizedPath, version, content);
+	if (changeSent)
+		recordSentContent(state, normalizedPath, version, content, coalescedCount);
+}
+
+/**
+ * #2113: serialize the read/build/send/record transaction per document. The
+ * content-change payload must be built against the content recorded by the
+ * preceding send for this path; unrelated paths retain parallel sends.
+ */
+export function handleNotifyChange(
+	state: LSPClientState,
+	filePath: string,
+	content: string,
+): Promise<void> {
+	if (!isClientAlive(state)) return Promise.resolve();
+	const normalizedPath = normalizeMapKey(filePath);
+	return enqueueDocumentNotify(state, normalizedPath, (coalescedCount) =>
+		handleNotifyChangeOnce(
+			state,
+			filePath,
+			content,
+			normalizedPath,
+			coalescedCount,
+		),
+	);
 }
 
 /** Close a document through the same lifecycle path exposed by the client. */
@@ -3654,7 +4138,50 @@ export async function closeDocument(
 	// harmless and cheap) — mirror openDocuments' own per-close cleanup so it
 	// doesn't grow unbounded across a long session's worth of open/close churn.
 	state.projectIdentityProbedFiles?.delete(normalizedPath);
+	const retained = state.documentContentHashes.get(normalizedPath);
+	if (retained?.text !== undefined) {
+		state.incrementalTextRetainedEntries = Math.max(
+			0,
+			(state.incrementalTextRetainedEntries ?? 1) - 1,
+		);
+		state.incrementalTextRetainedBytes = Math.max(
+			0,
+			(state.incrementalTextRetainedBytes ?? retained.text.length * 2) -
+				retained.text.length * 2,
+		);
+		// #2065 fix round 2 N1: `recordSentContent` and the eviction loop both
+		// delete from `incrementalTextBearingPaths` when they strip a path's
+		// text, but neither runs on close — this was the missing third writer.
+		// Without it, a closed path's membership in the aux set survives
+		// forever: below the 128-entry/64 MiB cap the eviction loop that would
+		// otherwise clean it up never runs at all, so the set grows by one
+		// stale entry per open/close cycle with nothing ever draining it — the
+		// exact unbounded-per-path-store class #2065 exists to close, just
+		// moved into the aux index instead of the byte-retention count itself.
+		state.incrementalTextBearingPaths?.delete(normalizedPath);
+	}
+	// Keep the hash/version binding only while the document is open; the full
+	// text is needed for the next edit, never after didClose (#2065).
+	state.documentContentHashes.delete(normalizedPath);
 	clearDiagnosticsForPath(state, normalizedPath);
+	// #2065 fix round 2 (reverts fix round 1 F4): `pullGenerations` is the
+	// eighth per-path map in this family, but it is deliberately NOT cleared
+	// here — the same reasoning `clearDiagnosticsForPath` already documents
+	// above for `pullRequestSequences` applies to this counter too, and fix
+	// round 1's F4 missed it. `pullGenerationFor` defaults a missing entry to
+	// `0`, so deleting the entry on close resets the counter. A pull already
+	// in flight before the close captured its generation BEFORE this close's
+	// `clearDiagnosticsForPath` bump above ran. If the document is closed and
+	// reopened before that in-flight pull's write lands, deleting the entry
+	// here would let the counter read back as `0` again — the exact value the
+	// stale write's stale captured generation equals — so the write-time
+	// `!== generation` check at its call site would wrongly accept a stale
+	// answer computed against the pre-close content. Leaving the counter
+	// monotonic and un-reset keeps every pre-close capture permanently
+	// distinguishable from whatever the counter reads afterward, no matter how
+	// many closes or reopens happen in between. The cost is one integer per
+	// path that outlives the document's open lifetime — negligible next to
+	// correctness here.
 }
 
 /**
@@ -3744,6 +4271,9 @@ async function clientShutdownOnce(
 	state.pendingOpens.clear();
 	state.openDocuments.clear();
 	state.openDocumentUris?.clear();
+	// #2357: superseded notifications that have not started writing are moot
+	// once this client is dead; resolve their callers and release the queue.
+	cancelDocumentNotifyQueues(state);
 	// #1412 L1: mirror openDocuments' clear — a shut-down/evicted client's
 	// probe memo is moot along with everything else document-scoped.
 	state.projectIdentityProbedFiles?.clear();
@@ -3808,6 +4338,9 @@ async function clientShutdownOnce(
 			}
 		}
 	} finally {
+		// #2065 fix round 1: deregistration now lives in disposeClientConnection
+		// itself (the convergence point for every crash/dispose path, not just
+		// this graceful one) — see its comment.
 		disposeClientConnection(state);
 		const pid = state.lspProcess.pid;
 		logLatency({
@@ -4445,6 +4978,14 @@ async function resolveCodeActionBestEffort(
 			),
 		};
 	}
+	if (!state.operationSupport.codeActionResolve) {
+		recordDegradationOnce({
+			kind: "lsp-capability-skip",
+			subject: `${state.serverId}:codeAction/resolve`,
+			reason: "server did not advertise codeActionProvider.resolveProvider",
+		});
+		return action;
+	}
 	let resolved: LSPCodeAction | null | undefined;
 	try {
 		resolved = await withTimeout(
@@ -4479,6 +5020,8 @@ export async function createLSPClient(options: {
 	serverId: string;
 	process: LSPProcess;
 	root: string;
+	/** Session cwd, distinct from the language-server project root. */
+	sessionCwd?: string;
 	initialization?: Record<string, unknown>;
 	initializeTimeoutMs?: number;
 	/** See `LSPServerInfo.spawn`'s `launchVariant` (server.ts) — which concrete
@@ -4493,6 +5036,7 @@ export async function createLSPClient(options: {
 		serverId,
 		process: lspProcess,
 		root,
+		sessionCwd,
 		initialization,
 		initializeTimeoutMs = INITIALIZE_TIMEOUT_MS,
 		launchVariant,
@@ -4510,6 +5054,13 @@ export async function createLSPClient(options: {
 		serverId,
 		command: lspProcess.command,
 		marker: extractSpawnMarker(lspProcess.args),
+		sessionIdentity: {
+			projectRoot: sessionCwd ?? process.cwd(),
+			rootSource: sessionCwd ? "service-cwd" : "lsp-fallback",
+			startedAt: new Date(
+				workspaceDiagnosticsCacheSessionStart(),
+			).toISOString(),
+		},
 	}).catch((err) => {
 		// best-effort observability — never fail LSP startup over this
 		logLatency({
@@ -4657,8 +5208,12 @@ export async function createLSPClient(options: {
 		diagnosticsVersion: 0,
 		diagnosticsVersionsByPath: new Map(),
 		documentVersions: new Map(),
+		notifyChangeQueues: new Map(),
 		diagnosticDocVersions: new Map(),
 		documentContentHashes: new Map(),
+		incrementalTextRetainedEntries: 0,
+		incrementalTextBearingPaths: new Set(),
+		incrementalTextRetainedBytes: 0,
 		diagnosticBindings: new Map(),
 		pullResultIds: new Map(),
 		documentPullDiagnosticsBySource: new Map(),
@@ -4691,6 +5246,7 @@ export async function createLSPClient(options: {
 		// SAFETY: state construction completes before the flush closure can run.
 		watchQueue: undefined as unknown as WatchedFilesQueue,
 	};
+	activeLspClientSet().add(state);
 
 	// #271: batch per-file workspace/didChangeWatchedFiles into one notification
 	// per debounce window, so an N-file turn re-indexes the server once, not N×.
@@ -4809,6 +5365,35 @@ export async function createLSPClient(options: {
 	state.workspaceDiagnosticsSupport =
 		detectWorkspaceDiagnosticsSupport(initResult);
 	state.operationSupport = detectOperationSupport(initResult);
+	const capabilities = ((initResult as { capabilities?: unknown })
+		?.capabilities ?? {}) as Record<string, unknown>;
+	const workspace = isCapabilityRecord(capabilities.workspace)
+		? capabilities.workspace
+		: undefined;
+	const fileOperations = isCapabilityRecord(workspace)
+		? workspace.fileOperations
+		: undefined;
+	const malformedFileOperationRegistrations = new Set<
+		"willRename" | "didRename"
+	>();
+	if (isCapabilityRecord(fileOperations)) {
+		for (const operation of ["willRename", "didRename"] as const) {
+			if (
+				fileOperations[operation] !== undefined &&
+				parseFileOperationFilters(fileOperations[operation]) === undefined
+			) {
+				malformedFileOperationRegistrations.add(operation);
+			}
+		}
+	}
+	state.fileOperationMalformedRegistrations =
+		malformedFileOperationRegistrations;
+	if (isCapabilityRecord(fileOperations)) {
+		state.fileOperationFilters = {
+			willRename: parseFileOperationFilters(fileOperations.willRename),
+			didRename: parseFileOperationFilters(fileOperations.didRename),
+		};
+	}
 	state.positionEncoding = negotiatePositionEncoding(
 		(initResult as { capabilities?: unknown })?.capabilities,
 	);
@@ -4861,6 +5446,9 @@ export async function createLSPClient(options: {
 
 		/** #1277: cheap request round-trip proving the server still responds. */
 		pingLiveness: (timeoutMs?: number) => clientPingLiveness(state, timeoutMs),
+
+		/** #2358: the OS pid of the live server process (see interface doc). */
+		getProcessPid: () => lspProcess.pid,
 
 		notify: {
 			async open(filePath, content, languageId, preserveDiagnostics, silent) {
@@ -4959,6 +5547,10 @@ export async function createLSPClient(options: {
 
 		getOperationSupport() {
 			return state.operationSupport;
+		},
+
+		getMalformedFileOperationRegistrations() {
+			return state.fileOperationMalformedRegistrations ?? new Set();
 		},
 
 		getAdvertisedCommands() {
@@ -5165,14 +5757,36 @@ export async function createLSPClient(options: {
 		closeDocument: (filePath) => closeDocument(state, filePath),
 
 		async willRenameFiles(oldFilePath, newFilePath) {
+			if (!isClientAlive(state)) return null;
+			// #1971 review: the server registered WHICH paths it cares about.
+			// Sending outside those filters asks a question the server never
+			// signed up to answer.
+			const oldUri = pathToFileURL(oldFilePath).href;
+			const newUri = pathToFileURL(newFilePath).href;
+			if (
+				!(await fileOperationFiltersMatch(
+					state.fileOperationFilters?.willRename,
+					oldUri,
+					newUri,
+					oldFilePath,
+					newFilePath,
+				))
+			) {
+				recordDegradationOnce({
+					kind: "lsp-capability-skip",
+					subject: `${state.serverId}:workspace/willRenameFiles:filter`,
+					reason: "filter-mismatch",
+				});
+				return null;
+			}
 			const result = await navRequest<LSPWorkspaceEdit>(
 				state,
 				"workspace/willRenameFiles",
 				{
 					files: [
 						{
-							oldUri: pathToFileURL(oldFilePath).href,
-							newUri: pathToFileURL(newFilePath).href,
+							oldUri,
+							newUri,
 						},
 					],
 				},
@@ -5182,11 +5796,36 @@ export async function createLSPClient(options: {
 
 		async didRenameFiles(oldFilePath, newFilePath, oldUri, newUri) {
 			if (!isClientAlive(state)) return;
+			// `fileOperationFilters.didRename` is parsed by the same predicate that
+			// derives operationSupport.didRenameFiles (see
+			// isFileOperationRegistrationOptions). Thus filters undefined iff the
+			// capability is absent; the service-level gate remains the enforcement
+			// point for aggregated dispatch.
+			// #1971 review: same registration-filter discipline as willRename —
+			// the server only signed up to hear about matching paths.
+			const wireOldUri = oldUri ?? pathToFileURL(oldFilePath).href;
+			const wireNewUri = newUri ?? pathToFileURL(newFilePath).href;
+			if (
+				!(await fileOperationFiltersMatch(
+					state.fileOperationFilters?.didRename,
+					wireOldUri,
+					wireNewUri,
+					oldFilePath,
+					newFilePath,
+				))
+			) {
+				recordDegradationOnce({
+					kind: "lsp-capability-skip",
+					subject: `${state.serverId}:workspace/didRenameFiles:filter`,
+					reason: "filter-mismatch",
+				});
+				return;
+			}
 			await safeSendNotification(state.connection, "workspace/didRenameFiles", {
 				files: [
 					{
-						oldUri: oldUri ?? pathToFileURL(oldFilePath).href,
-						newUri: newUri ?? pathToFileURL(newFilePath).href,
+						oldUri: wireOldUri,
+						newUri: wireNewUri,
 					},
 				],
 			});
@@ -5467,8 +6106,13 @@ function detectOperationSupport(initResult: unknown): LSPOperationSupport {
 		const value = capabilities?.[key];
 		if (value === undefined || value === null) return false;
 		if (typeof value === "boolean") return value;
-		return true;
+		return isCapabilityRecord(value);
 	};
+	const codeActionProvider = capabilities?.codeActionProvider;
+	const workspace = capabilities?.workspace;
+	const fileOperations = isCapabilityRecord(workspace)
+		? workspace.fileOperations
+		: undefined;
 
 	return {
 		definition: hasProvider("definitionProvider"),
@@ -5480,8 +6124,162 @@ function detectOperationSupport(initResult: unknown): LSPOperationSupport {
 		documentSymbol: hasProvider("documentSymbolProvider"),
 		workspaceSymbol: hasProvider("workspaceSymbolProvider"),
 		codeAction: hasProvider("codeActionProvider"),
+		codeActionResolve:
+			isCapabilityRecord(codeActionProvider) &&
+			codeActionProvider.resolveProvider === true,
 		rename: hasProvider("renameProvider"),
+		willRenameFiles:
+			isCapabilityRecord(fileOperations) &&
+			isFileOperationRegistrationOptions(fileOperations.willRename),
+		didRenameFiles:
+			isCapabilityRecord(fileOperations) &&
+			isFileOperationRegistrationOptions(fileOperations.didRename),
 		implementation: hasProvider("implementationProvider"),
 		callHierarchy: hasProvider("callHierarchyProvider"),
 	};
+}
+
+function isCapabilityRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isFileOperationRegistrationOptions(value: unknown): boolean {
+	return parseFileOperationFilters(value) !== undefined;
+}
+
+/** One parsed `FileOperationFilter` from a registration-options object. */
+export interface LSPFileOperationFilter {
+	scheme: string | undefined;
+	glob: string;
+	matches: "file" | "folder" | undefined;
+	ignoreCase: boolean;
+}
+
+/**
+ * Parse the filters of a `FileOperationRegistrationOptions` object. Returns
+ * `undefined` when the options are absent or malformed — callers treat that as
+ * "no interest declared" and fail closed, never sending the operation.
+ */
+function parseFileOperationFilters(
+	value: unknown,
+): LSPFileOperationFilter[] | undefined {
+	if (!isCapabilityRecord(value) || !Array.isArray(value.filters)) {
+		return undefined;
+	}
+	const filters: LSPFileOperationFilter[] = [];
+	for (const entry of value.filters) {
+		if (!isCapabilityRecord(entry)) return undefined;
+		const pattern = entry.pattern;
+		if (
+			!isCapabilityRecord(pattern) ||
+			typeof pattern.glob !== "string" ||
+			pattern.glob.trim() === ""
+		) {
+			return undefined;
+		}
+		if (
+			entry.scheme !== undefined &&
+			(typeof entry.scheme !== "string" ||
+				entry.scheme.trim() === "" ||
+				!/^[A-Za-z][A-Za-z0-9+.-]*$/.test(entry.scheme))
+		) {
+			return undefined;
+		}
+		const matches = pattern.matches;
+		if (matches !== undefined && matches !== "file" && matches !== "folder") {
+			return undefined;
+		}
+		if (pattern.options !== undefined && !isCapabilityRecord(pattern.options)) {
+			return undefined;
+		}
+		const options = isCapabilityRecord(pattern.options)
+			? pattern.options
+			: undefined;
+		if (
+			options?.ignoreCase !== undefined &&
+			typeof options.ignoreCase !== "boolean"
+		) {
+			return undefined;
+		}
+		filters.push({
+			scheme: entry.scheme?.toLowerCase(),
+			glob: pattern.glob,
+			matches: matches === "file" || matches === "folder" ? matches : undefined,
+			ignoreCase: options?.ignoreCase === true,
+		});
+	}
+	return filters;
+}
+
+/**
+ * Whether ANY parsed filter expresses interest in either path of a rename.
+ * Conservative by design: unsupported URI schemes, an unresolved explicit
+ * file/folder kind, malformed URIs, and zero filters all match nothing.
+ */
+async function fileOperationFiltersMatch(
+	filters: LSPFileOperationFilter[] | undefined,
+	oldUri: string,
+	newUri: string,
+	oldFilePath: string,
+	newFilePath: string,
+): Promise<boolean> {
+	if (!filters || filters.length === 0) return false;
+	const candidates = [oldUri, newUri].flatMap(fileOperationUriCandidates);
+	const entityKind = filters.some((filter) => filter.matches !== undefined)
+		? await probeRenameEntityKind(oldFilePath, newFilePath)
+		: undefined;
+	for (const filter of filters) {
+		if (filter.scheme !== undefined && filter.scheme !== "file") continue;
+		if (filter.matches !== undefined && filter.matches !== entityKind) continue;
+		for (const candidate of candidates) {
+			try {
+				if (
+					minimatch(candidate, filter.glob, {
+						nocase: filter.ignoreCase,
+						dot: true,
+					})
+				) {
+					return true;
+				}
+			} catch {
+				// Malformed glob implementations must never widen server fan-out.
+			}
+		}
+	}
+	return false;
+}
+
+function fileOperationUriCandidates(uri: string): string[] {
+	let parsed: URL;
+	try {
+		parsed = new URL(uri);
+	} catch {
+		return [];
+	}
+	// pi-lens performs local filesystem renames only. Even when a caller supplies
+	// preserved URI spelling, another scheme cannot describe that operation.
+	if (parsed.protocol.toLowerCase() !== "file:") return [];
+	let uriPath: string;
+	try {
+		uriPath = decodeURIComponent(parsed.pathname).replace(/\\/g, "/");
+	} catch {
+		return [];
+	}
+	return [uriPath];
+}
+
+async function probeRenameEntityKind(
+	oldFilePath: string,
+	newFilePath: string,
+): Promise<"file" | "folder" | undefined> {
+	for (const filePath of [oldFilePath, newFilePath]) {
+		try {
+			const info = await lstat(filePath);
+			return info.isDirectory() ? "folder" : "file";
+		} catch {
+			// Before the rename the old path normally exists; after it, the new path
+			// does. Probe both instead of deriving behavior from the host OS.
+		}
+	}
+	return undefined;
 }

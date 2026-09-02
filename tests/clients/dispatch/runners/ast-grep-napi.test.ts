@@ -7,20 +7,39 @@ import {
 } from "../../../support/runner-ctx.js";
 import { setupTestEnvironment } from "../../test-utils.js";
 
-const { mockAuxiliaryLspAlive, mockResolveAstGrepNativeExe } = vi.hoisted(
-	() => ({
-		mockAuxiliaryLspAlive: vi.fn().mockResolvedValue(false),
-		mockResolveAstGrepNativeExe: vi.fn().mockReturnValue(undefined),
-	}),
-);
+const { mockAuxiliaryLspPublished, fsSyncOverrides } = vi.hoisted(() => ({
+	mockAuxiliaryLspPublished: vi.fn().mockResolvedValue(false),
+	// #2324 R3-B: `vi.spyOn` cannot redefine a `node:fs` ESM namespace export
+	// ("Module namespace is not configurable"). Route `statSync`/`readFileSync`
+	// through an overridable indirection instead — real `node:fs` by default
+	// for every OTHER test in this file, throwing only when a test sets its
+	// own override, always reset to undefined afterward.
+	fsSyncOverrides: {
+		statSync: undefined as ((...args: unknown[]) => unknown) | undefined,
+		readFileSync: undefined as ((...args: unknown[]) => unknown) | undefined,
+	},
+}));
 
 vi.mock("../../../../clients/lsp/index.js", () => ({
-	isAuxiliaryLspAlive: mockAuxiliaryLspAlive,
+	hasAuxiliaryLspPublishedForRoot: mockAuxiliaryLspPublished,
 }));
 
-vi.mock("../../../../clients/lsp/wait-policy/index.js", () => ({
-	resolveAstGrepNativeExe: mockResolveAstGrepNativeExe,
-}));
+vi.mock("node:fs", async () => {
+	const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+	return {
+		...actual,
+		statSync: (...args: unknown[]) =>
+			fsSyncOverrides.statSync
+				? fsSyncOverrides.statSync(...args)
+				: // biome-ignore lint/suspicious/noExplicitAny: node:fs overload set
+					(actual.statSync as any)(...args),
+		readFileSync: (...args: unknown[]) =>
+			fsSyncOverrides.readFileSync
+				? fsSyncOverrides.readFileSync(...args)
+				: // biome-ignore lint/suspicious/noExplicitAny: node:fs overload set
+					(actual.readFileSync as any)(...args),
+	};
+});
 
 // Mock heavy dependencies before importing the runner
 vi.mock("../../../../clients/tool-policy.js", () => ({
@@ -66,29 +85,31 @@ function mockWorkingSgLoad(): void {
 				}),
 			}),
 		},
+		// #2324 R2-B: declared but undefined, matching an addon build that
+		// dropped a grammar (#2215) — `getLang` must read this as "no parser
+		// for html", not throw on an undeclared mock export.
+		html: undefined,
 	}));
 }
 
 describe("ast-grep-napi runner — LSP supersede gate (#239 Phase 2)", () => {
 	beforeEach(() => {
 		vi.resetModules();
-		mockAuxiliaryLspAlive.mockResolvedValue(false);
-		mockResolveAstGrepNativeExe.mockReturnValue(undefined);
+		mockAuxiliaryLspPublished.mockResolvedValue(false);
 	});
 
-	it("skips when PATH fails but the bundled launcher binary resolves", async () => {
+	it("runs until the bundled LSP completes its first root publication", async () => {
 		const env = setupTestEnvironment("pi-lens-ast-grep-gate-");
 		try {
 			const filePath = path.join(env.tmpDir, "file.ts");
 			fs.writeFileSync(filePath, "const r = arr.sort();\n"); // would match no-sort-without-comparator
-			mockResolveAstGrepNativeExe.mockReturnValue("/bundled/ast-grep.exe");
 			mockWorkingSgLoad();
 			const mod =
 				await import("../../../../clients/dispatch/runners/ast-grep-napi.js");
 			const result = await mod.default.run(
 				createCtx(filePath, { hasTool: async () => false }) as any,
 			);
-			expect(result.status).toBe("skipped");
+			expect(result.status).toBe("succeeded");
 			expect(result.diagnostics).toHaveLength(0);
 		} finally {
 			env.cleanup();
@@ -112,12 +133,12 @@ describe("ast-grep-napi runner — LSP supersede gate (#239 Phase 2)", () => {
 		}
 	});
 
-	it("skips when a live ast-grep LSP client is handling the file regardless of PATH", async () => {
+	it("skips after the ast-grep LSP completes its first root publication", async () => {
 		const env = setupTestEnvironment("pi-lens-ast-grep-gate-");
 		try {
 			const filePath = path.join(env.tmpDir, "file.ts");
 			fs.writeFileSync(filePath, "const x = 1;\n");
-			mockAuxiliaryLspAlive.mockResolvedValue(true);
+			mockAuxiliaryLspPublished.mockResolvedValue(true);
 			mockWorkingSgLoad();
 			const mod =
 				await import("../../../../clients/dispatch/runners/ast-grep-napi.js");
@@ -134,6 +155,97 @@ describe("ast-grep-napi runner — LSP supersede gate (#239 Phase 2)", () => {
 	// comprehensively by ast-grep-sonar-rules.test.ts, whose ctx now defaults to
 	// hasTool('ast-grep') === false. Asserting it here too would require a working
 	// @ast-grep/napi mock and collides with the doMock in the skip-path suite.
+});
+
+describe("ast-grep-napi runner — late-auxiliary dedupe (#2324 F3/R2)", () => {
+	beforeEach(() => {
+		vi.resetModules();
+		mockAuxiliaryLspPublished.mockResolvedValue(false);
+	});
+
+	// #2324 R2-A: production can NEVER see a pending pair for THIS touch by
+	// the time napi's clear runs — the wait that marks a pair for this touch
+	// takes up to its own grace budget (~1800ms), strictly LONGER than napi's
+	// Gate-B check plus rule evaluation. Any pair visible here is therefore a
+	// LEFTOVER from an EARLIER touch, describing a PREVIOUS revision this
+	// fresh evaluation supersedes — clearing it is correct. The mark-vs-clear
+	// RACE for THIS touch's own pair is closed on the OTHER side, in
+	// service-aux-grace.test.ts, where the aux-grace wait consults
+	// `napiFallbackCoveredSince` before it ever marks.
+	it("clears a leftover pending pair from an earlier touch once it actually evaluates rules", async () => {
+		const env = setupTestEnvironment("pi-lens-ast-grep-dedupe-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(filePath, "const x = 1;\n");
+			const pendingAux =
+				await import("../../../../clients/lsp/pending-aux-coverage.js");
+			pendingAux.resetPendingAuxiliaryCoverage();
+			// A leftover pair from an EARLIER touch, still undelivered.
+			pendingAux.markPendingAuxiliaryCoverage(filePath, ["ast-grep"]);
+			expect(pendingAux.hasPendingAuxiliaryCoverage(filePath, "ast-grep")).toBe(
+				true,
+			);
+
+			mockWorkingSgLoad();
+			const mod =
+				await import("../../../../clients/dispatch/runners/ast-grep-napi.js");
+			const result = await mod.default.run(
+				createCtx(filePath, { hasTool: async () => false }) as any,
+			);
+			expect(result.status).toBe("succeeded");
+
+			// This fresh evaluation supersedes the leftover pair.
+			expect(pendingAux.hasPendingAuxiliaryCoverage(filePath, "ast-grep")).toBe(
+				false,
+			);
+			pendingAux.resetPendingAuxiliaryCoverage();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	// #2324 R2-B: the clear/record must sit AFTER every early-return skip —
+	// loadSg failure, missing file, unresolved language, stat/size/read/parse
+	// failure — not at Gate B's decision point. A run that never reaches rule
+	// evaluation did not actually cover the file, so it must not consume a
+	// pending pair a genuine late LSP delivery still needs. Reproduces the
+	// reviewer's probe: an .html file the mocked sg module has no parser for
+	// (`mockWorkingSgLoad` only registers `ts`), so `getLang` returns
+	// undefined and napi skips before ever touching rules.
+	it("preserves a pending late-auxiliary pair when napi never reaches rule evaluation", async () => {
+		const env = setupTestEnvironment("pi-lens-ast-grep-dedupe-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.html");
+			fs.writeFileSync(
+				filePath,
+				"<div>unparsed by the mocked sg module</div>\n",
+			);
+			const pendingAux =
+				await import("../../../../clients/lsp/pending-aux-coverage.js");
+			pendingAux.resetPendingAuxiliaryCoverage();
+			pendingAux.markPendingAuxiliaryCoverage(filePath, ["ast-grep"]);
+			expect(pendingAux.hasPendingAuxiliaryCoverage(filePath, "ast-grep")).toBe(
+				true,
+			);
+
+			mockWorkingSgLoad();
+			const mod =
+				await import("../../../../clients/dispatch/runners/ast-grep-napi.js");
+			const result = await mod.default.run(
+				createCtx(filePath, { hasTool: async () => false }) as any,
+			);
+			expect(result.status).toBe("skipped");
+
+			// Napi never evaluated a rule for this file — the pending pair, and
+			// the LSP's legitimate late delivery it represents, must survive.
+			expect(pendingAux.hasPendingAuxiliaryCoverage(filePath, "ast-grep")).toBe(
+				true,
+			);
+			pendingAux.resetPendingAuxiliaryCoverage();
+		} finally {
+			env.cleanup();
+		}
+	});
 });
 
 describe("ast-grep-napi runner — skip paths", () => {
@@ -244,8 +356,7 @@ describe("ast-grep-napi runner — skip paths", () => {
 describe("ast-grep-napi runner — real shipped rule", () => {
 	it("loads and matches no-sort-without-comparator through the real YAML parser", async () => {
 		vi.resetModules();
-		mockAuxiliaryLspAlive.mockResolvedValue(false);
-		mockResolveAstGrepNativeExe.mockReturnValue(undefined);
+		mockAuxiliaryLspPublished.mockResolvedValue(false);
 		vi.doUnmock("../../../../clients/dispatch/runners/yaml-rule-parser.js");
 		vi.doUnmock("../../../../clients/package-root.js");
 		// Earlier skip-path cases install per-test NAPI mocks. Replace any
@@ -284,49 +395,341 @@ describe("ast-grep-napi runner — metadata", () => {
 		const runner = mod.default;
 		expect(runner.id).toBe("ast-grep-napi");
 		expect(runner.appliesTo).toContain("jsts");
-		expect(runner.enabledByDefault).toBe(true);
 	});
 });
 
-// #1371 review: the dedupe must be mutation-effective — two evaluations with
-// the same unsupported language emit the skip event exactly ONCE, and a reset
-// re-arms it. Drives evaluateAstGrepRules directly with the module-level Set.
-describe("unsupported-language skip dedupe (#1371)", () => {
-	it("emits once across evaluations and re-arms on reset", async () => {
+// #2324 F2/R2-C: the residual "published once, silent now" loss is a bounded
+// `aux-runner-findings-lost` degradation, not a re-run. Neutering the branch
+// that records it must turn this test red — the finding the review round
+// caught was that no test referenced the record at all, so the branch could
+// be deleted with the suite staying green.
+describe("ast-grep-napi runner — aux-runner-findings-lost degradation (#2324 R2-C)", () => {
+	beforeEach(() => {
 		vi.resetModules();
-		const latencyCalls: Array<Record<string, unknown>> = [];
-		vi.doMock("../../../../clients/latency-logger.js", () => ({
-			logLatency: (entry: Record<string, unknown>) => latencyCalls.push(entry),
-		}));
-		const kotlinRule = {
-			id: "kotlin-rule-1",
-			language: "kotlin",
-			severity: "warning",
-			message: "m",
-			rule: { pattern: "foo" },
-		};
-		vi.doMock(
-			"../../../../clients/dispatch/runners/yaml-rule-parser.js",
-			async (importOriginal) => ({
-				...(await importOriginal<Record<string, unknown>>()),
-				loadYamlRules: () => [kotlinRule],
-				loadYamlRulesFresh: () => [kotlinRule],
-			}),
-		);
-		const mod =
-			await import("../../../../clients/dispatch/runners/ast-grep-napi.js");
-		mod.resetAstGrepUnsupportedLanguageLog();
-		const root = { findAll: () => [] };
-		const emits = () =>
-			latencyCalls.filter(
-				(c) => c.phase === "astgrep_napi_unsupported_rules_skipped",
-			).length;
-		mod.evaluateAstGrepRules("/repo/a.ts", root as never, "/repo", "jsts");
-		expect(emits()).toBe(1);
-		mod.evaluateAstGrepRules("/repo/b.ts", root as never, "/repo", "jsts");
-		expect(emits()).toBe(1);
-		mod.resetAstGrepUnsupportedLanguageLog();
-		mod.evaluateAstGrepRules("/repo/c.ts", root as never, "/repo", "jsts");
-		expect(emits()).toBe(2);
+		mockAuxiliaryLspPublished.mockResolvedValue(false);
+	});
+
+	it("records the loss when Gate B skips on a leftover pending pair", async () => {
+		const env = setupTestEnvironment("pi-lens-ast-grep-loss-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(filePath, "const x = 1;\n");
+			// #2324 R2-C: dynamically imported AFTER vi.resetModules() so this is
+			// the SAME module instance (and the same ledger state) the runner
+			// module below resolves — a static top-of-file import would bind to
+			// a stale pre-reset instance and this test would fail for the wrong
+			// reason.
+			const ledger = await import("../../../../clients/degradation-ledger.js");
+			ledger.resetDegradationLedger();
+			const pendingAux =
+				await import("../../../../clients/lsp/pending-aux-coverage.js");
+			pendingAux.resetPendingAuxiliaryCoverage();
+			// A leftover pair from an earlier touch — by R2-A's ordering, the
+			// only shape a pair can take by the time this synchronous check
+			// runs (this touch's own mark, if any, is decided strictly later).
+			pendingAux.markPendingAuxiliaryCoverage(filePath, ["ast-grep"]);
+
+			// Gate B: the per-file publication gate reads "published" (a prior
+			// touch's publication), so napi is about to skip.
+			mockAuxiliaryLspPublished.mockResolvedValue(true);
+			mockWorkingSgLoad();
+			const mod =
+				await import("../../../../clients/dispatch/runners/ast-grep-napi.js");
+			const result = await mod.default.run(
+				createCtx(filePath, { hasTool: async () => false }) as any,
+			);
+			expect(result.status).toBe("skipped");
+
+			const group = ledger
+				.getDegradationSummary()
+				.find((g) => g.kind === "aux-runner-findings-lost");
+			expect(group).toBeDefined();
+			expect(group?.count).toBe(1);
+			expect(group?.latestReasons[0]?.subject).toBe("ast-grep");
+			// The reason must describe an EARLIER-touch leftover, not this
+			// touch's own aux-grace outcome — R2-C's corrected claim.
+			expect(group?.latestReasons[0]?.reason).toContain("EARLIER touch");
+			pendingAux.resetPendingAuxiliaryCoverage();
+			ledger.resetDegradationLedger();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("does not record the loss when no pending pair exists (a clean skip)", async () => {
+		const env = setupTestEnvironment("pi-lens-ast-grep-loss-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(filePath, "const x = 1;\n");
+			const ledger = await import("../../../../clients/degradation-ledger.js");
+			ledger.resetDegradationLedger();
+			const pendingAux =
+				await import("../../../../clients/lsp/pending-aux-coverage.js");
+			pendingAux.resetPendingAuxiliaryCoverage();
+
+			mockAuxiliaryLspPublished.mockResolvedValue(true);
+			mockWorkingSgLoad();
+			const mod =
+				await import("../../../../clients/dispatch/runners/ast-grep-napi.js");
+			const result = await mod.default.run(
+				createCtx(filePath, { hasTool: async () => false }) as any,
+			);
+			expect(result.status).toBe("skipped");
+			expect(
+				ledger
+					.getDegradationSummary()
+					.find((g) => g.kind === "aux-runner-findings-lost"),
+			).toBeUndefined();
+			ledger.resetDegradationLedger();
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+// #2324 R3-B: the R2-A ordering fix depends on the PRODUCER write
+// (`recordNapiFallbackCoverage`) actually firing when napi evaluates rules,
+// and NOT firing on any of napi's early-return skips. The prior round's
+// tests only exercised the CONSUMER side (`hasPendingAuxiliaryCoverage`
+// after a manually pre-marked pair), so no-opping the producer write left
+// every existing test green — this pins the write directly.
+describe("ast-grep-napi runner — napiFallbackCoveredSince producer pin (#2324 R3-B)", () => {
+	beforeEach(() => {
+		vi.resetModules();
+		mockAuxiliaryLspPublished.mockResolvedValue(false);
+	});
+
+	it("ARM A: records coverage after a real rule evaluation", async () => {
+		const env = setupTestEnvironment("pi-lens-ast-grep-r3b-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(filePath, "const x = 1;\n");
+			const pendingAux =
+				await import("../../../../clients/lsp/pending-aux-coverage.js");
+			pendingAux.resetPendingAuxiliaryCoverage();
+			const before = Date.now();
+
+			mockWorkingSgLoad();
+			const mod =
+				await import("../../../../clients/dispatch/runners/ast-grep-napi.js");
+			const result = await mod.default.run(
+				createCtx(filePath, { hasTool: async () => false }) as any,
+			);
+			expect(result.status).not.toBe("skipped");
+			expect(pendingAux.napiFallbackCoveredSince(filePath, before)).toBe(true);
+			pendingAux.resetPendingAuxiliaryCoverage();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("ARM B1: does not record coverage when loadSg fails", async () => {
+		const env = setupTestEnvironment("pi-lens-ast-grep-r3b-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(filePath, "const x = 1;\n");
+			const pendingAux =
+				await import("../../../../clients/lsp/pending-aux-coverage.js");
+			pendingAux.resetPendingAuxiliaryCoverage();
+			const before = Date.now();
+
+			vi.doMock("@ast-grep/napi", () => {
+				throw new Error("native module failed");
+			});
+			const mod =
+				await import("../../../../clients/dispatch/runners/ast-grep-napi.js");
+			const result = await mod.default.run(
+				createCtx(filePath, { hasTool: async () => false }) as any,
+			);
+			expect(result.status).toBe("skipped");
+			expect(pendingAux.napiFallbackCoveredSince(filePath, before)).toBe(false);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("ARM B2: does not record coverage when the file does not exist", async () => {
+		const env = setupTestEnvironment("pi-lens-ast-grep-r3b-");
+		try {
+			const filePath = path.join(env.tmpDir, "missing.ts");
+			const pendingAux =
+				await import("../../../../clients/lsp/pending-aux-coverage.js");
+			pendingAux.resetPendingAuxiliaryCoverage();
+			const before = Date.now();
+
+			mockWorkingSgLoad();
+			const mod =
+				await import("../../../../clients/dispatch/runners/ast-grep-napi.js");
+			const result = await mod.default.run(
+				createCtx(filePath, { hasTool: async () => false }) as any,
+			);
+			expect(result.status).toBe("skipped");
+			expect(pendingAux.napiFallbackCoveredSince(filePath, before)).toBe(false);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("ARM B3: does not record coverage when the language grammar is unresolved", async () => {
+		const env = setupTestEnvironment("pi-lens-ast-grep-r3b-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.html");
+			fs.writeFileSync(filePath, "<div>no html export in the mock</div>\n");
+			const pendingAux =
+				await import("../../../../clients/lsp/pending-aux-coverage.js");
+			pendingAux.resetPendingAuxiliaryCoverage();
+			const before = Date.now();
+
+			mockWorkingSgLoad();
+			const mod =
+				await import("../../../../clients/dispatch/runners/ast-grep-napi.js");
+			const result = await mod.default.run(
+				createCtx(filePath, { hasTool: async () => false }) as any,
+			);
+			expect(result.status).toBe("skipped");
+			expect(pendingAux.napiFallbackCoveredSince(filePath, before)).toBe(false);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("ARM B4: does not record coverage when statSync throws", async () => {
+		const env = setupTestEnvironment("pi-lens-ast-grep-r3b-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(filePath, "const x = 1;\n");
+			const pendingAux =
+				await import("../../../../clients/lsp/pending-aux-coverage.js");
+			pendingAux.resetPendingAuxiliaryCoverage();
+			const before = Date.now();
+
+			fsSyncOverrides.statSync = () => {
+				throw new Error("stat failed");
+			};
+			mockWorkingSgLoad();
+			const mod =
+				await import("../../../../clients/dispatch/runners/ast-grep-napi.js");
+			const result = await mod.default.run(
+				createCtx(filePath, { hasTool: async () => false }) as any,
+			);
+			expect(result.status).toBe("skipped");
+			expect(pendingAux.napiFallbackCoveredSince(filePath, before)).toBe(false);
+		} finally {
+			fsSyncOverrides.statSync = undefined;
+			env.cleanup();
+		}
+	});
+
+	it("ARM B5: does not record coverage when the file exceeds the size cap", async () => {
+		const env = setupTestEnvironment("pi-lens-ast-grep-r3b-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(
+				filePath,
+				`const big = "${"x".repeat(1024 * 1024 + 1)}";\n`,
+			);
+			const pendingAux =
+				await import("../../../../clients/lsp/pending-aux-coverage.js");
+			pendingAux.resetPendingAuxiliaryCoverage();
+			const before = Date.now();
+
+			mockWorkingSgLoad();
+			const mod =
+				await import("../../../../clients/dispatch/runners/ast-grep-napi.js");
+			const result = await mod.default.run(
+				createCtx(filePath, { hasTool: async () => false }) as any,
+			);
+			expect(result.status).toBe("skipped");
+			expect(pendingAux.napiFallbackCoveredSince(filePath, before)).toBe(false);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("ARM B6: does not record coverage when readFileSync throws", async () => {
+		const env = setupTestEnvironment("pi-lens-ast-grep-r3b-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(filePath, "const x = 1;\n");
+			const pendingAux =
+				await import("../../../../clients/lsp/pending-aux-coverage.js");
+			pendingAux.resetPendingAuxiliaryCoverage();
+			const before = Date.now();
+
+			fsSyncOverrides.readFileSync = () => {
+				throw new Error("read failed");
+			};
+			mockWorkingSgLoad();
+			const mod =
+				await import("../../../../clients/dispatch/runners/ast-grep-napi.js");
+			const result = await mod.default.run(
+				createCtx(filePath, { hasTool: async () => false }) as any,
+			);
+			expect(result.status).toBe("skipped");
+			expect(pendingAux.napiFallbackCoveredSince(filePath, before)).toBe(false);
+		} finally {
+			fsSyncOverrides.readFileSync = undefined;
+			env.cleanup();
+		}
+	});
+
+	it("ARM B7: does not record coverage when the grammar fails to parse", async () => {
+		const env = setupTestEnvironment("pi-lens-ast-grep-r3b-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(filePath, "const x = 1;\n");
+			const pendingAux =
+				await import("../../../../clients/lsp/pending-aux-coverage.js");
+			pendingAux.resetPendingAuxiliaryCoverage();
+			const before = Date.now();
+
+			vi.doMock("@ast-grep/napi", () => ({
+				ts: {
+					parse: vi.fn(() => {
+						throw new Error("parse failed");
+					}),
+				},
+			}));
+			const mod =
+				await import("../../../../clients/dispatch/runners/ast-grep-napi.js");
+			const result = await mod.default.run(
+				createCtx(filePath, { hasTool: async () => false }) as any,
+			);
+			expect(result.status).toBe("skipped");
+			expect(pendingAux.napiFallbackCoveredSince(filePath, before)).toBe(false);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("ARM B8: does not record coverage when the parsed root cannot be read", async () => {
+		const env = setupTestEnvironment("pi-lens-ast-grep-r3b-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(filePath, "const x = 1;\n");
+			const pendingAux =
+				await import("../../../../clients/lsp/pending-aux-coverage.js");
+			pendingAux.resetPendingAuxiliaryCoverage();
+			const before = Date.now();
+
+			vi.doMock("@ast-grep/napi", () => ({
+				ts: {
+					parse: vi.fn().mockReturnValue({
+						root: () => {
+							throw new Error("root failed");
+						},
+					}),
+				},
+			}));
+			const mod =
+				await import("../../../../clients/dispatch/runners/ast-grep-napi.js");
+			const result = await mod.default.run(
+				createCtx(filePath, { hasTool: async () => false }) as any,
+			);
+			expect(result.status).toBe("skipped");
+			expect(pendingAux.napiFallbackCoveredSince(filePath, before)).toBe(false);
+		} finally {
+			env.cleanup();
+		}
 	});
 });

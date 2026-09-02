@@ -7,11 +7,21 @@ import {
 	type RunnerResult,
 } from "../../../../clients/dispatch/types.js";
 import { makeRunnerCtx } from "../../../support/runner-ctx.js";
+import {
+	capKilledSpawnResult,
+	capThenAbortedSpawnResult,
+	capThenTimedOutSpawnResult,
+} from "../../../support/spawn-shapes.js";
 import { setupTestEnvironment } from "../../test-utils.js";
 
-const safeSpawn = vi.fn();
-const safeSpawnAsync = vi.fn();
-const ensureTool = vi.fn(async (_toolId?: string) => "oxlint");
+// All hoisted: importing `spawn-shapes.js` above reaches the mocked safe-spawn
+// module, so every mock factory below now runs during the import phase — a
+// plain `const` would still be in its temporal dead zone when it does.
+const { safeSpawn, safeSpawnAsync, ensureTool } = vi.hoisted(() => ({
+	safeSpawn: vi.fn(),
+	safeSpawnAsync: vi.fn(),
+	ensureTool: vi.fn(async (_toolId?: string) => "oxlint"),
+}));
 const logLatency = vi.hoisted(() => vi.fn());
 
 const OXLINT_NO_FILES_BANNER =
@@ -46,6 +56,9 @@ const MATRIX_UNCONFIRMED_REASONS: Record<string, string> = {
 	"killed process with exact envelope": "process-killed",
 	"signal termination with exact envelope": "process-signal",
 	"truncated exact envelope": "process-truncated",
+	"cap-killed truncated envelope": "process-truncated",
+	"capped then timed-out envelope": "process-timeout",
+	"capped then aborted envelope": "process-killed",
 	"status zero with exact envelope": "status-zero",
 	"other nonzero status with exact envelope": "status-other",
 	"null status with exact envelope": "status-null",
@@ -68,7 +81,12 @@ const MATRIX_UNCONFIRMED_REASONS: Record<string, string> = {
 	"nonzero file count after exact banner": "files-nonzero",
 };
 
-vi.mock("../../../../clients/safe-spawn.js", () => ({
+// `importOriginal`, not a bare stub: the cap-kill row below builds the REAL
+// truncation result, and that needs safe-spawn's own `SpawnFailureError`.
+vi.mock("../../../../clients/safe-spawn.js", async (importOriginal) => ({
+	...(await importOriginal<
+		typeof import("../../../../clients/safe-spawn.js")
+	>()),
 	safeSpawn,
 	safeSpawnAsync,
 }));
@@ -200,6 +218,28 @@ describe("oxlint runner", () => {
 			},
 			expectedStatus: "failed",
 			expectedDegradation: "runner-parsed-nothing",
+		},
+		{
+			name: "cap-killed truncated envelope",
+			result: capKilledSpawnResult({ stdout: CAPTURED_NO_FILES_STDOUT }),
+			expectedStatus: "skipped",
+			expectedDegradation: "runner-empty-result",
+		},
+		{
+			name: "capped then timed-out envelope",
+			result: capThenTimedOutSpawnResult({
+				stdout: CAPTURED_NO_FILES_STDOUT,
+			}),
+			expectedStatus: "skipped",
+			expectedDegradation: "runner-empty-result",
+		},
+		{
+			name: "capped then aborted envelope",
+			result: capThenAbortedSpawnResult({
+				stdout: CAPTURED_NO_FILES_STDOUT,
+			}),
+			expectedStatus: "skipped",
+			expectedDegradation: "runner-empty-result",
 		},
 		{
 			name: "status zero with exact envelope",
@@ -583,7 +623,11 @@ describe("oxlint runner", () => {
 			expect(safeSpawnAsync).toHaveBeenCalledWith(
 				"oxlint",
 				expect.arrayContaining(["--format", "json", filePath]),
-				expect.objectContaining({ timeout: 30000 }),
+				// #2100: the cap is what makes `outputTruncated` reachable at all.
+				expect.objectContaining({
+					timeout: 30000,
+					maxOutputBytes: 8 * 1024 * 1024,
+				}),
 			);
 			expect(result.status).toBe("failed");
 			expect(result.semantic).toBe("warning");
@@ -691,7 +735,6 @@ describe("oxlint runner", () => {
 				id: "eslint",
 				appliesTo: ["jsts"],
 				priority: 1,
-				enabledByDefault: true,
 				async run() {
 					return { status: "skipped", diagnostics: [], semantic: "none" };
 				},
@@ -701,7 +744,6 @@ describe("oxlint runner", () => {
 				id: "biome-check-json",
 				appliesTo: ["jsts"],
 				priority: 3,
-				enabledByDefault: true,
 				async run() {
 					biomeCalls.push(Date.now());
 					return { status: "succeeded", diagnostics: [], semantic: "none" };
@@ -793,7 +835,11 @@ describe("oxlint runner", () => {
 			expect(safeSpawnAsync).toHaveBeenCalledWith(
 				"oxlint",
 				expect.arrayContaining(["--format", "json", filePath]),
-				expect.objectContaining({ timeout: 30000 }),
+				// #2100: the cap is what makes `outputTruncated` reachable at all.
+				expect.objectContaining({
+					timeout: 30000,
+					maxOutputBytes: 8 * 1024 * 1024,
+				}),
 			);
 			expect(result.status).toBe("succeeded");
 		} finally {
@@ -1198,7 +1244,6 @@ describe("oxlint runner", () => {
 				id: "malformed-skip",
 				appliesTo: ["jsts"],
 				priority: 1,
-				enabledByDefault: true,
 				async run() {
 					return {
 						status: "skipped",

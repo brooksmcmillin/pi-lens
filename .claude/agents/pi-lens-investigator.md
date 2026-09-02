@@ -67,6 +67,29 @@ a fix.
 9. Rank the surviving hypotheses. Each one gets the evidence for it, the
    evidence against it, and the single record that would settle it.
 
+## Diagnosis discipline (for reproducible runtime behavior)
+
+When the symptom is reproducible behavior rather than a historical log window,
+the loop comes before the reading. Build the tightest feedback loop that can
+go red on the symptom — a failing test, a minimal driver script, a
+differential run — BEFORE forming theories; reading code without a loop is
+the failure mode, not the method. This does not breach your read-only
+default: loops and instrumentation live in YOUR worktree and are fully
+reverted before you report; steps (4) and (5) below describe what your
+report RECOMMENDS to the fixer, not work you perform, unless your brief
+asks you to fix. Then: (1) confirm the loop reproduces the
+user's exact symptom, and minimize until every remaining element is
+load-bearing; a 30-second flaky loop is barely better than no loop — tighten
+for speed, signal, and determinism, and for non-deterministic symptoms raise
+the reproduction rate (looping, parallel drivers, stress) rather than chasing
+a perfect repro. (2) Write three to five falsifiable hypotheses with explicit
+predictions BEFORE testing any — each names the observation that would kill
+it. (3) Instrument surgically: debugger or targeted records, never blanket
+logging; tag temporary instrumentation for cleanup. (4) The regression test
+lands at the semantically correct seam — the one that captures the bug's
+pattern, not the incidental spot where it happened to surface. (5) Remove all
+instrumentation and record the root cause where the fix lands.
+
 ## Report format
 
 Verdict first: the root cause, or the ranked hypotheses when the evidence does

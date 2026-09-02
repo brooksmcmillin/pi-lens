@@ -8,6 +8,7 @@ import { normalizeMapKey } from "../path-utils.js";
 import { loadReverseDependencyIndexFromSnapshot } from "../reverse-deps.js";
 import { freshnessFromMtime } from "../freshness.js";
 import { logLatency } from "../latency-logger.js";
+import { compareOrdinal } from "../string-utils.js";
 import { workspaceDiagnosticsCacheSessionStart } from "./workspace-diagnostics-session.js";
 import type { LSPDiagnostic } from "./client.js";
 import {
@@ -48,6 +49,21 @@ export interface WorkspaceDiagnosticsCacheEntry {
 	count: number;
 	/** The file's own mtime (ms since epoch) at the moment it was scanned. */
 	mtimeMs: number;
+	/**
+	 * #2300: the file's own byte size at the moment it was scanned, from the
+	 * SAME stat call `mtimeMs` came from (zero extra syscalls). `isEntryFresh`'s
+	 * own-file check is an mtime EQUALITY memo — a same-mtime-bucket external
+	 * rewrite (same second/coarse-granularity timestamp, different bytes; the
+	 * NTFS-granularity case #2287 N1 named) is invisible to mtime alone. Size
+	 * is the cheap second axis; a full content hash stays reserved for the
+	 * `contentHash`/binding tier below, not this hot per-file gate.
+	 * Optional so a pre-#2300 persisted entry doesn't need a version bump to
+	 * stay loadable: `isEntryFresh` fails OPEN (mtime-only) when absent,
+	 * mirroring `depIndexAtScan`'s established precedent for this same cache —
+	 * an old entry never asserted a size claim, so there is nothing stronger to
+	 * hold it to, and every entry this cache writes going forward carries it.
+	 */
+	sizeBytes?: number;
 	/**
 	 * Wall-clock time (ms since epoch) this entry was written. The
 	 * dependency-staleness check in `isEntryFresh` compares each import's
@@ -377,7 +393,11 @@ export function classifyWorkspaceDiagnosticsCacheExpiry(
  * Two invalidation layers:
  * 1. The file's OWN mtime must be unchanged since it was scanned (exact
  *    match against `entry.mtimeMs`) — any drift, or a stat failure
- *    (deleted/unreadable), invalidates.
+ *    (deleted/unreadable), invalidates. #2300: when the entry also carries a
+ *    `sizeBytes`, the current size must match too — an external rewrite that
+ *    lands in the same mtime bucket with a different length is otherwise
+ *    invisible to mtime alone. A pre-#2300 entry without `sizeBytes` fails
+ *    OPEN to the mtime-only check (see the field's doc comment).
  * 2. When a reverse-dependency index is available (`getImports` returns an
  *    array rather than `undefined`), every file THIS file imports must not
  *    have changed after `entry.scannedAt` either — this is the fix for the
@@ -426,13 +446,17 @@ export function isEntryFresh(
 	entry: WorkspaceDiagnosticsCacheEntry,
 	getImports: (filePath: string) => string[] | undefined,
 ): boolean {
-	let ownMtime: number;
+	let ownStat: fs.Stats;
 	try {
-		ownMtime = fs.statSync(filePath).mtimeMs;
+		ownStat = fs.statSync(filePath);
 	} catch {
 		return false; // deleted / unreadable
 	}
-	if (ownMtime !== entry.mtimeMs) return false;
+	if (ownStat.mtimeMs !== entry.mtimeMs) return false;
+	// #2300: same axis reused from the stat above — no extra syscall.
+	if (entry.sizeBytes !== undefined && ownStat.size !== entry.sizeBytes) {
+		return false;
+	}
 
 	const imports = getImports(filePath);
 	if (imports === undefined) {
@@ -478,7 +502,7 @@ export function buildScopeKey(
 	excludeServerIds?: readonly string[],
 ): string {
 	const excluded = excludeServerIds
-		? [...excludeServerIds].sort((a, b) => a.localeCompare(b))
+		? [...excludeServerIds].sort(compareOrdinal)
 		: [];
 	return `${clientScope}|${excluded.join(",")}`;
 }
@@ -546,6 +570,11 @@ export interface WorkspaceDiagnosticsCacheContext {
 		 *  against, when the caller had content in hand. Omit when unavailable —
 		 *  the entry's binding then reads "unknown". */
 		contentHash?: string,
+		/** #2300: the file's byte size at the same moment as `mtimeMs`, from the
+		 *  same stat call — see `WorkspaceDiagnosticsCacheEntry.sizeBytes`. Omit
+		 *  when unavailable — `isEntryFresh` then fails open to mtime-only for
+		 *  this entry. */
+		sizeBytes?: number,
 	): void;
 	/** Best-effort disk write of everything recorded so far. Swallows any
 	 * write failure — a failed cache write should never fail the sweep that
@@ -726,7 +755,7 @@ export function createWorkspaceDiagnosticsCacheContext(
 				scannedAt: entry.scannedAt,
 			};
 		},
-		record(filePath, scopeKey, diagnostics, mtimeMs, contentHash) {
+		record(filePath, scopeKey, diagnostics, mtimeMs, contentHash, sizeBytes) {
 			entries[cacheKeyFor(filePath)] = {
 				diagnostics,
 				count: diagnostics.length,
@@ -740,6 +769,7 @@ export function createWorkspaceDiagnosticsCacheContext(
 				// weaker mtime-only path only when that refusal is warranted.
 				depIndexAtScan: hasDepKnowledge(filePath),
 				...(contentHash !== undefined && { contentHash }),
+				...(sizeBytes !== undefined && { sizeBytes }),
 			};
 			dirty = true;
 		},

@@ -3,7 +3,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
+import {
+	getDegradationSummary,
+	resetDegradationLedger,
+} from "../../../clients/degradation-ledger.js";
+import { createLSPClient } from "../../../clients/lsp/client.js";
 import { LSPService } from "../../../clients/lsp/index.js";
+import { launchLSP, stopLSP } from "../../../clients/lsp/launch.js";
 import { normalizeMapKey } from "../../../clients/path-utils.js";
 import { removeTempDirSync } from "../test-utils.js";
 
@@ -15,6 +21,8 @@ type MockRenameClient = {
 	closeDocument: ReturnType<typeof vi.fn>;
 	notify: { open: ReturnType<typeof vi.fn> };
 	willRenameFiles: ReturnType<typeof vi.fn>;
+	getOperationSupport: ReturnType<typeof vi.fn>;
+	getMalformedFileOperationRegistrations: ReturnType<typeof vi.fn>;
 	didRenameFiles: ReturnType<typeof vi.fn>;
 };
 
@@ -27,6 +35,11 @@ function makeClient(root: string, edit: unknown): MockRenameClient {
 		closeDocument: vi.fn(async () => undefined),
 		notify: { open: vi.fn(async () => undefined) },
 		willRenameFiles: vi.fn(async () => edit),
+		getOperationSupport: vi.fn(() => ({
+			willRenameFiles: true,
+			didRenameFiles: true,
+		})),
+		getMalformedFileOperationRegistrations: vi.fn(() => new Set()),
 		didRenameFiles: vi.fn(async () => undefined),
 	};
 }
@@ -105,6 +118,211 @@ describe("LSPService.renameFile", () => {
 			expect(secondary.willRenameFiles).toHaveBeenCalledWith(oldPath, newPath);
 			expect(primary.didRenameFiles).toHaveBeenCalledWith(oldPath, newPath);
 			expect(secondary.didRenameFiles).toHaveBeenCalledWith(oldPath, newPath);
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
+	});
+
+	it("records malformed registration skips at both service gates", async () => {
+		resetDegradationLedger();
+		const tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-rename-file-"),
+		);
+		const oldPath = path.join(tmpDir, "old.ts");
+		const newPath = path.join(tmpDir, "new.ts");
+		fs.writeFileSync(oldPath, "export const value = 1;\n", "utf-8");
+		const malformed = makeClient(tmpDir, null);
+		malformed.getOperationSupport.mockReturnValue({
+			willRenameFiles: false,
+			didRenameFiles: false,
+		});
+		malformed.getMalformedFileOperationRegistrations.mockReturnValue(
+			new Set(["willRename", "didRename"]),
+		);
+		const service = new LSPService();
+		addClient(service, "malformed", tmpDir, malformed);
+
+		try {
+			const result = await service.renameFile(oldPath, newPath, {
+				cwd: tmpDir,
+				apply: true,
+			});
+			expect(result.applied).toBe(true);
+			expect(malformed.willRenameFiles).not.toHaveBeenCalled();
+			expect(malformed.didRenameFiles).not.toHaveBeenCalled();
+			const reasons = getDegradationSummary()
+				.find((group) => group.kind === "lsp-capability-skip")
+				?.latestReasons.map((entry) => entry.reason);
+			expect(reasons).toEqual([
+				"malformed-registration",
+				"malformed-registration",
+			]);
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
+	});
+
+	it("connects initialize registration parsing to the real service gates", async () => {
+		const cases = [
+			{
+				name: "malformed willRename",
+				env: { FAKE_LSP_WILL_RENAME: "malformed" },
+				expected: ["malformed-registration", "no-registration"],
+			},
+			{
+				name: "malformed didRename",
+				env: {
+					FAKE_LSP_WILL_RENAME: "true",
+					FAKE_LSP_DID_RENAME: "true",
+					FAKE_LSP_DID_RENAME_FILTERS: JSON.stringify([{ scheme: "" }]),
+				},
+				expected: ["malformed-registration"],
+			},
+			{
+				name: "capability absent",
+				env: {},
+				expected: ["no-registration", "no-registration"],
+			},
+			{
+				name: "well-formed non-matching filters",
+				env: {
+					FAKE_LSP_WILL_RENAME: "true",
+					FAKE_LSP_DID_RENAME: "true",
+					FAKE_LSP_WILL_RENAME_GLOB: "**/*.go",
+					FAKE_LSP_DID_RENAME_GLOB: "**/*.go",
+				},
+				expected: ["filter-mismatch", "filter-mismatch"],
+			},
+		] as const;
+
+		for (const testCase of cases) {
+			resetDegradationLedger();
+			const tmpDir = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-lsp-real-rename-"),
+			);
+			const oldPath = path.join(tmpDir, "old.ts");
+			const newPath = path.join(tmpDir, "new.ts");
+			fs.writeFileSync(oldPath, "export const value = 1;\n", "utf-8");
+			const proc = await launchLSP(
+				process.execPath,
+				[path.join(process.cwd(), "tests/fixtures/fake-lsp-server.mjs")],
+				{ cwd: process.cwd(), env: { ...process.env, ...testCase.env } },
+			);
+			const client = await createLSPClient({
+				serverId: `real-${testCase.name}`,
+				process: proc,
+				root: tmpDir,
+			});
+			const service = new LSPService();
+			addClient(
+				service,
+				`real-${testCase.name}`,
+				tmpDir,
+				client as unknown as MockRenameClient,
+			);
+			try {
+				await service.renameFile(oldPath, newPath, {
+					cwd: tmpDir,
+					apply: true,
+				});
+				const reasons = getDegradationSummary()
+					.find((group) => group.kind === "lsp-capability-skip")
+					?.latestReasons.map((entry) => entry.reason);
+				expect(reasons, testCase.name).toEqual([...testCase.expected]);
+			} finally {
+				await client.shutdown().catch(() => {});
+				await stopLSP(proc).catch(() => {});
+				removeTempDirSync(tmpDir);
+			}
+		}
+	}, 30_000);
+
+	it("skips unsupported willRenameFiles clients while retaining supporting edits", async () => {
+		const tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-rename-file-"),
+		);
+		const oldPath = path.join(tmpDir, "old.ts");
+		const newPath = path.join(tmpDir, "new.ts");
+		const importPath = path.join(tmpDir, "import.ts");
+		fs.writeFileSync(oldPath, "export const value = 1;\n", "utf-8");
+		fs.writeFileSync(importPath, "import { value } from './old';\n", "utf-8");
+		const supporting = makeClient(tmpDir, {
+			changes: {
+				[pathToFileURL(importPath).href]: [
+					{
+						range: {
+							start: { line: 0, character: 25 },
+							end: { line: 0, character: 28 },
+						},
+						newText: "new",
+					},
+				],
+			},
+		});
+		const unsupported = makeClient(tmpDir, {
+			changes: { [pathToFileURL(importPath).href]: [] },
+		});
+		unsupported.getOperationSupport.mockReturnValue({
+			willRenameFiles: false,
+			didRenameFiles: false,
+		});
+		const service = new LSPService();
+		addClient(service, "typescript", tmpDir, supporting);
+		addClient(service, "eslint", tmpDir, unsupported);
+
+		try {
+			const result = await service.renameFile(oldPath, newPath, {
+				cwd: tmpDir,
+				apply: true,
+			});
+			expect(result.applied).toBe(true);
+			expect(supporting.willRenameFiles).toHaveBeenCalledWith(oldPath, newPath);
+			expect(unsupported.willRenameFiles).not.toHaveBeenCalled();
+			expect(unsupported.didRenameFiles).not.toHaveBeenCalled();
+			expect(fs.readFileSync(importPath, "utf-8")).toBe(
+				"import { value } from './new';\n",
+			);
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
+	});
+
+	it("applies and notifies when every active client skips willRenameFiles", async () => {
+		const tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-rename-file-"),
+		);
+		const oldPath = path.join(tmpDir, "old.ts");
+		const newPath = path.join(tmpDir, "new.ts");
+		fs.writeFileSync(oldPath, "export const value = 1;\n", "utf-8");
+		const first = makeClient(tmpDir, null);
+		const second = makeClient(tmpDir, null);
+		first.getOperationSupport.mockReturnValue({
+			willRenameFiles: false,
+			didRenameFiles: true,
+		});
+		second.getOperationSupport.mockReturnValue({
+			willRenameFiles: false,
+			didRenameFiles: true,
+		});
+		const service = new LSPService();
+		addClient(service, "typescript", tmpDir, first);
+		addClient(service, "eslint", tmpDir, second);
+
+		try {
+			const result = await service.renameFile(oldPath, newPath, {
+				cwd: tmpDir,
+				apply: true,
+			});
+			expect(result.applied).toBe(true);
+			expect(result.serverIds).toEqual(["typescript", "eslint"]);
+			expect(first.willRenameFiles).not.toHaveBeenCalled();
+			expect(second.willRenameFiles).not.toHaveBeenCalled();
+			expect(first.didRenameFiles).toHaveBeenCalledWith(oldPath, newPath);
+			expect(second.didRenameFiles).toHaveBeenCalledWith(oldPath, newPath);
+			expect(fs.existsSync(oldPath)).toBe(false);
+			expect(fs.readFileSync(newPath, "utf-8")).toBe(
+				"export const value = 1;\n",
+			);
 		} finally {
 			removeTempDirSync(tmpDir);
 		}

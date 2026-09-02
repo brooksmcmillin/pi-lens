@@ -4,6 +4,7 @@ import { getGlobalPiLensDir } from "./file-utils.js";
 import { createNdjsonLogger } from "./ndjson-logger.js";
 import type { TreeSitterParseCacheStats } from "./tree-sitter-client.js";
 import { getMaxLogSizeMB } from "./log-cleanup.js";
+import { normalizeLoggedPath } from "./path-utils.js";
 
 const TREE_SITTER_LOG_DIR = getGlobalPiLensDir();
 const TREE_SITTER_LOG_FILE = path.join(TREE_SITTER_LOG_DIR, "tree-sitter.log");
@@ -63,11 +64,26 @@ const CACHE_COUNTER_KEYS = [
 	"parserFailures",
 ] as const satisfies readonly (keyof TreeSitterParseCacheStats)[];
 
+/**
+ * #2219 (the #2141 class): `filePath` mixes raw `path.resolve()`/`cwd`
+ * values (`project-diagnostics/scanner.ts`, `review-graph/builder.ts`,
+ * `tree-sitter-shared.ts`) with already-normalized `ctx.filePath` (the
+ * `dispatch/runners/tree-sitter.ts` call sites) and the `"<tree-sitter>"`
+ * sentinel `logTreeSitterDiagnostic` falls back to below. This is the single
+ * seam every one of those paths funnels through (`logTreeSitterCacheStats`
+ * and `logTreeSitterDiagnostic` both call this function), so normalize once
+ * here — guarded via `normalizeLoggedPath` so the sentinel passes through
+ * unchanged instead of being resolved against the process cwd.
+ */
 export function logTreeSitter(entry: TreeSitterLogEntry): void {
 	if (isTestMode()) {
 		return;
 	}
-	writer.log({ ts: new Date().toISOString(), ...entry });
+	writer.log({
+		ts: new Date().toISOString(),
+		...entry,
+		filePath: normalizeLoggedPath(entry.filePath),
+	});
 }
 
 export function logTreeSitterCacheStats(options: {
@@ -138,7 +154,7 @@ export function logTreeSitterDiagnostic(entry: {
 		...(entry.languageId ? { languageId: entry.languageId } : {}),
 		status: entry.level ?? "error",
 		reason: entry.message,
-		metadata: { subsystem: entry.subsystem, ...(entry.metadata ?? {}) },
+		metadata: { subsystem: entry.subsystem, ...entry.metadata },
 	});
 }
 

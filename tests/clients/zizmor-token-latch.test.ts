@@ -145,6 +145,12 @@ describe("resolveZizmorGitHubToken transient handling (#1535)", () => {
 
 		expect(await resolveZizmorGitHubToken()).toBeUndefined();
 		expect(safeSpawnAsync).toHaveBeenCalledTimes(1);
+		// A timeout classifies as "transient" straight off classifyProbeFailure
+		// — classifyGhTokenFailure passes it through unchanged, so this row is
+		// a genuine probe classification (#2226 review F2).
+		expect(tokenDecisions()[0]?.metadata).toMatchObject({
+			classifiedBy: "probe",
+		});
 
 		// Still within the cooldown: served from the latch, no re-spawn — the
 		// verdict has NOT been forgotten, it's just not re-probed yet.
@@ -172,6 +178,11 @@ describe("resolveZizmorGitHubToken transient handling (#1535)", () => {
 		// or `non-installable` (both of which latch forever).
 		expect(metadata.outcome).toBe("transient");
 		expect(metadata.latched).toBe(false);
+		// classifyGhTokenFailure OVERRODE classifyProbeFailure's own
+		// "non-installable" answer here (permission-denied falls through its
+		// unrecognized-failure default) — this call site asserted the
+		// outcome, not a probe passthrough (#2226 review F2).
+		expect(metadata.classifiedBy).toBe("caller");
 	});
 
 	it("caches a genuine 'not authenticated' answer (gh ran and answered)", async () => {
@@ -192,6 +203,9 @@ describe("resolveZizmorGitHubToken transient handling (#1535)", () => {
 			outcome: "non-installable",
 			cause: "probe-rejected",
 			latched: true,
+			// A completed run with a real exit code is classifyGhTokenFailure's
+			// own rule, not a classifyProbeFailure passthrough (#2226 review F2).
+			classifiedBy: "caller",
 		});
 	});
 
@@ -296,6 +310,9 @@ describe("gh answered but had nothing to say (#1535 P2)", () => {
 			outcome: "non-installable",
 			cause: "empty-result",
 			latched: true,
+			// A literal assertion in deriveGhCliToken itself — no classifier
+			// ran on this path at all (#2226 review F2).
+			classifiedBy: "caller",
 		});
 
 		// A durable, well-understood "no token" answer is safe to cache.
@@ -313,6 +330,9 @@ describe("gh answered but had nothing to say (#1535 P2)", () => {
 			outcome: "missing",
 			cause: "not-found",
 			latched: true,
+			// classifyGhTokenFailure's own tool-not-found rule, not a
+			// classifyProbeFailure passthrough (#2226 review F2).
+			classifiedBy: "caller",
 		});
 
 		expect(await resolveZizmorGitHubToken()).toBeUndefined();

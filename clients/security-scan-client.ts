@@ -27,6 +27,16 @@ import {
 	logAvailabilityDecision,
 	startHostStallSampler,
 } from "./dispatch/runners/utils/availability-policy.js";
+import { createAvailabilityProbeFlight } from "./availability-probe-flight.js";
+import { createSingleFlight } from "./single-flight.js";
+
+type SecurityProbeResult = {
+	probe: Awaited<ReturnType<typeof safeSpawnAsync>>;
+	binaryPath: string | null;
+};
+
+const securityProbeFlights =
+	createAvailabilityProbeFlight<SecurityProbeResult>();
 
 export abstract class SecurityScanClient<TResult> {
 	/**
@@ -85,6 +95,7 @@ export abstract class SecurityScanClient<TResult> {
 	private logDurableAbsence(evidence?: ProbeEvidence, elapsedMs = 0): void {
 		logAvailabilityDecision({
 			tool: this.toolName,
+			producer: "security-scan",
 			verdict: "unavailable",
 			outcome: "missing",
 			cause: "not-found",
@@ -98,7 +109,8 @@ export abstract class SecurityScanClient<TResult> {
 	/** Outcome of the most recent `probeVersion` call. */
 	protected lastProbeOutcome: AvailabilityOutcome | null = null;
 
-	private ensureInFlight: Promise<boolean> | null = null;
+	/** Availability resolution is instance-owned; only its external probe is shared. */
+	private readonly ensureFlight = createSingleFlight<boolean>();
 	protected readonly inFlight = new Map<string, Promise<TResult>>();
 	protected binaryPath: string | null = null;
 	protected readonly log: (msg: string) => void;
@@ -121,13 +133,9 @@ export abstract class SecurityScanClient<TResult> {
 	 */
 	async ensureAvailable(): Promise<boolean> {
 		if (this.available !== null) return this.available;
-		if (this.ensureInFlight) return this.ensureInFlight;
-		this.ensureInFlight = this.doEnsureAvailable();
-		try {
-			return await this.ensureInFlight;
-		} finally {
-			this.ensureInFlight = null;
-		}
+		return this.ensureFlight.run("availability", () =>
+			this.doEnsureAvailable(),
+		);
 	}
 
 	/** Tool-specific PATH probe + optional auto-install. Sets `this.available`. */
@@ -152,10 +160,30 @@ export abstract class SecurityScanClient<TResult> {
 		const startedAt = Date.now();
 		let probe: Awaited<ReturnType<typeof safeSpawnAsync>>;
 		let hostStallMs: number;
+		let resolvedBinaryPath: string | null = null;
+		let probeJoined = false;
 		try {
-			probe = await safeSpawnAsync(this.toolName, versionArgs, {
-				timeout: 5000,
-			});
+			const shared = securityProbeFlights.run(
+				`security:${this.toolName}|${versionArgs.join("|")}`,
+				async () => {
+					const { findManagedToolBinary } =
+						await import("./installer/index.js");
+					const managed = await findManagedToolBinary(this.toolName);
+					return {
+						probe: await safeSpawnAsync(managed ?? this.toolName, versionArgs, {
+							timeout: 5000,
+						}),
+						binaryPath: managed ?? null,
+					};
+				},
+			);
+			probeJoined = shared.joined;
+			const flightResult = await shared.promise;
+			probe = flightResult.probe;
+			resolvedBinaryPath = flightResult.binaryPath;
+			if (!probe.error && probe.status === 0 && flightResult.binaryPath) {
+				this.binaryPath = flightResult.binaryPath;
+			}
 		} finally {
 			hostStallMs = sampler.stop();
 		}
@@ -165,6 +193,7 @@ export abstract class SecurityScanClient<TResult> {
 			this.log(`${this.toolName} found: ${probe.stdout.trim().split("\n")[0]}`);
 			logAvailabilityDecision({
 				tool: this.toolName,
+				producer: "security-scan",
 				verdict: "available",
 				outcome: "success",
 				cause: "ok",
@@ -172,8 +201,14 @@ export abstract class SecurityScanClient<TResult> {
 				latched: true,
 				hostStallMs,
 				budgetMs: 5000,
-				classifiedBy: "probe",
-				evidence: describeProbeEvidence(probe),
+				classifiedBy: probeJoined ? "joined" : "probe",
+				evidence: {
+					...describeProbeEvidence(probe),
+					...(resolvedBinaryPath && {
+						binary: path.basename(resolvedBinaryPath),
+						source: "managed-dir",
+					}),
+				},
 			});
 			return true;
 		}
@@ -191,6 +226,7 @@ export abstract class SecurityScanClient<TResult> {
 				: 0;
 		logAvailabilityDecision({
 			tool: this.toolName,
+			producer: "security-scan",
 			verdict: "unavailable",
 			outcome,
 			cause,
@@ -199,8 +235,14 @@ export abstract class SecurityScanClient<TResult> {
 			hostStallMs,
 			...(retryAfterMs > 0 && { retryAfterMs }),
 			budgetMs: 5000,
-			classifiedBy: "probe",
-			evidence,
+			classifiedBy: probeJoined ? "joined" : "probe",
+			evidence: {
+				...evidence,
+				...(resolvedBinaryPath && {
+					binary: path.basename(resolvedBinaryPath),
+					source: "managed-dir",
+				}),
+			},
 		});
 		return false;
 	}
@@ -356,7 +398,13 @@ export abstract class SecurityScanClient<TResult> {
 			this.log(`Scan already in flight for ${key}; sharing result`);
 			return existing;
 		}
-		const promise = run().finally(() => this.inFlight.delete(key));
+		// Identity-guarded release (#1968's pattern): delete only if THIS run is
+		// still the registered one. A bare delete-by-key lets a late-settling run
+		// evict a live successor a second writer registered under the same key
+		// mid-flight, after which the next caller starts a duplicate scan.
+		const promise = run().finally(() => {
+			if (this.inFlight.get(key) === promise) this.inFlight.delete(key);
+		});
 		this.inFlight.set(key, promise);
 		return promise;
 	}

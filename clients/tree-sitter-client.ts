@@ -163,6 +163,12 @@ interface QueryBatch {
 	ownerOfPattern: number[];
 }
 
+interface GrammarDirResolutionDeps {
+	resolveAsset: (asset: string) => string | undefined;
+	resolvePackage: (specifier: string) => string;
+	cwd: () => string;
+}
+
 function createParserCounters(): TreeSitterParserCounters {
 	return {
 		parserInvocations: 0,
@@ -454,8 +460,18 @@ export class TreeSitterClient {
 	private activeMeasurements = 0;
 	private onWasmAbort: (() => void) | undefined;
 	private wasmAborted = false;
+	private readonly grammarDirResolutionDeps: GrammarDirResolutionDeps;
 
-	constructor(verbose = false, onWasmAbort?: () => void) {
+	constructor(
+		verbose = false,
+		onWasmAbort?: () => void,
+		grammarDirResolutionDeps?: GrammarDirResolutionDeps,
+	) {
+		this.grammarDirResolutionDeps = grammarDirResolutionDeps ?? {
+			resolveAsset: (asset) => this.resolveWebTreeSitterAsset(asset),
+			resolvePackage: (specifier) => _require.resolve(specifier),
+			cwd: () => process.cwd(),
+		};
 		this.grammarsDir = this.findGrammarsDir();
 		this.verbose = verbose;
 		this.onWasmAbort = onWasmAbort;
@@ -884,8 +900,8 @@ export class TreeSitterClient {
 	}
 
 	/** Find tree-sitter grammar directory */
-	private findGrammarsDir(): string {
-		const grammarsDir = this.resolveWebTreeSitterAsset("grammars");
+	private findGrammarsDir(deps = this.grammarDirResolutionDeps): string {
+		const grammarsDir = deps.resolveAsset("grammars");
 		if (
 			grammarsDir &&
 			fs.existsSync(path.join(grammarsDir, "tree-sitter-typescript.wasm"))
@@ -897,7 +913,7 @@ export class TreeSitterClient {
 		// (it is not a pi-lens dependency — grammars ship bundled / lazy-fetched).
 		try {
 			const wasmsOut = path.join(
-				path.dirname(_require.resolve("tree-sitter-wasms/package.json")),
+				path.dirname(deps.resolvePackage("tree-sitter-wasms/package.json")),
 				"out",
 			);
 			if (fs.existsSync(wasmsOut)) return wasmsOut;
@@ -906,7 +922,7 @@ export class TreeSitterClient {
 		}
 
 		const cwdWasms = path.join(
-			process.cwd(),
+			deps.cwd(),
 			"node_modules",
 			"tree-sitter-wasms",
 			"out",

@@ -8,7 +8,10 @@ const { publicationEvents } = vi.hoisted(() => ({
 	publicationEvents: [] as Array<Record<string, unknown>>,
 }));
 
-vi.mock("../../../clients/latency-logger.js", () => ({
+vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
+	...(await importActual<
+		typeof import("../../../clients/latency-logger.js")
+	>()),
 	logLatency: vi.fn((event: Record<string, unknown>) => {
 		if (event.phase === "lsp_typescript_diagnostic_sequence")
 			publicationEvents.push(event);

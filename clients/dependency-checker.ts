@@ -15,6 +15,7 @@ import * as path from "node:path";
 import { findNodeToolBinary } from "./package-manager.js";
 import { isFullyQualified } from "./path-utils.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
+import { compareOrdinal } from "./string-utils.js";
 import {
 	createAvailabilityChecker,
 	discoverManagedTool,
@@ -667,9 +668,15 @@ export class DependencyChecker {
 		const existing = this.checkInFlight.get(key);
 		if (existing) return existing;
 
+		// Identity-guarded release (#1968's pattern): delete only if THIS run is
+		// still the registered one. A bare delete-by-key lets a late-settling run
+		// evict a live successor a second writer registered under the same key
+		// mid-flight, after which the next caller starts a duplicate check.
 		const promise = this.runCheckFile(normalized, projectRoot, gen).finally(
 			() => {
-				this.checkInFlight.delete(key);
+				if (this.checkInFlight.get(key) === promise) {
+					this.checkInFlight.delete(key);
+				}
 			},
 		);
 		this.checkInFlight.set(key, promise);
@@ -1058,8 +1065,14 @@ export class DependencyChecker {
 		// does, and the two overlap (runtime-session, fresh-fetch), so it takes a
 		// generation too — claimed before the spawn, as late as a scan can.
 		const gen = ++this.opGeneration;
+		// Identity-guarded release (#1968's pattern): delete only if THIS run is
+		// still the registered one. A bare delete-by-key lets a late-settling run
+		// evict a live successor a second writer registered under the same key
+		// mid-flight, after which the next caller starts a duplicate scan.
 		const promise = this.runScanProject(projectRoot, gen).finally(() => {
-			this.scanInFlight.delete(projectRoot);
+			if (this.scanInFlight.get(projectRoot) === promise) {
+				this.scanInFlight.delete(projectRoot);
+			}
 		});
 		this.scanInFlight.set(projectRoot, promise);
 		return promise;
@@ -1123,7 +1136,11 @@ export class DependencyChecker {
 		let output = `[Circular Deps] ${circular.length} cycle(s) found:\n`;
 
 		for (const dep of circular) {
-			const cycleKey = dep.path.sort((a, b) => a.localeCompare(b)).join("→");
+			// Copy before sorting: `dep.path` is rendered verbatim below (and by
+			// other CircularDep consumers, e.g. madge.ts's diagnostic renderer),
+			// so the dedupe key must not reorder — let alone mutate in place —
+			// the path a user reads.
+			const cycleKey = [...dep.path].sort(compareOrdinal).join("→");
 			if (seen.has(cycleKey)) continue;
 			seen.add(cycleKey);
 

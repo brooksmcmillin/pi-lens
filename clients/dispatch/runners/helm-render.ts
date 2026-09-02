@@ -82,6 +82,10 @@ import {
 	projectTrustDenialReason,
 } from "../../project-trust.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
+import {
+	killedForOutputCap,
+	truncatedByOutputCap,
+} from "../../spawn-output-cap.js";
 import { isTrivyEnabled, resolveSeverityFloor } from "../../trivy-client.js";
 import { findNearestDirWithMarker } from "../../workspace-topology.js";
 import { PRIORITY } from "../priorities.js";
@@ -118,6 +122,15 @@ const TRIVY_TIMEOUT_MS = 45_000;
 const MAX_RENDERED_FILES = 400;
 /** Bytes of trivy report we retain. Truncation is reported, never parsed past. */
 const MAX_REPORT_BYTES = 8 * 1024 * 1024;
+/**
+ * Bytes of `helm template` output we retain. The manifests go to `--output-dir`,
+ * so stdout is one short "wrote <path>" line per file — bounded near
+ * {@link MAX_RENDERED_FILES} — and stderr carries template errors. 8 MiB is
+ * therefore a blast-radius bound on a chart that loops or a helm that wedges,
+ * not a working limit, and it is what makes `render.outputTruncated` reachable
+ * at all (#2100).
+ */
+const MAX_RENDER_OUTPUT_BYTES = 8 * 1024 * 1024;
 
 const SKIPPED: RunnerResult = {
 	status: "skipped",
@@ -685,6 +698,11 @@ type CoverageRule =
 	| "iac-pass-failed"
 	| "iac-report-unreadable"
 	| "render-truncated"
+	// Distinct from `render-truncated` on purpose (#2100 review F1): helm
+	// COMPLETED and `--output-dir` wrote the whole tree, so every manifest was
+	// validated — only the stdout we never parse was capped. Sharing the
+	// `render-truncated` id would also collide with the walk's own gap.
+	| "render-output-truncated"
 	| "rendered-file-unreadable"
 	| "render-empty"
 	| "render-untrusted";
@@ -776,6 +794,20 @@ export async function runIacPass(options: {
 			maxOutputBytes: MAX_REPORT_BYTES,
 		},
 	);
+	// FIRST (#2100): hitting the cap makes safe-spawn SIGTERM trivy, so a
+	// truncated report also arrives as a killed spawn with a null status. Read
+	// after the gate below, this said "the IaC pass failed" when what actually
+	// happened is that WE stopped reading. A timed-out or aborted scan carries
+	// the flag too and stays with the failure gate, which names its real cause.
+	if (truncatedByOutputCap(scan)) {
+		return [
+			coverageGap(
+				chartRoot,
+				"iac-report-unreadable",
+				`Rendered-manifest IaC checks did not run: the trivy report exceeded ${MAX_REPORT_BYTES} bytes and was truncated before parsing.`,
+			),
+		];
+	}
 	const scanFailure = spawnFailureKind(scan);
 	// `trivy config` is not given `--exit-code`, so it exits 0 whenever it
 	// completed. ANY nonzero status is therefore a real error, with or without
@@ -792,15 +824,6 @@ export async function runIacPass(options: {
 				chartRoot,
 				"iac-pass-failed",
 				`Rendered-manifest IaC checks failed to complete (${why}): ${detail}`,
-			),
-		];
-	}
-	if (scan.outputTruncated) {
-		return [
-			coverageGap(
-				chartRoot,
-				"iac-report-unreadable",
-				`Rendered-manifest IaC checks did not run: the trivy report exceeded ${MAX_REPORT_BYTES} bytes and was truncated before parsing.`,
 			),
 		];
 	}
@@ -911,8 +934,36 @@ async function renderAndValidate(
 				timeout: RENDER_TIMEOUT_MS,
 				deadlineAt: Date.now() + RENDER_TIMEOUT_MS,
 				resourceLabel: "helm-render",
+				maxOutputBytes: MAX_RENDER_OUTPUT_BYTES,
 			},
 		);
+
+		const renderOutput = [render.stdout, render.stderr]
+			.filter(Boolean)
+			.join("\n");
+		// `killedForOutputCap` is platform-neutral. POSIX usually reports SIGTERM,
+		// but Windows reports status 1 with no failure or signal. A timed-out or
+		// aborted render retains its own classification.
+		const renderCapped = truncatedByOutputCap(render);
+		if (killedForOutputCap(render)) {
+			// helm was cut off mid-render, so the scratch tree is a PREFIX —
+			// reading it back would report the manifests we never saw as clean
+			// (shape 10). Not parsed as a chart failure either: helm never reported
+			// a verdict, and `parseHelmTemplateFailure` synthesizes a BLOCKING
+			// "helm template failed" finding when it sees no `Error:` line, which
+			// would blame the chart for our own cap (the #1487 inversion).
+			logRenderPass(filePath, chartRoot, startedAt, {
+				outcome: "render-truncated",
+				diagnostics: 1,
+			});
+			return summarize([
+				coverageGap(
+					chartRoot,
+					"render-truncated",
+					`helm template produced more than ${MAX_RENDER_OUTPUT_BYTES} bytes and was stopped mid-render, so the rendered manifests are UNCHECKED rather than clean.`,
+				),
+			]);
+		}
 
 		const startupFailure = spawnFailureKind(render);
 		if (startupFailure) {
@@ -928,9 +979,6 @@ async function renderAndValidate(
 				render.error?.message || `helm template ${startupFailure}`,
 			);
 		}
-		const renderOutput = [render.stdout, render.stderr]
-			.filter(Boolean)
-			.join("\n");
 		if (render.status !== 0) {
 			// Before blaming the chart: did helm reject OUR OWN command line? An old
 			// helm (v2 has no `helm template --output-dir`) or a wrapper shim exits
@@ -950,7 +998,9 @@ async function renderAndValidate(
 			}
 			// A failed RENDER is a real diagnostic: the chart cannot be installed.
 			const diagnostics = parseHelmTemplateFailure(renderOutput, chartRoot);
-			if (render.outputTruncated) {
+			if (renderCapped) {
+				// helm reported this failure itself, but we kept only a prefix of
+				// what it said, so the report above may be missing errors.
 				diagnostics.push(
 					coverageGap(
 						chartRoot,
@@ -976,6 +1026,20 @@ async function renderAndValidate(
 					sourcePath: manifest.sourcePath,
 					sourceMapped: manifest.sourceMapped,
 				}),
+			);
+		}
+		if (renderCapped) {
+			// helm exited 0, so `--output-dir` holds the COMPLETE tree and every
+			// manifest above was validated from disk — the cap only cost us the
+			// "wrote <path>" lines on stdout, which this runner never parses.
+			// Recorded rather than silent (shape 8), but deliberately not an
+			// UNCHECKED claim: nothing was skipped (review F1).
+			diagnostics.push(
+				coverageGap(
+					chartRoot,
+					"render-output-truncated",
+					`helm template printed more than ${MAX_RENDER_OUTPUT_BYTES} bytes and its stdout was truncated. The rendered manifests were still validated from disk; only helm's own progress output was lost.`,
+				),
 			);
 		}
 		if (tree.truncated) {
@@ -1043,7 +1107,6 @@ const helmRenderRunner: RunnerDefinition = {
 	id: "helm-render",
 	appliesTo: ["yaml", "helm-template"],
 	priority: PRIORITY.GENERAL_ANALYSIS,
-	enabledByDefault: true,
 	skipTestFiles: false,
 	timeoutMs: RENDER_TIMEOUT_MS + TRIVY_TIMEOUT_MS + 10_000,
 

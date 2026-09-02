@@ -13,6 +13,7 @@
 
 import type { FileKind } from "../file-kinds.js";
 import type { FileRole } from "../file-role.js";
+import type { GeneratedArtifactEvidence } from "../generated-artifacts.js";
 import type { PiLensProjectConfig } from "../project-lens-config.js";
 
 export type DefectClass =
@@ -130,7 +131,6 @@ export interface RunnerDefinition {
 	id: string;
 	appliesTo: readonly FileKind[];
 	priority: number;
-	enabledByDefault: boolean;
 	/** Skip this runner for test files (false positive reduction) */
 	skipTestFiles?: boolean;
 	/** Per-runner wall-clock timeout in ms; overrides dispatch.runnerTimeoutMs when set */
@@ -177,13 +177,44 @@ export interface RunnerResult {
 
 // --- Dispatch Context ---
 
+/**
+ * #2016 invariant: `filePath`, `projectRoot`, and `cwd` are ALREADY
+ * `normalizeMapKey`-normalized. `createDispatchContext` is the only constructor
+ * and it normalizes all three before building the object.
+ *
+ * So `normalizeMapKey(ctx.filePath)` is a pure `realpathSync.native` syscall
+ * that returns its own input. On Windows that measures ~200 microseconds per
+ * call, and POSIX short-circuits it, which is why CI timing gates cannot see
+ * the waste. Use these three fields directly as map keys, fact keys, once-keys,
+ * and degradation subjects. `tests/clients/dispatch-context-normalized.test.ts`
+ * pins both halves: that the constructor normalizes, and that no call site
+ * re-normalizes.
+ */
 export interface DispatchContext {
+	/** Normalized. See the #2016 invariant above. */
 	readonly filePath: string;
-	/** Workspace/project root before language-specific root resolution. */
+	/**
+	 * Workspace/project root before language-specific root resolution.
+	 * Normalized. See the #2016 invariant above.
+	 */
 	readonly projectRoot?: string;
+	/** Normalized. See the #2016 invariant above. */
 	readonly cwd: string;
 	readonly kind: FileKind | undefined;
 	readonly fileRole: FileRole;
+	/**
+	 * When `fileRole === "generated"`: the evidence tier that decided the
+	 * verdict (undefined otherwise). Threaded from `createDispatchContext` so
+	 * the generated short-circuit can emit a `dispatch_skipped_generated`
+	 * phase record without re-reading the file (refs #2346).
+	 */
+	readonly generatedEvidence?: GeneratedArtifactEvidence;
+	/**
+	 * When `generatedEvidence === "line-shape"`: the measured mean non-empty
+	 * line length that crossed the threshold. Undefined for path/header/decl
+	 * evidence tiers (refs #2346).
+	 */
+	readonly generatedLineShapeMean?: number;
 	readonly pi: PiAgentAPI;
 	readonly autofix: boolean;
 	readonly deltaMode: boolean;

@@ -21,6 +21,17 @@ vi.mock("../../clients/latency-logger.js", async (importOriginal) => {
 });
 
 import { CacheManager } from "../../clients/cache-manager.js";
+import { gateFindingsByPathFreshness } from "../../clients/advisory-provenance.js";
+import {
+	drainPendingRunnerFindings,
+	deferRunnerFindings,
+	pendingRunnerFindingsSize,
+	resetPendingRunnerFindings,
+} from "../../clients/dispatch/pending-runner-findings.js";
+import {
+	getDegradationSummary,
+	resetDegradationLedger,
+} from "../../clients/degradation-ledger.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import {
 	cancelLSPIdleReset,
@@ -69,10 +80,47 @@ function driftIntoFuture(filePath: string): void {
 
 afterEach(() => {
 	cancelLSPIdleReset();
+	vi.useRealTimers();
+	resetPendingRunnerFindings();
+	resetDegradationLedger();
 	logLatency.mockClear();
 });
 
 describe("turn-end blocker freshness (#1631)", () => {
+	it("arms idle reset before delivering a pending runner on a no-write turn", async () => {
+		vi.useFakeTimers();
+		const env = setupTestEnvironment("pi-lens-runner-idle-reset-");
+		try {
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId: "runner-idle-session" });
+			runtime.beginTurn();
+			const cacheManager = new CacheManager(false);
+			deferRunnerFindings({
+				filePath: path.join(env.tmpDir, "pending.ts"),
+				cwd: env.tmpDir,
+				projectRoot: env.tmpDir,
+				runnerId: "never-settling-runner",
+				markedAtMs: Date.now(),
+				promise: new Promise(() => {}),
+			});
+
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, { ctxCwd: env.tmpDir }),
+			);
+
+			// The deferred work remains owned for a later turn, but delivery still ran.
+			expect(pendingRunnerFindingsSize()).toBe(1);
+			expect(
+				logLatency.mock.calls.some(
+					([entry]) => entry?.phase === "late_runner_findings",
+				),
+			).toBe(true);
+			expect(vi.getTimerCount()).toBe(1);
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("re-serves a drifted blocker as a [stale] advisory, not an authoritative blocker, and logs the sweep", async () => {
 		const env = setupTestEnvironment("pi-lens-fresh-turnend-");
 		try {
@@ -184,6 +232,146 @@ describe("turn-end blocker freshness (#1631)", () => {
 			const content = findings?.data?.content ?? "";
 			expect(content).toContain("Unresolved from this turn");
 			expect(content).not.toContain("[stale — re-run to confirm]");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("drops stale deferred runner findings and records the coverage gap", async () => {
+		const env = setupTestEnvironment("pi-lens-runner-fresh-turnend-");
+		try {
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId: "runner-fresh-session" });
+			runtime.beginTurn();
+			const cacheManager = new CacheManager(false);
+			const filePath = path.join(env.tmpDir, "runner.ts");
+			fs.writeFileSync(filePath, "export const value = 1;\n");
+			const markedAtMs = 1;
+			deferRunnerFindings({
+				filePath,
+				cwd: env.tmpDir,
+				projectRoot: env.tmpDir,
+				runnerId: "slow-runner",
+				markedAtMs,
+				promise: Promise.resolve({
+					status: "succeeded",
+					diagnostics: [
+						{
+							id: "old",
+							message: "old bytes",
+							filePath,
+							tool: "slow-runner",
+							severity: "warning",
+							semantic: "warning",
+						},
+					],
+					semantic: "warning",
+				}),
+			});
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			const completed = (await drainPendingRunnerFindings(0))[0]!;
+			deferRunnerFindings({
+				...completed,
+				markedAtMs,
+				promise: Promise.resolve(completed.result!),
+			});
+			driftIntoFuture(filePath);
+			expect(
+				gateFindingsByPathFreshness({
+					store: "test-runner",
+					findings: [{ filePath }],
+					cwd: env.tmpDir,
+					scannedAt: markedAtMs,
+					citedPath: (finding) => finding.filePath,
+				}).stale,
+			).toHaveLength(1);
+
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, { ctxCwd: env.tmpDir }),
+			);
+
+			const findings = cacheManager.readCache<{ content: string }>(
+				"turn-end-findings",
+				env.tmpDir,
+			);
+			expect(findings?.data?.content ?? "").not.toContain("old bytes");
+			expect(pendingRunnerFindingsSize()).toBe(0);
+			expect(getDegradationSummary()).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						kind: "runner-findings-stale",
+						latestReasons: [
+							expect.objectContaining({
+								subject: `slow-runner:${filePath}`,
+							}),
+						],
+					}),
+				]),
+			);
+			const runnerRecord = logLatency.mock.calls
+				.map((call) => call[0])
+				.find((entry: any) => entry?.phase === "late_runner_findings");
+			expect(runnerRecord?.metadata).toMatchObject({
+				delivered: 0,
+				stale: 1,
+				dropped: 1,
+				deliveredIds: [],
+			});
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("delivers a completed runner finding on a no-write turn", async () => {
+		const env = setupTestEnvironment("pi-lens-runner-no-write-turn-");
+		try {
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId: "runner-no-write-session" });
+			runtime.beginTurn();
+			const cacheManager = new CacheManager(false);
+			const filePath = path.join(env.tmpDir, "runner.ts");
+			fs.writeFileSync(filePath, "export const value = 1;\n");
+			deferRunnerFindings({
+				filePath,
+				cwd: env.tmpDir,
+				projectRoot: env.tmpDir,
+				runnerId: "late-eslint",
+				markedAtMs: Date.now() + 60_000,
+				promise: Promise.resolve({
+					status: "succeeded",
+					diagnostics: [
+						{
+							id: "late-id",
+							message: "late bytes",
+							filePath,
+							tool: "late-eslint",
+							severity: "warning",
+							semantic: "warning",
+						},
+					],
+					semantic: "warning",
+				}),
+			});
+
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, { ctxCwd: env.tmpDir }),
+			);
+
+			const content =
+				cacheManager.readCache<{ content: string }>(
+					"turn-end-findings",
+					env.tmpDir,
+				)?.data?.content ?? "";
+			expect(content).toContain("late-id");
+			const runnerRecord = logLatency.mock.calls
+				.map((call) => call[0])
+				.find((entry: any) => entry?.phase === "late_runner_findings");
+			expect(runnerRecord?.metadata).toMatchObject({
+				delivered: 1,
+				stale: 0,
+				deliveredIds: ["late-id"],
+			});
 		} finally {
 			env.cleanup();
 		}

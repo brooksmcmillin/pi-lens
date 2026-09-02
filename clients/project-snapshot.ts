@@ -327,9 +327,12 @@ interface AuthoritativeSnapshotEntry {
 	 * pre-write file's mtime at save time (or -Infinity when no file exists
 	 * yet), then updated to the promoted file's mtime once the worker (or the
 	 * sync fallback) lands the write. Load prefers this entry while the on-disk
-	 * mtime is `<=` this value.
+	 * mtime is `<=` this value and its size still matches `knownSize`. The size
+	 * axis detects coarse-mtime collisions without hashing this hot read path;
+	 * a same-size, same-mtime external rewrite remains invisible by design.
 	 */
 	knownMtime: number;
+	knownSize: number;
 	lastUsedAt: number;
 	idleTimer?: ReturnType<typeof setTimeout>;
 }
@@ -791,12 +794,24 @@ export function loadProjectSnapshotExportsAndRules(
 	const body = resolveSnapshotBodyPath(cwd);
 	const authoritative = authoritativeSnapshots.get(key);
 	if (authoritative) {
-		const diskMtime = body ? body.mtimeMs : Number.NEGATIVE_INFINITY;
-		if (diskMtime <= authoritative.knownMtime) {
+		// `body === null` means nothing is on disk — that is never "the body
+		// changed size", so it must not be read as superseding our own write.
+		// See the matching comment in loadProjectSnapshotInternal.
+		const notSuperseded =
+			body === null ||
+			(body.mtimeMs <= authoritative.knownMtime &&
+				body.size === authoritative.knownSize);
+		if (notSuperseded) {
 			const { version, seq, cachedExports, projectRulesScan } =
 				authoritative.snapshot;
 			return { version, seq, cachedExports, projectRulesScan };
 		}
+		// On mismatch, unlike the full loader, this narrow loader neither
+		// deletes the entry nor touches its idle timer (it never calls
+		// touchAuthoritativeSnapshot even on a hit). The stale entry is safe to
+		// leave in place: nothing here re-arms its eviction, so it is still
+		// bounded by whatever idle window the full loader (or the original
+		// write) last set, not left to live indefinitely.
 	}
 	if (!body) return null;
 	return readSnapshotExportsAndRulesBody(body.path, body.gz);
@@ -809,18 +824,23 @@ function loadProjectSnapshotInternal(
 	const key = normalizeMapKey(cwd);
 	const body = resolveSnapshotBodyPath(cwd);
 	// Authoritative in-process write wins while our own (possibly still
-	// in-flight) write has not been superseded on disk by a newer external
-	// mtime. `body === null` means nothing is on disk yet — our just-scheduled
-	// write is the only truth, so serve it.
+	// in-flight) write has not been superseded on disk by a newer external mtime
+	// or a different-size body in the same/coarser bucket. `body === null` means
+	// nothing is on disk — either our just-scheduled write hasn't landed yet, or
+	// something removed the body after we wrote it (e.g. a cleared cache dir).
+	// Neither case is "the body changed size", so serve the in-process object.
 	const authoritative = authoritativeSnapshots.get(key);
 	if (authoritative) {
-		const diskMtime = body ? body.mtimeMs : Number.NEGATIVE_INFINITY;
-		if (diskMtime <= authoritative.knownMtime) {
+		const notSuperseded =
+			body === null ||
+			(body.mtimeMs <= authoritative.knownMtime &&
+				body.size === authoritative.knownSize);
+		if (notSuperseded) {
 			touchAuthoritativeSnapshot(key, authoritative);
 			return authoritative.snapshot;
 		}
-		// An external writer moved past our write — honor disk and stop
-		// serving the now-stale in-memory object.
+		// An external writer changed the body beyond our metadata stamp — honor
+		// disk and stop serving the now-stale in-memory object.
 		deleteAuthoritativeSnapshot(key);
 	}
 	if (!body) {
@@ -1298,9 +1318,11 @@ function reconcileAuthoritativeAfterWrite(
 		return;
 	}
 	try {
-		entry.knownMtime = fs.statSync(pending.gzPath).mtimeMs;
+		const stat = fs.statSync(pending.gzPath);
+		entry.knownMtime = stat.mtimeMs;
+		entry.knownSize = stat.size;
 	} catch {
-		// If we can't stat our own write, leave knownMtime as-is; the worst case
+		// If we can't stat our own write, leave the metadata as-is; the worst case
 		// is one extra disk re-parse on the next load.
 	}
 }
@@ -1812,11 +1834,16 @@ export function saveProjectSnapshot(
 	// legacy body to a merge-consumer, silently dropping this snapshot's fields.
 	const priorBody = resolveSnapshotBodyPath(cwd);
 	const knownMtime = priorBody ? priorBody.mtimeMs : Number.NEGATIVE_INFINITY;
+	const knownSize = priorBody ? priorBody.size : Number.NEGATIVE_INFINITY;
 	const authoritativeEntry: AuthoritativeSnapshotEntry = {
 		snapshot,
 		knownMtime,
+		knownSize,
 		lastUsedAt: Date.now(),
 	};
+	const previousAuthoritativeEntry = authoritativeSnapshots.get(key);
+	if (previousAuthoritativeEntry)
+		clearAuthoritativeSnapshotTimer(previousAuthoritativeEntry);
 	authoritativeSnapshots.set(key, authoritativeEntry);
 	scheduleAuthoritativeSnapshotEviction(key, authoritativeEntry);
 	enforceAuthoritativeSnapshotCap();

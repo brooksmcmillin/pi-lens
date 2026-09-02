@@ -160,7 +160,6 @@ const dartAnalyzeRunner: RunnerDefinition = {
 	id: "dart-analyze",
 	appliesTo: ["dart"],
 	priority: PRIORITY.GENERAL_ANALYSIS,
-	enabledByDefault: true,
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {

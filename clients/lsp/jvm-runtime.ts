@@ -213,6 +213,9 @@ function probeJavaOnPath(): Promise<boolean | undefined> {
 					javaAvailabilityLatch.getRetryAtMs() - Date.now(),
 				),
 				budgetMs: JAVA_PROBE_TIMEOUT_MS,
+				// No probe ran here: the latch's own remembered cause is replayed
+				// as-is, so the call site is the one asserting it (#2209).
+				classifiedBy: "caller",
 			});
 			return Promise.resolve(undefined);
 		}
@@ -254,6 +257,7 @@ async function runJavaProbe(): Promise<boolean | undefined> {
 			latched: true,
 			hostStallMs,
 			budgetMs: JAVA_PROBE_TIMEOUT_MS,
+			classifiedBy: "probe",
 		});
 		return true;
 	}
@@ -276,6 +280,7 @@ async function runJavaProbe(): Promise<boolean | undefined> {
 		hostStallMs,
 		...(retryAfterMs > 0 && { retryAfterMs }),
 		budgetMs: JAVA_PROBE_TIMEOUT_MS,
+		classifiedBy: "probe",
 	});
 	return outcome === "transient" ? undefined : false;
 }

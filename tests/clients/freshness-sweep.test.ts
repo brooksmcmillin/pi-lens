@@ -23,6 +23,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { toPosix } from "../../clients/path-utils.js";
+import { assertNonEmptyScan } from "../support/sweep-kit.js";
 
 const REPO_ROOT = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -35,6 +36,8 @@ const KERNEL_FILE = "freshness.ts";
 const EXEMPT: Record<string, string> = {
 	"bounded-pid-file-lock.ts":
 		"age-based TTL staleness of a lock file (Date.now() - mtime), not comparison against a recorded scan/record timestamp",
+	"instance-registry-lock.ts":
+		"lock staleness is a cross-process liveness check on a foreign file, not a content-freshness read; freshnessFromMtime targets in-kernel content caches",
 	"installer/index.ts":
 		"age-based maxAge expiry of a cached install probe, same TTL-not-freshness shape",
 	"lsp/lombok.ts":
@@ -50,6 +53,8 @@ describe("freshness kernel coverage (#1739)", () => {
 
 	it("every mtime-comparison site uses the kernel or carries an exemption", () => {
 		const violations: string[] = [];
+		let scanned = 0;
+		let matched = 0;
 		const walkDir = (dir: string): void => {
 			for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
 				const full = path.join(dir, entry.name);
@@ -69,6 +74,8 @@ describe("freshness kernel coverage (#1739)", () => {
 				const hits = [
 					...source.matchAll(/\.mtimeMs\s*(?:>|>=)\s*(?!best\b)[A-Za-z_$]/g),
 				];
+				scanned++;
+				matched += hits.length;
 				if (hits.length === 0) continue;
 				const base = path.basename(rel);
 				if (EXEMPT[rel] || EXEMPT[base]) continue;
@@ -76,6 +83,14 @@ describe("freshness kernel coverage (#1739)", () => {
 			}
 		};
 		walkDir(CLIENTS_DIR);
+		// Calibration: 393 production files walked on 2026-08-26; half rounds
+		// to 200. The matched population is 5, so its floor is 3.
+		assertNonEmptyScan("freshness sweep: clients files scanned", scanned, 200);
+		assertNonEmptyScan(
+			"freshness sweep: freshness-shaped comparisons",
+			matched,
+			3,
+		);
 		expect(
 			violations,
 			`out-of-kernel mtime comparisons found - migrate to clients/freshness.ts freshnessFromMtime(), or add an EXEMPT entry with a reason: ${violations.join(", ")}`,

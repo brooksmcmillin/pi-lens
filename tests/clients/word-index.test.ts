@@ -2,24 +2,52 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	buildWordIndex,
+	collectWordIndexDocs,
 	buildWordIndexQueryFilter,
 	centralityFromReverseDeps,
 	deserializeWordIndex,
 	getWordIndexBuildStatus,
 	parseWordIndexQuery,
+	flushWordIndexRecompactionsForTests,
 	searchWordIndex,
 	serializeWordIndex,
 	splitIdentifier,
 	tokenizeLine,
+	updateWordIndexDocument,
 	WORD_INDEX_FORMAT_VERSION,
 	WordIndexQueryError,
 	wordIndexKey,
 	_resetWordIndexBuildGuardForTests,
 	triggerBackgroundWordIndexBuild,
 } from "../../clients/word-index.js";
+import {
+	compactPostingsIntoArena,
+	compactPostingsIntoArenaCooperatively,
+	countPostingBackingStores,
+	estimateWordIndexStoreBytes,
+	WORD_POSTING_LIST_OVERHEAD_BYTES,
+	WordPostingList,
+} from "../../clients/word-index-store.js";
 import { KIND_EXTENSIONS } from "../../clients/file-kinds.js";
 import { loadProjectSnapshot } from "../../clients/project-snapshot.js";
+import {
+	getDegradationSummary,
+	resetDegradationLedger,
+} from "../../clients/degradation-ledger.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
+
+/**
+ * Arena repacks recorded so far, read from the degradation ledger's own
+ * `word-index-arena-recompact` tally (#2117) rather than a parallel counter —
+ * `recompactWordIndexPostingsIfNeeded` bumps that ledger once per repack.
+ */
+function recompactionCount(): number {
+	return (
+		getDegradationSummary().find(
+			(group) => group.kind === "word-index-arena-recompact",
+		)?.count ?? 0
+	);
+}
 
 describe("splitIdentifier", () => {
 	it("splits camelCase and keeps the whole identifier", () => {
@@ -801,4 +829,216 @@ describe("triggerBackgroundWordIndexBuild (#348 cold-query stampede guard)", () 
 			env.cleanup();
 		}
 	}, 10_000);
+
+	it("recompacts the arena after full-corpus incremental churn (#2117)", async () => {
+		const env = setupTestEnvironment("pi-lens-wordindex-recompact-");
+		try {
+			for (let file = 0; file < 100; file += 1) {
+				createTempFile(
+					env.tmpDir,
+					`src/f${file}.ts`,
+					`sharedToken stableToken${file}`,
+				);
+			}
+			const docs = await collectWordIndexDocs(env.tmpDir);
+			const index = buildWordIndex(docs);
+			for (let file = 0; file < 100; file += 1) {
+				createTempFile(
+					env.tmpDir,
+					`src/f${file}.ts`,
+					`sharedToken changedToken${file} revision`,
+				);
+			}
+			for (let file = 0; file < 100; file += 1) {
+				updateWordIndexDocument(index, {
+					path: path.join(env.tmpDir, "src", `f${file}.ts`),
+					content: `sharedToken changedToken${file} revision`,
+				});
+			}
+			await flushWordIndexRecompactionsForTests(index);
+			expect(countPostingBackingStores(index.postings)).toBe(1);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	// #2246: the recompaction gate is a share of the vocabulary, not a flat 64
+	// stores. The flat gate was crossed by every edit — one replacement raises the
+	// store estimate by the edited document's distinct-token count (hundreds) — so
+	// the whole O(vocab) arena was rebuilt per edit. On a large-vocabulary index
+	// the proportional gate must fire a bounded number of times over many edits,
+	// while still firing at least once so churn cannot grow the arena without end.
+	//
+	// The loop turns the event loop between edits, the way a real session lands
+	// one edit per turn: the scheduled recompaction is a fire-and-forget async job
+	// coalesced by a single-flight, so without a turn a whole synchronous burst
+	// collapses into one repack and the gate's frequency is never exercised.
+	//
+	// Red-first proof: with the pre-#2246 flat 64-store gate (restore
+	// clients/word-index.ts from origin/master), the same fixture repacks once
+	// per edit — measured 297 of 300 — so the `toBeLessThan(40)` bound fails.
+	it("recompacts a share of the vocabulary, not once per edit (#2246)", async () => {
+		const DOCS = 100;
+		const REVISIONS = 3;
+		const TOKENS_PER_DOC = 40;
+		// Every document carries a disjoint token block, so the vocabulary is large
+		// (~4,000) and the proportional threshold (10% ≈ 400 stores) sits well above
+		// the 64-store floor. A flat 64 gate would repack far more often here.
+		const doc = (revision: number, id: number) => ({
+			path: `src/module${id}.ts`,
+			content: Array.from(
+				{ length: TOKENS_PER_DOC },
+				(_unused, t) =>
+					`const tokenR${revision}D${id}N${t} = valueR${revision}D${id}N${t};`,
+			).join("\n"),
+		});
+
+		const index = buildWordIndex(
+			Array.from({ length: DOCS }, (_unused, id) => doc(0, id)),
+		);
+		expect(index.postings.size).toBeGreaterThan(640); // 0.1 * size > 64 floor
+		resetDegradationLedger();
+		// Replace every document three times with fresh disjoint tokens, turning the
+		// loop between edits so each edit's scheduled repack can run before the next.
+		for (let revision = 1; revision <= REVISIONS; revision += 1) {
+			for (let id = 0; id < DOCS; id += 1) {
+				updateWordIndexDocument(index, doc(revision, id));
+				await new Promise((resolve) => setImmediate(resolve));
+			}
+		}
+		await flushWordIndexRecompactionsForTests(index);
+		const recompactions = recompactionCount();
+		// Bounded: the proportional gate repacks on the order of the churn-to-
+		// threshold ratio, not once per edit. 300 edits over a ~4,000-token
+		// vocabulary repacks under 40 times; the flat 64 gate does it ~300 times.
+		expect(recompactions).toBeGreaterThan(0);
+		expect(recompactions).toBeLessThan(40);
+	});
+
+	// #2246 review F2: the 64-store FLOOR needs its own red. The proportional
+	// half of the gate is pinned above, but on a small index the floor IS the
+	// gate, and dropping `Math.max(64, ...)` leaves a single-digit threshold that
+	// repacks a small corpus on nearly every edit. That mutation used to red only
+	// the wall-clock occupancy bound in word-index-per-edit.test.ts, which #2254
+	// replaces with a work count — so without this test the floor loses its guard.
+	// Deterministic by construction: it counts repacks, not milliseconds.
+	it("keeps the 64-store floor governing a small index (#2246)", async () => {
+		const DOCS = 40;
+		const REVISIONS = 2;
+		// A deliberately tiny vocabulary: two shared tokens plus one unique token
+		// per document, so `0.1 * postings.size` is single digits and the 64-store
+		// floor is what actually gates. This is the regime the floor exists for.
+		const doc = (revision: number, id: number) => ({
+			path: `src/small${id}.ts`,
+			content: `sharedalpha sharedbeta uniquetoken${revision}x${id}`,
+		});
+
+		const index = buildWordIndex(
+			Array.from({ length: DOCS }, (_unused, id) => doc(0, id)),
+		);
+		// Not vacuous: the proportional term really is below the floor here, so
+		// dropping the floor changes the threshold instead of being masked by it.
+		expect(Math.floor(index.postings.size * 0.1)).toBeLessThan(64);
+		resetDegradationLedger();
+		for (let revision = 1; revision <= REVISIONS; revision += 1) {
+			for (let id = 0; id < DOCS; id += 1) {
+				updateWordIndexDocument(index, doc(revision, id));
+				await new Promise((resolve) => setImmediate(resolve));
+			}
+		}
+		await flushWordIndexRecompactionsForTests(index);
+		// With the floor, 80 edits on this corpus repack a handful of times.
+		// Dropping `Math.max(64, ...)` repacks on nearly every edit.
+		expect(recompactionCount()).toBeLessThan(15);
+	});
+
+	// #2117 review F2: the cooperative compactor sizes the arena from a snapshot,
+	// then yields. A synchronous edit that grows a not-yet-adopted list during a
+	// yield made the pre-fix `adoptArena` write past the arena, and V8 silently
+	// dropped the overflow so the tail postings read `undefined`. The fix skips
+	// any list that changed since the snapshot, so no posting is ever corrupted.
+	it("never corrupts postings when an edit grows a list mid-recompaction (#2117)", async () => {
+		// Enough lane data that the copy crosses the 8 ms budget and yields at
+		// least once — the window the concurrent edit needs.
+		const postings = new Map<string, WordPostingList>();
+		const LISTS = 40_000;
+		const ENTRIES = 60;
+		for (let t = 0; t < LISTS; t += 1) {
+			const list = new WordPostingList(`token${t}`, ENTRIES);
+			for (let e = 0; e < ENTRIES; e += 1) list.push(t % 7, e);
+			postings.set(`token${t}`, list);
+		}
+		// The victim is inserted last, so the copy adopts it only at the very end;
+		// every yield gap lands before its adoption.
+		const victim = new WordPostingList("victimToken", 1);
+		victim.push(3, 0);
+		postings.set("victimToken", victim);
+
+		const recompact = compactPostingsIntoArenaCooperatively(postings);
+		let settled = false;
+		void recompact.then(() => {
+			settled = true;
+		});
+		// Grow the victim in each yield gap until the copy finishes. On the
+		// pre-fix code the grown victim overruns its 1-entry arena slot.
+		let grewDuringYield = false;
+		while (!settled) {
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			if (!settled) {
+				victim.push(3, victim.length);
+				grewDuringYield = true;
+			}
+		}
+		await recompact;
+
+		expect(grewDuringYield).toBe(true);
+		let corruptPostings = 0;
+		for (const list of postings.values()) {
+			for (let i = 0; i < list.length; i += 1) {
+				if (list.fileIdAt(i) === undefined || list.lineAt(i) === undefined) {
+					corruptPostings += 1;
+				}
+			}
+		}
+		expect(corruptPostings).toBe(0);
+	}, 30_000);
+
+	// #2117 criterion 3: the estimator charges each distinct backing store once,
+	// including abandoned arena slack, so a churned index reads higher than
+	// master's per-list-slice sum, which cannot see the vacated lanes. A list
+	// that outgrows its arena slice detaches to a private store; its old slice
+	// stays resident inside the shared arena but no list's `byteLength` covers
+	// it. The estimate must account for that slack.
+	it("charges abandoned arena slack that a per-list sum misses (#2117)", () => {
+		const postings = new Map<string, WordPostingList>();
+		for (const token of ["alpha", "beta", "gamma"]) {
+			const list = new WordPostingList(token, 4);
+			for (let e = 0; e < 4; e += 1) list.push(0, e);
+			postings.set(token, list);
+		}
+		// Pack the three lists into ONE shared arena (3 * 4 entries * 8 bytes).
+		compactPostingsIntoArena(postings);
+		const store = { postings };
+		const arena = postings.get("alpha")!.backingStore;
+		expect(arena.byteLength).toBe(96);
+		expect(postings.get("gamma")!.backingStore).toBe(arena);
+
+		// Grow beta far past its 4-entry slice: it detaches to a private store and
+		// abandons its 4-entry (32-byte) slice inside the still-referenced arena.
+		const beta = postings.get("beta")!;
+		beta.reserve(64);
+		expect(beta.backingStore).not.toBe(arena);
+
+		const estimate = estimateWordIndexStoreBytes(store);
+		// alpha and gamma still pin the whole arena, so its full byteLength — the
+		// abandoned beta slice included — is resident and must be charged, plus
+		// beta's new private store and one fixed overhead per list. Master summed
+		// only each list's own live slice (alpha 32 + gamma 32 for the arena), so
+		// it missed the 32 abandoned bytes and reads below this floor.
+		expect(estimate).toBeGreaterThanOrEqual(
+			arena.byteLength +
+				beta.backingStore.byteLength +
+				3 * WORD_POSTING_LIST_OVERHEAD_BYTES,
+		);
+	});
 });

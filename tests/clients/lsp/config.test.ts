@@ -153,3 +153,70 @@ describe("loadLSPConfig global configuration (#870)", () => {
 		expect(error).not.toHaveBeenCalled();
 	});
 });
+
+/**
+ * In-flight ABA release (#1968, kit-driven white-box probe — sibling of
+ * dead-code-client's/knip-client's bare-`.finally` release, same shape).
+ *
+ * `initLSPConfig`'s in-flight map cleared with a bare delete-by-key. The race
+ * needs a SECOND WRITER replacing the map entry mid-flight — the public API
+ * alone cannot produce it today (single set site; microtask FIFO orders every
+ * observer after A's cleanup) — so this test simulates that writer directly.
+ * `initLSPConfig` registers the map entry synchronously (before its first
+ * internal `await loadLSPConfig(cwd)` settles), so the successor can be
+ * installed with zero awaits between the call and the injection. Red on the
+ * pre-fix bare `.finally` delete: A's cleanup evicted B and the third caller
+ * started a duplicate config load.
+ */
+describe("initLSPConfig in-flight ABA release (#1968)", () => {
+	it("a late-settling init does not evict its mid-flight successor", async () => {
+		const projectDir = tmpDir("pi-lens-lsp-project-aba-");
+		const { initLSPConfig, _peekConfigInFlightForTests } =
+			await import("../../../clients/lsp/config.js");
+
+		const buildA = initLSPConfig(projectDir);
+		// Synchronous: the map entry is already registered here, before A's
+		// `await loadLSPConfig(cwd)` has had a chance to resolve.
+		const inFlight = _peekConfigInFlightForTests();
+		expect(inFlight.size).toBe(1);
+		const key = [...inFlight.keys()][0]!;
+
+		// B replaces the entry under the same key while A is still in flight.
+		let resolveSuccessor: () => void;
+		const successor = new Promise<void>((resolve) => {
+			resolveSuccessor = resolve;
+		});
+		inFlight.set(key, successor);
+
+		await buildA; // A settles
+
+		// B's entry survived A's cleanup.
+		expect(inFlight.get(key)).toBe(successor);
+
+		resolveSuccessor!();
+		await successor;
+	});
+
+	// Mutation-proof companion: pins that a normal, uncontested settlement
+	// still empties the slot, so a mutant that makes the identity guard
+	// permanently `false` (never releases) reds here. Checked by KEY, not
+	// overall map size — the sibling test above leaves a synthetic successor
+	// entry under its OWN key that nothing but a real `initLSPConfig` call for
+	// that same cwd would ever clear.
+	it("a normally-settling init still cleans up its own entry", async () => {
+		const projectDir = tmpDir("pi-lens-lsp-project-clean-");
+		const { initLSPConfig, _peekConfigInFlightForTests } =
+			await import("../../../clients/lsp/config.js");
+
+		const inFlight = _peekConfigInFlightForTests();
+		const before = new Set(inFlight.keys());
+		const pass = initLSPConfig(projectDir);
+		// Synchronous: the map entry is already registered here, exactly as the
+		// ABA test above relies on.
+		const key = [...inFlight.keys()].find((k) => !before.has(k))!;
+		expect(key).toBeDefined();
+
+		await pass;
+		expect(inFlight.has(key)).toBe(false);
+	});
+});

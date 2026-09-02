@@ -21,16 +21,33 @@ import {
 	forEachCooperatively,
 	yieldIfOverBudget,
 } from "./cooperative-budget.js";
+import { incrementDegradationCount } from "./degradation-ledger.js";
 import { KIND_EXTENSIONS, type FileKind } from "./file-kinds.js";
 import { PathKeyedMap } from "./path-keyed-map.js";
 import { isAtOrAboveHomeDir, normalizeEphemeralMapKey } from "./path-utils.js";
+import { createSingleFlight, type SingleFlight } from "./single-flight.js";
 import {
 	createDebounceScheduler,
 	type DebounceScheduler,
 } from "./persist-debounce.js";
 import { getWordIndexMaxFilesDerived } from "./project-scale.js";
+import {
+	compactPostingsIntoArena,
+	compactPostingsIntoArenaCooperatively,
+	countPostingBackingStores,
+	countPostingEntries,
+	estimateWordIndexStoreBytes,
+	WordForwardEntry,
+	WordIndexFileTable,
+	WordPostingList,
+} from "./word-index-store.js";
 import { logWordIndex } from "./word-index-logger.js";
 
+/**
+ * One posting, decoded. This is NOT the storage shape (#2069): postings live
+ * packed in a {@link WordPostingList}, and this object is materialized only
+ * when a caller asks for a decoded view via {@link wordIndexPostingHits}.
+ */
 export interface WordHit {
 	file: string;
 	line: number;
@@ -51,8 +68,15 @@ export interface WordHit {
 export const wordIndexKey = normalizeEphemeralMapKey;
 
 export interface WordIndex {
-	/** token → postings (one entry per (file,line) the token appears on). */
-	postings: Map<string, WordHit[]>;
+	/**
+	 * token → packed postings (one entry per (file,line) the token appears on).
+	 * Entries are `[fileId, line]` pairs in an `Int32Array`, where `fileId`
+	 * indexes {@link fileTable} (#2069). Use {@link wordIndexPostingHits} for a
+	 * decoded `{ file, line }` view.
+	 */
+	postings: Map<string, WordPostingList>;
+	/** Canonical file key ↔ dense file id ↔ display path, shared by every posting. */
+	fileTable: WordIndexFileTable;
 	/**
 	 * file → number of indexed tokens (document length, for BM25 normalization).
 	 * Path-keyed via {@link wordIndexKey} ({@link PathKeyedMap}) so build-form and
@@ -74,7 +98,7 @@ export interface WordIndex {
 	 * need incremental updates must treat a missing forward index as "no
 	 * incremental primitive available" and fall back to a full rebuild.
 	 */
-	forward?: PathKeyedMap<Map<string, number>>;
+	forward?: PathKeyedMap<WordForwardEntry>;
 	/** File mtimes captured when each document was tokenized (#958). */
 	fileMtimes: PathKeyedMap<number>;
 	/**
@@ -94,6 +118,28 @@ export interface WordIndex {
 	 * discipline forbids.
 	 */
 	fileSizes: PathKeyedMap<number>;
+	/** Bounded scalar aggregate for the current persist window. */
+	replacementStats?: { count: number; totalMs: number; maxMs: number };
+	/** Files whose wire contribution changed since the last serialized snapshot. */
+	dirtyFiles?: Set<string>;
+	/**
+	 * Running over-estimate of distinct posting backing stores since the last
+	 * compaction (#2117). Incremental edits bump it by one per fresh private
+	 * store they allocate; a compaction resets it to the exact store count. It
+	 * is an O(1) gate for the churn-recompaction threshold, so the per-edit hot
+	 * path never rebuilds a `Set` over the whole vocabulary. Over-counting only
+	 * recompacts marginally early, which is safe; it never under-counts, so it
+	 * never misses the threshold.
+	 */
+	postingStoreCount?: number;
+	/**
+	 * At-most-one-in-flight registry for this index's threshold-triggered arena
+	 * recompaction (#2117). Uses the repo's canonical `createSingleFlight`
+	 * primitive (#1753) rather than a hand-rolled latch, so a burst of edits
+	 * joins the running recompaction instead of stacking duplicates. Held on the
+	 * index so its lifetime is the index's and it adds no module-level state.
+	 */
+	recompactFlight?: SingleFlight<void>;
 }
 
 export interface RankedFile {
@@ -271,20 +317,300 @@ const WORD_INDEX_LONG_LINE_YIELD_CHARS = 4096;
  */
 function createEmptyWordIndex(truncated: boolean): WordIndex {
 	return {
-		postings: new Map<string, WordHit[]>(),
+		postings: new Map<string, WordPostingList>(),
+		fileTable: new WordIndexFileTable(),
 		docLengths: new PathKeyedMap<number>(wordIndexKey),
 		totalTokens: 0,
 		docCount: 0,
 		truncated,
-		forward: new PathKeyedMap<Map<string, number>>(wordIndexKey),
+		forward: new PathKeyedMap<WordForwardEntry>(wordIndexKey),
 		fileMtimes: new PathKeyedMap<number>(wordIndexKey),
 		fileSizes: new PathKeyedMap<number>(wordIndexKey),
+		replacementStats: { count: 0, totalMs: 0, maxMs: 0 },
+		dirtyFiles: new Set<string>(),
+		postingStoreCount: 0,
+		recompactFlight: createSingleFlight<void>(),
 	};
+}
+
+export function countWordIndexPostingEntries(index: WordIndex): number {
+	return countPostingEntries(index);
+}
+
+/**
+ * Estimated resident bytes of the index's two packed stores (#2069).
+ * Reported on the `full_rebuild`, `incremental_refresh`, and `cold_build`
+ * word-index log records and on the `memory_sample` word-index subsystem, so
+ * a heap census can be reconciled against the log without taking a snapshot —
+ * the gap that let #1999 under-count this subsystem by a factor of sixty.
+ */
+export function estimateWordIndexResidentBytes(index: WordIndex): number {
+	return estimateWordIndexStoreBytes(index);
+}
+
+/**
+ * Record a posting whose file id the file table cannot resolve (#2069).
+ *
+ * Unreachable by construction: {@link WordIndexFileTable.release} only runs
+ * after the forward index has enumerated and removed every posting naming that
+ * id. If it fires, that invariant broke, and the visible symptom is a query
+ * returning FEWER results with nothing to distinguish it from a smaller match
+ * set — the clean-versus-errored ambiguity AGENTS.md catalogs as shape 10.
+ *
+ * `incrementDegradationCount` rather than `recordDegradationOnce` because
+ * ranking is a hot loop: the tally stays exact for every occurrence while only
+ * the first per (kind, orphaned id) writes a durable row. Subject is the id
+ * itself, so aggregation keeps the discriminating identity.
+ */
+function recordOrphanWordIndexFileId(
+	fileId: number,
+	token: string,
+	seam: "search" | "decode",
+): void {
+	incrementDegradationCount({
+		kind: "word-index-orphan-file-id",
+		subject: `fileId:${fileId}`,
+		reason: `${seam} dropped a posting for token "${token}": the file table has no path for this id`,
+	});
+}
+
+/**
+ * Decode one token’s postings into `{ file, line }` objects. Allocates, so it
+ * is for callers that genuinely need the display form (tests, diagnostics) —
+ * never for the hot ranking loop, which reads the packed lanes directly.
+ */
+export function wordIndexPostingHits(
+	index: WordIndex,
+	token: string,
+): WordHit[] {
+	const list = index.postings.get(token);
+	if (!list) return [];
+	const hits: WordHit[] = [];
+	for (let i = 0; i < list.length; i += 1) {
+		const fileId = list.fileIdAt(i);
+		const file = index.fileTable.pathFor(fileId);
+		if (file === undefined) {
+			recordOrphanWordIndexFileId(fileId, token, "decode");
+			continue;
+		}
+		hits.push({ file, line: list.lineAt(i) });
+	}
+	return hits;
+}
+
+/**
+ * Settle a freshly built index's posting store into its compact resident form
+ * (#2069): re-home every list into one shared arena, sized from the live entry
+ * counts. That both releases the doubling growth slack a build leaves behind
+ * and stops the long tail of rare tokens paying for an `ArrayBuffer` header
+ * each.
+ */
+function compactWordIndexPostings(index: WordIndex): void {
+	compactPostingsIntoArena(index.postings);
+	index.postingStoreCount = countPostingBackingStores(index.postings);
+}
+
+/** Bump the running distinct-backing-store tally by `count` (#2117). */
+function notePostingStoresAllocated(index: WordIndex, count: number): void {
+	index.postingStoreCount = (index.postingStoreCount ?? 0) + count;
+}
+
+/**
+ * Floor for the recompaction gate: below this many backing stores the arena is
+ * never repacked, so a small index never pays an O(vocab) walk it cannot amortize
+ * (#2117). This is also the whole gate for indexes whose vocabulary is under
+ * `WORD_INDEX_RECOMPACT_STORE_FLOOR / WORD_INDEX_RECOMPACT_STORE_FRACTION`
+ * tokens, keeping the pre-#2246 behaviour for small corpora bit-identical.
+ */
+const WORD_INDEX_RECOMPACT_STORE_FLOOR = 64;
+
+/**
+ * Recompaction gate as a share of the live vocabulary (#2246). The flat 64-store
+ * threshold #2117 shipped was crossed by every single edit: one document
+ * replacement raises `postingStoreCount` by roughly the edited document's
+ * distinct-token count (hundreds), so the whole O(vocab) arena was rebuilt after
+ * every edit. Gating on a fraction of `postings.size` instead lets fragmentation
+ * accumulate proportionally to the index, so recompaction fires once per many
+ * edits rather than once per edit.
+ *
+ * Memory ceiling: the store count can reach a tenth of the vocabulary in private
+ * stores before a repack, each carrying a fixed header plus growth slack. #2117
+ * measured the fully-churned ceiling (every token private, store count =
+ * vocabulary) at +22% resident. The cost does not scale with the store count
+ * alone, because the tokens that churn most are also the ones carrying the
+ * longest posting lists. PR #2246's adversarial hot-token probe measured this
+ * gate at +13.7% resident at rest and +19.9% peak over base — inside the +22%
+ * #2117 accepted, but not by the wide margin a naive store-count ratio would
+ * predict. Raising the fraction further would cross that bound.
+ */
+const WORD_INDEX_RECOMPACT_STORE_FRACTION = 0.1;
+
+/**
+ * Backing-store count that triggers a repack for `index`: a fixed floor, or a
+ * share of the live vocabulary once the index is large enough for the share to
+ * exceed the floor. O(1) — reads `postings.size`, never walks the vocabulary.
+ */
+function wordIndexRecompactThreshold(index: WordIndex): number {
+	return Math.max(
+		WORD_INDEX_RECOMPACT_STORE_FLOOR,
+		Math.floor(index.postings.size * WORD_INDEX_RECOMPACT_STORE_FRACTION),
+	);
+}
+
+/**
+ * Pack the arena if churn has spread the postings across more than the
+ * threshold of backing stores (#2117, #2246). Runs the exact O(vocab) store
+ * count as the authoritative gate — the per-edit hot path uses the O(1)
+ * `postingStoreCount` estimate, so this expensive walk only happens inside the
+ * bounded, off-hot-path recompaction it guards. Resets the estimate to the
+ * true post-compaction count.
+ */
+async function recompactWordIndexPostingsIfNeeded(
+	index: WordIndex,
+	root: string,
+): Promise<void> {
+	const threshold = wordIndexRecompactThreshold(index);
+	const beforeStores = countPostingBackingStores(index.postings);
+	if (beforeStores <= threshold) {
+		index.postingStoreCount = beforeStores;
+		return;
+	}
+	const beforeBytes = estimateWordIndexResidentBytes(index);
+	await compactPostingsIntoArenaCooperatively(index.postings);
+	const afterStores = countPostingBackingStores(index.postings);
+	index.postingStoreCount = afterStores;
+	const afterBytes = estimateWordIndexResidentBytes(index);
+	const firstForRoot = incrementDegradationCount({
+		kind: "word-index-arena-recompact",
+		subject: path.resolve(root),
+		reason: `arena store threshold ${threshold} exceeded`,
+		metadata: { beforeBytes, afterBytes, beforeStores, afterStores },
+	});
+	// Keep the detailed record bounded per root. The ledger still counts every
+	// repeated recompaction and emits its own power-of-two summaries.
+	if (firstForRoot) {
+		logWordIndex({
+			phase: "incremental_refresh",
+			cwd: path.resolve(root),
+			trigger: "incremental_refresh",
+			reason: `arena_recompact beforeBytes=${beforeBytes} afterBytes=${afterBytes} beforeStores=${beforeStores} afterStores=${afterStores}`,
+		});
+	}
+}
+
+/**
+ * Serialize a recompaction through the per-index async operation queue so no
+ * async edit or refresh interleaves it (#2117). The queue plus the corruption-
+ * proof cooperative compactor together close the review-F2 data race: the queue
+ * excludes async operations, and the compactor's snapshot-and-skip publish
+ * excludes the synchronous per-edit path the queue cannot see. The per-index
+ * `recompactFlight` single-flight (#1753) keeps a burst of edits from stacking
+ * duplicates: a caller that arrives while one recompaction runs joins it rather
+ * than starting a second. The single slot uses a constant key.
+ */
+function enqueueWordIndexRecompact(
+	index: WordIndex,
+	root: string,
+): Promise<void> {
+	if ((index.postingStoreCount ?? 0) <= wordIndexRecompactThreshold(index)) {
+		return Promise.resolve();
+	}
+	const flight = (index.recompactFlight ??= createSingleFlight<void>());
+	return flight.run("recompact", () =>
+		enqueueAsyncWordIndexOperation(index, () =>
+			recompactWordIndexPostingsIfNeeded(index, root),
+		),
+	);
+}
+
+/**
+ * O(1) hot-path gate for the synchronous per-edit seam. Reads the running
+ * store-count estimate, never a fresh `Set` over the vocabulary, then defers
+ * the actual work onto the async queue so it cannot stall the edit (#2117).
+ */
+function scheduleWordIndexRecompact(index: WordIndex, filePath: string): void {
+	void enqueueWordIndexRecompact(index, path.dirname(filePath));
+}
+
+/**
+ * Test hook: settle any queued arena recompaction for `index`. Draining the
+ * index's own async operation queue is enough because the recompaction runs
+ * through it; there is no module-level scheduler to flush.
+ */
+export async function flushWordIndexRecompactionsForTests(
+	index: WordIndex,
+): Promise<void> {
+	await (asyncWordIndexOperations.get(index) ?? Promise.resolve());
+}
+
+function recordWordIndexReplacement(index: WordIndex, startedAt: number): void {
+	const stats = index.replacementStats ?? { count: 0, totalMs: 0, maxMs: 0 };
+	const durationMs = Math.max(0, Date.now() - startedAt);
+	stats.count += 1;
+	stats.totalMs += durationMs;
+	stats.maxMs = Math.max(stats.maxMs, durationMs);
+	index.replacementStats = stats;
+}
+
+/** Intern a document path once per index; posting removal compares this id. */
+function internWordIndexFile(index: WordIndex, filePath: string): number {
+	return index.fileTable.intern(wordIndexKey(filePath), filePath);
+}
+
+function appendWordIndexPostings(
+	index: WordIndex,
+	filePath: string,
+	perTokenHits: Map<string, number[]>,
+): Map<string, number> {
+	const fileId = internWordIndexFile(index, filePath);
+	const tokenLineCounts = new Map<string, number>();
+	for (const [token, lineNumbers] of perTokenHits) {
+		let list = index.postings.get(token);
+		if (list) {
+			// A grow allocates a fresh private store; count it so the O(1) gate
+			// tracks fragmentation without re-walking the vocabulary (#2117).
+			if (list.reserve(list.length + lineNumbers.length)) {
+				notePostingStoresAllocated(index, 1);
+			}
+		} else {
+			list = new WordPostingList(token, lineNumbers.length);
+			index.postings.set(token, list);
+			notePostingStoresAllocated(index, 1);
+		}
+		// `list.token` is the canonical instance, so the forward entry points at
+		// the same string the postings map is keyed by instead of retaining this
+		// document’s own tokenizer allocation (#2069).
+		tokenLineCounts.set(list.token, lineNumbers.length);
+		for (const line of lineNumbers) list.push(fileId, line);
+	}
+	return tokenLineCounts;
+}
+
+function commitWordIndexDocumentReplacement(
+	index: WordIndex,
+	doc: { path: string; content: string },
+	perTokenHits: Map<string, number[]>,
+	docLength: number,
+	startedAt: number,
+): void {
+	const tokenLineCounts = appendWordIndexPostings(
+		index,
+		doc.path,
+		perTokenHits,
+	);
+	index.docLengths.set(doc.path, docLength);
+	index.forward!.set(doc.path, WordForwardEntry.fromTally(tokenLineCounts));
+	index.fileMtimes.set(doc.path, -1);
+	index.fileSizes.set(doc.path, Buffer.byteLength(doc.content, "utf-8"));
+	index.dirtyFiles?.add(wordIndexKey(doc.path));
+	index.totalTokens += docLength;
+	index.docCount += 1;
+	recordWordIndexReplacement(index, startedAt);
 }
 
 function indexWordLine(
 	index: WordIndex,
-	filePath: string,
+	fileId: number,
 	line: string,
 	lineNumber: number,
 	tokenLineCounts: Map<string, number>,
@@ -294,10 +620,15 @@ function indexWordLine(
 	for (const token of lineTokens) {
 		if (seenOnLine.has(token)) continue;
 		seenOnLine.add(token);
-		const arr = index.postings.get(token);
-		if (arr) arr.push({ file: filePath, line: lineNumber });
-		else index.postings.set(token, [{ file: filePath, line: lineNumber }]);
-		tokenLineCounts.set(token, (tokenLineCounts.get(token) ?? 0) + 1);
+		let list = index.postings.get(token);
+		if (!list) {
+			list = new WordPostingList(token, 1);
+			index.postings.set(token, list);
+		}
+		list.push(fileId, lineNumber);
+		// Canonical instance, not this line’s fresh tokenizer allocation (#2069).
+		const canonical = list.token;
+		tokenLineCounts.set(canonical, (tokenLineCounts.get(canonical) ?? 0) + 1);
 	}
 	return lineTokens.length;
 }
@@ -309,12 +640,15 @@ function finishWordIndexDocument(
 	tokenLineCounts: Map<string, number>,
 ): void {
 	index.docLengths.set(doc.path, docLength);
-	index.forward?.set(doc.path, tokenLineCounts);
+	index.forward?.set(doc.path, WordForwardEntry.fromTally(tokenLineCounts));
 	index.fileMtimes.set(doc.path, doc.mtimeMs ?? 0);
 	index.fileSizes.set(
 		doc.path,
 		doc.size ?? Buffer.byteLength(doc.content, "utf-8"),
 	);
+	// A build has no prior wire cache. Keeping the marker makes a future
+	// serializer cache explicit and gives incremental refresh one uniform seam.
+	index.dirtyFiles?.add(wordIndexKey(doc.path));
 	index.totalTokens += docLength;
 	index.docCount += 1;
 }
@@ -323,17 +657,12 @@ function indexWordDocument(
 	index: WordIndex,
 	doc: WordIndexInputDocument,
 ): void {
+	const fileId = internWordIndexFile(index, doc.path);
 	const lines = doc.content.split(/\r?\n/);
 	const tokenLineCounts = new Map<string, number>();
 	let docLength = 0;
 	for (let i = 0; i < lines.length; i += 1) {
-		docLength += indexWordLine(
-			index,
-			doc.path,
-			lines[i],
-			i + 1,
-			tokenLineCounts,
-		);
+		docLength += indexWordLine(index, fileId, lines[i], i + 1, tokenLineCounts);
 	}
 	finishWordIndexDocument(index, doc, docLength, tokenLineCounts);
 }
@@ -341,6 +670,7 @@ function indexWordDocument(
 export function buildWordIndex(files: WordIndexInputDocuments): WordIndex {
 	const index = createEmptyWordIndex(files.truncated ?? false);
 	for (const doc of files) indexWordDocument(index, doc);
+	compactWordIndexPostings(index);
 	return index;
 }
 
@@ -359,12 +689,13 @@ export async function buildWordIndexAsync(
 	const deadline = createDeadline(WORD_INDEX_BUILD_YIELD_BUDGET_MS);
 	for (const doc of files) {
 		if (!shouldContinue()) throw new Error("word index build superseded");
+		const fileId = internWordIndexFile(index, doc.path);
 		const lines = doc.content.split(/\r?\n/);
 		const tokenLineCounts = new Map<string, number>();
 		let docLength = 0;
 		for (let i = 0; i < lines.length; i += 1) {
 			const line = lines[i];
-			docLength += indexWordLine(index, doc.path, line, i + 1, tokenLineCounts);
+			docLength += indexWordLine(index, fileId, line, i + 1, tokenLineCounts);
 			if (
 				line.length >= WORD_INDEX_LONG_LINE_YIELD_CHARS ||
 				deadline.expired()
@@ -378,6 +709,7 @@ export async function buildWordIndexAsync(
 			if (!shouldContinue()) throw new Error("word index build superseded");
 		}
 	}
+	compactWordIndexPostings(index);
 	return index;
 }
 
@@ -397,18 +729,25 @@ export function removeWordIndexDocument(
 	const tokenLineCounts = index.forward.get(filePath);
 	if (!tokenLineCounts) return false;
 
-	// `postings` is token-keyed (not a PathKeyedMap), so its `WordHit.file`
-	// display strings must be compared through the SAME normalizer the path maps
-	// use — otherwise a build-form hit (`SUB/a.ts`) survives an edit-form removal
+	// `postings` is token-keyed (not a PathKeyedMap), so the file identity it
+	// carries must be resolved through the SAME normalizer the path maps use —
+	// otherwise a build-form hit (`SUB/a.ts`) survives an edit-form removal
 	// (`sub/a.ts`) on a case-insensitive FS and lingers as a stale posting
-	// (the #1025 item #2 bug this fix closes).
+	// (the #1025 item #2 bug this fix closes). Since #2069 that identity is the
+	// file table’s integer id, so the comparison below is an int compare rather
+	// than a per-element string compare.
 	const removedKey = wordIndexKey(filePath);
+	const removedId = index.fileTable.idFor(removedKey);
+	if (removedId === undefined) return false;
 	for (const token of tokenLineCounts.keys()) {
-		const arr = index.postings.get(token);
-		if (!arr) continue;
-		const next = arr.filter((hit) => wordIndexKey(hit.file) !== removedKey);
-		if (next.length > 0) index.postings.set(token, next);
-		else index.postings.delete(token);
+		const list = index.postings.get(token);
+		if (!list) continue;
+		const next = list.withoutFile(removedId);
+		// `withoutFile` always returns a freshly allocated private store (#2117).
+		if (next.length > 0) {
+			index.postings.set(token, next);
+			notePostingStoresAllocated(index, 1);
+		} else index.postings.delete(token);
 	}
 
 	const docLength = index.docLengths.get(filePath) ?? 0;
@@ -416,6 +755,8 @@ export function removeWordIndexDocument(
 	index.forward.delete(filePath);
 	index.fileMtimes.delete(filePath);
 	index.fileSizes.delete(filePath);
+	index.dirtyFiles?.add(wordIndexKey(filePath));
+	index.fileTable.release(removedKey);
 	index.totalTokens -= docLength;
 	index.docCount = Math.max(0, index.docCount - 1);
 	return true;
@@ -439,6 +780,7 @@ export function updateWordIndexDocument(
 	doc: { path: string; content: string },
 ): boolean {
 	if (!index.forward) return false;
+	const startedAt = Date.now();
 
 	// Remove the old contribution first (no-op if this is a brand new doc).
 	if (index.forward.has(doc.path)) {
@@ -464,38 +806,46 @@ export function updateWordIndexDocument(
 		}
 	}
 
-	const tokenLineCounts = new Map<string, number>();
-	for (const [token, lineNumbers] of perTokenHits) {
-		tokenLineCounts.set(token, lineNumbers.length);
-		const hits = lineNumbers.map((line) => ({ file: doc.path, line }));
-		const arr = index.postings.get(token);
-		if (arr) arr.push(...hits);
-		else index.postings.set(token, hits);
-	}
-
-	index.docLengths.set(doc.path, docLength);
-	index.forward.set(doc.path, tokenLineCounts);
 	// Per-edit callers generally already have content but not a stat. -1 is an
 	// impossible real mtime, so it deliberately makes the document stale at the
 	// next startup refresh (`-1 !== realMtime` always) — unlike 0, which is a
 	// legal on-disk mtime (SOURCE_DATE_EPOCH=0, archive extraction) and would
 	// collide, leaving such a file never re-tokenized (#958 review F2).
-	index.fileMtimes.set(doc.path, -1);
-	// Size is likewise recorded for the #1105 mtime+size refresh gate. The -1
-	// mtime already forces a re-read next session, so this value only keeps the
-	// map dense (parallel to fileMtimes); store the real byte length so a
-	// deserialize→reserialize round-trip before any refresh carries a truthful
-	// size rather than a placeholder.
-	index.fileSizes.set(doc.path, Buffer.byteLength(doc.content, "utf-8"));
-	index.totalTokens += docLength;
-	index.docCount += 1;
+	commitWordIndexDocumentReplacement(
+		index,
+		doc,
+		perTokenHits,
+		docLength,
+		startedAt,
+	);
+	scheduleWordIndexRecompact(index, doc.path);
 	return true;
 }
 
 type StagedWordIndexRemoval = {
-	postings: Map<string, WordHit[] | undefined>;
+	postings: Map<string, WordPostingList | undefined>;
 	docLength: number;
 };
+
+const asyncWordIndexOperations = new WeakMap<WordIndex, Promise<void>>();
+
+function enqueueAsyncWordIndexOperation<T>(
+	index: WordIndex,
+	operation: () => Promise<T>,
+): Promise<T> {
+	const previous = asyncWordIndexOperations.get(index) ?? Promise.resolve();
+	const run = previous.catch(() => undefined).then(operation);
+	const settled = run.then(
+		() => undefined,
+		() => undefined,
+	);
+	asyncWordIndexOperations.set(index, settled);
+	return run.finally(() => {
+		if (asyncWordIndexOperations.get(index) === settled) {
+			asyncWordIndexOperations.delete(index);
+		}
+	});
+}
 
 async function stageWordIndexDocumentRemoval(
 	index: WordIndex,
@@ -506,20 +856,27 @@ async function stageWordIndexDocumentRemoval(
 	const tokenLineCounts = index.forward.get(filePath);
 	if (!tokenLineCounts) return undefined;
 	const removedKey = wordIndexKey(filePath);
-	const postings = new Map<string, WordHit[] | undefined>();
+	const removedId = index.fileTable.idFor(removedKey);
+	if (removedId === undefined) return undefined;
+	const postings = new Map<string, WordPostingList | undefined>();
 	const deadline = createDeadline(WORD_INDEX_BUILD_YIELD_BUDGET_MS);
 	for (const token of tokenLineCounts.keys()) {
 		if (!shouldContinue()) throw new Error("word index refresh superseded");
-		const arr = index.postings.get(token);
-		if (!arr) continue;
-		const next: WordHit[] = [];
-		for (const hit of arr) {
-			if (wordIndexKey(hit.file) !== removedKey) next.push(hit);
-			if (deadline.expired() && (await yieldIfOverBudget(deadline))) {
-				if (!shouldContinue()) throw new Error("word index refresh superseded");
-			}
+		const list = index.postings.get(token);
+		if (!list) continue;
+		// One token's postings, filtered by the SAME packed primitive the
+		// synchronous path uses, so the staged result is identical rather than
+		// merely equivalent. The work unit is the token, not the posting element:
+		// a per-element deadline check cost one `performance.now()` per entry —
+		// on the order of a million per edit on a 2.2M-posting corpus — which is
+		// the tax that made this path unusable from the per-edit seam (#2067).
+		// One list's scan is a bounded, non-yieldable unit; the deadline is
+		// checked between lists.
+		const survivors = list.withoutFile(removedId);
+		postings.set(token, survivors.length > 0 ? survivors : undefined);
+		if (deadline.expired() && (await yieldIfOverBudget(deadline))) {
+			if (!shouldContinue()) throw new Error("word index refresh superseded");
 		}
-		postings.set(token, next.length > 0 ? next : undefined);
 	}
 	return { postings, docLength: index.docLengths.get(filePath) ?? 0 };
 }
@@ -529,14 +886,21 @@ function commitWordIndexDocumentRemoval(
 	filePath: string,
 	staged: StagedWordIndexRemoval,
 ): void {
-	for (const [token, hits] of staged.postings) {
-		if (hits) index.postings.set(token, hits);
-		else index.postings.delete(token);
+	for (const [token, list] of staged.postings) {
+		// Staged survivors come from `WordPostingList.withoutFile` — a fresh
+		// private store each, so the O(1) fragmentation gate must count them
+		// (#2117).
+		if (list) {
+			index.postings.set(token, list);
+			notePostingStoresAllocated(index, 1);
+		} else index.postings.delete(token);
 	}
 	index.docLengths.delete(filePath);
 	index.forward?.delete(filePath);
 	index.fileMtimes.delete(filePath);
 	index.fileSizes.delete(filePath);
+	index.dirtyFiles?.add(wordIndexKey(filePath));
+	index.fileTable.release(wordIndexKey(filePath));
 	index.totalTokens -= staged.docLength;
 	index.docCount = Math.max(0, index.docCount - 1);
 }
@@ -547,15 +911,38 @@ export async function removeWordIndexDocumentAsync(
 	filePath: string,
 	shouldContinue: () => boolean = () => true,
 ): Promise<boolean> {
-	const staged = await stageWordIndexDocumentRemoval(
-		index,
-		filePath,
-		shouldContinue,
-	);
-	if (!staged) return false;
-	if (!shouldContinue()) throw new Error("word index refresh superseded");
-	commitWordIndexDocumentRemoval(index, filePath, staged);
-	return true;
+	return enqueueAsyncWordIndexOperation(index, async () => {
+		const staged = await stageWordIndexDocumentRemoval(
+			index,
+			filePath,
+			shouldContinue,
+		);
+		if (!staged) return false;
+		if (!shouldContinue()) throw new Error("word index refresh superseded");
+		commitWordIndexDocumentRemoval(index, filePath, staged);
+		return true;
+	});
+}
+
+/**
+ * The per-edit replacement primitive the cascade seam calls (#2067).
+ *
+ * `updateWordIndexDocumentAsync` plus the arena-recompaction gate the
+ * synchronous variant carries, which is what makes this the per-edit entry
+ * point rather than a rename. Bulk refresh must NOT use it: one refreshed
+ * document raises `postingStoreCount` by roughly its distinct-token count, so a
+ * per-document schedule would drive an O(vocabulary) recompaction between
+ * nearly every pair of documents. `refreshWordIndexIncrementally` therefore
+ * drives `updateWordIndexDocumentAsync` directly and recompacts ONCE after its
+ * loop; the per-edit seam has no such "after the loop" and schedules here.
+ */
+export async function updateWordIndexDocumentForEdit(
+	index: WordIndex,
+	doc: { path: string; content: string },
+): Promise<boolean> {
+	const updated = await updateWordIndexDocumentAsync(index, doc);
+	if (updated) scheduleWordIndexRecompact(index, doc.path);
+	return updated;
 }
 
 /** Cooperative replacement whose old/new state is committed without an await. */
@@ -564,7 +951,18 @@ export async function updateWordIndexDocumentAsync(
 	doc: { path: string; content: string },
 	shouldContinue: () => boolean = () => true,
 ): Promise<boolean> {
+	return enqueueAsyncWordIndexOperation(index, () =>
+		updateWordIndexDocumentAsyncUnsafe(index, doc, shouldContinue),
+	);
+}
+
+async function updateWordIndexDocumentAsyncUnsafe(
+	index: WordIndex,
+	doc: { path: string; content: string },
+	shouldContinue: () => boolean,
+): Promise<boolean> {
 	if (!index.forward) return false;
+	const startedAt = Date.now();
 	const removal = index.forward.has(doc.path)
 		? await stageWordIndexDocumentRemoval(index, doc.path, shouldContinue)
 		: undefined;
@@ -594,20 +992,13 @@ export async function updateWordIndexDocumentAsync(
 	);
 	if (!shouldContinue()) throw new Error("word index refresh superseded");
 	if (removal) commitWordIndexDocumentRemoval(index, doc.path, removal);
-	const tokenLineCounts = new Map<string, number>();
-	for (const [token, lineNumbers] of perTokenHits) {
-		tokenLineCounts.set(token, lineNumbers.length);
-		const hits = lineNumbers.map((line) => ({ file: doc.path, line }));
-		const arr = index.postings.get(token);
-		if (arr) arr.push(...hits);
-		else index.postings.set(token, hits);
-	}
-	index.docLengths.set(doc.path, docLength);
-	index.forward.set(doc.path, tokenLineCounts);
-	index.fileMtimes.set(doc.path, -1);
-	index.fileSizes.set(doc.path, Buffer.byteLength(doc.content, "utf-8"));
-	index.totalTokens += docLength;
-	index.docCount += 1;
+	commitWordIndexDocumentReplacement(
+		index,
+		doc,
+		perTokenHits,
+		docLength,
+		startedAt,
+	);
 	return true;
 }
 
@@ -787,6 +1178,12 @@ const WORD_INDEX_FILE_READ_TOKEN_COST = 300;
  * against a 1,436 ms rebuild + re-read). The synthetic high-df corpus in the
  * #1197 probe gives 0.09, so this is the conservative (incremental-favouring)
  * end of the observed range.
+ *
+ * #2069 made the scan an Int32 compare over packed lanes instead of a string
+ * compare over boxed objects, so the real per-element cost is now BELOW this
+ * constant. The constant is left as measured: over-stating incremental cost
+ * only ever routes work to a full rebuild, which is the bounded side of the
+ * decision. Re-measuring it is #2067/#2068 territory, not this change.
  */
 const WORD_INDEX_POSTING_SCAN_TOKEN_COST = 0.2;
 
@@ -938,9 +1335,9 @@ export async function refreshWordIndexIncrementally(
 	// this decision exists to avoid.
 	let postingEntries = 0;
 	let weightedPostingEntries = 0;
-	for (const hits of index.postings.values()) {
-		postingEntries += hits.length;
-		weightedPostingEntries += hits.length * hits.length;
+	for (const list of index.postings.values()) {
+		postingEntries += list.length;
+		weightedPostingEntries += list.length * list.length;
 	}
 	// The mean posting-array length weighted by OCCURRENCES, not the plain mean:
 	// a document's tokens are drawn from the frequency distribution, so the arrays
@@ -1051,6 +1448,9 @@ export async function refreshWordIndexIncrementally(
 		}
 	}
 	timings.refreshReadsMs = Date.now() - refreshReadsStartMs;
+	// Route through the same guarded queue the per-edit seam uses, so a refresh
+	// and a concurrent cascade edit cannot both drive a recompaction (#2117).
+	await enqueueWordIndexRecompact(index, root);
 	index.truncated = walked.length === maxFiles;
 	return {
 		mode: "incremental",
@@ -1343,19 +1743,31 @@ export function searchWordIndex(
 		const posting = index.postings.get(token);
 		if (!posting) continue;
 
-		const linesByFile = new Map<string, number[]>();
-		for (const hit of posting) {
-			const arr = linesByFile.get(hit.file);
-			if (arr) arr.push(hit.line);
-			else linesByFile.set(hit.file, [hit.line]);
+		// Grouped by the packed file id, then resolved to the display path once
+		// per (token, file) instead of once per posting (#2069). Insertion order,
+		// document frequency, and the per-file line lists are identical to the
+		// boxed representation, so scores and ordering are unchanged.
+		const linesByFileId = new Map<number, number[]>();
+		for (let i = 0; i < posting.length; i += 1) {
+			const fileId = posting.fileIdAt(i);
+			const arr = linesByFileId.get(fileId);
+			if (arr) arr.push(posting.lineAt(i));
+			else linesByFileId.set(fileId, [posting.lineAt(i)]);
 		}
 
-		const docFrequency = linesByFile.size;
+		const docFrequency = linesByFileId.size;
 		const idf = Math.log(
 			1 + (docCount - docFrequency + 0.5) / (docFrequency + 0.5),
 		);
 
-		for (const [file, lines] of linesByFile) {
+		for (const [fileId, lines] of linesByFileId) {
+			const file = index.fileTable.pathFor(fileId);
+			if (file === undefined) {
+				// Dropping this silently would shorten the result list with nothing to
+				// tell it apart from a smaller match set. Record, then drop.
+				recordOrphanWordIndexFileId(fileId, token, "search");
+				continue;
+			}
 			if (combinedFilter && !combinedFilter(file)) continue;
 			const termFrequency = lines.length;
 			const docLength = index.docLengths.get(file) ?? avgDocLength;
@@ -1464,18 +1876,82 @@ export interface SerializedWordIndex {
 /** Persisted word-index serialization format version. Bump on breaking format changes. */
 export const WORD_INDEX_FORMAT_VERSION = 2;
 
-export function serializeWordIndex(index: WordIndex): SerializedWordIndex {
+const WORD_INDEX_INT32_MAX = 2_147_483_647;
+// A file id and line fit in one exact Number key through this boundary.
+const WORD_INDEX_PACKED_FILE_ID_MAX = 4_194_303;
+
+function isCanonicalWordIndexNumber(value: unknown): value is number {
+	return (
+		typeof value === "number" &&
+		Number.isFinite(value) &&
+		Number.isSafeInteger(value) &&
+		!Object.is(value, -0)
+	);
+}
+
+function isCanonicalWordIndexToken(token: unknown): token is string {
+	return (
+		typeof token === "string" &&
+		token.length >= 2 &&
+		token === token.toLowerCase() &&
+		/^[a-z0-9_$]+$/.test(token) &&
+		!STOPWORDS.has(token)
+	);
+}
+
+interface SerializedWordIndexCache {
+	serialized: SerializedWordIndex;
+	slotByFileId: Map<number, number>;
+	tokensByFile: Map<string, Set<string>>;
+}
+
+const serializedWordIndexCaches = new WeakMap<
+	WordIndex,
+	SerializedWordIndexCache
+>();
+
+/**
+ * Deterministic work performed by the most recent {@link serializeWordIndex}
+ * call: how many distinct tokens the persist pass re-flattened, and whether
+ * it took the bounded incremental path or fell back to a full rebuild.
+ * Test-only observability (#2202) — the incremental path's whole point is to
+ * touch O(dirty-file tokens), not O(corpus tokens), and that property is a
+ * deterministic count, not a wall-clock duration, so it does not flake under
+ * runner load the way a same-run timing ratio does.
+ */
+export interface WordIndexSerializeWork {
+	affectedTokenCount: number;
+	tookFullPath: boolean;
+}
+
+let _lastSerializeWork: WordIndexSerializeWork | undefined;
+
+/** Test-only: work stats for the most recent {@link serializeWordIndex} call. */
+export function getLastWordIndexSerializeWork():
+	| WordIndexSerializeWork
+	| undefined {
+	return _lastSerializeWork;
+}
+
+function serializeWordIndexFull(index: WordIndex): SerializedWordIndexCache {
 	const files = [...index.docLengths.keys()];
-	const fileIndex = new Map<string, number>();
-	files.forEach((file, i) => fileIndex.set(file, i));
+	// `files` carries whatever spelling `docLengths` last stored, which can
+	// differ from the spelling the file table interned. Both fold through
+	// `wordIndexKey`, so the slot lookup runs in the folded key space and a
+	// separator- or case-divergent spelling still finds its postings (#1025).
+	const slotByFileId = new Map<number, number>();
+	files.forEach((file, i) => {
+		const fileId = index.fileTable.idFor(wordIndexKey(file));
+		if (fileId !== undefined) slotByFileId.set(fileId, i);
+	});
 
 	const postings: Array<[string, number[]]> = [];
-	for (const [token, hits] of index.postings) {
+	for (const [token, list] of index.postings) {
 		const flat: number[] = [];
-		for (const hit of hits) {
-			const idx = fileIndex.get(hit.file);
-			if (idx === undefined) continue;
-			flat.push(idx, hit.line);
+		for (let i = 0; i < list.length; i += 1) {
+			const slot = slotByFileId.get(list.fileIdAt(i));
+			if (slot === undefined) continue;
+			flat.push(slot, list.lineAt(i));
 		}
 		if (flat.length > 0) postings.push([token, flat]);
 	}
@@ -1484,11 +1960,11 @@ export function serializeWordIndex(index: WordIndex): SerializedWordIndex {
 		index.forward
 			? files.map((file, i) => [
 					i,
-					[...(index.forward!.get(file) ?? new Map()).entries()],
+					[...(index.forward!.get(file)?.entries() ?? [])],
 				])
 			: undefined;
 
-	return {
+	const serialized: SerializedWordIndex = {
 		version: WORD_INDEX_FORMAT_VERSION,
 		files,
 		postings,
@@ -1500,6 +1976,152 @@ export function serializeWordIndex(index: WordIndex): SerializedWordIndex {
 		fileSizes: files.map((file) => index.fileSizes.get(file) ?? 0),
 		forward,
 	};
+	const tokensByFile = new Map<string, Set<string>>();
+	if (index.forward) {
+		for (const file of files) {
+			tokensByFile.set(
+				wordIndexKey(file),
+				new Set(index.forward.get(file)?.keys() ?? []),
+			);
+		}
+	}
+	_lastSerializeWork = {
+		affectedTokenCount: postings.length,
+		tookFullPath: true,
+	};
+	return { serialized, slotByFileId, tokensByFile };
+}
+
+/**
+ * Refresh the cached wire view without walking untouched posting lanes.
+ * Existing files keep their slots, so a document replacement only rebuilds
+ * the token lists named by that document's old or new forward entry. A file
+ * removal or reordering changes slot identity and deliberately takes the
+ * bounded full path.
+ */
+function serializeWordIndexIncrementally(
+	index: WordIndex,
+	cache: SerializedWordIndexCache,
+): SerializedWordIndexCache {
+	const files = [...index.docLengths.keys()];
+	const priorFiles = cache.serialized.files;
+	const currentKeys = new Set(files.map(wordIndexKey));
+	const priorKeys = new Set(priorFiles.map(wordIndexKey));
+	if ([...priorKeys].some((key) => !currentKeys.has(key))) {
+		return serializeWordIndexFull(index);
+	}
+	// Re-flattening most lanes costs more than rebuilding the compact wire view.
+	// The review fixture crosses over between 10% and 100% dirty, so use the
+	// midpoint as a conservative bound until a workload-specific model exists.
+	const dirty = index.dirtyFiles;
+	if (dirty && dirty.size * 2 > files.length) {
+		return serializeWordIndexFull(index);
+	}
+	// A replacement deletes and re-adds a PathKeyedMap entry, which changes Map
+	// insertion order. Keep the cached wire slots stable instead of rewriting
+	// every posting just because one document changed order.
+	const filesInWireOrder = [
+		...priorFiles,
+		...files.filter((file) => !priorKeys.has(wordIndexKey(file))),
+	];
+	if (!dirty || dirty.size === 0) {
+		_lastSerializeWork = { affectedTokenCount: 0, tookFullPath: false };
+		return cache;
+	}
+
+	const slotByFileId = new Map(cache.slotByFileId);
+	for (let i = priorFiles.length; i < filesInWireOrder.length; i += 1) {
+		const fileId = index.fileTable.idFor(wordIndexKey(filesInWireOrder[i]));
+		if (fileId !== undefined) slotByFileId.set(fileId, i);
+	}
+	const postings = cache.serialized.postings.slice() as Array<
+		[string, number[]]
+	>;
+	const postingAt = new Map<string, number>();
+	postings.forEach(([token], i) => postingAt.set(token, i));
+	const removedTokens = new Set<string>();
+	const tokensByFile = new Map(cache.tokensByFile);
+	const fileByKey = new Map(
+		filesInWireOrder.map((file) => [wordIndexKey(file), file]),
+	);
+	const affectedTokens = new Set<string>();
+	for (const fileKey of dirty) {
+		const file = fileByKey.get(fileKey);
+		const oldTokens = tokensByFile.get(fileKey) ?? new Set<string>();
+		const currentEntry =
+			file === undefined ? undefined : index.forward?.get(file);
+		const currentTokens = new Set(currentEntry?.keys() ?? []);
+		for (const token of oldTokens) affectedTokens.add(token);
+		for (const token of currentTokens) affectedTokens.add(token);
+		if (file === undefined) tokensByFile.delete(fileKey);
+		else tokensByFile.set(fileKey, currentTokens);
+	}
+	for (const token of affectedTokens) {
+		const list = index.postings.get(token);
+		const flat: number[] = [];
+		if (list) {
+			for (let i = 0; i < list.length; i += 1) {
+				const slot = slotByFileId.get(list.fileIdAt(i));
+				if (slot !== undefined) flat.push(slot, list.lineAt(i));
+			}
+		}
+		const at = postingAt.get(token);
+		if (flat.length === 0) {
+			if (at !== undefined) removedTokens.add(token);
+		} else if (at === undefined) {
+			postings.push([token, flat]);
+			postingAt.set(token, postings.length - 1);
+		} else {
+			postings[at] = [postings[at][0], flat];
+		}
+	}
+	const compactedPostings = removedTokens.size
+		? postings.filter(([token]) => !removedTokens.has(token))
+		: postings;
+	const forward = index.forward
+		? (cache.serialized.forward
+				?.slice()
+				.map(
+					(entry) => [entry[0], entry[1]] as [number, Array<[string, number]>],
+				) ?? [])
+		: undefined;
+	for (const fileKey of dirty) {
+		const file = fileByKey.get(fileKey);
+		const fileId =
+			file === undefined
+				? undefined
+				: index.fileTable.idFor(wordIndexKey(file));
+		const slot = fileId === undefined ? undefined : slotByFileId.get(fileId);
+		if (slot === undefined || !forward || file === undefined) continue;
+		forward[slot] = [slot, [...(index.forward?.get(file)?.entries() ?? [])]];
+	}
+	const serialized: SerializedWordIndex = {
+		...cache.serialized,
+		files: filesInWireOrder,
+		postings: compactedPostings,
+		docLengths: filesInWireOrder.map((file) => index.docLengths.get(file) ?? 0),
+		fileMtimes: filesInWireOrder.map((file) => index.fileMtimes.get(file) ?? 0),
+		fileSizes: filesInWireOrder.map((file) => index.fileSizes.get(file) ?? 0),
+		forward,
+		totalTokens: index.totalTokens,
+		indexedFileCount: index.docCount,
+		truncated: index.truncated,
+	};
+	_lastSerializeWork = {
+		affectedTokenCount: affectedTokens.size,
+		tookFullPath: false,
+	};
+	return { serialized, slotByFileId, tokensByFile };
+}
+
+export function serializeWordIndex(index: WordIndex): SerializedWordIndex {
+	const prior = serializedWordIndexCaches.get(index);
+	const cache = prior
+		? serializeWordIndexIncrementally(index, prior)
+		: serializeWordIndexFull(index);
+	serializedWordIndexCaches.set(index, cache);
+	index.dirtyFiles?.clear();
+	return cache.serialized;
 }
 
 export function deserializeWordIndex(
@@ -1511,20 +2133,56 @@ export function deserializeWordIndex(
 		!Array.isArray(data.files) ||
 		!Array.isArray(data.postings) ||
 		!Array.isArray(data.docLengths) ||
-		!Array.isArray(data.fileMtimes) ||
-		data.fileMtimes.length !== data.files.length
+		!Array.isArray(data.fileMtimes)
 	) {
 		return null;
 	}
+	let canonical =
+		data.docLengths.length === data.files.length &&
+		data.fileMtimes.length === data.files.length;
+	let needsDeepSanitize = !Array.isArray(data.forward);
+	if (needsDeepSanitize) canonical = false;
+	const fileKeys = new Set<string>();
+	for (const file of data.files) {
+		if (typeof file !== "string") return null;
+		const key = wordIndexKey(file);
+		if (fileKeys.has(key)) {
+			canonical = false;
+			needsDeepSanitize = true;
+		}
+		fileKeys.add(key);
+	}
 	const docLengths = new PathKeyedMap<number>(wordIndexKey);
+	// Slot i of the wire `files` array becomes file id `fileIdBySlot[i]`. Two
+	// slots whose spellings fold to one key share one id, exactly as a build
+	// would intern them, so a divergent snapshot cannot deserialize into two
+	// posting identities for one document.
+	const fileTable = new WordIndexFileTable();
+	const fileIdBySlot = data.files.map((file) =>
+		fileTable.intern(wordIndexKey(file), file),
+	);
+	const slotByFileId = new Map<number, number>();
+	fileIdBySlot.forEach((fileId, slot) => {
+		if (!slotByFileId.has(fileId)) slotByFileId.set(fileId, slot);
+	});
 	const fileMtimes = new PathKeyedMap<number>(wordIndexKey);
 	const fileSizes = new PathKeyedMap<number>(wordIndexKey);
-	data.files.forEach((file, i) =>
-		docLengths.set(file, data.docLengths[i] ?? 0),
-	);
-	data.files.forEach((file, i) =>
-		fileMtimes.set(file, data.fileMtimes[i] ?? 0),
-	);
+	data.files.forEach((file, i) => {
+		const value = data.docLengths[i];
+		if (!isCanonicalWordIndexNumber(value) || value < 0) canonical = false;
+		docLengths.set(
+			file,
+			isCanonicalWordIndexNumber(value) && value >= 0 ? value : 0,
+		);
+	});
+	data.files.forEach((file, i) => {
+		const value = data.fileMtimes[i];
+		if (typeof value !== "number" || !Number.isFinite(value)) canonical = false;
+		fileMtimes.set(
+			file,
+			typeof value === "number" && Number.isFinite(value) ? value : 0,
+		);
+	});
 	// #1105: `fileSizes` is optional on the wire (pre-#1105 snapshots omit it).
 	// Only populate when the array is present AND parallel to `files`; otherwise
 	// leave it empty so the refresh gate re-reads every file once to repopulate,
@@ -1533,55 +2191,253 @@ export function deserializeWordIndex(
 		Array.isArray(data.fileSizes) &&
 		data.fileSizes.length === data.files.length
 	) {
-		data.files.forEach((file, i) =>
-			fileSizes.set(file, data.fileSizes?.[i] ?? 0),
-		);
+		data.files.forEach((file, i) => {
+			const value = data.fileSizes?.[i];
+			if (!isCanonicalWordIndexNumber(value) || value < 0) canonical = false;
+			fileSizes.set(
+				file,
+				isCanonicalWordIndexNumber(value) && value >= 0 ? value : 0,
+			);
+		});
+	} else {
+		canonical = false;
 	}
 
-	const postings = new Map<string, WordHit[]>();
-	for (const [token, flat] of data.postings) {
-		if (typeof token !== "string" || !Array.isArray(flat)) continue;
-		const hits: WordHit[] = [];
-		for (let i = 0; i + 1 < flat.length; i += 2) {
-			const file = data.files[flat[i]];
+	const postings = new Map<string, WordPostingList>();
+	const postingTokens = new Set<string>();
+	const postingFileCounts = new Map<string, Map<number, number>>();
+	for (const posting of data.postings) {
+		if (!Array.isArray(posting) || posting.length !== 2) {
+			canonical = false;
+			needsDeepSanitize = true;
+			continue;
+		}
+		const [token, flat] = posting;
+		if (
+			!isCanonicalWordIndexToken(token) ||
+			postingTokens.has(token) ||
+			!Array.isArray(flat) ||
+			flat.length === 0 ||
+			flat.length % 2 !== 0
+		) {
+			canonical = false;
+			needsDeepSanitize = true;
+			continue;
+		}
+		postingTokens.add(token);
+		const lanes: number[] = [];
+		const seenPairs = new Set<number | string>();
+		const observedCounts = new Map<number, number>();
+		for (let i = 0; i < flat.length; i += 2) {
+			const slot = flat[i];
 			const line = flat[i + 1];
-			if (typeof file === "string" && typeof line === "number") {
-				hits.push({ file, line });
+			if (
+				!isCanonicalWordIndexNumber(slot) ||
+				slot < 0 ||
+				slot >= fileIdBySlot.length ||
+				!isCanonicalWordIndexNumber(line) ||
+				line < 1 ||
+				line > WORD_INDEX_INT32_MAX
+			) {
+				canonical = false;
+				needsDeepSanitize = true;
+				continue;
+			}
+			const fileId = fileIdBySlot[slot];
+			const pairKey =
+				fileId <= WORD_INDEX_PACKED_FILE_ID_MAX
+					? fileId * (WORD_INDEX_INT32_MAX + 1) + line
+					: `${fileId}:${line}`;
+			if (seenPairs.has(pairKey)) {
+				canonical = false;
+				needsDeepSanitize = true;
+			}
+			seenPairs.add(pairKey);
+			lanes.push(fileId, line);
+			observedCounts.set(fileId, (observedCounts.get(fileId) ?? 0) + 1);
+		}
+		if (lanes.length === 0) continue;
+		const list = WordPostingList.fromLanes(token, lanes);
+		postings.set(token, list);
+		postingFileCounts.set(token, observedCounts);
+	}
+
+	// Every list above was sized exactly from the wire payload, so there is no
+	// growth slack to release — but the per-list `ArrayBuffer` headers are the
+	// same third-of-the-store cost a fresh build pays, and a deserialized index
+	// is the LONG-lived one (a warm session reuses it across turns).
+	compactPostingsIntoArena(postings);
+
+	let forward: PathKeyedMap<WordForwardEntry> | undefined;
+	if (Array.isArray(data.forward)) {
+		const candidate = data.files.map(() => new Map<string, number>());
+		const forwardTotals = new Map<string, number>();
+		if (data.forward.length !== data.files.length) canonical = false;
+		if (data.forward.length !== data.files.length) needsDeepSanitize = true;
+		for (const [entryIndex, entry] of data.forward.entries()) {
+			if (!Array.isArray(entry) || entry.length !== 2) {
+				canonical = false;
+				needsDeepSanitize = true;
+				continue;
+			}
+			const [fileIdx, tokenCounts] = entry;
+			if (
+				!isCanonicalWordIndexNumber(fileIdx) ||
+				fileIdx !== entryIndex ||
+				fileIdx < 0 ||
+				fileIdx >= data.files.length ||
+				!Array.isArray(tokenCounts)
+			) {
+				canonical = false;
+				needsDeepSanitize = true;
+				continue;
+			}
+			for (const pair of tokenCounts) {
+				if (
+					!Array.isArray(pair) ||
+					pair.length !== 2 ||
+					!isCanonicalWordIndexToken(pair[0]) ||
+					!isCanonicalWordIndexNumber(pair[1]) ||
+					pair[1] < 1 ||
+					pair[1] > WORD_INDEX_INT32_MAX ||
+					candidate[fileIdx].has(pair[0])
+				) {
+					canonical = false;
+					needsDeepSanitize = true;
+					continue;
+				}
+				candidate[fileIdx].set(pair[0], pair[1]);
+				forwardTotals.set(pair[0], (forwardTotals.get(pair[0]) ?? 0) + pair[1]);
 			}
 		}
-		if (hits.length > 0) postings.set(token, hits);
-	}
-
-	let forward: PathKeyedMap<Map<string, number>> | undefined;
-	if (Array.isArray(data.forward)) {
-		forward = new PathKeyedMap<Map<string, number>>(wordIndexKey);
-		for (const entry of data.forward) {
-			if (!Array.isArray(entry) || entry.length !== 2) continue;
-			const [fileIdx, tokenCounts] = entry;
-			const file = data.files[fileIdx];
-			if (typeof file !== "string" || !Array.isArray(tokenCounts)) continue;
-			const perToken = new Map<string, number>();
-			for (const pair of tokenCounts) {
-				if (!Array.isArray(pair) || pair.length !== 2) continue;
-				const [token, count] = pair;
-				if (typeof token === "string" && typeof count === "number") {
-					perToken.set(token, count);
+		let forwardMatchesPostings = true;
+		for (const [token, list] of postings) {
+			if (forwardTotals.get(token) !== list.length) {
+				forwardMatchesPostings = false;
+			}
+			const observed = postingFileCounts.get(token);
+			if (!observed) {
+				forwardMatchesPostings = false;
+				continue;
+			}
+			for (const [fileId, count] of observed) {
+				const slot = slotByFileId.get(fileId);
+				if (slot === undefined || candidate[slot].get(token) !== count) {
+					forwardMatchesPostings = false;
 				}
 			}
-			forward.set(file, perToken);
+		}
+		for (const token of forwardTotals.keys()) {
+			if (!postingTokens.has(token)) forwardMatchesPostings = false;
+		}
+		if (!forwardMatchesPostings) canonical = false;
+		if (!forwardMatchesPostings) needsDeepSanitize = true;
+		forward = new PathKeyedMap<WordForwardEntry>(wordIndexKey);
+		for (let i = 0; i < data.files.length; i += 1) {
+			forward.set(data.files[i], WordForwardEntry.fromTally(candidate[i]));
+		}
+	} else if (Object.prototype.hasOwnProperty.call(data, "forward")) {
+		canonical = false;
+		needsDeepSanitize = true;
+	}
+	if (needsDeepSanitize) {
+		const actualForwardCounts = data.files.map(() => new Map<string, number>());
+		for (const [token, list] of postings) {
+			const seenPairs = new Set<string>();
+			const sanitized = new WordPostingList(token, list.length);
+			for (let i = 0; i < list.length; i += 1) {
+				const fileId = list.fileIdAt(i);
+				const line = list.lineAt(i);
+				const pairKey = `${fileId}:${line}`;
+				if (seenPairs.has(pairKey)) continue;
+				seenPairs.add(pairKey);
+				sanitized.push(fileId, line);
+				const slot = slotByFileId.get(fileId);
+				if (slot !== undefined) {
+					const counts = actualForwardCounts[slot];
+					counts.set(token, (counts.get(token) ?? 0) + 1);
+				}
+			}
+			postings.set(token, sanitized);
+		}
+		compactPostingsIntoArena(postings);
+		if (Array.isArray(data.forward)) {
+			forward = new PathKeyedMap<WordForwardEntry>(wordIndexKey);
+			for (let i = 0; i < data.files.length; i += 1) {
+				const canonicalSlot = slotByFileId.get(fileIdBySlot[i]) ?? i;
+				forward.set(
+					data.files[i],
+					WordForwardEntry.fromTally(actualForwardCounts[canonicalSlot]),
+				);
+			}
 		}
 	}
+	const expectedTotalTokens = [...docLengths.values()].reduce(
+		(total, length) => total + length,
+		0,
+	);
+	const totalTokens = isCanonicalWordIndexNumber(expectedTotalTokens)
+		? expectedTotalTokens
+		: 0;
+	if (
+		!isCanonicalWordIndexNumber(data.totalTokens) ||
+		data.totalTokens !== totalTokens
+	) {
+		canonical = false;
+	}
+	if (
+		typeof data.indexedFileCount !== "number" ||
+		data.indexedFileCount !== docLengths.size
+	) {
+		canonical = false;
+	}
+	if (typeof data.truncated !== "boolean") canonical = false;
 
-	return {
+	const index: WordIndex = {
 		postings,
+		fileTable,
 		docLengths,
-		totalTokens: typeof data.totalTokens === "number" ? data.totalTokens : 0,
-		docCount: data.files.length,
+		totalTokens,
+		docCount: docLengths.size,
 		truncated: data.truncated === true,
 		forward,
 		fileMtimes,
 		fileSizes,
+		// Postings were just packed into one arena above, so the running gate
+		// starts from the exact post-compaction store count (#2117).
+		postingStoreCount: countPostingBackingStores(postings),
+		recompactFlight: createSingleFlight<void>(),
+		// A deserialized index is a fresh object distinct from whichever index
+		// produced `data`. Without this, every per-edit dirty mark on a
+		// session-start reload (#2068) is a no-op against `undefined`, and
+		// serializeWordIndexIncrementally's `!dirty` branch then returns the
+		// stale cached wire view forever, silently dropping every later edit
+		// from the persisted snapshot.
+		dirtyFiles: new Set<string>(),
 	};
+
+	// Seed the wire cache from the snapshot just loaded so the FIRST persist
+	// of a reloaded session (session-start's `snapshotSaveSyncMs`, #2068) also
+	// takes the bounded incremental path instead of paying a full rebuild —
+	// mirrors exactly what one priming `serializeWordIndex` call would cache.
+	const tokensByFile = new Map<string, Set<string>>();
+	if (forward) {
+		for (const file of data.files) {
+			tokensByFile.set(
+				wordIndexKey(file),
+				new Set(forward.get(file)?.keys() ?? []),
+			);
+		}
+	}
+	if (canonical) {
+		serializedWordIndexCaches.set(index, {
+			serialized: data,
+			slotByFileId,
+			tokensByFile,
+		});
+	}
+
+	return index;
 }
 
 // --- Cold-query background build trigger (#348) -------------------------------
@@ -1686,6 +2542,8 @@ export function triggerBackgroundWordIndexBuild(
 				durationMs: Date.now() - startMs,
 				indexedFileCount: index.docCount,
 				tokens: index.postings.size,
+				postingEntries: countWordIndexPostingEntries(index),
+				residentBytes: estimateWordIndexResidentBytes(index),
 				truncated: index.truncated,
 				skipped: docs.skipped,
 			});
@@ -1756,6 +2614,7 @@ async function writeWordIndexSnapshot(
 	index: WordIndex,
 	dbg?: (msg: string) => void,
 ): Promise<void> {
+	const persistStartedAt = Date.now();
 	try {
 		const {
 			loadProjectSnapshot,
@@ -1774,8 +2633,11 @@ async function writeWordIndexSnapshot(
 			cachedExports: [],
 		};
 		snapshot.generatedAt = new Date().toISOString();
+		const serializeStartedAt = performance.now();
 		snapshot.wordIndex = serializeWordIndex(index);
+		const serializeMs = performance.now() - serializeStartedAt;
 		saveProjectSnapshot(cwd, snapshot);
+		const writeMs = performance.now() - serializeStartedAt - serializeMs;
 		dbg?.(
 			`word-index persist: ${index.docCount} files, ${index.postings.size} tokens`,
 		);
@@ -1787,9 +2649,18 @@ async function writeWordIndexSnapshot(
 			phase: "persist_succeeded",
 			cwd: path.resolve(cwd),
 			trigger: "per_edit",
+			durationMs: Date.now() - persistStartedAt,
+			serializeMs,
+			writeMs,
 			indexedFileCount: index.docCount,
 			tokens: index.postings.size,
+			postingEntries: countWordIndexPostingEntries(index),
+			residentBytes: estimateWordIndexResidentBytes(index),
+			replacementCount: index.replacementStats?.count ?? 0,
+			totalReplacementMs: index.replacementStats?.totalMs ?? 0,
+			maxReplacementMs: index.replacementStats?.maxMs ?? 0,
 		});
+		index.replacementStats = { count: 0, totalMs: 0, maxMs: 0 };
 	} catch (err) {
 		dbg?.(`word-index persist: failed: ${err}`);
 		// M3, #958: a swallowed persist means every LATER symbol_search reads a

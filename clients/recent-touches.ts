@@ -79,6 +79,7 @@ export function isRecentTouchesEnabled(): boolean {
 export function _resetRecentTouchesForTests(): void {
 	_enabledCache = undefined;
 	_lastSeenMtimeMs = undefined;
+	_lastSeenSizeBytes = undefined;
 	_lastConsumedCursor.clear();
 }
 
@@ -228,10 +229,12 @@ export async function readCrossProcessTouchesForSessionStart(
 
 // --- Consumer: parent at turn_start (mtime-gated hot path) ---
 
-// Module state: the last mtime we've already consumed, and a per-cwd cursor
-// (max ts already surfaced) so repeated reads of an unchanged-since-last-
-// check file never re-emit the same entries into the accumulator twice.
+// Module state: the last mtime (+ size, #2300) we've already consumed, and a
+// per-cwd cursor (max ts already surfaced) so repeated reads of an
+// unchanged-since-last-check file never re-emit the same entries into the
+// accumulator twice.
 let _lastSeenMtimeMs: number | undefined;
+let _lastSeenSizeBytes: number | undefined;
 const _lastConsumedCursor = new Map<string, number>();
 
 export interface ReadCrossProcessTouchesForTurnStartArgs {
@@ -267,15 +270,25 @@ export async function readCrossProcessTouchesForTurnStart(
 	try {
 		const target = recentTouchesPath(args.cwd);
 		let mtimeMs: number;
+		let sizeBytes: number;
 		try {
-			mtimeMs = (await fs.promises.stat(target)).mtimeMs;
+			const stat = await fs.promises.stat(target);
+			mtimeMs = stat.mtimeMs;
+			sizeBytes = stat.size;
 		} catch {
 			// No record file yet (ENOENT) or inaccessible (EACCES) — nothing to
 			// report; do not disturb the mtime watermark.
 			return [];
 		}
-		if (_lastSeenMtimeMs === mtimeMs) return [];
+		// #2300: size alongside mtime — a same-mtime-bucket rewrite (a sibling
+		// process's write landing in the same coarse-granularity mtime tick)
+		// changes the file's length, so mtime equality alone would wrongly
+		// short-circuit to "nothing new" and drop its entries.
+		if (_lastSeenMtimeMs === mtimeMs && _lastSeenSizeBytes === sizeBytes) {
+			return [];
+		}
 		_lastSeenMtimeMs = mtimeMs;
+		_lastSeenSizeBytes = sizeBytes;
 
 		const selfPid = args.selfPid ?? process.pid;
 		const now = args.now ?? Date.now();

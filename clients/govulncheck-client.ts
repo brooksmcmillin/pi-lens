@@ -183,6 +183,7 @@ export class GovulncheckClient extends SecurityScanClient<GovulncheckResult> {
 					hostStallMs: goHostStallMs,
 					...(retryAfterMs > 0 && { retryAfterMs }),
 					budgetMs: 5000,
+					classifiedBy: "probe",
 				});
 				return false;
 			}
@@ -267,8 +268,10 @@ export class GovulncheckClient extends SecurityScanClient<GovulncheckResult> {
 					// row says so and carries the install facts behind it. Every retry
 					// DID run a `go install` that failed, so `install: "failed"` is
 					// earned, and the reason names the ceiling rather than the spawn.
+					// Below the ceiling, outcome/cause are fresh off `classifyProbeFailure`
+					// above, so that row is still `"probe"` (#2209).
+					classifiedBy: exhausted ? "caller" : "probe",
 					...(exhausted && {
-						classifiedBy: "caller" as const,
 						evidence: {
 							...describeProbeEvidence(install, "go install"),
 							install: "failed" as const,
@@ -398,6 +401,7 @@ export class GovulncheckClient extends SecurityScanClient<GovulncheckResult> {
 				hostStallMs: reprobeHostStallMs,
 				...(retryAfterMs > 0 && { retryAfterMs }),
 				budgetMs: 5000,
+				classifiedBy: "probe",
 			});
 			return false;
 		}

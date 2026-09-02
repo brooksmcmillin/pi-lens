@@ -178,7 +178,6 @@ function createJavaRegistry(
 		id: "lsp",
 		appliesTo: ["java"],
 		priority: 4,
-		enabledByDefault: true,
 		async run() {
 			return {
 				status: lspReady() ? "succeeded" : "skipped",

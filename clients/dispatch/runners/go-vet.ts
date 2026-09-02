@@ -24,7 +24,6 @@ const goVetRunner: RunnerDefinition = {
 	id: "go-vet",
 	appliesTo: ["go"],
 	priority: PRIORITY.SPECIALIZED_ANALYSIS,
-	enabledByDefault: true,
 	timeoutMs: 40_000,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {

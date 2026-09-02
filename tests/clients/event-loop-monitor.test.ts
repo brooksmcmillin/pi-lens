@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	_stopEventLoopMonitorForTest,
+	classifyLoopBlock,
 	getEventLoopStats,
 	isSuspendSuspectedBlock,
 	resetEventLoopMonitor,
@@ -146,5 +147,84 @@ describe("resetEventLoopMonitor window re-baselining (#1122)", () => {
 		// inflate the fresh window on a loaded CI box, so assert only that reset
 		// cut it well below the pre-reset elapsed span.
 		expect(after).toBeLessThan(before / 2);
+	});
+});
+
+/**
+ * #1980: `windowCpuMs` has sat beside every `loop_block` since #1122 and was
+ * never read together with `durationMs`. Over a 23h window (1221 records),
+ * nine of the sixteen genuine 5s+ blocks burned LESS CPU than the block
+ * lasted — they were parked in a syscall, not computing — and every one of
+ * them read as ordinary work because `suspectSystemStall` only fires above
+ * 20s. These pin the ladder that splits them. Every case is a real row from
+ * the issue's evidence where one exists.
+ */
+describe("classifyLoopBlock: CPU-vs-wall stall discrimination (#1980)", () => {
+	it("declines to classify a sub-floor block instead of defaulting it to compute", () => {
+		// Under STALL_CLASSIFY_FLOOR_MS the CPU accounting is the same order as
+		// its own measurement slop, so the honest answer is "not classified".
+		expect(classifyLoopBlock(900, 0).stallClass).toBe("below-floor");
+	});
+
+	it("classes a block the window's whole CPU budget cannot cover as a non-CPU stall", () => {
+		// #1980's top row: d=19780ms cpu=7907ms at 13:59:03. 7.9s of CPU cannot
+		// produce a 19.8s synchronous burst, so the loop was waiting.
+		expect(classifyLoopBlock(19780, 7907).stallClass).toBe("non-cpu-stall");
+		// Two more from the same evidence block.
+		expect(classifyLoopBlock(16895, 4078).stallClass).toBe("non-cpu-stall");
+		expect(classifyLoopBlock(10435, 1688).stallClass).toBe("non-cpu-stall");
+	});
+
+	it("classes a block the window's CPU covers as cpu-accounted, not a stall", () => {
+		expect(classifyLoopBlock(5000, 5500).stallClass).toBe("cpu-accounted");
+	});
+
+	it("keeps the suspend verdict distinct from an ordinary non-CPU stall", () => {
+		// At or above the 20s suspend floor with ~no CPU: sleep/standby/paging.
+		expect(classifyLoopBlock(300000, 200).stallClass).toBe("system-stall");
+		// The SAME evidence shape below that floor is the narrower class — this
+		// is the whole 5-20s tier #1980 found and #1122's flag could not see.
+		expect(classifyLoopBlock(15435, 3985).stallClass).toBe("non-cpu-stall");
+	});
+
+	it("agrees with the pre-existing suspend predicate on every classified sample", () => {
+		// One definition of a suspend, not two: the class delegates.
+		for (const [maxMs, cpuMs] of [
+			[300000, 200],
+			[25000, 20000],
+			[30000, 30000],
+			[19780, 7907],
+			[5000, 5500],
+		] as const) {
+			expect(
+				classifyLoopBlock(maxMs, cpuMs).stallClass === "system-stall",
+			).toBe(isSuspendSuspectedBlock(maxMs, cpuMs));
+		}
+	});
+
+	it("honours the CPU slop so a near-exact match is not called a stall", () => {
+		expect(classifyLoopBlock(5000, 4800).stallClass).toBe("cpu-accounted");
+		expect(classifyLoopBlock(5000, 4700).stallClass).toBe("non-cpu-stall");
+	});
+
+	it("reports the CPU coverage ratio the issue had to compute by hand", () => {
+		expect(classifyLoopBlock(19780, 7907).cpuCoverageRatio).toBe(0.4);
+		expect(classifyLoopBlock(5000, 5500).cpuCoverageRatio).toBe(1.1);
+		// No block means nothing to cover — not a ratio of zero.
+		expect(classifyLoopBlock(0, 0).cpuCoverageRatio).toBeUndefined();
+	});
+
+	it("getEventLoopStats carries the class and the ratio onto every sample", async () => {
+		startEventLoopMonitor(10);
+		await settle(40);
+		const s = getEventLoopStats();
+		// A live loop's own jitter is far under the floor, so the honest class is
+		// below-floor — and it must be PRESENT, which is what the loop_block
+		// record reads.
+		expect(s?.stallClass).toBe("below-floor");
+		expect(s?.suspectSystemStall).toBe(false);
+		expect(
+			s?.cpuCoverageRatio === undefined || Number.isFinite(s.cpuCoverageRatio),
+		).toBe(true);
 	});
 });

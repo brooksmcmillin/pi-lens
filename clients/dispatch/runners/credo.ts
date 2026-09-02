@@ -83,7 +83,6 @@ const credoRunner: RunnerDefinition = {
 	id: "credo",
 	appliesTo: ["elixir"],
 	priority: PRIORITY.GENERAL_ANALYSIS,
-	enabledByDefault: true,
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {

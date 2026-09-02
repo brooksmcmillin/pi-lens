@@ -56,7 +56,6 @@ const zigCheckRunner: RunnerDefinition = {
 	id: "zig-check",
 	appliesTo: ["zig"],
 	priority: PRIORITY.GENERAL_ANALYSIS,
-	enabledByDefault: true,
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {

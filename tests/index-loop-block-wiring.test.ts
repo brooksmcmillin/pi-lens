@@ -303,6 +303,37 @@ describe(
 			expect(metadata.inFlightPhaseElapsedMs).toBeUndefined();
 		});
 
+		// #1980: the stall class and its CPU-coverage ratio have to reach the
+		// PERSISTED record, or the split exists only in memory and a reader
+		// mining latency.log is back to computing the ratio by hand over 1221
+		// records. The monitor owns the verdict; this pins that turn_end stamps
+		// what the monitor decided instead of dropping it or re-deriving it.
+		it("(g) #1980: the loop_block record carries the stall class and CPU coverage ratio", async () => {
+			statsToReturn = {
+				// #1980's own top row: d=19780ms cpu=7907ms wall=41295ms.
+				maxMs: 19780,
+				p99Ms: 0,
+				meanMs: 0,
+				windowWallMs: 41295,
+				windowCpuMs: 7907,
+				suspectSystemStall: false,
+				stallClass: "non-cpu-stall",
+				cpuCoverageRatio: 0.4,
+			};
+
+			await fireTurnEnd();
+
+			const logged = loopBlocks();
+			expect(logged).toHaveLength(1);
+			const metadata = logged[0].metadata as Record<string, unknown>;
+			// Pre-fix both fields are absent from the record entirely.
+			expect(metadata.stallClass).toBe("non-cpu-stall");
+			expect(metadata.cpuCoverageRatio).toBe(0.4);
+			// The #1122 flag is untouched beside them, not replaced.
+			expect(metadata.suspectSystemStall).toBe(false);
+			expect(metadata.windowCpuMs).toBe(7907);
+		});
+
 		// #1723 review round 7, S3: `resetCurrentPhaseForSession()`'s call site
 		// (index.ts's `session_start` handler, behind the #473 gate) is exactly
 		// the kind of wiring `SESSION_STATE_REGISTRY`'s reachability derivation

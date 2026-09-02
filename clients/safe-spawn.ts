@@ -27,6 +27,7 @@ import { recordDegradation } from "./degradation-ledger.js";
 import { logExtension } from "./extension-log.js";
 import { isFullyQualifiedWin32 } from "./path-utils.js";
 import { startSpawnUsageSampler } from "./resource-sampler.js";
+import { compareOrdinal } from "./string-utils.js";
 
 export interface SpawnResourceUsage {
 	sampleCount: number;
@@ -149,6 +150,10 @@ export interface SpawnResult {
 	};
 	/** True when stdout or stderr was capped before process completion. */
 	outputTruncated?: boolean;
+	/** True when the output cap started terminating the child. */
+	killedForOutputCap?: boolean;
+	/** True when the optional streaming matcher saw a matching chunk. */
+	streamingMatch?: boolean;
 	/** Peak/average CPU%+RSS sampled across this spawn's lifetime (#620).
 	 *  `undefined` when no sample ever landed (process exited faster than the
 	 *  first poll tick, or sampling failed for the whole invocation) — never
@@ -344,6 +349,10 @@ export interface SafeSpawnOptions {
 	resourceLabel?: string;
 	/** Maximum bytes retained across stdout and stderr for this child. */
 	maxOutputBytes?: number;
+	/** Match output chunks before output-cap truncation can discard them. */
+	matchWhileStreaming?: RegExp;
+	/** Optional stdin payload. Supplying it always writes and closes stdin. */
+	input?: string;
 	/**
 	 * Couple a long-lived, side-effecting child to this Node process. Registered
 	 * children are synchronously tree-killed during process exit/signals.
@@ -946,7 +955,7 @@ export function resolveWindowsCommandForEnvironment(
 				? ([[key.toLowerCase(), value] as const] as const)
 				: [],
 		)
-		.sort(([left], [right]) => left.localeCompare(right));
+		.sort(([left], [right]) => compareOrdinal(left, right));
 	// Keep presence separate from value: absent PATHEXT means the Windows
 	// default extension list, while PATHEXT="" means no implicit extensions.
 	// The per-drive snapshot is equally important: it is provenance for
@@ -1053,6 +1062,13 @@ function ensureUtf8ConsoleCodePageOnce(): void {
 		spawnSync(cmdExe, ["/d", "/s", "/c", "chcp 65001 >nul 2>&1"], {
 			shell: false,
 			windowsHide: true,
+			// #1980 population sweep: a synchronous spawn with no timeout parks
+			// the event loop for as long as the child takes, and nothing here
+			// bounds that. `chcp` is normally instant, but this runs before the
+			// FIRST real spawn of the process, which is exactly when a cold or
+			// antivirus-throttled cmd.exe is slowest. Matches the 5s bound every
+			// other synchronous child-process site in this repo already carries.
+			timeout: 5000,
 		});
 	} catch {
 		// Best-effort: worst case is non-ASCII tool output decoded incorrectly, not a
@@ -1164,6 +1180,8 @@ export async function safeSpawnAsync(
 		let aborted = false;
 		let killed = false;
 		let outputTruncated = false;
+		let killedForOutputCap = false;
+		let streamingMatch = false;
 		// #1651 review: a single boolean the close/error handlers both check
 		// AND set, so whichever one decides the outcome first wins outright —
 		// the DECISION itself is shape-based (see the `close` handler below),
@@ -1211,19 +1229,126 @@ export async function safeSpawnAsync(
 			options.maxOutputBytes > 0
 				? Math.floor(options.maxOutputBytes)
 				: undefined;
-		const appendOutput = (current: string, chunk: string | Buffer): string => {
-			const text = typeof chunk === "string" ? chunk : chunk.toString();
-			if (maxOutputBytes === undefined) return current + text;
-			const used = Buffer.byteLength(stdout) + Buffer.byteLength(stderr);
-			const remaining = maxOutputBytes - used;
-			if (remaining <= 0) {
-				outputTruncated = true;
-				return current;
+		const outputTruncationMarker = "\n...[output truncated]...\n";
+		type OutputStream = "stdout" | "stderr";
+		type OutputPart = { stream: OutputStream; text: string };
+		let retainedHead: OutputPart[] = [];
+		let retainedTail: OutputPart[] = [];
+		let retainedTailBytes = 0;
+		let retainedTailLimit = 0;
+		let truncationStream: OutputStream = "stderr";
+		const streamingMatcher = options?.matchWhileStreaming;
+		const streamingCarryBytes = streamingMatcher
+			? Math.max(0, streamingMatcher.source.length - 1)
+			: 0;
+		const streamingCarry: Record<OutputStream, string> = {
+			stdout: "",
+			stderr: "",
+		};
+		const bytePrefix = (text: string, bytes: number): string =>
+			Buffer.from(text).subarray(0, bytes).toString();
+		const byteSuffix = (text: string, bytes: number): string => {
+			const buffer = Buffer.from(text);
+			return buffer.subarray(Math.max(0, buffer.byteLength - bytes)).toString();
+		};
+		const appendTail = (part: OutputPart, maxBytes: number): void => {
+			if (maxBytes <= 0) return;
+			retainedTail.push({ stream: part.stream, text: part.text });
+			retainedTailBytes += Buffer.byteLength(part.text);
+			while (retainedTailBytes > maxBytes && retainedTail.length > 0) {
+				const first = retainedTail[0];
+				const excess = retainedTailBytes - maxBytes;
+				const firstBytes = Buffer.byteLength(first.text);
+				if (firstBytes <= excess) {
+					retainedTail.shift();
+					retainedTailBytes -= firstBytes;
+				} else {
+					first.text = byteSuffix(first.text, firstBytes - excess);
+					retainedTailBytes -= excess;
+				}
 			}
+		};
+		const renderOutput = (stream: OutputStream): string => {
+			const head = retainedHead
+				.filter((part) => part.stream === stream)
+				.map((part) => part.text)
+				.join("");
+			const tail = retainedTail
+				.filter((part) => part.stream === stream)
+				.map((part) => part.text)
+				.join("");
+			const marker = stream === truncationStream ? outputTruncationMarker : "";
+			return head + marker + tail;
+		};
+		const refreshRetainedOutputs = (): void => {
+			stdout = renderOutput("stdout");
+			stderr = renderOutput("stderr");
+		};
+		const appendOutput = (
+			stream: OutputStream,
+			current: string,
+			chunk: string | Buffer,
+		): string => {
+			const text = typeof chunk === "string" ? chunk : chunk.toString();
+			if (maxOutputBytes === undefined || outputTruncated) {
+				if (maxOutputBytes === undefined) return current + text;
+				appendTail({ stream, text }, retainedTailLimit);
+				truncationStream = stream;
+				return renderOutput(stream);
+			}
+			const used = Buffer.byteLength(stdout) + Buffer.byteLength(stderr);
 			const bytes = Buffer.byteLength(text);
-			if (bytes <= remaining) return current + text;
+			if (used + bytes <= maxOutputBytes) return current + text;
 			outputTruncated = true;
-			return current + Buffer.from(text).subarray(0, remaining).toString();
+			truncationStream = stream;
+			const available = Math.max(
+				0,
+				maxOutputBytes - Buffer.byteLength(outputTruncationMarker),
+			);
+			const headBytes = Math.floor(available / 2);
+			const tailBytes = available - headBytes;
+			retainedTailLimit = tailBytes;
+			const parts: OutputPart[] = [
+				{ stream: "stdout", text: stdout },
+				{ stream: "stderr", text: stderr },
+				{ stream, text },
+			];
+			let headRemaining = headBytes;
+			for (const part of parts) {
+				if (headRemaining <= 0) break;
+				const kept = bytePrefix(part.text, headRemaining);
+				if (kept) retainedHead.push({ stream: part.stream, text: kept });
+				headRemaining -= Buffer.byteLength(kept);
+			}
+			let tailRemaining = tailBytes;
+			for (
+				let index = parts.length - 1;
+				index >= 0 && tailRemaining > 0;
+				index--
+			) {
+				const part = parts[index];
+				const kept = byteSuffix(part.text, tailRemaining);
+				if (kept) {
+					retainedTail.unshift({ stream: part.stream, text: kept });
+					tailRemaining -= Buffer.byteLength(kept);
+				}
+			}
+			retainedTailBytes = tailBytes - tailRemaining;
+			return renderOutput(stream);
+		};
+		const matchStreamingChunk = (
+			stream: OutputStream,
+			chunk: string | Buffer,
+		): void => {
+			if (streamingMatch || !streamingMatcher) return;
+			const text = typeof chunk === "string" ? chunk : chunk.toString();
+			streamingMatcher.lastIndex = 0;
+			streamingMatch = streamingMatcher.test(streamingCarry[stream] + text);
+			if (streamingCarryBytes > 0) {
+				streamingCarry[stream] = Buffer.from(streamingCarry[stream] + text)
+					.subarray(-streamingCarryBytes)
+					.toString();
+			}
 		};
 
 		// Spawn the process (non-blocking). Keeping Node's `shell` option false
@@ -1370,6 +1495,12 @@ export async function safeSpawnAsync(
 			);
 			return;
 		}
+		// Keep historical open stdin by default. An opted-in payload is written
+		// completely and followed by EOF; input: "" closes stdin immediately.
+		if (options?.input !== undefined) {
+			child.stdin?.on("error", () => {});
+			child.stdin?.end(options.input);
+		}
 		if (child.pid && (posixProcessGroup || options?.lifetimeCoupled)) {
 			// #2026: POSIX registers unconditionally - detached children no
 			// longer receive terminal signals directly, so the lifetime
@@ -1480,11 +1611,20 @@ export async function safeSpawnAsync(
 		abortSignal?.addEventListener("abort", onAbort, { once: true });
 
 		// Output-cap kills are awaited by finalize() below, just like
-		// timeout/abort kills. This keeps a noisy CLI from continuing in the
-		// background after its retained output has been bounded.
+		// timeout/abort kills. An armed, unmatched streaming matcher is the one
+		// exception: retention remains bounded, but the caller's timeout is the
+		// bound while the child gets a chance to emit its rescue line.
 		let killPromise: Promise<void> | undefined;
 		const stopForOutputLimit = (): void => {
-			if (outputTruncated && !killed && !child.killed) {
+			const waitingForStreamingMatch =
+				streamingMatcher !== undefined && !streamingMatch;
+			if (
+				outputTruncated &&
+				!waitingForStreamingMatch &&
+				!killed &&
+				!child.killed
+			) {
+				killedForOutputCap = true;
 				killed = true;
 				killPromise = killTree();
 			}
@@ -1494,12 +1634,16 @@ export async function safeSpawnAsync(
 		child.stdout?.setEncoding("utf-8");
 		child.stderr?.setEncoding("utf-8");
 		child.stdout?.on("data", (data) => {
-			stdout = appendOutput(stdout, data);
+			matchStreamingChunk("stdout", data);
+			stdout = appendOutput("stdout", stdout, data);
+			if (outputTruncated) refreshRetainedOutputs();
 			stopForOutputLimit();
 			rearmIdleGrace?.();
 		});
 		child.stderr?.on("data", (data) => {
-			stderr = appendOutput(stderr, data);
+			matchStreamingChunk("stderr", data);
+			stderr = appendOutput("stderr", stderr, data);
+			if (outputTruncated) refreshRetainedOutputs();
 			stopForOutputLimit();
 			rearmIdleGrace?.();
 		});
@@ -1698,7 +1842,11 @@ export async function safeSpawnAsync(
 			await waitForPipeIdle();
 			const resourceUsage = finishResourceUsage();
 
-			const outputInfo = outputTruncated ? { outputTruncated: true } : {};
+			const outputInfo = {
+				...(outputTruncated ? { outputTruncated: true } : {}),
+				...(killedForOutputCap ? { killedForOutputCap: true } : {}),
+			};
+			const streamingMatchInfo = streamingMatch ? { streamingMatch: true } : {};
 			// #1816: surface the signal name as a field on every path where one
 			// exists, so callers can NAME it instead of scraping `error.message`.
 			const signalInfo = signal ? { signal } : {};
@@ -1725,6 +1873,7 @@ export async function safeSpawnAsync(
 					...(timeoutTeardown && { timeoutTeardown }),
 					spawnFailure: new SpawnFailureError("timeout", cause.message, cause),
 					...outputInfo,
+					...streamingMatchInfo,
 					resourceUsage,
 				});
 			} else if (aborted) {
@@ -1738,6 +1887,7 @@ export async function safeSpawnAsync(
 					...signalInfo,
 					spawnFailure: new SpawnFailureError("killed", cause.message, cause),
 					...outputInfo,
+					...streamingMatchInfo,
 					resourceUsage,
 				});
 			} else if (signal) {
@@ -1751,6 +1901,7 @@ export async function safeSpawnAsync(
 					...signalInfo,
 					spawnFailure: new SpawnFailureError("killed", cause.message, cause),
 					...outputInfo,
+					...streamingMatchInfo,
 					resourceUsage,
 				});
 			} else if (code === null || code < 0) {
@@ -1779,10 +1930,18 @@ export async function safeSpawnAsync(
 					failure: "spawn",
 					spawnFailure,
 					...outputInfo,
+					...streamingMatchInfo,
 					resourceUsage,
 				});
 			} else {
-				resolve({ stdout, stderr, status: code, ...outputInfo, resourceUsage });
+				resolve({
+					stdout,
+					stderr,
+					status: code,
+					...outputInfo,
+					...streamingMatchInfo,
+					resourceUsage,
+				});
 			}
 		};
 
@@ -1825,6 +1984,8 @@ export async function safeSpawnAsync(
 					failure,
 					spawnFailure,
 					...(outputTruncated ? { outputTruncated: true } : {}),
+					...(killedForOutputCap ? { killedForOutputCap: true } : {}),
+					...(streamingMatch ? { streamingMatch: true } : {}),
 					resourceUsage,
 				});
 			if (controlFailure) finish(controlFailure);

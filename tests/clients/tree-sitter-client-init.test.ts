@@ -7,12 +7,15 @@
  */
 
 import { createRequire } from "node:module";
+import * as fs from "node:fs";
+import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	TreeSitterClient,
 	type TreeSitterParseCacheStats,
 } from "../../clients/tree-sitter-client.js";
+import { createTempFile, setupTestEnvironment } from "../clients/test-utils.js";
 
 const _require = createRequire(import.meta.url);
 
@@ -29,6 +32,26 @@ describe("tree-sitter-client wasm resolution", () => {
 		// regardless of whether it's nested or hoisted.
 		const wasmPath = _require.resolve("web-tree-sitter/tree-sitter.wasm");
 		expect(wasmPath).toMatch(/tree-sitter\.wasm$/);
+		const client = new TreeSitterClient();
+		const deps = (
+			client as unknown as {
+				grammarDirResolutionDeps: {
+					cwd: () => string;
+					resolvePackage: (specifier: string) => string;
+					resolveAsset: (asset: string) => string | undefined;
+				};
+			}
+		).grammarDirResolutionDeps;
+		expect(deps.cwd()).toBe(process.cwd());
+		expect(path.isAbsolute(deps.resolvePackage("vitest/package.json"))).toBe(
+			true,
+		);
+		expect(deps.resolveAsset("grammars")).toBe(
+			path.resolve(
+				path.dirname(fileURLToPath(import.meta.url)),
+				"../../node_modules/web-tree-sitter/grammars",
+			),
+		);
 		// Must NOT assume the wasm lives nested under pi-lens's own node_modules
 		// relative to import.meta.url — that breaks in hoisted layouts.
 		expect(path.isAbsolute(wasmPath)).toBe(true);
@@ -49,18 +72,93 @@ describe("tree-sitter-client wasm resolution", () => {
 		expect(path.dirname(sibling)).toBe(wasmDir);
 	});
 
-	it("findGrammarsDir resolves external packages via require.resolve, not process.cwd()", () => {
-		// Verify tree-sitter-wasms is resolvable through Node's resolver.
-		// This would fail in a hoisted monorepo if we used process.cwd()/node_modules directly.
-		let resolved: string | undefined;
+	it("findGrammarsDir resolves the web-tree-sitter asset branch", () => {
+		const env = setupTestEnvironment("pi-lens-tree-sitter-2112-asset-");
 		try {
-			resolved = _require.resolve("tree-sitter-wasms/package.json");
-		} catch {
-			// package not installed in this env — skip
-			return;
+			const wasmPath = createTempFile(
+				env.tmpDir,
+				"grammars/tree-sitter-typescript.wasm",
+				"fixture wasm",
+			);
+			const client = new TreeSitterClient(false, undefined, {
+				resolveAsset: () => path.dirname(wasmPath),
+				resolvePackage: () => {
+					throw new Error("package resolver must not run");
+				},
+				cwd: () => {
+					throw new Error("cwd resolver must not run");
+				},
+			}) as unknown as { grammarsDir: string };
+			// isAvailable() overwrites this.grammarsDir; this post-construction
+			// read is the only faithful observable of findGrammarsDir().
+			expect(client.grammarsDir).toBe(path.dirname(wasmPath));
+		} finally {
+			env.cleanup();
 		}
-		expect(resolved).toMatch(/package\.json$/);
-		expect(path.isAbsolute(resolved)).toBe(true);
+	});
+
+	it("findGrammarsDir resolves the tree-sitter-wasms package branch", () => {
+		const env = setupTestEnvironment("pi-lens-tree-sitter-2112-package-");
+		try {
+			const packageJson = createTempFile(
+				env.tmpDir,
+				"tree-sitter-wasms/package.json",
+				"{}",
+			);
+			const expectedDir = path.join(env.tmpDir, "tree-sitter-wasms", "out");
+			fs.mkdirSync(expectedDir);
+			// An ambient cwd fixture must not win over the injected package branch.
+			createTempFile(
+				env.tmpDir,
+				"node_modules/tree-sitter-wasms/out/tree-sitter-typescript.wasm",
+				"ambient fixture wasm",
+			);
+			const client = new TreeSitterClient(false, undefined, {
+				resolveAsset: () => undefined,
+				resolvePackage: (specifier) => {
+					expect(specifier).toBe("tree-sitter-wasms/package.json");
+					return packageJson;
+				},
+				cwd: () => env.tmpDir,
+			}) as unknown as { grammarsDir: string };
+			expect(client.grammarsDir).toBe(expectedDir);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("findGrammarsDir resolves the cwd fallback branch", () => {
+		const env = setupTestEnvironment("pi-lens-tree-sitter-2112-cwd-");
+		try {
+			const expectedDir = path.join(
+				env.tmpDir,
+				"node_modules",
+				"tree-sitter-wasms",
+				"out",
+			);
+			fs.mkdirSync(expectedDir, { recursive: true });
+			const client = new TreeSitterClient(false, undefined, {
+				resolveAsset: () => undefined,
+				resolvePackage: () => {
+					throw new Error("package resolver must not run");
+				},
+				cwd: () => env.tmpDir,
+			}) as unknown as { grammarsDir: string };
+			expect(client.grammarsDir).toBe(expectedDir);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("findGrammarsDir returns empty when no branch resolves", () => {
+		const client = new TreeSitterClient(false, undefined, {
+			resolveAsset: () => undefined,
+			resolvePackage: () => {
+				throw new Error("package unavailable");
+			},
+			cwd: () => "C:/absent-pi-lens-test-cwd",
+		}) as unknown as { grammarsDir: string };
+		expect(client.grammarsDir).toBe("");
 	});
 
 	it("TreeSitterClient.isAvailable returns true when grammars are installed", async () => {

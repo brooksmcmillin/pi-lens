@@ -114,6 +114,25 @@ function handle(raw) {
 	} catch {
 		return;
 	}
+	if (process.env.FAKE_LSP_TRACE_FILE) {
+		const trace = (what) => {
+			import("node:fs")
+				.then((fs) =>
+					fs.appendFileSync(
+						process.env.FAKE_LSP_TRACE_FILE,
+						`${what}\n`,
+					),
+				)
+				.catch(() => {});
+		};
+		trace(`recv ${data.method ?? "<response>"}`);
+		if (
+			process.env.FAKE_LSP_ECHO_NOTIFY_METHODS === "1" &&
+			data.id === undefined
+		) {
+			trace(`echo-eligible ${data.method}`);
+		}
+	}
 
 	// Initialize handshake. FAKE_LSP_IGNORE_INITIALIZE simulates a hung server
 	// that never completes the handshake, so createLSPClient's
@@ -121,6 +140,69 @@ function handle(raw) {
 	// timeout kill + 2s SIGKILL-backstop path (#1114).
 	if (data.method === "initialize") {
 		if (process.env.FAKE_LSP_IGNORE_INITIALIZE === "1") return;
+		const clientCapabilities = data.params?.capabilities;
+		const clientCodeAction = clientCapabilities?.textDocument?.codeAction;
+		const clientSupportsCodeActionResolve =
+			clientCodeAction?.dataSupport === true &&
+			Array.isArray(clientCodeAction?.resolveSupport?.properties) &&
+			clientCodeAction.resolveSupport.properties.includes("edit");
+		const clientSupportsWillRename =
+			clientCapabilities?.workspace?.fileOperations?.willRename === true;
+		const clientSupportsDidRename =
+			clientCapabilities?.workspace?.fileOperations?.didRename === true;
+		const renameFilter = (globEnv, globDefault) => ({
+			scheme: "file",
+			pattern: {
+				glob: process.env[globEnv] ?? globDefault,
+			},
+		});
+		const renameFilters = (operation, globEnv, globDefault) => {
+			const encoded = process.env[`FAKE_LSP_${operation}_FILTERS`];
+			return encoded === undefined
+				? [renameFilter(globEnv, globDefault)]
+				: JSON.parse(encoded);
+		};
+		const codeActionProvider =
+			process.env.FAKE_LSP_CODE_ACTION_PROVIDER === "false"
+				? { resolveProvider: false }
+				: process.env.FAKE_LSP_CODE_ACTION_PROVIDER === "malformed"
+					? { resolveProvider: "yes" }
+					: process.env.FAKE_LSP_NO_CODE_ACTION_RESOLVE === "1" ||
+						  !clientSupportsCodeActionResolve
+						? {}
+						: { resolveProvider: true };
+		const workspaceFileOperations =
+			process.env.FAKE_LSP_WILL_RENAME === "true"
+				? {
+						willRename: clientSupportsWillRename
+							? {
+									filters: renameFilters(
+										"WILL_RENAME",
+										"FAKE_LSP_WILL_RENAME_GLOB",
+										"**/*",
+									),
+								}
+							: undefined,
+						...(process.env.FAKE_LSP_DID_RENAME === "true" &&
+						clientSupportsDidRename
+							? {
+									didRename: {
+										filters: renameFilters(
+											"DID_RENAME",
+											"FAKE_LSP_DID_RENAME_GLOB",
+											"**/*",
+										),
+									},
+								  }
+							: {}),
+				  }
+				: process.env.FAKE_LSP_WILL_RENAME === "false"
+					? { willRename: false }
+					: process.env.FAKE_LSP_WILL_RENAME === "empty-object"
+						? { willRename: {} }
+						: process.env.FAKE_LSP_WILL_RENAME === "malformed"
+							? { willRename: "yes" }
+							: undefined;
 		send({
 			jsonrpc: "2.0",
 			id: data.id,
@@ -156,18 +238,47 @@ function handle(raw) {
 					...(process.env.FAKE_LSP_NO_WORKSPACE_SYMBOL === "1"
 						? {}
 						: { workspaceSymbolProvider: true }),
-					codeActionProvider: { resolveProvider: true },
+					codeActionProvider,
+					...(workspaceFileOperations
+						? { workspace: { fileOperations: workspaceFileOperations } }
+						: {}),
 					executeCommandProvider: {
 						commands: ["fake.doThing", "fake.applyEdit"],
 					},
 					diagnosticProvider: {
 						interFileDependencies: false,
-						workspaceDiagnostics: false,
+						workspaceDiagnostics:
+							process.env.FAKE_LSP_WORKSPACE_DIAGNOSTICS === "1",
 					},
 				},
 			},
 		});
 		return;
+	}
+
+	if (
+		process.env.FAKE_LSP_ECHO_REQUEST_METHODS === "1" &&
+		data.id !== undefined
+	) {
+		send({
+			jsonrpc: "2.0",
+			method: "$/test/requestReceived",
+			params: { method: data.method },
+		});
+	}
+
+	// #1971: notification twin of the request echo above, so tests can assert
+	// WHETHER a notification (e.g. workspace/didRenameFiles) was sent at all.
+	if (
+		process.env.FAKE_LSP_ECHO_NOTIFY_METHODS === "1" &&
+		data.id === undefined &&
+		typeof data.method === "string"
+	) {
+		send({
+			jsonrpc: "2.0",
+			method: "$/test/notifyReceived",
+			params: { method: data.method },
+		});
 	}
 
 	// Ignore notifications without id
@@ -200,9 +311,23 @@ function handle(raw) {
 		// bug). Keep a harmless interval alive so the process (and its stdin
 		// pipe) stays open and unread indefinitely, like a real wedged
 		// server whose main loop is busy elsewhere.
+		//
+		// #2358: two stop-reading-but-alive liveness profiles for the
+		// notify-stall breaker's CPU discriminator. `FAKE_LSP_BURN_CPU_AFTER_INIT`
+		// makes the "dead but spinning" server real — one core busy-looping
+		// forever while nothing drains (the breaker must NOT kill it); without
+		// it the server is idle and flat (the breaker must kill it). Whether the
+		// fixture's burns are visible depends on the discriminator sampling
+		// this same process's cumulative CPU, which both Windows and POSIX
+		// do via kernel counters.
 		if (process.env.FAKE_LSP_WEDGE_STDIN_AFTER_INIT === "1") {
 			process.stdin.pause();
-			setInterval(() => {}, 60_000);
+			if (process.env.FAKE_LSP_BURN_CPU_AFTER_INIT === "1") {
+				const burnHandle = setInterval(() => burnCpu(100), 100);
+				process.on("exit", () => clearInterval(burnHandle));
+			} else {
+				setInterval(() => {}, 60_000);
+			}
 		}
 		return;
 	}
@@ -411,6 +536,40 @@ function handle(raw) {
 					],
 			},
 		});
+		return;
+	}
+
+	// Programmable project-wide pull for real-wire workspace sweep tests.
+	if (data.method === "workspace/diagnostic") {
+		const reply = () => {
+			if (process.env.FAKE_LSP_WORKSPACE_DIAGNOSTIC_ERROR === "1") {
+				send({
+					jsonrpc: "2.0",
+					id: data.id,
+					error: { code: -32603, message: "fake workspace pull failed" },
+				});
+				return;
+			}
+			const uri = process.env.FAKE_LSP_WORKSPACE_DIAGNOSTIC_URI;
+			send({
+				jsonrpc: "2.0",
+				id: data.id,
+				result: {
+					items: uri ? [{ uri, kind: "full", items: [] }] : [],
+				},
+			});
+		};
+		const delay = Number.parseInt(
+			process.env.FAKE_LSP_WORKSPACE_DIAGNOSTIC_DELAY_MS ?? "0",
+			10,
+		);
+		if (delay > 0) setTimeout(reply, delay);
+		else reply();
+		return;
+	}
+
+	if (data.method === "workspace/willRenameFiles") {
+		send({ jsonrpc: "2.0", id: data.id, result: null });
 		return;
 	}
 

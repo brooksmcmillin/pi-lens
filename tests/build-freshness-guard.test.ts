@@ -16,7 +16,11 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { findStaleCompiledSources } from "./support/check-build-freshness.js";
+import {
+	findResidueCompiledTestSources,
+	findStaleCompiledSources,
+	runFreshnessChecks,
+} from "./support/check-build-freshness.js";
 
 let root: string;
 const older = new Date("2020-01-01T00:00:00Z");
@@ -77,5 +81,69 @@ describe("findStaleCompiledSources (#198 build-freshness guard)", () => {
 		const r = run();
 		expect(r.some((p) => p.includes("thing.test.ts"))).toBe(false);
 		expect(r.some((p) => p.includes("thing.d.ts"))).toBe(false);
+	});
+});
+
+describe("findResidueCompiledTestSources (#2232 stale test-support residue guard)", () => {
+	let residueRoot: string;
+
+	beforeAll(() => {
+		residueRoot = mkdtempSync(join(tmpdir(), "pi-lens-test-residue-"));
+		const support = join(residueRoot, "tests", "support");
+		mkdirSync(support, { recursive: true });
+		const write = (rel: string) => writeFileSync(join(residueRoot, rel), "");
+
+		// tests/ is never built, so ANY .js sibling of a tests/**/*.ts is residue,
+		// regardless of mtime — unlike findStaleCompiledSources above.
+		write("tests/support/shadowed.ts");
+		write("tests/support/shadowed.js");
+		// no sibling .js: clean, must not be flagged.
+		write("tests/support/clean.ts");
+		// .d.ts is never a real test-support module: must not be flagged even
+		// with a .js sibling.
+		write("tests/support/types.d.ts");
+		write("tests/support/types.js");
+	});
+
+	afterAll(() => rmSync(residueRoot, { recursive: true, force: true }));
+
+	it("flags a .ts file that has a compiled .js sibling", () => {
+		const r = findResidueCompiledTestSources({ root: residueRoot }).map((p) =>
+			p.replace(/\\/g, "/"),
+		);
+		expect(r.some((p) => p.endsWith("tests/support/shadowed.js"))).toBe(true);
+	});
+
+	it("does not flag a .ts file with no compiled sibling", () => {
+		const r = findResidueCompiledTestSources({ root: residueRoot });
+		expect(r.some((p) => p.includes("clean"))).toBe(false);
+	});
+
+	it("ignores .d.ts even when a same-stem .js sits beside it", () => {
+		const r = findResidueCompiledTestSources({ root: residueRoot });
+		expect(r.some((p) => p.includes("types.js"))).toBe(false);
+	});
+});
+
+describe("runFreshnessChecks() end-to-end (#2232)", () => {
+	// An isolated temp tree, NOT the live repo tests/ directory: planting a
+	// file under the real tests/support/ raced a concurrent
+	// module-instance-scan.ts walk of that same live tree under parallel
+	// test workers (ENOENT observed in review — CI green beforehand was
+	// scheduling luck, not correctness). runFreshnessChecks() takes an
+	// injectable root precisely so this proof never touches the live tree.
+	let e2eRoot: string;
+
+	beforeAll(() => {
+		e2eRoot = mkdtempSync(join(tmpdir(), "pi-lens-freshness-e2e-"));
+		mkdirSync(join(e2eRoot, "tests", "support"), { recursive: true });
+	});
+
+	afterAll(() => rmSync(e2eRoot, { recursive: true, force: true }));
+
+	it("throws a loud error naming a planted stale-residue file", () => {
+		writeFileSync(join(e2eRoot, "tests", "support", "probe.ts"), "");
+		writeFileSync(join(e2eRoot, "tests", "support", "probe.js"), "");
+		expect(() => runFreshnessChecks(e2eRoot)).toThrow(/probe\.js/);
 	});
 });

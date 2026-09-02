@@ -18,7 +18,7 @@ import { recordLsp } from "../widget-state.js";
 import { applyAuxiliarySuppressions } from "../dispatch/auxiliary-lsp.js";
 import { detectFileRole } from "../file-role.js";
 import { emitBounded } from "../bounded-telemetry.js";
-import { logLatency } from "../latency-logger.js";
+import { logLatency, phaseFinished, phaseStarted } from "../latency-logger.js";
 import { logSessionStart } from "../sessionstart-logger.js";
 import {
 	incrementDegradationCount,
@@ -31,6 +31,7 @@ import {
 	projectTrustDenialReason,
 } from "../project-trust.js";
 import { shouldPreferPullOnlyDiagnostics } from "../lsp-budget.js";
+import { sampleProcessTreeCpuPercent } from "../resource-sampler.js";
 import { withDeadline, withTimeout } from "../deadline-utils.js";
 import {
 	acquireWorkspaceSweepHold,
@@ -41,7 +42,10 @@ import {
 	fingerprintDocumentContent,
 	type DriftSweepResult,
 } from "./document-drift.js";
-import { markPendingAuxiliaryCoverage } from "./pending-aux-coverage.js";
+import {
+	markPendingAuxiliaryCoverage,
+	napiFallbackCoveredSince,
+} from "./pending-aux-coverage.js";
 import {
 	isAtOrAboveHomeDir,
 	isWindowsPath,
@@ -74,6 +78,14 @@ import {
 	getServersForFileWithConfig,
 	getServerInitOverride,
 } from "./config.js";
+// #2052: deliberately NOT taken from `config.js`. This module's import surface
+// from `config.js` is mirrored by explicit `vi.mock` factories in ~58 test
+// files, so every new symbol taken from there breaks all of them.
+import {
+	getSessionRootsForTelemetry,
+	isOutsideAllSessionRoots,
+} from "./session-roots.js";
+import { getProcessSingleton } from "../process-singletons.js";
 import { getLanguageId } from "./language.js";
 import type { LSPServerInfo } from "./server.js";
 import {
@@ -82,6 +94,7 @@ import {
 	hasProjectBoundaryMarker,
 	isDirectLspCommandTemporarilyUnavailable,
 	resetClassicTsRepairGuard,
+	resetLspLaunchAvailabilityGeneration,
 } from "./server.js";
 import {
 	classifyCascadeWaitTier,
@@ -478,6 +491,31 @@ function readEnvAuxGraceMs(): number | undefined {
 	if (!Number.isFinite(parsed) || parsed < 0) return undefined;
 	return parsed;
 }
+const DEFAULT_AUX_GRACE_CEILING_MS = 2000;
+const MAX_ADAPTIVE_AUX_GRACE_CEILING_MS = 8000;
+const ADAPTIVE_AUX_GRACE_MARGIN_MS = 500;
+
+export function auxWaitBudgetMs(
+	serverId: string,
+	isCold: boolean,
+	configuredCeilingMs: number | undefined,
+	declaredWaitMs: number,
+): number {
+	if (configuredCeilingMs !== undefined || !isCold) {
+		return Math.min(
+			declaredWaitMs,
+			configuredCeilingMs ?? DEFAULT_AUX_GRACE_CEILING_MS,
+		);
+	}
+	const observedSpawnMs = getSuccessfulLspSpawnDurationMs(serverId);
+	if (observedSpawnMs === undefined || observedSpawnMs <= 0) {
+		return Math.min(declaredWaitMs, DEFAULT_AUX_GRACE_CEILING_MS);
+	}
+	return Math.min(
+		MAX_ADAPTIVE_AUX_GRACE_CEILING_MS,
+		Math.max(declaredWaitMs, observedSpawnMs + ADAPTIVE_AUX_GRACE_MARGIN_MS),
+	);
+}
 const DIAGNOSTICS_SEMANTIC_SETTLE_THRESHOLD_MS = Math.max(
 	0,
 	Number.parseInt(
@@ -506,6 +544,15 @@ export interface SpawnedServer {
 	info: LSPServerInfo;
 }
 
+type OutstandingAuxNotifyWrite = {
+	startedAt: number;
+	client: LSPClientInfo;
+	settled: Promise<void>;
+	wedgeTimer: ReturnType<typeof setTimeout>;
+	armedBudgetMs: number;
+	resolveSettled: () => void;
+};
+
 /**
  * #1934: what the client pool actually did to serve one selection.
  *
@@ -524,11 +571,32 @@ export interface SpawnedServer {
  * `declined` never reaches `lsp_client_selected` — those paths already have
  * their own records (`lsp_client_unavailable`, `lsp_client_skipped_broken`,
  * `lsp_client_skipped_unavailable_command`).
+ *
+ * #2064: `cold-spawn` alone conflated two different facts. Every caller that
+ * awaited one spawn reported `cold-spawn`, so the value read as a spawn count
+ * and was not one. In a 21.8h field window 62 `cold-spawn` records clustered
+ * into 21 real spawn events, a 3.0x over-count, and one cluster held 39
+ * records inside 2ms against a measured 29.3s TypeScript spawn. The `-joined`
+ * values split the two readings apart without splitting the record:
+ *
+ * - selections that paid a spawn wait = every cold/failure value;
+ * - selections served from the pool = `warm-reuse`;
+ * - reuse rate = `warm-reuse / (warm-reuse + every cold/failure value)`, the
+ *   same single denominator #1934 defined.
+ *
+ * These values are NOT the spawn count. `lsp_server_spawned` is, and it is
+ * authoritative: `getClientsForFile` and `getAuxiliaryClientsForFile` pass no
+ * `onOutcome`, so a multi-client or auxiliary spawn writes a spawn record and
+ * no selection record at all. Read the relation as
+ * `count(lsp_server_spawned) >= count(outcome="cold-spawn")`, never as
+ * equality (#2064 review F1).
  */
 export type LSPClientAcquisitionOutcome =
 	| "warm-reuse"
 	| "cold-spawn"
+	| "cold-spawn-joined"
 	| "spawn-failure"
+	| "spawn-failure-joined"
 	| "declined";
 
 // #1621: a rename-propagation notify failure now records WHY it failed —
@@ -709,7 +777,15 @@ export type LSPWorkspaceUnconfirmedReason =
 	| "coverage_gap"
 	| "service_destroyed"
 	| "error"
-	| "binding_mismatch";
+	| "binding_mismatch"
+	// #2052: the file lies outside every initialized session cwd, so no client
+	// was asked at all. NOT a timeout and NOT a clean result: the sweep has no
+	// evidence about this file either way. It shares `timedOut: true` with the
+	// other members purely because that flag is what excludes a result from the
+	// workspace-cache write-back — persisting a declined file as confirmed
+	// clean would replay a false clean on every later sweep, which is the whole
+	// defect #2052 exists to close.
+	| "outside_project_root";
 
 export interface LSPWorkspaceDiagnosticResult {
 	filePath: string;
@@ -953,6 +1029,23 @@ function notifyWriteBudgetMs(): number {
 	return Number.isFinite(raw) && raw > 0 ? raw : 2000;
 }
 
+// #2239: the SAME effective per-server wait floor `getClientForFile` uses to
+// size its own acquisition race — the caller's declared budget, raised to
+// whatever the file's primary server(s) configure via `clientWaitTimeoutMs`
+// (Ruby 30s, and the Bash/JSON/Vue/Svelte/Prisma overrides #2233 added). A
+// cold primary spawn is allowed to run this long, so anything downstream that
+// charges itself against `maxWaitMs` alone — rather than this floor — sees an
+// already-elapsed time it never budgeted for and clamps to zero.
+function primaryServerWaitFloorMs(
+	filePath: string,
+	maxWaitMs?: number,
+): number {
+	const serverWaitOverrideMs = getServersForFileWithConfig(filePath)
+		.filter((s) => s.role !== "auxiliary")
+		.reduce((max, server) => Math.max(max, server.clientWaitTimeoutMs ?? 0), 0);
+	return Math.max(maxWaitMs ?? 0, serverWaitOverrideMs);
+}
+
 // #1459: how long ONE auxiliary notify write may stay outstanding before the
 // server counts as wedged rather than merely slow. A scanner whose per-file work
 // exceeds the write budget is normal (opengrep routinely needs >2s on a large
@@ -965,6 +1058,59 @@ const NOTIFY_WEDGED_BUDGET_MULTIPLIER = 5;
 function notifyWedgedMs(): number {
 	return notifyWriteBudgetMs() * NOTIFY_WEDGED_BUDGET_MULTIPLIER;
 }
+
+// #2358: the wedge window's teardown decision gained a liveness discriminator.
+// The fixed window above stays the FLOOR; a server whose drain history says it
+// answers per-write in `ewmaMs` with `unacked` documents queued earns
+// `k x ewmaMs x unacked` of patience instead — the issue's "a server that
+// historically answers in 855 ms with 8 writes queued earns 15-20 s". The cap
+// bounds the whole thing so a busy-but-never-draining server still respawns.
+const NOTIFY_WEDGED_EWMA_MULTIPLIER = 2;
+const NOTIFY_WEDGED_CAP_MS = 60_000;
+
+function notifyWedgedCapMs(): number {
+	const raw = Number(process.env.PI_LENS_LSP_NOTIFY_WEDGED_CAP_MS);
+	return Number.isFinite(raw) && raw > 0 ? raw : NOTIFY_WEDGED_CAP_MS;
+}
+
+// #2358: how long the CPU-liveness discriminator watches the server between
+// two process-CPU samples before deciding "busy" vs "flat". Only ever spent
+// on a server whose write is already past its patience window — never on the
+// per-edit hot path.
+function notifyStallCpuSampleMs(): number {
+	const raw = Number(process.env.PI_LENS_LSP_NOTIFY_STALL_CPU_SAMPLE_MS);
+	return Number.isFinite(raw) && raw > 0 ? raw : 1200;
+}
+
+// A server burning more than this percent of one core across the sample
+// window counts as BUSY (progressing), not flat (wedged). A single-threaded
+// scanner under burst sits near 100; an idle or dead one near 0.
+const NOTIFY_STALL_CPU_BUSY_FLOOR_PERCENT = 10;
+
+/**
+ * #2358: the reason a notify-stall teardown fired, naming WHICH discriminator
+ * decided it. `demoteForNotifyStall` spreads this into the
+ * `lsp_notify_backpressure_broken` record, so a production kill is classifiable
+ * by its own log line.
+ */
+export type NotifyStallDemotionReason =
+	| {
+			consecutiveTimeouts: number;
+			discriminator?: "consecutive-timeouts";
+			cpuVerdict?: "flat" | "busy" | "unmeasured";
+	  }
+	| {
+			outstandingMs: number;
+			discriminator:
+				| "budget-exceeded"
+				| "budget-exceeded-cpu-flat"
+				| "cap-exceeded";
+			budgetMs?: number;
+			ewmaInputMs?: number;
+			unackedDepth?: number;
+			cpuVerdict?: "flat" | "busy" | "unmeasured";
+			cpuPercent?: number | null;
+	  };
 
 // #1714: how many document notifies one auxiliary may hold UNACKNOWLEDGED
 // before the next notify has to prove the server drained its input.
@@ -1091,10 +1237,12 @@ async function collectWorkspaceDiagnosticFiles(
 // --- Service ---
 
 export class LSPService {
+	private readonly sessionCwd: string | undefined;
 	private state: LSPState;
 	private readonly workspaceProbeLogged = new Set<string>();
 	/** Per-service immutable root-boundary verdicts; root detectors cache hits too. */
 	private readonly projectBoundaryCache = new Map<string, Promise<boolean>>();
+	/** Foreign roots are recorded once per normalized root for this service/session. */
 	private readonly warmStartLogged = new Set<string>();
 	private readonly optionalFailureLogged = new Set<string>();
 	/** Server/root pairs that already emitted unavailable for the current occurrence. */
@@ -1218,6 +1366,22 @@ export class LSPService {
 	 */
 	private readonly notifyWriteBackpressureStreak = new Map<string, number>();
 	/**
+	 * #2358: EWMA of one auxiliary's per-document drain latency
+	 * (ms per unacknowledged write), keyed by "serverId:normalizedRoot".
+	 *
+	 * Updated from DRAINED notify barriers only: the round-trip proves the
+	 * server processed its `outstanding` backlog, and
+	 * duration / outstanding is the per-write service time a single-threaded
+	 * scanner actually achieves under load. The breaker grants a wedged write
+	 * `k x ewma x unacked` of patience from it, so a slow-but-alive scanner is
+	 * not killed at the fixed window by construction (#2358).
+	 *
+	 * Cleared by the service teardown (via `session_start`) like the rest of
+	 * the breaker state; a stale throughput estimate from a previous session's
+	 * client must not price the next one.
+	 */
+	private readonly auxNotifyDrainLatencyEwma = new Map<string, number>();
+	/**
 	 * #1714: unacknowledged auxiliary document notifies per server key
 	 * ("serverId:normalizedRoot" — the same identity as every other gate here).
 	 *
@@ -1264,13 +1428,17 @@ export class LSPService {
 	 */
 	private readonly outstandingAuxNotifyWrites = new Map<
 		string,
-		{
-			startedAt: number;
-			client: LSPClientInfo;
-			settled: Promise<void>;
-			wedgeTimer: ReturnType<typeof setTimeout>;
-		}
+		OutstandingAuxNotifyWrite
 	>();
+	/**
+	 * #2356: auxiliary clients removed by the notify-stall breaker are a
+	 * temporary absence, not a missing scanner. Keep the demotion identity after
+	 * deleting the client so the turn-end late-coverage probe can re-arm the
+	 * pending pair until a replacement is published (or its existing bounded
+	 * re-arm ceiling is reached). A successful replacement removes the marker.
+	 */
+	private readonly notifyStallDemotions = new Map<string, number>();
+	private static readonly MAX_NOTIFY_STALL_DEMOTIONS = 50;
 	/** LRU clock for capacity eviction, keyed by the canonical server/root key. */
 	private readonly clientLastUsedAt = new Map<string, number>();
 	/**
@@ -1302,8 +1470,9 @@ export class LSPService {
 	 */
 	private generationHandoff: Promise<void> | undefined;
 
-	constructor(generationHandoff?: Promise<void>) {
+	constructor(generationHandoff?: Promise<void>, sessionCwd?: string) {
 		this.generationHandoff = generationHandoff;
+		this.sessionCwd = sessionCwd;
 		this.state = {
 			clients: new Map(),
 			servers: new Map(),
@@ -1326,6 +1495,13 @@ export class LSPService {
 	): Promise<string | undefined> {
 		const candidate = await server.root(filePath);
 		if (!candidate) return undefined;
+		// #2052: a file outside EVERY initialized session cwd gets no client at
+		// all. The ceiling below is unchanged (`process.cwd()`, as before this
+		// issue) and still only clamps files that are actually inside it —
+		// `enforceLspRootCeiling` returns the root untouched for an out-of-ceiling
+		// file. So this gate is the ONLY new refusal, and it consults the
+		// registry, not a single cwd.
+		if (isOutsideAllSessionRoots(filePath)) return undefined;
 		const root = enforceLspRootCeiling(candidate, process.cwd(), filePath);
 		if (normalizeMapKey(root) === normalizeMapKey(process.cwd())) return root;
 
@@ -1505,6 +1681,7 @@ export class LSPService {
 		}
 
 		const [victimKey, victimClient] = victim;
+		this.releaseOutstandingAuxNotifyWrite(victimKey);
 		await victimClient.shutdown({ reason: "client_ceiling_lru" });
 		this.state.clients.delete(victimKey);
 		this.state.clientSpawnedAt.delete(victimKey);
@@ -1522,6 +1699,18 @@ export class LSPService {
 		const timer = this.typeScriptIdleTimers.get(key);
 		if (timer) clearTimeout(timer);
 		this.typeScriptIdleTimers.delete(key);
+	}
+
+	/** Release a notify token and its timer when its client generation retires. */
+	private releaseOutstandingAuxNotifyWrite(
+		key: string,
+		token?: OutstandingAuxNotifyWrite,
+	): void {
+		const current = this.outstandingAuxNotifyWrites.get(key);
+		if (!current || (token !== undefined && current !== token)) return;
+		clearTimeout(current.wedgeTimer);
+		this.outstandingAuxNotifyWrites.delete(key);
+		current.resolveSettled();
 	}
 
 	private scheduleTypeScriptIdleEviction(key: string): void {
@@ -1549,6 +1738,7 @@ export class LSPService {
 				// Publish the cold state synchronously before awaiting teardown. A request
 				// arriving while shutdown is in progress therefore waits on the spawn gate
 				// and creates a fresh client; it can never receive this retiring one.
+				this.releaseOutstandingAuxNotifyWrite(key);
 				this.state.clients.delete(key);
 				this.state.clientSpawnedAt.delete(key);
 				this.state.demonstratedReady.delete(key);
@@ -1722,9 +1912,140 @@ export class LSPService {
 			return;
 		}
 		this.notifyWriteBackpressureStreak.delete(key);
-		this.demoteForNotifyStall(key, entry, filePath, {
+		// #2358: the consecutive-timeout ladder lands here too, and its verdict
+		// must not kill a server that is demonstrably BUSY. The guarded demotion
+		// samples the live process CPU and merely resets the ladder (the next
+		// three timeouts re-try) when the server is progressing — the wedged-write
+		// path's cap owns a busy-but-never-draining server, not this streak.
+		void this.demoteNotifyStallCpuGuarded(key, entry, filePath, {
 			consecutiveTimeouts: NOTIFY_BACKPRESSURE_BROKEN_AFTER,
 		});
+	}
+
+	/**
+	 * #2358: liveness-guarded teardown for the STREAK ladder.
+	 *
+	 * The wedged-write path ({@link decideNotifyStallTeardown}) keeps its own
+	 * re-arm loop so a busy server's outstanding write stays un-torn-down; the
+	 * streak ladder has no write to hold — it simply does not demote, and the
+	 * next three timeouts re-attempt. Generation-guarded after the await so a
+	 * client replaced mid-sample is never demoted for a verdict about its
+	 * predecessor.
+	 */
+	private async demoteNotifyStallCpuGuarded(
+		key: string,
+		entry: SpawnedServer,
+		filePath: string,
+		reason: { consecutiveTimeouts: number },
+	): Promise<void> {
+		if (this.state.clients.get(key) !== entry.client) return;
+		// The CPU verdict is asynchronous, but the streak has already committed to
+		// this client's teardown path. Release the TypeScript idle-timer ownership
+		// before sampling so another idle callback cannot target the same client
+		// while the verdict is in flight. A BUSY verdict below re-arms a fresh timer.
+		this.clearTypeScriptIdleTimer(key);
+		const verdict = await this.notifyStallCpuVerdict(entry);
+		if (verdict.cpuVerdict === "busy") {
+			if (this.state.clients.get(key) === entry.client) {
+				this.scheduleTypeScriptIdleEviction(key);
+			}
+			this.logNotifyStallCpuBusy(key, entry, filePath, 0, verdict);
+			return;
+		}
+		if (this.state.clients.get(key) !== entry.client) return;
+		this.demoteForNotifyStall(key, entry, filePath, {
+			...reason,
+			discriminator: "consecutive-timeouts",
+			cpuVerdict: verdict.cpuVerdict,
+		});
+	}
+
+	/**
+	 * #2358: classify a stalled server's live process CPU.
+	 *
+	 * A client with no process handle (a test/mock double, a legacy client)
+	 * reports "unmeasured" — the caller keeps the pre-#2358 demote-at-budget
+	 * behavior, because there is no liveness evidence to override it. A sampled
+	 * process that burns a core is BUSY; anything else is FLAT, including a
+	 * query that failed to resolve the pid — a server we cannot measure is not
+	 * proven busy, and the replacement self-heal is cheap.
+	 */
+	private async notifyStallCpuVerdict(entry: SpawnedServer): Promise<{
+		cpuVerdict: "busy" | "flat" | "unmeasured";
+		cpuPercent: number | null;
+	}> {
+		const pid = entry.client.getProcessPid?.();
+		if (pid === undefined || !(Number.isFinite(pid) && pid > 0)) {
+			return { cpuVerdict: "unmeasured", cpuPercent: null };
+		}
+		const sample = await sampleProcessTreeCpuPercent(
+			pid,
+			notifyStallCpuSampleMs(),
+			NOTIFY_STALL_CPU_BUSY_FLOOR_PERCENT,
+		);
+		if (!sample.measured) {
+			return { cpuVerdict: "unmeasured", cpuPercent: null };
+		}
+		if (sample.busy) {
+			return { cpuVerdict: "busy", cpuPercent: sample.cpuPercent };
+		}
+		return { cpuVerdict: "flat", cpuPercent: sample.cpuPercent };
+	}
+
+	/**
+	 * #2358: one bounded row per busy defer. Not a failure record — the
+	 * discrimination succeeded — so it is a plain latency phase; its volume is
+	 * bounded by the re-arm cadence of one outstanding write (at most the wedge
+	 * cap divided by the budget, ~6 fires at defaults).
+	 */
+	private logNotifyStallCpuBusy(
+		key: string,
+		entry: SpawnedServer,
+		filePath: string,
+		outstandingMs: number,
+		verdict: { cpuPercent: number | null },
+		extra: { budgetMs?: number } = {},
+	): void {
+		emitBounded(
+			"lsp_notify_stall_cpu_busy",
+			`${key}:${normalizeMapKey(filePath)}`,
+			{
+				type: "phase",
+				durationMs: outstandingMs,
+				metadata: {
+					serverId: entry.info.id,
+					clientKey: key,
+					outstandingMs,
+					cpuPercent: verdict.cpuPercent ?? null,
+					...extra,
+				},
+			},
+			{
+				ledgerKind: "lsp-notify-stall-cpu-busy",
+				risingEdgePer: "identity",
+			},
+		);
+	}
+
+	/**
+	 * #2358: the patience window a wedged auxiliary write earns.
+	 *
+	 * max(fixed floor, k x EWMA per-write latency x unacked depth), capped so a
+	 * busy-but-never-draining server still respawns within the cap. The EWMA
+	 * comes from DRAINED notify barriers (see {@link noteAuxNotifyDrainLatency});
+	 * with no history the fixed floor (the pre-#2358 window) stands.
+	 */
+	private auxNotifyWedgeBudgetMs(key: string): number {
+		let budgetMs = notifyWedgedMs();
+		const ewma = this.auxNotifyDrainLatencyEwma.get(key);
+		if (ewma !== undefined && ewma > 0) {
+			const unacked = this.auxNotifyInflight.get(key)?.unacked ?? 0;
+			budgetMs = Math.max(
+				budgetMs,
+				NOTIFY_WEDGED_EWMA_MULTIPLIER * ewma * unacked,
+			);
+		}
+		return Math.min(budgetMs, notifyWedgedCapMs());
 	}
 
 	/**
@@ -1736,15 +2057,26 @@ export class LSPService {
 		key: string,
 		entry: SpawnedServer,
 		filePath: string,
-		reason: { consecutiveTimeouts: number } | { outstandingMs: number },
+		reason: NotifyStallDemotionReason,
 	): void {
+		// An async verdict belongs to one client generation. Never let a
+		// predecessor's decision delete or cool down its replacement.
+		if (this.state.clients.get(key) !== entry.client) return;
 		this.notifyWriteBackpressureStreak.delete(key);
-		this.outstandingAuxNotifyWrites.delete(key);
+		this.releaseOutstandingAuxNotifyWrite(key);
 		// #1714: the demoted client is torn down, so its backlog count describes a
 		// process that no longer exists. Leaving it would make the replacement start
 		// at the ceiling and pay a barrier on its first file.
 		this.auxNotifyInflight.delete(key);
 		this.state.broken.set(key, Date.now() + BROKEN_BASE_COOLDOWN_MS);
+		this.notifyStallDemotions.set(key, Date.now());
+		while (
+			this.notifyStallDemotions.size > LSPService.MAX_NOTIFY_STALL_DEMOTIONS
+		) {
+			const oldest = this.notifyStallDemotions.keys().next().value;
+			if (oldest === undefined) break;
+			this.notifyStallDemotions.delete(oldest);
+		}
 		void entry.client.shutdown().catch(() => {});
 		this.state.clients.delete(key);
 		this.state.clientSpawnedAt.delete(key);
@@ -1810,6 +2142,108 @@ export class LSPService {
 			return;
 		}
 		this.auxNotifyInflight.set(key, { client, unacked: 1 });
+	}
+
+	/**
+	 * #2358: fold one DRAINED notify barrier's per-write latency into the
+	 * per-key EWMA. A drained round-trip proves the server processed its
+	 * `outstanding` backlog after the ping; duration / outstanding is the
+	 * per-document service time the single-threaded scanner actually achieves
+	 * under load, which is exactly what a busy-server patience window must be
+	 * priced from (#2358's evidence: an 855 ms per-answer server with an
+	 * 8-write backlog, able to drain in 10-20 s while healthy).
+	 */
+	private noteAuxNotifyDrainLatency(
+		key: string,
+		durationMs: number,
+		outstanding: number,
+		record?: { client: LSPClientInfo },
+	): void {
+		if (!(outstanding > 0 && durationMs > 0)) return;
+		if (record && this.auxNotifyInflight.get(key) !== record) return;
+		const perWriteMs = durationMs / outstanding;
+		const prev = this.auxNotifyDrainLatencyEwma.get(key);
+		this.auxNotifyDrainLatencyEwma.set(
+			key,
+			prev === undefined ? perWriteMs : 0.5 * perWriteMs + 0.5 * prev,
+		);
+	}
+
+	/**
+	 * #2358: decide whether a wedged notify write's teardown really fires.
+	 *
+	 * Before #2358 the breaker killed a server whose write stayed outstanding
+	 * past a FIXED window, conflating a dead input path with a busy scanner
+	 * draining a burst — the live opengrep kill at #2358's head. The decision
+	 * now has two guards, and the record names which one fired:
+	 *
+	 * - the window is ADAPTIVE — max(fixed floor, k x EWMA per-write latency x
+	 *   unacked depth), capped at {@link notifyWedgedCapMs} — so a server that
+	 *   historically answers in 855 ms with 8 writes queued earns 13.7 s (k=2),
+	 *   not 10 s;
+	 * - past the window, the server's process CPU is sampled twice; a BUSY
+	 *   server is left alone (the write stays outstanding and the caller re-arms
+	 *   this timer), a FLAT or unmeasured one is torn down.
+	 *
+	 * The hard cap still kills: a busy server that cannot drain inside it is
+	 * damaged, and the replacement is the self-heal the breaker exists to
+	 * provide.
+	 */
+	private async decideNotifyStallTeardown(
+		key: string,
+		entry: SpawnedServer,
+		filePath: string,
+		token: OutstandingAuxNotifyWrite,
+	): Promise<
+		| { action: "demote"; reason: NotifyStallDemotionReason }
+		| { action: "rearm"; budgetMs: number }
+	> {
+		if (
+			this.state.clients.get(key) !== entry.client ||
+			this.outstandingAuxNotifyWrites.get(key) !== token
+		) {
+			throw new Error("stale notify generation");
+		}
+		const outstandingMs = Date.now() - token.startedAt;
+		const armedBudgetMs = token.armedBudgetMs;
+		if (outstandingMs >= notifyWedgedCapMs()) {
+			return {
+				action: "demote",
+				reason: {
+					outstandingMs,
+					discriminator: "cap-exceeded",
+					budgetMs: armedBudgetMs,
+				},
+			};
+		}
+		const verdict = await this.notifyStallCpuVerdict(entry);
+		if (
+			this.state.clients.get(key) !== entry.client ||
+			this.outstandingAuxNotifyWrites.get(key) !== token
+		) {
+			throw new Error("stale notify generation");
+		}
+		if (verdict.cpuVerdict === "busy") {
+			this.logNotifyStallCpuBusy(key, entry, filePath, outstandingMs, verdict, {
+				budgetMs: armedBudgetMs,
+			});
+			return { action: "rearm", budgetMs: this.auxNotifyWedgeBudgetMs(key) };
+		}
+		return {
+			action: "demote",
+			reason: {
+				outstandingMs,
+				discriminator:
+					verdict.cpuVerdict === "unmeasured"
+						? "budget-exceeded"
+						: "budget-exceeded-cpu-flat",
+				budgetMs: armedBudgetMs,
+				ewmaInputMs: this.auxNotifyDrainLatencyEwma.get(key),
+				unackedDepth: this.auxNotifyInflight.get(key)?.unacked ?? 0,
+				cpuVerdict: verdict.cpuVerdict,
+				cpuPercent: verdict.cpuPercent ?? null,
+			},
+		};
 	}
 
 	/**
@@ -1946,11 +2380,17 @@ export class LSPService {
 					// and the waiter is what latches. A second latch here would be
 					// unreachable, and no test could hold it honest.
 				}
+				// #2358: a DRAINED round-trip is a per-write latency measurement —
+				// the server really processed its backlog — so it feeds the EWMA
+				// the adaptive wedge window is priced from.
+				const durationMs = Date.now() - startedAt;
+				if (drained)
+					this.noteAuxNotifyDrainLatency(key, durationMs, outstanding, record);
 				this.noteDrainBarrierOutcome(key, entry, filePath, context, {
 					unacked: outstanding,
 					limit,
 					waitMs,
-					durationMs: Date.now() - startedAt,
+					durationMs,
 					outcome: drained ? "drained" : "stalled",
 				});
 				return drained;
@@ -2116,7 +2556,7 @@ export class LSPService {
 			// respawned) says nothing about this client's stdin — drop it, so a stale
 			// entry can never starve a healthy server.
 			if (outstanding && outstanding.client !== entry.client) {
-				this.outstandingAuxNotifyWrites.delete(clientKey);
+				this.releaseOutstandingAuxNotifyWrite(clientKey, outstanding);
 			} else if (outstanding) {
 				const outstandingMs = Date.now() - outstanding.startedAt;
 				const remainingMs = deadline - Date.now();
@@ -2151,29 +2591,91 @@ export class LSPService {
 				startedAt: Date.now(),
 				client: entry.client,
 				settled,
-				// A write nothing accepts for the whole wedge window is a dead input
-				// path, not a slow scan. Armed HERE rather than checked by the next
-				// waiter: inside a burst every waiter arrives within one budget, so a
-				// waiter-side check could never see the wedge window elapse and a
-				// wedged scanner was never demoted. Unref'd so it cannot hold a
-				// one-shot host alive, and cleared on release.
-				wedgeTimer: setTimeout(() => {
-					if (this.outstandingAuxNotifyWrites.get(clientKey) !== token) return;
-					this.demoteForNotifyStall(clientKey, entry, filePath, {
-						outstandingMs: Date.now() - token.startedAt,
-					});
-					resolveSettled?.();
-				}, notifyWedgedMs()),
+				armedBudgetMs: 0,
+				// SAFETY: the handle is a torn-initialized placeholder. It is armed
+				// a beat later in this same atomic claim (no await in between) and
+				// thereafter only ever written by this token's own fire/release
+				// closures, so the placeholder value is never read by anyone.
+				wedgeTimer: undefined as unknown as ReturnType<typeof setTimeout>,
+				resolveSettled: (): void => resolveSettled?.(),
 			};
+			// A write nothing accepts for the whole wedge window is a dead input
+			// path, not a slow scan. Armed HERE rather than checked by the next
+			// waiter: inside a burst every waiter arrives within one budget, so a
+			// waiter-side check could never see the wedge window elapse and a
+			// wedged scanner was never demoted. Unref'd so it cannot hold a
+			// one-shot host alive, and cleared on release.
+			//
+			// #2358: the window itself is now ADAPTIVE (issue's `max(fixed,
+			// k x EWMA per-answer latency x unacked depth)`, capped), and when it
+			// fires the server's process CPU is sampled before the kill — a busy
+			// server is left alone and the timer re-arms, so a scanner draining a
+			// burst is never killed by construction. Every fire re-checks the
+			// token identity after its awaits, so a release or a concurrent
+			// demotion that lands mid-sample aborts the decision.
+			const fireWedge = async (): Promise<void> => {
+				if (
+					this.outstandingAuxNotifyWrites.get(clientKey) !== token ||
+					this.state.clients.get(clientKey) !== entry.client
+				) {
+					this.releaseOutstandingAuxNotifyWrite(clientKey, token);
+					return;
+				}
+				let decision:
+					| { action: "demote"; reason: NotifyStallDemotionReason }
+					| { action: "rearm"; budgetMs: number };
+				try {
+					decision = await this.decideNotifyStallTeardown(
+						clientKey,
+						entry,
+						filePath,
+						token,
+					);
+				} catch {
+					// A failed decision must not strand the outstanding write or the
+					// waiter: fall back to the pre-#2358 demote-at-budget teardown.
+					decision = {
+						action: "demote",
+						reason: {
+							outstandingMs: Date.now() - token.startedAt,
+							discriminator: "budget-exceeded",
+							budgetMs: token.armedBudgetMs,
+						},
+					};
+				}
+				if (
+					this.outstandingAuxNotifyWrites.get(clientKey) !== token ||
+					this.state.clients.get(clientKey) !== entry.client
+				) {
+					this.releaseOutstandingAuxNotifyWrite(clientKey, token);
+					return;
+				}
+				if (decision.action === "demote") {
+					this.demoteForNotifyStall(
+						clientKey,
+						entry,
+						filePath,
+						decision.reason,
+					);
+					resolveSettled?.();
+					return;
+				}
+				token.wedgeTimer = setTimeout(
+					() => void fireWedge(),
+					decision.budgetMs,
+				);
+				token.wedgeTimer.unref?.();
+			};
+			token.armedBudgetMs = this.auxNotifyWedgeBudgetMs(clientKey);
+			token.wedgeTimer = setTimeout(
+				() => void fireWedge(),
+				token.armedBudgetMs,
+			);
 			token.wedgeTimer.unref?.();
 			this.outstandingAuxNotifyWrites.set(clientKey, token);
 			return {
 				release: (): void => {
-					clearTimeout(token.wedgeTimer);
-					if (this.outstandingAuxNotifyWrites.get(clientKey) === token) {
-						this.outstandingAuxNotifyWrites.delete(clientKey);
-					}
-					resolveSettled?.();
+					this.releaseOutstandingAuxNotifyWrite(clientKey, token);
 				},
 			};
 		}
@@ -2283,17 +2785,13 @@ export class LSPService {
 		const servers = getServersForFileWithConfig(filePath).filter(
 			(s) => s.role !== "auxiliary",
 		);
-		const serverWaitOverrideMs = servers.reduce(
-			(max, server) => Math.max(max, server.clientWaitTimeoutMs ?? 0),
-			0,
-		);
 		// hardCapMs is a caller-imposed ceiling (e.g. pipeline budget) that
 		// prevents tool_result from blocking the TUI for the full LSP cold-start
 		// window. When no server config sets a wait (serverWaitOverrideMs = 0),
 		// hardCapMs is used directly — Math.min(0, cap) = 0 would otherwise
 		// take the no-timeout branch and block indefinitely (e.g. pyright, which
 		// has no clientWaitTimeoutMs but can take 30s to initialize on cold start).
-		const serverBaseMs = Math.max(maxWaitMs ?? 0, serverWaitOverrideMs);
+		const serverBaseMs = primaryServerWaitFloorMs(filePath, maxWaitMs);
 		const effectiveMaxWaitMs =
 			hardCapMs !== undefined
 				? serverBaseMs > 0
@@ -2324,7 +2822,11 @@ export class LSPService {
 			// #1934: the first server whose acquisition ERRORED, as opposed to
 			// cleanly declining. Kept so a selection that served nobody still
 			// says which server the pool actually tried and failed to spawn.
+			// #2064 carries the errored outcome VALUE with it, so the record
+			// below reports whether this caller started the failed spawn or
+			// joined it, instead of pinning a starter label on every joiner.
 			let erroredServerId: string | undefined;
+			let erroredOutcome: LSPClientAcquisitionOutcome | undefined;
 
 			// Try each matching server
 			for (const server of servers) {
@@ -2360,8 +2862,14 @@ export class LSPService {
 					});
 					return spawned;
 				}
-				if (acquisition.outcome === "spawn-failure") {
-					erroredServerId ??= server.id;
+				if (
+					acquisition.outcome === "spawn-failure" ||
+					acquisition.outcome === "spawn-failure-joined"
+				) {
+					if (erroredServerId === undefined) {
+						erroredServerId = server.id;
+						erroredOutcome = acquisition.outcome;
+					}
 				}
 			}
 
@@ -2379,7 +2887,8 @@ export class LSPService {
 					metadata: {
 						serverId: erroredServerId,
 						candidateCount: servers.length,
-						outcome: "spawn-failure" satisfies LSPClientAcquisitionOutcome,
+						outcome: (erroredOutcome ??
+							"spawn-failure") satisfies LSPClientAcquisitionOutcome,
 					},
 				});
 			}
@@ -2507,8 +3016,10 @@ export class LSPService {
 	}
 
 	/**
-	 * Get or create ALL LSP clients that can serve a file.
-	 * Used for diagnostics aggregation across complementary servers.
+	 * Get or create all complementary LSP clients that can serve a file. Alternate
+	 * language servers marked with `fallbackFor` remain sequential fallbacks: an
+	 * aggregate diagnostics pass must not launch them beside a working preferred
+	 * server merely because it requested `clientScope: "all"`.
 	 */
 	async getClientsForFile(
 		filePath: string,
@@ -2522,24 +3033,46 @@ export class LSPService {
 				: allServers;
 		if (servers.length === 0) return { clients: [], serverCountAttempted: 0 };
 
-		// Count servers with a valid root as "attempted" — extension-only matches
-		// that fail the root check are not real spawn attempts.
-		const roots = await Promise.all(
-			servers.map((s) => this.resolveServerRoot(s, filePath)),
+		// Resolve once to keep the attempted count tied to servers with a real root.
+		const rootedServers = (
+			await Promise.all(
+				servers.map(async (server) => ({
+					server,
+					root: await this.resolveServerRoot(server, filePath),
+				})),
+			)
+		).filter(
+			(entry): entry is { server: LSPServerInfo; root: string } =>
+				entry.root !== undefined,
 		);
-		const serverCountAttempted = roots.filter(Boolean).length;
 
-		const spawned = await Promise.all(
-			servers.map((server) =>
-				this.ensureClientForServer(filePath, server, resolvedRoots),
-			),
-		);
-		return {
-			clients: spawned.filter((entry): entry is SpawnedServer =>
-				Boolean(entry),
-			),
-			serverCountAttempted,
+		let serverCountAttempted = 0;
+		const acquisitions = new Map<string, Promise<SpawnedServer | undefined>>();
+		const acquire = (server: LSPServerInfo) => {
+			serverCountAttempted += 1;
+			return this.ensureClientForServer(filePath, server, resolvedRoots);
 		};
+
+		// Start complementary servers immediately. An alternate waits only for its
+		// own preferred server, not for unrelated scanners, and starts if that server
+		// declines. Registry order makes chained fallbacks deterministic.
+		for (const { server } of rootedServers) {
+			const preferred = server.fallbackFor
+				? acquisitions.get(server.fallbackFor)
+				: undefined;
+			const acquisition = preferred
+				? preferred.then((entry) =>
+						entry === undefined ? acquire(server) : undefined,
+					)
+				: acquire(server);
+			acquisitions.set(server.id, acquisition);
+		}
+
+		const results = await Promise.all(acquisitions.values());
+		const clients = results.filter(
+			(entry): entry is SpawnedServer => entry !== undefined,
+		);
+		return { clients, serverCountAttempted };
 	}
 
 	/**
@@ -2550,6 +3083,10 @@ export class LSPService {
 	async getAuxiliaryClientsForFile(
 		filePath: string,
 		enabledIds: ReadonlySet<string>,
+		onOutcome?: (
+			serverId: string,
+			outcome: LSPClientAcquisitionOutcome,
+		) => void,
 	): Promise<SpawnedServer[]> {
 		if (this.checkDestroyed() || enabledIds.size === 0) return [];
 		const servers = getServersForFileWithConfig(filePath).filter(
@@ -2557,7 +3094,15 @@ export class LSPService {
 		);
 		if (servers.length === 0) return [];
 		const spawned = await Promise.all(
-			servers.map((server) => this.ensureClientForServer(filePath, server)),
+			servers.map((server) =>
+				this.ensureClientForServer(
+					filePath,
+					server,
+					undefined,
+					undefined,
+					(reported) => onOutcome?.(server.id, reported),
+				),
+			),
 		);
 		return spawned.filter((entry): entry is SpawnedServer => Boolean(entry));
 	}
@@ -2614,11 +3159,11 @@ export class LSPService {
 	}
 
 	/**
-	 * Read-only liveness check for one server/file pair. Unlike
-	 * `getClientForFile`, this never creates or warms a client; it only resolves
-	 * the server's root and checks the already-connected client map.
+	 * Read-only Gate-B readiness check for one auxiliary server/root. A connected
+	 * process is not yet a diagnostic producer: only its first publication proves
+	 * that this root's client can supersede an in-process fallback runner.
 	 */
-	async isServerAliveForFile(
+	async hasServerPublishedForFileRoot(
 		serverId: string,
 		filePath: string,
 	): Promise<boolean> {
@@ -2628,7 +3173,18 @@ export class LSPService {
 			const root = await this.resolveServerRoot(server, filePath);
 			if (!root) continue;
 			const key = `${server.id}:${normalizeMapKey(root)}`;
-			if (this.state.clients.get(key)?.isAlive()) return true;
+			const client = this.state.clients.get(key);
+			// #2324 F1: per-file grain. `diagnosticsVersion` is client-global —
+			// any sibling path's publication bumps it, so it cannot answer "did
+			// THIS server publish for THIS file?" (client.ts:339-341). A file
+			// this server never touched would otherwise read as gated-open the
+			// moment any other file on the same client got a publication.
+			if (
+				client?.isAlive() &&
+				client.getDiagnosticsVersionForPath(filePath) > 0
+			) {
+				return true;
+			}
 		}
 		return false;
 	}
@@ -2636,18 +3192,40 @@ export class LSPService {
 	/**
 	 * #2001/#2002 collect-later: read-only cached-diagnostics probe for the
 	 * turn-end late-auxiliary delivery (`clients/runtime-turn.ts`). Like
-	 * `isServerAliveForFile`, this NEVER creates or warms a client — it only
+	 * the Gate-B readiness check, this NEVER creates or warms a client — it only
 	 * resolves each requested server's root and reads the already-connected
 	 * client's cached diagnostics for `filePath`. Servers with no live client
-	 * are simply absent from the returned map (the caller drops those pairs
-	 * silently); a present server maps to its cache contents, possibly empty
-	 * (still scanning).
+	 * are absent unless notify-stall teardown marked that generation as
+	 * replaceable; that status carries the demotion timestamp so turn-end late
+	 * coverage can correlate each pair to the removed generation. A live
+	 * client is present even when its per-file cache entry is empty; its
+	 * timestamp distinguishes a published clean result from no publication.
 	 */
 	async readCachedDiagnosticsForServers(
 		filePath: string,
 		serverIds: ReadonlySet<string>,
-	): Promise<Map<string, import("./client.js").LSPDiagnostic[]>> {
-		const out = new Map<string, import("./client.js").LSPDiagnostic[]>();
+	): Promise<
+		Map<
+			string,
+			{
+				diags: import("./client.js").LSPDiagnostic[];
+				publishedAt?: number;
+				/** The client was removed by notify-stall teardown and may be replaced. */
+				notifyStallDemoted?: boolean;
+				/** When the demoted client generation was removed. */
+				demotedAt?: number;
+			}
+		>
+	> {
+		const out = new Map<
+			string,
+			{
+				diags: import("./client.js").LSPDiagnostic[];
+				publishedAt?: number;
+				notifyStallDemoted?: boolean;
+				demotedAt?: number;
+			}
+		>();
 		if (this.checkDestroyed() || serverIds.size === 0) return out;
 		for (const server of getServersForFileWithConfig(filePath)) {
 			if (!serverIds.has(server.id) || out.has(server.id)) continue;
@@ -2655,8 +3233,25 @@ export class LSPService {
 			if (!root) continue;
 			const key = `${server.id}:${normalizeMapKey(root)}`;
 			const client = this.state.clients.get(key);
-			if (!client?.isAlive()) continue;
-			out.set(server.id, client.getDiagnostics(filePath));
+			if (!client?.isAlive()) {
+				const demotedAt = this.notifyStallDemotions.get(key);
+				if (demotedAt !== undefined) {
+					out.set(server.id, {
+						diags: [],
+						notifyStallDemoted: true,
+						demotedAt,
+					});
+				}
+				continue;
+			}
+			// A replacement is live again. The old generation's marker no longer
+			// describes this client and must not make a later absence look transient.
+			this.notifyStallDemotions.delete(key);
+			const entry = client.getAllDiagnostics().get(normalizeMapKey(filePath));
+			out.set(server.id, {
+				diags: entry?.diags ?? [],
+				publishedAt: entry?.ts,
+			});
 		}
 		return out;
 	}
@@ -3019,6 +3614,7 @@ export class LSPService {
 					intentional: wasIntentional,
 				},
 			});
+			this.releaseOutstandingAuxNotifyWrite(key);
 			try {
 				await existing.shutdown();
 			} catch {
@@ -3197,11 +3793,20 @@ export class LSPService {
 			if (isOptionalServer) this.optionalDisabled.delete(key);
 		}
 
+		// #2064: did THIS caller start the language-server process, or did it
+		// join a spawn another caller already had in flight? The answer is only
+		// knowable here, before the await — downstream of `await spawnPromise`
+		// the two are indistinguishable, which is exactly how the 3.0x
+		// over-count happened. There are two join sites and both count as
+		// joins: the unguarded read below, and the `raced` re-read inside the
+		// spawn gate, which catches a caller that reached the gate before the
+		// starter published its promise.
+		let startedSpawn = false;
 		let spawnPromise = this.state.inFlight.get(key);
 		if (!spawnPromise) {
 			const started = await this.withClientSpawnGate(async () => {
 				const raced = this.state.inFlight.get(key);
-				if (raced) return { promise: raced };
+				if (raced) return { promise: raced, startedSpawn: false };
 				// `server.root()` and dead-client cleanup above are async. A reset during
 				// either gap must not let this retired generation start a late spawn.
 				if (this.checkDestroyed()) return undefined;
@@ -3214,10 +3819,11 @@ export class LSPService {
 					allowInstall,
 				);
 				this.state.inFlight.set(key, promise);
-				return { promise };
+				return { promise, startedSpawn: true };
 			});
 			if (!started) return undefined;
 			spawnPromise = started.promise;
+			startedSpawn = started.startedSpawn;
 		}
 		// Announce the in-flight spawn so the caller can skip a doomed touch
 		// wait. The announcement never returns a client and never
@@ -3238,19 +3844,42 @@ export class LSPService {
 			// #1934: a client here cost a process WAIT, whether this caller
 			// started the spawn or joined another caller's in-flight promise.
 			// Either way the selection was not served from the warm pool.
+			// #2064: which of the two it was is now named, so the record can
+			// answer "how many processes started" as well as "how many
+			// selections paid a wait". `startedSpawn` is captured before the
+			// await, because after it the two are indistinguishable.
 			//
 			// The verdict read is synchronous and sits in the same microtask as
 			// the await above, so it can only see the attempt just settled.
 			onOutcome?.(
 				spawned
-					? "cold-spawn"
+					? startedSpawn
+						? "cold-spawn"
+						: "cold-spawn-joined"
 					: this.lastSpawnVerdict.get(key) === "failed"
-						? "spawn-failure"
+						? startedSpawn
+							? "spawn-failure"
+							: "spawn-failure-joined"
 						: "declined",
 			);
 			return spawned;
 		} catch (err) {
 			// A throwing spawn promise is an errored acquisition by definition.
+			//
+			// #2064 review F2: deliberately NOT split into a starter/joiner pair
+			// like the resolve path above, because nothing could observe the
+			// split. `spawnClient` never rethrows; it catches its own spawn and
+			// initialize failures and resolves `undefined`. This catch is
+			// therefore reachable only when `spawnClient` throws BEFORE its own
+			// `try` (the trust probe, `logSessionStart`, `recordLsp`). A joiner
+			// CAN read the already-rejected promise out of `inFlight` (the #2106
+			// verify measured 2 invocations for 3 callers), but it does not
+			// matter: the rethrow
+			// below unwinds past every `lsp_client_selected` emit site, so this
+			// value is written to no record: a probe drove a throwing trust
+			// check through two concurrent callers and got two rejections and
+			// zero selection records. An unobservable discriminator is a
+			// vacuous guard, so this path keeps the single #1934 value.
 			onOutcome?.("spawn-failure");
 			throw err;
 		} finally {
@@ -3375,6 +4004,7 @@ export class LSPService {
 				serverId: server.id,
 				process: spawned.process,
 				root,
+				sessionCwd: this.sessionCwd,
 				initialization: mergedInit,
 				initializeTimeoutMs: server.initializeTimeoutMs,
 				launchVariant: spawned.launchVariant,
@@ -3401,6 +4031,9 @@ export class LSPService {
 						};
 
 			this.state.clients.set(key, client);
+			// #2356: this generation is the replacement the late-coverage probe was
+			// waiting for. Clear the retired-generation marker before any later probe.
+			this.notifyStallDemotions.delete(key);
 			this.unavailableLogged.delete(key);
 			// #1934 review F1: a success retires the previous verdict, so the map
 			// never outlives the attempts it describes.
@@ -3419,6 +4052,36 @@ export class LSPService {
 			const spawnDurationMs = Date.now() - startedAt;
 			recordLsp(server.id, root, "spawn_success", spawnDurationMs);
 			recordSuccessfulLspSpawn(server.id, spawnDurationMs);
+			// #2064: the only latency record that a language-server PROCESS
+			// started. `lsp_launch_candidate_success` covers the servers that
+			// launch through `resolveAndLaunch` and never fired for TypeScript,
+			// which served 913 of 941 selections in the field window — so
+			// nothing in `latency.log` counted the 29.3s TypeScript spawn at
+			// all. This sits at `spawnClient`'s single success path, so every
+			// server reports through one record instead of a per-server
+			// launcher, and `count(serverId=typescript)` is answerable from
+			// `latency.log` alone. Volume is bounded by process starts: one
+			// record per spawn, and a spawn is single-flighted per
+			// `serverId:root` by `state.inFlight`.
+			//
+			// The two path fields are deliberate and are not duplicates.
+			// `filePath` carries the ROOT, because the root plus `serverId` is
+			// the client's identity and the unit a spawn is single-flighted on.
+			// `triggerFilePath` carries the file whose touch paid for the
+			// spawn, which answers a different question and is the one that
+			// varies across records for the same client.
+			logLatency({
+				type: "phase",
+				phase: "lsp_server_spawned",
+				filePath: root,
+				durationMs: spawnDurationMs,
+				metadata: {
+					serverId: server.id,
+					source: spawned.source ?? "unknown",
+					launchVariant: spawned.launchVariant ?? "default",
+					triggerFilePath: filePath,
+				},
+			});
 			if (!this.workspaceProbeLogged.has(key)) {
 				logSessionStart(
 					`lsp workspace-diag probe ${server.id}: advertised=${wsDiag.advertised} mode=${wsDiag.mode} provider=${wsDiag.diagnosticProviderKind}`,
@@ -3562,6 +4225,11 @@ export class LSPService {
 		}
 		const startedAt = Date.now();
 		const normalizedPath = normalizeMapKey(filePath);
+		const outsideRoot = await this.findOutsideProjectRoot(filePath);
+		if (outsideRoot) {
+			this.recordOutsideRootDecline(filePath, outsideRoot, "touchFile");
+			return { diags: [], skipReason: "outside-project-root" };
+		}
 		// #1783: every path that asks a language server anything comes through
 		// here, so this is where the disk-drift backstop gets its heartbeat.
 		// Deliberately NOT awaited: the sweep is rate-limited to one pass per
@@ -3582,6 +4250,15 @@ export class LSPService {
 		const useAllClients = clientScope === "all";
 		const resolvedPrimaryRoots = new Map<string, string>();
 		const waitSkipReasons = new Set<string>();
+		const coldAuxiliaryServerIds = new Set<string>();
+		const noteColdAuxiliary = (
+			serverId: string,
+			outcome: LSPClientAcquisitionOutcome,
+		): void => {
+			if (outcome === "cold-spawn" || outcome === "cold-spawn-joined") {
+				coldAuxiliaryServerIds.add(serverId);
+			}
+		};
 		let spawned: SpawnedServer[];
 		let serverCountAttempted: number;
 		if (useAllClients) {
@@ -3606,6 +4283,7 @@ export class LSPService {
 				this.getAuxiliaryClientsForFile(
 					filePath,
 					new Set(options.auxiliaryServerIds ?? []),
+					noteColdAuxiliary,
 				),
 			]);
 			spawned = entry ? [entry, ...aux] : aux;
@@ -3732,6 +4410,10 @@ export class LSPService {
 			const diagnosticBaselines = new Map(
 				spawned.map((entry) => [entry.client, readPathVersion(entry.client)]),
 			);
+			// #2161: anchor publication evidence before this touch's notify. A
+			// later per-file cache entry, including an empty one, proves that the
+			// primary answered; an empty diagnostics result alone cannot.
+			const markedAtMs = Date.now();
 			// #1458: read a late auxiliary publication BEFORE the ordinary resync
 			// clears its client cache. Carry it only when the publication's exact
 			// sent-content fingerprint matches this touch's content. A changed edit,
@@ -3842,17 +4524,32 @@ export class LSPService {
 			if (!notifySkipped) {
 				const budget = notifyWriteBudgetMs();
 				// #1459: how long a queued auxiliary may wait for its resync slot. Bounded
-				// by the write budget AND by whatever the caller already declared it is
-				// willing to spend on this touch (`maxClientWaitMs` — cascade's cold
-				// snapshot passes 1000ms), minus what the client wait above already spent.
+				// by the write budget and by the effective primary wait floor, minus what
+				// which includes the caller's `maxClientWaitMs` and any primary
+				// server `clientWaitTimeoutMs` override. The elapsed client wait is
+				// subtracted below.
 				// A flat write-budget wait would tax a caller that asked for less than one
 				// budget in total. Non-positive means "no time left to queue": the server
 				// is reported as uncovered immediately.
+				//
+				// #2239: "what the caller already declared" is `primaryServerWaitFloorMs`,
+				// not the raw `options.maxClientWaitMs` — the SAME floor `getClientForFile`
+				// races the primary spawn against. A cold primary configured with its own
+				// `clientWaitTimeoutMs` (Ruby 30s, and the #2233 Bash/JSON/Vue/Svelte/Prisma
+				// overrides) is allowed to run past the caller's flat budget, and did just
+				// that by the time this line runs — charging the subtraction against the
+				// flat value alone always went negative and clamped to zero. The outer
+				// `Math.min(budget, …)` is unchanged, so this raises what "already spent"
+				// is measured against without widening the wait beyond one write budget.
 				const queueWaitMs =
 					options.maxClientWaitMs !== undefined
 						? Math.min(
 								budget,
-								Math.max(0, options.maxClientWaitMs - (Date.now() - startedAt)),
+								Math.max(
+									0,
+									primaryServerWaitFloorMs(filePath, options.maxClientWaitMs) -
+										(Date.now() - startedAt),
+								),
 							)
 						: budget;
 				await Promise.all(
@@ -3959,11 +4656,14 @@ export class LSPService {
 									// streak outright, so only the late case retracts. A landing
 									// past the WEDGE window keeps its strike: at that point the
 									// stall was long enough that #743's demotion is the honest
-									// verdict, not a latency artifact.
+									// verdict, not a latency artifact. #2358: the wedge window
+									// is the adaptive one the timer itself arms with, so a
+									// write a BUSY server would have been left alone for also
+									// retracts its strike instead of accruing a ladder charge.
 									const outstandingMs = Date.now() - writeStartedAt;
 									if (
 										outstandingMs > budget &&
-										outstandingMs <= notifyWedgedMs()
+										outstandingMs <= this.auxNotifyWedgeBudgetMs(clientKey)
 									) {
 										this.retractNotifyWriteBackpressure(
 											clientKey,
@@ -4364,7 +5064,39 @@ export class LSPService {
 						// Fail-open: missing capability state keeps today's push fallback.
 					}
 				}
-				const perServerWaits = spawned.map((entry) => {
+				const configuredAuxCeilingMs = readEnvAuxGraceMs();
+				const perServerDeclaredTimeouts = spawned.map((entry) =>
+					timeoutFor(entry.client.serverId),
+				);
+				const perServerWaitTimeouts = spawned.map((entry, entryIndex) => {
+					const declaredServerTimeout = perServerDeclaredTimeouts[entryIndex];
+					const observedSpawnMs = getSuccessfulLspSpawnDurationMs(
+						entry.client.serverId,
+					);
+					return hasTouchAuxiliaries &&
+						entry.info.role === "auxiliary" &&
+						coldAuxiliaryServerIds.has(entry.client.serverId) &&
+						(configuredAuxCeilingMs !== undefined ||
+							(observedSpawnMs !== undefined && observedSpawnMs > 0))
+						? auxWaitBudgetMs(
+								entry.client.serverId,
+								true,
+								configuredAuxCeilingMs,
+								declaredServerTimeout,
+							)
+						: perServerDeclaredTimeouts[entryIndex];
+				});
+				const perServerRaceBudgets = spawned.map((entry, entryIndex) => {
+					return hasTouchAuxiliaries && entry.info.role === "auxiliary"
+						? auxWaitBudgetMs(
+								entry.client.serverId,
+								coldAuxiliaryServerIds.has(entry.client.serverId),
+								configuredAuxCeilingMs,
+								perServerDeclaredTimeouts[entryIndex],
+							)
+						: perServerDeclaredTimeouts[entryIndex];
+				});
+				const perServerWaits = spawned.map((entry, entryIndex) => {
 					// #1459: a DEFERRED server never received this content, so its version
 					// can never advance past the baseline — waiting on it burns its whole
 					// budget and would flip the touch to `inconclusive`, discarding a
@@ -4373,7 +5105,7 @@ export class LSPService {
 					if (deferredResyncServerIds.has(entry.info.id)) {
 						return Promise.resolve(undefined);
 					}
-					const serverTimeout = timeoutFor(entry.client.serverId);
+					const serverTimeout = perServerWaitTimeouts[entryIndex];
 					// #1531: a per-path baseline. `clientWaitForDiagnostics` compares it
 					// against this path's own publication stamp, so a sibling file's
 					// publication on a shared client can no longer end this wait before the
@@ -4443,6 +5175,7 @@ export class LSPService {
 												serverId: spawned[i].info.id,
 												client: spawned[i].client,
 												baseline: diagnosticBaselines.get(spawned[i].client),
+												budgetMs: perServerRaceBudgets[i],
 											}
 										: null,
 								)
@@ -4454,13 +5187,12 @@ export class LSPService {
 										serverId: string;
 										client: (typeof spawned)[number]["client"];
 										baseline: number | undefined;
+										budgetMs: number;
 									} => x !== null,
 								);
-							const auxCeilingMs = readEnvAuxGraceMs() ?? 2000;
-							// After all primaries settle, give each auxiliary the smaller of
-							// its declared wait budget and the global auxiliary ceiling. The
-							// 2000ms default admits measured ~1.3s warm scanner runs without
-							// making every edit pay opengrep's 3500ms cold-start allowance.
+							// After all primaries settle, use the same per-auxiliary budget
+							// that bounded its own diagnostic wait. Warm acquisitions retain
+							// the 2000ms ceiling; cold acquisitions include observed startup.
 							// Late aux results are dropped from this wait. A later unchanged-
 							// content read may carry a SHA-256-bound cache publication before its
 							// resync clears the cache; changed or unknown content never replays.
@@ -4473,10 +5205,7 @@ export class LSPService {
 								const auxWaitStartedAt = Date.now();
 								const outcomes = await Promise.all(
 									auxWaits.map(async (aux) => {
-										const budgetMs = Math.min(
-											timeoutFor(aux.serverId),
-											auxCeilingMs,
-										);
+										const { budgetMs } = aux;
 										let timer: ReturnType<typeof setTimeout> | undefined;
 										const timeout = new Promise<false>((resolve) => {
 											timer = setTimeout(() => resolve(false), budgetMs);
@@ -4577,7 +5306,26 @@ export class LSPService {
 									.filter(
 										(o) =>
 											!o.publishedThisContent &&
-											(o.outcome === "cut_off" || o.outcome === "silent"),
+											(o.outcome === "cut_off" || o.outcome === "silent") &&
+											// #2324 R2-A/R3-A: ast-grep's napi fallback is a
+											// SECOND producer of coverage for this exact pair,
+											// dispatched CONCURRENTLY with this whole touch
+											// (dispatcher.ts's Promise.all groups) — not just
+											// concurrently with this wait. On a COLD touch,
+											// getClientsForFile's spawn+handshake (above, before
+											// waitStartedAt is ever captured) can itself take
+											// long enough that napi's near-instant Gate-B check
+											// records coverage BEFORE waitStartedAt — the
+											// issue's own 68ms race shape. Baseline on startedAt
+											// instead: stamped at touchFile's own entry, before
+											// ANY spawn work, so it is the earliest instant this
+											// touch's own napi run could possibly predate. Still
+											// excludes a stale record from an EARLIER touch,
+											// which is all the staleness guard needs.
+											!(
+												o.serverId === "ast-grep" &&
+												napiFallbackCoveredSince(filePath, startedAt)
+											),
 									)
 									.map((o) => o.serverId);
 								if (collectLaterServerIds.length > 0) {
@@ -4642,9 +5390,12 @@ export class LSPService {
 						// Push already answered (settled, or published diagnostics that
 						// its wait is about to settle on) — nothing to confirm, no sync
 						// request goes out.
+						const publishedAt = primaryClient
+							.getAllDiagnostics?.()
+							.get(normalizedPath)?.ts;
 						if (
 							pushWaitSettled ||
-							primaryClient.getDiagnostics(filePath).length > 0
+							(publishedAt !== undefined && publishedAt > markedAtMs)
 						) {
 							return new Promise<never>(() => {});
 						}
@@ -5368,9 +6119,7 @@ export class LSPService {
 						reason: reasons.join(", ") || "scanner coverage gap",
 					});
 				}
-				logLatency({
-					type: "phase",
-					phase: "lsp_scanner_coverage_gap",
+				emitBounded("lsp_scanner_coverage_gap", `${source}:${normalizedPath}`, {
 					filePath: normalizedPath,
 					durationMs: Date.now() - startedAt,
 					metadata: {
@@ -5379,10 +6128,10 @@ export class LSPService {
 						...(brokenSkippedServerIds.length > 0 && {
 							brokenSkippedServerIds,
 						}),
-						// #1586: the deferrals this touch is actually uncovered for. The raw
+						// #1586: the deferrals this touch is actually uncovered for. The
 						// gate action keeps its own record in `lsp_notify_resync_deferred`;
-						// this row exists to prove a blackout, and a scanner already bound to
-						// these bytes is not one.
+						// this row exists to prove a blackout, and a scanner already bound
+						// to these bytes is not one.
 						...(uncoveredDeferredServerIds.length > 0 && {
 							deferredResyncServerIds: uncoveredDeferredServerIds,
 						}),
@@ -5638,6 +6387,67 @@ export class LSPService {
 	}
 
 	/**
+	 * #2052: the file's nearest marker root, but ONLY when the file is outside
+	 * every initialized session cwd. Returns undefined (no decline) otherwise.
+	 *
+	 * The cheap registry test runs FIRST so an in-session file — the hot path —
+	 * pays one bounded map walk and never the `server.root()` filesystem walks.
+	 */
+	private async findOutsideProjectRoot(
+		filePath: string,
+	): Promise<string | undefined> {
+		if (!isOutsideAllSessionRoots(filePath)) return undefined;
+		const candidates = await Promise.all(
+			getServersForFileWithConfig(filePath).map((server) =>
+				server.root(filePath),
+			),
+		);
+		return candidates.find((candidate): candidate is string =>
+			Boolean(candidate),
+		);
+	}
+
+	/**
+	 * #2052: one bounded record per normalized foreign root per session.
+	 *
+	 * `operation` is a PARAMETER, not a constant: `touchFile` and
+	 * `getDiagnostics` both decline here, and a record that always claimed
+	 * "touchFile" would erase which call site actually refused — the
+	 * discriminating identity a bounded record has to preserve. The ledger's
+	 * rising edge is keyed on the root, so many files under one foreign root
+	 * still collapse to a single detailed row.
+	 */
+	private recordOutsideRootDecline(
+		filePath: string,
+		nearestRoot: string,
+		operation: "touchFile" | "getDiagnostics",
+	): void {
+		const root = normalizeMapKey(nearestRoot);
+		const sessionRoots = getSessionRootsForTelemetry()
+			.map((sessionRoot) => normalizeMapKey(sessionRoot))
+			.join(", ");
+		emitBounded(
+			"lsp_capability_skip",
+			root,
+			{
+				filePath: normalizeMapKey(filePath),
+				durationMs: 0,
+				metadata: {
+					operation,
+					nearestMarkerRoot: root,
+					sessionRoots,
+					identity: root,
+				},
+			},
+			{
+				ledgerKind: "lsp-capability-skip",
+				risingEdgePer: "identity",
+				reason: `declined LSP root outside session cwd: ${root}`,
+			},
+		);
+	}
+
+	/**
 	 * Get diagnostics for a file
 	 */
 	getDiagnosticsHealth(filePath: string): LSPDiagnosticsHealth | undefined {
@@ -5680,6 +6490,11 @@ export class LSPService {
 		diagnosticsMode: LSPDiagnosticsMode = "full",
 	): Promise<import("./client.js").LSPDiagnostic[]> {
 		const normalizedPath = normalizeMapKey(filePath);
+		const outsideRoot = await this.findOutsideProjectRoot(filePath);
+		if (outsideRoot) {
+			this.recordOutsideRootDecline(filePath, outsideRoot, "getDiagnostics");
+			return [];
+		}
 		if (this.checkDestroyed()) {
 			this.lastDiagnosticsHealth.set(normalizedPath, {
 				health: "destroyed",
@@ -6254,7 +7069,7 @@ export class LSPService {
 	 * `executeCommand` above cannot give a render-path probe:
 	 *
 	 * - **Never spawns.** It resolves the already-connected client map the way
-	 *   `isServerAliveForFile` does, instead of routing through
+	 *   other read-only client-map lookups do, instead of routing through
 	 *   `getClientForFile` → `ensureClientForServer`. A probe that spawns a
 	 *   language-server fleet to answer a question about how to RENDER a
 	 *   diagnostic is a cost the caller never asked for — and under warm attach
@@ -6519,9 +7334,22 @@ export class LSPService {
 		const activeClients = this.activeClientsForCwd(cwd, priorityServerIds);
 		const willRenameFailures: Array<{ serverId: string; error: string }> = [];
 		const didRenameFailures: RenameNotifyFailure[] = [];
+		const willRenameClients = activeClients.filter(({ serverId, client }) => {
+			if (client.getOperationSupport().willRenameFiles === true) return true;
+			recordDegradationOnce({
+				kind: "lsp-capability-skip",
+				subject: `${serverId}:workspace/willRenameFiles`,
+				reason: client
+					.getMalformedFileOperationRegistrations()
+					.has("willRename")
+					? "malformed-registration"
+					: "no-registration",
+			});
+			return false;
+		});
 
 		const willResults = await Promise.all(
-			activeClients.map(async ({ serverId, client }) => {
+			willRenameClients.map(async ({ serverId, client }) => {
 				try {
 					return {
 						serverId,
@@ -6543,7 +7371,7 @@ export class LSPService {
 					(failure) => failure.serverId === result.serverId,
 				),
 		);
-		if (activeClients.length > 0 && successfulWillResults.length === 0) {
+		if (willRenameClients.length > 0 && successfulWillResults.length === 0) {
 			throw new Error(
 				`workspace/willRenameFiles failed for all active LSP servers: ${willRenameFailures.map((failure) => `${failure.serverId}: ${failure.error}`).join("; ")}`,
 			);
@@ -6717,6 +7545,21 @@ export class LSPService {
 
 		await Promise.all(
 			activeClients.map(async ({ serverId, client }) => {
+				// #1971 review: didRename has its own registration. A server that
+				// never asked for didRenameFiles notifications must not receive
+				// them — same chokepoint discipline as the willRename preflight.
+				if (client.getOperationSupport().didRenameFiles !== true) {
+					recordDegradationOnce({
+						kind: "lsp-capability-skip",
+						subject: `${serverId}:workspace/didRenameFiles`,
+						reason: client
+							.getMalformedFileOperationRegistrations()
+							.has("didRename")
+							? "malformed-registration"
+							: "no-registration",
+					});
+					return;
+				}
 				const opened = openDocuments.find(
 					(entry) => entry.serverId === serverId,
 				);
@@ -7316,6 +8159,10 @@ export class LSPService {
 		// mtime it was ACTUALLY scanned at (not re-stat'd after the fact, which
 		// could race a concurrent edit).
 		const scannedMtimeByFile = new Map<string, number>();
+		// #2300: size from the SAME stat call as the mtime above — zero extra
+		// syscalls — so the cache write below can give `isEntryFresh` a size
+		// axis alongside the mtime.
+		const scannedSizeByFile = new Map<string, number>();
 
 		// Group files by their primary language server (#387, extracted as
 		// `groupFilesByPrimaryServer` for #631). tsserver — and most servers — is
@@ -7518,7 +8365,9 @@ export class LSPService {
 				// microseconds with no extra event-loop tick, where an awaited
 				// promise would insert one.
 				try {
-					scannedMtimeByFile.set(filePath, nodeFs.statSync(filePath).mtimeMs);
+					const scanStat = nodeFs.statSync(filePath);
+					scannedMtimeByFile.set(filePath, scanStat.mtimeMs);
+					scannedSizeByFile.set(filePath, scanStat.size);
 				} catch {
 					// Best-effort: a failed stat here just means this file won't be
 					// eligible for caching below (no entry gets written for it).
@@ -7598,20 +8447,37 @@ export class LSPService {
 				// instead of aggregating as a confirmed clean. Every route is gated here.
 				const unconfirmedServerIds = touchCoverageGap(touchResult);
 				const coverageGap = unconfirmedServerIds.length > 0;
+				// #2052: the touch DECLINED this file — it is outside every
+				// initialized session cwd, so nothing was asked and `diags` is an
+				// empty placeholder, not an observation. Before this, the sweep
+				// never read `skipReason`, so a declined foreign file fell through
+				// as `timedOut: false` with zero diagnostics: reported CONFIRMED
+				// CLEAN, and then written into the workspace cache by the record
+				// loop below, which replays that false clean on every later sweep.
+				const declinedOutsideRoot =
+					touchResult?.skipReason === "outside-project-root";
 				// #1549: the sweep verdict is per answering lane. An auxiliary gap
 				// narrows coverage, but a primary answer remains usable; only absence of
 				// the touch result or a primary-scoped inconclusive verdict poisons it.
-				const timedOut = touchResult === undefined || inconclusive;
+				const timedOut =
+					touchResult === undefined || inconclusive || declinedOutsideRoot;
 				if (timedOut) timedOutFiles += 1;
 				// #1618: WHY, in priority order — the outer deadline (nothing came
 				// back at all) outranks an inner inconclusive signal, which outranks
 				// a narrower auxiliary coverage gap.
+				// #2052: `outside_project_root` is checked FIRST among the reasons a
+				// touch produced no observation. A declined file cannot be
+				// `inconclusive` (nothing was asked, so nothing timed out), and
+				// rendering it as "didn't complete within budget" would tell the
+				// reader to retry a request that will always be refused.
 				const unconfirmedReason: LSPWorkspaceUnconfirmedReason | undefined =
 					touchResult === undefined
 						? "budget"
-						: inconclusive
-							? "inconclusive"
-							: undefined;
+						: declinedOutsideRoot
+							? "outside_project_root"
+							: inconclusive
+								? "inconclusive"
+								: undefined;
 				// #1104 (shape 5 — AGENTS.md): the touch's content binding is an
 				// EXPLICIT enumerable field on the wrapper now (#1179), so it survives
 				// `applyAuxiliarySuppressions` below rebuilding `.diags` via `.filter()`
@@ -7697,157 +8563,190 @@ export class LSPService {
 			WORKSPACE_DIAGNOSTICS_CONCURRENCY,
 			groups.length,
 		);
-		await runPerServerGroups(
-			groups,
-			groupWorkers,
-			async (group) => {
-				if (signal?.aborted) return;
-				// #1618: checked before any per-group work (pull attempt, warm-up,
-				// per-file loop) so a service already destroyed when this group
-				// starts never pays for a language-server round trip it cannot get.
-				if (this.checkDestroyed()) {
-					markServiceDestroyed(group.files);
-					return;
-				}
-				// Fast path: one project-wide pull for the whole group (opt-in).
-				if (!isWarmAttached() && workspacePullEnabled && !group.multiServer) {
-					const pulled = await this.tryWorkspacePull(
-						group.files,
-						perFileMs,
-						cacheServedKeys,
-					);
-					if (pulled) {
-						// #1782: an explicit zero-diagnostic answer for a file this
-						// sweep served from cache SUPERSEDES that cached replay. Route
-						// it through the same result list every other answer uses, so
-						// the cache write below overwrites the stale entry and the
-						// footer reconcile in `tools/lens-diagnostics.ts` clears the
-						// widget rows — no second eviction path to keep in step.
-						for (const clean of pulled.extraClean) {
-							supersededCacheKeys.add(normalizeMapKey(clean.filePath));
-						}
-						for (const result of [...pulled.results, ...pulled.extraClean]) {
-							results.push({
-								...result,
-								writeIndex: writeIndexByPath.get(
-									normalizeMapKey(result.filePath),
-								),
-							});
-							// #671: a pull result is always confirmed (see
-							// `tryWorkspacePull`'s doc comment), so it's cache-eligible
-							// too — best-effort stat since the pull already resolved the
-							// diagnostics for this file some time ago.
-							try {
-								scannedMtimeByFile.set(
-									result.filePath,
-									nodeFs.statSync(result.filePath).mtimeMs,
-								);
-							} catch {
-								// Not cache-eligible without a confirmed mtime.
-							}
-						}
-						completed += group.files.length;
-						options.onProgress?.(completed, files.length);
-						return;
-					}
-				}
-				// #667: warm-check before this group's own per-file loop starts —
-				// cheap/no-op when the group's primary server already demonstrated
-				// readiness (from an earlier sweep, or an earlier group sharing the
-				// same server root, this session); pays one deliberate warm-up round
-				// trip against the group's first file only when genuinely cold. Not
-				// needed above the pull fast path: a `workspace/diagnostic` pull
-				// already covers the WHOLE group with its own generous per-server
-				// budget in one shot — the per-file "first N files eat individual
-				// timeouts" failure mode this fixes doesn't apply there.
-				const first = group.files[0];
-				if (first && !isWarmAttached()) {
-					const warmup = await this.ensureWarmForSweep(first, { signal });
+		// #1723 residual, named as a deferred gap on PR #1805 and closed here:
+		// the SCAN-side twin of the runner chokepoint #1805 wired in
+		// `dispatcher.ts`'s `runRunner`. This sweep is the site whose COMPLETION
+		// (`lsp_workspace_diagnostics`) is the `lastPhase` on #1723's own
+		// 18 270 ms reproduction, so until this bracket existed the record could
+		// only ever name the phase that finished BEFORE the block, never the one
+		// burning the time during it.
+		//
+		// ONE bracket for the whole fan-out, not one per file (#2272 review F1).
+		// Per-file bracketing was the first shape and it was inert for exactly
+		// the case above: `phaseFinished` pushes onto a ring capped at
+		// `CLOSED_BRACKET_CAP` (5, clients/latency-logger.ts), while `turn_end`
+		// reads `getPhaseForWindow` AFTER the sweep returns. A 225-file sweep
+		// therefore evicted the blocking file's own bracket unless the block
+		// landed in the last five files, and the survivors were then rejected by
+		// `MIN_PLAUSIBLE_ELAPSED_FRACTION` for being far shorter than the block
+		// window. The phase string is a constant carrying no per-file identity,
+		// so 225 brackets never held more information than one — they only cost
+		// 225 map inserts and destroyed the ring. One bracket keeps the same
+		// discriminating identity, survives to the read point, and spans the
+		// block by construction.
+		//
+		// Paired in `finally`, per `phaseFinished`'s contract: an abandoned
+		// bracket would misattribute every LATER loop_block to this sweep. The
+		// leak guard is what the tests pin: emptying this `finally` reds three
+		// of them. `finally` rather than a trailing call covers a throw that
+		// escapes the fan-out; abort and service-destroyed both RETURN from the
+		// worker callback rather than throwing, so those two paths alone would
+		// not distinguish the two spellings.
+		const sweepPhase = phaseStarted("lsp_workspace_diagnostics_touch");
+		try {
+			await runPerServerGroups(
+				groups,
+				groupWorkers,
+				async (group) => {
 					if (signal?.aborted) return;
-					// #744: the group's primary server failed warm-up (initial round
-					// trip + one retry both left it cold). Every per-file touch to it
-					// would re-pay its full timeout and time out again, dragging the
-					// whole sweep — the exact wedged-marksman failure mode this closes.
-					// So skip this group's files and record each as UNCONFIRMED
-					// (timedOut + skippedWarmupFailure), never as confirmed-clean `[]`:
-					// the group is keyed by its primary server, so a non-empty
-					// `failedServerIds` means that primary is the one that couldn't warm.
-					if (warmup.failedServerIds.length > 0) {
-						logLatency({
-							type: "phase",
-							phase: "lsp_sweep_group_skipped_warmup",
-							filePath: first,
-							durationMs: 0,
-							metadata: {
-								failedServerIds: warmup.failedServerIds,
-								// #799: distinguishes a fresh warm-up failure from a
-								// negative-cache hit (this sweep never re-attempted warm-up
-								// at all — it was already known cold from earlier this
-								// session).
-								skippedFromCache: warmup.skippedFromCache ?? false,
-								skippedFiles: group.files.length,
-							},
-						});
-						for (const filePath of group.files) {
-							results.push({
-								filePath,
-								diagnostics: [],
-								count: 0,
-								timedOut: true,
-								unconfirmedReason: "inconclusive",
-								skippedWarmupFailure: true,
-							});
-							timedOutFiles += 1;
-							completed += 1;
-						}
-						options.onProgress?.(completed, files.length);
-						return;
-					}
-					if (warmup.performedWarmup) options.onServerReady?.();
-				}
-				// #608/#621: batch-open a CHUNK of this group's files before
-				// waiting on diagnostics for any of them individually — see
-				// `preOpenGroupFiles` above. Chunking (rather than the whole
-				// group at once) bounds how much a single burst can dump on
-				// the server's request queue at real project scale, while each
-				// chunk's opens still land inside the debounce window and
-				// coalesce into one flush — see `WORKSPACE_SWEEP_PREOPEN_CHUNK_SIZE`.
-				for (
-					let chunkStart = 0;
-					chunkStart < group.files.length;
-					chunkStart += WORKSPACE_SWEEP_PREOPEN_CHUNK_SIZE
-				) {
-					if (signal?.aborted) return;
-					// #1618: a service destroyed WHILE this group's chunk loop was
-					// already running (the group-start check above can't see a
-					// destruction that lands mid-loop) — stop here and mark every
-					// file from this chunk onward, rather than letting the remaining
-					// chunks pay for pre-opens/touches against a torn-down service.
+					// #1618: checked before any per-group work (pull attempt, warm-up,
+					// per-file loop) so a service already destroyed when this group
+					// starts never pays for a language-server round trip it cannot get.
 					if (this.checkDestroyed()) {
-						markServiceDestroyed(group.files.slice(chunkStart));
+						markServiceDestroyed(group.files);
 						return;
 					}
-					const chunk = group.files.slice(
-						chunkStart,
-						chunkStart + WORKSPACE_SWEEP_PREOPEN_CHUNK_SIZE,
-					);
-					await preOpenGroupFiles(chunk);
-					for (const filePath of chunk) {
-						// Honor cancellation between files (#341); already-collected
-						// results are returned as a partial.
-						if (signal?.aborted) return;
-						if (this.checkDestroyed()) {
-							markServiceDestroyed(
-								group.files.slice(group.files.indexOf(filePath)),
-							);
+					// Fast path: one project-wide pull for the whole group (opt-in).
+					if (!isWarmAttached() && workspacePullEnabled && !group.multiServer) {
+						const pulled = await this.tryWorkspacePull(
+							group.files,
+							perFileMs,
+							cacheServedKeys,
+						);
+						if (pulled) {
+							// #1782: an explicit zero-diagnostic answer for a file this
+							// sweep served from cache SUPERSEDES that cached replay. Route
+							// it through the same result list every other answer uses, so
+							// the cache write below overwrites the stale entry and the
+							// footer reconcile in `tools/lens-diagnostics.ts` clears the
+							// widget rows — no second eviction path to keep in step.
+							for (const clean of pulled.extraClean) {
+								supersededCacheKeys.add(normalizeMapKey(clean.filePath));
+							}
+							for (const result of [...pulled.results, ...pulled.extraClean]) {
+								results.push({
+									...result,
+									writeIndex: writeIndexByPath.get(
+										normalizeMapKey(result.filePath),
+									),
+								});
+								// #671: a pull result is always confirmed (see
+								// `tryWorkspacePull`'s doc comment), so it's cache-eligible
+								// too — best-effort stat since the pull already resolved the
+								// diagnostics for this file some time ago.
+								try {
+									const pullStat = nodeFs.statSync(result.filePath);
+									scannedMtimeByFile.set(result.filePath, pullStat.mtimeMs);
+									scannedSizeByFile.set(result.filePath, pullStat.size);
+								} catch {
+									// Not cache-eligible without a confirmed mtime.
+								}
+							}
+							completed += group.files.length;
+							options.onProgress?.(completed, files.length);
 							return;
 						}
-						await processFile(filePath);
 					}
-				}
-			},
-			signal,
-		);
+					// #667: warm-check before this group's own per-file loop starts —
+					// cheap/no-op when the group's primary server already demonstrated
+					// readiness (from an earlier sweep, or an earlier group sharing the
+					// same server root, this session); pays one deliberate warm-up round
+					// trip against the group's first file only when genuinely cold. Not
+					// needed above the pull fast path: a `workspace/diagnostic` pull
+					// already covers the WHOLE group with its own generous per-server
+					// budget in one shot — the per-file "first N files eat individual
+					// timeouts" failure mode this fixes doesn't apply there.
+					const first = group.files[0];
+					if (first && !isWarmAttached()) {
+						const warmup = await this.ensureWarmForSweep(first, { signal });
+						if (signal?.aborted) return;
+						// #744: the group's primary server failed warm-up (initial round
+						// trip + one retry both left it cold). Every per-file touch to it
+						// would re-pay its full timeout and time out again, dragging the
+						// whole sweep — the exact wedged-marksman failure mode this closes.
+						// So skip this group's files and record each as UNCONFIRMED
+						// (timedOut + skippedWarmupFailure), never as confirmed-clean `[]`:
+						// the group is keyed by its primary server, so a non-empty
+						// `failedServerIds` means that primary is the one that couldn't warm.
+						if (warmup.failedServerIds.length > 0) {
+							logLatency({
+								type: "phase",
+								phase: "lsp_sweep_group_skipped_warmup",
+								filePath: first,
+								durationMs: 0,
+								metadata: {
+									failedServerIds: warmup.failedServerIds,
+									// #799: distinguishes a fresh warm-up failure from a
+									// negative-cache hit (this sweep never re-attempted warm-up
+									// at all — it was already known cold from earlier this
+									// session).
+									skippedFromCache: warmup.skippedFromCache ?? false,
+									skippedFiles: group.files.length,
+								},
+							});
+							for (const filePath of group.files) {
+								results.push({
+									filePath,
+									diagnostics: [],
+									count: 0,
+									timedOut: true,
+									unconfirmedReason: "inconclusive",
+									skippedWarmupFailure: true,
+								});
+								timedOutFiles += 1;
+								completed += 1;
+							}
+							options.onProgress?.(completed, files.length);
+							return;
+						}
+						if (warmup.performedWarmup) options.onServerReady?.();
+					}
+					// #608/#621: batch-open a CHUNK of this group's files before
+					// waiting on diagnostics for any of them individually — see
+					// `preOpenGroupFiles` above. Chunking (rather than the whole
+					// group at once) bounds how much a single burst can dump on
+					// the server's request queue at real project scale, while each
+					// chunk's opens still land inside the debounce window and
+					// coalesce into one flush — see `WORKSPACE_SWEEP_PREOPEN_CHUNK_SIZE`.
+					for (
+						let chunkStart = 0;
+						chunkStart < group.files.length;
+						chunkStart += WORKSPACE_SWEEP_PREOPEN_CHUNK_SIZE
+					) {
+						if (signal?.aborted) return;
+						// #1618: a service destroyed WHILE this group's chunk loop was
+						// already running (the group-start check above can't see a
+						// destruction that lands mid-loop) — stop here and mark every
+						// file from this chunk onward, rather than letting the remaining
+						// chunks pay for pre-opens/touches against a torn-down service.
+						if (this.checkDestroyed()) {
+							markServiceDestroyed(group.files.slice(chunkStart));
+							return;
+						}
+						const chunk = group.files.slice(
+							chunkStart,
+							chunkStart + WORKSPACE_SWEEP_PREOPEN_CHUNK_SIZE,
+						);
+						await preOpenGroupFiles(chunk);
+						for (const filePath of chunk) {
+							// Honor cancellation between files (#341); already-collected
+							// results are returned as a partial.
+							if (signal?.aborted) return;
+							if (this.checkDestroyed()) {
+								markServiceDestroyed(
+									group.files.slice(group.files.indexOf(filePath)),
+								);
+								return;
+							}
+							await processFile(filePath);
+						}
+					}
+				},
+				signal,
+			);
+		} finally {
+			phaseFinished(sweepPhase);
+		}
 
 		// #1618: per-reason tally alongside the flat `timedOutFiles` count (kept
 		// for the existing `scripts/analyze-pi-lens-logs.mjs` consumer) — a
@@ -7931,6 +8830,7 @@ export class LSPService {
 				result.diagnostics,
 				scannedAt,
 				result.contentHash,
+				scannedSizeByFile.get(result.filePath),
 			);
 		}
 		workspaceDiagnosticsCacheCtx.persist();
@@ -8229,6 +9129,9 @@ export class LSPService {
 		const resetStartedAt = Date.now();
 		if (this.checkDestroyed()) return;
 		this.isDestroyed = true;
+		for (const [key, token] of this.outstandingAuxNotifyWrites) {
+			this.releaseOutstandingAuxNotifyWrite(key, token);
+		}
 		for (const key of this.typeScriptIdleTimers.keys()) {
 			this.clearTypeScriptIdleTimer(key);
 		}
@@ -8286,7 +9189,15 @@ export class LSPService {
 		// #1459: every gated client is gone, so no outstanding-write record can
 		// describe a live one. The gate's identity check already neutralises a stale
 		// entry; clearing keeps the map honest rather than relying on that.
-		this.outstandingAuxNotifyWrites.clear();
+		for (const [key, token] of this.outstandingAuxNotifyWrites) {
+			this.releaseOutstandingAuxNotifyWrite(key, token);
+		}
+		this.notifyStallDemotions.clear();
+		// #2358: same reasoning — a per-write latency estimate belongs to a client
+		// generation, and every client is gone. `session_start` reaches this
+		// through the service reset, so the adaptive wedge window re-arms with
+		// the session rather than being priced by a previous one's throughput.
+		this.auxNotifyDrainLatencyEwma.clear();
 		// #1714: same reasoning — a backlog count belongs to a client generation,
 		// and every client is gone. `session_start` reaches this through the service
 		// reset, so the pacing state re-arms with the session rather than living for
@@ -8459,31 +9370,71 @@ export class LSPService {
 
 // --- Singleton Instance ---
 
-let globalLSPService: LSPService | null = null;
+interface LSPProcessState {
+	service: LSPService | null;
+	generationHandoff: Promise<void> | undefined;
+}
+
+const LSP_PROCESS_FAMILY = "lsp.service";
+const LSP_PROCESS_VERSION = 1;
+
+function lspProcessState(): LSPProcessState {
+	let incompatibleHandoff: Promise<void> | undefined;
+	return getProcessSingleton(
+		LSP_PROCESS_FAMILY,
+		LSP_PROCESS_VERSION,
+		() => ({ service: null, generationHandoff: incompatibleHandoff }),
+		(value) => {
+			// Shut down a live incompatible service before replacing its cell.
+			if (!value || typeof value !== "object") return;
+			const candidate = value as {
+				service?: {
+					shutdown?: (options: LSPShutdownOptions) => Promise<void>;
+				} | null;
+				generationHandoff?: Promise<void>;
+			};
+			const previousHandoff = candidate.generationHandoff;
+			const teardown = candidate.service?.shutdown
+				? candidate.service
+						.shutdown({ fast: true, reason: "process_singleton_reset" })
+						.catch(() => undefined)
+				: undefined;
+			if (previousHandoff && teardown) {
+				incompatibleHandoff = Promise.allSettled([
+					previousHandoff,
+					teardown,
+				]).then(() => undefined);
+			} else {
+				incompatibleHandoff = previousHandoff ?? teardown;
+			}
+		},
+	);
+}
+
+function processService(): LSPService {
+	const state = lspProcessState();
+	if (!state.service)
+		state.service = new LSPService(state.generationHandoff, process.cwd());
+	return state.service;
+}
 /**
  * #850: all singleton generations whose teardown is still pending. A new
  * generation may be allocated synchronously, but its first spawn waits on this
  * handoff so two generations can never own the same server/root concurrently.
  */
-let globalLSPGenerationHandoff: Promise<void> | undefined;
-
 export function getLSPService(): LSPService {
-	if (!globalLSPService) {
-		globalLSPService = new LSPService(globalLSPGenerationHandoff);
-	}
-	return globalLSPService;
+	return processService();
 }
 
 /**
- * Cross-layer liveness seam for dispatch-side auxiliary gates. This is a
- * liveness read only: it does not spawn, wait for initialization, or probe a
- * binary.
+ * Gate-B readiness seam. It reads only the live client map and never spawns,
+ * waits for initialization, or probes a binary.
  */
-export async function isAuxiliaryLspAlive(
+export async function hasAuxiliaryLspPublishedForRoot(
 	serverId: string,
 	filePath: string,
 ): Promise<boolean> {
-	return getLSPService().isServerAliveForFile(serverId, filePath);
+	return getLSPService().hasServerPublishedForFileRoot(serverId, filePath);
 }
 
 /**
@@ -8500,6 +9451,10 @@ export async function notifyExternalFileChange(
 }
 
 export function resetLSPService(options: LSPShutdownOptions = {}): void {
+	// Invalidate availability publication started by the retiring service before
+	// any asynchronous teardown. The launch seam checks this generation after
+	// every managed lookup, install, and process launch (#2351).
+	resetLspLaunchAvailabilityGeneration();
 	// A new session must get its own classic-tsserver-repair attempt: the
 	// guard is a process-lifetime flag (see resetClassicTsRepairGuard), so a
 	// repair that failed transiently in an earlier session must not stay
@@ -8511,8 +9466,9 @@ export function resetLSPService(options: LSPShutdownOptions = {}): void {
 		// hide behind a leaked/stuck guard from the generation before it.
 		clearWorkspaceSweepHoldForSessionStart();
 	}
-	const retiringService = globalLSPService;
-	globalLSPService = null;
+	const state = lspProcessState();
+	const retiringService = state.service;
+	state.service = null;
 	if (!retiringService) return;
 
 	// shutdown() marks the service destroyed synchronously before its first
@@ -8521,14 +9477,14 @@ export function resetLSPService(options: LSPShutdownOptions = {}): void {
 	// its predecessor. allSettled keeps teardown best-effort without ever
 	// rejecting (and therefore permanently poisoning) the next generation.
 	const teardown = retiringService.shutdown(options);
-	const pending = globalLSPGenerationHandoff
-		? [globalLSPGenerationHandoff, teardown]
+	const pending = state.generationHandoff
+		? [state.generationHandoff, teardown]
 		: [teardown];
 	const handoff = Promise.allSettled(pending).then(() => undefined);
-	globalLSPGenerationHandoff = handoff;
+	state.generationHandoff = handoff;
 	void handoff.then(() => {
-		if (globalLSPGenerationHandoff === handoff) {
-			globalLSPGenerationHandoff = undefined;
+		if (state.generationHandoff === handoff) {
+			state.generationHandoff = undefined;
 		}
 	});
 }

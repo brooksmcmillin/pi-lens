@@ -78,3 +78,9 @@
 - name: red-ci
   color: e11d21
   description: Merge-train warden - a required check is failing on the current head
+- name: train:approved
+  color: 0e8a16
+  description: Maintainer review verdict - the merge train may land this PR once its current head concludes green
+- name: train:squash
+  color: 1d76db
+  description: Merge train - squash instead of the default merge commit

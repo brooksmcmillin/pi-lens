@@ -19,6 +19,8 @@ import {
 	logAvailabilityDecision,
 } from "./availability-policy.js";
 import { probeAvailabilityCandidates } from "./candidate-probe.js";
+import { createAvailabilityProbeFlight } from "../../../availability-probe-flight.js";
+import { createSingleFlight } from "../../../single-flight.js";
 
 export interface ToolchainAvailabilityConfig {
 	/** Tool name as it appears in the `availability_decision` record. */
@@ -44,6 +46,11 @@ export interface ToolchainAvailability {
 	isAvailable: () => Promise<boolean>;
 }
 
+const toolchainProbeFlights =
+	createAvailabilityProbeFlight<
+		Awaited<ReturnType<typeof probeAvailabilityCandidates>>
+	>();
+
 /**
  * Own one toolchain's availability: sweep the platform candidate list, memoize
  * the path that answered, and park the verdict behind the shared latch so a
@@ -61,18 +68,19 @@ export function createToolchainAvailability(
 	let sweepHostStallMs = 0;
 	/** What the last classified candidate returned, for the decision record. */
 	let sweepEvidence: ProbeEvidence | undefined;
-	let ensureInFlight: Promise<boolean> | null = null;
+	const ensureFlight = createSingleFlight<boolean>();
 
 	async function findPath(): Promise<string | null> {
 		if (toolPath) return toolPath;
 
 		const paths =
 			process.platform === "win32" ? config.windowsPaths : config.unixPaths;
-		const sweep = await probeAvailabilityCandidates(
-			paths,
-			config.probeArgs,
-			config.budgetMs,
+		const shared = toolchainProbeFlights.run(
+			`toolchain:${config.tool}|${config.probeArgs.join("|")}|${config.windowsPaths.join("|")}|${config.unixPaths.join("|")}`,
+			() =>
+				probeAvailabilityCandidates(paths, config.probeArgs, config.budgetMs),
 		);
+		const sweep = await shared.promise;
 		sweepSawTransient = sweep.sawTransient;
 		sweepTransientCause = sweep.transientCause;
 		sweepHostStallMs = sweep.hostStallMs;
@@ -129,15 +137,7 @@ export function createToolchainAvailability(
 		// cooldown expired, which re-enters the candidate sweep (#1476).
 		const memo = availabilityLatch.read();
 		if (memo !== null) return memo;
-		// Now that a verdict can expire, concurrent callers arriving just after a
-		// cooldown must share ONE sweep rather than each spawning their own.
-		if (ensureInFlight) return ensureInFlight;
-		ensureInFlight = resolveAvailability();
-		try {
-			return await ensureInFlight;
-		} finally {
-			ensureInFlight = null;
-		}
+		return ensureFlight.run("availability", resolveAvailability);
 	}
 
 	return { findPath, isAvailable };

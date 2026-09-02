@@ -87,7 +87,6 @@ const actionlintRunner: RunnerDefinition = {
 	id: "actionlint",
 	appliesTo: ["yaml"],
 	priority: PRIORITY.YAML_LINT + 1,
-	enabledByDefault: true,
 	skipTestFiles: false,
 
 	when(ctx: DispatchContext): boolean {

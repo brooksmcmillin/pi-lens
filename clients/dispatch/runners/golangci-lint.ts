@@ -124,7 +124,6 @@ const golangciRunner: RunnerDefinition = {
 	id: "golangci-lint",
 	appliesTo: ["go"],
 	priority: PRIORITY.GENERAL_ANALYSIS,
-	enabledByDefault: true,
 	timeoutMs: 90_000,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {

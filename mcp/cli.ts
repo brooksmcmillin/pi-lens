@@ -57,7 +57,9 @@ async function buildGraph(): Promise<void> {
 	if (!stat.isDirectory()) fail(`cwd is not a directory: ${cwd}`);
 
 	const startedAt = Date.now();
-	const graph = await buildOrUpdateGraph(cwd, [], new FactStore());
+	// Subject labels this store's capacity-eviction telemetry distinctly from
+	// the other five production FactStore instances (#2243 review round 3, F1).
+	const graph = await buildOrUpdateGraph(cwd, [], new FactStore("mcp-cli"));
 	const attempt = getLastReviewGraphBuildAttempt(cwd);
 	// "succeeded" can still carry a `reason` string — persistGraph() stamps one
 	// on to explain a partial (over-cap) persist, which is NOT a failure (#960

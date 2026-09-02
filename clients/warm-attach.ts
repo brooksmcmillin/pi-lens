@@ -4,8 +4,9 @@ import * as path from "node:path";
 import {
 	type InstanceEntry,
 	readInstanceRegistry,
+	selectLivePeerInstances,
 } from "./instance-registry.js";
-import { realIsPidAlive, STALE_HEARTBEAT_MS } from "./instance-reaper.js";
+import { realIsPidAlive } from "./instance-reaper.js";
 import { logLatency } from "./latency-logger.js";
 import { touchCoverageGap } from "./lsp/diagnostic-binding.js";
 import { loadLspService } from "./lsp-lazy.js";
@@ -52,23 +53,18 @@ function record(
 	});
 }
 
+/**
+ * The oldest live peer on this root, if any. The liveness rule itself lives
+ * in `selectLivePeerInstances` (#2007) so warm-attach and the shared-checkout
+ * guard cannot drift apart about what "another session is here" means.
+ */
 export function selectWarmAttachIncumbent(
 	entries: readonly InstanceEntry[],
 	cwd: string,
 	now = Date.now(),
 	isPidAlive: (pid: number) => boolean = realIsPidAlive,
 ): InstanceEntry | undefined {
-	const root = normalizeFilePath(cwd);
-	return entries
-		.filter(
-			(entry) =>
-				entry.pid !== process.pid &&
-				entry.projectRoot === root &&
-				isPidAlive(entry.pid) &&
-				Number.isFinite(Date.parse(entry.heartbeatAt)) &&
-				now - Date.parse(entry.heartbeatAt) <= STALE_HEARTBEAT_MS,
-		)
-		.sort((a, b) => Date.parse(a.startedAt) - Date.parse(b.startedAt))[0];
+	return selectLivePeerInstances(entries, cwd, now, isPidAlive)[0];
 }
 
 async function serveRequest(

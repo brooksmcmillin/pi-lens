@@ -29,11 +29,47 @@ import {
 	RECENT_PHASE_CAP,
 	resetCurrentPhaseForSession,
 } from "../../clients/latency-logger.js";
+import { normalizeFilePath } from "../../clients/path-utils.js";
 
 describe("latency-logger", () => {
 	beforeEach(() => {
 		writerLog.mockClear();
 	});
+
+	// #2219 (the #2141 class): module-report.ts feeds `logLatency` a raw
+	// `path.resolve()` result while dispatcher.ts-derived call sites already
+	// pass a normalized `ctx.filePath`.
+	it("normalizes a backslash-supplied absolute filePath to the canonical slash form (#2141 class)", () => {
+		logLatency({
+			type: "phase",
+			phase: "test",
+			filePath: "C:\\Users\\dev\\pi-free\\src\\a.ts",
+			durationMs: 5,
+		});
+
+		expect(writerLog.mock.calls[0][0].filePath).toBe(
+			normalizeFilePath("C:\\Users\\dev\\pi-free\\src\\a.ts"),
+		);
+	});
+
+	// Several call sites deliberately use `filePath` for a non-path label
+	// (bounded-telemetry.ts's own comment on the field), a shell command
+	// (spawn-timeout-cooldown.ts), or an empty placeholder
+	// (safe-spawn.ts/lens-diagnostics.ts). None of these may be resolved
+	// against the process cwd — only a genuine fully-qualified path is the
+	// #2141 defect.
+	it.each(["<pi-lens>", "", "git", "npm run build"])(
+		"leaves the non-path label %j untouched",
+		(label) => {
+			logLatency({
+				type: "phase",
+				phase: "test",
+				filePath: label,
+				durationMs: 5,
+			});
+			expect(writerLog.mock.calls[0][0].filePath).toBe(label);
+		},
+	);
 
 	it("owns process and timestamp attribution instead of trusting caller fields", () => {
 		logLatency({
@@ -171,6 +207,60 @@ describe("getLastLoggedPhase (loop_block attribution, #1122/#1123)", () => {
 			phase: "cache_usage_summary",
 			filePath: "<pi-lens>",
 			durationMs: 0,
+		});
+		expect(getLastLoggedPhase()?.phase).toBe("provider_request");
+	});
+
+	it("does not let failed-target decision telemetry own stall attribution (#2044)", () => {
+		logLatency({
+			type: "phase",
+			phase: "turn_end_tests",
+			filePath: "<pi-lens>",
+			durationMs: 5,
+		});
+		logLatency({
+			type: "phase",
+			phase: "test_runner_failed_target_state",
+			filePath: "/repo/stale.test.ts",
+			durationMs: 0,
+		});
+		expect(getLastLoggedPhase()?.phase).toBe("turn_end_tests");
+	});
+
+	// #2249/#2312 review F3: `concurrent_session_bind_rollup` is a zero-duration
+	// session-end summary, the same shape as `session_end_bus_rollup` and
+	// `path_attribution_verified_rollup` above — it must not win lastPhase
+	// attribution for a loop_block that happens to land right after it. Pins
+	// the `LAST_PHASE_EXCLUDED` entry so deleting it reds here instead of
+	// surviving unnoticed.
+	it("does not let the concurrent-session-bind rollup own stall attribution (#2249)", () => {
+		logLatency({
+			type: "phase",
+			phase: "provider_request",
+			filePath: "<pi-lens>",
+			durationMs: 5,
+		});
+		logLatency({
+			type: "phase",
+			phase: "concurrent_session_bind_rollup",
+			filePath: "<pi-lens>",
+			durationMs: 0,
+		});
+		expect(getLastLoggedPhase()?.phase).toBe("provider_request");
+	});
+
+	it("does not let a busy notify decision own stall attribution (#2358)", () => {
+		logLatency({
+			type: "phase",
+			phase: "provider_request",
+			filePath: "<pi-lens>",
+			durationMs: 5,
+		});
+		logLatency({
+			type: "phase",
+			phase: "lsp_notify_stall_cpu_busy",
+			filePath: "server:root",
+			durationMs: 1000,
 		});
 		expect(getLastLoggedPhase()?.phase).toBe("provider_request");
 	});

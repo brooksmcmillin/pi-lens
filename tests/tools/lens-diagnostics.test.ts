@@ -295,6 +295,7 @@ describe("lens_diagnostics mode=delta", () => {
 			blocking: 1,
 			errors: 1,
 			warnings: 1,
+			advisories: 0,
 			hasFinalSnapshot: true,
 			diagnostics: [
 				{ severity: "error", message: "boom", line: 5 },
@@ -655,7 +656,12 @@ type Diag = Summary["diagnostics"][number];
 
 function sum(
 	filePath: string,
-	counts: { blocking?: number; errors?: number; warnings?: number },
+	counts: {
+		blocking?: number;
+		errors?: number;
+		warnings?: number;
+		advisories?: number;
+	},
 	opts: { hasFinalSnapshot?: boolean; diagnostics?: Diag[] } = {},
 ): Summary {
 	return {
@@ -663,6 +669,7 @@ function sum(
 		blocking: counts.blocking ?? 0,
 		errors: counts.errors ?? 0,
 		warnings: counts.warnings ?? 0,
+		advisories: counts.advisories ?? 0,
 		hasFinalSnapshot: opts.hasFinalSnapshot ?? true,
 		diagnostics: opts.diagnostics ?? [],
 	};
@@ -1067,6 +1074,40 @@ describe("lens_diagnostics mode=full", () => {
 			lspFilesConfirmed: 1,
 			lspFilesUnconfirmed: 2,
 			unconfirmedLspFiles: ["/proj/src/after-1.ts", "/proj/src/after-2.ts"],
+		});
+	});
+
+	// #2052 fix round 1 (F4d): a file outside every registered session root is
+	// declined before any server is asked. The full sweep must name that
+	// explicitly and must never let its empty placeholder read as clean.
+	it("renders an outside-project-root decline as unconfirmed, never as clean or a timeout (#2052)", async () => {
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([
+				{ filePath: "/proj/src/local.ts", diagnostics: [], count: 0 },
+				{
+					filePath: "/tmp/pi-agent-abc/src/foreign.ts",
+					diagnostics: [],
+					count: 0,
+					timedOut: true,
+					unconfirmedReason: "outside_project_root",
+				},
+			]),
+		};
+		const result = await run(makeTool({}, lspService), { mode: "full" });
+		const text = String(result.content[0].text);
+
+		expect(text).toContain("foreign.ts");
+		expect(text).toMatch(/unconfirmed/i);
+		// Pre-fix the sweep handed this file back as a confirmed clean, so it
+		// counted toward `lspFilesConfirmed` and never appeared in the note.
+		expect(text).toContain("outside every initialized session project root");
+		// A decline is permanent for this path — telling the reader it ran out
+		// of budget would send them into an infinite retry.
+		expect(text).not.toContain("within budget");
+		expect(result.details).toMatchObject({
+			lspFilesConfirmed: 1,
+			lspFilesUnconfirmed: 1,
+			unconfirmedLspFiles: ["/tmp/pi-agent-abc/src/foreign.ts"],
 		});
 	});
 
@@ -2632,6 +2673,59 @@ describe("lens_diagnostics mode=all", () => {
 		});
 	});
 
+	// #2414: hint/info tier findings are style opinions and must not present
+	// as warning defects. `advisories` is a separate tally that keeps a
+	// hint-only file visible without inflating `warnings`.
+	describe("severity projection (#2414)", () => {
+		it("a hint/info-only file is excluded from severity=warning", async () => {
+			mockSummaries.length = 0;
+			mockSummaries.push(sum("/proj/hints.ts", { advisories: 2 }));
+			mockSummaries.push(sum("/proj/real-warning.ts", { warnings: 1 }));
+			const result = await run(makeTool(), {
+				mode: "all",
+				severity: "warning",
+			});
+			const text = String(result.content[0].text);
+			expect(text).toContain("real-warning.ts");
+			expect(text).not.toContain("hints.ts");
+		});
+
+		it("a hint/info-only file still surfaces under severity=all (not dropped)", async () => {
+			mockSummaries.length = 0;
+			mockSummaries.push(sum("/proj/hints.ts", { advisories: 2 }));
+			const result = await run(makeTool(), { mode: "all", severity: "all" });
+			const text = String(result.content[0].text);
+			expect(text).toContain("hints.ts");
+			expect(text).toContain("2 hints");
+			expect(result.details).toMatchObject({ filesWithIssues: 1 });
+		});
+
+		it("summary totals separate advisories from warnings", async () => {
+			mockSummaries.length = 0;
+			mockSummaries.push(sum("/proj/a.ts", { warnings: 3, advisories: 5 }));
+			const result = await run(makeTool(), { mode: "all" });
+			const text = String(result.content[0].text);
+			expect(text).toContain("3 warnings");
+			expect(text).toContain("5 hint/info");
+			expect(result.details).toMatchObject({
+				totalWarnings: 3,
+				totalAdvisories: 5,
+			});
+		});
+
+		it("a hint/info-only session renders as clean, not as N warnings", async () => {
+			mockSummaries.length = 0;
+			mockSummaries.push(sum("/proj/hints.ts", { advisories: 4 }));
+			const result = await run(makeTool(), { mode: "all" });
+			expect(result.details).toMatchObject({
+				totalBlocking: 0,
+				totalErrors: 0,
+				totalWarnings: 0,
+				totalAdvisories: 4,
+			});
+		});
+	});
+
 	// #1799: `semantic === "blocking"` iff `severity === "error"` holds
 	// codebase-wide, so every error-severity finding is ALSO a blocking one —
 	// the rendered summary must not print the same 3 findings once as
@@ -3376,6 +3470,7 @@ describe("lens_diagnostics disposition read-filter (#755)", () => {
 			blocking: 0,
 			errors: 0,
 			warnings: 1,
+			advisories: 0,
 			hasFinalSnapshot: true,
 			diagnostics: [
 				{
@@ -3506,6 +3601,7 @@ describe("lens_diagnostics disposition read-filter (#755)", () => {
 			blocking: 0,
 			errors: 0,
 			warnings: 1,
+			advisories: 0,
 			hasFinalSnapshot: true,
 			diagnostics: [
 				{
@@ -3621,6 +3717,7 @@ describe("lens_diagnostics disposition read-filter (#755)", () => {
 			blocking: 0,
 			errors: 0,
 			warnings: 1,
+			advisories: 0,
 			hasFinalSnapshot: true,
 			diagnostics: [
 				{
@@ -3657,6 +3754,7 @@ describe("lens_diagnostics disposition read-filter (#755)", () => {
 			blocking: 0,
 			errors: 0,
 			warnings: 1,
+			advisories: 0,
 			hasFinalSnapshot: true,
 			diagnostics: [
 				{

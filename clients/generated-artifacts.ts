@@ -196,21 +196,107 @@ function hasGeneratedArtifactContent(content: string): boolean {
 	return GENERATED_HEADER_PATTERNS.some((pattern) => pattern.test(header));
 }
 
-// Memoize the generated-banner verdict per (path, mtimeMs, size, maxBytes).
-// The 4 KB header read (openSync + readSync + closeSync) is ~70% of the
-// per-file cost in `collectSourceFiles`, and the same files are re-scanned by
-// multiple background scanners (todo, project-diagnostics, language-profile)
+/**
+ * Content-shape classifier for machine-emitted text (refs #2346).
+ *
+ * A saved/scraped page, a minified bundle, or an embedded data blob is one
+ * giant line or a handful, so mean non-empty line length on already-loaded
+ * content is a language-agnostic generated signature. Extensions covered by
+ * name patterns can never cover it (`.html` has no `.min.`-style convention),
+ * which is the exact gap #2346 hit: a 269 KB scraped page on 38 lines (mean
+ * ~7084/line) drew the full auxiliary scanner stack.
+ *
+ * The threshold is derived from measurement ON THE SHIPPED STATISTIC (the
+ * 4096-byte header/prefix mean, not full-content means — the two differ by
+ * 3-7x on long-paragraph prose). Measured 2026-08-28 across all 3,331 text
+ * files in this repo: the maximum hand-authored prefix mean is 453.2
+ * (`docs/analysisall.md`, unwrapped prose paragraphs); the widest
+ * hand-authored one-line shape observed anywhere probed is a ~2048-char
+ * barrel re-export. The threshold of 2500 sits ~5.5x above the repo's worst
+ * prose file and above every observed hand-authored shape, while the #2346
+ * evidence file (269 KB / 38 lines) remains far above it. Direction of
+ * error is deliberate per #1107: a borderline machine-emitted file that
+ * slips through (false KEEP) costs noise once; a hand-authored file
+ * silently classified generated (false DROP) vanishes from scans with no
+ * signal. Both constants are exported so the tuning claim is checkable and
+ * the regression tests pin the margin probes on both sides.
+ *
+ * Prefix-path quantization: on the 4096-byte header/prefix paths the
+ * achievable means are quantized (~4096 for a one-line prefix, ~2048 for
+ * two lines), so any threshold in (2048, 4096] behaves as "is the first
+ * line longer than 4096 bytes". A machine-emitted file with 2500-4000-char
+ * lines is missed on the prefix path even though its full content would
+ * classify — the deliberate false-KEEP direction, not a continuous 5.5x
+ * margin there. The full-content path (dispatch) has no such quantization.
+ *
+ * Degenerate cases are guarded: content below the minimum byte length never
+ * classifies generated on line shape alone (a 500-byte single-line config
+ * file is not machine-emitted evidence), and an empty or whitespace-only
+ * file yields a zero mean and stays source.
+ */
+export const MACHINE_EMITTED_LINE_SHAPE_MIN_CONTENT = 2048;
+export const MACHINE_EMITTED_LINE_SHAPE_MEAN_THRESHOLD = 2500;
+
+export interface MachineEmittedLineShape {
+	/** True when the content shape classifies as generated. */
+	generated: boolean;
+	/** Mean length of the content's non-empty lines in UTF-16 code units. */
+	meanLineLength: number;
+}
+
+export function classifyMachineEmittedLineShape(
+	content: string,
+): MachineEmittedLineShape {
+	const contentLength = content.length;
+	if (contentLength < MACHINE_EMITTED_LINE_SHAPE_MIN_CONTENT) {
+		return { generated: false, meanLineLength: 0 };
+	}
+	// Single O(contentLength) pass. Deliberately no `split(/\r?\n/)`: a
+	// minified blob's single line can be megabytes, and splitting allocates a
+	// copy of the whole content. `\r` contributes nothing to line length so a
+	// CRLF line is measured by its display width.
+	let nonEmptyLineTotal = 0;
+	let nonEmptyLineCount = 0;
+	let currentLineLength = 0;
+	for (let i = 0; i < contentLength; i++) {
+		const code = content.charCodeAt(i);
+		if (code === 10 /* \n */) {
+			if (currentLineLength > 0) {
+				nonEmptyLineTotal += currentLineLength;
+				nonEmptyLineCount += 1;
+			}
+			currentLineLength = 0;
+		} else if (code !== 13 /* \r */) {
+			currentLineLength += 1;
+		}
+	}
+	if (currentLineLength > 0) {
+		nonEmptyLineTotal += currentLineLength;
+		nonEmptyLineCount += 1;
+	}
+	if (nonEmptyLineCount === 0) return { generated: false, meanLineLength: 0 };
+	const meanLineLength = nonEmptyLineTotal / nonEmptyLineCount;
+	return {
+		generated: meanLineLength > MACHINE_EMITTED_LINE_SHAPE_MEAN_THRESHOLD,
+		meanLineLength,
+	};
+}
+
+// Memoize the header analysis (banner + line shape) per (path, mtimeMs, size,
+// maxBytes). The 4 KB header read (openSync + readSync + closeSync) is ~70% of
+// the per-file cost in `collectSourceFiles`, and the same files are re-scanned
+// by multiple background scanners (todo, project-diagnostics, language-profile)
 // every session/turn. Keying on mtime+size makes the memo self-invalidating:
 // an edited file misses the cache and is re-read. A single stat replaces the
 // open/read/close on a hit. Bounded to avoid unbounded growth on giant repos.
 const HEADER_VERDICT_MEMO_CAP = 50_000;
-const headerVerdictMemo = new BoundedLruCache<string, boolean>(
+const headerAnalysisMemo = new BoundedLruCache<string, FileHeaderAnalysis>(
 	HEADER_VERDICT_MEMO_CAP,
 );
 
-/** Test-only: drop the header-verdict memo so fixtures don't leak across cases. */
+/** Test-only: drop the header-analysis memo so fixtures don't leak across cases. */
 export function _resetGeneratedArtifactCaches(): void {
-	headerVerdictMemo.clear();
+	headerAnalysisMemo.clear();
 }
 
 function readFileHeader(
@@ -237,24 +323,42 @@ function readFileHeader(
 }
 
 /**
- * Memoized form of "does this file's header contain a generated-code banner?".
- * Returns `false` when the file cannot be stat'd/read (same fallback as the
- * inline read path). Keyed on path + mtime + size so edits invalidate it.
+ * Memoized content analysis of a file's header: the generated-code banner
+ * verdict AND the line-shape classification, both computed over the bytes
+ * already read for the header probe (no second read). Returns `undefined`
+ * when the file cannot be stat'd. Keyed on path + mtime + size so edits
+ * invalidate it.
  */
-function fileHeaderLooksGenerated(filePath: string, maxBytes: number): boolean {
+interface FileHeaderAnalysis {
+	banner: boolean;
+	shape: MachineEmittedLineShape;
+}
+
+function analyzeFileHeader(
+	filePath: string,
+	maxBytes: number,
+): FileHeaderAnalysis | undefined {
 	let key: string;
 	try {
 		const st = fs.statSync(filePath);
 		key = `${st.mtimeMs}:${st.size}:${maxBytes}:${filePath}`;
 	} catch {
-		return false;
+		return undefined;
 	}
-	const cached = headerVerdictMemo.get(key);
+	const cached = headerAnalysisMemo.get(key);
 	if (cached !== undefined) return cached;
 	const header = readFileHeader(filePath, maxBytes);
-	const verdict = header !== undefined && hasGeneratedArtifactContent(header);
-	headerVerdictMemo.set(key, verdict);
-	return verdict;
+	// A header that cannot be read classifies as clean (no banner, no shape
+	// signal) and is memoized as such, mirroring the pre-#2346 fallback.
+	const analysis: FileHeaderAnalysis =
+		header === undefined
+			? { banner: false, shape: { generated: false, meanLineLength: 0 } }
+			: {
+					banner: hasGeneratedArtifactContent(header),
+					shape: classifyMachineEmittedLineShape(header),
+				};
+	headerAnalysisMemo.set(key, analysis);
+	return analysis;
 }
 
 /**
@@ -287,6 +391,13 @@ export type GeneratedArtifactVerdict = "generated" | "override" | "clean";
  *    caller-supplied `content`) — the escape hatch checked and the evidence
  *    came back positive. Also not a coverage-hole signal: this is exactly
  *    the case #1107 phase 2 wanted to keep skipping.
+ *  - `"line-shape"`: NO name signal at all — the content's line shape alone
+ *    classifies it as machine-emitted (mean non-empty line length above
+ *    {@link MACHINE_EMITTED_LINE_SHAPE_MEAN_THRESHOLD}, content above
+ *    {@link MACHINE_EMITTED_LINE_SHAPE_MIN_CONTENT}). #2346: a scraped or
+ *    minified page whose name carries no generated marker. Distinct from
+ *    `"name-only"` on purpose: this verdict has content EVIDENCE (the shape
+ *    measurement), so it is not part of the residual at-risk bucket.
  *  - `"name-only"`: a WEAK name match trusted with NO corroborating evidence
  *    check performed at all — only reachable when the caller supplied
  *    neither `content` nor `readContentHeader:true` (source-filter.ts's
@@ -297,12 +408,21 @@ export type GeneratedArtifactVerdict = "generated" | "override" | "clean";
  *    the #1107 phase 2 escape hatch could not evaluate — a tool-facing
  *    notice should key off this, not the full `"generated"` count.
  */
-export type GeneratedArtifactEvidence = "strong" | "content" | "name-only";
+export type GeneratedArtifactEvidence =
+	| "strong"
+	| "content"
+	| "line-shape"
+	| "name-only";
 
 export interface GeneratedArtifactClassification {
 	verdict: GeneratedArtifactVerdict;
 	/** Only set when `verdict === "generated"`. See {@link GeneratedArtifactEvidence}. */
 	evidence?: GeneratedArtifactEvidence;
+	/**
+	 * Only set when `verdict === "generated"` AND `evidence === "line-shape"`:
+	 * the mean non-empty line length measured on the content that decided it.
+	 */
+	lineShapeMean?: number;
 }
 
 /**
@@ -358,17 +478,31 @@ export function classifyGeneratedOrArtifactDetailed(
 		if (hasGeneratedArtifactContent(options.content)) {
 			return { verdict: "generated", evidence: "content" };
 		}
+		const shape = classifyMachineEmittedLineShape(options.content);
+		if (shape.generated) {
+			return {
+				verdict: "generated",
+				evidence: "line-shape",
+				lineShapeMean: shape.meanLineLength,
+			};
+		}
 		return { verdict: weakNameMatch ? "override" : "clean" };
 	}
 
 	if (options.readContentHeader) {
-		if (
-			fileHeaderLooksGenerated(
-				filePath,
-				options.maxHeaderBytes ?? DEFAULT_HEADER_BYTES,
-			)
-		) {
+		const analysis = analyzeFileHeader(
+			filePath,
+			options.maxHeaderBytes ?? DEFAULT_HEADER_BYTES,
+		);
+		if (analysis?.banner) {
 			return { verdict: "generated", evidence: "content" };
+		}
+		if (analysis?.shape.generated) {
+			return {
+				verdict: "generated",
+				evidence: "line-shape",
+				lineShapeMean: analysis.shape.meanLineLength,
+			};
 		}
 		return { verdict: weakNameMatch ? "override" : "clean" };
 	}

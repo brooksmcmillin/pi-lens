@@ -1,19 +1,49 @@
 import * as fs from "node:fs";
+import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { CacheManager } from "../../clients/cache-manager.js";
 import { readChangesSince } from "../../clients/project-changes.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
+import {
+	registerPrimarySession,
+	releasePrimarySession,
+} from "../../clients/session-lifecycle.js";
 import { handleToolCall } from "../../clients/runtime-tool-call.js";
 import { handleToolResult } from "../../clients/runtime-tool-result.js";
+import {
+	clearFormatterRuntimeState,
+	getFormattersForFile,
+} from "../../clients/formatters.js";
+import { getProjectIgnoreMatcher } from "../../clients/file-utils.js";
 import {
 	getVerifiedPathAttributionGuessCount,
 	resetVerifiedPathAttributionGuessCount,
 } from "../../clients/path-attribution-telemetry.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 
+const readFileSyncSpy = vi.hoisted(() => vi.fn());
+vi.mock("node:fs", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:fs")>();
+	return {
+		...actual,
+		readFileSync: (...args: any[]) => {
+			readFileSyncSpy(...args);
+			return (actual.readFileSync as any)(...args);
+		},
+	};
+});
+
 const logLatency = vi.hoisted(() => vi.fn());
-vi.mock("../../clients/latency-logger.js", () => ({ logLatency }));
+vi.mock("node:fs/promises", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:fs/promises")>();
+	return { ...actual, readdir: vi.fn(actual.readdir) };
+});
+
+vi.mock("../../clients/latency-logger.js", async (importActual) => ({
+	...(await importActual<typeof import("../../clients/latency-logger.js")>()),
+	logLatency,
+}));
 
 vi.mock("../../clients/pipeline.js", () => ({
 	runPipeline: vi.fn(),
@@ -22,7 +52,256 @@ vi.mock("../../clients/pipeline.js", () => ({
 const notifyExternalFileChange = vi.hoisted(() => vi.fn(async () => undefined));
 vi.mock("../../clients/lsp/index.js", () => ({ notifyExternalFileChange }));
 
+const readdirMock = vi.mocked(fsp.readdir);
+const realReaddir = readdirMock.getMockImplementation()!;
+
+beforeEach(() => {
+	readdirMock.mockImplementation(realReaddir);
+	readdirMock.mockClear();
+});
+
 describe("bash grep searchReads registration", () => {
+	it("invalidates formatter selection through handleToolResult", async () => {
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		vi.mocked(runPipeline).mockResolvedValue({
+			output: "",
+			hasBlockers: false,
+			isError: false,
+			fileModified: false,
+		});
+		const env = setupTestEnvironment("pi-lens-1603-tool-result-");
+		try {
+			const filePath = path.join(env.tmpDir, "init.lua");
+			const configPath = path.join(env.tmpDir, "stylua.toml");
+			expect(await getFormattersForFile(filePath, env.tmpDir)).toEqual([]);
+			fs.writeFileSync(configPath, "column_width = 100\n");
+			expect(await getFormattersForFile(filePath, env.tmpDir)).toEqual([]);
+
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			await handleToolResult({
+				event: {
+					toolName: "write",
+					input: { path: configPath },
+					content: [{ type: "text", text: "written" }],
+				},
+				getFlag: () => false,
+				dbg: () => {},
+				runtime,
+				cacheManager: { addModifiedRange: () => {}, readTurnState: () => ({}) },
+				biomeClient: {},
+				ruffClient: {},
+				metricsClient: {},
+				resetLSPService: () => {},
+				agentBehaviorRecord: () => [],
+				formatBehaviorWarnings: () => "",
+			} as any);
+
+			expect(
+				(await getFormattersForFile(filePath, env.tmpDir)).map((f) => f.name),
+			).toEqual(["stylua"]);
+		} finally {
+			clearFormatterRuntimeState();
+			env.cleanup();
+		}
+	});
+
+	it("invalidates a warm formatter selection after an in-place config rewrite", async () => {
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		vi.mocked(runPipeline).mockResolvedValue({
+			output: "",
+			hasBlockers: false,
+			isError: false,
+			fileModified: false,
+		});
+		const env = setupTestEnvironment("pi-lens-1603-rewrite-");
+		try {
+			const filePath = path.join(env.tmpDir, "init.lua");
+			const configPath = path.join(env.tmpDir, "stylua.toml");
+			fs.writeFileSync(configPath, "column_width = 100\n");
+
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			const deps = {
+				getFlag: () => false,
+				dbg: () => {},
+				runtime,
+				cacheManager: { addModifiedRange: () => {}, readTurnState: () => ({}) },
+				biomeClient: {},
+				ruffClient: {},
+				metricsClient: {},
+				resetLSPService: () => {},
+				agentBehaviorRecord: () => [],
+				formatBehaviorWarnings: () => "",
+			} as any;
+
+			expect(
+				(await getFormattersForFile(filePath, env.tmpDir)).map((f) => f.name),
+			).toEqual(["stylua"]);
+			readdirMock.mockClear();
+			expect(
+				(await getFormattersForFile(filePath, env.tmpDir)).map((f) => f.name),
+			).toEqual(["stylua"]);
+			expect(readdirMock).not.toHaveBeenCalled();
+
+			// Keep the same path and file name. Only the contents change in place.
+			fs.writeFileSync(configPath, "column_width = 120\n");
+			await handleToolResult({
+				...deps,
+				event: {
+					toolName: "write",
+					input: { path: configPath },
+					content: [{ type: "text", text: "rewritten" }],
+				},
+			});
+
+			readdirMock.mockClear();
+			expect(
+				(await getFormattersForFile(filePath, env.tmpDir)).map((f) => f.name),
+			).toEqual(["stylua"]);
+			// A warm stale entry would return above without walking ancestors.
+			expect(readdirMock.mock.calls.length).toBeGreaterThan(0);
+		} finally {
+			clearFormatterRuntimeState();
+			env.cleanup();
+		}
+	});
+
+	it("invalidates formatter selection for config removal and changedFiles side effects", async () => {
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		vi.mocked(runPipeline).mockResolvedValue({
+			output: "",
+			hasBlockers: false,
+			isError: false,
+			fileModified: false,
+		});
+		const env = setupTestEnvironment("pi-lens-1603-removal-");
+		try {
+			const filePath = path.join(env.tmpDir, "init.lua");
+			const sourcePath = path.join(env.tmpDir, "source.ts");
+			const configPath = path.join(env.tmpDir, "stylua.toml");
+			fs.writeFileSync(sourcePath, "const value = 1;\n");
+			fs.writeFileSync(configPath, "column_width = 100\n");
+
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			const deps = {
+				getFlag: () => false,
+				dbg: () => {},
+				runtime,
+				cacheManager: { addModifiedRange: () => {}, readTurnState: () => ({}) },
+				biomeClient: {},
+				ruffClient: {},
+				metricsClient: {},
+				resetLSPService: () => {},
+				agentBehaviorRecord: () => [],
+				formatBehaviorWarnings: () => "",
+			} as any;
+
+			await handleToolResult({
+				...deps,
+				event: {
+					toolName: "write",
+					input: { path: configPath },
+					content: [{ type: "text", text: "written" }],
+				},
+			});
+			expect(
+				(await getFormattersForFile(filePath, env.tmpDir)).map((f) => f.name),
+			).toEqual(["stylua"]);
+
+			fs.rmSync(configPath);
+			await handleToolResult({
+				...deps,
+				event: {
+					toolName: "write",
+					input: { path: configPath },
+					content: [{ type: "text", text: "removed" }],
+				},
+			});
+			expect(await getFormattersForFile(filePath, env.tmpDir)).toEqual([]);
+
+			fs.writeFileSync(configPath, "column_width = 120\n");
+			await handleToolResult({
+				...deps,
+				event: {
+					toolName: "write",
+					input: { path: configPath },
+					content: [{ type: "text", text: "written" }],
+				},
+			});
+			expect(
+				(await getFormattersForFile(filePath, env.tmpDir)).map((f) => f.name),
+			).toEqual(["stylua"]);
+
+			fs.rmSync(configPath);
+			vi.mocked(runPipeline).mockResolvedValue({
+				output: "",
+				hasBlockers: false,
+				isError: false,
+				fileModified: false,
+				changedFiles: [configPath],
+			});
+			await handleToolResult({
+				...deps,
+				event: {
+					toolName: "write",
+					input: { path: sourcePath },
+					content: [{ type: "text", text: "source changed" }],
+				},
+			});
+			expect(await getFormattersForFile(filePath, env.tmpDir)).toEqual([]);
+		} finally {
+			clearFormatterRuntimeState();
+			env.cleanup();
+		}
+	});
+
+	it("invalidates the ignore matcher through handleToolResult", async () => {
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		vi.mocked(runPipeline).mockResolvedValue({
+			output: "",
+			hasBlockers: false,
+			isError: false,
+			fileModified: false,
+		});
+		const env = setupTestEnvironment("pi-lens-2071-tool-result-");
+		try {
+			const nested = path.join(env.tmpDir, "packages", "app");
+			fs.mkdirSync(nested, { recursive: true });
+			const ignoredPath = path.join(nested, "generated.ts");
+			const ignorePath = path.join(nested, ".gitignore");
+			fs.writeFileSync(ignorePath, "generated.ts\n");
+			const matcher = getProjectIgnoreMatcher(env.tmpDir);
+			expect(matcher.isIgnored(ignoredPath)).toBe(true);
+
+			fs.writeFileSync(ignorePath, "!generated.ts\n");
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			await handleToolResult({
+				event: {
+					toolName: "write",
+					input: { path: ignorePath },
+					content: [{ type: "text", text: "written" }],
+				},
+				getFlag: () => false,
+				dbg: () => {},
+				runtime,
+				cacheManager: { addModifiedRange: () => {}, readTurnState: () => ({}) },
+				biomeClient: {},
+				ruffClient: {},
+				metricsClient: {},
+				resetLSPService: () => {},
+				agentBehaviorRecord: () => [],
+				formatBehaviorWarnings: () => "",
+			} as any);
+
+			expect(matcher.isIgnored(ignoredPath)).toBe(false);
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("registers bash reads only from a successful tool result", async () => {
 		const env = setupTestEnvironment("pi-lens-bash-read-result-");
 		try {
@@ -102,6 +381,126 @@ describe("bash grep searchReads registration", () => {
 				},
 			});
 			expect(recordRead).not.toHaveBeenCalled();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("does not record or deliver a failed native edit result", async () => {
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		vi.mocked(runPipeline).mockClear();
+		const env = setupTestEnvironment("pi-lens-native-edit-failed-");
+		try {
+			const filePath = path.join(env.tmpDir, "sample.ts");
+			fs.writeFileSync(filePath, "const a = 1;\n");
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			const result = await handleToolResult({
+				event: {
+					toolName: "edit",
+					isError: true,
+					input: {
+						path: filePath,
+						edits: [{ oldText: "const a = 1;", newText: "const a = 2;" }],
+					},
+					content: [{ type: "text", text: "edit failed" }],
+				},
+				getFlag: () => false,
+				dbg: () => {},
+				runtime,
+				cacheManager: new CacheManager(false),
+				biomeClient: {},
+				ruffClient: {},
+				metricsClient: {},
+				resetLSPService: () => {},
+				agentBehaviorRecord: () => [],
+				formatBehaviorWarnings: () => "",
+			} as any);
+			expect(result).toMatchObject({ isError: true });
+			expect(
+				runtime.partialApplyRecords.find(
+					filePath,
+					"const a = 1;",
+					"const a = 2;",
+				),
+			).toBeUndefined();
+			expect(readChangesSince(env.tmpDir, 0)).toEqual([]);
+			expect(runPipeline).not.toHaveBeenCalled();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("hashes a native multi-edit result once for all applied records", async () => {
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		vi.mocked(runPipeline).mockResolvedValue({
+			output: "",
+			hasBlockers: false,
+			isError: false,
+			fileModified: false,
+		});
+		const env = setupTestEnvironment("pi-lens-native-edit-hash-");
+		try {
+			const filePath = path.join(env.tmpDir, "sample.ts");
+			fs.writeFileSync(filePath, "const a = 1;\nconst b = 2;\nconst c = 3;\n");
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			readFileSyncSpy.mockClear();
+			await handleToolResult({
+				event: {
+					toolName: "edit",
+					input: {
+						path: filePath,
+						edits: [
+							{ oldText: "const a = 1;", newText: "const a = 10;" },
+							{ oldText: "const b = 2;", newText: "const b = 20;" },
+							{ oldText: "const c = 3;", newText: "const c = 30;" },
+						],
+					},
+					content: [],
+				},
+				_bypassDebounce: true,
+				getFlag: () => false,
+				dbg: () => {},
+				runtime,
+				cacheManager: new CacheManager(false),
+				biomeClient: {},
+				ruffClient: {},
+				metricsClient: {},
+				resetLSPService: () => {},
+				agentBehaviorRecord: () => [],
+				formatBehaviorWarnings: () => "",
+			} as any);
+			const rawHashReads = readFileSyncSpy.mock.calls.filter(
+				(args) => args.length === 1,
+			);
+			// Two raw-byte hashes total across three applied records: one post-write
+			// hash (shared by all three record() calls AND reused as the pipeline
+			// dedup key, finding 3) and one post-pipeline hash. record() never
+			// re-reads per edit.
+			expect(rawHashReads).toHaveLength(2);
+			const records = [
+				runtime.partialApplyRecords.find(
+					filePath,
+					"const a = 1;",
+					"const a = 10;",
+				),
+				runtime.partialApplyRecords.find(
+					filePath,
+					"const b = 2;",
+					"const b = 20;",
+				),
+				runtime.partialApplyRecords.find(
+					filePath,
+					"const c = 3;",
+					"const c = 30;",
+				),
+			];
+			expect(
+				records.every(
+					(record) => record?.contentHash === records[0]?.contentHash,
+				),
+			).toBe(true);
 		} finally {
 			env.cleanup();
 		}
@@ -1614,6 +2013,98 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				reason: "pipeline_crash",
 			});
 		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("does not let a secondary pipeline crash reset the primary fleet", async () => {
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		vi.mocked(runPipeline).mockRejectedValue(new Error("secondary boom"));
+
+		const env = setupTestEnvironment("pi-lens-runtime-tool-secondary-crash-");
+		try {
+			const filePath = path.join(env.tmpDir, "src", "app.ts");
+			fs.mkdirSync(path.dirname(filePath), { recursive: true });
+			fs.writeFileSync(filePath, "export const x = 1;\n");
+			registerPrimarySession({}, "primary-session", env.tmpDir);
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			runtime.setSessionLifecycle({ sessionId: "secondary-session" });
+			runtime.beginTurn();
+			const resetLSPService = vi.fn();
+
+			await handleToolResult({
+				event: {
+					toolName: "edit",
+					input: { path: filePath },
+					details: { diff: "+  1 export const x = 2;" },
+					content: [{ type: "text", text: "base" }],
+				},
+				getFlag: () => false,
+				dbg: () => {},
+				runtime,
+				cacheManager: new CacheManager(false),
+				biomeClient: {},
+				ruffClient: {},
+				testRunnerClient: {},
+				metricsClient: {},
+				resetLSPService,
+				agentBehaviorRecord: () => [],
+				formatBehaviorWarnings: () => "",
+			} as any);
+
+			expect(resetLSPService).not.toHaveBeenCalled();
+		} finally {
+			releasePrimarySession();
+			env.cleanup();
+		}
+	});
+
+	// R2-F2 (#2157 fix round 2): the primary-direction mirror of the secondary
+	// test above — a crash belonging to the registered primary must still
+	// reset its own fleet.
+	it("lets a primary session's own pipeline crash reset its fleet", async () => {
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		vi.mocked(runPipeline).mockRejectedValue(new Error("primary boom"));
+
+		const env = setupTestEnvironment("pi-lens-runtime-tool-primary-crash-");
+		try {
+			const filePath = path.join(env.tmpDir, "src", "app.ts");
+			fs.mkdirSync(path.dirname(filePath), { recursive: true });
+			fs.writeFileSync(filePath, "export const x = 1;\n");
+			registerPrimarySession({}, "primary-session", env.tmpDir);
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			runtime.setSessionLifecycle({ sessionId: "primary-session" });
+			runtime.beginTurn();
+			const resetLSPService = vi.fn();
+
+			await handleToolResult({
+				event: {
+					toolName: "edit",
+					input: { path: filePath },
+					details: { diff: "+  1 export const x = 2;" },
+					content: [{ type: "text", text: "base" }],
+				},
+				getFlag: () => false,
+				dbg: () => {},
+				runtime,
+				cacheManager: new CacheManager(false),
+				biomeClient: {},
+				ruffClient: {},
+				testRunnerClient: {},
+				metricsClient: {},
+				resetLSPService,
+				agentBehaviorRecord: () => [],
+				formatBehaviorWarnings: () => "",
+			} as any);
+
+			expect(resetLSPService).toHaveBeenCalledWith({
+				fast: true,
+				reason: "pipeline_crash",
+			});
+		} finally {
+			releasePrimarySession();
 			env.cleanup();
 		}
 	});

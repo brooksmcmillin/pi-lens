@@ -163,9 +163,9 @@ export function parseVultureOutput(
  *
  * vulture finds unused functions, classes, methods, imports, variables and
  * attributes by static analysis of the whole tree. It has no JSON reporter, so
- * we parse its stable one-line-per-finding text output. It exits 1 when it
- * FINDS dead code (linter convention), so a non-zero exit with parseable
- * output is success, not failure.
+ * we parse its stable one-line-per-finding text output. A clean run exits 0;
+ * found dead code exits 3 with findings on stdout. A non-zero exit with
+ * parseable output is success, not failure (see runAnalyze for the table).
  */
 export class PythonDeadCodeClient implements DeadCodeClient {
 	readonly id = "python";
@@ -325,6 +325,7 @@ export class PythonDeadCodeClient implements DeadCodeClient {
 					latched: true,
 					hostStallMs,
 					budgetMs: 5000,
+					classifiedBy: "probe",
 				});
 				return true;
 			}
@@ -458,14 +459,16 @@ export class PythonDeadCodeClient implements DeadCodeClient {
 				durationMs,
 			};
 		}
-		// vulture writes parse/usage errors to stderr and exits 1 with no
-		// stdout findings; distinguish that from "found dead code" (exit 1 WITH
-		// findings on stdout). #1736 sweep: the ORIGINAL guard here required
-		// non-empty stderr to call it an error, so a nonzero exit with BOTH
-		// empty stdout and empty stderr (a silent crash) still fell through to
-		// "No dead code found" -- the same empty-distinguishes-clean-from-errored
-		// gap the knip fix closes. A nonzero exit with no findings on stdout is
-		// never clean now, regardless of whether stderr said anything.
+		// Verified exit-code table (vulture 2.16, probed live during the #1758
+		// review): a clean run exits 0 with empty stdout; dead code found exits
+		// 3 with findings on stdout; invalid input or a parse error exits 1
+		// with empty stdout and the error on stderr. #1736 sweep: the ORIGINAL
+		// guard here required non-empty stderr to call it an error, so a
+		// nonzero exit with BOTH empty stdout and empty stderr (a silent crash)
+		// still fell through to "No dead code found" -- the same
+		// empty-distinguishes-clean-from-errored gap the knip fix closes. A
+		// nonzero exit with no findings on stdout is never clean now,
+		// regardless of whether stderr said anything.
 		const output = result.stdout || "";
 		if (!output.trim()) {
 			const stderr = (result.stderr || "").trim();

@@ -185,6 +185,43 @@ describe("git-guard", () => {
 		).toBe(false);
 	});
 
+	// #2007 R1 (regression, caught in review): the shared-checkout guard added
+	// a post-verb `--help`/`-h` suppression to the classifier both gates now
+	// share. Applied to THIS gate it was a hole, because `-h` is a legal
+	// option VALUE. Verified against real git 2.55 in a scratch repo:
+	// `git commit -m -h` exits 0 and the log subject reads `-h`, and
+	// `git push --repo -h` reaches the push path rather than printing help.
+	// A gate that fails closed must never be talked out of a match by a token
+	// that might be a value.
+	it("still matches when -h is an option VALUE, not a help request", () => {
+		for (const command of [
+			"git commit -m -h",
+			"git commit -F -h",
+			"git commit --file -h",
+			"git commit -c -h",
+			"git commit --reuse-message -h",
+			"git push --repo -h",
+			"git push --receive-pack -h",
+			"git push --exec -h",
+		]) {
+			expect(isGitCommitOrPushAttempt("bash", { command }), command).toBe(true);
+		}
+	});
+
+	it("keeps failing closed on an explicit post-verb help flag", () => {
+		// Not a value here, but this gate does not get to decide that: the
+		// pre-#2007 classifier matched these, and a commit gate that can be
+		// switched off by appending a flag is not a gate.
+		for (const command of [
+			"git commit --help",
+			"git commit -h",
+			"git push --help",
+			"git push -h",
+		]) {
+			expect(isGitCommitOrPushAttempt("bash", { command }), command).toBe(true);
+		}
+	});
+
 	it("does not treat literal git text as an indirect operation", () => {
 		for (const command of [
 			'echo "remember to git push later"',

@@ -116,7 +116,10 @@ export const LANGUAGE_CAPABILITY_MATRIX: Record<
 	json: {
 		name: "JSON Processing",
 		capabilities: ["format", "lint"],
-		writeGroups: [primary("json")],
+		writeGroups: [
+			primary("json"),
+			{ mode: "all", runnerIds: ["trivy-config"], filterKinds: ["json"] },
+		],
 	},
 	markdown: {
 		name: "Markdown Processing",
@@ -129,7 +132,11 @@ export const LANGUAGE_CAPABILITY_MATRIX: Record<
 	css: {
 		name: "CSS Processing",
 		capabilities: ["format", "lint"],
-		writeGroups: [primary("css")],
+		writeGroups: [
+			primary("css"),
+			{ mode: "all", runnerIds: ["tree-sitter"], filterKinds: ["css"] },
+			{ mode: "all", runnerIds: ["ast-grep-napi"], filterKinds: ["css"] },
+		],
 	},
 	yaml: {
 		name: "YAML Processing",
@@ -152,7 +159,10 @@ export const LANGUAGE_CAPABILITY_MATRIX: Record<
 	html: {
 		name: "HTML Linting",
 		capabilities: ["lint"],
-		writeGroups: [primary("html")],
+		writeGroups: [
+			primary("html"),
+			{ mode: "all", runnerIds: ["ast-grep-napi"], filterKinds: ["html"] },
+		],
 	},
 	docker: {
 		name: "Dockerfile Linting",
@@ -162,7 +172,10 @@ export const LANGUAGE_CAPABILITY_MATRIX: Record<
 	php: {
 		name: "PHP Linting",
 		capabilities: ["types", "lint"],
-		writeGroups: [primary("php")],
+		writeGroups: [
+			primary("php"),
+			{ mode: "all", runnerIds: ["tree-sitter"], filterKinds: ["php"] },
+		],
 	},
 	powershell: {
 		name: "PowerShell Linting",
@@ -177,7 +190,10 @@ export const LANGUAGE_CAPABILITY_MATRIX: Record<
 	csharp: {
 		name: "C# Linting",
 		capabilities: ["types", "lint"],
-		writeGroups: [primary("csharp")],
+		writeGroups: [
+			primary("csharp"),
+			{ mode: "all", runnerIds: ["tree-sitter"], filterKinds: ["csharp"] },
+		],
 	},
 	fsharp: {
 		name: "F# Linting",

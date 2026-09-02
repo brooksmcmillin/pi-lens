@@ -11,6 +11,7 @@ import {
 	loadSg,
 } from "../dispatch/runners/ast-grep-napi.js";
 import type { Diagnostic } from "../dispatch/types.js";
+import { detectFileKind } from "../file-kinds.js";
 import { isTestFile } from "../file-utils.js";
 import { isAtOrAboveHomeDir } from "../path-utils.js";
 import { getProjectDiagnosticsScannerMaxFiles } from "../project-scale.js";
@@ -154,7 +155,9 @@ async function scanFileMajorRules(
 		? await queryLoader.loadQueries(cwd)
 		: undefined;
 
-	const facts = new FactStore();
+	// Subject labels this store's capacity-eviction telemetry distinctly from
+	// the other five production FactStore instances (#2243 review round 3, F1).
+	const facts = new FactStore("project-diagnostics-scanner");
 	const pi = { getFlag: () => undefined };
 	const treeSitter: ProjectDiagnostic[] = [];
 	const factRules: ProjectDiagnostic[] = [];
@@ -209,7 +212,7 @@ async function scanFileMajorRules(
 		filePath: string,
 		content: string | null,
 	): Promise<void> => {
-		facts.clearFileFactsFor(filePath);
+		facts.dropFileFacts(filePath);
 		// Seed the exact bytes already supplied to tree-sitter so the file-content
 		// provider is skipped by runProviders.
 		facts.setFileFact(filePath, "file.content", content);
@@ -236,10 +239,12 @@ async function scanFileMajorRules(
 				filePath,
 				rootNode,
 				cwd,
-				"jsts",
+				detectFileKind(filePath),
 				{
 					maxMatchesPerRule: AST_GREP_SCAN_MAX_MATCHES_PER_RULE,
 					maxTotalDiagnostics: AST_GREP_SCAN_MAX_DIAGNOSTICS_PER_FILE,
+					content,
+					sgModule,
 				},
 			);
 			for (const diagnostic of fileDiagnostics) {
@@ -345,7 +350,10 @@ async function scanFileMajorRules(
 			} finally {
 				// This store belongs to the scan, and every consumer of this file's
 				// content and derived facts has completed by the end of the iteration.
-				facts.clearFileFactsFor(filePath);
+				// Drop without pinning: the scan is sequential and owns this store, so
+				// there is no concurrent walk to guard against, and pinning every
+				// scanned file would exempt it from the capacity cap (#2243).
+				facts.dropFileFacts(filePath);
 			}
 		}
 		if (wasmAborted) {

@@ -9,7 +9,6 @@ import {
 	evaluateAstGrepRules,
 	type AstGrepEvaluateOptions,
 } from "../../clients/dispatch/runners/ast-grep-napi.js";
-import { clearRulesCache } from "../../clients/dispatch/runners/yaml-rule-parser.js";
 import { createLSPClient } from "../../clients/lsp/client.js";
 import { getServerById } from "../../clients/lsp/server.js";
 import {
@@ -192,9 +191,17 @@ function runCli(configPath: string, filePath: string) {
 	};
 }
 
+// No `clearRulesCache()` call here (removed with the function in #2262 round
+// 2 — it had no remaining production caller). Isolation does not depend on
+// it: every case builds its project rule tree under a fresh
+// `fs.mkdtempSync` root via `makeProject()`, so each test's `getCachedRules`/
+// `loadYamlRulesFresh` cache key (the directory path) is unique across the
+// whole run and a prior test's entry can never be read back. The bundled
+// catalog tier (the real `rules/ast-grep-rules/...` directories) DOES share
+// one cache entry across every test in this file — that's the caching
+// working as designed, since no case here mutates bundled files on disk.
 afterEach(() => {
 	_resetBaselineSgconfigForTests();
-	clearRulesCache();
 	for (const root of tempRoots.splice(0)) {
 		// Windows: the raw ast-grep LSP child spawned by the cliIt case can still
 		// hold a handle on the temp dir when teardown runs, making rmSync throw

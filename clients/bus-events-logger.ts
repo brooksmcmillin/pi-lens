@@ -84,6 +84,10 @@ export interface BusEventLogEntry {
 	fileCount?: number;
 	/** FilesTouchedReason, when applicable (files:touched only). */
 	reason?: string;
+	/** The pi-lens writer that produced a files:touched correlation record. */
+	writer?: "pi-lens";
+	/** Bounded normalized paths for correlating writes with drift records. */
+	paths?: string[];
 	/** Diagnostics seq, when applicable (diagnostics only, `emitted`). */
 	seq?: number;
 	/** emit_failed detail. */

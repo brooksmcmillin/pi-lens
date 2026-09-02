@@ -50,6 +50,7 @@ import {
 	dispatchForFile,
 } from "../../../clients/dispatch/dispatcher.js";
 import { runProviders } from "../../../clients/dispatch/fact-runner.js";
+import { getFactStoreEvictionReporter } from "../../../clients/dispatch/fact-store.js";
 
 const emptyDispatchResult = {
 	diagnostics: [],
@@ -291,5 +292,12 @@ describe("Dispatch Integration", () => {
 			const runners = await getAvailableRunners("data.csv");
 			expect(runners).toEqual([]);
 		});
+	});
+
+	// #2243: importing this module (done at the top of this file) must install
+	// the fact-store capacity-eviction reporter. Without it, the store's cap
+	// evicts silently and item 4's ledger record is never emitted.
+	it("installs the fact-store eviction reporter on import", () => {
+		expect(getFactStoreEvictionReporter()).toBeTypeOf("function");
 	});
 });

@@ -159,8 +159,22 @@ function uniqueDetails(
 	fileDetails: AppliedWorkspaceEdit["fileDetails"],
 ): AppliedWorkspaceEdit["fileDetails"] {
 	const byPath = new Map<string, AppliedWorkspaceEdit["fileDetails"][number]>();
+	// #2016: `files` and `fileDetails` name the same paths, so without this the
+	// map-build loop and the lookup below each pay `realpathSync.native` for the
+	// same path (~200 microseconds per call on Windows; POSIX short-circuits, so
+	// CI cannot see it). The memo lives for one call, so it has no staleness
+	// window at all and needs no freshness design.
+	const keyMemo = new Map<string, string>();
+	const keyFor = (filePath: string): string => {
+		let key = keyMemo.get(filePath);
+		if (key === undefined) {
+			key = normalizeMapKey(path.resolve(filePath));
+			keyMemo.set(filePath, key);
+		}
+		return key;
+	};
 	for (const detail of fileDetails) {
-		const key = normalizeMapKey(path.resolve(detail.filePath));
+		const key = keyFor(detail.filePath);
 		const previous = byPath.get(key);
 		if (!previous) {
 			byPath.set(key, detail);
@@ -180,7 +194,7 @@ function uniqueDetails(
 	}
 	return files.map(
 		(filePath) =>
-			byPath.get(normalizeMapKey(path.resolve(filePath))) ?? {
+			byPath.get(keyFor(filePath)) ?? {
 				filePath,
 				// Resource operations have no already-computed text range. A small
 				// range is still enough to invalidate the touched-file turn state;

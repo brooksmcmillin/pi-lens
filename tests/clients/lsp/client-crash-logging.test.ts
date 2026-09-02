@@ -21,7 +21,12 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { logLatency } from "../../../clients/latency-logger.js";
 
-vi.mock("../../../clients/latency-logger.js", () => ({ logLatency: vi.fn() }));
+vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
+	...(await importActual<
+		typeof import("../../../clients/latency-logger.js")
+	>()),
+	logLatency: vi.fn(),
+}));
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FAKE_SERVER_PATH = path.join(

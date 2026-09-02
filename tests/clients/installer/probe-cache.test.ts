@@ -57,13 +57,20 @@ const TOOL_PATH =
 const MTIME_MS = 1_700_000_000_000;
 
 function makeCacheJson(
-	overrides: Partial<{ cachedAt: number; mtimeMs: number }> = {},
+	overrides: Partial<{
+		cachedAt: number;
+		mtimeMs: number;
+		sizeBytes: number;
+	}> = {},
 ) {
 	return JSON.stringify({
 		[TOOL_ID]: {
 			path: TOOL_PATH,
 			mtimeMs: overrides.mtimeMs ?? MTIME_MS,
 			cachedAt: overrides.cachedAt ?? Date.now(),
+			...(overrides.sizeBytes !== undefined && {
+				sizeBytes: overrides.sizeBytes,
+			}),
 		},
 	});
 }
@@ -137,6 +144,46 @@ describe("checkProbeCache", () => {
 		expect(result).toBe(TOOL_PATH);
 	});
 
+	// #2300: a same-mtime-bucket rewrite (coarse filesystem mtime granularity)
+	// that changes the binary's byte length must not pass the mtime-only
+	// freshness check. Varies SIZE, never same-length content.
+	it("returns undefined and evicts when the binary size has changed even though mtime matches", async () => {
+		mockFsReadFile.mockResolvedValue(
+			makeCacheJson({ mtimeMs: MTIME_MS, sizeBytes: 1000 }),
+		);
+		mockFsAccess.mockResolvedValue(undefined);
+		mockFsStat.mockResolvedValue({ mtimeMs: MTIME_MS, size: 2000 });
+
+		const result = await checkProbeCache(TOOL_ID);
+
+		expect(result).toBeUndefined();
+		expect(mockFsStat).toHaveBeenCalledWith(TOOL_PATH);
+	});
+
+	it("returns the cached path when both mtime and size match", async () => {
+		mockFsReadFile.mockResolvedValue(
+			makeCacheJson({ mtimeMs: MTIME_MS, sizeBytes: 1000 }),
+		);
+		mockFsAccess.mockResolvedValue(undefined);
+		mockFsStat.mockResolvedValue({ mtimeMs: MTIME_MS, size: 1000 });
+
+		const result = await checkProbeCache(TOOL_ID);
+
+		expect(result).toBe(TOOL_PATH);
+	});
+
+	it("keeps serving a legacy entry with no sizeBytes field when mtime matches (fail open)", async () => {
+		mockFsReadFile.mockResolvedValue(makeCacheJson({ mtimeMs: MTIME_MS }));
+		mockFsAccess.mockResolvedValue(undefined);
+		// Real current size differs, but the legacy entry never asserted a size
+		// claim, so this pre-#2300 entry still fails OPEN to mtime-only.
+		mockFsStat.mockResolvedValue({ mtimeMs: MTIME_MS, size: 9999 });
+
+		const result = await checkProbeCache(TOOL_ID);
+
+		expect(result).toBe(TOOL_PATH);
+	});
+
 	it("skips readFile on the second call (uses in-memory cache)", async () => {
 		mockFsReadFile.mockResolvedValue(makeCacheJson({ mtimeMs: MTIME_MS }));
 		mockFsAccess.mockResolvedValue(undefined);
@@ -193,6 +240,28 @@ describe("updateProbeCache", () => {
 		expect(written[TOOL_ID]).toMatchObject({
 			path: TOOL_PATH,
 			mtimeMs: MTIME_MS,
+		});
+	});
+
+	it("persists the resolved binary's size alongside its mtime (#2300)", async () => {
+		vi.useFakeTimers();
+		mockFsReadFile.mockRejectedValue(
+			Object.assign(new Error("ENOENT"), { code: "ENOENT" }),
+		);
+		mockFsStat.mockResolvedValue({ mtimeMs: MTIME_MS, size: 4242 });
+
+		await updateProbeCache(TOOL_ID, TOOL_PATH);
+		await vi.advanceTimersByTimeAsync(400);
+
+		const [, content] = mockWriteFileAtomicAsync.mock.calls[0] as [
+			string,
+			string,
+		];
+		const written = JSON.parse(content) as Record<string, unknown>;
+		expect(written[TOOL_ID]).toMatchObject({
+			path: TOOL_PATH,
+			mtimeMs: MTIME_MS,
+			sizeBytes: 4242,
 		});
 	});
 

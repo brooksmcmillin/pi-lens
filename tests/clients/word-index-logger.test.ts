@@ -23,6 +23,7 @@ vi.mock("../../clients/ndjson-logger.js", () => ({
 	}),
 }));
 
+import { normalizeFilePath } from "../../clients/path-utils.js";
 import { logWordIndex } from "../../clients/word-index-logger.js";
 
 describe("word-index-logger", () => {
@@ -48,7 +49,7 @@ describe("word-index-logger", () => {
 		expect(writerLog.mock.calls[0][0]).toEqual(
 			expect.objectContaining({
 				phase: "incremental_refresh",
-				cwd: "/proj",
+				cwd: normalizeFilePath("/proj"),
 				indexedFileCount: 42,
 				refreshed: 3,
 				reused: 38,
@@ -61,5 +62,29 @@ describe("word-index-logger", () => {
 		isTestModeRef.value = true;
 		logWordIndex({ phase: "persist_failed", cwd: "/proj", error: "boom" });
 		expect(writerLog).not.toHaveBeenCalled();
+	});
+
+	// #2141 class sweep: this logger mixes raw roots (`snapshotRoot`,
+	// `path.resolve(cwd)`) and pre-normalized cache keys (`key`) across call
+	// sites, so the same root could reach the log in two path forms. The single
+	// emit seam must fold both into one canonical form.
+	it("normalizes a backslash-supplied cwd to the same form as an already-normalized one (#2141)", () => {
+		logWordIndex({
+			phase: "full_rebuild",
+			cwd: "C:\\Users\\dev\\pi-free",
+			trigger: "session_start",
+			indexedFileCount: 1,
+		});
+		logWordIndex({
+			phase: "full_rebuild",
+			cwd: "C:/Users/dev/pi-free",
+			trigger: "session_start",
+			indexedFileCount: 1,
+		});
+
+		expect(writerLog).toHaveBeenCalledTimes(2);
+		const [firstCwd] = [writerLog.mock.calls[0][0].cwd];
+		const [secondCwd] = [writerLog.mock.calls[1][0].cwd];
+		expect(firstCwd).toBe(secondCwd);
 	});
 });

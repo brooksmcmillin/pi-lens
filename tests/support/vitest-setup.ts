@@ -2,6 +2,8 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { afterAll, expect } from "vitest";
+import { installGitFixtureEnv } from "./git-fixture-env.js";
 
 // The review-graph persist is debounced in production (#260 circuit-breaker) so
 // a burst of edits collapses to one write. In tests that would race disk-snapshot
@@ -47,6 +49,7 @@ process.env.PI_LENS_CONFIG_PATH = "/nonexistent-pi-lens-tests/config.json";
 process.env.PI_LENS_HOME = fs.mkdtempSync(
 	path.join(os.tmpdir(), "pi-lens-test-home-"),
 );
+installGitFixtureEnv(process.env.PI_LENS_HOME);
 
 // Hand this worker the suite-wide tool template's probe cache (built once by
 // prewarm-tool-home.ts globalSetup). ensureTool's probe-cache fast path then
@@ -63,4 +66,49 @@ if (toolTemplate) {
 	} catch {
 		// missing template file — worker simply runs cold, as before
 	}
+}
+
+// #2042: per-file peak memory, for the files big enough to matter.
+//
+// Vitest's forks pool with `isolate: true` gives every test FILE its own child
+// process (verified 2026-08-25: 20 files at `maxWorkers: 1` produced 20 distinct
+// pids), so `process.resourceUsage().maxRSS` at the end of a file is that
+// file's own peak, uncontaminated by its neighbours. Measured over all 740
+// files of the default project: p50 93 MB, p90 389 MB, p99 1405 MB, max
+// 2267 MB. The heavy tail is NATIVE memory — tree-sitter wasm grammar compiles
+// and @ast-grep/napi arenas — which no V8 flag bounds and no reporter shows.
+//
+// What this record can and cannot say. It is an `afterAll` hook, so it only
+// fires for a file that FINISHED. The file that was mid-run when the OS killed
+// the job never reports its own peak. What the last lines before a kill name is
+// the completed co-residents -- the memory profile of the phase the run died
+// in, not the culprit. That is still far better than the nothing there was
+// before, but it is circumstantial evidence, not attribution, and the
+// `[mem-watch]` low-water mark is the record that says how close the run
+// actually came.
+//
+// `maxRSS` is kilobytes on every platform: libuv normalizes the Win32 peak
+// working set for `uv_getrusage`, so no per-platform scaling is needed.
+const memReportThresholdMb = Number(
+	process.env.PI_LENS_TEST_MEM_REPORT_MB ?? (process.env.CI ? "512" : "0"),
+);
+if (memReportThresholdMb > 0) {
+	afterAll(() => {
+		const usage = process.memoryUsage();
+		const peakMb = Math.round(process.resourceUsage().maxRSS / 1024);
+		if (peakMb < memReportThresholdMb) return;
+		const file = String(expect.getState().testPath ?? "unknown")
+			.replace(/\\/g, "/")
+			.split("/tests/")
+			.pop();
+		// Straight to the fork's stderr, not `console.log`: vitest intercepts
+		// worker console output and routes it through the reporter, which
+		// attributes it to a task and can drop it entirely for a hook that runs
+		// after the last test (verified 2026-08-25 — the console form printed
+		// nothing). A raw write lands in the job log unconditionally, which is the
+		// whole point of a line whose only reader is a post-mortem.
+		process.stderr.write(
+			`[mem-file] peakRssMb=${peakMb} heapUsedMb=${Math.round(usage.heapUsed / 1048576)} externalMb=${Math.round(usage.external / 1048576)} tests/${file}\n`,
+		);
+	});
 }

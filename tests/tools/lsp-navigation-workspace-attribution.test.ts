@@ -26,7 +26,10 @@ const support = (workspaceSymbol: boolean): LSPOperationSupport => ({
 	documentSymbol: false,
 	workspaceSymbol,
 	codeAction: false,
+	codeActionResolve: false,
 	rename: false,
+	willRenameFiles: false,
+	didRenameFiles: false,
 	implementation: false,
 	callHierarchy: false,
 });

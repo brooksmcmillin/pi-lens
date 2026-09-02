@@ -12,6 +12,7 @@ import {
 	isExternalOrVendorFile,
 	normalizeEphemeralMapKey,
 	normalizeFilePath,
+	normalizeLoggedPath,
 	normalizeMapKey,
 	pathToUri,
 	splitPathSegments,
@@ -219,12 +220,17 @@ describe("normalizeEphemeralMapKey (refs #191)", () => {
 		);
 	});
 
-	it("is case-insensitive on win32 semantics (matches this suite's Windows CI target)", () => {
-		if (process.platform !== "win32") return;
-		expect(normalizeEphemeralMapKey("C:\\Foo\\BAR.TS")).toBe(
-			normalizeEphemeralMapKey("c:\\foo\\bar.ts"),
-		);
-	});
+	// Case folding is a no-op off Windows, so this declares itself skipped there
+	// rather than returning early from a body that would report as PASSED
+	// without asserting anything (#2089).
+	it.skipIf(process.platform !== "win32")(
+		"is case-insensitive on win32 semantics (matches this suite's Windows CI target)",
+		() => {
+			expect(normalizeEphemeralMapKey("C:\\Foo\\BAR.TS")).toBe(
+				normalizeEphemeralMapKey("c:\\foo\\bar.ts"),
+			);
+		},
+	);
 });
 
 describe("walkUpDirs / findNearestContaining (#122)", () => {
@@ -617,5 +623,70 @@ describe("splitPathSegments (refs #1193, #1161/#1163)", () => {
 	it("returns [] for empty or separator-only input", () => {
 		expect(splitPathSegments("")).toEqual([]);
 		expect(splitPathSegments("///")).toEqual([]);
+	});
+});
+
+/**
+ * #2219/#2229 review round 1: `normalizeLoggedPath` guards `normalizeFilePath`
+ * so a logger's `filePath`/`cwd` field can carry non-path sentinels
+ * (cascade-logger.ts's "<quiet-window>", tree-sitter-logger.ts's
+ * "<tree-sitter>", latency-logger.ts's shell commands and "<pi-lens>") without
+ * having them resolved against the process cwd.
+ */
+describe("normalizeLoggedPath (#2219, #2229 review round 1)", () => {
+	// F1 (blocker): the classifier must answer the same way for a given
+	// STRING regardless of which OS is asking. `isFullyQualified` alone
+	// dispatches on `process.platform`, so on Linux CI a Windows-shaped
+	// absolute path (`C:\Users\...`) reads as NOT fully qualified
+	// (isFullyQualifiedPosix rejects it) and passes through raw — silently
+	// no-opping the #2141 fix for every Windows-authored path in CI. Checking
+	// BOTH `isFullyQualifiedWin32` and `isFullyQualifiedPosix` fixes that.
+	it("normalizes a Windows-shaped absolute path independent of the host platform", () => {
+		const raw = String.raw`C:\Users\dev\pi-free\src\a.ts`;
+		expect(normalizeLoggedPath(raw)).toBe(normalizeFilePath(raw));
+		// Never the raw, un-normalized backslash form — this is the exact
+		// shape CI caught: isFullyQualified(raw) is false on a POSIX host,
+		// which made the pre-fix guard a no-op there.
+		expect(normalizeLoggedPath(raw)).not.toBe(raw);
+	});
+
+	it("normalizes a POSIX-shaped absolute path independent of the host platform", () => {
+		const raw = "/workspace/src/a.ts";
+		expect(normalizeLoggedPath(raw)).toBe(normalizeFilePath(raw));
+	});
+
+	it.each([
+		"<quiet-window>",
+		"<tree-sitter>",
+		"<pi-lens>",
+		"",
+		"git",
+		"npm run build",
+		"relative/a.ts",
+	])("passes the non-path value %j through unchanged", (value) => {
+		expect(normalizeLoggedPath(value)).toBe(value);
+	});
+
+	// F2 (documented, not fixed): a command string that HAPPENS to start with
+	// a drive-letter root is indistinguishable from a genuine absolute path by
+	// this classifier, so it IS normalized — including the trailing
+	// arguments, which get their backslashes flipped as collateral. No live
+	// caller passes a command with arguments through this field today
+	// (verified by reading every `normalizeLoggedPath`/`logLatency`
+	// `filePath` call site); this pins the current, accepted behavior so a
+	// future caller doing so is a visible test change, not a silent
+	// surprise.
+	//
+	// #2229 review round 3, R2-F1: the expected value must be DERIVED via
+	// normalizeFilePath, not a hardcoded literal — normalizeFilePath's
+	// last-resort branch (path-utils.ts's win32 no-existing-ancestor case)
+	// lowercases the whole string when no `C:\` ancestor exists on the host
+	// filesystem, which is true on Linux CI but not on a Windows dev box with
+	// a real C: drive. A hardcoded "C:/tools/..." literal passes on Windows
+	// and fails on Linux with "c:/tools/..." (AGENTS.md shape 7, the
+	// #1139/#1150 drive-letter-case class).
+	it("pins current behavior for a drive-rooted command WITH arguments (no live caller does this)", () => {
+		const withArgs = String.raw`C:\tools\rg.exe --files`;
+		expect(normalizeLoggedPath(withArgs)).toBe(normalizeFilePath(withArgs));
 	});
 });

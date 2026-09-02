@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+	hostEventShapeScanFileCount,
 	scanHostEventShapeViolations,
 	scanSourceForHostEventShapeViolations,
 } from "./host-event-shape-scan.ts";
+import { assertNonEmptyScan } from "./sweep-kit.js";
 
 /**
  * #1681: pins every `session_start`/`tool_result` test fixture to the real
@@ -14,6 +16,12 @@ import {
  */
 describe("host event-shape scan (#1681)", () => {
 	it("finds no fixture that puts sessionId/provider/model on a session_start or tool_result event", () => {
+		assertNonEmptyScan(
+			"host event-shape production walk",
+			hostEventShapeScanFileCount(),
+			// Calibration: 830 files walked on 2026-08-26; half rounds to 400.
+			400,
+		);
 		const violations = scanHostEventShapeViolations();
 		expect(violations, JSON.stringify(violations, null, 2)).toEqual([]);
 	});

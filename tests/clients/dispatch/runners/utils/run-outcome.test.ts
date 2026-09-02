@@ -4,8 +4,15 @@ import {
 	firstOutputLine,
 	spawnFailedWithNoOutput,
 } from "../../../../../clients/dispatch/runners/utils/spawn-outcome.js";
-import { formatToolFailure } from "../../../../../clients/dispatch/runners/utils/tool-failure.js";
+import {
+	formatRunOutcomeFailure,
+	formatToolFailure,
+} from "../../../../../clients/dispatch/runners/utils/tool-failure.js";
 import type { SpawnResult } from "../../../../../clients/safe-spawn.js";
+import {
+	capKilledSpawnResult,
+	capThenTimedOutSpawnResult,
+} from "../../../../support/spawn-shapes.js";
 
 function spawnResult(partial: Partial<SpawnResult>): SpawnResult {
 	return { stdout: "", stderr: "", status: 0, ...partial };
@@ -201,5 +208,54 @@ describe("formatToolFailure", () => {
 		expect(
 			formatToolFailure({ tool: "taplo", status: 1, stdout: "usage: taplo" }),
 		).toBe("taplo exited 1 with no output: usage: taplo");
+	});
+
+	// #2100 review F3: an output-cap kill reaches this seam as a plain SIGTERM,
+	// so the ledger row read "killed by SIGTERM" — the tool blamed for a kill we
+	// sent because WE stopped reading. The cap is the stronger explanation and
+	// displaces the signal, exactly as the signal displaces a null exit status.
+	it("names the output cap instead of the signal it killed with", () => {
+		expect(
+			formatToolFailure({
+				tool: "oxlint",
+				status: null,
+				signal: "SIGTERM",
+				outputCapped: true,
+				stderr: "",
+			}),
+		).toBe("oxlint was stopped at its output cap with no output: no stderr");
+	});
+});
+
+describe("classifyRunOutcome output-cap evidence (#2100)", () => {
+	it("carries the cap verdict without moving the classification", () => {
+		const capped = classifyRunOutcome({
+			result: capKilledSpawnResult({ stdout: "partial" }),
+		});
+		expect(capped.kind).toBe("did-not-run");
+		expect(capped.outputCapped).toBe(true);
+
+		// A timeout that also truncated is a timeout, not a cap kill.
+		const timedOut = classifyRunOutcome({
+			result: capThenTimedOutSpawnResult({ stdout: "partial" }),
+		});
+		expect(timedOut.kind).toBe("did-not-run");
+		expect(timedOut.outputCapped).toBe(false);
+
+		// And an ordinary run is untouched.
+		const ran = classifyRunOutcome({
+			result: { stdout: "findings", stderr: "", status: 0 },
+		});
+		expect(ran.kind).toBe("ran");
+		expect(ran.outputCapped).toBe(false);
+	});
+
+	it("routes the cap wording all the way into the ledger reason", () => {
+		const outcome = classifyRunOutcome({
+			result: capKilledSpawnResult({ stdout: "partial" }),
+		});
+		expect(formatRunOutcomeFailure("oxlint", outcome)).toContain(
+			"was stopped at its output cap",
+		);
 	});
 });

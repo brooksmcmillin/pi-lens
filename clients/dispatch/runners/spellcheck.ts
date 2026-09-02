@@ -103,7 +103,6 @@ const spellcheckRunner: RunnerDefinition = {
 	id: "spellcheck",
 	appliesTo: ["markdown"],
 	priority: PRIORITY.DOC_QUALITY,
-	enabledByDefault: true,
 	skipTestFiles: false, // Check docs in test files too
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {

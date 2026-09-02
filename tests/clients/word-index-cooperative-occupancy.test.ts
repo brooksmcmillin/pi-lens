@@ -6,6 +6,7 @@ import {
 	serializeWordIndex,
 	updateWordIndexDocument,
 	updateWordIndexDocumentAsync,
+	wordIndexPostingHits,
 } from "../../clients/word-index.js";
 import { measureMaxSyncBlockMs } from "../support/perf-harness.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
@@ -121,4 +122,40 @@ describe("cooperative word-index refresh occupancy (#1215/#1224/#1225)", () => {
 			searchWordIndex(index, "novel").some((hit) => hit.file === path),
 		).toBe(true);
 	});
+
+	it(
+		"serializes concurrent async replacements and preserves postings/forward consistency",
+		{ timeout: 30_000 },
+		async () => {
+			const docs = Object.assign(
+				Array.from({ length: 300 }, (_, file) => ({
+					path: `src/f${file}.ts`,
+					content: sharedBody(file, "original", 20),
+				})),
+				{ truncated: false },
+			);
+			const index = buildWordIndex(docs);
+			const expected = buildWordIndex(docs);
+			const updates = [0, 1].map((file) => ({
+				path: docs[file].path,
+				content: sharedBody(file, "updated", 20),
+			}));
+			for (const update of updates) updateWordIndexDocument(expected, update);
+
+			await Promise.all(
+				updates.map((update) => updateWordIndexDocumentAsync(index, update)),
+			);
+
+			expect(serializeWordIndex(index)).toEqual(serializeWordIndex(expected));
+			for (const [file, tokenCounts] of index.forward!) {
+				for (const [token, count] of tokenCounts) {
+					expect(
+						wordIndexPostingHits(index, token).filter(
+							(hit) => hit.file === file,
+						),
+					).toHaveLength(count);
+				}
+			}
+		},
+	);
 });

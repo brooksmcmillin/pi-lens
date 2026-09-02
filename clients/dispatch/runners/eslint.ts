@@ -39,7 +39,11 @@ function makeEslintProbe(cmd: string) {
 				timeout: ESLINT_PROBE_BUDGET_MS,
 				cwd,
 			}),
-		{ tool: "eslint", budgetMs: ESLINT_PROBE_BUDGET_MS },
+		{
+			tool: "eslint",
+			budgetMs: ESLINT_PROBE_BUDGET_MS,
+			flightKeyComponent: cmd,
+		},
 	);
 }
 const eslintAvailabilityByCmd = new Map<
@@ -114,7 +118,6 @@ const eslintRunner: RunnerDefinition = {
 	id: "eslint",
 	appliesTo: ["jsts"],
 	priority: PRIORITY.LINT_SECONDARY,
-	enabledByDefault: true,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
 		const cwd = ctx.cwd || process.cwd();

@@ -128,6 +128,33 @@ describe("runWorkspaceDiagnostics warm attach sweeps (#822)", () => {
 		).toBeUndefined();
 	});
 
+	// #2300 C1 (verify round): `runWorkspaceDiagnostics`'s own `record` call
+	// (`clients/lsp/index.ts`) wires `scannedSizeByFile.get(result.filePath)`
+	// as the `sizeBytes` argument. A unit test against the cache primitive
+	// alone (`workspace-diagnostics-cache.test.ts`) cannot see this wiring —
+	// it calls `ctx.record` directly with a hand-supplied size, so neutering
+	// the PRODUCTION argument to `undefined` would leave that test green.
+	// This drives the real sweep end to end and reads the persisted entry
+	// back through the cache's own load API.
+	it("persists the swept file's real byte size into the cache entry (#2300)", async () => {
+		fs.mkdirSync(path.join(tmp, ".pi-lens"));
+		const file = path.join(tmp, "a.ts");
+		fs.writeFileSync(file, "const x = 1;\n");
+		tryWarmAttachedDiagnostics.mockResolvedValue({
+			available: true,
+			response: { diagnostics: [] },
+		});
+
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		await new LSPService().runWorkspaceDiagnostics(tmp, { files: [file] });
+
+		const { cacheKeyFor, loadWorkspaceDiagnosticsCache } =
+			await import("../../../clients/lsp/workspace-diagnostics-cache.js");
+		const entry =
+			loadWorkspaceDiagnosticsCache(tmp)?.entries[cacheKeyFor(file)];
+		expect(entry?.sizeBytes).toBe(fs.statSync(file).size);
+	});
+
 	it("promotes after an IPC failure and completes that file and the remainder locally", async () => {
 		const files = ["a.ts", "b.ts", "c.ts"].map((name) => path.join(tmp, name));
 		for (const file of files) fs.writeFileSync(file, "const x = 1;\n");

@@ -12,10 +12,16 @@ import { removeTempDirSync } from "../test-utils.js";
 const { launchLSP } = vi.hoisted(() => ({ launchLSP: vi.fn() }));
 const { logLatency } = vi.hoisted(() => ({ logLatency: vi.fn() }));
 vi.mock("../../../clients/lsp/launch.js", () => ({ launchLSP }));
-vi.mock("../../../clients/latency-logger.js", () => ({ logLatency }));
+vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
+	...(await importActual<
+		typeof import("../../../clients/latency-logger.js")
+	>()),
+	logLatency,
+}));
 vi.mock("../../../clients/installer/index.js", () => ({
 	ensureTool: vi.fn(async () => null),
 	getToolEnvironment: () => ({}),
+	findManagedToolBinary: vi.fn(async () => undefined),
 }));
 
 import {

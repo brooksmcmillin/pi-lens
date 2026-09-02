@@ -14,6 +14,7 @@ process.env.PI_LENS_TEST_MODE = "1";
 vi.mock("../../clients/installer/index.js", () => ({
 	ensureTool: vi.fn(),
 	getToolEnvironment: vi.fn(async () => ({})),
+	findManagedToolBinary: vi.fn(async () => undefined),
 }));
 
 vi.mock("../../clients/lsp/launch.js", () => ({

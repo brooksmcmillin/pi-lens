@@ -7,6 +7,15 @@ import {
 	getSinkWriteFailures,
 	resetSinkWriteFailures,
 } from "./ndjson-logger.js";
+// #2146: pulled at READ time, never pushed. `process-singletons.ts` is a
+// dependency leaf on purpose — it cannot import this module without closing a
+// no-client-cycles cycle through instance-registry/instance-reaper — so the
+// ledger reaches IN for its reset log, the same inversion `getSinkWriteFailures`
+// above uses.
+import {
+	getProcessSingletonResets,
+	PROCESS_SINGLETON_RESET_KIND,
+} from "./process-singletons.js";
 
 // Re-exported so existing importers keep one name for the ledger's bound.
 export { LEDGER_FIELD_MAX, truncateForLedger };
@@ -16,6 +25,10 @@ export type DegradationKind =
 	| "mode-suppression"
 	| "ts-idle-eviction"
 	| "spawn-failure"
+	/** A managed-tool verification probe exceeded its retained output bound. */
+	| "installer-verification-output-truncated"
+	/** A git ls-files collection was truncated before parsing completed (#2075). */
+	| "git-tracked-ignore-truncated"
 	| "formatter-skip"
 	| "grammar-blocked"
 	| "lsp-breaker"
@@ -44,6 +57,15 @@ export type DegradationKind =
 	 * cannot carry, since the warm-only callers never reach selection.
 	 */
 	| "lsp-warm-client-missing"
+	| "lsp-capability-skip"
+	/**
+	 * #2007: a worktree-mutating git command was declined because a live peer
+	 * session shares this dirty checkout. The subject is the checkout root, so
+	 * the ledger says WHICH shared directory is contended.
+	 */
+	| "shared-checkout-wip"
+	/** #2007: `git status` could not answer for that same decision. */
+	| "shared-checkout-probe"
 	/**
 	 * The blind review-graph read (`getCachedReviewGraph`) either DROPPED a
 	 * persisted snapshot because its git stamp names a different worktree, or
@@ -64,15 +86,54 @@ export type DegradationKind =
 	 * is the exact number of detections this session.
 	 */
 	| "snapshot-integrity"
+	/**
+	 * Failed-first test state was retired only after ENOENT/ENOTDIR evidence,
+	 * retained when the filesystem probe was indeterminate, or evicted at the
+	 * state cap (#2044). Subject is outcome + runner + bounded path, so repeated
+	 * checks stay attributable.
+	 */
+	| "test-runner-failed-target-state"
+	/** Automatic test-result delivery could not reach the host entry surface. */
+	| "test-runner-delivery"
 	| "formatter-failure"
+	/**
+	 * A selected formatter's executable was proven absent (#2413): its
+	 * `resolveCommand` probed every install location and PATH and found nothing,
+	 * or the static fallback spawn returned a typed `tool-not-found`. Distinct
+	 * from `formatter-failure` (a tool that ran and failed) precisely so durable
+	 * unavailability is never counted, requeued, or surfaced as a code error.
+	 * Subject is `<formatter>:<basename>`.
+	 */
+	| "formatter-unavailable"
 	| "wasm-abort"
 	| "lsp-diagnostics-timeout"
 	| "lsp-scanner-coverage-gap"
 	| "lsp-notify-inflight-stall"
+	/** A busy notify-stall discriminator was deferred; detail is rising-edge bounded. */
+	| "lsp-notify-stall-cpu-busy"
+	/** A didChange content mirror was recorded behind a newer document version. */
+	| "lsp-document-send-order"
 	| "bus-stale"
 	| "query-predicates-invalid"
 	| "install-retry-exhausted"
 	| "ast-grep-napi-unavailable"
+	/**
+	 * The napi fallback ADMITTED a file — its extension is in the in-process
+	 * language matrix (`clients/dispatch/runners/ast-grep-napi.ts`) — and the
+	 * addon that actually loaded then exposed no grammar for it, so every rule
+	 * for that language is skipped in-process for the rest of the session
+	 * (#2215). Before this kind that skip was the invisible half of the defect:
+	 * `getLang` returned undefined and each caller read it as an ordinary
+	 * "nothing to do", the AGENTS.md shape-10 clean-versus-unavailable
+	 * collapse. Unreachable while the matrix and the addon agree (the coverage
+	 * test pins that), so a record here means a napi upgrade dropped a grammar
+	 * or the matrix claims one the package never shipped. Subject is the rule
+	 * language rather than the file, because the gap is per-language: recorded
+	 * once, not once per file.
+	 */
+	| "ast-grep-napi-language-unavailable"
+	/** An availability probe exceeded its advertised wall-clock budget (#2131). */
+	| "availability-probe-overrun"
 	/**
 	 * `loadWebTreeSitter()` (clients/deps/web-tree-sitter.js) rejected during
 	 * MODULE EVALUATION, not resolution (#1592). Node's ESM loader permanently
@@ -99,6 +160,19 @@ export type DegradationKind =
 	 * `clients/session-event-guard.ts` is the only writer.
 	 */
 	| "extension-ctx-stale"
+	/**
+	 * A `message_end` event reached its handler on a ctx the SDK had already
+	 * invalidated, so the `cache_usage` row wrote with an UNATTRIBUTED stable
+	 * session id (#1956). Distinct from `extension-ctx-stale` on purpose: that
+	 * kind means the handler was SKIPPED, while here the row KEEPS WRITING —
+	 * the `message` payload is valid provider token/cost data, and dropping it
+	 * would lose real usage numbers. Only the attribution degraded. Subject is
+	 * the event name (`message_end`), so aggregation still answers WHICH
+	 * handler keeps losing its id after the record count stops. Written only on
+	 * a CONFIRMED stale probe; a live ctx that merely lacks a session id
+	 * (older host, unexpected shape) never reaches this kind.
+	 */
+	| "cache-usage-attribution-stale"
 	/**
 	 * A tool-event path did not resolve to an existing file, and pi's own
 	 * unicode/spacing variant ladder did not find it either (#1655 item 5).
@@ -248,6 +322,12 @@ export type DegradationKind =
 	 * file clean, or did the parser fail to read it?".
 	 */
 	| "runner-parsed-nothing"
+	/** A runner exceeded the observed inline budget and moved to collect-later. */
+	| "runner-collect-later"
+	/** A pending runner entry was evicted at the bounded handoff cap (#2122). */
+	| "runner-findings-evicted"
+	/** A completed runner answer was stale and dropped instead of being replayed. */
+	| "runner-findings-stale"
 	/** A process-table resource sample failed or timed out; it is unknown. */
 	| "resource-sampler-query-failed"
 	/**
@@ -329,6 +409,24 @@ export type DegradationKind =
 	 */
 	| "read-guard-record-cap-trim"
 	/**
+	 * `read-guard.ts`'s whole-file evictor (`evictFile`) dropped a file's
+	 * tracked read/edit state (#1918, the #1913 class sibling). Fires from
+	 * three call sites — the consumed-file cap, the unconsumed-file cap, and
+	 * the idle-eviction timer — the `reason` text in the matching
+	 * `read_file_evicted` read-guard.log line says which. Rising edge gates
+	 * that log line per file per session, same as `read-guard-record-cap-trim`.
+	 */
+	| "read-guard-file-evicted"
+	/**
+	 * `read-guard.ts`'s per-file edits-cap splice (`READ_GUARD_MAX_EDITS_PER_FILE`)
+	 * trimmed a file's edit history (#1918). The in-repo doc comment on that
+	 * cap argues the trim is inert in practice, but this kind gives it a
+	 * record instead of resting only on that argument. Rising edge gates the
+	 * matching `edits_cap_trimmed` read-guard.log line, same shape as
+	 * `read-guard-record-cap-trim`.
+	 */
+	| "read-guard-edits-cap-trim"
+	/**
 	 * A demoted finding was RETIRED from a delivery store instead of being
 	 * re-served (#1944). Raised when the cited file shrank past the
 	 * coordinates the finding is pinned to, so no re-run can ever confirm it.
@@ -356,12 +454,104 @@ export type DegradationKind =
 	 * the recursion this design avoids — see `ndjson-logger.ts`'s
 	 * `writeFailures` doc comment.
 	 */
-	| "log-sink-write-failure";
+	| "log-sink-write-failure"
+	/**
+	 * A word-index posting named a file id the file table could not resolve to
+	 * a path, so the posting was dropped from a search result or a decoded hit
+	 * list (#2069). Since #2069 a posting carries an integer id rather than a
+	 * shared string, and an id is only released once the forward index has
+	 * enumerated and removed every posting naming it — so this is unreachable
+	 * by construction and means that invariant broke. Without this kind the
+	 * drop is invisible: the query returns a SHORTER result list and nothing
+	 * distinguishes it from a genuinely smaller match set (AGENTS.md shape 10,
+	 * an empty or reduced result that cannot tell clean from errored). Subject
+	 * is the orphaned id, so aggregation still answers WHICH id leaked after
+	 * the per-kind entry bound is reached.
+	 */
+	| "word-index-orphan-file-id"
+	/** Incremental word-index churn required an arena re-compaction. */
+	| "word-index-arena-recompact"
+	/**
+	 * The dispatch `FactStore` (`clients/dispatch/fact-store.ts`) evicted a
+	 * least-recently-used file fact because the record count passed its cap
+	 * (#2243 item 4). The eviction is otherwise silent, yet a fact a live
+	 * dispatch still needs can be the victim — `dispatcher.ts` reads
+	 * `file.content` back with `?? ""`, so an evicted content fact turns into
+	 * empty content and inline suppressions stop applying. Recorded once per
+	 * session, stamped with the first evicted path, so the drop is visible in
+	 * the ledger rather than inferred from a downstream symptom. Subject
+	 * carries `<store>:<axis>` (#2247 review F1) so a count-axis and a
+	 * byte-axis eviction on the SAME store each get their own once-per-session
+	 * record instead of one collapsing into the other.
+	 */
+	| "fact-store-capacity-eviction"
+	/**
+	 * The dispatch `FactStore`'s pinned content bytes alone exceed the
+	 * 64 MiB retained-content budget (#2247 review F2). A pin exempts an
+	 * in-flight dispatch's file from eviction, so a leaked pin on a large
+	 * file — or several overlapping ones — can put pinned bytes over budget
+	 * on their own; evicting the remaining unpinned records can never bring
+	 * total bytes back under budget in that state, so `FactStore` stops
+	 * evicting and admits unpinned inserts without eviction until a pin
+	 * releases. Without this kind that admission-without-enforcement state
+	 * is invisible: the store just silently stops honoring its budget.
+	 * Recorded once per session, subject is the store label.
+	 */
+	| "fact-store-pinned-over-budget"
+	/**
+	 * Gate B (`clients/dispatch/runners/ast-grep-napi.ts`) skipped the napi
+	 * fallback because the ast-grep LSP client has published for this file
+	 * BEFORE, and a pending late-auxiliary pair for the same (file, "ast-grep")
+	 * still sits in `clients/lsp/pending-aux-coverage.ts` (#2324 F2). Ordering
+	 * makes this pair provably a LEFTOVER from an earlier touch, never this
+	 * one: the aux-grace wait that marks a pair for THIS touch only runs to
+	 * completion, and only decides to mark, after napi's Gate B check has
+	 * already returned (napi's check is a synchronous map lookup; the wait's
+	 * own budget is up to ~1800 ms) — so a pair visible here was marked by a
+	 * PRIOR touch's wait and never got delivered. Subject is the server id, so
+	 * the ledger still answers which server's earlier finding never resurfaced
+	 * after the count-bound stops naming files.
+	 */
+	| "aux-runner-findings-lost"
+	/**
+	 * The napi HTML embedded-`<script>` evaluation (#2347) hit its evaluation
+	 * budget (body-count and/or cumulative body-bytes cap) and dropped the
+	 * remainder without parsing them. Subject is the file path, so the ledger
+	 * says WHICH generated/pathological page keeps losing embedded coverage.
+	 * Counted per file: the exact dropped total matters more than one retained
+	 * reason, and the recorded counts (`scriptElementCount`, `bodiesEvaluated`,
+	 * `truncatedBodies`) make the truncation reconstructable.
+	 */
+	| "ast-grep-napi-html-script-budget"
+	/**
+	 * A `<script>` body of an HTML file the napi runner was evaluating (#2347)
+	 * refused to parse as JavaScript, so that body contributed no embedded
+	 * findings. Subject is the file path; counted so the totals survive the
+	 * ledger's retained-entry window. A parse refusal on a whole file degrades
+	 * that file to "no embedded coverage" like an unparseable `.js` file and is
+	 * recorded as such, never as a clean empty result.
+	 */
+	| "ast-grep-napi-html-script-parse-failed"
+	/**
+	 * The loaded addon exposed no `js` grammar while an HTML file's embedded
+	 * `language: JavaScript` evaluation asked for one (#2347). The embedded
+	 * coverage degrades to nothing for the whole file, silently prior to this
+	 * kind. Once per file per session; subject is the file path.
+	 */
+	| "ast-grep-napi-html-js-grammar-missing"
+	/**
+	 * The `script_element` scan of an HTML root threw while napi prepared the
+	 * embedded-`<script>` evaluation (#2347). The embedded coverage degrades to
+	 * nothing for the file, silently prior to this kind. Once per file per
+	 * session; subject is the file path.
+	 */
+	| "ast-grep-napi-html-script-scan-failed";
 
 export interface DegradationRecord {
 	kind: unknown;
 	subject: unknown;
 	reason: unknown;
+	metadata?: Record<string, unknown>;
 }
 
 export interface DegradationGroup {
@@ -430,7 +620,7 @@ export function recordDegradationOnce(record: DegradationRecord): void {
 		if (onceKeys.has(key)) return;
 		onceKeys.add(key);
 		if (recordDegradation({ kind, subject, reason: record.reason })) {
-			logDurableDegradation(kind, subject, 1);
+			logDurableDegradation(kind, subject, 1, record.metadata);
 		}
 	} catch (error) {
 		debugLedgerFailure("record-once", error);
@@ -479,7 +669,7 @@ export function incrementDegradationCount(record: DegradationRecord): boolean {
 		// Durable rows use the summary's admission and emit the first event and
 		// power-of-two milestones only, keeping the sink bounded.
 		if (admitted && isPowerOfTwo(count)) {
-			logDurableDegradation(kind, subject, count);
+			logDurableDegradation(kind, subject, count, record.metadata);
 		}
 		return count === 1;
 	} catch (error) {
@@ -499,14 +689,38 @@ function logDurableDegradation(
 	kind: string,
 	subject: string,
 	count: number,
+	metadata?: Record<string, unknown>,
 ): void {
+	const boundedMetadata = boundLedgerMetadata(metadata);
 	logLatency({
 		type: "phase",
 		phase: "degradation_ledger",
 		filePath: subject,
 		durationMs: 0,
-		metadata: { kind, subject, count, ledgerGeneration },
+		metadata: {
+			...boundedMetadata,
+			kind,
+			subject,
+			count,
+			ledgerGeneration,
+		},
 	});
+}
+
+const MAX_METADATA_KEYS = 8;
+
+function boundLedgerMetadata(
+	metadata: Record<string, unknown> | undefined,
+): Record<string, string | number> {
+	if (!metadata) return {};
+	const entries = Object.entries(metadata);
+	const kept = entries.slice(0, MAX_METADATA_KEYS);
+	const bounded = Object.fromEntries(
+		kept.map(([key, value]) => [key, truncateForLedger(value)]),
+	) as Record<string, string | number>;
+	const dropped = entries.length - kept.length;
+	if (dropped > 0) bounded.metadataDropped = dropped;
+	return bounded;
 }
 
 function isPowerOfTwo(value: number): boolean {
@@ -541,6 +755,21 @@ export function getDegradationSummary(): DegradationGroup[] {
 				reason: truncateForLedger(
 					`${sink.droppedCount} dropped write(s) after reopen-retry failed`,
 				),
+			})),
+		});
+	}
+	// #2146, same read-time fold: process-singleton resets live in the leaf
+	// module's own bounded log. One entry per family, so this group's count is
+	// the number of families this build could not adopt, never an event tally.
+	const singletonResets = getProcessSingletonResets();
+	if (singletonResets.length > 0) {
+		summary.push({
+			kind: PROCESS_SINGLETON_RESET_KIND,
+			count: singletonResets.length,
+			droppedCount: 0,
+			latestReasons: singletonResets.map((reset) => ({
+				subject: truncateForLedger(reset.family),
+				reason: truncateForLedger(reset.reason),
 			})),
 		});
 	}
@@ -603,6 +832,18 @@ export function resetDegradationLedger(): void {
 	// process-lifetime latch too — it re-arms alongside the rest of the
 	// ledger rather than surviving past the session that observed it.
 	resetSinkWriteFailures();
+	// #2146 review F3: the OTHER pulled source, `getProcessSingletonResets()`,
+	// deliberately does NOT re-arm here, and the difference from its neighbour
+	// above is the point. A sink write failure recurs — new writes fail, so
+	// clearing the tally costs nothing and a later session re-observes the
+	// problem. A process-singleton reset happens once, at module-evaluation
+	// time, and cannot recur: after it, the container holds only compatible
+	// cells. Clearing it would show the fact in the first session's
+	// `pilens_health` and hide it from every session after, which is exactly
+	// when someone reads that line. The row is bounded independently of the
+	// session (one entry per family, capped at 16), so leaving it costs a fixed
+	// handful of lines and keeps a process-scope fact visible for the process's
+	// life. Deliberate exception to catalog shape 17, not an oversight.
 }
 
 export const DEGRADATION_ENTRIES_PER_KIND = ENTRIES_PER_KIND;

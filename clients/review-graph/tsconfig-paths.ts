@@ -5,6 +5,7 @@ import * as path from "node:path";
 import {
 	findGoverningTsconfigDir,
 	getDirectoryMarkers,
+	registerWorkspaceTopologyReset,
 } from "../workspace-topology.js";
 
 export interface TsconfigPathMatcher {
@@ -35,6 +36,10 @@ interface ParsedConfig {
 
 const cache = new BoundedLruCache<string, TsconfigPathMatcher[]>(64);
 const referencesCache = new BoundedLruCache<string, Map<string, string>>(64);
+registerWorkspaceTopologyReset(() => {
+	cache.clear();
+	referencesCache.clear();
+});
 
 /** Strip JSONC comments and trailing commas without touching string contents. */
 function parseJsonc(content: string): TsconfigJson {

@@ -35,12 +35,19 @@ test-lsp-files/
 test-filetime/
 test-projects/
 # scripts/ intentionally tracked
-test-*.ts
-test-*.js
-test-*.py
-test-*.md
-test-*.sh
-test-*.mjs
+# Anchored to repo root (#2250): unanchored, these matched the basename of
+# any tracked test file anywhere in the tree (tests/clients/test-*.test.ts,
+# clients/test-runner-client.ts, .changelog/test-*.md), silently hiding
+# them from ignore-respecting search tools (rg, grep --exclude-from) even
+# though `git status`/`git check-ignore` show nothing wrong for a tracked
+# path. These rules only ever meant to catch ad hoc scratch files dropped
+# at the repo root.
+/test-*.ts
+/test-*.js
+/test-*.py
+/test-*.md
+/test-*.sh
+/test-*.mjs
 
 # Debug/dev scripts
 debug-*.js
@@ -55,12 +62,18 @@ migrate-*.js
 !tests/fixtures/changelog-entries/*.md
 !.changelog/*.md
 !AGENTS.md
+!HISTORY.md
 !README.md
 !CHANGELOG.md
 !CODE_OF_CONDUCT.md
 !CONTRIBUTING.md
 !LICENSE
 !SECURITY.md
+!docs/pi-lens-subagent.md
+!docs/pi-lens-fixer.md
+!docs/pi-lens-reviewer.md
+!docs/pi-lens-investigator.md
+!docs/pi-lens-warden.md
 !docs/audit1.md
 !docs/agent-guide.md
 !docs/agent-tools.md
@@ -86,6 +99,9 @@ migrate-*.js
 !docs/dispositions.md
 !docs/word-index.md
 !docs/durable-store-audit-1202.md
+!docs/analysisall.md
+!docs/api-ports-inventory.md
+!docs/astplayground.md
 !skills/**/*.md
 !.github/PULL_REQUEST_TEMPLATE.md
 
@@ -118,10 +134,14 @@ BUG_*.md
 # Autofix-smoke fixtures (#209 --autofix layer) — files with a safely-autofixable
 # lint violation; the pipeline's safe-autofix phase must fix them.
 !tests/fixtures/autofix-smoke/**
+# call-graph / function-facts fixtures — small real-language snippets several
+# call-graph and function-fact test suites parse for structural facts; tracked
+# but shadowed by the global *.js ignore above (#2250 sweep).
+!tests/fixtures/call-graph/**
+!tests/fixtures/function-facts/**
 
 clients/dispatch/debug.log
 clients/lsp/.intelephense/
-AGENTS.md
 .npmignore
 .claude/
 !.claude/

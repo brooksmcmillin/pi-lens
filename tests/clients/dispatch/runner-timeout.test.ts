@@ -56,7 +56,6 @@ describe("runRunner timeout behavior", () => {
 			id: "slow-tool",
 			appliesTo: ["jsts"],
 			priority: 10,
-			enabledByDefault: true,
 			timeoutMs: 30,
 			async run(): Promise<RunnerResult> {
 				return new Promise(() => {});
@@ -78,7 +77,6 @@ describe("runRunner timeout behavior", () => {
 			id: "fast-tool",
 			appliesTo: ["jsts"],
 			priority: 10,
-			enabledByDefault: true,
 			timeoutMs: 5_000,
 			async run(): Promise<RunnerResult> {
 				return {
@@ -112,7 +110,6 @@ describe("runRunner timeout behavior", () => {
 			id: "exploding",
 			appliesTo: ["jsts"],
 			priority: 10,
-			enabledByDefault: true,
 			timeoutMs: 5_000,
 			async run(): Promise<RunnerResult> {
 				throw new Error("runner blew up");
@@ -134,7 +131,6 @@ describe("runRunner timeout behavior", () => {
 			id: "slow-a",
 			appliesTo: ["jsts"],
 			priority: 10,
-			enabledByDefault: true,
 			timeoutMs: 30,
 			async run(): Promise<RunnerResult> {
 				return new Promise(() => {});
@@ -146,7 +142,6 @@ describe("runRunner timeout behavior", () => {
 			id: "fast-b",
 			appliesTo: ["jsts"],
 			priority: 11,
-			enabledByDefault: true,
 			timeoutMs: 5_000,
 			async run(): Promise<RunnerResult> {
 				return {
@@ -213,7 +208,6 @@ describe("runRunner in-flight phase attribution (#1723)", () => {
 			id: "astgrep-scan",
 			appliesTo: ["jsts"],
 			priority: 10,
-			enabledByDefault: true,
 			async run(): Promise<RunnerResult> {
 				// Read the slot mid-flight — this is the synthetic stand-in for a
 				// loop_block sample landing while the runner is still running.
@@ -233,7 +227,6 @@ describe("runRunner in-flight phase attribution (#1723)", () => {
 			id: "fast-tool",
 			appliesTo: ["jsts"],
 			priority: 10,
-			enabledByDefault: true,
 			async run(): Promise<RunnerResult> {
 				return { status: "succeeded", diagnostics: [], semantic: "warning" };
 			},
@@ -253,7 +246,6 @@ describe("runRunner in-flight phase attribution (#1723)", () => {
 			id: "exploding",
 			appliesTo: ["jsts"],
 			priority: 10,
-			enabledByDefault: true,
 			timeoutMs: 5_000,
 			async run(): Promise<RunnerResult> {
 				throw new Error("runner blew up");
@@ -271,7 +263,6 @@ describe("runRunner in-flight phase attribution (#1723)", () => {
 			id: "slow-tool",
 			appliesTo: ["jsts"],
 			priority: 10,
-			enabledByDefault: true,
 			timeoutMs: 30,
 			async run(): Promise<RunnerResult> {
 				return new Promise(() => {});
@@ -339,7 +330,6 @@ describe("runRunner in-flight phase attribution against real parallel groups (#1
 			id: "cpu-hog",
 			appliesTo: ["jsts"],
 			priority: 10,
-			enabledByDefault: true,
 			timeoutMs: 5_000,
 			async run(): Promise<RunnerResult> {
 				return hogPromise;
@@ -349,7 +339,6 @@ describe("runRunner in-flight phase attribution against real parallel groups (#1
 			id: "idle",
 			appliesTo: ["jsts"],
 			priority: 11,
-			enabledByDefault: true,
 			async run(): Promise<RunnerResult> {
 				return { status: "succeeded", diagnostics: [], semantic: "warning" };
 			},
@@ -414,7 +403,6 @@ describe("runRunner in-flight phase attribution against real parallel groups (#1
 			id: "cpu-hog",
 			appliesTo: ["jsts"],
 			priority: 10,
-			enabledByDefault: true,
 			timeoutMs: 5_000,
 			async run(): Promise<RunnerResult> {
 				return hogPromise;
@@ -424,7 +412,6 @@ describe("runRunner in-flight phase attribution against real parallel groups (#1
 			id: "idle",
 			appliesTo: ["jsts"],
 			priority: 11,
-			enabledByDefault: true,
 			async run(): Promise<RunnerResult> {
 				return { status: "succeeded", diagnostics: [], semantic: "warning" };
 			},
@@ -477,7 +464,6 @@ describe("runRunner in-flight phase attribution against real parallel groups (#1
 			id: "innocent-parked-runner",
 			appliesTo: ["jsts"],
 			priority: 10,
-			enabledByDefault: true,
 			timeoutMs: 5_000,
 			async run(): Promise<RunnerResult> {
 				return innocentPromise;
@@ -492,7 +478,6 @@ describe("runRunner in-flight phase attribution against real parallel groups (#1
 			id: "cpu-hog",
 			appliesTo: ["jsts"],
 			priority: 11,
-			enabledByDefault: true,
 			timeoutMs: 5_000,
 			async run(): Promise<RunnerResult> {
 				return hogPromise;
@@ -584,7 +569,6 @@ describe("runRunner in-flight phase attribution against real parallel groups (#1
 				id: "cpu-hog",
 				appliesTo: ["jsts"],
 				priority: 10,
-				enabledByDefault: true,
 				timeoutMs: 60_000, // generous — never meant to fire, resolved manually
 				async run(): Promise<RunnerResult> {
 					return hogPromise;
@@ -594,7 +578,6 @@ describe("runRunner in-flight phase attribution against real parallel groups (#1
 				id: "innocent-co-started-runner",
 				appliesTo: ["jsts"],
 				priority: 11,
-				enabledByDefault: true,
 				timeoutMs: 60_000,
 				async run(): Promise<RunnerResult> {
 					return innocentPromise;

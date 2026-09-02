@@ -55,7 +55,6 @@ const hadolintRunner: RunnerDefinition = {
 	id: "hadolint",
 	appliesTo: ["docker"],
 	priority: PRIORITY.GENERAL_ANALYSIS,
-	enabledByDefault: true,
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {

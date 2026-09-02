@@ -49,7 +49,6 @@ const prismaValidateRunner: RunnerDefinition = {
 	id: "prisma-validate",
 	appliesTo: ["prisma"],
 	priority: PRIORITY.GENERAL_ANALYSIS,
-	enabledByDefault: true,
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {

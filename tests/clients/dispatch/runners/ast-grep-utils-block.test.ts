@@ -94,15 +94,33 @@ describe("ast-grep NAPI utils: block passthrough (#663)", () => {
 				(entry) => entry.phase === "astgrep_napi_unsupported_rules_skipped",
 			);
 		expect(entries).toHaveLength(1);
-		const python = (
-			entries[0].metadata?.skippedByLanguage as Record<
-				string,
-				{ count: number; ruleIds: string[] }
-			>
-		).python;
+		const skipped = entries[0].metadata?.skippedByLanguage as Record<
+			string,
+			{ count: number; ruleIds: string[]; route?: string }
+		>;
+		const python = skipped.python;
 		expect(python.ruleIds.length).toBeGreaterThan(0);
 		expect(python.ruleIds.length).toBeLessThanOrEqual(5);
 		expect(python.count).toBeGreaterThanOrEqual(python.ruleIds.length);
+
+		// #2215 review F1: the `route` annotation is only worth emitting if it
+		// is read back off the RECORD. Pinning `deliveryRouteForRuleLanguage`
+		// alone leaves the wiring free to be deleted while every test stays
+		// green. Both of `skipRouteFor`'s branches land in this one record, so
+		// assert one of each. `python` has no bundled napi grammar, so its
+		// rules deliver through the ast-grep LSP/CLI. A `mismatch:` key is a
+		// language this engine DOES serve that simply is not this file's
+		// grammar, so it still routes through napi on its own files.
+		expect(python.route).toBe("ast-grep-lsp-cli");
+		expect(skipped["mismatch:javascript->typescript"]?.route).toBe("napi");
+		// No key may go unrouted: `unclassified` is the runtime signal that
+		// rules ship for a language nobody decided a delivery route for.
+		expect(
+			Object.entries(skipped)
+				.filter(([, value]) => value.route !== "ast-grep-lsp-cli")
+				.filter(([, value]) => value.route !== "napi")
+				.map(([key]) => key),
+		).toEqual([]);
 	});
 
 	it("dedupes unsupported-language telemetry across files and resets per session", async () => {

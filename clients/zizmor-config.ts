@@ -121,6 +121,20 @@ export function _resetZizmorTokenCacheForTests(): void {
 	resetZizmorTokenAvailability();
 }
 
+interface GhTokenFailureVerdict {
+	outcome: AvailabilityOutcome;
+	cause: AvailabilityCause;
+	/**
+	 * How THIS verdict was reached. Only the passthrough branch below is a
+	 * genuine `classifyProbeFailure` read; the other three branches assert
+	 * their own outcome/cause from this function's own rules, so they are
+	 * `"caller"` even though this function LOOKS like a classifier (#2226
+	 * review F2 — carried through so `recordGhTokenUnavailable` doesn't have
+	 * to guess).
+	 */
+	classifiedBy: "probe" | "caller";
+}
+
 /**
  * Classify a failed `gh auth token` probe.
  *
@@ -136,7 +150,7 @@ export function _resetZizmorTokenCacheForTests(): void {
 function classifyGhTokenFailure(
 	res: SpawnResult,
 	hostStallMs: number,
-): { outcome: AvailabilityOutcome; cause: AvailabilityCause } {
+): GhTokenFailureVerdict {
 	// #1651 review F5: `!res.error` alone is not proof gh ran and answered.
 	// A `null` or negative `status` is Node's OWN signal that the process
 	// never completed a real run — no completed process exits with either —
@@ -149,20 +163,28 @@ function classifyGhTokenFailure(
 		// The process ran to completion with a real (nonzero, since the zero
 		// exit is handled before this is ever called) exit code — a genuine
 		// "not authenticated" (or otherwise rejected) answer, safe to cache.
-		return { outcome: "non-installable", cause: "probe-rejected" };
+		return {
+			outcome: "non-installable",
+			cause: "probe-rejected",
+			classifiedBy: "caller",
+		};
 	}
 	if (res.spawnFailure?.kind === "tool-not-found") {
 		// gh genuinely isn't on PATH — a durable fact about the machine.
-		return { outcome: "missing", cause: "not-found" };
+		return { outcome: "missing", cause: "not-found", classifiedBy: "caller" };
 	}
 	const classified = classifyProbeFailure(res, { hostStallMs });
 	if (classified.outcome === "transient" || classified.outcome === "missing") {
-		return classified;
+		return { ...classified, classifiedBy: "probe" };
 	}
 	// Everything else (EACCES/permission-denied, cwd-unresolvable, a generic
 	// spawn-failed, or an unrecognized errno) means the child never launched —
 	// that's evidence about this moment, not about gh's auth state.
-	return { outcome: "transient", cause: classified.cause };
+	return {
+		outcome: "transient",
+		cause: classified.cause,
+		classifiedBy: "caller",
+	};
 }
 
 async function deriveGhCliToken(): Promise<string | undefined> {
@@ -193,6 +215,7 @@ async function deriveGhCliToken(): Promise<string | undefined> {
 				latched: true,
 				hostStallMs,
 				budgetMs: GH_TOKEN_PROBE_TIMEOUT_MS,
+				classifiedBy: "probe",
 			});
 			return token;
 		}
@@ -204,7 +227,11 @@ async function deriveGhCliToken(): Promise<string | undefined> {
 		// online audits ran while zizmor was actually about to launch offline
 		// — the #1535 silence moved into the telemetry instead of being fixed.
 		return recordGhTokenUnavailable(
-			{ outcome: "non-installable", cause: "empty-result" },
+			{
+				outcome: "non-installable",
+				cause: "empty-result",
+				classifiedBy: "caller",
+			},
 			elapsedMs,
 			hostStallMs,
 		);
@@ -224,10 +251,7 @@ async function deriveGhCliToken(): Promise<string | undefined> {
  * can't drift on which fields get set.
  */
 function recordGhTokenUnavailable(
-	{
-		outcome,
-		cause,
-	}: { outcome: AvailabilityOutcome; cause: AvailabilityCause },
+	{ outcome, cause, classifiedBy }: GhTokenFailureVerdict,
 	elapsedMs: number,
 	hostStallMs: number,
 ): undefined {
@@ -247,6 +271,10 @@ function recordGhTokenUnavailable(
 		hostStallMs,
 		...(retryAfterMs > 0 && { retryAfterMs }),
 		budgetMs: GH_TOKEN_PROBE_TIMEOUT_MS,
+		// Shared tail for both call paths; the caller carries whether ITS
+		// own verdict was a `classifyProbeFailure` passthrough or one of
+		// this module's own assertions (#2226 review F2).
+		classifiedBy,
 	});
 	return undefined;
 }
@@ -342,6 +370,9 @@ export async function resolveZizmorGitHubToken(): Promise<string | undefined> {
 				hostStallMs: 0,
 				...(retryAfterMs > 0 && { retryAfterMs }),
 				budgetMs: GH_TOKEN_PROBE_TIMEOUT_MS,
+				// No probe ran here: the latch's own remembered cause is replayed
+				// as-is, so the call site is the one asserting it (#2209).
+				classifiedBy: "caller",
 			});
 		}
 		return memo ? cachedToken : undefined;

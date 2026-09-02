@@ -26,7 +26,9 @@ import type { LatencyEntry } from "../../clients/latency-logger.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 
 const latencyEntries = vi.hoisted(() => [] as LatencyEntry[]);
-vi.mock("../../clients/latency-logger.js", () => ({
+
+vi.mock("../../clients/latency-logger.js", async (importActual) => ({
+	...(await importActual<typeof import("../../clients/latency-logger.js")>()),
 	logLatency: (entry: LatencyEntry) => latencyEntries.push(entry),
 }));
 
@@ -197,6 +199,7 @@ describe("startup overhead — interactive path regression guard", () => {
 			expect(phases.get("session_start_total")?.metadata).toEqual({
 				mode: "quick",
 				reason: "startup",
+				sameRoot: "unknown",
 			});
 			expect(phases.get("session_start_sequence_read")?.metadata).toEqual(
 				expect.objectContaining({ entries: expect.any(Number) }),

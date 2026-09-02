@@ -17,6 +17,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { vi } from "vitest";
 
 /**
  * Build a nested tree of ~`target` source files under `root`, plus ignored
@@ -94,4 +95,27 @@ export async function measureMaxSyncBlockMs(
 	// Let the final gap (the stretch after the work's last yield) register.
 	await new Promise<void>((resolve) => setImmediate(resolve));
 	return maxLagMs;
+}
+
+/**
+ * Run `work` and return how many times it read the clock (`performance.now`).
+ *
+ * A deterministic WORK COUNT, not a wall-clock measurement, so it is invariant
+ * to machine speed and event-loop load (#2202, #2254). A cooperative loop that
+ * checks its deadline per bounded work unit reads the clock O(work units) times;
+ * a loop that checks per posting element reads it O(elements) times. The gap
+ * between those two is what a clock-read guard pins, and it does not move when a
+ * shared runner lane is under contention, so this belongs outside the
+ * timing-sensitive lane.
+ */
+export async function countClockReads(
+	work: () => Promise<unknown>,
+): Promise<number> {
+	const spy = vi.spyOn(performance, "now");
+	try {
+		await work();
+		return spy.mock.calls.length;
+	} finally {
+		spy.mockRestore();
+	}
 }

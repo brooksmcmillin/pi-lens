@@ -8,7 +8,7 @@
  * changelog-extract.mjs CLI end-to-end.
  */
 
-import { execFileSync } from "node:child_process";
+import { execFileSync } from "../support/git-fixture-env.js";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -270,7 +270,7 @@ describe("repo CHANGELOG.md contract", () => {
 	// The CHANGELOG begins at the 3.x line; pre-3.x tags predate it (the backfill
 	// script skips them). Guard the era the CHANGELOG actually covers: no v3.*
 	// tag may be missing a curated section.
-	it("every v3.* git tag has a non-empty CHANGELOG section", () => {
+	it("every v3.* git tag has a non-empty CHANGELOG section", (ctx) => {
 		const tags = execFileSync("git", ["tag", "--list", "v3.*"], {
 			cwd: REPO_ROOT,
 			encoding: "utf8",
@@ -279,10 +279,14 @@ describe("repo CHANGELOG.md contract", () => {
 			.map((t) => t.trim())
 			.filter(Boolean);
 		// CI checks out shallow with no tags fetched, so the tag list is empty
-		// there — this contract is a local pre-push guard; skip when no tags exist
-		// (the release workflow's "Verify changelog entry exists" step covers the
-		// real risk of a tagged version missing its section).
-		if (tags.length === 0) return;
+		// there — this contract is a local pre-push guard. Skip VISIBLY when no
+		// tags exist rather than returning, which reports a pass (#2089); the
+		// release workflow's "Verify changelog entry exists" step covers the real
+		// risk of a tagged version missing its section.
+		ctx.skip(
+			tags.length === 0,
+			"no v3.* tags in this checkout (CI clones shallow, without tags)",
+		);
 		const missing = tags.filter((t) => !hasSection(CHANGELOG, t));
 		expect(missing).toEqual([]);
 	});

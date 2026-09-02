@@ -217,9 +217,11 @@ describe("scanProjectDiagnostics FactStore lifecycle (#886, #939)", () => {
 				occupiedFiles.add(path.resolve(filePath));
 				peakOccupiedFiles = Math.max(peakOccupiedFiles, occupiedFiles.size);
 			});
-		const originalClear = FactStore.prototype.clearFileFactsFor;
+		// #2243: the scan releases each file's facts through dropFileFacts (clear
+		// without pinning), so the capacity cap stays effective on its own store.
+		const originalClear = FactStore.prototype.dropFileFacts;
 		const clearSpy = vi
-			.spyOn(FactStore.prototype, "clearFileFactsFor")
+			.spyOn(FactStore.prototype, "dropFileFacts")
 			.mockImplementation(function (this: FactStore, filePath: string) {
 				const resolved = path.resolve(filePath);
 				const hadContent = this.hasFileFact(filePath, "file.content");

@@ -4,11 +4,30 @@
  * open PRs for merge conflicts, stale auto-merge, and red required checks.
  *
  * The warden OBSERVES AND ANNOTATES ONLY. It never resolves conflicts,
- * never merges, and never pushes to a PR branch. The one exception is the
- * GitHub-sanctioned "update branch" kick for a PR that already has auto-merge
- * armed and has fallen BEHIND -- that is the same button a human clicks in
- * the PR UI, exposed here as the API GitHub documents for it.
+ * never merges, and never pushes to a PR branch. Two exceptions, both
+ * GitHub-sanctioned buttons a human clicks in the UI:
+ *
+ * - "update branch" for a PR that already has auto-merge armed and has
+ *   fallen BEHIND.
+ * - "re-run workflow" for a run this sweep classified as STARVED (#2184) --
+ *   at most once per run, keyed on GitHub's own `run_attempt` counter.
+ *
+ * Merging stays out of this file by construction; the label-gated merge lane
+ * lives in scripts/lib/merge-train-lane.mjs with its own workflow and its own
+ * permissions (#2185).
  */
+
+import {
+	commentMarkerExists,
+	presentCommentMarkers,
+} from "./github-paging.mjs";
+import {
+	absentRunCommentMarker,
+	decideRunHealthActions,
+	fetchHeadRunHealth,
+	RUN_HEALTH,
+	stalledRunCommentMarker,
+} from "./warden-run-health.mjs";
 
 export const CONFLICT_LABEL = "conflict";
 export const RED_CI_LABEL = "red-ci";
@@ -22,6 +41,45 @@ export const MAX_PAGES = 4; // 200 open PRs is far above this repo's steady stat
 // the scheduled run red, so the run doesn't email every 10 minutes for
 // benign races.
 const BENIGN_HTTP_STATUSES = new Set([404, 409, 422]);
+
+/**
+ * One check run per NAME, newest wins. Review round 1, F4: GitHub's rollup
+ * really does carry duplicate names on a single head -- PR #2191's own head
+ * listed six names twice, and PR #2190 listed `Unit tests` as both
+ * IN_PROGRESS and COMPLETED/SUCCESS. A naive `new Map(list.map(...))` is
+ * last-wins on ARRAY order, which is not time order, so a consumer can read
+ * the SUPERSEDED run and call an in-flight re-run settled.
+ *
+ * `startedAt` orders them. When it is missing or tied AND the duplicates
+ * disagree, the resolution is fail-closed: the run that is not a concluded
+ * success wins, so an unorderable tie can only ever withhold a pass, never
+ * grant one.
+ *
+ * Lives here, not in the merge lane, because BOTH consumers have the defect:
+ * the lane's gate and this file's own required-check scan.
+ */
+export function resolveCheckRuns(checkRuns) {
+	const byName = new Map();
+	for (const run of checkRuns ?? []) {
+		const incumbent = byName.get(run.name);
+		byName.set(run.name, incumbent ? preferCheckRun(incumbent, run) : run);
+	}
+	return byName;
+}
+
+function isConcludedSuccess(run) {
+	return run.status === "COMPLETED" && run.conclusion === "SUCCESS";
+}
+
+function preferCheckRun(a, b) {
+	const ta = Date.parse(a.startedAt ?? "");
+	const tb = Date.parse(b.startedAt ?? "");
+	if (!Number.isNaN(ta) && !Number.isNaN(tb) && ta !== tb)
+		return ta > tb ? a : b;
+	if (isConcludedSuccess(a) && !isConcludedSuccess(b)) return b;
+	if (isConcludedSuccess(b) && !isConcludedSuccess(a)) return a;
+	return a;
+}
 
 const PR_QUERY = `
 query($owner: String!, $name: String!, $after: String) {
@@ -39,13 +97,16 @@ query($owner: String!, $name: String!, $after: String) {
           nodes {
             commit {
               oid
+              committedDate
               statusCheckRollup {
                 contexts(first: 100) {
                   nodes {
                     __typename
                     ... on CheckRun {
                       name
+                      status
                       conclusion
+                      startedAt
                       detailsUrl
                     }
                   }
@@ -87,9 +148,21 @@ function normalizePr(node) {
 	// "confirmed no failures" from "we don't know".
 	const checksUnknown = rollup == null;
 	const contexts = rollup?.contexts?.nodes ?? [];
-	const checkRunsByName = new Map();
+	const checkRuns = [];
 	for (const c of contexts) {
-		if (c.__typename === "CheckRun") checkRunsByName.set(c.name, c);
+		if (c.__typename !== "CheckRun") continue;
+		// The full list (name + status + conclusion) is what the merge lane's
+		// "zero non-advisory failing checks" gate reads (#2185). The warden
+		// itself still looks only at REQUIRED_CHECKS below.
+		// startedAt orders duplicate names on one head: GitHub's rollup really
+		// carries them (review round 1, F4), and array order is not time order.
+		checkRuns.push({
+			name: c.name,
+			status: c.status ?? null,
+			conclusion: c.conclusion ?? null,
+			startedAt: c.startedAt ?? null,
+			url: c.detailsUrl,
+		});
 	}
 	const failingRequiredChecks = [];
 	// A required check that hasn't reported yet (absent from the rollup) or is
@@ -101,18 +174,28 @@ function normalizePr(node) {
 	// non-required check (e.g. SonarCloud) from tripping red-ci (review round
 	// 1, F5) -- it looks up exactly the required names, ignoring every other
 	// key checkRunsByName may hold.
+	// Resolved newest-per-name (review round 1, F4): a superseded duplicate
+	// must not decide whether a required check is failing or unresolved.
+	const checkRunsByName = resolveCheckRuns(checkRuns);
 	const unresolvedRequiredChecks = [];
 	for (const name of REQUIRED_CHECKS) {
 		const run = checkRunsByName.get(name);
 		if (!run) unresolvedRequiredChecks.push(name);
 		else if (run.conclusion === "FAILURE")
-			failingRequiredChecks.push({ name, url: run.detailsUrl });
+			// `url`, not `detailsUrl`: the resolver returns the NORMALIZED record
+			// built above, not the raw GraphQL node.
+			failingRequiredChecks.push({ name, url: run.url });
 		else if (!run.conclusion) unresolvedRequiredChecks.push(name);
 	}
 	return {
 		number: node.number,
 		url: node.url,
 		headSha: headCommit?.oid,
+		// GraphQL's `pushedDate` is deprecated and reads null on every real PR
+		// in this repository (probed 2026-08-26 against #2180/#2181), so the
+		// committer date is the available age signal for "the dispatch should
+		// have landed by now" (#2184).
+		headCommittedDate: headCommit?.committedDate ?? null,
 		mergeStateStatus: node.mergeStateStatus,
 		autoMergeEnabled: Boolean(node.autoMergeRequest),
 		// isCrossRepository is GitHub's own fork signal: true when the PR's head
@@ -123,10 +206,19 @@ function normalizePr(node) {
 		isFork: Boolean(node.isCrossRepository),
 		labels,
 		checksUnknown,
+		checkRuns,
 		failingRequiredChecks,
 		unresolvedRequiredChecks,
 	};
 }
+
+/**
+ * How many repeated PR numbers one duplicate record names before it stops
+ * listing them and reports a remainder count (#2192). The record has to stay
+ * one line in a workflow summary; the COUNT is the signal, the first few
+ * numbers are the breadcrumb.
+ */
+export const DUPLICATE_REPORT_CAP = 5;
 
 /**
  * Single paginated list call (per PR, bounded by MAX_PAGES): rate-limit
@@ -134,30 +226,102 @@ function normalizePr(node) {
  * a request throws, or a page comes back with partial `errors`, bail
  * gracefully with whatever PRs were already collected plus a recorded error
  * -- never throw out of this function (review round 1, F6).
+ *
+ * Returns `errors` as `{ message, benign }` RECORDS, not strings (#2192).
+ * Both consumers -- `runWarden` below and the merge lane -- used to map every
+ * list error to `benign: false` on the way in, which is exactly the bug: a
+ * cross-page duplicate is routine, not fatal. The query orders by UPDATED_AT
+ * desc, so any open PR touched mid-pagination shifts the window and pushes a
+ * PR from page N onto page N+1. On a 10-minute cadence that is expected noise,
+ * and this file's own design note (BENIGN_HTTP_STATUSES above) says such races
+ * must not mark the scheduled run red. An intra-page duplicate is malformed
+ * API data and stays fatal (#2289). Classifying at the SOURCE also means the
+ * two consumers stop carrying identical mapping code that can drift apart.
  */
 export async function fetchOpenPullRequests(fetcher, owner, name) {
 	const prs = [];
 	const errors = [];
+	const record = (message, benign = false) => errors.push({ message, benign });
+	const seenNumbers = new Set();
 	let after;
 	for (let page = 0; page < MAX_PAGES; page++) {
 		let payload;
 		try {
 			payload = await graphql(fetcher, PR_QUERY, { owner, name, after });
 		} catch (error) {
-			errors.push(
+			record(
 				`GraphQL request failed: ${error instanceof Error ? error.message : String(error)}`,
 			);
 			break;
 		}
 		if (payload?.errors?.length)
-			errors.push(
+			record(
 				`GraphQL errors: ${payload.errors.map((e) => e.message).join("; ")}`,
 			);
 		const connection = payload?.data?.repository?.pullRequests;
 		if (!connection || !Array.isArray(connection.nodes)) break;
-		for (const node of connection.nodes) prs.push(normalizePr(node));
-		if (!connection.pageInfo?.hasNextPage) break;
-		after = connection.pageInfo.endCursor;
+		// Collected, not recorded per node (#2192): the old code pushed one
+		// FATAL error per repeated node, so a fully shifted window emitted up
+		// to MAX_PAGES x PAGE_SIZE = 200 identical lines into one summary. One
+		// record per page, naming the count, is the same information at 1/50th
+		// the volume.
+		const seenOnPage = new Set();
+		const boundaryDuplicates = [];
+		const intraPageDuplicates = [];
+		for (const node of connection.nodes) {
+			if (seenOnPage.has(node.number)) {
+				intraPageDuplicates.push(node.number);
+				continue;
+			}
+			seenOnPage.add(node.number);
+			if (seenNumbers.has(node.number)) {
+				boundaryDuplicates.push(node.number);
+				continue;
+			}
+			seenNumbers.add(node.number);
+			prs.push(normalizePr(node));
+		}
+
+		const hasNextPage = Boolean(connection.pageInfo?.hasNextPage);
+		const nextCursor = connection.pageInfo?.endCursor;
+		// Read BEFORE the breaks below, because it decides how a cross-page
+		// duplicate is classified. An intra-page duplicate cannot be a boundary
+		// slide, regardless of cursor state, and is recorded separately above.
+		const cursorAdvanced =
+			!hasNextPage || (nextCursor != null && nextCursor !== after);
+		if (boundaryDuplicates.length > 0) {
+			const shown = boundaryDuplicates.slice(0, DUPLICATE_REPORT_CAP);
+			const remainder = boundaryDuplicates.length - shown.length;
+			record(
+				`GraphQL pagination repeated ${boundaryDuplicates.length} PR number(s) on page ${page + 1} ` +
+					`(${shown.map((n) => `#${n}`).join(", ")}${remainder > 0 ? `, +${remainder} more` : ""}); ` +
+					(cursorAdvanced
+						? "the open-PR window shifted during pagination, so this is a routine boundary repeat"
+						: "the cursor did not advance, so the collection is truncated"),
+				cursorAdvanced,
+			);
+		}
+		if (intraPageDuplicates.length > 0) {
+			const shown = intraPageDuplicates.slice(0, DUPLICATE_REPORT_CAP);
+			const remainder = intraPageDuplicates.length - shown.length;
+			record(
+				`GraphQL returned malformed page ${page + 1}: repeated ${intraPageDuplicates.length} PR number(s) within the page ` +
+					`(${shown.map((n) => `#${n}`).join(", ")}${remainder > 0 ? `, +${remainder} more` : ""})`,
+			);
+		}
+
+		if (!hasNextPage) break;
+		if (!cursorAdvanced) {
+			record("GraphQL pagination truncated because cursor did not advance");
+			break;
+		}
+		if (page === MAX_PAGES - 1) {
+			record(
+				`GraphQL pagination truncated after ${MAX_PAGES} pages while hasNextPage=true`,
+			);
+			break;
+		}
+		after = nextCursor;
 	}
 	return { prs, errors };
 }
@@ -296,6 +460,24 @@ export async function applyAction(fetcher, owner, repo, pr, action) {
 				`${base}/pulls/${pr.number}/update-branch`,
 				{ expected_head_sha: pr.headSha },
 			);
+		case "rerun-run":
+			// Full rerun, not rerun-failed-jobs: a starved run has no failed jobs
+			// to re-run, because nothing ever executed (#2184).
+			return restJson(
+				fetcher,
+				"POST",
+				`${base}/actions/runs/${action.runId}/rerun`,
+			);
+		case "cancel-run":
+			// #2203. GitHub refuses `rerun` on a run that has not completed, so a
+			// zombie stuck in `queued` must be cancelled before it can be re-run.
+			// A second cancel of the same run returns 409, which is already
+			// classified benign.
+			return restJson(
+				fetcher,
+				"POST",
+				`${base}/actions/runs/${action.runId}/cancel`,
+			);
 		default:
 			throw new Error(`unknown warden action type: ${action.type}`);
 	}
@@ -309,7 +491,59 @@ export async function applyAction(fetcher, owner, repo, pr, action) {
  * BENIGN_HTTP_STATUSES) or a "note" is expected noise, never cause for the
  * scheduled run itself to go red; anything else is a real failure.
  */
-export async function runWarden({ fetcher, owner, repo }) {
+/**
+ * Does the absent-run comment for THIS head already exist? Per-head dedupe
+ * needs a per-head key, and the warden's usual label-as-dedupe-key idiom
+ * cannot carry one: a label says "absent" but not "absent for which head", so
+ * a second consecutive dropped dispatch would go unreported. The comment
+ * itself carries the head SHA as an HTML marker, and this reads it back.
+ *
+ * Called ONLY for a head already classified absent, so the extra REST call
+ * lands on the anomalous minority of PRs, never on the healthy sweep.
+ */
+export async function hasAbsentRunComment(fetcher, owner, repo, pr) {
+	// Paginated (review round 1, F6): a first-page-only read stops finding its
+	// own marker past 100 comments and starts repeating the notice.
+	return commentMarkerExists(
+		fetcher,
+		owner,
+		repo,
+		pr.number,
+		absentRunCommentMarker(pr.headSha),
+	);
+}
+
+/**
+ * Which stalled runs on this head already carry the warden's marker comment?
+ * One paged comment read per head, and ONLY for a head that already has a
+ * stalled run, so the healthy sweep pays nothing (#2203).
+ *
+ * Returns null when the read failed: the caller must not treat "we could not
+ * look" as "no marker", which would repost the notice and, worse, re-attribute
+ * a person's cancellation to the warden.
+ */
+export async function readStalledRunMarkers(fetcher, owner, repo, pr, health) {
+	const runs = [
+		...(health.stalledRuns ?? []),
+		...(health.cancelledStalledRuns ?? []),
+	];
+	if (runs.length === 0) return new Set();
+	return presentCommentMarkers(
+		fetcher,
+		owner,
+		repo,
+		pr.number,
+		runs.map((run) => stalledRunCommentMarker(run.id)),
+	);
+}
+
+function describeApplied(action) {
+	if (action.type === "rerun-run" || action.type === "cancel-run")
+		return `${action.type}:${action.workflowPath}#${action.runId}`;
+	return action.type + (action.label ? `:${action.label}` : "");
+}
+
+export async function runWarden({ fetcher, owner, repo, now = Date.now() }) {
 	const { prs, errors: listErrors } = await fetchOpenPullRequests(
 		fetcher,
 		owner,
@@ -322,13 +556,79 @@ export async function runWarden({ fetcher, owner, repo }) {
 			url: null,
 			mergeStateStatus: null,
 			applied: [],
-			errors: listErrors.map((message) => ({ message, benign: false })),
+			// #2192: the classification is the READER's, not this caller's --
+			// `fetchOpenPullRequests` already returns `{ message, benign }`. The
+			// old blanket `benign: false` here is what made a routine
+			// window-slide duplicate mark the 10-minute run red.
+			errors: listErrors,
+			runHealth: null,
 		});
 	}
 	for (const pr of prs) {
-		const actions = decideActions(pr);
 		const applied = [];
 		const errors = [];
+		// #2184: run health is read for EVERY open PR head, so the sweep record
+		// can name a classification per PR even when nothing needed doing. A
+		// stalled train is then visible in one warden cycle instead of at a
+		// session gate's timeout.
+		const { health, errors: healthErrors } = await fetchHeadRunHealth(
+			fetcher,
+			owner,
+			repo,
+			pr.headSha,
+			pr.headCommittedDate,
+			now,
+		);
+		for (const message of healthErrors)
+			errors.push({ message: `PR #${pr.number}: ${message}`, benign: true });
+
+		let absentCommentExists = false;
+		if (health.absentWorkflows.length > 0) {
+			try {
+				absentCommentExists = await hasAbsentRunComment(
+					fetcher,
+					owner,
+					repo,
+					pr,
+				);
+			} catch (error) {
+				// Fail CLOSED on an unreadable comment list: assume the comment is
+				// already there rather than risk re-posting the loud dropped-dispatch
+				// notice on every tick of an API outage.
+				absentCommentExists = true;
+				errors.push({
+					message: `PR #${pr.number}: ${error instanceof Error ? error.message : String(error)}; absent-run comment suppressed this run`,
+					benign: true,
+				});
+			}
+		}
+
+		let stalledRunMarkers = new Set();
+		try {
+			stalledRunMarkers = await readStalledRunMarkers(
+				fetcher,
+				owner,
+				repo,
+				pr,
+				health,
+			);
+		} catch (error) {
+			// null, not an empty Set: the ladder must stand still for a cycle
+			// rather than act on a guess (#2203).
+			stalledRunMarkers = null;
+			errors.push({
+				message: `PR #${pr.number}: ${error instanceof Error ? error.message : String(error)}; stalled-run markers unreadable this run`,
+				benign: true,
+			});
+		}
+
+		const actions = [
+			...decideActions(pr),
+			...decideRunHealthActions(pr, health, {
+				absentCommentExists,
+				stalledRunMarkers,
+			}),
+		];
 		for (const action of actions) {
 			if (action.type === "note") {
 				errors.push({ message: action.message, benign: action.benign ?? true });
@@ -349,7 +649,7 @@ export async function runWarden({ fetcher, owner, repo }) {
 						`${action.type} ${action.label ?? ""} -> HTTP ${response.status}${suffix}`.trim();
 					errors.push({ message, benign: classification.benign });
 				} else {
-					applied.push(action.type + (action.label ? `:${action.label}` : ""));
+					applied.push(describeApplied(action));
 				}
 			} catch (error) {
 				errors.push({
@@ -364,7 +664,42 @@ export async function runWarden({ fetcher, owner, repo }) {
 			mergeStateStatus: pr.mergeStateStatus,
 			applied,
 			errors,
+			runHealth: summarizeRunHealth(health),
 		});
 	}
 	return results;
 }
+
+/**
+ * The sweep record for one head (#2184 AC3): a classification plus the exact
+ * workflows behind it, short enough for one line of the run summary.
+ */
+export function summarizeRunHealth(health) {
+	const detail = [];
+	for (const run of health.starvedRuns)
+		detail.push(
+			`starved ${run.path} run ${run.id} (attempt ${run.runAttempt})`,
+		);
+	// #2203 AC4: the sweep record must name the stuck run and how long it has
+	// been stuck, so a stalled train is one grep away in the warden run log.
+	for (const run of health.stalledRuns ?? [])
+		detail.push(
+			`stalled ${run.path} run ${run.id} ${run.status} ${Math.round(run.stalledForMinutes ?? 0)}m with zero executed steps (attempt ${run.runAttempt})`,
+		);
+	for (const run of health.cancelledStalledRuns ?? [])
+		detail.push(
+			`cancelled zero-step ${run.path} run ${run.id} (attempt ${run.runAttempt})`,
+		);
+	if (health.absentWorkflows.length > 0)
+		detail.push(`no run for ${health.absentWorkflows.join(", ")}`);
+	if (health.unknownWorkflows.length > 0)
+		detail.push(`unreadable ${health.unknownWorkflows.join(", ")}`);
+	if (health.pendingWorkflows.length > 0)
+		detail.push(`in flight ${health.pendingWorkflows.join(", ")}`);
+	return {
+		classification: health.classification,
+		detail: detail.join("; "),
+	};
+}
+
+export { RUN_HEALTH };

@@ -38,17 +38,20 @@ describe("projectReport — cold path (#773)", () => {
 		const env = makeEnv();
 		createTempFile(env.tmpDir, "src/a.ts", "export const a = 1;\n");
 
-		const startedAt = Date.now();
 		const report = await projectReport(env.tmpDir);
-		const elapsedMs = Date.now() - startedAt;
 
 		expect(report.available).toBe(false);
 		expect(report.hint).toBeTruthy();
 		expect(report.trust).toBeUndefined();
 		expect(report.hubs).toBeUndefined();
-		// The call must return immediately — it must never synchronously run a
-		// full graph build on this path (#773's graph-cold contract).
-		expect(elapsedMs).toBeLessThan(2000);
+		// #2090: the actual claim is "never synchronously run a full graph
+		// build on this path" (#773's graph-cold contract) - a wall-clock bound
+		// only approximates that, and passed at 88ms against a 2000ms ceiling
+		// (a 22.7x margin), loose enough to hide a synchronous build on a small
+		// fixture. Assert the claim directly: the cache must still be cold the
+		// instant the call returns, because the build is only kicked off
+		// (fire-and-forget), never awaited.
+		expect(getCachedReviewGraph(env.tmpDir)).toBeUndefined();
 
 		// The background build was kicked off (deduped, fire-and-forget) — assert
 		// it eventually populates the cache, proving it actually ran rather than

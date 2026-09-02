@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import { GITHUB_TOOLS, TOOLS } from "../../../clients/installer/index.js";
+import {
+	GITHUB_TOOLS,
+	TOOLS,
+	getRefreshableManagedTools,
+	getToolVerificationTimeout,
+} from "../../../clients/installer/index.js";
 
 // Use the real installer module, not any mock another test file registered.
 vi.unmock("../../../clients/installer/index.js");
@@ -40,6 +45,54 @@ function resolvesFullMatrix(tool: (typeof TOOLS)[number]): boolean {
 describe("TOOLS registry consistency", () => {
 	it("is non-empty", () => {
 		expect(TOOLS.length).toBeGreaterThan(0);
+	});
+
+	it("uses the Vue-specific cold-start budget without changing the default", () => {
+		const vue = TOOLS.find((tool) => tool.id === "@vue/language-server");
+		expect(vue).toBeDefined();
+		expect(getToolVerificationTimeout(vue!)).toBe(30_000);
+		expect(
+			getToolVerificationTimeout(TOOLS.find((tool) => tool.id === "pyright")!),
+		).toBe(10_000);
+	});
+
+	it("carries the Vue timeout into refresh candidates", () => {
+		const vue = getRefreshableManagedTools().find(
+			(tool) => tool.toolId === "@vue/language-server",
+		);
+		expect(vue?.verificationTimeoutMs).toBe(30_000);
+	});
+
+	it("uses the bash/JSON language-server cold-start budgets (#2194)", () => {
+		const bash = TOOLS.find((tool) => tool.id === "bash-language-server");
+		const json = TOOLS.find(
+			(tool) => tool.id === "vscode-json-language-server",
+		);
+		expect(bash).toBeDefined();
+		expect(json).toBeDefined();
+		expect(getToolVerificationTimeout(bash!)).toBe(20_000);
+		expect(getToolVerificationTimeout(json!)).toBe(20_000);
+	});
+
+	it("uses the Svelte/Prisma language-server cold-start budgets (#2169)", () => {
+		const svelte = TOOLS.find((tool) => tool.id === "svelte-language-server");
+		const prisma = TOOLS.find((tool) => tool.id === "@prisma/language-server");
+		expect(svelte).toBeDefined();
+		expect(prisma).toBeDefined();
+		expect(getToolVerificationTimeout(svelte!)).toBe(20_000);
+		expect(getToolVerificationTimeout(prisma!)).toBe(40_000);
+	});
+
+	it("carries the Svelte/Prisma timeouts into refresh candidates (#2169)", () => {
+		const refreshable = getRefreshableManagedTools();
+		const svelte = refreshable.find(
+			(tool) => tool.toolId === "svelte-language-server",
+		);
+		const prisma = refreshable.find(
+			(tool) => tool.toolId === "@prisma/language-server",
+		);
+		expect(svelte?.verificationTimeoutMs).toBe(20_000);
+		expect(prisma?.verificationTimeoutMs).toBe(40_000);
 	});
 
 	it("every tool has the required base wiring (id, name, checkCommand, checkArgs, strategy)", () => {

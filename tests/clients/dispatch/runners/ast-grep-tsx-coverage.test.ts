@@ -26,6 +26,7 @@ import * as path from "node:path";
 import { parse, Lang } from "@ast-grep/napi";
 import * as yaml from "js-yaml";
 import {
+	canHandle,
 	evaluateAstGrepRules,
 	ruleLanguageForFile,
 } from "../../../../clients/dispatch/runners/ast-grep-napi.js";
@@ -76,6 +77,14 @@ describe("ruleLanguageForFile (#1608)", () => {
 		expect(ruleLanguageForFile("Component.tsx")).toBe("tsx");
 		expect(ruleLanguageForFile("module.ts")).toBe("typescript");
 	});
+
+	it.each([["App.java"], ["App.kt"], ["build.gradle.kts"]] as const)(
+		"does not route polyglot files through the NAPI grammar seam",
+		(file) => {
+			expect(canHandle(file)).toBe(false);
+			expect(ruleLanguageForFile(file)).toBeUndefined();
+		},
+	);
 });
 
 describe("shipped TypeScript rules retain tsx coverage (#1608)", () => {
@@ -149,5 +158,5 @@ describe("evaluateAstGrepRules runs TypeScript rules against .tsx files (#1608)"
 		expect(diagnostics.some((d) => d.rule === "array-callback-return")).toBe(
 			true,
 		);
-	});
+	}, 10_000);
 });

@@ -10,9 +10,9 @@
  * get the bounding right. This module is the intersection of those four, not
  * a speculative framework. Three of its four options come straight from those
  * sites. The fourth, `capPerTurn`, expresses #1733's per-turn bound
- * structurally but has no caller yet: that site's bound is its call cadence,
- * and pinning a cap there would red its own wiring tests. It ships tested and
- * mutation-proofed, awaiting its first site.
+ * structurally and now caps re-raised auxiliary coverage-gap detail rows
+ * (#2356), while the aggregate count and ledger retain bounded latest
+ * identities plus the dropped count.
  *
  * Three rules the helper makes structural instead of prose:
  *
@@ -24,10 +24,9 @@
  *    that must re-arm at `session_start` and will eventually be forgotten
  *    (the #1266–#1625 defect class).
  * 2. **A per-turn cap names its turn.** `capPerTurn` carries the caller's
- *    `turnIndex` in the same object as the limit, so there is no separate
- *    reset to wire and forget: the counters clear when the observed turn
- *    changes. This is the same lazy clear-on-transition shape as
- *    `noteImportResolutionMemoTurn` (`clients/blocker-freshness.ts`).
+ *    `turnIndex` in the same object as the limit. A bounded 64-turn window
+ *    keeps overlapping async turns independent; results older than that window
+ *    fail closed. Session start clears the window when numbering restarts.
  * 3. **Identity always survives.** Every emitted record carries the
  *    discriminating identity in `filePath` and in `metadata.identity`, so
  *    aggregation can still answer "which file, which method, which record is
@@ -39,7 +38,7 @@
  * stated reason for staying raw.
  *
  * Nothing here ever throws. Telemetry must not perturb the path it observes —
- * every one of the four migrated sites had already decided its outcome before
+ * each caller has already decided its outcome before
  * calling in.
  */
 
@@ -88,6 +87,16 @@ export const BOUNDED_TELEMETRY_PHASES = [
 	 * exact count.
 	 */
 	"lsp_warm_client_missing",
+	/** #2052: a file's nearest LSP root is outside the session ceiling. */
+	"lsp_capability_skip",
+	/**
+	 * #2044: failed-first test state was retired after a confirmed missing path,
+	 * retained because the filesystem verdict was indeterminate, or evicted at
+	 * the state cap. Selection checks and detailed rows are both capped per turn.
+	 */
+	"test_runner_failed_target_state",
+	/** #2366: bounded lifecycle records for automatic test-result delivery. */
+	"test_runner_delivery",
 	/**
 	 * #1723: an event-loop block at or above the floor. Not a degradation, so
 	 * no ledger kind; bounded by call cadence (one `turn_end` runs it once per
@@ -100,6 +109,23 @@ export const BOUNDED_TELEMETRY_PHASES = [
 	 * queue of them, so it is rising-edge per event name.
 	 */
 	"session_event_stale_ctx_skip",
+	/**
+	 * #2007: a worktree-mutating git command declined because another live
+	 * session shares this dirty checkout. Rising edge per checkout root; the
+	 * ledger keeps the exact repeat count.
+	 */
+	"shared_checkout_switch_blocked",
+	/**
+	 * #2007: `git status` could not report the working-tree state, so the same
+	 * command was declined on an UNKNOWN rather than assumed clean.
+	 */
+	"shared_checkout_probe_failed",
+	/** #2356: a notify-stall auxiliary remained uncovered after its bounded
+	 * replacement window. Detailed rows are capped per turn; the ledger and
+	 * aggregate turn-end row retain the complete count and identity. */
+	"lsp_scanner_coverage_gap",
+	/** #2358: a busy CPU discriminator deferred notify-stall teardown. */
+	"lsp_notify_stall_cpu_busy",
 ] as const;
 
 export type BoundedPhase = (typeof BOUNDED_TELEMETRY_PHASES)[number];
@@ -183,14 +209,15 @@ export type BoundedTelemetryPayload = Omit<
 };
 
 /**
- * Per-turn admission counters, keyed by phase. Cleared lazily when a call
- * observes a turn index different from the one the counters were built for,
- * and eagerly by `resetBoundedTelemetry` at `session_start` (a new session
- * restarts turn numbering at 0, so the lazy check alone could carry a stale
- * count across a session boundary that happened to land on the same index).
+ * Per-turn admission counters, keyed by turn and phase. Multiple turns remain
+ * live because async work can finish T1 after T2 has already emitted. The map
+ * retains a bounded recent window; work older than that window fails closed
+ * rather than reopening an exhausted budget. Session start clears all state.
  */
-let turnCounts = new Map<string, number>();
-let countedTurnIndex: number | undefined;
+const MAX_TRACKED_TURN_CAPS = 64;
+let turnCounts = new Map<number, Map<string, number>>();
+let latestCountedTurnIndex: number | undefined;
+let retiredThroughTurnIndex = Number.NEGATIVE_INFINITY;
 
 /**
  * Decide whether this occurrence earns a detailed record, and count it in the
@@ -269,13 +296,29 @@ function admitAgainstTurnCap(
 	cap: BoundedTelemetryOptions["capPerTurn"],
 ): boolean {
 	if (cap === undefined) return true;
-	if (countedTurnIndex !== cap.turnIndex) {
-		turnCounts = new Map();
-		countedTurnIndex = cap.turnIndex;
+	if (cap.turnIndex <= retiredThroughTurnIndex) return false;
+
+	let counts = turnCounts.get(cap.turnIndex);
+	if (!counts) {
+		if (turnCounts.size >= MAX_TRACKED_TURN_CAPS) {
+			const oldestTrackedTurn = Math.min(...turnCounts.keys());
+			if (cap.turnIndex < oldestTrackedTurn) return false;
+			turnCounts.delete(oldestTrackedTurn);
+			retiredThroughTurnIndex = Math.max(
+				retiredThroughTurnIndex,
+				oldestTrackedTurn,
+			);
+		}
+		counts = new Map();
+		turnCounts.set(cap.turnIndex, counts);
 	}
-	const used = turnCounts.get(phase) ?? 0;
+	latestCountedTurnIndex = Math.max(
+		latestCountedTurnIndex ?? cap.turnIndex,
+		cap.turnIndex,
+	);
+	const used = counts.get(phase) ?? 0;
 	if (used >= cap.limit) return false;
-	turnCounts.set(phase, used + 1);
+	counts.set(phase, used + 1);
 	return true;
 }
 
@@ -287,10 +330,20 @@ function admitAgainstTurnCap(
  */
 export function resetBoundedTelemetry(): void {
 	turnCounts = new Map();
-	countedTurnIndex = undefined;
+	latestCountedTurnIndex = undefined;
+	retiredThroughTurnIndex = Number.NEGATIVE_INFINITY;
 }
 
-/** Test-only: the live per-turn admission count for a phase. */
-export function _boundedTurnCountForTest(phase: string): number {
-	return turnCounts.get(phase) ?? 0;
+/** Test-only: one turn's live admission count for a phase. */
+export function _boundedTurnCountForTest(
+	phase: string,
+	turnIndex = latestCountedTurnIndex,
+): number {
+	if (turnIndex === undefined) return 0;
+	return turnCounts.get(turnIndex)?.get(phase) ?? 0;
+}
+
+/** Test-only: number of turn buckets retained by the bounded counter. */
+export function _boundedTrackedTurnsForTest(): number {
+	return turnCounts.size;
 }

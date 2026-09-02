@@ -40,10 +40,6 @@ vi.mock("../../clients/project-snapshot.js", async (importOriginal) => {
 	};
 });
 
-async function flushMicrotasks(): Promise<void> {
-	for (let i = 0; i < 25; i++) await new Promise((r) => setTimeout(r, 5));
-}
-
 beforeEach(() => {
 	logSpy.mockClear();
 	failPersist.value = false;
@@ -71,11 +67,19 @@ describe("word-index observability (#958)", () => {
 			const { collectWordIndexDocs, WORD_INDEX_MAX_BYTES } =
 				await import("../../clients/word-index.js");
 			createTempFile(env.tmpDir, "src/small.ts", "export const kept = 1;");
-			createTempFile(
-				env.tmpDir,
-				"src/huge.ts",
-				`// x\nexport const big = "${"z".repeat(WORD_INDEX_MAX_BYTES + 16)}";\n`,
-			);
+			// The oversized fixture must stay HUMAN-shaped: many ordinary lines,
+			// not one giant line. Since #2346 a giant single-line file classifies
+			// as machine-emitted generated and is pruned at the source walk, so
+			// the oversized-skip accounting below would otherwise see nothing to
+			// count. A many-line >cap file still exercises the L1 contract.
+			const bodyLine = `export const data = "${"x".repeat(48)}";`;
+			const hugeBody = Array.from(
+				{
+					length: Math.ceil((WORD_INDEX_MAX_BYTES + 16) / bodyLine.length),
+				},
+				(_, i) => `// section ${i}\n${bodyLine}`,
+			).join("\n");
+			createTempFile(env.tmpDir, "src/huge.ts", `// x\n${hugeBody}\n`);
 
 			const docs = await collectWordIndexDocs(env.tmpDir);
 
@@ -104,7 +108,11 @@ describe("word-index observability (#958)", () => {
 			failPersist.value = true;
 			scheduleWordIndexPersist(env.tmpDir, index);
 			flushWordIndexPersistsForTests();
-			await flushMicrotasks();
+			await vi.waitFor(() =>
+				expect(
+					logSpy.mock.calls.some((c) => c[0]?.phase === "persist_failed"),
+				).toBe(true),
+			);
 
 			const persistFailed = logSpy.mock.calls.find(
 				(c) => c[0]?.phase === "persist_failed",
@@ -128,19 +136,31 @@ describe("word-index observability (#958)", () => {
 		try {
 			const {
 				buildWordIndex,
+				updateWordIndexDocument,
 				scheduleWordIndexPersist,
 				flushWordIndexPersistsForTests,
 			} = await import("../../clients/word-index.js");
 			const index = buildWordIndex([
 				{ path: "a.ts", content: "export const alpha = 1;" },
 			]);
+			updateWordIndexDocument(index, {
+				path: "a.ts",
+				content: "export const alpha = 2;",
+			});
 
 			scheduleWordIndexPersist(env.tmpDir, index);
 			flushWordIndexPersistsForTests();
-			await flushMicrotasks();
+			await vi.waitFor(() =>
+				expect(
+					logSpy.mock.calls.some(
+						(c) =>
+							c[0]?.phase === "persist_succeeded" && c[0]?.cwd === env.tmpDir,
+					),
+				).toBe(true),
+			);
 
 			const ok = logSpy.mock.calls.find(
-				(c) => c[0]?.phase === "persist_succeeded",
+				(c) => c[0]?.phase === "persist_succeeded" && c[0]?.cwd === env.tmpDir,
 			);
 			expect(ok).toBeDefined();
 			expect(ok?.[0]).toEqual(
@@ -149,12 +169,134 @@ describe("word-index observability (#958)", () => {
 					trigger: "per_edit",
 					indexedFileCount: 1,
 					tokens: expect.any(Number),
+					postingEntries: expect.any(Number),
+					replacementCount: 1,
+					totalReplacementMs: expect.any(Number),
+					maxReplacementMs: expect.any(Number),
 				}),
 			);
 			// And no persist_failed on the success path.
 			expect(
 				logSpy.mock.calls.find((c) => c[0]?.phase === "persist_failed"),
 			).toBeUndefined();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("records bounded arena recompaction measurements", async () => {
+		const env = setupTestEnvironment("pi-lens-word-recompact-log-");
+		try {
+			const {
+				buildWordIndex,
+				flushWordIndexRecompactionsForTests,
+				updateWordIndexDocument,
+			} = await import("../../clients/word-index.js");
+			const index = buildWordIndex(
+				Array.from({ length: 70 }, (_, file) => ({
+					path: `${env.tmpDir}/f${file}.ts`,
+					content: `sharedToken stableToken${file}`,
+				})),
+			);
+			for (let file = 0; file < 70; file += 1) {
+				updateWordIndexDocument(index, {
+					path: `${env.tmpDir}/f${file}.ts`,
+					content: `sharedToken changedToken${file} revision`,
+				});
+			}
+			await flushWordIndexRecompactionsForTests(index);
+			expect(logSpy.mock.calls).toContainEqual([
+				expect.objectContaining({
+					phase: "incremental_refresh",
+					trigger: "incremental_refresh",
+					reason: expect.stringMatching(
+						/^arena_recompact beforeBytes=\d+ afterBytes=\d+ beforeStores=\d+ afterStores=1$/,
+					),
+				}),
+			]);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("records them for the per-edit seam's cooperative primitive too", async () => {
+		const env = setupTestEnvironment("pi-lens-word-recompact-async-");
+		try {
+			const {
+				buildWordIndex,
+				flushWordIndexRecompactionsForTests,
+				updateWordIndexDocumentForEdit,
+			} = await import("../../clients/word-index.js");
+			const index = buildWordIndex(
+				Array.from({ length: 70 }, (_, file) => ({
+					path: `${env.tmpDir}/f${file}.ts`,
+					content: `sharedToken stableToken${file}`,
+				})),
+			);
+			for (let file = 0; file < 70; file += 1) {
+				expect(
+					await updateWordIndexDocumentForEdit(index, {
+						path: `${env.tmpDir}/f${file}.ts`,
+						content: `sharedToken changedToken${file} revision`,
+					}),
+				).toBe(true);
+			}
+			await flushWordIndexRecompactionsForTests(index);
+			expect(logSpy.mock.calls).toContainEqual([
+				expect.objectContaining({
+					phase: "incremental_refresh",
+					trigger: "incremental_refresh",
+					reason: expect.stringMatching(
+						/^arena_recompact beforeBytes=\d+ afterBytes=\d+ beforeStores=\d+ afterStores=1$/,
+					),
+				}),
+			]);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("resets replacementCount between successful persist records", async () => {
+		const env = setupTestEnvironment("pi-lens-word-replacement-reset-");
+		try {
+			const {
+				buildWordIndex,
+				updateWordIndexDocument,
+				scheduleWordIndexPersist,
+				flushWordIndexPersistsForTests,
+			} = await import("../../clients/word-index.js");
+			const index = buildWordIndex([{ path: "a.ts", content: "alpha" }]);
+			updateWordIndexDocument(index, { path: "a.ts", content: "beta" });
+			scheduleWordIndexPersist(env.tmpDir, index);
+			flushWordIndexPersistsForTests();
+			await vi.waitFor(() =>
+				expect(
+					logSpy.mock.calls.filter(
+						(c) =>
+							c[0]?.phase === "persist_succeeded" && c[0]?.cwd === env.tmpDir,
+					).length,
+				).toBe(1),
+			);
+			scheduleWordIndexPersist(env.tmpDir, index);
+			flushWordIndexPersistsForTests();
+			await vi.waitFor(() =>
+				expect(
+					logSpy.mock.calls.filter(
+						(c) =>
+							c[0]?.phase === "persist_succeeded" && c[0]?.cwd === env.tmpDir,
+					).length,
+				).toBe(2),
+			);
+			const records = logSpy.mock.calls
+				.map((call) => call[0])
+				.filter(
+					(record) =>
+						record?.phase === "persist_succeeded" && record?.cwd === env.tmpDir,
+				);
+			expect(records).toHaveLength(2);
+			expect(records[1]).toEqual(
+				expect.objectContaining({ replacementCount: 0 }),
+			);
 		} finally {
 			env.cleanup();
 		}
@@ -172,7 +314,11 @@ describe("word-index observability (#958)", () => {
 				await import("../../clients/word-index.js");
 
 			triggerBackgroundWordIndexBuild(env.tmpDir);
-			await flushMicrotasks();
+			await vi.waitFor(() =>
+				expect(
+					logSpy.mock.calls.some((c) => c[0]?.phase === "cold_build"),
+				).toBe(true),
+			);
 
 			const coldBuild = logSpy.mock.calls.find(
 				(c) => c[0]?.phase === "cold_build",

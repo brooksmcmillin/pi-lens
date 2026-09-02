@@ -11,6 +11,24 @@ export interface StaleIssueCandidate {
 	};
 	evidence: string[];
 }
+export interface PriorityLabeledIssue {
+	number: number;
+	title: string;
+	html_url?: string;
+	pull_request?: unknown;
+	labels?: Array<string | { name?: string }>;
+}
+export interface PriorityCoverage {
+	zero: PriorityLabeledIssue[];
+	multiple: PriorityLabeledIssue[];
+}
+export function checkPriorityCoverage(
+	issues: PriorityLabeledIssue[],
+): PriorityCoverage;
+export function shouldPost(options: {
+	candidates: StaleIssueCandidate[];
+	priorityCoverage: PriorityCoverage;
+}): boolean;
 export function detectStaleOpenIssues(options: {
 	fetcher: (
 		url: string,
@@ -18,10 +36,20 @@ export function detectStaleOpenIssues(options: {
 	) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
 	repository: string;
 	branch?: string;
-}): Promise<{ candidates: StaleIssueCandidate[]; truncatedCommits: number }>;
+}): Promise<{
+	candidates: StaleIssueCandidate[];
+	truncatedCommits: number;
+	scannedOpenItems: number;
+	priorityCoverage: PriorityCoverage;
+}>;
 export function formatSummary(
 	candidates: StaleIssueCandidate[],
-	options?: { runUrl?: string; truncatedCommits?: number },
+	options?: {
+		runUrl?: string;
+		truncatedCommits?: number;
+		scannedOpenItems?: number;
+		priorityCoverage?: PriorityCoverage;
+	},
 ): string;
 export function defaultFetcher(
 	token: string,

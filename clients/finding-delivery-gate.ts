@@ -411,6 +411,13 @@ export const DELIVERY_SURFACES: Record<string, DeliverySurfaceEntry> = {
 		["gateFindingsByPathFreshness"],
 		['store: "late-auxiliary-findings"'],
 	),
+	"runtime-turn:late-runner-findings": gated(
+		RUNTIME_TURN_FILE,
+		"Turn-end CLI runner findings collected after the post-write path.",
+		["gateFindingsByPathFreshness"],
+		['store: "late-runner-findings"'],
+		{ evidenceMin: 2 },
+	),
 	"runtime-turn:cascade-blocker": labeled(
 		RUNTIME_TURN_FILE,
 		"Turn-end 🧪 cascade neighbor blocker.",
@@ -513,6 +520,12 @@ export const DELIVERY_SURFACES: Record<string, DeliverySurfaceEntry> = {
 			"content IS the current state by construction.",
 		"live",
 	),
+	"test-runner-delivery:custom-entry": labeled(
+		"clients/test-runner-delivery.ts",
+		"Post-agent test-runner failures in a non-context custom entry.",
+		"The cache remains authoritative for pull diagnostics and the commit guard; this surface appends only after provenance validation and an idle recheck.",
+		"live",
+	),
 	"project-diagnostics:persisted-snapshot": gated(
 		LENS_DIAGNOSTICS_FILE,
 		"Cross-session persisted project-diagnostics snapshot read.",
@@ -560,11 +573,24 @@ export const DELIVERY_SURFACES: Record<string, DeliverySurfaceEntry> = {
 			"detection and delivery.",
 		"live",
 	),
+	"shared-checkout-guard:worktree-mutation-blocked": labeled(
+		"clients/shared-checkout-guard.ts",
+		"Shared-checkout 🔴 WORKING-TREE CHANGE BLOCKED verdict (--lens-checkout-guard).",
+		"Synchronous preflight rejection returned inline with the failed git " +
+			"command. Both inputs are read at decision time — the instance registry " +
+			"and `git status` — so no stored finding is replayed and nothing can go " +
+			"stale between detection and delivery.",
+		"live",
+	),
 	"read-guard-tool-lines:preflight-errors": labeled(
 		"clients/read-guard-tool-lines.ts",
-		"Read-guard hashline BLOCKED / RE-READ REQUIRED preflight errors.",
+		"Read-guard hashline BLOCKED / RE-READ REQUIRED / PARTIAL APPLY / " +
+			"ALREADY APPLIED preflight errors (#2402).",
 		"Computed fresh per edit attempt and returned as that attempt's rejection — " +
-			"no cached findings are replayed, so there is no staleness window.",
+			"no cached findings are replayed, so there is no staleness window. The " +
+			"PARTIAL APPLY and ALREADY APPLIED variants describe the same attempt's " +
+			"commit outcome; applied-edit recognition reads RuntimeCoordinator's " +
+			"session-scoped record, which resets with the session.",
 		"live",
 	),
 	"tool-call:duplicate-export-blocker": labeled(

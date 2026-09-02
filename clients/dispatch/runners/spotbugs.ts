@@ -213,7 +213,6 @@ const spotbugsRunner: RunnerDefinition = {
 	id: "spotbugs",
 	appliesTo: ["java", "kotlin"],
 	priority: PRIORITY.DEEP_LANGUAGE_ANALYSIS,
-	enabledByDefault: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
 		const cwd = ctx.cwd || process.cwd();

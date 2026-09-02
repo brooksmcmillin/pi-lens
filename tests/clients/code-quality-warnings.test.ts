@@ -200,7 +200,7 @@ describe("id path-form stability (#1816 — #533 class swept into the warning st
 	// No persisted-store migration is needed here (unlike
 	// actionable-warnings.ts) — see that id builder's own doc comment for why
 	// `cq:` ids are ephemeral-per-turn.
-	it("computes the same id for a raw mis-cased path form and its normalized form", () => {
+	it("computes the same id for a raw mis-cased path form and its normalized form", (ctx) => {
 		const projectDir = fs.mkdtempSync(
 			path.join(os.tmpdir(), "pi-lens-cq-id-form-"),
 		);
@@ -211,9 +211,12 @@ describe("id path-form stability (#1816 — #533 class swept into the warning st
 			fs.writeFileSync(fileOnDisk, "function fn() {}\n");
 
 			const rawFile = path.join(projectDir, "SUB", "a.ts");
-			// Only aliases on a case-insensitive filesystem — skip honestly on
-			// Linux CI rather than asserting something the FS can't produce.
-			if (!fs.existsSync(rawFile)) return;
+			// Only aliases on a case-insensitive filesystem. Skip VISIBLY on Linux
+			// CI rather than returning, which reports a pass (#2089).
+			ctx.skip(
+				!fs.existsSync(rawFile),
+				"case-sensitive filesystem: SUB/a.ts does not alias sub/a.ts",
+			);
 
 			const rawRecord = recordFromCodeQualityDiagnostic(
 				makeQualityWarning(rawFile),

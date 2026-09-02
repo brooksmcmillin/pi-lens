@@ -9,6 +9,7 @@ import {
 	FORMATTER_POLICY_BY_EXTENSION,
 	FORMATTER_POLICY_BY_FILENAME,
 } from "../../clients/tool-policy.js";
+import { assertNonEmptyScan } from "../support/sweep-kit.js";
 
 // Bidirectional drift guard binding the two hand-maintained INVERSE mappings of
 // the formatter↔extension relation (#1135, the #883/#209 single-source-of-truth
@@ -48,8 +49,15 @@ function collectViolations<T>(items: Iterable<T>, check: Checker<T>): string[] {
 	return violations;
 }
 
-function expectClean<T>(items: Iterable<T>, check: Checker<T>): void {
-	const violations = collectViolations(items, check);
+function expectClean<T>(
+	label: string,
+	items: Iterable<T>,
+	check: Checker<T>,
+	minimumItemCount: number,
+): void {
+	const materialized = [...items];
+	assertNonEmptyScan(label, materialized.length, minimumItemCount);
+	const violations = collectViolations(materialized, check);
 	expect(violations, violations.join("\n")).toEqual([]);
 }
 
@@ -112,82 +120,117 @@ const NO_POLICY_FALLBACK_EXTS = new Set<string>([
 	".ru", // rubocop
 ]);
 
+// Calibration: ALL_FORMATTERS contains 34 definitions on 2026-08-26; keep
+// half, rounded up, so an emptied registry cannot read as a clean consistency
+// suite.
+assertNonEmptyScan("formatter definitions", ALL_FORMATTERS.length, 17);
+
 describe("formatter ↔ policy consistency (#1135)", () => {
 	it("every multi-formatter extension has one unique deterministic default (#1306)", () => {
-		expectClean(FORMATTER_POLICY_BY_EXTENSION, ([ext, policy]) => {
-			if (policy.formatterNames.length < 2) return null;
-			const uniqueNames = new Set(policy.formatterNames);
-			if (uniqueNames.size !== policy.formatterNames.length) {
-				return `${ext} contains duplicate formatter claims`;
-			}
-			return policy.defaultFormatter && uniqueNames.has(policy.defaultFormatter)
-				? null
-				: `${ext} has multiple formatter candidates but no defaultFormatter among them`;
-		});
+		expectClean(
+			"formatter extension policies",
+			FORMATTER_POLICY_BY_EXTENSION,
+			([ext, policy]) => {
+				if (policy.formatterNames.length < 2) return null;
+				const uniqueNames = new Set(policy.formatterNames);
+				if (uniqueNames.size !== policy.formatterNames.length) {
+					return `${ext} contains duplicate formatter claims`;
+				}
+				return policy.defaultFormatter &&
+					uniqueNames.has(policy.defaultFormatter)
+					? null
+					: `${ext} has multiple formatter candidates but no defaultFormatter among them`;
+			},
+			36,
+		);
 	});
 	it("every formatter definition extension is policy-included, a documented exclusion, or a documented no-policy fallback (direction 1: no silent drop)", () => {
-		expectClean(definitionExtensionPairs, ({ name, ext }) => {
-			const policy = FORMATTER_POLICY_BY_EXTENSION.get(ext);
-			if (!policy) {
-				// No policy entry → offered via the no-policy fallback path. Must be a
-				// consciously documented fallback extension.
-				return NO_POLICY_FALLBACK_EXTS.has(ext)
-					? null
-					: `${name} claims ${ext} but there is NO formatter policy for ${ext} and it is not in NO_POLICY_FALLBACK_EXTS (add a policy entry or document the fallback)`;
-			}
-			// A non-empty candidate list GATES selection to those names; if the
-			// formatter isn't among them, the extension is silently dropped for it —
-			// unless it's a deliberate exclusion.
-			const gatedOut =
-				policy.formatterNames.length > 0 &&
-				!policy.formatterNames.includes(name) &&
-				!DELIBERATE_POLICY_EXCLUSIONS.has(`${name}|${ext}`);
-			return gatedOut
-				? `${name} claims ${ext} but the ${ext} policy [${policy.formatterNames.join(", ")}] excludes it (never offered) — add it to the policy or to DELIBERATE_POLICY_EXCLUSIONS`
-				: null;
-		});
+		expectClean(
+			"formatter definition extensions",
+			definitionExtensionPairs,
+			({ name, ext }) => {
+				const policy = FORMATTER_POLICY_BY_EXTENSION.get(ext);
+				if (!policy) {
+					// No policy entry → offered via the no-policy fallback path. Must be a
+					// consciously documented fallback extension.
+					return NO_POLICY_FALLBACK_EXTS.has(ext)
+						? null
+						: `${name} claims ${ext} but there is NO formatter policy for ${ext} and it is not in NO_POLICY_FALLBACK_EXTS (add a policy entry or document the fallback)`;
+				}
+				// A non-empty candidate list GATES selection to those names; if the
+				// formatter isn't among them, the extension is silently dropped for it —
+				// unless it's a deliberate exclusion.
+				const gatedOut =
+					policy.formatterNames.length > 0 &&
+					!policy.formatterNames.includes(name) &&
+					!DELIBERATE_POLICY_EXCLUSIONS.has(`${name}|${ext}`);
+				return gatedOut
+					? `${name} claims ${ext} but the ${ext} policy [${policy.formatterNames.join(", ")}] excludes it (never offered) — add it to the policy or to DELIBERATE_POLICY_EXCLUSIONS`
+					: null;
+			},
+			62,
+		);
 	});
 
 	it("every extension-policy formatterName is a real formatter whose definition claims that extension (direction 2: no broken option)", () => {
-		expectClean(extensionPolicyNamePairs, ({ ext, name }) => {
-			if (!formatterByName.has(name)) {
-				return `policy ${ext} names "${name}" but no formatter definition exists with that name`;
-			}
-			return extensionsOf(name).has(ext)
-				? null
-				: `policy ${ext} names "${name}" but ${name}'s definition does not claim ${ext} (broken option)`;
-		});
+		expectClean(
+			"formatter extension policy names",
+			extensionPolicyNamePairs,
+			({ ext, name }) => {
+				if (!formatterByName.has(name)) {
+					return `policy ${ext} names "${name}" but no formatter definition exists with that name`;
+				}
+				return extensionsOf(name).has(ext)
+					? null
+					: `policy ${ext} names "${name}" but ${name}'s definition does not claim ${ext} (broken option)`;
+			},
+			56,
+		);
 	});
 
 	it("every policy defaultFormatter maps to a real formatter definition (extension + filename policies; #1135 comment: terragrunt-hcl)", () => {
-		expectClean(defaultFormatterEntries, ({ kind, key, defaultFormatter }) => {
-			if (!defaultFormatter || formatterByName.has(defaultFormatter))
-				return null;
-			return `${kind} policy ${key} has defaultFormatter "${defaultFormatter}" with no formatter definition`;
-		});
+		expectClean(
+			"formatter default entries",
+			defaultFormatterEntries,
+			({ kind, key, defaultFormatter }) => {
+				if (!defaultFormatter || formatterByName.has(defaultFormatter))
+					return null;
+				return `${kind} policy ${key} has defaultFormatter "${defaultFormatter}" with no formatter definition`;
+			},
+			37,
+		);
 	});
 
 	it("every filename-policy formatterName is a real formatter whose definition claims that filename (terragrunt.hcl class)", () => {
-		expectClean(filenamePolicyNamePairs, ({ filename, name }) => {
-			const formatter = formatterByName.get(name);
-			if (!formatter) {
-				return `filename policy ${filename} names "${name}" but no formatter definition exists with that name`;
-			}
-			const claimed = (formatter.filenames ?? []).map((f) => f.toLowerCase());
-			return claimed.includes(filename.toLowerCase())
-				? null
-				: `filename policy ${filename} names "${name}" but ${name}'s definition does not claim filename ${filename}`;
-		});
+		expectClean(
+			"formatter filename policy names",
+			filenamePolicyNamePairs,
+			({ filename, name }) => {
+				const formatter = formatterByName.get(name);
+				if (!formatter) {
+					return `filename policy ${filename} names "${name}" but no formatter definition exists with that name`;
+				}
+				const claimed = (formatter.filenames ?? []).map((f) => f.toLowerCase());
+				return claimed.includes(filename.toLowerCase())
+					? null
+					: `filename policy ${filename} names "${name}" but ${name}'s definition does not claim filename ${filename}`;
+			},
+			1,
+		);
 	});
 
 	it("every AUTO_INSTALLABLE_DEFAULT_FORMATTERS key is a real formatter definition (sibling drift, #1086)", () => {
 		// Keys are formatter names consumed by getAutoInstallToolIdForFormatter (via
 		// formatter.name); a rename in formatters.ts that misses this map silently
 		// disables auto-install for that formatter.
-		expectClean(AUTO_INSTALLABLE_DEFAULT_FORMATTERS.keys(), (name) =>
-			formatterByName.has(name)
-				? null
-				: `AUTO_INSTALLABLE_DEFAULT_FORMATTERS names "${name}" with no formatter definition`,
+		expectClean(
+			"auto-installable formatter names",
+			AUTO_INSTALLABLE_DEFAULT_FORMATTERS.keys(),
+			(name) =>
+				formatterByName.has(name)
+					? null
+					: `AUTO_INSTALLABLE_DEFAULT_FORMATTERS names "${name}" with no formatter definition`,
+			3,
 		);
 	});
 
@@ -196,27 +239,32 @@ describe("formatter ↔ policy consistency (#1135)", () => {
 		// only legitimate if the formatter's definition DOES claim the extension AND
 		// the policy DOES actually gate it out. Otherwise a future author could
 		// silence a genuine "never offered" drift just by adding a decorative pair.
-		expectClean(DELIBERATE_POLICY_EXCLUSIONS, (pair) => {
-			const [name, ext] = pair.split("|");
-			const formatter = formatterByName.get(name);
-			if (!formatter) {
-				return `exclusion "${pair}" names formatter "${name}" which has no definition`;
-			}
-			if (!formatter.extensions.includes(ext)) {
-				return `exclusion "${pair}" is decorative: ${name}'s definition does not claim ${ext} (nothing to exclude)`;
-			}
-			const policy = FORMATTER_POLICY_BY_EXTENSION.get(ext);
-			if (!policy) {
-				return `exclusion "${pair}" is decorative: there is no ${ext} policy to exclude ${name} from`;
-			}
-			if (
-				policy.formatterNames.length === 0 ||
-				policy.formatterNames.includes(name)
-			) {
-				return `exclusion "${pair}" is unnecessary: the ${ext} policy [${policy.formatterNames.join(", ")}] already offers ${name} — remove the exclusion`;
-			}
-			return null;
-		});
+		expectClean(
+			"formatter deliberate exclusions",
+			DELIBERATE_POLICY_EXCLUSIONS,
+			(pair) => {
+				const [name, ext] = pair.split("|");
+				const formatter = formatterByName.get(name);
+				if (!formatter) {
+					return `exclusion "${pair}" names formatter "${name}" which has no definition`;
+				}
+				if (!formatter.extensions.includes(ext)) {
+					return `exclusion "${pair}" is decorative: ${name}'s definition does not claim ${ext} (nothing to exclude)`;
+				}
+				const policy = FORMATTER_POLICY_BY_EXTENSION.get(ext);
+				if (!policy) {
+					return `exclusion "${pair}" is decorative: there is no ${ext} policy to exclude ${name} from`;
+				}
+				if (
+					policy.formatterNames.length === 0 ||
+					policy.formatterNames.includes(name)
+				) {
+					return `exclusion "${pair}" is unnecessary: the ${ext} policy [${policy.formatterNames.join(", ")}] already offers ${name} — remove the exclusion`;
+				}
+				return null;
+			},
+			3,
+		);
 	});
 
 	it("NO_POLICY_FALLBACK_EXTS lists exactly the definition extensions that lack a policy (keeps the allowlist honest)", () => {

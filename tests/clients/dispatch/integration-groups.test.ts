@@ -48,7 +48,9 @@ describe("dispatch integration groups", () => {
 			getFlag: (name: string) => name === "no-lsp",
 		});
 
-		expect(groups).toHaveLength(1);
+		expect(groups).toHaveLength(3);
 		expect(groups[0].runnerIds).toEqual(["stylelint"]);
+		expect(groups[1].runnerIds).toEqual(["tree-sitter"]);
+		expect(groups[2].runnerIds).toEqual(["ast-grep-napi"]);
 	});
 });

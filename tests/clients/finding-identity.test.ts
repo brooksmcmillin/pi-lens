@@ -82,7 +82,7 @@ describe("finding-identity", () => {
 	// inside relativeFile (i.e. reverting to bare path.relative(cwd, filePath))
 	// makes this fail on a case-insensitive filesystem, since `SUB/a.ts` and
 	// `sub/a.ts` would then relativize to different strings.
-	it("relativeFile canonicalizes a raw mis-cased path form to the same relative path as its normalized form", () => {
+	it("relativeFile canonicalizes a raw mis-cased path form to the same relative path as its normalized form", (ctx) => {
 		const projectDir = fs.mkdtempSync(
 			path.join(os.tmpdir(), "pi-lens-finding-identity-"),
 		);
@@ -97,9 +97,12 @@ describe("finding-identity", () => {
 			const rawFile = path.join(projectDir, "SUB", "a.ts");
 			// This mis-cased scenario only aliases on a CASE-INSENSITIVE filesystem
 			// (Windows/macOS default). On a case-sensitive FS (Linux CI), `SUB` and
-			// `sub` are genuinely different paths — skip honestly rather than
-			// asserting something the filesystem can't produce.
-			if (!fs.existsSync(rawFile)) return;
+			// `sub` are genuinely different paths — skip VISIBLY rather than
+			// returning, which reports a pass (#2089).
+			ctx.skip(
+				!fs.existsSync(rawFile),
+				"case-sensitive filesystem: SUB/a.ts does not alias sub/a.ts",
+			);
 
 			const normalizedCwd = normalizeMapKey(projectDir);
 			const normalizedFile = normalizeMapKey(fileOnDisk);

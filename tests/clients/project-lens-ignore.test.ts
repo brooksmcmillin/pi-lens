@@ -1,10 +1,11 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	createProjectIgnoreMatcher,
 	getProjectIgnoreMatcher,
+	PROJECT_IGNORE_FRESHNESS_CADENCE_MS,
 } from "../../clients/file-utils.js";
 import { resetProjectLensConfigCache } from "../../clients/project-lens-config.js";
 import {
@@ -21,6 +22,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	vi.useRealTimers();
 	removeTempDirSync(tmpDir);
 	resetProjectLensConfigCache();
 });
@@ -271,6 +273,12 @@ describe("ignore-matcher cache freshness (#1105 mtime+size)", () => {
 		fs.writeFileSync(nestedConfig, JSON.stringify({ ignore: ["skip-new/**"] }));
 		fs.utimesSync(nestedConfig, pinned, pinned);
 
+		// #2071: the nested rules and the verdicts derived from them now share one
+		// clock, so the gate re-checks at window expiry rather than per call. The
+		// size axis under test is unchanged; only when it is consulted moved.
+		vi.useFakeTimers();
+		vi.setSystemTime(Date.now() + PROJECT_IGNORE_FRESHNESS_CADENCE_MS + 1);
+
 		// Fresh paths → bypass patternMemo → hit the nested cache gate.
 		expect(matcher.isIgnored(path.join(subDir, "skip-new/y.ts"), false)).toBe(
 			true,
@@ -298,6 +306,10 @@ describe("ignore-matcher cache freshness (#1105 mtime+size)", () => {
 		// Shorter, different .gitignore; restore the SAME mtime.
 		fs.writeFileSync(nestedGitignore, "new-dir/\n");
 		fs.utimesSync(nestedGitignore, pinned, pinned);
+
+		// #2071: same shared clock as the .pi-lens.json case above.
+		vi.useFakeTimers();
+		vi.setSystemTime(Date.now() + PROJECT_IGNORE_FRESHNESS_CADENCE_MS + 1);
 
 		// Fresh paths → bypass patternMemo → hit the nested cache gate.
 		expect(matcher.isIgnored(path.join(subDir, "new-dir/y.ts"), false)).toBe(

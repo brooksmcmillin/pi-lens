@@ -37,7 +37,12 @@ const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
 const logLatency = vi.fn();
 
-vi.mock("../../../clients/latency-logger.js", () => ({ logLatency }));
+vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
+	...(await importActual<
+		typeof import("../../../clients/latency-logger.js")
+	>()),
+	logLatency,
+}));
 vi.mock("../../../clients/lsp/config.js", () => ({
 	getServersForFileWithConfig,
 	getServerInitOverride: vi.fn().mockReturnValue(undefined),

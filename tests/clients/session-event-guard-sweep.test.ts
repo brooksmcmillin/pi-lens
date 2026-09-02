@@ -58,7 +58,7 @@ const UNWRAPPED_HANDLER_REASONS: Readonly<Record<string, string>> = {
 	session_shutdown:
 		"The stable-id read is inside a try/catch; activation-owned role decides every post-start shutdown, and the pre-start fallback remains behind noteSessionShutdown's probe. A known secondary returns before shared teardown, while an inconclusive pre-start fallback still tears down to avoid leaking the LSP fleet.",
 	message_end:
-		"The handler body is a total try/catch, and its only ctx reader is getStableSessionId (its own try/catch); activation-owned role classification reads closure state and its pre-session fallback is probe-based. Nothing throws and nothing is skipped: a stale ctx degrades the cache_usage row to an unattributed sessionId instead. Wrapping it would DROP a row whose `message` payload is still valid, so the fix is a bounded attribution record, not a skip. Tracked in #1956/#1996.",
+		"The handler body is a total try/catch, and its only ctx reader is getStableSessionId (its own try/catch); activation-owned role classification reads closure state and its pre-session fallback is probe-based. Nothing throws and nothing is skipped: a stale ctx degrades the cache_usage row to an unattributed sessionId instead. Wrapping it would DROP a row whose `message` payload is still valid, so the handler records the attribution loss as a bounded `cache-usage-attribution-stale` ledger entry (subject `message_end`) when `probeCtxActive` confirms the stale ctx, while the row keeps writing. (#1956)",
 };
 
 /** One `pi.on("<event>", ...)` registration found in index.ts. */

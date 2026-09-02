@@ -218,6 +218,8 @@ export const UNBOUNDED_FAILURE_PHASE_REASONS: Record<string, string> = {
 		"One record per instance-registry write failure, and those writes are per-child lifecycle events (spawn, shutdown).",
 	module_report_extract_error:
 		"One record per module-report extraction of one file, so volume follows the files the agent asks about.",
+	dispatch_skipped_generated:
+		"Deduplicated to one record per file per process by `generatedSkipRecorded`; repeated dispatches of the same generated file aggregate in the `dispatch-skipped-generated` degradation ledger, which is already bounded per kind and subject.",
 	module_report_callback_extract_error:
 		"Same bound as `module_report_extract_error`: once per extraction of one file.",
 	module_report_import_resolve_error:

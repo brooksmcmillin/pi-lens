@@ -32,7 +32,17 @@ vi.mock("../../../clients/lsp/config.js", () => ({
 	getServerInitOverride: vi.fn().mockReturnValue(undefined),
 }));
 vi.mock("../../../clients/lsp/client.js", () => ({ createLSPClient }));
-vi.mock("../../../clients/latency-logger.js", () => ({ logLatency }));
+// Partial mock, not a whole-module replacement (#1723): `() => ({ logLatency })`
+// replaces the ENTIRE module, so the day `clients/lsp/index.ts` imports one
+// more thing from latency-logger — as it now does, for the sweep's phase
+// bracket — this file dies with "No <name> export is defined on the mock".
+// Spreading the actual module overrides only what this test needs to observe.
+vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
+	...(await importActual<
+		typeof import("../../../clients/latency-logger.js")
+	>()),
+	logLatency,
+}));
 
 function makeTsServer(root: string) {
 	return {

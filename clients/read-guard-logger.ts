@@ -2,6 +2,7 @@ import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
 import { getGlobalPiLensDir } from "./file-utils.js";
 import { createNdjsonLogger } from "./ndjson-logger.js";
+import { normalizeFilePath } from "./path-utils.js";
 
 const READ_GUARD_LOG_DIR = getGlobalPiLensDir();
 const READ_GUARD_LOG_FILE = path.join(READ_GUARD_LOG_DIR, "read-guard.log");
@@ -34,8 +35,9 @@ export const MAX_EDIT_BATCH_ITEMS = 100;
 
 export type EditBatchRejectionCode =
 	| "oldtext_not_found"
+	| "oldtext_unrepresentable"
 	| "oldtext_duplicate"
-	| "replace_once_skipped"
+	| "span_overlap"
 	| "preflight_blocked"
 	| "write_failed"
 	| "pipeline_failed";
@@ -60,6 +62,10 @@ export interface ReadGuardEditBatchSummary {
 	appliedCount: number;
 	appliedTotal: number;
 	appliedIndexes: number[];
+	/** Edits recognized as exact retries of already-applied pairs (#2402). */
+	alreadyAppliedCount: number;
+	alreadyAppliedTotal: number;
+	alreadyAppliedIndexes: number[];
 	/** Correlations participating in a coalesced terminal outcome. */
 	participantIds: string[];
 	participantTotal: number;
@@ -132,6 +138,8 @@ export function createReadGuardEditBatchSummary(args: {
 	rejectedTotal?: number;
 	appliedIndexes?: number[];
 	appliedTotal?: number;
+	alreadyAppliedIndexes?: number[];
+	alreadyAppliedTotal?: number;
 	participantIds?: string[];
 	participantTotal?: number;
 	commitStatus?: ReadGuardEditBatchSummary["commitStatus"];
@@ -145,6 +153,7 @@ export function createReadGuardEditBatchSummary(args: {
 		(entry) => Number.isInteger(entry.index) && entry.index >= 0,
 	);
 	const appliedSource = validIndexes(args.appliedIndexes ?? []);
+	const alreadyAppliedSource = validIndexes(args.alreadyAppliedIndexes ?? []);
 	const requestedIndexes = boundedEditIndexes(requestedSource);
 	const resolvedIndexes = boundedEditIndexes(resolvedSource);
 	const rejectedReasons = rejectedSource.slice(0, MAX_EDIT_BATCH_ITEMS);
@@ -152,6 +161,7 @@ export function createReadGuardEditBatchSummary(args: {
 		rejectedSource.map((entry) => entry.index),
 	);
 	const appliedIndexes = boundedEditIndexes(appliedSource);
+	const alreadyAppliedIndexes = boundedEditIndexes(alreadyAppliedSource);
 	const participantSource = (args.participantIds ?? []).filter(
 		(id): id is string => typeof id === "string" && id.length > 0,
 	);
@@ -184,6 +194,10 @@ export function createReadGuardEditBatchSummary(args: {
 		appliedCount: appliedSource.length,
 		appliedTotal: args.appliedTotal ?? appliedSource.length,
 		appliedIndexes,
+		alreadyAppliedCount: alreadyAppliedSource.length,
+		alreadyAppliedTotal:
+			args.alreadyAppliedTotal ?? alreadyAppliedSource.length,
+		alreadyAppliedIndexes,
 		participantIds,
 		participantTotal: args.participantTotal ?? participantSource.length,
 		participantIdsTruncated:
@@ -194,7 +208,9 @@ export function createReadGuardEditBatchSummary(args: {
 				requestedIndexes.length ||
 			(args.resolvedTotal ?? resolvedSource.length) > resolvedIndexes.length ||
 			(args.rejectedTotal ?? rejectedSource.length) > rejectedIndexes.length ||
-			(args.appliedTotal ?? appliedSource.length) > appliedIndexes.length,
+			(args.appliedTotal ?? appliedSource.length) > appliedIndexes.length ||
+			(args.alreadyAppliedTotal ?? alreadyAppliedSource.length) >
+				alreadyAppliedIndexes.length,
 		commitStatus,
 		postEditStatus,
 		terminalStatus,
@@ -236,6 +252,10 @@ export function shouldLogEvent(event: string): boolean {
 		event === "edit_preflight_blocked" ||
 		event === "edit_partial_apply" ||
 		event === "edit_partial_apply_skipped" ||
+		// #2402: pre-write batch rejections and recognized exact retries are the
+		// two new partial-apply outcomes; each is rare by construction.
+		event === "edit_partial_apply_rejected" ||
+		event === "edit_already_applied_retry" ||
 		event === "edit_post_edit_pipeline_failed" ||
 		event === "edit_batch_summary" ||
 		event === "edit_batch_summary_overflow" ||
@@ -244,7 +264,18 @@ export function shouldLogEvent(event: string): boolean {
 		// READ_GUARD_MAX_RECORDS_PER_FILE overflow triggers one), so this trim
 		// record bypasses the per-read verbosity gate — a live eviction
 		// regression must be visible without PI_LENS_READ_GUARD_VERBOSE=1.
-		event === "read_cap_trimmed"
+		event === "read_cap_trimmed" ||
+		// #1918: the record-cap trim's population siblings — whole-file
+		// eviction under real pressure (file cap or an external delete) and
+		// the per-file edits-cap trim. Idle-timeout eviction is deliberately
+		// EXCLUDED from this event (see read-guard.ts's evictFile doc
+		// comment) — it's routine housekeeping, not a fault, and its
+		// per-file cardinality is unbounded in a healthy session. Same
+		// rarity argument as #1913 for the reasons that DO fire: each is
+		// rising-edge gated once per file per session, so always-on
+		// visibility costs nothing.
+		event === "read_file_evicted" ||
+		event === "edits_cap_trimmed"
 	);
 }
 
@@ -333,7 +364,17 @@ export function logReadGuardEvent(entry: ReadGuardLogEntry): void {
 				? (bounded.value as Record<string, unknown>)
 				: undefined;
 	const { correlationId: _correlationId, ...logEntry } = entry;
-	writer.log({ ts: new Date().toISOString(), ...logEntry, metadata });
+	// #2219 (the #2141 class): `filePath` reaches here from
+	// `runtime-tool-result.ts`'s raw `path.resolve()`/`path.isAbsolute()`
+	// arithmetic (never `normalizeFilePath`-passed), always a genuine file —
+	// this field carries no non-path sentinel. Normalize once at this single
+	// emit seam, matching `review-graph-logger.ts`'s `logReviewGraph`.
+	writer.log({
+		ts: new Date().toISOString(),
+		...logEntry,
+		filePath: normalizeFilePath(logEntry.filePath),
+		metadata,
+	});
 }
 
 export function getReadGuardLogPath(): string {

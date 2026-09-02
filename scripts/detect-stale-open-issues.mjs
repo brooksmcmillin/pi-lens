@@ -5,6 +5,7 @@ import {
 	defaultFetcher,
 	detectStaleOpenIssues,
 	formatSummary,
+	shouldPost,
 } from "./lib/stale-open-issues.mjs";
 
 const repository = process.env.GITHUB_REPOSITORY;
@@ -15,15 +16,21 @@ const runUrl =
 	process.env.GITHUB_SERVER_URL && process.env.GITHUB_RUN_ID
 		? `${process.env.GITHUB_SERVER_URL}/${repository}/actions/runs/${process.env.GITHUB_RUN_ID}`
 		: undefined;
-const { candidates, truncatedCommits } = await detectStaleOpenIssues({
-	fetcher: defaultFetcher(token),
-	repository,
+const { candidates, truncatedCommits, scannedOpenItems, priorityCoverage } =
+	await detectStaleOpenIssues({
+		fetcher: defaultFetcher(token),
+		repository,
+	});
+const summary = formatSummary(candidates, {
+	runUrl,
+	truncatedCommits,
+	scannedOpenItems,
+	priorityCoverage,
 });
-const summary = formatSummary(candidates, { runUrl, truncatedCommits });
 console.log(summary);
 if (process.env.GITHUB_STEP_SUMMARY)
 	appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${summary}\n`);
-if (candidates.length > 0) {
+if (shouldPost({ candidates, priorityCoverage })) {
 	const headers = {
 		accept: "application/vnd.github+json",
 		authorization: `Bearer ${token}`,

@@ -143,8 +143,10 @@ Edits fail or warn when:
 
 A blocked edit returns a retryable message, e.g.:
 
-> `🔄 RETRYABLE — Edit without read … Read the file first, then retry the edit:
-> read path="<file>"`
+```text
+🔄 RETRYABLE — Edit without read: you have not read `<file>` in this
+conversation. Read it first, then retry: `read path="<file>"`.
+```
 
 **Correct behavior:** read the file (or the relevant range/symbol) *before* editing.
 Helpful mechanics you can rely on:

@@ -41,16 +41,17 @@
  *      `subagent_light_mode` phase logged. `subagent-mode.ts`'s doc comment
  *      requires the PAIR — a lone var set by some unrelated tool must not
  *      trigger light mode (#507/#518).
- *   6. concurrent_session_bind (#473's in-process guard) — NOT asserted.
+ *   6. concurrent_session_bind (#473's in-process guard) and its #2249
+ *      session-end summary concurrent_session_bind_rollup — NOT asserted.
  *      The guard IS fully wired on master (PR #477: `decideSessionStart` is
- *      called from `index.ts`'s `session_start` handler), so the phase
- *      exists — but OBSERVING it requires reproducing tintinweb's in-process
- *      model for real (a second `createAgentSession()` + `bindExtensions()`
- *      in the same process), and session construction needs model/provider
- *      config that can't cheaply be stubbed without a real key. #476
- *      explicitly asks not to ship something flaky here. Documented as a
- *      TODO in docs/subagent-compat.md; revisit if the SDK grows a
- *      model-free session constructor or a stub provider.
+ *      called from `index.ts`'s `session_start` handler), so both phases
+ *      exist — but OBSERVING either requires reproducing tintinweb's
+ *      in-process model for real (a second `createAgentSession()` +
+ *      `bindExtensions()` in the same process), and session construction
+ *      needs model/provider config that can't cheaply be stubbed without a
+ *      real key. #476 explicitly asks not to ship something flaky here.
+ *      Documented as a TODO in docs/subagent-compat.md; revisit if the SDK
+ *      grows a model-free session constructor or a stub provider.
  *
  * Usage: node scripts/compat-smoke-behavioral.mjs [--keep] [--tarball <path>]
  *   --keep            don't delete the scratch project/install dirs
@@ -71,6 +72,7 @@ import {
 	parseNdjsonEntries,
 	phaseWasLogged,
 } from "./lib/latency-log-phases.mjs";
+import { gitExecFileSync } from "./lib/git-fixture-env.mjs";
 
 const isWindows = process.platform === "win32";
 const HEAVYWEIGHT_SCAN_PHASES = [
@@ -109,11 +111,11 @@ function setUpFixtureProject(dir) {
 		path.join(dir, "package.json"),
 		'{ "name": "d", "version": "1.0.0", "type": "module" }\n',
 	);
-	execFileSync("git", ["init", "-q"], { cwd: dir });
-	execFileSync("git", ["config", "user.email", "t@t.t"], { cwd: dir });
-	execFileSync("git", ["config", "user.name", "t"], { cwd: dir });
-	execFileSync("git", ["add", "-A"], { cwd: dir });
-	execFileSync("git", ["commit", "-qm", "init"], { cwd: dir });
+	gitExecFileSync(["init", "-q"], { cwd: dir });
+	gitExecFileSync(["config", "user.email", "t@t.t"], { cwd: dir });
+	gitExecFileSync(["config", "user.name", "t"], { cwd: dir });
+	gitExecFileSync(["add", "-A"], { cwd: dir });
+	gitExecFileSync(["commit", "-qm", "init"], { cwd: dir });
 }
 
 function installPiLens(projectDir, tarball) {
@@ -551,18 +553,20 @@ async function main() {
 		}
 	}
 
-	// --- Assertion 6 (concurrent_session_bind, #473) — documented TODO ---
+	// --- Assertion 6 (concurrent_session_bind + concurrent_session_bind_rollup,
+	// #473 / #2249) — documented TODO ---
 	results.push({
 		id: "concurrent-session-bind-in-process",
 		pass: true,
 		skipped: true,
 		detail:
-			"NOT ASSERTED — decideSessionStart() (clients/session-lifecycle.ts) has no " +
-			"call site in index.ts as of this writing (grep confirms zero matches on " +
-			"master and on the open #473 PR branch); there is no concurrent_session_bind " +
-			"phase to observe yet. Reproducing tintinweb's in-process bindExtensions() " +
-			"model needs a full createAgentSession() + model config that isn't cheaply " +
-			"stubbable without a real model key. See docs/subagent-compat.md.",
+			"NOT ASSERTED — decideSessionStart() (clients/session-lifecycle.ts) IS wired " +
+			"into index.ts's session_start handler, so both the per-bind " +
+			"concurrent_session_bind phase and #2249's session-end " +
+			"concurrent_session_bind_rollup phase exist to observe. Reproducing " +
+			"tintinweb's in-process bindExtensions() model needs a full " +
+			"createAgentSession() + model config that isn't cheaply stubbable without a " +
+			"real model key. See docs/subagent-compat.md.",
 	});
 
 	console.log("\nbehavioral smoke assertions:");

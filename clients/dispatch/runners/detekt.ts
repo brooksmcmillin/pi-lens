@@ -140,7 +140,6 @@ const detektRunner: RunnerDefinition = {
 	id: "detekt",
 	appliesTo: ["kotlin"],
 	priority: PRIORITY.GENERAL_ANALYSIS,
-	enabledByDefault: true,
 	timeoutMs: 90_000,
 	skipTestFiles: false,
 

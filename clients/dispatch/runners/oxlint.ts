@@ -11,6 +11,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { walkUpDirs } from "../../path-utils.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
+import { truncatedByOutputCap } from "../../spawn-output-cap.js";
 import {
 	getJstsLintPolicyForCwd,
 	hasVitePlusConfig,
@@ -27,6 +28,12 @@ import {
 	resolveToolCommandWithInstallFallback,
 } from "./utils/runner-helpers.js";
 import { finishParsedRun, parseToolRun } from "./utils/tool-failure.js";
+
+// One file's JSON report. Nothing legitimate approaches 8 MiB here, so this is
+// a blast-radius bound on a runaway or wedged oxlint rather than a working
+// limit — the same value MAX_SG_OUTPUT_BYTES and MAX_REPORT_BYTES use, and what
+// makes `outputTruncated` reachable for this runner at all (#2100).
+const MAX_OXLINT_OUTPUT_BYTES = 8 * 1024 * 1024;
 
 const OXLINT_NO_FILES = Symbol("oxlint-no-files");
 const OXLINT_NO_FILES_UNCONFIRMED = Symbol("oxlint-no-files-unconfirmed");
@@ -97,7 +104,6 @@ const oxlintRunner: RunnerDefinition = {
 	id: "oxlint",
 	appliesTo: ["jsts"],
 	priority: PRIORITY.LINT_SECONDARY,
-	enabledByDefault: true,
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
@@ -131,6 +137,7 @@ const oxlintRunner: RunnerDefinition = {
 		// Run oxlint (or Vite+'s vp lint wrapper) on the file.
 		const result = await safeSpawnAsync(cmd, args, {
 			timeout: 30000,
+			maxOutputBytes: MAX_OXLINT_OUTPUT_BYTES,
 		});
 
 		// Oxlint exits 0 whenever nothing at ERROR severity was found — that
@@ -282,12 +289,12 @@ interface OxlintProcessEvidence {
 
 function oxlintProcessState(result: OxlintProcessEvidence): OxlintProcessState {
 	const failureKind = result.spawnFailure?.kind;
-	if (result.signal || result.failure === "signal") return "signal";
+	if (truncatedByOutputCap(result)) return "truncated";
 	if (result.failure === "timeout" || failureKind === "timeout")
 		return "timeout";
 	if (result.failure === "aborted" || failureKind === "killed") return "killed";
+	if (result.signal || result.failure === "signal") return "signal";
 	if (result.failure === "spawn" || result.error) return "spawn";
-	if (result.outputTruncated) return "truncated";
 	return "normal";
 }
 

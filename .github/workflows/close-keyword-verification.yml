@@ -21,5 +21,14 @@ jobs:
 
       - name: Verify referenced issues closed
         env:
+          # GH_TOKEN: the gh CLI calls in check-close-keywords.mjs (issue
+          # state lookups, the PR comment). GITHUB_TOKEN: the live-body
+          # fetch this step exists for (#2267 F1) -- check-pr-body.mjs's
+          # resolveLivePrBody/fetchLivePrBody read process.env.GITHUB_TOKEN
+          # specifically, not GH_TOKEN, so without this the live fetch
+          # always throws "GITHUB_TOKEN is not set" and every run silently
+          # falls back to the stale closed-event body -- the exact bug
+          # #2086 was filed to fix, still present under a different name.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: node scripts/check-close-keywords.mjs --verify-merged

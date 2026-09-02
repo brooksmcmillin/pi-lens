@@ -11,6 +11,7 @@ import {
 	getReviewGraphCacheIdentity,
 	getReviewGraphWorkspaceCacheSnapshot,
 	_getReviewGraphWorkspaceCacheKeysForTests,
+	_setReviewGraphWorkspaceEntryForTests,
 	_setReviewGraphBuildGateForTests,
 } from "../../clients/review-graph/builder.js";
 import { normalizeMapKey } from "../../clients/path-utils.js";
@@ -104,6 +105,17 @@ describe("buildOrUpdateGraph — Promise dedup cache", () => {
 		const second = await buildOrUpdateGraph(cwd, [], facts);
 		expect(second).not.toBe(first);
 		expect(second.nodes.size).toBe(first.nodes.size);
+		vi.useRealTimers();
+	});
+
+	it("keeps one live idle-eviction timer per replacement", () => {
+		vi.useFakeTimers();
+		vi.stubEnv("PI_LENS_REVIEW_GRAPH_IDLE_EVICT_MS", "100000");
+		const graph = { nodes: new Map(), edges: [] } as never;
+		const before = vi.getTimerCount();
+		for (let i = 0; i < 20; i++)
+			_setReviewGraphWorkspaceEntryForTests("workspace", graph);
+		expect(vi.getTimerCount() - before).toBe(1);
 		vi.useRealTimers();
 	});
 

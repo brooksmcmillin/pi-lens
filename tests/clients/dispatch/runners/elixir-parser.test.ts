@@ -87,17 +87,21 @@ describe("elixir-check output parser (parseElixirOutput)", () => {
 		});
 	});
 
-	it("matches paths case-insensitively on win32 (lowercase drive letter)", () => {
-		if (process.platform !== "win32") return;
-		// Elixir lowercases the drive letter and uses forward slashes.
-		const lowerDrive = target
-			.replace(/^[A-Z]:/, (m) => m.toLowerCase())
-			.replace(/\\/g, "/");
-		const raw = [
-			"    error: undefined function foo/0",
-			`    └─ ${lowerDrive}:4:5: App.greet/0`,
-		].join("\n");
+	// There is no drive letter to lowercase off Windows, so this declares itself
+	// skipped there instead of returning early and reporting a PASS (#2089).
+	it.skipIf(process.platform !== "win32")(
+		"matches paths case-insensitively on win32 (lowercase drive letter)",
+		() => {
+			// Elixir lowercases the drive letter and uses forward slashes.
+			const lowerDrive = target
+				.replace(/^[A-Z]:/, (m) => m.toLowerCase())
+				.replace(/\\/g, "/");
+			const raw = [
+				"    error: undefined function foo/0",
+				`    └─ ${lowerDrive}:4:5: App.greet/0`,
+			].join("\n");
 
-		expect(parseElixirOutput(raw, target, cwd)).toHaveLength(1);
-	});
+			expect(parseElixirOutput(raw, target, cwd)).toHaveLength(1);
+		},
+	);
 });

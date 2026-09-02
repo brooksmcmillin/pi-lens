@@ -27,6 +27,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { normalizeMapKey } from "../../../clients/path-utils.js";
 
 // --- Module-level mocks set up BEFORE any imports of the tested module ---
 
@@ -47,7 +48,10 @@ vi.mock("../../../clients/quiet-window.js", () => ({
 	registerQuietWindowTask: vi.fn(),
 }));
 
-vi.mock("../../../clients/latency-logger.js", () => ({
+vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
+	...(await importActual<
+		typeof import("../../../clients/latency-logger.js")
+	>()),
 	logLatency: vi.fn(),
 }));
 
@@ -393,6 +397,65 @@ describe("#707 per-edit tsserver sync clean-confirm in touchFile", () => {
 			expect(result).toBeDefined();
 			expect(result?.diags).toEqual([]);
 			expect(result?.inconclusive).toBeFalsy();
+		});
+
+		it("fresh empty publication before grace: does not launch the sync racer", async () => {
+			process.env.PI_LENS_TSSERVER_SYNC_GRACE_MS = "10";
+			const executeCommand = vi.fn();
+			const client = makeClient({
+				executeCommand,
+				waitForDiagnostics: vi.fn(
+					() => new Promise((resolve) => setTimeout(resolve, 80)),
+				),
+				getAllDiagnostics: () =>
+					new Map([[normalizeMapKey(FILE), { diags: [], ts: Date.now() }]]),
+			});
+			createLSPClient.mockResolvedValue(client);
+			getServersForFileWithConfig.mockReturnValue([makeServer("typescript")]);
+
+			const { LSPService } = await import("../../../clients/lsp/index.js");
+			const service = new LSPService();
+
+			const result = await service.touchFile(FILE, "const x = 1;\n", {
+				clientScope: "primary",
+				diagnostics: "document",
+				collectDiagnostics: true,
+				maxDiagnosticsWaitMs: 5000,
+				source: "test-2161-fresh-clean-publication",
+			});
+
+			expect(executeCommand).not.toHaveBeenCalled();
+			expect(result?.diags).toEqual([]);
+		});
+
+		it("stale empty publication before grace: launches the sync racer", async () => {
+			process.env.PI_LENS_TSSERVER_SYNC_GRACE_MS = "10";
+			const executeCommand = vi.fn();
+			const stalePublishedAt = Date.now() - 1_000;
+			const client = makeClient({
+				executeCommand: executeCommand.mockImplementation(makeSyncResponse({})),
+				waitForDiagnostics: vi.fn(() => new Promise(() => {})), // push pinned
+				getAllDiagnostics: () =>
+					new Map([
+						[normalizeMapKey(FILE), { diags: [], ts: stalePublishedAt }],
+					]),
+			});
+			createLSPClient.mockResolvedValue(client);
+			getServersForFileWithConfig.mockReturnValue([makeServer("typescript")]);
+
+			const { LSPService } = await import("../../../clients/lsp/index.js");
+			const service = new LSPService();
+
+			const result = await service.touchFile(FILE, "missingSymbol();\n", {
+				clientScope: "primary",
+				diagnostics: "document",
+				collectDiagnostics: true,
+				maxDiagnosticsWaitMs: 5000,
+				source: "test-2161-stale-clean-publication",
+			});
+
+			expect(executeCommand).toHaveBeenCalled();
+			expect(result?.diags).toEqual([]);
 		});
 
 		it("dirty file: racing sync winner surfaces the diagnostics, not discarded", async () => {

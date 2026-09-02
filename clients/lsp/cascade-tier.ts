@@ -78,6 +78,15 @@ import {
 } from "./wait-policy/classification.js";
 
 export { classifyServerWaitTier };
+// The observed-latency half of the collect-later policy is shared with CLI
+// runners. Keep this module as the LSP-facing export seam without duplicating
+// the state machine in the cascade classifier.
+export {
+	classifyObservedRunner,
+	observeRunnerLatency,
+	resetObservedRunnerLatency,
+	type CollectLaterTier,
+} from "../dispatch/collect-later-tier.js";
 
 /** Cascade-only extension of the shared wait policy. Native TS7 keeps the
  * shared `waits` policy everywhere else, but cascade collects its late pull

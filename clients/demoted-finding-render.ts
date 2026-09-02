@@ -181,3 +181,20 @@ export function formatRetirementNote(deadLines: readonly number[]): string {
 		"so this finding cannot be re-confirmed and will not be served again."
 	);
 }
+
+/**
+ * The one-line note a surface appends when it RETIRES a dependency-drift
+ * demotion at its delivery cap (#1950). Deliberately worded differently from
+ * {@link formatRetirementNote}: that one means the finding is provably
+ * unrecoverable (the cited lines are gone), while THIS retirement is a
+ * bounded-noise cap on a record that is still recoverable — a fresh dispatch
+ * of the file could still confirm or clear it. Saying "cannot be re-confirmed"
+ * here would be false.
+ */
+export function formatDeliveryCapNote(deliveryCount: number): string {
+	return (
+		`Not shown again after ${deliveryCount} deliveries with no re-run: ` +
+		"this finding may still be accurate, but re-serving it further adds no " +
+		"new information. A fresh dispatch of this file will re-confirm or clear it."
+	);
+}

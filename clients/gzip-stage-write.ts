@@ -13,6 +13,8 @@ export interface GzipStageWriteMetrics {
 	gzBytes: number;
 	serializeMs: number;
 	writeMs: number;
+	/** Wall-clock duration of the complete stage operation. */
+	durationMs: number;
 	/** Optional semantic digest derived from the serialized JSON. */
 	semanticFingerprint?: string;
 	/** True when the digest matched and no gzip or stage write ran. */
@@ -46,6 +48,7 @@ export interface GzipStageWorkerResult {
 	gzBytes?: number;
 	serializeMs?: number;
 	writeMs?: number;
+	durationMs?: number;
 	semanticFingerprint?: string;
 	skippedUnchanged?: boolean;
 	error?: string;
@@ -90,6 +93,10 @@ export async function writeGzipStageFile(
 	testDelayMs?: number,
 	options?: GzipStageWriteOptions,
 ): Promise<GzipStageWriteMetrics> {
+	// Worker-path duration starts inside this stage, so it includes the worker's
+	// test delay, serialization, gzip, and rename, but excludes postMessage queue
+	// latency. Main-thread callers measure from their inclusive persist entry.
+	const startedAt = performance.now();
 	const tmpPath = stagePathFor(stagePath);
 	try {
 		if (testDelayMs) {
@@ -109,6 +116,7 @@ export async function writeGzipStageFile(
 				gzBytes: 0,
 				serializeMs,
 				writeMs: 0,
+				durationMs: performance.now() - startedAt,
 				semanticFingerprint,
 				skippedUnchanged: true,
 			};
@@ -135,6 +143,7 @@ export async function writeGzipStageFile(
 			gzBytes,
 			serializeMs,
 			writeMs,
+			durationMs: performance.now() - startedAt,
 			semanticFingerprint,
 		};
 	} catch (err) {
@@ -188,6 +197,7 @@ export function serveGzipStageWorker<
 				result.gzBytes = metrics.gzBytes;
 				result.serializeMs = metrics.serializeMs;
 				result.writeMs = metrics.writeMs;
+				result.durationMs = metrics.durationMs;
 				result.semanticFingerprint = metrics.semanticFingerprint;
 				result.skippedUnchanged = metrics.skippedUnchanged;
 			} catch (err) {

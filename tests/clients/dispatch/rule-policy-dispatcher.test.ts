@@ -41,7 +41,6 @@ function mockRunner(id: string, diagnostics: Diagnostic[]): RunnerDefinition {
 		id,
 		appliesTo: ["jsts"],
 		priority: 10,
-		enabledByDefault: true,
 		async run() {
 			return {
 				status: "succeeded",
@@ -504,7 +503,7 @@ describe("dispatcher filter — delta baseline integrity", () => {
 		);
 		expect(result.diagnostics.map((d) => d.rule)).toEqual(["no-debugger"]);
 
-		const baseline = facts.getSessionFact<Diagnostic[]>(
+		const baseline = facts.getBoundedSessionFact<Diagnostic[]>(
 			`session.baseline.${normalizeMapKey(ctx.filePath)}`,
 		);
 		expect(baseline?.map((d) => d.rule).sort()).toEqual([

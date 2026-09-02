@@ -146,7 +146,6 @@ describe("eslint runner", () => {
 					id,
 					appliesTo: ["jsts"],
 					priority: id === "oxlint" ? 2 : 3,
-					enabledByDefault: true,
 					async run() {
 						downstreamRuns++;
 						return { status: "succeeded", diagnostics: [], semantic: "none" };

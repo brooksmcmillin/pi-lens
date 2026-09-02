@@ -11,14 +11,24 @@
  * specific file being edited, not the entire suite.
  */
 
-import { createSubsystemLogger } from "./extension-log.js";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { emitBounded } from "./bounded-telemetry.js";
+import { LEDGER_FIELD_MAX } from "./degradation-ledger.js";
 import { minimatch } from "./deps/minimatch.js";
+import { createSubsystemLogger } from "./extension-log.js";
 import { detectFileRole } from "./file-role.js";
 import { findGlobalBinary } from "./package-manager.js";
+import { PathKeyedMap } from "./path-keyed-map.js";
+import {
+	augmentPythonEnvironment,
+	detectPythonEnvironment,
+} from "./python-environment.js";
+import { normalizeEphemeralMapKey, normalizeMapKey } from "./path-utils.js";
 import { isMeasuredDuration, toMeasuredDurationMs } from "./run-duration.js";
 import { safeSpawn, safeSpawnAsync } from "./safe-spawn.js";
+import { stripAnsi } from "./sanitize.js";
 
 // --- Types ---
 
@@ -260,25 +270,252 @@ export function stripWrapperArgs(binName: string, args: string[]): string[] {
 
 // --- Client ---
 
+const MAX_FAILED_TARGETS_PER_RUNNER = 32;
+const MAX_FAILED_TARGET_CHECKS_PER_SELECTION = 8;
+const FAILED_TARGET_DETAIL_CAP_PER_TURN = 8;
+
+interface TestRunnerClientOptions {
+	statFailedTarget?: (filePath: string) => void;
+}
+
+interface TestRunRequest {
+	runner: string;
+	config: RunnerConfig;
+	turnIndex?: number;
+}
+
+interface FailedTargetStateRecord {
+	outcome: "retired-missing" | "retained-indeterminate" | "capacity-evicted";
+	runner: string;
+	candidate: string;
+	errorCode?: string;
+	turnIndex?: number;
+}
+
+interface FailedTargetEntry {
+	displayPath: string;
+	sequence: number;
+}
+
+interface FailedTargetSelection {
+	cwd: string;
+	runner: string;
+	failedTargets: PathKeyedMap<FailedTargetEntry>;
+	relatedAbs?: string;
+	selfAbs?: string;
+	turnIndex?: number;
+}
+
+interface TestResultRecord {
+	cwd: string;
+	runner: string;
+	testFile: string;
+	result: TestResult;
+	turnIndex?: number;
+}
+
+function canonicalFailedPath(filePath: string): string {
+	const absolute = path.resolve(filePath);
+	try {
+		return normalizeMapKey(fs.realpathSync.native(absolute));
+	} catch {
+		return normalizeMapKey(absolute);
+	}
+}
+
+function canonicalProjectRoot(cwd: string): {
+	key: string;
+	resolved: boolean;
+} {
+	const absolute = path.resolve(cwd);
+	try {
+		return {
+			key: normalizeEphemeralMapKey(fs.realpathSync.native(absolute)),
+			resolved: true,
+		};
+	} catch {
+		return { key: normalizeEphemeralMapKey(absolute), resolved: false };
+	}
+}
+
+const MAX_CANONICAL_ROOT_MEMO_ENTRIES = 512;
+
+interface RunnerAvailability {
+	available: boolean;
+	evidencePath?: string;
+}
+
+function filesystemErrorCode(error: unknown): string | undefined {
+	if (
+		error !== null &&
+		typeof error === "object" &&
+		"code" in error &&
+		typeof error.code === "string"
+	) {
+		return error.code;
+	}
+	return undefined;
+}
+
+interface PytestSummary {
+	passed: number;
+	failed: number;
+	skipped: number;
+	duration?: number;
+}
+
+const PYTEST_SUMMARY_OUTCOME =
+	"(?:passed|failed|skipped|reruns?|errors?|warnings?|deselected|xfailed|xpassed)";
+const PYTEST_SUMMARY_LINE = new RegExp(
+	`^\\s*(?:=+\\s*)?\\d+\\s+${PYTEST_SUMMARY_OUTCOME}` +
+		`(?:\\s*,\\s*\\d+\\s+${PYTEST_SUMMARY_OUTCOME})*` +
+		`\\s+in\\s+[\\d.]+s(?:\\s*=+)?\\s*$`,
+	"i",
+);
+
+/** Extract aggregate values from pytest's final outcome line only. */
+function parsePytestSummary(output: string): PytestSummary {
+	// Pytest may color the whole summary or individual tokens. Strip ANSI before
+	// selecting and extracting so formatting cannot turn the first count into 0.
+	const normalizedOutput = stripAnsi(output);
+	const summaryLine = normalizedOutput
+		.split(/\r?\n/)
+		.reverse()
+		.find((line) => PYTEST_SUMMARY_LINE.test(line));
+	let passed = 0;
+	let failed = 0;
+	let skipped = 0;
+	if (!summaryLine) return { passed, failed, skipped };
+
+	const summaryBody = summaryLine.replace(/^=+\s*|\s*=+\s*$/g, "");
+	for (const field of summaryBody.split(",")) {
+		const [countText, outcome] = field.trim().split(/\s+/, 2);
+		const count = Number.parseInt(countText, 10);
+		if (!Number.isFinite(count)) continue;
+		switch (outcome) {
+			case "passed":
+				passed = count;
+				break;
+			case "failed":
+				failed = count;
+				break;
+			case "skipped":
+				skipped = count;
+				break;
+		}
+	}
+
+	const durationMatch = /in\s+([\d.]+)s/.exec(summaryLine);
+	// Rounded, like `jsonRunDurationMs` and PHPUnit's legacy path:
+	// `in 2.01s` is 2009.9999999999998 in binary floating point.
+	const duration = durationMatch
+		? Math.round(Number.parseFloat(durationMatch[1]) * 1000)
+		: undefined;
+	return { passed, failed, skipped, duration };
+}
+
 export class TestRunnerClient {
 	private log: (msg: string) => void;
-	private availableRunners: Map<string, boolean> = new Map();
-	private failedTestsByRunner: Map<string, Set<string>> = new Map();
+	// This is an instance-lifetime memo of RESOLVED spellings only, which leaves
+	// two temporal edges. A symlink retargeted mid-session keeps its old
+	// resolution until a new client instance — acceptable because round 2's
+	// evidence re-validation already handles verdict-level staleness (positive
+	// verdicts re-stat their config file). A spelling that did NOT resolve is
+	// never memoized (#2077): the fallback key is a guess about a path that does
+	// not exist yet, so memoizing it would pin an alias probed before its
+	// symlink was created to a stale verdict for the instance's life. Re-probing
+	// costs one failing realpath per call, and only for a cwd that does not
+	// resolve — a state where `detectRunner` already walks node_modules on every
+	// call. Keep the memo bounded so pathological spelling churn cannot grow it
+	// without limit.
+	private canonicalRootMemo = new Map<string, string>();
+	private availableRunners = new PathKeyedMap<Map<string, RunnerAvailability>>(
+		normalizeEphemeralMapKey,
+	);
+	private failedTestsByRunner = new Map<
+		string,
+		PathKeyedMap<PathKeyedMap<FailedTargetEntry>>
+	>();
+	private failedTargetSequence = 0;
+	private readonly statFailedTarget: (filePath: string) => void;
 	// Best-effort vitest config `test.include`/`test.exclude` globs, scraped as
 	// plain text (never executed) and cached per cwd so the config file is
 	// only read/parsed once, not on every edit. `null` means "no config found
 	// or it couldn't be parsed in the simple shape we look for" — callers
 	// treat that as "no additional signal" and fall back to naming-convention
 	// detection only.
-	private vitestTestGlobsCache: Map<
-		string,
-		{ include?: string[]; exclude?: string[] } | null
-	> = new Map();
+	private vitestTestGlobsCache = new PathKeyedMap<{
+		result: { include?: string[]; exclude?: string[] } | null;
+		/**
+		 * #2252 F2: the config file `result` was derived from, present whether
+		 * or not it parsed. `undefined` means no candidate config file existed
+		 * at cache time. Re-checked on every read — same shape as
+		 * `getRunnerAvailability`'s `evidencePath`: a `result: null` entry is
+		 * revalidated by `fs.existsSync`, not trusted forever, so a config file
+		 * that appears (or a broken one that gets fixed) converges instead of
+		 * latching the earlier miss.
+		 */
+		evidencePath?: string;
+	}>(normalizeEphemeralMapKey);
 
-	constructor(verbose = false) {
-		this.log = verbose
-			? createSubsystemLogger("test-runner")
-			: () => {};
+	constructor(verbose = false, options: TestRunnerClientOptions = {}) {
+		this.log = verbose ? createSubsystemLogger("test-runner") : () => {};
+		this.statFailedTarget =
+			options.statFailedTarget ?? ((filePath) => void fs.statSync(filePath));
+	}
+
+	private getCanonicalProjectRoot(cwd: string): string {
+		const cached = this.canonicalRootMemo.get(cwd);
+		if (cached !== undefined) return cached;
+
+		const { key, resolved } = canonicalProjectRoot(cwd);
+		if (!resolved) return key;
+		if (this.canonicalRootMemo.size >= MAX_CANONICAL_ROOT_MEMO_ENTRIES) {
+			const oldest = this.canonicalRootMemo.keys().next().value;
+			if (oldest !== undefined) this.canonicalRootMemo.delete(oldest);
+		}
+		this.canonicalRootMemo.set(cwd, key);
+		return key;
+	}
+
+	private getRunnerAvailability(
+		byRunner: Map<string, RunnerAvailability> | undefined,
+		runner: string,
+	): boolean | undefined {
+		const cached = byRunner?.get(runner);
+		if (!cached) return undefined;
+		if (
+			cached.available &&
+			cached.evidencePath !== undefined &&
+			!fs.existsSync(cached.evidencePath)
+		) {
+			byRunner?.delete(runner);
+			return undefined;
+		}
+		return cached.available;
+	}
+
+	/**
+	 * #2252: only a POSITIVE verdict is memoized. A negative one has no
+	 * `evidencePath` to re-stat, so `getRunnerAvailability` had no way to tell
+	 * "still absent" from "a config file just appeared" and served the first
+	 * miss for the client's whole process lifetime — measured live: probe an
+	 * empty directory, add `vitest.config.ts`, and the SAME client kept
+	 * answering "no runner". Same precedent as #2242's alias-canonicalization
+	 * fix (`clients/test-runner-client.ts`'s `getCanonicalProjectRoot`): drop
+	 * the memo write on the failure branch rather than adding a TTL or a
+	 * re-arm signal. The cost is bounded and already paid today — a cache miss
+	 * re-runs the exact same `configFiles.some(fs.existsSync)` walk this
+	 * method's caller already does on every FIRST probe of a runner.
+	 */
+	private setRunnerAvailability(
+		byRunner: Map<string, RunnerAvailability>,
+		runner: string,
+		available: boolean,
+		evidencePath?: string,
+	): void {
+		if (!available) return;
+		byRunner.set(runner, { available, evidencePath });
 	}
 
 	/**
@@ -292,23 +529,32 @@ export class TestRunnerClient {
 		cwd: string,
 		sourceFilePath?: string,
 	): { runner: string; config: RunnerConfig } | null {
+		const rootKey = this.getCanonicalProjectRoot(cwd);
+		let byRunner = this.availableRunners.get(rootKey);
+		if (!byRunner) {
+			byRunner = new Map();
+			this.availableRunners.set(rootKey, byRunner);
+		}
 		// Priority 1: Config files
 		for (const [name, config] of Object.entries(RUNNERS)) {
-			const cacheKey = `${cwd}:${name}:config`;
-			if (this.availableRunners.has(cacheKey)) {
-				if (this.availableRunners.get(cacheKey)) {
+			const cached = this.getRunnerAvailability(byRunner, name);
+			if (cached !== undefined) {
+				if (cached) {
 					return { runner: name, config };
 				}
 				continue;
 			}
 
+			let configEvidencePath: string | undefined;
 			const found = config.configFiles.some((cf) => {
 				if (name === "pytest" && cf === "pyproject.toml") {
 					const pyprojectPath = path.join(cwd, cf);
 					if (!fs.existsSync(pyprojectPath)) return false;
 					try {
 						const pyproject = fs.readFileSync(pyprojectPath, "utf-8");
-						return pyproject.includes("[tool.pytest.ini_options]");
+						const matches = pyproject.includes("[tool.pytest.ini_options]");
+						if (matches) configEvidencePath = pyprojectPath;
+						return matches;
 					} catch {
 						return false;
 					}
@@ -322,15 +568,20 @@ export class TestRunnerClient {
 							...composer.require,
 							...composer["require-dev"],
 						};
-						return Boolean(allDeps["phpunit/phpunit"]);
+						const matches = Boolean(allDeps["phpunit/phpunit"]);
+						if (matches) configEvidencePath = composerPath;
+						return matches;
 					} catch {
 						return false;
 					}
 				}
-				return fs.existsSync(path.join(cwd, cf));
+				const candidate = path.join(cwd, cf);
+				const matches = fs.existsSync(candidate);
+				if (matches) configEvidencePath = candidate;
+				return matches;
 			});
 
-			this.availableRunners.set(cacheKey, found);
+			this.setRunnerAvailability(byRunner, name, found, configEvidencePath);
 			if (found) {
 				this.log(`Detected runner via config: ${name}`);
 				return { runner: name, config };
@@ -348,17 +599,17 @@ export class TestRunnerClient {
 			// Check for vitest first (more specific than jest)
 			if (allDeps.vitest) {
 				this.log("Detected vitest in package.json");
-				this.availableRunners.set(`${cwd}:vitest:config`, true);
+				this.setRunnerAvailability(byRunner, "vitest", true, packageJsonPath);
 				return { runner: "vitest", config: RUNNERS.vitest };
 			}
 			if (allDeps.jest) {
 				this.log("Detected jest in package.json");
-				this.availableRunners.set(`${cwd}:jest:config`, true);
+				this.setRunnerAvailability(byRunner, "jest", true, packageJsonPath);
 				return { runner: "jest", config: RUNNERS.jest };
 			}
 			if (allDeps.pytest || allDeps["pytest-cov"]) {
 				this.log("Detected pytest in package.json (unusual)");
-				this.availableRunners.set(`${cwd}:pytest:config`, true);
+				this.setRunnerAvailability(byRunner, "pytest", true, packageJsonPath);
 				return { runner: "pytest", config: RUNNERS.pytest };
 			}
 		} catch (err) {
@@ -516,10 +767,18 @@ export class TestRunnerClient {
 	 * `clients/knip-client.ts`, so `tests/clients/knip-client.test.ts` is
 	 * checked alongside the flat `tests/knip-client.test.ts` candidate).
 	 */
-	private relativeSourceDir(sourceFilePath: string, cwd: string): string | null {
+	private relativeSourceDir(
+		sourceFilePath: string,
+		cwd: string,
+	): string | null {
 		const dir = path.dirname(sourceFilePath);
 		const relDir = path.relative(cwd, path.resolve(cwd, dir));
-		if (!relDir || relDir === "." || relDir.startsWith("..") || path.isAbsolute(relDir)) {
+		if (
+			!relDir ||
+			relDir === "." ||
+			relDir.startsWith("..") ||
+			path.isAbsolute(relDir)
+		) {
 			return null;
 		}
 		return relDir;
@@ -539,25 +798,44 @@ export class TestRunnerClient {
 	 * template expression) — anything more dynamic than that is out of
 	 * scope for this heuristic.
 	 *
-	 * Cached per `cwd` so the file is only read/parsed once per project,
-	 * not on every edit.
+	 * Cached per `cwd`, including a `null` result — #2252 F2: a project with
+	 * no vitest config, or one this heuristic can't scrape, is a COMMON shape
+	 * (every non-vitest project pays this on every edit otherwise; measured
+	 * ~1500x — 0.4µs cached vs. 598.7µs re-reading the candidate list every
+	 * call). The cache entry is revalidated on every read, the same shape
+	 * `getRunnerAvailability` uses for a positive verdict: bounded
+	 * `fs.existsSync` checks against the config file the result was derived
+	 * from (or, when none existed, against the candidate list itself), never
+	 * a full re-read/re-parse on a cache hit. So a config file appearing (or
+	 * a broken one being fixed) still converges — only the FULL parse is
+	 * paid once, not the existence check.
 	 */
 	parseVitestTestGlobs(
 		cwd: string,
 	): { include?: string[]; exclude?: string[] } | null {
-		if (this.vitestTestGlobsCache.has(cwd)) {
-			return this.vitestTestGlobsCache.get(cwd) ?? null;
-		}
-
+		const rootKey = this.getCanonicalProjectRoot(cwd);
 		// .mts isn't in RUNNERS.vitest.configFiles (that list drives runner
 		// *detection* priority) but is a legal vitest config extension, so it's
 		// included here for the scrape even though detectRunner doesn't check it.
 		const candidates = [...RUNNERS.vitest.configFiles, "vitest.config.mts"];
 
+		const cached = this.vitestTestGlobsCache.get(rootKey);
+		if (cached !== undefined) {
+			const stillValid =
+				cached.evidencePath !== undefined
+					? fs.existsSync(cached.evidencePath)
+					: !candidates.some((cf) => fs.existsSync(path.join(cwd, cf)));
+			if (stillValid) return cached.result;
+			this.vitestTestGlobsCache.delete(rootKey);
+		}
+
 		let content: string | null = null;
+		let foundPath: string | undefined;
 		for (const cf of candidates) {
+			const candidatePath = path.join(cwd, cf);
 			try {
-				content = fs.readFileSync(path.join(cwd, cf), "utf-8");
+				content = fs.readFileSync(candidatePath, "utf-8");
+				foundPath = candidatePath;
 				break;
 			} catch {
 				continue;
@@ -575,7 +853,7 @@ export class TestRunnerClient {
 			}
 		}
 
-		this.vitestTestGlobsCache.set(cwd, result);
+		this.vitestTestGlobsCache.set(rootKey, { result, evidencePath: foundPath });
 		return result;
 	}
 
@@ -845,6 +1123,7 @@ export class TestRunnerClient {
 	getTestRunTarget(
 		sourceFilePath: string,
 		cwd: string,
+		turnIndex?: number,
 	): {
 		testFile: string;
 		runner: string;
@@ -854,8 +1133,7 @@ export class TestRunnerClient {
 		const detected = this.detectRunner(cwd, sourceFilePath);
 		if (!detected) return null;
 
-		const key = this.failedKey(cwd, detected.runner);
-		const failedSet = this.failedTestsByRunner.get(key);
+		const failedSet = this.getFailedTargets(cwd, detected.runner);
 
 		// If the edited file is itself a test file, there's no "related test"
 		// to discover — running findTestFile on it would strip its own
@@ -867,36 +1145,22 @@ export class TestRunnerClient {
 			: this.findTestFile(sourceFilePath, cwd, detected.runner);
 
 		if (failedSet && failedSet.size > 0) {
-			if (related) {
-				const relatedAbs = path.resolve(related.testFile);
-				if (failedSet.has(relatedAbs)) {
-					return {
-						testFile: relatedAbs,
-						runner: detected.runner,
-						config: detected.config,
-						strategy: "failed-first",
-					};
-				}
-			}
-
-			if (selfIsTest) {
-				const selfAbs = path.resolve(sourceFilePath);
-				if (failedSet.has(selfAbs)) {
-					return {
-						testFile: selfAbs,
-						runner: detected.runner,
-						config: detected.config,
-						strategy: "failed-first",
-					};
-				}
-			}
-
-			return {
-				testFile: [...failedSet][0],
+			const failedFirst = this.retireMissingFailedTargets({
+				cwd,
 				runner: detected.runner,
-				config: detected.config,
-				strategy: "failed-first",
-			};
+				failedTargets: failedSet,
+				relatedAbs: related ? path.resolve(related.testFile) : undefined,
+				selfAbs: selfIsTest ? path.resolve(sourceFilePath) : undefined,
+				turnIndex,
+			});
+			if (failedFirst) {
+				return {
+					testFile: failedFirst,
+					runner: detected.runner,
+					config: detected.config,
+					strategy: "failed-first",
+				};
+			}
 		}
 
 		if (selfIsTest) {
@@ -928,8 +1192,34 @@ export class TestRunnerClient {
 		cwd: string,
 		runner: string,
 		config: RunnerConfig,
+	): Promise<TestResult>;
+	async runTestFileAsync(
+		testFile: string,
+		cwd: string,
+		request: TestRunRequest,
+	): Promise<TestResult>;
+	async runTestFileAsync(
+		testFile: string,
+		cwd: string,
+		runnerOrRequest: string | TestRunRequest,
+		legacyConfig?: RunnerConfig,
 	): Promise<TestResult> {
 		const absoluteTestFile = path.resolve(testFile);
+		let request: TestRunRequest;
+		if (typeof runnerOrRequest === "string") {
+			if (!legacyConfig) {
+				return this.emptyResult(
+					absoluteTestFile,
+					"",
+					runnerOrRequest,
+					"Runner configuration missing",
+				);
+			}
+			request = { runner: runnerOrRequest, config: legacyConfig };
+		} else {
+			request = runnerOrRequest;
+		}
+		const { runner, config, turnIndex } = request;
 		if (!fs.existsSync(absoluteTestFile)) {
 			return this.emptyResult(
 				absoluteTestFile,
@@ -940,7 +1230,7 @@ export class TestRunnerClient {
 		}
 
 		try {
-			const { command, args } = await this.resolveExec(
+			const { command, args, env } = await this.resolveExec(
 				runner,
 				config,
 				absoluteTestFile,
@@ -951,6 +1241,7 @@ export class TestRunnerClient {
 			const result = await safeSpawnAsync(command, args, {
 				cwd,
 				timeout: 60000,
+				env,
 			});
 
 			const stdout = result.stdout || "";
@@ -1025,12 +1316,205 @@ export class TestRunnerClient {
 					break;
 			}
 
-			this.recordResult(cwd, runner, absoluteTestFile, parsed);
+			this.recordResult({
+				cwd,
+				runner,
+				testFile: absoluteTestFile,
+				result: parsed,
+				turnIndex,
+			});
 			return parsed;
 		} catch (err: any) {
 			this.log(`Run error: ${err.message}`);
 			return this.emptyResult(absoluteTestFile, "", runner, err.message);
 		}
+	}
+
+	private getFailedTargets(
+		cwd: string,
+		runner: string,
+		create = false,
+	): PathKeyedMap<FailedTargetEntry> | undefined {
+		let roots = this.failedTestsByRunner.get(runner);
+		if (!roots && create) {
+			roots = new PathKeyedMap<PathKeyedMap<FailedTargetEntry>>(
+				canonicalFailedPath,
+			);
+			this.failedTestsByRunner.set(runner, roots);
+		}
+		if (!roots) return undefined;
+
+		const root = canonicalFailedPath(cwd);
+		let targets = roots.get(root);
+		if (!targets && create) {
+			targets = new PathKeyedMap<FailedTargetEntry>(canonicalFailedPath);
+			roots.set(root, targets);
+		}
+		return targets;
+	}
+
+	private deleteFailedRoot(cwd: string, runner: string): void {
+		const roots = this.failedTestsByRunner.get(runner);
+		if (!roots) return;
+		roots.delete(canonicalFailedPath(cwd));
+		if (roots.size === 0) this.failedTestsByRunner.delete(runner);
+	}
+
+	private failedTargetCount(runner: string): number {
+		const roots = this.failedTestsByRunner.get(runner);
+		if (!roots) return 0;
+		let count = 0;
+		for (const targets of roots.values()) count += targets.size;
+		return count;
+	}
+
+	private evictOldestFailedTarget(runner: string): string | undefined {
+		const roots = this.failedTestsByRunner.get(runner);
+		if (!roots) return undefined;
+		let oldest:
+			| {
+					root: string;
+					identity: string;
+					entry: FailedTargetEntry;
+			  }
+			| undefined;
+		for (const [root, targets] of roots) {
+			for (const [identity, entry] of targets) {
+				if (!oldest || entry.sequence < oldest.entry.sequence) {
+					oldest = { root, identity, entry };
+				}
+			}
+		}
+		if (!oldest) return undefined;
+
+		const targets = roots.get(oldest.root);
+		targets?.delete(oldest.identity);
+		if (targets?.size === 0) roots.delete(oldest.root);
+		if (roots.size === 0) this.failedTestsByRunner.delete(runner);
+		return oldest.entry.displayPath;
+	}
+
+	private classifyFailedTarget(candidate: string): {
+		status: "present" | "missing" | "indeterminate";
+		errorCode?: string;
+	} {
+		try {
+			this.statFailedTarget(candidate);
+			return { status: "present" };
+		} catch (error) {
+			const errorCode = filesystemErrorCode(error);
+			if (errorCode === "ENOENT" || errorCode === "ENOTDIR") {
+				return { status: "missing", errorCode };
+			}
+			return { status: "indeterminate", errorCode };
+		}
+	}
+
+	private recordFailedTargetState(record: FailedTargetStateRecord): void {
+		const { outcome, runner, candidate, errorCode, turnIndex } = record;
+		const boundedTarget =
+			candidate.length <= LEDGER_FIELD_MAX
+				? candidate
+				: `…${candidate.slice(1 - LEDGER_FIELD_MAX)}`;
+		const targetIdentity = createHash("sha256")
+			.update(runner)
+			.update("\0")
+			.update(candidate)
+			.digest("hex");
+		const identity = `${outcome}:${targetIdentity}`;
+		const payload = {
+			durationMs: 0,
+			filePath: boundedTarget,
+			metadata: {
+				outcome,
+				runner,
+				errorCode: errorCode ?? "unknown",
+			},
+		};
+		const options = {
+			ledgerKind: "test-runner-failed-target-state" as const,
+			risingEdgePer: "identity" as const,
+			reason: `${outcome}: ${boundedTarget}`,
+		};
+		emitBounded(
+			"test_runner_failed_target_state",
+			identity,
+			payload,
+			turnIndex === undefined
+				? options
+				: {
+						...options,
+						capPerTurn: {
+							limit: FAILED_TARGET_DETAIL_CAP_PER_TURN,
+							turnIndex,
+						},
+					},
+		);
+	}
+
+	/**
+	 * Retire only confirmed-missing failed-first paths, then return one usable
+	 * target. A bounded prefix is checked per selection; remaining candidates
+	 * carry over to the next selection instead of adding unbounded synchronous
+	 * filesystem work to turn_end. Related/self targets keep priority.
+	 */
+	private retireMissingFailedTargets(
+		selection: FailedTargetSelection,
+	): string | undefined {
+		const { cwd, runner, failedTargets, relatedAbs, selfAbs, turnIndex } =
+			selection;
+		let checked = 0;
+		const inspected = new Set<string>();
+		const inspect = (
+			identity: string,
+			entry: FailedTargetEntry,
+		): string | undefined => {
+			if (checked >= MAX_FAILED_TARGET_CHECKS_PER_SELECTION) return undefined;
+			checked += 1;
+			inspected.add(identity);
+			const candidate = entry.displayPath;
+			const verdict = this.classifyFailedTarget(candidate);
+			if (verdict.status === "missing") {
+				failedTargets.delete(identity);
+				this.recordFailedTargetState({
+					outcome: "retired-missing",
+					runner,
+					candidate,
+					errorCode: verdict.errorCode,
+					turnIndex,
+				});
+				return undefined;
+			}
+			if (verdict.status === "indeterminate") {
+				this.recordFailedTargetState({
+					outcome: "retained-indeterminate",
+					runner,
+					candidate,
+					errorCode: verdict.errorCode,
+					turnIndex,
+				});
+			}
+			return candidate;
+		};
+
+		for (const preferred of [relatedAbs, selfAbs]) {
+			if (!preferred) continue;
+			const identity = canonicalFailedPath(preferred);
+			const entry = failedTargets.get(identity);
+			if (!entry) continue;
+			const selected = inspect(identity, entry);
+			if (selected) return selected;
+		}
+
+		for (const [identity, entry] of failedTargets) {
+			if (inspected.has(identity)) continue;
+			if (checked >= MAX_FAILED_TARGET_CHECKS_PER_SELECTION) break;
+			const selected = inspect(identity, entry);
+			if (selected) return selected;
+		}
+
+		if (failedTargets.size === 0) this.deleteFailedRoot(cwd, runner);
+		return undefined;
 	}
 
 	/**
@@ -1272,35 +1756,9 @@ export class TestRunnerClient {
 		const failures: TestFailure[] = [];
 		const output = `${stdout}\n${stderr}`;
 
-		// Parse summary line: "5 passed, 2 failed, 1 skipped in 0.23s"
-		const summaryMatch =
-			output.match(/(\d+)\s+passed?.*?(\d+)\s+failed.*?in\s+([\d.]+)s/i) ||
-			output.match(/(\d+)\s+passed.*?in\s+([\d.]+)s/i);
-
-		let passed = 0;
-		let failed = 0;
-		let skipped = 0;
-		// #1479: undefined until pytest's own `in N.NNs` is read. `in 0.00s` is
-		// a real pytest summary, so 0 has to stay available as a measurement.
-		let duration: number | undefined;
-
-		if (summaryMatch) {
-			// Extract numbers from various patterns
-			const passedMatch = output.match(/(\d+)\s+passed/);
-			const failedMatch = output.match(/(\d+)\s+failed/);
-			const skippedMatch = output.match(/(\d+)\s+skipped/);
-			const durationMatch = output.match(/in\s+([\d.]+)s/);
-
-			passed = passedMatch ? parseInt(passedMatch[1], 10) : 0;
-			failed = failedMatch ? parseInt(failedMatch[1], 10) : 0;
-			skipped = skippedMatch ? parseInt(skippedMatch[1], 10) : 0;
-			// Rounded, like `jsonRunDurationMs` and PHPUnit's legacy path:
-			// `in 2.01s` is 2009.9999999999998 in binary floating point, and
-			// the turn-end log prints the number as it stands.
-			// (Routing this through `toMeasuredDurationMs` is #1484, not this.)
-			if (durationMatch)
-				duration = Math.round(parseFloat(durationMatch[1]) * 1000);
-		}
+		// #1479: `duration` stays undefined unless pytest emits its own `in N.NNs`
+		// summary. A measured `in 0.00s` remains a real zero.
+		const { passed, failed, skipped, duration } = parsePytestSummary(output);
 
 		// Parse individual failures: "FAILED tests/test_foo.py::test_something - AssertionError: ..."
 		const failureRegex = /FAILED\s+(\S+::\S+)\s*-\s*(.+?)(?:\n|$)/g;
@@ -1350,7 +1808,9 @@ export class TestRunnerClient {
 		let skipped = 0;
 
 		// Success (or success-with-incomplete/skipped): "OK (12 tests, 34 assertions)"
-		const okMatch = output.match(/OK\s*\((\d+)\s+tests?,\s*\d+\s+assertions?\)/i);
+		const okMatch = output.match(
+			/OK\s*\((\d+)\s+tests?,\s*\d+\s+assertions?\)/i,
+		);
 		if (okMatch) {
 			passed = Number.parseInt(okMatch[1], 10);
 		} else {
@@ -1361,7 +1821,9 @@ export class TestRunnerClient {
 			const skippedMatch = output.match(/Skipped:\s*(\d+)/i);
 
 			const total = testsMatch ? Number.parseInt(testsMatch[1], 10) : 0;
-			const failures = failuresMatch ? Number.parseInt(failuresMatch[1], 10) : 0;
+			const failures = failuresMatch
+				? Number.parseInt(failuresMatch[1], 10)
+				: 0;
 			const errors = errorsMatch ? Number.parseInt(errorsMatch[1], 10) : 0;
 			skipped = skippedMatch ? Number.parseInt(skippedMatch[1], 10) : 0;
 			failed = failures + errors;
@@ -1409,11 +1871,12 @@ export class TestRunnerClient {
 			if (legacyMatch) {
 				const value = Number.parseFloat(legacyMatch[1]);
 				const unit = legacyMatch[2].toLowerCase();
-				const scale = unit.startsWith("ms") || unit.startsWith("milli")
-					? 1
-					: unit.startsWith("min")
-						? 60_000
-						: 1000;
+				const scale =
+					unit.startsWith("ms") || unit.startsWith("milli")
+						? 1
+						: unit.startsWith("min")
+							? 60_000
+							: 1000;
 				if (Number.isFinite(value) && value > 0) {
 					duration = Math.round(value * scale);
 				}
@@ -1459,7 +1922,9 @@ export class TestRunnerClient {
 		if (summaryMatch) {
 			const total = Number.parseInt(summaryMatch[1], 10);
 			failed = Number.parseInt(summaryMatch[2], 10);
-			const excluded = summaryMatch[3] ? Number.parseInt(summaryMatch[3], 10) : 0;
+			const excluded = summaryMatch[3]
+				? Number.parseInt(summaryMatch[3], 10)
+				: 0;
 			const skippedCount = summaryMatch[4]
 				? Number.parseInt(summaryMatch[4], 10)
 				: 0;
@@ -1881,9 +2346,7 @@ export class TestRunnerClient {
 		// Package-line counts, like the go duration probe above, take the
 		// FIRST package summary only — the same known limit already
 		// documented on `parseGenericRunnerDuration`.
-		const goFailNames = [
-			...output.matchAll(/--- FAIL:[^\S\n]+([^\s(]+)/g),
-		];
+		const goFailNames = [...output.matchAll(/--- FAIL:[^\S\n]+([^\s(]+)/g)];
 		// #1524-r4: only COUNT unparented failures. go prints a `--- FAIL:`
 		// line for every level of a failing subtest tree — `TestA` AND
 		// `TestA/sub` each get their own line for what is really one
@@ -1910,9 +2373,7 @@ export class TestRunnerClient {
 			// were rendering as `✗ 1/1 failed ✗ go failure` instead of the
 			// runner error they are.
 			const goFailPackage =
-				/^FAIL(?![^\n]*\[(?:build|setup) failed\])[^\S\n]+\S+/m.test(
-					output,
-				);
+				/^FAIL(?![^\n]*\[(?:build|setup) failed\])[^\S\n]+\S+/m.test(output);
 			const goOkPackages = [
 				...output.matchAll(/^ok[^\S\n]+\S+[^\S\n]+[\d.]+s/gm),
 			];
@@ -1982,7 +2443,10 @@ export class TestRunnerClient {
 		// `failures` above when `matched` or `goFailNames` already settled
 		// the question some other way, but they no longer settle it alone.
 		const runnerError =
-			exitCode !== 0 && !matched && goFailNames.length === 0 && lower.includes("error")
+			exitCode !== 0 &&
+			!matched &&
+			goFailNames.length === 0 &&
+			lower.includes("error")
 				? `Runner ${runner} exited with ${exitCode}`
 				: undefined;
 
@@ -2134,9 +2598,7 @@ export class TestRunnerClient {
 		const relDir = path.relative(cwd, dir);
 		const segments = relDir.split(path.sep).filter(Boolean);
 		if (segments.length > 1 && knownSourceRoots.has(segments[0])) {
-			return [
-				path.join(cwd, testDir, ...segments.slice(1), testFilename),
-			];
+			return [path.join(cwd, testDir, ...segments.slice(1), testFilename)];
 		}
 		return [];
 	}
@@ -2212,7 +2674,21 @@ export class TestRunnerClient {
 		config: RunnerConfig,
 		testFile: string,
 		cwd: string,
-	): Promise<{ command: string; args: string[] }> {
+	): Promise<{ command: string; args: string[]; env?: NodeJS.ProcessEnv }> {
+		// Run pytest through the project interpreter itself, not a generic `python`
+		// resolved from the host PATH. The child-only environment also keeps tools
+		// spawned by tests inside the same project environment.
+		if (runner === "pytest") {
+			const pythonEnvironment = await detectPythonEnvironment(cwd);
+			if (pythonEnvironment) {
+				return {
+					command: pythonEnvironment.pythonPath,
+					args: config.args(testFile, cwd),
+					env: augmentPythonEnvironment(process.env, pythonEnvironment),
+				};
+			}
+		}
+
 		// PHPUnit has no npx-style automatic local-binary resolution — Composer's
 		// standard local-install location is vendor/bin/phpunit, so check that
 		// explicitly before falling back to a global `phpunit` on PATH.
@@ -2233,13 +2709,19 @@ export class TestRunnerClient {
 		// itself, so the leading wrapper-name arg(s) that named it (e.g. "vitest",
 		// or "-m pytest") are stripped from args() — see stripWrapperArgs.
 		if (fs.existsSync(localBin)) {
-			return { command: localBin, args: stripWrapperArgs(binName, config.args(testFile, cwd)) };
+			return {
+				command: localBin,
+				args: stripWrapperArgs(binName, config.args(testFile, cwd)),
+			};
 		}
 
 		// Any package manager's global bin dir (npm/pnpm/yarn/bun) before npx (#375).
 		const globalBin = await findGlobalBinary(binName);
 		if (globalBin) {
-			return { command: globalBin, args: stripWrapperArgs(binName, config.args(testFile, cwd)) };
+			return {
+				command: globalBin,
+				args: stripWrapperArgs(binName, config.args(testFile, cwd)),
+			};
 		}
 
 		return { command: config.command, args: config.args(testFile, cwd) };
@@ -2272,30 +2754,45 @@ export class TestRunnerClient {
 		return lines.join("\n").slice(0, 500);
 	}
 
-	private failedKey(cwd: string, runner: string): string {
-		return `${path.resolve(cwd)}:${runner}`;
-	}
-
-	private recordResult(
-		cwd: string,
-		runner: string,
-		testFile: string,
-		result: TestResult,
-	): void {
-		const key = this.failedKey(cwd, runner);
-		const abs = path.resolve(testFile);
-		const set = this.failedTestsByRunner.get(key) ?? new Set<string>();
+	private recordResult(record: TestResultRecord): void {
+		const { cwd, runner, testFile, result, turnIndex } = record;
+		const targetPath = path.resolve(testFile);
+		const target = canonicalFailedPath(targetPath);
+		let failedTargets = this.getFailedTargets(cwd, runner, result.failed > 0);
+		if (!failedTargets) return;
 
 		if (result.failed > 0) {
-			set.add(abs);
-			this.failedTestsByRunner.set(key, set);
+			const alreadyRecorded = failedTargets.has(target);
+			if (
+				!alreadyRecorded &&
+				this.failedTargetCount(runner) >= MAX_FAILED_TARGETS_PER_RUNNER
+			) {
+				const evicted = this.evictOldestFailedTarget(runner);
+				if (evicted) {
+					this.recordFailedTargetState({
+						outcome: "capacity-evicted",
+						runner,
+						candidate: evicted,
+						turnIndex,
+					});
+				}
+				// Eviction can remove this root's final prior target. Reacquire the
+				// root map before inserting so the newest failure never lands in a
+				// detached PathKeyedMap.
+				failedTargets = this.getFailedTargets(cwd, runner, true);
+				if (!failedTargets) return;
+			}
+			// Sequence is global across roots, so a refreshed target becomes the
+			// newest failure without relying on one root map's insertion order.
+			failedTargets.set(target, {
+				displayPath: targetPath,
+				sequence: ++this.failedTargetSequence,
+			});
 			return;
 		}
 
-		if (set.has(abs)) {
-			set.delete(abs);
-			if (set.size === 0) this.failedTestsByRunner.delete(key);
-			else this.failedTestsByRunner.set(key, set);
+		if (failedTargets.delete(target) && failedTargets.size === 0) {
+			this.deleteFailedRoot(cwd, runner);
 		}
 	}
 }

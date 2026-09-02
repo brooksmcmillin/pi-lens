@@ -13,9 +13,15 @@ const { ensureTool, getToolEnvironment, launchLSP } = vi.hoisted(() => ({
 vi.mock("../../../clients/installer/index.js", () => ({
 	ensureTool,
 	getToolEnvironment,
+	findManagedToolBinary: vi.fn(async () => undefined),
 }));
 vi.mock("../../../clients/lsp/launch.js", () => ({ launchLSP }));
-vi.mock("../../../clients/latency-logger.js", () => ({ logLatency: vi.fn() }));
+vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
+	...(await importActual<
+		typeof import("../../../clients/latency-logger.js")
+	>()),
+	logLatency: vi.fn(),
+}));
 
 import { TypeScriptServer } from "../../../clients/lsp/server.js";
 

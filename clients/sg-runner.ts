@@ -16,6 +16,7 @@ import {
 import { getProjectIgnoreGlobs } from "./file-utils.js";
 import { findGlobalBinary } from "./package-manager.js";
 import { safeSpawnAsync, type SpawnResult } from "./safe-spawn.js";
+import { truncatedByOutputCap } from "./spawn-output-cap.js";
 import { createSingleFlight } from "./single-flight.js";
 import {
 	type AvailabilityCause,
@@ -170,10 +171,12 @@ function tryParseSgMatches(stdout: string): SgMatch[] | null {
 	}
 }
 
+// The truncation veto lives at the head of `exec`/`interpretScanResult` now
+// (#2100), so this stays a pure parser rather than re-asking a settled question.
 function tryParseNonZeroSgMatches(
-	result: Pick<SpawnResult, "stdout" | "outputTruncated">,
+	result: Pick<SpawnResult, "stdout">,
 ): SgMatch[] | null {
-	if (result.outputTruncated || !result.stdout.trim()) return null;
+	if (!result.stdout.trim()) return null;
 	// Trimmed on purpose: a leading BOM survives JSON.parse's whitespace
 	// tolerance but String.trim() strips it (matches the pre-refactor guard).
 	return tryParseSgMatches(result.stdout.trim());
@@ -461,6 +464,7 @@ export class SgRunner {
 			cause: provisional ? this.sweepTransientCause : "ok",
 			elapsedMs: Date.now() - startedAt,
 			latched: !provisional,
+			classifiedBy: "probe",
 			hostStallMs: this.sweepHostStallMs,
 			budgetMs: PROBE_TIMEOUT_MS,
 			...(provisional && {
@@ -775,6 +779,17 @@ export class SgRunner {
 			totalMatches: 0,
 			truncated: false,
 		});
+		// FIRST (#2100): hitting the cap makes safe-spawn SIGTERM ast-grep, so a
+		// truncated run also classifies as a killed spawn. Read after the two
+		// gates below, this guard could only ever describe a run that exited
+		// before the signal reached it. A timed-out or aborted run carries the
+		// flag too and keeps its own classification below.
+		if (truncatedByOutputCap(result)) {
+			return {
+				...empty(),
+				error: "Failed to parse output: output was truncated",
+			};
+		}
 		const spawnFailure = this.failureForSpawnResult(result);
 		if (spawnFailure) {
 			return {
@@ -817,12 +832,6 @@ export class SgRunner {
 			};
 		}
 		if (!result.stdout.trim()) return empty();
-		if (result.outputTruncated) {
-			return {
-				...empty(),
-				error: "Failed to parse output: output was truncated",
-			};
-		}
 		{
 			const matches = tryParseSgMatches(result.stdout);
 			if (matches) {
@@ -869,6 +878,17 @@ export class SgRunner {
 		result: SpawnResult,
 		args: string[],
 	): SgScanResult {
+		// FIRST (#2100): same reason as `exec` above — the cap kill is our own
+		// SIGTERM, so `failureForSpawnResult` answers "cli-failure" for it and
+		// the truncation guard below never speaks.
+		if (truncatedByOutputCap(result)) {
+			return {
+				matches: [],
+				status: result.status,
+				error: "Failed to parse ast-grep scan output: output was truncated",
+				failure: "parse-failure",
+			};
+		}
 		const failure = this.failureForSpawnResult(result);
 		if (failure) {
 			return {
@@ -909,14 +929,6 @@ export class SgRunner {
 			};
 		}
 		if (!result.stdout.trim()) return { matches: [], status: result.status };
-		if (result.outputTruncated) {
-			return {
-				matches: [],
-				status: result.status,
-				error: "Failed to parse ast-grep scan output: output was truncated",
-				failure: "parse-failure",
-			};
-		}
 		{
 			const matches = tryParseSgMatches(result.stdout);
 			if (matches) {

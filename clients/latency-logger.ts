@@ -3,6 +3,7 @@ import { isTestMode } from "./env-utils.js";
 import { getGlobalPiLensDir } from "./file-utils.js";
 import { createNdjsonLogger } from "./ndjson-logger.js";
 import { getMaxLogSizeMB } from "./log-cleanup.js";
+import { normalizeLoggedPath } from "./path-utils.js";
 
 const LATENCY_LOG_DIR = getGlobalPiLensDir();
 const LATENCY_LOG_FILE = path.join(LATENCY_LOG_DIR, "latency.log");
@@ -117,6 +118,15 @@ let recentPhases: Array<{ phase: string; ts: string }> = [];
  * #1996: `cache_usage_summary` is a zero-duration session rollup over earlier
  * usage records. It reports no new work and therefore cannot own last-phase
  * stall attribution.
+ *
+ * #2249: `concurrent_session_bind_rollup` is the same shape as
+ * `session_end_bus_rollup`/`path_attribution_verified_rollup` above — a
+ * zero-duration session-end summary of records already logged individually,
+ * not new work of its own.
+ *
+ * #2044: `test_runner_failed_target_state` is a zero-duration decision after a
+ * bounded filesystem probe. The surrounding turn-end test-selection phase owns
+ * any real work, so this row must not replace it in stall attribution.
  */
 const LAST_PHASE_EXCLUDED = new Set([
 	"loop_block",
@@ -127,6 +137,7 @@ const LAST_PHASE_EXCLUDED = new Set([
 	"agent_end_deferred_mutation_requeue",
 	"session_end_bus_rollup",
 	"cache_usage_summary",
+	"test_runner_failed_target_state",
 	"lsp_aux_wait_outcome",
 	"tool_set_mutation",
 	"availability_decision",
@@ -135,8 +146,10 @@ const LAST_PHASE_EXCLUDED = new Set([
 	"lsp_scanner_coverage_gap",
 	"lsp_notify_resync_deferred",
 	"lsp_notify_write_late_landed",
+	"lsp_notify_stall_cpu_busy",
 	"degradation_ledger",
 	"path_attribution_verified_rollup",
+	"concurrent_session_bind_rollup",
 ]);
 
 /**
@@ -631,7 +644,19 @@ export function logLatency(entry: LatencyEntry): void {
 	if (isTestMode()) {
 		return;
 	}
-	writer.log({ ...entry, ts, pid: process.pid });
+	// #2219 (the #2141 class): `filePath` mixes raw `path.resolve()`/`cwd`
+	// values (module-report.ts) with already-normalized ones
+	// (dispatcher.ts-derived `ctx.filePath`) AND non-path labels ("<pi-lens>",
+	// a tool name, a shell command) that several call sites deliberately use
+	// as a coarse identity — see bounded-telemetry.ts's comment on this field.
+	// `normalizeLoggedPath` normalizes only values that are already
+	// fully-qualified paths, leaving every label/command untouched.
+	writer.log({
+		...entry,
+		ts,
+		pid: process.pid,
+		filePath: normalizeLoggedPath(entry.filePath),
+	});
 }
 
 export function getLatencyLogPath(): string {

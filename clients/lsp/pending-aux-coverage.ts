@@ -36,6 +36,21 @@
  * index whose keys are produced by this same process's touch path, so the
  * cheap ephemeral normalizer is the lifetime-appropriate choice per the
  * PathKeyedMap guidance — no realpath walk on the per-edit path.
+ *
+ * #2324 F3/R2-A: this module ALSO hands off in the other direction, for
+ * ast-grep specifically. Gate B's napi runner is a second producer of
+ * coverage for the same (file, "ast-grep") pair — when it runs as the
+ * fallback and actually evaluates rules, it calls
+ * {@link recordNapiFallbackCoverage}. The PRODUCER above reads that record
+ * (via {@link napiFallbackCoveredSince}) before deciding whether to mark a
+ * pair, because napi's Gate-B check settles synchronously while the aux-grace
+ * wait's own decision takes up to its full grace budget — by the time the
+ * wait is ready to mark, THIS touch's napi run (if any) has already finished,
+ * so the wait can reliably see it; a clear issued from napi's side cannot,
+ * because the mark it would be racing has not been written yet.
+ * {@link clearPendingAuxiliaryCoverage} is still used, but only to drop a
+ * LEFTOVER pair from an EARLIER touch once napi has fresh evaluated findings
+ * to supersede it.
  */
 
 import { normalizeEphemeralMapKey } from "../path-utils.js";
@@ -50,6 +65,7 @@ export const MAX_PENDING_AUX_ENTRIES = 50;
  * forever. Overridable via `PI_LENS_LATE_AUX_REARM_TTL_MS`.
  */
 export const DEFAULT_LATE_AUX_REARM_TTL_MS = 5 * 60_000;
+export const MAX_LATE_AUX_REARMS = 8;
 
 /**
  * Read the `PI_LENS_LATE_AUX_REARM_TTL_MS` env override at call time (not
@@ -89,6 +105,7 @@ export interface PendingAuxCoverageEntry {
 	 * gate's freshness comparison.
 	 */
 	lastRearmedAtMs?: number;
+	rearmCount?: number;
 }
 
 /**
@@ -106,6 +123,15 @@ export function isPendingAuxiliaryPastRearmTtl(
 }
 
 const pending = new Map<string, PendingAuxCoverageEntry>();
+
+/**
+ * #2168: pairs evicted at the cap have no other retirement record — the
+ * drain-time reconciliation in `runtime-turn.ts` never sees them because
+ * they are gone before a drain can observe them. Counted here so the
+ * consumer can fold them into its per-turn `pairCreated`/retirement sum
+ * instead of the pair vanishing uncounted.
+ */
+let capEvictedCount = 0;
 
 function pairKey(filePath: string, serverId: string): string {
 	return `${normalizeEphemeralMapKey(filePath)}\u0000${serverId}`;
@@ -129,6 +155,7 @@ export function markPendingAuxiliaryCoverage(
 	serverIds: readonly string[],
 	markedAtMs: number = Date.now(),
 	rearmedAtMs?: number,
+	rearmCount?: number,
 ): void {
 	for (const serverId of serverIds) {
 		const key = pairKey(filePath, serverId);
@@ -149,6 +176,7 @@ export function markPendingAuxiliaryCoverage(
 							serverId,
 							markedAtMs: existing.markedAtMs,
 							lastRearmedAtMs: rearmedAtMs,
+							rearmCount: rearmCount ?? (existing.rearmCount ?? 0) + 1,
 						},
 			);
 			continue;
@@ -157,14 +185,53 @@ export function markPendingAuxiliaryCoverage(
 			key,
 			rearmedAtMs === undefined
 				? { filePath, serverId, markedAtMs }
-				: { filePath, serverId, markedAtMs, lastRearmedAtMs: rearmedAtMs },
+				: {
+						filePath,
+						serverId,
+						markedAtMs,
+						lastRearmedAtMs: rearmedAtMs,
+						rearmCount: rearmCount ?? 1,
+					},
 		);
 		while (pending.size > MAX_PENDING_AUX_ENTRIES) {
 			const oldest = pending.keys().next().value;
 			if (oldest === undefined) break;
 			pending.delete(oldest);
+			capEvictedCount += 1;
 		}
 	}
+}
+
+/** Re-arm a drained pair while carrying its ceiling count across the drain. */
+export function rearmPendingAuxiliaryCoverage(
+	pair: PendingAuxCoverageEntry,
+	rearmedAtMs: number = Date.now(),
+	refreshBaseline = false,
+): void {
+	const nextCount = (pair.rearmCount ?? 0) + 1;
+	markPendingAuxiliaryCoverage(
+		pair.filePath,
+		[pair.serverId],
+		refreshBaseline ? rearmedAtMs : pair.markedAtMs,
+		rearmedAtMs,
+		nextCount,
+	);
+}
+
+/**
+ * Read-only check: is this (file, server) pair currently pending late
+ * delivery? #2324 F2: Gate B's "has this server EVER published for this
+ * file" answer goes stale the moment a later touch's aux-grace wait finds
+ * the server silent for the CURRENT content — a pending pair is exactly
+ * that signal, so a caller deciding whether to skip a fallback runner can
+ * tell "published, still current" from "published once, silent now" without
+ * draining or mutating the store.
+ */
+export function hasPendingAuxiliaryCoverage(
+	filePath: string,
+	serverId: string,
+): boolean {
+	return pending.has(pairKey(filePath, serverId));
 }
 
 /**
@@ -190,9 +257,82 @@ export function drainPendingAuxiliaryCoverage(): PendingAuxCoverageEntry[] {
 	return drained;
 }
 
-/** Test-only: current pending pair count. */
-export function pendingAuxiliaryCoverageSizeForTests(): number {
+/** Current pending pair count for bounded reconciliation telemetry. */
+export function pendingAuxiliaryCoverageSize(): number {
 	return pending.size;
+}
+
+/** Test-only alias for the store-size assertion seam. */
+export const pendingAuxiliaryCoverageSizeForTests =
+	pendingAuxiliaryCoverageSize;
+
+/**
+ * Drain (read and reset) the cap-eviction count accumulated since the last
+ * drain. Mirrors {@link drainPendingAuxiliaryCoverage}'s consume-once shape
+ * so the turn-end consumer can fold evictions that happened between two
+ * turn ends into its reconciliation sum exactly once, never accumulating
+ * across turns.
+ */
+export function drainPendingAuxCapEvictedCount(): number {
+	const count = capEvictedCount;
+	capEvictedCount = 0;
+	return count;
+}
+
+/**
+ * #2324 R2-A: (file) -> the timestamp of the LAST time the ast-grep napi
+ * fallback actually evaluated rules for it, as Gate B's runner
+ * (`clients/dispatch/runners/ast-grep-napi.ts`). This is the cross-module
+ * hand-off the aux-grace wait (`clients/lsp/index.ts`) needs to avoid
+ * marking a pending late-auxiliary pair for a file napi ALREADY delivered
+ * for on THIS touch.
+ *
+ * Ordering is why a synchronous clear-on-napi-run cannot do this job: the
+ * wait that decides whether to mark a pair runs for up to ~1800ms (its own
+ * grace budget) AFTER napi's Gate-B check, which is a single map lookup.
+ * Clearing at napi's run start (or end) races the mark and reliably loses —
+ * the mark, if any, has not been written yet. The wait itself is the only
+ * place that knows the outcome, so it is the one that must consult this
+ * store and skip marking, not the runner that must guess at the wait's
+ * future decision.
+ *
+ * Bounded like the pending-pair store itself; oldest evicted first.
+ */
+const napiFallbackCoverage = new Map<string, number>();
+export const MAX_NAPI_COVERAGE_ENTRIES = 50;
+
+/** Record that napi actually evaluated rules for `filePath` at `atMs`. */
+export function recordNapiFallbackCoverage(
+	filePath: string,
+	atMs: number = Date.now(),
+): void {
+	const key = normalizeEphemeralMapKey(filePath);
+	napiFallbackCoverage.delete(key);
+	napiFallbackCoverage.set(key, atMs);
+	while (napiFallbackCoverage.size > MAX_NAPI_COVERAGE_ENTRIES) {
+		const oldest = napiFallbackCoverage.keys().next().value;
+		if (oldest === undefined) break;
+		napiFallbackCoverage.delete(oldest);
+	}
+}
+
+/**
+ * Did napi cover `filePath` at or after `sinceMs`? The aux-grace wait passes
+ * its own `waitStartedAt` baseline so a STALE coverage record from an
+ * earlier touch (napi ran for a PREVIOUS revision) cannot suppress marking a
+ * pair this touch's silent server genuinely needs delivered later.
+ */
+export function napiFallbackCoveredSince(
+	filePath: string,
+	sinceMs: number,
+): boolean {
+	const ts = napiFallbackCoverage.get(normalizeEphemeralMapKey(filePath));
+	return ts !== undefined && ts >= sinceMs;
+}
+
+/** Test-only reset for the napi-coverage hand-off. */
+export function resetNapiFallbackCoverageForTests(): void {
+	napiFallbackCoverage.clear();
 }
 
 /**
@@ -201,4 +341,6 @@ export function pendingAuxiliaryCoverageSizeForTests(): number {
  */
 export function resetPendingAuxiliaryCoverage(): void {
 	pending.clear();
+	capEvictedCount = 0;
+	napiFallbackCoverage.clear();
 }

@@ -14,7 +14,12 @@ vi.mock("../../../clients/lsp/client.js", () => ({
 	createLSPClient,
 }));
 
-vi.mock("../../../clients/latency-logger.js", () => ({ logLatency }));
+vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
+	...(await importActual<
+		typeof import("../../../clients/latency-logger.js")
+	>()),
+	logLatency,
+}));
 
 describe("LSPService race hardening", () => {
 	beforeEach(() => {

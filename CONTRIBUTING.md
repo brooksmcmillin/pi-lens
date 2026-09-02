@@ -20,7 +20,7 @@ npm run lint
 npm test
 ```
 
-Pull requests must pass `npm run lint` and `npm test`. CI also runs `npm run check:lockfile` and a production `--omit=dev` build (`npm run build:dist`), so keep `package-lock.json` in sync with `package.json`.
+Pull requests must pass `npm run lint`. Run targeted test files for touched seams locally after `npm run build`; the full `npm test` suite is CI's job. CI also runs `npm run check:lockfile` and a production `--omit=dev` build (`npm run build:dist`), so keep `package-lock.json` in sync with `package.json`.
 
 ## Local git hooks
 
@@ -89,7 +89,7 @@ This avoids spending time on a direction the maintainers may not accept.
 - [ ] The change has a clear purpose and a focused diff
 - [ ] New logic has tests (happy path, edge cases, regression test for bugs)
 - [ ] `npm run lint` passes (`tsc` type-checks the whole repo including tests)
-- [ ] `npm test` passes
+- [ ] Targeted test files for the touched seams pass locally after `npm run build`; the full suite is CI's job
 - [ ] `npm run build:dist` succeeds if you changed code under `clients/`, `commands/`, `tools/`, or `index.ts`
 - [ ] `package-lock.json` is in sync with `package.json` (run `npm install` after dep changes)
 - [ ] New rules, runners, or LSP servers follow the wiring checklists below
@@ -293,3 +293,13 @@ If you land a pull request or report an issue that gets resolved, we'll add you 
 ## Questions?
 
 Open a discussion issue or ask in the project's issue tracker. Keep it concrete and reference the files you're working with.
+
+## Issue priority labels
+
+Every open issue carries one `priority:*` label:
+
+- `priority:p1` — scheduled next; a p1 bug blocks the next release.
+- `priority:p2` — the normal queue, batched into themed waves.
+- `priority:p3` — opportunistic; a good place to start contributing, especially together with `help wanted`.
+
+Pick from `priority:p2` and `priority:p3` (with `help wanted`) if you are looking for something to work on, and say so on the issue so work is not duplicated.

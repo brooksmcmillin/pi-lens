@@ -10,10 +10,14 @@
  * shared with the rest of the suite.
  */
 
+import * as os from "node:os";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
 	buildMemorySample,
 	collectMemorySampleSubsystems,
+	estimateDispatchCacheBytes,
 	formatMemoryHealthLine,
 	HEAP_GROWTH_TIGHTEN_RATIO,
 	isRapidHeapGrowth,
@@ -24,11 +28,28 @@ import {
 	shouldEmitMemorySampleAdaptive,
 	toMemoryProcessUsage,
 } from "../../clients/memory-sampler.js";
-import { getReviewGraphWorkspaceCacheSnapshot } from "../../clients/review-graph/builder.js";
+import {
+	estimateReviewGraphStoreBytes,
+	getReviewGraphWorkspaceCacheSnapshot,
+} from "../../clients/review-graph/builder.js";
 import { getDispatchCascadeCacheStats } from "../../clients/dispatch/integration.js";
 import type { WordIndex } from "../../clients/word-index.js";
+import {
+	WORD_POSTING_LIST_OVERHEAD_BYTES,
+	WordForwardEntry,
+	WordIndexFileTable,
+	WordPostingList,
+} from "../../clients/word-index-store.js";
 import { PathKeyedMap } from "../../clients/path-keyed-map.js";
 import { normalizeEphemeralMapKey } from "../../clients/path-utils.js";
+import { createLSPClient } from "../../clients/lsp/client.js";
+import { launchLSP, stopLSP } from "../../clients/lsp/launch.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const FAKE_SERVER_PATH = path.join(
+	__dirname,
+	"../fixtures/fake-lsp-server.mjs",
+);
 
 describe("shouldEmitMemorySample (cadence)", () => {
 	it("is false on turn 0 (nothing meaningful resident yet)", () => {
@@ -170,6 +191,30 @@ function fakeMem(
 }
 
 describe("collectMemorySampleSubsystems (O(1)/O(bounded-cache-size) live reads)", () => {
+	it("estimates graph store bytes from counts without walking graph contents", () => {
+		// Independent oracle from the reviewer’s isolated-store measurement:
+		// 450.5 bytes per node and 243 bytes per edge.
+		expect(estimateReviewGraphStoreBytes(2, 3)).toBe(1630);
+	});
+
+	// #2282 review round F4: the session-fact entry count arrived as a
+	// count-only field, so `dispatchCaches.estimatedBytes` still omitted the
+	// whole sessionFacts footprint. Both counts now carry measured bytes.
+	it("attributes bytes to session-fact entries, not just the neighbor cache", () => {
+		expect(
+			estimateDispatchCacheBytes({
+				recentlyCleanNeighborCacheSize: 2,
+				sessionFactEntries: 1000,
+			}),
+		).toBe(440_640);
+		expect(
+			estimateDispatchCacheBytes({
+				recentlyCleanNeighborCacheSize: 0,
+				sessionFactEntries: 1000,
+			}),
+		).toBe(440_000);
+	});
+
 	it("wordIndex is null when none is supplied (no word index built yet this session)", () => {
 		const subsystems = collectMemorySampleSubsystems(null);
 		expect(subsystems.wordIndex).toBeNull();
@@ -177,17 +222,20 @@ describe("collectMemorySampleSubsystems (O(1)/O(bounded-cache-size) live reads)"
 
 	it("reports word-index doc/posting/forward counts when a word index is supplied", () => {
 		const wordIndex: WordIndex = {
-			postings: new Map([["foo", [{ file: "a.ts", line: 1 }]]]),
+			postings: new Map([["foo", WordPostingList.fromLanes("foo", [0, 1])]]),
+			fileTable: (() => {
+				const table = new WordIndexFileTable();
+				table.intern(normalizeEphemeralMapKey("a.ts"), "a.ts");
+				return table;
+			})(),
 			docLengths: (() => {
 				const m = new PathKeyedMap<number>(normalizeEphemeralMapKey);
 				m.set("a.ts", 5);
 				return m;
 			})(),
 			forward: (() => {
-				const m = new PathKeyedMap<Map<string, number>>(
-					normalizeEphemeralMapKey,
-				);
-				m.set("a.ts", new Map([["foo", 1]]));
+				const m = new PathKeyedMap<WordForwardEntry>(normalizeEphemeralMapKey);
+				m.set("a.ts", WordForwardEntry.fromTally(new Map([["foo", 1]])));
 				return m;
 			})(),
 			totalTokens: 5,
@@ -198,7 +246,15 @@ describe("collectMemorySampleSubsystems (O(1)/O(bounded-cache-size) live reads)"
 		const subsystems = collectMemorySampleSubsystems(wordIndex);
 		expect(subsystems.wordIndex).toEqual({
 			docs: 1,
+			fileTable: 1,
+			// `postings` is the DISTINCT TOKEN count and `postingEntries` is the
+			// posting count. #1999 read the first as the second and under-counted
+			// the subsystem sixtyfold, so both are asserted here (#2069).
 			postings: 1,
+			postingEntries: 1,
+			// One packed posting (8 bytes) plus one packed forward entry (8
+			// bytes), each carrying the fixed per-list header charge.
+			residentBytes: 2 * (8 + WORD_POSTING_LIST_OVERHEAD_BYTES),
 			forwardEntries: 1,
 		});
 	});
@@ -208,17 +264,35 @@ describe("collectMemorySampleSubsystems (O(1)/O(bounded-cache-size) live reads)"
 		expect(subsystems.reviewGraph).toEqual(
 			getReviewGraphWorkspaceCacheSnapshot(),
 		);
-		expect(subsystems.dispatchCaches).toEqual(getDispatchCascadeCacheStats());
+		expect(subsystems.dispatchCaches).toEqual({
+			...getDispatchCascadeCacheStats(),
+			estimatedBytes: 0,
+		});
 	});
 
 	it("every numeric field is non-negative and finite (plausibility, not exact values)", () => {
 		const subsystems = collectMemorySampleSubsystems(null);
+		expect(subsystems.lsp.clients).toBeGreaterThanOrEqual(0);
+		expect(subsystems.lsp.incrementalTextEntries).toBeGreaterThanOrEqual(0);
+		expect(subsystems.lsp.incrementalTextBytes).toBeGreaterThanOrEqual(0);
 		expect(subsystems.reviewGraph.cacheEntries).toBeGreaterThanOrEqual(0);
 		expect(subsystems.reviewGraph.totalNodes).toBeGreaterThanOrEqual(0);
 		expect(subsystems.reviewGraph.totalEdges).toBeGreaterThanOrEqual(0);
+		expect(subsystems.reviewGraph.residentBytes).toBeGreaterThanOrEqual(0);
 		expect(
 			subsystems.dispatchCaches.recentlyCleanNeighborCacheSize,
 		).toBeGreaterThanOrEqual(0);
+		expect(subsystems.dispatchCaches.estimatedBytes).toBeGreaterThanOrEqual(0);
+		// Registry sweep: every non-null subsystem must expose a byte field, so
+		// adding a count-only subsystem cannot silently recur (#2114, #2132
+		// criterion 3).
+		for (const [name, subsystem] of Object.entries(subsystems)) {
+			if (subsystem === null) continue;
+			expect(
+				Object.keys(subsystem).some((key) => /Bytes$/.test(key)),
+				`${name} must expose a byte-denominated field`,
+			).toBe(true);
+		}
 		if (subsystems.treeSitter) {
 			expect(subsystems.treeSitter.languagesLoaded).toBeGreaterThanOrEqual(0);
 			expect(subsystems.treeSitter.treeCacheTotalBytes).toBeGreaterThanOrEqual(
@@ -226,6 +300,39 @@ describe("collectMemorySampleSubsystems (O(1)/O(bounded-cache-size) live reads)"
 			);
 		}
 	});
+
+	it("#2065 fix round 1 F6: reports a REAL client's retained bytes, not just a mock's structural zero (#2065)", async () => {
+		// The "non-negative" test above never proves the lsp fields are actually
+		// wired: every state it reads from is either freshly booted or a plain
+		// mock that never enters `activeLspClients`, so `clients`/
+		// `incrementalTextEntries`/`incrementalTextBytes` all read 0 whether or
+		// not the plumbing works. A real client with known retained text is the
+		// only way to prove a positive value flows through.
+		const proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+			cwd: process.cwd(),
+			env: { ...process.env, FAKE_LSP_SYNC_KIND: "2" }, // Incremental
+		});
+		const client = await createLSPClient({
+			serverId: "memory-sample-real",
+			process: proc,
+			root: process.cwd(),
+		});
+		try {
+			const filePath = path.join(os.tmpdir(), "pi-lens-memory-sample-real.ts");
+			const content = "x".repeat(1000);
+			await client.notify.open(filePath, content, "typescript");
+
+			const subsystems = collectMemorySampleSubsystems(null);
+			expect(subsystems.lsp.clients).toBeGreaterThan(0);
+			expect(subsystems.lsp.incrementalTextEntries).toBeGreaterThan(0);
+			expect(subsystems.lsp.incrementalTextBytes).toBeGreaterThanOrEqual(
+				content.length * 2,
+			);
+		} finally {
+			await client.shutdown().catch(() => {});
+			await stopLSP(proc).catch(() => {});
+		}
+	}, 15_000);
 });
 
 describe("buildMemorySample", () => {

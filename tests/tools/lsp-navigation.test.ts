@@ -110,7 +110,10 @@ describe("lsp_navigation tool", () => {
 					documentSymbol: true,
 					workspaceSymbol: true,
 					codeAction: true,
+					codeActionResolve: false,
 					rename: true,
+					willRenameFiles: false,
+					didRenameFiles: false,
 					implementation: false,
 					callHierarchy: true,
 				},
@@ -141,8 +144,12 @@ describe("lsp_navigation tool", () => {
 		);
 		expect(String(result.content[0]?.text)).toContain("definition ✓");
 		expect(String(result.content[0]?.text)).toContain("signatureHelp ✗");
+		expect(String(result.content[0]?.text)).toContain("codeAction/resolve ✗");
 		expect(String(result.content[0]?.text)).toContain(
-			"rename_file ✓ (willRenameFiles/didRenameFiles helper available)",
+			"workspace/willRenameFiles ✗",
+		);
+		expect(String(result.content[0]?.text)).toContain(
+			"rename_file ✓ (filesystem rename; preflight support shown above)",
 		);
 		expect(result.details?.servers).toEqual(["typescript"]);
 	});
@@ -625,7 +632,10 @@ describe("lsp_navigation tool", () => {
 				documentSymbol: false,
 				workspaceSymbol: false,
 				codeAction: false,
+				codeActionResolve: false,
 				rename: false,
+				willRenameFiles: false,
+				didRenameFiles: false,
 				implementation: false,
 				callHierarchy: false,
 			});
@@ -679,7 +689,10 @@ describe("lsp_navigation tool", () => {
 				documentSymbol: false,
 				workspaceSymbol: false,
 				codeAction: false,
+				codeActionResolve: false,
 				rename: false,
+				willRenameFiles: false,
+				didRenameFiles: false,
 				implementation: false,
 				callHierarchy: true,
 			});

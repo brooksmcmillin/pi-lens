@@ -280,7 +280,14 @@ describe("Pipeline", () => {
 					fs.writeFileSync(filePath, "const x = 1;\n");
 					return {
 						filePath: fp,
-						formatters: [{ name: "biome", success: true, changed: true }],
+						formatters: [
+							{
+								name: "biome",
+								success: true,
+								changed: true,
+								outcome: "formatted" as const,
+							},
+						],
 						anyChanged: true,
 						allSucceeded: true,
 					};
@@ -344,6 +351,7 @@ describe("Pipeline", () => {
 						name: "prettier",
 						success: false,
 						changed: false,
+						outcome: "failed" as const,
 						error: "timed out",
 					},
 				],
@@ -428,7 +436,14 @@ describe("Pipeline", () => {
 					fs.writeFileSync(filePath, "const x = 1;\n");
 					return {
 						filePath: fp,
-						formatters: [{ name: "biome", success: true, changed: true }],
+						formatters: [
+							{
+								name: "biome",
+								success: true,
+								changed: true,
+								outcome: "formatted" as const,
+							},
+						],
 						anyChanged: true,
 						allSucceeded: true,
 					};
@@ -551,7 +566,14 @@ describe("Pipeline", () => {
 					fs.writeFileSync(filePath, "const x = 1;\n");
 					return {
 						filePath: fp,
-						formatters: [{ name: "biome", success: true, changed: true }],
+						formatters: [
+							{
+								name: "biome",
+								success: true,
+								changed: true,
+								outcome: "formatted" as const,
+							},
+						],
 						anyChanged: true,
 						allSucceeded: true,
 					};
@@ -1047,49 +1069,51 @@ describe("Pipeline", () => {
 		// drive-letter class as #1139/#1150. A bare `path.resolve` equality does
 		// not fold that case difference, so it drops EVERY LSP blocker line and
 		// this record silently skips the past-EOF gate — fail-open, but exactly
-		// the pre-fix behavior on the surface #1641 targets. Guarded like this
-		// repo's other win32-casing probes (see `normalizeEphemeralMapKey`'s own
-		// tests in `path-utils.test.ts`) since CI's Unit tests job runs on
-		// ubuntu-latest and case-folding is a no-op there.
-		it("still captures lines when the blocker's path differs from ctx.filePath only by drive-letter case (win32)", async () => {
-			if (process.platform !== "win32") return;
-			const filePath = createTempFile(tmpDir, "app.ts", "const x = 1;");
-			const lowerDriveFilePath =
-				filePath.charAt(0).toLowerCase() + filePath.slice(1);
-			// The diagnostic's path is the OPPOSITE case from `ctx.filePath` —
-			// simulating an LSP-stamped realpath-canonical path colliding with a
-			// pipeline call site that received a lowercase-drive path.
-			const canonicalCaseFilePath =
-				filePath.charAt(0).toUpperCase() + filePath.slice(1);
-			vi.mocked(dispatchLintWithResult).mockResolvedValue({
-				diagnostics: [],
-				blockers: [
-					{
-						id: "lsp-1",
-						message: "Type error",
-						filePath: canonicalCaseFilePath,
-						line: 3,
-						severity: "error",
-						semantic: "blocking",
-						tool: "lsp",
-					},
-				],
-				warnings: [],
-				baselineWarningCount: 0,
-				fixed: [],
-				resolvedCount: 0,
-				output: "type error",
-				blockerOutput: "type error",
-				hasBlockers: true,
-			});
+		// the pre-fix behavior on the surface #1641 targets. Declared skipped off
+		// Windows (#2089): CI's Unit tests job runs on ubuntu-latest, where
+		// case-folding is a no-op, and an early return there would report a PASS
+		// on a body that asserted nothing.
+		it.skipIf(process.platform !== "win32")(
+			"still captures lines when the blocker's path differs from ctx.filePath only by drive-letter case (win32)",
+			async () => {
+				const filePath = createTempFile(tmpDir, "app.ts", "const x = 1;");
+				const lowerDriveFilePath =
+					filePath.charAt(0).toLowerCase() + filePath.slice(1);
+				// The diagnostic's path is the OPPOSITE case from `ctx.filePath` —
+				// simulating an LSP-stamped realpath-canonical path colliding with a
+				// pipeline call site that received a lowercase-drive path.
+				const canonicalCaseFilePath =
+					filePath.charAt(0).toUpperCase() + filePath.slice(1);
+				vi.mocked(dispatchLintWithResult).mockResolvedValue({
+					diagnostics: [],
+					blockers: [
+						{
+							id: "lsp-1",
+							message: "Type error",
+							filePath: canonicalCaseFilePath,
+							line: 3,
+							severity: "error",
+							semantic: "blocking",
+							tool: "lsp",
+						},
+					],
+					warnings: [],
+					baselineWarningCount: 0,
+					fixed: [],
+					resolvedCount: 0,
+					output: "type error",
+					blockerOutput: "type error",
+					hasBlockers: true,
+				});
 
-			const result = await runPipeline(
-				createMockContext(lowerDriveFilePath),
-				createMockDeps(),
-			);
+				const result = await runPipeline(
+					createMockContext(lowerDriveFilePath),
+					createMockDeps(),
+				);
 
-			expect(result.inlineBlockerLines).toEqual([3]);
-		});
+				expect(result.inlineBlockerLines).toEqual([3]);
+			},
+		);
 	});
 
 	// #2028: the 🔴 STOP block is a registered agent-facing delivery surface

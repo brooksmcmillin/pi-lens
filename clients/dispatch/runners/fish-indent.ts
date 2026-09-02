@@ -15,7 +15,6 @@ const fishIndentRunner: RunnerDefinition = {
 	id: "fish-indent",
 	appliesTo: ["fish"],
 	priority: PRIORITY.FORMAT_AND_LINT_PRIMARY,
-	enabledByDefault: true,
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {

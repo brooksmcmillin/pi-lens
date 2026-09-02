@@ -10,6 +10,7 @@ import { toPosix } from "../../clients/path-utils.js";
 // root, so this guard would silently read a stale config (verified 2026-08-12:
 // commenting an entry out of the .ts left the imported list unchanged).
 import vitestConfig from "../../vitest.config.ts";
+import { assertNonEmptyScan } from "../support/sweep-kit.js";
 
 const repoRoot = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -86,6 +87,8 @@ describe("timing-sensitive Vitest project coverage", () => {
 			.filter((file) =>
 				isTimingSensitive(fs.readFileSync(path.join(repoRoot, file), "utf8")),
 			);
+		// Calibration: 14 sampler/CPU-usage tests on 2026-08-26; half is 7.
+		assertNonEmptyScan("timing-sensitive detection", timingFiles.length, 7);
 
 		// Reverse check: a renamed or deleted test must not leave a dead glob
 		// behind — a stale entry silently stops phasing anything at all.

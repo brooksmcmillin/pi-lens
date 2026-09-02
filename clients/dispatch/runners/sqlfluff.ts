@@ -139,7 +139,6 @@ const sqlfluffRunner: RunnerDefinition = {
 	id: "sqlfluff",
 	appliesTo: ["sql"],
 	priority: PRIORITY.SQL_LINT,
-	enabledByDefault: true,
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {

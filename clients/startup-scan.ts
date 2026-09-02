@@ -24,7 +24,10 @@ import {
 	walkTreeStackSync,
 	type WalkVisitor,
 } from "./source-walker.js";
-import { getDirectoryMarkers } from "./workspace-topology.js";
+import {
+	getDirectoryMarkers,
+	registerWorkspaceTopologyReset,
+} from "./workspace-topology.js";
 
 export const PROJECT_ROOT_MARKERS = [
 	".git",
@@ -318,17 +321,16 @@ export function countSourceFilesWithinLimit(
 	return walkSourceCount(dir, limit, Number.POSITIVE_INFINITY).count;
 }
 
-// Process-lifetime memo for the (cwd, homeDir, maxSourceFiles) tuple. The
+// Session-lifetime memo for the (cwd, homeDir, maxSourceFiles) tuple. The
 // underlying computation walks the entire project root counting source
 // files and is dominated by ignoreMatcher.isIgnored() calls; on a 2k-file
-// project it costs ~2-3s the first time. Every `session_start` invocation
-// (boot, /new, --print) recomputes this otherwise. Since the answer
-// depends only on the file tree shape and ignore rules — both of which
-// are also captured by the project snapshot freshness check upstream —
-// in-process memoisation is safe for the duration of a single pi process.
+// project it costs ~2-3s the first time. The topology-reset registry clears
+// this memo at session start, so each session re-derives its answer. The memo
+// remains valid until the next session-start reset.
 const startupScanContextCache = new BoundedLruCache<string, StartupScanContext>(
 	32,
 );
+registerWorkspaceTopologyReset(() => startupScanContextCache.clear());
 
 function startupScanCacheKey(cwd: string, options: StartupScanOptions): string {
 	return [

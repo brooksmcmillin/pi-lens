@@ -13,11 +13,11 @@
  * teardown still completes. Pre-fix they hang to their own vitest timeout.
  */
 
-import { EventEmitter } from "node:events";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { MessageConnection } from "vscode-jsonrpc";
 import { removeLspChild } from "../../../clients/instance-registry.js";
 import { logLatency } from "../../../clients/latency-logger.js";
+import { createMockState } from "./mock-client-state.js";
 
 // Keep both budgets short so a wedged double is bounded well inside the
 // per-test timeout. Assigned before any dynamic `client.js` import below, so
@@ -25,7 +25,12 @@ import { logLatency } from "../../../clients/latency-logger.js";
 process.env.PI_LENS_LSP_SHUTDOWN_TIMEOUT_MS = "50";
 process.env.PI_LENS_LSP_EXIT_NOTIFY_TIMEOUT_MS = "50";
 
-vi.mock("../../../clients/latency-logger.js", () => ({ logLatency: vi.fn() }));
+vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
+	...(await importActual<
+		typeof import("../../../clients/latency-logger.js")
+	>()),
+	logLatency: vi.fn(),
+}));
 vi.mock("../../../clients/instance-registry.js", () => ({
 	recordLspChild: vi.fn().mockResolvedValue(undefined),
 	removeLspChild: vi.fn().mockResolvedValue(undefined),
@@ -53,23 +58,12 @@ function createWedgedConnection(): MessageConnection {
 }
 
 function createWedgedState(kill: ReturnType<typeof vi.fn>) {
-	const diagnosticEmitter = new EventEmitter();
-	diagnosticEmitter.setMaxListeners(50);
-	// A partial state is enough: clientShutdown only touches lifecycle fields.
-	// Cast once at the boundary rather than restating the full LSPClientState.
-	return {
-		isConnected: true,
-		isDestroyed: false,
-		shutdownRequested: false,
-		connectionDisposed: false,
+	// Build the state through the shared fixture so this test follows the real
+	// LSPClientState contract, including lifecycle maps such as
+	// `notifyChangeQueues`. Only the connection and child process boundaries are
+	// doubled because they provide the wedged-transport and safe-pid probes.
+	return createMockState({
 		connection: createWedgedConnection(),
-		pendingDiagnostics: new Map(),
-		pendingOpens: new Set(),
-		openDocuments: new Set(),
-		openDocumentUris: new Map(),
-		projectIdentityProbedFiles: new Set<string>(),
-		watchQueue: { cancel: vi.fn() },
-		diagnosticEmitter,
 		serverId: "wedged",
 		root: "/project",
 		// pid 0 keeps killProcessTree off both the win32 `taskkill /F /T` branch
@@ -91,8 +85,8 @@ function createWedgedState(kill: ReturnType<typeof vi.fn>) {
 				},
 				off: vi.fn(),
 			},
-		},
-	} as unknown as Parameters<ClientModule["clientShutdown"]>[0];
+		} as any,
+	});
 }
 
 describe("clientShutdown with a fully wedged connection (#1620)", () => {

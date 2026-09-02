@@ -189,7 +189,6 @@ describe("tree-sitter runner — metadata", () => {
 		expect(runner.appliesTo).toContain("rust");
 		expect(runner.appliesTo).toContain("ruby");
 		expect(runner.appliesTo).toContain("cxx");
-		expect(runner.enabledByDefault).toBe(true);
 	});
 });
 

@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { gatedPromise } from "../support/fault-injection.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
 const ensureTool = vi.fn();
@@ -506,6 +507,97 @@ describe("jscpd-client", () => {
 			const patterns = String(args[ignoreIndex + 1] ?? "").split(",");
 			expect(patterns).not.toContain("**/*.js");
 			expect(patterns).not.toContain("**/*.jsx");
+		} finally {
+			cleanup();
+		}
+	});
+});
+
+/**
+ * In-flight ABA release (#1968, kit-driven white-box probe — sibling of
+ * dead-code-client's/knip-client's bare-`.finally` release, same shape).
+ *
+ * The race needs a SECOND WRITER replacing the map entry mid-flight — the
+ * public API alone cannot produce it (single set site; microtask FIFO orders
+ * every observer after A's cleanup). The test simulates that writer directly.
+ * Red on the pre-fix bare `.finally` delete: A's cleanup evicted B and the
+ * third caller started a duplicate scan.
+ */
+describe("jscpd-client in-flight ABA release (#1968)", () => {
+	const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+	interface Internals {
+		ensureAvailable: () => Promise<boolean>;
+		hasSourceFilesRecursive: (dir: string) => boolean;
+		runScan: (
+			cwd: string,
+			minLines: number,
+			minTokens: number,
+			isTsProject: boolean,
+		) => Promise<unknown>;
+		inFlight: Map<string, Promise<unknown>>;
+	}
+
+	it("a late-settling scan does not evict its mid-flight successor", async () => {
+		const { JscpdClient } = await import("../../clients/jscpd-client.js");
+		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-jscpd-aba-");
+		try {
+			const client = new JscpdClient(false);
+			const internals = client as unknown as Internals;
+			vi.spyOn(internals, "ensureAvailable").mockResolvedValue(true);
+			vi.spyOn(internals, "hasSourceFilesRecursive").mockReturnValue(true);
+
+			const gateA = gatedPromise<unknown>();
+			let scanCalls = 0;
+			vi.spyOn(internals, "runScan").mockImplementation(() => {
+				scanCalls += 1;
+				return scanCalls === 1
+					? gateA.promise
+					: gatedPromise<unknown>().promise;
+			});
+
+			void client.scan(tmpDir, 5, 50, false); // scan A in flight
+			await tick();
+			expect(internals.inFlight.size).toBe(1);
+			const key = [...internals.inFlight.keys()][0]!;
+
+			// B replaces the entry under the same key while A is still in flight.
+			const successor = gatedPromise<unknown>();
+			internals.inFlight.set(key, successor.promise);
+
+			gateA.resolve({}); // A settles late
+			await tick();
+			await tick();
+
+			// B's entry survived A's cleanup...
+			expect(internals.inFlight.get(key)).toBe(successor.promise);
+			// ...and a third caller SHARES B instead of starting a duplicate scan.
+			void client.scan(tmpDir, 5, 50, false);
+			await tick();
+			expect(scanCalls).toBe(1);
+
+			successor.resolve({});
+		} finally {
+			cleanup();
+		}
+	});
+
+	// Mutation-proof companion: pins that a normal, uncontested settlement
+	// still empties the slot, so a mutant that makes the identity guard
+	// permanently `false` (never releases) reds here.
+	it("a normally-settling scan still cleans up its own entry", async () => {
+		const { JscpdClient } = await import("../../clients/jscpd-client.js");
+		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-jscpd-clean-");
+		try {
+			const client = new JscpdClient(false);
+			const internals = client as unknown as Internals;
+			vi.spyOn(internals, "ensureAvailable").mockResolvedValue(true);
+			vi.spyOn(internals, "hasSourceFilesRecursive").mockReturnValue(true);
+			vi.spyOn(internals, "runScan").mockResolvedValue({});
+
+			await client.scan(tmpDir, 5, 50, false);
+			await tick();
+			expect(internals.inFlight.size).toBe(0);
 		} finally {
 			cleanup();
 		}

@@ -27,38 +27,49 @@ released `ast-grep`), so we get a fresh-engine cross-check.
 
 ## What the playground actually does
 
-The playground's source code is **fixed** — the user cannot inject custom
-source via the URL hash. The URL hash only carries:
+The verifier encodes `--code` into the playground's URL-hash state so the
+upstream engine matches the rule against it. The state (`ast-grep/ast-
+grep.github.io`, `website/src/components/astGrep/state.ts` +
+`index.ts`) carries:
 
 - `mode: "Config"` + `config: <rule YAML>` (the rule)
-- `query` (an ast-grep pattern string, only used in `mode: "Pattern"`)
+- `source: <code>` — the code the rule is matched against, in **both**
+  modes
+- `query` — an ast-grep pattern string, used only in `mode: "Pattern"`
+  (irrelevant here; the verifier always requests Config mode)
 
-So this verifier is a **pattern-level smoke test**: "does the rule's
-pattern fire on the playground's hardcoded sample source?" It catches:
+So this verifier checks: "does the rule match `--code` on the upstream
+engine, and does the count agree with the local `ast-grep` CLI?" It catches:
 
 - **YAML/pattern rejection** — the playground shows an error if the rule's
   YAML uses features the upstream engine doesn't support
 - **Pattern-engine divergence** — local ast-grep matches but upstream
   doesn't (or vice versa)
 - **Match-count drift** — `Found N match(es)` count differs between local
-  and upstream
+  and upstream, for the *same* source
 
-It does **not** catch rule-vs-source bugs where the source is what the user
-wrote — the local CLI test is the source of truth for that.
+#2208: earlier versions of this verifier wrote `--code` into `query`
+instead of `source`. Since `query` is ignored in Config mode, the hash
+carried no source at all, and the playground's `{...defaultState,
+...parsed}` state merge silently fell back to its own hardcoded sample —
+every run graded that fixed sample, not `--code`. Every "ok:true
+matches:N" this verifier produced before the fix reflected the playground's
+sample source, never the caller's code.
 
 ## Usage
 
 ```bash
-# Smoke-test a single rule (auto-launches headless Chrome on 9224, then kills it)
-node scripts/playground-verify-rule.mjs rules/ast-grep-rules/rules/no-console-except-error.yml --code "ignored"
+# Smoke-test a single rule against a snippet it matches
+# (auto-launches headless Chrome on 9224, then kills it)
+node scripts/playground-verify-rule.mjs rules/ast-grep-rules/rules/no-console-except-error.yml --code "console.log('x');"
 
 # Assert a specific match count
 node scripts/playground-verify-rule.mjs rules/ast-grep-rules/rules/jsx-boolean-short-circuit.yml \
-  --code "ignored" --expected 0
+  --code "const a = 1;" --expected 0
 
 # Keep Chrome alive for follow-up runs (avoids the 5–10s cold-start cost)
 node scripts/playground-verify-rule.mjs rules/ast-grep-rules/rules/no-console-except-error.yml \
-  --code "ignored" --keep-chrome
+  --code "console.log('x');" --keep-chrome
 
 ```
 
@@ -142,7 +153,9 @@ Three scripts, one job each:
   resolution, accessibility tree, and network tracing stripped out.
 - `playground-verify-rule.mjs` — the CLI the user invokes. Reads the rule,
   builds the playground URL, runs the page through CDP, scrapes the
-  result, prints JSON, kills Chrome.
+  result, prints JSON, and kills Chrome. Its source-drift sentinel reads only
+  the first `.monaco-editor` in the source pane, not the config editor, so a
+  rule note cannot satisfy the check by repeating the fixture text.
 
 ## Skipping the test
 
@@ -165,10 +178,6 @@ auto-skipped when Google Chrome is not on `PATH` and
 
 ## Known limitations
 
-- **Source is fixed.** The playground uses its own hardcoded sample
-  source. Custom source code passed via `--code` is ignored by the
-  upstream playground in `mode: "Config"`. This is by design — the
-  playground is a manual tool, not a test harness.
 - **Slow.** ~11s per rule. Don't enable in the default `npm test` run.
 - **Line numbers are best-effort.** The playground's gutter layout
   changes between builds. If the line-extraction JS misses, `lines` is

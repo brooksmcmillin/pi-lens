@@ -166,3 +166,8 @@ export function scanHostEventShapeViolations(): HostEventShapeViolation[] {
 	}
 	return violations;
 }
+
+/** Number of test source files visited by the production walk. */
+export function hostEventShapeScanFileCount(): number {
+	return testFiles().length;
+}

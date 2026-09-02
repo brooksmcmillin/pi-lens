@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
+	checkPriorityCoverage,
 	detectStaleOpenIssues,
 	formatSummary,
 	MAX_COMMIT_DETAILS,
 	MAX_PAGES,
 	PAGE_SIZE,
+	shouldPost,
 } from "../../scripts/lib/stale-open-issues.mjs";
 
 function fakeGithub(data: Record<string, unknown>) {
@@ -57,6 +59,48 @@ describe("stale open-issue detector (#1323)", () => {
 			},
 		]);
 		expect(truncatedCommits).toBe(0);
+	});
+
+	it("fails loudly instead of returning a population beyond the page bound", async () => {
+		const { fetcher } = fakeGithub({
+			"/repos/acme/repo/issues": Array.from({ length: PAGE_SIZE }, (_, i) => ({
+				number: i + 1,
+				labels: [{ name: "priority:p3" }],
+			})),
+			"/repos/acme/repo/commits": [],
+		});
+		await expect(
+			detectStaleOpenIssues({ fetcher, repository: "acme/repo" }),
+		).rejects.toThrow("refusing to use a partial response");
+	});
+
+	it("paginates the open population until GitHub returns an empty page", async () => {
+		const pages = [
+			Array.from({ length: PAGE_SIZE }, (_, i) => ({
+				number: i + 1,
+				labels: [{ name: "priority:p3" }],
+			})),
+			[{ number: PAGE_SIZE + 1, labels: [{ name: "priority:p3" }] }],
+			[],
+		];
+		const fetcher = async (url: string) => {
+			const parsed = new URL(url);
+			const page = Number(parsed.searchParams.get("page"));
+			return {
+				ok: true,
+				status: 200,
+				json: async () =>
+					parsed.pathname.endsWith("/issues") ? pages[page - 1] : [],
+			};
+		};
+		const result = await detectStaleOpenIssues({
+			fetcher,
+			repository: "acme/repo",
+		});
+		expect(result.scannedOpenItems).toBe(PAGE_SIZE + 1);
+		expect(
+			formatSummary([], { scannedOpenItems: result.scannedOpenItems }),
+		).toContain("Scanned population: 101 open item(s).");
 	});
 
 	it("ignores issues absent from the open-issue response and non-test filenames", async () => {
@@ -130,6 +174,35 @@ describe("stale open-issue detector (#1323)", () => {
 		);
 	});
 
+	it("keeps the bounded commit window and reports truncation", async () => {
+		const pages = Array.from({ length: MAX_PAGES }, (_, pageIndex) =>
+			Array.from({ length: PAGE_SIZE }, (_, itemIndex) => ({
+				sha: `page${pageIndex}-sha${itemIndex}`,
+				commit: { message: "chore: routine" },
+			})),
+		);
+		const commits = pages.flat();
+		const fetcher = async (url: string) => {
+			const parsed = new URL(url);
+			if (parsed.pathname.endsWith("/issues"))
+				return { ok: true, status: 200, json: async () => [] };
+			if (parsed.pathname.endsWith("/commits"))
+				return {
+					ok: true,
+					status: 200,
+					json: async () => pages[Number(parsed.searchParams.get("page")) - 1],
+				};
+			return { ok: true, status: 200, json: async () => ({ files: [] }) };
+		};
+
+		const result = await detectStaleOpenIssues({
+			fetcher,
+			repository: "acme/repo",
+		});
+		expect(result.candidates).toEqual([]);
+		expect(result.truncatedCommits).toBe(commits.length - MAX_COMMIT_DETAILS);
+	});
+
 	it("keeps API work bounded and formats one detection-only summary", async () => {
 		const { fetcher, calls } = fakeGithub({
 			"/repos/acme/repo/issues": [],
@@ -146,5 +219,158 @@ describe("stale open-issue detector (#1323)", () => {
 		expect(formatSummary([], { runUrl: "https://example/run" })).toContain(
 			"never closes issues",
 		);
+	});
+});
+
+describe("priority label coverage (#1676)", () => {
+	it("flags an open issue with zero priority:* labels", () => {
+		const issues = [
+			{
+				number: 1,
+				title: "no priority",
+				html_url: "https://github.com/acme/repo/issues/1",
+				labels: [{ name: "bug" }],
+			},
+		];
+		const { zero, multiple } = checkPriorityCoverage(issues);
+		expect(zero).toEqual([expect.objectContaining({ number: 1 })]);
+		expect(multiple).toEqual([]);
+	});
+
+	it("does not flag an open issue with exactly one priority:* label", () => {
+		const issues = [
+			{
+				number: 2,
+				title: "one priority",
+				html_url: "https://github.com/acme/repo/issues/2",
+				labels: [{ name: "bug" }, { name: "priority:p2" }],
+			},
+		];
+		const { zero, multiple } = checkPriorityCoverage(issues);
+		expect(zero).toEqual([]);
+		expect(multiple).toEqual([]);
+	});
+
+	it("flags an open issue with more than one priority:* label", () => {
+		const issues = [
+			{
+				number: 3,
+				title: "two priorities",
+				html_url: "https://github.com/acme/repo/issues/3",
+				labels: [{ name: "priority:p1" }, { name: "priority:p2" }],
+			},
+		];
+		const { zero, multiple } = checkPriorityCoverage(issues);
+		expect(zero).toEqual([]);
+		expect(multiple).toEqual([expect.objectContaining({ number: 3 })]);
+	});
+
+	it("treats labels that merely contain 'priority' but aren't priority:* as zero coverage", () => {
+		const issues = [
+			{
+				number: 4,
+				title: "decoy label",
+				html_url: "https://github.com/acme/repo/issues/4",
+				labels: [{ name: "high-priority" }, { name: "not-priority:p1" }],
+			},
+		];
+		const { zero, multiple } = checkPriorityCoverage(issues);
+		expect(zero).toEqual([expect.objectContaining({ number: 4 })]);
+		expect(multiple).toEqual([]);
+	});
+
+	it("ignores pull requests when checking priority coverage", () => {
+		const issues = [
+			{
+				number: 5,
+				title: "a pull request",
+				html_url: "https://github.com/acme/repo/pull/5",
+				pull_request: {},
+				labels: [],
+			},
+		];
+		const { zero, multiple } = checkPriorityCoverage(issues);
+		expect(zero).toEqual([]);
+		expect(multiple).toEqual([]);
+	});
+
+	it("accepts plain-string labels, not only label objects", () => {
+		const issues = [
+			{ number: 6, title: "string label", labels: ["priority:p3"] },
+		];
+		const { zero, multiple } = checkPriorityCoverage(issues);
+		expect(zero).toEqual([]);
+		expect(multiple).toEqual([]);
+	});
+
+	it("sorts both lists by issue number", () => {
+		const issues = [
+			{ number: 20, title: "b", labels: [] },
+			{ number: 7, title: "a", labels: [] },
+		];
+		const { zero } = checkPriorityCoverage(issues);
+		expect(zero.map((issue) => issue.number)).toEqual([7, 20]);
+	});
+});
+
+describe("formatSummary priority coverage section", () => {
+	it("lists zero- and multiple-priority issues by number and title", () => {
+		const summary = formatSummary([], {
+			priorityCoverage: {
+				zero: [
+					{
+						number: 8,
+						title: "missing priority",
+						html_url: "https://github.com/acme/repo/issues/8",
+					},
+				],
+				multiple: [
+					{
+						number: 9,
+						title: "double priority",
+						html_url: "https://github.com/acme/repo/issues/9",
+					},
+				],
+			},
+		});
+		expect(summary).toContain("Priority label coverage");
+		expect(summary).toContain("#8");
+		expect(summary).toContain("missing priority");
+		expect(summary).toContain("#9");
+		expect(summary).toContain("double priority");
+	});
+
+	it("omits the priority coverage section when not provided (byte-identical for existing callers)", () => {
+		const before = formatSummary([], { runUrl: "https://example/run" });
+		expect(before).not.toContain("Priority label coverage");
+	});
+});
+
+describe("shouldPost (#1676 fix round)", () => {
+	it("posts when priority gaps exist even with zero stale candidates", () => {
+		expect(
+			shouldPost({
+				candidates: [],
+				priorityCoverage: { zero: [{ number: 1, title: "x" }], multiple: [] },
+			}),
+		).toBe(true);
+	});
+
+	it("stays silent when there are neither stale candidates nor priority gaps", () => {
+		expect(
+			shouldPost({
+				candidates: [],
+				priorityCoverage: { zero: [], multiple: [] },
+			}),
+		).toBe(false);
+	});
+
+	it("posts when multiple priority labels exist even without zero-label gaps", () => {
+		expect(
+			shouldPost({
+				candidates: [],
+				priorityCoverage: { zero: [], multiple: [{ number: 2, title: "x" }] },
+			}),
+		).toBe(true);
 	});
 });

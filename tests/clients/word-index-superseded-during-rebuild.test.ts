@@ -32,6 +32,7 @@ vi.mock("../../clients/cooperative-budget.js", async (importOriginal) => {
 import {
 	buildWordIndexAsync,
 	type WordIndex,
+	wordIndexPostingHits,
 } from "../../clients/word-index.js";
 
 function document(path: string, identifier: string) {
@@ -89,7 +90,7 @@ describe("word-index rebuild supersession (#1227)", () => {
 			// Atomic publish: the replacement is complete, and none of generation 1's
 			// postings escaped from its private staged index.
 			expect(replacement.docCount).toBe(newDocs.length);
-			expect(replacement.postings.get("newgenerationalpha")).toEqual([
+			expect(wordIndexPostingHits(replacement, "newgenerationalpha")).toEqual([
 				{ file: "src/new-a.ts", line: 1 },
 			]);
 			expect(replacement.postings.get("oldgenerationalpha")).toBeUndefined();

@@ -5,7 +5,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { minimatch } from "./deps/minimatch.js";
+import { Minimatch, type MinimatchOptions } from "./deps/minimatch.js";
 import {
 	isInSpawnTimeoutCooldown,
 	noteSpawnTimeout,
@@ -18,7 +18,11 @@ import {
 	getGlobalIgnorePatterns,
 	getPiLensGlobalConfigPath,
 } from "./lens-config.js";
-import { normalizeEphemeralMapKey, normalizeFilePath } from "./path-utils.js";
+import {
+	isUnderDir,
+	normalizeEphemeralMapKey,
+	normalizeFilePath,
+} from "./path-utils.js";
 import {
 	findPiLensConfigInDir,
 	findPiLensProjectConfig,
@@ -167,6 +171,8 @@ export interface GitignorePattern {
 export interface ProjectIgnoreMatcher {
 	rootDir: string;
 	patterns: GitignorePattern[];
+	/** Drops path verdicts below a changed nested `.gitignore`. */
+	invalidateSubtree(subtree: string): void;
 	isIgnored(filePath: string, isDirectory?: boolean): boolean;
 	/**
 	 * Primes the tracked-files set for `rootDir` (async `git ls-files`,
@@ -181,6 +187,17 @@ export interface ProjectIgnoreMatcher {
 	 */
 	ensureTrackedIndex(): Promise<void>;
 }
+
+interface IgnoreSource {
+	path: string;
+	mtimeMs: number;
+	size: number;
+}
+
+type ProjectIgnoreMatcherWithFreshness = ProjectIgnoreMatcher & {
+	getConsumedIgnoreSources(): readonly IgnoreSource[];
+	refreshConsumedIgnoreSource(filePath: string): void;
+};
 
 function resolveGitIgnoreRoot(startDir: string): string {
 	const fallback = path.resolve(startDir);
@@ -283,18 +300,18 @@ function matchesGitignorePattern(
 	pattern: GitignorePattern,
 	relativePath: string,
 	isDirectory: boolean,
+	matchExpanded: (value: string, expanded: string) => boolean,
 ): boolean {
 	const candidate = stripLeadingSlashes(normalizeIgnorePath(relativePath));
 	if (!candidate) return false;
 	const candidates = isDirectory ? [candidate, `${candidate}/`] : [candidate];
-	const options = { dot: true, nocase: process.platform === "win32" };
 	return expandGitignorePattern(pattern).some((expanded) => {
 		if (isDirectory && expanded.endsWith("/**")) {
 			const prefix = expanded.slice(0, -3);
 			if (candidate === prefix || candidate.startsWith(`${prefix}/`))
 				return true;
 		}
-		return candidates.some((value) => minimatch(value, expanded, options));
+		return candidates.some((value) => matchExpanded(value, expanded));
 	});
 }
 
@@ -329,10 +346,27 @@ function ancestorDirsBetween(rootDir: string, targetDir: string): string[] {
 function buildProjectIgnoreMatcher(
 	resolvedRoot: string,
 	patterns: GitignorePattern[],
-): ProjectIgnoreMatcher {
+): ProjectIgnoreMatcherWithFreshness {
+	const consumedIgnoreSources = new Map<string, IgnoreSource>();
+	// `signature` lets a caller that already statted the file reuse that one
+	// stat (#2016's class on this seam: never re-derive a value you just
+	// computed). Callers with no signature in hand still pay their own stat.
+	const rememberIgnoreSource = (
+		filePath: string,
+		signature: FreshnessSignature = fileFreshnessSignature(filePath),
+	): void => {
+		consumedIgnoreSources.set(filePath, { path: filePath, ...signature });
+	};
+	rememberIgnoreSource(path.join(resolvedRoot, ".gitignore"));
 	const nestedCache = new Map<
 		string,
 		{
+			/**
+			 * #2071: the ONE clock this directory's ignore rules and every path
+			 * verdict derived from them share. Inside the window neither is
+			 * re-checked, so two paths under the same rule cannot disagree.
+			 */
+			checkedAtMs: number;
 			gitignoreMtimeMs: number;
 			gitignoreSize: number;
 			pilensMtimeMs: number;
@@ -352,7 +386,28 @@ function buildProjectIgnoreMatcher(
 	// caller (or the root-config lookup above) already loaded.
 	const patternsForDir = (dir: string): GitignorePattern[] => {
 		if (dir === resolvedRoot) return patterns;
+		const cached = nestedCache.get(dir);
+		const now = Date.now();
+		// #2071: inside the cadence window this directory's rules are frozen, so
+		// no stat runs and every verdict already memoized under `dir` stays
+		// derivable from exactly these patterns. Before this gate the freshness
+		// check ran per call while `patternMemo` did not, which is what let a
+		// fresh path and a memoized path in the same directory return opposite
+		// verdicts for the same rule. Externally edited nested sources are
+		// therefore picked up within PROJECT_IGNORE_FRESHNESS_CADENCE_MS, the
+		// same bound #2159 already accepted for the root sources.
+		// pi-authored `.gitignore` writes keep their instant path through
+		// `invalidateProjectIgnoreMatcherForPath`.
+		if (
+			cached !== undefined &&
+			now - cached.checkedAtMs < PROJECT_IGNORE_FRESHNESS_CADENCE_MS
+		) {
+			return cached.patterns;
+		}
 		const gitignoreSig = gitignoreSignature(dir);
+		// One stat, two consumers. `rememberIgnoreSource` used to stat the same
+		// file a second time on the line below this one.
+		rememberIgnoreSource(path.join(dir, ".gitignore"), gitignoreSig);
 		// #1105: gate on size too. `findPiLensConfigInDir` returns `size` alongside
 		// `mtimeMs` (both from one stat), and `gitignoreSignature` reads both for
 		// the nested `.gitignore`, so an mtime-preserving, length-changing edit to
@@ -360,13 +415,15 @@ function buildProjectIgnoreMatcher(
 		const pilensInfo = findPiLensConfigInDir(dir);
 		const pilensMtime = pilensInfo?.mtimeMs ?? -1;
 		const pilensSize = pilensInfo?.size ?? -1;
-		const cached = nestedCache.get(dir);
 		if (
 			cached?.gitignoreMtimeMs === gitignoreSig.mtimeMs &&
 			cached?.gitignoreSize === gitignoreSig.size &&
 			cached?.pilensMtimeMs === pilensMtime &&
 			cached?.pilensSize === pilensSize
 		) {
+			// Unchanged: re-arm the shared clock so the next window is measured
+			// from this check, not from the build that first populated the entry.
+			cached.checkedAtMs = now;
 			return cached.patterns;
 		}
 		const nestedConfig = loadPiLensConfigInDir(dir);
@@ -375,12 +432,18 @@ function buildProjectIgnoreMatcher(
 			...parseGitignoreContent(nestedConfig.ignore.join("\n"), "pilens"),
 		];
 		nestedCache.set(dir, {
+			checkedAtMs: now,
 			gitignoreMtimeMs: gitignoreSig.mtimeMs,
 			gitignoreSize: gitignoreSig.size,
 			pilensMtimeMs: pilensMtime,
 			pilensSize: pilensSize,
 			patterns: nextPatterns,
 		});
+		// #2071: drift is the SINGLE trigger. The rules under `dir` just changed,
+		// so every verdict computed under the superseded rules dies in the same
+		// step that supersedes them. `cached === undefined` is a first build, not
+		// a change, and has no verdicts to drop.
+		if (cached !== undefined) dropVerdictsUnder(dir);
 		return nextPatterns;
 	};
 
@@ -409,6 +472,47 @@ function buildProjectIgnoreMatcher(
 		string,
 		{ ignored: boolean; layer: GitignorePatternLayer | undefined }
 	>();
+	/**
+	 * Drop every memoized verdict at or below `subtree`, leaving `nestedCache`
+	 * alone. `patternsForDir` calls this the moment it rebuilds a directory's
+	 * patterns, which is why it must NOT evict the entry that rebuild just
+	 * wrote. `invalidateSubtree` layers the eviction on top for the write-hook
+	 * path, where the caller knows the source changed but has not re-read it.
+	 */
+	function dropVerdictsUnder(subtree: string): void {
+		const resolvedSubtree = path.resolve(subtree);
+		for (const key of patternMemo.keys()) {
+			const memoPath = key.slice(2);
+			const relative = path.relative(resolvedSubtree, memoPath);
+			if (
+				!relative ||
+				(!relative.startsWith("..") && !path.isAbsolute(relative))
+			) {
+				patternMemo.delete(key);
+			}
+		}
+	}
+	const invalidateSubtree = (subtree: string): void => {
+		dropVerdictsUnder(subtree);
+		nestedCache.delete(path.resolve(subtree));
+	};
+
+	// Compile expanded gitignore globs once per matcher instance. Relative-path
+	// resolution remains outside this cache, so nested ignore scopes cannot leak
+	// verdicts between sibling trees. The instance lifetime bounds this map.
+	const gitignoreGlobOptions: MinimatchOptions = {
+		dot: true,
+		nocase: process.platform === "win32",
+	};
+	const compiledGlobs = new Map<string, Minimatch>();
+	const matchExpanded = (value: string, expanded: string): boolean => {
+		let compiled = compiledGlobs.get(expanded);
+		if (compiled === undefined) {
+			compiled = new Minimatch(expanded, gitignoreGlobOptions);
+			compiledGlobs.set(expanded, compiled);
+		}
+		return compiled.match(value);
+	};
 
 	// #703 perf follow-up: `normalizeEphemeralMapKey` (cheap slash-fold +
 	// Windows-lowercase, zero fs I/O), NOT `normalizeMapKey` (realpath-backed).
@@ -436,6 +540,12 @@ function buildProjectIgnoreMatcher(
 	return {
 		rootDir: resolvedRoot,
 		patterns,
+		getConsumedIgnoreSources: () => [...consumedIgnoreSources.values()],
+		refreshConsumedIgnoreSource(filePath: string): void {
+			// The freshness sweep refreshes this baseline after invalidation.
+			if (consumedIgnoreSources.has(filePath)) rememberIgnoreSource(filePath);
+		},
+		invalidateSubtree,
 		ensureTrackedIndex(): Promise<void> {
 			return collectTrackedFiles(resolvedRoot).then(() => undefined);
 		},
@@ -466,7 +576,14 @@ function buildProjectIgnoreMatcher(
 						const relative = path.relative(dir, resolved);
 						const normalized = normalizeIgnorePath(relative);
 						for (const pattern of dirPatterns) {
-							if (!matchesGitignorePattern(pattern, normalized, isDirectory))
+							if (
+								!matchesGitignorePattern(
+									pattern,
+									normalized,
+									isDirectory,
+									matchExpanded,
+								)
+							)
 								continue;
 							ignored = !pattern.negated;
 							layer = pattern.layer;
@@ -500,7 +617,7 @@ export function createProjectIgnoreMatcher(
 	rootDir: string,
 	extraPatterns: string[] = [],
 	globalPatterns: string[] = [],
-): ProjectIgnoreMatcher {
+): ProjectIgnoreMatcherWithFreshness {
 	const resolvedRoot = resolveGitIgnoreRoot(rootDir);
 	// Precedence is gitignore order: LATER patterns override earlier ones. So
 	// global (lowest) → project .gitignore → project .pi-lens.json (highest),
@@ -519,6 +636,8 @@ export function createProjectIgnoreMatcher(
 const projectIgnoreMatcherCache = new Map<
 	string,
 	{
+		ignoreSources: IgnoreSource[];
+		lastIgnoreFreshnessCheckMs: number;
 		gitignoreMtimeMs: number;
 		/** #1105 second axis for the root `.gitignore` (see FreshnessSignature). */
 		gitignoreSize: number;
@@ -532,9 +651,12 @@ const projectIgnoreMatcherCache = new Map<
 		globalConfigMtimeMs: number;
 		/** #1105 second axis for the global `~/.pi-lens/config.json`. */
 		globalConfigSize: number;
-		matcher: ProjectIgnoreMatcher;
+		matcher: ProjectIgnoreMatcherWithFreshness;
 	}
 >();
+
+/** Nested ignore sources are checked at most once per root per cadence window. */
+export const PROJECT_IGNORE_FRESHNESS_CADENCE_MS = 2_000;
 
 /**
  * `size:mtimeMs` freshness signature for a single file (#1105). mtime alone
@@ -567,6 +689,13 @@ function gitignoreSignature(rootDir: string): FreshnessSignature {
 	return fileFreshnessSignature(path.join(rootDir, ".gitignore"));
 }
 
+function hasIgnoreSourceDrift(sources: readonly IgnoreSource[]): boolean {
+	return sources.some((source) => {
+		const current = fileFreshnessSignature(source.path);
+		return current.mtimeMs !== source.mtimeMs || current.size !== source.size;
+	});
+}
+
 /**
  * The project config file found by the same upward walk as the loader. Cache
  * invalidation must track the actual file found, not only a file directly under
@@ -591,6 +720,47 @@ export function getProjectIgnoreMatcher(rootDir: string): ProjectIgnoreMatcher {
 	const lensConfig = lensConfigInfo(resolvedRoot);
 	const globalSig = globalConfigSignature();
 	const cached = projectIgnoreMatcherCache.get(resolvedRoot);
+	// A path can be discovered during the previous matcher lookup. Publish only
+	// previously unseen sources so a walk cannot replace a pre-edit baseline.
+	//
+	// This runs BEFORE the sweep below, and the order is load-bearing. A nested
+	// source can only be published on a call AFTER the one that consumed it.
+	// With the publish second, the sweep never saw a source during the window in
+	// which it was discovered, yet still reset `lastIgnoreFreshnessCheckMs`, so
+	// the first sweep that could see it ran a FULL cadence later. Pickup was up
+	// to 2x cadence, not 1x: measured stale at 2 s and 3 s, fresh at 4 s. The
+	// baseline is protected by the `known` set, not by the ordering, so moving
+	// the publish earlier cannot let a walk overwrite a pre-edit baseline.
+	if (cached) {
+		const known = new Set(cached.ignoreSources.map((source) => source.path));
+		for (const source of cached.matcher.getConsumedIgnoreSources()) {
+			if (!known.has(source.path)) cached.ignoreSources.push(source);
+		}
+	}
+	if (
+		cached &&
+		Date.now() - cached.lastIgnoreFreshnessCheckMs >=
+			PROJECT_IGNORE_FRESHNESS_CADENCE_MS
+	) {
+		cached.lastIgnoreFreshnessCheckMs = Date.now();
+		if (hasIgnoreSourceDrift(cached.ignoreSources)) {
+			for (const source of cached.ignoreSources) {
+				if (hasIgnoreSourceDrift([source])) {
+					const sourceIndex = cached.ignoreSources.findIndex(
+						(cachedSource) => cachedSource.path === source.path,
+					);
+					invalidateProjectIgnoreMatcherForPath(source.path);
+					cached.matcher.refreshConsumedIgnoreSource(source.path);
+					const refreshedSource = cached.matcher
+						.getConsumedIgnoreSources()
+						.find((current) => current.path === source.path);
+					if (sourceIndex !== -1 && refreshedSource !== undefined) {
+						cached.ignoreSources.splice(sourceIndex, 1, refreshedSource);
+					}
+				}
+			}
+		}
+	}
 	if (
 		cached?.gitignoreMtimeMs === gitignoreSig.mtimeMs &&
 		cached?.gitignoreSize === gitignoreSig.size &&
@@ -615,6 +785,8 @@ export function getProjectIgnoreMatcher(rootDir: string): ProjectIgnoreMatcher {
 		getGlobalIgnorePatterns(),
 	);
 	projectIgnoreMatcherCache.set(resolvedRoot, {
+		ignoreSources: [...matcher.getConsumedIgnoreSources()],
+		lastIgnoreFreshnessCheckMs: Date.now(),
 		gitignoreMtimeMs: gitignoreSig.mtimeMs,
 		gitignoreSize: gitignoreSig.size,
 		lensConfigPath: lensConfig.path,
@@ -625,6 +797,29 @@ export function getProjectIgnoreMatcher(rootDir: string): ProjectIgnoreMatcher {
 		matcher,
 	});
 	return matcher;
+}
+
+/**
+ * Invalidate the cached matcher state affected by a written `.gitignore`.
+ *
+ * Root changes discard the whole matcher because they change its base pattern
+ * set. Nested changes evict only verdicts in that directory's subtree; the
+ * matcher and compiled-glob memo remain reusable for unrelated trees.
+ */
+export function invalidateProjectIgnoreMatcherForPath(filePath: string): void {
+	const resolvedPath = path.resolve(filePath);
+	if (path.basename(resolvedPath).toLowerCase() !== ".gitignore") return;
+	for (const [cachedRoot, cached] of projectIgnoreMatcherCache) {
+		if (!isUnderDir(resolvedPath, cachedRoot)) continue;
+		if (
+			normalizeFilePath(resolvedPath) ===
+			normalizeFilePath(path.join(cachedRoot, ".gitignore"))
+		) {
+			projectIgnoreMatcherCache.delete(cachedRoot);
+			continue;
+		}
+		cached.matcher.invalidateSubtree(path.dirname(resolvedPath));
+	}
 }
 
 export function isPathIgnoredByProject(

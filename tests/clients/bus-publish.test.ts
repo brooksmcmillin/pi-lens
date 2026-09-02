@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { normalizeFilePath } from "../../clients/path-utils.js";
 
 const appendRecentTouches = vi.fn().mockResolvedValue(undefined);
 vi.mock("../../clients/recent-touches.js", () => ({
@@ -340,6 +341,35 @@ describe("bus-publish — pilens:files:touched (#482)", () => {
 		expect(getDegradationSummary()).toEqual([
 			expect.objectContaining({ kind: "bus-stale", count: 2 }),
 		]);
+	});
+
+	it("records the pi-lens writer and bounded paths for drift correlation", () => {
+		const emit = vi.fn();
+		wireBusEmitter(emit);
+		const paths = Array.from(
+			{ length: 70 },
+			(_, index) => `/repo/src/file-${index}.ts`,
+		);
+
+		publishFilesTouched({
+			reason: "autofix",
+			paths,
+			cwd: "/repo",
+		});
+
+		expect(logBusEvent).toHaveBeenCalledWith(
+			expect.objectContaining({
+				event: BUS_FILES_TOUCHED_EVENT,
+				outcome: "emitted",
+				writer: "pi-lens",
+				paths: expect.arrayContaining([
+					normalizeFilePath(paths[0]),
+					normalizeFilePath(paths[63]),
+				]),
+			}),
+		);
+		const record = logBusEvent.mock.calls[0]?.[0] as { paths?: string[] };
+		expect(record.paths).toHaveLength(64);
 	});
 
 	describe("#502: fix-provenance additive fields", () => {

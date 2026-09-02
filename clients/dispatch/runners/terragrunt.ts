@@ -154,7 +154,6 @@ const terragruntRunner: RunnerDefinition = {
 	id: "terragrunt",
 	appliesTo: ["terragrunt"],
 	priority: PRIORITY.GENERAL_ANALYSIS,
-	enabledByDefault: true,
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {

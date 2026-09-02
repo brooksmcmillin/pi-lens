@@ -60,9 +60,7 @@ export function registerDefaultRunners(registry: RunnerRegistry): void {
 	registry.register(lspRunner); // Unified LSP type-checking for all languages (priority 4)
 	registry.register(pyrightRunner); // Python type-checking (priority 5) - fallback when --lens-lsp disabled
 	registry.register(biomeCheckJsonRunner); // Biome check with JSON output for diagnostic capture (priority 9)
-	// DISABLED in post-write dispatch - ast-grep-napi can crash. Runs in the
-	// project-wide pass via lens_diagnostics mode=full (refreshRunners) instead.
-	registry.register(astGrepNapiRunner); // TS/JS structural analysis via NAPI (priority 15, post-write disabled)
+	registry.register(astGrepNapiRunner); // JS/TS, CSS, and HTML structural analysis via NAPI (priority 15)
 	registry.register(treeSitterRunner); // Tree-sitter structural analysis (priority 14)
 	registry.register(ruffRunner); // Python linting (priority 10)
 	registry.register(shellcheckRunner); // Shell script linting (priority 20)

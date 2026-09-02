@@ -20,6 +20,7 @@ import type {
 	SgMatch,
 } from "./ast-grep-types.js";
 import { resolvePackagePath } from "./package-root.js";
+import { truncatedByOutputCap } from "./spawn-output-cap.js";
 import {
 	SgRunner,
 	type SgExecutionOptions,
@@ -401,6 +402,18 @@ export class AstGrepClient {
 			const result = await this.runner.execRaw(args, 10_000, options);
 			const stderr = result.stderr.trim();
 			const stdout = result.stdout.trim();
+			// FIRST (#2100): hitting `execRaw`'s cap SIGTERMs ast-grep, so a
+			// truncated run also carries the kill's error message. Read after the
+			// two checks below, this guard could only ever describe a run that
+			// exited before the signal reached it. `execRaw` re-spells `failure`
+			// in its own vocabulary but keeps the timeout/aborted spellings, so
+			// those runs still fall through to the error branch below.
+			if (truncatedByOutputCap(result)) {
+				return {
+					valid: false,
+					error: "ast-grep validation output was truncated",
+				};
+			}
 			if (result.error) return { valid: false, error: result.error };
 			if (result.status !== 0 && !(result.status === 1 && !stderr)) {
 				return {
@@ -408,12 +421,6 @@ export class AstGrepClient {
 					error:
 						stderr ||
 						`ast-grep validation failed with exit code ${result.status}`,
-				};
-			}
-			if (result.outputTruncated) {
-				return {
-					valid: false,
-					error: "ast-grep validation output was truncated",
 				};
 			}
 			if (stderrHasError(stderr)) return { valid: false, error: stderr };

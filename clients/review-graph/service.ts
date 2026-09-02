@@ -1,4 +1,5 @@
 import type { FactStore } from "../dispatch/fact-store.js";
+import { normalizeMapKey } from "../path-utils.js";
 import {
 	computeImpactCascade as computeImpactCascadeImpl,
 	computeTransitiveImpact as computeTransitiveImpactImpl,
@@ -54,10 +55,23 @@ export function recordEntitySnapshotDiff(
 	filePath: string,
 	nextSnapshot: Map<string, string>,
 ): { added: string[]; removed: string[]; modified: string[] } {
-	const prev =
-		facts.getSessionFact<Map<string, string>>(
-			`${ENTITY_SNAPSHOT_PREFIX}${filePath}`,
-		) ?? new Map<string, string>();
+	// Normalize once at this boundary, then reuse the folded path for both
+	// per-file facts. An unnormalized write is a key the builder reader can never
+	// hit, and an unnormalized snapshot forks a second empty diff (#2355).
+	const normalizedFilePath = normalizeMapKey(filePath);
+	const snapshotKey = `${ENTITY_SNAPSHOT_PREFIX}${normalizedFilePath}`;
+	const changedSymbolsKey = `${CHANGED_SYMBOLS_PREFIX}${normalizedFilePath}`;
+	const stored = facts.getBoundedSessionFact<Map<string, string>>(snapshotKey);
+	// An evicted snapshot is unknown, not empty. Diffing against an empty Map
+	// puts every entity in `added`, which reads downstream as "the whole file
+	// changed" and schedules a blast-radius run for a file that did not change.
+	// Re-seed the snapshot and report no diff instead (#2282 review F1).
+	if (stored === undefined && facts.wasBoundedSessionFactEvicted(snapshotKey)) {
+		facts.setBoundedSessionFact(snapshotKey, new Map(nextSnapshot));
+		facts.setBoundedSessionFact(changedSymbolsKey, []);
+		return { added: [], removed: [], modified: [] };
+	}
+	const prev = stored ?? new Map<string, string>();
 	const added: string[] = [];
 	const removed: string[] = [];
 	const modified: string[] = [];
@@ -77,10 +91,7 @@ export function recordEntitySnapshotDiff(
 				.filter(Boolean),
 		),
 	];
-	facts.setSessionFact(
-		`${ENTITY_SNAPSHOT_PREFIX}${filePath}`,
-		new Map(nextSnapshot),
-	);
-	facts.setSessionFact(`${CHANGED_SYMBOLS_PREFIX}${filePath}`, changedSymbols);
+	facts.setBoundedSessionFact(snapshotKey, new Map(nextSnapshot));
+	facts.setBoundedSessionFact(changedSymbolsKey, changedSymbols);
 	return { added, removed, modified };
 }

@@ -124,6 +124,7 @@ function notePsDecision(
 		cause: verdict.available ? "ok" : verdict.cause,
 		elapsedMs: verdict.elapsedMs,
 		latched: verdict.available || isLatchingOutcome(verdict.outcome),
+		classifiedBy: "probe",
 		hostStallMs: verdict.hostStallMs,
 		...(retryAfterMs !== undefined && { retryAfterMs }),
 		budgetMs: PS_TIMEOUT_MS,
@@ -326,7 +327,6 @@ const psScriptAnalyzerRunner: RunnerDefinition = {
 	id: "psscriptanalyzer",
 	appliesTo: ["powershell"],
 	priority: PRIORITY.GENERAL_ANALYSIS,
-	enabledByDefault: true,
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
@@ -480,6 +480,9 @@ const psScriptAnalyzerRunner: RunnerDefinition = {
 					latched: false,
 					hostStallMs,
 					budgetMs: PS_TIMEOUT_MS,
+					// A read of the process's own stdout, not classifyProbeFailure, is
+					// what decided this (#2209).
+					classifiedBy: "caller",
 				});
 				incrementDegradationCount({
 					kind: "grammar-blocked",

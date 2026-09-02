@@ -55,8 +55,13 @@ import { BoundedLruCache } from "../bounded-cache.js";
 import { getGlobalPiLensDir } from "../file-utils.js";
 import { launchLSP } from "./launch.js";
 import {
+	registerSessionRoot,
+	resetSessionRootsForTests,
+} from "./session-roots.js";
+import {
 	createRootDetector,
 	LSP_SERVERS,
+	resetLSPCaseSensitivityState,
 	type LSPServerInfo,
 } from "./server.js";
 
@@ -268,6 +273,10 @@ function getConfigForFile(filePath: string): RegisteredLSPConfig {
  */
 export async function initLSPConfig(cwd: string): Promise<void> {
 	const normalizedCwd = normalizeWorkspacePath(cwd);
+	// #2052: this cwd is now a served session root. Registered BEFORE the
+	// in-flight dedup return below, so a concurrent duplicate init still
+	// registers it rather than returning early with the root unrecorded.
+	registerSessionRoot(normalizedCwd);
 
 	const existing = configInFlight.get(normalizedCwd);
 	if (existing) return existing;
@@ -319,7 +328,13 @@ export async function initLSPConfig(cwd: string): Promise<void> {
 	try {
 		await promise;
 	} finally {
-		configInFlight.delete(normalizedCwd);
+		// Identity-guarded release (#1968's pattern): delete only if THIS run is
+		// still the registered one. A bare delete-by-key lets a late-settling run
+		// evict a live successor a second writer registered under the same cwd
+		// mid-flight, after which the next caller starts a duplicate config load.
+		if (configInFlight.get(normalizedCwd) === promise) {
+			configInFlight.delete(normalizedCwd);
+		}
 	}
 }
 
@@ -397,6 +412,19 @@ export function getServerInitOverride(
 
 export function resetLSPConfigStateForTests(): void {
 	workspaceConfigs.clear();
+	resetLSPCaseSensitivityState();
+	// Reset both together: a cleared config store beside a live session-root
+	// registry would decline files for roots nothing can serve any more.
+	resetSessionRootsForTests();
+}
+
+/**
+ * Test hook — read the `initLSPConfig` in-flight map directly (#1968's ABA
+ * regression: a second writer replacing an entry mid-flight, then a
+ * late-settling first run evicting it with a bare delete-by-key).
+ */
+export function _peekConfigInFlightForTests(): Map<string, Promise<void>> {
+	return configInFlight;
 }
 
 // Re-export with config support

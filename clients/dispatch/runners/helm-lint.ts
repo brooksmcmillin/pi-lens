@@ -2,6 +2,7 @@ import * as path from "node:path";
 import { PathKeyedMap } from "../../path-keyed-map.js";
 import { normalizeMapKey } from "../../path-utils.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
+import { truncatedByOutputCap } from "../../spawn-output-cap.js";
 import { findNearestDirWithMarker } from "../../workspace-topology.js";
 import { PRIORITY } from "../priorities.js";
 import type {
@@ -21,6 +22,11 @@ const inFlightByChartRoot = new PathKeyedMap<Promise<RunnerResult>>(
 	normalizeMapKey,
 );
 const HELM_LINT_TIMEOUT_MS = 30_000;
+// `helm lint` prints one `[LEVEL]` line per finding for one chart, so nothing
+// legitimate approaches 8 MiB: this bounds a wedged or runaway helm rather than
+// real lint output, and it is what makes `outputTruncated` reachable for this
+// runner at all (#2100). Same value as the sibling report caps.
+const MAX_HELM_LINT_OUTPUT_BYTES = 8 * 1024 * 1024;
 
 const SKIPPED: RunnerResult = {
 	status: "skipped",
@@ -130,7 +136,20 @@ async function lintChart(
 		timeout: HELM_LINT_TIMEOUT_MS,
 		deadlineAt: Date.now() + HELM_LINT_TIMEOUT_MS,
 		resourceLabel: "helm-lint",
+		maxOutputBytes: MAX_HELM_LINT_OUTPUT_BYTES,
 	});
+	// FIRST (#2100): the cap kill is OUR SIGTERM, so it also sets
+	// `spawnFailure.kind === "killed"` and `failure === "signal"`. Read after
+	// those two, a truncated lint was reported as a server_error — helm blamed
+	// for output we threw away. A timed-out or aborted run carries
+	// `outputTruncated` too, and `truncatedByOutputCap` leaves those to the
+	// typed-failure block below so they keep reporting timeout/aborted.
+	if (truncatedByOutputCap(result)) {
+		return failedResult(
+			"parser_error",
+			"helm lint output was truncated before parsing completed",
+		);
+	}
 	const output = [result.stdout, result.stderr].filter(Boolean).join("\n");
 	const diagnostics = parseHelmLintOutput(output, chartRoot);
 	const typedFailure = result.spawnFailure?.kind;
@@ -152,12 +171,6 @@ async function lintChart(
 		return failedResult(
 			result.failure === "timeout" ? "timeout" : result.failure,
 			result.error?.message || `helm lint ${result.failure}`,
-		);
-	}
-	if (result.outputTruncated) {
-		return failedResult(
-			"parser_error",
-			"helm lint output was truncated before parsing completed",
 		);
 	}
 	const hasErrorDiagnostic = diagnostics.some(
@@ -184,7 +197,6 @@ const helmLintRunner: RunnerDefinition = {
 	id: "helm-lint",
 	appliesTo: ["yaml", "helm-template"],
 	priority: PRIORITY.GENERAL_ANALYSIS,
-	enabledByDefault: true,
 	skipTestFiles: false,
 	timeoutMs: 35_000,
 

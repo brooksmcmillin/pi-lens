@@ -418,8 +418,12 @@ export function runTurnEndForIpc(cwd: string): Promise<TurnEndDelivery> {
 	// simply finds the delivery already committed.
 	const inFlight = inFlightIpcTurnEnds.get(cwd);
 	if (inFlight) return inFlight;
+	// Identity-guarded release (#1968's pattern): delete only if THIS run is
+	// still the registered one. A bare delete-by-key lets a late-settling run
+	// evict a live successor a second writer registered under the same cwd
+	// mid-flight, after which the next caller starts a duplicate Stop-hook pass.
 	const run = runTurnEndForIpcNow(cwd).finally(() => {
-		inFlightIpcTurnEnds.delete(cwd);
+		if (inFlightIpcTurnEnds.get(cwd) === run) inFlightIpcTurnEnds.delete(cwd);
 	});
 	inFlightIpcTurnEnds.set(cwd, run);
 	return run;
@@ -491,4 +495,16 @@ export function _resetTurnEndChain(): void {
 	turnEndQueue.reset();
 	pendingTurnEndDeliveries.clear();
 	inFlightIpcTurnEnds.clear();
+}
+
+/**
+ * Test hook — read the `runTurnEndForIpc` in-flight map directly (#1968's
+ * ABA regression: a second writer replacing an entry mid-flight, then a
+ * late-settling first run evicting it with a bare delete-by-key).
+ */
+export function _peekInFlightIpcTurnEnds(): Map<
+	string,
+	Promise<TurnEndDelivery>
+> {
+	return inFlightIpcTurnEnds;
 }

@@ -3,13 +3,26 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DispatchContext } from "../../../../clients/dispatch/types.js";
+import {
+	capFastExitSpawnResult,
+	capKilledSpawnResult,
+	capThenAbortedSpawnResult,
+	capThenTimedOutSpawnResult,
+} from "../../../support/spawn-shapes.js";
 
 const { safeSpawnAsync, resolveAvailableOrInstall } = vi.hoisted(() => ({
 	safeSpawnAsync: vi.fn(),
 	resolveAvailableOrInstall: vi.fn(),
 }));
 
-vi.mock("../../../../clients/safe-spawn.js", () => ({ safeSpawnAsync }));
+// `importOriginal`, not a bare stub: the cap-kill test below builds the REAL
+// truncation result, and that needs safe-spawn's own `SpawnFailureError`.
+vi.mock("../../../../clients/safe-spawn.js", async (importOriginal) => ({
+	...(await importOriginal<
+		typeof import("../../../../clients/safe-spawn.js")
+	>()),
+	safeSpawnAsync,
+}));
 vi.mock("../../../../clients/dispatch/runners/utils/runner-helpers.js", () => ({
 	createAvailabilityChecker: () => ({ getOutcome: () => "success" }),
 	resolveAvailableOrInstall,
@@ -207,18 +220,70 @@ describe("helm-lint runner", () => {
 			failureKind: "parser_error",
 		});
 
-		safeSpawnAsync.mockResolvedValueOnce({
-			status: 0,
-			stdout: "[INFO] Chart.yaml: icon is recommended",
-			stderr: "",
-			outputTruncated: true,
-		});
+		safeSpawnAsync.mockResolvedValueOnce(
+			capFastExitSpawnResult({
+				stdout: "[INFO] Chart.yaml: icon is recommended",
+			}),
+		);
 		expect(
 			await helmLintRunner.run(context(filePath, workspace)),
 		).toMatchObject({
 			status: "failed",
 			failureKind: "parser_error",
 		});
+	});
+
+	// #2100: the cap kill is a SIGTERM, so it also carries `spawnFailure.kind
+	// === "killed"` and `failure === "signal"`. Read in the old order those two
+	// answered first and the truncation was reported as a server_error — the
+	// output we threw away, described as helm misbehaving.
+	it("reports a cap-killed lint as truncated, not as a server error", async () => {
+		const filePath = createChart(workspace, "values.yaml");
+		safeSpawnAsync.mockResolvedValueOnce(
+			capKilledSpawnResult({
+				stdout: "[INFO] Chart.yaml: icon is recommended",
+			}),
+		);
+
+		expect(
+			await helmLintRunner.run(context(filePath, workspace)),
+		).toMatchObject({
+			status: "failed",
+			failureKind: "parser_error",
+			failureMessage: "helm lint output was truncated before parsing completed",
+		});
+	});
+
+	// #2100 review F2: `outputTruncated` rides along on timeout/abort results
+	// too — safe-spawn spreads it into every branch. Those endings own their own
+	// classification; only the cap's own kill is a truncation verdict.
+	it.each([
+		["timed out", capThenTimedOutSpawnResult, "timeout"],
+		["aborted", capThenAbortedSpawnResult, "aborted"],
+	])(
+		"keeps reporting a %s lint as such when it also hit the cap",
+		async (_label, shape, failureKind) => {
+			const filePath = createChart(workspace, "values.yaml");
+			safeSpawnAsync.mockResolvedValueOnce(
+				shape({ stdout: "[INFO] Chart.yaml: icon is recommended" }),
+			);
+
+			expect(
+				await helmLintRunner.run(context(filePath, workspace)),
+			).toMatchObject({ status: "failed", failureKind });
+		},
+	);
+
+	it("caps helm lint output so the truncation guard can fire at all", async () => {
+		const filePath = createChart(workspace, "values.yaml");
+
+		await helmLintRunner.run(context(filePath, workspace));
+
+		expect(safeSpawnAsync).toHaveBeenCalledWith(
+			"helm",
+			["lint", path.dirname(filePath)],
+			expect.objectContaining({ maxOutputBytes: 8 * 1024 * 1024 }),
+		);
 	});
 });
 

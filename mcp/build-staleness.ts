@@ -34,7 +34,9 @@
 import * as fs from "node:fs";
 
 /** Injectable so tests never touch the real filesystem. */
-export type StatFn = (targetPath: string) => { mtimeMs: number } | undefined;
+export type StatFn = (
+	targetPath: string,
+) => { mtimeMs: number; size: number } | undefined;
 
 export const realStat: StatFn = (targetPath) => {
 	try {
@@ -48,6 +50,14 @@ export const realStat: StatFn = (targetPath) => {
 export interface BuildStamp {
 	entryPath: string;
 	mtimeMs: number;
+	/**
+	 * #2300: the entry file's byte size at startup, from the same stat call as
+	 * `mtimeMs`. A rebuild that lands in the same mtime bucket as the startup
+	 * stat (coarse filesystem mtime granularity) but changes the bundle's
+	 * length would otherwise be invisible to `checkStaleness`'s mtime-only
+	 * comparison.
+	 */
+	size: number;
 }
 
 /**
@@ -63,11 +73,11 @@ export function computeBuildStamp(
 ): BuildStamp | undefined {
 	const info = stat(entryPath);
 	if (!info) return undefined;
-	return { entryPath, mtimeMs: info.mtimeMs };
+	return { entryPath, mtimeMs: info.mtimeMs, size: info.size };
 }
 
 export interface StalenessCheckResult {
-	/** true when the on-disk entry's mtime no longer matches the startup stamp. */
+	/** true when the on-disk entry's mtime or size no longer matches the startup stamp. */
 	stale: boolean;
 	/** The stamp captured at startup (echoed for logging/tests). */
 	stamp: BuildStamp;
@@ -77,11 +87,12 @@ export interface StalenessCheckResult {
 
 /**
  * One-shot comparison: re-stats `stamp.entryPath` and compares against the
- * startup mtime. A failed re-stat (file briefly missing mid-rebuild-write, or
- * an installed-package layout) is treated as NOT stale — we only ever flag a
- * build change we can positively observe, never assume one from an I/O
- * hiccup (false positives would make every tool call route to fresh, which
- * defeats the warm server's entire purpose).
+ * startup mtime AND size (#2300 — a same-mtime-bucket rebuild that changes
+ * the bundle's length is otherwise invisible). A failed re-stat (file briefly
+ * missing mid-rebuild-write, or an installed-package layout) is treated as
+ * NOT stale — we only ever flag a build change we can positively observe,
+ * never assume one from an I/O hiccup (false positives would make every tool
+ * call route to fresh, which defeats the warm server's entire purpose).
  */
 export function checkStaleness(
 	stamp: BuildStamp,
@@ -90,7 +101,7 @@ export function checkStaleness(
 	const info = stat(stamp.entryPath);
 	if (!info) return { stale: false, stamp, currentMtimeMs: undefined };
 	return {
-		stale: info.mtimeMs !== stamp.mtimeMs,
+		stale: info.mtimeMs !== stamp.mtimeMs || info.size !== stamp.size,
 		stamp,
 		currentMtimeMs: info.mtimeMs,
 	};

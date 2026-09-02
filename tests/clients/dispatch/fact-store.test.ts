@@ -37,13 +37,13 @@ describe("FactStore", () => {
 		expect(store.getFileFact("src/b.ts", "file.content")).toBe("bbb");
 	});
 
-	it("clearFileFacts() removes file facts but preserves session facts", () => {
+	it("dropFileFacts clears one file's facts without disturbing others", () => {
 		const store = new FactStore();
 		store.setFileFact("src/a.ts", "file.content", "aaa");
-		store.setSessionFact("session.toolCache.biome", true);
-		store.clearFileFacts();
+		store.setFileFact("src/b.ts", "file.content", "bbb");
+		store.dropFileFacts("src/a.ts");
 		expect(store.getFileFact("src/a.ts", "file.content")).toBeUndefined();
-		expect(store.getSessionFact("session.toolCache.biome")).toBe(true);
+		expect(store.getFileFact("src/b.ts", "file.content")).toBe("bbb");
 	});
 
 	it("clearAll() removes both file and session facts", () => {

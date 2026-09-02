@@ -108,16 +108,18 @@ d("shipped ast-grep rules have fixture-style valid/invalid tests", () => {
 			})
 			.filter((r): r is RuleEntry => Boolean(r));
 	})();
-	// All language families get fixture coverage (TS, TSX, JS, Python, Rust, Go).
+	// All language families get fixture coverage (TS, TSX, JS, CSS, Python, Rust, Go, Java).
 	// The rule schema says unspecified language defaults to TypeScript; the
 	// remaining families are spelled out explicitly.
 	const ALL_LANGUAGES = new Set([
 		"typescript",
 		"tsx",
 		"javascript",
+		"css",
 		"python",
 		"rust",
 		"go",
+		"java",
 	]);
 	const isCoveredLanguage = (r: RuleEntry) => {
 		const l = (r.language || "TypeScript").toLowerCase();
@@ -146,7 +148,11 @@ d("shipped ast-grep rules have fixture-style valid/invalid tests", () => {
 		expect(orphans, orphans.join("\n")).toEqual([]);
 	});
 
-	it("every rule (TS/TSX/JS/Python/Rust/Go) has a corresponding -test.yml fixture", () => {
+	it("every rule (TS/TSX/JS/CSS/Python/Rust/Go/Java) has a corresponding -test.yml fixture", () => {
+		expect(
+			coveredRuleIds,
+			"CSS rules must be included in fixture coverage",
+		).toContain("no-important");
 		// Contract: every shipped rule (across all supported language families)
 		// ships a fixture file exercising its `valid:`/`invalid:` cases. A
 		// missing fixture for a rule means the rule's behavioural contract is

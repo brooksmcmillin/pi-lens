@@ -394,7 +394,6 @@ const treeSitterRunner: RunnerDefinition = {
 		"css",
 	],
 	priority: PRIORITY.STRUCTURAL_ANALYSIS,
-	enabledByDefault: true,
 	skipTestFiles: false, // Run on test files too (structural issues matter there)
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {

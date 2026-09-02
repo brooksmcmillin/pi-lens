@@ -50,7 +50,6 @@ const gleamCheckRunner: RunnerDefinition = {
 	id: "gleam-check",
 	appliesTo: ["gleam"],
 	priority: PRIORITY.GENERAL_ANALYSIS,
-	enabledByDefault: true,
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {

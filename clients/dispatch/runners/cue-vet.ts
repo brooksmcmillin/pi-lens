@@ -335,7 +335,6 @@ const cueVetRunner: RunnerDefinition = {
 	id: "cue-vet",
 	appliesTo: ["cue"],
 	priority: PRIORITY.GENERAL_ANALYSIS,
-	enabledByDefault: true,
 	skipTestFiles: false,
 	timeoutMs: 30_000,
 

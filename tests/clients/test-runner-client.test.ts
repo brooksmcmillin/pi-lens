@@ -1,12 +1,27 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { RUNNERS, TestRunnerClient } from "../../clients/test-runner-client.js";
+import { resetBoundedTelemetry } from "../../clients/bounded-telemetry.js";
+import {
+	getDegradationSummary,
+	resetDegradationLedger,
+} from "../../clients/degradation-ledger.js";
+import {
+	clearLatencyLog,
+	flushLatencyLog,
+	getLatencyLogPath,
+} from "../../clients/latency-logger.js";
+import {
+	RUNNERS,
+	TestRunnerClient,
+	type TestResult,
+} from "../../clients/test-runner-client.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 
 // Only the resolveExec matrix below (#1098) needs this mocked; every other
 // test in this file never reaches a `findGlobalBinary` call.
-const findGlobalBinary = vi.fn<(command: string) => Promise<string | undefined>>();
+const findGlobalBinary =
+	vi.fn<(command: string) => Promise<string | undefined>>();
 vi.mock("../../clients/package-manager.js", () => ({
 	findGlobalBinary: (command: string) => findGlobalBinary(command),
 }));
@@ -22,7 +37,10 @@ describe("test-runner-client", () => {
 		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
 		cleanups.push(cleanup);
 
-		fs.writeFileSync(path.join(tmpDir, "vite.config.ts"), "export default {}\n");
+		fs.writeFileSync(
+			path.join(tmpDir, "vite.config.ts"),
+			"export default {}\n",
+		);
 		fs.writeFileSync(
 			path.join(tmpDir, "package.json"),
 			JSON.stringify({ name: "tmp", version: "1.0.0" }),
@@ -672,7 +690,9 @@ describe("test-runner-client", () => {
 			expect(result.error).toBeUndefined();
 			expect(result.failed).toBeGreaterThan(0);
 			expect(result.failures).toEqual(
-				expect.arrayContaining([expect.objectContaining({ name: "TestParse" })]),
+				expect.arrayContaining([
+					expect.objectContaining({ name: "TestParse" }),
+				]),
 			);
 		});
 
@@ -711,7 +731,10 @@ describe("test-runner-client", () => {
 		});
 
 		it("still reports a genuine runner-start failure as an error (no failure names, #1487 stays green)", () => {
-			const result = parse("go: cannot find main module; error initializing", 1);
+			const result = parse(
+				"go: cannot find main module; error initializing",
+				1,
+			);
 
 			expect(result.error).toBe("Runner go exited with 1");
 			expect(result.failed).toBe(0);
@@ -808,7 +831,9 @@ describe("test-runner-client", () => {
 			const result = parse("FAILED\n\nsome trailing note\n", 1, "cargo");
 
 			expect(
-				result.failures.some((f: { name: string }) => f.name === "some trailing note"),
+				result.failures.some(
+					(f: { name: string }) => f.name === "some trailing note",
+				),
 			).toBe(false);
 		});
 	});
@@ -888,7 +913,9 @@ describe("test-runner-client", () => {
 	// exclusive, so a `TestResult` claiming both is self-contradictory.
 	describe("a runner-error result has no leftover failure names (#1524-r4 tidy)", () => {
 		it("clears failures when the rspec load-error text also matches a same-line Failure: name", () => {
-			const result = (new TestRunnerClient(false) as any).parseGenericRunnerOutput(
+			const result = (
+				new TestRunnerClient(false) as any
+			).parseGenericRunnerOutput(
 				"",
 				"An error occurred while loading ./spec/foo_spec.rb.\nFailure: cannot load such file -- foo\n",
 				1,
@@ -918,6 +945,108 @@ describe("test-runner-client", () => {
 			expect(result.duration).toBe(2010);
 		});
 
+		it("parses an ANSI-colored pytest summary through the real output parser", () => {
+			const result = (new TestRunnerClient(false) as any).parsePytestOutput(
+				"\u001b[1m2 failed, 1 passed, 3 skipped in 2.19s\u001b[0m",
+				"",
+				1,
+				"/tmp/test_foo.py",
+				"/tmp",
+				"pytest",
+			);
+
+			expect(result.passed).toBe(1);
+			expect(result.failed).toBe(2);
+			expect(result.skipped).toBe(3);
+			expect(result.duration).toBe(2190);
+		});
+
+		it("ignores a count-and-duration lookalike after the genuine summary", () => {
+			const result = (new TestRunnerClient(false) as any).parsePytestOutput(
+				[
+					"===== 2 passed, 1 failed in 1.25s =====",
+					"post-run: 55432 failed in 4s",
+				].join("\n"),
+				"",
+				1,
+				"/tmp/test_foo.py",
+				"/tmp",
+				"pytest",
+			);
+
+			expect(result.passed).toBe(2);
+			expect(result.failed).toBe(1);
+			expect(result.duration).toBe(1250);
+		});
+
+		it("uses the terminal summary when output repeats summary-looking lines", () => {
+			const result = (new TestRunnerClient(false) as any).parsePytestOutput(
+				[
+					"===== 1 passed in 0.10s =====",
+					"===== 2 failed, 3 passed in 0.20s =====",
+				].join("\n"),
+				"",
+				1,
+				"/tmp/test_foo.py",
+				"/tmp",
+				"pytest",
+			);
+
+			expect(result.passed).toBe(3);
+			expect(result.failed).toBe(2);
+			expect(result.duration).toBe(200);
+		});
+
+		it("parses a CRLF-terminated pytest summary", () => {
+			const result = (new TestRunnerClient(false) as any).parsePytestOutput(
+				"===== 2 passed, 1 skipped in 0.50s =====\r\n",
+				"",
+				0,
+				"/tmp/test_foo.py",
+				"/tmp",
+				"pytest",
+			);
+
+			expect(result.passed).toBe(2);
+			expect(result.skipped).toBe(1);
+			expect(result.duration).toBe(500);
+		});
+
+		it("recognizes pytest's outcome token variants in one summary", () => {
+			const result = (new TestRunnerClient(false) as any).parsePytestOutput(
+				"===== 4 passed, 2 failed, 3 skipped, 1 error, 5 warnings, 6 deselected, 7 xfailed, 8 xpassed in 3.21s =====",
+				"",
+				1,
+				"/tmp/test_foo.py",
+				"/tmp",
+				"pytest",
+			);
+
+			expect(result.passed).toBe(4);
+			expect(result.failed).toBe(2);
+			expect(result.skipped).toBe(3);
+			expect(result.duration).toBe(3210);
+		});
+
+		it("recognizes rerun outcomes with ANSI, CRLF, and a trailing lookalike", () => {
+			const result = (new TestRunnerClient(false) as any).parsePytestOutput(
+				[
+					"\u001b[1m===== 1 rerun, 2 failed, 3 passed, 4 skipped in 0.50s =====\u001b[0m\r",
+					"post-run: 55432 failed in 4s",
+				].join("\n"),
+				"",
+				1,
+				"/tmp/test_foo.py",
+				"/tmp",
+				"pytest",
+			);
+
+			expect(result.passed).toBe(3);
+			expect(result.failed).toBe(2);
+			expect(result.skipped).toBe(4);
+			expect(result.duration).toBe(500);
+		});
+
 		it("rounds the mix test summary duration", () => {
 			const result = (new TestRunnerClient(false) as any).parseMixTestOutput(
 				"Finished in 2.01 seconds (0.00s async, 2.01s sync)\n3 tests, 0 failures",
@@ -931,7 +1060,7 @@ describe("test-runner-client", () => {
 		});
 	});
 
-	it("prefers failed-first target when failure cache exists", () => {
+	it("prefers failed-first target when failure cache exists", async () => {
 		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
 		cleanups.push(cleanup);
 
@@ -941,12 +1070,506 @@ describe("test-runner-client", () => {
 		fs.writeFileSync(src, "package main\n");
 		fs.writeFileSync(testFile, "package main\n");
 
-		const client = new TestRunnerClient(false) as any;
-		client.failedTestsByRunner.set(`${path.resolve(tmpDir)}:go`, new Set([testFile]));
+		const client = new TestRunnerClient(false);
+		const seeded = await client.runTestFileAsync(testFile, tmpDir, "go", {
+			...RUNNERS.go,
+			command: process.execPath,
+			binName: "pi-lens-failed-first-fixture",
+			args: (target) => [
+				"-e",
+				"console.log('--- FAIL: fixture'); process.exitCode = 1;",
+				target,
+			],
+		});
+		expect(seeded.failed).toBe(1);
 
 		const target = client.getTestRunTarget(src, tmpDir);
 		expect(target?.strategy).toBe("failed-first");
 		expect(target?.testFile).toBe(path.resolve(testFile));
+	});
+
+	describe("failed-first target retirement (#2044)", () => {
+		const failingNodeConfig = {
+			...RUNNERS.go,
+			command: process.execPath,
+			binName: "pi-lens-2044-fixture-runner",
+			args: (testFile: string) => [
+				"-e",
+				"console.log('--- FAIL: fixture'); process.exitCode = 1;",
+				testFile,
+			],
+		};
+
+		it("retires one deleted failed target and falls back to normal discovery", async () => {
+			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-2044-");
+			cleanups.push(cleanup);
+
+			fs.writeFileSync(path.join(tmpDir, "go.mod"), "module example.com/tmp\n");
+			const sourceFile = path.join(tmpDir, "widget.go");
+			const staleTest = path.join(tmpDir, "MixedCase_Test.go");
+			const relatedTest = path.join(tmpDir, "widget_test.go");
+			fs.writeFileSync(sourceFile, "package widget\n");
+			fs.writeFileSync(staleTest, "package widget\n");
+			fs.writeFileSync(relatedTest, "package widget\n");
+
+			const client = new TestRunnerClient(false);
+			const seeded = await client.runTestFileAsync(
+				staleTest,
+				tmpDir,
+				"go",
+				failingNodeConfig,
+			);
+			expect(seeded.failed).toBe(1);
+			fs.rmSync(staleTest);
+
+			const target = client.getTestRunTarget(sourceFile, tmpDir);
+			expect(target).toMatchObject({
+				testFile: path.resolve(relatedTest),
+				runner: "go",
+				strategy: "related",
+			});
+
+			// Recreating the same mixed-case path must not resurrect a stale entry.
+			// On Windows this also proves deletion survives the normalizer changing
+			// from real on-disk casing to a lowercased missing-path tail.
+			fs.writeFileSync(staleTest, "package widget\n");
+			expect(client.getTestRunTarget(sourceFile, tmpDir)).toMatchObject({
+				testFile: path.resolve(relatedTest),
+				strategy: "related",
+			});
+		});
+
+		it("keeps the next valid failed target after missing execution", async () => {
+			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-2044-");
+			cleanups.push(cleanup);
+
+			fs.writeFileSync(path.join(tmpDir, "go.mod"), "module example.com/tmp\n");
+			const sourceFile = path.join(tmpDir, "widget.go");
+			const staleTest = path.join(tmpDir, "stale_test.go");
+			const validFailedTest = path.join(tmpDir, "other_test.go");
+			fs.writeFileSync(sourceFile, "package widget\n");
+			fs.writeFileSync(staleTest, "package widget\n");
+			fs.writeFileSync(validFailedTest, "package widget\n");
+
+			const client = new TestRunnerClient(false);
+			for (const testFile of [staleTest, validFailedTest]) {
+				const seeded = await client.runTestFileAsync(
+					testFile,
+					tmpDir,
+					"go",
+					failingNodeConfig,
+				);
+				expect(seeded.failed).toBe(1);
+			}
+			fs.rmSync(staleTest);
+
+			const missing = await client.runTestFileAsync(
+				staleTest,
+				tmpDir,
+				"go",
+				failingNodeConfig,
+			);
+			expect(missing.error).toBe("Test file not found");
+
+			const target = client.getTestRunTarget(sourceFile, tmpDir);
+			expect(target).toMatchObject({
+				testFile: path.resolve(validFailedTest),
+				runner: "go",
+				strategy: "failed-first",
+			});
+		});
+
+		it("retires one runner without clearing another in the same project", async () => {
+			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-2044-");
+			const aliasRoot = `${tmpDir}-alias`;
+			fs.symlinkSync(
+				tmpDir,
+				aliasRoot,
+				process.platform === "win32" ? "junction" : "dir",
+			);
+			cleanups.push(
+				() => fs.rmSync(aliasRoot, { recursive: true, force: true }),
+				cleanup,
+			);
+
+			fs.writeFileSync(path.join(tmpDir, "go.mod"), "module example.com/tmp\n");
+			fs.writeFileSync(
+				path.join(tmpDir, "Cargo.toml"),
+				"[package]\nname='tmp'\n",
+			);
+			const goSource = path.join(tmpDir, "widget.go");
+			const staleGoTest = path.join(tmpDir, "stale_test.go");
+			const cargoSource = path.join(tmpDir, "widget.rs");
+			const cargoTest = path.join(aliasRoot, "widget_test.rs");
+			for (const file of [goSource, staleGoTest, cargoSource, cargoTest]) {
+				fs.writeFileSync(file, "fixture\n");
+			}
+
+			const cargoConfig = {
+				...RUNNERS.cargo,
+				command: process.execPath,
+				binName: "pi-lens-2044-cargo-runner",
+				args: (testFile: string) => [
+					"-e",
+					"console.log('test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out'); process.exitCode = 1;",
+					testFile,
+				],
+			};
+			const client = new TestRunnerClient(false);
+			const goFailure = await client.runTestFileAsync(
+				staleGoTest,
+				tmpDir,
+				"go",
+				failingNodeConfig,
+			);
+			const cargoFailure = await client.runTestFileAsync(
+				cargoTest,
+				tmpDir,
+				"cargo",
+				cargoConfig,
+			);
+			expect(goFailure.failed).toBe(1);
+			expect(cargoFailure.failed).toBe(1);
+
+			fs.rmSync(staleGoTest);
+			expect(client.getTestRunTarget(goSource, tmpDir)).toBeNull();
+
+			// Seed the target through its symlink spelling, then consume the project
+			// through the aliased root. Keys collapse while the returned target keeps
+			// caller spelling and Cargo survives retirement of the missing Go target.
+			fs.rmSync(path.join(tmpDir, "go.mod"));
+			const cargoTarget = client.getTestRunTarget(cargoSource, aliasRoot);
+			expect(cargoTarget).toMatchObject({
+				runner: "cargo",
+				strategy: "failed-first",
+				testFile: path.resolve(cargoTest),
+			});
+		});
+
+		it("retains indeterminate paths and writes bounded real telemetry", async () => {
+			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-2044-");
+			cleanups.push(cleanup);
+			fs.writeFileSync(path.join(tmpDir, "go.mod"), "module example.com/tmp\n");
+			const sourceFile = path.join(tmpDir, "widget.go");
+			const failedTest = path.join(tmpDir, "widget_test.go");
+			fs.writeFileSync(sourceFile, "package widget\n");
+			fs.writeFileSync(failedTest, "package widget\n");
+
+			const denied = Object.assign(new Error("access denied"), {
+				code: "EACCES",
+			});
+			const client = new TestRunnerClient(false, {
+				statFailedTarget: () => {
+					throw denied;
+				},
+			});
+			const seeded = await client.runTestFileAsync(
+				failedTest,
+				tmpDir,
+				"go",
+				failingNodeConfig,
+			);
+			expect(seeded.failed).toBe(1);
+
+			const previousTestMode = process.env.PI_LENS_TEST_MODE;
+			process.env.PI_LENS_TEST_MODE = "0";
+			try {
+				resetBoundedTelemetry();
+				clearLatencyLog();
+				await flushLatencyLog();
+				const target = client.getTestRunTarget(sourceFile, tmpDir, 2044);
+				expect(target).toMatchObject({
+					strategy: "failed-first",
+					testFile: fs.realpathSync.native(failedTest),
+				});
+				await flushLatencyLog();
+				const records = fs
+					.readFileSync(getLatencyLogPath(), "utf8")
+					.trim()
+					.split("\n")
+					.map((line) => JSON.parse(line));
+				expect(records).toContainEqual(
+					expect.objectContaining({
+						phase: "test_runner_failed_target_state",
+						metadata: expect.objectContaining({
+							outcome: "retained-indeterminate",
+							runner: "go",
+							errorCode: "EACCES",
+						}),
+					}),
+				);
+			} finally {
+				if (previousTestMode === undefined) {
+					delete process.env.PI_LENS_TEST_MODE;
+				} else {
+					process.env.PI_LENS_TEST_MODE = previousTestMode;
+				}
+			}
+		});
+
+		it("keeps long target identities distinct in the degradation ledger", () => {
+			resetDegradationLedger();
+			resetBoundedTelemetry();
+			const client = new TestRunnerClient(false);
+			const record = (
+				client as unknown as {
+					recordFailedTargetState(value: {
+						outcome: "retired-missing";
+						runner: string;
+						candidate: string;
+						errorCode: string;
+						turnIndex: number;
+					}): void;
+				}
+			).recordFailedTargetState.bind(client);
+			const sharedPrefix = `C:/${"a".repeat(260)}`;
+			record({
+				outcome: "retired-missing",
+				runner: "vitest",
+				candidate: `${sharedPrefix}/one.test.ts`,
+				errorCode: "ENOENT",
+				turnIndex: 9,
+			});
+			record({
+				outcome: "retired-missing",
+				runner: "vitest",
+				candidate: `${sharedPrefix}/two.test.ts`,
+				errorCode: "ENOENT",
+				turnIndex: 9,
+			});
+
+			const group = getDegradationSummary().find(
+				(entry) => entry.kind === "test-runner-failed-target-state",
+			);
+			expect(group?.count).toBe(2);
+			expect(group?.droppedCount).toBe(0);
+			expect(
+				new Set(group?.latestReasons.map((entry) => entry.subject)).size,
+			).toBe(2);
+		});
+
+		it("bounds missing-target probes and carries the remainder forward", async () => {
+			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-2044-");
+			cleanups.push(cleanup);
+			fs.writeFileSync(path.join(tmpDir, "go.mod"), "module example.com/tmp\n");
+			const sourceFile = path.join(tmpDir, "widget.go");
+			const relatedTest = path.join(tmpDir, "widget_test.go");
+			fs.writeFileSync(sourceFile, "package widget\n");
+			fs.writeFileSync(relatedTest, "package widget\n");
+
+			let statCalls = 0;
+			const client = new TestRunnerClient(false, {
+				statFailedTarget: (filePath) => {
+					statCalls += 1;
+					void fs.statSync(filePath);
+				},
+			});
+			const staleTests = Array.from({ length: 12 }, (_, index) =>
+				path.join(tmpDir, `stale-${index}_test.go`),
+			);
+			for (const testFile of staleTests) {
+				fs.writeFileSync(testFile, "package widget\n");
+				const seeded = await client.runTestFileAsync(
+					testFile,
+					tmpDir,
+					"go",
+					failingNodeConfig,
+				);
+				expect(seeded.failed).toBe(1);
+				fs.rmSync(testFile);
+			}
+
+			expect(client.getTestRunTarget(sourceFile, tmpDir, 88)?.testFile).toBe(
+				path.resolve(relatedTest),
+			);
+			expect(statCalls).toBe(8);
+			expect(client.getTestRunTarget(sourceFile, tmpDir, 88)?.testFile).toBe(
+				path.resolve(relatedTest),
+			);
+			expect(statCalls).toBe(12);
+		});
+
+		it("caps each runner at the newest 32 failed targets", async () => {
+			const first = setupTestEnvironment("pi-lens-tests-2044-first-");
+			const second = setupTestEnvironment("pi-lens-tests-2044-second-");
+			cleanups.push(first.cleanup, second.cleanup);
+			for (const root of [first.tmpDir, second.tmpDir]) {
+				fs.writeFileSync(path.join(root, "go.mod"), "module example.com/tmp\n");
+			}
+			const sourceFile = path.join(first.tmpDir, "widget.go");
+			const oldest = path.join(first.tmpDir, "oldest_test.go");
+			const newest = path.join(first.tmpDir, "newest_test.go");
+			fs.writeFileSync(sourceFile, "package widget\n");
+			const middle = Array.from({ length: 31 }, (_, index) =>
+				path.join(second.tmpDir, `failure-${index}_test.go`),
+			);
+			const client = new TestRunnerClient(false);
+			// The cap is the behavior under test. Feed the real client failed results
+			// at its recording seam instead of paying for 33 process startups.
+			const recordFailedTarget = (root: string, testFile: string): void => {
+				fs.writeFileSync(testFile, "package widget\n");
+				(
+					client as unknown as {
+						recordResult(record: {
+							cwd: string;
+							runner: string;
+							testFile: string;
+							result: TestResult;
+							turnIndex: number;
+						}): void;
+					}
+				).recordResult({
+					cwd: root,
+					runner: "go",
+					testFile,
+					result: {
+						file: testFile,
+						sourceFile: "",
+						runner: "go",
+						passed: 0,
+						failed: 1,
+						skipped: 0,
+						failures: [],
+					},
+					turnIndex: 2045,
+				});
+			};
+			const previousTestMode = process.env.PI_LENS_TEST_MODE;
+			process.env.PI_LENS_TEST_MODE = "0";
+			try {
+				resetBoundedTelemetry();
+				clearLatencyLog();
+				await flushLatencyLog();
+				for (const [root, testFile] of [
+					[first.tmpDir, oldest],
+					...middle.map((testFile) => [second.tmpDir, testFile]),
+					[first.tmpDir, newest],
+				]) {
+					recordFailedTarget(root, testFile);
+				}
+
+				expect(
+					client.getTestRunTarget(sourceFile, first.tmpDir)?.testFile,
+				).toBe(fs.realpathSync.native(newest));
+				await flushLatencyLog();
+				const log = fs.readFileSync(getLatencyLogPath(), "utf8");
+				expect(log).toContain('"outcome":"capacity-evicted"');
+				expect(log).toContain('"phase":"test_runner_failed_target_state"');
+			} finally {
+				if (previousTestMode === undefined) {
+					delete process.env.PI_LENS_TEST_MODE;
+				} else {
+					process.env.PI_LENS_TEST_MODE = previousTestMode;
+				}
+			}
+		});
+
+		it("evicts the globally oldest target after a cross-root refresh", async () => {
+			const first = setupTestEnvironment("pi-lens-tests-2044-hot-");
+			const second = setupTestEnvironment("pi-lens-tests-2044-cold-");
+			cleanups.push(first.cleanup, second.cleanup);
+			for (const root of [first.tmpDir, second.tmpDir]) {
+				fs.writeFileSync(path.join(root, "go.mod"), "module example.com/tmp\n");
+				fs.writeFileSync(path.join(root, "widget.go"), "package widget\n");
+			}
+			const hot = path.join(first.tmpDir, "hot_test.go");
+			const cold = Array.from({ length: 31 }, (_, index) =>
+				path.join(second.tmpDir, `cold-${index}_test.go`),
+			);
+			const newest = path.join(second.tmpDir, "newest_test.go");
+			const client = new TestRunnerClient(false);
+			const recordFailure = (
+				client: TestRunnerClient,
+				root: string,
+				testFile: string,
+			): void => {
+				fs.writeFileSync(testFile, "package widget\n");
+				(
+					client as unknown as {
+						recordResult(record: {
+							cwd: string;
+							runner: string;
+							testFile: string;
+							result: TestResult;
+							turnIndex: number;
+						}): void;
+					}
+				).recordResult({
+					cwd: root,
+					runner: "go",
+					testFile,
+					result: {
+						file: testFile,
+						sourceFile: "",
+						runner: "go",
+						passed: 0,
+						failed: 1,
+						skipped: 0,
+						failures: [],
+					},
+					turnIndex: 2045,
+				});
+			};
+
+			const previousTestMode = process.env.PI_LENS_TEST_MODE;
+			process.env.PI_LENS_TEST_MODE = "0";
+			try {
+				resetBoundedTelemetry();
+				clearLatencyLog();
+				await flushLatencyLog();
+				recordFailure(client, first.tmpDir, hot);
+				for (const testFile of cold) {
+					recordFailure(client, second.tmpDir, testFile);
+				}
+				// Refresh A after every original B entry, then force one eviction in B.
+				recordFailure(client, first.tmpDir, hot);
+				recordFailure(client, second.tmpDir, newest);
+
+				expect(
+					client.getTestRunTarget(
+						path.join(first.tmpDir, "widget.go"),
+						first.tmpDir,
+					)?.testFile,
+				).toBe(path.resolve(hot));
+				expect(
+					client.getTestRunTarget(
+						path.join(second.tmpDir, "widget.go"),
+						second.tmpDir,
+					)?.testFile,
+				).toBe(path.resolve(cold[1]));
+
+				// Refresh another root, then evict the sole target in this root. The
+				// new target must be inserted into a reacquired root map.
+				const reacquisitionClient = new TestRunnerClient(false);
+				const reacquisitionNewest = path.join(
+					first.tmpDir,
+					"reacquired_test.go",
+				);
+				recordFailure(reacquisitionClient, first.tmpDir, hot);
+				for (const testFile of cold) {
+					recordFailure(reacquisitionClient, second.tmpDir, testFile);
+				}
+				recordFailure(reacquisitionClient, second.tmpDir, cold[0]);
+				recordFailure(reacquisitionClient, first.tmpDir, reacquisitionNewest);
+				expect(
+					reacquisitionClient.getTestRunTarget(
+						path.join(first.tmpDir, "widget.go"),
+						first.tmpDir,
+					)?.testFile,
+				).toBe(path.resolve(reacquisitionNewest));
+
+				await flushLatencyLog();
+				const log = fs.readFileSync(getLatencyLogPath(), "utf8");
+				expect(log).toContain('"outcome":"capacity-evicted"');
+				expect(log).toContain('"phase":"test_runner_failed_target_state"');
+			} finally {
+				if (previousTestMode === undefined) {
+					delete process.env.PI_LENS_TEST_MODE;
+				} else {
+					process.env.PI_LENS_TEST_MODE = previousTestMode;
+				}
+			}
+		});
 	});
 
 	it("does not infer pytest from pyproject without pytest section", () => {
@@ -991,7 +1614,10 @@ describe("test-runner-client", () => {
 			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
 			cleanups.push(cleanup);
 
-			fs.writeFileSync(path.join(tmpDir, "vitest.config.ts"), "export default {}\n");
+			fs.writeFileSync(
+				path.join(tmpDir, "vitest.config.ts"),
+				"export default {}\n",
+			);
 			const srcDir = path.join(tmpDir, "clients");
 			fs.mkdirSync(srcDir, { recursive: true });
 			const src = path.join(srcDir, "knip-client.ts");
@@ -1011,7 +1637,10 @@ describe("test-runner-client", () => {
 			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
 			cleanups.push(cleanup);
 
-			fs.writeFileSync(path.join(tmpDir, "vitest.config.ts"), "export default {}\n");
+			fs.writeFileSync(
+				path.join(tmpDir, "vitest.config.ts"),
+				"export default {}\n",
+			);
 			const srcDir = path.join(tmpDir, "lib", "utils");
 			fs.mkdirSync(srcDir, { recursive: true });
 			const src = path.join(srcDir, "format.ts");
@@ -1051,7 +1680,10 @@ describe("test-runner-client", () => {
 			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
 			cleanups.push(cleanup);
 
-			fs.writeFileSync(path.join(tmpDir, "vitest.config.ts"), "export default {}\n");
+			fs.writeFileSync(
+				path.join(tmpDir, "vitest.config.ts"),
+				"export default {}\n",
+			);
 			const srcDir = path.join(tmpDir, "clients");
 			fs.mkdirSync(srcDir, { recursive: true });
 			const src = path.join(srcDir, "widget.ts");
@@ -1068,7 +1700,10 @@ describe("test-runner-client", () => {
 			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
 			cleanups.push(cleanup);
 
-			fs.writeFileSync(path.join(tmpDir, "vitest.config.ts"), "export default {}\n");
+			fs.writeFileSync(
+				path.join(tmpDir, "vitest.config.ts"),
+				"export default {}\n",
+			);
 			const srcDir = path.join(tmpDir, "clients");
 			fs.mkdirSync(srcDir, { recursive: true });
 			const src = path.join(srcDir, "gadget.ts");
@@ -1088,7 +1723,10 @@ describe("test-runner-client", () => {
 			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
 			cleanups.push(cleanup);
 
-			fs.writeFileSync(path.join(tmpDir, "vitest.config.ts"), "export default {}\n");
+			fs.writeFileSync(
+				path.join(tmpDir, "vitest.config.ts"),
+				"export default {}\n",
+			);
 			const srcDir = path.join(tmpDir, "clients");
 			fs.mkdirSync(srcDir, { recursive: true });
 			const src = path.join(srcDir, "dual.ts");
@@ -1250,7 +1888,10 @@ describe("test-runner-client", () => {
 			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
 			cleanups.push(cleanup);
 
-			fs.writeFileSync(path.join(tmpDir, "vitest.config.ts"), "export default {}\n");
+			fs.writeFileSync(
+				path.join(tmpDir, "vitest.config.ts"),
+				"export default {}\n",
+			);
 			const src = path.join(tmpDir, "foo.test.ts");
 			fs.writeFileSync(src, "// test\n");
 
@@ -1264,7 +1905,10 @@ describe("test-runner-client", () => {
 			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
 			cleanups.push(cleanup);
 
-			fs.writeFileSync(path.join(tmpDir, "vitest.config.ts"), "export default {}\n");
+			fs.writeFileSync(
+				path.join(tmpDir, "vitest.config.ts"),
+				"export default {}\n",
+			);
 			const src = path.join(tmpDir, "bar.spec.ts");
 			fs.writeFileSync(src, "// test\n");
 
@@ -1292,7 +1936,10 @@ describe("test-runner-client", () => {
 			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
 			cleanups.push(cleanup);
 
-			fs.writeFileSync(path.join(tmpDir, "vitest.config.ts"), "export default {}\n");
+			fs.writeFileSync(
+				path.join(tmpDir, "vitest.config.ts"),
+				"export default {}\n",
+			);
 			const src = path.join(tmpDir, "widget.ts");
 			fs.writeFileSync(src, "export const x = 1;\n");
 			const testFile = path.join(tmpDir, "widget.test.ts");
@@ -1304,19 +1951,34 @@ describe("test-runner-client", () => {
 			expect(target?.strategy).toBe("related");
 		});
 
-		it("prefers failed-first over self when the edited test file is itself in the failed set", () => {
+		it("prefers failed-first over self when the edited test file is itself in the failed set", async () => {
 			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
 			cleanups.push(cleanup);
 
-			fs.writeFileSync(path.join(tmpDir, "vitest.config.ts"), "export default {}\n");
+			fs.writeFileSync(
+				path.join(tmpDir, "vitest.config.ts"),
+				"export default {}\n",
+			);
 			const src = path.join(tmpDir, "flaky.test.ts");
 			fs.writeFileSync(src, "// test\n");
+			const vitestFailureConfig = {
+				...RUNNERS.vitest,
+				command: process.execPath,
+				binName: "pi-lens-failed-vitest-fixture",
+				args: (testFile: string) => [
+					"-e",
+					`console.log(JSON.stringify({ numPassedTests: 0, numFailedTests: 1, numPendingTests: 0, testResults: [{ name: ${JSON.stringify(testFile)}, assertionResults: [{ status: "failed", title: "fixture", failureMessages: ["boom"] }] }] })); process.exitCode = 1;`,
+				],
+			};
 
-			const client = new TestRunnerClient(false) as any;
-			client.failedTestsByRunner.set(
-				`${path.resolve(tmpDir)}:vitest`,
-				new Set([path.resolve(src)]),
+			const client = new TestRunnerClient(false);
+			const seeded = await client.runTestFileAsync(
+				src,
+				tmpDir,
+				"vitest",
+				vitestFailureConfig,
 			);
+			expect(seeded.failed).toBe(1);
 
 			const target = client.getTestRunTarget(src, tmpDir);
 			expect(target?.strategy).toBe("failed-first");
@@ -1513,7 +2175,10 @@ describe("test-runner-client", () => {
 		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
 		cleanups.push(cleanup);
 
-		fs.writeFileSync(path.join(tmpDir, "phpunit.xml.dist"), "<phpunit></phpunit>\n");
+		fs.writeFileSync(
+			path.join(tmpDir, "phpunit.xml.dist"),
+			"<phpunit></phpunit>\n",
+		);
 
 		const client = new TestRunnerClient(false);
 		const detected = client.detectRunner(tmpDir);
@@ -1556,7 +2221,11 @@ describe("test-runner-client", () => {
 		cleanups.push(cleanup);
 
 		fs.writeFileSync(path.join(tmpDir, "phpunit.xml"), "<phpunit></phpunit>\n");
-		const src = createTempFile(tmpDir, "src/Foo/Bar.php", "<?php\nclass Bar {}\n");
+		const src = createTempFile(
+			tmpDir,
+			"src/Foo/Bar.php",
+			"<?php\nclass Bar {}\n",
+		);
 		const testFile = createTempFile(
 			tmpDir,
 			"tests/Foo/BarTest.php",
@@ -1717,7 +2386,11 @@ describe("test-runner-client", () => {
 				startTime: 1786866554330,
 				endTime: 1786866554461.674,
 				assertionResults: [
-					{ status: "passed", title: "slow pass", duration: 122.60340400000001 },
+					{
+						status: "passed",
+						title: "slow pass",
+						duration: 122.60340400000001,
+					},
 					{ status: "failed", title: "quick fail", duration: 8.674104 },
 					{ status: "skipped", title: "skipped" },
 				],
@@ -1902,8 +2575,18 @@ describe("test-runner-client", () => {
 				numPassedTests: 2,
 				numFailedTests: 0,
 				testResults: [
-					{ name: "/tmp/a.test.js", status: "passed", startTime: 1000, endTime: 1500 },
-					{ name: "/tmp/b.test.js", status: "passed", startTime: 1100, endTime: 1900 },
+					{
+						name: "/tmp/a.test.js",
+						status: "passed",
+						startTime: 1000,
+						endTime: 1500,
+					},
+					{
+						name: "/tmp/b.test.js",
+						status: "passed",
+						startTime: 1100,
+						endTime: 1900,
+					},
 				],
 			}),
 			"",
@@ -1929,7 +2612,9 @@ describe("test-runner-client", () => {
 						status: "passed",
 						startTime: 2000,
 						endTime: 1000,
-						assertionResults: [{ status: "passed", title: "a", duration: null }],
+						assertionResults: [
+							{ status: "passed", title: "a", duration: null },
+						],
 					},
 				],
 			}),
@@ -1963,7 +2648,9 @@ describe("test-runner-client", () => {
 						status: "passed",
 						startTime: 1_760_000_000_000,
 						endTime: 1_760_000_000_000,
-						assertionResults: [{ status: "passed", title: "a", duration: null }],
+						assertionResults: [
+							{ status: "passed", title: "a", duration: null },
+						],
 					},
 				],
 			}),
@@ -1988,7 +2675,9 @@ describe("test-runner-client", () => {
 					{
 						name: "/tmp/a.test.js",
 						status: "passed",
-						assertionResults: [{ status: "passed", title: "a", duration: null }],
+						assertionResults: [
+							{ status: "passed", title: "a", duration: null },
+						],
 					},
 				],
 			}),
@@ -2090,7 +2779,10 @@ describe("test-runner-client", () => {
 		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
 		cleanups.push(cleanup);
 
-		fs.writeFileSync(path.join(tmpDir, "mix.exs"), "defmodule Demo.MixProject do\nend\n");
+		fs.writeFileSync(
+			path.join(tmpDir, "mix.exs"),
+			"defmodule Demo.MixProject do\nend\n",
+		);
 
 		const client = new TestRunnerClient(false);
 		const detected = client.detectRunner(tmpDir);
@@ -2101,7 +2793,10 @@ describe("test-runner-client", () => {
 		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
 		cleanups.push(cleanup);
 
-		fs.writeFileSync(path.join(tmpDir, "mix.exs"), "defmodule Demo.MixProject do\nend\n");
+		fs.writeFileSync(
+			path.join(tmpDir, "mix.exs"),
+			"defmodule Demo.MixProject do\nend\n",
+		);
 		const src = createTempFile(
 			tmpDir,
 			"lib/accounts/user.ex",
@@ -2219,14 +2914,21 @@ describe("resolveExec argv preservation matrix (#1098)", () => {
 
 		describe(`runner: ${runnerKey}`, () => {
 			it("preserves argv on local-bin resolution", () => {
-				const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-resolve-exec-");
+				const { tmpDir, cleanup } = setupTestEnvironment(
+					"pi-lens-resolve-exec-",
+				);
 				resolveCleanups.push(cleanup);
 				const client = new TestRunnerClient(false) as any;
 
 				let localBinPath: string;
 				if (runnerKey === "phpunit") {
 					const phpSuffix = process.platform === "win32" ? ".bat" : "";
-					localBinPath = path.join(tmpDir, "vendor", "bin", `phpunit${phpSuffix}`);
+					localBinPath = path.join(
+						tmpDir,
+						"vendor",
+						"bin",
+						`phpunit${phpSuffix}`,
+					);
 				} else {
 					localBinPath = path.join(
 						tmpDir,
@@ -2251,7 +2953,9 @@ describe("resolveExec argv preservation matrix (#1098)", () => {
 						// phpunit's local (vendor/bin) resolution never strips —
 						// see the dedicated branch in resolveExec.
 						const expected =
-							runnerKey === "phpunit" ? rawArgs : expectedStrippedArgs(binName, rawArgs);
+							runnerKey === "phpunit"
+								? rawArgs
+								: expectedStrippedArgs(binName, rawArgs);
 						expect(resolved.args).toEqual(expected);
 					});
 			});
@@ -2262,7 +2966,9 @@ describe("resolveExec argv preservation matrix (#1098)", () => {
 				// (`command: "phpunit"`), so it's covered by the fallback case
 				// below instead of duplicated here.
 				it("preserves argv on global-bin resolution", () => {
-					const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-resolve-exec-");
+					const { tmpDir, cleanup } = setupTestEnvironment(
+						"pi-lens-resolve-exec-",
+					);
 					resolveCleanups.push(cleanup);
 					const client = new TestRunnerClient(false) as any;
 
@@ -2281,13 +2987,17 @@ describe("resolveExec argv preservation matrix (#1098)", () => {
 						.resolveExec(runnerKey, config, testFile, tmpDir)
 						.then((resolved: { command: string; args: string[] }) => {
 							expect(resolved.command).toBe(globalBinPath);
-							expect(resolved.args).toEqual(expectedStrippedArgs(binName, rawArgs));
+							expect(resolved.args).toEqual(
+								expectedStrippedArgs(binName, rawArgs),
+							);
 						});
 				});
 			}
 
 			it("preserves argv verbatim on fallback (no local/global bin)", () => {
-				const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-resolve-exec-");
+				const { tmpDir, cleanup } = setupTestEnvironment(
+					"pi-lens-resolve-exec-",
+				);
 				resolveCleanups.push(cleanup);
 				const client = new TestRunnerClient(false) as any;
 
@@ -2316,7 +3026,12 @@ describe("resolveExec argv preservation matrix (#1098)", () => {
 		resolveCleanups.push(cleanup);
 		const client = new TestRunnerClient(false) as any;
 
-		const localBinPath = path.join(tmpDir, "node_modules", ".bin", `cargo${binSuffix()}`);
+		const localBinPath = path.join(
+			tmpDir,
+			"node_modules",
+			".bin",
+			`cargo${binSuffix()}`,
+		);
 		fs.mkdirSync(path.dirname(localBinPath), { recursive: true });
 		fs.writeFileSync(localBinPath, "");
 

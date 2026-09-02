@@ -17,7 +17,10 @@ const { safeSpawnAsync, allowedFsRoots, logLatencySpy } = vi.hoisted(() => ({
 // Assert an `availability_decision` record lands even for a memo served
 // mid-cooldown — the review-round finding that this state left zero trace in
 // latency.log.
-vi.mock("../../../clients/latency-logger.js", () => ({
+vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
+	...(await importActual<
+		typeof import("../../../clients/latency-logger.js")
+	>()),
 	logLatency: logLatencySpy,
 	getLastLoggedPhase: () => undefined,
 }));

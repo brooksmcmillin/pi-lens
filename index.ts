@@ -9,6 +9,7 @@ import {
 import { wireUserNotifier } from "./clients/user-notify.js";
 import {
 	getDegradationSummary,
+	incrementDegradationCount,
 	recordDegradation,
 } from "./clients/degradation-ledger.js";
 import {
@@ -54,7 +55,10 @@ import {
 import { selectLspStatus } from "./clients/lsp-status.js";
 import type { PersistedReadGuardState } from "./clients/read-guard.js";
 import { registerReadBridge } from "./clients/read-bridge.js";
-import { isExternalOrVendorFile } from "./clients/path-utils.js";
+import {
+	isExternalOrVendorFile,
+	normalizeFilePath,
+} from "./clients/path-utils.js";
 import { isPathIgnoredByProject } from "./clients/file-utils.js";
 import {
 	dropStaleFiles,
@@ -110,8 +114,10 @@ import {
 } from "./clients/instance-reaper.js";
 import {
 	deregisterInstance,
+	deregisterInstanceRoot,
 	readInstanceRegistry,
 	registerInstance,
+	registerInstanceRoot,
 } from "./clients/instance-registry.js";
 import { logVanishedInstances } from "./clients/vanished-instance-marker.js";
 import {
@@ -137,9 +143,13 @@ import { checkCrossProcessLspBudget } from "./clients/lsp-budget.js";
 import { handleAgentEnd } from "./clients/runtime-agent-end.js";
 import {
 	consumeSessionStartGuidance,
-	consumeTestFindings,
 	consumeTurnEndFindings,
 } from "./clients/runtime-context.js";
+import {
+	deliverStagedTestRunnerFindings,
+	registerTestRunnerEntryRenderer,
+	stageTestRunnerDelivery,
+} from "./clients/test-runner-delivery.js";
 import {
 	readHostModelIdentity,
 	RuntimeCoordinator,
@@ -155,7 +165,10 @@ import {
 	classifyCurrentSessionEmission,
 	decideSessionStart,
 	decrementSecondarySessionCount,
+	getActivePrimaryRoot,
 	noteSessionShutdown,
+	releasePrimarySession,
+	probeCtxActive,
 } from "./clients/session-lifecycle.js";
 import {
 	clearLastAnalyzedStateCache,
@@ -197,6 +210,10 @@ import {
 	resetCurrentPhaseForSession,
 } from "./clients/latency-logger.js";
 import { emitBounded } from "./clients/bounded-telemetry.js";
+import {
+	getLastLiveMessageEndSessionId,
+	noteLiveMessageEndSessionId,
+} from "./clients/message-end-attribution.js";
 
 /**
  * Identity for the `loop_block` record (#1743). An event-loop block is a
@@ -220,11 +237,11 @@ import {
 	observeCachePrefix,
 } from "./clients/cache-observability.js";
 import {
+	buildStartupTimingRecords,
 	getPiLensEvalMs,
 	markPiLensLoaded,
 	getPiLensLoadedAtMs,
 	consumeHostReadyDelayAnchor,
-	PI_LENS_HOST_BOOT_MS,
 	PI_LENS_LOADED_FROM,
 } from "./clients/startup-timing.js";
 import { toRunnerDisplayPath } from "./clients/dispatch/runner-context.js";
@@ -240,8 +257,16 @@ import {
 	shouldLogWorstBlock,
 	startEventLoopMonitor,
 } from "./clients/event-loop-monitor.js";
+import {
+	formatBuildIdentity,
+	getBuildIdentity,
+} from "./clients/build-identity.js";
 import { logSessionStart } from "./clients/sessionstart-logger.js";
-import { logConcurrentSessionBind } from "./clients/session-start-observability.js";
+import {
+	emitConcurrentSessionBindRollupAtSessionEnd,
+	logConcurrentSessionBind,
+	resetConcurrentSessionBindRollupCounts,
+} from "./clients/session-start-observability.js";
 import { normalizeToolDefinition } from "./clients/tool-definition.js";
 import { warmFormatters } from "./clients/formatters-lazy.js";
 import { filterInactivePiLensSkills } from "./clients/conditional-skills.js";
@@ -448,27 +473,12 @@ export function createHostPorts(
 dbg(
 	`pi-lens loaded: ${PI_LENS_LOAD_MS}ms after process start (from ${PI_LENS_LOADED_FROM})`,
 );
-logLatency({
-	type: "phase",
-	filePath: "<pi-lens>",
-	phase: "extension_loaded",
-	durationMs: PI_LENS_LOAD_MS,
-	metadata: { loadedFrom: PI_LENS_LOADED_FROM },
-});
-logLatency({
-	type: "phase",
-	filePath: "<pi-lens>",
-	phase: "host_boot",
-	durationMs: PI_LENS_HOST_BOOT_MS,
-	metadata: { loadedFrom: PI_LENS_LOADED_FROM },
-});
-logLatency({
-	type: "phase",
-	filePath: "<pi-lens>",
-	phase: "extension_eval",
-	durationMs: PI_LENS_EVAL_MS,
-	metadata: { loadedFrom: PI_LENS_LOADED_FROM },
-});
+for (const record of buildStartupTimingRecords({
+	loadMs: PI_LENS_LOAD_MS,
+	evalMs: PI_LENS_EVAL_MS,
+})) {
+	logLatency(record);
+}
 
 // No-op log function (verbose console logging was removed with lens-verbose flag)
 function log(_msg: string) {
@@ -496,6 +506,8 @@ let _turnSummaryEmitCtx:
 			isLensEnabled: () => boolean;
 	  }
 	| undefined;
+let _testRunnerDeliveryRegistered = false;
+let _nextTestRunnerDeliveryOwnerId = 0;
 const _lspConfigInitializedCwds = new Set<string>();
 const LSP_CONFIG_CWD_CAP = 128;
 
@@ -594,6 +606,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 	// the log instead of pi's frame. Host-initiated output stays on the real
 	// console, because it runs outside every window.
 	const pi = withConsoleCaptureWindows(hostPi);
+	const testRunnerDeliveryOwnerId = `activation-${++_nextTestRunnerDeliveryOwnerId}`;
 	// Event contexts belong to the activation that owns this factory closure.
 	// The process-global latest ctx remains only a boot-window fallback.
 	// biome-ignore lint/suspicious/noExplicitAny: heterogeneous pi event ctx shapes
@@ -612,12 +625,16 @@ function activateExtension(hostPi: ExtensionAPI) {
 	const classifyOwnedSessionShutdown = (
 		ctx: unknown,
 		sessionId: string | undefined,
+		// #2146 F1: this session's own root. Only consulted on the fallback path
+		// below — when this extension instance never recorded a role of its own,
+		// so the shared registration is the only evidence available.
+		root: string | undefined,
 	): "primary" | "secondary" =>
 		ownedSessionRole === "concurrent-secondary"
 			? "secondary"
 			: ownedSessionRole === "primary"
 				? "primary"
-				: noteSessionShutdown(ctx, sessionId);
+				: noteSessionShutdown(ctx, sessionId, root);
 	// biome-ignore lint/suspicious/noExplicitAny: heterogeneous pi event ctx shapes
 	const rememberOwnEventCtx = (ctx: any): void => {
 		if (!ctx) return;
@@ -946,6 +963,10 @@ function activateExtension(hostPi: ExtensionAPI) {
 			dbg(`turn-summary renderer registration failed: ${registerRendererErr}`);
 		}
 	}
+	// #2366: test failures are a persistent, non-context custom entry. The
+	// delivery task still checks appendEntry at fire time; this registration is
+	// capability detection only and never authorizes a sendMessage fallback.
+	registerTestRunnerEntryRenderer(pi);
 
 	// --- Commands ---
 
@@ -1722,7 +1743,6 @@ function activateExtension(hostPi: ExtensionAPI) {
 			"session_start",
 			async (event, ctx) => {
 				const sessionStartMonotonicAt = performance.now();
-				resetVerifiedPathAttributionGuessCount();
 				warmDispatchAtSessionStart();
 				void warmLspService().catch((err) =>
 					logExtension({
@@ -1743,6 +1763,15 @@ function activateExtension(hostPi: ExtensionAPI) {
 				const sessionStartFiredAt = Date.now();
 				try {
 					dbg("session_start fired");
+					// #1775: one bounded build-identity line per session start —
+					// commit/entryMtime/version — so dogfood forensics ("does this
+					// session include PR #N?") reads it off the log instead of
+					// re-deriving it by hand in the serving checkout each time.
+					// getBuildIdentity is a pure fs read (no spawn) and returns
+					// undefined inside the test runner, so nothing is computed when
+					// this line would be a no-op anyway.
+					const buildIdentity = getBuildIdentity(import.meta.url);
+					if (buildIdentity) dbg(formatBuildIdentity(buildIdentity));
 					const sessionReason = (event as { reason?: string }).reason;
 
 					// #1334 S5: adopt the HOST's project-trust decision before anything
@@ -1783,21 +1812,79 @@ function activateExtension(hostPi: ExtensionAPI) {
 					// the shared LSP fleet + runtime generation out from under the still
 					// -live parent) or updateRuntimeIdentityFromCtx (which would
 					// overwrite the parent's telemetry identity).
-					const sessionStartDecision = decideSessionStart(ctx, stableSessionId);
+					// #2129: the third argument is this start's PROJECT ROOT. Without
+					// it, a subagent temp worktree arriving with an already-disposed
+					// prior ctx classified `sequential-replacement`, stole the primary
+					// registration, and re-ran the whole session_start battery against
+					// unchanged content. Root identity is now a classification input.
+					// Read defensively, and do NOT fall back to `process.cwd()`.
+					// `ctx.cwd` is an `assertActive()`-wrapped accessor, so a ctx the
+					// SDK already invalidated throws on the plain read. A
+					// `process.cwd()` fallback would also be worse than no value: it is
+					// identical for every root in the process, so a temp worktree would
+					// compare equal to the primary and the decline could never fire.
+					// An unreadable cwd yields `undefined` — "root unknown" — which
+					// changes no verdict.
+					const sessionStartCwd = (() => {
+						try {
+							return (ctx as { cwd?: string })?.cwd;
+						} catch {
+							return undefined;
+						}
+					})();
+					const sessionStartDecision = decideSessionStart(
+						ctx,
+						stableSessionId,
+						sessionStartCwd,
+					);
 					ownedSessionRole = sessionStartDecision.runFullSessionStart
 						? "primary"
 						: "concurrent-secondary";
 					if (!sessionStartDecision.runFullSessionStart) {
 						dbg(
-							`session_start: concurrent secondary detected (count=${sessionStartDecision.secondaryCount}) — skipping handleSessionStart`,
+							`session_start: ${sessionStartDecision.classification} detected (count=${sessionStartDecision.secondaryCount}, sameRoot=${sessionStartDecision.sameRoot}) — skipping handleSessionStart`,
 						);
 						logConcurrentSessionBind({
 							secondaryCount: sessionStartDecision.secondaryCount,
 							sessionReason,
 							sameCwd: (ctx as { cwd?: string })?.cwd === process.cwd(),
+							// #2129: `sameCwd` above compares against `process.cwd()`,
+							// which answers a different question and read `true` for every
+							// pre-fix bind. These three fields record the input the
+							// classification actually consulted — the registered PRIMARY's
+							// root — so a log reader can tell a root-declined start from a
+							// live-sibling one.
+							classification: sessionStartDecision.classification,
+							sameRoot: sessionStartDecision.sameRoot,
+							primaryRoot: sessionStartDecision.primaryRoot,
 						});
+						// #2130 review F2: a declined start returns BEFORE
+						// `registerInstance` (which lives in the full-start body below),
+						// so without this the secondary's root would be absent from
+						// `instances.json` entirely — the shared-checkout guard and warm
+						// attach would know LESS about it than they did before #2130, and
+						// `deregisterInstanceRoot` at its shutdown would have nothing to
+						// remove. Only the ROOT is added: none of `registerInstance`'s
+						// other side effects (RSS resample, startedAt reseed, subagent
+						// identity capture) belong to a session that is being declined.
+						// Gated on `sameRoot === false` — positive evidence of a
+						// different root — because a secondary in the primary's own
+						// directory adds nothing to the set.
+						if (
+							sessionStartDecision.sameRoot === false &&
+							typeof sessionStartCwd === "string"
+						) {
+							void registerInstanceRoot(sessionStartCwd).catch(() => {
+								// best-effort observability — never fail session_start
+							});
+						}
 						return;
 					}
+
+					// #2319: this process-singleton tally belongs to the primary
+					// session that owns the session-end rollup. A concurrent secondary
+					// must not erase a live primary's count before this decision.
+					resetVerifiedPathAttributionGuessCount();
 
 					// #1723 review F4: the in-flight-phase live-bracket map/closed-ring
 					// (clients/latency-logger.ts) is process-shared state, exactly like
@@ -1811,6 +1898,18 @@ function activateExtension(hostPi: ExtensionAPI) {
 					// accepted cost on the other side (a torn-down secondary's own
 					// bracket goes stale until the next full session start).
 					resetCurrentPhaseForSession();
+					// #2249: same gate — a declined bind's own session_start must never
+					// reach here (it returned above), so this only fires for a genuine
+					// new primary. A crash or forced kill can skip session_shutdown's
+					// own emit+reset below, so the rollup also re-arms here rather than
+					// trusting shutdown alone (AGENTS.md catalog shape 17).
+					// #2312 review F1: on the sequential-replacement path (prior primary
+					// never reached session_shutdown), the reset below would otherwise
+					// silently discard an unemitted tally. Emit first — a no-op when
+					// nothing was declined — so the crash/kill case still produces its
+					// one summary row instead of losing it.
+					emitConcurrentSessionBindRollupAtSessionEnd(runtime.projectRoot);
+					resetConcurrentSessionBindRollupCounts();
 
 					// Dynamic tooling (#pi 0.80.x+): put the active tool set back to the
 					// posture this logical conversation had — the always-active baseline
@@ -2008,6 +2107,10 @@ function activateExtension(hostPi: ExtensionAPI) {
 						handlerEnteredAt,
 						bootstrapClientsStartedAt,
 						bootstrapClientsDurationMs,
+						// #2129: this call site is only reached for "primary"/
+						// "sequential-replacement" — a declined start returned above.
+						sessionStartClassification: sessionStartDecision.classification,
+						sessionStartSameRoot: sessionStartDecision.sameRoot,
 						getFlag: (name: string) => getLensFlag(name),
 						notify: (msg, level) => notifyUi(ctx, msg, level),
 						dbg,
@@ -2506,10 +2609,12 @@ function activateExtension(hostPi: ExtensionAPI) {
 				// scheduled as a macrotask, and microtasks always drain first, so a
 				// genuinely synchronous phase has typically ALREADY closed by the
 				// time this line runs. Checking live brackets alone would read
-				// empty for exactly the case this exists to catch. NOT wired into
-				// the LSP workspace-diagnostics sweep's own touch loop
-				// (clients/lsp/index.ts) — that remains a named, deferred gap (see
-				// the PR body / issue comment), not a silent one.
+				// empty for exactly the case this exists to catch. Both bracket
+				// sites are wired now: the runner chokepoint (`runRunner` in
+				// dispatcher.ts, #1805) and the LSP workspace-diagnostics sweep
+				// (clients/lsp/index.ts), the latter as ONE bracket around the
+				// whole per-file loop so it survives the closed-bracket ring to
+				// reach this read point.
 				//
 				// #1723 review round 3: this window — [now - loopMaxMs, now] —
 				// assumes the block ENDED right at this sample, which is a
@@ -2544,6 +2649,16 @@ function activateExtension(hostPi: ExtensionAPI) {
 						worstSoFar: isNewSessionWorst,
 						turnIndex: runtime.turnIndex,
 						suspectSystemStall,
+						// #1980: the CPU-vs-wall split, read from the record alone.
+						// `windowCpuMs` has sat beside every block since #1122 and
+						// was never read together with `durationMs`; nine of sixteen
+						// genuine 5s+ blocks in a 23h window burned less CPU than the
+						// block lasted, which makes them parked, not computing. The
+						// monitor owns the verdict (clients/event-loop-monitor.ts's
+						// `classifyLoopBlock`) so `suspectSystemStall` and
+						// `stallClass` cannot disagree about one sample.
+						stallClass: elStats?.stallClass,
+						cpuCoverageRatio: elStats?.cpuCoverageRatio,
 						windowCpuMs: elStats?.windowCpuMs,
 						windowWallMs: elStats?.windowWallMs,
 						lastPhase: lastPhase?.phase,
@@ -2588,6 +2703,9 @@ function activateExtension(hostPi: ExtensionAPI) {
 							sessionAgeMs: Math.max(0, Date.now() - runtime.sessionStartedAt),
 							sessionStartedAt: runtime.sessionStartedAt,
 							turnCount: runtime.turnIndex,
+							// #2130: root discriminator. Two roots in one host emitted
+							// the same turnIndex with nothing to separate them.
+							root: getActivePrimaryRoot(),
 						},
 					);
 					logLatency({
@@ -2642,6 +2760,18 @@ function activateExtension(hostPi: ExtensionAPI) {
 				deadCodeClients,
 				depChecker,
 				testRunnerClient,
+				sessionId: getStableSessionId(ctx),
+				onTestRunnerComplete: (delivery) =>
+					stageTestRunnerDelivery({
+						...delivery,
+						owner: {
+							ownerId: testRunnerDeliveryOwnerId,
+							pi,
+							cacheManager,
+							runtime,
+							getCtx: () => ownEventCtx ?? {},
+						},
+					}),
 				// The LSP idle reset (240s of no turns) releases the warm servers
 				// from a detached timer, with no pi event in flight — so nothing
 				// would repaint the footer and it would keep showing a stale
@@ -2712,6 +2842,12 @@ function activateExtension(hostPi: ExtensionAPI) {
 	// would hold up the host returning control (e.g. blocking the user from
 	// starting a new turn). Kick it off unawaited and return immediately.
 	registerBuiltinQuietWindowTasks(() => runtime);
+	if (!_testRunnerDeliveryRegistered) {
+		_testRunnerDeliveryRegistered = true;
+		registerQuietWindowTask("test_runner_delivery", (quietContext) => {
+			deliverStagedTestRunnerFindings(quietContext);
+		});
+	}
 	// #458: reconcile any cascade-lane Tier-3 touches that skipped their
 	// in-lane wait (clients/lsp/cascade-tier.ts) in the same quiet window.
 	// #1023: re-inject a cold-snapshot neighbor whose error resolved after the
@@ -2845,6 +2981,9 @@ function activateExtension(hostPi: ExtensionAPI) {
 	}
 	const onAgentSettled = async (_event: unknown, ctx: DeferredDrainCtx) => {
 		if (!lensEnabled) return;
+		// Keep the activation-owned live ctx current for the detached delivery
+		// task. It must probe idleness and append through this run's host seam.
+		rememberOwnEventCtx(ctx);
 		// #1654: the #1387 deferred-format/autofix drain runs HERE, not at
 		// agent_end — see `runDeferredMutationDrain`'s doc comment above.
 		// Awaited (unlike the quiet-window tasks below): this mirrors the
@@ -2882,6 +3021,8 @@ function activateExtension(hostPi: ExtensionAPI) {
 				runtime,
 				dbg,
 				cwd,
+				sessionId: getStableSessionId(ctx),
+				ownerId: testRunnerDeliveryOwnerId,
 			}).catch((err) => {
 				dbg(`quiet_window crashed: ${err}`);
 			});
@@ -2928,9 +3069,21 @@ function activateExtension(hostPi: ExtensionAPI) {
 				return undefined;
 			}
 		})();
+		// #2146 F1: read once, up here, so the classifier and the scoped
+		// deregistration below both see the same value. A stale ctx must never
+		// break teardown, so an unreadable cwd degrades to `undefined`, which
+		// changes no verdict.
+		const shutdownCwd = (() => {
+			try {
+				return (ctx as { cwd?: string })?.cwd;
+			} catch {
+				return undefined;
+			}
+		})();
 		const shutdownClassification = classifyOwnedSessionShutdown(
 			ctx,
 			stableSessionId,
+			shutdownCwd,
 		);
 		if (shutdownClassification === "secondary") {
 			emitCacheUsageSummaryAtSessionEnd(
@@ -2939,6 +3092,36 @@ function activateExtension(hostPi: ExtensionAPI) {
 			);
 			clearCachePrefixSession(stableSessionId, "concurrent-secondary");
 			decrementSecondarySessionCount();
+			// #2130: scoped deregistration. A secondary's shutdown must never run
+			// `deregisterInstance()` — the process lives on and the primary still
+			// owns the entry. Drop only THIS session's own root, and only when it
+			// is positively a different root than the primary's, so a secondary
+			// that shares the primary's directory cannot deregister the root the
+			// host is still working in. A root this session never registered is a
+			// documented no-op inside `deregisterInstanceRoot`.
+			//
+			// #2130 round 2: the call is now QUEUED, so it lands behind this
+			// session's own `void registerInstanceRoot(cwd)` from the declined
+			// start above rather than racing ahead of it and leaving the temp
+			// root behind. Fire and forget is still correct — the tail owns the
+			// ordering, and teardown must not block on a registry write.
+			try {
+				const secondaryRoot = shutdownCwd;
+				const primaryRoot = getActivePrimaryRoot();
+				if (
+					typeof secondaryRoot === "string" &&
+					secondaryRoot.length > 0 &&
+					primaryRoot !== undefined &&
+					normalizeFilePath(secondaryRoot) !== primaryRoot
+				) {
+					void deregisterInstanceRoot(secondaryRoot).catch(() => {
+						// best-effort bookkeeping — never fail teardown
+					});
+				}
+			} catch {
+				// Best-effort observability bookkeeping — a stale ctx or an
+				// unresolvable path must never break teardown.
+			}
 			dbg(
 				"session_shutdown: concurrent secondary — skipping shared-infra teardown",
 			);
@@ -2960,6 +3143,14 @@ function activateExtension(hostPi: ExtensionAPI) {
 		// #449 slice 1: SYNC-only deregistration (no child spawns — see the
 		// processExiting note below); safe to call unconditionally here.
 		deregisterInstance();
+		// #2129 review F3: release the primary registration at the same boundary
+		// the registry entry is released. Root identity made a stale `activeRoot`
+		// decisive: without this, once root A's primary ended, every later start
+		// in root B would classify `secondary-root` forever — never primary,
+		// never a full start, no re-arm. This is the process-lifetime-latch shape
+		// the catalog names. Only the PRIMARY path reaches here; a secondary
+		// returned above precisely because the primary is still live.
+		releasePrimarySession();
 		// processExiting: the loop is closing here — killing LSP servers must NOT
 		// spawn taskkill, or libuv aborts on uv_async_send to the closing loop
 		// (Assertion !(handle->flags & UV_HANDLE_CLOSING), src\win\async.c) — seen
@@ -2980,6 +3171,10 @@ function activateExtension(hostPi: ExtensionAPI) {
 		// process-wide module state a live secondary would still need.
 		emitBusEventRollupAtSessionEnd(runtime.projectRoot);
 		emitVerifiedPathAttributionRollup(runtime.projectRoot);
+		// #2249: same primary-only placement — one concurrent_session_bind_rollup
+		// row summarizing this session's declined binds by classification, a
+		// no-op when none occurred.
+		emitConcurrentSessionBindRollupAtSessionEnd(runtime.projectRoot);
 		// #1123 item 4: dump active handles AFTER teardown — whatever is still
 		// alive at this point is exactly what would keep a --print/--no-session
 		// process from exiting (the #1097 lesson: what survives IS the leak).
@@ -2999,11 +3194,42 @@ function activateExtension(hostPi: ExtensionAPI) {
 			if (!lensEnabled) return;
 			try {
 				const sessionId = getStableSessionId(ctx);
+				// #1956: a CONFIRMED-stale ctx has no stable session id, so the
+				// cache_usage row below writes unattributed. That is right — the
+				// `message` payload is valid provider token/cost data and must
+				// keep writing; skipping it would lose real usage numbers. The
+				// lost attribution is still a degrade, and one a session
+				// replacement can repeat for every queued message_end, so it is
+				// counted through the bounded ledger (`cache-usage-attribution-
+				// stale`, subject `message_end`; durable `degradation_ledger`
+				// rows at the first and power-of-two milestones). Never a skip,
+				// and never recorded for a LIVE ctx that merely lacks a session
+				// id — `probeCtxActive` returning `false` is the proof.
+				const ctxActive = probeCtxActive(ctx);
+				const staleCtx = ctxActive === false;
+				if (ctxActive === true) {
+					noteLiveMessageEndSessionId(sessionId);
+				}
 				logCacheUsage((event as { message?: unknown })?.message, dbg, {
 					sessionId,
 					sessionRole: classifyOwnedSessionEmission(ctx, sessionId),
 					turnIndex: runtime.turnIndex,
 				});
+				if (staleCtx) {
+					const degradation = {
+						kind: "cache-usage-attribution-stale",
+						subject: "message_end",
+						reason:
+							"message_end met a stale extension ctx; cache_usage row wrote without a stable session id",
+						metadata: {
+							sessionId: getLastLiveMessageEndSessionId() ?? "unknown",
+						},
+					};
+					// Keep the stale-only guard narrow: live and inconclusive probes
+					// must not be classified as attribution loss.
+					// The cache_usage row is priority; this is best-effort.
+					incrementDegradationCount(degradation);
+				}
 			} catch (err) {
 				dbg(`message_end handler error: ${err}`);
 			}
@@ -3129,7 +3355,6 @@ function activateExtension(hostPi: ExtensionAPI) {
 						cacheManager,
 						cwd,
 					);
-					const testFindings = consumeTestFindings(cacheManager, cwd, runtime);
 					const agentNudge = consumeAgentNudge(dbg);
 					const sourceMessages = [
 						{
@@ -3139,10 +3364,6 @@ function activateExtension(hostPi: ExtensionAPI) {
 						{
 							source: "turn-findings" as const,
 							messages: turnEndFindings?.messages ?? [],
-						},
-						{
-							source: "test-findings" as const,
-							messages: testFindings?.messages ?? [],
 						},
 						{
 							source: "agent-nudge" as const,

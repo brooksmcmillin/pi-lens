@@ -7,7 +7,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const logLatency = vi.hoisted(() => vi.fn());
-vi.mock("../../../clients/latency-logger.js", () => ({ logLatency }));
+vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
+	...(await importActual<
+		typeof import("../../../clients/latency-logger.js")
+	>()),
+	logLatency,
+}));
 vi.mock("../../../clients/degradation-ledger.js", () => ({
 	recordDegradation: vi.fn(),
 }));

@@ -43,6 +43,24 @@
  * runtime condition — that edge is invisible to this gate, so a blocker whose only
  * stale dependency arrives that way survives a replay. This is an honest boundary,
  * not a silently-closed one.
+ *
+ * Delivery cap (#1950). A demoted-but-confirmable entry (`alreadyStale` above)
+ * is deliberately NOT retired after its past-EOF sibling's one-delivery rule
+ * (#1944, `blocker-past-eof.ts`) — its coordinates are still in bounds, so a
+ * fresh dispatch can genuinely confirm or clear it, and retiring on delivery
+ * one would discard a recoverable finding. But nothing capped how many times
+ * the SAME demoted record re-serves: incident data (#1944's lane sweep) showed
+ * 18 `alreadyStale` re-serves in one window, with repeat deliveries carrying
+ * near-zero information after the first. `runtime-turn.ts` counts each
+ * delivery (`InlineBlockerRecord.staleDeliveryCount`) and retires the record
+ * via `RuntimeCoordinator.retireDemotedDependencyDriftBlocker` once it reaches
+ * `DEPENDENCY_DRIFT_MAX_DELIVERIES` — a count, not a TTL or a session
+ * boundary, because "how many times has the agent already been told" is the
+ * quantity that actually went to zero information, not "how much time has
+ * passed". The ledger reason says "capped, re-run can still confirm" so it
+ * reads distinctly from #1944's "retired, unrecoverable" — a capped record
+ * COULD still resolve a fresh dispatch; it just stopped being handed one for
+ * free.
  */
 import * as fs from "node:fs";
 import { normalizeEphemeralMapKey } from "./path-utils.js";
@@ -53,6 +71,9 @@ import {
 	resolveTreeSitterLanguage,
 } from "./tree-sitter-shared.js";
 import { TreeSitterSymbolExtractor } from "./tree-sitter-symbol-extractor.js";
+
+/** See the module doc's "Delivery cap (#1950)" section above. */
+export const DEPENDENCY_DRIFT_MAX_DELIVERIES = 3;
 
 /**
  * Per-turn result of the freshness sweep over the cached inline blockers.

@@ -34,8 +34,29 @@
 
 import * as path from "node:path";
 import { isExcludedDirName } from "./file-utils.js";
+import { recordDegradationOnce } from "./degradation-ledger.js";
 import { normalizeEphemeralMapKey, normalizeMapKey } from "./path-utils.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
+import { truncatedByOutputCap } from "./spawn-output-cap.js";
+
+function recordTruncatedLsFiles(
+	parseSite: "untracked-ignored" | "tracked",
+): void {
+	recordDegradationOnce({
+		kind: "git-tracked-ignore-truncated",
+		subject: `git-ls-files:${parseSite}`,
+		reason: "safeSpawnAsync capped git ls-files stdout",
+	});
+}
+
+// The binding listing is the untracked-ignored one: a mid-size project's
+// node_modules alone yields a ~66k-line ignored list (roughly 4-6 MiB), and
+// a monorepo with several dependency trees can multiply that. 16 MiB leaves
+// that headroom while stopping safeSpawnAsync from retaining unbounded
+// stdout (an uncapped probe held 20 MiB in full). The tracked listing is
+// far smaller (~133 KiB in this repository). A capped read fails closed to
+// unavailable with one bounded ledger record per site.
+const MAX_LS_FILES_OUTPUT_BYTES = 16 * 1024 * 1024;
 
 /**
  * Parses `git ls-files --others --ignored --exclude-standard` output
@@ -71,8 +92,17 @@ async function fetchUntrackedIgnoredIds(
 		const result = await safeSpawnAsync(
 			"git",
 			["ls-files", "--others", "--ignored", "--exclude-standard"],
-			{ cwd, timeout: 10_000, resourceLabel: "git-tracked-ignore" },
+			{
+				cwd,
+				timeout: 10_000,
+				maxOutputBytes: MAX_LS_FILES_OUTPUT_BYTES,
+				resourceLabel: "git-tracked-ignore",
+			},
 		);
+		if (truncatedByOutputCap(result)) {
+			recordTruncatedLsFiles("untracked-ignored");
+			return undefined;
+		}
 		if (result.error || result.status !== 0) return undefined;
 		return parseUntrackedIgnoredOutput(result.stdout, cwd);
 	} catch {
@@ -163,8 +193,13 @@ async function fetchTrackedFiles(
 		const result = await safeSpawnAsync("git", ["ls-files"], {
 			cwd,
 			timeout: 10_000,
+			maxOutputBytes: MAX_LS_FILES_OUTPUT_BYTES,
 			resourceLabel: "git-tracked-ignore",
 		});
+		if (truncatedByOutputCap(result)) {
+			recordTruncatedLsFiles("tracked");
+			return undefined;
+		}
 		if (result.error || result.status !== 0) return undefined;
 		return parseTrackedFilesOutput(result.stdout, cwd);
 	} catch {

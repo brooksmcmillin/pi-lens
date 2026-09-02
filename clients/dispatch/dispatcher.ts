@@ -19,14 +19,19 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { FileKind } from "../file-kinds.js";
 import { recordRunner } from "../widget-state.js";
+import { incrementDegradationCount } from "../degradation-ledger.js";
 import { detectFileKind } from "../file-kinds.js";
 import { detectFileRole } from "../file-role.js";
+import {
+	classifyGeneratedOrArtifactDetailed,
+	type GeneratedArtifactEvidence,
+} from "../generated-artifacts.js";
 import { isTestFile } from "../file-utils.js";
 import { getPrimaryDispatchGroup } from "../language-policy.js";
 import { resolveLanguageRootForFile } from "../language-profile.js";
 import { logLatency, phaseFinished, phaseStarted } from "../latency-logger.js";
 import { isSpawnableCommand } from "../installer/index.js";
-import { normalizeMapKey } from "../path-utils.js";
+import { normalizeEphemeralMapKey, normalizeMapKey } from "../path-utils.js";
 import { loadPiLensProjectConfig } from "../project-lens-config.js";
 import { RUNTIME_CONFIG, getRunnerTimeoutFloorMs } from "../runtime-config.js";
 import { safeSpawnAsync } from "../safe-spawn.js";
@@ -37,14 +42,30 @@ import {
 	startHostStallSampler,
 	transientRetryDelayMs,
 } from "./runners/utils/availability-policy.js";
+import {
+	recordAvailabilityProbeOverrun,
+	getDispatchAvailabilityGeneration,
+} from "./runners/utils/runner-helpers.js";
+import { createAvailabilityProbeFlight } from "../availability-probe-flight.js";
 import type { FactStore } from "./fact-store.js";
 import { applyDispositions } from "../diagnostic-dispositions.js";
 import { applyInlineSuppressions } from "./inline-suppressions.js";
 import { getToolPlan } from "./plan.js";
 import { resolveRunnerPath } from "./runner-context.js";
+import {
+	classifyObservedRunner,
+	COLLECT_LATER_THRESHOLD_MS,
+	observeRunnerLatency,
+} from "./collect-later-tier.js";
+import { deferRunnerFindings } from "./pending-runner-findings.js";
+
 import { applyRulePolicy, rulePolicyMapFromConfig } from "./rule-policy.js";
 import { getToolProfile } from "./tool-profile.js";
 import { isRunnerSkipReason } from "./types.js";
+
+const dispatcherProbeFlights = createAvailabilityProbeFlight<
+	Awaited<ReturnType<typeof safeSpawnAsync>>
+>({ generation: () => getDispatchAvailabilityGeneration() });
 import type {
 	Diagnostic,
 	DispatchContext,
@@ -79,7 +100,7 @@ export class RunnerRegistry implements RunnerRegistryContract {
 
 		for (const runner of this.runners.values()) {
 			if (isTest && runner.skipTestFiles) continue;
-			if (runner.appliesTo.includes(kind) || runner.appliesTo.length === 0) {
+			if (runnerAppliesToKind(runner, kind)) {
 				matching.push(runner);
 			}
 		}
@@ -94,6 +115,16 @@ export class RunnerRegistry implements RunnerRegistryContract {
 	clear(): void {
 		this.runners.clear();
 	}
+}
+
+function runnerAppliesToKind(
+	runner: RunnerDefinition,
+	kind: FileKind | undefined,
+): boolean {
+	return (
+		runner.appliesTo.length === 0 ||
+		(kind !== undefined && runner.appliesTo.includes(kind))
+	);
 }
 
 // --- Tool Availability Cache ---
@@ -169,14 +200,26 @@ export async function checkToolAvailability(
 		const startedAt = Date.now();
 		let result: Awaited<ReturnType<typeof safeSpawnAsync>>;
 		let hostStallMs: number;
+		let probeJoined = false;
 		try {
-			result = await safeSpawnAsync(command, ["--version"], {
-				timeout: TOOL_PROBE_TIMEOUT_MS,
-			});
+			const shared = dispatcherProbeFlights.run(`dispatcher:${key}`, () =>
+				safeSpawnAsync(command, ["--version"], {
+					timeout: TOOL_PROBE_TIMEOUT_MS,
+				}),
+			);
+			probeJoined = shared.joined;
+			result = await shared.promise;
 		} finally {
 			hostStallMs = sampler.stop();
 		}
 		const elapsedMs = Date.now() - startedAt;
+		recordAvailabilityProbeOverrun(
+			command,
+			key,
+			elapsedMs,
+			TOOL_PROBE_TIMEOUT_MS,
+			result.failure,
+		);
 		if (result.status === 0) {
 			facts.setSessionFact(key, true);
 			// The tool answered: retire the cooldown facts rather than leaving a
@@ -190,6 +233,7 @@ export async function checkToolAvailability(
 				cause: "ok",
 				elapsedMs,
 				latched: true,
+				classifiedBy: probeJoined ? "joined" : "probe",
 				hostStallMs,
 				budgetMs: TOOL_PROBE_TIMEOUT_MS,
 			});
@@ -225,7 +269,7 @@ export async function checkToolAvailability(
 			hostStallMs,
 			...(retryAfterMs !== undefined && { retryAfterMs }),
 			budgetMs: TOOL_PROBE_TIMEOUT_MS,
-			classifiedBy: "probe",
+			classifiedBy: probeJoined ? "joined" : "probe",
 			evidence,
 		});
 		return false;
@@ -282,10 +326,20 @@ export function createDispatchContext(
 	);
 	const normalizedFilePath = normalizeMapKey(absoluteFilePath);
 	const kind = detectFileKind(normalizedFilePath);
-	const fileRole = detectFileRole(
-		normalizedFilePath,
-		readFilePrefix(normalizedFilePath),
-	);
+	const contentPrefix = readFilePrefix(normalizedFilePath);
+	const fileRole = detectFileRole(normalizedFilePath, contentPrefix);
+	// Captured once here so the generated short-circuit below can emit a
+	// `dispatch_skipped_generated` record carrying the deciding evidence tier
+	// and the measured line-shape statistic — without re-reading the file
+	// (refs #2346). The content passed is the same 4096-byte prefix already
+	// read for role detection, so this classification costs no extra I/O.
+	const generatedDetail =
+		fileRole === "generated"
+			? classifyGeneratedOrArtifactDetailed(normalizedFilePath, {
+					content: contentPrefix,
+					includeDeclarations: false,
+				})
+			: undefined;
 	const projectConfig = loadPiLensProjectConfig(normalizedCwd);
 
 	return {
@@ -294,6 +348,8 @@ export function createDispatchContext(
 		cwd: normalizedCwd,
 		kind,
 		fileRole,
+		generatedEvidence: generatedDetail?.evidence,
+		generatedLineShapeMean: generatedDetail?.lineShapeMean,
 		pi,
 		autofix: false,
 		deltaMode: !pi.getFlag("no-delta"),
@@ -480,10 +536,10 @@ function promoteDeltaUnusedToBlockers(diagnostics: Diagnostic[]): Diagnostic[] {
  * Optional per-runner result sink. Fires once for each runner that actually
  * executes (immediately after its `run()` returns), with the exact
  * `RunnerResult` — including `failureKind`/`failureMessage` that the merged
- * `DispatchResult` discards. Runners that are filtered out, `when`-skipped, or
- * not registered do not fire it. Lets the live tool-smoke harness (#209) assert
- * each tool spawned and exited cleanly without duplicating dispatch's
- * selection/gating logic.
+ * `DispatchResult` discards. Runners that are filtered out, `when`-skipped,
+ * skipped for being a test file, or not registered do not fire it. Lets the
+ * live tool-smoke harness (#209) assert each tool spawned and exited cleanly
+ * without duplicating dispatch's selection/gating logic.
  */
 export type RunnerResultSink = (runnerId: string, result: RunnerResult) => void;
 
@@ -492,7 +548,13 @@ export interface RunnerLatency {
 	startTime: number;
 	endTime: number;
 	durationMs: number;
-	status: "succeeded" | "failed" | "skipped" | "when_skipped";
+	status:
+		| "succeeded"
+		| "failed"
+		| "skipped"
+		| "when_skipped"
+		| "test_file_skipped"
+		| "pending";
 	diagnosticCount: number;
 	semantic: string;
 	skipReason?: RunnerSkipReason;
@@ -536,13 +598,19 @@ function buildCoverageNotice(
 		// The marker describes this exact silent-scanner set. A scanner can
 		// recover while another goes dark on the same file, so the set belongs
 		// in the session dedupe identity rather than only kind and path.
+		// #2016: these are SCANNER IDS, not filesystem paths. `normalizeMapKey`
+		// would realpath each one; on Windows that fails, falls through to
+		// `resolveNonExisting`, and resolves the id against the CURRENT process
+		// cwd, so the dedupe key differed by platform and by cwd (the #2219
+		// non-path-sentinel class). The cheap syntactic fold is what this
+		// session-scoped dedupe key actually needs.
 		const silentScannerSet = [...new Set(unconfirmedServerIds)]
-			.map(normalizeMapKey)
+			.map(normalizeEphemeralMapKey)
 			// Code-unit comparator: the sorted set is a dedupe KEY, so ordering
 			// must be deterministic across locales — localeCompare is not.
 			.sort((a, b) => Number(a > b) - Number(a < b))
 			.join(",");
-		const onceKey = `${ctx.kind}:${normalizeMapKey(ctx.filePath)}:${silentScannerSet}`;
+		const onceKey = `${ctx.kind}:${ctx.filePath}:${silentScannerSet}`;
 		if (coverageNoticeSeen.has(onceKey)) return undefined;
 		coverageNoticeSeen.add(onceKey);
 		const shown = unconfirmedServerIds.slice(0, 4);
@@ -565,7 +633,10 @@ function buildCoverageNotice(
 	if (primaryHasCoverage) return undefined;
 
 	const allPrimarySkipped = relevant.every(
-		(r) => r.status === "skipped" || r.status === "when_skipped",
+		(r) =>
+			r.status === "skipped" ||
+			r.status === "when_skipped" ||
+			r.status === "test_file_skipped",
 	);
 	if (!allPrimarySkipped) return undefined;
 
@@ -599,7 +670,7 @@ function buildCoverageNotice(
 	);
 	if (anyLinterHasCoverage) return undefined;
 
-	const onceKey = `${ctx.kind}:${normalizeMapKey(ctx.filePath)}`;
+	const onceKey = `${ctx.kind}:${ctx.filePath}`;
 	if (coverageNoticeSeen.has(onceKey)) return undefined;
 	coverageNoticeSeen.add(onceKey);
 
@@ -615,6 +686,11 @@ function buildCoverageNotice(
 
 const latencyReports: DispatchLatencyReport[] = [];
 const coverageNoticeSeen = new Set<string>();
+// One `dispatch_skipped_generated` phase record per file per process (refs
+// #2346): a generated file dispatched repeatedly must not spam latency.log,
+// so only the first skip of each file emits the row; the degradation ledger
+// below still tallies every repetition with a bounded per-subject count.
+const generatedSkipRecorded = new Set<string>();
 
 export function getLatencyReports(): DispatchLatencyReport[] {
 	return [...latencyReports];
@@ -626,6 +702,7 @@ export function clearLatencyReports(): void {
 
 export function clearCoverageNoticeState(): void {
 	coverageNoticeSeen.clear();
+	generatedSkipRecorded.clear();
 }
 
 export function formatLatencyReport(report: DispatchLatencyReport): string {
@@ -744,6 +821,61 @@ async function runGroup(
 			continue;
 		}
 
+		// Same skipTestFiles gate RunnerRegistry.getForKind applies for the
+		// per-edit path (#2337): the plan/group path resolves runners by id via
+		// registry.get() instead, which bypasses getForKind entirely, so a
+		// runner declaring skipTestFiles never had it enforced here.
+		if (runner.skipTestFiles && isTestFile(ctx.filePath)) {
+			latencies.push({
+				runnerId,
+				startTime: runnerStart,
+				endTime: Date.now(),
+				durationMs: Date.now() - runnerStart,
+				status: "test_file_skipped",
+				diagnosticCount: 0,
+				semantic: "none",
+			});
+			logLatency({
+				type: "runner",
+				filePath: ctx.filePath,
+				runnerId,
+				durationMs: 0,
+				status: "test_file_skipped",
+				diagnosticCount: 0,
+				semantic: "none",
+			});
+			continue;
+		}
+
+		// Keep explicit groups aligned with RunnerRegistry.getForKind(): an empty
+		// appliesTo list means every kind, while a populated list must contain the
+		// current kind. A filtered runner remains visible as skipped telemetry so
+		// language mismatches cannot be mistaken for runner failures.
+		const appliesToCurrentKind = runnerAppliesToKind(runner, ctx.kind);
+		if (!appliesToCurrentKind) {
+			const runnerEnd = Date.now();
+			latencies.push({
+				runnerId,
+				startTime: runnerStart,
+				endTime: runnerEnd,
+				durationMs: 0,
+				status: "skipped",
+				diagnosticCount: 0,
+				semantic: "unknown",
+			});
+			logLatency({
+				type: "runner",
+				filePath: ctx.filePath,
+				runnerId,
+				durationMs: 0,
+				status: "skipped",
+				diagnosticCount: 0,
+				semantic: "unknown",
+				metadata: { reason: "applies_to", kind: ctx.kind },
+			});
+			continue;
+		}
+
 		// Check preconditions
 		let shouldRun = true;
 		if (runner.when) {
@@ -776,10 +908,126 @@ async function runGroup(
 			continue;
 		}
 
+		const projectRoot = ctx.projectRoot ?? ctx.cwd;
+		// Only post-write dispatches participate. Project scans and direct API
+		// callers must retain their existing synchronous semantics.
+		const observedTier =
+			ctx.writeIndex === undefined
+				? "inline"
+				: classifyObservedRunner(projectRoot, runner.id);
+		if (observedTier === "collect-later") {
+			const markedAtMs = Date.now();
+			const deferred = runRunner(ctx, runner, semantic).then((result) => {
+				const durationMs = Date.now() - markedAtMs;
+				const tier = observeRunnerLatency({
+					projectRoot,
+					runnerId: runner.id,
+					durationMs,
+					timedOut: result.failureKind === "timeout",
+				});
+				if (tier !== observedTier) {
+					logLatency({
+						type: "phase",
+						filePath: ctx.filePath,
+						phase: "runner_collect_later_tier_flip",
+						durationMs: 0,
+						metadata: {
+							runnerId: runner.id,
+							from: observedTier,
+							to: tier,
+							projectRoot,
+						},
+					});
+				}
+				if (tier === "collect-later") {
+					incrementDegradationCount({
+						kind: "runner-collect-later",
+						subject: `${projectRoot}:${runner.id}`,
+						reason: `observed ${durationMs}ms, threshold ${COLLECT_LATER_THRESHOLD_MS}ms`,
+					});
+				}
+				logLatency({
+					type: "runner",
+					filePath: ctx.filePath,
+					runnerId: runner.id,
+					startedAt: new Date(markedAtMs).toISOString(),
+					durationMs,
+					status: result.status,
+					diagnosticCount: result.diagnostics.length,
+					semantic: result.semantic ?? semantic,
+					metadata: { tier: "collect-later", delivered: "turn_end" },
+				});
+				return result;
+			});
+			deferRunnerFindings({
+				filePath: ctx.filePath,
+				cwd: ctx.cwd,
+				projectRoot,
+				runnerId: runner.id,
+				markedAtMs,
+				writeIndex: ctx.writeIndex,
+				promise: deferred,
+			});
+			// A deferred runner is still an observed runner. Keep it visible in
+			// both the edit latency report and the widget until its turn-end result
+			// replaces this pending state (#2122 F1).
+			latencies.push({
+				runnerId: runner.id,
+				startTime: runnerStart,
+				endTime: runnerStart,
+				durationMs: 0,
+				status: "pending",
+				diagnosticCount: 0,
+				semantic: semantic,
+			});
+			recordRunner(ctx.filePath, runner.id, "pending", 0, 0, ctx.writeIndex);
+			logLatency({
+				type: "runner",
+				filePath: ctx.filePath,
+				runnerId: runner.id,
+				durationMs: 0,
+				status: "pending",
+				diagnosticCount: 0,
+				semantic,
+				metadata: { tier: "collect-later", delivered: "turn_end" },
+			});
+			continue;
+		}
+
 		const result = await runRunner(ctx, runner, semantic);
 		onRunnerResult?.(runnerId, result);
 		const runnerEnd = Date.now();
 		const duration = runnerEnd - runnerStart;
+		const tier =
+			ctx.writeIndex === undefined
+				? "inline"
+				: observeRunnerLatency({
+						projectRoot,
+						runnerId: runner.id,
+						durationMs: duration,
+						timedOut: result.failureKind === "timeout",
+					});
+		if (tier !== observedTier) {
+			logLatency({
+				type: "phase",
+				filePath: ctx.filePath,
+				phase: "runner_collect_later_tier_flip",
+				durationMs: 0,
+				metadata: {
+					runnerId: runner.id,
+					from: observedTier,
+					to: tier,
+					projectRoot,
+				},
+			});
+		}
+		if (tier === "collect-later") {
+			incrementDegradationCount({
+				kind: "runner-collect-later",
+				subject: `${projectRoot}:${runner.id}`,
+				reason: `observed ${duration}ms, threshold ${COLLECT_LATER_THRESHOLD_MS}ms`,
+			});
+		}
 		// Runner definitions are a typed API, but embedders/plugins can still
 		// return untyped objects at runtime. Admit only the closed taxonomy and
 		// only on actual skips so free text cannot enter durable latency metadata.
@@ -869,6 +1117,32 @@ export async function dispatchForFile(
 ): Promise<DispatchResult> {
 	const _overallStart = Date.now();
 	if (ctx.fileRole === "generated") {
+		// The generated short-circuit (refs #2346): never ran before this fix
+		// for name-less machine-emitted files (a scraped/minified page has no
+		// `.min.js` pattern to catch it), so the classification now also has a
+		// content-shape tier. The skip is observable — one `dispatch_skipped_generated`
+		// phase record per file per process carrying the deciding evidence tier
+		// and the measured line-shape statistic. Deliberately NOT a degradation
+		// ledger entry: skipping a generated file is healthy behavior working
+		// as designed, and the ledger's bounded kind slots are reserved for
+		// genuine degradations (#2348 review F3 — the ledger precedent at the
+		// collect-later tier flip below records an actual capability loss).
+		const evidence: GeneratedArtifactEvidence | undefined =
+			ctx.generatedEvidence;
+		const lineShapeMean = ctx.generatedLineShapeMean;
+		if (!generatedSkipRecorded.has(ctx.filePath)) {
+			generatedSkipRecorded.add(ctx.filePath);
+			logLatency({
+				type: "phase",
+				filePath: ctx.filePath,
+				phase: "dispatch_skipped_generated",
+				durationMs: 0,
+				metadata: {
+					evidence: evidence ?? "unknown",
+					...(lineShapeMean !== undefined && { lineShapeMean }),
+				},
+			});
+		}
 		return {
 			diagnostics: [],
 			blockers: [],
@@ -909,11 +1183,16 @@ export async function dispatchForFile(
 
 	// Count baseline warnings before filtering (for delta count display)
 	const relativeKey = path.relative(ctx.cwd, ctx.filePath).replace(/\\/g, "/");
-	const baselineAbsKey = `session.baseline.${normalizeMapKey(ctx.filePath)}`;
-	const baselineRelKey = `session.baseline.${normalizeMapKey(relativeKey)}`;
+	const baselineAbsKey = `session.baseline.${ctx.filePath}`;
+	// #2016: `relativeKey` is relative to `ctx.cwd`. `normalizeMapKey` resolved
+	// it against the process cwd instead, so on Windows this "relative" key
+	// became an absolute path anchored on the wrong root while POSIX left it
+	// relative. Both the read here and the write below use this const, so the
+	// key stays self-consistent within a session.
+	const baselineRelKey = `session.baseline.${normalizeEphemeralMapKey(relativeKey)}`;
 	const previousBaseline = ctx.deltaMode
-		? (ctx.facts.getSessionFact<Diagnostic[]>(baselineAbsKey) ??
-			ctx.facts.getSessionFact<Diagnostic[]>(baselineRelKey))
+		? (ctx.facts.getBoundedSessionFact<Diagnostic[]>(baselineAbsKey) ??
+			ctx.facts.getBoundedSessionFact<Diagnostic[]>(baselineRelKey))
 		: undefined;
 	const baselineWarnings = previousBaseline?.filter(
 		(d) => d.semantic === "warning" || d.semantic === "none",
@@ -1002,8 +1281,8 @@ export async function dispatchForFile(
 
 	// Persist full current snapshot for next run (not delta-filtered subset).
 	if (ctx.deltaMode) {
-		ctx.facts.setSessionFact(baselineAbsKey, [...dedupedDiagnostics]);
-		ctx.facts.setSessionFact(baselineRelKey, [...dedupedDiagnostics]);
+		ctx.facts.setBoundedSessionFact(baselineAbsKey, [...dedupedDiagnostics]);
+		ctx.facts.setBoundedSessionFact(baselineRelKey, [...dedupedDiagnostics]);
 	}
 
 	// Categorize results
@@ -1047,6 +1326,12 @@ export async function dispatchForFile(
 	if (coverageNotice) {
 		output += formatDiagnostics([coverageNotice], "warning", 1);
 		warnings.push(coverageNotice);
+	}
+	const pendingRunners = runnerLatencies
+		.filter((runner) => runner.status === "pending")
+		.map((runner) => runner.runnerId);
+	if (pendingRunners.length > 0) {
+		output += `\n⏳ Pending runners (reported at turn end): ${pendingRunners.join(", ")}\n`;
 	}
 
 	// Generate and store latency report
