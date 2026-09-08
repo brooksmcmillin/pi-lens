@@ -38,6 +38,8 @@ import {
 } from "../clients/bus-publish.js";
 import {
 	getDegradationSummary,
+	recordDegradation,
+	renderDegradationLines,
 	resetDegradationLedger,
 } from "../clients/degradation-ledger.js";
 import { _resetSessionLifecycleForTests } from "../clients/session-lifecycle.js";
@@ -51,8 +53,9 @@ import { removeTempDirSync } from "./clients/test-utils.js";
 // Mock out the two heavy real-work seams the same way
 // tests/index-integration.test.ts does, so firing session_start here stays a
 // fast, deterministic wiring check rather than a real scan/LSP-bootstrap.
-vi.mock("../clients/bootstrap.js", () => ({
-	loadBootstrapClients: async () => ({
+vi.mock("../clients/bootstrap.js", async () => {
+	const { bootstrapSeamMock } = await import("./support/bootstrap-mock.js");
+	return bootstrapSeamMock(async () => ({
 		metricsClient: { reset: () => {} },
 		todoScanner: {},
 		biomeClient: { isAvailable: () => false },
@@ -78,8 +81,8 @@ vi.mock("../clients/bootstrap.js", () => ({
 			isSupportedFile: () => false,
 			analyzeFile: () => null,
 		},
-	}),
-}));
+	}));
+});
 vi.mock("../clients/runtime-session.js", () => ({
 	handleSessionStart: async () => {},
 }));
@@ -839,6 +842,7 @@ describe("index.ts extension wiring", () => {
 		// The previous module-relative join landed on dist/skills/ (nonexistent) so
 		// skills silently failed to load.
 		it("resolves skillPaths to an existing skills/ directory at the package root", async () => {
+			resetDegradationLedger();
 			const pi = createPiMock();
 			extension(pi.asExtensionAPI());
 
@@ -880,6 +884,16 @@ describe("index.ts extension wiring", () => {
 					`generic skill dir must not exist (regression guard against rename-back): ${name}`,
 				).toBe(false);
 			}
+			// #2626: the standard layout (this repo's own skills/ beside
+			// package.json) must produce NO "skills-dir-missing" degradation —
+			// the negative case for the silent-zero-skills fix, driven through
+			// the real resources_discover handler rather than the resolver in
+			// isolation.
+			expect(
+				getDegradationSummary().find(
+					(group) => group.kind === "skills-dir-missing",
+				),
+			).toBeUndefined();
 		});
 
 		it("filters inactive navigation guides through the before_agent_start hook", async () => {
@@ -897,7 +911,9 @@ describe("index.ts extension wiring", () => {
 			expect(result).toEqual({
 				systemPrompt: expect.stringContaining("<name>pi-lens-ast-grep</name>"),
 			});
-			expect((result as { systemPrompt: string }).systemPrompt).not.toContain("pi-lens-lsp-navigation");
+			expect((result as { systemPrompt: string }).systemPrompt).not.toContain(
+				"pi-lens-lsp-navigation",
+			);
 		});
 	});
 
@@ -1048,6 +1064,44 @@ describe("index.ts extension wiring", () => {
 			expect(out).toContain("Current process session");
 			expect(out).toContain("Machine-wide active log window");
 			expect(out).toContain("wiring-fixture: p50 100ms, p99 100ms, n=3");
+		});
+
+		it("renders degradations through the shared renderDegradationLines seam, agreeing with pilens_health (#2515 S3)", async () => {
+			resetDegradationLedger();
+			try {
+				// `log-sink-rotated` is an INFORMATIONAL kind (see
+				// `INFORMATIONAL_DEGRADATION_KINDS` in degradation-ledger.ts): the
+				// shared renderer prints it as a bare count with no subject/reason.
+				// A hand-rolled renderer that always interpolates
+				// `latestReasons.at(-1)` (the pre-fix shape here) would print a
+				// fabricated "(subject: reason)" suffix even for this kind — the
+				// exact divergence from the MCP `pilens_health` path (which already
+				// uses `renderDegradationLines`) that #2515 S3 flags.
+				recordDegradation({
+					kind: "log-sink-rotated",
+					subject: "test.log",
+					reason: "rotated",
+				});
+
+				const pi = createPiMock();
+				extension(pi.asExtensionAPI());
+				const ctx = makeCtx();
+
+				await pi.runCommand("lens-perf", "", ctx);
+
+				const out = ctx.notifications.map((n) => n.message).join("\n");
+				const expectedLines = renderDegradationLines(getDegradationSummary());
+				expect(expectedLines).toEqual([
+					"Degradations:",
+					"  log-sink-rotated: 1",
+				]);
+				for (const line of expectedLines) {
+					expect(out).toContain(line);
+				}
+				expect(out).not.toContain("log-sink-rotated: 1 (test.log: rotated)");
+			} finally {
+				resetDegradationLedger();
+			}
 		});
 	});
 });

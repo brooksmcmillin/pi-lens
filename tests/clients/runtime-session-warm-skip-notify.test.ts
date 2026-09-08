@@ -12,6 +12,7 @@
  *   - a normal (small, `canWarmCaches: true`) project never fires it.
  */
 
+import { withResidentBootstrap } from "../support/bootstrap-access.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -21,6 +22,7 @@ import {
 } from "../../clients/project-snapshot.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
+import { makeLspServiceDouble } from "../support/lsp-service-double.js";
 
 vi.mock("../../clients/lsp/config.js", () => ({
 	loadLSPConfig: vi.fn().mockResolvedValue({}),
@@ -29,10 +31,7 @@ vi.mock("../../clients/lsp/config.js", () => ({
 }));
 
 vi.mock("../../clients/lsp/index.js", () => ({
-	getLSPService: vi.fn(() => ({
-		touchFile: vi.fn().mockResolvedValue(undefined),
-		supportsLSP: () => false,
-	})),
+	getLSPService: vi.fn(() => makeLspServiceDouble()),
 }));
 
 import { handleSessionStart } from "../../clients/runtime-session.js";
@@ -50,7 +49,7 @@ function makeDeps(
 	ctxCwd: string,
 	notify: (msg: string, level: string) => void,
 ) {
-	return {
+	return withResidentBootstrap({
 		ctxCwd,
 		getFlag: () => false,
 		notify,
@@ -95,7 +94,7 @@ function makeDeps(
 		cleanStaleTsBuildInfo: () => [],
 		resetDispatchBaselines: () => {},
 		resetLSPService: () => {},
-	} as any;
+	}) as any;
 }
 
 describe("warm-pipeline size-skip notify (#775)", () => {

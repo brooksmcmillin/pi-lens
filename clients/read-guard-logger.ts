@@ -1,10 +1,10 @@
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
-import { getGlobalPiLensDir } from "./file-utils.js";
+import { getGlobalPiLensLogDir } from "./probe-home-state.js";
 import { createNdjsonLogger } from "./ndjson-logger.js";
 import { normalizeFilePath } from "./path-utils.js";
 
-const READ_GUARD_LOG_DIR = getGlobalPiLensDir();
+const READ_GUARD_LOG_DIR = getGlobalPiLensLogDir();
 const READ_GUARD_LOG_FILE = path.join(READ_GUARD_LOG_DIR, "read-guard.log");
 const READ_GUARD_LOG_BACKUP_FILE = path.join(
 	READ_GUARD_LOG_DIR,
@@ -31,9 +31,9 @@ const LOG_SNAPSHOT_VALIDATION = !["0", "false", "off"].includes(
 	SNAPSHOT_LOG_SETTING,
 );
 
-export const MAX_EDIT_BATCH_ITEMS = 100;
+const MAX_EDIT_BATCH_ITEMS = 100;
 
-export type EditBatchRejectionCode =
+type EditBatchRejectionCode =
 	| "oldtext_not_found"
 	| "oldtext_unrepresentable"
 	| "oldtext_duplicate"
@@ -350,7 +350,7 @@ export function logReadGuardEvent(entry: ReadGuardLogEntry): void {
 		return;
 	}
 	const rawMetadata = entry.correlationId
-		? { ...(entry.metadata ?? {}), correlationId: entry.correlationId }
+		? { ...entry.metadata, correlationId: entry.correlationId }
 		: entry.metadata;
 	const bounded = boundTelemetryValue(rawMetadata, "metadata", 0);
 	const metadata: Record<string, unknown> | undefined =

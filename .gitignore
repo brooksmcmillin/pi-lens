@@ -1,9 +1,15 @@
 # Dependencies
-node_modules/
+node_modules
 features.md
 
 # pi-lens internal
 .pi-lens/
+# Probe-home redirect target (#2506): getGlobalPiLensLogDir() sends the logs
+# of a probe run without a PI_LENS_HOME pin here instead of the real
+# ~/.pi-lens. Untracked by design -- if it were not ignored, every agent
+# worktree that ran one probe would stay dirty forever and #2435's aged
+# worktree sweep (clean-only) could never reap it.
+.pi-lens-probe-home/
 .harness/
 .pi-subagents/
 
@@ -102,6 +108,13 @@ migrate-*.js
 !docs/analysisall.md
 !docs/api-ports-inventory.md
 !docs/astplayground.md
+!docs/public-api-stability.md
+!docs/configuration.md
+!docs/release-qa-baseline.md
+
+# release-qa run artifacts (scripts/release-qa.mjs writes these into cwd)
+/release-qa-report.md
+/release-qa-evidence/
 !skills/**/*.md
 !.github/PULL_REQUEST_TEMPLATE.md
 
@@ -151,6 +164,9 @@ clients/lsp/.intelephense/
 !.claude/skills/
 !.claude/skills/**
 !.claude/skills/**/*.md
+# Project-level hook registrations (#2435). settings.local.json stays ignored:
+# it is per-developer permission state, not shared configuration.
+!.claude/settings.json
 autoresearch.jsonl
 coverage/
 PR_issues_Audit.md
@@ -165,3 +181,6 @@ tests/fixtures/**/bin/
 
 # Live native-TS7 integration temp projects (removed in afterAll; survive hard aborts)
 tests/native-ts7-live-*/
+
+# prepack backup of package.json (scripts/strip-dev-deps-for-pack.mjs)
+.pack-backup/

@@ -66,7 +66,7 @@ export type SearchCreditReason =
 	| "delivered-context-flags"
 	| "caller-margin";
 
-export interface SearchCredit {
+interface SearchCredit {
 	marginBefore: number;
 	marginAfter: number;
 	reason: SearchCreditReason;
@@ -80,7 +80,7 @@ export interface SearchCredit {
  *  - `enforced-pass`: a hash-checked read matched, so the edit passed the gate.
  *  - `not-decidable`: no candidate read could be hash-checked.
  */
-export type RangeSnapshotOutcome =
+type RangeSnapshotOutcome =
 	| "enforced-block"
 	| "bypassed-content-match"
 	| "enforced-pass"
@@ -95,7 +95,11 @@ export interface ReadContentBinding {
 
 export interface EditRecord {
 	filePath: string;
-	tool: "write" | "edit";
+	/**
+	 * Host tool name. Widened from `"write" | "edit"` in #2423 so a third-party
+	 * mutating tool is recorded under its own name instead of being relabelled.
+	 */
+	tool: string;
 	touchedLines: [start: number, end: number];
 	precedingReads: ReadRecord[];
 	verdict: "allowed" | "blocked" | "warned";
@@ -1195,6 +1199,27 @@ export class ReadGuard {
 	}
 
 	/**
+	 * Every path this guard has a read or a write record for, as normalized keys
+	 * (#2430).
+	 *
+	 * This is the read-guard half of the observational net's TRACKED-FILE SET:
+	 * the files pi-lens has actually seen this session, which the `agent_settled`
+	 * sweep hash-checks instead of walking the workspace. It reads state already
+	 * held in memory and stats nothing; both backing containers are capped
+	 * (`READ_GUARD_MAX_UNCONSUMED_FILES`), so the result is bounded by
+	 * construction.
+	 *
+	 * `touchFile` is deliberately NOT called: enumerating is not using, and
+	 * refreshing every entry's idle clock on each sweep would make the idle
+	 * eviction unreachable.
+	 */
+	getTrackedPaths(): string[] {
+		const tracked = new Set<string>(this.reads.keys());
+		for (const written of this.writtenThisSession) tracked.add(written);
+		return [...tracked];
+	}
+
+	/**
 	 * Drop all record of a path pi-lens confirmed no longer exists on disk
 	 * (#1668, external delete). Without this a later write reusing the same
 	 * path would inherit a stale writtenThisSession/reads entry from before
@@ -1865,9 +1890,12 @@ export class ReadGuard {
 			return filePath.endsWith(suffix);
 		}
 		if (pattern.includes("*")) {
-			// Convert glob to regex
+			// Adjacent stars are equivalent to one star in this dialect. Collapse
+			// them before compiling so a non-match cannot backtrack over every
+			// nullable `.*` group (#2622).
+			const collapsedPattern = pattern.replace(/\*+/g, "*");
 			const regex = new RegExp(
-				`^${pattern.replace(/\\/g, "\\\\").replace(/\./g, "\\.").replace(/\*/g, ".*")}$`,
+				`^${collapsedPattern.replace(/\\/g, "\\\\").replace(/\./g, "\\.").replace(/\*/g, ".*")}$`,
 			);
 			return regex.test(filePath);
 		}
@@ -1893,7 +1921,7 @@ export class ReadGuard {
 
 	private recordEdit(
 		filePath: string,
-		tool: "write" | "edit",
+		tool: string,
 		touchedLines: [number, number],
 		verdict: ReadGuardVerdict,
 	): void {
@@ -1937,7 +1965,7 @@ export class ReadGuard {
 
 	private recordVerdict(
 		filePath: string,
-		tool: "write" | "edit",
+		tool: string,
 		touchedLines: [number, number] | undefined,
 		verdict: ReadGuardVerdict,
 		metadata: Record<string, unknown> = {},

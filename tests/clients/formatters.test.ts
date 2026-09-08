@@ -17,6 +17,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+	type ResolvedFormatterCommand,
 	SKIP_FORMATTING,
 	biomeFormatter,
 	blackFormatter,
@@ -90,6 +91,19 @@ async function withPathShim(
 		await fn();
 	} finally {
 		process.env.PATH = origPath;
+	}
+}
+
+async function withIsolatedPath(fn: () => Promise<void> | void): Promise<void> {
+	const isolatedPath = path.join(tmpDir, "isolated-path");
+	fs.mkdirSync(isolatedPath, { recursive: true });
+	const origPath = process.env.PATH;
+	process.env.PATH = isolatedPath;
+	try {
+		await fn();
+	} finally {
+		if (origPath === undefined) delete process.env.PATH;
+		else process.env.PATH = origPath;
 	}
 }
 
@@ -363,13 +377,13 @@ describe("resolveCommand — vendor/bin", () => {
 		expect(cmd).toContain(filePath);
 	});
 
-	it("php-cs-fixer: returns null when no vendor/bin", async () => {
-		const cmd = await phpCsFixerFormatter.resolveCommand!(
-			fileIn(tmpDir, "app.php"),
-			tmpDir,
-		);
-		expect(cmd).toBeNull();
-	});
+	// The "no vendor/bin AND no PATH binary" case is NOT covered here: this
+	// file never mocks `safe-spawn.js`, so a real `php-cs-fixer` on the host
+	// PATH would make that assertion PATH-dependent (#2472 review F1). It is
+	// covered instead in `formatter-unavailable-outcome.test.ts`, which
+	// mocks `safeSpawnAsync` so every `where`/`which` probe deterministically
+	// reports the tool absent — and asserts the actual current contract
+	// (`FORMATTER_UNAVAILABLE`, not `null`; #2472 review F4).
 });
 
 // ---------------------------------------------------------------------------
@@ -1323,10 +1337,13 @@ describe("getFormattersForFile — policy selection", () => {
 			.mockResolvedValue(managedPath);
 		try {
 			const formatters = await import("../../clients/formatters.js");
-			const cmd = await formatters.taploFormatter.resolveCommand!(
-				fileIn(tmpDir, "config.toml"),
-				tmpDir,
-			);
+			let cmd: ResolvedFormatterCommand | undefined;
+			await withIsolatedPath(async () => {
+				cmd = await formatters.taploFormatter.resolveCommand!(
+					fileIn(tmpDir, "config.toml"),
+					tmpDir,
+				);
+			});
 			expect(spy).toHaveBeenCalledWith("taplo");
 			expect(cmd).toEqual([managedPath, "fmt", fileIn(tmpDir, "config.toml")]);
 		} finally {

@@ -208,9 +208,14 @@ describe("tree-sitter runner — skip paths", () => {
 		expect(result.diagnostics).toHaveLength(0);
 	});
 
+	// `.md` has no tree-sitter grammar in the language registry. This used to
+	// use `.java`, which #2424 wired to the java grammar as one of its reconciled
+	// rows (the project scanner already resolved it; the shared ext->grammar map
+	// did not). The runner's appliesTo never included the java kind, so nothing
+	// but this direct call ever reached the skip path with a .java file.
 	it("skips unsupported file extension", async () => {
 		const runner = await loadRunnerWithClient(true, true);
-		const result = await runner.run(createCtx("/fake/file.java") as any);
+		const result = await runner.run(createCtx("/fake/file.md") as any);
 		expect(result.status).toBe("skipped");
 	});
 
@@ -296,5 +301,35 @@ describe("tree-sitter runner — batched per-edit queries (#888)", () => {
 		expect(runQueriesOnFile.mock.calls[0][3]).toEqual({ maxResults: 10 });
 		// Small edit: no entity walks either.
 		expect(runQueryOnFile).not.toHaveBeenCalled();
+	});
+
+	it("interpolates double-brace capture placeholders in diagnostic messages", async () => {
+		const query = {
+			...fakeQuery,
+			message: "Hallucinated import '{{NAME}}' from '{{MODULE}}'",
+		};
+		const { runner, runQueriesOnFile } = await loadRunnerWithQueries([query]);
+		runQueriesOnFile.mockResolvedValueOnce([
+			{
+				queryDef: query,
+				match: {
+					line: 1,
+					column: 1,
+					captures: { NAME: "JSONResponse", MODULE: "django" },
+					matchedText: "from django import JSONResponse",
+					nodeType: "import_from_statement",
+				},
+			},
+		]);
+
+		const result = await runner.run({
+			...createCtx("/fake/file.ts"),
+			modifiedRanges: [{ start: 1, end: 1 }],
+		} as any);
+
+		expect(result.diagnostics).toHaveLength(1);
+		expect(result.diagnostics[0]?.message).toBe(
+			"Hallucinated import 'JSONResponse' from 'django'",
+		);
 	});
 });

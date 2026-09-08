@@ -45,8 +45,17 @@ const GLOBAL_BIN_2 =
 		: "/usr/bin/madge";
 
 vi.mock("../../clients/safe-spawn.js", () => ({ safeSpawnAsync, safeSpawn }));
-vi.mock("../../clients/package-manager.js", () => ({ findNodeToolBinary }));
+vi.mock("../../clients/package-manager.js", async (importOriginal) => ({
+	...(await importOriginal<
+		typeof import("../../clients/package-manager.js")
+	>()),
+	findNodeToolBinary,
+}));
 vi.mock("../../clients/installer/index.js", () => ({
+	// #2140: the probe resolver asks the installer for a release-managed
+	// binary (`~/.pi-lens/bin`) before falling back to PATH. Undefined is
+	// "no managed install", which is what these tests already assumed.
+	findManagedToolBinary: vi.fn(async () => undefined),
 	ensureTool,
 	getManagedToolsDir: () => MANAGED_TOOLS_DIR,
 	// #1612: resolveAvailableOrInstallUnshared reads these on the install-

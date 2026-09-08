@@ -16,6 +16,8 @@ import {
 } from "../clients/lsp-mutation.js";
 import type { LSPCallHierarchyItem } from "../clients/lsp/client.js";
 import { uriToPath } from "../clients/path-utils.js";
+import { escapeRegExp } from "../clients/string-utils.js";
+import { isRecordableProjectPath } from "../clients/file-utils.js";
 import { compactRenderResult } from "./render-compact.js";
 import {
 	applyWorkspaceEdit,
@@ -113,10 +115,6 @@ function emptyReasonForOperation(operation: LspNavigationOperation): string {
 	if (operation === "incomingCalls" || operation === "outgoingCalls")
 		return "no-call-hierarchy-results";
 	return "no-results";
-}
-
-function escapeRegExp(value: string): string {
-	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 type SymbolColumnResolution = {
@@ -705,15 +703,16 @@ async function openFileBestEffort(
 	}
 	if (!fileContent) return;
 	try {
-		if (typeof lspService.touchFile === "function") {
-			await lspService.touchFile(filePath, fileContent, {
-				diagnostics: waitForDiagnostics ? "document" : "none",
-				source: "lsp_navigation",
-				clientScope: waitForDiagnostics ? "all" : "primary",
-			});
-		} else {
-			await lspService.openFile(filePath, fileContent);
-		}
+		// #2598: `touchFile` is defined unconditionally on the real `LSPService`
+		// (clients/lsp/index.ts), so the former `typeof … === "function"` hedge
+		// and its `openFile` arm were reachable only from a partial test double
+		// (AGENTS.md shape 7). Nothing here reads the result — a touch that
+		// resolves no clients is already the no-op this helper wants.
+		await lspService.touchFile(filePath, fileContent, {
+			diagnostics: waitForDiagnostics ? "document" : "none",
+			source: "lsp_navigation",
+			clientScope: waitForDiagnostics ? "all" : "primary",
+		});
 	} catch {
 		/* LSP server may not be ready yet — proceed anyway */
 	}
@@ -994,7 +993,7 @@ export function createLspNavigationTool(
 						},
 					],
 					details: {
-						...(payload.details ?? {}),
+						...payload.details,
 						failureKind: meta.failureKind,
 					},
 				};
@@ -1093,15 +1092,41 @@ export function createLspNavigationTool(
 				["rename", "rename_file", "executeCommand"].includes(operation)
 			) {
 				const cwd = ctx.cwd || ".";
+				// Name the specific LSP operation in the receipt rather than a
+				// generic "lsp-edit" tag, so a rename's change-log entry reads
+				// differently from an executeCommand-solicited edit (#2450).
+				const mutationSource =
+					operation === "executeCommand" ? "lsp-execute-command" : "lsp-rename";
 				mutationContext = {
 					cwd,
 					correlationId: newLspMutationCorrelationId(_toolCallId),
-					tool: "lsp_navigation",
-					source: "lsp-edit",
+					tool: `lsp_navigation:${operation}`,
+					source: mutationSource,
 					...mutationDeps,
 					readGuard: getFlag("no-read-guard", cwd)
 						? undefined
 						: mutationDeps?.readGuard,
+					// #2450 review round 2 (F4)/round 3 (F2, F4): the SAME gate
+					// `registerMutationBridge` applies internally in `index.ts`, so
+					// this directly-threaded path and the bridge fallback
+					// (`clients/lsp-mutation.ts`, reached when `mutationDeps` is
+					// absent/partial — e.g. the MCP server) agree on which files
+					// count as project source, rather than the direct path
+					// recording an ignored/vendor write the fallback would drop.
+					// `no-read-guard` is intentionally NOT checked here (round 3
+					// F2): it gates only the read-guard stamp above, the same
+					// canonical split `clients/runtime-tool-result.ts` applies
+					// (`:1120`, `:1485`) — bookkeeping (turn-state / receipts)
+					// still runs under `--no-read-guard`. Judge against the
+					// project root, not the request `cwd` (round 3 F4): a
+					// sub-package `cwd` must not read a sibling-package rename as
+					// external.
+					isRecordable: (filePath: string): boolean => {
+						return isRecordableProjectPath(
+							filePath,
+							mutationDeps?.runtime?.projectRoot ?? cwd,
+						);
+					},
 				};
 			}
 

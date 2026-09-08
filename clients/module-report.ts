@@ -54,6 +54,7 @@ import {
 } from "./tree-sitter-shared.js";
 import {
 	type ImportRef,
+	symbolExtractionGrammar,
 	TreeSitterSymbolExtractor,
 } from "./tree-sitter-symbol-extractor.js";
 
@@ -64,7 +65,7 @@ import {
 // the review graph (computed once, persisted) so this path just reads them.
 
 /** Hard payload bound for the per-symbol who-uses-this section. */
-export const MAX_MODULE_REPORT_REFS = 100;
+const MAX_MODULE_REPORT_REFS = 100;
 
 function normalizeMaxRefsPerSymbol(value: number | undefined): number {
 	if (value === undefined || !Number.isFinite(value)) return 10;
@@ -95,6 +96,7 @@ export interface ModuleReportOptions {
 	maxCallGraphEntries?: number;
 }
 
+/** @public — consumed by clients/module-report-lsp.ts, which knip.jsonc lists under `ignore`. */
 export interface ModuleSymbolUsedBy {
 	file: string;
 	symbol: string;
@@ -165,7 +167,7 @@ export interface ModuleSymbolEntry {
 	// THIS report's path.
 }
 
-export interface RecommendedRead {
+interface RecommendedRead {
 	reason: string;
 	/** Named symbol or synthetic callback handle. */
 	symbol?: string;
@@ -173,7 +175,7 @@ export interface RecommendedRead {
 	endLine: number;
 }
 
-export interface ModuleCallbackEntry {
+interface ModuleCallbackEntry {
 	/** Stable synthetic handle usable with read_symbol. */
 	name: string;
 	/** Normalized role for an inline callback/closure/lambda. */
@@ -192,7 +194,7 @@ export interface ModuleCallbackEntry {
 
 /** One file in the blast radius (#304): a transitive dependent of this module,
  * aggregated from its (possibly several) dependent symbols. */
-export interface BlastRadiusFile {
+interface BlastRadiusFile {
 	/** cwd-relative display path of the dependent file. */
 	file: string;
 	/** How many dependent symbols/edges in this file reach the module. */
@@ -207,7 +209,7 @@ export interface BlastRadiusFile {
 
 /** Cross-file blast radius (#304): "if you change this module, read/verify these
  * files". Present only when requested AND the cached graph is warm. */
-export interface BlastRadius {
+interface BlastRadius {
 	/** True when the impact walk hit its node cap (the list is a prefix). */
 	truncated: boolean;
 	/** Deepest hop reached (transitivity actually observed). */
@@ -216,7 +218,7 @@ export interface BlastRadius {
 	files: BlastRadiusFile[];
 }
 
-export interface ModuleCallGraphRelation {
+interface ModuleCallGraphRelation {
 	/** Stable FunctionCallGraph symbol key for the related symbol. */
 	symbolId: string;
 	/** Stable symbol key for the module symbol this relation belongs to. */
@@ -236,7 +238,7 @@ export interface ModuleCallGraphRelation {
 	weight?: number;
 }
 
-export interface ModuleCallGraphCoverage {
+interface ModuleCallGraphCoverage {
 	status: "complete" | "partial" | "unavailable";
 	complete: boolean;
 	totalEvidence?: number;
@@ -252,7 +254,7 @@ export interface ModuleCallGraphCoverage {
 	languages?: Record<string, "complete" | "partial" | "unavailable">;
 }
 
-export interface ModuleCallGraph {
+interface ModuleCallGraph {
 	available: boolean;
 	/** Why the cached view is unavailable; never infer zero calls from this state. */
 	reason?:
@@ -368,7 +370,7 @@ export interface ReadSymbolOptions {
 	kind?: string;
 }
 
-export interface ReadEnclosingOutlineItem {
+interface ReadEnclosingOutlineItem {
 	name: string;
 	kind: string;
 	startLine: number;
@@ -414,54 +416,26 @@ export interface ReadEnclosingOptions {
 	aroundLine?: number;
 }
 
-// kind -> tree-sitter languageId. The languageId keys BOTH the grammar map
-// (tree-sitter-client) and SYMBOL_QUERIES (tree-sitter-symbol-extractor), so it
-// must match a key present in both. jsts/cxx are extension-split kinds resolved
-// through the SHARED ext→grammar resolver below (never a local extension map —
-// #887). Using these gives the primary languages the same rich outline
-// (classes/interfaces/types/signatures) as every other language, not the
-// functions-only FunctionSummary.
-const KIND_TO_TS_LANG: Record<string, string> = {
-	python: "python",
-	go: "go",
-	rust: "rust",
-	ruby: "ruby",
-	java: "java",
-	kotlin: "kotlin",
-	dart: "dart",
-	elixir: "elixir",
-	csharp: "csharp",
-	php: "php",
-	swift: "swift",
-	lua: "lua",
-	ocaml: "ocaml",
-	zig: "zig",
-	shell: "bash",
-	// cxx resolved by extension below (c vs cpp)
-};
-
 export function tsLangForFile(
 	filePath: string,
 	kind: string | undefined,
 ): string | undefined {
-	// jsts/cxx are extension-split kinds: resolve them through the shared
-	// ext→grammar authority (tree-sitter-shared.ts EXT_TO_LANG) — the SAME
-	// resolver the dispatch tree-sitter runner, fact providers, project scanner
-	// and read expansion use — so a file is parsed and TreeCache-keyed
-	// (`languageId:path`) under exactly one grammar process-wide. #887: this
-	// used to hand-roll a local map that sent .js/.mjs/.cjs to the typescript
-	// grammar and .jsx to tsx, so every plain-JS file was parsed and cached
-	// twice under two grammars and ran TS-grammar symbol queries on JS trees.
-	// Extensions the shared map does not cover (.svelte/.vue for jsts; the
-	// module-interface/Objective-C/CUDA tail for cxx) keep the historical
-	// kind default.
+	// jsts is an extension-split kind with no single grammar: resolve it through
+	// the SHARED ext -> grammar authority (language-registry via
+	// tree-sitter-shared) so a file is parsed and TreeCache-keyed
+	// (`languageId:path`) under exactly one grammar process-wide. #887: this used
+	// to hand-roll a local map that sent .js/.mjs/.cjs to the typescript grammar
+	// and .jsx to tsx, so every plain-JS file was parsed and cached twice under
+	// two grammars and ran TS-grammar symbol queries on JS trees. .svelte/.vue
+	// have no grammar wiring and keep the historical kind default.
 	if (kind === "jsts") {
 		return resolveTreeSitterLanguage(filePath) ?? "typescript";
 	}
-	if (kind === "cxx") {
-		return resolveTreeSitterLanguage(filePath) ?? "cpp";
-	}
-	return kind ? KIND_TO_TS_LANG[kind] : undefined;
+	// Every other kind goes through the registry-derived resolver, which handles
+	// the cxx `.c`/`.h`-vs-cpp split and only answers for grammars that have
+	// symbol queries. #2424 deleted the hand-kept kind -> languageId map that
+	// used to live here alongside review-graph's copy of the same thing.
+	return symbolExtractionGrammar(kind, filePath);
 }
 
 // Per-language extractor cache — extractors are cheap once their queries are
@@ -1402,7 +1376,7 @@ const pythonCallbackRules: CallbackLanguageRules = {
 				include: true,
 			};
 		}
-		if (/\.add_done_callback$/.test(callName)) {
+		if (callName.endsWith(".add_done_callback")) {
 			return {
 				kind: "future_callback",
 				flags: withFlag(base.flags, "future completion"),
@@ -1561,7 +1535,7 @@ const javaCallbackRules: CallbackLanguageRules = {
 			3,
 		);
 		const created = obj?.children?.find((c) => c.type === "type_identifier");
-		if (created && /Thread$/.test(created.text)) {
+		if (created && created.text.endsWith("Thread")) {
 			return {
 				kind: "task",
 				flags: withFlag(base.flags, "thread"),
@@ -2440,8 +2414,10 @@ function levenshteinDistance(a: string, b: string): number {
 	const bl = b.length;
 	if (al === 0) return bl;
 	if (bl === 0) return al;
-	let prev = new Array<number>(bl + 1);
-	let curr = new Array<number>(bl + 1);
+	let prev: number[] = [];
+	prev.length = bl + 1;
+	let curr: number[] = [];
+	curr.length = bl + 1;
 	for (let j = 0; j <= bl; j++) prev[j] = j;
 	for (let i = 1; i <= al; i++) {
 		curr[0] = i;

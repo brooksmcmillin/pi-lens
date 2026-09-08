@@ -218,7 +218,19 @@ function makeClient(
 	};
 }
 
-/** The cascade neighbour fan-out's own touch shape (integration.ts). */
+/**
+ * The multi-server sweep touch shape: `clientScope: "all"`, which is where a
+ * primary and its auxiliaries are waited on together (`lens_diagnostics`
+ * mode=full, `lsp_diagnostics` `serverScope: "all"`).
+ *
+ * This was the cascade neighbour fan-out's own shape when #1549 landed. #1720
+ * has since narrowed that fan-out to `clientScope: "primary"` (integration.ts),
+ * so the cascade lane no longer attaches auxiliaries at all — the touch-wide
+ * collapse this file guards is unreachable from THAT caller today. The probes
+ * stay on the "all" scope because that is the surface where the merge rule is
+ * still live; naming the wrong caller would make them look like cascade
+ * regression tests they are not.
+ */
 const CASCADE_TOUCH = {
 	clientScope: "all" as const,
 	collectDiagnostics: true as const,
@@ -241,16 +253,19 @@ function latencyRows(phase: string) {
  */
 async function mountService(clients: {
 	primary?: ReturnType<typeof makeClient>;
-	aux: ReturnType<typeof makeClient>;
+	aux: ReturnType<typeof makeClient> | ReturnType<typeof makeClient>[];
 }) {
 	const { LSPService } = await import("../../../clients/lsp/index.js");
 	const service = new LSPService();
+	const auxClients = Array.isArray(clients.aux) ? clients.aux : [clients.aux];
 	getServersForFileWithConfig.mockReturnValue([
 		...(clients.primary ? [makeServer("ts-primary")] : []),
-		makeServer("opengrep", "auxiliary"),
+		...auxClients.map((client) => makeServer(client.serverId, "auxiliary")),
 	]);
-	createLSPClient.mockImplementation(async (options: { serverId?: string }) =>
-		options?.serverId === "opengrep" ? clients.aux : clients.primary,
+	createLSPClient.mockImplementation(
+		async (options: { serverId?: string }) =>
+			auxClients.find((client) => client.serverId === options?.serverId) ??
+			clients.primary,
 	);
 	return service;
 }
@@ -328,6 +343,52 @@ describe("#1549 — per-server touch verdict", () => {
 		// `isConfirmedTouch` still fails closed and no cache is seeded from this.
 		expect(result?.confirmation).toBe("partial");
 		expect(result?.unconfirmedServerIds).toEqual(["opengrep"]);
+	});
+
+	it("the sweep shape with TWO auxiliaries: the healthy scanner's findings survive the slow one's lapse", async () => {
+		// The issue's actual population — a sweep touch attaches ~5 servers, and the
+		// aggregate deadline is the MAX over them, so ONE slow scanner lapses the wait
+		// for everyone. The single-auxiliary probes above pin the primary's answer;
+		// this one pins the SIBLING auxiliary's, which is the other half of "discards
+		// every good answer from the other servers in the same sweep". A merge that
+		// drops on any timeout (rather than per contributor) still passes every
+		// single-aux probe in this file and loses `typos finding` here.
+		const result = await touchOnce(
+			await mountService({
+				primary: makeClient(100, [makeDiagnostic("primary error")], {
+					serverId: "ts-primary",
+				}),
+				aux: [
+					makeClient(150, [makeDiagnostic("typos finding")], {
+						serverId: "typos",
+					}),
+					makeClient(5000, [], { serverId: "opengrep" }),
+				],
+			}),
+		);
+
+		expect((result?.diags ?? []).map((d) => d.message)).toEqual([
+			"primary error",
+			"typos finding",
+		]);
+		expect(result?.inconclusive).toBeUndefined();
+		// Per-SERVER, not per-touch: only the scanner that said nothing is named.
+		expect(result?.confirmation).toBe("partial");
+		expect(result?.unconfirmedServerIds).toEqual(["opengrep"]);
+		// And the record carries the same per-server attribution, so a forensic
+		// sweep can tell a lapsed auxiliary from a lapsed touch.
+		expect(latencyRows("lsp_diagnostics_timeout")[0]?.metadata).toMatchObject({
+			unansweredServerIds: ["opengrep"],
+			attributedToPrimary: false,
+		});
+		expect(latencyRows("degradation_ledger")).toContainEqual(
+			expect.objectContaining({
+				metadata: expect.objectContaining({
+					kind: "lsp-diagnostics-timeout",
+					subject: "opengrep",
+				}),
+			}),
+		);
 	});
 
 	it("the same shape on a CLEAN primary: confirmed-empty findings survive as partial", async () => {
@@ -531,7 +592,7 @@ describe("#1549 — per-server touch verdict", () => {
 	it("a PRIMARY's notify write timing out is a verdict, attributed to notify-write", async () => {
 		process.env.PI_LENS_LSP_NOTIFY_BUDGET_MS = "50";
 		// The primary never received this content; a publication it makes anyway is
-		// about a different revision. Both auxiliaries healthy — a good scanner must
+		// about a different revision. The auxiliary is healthy — a good scanner must
 		// not launder the primary's failure into a confirmation.
 		const result = await runTouch(
 			makeClient(100, [makeDiagnostic("stale finding")], {

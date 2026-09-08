@@ -25,13 +25,16 @@ import {
 // presence of one is the repo's deliberate opt-in: it carries the author's
 // chosen severities/ignores, so we let zizmor findings BLOCK in that workspace
 // (advisory-only otherwise, like Opengrep's local-rules gate).
-export const LOCAL_ZIZMOR_CONFIG_NAMES = [
+const LOCAL_ZIZMOR_CONFIG_NAMES = [
 	path.join(".github", "zizmor.yml"),
 	path.join(".github", "zizmor.yaml"),
 	"zizmor.yml",
 	"zizmor.yaml",
 ] as const;
 
+// Deliberately UNCEILINGED at $HOME (refs #2472 review round 3, F1): a
+// user-level `~/zizmor.yml` (or `~/.github/zizmor.yml`) is a legitimate
+// global config, not an escaped-workspace accident.
 export function findLocalZizmorConfig(startDir: string): string | undefined {
 	return findLocalToolConfig(startDir, LOCAL_ZIZMOR_CONFIG_NAMES);
 }

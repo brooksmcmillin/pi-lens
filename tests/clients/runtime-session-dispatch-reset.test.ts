@@ -11,9 +11,11 @@
  * asserts the tool is retried afterward.
  */
 
+import { withResidentBootstrap } from "../support/bootstrap-access.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { handleSessionStart } from "../../clients/runtime-session.js";
 import { removeTempDirSync, setupTestEnvironment } from "./test-utils.js";
+import { makeLspServiceDouble } from "../support/lsp-service-double.js";
 
 vi.mock("../../clients/safe-spawn.js", () => ({
 	safeSpawn: vi.fn(() => ({ stdout: "", stderr: "", status: 1 })),
@@ -39,10 +41,7 @@ vi.mock("../../clients/lsp/config.js", () => ({
 }));
 
 vi.mock("../../clients/lsp/index.js", () => ({
-	getLSPService: vi.fn(() => ({
-		touchFile: vi.fn().mockResolvedValue(undefined),
-		supportsLSP: () => false,
-	})),
+	getLSPService: vi.fn(() => makeLspServiceDouble()),
 }));
 
 function makeDefaultRuntime() {
@@ -61,7 +60,7 @@ function makeDefaultRuntime() {
 }
 
 function makeDeps(ctxCwd: string) {
-	return {
+	return withResidentBootstrap({
 		ctxCwd,
 		getFlag: () => false,
 		notify: vi.fn(),
@@ -107,7 +106,7 @@ function makeDeps(ctxCwd: string) {
 		resetDispatchBaselines: () => {},
 		resetLSPService: () => {},
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	} as any;
+	}) as any;
 }
 
 describe("dispatch availability suppression is reset at session start (#1266)", () => {

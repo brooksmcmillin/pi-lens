@@ -199,6 +199,11 @@ function canonicalizeGuardCommand(command: string): string {
 	let pendingSpace = false;
 	quote = undefined;
 	for (const ch of result) {
+		if (!quote && ch === "\n") {
+			collapsed += ch;
+			pendingSpace = false;
+			continue;
+		}
 		if (!quote && /\s/.test(ch)) {
 			pendingSpace = collapsed.length > 0;
 			continue;
@@ -755,7 +760,7 @@ export function writeGitGuardRecord(
 		Array.isArray(record.affectedFiles) ? record.affectedFiles : [],
 		cwd,
 	);
-	const fileSeqByPath = { ...(record.fileSeqByPath ?? {}) };
+	const fileSeqByPath = { ...record.fileSeqByPath };
 	for (const file of capped.files) {
 		const key = guardPathKey(file, cwd);
 		if (fileSeqByPath[key] === undefined) {

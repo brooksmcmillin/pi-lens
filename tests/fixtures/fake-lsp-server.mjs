@@ -1,6 +1,74 @@
 // Minimal JSON-RPC 2.0 LSP fake server over stdio
 // Used for integration tests — speaks real LSP protocol without actual language smarts
 
+// #2436: parent-death watchdog. A test that spawns this fixture and then
+// dies without running its own cleanup (a SIGKILLed vitest worker fork, a
+// `--force` worktree removal) must not leave this process running forever —
+// a real orphan was found on disk an hour after its parent process no
+// longer existed, holding its worktree directory open. Two independent
+// triggers, because neither alone covers every real teardown shape:
+//
+//   - stdin EOF: the parent's write end of this process's stdio pipe closes
+//     the instant the parent's file descriptors are torn down — true
+//     whether it exits cleanly, crashes, or is SIGKILLed (the OS closes a
+//     dead process's handles/fds unconditionally, pipes included). This
+//     covers the large majority of real teardown paths, INCLUDING a
+//     wedged/paused stdin (`FAKE_LSP_WEDGE_STDIN_AFTER_INIT` calls
+//     `stdin.pause()`, but a paused Readable still delivers the underlying
+//     `end` once the fd itself reports EOF — measured on both Windows and
+//     Linux at well under 100ms after the parent process dies; `pause()`
+//     only stops flowing `data`, it does not block `end`). Set
+//     `FAKE_LSP_SKIP_EOF_EXIT=1` to disable this trigger for a test that
+//     needs to isolate the second trigger below.
+//   - a `process.ppid` liveness poll — the backstop for the ONE shape stdin
+//     EOF cannot cover: a pipe write-end held open by something other than
+//     this process's direct parent (e.g. Windows handle-inheritance capture
+//     by a long-lived process — see the "#472 CORRECTION" comment at
+//     clients/lsp/client.ts:1278-1286). When some other live handle keeps
+//     the write end open, the OS never delivers EOF to this process no
+//     matter how dead the parent is, so stdin alone is not airtight; the
+//     poll is the only trigger that doesn't depend on the pipe staying
+//     closeable at all. POSIX reparents an orphan to init/a subreaper, so a
+//     changed `process.ppid` is itself conclusive; Windows does NOT do this
+//     — `process.ppid` is fixed at process-creation time and never updates
+//     to reflect the live parent, so a bare value comparison is a
+//     POSIX-only signal there. The portable check is whether the ORIGINAL
+//     parent pid is still alive at all: `process.kill(pid, 0)` sends no
+//     signal, it only probes existence (ESRCH means gone) — a syscall
+//     probe, not a spawned `taskkill` (AGENTS.md's "held handle, not a
+//     spawned taskkill" teardown note).
+const PARENT_WATCHDOG_INTERVAL_MS = 1000;
+const initialPpid = process.ppid;
+
+function parentIsAlive() {
+	if (!initialPpid) return true;
+	if (process.ppid !== initialPpid) return false;
+	try {
+		process.kill(initialPpid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+const parentWatchdog = setInterval(() => {
+	if (!parentIsAlive()) {
+		clearInterval(parentWatchdog);
+		process.exit(1);
+	}
+}, PARENT_WATCHDOG_INTERVAL_MS);
+parentWatchdog.unref();
+
+// FAKE_LSP_SKIP_EOF_EXIT=1 disables the stdin-EOF trigger above, isolating
+// the ppid poll so a test can prove IT ALONE reaps a parentless process —
+// see the second case in
+// tests/clients/lsp/fake-lsp-server-parent-watchdog.test.ts.
+if (process.env.FAKE_LSP_SKIP_EOF_EXIT !== "1") {
+	process.stdin.on("end", () => {
+		process.exit(0);
+	});
+}
+
 function encode(message) {
 	const json = JSON.stringify(message);
 	const header = `Content-Length: ${Buffer.byteLength(json, "utf8")}\r\n\r\n`;
@@ -30,6 +98,62 @@ function decodeFrames(buffer) {
 let readBuffer = Buffer.alloc(0);
 let applyEditIdCounter = 9000;
 let pendingExec = null;
+// #2479: the edit spec held back by "fake.applyEditDeferred" until a later
+// "fake.releaseDeferredApplyEdit" call sends it. Lets a test open an
+// executeCommand window, run an UNRELATED nested executeCommand to completion
+// inside it, and only THEN have the outer call's server-initiated applyEdit
+// arrive - the ordering the depth-unwind bug lives in, with no reliance on
+// message-arrival timing.
+let deferredApplyEdit = null;
+
+// #2450 review round 2 (F2): the target line/columns/replacement text are
+// overridable via a second `arguments[1]` object so callers can exercise a real
+// non-{1,1} range - a fixed line-0 edit made every caller's "real range" collide
+// with the {1,1} resource-op/whole-file default, so a test asserting {1,1}
+// passed whether or not the actual range plumbing worked. Omitted fields keep
+// the original line-0/0-5 default, so the pre-existing "applies a
+// server-initiated edit..." tests are unaffected.
+//
+// #2479 review round 2 (S1): declared at MODULE scope, beside the state they
+// read (`applyEditIdCounter`, `deferredApplyEdit`) and beside `send` - they
+// used to sit inside `handle(raw)`, which re-created both closures on every
+// single inbound message and left the block that follows them mis-indented.
+function buildApplyEditSpec(commandArguments) {
+	const uri = commandArguments?.[0];
+	const editOpts = commandArguments?.[1] ?? {};
+	const line = typeof editOpts.line === "number" ? editOpts.line : 0;
+	const startCharacter =
+		typeof editOpts.startCharacter === "number" ? editOpts.startCharacter : 0;
+	const endCharacter =
+		typeof editOpts.endCharacter === "number" ? editOpts.endCharacter : 5;
+	const newText =
+		typeof editOpts.newText === "string" ? editOpts.newText : "EDITED";
+	return { uri, line, startCharacter, endCharacter, newText };
+}
+
+function sendApplyEdit(spec) {
+	send({
+		jsonrpc: "2.0",
+		id: ++applyEditIdCounter,
+		method: "workspace/applyEdit",
+		params: {
+			edit: {
+				changes: {
+					[spec.uri]: [
+						{
+							range: {
+								start: { line: spec.line, character: spec.startCharacter },
+								end: { line: spec.line, character: spec.endCharacter },
+							},
+							newText: spec.newText,
+						},
+					],
+				},
+			},
+		},
+	});
+}
+
 const openDocuments = new Map();
 
 // #1714: a single-threaded scanner with a finite intake ceiling, for the
@@ -243,7 +367,12 @@ function handle(raw) {
 						? { workspace: { fileOperations: workspaceFileOperations } }
 						: {}),
 					executeCommandProvider: {
-						commands: ["fake.doThing", "fake.applyEdit"],
+						commands: [
+							"fake.doThing",
+							"fake.applyEdit",
+							"fake.applyEditDeferred",
+							"fake.releaseDeferredApplyEdit",
+						],
 					},
 					diagnosticProvider: {
 						interFileDependencies: false,
@@ -320,11 +449,31 @@ function handle(raw) {
 		// fixture's burns are visible depends on the discriminator sampling
 		// this same process's cumulative CPU, which both Windows and POSIX
 		// do via kernel counters.
+		//
+		// `FAKE_LSP_BURN_CPU_MS=<n>` is the THIRD profile and the one #2358's
+		// production evidence actually had: the scanner burns a core for a
+		// bounded stretch (draining the burst it was handed) and THEN wedges,
+		// flat and silent. Its CPU history therefore carries a burn the process
+		// is no longer doing — which is exactly what a liveness verdict must not
+		// mistake for progress.
 		if (process.env.FAKE_LSP_WEDGE_STDIN_AFTER_INIT === "1") {
 			process.stdin.pause();
+			const boundedBurnMs = Number(process.env.FAKE_LSP_BURN_CPU_MS ?? "");
 			if (process.env.FAKE_LSP_BURN_CPU_AFTER_INIT === "1") {
 				const burnHandle = setInterval(() => burnCpu(100), 100);
 				process.on("exit", () => clearInterval(burnHandle));
+			} else if (Number.isFinite(boundedBurnMs) && boundedBurnMs > 0) {
+				const burnUntil = Date.now() + boundedBurnMs;
+				const burnHandle = setInterval(() => {
+					if (Date.now() >= burnUntil) {
+						clearInterval(burnHandle);
+						return;
+					}
+					burnCpu(90);
+				}, 100);
+				process.on("exit", () => clearInterval(burnHandle));
+				// Outlives the burn, so the process stays alive and flat after it.
+				setInterval(() => {}, 60_000);
 			} else {
 				setInterval(() => {}, 60_000);
 			}
@@ -674,30 +823,31 @@ function handle(raw) {
 	// result once the client has responded (so tests are race-free).
 	if (data.method === "workspace/executeCommand") {
 		const cmd = data.params?.command;
-		if (cmd === "fake.applyEdit") {
-			const uri = data.params?.arguments?.[0];
-			const applyId = ++applyEditIdCounter;
+		if (cmd === "fake.applyEdit" || cmd === "fake.applyEditDeferred") {
+			const spec = buildApplyEditSpec(data.params?.arguments);
 			pendingExec = { execId: data.id, command: cmd };
+			// #2479: hold the edit until released, so the client-side
+			// executeCommand window stays open across an unrelated nested call.
+			if (cmd === "fake.applyEditDeferred") {
+				deferredApplyEdit = spec;
+				return;
+			}
+			sendApplyEdit(spec);
+			return;
+		}
+		if (cmd === "fake.releaseDeferredApplyEdit") {
+			// Answered immediately; the held edit then rides the STILL-OPEN
+			// window of whichever call armed it (#2479).
 			send({
 				jsonrpc: "2.0",
-				id: applyId,
-				method: "workspace/applyEdit",
-				params: {
-					edit: {
-						changes: {
-							[uri]: [
-								{
-									range: {
-										start: { line: 0, character: 0 },
-										end: { line: 0, character: 5 },
-									},
-									newText: "EDITED",
-								},
-							],
-						},
-					},
-				},
+				id: data.id,
+				result: { ran: cmd, released: deferredApplyEdit !== null },
 			});
+			if (deferredApplyEdit) {
+				const spec = deferredApplyEdit;
+				deferredApplyEdit = null;
+				sendApplyEdit(spec);
+			}
 			return;
 		}
 		send({ jsonrpc: "2.0", id: data.id, result: { ran: cmd } });

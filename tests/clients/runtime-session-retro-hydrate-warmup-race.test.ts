@@ -24,6 +24,7 @@
  * invariant of the warmup's own code, not a timing bet).
  */
 
+import { withResidentBootstrap } from "../support/bootstrap-access.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -38,6 +39,7 @@ import {
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { _resetSubagentModeForTests } from "../../clients/subagent-mode.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
+import { makeLspServiceDouble } from "../support/lsp-service-double.js";
 
 const readLatestProjectSequenceAsyncSpy = vi.hoisted(() => vi.fn());
 const loadProjectSnapshotExportsAndRulesCallTimesMs = vi.hoisted(
@@ -79,16 +81,13 @@ vi.mock("../../clients/lsp/config.js", () => ({
 }));
 
 vi.mock("../../clients/lsp/index.js", () => ({
-	getLSPService: vi.fn(() => ({
-		touchFile: vi.fn().mockResolvedValue(undefined),
-		supportsLSP: () => false,
-	})),
+	getLSPService: vi.fn(() => makeLspServiceDouble()),
 }));
 
 import { handleSessionStart } from "../../clients/runtime-session.js";
 
 function makeDeps(ctxCwd: string, runtime: RuntimeCoordinator) {
-	return {
+	return withResidentBootstrap({
 		ctxCwd,
 		getFlag: () => false,
 		notify: vi.fn(),
@@ -133,7 +132,7 @@ function makeDeps(ctxCwd: string, runtime: RuntimeCoordinator) {
 		cleanStaleTsBuildInfo: () => [],
 		resetDispatchBaselines: () => {},
 		resetLSPService: () => {},
-	} as any;
+	}) as any;
 }
 
 /** A deferred promise the test controls the settle timing of. */

@@ -31,10 +31,12 @@ import {
 	KIND_EXTENSIONS,
 } from "../file-kinds.js";
 import {
+	CARGO_WORKSPACE_MEMBER_DIALECT,
 	direntsHaveMarkerGlobMatch,
 	isAtOrAboveHomeDir,
 	isFullyQualified,
 	isWindowsPath,
+	matchesWorkspaceMemberPattern,
 	pathsEqual,
 } from "../path-utils.js";
 import {
@@ -59,6 +61,12 @@ import { logSessionStart } from "../sessionstart-logger.js";
 import { findLocalSgconfig, resolveBaselineSgconfig } from "../sgconfig.js";
 import { findLocalTyposConfig } from "../typos-config.js";
 import { resolvePackagePath } from "../package-root.js";
+import {
+	hasCargoWorkspaceTable,
+	readCargoWorkspaceExclude,
+	readCargoWorkspaceMembers,
+	readTextFileOrUndefined,
+} from "../cargo-manifest.js";
 import { resolveAstGrepNativeExe } from "./wait-policy/index.js";
 import {
 	hasSpawnFailureKind,
@@ -2463,87 +2471,6 @@ export const GoServer: LSPServerInfo = {
 	},
 };
 
-async function readTextFileOrUndefined(
-	filePath: string,
-): Promise<string | undefined> {
-	try {
-		return await readFile(filePath, "utf-8");
-	} catch {
-		return undefined;
-	}
-}
-
-/**
- * Slice out ONE top-level TOML table's raw body — from its `[name]` heading
- * to the next top-level `[...]`/`[[...]]` heading or EOF. `members`/`exclude`
- * must be read from the `[workspace]` table specifically: `[package]` has its
- * OWN `exclude` key (the standard cargo-publish exclude list, conventionally
- * written above `[workspace]` in a virtual-manifest-less root crate), and a
- * whole-file regex would misread it as workspace membership (#1671 F4).
- */
-function extractTomlTableSection(content: string, tableName: string): string {
-	const heading = new RegExp(`^\\[${tableName}\\][ \\t]*(?:#.*)?$`, "m");
-	const match = heading.exec(content);
-	if (!match) return "";
-	const rest = content.slice(match.index + match[0].length);
-	const nextHeading = rest.match(/^\[{1,2}[^\]]+\]{1,2}[ \t]*(?:#.*)?$/m);
-	return nextHeading?.index !== undefined
-		? rest.slice(0, nextHeading.index)
-		: rest;
-}
-
-function parseTomlStringArray(content: string, key: string): string[] {
-	const match = content.match(
-		new RegExp(`^[ \\t]*${key}[ \\t]*=[ \\t]*\\[([\\s\\S]*?)\\]`, "m"),
-	);
-	if (!match) return [];
-	return [...match[1].matchAll(/"([^"]*)"|'([^']*)'/g)].map((m) =>
-		(m[1] ?? m[2] ?? "").trim(),
-	);
-}
-
-/** Turn one `/`-delimited glob SEGMENT into a regex source: `*` matches any
- * run of characters within the segment, `?` matches exactly one character,
- * everything else is escaped and literal. */
-function segmentGlobToRegExpSource(segment: string): string {
-	let out = "";
-	for (const ch of segment) {
-		if (ch === "*") out += "[^/]*";
-		else if (ch === "?") out += "[^/]";
-		else out += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
-	}
-	return out;
-}
-
-/**
- * A `members`/`exclude` entry names a path exactly, or globs it segment by
- * segment: `*` and `?` inside a segment work at any depth — one wildcard
- * segment (`crates/*`), a bare `*`, or several chained together for a
- * deeper fixed-depth layout — matching cargo's own `glob`-crate semantics
- * for a fixed number of path components.
- *
- * KNOWN LIMITATION (#1671 F6, documented rather than implemented): a
- * recursive `**` segment (matching a variable number of path components) is
- * NOT supported and never matches — cargo workspaces that rely on `**` to
- * pull in an arbitrarily-nested crate tree will under-hoist (the crate stays
- * independently rooted instead of joining the workspace). This is
- * deliberately out of #1671's scope: the common, and the issue's fixture,
- * shape is an explicit fixed-depth `members` list.
- */
-function matchesCargoWorkspacePattern(
-	pattern: string,
-	relativePath: string,
-): boolean {
-	const normalized = pattern.replace(/\/+$/, "");
-	if (normalized.includes("**")) return false;
-	const patternSegments = normalized.split("/");
-	const pathSegments = relativePath.split("/");
-	if (patternSegments.length !== pathSegments.length) return false;
-	return patternSegments.every((segment, i) =>
-		new RegExp(`^${segmentGlobToRegExpSource(segment)}$`).test(pathSegments[i]),
-	);
-}
-
 /**
  * Given an ancestor Cargo.toml's raw contents that already contains a
  * `[workspace]` table, decide whether it actually claims `childDir` as a
@@ -2573,22 +2500,25 @@ function cargoWorkspaceDeclaresMember(
 		.split(path.sep)
 		.join("/");
 	if (relativePath === "" || relativePath.startsWith("..")) return false;
-	const workspaceSection = extractTomlTableSection(
-		workspaceContent,
-		"workspace",
-	);
-	const excluded = parseTomlStringArray(workspaceSection, "exclude");
-	if (
-		excluded.some((pattern) =>
-			matchesCargoWorkspacePattern(pattern, relativePath),
-		)
-	) {
-		return false;
-	}
-	const members = parseTomlStringArray(workspaceSection, "members");
-	return members.some((pattern) =>
-		matchesCargoWorkspacePattern(pattern, relativePath),
-	);
+	// Reuse the shared, `[workspace]`-scoped readers (review round 2, F4)
+	// instead of hand-composing `extractTomlTableSection` +
+	// `parseTomlStringArray` here — that hand-composition duplicated exactly
+	// what `readCargoWorkspaceMembers`/`readCargoWorkspaceExclude` do, the
+	// single-source-of-truth violation #2473 was filed to close for the OTHER
+	// two Cargo.toml readers. Pattern matching goes through the ONE
+	// workspace-member matcher for the same reason (#2591); cargo's dialect —
+	// `**` never matches (#1671 F6), wildcards confined to one component, so
+	// pattern and path must have the same component count — is
+	// `CARGO_WORKSPACE_MEMBER_DIALECT`, not a private compiler here.
+	const matches = (pattern: string): boolean =>
+		matchesWorkspaceMemberPattern(
+			pattern,
+			relativePath,
+			CARGO_WORKSPACE_MEMBER_DIALECT,
+		);
+	const excluded = readCargoWorkspaceExclude(workspaceContent);
+	if (excluded.some(matches)) return false;
+	return readCargoWorkspaceMembers(workspaceContent).some(matches);
 }
 
 /**
@@ -2632,7 +2562,7 @@ function RustWorkspaceRoot(): RootFunction {
 			const parentCargoContent = await readTextFileOrUndefined(parentCargoPath);
 			if (
 				parentCargoContent !== undefined &&
-				/^\s*\[workspace\]/m.test(parentCargoContent)
+				hasCargoWorkspaceTable(parentCargoContent)
 			) {
 				// Test membership against the ORIGINAL crate dir (`root`), never the
 				// walk cursor (`current`, which may already have climbed through
@@ -3808,7 +3738,6 @@ const AST_GREP_KINDS = [
 	"rust",
 	"scala",
 	"shell",
-	"solidity",
 	"swift",
 	"yaml",
 ] as const;

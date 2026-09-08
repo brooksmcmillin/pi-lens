@@ -53,6 +53,31 @@ so the final state is formatter-stable. A `write` immediately followed by an
 deferred too. See `clients/pipeline.ts`, `clients/runtime-tool-result.ts`, and
 `clients/runtime-agent-end.ts`.
 
+A tool pi-lens does not name is classified by the SHAPE of its arguments
+(`clients/mutating-tool.ts`). A host or extension edit tool called `replace` or
+`insert` therefore gets a turn-state entry, a change-log receipt attributed to
+the tool itself, and the deferred autofix and format pass — the same chain
+`edit` gets. Its lines are resolved when the anchor is unambiguous (roughly
+two-thirds of anchors in practice — `clients/hashline-anchor.ts`); otherwise
+the mutation is recorded whole-file with lines unknown, and the
+read-before-edit guard takes its no-line-info arm rather than guessing.
+Deferred is the default for any edit-shaped tool pi-lens cannot place, because
+formatting between the calls of a multi-step rewrite fights the tool that is
+still writing. A tool whose SHAPE is unrecognized too is caught by observation:
+pi-lens takes a bounded snapshot of the path that call names — and only that
+path, so a change to a neighbouring file is never blamed on it — replays
+whatever actually changed through the same chain, then remembers that tool as
+mutating for the session, and on disk under the project's data directory once a
+second observation confirms it, so later sessions classify it by name with no
+snapshot at all. A tool that names no file is caught at `agent_settled` by an
+incremental content check over the files pi-lens has already read, written,
+diagnosed or opened on a language server: a rotating window of the set each
+turn, reading only the files whose size or timestamp actually moved, so the
+check stays affordable as the set grows. A file it has never seen has no
+baseline and is therefore not covered, and a file it cannot verify is named
+rather than reformatted on a timestamp alone
+(`clients/observed-mutation.ts`).
+
 **Bundled fallback lint configs stay conservative.** When a project ships no
 tool config, the package-owned fallback configs set the rules (`config/biome/core.jsonc`,
 `config/ruff/core.toml`, `config/markdownlint/core.json`). The biome fallback
@@ -152,12 +177,14 @@ pi-lens MCP server expose the same shape to Claude Code / any MCP client.
 
 ### Actionable Warnings
 
-At `turn_end`, pi-lens writes `.pi-lens/cache/actionable-warnings.json` summarizing fixable warnings introduced by the current turn. This powers the optional conservative autofix at `agent_end`.
+At `turn_end`, pi-lens writes `<project-data-dir>/cache/actionable-warnings.json` summarizing fixable warnings introduced by the current turn. This powers the optional conservative autofix at `agent_end`.
+
+`<project-data-dir>` is whatever `getProjectDataDir(cwd)` resolves to: `<project>/.pi-lens` only when that legacy directory already exists, otherwise `~/.pi-lens/projects/<project-slug>` (or a `PILENS_DATA_DIR` location). The turn-end advisory points at `lens_diagnostics mode=delta` first and names the resolved file second, so you never have to work the layout out by hand (#2521).
 
 **Report contents:**
 
 - Warnings are delta-only by default: only diagnostics in lines touched during the current turn are included. Pass `--lens-actionable-warning-all` to report all warnings regardless of location
-- Each warning carries a stable `aw:<hash>` ID derived from file, rule, and message, so suppression state persists across turns in `.pi-lens/cache/actionable-warning-state.json`
+- Each warning carries a stable `aw:<hash>` ID derived from file, rule, and message, so suppression state persists across turns in `<project-data-dir>/cache/actionable-warning-state.json`
 - Sources: pipeline `fixable` diagnostics (always included) and LSP code-action warnings when `--lens-actionable-warning-actions` is set
 - When warnings are present, a concise advisory is injected into the agent context (no blocker language)
 
@@ -366,14 +393,14 @@ pi-lens ships an MCP (Model Context Protocol) server so Claude Code — or any M
 
 **Why a second host:** the pi extension's tools are registered via the host SDK and run on pi's event loop. Claude Code lives in a different process with no SDK access. The MCP server sits in that gap, speaking JSON-RPC over stdio (or a warm Unix socket / Windows named pipe side-channel for the Claude Code PostToolUse hook). It's the easiest way to live-test, debug, and dogfood pi-lens — including running a **review loop** where Claude commits to pi-lens and re-measures.
 
-**16 tools, grouped by lifecycle layer** (the same three layers the pi agent hooks use):
+**18 tools, grouped by lifecycle layer** (the same three layers the pi agent hooks use):
 
 | Layer | MCP tools | What they expose |
 |---|---|---|
-| **Per-edit** | `pilens_analyze`, `pilens_lsp_diagnostics`, `pilens_lsp_navigation`, `pilens_ast_grep_search`, `pilens_ast_grep_replace`, `pilens_module_report`, `pilens_read_symbol` | The fast pipeline (format → autofix → LSP diagnostics → parallel runners) plus the structured read-substitute pair. `analyze` accepts `mode: warm \| fresh` — `warm` reuses the server's in-process LSP, `fresh` forks a worker that loads freshly-built code from disk so the result reflects the latest commit. |
+| **Per-edit** | `pilens_analyze`, `pilens_lsp_diagnostics`, `pilens_lsp_navigation`, `pilens_ast_grep_search`, `pilens_ast_grep_replace`, `pilens_module_report`, `pilens_read_symbol`, `pilens_read_enclosing` | The fast pipeline (format → autofix → LSP diagnostics → parallel runners) plus the structured read-substitute pair. `analyze` accepts `mode: warm \| fresh` — `warm` reuses the server's in-process LSP, `fresh` forks a worker that loads freshly-built code from disk so the result reflects the latest commit. |
 | **Per-turn** | `pilens_turn_end` | Drives the **real** `handleTurnEnd` (knip incremental, dep-circular, cascade, tests, actionable+code-quality warnings) — not a re-implementation. Caller-supplied edited files are auto-registered into turn-state via `addModifiedRange`. |
 | **Per-session** | `pilens_session_start` | Drives the **real** `handleSessionStart` — full jscpd/knip/madge/govulncheck/gitleaks/trivy scans + complexity baselines + LSP warm. The error-debt baseline is not currently populated by the production session-start path. |
-| **Project / observability** | `pilens_project_scan`, `pilens_diagnostics`, `pilens_health`, `pilens_latency`, `pilens_symbol_search` | Cheap project-wide scans, cached diagnostic state, latency telemetry, ranked identifier search (BM25 over the persisted word index — see [docs/word-index.md](word-index.md)). Cross-file blast radius now lives in `pilens_module_report`'s `blastRadius` option. `pilens_health` (and its pi-side `/lens-health` counterpart) also reports a bounded, process-local **degradation ledger** — trust refusals, mode suppressions, LSP breaker trips, formatter skips/failures, TypeScript/word-index/review-graph/project-snapshot idle evictions, WASM aborts, and diagnostics-timeout tallies — so silently degraded behavior stays visible instead of vanishing into a log. |
+| **Project / observability** | `pilens_project_scan`, `pilens_project_report`, `pilens_diagnostics`, `pilens_health`, `pilens_latency`, `pilens_symbol_search`, `pilens_effective_config` | Cheap project-wide scans, cached diagnostic state, latency telemetry, ranked identifier search (BM25 over the persisted word index — see [docs/word-index.md](word-index.md)). Cross-file blast radius now lives in `pilens_module_report`'s `blastRadius` option. `pilens_health` (and its pi-side `/lens-health` counterpart) also reports a bounded, process-local **degradation ledger** — trust refusals, mode suppressions, LSP breaker trips, formatter skips/failures, TypeScript/word-index/review-graph/project-snapshot idle evictions, WASM aborts, and diagnostics-timeout tallies — so silently degraded behavior stays visible instead of vanishing into a log. `pilens_effective_config` answers **“why is X running / why is X not running”** from one query — the resolved configuration with the provenance of every setting, and for a file you name, its language plus every LSP server with the reason it was selected or denied and the runners that would dispatch. It reports sources, never values. |
 | **Lifecycle / loop** | `pilens_rebuild` | Runs `npm run build:dist` so `pilens_analyze mode=fresh` reflects the latest commit. Makes the review loop self-contained: commit → `pilens_rebuild` → `pilens_analyze mode=fresh` → `pilens_latency`. |
 
 **Honest limits** (live-tested, documented in `mcp.md`):

@@ -36,7 +36,7 @@ import {
 } from "../path-utils.js";
 import { collectProjectSourceFilesWithBudgetAsync } from "../project-scan-policy.js";
 import { getReviewGraphMaxFilesDerived } from "../project-scale.js";
-import { compareOrdinal } from "../string-utils.js";
+import { compareOrdinal, escapeRegExp } from "../string-utils.js";
 import { BoundedLruCache } from "../bounded-cache.js";
 import {
 	jsTsCandidatePaths,
@@ -63,6 +63,7 @@ import {
 import { getSharedTreeSitterClient } from "../tree-sitter-shared.js";
 import {
 	type ExtractedSymbols,
+	symbolExtractionGrammar,
 	TreeSitterSymbolExtractor,
 } from "../tree-sitter-symbol-extractor.js";
 import { withTreeSitterRoot } from "../tree-sitter-shared.js";
@@ -153,9 +154,7 @@ const MAIN_KINDS = new Set([
 const MAIN_KIND_EXTENSIONS: string[] = Array.from(MAIN_KINDS).flatMap(
 	(kind) => KIND_EXTENSIONS[kind as keyof typeof KIND_EXTENSIONS] ?? [],
 );
-/** The bounded, source-filtered extension set shared by graph cache readers. */
-export const REVIEW_GRAPH_SOURCE_EXTENSIONS: readonly string[] =
-	MAIN_KIND_EXTENSIONS;
+
 const CHANGED_SYMBOLS_PREFIX = "session.reviewGraph.changedSymbols:";
 const extractorCache = new Map<string, TreeSitterSymbolExtractor | null>();
 const REVIEW_GRAPH_MAX_WARM_WORKSPACES = 8;
@@ -170,17 +169,17 @@ interface SourcePathMemo {
 	cache: BoundedLruCache<string, string>;
 	normalizeCalls: { value: number };
 }
-const _sourcePathMemos = new Map<string, SourcePathMemo>();
+// BoundedLruCache, not BoundedFifoMap: a hit here must refresh the workspace's
+// recency (the hand-rolled version did its own delete+set for exactly that),
+// so a workspace still being built is never the one evicted (#2442).
+const _sourcePathMemos = new BoundedLruCache<string, SourcePathMemo>(
+	REVIEW_GRAPH_MAX_WARM_WORKSPACES,
+);
 
 function sourcePathMemo(cwd: string): SourcePathMemo {
 	const key = normalizeMapKey(path.resolve(cwd));
 	const existing = _sourcePathMemos.get(key);
-	if (existing) {
-		// The workspace map is also bounded LRU; a hit must refresh its recency.
-		_sourcePathMemos.delete(key);
-		_sourcePathMemos.set(key, existing);
-		return existing;
-	}
+	if (existing) return existing;
 	const memo: SourcePathMemo = {
 		cache: new BoundedLruCache<string, string>(
 			REVIEW_GRAPH_SOURCE_PATH_MEMO_ENTRIES,
@@ -188,11 +187,6 @@ function sourcePathMemo(cwd: string): SourcePathMemo {
 		normalizeCalls: { value: 0 },
 	};
 	_sourcePathMemos.set(key, memo);
-	while (_sourcePathMemos.size > REVIEW_GRAPH_MAX_WARM_WORKSPACES) {
-		const oldest = _sourcePathMemos.keys().next().value;
-		if (oldest === undefined) break;
-		_sourcePathMemos.delete(oldest);
-	}
 	return memo;
 }
 
@@ -632,7 +626,7 @@ export function estimateReviewGraphStoreBytes(
 // cleared). Bounding only the cache left the full graph resident on the fact, so
 // both sites go through `retainedGraph` below, memoized per graph instance so the
 // two sites share ONE bounded object instead of trimming twice (#2255 review F2).
-export const GRAPH_MAX_IN_MEMORY_BYTES_DEFAULT = 512 * 1024 * 1024;
+const GRAPH_MAX_IN_MEMORY_BYTES_DEFAULT = 512 * 1024 * 1024;
 
 function graphMaxInMemoryBytes(): number {
 	const raw = Number(process.env.PI_LENS_GRAPH_MAX_IN_MEMORY_BYTES);
@@ -1118,10 +1112,6 @@ function makeCtx(
 	};
 }
 
-function escapeRegExp(string: string): string {
-	return string.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 function createEmptyGraph(): ReviewGraph {
 	return {
 		version: REVIEW_GRAPH_VERSION,
@@ -1287,7 +1277,7 @@ function diffSignatureMaps(
 // `RUNTIME_CONFIG.reviewGraph.maxFiles` constant as the fallback — the ratio
 // table reproduces that same 1,000-file default at the default base, so this
 // is behavior-neutral when nothing is configured.
-export function getReviewGraphMaxFiles(cwd?: string): number {
+function getReviewGraphMaxFiles(cwd?: string): number {
 	const override = Number.parseInt(
 		process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES ?? "",
 		10,
@@ -3400,7 +3390,7 @@ export function _readReviewGraphCheckpointForTests(cwd: string): {
 
 /** Test hook: force any pending debounced persist to write immediately. */
 export function flushReviewGraphPersistsForTests(): void {
-	for (const key of [..._pendingPersist.keys()]) {
+	for (const key of _pendingPersist.keys()) {
 		const pending = _pendingPersist.get(key);
 		if (!pending) continue;
 		_pendingPersist.delete(key);
@@ -3488,7 +3478,7 @@ export function flushReviewGraphPersist(
 	let pending = _pendingPersist.get(key);
 	const removedWorkerRequests: PendingPersist[] = [];
 	let selectedWorkerRequest: PendingPersist | undefined;
-	for (const [id, request] of [..._workerRequests]) {
+	for (const [id, request] of _workerRequests) {
 		if (request.key !== key) continue;
 		_workerRequests.delete(id);
 		removedWorkerRequests.push(request.pending);
@@ -3979,48 +3969,16 @@ function addJsTsFile(
 	}
 }
 
-function mapKindToTreeSitterLanguage(
+// The review graph's kind -> tree-sitter grammar answer. Delegates to the
+// registry-derived resolver (#2424): this used to be a hand-written switch that
+// re-derived the `.c`/`.h` split inline and drifted from the ext -> grammar
+// authority. Exported for the language-identity golden snapshot
+// (scripts/gen-language-snapshot.mjs).
+export function mapKindToTreeSitterLanguage(
 	kind: string | undefined,
 	filePath?: string,
 ): string | undefined {
-	switch (kind) {
-		case "python":
-			return "python";
-		case "go":
-			return "go";
-		case "rust":
-			return "rust";
-		case "ruby":
-			return "ruby";
-		case "cxx": {
-			const ext = filePath ? path.extname(filePath).toLowerCase() : "";
-			return ext === ".c" || ext === ".h" ? "c" : "cpp";
-		}
-		case "java":
-			return "java";
-		case "kotlin":
-			return "kotlin";
-		case "dart":
-			return "dart";
-		case "elixir":
-			return "elixir";
-		case "csharp":
-			return "csharp";
-		case "php":
-			return "php";
-		case "swift":
-			return "swift";
-		case "lua":
-			return "lua";
-		case "ocaml":
-			return "ocaml";
-		case "zig":
-			return "zig";
-		case "shell":
-			return "bash";
-		default:
-			return undefined;
-	}
+	return symbolExtractionGrammar(kind, filePath);
 }
 
 async function getExtractor(
@@ -4353,7 +4311,7 @@ function addTreeSitterFile(
  * SymbolInformation results (including native TypeScript 7) recover the same
  * containment through `containerName` when the owner is present in the result.
  */
-export function addLspFallbackSymbols(
+function addLspFallbackSymbols(
 	graph: ReviewGraph,
 	filePath: string,
 	languageId: string,

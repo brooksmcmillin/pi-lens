@@ -74,13 +74,12 @@ import {
 } from "./atomic-write-staging.js";
 import { acquireQuarantinePidFileLock } from "./bounded-pid-file-lock.js";
 import {
-	type SpawnCollectResult,
 	type SpawnCollectStatus,
 	type SpawnTimeoutKill,
-	spawnCollectStdoutResult,
 	unrefChildAndPipes,
 } from "./child-unref.js";
 import {
+	type DegradationKind,
 	incrementDegradationCount,
 	recordDegradationOnce,
 } from "./degradation-ledger.js";
@@ -92,6 +91,7 @@ import {
 	readInstanceRegistry,
 } from "./instance-registry.js";
 import { logLatency } from "./latency-logger.js";
+import { queryProcessTable, windowsExe } from "./process-snapshot.js";
 
 const isWindows = process.platform === "win32";
 
@@ -101,7 +101,7 @@ export interface ChildToKill {
 	command: string;
 }
 
-export interface MarkerSearch {
+interface MarkerSearch {
 	marker: string;
 	serverId: string;
 }
@@ -347,36 +347,14 @@ export async function sweepAtomicWriteStages(
 	return sweepOwnStagingFiles(directories, { maxEntries, isPidAlive });
 }
 
-export function windowsExe(name: string): string {
-	return path.join(
-		process.env.SystemRoot ?? String.raw`C:\Windows`,
-		"System32",
-		name,
-	);
-}
-
-/** Resolve an absolute path to `ps` (S4036: never spawn via bare PATH lookup).
- *  Prefers `/bin/ps` (present on virtually every POSIX system), falls back to
- *  `/usr/bin/ps`, and defaults back to `/bin/ps` if neither probe succeeds
- *  (spawn will then fail closed rather than silently resolving via PATH). */
-function posixPsPath(): string {
-	if (fs.existsSync("/bin/ps")) return "/bin/ps";
-	if (fs.existsSync("/usr/bin/ps")) return "/usr/bin/ps";
-	return "/bin/ps";
-}
-
-/** Escape a value for embedding in a WQL LIKE clause: WQL uses `'` as the
- *  string delimiter (doubled to escape) and `%`/`_` as wildcards — the marker
- *  is an opaque path string, so escape all three before interpolating. */
-function escapeWqlLikeValue(value: string): string {
-	return value.replaceAll("'", "''").replaceAll(/[%_]/g, (ch) => `[${ch}]`);
-}
-
-/** Escape a value for a WQL EQUALITY comparison: only the string delimiter
- *  needs escaping — `%`/`_` are literal outside `LIKE`. */
-function escapeWqlStringValue(value: string): string {
-	return value.replaceAll("'", "''");
-}
+/**
+ * Interpreter resolution, WQL escaping and the platform listing itself all
+ * live in the ONE process-table seam (#2443): `scripts/lib/process-scan.mjs`,
+ * reached from clients/ through `clients/process-snapshot.ts`. This file used
+ * to carry its own copy of each, which is how the three queries below drifted
+ * apart from the two in `clients/resource-sampler.ts` and the two in
+ * `scripts/`. `windowsExe` is re-exported by the seam and imported above.
+ */
 
 /** Search running processes whose command line contains `marker` (Windows,
  *  via CIM/WQL). Returns matching pids. Best-effort: any failure ⇒ [], but a
@@ -385,19 +363,29 @@ function escapeWqlStringValue(value: string): string {
  *  tells them apart. */
 async function findPidsByMarkerWindows(marker: string): Promise<number[]> {
 	if (!isWindows || !marker) return [];
-	const escaped = escapeWqlLikeValue(marker);
-	// $PID exclusion: the query's own powershell.exe command line embeds the
-	// marker string, so it would match itself.
-	const psScript =
-		`Get-CimInstance Win32_Process -Filter "CommandLine LIKE '%${escaped}%'" ` +
-		`| Where-Object { $_.ProcessId -ne $PID } ` +
-		`| Select-Object -ExpandProperty ProcessId`;
-	const powershell = windowsExe("WindowsPowerShell\\v1.0\\powershell.exe");
-	const result = await spawnCollectStdoutResult(
-		powershell,
-		["-NoProfile", "-NonInteractive", "-Command", psScript],
-		{ shell: false, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] },
-		{ timeoutMs: BACKSTOP_SCAN_TIMEOUT_MS },
+	const result = await queryProcessTable(
+		{
+			fields: ["pid"],
+			filter: { column: "CommandLine", op: "like", values: [marker] },
+			// The query's own powershell.exe command line embeds the marker, so
+			// without this exclusion the search matches itself.
+			excludeSelfPid: true,
+		},
+		{
+			timeoutMs: BACKSTOP_SCAN_TIMEOUT_MS,
+			// #2527 review F2: omitting `onTimeout` falls through to
+			// child-unref.ts's default — one bare, unverified `child.kill()`, no
+			// tree kill, no identity-carrying record — inside the orphan backstop
+			// path, the exact abandonment `terminateScannerChild`'s own doc
+			// comment says it exists to prevent. This query shares the backstop's
+			// scanner identity and budget (same producer as
+			// `enumerateManagedProcesses`), so it gets the same kind.
+			onTimeout: (child) =>
+				terminateScannerChild(child, {
+					kind: "orphan-backstop-scanner-escalated",
+					timeoutMs: BACKSTOP_SCAN_TIMEOUT_MS,
+				}),
+		},
 	);
 	if (result.status !== "ok") {
 		recordDegradationOnce({
@@ -406,10 +394,7 @@ async function findPidsByMarkerWindows(marker: string): Promise<number[]> {
 			reason: `marker command-line search ${result.status}`,
 		});
 	}
-	return result.stdout
-		.split(/\r?\n/)
-		.map((line) => Number(line.trim()))
-		.filter((n) => Number.isFinite(n) && n > 0);
+	return result.rows.map((row) => row.pid);
 }
 
 /** Fetch command lines for a set of pids in one query (Windows: CIM; POSIX:
@@ -426,62 +411,38 @@ async function queryCommandLines(pids: number[]): Promise<Map<number, string>> {
 	const valid = [...new Set(pids.filter((p) => Number.isFinite(p) && p > 0))];
 	const map = new Map<number, string>();
 	if (valid.length === 0) return map;
-	const noteFailure = (status: SpawnCollectStatus) => {
-		if (status === "ok") return;
+	const result = await queryProcessTable(
+		{
+			fields: ["pid", "command"],
+			filter: { column: "ProcessId", op: "eq", values: valid },
+		},
+		{
+			timeoutMs: BACKSTOP_SCAN_TIMEOUT_MS,
+			// #2527 review F2: same rationale as findPidsByMarkerWindows above —
+			// route through the reaper's own tree-kill-and-verify machinery with
+			// the backstop's kind rather than falling through to the unverified
+			// default kill with no ledger record.
+			onTimeout: (child) =>
+				terminateScannerChild(child, {
+					kind: "orphan-backstop-scanner-escalated",
+					timeoutMs: BACKSTOP_SCAN_TIMEOUT_MS,
+				}),
+		},
+	);
+	// POSIX `ps -p` exits nonzero when NONE of the requested pids exist, which
+	// is a legitimate clean result for this caller, so that one status is not
+	// recorded on that platform. The shared collector calls it an exit failure;
+	// this caller's command contract makes it the expected empty table. Windows
+	// CIM has no such convention, so an exit failure there is a real failure.
+	const psReportedNoSuchPid = !isWindows && result.status === "exit-error";
+	if (result.status !== "ok" && !psReportedNoSuchPid) {
 		recordDegradationOnce({
 			kind: "orphan-backstop-scan-failed",
 			subject: "identity-query",
-			reason: `command-line identity query ${status}; reap suppressed this sweep`,
+			reason: `command-line identity query ${result.status}; reap suppressed this sweep`,
 		});
-	};
-	if (isWindows) {
-		const filter = valid.map((p) => `ProcessId=${p}`).join(" OR ");
-		const psScript =
-			`Get-CimInstance Win32_Process -Filter "${filter}" ` +
-			`| ForEach-Object { "$($_.ProcessId)\t$($_.CommandLine)" }`;
-		const powershell = windowsExe("WindowsPowerShell\\v1.0\\powershell.exe");
-		const result = await spawnCollectStdoutResult(
-			powershell,
-			["-NoProfile", "-NonInteractive", "-Command", psScript],
-			{ shell: false, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] },
-			{ timeoutMs: BACKSTOP_SCAN_TIMEOUT_MS },
-		);
-		noteFailure(result.status);
-		for (const line of result.stdout.split(/\r?\n/)) {
-			const tab = line.indexOf("\t");
-			if (tab <= 0) continue;
-			const pid = Number(line.slice(0, tab).trim());
-			if (Number.isFinite(pid) && pid > 0) map.set(pid, line.slice(tab + 1));
-		}
-		return map;
 	}
-	const result = await spawnCollectStdoutResult(
-		posixPsPath(),
-		["-p", valid.join(","), "-o", "pid=,args="],
-		{ shell: false, stdio: ["ignore", "pipe", "ignore"] },
-		{ timeoutMs: BACKSTOP_SCAN_TIMEOUT_MS },
-	);
-	// `ps -p` exits nonzero when NONE of the pids exist, which is a legitimate
-	// clean result here, so only spawn/timeout failures are recorded. The
-	// shared collector calls that an exit failure, but this caller's command
-	// contract makes that status the expected empty-table result.
-	if (result.status !== "exit-error") noteFailure(result.status);
-	for (const line of result.stdout.split(/\r?\n/)) {
-		// Linear parse (S8786/S6594: avoid regex backtracking on
-		// attacker-lengthenable ps output) — trim leading whitespace,
-		// then split on the first whitespace run: "  1234 args here".
-		const trimmed = line.trimStart();
-		if (!trimmed) continue;
-		let i = 0;
-		while (i < trimmed.length && trimmed[i] >= "0" && trimmed[i] <= "9") i++;
-		if (i === 0) continue;
-		const pidStr = trimmed.slice(0, i);
-		let j = i;
-		while (j < trimmed.length && (trimmed[j] === " " || trimmed[j] === "\t"))
-			j++;
-		const pid = Number(pidStr);
-		if (Number.isFinite(pid) && pid > 0) map.set(pid, trimmed.slice(j));
-	}
+	for (const row of result.rows) map.set(row.pid, row.command);
 	return map;
 }
 
@@ -522,13 +483,13 @@ export function buildIdentityMatcher(
  * a permanently unkillable process read exactly like a successful reap while
  * paying the full sweep cost every session.
  */
-export type KillOutcome = "gone" | "alive" | "invalid";
+type KillOutcome = "gone" | "alive" | "invalid";
 
 /** Post-kill liveness poll budget. `taskkill /F /T` returns before the kernel
  *  has finished tearing the tree down, so a single immediate check would
  *  report false `alive`s. */
-export const KILL_VERIFY_ATTEMPTS = 5;
-export const KILL_VERIFY_INTERVAL_MS = 100;
+const KILL_VERIFY_ATTEMPTS = 5;
+const KILL_VERIFY_INTERVAL_MS = 100;
 
 /** `setTimeout` as an awaitable, with the timer unref'd so a settled one-shot
  *  `pi --print` never waits on best-effort kill verification. */
@@ -539,7 +500,7 @@ function sleepUnref(ms: number): Promise<void> {
 	});
 }
 
-export interface KillPidTreeOptions {
+interface KillPidTreeOptions {
 	isPidAlive?: (pid: number) => boolean;
 	verifyAttempts?: number;
 	verifyIntervalMs?: number;
@@ -627,7 +588,7 @@ async function verifyPidGone(
  * (script path), not the process image name, exactly like the existing
  * marker-search's WQL LIKE query below.
  */
-export const MANAGED_BINARIES: readonly ManagedBinary[] = [
+const MANAGED_BINARIES: readonly ManagedBinary[] = [
 	{ name: "ast-grep", launcher: "native" },
 	{ name: "opengrep-core", launcher: "native" },
 	{ name: "opengrep", launcher: "native" },
@@ -645,7 +606,7 @@ export const MANAGED_BINARIES: readonly ManagedBinary[] = [
  * `native` entry runs as `<name>.exe`, a `node` entry runs as `node.exe`
  * with the script path on its command line.
  */
-export interface ManagedBinary {
+interface ManagedBinary {
 	name: string;
 	launcher: "native" | "node";
 }
@@ -805,9 +766,10 @@ export function partitionBackstopCandidates(
 
 /** Enumerate live OS processes whose command line contains one of
  *  `MANAGED_BINARY_NAMES` (#658), independent of the instance registry.
- *  Windows: one batched CIM/WQL query (mirrors `findPidsByMarkerWindows`'s
- *  query pattern). POSIX: `ps -eo pid=,ppid=,args=`, filtered in JS. Returns
- *  `{pid, parentPid, command}` rows. Best-effort: any failure ⇒ []. */
+ *  One projected process-table query through the shared seam, narrowed to
+ *  managed binaries in JS; returns `{pid, parentPid, command, ageMs}` rows.
+ *  Best-effort: any failure ⇒ [], with the scan status carried alongside so
+ *  an empty table is never mistaken for a scan that did not run. */
 async function enumerateManagedProcesses(
 	options: {
 		timeoutMs?: number;
@@ -815,99 +777,44 @@ async function enumerateManagedProcesses(
 		verifyIntervalMs?: number;
 	} = {},
 ): Promise<ManagedProcessScan> {
-	const timeoutMs = options.timeoutMs ?? BACKSTOP_SCAN_TIMEOUT_MS;
-	const collect = {
-		timeoutMs,
-		onTimeout: (child: ChildProcess) => terminateScannerChild(child, options),
-	};
-	if (isWindows) {
-		// #1857: `Name = '…'` equality replaces eight leading-wildcard
-		// `CommandLine LIKE '%…%'` clauses, and the query now also projects
-		// `CreationDate` so the spawn-grace guard has an age to work with. The
-		// image-name set is DERIVED from MANAGED_BINARIES (MANAGED_IMAGE_NAMES),
-		// so adding a managed binary cannot leave a stale parallel list behind.
-		const clauses = MANAGED_IMAGE_NAMES.map(
-			(name) => `Name = '${escapeWqlStringValue(name)}'`,
-		).join(" OR ");
-		// The age column is computed IN PowerShell as a millisecond delta, not
-		// exported as `CreationDate.Ticks`. `Ticks` is the LOCAL-time
-		// representation, so subtracting the Unix epoch in JS produced an age
-		// wrong by the machine's UTC offset — measured on a UTC+3 host as
-		// -8358s for a process started 40 minutes earlier. A delta computed on
-		// one side of the boundary has no timezone to get wrong. The explicit
-		// `[datetime]` test matters: `(Get-Date) - $null` yields a two-thousand
-		// year TimeSpan, which would read as "ancient" and defeat the grace
-		// guard exactly where the data is missing.
-		const psScript =
-			`Get-CimInstance -Query "SELECT ProcessId,ParentProcessId,CreationDate,CommandLine FROM Win32_Process WHERE ${clauses}" ` +
-			`| ForEach-Object { $age = if ($_.CreationDate -is [datetime]) { [int64]((Get-Date) - $_.CreationDate).TotalMilliseconds } else { '' }; ` +
-			`"$($_.ProcessId)\t$($_.ParentProcessId)\t$age\t$($_.CommandLine)" }`;
-		const powershell = windowsExe("WindowsPowerShell\\v1.0\\powershell.exe");
-		const result = await spawnCollectStdoutResult(
-			powershell,
-			["-NoProfile", "-NonInteractive", "-Command", psScript],
-			{ shell: false, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] },
-			collect,
-		);
-		const processes: OsProcessInfo[] = [];
-		for (const line of result.stdout.split(/\r?\n/)) {
-			const firstTab = line.indexOf("\t");
-			if (firstTab <= 0) continue;
-			const secondTab = line.indexOf("\t", firstTab + 1);
-			if (secondTab <= 0) continue;
-			const thirdTab = line.indexOf("\t", secondTab + 1);
-			if (thirdTab <= 0) continue;
-			const pid = Number(line.slice(0, firstTab).trim());
-			const parentPid = Number(line.slice(firstTab + 1, secondTab).trim());
-			const ageMs = parseNonNegativeMs(line.slice(secondTab + 1, thirdTab));
-			const command = line.slice(thirdTab + 1);
-			if (!Number.isFinite(pid) || pid <= 0) continue;
-			processes.push({ pid, parentPid, command, ageMs });
-		}
-		return narrowToManagedBinaries(processes, result);
-	}
-	// POSIX: enumerate everything, filter in JS by managed-name substring —
-	// there is no single-query WQL-style server-side filter available.
-	// `etime` is the POSIX-standard elapsed-time column (Linux and macOS both
-	// support it; `etimes` is Linux-only), and supplies the spawn-grace age.
-	const result = await spawnCollectStdoutResult(
-		posixPsPath(),
-		[...POSIX_PS_ARGS],
-		{ shell: false, stdio: ["ignore", "pipe", "ignore"] },
-		collect,
+	// #1857: `Name = '…'` equality replaces eight leading-wildcard
+	// `CommandLine LIKE '%…%'` clauses, and the projection carries an age so
+	// the spawn-grace guard has something to reason from. The image-name set is
+	// DERIVED from MANAGED_BINARIES (MANAGED_IMAGE_NAMES), so adding a managed
+	// binary cannot leave a stale parallel list behind.
+	//
+	// POSIX `ps` cannot express that filter — the seam reports it as
+	// `serverSideFiltered: false` and hands back the whole table — which is why
+	// `narrowToManagedBinaries` runs on BOTH platforms rather than only on the
+	// POSIX branch. Windows over-collects for its own reason anyway
+	// (`node.exe` is a superset image name covering every node process on the
+	// machine).
+	const scanTimeoutMs = options.timeoutMs ?? BACKSTOP_SCAN_TIMEOUT_MS;
+	const result = await queryProcessTable(
+		{
+			fields: ["pid", "ppid", "ageMs", "command"],
+			filter: { column: "Name", op: "eq", values: MANAGED_IMAGE_NAMES },
+		},
+		{
+			timeoutMs: scanTimeoutMs,
+			onTimeout: (child: ChildProcess) =>
+				terminateScannerChild(child, {
+					verifyAttempts: options.verifyAttempts,
+					verifyIntervalMs: options.verifyIntervalMs,
+					kind: "orphan-backstop-scanner-escalated",
+					timeoutMs: scanTimeoutMs,
+				}),
+		},
 	);
-	const processes: OsProcessInfo[] = [];
-	for (const line of result.stdout.split(/\r?\n/)) {
-		// Linear parse (S8786/S6594): "  pid ppid etime args here".
-		const trimmed = line.trimStart();
-		if (!trimmed) continue;
-		let i = 0;
-		while (i < trimmed.length && trimmed[i] >= "0" && trimmed[i] <= "9") i++;
-		if (i === 0) continue;
-		const pid = Number(trimmed.slice(0, i));
-		let rest = trimmed.slice(i);
-		let k = 0;
-		while (k < rest.length && (rest[k] === " " || rest[k] === "\t")) k++;
-		rest = rest.slice(k);
-		let j = 0;
-		while (j < rest.length && rest[j] >= "0" && rest[j] <= "9") j++;
-		if (j === 0) continue;
-		const parentPid = Number(rest.slice(0, j));
-		rest = rest.slice(j);
-		let m = 0;
-		while (m < rest.length && (rest[m] === " " || rest[m] === "\t")) m++;
-		rest = rest.slice(m);
-		// etime token: a non-whitespace run of digits, ':' and '-'.
-		let e = 0;
-		while (e < rest.length && rest[e] !== " " && rest[e] !== "\t") e++;
-		const ageMs = ageMsFromPosixEtime(rest.slice(0, e));
-		let n = e;
-		while (n < rest.length && (rest[n] === " " || rest[n] === "\t")) n++;
-		const args = rest.slice(n);
-		if (!Number.isFinite(pid) || pid <= 0) continue;
-		processes.push({ pid, parentPid, command: args, ageMs });
-	}
-	return narrowToManagedBinaries(processes, result);
+	return narrowToManagedBinaries(
+		result.rows.map((row) => ({
+			pid: row.pid,
+			parentPid: row.ppid,
+			command: row.command,
+			ageMs: row.ageMs,
+		})),
+		result,
+	);
 }
 
 /**
@@ -920,7 +827,7 @@ async function enumerateManagedProcesses(
  */
 function narrowToManagedBinaries(
 	processes: OsProcessInfo[],
-	result: SpawnCollectResult,
+	result: { status: SpawnCollectStatus; timeoutKill?: SpawnTimeoutKill },
 ): ManagedProcessScan {
 	return {
 		processes: processes.filter((proc) => matchesManagedBinary(proc.command)),
@@ -939,6 +846,34 @@ interface ManagedProcessScan {
 	timeoutKill?: SpawnTimeoutKill;
 }
 
+export interface TerminateScannerChildOptions {
+	verifyAttempts?: number;
+	verifyIntervalMs?: number;
+	/**
+	 * The degradation kind this escalation is attributed to. #2524: this
+	 * function has callers with two different budgets and cadences — the
+	 * registry-independent orphan backstop's own scanner queries
+	 * (`enumerateManagedProcesses`, `findPidsByMarkerWindows`,
+	 * `queryCommandLines`; one scan per cooldown window,
+	 * `BACKSTOP_SCAN_TIMEOUT_MS`) and the resource sampler's process-table
+	 * queries (`sampleProcessesWindows`, `findDescendantPidsWindows`; every
+	 * heartbeat/spawn-bracket tick, `RESOURCE_SAMPLE_QUERY_TIMEOUT_MS`).
+	 * A hardcoded kind here mis-attributed every sampler escalation to the
+	 * backstop (defect shape: a record's subject must be its producer) — the
+	 * caller now supplies its own kind so the ledger names who actually timed
+	 * out. #2527 review F2: `findPidsByMarkerWindows` and `queryCommandLines`
+	 * originally omitted `onTimeout` entirely, so a scanner they spawned that
+	 * blew `BACKSTOP_SCAN_TIMEOUT_MS` fell through to `child-unref.ts`'s bare,
+	 * unverified default kill with no identity-carrying record — the exact
+	 * abandonment this function exists to prevent, reachable from inside the
+	 * orphan backstop path itself. Both now route through here too.
+	 */
+	kind: DegradationKind;
+	/** The caller's own timeout budget in ms, folded into the reason text so
+	 *  the ledger names WHICH budget was blown without a second lookup. */
+	timeoutMs: number;
+}
+
 /**
  * Terminate a scanner child that blew the scan timeout, using the reaper's
  * OWN tree-kill-and-verify machinery (#1864 review F3).
@@ -950,10 +885,22 @@ interface ManagedProcessScan {
  * exists to fix, so the scanner now gets exactly what an orphan gets:
  * `taskkill /F /T` or a POSIX group kill, then a verified liveness poll. The
  * escalation is recorded with the scanner's identity, never swallowed.
+ *
+ * The kill attempt itself is real regardless of what happens next: this
+ * handler is invoked the instant the caller's timer elapses, which can race
+ * a query child that is genuinely about to close successfully (its own
+ * "close" event may still win the overall settle — see
+ * `child-unref.ts#spawnCollectStdoutResult`, which resolves on whichever of
+ * "close" or the timeout handler's own settle lands first). This function has
+ * no way to observe that outcome — it runs strictly BEFORE the caller's
+ * promise resolves — so it always records the escalation it actually
+ * attempted; callers whose escalation kind can fire on that race classify it
+ * as informational rather than a warning (see
+ * `degradation-ledger.ts`'s `resource-sampler-scanner-escalated` doc comment).
  */
 export async function terminateScannerChild(
 	child: ChildProcess,
-	options: { verifyAttempts?: number; verifyIntervalMs?: number },
+	options: TerminateScannerChildOptions,
 ): Promise<SpawnTimeoutKill> {
 	const pid = child.pid;
 	const outcome =
@@ -964,9 +911,9 @@ export async function terminateScannerChild(
 				})
 			: "invalid";
 	incrementDegradationCount({
-		kind: "orphan-backstop-scanner-escalated",
+		kind: options.kind,
 		subject: `${isWindows ? "win32-cim" : "posix-ps"}#${pid ?? "no-pid"}`,
-		reason: `scan exceeded its timeout; tree kill reported ${outcome}`,
+		reason: `scan exceeded its ${options.timeoutMs}ms timeout; tree kill reported ${outcome}`,
 	});
 	return outcome;
 }
@@ -982,52 +929,6 @@ function matchesManagedBinary(command: string): boolean {
 	return MANAGED_BINARY_NAMES.some((name) =>
 		lower.includes(name.toLowerCase()),
 	);
-}
-
-/**
- * Parse the Windows age column: a non-negative integer millisecond count, or
- * anything else. A negative or malformed value is `undefined`, not zero and
- * not a clamp — a nonsensical age means the age is UNKNOWN, and the grace
- * guard must spare an unknown-age process rather than reason from a number it
- * cannot trust. That rule is what surfaced the local-time tick bug during the
- * host probe instead of silently sparing everything.
- */
-function parseNonNegativeMs(raw: string): number | undefined {
-	const token = raw.trim();
-	if (!/^\d+$/.test(token)) return undefined;
-	const value = Number(token);
-	return Number.isFinite(value) ? value : undefined;
-}
-
-/**
- * POSIX enumeration columns. Exported so a real-`ps` test can assert this
- * exact argument vector is accepted by the host's `ps` — a rejected column
- * would make the whole backstop silently return zero rows, and this is the
- * one part of the fix that cannot be checked from a Windows dev machine.
- */
-export const POSIX_PS_ARGS: readonly string[] = [
-	"-eo",
-	"pid=,ppid=,etime=,args=",
-];
-
-/** Parse `ps -o etime` output: `[[dd-]hh:]mm:ss`. Returns undefined for any
- *  shape the column did not produce (a `ps` without the column emits the
- *  command line where the token was expected). */
-export function ageMsFromPosixEtime(raw: string): number | undefined {
-	const token = raw.trim();
-	if (!/^(?:\d+-)?(?:\d+:)?\d+:\d+$/.test(token)) return undefined;
-	let days = 0;
-	let rest = token;
-	const dash = rest.indexOf("-");
-	if (dash >= 0) {
-		days = Number(rest.slice(0, dash));
-		rest = rest.slice(dash + 1);
-	}
-	const parts = rest.split(":").map(Number);
-	if (parts.some((part) => !Number.isFinite(part))) return undefined;
-	const [hours, minutes, seconds] =
-		parts.length === 3 ? parts : [0, parts[0], parts[1]];
-	return ((days * 24 + hours) * 60 * 60 + minutes * 60 + seconds) * 1000;
 }
 
 /**
@@ -1270,12 +1171,12 @@ export interface BackstopSweepOptions {
  * not time-critical, so paying its cost once per half hour instead of once
  * per session_start removes essentially all of its aggregate cost.
  */
-export const BACKSTOP_COOLDOWN_MS = 30 * 60 * 1000;
+const BACKSTOP_COOLDOWN_MS = 30 * 60 * 1000;
 
 /** How long after session_start the deferred sweep fires. Chosen to clear the
  *  warmup window it was measured starving: `warmup_total` median 3288ms,
  *  worst on record 5480ms (#1857). */
-export const BACKSTOP_START_DELAY_MS = 30_000;
+const BACKSTOP_START_DELAY_MS = 30_000;
 
 /** Cap on process identities embedded in one latency record. */
 const BACKSTOP_IDENTITY_LOG_LIMIT = 10;
@@ -1285,7 +1186,7 @@ const BACKSTOP_IDENTITY_LOG_LIMIT = 10;
  * a candidate that was 1ms too fresh is comfortably past the grace by the
  * time the retry looks at it again.
  */
-export const BACKSTOP_GRACE_RETRY_MARGIN_MS = 30_000;
+const BACKSTOP_GRACE_RETRY_MARGIN_MS = 30_000;
 
 /** How long the sweep lock may be held before another process reclaims it.
  *  Well above the scan timeout plus the kill budget, and irrelevant when the

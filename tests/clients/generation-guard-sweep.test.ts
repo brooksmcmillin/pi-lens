@@ -79,6 +79,9 @@ const HAND_ROLLED_GENERATION_GUARDS: Readonly<Record<string, string>> = {
 	"mcp/analyze.ts":
 		"the warm word-index idle eviction captures a per-entry generation before its timer fires and re-checks it in the callback, alongside an entry-identity compare. The eviction direction again, on a per-entry counter rather than a keyed map; a migration candidate once GenerationMap gains an entry-scoped form",
 
+	"observed-mutation.ts":
+		"the settle rejects a baseline whose sessionGeneration no longer matches the one the tool_result carries. This IS the capture-before/check-after shape, but the counter is RuntimeCoordinator.sessionGeneration — captured at tool_call, handed back at tool_result, and owned by runtime-coordinator.ts, whose own migration is deferred above. Declaring a GenerationSource here would mint a SECOND counter mirroring the session's, which is the single-source-of-truth defect the ratchet exists to prevent; this file migrates when runtime-coordinator.ts exposes its source as one",
+
 	// --- Not the shape: a generation is compared, but no post-await write
 	// hangs on the answer. ---
 	"dispatch/runners/utils/runner-helpers.ts":
@@ -87,6 +90,10 @@ const HAND_ROLLED_GENERATION_GUARDS: Readonly<Record<string, string>> = {
 		"syncInstallGeneration folds in any resetInstallRetryLatches() since the last touch by clearing the attempt count and cooldown on a mismatch. Clear-on-transition, the same shape as runner-helpers' ensureCurrentGeneration, not a guarded write",
 	"tree-sitter-client.ts":
 		"the trust-notification set is cleared on a trust-generation transition before the set is consulted (lazy clear-on-transition, #1363). Clear-on-transition again: the generation decides whether to reset state, not whether a pending write may land",
+	"ast-grep-client.ts":
+		"#2636 review F3: ensureRulesHealthReported compares the CURRENT degradation-ledger generation against the last one it reported under, to decide whether to re-run an observational report (clear-on-transition, same shape as tree-sitter-client.ts's trust-notification set above) — not a write racing an await. The ledger's own onceKeys/tallies already re-arm on resetDegradationLedger(); this compare only decides WHETHER to call reportAstGrepRulesHealth again, never guards a pending write against a stale generation.",
+	"tree-sitter-query-loader.ts":
+		"#2636 review round 2, F3: getBundledQueriesRootHealth compares the CURRENT degradation-ledger generation against the one its memo was computed under, to decide whether to re-probe the bundled root's health (clear-on-transition, same shape as ast-grep-client.ts's ensureRulesHealthReported and tree-sitter-client.ts's trust-notification set above) — not a write racing an await. The compare only decides whether to recompute a READ-side memo; nothing downstream is a pending write that could land stale.",
 	"dispatch/integration.ts":
 		"reverse-dependency reuse eligibility compares a PERSISTED graph build generation read off disk against a cached index's, to decide whether a one-step import delta is contiguous. A read-side eligibility test, and the primitive has no persisted form — see workspace-diagnostics-cache.ts's #1669 review R2 note on why an inert persisted generation was reverted there",
 	"review-graph-logger.ts":

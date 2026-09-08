@@ -1,4 +1,8 @@
-import { createDeadline, yieldIfOverBudget } from "./cooperative-budget.js";
+import {
+	createDeadline,
+	yieldIfOverBudget,
+	type CooperativeDeadline,
+} from "./cooperative-budget.js";
 
 /**
  * Packed backing store for the word index's inverted postings (#2069).
@@ -32,8 +36,8 @@ import { createDeadline, yieldIfOverBudget } from "./cooperative-budget.js";
 /**
  * Bytes of backing store per posting entry: one `fileId` lane and one `line`
  * lane, both `Int32`. This is the constant #2069's acceptance criterion is
- * written against, and {@link estimatePostingListBytes} is the arithmetic the
- * memory-sample record and the regression test both read.
+ * written against, and the arithmetic the memory-sample record and the
+ * regression test both read.
  */
 export const WORD_POSTING_ENTRY_BYTES = 8;
 
@@ -211,11 +215,6 @@ export class WordPostingList {
 	}
 }
 
-/** Estimated bytes one posting list holds, backing store plus fixed headers. */
-export function estimatePostingListBytes(list: WordPostingList): number {
-	return list.byteLength + WORD_POSTING_LIST_OVERHEAD_BYTES;
-}
-
 /**
  * Re-home every posting list into ONE shared `ArrayBuffer`, exactly sized.
  *
@@ -271,9 +270,25 @@ export function compactPostingsIntoArena(
  *
  * Each `adoptArena` copies and re-homes one list within a single synchronous
  * step, so readers never observe a partially written list.
+ *
+ * `options.deadline` and `options.beforeYield` are a test seam only (#2293):
+ * production always takes the default 8 ms wall-clock deadline. The #2117
+ * regression test used to prove the "grew during a yield" invariant by racing
+ * a real timer against a 40,000-list copy, which made the yield itself a
+ * scheduling accident — the copy sometimes finished inside the 8 ms budget
+ * and never yielded at all, so the test's own precondition went unmet under
+ * load. Injecting a deadline lets a test force a yield deterministically
+ * instead of hoping wall-clock crosses the budget; `beforeYield` runs
+ * in-line, immediately before the real cooperative pause, so a test can
+ * mutate a not-yet-adopted list at that exact point with no reliance on
+ * event-loop scheduling order.
  */
 export async function compactPostingsIntoArenaCooperatively(
 	postings: Map<string, WordPostingList>,
+	options?: {
+		deadline?: CooperativeDeadline;
+		beforeYield?: () => void | Promise<void>;
+	},
 ): Promise<void> {
 	// Snapshot (token, list, width) in one synchronous pass; the arena is sized
 	// from these widths and only unchanged lists are adopted, so the sum of the
@@ -292,7 +307,7 @@ export async function compactPostingsIntoArenaCooperatively(
 	if (lanes === 0) return;
 	const arena = new Int32Array(lanes);
 	let offset = 0;
-	const deadline = createDeadline(8);
+	const deadline = options?.deadline ?? createDeadline(8);
 	for (const plan of planned) {
 		if (
 			postings.get(plan.token) === plan.list &&
@@ -301,7 +316,10 @@ export async function compactPostingsIntoArenaCooperatively(
 		) {
 			offset = plan.list.adoptArena(arena, offset);
 		}
-		if (deadline.expired()) await yieldIfOverBudget(deadline);
+		if (deadline.expired()) {
+			await options?.beforeYield?.();
+			await yieldIfOverBudget(deadline);
+		}
 	}
 }
 
@@ -425,7 +443,8 @@ export class WordForwardEntry {
 
 	/** Pack a tokenizer tally. Insertion order is preserved. */
 	static fromTally(tally: Map<string, number>): WordForwardEntry {
-		const tokenNames = new Array<string>(tally.size);
+		const tokenNames: string[] = [];
+		tokenNames.length = tally.size;
 		const lineCounts = new Int32Array(tally.size);
 		let i = 0;
 		for (const [token, count] of tally) {
@@ -441,7 +460,7 @@ export class WordForwardEntry {
  * Bytes per forward entry: one pointer-compressed slot for the shared token
  * string and one `Int32` count lane.
  */
-export const WORD_FORWARD_ENTRY_BYTES = 8;
+const WORD_FORWARD_ENTRY_BYTES = 8;
 
 /**
  * The word index's dense file-id space: canonical path key → integer id →

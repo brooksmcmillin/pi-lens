@@ -20,7 +20,24 @@
  * never lost, only un-rendered.
  */
 
+import {
+	type ConfigDiagnosticCode,
+	withConfigDiagnosticCode,
+} from "./config-diagnostic-codes.js";
+
 export type UserNotifyLevel = "info" | "warning" | "error";
+
+/**
+ * Per-call options for a user-facing degradation.
+ *
+ * `code` attaches a STABLE config diagnostic code (#2418) so the rendered
+ * message ends in a greppable ` [PILENS_CFG_NNNN]` marker. Prose may be
+ * rewritten freely; the code is the compatibility surface a user matches or
+ * suppresses on. Purely additive — an uncoded call renders exactly as before.
+ */
+export interface NotifyDegradationOptions {
+	code?: ConfigDiagnosticCode;
+}
 
 export type UserNotifier = (message: string, level?: UserNotifyLevel) => void;
 
@@ -43,11 +60,6 @@ export function resetUserNotifier(): void {
 	notifierGetter = undefined;
 }
 
-/** True when a host render path is available (for callers that want to branch). */
-export function hasUserNotifier(): boolean {
-	return notifierGetter !== undefined;
-}
-
 /**
  * Best-effort delivery of a user-facing degradation. Never throws — a stale
  * `ctx` after a session replacement must degrade to a no-op, not break the
@@ -56,10 +68,14 @@ export function hasUserNotifier(): boolean {
 export function notifyUserDegradation(
 	message: string,
 	level: UserNotifyLevel = "warning",
+	options?: NotifyDegradationOptions,
 ): void {
 	try {
 		const notify = notifierGetter?.();
-		notify?.(message, level);
+		const coded = options?.code
+			? withConfigDiagnosticCode(message, options.code)
+			: message;
+		notify?.(coded, level);
 	} catch {
 		// The ndjson sink already holds this message; a dead host is not an error.
 	}

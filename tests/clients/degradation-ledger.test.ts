@@ -257,6 +257,74 @@ describe("session degradation ledger", () => {
 		]);
 	});
 
+	// #2505 review: a routine rotation at the configured bound is the sink
+	// working as designed. Flagging it with the same warning marker a real
+	// degradation gets trains the reader to ignore the marker; the FAILED
+	// rotation (the sink cannot bound itself, so the file grows) is the line
+	// that has to stand out.
+	it("renders a routine sink rotation informationally and a failed one as a warning", () => {
+		const sink = "read-guard.log";
+		const lines = renderDegradationLines([
+			{
+				kind: "log-sink-rotated",
+				count: 3,
+				droppedCount: 0,
+				latestReasons: [
+					{ subject: sink, reason: "3 rotations at the byte bound" },
+				],
+			},
+			{
+				kind: "log-sink-rotate-failed",
+				count: 2,
+				droppedCount: 0,
+				latestReasons: [
+					{ subject: sink, reason: "2 failed rotations, sink still growing" },
+				],
+			},
+		]);
+		expect(lines[0]).toBe("Degradations:");
+		expect(lines[1]).toBe("  log-sink-rotated: 3");
+		expect(lines[1]).not.toContain("⚠");
+		expect(lines[2]).toContain("⚠ log-sink-rotate-failed: 2");
+		expect(lines[2]).toContain(sink);
+	});
+
+	// #2504 review round 8 (S1): both actionable-warnings carry-forward drops
+	// fire on the ordinary re-edit cadence and self-heal on the next turn's
+	// analysis or deferral, so they get the same informational treatment as a
+	// routine log rotation -- no `⚠`.
+	it("renders both actionable-warnings carry-forward drops informationally", () => {
+		const lines = renderDegradationLines([
+			{
+				kind: "actionable-warnings-inband-superseded",
+				count: 1,
+				droppedCount: 0,
+				latestReasons: [
+					{
+						subject: "/repo:inband-carry-superseded",
+						reason:
+							"1 carried-forward deferred file entry changed before this turn's in-band publish could keep them (src/a.ts)",
+					},
+				],
+			},
+			{
+				kind: "actionable-warnings-deferred-superseded",
+				count: 1,
+				droppedCount: 0,
+				latestReasons: [
+					{
+						subject: "/repo:deferred-file-superseded",
+						reason:
+							"1 file(s) changed while the deferred LSP pull was reading them (src/b.ts)",
+					},
+				],
+			},
+		]);
+		expect(lines[1]).toBe("  actionable-warnings-inband-superseded: 1");
+		expect(lines[1]).not.toContain("⚠");
+		expect(lines[2]).toBe("  actionable-warnings-deferred-superseded: 1");
+		expect(lines[2]).not.toContain("⚠");
+	});
 	it("renders newly wired degradation kinds", () => {
 		recordDegradation({
 			kind: "formatter-failure",

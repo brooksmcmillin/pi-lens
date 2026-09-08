@@ -250,7 +250,7 @@ export function summarizeWarningTiers(warnings: readonly Diagnostic[]): {
 	return { warnings: warnings.length - advisories, advisories };
 }
 
-export interface McpAnalyzeDiagnostic {
+interface McpAnalyzeDiagnostic {
 	line?: number;
 	column?: number;
 	severity: Diagnostic["severity"];
@@ -264,7 +264,7 @@ export interface McpAnalyzeDiagnostic {
 }
 
 /** Per-runner timing, mirroring the latency.log `runners[]` schema. */
-export interface McpRunnerLatency {
+interface McpRunnerLatency {
 	runnerId: string;
 	durationMs: number;
 	status: string;
@@ -439,10 +439,7 @@ export async function analyzeFile(
 		: path.resolve(cwd, filePath);
 	// no-delta by default → a full snapshot every call (not delta-filtered);
 	// caller flags win over the default.
-	const host = createMcpHost(
-		{ "no-delta": true, ...(options.flags ?? {}) },
-		cwd,
-	);
+	const host = createMcpHost({ "no-delta": true, ...options.flags }, cwd);
 
 	if (options.warmLsp !== false) {
 		await warmLspForFile(absPath, host);

@@ -1,19 +1,18 @@
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
 import type { AstGrepClient } from "./ast-grep-client.js";
-import type { BiomeClient } from "./biome-client.js";
 import { resetBoundedTelemetry } from "./bounded-telemetry.js";
 import { rotateMessageEndAttribution } from "./message-end-attribution.js";
 import type { CacheManager } from "./cache-manager.js";
 import { createDeadline, yieldIfOverBudget } from "./cooperative-budget.js";
-import type { DeadCodeClient, DeadCodeResult } from "./dead-code-client.js";
+import type { DeadCodeResult } from "./dead-code-client.js";
 import { deadCodeIssueCount } from "./dead-code-client.js";
 import { logDeadCodeScan } from "./dead-code-logger.js";
 import {
 	incrementDegradationCount,
+	recordDegradationOnce,
 	resetDegradationLedger,
 } from "./degradation-ledger.js";
-import type { DependencyChecker } from "./dependency-checker.js";
 import { getDiagnosticTracker } from "./diagnostic-tracker.js";
 import { resetPsScriptAnalyzerAvailability } from "./dispatch/runners/psscriptanalyzer.js";
 import { resetInstallRetryLatches } from "./dispatch/runners/utils/availability-policy.js";
@@ -29,14 +28,14 @@ import {
 	getProjectDataDir,
 } from "./file-utils.js";
 import { GitleaksClient, type GitleaksResult } from "./gitleaks-client.js";
-import type { GoClient } from "./go-client.js";
+import { resetGoAvailability } from "./go-client.js";
 import {
 	GovulncheckClient,
 	type GovulncheckResult,
 } from "./govulncheck-client.js";
 import { sweepAtomicWriteStages } from "./instance-reaper.js";
 import type { JscpdClient } from "./jscpd-client.js";
-import type { KnipClient, KnipResult } from "./knip-client.js";
+import type { KnipResult } from "./knip-client.js";
 import { canRunStartupHeavyScans } from "./language-policy.js";
 import {
 	detectProjectLanguageProfile,
@@ -53,8 +52,7 @@ import {
 	resetLSPCaseSensitivityState,
 } from "./lsp/server.js";
 import { loadLspService } from "./lsp-lazy.js";
-import type { MetricsClient } from "./metrics-client.js";
-import type { OpengrepClient, OpengrepResult } from "./opengrep-client.js";
+import type { OpengrepResult } from "./opengrep-client.js";
 import { resetManagedToolRefreshSession } from "./installer/managed-tool-refresh-session.js";
 import { resetResolvedPathCache } from "./installer/index.js";
 import { _resetPackageManagerCache } from "./package-manager.js";
@@ -82,11 +80,15 @@ import {
 	readProjectSnapshotMeta,
 	saveRuntimeProjectSnapshot,
 } from "./project-snapshot.js";
-import type { RuffClient } from "./ruff-client.js";
 import { scanProjectRules } from "./rules-scanner.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
-import type { RustClient } from "./rust-client.js";
+import { resetRustAvailability } from "./rust-client.js";
 import { resetSafeSpawnWindowsCommandCache } from "./safe-spawn.js";
+import {
+	type BootstrapClients,
+	resetAnalyzerBootstrapSessionState,
+	type SessionBootstrapAccess,
+} from "./bootstrap.js";
 import {
 	getSlowFsVerdict,
 	isSlowFs,
@@ -109,19 +111,25 @@ import {
 	isSubagentSession,
 	subagentLightModeNotice,
 } from "./subagent-mode.js";
-import type { TestRunnerClient } from "./test-runner-client.js";
-import type { TodoScanner } from "./todo-scanner.js";
 import { TrivyClient, type TrivyResult } from "./trivy-client.js";
 import { isWarmAttached } from "./warm-attach.js";
 import { setSessionLanguages } from "./widget-state.js";
 import { logWordIndex } from "./word-index-logger.js";
 import { resetOpaqueMutationState } from "./opaque-mutation-scan.js";
+import {
+	primePersistedMutationAttribution,
+	resetMutationAttribution,
+} from "./mutation-attribution.js";
+import { resetObservedMutationNet } from "./observed-mutation.js";
 import { resetPendingAuxiliaryCoverage } from "./lsp/pending-aux-coverage.js";
 import { resetWorkspaceTopology } from "./workspace-topology.js";
 import { resetZizmorTokenAvailability } from "./zizmor-config.js";
 import { resetSpawnTimeoutCooldowns } from "./spawn-timeout-cooldown.js";
 import { resetTestRunnerDelivery } from "./test-runner-delivery.js";
+import { resetLspMutationNoBridgeDbgLatch } from "./lsp-mutation.js";
 import type { SessionStartClassification } from "./session-lifecycle.js";
+import type { PiLensGlobalConfig } from "./lens-config.js";
+import type { PiLensProjectConfig } from "./project-lens-config.js";
 
 /** Durable root-identity value on `session_start_total` records. */
 export type SessionStartRootTelemetry = boolean | "unknown";
@@ -138,9 +146,9 @@ interface SessionStartDeps {
 	emitHostReadyDelay?: boolean;
 	sessionReason?: string;
 	handlerEnteredAt?: number;
-	bootstrapClientsStartedAt?: number;
-	bootstrapClientsDurationMs?: number;
 	getFlag: (name: string) => boolean | string | undefined;
+	globalConfig?: PiLensGlobalConfig;
+	projectConfig?: PiLensProjectConfig;
 	notify: (msg: string, level: "info" | "warning" | "error") => void;
 	dbg: (msg: string) => void;
 	log: (msg: string) => void;
@@ -169,27 +177,47 @@ interface SessionStartDeps {
 	 *  `ClassifySessionStartInput.sameRoot`). */
 	sessionStartSameRoot?: boolean;
 	runtime: RuntimeCoordinator;
-	metricsClient: MetricsClient;
 	cacheManager: CacheManager;
-	todoScanner: TodoScanner;
 	astGrepClient: AstGrepClient;
-	biomeClient: BiomeClient;
-	ruffClient: RuffClient;
-	knipClient: KnipClient;
-	jscpdClient: JscpdClient;
-	deadCodeClients: DeadCodeClient[];
-	govulncheckClient: GovulncheckClient;
-	gitleaksClient: GitleaksClient;
-	trivyClient: TrivyClient;
-	opengrepClient: OpengrepClient;
-	depChecker: DependencyChecker;
-	testRunnerClient: TestRunnerClient;
-	goClient: GoClient;
-	rustClient: RustClient;
+	/**
+	 * #2467: the ONE way this handler reaches the analyzer clients.
+	 *
+	 * It used to take fifteen already-constructed clients — i.e. an awaited
+	 * seventeen-module load on the interactive path. The first attempt at
+	 * lazifying it made those fifteen fields optional and added this seam
+	 * beside them, with "exactly one of the two shapes is supplied" stated in
+	 * prose; that admitted a third shape the compiler was happy with and the
+	 * handler was not — drop `metricsClient` and every startup scan silently
+	 * stopped running. One required field, one shape. A caller that already
+	 * holds concrete clients (`clients/mcp/session.ts`) wraps them with
+	 * `residentBootstrapAccess`.
+	 */
+	bootstrap: SessionBootstrapAccess;
 	ensureTool: (name: string) => Promise<string | null | undefined>;
 	cleanStaleTsBuildInfo: (cwd: string) => string[];
 	resetDispatchBaselines: (cwd?: string) => void;
 	resetLSPService: (options?: LSPShutdownOptions) => void;
+}
+
+/** `SessionStartDeps` with the analyzer clients merged in. */
+type BootstrapResolvedDeps = SessionStartDeps & BootstrapClients;
+
+/**
+ * `deps` with resolved analyzer clients merged in, or `null` when the
+ * bootstrap could not be served and the caller must proceed without them.
+ *
+ * No cast and no "is one representative field present?" probe: the seam
+ * answers with all seventeen clients or with `null`, so the two outcomes are
+ * the two branches. A skipped consumer is already counted in the ledger under
+ * `analyzer-bootstrap-unavailable`, so it is never mistaken for a clean one.
+ */
+async function demandBootstrapDeps(
+	deps: SessionStartDeps,
+	reason: string,
+): Promise<BootstrapResolvedDeps | null> {
+	const clients = await deps.bootstrap.request(reason);
+	if (!clients) return null;
+	return { ...deps, ...clients };
 }
 
 type StartupMode = "full" | "minimal" | "quick";
@@ -426,11 +454,17 @@ function logProjectSnapshotProbe(args: {
 	}
 }
 
-function resolveStartupMode(): StartupMode {
+function resolveStartupMode(
+	projectConfig?: PiLensProjectConfig,
+	globalConfig?: PiLensGlobalConfig,
+): StartupMode {
 	const envMode = (process.env.PI_LENS_STARTUP_MODE ?? "").trim().toLowerCase();
 	if (envMode === "full" || envMode === "minimal" || envMode === "quick") {
 		return envMode;
 	}
+	const configMode =
+		projectConfig?.startup?.mode ?? globalConfig?.startup?.mode;
+	if (configMode) return configMode;
 
 	if (isPrintMode()) {
 		return "quick";
@@ -1130,6 +1164,41 @@ function scheduleStartupScans(
 	languageProfile: ReturnType<typeof detectProjectLanguageProfile>,
 	dbg: SessionStartDeps["dbg"],
 ): void {
+	// #2467: the analyzers these scans drive are loaded HERE, on the deferred
+	// background path, instead of before the handler ran. This function was
+	// already fire-and-forget ("don't block session start"), so resolving them
+	// across one await adds no wait to the interactive path and changes no
+	// ordering its caller depends on — the caller never awaited it.
+	void (async () => {
+		const resolved = await demandBootstrapDeps(deps, "session-start-scans");
+		// Fail open: no analyzers means no scans, said out loud. The demand is
+		// already counted in the ledger, so this is not a silent skip.
+		if (!resolved) {
+			dbg("session_start scans: analyzer bootstrap unavailable — skipped");
+			return;
+		}
+		scheduleStartupScansWithClients(
+			resolved,
+			runtime,
+			sessionGeneration,
+			analysisRoot,
+			snapshotRoot,
+			languageProfile,
+			dbg,
+		);
+	})();
+}
+
+/** The scan bodies, once the analyzers they need are resolved. */
+function scheduleStartupScansWithClients(
+	deps: BootstrapResolvedDeps,
+	runtime: RuntimeCoordinator,
+	sessionGeneration: number,
+	analysisRoot: string,
+	snapshotRoot: string,
+	languageProfile: ReturnType<typeof detectProjectLanguageProfile>,
+	dbg: SessionStartDeps["dbg"],
+): void {
 	const {
 		todoScanner,
 		cacheManager,
@@ -1143,6 +1212,15 @@ function scheduleStartupScans(
 		astGrepClient,
 		depChecker,
 	} = deps;
+	const analyzerEnabled = (flag: string): boolean => !deps.getFlag(flag);
+	if (!analyzerEnabled("no-complexity")) {
+		dbg("session_start complexity: skipped (disabled by config)");
+		recordDegradationOnce({
+			kind: "startup-analyzer-disabled",
+			subject: "complexity",
+			reason: "skipped (disabled by config)",
+		});
+	}
 
 	// Some background scans are CPU-heavy and arrive on the event loop
 	// just as the user is most likely typing (right after /new). Defer
@@ -1207,7 +1285,7 @@ function scheduleStartupScans(
 	}
 	dbg(`session_start: launching background scans (${scanNames.join(", ")})`);
 
-	runTask("todo", async () => {
+	void runTask("todo", async () => {
 		if (!runtime.isCurrentSession(sessionGeneration)) return;
 		// The original implementation called todoScanner.scanDirectory(), which
 		// walks the project synchronously and freezes the TUI for ~3s on a 2k-file
@@ -1253,8 +1331,18 @@ function scheduleStartupScans(
 		name: string,
 		task: () => Promise<void>,
 	): void => {
+		const flag = `no-${name}`;
+		if (name !== "opengrep" && name !== "trivy" && !analyzerEnabled(flag)) {
+			dbg(`session_start ${name}: skipped (disabled by config)`);
+			recordDegradationOnce({
+				kind: "startup-analyzer-disabled",
+				subject: name,
+				reason: "skipped (disabled by config)",
+			});
+			return;
+		}
 		if (skipHeavyweightScans) return;
-		runTask(name, task);
+		void runTask(name, task);
 	};
 	if (skipHeavyweightScans) {
 		dbg(
@@ -1644,7 +1732,7 @@ function scheduleStartupScans(
 	// racing its independently deferred timer. Otherwise a slow graph build leaves
 	// `runtime.callGraph` unset at this task's start and loses the model for the
 	// entire session (#1070).
-	runTask("codebase-model", async () => {
+	void runTask("codebase-model", async () => {
 		await callGraphTask;
 		if (!runtime.isCurrentSession(sessionGeneration)) return;
 		if (!runtime.callGraph) return;
@@ -1672,7 +1760,7 @@ function scheduleStartupScans(
 	});
 
 	// ast-grep — export scan for duplicate detection
-	runTask("ast-grep-exports", async () => {
+	void runTask("ast-grep-exports", async () => {
 		if (await astGrepClient.ensureAvailable()) {
 			if (!runtime.isCurrentSession(sessionGeneration)) return;
 			const exports = await astGrepClient.scanExports(
@@ -1691,7 +1779,7 @@ function scheduleStartupScans(
 	// word-index — identifier inverted index + BM25 for ranked symbol search
 	// (#162). Load -> rebuild-if-stale -> persist lifecycle (#348), shared with
 	// the quick-mode cold-start warmup pass below.
-	runTask("word-index", async () => {
+	void runTask("word-index", async () => {
 		await buildOrRefreshWordIndex({
 			runtime,
 			sessionGeneration,
@@ -1704,6 +1792,36 @@ function scheduleStartupScans(
 
 function scheduleDeferredToolProbes(
 	deps: SessionStartDeps,
+	languageProfile: ReturnType<typeof detectProjectLanguageProfile>,
+	startupDefaults: string[],
+	startupScansWillRun: boolean,
+	dbg: SessionStartDeps["dbg"],
+): void {
+	// #2467: same deferral as `scheduleStartupScans` — the probes were already
+	// fire-and-forget, so the analyzers they probe load here rather than before
+	// the handler.
+	void (async () => {
+		const resolved = await demandBootstrapDeps(
+			deps,
+			"session-start-tool-probes",
+		);
+		if (!resolved) {
+			dbg("session_start tools: analyzer bootstrap unavailable — no probes");
+			return;
+		}
+		scheduleDeferredToolProbesWithClients(
+			resolved,
+			languageProfile,
+			startupDefaults,
+			startupScansWillRun,
+			dbg,
+		);
+	})();
+}
+
+/** The probe bodies, once the analyzers they probe are resolved. */
+function scheduleDeferredToolProbesWithClients(
+	deps: BootstrapResolvedDeps,
 	languageProfile: ReturnType<typeof detectProjectLanguageProfile>,
 	startupDefaults: string[],
 	startupScansWillRun: boolean,
@@ -1772,7 +1890,20 @@ export async function handleSessionStart(
 	deps: SessionStartDeps,
 ): Promise<void> {
 	resetDegradationLedger();
+	// #2467: re-arm the analyzer bootstrap's shutdown gate. The gate is a
+	// per-SESSION claim ("this session is over") held in process-lived storage,
+	// so without this a replacement session in the same process would find
+	// every analyzer refused for the rest of the process — AGENTS.md defect
+	// shape 17. The resident clients themselves are deliberately kept.
+	resetAnalyzerBootstrapSessionState();
 	resetTestRunnerDelivery();
+	// #2450 fix round 3, catalog shape 17: the "bridge unavailable" dbg latch
+	// (`clients/lsp-mutation.ts`) is a process-lifetime once-per-session flag,
+	// same shape as the ledger's own once-per-subject bookkeeping above, but
+	// kept as its own reset (not folded into `resetDegradationLedger`) to
+	// avoid that module reaching back into this one — see the latch's own
+	// comment for why.
+	resetLspMutationNoBridgeDbgLatch();
 	// #1743: the bounded-telemetry per-turn counters. The rising-edge state is
 	// NOT here — it is the ledger's own tally, reset on the line above. These
 	// counters are keyed by turn index, and a new session restarts turn
@@ -1783,25 +1914,16 @@ export async function handleSessionStart(
 	// live anchor into one bounded previous slot so the queued event keeps the
 	// replaced session's attribution until a newer live message_end is seen.
 	rotateMessageEndAttribution();
+	// #2526: the once-per-session `config_resolved` claim is NOT re-armed here.
+	// index.ts resolves this session's config in `ensureLSPConfigInitialized`
+	// BEFORE it calls this handler, so a re-arm on this line would fire between
+	// the session's own two resolutions and the deferred `loadLSPConfig` below
+	// would write a second row for one session (review round 2, F1). The re-arm
+	// lives in index.ts's `session_start` closure, ahead of that ensure and
+	// behind the #473 gate — see `resetOncePerSessionPhases`'s doc comment.
 	const handlerEnteredAt = Date.now();
 	const sessionStartMs = deps.sessionStartFiredAt ?? handlerEnteredAt;
 	const cwdForTelemetry = deps.ctxCwd ?? process.cwd();
-	if (
-		deps.bootstrapClientsStartedAt !== undefined &&
-		deps.bootstrapClientsDurationMs !== undefined
-	) {
-		logLatency({
-			type: "phase",
-			filePath: cwdForTelemetry,
-			phase: "bootstrap_clients_load",
-			startedAt: new Date(deps.bootstrapClientsStartedAt).toISOString(),
-			durationMs: deps.bootstrapClientsDurationMs,
-			metadata: {
-				parent: "session_start_prehandler",
-				reason: deps.sessionReason,
-			},
-		});
-	}
 	if (deps.sessionStartFiredAt !== undefined) {
 		logLatency({
 			type: "phase",
@@ -1839,7 +1961,7 @@ export async function handleSessionStart(
 	//   entirely — but only when PI_LENS_STARTUP_MODE is unset in the env
 	//   (an explicit env var still takes highest precedence).
 	// Tunable: PI_LENS_WARMUP_DELAY_MS adjusts the warmup delay.
-	let startupMode = resolveStartupMode();
+	let startupMode = resolveStartupMode(deps.projectConfig, deps.globalConfig);
 	// SAFETY: these two flags are process-lifetime state pi-lens stashes on
 	// `globalThis` so a second extension instance in the same process sees the
 	// first one's warmup. There is no ambient declaration for them, and adding
@@ -1853,7 +1975,9 @@ export async function handleSessionStart(
 	if (
 		isFirstSessionOfProcess &&
 		process.env.PI_LENS_COLD_START_QUICK !== "0" &&
-		!process.env.PI_LENS_STARTUP_MODE
+		!process.env.PI_LENS_STARTUP_MODE &&
+		!deps.projectConfig?.startup?.mode &&
+		!deps.globalConfig?.startup?.mode
 	) {
 		// Apply host-provided override (e.g. MCP server forces "full") before
 		// falling back to the TUI quick-mode heuristic.
@@ -2120,12 +2244,7 @@ export async function handleSessionStart(
 		dbg,
 		log,
 		runtime,
-		metricsClient,
-		knipClient,
 		cacheManager,
-		testRunnerClient,
-		goClient,
-		rustClient,
 		ensureTool,
 		cleanStaleTsBuildInfo,
 		resetDispatchBaselines,
@@ -2140,7 +2259,11 @@ export async function handleSessionStart(
 		_phaseT = Date.now();
 	};
 
-	metricsClient.reset();
+	// #2467: `peek`, never a load. A metrics client that was never constructed
+	// holds no per-session state to re-arm, so the reset is vacuous — and
+	// loading the analyzer graph in order to reset nothing is the interactive-
+	// path cost this issue removes.
+	deps.bootstrap.peek()?.metricsClient.reset();
 	getDiagnosticTracker().reset();
 	clearFileTimeSessions();
 	runtime.complexityBaselines.clear();
@@ -2153,6 +2276,14 @@ export async function handleSessionStart(
 	// after reset) and the git-worktree memo must re-probe after a session
 	// that may have seen a non-git dir become one.
 	resetOpaqueMutationState();
+	// #2430: the observational net's pending baselines are keyed by tool-call
+	// id and its content ledger describes the previous session's files; both
+	// mis-answer forever without this. The learned attribution map is cleared
+	// and then RE-PRIMED from this project's persisted file, so a tool an
+	// earlier session observed is classified by name with no snapshot at all.
+	resetObservedMutationNet();
+	resetMutationAttribution();
+	primePersistedMutationAttribution(ctxCwd);
 	// #2026: pending auxiliary baselines are unreachable after generation bump.
 	resetPendingAuxiliaryCoverage();
 	// #817/#1199: Windows command resolution is cached per (command, canonical
@@ -2192,6 +2323,18 @@ export async function handleSessionStart(
 	// login` and starts a fresh session still reads the previous session's
 	// stale "no token" verdict until the cooldown (if any) happens to expire.
 	resetZizmorTokenAvailability();
+	// #2455: same #1496/#1535 process-lifetime-latch shape, one caller later —
+	// the `goClient`/`rustClient` singletons each hold their own
+	// `createAvailabilityLatch()` outside the dispatch generation counter above
+	// (they predate `createCwdCachedProbe`). A "missing" verdict never expires
+	// on its own, so without these a go/cargo install between sessions stayed
+	// unobserved for the rest of the process's life. Found by hand while
+	// auditing #2455's detector widening, NOT surfaced by it: the sweep skips
+	// any file exporting no reset at all, and neither client module exported
+	// one, so no container predicate could have yielded them (#2455 fix round 4,
+	// F5 — an earlier draft of this comment had the causality backwards).
+	resetGoAvailability();
+	resetRustAvailability();
 	// psscriptanalyzer's three latches (interpreter, module, -File exec) are
 	// module-local, so the generation counter above does not reach them
 	// (#1490, #1540).
@@ -2239,7 +2382,9 @@ export async function handleSessionStart(
 	// Some embedders inject a capability-shaped Knip client rather than the
 	// concrete KnipClient. Session reset is an optional lifecycle capability;
 	// its absence must not make session_start fail.
-	knipClient.resetSessionState?.();
+	// #2467: `peek` for the same reason as `metricsClient.reset()` above —
+	// an unloaded knip client has no session state to clear.
+	deps.bootstrap.peek()?.knipClient.resetSessionState?.();
 	// #1910: the tier-3 cascade outstanding-touch registry and its
 	// sweep-scoped expired/evicted counters (clients/lsp/cascade-tier.ts) are
 	// a per-SESSION claim about touches THIS session fired. #1899 bounded the
@@ -2300,6 +2445,12 @@ export async function handleSessionStart(
 
 	const hasWorkspaceCwd = typeof ctxCwd === "string" && ctxCwd.length > 0;
 	const cwd = ctxCwd ?? process.cwd();
+	// #2526 review round 3, S1: this handler no longer predicts whether config
+	// will resolve. `loadLSPConfig` itself publishes a `config_resolution_pending`
+	// mark, from inside the function, at the instant a resolution is actually
+	// attempted — see that function's doc comment (`clients/lsp/config.ts`) for
+	// why a prediction mirrored against this handler's own gates drifted from
+	// what index.ts and this handler's callers actually schedule.
 	// #1228: generic atomic-write stages are shared by several project stores,
 	// so the review-graph-specific sweep cannot own this namespace. Sweep the
 	// project data roots and machine-global registry root once per session start;
@@ -2750,7 +2901,12 @@ export async function handleSessionStart(
 		dbg("session_start: no language defaults selected for pre-install");
 	}
 
-	const startupScansWillRun = allowBootstrapTasks && startupScan.canWarmCaches;
+	const startupScansEnabled =
+		deps.projectConfig?.startup?.scans?.enabled ??
+		deps.globalConfig?.startup?.scans?.enabled ??
+		true;
+	const startupScansWillRun =
+		allowBootstrapTasks && startupScan.canWarmCaches && startupScansEnabled;
 	const jstsHeavyScansWillRun =
 		startupScansWillRun && canRunStartupHeavyScans(languageProfile, "jsts");
 	if (allowBootstrapTasks) {
@@ -2771,11 +2927,20 @@ export async function handleSessionStart(
 		dbg("session_start: skipping prettier preinstall probe (startup mode)");
 	}
 
-	const detectedRunner = testRunnerClient.detectRunner(analysisRoot);
+	// #2467: the first point on the FULL-mode path that genuinely needs the
+	// analyzer clients, so it is where the load is paid. Quick mode — the
+	// process's first session, the one the user is waiting on — returns above
+	// and never reaches here. Fail open: an unavailable bootstrap drops these
+	// three entries from the "Active tools" line rather than failing the start.
+	const summaryClients = await deps.bootstrap.request("session-start-tools");
+	const detectedRunner =
+		summaryClients?.testRunnerClient.detectRunner(analysisRoot);
 	phase("test-runner-detect");
 	if (detectedRunner) tools.push(`Test runner (${detectedRunner.runner})`);
-	if (await goClient.isGoAvailableAsync()) tools.push("Go (go vet)");
-	if (await rustClient.isAvailableAsync()) tools.push("Rust (cargo)");
+	if (await summaryClients?.goClient.isGoAvailableAsync())
+		tools.push("Go (go vet)");
+	if (await summaryClients?.rustClient.isAvailableAsync())
+		tools.push("Rust (cargo)");
 	log(`Active tools: ${tools.join(", ")}`);
 	dbg(`session_start tools: ${tools.join(", ")}`);
 
@@ -2812,6 +2977,15 @@ export async function handleSessionStart(
 	// needs it before this point) and is stable across this whole call.
 	if (!allowBootstrapTasks) {
 		dbg("session_start: skipping startup background scans (startup mode)");
+	} else if (!startupScansEnabled) {
+		dbg(
+			"session_start: skipping startup background scans (disabled by config)",
+		);
+		recordDegradationOnce({
+			kind: "startup-analyzer-disabled",
+			subject: "startup-scans",
+			reason: "skipped (disabled by config)",
+		});
 	} else if (!startupScan.canWarmCaches) {
 		dbg(
 			`session_start: skipping heavy scans (${startupScan.reason ?? "unknown"})`,

@@ -12,6 +12,7 @@ import {
 	getLatencyLogPath,
 } from "../../clients/latency-logger.js";
 import {
+	isExcludedTestTarget,
 	RUNNERS,
 	TestRunnerClient,
 	type TestResult,
@@ -22,7 +23,10 @@ import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 // test in this file never reaches a `findGlobalBinary` call.
 const findGlobalBinary =
 	vi.fn<(command: string) => Promise<string | undefined>>();
-vi.mock("../../clients/package-manager.js", () => ({
+vi.mock("../../clients/package-manager.js", async (importOriginal) => ({
+	...(await importOriginal<
+		typeof import("../../clients/package-manager.js")
+	>()),
 	findGlobalBinary: (command: string) => findGlobalBinary(command),
 }));
 
@@ -653,6 +657,81 @@ describe("test-runner-client", () => {
 
 			expect(result.error).toBeUndefined();
 			expect(result.failed).toBeGreaterThan(0);
+		});
+	});
+
+	// #2532 review round 1, S1: `formatResult`'s OWN runner-error branch used
+	// to require `passed === 0` on top of `failed === 0 && error`, a third
+	// spelling of the #2532 classification that missed a run interrupted
+	// AFTER some tests had already passed cleanly — the exact shape a real
+	// pytest `Interrupted` run produces (exit code 2, a normal summary line).
+	// Before the fix that batch read as "[Tests] ✓ 3/3 passed", silently
+	// dropping the interruption; `lens_diagnostics mode=full` and the
+	// turn-end delivery message already reported the SAME `TestResult` as an
+	// error via `isRunnerErrorResult`, so this was the third disagreeing
+	// surface the round 1 class sweep missed.
+	describe("formatResult folds onto isRunnerErrorResult, not a local spelling (#2532 review S1)", () => {
+		it("reports a partial run when pytest is interrupted after some tests already passed", () => {
+			const client = new TestRunnerClient(false);
+			const result = (client as any).parsePytestOutput(
+				"===== 3 passed in 1.23s =====",
+				"",
+				2,
+				"/tmp/test_foo.py",
+				"/tmp",
+				"pytest",
+			);
+
+			// Pin the real parser's shape first: `error` alongside a non-zero
+			// `passed`, which the old `passed === 0` check could never see.
+			expect(result).toMatchObject({
+				passed: 3,
+				failed: 0,
+				error: "Pytest interrupted",
+			});
+			expect(client.formatResult(result)).toBe(
+				"[Tests] ⚠ Could not complete tests: Pytest interrupted (3 passed before)",
+			);
+		});
+
+		it("still reports the plain runner-error message when nothing passed first", () => {
+			const client = new TestRunnerClient(false);
+			const result = (client as any).parsePytestOutput(
+				"",
+				"",
+				2,
+				"/tmp/test_foo.py",
+				"/tmp",
+				"pytest",
+			);
+
+			expect(result).toMatchObject({ passed: 0, failed: 0 });
+			expect(client.formatResult(result)).toBe(
+				"[Tests] ⚠ Could not run tests: Pytest interrupted",
+			);
+		});
+
+		it("keeps a counted failure blocking even when the runner also reports an error", () => {
+			// pytest exit 2 after `2 failed, 1 passed` already printed: a
+			// counted failure must stay a failure, never re-read as a runner
+			// error just because `error` is also set (round 1 S2's inversion
+			// risk, pinned here on the surface it actually renders through).
+			const client = new TestRunnerClient(false);
+			const result = (client as any).parsePytestOutput(
+				"===== 2 failed, 1 passed in 1.23s =====",
+				"",
+				2,
+				"/tmp/test_foo.py",
+				"/tmp",
+				"pytest",
+			);
+
+			expect(result).toMatchObject({
+				passed: 1,
+				failed: 2,
+				error: "Pytest interrupted",
+			});
+			expect(client.formatResult(result)).toContain("✗ 2/3 failed");
 		});
 	});
 
@@ -2855,6 +2934,167 @@ describe("test-runner-client", () => {
 });
 
 /**
+ * #2522: turn-end selection must never auto-fire an integration/e2e test —
+ * those spawn external processes (a plegma dogfooding turn resolved
+ * `tests/integration/opencode-delegate.test.ts`, which spawns `opencode` and
+ * needs a configured provider — 17s to fail on a box without one, reported
+ * as "3/3 failed, fix before proceeding" on an unrelated model-switch turn).
+ *
+ * One hard-coded built-in list, no per-project config knob. Verified through
+ * the REAL `getTestRunTarget` (a real `TestRunnerClient` against real files
+ * on disk, same as the rest of this file), not a hand-fed path shaped to hit
+ * the exclusion — the self/related strategies must actually resolve to the
+ * excluded file first, exactly like the reported turn.
+ */
+describe("#2522 — turn-end selection excludes integration/e2e test targets", () => {
+	const exclusionCleanups: Array<() => void> = [];
+	afterEach(() => {
+		for (const c of exclusionCleanups.splice(0)) c();
+	});
+
+	describe("isExcludedTestTarget", () => {
+		// A real absolute cwd, resolved through the host's OWN `path` module —
+		// never a hardcoded drive-letter/UNC literal (AGENTS.md: a Windows-shaped
+		// literal fed as an INPUT is fine, but this also keeps every case below
+		// correctly parseable on Linux CI, where `path` is the posix module).
+		const cwd = path.resolve("pi-lens-2522-fixture-root");
+
+		it("excludes tests/integration/**", () => {
+			expect(
+				isExcludedTestTarget(
+					path.join(cwd, "tests", "integration", "foo.test.ts"),
+					cwd,
+				),
+			).toBe(true);
+		});
+
+		it("excludes tests/e2e/**", () => {
+			expect(
+				isExcludedTestTarget(
+					path.join(cwd, "tests", "e2e", "foo.test.ts"),
+					cwd,
+				),
+			).toBe(true);
+		});
+
+		it("excludes a *.integration.* basename outside an integration/ dir", () => {
+			expect(
+				isExcludedTestTarget(
+					path.join(cwd, "src", "foo.integration.test.ts"),
+					cwd,
+				),
+			).toBe(true);
+		});
+
+		it("excludes a *.e2e.* basename outside an e2e/ dir", () => {
+			expect(
+				isExcludedTestTarget(path.join(cwd, "src", "foo.e2e.test.ts"), cwd),
+			).toBe(true);
+		});
+
+		it("does not exclude an ordinary unit test", () => {
+			expect(
+				isExcludedTestTarget(
+					path.join(cwd, "tests", "clients", "foo.test.ts"),
+					cwd,
+				),
+			).toBe(false);
+		});
+
+		it("matches identically for the host-native path and its forward-slash form (cross-form)", () => {
+			// On Windows this exercises the REAL production shape — `path.resolve`
+			// returns backslash-separated paths there — against a forward-slash
+			// variant of the exact same path (which win32's own `path.resolve`
+			// also parses correctly, since it accepts either separator). On
+			// POSIX both forms are already identical, so this is a no-op there
+			// and stays meaningful specifically on the OS this bug shipped on.
+			const native = path.join(cwd, "tests", "integration", "foo.test.ts");
+			const forwardSlashForm = native.split(path.sep).join("/");
+			expect(isExcludedTestTarget(native, cwd)).toBe(true);
+			expect(isExcludedTestTarget(forwardSlashForm, cwd)).toBe(true);
+		});
+	});
+
+	it("a real self-strategy match under tests/integration/ is reported as excluded by the real getTestRunTarget resolution", () => {
+		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-2522-");
+		exclusionCleanups.push(cleanup);
+
+		fs.mkdirSync(path.join(tmpDir, "tests", "integration"), {
+			recursive: true,
+		});
+		const integrationTest = path.join(
+			tmpDir,
+			"tests",
+			"integration",
+			"opencode-delegate.test.ts",
+		);
+		fs.writeFileSync(
+			integrationTest,
+			"import { it } from 'vitest'; it('spawns opencode', () => {});\n",
+		);
+		fs.writeFileSync(
+			path.join(tmpDir, "vitest.config.ts"),
+			"export default {}\n",
+		);
+
+		const client = new TestRunnerClient(false);
+		// The real "self" strategy: editing the integration test file itself.
+		const target = client.getTestRunTarget(integrationTest, tmpDir);
+		expect(target?.strategy).toBe("self");
+		expect(target?.testFile).toBe(path.resolve(integrationTest));
+		// getTestRunTarget itself does not filter — the built-in exclusion is
+		// enforced at the turn-end SELECTION site (runtime-turn.ts), which
+		// checks every resolved target through this same real function before
+		// it is ever added to the fire list.
+		expect(isExcludedTestTarget(target!.testFile, tmpDir)).toBe(true);
+	});
+
+	/**
+	 * #2522 review round 4, P3c — the contract the batch's deferral logic and
+	 * its doubles are built on.
+	 *
+	 * `runTestFileAsync` `await`s `resolveExec` BEFORE it reaches the spawn, and
+	 * `safeSpawnAsync` resolves SYNCHRONOUSLY when the signal it is handed is
+	 * already aborted. So a target dispatched moments before the batch bound
+	 * does not hang and does not reject: it comes back as an ordinary FULFILLED
+	 * result with `passed === 0`, `failed === 0` and a runner error describing
+	 * work that never happened. Anything downstream that reads "fulfilled" as
+	 * "ran" records a suite as complete when nothing was executed.
+	 *
+	 * This pins the shape against the REAL client, so the doubles in
+	 * `runtime-turn-test-runner-bounds.test.ts` that mirror it are not mirroring
+	 * an assumption (AGENTS.md: a test double must be production-faithful on the
+	 * axis under test).
+	 */
+	it("resolves an already-aborted run as a fulfilled runner error, not a completed run", async () => {
+		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-2522-p3c-");
+		exclusionCleanups.push(cleanup);
+		const testFile = path.join(tmpDir, "unit.test.ts");
+		fs.writeFileSync(
+			testFile,
+			"import { it } from 'vitest'; it('x', () => {});\n",
+		);
+		fs.writeFileSync(
+			path.join(tmpDir, "vitest.config.ts"),
+			"export default {}\n",
+		);
+
+		const controller = new AbortController();
+		controller.abort();
+		const client = new TestRunnerClient(false);
+		const result = await client.runTestFileAsync(testFile, tmpDir, {
+			runner: "vitest",
+			config: RUNNERS.vitest,
+			signal: controller.signal,
+		});
+
+		expect(result.passed).toBe(0);
+		expect(result.failed).toBe(0);
+		expect(result.error).toContain("aborted before start");
+	});
+});
+
+/**
  * Regression matrix for #1098: `resolveExec` used to drop
  * `config.args(testFile, cwd)[0]` UNCONDITIONALLY whenever local-bin or
  * global-bin resolution succeeded — an npx-wrapper-convention assumption
@@ -3068,5 +3308,116 @@ describe("resolveExec argv preservation matrix (#1098)", () => {
 				expect(resolved.args).toEqual(["exec", "rspec", testFile]);
 				expect(findGlobalBinary).toHaveBeenCalledWith("bundle");
 			});
+	});
+});
+
+/**
+ * #2522 review round 2, F5/F6 — two ways the built-in exclusion opened when
+ * it had to stay shut.
+ *
+ * F5: the globs were matched case-SENSITIVELY, so a repo that names the
+ * directory `tests/Integration/` or `tests/E2E/` (or a file
+ * `foo.E2E.test.ts`) got the unbounded pre-#2522 behaviour back. The
+ * exclusion is a safety bound on what turn_end may auto-fire, and a safety
+ * bound that a capital letter defeats is not one. Windows and macOS default
+ * to case-insensitive filesystems, so the SAME repo excluded or admitted the
+ * same file depending on which box the agent ran on.
+ *
+ * F6: a target that resolves OUTSIDE the project root produced a `..`-leading
+ * relative path, which matches none of the globs — so it fell through as
+ * "not excluded" and turn_end would spawn a runner against a file it has no
+ * business auto-running. Out-of-tree must fail CLOSED.
+ */
+describe("#2522 R2 — the built-in exclusion fails closed", () => {
+	const r2Cleanups: Array<() => void> = [];
+	afterEach(() => {
+		while (r2Cleanups.length > 0) r2Cleanups.pop()?.();
+	});
+
+	it("excludes integration/e2e directories regardless of case (F5)", () => {
+		const cwd = path.resolve("/repo");
+		for (const rel of [
+			"tests/Integration/opencode-delegate.test.ts",
+			"tests/INTEGRATION/opencode-delegate.test.ts",
+			"tests/E2E/prune-worktrees.test.ts",
+			"tests/E2e/prune-worktrees.test.ts",
+		]) {
+			expect(isExcludedTestTarget(path.join(cwd, rel), cwd)).toBe(true);
+		}
+	});
+
+	it("excludes *.integration.*/*.e2e.* basenames regardless of case (F5)", () => {
+		const cwd = path.resolve("/repo");
+		for (const rel of [
+			"tests/clients/delegate.Integration.test.ts",
+			"tests/clients/delegate.E2E.test.ts",
+		]) {
+			expect(isExcludedTestTarget(path.join(cwd, rel), cwd)).toBe(true);
+		}
+	});
+
+	it("still admits an ordinary unit test whose name merely contains the words", () => {
+		const cwd = path.resolve("/repo");
+		// `integrationHelpers` / `e2eSupport` are not directory or dotted-suffix
+		// matches — case-insensitivity must not widen WHAT the globs match.
+		expect(
+			isExcludedTestTarget(
+				path.join(cwd, "tests/clients/integrationHelpers.test.ts"),
+				cwd,
+			),
+		).toBe(false);
+		expect(
+			isExcludedTestTarget(
+				path.join(cwd, "tests/clients/e2eSupport.test.ts"),
+				cwd,
+			),
+		).toBe(false);
+	});
+
+	it("fails CLOSED for a target that resolves outside the project root (F6)", () => {
+		const cwd = path.resolve("/repo/project");
+		// A `..`-leading relative target and an absolute sibling-tree target
+		// both land outside cwd; neither matches any glob, so pre-fix they were
+		// reported as "not excluded" and would have been spawned.
+		expect(isExcludedTestTarget("../other/tests/thing.test.ts", cwd)).toBe(
+			true,
+		);
+		expect(
+			isExcludedTestTarget(
+				path.resolve("/repo/other/tests/thing.test.ts"),
+				cwd,
+			),
+		).toBe(true);
+		// The project root itself is not a test target either.
+		expect(isExcludedTestTarget(cwd, cwd)).toBe(true);
+	});
+
+	it("still admits an in-tree unit test after the out-of-tree guard", () => {
+		const cwd = path.resolve("/repo/project");
+		expect(
+			isExcludedTestTarget(path.join(cwd, "tests/clients/widget.test.ts"), cwd),
+		).toBe(false);
+	});
+
+	it("fails closed through the REAL getTestRunTarget when the resolved target is out of tree", () => {
+		const root = setupTestEnvironment("pi-lens-2522-r2-");
+		r2Cleanups.push(root.cleanup);
+		const project = path.join(root.tmpDir, "project");
+		const outside = path.join(root.tmpDir, "outside");
+		fs.mkdirSync(project, { recursive: true });
+		fs.mkdirSync(outside, { recursive: true });
+		fs.writeFileSync(
+			path.join(project, "vitest.config.ts"),
+			"export default {}\n",
+		);
+		const strayTest = path.join(outside, "stray.test.ts");
+		fs.writeFileSync(strayTest, "export {};\n");
+
+		const client = new TestRunnerClient(false);
+		// The real "self" strategy resolves the edited test file itself — here
+		// one that lives outside the project root the turn is running in.
+		const target = client.getTestRunTarget(strayTest, project);
+		expect(target?.strategy).toBe("self");
+		expect(isExcludedTestTarget(target!.testFile, project)).toBe(true);
 	});
 });

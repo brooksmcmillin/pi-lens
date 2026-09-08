@@ -72,6 +72,20 @@
  *    silently tags the NEXT seam instead. Defense: a bounded blank-line gap
  *    (`maxBlankGap`, default 1) and outright rejection of inline tags — see
  *    {@link bindTagsToSeams}.
+ * - **Positional-ordinal disambiguation** (#2487 review round 3). A prior
+ *    version of this kit shipped `disambiguateFlaggedKeys`, which numbered
+ *    colliding occurrences `key`, `key#2`, `key#3`, ... by SCAN POSITION, not
+ *    by occurrence identity. A new colliding call inserted BETWEEN two already
+ *    exempted ones shifts every ordinal after it, so an exemption reasoned
+ *    about one call site silently rides a different one — one round it failed
+ *    loud with no file:line to act on, another round it stayed fully green
+ *    while an unreviewed unbounded call shipped. Removed outright: fix the
+ *    KEY GENERATOR so genuinely distinct call sites derive genuinely distinct
+ *    keys (`tests/config/sync-child-process-timeout.test.ts`'s `exemptionKey`
+ *    now matches each call's own ARGUMENTS against a discriminating snippet,
+ *    not a position-dependent ordinal), and let `requireUniqueFlagged` fail
+ *    loud — by file:line, via `FlaggedEntry.detail` — on any collision the
+ *    generator still produces.
  *
  * ## Known limits, named rather than papered over
  *
@@ -79,13 +93,13 @@
  *   directory walk, so excluding `vendor/x.ts` still descends into `vendor/`.
  *   That is cheap on these trees; a sweep over a `node_modules`-sized tree
  *   needs directory pruning this kit does not offer (#1755 review F5).
- * - Under `strings: "blank"`, a call written inside a TEMPLATE EXPRESSION
- *   (`` `${resetThing()}` ``) is blanked with the rest of the template, so a
- *   reachability walk cannot see it. This matches the behavior the
- *   session-state sweep shipped with before the kit, and it is a false
- *   NEGATIVE — the direction that matters for a guard. No such call exists in
- *   `clients/` today. A sweep that needs them visible wants `strings: "keep"`
- *   and a needle-based check (#1755 review F6).
+ * - RESOLVED by #2502: under `strings: "blank"`, a call written inside a
+ *   TEMPLATE EXPRESSION (`` `${resetThing()}` ``) used to be blanked with the
+ *   rest of the template — a false NEGATIVE, the direction that matters for a
+ *   guard, and the noted reason a reachability walk couldn't see it. Fixing
+ *   `${` nesting depth (below) required lexing the expression as real code
+ *   rather than opaque text, which makes it visible to a `"blank"`-policy scan
+ *   the same as any other code — the limitation is gone, not just narrowed.
  *
  * This module is deliberately STATELESS — no module-level caches, no latches.
  * A sweep helper that memoized its own scan would be exactly the
@@ -94,12 +108,19 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { Lang, parse } from "@ast-grep/napi";
+import { lineContentHash } from "../../clients/read-guard.js";
 import { toPosix } from "../../clients/path-utils.js";
+import type { SgNode } from "../../clients/deps/ast-grep-napi.js";
+// Re-exported for test doubles/helpers so the test side has ONE import to
+// reach for instead of hand-copying the escaping body (#2558). This is the
+// ONE test-side re-export; the runtime copy lives in clients/string-utils.ts.
+export { escapeRegExp } from "../../clients/string-utils.js";
 
 // ── 1. Source scanning ──────────────────────────────────────────────────────
 
 /** What {@link stripSource} does with string and template literal CONTENTS. */
-export type StringPolicy =
+type StringPolicy =
 	/**
 	 * Blank string/template contents along with comments (delimiters kept).
 	 * Use when a bare identifier inside a string must not read as code — the
@@ -153,6 +174,18 @@ const KEYWORDS_BEFORE_REGEX = new Set([
  * TOKEN rather than the preceding CHARACTER (#1635 review R2): a character
  * check reads the `f` of `typeof /x()/` as an identifier, calls the regex a
  * division, and leaves a phantom call visible to the scan.
+ *
+ * A TEMPLATE LITERAL's `${...}` interpolation is lexed as ordinary code, not
+ * opaque text (#2502) — nested templates, strings, comments and regexes
+ * inside it are recognized by this same state machine, so a stray delimiter
+ * in there (a nested `` ` `` in particular) cannot be misread as the
+ * template's own close. Its code is therefore never blanked by this
+ * function's own hand, on EITHER string policy: doing so once (to imitate the
+ * pre-#2502 "whole template is opaque" behavior) blanked plain identifiers
+ * like `arg` in `arg.replace(/"/g, ...)` above, which made `regexMayStart`'s
+ * backward walk over the already-blanked `out` array tunnel straight through
+ * them to the template's own opening backtick and misclassify the `/` that
+ * follows as NOT a regex-start — silently corrupting the rest of the file.
  */
 export function stripSource(
 	source: string,
@@ -185,6 +218,22 @@ export function stripSource(
 	let blockComment = false;
 	let regex = false;
 	let regexClass = false;
+	// Stack of currently-OPEN template literals (outermost first). Each frame
+	// tracks the unmatched `{` depth of that template's CURRENT `${...}`
+	// interpolation — 0 means the template is presently in its literal-text
+	// portion (`quote` is `` ` `` and this frame is the one it belongs to);
+	// >=1 means we are lexing the interpolation's expression as ordinary code
+	// (`quote` is unset) and this frame's count is how many unmatched `{` we
+	// have seen since the `${` that opened it.
+	//
+	// #2502: a scalar `quote` alone cannot express "inside template N's
+	// expression, which itself opened template N+1". Without this stack, a
+	// backtick that opens a NESTED template inside an interpolation
+	// (`` `x ${cond ? `y(` : `z`} w` ``) is read as `ch === quote` — the
+	// (wrong) CLOSE of the outer template — leaving the outer template's own
+	// remaining text, including this nested template's own stray delimiters,
+	// to fall through as ordinary unmasked code.
+	const templateStack: { braceDepth: number }[] = [];
 	for (let i = 0; i < source.length; i++) {
 		const ch = source[i];
 		const next = source[i + 1];
@@ -220,7 +269,18 @@ export function stripSource(
 					blank(i + 1);
 				}
 				i++;
+			} else if (quote === "`" && ch === "$" && next === "{") {
+				// Enter this template's `${...}` interpolation: it now reads as
+				// ordinary code (so a nested template, string, comment or regex
+				// inside the expression is lexed by its own real machinery below,
+				// rather than as opaque template text) until the matching `}`.
+				// `${`/`}` are delimiters, kept exactly like the surrounding
+				// backticks — never blanked, on either policy.
+				templateStack[templateStack.length - 1].braceDepth = 1;
+				quote = undefined;
+				i++;
 			} else if (ch === quote) {
+				if (quote === "`") templateStack.pop();
 				quote = undefined;
 			} else if (ch === "\n" && quote !== "`") {
 				// A `'`/`"` string cannot span a raw newline in valid source, so
@@ -252,9 +312,179 @@ export function stripSource(
 			regexClass = false;
 			continue;
 		}
-		if (ch === '"' || ch === "'" || ch === "`") quote = ch;
+		if (ch === '"' || ch === "'" || ch === "`") {
+			quote = ch;
+			if (ch === "`") templateStack.push({ braceDepth: 0 });
+			continue;
+		}
+		if (templateStack.length > 0) {
+			// Inside a template's `${...}` interpolation (invariant: reaching
+			// here with a non-empty stack means the top frame's braceDepth is
+			// already >=1 — every path that resumes template TEXT mode sets
+			// `quote` back to `` ` `` in the same step it would otherwise leave
+			// the top frame at depth 0). Track nested `{`/`}` — an object
+			// literal or block inside the expression — so the `}` that actually
+			// closes the interpolation is the one where this frame's count
+			// returns to 0, not the first `}` encountered.
+			//
+			// Deliberately NOT blanked, on EITHER policy: this is ordinary CODE,
+			// not template text, and `regexMayStart` above depends on it staying
+			// that way. It walks `out` backward, skipping blanked positions to
+			// see past neutralized comments/strings straight to the real
+			// preceding token — an early version of this fix blanked plain
+			// expression characters (to match the pre-#2502 "whole template is
+			// opaque" behavior under `strings: "blank"`), which made that walk
+			// tunnel through the blanked identifiers of e.g. `${arg.replace(`
+			// straight back to the template's own OPENING backtick — a
+			// preserved delimiter, so the scan stopped there and misread a
+			// value-position `/` (regex-start) as following a string/template
+			// close instead of `(`, silently corrupting comment/regex/string
+			// recognition for the rest of the file. Leaving expression code
+			// unblanked keeps `out` identical to `source` here, exactly like
+			// top-level code, so `regexMayStart` needs no special case.
+			const top = templateStack[templateStack.length - 1];
+			if (ch === "{") top.braceDepth++;
+			else if (ch === "}") {
+				top.braceDepth--;
+				if (top.braceDepth === 0) quote = "`"; // resume this template's text
+			}
+		}
 	}
 	return out.join("");
+}
+
+function matchIsCode(
+	stringsBlanked: string,
+	start: number,
+	end: number,
+): boolean {
+	return /[^\s"'`]/.test(stringsBlanked.slice(start, end));
+}
+
+/** Return every raw match whose span contains source code. */
+export function codeMatches(source: string, regex: RegExp): RegExpMatchArray[] {
+	const stringsBlanked = stripSource(source, { strings: "blank" });
+	const globalRegex = new RegExp(
+		regex.source,
+		regex.flags.includes("g") ? regex.flags : `${regex.flags}g`,
+	);
+	return [...source.matchAll(globalRegex)].filter((match) => {
+		const start = match.index ?? 0;
+		return matchIsCode(stringsBlanked, start, start + match[0].length);
+	});
+}
+
+export interface CallSite {
+	line: number;
+	argsText: string;
+	optionsLiteral: string | undefined;
+	/** Matched simple callee, for consumers that scan several names at once. */
+	callee: string;
+}
+
+export interface CallSiteScanner {
+	find(calleePattern: RegExp): CallSite[];
+}
+
+/**
+ * Return AST call sites whose simple callee matches `calleePattern`.
+ *
+ * The arguments are taken from the call node, not from a balanced-text scan:
+ * nested expressions, template literals, and comments cannot change where a
+ * call ends. `optionsLiteral` is the last top-level object-literal argument;
+ * nested objects and object-shaped text in strings are never candidates.
+ */
+export function createCallSiteScanner(source: string): CallSiteScanner {
+	let root: SgNode | undefined;
+	const parseRoot = (): SgNode => {
+		root ??= parse(Lang.TypeScript, source).root();
+		return root;
+	};
+
+	return {
+		find(calleePattern: RegExp): CallSite[] {
+			// Avoid parsing files that cannot contain the requested callee. This is a
+			// lexical admission check only; every admitted match still comes from the
+			// AST below. Anchors are common in callers because the AST supplies the
+			// complete simple name, so remove them for this presence probe.
+			const needle = calleePattern.source.replace(/^\^|\$$/g, "");
+			const candidate = new RegExp(
+				`${needle}\\s*\\(`,
+				calleePattern.flags.replace("g", ""),
+			);
+			if (!candidate.test(stripSource(source))) return [];
+			const syntaxRoot = parseRoot();
+			const sites: CallSite[] = [];
+			const visit = (node: SgNode): void => {
+				if (node.kind() === "call_expression") {
+					const fn = node.field("function");
+					const callee =
+						fn?.kind() === "identifier"
+							? fn.text()
+							: fn?.kind() === "member_expression"
+								? fn.field("property")?.text()
+								: undefined;
+					if (callee !== undefined) {
+						calleePattern.lastIndex = 0;
+						const match = calleePattern.exec(callee);
+						if (match?.[0] === callee) {
+							const args = node.field("arguments");
+							const children = args?.namedChildren() ?? [];
+							const first = children[0];
+							const last = children.at(-1);
+							const options = children
+								.filter((arg) => arg.kind() === "object")
+								.sort((a, b) => a.range().start.index - b.range().start.index)
+								.at(-1);
+							sites.push({
+								line: node.range().start.line + 1,
+								callee,
+								argsText:
+									first && last
+										? source.slice(
+												first.range().start.index,
+												last.range().end.index,
+											)
+										: "",
+								optionsLiteral: options?.text(),
+							});
+						}
+					}
+				}
+				for (const child of node.children()) visit(child);
+			};
+			visit(syntaxRoot);
+			return sites;
+		},
+	};
+}
+
+export function callSites(source: string, calleePattern: RegExp): CallSite[] {
+	return createCallSiteScanner(source).find(calleePattern);
+}
+
+/** Return the first raw match that is not only literal text. */
+export function firstCommentMatch(
+	source: string,
+	regex: RegExp,
+): RegExpMatchArray | undefined {
+	const commentsBlanked = stripSource(source, { strings: "keep" });
+	const stringsBlanked = stripSource(source, { strings: "blank" });
+	const globalRegex = new RegExp(
+		regex.source,
+		regex.flags.includes("g") ? regex.flags : `${regex.flags}g`,
+	);
+	for (const match of source.matchAll(globalRegex)) {
+		const start = match.index ?? 0;
+		const end = start + match[0].length;
+		if (
+			!/\S/.test(commentsBlanked.slice(start, end)) ||
+			matchIsCode(stringsBlanked, start, end)
+		) {
+			return match;
+		}
+	}
+	return undefined;
 }
 
 export interface ListSourceFilesOptions {
@@ -299,13 +529,107 @@ export function relativePosix(root: string, absolute: string): string {
 	return toPosix(path.relative(root, absolute));
 }
 
+/**
+ * Nearest named function/class/const-or-let declaration STRICTLY ABOVE
+ * `lineIndex` (0-based) in `lines` — a cheap line-scan heuristic, not a
+ * parser. Built for {@link stableOccurrenceKey}: keying a per-occurrence
+ * exemption on this name survives a line inserted anywhere else in the file,
+ * because the declaration's TEXT, not its line number, is what the walk
+ * matches (#2475 — the bounded-eviction-idiom sweep's `path:line` exemptions
+ * used to re-key on every unrelated insertion above a flagged site).
+ *
+ * Declarations are matched by shape at the start of the line: `function`/
+ * `class` (with `export`/`default`/`abstract`/`async` modifiers), or a
+ * `const`/`let` bound to a name. The walk goes upward and returns the FIRST
+ * match — the nearest enclosing declaration, on the assumption true of every
+ * #2442 site: a flagged statement sits directly inside the body of the
+ * declaration immediately above it. `maxLookback` bounds the walk so one
+ * pathological file can't turn this into an O(fileSize) scan per occurrence.
+ *
+ * Matched at column 0 ONLY — no leading whitespace. This repo's shipped
+ * source declares every top-level function/class/const at column 0, so
+ * anchoring there is what keeps a nested LOCAL (`let evictKey` two lines
+ * above a flagged `for` loop, indented inside an `if` inside the function)
+ * from winning over the function that actually encloses the flagged site —
+ * the first draft matched any indentation and resolved
+ * `clients/debug-handles.ts`'s flagged line to `evictKey`, a loop-local
+ * variable, instead of `recordTrackedInit`. The trade is real: a declaration
+ * nested inside a class or namespace is invisible to this pattern and falls
+ * back to the content hash in {@link stableOccurrenceKey}, same as a
+ * module-scope site with no enclosing declaration at all.
+ */
+const DECLARATION_PATTERN =
+	/^(?:export\s+)?(?:default\s+)?(?:abstract\s+)?(?:async\s+)?(?:function\s*\*?\s+|class\s+)([A-Za-z_$][\w$]*)|^(?:export\s+)?(?:const|let)\s+([A-Za-z_$][\w$]*)\s*[:=]/;
+
+export function findEnclosingSymbol(
+	lines: readonly string[],
+	lineIndex: number,
+	maxLookback = 400,
+): string | undefined {
+	// Starts ABOVE lineIndex, never on it: a flagged occurrence that itself
+	// happens to read as `const x = ...` (the eviction idiom's own shape) must
+	// never resolve to ITSELF as its own "enclosing" declaration.
+	const floor = Math.max(0, lineIndex - maxLookback);
+	for (let i = lineIndex - 1; i >= floor; i--) {
+		const match = DECLARATION_PATTERN.exec(lines[i] ?? "");
+		if (match) return match[1] ?? match[2];
+	}
+	return undefined;
+}
+
+/**
+ * A per-occurrence exemption key immune to line-number churn (#2475): the
+ * enclosing declaration's NAME when {@link findEnclosingSymbol} finds one —
+ * readable, and stable under any edit that doesn't touch the declaration or
+ * the flagged line itself — with a short content hash of the flagged line's
+ * OWN text always appended (`lineContentHash`, already used by read-guard's
+ * line-move relocation for exactly this "survive line movement, catch
+ * content movement" property). The hash does two jobs: it disambiguates two
+ * flagged occurrences that share one enclosing declaration WHEN their flagged
+ * lines' text differs, and it is the WHOLE key when no declaration is found
+ * at all (a top-level flagged site). Either way, editing the flagged line's
+ * own text — as opposed to inserting a line elsewhere in the file — correctly
+ * changes the key, which is the direction that must re-trigger review.
+ *
+ * This does NOT guarantee two distinct occurrences always get distinct keys.
+ * In a class-shaped file every method's flagged line resolves to the SAME
+ * enclosing symbol (the class name — `findEnclosingSymbol` matches column-0
+ * declarations only, and a method sits indented), so two sibling methods that
+ * each flag a byte-identical line (a stereotyped idiom like
+ * `for (const key of map.keys()) {`) collide on one key (#2487 review F1).
+ * An exemption keyed to that string then excuses BOTH occurrences, not the
+ * one it was reasoned about — the same laundering `stableOccurrenceKey` was
+ * built to close, one layer down. `auditRegistry`'s `requireUniqueFlagged`
+ * (default on) is the backstop: it fails loud on any duplicate flagged key
+ * rather than let a caller of this function rely on the hash alone.
+ */
+export function stableOccurrenceKey(
+	relPath: string,
+	lines: readonly string[],
+	lineIndex: number,
+): string {
+	const symbol = findEnclosingSymbol(lines, lineIndex);
+	const hash = lineContentHash(lines[lineIndex] ?? "");
+	return symbol ? `${relPath}#${symbol}:${hash}` : `${relPath}#${hash}`;
+}
+
 // ── 2. Registry semantics ───────────────────────────────────────────────────
+
+/**
+ * One item the scan flags. A bare string is both the registry/exemption key
+ * AND the diagnostic detail shown in messages. A caller that can distinguish
+ * an occurrence's stable KEY from a human-readable DETAIL (a file:line, a
+ * snippet) should pass the object form so a duplicate-key collision message
+ * ({@link RegistryAuditInput.requireUniqueFlagged}) can name each colliding
+ * occurrence by its own detail rather than repeating the shared key.
+ */
+type FlaggedEntry = string | { key: string; detail: string };
 
 export interface RegistryAuditInput {
 	/** Sweep name, used in every composed message. */
 	sweepName: string;
 	/** The items the scan currently flags — the sweep's REDS. */
-	flagged: Iterable<string>;
+	flagged: Iterable<FlaggedEntry>;
 	/** Items the registry covers. */
 	registered: Iterable<string>;
 	/** Exempted item → the reason it is exempt. A reason is REQUIRED. */
@@ -328,6 +652,18 @@ export interface RegistryAuditInput {
 	minScanned?: number;
 	/** Appended to the unaccounted-items message: what the author should do. */
 	remediation?: string;
+	/**
+	 * Fail loud when the same key appears more than once in `flagged` — two
+	 * distinct occurrences whose derived id collided (#2487 review F1: a
+	 * class's sibling methods can hash-collide under `stableOccurrenceKey`).
+	 * A duplicate key means one exemption or registry entry silently excuses
+	 * MORE than the single site it names, which is exactly the laundering this
+	 * kit's per-occurrence keying exists to prevent. Default `true` — no sweep
+	 * built on this kit legitimately relies on two distinct occurrences
+	 * sharing one flagged key. Set `false` only for a caller that deliberately
+	 * flags the same key more than once (none does today).
+	 */
+	requireUniqueFlagged?: boolean;
 }
 
 export interface RegistryAudit {
@@ -355,12 +691,16 @@ export interface RegistryAudit {
  * library behavior.
  */
 export function auditRegistry(input: RegistryAuditInput): RegistryAudit {
-	const flagged = [...input.flagged];
+	const flaggedEntries = [...input.flagged].map((entry) =>
+		typeof entry === "string" ? { key: entry, detail: entry } : entry,
+	);
+	const flagged = flaggedEntries.map((entry) => entry.key);
 	const flaggedSet = new Set(flagged);
 	const registered = new Set(input.registered);
 	const exemptions = input.exemptions ?? {};
 	const minReasonLength = input.minReasonLength ?? 15;
 	const minFlagged = input.minFlagged ?? 1;
+	const requireUniqueFlagged = input.requireUniqueFlagged ?? true;
 	const problems: string[] = [];
 
 	// Two distinct emptiness failures, reported separately (#1755 review F4).
@@ -387,6 +727,42 @@ export function auditRegistry(input: RegistryAuditInput): RegistryAudit {
 		);
 	}
 
+	// Duplicate-key collision (#2487 review F1). Two distinct occurrences that
+	// derived the SAME key are exactly the shape a per-occurrence exemption
+	// exists to forbid: one exemption entry then excuses both, silently.
+	// Checked on the raw entries (not `flaggedSet`) so the message can name
+	// every colliding occurrence's own detail — real diagnostic content in a
+	// MESSAGE, never folded into a key. Runs BEFORE the exemption-matching
+	// checks below: a caller should fix a collision, not exempt around it.
+	if (requireUniqueFlagged) {
+		const byKey = new Map<string, string[]>();
+		for (const entry of flaggedEntries) {
+			const details = byKey.get(entry.key) ?? [];
+			details.push(entry.detail);
+			byKey.set(entry.key, details);
+		}
+		const collisions = [...byKey.entries()].filter(
+			([, details]) => details.length > 1,
+		);
+		if (collisions.length > 0) {
+			problems.push(
+				`${input.sweepName}: ${collisions.length} flagged key(s) collide — ` +
+					"two or more distinct occurrences derived the SAME key, so one " +
+					"exemption or registry entry would silently excuse more than the " +
+					"single site it names:\n" +
+					collisions
+						.map(
+							([key, details]) =>
+								`  ${key} (${details.length}×): ${details.join(", ")}`,
+						)
+						.join("\n") +
+					"\n\nGive each occurrence a distinguishing key (or fix the " +
+					"generator that produced two identical ones) before exempting " +
+					"either.",
+			);
+		}
+	}
+
 	// `Object.hasOwn`, never `item in exemptions` (#1755 review F1). The `in`
 	// operator walks the PROTOTYPE CHAIN, so a flagged item named `toString`,
 	// `constructor`, `valueOf` or `__proto__` would exempt itself against an
@@ -394,6 +770,36 @@ export function auditRegistry(input: RegistryAuditInput): RegistryAudit {
 	// `Object.keys` (own properties only), so it could never report the phantom
 	// exemption as stale either. No sweep's id namespace collides today, but the
 	// kit is built for six more with arbitrary id namespaces.
+	// Detail lookup for readable messages (#2487 review round 3 F1). A caller
+	// that passes the object `FlaggedEntry` form gives each key a
+	// human-readable detail — a file:line, typically — and a problem message
+	// should NAME the site rather than print a bare key nobody can act on.
+	// Round 3's probe 1 was exactly this: an unaccounted ordinal key
+	// (`...#3`) printed with no file:line, so the natural remediation excused
+	// the wrong call site. Built once, over every entry, first occurrence
+	// wins (a duplicate key's collision is already reported separately, above).
+	//
+	// Used by `unaccounted` ONLY (#2487 review round 4 F2). A stale
+	// exemption's key is, by construction, one `flaggedEntries` never
+	// contains (that is what "stale" means: the scan no longer flags it), so
+	// it can never have an entry in `detailByKey` — calling this lookup for
+	// `staleExemptions` was dead code that always fell through to the bare
+	// key. `staleExemptions` prints the bare key directly below instead.
+	const detailByKey = new Map<string, string>();
+	for (const entry of flaggedEntries) {
+		if (
+			entry.detail &&
+			entry.detail !== entry.key &&
+			!detailByKey.has(entry.key)
+		) {
+			detailByKey.set(entry.key, entry.detail);
+		}
+	}
+	const describe = (item: string): string => {
+		const detail = detailByKey.get(item);
+		return detail ? `${item} (${detail})` : item;
+	};
+
 	const unaccounted = flagged.filter(
 		(item) => !registered.has(item) && !Object.hasOwn(exemptions, item),
 	);
@@ -401,7 +807,7 @@ export function auditRegistry(input: RegistryAuditInput): RegistryAudit {
 		problems.push(
 			`${input.sweepName}: ${unaccounted.length} flagged item(s) are neither ` +
 				"registered nor exempted:\n" +
-				unaccounted.map((item) => `  ${item}`).join("\n") +
+				unaccounted.map((item) => `  ${describe(item)}`).join("\n") +
 				(input.remediation ? `\n\n${input.remediation}` : ""),
 		);
 	}
@@ -683,7 +1089,7 @@ export function hasNearbyCallSite(
 }
 
 /** Window defaults lifted from #1692's shipped form. */
-export const DEFAULT_EVIDENCE_WINDOW = {
+const DEFAULT_EVIDENCE_WINDOW = {
 	back: 150,
 	forward: 10,
 	calleeProximity: 3,
@@ -856,6 +1262,23 @@ export function assertNonEmptyScan(
 			`${label}: scanned/matched ${count}, below the declared floor of ${minimum}. ` +
 				"An empty sweep must fail, not read as clean — if the target genuinely " +
 				"went away, delete the sweep instead of letting it pass on nothing.",
+		);
+	}
+}
+
+/** Enforce lexical order so parallel admission additions stay local. */
+export function assertSortedKeys(label: string, keys: readonly string[]): void {
+	const duplicate = keys.find((key, index) => keys.indexOf(key) !== index);
+	if (duplicate !== undefined) {
+		throw new Error(
+			`${label}: entries must be unique; duplicate key is ${duplicate}`,
+		);
+	}
+	const sorted = [...keys].sort();
+	const first = keys.findIndex((key, index) => key !== sorted[index]);
+	if (first !== -1) {
+		throw new Error(
+			`${label}: entries must be sorted; first out-of-order key is ${keys[first]}`,
 		);
 	}
 }

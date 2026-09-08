@@ -1,10 +1,17 @@
 /** Bounded, process-local telemetry for behavior degraded during one session. */
 
+import type { ConfigDiagnosticCode } from "./config-diagnostic-codes.js";
 import { logExtension } from "./extension-log.js";
-import { LEDGER_FIELD_MAX, truncateForLedger } from "./ledger-bounds.js";
+import {
+	DEGRADATION_ENTRIES_PER_KIND,
+	LEDGER_FIELD_MAX,
+	truncateForLedger,
+} from "./ledger-bounds.js";
 import { logLatency } from "./latency-logger.js";
 import {
+	getSinkRotations,
 	getSinkWriteFailures,
+	resetSinkRotations,
 	resetSinkWriteFailures,
 } from "./ndjson-logger.js";
 // #2146: pulled at READ time, never pushed. `process-singletons.ts` is a
@@ -16,19 +23,91 @@ import {
 	getProcessSingletonResets,
 	PROCESS_SINGLETON_RESET_KIND,
 } from "./process-singletons.js";
+// #2506: same inversion, same reason — the log-dir resolver cannot import this
+// module (directly OR dynamically). THIS module is on a no-client-cycles cycle
+// via extension-log.ts; the resolver's whole correctness argument is that it
+// sits off every cycle, so an edge in that direction would put it back on one.
+// `getGlobalPiLensLogDir()`'s probe-home-redirect event is therefore written
+// into `probe-home-state.ts` and read back here instead. See that module's doc
+// comment for the full account.
+import { getProbeHomeRedirectEvent } from "./probe-home-state.js";
 
 // Re-exported so existing importers keep one name for the ledger's bound.
 export { LEDGER_FIELD_MAX, truncateForLedger };
 
 export type DegradationKind =
+	/** A configured analyzer was deliberately skipped for this session. */
+	| "startup-analyzer-disabled"
+	/**
+	 * #2430: a tool mutated a tracked file but matched no built-in name and no
+	 * mutation shape adapter, so pi-lens could only find the change by diffing
+	 * the disk around the call. Subject is the tool name, recorded ONCE per
+	 * tool, so a session report names every gap in the classification registry
+	 * instead of leaving the observational net's work invisible.
+	 */
+	| "unclassified-mutating-tool"
+	/**
+	 * #2430: an observational capture — the pre-snapshot, the post-diff, or the
+	 * `agent_settled` sweep — hit its per-turn wall-clock budget, timed out, or
+	 * was aborted. The net then has NO opinion about that call, which must be
+	 * visible rather than read as "nothing changed" (catalog shape 10).
+	 */
+	| "observed-mutation-budget"
+	/**
+	 * #2430: an armed observation's universe was TRUNCATED — the tool named a
+	 * directory with more entries than {@link
+	 * clients/observed-mutation.ts#OBSERVED_TARGET_DIR_MAX_ENTRIES}, so the
+	 * entries past the cap were never watched. Subject is the tool name. This
+	 * is deliberately NOT `observed-mutation-budget`: no clock and no byte
+	 * budget was exceeded, and a reader tuning a timeout would be chasing a
+	 * structural cap that no amount of time changes (#2449 review round 3).
+	 */
+	| "observed-mutation-dir-cap"
 	| "trust-refusal"
 	| "mode-suppression"
 	| "ts-idle-eviction"
 	| "spawn-failure"
 	/** A managed-tool verification probe exceeded its retained output bound. */
 	| "installer-verification-output-truncated"
+	/**
+	 * #2722: a managed-tool verification probe returned a NON-VERDICT — the
+	 * #208 transport-required matcher was armed, never matched, and the kept
+	 * output is a truncated prefix, so the probe could not decide whether the
+	 * binary is a healthy stdio LSP server or a broken install. Subject is the
+	 * binary path. Deliberately NOT `installer-verification-output-truncated`
+	 * (which also fires on a probe that went on to VERIFY): a reader acting on
+	 * this row is looking for an install kept without proof, not for a noisy
+	 * one. The installer keeps such an installation rather than deleting it.
+	 */
+	| "installer-verification-inconclusive"
 	/** A git ls-files collection was truncated before parsing completed (#2075). */
 	| "git-tracked-ignore-truncated"
+	/**
+	 * #2523: an `await` on a hook path exceeded its per-hook wall BUDGET, so
+	 * `bounded()` (`clients/deadline-utils.ts`) abandoned it and the hook
+	 * returned WITHOUT that await's answer. Subject is `<hook>:<label>`,
+	 * recorded ONCE per pair so a hook that blows its budget every turn writes
+	 * one row, not one per turn. Deliberately NOT informational: the hook
+	 * shipped a partial answer, which is a degradation the reader has to act
+	 * on (raise the budget, move the work off-hook, or fix what wedged), not a
+	 * designed-for tally like a log rotation.
+	 *
+	 * The DEADLINE cause only. A caller's own abort (Escape, turn cancel) is a
+	 * deliberate user action and records nothing at all; a shutdown abort
+	 * records `hook-await-abandoned` below. Recording all three here inverted
+	 * the reader's signal exactly as `clients/bootstrap.ts` documents at its
+	 * `unavailableReason !== "aborted"` guard (#2530 review F1).
+	 */
+	| "hook-await-exceeded"
+	/**
+	 * #2523: a bounded hook await was abandoned because the SESSION is tearing
+	 * down, not because it was slow. A tally, not a call to action — teardown
+	 * abandoning in-flight work is the design — so it is in
+	 * `INFORMATIONAL_DEGRADATION_KINDS` and renders without the `⚠` a real
+	 * degradation gets. Subject is `<hook>:<label>`, same as above, so the two
+	 * causes stay separable in `pilens_health`.
+	 */
+	| "hook-await-abandoned"
 	| "formatter-skip"
 	| "grammar-blocked"
 	| "lsp-breaker"
@@ -48,6 +127,20 @@ export type DegradationKind =
 	 */
 	| "lsp-client-skipped-unavailable-command"
 	/**
+	 * #2518: the session-root registry hit its cap and dropped a root this
+	 * process was serving, together with that root's loaded LSP config — so the
+	 * operator's `lsp.disabledServers` denial for it stops applying until the
+	 * next session start or tool call NAMING that root loads it again
+	 * (`shouldInitializeSessionRoot` guarantees those two entry points do,
+	 * which is why this is a degradation and not a fault; the readers of the
+	 * denial trigger no load). Subject is the cap itself, so a process cycling
+	 * through hundreds of roots keys ONE tally rather than one per dropped root
+	 * — and it is a TALLY (`incrementDegradationCount`), because the number of
+	 * roots this process has had to drop is exactly what an operator tunes the
+	 * cap against. The reason names the first root dropped.
+	 */
+	| "lsp-session-root-evicted"
+	/**
 	 * A warm-only client lookup (`getWarmClientForFile`) found no live client
 	 * for a file that HAS a language server with a resolvable root (#1934).
 	 * Subject is the candidate `serverId:root` set, so the ledger still answers
@@ -58,6 +151,17 @@ export type DegradationKind =
 	 */
 	| "lsp-warm-client-missing"
 	| "lsp-capability-skip"
+	/**
+	 * A server-initiated `workspace/applyEdit` fell back to the mutation
+	 * bridge (`clients/lsp-mutation.ts`, #2450) because its `LspMutationContext`
+	 * carried no `runtime`/`cacheManager`, and no bridge is mounted in this
+	 * process (`registerMutationBridge` only runs inside pi's own in-process
+	 * extension activation — the standalone MCP server, `mcp/server.ts`,
+	 * never calls it). The write still lands on disk; only its bookkeeping
+	 * (read-guard stamp, turn-state entry, change-log receipt) is lost.
+	 * Subject is the soliciting tool name.
+	 */
+	| "lsp-mutation-bridge-unmounted"
 	/**
 	 * #2007: a worktree-mutating git command was declined because a live peer
 	 * session shares this dirty checkout. The subject is the checkout root, so
@@ -77,6 +181,31 @@ export type DegradationKind =
 	 * record; the count here is the exact total.
 	 */
 	| "review-graph-snapshot-read"
+	/**
+	 * #2477 round 2: `recordEntitySnapshotDiff` (`clients/review-graph/service.ts`)
+	 * received a non-absolute `filePath`. Every production writer
+	 * (`clients/dispatch/runners/tree-sitter.ts`) passes `ctx.filePath`, which
+	 * `createDispatchContext` guarantees is always absolute (the #2016
+	 * invariant) — this is a caller regression, not a runtime condition, so it
+	 * fires at most once per subject (the offending path) and the diff is
+	 * skipped rather than computed under a key the builder's reader could
+	 * never reach. Subject is the raw (unnormalized) `filePath` received.
+	 */
+	| "review-graph-non-absolute-entity-path"
+	/**
+	 * #2489 round 2: `dispatchForFile`'s (`clients/dispatch/dispatcher.ts`)
+	 * delta-baseline key is `session.baseline.<ctx.filePath>`. Every production
+	 * caller reaches `ctx.filePath` through `createDispatchContext`, which
+	 * guarantees it is always absolute (the #2016 invariant) — the same
+	 * guarantee `review-graph-non-absolute-entity-path` enforces for the
+	 * sibling entity-snapshot seam. A relative `ctx.filePath` here can only
+	 * happen through a caller regression (a hand-built `DispatchContext`
+	 * bypassing the constructor), so this fires at most once per subject (the
+	 * offending path) and the baseline read/write is skipped for that
+	 * dispatch rather than keyed under a value the constructor would never
+	 * produce. Subject is the raw `ctx.filePath` received.
+	 */
+	| "dispatch-non-absolute-baseline-path"
 	/**
 	 * The project-snapshot persist seam detected durable meta/body evidence
 	 * failing the #2008 integrity gate — the meta's recorded gz size no longer
@@ -367,6 +496,27 @@ export type DegradationKind =
 	 */
 	| "orphan-backstop-scanner-escalated"
 	/**
+	 * #2524: the resource sampler's OWN process-table scanner (heartbeat CPU/RSS
+	 * sampling, `RESOURCE_SAMPLE_QUERY_TIMEOUT_MS` 2000ms — a much tighter and
+	 * far more frequent budget than the orphan backstop's one-per-cooldown
+	 * 5000ms scan) blew its timeout and was tree-killed, the sampler-path
+	 * sibling of `orphan-backstop-scanner-escalated`. Before this kind existed,
+	 * `terminateScannerChild` hardcoded the backstop's kind for BOTH callers, so
+	 * every sampler escalation was misattributed to a backstop sweep that had
+	 * provably not run (defect shape: a record's subject must be its producer).
+	 * Informational, not a `⚠`: `terminateScannerChild` fires the instant its
+	 * caller's timer elapses, strictly before `spawnCollectStdoutResult` knows
+	 * which of "close" or the timeout handler's own settle will win — so this
+	 * kind can and does fire on a query that goes on to settle `status: "ok"`
+	 * (no matching `resource-sampler-query-failed` row), i.e. a kill attempt
+	 * against a scanner that was already about to finish successfully. The
+	 * sampler already treats a lost tick as ordinary best-effort data loss
+	 * (self-healing on the next heartbeat), so this rising/falling noise
+	 * doesn't warrant the same attention as the backstop's rare, single-sweep
+	 * escalation.
+	 */
+	| "resource-sampler-scanner-escalated"
+	/**
 	 * `session_start`'s bounded change-log sequence read (#1162) blew its
 	 * budget and a project snapshot existed on disk, but the freshness gate
 	 * could not tell whether that snapshot was current (#1785). Hydration was
@@ -455,6 +605,30 @@ export type DegradationKind =
 	 * `writeFailures` doc comment.
 	 */
 	| "log-sink-write-failure"
+	/**
+	 * `ndjson-logger.ts` rotated a shared file-sink at its configured
+	 * `maxBytes` bound mid-session (#2505) — the write path itself caught the
+	 * crossing, not the once-per-process `runLogCleanup` session-start sweep
+	 * (which a long-lived process, e.g. the warm MCP server, may never run
+	 * again). Subject is the sink's absolute path, count is the number of
+	 * rotations this session. Same "pulled at READ time" shape as
+	 * `log-sink-write-failure` above and for the same reason:
+	 * `degradation-ledger.ts` already imports `ndjson-logger.ts`
+	 * (`getSinkWriteFailures`), so a reverse import to call
+	 * `recordDegradation`/`recordDegradationOnce` directly from there would
+	 * close a cycle — see `NdjsonWriterState.rotationCount`'s doc comment.
+	 */
+	| "log-sink-rotated"
+	/**
+	 * A rotation that `ndjson-logger.ts` attempted and could NOT complete
+	 * (#2505 review F2) — an unwritable backup path, or the Windows sharing
+	 * violation another process holding the file open produces. This is the
+	 * one that matters: the sink cannot bound itself, so the file keeps
+	 * growing past `maxBytes` until something outside the writer moves it.
+	 * Its sibling above is informational; this one renders as a warning.
+	 * Same read-time pull, same cycle reason.
+	 */
+	| "log-sink-rotate-failed"
 	/**
 	 * A word-index posting named a file id the file table could not resolve to
 	 * a path, so the posting was dropped from a search result or a decoded hit
@@ -545,13 +719,180 @@ export type DegradationKind =
 	 * nothing for the file, silently prior to this kind. Once per file per
 	 * session; subject is the file path.
 	 */
-	| "ast-grep-napi-html-script-scan-failed";
+	| "ast-grep-napi-html-script-scan-failed"
+	/**
+	 * A demand for the analyzer bootstrap clients (`clients/bootstrap.ts`)
+	 * could not be served, so the caller PROCEEDED WITHOUT them (#2467). The
+	 * subject is the demand reason — `session-start-scans`,
+	 * `tool-call-complexity-baseline`, … — so the ledger still answers WHICH
+	 * consumer degraded after the bounded records stop; `unavailableReason` in
+	 * the record says which of four SEAM causes fired (the primary session was
+	 * shutting down, the caller's wall-clock ceiling elapsed, the load itself
+	 * rejected, or the strike latch had already closed). A fifth possible
+	 * reason, `aborted` — the caller's OWN signal firing (Escape, a turn
+	 * ending) — is deliberately never written here: that is the caller
+	 * choosing to stop waiting, not the seam degrading, and counting it would
+	 * make a user's cancel read as an unhealthy analyzer graph. Counted rather
+	 * than once-per-session: the load is retried on the next demand, so the
+	 * number of failed demands is the observability question. Fail-open is the
+	 * whole point — without this kind, an analyzer silently not running and an
+	 * analyzer finding nothing read identically (AGENTS.md shape 10).
+	 */
+	| "analyzer-bootstrap-unavailable"
+	/**
+	 * The analyzer bootstrap stopped rebuilding after
+	 * `BOOTSTRAP_FAILURE_STRIKE_LIMIT` consecutive failed loads (#2467 review).
+	 * Recorded ONCE per session, because that is exactly what it reports: a
+	 * state change, not a rate. The per-demand degradations that follow keep
+	 * arriving under `analyzer-bootstrap-unavailable` with
+	 * `unavailableReason: "latched"`, so the ledger still answers both "how
+	 * often did a consumer degrade" and "why did it stop even trying".
+	 */
+	| "analyzer-bootstrap-latched"
+	/**
+	 * A config file the user wrote — or one key inside it — was rejected and
+	 * IGNORED, so pi-lens ran on defaults instead of on what the user asked for
+	 * (#2418). Written only through `warnIgnoredConfigOnce`
+	 * (`clients/config-warn.ts`), the single seam behind all three config
+	 * loaders. Before this kind the rejection existed only as a log line and a
+	 * one-shot notification: nothing counted it, so a session could silently run
+	 * the whole time on defaults with no durable trace. Subject is
+	 * `<file>\0<key>` (empty key = the whole file was unreadable), so a per-key
+	 * rejection and a whole-file rejection stay distinct rows for the same path;
+	 * `metadata.subsystem` says which loader. Once per subject per session — a
+	 * config is re-read on many paths and the count of re-reads is not the
+	 * observability question, the fact of the ignore is. This is the only kind
+	 * that carries a `code` (`PILENS_CFG_0001`) into the durable row.
+	 */
+	| "config-ignored"
+	/**
+	 * A config file location or root key the user wrote is DEPRECATED and was
+	 * still honored (#2426). The deliberate opposite of `config-ignored`: the
+	 * setting applied exactly as written, and the location it was written in is
+	 * on the removal schedule in `DEPRECATED_CONFIG_SURFACES`. Kept as its own
+	 * kind so "how many sessions ran on defaults because a config was rejected"
+	 * stays answerable from the ledger without subtracting deprecations out of
+	 * it. Same producer and same `<file>\0<key>` subject as `config-ignored`,
+	 * one row per `(file, key)` per session, carrying `PILENS_CFG_0002`
+	 * (deprecated key) or `PILENS_CFG_0003` (deprecated file location).
+	 */
+	| "config-deprecated"
+	/**
+	 * A config file's NOTICE LIST was truncated by the per-resolution bound, and
+	 * this row carries how many notices were summarised away (#2426 review round
+	 * 6). Written through `warnIgnoredConfigOnce` like the two kinds above,
+	 * under `PILENS_CFG_0007`, with the same `<file>` subject.
+	 *
+	 * Its own kind because it is a fact about the OUTPUT, not about the config:
+	 * a legacy file whose every setting was applied still overflows the bound,
+	 * and recording that under `config-ignored` — which it did before this kind
+	 * existed — both told the user their valid file was being ignored and made
+	 * "how many sessions ran on defaults because a config was rejected"
+	 * unanswerable, since the ledger could no longer tell a rejection from a
+	 * long list. One row per file per session.
+	 */
+	| "config-notice-suppressed"
+	/**
+	 * `getGlobalPiLensLogDir()` (`clients/probe-home-state.ts`, #2506) redirected
+	 * the LOG/ledger root away from the real `~/.pi-lens` because `PI_LENS_HOME`
+	 * was unset and the process's `cwd` looked like a probe context (inside a
+	 * specific `.claude/worktrees/<worktree>/` or under `os.tmpdir()`), or
+	 * `PILENS_PROBE=1` forced the redirect — this fires in test mode too, not
+	 * only outside it: `tests/support/vitest-setup.ts` pins `PI_LENS_HOME` for
+	 * the workers it covers, but globalSetup and children spawned without that
+	 * pin still redirect. Without this kind
+	 * a probe run outside vitest that forgot to pin `PI_LENS_HOME` would
+	 * silently write into the maintainer's real telemetry with no durable trace
+	 * — the exact gap that let two review probes leave 42 fixture rows in real
+	 * `~/.pi-lens` files on 2026-09-02. Subject is the redirected probe-home
+	 * path.
+	 *
+	 * Scope note (#2506 round 3): only the log family moves.
+	 * `getGlobalPiLensDir()` — installed tools, `bin/`, `instances.json`, the
+	 * orphan-backstop lease, the probe cache, the global `config.json`, LSP
+	 * server storage — stays cwd-independent, so a pi session running from a
+	 * worktree keeps its tools and stays visible to the machine-wide registry.
+	 * This row therefore means "telemetry was diverted", never "this session
+	 * lost its tools".
+	 *
+	 * Never written via `recordDegradation`/`recordDegradationOnce` like every
+	 * other kind above — the same `log-sink-write-failure`/
+	 * `process-singleton-reset` shape: it is folded into
+	 * `getDegradationSummary()` at READ time from `probe-home-state.ts`'s own
+	 * process-scoped event, because the resolver cannot import this module
+	 * (directly OR dynamically) without landing back on a `no-client-cycles`
+	 * cycle — this one is on the `extension-log.ts` cycle, and staying off
+	 * every cycle is the resolver's whole correctness argument. See
+	 * `probe-home-state.ts`'s doc comment.
+	 */
+	| "global-dir-probe-redirect"
+	/**
+	 * #2504 review round 8 (S1): a carried-forward deferred file entry was
+	 * dropped from an IN-BAND `turn_end` publish (`clients/actionable-warnings.ts`)
+	 * because its file changed, or the publish crossed a session boundary,
+	 * before this turn's own publish could keep it. Informational, not a
+	 * fault: the entry's findings are re-discoverable on the ordinary re-edit
+	 * cadence (a later turn's own analysis, or a later deferral, sees the
+	 * file again), so the loss self-heals and does not warrant a `⚠` in a
+	 * dogfood summary. See `INFORMATIONAL_DEGRADATION_KINDS` below.
+	 */
+	| "actionable-warnings-inband-superseded"
+	/**
+	 * #2504 review round 7 (F5): the DEFERRED sibling of
+	 * `actionable-warnings-inband-superseded` — a file changed while the
+	 * off-hook deferred LSP pull was reading it, so its carried entry is
+	 * dropped rather than published against content that has since moved.
+	 * Same informational treatment: the next deferral or in-band analysis
+	 * re-observes the file.
+	 */
+	| "actionable-warnings-deferred-superseded"
+	/**
+	 * #2626: `resources_discover` (#205) resolved `<packageRoot>/skills` to a
+	 * directory that is absent, unreadable, or holds no `SKILL.md` — pi then
+	 * registers zero skills with no extension error and no stderr. Fires on
+	 * an installed copy missing `skills/`, or on the entry file having been
+	 * copied out of the package tree by a managed extension cache (so the
+	 * nearest `package.json` is the cache's own). Subject is the resolved
+	 * `skills/` path; see `clients/skills-resolver.ts`.
+	 */
+	| "skills-dir-missing"
+	/**
+	 * #2636 (the #2626 class sweep's ast-grep leg): `AstGrepClient`'s
+	 * `ruleDir` fell back to `resolvePackagePath(import.meta.url, "rules")`
+	 * with no existence check when the project has no `rules/` of its own —
+	 * same managed-cache-relocation gap as `skills-dir-missing`. Fires only
+	 * when NEITHER the project `rules/` nor the resolved bundled `rules/`
+	 * yields a loadable `.yml` rule description. Subject is the resolved
+	 * bundled `rules/` path; see `clients/bundled-resource-health.ts` and
+	 * `clients/ast-grep-rule-manager.ts`'s `checkAstGrepRulesHealth`.
+	 */
+	| "ast-grep-rules-dir-missing"
+	/**
+	 * #2636: the bundled `rules/tree-sitter-queries` root — read identically
+	 * by `clients/cache/rule-cache.ts` (`BUNDLED_RULES_ROOT`, to classify a
+	 * rule file as bundled-vs-project for cache fingerprinting) and
+	 * `clients/tree-sitter-query-loader.ts` (`ruleFilesForLanguage`, to
+	 * enumerate the effective rule set) — is absent, unreadable, or
+	 * (uncommonly) present but empty. Fires ONCE regardless of how many
+	 * languages/call sites hit it, because the subject is the shared ROOT
+	 * path, not a per-language one: a language with no bundled queries
+	 * AUTHORED for it (cobol, plsql — disabled by design, see
+	 * `tree-sitter-shared.ts`) resolves zero files from a HEALTHY root and
+	 * must never be confused with the root itself being gone.
+	 */
+	| "tree-sitter-queries-dir-missing";
 
 export interface DegradationRecord {
 	kind: unknown;
 	subject: unknown;
 	reason: unknown;
 	metadata?: Record<string, unknown>;
+	/**
+	 * Optional STABLE config diagnostic code (#2418). Reserved row field: it is
+	 * written into the durable row AFTER the bounded caller metadata, so the
+	 * `MAX_METADATA_KEYS` cap can never evict the one field a user greps on.
+	 */
+	code?: ConfigDiagnosticCode;
 }
 
 export interface DegradationGroup {
@@ -563,7 +904,7 @@ export interface DegradationGroup {
 	latestReasons: Array<{ subject: string; reason: string }>;
 }
 
-const ENTRIES_PER_KIND = 20;
+const ENTRIES_PER_KIND = DEGRADATION_ENTRIES_PER_KIND;
 const MAX_DISTINCT_KINDS = 32;
 const OVERFLOW_KIND = "other";
 const groups = new Map<
@@ -620,7 +961,7 @@ export function recordDegradationOnce(record: DegradationRecord): void {
 		if (onceKeys.has(key)) return;
 		onceKeys.add(key);
 		if (recordDegradation({ kind, subject, reason: record.reason })) {
-			logDurableDegradation(kind, subject, 1, record.metadata);
+			logDurableDegradation(kind, subject, 1, record.metadata, record.code);
 		}
 	} catch (error) {
 		debugLedgerFailure("record-once", error);
@@ -669,7 +1010,7 @@ export function incrementDegradationCount(record: DegradationRecord): boolean {
 		// Durable rows use the summary's admission and emit the first event and
 		// power-of-two milestones only, keeping the sink bounded.
 		if (admitted && isPowerOfTwo(count)) {
-			logDurableDegradation(kind, subject, count, record.metadata);
+			logDurableDegradation(kind, subject, count, record.metadata, record.code);
 		}
 		return count === 1;
 	} catch (error) {
@@ -690,6 +1031,7 @@ function logDurableDegradation(
 	subject: string,
 	count: number,
 	metadata?: Record<string, unknown>,
+	code?: ConfigDiagnosticCode,
 ): void {
 	const boundedMetadata = boundLedgerMetadata(metadata);
 	logLatency({
@@ -703,6 +1045,9 @@ function logDurableDegradation(
 			subject,
 			count,
 			ledgerGeneration,
+			// Reserved row field, written AFTER the bounded caller metadata so the
+			// `MAX_METADATA_KEYS` cap cannot evict the stable code (#2418).
+			...(code ? { code } : {}),
 		},
 	});
 }
@@ -758,6 +1103,42 @@ export function getDegradationSummary(): DegradationGroup[] {
 			})),
 		});
 	}
+	// #2505, same read-time fold: a mid-session rotation is visible without
+	// this module writing about it through the very sink family it is
+	// reporting on — see the `log-sink-rotated` doc comment on
+	// `DegradationKind`.
+	const sinkRotations = getSinkRotations();
+	const rotated = sinkRotations.filter((sink) => sink.rotationCount > 0);
+	if (rotated.length > 0) {
+		summary.push({
+			kind: "log-sink-rotated",
+			count: rotated.reduce((total, sink) => total + sink.rotationCount, 0),
+			droppedCount: 0,
+			latestReasons: rotated.map((sink) => ({
+				subject: truncateForLedger(sink.file),
+				reason: truncateForLedger(
+					`${sink.rotationCount} rotation(s) at the configured byte bound`,
+				),
+			})),
+		});
+	}
+	// A rotation the writer ATTEMPTED and could not complete is a different
+	// fact from a rotation that happened, and the only signal that a sink is
+	// growing past its bound right now (#2505 review F2).
+	const rotateFailed = sinkRotations.filter((sink) => sink.failureCount > 0);
+	if (rotateFailed.length > 0) {
+		summary.push({
+			kind: "log-sink-rotate-failed",
+			count: rotateFailed.reduce((total, sink) => total + sink.failureCount, 0),
+			droppedCount: 0,
+			latestReasons: rotateFailed.map((sink) => ({
+				subject: truncateForLedger(sink.file),
+				reason: truncateForLedger(
+					`${sink.failureCount} failed rotation attempt(s); this sink is growing past its byte bound`,
+				),
+			})),
+		});
+	}
 	// #2146, same read-time fold: process-singleton resets live in the leaf
 	// module's own bounded log. One entry per family, so this group's count is
 	// the number of families this build could not adopt, never an event tally.
@@ -771,6 +1152,25 @@ export function getDegradationSummary(): DegradationGroup[] {
 				subject: truncateForLedger(reset.family),
 				reason: truncateForLedger(reset.reason),
 			})),
+		});
+	}
+	// #2506, same read-time fold: `getGlobalPiLensLogDir()`'s probe-home redirect
+	// fires at most once per process (see `probe-home-state.ts`), so this is a
+	// presence check, not a tally.
+	const probeHomeRedirect = getProbeHomeRedirectEvent();
+	if (probeHomeRedirect) {
+		summary.push({
+			kind: "global-dir-probe-redirect",
+			count: 1,
+			droppedCount: 0,
+			latestReasons: [
+				{
+					subject: truncateForLedger(probeHomeRedirect.probeHome),
+					reason: truncateForLedger(
+						`PI_LENS_HOME unset with cwd in an agent worktree/tmp probe context (${probeHomeRedirect.cwd}), or PILENS_PROBE=1 forced it; LOGS redirected away from the real home directory (tools, bin and instances.json are unaffected)`,
+					),
+				},
+			],
 		});
 	}
 	return summary;
@@ -796,6 +1196,35 @@ function isRenderableSummary(value: unknown): value is DegradationGroup[] {
 	});
 }
 
+/**
+ * Kinds that record something the system did ON PURPOSE, correctly, and
+ * that a reader only needs a tally of — never a call to action (#2505
+ * review). A routine log rotation at the configured bound is the writer
+ * working as designed; giving it the same warning marker a real
+ * degradation gets trains the reader to ignore the marker. The FAILED
+ * rotation is the line that has to stand out, so it is deliberately NOT
+ * in this set.
+ */
+const INFORMATIONAL_DEGRADATION_KINDS: ReadonlySet<string> = new Set([
+	"log-sink-rotated",
+	// #2504 review round 8 (S1): both fire on the ordinary re-edit cadence
+	// (a carry-forward window closing, or a session boundary) and are
+	// self-healing -- the next turn's analysis or deferral re-observes the
+	// file -- so a `⚠` overstates them the same way a routine log rotation
+	// would.
+	"actionable-warnings-inband-superseded",
+	"actionable-warnings-deferred-superseded",
+	// #2523: a hook await abandoned because the session is tearing down. The
+	// teardown signal firing is the design working, so it is a tally; the
+	// BUDGET blow-out (`hook-await-exceeded`) is the line that has to stand
+	// out, and a caller's own Escape records nothing at all.
+	"hook-await-abandoned",
+	// #2524: can fire on a query that ultimately settles `ok` (see the kind's
+	// doc comment above) and is frequent/self-healing by design — a `⚠` would
+	// cry wolf on the sampler's ordinary best-effort data loss.
+	"resource-sampler-scanner-escalated",
+]);
+
 export function renderDegradationLines(
 	summary: unknown = getDegradationSummary(),
 ): string[] {
@@ -804,6 +1233,9 @@ export function renderDegradationLines(
 	return [
 		"Degradations:",
 		...summary.map((group) => {
+			if (INFORMATIONAL_DEGRADATION_KINDS.has(group.kind)) {
+				return `  ${group.kind}: ${group.count}`;
+			}
 			const latest = group.latestReasons.at(-1);
 			return `  ⚠ ${group.kind}: ${group.count}${latest ? ` — ${latest.subject}: ${latest.reason}` : ""}`;
 		}),
@@ -832,6 +1264,10 @@ export function resetDegradationLedger(): void {
 	// process-lifetime latch too — it re-arms alongside the rest of the
 	// ledger rather than surviving past the session that observed it.
 	resetSinkWriteFailures();
+	// #2505, same catalog shape 17 re-arm: a rotation tally recurs (new writes
+	// keep crossing the bound), so clearing it costs nothing and a later
+	// session re-observes the fact fresh.
+	resetSinkRotations();
 	// #2146 review F3: the OTHER pulled source, `getProcessSingletonResets()`,
 	// deliberately does NOT re-arm here, and the difference from its neighbour
 	// above is the point. A sink write failure recurs — new writes fail, so
@@ -844,7 +1280,18 @@ export function resetDegradationLedger(): void {
 	// session (one entry per family, capped at 16), so leaving it costs a fixed
 	// handful of lines and keeps a process-scope fact visible for the process's
 	// life. Deliberate exception to catalog shape 17, not an oversight.
+	//
+	// `getProbeHomeRedirectEvent()` (#2506) is the same shape as the
+	// process-singleton case above and for the same reason: the redirect is
+	// resolved at most once per PROCESS (memoized in the `globalThis` slot
+	// `probe-home-state.ts` owns, not a session-scoped one), so it cannot
+	// recur within this process's life either — clearing it here would hide
+	// the fact from every session after the first in the same probe process.
 }
 
-export const DEGRADATION_ENTRIES_PER_KIND = ENTRIES_PER_KIND;
+// Re-exported so every existing importer keeps its specifier. The value now
+// lives in the `ledger-bounds.js` leaf (#2426), so a producer that only needs
+// the BOUND does not have to import the ledger — and cannot be broken by a test
+// that mocks it wholesale.
+export { DEGRADATION_ENTRIES_PER_KIND };
 export const DEGRADATION_MAX_DISTINCT_KINDS = MAX_DISTINCT_KINDS;

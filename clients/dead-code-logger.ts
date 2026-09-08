@@ -8,10 +8,10 @@
 
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
-import { getGlobalPiLensDir } from "./file-utils.js";
+import { getGlobalPiLensLogDir } from "./probe-home-state.js";
 import { createNdjsonLogger } from "./ndjson-logger.js";
 
-const LOG_DIR = getGlobalPiLensDir();
+const LOG_DIR = getGlobalPiLensLogDir();
 const LOG_FILE = path.join(LOG_DIR, "dead-code.log");
 const LOG_BACKUP_FILE = path.join(LOG_DIR, "dead-code.log.1");
 const MAX_LOG_BYTES = Math.max(
@@ -48,9 +48,4 @@ export interface DeadCodeScanEvent {
 export function logDeadCodeScan(event: DeadCodeScanEvent): void {
 	if (isTestMode()) return;
 	writer.log({ ts: new Date().toISOString(), ...event });
-}
-
-/** Resolve once all enqueued dead-code writes are on disk (tests/shutdown). */
-export function flushDeadCodeLog(): Promise<void> {
-	return writer.flush();
 }

@@ -144,6 +144,8 @@ const SPAWN_EXEMPTIONS: Readonly<Record<string, string>> = {
 		"real clients across two module instances to prove process-scope retention; handshake only against the instant fixture, no contention budget",
 	"tests/clients/lsp/service-notify-cpu-liveness.test.ts":
 		"real wedged child and CPU sampling run in the serialized wall-clock-budget phase; the lower-bound wedge assertion needs that quiet phase",
+	"tests/clients/lsp/headless-tool-call-keepalive.test.ts":
+		"#2507: the real LSP child is spawned by a headless NODE child this test runs, not by this process; it is phased in the serialized wall-clock-budget lane (the flake-shape admission gate requires that lane), and its assertions are the child's exit code and stdout, not a handshake budget",
 	"tests/clients/lsp/initialize-timeout-backstop.test.ts":
 		"POSIX-only real-child initialize-timeout backstop; waits on a 50ms timeout firing then sleeps past kill escalation — deterministic and short",
 	"tests/clients/lsp/launch.test.ts":
@@ -166,6 +168,13 @@ const SPAWN_EXEMPTIONS: Readonly<Record<string, string>> = {
 		"one real handshake proving lsp client byte attribution; asserts the memory table, never a contended wire transaction",
 	"tests/clients/memory-sampler-root-discriminator.test.ts":
 		"real handshakes at two roots proving per-root client attribution; the assertion is the side table, not a timing budget",
+	// NB: these reasons must NOT spell the fixture's own name — this file
+	// self-excludes by splitting that literal at runtime, so writing it out
+	// here would make the sweep flag itself.
+	"tests/scripts/worktree-hygiene.test.ts":
+		"names the fake LSP fixture only inside synthetic process-table command strings feeding the #2435 orphan-reaper predicate; spawns nothing at all, LSP or otherwise",
+	"tests/scripts/process-scan.test.ts":
+		"names the fake LSP fixture only inside synthetic `ps`/CIM listing text used to pin the #2435 process-table parsers (moved here from the prune-agent-worktrees suite by PR #2438 review round 3, F2); it does list the real process table, but spawns no LSP child and asserts no wire timing",
 };
 
 describe("lsp-spawn-heavy Vitest project coverage", () => {

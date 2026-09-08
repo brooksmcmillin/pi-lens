@@ -369,7 +369,7 @@ export function lintPrBody(body = "", options = {}) {
  *
  * @param {{ number: number, body?: string | null }} payloadPr
  * @param {typeof fetch} fetchImpl
- * @returns {Promise<{body: string, normalized: boolean}>}
+ * @returns {Promise<{body: string, normalized: boolean, title: string | undefined}>}
  */
 export async function fetchLivePrBody(payloadPr, fetchImpl) {
 	const token = process.env.GITHUB_TOKEN;
@@ -393,7 +393,10 @@ export async function fetchLivePrBody(payloadPr, fetchImpl) {
 	const data = await response.json();
 	if (data.body !== null && typeof data.body !== "string")
 		throw new Error("GitHub API returned no body");
-	return normalizePrBodyForChecking(data.body ?? "", payloadPr.number);
+	return {
+		...normalizePrBodyForChecking(data.body ?? "", payloadPr.number),
+		title: data.title,
+	};
 }
 
 export async function resolveLivePrBody(
@@ -449,10 +452,10 @@ export async function resolveTouchesTests(
 			throw new Error("GitHub API returned no file list");
 		return files.some(
 			(file) =>
-				/^tests\//.test(file.filename ?? "") ||
+				(file.filename ?? "").startsWith("tests/") ||
 				// A rename OUT of tests/ reports only the new path in filename; a
 				// removal PR is exactly what the assessment exists to catch.
-				/^tests\//.test(file.previous_filename ?? ""),
+				(file.previous_filename ?? "").startsWith("tests/"),
 		);
 	} catch (error) {
 		console.warn(

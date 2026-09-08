@@ -16,6 +16,9 @@ import { removeTempDirSync } from "./test-utils.js";
 let dir: string;
 
 vi.mock("../../clients/file-utils.js", () => ({
+	// #2506: both resolvers, same dir. Under the vitest PI_LENS_HOME pin
+	// production returns one value for both, so a double that split them
+	// would diverge from production on the axis these tests measure.
 	getGlobalPiLensDir: () => dir,
 }));
 

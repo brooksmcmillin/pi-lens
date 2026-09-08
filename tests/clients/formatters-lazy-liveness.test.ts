@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createPiMock, makeCtx } from "../support/pi-mock.js";
+import { makeLspServiceDouble } from "../support/lsp-service-double.js";
 
 describe("formatter session warm/first-use liveness (#1394)", () => {
 	afterEach(() => vi.resetModules());
@@ -20,12 +21,13 @@ describe("formatter session warm/first-use liveness (#1394)", () => {
 			},
 		}));
 		vi.doMock("../../clients/lsp/index.js", () => ({
-			getLSPService: () => ({
-				touchFile: async () => [],
-				supportsLSP: () => false,
-				getStatus: () => [],
-				getAliveServerIds: () => [],
-			}),
+			getLSPService: () =>
+				makeLspServiceDouble({
+					touchFile: async () => [],
+					supportsLSP: () => false,
+					getStatus: () => [],
+					getAliveServerIds: () => [],
+				}),
 			resetLSPService: () => {},
 		}));
 		vi.doMock(
@@ -47,8 +49,10 @@ describe("formatter session warm/first-use liveness (#1394)", () => {
 				}),
 			}),
 		);
-		vi.doMock("../../clients/bootstrap.js", () => ({
-			loadBootstrapClients: async () => ({
+		vi.doMock("../../clients/bootstrap.js", async () => {
+			const { bootstrapSeamMock } =
+				await import("../support/bootstrap-mock.js");
+			return bootstrapSeamMock(async () => ({
 				metricsClient: { reset: () => {} },
 				todoScanner: {},
 				biomeClient: { isAvailable: () => false, isSupportedFile: () => false },
@@ -70,8 +74,8 @@ describe("formatter session warm/first-use liveness (#1394)", () => {
 					isSupportedFile: () => false,
 					analyzeFile: () => null,
 				},
-			}),
-		}));
+			}));
+		});
 		const { default: registerExtension } = await import("../../index.js");
 		const pi = createPiMock({ "immediate-format": true, "no-lsp": true });
 		registerExtension(pi.asExtensionAPI());

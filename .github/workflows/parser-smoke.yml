@@ -35,6 +35,7 @@ jobs:
     timeout-minutes: 15
     # The installer resolves GitHub release assets through the REST API.
     # Unauthenticated is 60 requests/hour per IP and shared runners exhaust it.
+    #
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:

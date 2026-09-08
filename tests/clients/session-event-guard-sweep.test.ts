@@ -51,6 +51,8 @@ const REPO_ROOT = path.resolve(
 const UNWRAPPED_HANDLER_REASONS: Readonly<Record<string, string>> = {
 	resources_discover:
 		"The handler takes `_event, _ctx` and reads neither, so there is no accessor for the SDK to invalidate.",
+	before_agent_start:
+		"The handler reads only the event payload and never accepts or accesses ctx, so stale ctx cannot affect it.",
 	session_before_fork:
 		"Registered with no ctx parameter at all; it reads only pi-lens's own in-process state.",
 	tool_call:

@@ -28,18 +28,21 @@ import {
 } from "../../clients/runtime-coordinator.js";
 import { handleToolCall } from "../../clients/runtime-tool-call.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
+import { makeLspServiceDouble } from "../support/lsp-service-double.js";
 
 const touchFileMock = vi.fn().mockResolvedValue(undefined);
 vi.mock("../../clients/lsp/index.js", () => ({
-	getLSPService: () => ({
-		touchFile: touchFileMock,
-		getWarmClientForFile: vi.fn().mockResolvedValue(undefined),
-	}),
+	getLSPService: () =>
+		makeLspServiceDouble({
+			touchFile: touchFileMock,
+			getWarmClientForFile: vi.fn().mockResolvedValue(undefined),
+		}),
 	resetLSPService: () => {},
 }));
 
-vi.mock("../../clients/bootstrap.js", () => ({
-	loadBootstrapClients: async () => ({
+vi.mock("../../clients/bootstrap.js", async () => {
+	const { bootstrapSeamMock } = await import("../support/bootstrap-mock.js");
+	return bootstrapSeamMock(async () => ({
 		complexityClient: {
 			isSupportedFile: () => false,
 			analyzeFile: async () => null,
@@ -48,8 +51,8 @@ vi.mock("../../clients/bootstrap.js", () => ({
 		ruffClient: {},
 		metricsClient: {},
 		agentBehaviorClient: { recordToolCall: () => {}, formatWarnings: () => "" },
-	}),
-}));
+	}));
+});
 
 const readGuardLogEntries: Array<Record<string, unknown>> = [];
 vi.mock("../../clients/read-guard-logger.js", async (importOriginal) => {

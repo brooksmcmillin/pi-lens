@@ -2,10 +2,15 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { CacheManager } from "../../clients/cache-manager.js";
+import {
+	getDegradationSummary,
+	resetDegradationLedger,
+} from "../../clients/degradation-ledger.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { handleToolCall } from "../../clients/runtime-tool-call.js";
 import type { TreeSitterClient } from "../../clients/tree-sitter-client.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
+import { makeLspServiceDouble } from "../support/lsp-service-double.js";
 
 // handleToolCall calls getLSPService() directly (not via DI, matching the
 // pattern already used by runtime-session.ts). Stub it so tests never spin up
@@ -14,15 +19,17 @@ import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 const touchFileMock = vi.fn().mockResolvedValue(undefined);
 const getWarmClientForFileMock = vi.fn().mockResolvedValue(undefined);
 vi.mock("../../clients/lsp/index.js", () => ({
-	getLSPService: () => ({
-		touchFile: touchFileMock,
-		getWarmClientForFile: getWarmClientForFileMock,
-	}),
+	getLSPService: () =>
+		makeLspServiceDouble({
+			touchFile: touchFileMock,
+			getWarmClientForFile: getWarmClientForFileMock,
+		}),
 	resetLSPService: () => {},
 }));
 
-vi.mock("../../clients/bootstrap.js", () => ({
-	loadBootstrapClients: async () => ({
+vi.mock("../../clients/bootstrap.js", async () => {
+	const { bootstrapSeamMock } = await import("../support/bootstrap-mock.js");
+	return bootstrapSeamMock(async () => ({
 		complexityClient: {
 			isSupportedFile: () => false,
 			analyzeFile: async () => null,
@@ -31,8 +38,8 @@ vi.mock("../../clients/bootstrap.js", () => ({
 		ruffClient: {},
 		metricsClient: {},
 		agentBehaviorClient: { recordToolCall: () => [], formatWarnings: () => "" },
-	}),
-}));
+	}));
+});
 
 // #2402: the partial-apply afterWrite routes through handleToolResult, whose
 // dispatch pipeline is a real subprocess surface. The mock keeps the test at
@@ -82,6 +89,108 @@ function baseDeps(
 }
 
 describe("handleToolCall", () => {
+	it("does not collect a complexity baseline when disabled", async () => {
+		resetDegradationLedger();
+		const env = setupTestEnvironment("pi-lens-runtime-tool-call-complexity-");
+		try {
+			const filePath = createTempFile(
+				env.tmpDir,
+				"src/disabled.ts",
+				"const x = 1;\n",
+			);
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			await handleToolCall(
+				baseDeps({
+					runtime,
+					getFlag: (name) => name === "no-complexity",
+					event: { toolName: "read", input: { filePath } },
+				}),
+			);
+			expect(runtime.complexityBaselines.has(filePath)).toBe(false);
+			expect(
+				getDegradationSummary().some(
+					(entry) => entry.kind === "startup-analyzer-disabled",
+				),
+			).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("does not let heredoc body words trigger the real git guard", async () => {
+		const env = setupTestEnvironment("pi-lens-2726-heredoc-guard-");
+		try {
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			runtime.setTelemetryIdentity({ sessionId: "session-2726" });
+			runtime.updateGitGuardStatus(true, "existing blocker");
+			const result = await handleToolCall(
+				baseDeps({
+					runtime,
+					ctx: { cwd: env.tmpDir },
+					getFlag: (name) => name === "lens-guard",
+					event: {
+						toolName: "bash",
+						input: {
+							command: "cat <<EOF\nbody text: git push\nEOF\n",
+						},
+					},
+				}),
+			);
+			expect(result).toBeUndefined();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("does not block a command after a heredoc delimiter metacharacter", async () => {
+		const env = setupTestEnvironment("pi-lens-2726-heredoc-operator-");
+		try {
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			runtime.setTelemetryIdentity({ sessionId: "session-2726-operator" });
+			runtime.updateGitGuardStatus(true, "existing blocker");
+			const result = await handleToolCall(
+				baseDeps({
+					runtime,
+					ctx: { cwd: env.tmpDir },
+					getFlag: (name) => name === "lens-guard",
+					event: {
+						toolName: "bash",
+						input: { command: "cat <<EOF; echo git push\nbody\nEOF" },
+					},
+				}),
+			);
+			expect(result).toBeUndefined();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("still blocks a git command after a heredoc body", async () => {
+		const env = setupTestEnvironment("pi-lens-2726-heredoc-git-");
+		try {
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			runtime.setTelemetryIdentity({ sessionId: "session-2726-git" });
+			runtime.updateGitGuardStatus(true, "existing blocker");
+			const result = await handleToolCall(
+				baseDeps({
+					runtime,
+					ctx: { cwd: env.tmpDir },
+					getFlag: (name) => name === "lens-guard",
+					event: {
+						toolName: "bash",
+						input: { command: "cat <<EOF; git push\nbody\nEOF" },
+					},
+				}),
+			);
+			expect(result).toMatchObject({ block: expect.anything() });
+		} finally {
+			env.cleanup();
+		}
+	});
 	it("is a no-op when lensEnabled is false", async () => {
 		const runtime = new RuntimeCoordinator();
 		const recordRead = vi.spyOn(runtime.readGuard, "recordRead");
@@ -575,6 +684,103 @@ describe("#2402 partial-apply contract (mixed-validity preflight)", () => {
 			// The synthetic post-edit dispatch stamps the read guard so a
 			// follow-up edit is not judged stale against our own commit.
 			expect(recordWritten).toHaveBeenCalledWith(filePath);
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+/**
+ * Review round 4, finding F5. `clients/hashline-anchor.ts`'s per-file anchor
+ * memo is keyed by `mtimeMs`+`size` alone. A rewrite that lands within one
+ * mtime tick and does not change the file's byte length changes NEITHER key,
+ * so a memo that survived across `tool_call`s could serve the PREVIOUS
+ * content's anchor index to a `tool_call` that reads the file after it
+ * changed. The fix drops the memo at the `tool_call` boundary
+ * (`handleToolCallImpl` entry in `clients/runtime-tool-call.ts`), so this
+ * drives `handleToolCall` itself — the reviewer's probe reproduces the
+ * mtime+size collision exactly, then asserts on what `readGuard.checkEdit`
+ * was actually told about the SECOND call, since that is what the guard and
+ * `addModifiedRange` act on downstream.
+ */
+describe("#2423 review round 4 (F5) — the hashline anchor memo drops at the tool_call boundary", () => {
+	it("does not resolve a rewritten file's line from a same-mtime, same-size stale memo", async () => {
+		const env = setupTestEnvironment("pi-lens-2423-f5-anchor-memo-");
+		try {
+			const filePath = createTempFile(
+				env.tmpDir,
+				"src/memo.ts",
+				"alpha\nbeta\ngamma\n",
+			);
+			// "alpha" -> "zebra": same byte length (5 ASCII chars), same total
+			// file size, so the ONLY thing that could distinguish the two reads
+			// is a genuine re-read, never mtime+size.
+			const before = "alpha\nbeta\ngamma\n";
+			const after = "zebra\nbeta\ngamma\n";
+			expect(Buffer.byteLength(after)).toBe(Buffer.byteLength(before));
+			const { computeHashlineAnchors } =
+				await import("../../clients/hashline-anchor.js");
+			const anchorForAlpha = computeHashlineAnchors(before)![0]!;
+			// Pinned, not "now": two separate fs.writeFileSync calls landing on
+			// the same wall-clock tick is exactly the scenario under test, and
+			// asserting it via real timing would be flaky by construction.
+			const pinnedMtime = new Date(2026, 0, 1, 12, 0, 0, 0);
+			fs.utimesSync(filePath, pinnedMtime, pinnedMtime);
+			const statBefore = fs.statSync(filePath);
+
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			const checkEdit = vi.spyOn(runtime.readGuard, "checkEdit");
+			const deps = baseDeps({
+				runtime,
+				ctx: { cwd: env.tmpDir },
+			});
+
+			// Call 1: warms `clients/hashline-anchor.ts`'s per-file memo against
+			// `before`'s content (this is what makes the second call a proof of
+			// the DROP, not just "the file happened to be read fresh once").
+			await handleToolCall({
+				...deps,
+				event: {
+					toolName: "replace",
+					input: {
+						path: filePath,
+						remove_from: anchorForAlpha,
+						remove_to: anchorForAlpha,
+						replacement_lines: ["placeholder"],
+					},
+				},
+			});
+			expect(checkEdit).toHaveBeenCalledTimes(1);
+			expect(checkEdit.mock.calls[0]![0]).toBe(filePath);
+			expect(checkEdit.mock.calls[0]![1]).toEqual([1, 1]);
+
+			// Rewrite with DIFFERENT content, IDENTICAL mtime and size.
+			fs.writeFileSync(filePath, after, "utf8");
+			fs.utimesSync(filePath, pinnedMtime, pinnedMtime);
+			const statAfter = fs.statSync(filePath);
+			expect(statAfter.mtimeMs).toBe(statBefore.mtimeMs);
+			expect(statAfter.size).toBe(statBefore.size);
+
+			// Call 2 quotes the SAME anchor token. "alpha" no longer exists in
+			// the file, so a genuine re-read must fail to resolve it — a memo
+			// that survived from call 1 would instead answer `line: 1`
+			// confidently, because that is exactly what it answered before.
+			await handleToolCall({
+				...deps,
+				event: {
+					toolName: "replace",
+					input: {
+						path: filePath,
+						remove_from: anchorForAlpha,
+						remove_to: anchorForAlpha,
+						replacement_lines: ["placeholder"],
+					},
+				},
+			});
+			expect(checkEdit).toHaveBeenCalledTimes(2);
+			expect(checkEdit.mock.calls[1]![0]).toBe(filePath);
+			expect(checkEdit.mock.calls[1]![1]).toBeUndefined();
 		} finally {
 			env.cleanup();
 		}

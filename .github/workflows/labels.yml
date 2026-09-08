@@ -107,3 +107,7 @@ jobs:
         with:
           manifest: .github/labels.yml
           token: ${{ secrets.GITHUB_TOKEN }}
+          # Explicit, though the pinned action already defaults `prune` to
+          # true: any live label absent from the manifest above is DELETED
+          # on every run of this workflow (#2553).
+          prune: true

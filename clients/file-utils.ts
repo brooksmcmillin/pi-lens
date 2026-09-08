@@ -6,6 +6,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Minimatch, type MinimatchOptions } from "./deps/minimatch.js";
+import { FRESHNESS_CADENCE_MS } from "./freshness-cadence.js";
 import {
 	isInSpawnTimeoutCooldown,
 	noteSpawnTimeout,
@@ -19,9 +20,12 @@ import {
 	getPiLensGlobalConfigPath,
 } from "./lens-config.js";
 import {
+	homeRelativePath,
+	isExternalOrVendorFile,
 	isUnderDir,
 	normalizeEphemeralMapKey,
 	normalizeFilePath,
+	toProjectRelativePath,
 } from "./path-utils.js";
 import {
 	findPiLensConfigInDir,
@@ -64,26 +68,104 @@ export function getProjectDataDir(cwd: string): string {
 }
 
 /**
+ * The project-data path to SHOW an agent or a human, for a file that
+ * {@link getProjectDataDir} owns.
+ *
+ * #2521: the turn-end actionable-warnings advisory told the agent to read a
+ * hardcoded `.pi-lens/cache/actionable-warnings.json`, but that spelling is
+ * only correct in the LEGACY arm of `getProjectDataDir` — a project with no
+ * `.pi-lens/` directory (the common case) stores the report under
+ * `~/.pi-lens/projects/<slug>/cache/`, and a `PILENS_DATA_DIR` project stores
+ * it somewhere else again. Agents followed the advisory literally and got
+ * `cat: .pi-lens/cache/actionable-warnings.json: No such file or directory`.
+ *
+ * Any instructional string that NAMES a project-data location must be built
+ * here, so the displayed path and the written path can never disagree. Guarded
+ * by `tests/clients/data-dir-display-path-sweep.test.ts`.
+ *
+ * Two output shapes, matching `toRunnerDisplayPath`'s convention
+ * (`clients/dispatch/runner-context.ts`) so one advisory never mixes styles:
+ *   - under `cwd` → a `/`-separated path relative to it
+ *     (`.pi-lens/cache/actionable-warnings.json`), which is what the legacy
+ *     arm produces and what an agent can paste straight into a shell.
+ *   - anywhere else → absolute, `/`-separated, and `~`-folded via
+ *     {@link homeRelativePath} so the default `~/.pi-lens/projects/...` store
+ *     does not leak the account name into agent context (#2440 F5).
+ *
+ * Pure string work on top of `getProjectDataDir`'s own resolution: it never
+ * stats the target, so it is safe to call for a file that has not been written
+ * yet and cannot throw on a surface whose whole job is to render a hint.
+ *
+ * The relative-or-absolute decision reuses `toProjectRelativePath`
+ * (`clients/path-utils.ts`) — the same shape-aware, non-stat'ing primitive
+ * `toRunnerDisplayPath` (`clients/dispatch/runner-context.ts`) composes for
+ * the analogous "relative path if under this root, else something else"
+ * decision — rather than a second hand-rolled `path.relative` fold. It is NOT
+ * `toRunnerDisplayPath` itself: that helper routes its result through
+ * `normalizeMapKey`, which on win32 calls `realpathSync.native()` (or, for a
+ * not-yet-existing path, lowercases the unresolved tail) — exactly the
+ * stat-and-mutate-casing behavior this function's contract above rules out.
+ */
+export function displayProjectDataPath(
+	cwd: string,
+	...segments: string[]
+): string {
+	const absolute = path.resolve(getProjectDataDir(cwd), ...segments);
+	const absolutePosix = absolute.replace(/\\/g, "/");
+	const relative = toProjectRelativePath(absolute, cwd);
+	if (relative !== absolutePosix) {
+		return relative;
+	}
+	// `toProjectRelativePath` fell back to the (posix-ified) absolute path —
+	// `absolute` is not under `cwd`. Fold `~` so the default
+	// `~/.pi-lens/projects/...` store does not leak the account name into
+	// agent context (#2440 F5). Posix-ify BEFORE the fold: `homeRelativePath`
+	// deliberately returns a path that is not under `$HOME` unchanged,
+	// separators included, so a `PILENS_DATA_DIR=D:\lens-data` store would
+	// otherwise render with backslashes while the legacy arm above renders
+	// with forward ones — `absolutePosix` is already folded, so this is a
+	// no-op fold, not a second one.
+	return homeRelativePath(absolutePosix);
+}
+
+/**
  * Machine-global pi-lens directory: `~/.pi-lens/` by default.
  *
- * Used for logs (latency, cascade, read-guard, tree-sitter, actionable-warnings,
- * sessionstart), tool binaries (`~/.pi-lens/tools/`, `~/.pi-lens/bin/`), the
- * cross-process instance registry (`instances.json`, #449/#525), the
- * auto-install probe cache, and other state that is intentionally NOT
- * project-scoped — it spans every project pi-lens has touched.
+ * Used for tool binaries (`~/.pi-lens/tools/`, `~/.pi-lens/bin/`), the
+ * cross-process instance registry (`instances.json`, #449/#525) and the
+ * orphan-backstop lease beside it, the auto-install probe cache, the
+ * canonical global config (`config.json`), LSP server storage (intelephense's
+ * index, PSES's per-PID session dir) and JVM runtimes — state that is
+ * intentionally NOT project-scoped, because it spans every project pi-lens
+ * has touched.
  *
  * Override: set `PI_LENS_HOME=/some/path` to relocate this ENTIRE root (every
- * caller below routes through this one function, so one env var covers all of
+ * caller routes through this one function, so one env var covers all of
  * them — see #525). Tests MUST set this to a per-worker temp dir in
  * `tests/support/vitest-setup.ts` rather than mocking each caller separately;
  * otherwise a test that exercises `registerInstance`/`sweepOrphans` or any
  * logger writes into the developer's REAL `~/.pi-lens` (dogfooded live: a
  * test-fixture instance survived in the real `instances.json` for 17h).
  *
+ * DELIBERATELY cwd-INDEPENDENT (#2506 round 3). Its sibling
+ * `getGlobalPiLensLogDir()` (`probe-home-state.ts`) carries the probe-home
+ * redirect; this one must not, because the things resolved here are shared
+ * machine state a session needs to KEEP: a pi session running from an agent
+ * worktree or a throwaway temp project must still find the tools it already
+ * installed and must still register in the one `instances.json` every other
+ * pi-lens process on the box reads. Redirecting THIS function (as round 2 of
+ * #2506 did) would silently give every worktree its own empty tool tree and
+ * its own private registry, so the reaper could never see across them — a
+ * worse defect than the telemetry pollution the redirect exists to stop.
+ *
  * Distinct from `getProjectDataDir(cwd)`, which respects `PILENS_DATA_DIR`
  * (project-scoped) and produces per-project subdirectories. Callers writing
  * project caches, snapshots, or worklogs should use `getProjectDataDir(cwd)`
  * instead — `PI_LENS_HOME` is the MACHINE-scoped sibling of that override.
+ * `getProjectDataDir` composes through THIS function, not the log one: a
+ * probe's project caches are already isolated by its own path slug, and a
+ * worktree session keeping its warm caches is the same "do not break the
+ * session" argument as the tools above.
  */
 export function getGlobalPiLensDir(): string {
 	const override = process.env.PI_LENS_HOME?.trim();
@@ -157,9 +239,9 @@ export const EXCLUDED_DIRS = [
  * `buildProjectIgnoreMatcher`'s `patternsForDir` (#783) — both are tagged
  * `"pilens"` and share the same tracked-file-rescue exemption.
  */
-export type GitignorePatternLayer = "global" | "gitignore" | "pilens";
+type GitignorePatternLayer = "global" | "gitignore" | "pilens";
 
-export interface GitignorePattern {
+interface GitignorePattern {
 	pattern: string;
 	negated: boolean;
 	directoryOnly: boolean;
@@ -315,7 +397,7 @@ function matchesGitignorePattern(
 	});
 }
 
-export function readGitignorePatterns(
+function readGitignorePatterns(
 	rootDir: string,
 	layer: GitignorePatternLayer = "gitignore",
 ): GitignorePattern[] {
@@ -655,8 +737,17 @@ const projectIgnoreMatcherCache = new Map<
 	}
 >();
 
-/** Nested ignore sources are checked at most once per root per cadence window. */
-export const PROJECT_IGNORE_FRESHNESS_CADENCE_MS = 2_000;
+/**
+ * Nested ignore sources are checked at most once per root per cadence window.
+ * Sourced from the shared leaf (`freshness-cadence.ts`) rather than owning the
+ * value: `project-lens-config.ts`'s no-config discovery cache (#2483 round 2)
+ * needs the same cadence and cannot import it FROM here, because this module
+ * already imports `project-lens-config.ts` (the `clients/` acyclic-imports
+ * rule would reject the reverse edge). Re-exported under this name so the
+ * existing test imports (`tests/clients/project-ignore-freshness.test.ts` and
+ * siblings) are unaffected.
+ */
+export const PROJECT_IGNORE_FRESHNESS_CADENCE_MS = FRESHNESS_CADENCE_MS;
 
 /**
  * `size:mtimeMs` freshness signature for a single file (#1105). mtime alone
@@ -830,6 +921,27 @@ export function isPathIgnoredByProject(
 	return getProjectIgnoreMatcher(rootDir).isIgnored(filePath, isDirectory);
 }
 
+/**
+ * "Is this a project-source path pi-lens's bookkeeping should care about" —
+ * the `isPathIgnoredByProject` + `isExternalOrVendorFile` pair, previously
+ * hand-duplicated at each of its 2 call sites (`registerReadBridge` and
+ * `registerMutationBridge` in `index.ts`, both #2423). Consolidated here
+ * (#2450 review round 2, F4) when a THIRD call site — `tools/lsp-navigation.ts`
+ * threading the same gate onto its directly-threaded `LspMutationContext`, so
+ * the direct LSP-mutation path and the mutation-bridge fallback path apply
+ * the identical gate instead of the fallback silently being narrower. A
+ * caller still layers its own `no-read-guard`-style flag check on top; that
+ * flag has no file path to check against, so it stays outside this helper.
+ */
+export function isRecordableProjectPath(
+	filePath: string,
+	projectRoot: string,
+): boolean {
+	if (isPathIgnoredByProject(filePath, projectRoot, false)) return false;
+	if (isExternalOrVendorFile(filePath, projectRoot)) return false;
+	return true;
+}
+
 const projectIgnoreGlobsCache = new Map<
 	string,
 	{ mtimeMs: number; size: number; globs: string[] }
@@ -873,7 +985,11 @@ export function readGitignoreDirs(rootDir: string): string[] {
 }
 
 function globToRegExp(glob: string): RegExp {
+	// Directory names use the same `*`-only dialect as read-guard exemptions.
+	// Collapse adjacent stars before compiling to avoid nullable-group
+	// backtracking on a non-matching name (#2622).
 	const escaped = glob
+		.replace(/\*+/g, "*")
 		.replace(/[.+^${}()|[\]\\]/g, "\\$&")
 		.replace(/\*/g, ".*")
 		.replace(/\?/g, ".");

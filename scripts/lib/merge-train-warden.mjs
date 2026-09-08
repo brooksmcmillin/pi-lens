@@ -21,17 +21,16 @@ import {
 	commentMarkerExists,
 	presentCommentMarkers,
 } from "./github-paging.mjs";
+import { REQUIRED_CHECKS, resolveLatestByName } from "./ci-checks.mjs";
 import {
 	absentRunCommentMarker,
 	decideRunHealthActions,
 	fetchHeadRunHealth,
-	RUN_HEALTH,
 	stalledRunCommentMarker,
 } from "./warden-run-health.mjs";
 
 export const CONFLICT_LABEL = "conflict";
 export const RED_CI_LABEL = "red-ci";
-export const REQUIRED_CHECKS = ["Unit tests", "Lint & type-check"];
 export const PAGE_SIZE = 50;
 export const MAX_PAGES = 4; // 200 open PRs is far above this repo's steady state; bail rather than loop forever.
 // Recorded-but-ok REST failures (review round 1, F4): a closed/deleted PR
@@ -42,44 +41,13 @@ export const MAX_PAGES = 4; // 200 open PRs is far above this repo's steady stat
 // benign races.
 const BENIGN_HTTP_STATUSES = new Set([404, 409, 422]);
 
-/**
- * One check run per NAME, newest wins. Review round 1, F4: GitHub's rollup
- * really does carry duplicate names on a single head -- PR #2191's own head
- * listed six names twice, and PR #2190 listed `Unit tests` as both
- * IN_PROGRESS and COMPLETED/SUCCESS. A naive `new Map(list.map(...))` is
- * last-wins on ARRAY order, which is not time order, so a consumer can read
- * the SUPERSEDED run and call an in-flight re-run settled.
- *
- * `startedAt` orders them. When it is missing or tied AND the duplicates
- * disagree, the resolution is fail-closed: the run that is not a concluded
- * success wins, so an unorderable tie can only ever withhold a pass, never
- * grant one.
- *
- * Lives here, not in the merge lane, because BOTH consumers have the defect:
- * the lane's gate and this file's own required-check scan.
- */
-export function resolveCheckRuns(checkRuns) {
-	const byName = new Map();
-	for (const run of checkRuns ?? []) {
-		const incumbent = byName.get(run.name);
-		byName.set(run.name, incumbent ? preferCheckRun(incumbent, run) : run);
-	}
-	return byName;
-}
-
-function isConcludedSuccess(run) {
-	return run.status === "COMPLETED" && run.conclusion === "SUCCESS";
-}
-
-function preferCheckRun(a, b) {
-	const ta = Date.parse(a.startedAt ?? "");
-	const tb = Date.parse(b.startedAt ?? "");
-	if (!Number.isNaN(ta) && !Number.isNaN(tb) && ta !== tb)
-		return ta > tb ? a : b;
-	if (isConcludedSuccess(a) && !isConcludedSuccess(b)) return b;
-	if (isConcludedSuccess(b) && !isConcludedSuccess(a)) return a;
-	return a;
-}
+// One check run per NAME, newest wins, fail-closed on an unorderable tie
+// (#2190 -- PR #2191's own head listed six names twice; PR #2190 listed
+// `Unit tests` as both IN_PROGRESS and COMPLETED/SUCCESS at once). The
+// resolution policy itself now lives in ci-checks.mjs (#2539 round 2, F2) as
+// `resolveLatestByName`, imported above, so this file, merge-train-lane.mjs's
+// gate, and ci-verdict.mjs share exactly one implementation instead of three
+// copies that could drift.
 
 const PR_QUERY = `
 query($owner: String!, $name: String!, $after: String) {
@@ -176,7 +144,7 @@ function normalizePr(node) {
 	// key checkRunsByName may hold.
 	// Resolved newest-per-name (review round 1, F4): a superseded duplicate
 	// must not decide whether a required check is failing or unresolved.
-	const checkRunsByName = resolveCheckRuns(checkRuns);
+	const checkRunsByName = resolveLatestByName(checkRuns);
 	const unresolvedRequiredChecks = [];
 	for (const name of REQUIRED_CHECKS) {
 		const run = checkRunsByName.get(name);
@@ -501,7 +469,7 @@ export async function applyAction(fetcher, owner, repo, pr, action) {
  * Called ONLY for a head already classified absent, so the extra REST call
  * lands on the anomalous minority of PRs, never on the healthy sweep.
  */
-export async function hasAbsentRunComment(fetcher, owner, repo, pr) {
+async function hasAbsentRunComment(fetcher, owner, repo, pr) {
 	// Paginated (review round 1, F6): a first-page-only read stops finding its
 	// own marker past 100 comments and starts repeating the notice.
 	return commentMarkerExists(
@@ -522,7 +490,7 @@ export async function hasAbsentRunComment(fetcher, owner, repo, pr) {
  * look" as "no marker", which would repost the notice and, worse, re-attribute
  * a person's cancellation to the warden.
  */
-export async function readStalledRunMarkers(fetcher, owner, repo, pr, health) {
+async function readStalledRunMarkers(fetcher, owner, repo, pr, health) {
 	const runs = [
 		...(health.stalledRuns ?? []),
 		...(health.cancelledStalledRuns ?? []),
@@ -674,7 +642,7 @@ export async function runWarden({ fetcher, owner, repo, now = Date.now() }) {
  * The sweep record for one head (#2184 AC3): a classification plus the exact
  * workflows behind it, short enough for one line of the run summary.
  */
-export function summarizeRunHealth(health) {
+function summarizeRunHealth(health) {
 	const detail = [];
 	for (const run of health.starvedRuns)
 		detail.push(
@@ -701,5 +669,3 @@ export function summarizeRunHealth(health) {
 		detail: detail.join("; "),
 	};
 }
-
-export { RUN_HEALTH };

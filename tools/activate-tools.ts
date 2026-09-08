@@ -125,15 +125,18 @@ export function createActivateToolsTool(
 				});
 			}
 			const requestedSet = new Set(requested);
-			const skillPaths = [...new Set(
-				lazyTools
-					.filter((tool) => requestedSet.has(tool.name))
-					.map((tool) => tool.skillPath)
-					.filter((skillPath): skillPath is string => Boolean(skillPath)),
-			)];
-			const skillHint = skillPaths.length > 0
-				? ` Before first use, read: ${skillPaths.join(", ")}.`
-				: "";
+			const skillPaths = [
+				...new Set(
+					lazyTools
+						.filter((tool) => requestedSet.has(tool.name))
+						.map((tool) => tool.skillPath)
+						.filter((skillPath): skillPath is string => Boolean(skillPath)),
+				),
+			];
+			const skillHint =
+				skillPaths.length > 0
+					? ` Before first use, read: ${skillPaths.join(", ")}.`
+					: "";
 
 			return {
 				content: [

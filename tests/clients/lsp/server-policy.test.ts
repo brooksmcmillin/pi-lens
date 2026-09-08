@@ -1758,6 +1758,34 @@ describe("monorepo root hoisting (#1671)", () => {
 		expect(roots[0]).toBe(tmp);
 	});
 
+	it("RustServer.root hoists to the workspace root even when Cargo.toml opens with a UTF-8 BOM (#2498/#2520 round 2, F4)", async () => {
+		const { RustServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-cargo-bom-"));
+		dirs.push(tmp);
+
+		// A BOM before `[workspace]` is valid Cargo.toml (rust-lang/cargo#2031).
+		// `﻿` is inside ECMAScript's `\s` class, so the OLD hand-rolled
+		// `/^\s*\[workspace\]/m` regex this walk-up used to carry (pre-#2498)
+		// matched it; `extractTomlTableSection`'s own anchor is `[ \t]*`, which
+		// does not, so routing detection through the shared reader without
+		// stripping the BOM first silently regressed a manifest shape the old
+		// code happened to accept.
+		fs.writeFileSync(
+			path.join(tmp, "Cargo.toml"),
+			'﻿[workspace]\nmembers = ["crate-a"]\n',
+		);
+		const crateDir = path.join(tmp, "crate-a");
+		fs.mkdirSync(path.join(crateDir, "src"), { recursive: true });
+		fs.writeFileSync(
+			path.join(crateDir, "Cargo.toml"),
+			'[package]\nname = "crate-a"\n',
+		);
+		const file = path.join(crateDir, "src", "lib.rs");
+		fs.writeFileSync(file, "pub fn x() {}\n");
+
+		await expect(RustServer.root(file)).resolves.toBe(tmp);
+	});
+
 	it("RustServer.root leaves a crate outside the workspace's members table crate-rooted", async () => {
 		const { RustServer } = await import("../../../clients/lsp/server.js");
 		const tmp = fs.mkdtempSync(
@@ -1819,6 +1847,71 @@ describe("monorepo root hoisting (#1671)", () => {
 		process.chdir(crateDir);
 
 		await expect(RustServer.root(file)).resolves.toBe(crateDir);
+	});
+
+	it("RustServer.root ignores a commented-out members entry even though the crate still exists on disk (#2473 review round 2, F1)", async () => {
+		const { RustServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-cargo-commented-member-"),
+		);
+		dirs.push(tmp);
+
+		fs.writeFileSync(
+			path.join(tmp, "Cargo.toml"),
+			[
+				"[workspace]",
+				"members = [",
+				'    "crate-a",',
+				'    # "crate-b",',
+				"]",
+			].join("\n"),
+		);
+		const crateAFile = path.join(tmp, "crate-a", "src", "lib.rs");
+		fs.mkdirSync(path.dirname(crateAFile), { recursive: true });
+		fs.writeFileSync(
+			path.join(tmp, "crate-a", "Cargo.toml"),
+			'[package]\nname = "crate-a"\n',
+		);
+		fs.writeFileSync(crateAFile, "pub fn x() {}\n");
+
+		// crate-b physically exists on disk but its `members` entry is
+		// commented out — it must stay independently rooted, not get swept
+		// into the workspace's shared rust-analyzer root.
+		const crateBFile = path.join(tmp, "crate-b", "src", "lib.rs");
+		fs.mkdirSync(path.dirname(crateBFile), { recursive: true });
+		fs.writeFileSync(
+			path.join(tmp, "crate-b", "Cargo.toml"),
+			'[package]\nname = "crate-b"\n',
+		);
+		fs.writeFileSync(crateBFile, "pub fn y() {}\n");
+
+		await expect(RustServer.root(crateAFile)).resolves.toBe(tmp);
+		await expect(RustServer.root(crateBFile)).resolves.toBe(
+			path.join(tmp, "crate-b"),
+		);
+	});
+
+	it("RustServer.root hoists a member declared under an INDENTED [workspace] heading (#2473 review round 2, F2)", async () => {
+		const { RustServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-cargo-indented-heading-"),
+		);
+		dirs.push(tmp);
+
+		// Valid TOML: a table heading need not start in column 0.
+		fs.writeFileSync(
+			path.join(tmp, "Cargo.toml"),
+			'  [workspace]\n  members = ["crate-a"]\n',
+		);
+		const crateFile = path.join(tmp, "crate-a", "src", "lib.rs");
+		fs.mkdirSync(path.dirname(crateFile), { recursive: true });
+		fs.writeFileSync(
+			path.join(tmp, "crate-a", "Cargo.toml"),
+			'[package]\nname = "crate-a"\n',
+		);
+		fs.writeFileSync(crateFile, "pub fn x() {}\n");
+
+		await expect(RustServer.root(crateFile)).resolves.toBe(tmp);
 	});
 
 	it("JavaServer.root hoists declared Maven modules to the parent pom, but leaves an undeclared sibling crate-rooted", async () => {
@@ -1969,6 +2062,62 @@ describe("monorepo root hoisting (#1671)", () => {
 		fs.writeFileSync(file, "pub fn x() {}\n");
 
 		await expect(RustServer.root(file)).resolves.toBe(tmp);
+	});
+
+	// The axis on which cargo and uv genuinely diverge, and the reason #2591's
+	// fold takes a dialect object rather than a flag: a `**` members entry
+	// matches NOTHING in cargo (#1671 F6, documented rather than implemented),
+	// while the same entry in a uv workspace crosses components. Nothing in this
+	// file discriminated the two before — every pre-existing cargo hoist case
+	// here stays green when the matcher is swapped for a bare minimatch call —
+	// so this is the production-path pin for "the fold did not quietly widen
+	// Rust workspace hoisting".
+	it("RustServer.root does NOT hoist through a `**` members entry (#1671 F6, pinned by #2591)", async () => {
+		const { RustServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-cargo-globstar-"),
+		);
+		dirs.push(tmp);
+
+		fs.writeFileSync(
+			path.join(tmp, "Cargo.toml"),
+			'[workspace]\nmembers = ["crates/**"]\n',
+		);
+		const crateDir = path.join(tmp, "crates", "nested", "foo");
+		fs.mkdirSync(path.join(crateDir, "src"), { recursive: true });
+		fs.writeFileSync(
+			path.join(crateDir, "Cargo.toml"),
+			'[package]\nname = "foo"\n',
+		);
+		const file = path.join(crateDir, "src", "lib.rs");
+		fs.writeFileSync(file, "pub fn x() {}\n");
+
+		// The crate stays independently rooted rather than joining the workspace.
+		await expect(RustServer.root(file)).resolves.toBe(crateDir);
+	});
+
+	// The companion vector: cargo's `*` cannot cross `/` either, so a
+	// single-wildcard entry does not claim a crate one level deeper. This is the
+	// production-path form of the table's segment-count-mismatch row.
+	it("RustServer.root does NOT hoist a crate deeper than a single-wildcard members entry (#2591)", async () => {
+		const { RustServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-cargo-depth-"));
+		dirs.push(tmp);
+
+		fs.writeFileSync(
+			path.join(tmp, "Cargo.toml"),
+			'[workspace]\nmembers = ["crates/*"]\n',
+		);
+		const crateDir = path.join(tmp, "crates", "nested", "foo");
+		fs.mkdirSync(path.join(crateDir, "src"), { recursive: true });
+		fs.writeFileSync(
+			path.join(crateDir, "Cargo.toml"),
+			'[package]\nname = "foo"\n',
+		);
+		const file = path.join(crateDir, "src", "lib.rs");
+		fs.writeFileSync(file, "pub fn x() {}\n");
+
+		await expect(RustServer.root(file)).resolves.toBe(crateDir);
 	});
 
 	it("RustServer.root matches a two-segment glob members entry (crates/*/*)", async () => {

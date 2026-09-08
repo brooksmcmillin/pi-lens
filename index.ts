@@ -1,4 +1,5 @@
 import "./clients/console-guard-install.js";
+import { BoundedSet } from "./clients/bounded-cache.js";
 import {
 	closeModuleLoadConsoleWindow,
 	installConsoleGuard,
@@ -11,6 +12,7 @@ import {
 	getDegradationSummary,
 	incrementDegradationCount,
 	recordDegradation,
+	renderDegradationLines,
 } from "./clients/degradation-ledger.js";
 import {
 	adoptProjectTrustFromPorts,
@@ -33,12 +35,19 @@ import {
 	type HostPorts,
 } from "./clients/host-ports.js";
 import { AstGrepClient } from "./clients/ast-grep-client.js";
-import { loadBootstrapClients } from "./clients/bootstrap.js";
+import {
+	loadBootstrapClients,
+	markAnalyzerBootstrapShutdown,
+	peekBootstrapClients,
+	requestBootstrapClients,
+	type SessionBootstrapAccess,
+} from "./clients/bootstrap.js";
 import { CacheManager } from "./clients/cache-manager.js";
 // #1561 F2: the retire hook re-syncs the gate latch and the persisted record
 // the same way the per-dispatch path does, so a retired blocker stops gating
 // the commit.
 import { retireInlineBlockerAndResyncGuard } from "./clients/git-guard.js";
+import { resolveSkillPaths } from "./clients/skills-resolver.js";
 import { resolvePackagePath } from "./clients/package-root.js";
 import {
 	clearWidgetState,
@@ -54,12 +63,23 @@ import {
 } from "./clients/widget-state.js";
 import { selectLspStatus } from "./clients/lsp-status.js";
 import type { PersistedReadGuardState } from "./clients/read-guard.js";
-import { registerReadBridge } from "./clients/read-bridge.js";
+import { registerMutationBridge } from "./clients/mutation-bridge.js";
 import {
-	isExternalOrVendorFile,
-	normalizeFilePath,
-} from "./clients/path-utils.js";
-import { isPathIgnoredByProject } from "./clients/file-utils.js";
+	OBSERVED_TRACKED_MAX_FILES,
+	refreshObservedMutationLedger,
+	runObservedSettledSweep,
+} from "./clients/observed-mutation.js";
+import {
+	collectTrackedPaths,
+	replayThroughMutationBridge,
+	storedLineHashesFor,
+} from "./clients/observed-mutation-sources.js";
+import { classifyMutatingTool } from "./clients/mutating-tool.js";
+import { resolveLanguageRootForFile } from "./clients/language-profile.js";
+import { countFileLines } from "./clients/read-guard-tool-lines.js";
+import { registerReadBridge } from "./clients/read-bridge.js";
+import { normalizeFilePath } from "./clients/path-utils.js";
+import { isRecordableProjectPath } from "./clients/file-utils.js";
 import {
 	dropStaleFiles,
 	loadSessionState,
@@ -107,6 +127,7 @@ import { registerCascadeTierReconcileTask } from "./clients/lsp/cascade-tier.js"
 import { buildResolvedFoundCascadeRun } from "./clients/cascade-format.js";
 import { initLSPConfig } from "./clients/lsp/config.js";
 import { getLSPService, resetLSPService } from "./clients/lsp/index.js";
+import { shouldInitializeSessionRoot } from "./clients/lsp/session-roots.js";
 import { warmLspService } from "./clients/lsp-lazy.js";
 import {
 	sweepOrphans,
@@ -146,8 +167,8 @@ import {
 	consumeTurnEndFindings,
 } from "./clients/runtime-context.js";
 import {
+	consumeStagedTestRunnerFindings,
 	deliverStagedTestRunnerFindings,
-	registerTestRunnerEntryRenderer,
 	stageTestRunnerDelivery,
 } from "./clients/test-runner-delivery.js";
 import {
@@ -201,6 +222,7 @@ import {
 	createReadSymbolTool,
 } from "./tools/module-report.js";
 import { createProjectReportTool } from "./tools/project-report.js";
+import { createEffectiveConfigTool } from "./tools/effective-config.js";
 import { createSymbolSearchTool } from "./tools/symbol-search.js";
 import {
 	getLastLoggedPhase,
@@ -208,6 +230,7 @@ import {
 	getRecentLoggedPhases,
 	logLatency,
 	resetCurrentPhaseForSession,
+	resetOncePerSessionPhases,
 } from "./clients/latency-logger.js";
 import { emitBounded } from "./clients/bounded-telemetry.js";
 import {
@@ -273,6 +296,31 @@ import { filterInactivePiLensSkills } from "./clients/conditional-skills.js";
 
 type DispatchIntegration = Awaited<ReturnType<typeof loadDispatchIntegration>>;
 let loadedDispatchIntegration: DispatchIntegration | undefined;
+
+/**
+ * The session-start view of the analyzer bootstrap (#2467).
+ *
+ * Activation binds this and nothing more: no `import()` of the seventeen
+ * analyzer modules runs until a consumer asks. `peek` serves the two
+ * session-start resets, which are vacuous when nothing is loaded;
+ * `request` serves the deferred scans and probes.
+ *
+ * No abort signal is bound here. Session start is not turn-scoped work, and a
+ * `session_start` that lands mid-turn (sequential replacement, `/new`) would
+ * arrive with the OUTGOING turn's ambient signal still installed — folding it
+ * in cancelled every startup scan, with no retry, for the whole session
+ * (#1394's lesson, found in review). Both bounds still hold inside
+ * `requestBootstrapClients`, which races its wall-clock ceiling against the
+ * seam's own session-teardown signal.
+ */
+const sessionBootstrapAccess: SessionBootstrapAccess = {
+	peek: () => peekBootstrapClients(),
+	// `session_start` is not a guess: this adapter IS the session-start seam —
+	// `SessionBootstrapAccess` is constructed here and reached only from
+	// `handleSessionStart`'s three demands (#2557 review F7).
+	request: (reason) =>
+		requestBootstrapClients({ reason, hook: "session_start" }),
+};
 
 function warmDispatchAtSessionStart(): void {
 	void warmDispatchIntegration()
@@ -488,6 +536,15 @@ function log(_msg: string) {
 // --- State ---
 
 const runtime = new RuntimeCoordinator();
+// #2423 review round 1 (F6): module scope, beside `runtime`, NOT inside
+// `activateExtension`. The mutation bridge and the read bridge are registered
+// once per process (`_mutationBridgeRegistered`) and hold their dependencies
+// through getters; a `cacheManager` declared inside the activation closure
+// would pin the FIRST activation's instance forever, so a re-activation
+// (#473 in-process subagent re-bind, extension reload) would write its turn
+// state into an object nothing else reads. `runtime` has always been module
+// scope for exactly this reason.
+const cacheManager = new CacheManager();
 // #484: the quiet-window task registry (clients/quiet-window.ts `_tasks`) is
 // module-level and survives factory re-activation in the same process (#473
 // in-process subagent re-binds, reload). Register the turn-summary emit task
@@ -496,6 +553,13 @@ const runtime = new RuntimeCoordinator();
 // holder, refreshed on every activation — never a stale captured `pi`.
 let _readBridgeRegistered = false;
 let _readBridgeGetFlag:
+	| ((name: string) => boolean | string | undefined)
+	| undefined;
+// #2423: the mutation bridge is the write-side sibling of the read bridge and
+// follows its registration discipline exactly — mount once per process, refresh
+// the flag getter on every activation.
+let _mutationBridgeRegistered = false;
+let _mutationBridgeGetFlag:
 	| ((name: string) => boolean | string | undefined)
 	| undefined;
 let _turnSummaryEmitRegistered = false;
@@ -508,19 +572,27 @@ let _turnSummaryEmitCtx:
 	| undefined;
 let _testRunnerDeliveryRegistered = false;
 let _nextTestRunnerDeliveryOwnerId = 0;
-const _lspConfigInitializedCwds = new Set<string>();
+/**
+ * A memo cap, not a mirror of the session-root registry's own bound (#2518).
+ * It used to be described as matching that registry so an uninitializable root
+ * could not stay served; the check below asks the registry directly instead, so
+ * the two numbers no longer have to agree for the answer to be right.
+ */
 const LSP_CONFIG_CWD_CAP = 128;
+const _lspConfigInitializedCwds = new BoundedSet<string>(LSP_CONFIG_CWD_CAP);
 
 async function ensureLSPConfigInitialized(cwd: string): Promise<void> {
 	const normalizedCwd = path.resolve(cwd);
-	if (_lspConfigInitializedCwds.has(normalizedCwd)) return;
+	// #2518: the memo alone is not enough, exactly as in `mcp/server.ts`'s
+	// `ensureReady`. `initLSPConfig` also runs from `clients/runtime-session.ts`
+	// and `clients/lens-engine.ts`, which this memo never sees, so the registry
+	// can evict this cwd while the memo still calls it initialized — and the
+	// evicted entry carries the operator's `disabledServers` denial with it.
+	if (!shouldInitializeSessionRoot(normalizedCwd, _lspConfigInitializedCwds)) {
+		return;
+	}
 	await initLSPConfig(normalizedCwd);
 	_lspConfigInitializedCwds.add(normalizedCwd);
-	while (_lspConfigInitializedCwds.size > LSP_CONFIG_CWD_CAP) {
-		const oldest = _lspConfigInitializedCwds.values().next().value;
-		if (oldest === undefined) break;
-		_lspConfigInitializedCwds.delete(oldest);
-	}
 }
 
 /**
@@ -706,7 +778,6 @@ function activateExtension(hostPi: ExtensionAPI) {
 		dbg,
 	});
 	const astGrepClient = new AstGrepClient();
-	const cacheManager = new CacheManager();
 
 	type LspStatusTheme = {
 		fg: (
@@ -842,11 +913,43 @@ function activateExtension(hostPi: ExtensionAPI) {
 			peekWriteIndex: () => runtime.peekWriteIndex(),
 			isRecordable(filePath: string): boolean {
 				if (_readBridgeGetFlag?.("no-read-guard")) return false;
-				if (isPathIgnoredByProject(filePath, runtime.projectRoot, false))
-					return false;
-				if (isExternalOrVendorFile(filePath, runtime.projectRoot)) return false;
-				return true;
+				return isRecordableProjectPath(filePath, runtime.projectRoot);
 			},
+		});
+	}
+
+	// Mutation bridge (#2423): same live-getter discipline as the read bridge.
+	// An in-process producer that writes a file outside pi-lens's tool-event
+	// path records it here, and the same bookkeeping runs.
+	_mutationBridgeGetFlag = getLensFlag;
+	if (!_mutationBridgeRegistered) {
+		_mutationBridgeRegistered = true;
+		registerMutationBridge({
+			getRuntime: () => runtime,
+			getCacheManager: () => cacheManager,
+			getProjectRoot: () => runtime.projectRoot || process.cwd(),
+			getDispatchCwd: (filePath: string) =>
+				resolveLanguageRootForFile(
+					filePath,
+					runtime.projectRoot || process.cwd(),
+				),
+			countFileLines,
+			// #2465: unlike the read bridge above (whose whole purpose IS the
+			// read-guard stamp, so `no-read-guard` correctly disables it
+			// entirely), this bridge also drives turn-state and the change-log
+			// receipt. `no-read-guard` gates ONLY the read-guard stamp — the same
+			// canonical split `clients/runtime-tool-result.ts` applies at
+			// `recordWritten` (:1859) — so it must not appear in the recordability
+			// gate `recordMutationThroughSeam` early-returns on. That gate stays
+			// path-scope only (ignored/vendor); the flag is threaded separately
+			// below via `shouldStampReadGuard`.
+			isRecordable(filePath: string): boolean {
+				return isRecordableProjectPath(filePath, runtime.projectRoot);
+			},
+			shouldStampReadGuard(): boolean {
+				return !_mutationBridgeGetFlag?.("no-read-guard");
+			},
+			dbg,
 		});
 	}
 	// Automatic context injection (the `context` hook). Independent of lensEnabled
@@ -963,11 +1066,6 @@ function activateExtension(hostPi: ExtensionAPI) {
 			dbg(`turn-summary renderer registration failed: ${registerRendererErr}`);
 		}
 	}
-	// #2366: test failures are a persistent, non-context custom entry. The
-	// delivery task still checks appendEntry at fire time; this registration is
-	// capability detection only and never authorizes a sendMessage fallback.
-	registerTestRunnerEntryRenderer(pi);
-
 	// --- Commands ---
 
 	pi.registerCommand("lens-toggle", {
@@ -1347,9 +1445,17 @@ function activateExtension(hostPi: ExtensionAPI) {
 				const report = await collectLatencyPerformance({
 					sessionStartedAt: runtime.sessionStartedAt,
 				});
-				const degradations = getDegradationSummary();
-				const degradationText = degradations.length
-					? `\n\nDegradations:\n${degradations.map((group) => `  ${group.kind}: ${group.count} (${group.latestReasons.at(-1)?.subject}: ${group.latestReasons.at(-1)?.reason})`).join("\n")}`
+				// Shared with the MCP `pilens_health` path (#2515 review, S3): a
+				// hand-rolled renderer here used to diverge from
+				// `renderDegradationLines()` (e.g. printing `log-sink-rotated` with
+				// a fabricated subject/reason instead of the bare informational
+				// count the shared renderer gives it), so the two surfaces
+				// disagreed about the exact same ledger.
+				const degradationLines = renderDegradationLines(
+					getDegradationSummary(),
+				);
+				const degradationText = degradationLines.length
+					? `\n\n${degradationLines.join("\n")}`
 					: "";
 				notifyUi(
 					ctx,
@@ -1539,6 +1645,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 			},
 		),
 		createSymbolSearchTool(() => runtime.projectRoot),
+		createEffectiveConfigTool(() => runtime.projectRoot),
 		createProjectReportTool(() => runtime.projectRoot),
 		createModuleReportTool(() => runtime.projectRoot),
 		createReadSymbolTool(
@@ -1592,7 +1699,11 @@ function activateExtension(hostPi: ExtensionAPI) {
 	];
 	const skillsDir = resolvePackagePath(import.meta.url, "skills");
 	const astGrepSkillPath = path.join(skillsDir, "pi-lens-ast-grep", "SKILL.md");
-	const lspNavigationSkillPath = path.join(skillsDir, "pi-lens-lsp-navigation", "SKILL.md");
+	const lspNavigationSkillPath = path.join(
+		skillsDir,
+		"pi-lens-lsp-navigation",
+		"SKILL.md",
+	);
 	const LAZY_TOOL_CATALOG: ActivatableToolInfo[] = [
 		{
 			name: "ast_grep_search",
@@ -1710,16 +1821,26 @@ function activateExtension(hostPi: ExtensionAPI) {
 		// module's own directory — under the compiled dist/ layout (#182) the module
 		// lives in dist/ but skills/ stays at the package root, so a module-relative
 		// join lands on the non-existent dist/skills/ and skills silently fail to load
-		// (#205). resolvePackagePath walks up to package.json, correct for both the
-		// source (index.ts at root) and dist (dist/index.js) layouts.
+		// (#205). resolveSkillPaths walks up to package.json (same as
+		// resolvePackagePath) and ALWAYS returns that path — pi handles an absent
+		// directory gracefully and the manifest may register the same dir — while
+		// separately recording a bounded skills-dir-missing degradation when pi's
+		// own discovery rule (root SKILL.md, nested SKILL.md, loose root .md) would
+		// load nothing there (#2626). Never turn the health check into a [] return:
+		// that inversion dropped real skills on four pi layouts in #2637 round 1.
 		return {
-			skillPaths: [skillsDir],
+			skillPaths: resolveSkillPaths(import.meta.url),
 		};
 	});
 
 	pi.on("before_agent_start", async (event) => {
-		const filtered = filterInactivePiLensSkills(event.systemPrompt, event.systemPromptOptions);
-		return filtered === event.systemPrompt ? undefined : { systemPrompt: filtered };
+		const filtered = filterInactivePiLensSkills(
+			event.systemPrompt,
+			event.systemPromptOptions,
+		);
+		return filtered === event.systemPrompt
+			? undefined
+			: { systemPrompt: filtered };
 	});
 
 	// --- Events ---
@@ -1898,6 +2019,18 @@ function activateExtension(hostPi: ExtensionAPI) {
 					// accepted cost on the other side (a torn-down secondary's own
 					// bracket goes stale until the next full session start).
 					resetCurrentPhaseForSession();
+					// #2526 review round 2, F1: the once-per-session phase claims
+					// (`config_resolved`) and the session record identity they are
+					// stamped with are re-armed HERE, not inside handleSessionStart.
+					// `ensureLSPConfigInitialized` below resolves this session's
+					// config BEFORE the handler runs, so a re-arm inside the handler
+					// fires between the session's own two resolutions and the
+					// deferred `loadLSPConfig` writes a SECOND row for one session.
+					// Same #473 gate and the same reason as the line above: the claim
+					// set is process-shared, and a concurrent secondary — which never
+					// reaches handleSessionStart and so never publishes an expectation
+					// line of its own — must not re-arm a live primary's claims.
+					resetOncePerSessionPhases();
 					// #2249: same gate — a declined bind's own session_start must never
 					// reach here (it returned above), so this only fires for a genuine
 					// new primary. A crash or forced kill can skip session_shutdown's
@@ -2069,26 +2202,13 @@ function activateExtension(hostPi: ExtensionAPI) {
 						dbg(`lsp config init failed: ${cfgErr}`);
 					}
 
-					const bootstrapClientsStartedAt = Date.now();
-					const {
-						metricsClient,
-						todoScanner,
-						biomeClient,
-						ruffClient,
-						knipClient,
-						jscpdClient,
-						govulncheckClient,
-						gitleaksClient,
-						trivyClient,
-						opengrepClient,
-						depChecker,
-						testRunnerClient,
-						goClient,
-						rustClient,
-						deadCodeClients,
-					} = await loadBootstrapClients();
-					const bootstrapClientsDurationMs =
-						Date.now() - bootstrapClientsStartedAt;
+					// #2467: no eager analyzer-bootstrap load here. This await used to
+					// sit between the host's session_start and `handleSessionStart`,
+					// paying the whole seventeen-module graph on the interactive path —
+					// and the process's FIRST session runs in quick mode, which uses
+					// none of those clients, so it was paid for nothing on exactly the
+					// start the user is waiting on. The handler now takes the on-demand
+					// seam and its consumers load what they need, off this path.
 					const handlerEnteredAt = Date.now();
 					// Consume the process-lifetime measurement at the first real session
 					// start. Concurrent secondary starts never reach this handler.
@@ -2105,8 +2225,8 @@ function activateExtension(hostPi: ExtensionAPI) {
 						emitHostReadyDelay,
 						sessionReason,
 						handlerEnteredAt,
-						bootstrapClientsStartedAt,
-						bootstrapClientsDurationMs,
+						globalConfig,
+						projectConfig: loadPiLensProjectConfig(runtime.projectRoot),
 						// #2129: this call site is only reached for "primary"/
 						// "sequential-replacement" — a declined start returned above.
 						sessionStartClassification: sessionStartDecision.classification,
@@ -2116,30 +2236,16 @@ function activateExtension(hostPi: ExtensionAPI) {
 						dbg,
 						log,
 						runtime,
-						metricsClient,
 						cacheManager,
-						todoScanner,
 						astGrepClient,
-						biomeClient,
-						ruffClient,
-						knipClient,
-						jscpdClient,
-						deadCodeClients,
-						govulncheckClient,
-						gitleaksClient,
-						trivyClient,
-						opengrepClient,
-						depChecker,
-						testRunnerClient,
-						goClient,
-						rustClient,
+						bootstrap: sessionBootstrapAccess,
 						ensureTool: async (name: string) =>
 							(await import("./clients/installer/index.js")).ensureTool(name),
 						cleanStaleTsBuildInfo,
 						resetDispatchBaselines,
 						resetLSPService,
 					});
-					ctx.ui && updateLspStatus(ctx.ui.setStatus, ctx.ui.theme);
+					if (ctx.ui) updateLspStatus(ctx.ui.setStatus, ctx.ui.theme);
 
 					// Pin the stable identity + reason AFTER handleSessionStart (which ran
 					// resetForSession → a fresh random id); the stable id now wins (#190).
@@ -2315,15 +2421,31 @@ function activateExtension(hostPi: ExtensionAPI) {
 		// is exactly why a wedged-LSP edit hang was invisible in latency.log. This
 		// row means "pi-lens received this edit"; if it is present but nothing
 		// follows, the stall is in the pipeline; if it is absent, it is upstream.
+		//
+		// #2423 review round 1 (F4): this was a SIXTEENTH comparison of the
+		// tool name against the two built-in literals, missed by the class sweep
+		// because it lives in `index.ts` — which the grep guard did not walk —
+		// under a local whose name the guard's pattern did not match. A
+		// third-party edit therefore reached the pipeline with no
+		// "pi-lens received this edit" row, which is precisely the trace the
+		// marker exists to leave. It now asks the seam, and the guard walks
+		// `index.ts` and `tools/` too.
 		const rtToolName = (event as { toolName?: string })?.toolName;
-		if (rtToolName === "edit" || rtToolName === "write") {
+		const rtMutation = classifyMutatingTool(event, { recognizeOnly: true });
+		if (rtMutation) {
 			logLatency({
 				type: "phase",
 				phase: "tool_result_received",
 				filePath:
-					(event as { input?: { path?: string } })?.input?.path ?? "<unknown>",
+					rtMutation.path ??
+					(event as { input?: { path?: string } })?.input?.path ??
+					"<unknown>",
 				durationMs: 0,
-				metadata: { toolName: rtToolName },
+				metadata: {
+					toolName: rtToolName,
+					mutationKind: rtMutation.kind,
+					mutationProvenance: rtMutation.provenance,
+				},
 			});
 		}
 		try {
@@ -2477,6 +2599,95 @@ function activateExtension(hostPi: ExtensionAPI) {
 		};
 	};
 
+	/**
+	 * #2430 item 3. Kept separate from `runDeferredMutationDrain` so a throw
+	 * here can never take the drain with it: the sweep is a last-resort net for
+	 * changes nothing else saw, and the drain is the pipeline's contract.
+	 *
+	 * #2465 round 2: this used to blanket-return under `no-read-guard`, on the
+	 * theory that the sweep's baseline only exists because the read-guard is
+	 * active. That is false — `clients/runtime-tool-call.ts`'s `recordRead`
+	 * (the call that seeds `getTrackedPaths`/`storedLineHashesFor`) has no flag
+	 * gate; only the pre-edit BLOCKING checks are gated, matching the flag's
+	 * documented meaning ("disable read-before-edit behavior monitor" —
+	 * `clients/lens-flag-registry.ts`). Under `no-read-guard` the sweep still
+	 * has real drift to catch, and skipping it here dropped turn-state, the
+	 * change-log receipt, and the `noteMutationHandled` mark right along with
+	 * the stamp — the same bridge-recordability conflation this issue already
+	 * fixed one layer down, just repeated here. The flag is threaded ONLY into
+	 * the replay's read-guard stamp step via the mutation bridge's
+	 * `shouldStampReadGuard` seam (see its registration above) — reused, not
+	 * duplicated.
+	 */
+	async function runObservedSettledSweepSafely(
+		ctx: DeferredDrainCtx,
+	): Promise<void> {
+		const cwd = ctx.cwd ?? runtime.projectRoot;
+		try {
+			const result = await runObservedSettledSweep({
+				turnIndex: runtime.turnIndex,
+				getTrackedPaths: () =>
+					collectTrackedPaths({
+						readGuard: runtime.readGuard,
+						cwd,
+						limit: OBSERVED_TRACKED_MAX_FILES,
+					}),
+				record: replayThroughMutationBridge,
+				getStoredLineHashes: (candidate) =>
+					storedLineHashesFor(runtime.readGuard, candidate),
+				// Merge of #2449 into #2450: #2449 wrote this gate as the
+				// hand-spelled `isPathIgnoredByProject` + `isExternalOrVendorFile`
+				// pair, which is the duplication #2450's review round 2 (F4)
+				// consolidated into `isRecordableProjectPath`. Routed through the
+				// helper so the settled sweep, the read bridge, the mutation
+				// bridge and the direct LSP path all ask ONE question.
+				isRecordable: (candidate) =>
+					isRecordableProjectPath(candidate, runtime.projectRoot),
+				signal: ctx?.signal,
+				dbg,
+			});
+			if (result.drifted.length > 0 || result.unverifiable.length > 0) {
+				dbg(
+					`observed_settled_sweep: ${result.drifted.length} drifted file(s), ${result.replayed} replayed, ` +
+						`${result.unverifiable.length} unverifiable; scanned ${result.scanned}, ${result.notReachedThisPass} not reached this pass (cursor ${result.cursor})`,
+				);
+			}
+		} catch (sweepErr) {
+			dbg(`observed_settled_sweep crashed: ${sweepErr}`);
+		}
+	}
+
+	/**
+	 * Post-drain re-baseline; see the call site for why it exists.
+	 *
+	 * No `getTrackedPaths` here on purpose (#2449 review round 5, F2): the
+	 * refresh's traversal is the `handled` set — the files THIS run's pipeline
+	 * or drain actually wrote — not the tracked set, so it needs no path
+	 * collection of its own.
+	 *
+	 * #2465 round 2: same fix as `runObservedSettledSweepSafely` above — no
+	 * blanket `no-read-guard` early return. This pass only re-baselines files
+	 * the drain just wrote (the `handled` set); it neither reads nor writes
+	 * the read-guard staleness stamp, so the flag has nothing to gate here.
+	 */
+	async function refreshObservedLedgerSafely(
+		ctx: DeferredDrainCtx,
+	): Promise<void> {
+		try {
+			await refreshObservedMutationLedger({
+				turnIndex: runtime.turnIndex,
+				// Same seeding shortcut the sweep uses: a file first seen here
+				// gets its baseline from the read-guard's stored per-line hashes
+				// rather than a read (#2449 review round 2, F3).
+				getStoredLineHashes: (candidate) =>
+					storedLineHashesFor(runtime.readGuard, candidate),
+				signal: ctx?.signal,
+			});
+		} catch (refreshErr) {
+			dbg(`observed_ledger_refresh crashed: ${refreshErr}`);
+		}
+	}
+
 	async function runDeferredMutationDrain(
 		ctx: DeferredDrainCtx,
 	): Promise<void> {
@@ -2546,7 +2757,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 			// `agent_settled` below, since — unlike this flush — running it here
 			// can fire mid-run, between auto-retries).
 			await flushDebouncedToolResults();
-			ctx.ui && updateLspStatus(ctx.ui.setStatus, ctx.ui.theme);
+			if (ctx.ui) updateLspStatus(ctx.ui.setStatus, ctx.ui.theme);
 		} catch (agentEndErr) {
 			// The stale-ctx class has ONE classifier and one record, in
 			// clients/session-event-guard.ts. Rethrow so the wrapper around this
@@ -2766,7 +2977,6 @@ function activateExtension(hostPi: ExtensionAPI) {
 						...delivery,
 						owner: {
 							ownerId: testRunnerDeliveryOwnerId,
-							pi,
 							cacheManager,
 							runtime,
 							getCtx: () => ownEventCtx ?? {},
@@ -3005,7 +3215,20 @@ function activateExtension(hostPi: ExtensionAPI) {
 		try {
 			setAmbientAbortSignal(ctx?.signal);
 			try {
+				// #2430 item 3: the turn-boundary net runs BEFORE the drain, so a
+				// file a path-less third-party tool changed is queued in time to be
+				// formatted in this same settle rather than a run later. It
+				// hash-checks the tracked-file set only — read-guard reads/writes,
+				// widget diagnostic files, open LSP documents — and never walks the
+				// workspace. Bounded on both axes (timeout + this ctx's abort) and
+				// wrapped, because an advisory sweep must never cost the drain.
+				await runObservedSettledSweepSafely(ctx);
 				await runDeferredMutationDrain(ctx);
+				// The drain just wrote formatted/autofixed bytes to files pi-lens
+				// itself owns. Re-baseline them, or the NEXT settle reads our own
+				// formatter output as unexplained third-party drift and requeues the
+				// same files forever.
+				await refreshObservedLedgerSafely(ctx);
 			} catch (drainErr) {
 				// #1924 classified the stale-ctx case inline here. #1925 moved the
 				// classifier and its record to clients/session-event-guard.ts, so
@@ -3151,6 +3374,12 @@ function activateExtension(hostPi: ExtensionAPI) {
 		// the catalog names. Only the PRIMARY path reaches here; a secondary
 		// returned above precisely because the primary is still live.
 		releasePrimarySession();
+		// #2467: no analyzer bootstrap may START loading from here on. A demand
+		// already in flight keeps its promise and still settles — the gate is
+		// checked only when no flight exists. Nothing is spawned, which is what
+		// AGENTS.md's #234 teardown rule requires of a session_shutdown-time
+		// call; a replacement session re-arms the gate at its session_start.
+		markAnalyzerBootstrapShutdown();
 		// processExiting: the loop is closing here — killing LSP servers must NOT
 		// spawn taskkill, or libuv aborts on uv_async_send to the closing loop
 		// (Assertion !(handle->flags & UV_HANDLE_CLOSING), src\win\async.c) — seen
@@ -3355,6 +3584,13 @@ function activateExtension(hostPi: ExtensionAPI) {
 						cacheManager,
 						cwd,
 					);
+					const testFindings = consumeStagedTestRunnerFindings({
+						cwd,
+						sessionId: runtime.telemetrySessionId,
+						ownerId: testRunnerDeliveryOwnerId,
+						cacheManager,
+						runtime,
+					});
 					const agentNudge = consumeAgentNudge(dbg);
 					const sourceMessages = [
 						{
@@ -3364,6 +3600,10 @@ function activateExtension(hostPi: ExtensionAPI) {
 						{
 							source: "turn-findings" as const,
 							messages: turnEndFindings?.messages ?? [],
+						},
+						{
+							source: "test-findings" as const,
+							messages: testFindings?.messages ?? [],
 						},
 						{
 							source: "agent-nudge" as const,

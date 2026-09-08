@@ -12,10 +12,10 @@
 
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
-import { getGlobalPiLensDir } from "./file-utils.js";
+import { getGlobalPiLensLogDir } from "./probe-home-state.js";
 import { createNdjsonLogger } from "./ndjson-logger.js";
 
-const AG_LOG_DIR = getGlobalPiLensDir();
+const AG_LOG_DIR = getGlobalPiLensLogDir();
 const AG_LOG_FILE = path.join(AG_LOG_DIR, "ast-grep-tools.log");
 const AG_LOG_BACKUP_FILE = path.join(AG_LOG_DIR, "ast-grep-tools.log.1");
 const MAX_LOG_BYTES = Math.max(
@@ -31,7 +31,7 @@ const writer = createNdjsonLogger({
 	backupPath: AG_LOG_BACKUP_FILE,
 });
 
-export type AstGrepToolName = "ast_grep_search" | "ast_grep_replace";
+type AstGrepToolName = "ast_grep_search" | "ast_grep_replace";
 
 export type AstGrepToolOutcome = "success" | "no_matches" | "error";
 
@@ -165,15 +165,6 @@ export function logAstGrepToolEvent(
 		errorRaw: truncate(event.errorRaw, ERROR_TRUNCATE_AT),
 	};
 	writer.log({ ts: new Date().toISOString(), ...payload });
-}
-
-export function getAstGrepToolLogPath(): string {
-	return AG_LOG_FILE;
-}
-
-/** Resolve once all enqueued ast-grep-tool writes are on disk. */
-export function flushAstGrepToolLog(): Promise<void> {
-	return writer.flush();
 }
 
 export { countLines as _countLinesForTest };

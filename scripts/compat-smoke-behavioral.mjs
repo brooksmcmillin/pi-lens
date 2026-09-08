@@ -64,13 +64,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
-	diffSurvivingLspProcesses,
-	isLspServerCommand,
+	evaluateNoSurvivingLspProcesses,
+	snapshotProcesses,
 } from "./lib/process-scan.mjs";
 import {
 	noPhasesLogged,
 	parseNdjsonEntries,
 	phaseWasLogged,
+	countEntriesSince,
 } from "./lib/latency-log-phases.mjs";
 import { gitExecFileSync } from "./lib/git-fixture-env.mjs";
 
@@ -141,7 +142,14 @@ function resolvePiBin() {
  * pi-lens's session_shutdown LSP teardown, which would make assertion 3
  * meaningless). Resolves with `{ commandCount, timedOut }`.
  */
-function runPiRpc({ piBin, extensionPath, cwd, env, timeoutMs = 45000 }) {
+function runPiRpc({
+	piBin,
+	extensionPath,
+	cwd,
+	env,
+	logHome,
+	timeoutMs = 45000,
+}) {
 	return new Promise((resolve, reject) => {
 		const child = spawn(
 			piBin,
@@ -159,6 +167,7 @@ function runPiRpc({ piBin, extensionPath, cwd, env, timeoutMs = 45000 }) {
 				stdio: ["pipe", "pipe", "inherit"],
 				env: {
 					...process.env,
+					PI_LENS_HOME: logHome,
 					...env,
 					ANTHROPIC_API_KEY:
 						process.env.ANTHROPIC_API_KEY || "sk-ant-dummy-compat-smoke",
@@ -233,85 +242,24 @@ function runPiRpc({ piBin, extensionPath, cwd, env, timeoutMs = 45000 }) {
 }
 
 // --- Process snapshot (Windows CIM / POSIX ps), narrow LSP markers only ---
+//
+// The listing itself is scripts/lib/process-scan.mjs (PR #2438 review round
+// 3, F2). This script asks only for pid + command: it diffs two snapshots by
+// pid and matches LSP markers on the command line, and has no use for a
+// parent pid.
 
-function windowsExe(name) {
-	return path.join(
-		process.env.SystemRoot ?? String.raw`C:\Windows`,
-		"System32",
-		name,
-	);
+function snapshotLspCandidates() {
+	return snapshotProcesses(["pid", "command"]);
 }
 
-async function snapshotProcesses() {
-	if (isWindows) {
-		return new Promise((resolve) => {
-			try {
-				const powershell = windowsExe(
-					"WindowsPowerShell\\v1.0\\powershell.exe",
-				);
-				const script =
-					"Get-CimInstance Win32_Process " +
-					`| Where-Object { $_.ProcessId -ne ${process.pid} } ` +
-					'| ForEach-Object { "$($_.ProcessId)`t$($_.CommandLine)" }';
-				const child = spawn(
-					powershell,
-					["-NoProfile", "-NonInteractive", "-Command", script],
-					{
-						shell: false,
-						windowsHide: true,
-						stdio: ["ignore", "pipe", "ignore"],
-					},
-				);
-				let out = "";
-				child.stdout.on("data", (d) => (out += d.toString()));
-				child.once("error", () => resolve([]));
-				child.once("close", () => {
-					const rows = [];
-					for (const line of out.split(/\r?\n/)) {
-						const tab = line.indexOf("\t");
-						if (tab <= 0) continue;
-						const pid = Number(line.slice(0, tab).trim());
-						if (Number.isFinite(pid) && pid > 0) {
-							rows.push({ pid, command: line.slice(tab + 1) });
-						}
-					}
-					resolve(rows);
-				});
-			} catch {
-				resolve([]);
-			}
-		});
-	}
-	return new Promise((resolve) => {
-		try {
-			const child = spawn("/bin/ps", ["-eo", "pid=,args="], {
-				stdio: ["ignore", "pipe", "ignore"],
-			});
-			let out = "";
-			child.stdout.on("data", (d) => (out += d.toString()));
-			child.once("error", () => resolve([]));
-			child.once("close", () => {
-				const rows = [];
-				for (const line of out.split(/\r?\n/)) {
-					const trimmed = line.trim();
-					if (!trimmed) continue;
-					const sp = trimmed.indexOf(" ");
-					if (sp <= 0) continue;
-					const pid = Number(trimmed.slice(0, sp));
-					if (Number.isFinite(pid) && pid > 0 && pid !== process.pid) {
-						rows.push({ pid, command: trimmed.slice(sp + 1) });
-					}
-				}
-				resolve(rows);
-			});
-		} catch {
-			resolve([]);
-		}
-	});
-}
-
-function readLatencyLogEntries() {
-	const logPath = path.join(os.homedir(), ".pi-lens", "latency.log");
+// The log is read from the PI_LENS_HOME pin every `pi` invocation below
+// runs under — never from the real `~/.pi-lens`. Since #2534 (#2506) the
+// global dir of any process whose cwd is under `os.tmpdir()` is redirected to
+// a per-project probe home, and this smoke's fixture project lives exactly
+// there; reading the real home returned an empty log and the two
+// absence-of-phase assertions passed vacuously (#2570).
+function readLatencyLogEntries(logHome) {
+	const logPath = path.join(logHome, "latency.log");
 	try {
 		return parseNdjsonEntries(fs.readFileSync(logPath, "utf8"));
 	} catch {
@@ -349,6 +297,10 @@ async function main() {
 
 	const projectDir = path.join(scratchRoot, "proj");
 	setUpFixtureProject(projectDir);
+	// Pin the global dir for every child `pi` so the latency log lands where
+	// `readLatencyLogEntries` reads it (same pattern as the other smokes).
+	const logHome = path.join(scratchRoot, "pi-lens-home");
+	fs.mkdirSync(logHome, { recursive: true });
 
 	let extensionPath;
 	try {
@@ -385,9 +337,10 @@ async function main() {
 				piBin,
 				extensionPath,
 				cwd: projectDir,
+				logHome,
 				env: { PI_SUBAGENT_CHILD: "1", PI_LENS_STARTUP_MODE: "full" },
 			});
-			const entries = readLatencyLogEntries();
+			const entries = readLatencyLogEntries(logHome);
 			const lightModeLogged = phaseWasLogged(
 				entries,
 				"subagent_light_mode",
@@ -398,10 +351,11 @@ async function main() {
 				HEAVYWEIGHT_SCAN_PHASES,
 				sinceIso,
 			);
+			const logged = countEntriesSince(entries, sinceIso);
 			results.push({
 				id: "subagent-light-mode-engages",
-				pass: lightModeLogged && heavyweightSkipped,
-				detail: `subagent_light_mode logged=${lightModeLogged}, heavyweight scans absent=${heavyweightSkipped}`,
+				pass: logged > 0 && lightModeLogged && heavyweightSkipped,
+				detail: `entries since run=${logged}, subagent_light_mode logged=${lightModeLogged}, heavyweight scans absent=${heavyweightSkipped}`,
 			});
 		} catch (err) {
 			results.push({
@@ -420,13 +374,14 @@ async function main() {
 				piBin,
 				extensionPath,
 				cwd: projectDir,
+				logHome,
 				env: {
 					PI_SUBAGENT_CHILD: "1",
 					PI_LENS_SUBAGENT_FULL: "1",
 					PI_LENS_STARTUP_MODE: "full",
 				},
 			});
-			const entries = readLatencyLogEntries();
+			const entries = readLatencyLogEntries(logHome);
 			const lightModeAbsent = !phaseWasLogged(
 				entries,
 				"subagent_light_mode",
@@ -449,11 +404,12 @@ async function main() {
 	// --- Assertion 3: zero surviving LSP-server processes after clean exit ---
 	{
 		try {
-			const before = await snapshotProcesses();
+			const before = await snapshotLspCandidates();
 			await runPiRpc({
 				piBin,
 				extensionPath,
 				cwd: projectDir,
+				logHome,
 				env: { PI_LENS_STARTUP_MODE: "full" },
 			});
 			// Grace period: pi's own teardown (session_shutdown -> LSP fast
@@ -461,16 +417,8 @@ async function main() {
 			// the parent process exits, not synchronously with it (verified
 			// empirically — see docs/subagent-compat.md).
 			await new Promise((r) => setTimeout(r, 3000));
-			const after = await snapshotProcesses();
-			const surviving = diffSurvivingLspProcesses(before, after);
-			results.push({
-				id: "no-surviving-lsp-processes",
-				pass: surviving.length === 0,
-				detail:
-					surviving.length === 0
-						? "no new LSP-server processes survived pi's exit"
-						: `${surviving.length} surviving process(es): ${surviving.map((p) => `pid=${p.pid} ${p.command.slice(0, 80)}`).join("; ")}`,
-			});
+			const after = await snapshotLspCandidates();
+			results.push(evaluateNoSurvivingLspProcesses(before, after));
 		} catch (err) {
 			results.push({
 				id: "no-surviving-lsp-processes",
@@ -488,13 +436,14 @@ async function main() {
 				piBin,
 				extensionPath,
 				cwd: projectDir,
+				logHome,
 				env: {
 					PI_SUBAGENT_CHILD_AGENT: "compat-smoke-worker",
 					PI_SUBAGENT_PARENT_PID: "4242",
 					PI_LENS_STARTUP_MODE: "full",
 				},
 			});
-			const entries = readLatencyLogEntries();
+			const entries = readLatencyLogEntries(logHome);
 			const lightModeLogged = phaseWasLogged(
 				entries,
 				"subagent_light_mode",
@@ -505,10 +454,11 @@ async function main() {
 				HEAVYWEIGHT_SCAN_PHASES,
 				sinceIso,
 			);
+			const logged = countEntriesSince(entries, sinceIso);
 			results.push({
 				id: "avtc-pair-engages-light-mode",
-				pass: lightModeLogged && heavyweightSkipped,
-				detail: `subagent_light_mode logged=${lightModeLogged}, heavyweight scans absent=${heavyweightSkipped}`,
+				pass: logged > 0 && lightModeLogged && heavyweightSkipped,
+				detail: `entries since run=${logged}, subagent_light_mode logged=${lightModeLogged}, heavyweight scans absent=${heavyweightSkipped}`,
 			});
 		} catch (err) {
 			results.push({
@@ -528,12 +478,13 @@ async function main() {
 				piBin,
 				extensionPath,
 				cwd: projectDir,
+				logHome,
 				env: {
 					PI_SUBAGENT_CHILD_AGENT: "compat-smoke-worker",
 					PI_LENS_STARTUP_MODE: "full",
 				},
 			});
-			const entries = readLatencyLogEntries();
+			const entries = readLatencyLogEntries(logHome);
 			const lightModeAbsent = !phaseWasLogged(
 				entries,
 				"subagent_light_mode",

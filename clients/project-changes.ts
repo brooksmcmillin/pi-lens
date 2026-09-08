@@ -10,8 +10,20 @@ export type ProjectChangeSource =
 	| "autofix"
 	| "partial-apply"
 	| "lsp-edit"
+	/** An LSP `textDocument/rename` or `workspace/willRenameFiles` resource rename (#2450). */
+	| "lsp-rename"
+	/** A `workspace/executeCommand` (allowlisted) or the `workspace/applyEdit` it solicited (#2450). */
+	| "lsp-execute-command"
 	| "opaque-script"
-	| "external";
+	| "external"
+	/**
+	 * A mutation attributed to a named tool that is neither pi's `write`/`edit`
+	 * nor one of pi-lens's own passes (#2423) — a third-party edit tool, or a
+	 * producer recording through `clients/mutation-bridge.ts`. The tool name is
+	 * carried in the member itself rather than collapsed onto `agent-edit`, so a
+	 * change report can tell an extension's rewrite from the model's own edit.
+	 */
+	| `agent-tool:${string}`;
 
 export interface ProjectChangeRange {
 	start: number;
@@ -84,7 +96,7 @@ export function readProjectChanges(cwd: string): ProjectChangeEntry[] {
  * version — a missing/corrupt log is the normal cold-start case, not a
  * caller-visible error.
  */
-export async function readProjectChangesAsync(
+async function readProjectChangesAsync(
 	cwd: string,
 ): Promise<ProjectChangeEntry[]> {
 	const logPath = getProjectChangeLogPath(cwd);

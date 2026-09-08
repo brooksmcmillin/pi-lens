@@ -19,6 +19,7 @@ import {
 	type ParsedTreeOutcome,
 	TreeSitterClient,
 } from "./tree-sitter-client.js";
+import { EXTENSION_TO_GRAMMAR } from "./language-registry.js";
 import { logTreeSitter } from "./tree-sitter-logger.js";
 
 let _shared: TreeSitterClient | null = null;
@@ -99,58 +100,71 @@ export function _resetSharedTreeSitterClientForTests(): void {
 	_wasmAbortedAt = undefined;
 }
 
-// Grammar selection by extension — the single ext→grammar-id authority. `.tsx` →
-// the tsx grammar (parses JSX); `.jsx` → the javascript grammar. The project
-// scanner (project-diagnostics/scanner.ts) DERIVES its map from this one and
-// module-report (module-report.ts `tsLangForFile`, #887) resolves its
-// extension-split kinds (jsts/cxx) through `resolveTreeSitterLanguage` below,
-// so neither can drift: post-#877 both key `.tsx`→tsx (the old note here said the
-// scanner mapped `.tsx`→typescript to reuse typescript queries — that stopped
-// being true when #877 moved typescript-rule inheritance into
-// `queriesForLanguage`). The scanner layers only java/kotlin on top, whose
-// grammars + rule dirs exist but are not wired into a per-edit runner `appliesTo`.
-export const EXT_TO_LANG: Record<string, string> = {
-	".ts": "typescript",
-	".mts": "typescript",
-	".cts": "typescript",
-	".tsx": "tsx",
-	".js": "javascript",
-	".mjs": "javascript",
-	".cjs": "javascript",
-	".jsx": "javascript",
-	".py": "python",
-	".go": "go",
-	".rs": "rust",
-	".rb": "ruby",
-	".c": "c",
-	".h": "c",
-	".cc": "cpp",
-	".cpp": "cpp",
-	".cxx": "cpp",
-	".c++": "cpp",
-	".hh": "cpp",
-	".hpp": "cpp",
-	".hxx": "cpp",
-	".inl": "cpp",
-	".ipp": "cpp",
-	".tpp": "cpp",
-	".txx": "cpp",
-	".cu": "cpp",
-	".hip": "cpp",
-	".cs": "csharp",
-	".php": "php",
-	".phtml": "php",
-	".php3": "php",
-	".php4": "php",
-	".php5": "php",
-	".css": "css",
-};
+// Grammar selection by extension — projected from the canonical language
+// registry (language-registry.ts, #2424), which is now THE ext→grammar
+// authority. `.tsx` → the tsx grammar (parses JSX); `.jsx` → the javascript
+// grammar. The project scanner (project-diagnostics/scanner.ts), read expansion
+// (read-expansion.ts) and module-report (`tsLangForFile`, #887) all project the
+// same registry column, so none of them can drift from this one: before #2424
+// the scanner spread this map and layered java/kotlin on top while read
+// expansion kept a hand-copied near-copy of it.
+// `Readonly` because the projection is `Object.freeze`d at the source, and the
+// mutable `Record` type let a caller type-check a write that would throw at
+// runtime (#2424 review, S4).
+export const EXT_TO_LANG: Readonly<Record<string, string>> =
+	EXTENSION_TO_GRAMMAR;
 
 /** Resolve a tree-sitter grammar/language id from a file path's extension. */
 export function resolveTreeSitterLanguage(
 	filePath: string,
 ): string | undefined {
 	return EXT_TO_LANG[path.extname(filePath).toLowerCase()];
+}
+
+/**
+ * The grammars `clients/complexity-client.ts` has a node mapping for.
+ *
+ * Lives HERE, beside the ext→grammar resolver, because the question "can this
+ * path produce a complexity baseline?" has to be answerable WITHOUT loading
+ * the analyzer graph (#2467): `clients/runtime-tool-call.ts` asks it on every
+ * tool call to decide whether the seventeen-module load is worth starting, and
+ * the client that owns the answer is behind that very load.
+ *
+ * It is not a second extension table — the extension half still comes from the
+ * one canonical registry through {@link resolveTreeSitterLanguage}. It is the
+ * language-id half, and `LANGUAGE_NODES` is typed
+ * `Record<ComplexityLanguageId, …>`, so adding a grammar there without adding
+ * it here (or the reverse) is a COMPILE error rather than a predicate that
+ * quietly drifts from the client it is supposed to mirror.
+ */
+export const COMPLEXITY_LANGUAGE_IDS = [
+	"typescript",
+	"tsx",
+	"javascript",
+	"python",
+	"go",
+	"rust",
+] as const;
+
+/** One of {@link COMPLEXITY_LANGUAGE_IDS}. */
+export type ComplexityLanguageId = (typeof COMPLEXITY_LANGUAGE_IDS)[number];
+
+/** Narrow a resolved grammar id to one complexity can analyze. */
+export function isComplexityLanguageId(
+	languageId: string,
+): languageId is ComplexityLanguageId {
+	return (COMPLEXITY_LANGUAGE_IDS as readonly string[]).includes(languageId);
+}
+
+/**
+ * Can a complexity baseline be produced for this path? Pure, synchronous, and
+ * free of every analyzer module — the guard `handleToolCallImpl` needs above
+ * its demand on the bootstrap seam. `ComplexityClient.isSupportedFile`
+ * delegates to it, so there is exactly one answer.
+ */
+export function isComplexitySupportedFile(filePath: string): boolean {
+	const languageId = resolveTreeSitterLanguage(filePath);
+	return languageId !== undefined && isComplexityLanguageId(languageId);
 }
 
 // --- Generic node-walk utilities (shared by the fact extractors and the

@@ -47,6 +47,16 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { gitExecFileSync } from "./lib/git-fixture-env.mjs";
+import {
+	bootstrapFixtureWorkspace,
+	withScratchHome,
+} from "./lib/lsp-fixture-workspace.mjs";
+import {
+	claimScratchDir,
+	SCRATCH_DIR_ROOT,
+	sweepScratchDirs,
+} from "./lib/scratch-dir.mjs";
+import { safeRm } from "./lib/safe-rm.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..");
@@ -1254,53 +1264,14 @@ function parseArgs(argv) {
 
 const TMP_PREFIX = "pi-lens-smoke-";
 
-/**
- * Best-effort temp cleanup. On Windows the spawned LSP servers keep a handle on
- * the workspace until THIS process exits, so an in-run rmSync can EPERM; never
- * let that abort the run.
- */
-function safeRm(dir) {
-	try {
-		fs.rmSync(dir, {
-			recursive: true,
-			force: true,
-			maxRetries: 3,
-			retryDelay: 200,
-		});
-	} catch {
-		// leftover temp dir — swept on the next run (see sweepLeftovers)
-	}
-}
-
-/**
- * Sweep leftovers from PRIOR runs. Those runs' LSP servers have long since
- * exited, so their workspace locks are released and the dirs delete cleanly —
- * this is why cleanup belongs at startup, not in the same process that holds the
- * lock. Keeps %TEMP% from accumulating across nightly runs without a separate
- * unlock step.
- */
-function sweepLeftovers() {
-	const tmp = os.tmpdir();
-	let swept = 0;
-	try {
-		for (const entry of fs.readdirSync(tmp)) {
-			if (!entry.startsWith(TMP_PREFIX)) continue;
-			try {
-				fs.rmSync(path.join(tmp, entry), { recursive: true, force: true });
-				swept++;
-			} catch {
-				// still locked by a live run — leave it
-			}
-		}
-	} catch {
-		// tmpdir unreadable — ignore
-	}
-	return swept;
+/** Sweep prior runs without deleting a workspace owned by a live process. */
+export function sweepLeftovers() {
+	return sweepScratchDirs(SCRATCH_DIR_ROOT, TMP_PREFIX);
 }
 
 function copyDirToTemp(srcRel) {
 	const src = path.join(repoRoot, srcRel);
-	const dest = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-smoke-"));
+	const dest = claimScratchDir(SCRATCH_DIR_ROOT, TMP_PREFIX);
 	fs.cpSync(src, dest, { recursive: true });
 	return dest;
 }
@@ -1407,6 +1378,234 @@ export function passFloorBreach(rows, minPass) {
 ✗ pass floor: ${passed} runner(s) passed, at least ${minPass} required (${unavailable} unavailable). A lane that installs nothing proves nothing — treat this as red, not as flaky tooling.`;
 }
 
+// A transient/offline registry condition — the runner has no network, or the
+// registry itself is down, neither of which is "this runner lacks a
+// toolchain" or "the installer has a defect" (#2661 review F2). E5xx covers
+// the registry's own 5xx responses; the rest are Node's own connect-failure
+// errno strings.
+const TRANSIENT_NETWORK_PATTERN =
+	/ENOTFOUND|ETIMEDOUT|ECONNRESET|EAI_AGAIN|E5\d\d/;
+
+/**
+ * The first non-empty line of `text`, capped at 200 chars — the same bound
+ * `describeInstallAttempt` (`clients/dispatch/runners/utils/availability-
+ * policy.ts`) uses for a free-text installer reason, so a row detail is one
+ * line long instead of spilling a whole `npm ERR!` transcript into the table
+ * (#2661 review F5).
+ */
+function firstLine(text) {
+	const line = String(text ?? "")
+		.split(/\r?\n/)
+		.find((l) => l.trim().length > 0);
+	if (!line) return "";
+	return line.length > 200 ? `${line.slice(0, 200)}…` : line;
+}
+
+/**
+ * Is `command --version` runnable on this runner? Best-effort, synchronous.
+ */
+function commandOnPath(command) {
+	try {
+		execFileSync(command, ["--version"], { stdio: "ignore" });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Is THIS pip candidate actually usable — not just present? `pip`/`pip3`
+ * answering `--version` IS proof; `python`/`python3` answering `--version`
+ * is NOT (#2661 review round 2, R2-F2: a python3-without-pip runner —
+ * Debian slim, manylinux base images — has a working `python3` but no `pip`
+ * module, so `installPipTool`'s OWN `python3 -m pip …` candidate fails while
+ * a bare `python3 --version` probe would misreport the toolchain as
+ * present). Probe the exact invocation the installer would run.
+ */
+export function pipCandidateUsable(command) {
+	const args =
+		command === "pip" || command === "pip3"
+			? ["--version"]
+			: ["-m", "pip", "--version"];
+	try {
+		execFileSync(command, args, { stdio: "ignore" });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Is a pip or gem toolchain reachable on this runner? For pip, tries every
+ * candidate the installer itself would try (`pipCommandCandidates()`, #2661
+ * review S5 — probing bare `pip` alone missed a `pip3`-only runner),
+ * verifying the pip MODULE specifically for a python-family command (R2-F2);
+ * for gem, the installer uses a single `gem` command. Cached per run in
+ * `toolchainPresence` (keyed by strategy) since this only needs to run once
+ * even if several pip/gem tools are unavailable.
+ */
+function toolchainPresent(strategy, toolchainPresence, pipCandidates) {
+	const cached = toolchainPresence[strategy];
+	if (cached !== undefined) return cached;
+	const present =
+		strategy === "gem"
+			? commandOnPath("gem")
+			: pipCandidates.some((cmd) => pipCandidateUsable(cmd));
+	toolchainPresence[strategy] = present;
+	return present;
+}
+
+/**
+ * Classify why `toolId` (one of a fixture's declared `tools`) never resolved
+ * via `ensureTool`, using the installer's own ATTEMPT record — never the
+ * `getInstallFailureReason` refusal map alone, which (per its own doc comment
+ * in `clients/installer/index.ts`) cannot answer whether an install even RAN
+ * (#2661 review F1: the previous version of this function inferred
+ * "genuine" from strategy + that map alone, so `PI_LENS_DISABLE_TOOL_INSTALL`,
+ * an install-lock timeout, and a project-trust decline — none of which ran an
+ * install at all — were all misclassified as a genuine installer defect).
+ *
+ * `{ row: "fail", detail }` only when ALL of:
+ *  - `getInstallAttempt(toolId).outcome === "failed"` — an install genuinely
+ *    RAN and did not succeed (excludes `declined`/`skipped`/no attempt);
+ *  - the reason isn't a transient/offline registry condition (F2) — a runner
+ *    with no network is a runner condition, not an installer defect;
+ *  - the strategy needed no toolchain this runner lacks: `npm` is always
+ *    genuine (this harness itself runs under Node, so Node can never be
+ *    "absent" for it); `pip`/`gem` only when `toolchainPresent` confirms the
+ *    runtime was actually there; every other strategy (`github`/`maven`/
+ *    `archive`) keeps the pre-#2638 skip semantics — a missing platform/arch
+ *    release asset is a real "this runner cannot install this" case.
+ *
+ * Every other case is `{ row: "skip", detail }` — the historical behavior.
+ *
+ * `toolchainPresent`'s pip probe (#2661 review round 2, R2-F2) runs the exact
+ * invocation `installPipTool` would for each candidate — `-m pip --version`
+ * for a python-family command, not a bare `--version` — so a python3-
+ * without-pip runner (Debian slim, manylinux base images: `python3` present,
+ * `pip` module absent) is correctly graded toolchain-ABSENT. Deliberately
+ * NOT short-circuited on `installPipTool`'s thrown message text: that
+ * function wraps EVERY pip failure — a truly-absent toolchain AND a genuine
+ * "package not found" error on an otherwise-working pip alike — in the same
+ * "no usable pip command found" prefix, so pattern-matching on it would
+ * reclassify every genuine pip install defect as toolchain-absent, exactly
+ * backwards from what this function exists to fix.
+ */
+export function classifyInstallOutcome(toolId, deps) {
+	const { getInstallAttempt, toolsById, toolchainPresence, pipCandidates } =
+		deps;
+	const attempt = getInstallAttempt(toolId);
+	if (attempt?.outcome !== "failed") {
+		return {
+			row: "skip",
+			detail: `${toolId} unavailable (${attempt?.outcome ?? "no install attempt"}${attempt?.reason ? `: ${firstLine(attempt.reason)}` : ""})`,
+		};
+	}
+	const reason = attempt.reason ?? "install failed (no reason recorded)";
+	if (TRANSIENT_NETWORK_PATTERN.test(reason)) {
+		return {
+			row: "skip",
+			detail: `${toolId} unavailable (transient registry/network condition: ${firstLine(reason)})`,
+		};
+	}
+	const strategy = toolsById.get(toolId)?.installStrategy;
+	const genuine =
+		strategy === "npm"
+			? true
+			: strategy === "pip" || strategy === "gem"
+				? toolchainPresent(strategy, toolchainPresence, pipCandidates)
+				: false;
+	if (!genuine) {
+		return {
+			row: "skip",
+			detail: `${toolId} unavailable (no ${strategy ?? "known"} toolchain on this runner)`,
+		};
+	}
+	return {
+		row: "fail",
+		detail: `ensureTool(${toolId}) failed (${strategy} toolchain present): ${firstLine(reason)}`,
+	};
+}
+
+/**
+ * The row this fixture's `ensureTool` step should report: the first GENUINE
+ * install failure among `toolIds` (see `classifyInstallOutcome`), or the
+ * given fallback "skip" detail when every unavailable tool in the list is
+ * legitimately declined/skipped/toolchain-absent/transient. The single call
+ * site all three `runLspHandshake` unavailability branches share (#2661
+ * review F3 — three near-identical inline blocks collapsed to one).
+ *
+ * `attemptSnapshots` is the actual `Map` `ensureFixtureTools` returned — not
+ * a `deps`-shaped object carrying its own `getInstallAttempt` closure that a
+ * future edit could reassemble either way. #2670 (from the #2661 r3 verify):
+ * the previous signature took a `deps` object whose caller built
+ * `{ ...classifyDeps, getInstallAttempt: (id) => attemptSnapshots.get(id) }`
+ * at the call site — nothing stopped a later edit from swapping that closure
+ * for the module-global `getInstallAttempt` (mutation E, #2661), which
+ * stayed green because no test exercised the call site's own wiring. Taking
+ * the snapshot Map as its own positional parameter and deriving
+ * `getInstallAttempt` from it INTERNALLY (always overriding anything a
+ * caller's `restDeps` might carry under that key) removes the shape that
+ * mutation needs to exist in.
+ */
+export function resolveUnavailabilityRow(
+	toolIds,
+	unavailableTools,
+	attemptSnapshots,
+	restDeps,
+	fallbackSkipDetail,
+) {
+	for (const id of toolIds) {
+		if (!unavailableTools.has(id)) continue;
+		const outcome = classifyInstallOutcome(id, {
+			...restDeps,
+			getInstallAttempt: (toolId) => attemptSnapshots.get(toolId),
+		});
+		if (outcome.row === "fail") return outcome;
+	}
+	return { row: "skip", detail: fallbackSkipDetail };
+}
+
+/**
+ * Ensure every tool in `toolIds`, returning which never resolved AND a
+ * SNAPSHOT (not a live reference) of each one's `getInstallAttempt` record
+ * taken the instant it was found unavailable (#2661 round 2 R2-F3).
+ *
+ * `getInstallAttempt` reads a module-global the installer keeps mutating —
+ * a later `{allowInstall:false}` re-ensure (e.g. from a DIFFERENT fixture
+ * whose `tools` overlaps this one) can rewrite `failed` → `declined` in
+ * place. Reading it live at classification time, potentially hundreds of
+ * lines and several `await`s after this loop ran, is a last-writer-wins race
+ * that can turn a real E404 into a false ⚠ skip. Snapshotting here, at the
+ * one moment this function KNOWS the record is fresh, removes the class —
+ * not reachable in today's single-pass nightly config, but a real one after
+ * #2606 lets tool-smoke's install lane run overlapping fixtures concurrently.
+ *
+ * `onEnsured(toolId, resolvedPathOrUndefined)`, when given, fires after each
+ * `ensureTool` call — the caller's own verbose-logging hook, kept out of this
+ * function so it stays testable without capturing console output.
+ */
+export async function ensureFixtureTools(
+	toolIds,
+	ensureTool,
+	getInstallAttempt,
+	onEnsured,
+) {
+	const unavailableTools = new Set();
+	const attemptSnapshots = new Map();
+	if (ensureTool) {
+		for (const toolId of toolIds) {
+			const resolved = await ensureTool(toolId);
+			if (!resolved) {
+				unavailableTools.add(toolId);
+				attemptSnapshots.set(toolId, getInstallAttempt?.(toolId));
+			}
+			onEnsured?.(toolId, resolved);
+		}
+	}
+	return { unavailableTools, attemptSnapshots };
+}
+
 /** Classify one target runner's outcome against the Step-1 bar. */
 function classify(outcome) {
 	if (!outcome) {
@@ -1492,6 +1691,9 @@ async function runLspHandshake({ langs, install, verbose }) {
 	const { initLSPConfig } = await import(pathToFileURL(configEntry).href);
 
 	let ensureTool;
+	let TOOLS_REGISTRY = [];
+	let getInstallAttempt;
+	let pipCandidates = [];
 	if (install) {
 		const installerEntry = path.join(
 			repoRoot,
@@ -1500,8 +1702,25 @@ async function runLspHandshake({ langs, install, verbose }) {
 			"installer",
 			"index.js",
 		);
-		({ ensureTool } = await import(pathToFileURL(installerEntry).href));
+		let pipCommandCandidatesFn;
+		({
+			ensureTool,
+			TOOLS: TOOLS_REGISTRY,
+			getInstallAttempt,
+			pipCommandCandidates: pipCommandCandidatesFn,
+		} = await import(pathToFileURL(installerEntry).href));
+		// The SAME candidate ladder `installPipTool` tries (#2661 review S5) —
+		// never a second, independently-maintained guess.
+		pipCandidates = pipCommandCandidatesFn?.() ?? [];
 	}
+	const toolsById = new Map(TOOLS_REGISTRY.map((t) => [t.id, t]));
+	// Computed lazily, once per run, the first time a pip/gem tool actually
+	// fails — most runs never touch this.
+	const toolchainPresence = {};
+	// `getInstallAttempt` is intentionally NOT included here — each fixture
+	// below overrides it with a per-fixture snapshot (R2-F3); this base object
+	// carries only the parts that are safe to share across the whole run.
+	const classifyDeps = { toolsById, toolchainPresence, pipCandidates };
 
 	const selected = langs.length
 		? LSP_FIXTURES.filter((f) => langs.includes(f.lang))
@@ -1514,20 +1733,33 @@ async function runLspHandshake({ langs, install, verbose }) {
 	const lsp = getLSPService();
 	const rows = [];
 	for (const fx of selected) {
-		const unavailableTools = new Set();
-		if (install && ensureTool) {
-			for (const toolId of fx.tools ?? []) {
-				const resolved = await ensureTool(toolId);
-				if (!resolved) unavailableTools.add(toolId);
+		const { unavailableTools, attemptSnapshots } = await ensureFixtureTools(
+			fx.tools ?? [],
+			ensureTool,
+			getInstallAttempt,
+			(toolId, resolved) => {
 				if (verbose) {
 					console.error(
 						`[${fx.lang}] ensureTool(${toolId}) → ${resolved ?? "UNAVAILABLE"}`,
 					);
 				}
-			}
+			},
+		);
+		// #2369/#2655/#2658: every fixture's temp workspace registers itself as a
+		// served session root unconditionally (not only for `disableServers`
+		// fixtures) — see lib/lsp-fixture-workspace.mjs / lib/lsp-fixture-
+		// session-guard.mjs for why this can't be conditional. `fx.setup`/
+		// `fx.lombokJar` (below) don't touch git/LSP-config state, so running
+		// them after registration+gitInit+disable+assert is order-safe.
+		const { workspace, absFile, cleanup } = await bootstrapFixtureWorkspace(
+			fx,
+			{ initLSPConfig, repoRoot, tmpPrefix: "pi-lens-smoke-" },
+		);
+		if (verbose && fx.disableServers) {
+			console.error(
+				`[${fx.lang}] disabled [${fx.disableServers.join(",")}] via .pi-lens/lsp.json → expecting ${fx.expectServerId}`,
+			);
 		}
-		const workspace = copyDirToTemp(fx.dir);
-		const absFile = path.join(workspace, fx.file);
 		if (fx.setup) {
 			if (verbose) {
 				const desc = Array.isArray(fx.setup) ? fx.setup.join(" ") : fx.setup;
@@ -1542,7 +1774,7 @@ async function runLspHandshake({ langs, install, verbose }) {
 					detail: setupResult.detail,
 					diags: 0,
 				});
-				safeRm(workspace);
+				cleanup();
 				continue;
 			}
 		}
@@ -1558,41 +1790,14 @@ async function runLspHandshake({ langs, install, verbose }) {
 					detail: `lombok.jar unavailable: ${err?.message ?? err}`,
 					diags: 0,
 				});
-				safeRm(workspace);
+				cleanup();
 				continue;
-			}
-		}
-		// Some auxiliary servers (opengrep) root at the nearest .git — give the
-		// temp workspace one so the copied fixture is treated as in-workspace.
-		if (fx.gitInit) {
-			try {
-				gitExecFileSync(["init", "-q"], {
-					cwd: workspace,
-					stdio: "ignore",
-				});
-			} catch {
-				// git unavailable — opengrep falls back to cwd; may not scan the temp file
 			}
 		}
 		const auxIds = fx.auxiliaryServerIds ?? [];
 		const useAux = auxIds.length > 0;
 		const push = (state, detail, diags = 0) =>
 			rows.push({ lang: fx.lang, runner: fx.serverHint, state, detail, diags });
-		// Alternate-primary fixtures: disable the default server for this workspace
-		// so getClientForFile falls through to the alternate.
-		if (fx.disableServers) {
-			fs.mkdirSync(path.join(workspace, ".pi-lens"), { recursive: true });
-			fs.writeFileSync(
-				path.join(workspace, ".pi-lens", "lsp.json"),
-				JSON.stringify({ disabledServers: fx.disableServers }, null, 2),
-			);
-			await initLSPConfig(workspace);
-			if (verbose) {
-				console.error(
-					`[${fx.lang}] disabled [${fx.disableServers.join(",")}] via .pi-lens/lsp.json → expecting ${fx.expectServerId}`,
-				);
-			}
-		}
 		try {
 			if (!lsp.supportsLSP(absFile)) {
 				push("skip", "no LSP server registered for this file");
@@ -1674,10 +1879,17 @@ async function runLspHandshake({ langs, install, verbose }) {
 				const auxUnavailable =
 					toolList.length > 0 && toolList.every((t) => unavailableTools.has(t));
 				if (auxDiags.length === 0 && auxUnavailable) {
-					push(
-						"skip",
+					// #2638/#2661 review: a genuine install failure (npm/pip with its
+					// toolchain present) is a RED row, not the same "unavailable"
+					// bucket a declined/skipped/toolchain-absent install uses.
+					const outcome = resolveUnavailabilityRow(
+						toolList,
+						unavailableTools,
+						attemptSnapshots,
+						classifyDeps,
 						`auxiliary ${auxIds.join(",")} unavailable (tool not installed; pass --install)`,
 					);
+					push(outcome.row, outcome.detail);
 					continue;
 				}
 				push(
@@ -1705,11 +1917,17 @@ async function runLspHandshake({ langs, install, verbose }) {
 			if (fx.expectServerId && !threw) {
 				if (!touchedDiags) {
 					// No client became ready — the alternate isn't installed (and
-					// --install wasn't passed or its install failed). Skip, don't fail.
-					push(
-						"skip",
+					// --install wasn't passed or its install failed). Skip, unless
+					// the failure was genuine (#2638/#2661 review) — then it's a
+					// real installer defect, not an absent toolchain.
+					const outcome = resolveUnavailabilityRow(
+						fx.tools ?? [],
+						unavailableTools,
+						attemptSnapshots,
+						classifyDeps,
 						`${fx.expectServerId} unavailable (no client ready; pass --install or install ${(fx.tools ?? []).join(",")})`,
 					);
+					push(outcome.row, outcome.detail);
 					continue;
 				}
 				const active = await lsp.getWarmClientForFile(absFile);
@@ -1822,15 +2040,24 @@ async function runLspHandshake({ langs, install, verbose }) {
 					diags,
 				);
 			} else {
-				push(
-					"skip",
+				// No client ready — either the toolchain this server needs isn't
+				// on this runner (⚠ skip, unchanged), or ensureTool RAN and FAILED
+				// even though its toolchain was present (a real installer defect:
+				// #2638, `vscode-css-languageserver`'s E404 sat in this exact
+				// "skip" bucket every night the nightly ran).
+				const outcome = resolveUnavailabilityRow(
+					fx.tools ?? [],
+					unavailableTools,
+					attemptSnapshots,
+					classifyDeps,
 					`no client ready in ${LSP_CLIENT_WAIT_MS}ms (server missing/slow; try --install)`,
 				);
+				push(outcome.row, outcome.detail);
 			}
 		} catch (err) {
 			push("fail", `error: ${err?.message ?? err}`);
 		} finally {
-			safeRm(workspace);
+			cleanup();
 		}
 	}
 
@@ -2078,6 +2305,12 @@ async function runAutofixSmoke({ langs, install, verbose }) {
 }
 
 async function main() {
+	// #2670/#2506-shape: pin PI_LENS_HOME/PILENS_DATA_DIR to a scratch temp
+	// dir BEFORE the first dist/ import any lane below performs —
+	// dist/clients/latency-logger.js reads its log dir into a top-level const
+	// at module load, not lazily per write.
+	withScratchHome();
+
 	const {
 		langs,
 		step2,

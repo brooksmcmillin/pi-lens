@@ -25,6 +25,7 @@ import {
 	getResourceFootprint as getResourceFootprintSnapshot,
 	type ResourceFootprint,
 } from "./instance-registry.js";
+import { extensionsForLanguageToken } from "./language-registry.js";
 import { initLSPConfig } from "./lsp/config.js";
 import { getLSPService } from "./lsp/index.js";
 import { acquireWarmWordIndex } from "./mcp/analyze.js";
@@ -47,19 +48,13 @@ import {
 
 // --- Facades (re-exported so adapters import only this module) ---------------
 
-export {
-	type AnalyzeFileOptions,
-	analyzeFile,
-	type McpAnalyzeResult,
-} from "./mcp/analyze.js";
+export { analyzeFile, type McpAnalyzeResult } from "./mcp/analyze.js";
 export { createMcpHost } from "./mcp/host-shim.js";
 export {
 	createWarmIpcLineReader,
 	createWarmIpcRequestQueue,
 	ipcPathForCwd,
 	readTurnEndStatus,
-	requestWarmAnalyze,
-	type TurnEndStatus,
 	WARM_TURN_END_SCHEMA_VERSION,
 	type WarmAnalyzeRequest,
 	type WarmTurnEndRequest,
@@ -68,10 +63,8 @@ export {
 export {
 	analyzeFileFresh,
 	canRebuildPiLens,
-	REBUILD_UNAVAILABLE_MESSAGE,
 	resolveRebuildScript,
 	runRebuild,
-	type ScanDiagnostic,
 	summarizeScan,
 } from "./mcp/review.js";
 export {
@@ -79,35 +72,30 @@ export {
 	runSessionStart,
 	runTurnEnd,
 	runTurnEndForIpc,
-	type SessionStartOutcome,
-	type TurnEndDelivery,
-	type TurnEndOutcome,
 } from "./mcp/session.js";
 export {
-	type ModuleReport,
-	type ModuleReportOptions,
-	type ModuleSymbolEntry,
 	moduleReport,
-	type ReadEnclosingOptions,
-	type ReadEnclosingResult,
-	type ReadSymbolResult,
-	type RecommendedRead,
 	readEnclosing,
 	readSymbol,
 	renderCompactModuleReport,
 } from "./module-report.js";
 export {
 	type ProjectReport,
-	type ProjectReportOptions,
 	projectReport,
 	renderCompactProjectReport,
 } from "./project-report.js";
+// Effective-config introspection (#2427). A facade rather than a wrapper for
+// the same reason the others are: the computation reaches into the config
+// resolution, the LSP registry and the dispatch plan at once, and putting that
+// composition here would make this file the fourth place that knows how a
+// server is selected. Adapters route to it; nobody re-derives it.
 export {
-	createDefaultHostPorts,
-	type HostLogSink,
-	type HostPorts,
-	type HostPortsOverrides,
-} from "./host-ports.js";
+	effectiveConfig,
+	type EffectiveConfigView,
+	type EffectiveFileView,
+	type EffectiveServerDecision,
+	isEffectiveFileViewError,
+} from "./effective-config.js";
 
 // --- Query wrappers (own the remaining internal reach-ins) -------------------
 
@@ -302,7 +290,7 @@ export function resourceFootprint(): Promise<ResourceFootprint> {
  * offset=startLine, limit=endLine-startLine+1 for a one-line peek — prefer
  * module_report on `file` for the real outline. No per-hit `read` block, no
  * repeated raw `lines[]` array on the wire. */
-export interface SymbolSearchHit {
+interface SymbolSearchHit {
 	file: string;
 	score: number;
 	hits: number;
@@ -342,45 +330,31 @@ export interface SymbolSearchOptions {
 	lang?: string;
 }
 
-// Same language identifiers ast_grep_search's `lang` param accepts
-// (tools/shared.ts's LANGUAGES) mapped to source file extensions. Duplicated
-// here rather than imported — clients/ never reaches into tools/ (see
-// AGENTS.md's MCP-mirror layering note) — so this is symbol_search's own small
-// copy, scoped to what its `lang` filter needs (extension matching only, no
-// AST/LSP concerns).
-const SYMBOL_SEARCH_LANG_EXTENSIONS: Readonly<
-	Record<string, readonly string[]>
-> = {
-	bash: [".sh", ".bash"],
-	c: [".c", ".h"],
-	cpp: [".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"],
-	csharp: [".cs"],
-	css: [".css", ".scss", ".less"],
-	elixir: [".ex", ".exs"],
-	go: [".go"],
-	haskell: [".hs", ".lhs"],
-	html: [".html", ".htm"],
-	java: [".java"],
-	javascript: [".js", ".jsx", ".mjs", ".cjs"],
-	json: [".json", ".jsonc", ".json5"],
-	kotlin: [".kt", ".kts"],
-	lua: [".lua"],
-	nix: [".nix"],
-	php: [".php"],
-	python: [".py", ".pyi"],
-	ruby: [".rb", ".rake", ".gemspec"],
-	rust: [".rs"],
-	scala: [".scala", ".sc"],
-	solidity: [".sol"],
-	swift: [".swift"],
-	tsx: [".tsx"],
-	typescript: [".ts", ".mts", ".cts"],
-	yaml: [".yaml", ".yml"],
-};
-
-function fileMatchesLang(file: string, lang: string): boolean {
-	const exts = SYMBOL_SEARCH_LANG_EXTENSIONS[lang];
-	if (!exts) return false;
+/**
+ * symbol_search's `lang` filter.
+ *
+ * The extension table this used to consult was a NINTH hand-written language ->
+ * extensions map, kept here because `clients/` never reaches into `tools/`
+ * (AGENTS.md's MCP-mirror layering note) — and it had drifted from every other
+ * one (#2424 review, S2): `css` claimed `.scss`/`.less`, `json` claimed
+ * `.jsonc`, `php` omitted its four alias extensions, `ruby` omitted `.ru`, and
+ * `solidity` was not a language the registry (or any grammar, or the ast-grep
+ * napi matrix) knows at all.
+ *
+ * The layering constraint was never a reason to duplicate the DATA, only a
+ * reason not to import the tool's token list. `extensionsForLanguageToken`
+ * resolves the token against the canonical registry instead.
+ *
+ * Exported so `tests/clients/language-registry-drift.test.ts` guards the SEAM
+ * and not just the projection behind it: a future local table reintroduced
+ * here would satisfy a registry-only assertion but fail this one.
+ */
+export function symbolSearchFileMatchesLang(
+	file: string,
+	lang: string,
+): boolean {
+	const exts = extensionsForLanguageToken(lang);
+	if (exts.length === 0) return false;
 	return exts.includes(path.extname(file).toLowerCase());
 }
 
@@ -413,7 +387,7 @@ function buildSymbolSearchFileFilter(
 	if (!paths?.length && !lang) return undefined;
 	return (file: string) => {
 		if (paths?.length && !fileMatchesPathGlobs(file, cwd, paths)) return false;
-		if (lang && !fileMatchesLang(file, lang)) return false;
+		if (lang && !symbolSearchFileMatchesLang(file, lang)) return false;
 		return true;
 	};
 }

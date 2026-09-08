@@ -13,6 +13,8 @@
  * `formatters.ts`'s `tryLazyInstallFormatterTool`.
  */
 
+import { withResidentBootstrap } from "../support/bootstrap-access.js";
+import { makeLspServiceDouble } from "../support/lsp-service-double.js";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	resetProjectTrust,
@@ -49,10 +51,7 @@ vi.mock("../../clients/lsp/config.js", () => ({
 	getServerInitOverride: vi.fn().mockReturnValue(undefined),
 }));
 vi.mock("../../clients/lsp/index.js", () => ({
-	getLSPService: vi.fn(() => ({
-		touchFile: vi.fn().mockResolvedValue(undefined),
-		supportsLSP: () => false,
-	})),
+	getLSPService: vi.fn(() => makeLspServiceDouble()),
 }));
 
 const okResult = { stdout: "", stderr: "", status: 0 };
@@ -99,7 +98,7 @@ function makeSessionStartDeps(
 		isAvailable: () => false,
 		ensureAvailable: async () => false,
 	};
-	return {
+	return withResidentBootstrap({
 		ctxCwd,
 		getFlag: () => false,
 		notify: vi.fn(),
@@ -137,7 +136,7 @@ function makeSessionStartDeps(
 		resetDispatchBaselines: () => {},
 		resetLSPService: () => {},
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	} as any;
+	}) as any;
 }
 
 let cwdSeq = 0;

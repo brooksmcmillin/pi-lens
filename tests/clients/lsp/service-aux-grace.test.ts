@@ -1873,7 +1873,7 @@ describe('#1533 — silent auxiliary honesty on clientScope "all"', () => {
 		expect(result?.confirmation).toBeUndefined();
 	});
 
-	it("case 2 — a fast silent aux beside a SLOWER primary does newly narrow, and should", async () => {
+	it("case 2 — a fast silent aux beside a slower primary narrows to partial, not confirmed", async () => {
 		// The counter-case to the test above, and the honest half of the blast radius.
 		// rust-analyzer declares 3000 and typos 1500, so under a 2000ms cap:
 		//   timeoutFor(rust-analyzer) = min(2000, 3000) = 2000

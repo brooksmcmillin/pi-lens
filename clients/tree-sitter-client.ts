@@ -26,6 +26,7 @@ import {
 	recordDegradation,
 	recordDegradationOnce,
 } from "./degradation-ledger.js";
+import { BoundedFifoMap } from "./bounded-cache.js";
 import { loadWebTreeSitter } from "./deps/web-tree-sitter.js";
 import { transientRetryDelayMs } from "./dispatch/runners/utils/availability-policy.js";
 import { getProjectIgnoreMatcher, isExcludedDirName } from "./file-utils.js";
@@ -45,6 +46,7 @@ import {
 	assertInstallAllowed,
 	getProjectTrustGeneration,
 } from "./project-trust.js";
+import { escapeRegExp } from "./string-utils.js";
 import { logTreeSitterDiagnostic } from "./tree-sitter-logger.js";
 import { notifyUserDegradation } from "./user-notify.js";
 
@@ -58,6 +60,14 @@ import {
 	type TreeCacheStats,
 } from "./tree-sitter-cache.js";
 import { TreeSitterNavigator } from "./tree-sitter-navigator.js";
+import {
+	isProvenSqlAlchemySessionReceiver,
+	isSafePsycopgIdentifierComposition,
+	isSqlAlchemyEntityQueryArgument,
+	isSqlAlchemyStatementArgument,
+	PYTHON_SQLALCHEMY_RECEIVER_NAMES,
+	PYTHON_SQLALCHEMY_STATEMENT_BUILDERS,
+} from "./python-provenance.js";
 import {
 	type TreeSitterQuery,
 	TreeSitterQueryLoader,
@@ -79,6 +89,14 @@ const QUERY_BATCH_MAX_LOAD_FAILURES = 3;
 // must not stall the batched query walk; the filter fails open when this cap
 // is reached so unrelated diagnostics and the current match are preserved.
 const NO_NESTED_ANCHOR_VISIT_CAP = 10_000;
+// The execute-style Python DB-API/ORM methods this rule treats as SQL sinks.
+// Hoisted so the post-filter does not rebuild the set per match.
+const PYTHON_SQL_SINK_METHODS: ReadonlySet<string> = new Set([
+	"execute",
+	"executemany",
+	"query",
+	"raw",
+]);
 
 // --- Type Declarations (local, no import needed) ---
 
@@ -119,12 +137,6 @@ export interface StructuralMatch {
 	/** Tree-sitter node type of the first capture (e.g. "call_expression") */
 	nodeType?: string;
 	captures: Record<string, string>;
-}
-
-export interface SearchPattern {
-	pattern: string;
-	language: string;
-	metavars: string[];
 }
 
 export interface TreeSitterParserCounters {
@@ -192,7 +204,7 @@ function grammarFileStamp(filePath: string): string | undefined {
 	}
 }
 
-export function isTreeSitterWasmAbortError(error: unknown): boolean {
+function isTreeSitterWasmAbortError(error: unknown): boolean {
 	const message = error instanceof Error ? error.message : String(error);
 	return message.includes("Aborted") || message.includes("abort()");
 }
@@ -398,13 +410,23 @@ export class TreeSitterClient {
 	private ParserClass: any = null;
 	// biome-ignore lint/suspicious/noExplicitAny: Language loader from module
 	private LanguageLoader: any = null;
-	// biome-ignore lint/suspicious/noExplicitAny: Compiled query cache by language+pattern hash
-	private queryCache = new Map<string, any>();
-	/** Combined multi-rule queries by language + rule-set identity (null = don't retry). */
-	private queryBatchCache = new Map<string, QueryBatch | null>();
+	// Declared BEFORE the two caches below: a static read by an instance field
+	// initializer must already be initialized (TS2729).
 	private static readonly QUERY_CACHE_MAX_ENTRIES = 256;
 	private static readonly QUERY_BATCH_CACHE_MAX_ENTRIES = 256;
-
+	// biome-ignore lint/suspicious/noExplicitAny: Compiled query cache by language+pattern hash
+	// BoundedFifoMap, not BoundedLruCache: recency here is refreshed by this
+	// class's own explicit delete+set on both the read and the write path (see
+	// cacheQuery and the two lookup sites) — exactly the raw-`Map` discipline
+	// the FIFO map documents. A get() that promoted on its own would change
+	// which entry eviction targets (#2442 review F5/F7).
+	private queryCache = new BoundedFifoMap<string, any>(
+		TreeSitterClient.QUERY_CACHE_MAX_ENTRIES,
+	);
+	/** Combined multi-rule queries by language + rule-set identity (null = don't retry). */
+	private queryBatchCache = new BoundedFifoMap<string, QueryBatch | null>(
+		TreeSitterClient.QUERY_BATCH_CACHE_MAX_ENTRIES,
+	);
 	private queryCacheCap(): number {
 		const value = Number.parseInt(
 			process.env.PI_LENS_TREE_SITTER_QUERY_CACHE_CAP ?? "",
@@ -425,30 +447,26 @@ export class TreeSitterClient {
 			: TreeSitterClient.QUERY_BATCH_CACHE_MAX_ENTRIES;
 	}
 
+	// biome-ignore lint/suspicious/noExplicitAny: compiled query objects
 	private cacheQuery(key: string, value: any): void {
-		this.queryCache.delete(key);
-		this.queryCache.set(key, value);
-		while (this.queryCache.size > this.queryCacheCap()) {
-			const oldest = this.queryCache.entries().next().value as
-				| [string, any]
-				| undefined;
-			if (!oldest) break;
-			this.queryCache.delete(oldest[0]);
-			oldest[1]?.query?.delete?.();
-		}
+		this.queryCache.delete(key); // write-refresh: this write is the newest
+		// The cap is env-readable, so re-apply it before every write — a raised
+		// or lowered ceiling has to take effect on the next insert, not on the
+		// next restart. Both calls hand back the dropped [key, value] pairs so
+		// the evicted compiled query's native handle is still freed (#2442
+		// review F5/F7 — this is why set() returns the VALUE, not just the key).
+		const evicted = this.queryCache.setMaxEntries(this.queryCacheCap());
+		evicted.push(...this.queryCache.set(key, value));
+		for (const [, dropped] of evicted) dropped?.query?.delete?.();
 	}
 
 	private cacheQueryBatch(key: string, value: QueryBatch | null): void {
 		this.queryBatchCache.delete(key);
-		this.queryBatchCache.set(key, value);
-		while (this.queryBatchCache.size > this.queryBatchCacheCap()) {
-			const oldest = this.queryBatchCache.entries().next().value as
-				| [string, QueryBatch | null]
-				| undefined;
-			if (!oldest) break;
-			this.queryBatchCache.delete(oldest[0]);
-			oldest[1]?.query?.delete?.();
-		}
+		const evicted = this.queryBatchCache.setMaxEntries(
+			this.queryBatchCacheCap(),
+		);
+		evicted.push(...this.queryBatchCache.set(key, value));
+		for (const [, dropped] of evicted) dropped?.query?.delete?.();
 	}
 	/** Consecutive grammar-load failures per batch key — bounds load retries (#889). */
 	private queryBatchLoadFailures = new Map<string, number>();
@@ -1804,7 +1822,8 @@ export class TreeSitterClient {
 			contentOverride,
 			(tree) => {
 				try {
-					for (const match of batch.query.matches(tree.rootNode)) {
+					const rootNode = tree.rootNode;
+					for (const match of batch.query.matches(rootNode)) {
 						const owner = batch.ownerOfPattern[match.patternIndex];
 						if (owner === undefined) continue;
 						const bucket = perQuery.get(owner) ?? [];
@@ -1823,7 +1842,7 @@ export class TreeSitterClient {
 								entry.postFilter,
 								entry.postFilterParams,
 								captures,
-								tree.rootNode,
+								rootNode,
 							)
 						) {
 							continue;
@@ -2284,14 +2303,16 @@ export class TreeSitterClient {
 		return false;
 	}
 
+	/**
+	 * SQLAlchemy sessions are conventionally bound to one of a handful of
+	 * receiver names. Structural provenance (`python-provenance.ts`) proves the
+	 * annotated case; this name check keeps the far more common unannotated
+	 * `session.execute(stmt)` quiet, as it has been since the exemption was
+	 * added. Removing it regresses every codebase that never annotates.
+	 */
 	private isLikelySqlAlchemyReceiver(text: string): boolean {
 		const tail = text.split(".").pop() ?? text;
-		return new Set([
-			"session",
-			"db_session",
-			"async_session",
-			"sync_session",
-		]).has(tail.toLowerCase());
+		return PYTHON_SQLALCHEMY_RECEIVER_NAMES.has(tail.toLowerCase());
 	}
 
 	/**
@@ -2894,13 +2915,18 @@ export class TreeSitterClient {
 		return object.text;
 	}
 
+	/**
+	 * `session.execute(select(...))` and friends pass a statement OBJECT, not a
+	 * SQL string: parameterized by construction, and far too noisy as blockers.
+	 */
 	private isSafeSqlAlchemyExpressionCall(node: TreeSitterNode): boolean {
 		if (node.type !== "call") return false;
 		const callee = node.children?.[0]?.text ?? "";
 		const expression = node.text;
-		return ["select", "insert", "update", "delete"].some(
-			(name) => callee === name || expression.startsWith(`${name}(`),
-		);
+		for (const name of PYTHON_SQLALCHEMY_STATEMENT_BUILDERS) {
+			if (callee === name || expression.startsWith(`${name}(`)) return true;
+		}
+		return false;
 	}
 
 	/**
@@ -2965,16 +2991,6 @@ export class TreeSitterClient {
 				break; // first __slots__ wins
 			}
 			return slots;
-		}
-
-		/**
-		 * Escape a string for safe interpolation into a `RegExp` source —
-		 * needed anywhere an identifier's raw text is combined with regex
-		 * metacharacters like `\b` word boundaries (see
-		 * "not_closed_or_try_with_resources" below; #1089 P2).
-		 */
-		function escapeRegExp(s: string): string {
-			return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 		}
 
 		switch (postFilter) {
@@ -4090,23 +4106,48 @@ export class TreeSitterClient {
 				);
 			case "py_sql_injection_sink": {
 				const fn = captures.FN?.text ?? "";
-				if (!new Set(["execute", "executemany", "query", "raw"]).has(fn)) {
-					return false;
-				}
+				if (!PYTHON_SQL_SINK_METHODS.has(fn)) return false;
 
 				const sqlNode = captures.SQL;
-				const receiver = captures.OBJ?.text ?? "";
+				const receiver = captures.OBJ;
 
-				// SQLAlchemy ORM sessions execute expression objects, not raw SQL
-				// strings. `session.execute(stmt)` and `session.execute(select(...))`
-				// are parameterized by construction and were too noisy as blockers.
-				if (fn === "execute" && this.isLikelySqlAlchemyReceiver(receiver)) {
+				// Pre-existing exemptions — kept verbatim so no current user
+				// regresses (#2577 review): an unannotated session receiver, and a
+				// statement-builder call in argument position.
+				if (
+					fn === "execute" &&
+					this.isLikelySqlAlchemyReceiver(receiver?.text ?? "")
+				) {
 					return false;
 				}
 				if (sqlNode && this.isSafeSqlAlchemyExpressionCall(sqlNode)) {
 					return false;
 				}
 
+				// #2576: a receiver PROVEN to be a sqlalchemy Session/AsyncSession.
+				// `Session.query` takes entity classes and `Session.execute` a
+				// statement object (a builder call, or a name bound to one —
+				// `stmt = select(User)`, which the check above cannot see). Neither
+				// suppression may swallow composed SQL text (#2577 review F1/F2).
+				if (isProvenSqlAlchemySessionReceiver(receiver, rootNode)) {
+					if (
+						fn === "query" &&
+						isSqlAlchemyEntityQueryArgument(sqlNode, rootNode)
+					) {
+						return false;
+					}
+					if (
+						fn === "execute" &&
+						isSqlAlchemyStatementArgument(sqlNode, rootNode)
+					) {
+						return false;
+					}
+				}
+
+				// #2576: psycopg `sql.SQL("...").format(sql.Identifier(...))`.
+				if (isSafePsycopgIdentifierComposition(sqlNode, rootNode)) {
+					return false;
+				}
 				return true;
 			}
 			case "go_sql_injection_sink":
@@ -4440,7 +4481,8 @@ export class TreeSitterClient {
 			contentOverride,
 			(tree) => {
 				try {
-					const queryMatches = query.matches(tree.rootNode);
+					const rootNode = tree.rootNode;
+					const queryMatches = query.matches(rootNode);
 
 					for (const match of queryMatches) {
 						const captures: Record<string, TreeSitterNode> = {};
@@ -4464,7 +4506,7 @@ export class TreeSitterClient {
 								postFilter,
 								postFilterParams,
 								captures,
-								tree.rootNode,
+								rootNode,
 							)
 						) {
 							continue;
@@ -4564,63 +4606,3 @@ export class TreeSitterClient {
 }
 
 // --- Simplified Pattern Search (regex fallback) ---
-
-/**
- * Fallback structural search using regex when tree-sitter unavailable
- * Less accurate but works without WASM dependencies
- */
-export function regexStructuralSearch(
-	pattern: string,
-	files: string[],
-	options: { maxResults?: number } = {},
-): StructuralMatch[] {
-	const matches: StructuralMatch[] = [];
-	const maxResults = options.maxResults ?? 50;
-
-	// Extract pattern structure for regex
-	// "console.log($MSG)" -> /console\.log\(([^)]+)\)/
-	const regexPattern = pattern
-		.replace(/\\/g, "\\\\")
-		.replace(/\./g, "\\.")
-		.replace(/\$\$\$[A-Z_][A-Z0-9_]*/g, "(.*?)") // variadic - non-greedy
-		.replace(/\$[A-Z_][A-Z0-9_]*/g, "([^,)]+)"); // single - capture group
-
-	try {
-		const regex = new RegExp(regexPattern, "g");
-
-		for (const file of files) {
-			if (matches.length >= maxResults) break;
-
-			try {
-				const content = fs.readFileSync(file, "utf-8");
-				const lines = content.split("\n");
-
-				for (let i = 0; i < lines.length; i++) {
-					regex.lastIndex = 0;
-					const match = regex.exec(lines[i]);
-					if (match) {
-						const captures: Record<string, string> = {};
-						// Extract captures
-						for (let j = 1; j < match.length; j++) {
-							captures[`$${j}`] = match[j];
-						}
-
-						matches.push({
-							file,
-							line: i + 1,
-							column: match.index + 1,
-							matchedText: match[0],
-							captures,
-						});
-
-						if (matches.length >= maxResults) break;
-					}
-				}
-			} catch {}
-		}
-	} catch {
-		// Invalid regex
-	}
-
-	return matches;
-}

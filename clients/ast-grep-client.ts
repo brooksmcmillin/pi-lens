@@ -12,13 +12,20 @@ import { createSubsystemLogger } from "./extension-log.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { AstGrepRuleManager } from "./ast-grep-rule-manager.js";
+import {
+	AstGrepRuleManager,
+	checkAstGrepRulesHealth,
+} from "./ast-grep-rule-manager.js";
 import type {
 	AstGrepDiagnostic,
 	AstGrepMatch,
 	RuleDescription,
 	SgMatch,
 } from "./ast-grep-types.js";
+import { reportBundledResourceDirHealth } from "./bundled-resource-health.js";
+import { getDegradationLedgerGeneration } from "./degradation-ledger.js";
+import { logLatency } from "./latency-logger.js";
+import { getMutationBridge } from "./mutation-bridge.js";
 import { resolvePackagePath } from "./package-root.js";
 import { truncatedByOutputCap } from "./spawn-output-cap.js";
 import {
@@ -26,6 +33,75 @@ import {
 	type SgExecutionOptions,
 	type SgScanResult,
 } from "./sg-runner.js";
+
+/**
+ * #2636: `AstGrepClient`'s constructor falls back to the bundled `rules/`
+ * (`resolvePackagePath(import.meta.url, "rules")`) with no existence check
+ * when the project has none of its own — same managed-cache-relocation gap
+ * #2626 fixed for `skills/`. Purely observational: logs a `phase` record
+ * naming the resolved path + rule-description count on EVERY call that uses
+ * the bundled fallback (healthy or not, so an empty ledger is distinguishable
+ * from this never having run at all — #2626 review F5), and records a
+ * bounded `ast-grep-rules-dir-missing` degradation only when the bundled dir
+ * itself turns out absent, unreadable, or holds no `.yml` rule description.
+ * Called only when using the bundled fallback — never when the project
+ * provides its own `rules/` (a broken PROJECT override is a user config
+ * concern, not this bug's shape) — from `ensureRulesHealthReported` below,
+ * both at construction and again on the ledger's next generation (#2636
+ * review F3).
+ */
+function reportAstGrepRulesHealth(bundledRuleDir: string): void {
+	const health = checkAstGrepRulesHealth(bundledRuleDir);
+	logLatency({
+		type: "phase",
+		phase: "ast_grep_rules_resolved",
+		filePath: bundledRuleDir,
+		durationMs: 0,
+		metadata: {
+			status: health.status,
+			entryCount: health.status === "healthy" ? health.entryCount : 0,
+		},
+	});
+	reportBundledResourceDirHealth(
+		"ast-grep-rules-dir-missing",
+		bundledRuleDir,
+		health,
+		"ast-grep rule descriptions",
+	);
+}
+
+/**
+ * Record an applied `ast_grep_replace` rewrite through the mutation bridge
+ * (#2423, acceptance criterion 3).
+ *
+ * ast-grep reports 0-based line numbers; the guard and the change log are
+ * 1-based, so every range is shifted by one. One record per FILE carries every
+ * range that file's matches covered, because the bridge's contract is
+ * per-file — the same shape a multi-hunk edit produces.
+ *
+ * Exported for tests: they drive it against a registered bridge instead of
+ * spawning ast-grep.
+ */
+function recordAstGrepApply(matches: AstGrepMatch[]): void {
+	const bridge = getMutationBridge();
+	if (!bridge || matches.length === 0) return;
+	const rangesByFile = new Map<string, Array<[number, number]>>();
+	for (const match of matches) {
+		const start = (match.range?.start?.line ?? 0) + 1;
+		const end = Math.max(start, (match.range?.end?.line ?? 0) + 1);
+		const existing = rangesByFile.get(match.file);
+		if (existing) existing.push([start, end]);
+		else rangesByFile.set(match.file, [[start, end]]);
+	}
+	for (const [filePath, editRanges] of rangesByFile) {
+		bridge.recordMutation({
+			filePath,
+			kind: "edit",
+			editRanges,
+			consumer: "ast_grep_replace",
+		});
+	}
+}
 
 // --- Client ---
 
@@ -167,23 +243,67 @@ export class AstGrepClient {
 	private log: (msg: string) => void;
 	private ruleManager: AstGrepRuleManager;
 	private runner: SgRunner;
+	// #2636 review F3/F7:
+	private readonly usingBundledRuleDirFallback: boolean;
+	private rulesHealthReportedGeneration: number | undefined;
 
 	constructor(ruleDir?: string, verbose = false) {
 		const projectRuleDir = path.join(process.cwd(), "rules");
+		// F7: ONE existsSync call, reused for both the fallback decision and the
+		// ruleDir choice — two separate calls let the directory appear (or a
+		// concurrent watcher/installer create it) between them, making
+		// `usingBundledRuleDirFallback` true while `this.ruleDir` ends up being
+		// the now-existing PROJECT dir: the health check would then classify a
+		// project override's own directory against `reportAstGrepRulesHealth`'s
+		// bundled-fallback doc contract.
+		const hasProjectRuleDir = fs.existsSync(projectRuleDir);
+		this.usingBundledRuleDirFallback = !ruleDir && !hasProjectRuleDir;
 		this.ruleDir =
 			ruleDir ||
-			(fs.existsSync(projectRuleDir)
+			(hasProjectRuleDir
 				? projectRuleDir
 				: resolvePackagePath(import.meta.url, "rules"));
 		this.log = verbose ? createSubsystemLogger("ast-grep") : () => {};
+		this.ensureRulesHealthReported();
 		this.ruleManager = new AstGrepRuleManager(this.ruleDir, this.log);
 		this.runner = new SgRunner(verbose);
+	}
+
+	/**
+	 * #2636 review F3: `AstGrepClient` is a per-PROCESS singleton
+	 * (`index.ts`/`mcp/server.ts`/`clients/mcp/session.ts` each construct it
+	 * exactly once), but `resetDegradationLedger()` wipes the ledger's
+	 * once-per-subject latch on EVERY `session_start`
+	 * (`runtime-session.ts`'s `handleSessionStart`). A report that only ever
+	 * fires at construction is therefore invisible after the first session
+	 * boundary — `pilens_health` shows nothing for a bug that is still there
+	 * (shape 17's inverse: `resolveSkillPaths`/`ruleFilesForLanguage` avoid
+	 * this because pi calls them fresh per request, but `AstGrepClient` has
+	 * no such per-request re-entry).
+	 *
+	 * Re-checked against the ledger's own generation counter at the START of
+	 * every real scan entry point (`ensureAvailable`, called by every
+	 * `tools/ast-grep-*`/`ast-dump` handler before doing any work) — the same
+	 * pattern `clients/tree-sitter-client.ts`'s `refreshGrammarSessionLatches`
+	 * uses for its own per-instance session latches, adapted here: the
+	 * degradation ledger already re-arms its OWN once-per-subject dedup on
+	 * reset, so this method only has to decide WHETHER to call
+	 * `reportAstGrepRulesHealth` again, never re-implement the dedup itself.
+	 */
+	private ensureRulesHealthReported(): void {
+		const generation = getDegradationLedgerGeneration();
+		if (this.rulesHealthReportedGeneration === generation) return;
+		this.rulesHealthReportedGeneration = generation;
+		if (this.usingBundledRuleDirFallback) {
+			reportAstGrepRulesHealth(this.ruleDir);
+		}
 	}
 
 	/**
 	 * Check if ast-grep CLI is available, auto-install if not
 	 */
 	ensureAvailable(): Promise<boolean> {
+		this.ensureRulesHealthReported();
 		return this.runner.ensureAvailable();
 	}
 
@@ -653,6 +773,13 @@ export class AstGrepClient {
 				error: applyResult.error,
 			};
 		}
+		// #2423: `--update-all` just rewrote these files, and no `tool_result`
+		// describes it — pi-lens's own tool was as invisible to the mutation
+		// bookkeeping as any third-party one. Record each rewritten file through
+		// the same seam an extension would use. Fire-and-forget: the bridge never
+		// throws, and a missing bridge (pi-lens not activated, guard disabled) is
+		// a silent no-op.
+		recordAstGrepApply(preCheck.matches);
 		return {
 			matches: preCheck.matches,
 			totalMatches: preCheck.totalMatches,
@@ -729,7 +856,7 @@ message: found
 		}
 
 		return Array.from(grouped.entries())
-			.filter(([_, functions]) => functions.length > 1)
+			.filter(([, functions]) => functions.length > 1)
 			.map(([pattern, functions]) => ({ pattern, functions }));
 	}
 

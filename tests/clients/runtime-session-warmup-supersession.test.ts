@@ -12,6 +12,7 @@
  * threw; supersession was a graceful `return`, and this restores that.
  */
 
+import { withResidentBootstrap } from "../support/bootstrap-access.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -34,10 +35,12 @@ vi.mock("../../clients/lsp/config.js", () => ({
 }));
 
 vi.mock("../../clients/lsp/index.js", () => ({
-	getLSPService: vi.fn(() => ({
-		touchFile: touchFileSpy,
-		supportsLSP: (file: string) => file.endsWith(".ts"),
-	})),
+	getLSPService: vi.fn(() =>
+		makeLspServiceDouble({
+			touchFile: touchFileSpy,
+			supportsLSP: (file: string) => file.endsWith(".ts"),
+		}),
+	),
 }));
 
 vi.mock("../../clients/latency-logger.js", async (importOriginal) => {
@@ -61,9 +64,10 @@ vi.mock("../../clients/word-index.js", async (importOriginal) => {
 });
 
 import { handleSessionStart } from "../../clients/runtime-session.js";
+import { makeLspServiceDouble } from "../support/lsp-service-double.js";
 
 function makeDeps(ctxCwd: string, runtime: RuntimeCoordinator) {
-	return {
+	return withResidentBootstrap({
 		ctxCwd,
 		getFlag: () => false,
 		notify: vi.fn(),
@@ -109,7 +113,7 @@ function makeDeps(ctxCwd: string, runtime: RuntimeCoordinator) {
 		resetDispatchBaselines: () => {},
 		resetLSPService: () => {},
 		// biome-ignore lint/suspicious/noExplicitAny: test double for the deps bag
-	} as any;
+	}) as any;
 }
 
 describe("quick-mode warmup survives a superseded word-index build (#1197)", () => {

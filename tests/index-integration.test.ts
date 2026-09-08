@@ -6,6 +6,7 @@ import { CacheManager } from "../clients/cache-manager.js";
 import { getEffectiveLspIdleResetMs } from "../clients/runtime-turn.js";
 import { createPiMock, makeCtx, makeStaleCtx } from "./support/pi-mock.js";
 import { removeTempDirSync } from "./clients/test-utils.js";
+import { makeLspServiceDouble } from "./support/lsp-service-double.js";
 // #2146: process-scope state (the primary-session registration, the instance
 // registry's mutation tail) now lives on `globalThis`, so `vi.resetModules()`
 // no longer clears it — that is the fix, not a regression. This suite gives
@@ -167,8 +168,10 @@ describe("index.ts integration", () => {
 				},
 			);
 
-			vi.doMock("../clients/bootstrap.js", () => ({
-				loadBootstrapClients: async () => ({
+			vi.doMock("../clients/bootstrap.js", async () => {
+				const { bootstrapSeamMock } =
+					await import("./support/bootstrap-mock.js");
+				return bootstrapSeamMock(async () => ({
 					metricsClient: { reset: () => {} },
 					todoScanner: {},
 					biomeClient: { isAvailable: () => false },
@@ -194,8 +197,8 @@ describe("index.ts integration", () => {
 						isSupportedFile: () => false,
 						analyzeFile: () => null,
 					},
-				}),
-			}));
+				}));
+			});
 			vi.doMock("../clients/runtime-session.js", () => ({
 				handleSessionStart: handleSessionStartMock,
 			}));
@@ -223,11 +226,7 @@ describe("index.ts integration", () => {
 		async () => {
 			const resetLSPService = vi.fn();
 			vi.doMock("../clients/lsp/index.js", () => ({
-				getLSPService: () => ({
-					touchFile: vi.fn(),
-					getAliveClientCount: () => 0,
-					getAliveServerIds: () => [],
-				}),
+				getLSPService: () => makeLspServiceDouble(),
 				resetLSPService,
 			}));
 
@@ -261,11 +260,7 @@ describe("index.ts integration", () => {
 				order.push("reset_lsp_service");
 			});
 			vi.doMock("../clients/lsp/index.js", () => ({
-				getLSPService: () => ({
-					touchFile: vi.fn(),
-					getAliveClientCount: () => 0,
-					getAliveServerIds: () => [],
-				}),
+				getLSPService: () => makeLspServiceDouble(),
 				resetLSPService,
 			}));
 			vi.doMock("../clients/debug-handles.js", () => ({
@@ -291,11 +286,7 @@ describe("index.ts integration", () => {
 		"session_shutdown emits the bus-event session-end rollup (S2d gap 5, #1432 review)",
 		async () => {
 			vi.doMock("../clients/lsp/index.js", () => ({
-				getLSPService: () => ({
-					touchFile: vi.fn(),
-					getAliveClientCount: () => 0,
-					getAliveServerIds: () => [],
-				}),
+				getLSPService: () => makeLspServiceDouble(),
 				resetLSPService: vi.fn(),
 			}));
 			const emitBusEventRollupAtSessionEnd = vi.fn();
@@ -715,11 +706,7 @@ describe("index.ts integration", () => {
 			// fire after runQuietWindow is invoked, not before.
 			const order: string[] = [];
 			vi.doMock("../clients/lsp/index.js", () => ({
-				getLSPService: () => ({
-					touchFile: vi.fn(),
-					getAliveClientCount: () => 0,
-					getAliveServerIds: () => [],
-				}),
+				getLSPService: () => makeLspServiceDouble(),
 				resetLSPService: vi.fn(),
 			}));
 			vi.doMock("../clients/quiet-window.js", () => ({
@@ -754,11 +741,7 @@ describe("index.ts integration", () => {
 	describe("#1654 deferred-mutation drain runs at agent_settled, not agent_end", () => {
 		function mockDrainDeps(handleAgentEndMock: ReturnType<typeof vi.fn>) {
 			vi.doMock("../clients/lsp/index.js", () => ({
-				getLSPService: () => ({
-					touchFile: vi.fn(),
-					getAliveClientCount: () => 0,
-					getAliveServerIds: () => [],
-				}),
+				getLSPService: () => makeLspServiceDouble(),
 				resetLSPService: vi.fn(),
 			}));
 			vi.doMock("../clients/quiet-window.js", () => ({
@@ -950,15 +933,17 @@ describe("index.ts integration", () => {
 				aliveIds = [];
 			});
 			vi.doMock("../clients/lsp/index.js", () => ({
-				getLSPService: () => ({
-					touchFile: vi.fn(),
-					getAliveClientCount: () => aliveIds.length,
-					getAliveServerIds: () => aliveIds,
-				}),
+				getLSPService: () =>
+					makeLspServiceDouble({
+						getAliveClientCount: () => aliveIds.length,
+						getAliveServerIds: () => aliveIds,
+					}),
 				resetLSPService,
 			}));
-			vi.doMock("../clients/bootstrap.js", () => ({
-				loadBootstrapClients: async () => ({
+			vi.doMock("../clients/bootstrap.js", async () => {
+				const { bootstrapSeamMock } =
+					await import("./support/bootstrap-mock.js");
+				return bootstrapSeamMock(async () => ({
 					knipClient: {
 						isAvailable: () => false,
 						analyze: async () => ({
@@ -969,8 +954,8 @@ describe("index.ts integration", () => {
 					},
 					depChecker: { isAvailable: () => false },
 					testRunnerClient: { detectRunner: () => null },
-				}),
-			}));
+				}));
+			});
 
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, handlers } = createMockPi({ "no-lsp": false });
@@ -1273,8 +1258,10 @@ describe("index.ts integration", () => {
 					telemetrySessionId = "test-session";
 				},
 			}));
-			vi.doMock("../clients/bootstrap.js", () => ({
-				loadBootstrapClients: async () => ({
+			vi.doMock("../clients/bootstrap.js", async () => {
+				const { bootstrapSeamMock } =
+					await import("./support/bootstrap-mock.js");
+				return bootstrapSeamMock(async () => ({
 					metricsClient: { reset: () => {} },
 					todoScanner: {},
 					biomeClient: { isAvailable: () => false },
@@ -1300,8 +1287,8 @@ describe("index.ts integration", () => {
 						isSupportedFile: () => false,
 						analyzeFile: () => null,
 					},
-				}),
-			}));
+				}));
+			});
 
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, handlers } = createMockPi({ "no-lsp": true });
@@ -1374,8 +1361,10 @@ describe("index.ts integration", () => {
 					telemetrySessionId = "test-session";
 				},
 			}));
-			vi.doMock("../clients/bootstrap.js", () => ({
-				loadBootstrapClients: async () => ({
+			vi.doMock("../clients/bootstrap.js", async () => {
+				const { bootstrapSeamMock } =
+					await import("./support/bootstrap-mock.js");
+				return bootstrapSeamMock(async () => ({
 					metricsClient: { reset: () => {} },
 					todoScanner: {},
 					biomeClient: { isAvailable: () => false },
@@ -1401,8 +1390,8 @@ describe("index.ts integration", () => {
 						isSupportedFile: () => false,
 						analyzeFile: () => null,
 					},
-				}),
-			}));
+				}));
+			});
 
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, handlers } = createMockPi({ "no-lsp": true });
@@ -1480,8 +1469,10 @@ describe("index.ts integration", () => {
 					telemetrySessionId = "test-session";
 				},
 			}));
-			vi.doMock("../clients/bootstrap.js", () => ({
-				loadBootstrapClients: async () => ({
+			vi.doMock("../clients/bootstrap.js", async () => {
+				const { bootstrapSeamMock } =
+					await import("./support/bootstrap-mock.js");
+				return bootstrapSeamMock(async () => ({
 					metricsClient: { reset: () => {} },
 					todoScanner: {},
 					biomeClient: { isAvailable: () => false },
@@ -1507,8 +1498,8 @@ describe("index.ts integration", () => {
 						isSupportedFile: () => false,
 						analyzeFile: () => null,
 					},
-				}),
-			}));
+				}));
+			});
 
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, handlers } = createMockPi({ "no-lsp": true });
@@ -1599,8 +1590,10 @@ describe("index.ts integration", () => {
 					telemetrySessionId = "test-session";
 				},
 			}));
-			vi.doMock("../clients/bootstrap.js", () => ({
-				loadBootstrapClients: async () => ({
+			vi.doMock("../clients/bootstrap.js", async () => {
+				const { bootstrapSeamMock } =
+					await import("./support/bootstrap-mock.js");
+				return bootstrapSeamMock(async () => ({
 					metricsClient: { reset: () => {} },
 					todoScanner: {},
 					biomeClient: { isAvailable: () => false },
@@ -1626,10 +1619,10 @@ describe("index.ts integration", () => {
 						isSupportedFile: () => false,
 						analyzeFile: () => null,
 					},
-				}),
-			}));
+				}));
+			});
 			vi.doMock("../clients/lsp/index.js", async () => ({
-				getLSPService: () => ({ touchFile: touchFileMock }),
+				getLSPService: () => makeLspServiceDouble({ touchFile: touchFileMock }),
 				resetLSPService: () => {},
 			}));
 
@@ -1701,8 +1694,10 @@ describe("index.ts integration", () => {
 					telemetrySessionId = "test-session";
 				},
 			}));
-			vi.doMock("../clients/bootstrap.js", () => ({
-				loadBootstrapClients: async () => ({
+			vi.doMock("../clients/bootstrap.js", async () => {
+				const { bootstrapSeamMock } =
+					await import("./support/bootstrap-mock.js");
+				return bootstrapSeamMock(async () => ({
 					metricsClient: { reset: () => {} },
 					todoScanner: {},
 					biomeClient: { isAvailable: () => false },
@@ -1728,10 +1723,10 @@ describe("index.ts integration", () => {
 						isSupportedFile: () => false,
 						analyzeFile: () => null,
 					},
-				}),
-			}));
+				}));
+			});
 			vi.doMock("../clients/lsp/index.js", async () => ({
-				getLSPService: () => ({ touchFile: touchFileMock }),
+				getLSPService: () => makeLspServiceDouble({ touchFile: touchFileMock }),
 				resetLSPService: () => {},
 			}));
 
@@ -1798,8 +1793,10 @@ describe("index.ts integration", () => {
 					telemetrySessionId = "test-session";
 				},
 			}));
-			vi.doMock("../clients/bootstrap.js", () => ({
-				loadBootstrapClients: async () => ({
+			vi.doMock("../clients/bootstrap.js", async () => {
+				const { bootstrapSeamMock } =
+					await import("./support/bootstrap-mock.js");
+				return bootstrapSeamMock(async () => ({
 					metricsClient: { reset: () => {} },
 					todoScanner: {},
 					biomeClient: { isAvailable: () => false },
@@ -1825,10 +1822,10 @@ describe("index.ts integration", () => {
 						isSupportedFile: () => false,
 						analyzeFile: () => null,
 					},
-				}),
-			}));
+				}));
+			});
 			vi.doMock("../clients/lsp/index.js", async () => ({
-				getLSPService: () => ({ touchFile: touchFileMock }),
+				getLSPService: () => makeLspServiceDouble({ touchFile: touchFileMock }),
 				resetLSPService: () => {},
 			}));
 
@@ -1882,15 +1879,14 @@ describe("index.ts integration", () => {
 				},
 			}));
 			vi.doMock("../clients/lsp/index.js", () => ({
-				getLSPService: () => ({
-					getAliveClientCount: () => 1,
-					getAliveServerIds: () => ["typescript"],
-					getStatus: () => [
-						{ serverId: "typescript", root: tmpDir, connected: true },
-					],
-					touchFile: vi.fn(),
-					resetLSPService: () => {},
-				}),
+				getLSPService: () =>
+					makeLspServiceDouble({
+						getAliveClientCount: () => 1,
+						getAliveServerIds: () => ["typescript"],
+						getStatus: () => [
+							{ serverId: "typescript", root: tmpDir, connected: true },
+						],
+					}),
 				resetLSPService: () => {},
 			}));
 			vi.doMock("../clients/dispatch/integration.js", async () => ({
@@ -1940,8 +1936,10 @@ describe("index.ts integration", () => {
 					}),
 				}),
 			}));
-			vi.doMock("../clients/bootstrap.js", () => ({
-				loadBootstrapClients: async () => ({
+			vi.doMock("../clients/bootstrap.js", async () => {
+				const { bootstrapSeamMock } =
+					await import("./support/bootstrap-mock.js");
+				return bootstrapSeamMock(async () => ({
 					metricsClient: { reset: () => {} },
 					todoScanner: {},
 					biomeClient: { isAvailable: () => false },
@@ -1967,8 +1965,8 @@ describe("index.ts integration", () => {
 						isSupportedFile: () => false,
 						analyzeFile: () => null,
 					},
-				}),
-			}));
+				}));
+			});
 
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, commands } = createMockPi();
@@ -2066,8 +2064,9 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 	});
 
 	function mockSuiteDeps() {
-		vi.doMock("../clients/bootstrap.js", () => ({
-			loadBootstrapClients: async () => ({
+		vi.doMock("../clients/bootstrap.js", async () => {
+			const { bootstrapSeamMock } = await import("./support/bootstrap-mock.js");
+			return bootstrapSeamMock(async () => ({
 				metricsClient: { reset: () => {} },
 				todoScanner: {},
 				biomeClient: { isAvailable: () => false },
@@ -2086,8 +2085,8 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 					isSupportedFile: () => false,
 					analyzeFile: () => null,
 				},
-			}),
-		}));
+			}));
+		});
 		// handleTurnEnd is a heavyweight, separately-tested pass
 		// (knip/madge/tests/actionable warnings — clients/runtime-turn.ts,
 		// exercised by its own suite). Stub it to a no-op so this suite
@@ -2249,19 +2248,25 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 	);
 
 	it(
-		"delivers staged test failures once through a non-context custom entry",
+		"delivers stale staged test failures once through the next model context",
 		async () => {
 			mockSuiteDeps();
 			const cache = new CacheManager(false);
 			cache.writeCache(
 				"test-runner-findings",
-				{ content: "FAIL test/app.test.ts:1", testRunGeneration: 1 },
+				{
+					content:
+						"[from a prior turn — the edit that triggered this run had already been superseded by the time results came back]\n\nFAIL test/app.test.ts:1",
+					testRunGeneration: 1,
+				},
 				tmpDir,
 			);
 			const filePath = path.join(tmpDir, "src", "app.ts");
 			fs.mkdirSync(path.dirname(filePath), { recursive: true });
 			fs.writeFileSync(filePath, "export const x = 1;\n");
-			handleTurnEndHook = (deps) =>
+			let stagedSessionId: string | undefined;
+			handleTurnEndHook = (deps) => {
+				stagedSessionId = deps.runtime.telemetrySessionId;
 				deps.onTestRunnerComplete?.({
 					cwd: tmpDir,
 					sessionId: deps.runtime.telemetrySessionId,
@@ -2269,6 +2274,7 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 					targetCount: 1,
 					hasFindings: true,
 				});
+			};
 
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, mock, handlers, sentMessages } = createMockPi();
@@ -2276,14 +2282,91 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 			await driveEditThenTurnEnd(handlers, filePath);
 
 			await fireAgentSettled(handlers);
+			// The production session-start path clears in-memory delivery state.
+			// Eligibility must survive that reset and reach the next context build.
+			await mock.emit(
+				"session_start",
+				{},
+				makeCtx({ cwd: tmpDir, sessionId: stagedSessionId }),
+			);
 
-			expect(mock.appendedEntries).toHaveLength(1);
-			expect(mock.appendedEntries[0]).toMatchObject({
-				customType: "pilens:test-runner-findings",
-				data: { content: expect.stringContaining("FAIL") },
-			});
 			expect(sentMessages).toHaveLength(0);
-			expect(mock.entryRenderers.has("pilens:test-runner-findings")).toBe(true);
+			const firstContext = await mock.emit(
+				"context",
+				{ messages: [{ role: "user", content: "continue" }] },
+				{ cwd: tmpDir },
+			);
+			const messages = (
+				firstContext as { messages?: Array<{ content: string }> }
+			)?.messages
+				?.map((message) => message.content)
+				.join("\n");
+			expect(messages).toContain(
+				"[pi-lens automated check — not a user request]",
+			);
+			expect(messages).toContain("[from a prior turn");
+			expect(messages).toContain("FAIL test/app.test.ts:1");
+			const secondContext = await mock.emit(
+				"context",
+				{ messages: [{ role: "user", content: "continue again" }] },
+				{ cwd: tmpDir },
+			);
+			expect(secondContext).toBeUndefined();
+		},
+		INTEGRATION_TIMEOUT_MS,
+	);
+
+	it(
+		"refuses a replacement session and retains the eligible marker",
+		async () => {
+			mockSuiteDeps();
+			const cache = new CacheManager(false);
+			cache.writeCache(
+				"test-runner-findings",
+				{ content: "FAIL replacement.test.ts:1", testRunGeneration: 1 },
+				tmpDir,
+			);
+			let stagedSessionId: string | undefined;
+			handleTurnEndHook = (deps) => {
+				stagedSessionId = deps.runtime.telemetrySessionId;
+				deps.onTestRunnerComplete?.({
+					cwd: tmpDir,
+					sessionId: stagedSessionId,
+					generation: 1,
+					targetCount: 1,
+					hasFindings: true,
+				});
+			};
+
+			const { default: registerExtension } = await import("../index.js");
+			const { pi, mock, handlers } = createMockPi();
+			registerExtension(pi as any);
+			const filePath = path.join(tmpDir, "src", "app.ts");
+			fs.mkdirSync(path.dirname(filePath), { recursive: true });
+			fs.writeFileSync(filePath, "export const x = 1;\n");
+			await driveEditThenTurnEnd(handlers, filePath);
+			await fireAgentSettled(handlers);
+			await mock.emit(
+				"session_start",
+				{},
+				makeCtx({
+					cwd: tmpDir,
+					sessionId: "replacement-session",
+				}),
+			);
+
+			const result = await mock.emit(
+				"context",
+				{ messages: [{ role: "user", content: "continue" }] },
+				{ cwd: tmpDir },
+			);
+			expect(result).toBeUndefined();
+			expect(
+				cache.readCache<{ deliveryEligible?: { sessionId: string } }>(
+					"test-runner-findings",
+					tmpDir,
+				)?.data.deliveryEligible,
+			).toMatchObject({ sessionId: stagedSessionId });
 		},
 		INTEGRATION_TIMEOUT_MS,
 	);
@@ -2345,17 +2428,6 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 				{},
 				makeCtx({ cwd: tmpDir, sessionId: "secondary-delivery" }),
 			);
-
-			expect(primary.mock.appendedEntries).toHaveLength(1);
-			expect(secondary.mock.appendedEntries).toHaveLength(1);
-			expect(primary.mock.appendedEntries[0]?.data).toMatchObject({
-				sessionId: "primary-delivery",
-				targetCount: 11,
-			});
-			expect(secondary.mock.appendedEntries[0]?.data).toMatchObject({
-				sessionId: "secondary-delivery",
-				targetCount: 22,
-			});
 		},
 		INTEGRATION_TIMEOUT_MS,
 	);
@@ -2692,11 +2764,7 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 			}));
 			const resetLSPService = vi.fn();
 			vi.doMock("../clients/lsp/index.js", () => ({
-				getLSPService: () => ({
-					touchFile: vi.fn(),
-					getAliveClientCount: () => 0,
-					getAliveServerIds: () => [],
-				}),
+				getLSPService: () => makeLspServiceDouble(),
 				resetLSPService,
 			}));
 
@@ -2772,11 +2840,7 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 			}));
 			const resetLSPService = vi.fn();
 			vi.doMock("../clients/lsp/index.js", () => ({
-				getLSPService: () => ({
-					touchFile: vi.fn(),
-					getAliveClientCount: () => 0,
-					getAliveServerIds: () => [],
-				}),
+				getLSPService: () => makeLspServiceDouble(),
 				resetLSPService,
 			}));
 
@@ -2944,11 +3008,7 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 				incrementDegradationCount: r6Mocks.incrementDegradationCount,
 			}));
 			vi.doMock("../clients/lsp/index.js", () => ({
-				getLSPService: () => ({
-					touchFile: vi.fn(),
-					getAliveClientCount: () => 0,
-					getAliveServerIds: () => [],
-				}),
+				getLSPService: () => makeLspServiceDouble(),
 				resetLSPService: vi.fn(),
 			}));
 

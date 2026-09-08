@@ -152,6 +152,9 @@ Or from git:
 pi install git:github.com/apmantza/pi-lens
 ```
 
+Requires Node.js >=22.19.0 (matches the pi host's own floor — see `engines`
+in `package.json`).
+
 > **npm v12 users:** dependency lifecycle scripts (e.g. `@ast-grep/cli`'s
 > `postinstall`) now require explicit approval — if `npm install` warns about
 > unreviewed install scripts, review and allow them with

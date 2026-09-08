@@ -21,19 +21,22 @@
  */
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
-import { getGlobalPiLensDir } from "./file-utils.js";
+import { getGlobalPiLensLogDir } from "./probe-home-state.js";
 import { getMaxLogSizeMB } from "./log-cleanup.js";
 import { createNdjsonLogger } from "./ndjson-logger.js";
 import { normalizeFilePath } from "./path-utils.js";
 
-const WORD_INDEX_LOG_FILE = path.join(getGlobalPiLensDir(), "word-index.log");
+const WORD_INDEX_LOG_FILE = path.join(
+	getGlobalPiLensLogDir(),
+	"word-index.log",
+);
 
 const writer = createNdjsonLogger({
 	filePath: WORD_INDEX_LOG_FILE,
 	maxBytes: getMaxLogSizeMB() * 1024 * 1024,
 });
 
-export type WordIndexLogPhase =
+type WordIndexLogPhase =
 	/** Full rebuild from a fresh file-walk-and-read (absent/stale/churned index). */
 	| "full_rebuild"
 	/** Only stale/new docs re-tokenized against a reused snapshot (#958). */
@@ -131,13 +134,4 @@ export function logWordIndex(entry: WordIndexLogEntry): void {
 		...entry,
 		cwd: normalizeFilePath(entry.cwd),
 	});
-}
-
-export function getWordIndexLogPath(): string {
-	return WORD_INDEX_LOG_FILE;
-}
-
-/** Resolve once all enqueued word-index writes are on disk (tests/shutdown). */
-export function flushWordIndexLog(): Promise<void> {
-	return writer.flush();
 }

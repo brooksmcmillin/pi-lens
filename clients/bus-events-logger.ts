@@ -22,8 +22,7 @@
  * This module gives bus events the same durable trace every other pi-lens
  * subsystem already has (latency.log, cascade.log, read-guard.log, ...) —
  * see clients/latency-logger.ts for the house pattern this mirrors exactly:
- * one shared `createNdjsonLogger` writer, `isTestMode()` no-op guard,
- * `getBusEventsLogPath()` for testability.
+ * one shared `createNdjsonLogger` writer, `isTestMode()` no-op guard.
  *
  * Logging volume: `emitted` and `emit_failed` are logged on every call —
  * they're the two outcomes an operator actually needs a per-event trace for.
@@ -44,19 +43,22 @@
  */
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
-import { getGlobalPiLensDir } from "./file-utils.js";
+import { getGlobalPiLensLogDir } from "./probe-home-state.js";
 import { createNdjsonLogger } from "./ndjson-logger.js";
 import { getMaxLogSizeMB } from "./log-cleanup.js";
 import { logLatency } from "./latency-logger.js";
 
-const BUS_EVENTS_LOG_FILE = path.join(getGlobalPiLensDir(), "bus-events.log");
+const BUS_EVENTS_LOG_FILE = path.join(
+	getGlobalPiLensLogDir(),
+	"bus-events.log",
+);
 
 const writer = createNdjsonLogger({
 	filePath: BUS_EVENTS_LOG_FILE,
 	maxBytes: getMaxLogSizeMB() * 1024 * 1024,
 });
 
-export type BusEventName =
+type BusEventName =
 	| "pilens:files:touched"
 	| "pilens:diagnostics"
 	| "pilens:diagnostic:disposition"
@@ -67,7 +69,7 @@ export type BusEventName =
 	| "pi-lens/findings"
 	| "pi-lens/turn-findings";
 
-export type BusEventOutcome =
+type BusEventOutcome =
 	| "emitted"
 	| "skipped_unwired"
 	| "skipped_disabled"
@@ -173,13 +175,4 @@ export function emitBusEventRollupAtSessionEnd(cwd: string): void {
 		});
 	}
 	resetBusEventRollupCounts();
-}
-
-export function getBusEventsLogPath(): string {
-	return BUS_EVENTS_LOG_FILE;
-}
-
-/** Resolve once all enqueued bus-event writes are on disk (tests/shutdown). */
-export function flushBusEventsLog(): Promise<void> {
-	return writer.flush();
 }

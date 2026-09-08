@@ -1,11 +1,13 @@
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
-import { loadBootstrapClients } from "./bootstrap.js";
+import { loadBootstrapClients, requestBootstrapClients } from "./bootstrap.js";
+import { getAmbientAbortSignal } from "./safe-spawn.js";
 import type { CacheManager } from "./cache-manager.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
 import { detectFileKind } from "./file-kinds.js";
 import { isPathIgnoredByProject } from "./file-utils.js";
 import { evaluateGitGuard, isGitCommitOrPushAttempt } from "./git-guard.js";
+import { dropHashlineAnchorMemo } from "./hashline-anchor.js";
 import { evaluateSharedCheckoutGuard } from "./shared-checkout-guard.js";
 import { logLatency } from "./latency-logger.js";
 import { normalizeMapKey } from "./path-utils.js";
@@ -18,6 +20,13 @@ import {
 import { normalizeForGuardMatch } from "./host-edit-normalize.js";
 import { retargetReplacementIndentation } from "./indent-retarget.js";
 import { LANGUAGE_POLICY } from "./language-policy.js";
+import { isComplexitySupportedFile } from "./tree-sitter-shared.js";
+import {
+	classifyMutatingTool,
+	readMutationPathField,
+} from "./mutating-tool.js";
+import { isProvisionalLearnedAttribution } from "./mutation-attribution.js";
+import { armObservedMutation } from "./observed-mutation.js";
 import type { LSPShutdownOptions } from "./lsp/client.js";
 import { getLSPService } from "./lsp/index.js";
 import {
@@ -58,10 +67,7 @@ import {
 } from "./read-guard-tool-lines.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
 import { handleToolResult } from "./runtime-tool-result.js";
-import {
-	isToolCallEventType,
-	resolveToolCallCorrelationId,
-} from "./tool-event.js";
+import { resolveToolCallCorrelationId } from "./tool-event.js";
 import { getSharedTreeSitterClient } from "./tree-sitter-shared.js";
 
 const LSP_TOOLCALL_NAV_TOUCH_BUDGET_MS = Math.max(
@@ -117,13 +123,10 @@ function getToolCallRawFilePath(
 ): string | undefined {
 	const inputObj = (event.input ?? {}) as Record<string, unknown>;
 
-	if (
-		isToolCallEventType("write", event as any) ||
-		isToolCallEventType("edit", event as any)
-	) {
-		const filePath = (event.input as { path?: unknown }).path;
-		return typeof filePath === "string" ? filePath : undefined;
-	}
+	// #2423: the seam owns "does this tool target a file it mutates". No ctx is
+	// passed — the path is not resolved yet, so adapters must not log here.
+	const mutation = classifyMutatingTool({ ...event, toolName });
+	if (mutation) return mutation.path;
 
 	if (toolName === "read") {
 		if (typeof inputObj.path === "string") return inputObj.path;
@@ -287,11 +290,12 @@ function isIndentationOnlyChange(before: string, after: string): boolean {
 }
 
 function getNewContentFromToolCall(event: unknown): string | undefined {
-	if (isToolCallEventType("write", event as any)) {
+	const mutation = classifyMutatingTool(event);
+	if (mutation?.kind === "write") {
 		return ((event as { input?: unknown }).input as { content?: string })
 			.content;
 	}
-	if (isToolCallEventType("edit", event as any)) {
+	if (mutation?.kind === "edit") {
 		const edits = (
 			(event as { input?: unknown }).input as {
 				edits?: Array<{ newText?: string }>;
@@ -322,6 +326,12 @@ interface ToolCallEvent {
 
 interface ToolCallCtx {
 	cwd?: string;
+	/**
+	 * This turn's abort signal, when the host supplies one. #2430 races every
+	 * observational snapshot against it so an interrupted turn cancels the walk
+	 * instead of finishing it for nobody.
+	 */
+	signal?: AbortSignal;
 	ui?: {
 		setStatus: (id: string, text: string | undefined) => void;
 		theme: {
@@ -476,6 +486,13 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 		getTreeSitterClient = getSharedTreeSitterClient,
 	} = deps;
 
+	// #2423 review round 4, finding F5: the hashline anchor memo is keyed by
+	// mtime+size, which a same-size rewrite inside one mtime tick cannot
+	// distinguish from stale content. It only ever needs to survive the
+	// several `classifyMutatingTool` asks WITHIN this one tool_call, so drop
+	// it here at the boundary rather than trusting mtime+size across calls.
+	dropHashlineAnchorMemo();
+
 	const readGuardCorrelationId = getReadGuardCorrelationId(event);
 	let filePath: string | undefined;
 	const logToolReadGuardEvent = (
@@ -483,6 +500,10 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 	): void =>
 		logReadGuardEvent({ ...entry, correlationId: readGuardCorrelationId });
 	const toolName = (event as { toolName?: string }).toolName ?? "";
+	// #2423: one classification per tool_call, reused by every branch below that
+	// used to compare `toolName` to the `"write"` / `"edit"` literals. No ctx —
+	// `filePath` is not resolved yet, and adapters stay silent without one.
+	const mutation = classifyMutatingTool(event);
 	const editInputForTelemetry = (event as { input?: unknown }).input as
 		| { edits?: unknown[] }
 		| undefined;
@@ -499,13 +520,13 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 	// changed width in between produced an internally inconsistent summary —
 	// indexes from the call-time array, totals from the mutated one.
 	const requestedEditIndexes =
-		toolName === "write"
+		mutation?.kind === "write"
 			? [0]
 			: Array.isArray(editInputForTelemetry?.edits)
 				? boundedIndexesForCount(editInputForTelemetry.edits.length)
 				: [0];
 	const requestedEditTotal =
-		toolName === "write"
+		mutation?.kind === "write"
 			? 1
 			: Array.isArray(editInputForTelemetry?.edits)
 				? editInputForTelemetry.edits.length
@@ -582,6 +603,49 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 			}
 		}
 	}
+	// #2430: the observational net. A call the seam could NOT classify, whose
+	// input still names a file, gets a bounded pre-snapshot so the tool_result
+	// side can see whether it actually wrote anything. `bash` is excluded
+	// because it already has its own (wider, git-first) baseline above, and a
+	// classified mutation never reaches here at all — that is what keeps the
+	// cost of a plain write/edit at zero.
+	//
+	// `isProvisionalLearnedAttribution` is the ONE exception (#2449 review round
+	// 2, F2): a tool attributed from a single observation IS classified from
+	// here on, but its attribution has not earned persistence yet, and the only
+	// thing that can earn it is a second real disk diff. Without this clause the
+	// tool is classified on call two and never observed again, so
+	// `PERSIST_AFTER_OBSERVATIONS = 2` is unreachable and nothing is ever
+	// written to disk for the next session to learn from.
+	//
+	// The eligibility check inside `armObservedMutation` is a map lookup, so an
+	// ineligible tool (durably attributed, or twice observed clean) pays that
+	// and nothing else. The universe is the TARGET PATH alone, so an armed call
+	// costs one stat plus one hash of the file it named — not a directory walk.
+	if (
+		(mutation === undefined || isProvisionalLearnedAttribution(toolName)) &&
+		toolName !== "bash" &&
+		!getFlag("no-read-guard")
+	) {
+		const observedRawPath = readMutationPathField(event);
+		const observedPath = observedRawPath
+			? resolveToolCallFilePath(observedRawPath, ctx.cwd, runtime.projectRoot)
+					?.path
+			: undefined;
+		if (observedPath) {
+			await armObservedMutation({
+				toolCallId: resolveToolCallCorrelationId(event),
+				toolName,
+				targetPath: observedPath,
+				cwd: ctx.cwd ?? runtime.projectRoot,
+				sessionGeneration: runtime.sessionGeneration,
+				turnIndex: runtime.turnIndex,
+				signal: ctx.signal,
+				dbg,
+			});
+		}
+	}
+
 	if (
 		getFlag("lens-guard") &&
 		isGitCommitOrPushAttempt(toolName, event.input)
@@ -649,7 +713,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 	);
 	const toolCallId = resolveToolCallCorrelationId(event);
 	const attributesMutationTarget =
-		toolCallId !== undefined && (toolName === "write" || toolName === "edit");
+		toolCallId !== undefined && mutation !== undefined;
 	const targetMissing = !nodeFs.existsSync(filePath);
 	// #1642 F1: a brand-new file's WRITE is never a "skip" — `tool_call`
 	// fires PRE-execution, so `existsSync` is false for every path a write
@@ -691,7 +755,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 		// those paths have no quote and no AM/PM, so every stage-2 candidate
 		// collapses onto the base path and nothing is "tried". `unresolved` is
 		// the whole condition; the tried list is detail for the reason string.
-		if (toolName !== "write" && pathResolution?.unresolved) {
+		if (mutation?.kind !== "write" && pathResolution?.unresolved) {
 			const tried =
 				pathResolution.triedVariants.length > 0
 					? `tried ${pathResolution.triedVariants.join(", ")}`
@@ -725,8 +789,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 		lspAutoTouchEligible &&
 		runtime.shouldWarmLspOnRead(filePath);
 	const shouldAutoTouch =
-		(toolName === "write" ||
-			toolName === "edit" ||
+		(mutation !== undefined ||
 			toolName === "lsp_navigation" ||
 			shouldWarmReadLsp) &&
 		!getFlag("no-lsp") &&
@@ -955,15 +1018,46 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 		});
 	}
 
-	const { complexityClient } = await loadBootstrapClients();
 	// Record complexity baseline for historical tracking (booboo/tdi).
 	// Not shown inline - just captured for delta analysis.
+	//
+	// #2467: every client-free guard runs FIRST, so a tool call that cannot
+	// produce a baseline never loads the analyzer graph. This await used to sit
+	// above them and fire on EVERY tool_call — a bash command, a grep, a read
+	// of a vendored file, a second read of an already-baselined file all paid
+	// the seventeen-module load.
+	//
+	// `isComplexitySupportedFile` is the LAST of those guards and the one that
+	// matters most in a real repo: complexity has node mappings for six
+	// grammars, so every .md/.json/.yaml/.css/.java/.sh read is unsupported.
+	// Asking the CLIENT (`isSupportedFile`) would mean loading the graph to
+	// learn the answer is no — and because only a produced baseline memoizes
+	// the file, the same read would pay it again on every repeat. The predicate
+	// is the client's own answer, hoisted into `tree-sitter-shared.ts` where it
+	// needs nothing but the extension registry; `ComplexityClient.isSupportedFile`
+	// delegates to it, so this is not a second copy.
 	if (
+		!getFlag("no-complexity") &&
 		!isExternalOrVendor &&
-		complexityClient.isSupportedFile(filePath) &&
-		!runtime.complexityBaselines.has(filePath)
+		filePath &&
+		!runtime.complexityBaselines.has(filePath) &&
+		isComplexitySupportedFile(filePath)
 	) {
-		const baseline = await complexityClient.analyzeFile(filePath);
+		// Fail open: no clients means no baseline for this call, counted once in
+		// the ledger. A complexity baseline is delta-analysis bookkeeping — it
+		// must never be the reason a user's tool call fails or stalls.
+		const complexityClient = (
+			await requestBootstrapClients({
+				reason: "tool-call-complexity-baseline",
+				// The pre-dispatch hook. It carries no wall budget in #2523's
+				// contract, which is why `LedgerHookKey` names it alongside the
+				// budgeted families rather than leaving this site to spell its
+				// own axis value (#2557 review F7).
+				hook: "tool_call",
+				signal: getAmbientAbortSignal(),
+			})
+		)?.complexityClient;
+		const baseline = await complexityClient?.analyzeFile(filePath);
 		if (baseline) {
 			runtime.complexityBaselines.set(filePath, baseline);
 			const { captureSnapshot } = await import("./metrics-history.js");
@@ -976,13 +1070,23 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 				entropy: baseline.codeEntropy,
 			});
 		}
+	} else if (
+		getFlag("no-complexity") &&
+		filePath &&
+		isComplexitySupportedFile(filePath)
+	) {
+		recordDegradationOnce({
+			kind: "startup-analyzer-disabled",
+			subject: "complexity",
+			reason: "skipped (disabled by config)",
+		});
 	}
 
 	// --- Read-Before-Edit Guard: check edits ---
 	// write = full replacement; no prior read needed (you're starting fresh).
 	// edit = partial modification; guard enforced to prevent blind overwrites.
-	const isEditOnly = isToolCallEventType("edit", event);
-	const isWriteOrEdit = isToolCallEventType("write", event) || isEditOnly;
+	const isEditOnly = mutation?.kind === "edit";
+	const isWriteOrEdit = mutation !== undefined;
 
 	// Track any Write so recordWritten can inject a synthetic read afterward.
 	// The agent authored the content (new or overwritten), so it trivially "knows" the file.
@@ -1386,7 +1490,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 				sessionId: runtime.telemetrySessionId,
 				filePath,
 				metadata: {
-					tool: isToolCallEventType("write", event) ? "write" : "edit",
+					tool: mutation?.kind ?? "edit",
 					touchedLines: touchedLines ?? null,
 					isExistingFile,
 				},

@@ -14,6 +14,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { BoundedFifoMap } from "./bounded-cache.js";
 import { emitBounded } from "./bounded-telemetry.js";
 import { LEDGER_FIELD_MAX } from "./degradation-ledger.js";
 import { minimatch } from "./deps/minimatch.js";
@@ -25,7 +26,11 @@ import {
 	augmentPythonEnvironment,
 	detectPythonEnvironment,
 } from "./python-environment.js";
-import { normalizeEphemeralMapKey, normalizeMapKey } from "./path-utils.js";
+import {
+	normalizeEphemeralMapKey,
+	normalizeMapKey,
+	toPosix,
+} from "./path-utils.js";
 import { isMeasuredDuration, toMeasuredDurationMs } from "./run-duration.js";
 import { safeSpawn, safeSpawnAsync } from "./safe-spawn.js";
 import { stripAnsi } from "./sanitize.js";
@@ -61,6 +66,42 @@ export interface TestResult {
 	 */
 	duration?: number; // ms; absent = not measured
 	error?: string; // if runner itself failed
+}
+
+/**
+ * #2532: the ONE classification seam for "this `TestResult` carries NO
+ * counted failure the agent needs to fix, even though the runner also
+ * reported an `error`" — i.e. `failed === 0 && !!error`. This is NOT "the
+ * suite never started": a runner can report BOTH counted failures and an
+ * error (pytest exit 2 "Interrupted" after `2 failed, 1 passed` already
+ * printed — `parsePytestOutput` sets `error` from the exit code
+ * independently of the parsed counts, review round 1 S2). The rule is
+ * exactly `failed === 0`, nothing about `error`'s presence or cause: a
+ * result with counted failures stays blocking even when `error` is also
+ * set (`testResultToProjectDiagnostics`/`formatResult` still mention the
+ * error in that case, they just don't let it downgrade the verdict).
+ *
+ * `hasRealFailure`/`runnerErrorOnly` (`runtime-turn.ts`, #2522) key off the
+ * exact same fact for the turn-end delivery framing — a batch made
+ * entirely of `isRunnerErrorResult` results is advisory, one containing
+ * even one counted failure keeps "fix before continuing". Three more
+ * surfaces route through this SAME predicate instead of re-deriving it
+ * (review round 1 S1's class sweep), so the identical `TestResult` cannot
+ * classify differently across them: `testResultToProjectDiagnostics`
+ * (`lens_diagnostics mode=full`), the `--lens-guard` merge call in
+ * `handleTurnEnd`, and `TestRunnerClient.formatResult`/the turn-end dbg
+ * summary (both in this file / `runtime-turn.ts`).
+ *
+ * Two call sites intentionally test the COMPLEMENT (a truly clean result,
+ * no counted failure AND no error) rather than this predicate, and are not
+ * a missed fourth spelling: `runtime-turn.ts`'s `cleanFiles` filter
+ * (`--lens-guard`'s clear-blocker list) and `testResultToProjectDiagnostics`'s
+ * own early "nothing to report" return. Both need "genuinely clean", which
+ * `!isRunnerErrorResult(result)` cannot express (it is also true for a
+ * counted failure).
+ */
+export function isRunnerErrorResult(result: TestResult): boolean {
+	return result.failed === 0 && !!result.error;
 }
 
 export interface TestFailure {
@@ -138,6 +179,66 @@ const MAX_NODE_MODULES_WALK_UP = 5;
 // test type rather than mirroring source layout) — capped depth, never an
 // unbounded walk of the whole tests tree.
 const MAX_PYTEST_RECURSE_DEPTH = 3;
+
+/**
+ * #2522: built-in exclusion list for the turn-end auto-fired test selection.
+ *
+ * `getTestRunTarget`'s three strategies (failed-first / related / self) will
+ * happily resolve to ANY test file on disk, including integration/e2e suites
+ * that spawn external processes. A plegma dogfooding turn resolved
+ * `tests/integration/opencode-delegate.test.ts` this way — it spawns
+ * `opencode` and needs a configured provider, so on a box without one it took
+ * 17s to fail and was reported to the agent as "3/3 failed, fix before
+ * proceeding" on an unrelated model-switch turn (#2522, refs #2504/#2509).
+ *
+ * One hard-coded list, no per-project config knob (maintainer decision
+ * 2026-09-03) — this is a safety bound on what turn_end may auto-fire, not a
+ * project preference. Documented in AGENTS.md and docs/. Matched against the
+ * resolved test file's project-relative, POSIX-folded path so it applies
+ * uniformly to whichever strategy produced the target.
+ */
+export const TURN_END_EXCLUDED_TEST_GLOBS: readonly string[] = [
+	"**/integration/**",
+	"**/e2e/**",
+	"**/*.integration.*",
+	"**/*.e2e.*",
+];
+
+/**
+ * Whether a resolved test target falls under the built-in turn-end
+ * exclusion list (#2522). `testFilePath` may be absolute or relative, and
+ * may use either path-separator form — folded through `toPosix` after being
+ * made cwd-relative so `\`- and `/`-separated inputs match identically
+ * (AGENTS.md cross-form-path screen).
+ */
+export function isExcludedTestTarget(
+	testFilePath: string,
+	cwd: string,
+): boolean {
+	const rel = toPosix(path.relative(cwd, path.resolve(cwd, testFilePath)));
+	// #2522 review round 2, F6: a target that resolves OUTSIDE the project root
+	// yields a `..`-leading relative path (or, across Windows drives, a still
+	// absolute one), which matches none of the globs — so the bare `some()`
+	// below reported it as "not excluded" and turn_end would have auto-spawned a
+	// runner against a file outside the project the turn is running in. An
+	// out-of-tree target, and the project root itself, fail CLOSED.
+	if (
+		rel === "" ||
+		rel === ".." ||
+		rel.startsWith("../") ||
+		path.isAbsolute(rel)
+	)
+		return true;
+	// #2522 review round 2, F5: case-INSENSITIVE. `tests/Integration/`,
+	// `tests/E2E/` and `foo.E2E.test.ts` are the same hazard as their lowercase
+	// spellings, and on the case-insensitive filesystems Windows and macOS ship
+	// by default they are literally the same files — so a case-sensitive match
+	// made the SAME repo excluded on one box and unbounded on another. A safety
+	// bound a capital letter defeats is not a bound.
+	return TURN_END_EXCLUDED_TEST_GLOBS.some((glob) =>
+		minimatch(rel, glob, { dot: true, nocase: true }),
+	);
+}
 
 // --- Runner Detection ---
 
@@ -282,6 +383,15 @@ interface TestRunRequest {
 	runner: string;
 	config: RunnerConfig;
 	turnIndex?: number;
+	/**
+	 * #2522 review round 2, F1: the turn-end BATCH's own abort signal, distinct
+	 * from this spawn's 60s timeout. When the batch's 20s wall budget is spent
+	 * the batch aborts it, which tree-kills this child immediately instead of
+	 * leaving it to burn the remaining 40s and then hand back a result nobody
+	 * is waiting for. Absent (`undefined`) falls back to `safeSpawnAsync`'s
+	 * ambient turn signal exactly as before.
+	 */
+	signal?: AbortSignal;
 }
 
 interface FailedTargetStateRecord {
@@ -338,7 +448,7 @@ function canonicalProjectRoot(cwd: string): {
 	}
 }
 
-const MAX_CANONICAL_ROOT_MEMO_ENTRIES = 512;
+export const MAX_CANONICAL_ROOT_MEMO_ENTRIES = 512;
 
 interface RunnerAvailability {
 	available: boolean;
@@ -428,7 +538,9 @@ export class TestRunnerClient {
 	// resolve — a state where `detectRunner` already walks node_modules on every
 	// call. Keep the memo bounded so pathological spelling churn cannot grow it
 	// without limit.
-	private canonicalRootMemo = new Map<string, string>();
+	private canonicalRootMemo = new BoundedFifoMap<string, string>(
+		MAX_CANONICAL_ROOT_MEMO_ENTRIES,
+	);
 	private availableRunners = new PathKeyedMap<Map<string, RunnerAvailability>>(
 		normalizeEphemeralMapKey,
 	);
@@ -470,12 +582,13 @@ export class TestRunnerClient {
 
 		const { key, resolved } = canonicalProjectRoot(cwd);
 		if (!resolved) return key;
-		if (this.canonicalRootMemo.size >= MAX_CANONICAL_ROOT_MEMO_ENTRIES) {
-			const oldest = this.canonicalRootMemo.keys().next().value;
-			if (oldest !== undefined) this.canonicalRootMemo.delete(oldest);
-		}
 		this.canonicalRootMemo.set(cwd, key);
 		return key;
+	}
+
+	/** #2442 test-only: exercise canonicalRootMemo's bounded eviction directly. */
+	_getCanonicalProjectRootForTests(cwd: string): string {
+		return this.getCanonicalProjectRoot(cwd);
 	}
 
 	private getRunnerAvailability(
@@ -1219,7 +1332,7 @@ export class TestRunnerClient {
 		} else {
 			request = runnerOrRequest;
 		}
-		const { runner, config, turnIndex } = request;
+		const { runner, config, turnIndex, signal } = request;
 		if (!fs.existsSync(absoluteTestFile)) {
 			return this.emptyResult(
 				absoluteTestFile,
@@ -1242,6 +1355,9 @@ export class TestRunnerClient {
 				cwd,
 				timeout: 60000,
 				env,
+				// #2522 R2 F1. `safeSpawnAsync` resolves `options.signal ?? ambient`,
+				// so an absent batch signal keeps the pre-#2522 ambient behaviour.
+				signal,
 			});
 
 			const stdout = result.stdout || "";
@@ -1789,7 +1905,12 @@ export class TestRunnerClient {
 			skipped,
 			failures,
 			duration,
-			error: exitCode === 2 ? "Pytest configuration error" : undefined,
+			error:
+				exitCode === 4
+					? "Pytest configuration error"
+					: exitCode === 2
+						? "Pytest interrupted"
+						: undefined,
 		};
 	}
 
@@ -2515,9 +2636,15 @@ export class TestRunnerClient {
 	 * Format test result for LLM consumption
 	 */
 	formatResult(result: TestResult): string {
-		if (result.error && result.passed === 0 && result.failed === 0) {
-			// Runner error, not test failure
-			return `[Tests] ⚠ Could not run tests: ${result.error}`;
+		// #2532 review S1: folded onto `isRunnerErrorResult` instead of the old
+		// local `error && passed === 0 && failed === 0` spelling — that missed a
+		// runner error reported alongside partial passes (pytest `Interrupted`
+		// after some tests already ran clean), which fell through to the normal
+		// "N/N passed" branch below and silently dropped the interruption.
+		if (isRunnerErrorResult(result)) {
+			return result.passed > 0
+				? `[Tests] ⚠ Could not complete tests: ${result.error} (${result.passed} passed before)`
+				: `[Tests] ⚠ Could not run tests: ${result.error}`;
 		}
 
 		const total = result.passed + result.failed + result.skipped;

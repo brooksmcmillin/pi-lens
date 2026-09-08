@@ -22,12 +22,12 @@ import {
 	restoreLineEndings,
 } from "../host-edit-normalize.js";
 
-export interface LSPPosition {
+interface LSPPosition {
 	line: number;
 	character: number;
 }
 
-export interface LSPRange {
+interface LSPRange {
 	start: LSPPosition;
 	end: LSPPosition;
 }
@@ -68,7 +68,7 @@ interface DeleteFileOp {
 	options?: ResourceOptions;
 }
 
-export interface AppliedWorkspaceFileDetail {
+interface AppliedWorkspaceFileDetail {
 	filePath: string;
 	range?: { start: number; end: number };
 	importsChanged?: boolean;
@@ -263,7 +263,7 @@ function formatRange(range: LSPRange): string {
 	return `${range.start.line + 1}:${range.start.character + 1}-${range.end.line + 1}:${range.end.character + 1}`;
 }
 
-export function rangesOverlap(a: LSPRange, b: LSPRange): boolean {
+function rangesOverlap(a: LSPRange, b: LSPRange): boolean {
 	return (
 		comparePosition(a.start, b.end) < 0 && comparePosition(b.start, a.end) < 0
 	);
@@ -533,7 +533,7 @@ export async function normalizeWorkspaceEditToUtf16(
 	};
 }
 
-export function flattenWorkspaceTextEdits(edit: {
+function flattenWorkspaceTextEdits(edit: {
 	changes?: Record<string, unknown[]>;
 	documentChanges?: unknown[];
 }): Map<string, LSPTextEdit[]> {
@@ -796,7 +796,17 @@ function planWorkspaceEdit(
 	};
 	const flushSubtree = (uri: string): void => {
 		const key = indexKey(uri);
-		for (const candidate of [...(descendants.get(key) ?? [])]) {
+		// flushUri -> removeIndex deletes `candidate` from this very Set (`key`
+		// is one of `candidate`'s ancestors by construction). No defensive copy
+		// needed: Set iterators reflect deletions safely — deleting the current
+		// or a not-yet-visited entry during iteration removes it from the
+		// remaining traversal without skipping or duplicating any other member
+		// (verified: https://tc39.es/ecma262/#sec-set.prototype.values, same
+		// guarantee already relied on for the Map iteration below and at
+		// clients/lsp/client.ts / clients/persist-debounce.ts /
+		// clients/review-graph/builder.ts). Nothing adds to `descendants`
+		// during this loop (only `addIndex` does, and it isn't called here).
+		for (const candidate of descendants.get(key) ?? []) {
 			const item = pending.get(candidate);
 			if (item) flushUri(item.uri);
 		}
@@ -842,7 +852,10 @@ function planWorkspaceEdit(
 		} else flushSubtree(resource.uri);
 		ops.push(resource);
 	}
-	for (const item of [...pending.values()]) flushUri(item.uri);
+	// flushUri deletes from `pending` — the same Map being iterated here — but
+	// Map iterators reflect deletions safely (see flushSubtree above), so no
+	// defensive copy is needed.
+	for (const item of pending.values()) flushUri(item.uri);
 	return ops;
 }
 
@@ -1039,6 +1052,7 @@ async function createWorkspaceUriConfiner(
 		} catch (err) {
 			throw new Error(
 				`invalid workspace edit URI ${uri}: ${err instanceof Error ? err.message : String(err)}`,
+				{ cause: err },
 			);
 		}
 		if (!path.isAbsolute(filePath))

@@ -16,7 +16,11 @@ import * as path from "node:path";
 import { BoundedLruCache } from "./bounded-cache.js";
 import { createGenerationSource } from "./generation-guard.js";
 import { normalizeMapKey } from "./path-utils.js";
+import { resolveCargoPackageEdition } from "./cargo-manifest.js";
+import { resolveKtfmtGradleStyle } from "./gradle-ktfmt-style.js";
+import { resolvePhpCsFixerConfig } from "./php-cs-fixer-config.js";
 import { TERRAGRUNT_FILENAMES } from "./file-kinds.js";
+import { stripAnsi } from "./sanitize.js";
 import {
 	detectIndentation,
 	hasDetectableIndentation,
@@ -30,7 +34,12 @@ import {
 	logAvailabilityDecision,
 	startHostStallSampler,
 } from "./dispatch/runners/utils/availability-policy.js";
-import { findGlobalBinary, findLocalBinUpwards } from "./package-manager.js";
+import {
+	findGlobalBinary,
+	findLocalBinUpwards,
+	VENDOR_BIN_DIRS,
+	VENV_BIN_DIRS,
+} from "./package-manager.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
 import { assertInstallAllowed } from "./project-trust.js";
 import { tryLazyInstallForFormatter } from "./dispatch/runners/utils/lazy-installer.js";
@@ -595,82 +604,70 @@ async function resolveGoFmtBinary(): Promise<string | null> {
 /**
  * Walk up from cwd looking for a binary in .venv or venv.
  * Returns the absolute path if found, null otherwise.
+ *
+ * Tool-resolution walker, not a config lookup (#2514/#2517 policy): escaping
+ * the project upward past HOME means STOP, not keep reading — a `.venv`/`venv`
+ * bin found at or above HOME can never be THIS project's own virtualenv. The
+ * ceiling lives in `findLocalBinUpwards` and is default-on there; the tests
+ * that pin a fake HOME drive that walker directly rather than threading a
+ * `homeDir` no production caller ever passed (#2544 review F3).
+ *
+ * On Windows the candidate order is EXT-OUTER, DIR-INNER — `.venv/Scripts/x.exe`,
+ * `venv/Scripts/x.exe`, then the bare names — which is what the pre-fold copy
+ * did and what `findLocalBinUpwards` preserves.
  */
 async function findInVenv(binary: string, cwd: string): Promise<string | null> {
-	const isWin = process.platform === "win32";
-	const candidates = isWin
-		? [
-				`.venv/Scripts/${binary}.exe`,
-				`venv/Scripts/${binary}.exe`,
-				`.venv/Scripts/${binary}`,
-				`venv/Scripts/${binary}`,
-			]
-		: [`.venv/bin/${binary}`, `venv/bin/${binary}`];
-
-	let dir = cwd;
-	const root = path.parse(dir).root;
-	while (dir !== root) {
-		for (const candidate of candidates) {
-			const full = path.join(dir, candidate);
-			if (await fileExists(full)) return full;
-		}
-		const parent = path.dirname(dir);
-		if (parent === dir) break;
-		dir = parent;
-	}
-	return null;
+	return (
+		findLocalBinUpwards(binary, cwd, {
+			windowsExt: ".exe",
+			binDirs: VENV_BIN_DIRS,
+		}) ?? null
+	);
 }
 
 /**
  * Check vendor/bin for PHP Composer-managed tools.
  * Walks up from cwd to find vendor/bin/<binary>.
+ *
+ * Tool-resolution walker, not a config lookup (#2514/#2517 policy): escaping
+ * the project upward past HOME means STOP, not keep reading — a `vendor/bin`
+ * match found at or above HOME can never be THIS project's own Composer
+ * install. Same single walker as `findInVenv` above; only `binDirs` and the
+ * Windows extension differ.
  */
 async function findInVendorBin(
 	binary: string,
 	cwd: string,
 ): Promise<string | null> {
-	const isWin = process.platform === "win32";
-	const names = isWin ? [`${binary}.bat`, binary] : [binary];
-	let dir = cwd;
-	const root = path.parse(dir).root;
-	while (dir !== root) {
-		for (const name of names) {
-			const full = path.join(dir, "vendor", "bin", name);
-			if (await fileExists(full)) return full;
-		}
-		const parent = path.dirname(dir);
-		if (parent === dir) break;
-		dir = parent;
-	}
-	return null;
+	return (
+		findLocalBinUpwards(binary, cwd, {
+			windowsExt: ".bat",
+			binDirs: VENDOR_BIN_DIRS,
+		}) ?? null
+	);
 }
 
 /**
  * Check node_modules/.bin for locally installed Node tools.
  * Walks up from cwd to find node_modules/.bin/<binary>.
+ *
+ * #2514: this WAS a private, byte-for-byte duplicate of
+ * `findLocalBinUpwards` (`package-manager.ts`) — the same walk `stylua`
+ * below, `taplo.ts`, `knip-client.ts`, and (via `findNodeToolBinary`)
+ * `dependency-checker.ts`/`jscpd-client.ts` already reuse. A stray
+ * `~/node_modules/.bin/oxfmt.cmd` (the home-level pi-extensions manifest
+ * installs its own bins) was picked up as the project's formatter because
+ * this copy had no HOME ceiling; fixing only this copy would have left every
+ * other caller of `findLocalBinUpwards` with the same defect. Delegating
+ * here instead of hand-rolling a second ceiling keeps there being exactly one
+ * `node_modules/.bin` walker — see that function for the tool-resolution
+ * "escaping the project means STOP" policy (#2517).
  */
 async function findInNodeModules(
 	binary: string,
 	cwd: string,
 ): Promise<string | null> {
-	const isWin = process.platform === "win32";
-	let dir = cwd;
-	const root = path.parse(dir).root;
-	while (dir !== root) {
-		const candidates = isWin
-			? [
-					path.join(dir, "node_modules", ".bin", `${binary}.cmd`),
-					path.join(dir, "node_modules", ".bin", binary),
-				]
-			: [path.join(dir, "node_modules", ".bin", binary)];
-		for (const full of candidates) {
-			if (await fileExists(full)) return full;
-		}
-		const parent = path.dirname(dir);
-		if (parent === dir) break;
-		dir = parent;
-	}
-	return null;
+	return findLocalBinUpwards(binary, cwd) ?? null;
 }
 
 /**
@@ -1139,6 +1136,17 @@ export const rustfmtFormatter: FormatterInfo = {
 	name: "rustfmt",
 	command: ["rustfmt", "$FILE"],
 	extensions: [".rs"],
+	// #2466: rustfmt defaults to an OLDER edition than the file's actual Cargo
+	// package when invoked bare, so it can reject valid newer-edition syntax
+	// (e.g. Rust 2024). Carry the nearest package's `edition` (honoring
+	// `edition.workspace = true` inheritance) through `--edition`; `undefined`
+	// (unreadable/unparseable manifest) falls back to the static command
+	// above, unchanged from pre-#2466 behavior.
+	async resolveCommand(filePath, _cwd) {
+		const edition = await resolveCargoPackageEdition(filePath);
+		if (edition === undefined) return null;
+		return ["rustfmt", "--edition", edition, filePath];
+	},
 	async detect(cwd: string) {
 		if ((await which("rustfmt")) !== null) return true;
 		// If we're in a Rust project, attempt one lazy install of rustfmt component.
@@ -1263,16 +1271,26 @@ export const ktfmtFormatter: FormatterInfo = {
 	// ktfmt formats in place when given a file path (no flag needed).
 	command: ["ktfmt", "$FILE"],
 	extensions: [".kt", ".kts"],
+	// #2468: ktfmt's CLI never reads a project's Gradle `ktfmt { googleStyle()
+	// | kotlinLangStyle() }` selection — style is CLI-flag-only
+	// (`--google-style`/`--kotlinlang-style`, verified against ktfmt v0.63's
+	// own arg parser). Carry the nearest module's declared style through;
+	// `undefined` (no declaration, unreadable/unparseable manifest, or an
+	// unsupported style like the removed `dropboxStyle()`) falls back to the
+	// bare invocation, unchanged from pre-#2468 behavior.
 	async resolveCommand(filePath, _cwd) {
+		const styleFlag = await resolveKtfmtGradleStyle(filePath);
 		const inPath = await which("ktfmt");
-		if (inPath) return [inPath, filePath];
+		if (inPath)
+			return styleFlag ? [inPath, styleFlag, filePath] : [inPath, filePath];
 		const { ensureTool } = await import("./installer/index.js");
 		const installed = await ensureTool("ktfmt");
 		// #2413: which() and ensureTool (PATH/global/managed + install) both
 		// failed, and `detect()` gates only on hasKtfmtConfig — no binary probe —
 		// so a config-only project reaches here with ktfmt absent. The static
 		// command is bare `ktfmt`; spawning it reproduces the ENOENT class.
-		return installed ? [installed, filePath] : FORMATTER_UNAVAILABLE;
+		if (!installed) return FORMATTER_UNAVAILABLE;
+		return styleFlag ? [installed, styleFlag, filePath] : [installed, filePath];
 	},
 	async detect(cwd: string) {
 		// Opt-in only: ktfmt becomes the formatter when the project elects it,
@@ -1362,16 +1380,48 @@ export const phpCsFixerFormatter: FormatterInfo = {
 	name: "php-cs-fixer",
 	command: ["php-cs-fixer", "fix", "$FILE"],
 	extensions: [".php"],
+	// #2472: php-cs-fixer does NOT walk up parent directories looking for its
+	// own config the way prettier/biome/eslint do (verified against upstream
+	// `computeConfigFiles()` — see `resolvePhpCsFixerConfig`'s doc comment),
+	// and `formatFile` spawns with cwd = the FILE's own directory, which is
+	// not necessarily where the ancestor config `detect()` found actually
+	// lives. Always resolve the binary explicitly here (vendor/bin first,
+	// then global) rather than falling through to the static `command` above
+	// — that static command can never carry `--config`, so a config found at
+	// an ancestor would silently be dropped whenever the vendor lookup here
+	// missed but a global binary still resolved. `--config` is attached
+	// whenever a config resolves, even when it sits in the file's own
+	// directory (AC3): unlike the pre-#2472 code, correctness no longer
+	// depends on php-cs-fixer's own (nonexistent) upward search.
 	async resolveCommand(filePath, cwd) {
-		const vendor = await findInVendorBin("php-cs-fixer", cwd);
-		if (vendor) return [vendor, "fix", filePath];
-		return null;
+		const configPath = resolvePhpCsFixerConfig(filePath);
+		const binary =
+			(await findInVendorBin("php-cs-fixer", cwd)) ??
+			(await which("php-cs-fixer"));
+		// #2413/#2472 review F4: both probes (vendor/bin, then PATH) have
+		// PROVEN the binary is absent — returning `null` here would fall back
+		// to the static `command` above, which is the SAME bare
+		// `php-cs-fixer` this just failed to find, spawning it only to
+		// re-observe the ENOENT already known. Report the proven-missing
+		// state instead so `formatFile` skips the wasted spawn.
+		if (!binary) return FORMATTER_UNAVAILABLE;
+		return configPath
+			? [binary, "fix", "--config", configPath, filePath]
+			: [binary, "fix", filePath];
 	},
 	async detect(cwd: string) {
 		const vendorBin = await findInVendorBin("php-cs-fixer", cwd);
 		const globalBin = await which("php-cs-fixer");
 		if (!vendorBin && !globalBin) return false;
-		// Only run if project has explicit config
+		// Only run if project has explicit config. This is a presence-only
+		// climb from the project `cwd` (not necessarily the formatted file's
+		// own directory) via this file's own `findUp` — deliberately NOT
+		// merged with `resolvePhpCsFixerConfig` above (#2472 AC4): that
+		// resolver climbs from the FILE's directory and needs the exact
+		// winning path for `--config`, while this only needs a yes/no answer
+		// from whatever `cwd` the caller passed. `rustfmtFormatter.detect`
+		// keeps the same non-merged shape against `resolveCargoPackageEdition`
+		// for the identical reason.
 		const configs = [".php-cs-fixer.php", ".php-cs-fixer.dist.php"];
 		const found = await findUp(configs, cwd);
 		return found.length > 0;
@@ -2092,11 +2142,6 @@ export function clearFormatterRuntimeState(): void {
 	// is `session_start`'s block in runtime-session.ts.
 }
 
-// ESC is built via fromCharCode so no raw control byte sits in the source.
-const ANSI_ESCAPE = new RegExp(
-	`${String.fromCharCode(27)}\\[[0-9;]*[A-Za-z]`,
-	"g",
-);
 const BOX_DRAWING_GLOBAL = /[\u2500-\u257F]/g;
 const HAS_BOX_DRAWING = /[\u2500-\u257F]/;
 
@@ -2116,7 +2161,7 @@ export function firstDiagnosticLine(
 	text: string | undefined,
 ): string | undefined {
 	for (const raw of (text ?? "").split("\n")) {
-		const line = raw.replace(ANSI_ESCAPE, "").trimEnd();
+		const line = stripAnsi(raw).trimEnd();
 		const stripped = line.replace(BOX_DRAWING_GLOBAL, "").trim();
 		if (!stripped) continue;
 		// "format ━━━━━━━━" is a section banner, not a diagnostic. Require a rule
