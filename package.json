@@ -1,6 +1,6 @@
 {
 	"name": "pi-lens",
-	"version": "4.1.4",
+	"version": "4.1.6",
 	"type": "module",
 	"description": "Real-time code feedback for pi — LSP, linters, formatters, type-checking, structural analysis & booboo",
 	"repository": {
@@ -33,10 +33,13 @@
 		"test:integration": "node scripts/with-test-lock.mjs -- vitest run tests/index-integration.test.ts tests/clients/lsp/integration.test.ts",
 		"test:targeted": "node scripts/with-test-lock.mjs --shared -- vitest run",
 		"test:watch": "vitest",
+		"test:real-harness": "node scripts/with-test-lock.mjs --shared -- vitest run",
+		"mutation:diff": "node scripts/stryker-diff.mjs --base origin/master --max-files 6",
 		"hygiene": "node scripts/prune-agent-worktrees.mjs",
 		"check": "node scripts/check-extensions.mjs",
 		"selftest:install": "node scripts/install-selftest.mjs",
 		"check:lockfile": "node scripts/check-lockfile-sync.mjs",
+		"preflight": "node scripts/pr-preflight.mjs",
 		"knip": "node scripts/run-knip.mjs",
 		"check:grammars": "node scripts/check-grammar-provenance.mjs",
 		"check:grammar-load": "node scripts/check-grammar-load.mjs",
@@ -49,7 +52,9 @@
 		"bench:cascade-budget": "node scripts/bench-cascade-budget.mjs",
 		"bench:word-index-replacement": "node scripts/bench-word-index-replacement.mjs",
 		"logs:smells": "node scripts/analyze-pi-lens-logs.mjs",
+		"complexity": "node scripts/complexity-report.mjs",
 		"changelog:check": "node scripts/rollup-changelog.mjs --check",
+		"test:regen": "node scripts/regen-test-baseline.mjs",
 		"changelog:release": "node scripts/changelog-release.mjs",
 		"changelog:extract": "node scripts/changelog-extract.mjs",
 		"release:backfill-notes": "node scripts/backfill-github-releases.mjs",
@@ -83,6 +88,7 @@
 	"engines": {
 		"node": ">=22.19.0"
 	},
+	"packageManager": "npm@11.18.0",
 	"files": [
 		"dist/",
 		"docs/",
@@ -137,25 +143,26 @@
 		"@biomejs/biome": "^2.4.10",
 		"@earendil-works/pi-coding-agent": "^0.85.1",
 		"@earendil-works/pi-tui": "^0.85.1",
+		"@stryker-mutator/core": "10.0.0",
 		"@taplo/cli": "0.7.0",
 		"@types/node": "^26.0.0",
 		"@types/pidusage": "^2.0.5",
 		"@types/semver": "^7.8.0",
-		"@vitest/coverage-v8": "^4.1.5",
+		"@vitest/coverage-v8": "^5.0.0",
 		"dependency-cruiser": "^18.2.0",
 		"husky": "^9.1.7",
 		"jscpd": "5.1.2",
 		"json5": "^2.2.3",
-		"knip": "6.34.0",
+		"knip": "6.35.1",
 		"oxfmt": "0.66.0",
-		"oxlint": "1.81.0",
+		"oxlint": "1.82.0",
 		"oxlint-tsgolint": "7.0.2001",
 		"publint": "0.3.24",
 		"semver": "^7.8.0",
 		"typebox": "^1.0.0",
 		"typescript": "^7.0.2",
 		"typescript-language-server": "5.3.0",
-		"vitest": "^4.1.1"
+		"vitest": "^5.0.0"
 	},
 	"pi": {
 		"extensions": [
@@ -169,5 +176,8 @@
 		"@ast-grep/cli@0.45.3": true,
 		"@google/genai@1.52.0": true,
 		"protobufjs@7.6.5": true
+	},
+	"overrides": {
+		"qs": "^6.15.4"
 	}
 }

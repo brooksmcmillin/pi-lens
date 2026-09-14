@@ -42,7 +42,10 @@ import {
 	SWEEP_IDLE_SAFETY_MARGIN_MS,
 } from "./lsp/workspace-sweep-hold.js";
 import { isTestRoleCollateral } from "./collateral-test-role.js";
-import type { GitleaksResult } from "./gitleaks-client.js";
+import {
+	classifyAndFilterFindings,
+	type GitleaksResult,
+} from "./gitleaks-client.js";
 import type { GovulncheckResult } from "./govulncheck-client.js";
 import type { TrivyResult } from "./trivy-client.js";
 import {
@@ -139,6 +142,8 @@ import {
 } from "./demoted-finding-render.js";
 import { STALE_LINE_MARKER } from "./stale-marker.js";
 import { getActiveSessionId } from "./session-lifecycle.js";
+import { bounded } from "./deadline-utils.js";
+import { HOOK_WALL_BUDGET_MS } from "./hook-budgets.js";
 
 import {
 	drainRenderedDependencyDriftFilePaths,
@@ -448,6 +453,8 @@ interface TurnEndDeps {
 	}) => void;
 	/** Stable session identity from the event ctx that fired this turn_end. */
 	sessionId?: string;
+	/** Abort signal from the event ctx that fired this turn_end. */
+	signal?: AbortSignal;
 }
 
 /**
@@ -708,6 +715,16 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		resetLSPService,
 		resetFormatService,
 	} = deps;
+	const turnIndexAtDispatch = runtime.turnIndex;
+	const clearOwnedTurnState = (): void => {
+		if (runtime.turnIndex !== turnIndexAtDispatch) {
+			dbg(
+				`turn_end: retaining newer turn state (dispatch=${turnIndexAtDispatch}, current=${runtime.turnIndex})`,
+			);
+			return;
+		}
+		cacheManager.clearTurnState(cwd, currentOwner);
+	};
 
 	// #449 slice 1: piggyback the instance-registry heartbeat on this existing
 	// per-turn touchpoint rather than adding a new timer/interval. Cheap (reads
@@ -770,7 +787,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		(turnState.files || turnState.owner || turnState.sessionId)
 	) {
 		dbg("turn_end: evicting stale turn-state owner");
-		cacheManager.clearTurnState(cwd, currentOwner);
+		clearOwnedTurnState();
 		turnState = cacheManager.readTurnState(cwd);
 	}
 
@@ -899,7 +916,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 
 	if (cacheManager.isMaxCyclesExceeded(cwd)) {
 		dbg("turn_end: max cycles exceeded, clearing state and forcing through");
-		cacheManager.clearTurnState(cwd, currentOwner);
+		clearOwnedTurnState();
 		runtime.fixedThisTurn.clear();
 		resetFormatService();
 		return;
@@ -953,6 +970,9 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	// map — see blocker-freshness.ts's `WidgetSweepBlockerEntry` doc for why this
 	// is injected here rather than imported by blocker-freshness.ts itself.
 	const blockerFreshness = await sweepInlineBlockerFreshness(runtime, cwd, {
+		// #2982: the hook's own signal, so the self axis's filesystem work is
+		// bounded by the same abort everything else in this handler honours.
+		...(deps.signal === undefined ? {} : { signal: deps.signal }),
 		additionalEntries: getWidgetBlockingFilesForSweep().map((row) => ({
 			filePath: row.filePath,
 			recordedAtMs: row.recordedAtMs,
@@ -972,6 +992,9 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			revalidated: blockerFreshness.revalidated,
 			alreadyStale: blockerFreshness.alreadyStale,
 			truncatedImports: blockerFreshness.truncatedImports,
+			selfHealed: blockerFreshness.selfHealed,
+			selfUnverifiable: blockerFreshness.selfUnverifiable,
+			hashBudgetExhausted: blockerFreshness.hashBudgetExhausted,
 		},
 	});
 
@@ -1865,6 +1888,34 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		cwd,
 	)?.data;
 	const trivySecretsData = trivyCacheEntry?.data;
+	// Gitleaks deliberately scans gitignored local files and nested repositories
+	// so an explicit security audit can still inspect them. The adapter is the
+	// source of truth for whether a finding belongs in a blocking delivery lane;
+	// filter here before freshness handling so demoted findings cannot leak into
+	// either the blocker or stale-secret turn context.
+	const boundedClassification = await bounded(
+		classifyAndFilterFindings(gitleaksData?.findings ?? [], cwd),
+		{
+			ms: HOOK_WALL_BUDGET_MS.turn_end,
+			signal: deps.signal,
+			hook: "turn_end",
+			label: "classifyAndFilterFindings",
+		},
+	);
+	const classifiedGitleaksFindings =
+		boundedClassification ?? gitleaksData?.findings ?? [];
+	if (boundedClassification === undefined) {
+		recordDegradationOnce({
+			kind: "gitleaks_classification_timeout",
+			subject: cwd,
+			reason:
+				"gitleaks classification exceeded the turn_end budget; retained raw findings to fail open",
+		});
+	}
+	const blockingGitleaksFindings = classifiedGitleaksFindings.filter(
+		(finding) =>
+			gitleaksFindingToProjectDiagnostic(cwd, finding).semantic === "blocking",
+	);
 	// #1461 slice 1 (#1460): the gitleaks cache is TTL-only, so a finding for a
 	// file deleted after the scan is still served as a 🔴 blocker for the rest
 	// of the 30-minute window — the live case, and 119 of 126 findings in
@@ -1879,7 +1930,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	// would let any edit — malicious or accidental — mute a real secret.
 	const gitleaksGate = gateFindingsByPathFreshness({
 		store: "gitleaks",
-		findings: gitleaksData?.findings ?? [],
+		findings: blockingGitleaksFindings,
 		cwd,
 		scannedAt: gitleaksData?.scannedAt,
 		citedPath: (finding) => finding.file,
@@ -2183,6 +2234,8 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		const targets: Array<
 			Omit<TurnEndTestTarget, "strategy"> & {
 				strategy: TurnEndTestTarget["strategy"] | "deferred";
+				sourceFile: string;
+				fileSeqAtRun?: number;
 				/** Cut-batch count carried in from the cache, for the cap below. */
 				deferralAttempts?: number;
 			}
@@ -2407,6 +2460,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				heldDeferred.push({
 					testFile,
 					runner: carried.runner,
+					sourceFile: carried.sourceFile ?? testFile,
 					attempts,
 					sessionId: turnSessionId,
 				});
@@ -2417,6 +2471,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			redispatchedDeferred++;
 			targets.push({
 				testFile,
+				sourceFile: carried.sourceFile ?? testFile,
 				runner: carried.runner,
 				config,
 				strategy: "deferred",
@@ -2529,7 +2584,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					overCapTargets++;
 					continue;
 				}
-				targets.push(target);
+				targets.push({ ...target, sourceFile: abs });
 				dbg(
 					`turn_end: ${display} → test ${target.runner} ${path.relative(cwd, target.testFile)} (${target.strategy}${isNeighbor ? ", cascade-neighbor" : ""})`,
 				);
@@ -2568,6 +2623,9 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			);
 		}
 		if (targets.length > 0) {
+			for (const target of targets) {
+				target.fileSeqAtRun = runtime.getFileSeq(target.sourceFile);
+			}
 			dbg(
 				`turn_end: firing ${targets.length} test target(s) async (non-blocking, max ${TEST_RUNNER_BATCH_CONCURRENCY} concurrent)`,
 			);
@@ -2619,8 +2677,36 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					}),
 			})
 				.then(({ results, deferred, stopReason }) => {
+					const settledResults = results as Array<
+						PromiseSettledResult<TestResult>
+					>;
+					const verdicts = settledResults.flatMap((result) => {
+						if (result.status === "rejected") return [];
+						const target = targets.find(
+							(candidate) => candidate.testFile === result.value.file,
+						);
+						return target
+							? [
+									{
+										file: result.value.file,
+										sourceFile: target.sourceFile,
+										fileSeq:
+											target.fileSeqAtRun === undefined
+												? ({
+														state: "unknown",
+														reason: "sequence-unavailable",
+													} as const)
+												: ({
+														state: "known",
+														value: target.fileSeqAtRun,
+													} as const),
+									},
+								]
+							: [];
+					});
 					const deferredTargets: DeferredTestTarget[] = deferred.map((t) => ({
 						testFile: t.testFile,
+						sourceFile: t.sourceFile,
 						runner: t.runner,
 						// One more cut batch for this target. Read back by the
 						// selection loop above, which retires it at
@@ -2852,6 +2938,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 								content,
 								stale,
 								results: resultValues,
+								verdicts,
 								testRunGeneration,
 								launchedFrom,
 								publishedAgainst,
@@ -2969,6 +3056,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 								content: deferralNote,
 								stale,
 								results: resultValues,
+								verdicts,
 								testRunGeneration,
 								launchedFrom,
 								publishedAgainst,
@@ -3508,6 +3596,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	let lateAuxCoverageGapDropCount = 0;
 	const lateAuxStuckPairs: Array<{ filePath: string; serverId: string }> = [];
 	if (drainedPairs.length > 0) {
+		const lateObserverDeadline = Date.now() + HOOK_WALL_BUDGET_MS.turn_end;
 		const byFile = new Map<string, typeof drainedPairs>();
 		for (const pair of drainedPairs) {
 			const list = byFile.get(pair.filePath);
@@ -3627,6 +3716,26 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 						}
 						continue;
 					}
+					// A demoted auxiliary still answers through this late path. Feed the
+					// publication-minus-mark interval into the re-promotion streak. This is
+					// delivery latency observed by the drain, not the scanner's total scan
+					// latency. Cache priming is
+					// below the freshness gate so a changed file cannot resurrect stale data.
+					if (typeof service.observeLateAuxiliaryAnswer === "function") {
+						await bounded(
+							service.observeLateAuxiliaryAnswer(
+								lateAuxPath,
+								pair.serverId,
+								cachedEntry.publishedAt - pair.markedAtMs,
+							),
+							{
+								ms: Math.max(1, lateObserverDeadline - Date.now()),
+								signal: deps.signal /* late observer */,
+								hook: "turn_end",
+								label: "observeLateAuxiliaryAnswer",
+							},
+						);
+					}
 					if (rawDiags.length === 0) {
 						lateAuxCleanConfirmed += 1;
 						continue;
@@ -3678,6 +3787,16 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 						}
 						continue;
 					}
+					// #2810 round 4: this drain does NOT write the hash-bound
+					// last-known record. The prime it used to call could only fire when
+					// a record already existed at the pair's hash — which requires a
+					// FULLY covered touch of those exact bytes, the one case where the
+					// scanner's findings are already in the record — so it was a no-op
+					// in the demoted steady state it was added for, and a #570/#1470
+					// hazard everywhere else (an auxiliary-only array replacing the
+					// merged one). Late findings reach the agent as the gated advisory
+					// below; the turn-end hash-guarded fast path stays cold for a file
+					// whose touch was partial, which is exactly what #1470 requires.
 					const lines = gate.live.map(
 						(f) =>
 							`  ${displayLateAuxPath}:${f.line}:${f.column} [${f.rule}] ${f.message}`,
@@ -3815,7 +3934,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					});
 				}
 			}
-			cacheManager.clearTurnState(cwd, currentOwner);
+			clearOwnedTurnState();
 			runtime.fixedThisTurn.clear();
 			resetFormatService();
 			return;
@@ -3919,7 +4038,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		});
 	}
 	if (blockerParts.length === 0) {
-		cacheManager.clearTurnState(cwd, currentOwner);
+		clearOwnedTurnState();
 		// `staleSecretParts` counts here too (#1622 review M2): clearing the
 		// findings record while a stale secret is still unverified would drop the
 		// only surviving trace of it.

@@ -9,6 +9,11 @@ Closes #NNN — only when every acceptance criterion is met. Otherwise Refs
 The reference must ALSO be in the PR title — the title becomes the
 merge-commit subject.
 
+Citations: every code fact uses ``path:line``; an offered fenced quote is
+checked against the cited source line. Test ids in tables are real `it(` titles;
+pre-existing-red claims carry the
+`origin/master` transcript.
+
 ## Type of change
 
 - [ ] Bug fix
@@ -41,7 +46,7 @@ merge-commit subject.
 - [ ] PR title carries the conventional prefix and the issue ref
 - [ ] `npm run lint` passes
 - [ ] `npm run build:dist` succeeds if I changed code under `clients/`, `commands/`, `tools/`, or `index.ts`
-- [ ] `package-lock.json` is in sync with `package.json` (run `npm install` after dep changes)
+- [ ] `package-lock.json` is in sync with `package.json` (regenerate with the exact npm pin in `package.json`'s `packageManager` field)
 - [ ] `AGENTS.md` is updated if this PR changes behavior, commands, conventions, or invariants documented there
 - [ ] `.changelog/<branch-or-slug>-<short-desc>.md` has one valid entry **in this PR** for any user-facing change (Added/Changed/Deprecated/Removed/Fixed/Security) — see [.changelog/README.md](../.changelog/README.md); internal-only test/refactor PRs may skip it
 - [ ] Commit subject includes the issue number: `(closes #NNN)` or `(refs #NNN)`
@@ -73,9 +78,23 @@ explicitly with why.
 
 ## Observability
 
-Name the log or ledger record that proves this change works in production
-(file + event/kind), or name the gap. Docs/test-only PRs may state not
-applicable.
+The `PR body` check accepts exactly three forms here, nothing else:
+
+1. the literal record kind this diff ADDS in runtime code (a `kind: "..."`
+   passed to `recordDegradationOnce` / `incrementDegradationCount` / a
+   `logLatency` phase) — the literal must appear in the added lines;
+2. `covered by existing record \`<kind>\` at \`<runtime file>:<line>\`` when
+   the new failure path is observed by a record an existing seam already
+   emits (the cited line must sit within 20 lines of that literal, in a
+   runtime file, no `..` in the path);
+3. the exact sentence `No new failure path; no record added.` — valid ONLY
+   when the diff adds no `catch`, `throw`, `return null` or degradation
+   branch in runtime code.
+
+"name the gap" / "not applicable" are refused. One `## Observability`
+section per PR: fix rounds append under `## Round N` and never repeat this
+heading — the check reads the FIRST section and a stale first section is
+the usual red.
 
 ## Class sweep
 

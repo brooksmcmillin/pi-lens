@@ -44,7 +44,7 @@ vi.mock("../../clients/lsp/wait-policy/index.js", () => ({
 	classifyCascadeWaitTier: () => mocked.cascadeTier,
 }));
 
-const reconcileScanDiagnosticsMock = vi.fn();
+const reconcileScanDiagnosticsMock = vi.fn().mockReturnValue(true);
 
 vi.mock("../../clients/widget-state.js", () => ({
 	reconcileScanDiagnostics: (...args: unknown[]) =>
@@ -59,7 +59,7 @@ describe("lsp_diagnostics tool", () => {
 		mocked.cascadeTier = "waits";
 		mocked.warmAttached = false;
 		mocked.attachedDiagnostics.mockReset();
-		reconcileScanDiagnosticsMock.mockReset();
+		reconcileScanDiagnosticsMock.mockReset().mockReturnValue(true);
 		mocked.service = makeLspServiceDouble({
 			getDiagnostics: vi.fn().mockImplementation(async (filePath: string) => {
 				if (filePath.endsWith("bad.ts")) {
@@ -289,6 +289,8 @@ describe("lsp_diagnostics tool", () => {
 	});
 
 	it("short-circuits the batch fan-out when the signal is already aborted (#343)", async () => {
+		// #2499 / PR #2957: the shared results overload must preserve the retired
+		// local pool's contract: unstarted files are absent, not undefined entries.
 		const tool = createLspDiagnosticsTool();
 		const controller = new AbortController();
 		controller.abort();
@@ -667,28 +669,17 @@ describe("lsp_diagnostics tool", () => {
 			}
 		});
 
-		it("compact render: batch with unconfirmed files shows the clean/unconfirmed split, not a bare diagnostic count", () => {
-			const tool = createLspDiagnosticsTool();
-			const fakeTheme = { fg: (_c: unknown, t: string) => t } as any;
-			const component = (tool.renderResult as any)(
-				{
-					content: [{ type: "text", text: "Files checked: 3" }],
-					details: {
-						mode: "batch",
-						totalDiagnostics: 1,
-						cleanFiles: 0,
-						unconfirmedFiles: 2,
-					},
-				},
-				{ expanded: false },
-				fakeTheme,
-				{ args: {} },
-			);
-			expect((component as { text: string }).text).toContain("unconfirmed");
-			expect((component as { text: string }).text).not.toMatch(
-				/— 1 diagnostic\s*$/,
-			);
-		});
+		// #2860 round 3 N5/F10: `createLspDiagnosticsTool` no longer returns a
+		// `renderResult` — the fold's only production caller
+		// (`tools/lens-diagnostics.ts`) routes rendering through its OWN
+		// `details.source === "lsp"` branch (never through this probe's
+		// renderer, which was unreachable dead code since round 1 per #533).
+		// The same invariant this test pinned — a batch/directory result with
+		// unconfirmed files must never compact-render as a bare N-diagnostic
+		// count — is covered on the surviving renderer by
+		// tests/tools/lens-diagnostics.test.ts's "lens_diagnostics source=lsp
+		// compact render" describe block ("preserves unconfirmed and
+		// timed-out files").
 	});
 
 	// #611: for a tier3-silent server (classic typescript-language-server), an
@@ -2049,6 +2040,7 @@ describe("lsp_diagnostics tool", () => {
 									end: { line: 0, character: 1 },
 								},
 								source: "typescript",
+								serverId: "typescript",
 							},
 							{
 								severity: 2,
@@ -2058,6 +2050,7 @@ describe("lsp_diagnostics tool", () => {
 									end: { line: 1, character: 1 },
 								},
 								source: "ast-grep",
+								serverId: "ast-grep",
 							},
 						];
 					}
@@ -2303,6 +2296,7 @@ describe("lsp_diagnostics tool", () => {
 									end: { line: 0, character: 1 },
 								},
 								source: "typescript",
+								serverId: "typescript",
 							},
 						];
 					}
@@ -2316,6 +2310,7 @@ describe("lsp_diagnostics tool", () => {
 									end: { line: 0, character: 1 },
 								},
 								source: "ast-grep",
+								serverId: "ast-grep",
 							},
 						];
 					}

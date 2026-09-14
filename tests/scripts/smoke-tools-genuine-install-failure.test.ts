@@ -30,11 +30,12 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	classifyInstallOutcome,
 	ensureFixtureTools,
 	pipCandidateUsable,
+	runInstallRegistrySmoke,
 	resolveUnavailabilityRow,
 } from "../../scripts/smoke-tools.mjs";
 
@@ -137,6 +138,16 @@ const CASES: Array<{
 		expectRow: "skip",
 	},
 	{
+		name: "PEP 668 externally-managed-environment remains a genuine pip failure",
+		toolId: "jedi-language-server",
+		attempt: {
+			outcome: "failed",
+			reason: "error: externally-managed-environment",
+		},
+		toolchainPresence: { pip: true },
+		expectRow: "fail",
+	},
+	{
 		name: "ETIMEDOUT is treated as transient",
 		toolId: "vscode-css-languageserver",
 		attempt: { outcome: "failed", reason: "npm error ETIMEDOUT" },
@@ -217,6 +228,52 @@ describe("classifyInstallOutcome (#2638/#2661) — outcome × toolchain table", 
 		expect(result.row).toBe("fail");
 		expect(result.detail).not.toContain("second line never shown");
 		expect(result.detail.length).toBeLessThan(300);
+	});
+
+	it("preserves the network-unreachable classification for release consumers", () => {
+		const result = classifyInstallOutcome(
+			"vscode-css-languageserver",
+			deps(() => ({
+				outcome: "failed",
+				reason: "npm error ENOTFOUND registry.npmjs.org",
+			})),
+		);
+		expect(result.networkUnreachable).toBe(true);
+	});
+
+	it("carries the classifier tag into the registry report", async () => {
+		const report = await runInstallRegistrySmoke({
+			deps: {
+				TOOLS: [{ id: "vscode-css-languageserver", installStrategy: "npm" }],
+				ensureTool: async () => undefined,
+				getInstallAttempt: () => ({
+					outcome: "failed",
+					reason: "npm error ENOTFOUND registry.npmjs.org",
+				}),
+				pipCommandCandidates: () => [],
+			},
+		});
+		expect(report.results[0].networkUnreachable).toBe(true);
+	});
+
+	it("does not fall back to the source checkout when installer root is absent", async () => {
+		const exit = vi.spyOn(process, "exit").mockImplementation(((
+			code?: number,
+		) => {
+			throw new Error(`process.exit(${code})`);
+		}) as never);
+		const error = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			await expect(runInstallRegistrySmoke()).rejects.toThrow(
+				"process.exit(2)",
+			);
+			expect(error).toHaveBeenCalledWith(
+				"installer root missing: --installer-root=<path> is required for the installed registry smoke",
+			);
+		} finally {
+			exit.mockRestore();
+			error.mockRestore();
+		}
 	});
 });
 

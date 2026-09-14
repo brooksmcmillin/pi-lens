@@ -27,7 +27,8 @@ const { safeSpawnAsync, logLatencySpy } = vi.hoisted(() => ({
 	logLatencySpy: vi.fn(),
 }));
 
-vi.mock("../../clients/latency-logger.js", () => ({
+vi.mock("../../clients/latency-logger.js", async (importOriginal) => ({
+	...(await importOriginal()),
 	logLatency: logLatencySpy,
 	getLastLoggedPhase: () => undefined,
 }));
@@ -169,23 +170,69 @@ describe("the installer records what its attempt did (#1500)", () => {
 	// failed to install recorded the same generic fallback, indistinguishable
 	// from a policy decline to any caller reading `getInstallAttempt`.
 	it("a genuine pip install failure records the real pip error, not a generic fallback", async () => {
-		const pipFailed = {
-			stdout: "",
-			stderr:
-				"ERROR: Could not find a version that satisfies the requirement cmake-language-server",
-			status: 1,
-		};
-		safeSpawnAsync.mockResolvedValue(pipFailed);
+		safeSpawnAsync.mockImplementation(async (command: string) =>
+			command === "pip3"
+				? {
+						stdout: "",
+						stderr:
+							"ERROR: Could not find a version that satisfies the requirement cmake-language-server\nsecond diagnostic line",
+						status: 1,
+					}
+				: { stdout: "", stderr: "", status: 1, error: new Error("ENOENT") },
+		);
 		const { ensureTool, getInstallFailureReason, getInstallAttempt } =
 			await installer();
 
 		expect(await ensureTool("cmake-language-server")).toBeUndefined();
 		const attempt = getInstallAttempt("cmake-language-server");
 		expect(attempt?.outcome).toBe("failed");
-		const reason = getInstallFailureReason("cmake-language-server");
+		const reason = getInstallFailureReason("cmake-language-server") ?? "";
 		expect(reason).toContain("cmake-language-server");
+		expect(reason).toContain("pip3 install --user");
 		expect(reason).not.toBe("install failed");
 		expect(attempt?.reason).toBe(reason);
+		expect(reason).toContain("ENOENT");
+		expect(reason).not.toContain("\n");
+		expect(reason.length).toBeLessThan(1000);
+	});
+
+	it("does not spawn an unavailable Python interpreter", async () => {
+		const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-no-python-"));
+		fs.writeFileSync(path.join(binDir, "pip3"), "pip3", { mode: 0o755 });
+		const calls: string[] = [];
+		safeSpawnAsync.mockImplementation(
+			async (command: string, args: string[]) => {
+				calls.push(`${command} ${args.join(" ")}`);
+				return { stdout: "", stderr: "no pip", status: 1 };
+			},
+		);
+		const restorePath = withEnv({ PATH: binDir });
+		try {
+			const { ensureTool } = await installer();
+			await ensureTool("cmake-language-server");
+		} finally {
+			restorePath();
+			fs.rmSync(binDir, { recursive: true, force: true });
+		}
+		expect(calls.some((call) => call.startsWith("python3 -m venv "))).toBe(
+			false,
+		);
+		expect(calls.some((call) => call.startsWith("python -m venv "))).toBe(
+			false,
+		);
+	});
+
+	it("preserves a PEP 668 pip refusal for downstream classification", async () => {
+		safeSpawnAsync.mockResolvedValue({
+			stdout: "",
+			stderr: "error: externally-managed-environment",
+			status: 1,
+		});
+		const { ensureTool, getInstallAttempt } = await installer();
+		expect(await ensureTool("cmake-language-server")).toBeUndefined();
+		expect(getInstallAttempt("cmake-language-server")?.reason).toContain(
+			"externally-managed-environment",
+		);
 	});
 
 	it("a successful install records succeeded", async () => {

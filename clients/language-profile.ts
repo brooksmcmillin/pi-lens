@@ -48,7 +48,13 @@ const PROJECT_MARKERS_BY_KIND: Partial<Record<FileKind, readonly string[]>> = {
 	sql: [".sqlfluff", "pyproject.toml"],
 	php: ["composer.json", "composer.lock"],
 	prisma: ["schema.prisma", "prisma/schema.prisma"],
-	java: ["pom.xml", "build.gradle", ".classpath"],
+	// #2870: `build.gradle.kts` is the Kotlin-DSL spelling of `build.gradle`
+	// and marks a Java module just as well — its absence here (and in
+	// ROOT_MARKERS_BY_KIND below) is what left a `.java` file in a
+	// Kotlin-DSL Gradle module resolving to the workspace root, where a
+	// polyglot repo's go.mod then claimed it. `kotlin` already lists both
+	// spellings; java listed only the Groovy one.
+	java: ["pom.xml", "build.gradle", "build.gradle.kts", ".classpath"],
 	kotlin: ["build.gradle.kts", "build.gradle", "pom.xml"],
 	swift: ["Package.swift"],
 	dart: ["pubspec.yaml"],
@@ -65,6 +71,8 @@ const PROJECT_MARKERS_BY_KIND: Partial<Record<FileKind, readonly string[]>> = {
 
 const ROOT_MARKERS_BY_KIND: Partial<Record<FileKind, readonly string[]>> = {
 	jsts: [
+		"biome.json",
+		"biome.jsonc",
 		"package.json",
 		"tsconfig.json",
 		"jsconfig.json",
@@ -95,7 +103,11 @@ const ROOT_MARKERS_BY_KIND: Partial<Record<FileKind, readonly string[]>> = {
 	sql: [".sqlfluff", "pyproject.toml", "setup.cfg", "tox.ini"],
 	php: ["composer.json", "composer.lock"],
 	prisma: ["prisma/schema.prisma", "schema.prisma"],
-	java: ["pom.xml", "build.gradle", ".classpath"],
+	// #2870: see PROJECT_MARKERS_BY_KIND.java above — this is the table
+	// `resolveLanguageRootForFile` walks, so the missing Kotlin-DSL spelling
+	// is what anchored a nested Gradle module's `.java` file at the
+	// workspace root.
+	java: ["pom.xml", "build.gradle", "build.gradle.kts", ".classpath"],
 	kotlin: ["build.gradle.kts", "build.gradle", "pom.xml"],
 	swift: ["Package.swift"],
 	dart: ["pubspec.yaml"],
@@ -109,6 +121,31 @@ const ROOT_MARKERS_BY_KIND: Partial<Record<FileKind, readonly string[]>> = {
 	csharp: DOTNET_CSHARP_ROOT_MARKERS,
 	fsharp: DOTNET_FSHARP_ROOT_MARKERS,
 };
+
+// Tool-owned configuration belongs beside the shared language vocabulary, but
+// not in ROOT_MARKERS_BY_KIND: these files are discovered by the tool, not by
+// the language root detector. Keeping them here lets runner cwd resolution
+// consume one canonical vocabulary without restoring a second seam-local map.
+const TOOL_MARKERS_BY_RUNNER: Readonly<Record<string, readonly string[]>> = {
+	ruff: ["ruff.toml", ".ruff.toml"],
+	oxlint: [".oxlintrc.json", "oxlint.config.js"],
+	"spellcheck/typos": ["_typos.toml", "typos.toml"],
+	yamllint: ["yamllint.yaml", "yamllint.yml"],
+	prettier: [".prettierignore"],
+};
+
+/** Return the one shared marker vocabulary used to anchor this file kind. */
+export function rootMarkersForFile(
+	filePath: string,
+	runner?: string,
+): readonly string[] {
+	const kind = detectFileKind(path.resolve(filePath));
+	const languageMarkers = kind ? (ROOT_MARKERS_BY_KIND[kind] ?? []) : [];
+	const toolMarkers = runner ? (TOOL_MARKERS_BY_RUNNER[runner] ?? []) : [];
+	return toolMarkers.length
+		? [...new Set([...languageMarkers, ...toolMarkers])]
+		: languageMarkers;
+}
 
 function hasProjectMarker(projectRoot: string, marker: string): boolean {
 	if (!marker.includes("*"))
@@ -229,7 +266,7 @@ export function resolveLanguageRootForFile(
 	const kind = detectFileKind(absoluteFilePath);
 	if (!kind) return path.resolve(workspaceRoot);
 
-	const markers = ROOT_MARKERS_BY_KIND[kind];
+	const markers = rootMarkersForFile(absoluteFilePath);
 	if (!markers || markers.length === 0) {
 		return path.resolve(workspaceRoot);
 	}

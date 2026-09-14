@@ -35,7 +35,9 @@
  * Usage:
  *   node scripts/smoke-tools.mjs [lang ...] [--step2] [--tier1] [--install] [--verbose]
  *   node scripts/smoke-tools.mjs --lsp [lang ...] [--install] [--verbose]
+ *   node scripts/smoke-tools.mjs --lsp-gate [lang ...] [--install] [--verbose]
  *   node scripts/smoke-tools.mjs --format [lang ...] [--install] [--verbose]
+ *   node scripts/smoke-tools.mjs --install --install-registry --installer-root=<path>
  *
  * Requires a built dist/ (run `npm run build:dist` first).
  */
@@ -77,6 +79,46 @@ export function matchDiagnosticMessages(pattern, diags) {
 }
 
 /**
+ * Classify the lsp_diagnostics clean-gate result (#2780/#2776). The gate
+ * deliberately counts the handler's primary bucket, not the raw diagnostic
+ * total: a server-authored source must not make an auxiliary finding look like
+ * proof that the configured primary answered.
+ */
+export function classifyLspGateResult(result, fx, unavailable = false) {
+	if (unavailable) {
+		return {
+			state: "skip",
+			detail: `${fx.serverHint} unavailable (tool not installed; pass --install)`,
+			diags: 0,
+		};
+	}
+	if (!result) {
+		return {
+			state: "fail",
+			detail: "lsp_diagnostics returned no result",
+			diags: 0,
+		};
+	}
+	const details = result.details ?? {};
+	const diags = Number(
+		details.totalDiagnostics ?? details.diagnostics?.length ?? 0,
+	);
+	const primary = Number(details.primaryDiagnosticsCount ?? 0);
+	if (primary > 0) {
+		return {
+			state: "pass",
+			detail: `lsp_diagnostics returned ${primary} primary finding${primary === 1 ? "" : "s"}`,
+			diags,
+		};
+	}
+	return {
+		state: "fail",
+		detail: `lsp_diagnostics returned ${diags} diagnostic(s) but 0 primary findings (auxiliary=${details.auxiliaryDiagnosticsCount ?? 0})`,
+		diags,
+	};
+}
+
+/**
  * Fixtures in the tier-1 parser lane (#1937): the ones whose tools install as a
  * pip package, an npm package, or a single GitHub-release binary, with no
  * language toolchain step. Those are the tools a scheduled job can install
@@ -92,11 +134,81 @@ export function tier1Fixtures() {
 }
 
 /**
+ * Classify one format smoke row from the formatter's typed result (#2767).
+ * `formatFile` intentionally reports an unavailable executable with
+ * `success: true`; the typed outcome must win over the success flag so the
+ * smoke lane reports an honest skip instead of a false formatting failure.
+ */
+export function classifyFormatRow(target, fx) {
+	if (target.outcome === "unavailable") {
+		const err = target.error ?? "unknown error";
+		return { status: "skip", detail: `tool not installed (${err})` };
+	}
+	if (!target.success) {
+		const err = target.error ?? "unknown error";
+		// A missing binary is "unavailable", not a failure (matches the rest
+		// of the harness — the runner is selected via config, but the tool
+		// isn't installed on this machine/runner).
+		if (/ENOENT|not found|not recognized|No such file/i.test(err)) {
+			return { status: "skip", detail: `tool not installed (${err})` };
+		}
+		return { status: "fail", detail: `formatter failed to run: ${err}` };
+	}
+	if (fx.expect === "preserve") {
+		// #1144: unconfigured workspace + no indentation evidence ⇒ the
+		// formatter must refuse rather than impose its stock style.
+		if (target.changed) {
+			return {
+				status: "fail",
+				detail: `${fx.formatter} rewrote an unconfigured file with no detectable style (style-preserving refusal expected)`,
+			};
+		}
+		return {
+			status: "pass",
+			detail: `${fx.formatter} preserved the unconfigured file`,
+		};
+	}
+	if (target.changed) {
+		return { status: "pass", detail: `${fx.formatter} reformatted the file` };
+	}
+	return {
+		status: "fail",
+		detail: "ran clean but left the mis-formatted file unchanged",
+	};
+}
+
+/**
  * One minimal real project per language. `targets` are the runner ids whose
  * tool we are smoke-testing; `expectDiagnostic` is the fixture's known defect
  * (used by --step2).
  */
 const FIXTURES = [
+	{
+		lang: "yaml-cwd",
+		dir: "tests/fixtures/tool-smoke/yaml-cwd",
+		file: "repo/bad.yaml",
+		cwd: "repo",
+		// #2691 recurrence: yamllint reads .yamllint from the process cwd.
+		targets: ["yamllint"],
+		tools: ["yamllint"],
+		tier1: true,
+		expectDiagnostic: true,
+		expectRule: "key-ordering",
+	},
+	{
+		// #2777 recurrence: a nested package's yamllint config must win over
+		// the dispatch root, and the smoke must retain the resolution witness.
+		lang: "yaml-nested-config",
+		dir: "tests/fixtures/tool-smoke/yaml-nested-config",
+		file: "packages/app/bad.yaml",
+		targets: ["yamllint"],
+		tools: ["yamllint"],
+		tier1: true,
+		expectDiagnostic: true,
+		expectRule: "key-ordering",
+		expectedCwd: "packages/app",
+		expectedReason: "marker:.yamllint",
+	},
 	{
 		lang: "typescript",
 		dir: "tests/fixtures/tool-smoke/typescript",
@@ -339,6 +451,28 @@ const LSP_FIXTURES = [
 		file: "bad.ts",
 		serverHint: "typescript-language-server",
 		tools: ["typescript-language-server"],
+		lspGate: true,
+		lspGateMarker: '"not a number"',
+	},
+	{
+		// #2777: the nested package marker must become the LSP root for this file.
+		lang: "typescript-nested-root-markers",
+		dir: "tests/fixtures/tool-smoke/typescript-nested-root-markers",
+		file: "packages/app/bad.ts",
+		serverHint: "typescript-language-server (nested rootMarkers)",
+		tools: ["typescript-language-server"],
+		rootMarkers: ["package.json"],
+		expectedCwd: "packages/app",
+		expectedReason: "marker:package.json",
+		expectedTool: "typescript-nested-root",
+		customServer: {
+			id: "typescript-nested-root",
+			name: "typescript-language-server (nested rootMarkers)",
+			extensions: [".ts"],
+			command: "typescript-language-server",
+			args: ["--stdio"],
+			rootMarkers: ["package.json"],
+		},
 	},
 	{
 		lang: "python",
@@ -399,6 +533,8 @@ const LSP_FIXTURES = [
 		file: "bad.json",
 		serverHint: "vscode-json-language-server",
 		tools: ["vscode-json-language-server"],
+		lspGate: true,
+		lspGateMarker: '"nested": { "ok": true },',
 	},
 	{
 		lang: "shell",
@@ -413,6 +549,8 @@ const LSP_FIXTURES = [
 		file: "bad.css",
 		serverHint: "vscode-css-language-server",
 		tools: ["vscode-css-languageserver"],
+		lspGate: true,
+		lspGateMarker: "#zzz",
 	},
 	{
 		lang: "html",
@@ -434,6 +572,8 @@ const LSP_FIXTURES = [
 		file: "bad.toml",
 		serverHint: "taplo",
 		tools: ["taplo"],
+		lspGate: true,
+		lspGateMarker: "[package",
 	},
 	{
 		lang: "terraform",
@@ -463,6 +603,8 @@ const LSP_FIXTURES = [
 		file: "bad.cue",
 		serverHint: "CUE Language Server (cue lsp serve)",
 		tools: ["cue"],
+		lspGate: true,
+		lspGateMarker: "a: {",
 		expectMessageMatch: "expected '\\}'|found 'EOF'",
 	},
 	{
@@ -579,6 +721,28 @@ const LSP_FIXTURES = [
 		file: "main.lua",
 		serverHint: "lua-language-server",
 		tools: ["lua-language-server"],
+	},
+	{
+		lang: "lua-custom-provenance",
+		dir: "tests/fixtures/tool-smoke/lua",
+		file: "main.lua",
+		serverHint: "fake custom lua server",
+		tools: [],
+		lspGate: true,
+		disableServers: ["lua"],
+		lspGateMarker: "diagnostic from pushed custom server",
+		customServer: {
+			id: "emmylua",
+			name: "probe custom emmylua",
+			extensions: [".lua"],
+			command: process.execPath,
+			args: [path.join(repoRoot, "tests/fixtures/fake-lsp-server.mjs")],
+			rootMarkers: [".git"],
+			env: {
+				FAKE_LSP_IGNORE_PULL: "1",
+				FAKE_LSP_PUSH_DIAGNOSTIC: "1",
+			},
+		},
 	},
 	{
 		lang: "cpp",
@@ -845,6 +1009,19 @@ const FORMAT_FIXTURES = [
 		tools: ["prettier"],
 	},
 	{
+		// #2777: the nested ignore is discovered from the formatter child cwd.
+		// The harness classifies the intentional no-change result as a visible
+		// preservation pass when the nested ignore is honored.
+		lang: "prettier-nested-ignore",
+		dir: "tests/fixtures/format-smoke/prettier-nested-ignore",
+		file: "packages/app/ignored.ts",
+		formatter: "prettier",
+		expect: "preserve",
+		tools: ["prettier"],
+		expectedCwd: "packages/app",
+		expectedReason: "marker:.prettierignore",
+	},
+	{
 		lang: "yaml",
 		dir: "tests/fixtures/format-smoke/yaml",
 		file: "messy.yaml",
@@ -988,7 +1165,7 @@ const FORMAT_FIXTURES = [
 		dir: "tests/fixtures/format-smoke/python-black",
 		file: "messy.py",
 		formatter: "black",
-		tools: [],
+		tools: ["black"],
 	},
 	{
 		lang: "ruby-standard",
@@ -1002,7 +1179,7 @@ const FORMAT_FIXTURES = [
 		dir: "tests/fixtures/format-smoke/cmake",
 		file: "messy.cmake",
 		formatter: "cmake-format",
-		tools: [],
+		tools: ["cmake-format"],
 	},
 	{
 		// oxfmt (the JS Oxidation Compiler formatter) is selected over biome via a
@@ -1012,7 +1189,7 @@ const FORMAT_FIXTURES = [
 		dir: "tests/fixtures/format-smoke/js-oxfmt",
 		file: "messy.js",
 		formatter: "oxfmt",
-		tools: [],
+		tools: ["oxfmt"],
 	},
 	// Standalone-binary formatters (no language runtime needed) — each fixture
 	// ships the config its detect() requires (stylua.toml / .cljfmt.edn /
@@ -1022,7 +1199,7 @@ const FORMAT_FIXTURES = [
 		dir: "tests/fixtures/format-smoke/lua",
 		file: "messy.lua",
 		formatter: "stylua",
-		tools: [],
+		tools: ["stylua"],
 	},
 	{
 		lang: "haskell",
@@ -1036,21 +1213,21 @@ const FORMAT_FIXTURES = [
 		dir: "tests/fixtures/format-smoke/clojure",
 		file: "messy.clj",
 		formatter: "cljfmt",
-		tools: [],
+		tools: ["cljfmt"],
 	},
 	{
 		lang: "php",
 		dir: "tests/fixtures/format-smoke/php",
 		file: "messy.php",
 		formatter: "php-cs-fixer",
-		tools: [],
+		tools: ["php-cs-fixer"],
 	},
 	{
 		lang: "java-gjf",
 		dir: "tests/fixtures/format-smoke/java-gjf",
 		file: "Messy.java",
 		formatter: "google-java-format",
-		tools: [],
+		tools: ["google-java-format"],
 	},
 	{
 		lang: "cpp",
@@ -1233,17 +1410,25 @@ function parseArgs(argv) {
 	let verbose = false;
 	let install = false;
 	let lsp = false;
+	let lspGate = false;
 	let format = false;
 	let autofix = false;
 	let tier1 = false;
 	let minPass = null;
-	for (const arg of argv) {
+	let installRegistry = false;
+	let installerRoot = null;
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i];
 		if (arg === "--step2") step2 = true;
 		else if (arg === "--verbose" || arg === "-v") verbose = true;
 		else if (arg === "--install") install = true;
 		else if (arg === "--lsp") lsp = true;
+		else if (arg === "--lsp-gate") lspGate = true;
 		else if (arg === "--format") format = true;
 		else if (arg === "--tier1") tier1 = true;
+		else if (arg === "--install-registry") installRegistry = true;
+		else if (arg.startsWith("--installer-root="))
+			installerRoot = arg.slice("--installer-root=".length);
 		else if (arg.startsWith("--min-pass="))
 			minPass = Number.parseInt(arg.slice("--min-pass=".length), 10);
 		else if (arg === "--autofix") autofix = true;
@@ -1255,14 +1440,43 @@ function parseArgs(argv) {
 		verbose,
 		install,
 		lsp,
+		lspGate,
 		format,
 		autofix,
 		tier1,
 		minPass,
+		installRegistry,
+		installerRoot,
 	};
 }
 
 const TMP_PREFIX = "pi-lens-smoke-";
+
+async function assertCwdResolutionLog(fixture, workspace, kind, tool) {
+	const extensionLog = await import(
+		pathToFileURL(path.join(repoRoot, "dist", "clients", "extension-log.js"))
+			.href
+	);
+	await extensionLog.flushExtensionLog();
+	const logPath = extensionLog.getExtensionLogPath();
+	const lines = fs.existsSync(logPath)
+		? fs.readFileSync(logPath, "utf8").trim().split("\n").filter(Boolean)
+		: [];
+	const expected =
+		`cwd ${kind} ${tool} cwd=${path.resolve(workspace, fixture.expectedCwd)} ` +
+		`reason=${fixture.expectedReason}`;
+	if (
+		!lines.some((line) => {
+			try {
+				return JSON.parse(line)?.message === expected;
+			} catch {
+				return false;
+			}
+		})
+	) {
+		throw new Error(`missing cwd resolution log: ${expected}`);
+	}
+}
 
 /** Sweep prior runs without deleting a workspace owned by a live process. */
 export function sweepLeftovers() {
@@ -1498,6 +1712,7 @@ export function classifyInstallOutcome(toolId, deps) {
 	if (attempt?.outcome !== "failed") {
 		return {
 			row: "skip",
+			networkUnreachable: false,
 			detail: `${toolId} unavailable (${attempt?.outcome ?? "no install attempt"}${attempt?.reason ? `: ${firstLine(attempt.reason)}` : ""})`,
 		};
 	}
@@ -1505,6 +1720,7 @@ export function classifyInstallOutcome(toolId, deps) {
 	if (TRANSIENT_NETWORK_PATTERN.test(reason)) {
 		return {
 			row: "skip",
+			networkUnreachable: true,
 			detail: `${toolId} unavailable (transient registry/network condition: ${firstLine(reason)})`,
 		};
 	}
@@ -1518,11 +1734,13 @@ export function classifyInstallOutcome(toolId, deps) {
 	if (!genuine) {
 		return {
 			row: "skip",
+			networkUnreachable: false,
 			detail: `${toolId} unavailable (no ${strategy ?? "known"} toolchain on this runner)`,
 		};
 	}
 	return {
 		row: "fail",
+		networkUnreachable: false,
 		detail: `ensureTool(${toolId}) failed (${strategy} toolchain present): ${firstLine(reason)}`,
 	};
 }
@@ -1606,8 +1824,135 @@ export async function ensureFixtureTools(
 	return { unavailableTools, attemptSnapshots };
 }
 
+/**
+ * Registry install lane (--install-registry, #2663): install every TOOLS
+ * entry whose installStrategy is npm or pip — the two strategies whose
+ * toolchain this harness itself guarantees (#2661: npm runs under Node, so it
+ * is always "present"; pip is probed through the installer's own
+ * `pipCommandCandidates` ladder) — and classify each unavailability with the
+ * SAME `classifyInstallOutcome` the fixture lanes use, so a dead registry
+ * entry (the #2638 `vscode-css-languageserver` shape) is one red row here
+ * instead of a ⚠ skip folded into "toolchain absent".
+ *
+ * The fixture lanes only exercise the registry entries their fixtures name;
+ * this lane sweeps the whole npm/pip registry, which is what the release gate
+ * (`scripts/release-qa.mjs`'s `tool-smoke-install` row) consumes.
+ *
+ * Output contract: ONE JSON document on stdout, human progress on stderr.
+ * Exit code (decided by the caller in main()): 0 when no genuine install
+ * failure, 1 otherwise. A network-unreachable classification is a SKIP here —
+ * the smoke's own semantics (#2661 F2: a runner with no network is a runner
+ * condition, not an installer defect) — and carries `networkUnreachable: true`
+ * so the release-qa consumer can refuse a ship verdict on an unmeasured lane
+ * instead of reading the skips as green.
+ *
+ * `deps` injects the installer surface for tests (the seam `runFormatSmoke`
+ * uses); production resolves it from dist/clients/installer. `toolchainPresence`
+ * is injectable for the same reason — the production value starts empty and
+ * caches probe results per strategy.
+ */
+export async function runInstallRegistrySmoke({
+	verbose,
+	deps,
+	installerRoot,
+} = {}) {
+	let ensureTool;
+	let TOOLS = [];
+	let getInstallAttempt;
+	let pipCommandCandidatesFn;
+	let toolchainPresence = {};
+	if (deps) {
+		({
+			ensureTool,
+			TOOLS,
+			getInstallAttempt,
+			pipCommandCandidates: pipCommandCandidatesFn,
+			toolchainPresence,
+		} = deps);
+	} else {
+		if (!installerRoot) {
+			console.error(
+				"installer root missing: --installer-root=<path> is required for the installed registry smoke",
+			);
+			process.exit(2);
+		}
+		const installerEntry = path.join(
+			installerRoot,
+			"dist",
+			"clients",
+			"installer",
+			"index.js",
+		);
+		if (!fs.existsSync(installerEntry)) {
+			console.error(
+				`dist build missing: ${installerEntry}\nRun \`npm run build:dist\` first.`,
+			);
+			process.exit(2);
+		}
+		({
+			ensureTool,
+			TOOLS,
+			getInstallAttempt,
+			pipCommandCandidates: pipCommandCandidatesFn,
+		} = await import(pathToFileURL(installerEntry).href));
+	}
+	const toolsById = new Map(TOOLS.map((t) => [t.id, t]));
+	const pipCandidates = pipCommandCandidatesFn?.() ?? [];
+	const targets = TOOLS.filter(
+		(t) => t.installStrategy === "npm" || t.installStrategy === "pip",
+	);
+	const { unavailableTools, attemptSnapshots } = await ensureFixtureTools(
+		targets.map((t) => t.id),
+		ensureTool,
+		getInstallAttempt,
+		(toolId, resolved) => {
+			if (verbose) {
+				console.error(`ensureTool(${toolId}) → ${resolved ?? "UNAVAILABLE"}`);
+			}
+		},
+	);
+	const results = [];
+	for (const tool of targets) {
+		if (!unavailableTools.has(tool.id)) {
+			results.push({
+				toolId: tool.id,
+				installStrategy: tool.installStrategy,
+				state: "pass",
+				detail: "resolved",
+				networkUnreachable: false,
+			});
+			continue;
+		}
+		const outcome = classifyInstallOutcome(tool.id, {
+			toolsById,
+			toolchainPresence,
+			pipCandidates,
+			getInstallAttempt: (toolId) => attemptSnapshots.get(toolId),
+		});
+		results.push({
+			toolId: tool.id,
+			installStrategy: tool.installStrategy,
+			state: outcome.row,
+			detail: outcome.detail,
+			networkUnreachable: outcome.networkUnreachable,
+		});
+	}
+	const genuineFailures = results.filter((r) => r.state === "fail");
+	return {
+		lane: "install-registry",
+		toolCount: results.length,
+		installed: results.filter((r) => r.state === "pass").length,
+		genuineFailures: genuineFailures.map((r) => r.toolId),
+		networkUnreachable: results
+			.filter((r) => r.networkUnreachable)
+			.map((r) => r.toolId),
+		ok: genuineFailures.length === 0,
+		results,
+	};
+}
+
 /** Classify one target runner's outcome against the Step-1 bar. */
-function classify(outcome) {
+export function classify(outcome) {
 	if (!outcome) {
 		return {
 			state: "skip",
@@ -1639,6 +1984,11 @@ function classify(outcome) {
 	};
 }
 
+/** Resolve the dispatch directory declared by a smoke row. */
+export function fixtureDispatchCwd(fixture, workspace) {
+	return path.resolve(workspace, fixture.cwd ?? ".");
+}
+
 // `setup-failed` (#530) is a distinct terminal state from `fail`: it means the
 // fixture's pre-touch setup step (e.g. `npm install typescript@7`) itself
 // broke — infrastructure, not the assertion under test — but it still counts
@@ -1665,6 +2015,155 @@ function report(rows, title) {
 		"Legend: ✓ ok  ✗ failure/setup-failed  ⚠ unavailable (not a failure)\n",
 	);
 	return counts.fail + counts["setup-failed"];
+}
+
+/**
+ * Gating LSP layer (#2780): run the real lsp_diagnostics handler against each
+ * installed primary fixture and require at least one primary finding. This is
+ * intentionally separate from the handshake layer, whose contract is only
+ * initialize-and-answer and therefore passed the #2776 provenance regression.
+ */
+async function runLspGate({ langs, install, verbose }) {
+	const lspToolEntry = path.join(
+		repoRoot,
+		"dist",
+		"tools",
+		"lsp-diagnostics.js",
+	);
+	const configEntry = path.join(
+		repoRoot,
+		"dist",
+		"clients",
+		"lsp",
+		"config.js",
+	);
+	if (!fs.existsSync(lspToolEntry) || !fs.existsSync(configEntry)) {
+		console.error(
+			`dist build missing: ${lspToolEntry}\nRun \`npm run build:dist\` first.`,
+		);
+		process.exit(2);
+	}
+	const { createLspDiagnosticsTool } = await import(
+		pathToFileURL(lspToolEntry).href
+	);
+	const { initLSPConfig } = await import(pathToFileURL(configEntry).href);
+	let ensureTool;
+	let getInstallAttempt;
+	let TOOLS_REGISTRY = [];
+	let pipCandidates = [];
+	{
+		const installerEntry = path.join(
+			repoRoot,
+			"dist",
+			"clients",
+			"installer",
+			"index.js",
+		);
+		let pipCommandCandidatesFn;
+		({
+			ensureTool,
+			TOOLS: TOOLS_REGISTRY,
+			getInstallAttempt,
+			pipCommandCandidates: pipCommandCandidatesFn,
+		} = await import(pathToFileURL(installerEntry).href));
+		pipCandidates = pipCommandCandidatesFn?.() ?? [];
+	}
+	const toolsById = new Map(TOOLS_REGISTRY.map((t) => [t.id, t]));
+	const toolchainPresence = {};
+	const selected = (
+		langs.length
+			? LSP_FIXTURES.filter((f) => langs.includes(f.lang))
+			: LSP_FIXTURES
+	).filter(
+		(f) => f.lspGate === true && !f.clean && !f.auxiliaryServerIds?.length,
+	);
+	if (selected.length === 0) {
+		console.log(`No opted-in LSP gate fixtures matched: ${langs.join(", ")}`);
+		return 0;
+	}
+	const rows = [];
+	for (const fx of selected) {
+		const { unavailableTools, attemptSnapshots } = await ensureFixtureTools(
+			fx.tools ?? [],
+			install
+				? ensureTool
+				: (toolId) => ensureTool(toolId, { allowInstall: false }),
+			getInstallAttempt,
+			(toolId, resolved) =>
+				verbose &&
+				console.error(
+					`[${fx.lang}] ensureTool(${toolId}) → ${resolved ?? "UNAVAILABLE"}`,
+				),
+		);
+		const unavailable =
+			(fx.tools ?? []).length > 0 &&
+			(fx.tools ?? []).every((t) => unavailableTools.has(t));
+		if (unavailable) {
+			const outcome = resolveUnavailabilityRow(
+				fx.tools ?? [],
+				unavailableTools,
+				attemptSnapshots,
+				{ toolsById, toolchainPresence, pipCandidates },
+				`${fx.serverHint} unavailable (tool not installed; pass --install)`,
+			);
+			rows.push({
+				lang: fx.lang,
+				runner: fx.serverHint,
+				state: outcome.row,
+				detail: outcome.detail,
+				diags: 0,
+			});
+			continue;
+		}
+		let workspace;
+		let absFile;
+		let cleanup;
+		try {
+			({ workspace, absFile, cleanup } = await bootstrapFixtureWorkspace(fx, {
+				initLSPConfig,
+				repoRoot,
+				tmpPrefix: "pi-lens-smoke-gate-",
+			}));
+			if (fx.setup) {
+				const setupResult = runFixtureSetup(fx.setup, workspace, verbose);
+				if (!setupResult.ok) {
+					rows.push({
+						lang: fx.lang,
+						runner: fx.serverHint,
+						state: "setup-failed",
+						detail: setupResult.detail,
+						diags: 0,
+					});
+					continue;
+				}
+			}
+			const result = await createLspDiagnosticsTool().execute(
+				`smoke-lsp-gate-${fx.lang}`,
+				{
+					path: absFile,
+					waitMs: LSP_DIAGNOSTICS_WAIT_MS,
+					serverScope: "primary",
+				},
+				undefined,
+				null,
+				{ cwd: workspace },
+			);
+			const verdict = classifyLspGateResult(result, fx);
+			rows.push({ lang: fx.lang, runner: fx.serverHint, ...verdict });
+			if (verbose) console.error(`[${fx.lang}] ${verdict.detail}`);
+		} catch (err) {
+			rows.push({
+				lang: fx.lang,
+				runner: fx.serverHint,
+				state: "fail",
+				detail: `lsp_diagnostics error: ${err?.message ?? err}`,
+				diags: 0,
+			});
+		} finally {
+			cleanup?.();
+		}
+	}
+	return report(rows, "LSP clean-gate (lsp_diagnostics primary findings)");
 }
 
 /**
@@ -1847,6 +2346,14 @@ async function runLspHandshake({ langs, install, verbose }) {
 				// survives either build; `undefined` still means "no client became
 				// ready" (skip semantics unchanged).
 				touchedDiags = Array.isArray(touched) ? touched : touched?.diags;
+				if (fx.expectedCwd && touchedDiags) {
+					await assertCwdResolutionLog(
+						fx,
+						workspace,
+						"lsp",
+						fx.expectedTool ?? fx.serverHint,
+					);
+				}
 				if (!auxRe) break;
 				const hit = (touchedDiags ?? []).some((d) =>
 					auxRe.test(d.source || ""),
@@ -2080,18 +2587,20 @@ async function runLspHandshake({ langs, install, verbose }) {
  * sqlfluff fix, biome, dart …), so this also covers the safe-autofix path.
  * Returns the failure count.
  */
-async function runFormatSmoke({ langs, install, verbose }) {
+export async function runFormatSmoke({ langs, install, verbose, deps }) {
 	const fmtEntry = path.join(repoRoot, "dist", "clients", "format-service.js");
-	if (!fs.existsSync(fmtEntry)) {
+	if (!deps && !fs.existsSync(fmtEntry)) {
 		console.error(
 			`dist build missing: ${fmtEntry}\nRun \`npm run build:dist\` first.`,
 		);
 		process.exit(2);
 	}
-	const { getFormatService } = await import(pathToFileURL(fmtEntry).href);
-	const formatService = getFormatService();
+	const formatService = deps?.getFormatService
+		? deps.getFormatService()
+		: (await import(pathToFileURL(fmtEntry).href)).getFormatService();
 
 	let ensureTool;
+	let getInstallAttempt;
 	if (install) {
 		const installerEntry = path.join(
 			repoRoot,
@@ -2100,7 +2609,13 @@ async function runFormatSmoke({ langs, install, verbose }) {
 			"installer",
 			"index.js",
 		);
-		({ ensureTool } = await import(pathToFileURL(installerEntry).href));
+		if (deps) {
+			({ ensureTool, getInstallAttempt } = deps);
+		} else {
+			({ ensureTool, getInstallAttempt } = await import(
+				pathToFileURL(installerEntry).href
+			));
+		}
 	}
 
 	const selected = langs.length
@@ -2113,16 +2628,19 @@ async function runFormatSmoke({ langs, install, verbose }) {
 
 	const rows = [];
 	for (const fx of selected) {
-		if (install && ensureTool) {
-			for (const toolId of fx.tools ?? []) {
-				const resolved = await ensureTool(toolId);
+		await ensureFixtureTools(
+			install ? (fx.tools ?? []) : [],
+			ensureTool,
+			getInstallAttempt,
+			(toolId, resolved) => {
+				deps?.onEnsure?.(toolId, resolved);
 				if (verbose) {
 					console.error(
 						`[${fx.lang}] ensureTool(${toolId}) → ${resolved ?? "UNAVAILABLE"}`,
 					);
 				}
-			}
-		}
+			},
+		);
 		const workspace = copyDirToTemp(fx.dir);
 		const absFile = path.join(workspace, fx.file);
 		const push = (state, detail) =>
@@ -2154,32 +2672,20 @@ async function runFormatSmoke({ langs, install, verbose }) {
 				);
 				continue;
 			}
-			if (!target.success) {
-				const err = target.error ?? "unknown error";
-				// A missing binary is "unavailable", not a failure (matches the rest
-				// of the harness — the runner is selected via config, but the tool
-				// isn't installed on this machine/runner).
-				if (/ENOENT|not found|not recognized|No such file/i.test(err)) {
-					push("skip", `tool not installed (${err})`);
-				} else {
-					push("fail", `formatter failed to run: ${err}`);
-				}
-			} else if (fx.expect === "preserve") {
-				// #1144: unconfigured workspace + no indentation evidence ⇒ the
-				// formatter must refuse rather than impose its stock style.
-				if (target.changed) {
-					push(
-						"fail",
-						`${fx.formatter} rewrote an unconfigured file with no detectable style (style-preserving refusal expected)`,
+			let verdict = classifyFormatRow(target, fx);
+			if (fx.expectedCwd && target.outcome !== "unavailable") {
+				try {
+					await assertCwdResolutionLog(
+						fx,
+						workspace,
+						"formatter",
+						fx.formatter,
 					);
-				} else {
-					push("pass", `${fx.formatter} preserved the unconfigured file`);
+				} catch (err) {
+					verdict = { status: "fail", detail: err?.message ?? String(err) };
 				}
-			} else if (target.changed) {
-				push("pass", `${fx.formatter} reformatted the file`);
-			} else {
-				push("fail", "ran clean but left the mis-formatted file unchanged");
 			}
+			push(verdict.status, verdict.detail);
 		} catch (err) {
 			push("fail", `error: ${err?.message ?? err}`);
 		} finally {
@@ -2317,10 +2823,13 @@ async function main() {
 		verbose,
 		install,
 		lsp,
+		lspGate,
 		format,
 		autofix,
 		tier1,
 		minPass,
+		installRegistry,
+		installerRoot,
 	} = parseArgs(process.argv.slice(2));
 
 	// Clean leftovers from prior runs (their file locks are released now).
@@ -2328,10 +2837,20 @@ async function main() {
 	if (verbose && swept > 0)
 		console.error(`swept ${swept} leftover temp workspace(s)`);
 
+	if (installRegistry) {
+		const result = await runInstallRegistrySmoke({ verbose, installerRoot });
+		console.log(JSON.stringify(result));
+		process.exit(result.ok ? 0 : 1);
+	}
+
 	if (lsp) {
 		process.exit(
 			(await runLspHandshake({ langs, install, verbose })) > 0 ? 1 : 0,
 		);
+	}
+
+	if (lspGate) {
+		process.exit((await runLspGate({ langs, install, verbose })) > 0 ? 1 : 0);
 	}
 
 	if (format) {
@@ -2404,8 +2923,21 @@ async function main() {
 		}
 		const workspace = copyDirToTemp(fixture.dir);
 		const absFile = path.join(workspace, fixture.file);
+		const previousProcessCwd = process.cwd();
 		try {
-			const { runners } = await dispatchLintDetailed(absFile, workspace, pi, {
+			const dispatchCwd = fixtureDispatchCwd(fixture, workspace);
+			if (fixture.lang === "yaml-cwd") {
+				// #2691 recurrence: the host cwd is a decoy. The runner must use
+				// the dispatch cwd when yamllint discovers its configuration.
+				const decoy = path.join(workspace, "host-cwd-decoy");
+				fs.mkdirSync(decoy);
+				fs.writeFileSync(
+					path.join(decoy, ".yamllint"),
+					"rules:\n  key-ordering: disable\n",
+				);
+				process.chdir(decoy);
+			}
+			const { runners } = await dispatchLintDetailed(absFile, dispatchCwd, pi, {
 				blockingOnly: false,
 			});
 			if (verbose) {
@@ -2426,6 +2958,14 @@ async function main() {
 			for (const target of fixture.targets) {
 				const outcome = runners.find((r) => r.runnerId === target);
 				const verdict = classify(outcome);
+				if (fixture.expectedCwd && verdict.state !== "skip") {
+					try {
+						await assertCwdResolutionLog(fixture, workspace, "runner", target);
+					} catch (err) {
+						verdict.state = "fail";
+						verdict.detail = err?.message ?? String(err);
+					}
+				}
 				// Step 2: a tool that ran clean but found nothing on a known defect fails.
 				if (
 					step2 &&
@@ -2436,6 +2976,25 @@ async function main() {
 					verdict.state = "fail";
 					verdict.detail =
 						"ran clean but produced no diagnostic on known defect";
+				}
+				if (
+					step2 &&
+					verdict.state === "pass" &&
+					fixture.expectRule &&
+					!outcome?.result.diagnostics.some(
+						(diagnostic) => diagnostic.rule === fixture.expectRule,
+					)
+				) {
+					verdict.state = "fail";
+					verdict.detail = `did not produce expected ${fixture.expectRule} diagnostic`;
+				}
+				if (
+					verdict.state === "pass" &&
+					fixture.expectDiagnosticCount !== undefined &&
+					verdict.diags !== fixture.expectDiagnosticCount
+				) {
+					verdict.state = "fail";
+					verdict.detail = `expected exactly ${fixture.expectDiagnosticCount} diagnostic(s), got ${verdict.diags}`;
 				}
 				rows.push({ lang: fixture.lang, runner: target, ...verdict });
 			}
@@ -2450,6 +3009,7 @@ async function main() {
 				});
 			}
 		} finally {
+			process.chdir(previousProcessCwd);
 			safeRm(workspace);
 		}
 	}

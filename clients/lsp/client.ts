@@ -16,6 +16,7 @@ import { pathToFileURL } from "node:url";
 import { emitBounded } from "../bounded-telemetry.js";
 import { withTimeout } from "../deadline-utils.js";
 import { minimatch } from "../deps/minimatch.js";
+import { mapWithConcurrency } from "../map-with-concurrency.js";
 import {
 	incrementDegradationCount,
 	recordDegradationOnce,
@@ -114,6 +115,8 @@ export interface LSPDiagnostic {
 	};
 	code?: string | number;
 	source?: string;
+	/** Registered server that delivered this diagnostic. Not LSP protocol data. */
+	serverId?: string;
 }
 
 export interface LSPPullFailure {
@@ -762,27 +765,6 @@ const WORKSPACE_PULL_SCOPE = "*workspace*";
 // protocol reply, never something worth tuning per project.
 const REFRESH_REPULL_CONCURRENCY = 4;
 
-/** Run `mapper` over `items` with at most `concurrency` in flight at once.
- *  Same shape as `dependency-checker.ts`'s helper of the same name — a
- *  worker-pool pattern repeated per-file by design in this codebase rather
- *  than shared, so each caller can keep it un-exported and file-local. */
-async function mapWithConcurrency<T>(
-	items: readonly T[],
-	concurrency: number,
-	mapper: (item: T) => Promise<void>,
-): Promise<void> {
-	if (items.length === 0) return;
-	let nextIndex = 0;
-	const workerCount = Math.max(1, Math.min(concurrency, items.length));
-	const worker = async (): Promise<void> => {
-		while (true) {
-			const index = nextIndex++;
-			if (index >= items.length) return;
-			await mapper(items[index]);
-		}
-	};
-	await Promise.all(Array.from({ length: workerCount }, () => worker()));
-}
 // Anti-deadlock backstop for workspace/executeCommand. Deliberately generous
 // (30s): the command is mutating and legitimately long-running (a real server
 // refactor / organize-imports), so this must not truncate valid work — it only
@@ -2246,6 +2228,7 @@ export function resolveConfigurationSection(
 export function setupIncomingHandlers(
 	state: LSPClientState,
 	initialization: Record<string, unknown> | undefined,
+	onDiagnosticsPublished?: (serverId: string) => void,
 ): void {
 	state.connection.onNotification(
 		"textDocument/publishDiagnostics",
@@ -2266,6 +2249,7 @@ export function setupIncomingHandlers(
 			// Do not resurrect diagnostics or their content binding for a document
 			// that is no longer open on this client.
 			if (state.closedDocuments?.has(normalizedPath)) return;
+			onDiagnosticsPublished?.(state.serverId);
 			const newDiags = normalizeLspDiagnostics(params.diagnostics || []);
 			const docVersion = params.version;
 			if (PUB_DEBUG) {
@@ -5123,6 +5107,7 @@ export async function createLSPClient(options: {
 	 *  single-variant server or not yet reported; consumers must treat that as
 	 *  the classic/default behavior (fail-safe). */
 	launchVariant?: "classic" | "native-ts7";
+	onDiagnosticsPublished?: (serverId: string) => void;
 }): Promise<LSPClientInfo> {
 	installCrashGuard();
 
@@ -5134,6 +5119,7 @@ export async function createLSPClient(options: {
 		initialization,
 		initializeTimeoutMs = INITIALIZE_TIMEOUT_MS,
 		launchVariant,
+		onDiagnosticsPublished,
 	} = options;
 
 	// #449/#472: register this LSP child in the cross-process instance registry
@@ -5353,7 +5339,7 @@ export async function createLSPClient(options: {
 		);
 	});
 
-	setupIncomingHandlers(state, initialization);
+	setupIncomingHandlers(state, initialization, onDiagnosticsPublished);
 	connection.listen();
 	setupConnectionLifecycle(state, recentStderr);
 

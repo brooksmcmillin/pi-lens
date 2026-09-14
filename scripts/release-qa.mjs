@@ -63,6 +63,9 @@
  *     --poll-cap-ms <n>    cap for polled async rows (default 120000)
  *     --git-ref <ref>      enable the git-install row against this pushed ref
  *     --keep               leave the scratch root on disk
+ *     --scratch-root <dir> use this directory as the scratch root instead of
+ *                          a fresh mkdtemp dir (created when missing; a
+ *                          pre-existing directory is never removed on exit)
  *
  * Node-only, no new dependency. Every spawn is shell-free (execFile/spawn with
  * an argv array) per AGENTS.md.
@@ -92,6 +95,24 @@ import { parseTable } from "./lib/md-matrix.mjs";
 const EXPECTED_SKILL_REGISTRAR = "extension:index";
 /** How many skills pi-lens ships: one SKILL.md per dir under `skills`. */
 const MIN_SHIPPED_SKILLS = 4;
+
+/**
+ * The baseline row that witnesses the installer registry (#2663): every
+ * npm/pip entry installs for real through the tool smoke's registry install
+ * lane, a genuine install failure is do-not-ship, and a registry-unreachable
+ * classification refuses the ship verdict instead of reading as green.
+ */
+export const TOOL_SMOKE_INSTALL_ROW_ID = "tool-smoke-install";
+
+/**
+ * The baseline row that witnesses the RELEASE WORKFLOW's own publish
+ * toolchain (#2940): `release.yml`'s publish job runs npm through
+ * `npx -y "npm@<packageManager pin>"`, and until this row nothing ever ran
+ * that path before a real release. 9183f39c6 left `npm publish` bare, so the
+ * v4.1.6 run tagged, released, and then took an E404 from the registry
+ * because Node 22's bundled npm has no OIDC trusted-publishing support.
+ */
+export const PUBLISH_TOOLCHAIN_ROW_ID = "publish-toolchain-pinned";
 
 /**
  * Short, schema-stable marker for the baseline's matrix table. Deliberately the
@@ -330,6 +351,19 @@ export function shipVerdict(results, options = {}) {
 			caveats: failed.map((r) => `${r.id}: ${r.detail}`),
 		};
 	}
+	// #2663: the tool-smoke install row is the release gate's ground truth for
+	// the installer registry. A registry-unreachable classification (the
+	// smoke's own transient-network branch) means that lane is UNMEASURED —
+	// its skips are not green — so the run refuses a ship verdict even where
+	// other rows passed. A genuine install failure outranks it (above): a real
+	// defect is a verdict, not an unmeasurable run.
+	if (options.inconclusiveReason) {
+		return {
+			verdict: "INCONCLUSIVE",
+			reason: options.inconclusiveReason,
+			caveats: [],
+		};
+	}
 	const caveats = list.filter(
 		(r) => r.outcome === OUTCOME.UNTESTED || r.outcome === OUTCOME.SKIPPED,
 	);
@@ -526,6 +560,334 @@ export function classifySelftestOutput(code, stdout) {
 }
 
 /**
+ * The tool-smoke install lane's report → the row's probe verdict (#2663).
+ *
+ *   - any genuine install failure (the smoke's red row, #2661) → `"fail"`:
+ *     the row FAILs and the run is do-not-ship (exit 1);
+ *   - no genuine failure but at least one registry-unreachable tool →
+ *     `"unreachable"` with `networkBlocked: true`: the lane is UNMEASURED, so
+ *     the run refuses a ship verdict (INCONCLUSIVE, exit 3) instead of
+ *     reading the skips as green;
+ *   - otherwise → `"pass"`: every entry resolved, with the legitimately
+ *     unavailable ones (toolchain absent, declined) named in the detail.
+ *
+ * The classification itself is never re-derived here — the row/skip verdict
+ * per tool is the smoke's `classifyInstallOutcome` (#2661), consumed through
+ * the lane's JSON; this function only maps that verdict onto the release
+ * gate's outcomes.
+ *
+ * A lane that produced no parseable report — crashed, missing dist build,
+ * timed out — is `"error"`: the check did not run, and a release gate whose
+ * check did not run is not a pass. `toolCount === 0` is the same refusal: a
+ * lane that enumerated no npm/pip entries witnessed nothing.
+ *
+ * @param {{ lane?: string, toolCount?: number, installed?: number, ok?: boolean, results?: Array<{ toolId: string, state: string, detail?: string, networkUnreachable?: boolean }> } | null} report
+ * @param {{ exitCode?: number, stderrTail?: string, timedOut?: boolean, stdout?: string }} [context]
+ */
+export function classifyToolSmokeInstallReport(report, context = {}) {
+	const stderrTail = String(context.stderrTail ?? "")
+		.trim()
+		.split(/\r?\n/)
+		.filter((l) => l.trim().length > 0)
+		.slice(-1)[0];
+	const witnessContent = report
+		? JSON.stringify(report)
+		: String(context.stdout ?? "");
+	if (!report) {
+		const why = context.timedOut
+			? "the install lane timed out"
+			: `the install lane produced no parseable result${
+					context.exitCode ? ` (exit ${context.exitCode})` : ""
+				}`;
+		return {
+			status: "error",
+			detail: `${why}${stderrTail ? `: ${stderrTail}` : ""}`,
+			shows: why,
+			networkBlocked: false,
+			witnessContent,
+		};
+	}
+	if (!Number.isInteger(report.toolCount) || report.toolCount <= 0) {
+		return {
+			status: "error",
+			detail: "the install lane enumerated no npm/pip registry entries",
+			shows: "install lane enumerated no npm/pip registry entries",
+			networkBlocked: false,
+			witnessContent,
+		};
+	}
+	const results = report.results ?? [];
+	const failures = results.filter((r) => r?.state === "fail");
+	if (failures.length > 0) {
+		const shows = `${failures.length} genuine install failure(s): ${failures
+			.map((f) => f.detail || f.toolId)
+			.join("; ")}`;
+		return {
+			status: "fail",
+			detail: shows,
+			shows,
+			networkBlocked: false,
+			witnessContent,
+		};
+	}
+	const network = results.filter((r) => r?.networkUnreachable);
+	if (network.length > 0) {
+		const shows =
+			`registry unreachable for ${network.length} npm/pip ` +
+			`${network.length === 1 ? "entry" : "entries"} ` +
+			`(${network.map((r) => r.toolId).join(", ")}); install ground truth unmeasured`;
+		return {
+			status: "unreachable",
+			detail: shows,
+			shows,
+			networkBlocked: true,
+			witnessContent,
+		};
+	}
+	const skips = results.filter((r) => r?.state === "skip");
+	const shows =
+		`${report.installed}/${report.toolCount} npm/pip registry entries resolved` +
+		(skips.length > 0
+			? `; ${skips.length} legitimately unavailable (${skips
+					.map((s) => s.toolId)
+					.join(", ")})`
+			: "");
+	return {
+		status: "pass",
+		detail: shows,
+		shows,
+		networkBlocked: false,
+		witnessContent,
+	};
+}
+
+/**
+ * A SKIPPED row refuses the run's ship verdict only when the lane it names
+ * was UNMEASURED (#2663) — not merely because the row was unreachable.
+ *
+ * The two are different states and were conflated: `main()` used to read any
+ * `"unreachable"` probe as the registry lane's network-blocked verdict, so
+ * `git-install-loads` without `--git-ref` turned every working-tree run
+ * INCONCLUSIVE, against this runner's own documented contract that such a run
+ * is the expected exit 2 (`docs/release-qa-baseline.md`, "Outcomes"; the skill
+ * says the same). #2940's publish-toolchain row is the second reachability
+ * skip, which is what made the conflation worth naming rather than living on
+ * as one `if` inside `main()`.
+ *
+ * @param {{ status?: string, unmeasured?: boolean } | null | undefined} probe
+ */
+export function isUnmeasured(probe) {
+	return probe?.status === "unreachable" && probe?.unmeasured === true;
+}
+
+/** Return the rows whose registry-dependent probe could not run. */
+export function unmeasuredRowIds(results) {
+	return (results ?? [])
+		.filter((row) => row.unmeasured === true || isUnmeasured(row))
+		.map((row) => row.id);
+}
+
+/**
+ * The publish job's toolchain → the release-QA row's verdict (#2940).
+ *
+ * Two things have to hold, in this order, and the FIRST is the one the
+ * v4.1.6 release found the hard way: the npm that answers the pinned
+ * invocation must BE the pin (a bare `npm`, a dropped `-y`, or an npx that
+ * fell back to the runner's bundled 10.x all answer something else), and the
+ * dry-run publish through it must exit 0.
+ *
+ * @param {{ pin?: string, reportedVersion?: string, dryRunExitCode?: number, dryRunTail?: string }} observed
+ */
+export function classifyPublishToolchain(observed) {
+	const pin = String(observed?.pin ?? "").trim();
+	if (!pin) {
+		const shows =
+			"package.json carries no `packageManager` npm pin, so the publish " +
+			"job's toolchain is undefined";
+		return { status: "error", detail: shows, shows };
+	}
+	const reported = String(observed?.reportedVersion ?? "").trim();
+	if (reported !== pin) {
+		const shows =
+			`the pinned invocation answered npm ${reported || "(nothing)"}, ` +
+			`expected the pin ${pin} — this is the 9183f39c6 shape: publish ran ` +
+			"a different npm than the one the workflow pins";
+		return { status: "fail", detail: shows, shows };
+	}
+	const exitCode = observed?.dryRunExitCode;
+	const lines = String(observed?.dryRunTail ?? "")
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter(Boolean);
+	if (exitCode !== 0) {
+		const conflict = lines.find((line) =>
+			/EPUBLISHCONFLICT|cannot publish over the previously published versions/i.test(
+				line,
+			),
+		);
+		if (conflict) {
+			const shows =
+				`npm ${pin} publish --dry-run reached the registry and packed the tarball; ` +
+				`the version is already published (${conflict})`;
+			return { status: "pass", detail: shows, shows };
+		}
+		const cause =
+			lines
+				.filter(
+					(line) =>
+						/^npm (?:error|ERR!)/i.test(line) &&
+						!/complete log can be found/i.test(line),
+				)
+				.slice(-1)[0] ?? lines.slice(-3).join(" | ");
+		const shows =
+			`npm ${pin} publish --dry-run exited ${exitCode ?? "(no exit code)"}` +
+			`${cause ? `: ${cause}` : ""}`;
+		return { status: "fail", detail: shows, shows };
+	}
+	const shows = `npx -y "npm@${pin}" reported ${pin} and its publish --dry-run exited 0`;
+	return { status: "pass", detail: shows, shows };
+}
+
+/**
+ * Drive the publish job's toolchain path over the exported candidate (#2940).
+ *
+ * Runs only in the scratch EXPORT: a dry-run publish fires this package's own
+ * `prepack`/`prepare`, so it may never run in the live checkout — the same
+ * reason `exportHeadForPack` exists.
+ *
+ * @param {{ exportRoot: string, exportedCommit?: string, env: NodeJS.ProcessEnv }} ctx
+ */
+export function runPublishToolchainProbe(ctx) {
+	if (!ctx.exportedCommit) {
+		return {
+			status: "unreachable",
+			unmeasured: false,
+			detail:
+				"no candidate tree was exported (--from npm:…): a dry-run publish " +
+				"runs this package's prepack/prepare, so it is driven only against " +
+				"the scratch export, never the live checkout",
+		};
+	}
+	let pin = "";
+	try {
+		const manifest = JSON.parse(
+			fs.readFileSync(path.join(ctx.exportRoot, "package.json"), "utf8"),
+		);
+		// The workflow's own derivation, character for character:
+		// `packageManager.replace(/^npm@/, '')`.
+		pin = String(manifest.packageManager ?? "").replace(/^npm@/, "");
+	} catch (err) {
+		return {
+			status: "error",
+			detail: `could not read the export's package.json: ${err?.message || err}`,
+		};
+	}
+	let reportedVersion = "";
+	try {
+		reportedVersion = pinnedNpm(pin, ["--version"], ctx.exportRoot, ctx.env);
+	} catch (err) {
+		const detail = `the pinned invocation did not run: ${(err?.stderr || err?.message || err).toString().slice(0, 300)}`;
+		return { status: "unreachable", unmeasured: true, detail, shows: detail };
+	}
+	let dryRunOutput = "";
+	let dryRunExitCode = 0;
+	try {
+		dryRunOutput = pinnedNpm(
+			pin,
+			["publish", "--dry-run"],
+			ctx.exportRoot,
+			ctx.env,
+		);
+	} catch (err) {
+		dryRunOutput = `${err?.stdout ?? ""}${err?.stderr ?? ""}`;
+		dryRunExitCode = typeof err?.status === "number" ? err.status : 1;
+	}
+	const classified = classifyPublishToolchain({
+		pin,
+		reportedVersion,
+		dryRunExitCode,
+		dryRunTail: dryRunOutput,
+	});
+	return {
+		...classified,
+		witness: {
+			ext: "txt",
+			content:
+				`$ npx -y "npm@${pin}" --version\n${reportedVersion}\n` +
+				`$ npx -y "npm@${pin}" publish --dry-run (exit ${dryRunExitCode})\n${dryRunOutput}`,
+		},
+	};
+}
+
+/**
+ * Run the installed smoke boundary for the registry baseline row.
+ * @param {{ exportRoot: string, installedPkgDir: string, projectDir: string, env: NodeJS.ProcessEnv }} ctx
+ * @returns {{ status: string, detail: string, shows?: string, witness?: { ext: string, content: string } }}
+ */
+export function runToolSmokeInstallProbe(ctx) {
+	if (!ctx.installedPkgDir) {
+		return {
+			status: "error",
+			detail: "installer root is missing; installed registry was not measured",
+		};
+	}
+	const script = path.join(ctx.exportRoot, "scripts", "smoke-tools.mjs");
+	if (!fs.existsSync(script)) {
+		return {
+			status: "fail",
+			detail: `smoke-tools.mjs is not in the export root (${script})`,
+		};
+	}
+	let report = null;
+	let context = {};
+	const parseSmokeOutput = (stdout) => {
+		try {
+			return { report: JSON.parse(String(stdout ?? "").trim()) };
+		} catch {
+			return { context: { stdout } };
+		}
+	};
+	try {
+		const stdout = execFileSync(
+			process.execPath,
+			[
+				script,
+				"--install",
+				"--install-registry",
+				`--installer-root=${ctx.installedPkgDir}`,
+			],
+			{
+				cwd: ctx.projectDir,
+				encoding: "utf8",
+				env: ctx.env,
+				timeout: 900_000,
+				maxBuffer: 10 * 1024 * 1024,
+			},
+		);
+		({ report, context } = parseSmokeOutput(stdout));
+	} catch (err) {
+		({ report, context } = parseSmokeOutput(err?.stdout));
+		context = {
+			...context,
+			exitCode: err?.status,
+			stderrTail: err?.stderr,
+			timedOut: Boolean(err?.killed),
+		};
+	}
+	const classified = classifyToolSmokeInstallReport(report, context);
+	return {
+		status: classified.status,
+		detail: classified.detail,
+		shows: classified.shows,
+		// The lane's registry-unreachable verdict is what refuses the ship
+		// verdict (#2663) — carried explicitly so `main()` reads THIS state
+		// rather than "any skipped row" (see isUnmeasured).
+		unmeasured: classified.networkBlocked,
+		witness: { ext: "json", content: classified.witnessContent },
+	};
+}
+
+/**
  * Hard Rule 1, as code: a row is PASS only when an artifact SHOWS the pass
  * criterion (#2619 review, cells C7 and C7b).
  *
@@ -717,6 +1079,7 @@ export function renderReport({
 
 const IS_WINDOWS = process.platform === "win32";
 const NPM_BIN = IS_WINDOWS ? "npm.cmd" : "npm";
+const NPX_BIN = IS_WINDOWS ? "npx.cmd" : "npx";
 const REPO_ROOT = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
 	"..",
@@ -735,6 +1098,7 @@ export function parseArgs(argv) {
 		pollCapMs: DEFAULT_POLL_CAP_MS,
 		gitRef: undefined,
 		keep: false,
+		scratchRoot: undefined,
 	};
 	// Every value-taking option reads its value through `value()`, which
 	// refuses a missing one. A trailing `--pi` used to leave `opts.pi`
@@ -763,6 +1127,7 @@ export function parseArgs(argv) {
 			}
 			opts.pollCapMs = parsed;
 		} else if (arg === "--keep") opts.keep = true;
+		else if (arg === "--scratch-root") opts.scratchRoot = value(++i, arg);
 		else throw new Error(`unknown option: ${arg}`);
 	}
 	return opts;
@@ -804,6 +1169,29 @@ export function npm(args, cwd, env) {
 }
 
 /**
+ * npm through the PINNED invocation `release.yml` publishes with — the same
+ * `npx -y "npm@<pin>"` argv, so this row exercises the release's toolchain
+ * rather than whatever npm is on PATH (#2940). Shell-free, and `env` is
+ * required for the same reason {@link npm}'s is: this spawns our own
+ * `prepack`/`prepare`.
+ */
+export function pinnedNpm(pin, args, cwd, env) {
+	if (!env) {
+		throw new Error(
+			"pinnedNpm() requires the pinned scratch env: a dry-run publish runs " +
+				"pi-lens's own prepare/prepack (#2619 review F1/N1)",
+		);
+	}
+	return execFileSync(NPX_BIN, ["-y", `npm@${pin}`, ...args], {
+		cwd,
+		encoding: "utf8",
+		timeout: NPM_TIMEOUT_MS,
+		env,
+		maxBuffer: 10 * 1024 * 1024,
+	});
+}
+
+/**
  * The scratch environment EVERY child process below runs under — `pi`, the
  * MCP server, `node`, and `npm` alike.
  *
@@ -828,14 +1216,23 @@ export function npm(args, cwd, env) {
  */
 export function scratchEnv(scratchRoot, extra = {}) {
 	const home = path.join(scratchRoot, "home");
+	// Keep only process settings needed to find the host tools and preserve their
+	// locale. In particular, never inherit host package-manager policy overrides.
 	return {
-		...process.env,
+		...Object.fromEntries(
+			["PATH", "Path", "PATHEXT", "SystemRoot", "LANG", "LC_ALL", "CI"]
+				.filter((key) => process.env[key] !== undefined)
+				.map((key) => [key, process.env[key]]),
+		),
 		HOME: home,
 		USERPROFILE: home,
 		PI_LENS_HOME: path.join(home, ".pi-lens"),
 		PILENS_DATA_DIR: path.join(home, ".pilens-data"),
 		PI_LENS_INSTALL_LOG: path.join(home, ".pi-lens", "install.log"),
 		npm_config_cache: path.join(scratchRoot, "npm-cache"),
+		// HOME is scratch-pinned, so this deliberately permits pip to measure
+		// package resolution instead of letting PEP 668 hide dead registry entries.
+		PIP_BREAK_SYSTEM_PACKAGES: "1",
 		ANTHROPIC_API_KEY:
 			process.env.ANTHROPIC_API_KEY || "sk-ant-dummy-release-qa",
 		...extra,
@@ -1492,11 +1889,73 @@ const ROW_PROBES = {
 			},
 		};
 	},
+
+	// The installer registry's ground truth (#2663): the smoke's install lane
+	// runs its harness from the exported source tree but loads the INSTALLED
+	// package's own dist, so a registry entry that is dead in the shipped
+	// artifact is one red row here — the same red row shape the
+	// fixture lanes produce (#2661) — instead of a ⚠ skip folded into
+	// "toolchain absent". The classification is the lane's own
+	// `classifyToolSmokeInstallReport` mapping; a registry-unreachable verdict
+	// surfaces as status "unreachable" and `main()` turns it into the run's
+	// INCONCLUSIVE reason rather than letting the skips read as green.
+	[TOOL_SMOKE_INSTALL_ROW_ID]: async (ctx) => {
+		return runToolSmokeInstallProbe(ctx);
+	},
+
+	// #2940: the release workflow's publish job, driven once against the
+	// candidate before the tag exists. The static half of that gate reads
+	// release.yml (tests/config/release-npm-pin-gate.test.ts); this row runs
+	// the argv it pins.
+	[PUBLISH_TOOLCHAIN_ROW_ID]: async (ctx) => {
+		return runPublishToolchainProbe(ctx);
+	},
 };
 
 /** Row ids this runner can execute. Exported for the drift guard. */
 export function implementedRowIds() {
 	return Object.keys(ROW_PROBES).sort();
+}
+
+/** Best-effort scratch removal shared by the normal and crash exits. */
+export function removeScratchRoot(scratchRoot) {
+	try {
+		fs.rmSync(scratchRoot, {
+			recursive: true,
+			force: true,
+			maxRetries: 5,
+			retryDelay: 200,
+		});
+	} catch (err) {
+		console.warn(`[release-qa] cleanup warning: ${err?.message || err}`);
+	}
+}
+
+// The crash exit at the bottom of this file cannot see main()'s locals, so
+// the active scratch root is published here when created and cleared after a
+// successful cleanup. A pre-existing --scratch-root directory is never
+// published: removing a directory the runner did not create would destroy
+// user state.
+let activeScratchRoot = null;
+
+export function noteActiveScratchRoot(scratchRoot) {
+	activeScratchRoot = scratchRoot;
+}
+
+export function cleanupActiveScratchRoot() {
+	if (!activeScratchRoot) return;
+	const root = activeScratchRoot;
+	activeScratchRoot = null;
+	removeScratchRoot(root);
+}
+
+function installScratchSignalCleanup() {
+	const onSignal = (signal) => {
+		cleanupActiveScratchRoot();
+		process.exit(signal === "SIGINT" ? 130 : 143);
+	};
+	process.once("SIGINT", onSignal);
+	process.once("SIGTERM", onSignal);
 }
 
 async function main() {
@@ -1528,9 +1987,18 @@ async function main() {
 		}
 	}
 
-	const scratchRoot = fs.mkdtempSync(
-		path.join(os.tmpdir(), "pi-lens-release-qa-"),
-	);
+	const scratchPreexisting = opts.scratchRoot
+		? fs.existsSync(opts.scratchRoot)
+		: false;
+	const scratchRoot = opts.scratchRoot
+		? path.resolve(opts.scratchRoot)
+		: fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-release-qa-"));
+	if (opts.scratchRoot) fs.mkdirSync(scratchRoot, { recursive: true });
+	// Owned unless the caller named a directory that already existed: the
+	// runner removes only scratch it created, and only when not kept.
+	const scratchOwned = !scratchPreexisting;
+	if (scratchOwned && !opts.keep) noteActiveScratchRoot(scratchRoot);
+	installScratchSignalCleanup();
 	const home = path.join(scratchRoot, "home");
 	fs.mkdirSync(path.join(home, ".pi", "agent"), { recursive: true });
 	fs.writeFileSync(
@@ -1549,13 +2017,14 @@ async function main() {
 	log(`scratch root: ${scratchRoot}`);
 	log(
 		`pinned under ${scratchRoot}: ${PINNED_ENV_KEYS.join(", ")} ` +
-			"(nothing this run spawns can reach the ambient home)",
+			"(allowlisted process environment; pip policy: PIP_BREAK_SYSTEM_PACKAGES=1)",
 	);
 
 	let blocked = false;
 	let blockedReason = "";
 	let candidateFailure = "";
 	let exportedCommit = "";
+	let exportRoot = REPO_ROOT;
 	let packListing = null;
 	let installedPkgDir = "";
 	let rpc = null;
@@ -1591,6 +2060,7 @@ async function main() {
 
 		if (opts.from === "tree") {
 			const exported = exportHeadForPack(scratchRoot);
+			exportRoot = exported.dir;
 			exportedCommit = exported.commit;
 			// The export carries no node_modules, and `prepare`'s bundle step
 			// (scripts/bundle-dist.mjs) inlines the pure-JS runtime deps with
@@ -1732,6 +2202,8 @@ async function main() {
 		env,
 		gitRef: opts.gitRef,
 		installedPkgDir,
+		exportRoot,
+		exportedCommit,
 		mcp,
 		mcpTools,
 		packListing,
@@ -1743,6 +2215,10 @@ async function main() {
 	};
 
 	const results = [];
+	// #2663: a registry-unreachable classification means the lane's skips are
+	// UNMEASURED, not green, so the run refuses a ship verdict. Carried beside
+	// `blocked`/`candidateFailure` for the same reason they are: the verdict is
+	// about the run, not any one row's outcome cell.
 	for (const row of rows) {
 		const probe = ROW_PROBES[row.id];
 		let raw;
@@ -1780,6 +2256,7 @@ async function main() {
 		);
 		results.push({
 			id: row.id,
+			unmeasured: isUnmeasured(raw),
 			outcome: classified.outcome,
 			detail: classified.detail,
 			implemented: attempted,
@@ -1788,6 +2265,7 @@ async function main() {
 		});
 		log(`  → ${formatOutcome(classified)}`);
 	}
+	const unreachableRows = unmeasuredRowIds(results);
 
 	if (mcp) await mcp.close();
 
@@ -1796,6 +2274,9 @@ async function main() {
 		blocked,
 		blockedReason,
 		candidateFailure,
+		inconclusiveReason: unreachableRows.length
+			? `registry-unreachable row(s) left UNMEASURED: ${unreachableRows.join(", ")}`
+			: "",
 	});
 	const report = renderReport({
 		rows,
@@ -1822,17 +2303,9 @@ async function main() {
 	console.log(`report: ${reportPath}`);
 	console.log(`evidence: ${evidenceDir}`);
 
-	if (!opts.keep) {
-		try {
-			fs.rmSync(scratchRoot, {
-				recursive: true,
-				force: true,
-				maxRetries: 5,
-				retryDelay: 200,
-			});
-		} catch (err) {
-			console.warn(`[release-qa] cleanup warning: ${err?.message || err}`);
-		}
+	if (scratchOwned && !opts.keep) {
+		activeScratchRoot = null;
+		removeScratchRoot(scratchRoot);
 	}
 
 	process.exit(coverage.balanced ? verdictExitCode(verdict.verdict) : 4);
@@ -1873,6 +2346,7 @@ const invokedDirectly =
 if (invokedDirectly) {
 	main().catch((err) => {
 		console.error("[release-qa] crashed:", err);
+		cleanupActiveScratchRoot();
 		process.exit(4);
 	});
 }

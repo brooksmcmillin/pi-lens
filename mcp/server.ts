@@ -23,10 +23,17 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+	finalizeToolResult,
+	finalizeToolResultWithDelivery,
+	renderToolText as toolText,
+	stripResultDetails,
+} from "../tools/render-compact.js";
 import { AstGrepClient } from "../clients/ast-grep-client.js";
 import { CacheManager } from "../clients/cache-manager.js";
 import {
 	getDegradationSummary,
+	recordDegradationOnce,
 	renderDegradationLines,
 } from "../clients/degradation-ledger.js";
 import {
@@ -74,10 +81,24 @@ import {
 	type WarmTurnEndResponse,
 } from "../clients/lens-engine.js";
 import { createAstGrepReplaceTool } from "../tools/ast-grep-replace.js";
-import { createAstGrepSearchTool } from "../tools/ast-grep-search.js";
+import {
+	astGrepDumpCompatibilityResult,
+	createAstGrepSearchTool,
+} from "../tools/ast-grep-search.js";
 import { createLensDiagnosticsTool } from "../tools/lens-diagnostics.js";
 import { peekMcpSessionRuntime } from "../clients/mcp/session.js";
-import { createLspDiagnosticsTool } from "../tools/lsp-diagnostics.js";
+import { loadPiLensGlobalConfig } from "../clients/lens-config.js";
+import { loadPiLensProjectConfig } from "../clients/project-lens-config.js";
+import {
+	resolveLensToolEnabled,
+	toolRegistryEntryForMcp,
+} from "../clients/tool-config.js";
+import {
+	endSituationalToolTelemetry,
+	observeSituationalToolCall,
+	startSituationalToolTelemetrySession,
+} from "../clients/situational-tool-telemetry.js";
+import { flushExtensionLog } from "../clients/extension-log.js";
 import { createLspNavigationTool } from "../tools/lsp-navigation.js";
 import { shouldInitializeSessionRoot } from "../clients/lsp/session-roots.js";
 import {
@@ -481,24 +502,6 @@ function sendError(id: JsonRpcId, code: number, message: string): void {
 	send({ jsonrpc: "2.0", id, error: { code, message } });
 }
 
-/**
- * A tool result: human-readable text first, full JSON appended for the agent.
- * `compact` omits indentation (#512) — for token-efficient tools like
- * module_report the ~30% saved on the wire is worth losing pretty-printing
- * for a payload the agent parses, not reads formatted.
- */
-function toolText(
-	summary: string,
-	structured?: unknown,
-	compact = false,
-): { content: { type: "text"; text: string }[] } {
-	const text =
-		structured === undefined
-			? summary
-			: `${summary}\n\n\`\`\`json\n${JSON.stringify(structured, compact ? undefined : null, compact ? undefined : 2)}\n\`\`\``;
-	return { content: [{ type: "text" as const, text }] };
-}
-
 // --- Graph-staleness signal (#536) -------------------------------------------
 //
 // Extends #514's honesty-warning shape from "missing node" (module_report's
@@ -554,6 +557,8 @@ const cacheManager = new CacheManager();
 // nothing — a no-op dressed as a fix, not a real parity gap. The 4th arg is left
 // at its default (`async () => {}`, already a no-op) rather than importing and
 // wiring a flush with nothing to flush.
+const isLensGuardEnabled = () =>
+	Boolean(createMcpHost(undefined, DEFAULT_CWD).getFlag("lens-guard"));
 const lensDiagnosticsTool = createLensDiagnosticsTool(
 	cacheManager,
 	() => DEFAULT_CWD,
@@ -566,6 +571,13 @@ const lensDiagnosticsTool = createLensDiagnosticsTool(
 	// an MCP session context exists there is no session to compare against and
 	// validation skips the check, which is the honest classification.
 	() => peekMcpSessionRuntime(),
+	// #2860: without this, the default `() => true` applies on the MCP
+	// surface and every confirmed-clean LSP probe unconditionally resyncs the
+	// commit-gate `turn-end-findings` record even when the project has
+	// `lens-guard` off — a config bypass on a durable cross-surface store.
+	// Matches index.ts:1656 and the two sibling readers
+	// (clients/runtime-tool-call.ts, clients/runtime-tool-result.ts).
+	() => isLensGuardEnabled(),
 );
 const astGrepClient = new AstGrepClient();
 const astGrepSearchTool = createAstGrepSearchTool(astGrepClient);
@@ -580,7 +592,6 @@ const astGrepReplaceTool = createAstGrepReplaceTool(astGrepClient);
 const lspNavigationTool = createLspNavigationTool((name, cwd) =>
 	createMcpHost(undefined, cwd ?? DEFAULT_CWD).getFlag(name),
 );
-const lspDiagnosticsTool = createLspDiagnosticsTool();
 
 // Wrapped pi tools already declare their params as typebox (which IS JSON
 // Schema). Emit that directly as the MCP inputSchema (+ the MCP-only `cwd`)
@@ -607,10 +618,7 @@ const ALL_TOOLS = [
 	{
 		name: "pilens_analyze",
 		description:
-			"Run pi-lens's per-edit dispatch pipeline (LSP + linters + structural " +
-			"rules) on a single file and return its diagnostics plus the latency " +
-			"record for that dispatch (same schema as latency.log). The core review " +
-			"probe: shows a change's real behavioral + perf impact on a real file.",
+			"Run pi-lens's per-edit dispatch pipeline on one file. Example: analyze `src/app.ts` after an edit.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -640,17 +648,13 @@ const ALL_TOOLS = [
 	},
 	{
 		name: "pilens_diagnostics",
-		description:
-			"Query pi-lens's diagnostic state across ALL runners (not just LSP). " +
-			"mode=delta (current turn, instant), mode=all (every dispatched file this " +
-			"session), mode=full (expensive project-wide active scan).",
+		description: lensDiagnosticsTool.description,
 		inputSchema: schemaWithCwd(lensDiagnosticsTool.parameters),
 	},
 	{
 		name: "pilens_latency",
 		description:
-			"Return recent dispatch latency reports (latency.log schema: per-file " +
-			"total duration + per-runner timings). The review-loop measurement surface.",
+			"Return recent dispatch latency reports. Example: limit results to 5.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -668,19 +672,13 @@ const ALL_TOOLS = [
 	{
 		name: "pilens_rebuild",
 		description:
-			"Rebuild pi-lens so subsequent `pilens_analyze mode=fresh` runs reflect " +
-			"the latest commit. Runs `npm run build` (in-place dev layout) or " +
-			"`npm run build:dist` (precompiled dist layout), matching how this server " +
-			"was launched. The missing link that makes the review loop honest: " +
-			"commit → pilens_rebuild → pilens_analyze mode=fresh.",
+			"Rebuild pi-lens so later fresh analyses use the latest commit. Example: rebuild after changing a tool.",
 		inputSchema: { type: "object", properties: {} },
 	},
 	{
 		name: "pilens_project_scan",
 		description:
-			"Cheap project-wide scan (tree-sitter + fact rules) across source files, " +
-			"returning structural/quality diagnostics. Complements pilens_diagnostics " +
-			"mode=full (which adds active LSP).",
+			"Scan project files for structural and quality diagnostics. Example: cap the scan with `maxFiles: 20`.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -700,17 +698,7 @@ const ALL_TOOLS = [
 	{
 		name: "pilens_symbol_search",
 		description:
-			"Ranked identifier search over the persisted word index (BM25 + priors " +
-			"that demote tests/vendor and doc files). Answers 'which files are most " +
-			"relevant to <query>' by identifier — first step of the discovery funnel: " +
-			"symbol_search finds candidate files, pilens_module_report explains one, " +
-			"pilens_read_symbol reads a body. Complements grep (raw substrings) and " +
-			"LSP (exact symbols). Each hit's `startLine`/`endLine` mark its best-matching " +
-			"line (offset=startLine, limit=endLine-startLine+1 for a one-line peek) — " +
-			"use pilens_module_report on `file` for the real outline. Returns " +
-			"`available: false` with a retry hint if the index isn't built yet for this " +
-			"workspace (pilens_session_start builds it, or it self-builds in the background " +
-			"on first query).",
+			"Find relevant files by ranked identifier search. On a cold cache, project_report and symbol_search return available: false with a retry hint and start a non-blocking background build; module_report degrades to outline-only with cache freshness explicit. Example: search `authenticate user` before pilens_module_report.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -742,23 +730,7 @@ const ALL_TOOLS = [
 	{
 		name: "pilens_module_report",
 		description:
-			"Structured, navigable overview of a source module — a token-efficient " +
-			"substitute for reading the whole file. Returns each symbol's " +
-			"name/kind/signature/line-range (plus a first-line `doc` summary when a " +
-			"doc comment is attached), plus who-uses-this, risk flags, and ranked " +
-			"recommendedReads. To read a symbol's body: call pilens_read_symbol (or " +
-			"read) with offset=startLine, limit=endLine-startLine+1 on THIS report's " +
-			"`file` — those aren't repeated per symbol. Prefer this before a full " +
-			"read; then use pilens_read_symbol for the exact body. Single mode: " +
-			"tree-sitter outline + review-graph who-uses-this + inline executable " +
-			"extraction; degrades to outline-only when no cached graph is available " +
-			"(this path never calls LSP). `semantic.source` reports whether graph " +
-			"data was used. Pass `blastRadius: true` for the cross-file blast radius " +
-			"(transitive dependents as ranked file reads, read-only over the cached " +
-			"graph). Pass `callGraph: true` for bounded derived callers/callees; a " +
-			"cold or stale call-graph cache is reported explicitly, never as zero calls. " +
-			'`view: "compact"` returns a line-oriented text rendering ' +
-			"(cheapest option) instead of JSON. An outline shows shape, not bodies.",
+			"Return a navigable source-module outline with references and read handles. An outline shows shape, not bodies, and does not satisfy read-before-edit; `read_symbol` and `read_enclosing` return body text and record read coverage. On a cold cache, project_report and symbol_search return available: false with a retry hint and start a non-blocking background build; module_report degrades to outline-only with cache freshness explicit. Example: use pilens_module_report on `src/app.ts` before pilens_read_symbol.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -809,24 +781,7 @@ const ALL_TOOLS = [
 	{
 		name: "pilens_project_report",
 		description:
-			"Project-level orientation from the review graph — 'orient me in this " +
-			"project' before drilling into any one file. First step of a wider " +
-			"discovery funnel: pilens_project_report orients, pilens_module_report " +
-			"explains a file, pilens_read_symbol reads a body. Six capped, ranked " +
-			"sections: a trust header (graph freshness, file coverage, " +
-			"edge-resolution-quality mix), hubs (top fan-in files — the repo's " +
-			"contract surface), entry points (near-zero fan-in / high fan-out files " +
-			"— activation/CLI/mains), a directory-level subsystem map (import " +
-			"cycles + layering violations, e.g. a forbidden clients/ -> tools/ " +
-			"edge), risk hotspots (fan-in × max per-symbol cyclomatic complexity), " +
-			"and suspected dead weight (zero-importer files, shipped with a " +
-			"low-confidence disclaimer). Every file line carries a `suggestedNext` " +
-			"module_report call. No per-symbol detail and no prose summary — " +
-			"structural facts only. Read-only over the cached graph: returns " +
-			"`available: false` with a retry hint on a cold cache and kicks off a " +
-			'background build (never blocks this call). `view: "compact"` returns ' +
-			"a line-oriented text rendering instead of JSON. Pass `focus` to " +
-			"re-rank every section toward a task hint.",
+			"Orient in a project from its review graph. On a cold cache, project_report and symbol_search return available: false with a retry hint and start a non-blocking background build; module_report degrades to outline-only with cache freshness explicit. Example: use pilens_project_report before choosing a file.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -853,15 +808,7 @@ const ALL_TOOLS = [
 	{
 		name: "pilens_read_symbol",
 		description:
-			"Return the verbatim source of a single named symbol " +
-			"(function/class/method/interface/type) in a file — a targeted, cheap " +
-			"alternative to reading the whole file. Pair with pilens_module_report: it " +
-			"finds the symbol, this shows its body. Includes an attached doc comment " +
-			"when one exists. Accepts a dotted `Class.method` name to resolve a " +
-			"member, falling back to a plain lookup when the qualifier doesn't " +
-			"resolve. A miss embeds the ~3 nearest symbol names in the file. When " +
-			"multiple same-file symbols share a name, the first is returned with an " +
-			"ambiguity note; pass `kind` to pick a specific one.",
+			"Return one symbol's verbatim source. An outline shows shape, not bodies, and does not satisfy read-before-edit; `read_symbol` and `read_enclosing` return body text and record read coverage. Example: use pilens_read_symbol after pilens_module_report identifies `parseConfig`.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -884,12 +831,7 @@ const ALL_TOOLS = [
 	{
 		name: "pilens_read_enclosing",
 		description:
-			"Return the verbatim source for the smallest useful symbol/callback " +
-			"enclosing a line in a file. Use after pilens_ast_grep_search, " +
-			"pilens_diagnostics, or pilens_lsp_navigation locations when you need " +
-			"exact body text without reading the whole file. Uses tree-sitter only — " +
-			"no LSP or graph build. MCP has no read-guard, so unlike the pi tool this " +
-			"does not record edit-coverage.",
+			"Return the smallest symbol or callback enclosing a line. An outline shows shape, not bodies, and does not satisfy read-before-edit; `read_symbol` and `read_enclosing` return body text and record read coverage. Example: use pilens_read_enclosing after a diagnostic points to line 42.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -933,26 +875,13 @@ const ALL_TOOLS = [
 	{
 		name: "pilens_health",
 		description:
-			"pi-lens runtime health for THIS server: alive LSP servers, last dispatch " +
-			"summary, session diagnostic counts, how many resolved config leaves each " +
-			"source tier decided, and the total CPU/RAM footprint attributable to " +
-			"pi-lens across every process it owns (host + LSP children) machine-wide, " +
-			"from the shared instance registry.",
+			"Return pi-lens runtime health for this server. Example: call it after a slow analysis.",
 		inputSchema: { type: "object", properties: {} },
 	},
 	{
 		name: "pilens_effective_config",
 		description:
-			"The resolved pi-lens configuration with the provenance of every " +
-			"decision: which file and source tier each setting came from, the trust " +
-			"decision that applied, and which config files contributed. Pass `file` " +
-			"to also get, for that path, its canonical language, EVERY LSP server " +
-			"with the reason it was selected or denied — including which tier's " +
-			"config denied it, which a nearer file cannot lift — and the lint/format " +
-			"runners that would dispatch. This is the answer to 'why is X running / " +
-			"why is X not running' without reading logs. Redacted by construction: " +
-			"it reports sources, never values — no environment values, no command " +
-			"arguments beyond the binary itself, and config paths are home-relative.",
+			"Explain resolved configuration and provenance. Response is redacted by construction: it contains no environment values, no command arguments beyond the binary, and home-relative paths; a tier-denied LSP decision cannot be lifted by a nearer config. Example: pass `file` to explain one selection.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -972,12 +901,7 @@ const ALL_TOOLS = [
 	{
 		name: "pilens_session_start",
 		description:
-			"Run pi-lens's real session_start lifecycle: warm the dominant-language " +
-			"LSP (so subsequent pilens_analyze is LSP-complete), establish the " +
-			"error-debt baseline (tests/build pass-state) + complexity baselines, and " +
-			"kick off knip/jscpd/type-coverage/dep/secrets project scans. Returns " +
-			"project guidance + baseline; scan results land in caches (query via " +
-			"pilens_diagnostics afterwards). Run once per workspace before reviewing.",
+			"Initialize pi-lens for a workspace. Example: run once before reviewing a project.",
 		inputSchema: {
 			type: "object",
 			properties: { cwd: { type: "string" } },
@@ -986,13 +910,7 @@ const ALL_TOOLS = [
 	{
 		name: "pilens_turn_end",
 		description:
-			"Run pi-lens's real turn_end lifecycle over the files changed this turn: " +
-			"knip dead-code + jscpd duplication (incremental), circular-dep checks, " +
-			"tests on affected targets, cascade to dependents, and the actionable/" +
-			"code-quality warning aggregation. Returns the turn-end advisory + test " +
-			"findings. `files` is OPTIONAL — pilens_analyze (and the PostToolUse hook) " +
-			"auto-register edited files into turn-state, so you can call this with no " +
-			"args after a series of edits; pass `files` to add any not analyzed.",
+			"Summarize checks for files changed this turn. Example: pass `files` for an unanalysed file.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -1007,41 +925,31 @@ const ALL_TOOLS = [
 		},
 	},
 	{
+		name: "pilens_session_end",
+		description:
+			"End the MCP connection's telemetry session and write its bounded situational-tool telemetry line. This is terminal for the connection.",
+		inputSchema: {
+			type: "object",
+			properties: {},
+		},
+	},
+	{
 		name: "pilens_ast_grep_search",
 		description:
-			"Structural (AST) code search via ast-grep — match by code structure, not " +
-			"text. Use complete patterns with arguments (e.g. 'console.log($MSG)', " +
-			"'function $NAME($$$ARGS) { $$$BODY }'), or use nodeKind to find every " +
-			"node of a known grammar kind. Metavariables do not match text inside " +
-			"quoted string literals; use an exact string or grep for wildcard text. " +
-			"This is the same schema and synthesis path as the pi tool.",
+			"Search code by AST structure rather than text. Example: find calls with `console.log($MSG)`.",
 		inputSchema: schemaWithCwd(astGrepSearchTool.parameters),
 	},
 	{
 		name: "pilens_ast_grep_replace",
 		description:
-			"Structural (AST) find-and-rewrite via ast-grep, e.g. pattern='var $X' " +
-			"rewrite='let $X'. DRY-RUN by default (apply=false shows the diff); set " +
-			"apply=true to write the changes to disk.",
+			"Find and rewrite code by AST structure; preview by default. Example: set `apply: false` to inspect a diff.",
 		inputSchema: schemaWithCwd(astGrepReplaceTool.parameters),
 	},
 	{
 		name: "pilens_lsp_navigation",
 		description:
-			"LSP code navigation: definition, typeDefinition, declaration, " +
-			"references, hover, documentSymbol, " +
-			"workspaceSymbol, implementation, call hierarchy (prepareCallHierarchy/" +
-			"incomingCalls/outgoingCalls), rename, codeAction, executeCommand " +
-			"(allowlisted, dry-run by default) — exact + type-aware, " +
-			"~50ms. Use before changing a signature to see every caller.",
+			'Navigate source with language-server operations. Example: use `{operation: "references", path: "src/app.ts", line: 12}`.',
 		inputSchema: schemaWithCwd(lspNavigationTool.parameters),
-	},
-	{
-		name: "pilens_lsp_diagnostics",
-		description:
-			"Pure LSP diagnostics for a file, directory, or batch of files (type " +
-			"errors only — narrower than pilens_diagnostics, which spans all runners).",
-		inputSchema: schemaWithCwd(lspDiagnosticsTool.parameters),
 	},
 ];
 // #920: published packages cannot rebuild themselves safely because their
@@ -1050,6 +958,18 @@ const ALL_TOOLS = [
 const TOOLS = canRebuildPiLens(REPO_ROOT)
 	? ALL_TOOLS
 	: ALL_TOOLS.filter((tool) => tool.name !== "pilens_rebuild");
+
+function enabledToolsForCwd(cwd: string) {
+	const global = loadPiLensGlobalConfig();
+	const project = loadPiLensProjectConfig(cwd);
+	return TOOLS.filter((tool) => {
+		const entry = toolRegistryEntryForMcp(tool.name);
+		return (
+			entry !== undefined &&
+			resolveLensToolEnabled(entry.name, global, project.raw)
+		);
+	});
+}
 
 function formatAnalyze(
 	result: McpAnalyzeResult,
@@ -1137,6 +1057,38 @@ async function callTool(
 	name: string,
 	args: Record<string, unknown>,
 ): Promise<{ content: { type: "text"; text: string }[]; isError?: boolean }> {
+	if (name === "pilens_lsp_diagnostics") {
+		recordDegradationOnce({
+			kind: "lsp-diagnostics-compatibility",
+			subject: "lsp_diagnostics",
+			reason: "retired tool name redirected to pilens_diagnostics source=lsp",
+		});
+		name = "pilens_diagnostics";
+		args = {
+			...args,
+			source: "lsp",
+			// #2860: the retired tool's contract was always "path or paths is
+			// required" (tools/lsp-diagnostics.ts's own early return) — it never
+			// had a bare "sweep the whole workspace" mode. `scope: "paths"` is a
+			// no-op for source=lsp (lens-diagnostics.ts only special-cases
+			// scope==="workspace"), so whatever `path`/`paths` the caller sent
+			// (or didn't) passes straight through to the probe's own path/paths
+			// handling unchanged, reproducing master's behavior exactly —
+			// including its error when neither is present. Mapping absent
+			// `paths` to `scope:"workspace"` here previously caused every
+			// no-args call to substitute `cwd` and run a whole-project LSP sweep
+			// instead (root-eviction smoke: 129 sweeps, 180s timeout x3).
+			scope: "paths",
+		};
+	}
+	if (name === "pilens_ast_grep_dump") {
+		recordDegradationOnce({
+			kind: "ast-grep-dump-compatibility",
+			subject: "ast_grep_dump",
+			reason: "retired tool name redirected to ast_grep_search dump mode",
+		});
+		return astGrepDumpCompatibilityResult(args, "mcp");
+	}
 	if (name === "pilens_analyze") {
 		const file = args.file;
 		if (typeof file !== "string" || file.length === 0) {
@@ -1542,7 +1494,10 @@ async function callTool(
 		const header = `${result.kind} ${result.name}${ambiguityNote}${sigSuffix}  ${path.relative(cwd, result.path)}:${result.startLine}-${result.endLine}`;
 		return {
 			content: [
-				{ type: "text" as const, text: `${header}\n\n${result.source ?? ""}` },
+				{
+					type: "text" as const,
+					text: `${header}\n\n${result.source ?? ""}`,
+				},
 			],
 		};
 	}
@@ -1603,7 +1558,10 @@ async function callTool(
 		const header = `${result.kind} ${result.name}  ${path.relative(cwd, result.path)}:${range}`;
 		return {
 			content: [
-				{ type: "text" as const, text: `${header}\n\n${result.source ?? ""}` },
+				{
+					type: "text" as const,
+					text: `${header}\n\n${result.source ?? ""}`,
+				},
 			],
 		};
 	}
@@ -1738,8 +1696,8 @@ async function callTool(
 			new AbortController().signal,
 			undefined,
 			{ cwd },
-		)) as { content: { type: "text"; text: string }[] };
-		return { content: out.content };
+		)) as { content: { type: "text"; text: string }[]; isError?: boolean };
+		return out;
 	}
 
 	if (name === "pilens_latency") {
@@ -1778,6 +1736,11 @@ async function callTool(
 		return toolText(lines.filter(Boolean).join("\n"), outcome);
 	}
 
+	if (name === "pilens_session_end") {
+		endSituationalToolTelemetry();
+		return toolText("Session ended.");
+	}
+
 	if (name === "pilens_turn_end") {
 		const cwd = typeof args.cwd === "string" ? args.cwd : DEFAULT_CWD;
 		await ensureReady(cwd);
@@ -1804,24 +1767,23 @@ async function callTool(
 			args,
 			new AbortController().signal,
 			undefined,
-			{ cwd },
-		)) as { content: { type: "text"; text: string }[] };
-		return { content: out.content };
+			{ cwd, resultMaxItems: Number.POSITIVE_INFINITY },
+		)) as { content: { type: "text"; text: string }[]; isError?: boolean };
+		return out;
 	}
 
-	if (name === "pilens_lsp_navigation" || name === "pilens_lsp_diagnostics") {
+	if (name === "pilens_lsp_navigation") {
 		const cwd = typeof args.cwd === "string" ? args.cwd : DEFAULT_CWD;
 		await ensureReady(cwd);
-		const tool =
-			name === "pilens_lsp_navigation" ? lspNavigationTool : lspDiagnosticsTool;
+		const tool = lspNavigationTool;
 		const out = (await tool.execute(
 			"mcp",
 			args,
 			new AbortController().signal,
 			undefined,
 			{ cwd },
-		)) as { content: { type: "text"; text: string }[] };
-		return { content: out.content };
+		)) as { content: { type: "text"; text: string }[]; isError?: boolean };
+		return out;
 	}
 
 	return { ...toolText(`Unknown tool: ${name}`), isError: true };
@@ -1854,7 +1816,7 @@ async function callTool(
 //   pilens_session_start, pilens_turn_end      — mutate warm LSP/graph state;
 //     must run in-process, can't be forked fresh.
 //   pilens_ast_grep_search, pilens_ast_grep_replace,
-//   pilens_lsp_navigation, pilens_lsp_diagnostics — depend on the warm LSP
+//   pilens_lsp_navigation, pilens_diagnostics — depend on the warm LSP
 //     fleet / ast-grep client instances; no fresh-fork machinery exists for
 //     them today (only pilens_analyze's worker.ts loads a fresh dispatch
 //     graph) and the LSP fleet specifically CANNOT be recreated cheaply per
@@ -1883,7 +1845,6 @@ const WARN_ONLY_STALE_TOOLS = new Set([
 	"pilens_ast_grep_search",
 	"pilens_ast_grep_replace",
 	"pilens_lsp_navigation",
-	"pilens_lsp_diagnostics",
 	"pilens_read_symbol",
 	"pilens_read_enclosing",
 	"pilens_effective_config",
@@ -1921,6 +1882,7 @@ async function handleRequest(request: JsonRpcRequest): Promise<void> {
 
 	switch (method) {
 		case "initialize": {
+			startSituationalToolTelemetrySession("mcp");
 			const requested = params?.protocolVersion;
 			sendResult(id ?? null, {
 				protocolVersion:
@@ -1938,7 +1900,7 @@ async function handleRequest(request: JsonRpcRequest): Promise<void> {
 			if (!isNotification) sendResult(id ?? null, {});
 			return;
 		case "tools/list":
-			sendResult(id ?? null, { tools: TOOLS });
+			sendResult(id ?? null, { tools: enabledToolsForCwd(DEFAULT_CWD) });
 			return;
 		case "tools/call": {
 			const name = params?.name;
@@ -1949,6 +1911,31 @@ async function handleRequest(request: JsonRpcRequest): Promise<void> {
 			if (typeof name !== "string") {
 				sendError(id ?? null, -32602, "tools/call requires a string 'name'");
 				return;
+			}
+			const enabledName =
+				name === "pilens_lsp_diagnostics" ? "pilens_diagnostics" : name;
+			if (
+				name !== "pilens_ast_grep_dump" &&
+				name !== "pilens_rebuild" &&
+				!enabledToolsForCwd(
+					typeof args.cwd === "string" ? args.cwd : DEFAULT_CWD,
+				).some((tool) => tool.name === enabledName)
+			) {
+				sendResult(
+					id ?? null,
+					stripResultDetails(
+						finalizeToolResult({
+							...toolText(`Unknown or disabled tool: ${name}`),
+							isError: true,
+						}),
+					),
+				);
+				return;
+			}
+			const entry = toolRegistryEntryForMcp(name);
+			if (entry && "situational" in entry && entry.situational) {
+				startSituationalToolTelemetrySession("mcp");
+				observeSituationalToolCall(entry.name);
 			}
 			// #544 self-heal: if auto-session was supposed to fire on `initialize`
 			// (PI_LENS_MCP_AUTO_SESSION=1) but never completed successfully — never
@@ -1963,6 +1950,9 @@ async function handleRequest(request: JsonRpcRequest): Promise<void> {
 				// see the forcedFresh branch inside callTool. Every other tool that
 				// depends on warm-only process state gets an honest-degrade warning
 				// instead, so the warm boundary never silently serves old code.
+				// The warning precedes the #2800 item 7 gate, so it is part of the
+				// payload the byte bound protects (kept in the retained tail) and
+				// its bytes land in the footer's delivered figure.
 				if (
 					WARN_ONLY_STALE_TOOLS.has(name) &&
 					!result.isError &&
@@ -1970,16 +1960,27 @@ async function handleRequest(request: JsonRpcRequest): Promise<void> {
 				) {
 					result = withStaleWarning(result);
 				}
-				sendResult(id ?? null, result);
+				// #2800 item 7: the payload bound runs first with the footer's own
+				// size reserved, then the footer is stamped with the delivered
+				// payload's byte count and the bound's truncated flag.
+				const delivery = finalizeToolResultWithDelivery(result);
+				// The gate consumed `details` for the footer's diag lines above;
+				// strip it so the wire carries only the bounded text (#2852 N1).
+				sendResult(id ?? null, stripResultDetails(delivery.result));
 			} catch (err) {
 				// Surface as a tool error (isError), not a transport error, so the
 				// agent sees the message instead of a dead request.
-				sendResult(id ?? null, {
-					...toolText(
-						`pi-lens tool '${name}' failed: ${(err as Error).message}`,
+				sendResult(
+					id ?? null,
+					stripResultDetails(
+						finalizeToolResult({
+							...toolText(
+								`pi-lens tool '${name}' failed: ${(err as Error).message}`,
+							),
+							isError: true,
+						}),
 					),
-					isError: true,
-				});
+				);
 			}
 			return;
 		}
@@ -2012,7 +2013,10 @@ process.stdin.on("data", (chunk: string) => {
 		newlineIndex = buffer.indexOf("\n");
 	}
 });
-process.stdin.on("end", () => process.exit(0));
+process.stdin.on("end", () => {
+	endSituationalToolTelemetry();
+	void flushExtensionLog().finally(() => process.exit(0));
+});
 
 startIpcServer();
 console.error(`[pi-lens-mcp] ready (cwd=${DEFAULT_CWD})`);

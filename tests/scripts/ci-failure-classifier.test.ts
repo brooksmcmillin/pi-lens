@@ -5,6 +5,7 @@
 // Log fixtures under tests/fixtures/ci-failure-logs/ named *.real.log or
 // *.composite.log are REAL captured output (AGENTS.md shape 16 -- never
 // hand-write a fixture for an external system's behavior):
+// The #2848 capture is a complete raw job log fetched for this round.
 //   - real-assertion-failure.real.log: run 32913518938, job 98012237782
 //     (fetch: `gh api repos/apmantza/pi-lens/actions/jobs/98012237782/logs`)
 //   - infra-kill-wrapper-killed.real.log: run 32908647308 attempt 1, job
@@ -33,6 +34,22 @@
 //     `{"outcome":"emit_failed","error":"ECONNRESET"}`) inside a synthetic
 //     surrounding log, to prove that string alone must not flip an
 //     unrecognized real failure to infra-net.
+//   - infra-net-registry-reset-beside-test-timeout.real.log (#2839): run
+//     34389495533 attempt 1, job 102594125043 (PR #2834, fetched via
+//     `gh api repos/apmantza/pi-lens/actions/jobs/102594125043/logs`), raw
+//     lines 2241-2259 (the npm-retry unit tests' own registry failures:
+//     three `npm error code ECONNRESET`, `npm-retry: attempt 1..3 network
+//     error`, the `##[error]infra: registry unreachable` annotations) joined
+//     with raw lines 3928-3947 (the run's only test failure, a vitest
+//     timeout: `FAIL ... tests/clients/flake-shape-ratchet.test.ts > ...` +
+//     `Error: Test timed out in 5000ms.` + the summary block). One real
+//     capture, two regions of it, nothing else omitted. Pre-#2839 this
+//     classified real and no rerun was armed.
+//   - infra-net-windows-crlf-prefix.real.log: runner-shaped evidence with
+//     CRLF and leading annotations, based on the real Windows job
+//     102669734529 from run 34412416504 (`gh run view --log`). The successful
+//     job supplied the timestamp, annotation, and vitest line shapes; the
+//     timeout/network combination is the #2839 fixture case.
 
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -70,6 +87,26 @@ describe("classifyFailureLog (#2103)", () => {
 		);
 	});
 
+	it("requires a compiler diagnostic line shape for TypeScript evidence", () => {
+		expect(
+			classifyFailureLog('echo "error TS2322: Type string is not assignable"'),
+		).not.toEqual(
+			expect.objectContaining({
+				detail: expect.stringContaining("error TS2322:"),
+			}),
+		);
+		expect(
+			classifyFailureLog(
+				"src/x.ts:12:3 - error TS2322: Type string is not assignable",
+			),
+		).toEqual(
+			expect.objectContaining({
+				kind: "real",
+				detail: expect.stringContaining("error TS2322:"),
+			}),
+		);
+	});
+
 	it("classifies the wrapper-as-victim OOM shape (no mem-watch verdict at all)", () => {
 		const result = classifyFailureLog(
 			fixture("infra-kill-wrapper-killed.real.log"),
@@ -79,6 +116,51 @@ describe("classifyFailureLog (#2103)", () => {
 		// proves the classifier reads the actual samples rather than emitting a
 		// generic "OOM happened" string with no evidence behind it.
 		expect(result.detail).toContain("availableMb=12999 of 15989");
+	});
+
+	it("classifies the #2848 exit-137 log as infra despite incidental output needles", () => {
+		const result = classifyFailureLog(fixture("infra-kill-2848.real.log"));
+		expect(result.kind).toBe("infra-kill");
+		expect(result.detail).toContain(
+			"tests/index-integration.test.ts (1406 MB)",
+		);
+		expect(result.detail).toContain(
+			"tests/clients/flake-shape-ratchet.test.ts (1300 MB)",
+		);
+		expect(result.detail).toContain(
+			"tests/config/lsp-service-double-sweep.test.ts (945 MB)",
+		);
+		expect(result.detail).toMatch(
+			/heaviest files by peak RSS: tests\/index-integration\.test\.ts \(1406 MB\), tests\/clients\/flake-shape-ratchet\.test\.ts \(1300 MB\), tests\/config\/lsp-service-double-sweep\.test\.ts \(945 MB\)/,
+		);
+	});
+
+	it("#2848 exit-137 log ignores quoted failure needles", () => {
+		const log =
+			fixture("infra-kill-2848.real.log") +
+			"\n✓ MCP smoke test: reports AssertionError: and FAIL as literal text\n";
+		expect(classifyFailureLog(log).kind).toBe("infra-kill");
+	});
+
+	it.each([
+		"2026-09-09T00:00:00.0000000Z  FAIL default tests/a.test.ts > broken\n",
+		"2026-09-09T00:00:00.0000000Z  Test Files  1 failed | 2 passed (3)\n",
+		"2026-09-09T00:00:00.0000000Z  Tests  1 failed | 2 passed (3)\n",
+	])("keeps summary failure evidence real beside exit 137 (%s)", (failure) => {
+		const result = classifyFailureLog(
+			`${failure}[mem-watch] KILLED WITH HEADROOM signal=SIGKILL totalMb=15989 lowWaterAvailableMb=12564\nexit code 137\n`,
+		);
+		expect(result.kind).toBe("real");
+	});
+
+	it("ignores malformed peak-RSS rows without throwing", () => {
+		expect(() =>
+			classifyFailureLog(
+				"[mem-file] peakRssMb=not-a-number tests/bad.test.ts\n" +
+					"[mem-file] peakRssMb=42\n" +
+					"[mem-watch] KILLED WITH HEADROOM signal=SIGKILL totalMb=15989 lowWaterAvailableMb=12564\n",
+			),
+		).not.toThrow();
 	});
 
 	it("classifies the pre-#2042 bare-Killed OOM shape (no wrapper existed yet)", () => {
@@ -321,6 +403,42 @@ describe("classifyFailureLog (#2103)", () => {
 		}
 	});
 
+	it("recognizes today's quoted CI infrastructure needles", () => {
+		const excerpts = [
+			["SARIF upload", "Error: Unable to upload SARIF file: HTTP 503"],
+			[
+				"CodeQL initialization",
+				"Initialize CodeQL: The request failed with HTTP 503",
+			],
+			[
+				"codeload 429",
+				"npm error request to https://codeload.github.com/acme/repo/tar.gz failed: 429 Too Many Requests",
+			],
+			[
+				"codeload 503",
+				"npm error request to https://codeload.github.com/acme/repo/tar.gz failed: 503 Service Unavailable",
+			],
+			[
+				"npm ci timeout",
+				"npm ci --no-audit\nnpm error code ETIMEDOUT\nnpm error network request timed out",
+			],
+		];
+		for (const [name, excerpt] of excerpts) {
+			expect(classifyFailureLog(excerpt).kind, name).toBe("infra-net");
+		}
+	});
+
+	it("keeps quoted Vitest and TypeScript failures real", () => {
+		const excerpts = [
+			"Test Files 1 failed | 42 passed",
+			"AssertionError: expected 1 to be 2",
+			"error TS2322: Type 'string' is not assignable to type 'number'",
+		];
+		for (const excerpt of excerpts) {
+			expect(classifyFailureLog(excerpt).kind, excerpt).toBe("real");
+		}
+	});
+
 	it("round 3: npm-only network shapes stay real for the CI classifier", () => {
 		const shapes = [
 			"ETIMEDOUT",
@@ -400,6 +518,196 @@ describe("classifyFailureLog (#2103)", () => {
 			fixture("fabricated-fail-in-passing-title.composite.log"),
 		);
 		expect(result.kind).toBe("infra-kill");
+	});
+
+	// --- #2839: a test timeout beside network-unreachable evidence is infra --
+	//
+	// Recurrence (#2839): PR #2834 and, within the hour, PR #2835 both logged
+	// registry ECONNRESET through every npm-retry attempt plus ONE test-level
+	// failure shaped as a vitest timeout, and the classifier labelled both
+	// `ci:real` because the timeout prints as a FAIL block (FAIL_LINE outranks
+	// network evidence) -- no rerun was armed, and the maintainer re-ran both
+	// by hand. The demotion below is deliberately narrow: the network
+	// evidence AND the absence of any AssertionError/compiler diagnostic are
+	// both required, so a genuine assertion failure beside network noise
+	// still wins as real.
+
+	// (a) The real #2834 excerpt (see the file header for provenance). Red
+	// first: on pre-#2839 code this classified real.
+	it("#2839 (a): the #2834 log's timeout beside registry ECONNRESET classifies infra-net", () => {
+		const result = classifyFailureLog(
+			fixture("infra-net-registry-reset-beside-test-timeout.real.log"),
+		);
+		expect(result.kind).toBe("infra-net");
+		expect(result.detail).toContain("Test timed out in 5000ms");
+		expect(result.detail).toContain("ECONNRESET");
+	});
+
+	// (b) The same record with a different timeout line: the rule keys on the
+	// timeout shape, not the 5000ms value or the specific test name.
+	it("#2839 (b): a different timeout line beside the same network evidence still classifies infra-net", () => {
+		const log = fixture(
+			"infra-net-registry-reset-beside-test-timeout.real.log",
+		).replace("Test timed out in 5000ms.", "Test timed out in 10000ms.");
+		expect(log).toContain("Test timed out in 10000ms.");
+		expect(classifyFailureLog(log).kind).toBe("infra-net");
+	});
+
+	// Vitest emits both spellings from one template: `${isHook ? "Hook" :
+	// "Test"} timed out in ${timeout}ms`. Keep the hook member in the same
+	// regression family so a hook starved by registry load gets the same retry.
+	it("#2839 (b2): a vitest hook timeout beside network evidence classifies infra-net", () => {
+		const log = [
+			"npm error code ECONNRESET",
+			"npm-retry: attempt 1 network error: ECONNRESET",
+			" FAIL default tests/a.test.ts > hook-backed test",
+			"Error: Hook timed out in 300ms.",
+		].join("\n");
+		expect(classifyFailureLog(log).kind).toBe("infra-net");
+	});
+
+	it("#2839: Windows CRLF and GitHub error annotations normalize once", () => {
+		expect(
+			classifyFailureLog(fixture("infra-net-windows-crlf-prefix.real.log"))
+				.kind,
+		).toBe("infra-net");
+	});
+
+	// The demotion is positive evidence: every test-level FAIL block must have
+	// a timeout as its first error. A neighboring thrown failure stays real.
+	it("#2839 F2: a TypeError in a second FAIL block stays real", () => {
+		const log = [
+			"npm error code ECONNRESET",
+			"npm-retry: attempt 1 network error: ECONNRESET",
+			" FAIL default tests/a.test.ts > slow sweep",
+			"Error: Test timed out in 5000ms.",
+			" FAIL default tests/b.test.ts > parses payload",
+			"TypeError: Cannot read properties of undefined (reading 'map')",
+		].join("\n");
+		expect(classifyFailureLog(log).kind).toBe("real");
+	});
+
+	// Mutation proof for the FAIL-block count guard: the file-level FAIL has no
+	// FAIL_LINE match, so dropping the count comparison would demote the timeout.
+	it("#2839 F2: an unparsed file-level FAIL keeps the run real", () => {
+		const log = [
+			"npm error code ECONNRESET",
+			" FAIL default tests/collection.test.ts",
+			"Error: Cannot find module './missing'",
+			" FAIL default tests/a.test.ts > slow sweep",
+			"Error: Test timed out in 5000ms.",
+		].join("\n");
+		expect(classifyFailureLog(log).kind).toBe("real");
+	});
+
+	// Shape 43 recurrence: detector needles must not consume a test title or
+	// console echo as evidence. Only the FAIL block's error and npm-owned lines
+	// can arm this demotion.
+	it("#2839 F3: echoed timeout and network text stays real", () => {
+		const log = [
+			'console.log "npm error code ECONNRESET"',
+			" FAIL default tests/a.test.ts > mentions Test timed out in 5000ms",
+			"TypeError: Cannot read properties of undefined (reading 'map')",
+		].join("\n");
+		expect(classifyFailureLog(log).kind).toBe("real");
+	});
+
+	it("#2839 F3: a console echo of npm error stays out of network evidence", () => {
+		const log = [
+			'console.log "npm error code ECONNRESET"',
+			" FAIL default tests/a.test.ts > starved test",
+			"Error: Test timed out in 5000ms.",
+		].join("\n");
+		expect(classifyFailureLog(log).kind).toBe("real");
+	});
+
+	// Mutation proof for the first-error predicate: a later echoed timeout must
+	// not replace a block whose first error is a TypeError.
+	it("#2839 F3: a later timeout echo does not replace the first real error", () => {
+		const log = [
+			"npm error code ECONNRESET",
+			" FAIL default tests/a.test.ts > broken parser",
+			"TypeError: Cannot read properties of undefined (reading 'map')",
+			"console.log Test timed out in 5000ms",
+		].join("\n");
+		expect(classifyFailureLog(log).kind).toBe("real");
+	});
+
+	// (c) An AssertionError beside the same network evidence still wins as
+	// real -- the demotion must never eat a genuine assertion failure.
+	it("#2839 (c): an AssertionError beside registry ECONNRESET stays real", () => {
+		const log = [
+			"npm error code ECONNRESET",
+			"npm error code ECONNRESET",
+			"npm-retry: attempt 1 network error: ECONNRESET",
+			" FAIL default tests/a.test.ts > assertion beside timeout",
+			"Error: Test timed out in 5000ms.",
+			"AssertionError: expected 2 to be 1",
+			"",
+		].join("\n");
+		expect(classifyFailureLog(log).kind).toBe("real");
+	});
+
+	it("#2839 F4: a compiler diagnostic beside a timeout stays real", () => {
+		const log = [
+			"npm error code ECONNRESET",
+			"npm-retry: attempt 1 network error: ECONNRESET",
+			" FAIL default tests/a.test.ts > compiler-backed test",
+			"Error: Test timed out in 5000ms.",
+			"src/a.ts(12,34): error TS2322: Type string is not assignable",
+		].join("\n");
+		expect(classifyFailureLog(log).kind).toBe("real");
+	});
+
+	// (d) A lone timeout with NO network evidence is unchanged from
+	// pre-#2839: real. This is the mutation-proof anchor for the network
+	// precondition -- deleting that precondition flips this log to infra-net.
+	it("#2839 (d): a lone test timeout with no network evidence stays real", () => {
+		expect(classifyFailureLog("Error: Test timed out in 5000ms.\n").kind).toBe(
+			"real",
+		);
+	});
+
+	// (e) The npm-retry wrapper's own attempt line is network evidence on its
+	// own. The line shape is quoted from scripts/npm-retry.mjs's literal
+	// `npm-retry: attempt ${attempt + 1} ${reason}` print (verified against
+	// that shipped source, like the mem-watch KILLED fixture above); no real
+	// capture has this shape alone because the wrapper echoes npm's stderr
+	// through. Mutation proof for the NPM_RETRY_ATTEMPT_LINE needle: without
+	// it this log has no error-prefixed network line and falls back to real.
+	it("#2839 (e): an npm-retry attempt line as the only network witness demotes a timeout to infra-net", () => {
+		const log = [
+			"npm-retry: attempt 1 network error: ECONNRESET",
+			"npm-retry: attempt 2 network error: ECONNRESET",
+			"Error: Test timed out in 5000ms.",
+			"",
+		].join("\n");
+		expect(classifyFailureLog(log).kind).toBe("infra-net");
+	});
+
+	it("#2839 F5: kill evidence outranks timeout-plus-network demotion", () => {
+		const log = [
+			"npm error code ECONNRESET",
+			"npm-retry: attempt 1 network error: ECONNRESET",
+			" FAIL default tests/a.test.ts > starved test",
+			"Error: Test timed out in 5000ms.",
+			"KILLED by kernel OOM",
+			"##[error]Process completed with exit code 137.",
+		].join("\n");
+		expect(classifyFailureLog(log).kind).toBe("infra-kill");
+	});
+
+	// The needle must stay scoped to the NETWORK reason: the wrapper prints
+	// `npm-retry: attempt N exited 1 (ERESOLVE)` for deterministic failures
+	// too (that exact line is in the real #2834 log), and a deterministic
+	// dependency conflict is not registry unreachability.
+	it("#2839: an npm-retry deterministic-failure line is not network evidence", () => {
+		const log = [
+			"npm-retry: attempt 1 exited 1 (ERESOLVE)",
+			"Error: Test timed out in 5000ms.",
+			"",
+		].join("\n");
+		expect(classifyFailureLog(log).kind).toBe("real");
 	});
 });
 

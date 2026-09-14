@@ -1,4 +1,5 @@
 import { safeSpawnAsync } from "../../safe-spawn.js";
+import { logRunnerAdvisoryOnce } from "../../tool-cwd.js";
 import { getLinterPolicyForCwd, hasYamllintConfig } from "../../tool-policy.js";
 import { PRIORITY } from "../priorities.js";
 import type {
@@ -9,6 +10,7 @@ import type {
 } from "../types.js";
 import {
 	createAvailabilityChecker,
+	resolveRunnerCwd,
 	resolveToolCommandWithInstallFallback,
 } from "./utils/runner-helpers.js";
 import { parseToolRun } from "./utils/tool-failure.js";
@@ -50,14 +52,19 @@ const yamllintRunner: RunnerDefinition = {
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
-		const cwd = ctx.cwd || process.cwd();
+		const cwd = resolveRunnerCwd(ctx, "yamllint");
 		const policy = getLinterPolicyForCwd(ctx.filePath, cwd);
 		if (policy && !policy.preferredRunners.includes("yamllint")) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 		const hasConfig = hasYamllintConfig(cwd);
 		if (!hasConfig) {
-			ctx.log("yamllint: no config detected, running with default rules");
+			logRunnerAdvisoryOnce(
+				ctx,
+				"yamllint",
+				cwd,
+				"yamllint: no config detected, running with default rules",
+			);
 		}
 
 		let cmd: string | null = null;

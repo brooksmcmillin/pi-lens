@@ -1,4 +1,4 @@
-// flake-shape: real-process-spawn — three spawns, each pinning something no
+// flake-shape: real-process-spawn — four spawns, each pinning something no
 // in-process double can reach. (1) `npm pack` of a two-line fixture package
 // whose `prepare` writes through `os.homedir()`: the F1 defect was npm
 // IGNORING the env it was handed, so an assertion on scratchEnv()'s OUTPUT
@@ -35,7 +35,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { gitExecFileSync } from "../../scripts/lib/git-fixture-env.mjs";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import * as os from "node:os";
 import {
 	BASELINE_COLUMNS,
@@ -54,8 +54,16 @@ import {
 	parseSupplyArgs,
 	PINNED_ENV_KEYS,
 	pollToTerminal,
+	removeScratchRoot,
 	rowReportShows,
 	rowProbeRequest,
+	runToolSmokeInstallProbe,
+	classifyPublishToolchain,
+	isUnmeasured,
+	unmeasuredRowIds,
+	pinnedNpm,
+	PUBLISH_TOOLCHAIN_ROW_ID,
+	runPublishToolchainProbe,
 	scratchEnv,
 	renderCoverageLine,
 	renderReport,
@@ -163,6 +171,51 @@ describe("release-QA baseline matrix parsing (#2606)", () => {
 			"umbrella",
 		]);
 	});
+
+	it("requires every documented entry-point path in its named source (#2893)", () => {
+		const { rows } = parseBaselineRows(baselineText());
+		const packageFiles = (
+			JSON.parse(
+				fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8"),
+			) as { files: string[] }
+		).files;
+		const hasDist = fs.existsSync(path.join(REPO_ROOT, "dist"));
+		const pathPattern = /<(export|installed)>\/([^\s`]+)/g;
+		for (const parsed of rows) {
+			const matches = [...parsed.entryPoint.matchAll(pathPattern)];
+			for (const [, source, relative] of matches) {
+				if (source === "export") {
+					expect(
+						fs.existsSync(path.join(REPO_ROOT, relative)),
+						`${parsed.id}: ${relative}`,
+					).toBe(true);
+				} else {
+					// Stryker sandboxes contain tracked sources, not gitignored dist/.
+					// The package-file assertion below remains unconditional; this
+					// check runs when a local build makes the installed path available.
+					if (hasDist) {
+						expect(
+							fs.existsSync(path.join(REPO_ROOT, relative)),
+							`${parsed.id}: ${relative} is not present in the built export`,
+						).toBe(true);
+					}
+					expect(
+						packageFiles.some(
+							(file) =>
+								relative === file ||
+								relative.startsWith(file.replace(/\/$/, "")),
+						),
+						`${parsed.id}: ${relative} is not packaged`,
+					).toBe(true);
+				}
+			}
+		}
+		const smoke = rows.find((parsed) => parsed.id === "tool-smoke-install");
+		expect(smoke?.entryPoint).toContain("<export>/scripts/smoke-tools.mjs");
+		expect(smoke?.entryPoint).toContain(
+			"<installed>/dist/clients/installer/index.js",
+		);
+	});
 });
 
 describe("release-QA matrix and probe map are one list (#2606)", () => {
@@ -174,6 +227,381 @@ describe("release-QA matrix and probe map are one list (#2606)", () => {
 		const { rows } = parseBaselineRows(baselineText());
 		const documented = rows.map((r) => r.id).sort();
 		expect(implementedRowIds()).toEqual(documented);
+	});
+});
+
+describe("release-QA tool-smoke install lane (#2663)", () => {
+	// The doc↔probe tie for #2663's row, pinned by name: the tool-smoke
+	// install lane (#2661's red-on-genuine-install-failure classification)
+	// joins the release gate, and a row present in only one of the two lists
+	// is either an undocumented probe or a documented row the runner silently
+	// skips. The generic tie above holds the whole list; this one names the
+	// new row so its removal reads as a named failure, not a count drift.
+	it("documents the tool-smoke-install row and implements its probe", () => {
+		const { rows } = parseBaselineRows(baselineText());
+		const documented = rows.find((r) => r.id === "tool-smoke-install");
+		expect(
+			documented,
+			"row tool-smoke-install is missing from the matrix",
+		).toBeDefined();
+		expect(implementedRowIds()).toContain("tool-smoke-install");
+	});
+
+	function stubSmoke(report: Record<string, unknown>, exitCode = 0) {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "release-qa-smoke-"));
+		const scripts = path.join(root, "scripts");
+		fs.mkdirSync(scripts);
+		fs.writeFileSync(
+			path.join(scripts, "smoke-tools.mjs"),
+			`process.stdout.write(${JSON.stringify(JSON.stringify(report))}); process.exit(${exitCode});\n`,
+		);
+		return root;
+	}
+
+	it("maps a red install row to exit 1 through the real smoke process boundary", () => {
+		const root = stubSmoke({
+			lane: "install-registry",
+			toolCount: 1,
+			installed: 0,
+			results: [{ toolId: "dead-tool", state: "fail", detail: "E404" }],
+		});
+		const installedRoot = fs.mkdtempSync(
+			path.join(os.tmpdir(), "release-qa-installed-"),
+		);
+		try {
+			const raw = runToolSmokeInstallProbe({
+				installedPkgDir: installedRoot,
+				exportRoot: root,
+				projectDir: root,
+				env: { ...process.env, PI_LENS_HOME: path.join(root, ".probe-home") },
+			});
+			const result = { id: "tool-smoke-install", ...classifyRowOutcome(raw) };
+			const verdict = shipVerdict([result]);
+			expect(verdictExitCode(verdict.verdict)).toBe(1);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+			fs.rmSync(installedRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("names a genuine install failure when smoke exits after printing JSON", () => {
+		const root = stubSmoke(
+			{
+				lane: "install-registry",
+				toolCount: 1,
+				installed: 0,
+				results: [
+					{
+						toolId: "yamllint",
+						state: "fail",
+						detail: "ensureTool(yamllint) failed: dead registry entry",
+					},
+				],
+			},
+			1,
+		);
+		const installedRoot = fs.mkdtempSync(
+			path.join(os.tmpdir(), "release-qa-installed-"),
+		);
+		try {
+			const raw = runToolSmokeInstallProbe({
+				installedPkgDir: installedRoot,
+				exportRoot: root,
+				projectDir: root,
+				env: { ...process.env, PI_LENS_HOME: path.join(root, ".probe-home") },
+			});
+			expect(raw.status).toBe("fail");
+			expect(raw.detail).toContain("yamllint");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+			fs.rmSync(installedRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("passes the distinct installed root to the export smoke process", () => {
+		const exportRoot = fs.mkdtempSync(
+			path.join(os.tmpdir(), "release-qa-export-"),
+		);
+		const installedRoot = fs.mkdtempSync(
+			path.join(os.tmpdir(), "release-qa-installed-"),
+		);
+		fs.mkdirSync(path.join(exportRoot, "scripts"));
+		fs.writeFileSync(
+			path.join(exportRoot, "scripts", "smoke-tools.mjs"),
+			"process.stdout.write(JSON.stringify({lane:'install-registry',toolCount:1,installed:1,results:[],ok:true,args:process.argv.slice(2)}))",
+		);
+		try {
+			const raw = runToolSmokeInstallProbe({
+				exportRoot,
+				installedPkgDir: installedRoot,
+				projectDir: exportRoot,
+				env: process.env,
+			});
+			expect(raw.status).toBe("pass");
+			expect(raw.witness?.content).toContain(
+				`--installer-root=${installedRoot}`,
+			);
+		} finally {
+			fs.rmSync(exportRoot, { recursive: true, force: true });
+			fs.rmSync(installedRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("makes a missing installer root inconclusive instead of green", () => {
+		const raw = runToolSmokeInstallProbe({
+			exportRoot: "/tmp/export",
+			installedPkgDir: "",
+			projectDir: "/tmp",
+			env: process.env,
+		});
+		expect(raw.status).toBe("error");
+	});
+
+	it("maps a network-unreachable install row to exit 3 through the real smoke process boundary", () => {
+		const root = stubSmoke({
+			lane: "install-registry",
+			toolCount: 1,
+			installed: 0,
+			results: [
+				{
+					toolId: "offline-tool",
+					state: "skip",
+					detail: "transient registry/network condition",
+					networkUnreachable: true,
+				},
+			],
+		});
+		try {
+			const raw = runToolSmokeInstallProbe({
+				installedPkgDir: root,
+				exportRoot: root,
+				projectDir: root,
+				env: { ...process.env, PI_LENS_HOME: path.join(root, ".probe-home") },
+			});
+			expect(raw.status).toBe("unreachable");
+			// #2940: this lane's skip is the one that leaves ground truth
+			// UNMEASURED, so it — unlike a reachability skip — refuses the ship
+			// verdict. `main()` reads this flag, not "any skipped row".
+			expect(isUnmeasured(raw)).toBe(true);
+			const result = { id: "tool-smoke-install", ...classifyRowOutcome(raw) };
+			const verdict = shipVerdict([result], {
+				inconclusiveReason: "registry-unreachable row(s) left UNMEASURED",
+			});
+			expect(verdictExitCode(verdict.verdict)).toBe(3);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("release-QA publish toolchain lane (#2940)", () => {
+	// Recurrence: #2940. 9183f39c6 routed release.yml's pin and install steps
+	// through `npx -y npm@<pin>` and left `npm publish` bare, so the publish
+	// job ran Node 22's bundled npm with no OIDC support. The v4.1.6 run
+	// (34530690014) created the tag and the GitHub release, then took
+	// `npm error 404 Not Found - PUT https://registry.npmjs.org/pi-lens`.
+	// Nothing had ever RUN that job's toolchain before a release; this row is
+	// what runs it.
+	it("documents the publish-toolchain row and implements its probe", () => {
+		const { rows } = parseBaselineRows(baselineText());
+		expect(
+			rows.find((r) => r.id === PUBLISH_TOOLCHAIN_ROW_ID),
+			`row ${PUBLISH_TOOLCHAIN_ROW_ID} is missing from the matrix`,
+		).toBeDefined();
+		expect(implementedRowIds()).toContain(PUBLISH_TOOLCHAIN_ROW_ID);
+	});
+
+	it("fails the row when the pinned invocation answers a different npm", () => {
+		const verdict = classifyPublishToolchain({
+			pin: "11.18.0",
+			reportedVersion: "10.9.4",
+			dryRunExitCode: 0,
+		});
+		expect(verdict.status).toBe("fail");
+		expect(verdict.detail).toContain("10.9.4");
+		expect(verdict.detail).toContain("11.18.0");
+	});
+
+	it("fails the row when the dry-run publish exits non-zero, naming the cause", () => {
+		const verdict = classifyPublishToolchain({
+			pin: "11.18.0",
+			reportedVersion: "11.18.0",
+			dryRunExitCode: 1,
+			dryRunTail: "npm notice\nnpm error code E404\n",
+		});
+		expect(verdict.status).toBe("fail");
+		expect(verdict.detail).toContain("E404");
+	});
+
+	it("passes an already-published dry run with the registry conflict noted", () => {
+		const verdict = classifyPublishToolchain({
+			pin: "11.18.0",
+			reportedVersion: "11.18.0",
+			dryRunExitCode: 1,
+			dryRunTail:
+				"npm error code EPUBLISHCONFLICT\nnpm error You cannot publish over the previously published versions: 4.1.6.\nnpm error A complete log can be found in: /tmp/npm-debug.log",
+		});
+		expect(verdict.status).toBe("pass");
+		expect(verdict.detail).toContain("already published");
+		expect(verdict.detail).toContain("EPUBLISHCONFLICT");
+	});
+
+	it("marks a pinned npm resolution failure as unmeasured", () => {
+		const root = fs.mkdtempSync(
+			path.join(os.tmpdir(), "release-qa-npx-unreachable-"),
+		);
+		try {
+			fs.writeFileSync(
+				path.join(root, "package.json"),
+				'{"packageManager":"npm@11.18.0"}',
+			);
+			const raw = runPublishToolchainProbe({
+				exportRoot: root,
+				exportedCommit: "ed63eb2f8",
+				env: { ...process.env, PATH: path.join(root, "missing-bin") },
+			});
+			expect(raw.status).toBe("unreachable");
+			expect(raw.unmeasured).toBe(true);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("errors rather than passing when package.json pins no npm", () => {
+		expect(
+			classifyPublishToolchain({ pin: "", reportedVersion: "11.18.0" }).status,
+		).toBe("error");
+	});
+
+	it("passes only when the pin answered AND the dry run exited 0", () => {
+		const verdict = classifyPublishToolchain({
+			pin: "11.18.0",
+			reportedVersion: "11.18.0",
+			dryRunExitCode: 0,
+		});
+		expect(verdict.status).toBe("pass");
+		expect(verdict.detail).toContain("11.18.0");
+	});
+
+	it("records only unmeasured rows in the inconclusive reason set", () => {
+		expect(
+			unmeasuredRowIds([
+				{ id: "git-install-loads", status: "unreachable", unmeasured: false },
+				{
+					id: PUBLISH_TOOLCHAIN_ROW_ID,
+					status: "unreachable",
+					unmeasured: true,
+				},
+				{ id: "tool-smoke-install", status: "pass", unmeasured: false },
+			]),
+		).toEqual([PUBLISH_TOOLCHAIN_ROW_ID]);
+	});
+
+	// A stub `npx` on PATH ahead of the real one, so the probe's REAL argv is
+	// the subject and nothing reaches the registry. `reports` is what the stub
+	// answers for `--version`; `dryRunExit` is the dry run's exit code.
+	function stubNpx(reports: string, dryRunExit = 0) {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "release-qa-npx-"));
+		const binDir = path.join(root, "bin");
+		fs.mkdirSync(binDir);
+		const argvLog = path.join(root, "argv.log");
+		fs.writeFileSync(
+			path.join(binDir, "npx"),
+			[
+				"#!/usr/bin/env node",
+				'const fs = require("fs");',
+				"const args = process.argv.slice(2);",
+				`fs.appendFileSync(${JSON.stringify(argvLog)}, args.join(" ") + "\\n");`,
+				`if (args.includes("--version")) { console.log(${JSON.stringify(reports)}); process.exit(0); }`,
+				'console.log("npm notice Tarball Details");',
+				`process.exit(${dryRunExit});`,
+				"",
+			].join("\n"),
+			{ mode: 0o755 },
+		);
+		fs.writeFileSync(
+			path.join(root, "package.json"),
+			JSON.stringify({ name: "pi-lens", packageManager: "npm@11.18.0" }),
+		);
+		return {
+			root,
+			argv: () =>
+				fs.existsSync(argvLog)
+					? fs.readFileSync(argvLog, "utf8").trim().split("\n")
+					: [],
+			ctx: {
+				exportRoot: root,
+				exportedCommit: "deadbee",
+				env: {
+					...process.env,
+					PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
+				},
+			},
+		};
+	}
+
+	it("drives the argv release.yml publishes with, and passes on the pin", () => {
+		const stub = stubNpx("11.18.0");
+		try {
+			const raw = runPublishToolchainProbe(stub.ctx);
+			expect(stub.argv()).toEqual([
+				"-y npm@11.18.0 --version",
+				"-y npm@11.18.0 publish --dry-run",
+			]);
+			expect(raw.status).toBe("pass");
+			expect(raw.witness?.content).toContain("Tarball Details");
+		} finally {
+			fs.rmSync(stub.root, { recursive: true, force: true });
+		}
+	});
+
+	it("fails through the real spawn when npx answers a different npm", () => {
+		const stub = stubNpx("10.9.4");
+		try {
+			const raw = runPublishToolchainProbe(stub.ctx);
+			expect(raw.status).toBe("fail");
+			expect(raw.detail).toContain("10.9.4");
+		} finally {
+			fs.rmSync(stub.root, { recursive: true, force: true });
+		}
+	});
+
+	it("fails through the real spawn when the dry-run publish exits non-zero", () => {
+		const stub = stubNpx("11.18.0", 1);
+		try {
+			expect(runPublishToolchainProbe(stub.ctx).status).toBe("fail");
+		} finally {
+			fs.rmSync(stub.root, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses to spawn the pinned npm without the pinned env", () => {
+		// Same rule as npm() (#2619 review F1/N1): a dry-run publish runs our
+		// own prepack/prepare, which write through os.homedir().
+		expect(() => pinnedNpm("11.18.0", ["--version"], os.tmpdir())).toThrow(
+			/pinned scratch env/,
+		);
+	});
+
+	it("skips the row, without refusing the ship verdict, when nothing was exported", () => {
+		// `--from npm:pi-lens@X` QAs a PUBLISHED release: there is no candidate
+		// tree, and a dry-run publish fires prepack/prepare, so it may never run
+		// in the live checkout.
+		const raw = runPublishToolchainProbe({
+			exportRoot: REPO_ROOT,
+			env: process.env,
+		});
+		expect(classifyRowOutcome(raw).outcome).toBe("SKIPPED");
+		expect(isUnmeasured(raw)).toBe(false);
+		const verdict = shipVerdict(
+			[
+				row("pack-skills-payload", "PASS"),
+				{ id: PUBLISH_TOOLCHAIN_ROW_ID, ...classifyRowOutcome(raw) },
+			],
+			{ inconclusiveReason: "" },
+		);
+		expect(verdict.verdict).toBe("SHIP-WITH-CAVEATS");
+		expect(verdictExitCode(verdict.verdict)).toBe(2);
 	});
 });
 
@@ -518,6 +946,23 @@ describe("release-QA scratch hermeticity (#2619 review F1)", () => {
 		expect(() => npm(["--version"], REPO_ROOT)).toThrow(
 			/npm\(\) requires the pinned scratch env/,
 		);
+	});
+
+	it("keeps host pip and npm policy overrides out of the install-row environment", () => {
+		const priorPip = process.env.PIP_BREAK_SYSTEM_PACKAGES;
+		const priorNpm = process.env.npm_config_userconfig;
+		process.env.PIP_BREAK_SYSTEM_PACKAGES = "host-value";
+		process.env.npm_config_userconfig = "/host/.npmrc";
+		try {
+			const env = scratchEnv(scratchRoot);
+			expect(env.PIP_BREAK_SYSTEM_PACKAGES).toBe("1");
+			expect(env.npm_config_userconfig).toBeUndefined();
+		} finally {
+			if (priorPip === undefined) delete process.env.PIP_BREAK_SYSTEM_PACKAGES;
+			else process.env.PIP_BREAK_SYSTEM_PACKAGES = priorPip;
+			if (priorNpm === undefined) delete process.env.npm_config_userconfig;
+			else process.env.npm_config_userconfig = priorNpm;
+		}
 	});
 
 	it("keeps a packed package's own lifecycle script inside the scratch root", () => {
@@ -942,7 +1387,9 @@ describe("release-QA dirty-checkout refusal (#2619 review F1)", () => {
 		// real script out of a throwaway tree with a dirty git repo at its root
 		// exercises the call site itself. No pi, no network: the refusal fires
 		// before the scratch root is created.
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "release-qa-dirty-"));
+		const root = fs.mkdtempSync(
+			path.join(REPO_ROOT, ".probe-home", "release-qa-dirty-"),
+		);
 		try {
 			fs.mkdirSync(path.join(root, "scripts", "lib"), { recursive: true });
 			for (const rel of [
@@ -1008,6 +1455,71 @@ describe("release-QA argument parsing (#2606)", () => {
 		expect(() => parseArgs(["--git-ref"])).toThrow(
 			/--git-ref requires a value/,
 		);
+	});
+
+	it("accepts an explicit scratch root and the existing keep flag independently", () => {
+		const opts = parseArgs(["--scratch-root", "/tmp/qa", "--keep"]);
+		expect(opts.scratchRoot).toBe("/tmp/qa");
+		expect(opts.keep).toBe(true);
+	});
+
+	it("removes an owned scratch root through the real filesystem helper", () => {
+		const root = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-release-qa-test-"),
+		);
+		fs.writeFileSync(path.join(root, "marker"), "owned");
+		removeScratchRoot(root);
+		expect(fs.existsSync(root)).toBe(false);
+	});
+
+	it("removes an owned explicit scratch root on SIGTERM", async () => {
+		const parent = fs.mkdtempSync(
+			path.join(REPO_ROOT, ".probe-home", "release-qa-signal-"),
+		);
+		const scratchRoot = path.join(parent, "owned-scratch");
+		const fakePi = path.join(parent, "fake-pi.mjs");
+		fs.writeFileSync(fakePi, "#!/usr/bin/env node\nprocess.stdin.resume();\n");
+		fs.chmodSync(fakePi, 0o755);
+		try {
+			const child = spawn(
+				process.execPath,
+				[
+					path.join(REPO_ROOT, "scripts/release-qa.mjs"),
+					"--pi",
+					fakePi,
+					"--scratch-root",
+					scratchRoot,
+					"--from",
+					"npm:pi-lens@0.0.0",
+					"--poll-cap-ms",
+					"1000",
+				],
+				{ cwd: REPO_ROOT, stdio: ["ignore", "pipe", "pipe"] },
+			);
+			const result = await new Promise<{
+				code: number | null;
+				signal: NodeJS.Signals | null;
+				stderr: string;
+			}>((resolve) => {
+				let signalled = false;
+				let stderr = "";
+				child.stderr.on("data", (chunk: Buffer) => {
+					stderr += chunk.toString();
+				});
+				child.stdout.on("data", (chunk: Buffer) => {
+					if (signalled || !chunk.toString().includes("scratch root:")) return;
+					signalled = true;
+					child.kill("SIGTERM");
+				});
+				child.once("close", (code, signal) =>
+					resolve({ code, signal, stderr }),
+				);
+			});
+			expect(result, result.stderr).toMatchObject({ code: 143, signal: null });
+			expect(fs.existsSync(scratchRoot)).toBe(false);
+		} finally {
+			fs.rmSync(parent, { recursive: true, force: true });
+		}
 	});
 });
 // flake-shape: real-process-spawn — this test calls a child-process helper; its boundary remains part of the contention surface

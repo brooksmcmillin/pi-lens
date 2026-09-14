@@ -4,11 +4,13 @@ import * as path from "node:path";
 import { noteAuthoritativeContentAttachment } from "./agent-nudge.js";
 import {
 	captureFileStats,
-	diffFileStats,
+	type CaptureOptions,
+	diffFileContent,
 	getOpaqueBaselineStore,
 	recoverOpaqueChangesViaGit,
 } from "./opaque-mutation-scan.js";
 import { normalizeMapKey } from "./path-utils.js";
+import { detectFileKind } from "./file-kinds.js";
 import {
 	extractReadPathsFromCommand,
 	extractDeletedPathsFromCommand,
@@ -62,10 +64,14 @@ import {
 	getReadGuardCorrelationId,
 	logReadGuardEvent,
 } from "./read-guard-logger.js";
+import { countFileLines } from "./read-guard-tool-lines.js";
 import type { PiLensFlagSource } from "./lens-config.js";
 import type { EditToolDetails } from "@earendil-works/pi-coding-agent";
 import type { LSPShutdownOptions } from "./lsp/client.js";
-import { notifyExternalFileChange } from "./lsp/index.js";
+import {
+	notifyExternalFileChange,
+	resyncGitChangedFiles,
+} from "./lsp/index.js";
 import type { MetricsClient } from "./metrics-client.js";
 import { type PipelineResult, runPipeline } from "./pipeline.js";
 import {
@@ -82,8 +88,19 @@ import { syncGitGuardRecord } from "./git-guard.js";
 import { scheduleWordIndexPersist } from "./word-index.js";
 import { RUNTIME_CONFIG } from "./runtime-config.js";
 import { getActiveSessionId } from "./session-lifecycle.js";
+import { requestBootstrapClients } from "./bootstrap.js";
+import { bounded } from "./deadline-utils.js";
+import { HOOK_WALL_BUDGET_MS } from "./hook-budgets.js";
+import {
+	incrementDegradationCount,
+	recordDegradationOnce,
+} from "./degradation-ledger.js";
 
 const AUTHORITATIVE_CONTENT_MAX_BYTES = RUNTIME_CONFIG.pipeline.lspMaxFileBytes;
+
+// Keep same-turn analysis below the observed-directory capture bound so one
+// opaque codemod cannot monopolize the hook or analyzer fleet.
+const OBSERVED_DISPATCH_MAX_PATHS = 32;
 
 /**
  * Git subcommands that import ANOTHER commit's content into the index. The
@@ -182,6 +199,8 @@ interface ToolResultEvent {
 }
 
 interface ToolResultDeps {
+	/** Abort signal owned by the tool_result hook. */
+	signal?: AbortSignal;
 	event: ToolResultEvent;
 	getFlag: (name: string, filePath?: string) => boolean | string | undefined;
 	/** Optional: provenance for dbg/skip logs — see `PipelineContext["getFlagSource"]` (#792). */
@@ -189,9 +208,9 @@ interface ToolResultDeps {
 	dbg: (msg: string) => void;
 	runtime: RuntimeCoordinator;
 	cacheManager: CacheManager;
-	biomeClient: BiomeClient;
-	ruffClient: RuffClient;
-	metricsClient: MetricsClient;
+	biomeClient?: BiomeClient;
+	ruffClient?: RuffClient;
+	metricsClient?: MetricsClient;
 	resetLSPService: (options?: LSPShutdownOptions) => void;
 	agentBehaviorRecord: (toolName: string, filePath?: string) => unknown[];
 	formatBehaviorWarnings: (warnings: unknown[]) => string;
@@ -227,6 +246,34 @@ interface ToolResultDeps {
 	 * — a direct write, bounded by the per-file cap alone.
 	 */
 	_attachmentBudget?: { remaining: number };
+	/** Internal test seam for making missing observation evidence reachable. */
+	_opaqueCaptureOptions?: Pick<CaptureOptions, "forcedUnknownReason">;
+	/** Internal: synthetic dispatch inherits the parent's read-guard evidence. */
+	_readGuardAuthorship?: boolean;
+}
+
+function ensureToolResultClients(
+	deps: ToolResultDeps,
+): boolean | Promise<boolean> {
+	if (deps.biomeClient && deps.ruffClient && deps.metricsClient) return true;
+	const request = {
+		reason: "tool-result-analysis",
+		hook: "tool_result_edit" as const,
+		timeoutMs: HOOK_WALL_BUDGET_MS.tool_result_edit,
+		...(deps.signal === undefined ? {} : { signal: deps.signal }),
+	};
+	return bounded(requestBootstrapClients(request), {
+		ms: HOOK_WALL_BUDGET_MS.tool_result_edit,
+		signal: deps.signal,
+		hook: "tool_result_edit",
+		label: "tool-result-bootstrap-demand",
+	}).then((clients) => {
+		if (!clients) return false;
+		deps.biomeClient = clients.biomeClient;
+		deps.ruffClient = clients.ruffClient;
+		deps.metricsClient = clients.metricsClient;
+		return true;
+	});
 }
 
 function parseDiffRanges(diff: string): { start: number; end: number }[] {
@@ -300,13 +347,11 @@ export function clearLastAnalyzedStateCache(): void {
  * with one owner (#2464 review round 3, F1) rather than two open-coded blocks
  * ~80 lines apart whose invariants only line up if a reader checks both.
  *
- * Exported for the isolation red in
- * `tests/clients/observed-mutation-integration.test.ts`: with
- * `claimPipelineDispatch` below now consulted by BOTH dispatch call sites, the
- * identity guard in the release has no reachable production trigger left, so
- * the only honest way to prove it is to drive the seam directly.
+ * Kept private because both dispatch call sites now use the shared claim before
+ * registration; publishing this seam without the claim obligation would make
+ * the identity guard's precondition easy to violate again.
  */
-export function registerInFlightPipeline(
+function registerInFlightPipeline(
 	filePath: string,
 	stateHash: string,
 	pipeline: InFlightPipeline,
@@ -333,7 +378,7 @@ export function registerInFlightPipeline(
  * deduping and its `participantIds`/`participantTotal` under-count. Delete only
  * when the outer map still points at the very map this registration went into.
  */
-export function releaseInFlightPipeline(
+function releaseInFlightPipeline(
 	filePath: string,
 	stateHash: string,
 	registered: Map<string, InFlightPipeline>,
@@ -386,7 +431,7 @@ export type PipelineDispatchClaim =
  * already analysed this turn — the duplicate-recording inversion #2464 exists
  * to remove.
  */
-export function claimPipelineDispatch(args: {
+function claimPipelineDispatch(args: {
 	filePath: string;
 	stateHash: string;
 	turnIndex: number;
@@ -763,6 +808,9 @@ async function dispatchPipelineAnalysis(args: {
 	 * round 2, S1) — a call site cannot be trusted to remember to do it.
 	 */
 	nativeAppliedPairs: Array<{ oldText: string; newText: string | undefined }>;
+	// The original bash result can reach this helper without authorship
+	// evidence; synthetic write results deliberately set this true.
+	allowReadGuardWrites: boolean;
 }): Promise<
 	| { crashed: false; result: PipelineResult }
 	| {
@@ -789,6 +837,7 @@ async function dispatchPipelineAnalysis(args: {
 		isPartialApplyResult,
 		toolResultStart,
 		nativeAppliedPairs,
+		allowReadGuardWrites,
 	} = args;
 	const {
 		event,
@@ -803,6 +852,7 @@ async function dispatchPipelineAnalysis(args: {
 
 	const pipelinePromise = runPipeline(
 		{
+			signal: deps.signal,
 			filePath,
 			cwd: dispatchCwd,
 			projectRoot: turnStateCwd,
@@ -845,9 +895,9 @@ async function dispatchPipelineAnalysis(args: {
 			},
 		},
 		{
-			biomeClient,
-			ruffClient,
-			metricsClient,
+			biomeClient: biomeClient!,
+			ruffClient: ruffClient!,
+			metricsClient: metricsClient!,
 			getFormatService,
 			fixedThisTurn: runtime.fixedThisTurn,
 		},
@@ -988,11 +1038,20 @@ async function dispatchPipelineAnalysis(args: {
 	// ladder (the #2402 after-write hash was never stamped), and a duplicate
 	// tool_result for the same bytes analysed the file a second time (the
 	// already-analysed latch was never set).
-	const finalStateHash = getFileStateHash(filePath);
-	lastAnalyzedStateByFile.set(filePath, {
-		turnIndex: runtime.turnIndex,
-		stateHash: finalStateHash,
-	});
+	// The latch identifies the bytes this pipeline actually analysed. A pipeline
+	// that reports no write analysed its input state, even if another writer
+	// changed disk while the await was parked. A pipeline-reported write selects
+	// only the identity captured by runPipeline before analysis awaits (#2499).
+	const pipelineOwnedWriteHash = result.fileModified
+		? result.postWriteStateHash
+		: undefined;
+	const finalStateHash = pipelineOwnedWriteHash ?? initialStateHash;
+	if (!result.fileModified || pipelineOwnedWriteHash !== undefined) {
+		lastAnalyzedStateByFile.set(filePath, {
+			turnIndex: runtime.turnIndex,
+			stateHash: finalStateHash,
+		});
+	}
 
 	// #2402: pi-lens' own immediate format/autofix may have rewritten the file
 	// after the native edit was recorded by the caller. Stamp the post-pipeline
@@ -1002,7 +1061,7 @@ async function dispatchPipelineAnalysis(args: {
 	// `initialStateHash` IS the post-write hash at both call sites — the
 	// classified chain passes `postWriteStateHash` verbatim, the observed path
 	// passes the same pre-settle digest.
-	if (finalStateHash !== initialStateHash) {
+	if (pipelineOwnedWriteHash !== undefined) {
 		for (const pair of nativeAppliedPairs) {
 			runtime.partialApplyRecords.noteAfterWriteHash(
 				filePath,
@@ -1016,7 +1075,7 @@ async function dispatchPipelineAnalysis(args: {
 	// The model's write/edit and pi-lens' own immediate format/autofix are now
 	// reflected on disk. Refresh read-guard staleness stamps so a follow-up edit
 	// is judged by read-range coverage, not by our own previous write.
-	if (!getFlag("no-read-guard")) {
+	if (!getFlag("no-read-guard") && allowReadGuardWrites) {
 		const changedForReadGuard = new Set([
 			path.resolve(filePath),
 			...(result.changedFiles ?? []).map((changedFile) =>
@@ -1049,6 +1108,8 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 
 	const rawFilePath = (event.input as { path?: string }).path;
 	const workspaceRoot = runtime.projectRoot || process.cwd();
+	let bashAuthorshipConfirmed =
+		deps._readGuardAuthorship ?? event.toolName !== "bash";
 
 	// #1642: a gitignored worktree edit got re-attributed onto a
 	// same-relative-path file in the parent checkout because this handler
@@ -1181,7 +1242,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		// THIS set, not raw recognized - otherwise a redirect target dropped
 		// by the isError filter would be subtracted from recovery AND
 		// excluded here, attributed nowhere.
-		const recognizedWritten =
+		let recognizedWritten =
 			event.isError !== true
 				? recognized.filter(
 						(wp) =>
@@ -1189,6 +1250,12 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 							!isPathIgnoredByProject(wp, workspaceRoot, false),
 					)
 				: [];
+		// Fence the mtime-based session-authored fallback before any async
+		// observation. Only later content evidence may clear this fence.
+		if (!getFlag("no-read-guard")) {
+			for (const recognizedPath of recognizedWritten)
+				deps.readGuard?.recordUnchanged?.(recognizedPath);
+		}
 		// #2000 phase 2: when the extractor recognizes NOTHING, the command is
 		// opaque-candidate — recover its actual changed set by diffing the pre
 		// snapshot taken at tool_call. Partial writes that landed before a
@@ -1196,6 +1263,8 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		// them) — a deliberate divergence from the isError filter above, which
 		// exists for restore semantics where attribution would lie.
 		let opaquePaths: string[] = [];
+		let observedChangedKeys: Set<string> | undefined;
+		let recognizedAuthored: string[] = [];
 		// Recovery runs for EVERY bash command with a pending baseline - not
 		// only recognized-empty ones. A mixed command (`python x.py > out.ts`
 		// plus script-internal writes) previously skipped observation entirely
@@ -1233,12 +1302,18 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 							!isExternalOrVendorFile(p, scanRoot) &&
 							!isPathIgnoredByProject(p, scanRoot, false),
 					);
+					observedChangedKeys = new Set(opaquePaths);
 				} else if (recovery.verdict === "unknown") {
 					// #2060: deliberately WIDER than the old `recognized.length > 0`
 					// guard. A fully opaque command whose probe failed is the shape
 					// whose coverage is least knowable, and it used to record
 					// nothing at all.
 					unknownReason = recovery.unknownReason;
+				} else {
+					// A clean git verdict is complete evidence that no path
+					// changed; it is not missing evidence. Keep recognized writes
+					// out of authorship because git found no changed bytes.
+					observedChangedKeys = new Set();
 				}
 				// #2060: both counts are bounded (one record per tool_result, no
 				// per-path logging) and exist because filtering is invisible in
@@ -1264,9 +1339,11 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			} else if (pending.stats) {
 				const outcome = await captureFileStats(scanRoot, {
 					withHashes: true,
+					...deps._opaqueCaptureOptions,
 				});
 				if (outcome.snapshot && !outcome.unknownReason) {
-					opaquePaths = diffFileStats(pending.stats, outcome.snapshot);
+					opaquePaths = diffFileContent(pending.stats, outcome.snapshot);
+					observedChangedKeys = new Set(opaquePaths);
 				} else {
 					unknownReason =
 						outcome.unknownReason ??
@@ -1281,6 +1358,16 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 					recognizedWritten.map((p) => normalizeMapKey(path.resolve(p))),
 				);
 				opaquePaths = opaquePaths.filter((p) => !survivingKeys.has(p));
+			}
+			if (observedChangedKeys) {
+				recognizedAuthored = recognizedWritten.filter((file) =>
+					observedChangedKeys!.has(normalizeMapKey(path.resolve(file))),
+				);
+				if (recognizedAuthored.length === 0) recognizedWritten = [];
+			} else if (unknownReason) {
+				recognizedAuthored = [];
+				// The bounded opaque_mutation_coverage_unknown record below remains
+				// the production proof that authorship evidence was unavailable.
 			}
 			if (unknownReason) {
 				logLatency({
@@ -1299,14 +1386,26 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 					durationMs: Date.now() - started,
 					result: `changed:${opaquePaths.length}`,
 				});
+				void resyncGitChangedFiles(opaquePaths).catch((err) => {
+					dbg(`git-change LSP resync failed: ${err}`);
+				});
 			}
 		}
 		// wp iterates opaquePaths VERBATIM (already normalizeMapKey keys), so the
 		// set must hold those exact strings - no re-resolution.
 		const opaqueSet = new Set(opaquePaths);
 		const written = [...recognizedWritten, ...opaquePaths];
+		const recognizedAuthoredSet = new Set(recognizedAuthored);
+		bashAuthorshipConfirmed =
+			recognizedAuthored.length > 0 || opaquePaths.length > 0;
 		for (const wp of written) {
-			if (!getFlag("no-read-guard")) deps.readGuard?.recordWritten(wp);
+			if (
+				!getFlag("no-read-guard") &&
+				(opaqueSet.has(wp) || recognizedAuthoredSet.has(wp))
+			)
+				deps.readGuard?.recordWritten(wp);
+			else if (!getFlag("no-read-guard") && recognizedWritten.includes(wp))
+				deps.readGuard?.recordUnchanged?.(wp);
 			const receipt = (runtime as Partial<RuntimeCoordinator>)
 				.recordMutationToolReceipt;
 			const autofixMode = receipt
@@ -1337,6 +1436,8 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 				_autofixMode: autofixMode,
 				_attachmentBudget: syntheticAttachmentBudget,
 				_mutationSourceOverride: isOpaque ? "opaque-script" : undefined,
+				_readGuardAuthorship:
+					opaqueSet.has(wp) || recognizedAuthoredSet.has(wp),
 			});
 			if (syntheticResult) {
 				// #1590: forward verbatim. The synthetic call already charged the
@@ -1349,7 +1450,68 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			}
 		}
 		if (event.isError !== true && !getFlag("no-read-guard")) {
-			for (const span of extractReadPathsFromCommand(command, workspaceRoot)) {
+			const truncation = (
+				event.details as {
+					truncation?: {
+						truncated?: boolean;
+						totalLines?: number;
+						outputLines?: number;
+					};
+				}
+			)?.truncation;
+			const parsedSpans = extractReadPathsFromCommand(command, workspaceRoot);
+			let spans = parsedSpans;
+			if (
+				truncation?.truncated === true &&
+				typeof truncation.outputLines === "number"
+			) {
+				if (parsedSpans.length === 1) {
+					const span = parsedSpans[0];
+					if (span) {
+						// countFileLines intentionally preserves the split-based guard
+						// convention, where a trailing newline contributes an empty final
+						// element. The host's output line count does not include that
+						// element, so remove it from the span basis before taking the tail.
+						const hasTrailingNewline = nodeFs
+							.readFileSync(span.filePath, "utf8")
+							.endsWith("\n");
+						const spanLineCount = hasTrailingNewline
+							? Math.max(1, span.limit - 1)
+							: span.limit;
+						const shown = Math.min(truncation.outputLines, spanLineCount);
+						spans =
+							shown > 0
+								? [
+										{
+											...span,
+											offset: span.offset + spanLineCount - shown,
+											limit: shown,
+										},
+									]
+								: [];
+					}
+				} else if (parsedSpans.length > 1) {
+					recordDegradationOnce({
+						kind: "bash-view-clipped",
+						subject: "multi-span",
+						reason: "truncated bash view contained multiple spans",
+					});
+					spans = [];
+				}
+				if (
+					parsedSpans.length === 1 &&
+					spans.length === 1 &&
+					(spans[0]?.offset !== parsedSpans[0]?.offset ||
+						spans[0]?.limit !== parsedSpans[0]?.limit)
+				) {
+					recordDegradationOnce({
+						kind: "bash-view-clipped",
+						subject: parsedSpans[0]?.filePath ?? "unknown",
+						reason: "truncated bash view narrowed a single span",
+					});
+				}
+			}
+			for (const span of spans) {
 				if (isExternalOrVendorFile(span.filePath, workspaceRoot)) continue;
 				if (isPathIgnoredByProject(span.filePath, workspaceRoot, false))
 					continue;
@@ -1432,6 +1594,90 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 				turnIndex: runtime.turnIndex,
 				writeIndex: runtime.peekWriteIndex(),
 			});
+		}
+	}
+
+	// Native read results are the authoritative read boundary. The tool_call
+	// input can request past EOF, and the host can cap bytes or lines before the
+	// result reaches the model. Register only the delivered range (#2802).
+	if (
+		deps.readGuard &&
+		event.toolName === "read" &&
+		event.isError !== true &&
+		filePath &&
+		!getFlag("no-read-guard") &&
+		!isExternalOrVendorFile(filePath, workspaceRoot)
+	) {
+		const deliveredFilePath =
+			attribution?.resolvedPath && nodeFs.existsSync(attribution.resolvedPath)
+				? attribution.resolvedPath
+				: filePath;
+		if (nodeFs.existsSync(deliveredFilePath)) {
+			const nativeReadToolCallId = resolveToolCallCorrelationId(event);
+			const input = event.input as { offset?: number; limit?: number };
+			const requestedOffset = input.offset ?? 1;
+			const requestedLimit = input.limit;
+			const truncation = (
+				event.details as
+					| {
+							truncation?: { outputLines?: number; truncated?: boolean };
+					  }
+					| undefined
+			)?.truncation;
+			const available = Math.max(
+				0,
+				countFileLines(deliveredFilePath) - requestedOffset + 1,
+			);
+			const deliveredLimit = Math.min(
+				available,
+				truncation?.outputLines ?? requestedLimit ?? available,
+			);
+			if (deliveredLimit > 0) {
+				if (truncation?.truncated === true && deliveredLimit < available) {
+					recordDegradationOnce({
+						kind: "native-read-clipped",
+						subject: deliveredFilePath,
+						reason: "native read result was clipped before delivery",
+					});
+				}
+				logReadGuardEvent({
+					event: "read_pattern",
+					sessionId: runtime.telemetrySessionId,
+					filePath: deliveredFilePath,
+					requestedOffset,
+					requestedLimit: requestedLimit ?? deliveredLimit,
+					effectiveOffset: requestedOffset,
+					effectiveLimit: deliveredLimit,
+					metadata: {
+						totalLines: countFileLines(deliveredFilePath),
+						isPartial: deliveredLimit < available,
+						fileKind: detectFileKind(deliveredFilePath) ?? "unknown",
+						fractionRead:
+							available > 0
+								? Math.round((deliveredLimit / available) * 100) / 100
+								: 1,
+						expandedByTs: false,
+					},
+				});
+				const deliveredRecord = {
+					filePath: deliveredFilePath,
+					requestedOffset,
+					requestedLimit: requestedLimit ?? deliveredLimit,
+					effectiveOffset: requestedOffset,
+					effectiveLimit: deliveredLimit,
+					expandedByLsp: false,
+					turnIndex: runtime.turnIndex,
+					writeIndex: runtime.peekWriteIndex(),
+					timestamp: Date.now(),
+				};
+				if (nativeReadToolCallId) {
+					deps.readGuard.recordRead(deliveredRecord, {
+						supersedes: { toolCallId: nativeReadToolCallId },
+					});
+				} else {
+					deps.readGuard.recordRead(deliveredRecord);
+				}
+			}
 		}
 	}
 
@@ -1616,18 +1862,38 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			const observedAutofixMode: "immediate" | "deferred" =
 				receiptOutcome?.autofixMode ??
 				(observedKind === "edit" ? "deferred" : "immediate");
-			// Analyse the file the observation actually RECORDED, not merely the
-			// one the tool named: a directory-target tool names a path that is not
-			// a file at all, and `runPipeline` on it is meaningless. `changedPaths`
-			// is already filtered by the `isRecordable` predicate handed to the
-			// settle above, so membership here also implies not-vendored and
-			// not-gitignored — the same two gates the classified chain applies
-			// before its own dispatch.
-			if (
-				observedChangedPaths.some((candidate) =>
-					pathsEqual(candidate, filePath),
+			// Analyse the files the observation actually RECORDED, not merely the
+			// path the tool named. A directory is never a pipeline target.
+			const observedDispatchPaths = observedChangedPaths
+				.filter((candidate) => {
+					try {
+						return !nodeFs.statSync(candidate).isDirectory();
+					} catch {
+						return false;
+					}
+				})
+				.slice(0, OBSERVED_DISPATCH_MAX_PATHS);
+			const observedDispatchDropped =
+				observedChangedPaths.length - observedDispatchPaths.length;
+			if (observedDispatchDropped > 0) {
+				incrementDegradationCount({
+					kind: "observed-mutation-dispatch-cap",
+					subject: event.toolName,
+					reason: `observed mutation dispatch capped at ${OBSERVED_DISPATCH_MAX_PATHS}; ${observedDispatchDropped} path(s) not dispatched`,
+				});
+			}
+			if (observedDispatchPaths.length > 0) {
+				const observedClients = ensureToolResultClients(deps);
+				if (
+					observedClients !== true &&
+					!(await bounded(Promise.resolve(observedClients), {
+						ms: HOOK_WALL_BUDGET_MS.tool_result_edit,
+						signal: deps.signal ?? undefined,
+						hook: "tool_result_edit",
+						label: "observed-tool-result-analysis",
+					}))
 				)
-			) {
+					return;
 				const observedReadGuardCorrelationId = getReadGuardCorrelationId(event);
 				// #2464 review round 3 (F1): the SAME two pre-conditions the
 				// classified site consults, through the same shared claim. Round 2
@@ -1637,65 +1903,86 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 				// second overwrote the first's registry entry, and the first's
 				// release then evicted the outer entry a live, unrelated classified
 				// pipeline had since re-created under it.
-				const observedClaim = claimPipelineDispatch({
-					filePath,
-					stateHash: observedStateHash,
-					turnIndex: runtime.turnIndex,
-					participantId: observedReadGuardCorrelationId,
-					dbg,
-				});
-				if (!observedClaim.proceed) {
-					if (observedClaim.joined) {
-						await observedClaim.joined;
+				for (const observedPath of observedDispatchPaths) {
+					const observedDispatchSignal = deps.signal;
+					const observedJoinSignal = deps.signal;
+					const observedStateHashForPath = getFileStateHash(observedPath);
+					const observedClaim = claimPipelineDispatch({
+						filePath: observedPath,
+						stateHash: observedStateHashForPath,
+						turnIndex: runtime.turnIndex,
+						participantId: observedReadGuardCorrelationId,
+						dbg,
+					});
+					if (!observedClaim.proceed) {
+						if (observedClaim.joined) {
+							await bounded(observedClaim.joined, {
+								ms: HOOK_WALL_BUDGET_MS.tool_result_edit,
+								signal: observedJoinSignal,
+								hook: "tool_result_edit",
+								label: "observed-tool-result-join",
+							});
+						}
+						continue;
 					}
-					// Same terminal value as the block's own exit below: the bridge
-					// already recorded this edit, and the analysis it would have asked
-					// for is either running or already done.
-					return syntheticWriteContent.length > 0
-						? { content: [...event.content, ...syntheticWriteContent] }
-						: undefined;
-				}
-				const observedDispatchOutcome = await dispatchPipelineAnalysis({
-					deps,
-					runtime,
-					filePath,
-					dispatchCwd: resolveLanguageRootForFile(filePath, workspaceRoot),
-					turnStateCwd: path.resolve(workspaceRoot),
-					autofixMode: observedAutofixMode,
-					// #2423: no adapter/diff ranges exist for a "learned" (unnamed)
-					// tool — the classified chain below hits the same gap for this
-					// provenance and also leaves `modifiedRanges` undefined, so the
-					// dispatch runs unscoped (whole-file) exactly as it would there.
-					modifiedRanges: undefined,
-					writeIndex: runtime.nextWriteIndex(),
-					initialStateHash: observedStateHash,
-					readGuardCorrelationId: observedReadGuardCorrelationId,
-					requestedEditIndexes: getRequestedEditIndexes(event, observedKind),
-					requestedEditTotal: getRequestedEditCount(event, observedKind),
-					isPartialApplyResult:
-						((event.details ?? {}) as Record<string, unknown>)
-							.piLensPartialApply === true,
-					participantIds: [observedReadGuardCorrelationId],
-					participantTotal: 1,
-					toolResultStart,
-					nativeAppliedPairs: observedAppliedPairs,
-				});
-				if (observedDispatchOutcome.crashed) {
-					// #2464 review round 2, S6: parity with the classified chain — a
-					// pipeline crash surfaces its notice to the agent instead of being
-					// swallowed into a dbg line the model never sees. The recorded
-					// edit stands either way; only the analysis was lost.
-					dbg(
-						`tool_result: pipeline analysis crashed for the observed mutation on ${filePath}; the recorded edit stands, analysis did not run this turn`,
+					const observedDispatchOutcome = await bounded(
+						dispatchPipelineAnalysis({
+							deps,
+							runtime,
+							filePath: observedPath,
+							dispatchCwd: resolveLanguageRootForFile(
+								observedPath,
+								workspaceRoot,
+							),
+							turnStateCwd: path.resolve(workspaceRoot),
+							autofixMode: observedAutofixMode,
+							modifiedRanges: undefined,
+							writeIndex: runtime.nextWriteIndex(),
+							initialStateHash: observedStateHashForPath,
+							readGuardCorrelationId: observedReadGuardCorrelationId,
+							requestedEditIndexes: getRequestedEditIndexes(
+								event,
+								observedKind,
+							),
+							requestedEditTotal: getRequestedEditCount(event, observedKind),
+							isPartialApplyResult:
+								((event.details ?? {}) as Record<string, unknown>)
+									.piLensPartialApply === true,
+							participantIds: [observedReadGuardCorrelationId],
+							participantTotal: 1,
+							toolResultStart,
+							nativeAppliedPairs: observedAppliedPairs,
+							// #2802 authorship rule (master): the observational
+							// settle already recorded this edit through the
+							// bridge, so the dispatch's read-guard write refresh
+							// carries evidence and stays enabled on every
+							// per-path dispatch.
+							allowReadGuardWrites: true,
+						}),
+						{
+							ms: HOOK_WALL_BUDGET_MS.tool_result_edit,
+							signal: observedDispatchSignal,
+							hook: "tool_result_edit",
+							label: "observed-tool-result-analysis",
+						},
 					);
-					return observedDispatchOutcome.response;
+					if (observedDispatchOutcome?.crashed) {
+						// #2464 review round 2, S6: parity with the classified chain — a
+						// pipeline crash surfaces its notice to the agent instead of being
+						// swallowed into a dbg line the model never sees. The recorded
+						// edit stands either way; only the analysis was lost.
+						dbg(
+							`tool_result: pipeline analysis crashed for the observed mutation on ${observedPath}; the recorded edit stands, analysis did not run this turn`,
+						);
+						return observedDispatchOutcome.response;
+					}
 				}
 				dbg(
 					`tool_result: the observational settle already recorded ${observedReplayed} mutation(s) for "${event.toolName}"; kept the applied-edit records, mutation receipt, cachedExports refresh, and ran the pipeline dispatch (#2464); skipped the bridge-covered staleness stamp / turn-state ranges / change-log receipt / deferred autofix+format`,
 				);
 			} else {
 				dbg(
-					`tool_result: the observational settle recorded ${observedReplayed} mutation(s) for "${event.toolName}", none of them ${filePath} — nothing to analyse under the named path`,
+					`tool_result: the observational settle recorded ${observedReplayed} mutation(s) for "${event.toolName}", but no dispatchable changed paths remained`,
 				);
 			}
 		}
@@ -1820,7 +2107,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 
 	// Refresh the read-guard's FileTime stamp so that the model's own write
 	// doesn't trigger a spurious "file_modified" block on the next edit.
-	deps.readGuard?.recordWritten(filePath);
+	if (bashAuthorshipConfirmed) deps.readGuard?.recordWritten(filePath);
 
 	// Keep cachedExports in sync after each write/edit so the pre-write STOP
 	// check doesn't fire on names that were removed from this file this session.
@@ -1856,7 +2143,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	// tool_result is emitted after write/edit has already been applied.
 	// Asserting pre-write stamps here produces false positives on rapid edits.
 	sessionFileTime.read(filePath);
-	if (!getFlag("no-read-guard")) {
+	if (!getFlag("no-read-guard") && bashAuthorshipConfirmed) {
 		const readGuard = (
 			runtime as {
 				readGuard?: { recordWritten?: (writtenPath: string) => void };
@@ -2025,25 +2312,46 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	// (defined above `handleToolResult`), shared with the observed-mutation
 	// early return. This call site is otherwise unchanged — same arguments, same
 	// crash-then-return / success-then-continue shape as before the split.
-	const dispatchOutcome = await dispatchPipelineAnalysis({
-		deps,
-		runtime,
-		filePath,
-		dispatchCwd,
-		turnStateCwd,
-		autofixMode,
-		modifiedRanges,
-		writeIndex,
-		initialStateHash,
-		readGuardCorrelationId,
-		requestedEditIndexes,
-		requestedEditTotal,
-		isPartialApplyResult,
-		participantIds,
-		participantTotal,
-		toolResultStart,
-		nativeAppliedPairs,
-	});
+	const classifiedClients = ensureToolResultClients(deps);
+	if (
+		classifiedClients !== true &&
+		!(await bounded(Promise.resolve(classifiedClients), {
+			ms: HOOK_WALL_BUDGET_MS.tool_result_edit,
+			signal: deps.signal,
+			hook: "tool_result_edit",
+			label: "classified-tool-result-analysis",
+		}))
+	)
+		return;
+	const dispatchOutcome = await bounded(
+		dispatchPipelineAnalysis({
+			deps,
+			runtime,
+			filePath,
+			dispatchCwd,
+			turnStateCwd,
+			autofixMode,
+			modifiedRanges,
+			writeIndex,
+			initialStateHash,
+			readGuardCorrelationId,
+			requestedEditIndexes,
+			requestedEditTotal,
+			isPartialApplyResult,
+			participantIds,
+			participantTotal,
+			toolResultStart,
+			nativeAppliedPairs,
+			allowReadGuardWrites: bashAuthorshipConfirmed,
+		}),
+		{
+			ms: HOOK_WALL_BUDGET_MS.tool_result_edit,
+			signal: deps.signal || undefined,
+			hook: "tool_result_edit",
+			label: "pipeline-analysis",
+		},
+	);
+	if (!dispatchOutcome) return;
 	if (dispatchOutcome.crashed) {
 		return dispatchOutcome.response;
 	}
@@ -2217,6 +2525,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			writeIndex,
 			result.inlineBlockerSources,
 			result.inlineBlockerLines,
+			result.inlineBlockerFileContent,
 		);
 	} else {
 		runtime.clearInlineBlockers(filePath);

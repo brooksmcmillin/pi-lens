@@ -47,9 +47,9 @@ review-graph, install-choices, etc.).
 
 **Default resolution order:**
 
-1. `$PILENS_DATA_DIR/<sanitized-cwd-slug>/` (if `PILENS_DATA_DIR` is set)
+1. `$PILENS_DATA_DIR/<sanitized-cwd-slug>-<8-hex-hash>/` (if `PILENS_DATA_DIR` is set)
 2. `<cwd>/.pi-lens/` (legacy — only if it already exists in the project)
-3. `~/.pi-lens/projects/<sanitized-cwd-slug>/` (current default)
+3. `~/.pi-lens/projects/<sanitized-cwd-slug>-<8-hex-hash>/` (current default)
 
 **When to set it:** running pi with a local model server (llama.cpp,
 Ollama, etc.) that monitors the project directory — cache-file churn
@@ -122,11 +122,6 @@ is `max(runner budget, floor)`. **Default:** `0` (no floor). Also settable via
 the `dispatch.runnerTimeoutFloorMs` config key, which wins when both are set.
 
 ## Install control
-
-### `PI_LENS_AUTO_INSTALL`
-
-Set to `1` to auto-approve tool installs non-interactively (same as
-`--auto-install`). Off by default — installs prompt interactively.
 
 ### `PI_LENS_DISABLE_LSP_INSTALL`
 

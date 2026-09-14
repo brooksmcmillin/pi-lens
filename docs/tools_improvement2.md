@@ -276,7 +276,7 @@ These categories are language-agnostic at the tool UX level even if implementati
 - Keep `items: "exports"` prominent in the docs; it is much more usable than `items: "all"` on configuration-heavy modules.
 - Include a clear `syntaxOnly: true` and “does not satisfy read guard” note in the main text, not only details.
 
-## `ast_grep_dump` / `ast_dump`
+## `ast_grep_search` dump mode
 
 ### What works well
 
@@ -322,12 +322,12 @@ These categories are language-agnostic at the tool UX level even if implementati
 - For `codeAction`, include whether diagnostics were present at the requested range; an empty result is more useful if it says “no diagnostic at range” vs “server has no quickfix.”
 - For rename previews, the current summary is useful; consider adding a `filesTouched` / `editsCount` top-level summary for easier scanning.
 
-## `lsp_diagnostics` and `lens_diagnostics`
+## `lens_diagnostics` (`source=session` / `source=lsp`)
 
 ### What works well
 
-- `lsp_diagnostics` is good for file-scoped type/error checks before builds.
-- `lens_diagnostics` is valuable because it includes non-LSP runners.
+- `source=lsp` is good for file-scoped type/error checks before builds.
+- `source=session` is valuable because it includes non-LSP runners.
 
 ### Proposed improvements
 

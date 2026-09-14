@@ -1313,6 +1313,11 @@ describe("context injection framing", () => {
 
 	it("SESSION_START_GUIDANCE advertises the read-substitute tools and only registered pi tools", () => {
 		const text = SESSION_START_GUIDANCE.join("\n");
+		// An empty cache is not evidence that changed files were checked.
+		expect(text).toMatch(/source=session[^.\n]*cache/);
+		expect(text).toMatch(/source=lsp[^.\n]*scope=paths/);
+		// #2795 review: the orientation also says an empty cache is not clean.
+		expect(text).toMatch(/empty cache ≠ clean/);
 
 		// The #245 gap this guards: module_report + read_symbol were registered as
 		// pi tools but never surfaced in the session-start orientation, so the agent
@@ -1326,13 +1331,14 @@ describe("context injection framing", () => {
 			"module_report",
 			"read_symbol",
 			"lsp_navigation",
-			"lsp_diagnostics",
 			"ast_grep_search",
 			"ast_grep_replace",
-			"ast_grep_dump",
 		]) {
 			expect(text).toContain(tool);
 		}
+
+		// Aggregate hosts reach the same entry point as lens(action=diagnostics).
+		expect(text).toMatch(/aggregate hosts: lens\(action=diagnostics\)/);
 
 		// Stay lean: the orientation is a nudge, not re-documentation of every arg.
 		expect(text.length).toBeLessThan(750);
@@ -1538,6 +1544,93 @@ describe("turn_end unified secret surfacing", () => {
 			env.cleanup();
 		}
 	});
+
+	it("reclassifies a legacy cached finding inside a nested repository before delivery", async () => {
+		const env = setupTestEnvironment("pi-lens-secret-legacy-nested-");
+		try {
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId: "legacy-nested-session" });
+			const cacheManager = new CacheManager(false);
+			const nested = path.join(env.tmpDir, "submodule");
+			fs.mkdirSync(nested, { recursive: true });
+			fs.writeFileSync(
+				path.join(nested, ".git"),
+				"gitdir: ../.git/modules/submodule\n",
+			);
+			const secretFile = path.join(nested, ".env");
+			fs.writeFileSync(secretFile, "SECRET=real-shaped-value\n");
+			cacheManager.writeCache(
+				"gitleaks",
+				{
+					success: true,
+					scannedAt: "",
+					findings: [
+						{
+							ruleId: "generic-api-key",
+							file: secretFile,
+							startLine: 1,
+							pathStatus: "untracked" as const,
+						},
+					],
+				},
+				env.tmpDir,
+			);
+
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, { ctxCwd: env.tmpDir }),
+			);
+
+			const content =
+				consumeTurnEndFindings(cacheManager, env.tmpDir)?.messages?.[0]
+					?.content ?? "";
+			expect(content).not.toContain("hardcoded secrets detected");
+			expect(content).not.toContain("generic-api-key");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it.each(["ignored", "nested-repository", "scratch"] as const)(
+		"does not inject a %s gitleaks finding into turn context",
+		async (pathStatus) => {
+			const env = setupTestEnvironment(`pi-lens-secret-${pathStatus}-`);
+			try {
+				const runtime = new RuntimeCoordinator();
+				runtime.setTelemetryIdentity({ sessionId: "demoted-secret-session" });
+				const cacheManager = new CacheManager(false);
+				const secretFile = path.join(env.tmpDir, ".env");
+				fs.writeFileSync(secretFile, "SECRET=real-shaped-value\n");
+				cacheManager.writeCache(
+					"gitleaks",
+					{
+						success: true,
+						scannedAt: "",
+						findings: [
+							{
+								ruleId: "generic-api-key",
+								file: secretFile,
+								startLine: 1,
+								pathStatus,
+							},
+						],
+					},
+					env.tmpDir,
+				);
+
+				await handleTurnEnd(
+					makeTurnEndDeps(runtime, cacheManager, { ctxCwd: env.tmpDir }),
+				);
+
+				const content =
+					consumeTurnEndFindings(cacheManager, env.tmpDir)?.messages?.[0]
+						?.content ?? "";
+				expect(content).not.toContain("hardcoded secrets detected");
+				expect(content).not.toContain("generic-api-key");
+			} finally {
+				env.cleanup();
+			}
+		},
+	);
 });
 
 // ── Dead-path gitleaks findings (#1461 slice 1 / #1460) ───────────────────────
@@ -1871,6 +1964,10 @@ describe("turn_end test runner — stale results are cached, not discarded", () 
 				env.tmpDir,
 				"stale-session",
 			);
+			runtime.recordProjectMutation({
+				filePath: srcFile,
+				source: "agent-edit",
+			});
 
 			let resolveRun!: (v: {
 				file: string;
@@ -1913,6 +2010,10 @@ describe("turn_end test runner — stale results are cached, not discarded", () 
 			// test subprocess resolves — this is the routine, non-rare case from
 			// the real dogfooding logs.
 			runtime.beginTurn();
+			runtime.recordProjectMutation({
+				filePath: srcFile,
+				source: "agent-edit",
+			});
 			resolveRun({
 				file: testFile,
 				sourceFile: srcFile,
@@ -1931,6 +2032,7 @@ describe("turn_end test runner — stale results are cached, not discarded", () 
 				stale?: boolean;
 				superseded?: boolean;
 				provenance?: { files: unknown[] };
+				verdicts?: Array<{ sourceFile: string; fileSeq: number }>;
 			}>("test-runner-findings", env.tmpDir);
 
 			// The old behavior discarded this entirely (no cache entry at all).
@@ -1939,6 +2041,13 @@ describe("turn_end test runner — stale results are cached, not discarded", () 
 			expect(cached?.data?.superseded).toBe(true);
 			expect(cached?.data?.provenance?.files.length).toBeGreaterThan(0);
 			expect(cached?.data?.content).toContain("prior turn");
+			// #2542: preserve the sequence captured before the later edit.
+			expect(cached?.data?.verdicts).toEqual([
+				expect.objectContaining({
+					sourceFile: srcFile,
+					fileSeq: { state: "known", value: 1 },
+				}),
+			]);
 		} finally {
 			env.cleanup();
 		}

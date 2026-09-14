@@ -34,8 +34,24 @@ jobs:
     # The auto-provided token raises this to 5000 req/hr; the installer sends it
     # ONLY to api.github.com, never the asset CDN.
     #
+    # PI_LENS_HOME/PILENS_DATA_DIR (#2670 review F1): job-level, so the SEVEN
+    # `--install` steps below share one tool tree/bin dir across the job
+    # instead of each `withScratchHome()` pin minting its own empty one per
+    # step — without this, each script re-pulls every managed tool from
+    # scratch (measured against the last full nightly, run 32817692457: the
+    # shared cache made the format step ~9s; per-step scratch homes would add
+    # ~10min across the job and 4-5x the release-asset downloads on this
+    # shared-IP runner). A bare `/tmp` path, not `${{ runner.temp }}`: the
+    # `runner` context is unavailable at job-level `env:` (actionlint: "context
+    # \"runner\" is not allowed here"), and this runner's whole VM — `/tmp`
+    # included — is destroyed after the job either way, so this never becomes
+    # a second `~/.pi-lens` some other step relies on persisting.
+    # `withScratchHome`'s "already pinned" branch is a no-op against an
+    # explicit PI_LENS_HOME, so this is the ONLY change these steps need.
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PI_LENS_HOME: /tmp/pi-lens-home
+      PILENS_DATA_DIR: /tmp/pi-lens-home
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -59,7 +75,7 @@ jobs:
       # nightly (the harness already treats an unavailable tool as ⚠, not a
       # failure), so each is continue-on-error.
       # yamllint disable-line rule:line-length
-      - uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         continue-on-error: true
         with:
           distribution: temurin
@@ -120,6 +136,18 @@ jobs:
         run: |
           set -o pipefail
           node scripts/smoke-tools.mjs --lsp --install --verbose 2>&1 | tee "$RUNNER_TEMP/tool-smoke-lsp-handshake.log"
+
+      # Gating diagnostic layer (#2780, recurrence #2776): the handshake above
+      # proves initialize only. This row family drives the real lsp_diagnostics
+      # handler against every installed primary fixture and requires a finding
+      # in its PRIMARY bucket. A server-authored source cannot make an
+      # auxiliary finding look like primary coverage.
+      - name: LSP diagnostics clean-gate (primary finding per installed server)
+        id: lsp_gate
+        timeout-minutes: 30
+        run: |
+          set -o pipefail
+          node scripts/smoke-tools.mjs --lsp-gate --install --verbose 2>&1 | tee "$RUNNER_TEMP/tool-smoke-lsp-gate.log"
 
       # Diagnostic-mode matrix (#240): spawn each server and record its
       # advertised mode (pull vs push) — the first cut of the affirmative-clean
@@ -216,8 +244,8 @@ jobs:
       # independent notifier scoped to the job's actual pass/fail verdict,
       # placed last and gated on `if: always()` so it runs on every outcome,
       # mirroring install-smoke.yml's `Notify install drift` step. Reads the
-      # three gating layers' outcomes + captured logs (the only three steps
-      # above without `continue-on-error`, so the only three whose outcome
+      # four gating layers' outcomes + captured logs (the only four steps
+      # above without `continue-on-error`, so the only four whose outcome
       # can turn the job red) — see scripts/lib/tool-smoke-drift.mjs's module
       # doc. GITHUB_TOKEN is inherited from this job's own env (`issues:
       # write` already granted at job level, #529/#594). Best-effort:
@@ -232,6 +260,8 @@ jobs:
           TOOL_LAYER_LOG: ${{ runner.temp }}/tool-smoke-tool-layer.log
           LSP_HANDSHAKE_OUTCOME: ${{ steps.lsp_handshake.outcome }}
           LSP_HANDSHAKE_LOG: ${{ runner.temp }}/tool-smoke-lsp-handshake.log
+          LSP_GATE_OUTCOME: ${{ steps.lsp_gate.outcome }}
+          LSP_GATE_LOG: ${{ runner.temp }}/tool-smoke-lsp-gate.log
           FORMAT_LAYER_OUTCOME: ${{ steps.format_layer.outcome }}
           FORMAT_LAYER_LOG: ${{ runner.temp }}/tool-smoke-format-layer.log
           # #2723 review F3: a job failure BEFORE the three tracked layers

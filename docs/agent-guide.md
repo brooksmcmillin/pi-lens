@@ -278,8 +278,7 @@ Registered as pi agent tools. Verified names:
 
 | Tool | What it does | Use it to… |
 |---|---|---|
-| `lens_diagnostics` | Query pi-lens diagnostic state. `mode=delta` (default, this turn) / `mode=all` (cache-wide) / `mode=full` (fresh whole-project scan). Optional `paths` scope. | Check what pi-lens found; confirm clean before "done" (use `mode=full`). |
-| `lsp_diagnostics` | LSP diagnostics for explicit files/dirs (per-file `clean`/`unavailable`/`unconfirmed`/… outcomes). | Targeted LSP check on specific files. |
+| `lens_diagnostics` | Session-cache or LSP-probe diagnostics with `source` and `scope` selectors. | Use `source=lsp` with `scope=paths` for targeted checks; an empty cache is not proof of clean. |
 | `lsp_navigation` | LSP navigation (definition/references/etc.). | Trace symbols semantically. |
 | `symbol_search` | Ranked identifier search over the warm word index (BM25 + priors). | Entry point of the discovery funnel. |
 | `module_report` | Navigable outline + signatures + decorators + imports + callbacks for a file; optional `blastRadius`. | Understand a module without reading the whole body. |
@@ -287,7 +286,7 @@ Registered as pi agent tools. Verified names:
 | `read_enclosing` | Smallest enclosing symbol/callback body for a file+line (records coverage). | Bridge a diagnostic location → exact body. |
 | `project_report` | Project-level structural report. | Orient in an unfamiliar project. |
 | `ast_grep_search` / `ast_grep_replace` | Structural AST search / replace. | Find or rewrite by code shape, not regex. |
-| `ast_grep_outline` / `ast_grep_dump` | Outline / AST dump. | Inspect structure. |
+| `ast_grep_outline` / `ast_grep_search` (`dump=true`) | Outline / AST dump. | Inspect structure. |
 | `lens_diagnostic_mark` | Mark a finding false-positive / suppressed / deferred / flagged-to-fix (honored across surfaces). | Triage a finding you've judged. |
 
 Funnel discipline: **`symbol_search` → `module_report` → `read_symbol`/`read_enclosing`**
@@ -315,7 +314,7 @@ pi-lens is also an MCP server. The same capabilities are mirrored under a `pilen
 prefix: `pilens_diagnostics`, `pilens_analyze`, `pilens_module_report`,
 `pilens_symbol_search`, `pilens_read_symbol`, `pilens_read_enclosing`,
 `pilens_project_report`, `pilens_project_scan`, `pilens_lsp_navigation`,
-`pilens_lsp_diagnostics`, `pilens_ast_grep_search`/`pilens_ast_grep_replace`,
+`pilens_ast_grep_search`/`pilens_ast_grep_replace`,
 `pilens_session_start`/`pilens_turn_end`, `pilens_health`, `pilens_latency`,
 `pilens_rebuild` (source checkouts only). Note MCP has **no read-guard** — mirror reads
 don't record edit coverage. Prefer the **warm** review path; MCP `fresh` mode

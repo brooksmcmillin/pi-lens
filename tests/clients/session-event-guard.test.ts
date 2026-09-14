@@ -15,6 +15,7 @@ import {
 } from "../../clients/degradation-ledger.js";
 import {
 	isStaleExtensionCtxError,
+	surfaceHandlerCrash,
 	wrapSessionEventHandler,
 	wrapSessionEventHandlerWithResult,
 } from "../../clients/session-event-guard.js";
@@ -28,6 +29,12 @@ function liveCtx(): unknown {
 function staleGroup() {
 	return getDegradationSummary().find(
 		(group) => group.kind === "extension-ctx-stale",
+	);
+}
+
+function identityFallbackGroup() {
+	return getDegradationSummary().find(
+		(group) => group.kind === "turn-context-identity-fallback",
 	);
 }
 
@@ -148,6 +155,26 @@ describe("wrapSessionEventHandler (#1925)", () => {
 		expect(() => guarded({} as never, makeStaleCtx() as never)).not.toThrow();
 		expect(staleGroup()?.count).toBe(1);
 	});
+
+	it("records a stable identity resolution fallback once", () => {
+		const guarded = wrapSessionEventHandler("turn_start", vi.fn());
+		const ctx = {
+			isIdle: () => true,
+			get sessionManager(): never {
+				throw new Error("session manager unavailable");
+			},
+		};
+
+		guarded({} as never, ctx as never);
+		guarded({} as never, ctx as never);
+
+		expect(identityFallbackGroup()).toEqual(
+			expect.objectContaining({
+				kind: "turn-context-identity-fallback",
+				count: 1,
+			}),
+		);
+	});
 });
 
 /**
@@ -255,10 +282,52 @@ describe("wrapSessionEventHandlerWithResult (#1929)", () => {
 describe("isStaleExtensionCtxError (#1925)", () => {
 	it("matches the SDK's message and nothing else", () => {
 		expect(isStaleExtensionCtxError(new Error(STALE_CTX_MESSAGE))).toBe(true);
+		// #2992 recurrence: the bridge fallback must not swallow the narrower
+		// probe phrase, or a different host failure becomes a false degradation.
+		expect(
+			isStaleExtensionCtxError(new Error("stale after session replacement")),
+		).toBe(false);
 		expect(isStaleExtensionCtxError(new Error("some other failure"))).toBe(
 			false,
 		);
 		expect(isStaleExtensionCtxError(STALE_CTX_MESSAGE)).toBe(false);
 		expect(isStaleExtensionCtxError(undefined)).toBe(false);
+	});
+});
+
+/**
+ * #2884 — `surfaceHandlerCrash`'s own policy, at the unit level.
+ *
+ * `tests/index-wiring.test.ts` proves the helper is APPLIED to all nine
+ * `index.ts` catch sites. The case below is the one branch an end-to-end probe
+ * cannot reach: the debug sink itself throwing. Recurrence it prevents — a
+ * `dbg` that throws would otherwise replace the handler's error with the
+ * sink's on the way out of a production catch, and take the bounded record
+ * with it, so the host would see a debug-logger bug where a handler crash
+ * happened.
+ */
+describe("surfaceHandlerCrash (#2884)", () => {
+	beforeEach(() => {
+		resetDegradationLedger();
+	});
+
+	function crashGroup() {
+		return getDegradationSummary().find(
+			(group) => group.kind === "hook-handler-crash",
+		);
+	}
+
+	it("records and rethrows the HANDLER's error even when the debug sink throws", () => {
+		const original = new Error("handler boom");
+		expect(() =>
+			surfaceHandlerCrash("turn_end", original, {
+				dbg: () => {
+					throw new Error("sink boom");
+				},
+			}),
+		).toThrow(original);
+		expect(crashGroup()?.latestReasons.map((reason) => reason.subject)).toEqual(
+			["turn_end"],
+		);
 	});
 });

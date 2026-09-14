@@ -1,6 +1,7 @@
-import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { gitExecFileSync } from "./lib/git-fixture-env.mjs";
 
 const TEMPLATE_PATH = ".github/PULL_REQUEST_TEMPLATE.md";
 const TEMPLATE_FILE = resolve(
@@ -119,6 +120,814 @@ function hasRealContent(lines, section, placeholders) {
 			!templateLines.has(value)
 		);
 	});
+}
+
+function blankCommentsAndStrings(source) {
+	let state = "code";
+	let result = "";
+	const strings = [];
+	let stringStart = -1;
+	let previousToken = null;
+	let stringPrefix = "";
+	// ECMAScript's lexical grammar permits a RegularExpressionLiteral where an
+	// expression starts. Classify the preceding token by whether it can end an
+	// expression; this covers expression-start keywords and punctuators without
+	// maintaining a list of individual regex contexts.
+	const expressionEndingPunctuation = new Set([")", "]", "}", "++", "--"]);
+	const expressionStartKeywords = new Set([
+		"await",
+		"case",
+		"delete",
+		"do",
+		"else",
+		"in",
+		"instanceof",
+		"new",
+		"of",
+		"return",
+		"throw",
+		"typeof",
+		"void",
+		"yield",
+	]);
+	const regexMayStart = (token) => {
+		if (token === null || expressionStartKeywords.has(token)) return true;
+		if (expressionEndingPunctuation.has(token)) return false;
+		return !/[$\w]/.test(token);
+	};
+	const decoded = (value) => value.replace(/\\([\s\S])/g, "$1");
+	for (let index = 0; index < source.length; index += 1) {
+		const char = source[index];
+		const next = source[index + 1];
+		if (state === "line-comment") {
+			result += char === "\n" ? "\n" : " ";
+			if (char === "\n") state = "code";
+			continue;
+		}
+		if (state === "block-comment") {
+			result += char === "\n" ? "\n" : " ";
+			if (char === "*" && next === "/") {
+				result += " ";
+				index += 1;
+				state = "code";
+			}
+			continue;
+		}
+		if (state === "regex" || state === "regex-class") {
+			result += char === "\n" ? "\n" : " ";
+			if (char === "\\") {
+				if (next === "\n") result += "\n";
+				else {
+					result += " ";
+					index += 1;
+				}
+			} else if (state === "regex" && char === "[") state = "regex-class";
+			else if (state === "regex-class" && char === "]") state = "regex";
+			else if (state === "regex" && char === "/") {
+				state = "code";
+				previousToken = "value";
+			}
+			continue;
+		}
+		if (state !== "code") {
+			result += char === "\n" ? "\n" : " ";
+			if (char === "\\") {
+				if (next === "\n") result += "\n";
+				else {
+					result += " ";
+					index += 1;
+				}
+			} else if (char === state) {
+				strings.push({
+					start: stringStart,
+					end: index + 1,
+					quote: state,
+					text: decoded(source.slice(stringStart + 1, index)),
+					prefix: stringPrefix,
+				});
+				state = "code";
+				previousToken = "value";
+			}
+			continue;
+		}
+		if (char === "/" && next === "/") {
+			result += "  ";
+			index += 1;
+			state = "line-comment";
+		} else if (char === "/" && next === "*") {
+			result += "  ";
+			index += 1;
+			state = "block-comment";
+		} else if (char === "/" && regexMayStart(previousToken)) {
+			result += " ";
+			state = "regex";
+		} else if (char === "'" || char === '"' || char === "`") {
+			result += " ";
+			stringStart = index;
+			stringPrefix = result.slice(-256).trimEnd();
+			state = char;
+			previousToken = "string";
+		} else {
+			result += char;
+			if (/[$\w]/.test(char)) {
+				let wordEnd = index + 1;
+				while (/[$\w]/.test(source[wordEnd] ?? "")) wordEnd += 1;
+				const word = source.slice(index, wordEnd);
+				result += word.slice(1);
+				index = wordEnd - 1;
+				previousToken = word;
+			} else if (char === next && (char === "+" || char === "-")) {
+				result += next;
+				index += 1;
+				previousToken = char + next;
+			} else if (!/\s/.test(char)) previousToken = char;
+		}
+	}
+	return { text: result, strings };
+}
+
+export { blankCommentsAndStrings };
+
+function isRuntimeObservabilityPath(name) {
+	return (
+		/^(?:clients|tools|mcp)\//.test(name) &&
+		!/(?:^|\/)__tests__(?:\/|$)/.test(name) &&
+		!/\.test\.[^/]+$/.test(name) &&
+		!/\.d\.(?:ts|mts)$/.test(name)
+	);
+}
+
+function runtimeObservabilityFromDiff(diff = "") {
+	const records = new Set();
+	let runtime = false;
+	let added = "";
+	let currentRuntime = false;
+	for (const line of String(diff).split(/\r?\n/)) {
+		const header = /^diff --git a\/(.+) b\/(.+)$/.exec(line);
+		if (header) {
+			currentRuntime = [header[1], header[2]].some(isRuntimeObservabilityPath);
+			runtime ||= currentRuntime;
+			continue;
+		}
+		if (currentRuntime && /^\+(?!\+\+)/.test(line))
+			added += `${line.slice(1)}\n`;
+	}
+	if (!runtime) return { runtime: false, records, failurePath: false };
+	const blanked = blankCommentsAndStrings(added).text;
+	return {
+		runtime: true,
+		records: recordLiteralsFromRuntimeSource(added),
+		failurePath:
+			/\bcatch\b|\brecordDegradationOnce\b|\bthrow\b|\breturn\s+null\b/.test(
+				blanked,
+			),
+	};
+}
+
+function observabilitySectionContent(body, lines, headings) {
+	const heading = headings.find((candidate) =>
+		hasSection(candidate, "observability"),
+	);
+	if (!heading) return "";
+	const next = headings.find(
+		(candidate) =>
+			candidate.index > heading.index && candidate.level <= heading.level,
+	);
+	return lines.slice(heading.index + 1, next?.index ?? lines.length).join("\n");
+}
+
+function recordLiteralsFromRuntimeSource(source) {
+	return new Set(
+		recordLocationsFromRuntimeSource(source).map(({ value }) => value),
+	);
+}
+
+function recordLocationsFromRuntimeSource(source) {
+	const records = [];
+	const blanked = blankCommentsAndStrings(source).text;
+	const calls = [
+		["recordDegradationOnce", ["kind"]],
+		["incrementDegradationCount", ["kind"]],
+		["logExtension", ["subsystem", "message"]],
+		["logLatency", ["phase", "event", "eventName", "name"]],
+		["emitBounded", ["kind", "event", "eventName"]],
+	];
+	for (const [name, fields] of calls) {
+		const callPattern = new RegExp(`${name}\\s*\\(\\s*\\{[\\s\\S]*?\\}`, "g");
+		for (const match of blanked.matchAll(callPattern)) {
+			const original = source.slice(match.index, match.index + match[0].length);
+			for (const field of fields) {
+				const fieldMatch = new RegExp(`${field}\\s*:\\s*["']([^"']+)["']`).exec(
+					original,
+				);
+				const value = fieldMatch?.[1];
+				if (value) {
+					const valueIndex =
+						match.index + fieldMatch.index + fieldMatch[0].indexOf(value);
+					records.push({
+						value,
+						line: source.slice(0, valueIndex).split("\n").length,
+					});
+				}
+			}
+		}
+	}
+	return records;
+}
+
+const CODE_CITATION = /`([^`\s:]+):((?:~?\d+)(?:-\d+)?)`/g;
+const MASTER_CLAIM =
+	/pre-existing|red on master|also fails on origin\/master|environment-specific/i;
+
+function headFileSource(file, options = {}) {
+	if (options.headFiles?.has?.(file)) return options.headFiles.get(file);
+	if (/(?:^|\/)\.\.(?:\/|$)/.test(file) || isAbsolute(file)) return null;
+	if (options.workingTree) {
+		try {
+			return readFileSync(resolve(options.cwd ?? process.cwd(), file), "utf8");
+		} catch {
+			return null;
+		}
+	}
+	try {
+		return String(
+			(options.git ?? gitExecFileSync)(["show", `HEAD:${file}`], {
+				cwd: options.cwd ?? process.cwd(),
+				encoding: "utf8",
+			}),
+		);
+	} catch {
+		return null;
+	}
+}
+
+function sourceLines(source) {
+	return String(source ?? "").split(/\r?\n/);
+}
+
+const HEAD_TEST_CORPUS_CACHE_LIMIT = 8;
+const headTestCorpusCache = new Map();
+
+function testCorpus(options = {}) {
+	const cwd = options.cwd ?? process.cwd();
+	let cacheKey;
+	if (!options.workingTree) {
+		try {
+			const revision = String(
+				(options.git ?? gitExecFileSync)(["rev-parse", "HEAD"], {
+					cwd,
+					encoding: "utf8",
+				}),
+			).trim();
+			if (revision) cacheKey = `${cwd}:${revision}`;
+		} catch {
+			// A failed revision lookup must not turn a mutable tree into a cache hit.
+		}
+	}
+	if (cacheKey) {
+		const cached = headTestCorpusCache.get(cacheKey);
+		if (cached) return cached;
+	}
+	let files = [];
+	try {
+		const tracked = String(
+			(options.git ?? gitExecFileSync)(["ls-files", "--", "tests"], {
+				cwd,
+				encoding: "utf8",
+			}),
+		);
+		files = tracked.split(/\r?\n/).filter(Boolean);
+		if (options.workingTree) {
+			const untracked = String(
+				(options.git ?? gitExecFileSync)(
+					["ls-files", "--others", "--exclude-standard", "--", "tests"],
+					{ cwd, encoding: "utf8" },
+				),
+			)
+				.split(/\r?\n/)
+				.filter(Boolean);
+			files = [...new Set([...files, ...untracked])];
+		}
+	} catch {
+		const visit = (directory) => {
+			for (const entry of readdirSync(directory, { withFileTypes: true })) {
+				const path = resolve(directory, entry.name);
+				if (entry.isDirectory()) visit(path);
+				else if (path.endsWith(".ts") || path.endsWith(".tsx"))
+					files.push(path.slice(cwd.length + 1).replaceAll("\\", "/"));
+			}
+		};
+		try {
+			visit(resolve(cwd, "tests"));
+		} catch {
+			files = [];
+		}
+	}
+	const paths = new Set(
+		// #3013 (defect shape 47): PR-body fixtures live under the scanned
+		// tests/ root, so without this filter the corpus would resolve a
+		// fixture's own fabricated ids and accept the body under test.
+		files.filter((file) => !file.startsWith("tests/fixtures/ci-pr-bodies/")),
+	);
+	const titles = new Set();
+	for (const file of files) {
+		if (
+			file.startsWith("tests/fixtures/ci-pr-bodies/") ||
+			!/\.(?:[cm]?[jt]sx?)$/.test(file)
+		)
+			continue;
+		// The checker test contributes only its declaration titles. Its fixture
+		// strings and arbitrary prose never enter this corpus.
+		let source;
+		try {
+			source = readFileSync(resolve(cwd, file), "utf8");
+		} catch {
+			continue;
+		}
+		const lexed = blankCommentsAndStrings(source);
+		for (const string of lexed.strings) {
+			const prefix = string.prefix;
+			const opening = prefix.lastIndexOf("(");
+			if (opening < 0) continue;
+			const beforeOpening = prefix.slice(0, opening).trimEnd();
+			const direct = /\b(?:it|test|describe)\s*$/.test(beforeOpening);
+			let depth = 0;
+			let matchingOpening = -1;
+			for (let index = beforeOpening.length - 1; index >= 0; index -= 1) {
+				if (beforeOpening[index] === ")") depth += 1;
+				else if (beforeOpening[index] === "(" && --depth === 0) {
+					matchingOpening = index;
+					break;
+				}
+			}
+			const each =
+				(matchingOpening >= 0 &&
+					/\b(?:it|test|describe)\s*\.each\s*$/.test(
+						beforeOpening.slice(0, matchingOpening).trimEnd(),
+					)) ||
+				/\b(?:it|test|describe)\s*\.each\s*(?:[\s\S]*\)|`[\s\S]*`)$/.test(
+					beforeOpening,
+				);
+			if (!direct && !each) continue;
+			const title = string.text;
+			if (title.trim()) titles.add(title.trim());
+		}
+	}
+	const corpus = { paths, titles };
+	if (cacheKey) {
+		if (headTestCorpusCache.size >= HEAD_TEST_CORPUS_CACHE_LIMIT)
+			headTestCorpusCache.delete(headTestCorpusCache.keys().next().value);
+		headTestCorpusCache.set(cacheKey, corpus);
+	}
+	return corpus;
+}
+
+function markdownBlocks(body) {
+	const lines = String(body ?? "").split(/\r?\n/);
+	const blocks = [];
+	let current = null;
+	let fence = null;
+	const flush = () => {
+		if (current?.lines.length) blocks.push(current);
+		current = null;
+	};
+	for (let index = 0; index < lines.length; index += 1) {
+		const line = lines[index];
+		const marker = line.match(/^\s*(```+)/)?.[1];
+		if (marker || fence) {
+			if (marker && !fence && current && current.lines.length) flush();
+			if (!current) current = { lines: [], start: index, fence: true };
+			current.lines.push(line);
+			if (marker && !fence) fence = marker;
+			else if (fence && marker && marker.length >= fence.length) {
+				fence = null;
+				flush();
+			}
+			continue;
+		}
+		if (!line.trim()) {
+			flush();
+			continue;
+		}
+		if (/^\s*\|/.test(line) && current && !/^\s*\|/.test(current.lines[0]))
+			flush();
+		if (!current) current = { lines: [], start: index, fence: false };
+		current.lines.push(line);
+	}
+	flush();
+	return blocks.map((block) => ({
+		...block,
+		text: block.lines.join("\n"),
+		table: !block.fence && block.lines.every((line) => /^\s*\|/.test(line)),
+	}));
+}
+
+function codeSpanMasked(text) {
+	return String(text).replace(/(`+)([\s\S]*?)\1/g, (span) =>
+		" ".repeat(span.length),
+	);
+}
+
+function endsSentence(text, index) {
+	const char = text[index];
+	if (!".!?".includes(char) || !/\s/.test(text[index + 1] ?? "")) return false;
+	if (char === ".") {
+		if (text[index - 1] === "." || text[index + 1] === ".") return false;
+		if (/\d\.\d/.test(text.slice(Math.max(0, index - 1), index + 2)))
+			return false;
+		const word = text.slice(0, index).match(/[A-Za-z]+$/)?.[0] ?? "";
+		const token = text.slice(text.lastIndexOf(" ", index - 1) + 1, index);
+		if (word.length <= 3 && !/[/:]/.test(token)) return false;
+	}
+	return true;
+}
+
+function splitMarkdownSentences(text) {
+	const sentences = [];
+	let start = 0;
+	const masked = codeSpanMasked(text);
+	for (let index = 0; index < text.length; index += 1) {
+		if (endsSentence(masked, index)) {
+			sentences.push({ text: text.slice(start, index + 1), start });
+			start = index + 1;
+		}
+	}
+	if (text.slice(start).trim())
+		sentences.push({ text: text.slice(start), start });
+	return sentences;
+}
+
+export function splitMarkdownUnits(body = "") {
+	const units = [];
+	for (const block of markdownBlocks(body)) {
+		if (block.fence) {
+			units.push({ kind: "fence", text: block.text });
+			continue;
+		}
+		if (/^\s*#{1,6}\s/.test(block.lines[0])) {
+			units.push({ kind: "heading", text: block.text });
+			continue;
+		}
+		if (/^\s*[-*+]\s+/.test(block.lines[0])) {
+			units.push({ kind: "list", text: block.text });
+			continue;
+		}
+		if (block.table) {
+			for (const line of block.lines) units.push({ kind: "table", text: line });
+			continue;
+		}
+		for (const sentence of splitMarkdownSentences(block.text))
+			units.push({ kind: "sentence", text: sentence.text.trim() });
+	}
+	return units;
+}
+
+function bodyLinesOutsideFences(body) {
+	let fence;
+	return String(body ?? "")
+		.split(/\r?\n/)
+		.map((line) => {
+			const marker = line.match(/^\s*(```+)/)?.[1];
+			if (marker) {
+				if (!fence) fence = marker;
+				else if (marker.length >= fence.length) fence = undefined;
+				return "";
+			}
+			return fence ? "" : line;
+		});
+}
+
+function pathLineReferences(text) {
+	return [...String(text ?? "").matchAll(CODE_CITATION)].map((match) => ({
+		file: match[1],
+		lineText: match[2],
+		line: Number(match[2].replace(/^~/, "").split("-", 1)[0]),
+		end: match[2].includes("-")
+			? Number(match[2].replace(/^~/, "").split("-", 2)[1])
+			: undefined,
+		index: match.index,
+	}));
+}
+
+function sourceQuoteAfter(lines, bodyLine) {
+	let index = bodyLine + 1;
+	while (index < lines.length && !lines[index].trim()) index += 1;
+	const opener = lines[index]?.match(/^\s*(```+)(.*)$/);
+	if (!opener) return null;
+	const fence = opener[1];
+	const end = lines.findIndex(
+		(row, rowIndex) =>
+			rowIndex > index && new RegExp(`^\\s*${fence}\\s*$`).test(row),
+	);
+	if (end === -1) return null;
+	const text = lines.slice(index + 1, end).filter((row) => row.trim());
+	return { end, info: opener[2].trim(), text };
+}
+
+function isTranscriptQuote(quote) {
+	const lines = quote.text.join("\n");
+	return (
+		/^(?:text|console|shell|sh|bash|output)$/i.test(quote.info) &&
+		/^(?:\s*(?:\$|>)\s+(?:git|npm|npx|vitest|tsc)\b|\s*Test Files?\b.*\b(?:failed|passed)\b|\s*Tests?\s+\d+\s+(?:failed|passed)\b|\s*(?:PASS|FAIL)\s+(?:\||$)|\s*npm ERR!|\s*error TS\d+)/im.test(
+			lines,
+		)
+	);
+}
+
+function lintCodeCitations(body, options = {}) {
+	const errors = [];
+	const rawLines = String(body ?? "").split(/\r?\n/);
+	const visibleBody = bodyLinesOutsideFences(body).join("\n");
+	for (const {
+		file,
+		lineText,
+		line: lineNumber,
+		end,
+		index,
+	} of pathLineReferences(visibleBody)) {
+		const bodyLine = visibleBody.slice(0, index).split(/\r?\n/).length - 1;
+		const key = `${file}:${lineText}`;
+		if (end !== undefined && end < lineNumber) {
+			errors.push(`PR body citation ${key} has a malformed backwards range.`);
+			continue;
+		}
+		const source = headFileSource(file, options);
+		if (source === null) {
+			errors.push(`PR body citation ${key} does not exist in the HEAD tree.`);
+			continue;
+		}
+		const sourceRows = sourceLines(source);
+		if (lineNumber < 1 || lineNumber > sourceRows.length) {
+			errors.push(`PR body citation ${key} is outside the HEAD tree.`);
+			continue;
+		}
+		const quote = sourceQuoteAfter(rawLines, bodyLine);
+		if (!quote) continue;
+		if (isTranscriptQuote(quote)) continue;
+		const start = Math.max(0, lineNumber - 1 - 20);
+		const finish = Math.min(sourceRows.length, lineNumber + 20);
+		const window = sourceRows.slice(start, finish).join("\n");
+		if (!quote.text.length || !window.includes(quote.text.join("\n")))
+			errors.push(
+				`PR body quote after citation ${key} does not match HEAD source within ±20 lines.`,
+			);
+	}
+	return errors;
+}
+
+// Positive test-reference recognition (#3013): prose outside a test column
+// only names a test through a recognisable form — an it("…") call, a
+// concrete tests/ path, or a short id. A backticked shell invocation is
+// never a test title. The discriminator is semantic (catalog shape 34): a
+// leading argv-like word plus invocation evidence (a flag, a quoted word,
+// an assignment, or a shell metacharacter) reads as a command, not a title.
+// This replaces the four-prefix command allowlist, which missed the next
+// spelling every time. A bare `argv path…` span stays a citation, so a
+// missing tests/ path there still reds.
+function isArgvLike(word) {
+	return (
+		/^(?:\.{1,2}\/)?[A-Za-z0-9_.$~][A-Za-z0-9_.+:@$-]*$/.test(word) ||
+		/^[A-Za-z_][A-Za-z0-9_]*=[^\s]*$/.test(word)
+	);
+}
+
+function isInvocationEvidence(word) {
+	return (
+		word.startsWith("-") ||
+		/^\/[A-Za-z]/.test(word) ||
+		/^(['"]).*\1$/.test(word) ||
+		/^[A-Za-z_][A-Za-z0-9_]*=/.test(word) ||
+		/[=|$><;&*?`]/.test(word)
+	);
+}
+
+function isCommandLikeSpan(value) {
+	const words = String(value ?? "")
+		.split(/\s+/)
+		.filter(Boolean);
+	return (
+		words.length >= 2 &&
+		isArgvLike(words[0]) &&
+		words.slice(1).some(isInvocationEvidence)
+	);
+}
+
+// A tests/ token that cannot name a file (a glob, a brace expansion, or a
+// quoted/bracketed paste) is never a file reference (#3013).
+function isConcreteTestPathToken(token) {
+	return !/[{}[\]*?"'()<>|&;`]/.test(token);
+}
+
+function extractTestPathTokens(value) {
+	const tokens = [];
+	for (const raw of String(value ?? "").split(/\s+/)) {
+		const token = raw
+			.replace(/^(['"([{<]+)/, "")
+			.replace(/([.,;:!?)\]}'"]+)$/, "");
+		if (token.startsWith("tests/")) tokens.push(token);
+	}
+	return tokens;
+}
+
+function lintTestReferences(body, options = {}, corpus = testCorpus(options)) {
+	const references = [];
+	const visibleBody = bodyLinesOutsideFences(body).join("\n");
+	const isExistingDirectory = (pathToken) => {
+		try {
+			return statSync(
+				resolve(options.cwd ?? process.cwd(), pathToken),
+			).isDirectory();
+		} catch {
+			return false;
+		}
+	};
+	const pushMissingPathTokens = (value) => {
+		for (const pathToken of extractTestPathTokens(value)) {
+			// A trailing slash names a suite directory, never a file.
+			if (pathToken.endsWith("/")) continue;
+			if (!isConcreteTestPathToken(pathToken)) continue;
+			if (
+				corpus.paths.has(pathToken) ||
+				corpus.titles.has(pathToken) ||
+				corpus.paths.has(pathToken.match(/^(tests\/[^:]+):\d+$/)?.[1] ?? "")
+			)
+				continue;
+			// A slash-less directory (tests/config) names a suite too.
+			if (isExistingDirectory(pathToken)) continue;
+			references.push(pathToken);
+		}
+	};
+	const addToken = (raw, strict = false, testColumn = false) => {
+		const token = raw.trim();
+		const wrapped = /^it\(\s*(["'])(.*?)\1\s*\)(?:\s*\([^)]*\))?$/.exec(token);
+		const value = wrapped
+			? wrapped[2].replace(/\s*\([^)]*\)\s*$/, "").trim()
+			: token;
+		// Short IDs are references only in an explicitly named test column.
+		// A bare ID in prose is not evidence of a test and must remain inert.
+		if ((/^[A-Z]\d+$/.test(value) && testColumn) || wrapped) {
+			references.push(value);
+			return;
+		}
+		if (strict) {
+			// Test-column placement recognises the reference, so even a
+			// command-shaped span is checked, exactly as before. Pipe lines
+			// outside a valid table share this strictness: without the
+			// separator that makes columns meaningful, a broken separator
+			// must not hide a fabricated reference.
+			if (/\s/.test(value) || value.startsWith("tests/"))
+				references.push(value);
+			return;
+		}
+		if (isCommandLikeSpan(value)) return;
+		// Prose, bullets, and non-test cells: positive recognition only —
+		// anything without a concrete tests/ path is not a test reference
+		// and is never asserted to exist.
+		pushMissingPathTokens(value);
+	};
+	const lines = visibleBody.split(/\r?\n/);
+	let tableHeaders = null;
+	const tableCells = (line) => line.split("|").map((cell) => cell.trim());
+	const isValidSeparator = (line, headers) => {
+		if (!headers) return false;
+		if (!/^\s*\|.*\|\s*$/.test(line)) return false;
+		const cells = tableCells(line);
+		return (
+			cells.length === headers.length &&
+			cells.slice(1, -1).every((cell) => /^:?-{3,}:?$/.test(cell))
+		);
+	};
+	for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+		const line = lines[lineIndex];
+		const isBullet = /^\s*[-*+]\s+/.test(line);
+		const table = /^\s*\|.*\|\s*$/.test(line);
+		if (!table) tableHeaders = null;
+		if (
+			table &&
+			lineIndex + 1 < lines.length &&
+			isValidSeparator(lines[lineIndex + 1], tableCells(line))
+		) {
+			tableHeaders = tableCells(line);
+			continue;
+		}
+		const inTable = table && tableHeaders !== null;
+		if (inTable && isValidSeparator(line, tableHeaders)) continue;
+		for (const match of line.matchAll(/`([^`]+)`/g)) {
+			const cellIndex = inTable
+				? line.slice(0, match.index).split("|").length - 1
+				: -1;
+			const inTestColumn = Boolean(
+				// Word-boundary match (#3013): a bare "id" substring qualified
+				// every "Evidence" column as a test column, so claim-matrix
+				// evidence cells holding commands and code read as missing test
+				// references. A column names tests only when it says so as a
+				// word ("Test", "Test id", "Case").
+				inTable &&
+				/\b(?:test|probe|case|witness|id)\b/i.test(
+					tableHeaders[cellIndex] ?? "",
+				),
+			);
+			addToken(match[1], inTestColumn || (table && !inTable), inTestColumn);
+		}
+		for (const match of line.matchAll(/\bit\(\s*(["'])(.*?)\1\s*\)/g))
+			if (isBullet || !inTable) addToken(match[0]);
+	}
+	const exists = (reference) => {
+		const path = reference.match(/^(tests\/[^:]+):\d+$/)?.[1];
+		return (
+			corpus.paths.has(reference) ||
+			corpus.paths.has(path ?? reference) ||
+			corpus.titles.has(reference)
+		);
+	};
+	return [...new Set(references)]
+		.filter((reference) => !exists(reference))
+		.map(
+			(reference) =>
+				`PR body test reference is missing under tests/: ${reference}`,
+		);
+}
+
+function lintMasterClaims(body) {
+	const errors = [];
+	const units = splitMarkdownUnits(body);
+	for (let index = 0; index < units.length; index += 1) {
+		const unit = units[index];
+		if (
+			unit.kind === "fence" ||
+			unit.kind === "table" ||
+			!MASTER_CLAIM.test(unit.text) ||
+			/reviewer\s+(?:wrote|said)/i.test(unit.text)
+		)
+			continue;
+		const next = units[index + 1];
+		if (next?.kind === "fence" && /origin\/master/i.test(next.text)) continue;
+		errors.push(
+			`PR body master/environment claim lacks an origin/master transcript: ${unit.text.trim()}`,
+		);
+	}
+	return errors;
+}
+
+function lintRuntimeObservability(
+	body,
+	lines,
+	headings,
+	diff,
+	cwd = process.cwd(),
+) {
+	const observation = runtimeObservabilityFromDiff(diff);
+	if (!observation.runtime) return [];
+	const content = observabilitySectionContent(body, lines, headings);
+	if ([...observation.records].some((record) => content.includes(record)))
+		return [];
+	const existingRecordCitation = pathLineReferences(content).find(
+		(reference) => {
+			const prefix = content.slice(0, reference.index);
+			return /covered by existing record `[^`]+` at\s*$/.test(prefix);
+		},
+	);
+	const existingRecordPrefix = existingRecordCitation
+		? content
+				.slice(0, existingRecordCitation.index)
+				.match(/covered by existing record `([^`]+)` at\s*$/)
+		: null;
+	if (
+		existingRecordCitation &&
+		existingRecordPrefix &&
+		!/(?:^|\/)\.\.(?:\/|$)/.test(existingRecordCitation.file) &&
+		isRuntimeObservabilityPath(existingRecordCitation.file)
+	) {
+		const [, kind] = existingRecordPrefix;
+		const { file, line: lineNumber } = existingRecordCitation;
+		try {
+			const source = readFileSync(
+				isAbsolute(file) ? file : resolve(cwd, file),
+				"utf8",
+			);
+			if (
+				recordLocationsFromRuntimeSource(source).some(
+					({ value, line }) =>
+						value === kind && Math.abs(line - lineNumber) <= 20,
+				)
+			)
+				return [];
+		} catch {
+			// Fall through to the existing strict error.
+		}
+	}
+	if (
+		!observation.failurePath &&
+		content.includes("No new failure path; no record added.")
+	)
+		return [];
+	if (observation.failurePath)
+		return [
+			`PR body Observability must name a record literal from the runtime diff${observation.records.size ? ` (${[...observation.records].join(", ")})` : ""}; "No new failure path; no record added." is not valid when the added lines contain a failure path.`,
+		];
+	return [
+		'PR body Observability must name a record literal present in the runtime diff, or state exactly "No new failure path; no record added.".',
+	];
 }
 
 /** Detect the high-confidence shape produced when a worker flattens a body. */
@@ -354,6 +1163,19 @@ export function lintPrBody(body = "", options = {}) {
 				sectionMessage(name, "has no content before the next heading"),
 			);
 	}
+	if (options.diff)
+		errors.push(
+			...lintRuntimeObservability(
+				body,
+				lines,
+				headings,
+				options.diff,
+				options.cwd,
+			),
+		);
+	errors.push(...lintCodeCitations(body, options));
+	errors.push(...lintTestReferences(body, options, testCorpus(options)));
+	errors.push(...lintMasterClaims(body));
 	return { valid: errors.length === 0, errors };
 }
 
@@ -488,7 +1310,18 @@ export async function lintPullRequestEvent(
 	const { body, normalized } = await resolveLivePrBody(pullRequest, fetchImpl);
 	const requireTestAssessment =
 		(await resolveTouchesTests(pullRequest, fetchImpl)) === true;
-	const result = lintPrBody(body, { requireTestAssessment });
+	let diff = "";
+	try {
+		diff = localDiff();
+	} catch (error) {
+		if (process.env.GITHUB_ACTIONS) {
+			const reason = error instanceof Error ? error.message : String(error);
+			throw new Error(`diff unavailable: ${reason}`);
+		}
+		// Local callers may not have an upstream ref. Preserve structural lint
+		// outside CI rather than inventing a runtime scope.
+	}
+	const result = lintPrBody(body, { requireTestAssessment, diff });
 	if (result.valid) {
 		console.log(`PR body OK: ${pullRequest.number}`);
 		return { valid: true, repaired: normalized };
@@ -497,13 +1330,86 @@ export async function lintPullRequestEvent(
 	return { valid: false, repaired: false };
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
-	lintPullRequestEvent()
-		.then((result) => {
-			if (!result.valid) process.exitCode = 1;
-		})
-		.catch((error) => {
-			console.error(error instanceof Error ? error.message : error);
-			process.exitCode = 1;
+export function localDiff(cwd = process.cwd(), git = gitExecFileSync) {
+	return git(["diff", "--unified=0", "--no-color", "origin/master...HEAD"], {
+		cwd,
+		encoding: "utf8",
+	});
+}
+
+export function localTouchesTests(cwd = process.cwd(), git = gitExecFileSync) {
+	let names;
+	try {
+		names = git(["diff", "--name-only", "origin/master...HEAD"], {
+			cwd,
+			encoding: "utf8",
 		});
+	} catch {
+		try {
+			names = git(["diff", "--name-only", "HEAD~1"], {
+				cwd,
+				encoding: "utf8",
+			});
+		} catch {
+			// #2904 round 2 recurrence: shallow or single-commit repositories may
+			// have neither range; require assessment because assuming no test changes
+			// would weaken the lint.
+			return true;
+		}
+	}
+	return names.split(/\r?\n/).some((name) => name.startsWith("tests/"));
+}
+
+export function lintLocalPrBody(
+	body,
+	cwd = process.cwd(),
+	git = gitExecFileSync,
+) {
+	let diff;
+	try {
+		diff = localDiff(cwd, git);
+	} catch {
+		// A local preflight must use the same range as CI. If the caller has no
+		// upstream ref, retain structural lint rather than inventing scope.
+		diff = "";
+	}
+	return lintPrBody(body, {
+		requireTestAssessment: localTouchesTests(cwd, git),
+		diff,
+		cwd,
+		workingTree: true,
+	});
+}
+
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+	// Local contract: --lint-local <body-file> remains the preflight form from
+	// #2796. The equivalent --body <body-file> --title <title-file> form keeps
+	// title validation in check-pr-title.mjs while accepting preflight's inputs.
+	const bodyIndex = process.argv.indexOf("--body");
+	const titleIndex = process.argv.indexOf("--title");
+	if (bodyIndex !== -1) {
+		const bodyPath = process.argv[bodyIndex + 1];
+		if (!bodyPath) throw new Error("--body requires a file path");
+		// --title is accepted for preflight parity. Title validation belongs to
+		// check-pr-title.mjs, but preflight passes both local input files.
+		if (titleIndex !== -1 && !process.argv[titleIndex + 1])
+			throw new Error("--title requires a file path");
+		const result = lintLocalPrBody(readFileSync(bodyPath, "utf8"));
+		for (const error of result.errors) console.error(error);
+		process.exitCode = result.valid ? 0 : 1;
+	} else if (process.argv[2] === "--lint-local") {
+		const bodyPath = process.argv[3];
+		if (!bodyPath) throw new Error("--lint-local requires a file path");
+		const result = lintLocalPrBody(readFileSync(bodyPath, "utf8"));
+		for (const error of result.errors) console.error(error);
+		process.exitCode = result.valid ? 0 : 1;
+	} else
+		lintPullRequestEvent()
+			.then((result) => {
+				if (!result.valid) process.exitCode = 1;
+			})
+			.catch((error) => {
+				console.error(error instanceof Error ? error.message : error);
+				process.exitCode = 1;
+			});
 }

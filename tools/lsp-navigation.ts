@@ -737,29 +737,8 @@ export function createLspNavigationTool(
 		name: "lsp_navigation" as const,
 		label: "LSP Navigate",
 		description:
-			"Navigate code using LSP (Language Server Protocol). LSP is enabled by default; disable with --no-lsp.\n" +
-			"Operations:\n" +
-			"- definition: Jump to where a symbol is defined\n" +
-			"- typeDefinition: Jump to the definition of a symbol's TYPE (e.g. the class/interface of a variable)\n" +
-			"- declaration: Jump to a symbol's declaration (e.g. an extern/forward decl, distinct from its definition)\n" +
-			"- references: Find all usages of a symbol\n" +
-			"- hover: Get type/doc info at a position\n" +
-			"- signatureHelp: Show callable signatures at cursor\n" +
-			"- documentSymbol: List all symbols (functions/classes/vars) in a file\n" +
-			"- findSymbol: Search document symbols in a file by name/detail with optional kind/top-level/exact filters\n" +
-			"- workspaceSymbol: Search symbols across the whole project (best with path context)\n" +
-			"- codeAction: Find available quick fixes/refactors at a range\n" +
-			"- rename: Compute or apply workspace edits for renaming a symbol\n" +
-			"- rename_file: Preview/apply LSP-aware source file rename notifications\n" +
-			"- implementation: Jump to interface implementations\n" +
-			"- prepareCallHierarchy: Get callable item at position (for incoming/outgoing)\n" +
-			"- incomingCalls: Find all functions/methods that CALL this function\n" +
-			"- outgoingCalls: Find all functions/methods CALLED by this function\n" +
-			"- executeCommand: Run a server-advertised command via workspace/executeCommand. HARDENED: allowlisted to commands the server advertised; dry-run by default (reports whether advertised) — set apply:true to actually run. Pass command (+ optional commandArguments).\n" +
-			"- workspaceDiagnostics: List all diagnostics tracked by active LSP clients\n" +
-			"- capabilities: Show cached operation support for active LSP servers\n\n" +
-			"Line and character are 1-based (as shown in editors). For position-based operations, prefer passing symbol when you know the line but not the exact character; character can be omitted or -1 and pi-lens will resolve the symbol column. Use symbol#N for repeated symbols on the same line (1-based occurrence).",
-		promptSnippet: "Find definitions, references, and hover info via LSP",
+			'Navigate source with language-server operations such as definition, references, hover, and rename. Example: use `{operation: "references", path: "src/app.ts", line: 12}`.',
+		promptSnippet: "Navigate definitions and references with LSP",
 		renderResult: compactRenderResult<{
 			operation?: string;
 			resultCount?: number;
@@ -781,100 +760,86 @@ export function createLspNavigationTool(
 		parameters: Type.Object({
 			operation: Type.String({
 				description:
-					"LSP operation to perform. Valid values: " +
-					VALID_OPERATIONS.join(", "),
+					"LSP operation to perform. Valid values: definition, typeDefinition, declaration, references, hover, signatureHelp, documentSymbol, findSymbol, workspaceSymbol, codeAction, rename, rename_file, implementation, prepareCallHierarchy, incomingCalls, outgoingCalls, executeCommand, workspaceDiagnostics, capabilities.",
 			}),
 			path: Type.Optional(
 				Type.String({
-					description:
-						"Absolute or relative file path. Required for file-scoped operations; optional for workspaceSymbol/workspaceDiagnostics.",
+					description: "Target file path.",
 				}),
 			),
 			line: Type.Optional(
 				Type.Number({
-					description:
-						"Line number (1-based). Required for definition/references/hover/implementation",
+					description: "1-based line number.",
 				}),
 			),
 			character: Type.Optional(
 				Type.Number({
-					description:
-						"Character offset (1-based). Optional when symbol is provided; use -1 to force symbol-column resolution.",
+					description: "1-based character offset.",
 				}),
 			),
 			symbol: Type.Optional(
 				Type.String({
-					description:
-						"Symbol name on the target line for automatic character resolution. Use symbol#N to select the Nth occurrence on the line.",
+					description: "Symbol for automatic character resolution.",
 				}),
 			),
 			endLine: Type.Optional(
 				Type.Number({
-					description:
-						"End line (1-based). Optional; used by codeAction range.",
+					description: "1-based range end line.",
 				}),
 			),
 			endCharacter: Type.Optional(
 				Type.Number({
-					description:
-						"End character (1-based). Optional; used by codeAction range.",
+					description: "1-based range end character.",
 				}),
 			),
 			newName: Type.Optional(
 				Type.String({
-					description: "Required for rename operation.",
+					description: "New symbol name.",
 				}),
 			),
 			newFilePath: Type.Optional(
 				Type.String({
-					description: "Required for rename_file operation.",
+					description: "New file path.",
 				}),
 			),
 			apply: Type.Optional(
 				Type.Boolean({
-					description:
-						"rename/executeCommand: apply for real. rename defaults to preview; executeCommand defaults to a dry-run that only reports whether the command is advertised — set apply:true to actually run it.",
+					description: "Apply a mutation instead of previewing it.",
 				}),
 			),
 			command: Type.Optional(
 				Type.String({
-					description:
-						"executeCommand only: the server command id to run. Must be one the server advertised (see the capabilities operation).",
+					description: "Server command identifier.",
 				}),
 			),
 			commandArguments: Type.Optional(
 				Type.Array(Type.Unknown(), {
-					description:
-						"executeCommand only: arguments array passed to workspace/executeCommand.",
+					description: "Arguments for the server command.",
 				}),
 			),
 			query: Type.Optional(
 				Type.String({
-					description:
-						"Symbol name to search. Used by workspaceSymbol and findSymbol.",
+					description: "Symbol search query.",
 				}),
 			),
 			kinds: Type.Optional(
 				Type.Array(Type.String(), {
-					description:
-						"findSymbol only: restrict matches to symbol kind labels such as function, class, method, variable, interface.",
+					description: "Symbol-kind filters.",
 				}),
 			),
 			exactMatch: Type.Optional(
 				Type.Boolean({
-					description:
-						"findSymbol only: match whole symbol names/details exactly instead of substring matching.",
+					description: "Require an exact symbol match.",
 				}),
 			),
 			topLevelOnly: Type.Optional(
 				Type.Boolean({
-					description: "findSymbol only: do not search nested child symbols.",
+					description: "Exclude nested symbols.",
 				}),
 			),
 			maxResults: Type.Optional(
 				Type.Number({
-					description:
-						"findSymbol only: maximum matches to return. Default 20.",
+					description: "Maximum symbol matches.",
 				}),
 			),
 			callHierarchyItem: Type.Optional(
@@ -904,10 +869,7 @@ export function createLspNavigationTool(
 							}),
 						}),
 					},
-					{
-						description:
-							"Call hierarchy item. Required for incomingCalls/outgoingCalls",
-					},
+					{},
 				),
 			),
 		}),

@@ -21,7 +21,8 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { removeTempDirSync } from "../clients/test-utils.js";
 import { makeLspServiceDouble } from "../support/lsp-service-double.js";
 
 const mocked = vi.hoisted(() => ({ service: null as unknown }));
@@ -51,7 +52,7 @@ vi.mock("../../clients/lsp/index.js", async () => {
 });
 
 vi.mock("../../clients/widget-state.js", () => ({
-	reconcileScanDiagnostics: vi.fn(),
+	reconcileScanDiagnostics: vi.fn().mockReturnValue(true),
 }));
 
 import { createLspDiagnosticsTool } from "../../tools/lsp-diagnostics.js";
@@ -102,6 +103,10 @@ describe("lsp_diagnostics batch — per-server serialization (#631)", () => {
 			getDiagnosticsHealth: vi.fn().mockReturnValue(undefined),
 			getCapabilitySnapshots: vi.fn().mockResolvedValue([]),
 		});
+	});
+
+	afterEach(() => {
+		removeTempDirSync(tmpDir);
 	});
 
 	function writeFiles(names: string[]): string[] {

@@ -151,6 +151,13 @@ import {
 	resetLspMutationNoBridgeDbgLatch,
 	type LspMutationContext,
 } from "../../clients/lsp-mutation.js";
+import {
+	_getSituationalToolTelemetryStateForTests,
+	emitSituationalDeadWeight,
+	observeSituationalToolActivation,
+	observeSituationalToolCall,
+	resetSituationalToolTelemetry,
+} from "../../clients/situational-tool-telemetry.js";
 
 /**
  * When a piece of state must return to its initial value.
@@ -505,6 +512,15 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 			"A once-per-session coverage notice must be sayable again to the next session's agent; `generatedSkipRecorded` (refs #2346) rides the same reset so a generated file's `dispatch_skipped_generated` record is emitted for the new session's dispatches of that file, not silently withheld because an older session already logged it.",
 	},
 	{
+		id: "file-utils:pendingDataDirMigrations",
+		module: "file-utils.ts",
+		state: "pendingDataDirMigrations",
+		policy: "session_start",
+		resetName: "resetProjectDataDirSessionState",
+		reason:
+			"Migration notices belong to the session that resolves the project data directory; clearing the bounded queue at session_start prevents a prior session's migration from being emitted again.",
+	},
+	{
 		id: "formatters:runtimeState",
 		module: "formatters.ts",
 		state: "detectionCache",
@@ -517,13 +533,13 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 		id: "formatters:whichLatches",
 		module: "formatters.ts",
 		state:
-			"whichLatchByCommand, whichTransientCommands, cooldownRecordedForRetryAtMs (cleared together with detectionCache)",
+			"whichLatchByCommand, whichTransientCommands, cooldownRecordedForRetryAtMs, formatterSignatureFlights (cleared together with detectionCache)",
 		policy: "session_start",
 		resetName: "clearFormatterCache",
 		reason:
 			"#1895: formatter PATH availability is session-scoped, but these module-local latches are not covered by the dispatch availability generation. A formatter installed or removed between sessions must be re-probed. The reset is `clearFormatterCache`, not the latch clear alone: `getFormattersForFile` answers a same-cwd lookup from `detectionCache` before it reaches a `which` probe, so dropping the latches without the selection cache re-arms every directory except the working one (review round on PR #1896).",
 		probe: {
-			// Arms all FOUR pieces of state the reset claims to cover — the three
+			// Arms all FIVE pieces of state the reset claims to cover — the three
 			// latch maps AND the selection cache. A probe that armed only the
 			// latches would stay green if a future cache were added and left out
 			// of `clearFormatterCache`; that omission is precisely the #1895 bug.
@@ -539,6 +555,9 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 					signature: "session-state-registry-probe",
 					entries: new Map(),
 				});
+				ns.formatterSignatureFlights.set("/pi-lens-probe-cwd", {
+					promise: Promise.resolve("session-state-registry-probe"),
+				});
 			},
 			isArmed: () => {
 				const ns = getFormattersInternals();
@@ -546,7 +565,8 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 					ns.whichLatchByCommand.size === 0 &&
 					ns.whichTransientCommands.size === 0 &&
 					ns.cooldownRecordedForRetryAtMs.size === 0 &&
-					ns.detectionCache.size === 0
+					ns.detectionCache.size === 0 &&
+					ns.formatterSignatureFlights.size === 0
 				);
 			},
 			reset: () => clearFormatterCache(),
@@ -664,7 +684,7 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 		policy: "session_start",
 		resetName: "resetLSPService",
 		reason:
-			"The service is torn down and rebuilt per session; this reset is also the seam that carries the sweep hold and TS-repair guard resets.",
+			"The service is torn down and rebuilt per session; this reset also clears the adaptive auxiliary wait streak and demotion set, alongside the sweep hold and TS-repair guard resets.",
 	},
 	{
 		id: "lsp-mutation:noBridgeDbgLogged",
@@ -1048,6 +1068,28 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 			"#2319: #2249's declined-bind rollup is process-singleton backed (catalog shape 25), so the module-scope container scan could not see it. Its reset runs in index.ts's session_start closure on the primary-continuation path behind the #473 concurrent-secondary gate - a declined bind's own session_start increments these counters, so resetting there would erase every prior sibling's tally; the closure placement (with the emit-before-reset first line) still lets a primary that crashed before session_shutdown start from zero.",
 	},
 	{
+		id: "situational-tool-telemetry:sessionObservation",
+		module: "situational-tool-telemetry.ts",
+		state:
+			"activated, called (the conversation's observation sets), emitted (its once-per-row latch), sessionHost (which host owns the open session), and connectionEnded (the MCP-only connection-terminal latch). situationalToolSet is also counted by the scan but is an import-time frozen lookup over TOOL_REGISTRY (SWEEP_HEURISTIC_LIMITS item 5); sessionStarted is the start/end pair's own in-progress flag. sessionStarted and connectionEnded are deliberately NOT cleared by this reset: both hosts call startSituationalToolTelemetrySession() before handleSessionStart, so clearing sessionStarted would make endSituationalToolTelemetry() skip the session's own final row, and only MCP may arm connectionEnded. The reset also refuses to clear while a telemetry session is live because a repeated MCP session_start refresh must not wipe calls recorded before it; this reset is the registry's structural hook and the real clearing happens in endSituationalToolTelemetry() and in the opener itself.",
+		policy: "session_start",
+		resetName: "resetSituationalToolTelemetry",
+		reason:
+			"#2858: the dead-weight line is one row per pi conversation or MCP connection naming situational tools that host never used. The row belongs to the conversation identified by pi's session file: a shutdown that switches the file (new, resume, fork — pi sends targetSessionFile) emits the ending conversation's row and resets; reload keeps the same file and preserves the observations even though pi re-runs the extension factory (the module state survives); a process restart starts both sets empty and recovers nothing, because the restore deactivates every situational tool in a new process (#2866 review F1 — the host's restored active set is every registered tool, not evidence of activation). MCP owns connectionEnded. The reset's sessionStarted exclusion is stated in the state field above.",
+		probe: {
+			arm: () => {
+				observeSituationalToolActivation(["lsp_navigation"]);
+				observeSituationalToolCall("lsp_navigation");
+				emitSituationalDeadWeight();
+			},
+			isArmed: () => {
+				const state = _getSituationalToolTelemetryStateForTests();
+				return state.activated === 0 && state.called === 0 && !state.emitted;
+			},
+			reset: () => resetSituationalToolTelemetry(),
+		},
+	},
+	{
 		id: "smells-rollup:notifiedThisSession",
 		module: "smells-rollup.ts",
 		state: "notifiedThisSession",
@@ -1112,6 +1154,15 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 			"#2366: staged test results belong to their owning session and must not cross a primary session replacement; the durable findings cache remains available to pull diagnostics.",
 	},
 	{
+		id: "tool-set-policy:rememberedLazyToolsBySessionFile",
+		module: "tool-set-policy.ts",
+		state: "rememberedLazyToolsBySessionFile",
+		policy: "process_lifetime",
+		resetName: "resetRememberedLazyToolsForTests",
+		reason:
+			"Activation posture must survive factory rebuilds and return-to-session transitions; the bounded FIFO cap limits process-lifetime retention without clearing live conversation memory.",
+	},
+	{
 		id: "tree-sitter-shared:webTreeSitterLoadFailed",
 		module: "tree-sitter-shared.ts",
 		state:
@@ -1144,6 +1195,17 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 		resetName: "resetWorkspaceTopology",
 		reason:
 			"Tsconfig path and project-reference resolutions derive from workspace topology, so both memos must re-arm with that index.",
+	},
+	{
+		id: "turn-context:perSessionCounters",
+		module: "turn-context.ts",
+		state:
+			"the per-session turn counters keyed by stable session id (and the AsyncLocalStorage binding)",
+		policy: "session_start",
+		resetName: "resetTurnContext",
+		sessionStartClosureReset: true,
+		reason:
+			"#2815: turn context is process-singleton-backed state with per-session counters. Its reset must run once from the primary session_start closure, after concurrent-secondary classification, so a secondary cannot erase the primary's live turn identity; the coordinator only changes identity and begins turns.",
 	},
 	{
 		id: "workspace-modules:moduleSourceFilesMemo",
@@ -1261,7 +1323,7 @@ export const EXEMPT_SESSION_STATE_FILES: Readonly<Record<string, string>> = {
 	// a test can re-register a fresh subscriber set. ---
 	"bus-publish.ts": "bus publisher registration",
 	"cache-observability.ts":
-		"cache-prefix observation and per-session miss-attribution/summary state; both maps are role-separated when session identity is absent, bounded by the same LRU cap, summarized then cleared on each role-specific shutdown",
+		"cache-prefix observation and per-session miss-attribution/summary state; both maps are role-separated when session identity is absent, bounded by the same LRU cap, summarized then cleared on each role-specific shutdown; repeated-finding identities re-arm on the owned session_start through index.ts",
 	// #2418: the warn-once latch that used to live in lens-config.ts and
 	// project-lens-config.ts moved here when the three loaders' duplicated warn
 	// bodies were collapsed into one seam. Same lifetime as before — it is tied
@@ -1293,6 +1355,8 @@ export const EXEMPT_SESSION_STATE_FILES: Readonly<Record<string, string>> = {
 	"event-loop-hold.ts":
 		"in-flight tool-call keep-alive; scoped to one call's try/finally and force-released by its own max-age failsafe — a session boundary that cleared it would un-hold a still-running call and reintroduce #2507",
 	"extension-log.ts": "console-method guard installation",
+	"file-utils.ts":
+		"the settledDataDirs project-directory memo is process-lifetime identity state; it is keyed by configured base and resolved cwd, and resetting it at session_start would repeat filesystem migration checks without changing identity. The projectIgnoreMatcherCache and projectIgnoreGlobsCache in the same file are signature-validated content caches: every read re-checks .gitignore mtime+size, the .pi-lens.json path+mtime+size and the global-config mtime, with a 2 s cadence sweep for newly created nested sources, so a session boundary reset is unnecessary (#2929 round 4, F1)",
 	"format-events-publish.ts": "format event publisher registration",
 	"generated-artifacts.ts":
 		"generated-file classification derived from path patterns",
@@ -1467,6 +1531,12 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"disposition-publish.ts": 0,
 	"event-loop-hold.ts": 0,
 	"extension-log.ts": 2,
+	// #2874: the live scan sees settledDataDirs plus the two project-ignore
+	// caches. All three ride the file-level exemption above: the ignore caches
+	// are signature-validated per call (#2929 round 4, F1), so no reset exists
+	// to register. This pin counts all three module-level containers, not the
+	// migration queue array.
+	"file-utils.ts": 3,
 	"format-events-publish.ts": 0,
 	// #2442 review F2: the container regex now recognises BoundedFifoMap /
 	// BoundedLruCache, so this file's module-level bounded cache is counted.
@@ -1475,6 +1545,10 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	// module-level `new Set`) is counted (8 -> 9). An import-time frozen
 	// vocabulary with no session lifetime — SWEEP_HEURISTIC_LIMITS item 5, and
 	// this file's existing registry entries already cover its real caches.
+	// #2756 round 3: the live container scan includes the module-level
+	// formatterSignatureFlights cache added with the project-root cwd resolver.
+	// #2777 folded the formatter marker map into tool-cwd.ts, removing one
+	// import-time container from this module.
 	"formatters.ts": 9,
 	// #2442 review F2: the container regex now recognises BoundedFifoMap /
 	// BoundedLruCache, so this file's module-level bounded cache is counted.
@@ -1617,6 +1691,12 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	// is what flags this file now.
 	"session-start-observability.ts": 0,
 	"sgconfig.ts": 2,
+	// #2800 item 8: the dead-weight line's two per-session observation sets
+	// (activated, called) plus situationalToolSet — an import-time frozen lookup
+	// over TOOL_REGISTRY that the container scan cannot distinguish from mutable
+	// state (SWEEP_HEURISTIC_LIMITS item 5). Registered above; the wired reset
+	// clears the two sets and the emitted latch.
+	"situational-tool-telemetry.ts": 3,
 	// #2442 review F2: the container regex now recognises BoundedFifoMap /
 	// BoundedLruCache, so this file's module-level bounded cache is counted.
 	"slow-fs.ts": 1,
@@ -1629,8 +1709,10 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	// `let`) plus its `_resetBundledQueriesRootHealthForTests` export (the
 	// scan's reset-signal detector) — see this file's EXEMPT_SESSION_STATE_FILES
 	// entry above for why it is exempt rather than registered.
+	"tool-set-policy.ts": 1,
 	"tree-sitter-query-loader.ts": 2,
 	"tree-sitter-shared.ts": 0,
+	"turn-context.ts": 0,
 	"warm-attach.ts": 0,
 	// #2275 added `renderedDependencyDriftFiles` (the drained per-turn footer
 	// delivery set) alongside the existing two.

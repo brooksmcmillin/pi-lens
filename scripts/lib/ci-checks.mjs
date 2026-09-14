@@ -18,10 +18,17 @@
 
 export const REQUIRED_CHECKS = ["Unit tests", "Lint & type-check"];
 
+export const CI_JOB_NAMES = Object.freeze({
+	CHANGELOG_FRAGMENT: "Changelog fragment (fast-fail)",
+	LINT_AND_TYPECHECK: "Lint & type-check",
+	KNIP: "knip (advisory)",
+	UNIT_TESTS: "Unit tests",
+});
+
 // How this repository ACTUALLY marks a check advisory: the workflow job name
 // ends in "(advisory)". Probed 2026-08-26 against the live rollups of every
-// open PR -- `oxfmt format check (advisory)`, `PR body (advisory)`,
-// `Vale prose lint (advisory)`, `OSV scan (advisory)`. Originally lived only
+// open PR -- `PR body (advisory)`, `Vale prose lint (advisory)`,
+// `OSV scan (advisory)`. Originally lived only
 // in merge-train-lane.mjs; moved here in #2609 so ci-verdict.mjs (a second
 // consumer of the exact same policy) imports the ONE list instead of
 // hand-rolling its own -- AGENTS.md shape 38's own warning ("the cheapest
@@ -45,6 +52,12 @@ export const ADVISORY_CHECKS = new Set([
 	"yamllint (advisory)",
 	"typos (advisory)",
 	"taplo (advisory)",
+	"mutation (advisory)",
+	"complexity (advisory)",
+	// Stale verdict labels are bookkeeping only. Their cleanup asserts no
+	// property of the change, so API or token failures must never block a merge
+	// (#2993, including read-only fork pull_request tokens).
+	"Clear stale CI verdict labels",
 	// .github/workflows/greetings.yml's `greeting` job (the job KEY -- no
 	// `name:` override), posted by `actions/first-interaction` on
 	// `pull_request_target: types: [opened]` only. A cosmetic

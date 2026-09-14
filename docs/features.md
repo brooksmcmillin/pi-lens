@@ -12,20 +12,20 @@ pi-lens includes **45 language server definitions** (including four cross-cuttin
 { "warmFiles": ["src/main.cpp", "src/lib.cpp"] }
 ```
 
-**Agent LSP tools:** `lsp_diagnostics` can check one file, a directory, or an explicit `filePaths` batch with bounded concurrency. `lsp_navigation` provides definitions, references, hover, workspace symbols, call hierarchy, rename edits, and `findSymbol` for filtered document-symbol lookup. Key operations:
+**Agent LSP tools:** `lens_diagnostics` with `source=lsp` can check one file, a directory, or explicit paths with bounded concurrency. `lsp_navigation` provides definitions, references, hover, workspace symbols, call hierarchy, rename edits, and `findSymbol` for filtered document-symbol lookup. Key operations:
 
 - **`rename`** — renames a symbol across all references; `apply: true` writes workspace edits to disk with per-file LSP re-sync.
 - **`rename_file`** — LSP-aware file rename: sends `workspace/willRenameFiles` to collect import-path rewrites, applies them, renames the file on disk, and notifies servers via `workspace/didRenameFiles`. `apply: false` previews the workspace edits without touching the filesystem.
 - **`capabilities`** — shows which operations are supported by the active LSP server(s) for a file, read directly from the cached `initialize` response (no round-trip).
 - **Symbol column resolution** — passing `symbol: "myFunc"` instead of an exact `character` position resolves the correct column automatically. Use `symbol: "foo#2"` for the second occurrence of `foo` on the line.
 
-LSP servers for: TypeScript, Deno, Python (pyright/basedpyright + jedi), Go, Rust, Ruby (ruby-lsp + solargraph), PHP, C# (omnisharp), F#, Java (JDT LS, with Lombok javaagent support when a Lombok jar is available), Kotlin, Swift, Dart, Lua, C/C++, Zig, Haskell, Elixir, Gleam, OCaml, Clojure, CUE (syntax and parse diagnostics; evaluation errors via the cue-vet auxiliary runner), Terraform, Nix, Bash, Docker, YAML, JSON, HTML, TOML, Prisma, Vue, Svelte, CSS.
+LSP servers for: TypeScript, Deno, Python (pyright/basedpyright + jedi), Go, Rust, Ruby (ruby-lsp + solargraph), PHP, PowerShell, C# (omnisharp), F#, Java (JDT LS, with Lombok javaagent support when a Lombok jar is available), Kotlin, Swift, Dart, Lua, C/C++, Zig, Haskell, Elixir, Gleam, Markdown (marksman), OCaml, Clojure, CUE (syntax and parse diagnostics; evaluation errors via the cue-vet auxiliary runner), Terraform, Nix, Bash, Fish, CMake, Docker, YAML, JSON, HTML, TOML, Prisma, Vue, Svelte, CSS.
 
 ### Formatters
 
 pi-lens auto-detects and runs **34 formatters** based on project config:
 
-biome, prettier, oxfmt, ruff, black, sqlfluff, gofmt, rustfmt, zig fmt, dart format, shfmt, nixfmt, mix format, ocamlformat, clang-format, ktlint, rubocop, standardrb, gleam format, terraform fmt, php-cs-fixer, csharpier, fantomas, swiftformat, stylua, ormolu, taplo, fish_indent, google-java-format, cljfmt, cmake-format, cue fmt, psscriptanalyzer-format
+biome, prettier, oxfmt, ruff, black, sqlfluff, gofmt, rustfmt, zig fmt, dart format, shfmt, nixfmt, mix format, ocamlformat, clang-format, ktlint, ktfmt, rubocop, standardrb, gleam format, terraform fmt, terragrunt-hcl, php-cs-fixer, csharpier, fantomas, swiftformat, stylua, ormolu, taplo, google-java-format, cljfmt, cmake-format, cue fmt, psscriptanalyzer-format
 
 Detection rules:
 
@@ -310,7 +310,7 @@ Covers JavaScript/TypeScript, Python, Go, Rust, Ruby, Shell, and CMake. A TypeSc
 - **Strictness modes** — `strictness: "relaxed"` ignores optional punctuation (trailing commas, semicolons) that causes zero matches in `smart` mode. Also supports `ast`, `cst`, `signature`, `template`.
 - **Pagination** — `skip: N` offsets into large result sets; truncated results include a next-page hint.
 - **Stale-preview detection** — `ast_grep_replace` re-validates the pattern before writing; returns a clear error if files changed since the preview instead of applying against wrong content.
-- **`ast_grep_dump`** — dumps the full tree-sitter AST for a source snippet. Use this when a pattern returns zero matches and the correct node kind or field name is unknown.
+- **`ast_grep_search` with `dump=true`** — dumps the full tree-sitter AST for a source snippet. Use this when a pattern returns zero matches and the correct node kind or field name is unknown.
 
 ### Tree-sitter Rules
 
@@ -397,7 +397,7 @@ pi-lens ships an MCP (Model Context Protocol) server so Claude Code — or any M
 
 | Layer | MCP tools | What they expose |
 |---|---|---|
-| **Per-edit** | `pilens_analyze`, `pilens_lsp_diagnostics`, `pilens_lsp_navigation`, `pilens_ast_grep_search`, `pilens_ast_grep_replace`, `pilens_module_report`, `pilens_read_symbol`, `pilens_read_enclosing` | The fast pipeline (format → autofix → LSP diagnostics → parallel runners) plus the structured read-substitute pair. `analyze` accepts `mode: warm \| fresh` — `warm` reuses the server's in-process LSP, `fresh` forks a worker that loads freshly-built code from disk so the result reflects the latest commit. |
+| **Per-edit** | `pilens_analyze`, `pilens_lsp_navigation`, `pilens_ast_grep_search`, `pilens_ast_grep_replace`, `pilens_module_report`, `pilens_read_symbol`, `pilens_read_enclosing` | The fast pipeline (format → autofix → LSP diagnostics → parallel runners) plus the structured read-substitute pair. `analyze` accepts `mode: warm \| fresh` — `warm` reuses the server's in-process LSP, `fresh` forks a worker that loads freshly-built code from disk so the result reflects the latest commit. |
 | **Per-turn** | `pilens_turn_end` | Drives the **real** `handleTurnEnd` (knip incremental, dep-circular, cascade, tests, actionable+code-quality warnings) — not a re-implementation. Caller-supplied edited files are auto-registered into turn-state via `addModifiedRange`. |
 | **Per-session** | `pilens_session_start` | Drives the **real** `handleSessionStart` — full jscpd/knip/madge/govulncheck/gitleaks/trivy scans + complexity baselines + LSP warm. The error-debt baseline is not currently populated by the production session-start path. |
 | **Project / observability** | `pilens_project_scan`, `pilens_project_report`, `pilens_diagnostics`, `pilens_health`, `pilens_latency`, `pilens_symbol_search`, `pilens_effective_config` | Cheap project-wide scans, cached diagnostic state, latency telemetry, ranked identifier search (BM25 over the persisted word index — see [docs/word-index.md](word-index.md)). Cross-file blast radius now lives in `pilens_module_report`'s `blastRadius` option. `pilens_health` (and its pi-side `/lens-health` counterpart) also reports a bounded, process-local **degradation ledger** — trust refusals, mode suppressions, LSP breaker trips, formatter skips/failures, TypeScript/word-index/review-graph/project-snapshot idle evictions, WASM aborts, and diagnostics-timeout tallies — so silently degraded behavior stays visible instead of vanishing into a log. `pilens_effective_config` answers **“why is X running / why is X not running”** from one query — the resolved configuration with the provenance of every setting, and for a file you name, its language plus every LSP server with the reason it was selected or denied and the runners that would dispatch. It reports sources, never values. |

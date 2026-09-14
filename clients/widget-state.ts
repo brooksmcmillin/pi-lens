@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -15,6 +16,15 @@ import { freshnessFromMtime } from "./freshness.js";
 import { PAST_EOF_STALE_MARKER } from "./diagnostic-line-freshness.js";
 import { STALE_LINE_MARKER } from "./stale-marker.js";
 import type { FormatterOutcomeKind } from "./formatters.js";
+import {
+	anchorsForDiagnostic,
+	applyDispositions,
+	getDisposition,
+	registerWidgetDispositionReconciler,
+	type Disposition,
+	type DispositionMarkTarget,
+} from "./diagnostic-dispositions.js";
+import { recordDegradationOnce } from "./degradation-ledger.js";
 
 /**
  * Canonical key for the `files` map (and `diagnosticsWriteGuard`) — #1020.
@@ -66,6 +76,8 @@ export interface WidgetDiagnostic {
 	 * (mode=full's suppression pass), never computed for mode=all/delta to
 	 * keep those cache-only and instant. */
 	flagged?: boolean;
+	/** Finding retained as an explicit suppressed bucket (#1616). */
+	disposition?: "false-positive" | "suppress";
 	/**
 	 * Wall-clock time this specific diagnostic was OBSERVED (#1186). Per-ENTRY,
 	 * not per-record: a merged record (see `reconcileCascadeNeighborLspErrors`)
@@ -253,6 +265,128 @@ function maybePruneInactiveFileRecords(): void {
 
 export function setRenderCallback(fn: () => void): void {
 	requestRenderFn = fn;
+}
+
+/** Reconcile a mark through the same apply/count/commit path as dispatch. */
+export function reconcileWidgetDisposition(
+	cwd: string,
+	target: DispositionMarkTarget,
+	_disposition: Disposition,
+	content?: string,
+): void {
+	const current = getFileDiagnostics(target.filePath);
+	if (!current) {
+		recordDegradationOnce({
+			kind: "widget-disposition-reconcile-fallback",
+			subject: target.filePath,
+			reason: "the marked finding's widget record is absent",
+		});
+		return;
+	}
+	let source = content ?? target.content;
+	if (source === undefined) {
+		try {
+			source = readFileSync(target.filePath, "utf8");
+		} catch {
+			recordDegradationOnce({
+				kind: "widget-disposition-reconcile-fallback",
+				subject: target.filePath,
+				reason: "the disposition anchor content could not be read",
+			});
+			source = "";
+		}
+	}
+	const active = new Set(
+		applyDispositions(current, cwd, target.filePath, source),
+	);
+	const normalized: WidgetDiagnostic[] = current.map((diagnostic) => {
+		const { strict, weak } = anchorsForDiagnostic(
+			cwd,
+			target.filePath,
+			diagnostic,
+			source,
+		);
+		const entry = getDisposition(cwd, strict) ?? getDisposition(cwd, weak);
+		if (
+			!active.has(diagnostic) &&
+			(entry?.disposition === "false-positive" ||
+				entry?.disposition === "suppress")
+		) {
+			return { ...diagnostic, disposition: entry.disposition, flagged: false };
+		}
+		const {
+			disposition: _disposition,
+			flagged: _flagged,
+			...baseDiagnostic
+		} = diagnostic;
+		return entry?.disposition === "flagged"
+			? { ...baseDiagnostic, flagged: true }
+			: baseDiagnostic;
+	});
+	const rec = getOrCreate(target.filePath);
+	const writeIndex = admitWidgetDiagnosticsWrite(target.filePath);
+	if (
+		!diagnosticsWriteGuard.shouldWrite(fileMapKey(target.filePath), writeIndex)
+	)
+		return;
+	commitDiagnostics(rec, target.filePath, normalized, Date.now());
+}
+
+/** Reserve a widget write for a producer that has no runtime write index. */
+export function admitWidgetDiagnosticsWrite(
+	filePath: string,
+	writeIndex?: number,
+): number {
+	const key = fileMapKey(filePath);
+	const token = writeIndex ?? diagnosticsWriteGuard.nextToken(key);
+	diagnosticsWriteGuard.shouldWrite(key, token);
+	runnerWriteGuard.shouldWrite(key, token);
+	return token;
+}
+
+registerWidgetDispositionReconciler((cwd, target, disposition) =>
+	reconcileWidgetDisposition(cwd, target, disposition, target.content),
+);
+
+export interface WidgetDispositionEvents {
+	events:
+		| { on?: (channel: string, handler: (data: unknown) => void) => unknown }
+		| undefined;
+}
+
+/** Consume the host-side disposition event and refresh the real widget store. */
+export function wireWidgetDispositionSubscriber(
+	args: WidgetDispositionEvents,
+): void {
+	args.events?.on?.("pilens:diagnostic:disposition", (data) => {
+		if (!data || typeof data !== "object") return;
+		const payload = data as Record<string, unknown>;
+		if (payload.source !== "pi-lens" || typeof payload.cwd !== "string") return;
+		if (
+			typeof payload.filePath !== "string" ||
+			typeof payload.disposition !== "string"
+		)
+			return;
+		if (typeof payload.message !== "string") return;
+		if (
+			!(
+				["false-positive", "suppress", "defer", "flagged"] as string[]
+			).includes(payload.disposition)
+		)
+			return;
+		reconcileWidgetDisposition(
+			payload.cwd,
+			{
+				cwd: payload.cwd,
+				filePath: payload.filePath,
+				message: typeof payload.message === "string" ? payload.message : "",
+				...(typeof payload.tool === "string" ? { tool: payload.tool } : {}),
+				...(typeof payload.rule === "string" ? { rule: payload.rule } : {}),
+				...(typeof payload.line === "number" ? { line: payload.line } : {}),
+			},
+			payload.disposition as Disposition,
+		);
+	});
 }
 
 /**
@@ -576,7 +710,7 @@ export function recordDiagnostics(
 	// `reconcileStaleWidgetFiles`'s `mtimeMs > touchedAt` gate so a resolved
 	// finding renders forever (the #1092 touchedAt-re-arming defect).
 	observedAt?: number,
-): void {
+): boolean {
 	// Drop a write that's superseded by a later same-turn edit to this file
 	// whose pipeline finished first (same race class as #555). No cache write,
 	// no count/timestamp update, no render trigger — the recorded state must
@@ -585,7 +719,7 @@ export function recordDiagnostics(
 	// ordering token) always proceeds, same as version-less LSP servers in the
 	// #555 guard.
 	const key = fileMapKey(filePath);
-	if (!diagnosticsWriteGuard.shouldWrite(key, writeIndex)) return;
+	if (!diagnosticsWriteGuard.shouldWrite(key, writeIndex)) return false;
 	// Keep runner state ordered with the final diagnostic replacement. The
 	// guards are deliberately advanced in both directions because either verb
 	// may be the first completion from a pipeline.
@@ -603,6 +737,7 @@ export function recordDiagnostics(
 		observedTs,
 		key,
 	);
+	return true;
 }
 
 /** Map the raw diagnostic shape callers pass into stored {@link WidgetDiagnostic}s.
@@ -710,6 +845,7 @@ function countDiagnostics(diags: WidgetDiagnostic[]): {
 	let errors = 0;
 	let warnings = 0;
 	for (const diagnostic of diags) {
+		if (diagnostic.disposition) continue;
 		if (isBlocking(diagnostic)) blocking++;
 		// A past-EOF stale entry keeps its severity for display purposes but is
 		// excluded from the error/warning tallies alongside blocking — its cited
@@ -933,9 +1069,9 @@ export function reconcileScanDiagnostics(
 	confirmed: boolean,
 	writeIndex?: number,
 	observedAt?: number,
-): void {
-	if (!confirmed) return;
-	recordDiagnostics(filePath, diagnostics, writeIndex, observedAt);
+): boolean {
+	if (!confirmed) return false;
+	return recordDiagnostics(filePath, diagnostics, writeIndex, observedAt);
 }
 
 /**
@@ -1370,6 +1506,8 @@ export function scheduleStaleReconcile(): void {
 /** Summary of current diagnostic counts across all files in the widget. */
 export interface FileDiagnosticSummary {
 	filePath: string;
+	/** Projected by lens_diagnostics from the shared LSP tool-cwd seam. */
+	resolvedCwd?: string;
 	blocking: number;
 	errors: number;
 	warnings: number;
@@ -1505,6 +1643,7 @@ export function renderWidget(
 	const totalBlocking = countBlockingIn(deduped);
 	const totalErrors = countTotalIn("error", deduped);
 	const totalWarnings = countTotalIn("warning", deduped);
+	const totalSuppressed = countSuppressedIn(deduped);
 	const hasPendingAnalysis = deduped.some(isPendingAnalysis);
 	const errorChunk =
 		totalErrors > 0
@@ -1528,6 +1667,9 @@ export function renderWidget(
 
 	const header = ` ${cyan("pi-lens")}${langStr ? "  " + dim(langStr) : ""}${lspChip}${summary ? "  " + summary : ""}`;
 	lines.push(fitLine(header, w));
+	if (totalSuppressed > 0) {
+		lines.push(fitLine(` ${dim(`suppressed: ${totalSuppressed}`)}`, w));
+	}
 
 	// File list — display order varies by mode
 	if (useHorizontal) {
@@ -1894,6 +2036,16 @@ function countTotalIn(
 	for (const rec of recs) {
 		if (severity === "error") n += rec.diagnosticCounts.errors;
 		else n += rec.diagnosticCounts.warnings;
+	}
+	return n;
+}
+
+function countSuppressedIn(recs: FileRecord[]): number {
+	let n = 0;
+	for (const rec of recs) {
+		for (const diagnostic of rec.allDiagnostics) {
+			if (diagnostic.disposition) n++;
+		}
 	}
 	return n;
 }

@@ -16,6 +16,7 @@ import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
+import { withTimeout } from "../../clients/deadline-utils.js";
 
 interface RecordedFlag {
 	description?: string;
@@ -31,6 +32,27 @@ interface RecordedCommand {
 
 /** A handler registered via `pi.on(event, handler)`. */
 type Hook = (event: unknown, ctx: unknown) => unknown;
+
+/** A session_start test must fail if its awaited handler does not settle. */
+export const SESSION_START_TEST_BUDGET_MS = 5_000;
+
+async function runSessionStartWithBudget<T>(
+	hook: () => T | Promise<T>,
+): Promise<T> {
+	try {
+		return await withTimeout(
+			Promise.resolve().then(hook),
+			SESSION_START_TEST_BUDGET_MS,
+		);
+	} catch (error) {
+		if (error instanceof Error && /^Timeout after /.test(error.message)) {
+			throw new Error(
+				`session_start handler exceeded test budget (${SESSION_START_TEST_BUDGET_MS}ms)`,
+			);
+		}
+		throw error;
+	}
+}
 
 /** A `ui.notify(...)` call captured for assertions. */
 interface CapturedNotification {
@@ -84,6 +106,8 @@ export interface PiMock {
 	 * filters DOWN). Only meaningful when `supportsActiveTools` is true.
 	 */
 	readonly activeTools: Set<string>;
+	/** Number of host active-tool mutations, for lifecycle wiring assertions. */
+	readonly activeToolSetCalls: string[][];
 
 	// ── ExtensionAPI surface that index.ts uses ──────────────────────────────
 	registerFlag(name: string, options: RecordedFlag): void;
@@ -115,11 +139,16 @@ export interface PiMock {
 	 * true })`, and fork / newSession / switchSession / importFromJsonl / reload
 	 * each construct a FRESH session that way before the event is emitted. The
 	 * active tool set is never persisted per session, so every registered tool
-	 * is active again by the time pi-lens's handler runs — while the extension's
-	 * own closure state survives (the runner does not re-run the factory).
-	 * Call this before emitting a fork/reload/resume `session_start`.
+	 * is active again by the time pi-lens's handler runs. The mock preserves the
+	 * extension closure for every rebuild and does not re-run the factory. Real
+	 * pi re-runs the factory on reload, resume, fork, and new; the real-pi
+	 * integration tests cover that boundary.
+	 * Call this to reproduce pi's `session_shutdown` then `session_start` order.
 	 */
-	simulateSessionRebuild(): void;
+	simulateSessionShutdownAndRebuild(
+		reason: "reload" | "resume" | "fork" | "new" | "quit",
+		ctx?: unknown,
+	): Promise<void>;
 	/** Run every handler registered for `event`; return the last defined result. */
 	emit(event: string, payload?: unknown, ctx?: unknown): Promise<unknown>;
 	/** Invoke a registered command's handler. */
@@ -158,6 +187,7 @@ export function createPiMock(
 	const messageRenderers = new Map<string, unknown>();
 	const sentMessages: CapturedMessage[] = [];
 	const activeTools = new Set<string>();
+	const activeToolSetCalls: string[][] = [];
 
 	const mock: PiMock = {
 		flags,
@@ -168,6 +198,7 @@ export function createPiMock(
 		messageRenderers,
 		sentMessages,
 		activeTools,
+		activeToolSetCalls,
 
 		registerFlag(name, options) {
 			flags.set(name, options);
@@ -190,8 +221,13 @@ export function createPiMock(
 			activeTools.add(tool.name);
 		},
 		on(event, handler) {
+			const boundedHandler: Hook =
+				event === "session_start"
+					? (payload, ctx) =>
+							runSessionStartWithBudget(() => handler(payload, ctx))
+					: handler;
 			const list = handlers.get(event) ?? [];
-			list.push(handler);
+			list.push(boundedHandler);
 			handlers.set(event, list);
 		},
 		getFlag(name) {
@@ -228,8 +264,27 @@ export function createPiMock(
 		getCommand(name) {
 			return commands.get(name);
 		},
-		simulateSessionRebuild() {
+		async simulateSessionShutdownAndRebuild(reason, ctx) {
+			if (reason === "quit") {
+				await mock.emit(
+					"session_shutdown",
+					{ type: "session_shutdown", reason },
+					ctx,
+				);
+				return;
+			}
+			await mock.emit(
+				"session_shutdown",
+				{
+					type: "session_shutdown",
+					reason,
+					targetSessionFile:
+						reason === "reload" ? undefined : "replacement-session-file",
+				},
+				ctx,
+			);
 			for (const name of tools.keys()) activeTools.add(name);
+			await mock.emit("session_start", { type: "session_start", reason }, ctx);
 		},
 		async emit(event, payload, ctx) {
 			let result: unknown;
@@ -249,6 +304,7 @@ export function createPiMock(
 			if (supportsActiveTools) {
 				api.getActiveTools = () => Array.from(activeTools);
 				api.setActiveTools = (names: string[]) => {
+					activeToolSetCalls.push([...names]);
 					activeTools.clear();
 					for (const name of names) activeTools.add(name);
 				};
@@ -270,6 +326,7 @@ export function makeCtx(
 	overrides: Partial<{
 		cwd: string;
 		sessionId: string;
+		sessionFile?: string;
 		/**
 		 * #1334 S5: host project-trust decision. Omit entirely to simulate an
 		 * older host with no `isProjectTrusted` on the ctx — pi-lens must then
@@ -326,6 +383,7 @@ export function makeCtx(
 		// resume rehydration via `ctx.sessionManager.getSessionId()`.
 		sessionManager: {
 			getSessionId: () => overrides.sessionId,
+			getSessionFile: () => overrides.sessionFile,
 		},
 		model: overrides.model,
 		signal: undefined,

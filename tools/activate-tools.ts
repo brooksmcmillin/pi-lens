@@ -35,15 +35,16 @@ export type ActiveToolsHost = {
 };
 
 export interface ActivateToolsOptions {
+	onRejected?: (name: string) => void;
 	deferredToolSupport?: (ctx: unknown) => boolean;
 	/**
 	 * Called with every lazy tool name the model asked for, so the extension
 	 * can remember this logical session's activations and restore them after
 	 * the host rebuilds the session — fork/reload/resume construct a fresh
-	 * AgentSession with every registered tool active again, while pi-lens's
-	 * closure state survives (see clients/tool-set-policy.ts).
+	 * AgentSession with every registered tool active again. The module-level
+	 * session-file store survives the factory re-run (see clients/tool-set-policy.ts).
 	 */
-	onActivated?: (names: string[]) => void;
+	onActivated?: (names: string[], ctx: unknown) => void;
 	onMutation?: (mutation: {
 		addedCount: number;
 		removedCount: number;
@@ -59,22 +60,18 @@ export function createActivateToolsTool(
 ) {
 	const lazyNames = lazyTools.map((t) => t.name);
 	const lazyNameSet = new Set(lazyNames);
-	const catalog = lazyTools.map((t) => `${t.name} — ${t.summary}`).join("\n");
 
 	return {
 		name: "pi_lens_activate_tools" as const,
 		label: "Activate pi-lens Tools",
 		description:
-			"Activate one or more situational pi-lens tools that stay registered but inactive by default, so the default tool list stays lean. " +
-			"Call this ONCE with the tools you need before using them — they become callable starting the NEXT turn. " +
-			`Available:\n${catalog}`,
-		promptSnippet:
-			"Activate situational ast-grep / lsp_navigation tools before using them",
+			'Activate registered situational tools for the next turn. Example: `{tools: ["lsp_navigation"]}`.',
+		promptSnippet: "Activate a situational tool",
 		parameters: Type.Object({
 			tools: Type.Array(Type.String({ enum: lazyNames }), {
 				minItems: 1,
 				description:
-					"Names of situational tools to activate (see this tool's description for the catalog).",
+					"Names of situational tools to activate, e.g. `lsp_navigation`.",
 			}),
 		}),
 		async execute(
@@ -89,6 +86,12 @@ export function createActivateToolsTool(
 						(t): t is string => typeof t === "string" && lazyNameSet.has(t),
 					)
 				: [];
+			if (Array.isArray(params.tools)) {
+				for (const name of params.tools) {
+					if (typeof name === "string" && !lazyNameSet.has(name))
+						options.onRejected?.(name);
+				}
+			}
 
 			if (requested.length === 0) {
 				return {
@@ -108,7 +111,7 @@ export function createActivateToolsTool(
 			// Remember every requested tool, not just the newly-added ones: a
 			// tool that is already active still has to survive the next
 			// fork/reload/resume restore.
-			options.onActivated?.(requested);
+			options.onActivated?.(requested, ctx);
 
 			const active =
 				typeof pi.getActiveTools === "function" ? pi.getActiveTools() : [];
