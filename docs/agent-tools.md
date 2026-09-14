@@ -2,45 +2,69 @@
 
 pi-lens registers the following tools with the pi agent. Most are also exposed
 through the MCP mirror (`clients/lens-engine.ts` is the seam both adapters
-share) — current exceptions: `ast_grep_outline` and `ast_grep_dump`
+share) — current exception: `ast_grep_outline`
 (module_report supersedes them for discovery), and `lens_diagnostic_mark`
 (pi-lens-internal for now). `read_enclosing` gained MCP parity
-(`pilens_read_enclosing`) as of #536, closing #522 item 1.
+(`pilens_read_enclosing`) as of #536, closing #522 item 1. The standalone
+`lsp_diagnostics` tool was folded into `lens_diagnostics` (`source=lsp`,
+#2860). The retired MCP name remains a one-release compatibility redirect to
+`pilens_diagnostics` with `source=lsp` and `scope=paths` (`mcp/server.ts`),
+logging one `lsp-diagnostics-compatibility` degradation per session. Callers
+should move to `pilens_diagnostics`.
 
-**Dynamic tooling.** Six tools stay always-active: `lens_diagnostics`,
-`lsp_diagnostics`, `module_report`, `read_symbol`, `read_enclosing`,
-`symbol_search`. Six situational tools — `ast_grep_search`, `ast_grep_replace`,
-`ast_grep_outline`, `ast_grep_dump`, `lsp_navigation`, `lens_diagnostic_mark` —
+
+**Dynamic tooling.** Five tools stay always-active: `lens_diagnostics`,
+	`module_report`, `read_symbol`, `read_enclosing`,
+`symbol_search`. Five situational tools — `ast_grep_search`, `ast_grep_replace`,
+`ast_grep_outline`, `lsp_navigation`, `lens_diagnostic_mark` —
 are registered but
 inactive by default; the model activates the ones it needs via the always-active
 loader tool `pi_lens_activate_tools`, per pi's dynamic-tool-loading API
 (`pi.setActiveTools`/`pi.getActiveTools`). The loader explicitly reports
 "Available starting next turn"; do not retry the tool in the same turn.
-Feature-detected: on hosts without that API, the six situational tools fall back
+Feature-detected: on hosts without that API, the five situational tools fall back
 to being statically active, exactly as before (`tools/activate-tools.ts`, wired
 in `index.ts`). The default skill catalog also omits the AST and LSP navigation
 guides until a tool from that family is active. The loader returns the matching
 `SKILL.md` path so you can read the guide after you choose a tool family.
 
+Tool descriptions contain the contract sentence and one example. Operational
+guidance, including cache state, scan scope, safety details, and lifecycle
+results, belongs in the returned result so it is paid only when the tool runs.
+
+**Result contract.** One post-result gate per surface — `finalizeToolResult` /
+`finalizeToolResultWithDelivery` in `tools/render-compact.ts`, wired into every
+pi tool's `execute` wrapper in `index.ts` and into the MCP `tools/call`
+dispatcher in `mcp/server.ts` — bounds every delivered result to 40 KiB
+(`MAX_RESULT_BYTES`) and stamps a trailing usage footer describing what was
+actually sent: `usage tokens=<n> elapsed-ms=<n> bytes=<n> truncated=<true|false>`.
+A rejected call (e.g. MCP's "Unknown or disabled tool") is rendered through the
+same gate rather than bypassing it.
+
 ## Per-edit
 
-- **`lens_diagnostics`** — Cached diagnostic state for the current session.
-  Modes: `delta` (current turn), `all` (resurfaces stale blockers dropped from
-  turn context), `full` (project-wide scan).
+- **`lens_diagnostics`** — Session-cache or LSP-probe diagnostic state, selected
+  by `source` (`session` default, or `lsp`) and `scope` (`paths` or
+  `workspace`; explicit `paths` always win over `scope`). `severity` is a
+  threshold, not an exact filter: `error` shows only errors; `warning` adds
+  warnings; `information` adds information; `hint`/`all` (default) show every
+  tier. Legacy `mode`: `delta` (current turn), `all` (resurfaces stale
+  blockers dropped from turn context), `full` (project-wide scan).
 - **`lens_diagnostic_mark`** — Triage a diagnostic: `false-positive` /
   `suppress` (writes an inline `pi-lens-ignore` comment) / `defer`
   (session-only) / `flagged` (persists, rendered `📌 flagged-to-fix`).
   Content-anchored so marks survive edits; every mark is logged and published
   on the bus. See [dispositions.md](dispositions.md).
-- **`lsp_diagnostics`** — File- or directory-scoped LSP diagnostics via the
-  active language server.
-- **`lsp_navigation`** — IDE-style navigation: `definition`, `references`,
-  `implementation`, `typeDefinition`, `declaration`, `rename`, `rename_file`,
-  `hover`, `documentSymbol`, `workspaceSymbol`, `signatureHelp`,
-  `prepareCallHierarchy`, `incomingCalls`, `outgoingCalls`, `executeCommand`,
-  and `capabilities`. Position-based operations accept a `path`/`line`/`character`
-  triple. `documentSymbol` accepts a `kinds` filter (e.g. `function`, `class`)
-  and a `maxResults` cap (default 20, max 100) to keep large files bounded.
+- **`lsp_navigation`** — IDE-style navigation, 19 operations: `definition`,
+  `typeDefinition`, `declaration`, `references`, `hover`, `signatureHelp`,
+  `documentSymbol`, `findSymbol`, `workspaceSymbol`, `codeAction`, `rename`,
+  `rename_file`, `implementation`, `prepareCallHierarchy`, `incomingCalls`,
+  `outgoingCalls`, `executeCommand`, `workspaceDiagnostics`, and `capabilities`
+  (`tools/lsp-navigation.ts` operation description). Position-based operations
+  accept a `path`/`line`/`character` triple. `documentSymbol` accepts a `kinds`
+  filter (e.g. `function`, `class`) and a `maxResults` cap (default 20, max 100)
+  to keep large files bounded. Full per-operation parameter reference:
+  [skills/pi-lens-lsp-navigation/SKILL.md](../skills/pi-lens-lsp-navigation/SKILL.md).
 - **`ast_grep_search`** — AST-aware structural search across ~40 languages via
   the `sg` CLI. Supports metavariables (`$VAR`, `$$$ARGS`), `strictness`
   modes (`smart`, `relaxed`, `ast`, `cst`, `signature`, `template`), structural
@@ -50,7 +74,7 @@ guides until a tool from that family is active. The loader returns the matching
   (per-call cap, default 50, max 200; also sets the pagination step).
   `nodeKind` is an expert grammar-specific escape hatch: it finds every node of
   the exact kind used by the target grammar. Node kinds are not universal across
-  languages; use `ast_grep_dump` to discover the kind in the target language. It is mutually exclusive with `pattern` and `rule`.
+  languages; use `dump=true` with the representative snippet in `pattern` to discover the kind in the target language. It is mutually exclusive with `rule`.
   `hasKind` retains ast-grep's immediate-child semantics; use
   `hasDescendantKind` for an explicit recursive descendant search. A future
   canonical `find`/`query` facade (call/function/import/etc.) should map to
@@ -62,11 +86,11 @@ guides until a tool from that family is active. The loader returns the matching
   searches. `pattern` is optional when a `rule` or `nodeKind` is given.
   Results include `details.matchLocations[]` — each hit carries a ready
   `readSlice` (`path`/`offset`/`limit`) for a bounded context read; zero-match
-  results include a `suggestedDump` hint pointing at `ast_grep_dump`.
+  results include a `suggestedDump` hint pointing at `ast_grep_search` with `dump=true`.
 - **`ast_grep_replace`** — AST-aware structural replace. Re-validates the pattern
   against the current file before writing and reports a clear error if the
   file changed since the preview.
-- **`ast_grep_dump`** — Dumps the raw tree-sitter AST for a source snippet. Use
+- **`ast_grep_search` with `dump=true`** — Dumps the raw tree-sitter AST for a source snippet. Use
   this when an `ast_grep_search` or `ast_grep_replace` pattern returns zero
   matches and the correct node kind or field name is unknown. `includeAnonymous`
   shows punctuation/CST nodes.

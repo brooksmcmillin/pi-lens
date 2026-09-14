@@ -7,7 +7,6 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { Type } from "../clients/deps/typebox.js";
 import {
 	getProjectIgnoreMatcher,
 	isExcludedDirName,
@@ -26,6 +25,7 @@ import {
 	getServersForFileWithConfig,
 	primaryServerId,
 } from "../clients/lsp/config.js";
+import { mapWithConcurrency } from "../clients/map-with-concurrency.js";
 import {
 	combineAbortSignals,
 	withDeadline,
@@ -51,8 +51,7 @@ import {
 	isBlocking,
 	reconcileScanDiagnostics,
 } from "../clients/widget-state.js";
-import { baseName, compactRenderResult } from "./render-compact.js";
-import { makeProgressReporter, scanningSummaryLine } from "./scan-progress.js";
+import { makeProgressReporter } from "./scan-progress.js";
 import {
 	isWarmAttached,
 	tryWarmAttachedDiagnostics,
@@ -63,19 +62,23 @@ import {
 } from "../clients/language-registry.js";
 
 const MAX_FILES = 100;
-const MAX_BATCH_FILES = 100;
+export const MAX_BATCH_FILES = 100;
 const MAX_DIAGNOSTICS = 200;
 const DEFAULT_BATCH_CONCURRENCY = 8;
 const MAX_BATCH_CONCURRENCY = 16;
 const DEFAULT_BATCH_FILE_DEADLINE_MS = 15_000;
 
 // LSP severities: 1=Error, 2=Warning, 3=Information, 4=Hint
-const SEVERITY_NAMES: Record<number, string> = {
+export const SEVERITY_NAMES: Record<number, string> = {
 	1: "error",
 	2: "warning",
 	3: "information",
 	4: "hint",
 };
+export const LSP_SEVERITY_FILTERS = [
+	...Object.values(SEVERITY_NAMES),
+	"all",
+] as const;
 
 type LspHealthLike = {
 	health?: string;
@@ -117,6 +120,7 @@ type FileDiag = {
 	severity: number;
 	message: string;
 	source?: string;
+	serverId?: string;
 	code?: string | number;
 };
 
@@ -154,6 +158,7 @@ type FileDiagnosticResult = {
 	 * type checker/compiler confirmed the file clean.
 	 */
 	primaryServerId?: string;
+	diagnosticsUnsupported?: boolean;
 };
 
 /** The only per-file states an explicit batch exposes to an agent. */
@@ -239,56 +244,6 @@ function boundedPositiveInt(
  * for THIS tool's batch/directory sweep the same way #667 fixed it for the
  * workspace-diagnostics sweep.
  */
-async function mapWithConcurrency<R>(
-	items: string[],
-	concurrency: number,
-	mapper: (item: string, index: number) => Promise<R>,
-	lspService: NonNullable<ReturnType<typeof getLSPService>> | undefined,
-	signal?: AbortSignal,
-	onProgress?: (completed: number, total: number) => void,
-): Promise<R[]> {
-	const results: R[] = [];
-	let completed = 0;
-	// Multiple original indices can map to the same file path (duplicate
-	// entries in an explicit `paths` batch) — track them as a per-file queue
-	// so each occurrence still lands in its own original slot.
-	const pendingIndices = new Map<string, number[]>();
-	items.forEach((item, index) => {
-		const queue = pendingIndices.get(item);
-		if (queue) queue.push(index);
-		else pendingIndices.set(item, [index]);
-	});
-	const groups = groupFilesByPrimaryServer(items);
-	await runPerServerGroups(
-		groups,
-		concurrency,
-		async (group) => {
-			if (signal?.aborted) return;
-			const first = group.files[0];
-			if (
-				first &&
-				lspService &&
-				!isWarmAttached() &&
-				typeof lspService.ensureWarmForSweep === "function"
-			) {
-				await lspService.ensureWarmForSweep(first, { signal });
-				if (signal?.aborted) return;
-			}
-			for (const item of group.files) {
-				// Honor cancellation (Escape / turn abort): stop pulling new items
-				// rather than grind the whole batch. Completed entries are returned.
-				if (signal?.aborted) return;
-				const index = pendingIndices.get(item)!.shift()!;
-				results[index] = await mapper(item, index);
-				completed += 1;
-				onProgress?.(completed, items.length);
-			}
-		},
-		signal,
-	);
-	return results;
-}
-
 /**
  * Project-ignore predicate rooted at `root`, fail-open. Lets a directory scan
  * honor the user's `.pi-lens.json` / `.gitignore` patterns — not just the
@@ -370,135 +325,9 @@ export function createLspDiagnosticsTool(
 	// "confirmed clean" for the same file. index.ts injects
 	// `runtime.retireInlineBlockerOnConfirmedClean`. Optional/undefined in tests.
 	onConfirmedNoBlockers?: (info: ConfirmedNoBlockersInfo) => void,
+	getService: () => ReturnType<typeof getLSPService> = getLSPService,
 ) {
 	return {
-		name: "lsp_diagnostics" as const,
-		label: "LSP Diagnostics",
-		description:
-			"Get errors, warnings, and hints from language servers for a file or directory. " +
-			"Use BEFORE running builds to proactively check for issues. " +
-			"Works on directories by auto-detecting file extensions and scanning all matching files.",
-		promptSnippet:
-			"Get LSP diagnostics for a file or directory (use before builds)",
-		renderResult: compactRenderResult<{
-			mode?: string;
-			phase?: string;
-			completed?: number;
-			total?: number;
-			filePath?: string;
-			diagnostics?: unknown[];
-			totalDiagnostics?: number;
-			filesChecked?: number;
-			filesScanned?: number;
-			cleanFiles?: number;
-			unconfirmedFiles?: number;
-			timedOutFiles?: number;
-			outcomeCounts?: Record<string, number>;
-			incompleteFiles?: number;
-			unconfirmed?: boolean;
-			timedOut?: boolean;
-		}>(({ details, args, isError, text }) => {
-			// Streaming progress partials render the live bar (see scanningSummaryLine).
-			const scanning = scanningSummaryLine(details, text);
-			if (scanning) return scanning;
-			if (isError) {
-				return `lsp_diagnostics — ${text.split("\n")[0] ?? "error"}`;
-			}
-			const count =
-				details?.totalDiagnostics ?? details?.diagnostics?.length ?? 0;
-			const target = baseName(details?.filePath ?? args.path) || "workspace";
-			const files = details?.filesChecked ?? details?.filesScanned;
-			const scope =
-				typeof files === "number" && files > 1
-					? ` across ${files} files`
-					: target
-						? ` ${target}`
-						: "";
-			const noun = count === 1 ? "diagnostic" : "diagnostics";
-			// #533: a batch/directory result with any unconfirmed files must NEVER
-			// compact-render as a bare "N diagnostics" — that erases the fact some
-			// files' clean status was never actually confirmed by the server.
-			const unconfirmedFiles = details?.unconfirmedFiles ?? 0;
-			if (unconfirmedFiles > 0) {
-				const cleanFiles = details?.cleanFiles ?? 0;
-				const timedOutFiles = details?.timedOutFiles ?? 0;
-				const suffix = timedOutFiles > 0 ? ` (${timedOutFiles} timed out)` : "";
-				return `lsp_diagnostics${scope} — ${count} ${noun} · ${cleanFiles} clean · ${unconfirmedFiles} unconfirmed${suffix}`;
-			}
-			const outcomeCounts = details?.outcomeCounts;
-			const notConfirmed = outcomeCounts
-				? (outcomeCounts.inconclusive ?? 0) +
-					(outcomeCounts.unavailable ?? 0) +
-					(outcomeCounts.unsupported ?? 0) +
-					(outcomeCounts.failed ?? 0)
-				: 0;
-			if (notConfirmed > 0) {
-				return `lsp_diagnostics${scope} — ${count} ${noun} · ${notConfirmed} checks not confirmed`;
-			}
-			if ((details?.incompleteFiles ?? 0) > 0) {
-				return `lsp_diagnostics${scope} — incomplete (${details?.incompleteFiles} files not confirmed)`;
-			}
-			// Single-file mode: 0 diagnostics from an unconfirmed result — either a
-			// silent-on-clean server or (#570) a timed-out check — is not a clean
-			// render either.
-			if (count === 0 && details?.unconfirmed) {
-				return details?.timedOut
-					? `lsp_diagnostics${scope} — timed out (result may be incomplete)`
-					: `lsp_diagnostics${scope} — unconfirmed (server cannot confirm clean)`;
-			}
-			return `lsp_diagnostics${scope} — ${count} ${noun}`;
-		}),
-		parameters: Type.Object({
-			path: Type.Optional(
-				Type.String({
-					description:
-						"File or directory path to check. For directories, all matching source files are scanned.",
-				}),
-			),
-			paths: Type.Optional(
-				Type.Array(Type.String(), {
-					minItems: 1,
-					maxItems: MAX_BATCH_FILES,
-					description:
-						"Explicit files to check as a bounded-concurrency batch. When provided, path is ignored.",
-				}),
-			),
-			severity: Type.Optional(
-				Type.String({
-					enum: ["error", "warning", "information", "hint", "all"],
-					description: "Filter by severity level (default: all)",
-				}),
-			),
-			concurrency: Type.Optional(
-				Type.Number({
-					description:
-						"Batch/directory concurrency, in distinct LSP server groups run in parallel " +
-						"(default 8, max 16) — not individual files. Files sharing one server " +
-						"(e.g. a same-language batch) are always processed one at a time against " +
-						"that server regardless of this value; this caps how many DIFFERENT " +
-						"servers run concurrently.",
-				}),
-			),
-			waitMs: Type.Optional(
-				Type.Number({
-					description:
-						"Optional per-file LSP wait budget for batch diagnostics. Uses server defaults when omitted.",
-				}),
-			),
-			serverScope: Type.Optional(
-				Type.String({
-					enum: ["primary", "all"],
-					description:
-						"'primary' (fast, low-noise): only the file's actual language " +
-						"server (e.g. typescript) — for 'does this have real type " +
-						"errors'. 'all' (default): also touches cross-cutting auxiliary " +
-						"scanners (ast-grep, opengrep, zizmor, typos, marksman) attached " +
-						"to this file, including findings for files not yet dispatched " +
-						"this session. Primary confirmation is always reported " +
-						"separately from auxiliary findings regardless of this setting.",
-				}),
-			),
-		}),
 		async execute(
 			_toolCallId: string,
 			params: Record<string, unknown>,
@@ -538,7 +367,7 @@ export function createLspDiagnosticsTool(
 			const serverScope: "primary" | "all" =
 				typedParams.serverScope === "primary" ? "primary" : "all";
 
-			const lspService = getLSPService();
+			const lspService = getService();
 			if (!lspService) {
 				return {
 					content: [
@@ -684,6 +513,8 @@ type DiagnosticsCollectionResult = {
 	 * honest.
 	 */
 	unconfirmedServerIds: readonly string[];
+	/** Custom navigation-only servers that supplied no diagnostic evidence. */
+	diagnosticsUnsupportedServerIds: readonly string[];
 	/**
 	 * #692: the file content read while collecting (undefined only when the
 	 * read itself failed) — reused by the widget-reconcile caller so it can
@@ -741,7 +572,7 @@ async function collectDiagnosticsForFile(
 				const scopedDiagnostics =
 					serverScope === "primary"
 						? attached.response.diagnostics.filter(
-								(item) => item.source === primaryServerId(absPath),
+								(item) => item.serverId === primaryServerId(absPath),
 							)
 						: attached.response.diagnostics;
 				const filtered = applyAuxiliarySuppressions(
@@ -771,6 +602,7 @@ async function collectDiagnosticsForFile(
 					// field across the socket. An older incumbent omits it → empty → the
 					// pre-#1470 handling, unchanged.
 					unconfirmedServerIds: attached.response.unconfirmedServerIds ?? [],
+					diagnosticsUnsupportedServerIds: [],
 					content,
 				};
 			}
@@ -834,6 +666,8 @@ async function collectDiagnosticsForFile(
 		// the getDiagnostics fallback never reports one, which is honest — that
 		// path claims no confirmation at all.
 		unconfirmedServerIds: touchCoverageGap(touched),
+		diagnosticsUnsupportedServerIds:
+			touched?.diagnosticsUnsupportedServerIds ?? [],
 		content,
 		binding,
 	};
@@ -850,6 +684,7 @@ function diagnosticsToFileDiags(
 		severity: d.severity,
 		message: d.message,
 		source: d.source,
+		serverId: d.serverId,
 		code: d.code,
 	}));
 }
@@ -1100,7 +935,14 @@ function reconcileWidgetFromLspResult(
 			content ?? "",
 			{ cwd, fileRole: detectFileRole(file, content) },
 		);
-		reconcileScanDiagnostics(file, retagged, true, writeIndex, observedAt);
+		const reconciled = reconcileScanDiagnostics(
+			file,
+			retagged,
+			true,
+			writeIndex,
+			observedAt,
+		);
+		if (!reconciled) return { confirmed: false, blocking: true };
 		// #1561: the blocking tally comes from the SAME `isBlocking` predicate the
 		// footer counts with — no second severity rule for the blocker-retire
 		// decision to drift away from.
@@ -1207,6 +1049,7 @@ async function collectFileDiagnosticResult(
 		timedOut,
 		confirmedByTouch,
 		unconfirmedServerIds,
+		diagnosticsUnsupportedServerIds,
 		content: collectedContent,
 		binding,
 		skipReason,
@@ -1223,7 +1066,11 @@ async function collectFileDiagnosticResult(
 	// be merged in rather than discarded.
 	let effectiveRawDiags = rawDiags;
 	let confirmation: "clean" | "unconfirmed" | undefined;
-	if (skipReason !== undefined) {
+	if (diagnosticsUnsupportedServerIds.length > 0) {
+		// No diagnostic provider and no push evidence is a capability boundary,
+		// not a clean result and not a timeout.
+		confirmation = undefined;
+	} else if (skipReason !== undefined) {
 		confirmation = "unconfirmed";
 	} else if (timedOut) {
 		if (applySeverityFilter(rawDiags, severity).length === 0) {
@@ -1299,6 +1146,7 @@ async function collectFileDiagnosticResult(
 		cacheCtx &&
 		scopeKey !== undefined &&
 		confirmation !== "unconfirmed" &&
+		diagnosticsUnsupportedServerIds.length === 0 &&
 		unconfirmedServerIds.length === 0
 	) {
 		cacheCtx.record(
@@ -1320,6 +1168,7 @@ async function collectFileDiagnosticResult(
 		timedOut: confirmation === "unconfirmed" ? timedOut : undefined,
 		...(skipReason !== undefined && { skipReason }),
 		primaryServerId: primaryServerId(file),
+		diagnosticsUnsupported: diagnosticsUnsupportedServerIds.length > 0,
 	};
 }
 
@@ -1343,6 +1192,7 @@ async function runFileDiagnostics(
 		timedOut,
 		confirmedByTouch,
 		unconfirmedServerIds,
+		diagnosticsUnsupportedServerIds,
 		content: collectedContent,
 		binding,
 		skipReason,
@@ -1362,7 +1212,9 @@ async function runFileDiagnostics(
 	// diagnostics it surfaces are merged in, not discarded.
 	let effectiveRawDiags = rawDiags;
 	let confirmation: "clean" | "unconfirmed" | undefined;
-	if (skipReason !== undefined) {
+	if (diagnosticsUnsupportedServerIds.length > 0) {
+		confirmation = undefined;
+	} else if (skipReason !== undefined) {
 		confirmation = "unconfirmed";
 	} else if (timedOut) {
 		if (applySeverityFilter(rawDiags, severity).length === 0) {
@@ -1439,13 +1291,16 @@ async function runFileDiagnostics(
 	}
 
 	const primaryId = primaryServerId(absPath);
-	const primaryDiags = limited.filter((d) => d.source === primaryId);
-	const auxiliaryDiags = limited.filter((d) => d.source !== primaryId);
+	const primaryDiags = limited.filter((d) => d.serverId === primaryId);
+	const auxiliaryDiags = limited.filter((d) => d.serverId !== primaryId);
 
 	// Primary confirmation is always its own line, independent of how many
 	// auxiliary findings exist — a wall of ast-grep/opengrep noise must never
 	// bury whether the actual language server confirmed the file clean.
 	const primaryLine = (() => {
+		if (diagnosticsUnsupportedServerIds.length > 0) {
+			return `Primary LSP${primaryId ? ` (${primaryId})` : ""}: navigation-only — diagnostics unsupported (no pull provider or publish evidence).`;
+		}
 		if (timedOut) {
 			return (
 				"Primary LSP: check timed out — NOT the same as 0 diagnostics; the " +
@@ -1477,7 +1332,7 @@ async function runFileDiagnostics(
 	// as "the security scanners found nothing".
 	const coverageLine =
 		unconfirmedServerIds.length > 0
-			? `Auxiliary coverage INCOMPLETE — ${[...unconfirmedServerIds].join(", ")} did not answer within the wait budget, so ${unconfirmedServerIds.length === 1 ? "its findings are" : "their findings are"} NOT included here. This is not a clean bill of health for ${unconfirmedServerIds.length === 1 ? "that scanner" : "those scanners"}; re-check after the next edit, or use waitMs to wait longer.`
+			? `Auxiliary coverage INCOMPLETE — ${[...unconfirmedServerIds].join(", ")} did not answer within the wait budget, so ${unconfirmedServerIds.length === 1 ? "its findings are" : "their findings are"} NOT included here. This is not a clean bill of health for ${unconfirmedServerIds.length === 1 ? "that scanner" : "those scanners"}; re-check after the next edit. waitMs can extend an ordinary wait, but it cannot override a session-demoted scanner.`
 			: undefined;
 
 	let text: string;
@@ -1529,6 +1384,8 @@ async function runFileDiagnostics(
 			truncated,
 			unconfirmed,
 			timedOut: unconfirmed ? timedOut : undefined,
+			navigationOnlyFiles:
+				diagnosticsUnsupportedServerIds.length > 0 ? 1 : undefined,
 			...(skipReason !== undefined && { skipReason }),
 			// #1470: which servers this result does NOT speak for. Absent when it
 			// speaks for all of them.
@@ -1553,11 +1410,17 @@ function tallyConfirmation(results: FileDiagnosticResult[]): {
 	clean: number;
 	unconfirmed: number;
 	timedOut: number;
+	navigationOnly: number;
 } {
 	let clean = 0;
 	let unconfirmed = 0;
 	let timedOut = 0;
+	let navigationOnly = 0;
 	for (const result of results) {
+		if (result.diagnosticsUnsupported) {
+			navigationOnly += 1;
+			continue;
+		}
 		if (result.diagnostics.length > 0) continue;
 		if (result.confirmation === "unconfirmed") {
 			unconfirmed += 1;
@@ -1568,13 +1431,14 @@ function tallyConfirmation(results: FileDiagnosticResult[]): {
 			clean += 1;
 		}
 	}
-	return { clean, unconfirmed, timedOut };
+	return { clean, unconfirmed, timedOut, navigationOnly };
 }
 
 function classifyBatchFileOutcome(
 	result: FileDiagnosticResult,
 ): BatchFileOutcome {
 	if (result.error) return "failed";
+	if (result.diagnosticsUnsupported) return "unsupported";
 	// A timed-out/unconfirmed answer may contain partial findings, but it cannot
 	// honestly be called a complete findings result. Keep the raw findings for
 	// investigation while making the aggregate incomplete.
@@ -1677,59 +1541,96 @@ async function collectBatchDiagnostics(
 	const resolvedCwd = options.cwd ?? process.cwd();
 	const cacheCtx = createWorkspaceDiagnosticsCacheContext(resolvedCwd);
 	const scopeKey = buildScopeKey(options.serverScope ?? "all");
-	const results = await mapWithConcurrency(
-		files,
+	const resultsByIndex = new Map<number, FileDiagnosticResult>();
+	let completed = 0;
+	const pendingIndices = new Map<string, number[]>();
+	files.forEach((file, index) => {
+		const queue = pendingIndices.get(file);
+		if (queue) queue.push(index);
+		else pendingIndices.set(file, [index]);
+	});
+	const groups = groupFilesByPrimaryServer(files);
+	await runPerServerGroups(
+		groups,
 		options.concurrency,
-		async (file) => {
-			const work = collectFileDiagnosticResult(
-				file,
-				severity,
-				lspService,
-				options.waitMs,
-				options.nextWriteIndex,
-				options.serverScope,
-				cacheCtx,
-				scopeKey,
-				resolvedCwd,
-				options.onConfirmedNoBlockers,
-			);
-			const bounded = withDeadline(work, {
-				ms: batchFileDeadlineMs(),
-				onTimeout: "undefined",
-				onReject: "undefined",
-			});
-			const result = options.signal
-				? await Promise.race([
-						bounded,
-						new Promise<FileDiagnosticResult | undefined>((resolve) => {
-							if (options.signal?.aborted) {
-								resolve(undefined);
-								return;
-							}
-							options.signal?.addEventListener(
-								"abort",
-								() => resolve(undefined),
-								{
-									once: true,
-								},
-							);
-						}),
-					])
-				: await bounded;
-			return (
-				result ??
-				inconclusiveBatchResult(
-					file,
-					options.signal?.aborted
-						? "Batch aborted before this file completed."
-						: `File check exceeded ${batchFileDeadlineMs()}ms.`,
-				)
+		async (group) => {
+			if (options.signal?.aborted) return;
+			const first = group.files[0];
+			if (
+				first &&
+				lspService &&
+				!isWarmAttached() &&
+				typeof lspService.ensureWarmForSweep === "function"
+			) {
+				await lspService.ensureWarmForSweep(first, {
+					signal: options.signal,
+				});
+				if (options.signal?.aborted) return;
+			}
+			await mapWithConcurrency(
+				group.files,
+				1,
+				async (file) => {
+					// Keep duplicate explicit paths in their original result slots.
+					const index = pendingIndices.get(file)!.shift()!;
+					const work = collectFileDiagnosticResult(
+						file,
+						severity,
+						lspService,
+						options.waitMs,
+						options.nextWriteIndex,
+						options.serverScope,
+						cacheCtx,
+						scopeKey,
+						resolvedCwd,
+						options.onConfirmedNoBlockers,
+					);
+					const bounded = withDeadline(work, {
+						ms: batchFileDeadlineMs(),
+						onTimeout: "undefined",
+						onReject: "undefined",
+					});
+					const result = options.signal
+						? await Promise.race([
+								bounded,
+								new Promise<FileDiagnosticResult | undefined>((resolve) => {
+									if (options.signal?.aborted) {
+										resolve(undefined);
+										return;
+									}
+									options.signal?.addEventListener(
+										"abort",
+										() => resolve(undefined),
+										{
+											once: true,
+										},
+									);
+								}),
+							])
+						: await bounded;
+					resultsByIndex.set(
+						index,
+						result ??
+							inconclusiveBatchResult(
+								file,
+								options.signal?.aborted
+									? "Batch aborted before this file completed."
+									: `File check exceeded ${batchFileDeadlineMs()}ms.`,
+							),
+					);
+					completed += 1;
+					options.onProgress?.(completed, files.length);
+				},
+				options.signal,
 			);
 		},
-		lspService,
 		options.signal,
-		options.onProgress,
 	);
+	// The retired local pool returned only slots whose mapper had run. Keep that
+	// dense abort contract while restoring the original file order for callers.
+	const results = [...resultsByIndex.entries()]
+		.sort(([left], [right]) => left - right)
+		.map(([, result]) => result);
 	// Persist whatever was recorded, including a partial/aborted sweep's
 	// already-completed files — same "don't throw away confirmed work"
 	// posture as `runWorkspaceDiagnostics`.
@@ -1771,10 +1672,10 @@ async function collectBatchDiagnostics(
 		results.map((r) => [r.file, r.primaryServerId] as const),
 	);
 	const primaryDisplay = display.filter(
-		(d) => d.source === primaryIdByFile.get(d.file),
+		(d) => d.serverId === primaryIdByFile.get(d.file),
 	);
 	const auxiliaryDisplay = display.filter(
-		(d) => d.source !== primaryIdByFile.get(d.file),
+		(d) => d.serverId !== primaryIdByFile.get(d.file),
 	);
 	return {
 		results,
@@ -1822,6 +1723,9 @@ async function runBatchFileDiagnostics(
 		outcomeCounts,
 		incompleteFiles,
 	} = await collectBatchDiagnostics(absPaths, severity, lspService, options);
+	const navigationOnly = results.filter(
+		(result) => result.diagnosticsUnsupported,
+	).length;
 
 	const lines: string[] = [
 		`Files checked: ${results.length}`,
@@ -1907,16 +1811,17 @@ async function runBatchFileDiagnostics(
 			truncated,
 			cleanFiles: clean,
 			unconfirmedFiles: unconfirmed,
+			navigationOnlyFiles: navigationOnly > 0 ? navigationOnly : undefined,
 			timedOutFiles: timedOut > 0 ? timedOut : undefined,
 			outcomes: results.map((result) => ({
 				file: result.file,
 				outcome: result.outcome,
 				reason: result.inconclusiveReason ?? result.error ?? result.unavailable,
 				primaryDiagnosticsCount: result.diagnostics.filter(
-					(diagnostic) => diagnostic.source === result.primaryServerId,
+					(diagnostic) => diagnostic.serverId === result.primaryServerId,
 				).length,
 				auxiliaryDiagnosticsCount: result.diagnostics.filter(
-					(diagnostic) => diagnostic.source !== result.primaryServerId,
+					(diagnostic) => diagnostic.serverId !== result.primaryServerId,
 				).length,
 			})),
 			outcomeCounts,
@@ -2000,6 +1905,7 @@ async function runDirectoryDiagnostics(
 	const wasCapped = collectedFiles.length > MAX_FILES;
 	const filesToProcess = collectedFiles.slice(0, MAX_FILES);
 	const {
+		results,
 		fileErrors,
 		lspHealthWarnings,
 		total,
@@ -2016,6 +1922,9 @@ async function runDirectoryDiagnostics(
 		lspService,
 		options,
 	);
+	const navigationOnly = results.filter(
+		(result) => result.diagnosticsUnsupported,
+	).length;
 
 	let text: string;
 	if (total === 0) {
@@ -2104,6 +2013,7 @@ async function runDirectoryDiagnostics(
 			truncated,
 			cleanFiles: clean,
 			unconfirmedFiles: unconfirmed,
+			navigationOnlyFiles: navigationOnly > 0 ? navigationOnly : undefined,
 			timedOutFiles: timedOut > 0 ? timedOut : undefined,
 			fileErrors: fileErrors.length > 0 ? fileErrors : undefined,
 			lspHealthWarnings:

@@ -75,6 +75,7 @@ on:
   # every pre-existing job) -- the full os x pm x pi-install matrices stay
   # push/nightly/dispatch-only, unchanged from before this lane existed.
   pull_request:
+    branches: [master]
     paths: *install-smoke-paths
 
 # A merge made with GITHUB_TOKEN suppresses its push event. Replayed
@@ -202,7 +203,7 @@ jobs:
             exit 1
           fi
           checked_sha="$(git rev-parse --verify HEAD)"
-          if [[ "${PAYLOAD_SHA,,}" != "$checked_sha" ]]; then
+          if [[ "$(printf '%s' "$PAYLOAD_SHA" | tr '[:upper:]' '[:lower:]')" != "$checked_sha" ]]; then
             echo "::error::checkout does not match the repository_dispatch SHA"
             exit 1
           fi
@@ -214,7 +215,7 @@ jobs:
 
       - name: Setup pnpm
         if: matrix.pm == 'pnpm'
-        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: 11.21.0
 
@@ -320,7 +321,7 @@ jobs:
             exit 1
           fi
           checked_sha="$(git rev-parse --verify HEAD)"
-          if [[ "${PAYLOAD_SHA,,}" != "$checked_sha" ]]; then
+          if [[ "$(printf '%s' "$PAYLOAD_SHA" | tr '[:upper:]' '[:lower:]')" != "$checked_sha" ]]; then
             echo "::error::checkout does not match the repository_dispatch SHA"
             exit 1
           fi
@@ -332,7 +333,7 @@ jobs:
 
       - name: Setup pnpm
         if: matrix.pi_install == 'pnpm-global'
-        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: 11.21.0
 
@@ -364,7 +365,7 @@ jobs:
               # (GITHUB_PATH only affects later steps), so export it here too.
               export PNPM_HOME="$HOME/.pnpm-global"; mkdir -p "$PNPM_HOME"
               export PATH="$PNPM_HOME:$PATH"
-              pnpm config set global-bin-dir "$PNPM_HOME"
+              pnpm config set --global global-bin-dir "$PNPM_HOME"
               # --ignore-scripts: pi's own lifecycle scripts aren't needed for
               # this smoke test (same as the npm-global case above).
               pnpm add -g --ignore-scripts "$PKG" || echo "::notice::pnpm add -g exit $? (blocked scripts?)"
@@ -467,7 +468,7 @@ jobs:
             exit 1
           fi
           checked_sha="$(git rev-parse --verify HEAD)"
-          if [[ "${PAYLOAD_SHA,,}" != "$checked_sha" ]]; then
+          if [[ "$(printf '%s' "$PAYLOAD_SHA" | tr '[:upper:]' '[:lower:]')" != "$checked_sha" ]]; then
             echo "::error::checkout does not match the repository_dispatch SHA"
             exit 1
           fi
@@ -523,7 +524,23 @@ jobs:
           # pi-lens-ignore: zizmor:adhoc-packages
           npm install -g --ignore-scripts pnpm@11.15.1
           mise reshim
+          # pnpm reads packageManager from the current project. Probe its
+          # version outside the checkout so this diagnostic cannot fail on
+          # the repository's npm declaration before global config is set.
+          cd "$RUNNER_TEMP"
           pnpm --version
+
+      - name: Configure pnpm global bin dir
+        shell: bash
+        run: |
+          set -uxo pipefail
+          # Keep pnpm's global setup outside the checkout's npm project config.
+          export PNPM_HOME="$HOME/.pnpm-global"
+          mkdir -p "$PNPM_HOME"
+          export PATH="$PNPM_HOME:$PATH"
+          pnpm config set --global global-bin-dir "$PNPM_HOME"
+          echo "PNPM_HOME=$PNPM_HOME" >> "$GITHUB_ENV"
+          echo "$PNPM_HOME" >> "$GITHUB_PATH"
 
       - name: Install pi (${{ matrix.pi_via }})
         shell: bash
@@ -782,7 +799,7 @@ jobs:
   # also CLOSES the tracker once a run installs cleanly again -- the
   # acceptance criterion this lane's first round missed.
   host-latest-smoke:
-    name: host latest (nightly, advisory)
+    name: host latest nightly (advisory)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:

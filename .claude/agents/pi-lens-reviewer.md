@@ -33,6 +33,10 @@ merge — you report internally to the orchestrator.
    with the claimed messages. A test that passes pre-fix is a finding.
 4. Attack with probes, not prose. Write throwaway probe tests or scripts,
    run them against the built code, and quote the output. Delete probes after.
+   Probe SCRIPTS (`.mjs`/`.ts` files you write) live OUTSIDE the worktree
+   (the scratchpad or `<worktree>/../probes-<pr>`): an untracked `.mjs`
+   inside the tree is picked up by oxlint's self-lint scope and reds
+   `tests/scripts/lint-js.test.ts` (#2865 verify v3, 2026-09-10).
    Favorite attack classes for this repo:
    - Inversions: does the fix over-correct (real failures downgraded, healthy
      paths narrowed, legitimate results dropped)?
@@ -169,6 +173,32 @@ it was added to handle (#2120 F3), and one was vacuous at the shipped seam
 while hiding an inversion (#2119 r2). Fix rounds introduce defects at the
 same rate they remove them here. Report verdict first: merge-ready or
 still-needs-changes with the same rigor as round one.
+
+**Probe the inverted direction whenever a round retunes a threshold, tier or
+predicate.** A round that cures OVER-triggering routinely ships
+UNDER-triggering, and the second fault is harder to see because the symptom is
+silence rather than noise. So when a fix narrows a guard, adds a confirmation
+tier, or makes a demotion conditional, build the boundary case that the new
+condition cannot distinguish and drive it through the real seam. The record:
+#2983 round 1 demoted an inline blocker on any mtime move, so a `touch` walked
+a finding out of turn-end rendering; round 2 added `size`-tier content
+confirmation, and a one-character SAME-LENGTH edit then kept a genuinely stale
+blocker authoritative — the original issue, arriving from the other side. Both
+directions obstruct the user; only one of them is loud. Name the tier that
+cannot separate the two states and ask what input lands exactly there.
+
+**A clean local run is not evidence when the defect involves a deferred
+producer or another worker.** Fixture leaks, snapshot persistence, debounced
+writes and cross-project observers all resolve differently under CI's worker
+schedule than under a developer's. A round that reports "the full population
+passed locally" has shown that the defect did not reproduce, not that it was
+fixed — those are different claims and the body must make the weaker one. The
+record: #2955 round 13 ran the full 1,095-file population clean and CI was red
+on the same family it had just fixed; round 14 instrumented the tick sequence,
+declared plainly that it could not reproduce the recreation locally, and
+reasoned from the CI observation instead. That is the correct shape. Treat "it
+passes locally now" in a fix round's body as an unproven claim and say so in
+the verdict.
 
 **Every verify round re-runs the previous rounds' mutation set** on the new
 head before it re-runs the new claims. A fix round can silently retire a guard

@@ -25,6 +25,7 @@ import {
 	POLL_INTERVAL_SECONDS,
 	resolveGhTimeoutMs,
 	resolveHeadSha,
+	resolveClassification,
 	resolveRepository,
 	resolveRequiredCheckNames,
 	resolveWaitCapSeconds,
@@ -57,6 +58,41 @@ const BOTH_SUCCESS = {
 };
 
 describe("computeVerdict — the four exit codes (#2539 acceptance criterion)", () => {
+	it("reports an armed infrastructure rerun only while its later attempt runs", () => {
+		const verdict = computeVerdict(
+			{
+				check_runs: [
+					checkRun({ name: "Unit tests", conclusion: "failure", id: 1 }),
+				],
+			},
+			["Unit tests"],
+			"MERGEABLE",
+			"infra-kill",
+			{
+				originalFailed: true,
+				latestAttempt: { status: "queued", conclusion: null, run_attempt: 2 },
+			},
+		);
+		expect(verdict.exitCode).toBe(EXIT_PENDING);
+		expect(verdict.reason).toContain("infra (rerun armed)");
+	});
+	it("reports a concluded rerun failure even when ci:infra remains", () => {
+		const verdict = computeVerdict(
+			{ check_runs: [checkRun({ name: "Unit tests", conclusion: "failure" })] },
+			["Unit tests"],
+			"MERGEABLE",
+			"infra-net",
+			{
+				originalFailed: true,
+				latestAttempt: {
+					status: "completed",
+					conclusion: "failure",
+					run_attempt: 2,
+				},
+			},
+		);
+		expect(verdict.exitCode).toBe(EXIT_FAILURE);
+	});
 	it("exits 0 when both required checks concluded success", () => {
 		const verdict = computeVerdict(BOTH_SUCCESS);
 		expect(verdict.exitCode).toBe(EXIT_SUCCESS);
@@ -983,8 +1019,8 @@ describe("isAdvisoryCheck — every job name from a PR-triggered workflow is cla
 	const EXTERNAL_ADVISORY_NAMES = ["CodeQL", "SonarCloud Code Analysis"];
 
 	const EXPECTED_ADVISORY = new Set([
+		"Unit tests Windows (advisory)",
 		"PR body (advisory)",
-		"oxfmt format check (advisory)",
 		"Vale prose lint (advisory)",
 		"OSV scan (advisory)",
 		"knip (advisory)",
@@ -992,7 +1028,16 @@ describe("isAdvisoryCheck — every job name from a PR-triggered workflow is cla
 		"yamllint (advisory)",
 		"typos (advisory)",
 		"taplo (advisory)",
+		"mutation (advisory)",
+		"complexity (advisory)",
+		// #2697 item 9: the strictness census lane (two scratch tsconfigs) is advisory.
+		"strictness (advisory)",
+		"host latest nightly (advisory)",
 		"greeting",
+		// #2993: stale verdict-label cleanup is metadata bookkeeping, not a
+		// change-correctness assertion, so token, API, or already-absent-label
+		// failures must never block a merge.
+		"Clear stale CI verdict labels",
 		// #2700 review round 3: named "oxlint (advisory)" (the `(advisory)`
 		// suffix, not a hand-maintained ci-checks.mjs entry like `greeting`
 		// above) -- the full categories+plugins+type-aware oxlint sweep
@@ -1046,6 +1091,7 @@ describe("isAdvisoryCheck — every job name from a PR-triggered workflow is cla
 			"Install test (windows-latest)",
 			"Install test (macos-latest)",
 			"Production install build (--omit=dev, from source)",
+			"oxfmt format check",
 		]) {
 			expect(isAdvisoryCheck(name)).toBe(false);
 		}
@@ -1056,7 +1102,6 @@ describe("isAdvisoryCheck — every job name from a PR-triggered workflow is cla
 			...EXTERNAL_ADVISORY_NAMES,
 			"greeting",
 			"PR body (advisory)",
-			"oxfmt format check (advisory)",
 			"Vale prose lint (advisory)",
 			"OSV scan (advisory)",
 			"oxlint (advisory)",
@@ -1064,6 +1109,7 @@ describe("isAdvisoryCheck — every job name from a PR-triggered workflow is cla
 			"yamllint (advisory)",
 			"typos (advisory)",
 			"taplo (advisory)",
+			"mutation (advisory)",
 		]) {
 			expect(isAdvisoryCheck(name)).toBe(true);
 		}
@@ -1071,7 +1117,7 @@ describe("isAdvisoryCheck — every job name from a PR-triggered workflow is cla
 
 	// #2700 review round 3: the repo's settled convention for a NEW advisory
 	// job is the `(advisory)` name suffix with no continue-on-error (what
-	// `oxfmt format check (advisory)`/`Vale prose lint (advisory)` above and
+	// `Vale prose lint (advisory)` above and
 	// osv-scan.yml already do) -- not a hand-maintained ADVISORY_CHECKS
 	// entry like `greeting`'s (that shape exists only because `greeting`'s
 	// real GitHub Actions job name, from greetings.yml's job KEY, carries no
@@ -1090,8 +1136,36 @@ describe("isAdvisoryCheck — every job name from a PR-triggered workflow is cla
 				"yamllint (advisory)",
 				"typos (advisory)",
 				"taplo (advisory)",
+				"mutation (advisory)",
+				"complexity (advisory)",
 			]),
 		);
+	});
+});
+
+describe("isAdvisoryCheck — workflow advisory names stay in policy", () => {
+	it("classifies every advisory-named job across all workflows", () => {
+		const mismatches: string[] = [];
+		const discovered: string[] = [];
+		for (const entry of readdirSync(
+			resolve(import.meta.dirname, "../../.github/workflows"),
+		)) {
+			if (!/\.ya?ml$/i.test(entry)) continue;
+			const document = yaml.load(
+				readFileSync(
+					resolve(import.meta.dirname, "../../.github/workflows", entry),
+					"utf8",
+				),
+			) as { jobs?: Record<string, { name?: unknown }> };
+			for (const [key, job] of Object.entries(document.jobs ?? {})) {
+				const name = typeof job?.name === "string" ? job.name : key;
+				if (!name.toLowerCase().includes("advisory")) continue;
+				discovered.push(`${entry}:${key}=${name}`);
+				if (!isAdvisoryCheck(name)) mismatches.push(`${entry}:${key}=${name}`);
+			}
+		}
+		expect(discovered).not.toEqual([]);
+		expect(mismatches).toEqual([]);
 	});
 });
 
@@ -1518,6 +1592,36 @@ describe("resolveHeadSha — mergeable resolution (#2539 round 2, F1)", () => {
 		};
 		resolveHeadSha("2539", ghExec);
 		expect(calls[0]).toEqual({ timeoutMs: DEFAULT_GH_TIMEOUT_MS });
+	});
+});
+
+describe("resolveClassification — label freshness (#2856)", () => {
+	it("ignores a verdict label whose classifier marker belongs to an older head", () => {
+		const ghExec = () =>
+			JSON.stringify({
+				headRefOid: "abcdef1234567",
+				labels: [{ name: "ci:real" }],
+				comments: [
+					{
+						body: "ci-classifier: real — first failure: old <!-- ci-classifier:sha=0123456789abc rerun=false -->",
+					},
+				],
+			});
+		expect(resolveClassification("2856", ghExec)).toBeNull();
+	});
+
+	it("accepts a verdict label only when its classifier marker matches the head", () => {
+		const ghExec = () =>
+			JSON.stringify({
+				headRefOid: "abcdef1234567",
+				labels: [{ name: "ci:infra" }],
+				comments: [
+					{
+						body: "ci-classifier: infra-kill (detail) <!-- ci-classifier:sha=abcdef1234567 rerun=false -->",
+					},
+				],
+			});
+		expect(resolveClassification("2856", ghExec)).toBe("infra-kill");
 	});
 });
 

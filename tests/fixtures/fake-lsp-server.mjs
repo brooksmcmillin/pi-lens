@@ -1,6 +1,8 @@
 // Minimal JSON-RPC 2.0 LSP fake server over stdio
 // Used for integration tests — speaks real LSP protocol without actual language smarts
 
+import fs from "node:fs";
+
 // #2436: parent-death watchdog. A test that spawns this fixture and then
 // dies without running its own cleanup (a SIGKILLed vitest worker fork, a
 // `--force` worktree removal) must not leave this process running forever —
@@ -240,16 +242,13 @@ function handle(raw) {
 	}
 	if (process.env.FAKE_LSP_TRACE_FILE) {
 		const trace = (what) => {
-			import("node:fs")
-				.then((fs) =>
-					fs.appendFileSync(
-						process.env.FAKE_LSP_TRACE_FILE,
-						`${what}\n`,
-					),
-				)
-				.catch(() => {});
+			try {
+				fs.appendFileSync(process.env.FAKE_LSP_TRACE_FILE, `${what}\n`);
+			} catch {}
 		};
-		trace(`recv ${data.method ?? "<response>"}`);
+		trace(
+			`recv ${data.method ?? "<response>"} ${data.params?.textDocument?.uri ?? ""}`.trim(),
+		);
 		if (
 			process.env.FAKE_LSP_ECHO_NOTIFY_METHODS === "1" &&
 			data.id === undefined
@@ -485,6 +484,22 @@ function handle(raw) {
 			data.params?.textDocument?.uri,
 			data.params?.textDocument?.text ?? "",
 		);
+		if (process.env.FAKE_LSP_PUSH_DIAGNOSTIC === "1") {
+			send({
+				jsonrpc: "2.0",
+				method: "textDocument/publishDiagnostics",
+				params: {
+					uri: data.params?.textDocument?.uri,
+					diagnostics: [{
+						severity: 1,
+						source: "fake-push",
+						code: "P2780",
+						message: "diagnostic from pushed custom server",
+						range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+					}],
+				},
+			});
+		}
 		// Gated on the wedge profile so every existing test keeps the incumbent
 		// silent-on-open behaviour it was written against.
 		if (HAS_BACKLOG_WEDGE) {
@@ -662,6 +677,7 @@ function handle(raw) {
 
 	// Pull diagnostics
 	if (data.method === "textDocument/diagnostic") {
+		if (process.env.FAKE_LSP_IGNORE_PULL === "1") return;
 		const text = openDocuments.get(data.params?.textDocument?.uri) ?? "";
 		send({
 			jsonrpc: "2.0",

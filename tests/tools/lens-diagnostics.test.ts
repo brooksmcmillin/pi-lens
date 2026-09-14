@@ -10,6 +10,14 @@ import {
 	_resetDeferredForTests,
 	_resetStateCacheForTests,
 } from "../../clients/diagnostic-dispositions.js";
+import {
+	getDegradationSummary,
+	resetDegradationLedger,
+} from "../../clients/degradation-ledger.js";
+import {
+	_setRecentPhasesForTest,
+	getRecentLoggedPhases,
+} from "../../clients/latency-logger.js";
 import { resetProjectLensConfigCache } from "../../clients/project-lens-config.js";
 import { removeTempDirSync } from "../clients/test-utils.js";
 import type { Theme } from "@earendil-works/pi-coding-agent";
@@ -82,7 +90,7 @@ const mockSummaries: ReturnType<
 let mockStaleDropped = 0;
 let mockDependencyDemoted = 0;
 
-const reconcileScanDiagnosticsMock = vi.fn();
+const reconcileScanDiagnosticsMock = vi.fn().mockReturnValue(true);
 const reconcileCorrelatedScanDiagnosticsMock = vi.fn();
 
 vi.mock("../../clients/widget-state.js", async (importOriginal) => {
@@ -116,6 +124,7 @@ vi.mock(
 );
 
 beforeEach(() => {
+	resetDegradationLedger();
 	projectDiagnosticsMocks.scanProjectDiagnostics.mockReset();
 	projectDiagnosticsMocks.loadProjectDiagnosticsSnapshot.mockReset();
 	projectDiagnosticsMocks.loadProjectDiagnosticsDeltaReport.mockReset();
@@ -123,13 +132,14 @@ beforeEach(() => {
 	freshFetchMocks.fetchFreshProjectDiagnostics.mockResolvedValue({
 		diagnostics: [],
 		runners: [],
+		analyzed: [],
 		cold: [],
 		timings: {},
 	});
 	mockSummaries.length = 0;
 	mockStaleDropped = 0;
 	mockDependencyDemoted = 0;
-	reconcileScanDiagnosticsMock.mockReset();
+	reconcileScanDiagnosticsMock.mockReset().mockReturnValue(true);
 	reconcileCorrelatedScanDiagnosticsMock.mockReset();
 	resetProjectLensConfigCache();
 });
@@ -165,6 +175,67 @@ function run(
 	return tool.execute("1", params, new AbortController().signal, null, { cwd });
 }
 
+describe("lens_diagnostics compact filename", () => {
+	it("names a real one-file paths request", async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-one-file-"));
+		const file = path.join(cwd, "app.ts");
+		fs.writeFileSync(file, "const app = 1;\n");
+		const service = {
+			touchFile: vi.fn(async () => undefined),
+			getDiagnostics: vi.fn(async () => []),
+			getCapabilitySnapshots: vi.fn(async () => []),
+		};
+		try {
+			const tool = makeTool({}, service);
+			const result = await run(tool, { source: "lsp", paths: [file] }, cwd);
+			const rendered = (
+				tool.renderResult?.(result, { expanded: false }, {} as Theme, {
+					args: { source: "lsp", paths: [file] },
+				}) as any
+			)
+				.render(200)
+				.join("\n");
+			expect(rendered).toContain("lens_diagnostics app.ts — 0 diagnostics");
+		} finally {
+			removeTempDirSync(cwd);
+		}
+	});
+
+	it("uses the diagnosed file when path and paths are both supplied", async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-both-paths-"));
+		const diagnosed = path.join(cwd, "diagnosed.ts");
+		const unrelated = path.join(cwd, "unrelated.ts");
+		fs.writeFileSync(diagnosed, "const diagnosed = 1;\n");
+		fs.writeFileSync(unrelated, "const unrelated = 1;\n");
+		const service = {
+			touchFile: vi.fn(async () => undefined),
+			getDiagnostics: vi.fn(async () => []),
+			getCapabilitySnapshots: vi.fn(async () => []),
+		};
+		try {
+			const tool = makeTool({}, service);
+			const result = await run(
+				tool,
+				{ source: "lsp", path: unrelated, paths: [diagnosed] },
+				cwd,
+			);
+			const rendered = (
+				tool.renderResult?.(result, { expanded: false }, {} as Theme, {
+					args: { source: "lsp", path: unrelated, paths: [diagnosed] },
+				}) as any
+			)
+				.render(200)
+				.join("\n");
+			expect(rendered).toContain(
+				"lens_diagnostics diagnosed.ts — 0 diagnostics",
+			);
+			expect(rendered).not.toContain("unrelated.ts");
+		} finally {
+			removeTempDirSync(cwd);
+		}
+	});
+});
+
 function withIgnoredFixture<T>(fn: (cwd: string) => Promise<T>): Promise<T> {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-diag-ignore-"));
 	fs.writeFileSync(
@@ -179,6 +250,288 @@ function withIgnoredFixture<T>(fn: (cwd: string) => Promise<T>): Promise<T> {
 		resetProjectLensConfigCache();
 	});
 }
+
+describe("lens_diagnostics source and scope routing", () => {
+	it("applies the same severity threshold to session and LSP sources", async () => {
+		const cwd = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-severity-threshold-"),
+		);
+		const file = path.join(cwd, "threshold.ts");
+		fs.writeFileSync(file, "const threshold = 1;\n");
+		const tiers = [
+			["error", "SESSION-ERROR", 1],
+			["warning", "SESSION-WARNING", 2],
+			["info", "SESSION-INFO", 3],
+			["hint", "SESSION-HINT", 4],
+		] as const;
+		mockSummaries.push(
+			sum(
+				file,
+				{ blocking: 1, errors: 1, warnings: 1, advisories: 2 },
+				{
+					diagnostics: tiers.map(([severity, message]) => ({
+						severity,
+						semantic: severity === "error" ? "blocking" : undefined,
+						message,
+						line: 1,
+					})),
+				},
+			),
+		);
+		const service = {
+			touchFile: vi.fn(async () => undefined),
+			getDiagnostics: vi.fn(async () =>
+				tiers.map(([_, message, severity]) => ({
+					severity,
+					message: message.replace("SESSION", "LSP"),
+					range: {
+						start: { line: 0, character: 0 },
+						end: { line: 0, character: 1 },
+					},
+				})),
+			),
+			getCapabilitySnapshots: vi.fn(async () => []),
+		};
+		try {
+			for (const [severity, expected] of [
+				["error", ["ERROR"]],
+				["warning", ["ERROR", "WARNING"]],
+				["information", ["ERROR", "WARNING", "INFO"]],
+				["hint", ["ERROR", "WARNING", "INFO", "HINT"]],
+			] as const) {
+				const sessionText = String(
+					(await run(makeTool(), { mode: "all", severity }, cwd)).content[0]
+						.text,
+				);
+				const lspText = String(
+					(
+						await run(
+							makeTool({}, service),
+							{ source: "lsp", scope: "paths", paths: [file], severity },
+							cwd,
+						)
+					).content[0].text,
+				);
+				const expectedTiers: readonly string[] = expected;
+				expect(
+					expected
+						.map((tier) => `SESSION-${tier}`)
+						.every((message) => sessionText.includes(message)),
+				).toBe(true);
+				expect(
+					expected
+						.map((tier) => `LSP-${tier}`)
+						.every((message) => lspText.includes(message)),
+				).toBe(true);
+				for (const tier of ["ERROR", "WARNING", "INFO", "HINT"])
+					if (!expectedTiers.includes(tier)) {
+						expect(sessionText).not.toContain(`SESSION-${tier}`);
+						expect(lspText).not.toContain(`LSP-${tier}`);
+					}
+			}
+		} finally {
+			mockSummaries.length = 0;
+			removeTempDirSync(cwd);
+		}
+	});
+
+	it("keeps an error-only file visible at the warning threshold", async () => {
+		const cwd = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-severity-error-only-"),
+		);
+		const file = path.join(cwd, "error-only.ts");
+		fs.writeFileSync(file, "const errorOnly = 1;\n");
+		mockSummaries.push(
+			sum(
+				file,
+				{ blocking: 1, errors: 1 },
+				{
+					diagnostics: [
+						{
+							severity: "error",
+							semantic: "blocking",
+							message: "SESSION-ERROR-ONLY",
+							line: 1,
+						},
+					],
+				},
+			),
+		);
+		const service = {
+			touchFile: vi.fn(async () => undefined),
+			getDiagnostics: vi.fn(async () => [
+				{
+					severity: 1,
+					message: "LSP-ERROR-ONLY",
+					range: {
+						start: { line: 0, character: 0 },
+						end: { line: 0, character: 1 },
+					},
+				},
+			]),
+			getCapabilitySnapshots: vi.fn(async () => []),
+		};
+		try {
+			const sessionText = String(
+				(await run(makeTool(), { mode: "all", severity: "warning" }, cwd))
+					.content[0].text,
+			);
+			const lspText = String(
+				(
+					await run(
+						makeTool({}, service),
+						{
+							source: "lsp",
+							scope: "paths",
+							paths: [file],
+							severity: "warning",
+						},
+						cwd,
+					)
+				).content[0].text,
+			);
+			expect(sessionText).toContain("SESSION-ERROR-ONLY");
+			expect(lspText).toContain("LSP-ERROR-ONLY");
+		} finally {
+			mockSummaries.length = 0;
+			removeTempDirSync(cwd);
+		}
+	});
+
+	it("routes source=lsp through the real probe implementation", async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-fold-lsp-"));
+		const file = path.join(cwd, "bad.ts");
+		fs.writeFileSync(file, "const value: number = 'bad';\n");
+		const service = {
+			touchFile: vi.fn(async () => undefined),
+			getDiagnostics: vi.fn(async () => [
+				{
+					severity: 1,
+					message: "probe finding",
+					range: {
+						start: { line: 0, character: 0 },
+						end: { line: 0, character: 1 },
+					},
+				},
+			]),
+			getCapabilitySnapshots: vi.fn(async () => []),
+		};
+		try {
+			const result = (await run(
+				makeTool({}, service),
+				{ source: "lsp", scope: "paths", paths: [file] },
+				cwd,
+			)) as any;
+			expect(result.isError).toBe(false);
+			expect(result.details.source).toBe("lsp");
+			expect(result.details.scope).toBe("paths");
+			expect(result.content[0].text).toContain("probe finding");
+			expect(service.getDiagnostics).toHaveBeenCalledWith(file, "full");
+		} finally {
+			removeTempDirSync(cwd);
+		}
+	});
+
+	it("source=lsp workspace scans the workspace without explicit paths", async () => {
+		const cwd = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-fold-workspace-"),
+		);
+		fs.writeFileSync(path.join(cwd, "one.ts"), "const one = 1;\n");
+		const service = {
+			runWorkspaceDiagnostics: vi.fn(async () => []),
+			touchFile: vi.fn(async () => undefined),
+			getDiagnostics: vi.fn(async () => []),
+			getCapabilitySnapshots: vi.fn(async () => []),
+		};
+		try {
+			const result = (await run(
+				makeTool({}, service),
+				{ source: "lsp", scope: "workspace" },
+				cwd,
+			)) as any;
+			expect(result.isError).toBe(false);
+			expect(service.getDiagnostics).toHaveBeenCalled();
+		} finally {
+			removeTempDirSync(cwd);
+		}
+	});
+
+	it("source=lsp workspace with an explicit path restricts the sweep to it, not the whole project (#2860 N2)", async () => {
+		// The SKILL.md "check a folder" recipe:
+		// lens_diagnostics({source:"lsp", scope:"workspace", path:"src/"}).
+		// Round 2 unconditionally deleted `path`/`paths` under scope=workspace
+		// and substituted `cwd`, silently widening a directory-scoped request
+		// into a whole-project sweep.
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-fold-dir-"));
+		const sub = path.join(cwd, "src");
+		fs.mkdirSync(sub);
+		fs.writeFileSync(path.join(sub, "a.ts"), "const a = 1;\n");
+		fs.writeFileSync(path.join(cwd, "outside.ts"), "const b = 1;\n");
+		const touched: string[] = [];
+		const service = {
+			touchFile: vi.fn(async (file: string) => {
+				touched.push(file);
+				return undefined;
+			}),
+			getDiagnostics: vi.fn(async () => []),
+			getCapabilitySnapshots: vi.fn(async () => []),
+		};
+		try {
+			const result = (await run(
+				makeTool({}, service),
+				{ source: "lsp", scope: "workspace", path: "src" },
+				cwd,
+			)) as any;
+			expect(result.isError).toBe(false);
+			expect(touched).toEqual([path.join(sub, "a.ts")]);
+			expect(touched).not.toContain(path.join(cwd, "outside.ts"));
+		} finally {
+			removeTempDirSync(cwd);
+		}
+	});
+
+	it("source=lsp scope=paths and the omitted-scope default behave identically (#2860 F4: delta dropped from the schema, still a real internal default)", async () => {
+		// Two DIFFERENT files (not the same path reused across calls) so a
+		// process-level per-file result cache cannot mask the second call's
+		// own routing decision.
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-fold-delta-"));
+		const fileA = path.join(cwd, "a.ts");
+		const fileB = path.join(cwd, "b.ts");
+		fs.writeFileSync(fileA, "const a = 1;\n");
+		fs.writeFileSync(fileB, "const b = 1;\n");
+		const touchedByScope = new Map<string, string[]>();
+		function makeService(key: string) {
+			return {
+				touchFile: vi.fn(async (f: string) => {
+					touchedByScope.set(key, [...(touchedByScope.get(key) ?? []), f]);
+					return undefined;
+				}),
+				getDiagnostics: vi.fn(async () => []),
+				getCapabilitySnapshots: vi.fn(async () => []),
+			};
+		}
+		try {
+			await run(
+				makeTool({}, makeService("paths")),
+				{ source: "lsp", scope: "paths", paths: [fileA] },
+				cwd,
+			);
+			const omittedResult = await run(
+				makeTool({}, makeService("omitted")),
+				{ source: "lsp", paths: [fileB] },
+				cwd,
+			);
+			expect(omittedResult.details).toMatchObject({
+				source: "lsp",
+				scope: "paths",
+			});
+			expect(touchedByScope.get("omitted")).toEqual([fileB]);
+			expect(touchedByScope.get("paths")).toEqual([fileA]);
+		} finally {
+			removeTempDirSync(cwd);
+		}
+	});
+});
 
 // ── compact render header ────────────────────────────────────────────────────
 
@@ -239,6 +592,58 @@ describe("lens_diagnostics compact render header", () => {
 	});
 });
 
+describe("lens_diagnostics source=lsp compact render", () => {
+	const identityTheme = {
+		fg: (_color: string, text: string) => text,
+		bold: (text: string) => text,
+	} as unknown as Theme;
+
+	function render(details: Record<string, unknown>) {
+		const component = makeTool().renderResult?.(
+			{ content: [{ type: "text", text: "" }], details, isError: false },
+			{ expanded: false },
+			identityTheme,
+			{ args: { source: "lsp", scope: "paths" }, lastComponent: undefined },
+		);
+		return (component?.render(200) ?? []).join("\n");
+	}
+
+	it("preserves severity-1 findings", () => {
+		const line = render({
+			source: "lsp",
+			totalDiagnostics: 2,
+			filesChecked: 1,
+		});
+		expect(line).toContain("2 diagnostics");
+		expect(line).not.toContain("clean");
+	});
+
+	it("preserves unconfirmed and timed-out files", () => {
+		const line = render({
+			source: "lsp",
+			totalDiagnostics: 0,
+			filesChecked: 1,
+			unconfirmedFiles: 1,
+			timedOutFiles: 1,
+		});
+		expect(line).toContain("unconfirmed");
+		expect(line).toContain("timed out");
+	});
+
+	it("preserves navigation-only and unavailable outcomes", () => {
+		expect(
+			render({ source: "lsp", filesChecked: 1, navigationOnlyFiles: 1 }),
+		).toContain("navigation-only");
+		expect(
+			render({
+				source: "lsp",
+				filesChecked: 1,
+				outcomeCounts: { unavailable: 1 },
+			}),
+		).toContain("not confirmed");
+	});
+});
+
 // ── schema ────────────────────────────────────────────────────────────────────
 
 describe("lens_diagnostics schema", () => {
@@ -249,6 +654,48 @@ describe("lens_diagnostics schema", () => {
 		expect(props.mode).toBeDefined();
 		expect(props.severity).toBeDefined();
 		expect(props.refreshRunners).toBeDefined();
+		expect(props.analysisRoot).toBeDefined();
+	});
+
+	it("passes an explicit analysis root through mode=full (#2053)", async () => {
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+		};
+		await run(makeTool({}, lspService), {
+			mode: "full",
+			refreshRunners: "all",
+			analysisRoot: "/home/me/repo",
+		});
+
+		expect(freshFetchMocks.fetchFreshProjectDiagnostics).toHaveBeenCalledWith(
+			expect.anything(),
+			"/proj",
+			expect.anything(),
+			expect.anything(),
+			expect.objectContaining({ analysisRoot: "/home/me/repo" }),
+		);
+	});
+
+	it("rejects an invalid explicit analysis root as a failed tool call (#2977 F2)", async () => {
+		freshFetchMocks.fetchFreshProjectDiagnostics.mockResolvedValue({
+			diagnostics: [],
+			runners: [],
+			analyzed: [],
+			cold: [],
+			timings: {},
+			failed: [],
+			analysisRootError: "explicit analysis root is unavailable",
+		});
+		const result = await run(
+			makeTool({}, { runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]) }),
+			{
+				mode: "full",
+				refreshRunners: "all",
+				analysisRoot: "/missing",
+			},
+		);
+		expect((result as { isError?: boolean }).isError).toBe(true);
+		expect(result.content[0].text).toMatch(/unavailable/);
 	});
 
 	it("defaults to delta mode when no params supplied", async () => {
@@ -268,17 +715,96 @@ describe("lens_diagnostics schema", () => {
 		expect(lspService.runWorkspaceDiagnostics).not.toHaveBeenCalled();
 	});
 
-	it("exposes full mode in the schema", () => {
+	it("exposes source and scope in the schema", () => {
 		const tool = makeTool();
 		const props = (tool.parameters as { properties: Record<string, any> })
 			.properties;
-		expect(props.mode.enum).toContain("full");
+		// #2860 round 3 N3/F4: `analyzers` was observationally identical to
+		// `session` at every scope (round-2 verify N3, mutation-proof: 446
+		// tests stayed green with the whole special-case deleted) and `delta`
+		// was byte-identical to `paths` for source=lsp (N2/F4) — both dropped
+		// from the model-facing enum rather than shipping dead choices.
+		expect(props.source.enum).toEqual(["session", "lsp"]);
+		expect(props.scope.enum).toEqual(["paths", "workspace"]);
+		expect(props.paths.maxItems).toBe(100);
+		expect(props.severity.enum).toEqual([
+			"error",
+			"warning",
+			"information",
+			"hint",
+			"all",
+		]);
+	});
+
+	it("distinguishes cached reporting from targeted active verification in agent guidance", () => {
+		const tool = makeTool();
+		for (const text of [
+			tool.description,
+			tool.promptSnippet,
+			(tool.parameters.properties.source as unknown as { description: string })
+				.description,
+		]) {
+			expect(text).toMatch(/session cache/i);
+			expect(text).toMatch(/lsp/i);
+			// #2860 round 3 F9: restored on every one of the three surfaces after
+			// round 2 dropped it from promptSnippet and the source parameter's
+			// own description (verify v2 mutation M7 — replacing the whole
+			// promptSnippet stayed green with no caveat assertion anywhere).
+			expect(text).toMatch(/empty cache[^.\n;]*(not proof|≠ clean)/i);
+		}
+		expect(tool.description).toContain("Empty cache is not proof of clean");
 	});
 });
 
 // ── delta mode ────────────────────────────────────────────────────────────────
 
 describe("lens_diagnostics mode=delta", () => {
+	it("projects the resolved LSP cwd onto every diagnostic row (#2777)", async () => {
+		mockSummaries.push({
+			filePath: "/proj/src/a.ts",
+			blocking: 1,
+			errors: 1,
+			warnings: 0,
+			advisories: 0,
+			hasFinalSnapshot: true,
+			diagnostics: [
+				{ severity: "error", semantic: "blocking", message: "boom", line: 3 },
+			],
+		});
+
+		const result = await run(makeTool(), { mode: "all" });
+		const text = String(result.content[0].text);
+		expect(text).toContain("cwd=/proj");
+	});
+
+	it("uses the server-owned cwd for the rendered row", async () => {
+		// #2846: the renderer must not independently rediscover a marker root.
+		const { LSP_SERVERS } = await import("../../clients/lsp/server.js");
+		const server = LSP_SERVERS.find((entry) => entry.id === "typescript");
+		if (!server) throw new Error("typescript server missing from registry");
+		const originalRoot = server.root;
+		server.root = async () => "/proj/server-owned-root";
+		mockSummaries.push({
+			filePath: "/proj/src/a.ts",
+			blocking: 1,
+			errors: 1,
+			warnings: 0,
+			advisories: 0,
+			hasFinalSnapshot: true,
+			diagnostics: [
+				{ severity: "error", semantic: "blocking", message: "boom", line: 3 },
+			],
+		});
+		try {
+			const result = await run(makeTool(), { mode: "all" });
+			expect(String(result.content[0].text)).toContain(
+				"cwd=/proj/server-owned-root",
+			);
+		} finally {
+			server.root = originalRoot;
+		}
+	});
+
 	it("returns clean message when caches are empty", async () => {
 		const result = await run(makeTool());
 		expect(String(result.content[0].text)).toContain("No");
@@ -400,7 +926,15 @@ describe("lens_diagnostics mode=delta", () => {
 				files: [
 					{
 						filePath: "/proj/src/foo.ts",
-						warnings: [{ line: 1, rule: "r", tool: "t", message: "warn" }],
+						warnings: [
+							{
+								line: 1,
+								rule: "r",
+								tool: "t",
+								message: "warn",
+								severity: "warning",
+							},
+						],
 					},
 				],
 				summary: { warnings: 1 },
@@ -411,6 +945,112 @@ describe("lens_diagnostics mode=delta", () => {
 		// No actionable warnings (they're warnings, not errors)
 		expect(text).toContain("No error");
 	});
+
+	it("severity=error excludes the cached warning in delta mode", async () => {
+		const result = await run(
+			makeTool({
+				"actionable-warnings": {
+					files: [
+						{
+							filePath: "/proj/src/foo.ts",
+							warnings: [
+								{
+									line: 1,
+									rule: "r",
+									tool: "t",
+									message: "warn",
+									severity: "warning",
+								},
+							],
+						},
+					],
+					summary: { warnings: 1 },
+				},
+			}),
+			{ mode: "delta", severity: "error" },
+		);
+		expect(String(result.content[0].text)).toContain("No error issues");
+	});
+
+	it.each([
+		["warning", ["ACTIONABLE-WARNING", "QUALITY-WARNING-TIER"]],
+		[
+			"information",
+			[
+				"ACTIONABLE-WARNING",
+				"QUALITY-WARNING-TIER",
+				"QUALITY-INFORMATION-TIER",
+			],
+		],
+		[
+			"hint",
+			[
+				"ACTIONABLE-WARNING",
+				"QUALITY-WARNING-TIER",
+				"QUALITY-INFORMATION-TIER",
+				"QUALITY-HINT-TIER",
+			],
+		],
+	])(
+		"filters delta cache records individually for severity=%s",
+		async (severity, expected) => {
+			const tool = makeTool({
+				"actionable-warnings": {
+					files: [
+						{
+							filePath: "/proj/a.ts",
+							warnings: [
+								{
+									severity: "warning",
+									line: 1,
+									message: "ACTIONABLE-WARNING",
+									tool: "runner",
+								},
+							],
+						},
+					],
+				},
+				"code-quality-warnings": {
+					files: [
+						{
+							filePath: "/proj/a.ts",
+							warnings: [
+								{
+									severity: "warning",
+									line: 2,
+									message: "QUALITY-WARNING-TIER",
+									tool: "quality",
+								},
+								{
+									severity: "info",
+									line: 3,
+									message: "QUALITY-INFORMATION-TIER",
+									tool: "quality",
+								},
+								{
+									severity: "hint",
+									line: 4,
+									message: "QUALITY-HINT-TIER",
+									tool: "quality",
+								},
+							],
+						},
+					],
+				},
+			});
+			const text = String(
+				(await run(tool, { mode: "delta", severity })).content[0].text,
+			);
+			for (const message of [
+				"ACTIONABLE-WARNING",
+				"QUALITY-WARNING-TIER",
+				"QUALITY-INFORMATION-TIER",
+				"QUALITY-HINT-TIER",
+			])
+				if (expected.includes(message)) expect(text).toContain(message);
+				else expect(text).not.toContain(message);
+		},
+	);
 
 	it("formats project diagnostics delta records", async () => {
 		// #1634 review round R3: appendProjectDiagnosticsDeltaLines now
@@ -676,6 +1316,301 @@ function sum(
 }
 
 describe("lens_diagnostics mode=full", () => {
+	it("retires only the analysed runner's retained row", async () => {
+		// Both directions: the analysed runner's row goes (R), and a row from a
+		// runner that did NOT analyse this call survives (O). #2154 round 3
+		// asserted only the first, so a filter that retired everything — the
+		// over-correction that silently deletes real findings — stayed green.
+		mockSummaries.push(
+			sum(
+				"/proj/src/stale.ts",
+				{ warnings: 2 },
+				{
+					diagnostics: [
+						{
+							severity: "warning",
+							message: "stale runner finding",
+							line: 4,
+							rule: "jscpd:duplicate-code",
+							tool: "jscpd",
+						},
+						{
+							severity: "warning",
+							message: "retained gitleaks finding",
+							line: 9,
+							rule: "gitleaks:secret",
+							tool: "gitleaks",
+						},
+					],
+				},
+			),
+		);
+		freshFetchMocks.fetchFreshProjectDiagnostics.mockResolvedValue({
+			diagnostics: [],
+			runners: [],
+			analyzed: ["jscpd"],
+			cold: ["gitleaks"],
+			timings: { jscpd: 1 },
+		});
+
+		const result = await run(
+			makeTool({}, { runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]) }),
+			{ mode: "full", refreshRunners: "cached" },
+		);
+
+		const text = String(result.content[0].text);
+		expect(text).not.toContain("stale runner finding");
+		expect(text).toContain("retained gitleaks finding");
+		// #2154 v4: the file's own tally must lose the retired row with it.
+		// Before, the summary kept the stored counts while the row was
+		// filtered out, so full mode rendered "2W … 2 warnings" over a single
+		// visible finding — its own counts and rows disagreeing.
+		expect(text).toContain("src/stale.ts  1W");
+		expect(text).not.toContain("2W");
+	});
+
+	it("logs one bounded phase row when a runner retirement removes rows", async () => {
+		// #2154 v4 F2: retirement must be observable — the LSP arm logs
+		// `lsp_authoritative_widget_retire` twelve lines away, and the runner
+		// arm shipped with nothing, so the exact scenario the reviewer proved
+		// (a runner deleting a real finding) left no trace in any stream.
+		mockSummaries.push(
+			sum(
+				"/proj/src/stale.ts",
+				{ warnings: 1 },
+				{
+					diagnostics: [
+						{
+							severity: "warning",
+							message: "stale runner finding",
+							line: 4,
+							rule: "jscpd:duplicate-code",
+							tool: "jscpd",
+						},
+					],
+				},
+			),
+		);
+		freshFetchMocks.fetchFreshProjectDiagnostics.mockResolvedValue({
+			diagnostics: [],
+			runners: [],
+			analyzed: ["jscpd"],
+			cold: [],
+			timings: { jscpd: 1 },
+		});
+		// The phase ring is process-global; start from a known state so the
+		// assertion is about THIS call.
+		_setRecentPhasesForTest([]);
+
+		await run(
+			makeTool({}, { runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]) }),
+			{ mode: "full", refreshRunners: "cached" },
+		);
+
+		const phases = getRecentLoggedPhases().map((entry) => entry.phase);
+		expect(phases).toContain("runner_authoritative_widget_retire");
+	});
+
+	it("logs no runner retirement row when nothing was retired", async () => {
+		// The bound: one row per call, only when rows were actually removed —
+		// never a row on every healthy mode=full call.
+		mockSummaries.push(
+			sum(
+				"/proj/src/stale.ts",
+				{ warnings: 1 },
+				{
+					diagnostics: [
+						{
+							severity: "warning",
+							message: "retained gitleaks finding",
+							line: 9,
+							rule: "gitleaks:secret",
+							tool: "gitleaks",
+						},
+					],
+				},
+			),
+		);
+		freshFetchMocks.fetchFreshProjectDiagnostics.mockResolvedValue({
+			diagnostics: [],
+			runners: [],
+			analyzed: ["jscpd"],
+			cold: ["gitleaks"],
+			timings: { jscpd: 1 },
+		});
+		_setRecentPhasesForTest([]);
+
+		await run(
+			makeTool({}, { runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]) }),
+			{ mode: "full", refreshRunners: "cached" },
+		);
+
+		const phases = getRecentLoggedPhases().map((entry) => entry.phase);
+		expect(phases).not.toContain("runner_authoritative_widget_retire");
+	});
+
+	it("logs runner coverage retirement evidence once per runner per session", async () => {
+		mockSummaries.push(
+			sum(
+				"/proj/src/clean.py",
+				{ warnings: 1 },
+				{
+					diagnostics: [
+						{
+							severity: "warning",
+							message: "retained",
+							line: 1,
+							rule: "opengrep:x",
+							tool: "opengrep",
+						},
+					],
+				},
+			),
+		);
+		freshFetchMocks.fetchFreshProjectDiagnostics.mockResolvedValue({
+			diagnostics: [],
+			runners: [],
+			analyzed: ["opengrep", "knip"],
+			cold: [],
+			timings: {},
+			authoritativeCoverage: [
+				{
+					runnerId: "opengrep",
+					root: "/proj",
+					files: new Set(["/proj/src/clean.py"]),
+				},
+			],
+		});
+		_setRecentPhasesForTest([]);
+		await run(
+			makeTool({}, { runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]) }),
+			{ mode: "full", refreshRunners: "cached" },
+		);
+		expect(getRecentLoggedPhases().map((entry) => entry.phase)).toContain(
+			"runner_coverage_retired",
+		);
+		const retirement = getRecentLoggedPhases().find(
+			(entry) => entry.phase === "runner_authoritative_widget_retire",
+		);
+		expect(retirement?.metadata?.runners).toBe("opengrep");
+		_setRecentPhasesForTest([]);
+		await run(
+			makeTool({}, { runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]) }),
+			{ mode: "full", refreshRunners: "cached" },
+		);
+		expect(getRecentLoggedPhases().map((entry) => entry.phase)).not.toContain(
+			"runner_coverage_retired",
+		);
+	});
+
+	it("retires only findings covered by an opengrep scanned path", async () => {
+		mockSummaries.push(
+			sum(
+				"/proj/nested/src.ts",
+				{ warnings: 1 },
+				{
+					diagnostics: [
+						{
+							severity: "warning",
+							message: "nested",
+							tool: "opengrep",
+							rule: "opengrep:export",
+						},
+					],
+				},
+			),
+			sum(
+				"/proj/src.ts",
+				{ warnings: 1 },
+				{
+					diagnostics: [
+						{
+							severity: "warning",
+							message: "other root",
+							tool: "opengrep",
+							rule: "opengrep:export",
+						},
+					],
+				},
+			),
+		);
+		freshFetchMocks.fetchFreshProjectDiagnostics.mockResolvedValue({
+			diagnostics: [],
+			runners: [],
+			analyzed: ["opengrep"],
+			cold: [],
+			timings: {},
+			authoritativeCoverage: [
+				{
+					runnerId: "opengrep",
+					root: "/proj/nested",
+					files: new Set(["/proj/nested/src.ts"]),
+				},
+			],
+		});
+		const result = await run(
+			makeTool({}, { runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]) }),
+			{ mode: "full", refreshRunners: "cached" },
+		);
+		const text = String(result.content[0].text);
+		expect(text).not.toContain("nested");
+		expect(text).toContain("other root");
+	});
+
+	it("keeps findings outside a runner file set", async () => {
+		mockSummaries.push(
+			sum(
+				"/proj/inside-set.ts",
+				{ warnings: 1 },
+				{
+					diagnostics: [
+						{
+							severity: "warning",
+							message: "inside-set",
+							tool: "opengrep",
+							rule: "opengrep:duplicate",
+						},
+					],
+				},
+			),
+			sum(
+				"/proj/outside-set.ts",
+				{ warnings: 1 },
+				{
+					diagnostics: [
+						{
+							severity: "warning",
+							message: "outside-set",
+							tool: "opengrep",
+							rule: "opengrep:duplicate",
+						},
+					],
+				},
+			),
+		);
+		freshFetchMocks.fetchFreshProjectDiagnostics.mockResolvedValue({
+			diagnostics: [],
+			runners: [],
+			analyzed: ["opengrep"],
+			cold: [],
+			timings: {},
+			authoritativeCoverage: [
+				{
+					runnerId: "opengrep",
+					root: "/proj",
+					files: new Set(["/proj/inside-set.ts"]),
+				},
+			],
+		});
+		const result = await run(
+			makeTool({}, { runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]) }),
+			{ mode: "full", refreshRunners: "cached" },
+		);
+		const text = String(result.content[0].text);
+		expect(text).not.toContain("inside-set");
+		expect(text).toContain("outside-set");
+	});
+
 	it("runs workspace diagnostics and merges LSP-only files with widget state", async () => {
 		mockSummaries.length = 0;
 		mockSummaries.push(
@@ -1013,6 +1948,30 @@ describe("lens_diagnostics mode=full", () => {
 		expect(reconciledFiles).not.toContain("/proj/src/timed-out.ts");
 	});
 
+	it("records an unreconciled confirmed result once per session and re-arms after reset", async () => {
+		const filePath = "/proj/src/rejected.ts";
+		const lspService = {
+			runWorkspaceDiagnostics: vi
+				.fn()
+				.mockResolvedValue([{ filePath, diagnostics: [], count: 0 }]),
+		};
+		reconcileScanDiagnosticsMock.mockReturnValue(undefined);
+
+		await run(makeTool({}, lspService), { mode: "full" });
+		await run(makeTool({}, lspService), { mode: "full" });
+		const firstSession = getDegradationSummary().find(
+			(group) => group.kind === "diagnostic-retained-unreconciled",
+		);
+		expect(firstSession?.count).toBe(1);
+
+		resetDegradationLedger();
+		await run(makeTool({}, lspService), { mode: "full" });
+		const secondSession = getDegradationSummary().find(
+			(group) => group.kind === "diagnostic-retained-unreconciled",
+		);
+		expect(secondSession?.count).toBe(1);
+	});
+
 	it("does not render an errored LSP file as clean, and distinguishes error from timeout in the note (#630)", async () => {
 		const lspService = {
 			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([
@@ -1236,12 +2195,14 @@ describe("lens_diagnostics mode=full", () => {
 								start: { line: 1, character: 0 },
 								end: { line: 1, character: 5 },
 							},
-							source: "typescript",
+							serverId: "typescript",
+							source: "eslint",
 							code: 2322,
 						},
 						{
 							severity: 2,
 							message: "ast-grep rule hit",
+							serverId: "ast-grep",
 							range: {
 								start: { line: 2, character: 0 },
 								end: { line: 2, character: 5 },
@@ -1805,6 +2766,45 @@ describe("lens_diagnostics mode=full", () => {
 		).toContain("knip");
 	});
 
+	// Recurrence: a real Opengrep partial report can carry findings without a
+	// complete scanned-path set; the renderer must not call that result cold.
+	it("mode=full renders partial Opengrep findings with incomplete coverage", async () => {
+		freshFetchMocks.fetchFreshProjectDiagnostics.mockResolvedValue({
+			diagnostics: [
+				{
+					filePath: "/proj/src/a.py",
+					line: 1,
+					column: 1,
+					severity: "warning",
+					semantic: "warning",
+					tool: "opengrep",
+					runner: "opengrep",
+					rule: "opengrep:danger",
+					message: "partial finding",
+					source: "project-scan",
+				},
+			],
+			runners: ["opengrep"],
+			analyzed: [],
+			cold: [],
+			partial: ["opengrep"],
+			partialReasons: { opengrep: "invalid UTF-8" },
+			timings: { opengrep: 4 },
+		});
+		const result = await run(
+			makeTool({}, { runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]) }),
+			{ mode: "full", refreshRunners: "cached" },
+		);
+		const text = String(result.content[0].text);
+		expect(text).toContain("partial finding");
+		expect(text).toContain("partial coverage (findings included): opengrep");
+		expect(text).toContain("Coverage is incomplete");
+		expect(text).not.toContain("opengrep — not run");
+		expect(
+			(result.details as { partialRunners?: string[] }).partialRunners,
+		).toEqual(["opengrep"]);
+	});
+
 	it("mode=full renders failed analyzers as unknown, not clean (#925)", async () => {
 		const lspService = {
 			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
@@ -1933,6 +2933,29 @@ describe("lens_diagnostics mode=full", () => {
 		// the heavyweight analyzers must still never run — only the rendering
 		// of that skip changed, not the (deliberately cheap) behavior itself.
 		expect(freshFetchMocks.fetchFreshProjectDiagnostics).not.toHaveBeenCalled();
+	});
+
+	// #2535 F1: the same quick-mode note on the MCP host must name the MCP
+	// tool. Drives the real execute with a mocked LSP service (no sweep).
+	it("mode=full without refreshRunners names the MCP tool on the MCP host (#2535)", async () => {
+		mockSummaries.length = 0;
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+		};
+		const tool = makeTool({}, lspService);
+		const result = await tool.execute(
+			"1",
+			{ mode: "full" },
+			new AbortController().signal,
+			null,
+			{ cwd: "/proj", host: "mcp" },
+		);
+		const text = String(result.content[0].text);
+		expect(text).toContain("not run this call (quick mode)");
+		expect(text).toContain("pilens_diagnostics mode=full");
+		// Reject twin: the bare pi name must not appear — the lookbehind
+		// excludes the pilens_ prefix.
+		expect(text).not.toMatch(/(?<![A-Za-z0-9_])lens_diagnostics/);
 	});
 
 	it("mode=full refreshRunners=cached triggers the analyzer fresh-fetch for the resolved cwd (#585)", async () => {
@@ -2220,6 +3243,48 @@ describe("lens_diagnostics mode=full", () => {
 		);
 	});
 
+	it("does not call a lower-order clean result authoritative (#2154)", async () => {
+		mockSummaries.length = 0;
+		mockSummaries.push(
+			sum(
+				"/proj/src/moved.ts",
+				{ blocking: 1, errors: 1 },
+				{
+					diagnostics: [
+						{
+							severity: "error",
+							semantic: "blocking",
+							message: "old line 400 finding",
+							line: 400,
+							rule: "knip:unused",
+						},
+					],
+				},
+			),
+		);
+		reconcileScanDiagnosticsMock.mockReturnValue(false);
+		const result = await run(
+			makeTool(
+				{},
+				{
+					runWorkspaceDiagnostics: vi.fn().mockResolvedValue([
+						{
+							filePath: "/proj/src/moved.ts",
+							diagnostics: [],
+							count: 0,
+							writeIndex: 1,
+						},
+					]),
+				},
+			),
+			{ mode: "full" },
+		);
+		const text = String(result.content[0].text);
+		expect(text).toContain("old line 400 finding");
+		expect(text).toContain("[stale — re-run to confirm]");
+		expect(text).not.toContain("🔴 1 blocking");
+	});
+
 	it("dedups the napi project scan against ast-grep LSP findings despite the source prefix (#308)", async () => {
 		// The ast-grep LSP keys its findings `ast-grep:<id>`; the napi scan (#308)
 		// uses the bare `<id>`. Same violation, same line — must collapse to ONE in
@@ -2363,6 +3428,86 @@ describe("lens_diagnostics mode=all", () => {
 		mockSummaries.length = 0;
 		const result = await run(makeTool(), { mode: "all" });
 		expect(String(result.content[0].text)).toContain("No files diagnosed");
+	});
+
+	it("omits the cwd term for a file with no primary LSP server (#2777 N1)", async () => {
+		// `.txt` has no primary LSP server, so `projectResolvedCwd` leaves
+		// `resolvedCwd` unset. Pre-fix the row rendered the literal
+		// `cwd=undefined`; the term must be absent from the row instead.
+		mockSummaries.push({
+			filePath: "/proj/notes.txt",
+			blocking: 1,
+			errors: 1,
+			warnings: 0,
+			advisories: 0,
+			hasFinalSnapshot: true,
+			diagnostics: [
+				{ severity: "error", semantic: "blocking", message: "boom", line: 1 },
+			],
+		});
+
+		const result = await run(makeTool(), { mode: "all" });
+		const text = String(result.content[0].text);
+		expect(text).toContain("notes.txt");
+		expect(text).toContain("🔴 1 blocking");
+		expect(text).not.toContain("cwd=undefined");
+	});
+
+	it("resolveLspCwdForFile splits primary-server files from non-LSP files (#2777 O1)", async () => {
+		// The O1 seam folds primaryServerId + getServersForFileWithConfig +
+		// resolveLspServerCwd into one call whose absent case is `undefined` —
+		// the shape that makes the N1 render guard structurally sound. The
+		// typescript server's FileDirRoot fallback makes the positive side
+		// deterministic even for a virtual path.
+		const { resolveLspCwdForFile } =
+			await import("../../clients/lsp/config.js");
+		expect(
+			await resolveLspCwdForFile("/proj/notes.txt", "/proj"),
+		).toBeUndefined();
+		expect(await resolveLspCwdForFile("/proj/src/a.ts", "/proj")).toBe(
+			"/proj/src",
+		);
+	});
+
+	it("resolves the primary-server cwd only for rendered rows (#2777 O2)", async () => {
+		// O2 moved the projection below the withIssues filter: a summary with
+		// nothing to render must not pay the root resolution. The `.txt` row
+		// has no findings at all (dropped by withIssues), the `.ts` row
+		// renders — so the seam is called exactly once, for the rendered file.
+		// Pre-O2 the projection ran over every summary and the count was 2.
+		const config = await import("../../clients/lsp/config.js");
+		const seamSpy = vi.spyOn(config, "resolveLspCwdForFile");
+		try {
+			mockSummaries.push({
+				filePath: "/proj/src/a.ts",
+				blocking: 1,
+				errors: 1,
+				warnings: 0,
+				advisories: 0,
+				hasFinalSnapshot: true,
+				diagnostics: [
+					{ severity: "error", semantic: "blocking", message: "boom", line: 1 },
+				],
+			});
+			mockSummaries.push({
+				filePath: "/proj/empty.txt",
+				blocking: 0,
+				errors: 0,
+				warnings: 0,
+				advisories: 0,
+				hasFinalSnapshot: true,
+				diagnostics: [],
+			});
+
+			const result = await run(makeTool(), { mode: "all" });
+			const text = String(result.content[0].text);
+			expect(text).toContain("src/a.ts");
+			expect(text).not.toContain("empty.txt");
+			expect(seamSpy).toHaveBeenCalledTimes(1);
+			expect(seamSpy.mock.calls[0]?.[0]).toBe("/proj/src/a.ts");
+		} finally {
+			seamSpy.mockRestore();
+		}
 	});
 
 	it("reports clean after a same-file backslash reconcile clears a forward-slash blocker (#1020)", async () => {
@@ -2640,14 +3785,14 @@ describe("lens_diagnostics mode=all", () => {
 		expect(String(result.content[0].text)).toContain("pending");
 	});
 
-	it("severity=warning excludes blocking/error-only files", async () => {
+	it("severity=warning includes blocking/error-only files", async () => {
 		mockSummaries.length = 0;
 		mockSummaries.push(sum("/proj/a.ts", { blocking: 1 }));
 		mockSummaries.push(sum("/proj/b.ts", { warnings: 2 }));
 		const result = await run(makeTool(), { mode: "all", severity: "warning" });
 		const text = String(result.content[0].text);
 		expect(text).toContain("b.ts");
-		expect(text).not.toContain("a.ts");
+		expect(text).toContain("a.ts");
 	});
 
 	it("severity=all shows all issue types", async () => {
@@ -2897,6 +4042,75 @@ describe("lens_diagnostics mode=all", () => {
 		expect(text).toContain("BOOM error here");
 		expect(text).not.toContain("minor warning here");
 	});
+
+	it.each([
+		["error", ["error-tier"]],
+		["warning", ["error-tier", "warning-tier"]],
+		[
+			"information",
+			["error-tier", "warning-tier", "info-tier", "note-tier", "help-tier"],
+		],
+		[
+			"hint",
+			[
+				"error-tier",
+				"warning-tier",
+				"info-tier",
+				"note-tier",
+				"help-tier",
+				"hint-tier",
+			],
+		],
+		[
+			"all",
+			[
+				"error-tier",
+				"warning-tier",
+				"info-tier",
+				"note-tier",
+				"help-tier",
+				"hint-tier",
+			],
+		],
+	])(
+		"mode=all applies the requested severity threshold: %s",
+		async (severity, expected) => {
+			mockSummaries.length = 0;
+			const diagnostics = [
+				"error",
+				"warning",
+				"info",
+				"note",
+				"help",
+				"hint",
+			].map((tier) => ({
+				severity: tier,
+				semantic: tier === "error" ? "blocking" : undefined,
+				message: `${tier}-tier`,
+				line: 1,
+			}));
+			mockSummaries.push(
+				sum(
+					"/proj/mixed.ts",
+					{ blocking: 1, errors: 1, warnings: 1, advisories: 2 },
+					{ diagnostics },
+				),
+			);
+			const text = String(
+				(await run(makeTool(), { mode: "all", severity })).content[0].text,
+			);
+			for (const message of expected) expect(text).toContain(message);
+			for (const message of [
+				"error-tier",
+				"warning-tier",
+				"info-tier",
+				"note-tier",
+				"help-tier",
+				"hint-tier",
+			])
+				if (!expected.includes(message)) expect(text).not.toContain(message);
+		},
+	);
 });
 
 // ── paths scope restrictor (#461) ───────────────────────────────────────────────
@@ -3014,6 +4228,58 @@ describe("lens_diagnostics paths", () => {
 				expect.objectContaining({ files: [fileA, fileB] }),
 			);
 		} finally {
+			removeTempDirSync(cwd);
+		}
+	});
+
+	it("mode=full: an explicitly named ignored file remains visible to an audit", async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-diag-audit-"));
+		try {
+			const ignoredFile = path.join(cwd, "ignored", "secret.env");
+			fs.mkdirSync(path.dirname(ignoredFile), { recursive: true });
+			fs.writeFileSync(ignoredFile, "SECRET=real-shaped-value\n");
+			fs.writeFileSync(
+				path.join(cwd, ".pi-lens.json"),
+				JSON.stringify({ ignore: ["ignored/**"] }),
+			);
+			resetProjectLensConfigCache();
+			const lspService = {
+				runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
+			};
+			mockSummaries.push(
+				sum(
+					ignoredFile,
+					{ advisories: 1 },
+					{
+						diagnostics: [
+							{
+								severity: "info",
+								semantic: "none",
+								tool: "gitleaks",
+								rule: "gitleaks:generic-api-key",
+								message: "ignored audit finding [git: ignored]",
+								line: 1,
+							},
+						],
+					},
+				),
+			);
+			const tool = createLensDiagnosticsTool(
+				makeCacheManager({}) as any,
+				() => cwd,
+				() => lspService as any,
+			);
+			const result = await tool.execute(
+				"1",
+				{ mode: "full", refreshRunners: "cheap", paths: [ignoredFile] },
+				new AbortController().signal,
+				null,
+				{ cwd },
+			);
+
+			expect(String(result.content[0].text)).toContain("ignored audit finding");
+		} finally {
+			resetProjectLensConfigCache();
 			removeTempDirSync(cwd);
 		}
 	});
@@ -3199,7 +4465,7 @@ describe("lens_diagnostics paths", () => {
 		}
 	});
 
-	it("errors clearly when paths exceeds the 200-entry cap", async () => {
+	it("errors clearly when paths exceeds the 100-entry cap", async () => {
 		const many = Array.from({ length: 201 }, (_, i) => `/proj/src/f${i}.ts`);
 		const result = (await run(makeTool(), { mode: "all", paths: many })) as {
 			content: [{ type: "text"; text: string }];
@@ -3207,7 +4473,7 @@ describe("lens_diagnostics paths", () => {
 		};
 		expect(result.isError).toBe(true);
 		const text = String(result.content[0].text);
-		expect(text).toContain("200");
+		expect(text).toContain("100");
 	});
 
 	it("mode=full: a nonexistent path produces the skipped-note without throwing", async () => {

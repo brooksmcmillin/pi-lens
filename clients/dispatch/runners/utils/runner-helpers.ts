@@ -46,6 +46,7 @@ import {
 } from "../../../package-manager.js";
 import { logLatency } from "../../../latency-logger.js";
 import { safeSpawnAsync } from "../../../safe-spawn.js";
+import { probeToolAsync } from "../../../tool-probe.js";
 import { compareOrdinal } from "../../../string-utils.js";
 import {
 	getToolCommandSpec,
@@ -53,6 +54,7 @@ import {
 } from "../../../tool-policy.js";
 import type { DispatchContext } from "../../types.js";
 import { isInSpawnTimeoutCooldown } from "../../../spawn-timeout-cooldown.js";
+import { resolveToolCwd } from "../../../tool-cwd.js";
 import { createAvailabilityProbeFlight } from "../../../availability-probe-flight.js";
 import {
 	type AvailabilityCause,
@@ -1822,7 +1824,7 @@ async function probeAstGrepCommandAsync(
 	let check: Awaited<ReturnType<typeof safeSpawnAsync>>;
 	let hostStallMs: number;
 	try {
-		check = await safeSpawnAsync(cmd, [...argsPrefix, "--version"], {
+		check = await probeToolAsync(cmd, [...argsPrefix, "--version"], {
 			timeout: 5000,
 		});
 	} finally {
@@ -2162,7 +2164,7 @@ export async function resolveLocalFirstAsync(
 	if (globalBin) return { cmd: globalBin, args: [] };
 
 	// 3. Global PATH (already installed system-wide, on PATH)
-	const globalCheck = await safeSpawnAsync(toolName, ["--version"], {
+	const globalCheck = await probeToolAsync(toolName, ["--version"], {
 		timeout: 3000,
 	});
 	if (!globalCheck.error && globalCheck.status === 0) {
@@ -2184,3 +2186,8 @@ export const sg = {
 	isAvailableAsync: isSgAvailableAsync,
 	getCommand: getSgCommand,
 };
+
+/** Shared cwd seam for runner probes and analysis children (#2777). */
+export function resolveRunnerCwd(ctx: DispatchContext, tool: string): string {
+	return resolveToolCwd("runner", tool, ctx.filePath, ctx).cwd;
+}

@@ -1,4 +1,5 @@
 import { safeSpawnAsync } from "../../safe-spawn.js";
+import { logRunnerAdvisoryOnce, resolveRunnerCwd } from "../../tool-cwd.js";
 import {
 	getLinterPolicyForCwd,
 	markdownlintConfigArgs,
@@ -118,7 +119,7 @@ const markdownlintRunner: RunnerDefinition = {
 	skipTestFiles: false,
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
-		const cwd = ctx.cwd || process.cwd();
+		const cwd = resolveRunnerCwd(ctx, "markdownlint");
 		const policy = getLinterPolicyForCwd(ctx.filePath, cwd);
 		if (policy && !policy.preferredRunners.includes("markdownlint")) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
@@ -136,7 +137,10 @@ const markdownlintRunner: RunnerDefinition = {
 		// its budget in another lane (availability verify, autofix --fix). Skip
 		// without spawning — "not checked", never re-reported as clean.
 		if (isInSpawnTimeoutCooldown(cmd)) {
-			ctx.log(
+			logRunnerAdvisoryOnce(
+				ctx,
+				"markdownlint",
+				cwd,
 				`markdownlint: ${cmd} is cooling down after a spawn timeout — skipping (one bounded failure budget per edit)`,
 			);
 			return { status: "skipped", diagnostics: [], semantic: "none" };

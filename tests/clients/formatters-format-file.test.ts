@@ -14,16 +14,66 @@ async function loadFormatFile() {
 	const mod = await import("../../clients/formatters.js");
 	return {
 		formatFile: mod.formatFile,
+		biome: mod.biomeFormatter,
+		prettier: mod.prettierFormatter,
+		oxfmt: mod.oxfmtFormatter,
 		formatter: mod.terragruntHclFormatter,
 		rubocop: mod.rubocopFormatter,
+		ktlint: mod.ktlintFormatter,
 	};
 }
 
 describe("formatFile", () => {
-	beforeEach(() => {
+	let getDegradationSummary: () => unknown;
+	let resetDegradationLedger: () => void;
+	beforeEach(async () => {
 		vi.resetModules();
 		safeSpawnAsync.mockReset();
+		({ getDegradationSummary, resetDegradationLedger } =
+			await import("../../clients/degradation-ledger.js"));
+		resetDegradationLedger();
 	});
+
+	it.each(["prettier", "biome", "oxfmt"] as const)(
+		"runs %s from the project root so cwd-relative ignores are honored",
+		async (name) => {
+			const env = setupTestEnvironment(`pi-lens-format-${name}-`);
+			try {
+				const nestedDir = path.join(env.tmpDir, "sub", "deep");
+				const filePath = path.join(nestedDir, "app.ts");
+				fs.mkdirSync(nestedDir, { recursive: true });
+				fs.mkdirSync(path.join(env.tmpDir, "node_modules", ".bin"), {
+					recursive: true,
+				});
+				fs.writeFileSync(
+					path.join(env.tmpDir, "node_modules", ".bin", name),
+					"",
+				);
+				fs.writeFileSync(path.join(env.tmpDir, ".gitignore"), "ignored.md\n");
+				fs.writeFileSync(
+					path.join(env.tmpDir, ".prettierignore"),
+					"ignored-by-prettier.md\n",
+				);
+				fs.writeFileSync(filePath, "function f() {\n  return 1;\n}\n");
+				safeSpawnAsync.mockResolvedValue({
+					status: 0,
+					stdout: "",
+					stderr: "",
+				});
+
+				const mod = await loadFormatFile();
+				await mod.formatFile(filePath, mod[name]);
+
+				expect(safeSpawnAsync).toHaveBeenCalledWith(
+					expect.any(String),
+					expect.any(Array),
+					expect.objectContaining({ cwd: env.tmpDir }),
+				);
+			} finally {
+				env.cleanup();
+			}
+		},
+	);
 
 	// A formatter that never ran leaves the file byte-identical, which is
 	// indistinguishable from "already formatted" unless the exit status is part
@@ -115,6 +165,99 @@ describe("formatFile", () => {
 
 			expect(result.success).toBe(true);
 			expect(result.changed).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("declines a Gradle-managed ktlint before the formatter resolver runs", async () => {
+		const env = setupTestEnvironment("pi-lens-format-ktlint-agreement-");
+		try {
+			const filePath = path.join(env.tmpDir, "App.kt");
+			fs.writeFileSync(filePath, 'fun main() { println("hi") }\n');
+			fs.writeFileSync(
+				path.join(env.tmpDir, "build.gradle"),
+				'plugins { id "org.jlleitschuh.gradle.ktlint" version "12.1.1" }\n',
+			);
+
+			const { formatFile, ktlint } = await loadFormatFile();
+			const result = await formatFile(filePath, ktlint);
+
+			expect(result).toMatchObject({
+				success: true,
+				changed: false,
+				outcome: "unavailable",
+				error: expect.stringContaining("agreement could not be established"),
+			});
+			expect(safeSpawnAsync).not.toHaveBeenCalled();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("declines a Node formatter when the lockfile disagrees with its pin", async () => {
+		const env = setupTestEnvironment("pi-lens-format-node-agreement-");
+		try {
+			const filePath = path.join(env.tmpDir, "app.ts");
+			fs.writeFileSync(filePath, "a { color: red; }\n");
+			fs.writeFileSync(
+				path.join(env.tmpDir, "package.json"),
+				JSON.stringify({ devDependencies: { "@biomejs/biome": "^1.0.0" } }),
+			);
+			fs.writeFileSync(
+				path.join(env.tmpDir, "package-lock.json"),
+				JSON.stringify({
+					packages: { "node_modules/@biomejs/biome": { version: "0.0.0" } },
+				}),
+			);
+
+			const { formatFile, biome } = await loadFormatFile();
+			const result = await formatFile(filePath, biome);
+
+			expect(result).toMatchObject({
+				success: true,
+				changed: false,
+				outcome: "unavailable",
+				error: expect.stringContaining("agreement could not be established"),
+			});
+			expect(safeSpawnAsync).not.toHaveBeenCalled();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("records one agreement decline for 200 formatter-path files", async () => {
+		const env = setupTestEnvironment(
+			"pi-lens-format-ktlint-agreement-bounded-",
+		);
+		try {
+			fs.writeFileSync(
+				path.join(env.tmpDir, "build.gradle"),
+				'plugins { id "org.jlleitschuh.gradle.ktlint" version "12.1.1" }\n',
+			);
+			const { formatFile, ktlint } = await loadFormatFile();
+			for (let index = 0; index < 200; index += 1) {
+				const filePath = path.join(env.tmpDir, `App${index}.kt`);
+				fs.writeFileSync(filePath, "fun main() {}\n");
+				await formatFile(filePath, ktlint);
+			}
+
+			const agreementRecords = (
+				getDegradationSummary() as Array<{ kind: string }>
+			).filter((record) => record.kind === "formatter-agreement-unavailable");
+			expect(agreementRecords).toEqual([
+				{
+					kind: "formatter-agreement-unavailable",
+					count: 1,
+					droppedCount: 0,
+					latestReasons: [
+						{
+							subject: "kotlin:gradle-ktlint",
+							reason: expect.stringContaining("cannot be established"),
+						},
+					],
+				},
+			]);
 		} finally {
 			env.cleanup();
 		}
@@ -244,6 +387,7 @@ describe("formatFile honors SKIP_FORMATTING (#1144)", () => {
 		try {
 			const filePath = path.join(env.tmpDir, "formatted.js");
 			fs.writeFileSync(filePath, "const value = 1;\n");
+			fs.writeFileSync(path.join(env.tmpDir, ".gitignore"), "ignored.md\n");
 			const mod = await import("../../clients/formatters.js");
 			const formatter = {
 				...mod.prettierFormatter,

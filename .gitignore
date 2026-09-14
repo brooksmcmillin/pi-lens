@@ -4,6 +4,11 @@ features.md
 
 # pi-lens internal
 .pi-lens/
+.stryker/
+reports/
+# Test-run scratch dirs (vitest spawn helpers create `.tmp/pi-lens-test-*`
+# under the repo root; never tracked).
+.tmp/
 # Probe-home redirect target (#2506): getGlobalPiLensLogDir() sends the logs
 # of a probe run without a PI_LENS_HOME pin here instead of the real
 # ~/.pi-lens. Untracked by design -- if it were not ignored, every agent
@@ -64,6 +69,7 @@ migrate-*.js
 
 # Documentation files - only keep specific docs in public repo
 *.md
+!tests/fixtures/ci-pr-bodies/*.md
 !CLAUDE.md
 !tests/fixtures/changelog-entries/*.md
 !.changelog/*.md
@@ -76,10 +82,13 @@ migrate-*.js
 !LICENSE
 !SECURITY.md
 !docs/pi-lens-subagent.md
+!docs/pi-lens-monitor.md
 !docs/pi-lens-fixer.md
 !docs/pi-lens-reviewer.md
 !docs/pi-lens-investigator.md
 !docs/pi-lens-warden.md
+!docs/pi-lens-monitor.md
+!docs/real-harness.md
 !docs/audit1.md
 !docs/agent-guide.md
 !docs/agent-tools.md
@@ -121,6 +130,7 @@ migrate-*.js
 # Local-only docs (not in git or npm)
 docs/plans/
 internal_docs/
+!docs/pi-lens-monitor.md
 
 # Auto-generated reports (CAPS)
 ANALYSIS_*.md
@@ -184,3 +194,6 @@ tests/native-ts7-live-*/
 
 # prepack backup of package.json (scripts/strip-dev-deps-for-pack.mjs)
 .pack-backup/
+
+# Probe hygiene home for tests and scripts (AGENTS.md "Probe hygiene"); never tracked.
+.probe-home/

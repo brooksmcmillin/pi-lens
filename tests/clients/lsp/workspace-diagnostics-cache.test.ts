@@ -34,10 +34,15 @@ import {
 	saveProjectSnapshot,
 } from "../../../clients/project-snapshot.js";
 import { removeTempDirSync } from "../test-utils.js";
+import {
+	getDegradationSummary,
+	resetDegradationLedger,
+} from "../../../clients/degradation-ledger.js";
 
 let tmp: string;
 
 beforeEach(() => {
+	resetDegradationLedger();
 	tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-cache-"));
 	// Legacy per-project data dir marker so the cache file writes INSIDE tmp
 	// (cleaned up by afterEach) instead of the real global ~/.pi-lens dir.
@@ -72,6 +77,26 @@ describe("loadWorkspaceDiagnosticsCache / saveWorkspaceDiagnosticsCache (#671)",
 		expect(loaded?.entries["/a.ts"]).toEqual(entry);
 	});
 
+	it("records content and scan freshness without duplicate provenance", () => {
+		const filePath = path.join(tmp, "a.ts");
+		fs.writeFileSync(filePath, "const a = 1;\n");
+		const context = createWorkspaceDiagnosticsCacheContext(tmp);
+		context.record(
+			filePath,
+			buildScopeKey("all"),
+			[],
+			fs.statSync(filePath).mtimeMs,
+			hashDiagnosticContent("const a = 1;\n"),
+			fs.statSync(filePath).size,
+		);
+		context.persist();
+		const entry = Object.values(
+			loadWorkspaceDiagnosticsCache(tmp)!.entries,
+		)[0]!;
+		expect(entry).not.toHaveProperty("provenance");
+		expect(entry.contentHash).toBe(hashDiagnosticContent("const a = 1;\n"));
+	});
+
 	it("fails open (undefined) when nothing has been cached yet", () => {
 		expect(loadWorkspaceDiagnosticsCache(tmp)).toBeUndefined();
 	});
@@ -96,6 +121,16 @@ describe("loadWorkspaceDiagnosticsCache / saveWorkspaceDiagnosticsCache (#671)",
 		expect(loadWorkspaceDiagnosticsCache(tmp)).toBeUndefined();
 	});
 
+	it("fails open on a v2 cache so provenance-less diagnostics are re-collected (#2776)", () => {
+		saveWorkspaceDiagnosticsCache(tmp, {
+			version: WORKSPACE_DIAGNOSTICS_CACHE_VERSION - 1,
+			entries: { "/a.ts": makeEntry() },
+		});
+		// Old records still parse safely, but the strict cache consumer refuses
+		// to serve them because their diagnostics have no serverId provenance.
+		expect(loadWorkspaceDiagnosticsCache(tmp)).toBeUndefined();
+	});
+
 	it("fails open when entries is missing/malformed", () => {
 		const cacheFile = path.join(
 			tmp,
@@ -109,6 +144,59 @@ describe("loadWorkspaceDiagnosticsCache / saveWorkspaceDiagnosticsCache (#671)",
 			JSON.stringify({ version: WORKSPACE_DIAGNOSTICS_CACHE_VERSION }),
 		);
 		expect(loadWorkspaceDiagnosticsCache(tmp)).toBeUndefined();
+	});
+
+	it("rejects only a v3 entry whose diagnostic lacks serverId (#2776)", () => {
+		saveWorkspaceDiagnosticsCache(tmp, {
+			version: WORKSPACE_DIAGNOSTICS_CACHE_VERSION,
+			entries: {
+				bad: makeEntry({
+					diagnostics: [
+						{
+							severity: 1,
+							message: "missing provenance",
+							range: {
+								start: { line: 0, character: 0 },
+								end: { line: 0, character: 1 },
+							},
+						},
+					],
+				}),
+				good: makeEntry({
+					diagnostics: [
+						{
+							severity: 1,
+							message: "kept",
+							range: {
+								start: { line: 0, character: 0 },
+								end: { line: 0, character: 1 },
+							},
+							serverId: "typescript",
+						},
+					],
+				}),
+			},
+		});
+
+		expect(loadWorkspaceDiagnosticsCache(tmp)?.entries).toEqual(
+			expect.objectContaining({ good: expect.anything() }),
+		);
+		expect(loadWorkspaceDiagnosticsCache(tmp)?.entries.bad).toBeUndefined();
+	});
+
+	it("records one bounded migration degradation with the old version and entry count (#2776)", () => {
+		saveWorkspaceDiagnosticsCache(tmp, {
+			version: 2,
+			entries: { a: makeEntry(), b: makeEntry() },
+		});
+		expect(loadWorkspaceDiagnosticsCache(tmp)).toBeUndefined();
+		expect(loadWorkspaceDiagnosticsCache(tmp)).toBeUndefined();
+		const group = getDegradationSummary().find(
+			(entry) => entry.kind === "lsp-workspace-cache-migration",
+		);
+		expect(group?.count).toBe(1);
+		expect(group?.latestReasons[0]?.reason).toContain("v2");
+		expect(group?.latestReasons[0]?.reason).toContain("2 entries");
 	});
 });
 
@@ -345,6 +433,7 @@ describe("WorkspaceDiagnosticsCacheContext (#671)", () => {
 					start: { line: 0, character: 0 },
 					end: { line: 0, character: 1 },
 				},
+				serverId: "typescript",
 			},
 		];
 
@@ -895,29 +984,38 @@ describe("per-file dependency-index coverage in isEntryFresh (#1814)", () => {
 // second sweep's call count directly proves whether the cache short-circuited
 // the per-file touch loop.
 
-const getServersForFileWithConfig = vi.fn();
-const createLSPClient = vi.fn();
-vi.mock("../../../clients/lsp/config.js", () => ({
+const { getServersForFileWithConfig, createLSPClient } = vi.hoisted(() => ({
+	getServersForFileWithConfig: vi.fn(),
+	createLSPClient: vi.fn(),
+}));
+vi.mock("../../../clients/lsp/config.js", async (importOriginal) => ({
+	...(await importOriginal()),
 	getServersForFileWithConfig,
 	getServerInitOverride: vi.fn().mockReturnValue(undefined),
 }));
-vi.mock("../../../clients/lsp/client.js", () => ({ createLSPClient }));
+vi.mock("../../../clients/lsp/client.js", async (importOriginal) => ({
+	...(await importOriginal()),
+	createLSPClient,
+}));
 
-function makeTsServer(root: string) {
+import { LSPService } from "../../../clients/lsp/index.js";
+
+function makeTsServer(root: string, id = "typescript", extension = ".ts") {
 	return {
-		id: "typescript",
-		name: "typescript",
-		extensions: [".ts"],
+		id,
+		name: id,
+		extensions: [extension],
 		root: async () => root,
 		spawn: vi.fn(async () => ({ process: {}, source: "test" })),
 	};
 }
 
-function makeFakeClient(root: string) {
+function makeFakeClient(root: string, serverId = "typescript") {
 	const waitCalls: Array<{ filePath: string; ms: number }> = [];
 	return {
 		client: {
 			isAlive: () => true,
+			isDocumentOpen: () => true,
 			shutdown: async () => {},
 			getWorkspaceDiagnosticsSupport: () => ({
 				advertised: false,
@@ -925,7 +1023,7 @@ function makeFakeClient(root: string) {
 				diagnosticProviderKind: "none",
 			}),
 			getOperationSupport: () => ({}),
-			serverId: "typescript",
+			serverId,
 			root,
 			notify: { open: vi.fn(async () => {}) },
 			waitForDiagnostics: vi.fn(async (filePath: string, ms: number) => {
@@ -976,6 +1074,34 @@ describe("runWorkspaceDiagnostics cache integration (#671)", () => {
 		expect(waitCalls.length).toBe(callsAfterFirstSweep);
 	});
 
+	it("freshly touches an uncovered language instead of serving its cache entry", async () => {
+		const file = path.join(tmpSweep, "main.py");
+		fs.writeFileSync(file, "value = 1\n");
+		const pythonServer = makeTsServer(tmpSweep, "python", ".py");
+		getServersForFileWithConfig.mockImplementation((fp: string) =>
+			fp.endsWith(".py") ? [pythonServer] : [],
+		);
+		const { client, waitCalls } = makeFakeClient(tmpSweep, "python");
+		createLSPClient.mockResolvedValue(client);
+
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+		await service.runWorkspaceDiagnostics(tmpSweep, { files: [file] });
+		const callsAfterFirstSweep = waitCalls.length;
+		const touchFile = vi.spyOn(service, "touchFile");
+
+		await service.runWorkspaceDiagnostics(tmpSweep, { files: [file] });
+
+		// Python is an LSP-backed language, but this fixture has no import-facts
+		// coverage. The scoped cache entry is therefore ineligible on repeat.
+		expect(waitCalls.length).toBeGreaterThanOrEqual(callsAfterFirstSweep);
+		expect(touchFile).toHaveBeenCalledWith(
+			file,
+			expect.any(String),
+			expect.objectContaining({ source: "lens_diagnostics_full" }),
+		);
+	});
+
 	it("a changed file still gets a fresh touch on the second sweep; unchanged siblings stay cached", async () => {
 		const names = ["a.ts", "b.ts", "c.ts"];
 		for (const n of names) {
@@ -1006,6 +1132,149 @@ describe("runWorkspaceDiagnostics cache integration (#671)", () => {
 		// two unchanged files were served from cache again.
 		expect(waitCalls.length).toBe(callsAfterFirstSweep + 1);
 		expect(waitCalls[waitCalls.length - 1]?.filePath).toBe(changed);
+	});
+
+	it("does not replay a cached result when the scoped dependency touch cap trips (#2817 round 2 F2)", async () => {
+		const importer = path.join(tmpSweep, "importer.ts");
+		const dependencies = Array.from({ length: 40 }, (_, i) =>
+			path.join(tmpSweep, `dep-${i}.ts`),
+		);
+		fs.writeFileSync(importer, "export const importer = 1;\n");
+		for (const dependency of dependencies)
+			fs.writeFileSync(dependency, "export const dependency = 1;\n");
+		const importerStat = fs.statSync(importer);
+		const stale: WorkspaceDiagnosticsCacheEntry["diagnostics"][number] = {
+			severity: 1,
+			message: "stale cached diagnostic",
+			range: {
+				start: { line: 0, character: 0 },
+				end: { line: 0, character: 1 },
+			},
+			serverId: "typescript",
+		};
+		saveProjectSnapshot(tmpSweep, {
+			version: PROJECT_SNAPSHOT_VERSION,
+			projectRoot: tmpSweep,
+			generatedAt: new Date().toISOString(),
+			seq: 1,
+			files: {
+				[cacheKeyFor(importer)]: {
+					path: importer,
+					mtimeMs: importerStat.mtimeMs,
+					size: importerStat.size,
+					imports: dependencies,
+					lastSeq: 1,
+				},
+			},
+			symbols: {},
+			reverseDeps: {},
+			cachedExports: [],
+		});
+		saveWorkspaceDiagnosticsCache(tmpSweep, {
+			version: WORKSPACE_DIAGNOSTICS_CACHE_VERSION,
+			entries: {
+				[cacheKeyFor(importer)]: {
+					diagnostics: [stale],
+					count: 1,
+					mtimeMs: importerStat.mtimeMs,
+					scannedAt: Date.now() + 60_000,
+					scopeKey: buildScopeKey("all", ["opengrep"]),
+					depIndexAtScan: true,
+				},
+			},
+		});
+		const tsServer = makeTsServer(tmpSweep);
+		getServersForFileWithConfig.mockReturnValue([tsServer]);
+		const { client } = makeFakeClient(tmpSweep);
+		createLSPClient.mockResolvedValue(client);
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+		for (const dependency of dependencies) {
+			await service.touchFile(
+				dependency,
+				await fs.promises.readFile(dependency, "utf8"),
+				{
+					diagnostics: "none",
+					clientScope: "primary",
+					source: "lsp_test_setup",
+				},
+			);
+		}
+		const result = await service.runWorkspaceDiagnostics(tmpSweep, {
+			files: [importer],
+		});
+		// The requested-file result must not be the stale cached diagnostic.
+		expect(result.flatMap((entry) => entry.diagnostics)).not.toEqual(
+			expect.arrayContaining([stale]),
+		);
+	});
+
+	it("freshly scans an admissible cached TypeScript file absent from importer facts (#2817 F3/F6)", async () => {
+		const file = path.join(tmpSweep, "uncovered.ts");
+		fs.writeFileSync(file, "export const uncovered = 1;\n");
+		const stat = fs.statSync(file);
+		saveProjectSnapshot(tmpSweep, {
+			version: PROJECT_SNAPSHOT_VERSION,
+			projectRoot: tmpSweep,
+			generatedAt: new Date().toISOString(),
+			seq: 1,
+			files: {
+				[cacheKeyFor(path.join(tmpSweep, "other.ts"))]: {
+					path: path.join(tmpSweep, "other.ts"),
+					mtimeMs: 0,
+					size: 0,
+					imports: [],
+					lastSeq: 1,
+				},
+			},
+			symbols: {},
+			reverseDeps: {},
+			cachedExports: [],
+		});
+		saveWorkspaceDiagnosticsCache(tmpSweep, {
+			version: WORKSPACE_DIAGNOSTICS_CACHE_VERSION,
+			entries: {
+				[cacheKeyFor(file)]: {
+					diagnostics: [
+						{
+							severity: 1,
+							message: "stale uncovered diagnostic",
+							range: {
+								start: { line: 0, character: 0 },
+								end: { line: 0, character: 1 },
+							},
+							serverId: "typescript",
+						},
+					],
+					count: 1,
+					mtimeMs: stat.mtimeMs,
+					scannedAt: Date.now(),
+					scopeKey: buildScopeKey("all", ["opengrep"]),
+					// The cache entry is otherwise admissible. The missing
+					// `imports[file]` key is the uncovered-facts condition this
+					// guard prevents from being served as a confirmed hit.
+					depIndexAtScan: false,
+				},
+			},
+		});
+		const tsServer = makeTsServer(tmpSweep);
+		getServersForFileWithConfig.mockReturnValue([tsServer]);
+		const { client, waitCalls } = makeFakeClient(tmpSweep);
+		createLSPClient.mockResolvedValue(client);
+		const cacheContext = createWorkspaceDiagnosticsCacheContext(tmpSweep);
+		expect(
+			cacheContext.lookup(file, buildScopeKey("all", ["opengrep"])),
+		).toBeDefined();
+		expect(cacheContext.importsFor(file)).toBeUndefined();
+		const result = await new LSPService().runWorkspaceDiagnostics(tmpSweep, {
+			files: [file],
+		});
+		expect(waitCalls.some((call) => call.filePath === file)).toBe(true);
+		expect(result.flatMap((entry) => entry.diagnostics)).not.toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ message: "stale uncovered diagnostic" }),
+			]),
+		);
 	});
 
 	// #1095 (P2-1): the SERVICE sweep must apply the same content-binding gate the
@@ -1049,6 +1318,51 @@ describe("runWorkspaceDiagnostics cache integration (#671)", () => {
 		// The mismatched entry was NOT served — a.ts (the only file) fell through to
 		// a fresh touch. A served cache hit would have produced zero wait calls.
 		expect(waitCalls.length).toBeGreaterThan(0);
+	});
+
+	it("re-collects a provenance-less v2 entry instead of replaying it (#2776)", async () => {
+		const file = path.join(tmpSweep, "a.ts");
+		fs.writeFileSync(file, "const z = 1;\n");
+		const stat = fs.statSync(file);
+		saveWorkspaceDiagnosticsCache(tmpSweep, {
+			version: WORKSPACE_DIAGNOSTICS_CACHE_VERSION - 1,
+			entries: {
+				[cacheKeyFor(file)]: {
+					diagnostics: [
+						{
+							severity: 1,
+							message: "old primary finding",
+							range: {
+								start: { line: 0, character: 0 },
+								end: { line: 0, character: 1 },
+							},
+						},
+					],
+					count: 1,
+					mtimeMs: stat.mtimeMs,
+					scannedAt: Date.now(),
+					scopeKey: buildScopeKey("all", ["opengrep"]),
+				},
+			},
+		});
+
+		const tsServer = makeTsServer(tmpSweep);
+		getServersForFileWithConfig.mockImplementation((fp: string) =>
+			fp.endsWith(".ts") ? [tsServer] : [],
+		);
+		const { client, waitCalls } = makeFakeClient(tmpSweep);
+		createLSPClient.mockResolvedValue(client);
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+		await service.runWorkspaceDiagnostics(tmpSweep);
+
+		expect(waitCalls.length).toBeGreaterThan(0);
+		const callsAfterMigration = waitCalls.length;
+		expect(loadWorkspaceDiagnosticsCache(tmpSweep)?.version).toBe(
+			WORKSPACE_DIAGNOSTICS_CACHE_VERSION,
+		);
+		await service.runWorkspaceDiagnostics(tmpSweep);
+		expect(waitCalls.length).toBe(callsAfterMigration);
 	});
 });
 

@@ -232,6 +232,8 @@ or timer with "if it throws / if it never returns" columns (#2649 r3). Both
 tables found sites the prescribed patch would have missed. Fix everything the
 table exposes in the same round; a table that finds nothing is quoted too.
 
+**Every test id in a PR-body table must exist.** Every test id, probe id or fixture name you write into a state-space, writers-by-axis or population table must be a grep-able `it(` title or file name in the tree at handoff; the orchestrator greps each id before accepting the round, and a table whose ids do not exist is a fabricated claim that fails the round (2026-09-10: #2877 r3 and #2868 r3 each shipped a 48- to 72-cell table with zero real ids).
+
 **A governance exemption added in a fix round is a finding until the reviewer
 clears it.** Name each one in the review-round section with the reason the
 file demands and why it is a registration rather than silencing (#2654 r2
@@ -296,7 +298,7 @@ verify brief asked for exactly that judgement).
   a full extra round.
 
 - **Run the pinned oxfmt on your diff before push.** Agent worktrees usually
-  lack the oxfmt binary, so CI's advisory format check is the first time your
+  lack the oxfmt binary, so CI's gating format check is the first time your
   files meet the formatter — and two fixers in one day shipped unformatted
   test files while calling the red check "a pre-existing environment gap."
   Before push: `npm install oxfmt --no-save` at the devDependency-pinned
@@ -344,6 +346,24 @@ Before `npm install` or `npm ci` in an agent worktree, export
 `PILENS_DATA_DIR=<your worktree>/.probe-home`. The install lifecycle's warm
 loader log honors that home, but an explicit `PI_LENS_INSTALL_LOG` pin remains
 the clearest choice for tests that inspect the record.
+
+## Never `git add -A` (2026-09-12)
+
+Your deliverables — `PR_BODY.md`, `COMMIT_MSG.txt`, any report the brief asks
+for — are written at the WORKSPACE ROOT, which in a worktree delegation is also
+the REPO ROOT. They are gitignored, so `git add -A` tracks a gitignored file and
+reds `tests/config/gitignore-tracked-shadow.test.ts` with
+`expected [ 'PR_BODY.md' ] to deeply equal []`. Three separate lanes did this in
+one day and each cost the orchestrator a trailing commit to untrack.
+
+Stage the source files your change actually touches, by name. Before you commit,
+run `git status --porcelain` and read it: anything you cannot name a reason for
+does not belong in the commit. After committing,
+`git ls-files | grep -E 'PR_BODY|COMMIT_MSG'` must print nothing.
+
+The same care applies to build output, `.probe-home/`, and any scratch fixture
+you created while measuring — a fix round's diff is the change, not the residue
+of making it.
 
 ## Before you call it done
 

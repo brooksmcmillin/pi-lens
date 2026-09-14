@@ -67,9 +67,14 @@ const _installerRequire = createRequire(import.meta.url);
 
 import { createGunzip } from "node:zlib";
 import { TRANSIENT_MAX_COOLDOWN_MS } from "../dispatch/runners/utils/availability-policy.js";
-import { recordDegradationOnce } from "../degradation-ledger.js";
+import {
+	getDegradationLedgerGeneration,
+	recordDegradationOnce,
+} from "../degradation-ledger.js";
 import { commitDurableStoreAsync } from "../durable-store.js";
 import { getGlobalPiLensDir } from "../file-utils.js";
+import { createGenerationMap } from "../generation-guard.js";
+import { resolveToolCwd } from "../tool-cwd.js";
 import {
 	allAvailableGlobalBinDirs,
 	installArgs,
@@ -80,6 +85,7 @@ import {
 	resetSafeSpawnWindowsCommandCache,
 	safeSpawnAsync,
 } from "../safe-spawn.js";
+import { probeToolAsync } from "../tool-probe.js";
 import { logSessionStart } from "../sessionstart-logger.js";
 
 // Global installation directory for pi-lens tools
@@ -273,6 +279,8 @@ interface GitHubAssetSpec {
 	 * so the `ktlint` jar must land next to it (#218).
 	 */
 	extraAssets?: (platform: string, arch: string) => string[];
+	/** Runtime wrapper for a platform asset that is a PHAR or runnable JAR. */
+	launcher?: "php" | "java";
 }
 
 /**
@@ -303,8 +311,8 @@ export interface ArchiveSpec {
 	 *   arch:     "x64" | "arm64" | ...
 	 */
 	url: string | ((platform: string, arch: string) => string | undefined);
-	/** Archive kind — both extracted via `tar` (Windows bsdtar handles zip too). */
-	kind: "tgz" | "zip";
+	/** Archive kind, or a platform/arch resolver for releases that vary by OS. */
+	kind: "tgz" | "zip" | ((platform: string, arch: string) => "tgz" | "zip");
 	/**
 	 * Launcher path relative to the archive's top-level dir (which is stripped on
 	 * extraction), e.g. "bin/spotbugs". On win32 the installer resolves the
@@ -402,6 +410,142 @@ const OS_ARCH_ZIP_ASSETS = {
 	win32: { x64: "windows_amd64.zip", arm64: "windows_arm64.zip" },
 };
 
+type ManagedPackageFormatterSpec = {
+	id: string;
+	name: string;
+	installStrategy: "npm" | "pip";
+	packageName: string;
+};
+
+function managedPackageFormatterTool(
+	spec: ManagedPackageFormatterSpec,
+): ToolDefinition {
+	return {
+		id: spec.id,
+		name: spec.name,
+		checkCommand: spec.id,
+		checkArgs: ["--version"],
+		installStrategy: spec.installStrategy,
+		packageName: spec.packageName,
+		binaryName: spec.id,
+	};
+}
+
+const MANAGED_PACKAGE_FORMATTERS = [
+	{ id: "black", name: "Black", installStrategy: "pip", packageName: "black" },
+	{
+		id: "cmake-format",
+		name: "cmake-format",
+		installStrategy: "pip",
+		packageName: "cmakelang",
+	},
+	{ id: "oxfmt", name: "oxfmt", installStrategy: "npm", packageName: "oxfmt" },
+] satisfies ManagedPackageFormatterSpec[];
+
+type ManagedGitHubFormatterSpec = {
+	id: string;
+	name: string;
+	owner: string;
+	repo: string;
+	assetPattern: GitHubAssetSpec["assetMatch"];
+	kind: "binary" | "phar" | "jar";
+	binaryInArchive?: string;
+};
+
+function managedGitHubFormatterTool(
+	spec: ManagedGitHubFormatterSpec,
+): ToolDefinition {
+	return {
+		id: spec.id,
+		name: spec.name,
+		checkCommand: spec.id,
+		checkArgs: ["--version"],
+		installStrategy: "github",
+		binaryName: spec.id,
+		github: {
+			repo: `${spec.owner}/${spec.repo}`,
+			assetMatch: spec.assetPattern,
+			...(spec.binaryInArchive && { binaryInArchive: spec.binaryInArchive }),
+			...(spec.kind === "phar" && { launcher: "php" as const }),
+			...(spec.kind === "jar" && { launcher: "java" as const }),
+		},
+	};
+}
+
+const MANAGED_GITHUB_FORMATTERS = [
+	{
+		id: "stylua",
+		name: "StyLua",
+		owner: "JohnnyMorganz",
+		repo: "StyLua",
+		assetPattern: archAssetMatch({
+			linux: { x64: "linux-x86_64.zip", arm64: "linux-aarch64.zip" },
+			darwin: { x64: "macos-x86_64.zip", arm64: "macos-aarch64.zip" },
+			win32: { x64: "windows-x86_64.zip" },
+		}),
+		kind: "binary",
+		binaryInArchive: "stylua",
+	},
+	{
+		id: "php-cs-fixer",
+		name: "PHP CS Fixer",
+		owner: "PHP-CS-Fixer",
+		repo: "PHP-CS-Fixer",
+		assetPattern: (platform) =>
+			platform === "linux" || platform === "darwin" || platform === "win32"
+				? "php-cs-fixer.phar"
+				: undefined,
+		kind: "phar",
+	},
+	{
+		id: "cljfmt",
+		name: "cljfmt",
+		owner: "weavejester",
+		repo: "cljfmt",
+		assetPattern: (platform, arch) => {
+			if (platform === "linux")
+				return arch === "arm64"
+					? "standalone.jar"
+					: "linux-amd64-static.tar.gz";
+			if (platform === "darwin") return "standalone.jar";
+			if (platform === "win32") return "win-amd64.zip";
+			return undefined;
+		},
+		kind: "jar",
+		binaryInArchive: "cljfmt",
+	},
+] satisfies ManagedGitHubFormatterSpec[];
+
+const MANAGED_MAVEN_FORMATTERS = [
+	{
+		id: "google-java-format",
+		name: "google-java-format",
+		groupId: "com.google.googlejavaformat",
+		artifactId: "google-java-format",
+		version: "1.27.0",
+		classifier: "all-deps",
+	},
+];
+
+function managedMavenFormatterTool(
+	spec: (typeof MANAGED_MAVEN_FORMATTERS)[number],
+): ToolDefinition {
+	return {
+		id: spec.id,
+		name: spec.name,
+		checkCommand: spec.id,
+		checkArgs: ["--version"],
+		installStrategy: "maven",
+		binaryName: spec.id,
+		maven: {
+			groupId: spec.groupId,
+			artifactId: spec.artifactId,
+			version: spec.version,
+			classifier: spec.classifier,
+		},
+	};
+}
+
 export const TOOLS: ToolDefinition[] = [
 	// Core LSP servers
 	{
@@ -450,6 +594,7 @@ export const TOOLS: ToolDefinition[] = [
 		packageName: "prettier",
 		binaryName: "prettier",
 	},
+	...MANAGED_PACKAGE_FORMATTERS.map(managedPackageFormatterTool),
 	{
 		id: "ruff",
 		name: "Ruff",
@@ -876,6 +1021,8 @@ export const TOOLS: ToolDefinition[] = [
 			// bare binary, no archive
 		},
 	},
+	...MANAGED_GITHUB_FORMATTERS.map(managedGitHubFormatterTool),
+	...MANAGED_MAVEN_FORMATTERS.map(managedMavenFormatterTool),
 	{
 		id: "rust-analyzer",
 		name: "rust-analyzer",
@@ -1105,7 +1252,7 @@ export const TOOLS: ToolDefinition[] = [
 						: `${base}/lua-language-server-${version}-win32-x64.zip`;
 				return undefined;
 			},
-			kind: "zip",
+			kind: (platform) => (platform === "win32" ? "zip" : "tgz"),
 			stripComponents: 0,
 			treeMarker: "bin",
 		},
@@ -1565,6 +1712,7 @@ export function getInstallFailureReason(toolId: string): string | undefined {
  *
  *   * `succeeded`  — an install ran and reported success.
  *   * `failed`     — an install ran and did not succeed. The retry candidate.
+ *   * `unavailable` — the install cannot run on this platform. Nothing ran.
  *   * `declined`   — policy said no: kill switch, `allowInstall: false`, project
  *                    trust, an unknown tool id. Nothing ran.
  *   * `skipped`    — another process holds the install lock. Nothing ran.
@@ -1572,6 +1720,7 @@ export function getInstallFailureReason(toolId: string): string | undefined {
 export type InstallAttemptOutcome =
 	| "succeeded"
 	| "failed"
+	| "unavailable"
 	| "declined"
 	| "skipped";
 
@@ -1929,28 +2078,18 @@ function isAstGrepVersionOutput(output: string): boolean {
 }
 
 async function verifyAstGrepProbePath(binPath: string): Promise<boolean> {
-	return new Promise((resolve) => {
-		let proc: ReturnType<typeof spawn>;
-		try {
-			proc = spawn(binPath, ["--version"], {
-				stdio: ["ignore", "pipe", "pipe"],
-				shell: process.platform === "win32" && /\.(cmd|bat)$/i.test(binPath),
-				timeout: 5000,
-			});
-		} catch {
-			// SYNCHRONOUS spawn throw (Windows `spawn UNKNOWN`/EINVAL, the pidusage
-			// bug class, #533) — best-effort probe, resolve rather than reject.
-			resolve(false);
-			return;
-		}
-		let output = "";
-		proc.stdout?.on("data", (data) => (output += data));
-		proc.stderr?.on("data", (data) => (output += data));
-		proc.on("exit", (code) => {
-			resolve(code === 0 && isAstGrepVersionOutput(output));
-		});
-		proc.on("error", () => resolve(false));
+	// #2894: through the probe seam rather than a hand-rolled `spawn` promise.
+	// `probeToolAsync` already owns the synchronous-throw case (#533), the
+	// Windows `.cmd`/`.bat` resolution this used `shell: true` for, and the
+	// timeout tree-kill a bare `spawn({ timeout })` does not do.
+	const result = await probeToolAsync(binPath, ["--version"], {
+		timeout: 5000,
 	});
+	return (
+		!result.error &&
+		result.status === 0 &&
+		isAstGrepVersionOutput(`${result.stdout}${result.stderr}`)
+	);
 }
 
 // Exported for testing only.
@@ -2544,30 +2683,15 @@ export async function getAllToolStatuses(): Promise<ToolStatus[]> {
 			status.installed = true;
 			status.source = "global-path";
 			status.path = tool.checkCommand;
-			// Try to get version
-			const versionResult = await new Promise<string>((resolve) => {
-				let proc: ReturnType<typeof spawn>;
-				try {
-					proc = spawn(tool.checkCommand, ["--version"], {
-						stdio: ["ignore", "pipe", "pipe"],
-						shell: process.platform === "win32",
-						timeout: 5000,
-					});
-				} catch {
-					// SYNCHRONOUS spawn throw (Windows `spawn UNKNOWN`/EINVAL, the
-					// pidusage bug class, #533) — best-effort, resolve empty version.
-					resolve("");
-					return;
-				}
-				let out = "";
-				proc.stdout?.on("data", (d) => (out += d));
-				proc.stderr?.on("data", (d) => (out += d));
-				proc.on("exit", () =>
-					resolve(out.trim().split("\n")[0]?.slice(0, 30) || ""),
-				);
-				proc.on("error", () => resolve(""));
+			// Try to get version — through the probe seam (#2894), which owns the
+			// synchronous-throw case (#533) and the timeout tree-kill that a bare
+			// `spawn({ timeout })` promise did not do.
+			const probe = await probeToolAsync(tool.checkCommand, ["--version"], {
+				timeout: 5000,
 			});
-			status.version = versionResult || undefined;
+			status.version =
+				`${probe.stdout}${probe.stderr}`.trim().split("\n")[0]?.slice(0, 30) ||
+				undefined;
 			statuses.push(status);
 			continue;
 		}
@@ -3030,6 +3154,15 @@ function getGitHubInstalledBinaryName(
 	return `${binaryName}.exe`;
 }
 
+function launcherForGitHubAsset(
+	spec: GitHubAssetSpec,
+	assetName: string,
+): "php" | "java" | undefined {
+	if (spec.launcher === "php" && assetName.endsWith(".phar")) return "php";
+	if (spec.launcher === "java" && assetName.endsWith(".jar")) return "java";
+	return undefined;
+}
+
 function getArchiveBinaryCandidates(
 	binaryName: string,
 	platform: string,
@@ -3126,13 +3259,15 @@ async function findPipUserToolPath(
 	verificationArgs: string[] = ["--version"],
 	verificationTimeoutMs = 10_000,
 ): Promise<string | undefined> {
-	const isWindows = process.platform === "win32";
-	const userBaseCandidates = await getPythonUserBaseCandidates();
+	const isWindows = installerPlatform() === "win32";
+	const userBaseCandidates = [
+		path.join(getGlobalPiLensDir(), "pip-tools"),
+		path.join(getGlobalPiLensDir(), "pip-user"),
+		...(await getPythonUserBaseCandidates()),
+	];
 
 	for (const userBase of userBaseCandidates) {
-		const scriptDirs: string[] = [
-			path.join(userBase, isWindows ? "Scripts" : "bin"),
-		];
+		const scriptDirs: string[] = [pipScriptsDir(userBase, installerPlatform())];
 
 		if (isWindows) {
 			try {
@@ -3489,12 +3624,43 @@ async function installGitHubTool(
 		platform,
 		asset.name,
 	);
-	const destPath = path.join(GITHUB_BIN_DIR, finalBinaryName);
+	let destPath = path.join(GITHUB_BIN_DIR, finalBinaryName);
 
 	const assetName = asset.name;
+	const launcherRuntime = launcherForGitHubAsset(spec, assetName);
+	if (
+		launcherRuntime &&
+		!(await isCommandAvailable(launcherRuntime, ["--version"]))
+	) {
+		logSessionStart(
+			`github-install ${tool.id}: ${launcherRuntime} not found — asset requires a runtime launcher`,
+		);
+		return undefined;
+	}
 
 	try {
-		if (assetName.endsWith(".gz") && !assetName.endsWith(".tar.gz")) {
+		if (launcherRuntime) {
+			const assetPath = path.join(
+				GITHUB_BIN_DIR,
+				`${tool.id}${assetName.endsWith(".phar") ? ".phar" : ".jar"}`,
+			);
+			await writeFileAtomicAsync(assetPath, assetBuffer, {
+				bestEffort: false,
+				mode: 0o750,
+			});
+			const launcherName = isWindows ? `${binaryName}.bat` : binaryName;
+			destPath = path.join(GITHUB_BIN_DIR, launcherName);
+			const runtimeTarget = assetName.endsWith(".phar")
+				? `${tool.id}.phar`
+				: `${tool.id}.jar`;
+			const command = isWindows
+				? `@echo off\r\n${launcherRuntime} "%~dp0${runtimeTarget}" %*\r\n`
+				: `#!/bin/sh\nexec ${launcherRuntime} "$(dirname "$0")/${runtimeTarget}" "$@"\n`;
+			await writeFileAtomicAsync(destPath, command, {
+				bestEffort: false,
+				mode: isWindows ? undefined : 0o750,
+			});
+		} else if (assetName.endsWith(".gz") && !assetName.endsWith(".tar.gz")) {
 			// Bare gzip (e.g. rust-analyzer-x86_64-unknown-linux-gnu.gz) — decompress directly
 			const decompressed = await new Promise<Buffer>((resolve, reject) => {
 				const gunzip = createGunzip();
@@ -3933,7 +4099,7 @@ async function probeManagedToolVersion(
 	const cached = (await readProbeCache())[tool.id];
 	if (!cached?.path || !existsSync(cached.path)) return undefined;
 	try {
-		const result = await safeSpawnAsync(cached.path, tool.checkArgs, {
+		const result = await probeToolAsync(cached.path, tool.checkArgs, {
 			timeout: getToolVerificationTimeout(tool),
 			input: "",
 			ignoreAmbientSignal: true,
@@ -4277,7 +4443,14 @@ async function refreshPackageManagerManagedTool(
 		tool.installStrategy === "pip"
 			? // `-U` is the whole fix: without it pip treats the installed copy as
 				// satisfying the requirement and the day-one version never moves.
-				await installPipTool(tool.id, tool.packageName, { upgrade: true })
+				await installPipTool(
+					tool.id,
+					tool.packageName,
+					tool.binaryName ?? tool.id,
+					{
+						upgrade: true,
+					},
+				)
 			: // `gem install` always fetches the newest version that satisfies the
 				// requirement, so the install command IS the upgrade command.
 				await installGemTool(tool.id, tool.packageName);
@@ -4508,10 +4681,49 @@ async function installMavenTool(
  */
 export function resolveArchiveUrl(
 	spec: ArchiveSpec,
-	platform: string = process.platform,
+	platform: string = installerPlatform(),
 	arch: string = process.arch,
 ): string | undefined {
 	return typeof spec.url === "function" ? spec.url(platform, arch) : spec.url;
+}
+
+/** Resolve the archive format independently from the extractor implementation. */
+export function resolveArchiveKind(
+	spec: ArchiveSpec,
+	platform: string = installerPlatform(),
+	arch: string = process.arch,
+): "tgz" | "zip" {
+	return typeof spec.kind === "function"
+		? spec.kind(platform, arch)
+		: spec.kind;
+}
+
+function recordArchiveExtractionDegradation(
+	toolId: string,
+	format: "tgz" | "zip",
+	reason: string,
+): void {
+	recordDegradationOnce({
+		kind: "managed-tool-install",
+		subject: `${toolId}:${format}`,
+		reason: `archive extraction ${reason}`,
+	});
+}
+
+async function stripExtractedArchiveRoot(
+	dir: string,
+	components: number,
+): Promise<boolean> {
+	for (let i = 0; i < components; i++) {
+		const entries = await fs.readdir(dir, { withFileTypes: true });
+		const [entry] = entries;
+		if (entries.length !== 1 || !entry?.isDirectory()) return false;
+		const root = path.join(dir, entry.name);
+		for (const child of await fs.readdir(root))
+			await fs.rename(path.join(root, child), path.join(dir, child));
+		await fs.rm(root, { recursive: true, force: true });
+	}
+	return true;
 }
 
 /**
@@ -4593,9 +4805,11 @@ async function installArchiveTool(
 	const spec = tool.archive;
 	if (!spec) return undefined;
 	const binaryName = tool.binaryName ?? tool.id;
-	const isWindows = process.platform === "win32";
+	const platform = installerPlatform();
+	const isWindows = platform === "win32";
+	const archiveKind = resolveArchiveKind(spec, platform, process.arch);
 
-	const url = resolveArchiveUrl(spec);
+	const url = resolveArchiveUrl(spec, platform, process.arch);
 	if (!url) {
 		logSessionStart(
 			`archive-install ${tool.id}: no archive for ${process.platform}/${process.arch} — unsupported, skipping`,
@@ -4631,7 +4845,7 @@ async function installArchiveTool(
 	// installed copy is now untouched until the replacement is proven good.
 	const extractName = tool.id;
 	const tmpExtractName = `${extractName}.refresh-tmp`;
-	const archiveName = `${tool.id}.download.${spec.kind === "zip" ? "zip" : "tgz"}`;
+	const archiveName = `${tool.id}.download.${archiveKind === "zip" ? "zip" : "tgz"}`;
 	const extractDir = path.join(TOOLS_DIR, extractName);
 	const tmpExtractDir = path.join(TOOLS_DIR, tmpExtractName);
 	const tmpArchive = path.join(TOOLS_DIR, archiveName);
@@ -4650,35 +4864,78 @@ async function installArchiveTool(
 		// dir — stripping would flatten/merge its sibling module folders — so the
 		// flag is omitted. bsdtar handles both .tgz and .zip with -xf.
 		const stripComponents = spec.stripComponents ?? 1;
-		const tarArgs = [
-			spec.kind === "tgz" ? "-xzf" : "-xf",
-			archiveName,
-			"-C",
-			tmpExtractName,
-			...(stripComponents > 0 ? [`--strip-components=${stripComponents}`] : []),
-		];
+		const extractionArgs =
+			archiveKind === "zip" && isWindows
+				? [
+						"-NoProfile",
+						"-Command",
+						`Expand-Archive -LiteralPath '${archiveName}' -DestinationPath '${tmpExtractName}' -Force`,
+					]
+				: archiveKind === "zip"
+					? ["-q", "-o", archiveName, "-d", tmpExtractName]
+					: [
+							"-xzf",
+							archiveName,
+							"-C",
+							tmpExtractName,
+							...(stripComponents > 0
+								? [`--strip-components=${stripComponents}`]
+								: []),
+						];
 		// Resolve `tar` to an absolute path on Windows (System32\tar.exe is the
 		// bsdtar shipped with Windows 10+) so extraction can't be hijacked via a
 		// writable PATH entry — same hardening as the taskkill spawn. On POSIX `tar`
 		// is a trusted coreutil whose absolute path varies by distro, so it stays
 		// bare (consistent with every other tool spawn).
-		const tarBin = isWindows
-			? `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\tar.exe`
-			: "tar";
-		const extractResult = await safeSpawnAsync(tarBin, tarArgs, {
+		const extractor =
+			archiveKind === "zip" && isWindows
+				? `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`
+				: archiveKind === "zip"
+					? "unzip"
+					: isWindows
+						? `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\tar.exe`
+						: "tar";
+		const extractionResult = await safeSpawnAsync(extractor, extractionArgs, {
 			cwd: TOOLS_DIR,
 			timeout: 120_000,
 			ignoreAmbientSignal: true,
 			lifetimeCoupled: true,
 		});
 		const extracted = {
-			ok: extractResult.status === 0,
-			stderr: extractResult.error?.message ?? extractResult.stderr,
+			ok: extractionResult.status === 0,
+			reason:
+				extractionResult.spawnFailure?.kind === "tool-not-found"
+					? "extractor-unavailable"
+					: extractionResult.spawnFailure
+						? "extractor-error"
+						: "extractor-exit",
 		};
 		await fs.rm(tmpArchive, { force: true });
 		if (!extracted.ok) {
+			recordArchiveExtractionDegradation(
+				tool.id,
+				archiveKind,
+				extracted.reason,
+			);
 			logSessionStart(
-				`archive-install ${tool.id}: extraction failed: ${extracted.stderr} — keeping installed version`,
+				`archive-install ${tool.id}: ${archiveKind} extraction failed (${extracted.reason}) — keeping installed version`,
+			);
+			await fs
+				.rm(tmpExtractDir, { recursive: true, force: true })
+				.catch(() => {});
+			return undefined;
+		}
+		if (
+			archiveKind === "zip" &&
+			!(await stripExtractedArchiveRoot(tmpExtractDir, stripComponents))
+		) {
+			recordArchiveExtractionDegradation(
+				tool.id,
+				archiveKind,
+				"layout-invalid",
+			);
+			logSessionStart(
+				`archive-install ${tool.id}: ${archiveKind} layout invalid — keeping installed version`,
 			);
 			await fs
 				.rm(tmpExtractDir, { recursive: true, force: true })
@@ -4697,8 +4954,13 @@ async function installArchiveTool(
 			try {
 				await fs.access(tmpMarker);
 			} catch {
+				recordArchiveExtractionDegradation(
+					tool.id,
+					archiveKind,
+					"marker-missing",
+				);
 				logSessionStart(
-					`archive-install ${tool.id}: tree marker not found at ${tmpMarker} after extraction — keeping installed version`,
+					`archive-install ${tool.id}: ${archiveKind} marker missing after extraction — keeping installed version`,
 				);
 				await fs
 					.rm(tmpExtractDir, { recursive: true, force: true })
@@ -4723,8 +4985,13 @@ async function installArchiveTool(
 		try {
 			await fs.access(tmpResolvedInner);
 		} catch {
+			recordArchiveExtractionDegradation(
+				tool.id,
+				archiveKind,
+				"launcher-missing",
+			);
 			logSessionStart(
-				`archive-install ${tool.id}: launcher not found at ${tmpResolvedInner} after extraction — keeping installed version`,
+				`archive-install ${tool.id}: ${archiveKind} launcher missing after extraction — keeping installed version`,
 			);
 			await fs
 				.rm(tmpExtractDir, { recursive: true, force: true })
@@ -4794,12 +5061,23 @@ function recordPackageManagerInstallException(
 	packageName: string,
 	err: unknown,
 ): undefined {
-	const message = (err as Error).message;
+	const message = boundInstallError((err as Error).message);
 	logSessionStart(
 		`auto-install ${strategyLabel} ${packageName}: exception: ${message}`,
 	);
 	installFailureReasons.set(toolId, message);
 	return undefined;
+}
+
+const INSTALL_ERROR_LINE_LIMIT = 1000;
+const INSTALL_CANDIDATE_ERROR_LIMIT = 200;
+
+function boundInstallError(
+	value: string,
+	limit = INSTALL_ERROR_LINE_LIMIT,
+): string {
+	const line = value.replace(/[\r\n]+/g, " ").trim();
+	return line.length > limit ? `${line.slice(0, limit - 3)}...` : line;
 }
 
 async function installNpmTool(
@@ -5030,27 +5308,34 @@ export function pipCommandCandidates(): string[] {
 		: ["pip3", "pip", "python3", "python"];
 }
 
+/** Resolve the script directory used by a Python installation on each OS. */
+export function pipScriptsDir(
+	base: string,
+	platform: NodeJS.Platform = installerPlatform(),
+): string {
+	return path.join(base, platform === "win32" ? "Scripts" : "bin");
+}
+
+const pipPep668LoggedRefusals = createGenerationMap("installer-pep668-log");
+
 /**
  * Install a pip package tool
  */
 async function installPipTool(
 	toolId: string,
 	packageName: string,
+	binaryName: string,
 	/**
 	 * Add `-U`, turning the install into an upgrade. Without it `pip install`
 	 * treats an already-present package as satisfied and leaves the day-one
 	 * version in place forever — the freeze #1747 is about. The flag is the ONLY
-	 * difference between install and refresh: same command ladder, same
-	 * `--user` target, so a refresh can never write somewhere the install would
-	 * not have.
+	 * difference between install and refresh within each selected environment.
 	 */
 	options: { upgrade?: boolean } = {},
 ): Promise<string | undefined> {
 	try {
-		const isWindows = process.platform === "win32";
-		const verb = options.upgrade
-			? ["install", "-U", "--user"]
-			: ["install", "--user"];
+		const isWindows = installerPlatform() === "win32";
+		const verb = options.upgrade ? ["install", "-U"] : ["install"];
 		// Built from `pipCommandCandidates()` — the single source of truth this
 		// module and any other caller (the tool-smoke lane's toolchain-presence
 		// probe, #2661 review) share, rather than a second, independently
@@ -5063,26 +5348,159 @@ async function installPipTool(
 					: ["-m", "pip", ...verb, packageName],
 		}));
 
-		let lastError = "";
-		for (const candidate of pipCandidates) {
-			const pipResult = await safeSpawnAsync(
-				candidate.command,
-				candidate.args,
-				{
-					timeout: 120_000,
-					ignoreAmbientSignal: true,
-					lifetimeCoupled: true,
-				},
-			);
-			const outcome = {
-				ok: pipResult.status === 0,
-				error: (pipResult.error?.message ?? pipResult.stderr).trim(),
-			};
+		const pep668 = /externally-managed-environment/i;
+		const refuse = (strategy: string, reason: string): void => {
+			if (!pep668.test(reason)) return;
+			const subject = `${toolId}:${strategy}`;
+			recordDegradationOnce({
+				kind: "pip-pep668-strategy-refused",
+				subject,
+				reason,
+			});
+			const logKey = `${getDegradationLedgerGeneration()}:${subject}`;
+			if (pipPep668LoggedRefusals.current(logKey) === 0) {
+				pipPep668LoggedRefusals.bump(logKey);
+				logSessionStart(
+					`auto-install pip ${packageName}: ${strategy} refused by PEP 668 (${boundInstallError(reason)})`,
+				);
+			}
+		};
+		const succeeded = (strategy: string, binaryPath: string): string => {
+			recordDegradationOnce({
+				kind: "pip-install-strategy-succeeded",
+				subject: `${toolId}:${strategy}`,
+				reason: binaryPath,
+			});
+			return binaryPath;
+		};
+		const run = (command: string, args: string[], env?: NodeJS.ProcessEnv) =>
+			safeSpawnAsync(command, args, {
+				timeout: 120_000,
+				ignoreAmbientSignal: true,
+				lifetimeCoupled: true,
+				cwd: resolveToolCwd("runner", toolId, getGlobalPiLensDir(), {
+					cwd: getGlobalPiLensDir(),
+					suppressTelemetry: true,
+				}).cwd,
+				...(env ? { env } : {}),
+			});
+		const addBinToPath = async (
+			binDir: string,
+		): Promise<string | undefined> => {
+			try {
+				await fs.access(binDir);
+			} catch {
+				return undefined;
+			}
+			const currentPath = process.env.PATH || process.env.Path || "";
+			const separator = isWindows ? ";" : path.delimiter;
+			if (
+				!currentPath
+					.toLowerCase()
+					.split(separator)
+					.includes(binDir.toLowerCase())
+			) {
+				const updatedPath = `${binDir}${separator}${currentPath}`;
+				process.env.PATH = updatedPath;
+				if (isWindows) process.env.Path = updatedPath;
+			}
+			const names = isWindows
+				? [`${binaryName}.exe`, `${binaryName}.cmd`, binaryName]
+				: [binaryName];
+			for (const name of names) {
+				const candidate = path.join(binDir, name);
+				try {
+					await fs.access(candidate);
+					return candidate;
+				} catch {
+					// continue
+				}
+			}
+			return undefined;
+		};
 
-			if (outcome.ok) {
-				// Ensure user-level scripts directory is available in current process PATH.
-				// This helps tools installed via `pip install --user` become immediately callable.
-				const userBaseResult = await new Promise<string>((resolve) => {
+		if (await isCommandAvailable("pipx")) {
+			const result = await run("pipx", [
+				options.upgrade ? "upgrade" : "install",
+				packageName,
+			]);
+			const error = (result.error?.message ?? result.stderr).trim();
+			if (result.status === 0) {
+				const location = await run("pipx", [
+					"environment",
+					"--value",
+					"PIPX_BIN_DIR",
+				]);
+				const binDir =
+					location.status === 0 && location.stdout.trim()
+						? location.stdout.trim()
+						: path.join(os.homedir(), ".local", "bin");
+				const binaryPath = await addBinToPath(binDir);
+				if (binaryPath) return succeeded("pipx", binaryPath);
+				throw new Error(
+					`pipx installed ${packageName} but ${binaryName} is not resolvable`,
+				);
+			}
+			refuse("pipx", error);
+		}
+
+		const pythonCandidates = pipCandidates.filter(
+			({ command }) =>
+				command === "python3" || command === "python" || command === "py",
+		);
+		const pythonAvailability = await Promise.all(
+			pythonCandidates.map(({ command }) => isCommandAvailable(command)),
+		);
+		const availablePythonCandidates = pythonCandidates.filter(
+			(_, index) => pythonAvailability[index],
+		);
+		const venvRoot = path.join(getGlobalPiLensDir(), "pip-tools");
+		for (const candidate of availablePythonCandidates) {
+			const venvBin = pipScriptsDir(venvRoot, installerPlatform());
+			let venvPip = path.join(venvBin, isWindows ? "pip.exe" : "pip");
+			try {
+				await fs.access(venvPip);
+			} catch {
+				const created = await run(candidate.command, ["-m", "venv", venvRoot]);
+				const error = (created.error?.message ?? created.stderr).trim();
+				if (created.status !== 0) {
+					refuse("venv", error || "python venv module unavailable");
+					continue;
+				}
+			}
+			try {
+				await fs.access(venvPip);
+			} catch {
+				venvPip = path.join(venvBin, isWindows ? "pip.cmd" : "pip3");
+				try {
+					await fs.access(venvPip);
+				} catch {
+					continue;
+				}
+			}
+			const result = await run(venvPip, [...verb, packageName]);
+			const error = (result.error?.message ?? result.stderr).trim();
+			if (result.status === 0) {
+				const binaryPath = await addBinToPath(venvBin);
+				if (binaryPath) return succeeded("venv", binaryPath);
+				throw new Error(
+					`venv installed ${packageName} but ${binaryName} is not resolvable`,
+				);
+			}
+			refuse("venv", error);
+		}
+
+		const candidateErrors: string[] = [];
+		let userRefused = false;
+		for (const candidate of pipCandidates) {
+			const args =
+				candidate.command === "pip" || candidate.command === "pip3"
+					? [...verb, "--user", packageName]
+					: ["-m", "pip", ...verb, "--user", packageName];
+			const result = await run(candidate.command, args);
+			const error = (result.error?.message ?? result.stderr).trim();
+			if (result.status === 0) {
+				const base = await new Promise<string>((resolve) => {
 					let probe: ReturnType<typeof spawn>;
 					try {
 						probe = spawn(candidate.command, ["-m", "site", "--user-base"], {
@@ -5090,83 +5508,66 @@ async function installPipTool(
 							shell: isWindows,
 						});
 					} catch {
-						// SYNCHRONOUS spawn throw (Windows `spawn UNKNOWN`/EINVAL, the
-						// pidusage bug class, #533) — best-effort probe, resolve empty.
 						resolve("");
 						return;
 					}
 					let stdout = "";
 					probe.stdout?.on("data", (data) => (stdout += data));
-					probe.on("exit", (code) => {
-						if (code === 0) resolve(stdout.trim());
-						else resolve("");
-					});
+					probe.on("exit", (code) => resolve(code === 0 ? stdout.trim() : ""));
 					probe.on("error", () => resolve(""));
 				});
-
-				if (userBaseResult) {
-					const candidateScriptDirs: string[] = [
-						path.join(userBaseResult, isWindows ? "Scripts" : "bin"),
-					];
-
-					if (isWindows) {
-						// Some Python setups report USER_BASE as ...\Roaming\Python,
-						// while scripts live in ...\Roaming\Python\PythonXY\Scripts.
-						try {
-							const children = await fs.readdir(userBaseResult, {
-								withFileTypes: true,
-							});
-							for (const entry of children) {
-								if (!entry.isDirectory()) continue;
-								if (!/^python\d+$/i.test(entry.name)) continue;
-								candidateScriptDirs.push(
-									path.join(userBaseResult, entry.name, "Scripts"),
-								);
-							}
-						} catch {
-							// ignore
-						}
-					}
-
-					const currentPath =
-						process.env.PATH || process.env.Path || process.env.path || "";
-					const separator = isWindows ? ";" : ":";
-					const normalizedPath = currentPath
-						.toLowerCase()
-						.split(separator)
-						.map((p) => p.trim());
-
-					for (const scriptsDir of candidateScriptDirs) {
-						try {
-							await fs.access(scriptsDir);
-							if (!normalizedPath.includes(scriptsDir.toLowerCase())) {
-								const existingPath =
-									process.env.PATH ||
-									process.env.Path ||
-									process.env.path ||
-									"";
-								const updatedPath = `${scriptsDir}${separator}${existingPath}`;
-								process.env.PATH = updatedPath;
-								if (isWindows) {
-									process.env.Path = updatedPath;
-								}
-								debugLog(`Added pip user scripts dir to PATH: ${scriptsDir}`);
-							}
-						} catch {
-							debugLog(`pip user scripts dir not accessible: ${scriptsDir}`);
-						}
-					}
-				}
-
-				return packageName;
+				const binaryPath = base
+					? await addBinToPath(pipScriptsDir(base, installerPlatform()))
+					: undefined;
+				// Keep the historical normal-user result even when the interpreter's
+				// user-base probe is unavailable. The next availability probe owns
+				// resolution through PATH and its user-base candidates.
+				return succeeded("user", binaryPath ?? packageName);
 			}
+			const candidateError = `${candidate.command} ${args.join(" ")}: ${boundInstallError(error, INSTALL_CANDIDATE_ERROR_LIMIT)}`;
+			candidateErrors.push(candidateError);
+			if (pep668.test(error)) {
+				userRefused = true;
+				refuse("user", error);
+			}
+		}
+		if (!userRefused)
+			throw new Error(
+				`pip install failed: ${candidateErrors.join(" | ") || "unknown error"}`,
+			);
 
-			lastError = `${candidate.command} ${candidate.args.join(" ")}: ${outcome.error}`;
-			debugLog(`[pip-fallback] ${lastError}`);
+		const privateBase = path.join(getGlobalPiLensDir(), "pip-user");
+		const privateEnv = { ...process.env, PYTHONUSERBASE: privateBase };
+		for (const candidate of pipCandidates) {
+			const args =
+				candidate.command === "pip" || candidate.command === "pip3"
+					? [...verb, "--user", "--break-system-packages", packageName]
+					: [
+							"-m",
+							"pip",
+							...verb,
+							"--user",
+							"--break-system-packages",
+							packageName,
+						];
+			const result = await run(candidate.command, args, privateEnv);
+			const error = (result.error?.message ?? result.stderr).trim();
+			if (result.status !== 0) {
+				const candidateError = `${candidate.command} ${args.join(" ")}: ${boundInstallError(error, INSTALL_CANDIDATE_ERROR_LIMIT)}`;
+				candidateErrors.push(candidateError);
+				continue;
+			}
+			const binaryPath = await addBinToPath(
+				pipScriptsDir(privateBase, installerPlatform()),
+			);
+			if (binaryPath) return succeeded("private-prefix", binaryPath);
+			throw new Error(
+				`private-prefix pip installed ${packageName} but ${binaryName} is not resolvable`,
+			);
 		}
 
 		throw new Error(
-			`Failed to install ${packageName}: no usable pip command found (${lastError || "unknown error"})`,
+			`pip install failed: ${candidateErrors.join(" | ") || "unknown error"}`,
 		);
 	} catch (err) {
 		return recordPackageManagerInstallException(
@@ -5360,7 +5761,11 @@ export async function installTool(toolId: string): Promise<boolean> {
 
 			case "pip": {
 				if (!tool.packageName) return false;
-				const pipPath = await installPipTool(tool.id, tool.packageName);
+				const pipPath = await installPipTool(
+					tool.id,
+					tool.packageName,
+					tool.binaryName ?? tool.id,
+				);
 				return finishInstallAttempt(tool.id, pipPath !== undefined, startedAt);
 			}
 
@@ -5372,6 +5777,12 @@ export async function installTool(toolId: string): Promise<boolean> {
 
 			case "github": {
 				if (!tool.github) return false;
+				if (!tool.github.assetMatch(process.platform, process.arch)) {
+					const reason = `unsupported platform=${process.platform} arch=${process.arch}`;
+					noteInstallAttempt(tool.id, "unavailable", reason);
+					logSessionStart(`auto-install ${tool.id}: ${reason}`);
+					return false;
+				}
 				const ghPath = await installGitHubTool(tool);
 				return finishInstallAttempt(tool.id, ghPath !== undefined, startedAt);
 			}
@@ -5388,6 +5799,12 @@ export async function installTool(toolId: string): Promise<boolean> {
 
 			case "archive": {
 				if (!tool.archive) return false;
+				if (!resolveArchiveUrl(tool.archive)) {
+					const reason = `unsupported platform=${process.platform} arch=${process.arch}`;
+					noteInstallAttempt(tool.id, "unavailable", reason);
+					logSessionStart(`auto-install ${tool.id}: ${reason}`);
+					return false;
+				}
 				const archivePath = await installArchiveTool(tool);
 				return finishInstallAttempt(
 					tool.id,
@@ -5809,6 +6226,8 @@ export function getToolInstallStrategy(
  * "at least one platform" guard instead.
  */
 export const GITHUB_TOOLS = [
+	"cljfmt",
+	"php-cs-fixer",
 	"shellcheck",
 	"shfmt",
 	"rust-analyzer",
@@ -5848,6 +6267,17 @@ export function resolveGitHubAsset(
 ): string | undefined {
 	const tool = TOOLS.find((t) => t.id === toolId);
 	return tool?.github?.assetMatch(platform, arch);
+}
+
+export function resolveGitHubAssetLauncher(
+	toolId: string,
+	_platform: string,
+	assetName: string,
+): "php" | "java" | undefined {
+	const tool = TOOLS.find((t) => t.id === toolId);
+	return tool?.github
+		? launcherForGitHubAsset(tool.github, assetName)
+		: undefined;
 }
 
 export function resolveGitHubInstalledBinaryName(

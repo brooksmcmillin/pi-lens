@@ -68,7 +68,9 @@ import {
 // apart on a Windows-shaped path (AGENTS.md defect shape 2).
 import { isSameOrWithin } from "./lsp/server.js";
 import { homeRelativePath } from "./path-utils.js";
+import { resolveToolCwd } from "./tool-cwd.js";
 import { compareOrdinal } from "./string-utils.js";
+import { LENS_TOOL_NAMES, resolveLensToolEnabled } from "./tool-config.js";
 
 export interface EffectiveConfigOptions {
 	/** Workspace the resolution is performed for. Defaults to `process.cwd()`. */
@@ -83,6 +85,7 @@ export interface EffectiveConfigOptions {
 	readonly redact?: true;
 	/** `$HOME` used for home-relative rewriting. Test seam only. */
 	readonly homeDir?: string;
+	readonly noTools?: string | readonly string[];
 }
 
 /**
@@ -133,6 +136,7 @@ interface EffectiveToolDecision {
 	readonly id: string;
 	readonly selected: boolean;
 	readonly reason: ToolSelectionReason;
+	readonly resolvedCwd: string;
 }
 
 /** The per-file half: language, servers, tools. */
@@ -173,6 +177,7 @@ export interface EffectiveConfigView {
 	readonly provenanceCounts: Readonly<Record<SourceTier, number>>;
 	/** The stable `PILENS_CFG_*` codes this resolution produced, with counts. */
 	readonly recordCounts: Readonly<Record<string, number>>;
+	readonly tools: readonly { name: string; enabled: boolean }[];
 	/**
 	 * Absent when no `file` was asked about. `{ error }` when one was named but
 	 * lies outside `cwd` — never a view resolved against a tree unrelated to the
@@ -443,6 +448,15 @@ export async function effectiveConfig(
 		provenance: provenanceView(resolved, homeDir).entries,
 		provenanceCounts: summary.countsByTier,
 		recordCounts: countBy(resolution.records, (record) => record.code),
+		tools: LENS_TOOL_NAMES.map((name) => ({
+			name,
+			enabled: resolveLensToolEnabled(
+				name,
+				resolved.value,
+				undefined,
+				options.noTools,
+			),
+		})),
 		...(fileOutsideCwd
 			? {
 					file: {
@@ -458,6 +472,7 @@ export async function effectiveConfig(
 							absolute,
 							resolved,
 							homeDir,
+							cwd,
 							// The gates read the LSP slice of that SAME resolution, through
 							// the same `registerLSPConfig` conversion `initLSPConfig` uses —
 							// no session-root registration, no per-root config-store write
@@ -492,6 +507,7 @@ async function fileView(
 	absolute: string,
 	resolved: Resolved<Record<string, unknown>>,
 	homeDir: string,
+	workspaceCwd: string,
 	lspConfig: RegisteredLSPConfig,
 ): Promise<EffectiveFileView> {
 	const language: LanguageEntry | undefined = resolveLanguage(absolute);
@@ -582,6 +598,13 @@ async function fileView(
 		id,
 		selected: available.has(id),
 		reason: toolReason(available.has(id), kind),
+		resolvedCwd: homeRelativePath(
+			resolveToolCwd("runner", id, absolute, {
+				cwd: workspaceCwd,
+				suppressTelemetry: true,
+			}).cwd,
+			homeDir,
+		),
 	}));
 
 	return {

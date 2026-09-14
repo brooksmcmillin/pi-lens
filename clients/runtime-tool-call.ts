@@ -1,7 +1,6 @@
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
 import { loadBootstrapClients, requestBootstrapClients } from "./bootstrap.js";
-import { getAmbientAbortSignal } from "./safe-spawn.js";
 import type { CacheManager } from "./cache-manager.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
 import { detectFileKind } from "./file-kinds.js";
@@ -326,6 +325,7 @@ interface ToolCallEvent {
 
 interface ToolCallCtx {
 	cwd?: string;
+	host?: "pi" | "mcp";
 	/**
 	 * This turn's abort signal, when the host supplies one. #2430 races every
 	 * observational snapshot against it so an interrupted turn cancels the walk
@@ -654,6 +654,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 			runtime,
 			cacheManager,
 			ctx.cwd ?? runtime.projectRoot,
+			ctx.host ?? "pi",
 		);
 		if (guard.block) {
 			return {
@@ -869,7 +870,6 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 	// For partial reads (small limit, not from line 1), find the enclosing
 	// symbol and expand the read range to cover it. This gives the read guard
 	// accurate symbol-level coverage without requiring an LSP server.
-	let expandedByLsp = false;
 	let enclosingSymbol:
 		| {
 				name: string;
@@ -912,7 +912,6 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 				readInput.limit = expansion.newLimit;
 				effectiveReadOffset = expansion.newOffset;
 				effectiveReadLimit = expansion.newLimit;
-				expandedByLsp = true;
 				let enriched = false;
 				let enrichedAncestry = expansion.ancestry;
 				const lspSymbols = await getOpenDocumentSymbols(filePath);
@@ -980,7 +979,10 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 		}
 	}
 
-	// --- Read-Before-Edit Guard: record reads ---
+	// Register the host-resolved path at tool_call. This path is load-bearing for
+	// the read guard and the observed-mutation settled sweep, including under
+	// --no-read-guard. The paired tool_result adds the authoritative delivered
+	// range after the host applies EOF and output-cap clipping (#2802 probe 3).
 	if (toolName === "read" && filePath && !isExternalOrVendor) {
 		const totalLines = countFileLines(filePath);
 		const deliveredLimit = effectiveReadLimit ?? 1;
@@ -1001,7 +1003,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 					totalLines > 0
 						? Math.round((deliveredLimit / totalLines) * 100) / 100
 						: 1,
-				expandedByTs: expandedByLsp,
+				expandedByTs: enclosingSymbol !== undefined,
 			},
 		});
 		runtime.readGuard.recordRead({
@@ -1010,11 +1012,15 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 			requestedLimit: requestedReadLimit ?? deliveredLimit,
 			effectiveOffset: effectiveReadOffset,
 			effectiveLimit: deliveredLimit,
-			expandedByLsp,
-			enclosingSymbol,
+			expandedByLsp: enclosingSymbol !== undefined,
+			...(enclosingSymbol !== undefined && { enclosingSymbol }),
 			turnIndex: runtime.turnIndex,
 			writeIndex: runtime.peekWriteIndex(),
 			timestamp: Date.now(),
+			provisional: true,
+			...(resolveToolCallCorrelationId(event) !== undefined && {
+				source: `native-read:${resolveToolCallCorrelationId(event)}:provisional`,
+			}),
 		});
 	}
 
@@ -1054,7 +1060,10 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 				// budgeted families rather than leaving this site to spell its
 				// own axis value (#2557 review F7).
 				hook: "tool_call",
-				signal: getAmbientAbortSignal(),
+				// The ambient slot is populated by tool_result, after this hook has
+				// already run. Use the live tool_call signal so Escape can release
+				// this await (#2523 AC4).
+				signal: deps.ctx.signal,
 			})
 		)?.complexityClient;
 		const baseline = await complexityClient?.analyzeFile(filePath);
@@ -1090,7 +1099,13 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 
 	// Track any Write so recordWritten can inject a synthetic read afterward.
 	// The agent authored the content (new or overwritten), so it trivially "knows" the file.
-	if (!isEditOnly && isWriteOrEdit && filePath && !getFlag("no-read-guard")) {
+	if (
+		!isEditOnly &&
+		isWriteOrEdit &&
+		event.toolName !== "bash" &&
+		filePath &&
+		!getFlag("no-read-guard")
+	) {
 		runtime.readGuard.noteCreatedFile(
 			filePath,
 			runtime.turnIndex,
@@ -1384,6 +1399,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 									agentBehaviorClient,
 								} = await loadBootstrapClients();
 								const result = await handleToolResult({
+									signal: deps.ctx.signal,
 									event: {
 										toolName: "write",
 										input: { path: filePath },

@@ -77,6 +77,7 @@ import {
 } from "../latency-logger.js";
 import { getPiLensGlobalConfigPath } from "../lens-config.js";
 import { normalizeFilePath } from "../path-utils.js";
+import { resolveToolCwd } from "../tool-cwd.js";
 import { logSessionStart } from "../sessionstart-logger.js";
 import { launchLSP } from "./launch.js";
 import {
@@ -86,9 +87,9 @@ import {
 	setSessionRootConfig,
 } from "./session-roots.js";
 import {
-	createRootDetector,
 	LSP_SERVERS,
 	resetLSPCaseSensitivityState,
+	resolveLspServerCwd,
 	type LSPServerInfo,
 } from "./server.js";
 
@@ -493,10 +494,17 @@ export function createCustomServer(
 	return {
 		id,
 		name: config.name,
+		custom: true,
 		extensions: config.extensions,
+		...(config.rootMarkers ? { rootMarkers: config.rootMarkers } : {}),
 		root: config.rootMarkers
-			? createRootDetector(config.rootMarkers)
-			: async () => process.cwd(),
+			? async (file) =>
+					resolveToolCwd("lsp", id, file, {
+						cwd: process.cwd(),
+						...(config.rootMarkers ? { rootMarkers: config.rootMarkers } : {}),
+					}).cwd
+			: async (file) =>
+					resolveToolCwd("lsp", id, file, { cwd: process.cwd() }).cwd,
 		async spawn(root) {
 			const proc = await launchLSP(config.command, config.args ?? ["--stdio"], {
 				cwd: root,
@@ -808,11 +816,23 @@ export function getServersForFileWithConfig(filePath: string): LSPServerInfo[] {
 }
 
 /**
+ * The primary language server ENTRY for a file — the one "first non-auxiliary
+ * server" predicate, shared by {@link primaryServerId} and
+ * {@link resolveLspCwdForFile} so the id-level and entry-level consumers
+ * cannot drift. `role` is only ever set to "auxiliary" on cross-cutting
+ * scanner entries (ast-grep, opengrep, zizmor, typos, marksman, ...) — see
+ * clients/lsp/server.ts; undefined here means a real language server.
+ */
+function primaryServerEntry(filePath: string): LSPServerInfo | undefined {
+	return getServersForFileWithConfig(filePath).find(
+		(s) => s.role !== "auxiliary",
+	);
+}
+
+/**
  * The primary language server for a file (e.g. "typescript"), as opposed to a
  * cross-cutting auxiliary scanner attached via clientScope "all"/
- * "with-auxiliary" (ast-grep, opengrep, zizmor, typos, marksman, ...). `role`
- * is only ever set to "auxiliary" on those auxiliary entries (see
- * clients/lsp/server.ts) — undefined means a real language server. Used to
+ * "with-auxiliary" (ast-grep, opengrep, zizmor, typos, marksman, ...). Used to
  * split a file's diagnostics into "primary confirmation" vs "auxiliary
  * findings" so a page of ast-grep/opengrep/marksman noise never buries
  * whether the actual type checker/compiler confirmed the file clean.
@@ -823,9 +843,25 @@ export function getServersForFileWithConfig(filePath: string): LSPServerInfo[] {
  * now report the same primary-vs-auxiliary split for the same file.
  */
 export function primaryServerId(filePath: string): string | undefined {
-	return getServersForFileWithConfig(filePath).find(
-		(s) => s.role !== "auxiliary",
-	)?.id;
+	return primaryServerEntry(filePath)?.id;
+}
+
+/**
+ * #2777 O1: the one seam a tool uses to answer "which cwd did this file's
+ * primary LSP server resolve to". Folds the three-step lookup callers used to
+ * hand-roll (`primaryServerId` + `getServersForFileWithConfig` +
+ * `resolveLspServerCwd`) into one call that returns `undefined` for a file
+ * with no primary LSP server, so the caller must handle the absent case
+ * instead of rendering it (the N1 `cwd=undefined` row becomes structurally
+ * impossible).
+ */
+export async function resolveLspCwdForFile(
+	filePath: string,
+	sessionCwd: string,
+): Promise<string | undefined> {
+	const primary = primaryServerEntry(filePath);
+	if (!primary) return undefined;
+	return resolveLspServerCwd(primary, filePath, sessionCwd);
 }
 
 /**

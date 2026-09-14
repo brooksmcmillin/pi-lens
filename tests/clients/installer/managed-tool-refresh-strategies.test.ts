@@ -417,6 +417,7 @@ function freshenAllExcept(
 }
 
 let originalPath: string | undefined;
+let fakeBin: string | undefined;
 let restoreDisableToolInstall: () => void;
 
 beforeEach(() => {
@@ -434,11 +435,13 @@ beforeEach(() => {
 	stubSpawn();
 	// `installMavenTool` gates on a JRE via a PATH walk, so give it one.
 	originalPath = process.env.PATH;
-	const fakeBin = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-1747-java-"));
+	fakeBin = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-1747-java-"));
 	for (const name of ["java", "java.exe"]) {
 		fs.writeFileSync(path.join(fakeBin, name), "x");
 	}
-	process.env.PATH = `${fakeBin}${path.delimiter}${originalPath ?? ""}`;
+	// Availability probes must see only fixture binaries. In particular, an
+	// ambient pipx must not redirect pip refreshes to the pipx strategy.
+	process.env.PATH = fakeBin;
 	delete process.env.PI_LENS_DISABLE_TOOL_REFRESH;
 	delete process.env.PI_LENS_TOOL_REFRESH_MAX_PER_SESSION;
 	// `vitest.config.*` defaults this to "1" globally so an ordinary test run
@@ -451,6 +454,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	if (fakeBin) fs.rmSync(fakeBin, { recursive: true, force: true });
+	fakeBin = undefined;
 	if (originalPath !== undefined) process.env.PATH = originalPath;
 	restoreDisableToolInstall();
 	delete process.env.PI_LENS_INSTALL_LOCK_TIMEOUT_MS;
@@ -1432,13 +1437,16 @@ describe("archive tree-bundle refresh updates the probe cache", () => {
 				body: Buffer.from("fake-zip-bytes"),
 			}),
 		});
-		// Simulate `tar` genuinely writing the tree marker into whatever `-C`
-		// target the code extracted into — decoupled from any tmp-dir naming
-		// convention, so this exercises the real extract → verify → swap path.
+		// Simulate the archive extractor genuinely writing the tree marker into
+		// whatever `-C` (tar) or `-d` (unzip) target it received. Keep this decoupled
+		// from any tmp-dir naming convention so the fixture follows both extractor
+		// shapes through the real extract → verify → swap path.
 		spawnMock.mockImplementation(async (_command: string, args: string[]) => {
-			const cIndex = (args ?? []).indexOf("-C");
-			if (cIndex !== -1) {
-				const targetDir = args[cIndex + 1];
+			const targetIndex = (args ?? []).findIndex(
+				(arg) => arg === "-C" || arg === "-d",
+			);
+			if (targetIndex !== -1) {
+				const targetDir = args[targetIndex + 1];
 				const written = path.join(TOOLS_DIR, targetDir, ...treeMarkerRel);
 				fs.mkdirSync(path.dirname(written), { recursive: true });
 				fs.writeFileSync(written, "# fresh bootstrap");

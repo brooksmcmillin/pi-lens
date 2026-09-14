@@ -56,7 +56,7 @@ import * as path from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import vitestConfig from "../../vitest.config.ts";
+import vitestConfig, { realHarnessInclude } from "../../vitest.config.ts";
 import {
 	admissionHeader,
 	countsByDetector,
@@ -69,7 +69,9 @@ import {
 	scanRealProcessSpawn,
 	scanUngovernedWaitFor,
 } from "../support/flake-shape-scan.js";
-import { assertSortedKeys } from "../support/sweep-kit.js";
+import { testSourceFiles as allTestSourceFiles } from "../support/module-instance-scan.js";
+import { localImportTargets } from "../support/hook-await-scan.js";
+import { assertSortedRegistry } from "../support/sweep-kit.js";
 
 // ── The baseline ─────────────────────────────────────────────────────────
 
@@ -90,6 +92,15 @@ const FLAKE_SHAPE_BASELINE: Baseline = JSON.parse(
 const ADMITTED_AFTER_BASELINE: Readonly<
 	Record<string, { detector: DetectorName; reason: string }>
 > = {
+	// 2026-09-11 (#2886 round 2): the /lens-perf occupancy row keeps one
+	// real-clock sampler assertion alongside its deterministic yield count —
+	// event-loop occupancy has no deterministic proxy; the yield count is
+	// O(input) and cannot see per-chunk block growth.
+	"elapsed-time-assertion:clients/performance-report-occupancy.test.ts": {
+		detector: "elapsed-time-assertion",
+		reason:
+			"event-loop occupancy has no deterministic proxy; the sampler row guards per-chunk block size the yield count cannot see",
+	},
 	// 2026-09-08 (#2622): the defect is wall-clock only — 2^N regex
 	// backtracking in both glob compilers; a fake clock measures nothing.
 	"elapsed-time-assertion:clients/read-guard-glob-nonbacktracking.test.ts": {
@@ -114,6 +125,23 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "raw-timer-wait",
 		reason:
 			"unhandledRejection is delivered on a real macrotask; one real setImmediate drain, assertion on the captured list",
+	},
+	// 2026-09-08 (#2765 round 3): the hook remainder is the subject; fake timers
+	// drive the delayed pre-snapshot work and the bounded lookup.
+	"raw-timer-wait:clients/lsp/service-inconclusive-per-server.test.ts": {
+		detector: "raw-timer-wait",
+		reason:
+			"the hook remainder is the defect; fake timers isolate the delayed pre-snapshot work from scheduler contention",
+	},
+	"raw-timer-wait:support/fault-injection.ts": {
+		detector: "raw-timer-wait",
+		reason:
+			"fault injection must model real timer and child teardown timing; fake timers cannot reproduce the boundary",
+	},
+	"raw-timer-wait:support/real-pi-harness.ts": {
+		detector: "raw-timer-wait",
+		reason:
+			"the harness timeout models real child-process progress and must remain bounded across teardown",
 	},
 	"real-process-spawn:clients/biome-config-decorator-metadata.test.ts": {
 		detector: "real-process-spawn",
@@ -145,6 +173,11 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "real-process-spawn",
 		reason:
 			"real git children decide tracked-versus-ignored files from index state no stub reproduces",
+	},
+	"real-process-spawn:clients/installer/pip-pep668.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"real installer subprocesses prove PEP 668 strategy selection and binary resolution across executable package-manager boundaries",
 	},
 	"real-process-spawn:clients/installer/posix-group-kill.test.ts": {
 		detector: "real-process-spawn",
@@ -179,6 +212,11 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "real-process-spawn",
 		reason:
 			"real git children emit stderr bytes whose metrics classification cannot be observed in-process",
+	},
+	"real-process-spawn:clients/project-data-dir-slug.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"two real Node children must contend on the production rename; an in-process mock cannot expose the cross-process ENOENT",
 	},
 	"real-process-spawn:clients/safe-spawn-ambient-signal.test.ts": {
 		detector: "real-process-spawn",
@@ -232,6 +270,41 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"observes the real npm pack lifecycle (prepack/postpack); no in-process double is faithful",
 	},
+	"real-process-spawn:real-harness/child-exit.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"real pi child death is the process-boundary failure that must reject a governed waiter promptly",
+	},
+	"real-process-spawn:real-harness/negative.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"real pi must surface provider exhaustion and malformed tool arguments across the process boundary",
+	},
+	"real-process-spawn:real-harness/scenario-1.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the real pi RPC host and extension lifecycle cannot be certified by an in-process double",
+	},
+	"real-process-spawn:real-harness/scenario-3.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the real host tool handler and read guard must cross the pi process boundary",
+	},
+	// 2026-09-10 (#2800): the tools.<name>.enabled roster is what pi's provider
+	// receives on the wire; a mocked host cannot certify which tools the real
+	// extension registered. Header on the file states why.
+	"real-process-spawn:real-harness/tools-enabled.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the provider wire roster is produced by a real pi host loading the built extension; an in-process double cannot certify tools.<name>.enabled",
+	},
+	// #2807 review F1/F4: the local CLI's exact argv and a shallow checkout's
+	// missing diff are the subjects; an in-process call cannot prove either.
+	"real-process-spawn:scripts/check-pr-body.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the exact local CLI and shallow checkout are the subjects; an in-process double cannot prove either command boundary",
+	},
 	"real-process-spawn:scripts/git-fixture-env.test.ts": {
 		detector: "real-process-spawn",
 		reason:
@@ -263,6 +336,11 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "real-process-spawn",
 		reason:
 			"resolves oxlint's real --print-config for lint:js and lint:js:advisory; no in-process double is faithful",
+	},
+	"real-process-spawn:scripts/lockfile-completeness.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the real pinned npm child is required to reproduce lockfile optional-binding rewrites; a process double cannot validate npm behavior",
 	},
 	// 2026-09-07 (#2613 review S2/T3): --dry-run env-reading/report-building
 	// wiring is the subject; the real `gh` calls stay untested, same
@@ -375,6 +453,34 @@ function wallClockBudgetInclude(): string[] {
 	return include.map(String);
 }
 
+/** Support helpers inherit the serialized lane from an importing test. */
+function supportHelperHasLaneProof(
+	relativePath: string,
+	included: ReadonlySet<string>,
+): boolean {
+	const target = path.join(repoRoot, "tests", relativePath);
+	const files = allTestSourceFiles().filter((file) =>
+		file.endsWith(".test.ts"),
+	);
+	const visited = new Set<string>();
+	const walk = (absolute: string): boolean => {
+		if (visited.has(absolute)) return false;
+		visited.add(absolute);
+		const relative = path
+			.relative(repoRoot, absolute)
+			.replaceAll(path.sep, "/");
+		if (absolute.endsWith(".test.ts") && included.has(relative)) return true;
+		return files.some(
+			(candidate) =>
+				localImportTargets(candidate).includes(absolute) && walk(candidate),
+		);
+	};
+	return files.some(
+		(candidate) =>
+			localImportTargets(candidate).includes(target) && walk(candidate),
+	);
+}
+
 interface RatchetProblem {
 	file: string;
 	detector: DetectorName;
@@ -448,20 +554,20 @@ function describeProblem(p: RatchetProblem): string {
 describe("flake-shape ratchet (#2547)", () => {
 	it("keeps every admission map sorted", () => {
 		// #2671 recurrence: an unsorted admission is a merge-conflict magnet.
-		expect(() => assertSortedKeys("fixture", ["b", "a"])).toThrow(
+		expect(() => assertSortedRegistry("fixture", ["b", "a"])).toThrow(
 			"entries must be sorted",
 		);
 		for (const detector of DETECTOR_NAMES) {
-			assertSortedKeys(
+			assertSortedRegistry(
 				`flake-shape-baseline:${detector}`,
 				Object.keys(FLAKE_SHAPE_BASELINE[detector]),
 			);
 		}
-		assertSortedKeys(
+		assertSortedRegistry(
 			"ADMITTED_AFTER_BASELINE",
 			Object.keys(ADMITTED_AFTER_BASELINE),
 		);
-		assertSortedKeys("wallClockBudgetInclude", wallClockBudgetInclude());
+		assertSortedRegistry("wallClockBudgetInclude", wallClockBudgetInclude());
 	});
 	it.each(DETECTOR_NAMES)(
 		"detector %s: no new files, no risen counts vs. the baseline",
@@ -649,7 +755,7 @@ function validateAdmission(
 	key: string,
 	entry: { detector: DetectorName; reason: string },
 	source: string | undefined,
-	wallClockBudgetIncluded: ReadonlySet<string>,
+	serializedLaneIncluded: ReadonlySet<string>,
 	relativeTestsPath: string,
 ): string[] {
 	const problems: string[] = [];
@@ -668,9 +774,13 @@ function validateAdmission(
 	} else if (header.reason.length < 15) {
 		problems.push(`${key}: header reason too short to be real`);
 	}
-	if (!wallClockBudgetIncluded.has(`tests/${relativeTestsPath}`)) {
+	const laneProof =
+		serializedLaneIncluded.has(`tests/${relativeTestsPath}`) ||
+		(relativeTestsPath.startsWith("support/") &&
+			supportHelperHasLaneProof(relativeTestsPath, serializedLaneIncluded));
+	if (!laneProof) {
 		problems.push(
-			`${key}: not listed in vitest.config.ts wallClockBudgetInclude`,
+			`${key}: not listed in vitest.config.ts wallClockBudgetInclude or real-harness lane`,
 		);
 	}
 	if (entry.reason.trim().length < 15) {
@@ -680,19 +790,41 @@ function validateAdmission(
 }
 
 describe("flake-shape ratchet — admission gate", () => {
+	// #2857: the admission sweep reads every admitted file's source and timed
+	// out at vitest's 5 s default under full-suite load; give it a real budget.
 	it("ADMITTED_AFTER_BASELINE entries carry the header and wallClockBudgetInclude membership", () => {
-		const included = new Set(wallClockBudgetInclude());
+		const included = new Set([
+			...wallClockBudgetInclude(),
+			...realHarnessInclude,
+		]);
 		const problems: string[] = [];
 		for (const [key, entry] of Object.entries(ADMITTED_AFTER_BASELINE)) {
 			const file = key.slice(entry.detector.length + 1);
+			if (file.startsWith("support/") && !file.endsWith(".test.ts")) continue;
 			const absolute = path.join(repoRoot, "tests", file);
 			const source = fs.existsSync(absolute)
 				? fs.readFileSync(absolute, "utf8")
 				: undefined;
 			problems.push(...validateAdmission(key, entry, source, included, file));
 		}
+		for (const detector of DETECTOR_NAMES) {
+			for (const file of Object.keys(FLAKE_SHAPE_BASELINE[detector] ?? {})) {
+				if (!file.startsWith("support/") || file.endsWith(".test.ts")) continue;
+				const key = `${detector}:${file}`;
+				const entry = ADMITTED_AFTER_BASELINE[key];
+				if (!entry) {
+					problems.push(`${key}: missing ADMITTED_AFTER_BASELINE entry`);
+					continue;
+				}
+				const source = fs.readFileSync(
+					path.join(repoRoot, "tests", file),
+					"utf8",
+				);
+				problems.push(...validateAdmission(key, entry, source, included, file));
+			}
+		}
 		expect(problems).toEqual([]);
-	});
+	}, 30_000);
 
 	// `ADMITTED_AFTER_BASELINE` is empty in steady state, so the test above
 	// alone never proves `validateAdmission` catches anything. These fixtures
@@ -996,6 +1128,119 @@ describe("flake-shape scan — raw-timer-wait", () => {
 		const source =
 			"export function realWait(ms) {\n\treturn new Promise((r) => setTimeout(r, ms));\n}\n";
 		expect(scanRawTimerWait("interleaving-kit.ts", source)).toEqual([]);
+	});
+
+	it("(#2563) the live scan walks tests/support helpers: fault-injection.ts sits in the population", () => {
+		// Mutation-sensitive population proof: dropping the support walk from
+		// countsByDetector makes this red. fault-injection.ts is the one
+		// existing helper the extended scan flags (its sanctioned delayInside
+		// timer + teardown failsafe are baselined, not admitted).
+		expect(countsByDetector("raw-timer-wait")).toHaveProperty(
+			"support/fault-injection.ts",
+		);
+	});
+
+	it("(#2563) the spawn detector stays test-file-only: support helpers are the sanctioned spawn boundary", () => {
+		// git-fixture-env.ts / fake-child.ts / spawn-shapes.ts import
+		// node:child_process by design — they are the fixture boundary the
+		// test-side detector routes callers toward, not a flake shape.
+		expect(
+			countsByDetector("real-process-spawn")["support/git-fixture-env.ts"],
+		).toBeUndefined();
+		expect(
+			countsByDetector("real-process-spawn")["support/fake-child.ts"],
+		).toBeUndefined();
+	});
+
+	it("ATTACK (#2563): a raw timer inside a tests/support helper is a NEW flagged file", () => {
+		// The acceptance-criterion scenario for the new population: a helper
+		// file the baseline has never seen, containing exactly the shape
+		// detector 3 exists to catch.
+		const fixtureSource = [
+			"export function tick(ms: number): void {",
+			"\tsetTimeout(() => {}, ms);",
+			"}",
+		].join("\n");
+		const file = "support/_fixture-raw-timer.ts";
+		const hits = scanRawTimerWait(file, fixtureSource);
+		expect(hits).toHaveLength(1);
+		const problems = auditAgainstBaseline("raw-timer-wait", {
+			[file]: hits.length,
+		});
+		expect(problems.map(describeProblem)).toEqual([
+			expect.stringContaining(`NEW flagged file ${file}`),
+		]);
+	});
+
+	it("ATTACK (#2563): a delay clone DEFINED in a tests/support helper is flagged even when its timer is hidden", () => {
+		// The evasion the issue names: the clone's timer text is never
+		// `setTimeout(` (aliased import), so only the definition shape sees
+		// it — the raw-timer call regex alone would pass the clone silently.
+		const fixtureSource = [
+			'import { setTimeout as sleep } from "node:timers";',
+			"",
+			"export const delay = (ms: number) =>",
+			"\tnew Promise<void>((resolve) => sleep(resolve, ms));",
+		].join("\n");
+		const file = "support/_fixture-hidden-timer-delay.ts";
+		const hits = scanRawTimerWait(file, fixtureSource);
+		expect(hits).toHaveLength(1);
+		expect(hits[0].reason).toContain("delay/sleep helper definition");
+		const problems = auditAgainstBaseline("raw-timer-wait", {
+			[file]: hits.length,
+		});
+		expect(problems.map(describeProblem)).toEqual([
+			expect.stringContaining(`NEW flagged file ${file}`),
+		]);
+	});
+
+	it.each([
+		[
+			"local alias",
+			"export function pause(ms: number) { const t = setTimeout; t(() => {}, ms); }",
+		],
+		[
+			"destructured globalThis alias",
+			"const { setTimeout: t } = globalThis; export function pause(ms: number) { t(() => {}, ms); }",
+		],
+		[
+			"destructured globalThis shorthand",
+			"const { setTimeout } = globalThis; export function pause(ms: number) { setTimeout(() => {}, ms); }",
+		],
+		[
+			"named timers/promises import",
+			'import { setTimeout as timer } from "node:timers/promises"; export function pause(ms: number) { return timer(ms); }',
+		],
+		[
+			"namespace timers/promises import",
+			'import * as timers from "timers/promises"; export function pause(ms: number) { return timers.setTimeout(ms); }',
+		],
+	])("flags a %s timer alias", (_name, source) => {
+		// #2563 recurrence: a pause/tick helper must not hide a real timer
+		// behind a binding that evades both the delay-name and raw-call passes.
+		expect(
+			scanRawTimerWait("support/_fixture-aliased-timer.ts", source),
+		).toHaveLength(1);
+	});
+
+	it("does not treat a destructured non-timer object as a timer alias", () => {
+		const source =
+			"const { setTimeout: t } = unrelated; export function pause(ms: number) { t(() => {}, ms); }";
+		expect(
+			scanRawTimerWait("support/_fixture-aliased-timer.ts", source),
+		).toEqual([]);
+	});
+
+	it("(#2563) the delay/sleep definition shape is support-scoped: a non-support file is not flagged for it", () => {
+		// In a .test.ts file the shape is redundant (the timer call itself is
+		// already governed), so the definition check must not widen the
+		// population there.
+		const fixtureSource =
+			"export const delay = (ms: number) =>\n" +
+			"\tnew Promise<void>((resolve) => sleep(resolve, ms));\n";
+		expect(
+			scanRawTimerWait("clients/uses-delay.test.ts", fixtureSource),
+		).toEqual([]);
 	});
 });
 

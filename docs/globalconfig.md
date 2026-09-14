@@ -18,6 +18,7 @@ Each runtime toggle is settable from the CLI *and* from `config.json`. The two a
 | `--no-autofix` | `autofix.enabled` | `true` |
 | `--no-lens-context` | `contextInjection.enabled` | `true` |
 | `--lens-guard` | `guard.enabled` | `false` |
+| `--lens-checkout-guard` | `guard.sharedCheckout` | `false` |
 | `--immediate-format` | `format.mode` (`"immediate"`) | `"deferred"` |
 | `--lens-turn-summary` | `turnSummary.enabled` | `false` |
 | `--lens-actionable-warnings` | `actionableWarnings.enabled` | `false` |
@@ -42,7 +43,7 @@ Each runtime toggle is settable from the CLI *and* from `config.json`. The two a
 | `startup.mode` | `full` | `quick`, `full`, or `minimal`; `PI_LENS_STARTUP_MODE` wins |
 | `startup.scans.enabled` | `true` | `true` or `false` |
 
-By default pi-lens registers six situational tools (the `ast_grep_*` family,
+By default pi-lens registers five situational tools (the `ast_grep_*` family,
 `lsp_navigation`, `lens_diagnostic_mark`) inactive and exposes a small loader,
 `pi_lens_activate_tools`, that the model calls to activate the ones it needs.
 `--no-lazy-tools` turns that off: every pi-lens tool is active from the first
@@ -122,6 +123,15 @@ Turn subsystems off globally instead of retyping flags every session:
 ```
 
 `lens.enabled: false` starts every session with pi-lens off (the `--no-lens` equivalent); `/lens-toggle` still re-enables it for one session. `lsp.enabled: false` falls back to language-specific checkers such as pyright. `tests.enabled: false` skips the on-write test runner. `delta.enabled: false` reports every diagnostic rather than only ones introduced this turn. `opengrep.enabled: false` detaches the Opengrep security scanner. `readGuard.enabled: false` turns off the read-before-edit monitor. `guard.enabled: true` opts into the experimental commit/push blocker.
+
+The `tools.<name>.enabled` setting controls each model-facing tool. Valid names
+include `ast_grep_search`, `ast_grep_replace`, `ast_grep_outline`,
+`lsp_navigation`, `lens_diagnostics`,
+`lens_diagnostic_mark`, `symbol_search`, `module_report`, `project_report`,
+`read_symbol`, `read_enclosing`, `effective_config`, `analyze`, `health`,
+`latency`, `project_scan`, and `rebuild`. The activation loader and MCP
+lifecycle tools `session_start`, `turn_end`, and `session_end` cannot be
+disabled.
 
 ## Project Config
 

@@ -1,25 +1,59 @@
 # Fixer contract
 
-Deliver a root-caused fix with red proof and a reviewable handoff.
+## Mission
 
-Read the issue, repository instructions, shared delegated worker contract, and
-relevant architecture before editing. Reuse the shared seam and existing
-machinery. Keep the change localized and compatible with concurrent branches.
+- Read the issue, `AGENTS.md`, `docs/pi-lens-subagent.md`, and this contract.
+- Trace the production entry point before naming a seam.
+- Reproduce the defect on the current tree.
+- Implement the smallest root-caused fix.
+- Preserve contributor authorship and leave Git authority to the orchestrator
+  unless the delegation grants it explicitly.
 
-Build the smallest faithful reproduction first. Preserve its pre-fix failure
-output. After fixing, prove every new guard mutation-sensitive. Run a pattern
-sweep and a population sweep for the defect class. Record per-member verdicts,
-the blast radius, and bounded observability. Add a changelog fragment for a code
-change.
+## Evidence
 
-## Tautological tests considered harmful
+- Add a regression test through the production path.
+- Capture the pre-fix assertion failure.
+- Prove the fixed test passes.
+- Mutate or remove every new guard, branch, filter, cap, and fallback; quote the
+  compile-valid red result.
+- Sweep the whole codebase for the defect shape and every enumerable member.
+- Record per-member verdicts, blast radius, affected callers, and bounded
+  observability.
+- State language coverage from `clients/language-registry.ts`; include one
+  non-TypeScript case for language-neutral seams.
 
-Do not assert a value that the test setup already supplied, duplicate the source
-predicate in the test, or replace a real in-process seam with a fake to keep the
-test green. Drive the production path and assert an independent observable. If
-the test passes after deleting the guard, it is tautological and must be
-redesigned before the fix is complete.
+## Required checks
 
-Verify the build and every targeted or sibling suite required by repository
-policy. Follow the shared contract's Git authority. Report what ran, what was
-skipped, and why. Use active, plain prose.
+- Run `npm run build` before tests and rebuild between mutations.
+- Run targeted tests through the repository's pinned environment. Include every
+  test that mocks or deep-equals a changed module or record.
+- Add `tests/config/` and spawn-heavy lanes for real child or LSP tests.
+- Reproduce CI-only failures in the CI command shape.
+- Use the exact npm pin in `package.json` for lockfile changes.
+- Use fake clocks and `tests/clients/interleaving-kit.ts` before real waits.
+- Run `npm run preflight` last and paste its table into `PR_BODY.md`.
+- Add one `.changelog/<slug>.md` fragment for code changes. Never edit
+  `CHANGELOG.md`.
+- Run release-QA end to end when a release-QA row changes.
+
+## Test screens
+
+- Enter through the real production function.
+- Do not use setup-echoing, implementation-mirroring, or mock-only assertions.
+- Do not use ambient stack/caller inspection in doubles.
+- Restore env, timers, cwd, and module state.
+- Make skips explicit and visible.
+- Use independent expected values and behavioral assertions.
+- Keep timing bounds near measured fixed and regressed values.
+- Make every PR-body test id grepable in the tree.
+
+## Handoff
+
+- Without Git authority, leave changes uncommitted.
+- Write root-level `PR_BODY.md` and `COMMIT_MSG.txt`; keep both untracked.
+- PR body headings: `## Summary`, `## Tests`, `## Blast radius`,
+  `## Class sweep`, `## Observability`, and `## Test assessment` when tests
+  changed.
+- Include every red, mutation result, skipped check, and environment block.
+- Answer each finding id with `fixed`, `not fixed`, or `withdrawn (reason)`.
+- Report verdict, changed files, totals, and unverifiable checks.

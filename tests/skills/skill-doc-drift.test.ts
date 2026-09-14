@@ -22,11 +22,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import { createAstGrepDumpTool } from "../../tools/ast-dump.js";
 import { createAstGrepOutlineTool } from "../../tools/ast-grep-outline.js";
 import { createAstGrepReplaceTool } from "../../tools/ast-grep-replace.js";
 import { createAstGrepSearchTool } from "../../tools/ast-grep-search.js";
-import { createLspDiagnosticsTool } from "../../tools/lsp-diagnostics.js";
+import { createLensDiagnosticsTool } from "../../tools/lens-diagnostics.js";
 import { createLspNavigationTool } from "../../tools/lsp-navigation.js";
 
 const REPO_ROOT = path.resolve(__dirname, "../..");
@@ -84,9 +83,13 @@ const REAL_TOOL_SCHEMAS: Record<string, Set<string>> = {
 	ast_grep_search: schemaProps(createAstGrepSearchTool(astGrepClientStub)),
 	ast_grep_replace: schemaProps(createAstGrepReplaceTool(astGrepClientStub)),
 	ast_grep_outline: schemaProps(createAstGrepOutlineTool(astGrepClientStub)),
-	ast_grep_dump: schemaProps(createAstGrepDumpTool(astGrepClientStub)),
 	lsp_navigation: schemaProps(createLspNavigationTool(() => true)),
-	lsp_diagnostics: schemaProps(createLspDiagnosticsTool()),
+	lens_diagnostics: schemaProps(
+		createLensDiagnosticsTool(
+			{ readCache: () => undefined } as any,
+			() => "/proj",
+		),
+	),
 };
 
 /** Which real tool(s) each skill file documents params for. */
@@ -95,11 +98,10 @@ const FILE_TOOL_SCOPE: Record<string, string[]> = {
 		"ast_grep_search",
 		"ast_grep_replace",
 		"ast_grep_outline",
-		"ast_grep_dump",
 	],
 	"skills/pi-lens-lsp-navigation/SKILL.md": [
 		"lsp_navigation",
-		"lsp_diagnostics",
+		"lens_diagnostics",
 	],
 };
 
@@ -179,6 +181,16 @@ function extractCodeBlockParamCandidates(text: string): string[] {
 	for (const m of text.matchAll(fenceRe)) {
 		const block = m[0];
 		for (const km of block.matchAll(/(?<!\$)\b([a-zA-Z][a-zA-Z0-9]*)=/g)) {
+			out.push(km[1]);
+		}
+	}
+	// Tool recipes also use JavaScript object literals, which do not contain
+	// assignment syntax. Read their keys so object-shaped examples cannot drift
+	// silently from the registered schema.
+	for (const block of text.matchAll(
+		/lens_diagnostics\s*\(\s*\{([\s\S]*?)\}\s*\)/g,
+	)) {
+		for (const km of block[1].matchAll(/\b([a-zA-Z][a-zA-Z0-9]*)\s*:/g)) {
 			out.push(km[1]);
 		}
 	}

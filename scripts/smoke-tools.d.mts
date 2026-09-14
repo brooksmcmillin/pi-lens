@@ -4,9 +4,14 @@ export interface SmokeFixture {
 	lang: string;
 	dir: string;
 	file: string;
+	cwd?: string;
 	targets?: string[];
 	tools?: string[];
 	expectDiagnostic?: boolean;
+	expectDiagnosticCount?: number;
+	expectRule?: string;
+	expectedCwd?: string;
+	expectedReason?: string;
 	/**
 	 * In the tier-1 parser lane (#1937): the tool installs as a pip/npm package
 	 * or a single GitHub-release binary, with no language toolchain step.
@@ -18,12 +23,19 @@ export interface LspFixture {
 	dir: string;
 	file: string;
 	serverHint: string;
+	expectedCwd?: string;
+	expectedReason?: string;
+	expectedTool?: string;
 	tools?: string[];
 	/** Auxiliary (diagnostic-only) servers attached alongside the primary. */
 	auxiliaryServerIds?: string[];
 	auxiliarySourceMatch?: string;
 	gitInit?: boolean;
 	clean?: boolean;
+	/** Require a primary finding from the real lsp_diagnostics handler. */
+	lspGate?: boolean;
+	/** The source text the gated fixture must contain (its seeded error). */
+	lspGateMarker?: string;
 	lombokJar?: boolean;
 	expectNoMessageMatch?: string;
 	/** A diagnostic message that MUST arrive. The lane's default verdict passes
@@ -33,6 +45,16 @@ export interface LspFixture {
 	disableServers?: string[];
 	expectServerId?: string;
 	expectSourceMatch?: string;
+	/** Optional custom-server config written into the copied fixture workspace. */
+	customServer?: {
+		id: string;
+		name: string;
+		extensions: string[];
+		command: string;
+		args?: string[];
+		env?: Record<string, string>;
+		rootMarkers?: string[];
+	};
 	/** Optional pre-touch setup step, run in the COPIED temp workspace (#530) — a
 	 * string command (split on whitespace) or an argv array. Bounded by
 	 * FIXTURE_SETUP_TIMEOUT_MS; failure reports a distinct `setup-failed`
@@ -57,6 +79,28 @@ export interface FormatFixture {
 	 */
 	expect?: "reformat" | "preserve";
 }
+export interface FormatResult {
+	success: boolean;
+	changed: boolean;
+	error?: string;
+	outcome: "formatted" | "unchanged" | "skipped" | "unavailable" | "failed";
+}
+/** Run the production Format smoke layer, optionally with injected seams. */
+export function runFormatSmoke(options: {
+	langs: string[];
+	install: boolean;
+	verbose: boolean;
+	deps?: unknown;
+}): Promise<number>;
+export interface FormatRowVerdict {
+	status: "pass" | "skip" | "fail";
+	detail: string;
+}
+/** Classify one formatter result without running tools or touching files. */
+export function classifyFormatRow(
+	target: FormatResult,
+	fx: FormatFixture,
+): FormatRowVerdict;
 export interface AutofixFixture {
 	lang: string;
 	dir: string;
@@ -79,6 +123,12 @@ export function matchDiagnosticMessages(
 	pattern: string,
 	diags: readonly SmokeDiagnostic[] | undefined,
 ): SmokeDiagnostic[];
+/** Classify one real lsp_diagnostics primary-finding gate result. */
+export function classifyLspGateResult(
+	result: unknown,
+	fixture: Pick<LspFixture, "serverHint">,
+	unavailable?: boolean,
+): { state: "pass" | "skip" | "fail"; detail: string; diags: number };
 /** One reported row from a smoke lane, as far as the pass floor is concerned. */
 export interface SmokeRow {
 	state: "pass" | "fail" | "skip" | "setup-failed";
@@ -93,6 +143,17 @@ export function passFloorBreach(
 ): string | null;
 /** Fixtures flagged `tier1` — the scheduled parser lane's selection. */
 export function tier1Fixtures(): SmokeFixture[];
+/** Resolve a smoke row's dispatch cwd inside its copied workspace. */
+export function fixtureDispatchCwd(
+	fixture: SmokeFixture,
+	workspace: string,
+): string;
+/** Classify one real runner outcome for the tool-layer report. */
+export function classify(outcome: unknown): {
+	state: "pass" | "fail" | "skip";
+	detail: string;
+	diags: number;
+};
 /** Remove dead or old scratch workspaces from previous smoke runs. */
 export function sweepLeftovers(): number;
 /** One TOOLS registry entry, as far as this classification cares. */
@@ -124,6 +185,7 @@ export type ClassifyOutcomeRestDeps = Omit<
 export interface InstallOutcomeRow {
 	row: "fail" | "skip";
 	detail: string;
+	networkUnreachable: boolean;
 }
 /**
  * Classify why `toolId` never resolved via `ensureTool`, using the
@@ -179,6 +241,28 @@ export function ensureFixtureTools(
 ): Promise<{
 	unavailableTools: Set<string>;
 	attemptSnapshots: Map<string, SmokeInstallAttempt | undefined>;
+}>;
+export function runInstallRegistrySmoke(options?: {
+	verbose?: boolean;
+	installerRoot?: string;
+	deps?: {
+		TOOLS: Array<{ id: string; installStrategy: string }>;
+		ensureTool: (toolId: string) => Promise<string | undefined>;
+		getInstallAttempt: (toolId: string) => SmokeInstallAttempt | undefined;
+		pipCommandCandidates?: () => string[];
+	};
+}): Promise<{
+	lane: string;
+	toolCount: number;
+	installed: number;
+	ok: boolean;
+	results: Array<{
+		toolId: string;
+		installStrategy: string;
+		state: string;
+		detail: string;
+		networkUnreachable: boolean;
+	}>;
 }>;
 export const FIXTURES: SmokeFixture[];
 export const LSP_FIXTURES: LspFixture[];

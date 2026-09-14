@@ -9,6 +9,19 @@ flags in context, see [Usage](./usage.md).
 pi-lens ships with sensible defaults, so **zero configuration is needed** — it
 works out of the box. Everything below is optional tuning.
 
+Tool root resolution is recorded in the pi-lens extension log as one bounded
+line per session key: `cwd <kind> <tool> cwd=<path>
+reason=<dispatch-root|marker:<name>|git-root|file-dir-fallback|home-cap>`.
+Fallbacks also create one `tool-cwd-resolution` degradation record per tool and
+session, so repeated files do not create unbounded health or log rows.
+
+Complete MCP tool results use `COMPLETE_MCP_RESULT_INPUT_BUDGET_BYTES` (8 MiB) as
+their input budget. Results above this budget
+write a bounded head, an `[incomplete: N bytes omitted, budget M]` marker, and a
+tail to the session log, and record one `mcp-complete-result-budget-exceeded`
+degradation per session. Results at or below the budget keep the complete-log
+contract.
+
 ## The three ways to configure pi-lens
 
 1. **Environment variables** (`PI_LENS_*`) — read at process start; set them in
@@ -60,7 +73,7 @@ column is the effective behavior when nothing is set.
 | `--no-tests` | `tests.enabled` | global | test runner **on** |
 | `--no-delta` | `delta.enabled` | global | delta mode **on** (new diagnostics only) |
 | `--lens-guard` | `guard.enabled` | global | **off** |
-
+| `--lens-checkout-guard` | `guard.sharedCheckout` | global | **off** |
 | `--no-opengrep` | `opengrep.enabled` | global | Opengrep scanner **on** |
 | `--no-read-guard` | `readGuard.enabled` | global | read-before-edit monitor **on** |
 | `--no-lens-context` | `contextInjection.enabled` | global | context injection **on** |
@@ -70,13 +83,35 @@ column is the effective behavior when nothing is set.
 | `--lens-actionable-warning-autofix` | `actionableWarnings.autoFix.enabled` | project | **off** |
 | `--lens-actionable-warning-all` | `actionableWarnings.deltaOnly` (`false`) | global | `deltaOnly` **on** (report this turn only) |
 | `--lens-compact-tool-line` | `ui.compactToolLine` | global | **off** (two-row tool rendering) |
-| `--no-lazy-tools` | `tools.lazy` | global | lazy tools **on** (six situational tools start inactive) |
+| `--no-lazy-tools` | `tools.lazy` | global | lazy tools **on** (five situational tools start inactive) |
+| `--no-tool=<name>` | `tools.<name>.enabled` | project | every lens tool **on** |
 | `--lens-turn-end-madge` | `turnEnd.madge.enabled` | global | **off** (madge runs at session start, not per turn) |
+| `--no-knip` | `knip.enabled` | project | knip analyzer **on** |
+| `--no-jscpd` | `jscpd.enabled` | project | jscpd analyzer **on** |
+| `--no-madge` | `madge.enabled` | project | madge analyzer **on** |
+| `--no-gitleaks` | `gitleaks.enabled` | project | gitleaks analyzer **on** |
+| `--no-govulncheck` | `govulncheck.enabled` | project | govulncheck analyzer **on** |
+| `--no-dead-code` | `deadCode.enabled` | project | dead-code analyzer **on** |
+| `--no-complexity` | `complexity.enabled` | project | complexity analyzer **on** |
 
 `--no-lazy-tools` keeps every pi-lens tool active for the whole session, so the
 advertised tool list never changes. The `pi_lens_activate_tools` loader stays
 registered and keeps its usual description; under this flag the tools it names
 are already active, so calling it is a no-op.
+
+The `tools.<name>.enabled` population covers every model-facing pi and MCP
+tool. The loader `pi_lens_activate_tools` and MCP lifecycle tools
+`pilens_session_start`, `pilens_turn_end`, and `pilens_session_end` are
+required by their host protocols and cannot be disabled. Unknown or
+non-disableable names emit `PILENS_CFG_0009`.
+
+Valid names for `tools.<name>.enabled` include `ast_grep_search`,
+`ast_grep_replace`, `ast_grep_outline`, `lsp_navigation`,
+`lens_diagnostics`, `lens_diagnostic_mark`, `symbol_search`,
+`module_report`, `project_report`, `read_symbol`, `read_enclosing`,
+`effective_config`, `analyze`, `health`, `latency`, `project_scan`, and
+`rebuild`. The activation loader and MCP lifecycle tools `session_start`,
+`turn_end`, and `session_end` cannot be disabled.
 
 `--lens-guard` is **EXPERIMENTAL and strictly opt-in**. When enabled, actual
 `git commit`/`git push` commands are blocked only for current, structured

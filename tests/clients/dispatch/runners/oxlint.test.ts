@@ -102,13 +102,19 @@ vi.mock("../../../../clients/latency-logger.js", async (importActual) => ({
 	logLatency,
 }));
 
-vi.mock("../../../../clients/dispatch/runners/utils/runner-helpers.js", () => ({
-	resolveToolCommand: vi.fn(() => null),
-	resolveToolCommandWithInstallFallback: vi.fn(async (_cwd: string) => {
-		const installed = await ensureTool("oxlint");
-		return installed ?? null;
+vi.mock(
+	"../../../../clients/dispatch/runners/utils/runner-helpers.js",
+	async (importOriginal) => ({
+		...(await importOriginal<
+			typeof import("../../../../clients/dispatch/runners/utils/runner-helpers.js")
+		>()),
+		resolveToolCommand: vi.fn(() => null),
+		resolveToolCommandWithInstallFallback: vi.fn(async (_cwd: string) => {
+			const installed = await ensureTool("oxlint");
+			return installed ?? null;
+		}),
 	}),
-}));
+);
 
 function createCtx(filePath: string, cwd: string) {
 	return makeRunnerCtx(filePath, cwd);
@@ -127,7 +133,10 @@ describe("oxlint runner", () => {
 	});
 
 	it("keeps expected runner skip reasons on a closed type/runtime taxonomy", () => {
-		expect(RUNNER_SKIP_REASONS).toEqual(["no-files-matched"]);
+		expect(RUNNER_SKIP_REASONS).toEqual([
+			"no-files-matched",
+			"configured-non-biome-linter",
+		]);
 		const valid: RunnerResult = {
 			status: "skipped",
 			diagnostics: [],

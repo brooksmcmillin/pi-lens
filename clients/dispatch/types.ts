@@ -11,6 +11,7 @@
  * The dispatcher must handle these semantics consistently.
  */
 
+import type { ExtensionLogLevel } from "../extension-log.js";
 import type { FileKind } from "../file-kinds.js";
 import type { FileRole } from "../file-role.js";
 import type { GeneratedArtifactEvidence } from "../generated-artifacts.js";
@@ -142,7 +143,10 @@ export interface RunnerDefinition {
 }
 
 /** Closed telemetry taxonomy for expected runner skips. */
-export const RUNNER_SKIP_REASONS = ["no-files-matched"] as const;
+export const RUNNER_SKIP_REASONS = [
+	"no-files-matched",
+	"configured-non-biome-linter",
+] as const;
 export type RunnerSkipReason = (typeof RUNNER_SKIP_REASONS)[number];
 
 /** Runtime guard for untyped/plugin-provided runner results. */
@@ -151,7 +155,7 @@ export function isRunnerSkipReason(value: unknown): value is RunnerSkipReason {
 }
 
 export interface RunnerResult {
-	status: "succeeded" | "failed" | "skipped";
+	status: "succeeded" | "failed" | "skipped" | "deferred";
 	/** Diagnostics found */
 	diagnostics: Diagnostic[];
 	/** Output semantic for these diagnostics */
@@ -173,6 +177,12 @@ export interface RunnerResult {
 	skipReason?: RunnerSkipReason;
 	/** Correlated scanner ids whose findings are absent from this result. */
 	unconfirmedServerIds?: readonly string[];
+	/**
+	 * Correlated scanner ids the touch marked collect-later, so their findings
+	 * can still arrive at turn end (#2810). A subset of `unconfirmedServerIds`;
+	 * the rest of that set has no delivery path and reads as silent.
+	 */
+	deferredServerIds?: readonly string[];
 }
 
 // --- Dispatch Context ---
@@ -231,9 +241,12 @@ export interface DispatchContext {
 	 * attributed. Blank/absent outside a live agent turn (e.g. project scans). */
 	readonly telemetryModel?: string;
 	readonly telemetryProvider?: string;
+	/** Pass-scoped filesystem memo for the shared tool-cwd seam. */
+	readonly toolCwdMemo?: { gitRoot?: string | null };
 
 	hasTool(command: string): Promise<boolean>;
-	log(message: string): void;
+	/** Log an advisory to the dispatch sink; `level` defaults to `error`. */
+	log(message: string, level?: ExtensionLogLevel): void;
 }
 
 // --- Tool Plan ---

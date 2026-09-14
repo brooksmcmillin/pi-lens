@@ -394,10 +394,13 @@ export interface CallSiteScanner {
  * call ends. `optionsLiteral` is the last top-level object-literal argument;
  * nested objects and object-shaped text in strings are never candidates.
  */
-export function createCallSiteScanner(source: string): CallSiteScanner {
+export function createCallSiteScanner(
+	source: string,
+	parsedRoot?: SgNode,
+): CallSiteScanner {
 	let root: SgNode | undefined;
 	const parseRoot = (): SgNode => {
-		root ??= parse(Lang.TypeScript, source).root();
+		root ??= parsedRoot ?? parse(Lang.TypeScript, source).root();
 		return root;
 	};
 
@@ -1267,7 +1270,10 @@ export function assertNonEmptyScan(
 }
 
 /** Enforce lexical order so parallel admission additions stay local. */
-export function assertSortedKeys(label: string, keys: readonly string[]): void {
+export function assertSortedRegistry(
+	label: string,
+	keys: readonly string[],
+): void {
 	const duplicate = keys.find((key, index) => keys.indexOf(key) !== index);
 	if (duplicate !== undefined) {
 		throw new Error(
