@@ -176,6 +176,12 @@ function expectCwdOutsideChildTmpdir(facts: ChildFacts, cwd: string): void {
 	expect(path.resolve(cwd)).not.toBe(normalizedTmp);
 }
 
+function expectExternalLogs(logDir: string, home: string, cwd: string): void {
+	expect(path.dirname(logDir)).toBe(path.join(home, ".pi-lens", "probe-logs"));
+	expect(path.basename(logDir)).toMatch(/^[a-f0-9]{64}$/);
+	expect(fs.existsSync(path.join(cwd, ".pi-lens-probe-home"))).toBe(false);
+}
+
 describe("getGlobalPiLensLogDir probe-home redirect (#2506)", () => {
 	it("redirects a worktree probe's LOGS while leaving tools/registry on the real home", async () => {
 		const { root, fakeHome, isolatedTmp } = makeFixture("probe-worktree");
@@ -192,8 +198,9 @@ describe("getGlobalPiLensLogDir probe-home redirect (#2506)", () => {
 			// The tmpdir branch cannot be what satisfied this case.
 			expectCwdOutsideChildTmpdir(facts, probeCwd);
 
-			// The log root moved — and anchored at the WORKTREE, not at `cwd`.
-			expect(facts.logDir).toBe(path.join(worktree, ".pi-lens-probe-home"));
+			expectExternalLogs(facts.logDir, fakeHome, worktree);
+			const fromRoot = await runChild(worktree, fakeHome, isolatedTmp);
+			expect(fromRoot.logDir).toBe(facts.logDir);
 
 			// ...while every machine-global path stayed on the (fake) real home.
 			// This is the whole point of the round-3 split: a pi session running
@@ -220,10 +227,10 @@ describe("getGlobalPiLensLogDir probe-home redirect (#2506)", () => {
 
 	it("redirects a probe whose cwd is under os.tmpdir() with no worktree segment", async () => {
 		const { root, fakeHome } = makeFixture("probe-tmpdir");
-		// No `.claude/worktrees` anywhere in this path and no PILENS_PROBE: the
-		// tmpdir branch is the ONLY thing that can fire here.
+		// A foreign checkout has no pi-lens-specific ignore rules.
 		const probeCwd = path.join(root, "scratch-probe");
 		fs.mkdirSync(probeCwd, { recursive: true });
+		execFileSync("git", ["init", "--quiet"], { cwd: probeCwd });
 
 		try {
 			// The child's os.tmpdir() IS the fixture root, so cwd sits under it.
@@ -232,8 +239,28 @@ describe("getGlobalPiLensLogDir probe-home redirect (#2506)", () => {
 				path.resolve(probeCwd).startsWith(path.resolve(facts.tmpdir)),
 			).toBe(true);
 			expect(probeCwd).not.toContain(".claude");
+			expect(
+				execFileSync(
+					"git",
+					["status", "--porcelain", "--untracked-files=all"],
+					{
+						cwd: probeCwd,
+						encoding: "utf8",
+					},
+				),
+			).toBe("");
 
-			expect(facts.logDir).toBe(path.join(probeCwd, ".pi-lens-probe-home"));
+			expectExternalLogs(facts.logDir, fakeHome, probeCwd);
+			expect(
+				fs.readFileSync(path.join(facts.logDir, "latency.log"), "utf8"),
+			).toContain("config-ignored");
+			const again = await runChild(probeCwd, fakeHome, root);
+			expect(again.logDir).toBe(facts.logDir);
+			const sibling = path.join(root, "other-checkout");
+			fs.mkdirSync(sibling);
+			const other = await runChild(sibling, fakeHome, root);
+			expectExternalLogs(other.logDir, fakeHome, sibling);
+			expect(other.logDir).not.toBe(facts.logDir);
 			expect(facts.globalDir).toBe(path.join(fakeHome, ".pi-lens"));
 			expect(facts.toolsDir).toBe(path.join(fakeHome, ".pi-lens", "tools"));
 		} finally {
@@ -255,7 +282,7 @@ describe("getGlobalPiLensLogDir probe-home redirect (#2506)", () => {
 			expectCwdOutsideChildTmpdir(facts, ordinaryCwd);
 			expect(ordinaryCwd).not.toContain(".claude");
 
-			expect(facts.logDir).toBe(path.join(ordinaryCwd, ".pi-lens-probe-home"));
+			expectExternalLogs(facts.logDir, fakeHome, ordinaryCwd);
 			expect(facts.globalDir).toBe(path.join(fakeHome, ".pi-lens"));
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
@@ -340,7 +367,7 @@ describe("getGlobalPiLensLogDir probe-home redirect (#2506)", () => {
 				// the redirect below can only have matched via realpath, not
 				// because the literal paths already agreed.
 				expect(facts.tmpdir).toBe(tmpSymlink);
-				expect(facts.logDir).toBe(path.join(probeCwd, ".pi-lens-probe-home"));
+				expectExternalLogs(facts.logDir, fakeHome, probeCwd);
 				expect(facts.globalDir).toBe(path.join(fakeHome, ".pi-lens"));
 			} finally {
 				fs.rmSync(root, { recursive: true, force: true });
@@ -381,9 +408,7 @@ describe("probe-home resolution is memoized per process (#2506 F5)", () => {
 
 			process.chdir(first);
 			const before = getGlobalPiLensLogDir();
-			expect(before).toBe(
-				path.join(fs.realpathSync(first), ".pi-lens-probe-home"),
-			);
+			expectExternalLogs(before, os.homedir(), first);
 
 			process.chdir(second);
 			// Same answer despite a different cwd: memoized, not re-derived.
@@ -392,9 +417,9 @@ describe("probe-home resolution is memoized per process (#2506 F5)", () => {
 			// ...and the reset really does clear the memo, so the helper is not
 			// a no-op the way round 2's orphaned version was (F6).
 			_resetProbeHomeRedirectStateForTests();
-			expect(getGlobalPiLensLogDir()).toBe(
-				path.join(fs.realpathSync(second), ".pi-lens-probe-home"),
-			);
+			const after = getGlobalPiLensLogDir();
+			expectExternalLogs(after, os.homedir(), second);
+			expect(after).not.toBe(before);
 		} finally {
 			process.chdir(savedCwd);
 			fs.rmSync(root, { recursive: true, force: true });
@@ -416,7 +441,7 @@ describe("probe-home resolution is memoized per process (#2506 F5)", () => {
 	});
 });
 
-describe("the probe home is gitignored (#2506 F2)", () => {
+describe("legacy checkout-local probe logs remain gitignored", () => {
 	it("git check-ignore accepts a file under .pi-lens-probe-home/", () => {
 		// Without this entry every agent worktree that ever ran one probe is
 		// dirty forever, and #2435's aged worktree sweep — which only removes
@@ -470,7 +495,7 @@ describe("a VITEST-marked process with no PI_LENS_HOME pin (#2516 round 2)", () 
 			// own os.tmpdir() is a sibling of the fixture cwd.
 			expectCwdOutsideChildTmpdir(facts, probeCwd);
 
-			expect(facts.logDir).toBe(path.join(worktree, ".pi-lens-probe-home"));
+			expectExternalLogs(facts.logDir, fakeHome, worktree);
 			expect(facts.logDir).not.toBe(path.join(fakeHome, ".pi-lens"));
 			// ...and nothing was written into the stand-in for the real home.
 			expect(
