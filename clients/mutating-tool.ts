@@ -72,6 +72,12 @@ import {
 } from "./hashline-anchor.js";
 import { lookupLearnedMutatingTool } from "./mutation-attribution.js";
 import {
+	isFullyQualifiedPosix,
+	isFullyQualifiedWin32,
+	isWindowsPath,
+	toPosix,
+} from "./path-utils.js";
+import {
 	boundedIndexesForCount,
 	createReadGuardEditBatchSummary,
 	logReadGuardEvent,
@@ -197,6 +203,8 @@ export interface MutatingToolClassification {
 	provenance: MutationProvenance;
 	/** Adapter that resolved the lines. `undefined` for a built-in shape. */
 	source?: string;
+	/** A dedicated opaque replacement that must not expose prior bytes as a read. */
+	readGuardPolicy?: "opaque-replace";
 }
 
 /**
@@ -745,6 +753,30 @@ function readToolName(event: unknown): string | undefined {
 	return typeof name === "string" && name.length > 0 ? name : undefined;
 }
 
+function isCanonicalClaimReceiptWrite(
+	toolName: string,
+	input: Record<string, unknown>,
+): boolean {
+	if (toolName !== "write_taskmanager_claim_receipt") return false;
+	const rawTaskId = input.task_id;
+	const targetPath = resolveMutationPath(input);
+	if (typeof rawTaskId !== "string" || targetPath === undefined) return false;
+	const taskId = rawTaskId.replace(/^task_/u, "");
+	if (!/^[1-9][0-9]*$/u.test(taskId)) return false;
+	const windowsPath = isWindowsPath(targetPath);
+	const isFullyQualified = windowsPath
+		? isFullyQualifiedWin32(targetPath)
+		: isFullyQualifiedPosix(targetPath);
+	const normalizedTarget = toPosix(targetPath);
+	const comparableTarget = windowsPath
+		? normalizedTarget.toLowerCase()
+		: normalizedTarget;
+	return (
+		isFullyQualified &&
+		comparableTarget.endsWith(`/.scratchpad/claim-receipt-${taskId}.json`)
+	);
+}
+
 /**
  * pi-lens's own marker on a `tool_result` it SYNTHESIZED from a bash command
  * (`runtime-tool-result.ts`'s recognized-write and opaque-recovery dispatch).
@@ -785,6 +817,17 @@ export function classifyMutatingTool(
 			path: resolveMutationPath(input),
 			kind: "write",
 			provenance: builtinProvenance,
+		};
+	}
+
+	if (isCanonicalClaimReceiptWrite(toolName, input)) {
+		return {
+			toolName,
+			path: resolveMutationPath(input),
+			kind: "edit",
+			provenance: "declared",
+			source: "taskmanager-claim-receipt",
+			readGuardPolicy: "opaque-replace",
 		};
 	}
 
