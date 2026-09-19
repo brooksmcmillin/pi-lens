@@ -218,6 +218,30 @@ function isLspCapableFile(filePath: string): boolean {
 	return LANGUAGE_POLICY[kind]?.lspCapable !== false;
 }
 
+export function opaqueReplacePathIdentitiesMatch(
+	lexicalPath: string,
+	realPath: string,
+	resolvePath: (value: string) => string = path.resolve,
+	caseInsensitive = process.platform === "win32",
+): boolean {
+	const normalize = (value: string): string => {
+		const resolved = resolvePath(value);
+		return caseInsensitive ? resolved.toLowerCase() : resolved;
+	};
+	return normalize(lexicalPath) === normalize(realPath);
+}
+
+function isOpaqueReplaceTargetStable(filePath: string): boolean {
+	try {
+		return opaqueReplacePathIdentitiesMatch(
+			filePath,
+			nodeFs.realpathSync(filePath),
+		);
+	} catch {
+		return false;
+	}
+}
+
 function shouldSkipLspAutoTouch(
 	filePath: string,
 	projectRoot: string,
@@ -504,6 +528,26 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 	// used to compare `toolName` to the `"write"` / `"edit"` literals. No ctx —
 	// `filePath` is not resolved yet, and adapters stay silent without one.
 	const mutation = classifyMutatingTool(event);
+	if (!lensEnabled) return;
+	const opaqueReplaceTarget = mutation?.readGuardPolicy === "opaque-replace";
+	if (opaqueReplaceTarget) {
+		try {
+			const opaqueRawFilePath = getToolCallRawFilePath(toolName, event);
+			filePath = resolveToolCallFilePath(
+				opaqueRawFilePath,
+				ctx.cwd,
+				runtime.projectRoot,
+			)?.path;
+		} catch {
+			filePath = undefined;
+		}
+		if (!filePath || !isOpaqueReplaceTargetStable(filePath)) {
+			return {
+				block: true,
+				reason: `Opaque replacement requires a stable existing target: ${filePath ?? "unresolved"}`,
+			};
+		}
+	}
 	const editInputForTelemetry = (event as { input?: unknown }).input as
 		| { edits?: unknown[] }
 		| undefined;
@@ -550,7 +594,6 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 				}),
 			},
 		});
-	if (!lensEnabled) return;
 	// #2000 phase 2: opaque-command pre-snapshot. A bash command whose writes
 	// the extractor will not recognize gets a bounded stat snapshot of the
 	// project source universe BEFORE it runs; the tool_result side diffs it.
@@ -1360,7 +1403,12 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 			}
 		}
 	}
-	if (isEditOnly && filePath && !getFlag("no-read-guard")) {
+	if (
+		isEditOnly &&
+		!opaqueReplaceTarget &&
+		filePath &&
+		!getFlag("no-read-guard")
+	) {
 		const readGuard = runtime.readGuard;
 		const isExistingFile =
 			typeof readGuard?.isNewFile !== "function" ||

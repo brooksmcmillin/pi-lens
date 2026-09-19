@@ -7,7 +7,10 @@ import {
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
-import { handleToolCall } from "../../clients/runtime-tool-call.js";
+import {
+	handleToolCall,
+	opaqueReplacePathIdentitiesMatch,
+} from "../../clients/runtime-tool-call.js";
 import type { TreeSitterClient } from "../../clients/tree-sitter-client.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 import { makeLspServiceDouble } from "../support/lsp-service-double.js";
@@ -330,6 +333,332 @@ describe("handleToolCall", () => {
 			);
 
 			expect(result).toMatchObject({ block: true });
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("allows the dedicated claim-receipt replacement without exposing stale contents as a read", async () => {
+		const env = setupTestEnvironment("pi-lens-runtime-tool-call-receipt-");
+		try {
+			const filePath = createTempFile(
+				env.tmpDir,
+				".scratchpad/claim-receipt-7078.json",
+				'{"claim_token":"stale-secret"}\n',
+			);
+			fs.chmodSync(filePath, 0o600);
+			const beforeSession = new Date(Date.now() - 1000);
+			fs.utimesSync(filePath, beforeSession, beforeSession);
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			const recordRead = vi.spyOn(runtime.readGuard, "recordRead");
+			const noteCreatedFile = vi.spyOn(runtime.readGuard, "noteCreatedFile");
+
+			const result = await handleToolCall(
+				baseDeps({
+					runtime,
+					ctx: { cwd: env.tmpDir },
+					event: {
+						toolName: "write_taskmanager_claim_receipt",
+						input: {
+							task_id: "7078",
+							path: filePath,
+							updated_at: "2026-09-18T00:00:00Z",
+						},
+					},
+				}),
+			);
+
+			expect(result).toBeUndefined();
+			expect(recordRead).not.toHaveBeenCalled();
+			expect(noteCreatedFile).not.toHaveBeenCalled();
+			expect(fs.statSync(filePath).mode & 0o777).toBe(0o600);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it.each(["target", "parent"])(
+		"rejects a canonical receipt whose %s path component is a symlink",
+		async (symlinkKind) => {
+			const env = setupTestEnvironment(
+				"pi-lens-runtime-tool-call-receipt-link-",
+			);
+			try {
+				const realDirectory = path.join(env.tmpDir, "real-scratchpad");
+				fs.mkdirSync(realDirectory, { recursive: true });
+				const realFile = path.join(realDirectory, "claim-receipt-7078.json");
+				fs.writeFileSync(realFile, '{"claim_token":"stale-secret"}\n');
+				const beforeSession = new Date(Date.now() - 1000);
+				fs.utimesSync(realFile, beforeSession, beforeSession);
+				const scratchpad = path.join(env.tmpDir, ".scratchpad");
+				let filePath: string;
+				if (symlinkKind === "parent") {
+					fs.symlinkSync(realDirectory, scratchpad, "dir");
+					filePath = path.join(scratchpad, "claim-receipt-7078.json");
+				} else {
+					fs.mkdirSync(scratchpad);
+					filePath = path.join(scratchpad, "claim-receipt-7078.json");
+					fs.symlinkSync(realFile, filePath, "file");
+				}
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+
+				const result = await handleToolCall(
+					baseDeps({
+						runtime,
+						ctx: { cwd: env.tmpDir },
+						event: {
+							toolName: "write_taskmanager_claim_receipt",
+							input: {
+								task_id: "7078",
+								path: filePath,
+								updated_at: "2026-09-18T00:00:00Z",
+							},
+						},
+					}),
+				);
+
+				expect(result).toMatchObject({ block: true });
+				expect((result as { reason: string }).reason).toContain(
+					"stable existing target",
+				);
+			} finally {
+				env.cleanup();
+			}
+		},
+	);
+
+	it("blocks a missing receipt beneath a symlinked parent", async () => {
+		const env = setupTestEnvironment(
+			"pi-lens-runtime-tool-call-missing-receipt-parent-link-",
+		);
+		try {
+			const realDirectory = path.join(env.tmpDir, "real-scratchpad");
+			fs.mkdirSync(realDirectory, { recursive: true });
+			const scratchpad = path.join(env.tmpDir, ".scratchpad");
+			fs.symlinkSync(realDirectory, scratchpad, "dir");
+			const filePath = path.join(scratchpad, "claim-receipt-7078.json");
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+
+			const result = await handleToolCall(
+				baseDeps({
+					runtime,
+					ctx: { cwd: env.tmpDir },
+					event: {
+						toolName: "write_taskmanager_claim_receipt",
+						input: {
+							task_id: "7078",
+							path: filePath,
+							updated_at: "2026-09-18T00:00:00Z",
+						},
+					},
+				}),
+			);
+
+			expect(result).toMatchObject({ block: true });
+			expect((result as { reason: string }).reason).toContain(
+				"stable existing target",
+			);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("blocks a dangling canonical receipt symlink", async () => {
+		const env = setupTestEnvironment(
+			"pi-lens-runtime-tool-call-dangling-receipt-link-",
+		);
+		try {
+			const scratchpad = path.join(env.tmpDir, ".scratchpad");
+			fs.mkdirSync(scratchpad);
+			const filePath = path.join(scratchpad, "claim-receipt-7078.json");
+			fs.symlinkSync(
+				path.join(env.tmpDir, "missing-receipt.json"),
+				filePath,
+				"file",
+			);
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+
+			const result = await handleToolCall(
+				baseDeps({
+					runtime,
+					ctx: { cwd: env.tmpDir },
+					event: {
+						toolName: "write_taskmanager_claim_receipt",
+						input: {
+							task_id: "7078",
+							path: filePath,
+							updated_at: "2026-09-18T00:00:00Z",
+						},
+					},
+				}),
+			);
+
+			expect(result).toMatchObject({ block: true });
+			expect((result as { reason: string }).reason).toContain(
+				"stable existing target",
+			);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("blocks an unstable receipt before throwing attribution bookkeeping runs", async () => {
+		const env = setupTestEnvironment(
+			"pi-lens-runtime-tool-call-receipt-pre-gate-",
+		);
+		try {
+			const filePath = path.join(
+				env.tmpDir,
+				".scratchpad",
+				"claim-receipt-7078.json",
+			);
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			const recordAttribution = vi
+				.spyOn(runtime, "recordToolCallAttribution")
+				.mockImplementation(() => {
+					throw new Error("attribution bookkeeping failed");
+				});
+
+			const result = await handleToolCall(
+				baseDeps({
+					runtime,
+					ctx: { cwd: env.tmpDir },
+					event: {
+						toolName: "write_taskmanager_claim_receipt",
+						toolCallId: "receipt-pre-gate",
+						input: {
+							task_id: "7078",
+							path: filePath,
+							updated_at: "2026-09-18T00:00:00Z",
+						},
+					},
+				}),
+			);
+
+			expect(result).toMatchObject({ block: true });
+			expect(recordAttribution).not.toHaveBeenCalled();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("routes a Windows canonical receipt through the runtime stability gate", async () => {
+		const env = setupTestEnvironment(
+			"pi-lens-runtime-tool-call-windows-receipt-link-",
+		);
+		try {
+			const realFile = createTempFile(
+				env.tmpDir,
+				"real-receipt.json",
+				'{"claim_token":"stale-secret"}\n',
+			);
+			const receiptPath =
+				process.platform === "win32"
+					? path.win32.join(
+							env.tmpDir,
+							".scratchpad",
+							"claim-receipt-7078.json",
+						)
+					: "C:\\repo\\.scratchpad\\claim-receipt-7078.json";
+			const linkPath =
+				process.platform === "win32"
+					? receiptPath
+					: path.join(env.tmpDir, receiptPath);
+			fs.mkdirSync(path.dirname(linkPath), { recursive: true });
+			fs.symlinkSync(realFile, linkPath, "file");
+			const beforeSession = new Date(Date.now() - 1000);
+			fs.utimesSync(realFile, beforeSession, beforeSession);
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+
+			const result = await handleToolCall(
+				baseDeps({
+					runtime,
+					ctx: { cwd: env.tmpDir },
+					event: {
+						toolName: "write_taskmanager_claim_receipt",
+						input: {
+							task_id: "7078",
+							path: receiptPath,
+							updated_at: "2026-09-18T00:00:00Z",
+						},
+					},
+				}),
+			);
+
+			expect(result).toMatchObject({ block: true });
+			expect((result as { reason: string }).reason).toContain(
+				"stable existing target",
+			);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it.each([
+		{
+			label: "target symlink",
+			lexical: "C:\\repo\\.scratchpad\\claim-receipt-7078.json",
+			real: "C:\\vault\\claim-receipt-7078.json",
+		},
+		{
+			label: "parent junction",
+			lexical: "C:\\repo\\.scratchpad\\claim-receipt-7078.json",
+			real: "D:\\receipts\\claim-receipt-7078.json",
+		},
+	])("rejects a Windows $label identity", ({ lexical, real }) => {
+		expect(
+			opaqueReplacePathIdentitiesMatch(lexical, real, path.win32.resolve, true),
+		).toBe(false);
+	});
+
+	it("accepts Windows case differences without resolving the lexical path", () => {
+		expect(
+			opaqueReplacePathIdentitiesMatch(
+				"C:\\Repo\\.scratchpad\\claim-receipt-7078.json",
+				"c:\\repo\\.scratchpad\\claim-receipt-7078.json",
+				path.win32.resolve,
+				true,
+			),
+		).toBe(true);
+	});
+
+	it("uses ordinary write semantics for a generic write to a claim-receipt path", async () => {
+		const env = setupTestEnvironment(
+			"pi-lens-runtime-tool-call-receipt-write-",
+		);
+		try {
+			const filePath = createTempFile(
+				env.tmpDir,
+				".scratchpad/claim-receipt-7078.json",
+				'{"claim_token":"stale-secret"}\n',
+			);
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			const noteCreatedFile = vi.spyOn(runtime.readGuard, "noteCreatedFile");
+
+			const result = await handleToolCall(
+				baseDeps({
+					runtime,
+					ctx: { cwd: env.tmpDir },
+					event: {
+						toolName: "write",
+						input: { path: filePath, content: "replacement" },
+					},
+				}),
+			);
+
+			expect(result).toBeUndefined();
+			expect(noteCreatedFile).toHaveBeenCalledWith(
+				filePath,
+				runtime.turnIndex,
+				runtime.peekWriteIndex(),
+			);
 		} finally {
 			env.cleanup();
 		}

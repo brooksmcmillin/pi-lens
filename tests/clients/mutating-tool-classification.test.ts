@@ -445,7 +445,113 @@ describe("#2423 — classification contract", () => {
 		expect(
 			classifyMutatingTool({ toolName: "read", input: { path: "/a.ts" } }),
 		).toBeUndefined();
+
+		const receiptPath = "/repo/.scratchpad/claim-receipt-7078.json";
+		expect(
+			classifyMutatingTool({
+				toolName: "write",
+				input: { path: receiptPath, content: "replacement" },
+			}),
+		).not.toHaveProperty("readGuardPolicy");
+		expect(
+			classifyMutatingTool({
+				toolName: "edit",
+				input: {
+					path: receiptPath,
+					oldText: "stale",
+					newText: "replacement",
+				},
+			}),
+		).not.toHaveProperty("readGuardPolicy");
 	});
+
+	it("classifies only the canonical TaskManager claim receipt as an opaque replacement", async () => {
+		const { classifyMutatingTool } =
+			await import("../../clients/mutating-tool.js");
+		const canonical = {
+			toolName: "write_taskmanager_claim_receipt",
+			input: {
+				task_id: "task_7078",
+				path: "/repo/.scratchpad/claim-receipt-7078.json",
+				updated_at: "2026-09-18T00:00:00Z",
+			},
+		};
+
+		expect(classifyMutatingTool(canonical)).toMatchObject({
+			kind: "edit",
+			path: canonical.input.path,
+			provenance: "declared",
+			source: "taskmanager-claim-receipt",
+			readGuardPolicy: "opaque-replace",
+		});
+		expect(
+			classifyMutatingTool({
+				...canonical,
+				toolName: "write_taskmanager_claim_receipt_backup",
+			}),
+		).toBeUndefined();
+		expect(
+			classifyMutatingTool({
+				...canonical,
+				input: { ...canonical.input, task_id: "7079" },
+			}),
+		).toBeUndefined();
+		expect(
+			classifyMutatingTool({
+				...canonical,
+				input: { ...canonical.input, path: "/repo/claim-receipt-7078.json" },
+			}),
+		).toBeUndefined();
+		expect(
+			classifyMutatingTool({
+				...canonical,
+				input: { ...canonical.input, path: "/repo/.scratchpad/other.json" },
+			}),
+		).toBeUndefined();
+	});
+
+	it("keeps canonical receipt matching case-sensitive for POSIX paths", async () => {
+		const { classifyMutatingTool } =
+			await import("../../clients/mutating-tool.js");
+
+		expect(
+			classifyMutatingTool({
+				toolName: "write_taskmanager_claim_receipt",
+				input: {
+					task_id: "7078",
+					path: "/repo/.Scratchpad/Claim-Receipt-7078.JSON",
+					updated_at: "2026-09-18T00:00:00Z",
+				},
+			}),
+		).toBeUndefined();
+	});
+
+	it.each([
+		"C:\\repo\\.scratchpad\\claim-receipt-7078.json",
+		"C:/repo/.scratchpad/claim-receipt-7078.json",
+		"C:\\Repo\\.Scratchpad\\Claim-Receipt-7078.JSON",
+	])(
+		"classifies a canonical Windows receipt path as an opaque replacement: %s",
+		async (receiptPath) => {
+			const { classifyMutatingTool } =
+				await import("../../clients/mutating-tool.js");
+
+			expect(
+				classifyMutatingTool({
+					toolName: "write_taskmanager_claim_receipt",
+					input: {
+						task_id: "7078",
+						path: receiptPath,
+						updated_at: "2026-09-18T00:00:00Z",
+					},
+				}),
+			).toMatchObject({
+				kind: "edit",
+				path: receiptPath,
+				readGuardPolicy: "opaque-replace",
+			});
+		},
+	);
 
 	it("marks a bash-derived synthetic write with its own provenance", async () => {
 		const { classifyMutatingTool, PI_LENS_SYNTHETIC_MUTATION_FIELD } =
