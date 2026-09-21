@@ -473,6 +473,11 @@ uses `getGlobalPiLensLogDir()`. `PILENS_DATA_DIR` relocates project state and
 `PI_LENS_HOME` relocates machine state. Display paths through
 `displayProjectDataPath`; do not spell a project-data path in agent text.
 
+Without a `PI_LENS_HOME` override, probe, agent-worktree, and temporary-project
+telemetry uses `~/.pi-lens/probe-logs/<canonical-root-sha256>`, outside the
+checkout and separate from ordinary telemetry. Machine state is not redirected.
+The `global-dir-probe-redirect` degradation records the chosen log directory.
+
 All loggers use `createNdjsonLogger`. Flush the specific logger before reading
 its file. Relevant logs are `latency.log`, `sessionstart.log`, `cascade.log`,
 `review-graph.log`, `read-guard.log`, `actionable-warnings.log`,

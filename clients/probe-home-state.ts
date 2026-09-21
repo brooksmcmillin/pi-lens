@@ -52,6 +52,7 @@
  * real spawned `node` children, including the VITEST-set-but-unpinned case.
  */
 
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -110,8 +111,9 @@ export function getProbeHomeRedirectEvent():
 /**
  * Where pi-lens writes its LOGS, ledger rows and debug dumps: `~/.pi-lens/` by
  * default, exactly like `getGlobalPiLensDir()` in `file-utils.ts` — but
- * redirected to a per-probe directory when this process looks like an ad-hoc
- * probe rather than a real pi session (#2506).
+ * redirected to `~/.pi-lens/probe-logs/<root-hash>` for explicit probes,
+ * agent worktrees, and temporary projects (including ordinary pi sessions).
+ * Automatic telemetry must not create untracked files in those checkouts.
  *
  * Every log-family writer routes here: `latency.log`, `extension.log`,
  * `sessionstart.log`, `cascade.log`, `read-guard.log`, `tree-sitter.log`,
@@ -198,14 +200,23 @@ function computeProbeHomeDir(cwd: string): string | undefined {
 	// project checkout opts in, and it must work even under a harness that has
 	// set a test-mode marker but no PI_LENS_HOME.
 	if (process.env.PILENS_PROBE === "1") {
-		return path.join(cwd, ".pi-lens-probe-home");
+		return probeLogDir(cwd);
 	}
 	const worktreeRoot = findAgentWorktreeRoot(cwd);
-	if (worktreeRoot) return path.join(worktreeRoot, ".pi-lens-probe-home");
+	if (worktreeRoot) return probeLogDir(worktreeRoot);
 	if (isUnderRealDir(cwd, os.tmpdir())) {
-		return path.join(cwd, ".pi-lens-probe-home");
+		return probeLogDir(cwd);
 	}
 	return undefined;
+}
+
+// Canonical roots keep symlink aliases together and distinct checkouts separate.
+// Only telemetry moves; installed tools and the instance registry keep their root.
+function probeLogDir(root: string): string {
+	const key = createHash("sha256")
+		.update(normalizeFilePath(toRealPath(root)))
+		.digest("hex");
+	return path.join(os.homedir(), ".pi-lens", "probe-logs", key);
 }
 
 /**
