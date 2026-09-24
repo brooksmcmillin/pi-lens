@@ -32,6 +32,10 @@ jobs:
   validate-merge-train-dispatch:
     name: Validate merge-train dispatch
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 5s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -55,6 +59,10 @@ jobs:
     name: actionlint
     needs: validate-merge-train-dispatch
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 8s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -151,7 +159,7 @@ jobs:
   pr-body-lint:
     name: PR body (advisory)
     needs: validate-merge-train-dispatch
-    if: github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]'
+    if: github.event_name == 'pull_request' && github.event.action != 'synchronize' && github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -201,6 +209,10 @@ jobs:
     name: oxfmt format check
     needs: validate-merge-train-dispatch
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 32s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
     permissions:
       contents: read
     # Gating: preflight runs the same fmt:check locally before a PR is pushed.
@@ -265,6 +277,10 @@ jobs:
     name: knip (advisory)
     needs: validate-merge-train-dispatch
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 27s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
     permissions:
       contents: read
     # Advisory: not in required-checks branch protection, so a finding never
@@ -342,6 +358,10 @@ jobs:
     name: markdownlint
     needs: validate-merge-train-dispatch
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 26s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -393,6 +413,12 @@ jobs:
     if: always() && github.event_name == 'repository_dispatch' && needs.validate-merge-train-dispatch.result == 'success'
     needs: [validate-merge-train-dispatch, actionlint, oxfmt, markdownlint, vale, jscpd, yamllint, typos, taplo]
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # No successful run found (job requires github.event_name ==
+    # 'repository_dispatch'; 0 repository_dispatch-triggered runs of this
+    # workflow exist in the visible history) -- defaulted to the floor of 10 min
+    # for this single-step job.
+    timeout-minutes: 10
     permissions:
       issues: write
     steps:
@@ -434,6 +460,10 @@ jobs:
     name: Vale prose lint (advisory)
     needs: validate-merge-train-dispatch
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 13s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
     permissions:
       contents: read
     # Advisory to start (see PR body / #1844): not wired into required-checks
@@ -490,6 +520,10 @@ jobs:
     name: oxlint (advisory)
     needs: validate-merge-train-dispatch
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 49s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
     permissions:
       contents: read
     # #2700: the full categories (correctness+suspicious+perf) + plugins
@@ -558,10 +592,11 @@ jobs:
       # this job carries no continue-on-error, would otherwise be
       # INDISTINGUISHABLE at the check level from a healthy run that found
       # real issues (also exit 1: #2697's findings are still un-triaged).
-      # `--format default` (pinned below, also fixing the CI auto-selected
-      # `github` reporter stripping every rule id from #2700's per-rule
-      # table) prints a `Finished in … on N files with R rules using T
-      # threads.` trailer this step parses. The step's own natural exit
+      # The advisory command uses Unix output because the pinned
+      # oxlint-tsgolint toolchain's default reporter can panic. Unix output
+      # has no rule-count trailer, so the step asks the SAME advisory argv for
+      # oxlint's machine-readable --print-config surface and counts enabled
+      # rules. The step's own natural exit
       # code ($status) is deliberately NOT what decides this job's
       # conclusion (#2700 review round 3): a healthy run with 4900+
       # un-triaged findings must read GREEN (type-aware ran correctly),
@@ -579,7 +614,8 @@ jobs:
           echo "$output"
           echo "(lint:js:advisory exited $status -- findings, if any, are advisory and do not affect this job's conclusion; only the rule-count floor below does)"
           RULE_FLOOR=100
-          rules="$(printf '%s\n' "$output" | grep -oE 'with [0-9]+ rules' | grep -oE '[0-9]+' | tail -1 || true)"
+          config="$(npm run lint:js:advisory --silent -- --print-config 2>/dev/null || true)"
+          rules="$(printf '%s\n' "$config" | node scripts/count-oxlint-rules.mjs)"
           rules="${rules:-0}"
           if [ "$rules" -lt "$RULE_FLOOR" ]; then
             echo "::error::oxlint advisory ran with only $rules rules (floor $RULE_FLOOR) -- oxlint-tsgolint is likely missing or --type-aware silently degraded; this is NOT the same as a clean or lightly-findinged run"
@@ -592,6 +628,10 @@ jobs:
     needs: validate-merge-train-dispatch
     continue-on-error: true
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 23s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -612,6 +652,10 @@ jobs:
     needs: validate-merge-train-dispatch
     continue-on-error: true
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 34s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -645,6 +689,10 @@ jobs:
     needs: validate-merge-train-dispatch
     continue-on-error: true
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 33s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -669,6 +717,10 @@ jobs:
     needs: validate-merge-train-dispatch
     continue-on-error: true
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 20s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -680,7 +732,7 @@ jobs:
         with:
           python-version: "3.x"
       - name: Install yamllint
-        run: python -m pip install --disable-pip-version-check yamllint==1.37.1
+        run: "python -m pip install --disable-pip-version-check --only-binary=:all: yamllint==1.37.1"
       - name: Lint YAML
         run: |
           mapfile -t yaml_files < <(git ls-files '*.yml' '*.yaml')
@@ -691,6 +743,10 @@ jobs:
     needs: validate-merge-train-dispatch
     continue-on-error: true
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 11s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -698,7 +754,7 @@ jobs:
         with:
           ref: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || github.ref }}
           persist-credentials: false
-      - uses: crate-ci/typos@d43b6c087ac471e2ea7b8af622ff15f05c0c365b # v1.50.1
+      - uses: crate-ci/typos@512fc24f32f44ab01972217aaaf3dc86ec234d53 # v1.50.2
         with:
           args: --force-exclude
 
@@ -707,6 +763,10 @@ jobs:
     needs: validate-merge-train-dispatch
     continue-on-error: true
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 30s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:

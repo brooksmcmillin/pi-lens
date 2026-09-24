@@ -375,7 +375,9 @@ export async function effectiveConfig(
 		resolvePiLensConfig({
 			cwd: dir,
 			globalDir: getGlobalPiLensDir(),
-			globalConfigPath: getPiLensGlobalConfigPath(homeDir),
+			// Production resolution for the global tier — see loadLSPConfig's
+			// comment (global-config-location PR, refs #2457).
+			globalConfigPath: getPiLensGlobalConfigPath(),
 			homeDir,
 		});
 

@@ -104,11 +104,24 @@
  * This module is deliberately STATELESS — no module-level caches, no latches.
  * A sweep helper that memoized its own scan would be exactly the
  * process-lifetime-state shape the session-state sweep exists to catch.
+ *
+ * ONE carve-out, added with {@link readWalkedFile} (#3082, named in review
+ * round 2 F5): the set of paths that vanished between a walk and its read. It
+ * is per-FORK, never reset, and deliberately so — the rule it implements is
+ * "warn once per distinct path per worker", which a reset would turn back into
+ * one warning per occurrence. It is safe because it is purely diagnostic: no
+ * sweep reads it, no verdict depends on it, and a stale entry can only
+ * suppress a repeat WARNING, never change a finding. It is BOUNDED
+ * ({@link BoundedSet}, {@link VANISHED_PATH_RECORD_CAP}) rather than a raw
+ * `Set`, so a pathological churning tree cannot grow it without limit
+ * (AGENTS.md shape 9); past the cap the oldest path can warn a second time,
+ * which is the harmless direction.
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Lang, parse } from "@ast-grep/napi";
+import { BoundedSet } from "../../clients/bounded-cache.js";
 import { lineContentHash } from "../../clients/read-guard.js";
 import { toPosix } from "../../clients/path-utils.js";
 import type { SgNode } from "../../clients/deps/ast-grep-napi.js";
@@ -361,6 +374,105 @@ function matchIsCode(
 	return /[^\s"'`]/.test(stringsBlanked.slice(start, end));
 }
 
+/**
+ * Index of the `close` character balancing the `open` character AT
+ * `openIndex`, scanning forward, or -1 when unbalanced. Depth-counts both
+ * characters, so a nested pair of the same delimiter (`"(a(b)c)"` from index
+ * 0) resolves to the OUTER close, never the first one seen.
+ *
+ * Assumes `source[openIndex] === open` — same contract every prior private
+ * copy carried, checked by the CALLER (a mismatched index is a caller bug,
+ * not a value this function can usefully report beyond `-1`).
+ *
+ * Callers are expected to run this over already comment/string-blanked text
+ * (via {@link stripSource}) when a delimiter char could otherwise hide inside
+ * a string or comment; this function itself is a pure character scan and
+ * applies no stripping of its own.
+ *
+ * Folded from three byte-for-byte-identical private copies (#3072):
+ * `tests/support/vacuous-skip-scan.ts`'s `matchingCloseBrace` (open/close
+ * fixed to `{`/`}`) and `skipGroup` (open/close taken from the call site),
+ * and `tests/clients/pi-lens-home-hermeticity.test.ts`'s `balancedBraceEnd`
+ * (open/close fixed to `{`/`}`) plus two more inline copies of the same loop
+ * (the parameter-list paren balance in `bodyBraceAfterParams`, and the
+ * `vi.mock(...)` call's paren balance in `findMockCallText`).
+ *
+ * `options.quoteAware` (#3134) folds in the second convention the sibling
+ * copies split on: skip over `"`/`'`/`` ` ``-quoted spans (backslash-escaped
+ * chars included) so a delimiter INSIDE a string argument cannot unbalance
+ * the count. Default `false` reproduces the exact loop above with no added
+ * branch cost for every pre-#3134 caller (`vacuous-skip-scan.ts`,
+ * `pi-lens-home-hermeticity.test.ts`) — none of them need it, because they
+ * already scan `stripSource`-blanked text where string contents cannot hide
+ * a delimiter. The two #3134 callers that DO pass `true`
+ * (`availability-classifiedby-scan.ts`, `latency-logger-mock-shape.test.ts`)
+ * scan `strings: "keep"` text instead — they read `cause`/`classifiedBy`
+ * values and a mock's module-specifier string, which stripping would blind
+ * them to — so the delimiter-in-a-string case is real for them, not
+ * hypothetical. One option on one seam rather than a second exported
+ * function, per the fold's "at most one quote-aware variant" rule.
+ */
+export function matchingCloseIndex(
+	source: string,
+	openIndex: number,
+	open: string,
+	close: string,
+	options?: { quoteAware?: boolean },
+): number {
+	const quoteAware = options?.quoteAware === true;
+	let depth = 0;
+	let quote: string | undefined;
+	for (let i = openIndex; i < source.length; i++) {
+		const ch = source[i];
+		if (quoteAware) {
+			if (quote !== undefined) {
+				if (ch === "\\") i++;
+				else if (ch === quote) quote = undefined;
+				continue;
+			}
+			if (ch === '"' || ch === "'" || ch === "`") {
+				quote = ch;
+				continue;
+			}
+		}
+		if (ch === open) depth++;
+		else if (ch === close) {
+			depth--;
+			if (depth === 0) return i;
+		}
+	}
+	return -1;
+}
+
+/**
+ * Index of the `open` character balancing the `close` character AT
+ * `closeIndex`, scanning backward, or -1 when unbalanced. The backward twin
+ * of {@link matchingCloseIndex}, same contract (assumes
+ * `source[closeIndex] === close`, no stripping of its own).
+ *
+ * Folded from `tests/support/vacuous-skip-scan.ts`'s `matchingOpenParen`
+ * (#3072) — the only backward direction any current consumer needs, so
+ * `open`/`close` here are still explicit rather than assumed to be
+ * `(`/`)`, matching {@link matchingCloseIndex}'s signature for one
+ * consistent shape.
+ */
+export function matchingOpenIndex(
+	source: string,
+	closeIndex: number,
+	open: string,
+	close: string,
+): number {
+	let depth = 0;
+	for (let i = closeIndex; i >= 0; i--) {
+		if (source[i] === close) depth++;
+		else if (source[i] === open) {
+			depth--;
+			if (depth === 0) return i;
+		}
+	}
+	return -1;
+}
+
 /** Return every raw match whose span contains source code. */
 export function codeMatches(source: string, regex: RegExp): RegExpMatchArray[] {
 	const stringsBlanked = stripSource(source, { strings: "blank" });
@@ -530,6 +642,103 @@ export function listSourceFiles(
 /** `root`-relative posix path for an absolute path. */
 export function relativePosix(root: string, absolute: string): string {
 	return toPosix(path.relative(root, absolute));
+}
+
+/**
+ * Per-fork cap on remembered vanished paths (AGENTS.md shape 9). One `tests/`
+ * tree holds ~1,200 source files, so a cap of 256 is far above any real
+ * churn while keeping the diagnostic set finite for a worker that scans a
+ * tree something is rewriting in a loop. Eviction costs at most one repeated
+ * warning for the oldest path.
+ */
+export const VANISHED_PATH_RECORD_CAP = 256;
+
+/**
+ * Paths this worker found gone between the walk and the read, oldest first.
+ * One entry per distinct path: a scan that retries the same walk inside two
+ * `it` bodies must not turn one vanished file into two records (bounded
+ * observability, AGENTS.md shape 9). Bounded, not a raw `Set` — see the
+ * module docstring's carve-out for why this one piece of module state exists.
+ */
+const vanishedBetweenWalkAndRead = new BoundedSet<string>(
+	VANISHED_PATH_RECORD_CAP,
+);
+
+/** Every path {@link readWalkedFile} found gone, for this worker fork. */
+export function walkedFilesVanished(): readonly string[] {
+	return [...vanishedBetweenWalkAndRead];
+}
+
+/** Test seam: the cap is only observable through many recorded paths. */
+export function recordedVanishedPathCount(): number {
+	return vanishedBetweenWalkAndRead.size;
+}
+
+/**
+ * Read a file a directory walk just produced, tolerating its disappearance
+ * between the walk and the read.
+ *
+ * Named recurrence (#3082/#3092): every sweep here lists `tests/**` and then
+ * `readFileSync`s what the walk returned. A sibling test file running
+ * concurrently in another fork that creates a source file under the walked
+ * root and removes it again — `tests/clients/pi-lens-home-hermeticity.test.ts`
+ * wrote `tests/scratch-3050-pre-3048-vanished-wiring.test.ts` for the length
+ * of one assertion — makes that read throw `ENOENT` in whichever walker
+ * happened to be mid-enumeration. Four different governance suites took the
+ * hit on rotating runs (`sweep-floor-coverage`, `vacuous-skip-coverage`,
+ * `latency-logger-mock-shape`, `lsp-spawn-heavy-coverage`), each time with an
+ * error naming a file that never existed on any branch.
+ *
+ * `undefined` means "this path is no longer part of the population": the
+ * caller skips it rather than counting it as a finding — a file that is gone
+ * cannot violate anything, and a sweep that reported it would be reporting
+ * its own race. The disappearance is NOT swallowed (AGENTS.md shape 10): it
+ * is recorded once per distinct path in {@link walkedFilesVanished} and
+ * printed once, via a raw `process.stderr.write` rather than `console.warn`
+ * (#3107) — Vitest's default reporter (every `npm test` script uses it; no
+ * `--reporter` anywhere) intercepts a worker's `console.warn` and can drop it
+ * entirely on a passing run, so a `console.warn` call here would be recorded
+ * but never actually visible in the run log. A raw stderr write bypasses that
+ * interception and lands in the job log unconditionally, so a genuinely
+ * churning tree is visible in the run log instead of quietly shrinking every
+ * scan's population. The `minScanned` floors every sweep already carries are
+ * what catch a walk that loses its whole population this way.
+ *
+ * Any other error (EACCES, EISDIR, a decode failure) is rethrown untouched —
+ * only the vanished-file race is tolerated.
+ */
+export function readWalkedFile(file: string): string | undefined {
+	try {
+		return fs.readFileSync(file, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		if (!vanishedBetweenWalkAndRead.has(file)) {
+			vanishedBetweenWalkAndRead.add(file);
+			// Raw stderr write, not console.warn (#3107): Vitest's default
+			// reporter swallows a worker's console.warn on a passing run, so
+			// this line would never reach CI's log. See the docstring above.
+			process.stderr.write(
+				`[sweep-kit] ${file} vanished between the walk and the read; skipped (#3082)\n`,
+			);
+		}
+		return undefined;
+	}
+}
+
+/**
+ * {@link readWalkedFile} over a whole walk result, dropping the files that
+ * vanished. The pairing is what most sweeps want: they scan `source` and
+ * report `file`.
+ */
+export function readWalkedFiles(
+	files: readonly string[],
+): Array<{ file: string; source: string }> {
+	const read: Array<{ file: string; source: string }> = [];
+	for (const file of files) {
+		const source = readWalkedFile(file);
+		if (source !== undefined) read.push({ file, source });
+	}
+	return read;
 }
 
 /**

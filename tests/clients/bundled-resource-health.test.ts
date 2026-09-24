@@ -61,7 +61,7 @@ afterEach(() => {
 
 function freshTempDir(): string {
 	const dir = fsSync.mkdtempSync(
-		path.join(os.tmpdir(), "pilens-bundled-resource-health-"),
+		path.join(os.tmpdir(), "pi-lens-pilens-bundled-resource-health-"),
 	);
 	tmpDirs.push(dir);
 	return dir;

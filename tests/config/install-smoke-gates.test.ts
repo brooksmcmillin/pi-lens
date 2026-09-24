@@ -1,10 +1,24 @@
-// Pins install-smoke.yml's FOUR job-level `if:` event gates (#2613 review
-// T1): the three `!= 'pull_request'` gates on `smoke`/`pi-load`/`mise-repro`
-// (unchanged pre-#2613 behavior -- the os x pm x pi-install matrices stay
-// off pull_request) and `host-latest-smoke`'s `schedule`/`workflow_dispatch`
-// gate (the nightly advisory lane). `host-range-smoke` deliberately carries
-// NO gate (it is the new PR-gating lane) and is intentionally absent from
-// this table.
+// Pins install-smoke.yml's job-level `if:` event gates (#2613 review T1).
+// Exactly ONE job still carries one: `host-latest-smoke`'s
+// `schedule`/`workflow_dispatch` gate, the nightly advisory drift lane.
+// `host-range-smoke` deliberately carries NO gate (it is the PR-gating lane)
+// and is intentionally absent from this table.
+//
+// #3043: `pi-load` LEFT this table. It used to carry a
+// `!= 'pull_request'` gate, which is why #3033 could edit its pnpm-global
+// arm and ship a break no PR-eligible lane could execute -- six matrix cells
+// then failed on every master push for a day. Its gating moved into an
+// event-dependent matrix (one ubuntu x pnpm-global cell on pull_request, the
+// full 2x4 otherwise); the block at the bottom of this file evaluates that
+// real expression per event.
+//
+// 2026-09-15 retro F2: `smoke` and `mise-repro` left this table the same way
+// and for the same reason -- #3049's own round-2 review named mise-repro as
+// the next member of #3043's class ("moving its `export PATH=` line below
+// the `pnpm config set` line would have reached master unseen"). Their
+// per-event matrices are evaluated at the bottom of this file beside
+// pi-load's, and the general rule they now satisfy is swept over every
+// workflow by tests/config/workflow-pull-request-reachability.test.ts.
 //
 // Same technique as tests/config/ci-infra-kill-rerun-gate.test.ts (#2668
 // review F3): load the REAL workflow via yaml.load, then evaluate the
@@ -88,29 +102,24 @@ const EVENTS = [
 
 // [jobName, expected-eligible-events]
 const GATES: Array<[string, readonly string[]]> = [
-	["smoke", ["push", "schedule", "workflow_dispatch", "repository_dispatch"]],
-	["pi-load", ["push", "schedule", "workflow_dispatch", "repository_dispatch"]],
-	[
-		"mise-repro",
-		["push", "schedule", "workflow_dispatch", "repository_dispatch"],
-	],
 	["host-latest-smoke", ["schedule", "workflow_dispatch"]],
 ];
 
 describe("install-smoke.yml job event gates (#2613 review T1)", () => {
 	const workflow = loadWorkflow();
 
-	it("names exactly the four gated jobs this table covers", () => {
+	it("names exactly the one gated job this table still covers", () => {
 		// Guards the table itself: a job renamed out from under GATES would
 		// otherwise throw inside readJobIf below with a less legible message.
-		expect(GATES.map(([name]) => name).sort()).toEqual(
-			["mise-repro", "pi-load", "smoke", "host-latest-smoke"].sort(),
-		);
+		expect(GATES.map(([name]) => name)).toEqual(["host-latest-smoke"]);
 	});
 
-	it("host-range-smoke deliberately carries no event gate (always eligible, incl. pull_request)", () => {
-		expect(workflow.jobs?.["host-range-smoke"]?.if).toBeUndefined();
-	});
+	it.each(["host-range-smoke", "pi-load", "smoke", "mise-repro"])(
+		"%s deliberately carries no event gate (its matrix is the whole gate)",
+		(jobName) => {
+			expect(workflow.jobs?.[jobName]?.if).toBeUndefined();
+		},
+	);
 
 	for (const [jobName, eligibleEvents] of GATES) {
 		describe(`jobs.${jobName}.if`, () => {
@@ -307,3 +316,160 @@ describe("PI_HOST_SUPPORTED_RANGE is a genuinely bounded range, never a wildcard
 		},
 	);
 });
+
+// #3043: the lane that shipped the break, and the two lanes the 2026-09-15
+// retro swept beside it. `pi-load` used to be gated off pull_request
+// entirely, so #3033 edited its pnpm-global arm with no lane able to run it
+// and six matrix cells failed on every master push until a human read
+// master; `smoke` and `mise-repro` carried the identical gate and #3049's
+// round-2 review named mise-repro as the next member of the class. The gate
+// is now the matrix itself in all three: PR-time exactly ONE cell executes
+// the arm; every other event keeps the full matrix. This block evaluates the
+// REAL expressions off the loaded workflow -- never a restatement of them --
+// the same way the `if:` table above evaluates the real gate strings.
+//
+// One evaluator, three jobs: the per-job copy this block used to carry for
+// pi-load alone is now the shared one below (net-count rule -- a second
+// copy of a matrix evaluator is a defect, not a convenience).
+
+// GitHub Actions expression -> value, for the subset these matrix keys use:
+// `github.event_name`, string equality, `&&`/`||`, and `fromJSON` of a
+// literal. JS agrees with Actions on all of it (and `A && X || Y` picks X
+// when A holds, Y otherwise, in both languages).
+function evaluateMatrixExpression(raw: unknown, eventName: string): unknown {
+	if (typeof raw !== "string") return raw;
+	const body = raw.trim().match(/^\$\{\{([\s\S]*)\}\}$/)?.[1];
+	if (body === undefined) return raw;
+	const substituted = body
+		.split("github.event_name")
+		.join(JSON.stringify(eventName))
+		.split("fromJSON(")
+		.join("JSON.parse(");
+	if (substituted.includes("github.")) {
+		throw new Error(
+			`unsubstituted github.* reference survived evaluation: ${substituted}`,
+		);
+	}
+	// `new Function` over this repo's own workflow text plus a JSON-literal
+	// fixture event name, never external input.
+	return new Function(`"use strict"; return (${substituted});`)();
+}
+
+type MatrixGatedJob = {
+	/** Job key in the workflow. */
+	job: string;
+	/** The matrix key crossed with `os` for this job. */
+	axis: string;
+	/** Cells that run on pull_request, as "<os> · <axis value>". */
+	prCells: readonly string[];
+	/** Cells that run on every non-PR event. */
+	fullCells: readonly string[];
+};
+
+const MATRIX_GATED_JOBS: readonly MatrixGatedJob[] = [
+	{
+		job: "pi-load",
+		axis: "pi_install",
+		prCells: ["ubuntu-latest · pnpm-global"],
+		fullCells: [
+			"ubuntu-latest · npm-global",
+			"ubuntu-latest · pnpm-global",
+			"ubuntu-latest · bun-global",
+			"ubuntu-latest · curl",
+			"macos-latest · npm-global",
+			"macos-latest · pnpm-global",
+			"macos-latest · bun-global",
+			"macos-latest · curl",
+		],
+	},
+	{
+		job: "smoke",
+		axis: "pm",
+		prCells: ["ubuntu-latest · pnpm"],
+		fullCells: [
+			"ubuntu-latest · npm",
+			"ubuntu-latest · pnpm",
+			"ubuntu-latest · bun",
+			"ubuntu-latest · yarn",
+			"macos-latest · npm",
+			"macos-latest · pnpm",
+			"macos-latest · bun",
+			"macos-latest · yarn",
+		],
+	},
+	{
+		job: "mise-repro",
+		axis: "pi_via",
+		prCells: ["ubuntu-latest · mise-node"],
+		fullCells: [
+			"ubuntu-latest · mise-node",
+			"ubuntu-latest · mise-npm-backend",
+			"macos-latest · mise-node",
+			"macos-latest · mise-npm-backend",
+		],
+	},
+];
+
+describe.each(MATRIX_GATED_JOBS)(
+	"install-smoke.yml $job matrix: a pull_request-eligible cell, not an event gate (#3043)",
+	({ job, axis, prCells, fullCells }) => {
+		const workflow = loadWorkflow() as unknown as {
+			jobs?: Record<
+				string,
+				{ if?: unknown; strategy?: { matrix?: Record<string, unknown> } }
+			>;
+		};
+		const matrix = workflow.jobs?.[job]?.strategy?.matrix;
+
+		function cellsFor(eventName: string): string[] {
+			const os = evaluateMatrixExpression(matrix?.os, eventName) as string[];
+			const axisValues = evaluateMatrixExpression(
+				matrix?.[axis],
+				eventName,
+			) as string[];
+			const exclude = (evaluateMatrixExpression(matrix?.exclude, eventName) ??
+				[]) as Array<Record<string, string>>;
+			return os
+				.flatMap((osValue) =>
+					axisValues.map((axisValue) => ({ os: osValue, [axis]: axisValue })),
+				)
+				.filter(
+					(cell) =>
+						!exclude.some((entry) =>
+							Object.entries(entry).every(
+								([key, value]) =>
+									(cell as Record<string, string>)[key] === value,
+							),
+						),
+				)
+				.map(
+					(cell) => `${cell.os} · ${(cell as Record<string, string>)[axis]}`,
+				);
+		}
+
+		it("carries no job-level `if:` (the matrix is the whole gate)", () => {
+			expect(workflow.jobs?.[job]?.if).toBeUndefined();
+		});
+
+		it(`runs exactly ${prCells.join(", ")} on pull_request`, () => {
+			expect(cellsFor("pull_request")).toEqual([...prCells]);
+		});
+
+		it.each(["push", "schedule", "workflow_dispatch", "repository_dispatch"])(
+			"keeps the full matrix on %s",
+			(event) => {
+				expect(cellsFor(event).sort()).toEqual([...fullCells].sort());
+			},
+		);
+
+		// The PR-time narrowing is done with `exclude`, NOT by turning `os` into
+		// an expression, because tests/support/workflow-shell-portability.ts
+		// decides "can this job run on macOS?" by looking for a literal `macos-`
+		// string in the matrix value: an expression-valued `os` would silently
+		// drop the job from that bash-4 portability sweep while every test here
+		// stayed green.
+		it("keeps matrix.os a literal array so the macOS portability sweep still sees this job", () => {
+			expect(matrix?.os).toEqual(["ubuntu-latest", "macos-latest"]);
+		});
+	},
+);

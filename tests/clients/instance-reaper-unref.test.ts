@@ -13,9 +13,20 @@
  * whether `unref()` was called on the child and its stdout. Fail-then-pass:
  * on pre-fix code (no `unrefReaperChild` calls) `child.unref()` is never
  * invoked and these assertions fail; post-fix they pass.
+ *
+ * Mocking `node:child_process` and `instance-registry.js` is NOT enough to
+ * make the sweep hermetic: `sweepUntrackedOrphans` reaches the real
+ * `<PI_LENS_HOME>/orphan-backstop.{json,lock}` (cooldown stamp + cross-process
+ * sweep lock) BEFORE it enumerates anything, and since #2912 that home is ONE
+ * directory shared by the whole Vitest run — see the per-case `PI_LENS_HOME`
+ * pin below (#3042 shape; master 038e28b's Unit red).
  */
 
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { removeTempDirSync } from "./test-utils.js";
 
 interface FakeChild {
 	unref: ReturnType<typeof vi.fn>;
@@ -84,13 +95,36 @@ function expectAllChildrenUnrefd() {
 }
 
 describe("instance-reaper: fire-and-forget spawns are unref'd (#1153)", () => {
+	// #3042 shape, caught by master 038e28b's Unit lane: `sweepUntrackedOrphans`
+	// takes `<PI_LENS_HOME>/orphan-backstop.lock` and reads the
+	// `orphan-backstop.json` cooldown stamp (30 min) BEFORE it enumerates, so
+	// against the run-shared home (#2912: one `.probe-home` for the whole run,
+	// not a per-worker temp dir) ANY sibling fork's real `session_start` —
+	// measured: `tests/index-integration.test.ts` arms 37 real
+	// `scheduleUntrackedOrphanSweep()` timers through `index.js` — leaves a
+	// fresh stamp that makes this file's sweep return `cooldown` with ZERO
+	// spawns ("expected 0 to be greater than or equal to 1"). The same stamp is
+	// what THIS file used to leave behind for the next reader. A private home
+	// per case is the seam production already resolves the stamp through
+	// (`clients/file-utils.ts` `getGlobalPiLensDir`), and the idiom
+	// `instance-reaper-backstop.test.ts` (#3066) and
+	// `instance-reaper-prune-concurrency.test.ts` already use.
+	let previousHome: string | undefined;
+	let caseHome: string;
+
 	beforeEach(() => {
+		previousHome = process.env.PI_LENS_HOME;
+		caseHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-unref-"));
+		process.env.PI_LENS_HOME = caseHome;
 		h.spawned.length = 0;
 		h.state.registry = [];
 		h.state.enabled = true;
 	});
 
 	afterEach(() => {
+		if (previousHome === undefined) delete process.env.PI_LENS_HOME;
+		else process.env.PI_LENS_HOME = previousHome;
+		removeTempDirSync(caseHome);
 		vi.clearAllMocks();
 	});
 

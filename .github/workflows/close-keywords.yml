@@ -18,6 +18,11 @@ jobs:
     name: Close-keyword syntax
     if: github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default. This job runs
+    # on pull_request so --branch master matched no runs; measured max over the
+    # last 10 successful runs regardless of branch: 14s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
     permissions:
       pull-requests: read
     steps:

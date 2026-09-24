@@ -23,10 +23,10 @@ export declare function lintPrBody(
 	body?: string,
 	options?: {
 		requireTestAssessment?: boolean;
+		workingTree?: boolean;
 		diff?: string;
 		cwd?: string;
 		git?: (args: string[], options?: Record<string, unknown>) => string;
-		workingTree?: boolean;
 		headFiles?: Map<string, string>;
 	},
 ): {

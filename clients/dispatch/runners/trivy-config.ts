@@ -39,6 +39,7 @@
 import { formatToolFailure } from "./utils/tool-failure.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { pathsEqual } from "../../path-utils.js";
 import { incrementDegradationCount } from "../../degradation-ledger.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import { resolveRunnerCwd } from "../../tool-cwd.js";
@@ -109,6 +110,7 @@ function normalizeSeverity(raw: unknown): TrivySeverity {
 export function parseTrivyConfigOutput(
 	raw: string,
 	filePath: string,
+	cwd = process.cwd(),
 ): Diagnostic[] {
 	if (!raw.trim()) return [];
 	let parsed: unknown;
@@ -121,8 +123,15 @@ export function parseTrivyConfigOutput(
 	if (!Array.isArray(results)) return [];
 
 	const diagnostics: Diagnostic[] = [];
+	const absTarget = path.resolve(cwd, filePath);
 	for (const resultEntry of results) {
 		if (!resultEntry || typeof resultEntry !== "object") continue;
+		const target = (resultEntry as { Target?: unknown }).Target;
+		if (
+			typeof target !== "string" ||
+			!pathsEqual(path.resolve(cwd, target), absTarget)
+		)
+			continue;
 		const rows = (resultEntry as { Misconfigurations?: unknown })
 			.Misconfigurations;
 		if (!Array.isArray(rows)) continue;
@@ -261,6 +270,7 @@ const trivyConfigRunner: RunnerDefinition = {
 		const diagnostics = parseTrivyConfigOutput(
 			result.stdout || "",
 			ctx.filePath,
+			cwd,
 		);
 		if (diagnostics.length === 0) {
 			return { status: "succeeded", diagnostics: [], semantic: "none" };

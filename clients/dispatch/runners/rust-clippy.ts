@@ -5,6 +5,7 @@
  */
 
 import { isAbsolute, resolve } from "node:path";
+import { pathsEqual } from "../../path-utils.js";
 import { rustClient } from "../../rust-client.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import { stripAnsi } from "../../sanitize.js";
@@ -171,9 +172,13 @@ const rustClippyRunner: RunnerDefinition = {
 		// a crate-mate's pre-existing diagnostic must NOT fail the edited file's
 		// turn. Filter to the edited file like golangci-lint — if the edited file
 		// is clean, this turn succeeds even when siblings carry warnings/errors.
+		// #3278: one seam for reported-path attribution — see javac.ts. This
+		// member already had the right BASE (`parseClippyOutput` resolves
+		// `span.file` against `cargoDir`); what it lacked was the on-disk
+		// identity predicate.
 		const absEdited = resolve(ctx.filePath);
-		const diagnostics = allDiagnostics.filter(
-			(d) => resolve(d.filePath) === absEdited,
+		const diagnostics = allDiagnostics.filter((d) =>
+			pathsEqual(resolve(cargoDir, d.filePath), absEdited),
 		);
 
 		const hasErrors = diagnostics.some((d) => d.semantic === "blocking");

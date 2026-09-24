@@ -27,7 +27,7 @@ import { removeTempDirSync } from "./test-utils.js";
 describe("findLocalTyposConfig (#283)", () => {
 	let root: string;
 	beforeEach(() => {
-		root = fs.mkdtempSync(path.join(os.tmpdir(), "typos-cfg-"));
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-typos-cfg-"));
 	});
 	afterEach(() => {
 		removeTempDirSync(root);

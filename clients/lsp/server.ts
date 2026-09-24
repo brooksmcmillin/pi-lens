@@ -30,6 +30,7 @@ import {
 	DOTNET_FSHARP_ROOT_MARKERS,
 	KIND_EXTENSIONS,
 } from "../file-kinds.js";
+import { extensionsForLanguage } from "../language-registry.js";
 import {
 	CARGO_WORKSPACE_MEMBER_DIALECT,
 	direntsHaveMarkerGlobMatch,
@@ -37,6 +38,7 @@ import {
 	isFullyQualified,
 	isWindowsPath,
 	matchesWorkspaceMemberPattern,
+	normalizeEphemeralMapKey,
 	pathsEqual,
 } from "../path-utils.js";
 import {
@@ -1260,31 +1262,32 @@ function nodeBinCandidates(root: string, baseName: string): string[] {
 	return [...nodeBinLocalCandidates(root, baseName), baseName];
 }
 
-function normalizeSlashKey(value: string): string {
-	const normalized = path.resolve(value).replace(/\\/g, "/");
-	return process.platform === "win32" ? normalized.toLowerCase() : normalized;
-}
-
 function piAgentExtensionsRootKey(file: string): string | undefined {
-	const dirKey = normalizeSlashKey(path.dirname(path.resolve(file)));
+	// #1193 P3: `normalizeEphemeralMapKey` IS this module's former
+	// `normalizeSlashKey` — slash-fold, then lowercase only on win32 — and these
+	// directory keys are exactly what it is scoped for: process-local, same-run,
+	// derived from this process's own `path.resolve`, never persisted and never
+	// compared against an externally supplied spelling.
+	const dirKey = normalizeEphemeralMapKey(path.dirname(path.resolve(file)));
 	const marker = "/.pi/agent/extensions";
 	const index = dirKey.indexOf(marker);
 	if (index === -1) return undefined;
 	return dirKey.slice(0, index + marker.length);
 }
 
-function normalizeRootKey(root: string): string {
-	return process.platform === "win32"
-		? path.resolve(root).toLowerCase()
-		: path.resolve(root);
-}
-
 function IgnoreHomeRoot(primary: RootFunction): RootFunction {
-	const homeKey = normalizeRootKey(os.homedir());
+	// #1193 P3: the former `normalizeRootKey` folded case on win32 but left the
+	// separator alone; both sides of the comparison below go through the same
+	// derivation, so adding the seam's slash fold cannot change the verdict for
+	// any spelling the old copy already agreed on, and it makes a mixed-separator
+	// root agree with the home directory it names.
+	const homeKey = normalizeEphemeralMapKey(path.resolve(os.homedir()));
 	return withRootMarkers(async (file: string): Promise<string | undefined> => {
 		const root = await primary(file);
 		if (!root) return undefined;
-		return normalizeRootKey(root) === homeKey ? undefined : root;
+		return normalizeEphemeralMapKey(path.resolve(root)) === homeKey
+			? undefined
+			: root;
 	}, primary.rootMarkers ?? []);
 }
 
@@ -2167,7 +2170,7 @@ async function findExtensionBoundedRoot(
 		}
 		// Stop at or beyond the extensions root — never walk into the
 		// pi-agent-wide scope.
-		const currentKey = normalizeSlashKey(currentDir);
+		const currentKey = normalizeEphemeralMapKey(path.resolve(currentDir));
 		if (currentKey === extensionRootKey) return undefined;
 		const parent = path.dirname(currentDir);
 		if (parent === currentDir) return undefined;
@@ -3231,6 +3234,25 @@ export const GleamServer: LSPServerInfo = {
 	},
 };
 
+export const TinymistServer: LSPServerInfo = {
+	id: "tinymist",
+	name: "Tinymist",
+	extensions: extensionsForLanguage("typst"),
+	root: RootWithFallback(createRootDetector(["typst.toml", ".git"])),
+	availabilityKey: "tinymist",
+	async spawn(root, options) {
+		return resolveAndLaunch(
+			{
+				candidates: ["tinymist"],
+				args: ["lsp"],
+				cwd: root,
+				managedToolId: "tinymist",
+			},
+			options?.allowInstall,
+		);
+	},
+};
+
 export const MarksmanServer: LSPServerInfo = {
 	id: "marksman",
 	name: "Marksman",
@@ -3370,7 +3392,7 @@ export const FishServer: LSPServerInfo = {
 		return resolveAndLaunch(
 			{
 				candidates: nodeBinCandidates(root, "fish-lsp"),
-				args: ["start"],
+				args: ["start", "--stdio"],
 				cwd: root,
 				managedToolId: "fish-lsp",
 			},
@@ -4029,6 +4051,7 @@ export const LSP_SERVERS: LSPServerInfo[] = [
 	ElixirServer,
 	ElixirExpertServer,
 	GleamServer,
+	TinymistServer,
 	MarksmanServer,
 	OCamlServer,
 	ClojureServer,

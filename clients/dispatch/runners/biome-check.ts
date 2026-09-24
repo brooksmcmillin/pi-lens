@@ -6,7 +6,9 @@
  * mutating files mid-dispatch after LSP sync has already happened.
  */
 
+import * as path from "node:path";
 import { incrementDegradationCount } from "../../degradation-ledger.js";
+import { pathsEqual } from "../../path-utils.js";
 import { mapWithConcurrency } from "../../dependency-checker.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import {
@@ -94,40 +96,55 @@ export function biomeRuleNameFromCategory(
 export function parseBiomeJson(
 	raw: string,
 	filePath: string,
+	cwd: string,
 	fixKindByRule?: ReadonlyMap<string, BiomeFixKind>,
 ): { diagnostics: Diagnostic[]; parseError?: string } {
 	try {
 		const result = JSON.parse(raw);
 		const diagnostics: BiomeDiagnostic[] = result.diagnostics || [];
 		const autofix = getAutofixCapability("biome");
+		const absTarget = path.resolve(cwd, filePath);
 
 		return {
-			diagnostics: diagnostics.map((d) => {
-				const ruleName = biomeRuleNameFromCategory(d.category);
-				const fixKind = ruleName ? fixKindByRule?.get(ruleName) : undefined;
-				const isFixable = fixKind === "safe" || fixKind === "unsafe";
+			diagnostics: diagnostics.flatMap((d) => {
+				// #3295: `location.path` is biome's own name for the file each
+				// diagnostic is about; `biome.json` `files.includes` can widen the
+				// run past the argv.
+				if (
+					d.location?.path &&
+					!pathsEqual(path.resolve(cwd, d.location.path), absTarget)
+				)
+					return [];
+				{
+					const ruleName = biomeRuleNameFromCategory(d.category);
+					const fixKind = ruleName ? fixKindByRule?.get(ruleName) : undefined;
+					const isFixable = fixKind === "safe" || fixKind === "unsafe";
 
-				return {
-					id: `biome:${d.category}:${d.location.start.line}`,
-					message: d.message,
-					filePath,
-					line: d.location.start.line,
-					column: d.location.start.column,
-					severity: normalizeBiomeSeverity(d.severity),
-					semantic: d.severity === "error" ? "blocking" : ("warning" as const),
-					tool: "biome",
-					rule: d.category,
-					fixable: isFixable,
-					// Mirrors `biomeClient.fixFileAsync`'s own `lint --write` call
-					// (no `--unsafe`, clients/biome-client.ts): the pipeline only
-					// ever applies SAFE fixes, so only "safe" earns autoFixAvailable.
-					autoFixAvailable:
-						fixKind === "safe" && (autofix?.safePipelineAutofix ?? false),
-					fixKind:
-						isFixable && autofix?.fixKind !== "none"
-							? autofix?.fixKind
-							: undefined,
-				};
+					return [
+						{
+							id: `biome:${d.category}:${d.location.start.line}`,
+							message: d.message,
+							filePath,
+							line: d.location.start.line,
+							column: d.location.start.column,
+							severity: normalizeBiomeSeverity(d.severity),
+							semantic:
+								d.severity === "error" ? "blocking" : ("warning" as const),
+							tool: "biome",
+							rule: d.category,
+							fixable: isFixable,
+							// Mirrors `biomeClient.fixFileAsync`'s own `lint --write` call
+							// (no `--unsafe`, clients/biome-client.ts): the pipeline only
+							// ever applies SAFE fixes, so only "safe" earns autoFixAvailable.
+							autoFixAvailable:
+								fixKind === "safe" && (autofix?.safePipelineAutofix ?? false),
+							fixKind:
+								isFixable && autofix?.fixKind !== "none"
+									? autofix?.fixKind
+									: undefined,
+						},
+					];
+				}
 			}),
 		};
 	} catch (err) {
@@ -323,7 +340,12 @@ const biomeCheckJsonRunner: RunnerDefinition = {
 
 		const parsed =
 			checkResult.status === 0 || checkResult.status === 1
-				? parseBiomeJson(checkResult.stdout || "", ctx.filePath, fixKindByRule)
+				? parseBiomeJson(
+						checkResult.stdout || "",
+						ctx.filePath,
+						cwd,
+						fixKindByRule,
+					)
 				: { diagnostics: [] as Diagnostic[] };
 
 		if (parsed.parseError) {

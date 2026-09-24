@@ -26,6 +26,15 @@
 
 ## Evidence rules
 
+- **Already-shipped check before naming a slice:** for every umbrella member the
+  brief cites as remaining work, grep the current tree and the closing PRs and
+  state shipped, partially shipped, or not shipped with `file:line`; a first
+  slice may name only work whose absence was verified on the current head.
+  The 2026-09-22 primitives brief named three scanner filter blocks as the
+  #1461 first slice even though #1622/#1625/#1628 had already removed them;
+  the fixer found the premise error in PR #3264 and the #1892 comment on
+  2026-09-23.
+
 - A reported defect is not confirmed until the production-path probe is red on
   the current tree for the reported reason.
 - A probe must distinguish competing hypotheses, use independent observations,

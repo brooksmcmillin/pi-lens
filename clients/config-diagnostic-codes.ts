@@ -188,6 +188,8 @@ export const CONFIG_DIAGNOSTIC_CODES = {
 	PILENS_CFG_0008: "config resolution failed; whole configuration ignored",
 	/** A tool key is unknown or names a required, non-disableable tool. */
 	PILENS_CFG_0009: "unknown or non-disableable tool config key ignored",
+	/** A lower-precedence supported global config file was shadowed by the winner. */
+	PILENS_CFG_0010: "lower-precedence global config file shadowed",
 } as const satisfies Record<`PILENS_CFG_${string}`, string>;
 
 export type ConfigDiagnosticCode = keyof typeof CONFIG_DIAGNOSTIC_CODES;

@@ -93,11 +93,48 @@ export function resolveSkillPaths(importMetaUrl: string): string[] {
 
 	if (health.status !== "healthy") {
 		const entryDir = path.dirname(fileURLToPath(importMetaUrl));
-		const reason = `${describeBundledResourceHealth(
+		const healthDescription = describeBundledResourceHealth(
 			health,
 			skillsDir,
 			`no SKILL.md (or loadable .md) found under ${skillsDir}`,
-		)} (entry loaded from ${entryDir})`;
+		);
+		// #3175: two DIFFERENT strings, not one `reason` reused for both sinks
+		// as this used to be.
+		//
+		// `notifyReason` (uncapped — `notifyUserDegradation` never truncates)
+		// keeps the full, natural description: classification first, then
+		// where the entry file that triggered this lookup was loaded from.
+		const notifyReason = `${healthDescription} (entry loaded from ${entryDir})`;
+		// `ledgerReason` is built from a SHORT, path-free classification tag
+		// instead of `healthDescription`, because the LEDGER's `reason` field
+		// IS capped (`truncateForLedger`, `LEDGER_FIELD_MAX` = 200 chars,
+		// head-preserving — see `ledger-bounds.ts`) and `healthDescription`
+		// repeats `skillsDir` in full — already recorded, untruncated, in
+		// `subject` below whenever it's under the cap on its own. A
+		// managed-cache `skillsDir` plus this entry's `entryDir` sharing one
+		// long root routinely sums past 200 chars (#3175: TMPDIR ~60+ chars is
+		// a real dry-roll and CI-lane shape, not a pathological one); a
+		// head-preserving cap over the OLD concatenation (dir-bearing text
+		// first, `entryDir` last) then kept the redundant path and dropped the
+		// one fact nothing else records — which entry file's directory
+		// triggered this lookup (#2587's "entry file copied out of the
+		// package tree" case is exactly this). Simply swapping that order is
+		// NOT enough: `healthDescription`'s own `unreadable` branch reads
+		// `cannot read ${dir} (${fsErrorCode})`, so `dir` sitting in the
+		// MIDDLE of the classification text can still push `fsErrorCode`
+		// itself off the cap once `entryDir` leads. Dropping the redundant
+		// path from the ledger's copy entirely — keeping only the
+		// classification word/code — removes that squeeze instead of moving
+		// it, and leaves comfortable room (entry directories under roughly
+		// 150 chars fit whole) for every managed-cache/npm-install layout
+		// observed so far.
+		const classification =
+			health.status === "unreadable"
+				? `cannot read (${health.fsErrorCode})`
+				: health.status === "empty"
+					? "no SKILL.md found"
+					: "no such directory";
+		const ledgerReason = `${classification} (entry loaded from ${entryDir})`;
 		// #2626 review F3: the notify-once gate previously re-derived "have we
 		// already recorded this" by scanning `getDegradationSummary()` and
 		// comparing the RAW `skillsDir` against subjects the ledger stores
@@ -119,8 +156,8 @@ export function resolveSkillPaths(importMetaUrl: string): string[] {
 			skillsDir,
 			health,
 			"skills",
-			reason,
-			`pi-lens: registers zero skills — ${reason}.`,
+			ledgerReason,
+			`pi-lens: registers zero skills — ${notifyReason}.`,
 		);
 	}
 

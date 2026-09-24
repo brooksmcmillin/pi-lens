@@ -5,6 +5,7 @@
 
 import * as fs from "node:fs";
 import * as os from "node:os";
+import * as path from "node:path";
 
 const MB = 1024 * 1024;
 
@@ -153,5 +154,146 @@ export function formatVerdict(exit, watch) {
 		// 33010136296 the victim was `npm`, the SMALLEST node process in the
 		// tree, which is by itself evidence against the kernel OOM killer.
 		(watch.childPid ? ` childPid=${watch.childPid}` : "")
+	);
+}
+
+// --- Per-sample cgroup attribution (#2042 2026-09-15) -----------------------
+//
+// The 2026-09-15 diagnosis's "cheapest probe" (section A): a 2s (now 200ms)
+// `MemAvailable` poll cannot see per-process RSS, PID-count churn, or PSI
+// stall. cgroup v2 can, with no sampling error at all for `memory.peak`. This
+// reads the SAME cgroup the "Kernel kill evidence" CI step already resolves,
+// so the two records describe the same box the same way.
+
+/**
+ * Resolve this process's own cgroup v2 directory by walking `/proc/self/cgroup`
+ * upward until an ancestor exposes a readable `memory.events` — the same
+ * criterion, and the same walk direction, the "Kernel kill evidence" step uses
+ * in bash. cgroup v2's root union hierarchy never populates `memory.events`
+ * (or `memory.max`), so reading the literal root silently prints nothing on
+ * every run — the defect the "Runner capacity" step repeated four lines away
+ * from the #2230 fix until 2026-09-15.
+ *
+ * @param {string} [cgroupRoot]
+ * @param {string} [procCgroupPath]
+ * @returns {string | null}
+ */
+export function resolveCgroupDir(
+	cgroupRoot = "/sys/fs/cgroup",
+	procCgroupPath = "/proc/self/cgroup",
+) {
+	let cg;
+	try {
+		const text = fs.readFileSync(procCgroupPath, "utf8");
+		const line = text.split("\n").find((entry) => entry.startsWith("0:"));
+		cg = line ? line.split(":").slice(2).join(":").trim() : null;
+	} catch {
+		return null;
+	}
+	if (!cg) return null;
+
+	let p = cg;
+	for (;;) {
+		const dir = path.join(cgroupRoot, p === "/" ? "" : p);
+		try {
+			fs.accessSync(path.join(dir, "memory.events"), fs.constants.R_OK);
+			return dir;
+		} catch {
+			// not this one — walk up
+		}
+		if (p === "/" || p === "") return null;
+		p = path.dirname(p);
+	}
+}
+
+/**
+ * @param {string} text raw PSI file content (`some avg10=.. total=N\nfull ...`)
+ * @returns {number | null} the "some" line's cumulative stall total, in µs
+ */
+function parsePressureSomeTotal(text) {
+	const some = text.split("\n").find((line) => line.startsWith("some "));
+	const match = some ? /total=(\d+)/.exec(some) : null;
+	return match ? Number(match[1]) : null;
+}
+
+/**
+ * This run's cgroup memory/PID/PSI counters — the axis a host-memory poll
+ * cannot see: `memory.peak` is an exact per-cgroup high-water mark, and PSI's
+ * `total` is a cumulative stall counter, so a stall between polls still shows
+ * up in the next one. Every field is independently best-effort: an absent or
+ * unreadable file (a non-cgroup-v2 host, a sandbox without pids/PSI
+ * controllers delegated) yields `null` for that field alone, never a thrown
+ * error that would take the sampler down.
+ *
+ * @param {string | null} cgroupDir
+ * @returns {{ memCurrentMb: number|null, memPeakMb: number|null, pidsCurrent: number|null, memPressureSomeTotal: number|null, cpuPressureSomeTotal: number|null }}
+ */
+export function readCgroupSample(cgroupDir) {
+	const readNum = (name) => {
+		if (!cgroupDir) return null;
+		try {
+			const n = Number(
+				fs.readFileSync(path.join(cgroupDir, name), "utf8").trim(),
+			);
+			return Number.isFinite(n) ? n : null;
+		} catch {
+			return null;
+		}
+	};
+	const readPressureTotal = (name) => {
+		if (!cgroupDir) return null;
+		try {
+			return parsePressureSomeTotal(
+				fs.readFileSync(path.join(cgroupDir, name), "utf8"),
+			);
+		} catch {
+			return null;
+		}
+	};
+	const current = readNum("memory.current");
+	const peak = readNum("memory.peak");
+	return {
+		memCurrentMb: current === null ? null : Math.round(current / MB),
+		memPeakMb: peak === null ? null : Math.round(peak / MB),
+		pidsCurrent: readNum("pids.current"),
+		memPressureSomeTotal: readPressureTotal("memory.pressure"),
+		cpuPressureSomeTotal: readPressureTotal("cpu.pressure"),
+	};
+}
+
+/**
+ * One line of the on-disk sample tail, appended (never rewritten — see
+ * `scripts/with-memory-watch.mjs`) once per tick. Kept separate from the
+ * host-memory step-print policy above: this line is never printed to the
+ * job's console directly, only appended to the file, so it can afford to
+ * carry every field every tick.
+ *
+ * The `[mem-sample] ` prefix (round-2 review F3) is deliberately distinct
+ * from `[mem-watch]`: `scripts/lib/ci-failure-classifier.mjs` matches only
+ * `[mem-watch] … availableMb=N of M` today, so these lines are NOT yet
+ * consumed by the failure classifier — the prefix exists so a future
+ * classifier change has a grep-able handle, not because one reads it yet.
+ *
+ * `at` carries milliseconds (round-2 review F1): the shared `[mem-watch]`
+ * `at` (HH:MM:SS, asserted verbatim in `formatVerdict`'s `lowWaterAt=` and by
+ * `ci-failure-classifier.test.ts`) is second-resolution, but the cadence here
+ * is 200ms — on the 2026-09-15 head's own CI run, 58 of the tail's 300 lines
+ * shared a wall-clock second with four to five siblings, indistinguishable
+ * without the milliseconds. The caller passes a SEPARATE, higher-resolution
+ * timestamp here; the shared `at` local is never widened.
+ *
+ * @param {string} atMs HH:MM:SS.mmm
+ * @param {{ availableMb: number, totalMb: number }} hostSample
+ * @param {ReturnType<typeof readCgroupSample>} cgroupSample
+ * @returns {string}
+ */
+export function formatSampleLine(atMs, hostSample, cgroupSample) {
+	const n = (v) => (v === null || v === undefined ? "?" : v);
+	return (
+		`[mem-sample] ${atMs} availableMb=${hostSample.availableMb} totalMb=${hostSample.totalMb} ` +
+		`memCurrentMb=${n(cgroupSample.memCurrentMb)} memPeakMb=${n(cgroupSample.memPeakMb)} ` +
+		`pids=${n(cgroupSample.pidsCurrent)} ` +
+		`memPressureSomeTotal=${n(cgroupSample.memPressureSomeTotal)} ` +
+		`cpuPressureSomeTotal=${n(cgroupSample.cpuPressureSomeTotal)}`
 	);
 }

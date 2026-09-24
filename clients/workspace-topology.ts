@@ -39,7 +39,10 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { PROJECT_CONFIG_BASENAMES } from "./config-locations.js";
+import {
+	PROJECT_CONFIG_BASENAMES,
+	isResolvedGlobalConfigPath,
+} from "./config-locations.js";
 import { logLatency } from "./latency-logger.js";
 import {
 	isAtOrAboveHomeDir,
@@ -463,12 +466,21 @@ export interface PiLensConfigMarker {
  * `.pi-lens.json`/`pi-lens.json` directly IN `dir` — no upward walk. The
  * shared-index equivalent of `project-lens-config.ts`'s old private
  * `findPiLensConfigInDir` probe loop.
+ *
+ * A candidate that IS the resolved global config path is refused
+ * (global-config-location PR, refs #2457): the global tier reads that file by
+ * absolute path, and discovering it here a second time made the nested ignore
+ * layering full-validate it and warn that its global-only keys are "not
+ * honored in a project config" — including the notice advising the user to
+ * set them in the very file being ignored. The refusal is observable through
+ * the marker staying absent, the same shape as a directory with no marker.
  */
 export function findPiLensConfigMarkerInDir(
 	dir: string,
 ): PiLensConfigMarker | undefined {
 	const markers = getDirectoryMarkers(dir);
 	if (!markers.piLensConfigPath) return undefined;
+	if (isResolvedGlobalConfigPath(markers.piLensConfigPath)) return undefined;
 	const stat = (() => {
 		try {
 			return fs.statSync(markers.piLensConfigPath!);

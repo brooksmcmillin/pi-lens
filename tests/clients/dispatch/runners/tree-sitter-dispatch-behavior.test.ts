@@ -94,6 +94,43 @@ describe("tree-sitter runner — dispatch filtering (#448)", () => {
 		expect(debuggerLines).toEqual([3]);
 	}, 30_000);
 
+	// #3041: the tree-sitter runner's `ignore_paths` carve-out (#965) had NO test
+	// of its own — folding its matcher onto the shared `rule-ignores` seam was
+	// mutation-inert until this pair. `console-statement` is the one shipped query
+	// that declares `ignore_paths`, carving out `scripts/**` and logger sinks.
+	it("honors a query's ignore_paths carve-out and still fires elsewhere (#965)", async () => {
+		const src = "console.log('cli output');\n";
+		const carved = await treeSitterRunner.run(
+			env.addFile("scripts/cli.ts", src).ctx,
+		);
+		const kept = await treeSitterRunner.run(env.addFile("src/app.ts", src).ctx);
+		expect(firedRuleIds(carved)).not.toContain("console-statement");
+		expect(firedRuleIds(kept)).toContain("console-statement");
+	}, 30_000);
+
+	it("applies console directory carve-outs at nested depths only", async () => {
+		for (const relPath of [
+			"packages/tool/scripts/cli.ts",
+			"packages/tool/bin/runner.ts",
+		]) {
+			const carved = await treeSitterRunner.run(
+				env.addFile(relPath, "console.log('cli output');\n").ctx,
+			);
+			expect(firedRuleIds(carved)).not.toContain("console-statement");
+		}
+
+		for (const relPath of [
+			"src/myscripts/app.ts",
+			"src/scripts-file.ts",
+			"src/bin-helper.ts",
+		]) {
+			const kept = await treeSitterRunner.run(
+				env.addFile(relPath, "console.log('application output');\n").ctx,
+			);
+			expect(firedRuleIds(kept)).toContain("console-statement");
+		}
+	}, 30_000);
+
 	it("applies inline suppression to a diagnostic produced by the real rule", async () => {
 		const content = [
 			"function suppressed() {",

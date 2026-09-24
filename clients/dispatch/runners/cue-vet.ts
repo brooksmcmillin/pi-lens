@@ -105,6 +105,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { safeSpawnAsync } from "../../safe-spawn.js";
+import { pathsEqual } from "../../path-utils.js";
 import { resolveRunnerCwd } from "../../tool-cwd.js";
 import {
 	createAvailabilityChecker,
@@ -231,13 +232,28 @@ export function hasPackageClause(content: string): boolean {
 	return false;
 }
 
-/** `.\bad.cue`, `./bad.cue`, and `bad.cue` all name the same file. */
+/**
+ * Is this reported location about the file we dispatched for? ONE seam answers
+ * that for every runner (#3278): resolve the tool's spelling against the cwd
+ * the tool RAN in and compare through `pathsEqual`.
+ *
+ * `cue` prints every position relative to its own cwd and prefixes a `./` when
+ * the result does not already start with a dot (`cue/errors/errors.go:586-596`
+ * at v0.11.0: `filepath.Rel(cfg.Cwd, s)`), which is why `.\bad.cue`,
+ * `./bad.cue` and `bad.cue` all name the vetted file — `pathsEqual` folds the
+ * separator and the `.` segment, so all three still match.
+ *
+ * What the basename compare this replaces could not do is tell those apart
+ * from `./sub/bad.cue` or `../lib/bad.cue`: an imported package's file that
+ * merely SHARES the touched file's basename was reported as the touched file's
+ * own failure (the over-merge direction, #3278 sub-shape C).
+ */
 function locationMatchesFile(
 	location: CueVetLocation,
-	fileName: string,
+	absTarget: string,
+	vetCwd: string,
 ): boolean {
-	const normalized = location.file.replace(/\\/g, "/").replace(/^\.\//, "");
-	return path.posix.basename(normalized) === fileName;
+	return pathsEqual(path.resolve(vetCwd, location.file), absTarget);
 }
 
 function toDiagnostic(
@@ -292,8 +308,12 @@ function toDiagnostic(
 export function filterToTouchedFile(
 	errors: CueVetError[],
 	fileName: string,
+	vetCwd: string,
 ): Diagnostic[] | undefined {
 	if (errors.length === 0) return undefined;
+	// `cue vet` always runs in the touched file's own directory, so the vet cwd
+	// joined with the bare file name IS the dispatched file.
+	const absTarget = path.resolve(vetCwd, fileName);
 	const withLocation = errors.filter((error) => error.locations.length > 0);
 	const unattributable = errors.filter((error) => error.locations.length === 0);
 	if (withLocation.length === 0) return undefined;
@@ -301,7 +321,7 @@ export function filterToTouchedFile(
 	const diagnostics: Diagnostic[] = [];
 	for (const error of withLocation) {
 		const match = error.locations.find((location) =>
-			locationMatchesFile(location, fileName),
+			locationMatchesFile(location, absTarget, vetCwd),
 		);
 		if (!match) continue; // sibling-only finding — surfaces when that file is touched
 		diagnostics.push(
@@ -431,7 +451,7 @@ const cueVetRunner: RunnerDefinition = {
 		// the directory-scoped path — one code path, and a single-file run
 		// that somehow fails with no location at all still gets the same
 		// never-silently-clean `undefined` fallback as the directory path.
-		const filtered = filterToTouchedFile(errors, fileName);
+		const filtered = filterToTouchedFile(errors, fileName, fileDir);
 
 		if (filtered === undefined) {
 			// Nonzero exit, some output, but nothing in it could be attributed to

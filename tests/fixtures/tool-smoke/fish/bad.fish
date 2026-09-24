@@ -1,2 +1,1 @@
-if true
-	echo missing end
+function; end; end;

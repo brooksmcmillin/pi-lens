@@ -82,6 +82,7 @@ describe("vale parseValeOutput (real binary shape, #1933 review F1)", () => {
 		const diagnostics = parseValeOutput(
 			REAL_WARNING_SUGGESTION_OUTPUT,
 			"AGENTS.md",
+			".",
 		);
 
 		// Pre-fix: this was always [] -- `Data.Files` never existed on real
@@ -101,6 +102,7 @@ describe("vale parseValeOutput (real binary shape, #1933 review F1)", () => {
 		const diagnostics = parseValeOutput(
 			REAL_WARNING_SUGGESTION_OUTPUT,
 			"AGENTS.md",
+			".",
 		);
 
 		const claim = diagnostics.find((d) => d.rule === "Google.ExcessiveClaims");
@@ -110,7 +112,7 @@ describe("vale parseValeOutput (real binary shape, #1933 review F1)", () => {
 	});
 
 	it("parses a real error-severity alert and marks it blocking", () => {
-		const diagnostics = parseValeOutput(REAL_ERROR_OUTPUT, "sample.md");
+		const diagnostics = parseValeOutput(REAL_ERROR_OUTPUT, "sample.md", ".");
 
 		// Pre-fix: this was also always [] -- the exact defect the reviewer
 		// flagged: a real vale run with real errors silently read as
@@ -123,9 +125,9 @@ describe("vale parseValeOutput (real binary shape, #1933 review F1)", () => {
 	});
 
 	it("returns no diagnostics for empty or unparseable output", () => {
-		expect(parseValeOutput("", "AGENTS.md")).toEqual([]);
-		expect(parseValeOutput("not json", "AGENTS.md")).toEqual([]);
+		expect(parseValeOutput("", "AGENTS.md", ".")).toEqual([]);
+		expect(parseValeOutput("not json", "AGENTS.md", ".")).toEqual([]);
 		// An empty flat map (vale ran, found nothing) is a real, valid shape.
-		expect(parseValeOutput("{}", "AGENTS.md")).toEqual([]);
+		expect(parseValeOutput("{}", "AGENTS.md", ".")).toEqual([]);
 	});
 });

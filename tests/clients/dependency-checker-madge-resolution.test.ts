@@ -75,8 +75,12 @@ describe("DependencyChecker madge resolution (#766)", () => {
 
 	beforeEach(() => {
 		vi.resetAllMocks();
-		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pilens-madge-resolve-"));
-		otherRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pilens-madge-other-"));
+		tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-pilens-madge-resolve-"),
+		);
+		otherRoot = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-pilens-madge-other-"),
+		);
 		findNodeToolBinary.mockResolvedValue(undefined);
 		ensureTool.mockResolvedValue(undefined);
 		isSpawnableCommand.mockResolvedValue(true);

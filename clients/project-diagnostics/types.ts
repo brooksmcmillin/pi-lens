@@ -17,6 +17,25 @@ export interface ProjectDiagnostic {
 	source: ProjectDiagnosticSource;
 }
 
+/**
+ * What a finding-bearing file's bytes were when the scan read them — the
+ * second content axis `WorkspaceDiagnosticsCacheEntry` has carried since
+ * #2300/#1095, in the cheap-tier store's own vocabulary. `sizeBytes` is the
+ * cheap reject (no read); `contentHash` settles a same-size rewrite.
+ */
+export interface ProjectScanFileFingerprint {
+	/**
+	 * The file's ON-DISK byte length at the moment the scan read it — the
+	 * buffer's own length, never `Buffer.byteLength` of the decoded string
+	 * (#3060 round 2 F1: those differ by 2 for every byte that is not valid
+	 * UTF-8, so a decoded-string length could never match `statSync().size`
+	 * and retired every row from such a file on every cached read).
+	 */
+	sizeBytes: number;
+	/** sha256 of that same content, via `hashDiagnosticContent`. */
+	contentHash: string;
+}
+
 export interface ProjectDiagnosticsSnapshot {
 	version: number;
 	cwd: string;
@@ -25,6 +44,35 @@ export interface ProjectDiagnosticsSnapshot {
 	diagnostics: ProjectDiagnostic[];
 	filesScanned: number;
 	runners: string[];
+	/**
+	 * #2154 (#3060 review F1): the bytes each finding-bearing file actually had
+	 * when this scan read them, keyed by the row's own `filePath`.
+	 *
+	 * `scannedAt` is ONE timestamp, stamped after the whole file loop has
+	 * finished, so `reconcileProjectDiagnosticsSnapshot`'s `mtime <= scannedAt`
+	 * test cannot separate "this file has not changed since it was scanned"
+	 * from "this file changed WHILE the scan was still running, before the
+	 * timestamp was taken". An edit landing mid-scan therefore produced a row
+	 * that read as fresh forever — in that session and every later one, since
+	 * the record is the cross-session cache — which is the reported false
+	 * blocker. A timestamp comparison cannot be made safe here (the producer
+	 * would need a per-file scan time AND an mtime granularity it does not
+	 * control), so the record carries a content axis instead: the byte length,
+	 * and the sha256 of the exact bytes the rules ran over.
+	 *
+	 * Written only for files the scan actually READ — a rule may cite a path it
+	 * never opened. A row whose file has no entry keeps the mtime-only rule: it
+	 * never asserted a content claim, the same fail-open posture
+	 * `WorkspaceDiagnosticsCacheEntry.sizeBytes` takes for a pre-#2300 entry.
+	 * Snapshots written before this field existed cannot reach that path at
+	 * all: `PROJECT_DIAGNOSTICS_CACHE_VERSION` was bumped so the version guard
+	 * rejects them and the project is re-scanned — the same clean break
+	 * `WORKSPACE_DIAGNOSTICS_CACHE_VERSION` v3 made for `serverId` provenance,
+	 * chosen over serving them because every row here is a POSITIVE claim
+	 * ("this file has this finding right now") on the axis that just proved
+	 * unreliable.
+	 */
+	fileFingerprints?: Record<string, ProjectScanFileFingerprint>;
 	/** Visible degraded state after the process-wide WASM runtime aborts. */
 	treeSitterStatus?: "wasm_aborted_restart_required";
 	/**

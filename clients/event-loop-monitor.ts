@@ -41,12 +41,12 @@
  */
 
 import { logExtension } from "./extension-log.js";
-import { monitorEventLoopDelay, type IntervalHistogram } from "node:perf_hooks";
+import { monitorEventLoopDelay } from "node:perf_hooks";
 
 const NS_PER_MS = 1e6;
 const US_PER_MS = 1e3;
 
-let histogram: IntervalHistogram | undefined;
+let histogram: ReturnType<typeof monitorEventLoopDelay> | undefined;
 let monitorUnavailable = false;
 
 // Per-window (per-turn) baselines for CPU-vs-wall accounting. Captured when the

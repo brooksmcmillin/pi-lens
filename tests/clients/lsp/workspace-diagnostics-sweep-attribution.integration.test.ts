@@ -29,7 +29,7 @@ describe("runWorkspaceDiagnostics sweep bracket on the real wire (#2332)", () =>
 	beforeEach(async () => {
 		vi.resetModules();
 		getServersForFileWithConfig.mockReset();
-		root = fs.mkdtempSync(path.join(os.tmpdir(), "wsd-2332-"));
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-wsd-2332-"));
 		fs.mkdirSync(path.join(root, ".pi-lens"));
 		file = path.join(root, "subject.ts");
 		traceFile = path.join(root, "wire.trace");

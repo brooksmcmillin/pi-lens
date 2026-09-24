@@ -22,6 +22,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { pathsEqual } from "../../path-utils.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import { resolveRunnerCwd } from "../../tool-cwd.js";
 import { PRIORITY } from "../priorities.js";
@@ -74,8 +75,13 @@ function findShellcheckConfig(cwd: string): string | undefined {
  *
  * Levels: "error", "warning", "info", "style"
  */
-function parseShellcheckOutput(raw: string, filePath: string): Diagnostic[] {
+function parseShellcheckOutput(
+	raw: string,
+	filePath: string,
+	cwd: string,
+): Diagnostic[] {
 	const diagnostics: Diagnostic[] = [];
+	const absTarget = path.resolve(cwd, filePath);
 
 	if (!raw.trim()) {
 		return diagnostics;
@@ -100,6 +106,8 @@ function parseShellcheckOutput(raw: string, filePath: string): Diagnostic[] {
 
 		for (const item of parsed) {
 			if (!item.message || !item.line) continue;
+			if (!item.file || !pathsEqual(path.resolve(cwd, item.file), absTarget))
+				continue;
 
 			// Map shellcheck levels to our severity
 			const severityMap: Record<string, "error" | "warning" | "info"> = {
@@ -200,7 +208,7 @@ const shellcheckRunner: RunnerDefinition = {
 
 		// Parse diagnostics
 		const raw = result.stdout + result.stderr;
-		const diagnostics = parseShellcheckOutput(raw, ctx.filePath);
+		const diagnostics = parseShellcheckOutput(raw, ctx.filePath, cwd);
 
 		return finishParsedRun({
 			tool: "shellcheck",

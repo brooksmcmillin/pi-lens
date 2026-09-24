@@ -116,7 +116,9 @@ function scanFixtureTree(): Array<{
 	file: string;
 	line: number;
 }> {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pilens-errorfloor-"));
+	const dir = fs.mkdtempSync(
+		path.join(os.tmpdir(), "pi-lens-pilens-errorfloor-"),
+	);
 	try {
 		fs.mkdirSync(path.join(dir, "src"), { recursive: true });
 		fs.mkdirSync(path.join(dir, "tests"), { recursive: true });

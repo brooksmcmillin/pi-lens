@@ -458,6 +458,24 @@ interface ModuleImport {
 
 const moduleImportCache = new Map<string, ModuleImport[]>();
 
+/**
+ * #3058: `exportedValues` was re-read and re-parsed once per `vi.mock` call
+ * naming the module -- 781 parses of 133 MB of production source over the
+ * 1,152-file sweep, against a few hundred distinct files. Memoised by path
+ * the same way `moduleImportCache` above already memoises the import side;
+ * every caller resolves a repository path or a `mkdtemp` fixture path, so a
+ * key is never reused within a process.
+ */
+const exportedValuesCache = new Map<string, Set<string>>();
+
+function exportedValuesOf(file: string): Set<string> {
+	const cached = exportedValuesCache.get(file);
+	if (cached) return cached;
+	const values = exportedValues(fs.readFileSync(file, "utf8"));
+	exportedValuesCache.set(file, values);
+	return values;
+}
+
 function moduleImports(file: string, source?: string): ModuleImport[] {
 	const cached = moduleImportCache.get(file);
 	if (cached) return cached;
@@ -500,23 +518,56 @@ function moduleImports(file: string, source?: string): ModuleImport[] {
 	return imports;
 }
 
-function requiredValues(
-	file: string,
-	source: string,
-	specifier: string,
-	options: ViMockExportOptions = {},
-): Set<string> {
-	const target = resolveProduction(file, specifier);
-	const testImports = moduleImports(file, source);
-	const testRoot = parse(Lang.TypeScript, source).root();
-	const mockedSpecifiers = new Set<string>();
-	for (const call of testRoot.findAll({ rule: { kind: "call_expression" } })) {
+/**
+ * One parse, and one `call_expression` materialisation, per distinct source
+ * text. The sweep runs the whole 1,152-file `tests/` population through the
+ * detector twice -- once in `imported` mode, once in `all` mode for the
+ * latency surface -- so each test file was parsed and its call expressions
+ * materialised twice over (#3058). Keyed by SOURCE TEXT rather than path, so
+ * a fixture that rewrites a path inside one process can never read back a
+ * stale tree.
+ */
+const parsedSourceCache = new Map<string, { root: SgNode; calls: SgNode[] }>();
+
+function parsedSource(source: string): { root: SgNode; calls: SgNode[] } {
+	const cached = parsedSourceCache.get(source);
+	if (cached) return cached;
+	const root = parse(Lang.TypeScript, source).root();
+	const entry = {
+		root,
+		calls: root.findAll({ rule: { kind: "call_expression" } }),
+	};
+	parsedSourceCache.set(source, entry);
+	return entry;
+}
+
+/**
+ * Every specifier the test file mocks. A per-FILE fact, so it is computed
+ * once from the call expressions `findViMockExportGaps` already materialised
+ * and handed to `requiredValues`, which used to re-parse the whole test
+ * source on every `vi.mock` occurrence (#3058).
+ */
+function mockedSpecifiers(calls: readonly SgNode[]): Set<string> {
+	const specifiers = new Set<string>();
+	for (const call of calls) {
 		const callee = call.field("function");
 		if (!isViMockCall(callee)) continue;
 		const mocked = call.field("arguments")?.namedChildren()[0];
 		const mockedSpecifier = mocked ? unquote(mocked.text()) : undefined;
-		if (mockedSpecifier) mockedSpecifiers.add(mockedSpecifier);
+		if (mockedSpecifier) specifiers.add(mockedSpecifier);
 	}
+	return specifiers;
+}
+
+function requiredValues(
+	file: string,
+	source: string,
+	specifier: string,
+	mocked: ReadonlySet<string>,
+	options: ViMockExportOptions = {},
+): Set<string> {
+	const target = resolveProduction(file, specifier);
+	const testImports = moduleImports(file, source);
 	const names = new Set<string>();
 	const add = (values: Set<string>) => {
 		for (const name of values) names.add(name);
@@ -528,10 +579,7 @@ function requiredValues(
 
 	const maxDepth = options.importerDepth ?? Number.POSITIVE_INFINITY;
 	const queue = testImports
-		.filter(
-			(imported) =>
-				imported.resolved && !mockedSpecifiers.has(imported.specifier),
-		)
+		.filter((imported) => imported.resolved && !mocked.has(imported.specifier))
 		.map((imported) => ({ file: imported.resolved as string, depth: 1 }));
 	const visited = new Set<string>();
 	while (queue.length > 0) {
@@ -545,7 +593,7 @@ function requiredValues(
 				queue.push({ file: imported.resolved, depth: current.depth + 1 });
 		}
 	}
-	if (names.has("*")) return exportedValues(fs.readFileSync(target, "utf8"));
+	if (names.has("*")) return exportedValuesOf(target);
 	return names;
 }
 
@@ -555,9 +603,11 @@ export function findViMockExportGaps(
 	mode: ViMockExportMode = "imported",
 	options: ViMockExportOptions = {},
 ): ViMockExportFinding[] {
-	const root = parse(Lang.TypeScript, source).root();
+	const { root, calls } = parsedSource(source);
+	let mockedOnce: Set<string> | undefined;
+	const mocked = () => (mockedOnce ??= mockedSpecifiers(calls));
 	const findings: ViMockExportFinding[] = [];
-	for (const call of root.findAll({ rule: { kind: "call_expression" } })) {
+	for (const call of calls) {
 		const callee = call.field("function");
 		if (!isViMockCall(callee)) continue;
 		const args = call.field("arguments")?.namedChildren() ?? [];
@@ -570,8 +620,8 @@ export function findViMockExportGaps(
 			if (!productionFile) continue;
 			const required =
 				mode === "all"
-					? exportedValues(fs.readFileSync(productionFile, "utf8"))
-					: requiredValues(file, source, specifier, options);
+					? exportedValuesOf(productionFile)
+					: requiredValues(file, source, specifier, mocked(), options);
 			if (required.size === 0) continue;
 			findings.push({
 				file,
@@ -590,8 +640,8 @@ export function findViMockExportGaps(
 		if (!productionFile) continue;
 		const required =
 			mode === "all"
-				? exportedValues(fs.readFileSync(productionFile, "utf8"))
-				: requiredValues(file, source, specifier, options);
+				? exportedValuesOf(productionFile)
+				: requiredValues(file, source, specifier, mocked(), options);
 		if (required.size === 0) continue;
 		const missing = [...required]
 			.filter((name) => !propertyNames(object).has(name))

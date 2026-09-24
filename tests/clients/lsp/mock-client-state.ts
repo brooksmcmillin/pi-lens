@@ -83,6 +83,8 @@ export function createMockState(
 		pullResultIds: new Map(),
 		workspacePullResultCache: new Map(),
 		openDocuments: new Set(),
+		// #3310: mirrors createLSPClient's own initial state literal.
+		emptyFirstPublishHoldSpent: false,
 		closedDocuments: new Set(),
 		// #1669 review F8: REQUIRED, not left to the `?.`-optional default —
 		// both are `optional` on `LSPClientState`, and a factory that omits

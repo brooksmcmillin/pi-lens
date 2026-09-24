@@ -13,6 +13,10 @@ permissions:
 jobs:
   stale:
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 8s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
     steps:
       # yamllint disable-line rule:line-length
       - uses: actions/stale@4391f3da665fdf50b6810c1a66712fb9ba21aa93 # v11.0.0

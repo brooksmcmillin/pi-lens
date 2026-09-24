@@ -194,6 +194,26 @@ describe("getLastLoggedPhase (loop_block attribution, #1122/#1123)", () => {
 		expect(getLastLoggedPhase()?.phase).toBe("word_index_build");
 	});
 
+	// #3310: `lsp_empty_first_publish_held` is written from inside a live
+	// `lsp_touch_file` wait and its duration is the HELD PUBLISH's age since
+	// didOpen, not work of its own — the touch it fires inside owns any stall.
+	// Pins the `LAST_PHASE_EXCLUDED` entry so deleting it reds here.
+	it("does not let the held empty-first publish record own stall attribution (#3310)", () => {
+		logLatency({
+			type: "phase",
+			phase: "lsp_touch_file",
+			filePath: "/repo/src/app.php",
+			durationMs: 5,
+		});
+		logLatency({
+			type: "phase",
+			phase: "lsp_empty_first_publish_held",
+			filePath: "/repo/src/app.php",
+			durationMs: 300,
+		});
+		expect(getLastLoggedPhase()?.phase).toBe("lsp_touch_file");
+	});
+
 	it("does not let the cache usage session summary own stall attribution (#1996)", () => {
 		logLatency({
 			type: "phase",

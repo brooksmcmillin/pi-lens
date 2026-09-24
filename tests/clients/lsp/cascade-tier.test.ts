@@ -663,6 +663,15 @@ describe("registerCascadeTierReconcileTask", () => {
 				diagnostics: [
 					expect.objectContaining({ message: "cold neighbor err" }),
 				],
+				// #3168 F9: the #1444 publish stamp must reach the callback —
+				// `buildResolvedFoundCascadeRun` turns it into
+				// `CascadeRun.observedAt` and the carried-render label states its
+				// age. Without this assertion, dropping `publishedAt:
+				// o.publishedAt` from the resolved-found arm left the whole
+				// cascade neighbourhood green (157 passed), because the only
+				// downstream age assertion was fed a stamp its own harness
+				// supplied.
+				publishedAt: PUBLISH_TS,
 			}),
 		);
 	});

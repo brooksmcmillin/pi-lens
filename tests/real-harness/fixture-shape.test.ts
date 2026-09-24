@@ -12,12 +12,23 @@ describe("real harness fixture shape", () => {
 			const dir = path.join(realHarnessFixtureRoot, scenario);
 			if (!statSync(dir).isDirectory() || scenario.startsWith(".")) continue;
 			expect(statSync(path.join(dir, "project")).isDirectory()).toBe(true);
-			const script = JSON.parse(
-				readFileSync(path.join(dir, "script.json"), "utf8"),
-			) as unknown;
-			expect(() =>
-				validateScript(script, `${scenario}/script.json`),
-			).not.toThrow();
+			// Every script in the scenario, not only `script.json` (#2154): a
+			// scenario whose sessions need different turn sequences — two live
+			// children each replay from their OWN turn 0, so one script cannot
+			// drive both — ships one file per role, and an unvalidated sibling
+			// script is exactly the malformed fixture this gate exists to catch.
+			const scripts = readdirSync(dir).filter((entry) =>
+				entry.endsWith(".json"),
+			);
+			expect(scripts).toContain("script.json");
+			for (const name of scripts) {
+				const script = JSON.parse(
+					readFileSync(path.join(dir, name), "utf8"),
+				) as unknown;
+				expect(() =>
+					validateScript(script, `${scenario}/${name}`),
+				).not.toThrow();
+			}
 		}
 	});
 	it("names the malformed field", () => {

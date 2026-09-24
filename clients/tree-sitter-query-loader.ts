@@ -13,7 +13,11 @@ import {
 	classifyBundledResourceDir,
 	reportBundledResourceDirHealth,
 } from "./bundled-resource-health.js";
-import { getDegradationLedgerGeneration } from "./degradation-ledger.js";
+import {
+	getDegradationLedgerGeneration,
+	recordDegradationOnce,
+} from "./degradation-ledger.js";
+import yaml from "./deps/js-yaml.js";
 import { resolvePackagePath } from "./package-root.js";
 
 /**
@@ -199,13 +203,20 @@ export function queriesForLanguage(
 }
 
 /**
- * Drop a trailing ` # comment` from an unquoted YAML scalar. Quoted values keep
- * their `#` (a message may legitimately contain one), matching YAML's rule that
- * a comment only starts after whitespace outside quotes.
+ * Coerce a parsed YAML scalar to a string, refusing a mapping or array.
+ * `String({})`/`String([])` silently produce the literal text
+ * `"[object Object]"`/`"a,b"` — SonarCloud typescript:S6551 flagged this at
+ * every scalar field in `parseQueryFile` once `parseYaml` widened to
+ * `Record<string, unknown>` (#3054 review F2). Returns `undefined` for
+ * `null`/`undefined`/a non-scalar so call sites keep using `||`/`??` for
+ * defaults exactly as the old `String(x || fallback)` calls did.
  */
-function stripInlineComment(value: string): string {
-	if (value.startsWith('"') || value.startsWith("'")) return value;
-	return value.replace(/\s+#.*$/, "").trim();
+function str(value: unknown): string | undefined {
+	return typeof value === "string" ||
+		typeof value === "number" ||
+		typeof value === "boolean"
+		? String(value)
+		: undefined;
 }
 
 export function isDisabledQueryFilePath(filePath: string): boolean {
@@ -276,6 +287,20 @@ export class TreeSitterQueryLoader {
 	private loaded = false;
 	private loadedRoot: string | null = null;
 	private verbose: boolean;
+	/**
+	 * This root's per-file parse failures, remembered across the memoized
+	 * (no-`force`) `loadQueries` path so a later session's ledger can carry
+	 * the same row without re-parsing every file (#3070 N1).
+	 */
+	private readonly parseFailures = new Map<string, string>();
+	/**
+	 * Generation (`getDegradationLedgerGeneration()`) at which `parseFailures`
+	 * was last replayed into the ledger — the same generation-keyed memo
+	 * idiom `getBundledQueriesRootHealth` above uses, applied here so a
+	 * memoized `loadQueries` return still re-arms `recordDegradationOnce` once
+	 * per session rather than only in the session that actually parsed.
+	 */
+	private parseFailuresReplayedGeneration: number | undefined;
 
 	constructor(verbose = false) {
 		this.verbose = verbose;
@@ -289,6 +314,53 @@ export class TreeSitterQueryLoader {
 				subsystem: "query-loader",
 				level: "debug",
 				message: msg,
+			});
+		}
+	}
+
+	/**
+	 * One degradation-ledger record per malformed rule file per session
+	 * (#3054 review F1). The old hand-rolled scanner tolerated almost any
+	 * line-level mistake and still produced SOME parsed shape; `yaml.load`
+	 * correctly throws on realistic authoring mistakes the scanner shrugged
+	 * off (a colon in an unquoted scalar, a tab in list indentation, a
+	 * duplicate key, an unclosed quote, a bare `@` value — fuzzed over 800
+	 * corruptions of one shipped query: 139 that loaded before now skip, 0
+	 * the other way). Before this, the only sink on that skip path was
+	 * `dbg()`, gated behind `verbose` — both production instantiations
+	 * (this file's `queryLoader` singleton and `tree-sitter-client.ts`'s
+	 * `new TreeSitterQueryLoader()`) construct with the `verbose = false`
+	 * default — so a silently-dropped custom rule had no surviving signal.
+	 */
+	private recordQueryParseFailure(filePath: string, reason: string): void {
+		this.parseFailures.set(filePath, reason);
+		recordDegradationOnce({
+			kind: "tree-sitter-query-parse-failed",
+			subject: filePath,
+			reason,
+		});
+	}
+
+	/**
+	 * Replay every remembered per-file parse failure into the CURRENT
+	 * session's ledger, at most once per ledger generation (#3070 N1). A
+	 * memoized `loadQueries` return skips `parseQueryFile` entirely, so
+	 * without this replay the `tree-sitter-query-parse-failed` record only
+	 * ever reached the FIRST session that actually parsed — `resetDegradationLedger`
+	 * (wired into `handleSessionStart`) clears the once-keys every session,
+	 * but the loader instance and its `parseFailures` memo are kept across
+	 * sessions (`clients/tree-sitter-shared.ts:39`), the same shape
+	 * `getBundledQueriesRootHealth` above already re-probes per generation.
+	 */
+	private replayQueryParseFailures(): void {
+		const generation = getDegradationLedgerGeneration();
+		if (this.parseFailuresReplayedGeneration === generation) return;
+		this.parseFailuresReplayedGeneration = generation;
+		for (const [filePath, reason] of this.parseFailures) {
+			recordDegradationOnce({
+				kind: "tree-sitter-query-parse-failed",
+				subject: filePath,
+				reason,
 			});
 		}
 	}
@@ -309,10 +381,12 @@ export class TreeSitterQueryLoader {
 	): Promise<Map<string, TreeSitterQuery[]>> {
 		const resolvedRoot = path.resolve(rootDir);
 		if (!options.force && this.loaded && this.loadedRoot === resolvedRoot) {
+			this.replayQueryParseFailures();
 			return this.queries;
 		}
 
 		this.queries.clear();
+		this.parseFailures.clear();
 		this.loaded = false;
 
 		// Load from user's project rules AND package built-in rules (coexist)
@@ -360,6 +434,11 @@ export class TreeSitterQueryLoader {
 
 		this.loaded = true;
 		this.loadedRoot = resolvedRoot;
+		// Every failure hit above was recorded into THIS generation's ledger
+		// directly (via recordQueryParseFailure); mark it replayed so a
+		// same-generation memoized call right after this one doesn't redo the
+		// (harmless but pointless) replay loop.
+		this.parseFailuresReplayedGeneration = getDegradationLedgerGeneration();
 		return this.queries;
 	}
 
@@ -373,40 +452,51 @@ export class TreeSitterQueryLoader {
 		try {
 			const content = fs.readFileSync(filePath, "utf-8");
 
-			// Simple YAML parsing (extract key: value pairs)
 			const parsed = this.parseYaml(content);
 
-			if (!parsed.id || !parsed.query) {
+			// #3054 review F2: type-checked, not just truthy. `yaml.load` widened
+			// `parsed` to `Record<string, unknown>`, so a mapping- or
+			// array-valued `id`/`query` (a plausible authoring slip: forgetting
+			// the `|` on `query:` turns the block into a nested mapping) is
+			// truthy and used to sail through the old `!parsed.id || !parsed.query`
+			// check, then `String(...)` turned it into the literal text
+			// `"[object Object]"` — which for `query` reached the Query
+			// constructor (SonarCloud typescript:S6551 flagged every such
+			// stringification in this function; fixed below via `str()`).
+			const id = str(parsed.id);
+			const query = typeof parsed.query === "string" ? parsed.query : undefined;
+			if (!id || !query) {
 				this.dbg(`Invalid query file: ${filePath}`);
+				this.recordQueryParseFailure(
+					filePath,
+					!id
+						? `'id' is missing or not a scalar (got ${typeof parsed.id})`
+						: `'query' is missing or not a string (got ${typeof parsed.query})`,
+				);
 				return null;
 			}
 
 			return {
-				id: String(parsed.id),
-				name: String(parsed.name || parsed.id),
+				id,
+				name: str(parsed.name) || id,
 				severity: this.parseSeverity(parsed.severity),
-				category: String(parsed.category || "general"),
-				language: String(parsed.language || language),
-				message: String(parsed.message || `Pattern: ${parsed.id}`),
-				description: parsed.description
-					? String(parsed.description)
-					: undefined,
-				query:
-					this.extractMultilineValue(content, "query") || String(parsed.query),
+				category: str(parsed.category) || "general",
+				language: str(parsed.language) || language,
+				message: str(parsed.message) || `Pattern: ${id}`,
+				description: str(parsed.description) || undefined,
+				query,
 				metavars: Array.isArray(parsed.metavars)
 					? parsed.metavars.map(String)
-					: this.extractMetavars(String(parsed.query)),
-				post_filter: parsed.post_filter
-					? String(parsed.post_filter)
-					: undefined,
+					: this.extractMetavars(query),
+				post_filter: str(parsed.post_filter) || undefined,
 				// biome-ignore lint/suspicious/noExplicitAny: Post filter params
 				post_filter_params: parsed.post_filter_params as any,
-				defect_class: parsed.defect_class
-					? String(parsed.defect_class)
-					: undefined,
-				inline_tier: parsed.inline_tier
-					? (String(parsed.inline_tier) as "blocking" | "warning" | "review")
-					: undefined,
+				defect_class: str(parsed.defect_class) || undefined,
+				inline_tier: (str(parsed.inline_tier) || undefined) as
+					| "blocking"
+					| "warning"
+					| "review"
+					| undefined,
 				skip_test_files: parsed.skip_test_files === true,
 				ignore_paths: Array.isArray(parsed.ignore_paths)
 					? parsed.ignore_paths.map(String)
@@ -424,205 +514,44 @@ export class TreeSitterQueryLoader {
 				owasp: Array.isArray(parsed.owasp)
 					? parsed.owasp.map(String)
 					: undefined,
-				confidence: parsed.confidence
-					? (String(parsed.confidence) as "low" | "medium" | "high")
-					: undefined,
+				confidence: (str(parsed.confidence) || undefined) as
+					| "low"
+					| "medium"
+					| "high"
+					| undefined,
 				has_fix: parsed.has_fix === true || parsed.has_fix === "true",
-				fix_action: parsed.fix_action ? String(parsed.fix_action) : undefined,
+				fix_action: str(parsed.fix_action) || undefined,
 				filePath,
 			};
 		} catch (err) {
 			this.dbg(`Failed to parse ${filePath}: ${err}`);
+			this.recordQueryParseFailure(
+				filePath,
+				err instanceof Error ? err.message : String(err),
+			);
 			return null;
 		}
 	}
 
 	/**
-	 * Simple YAML parser for our query files
+	 * Parse a query file's YAML with `js-yaml` — the same real parser
+	 * `clients/dispatch/runners/yaml-rule-parser.ts` uses for ast-grep rules
+	 * (#206: a hand-rolled line scanner flattened nested structures there; the
+	 * hand-rolled scanner this loader carried made the identical mistake,
+	 * twice over — its inline `[a, b]` array branch unquoted list items but
+	 * its multi-line `- item` branch did not, so `console-statement.yml`'s
+	 * quoted `ignore_paths` glob parsed with the quote marks attached and the
+	 * #965 carve-out never matched a path, #3041/#3046). A genuine syntax
+	 * error throws, caught by `parseQueryFile`'s `try`/`catch`; a
+	 * syntactically valid but wrong-shaped document (a bare scalar, a list,
+	 * `null`) is cast here and skipped by `parseQueryFile`'s `id`/`query`
+	 * type check below — property access on a non-object primitive never
+	 * throws in JS, so no separate `typeof parsed !== "object"` guard is
+	 * needed here (#3054 review F3: that guard was vacuous — deleting it
+	 * reds nothing, every case it caught was already caught one frame up).
 	 */
-	private parseYaml(
-		content: string,
-	): Record<string, string | string[] | boolean> {
-		const result: Record<string, string | string[] | boolean> = {};
-		const lines = content.split("\n");
-
-		for (let i = 0; i < lines.length; i++) {
-			const line = lines[i];
-			const match = line.match(/^([a-z_]+):\s*(.*)$/);
-			if (match) {
-				const key = match[1];
-				// Strip a trailing YAML comment (` # …`) on unquoted scalars, as the
-				// array-item branch below already does. Without this, a rule written
-				// `post_filter: not_in_test_block  # skip test blocks` carried the
-				// whole comment as the filter NAME, so the filter never resolved and
-				// the rule reported unfiltered matches.
-				let value: string | string[] | boolean = stripInlineComment(
-					match[2].trim(),
-				);
-
-				// Handle arrays inline: metavars: [A, B, C]
-				if (value.startsWith("[") && value.endsWith("]")) {
-					value = value
-						.slice(1, -1)
-						.split(",")
-						.map((s) => s.trim().replace(/^["']|["']$/g, ""));
-				}
-				// Handle multi-line arrays: metavars:\n  - A\n  - B
-				// and nested objects: post_filter_params:\n  KEY: "value"
-				else if (value === "") {
-					const arrayItems: string[] = [];
-					const nestedObj: Record<string, string> = {};
-					const baseIndent = line.match(/^(\s*)/)?.[0].length || 0;
-
-					for (let j = i + 1; j < lines.length; j++) {
-						const nextLine = lines[j];
-						const nextIndent = nextLine.match(/^(\s*)/)?.[0].length || 0;
-
-						// Stop if we hit a line with same or less indent (new key)
-						if (
-							nextIndent <= baseIndent &&
-							nextLine.trim() !== "" &&
-							nextLine.match(/^\S/)
-						) {
-							break;
-						}
-
-						// Check if it's an array item
-						const itemMatch = nextLine.match(/^\s+-\s*(.+)$/);
-						if (itemMatch) {
-							const item = itemMatch[1].trim().replace(/\s*#.*$/, "");
-							if (item) arrayItems.push(item);
-							continue;
-						}
-
-						// Check if it's a nested key: value pair
-						const nestedMatch = nextLine.match(/^\s+(\w+):\s*(.+)$/);
-						if (nestedMatch) {
-							let nv = nestedMatch[2].trim();
-							if (
-								(nv.startsWith('"') && nv.endsWith('"')) ||
-								(nv.startsWith("'") && nv.endsWith("'"))
-							) {
-								nv = nv.slice(1, -1);
-							}
-							nestedObj[nestedMatch[1]] = nv;
-						}
-					}
-
-					if (arrayItems.length > 0) {
-						value = arrayItems;
-					} else if (Object.keys(nestedObj).length > 0) {
-						// biome-ignore lint/suspicious/noExplicitAny: nested object from YAML
-						(result as any)[key] = nestedObj;
-						continue;
-					}
-				}
-				// Handle booleans
-				else if (value === "true") value = true;
-				else if (value === "false") value = false;
-				// Strip quotes from strings
-				else if (value.startsWith('"') && value.endsWith('"')) {
-					value = value.slice(1, -1);
-				}
-
-				result[key] = value;
-			}
-		}
-
-		return result;
-	}
-
-	/**
-	 * Extract a multiline value (like query) from YAML
-	 */
-	private extractMultilineValue(content: string, key: string): string | null {
-		const lines = content.split("\n");
-		let startLine = -1;
-		let startIndent = 0;
-
-		const keyPrefix = `${key}:`;
-
-		// Find the key line
-		for (let i = 0; i < lines.length; i++) {
-			const trimmed = lines[i].trimStart();
-			if (trimmed.startsWith(keyPrefix)) {
-				startLine = i;
-				startIndent = lines[i].length - trimmed.length;
-				const afterKey = trimmed.slice(keyPrefix.length).trim();
-				// If there's content on the same line (not just |), return it
-				if (afterKey && afterKey !== "|") return afterKey;
-				break;
-			}
-		}
-
-		if (startLine === -1) return null;
-
-		// Collect all lines until we hit a new key with same or less indent
-		const valueLines: string[] = [];
-		for (let i = startLine + 1; i < lines.length; i++) {
-			const line = lines[i];
-
-			// Track empty lines
-			if (!line.trim()) {
-				valueLines.push("");
-				continue;
-			}
-
-			// Check indent
-			const indentMatch = line.match(/^(\s*)/);
-			const indent = indentMatch ? indentMatch[1].length : 0;
-			const trimmed = line.trim();
-
-			// Stop at a new top-level key (same or less indent than the key).
-			if (indent <= startIndent && trimmed.match(/^[a-z_]+:/)) {
-				break;
-			}
-
-			// A comment at or below the key's indent is a document-level comment
-			// that follows the block, not part of it — stop. Block-scalar content
-			// (including native tree-sitter predicate lines `#eq?`/`#match?`) is
-			// always MORE indented than the key, so those are preserved. Without
-			// this, a stray `# …` line between a `query: |` block and the next key
-			// was appended to the query and made it fail to compile (mixed-async).
-			if (trimmed.startsWith("#") && indent <= startIndent) {
-				break;
-			}
-
-			// Skip YAML comment lines for most keys, but preserve native
-			// tree-sitter predicate lines in query blocks (#eq?, #match?, ...).
-			if (trimmed.startsWith("#") && key !== "query") continue;
-
-			// This is part of the multiline value
-			valueLines.push(line);
-		}
-
-		// Strip the common minimum indent (relative to startIndent).
-		// YAML's `|` block scalar preserves content with consistent
-		// indentation; we want to remove the leading whitespace that
-		// was used for YAML formatting.
-		// biome-ignore lint/suspicious/noExplicitAny: line iteration
-		const nonEmpty = valueLines.filter((l: string) => l.trim().length > 0);
-		if (nonEmpty.length > 0) {
-			const minExtraIndent = Math.min(
-				...nonEmpty.map((l: string) => {
-					const m = l.match(/^(\s*)/);
-					return (m?.[1].length ?? 0) - startIndent;
-				}),
-			);
-			for (let i = 0; i < valueLines.length; i++) {
-				if (valueLines[i].trim().length === 0) continue; // leave blank lines alone
-				valueLines[i] = valueLines[i].slice(
-					startIndent + Math.max(0, minExtraIndent),
-				);
-			}
-		}
-
-		// Clean up - remove trailing empty lines
-		while (valueLines.length > 0 && !valueLines[valueLines.length - 1].trim()) {
-			valueLines.pop();
-		}
-
-		return valueLines.length > 0 ? valueLines.join("\n") : null;
+	private parseYaml(content: string): Record<string, unknown> {
+		return yaml.load(content) as Record<string, unknown>;
 	}
 
 	/**

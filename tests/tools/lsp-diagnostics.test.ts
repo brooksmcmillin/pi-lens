@@ -2350,3 +2350,64 @@ describe("lsp_diagnostics tool", () => {
 		});
 	});
 });
+
+/**
+ * #3041 recurrence: `lens_diagnostics({source:"lsp", …})` folds straight into
+ * this tool, and it reported ast-grep findings on paths the rule's OWN `ignores`
+ * globs carve out (#965) — the one suppression surface a rule author controls.
+ * ast-grep applies those globs in its `scan` walk but NOT to the per-document
+ * diagnostics its LSP publishes (measured against ast-grep 0.45.3), so this
+ * standalone query path has to apply them itself.
+ */
+describe("lsp_diagnostics per-rule ignores carve-out (#3041)", () => {
+	// The shipped catalog rule that carves out `scripts/**` (#965).
+	const RULE = "no-console-except-error";
+
+	async function check(relative: string) {
+		const tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-diag-ignores-"),
+		);
+		const file = path.join(tmpDir, relative);
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(file, "console.log('cli output');\n");
+		(mocked.service as any).getDiagnostics = vi.fn().mockResolvedValue([
+			{
+				severity: 2,
+				message: "Avoid console.log/debug/warn in production code",
+				range: {
+					start: { line: 0, character: 0 },
+					end: { line: 0, character: 11 },
+				},
+				source: "ast-grep",
+				code: RULE,
+			},
+		]);
+		try {
+			const result = (await createLspDiagnosticsTool().execute(
+				"diag-rule-ignores",
+				{ paths: [file], severity: "all" },
+				new AbortController().signal,
+				null,
+				{ cwd: tmpDir },
+			)) as any;
+			return {
+				total: result.details?.totalDiagnostics,
+				text: String(result.content[0]?.text),
+			};
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
+	}
+
+	it("omits a finding whose rule carves out the requested path", async () => {
+		const { total, text } = await check(path.join("scripts", "cli.ts"));
+		expect(total).toBe(0);
+		expect(text).not.toContain("Avoid console.log");
+	});
+
+	it("reports the same finding on a path the rule does not carve out", async () => {
+		const { total, text } = await check(path.join("src", "app.ts"));
+		expect(total).toBe(1);
+		expect(text).toContain("Avoid console.log");
+	});
+});

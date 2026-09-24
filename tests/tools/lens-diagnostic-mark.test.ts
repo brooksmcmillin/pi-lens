@@ -15,7 +15,10 @@ import {
 	retireWidgetDependencyDriftBlockers,
 } from "../../clients/widget-state.js";
 import { createLensDiagnosticMarkTool } from "../../tools/lens-diagnostic-mark.js";
-import { removeTempDirSync } from "../clients/test-utils.js";
+import {
+	createCaseAliasFixture,
+	removeTempDirSync,
+} from "../clients/test-utils.js";
 
 let tmpDir: string;
 let previousDataDir: string | undefined;
@@ -160,6 +163,95 @@ describe("lens_diagnostic_mark tool — line verification/reanchoring (#802)", (
 		const anchor = (result.details as { anchor: string }).anchor;
 		const entry = getDisposition(tmpDir, anchor);
 		expect(entry?.disposition).toBe("false-positive");
+	});
+
+	// #3160: `widgetCrossCheck` looked up the RAW (possibly mis-cased) absPath
+	// against `getFileDiagnostics`, which keys with `normalizeEphemeralMapKey`
+	// — case-preserving on POSIX by design (no filesystem I/O on that hot
+	// path). Production writers key from `ctx.filePath`, which
+	// `createDispatchContext` already normalizes to the on-disk casing
+	// (#2016/#3098), so a mis-cased `lens_diagnostic_mark` call derived a
+	// DIFFERENT key than the one the widget stored under, missed the live
+	// diagnostic, and silently fell through to the fuzzy fallback — exactly
+	// the input the #802 cross-check exists for. `createCaseAliasFixture`
+	// manufactures the identical kernel contract (two spellings, one file,
+	// `realpath` reporting the on-disk one) with a case-variant symlink, so
+	// this reproduces on the case-sensitive ubuntu Unit tests lane too — refs
+	// #3098/#3159.
+	it("mis-cased filePath still finds the live widget diagnostic to reanchor (#3160)", async (ctx) => {
+		const fixture = createCaseAliasFixture(tmpDir, {
+			content: "const a = 1;\nconst b = 2;\nconst target = bad();\n",
+		});
+		ctx.skip(fixture.skipReason !== undefined, fixture.skipReason ?? "");
+
+		// The widget-state write side records under the on-disk casing (what
+		// `ctx.filePath` always is in production) — never the caller's raw
+		// mis-cased spelling.
+		recordDiagnostics(fixture.onDisk, [
+			{ tool: "eslint", rule: "no-bad", message: "bad call", line: 3 },
+		]);
+
+		const misCasedRelative = path.relative(tmpDir, fixture.rawMisCased);
+		const result = await run({
+			filePath: misCasedRelative,
+			line: 2, // stale
+			message: "bad call",
+			rule: "no-bad",
+			tool: "eslint",
+			disposition: "false-positive",
+		});
+
+		expect(result.isError).toBeFalsy();
+		expect(String(result.content[0]?.text)).toMatch(
+			/reanchored from line 2 to 3/,
+		);
+		expect((result.details as { line: number }).line).toBe(3);
+	});
+
+	// #3184: the mark tool takes an ALREADY-absolute `filePath` argument
+	// through untouched (`tools/lens-diagnostic-mark.ts:324-326`,
+	// `path.isAbsolute(x) ? x : path.resolve(cwd, x)`), and before the
+	// path-utils fix `normalizeMapKey` passed dot segments through on POSIX —
+	// its casing arm returns the caller's spelling whenever
+	// `adoptCanonicalCasing` changes nothing, and for `<dir>/../<dir>/a.ts` it
+	// always does. So an agent-typed absolute path containing `/../` derived a
+	// key no writer ever used (every canonical writer keys through
+	// `path.resolve` first), the cross-check missed the live diagnostic, and
+	// the mark silently fell through to the fuzzy fallback — the #802
+	// cross-check's own defeat condition. The dot segment is built by string
+	// CONCATENATION: `path.join`/`path.resolve` would fold it and make the
+	// fixture vacuous.
+	it("an absolute filePath with a dot segment still finds the live widget diagnostic to reanchor (#3184)", async () => {
+		const absPath = writeFile(
+			"a.ts",
+			"const a = 1;\nconst b = 2;\nconst target = bad();\n",
+		);
+		// Canonical write, exactly as a per-edit dispatch keys it (ctx.filePath).
+		recordDiagnostics(absPath, [
+			{ tool: "eslint", rule: "no-bad", message: "bad call", line: 3 },
+		]);
+
+		const dotSegmentAbs = `${tmpDir}${path.sep}..${path.sep}${path.basename(tmpDir)}${path.sep}a.ts`;
+		expect(dotSegmentAbs).toContain("..");
+		expect(path.isAbsolute(dotSegmentAbs)).toBe(true);
+		expect(fs.realpathSync.native(dotSegmentAbs)).toBe(
+			fs.realpathSync.native(absPath),
+		);
+
+		const result = await run({
+			filePath: dotSegmentAbs,
+			line: 2, // stale
+			message: "bad call",
+			rule: "no-bad",
+			tool: "eslint",
+			disposition: "false-positive",
+		});
+
+		expect(result.isError).toBeFalsy();
+		expect(String(result.content[0]?.text)).toMatch(
+			/reanchored from line 2 to 3/,
+		);
+		expect((result.details as { line: number }).line).toBe(3);
 	});
 
 	// #2275 review F2: the widget footer's dependency-drift delivery cap stops

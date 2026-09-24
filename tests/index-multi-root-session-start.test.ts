@@ -90,7 +90,9 @@ describe("session_start keys on the project root (#2129 wiring)", () => {
 		deregisterInstance();
 		await settleRegistryWrites();
 		hostRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-host-root-"));
-		tempWorktree = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agent-worktree-"));
+		tempWorktree = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-pi-agent-worktree-"),
+		);
 	});
 
 	afterEach(async () => {

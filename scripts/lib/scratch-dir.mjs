@@ -5,6 +5,18 @@ import * as path from "node:path";
 export const SCRATCH_DIR_ROOT = path.join(os.tmpdir(), "pi-lens-scratch");
 export const SCRATCH_OWNER_FILE = "owner.pid";
 const DEFAULT_SCRATCH_MAX_AGE_MS = 60 * 60 * 1000;
+/**
+ * `maxAgeMs` for a caller whose rule is the PREFIX alone — "this is mine, and I
+ * am done with it" — with no age condition at all.
+ *
+ * Not `0`: the age gate below is `Date.now() - mtimeMs < maxAgeMs`, so `0` means
+ * "age >= 0" and SKIPS an entry whose mtime is in the future. That is not a
+ * hypothetical — a directory created microseconds before the sweep can carry a
+ * filesystem timestamp later than the process clock, and it redded CI on
+ * 2026-09-16 (run 35072411511, tmp-fixture-hygiene). Every finite age is
+ * >= -Infinity, so this value can never skip.
+ */
+export const SWEEP_ANY_AGE = Number.NEGATIVE_INFINITY;
 
 function ownerAlive(entryDir) {
 	let pidText;

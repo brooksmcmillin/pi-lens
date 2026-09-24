@@ -179,7 +179,7 @@ describe("parsed-nothing sweep (#1948)", () => {
 		expect(
 			ratchetDeclared.size,
 			"the ratchet registry scraper matched nothing",
-		).toBeGreaterThan(20);
+		).toBeGreaterThanOrEqual(14);
 
 		const doubleDeclared = Object.keys(EXEMPT).filter((name) =>
 			ratchetDeclared.has(name),

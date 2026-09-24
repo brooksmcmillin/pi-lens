@@ -7,7 +7,7 @@
 
 import * as path from "node:path";
 import { RuleCache } from "../../cache/rule-cache.js";
-import { minimatch } from "../../deps/minimatch.js";
+import { isRuleIgnoredForPath } from "../rule-ignores.js";
 import { isTestFile } from "../../file-utils.js";
 import {
 	buildOrUpdateGraph,
@@ -356,30 +356,6 @@ function getTotalLinesChanged(
 /** Threshold: skip entity extraction for changes under 5 lines */
 const ENTITY_EXTRACTION_LINE_THRESHOLD = 5;
 
-/**
- * `filePath` relative to `root`, forward-slashed, for matching a rule's
- * `ignore_paths` globs. Falls back to the absolute (slash-normalized) path
- * when `filePath` isn't under `root` (e.g. an out-of-tree temp file), so a
- * glob like `scripts/**` simply never matches rather than throwing.
- */
-function relativeForIgnoreGlob(filePath: string, root: string): string {
-	const rel = path.relative(root, filePath);
-	const normalized = (rel.startsWith("..") ? filePath : rel)
-		.split(path.sep)
-		.join("/");
-	return normalized;
-}
-
-function matchesIgnorePaths(
-	filePath: string,
-	root: string,
-	patterns: string[] | undefined,
-): boolean {
-	if (!patterns || patterns.length === 0) return false;
-	const rel = relativeForIgnoreGlob(filePath, root);
-	return patterns.some((pattern) => minimatch(rel, pattern, { dot: true }));
-}
-
 const treeSitterRunner: RunnerDefinition = {
 	id: "tree-sitter",
 	appliesTo: [
@@ -540,7 +516,7 @@ const treeSitterRunner: RunnerDefinition = {
 		).filter(
 			(q) =>
 				!(fileIsTest && q.skip_test_files) &&
-				!matchesIgnorePaths(filePath, ignoreRoot, q.ignore_paths),
+				!isRuleIgnoredForPath(filePath, ignoreRoot, q.ignore_paths),
 		);
 
 		logTreeSitter({

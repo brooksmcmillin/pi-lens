@@ -185,7 +185,7 @@ describe("the warm is verified, not assumed (#1926)", () => {
 	});
 
 	it("reports an entry with no marker at all, against the real filesystem", () => {
-		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "warm-corrupt-"));
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-warm-corrupt-"));
 		const fileName = "dist-index.abc12345.mjs";
 		fs.writeFileSync(path.join(dir, fileName), "truncated output, no marker");
 		const verdict = verifyCacheEntry({
@@ -200,6 +200,7 @@ describe("the warm is verified, not assumed (#1926)", () => {
 		});
 		expect(verdict.ok).toBe(false);
 		expect(verdict.reason).toContain("no jiti version marker");
+		fs.rmSync(dir, { recursive: true, force: true });
 	});
 
 	it("the script records not_cached rather than warmed when the check fails", () => {
@@ -305,7 +306,9 @@ describe("prepare chain keeps load-bearing steps load-bearing (#1926)", () => {
 			piLensHome: "empty" as const,
 		},
 	])("$name", ({ piLensHome }) => {
-		const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "warm-home-"));
+		const scratch = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-warm-home-"),
+		);
 		const pinnedHome = path.join(scratch, "pinned-home");
 		const canaryHome = path.join(scratch, "canary-home");
 		// Parity with getGlobalPiLensDir() (clients/file-utils.ts): the value is
@@ -339,6 +342,7 @@ describe("prepare chain keeps load-bearing steps load-bearing (#1926)", () => {
 		expect(JSON.parse(fs.readFileSync(expectedLog, "utf8").trim()).event).toBe(
 			"warm_loader_cache",
 		);
+		fs.rmSync(scratch, { recursive: true, force: true });
 	});
 
 	it("runs the warm last, after the steps that must fail loudly", () => {
@@ -367,7 +371,7 @@ describe("prepare chain keeps load-bearing steps load-bearing (#1926)", () => {
 		// Behavioural, not a regex over the source. `prepare` chains with `&&`, so
 		// a non-zero exit here would abort the install after a successful build.
 		const logFile = path.join(
-			fs.mkdtempSync(path.join(os.tmpdir(), "warm-run-")),
+			fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-warm-run-")),
 			"install.log",
 		);
 		const previousLog = process.env.PI_LENS_INSTALL_LOG;
@@ -388,6 +392,7 @@ describe("prepare chain keeps load-bearing steps load-bearing (#1926)", () => {
 			process.exitCode = previousExit;
 			if (previousLog === undefined) delete process.env.PI_LENS_INSTALL_LOG;
 			else process.env.PI_LENS_INSTALL_LOG = previousLog;
+			fs.rmSync(path.dirname(logFile), { recursive: true, force: true });
 		}
 	});
 
@@ -395,7 +400,7 @@ describe("prepare chain keeps load-bearing steps load-bearing (#1926)", () => {
 		// Pins the `invokedDirectly` guard. If it stopped matching, the prepare
 		// step would silently do nothing and every install would stay cold.
 		const logFile = path.join(
-			fs.mkdtempSync(path.join(os.tmpdir(), "warm-cli-")),
+			fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-warm-cli-")),
 			"install.log",
 		);
 		execFileSync(
@@ -415,6 +420,7 @@ describe("prepare chain keeps load-bearing steps load-bearing (#1926)", () => {
 		);
 		expect(written.event).toBe("warm_loader_cache");
 		expect(written.status).toBe("skipped");
+		fs.rmSync(path.dirname(logFile), { recursive: true, force: true });
 	});
 
 	it("ships both warm modules in the tarball", () => {

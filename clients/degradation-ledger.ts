@@ -37,6 +37,13 @@ import { getProbeHomeRedirectEvent } from "./probe-home-state.js";
 export { LEDGER_FIELD_MAX, truncateForLedger };
 
 export type DegradationKind =
+	/**
+	 * #3071: an actionable-warnings phase (LSP code-action enrichment, the
+	 * fix-application batch) truncated its eligible file/fix set at a bound —
+	 * `clients/actionable-warnings.ts`'s several file/fix caps all share this
+	 * one kind, distinguished by `subject`.
+	 */
+	| "actionable-warnings-cap"
 	/** A configured analyzer was deliberately skipped for this session. */
 	| "actionable-warnings-deferred-superseded"
 	/**
@@ -138,6 +145,20 @@ export type DegradationKind =
 	 * that is what the availability latch is about.
 	 */
 	| "config-ignored"
+	/**
+	 * An existence probe for a global-config location failed (ENOTDIR when a
+	 * file sits where a directory belongs, EACCES, ELOOP), so the resolution
+	 * RETAINED that location under uncertainty instead of silently switching
+	 * config sources (global-config-location PR, refs #2457; review H2
+	 * remedy B). Nothing was ignored — the retained file supplies the global
+	 * settings exactly as before; the read of it reports its own
+	 * `config-ignored` row when it fails. Subject is the retained path; the
+	 * reason names the failed probe's error class. Once per session via
+	 * `recordDegradationOnce`.
+	 */
+	| "config-location-probe-failed"
+	/** Both supported global config files exist; the higher-precedence one won. */
+	| "config-location-shadowed"
 	/**
 	 * #2518: the session-root registry hit its cap and dropped a root this
 	 * process was serving, together with that root's loaded LSP config — so the
@@ -245,8 +266,22 @@ export type DegradationKind =
 	 * checks stay attributable.
 	 */
 	| "git-tracked-ignore-truncated"
+	/** An anonymous GitHub API request was rejected after its rate limit was exhausted. */
+	| "github-api-rate-limit"
+	/**
+	 * #3071: gitleaks finding classification (`classifyAndFilterFindings`)
+	 * exceeded its `turn_end` wall budget. `runtime-turn.ts` fails OPEN —
+	 * retains the raw, unclassified findings rather than dropping them.
+	 */
+	| "gitleaks_classification_timeout"
 	/** Automatic test-result delivery could not reach the host entry surface. */
 	| "global-dir-probe-redirect"
+	/**
+	 * #3071: the Gradle build-logic ownership scan (`tool-policy.ts`) exceeded
+	 * its entry budget, so ownership could not be established and ktlint
+	 * autofix is declined for that scan rather than guessed at.
+	 */
+	| "gradle-ktlint-scan-budget-exceeded"
 	| "grammar-blocked"
 	/**
 	 * A selected formatter's executable was proven absent (#2413): its
@@ -268,11 +303,62 @@ export type DegradationKind =
 	 * must not turn the durable log into a stack-trace firehose.
 	 */
 	| "hook-handler-crash"
+	/**
+	 * #3246: a live inline-blocker record re-served at turn end carried no
+	 * structured diagnostics, so the shared finding policy had no identity to
+	 * anchor a stored disposition against and the record's rendered summary was
+	 * re-served verbatim (fail-open — a blocking finding is never hidden
+	 * because its identity was unavailable). Subject is
+	 * `inline-blocker:<display path>`, recorded ONCE per record and only while
+	 * the project actually holds marks: the condition recurs on every turn end
+	 * for the same record, so a counted row would grow without adding
+	 * information, and with an empty store there is nothing the record failed
+	 * to honor. Production pairs the two fields at the single writer
+	 * (`runtime-tool-result.ts`); a row here names a producer that did not.
+	 */
+	| "inline-blocker-unstructured"
 	| "install-retry-exhausted"
 	| "installer-verification-inconclusive"
 	| "installer-verification-output-truncated"
 	/** A busy notify-stall discriminator was deferred; detail is rising-edge bounded. */
 	| "instance-registry-corrupt"
+	/**
+	 * #3071: a registration-record write fell back to the process cwd because
+	 * the session's identity carried no `projectRoot` — `instance-registry.ts`
+	 * still records the child, just without the caller-supplied root.
+	 */
+	| "instance-registry-identity-fallback"
+	/**
+	 * #3071: a registry-file lock acquisition exhausted its retry budget
+	 * (`instance-registry-lock.ts`'s `recordLockTimeout`). Subject is the
+	 * resolved lock target path.
+	 */
+	| "instance-registry-lock-timeout"
+	/**
+	 * #3071: an LSP child was recorded before `registerInstance` had run for
+	 * this process (or its entry was reaped) — `instance-registry.ts`
+	 * synthesizes a minimal host entry so the child stays tracked.
+	 */
+	| "instance-registry-registration-missing"
+	/**
+	 * #2042: a kill-by-raw-pid was REFUSED because `/proc/<pid>/status` showed
+	 * the pid alive under a different parent — someone else's process. Subject
+	 * is the call site (`safe-spawn-register`, `lsp-stop-posix-group`,
+	 * `lsp-stop-windows-tree`), a fixed tiny set, so
+	 * the ledger stays bounded however often the refusal fires; the pid and
+	 * its real parent are in the reason. A pid that simply no longer exists is
+	 * NOT recorded — that is the ordinary "child already exited" case and
+	 * nothing is at risk.
+	 */
+	| "kill-foreign-pid-refused"
+	/**
+	 * #3091 F4: this Linux host cannot read `/proc/self/status`, so
+	 * kill-by-raw-pid ownership cannot be verified and falls back to the
+	 * best-effort behaviour the non-Linux platforms get. Once per session
+	 * (`recordDegradationOnce`); subject is the first call site that hit it.
+	 * Without this row the fallback is indistinguishable from a healthy run.
+	 */
+	| "kill-ownership-unverifiable"
 	/** A didChange content mirror was recorded behind a newer document version. */
 	| "lens-diagnostics-analysis-root-rejected"
 	/** Cross-graph rotation options disagreed; the first writer retained ownership. */
@@ -311,6 +397,13 @@ export type DegradationKind =
 	| "lsp-diagnostics-compatibility"
 	| "lsp-diagnostics-timeout"
 	| "lsp-diagnostics-unsupported"
+	/**
+	 * #3071: a live client's `onDrift` observer fired for a real resync or a
+	 * pacing-deferred heal (never for `unchanged`/`vanished`/`unheld`
+	 * bookkeeping) — `clients/lsp/index.ts`. Subject is the file path, and
+	 * `incrementDegradationCount` keeps one bounded entry per file.
+	 */
+	| "lsp-document-drift"
 	| "lsp-document-send-order"
 	| "lsp-liveness-probe-unsupported"
 	/**
@@ -349,6 +442,12 @@ export type DegradationKind =
 	 * vocabulary is kebab-case, so it is spelled that way here.
 	 */
 	| "lsp-notify-stall-cpu-busy"
+	/**
+	 * #3071: `tools/lsp-diagnostics.ts`'s probe-disposition filter threw while
+	 * applying policy to a batch of findings; the batch is returned unfiltered
+	 * (nothing suppressed) rather than dropped. Subject is the cwd.
+	 */
+	| "lsp-probe-finding-policy"
 	/**
 	 * A deferred-format record's origin (the cwd/worktree it was queued
 	 * under) does not match the flush attempting to claim it as an orphan,
@@ -468,6 +567,12 @@ export type DegradationKind =
 	 * this guard reached review vacuous. Subject carries the source name and
 	 * the identity of the dropped write.
 	 */
+	/**
+	 * #3071: a managed-tool archive extraction (tgz/zip) failed —
+	 * `clients/installer/index.ts`'s `recordArchiveExtractionDegradation`.
+	 * Subject is `<toolId>:<format>`, reason names the extraction failure.
+	 */
+	| "managed-tool-install"
 	| "managed-tool-refresh"
 	/** A complete MCP result exceeded the hard input budget (#2848). */
 	| "mcp-complete-result-budget-exceeded"
@@ -500,6 +605,8 @@ export type DegradationKind =
 	| "observed-mutation-dir-cap"
 	/** An observed directory mutation exceeded the same-turn analysis fan-out. */
 	| "observed-mutation-dispatch-cap"
+	/** Opaque mutation was analyzed without granting autonomous writer rights. */
+	| "opaque-mutation-ownership-boundary"
 	/** Opengrep completed with partial parsing warnings (#2943). */
 	| "opengrep-partial-scan"
 	/** Opengrep refused the requested root or reported a scan error (#2943). */
@@ -541,6 +648,22 @@ export type DegradationKind =
 	| "path-variant-unresolved"
 	| "pip-install-strategy-succeeded"
 	| "pip-pep668-strategy-refused"
+	/**
+	 * #3071: `clients/pipeline.ts` could not hash a just-written file to attach
+	 * a post-write state fingerprint (`fs.readFileSync` failed). The write
+	 * itself already landed; only the hash is missing. Subject is the file path.
+	 */
+	| "pipeline-post-write-hash-unavailable"
+	/**
+	 * #2146, #3140: an incompatible process-singleton cell was discarded and
+	 * replaced with a fresh value (`clients/process-singletons.ts`,
+	 * `PROCESS_SINGLETON_RESET_KIND`) — same read-time fold as
+	 * `log-sink-write-failure`: that module cannot import this one back
+	 * without closing a `no-client-cycles` cycle, so `getDegradationSummary()`
+	 * PULLS its bounded reset log instead of writing through
+	 * `recordDegradation`. One entry per family per process.
+	 */
+	| "process-singleton-reset"
 	/**
 	 * The orphan backstop's OWN process-table scanner blew the scan timeout and
 	 * had to be tree-killed (#1864 review F3). Reason carries the kill verdict,
@@ -643,6 +766,19 @@ export type DegradationKind =
 	 * `read_file_evicted` read-guard.log line says which. Rising edge gates
 	 * that log line per file per session, same as `read-guard-record-cap-trim`.
 	 */
+	/**
+	 * #3071: the live review graph exceeded its element/byte cap
+	 * (`clients/review-graph/builder.ts`) and centrality selection had to trim
+	 * to the cap. Subject is the cwd; reason carries the pre-trim size.
+	 */
+	| "review-graph-memory-cap"
+	/**
+	 * #3071: the SAME cap's centrality selection retained ZERO nodes from a
+	 * non-empty graph, which would otherwise read as an empty graph rather
+	 * than a capped one — `builder.ts` falls back to a deterministic head
+	 * slice instead and records the fallback under this distinct kind.
+	 */
+	| "review-graph-memory-cap-floor"
 	| "review-graph-non-absolute-entity-path"
 	/**
 	 * `read-guard.ts`'s per-file edits-cap splice (`READ_GUARD_MAX_EDITS_PER_FILE`)
@@ -720,11 +856,19 @@ export type DegradationKind =
 	 * the per-kind entry bound is reached.
 	 */
 	| "runner-parsed-nothing"
+	/** Windows/libuv cannot self-send SIGHUP after console-close cleanup. */
+	| "safe-spawn-signal-reraise-unsupported"
 	/** A duplicate RPC session start was suppressed after its first full pass. */
 	/** A self-drift baseline could not be verified within its available evidence. */
 	| "self-drift-hash-budget-exhausted"
 	| "self-drift-unverifiable"
 	| "session-start-duplicate"
+	/**
+	 * #3071: `clients/sgconfig.ts` evicted the oldest sg-config baseline
+	 * entries over its retained-entry cap. Subject is the baseline directory;
+	 * reason carries the evicted count.
+	 */
+	| "sgconfig-baseline-cap-evict"
 	/** Incremental word-index churn required an arena re-compaction. */
 	| "shared-checkout-probe"
 	/**
@@ -796,6 +940,14 @@ export type DegradationKind =
 	 */
 	| "startup-analyzer-disabled"
 	/**
+	 * #3071: a deferred turn-end test target hit `TEST_RUNNER_MAX_DEFERRALS`
+	 * and was retired from turn-end selection for the rest of the session —
+	 * `runtime-turn.ts`, subject `<cwd>:deferral-exhausted`. Counted, not
+	 * once-only, so the durable tally is the exact number of suites cut this
+	 * way; run the retired target explicitly.
+	 */
+	| "test-runner-batch-capped"
+	/**
 	 * The `script_element` scan of an HTML root threw while napi prepared the
 	 * embedded-`<script>` evaluation (#2347). The embedded coverage degrades to
 	 * nothing for the file, silently prior to this kind. Once per file per
@@ -864,6 +1016,14 @@ export type DegradationKind =
 	 */
 	| "tree-sitter-queries-dir-missing"
 	/**
+	 * #3071: a bundled or project tree-sitter query file failed to parse
+	 * (`tree-sitter-query-loader.ts`'s `recordQueryParseFailure`). Replayed
+	 * into the ledger once per generation from the loader's own cross-session
+	 * memo (#3070 N1), since a memoized `loadQueries` skips re-parsing.
+	 * Subject is the query file path.
+	 */
+	| "tree-sitter-query-parse-failed"
+	/**
 	 * A config file's NOTICE LIST was truncated by the per-resolution bound, and
 	 * this row carries how many notices were summarised away (#2426 review round
 	 * 6). Written through `warnIgnoredConfigOnce` like the two kinds above,
@@ -926,6 +1086,16 @@ export type DegradationKind =
 	 */
 	| "unclassified-mutating-tool"
 	/**
+	 * #3255: nothing is listening on the pid-scoped warm endpoint this session
+	 * derived for its incumbent, while the instance registry still confirms that
+	 * incumbent is alive. Narrowing the workspace-id case fold renamed the
+	 * endpoint, so a peer that registered BEFORE the upgrade keeps serving the
+	 * previous name and the two can no longer meet — the session drops to local
+	 * analysis with nothing a reader could see. Subject is the derived endpoint;
+	 * the remedy is restarting the incumbent, which no retry can substitute for.
+	 */
+	| "warm-ipc-endpoint-missing"
+	/**
 	 * #2504 review round 7 (F5): the DEFERRED sibling of
 	 * `actionable-warnings-inband-superseded` — a file changed while the
 	 * off-hook deferred LSP pull was reading it, so its carried entry is
@@ -945,6 +1115,28 @@ export type DegradationKind =
 	 */
 	| "web-tree-sitter-load-failed"
 	| "widget-disposition-reconcile-fallback"
+	/**
+	 * #3183: a file whose widget record holds a `false-positive`-marked row could
+	 * not be READ when the store needed its content to ask whether the marked
+	 * line still exists ({@link WidgetDiagnostic.anchorSpan}). With no content
+	 * there is no span to ask, so that file's suppressed rows fall back to the
+	 * pre-#3183 rules — the per-entry mtime gate and the coarse retention
+	 * identity — which can retire a mark that still stands, and the footer's
+	 * `suppressed: N` chip then under-counts the file. Bounded at one record per
+	 * file per session (`recordDegradationOnce`), never one per row or one per
+	 * sweep; subject is the file path. See `readContentOrUndefined` in
+	 * `clients/widget-state.ts`.
+	 */
+	| "widget-mark-anchor-unreadable"
+	/**
+	 * #3158: a file's disposition-tagged widget rows exceeded
+	 * `MAX_RETAINED_SUPPRESSED_PER_FILE`, so the footer's `suppressed: N` chip
+	 * under-counts that file by the stated number until its content changes.
+	 * Bounded at one record per file per session (`recordDegradationOnce`), never
+	 * one per dropped row; subject is the file path. See
+	 * `WidgetDiagnostic.suppressedRetained` in `clients/widget-state.ts`.
+	 */
+	| "widget-suppressed-retention-capped"
 	/**
 	 * #2636 (the #2626 class sweep's ast-grep leg): `AstGrepClient`'s
 	 * `ruleDir` fell back to `resolvePackagePath(import.meta.url, "rules")`
@@ -1014,6 +1206,25 @@ let ledgerGeneration = 0;
 /** Current session generation. Bump on every `resetDegradationLedger()`. */
 export function getDegradationLedgerGeneration(): number {
 	return ledgerGeneration;
+}
+
+/**
+ * Test-only population probe for bounded-container regressions. Keep this
+ * read-only and deliberately expose sizes, not the retained identities.
+ */
+export function _getDegradationLedgerStateForTests(): {
+	onceKeys: number;
+	tallies: number;
+	retainedEntries: number;
+} {
+	return {
+		onceKeys: onceKeys.size,
+		tallies: tallies.size,
+		retainedEntries: [...groups.values()].reduce(
+			(total, group) => total + group.entries.length,
+			0,
+		),
+	};
 }
 
 export function recordDegradation(record: DegradationRecord): boolean {

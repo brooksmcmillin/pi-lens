@@ -1,10 +1,11 @@
+// flake-shape: real-process-spawn — the real advisory argv and counter process are the only faithful proof that CI sees a nonzero type-aware rule population
 // Pins the `oxlint advisory` job's rule-count floor guard in lint.yml
 // (#2700 review round 2, F2): with `oxlint-tsgolint` absent, oxlint's
 // `--type-aware` flag degrades SILENTLY (exit 1, zero rules run, zero
-// findings) which, under this job's own `continue-on-error`, is
+// findings) which, if only the advisory finding exit code were observed, is
 // indistinguishable in the GitHub Actions checks UI from a healthy run
 // that simply found real issues (also exit 1). The step's inline bash
-// parses oxlint's own `Finished in … with N rules …` trailer and fails
+// parses oxlint's machine-readable `--print-config` rule map and fails
 // with a named `::error::` annotation when N falls below a floor — this
 // guard has NO other test (the PR's other lint-js.test.ts/ci-verdict.
 // test.ts/flake-shape-ratchet.test.ts cases never load lint.yml at all),
@@ -16,6 +17,7 @@
 // yaml.load (never a hand-copied restatement of its bash) and assert
 // against the loaded `run:` string.
 import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import yaml from "../../clients/deps/js-yaml.js";
@@ -70,15 +72,46 @@ describe("oxlint advisory rule-count floor guard (#2700 review round 2, F2)", ()
 		expect(exitAfterError).not.toBeNull();
 	});
 
-	it("the trailer this guard parses is produced by a pinned --format default, not CI's auto-selected reporter", () => {
-		// #2700 review round 1, F3: without an explicit --format, CI
-		// auto-selects a reporter that never prints the `Finished in … with
-		// N rules …` trailer this guard's `grep` depends on -- so the floor
-		// guard is only meaningful paired with the pinned reporter.
+	it("counts the real advisory --print-config surface and fails closed for absent or malformed evidence", () => {
+		const run = readStepRun(loadWorkflow());
+		expect(run).toContain("--print-config");
+		expect(run).toContain("scripts/count-oxlint-rules.mjs");
+		expect(run).not.toContain("Finished in");
+		expect(run).not.toContain("grep -oE");
 		const pkg = JSON.parse(
 			readFileSync(resolve(REPO_ROOT, "package.json"), "utf8"),
 		);
 		const advisoryScript: string = pkg.scripts["lint:js:advisory"];
-		expect(advisoryScript).toMatch(/--format default\b/);
+		expect(advisoryScript).toMatch(/--format unix\b/);
+		const counter = resolve(REPO_ROOT, "scripts/count-oxlint-rules.mjs");
+		const count = (input: string) =>
+			spawnSync(process.execPath, [counter], {
+				input,
+				encoding: "utf8",
+			}).stdout.trim();
+		const advisory = spawnSync(
+			process.platform === "win32" ? "npm.cmd" : "npm",
+			["run", "lint:js:advisory", "--silent", "--", "--print-config"],
+			{
+				cwd: REPO_ROOT,
+				encoding: "utf8",
+				env: {
+					...process.env,
+					PI_LENS_HOME: resolve(REPO_ROOT, ".probe-home"),
+					PILENS_DATA_DIR: resolve(REPO_ROOT, ".probe-home/data"),
+					HOME: resolve(REPO_ROOT, ".probe-home/home"),
+					XDG_DATA_HOME: resolve(REPO_ROOT, ".probe-home/xdg"),
+				},
+				timeout: 30_000,
+			},
+		);
+		expect(advisory.status, advisory.stdout + advisory.stderr).toBe(0);
+		expect(Number(count(advisory.stdout))).toBeGreaterThanOrEqual(100);
+		expect(count(JSON.stringify({ rules: { a: "deny", b: "warn" } }))).toBe(
+			"2",
+		);
+		expect(count("{}")).toBe("0");
+		expect(count(JSON.stringify({ rules: { invalid: "garbage" } }))).toBe("0");
+		expect(count("not json")).toBe("0");
 	});
 });

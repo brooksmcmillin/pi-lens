@@ -18,6 +18,24 @@ export interface SmokeFixture {
 	 */
 	tier1?: boolean;
 }
+/** The clean-gate population split (#3217): every fixture the gate could drive,
+ *  those that opted in, and those that carry an explicit exemption reason. */
+export function lspGatePopulation(fixtures?: LspFixture[]): {
+	eligible: LspFixture[];
+	gated: LspFixture[];
+	exempt: LspFixture[];
+};
+/** The nightly's `gated N / handshake-only M / unavailable K` census line. */
+export function formatGateCensus(
+	population: {
+		eligible: LspFixture[];
+		gated: LspFixture[];
+		exempt: LspFixture[];
+	},
+	rows: Array<{ state: string }>,
+	langs?: string[],
+): string;
+
 export interface LspFixture {
 	lang: string;
 	dir: string;
@@ -36,6 +54,9 @@ export interface LspFixture {
 	lspGate?: boolean;
 	/** The source text the gated fixture must contain (its seeded error). */
 	lspGateMarker?: string;
+	/** Why this gate-eligible fixture cannot opt in (#3217). Mutually exclusive
+	 *  with `lspGate`; the reason is asserted, not just the key's presence. */
+	lspGateExempt?: string;
 	lombokJar?: boolean;
 	expectNoMessageMatch?: string;
 	/** A diagnostic message that MUST arrive. The lane's default verdict passes
@@ -129,6 +150,13 @@ export function classifyLspGateResult(
 	fixture: Pick<LspFixture, "serverHint">,
 	unavailable?: boolean,
 ): { state: "pass" | "skip" | "fail"; detail: string; diags: number };
+/** Run the production LSP clean-gate layer, optionally with test seams. */
+export function runLspGate(options?: {
+	langs?: string[];
+	install?: boolean;
+	verbose?: boolean;
+	deps?: unknown;
+}): Promise<number>;
 /** One reported row from a smoke lane, as far as the pass floor is concerned. */
 export interface SmokeRow {
 	state: "pass" | "fail" | "skip" | "setup-failed";

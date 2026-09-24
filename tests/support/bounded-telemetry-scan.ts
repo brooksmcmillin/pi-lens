@@ -12,7 +12,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { stripSource } from "./sweep-kit.js";
+import { matchingCloseIndex, stripSource } from "./sweep-kit.js";
 
 export interface EmissionSite {
 	/** Repo-relative path, forward slashes, so findings read the same on any OS. */
@@ -129,18 +129,18 @@ function extractPhase(callee: string, argsText: string): string | undefined {
 	return /^\s*"([A-Za-z0-9_]+)"/.exec(argsText)?.[1];
 }
 
-/** Argument text between `(` at `openIndex` and its matching `)`. */
+/**
+ * Argument text between `(` at `openIndex` and its matching `)` — or, when
+ * unbalanced, the rest of `source` from just past `openIndex`. #3134: the
+ * depth count itself is `sweep-kit.ts`'s `matchingCloseIndex`; only this
+ * unbalanced-to-rest-of-source fallback is local (shared byte-for-byte with
+ * `session-event-guard-sweep.test.ts`'s copy of this function).
+ */
 function readBalancedArgs(source: string, openIndex: number): string {
-	let depth = 0;
-	for (let i = openIndex; i < source.length; i++) {
-		const ch = source[i];
-		if (ch === "(") depth++;
-		else if (ch === ")") {
-			depth--;
-			if (depth === 0) return source.slice(openIndex + 1, i);
-		}
-	}
-	return source.slice(openIndex + 1);
+	const close = matchingCloseIndex(source, openIndex, "(", ")");
+	return close === -1
+		? source.slice(openIndex + 1)
+		: source.slice(openIndex + 1, close);
 }
 
 function listTypeScriptFiles(target: string): string[] {
@@ -194,6 +194,10 @@ export const UNBOUNDED_FAILURE_PHASE_REASONS: Record<string, string> = {
 		"One record per tier-3 reconcile pass, and the cascade budget already caps those per turn.",
 	cross_process_lsp_budget_degraded:
 		"One record per cross-process budget evaluation, which runs on the LSP spawn path rather than per file.",
+	finding_path_stat_budget_exhausted:
+		"One batched record per delivery-gate call naming every source whose stat allowance ran out, so volume follows deliveries, not findings.",
+	scanner_cache_read_abandoned:
+		"One batched record per turn_end delivery naming every scanner store the tiers were composed without, so volume follows deliveries, not stores — the composer collects the stores in a per-delivery array and emits once, and there are only three such stores (#3274).",
 	finding_dead_path_drop:
 		"One batched record per delivery-gate call listing every dropped finding, so volume follows scans, not findings.",
 	lsp_client_unavailable:

@@ -338,8 +338,13 @@ describe("terraform/kotlin runners", () => {
 
 			expect(result.status).toBe("failed");
 			expect(result.semantic).toBe("warning");
+			// The guarded behaviour is unchanged — a nonzero ktlint run whose output
+			// the parser cannot read is never clean. Only the wording moved: the
+			// runner's local `ktlint-output-unparseable` branch was folded onto the
+			// shared `finishParsedRun` parse-error finding (#1816/#3291).
+			expect(result.diagnostics[0]?.id).toBe("ktlint:parse-error:1");
 			expect(result.diagnostics[0]?.message).toContain(
-				"Unable to parse ktlint output",
+				"ktlint exited 1 but its output could not be parsed",
 			);
 		} finally {
 			env.cleanup();

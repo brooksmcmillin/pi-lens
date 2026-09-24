@@ -51,7 +51,9 @@ interface RuleDocument {
 }
 
 function makeProject(): string {
-	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pilens-precedence-"));
+	const root = fs.mkdtempSync(
+		path.join(os.tmpdir(), "pi-lens-pilens-precedence-"),
+	);
 	tempRoots.push(root);
 	fs.mkdirSync(path.join(root, PRIMARY_RULES), { recursive: true });
 	return root;
@@ -733,6 +735,55 @@ describe(
 				).not.toContain(root);
 			},
 		);
+
+		// #3053 round 2 F1: before the fold, a within-source duplicate id was
+		// unfireable through TWO independent mechanisms — `duplicateSet.has`
+		// AND the deleted `seenRuleIds.add(ruleId)` inside
+		// `appendDuplicateRuleDiagnostics`, which also claimed the id in the
+		// shared `seenRuleIds` Set the per-rule loop consulted. The fold's new
+		// cross-source winner check (`catalog.effectiveRules.get(rule.id)
+		// ?.source !== source`) cannot serve as that second mechanism: both
+		// copies of a within-source duplicate share the SAME source, so the
+		// check passes for whichever copy the catalog happened to record as
+		// its (arbitrary, unused-for-this-purpose) winner. Neutering
+		// `duplicateSet.has(rule.id)` alone (`if (false) continue;`) left
+		// EVERY existing test green — this is the case that catches it.
+		it("never fires a rule whose id is duplicated within one source — only the Duplicate diagnostic", () => {
+			const root = makeProject();
+			writeRule(root, PRIMARY_RULES, "dup-a.yml", {
+				id: "duplicate-within-one-source",
+				message: "first",
+				pattern: "duplicateWithinOneSource($A)",
+			});
+			writeRule(root, PRIMARY_RULES, "dup-b.yml", {
+				id: "duplicate-within-one-source",
+				message: "second",
+				pattern: "duplicateWithinOneSource($A)",
+			});
+			const diagnostics = napiDiagnostics(
+				root,
+				path.join(root, "input.ts"),
+				"duplicateWithinOneSource(value);\n",
+				"typescript",
+			);
+			expect(diagnostics).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						rule: "duplicate-within-one-source",
+						message: expect.stringContaining(
+							'Duplicate ast-grep rule id "duplicate-within-one-source"',
+						),
+					}),
+				]),
+			);
+			expect(
+				diagnostics.filter(
+					(d) =>
+						d.rule === "duplicate-within-one-source" &&
+						!/^Duplicate ast-grep rule id/.test(d.message),
+				),
+			).toEqual([]);
+		});
 
 		it("keeps an explicit nearest project sgconfig as the replacement surface", () => {
 			const root = makeProject();

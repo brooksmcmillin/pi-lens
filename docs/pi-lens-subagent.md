@@ -51,6 +51,15 @@ runner's own notes say which mode lifts it). Run Vitest as
 tree-sitter grammar prefetch hangs offline, verify through direct probes of the
 built code and say so; the orchestrator re-runs the files outside the sandbox.
 
+Every Vitest invocation on the maintainer host exports
+`PI_LENS_TEST_MAX_WORKERS=6` and names its files; never the full suite. The
+plegma daemon's cgroup holds every worker's child processes, and on 2026-09-19
+one fixer's fan-out (16 forks on a 32-core host plus the real language servers
+its probes spawned) took the unit to 64 GB, systemd-oomd killed the daemon, and
+every live worker died with it. Kill every language server a probe spawns
+before moving on; the previous worker's unkilled servers were part of that
+footprint.
+
 When Git authority is granted, use one logical commit with an imperative,
 conventional-prefix subject of at most 50 characters, a blank line, and a
 72-column body that states what and why. Reference the issue. Open a PR, do not

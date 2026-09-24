@@ -89,7 +89,7 @@ describe(
 			duringTouch = undefined;
 			touchedCount = 0;
 
-			sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "wsd-1723-"));
+			sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-wsd-1723-"));
 			fs.mkdirSync(path.join(sessionDir, ".pi-lens"));
 			fileA = path.join(sessionDir, "a.ts");
 			fileB = path.join(sessionDir, "b.ts");

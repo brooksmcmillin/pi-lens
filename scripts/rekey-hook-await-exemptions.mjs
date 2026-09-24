@@ -30,7 +30,7 @@
  * 1. Parses every key straight out of `EXEMPT_SITES`'s source text, in
  *    declaration order.
  * 2. Runs the SAME detector `tests/config/hook-await-bounds.test.ts` uses
- *    (imported from `tests/support/hook-await-scan.ts` — the shared module
+ *    (imported from `tests/support/hook-await-scan.mjs` — the shared module
  *    that exists specifically so this script and the guard test can never
  *    drift apart) against the CURRENT tree, producing the live occurrence
  *    list.
@@ -72,10 +72,10 @@
  *   node scripts/rekey-hook-await-exemptions.mjs --write    # rewrite the file
  */
 
-import { register } from "node:module";
 import * as path from "node:path";
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { createJiti } from "jiti";
 
 const REPO_ROOT = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -293,16 +293,7 @@ export function applyPlan(source, plan, write) {
 }
 
 async function main() {
-	register(
-		pathToFileURL(
-			path.join(
-				path.dirname(fileURLToPath(import.meta.url)),
-				"lib/ts-sibling-loader.mjs",
-			),
-		),
-		import.meta.url,
-	);
-
+	const jiti = createJiti(import.meta.url);
 	const {
 		DEFINITION_FILE,
 		findHandRolledRaceLines,
@@ -310,8 +301,10 @@ async function main() {
 		hookPathFiles,
 		scanFiles,
 		shippedSourceFiles,
-	} = await import(
-		pathToFileURL(path.join(REPO_ROOT, "tests/support/hook-await-scan.ts")).href
+	} = await jiti.import(
+		pathToFileURL(path.join(REPO_ROOT, "tests/support/hook-await-scan.mjs"))
+			.href,
+		{ defaultExport: false },
 	);
 
 	const WRITE = process.argv.includes("--write");

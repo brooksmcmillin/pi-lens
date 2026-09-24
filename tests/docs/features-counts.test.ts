@@ -107,6 +107,7 @@ const DOCS_LABEL_OVERRIDES: Record<string, string> = {
 	fsharp: "F#",
 	cpp: "C/C++",
 	expert: "Elixir",
+	tinymist: "Typst",
 	marksman: "Markdown",
 };
 

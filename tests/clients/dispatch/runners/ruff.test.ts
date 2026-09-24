@@ -92,6 +92,62 @@ describe("ruff runner", () => {
 		}
 	});
 
+	it("does not turn nonzero empty or unparsable output into clean (#1816)", async () => {
+		const env = setupTestEnvironment("pi-lens-ruff-outcome-");
+		try {
+			const filePath = path.join(env.tmpDir, "sample.py");
+			fs.writeFileSync(filePath, "import os\n");
+			const runner = (
+				await import("../../../../clients/dispatch/runners/ruff.js")
+			).default;
+
+			for (const stdout of ["", "ruff emitted non-JSON failure output"]) {
+				safeSpawnAsync.mockResolvedValueOnce({
+					error: null,
+					status: 1,
+					stdout,
+					stderr: "",
+				});
+				const result = await runner.run(
+					createCtx(filePath, env.tmpDir) as never,
+				);
+				expect(result.status).not.toBe("succeeded");
+				if (stdout) expect(result.diagnostics.length).toBeGreaterThan(0);
+			}
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("preserves valid findings on status 2 (#1816)", async () => {
+		const env = setupTestEnvironment("pi-lens-ruff-status-2-findings-");
+		try {
+			const filePath = path.join(env.tmpDir, "sample.py");
+			fs.writeFileSync(filePath, "import os\n");
+			safeSpawnAsync.mockResolvedValueOnce({
+				error: null,
+				status: 2,
+				stdout: JSON.stringify([
+					{
+						code: "F401",
+						message: "unused import",
+						filename: filePath,
+						location: { row: 1, column: 1 },
+					},
+				]),
+				stderr: "",
+			});
+			const runner = (
+				await import("../../../../clients/dispatch/runners/ruff.js")
+			).default;
+			const result = await runner.run(createCtx(filePath, env.tmpDir) as never);
+			expect(result.status).toBe("succeeded");
+			expect(result.diagnostics).toHaveLength(1);
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	// #2691: the check spawn passed no `cwd`, so a nested `pyproject.toml`
 	// config was resolved against the extension host's `process.cwd()`
 	// instead of `ctx.cwd` -- same shape as #1731 (sqlfluff), even though

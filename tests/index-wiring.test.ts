@@ -1,7 +1,15 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	afterAll,
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	vi,
+} from "vitest";
 
 const activationToolFactoryOverride = vi.hoisted(() => ({
 	enabled: false,
@@ -175,7 +183,11 @@ import {
 import { _resetSessionLifecycleForTests } from "../clients/session-lifecycle.js";
 import { makeSessionStartEvent } from "./support/host-event-factory.js";
 import { createPiMock, makeCtx, makeStaleCtx } from "./support/pi-mock.js";
-import { removeTempDirSync } from "./clients/test-utils.js";
+import {
+	cleanupTestEnvironmentsDrained,
+	removeTempDirSync,
+	setupTestEnvironment,
+} from "./clients/test-utils.js";
 
 // #643: the dynamic-tool-deactivation call now runs inside the session_start
 // handler rather than synchronously at registration time (see index.ts), so
@@ -777,8 +789,18 @@ describe("index.ts extension wiring", () => {
 		it.each(["fork", "reload", "resume"])(
 			"restores the parent's tool posture on %s session_start",
 			async (reason) => {
-				const tmp = fs.mkdtempSync(
-					path.join(os.tmpdir(), `pi-lens-wiring-${reason}-`),
+				// #3306: these three roots are the ONLY ones in this file that
+				// outlive it. `removeTempDirSync(tmp)` in the `finally` below does
+				// remove the directory — measured — but this scenario's
+				// `session_start` leaves a `recent-touches` append in flight against
+				// the `PILENS_DATA_DIR` captured HERE, and that append recreates the
+				// root after the case has ended (measured: the `fork` root's
+				// `data/repo-<hash>/recent-touches.json` is written while the
+				// `resume` case is running). The repo's answer to a deferred fixture
+				// producer is the tracked-root seam plus the drained sweep at file
+				// end, not a second removal loop of this file's own.
+				const { tmpDir: tmp, cleanup } = setupTestEnvironment(
+					`pi-lens-wiring-${reason}-`,
 				);
 				const prevDataDir = process.env.PILENS_DATA_DIR;
 				process.env.PILENS_DATA_DIR = path.join(tmp, "data");
@@ -822,10 +844,19 @@ describe("index.ts extension wiring", () => {
 				} finally {
 					if (prevDataDir === undefined) delete process.env.PILENS_DATA_DIR;
 					else process.env.PILENS_DATA_DIR = prevDataDir;
-					removeTempDirSync(tmp);
+					cleanup();
 				}
 			},
 		);
+
+		// #3306: the three roots above stay TRACKED after `cleanup()` so this sweep
+		// still has a handle on the one a deferred `recent-touches` append
+		// recreated. It runs before the setup file's own teardown check, because
+		// vitest runs `afterAll` hooks in reverse registration order and the setup
+		// file registered first.
+		afterAll(async () => {
+			await cleanupTestEnvironmentsDrained("pi-lens-wiring-");
+		});
 
 		it("restores activation after a factory re-run for the same session file", async () => {
 			const tmp = fs.mkdtempSync(

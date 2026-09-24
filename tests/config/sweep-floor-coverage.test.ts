@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import {
 	auditRegistry,
 	listSourceFiles,
+	readWalkedFiles,
 	relativePosix,
 	stripSource,
 } from "../support/sweep-kit.js";
@@ -64,13 +65,18 @@ function isRegisteredFloorSource(source: string): boolean {
 	);
 }
 
-function sweepShapeFiles(): string[] {
-	return listSourceFiles(TESTS_ROOT, { extensions: [".ts"] })
+/** The sweep-shaped population, each with the source this scan already read —
+ *  one read per file, so the floor check below cannot see a different tree
+ *  than the shape check did. */
+function sweepShapeFiles(): Array<{ file: string; source: string }> {
+	const walked = listSourceFiles(TESTS_ROOT, { extensions: [".ts"] })
 		.filter((file) => file.endsWith(".test.ts"))
-		.filter((file) => relativePosix(REPO_ROOT, file) !== SELF)
-		.filter((file) =>
-			looksSweepShaped(stripSource(fs.readFileSync(file, "utf8"))),
-		);
+		.filter((file) => relativePosix(REPO_ROOT, file) !== SELF);
+	// readWalkedFiles, not readFileSync: a path that vanished between the walk
+	// and the read is out of the population, not a finding (#3082).
+	return readWalkedFiles(walked).filter(({ source }) =>
+		looksSweepShaped(stripSource(source)),
+	);
 }
 
 const DECLARED_EXCEPTIONS: Readonly<Record<string, string>> = {
@@ -197,14 +203,11 @@ const DECLARED_EXCEPTIONS: Readonly<Record<string, string>> = {
 
 describe("registered-or-fail sweep floors", () => {
 	it("every sweep-shaped test uses sweep-kit or declares a reason", () => {
-		const files = sweepShapeFiles().map((file) =>
-			relativePosix(REPO_ROOT, file),
-		);
-		const registered = files.filter((file) =>
-			isRegisteredFloorSource(
-				fs.readFileSync(path.join(REPO_ROOT, file), "utf8"),
-			),
-		);
+		const shaped = sweepShapeFiles();
+		const files = shaped.map(({ file }) => relativePosix(REPO_ROOT, file));
+		const registered = shaped
+			.filter(({ source }) => isRegisteredFloorSource(source))
+			.map(({ file }) => relativePosix(REPO_ROOT, file));
 		const scannedCount = listSourceFiles(TESTS_ROOT, {
 			extensions: [".ts"],
 		}).filter((file) => file.endsWith(".test.ts")).length;
@@ -327,7 +330,9 @@ describe("floor-call registration over blanked source (#2710)", () => {
 	});
 
 	it("reports a prose-only fixture sweep file uncovered and passes a real call", () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "sweep-floor-2710-"));
+		const root = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-sweep-floor-2710-"),
+		);
 		try {
 			fs.writeFileSync(
 				path.join(root, "comment-only.test.ts"),

@@ -33,7 +33,7 @@ describe("parseSqlfluffOutput — fixable propagation (#112 slice)", () => {
 				line_pos: 1,
 			},
 		]);
-		const diags = parseSqlfluffOutput(raw, "queries/example.sql");
+		const diags = parseSqlfluffOutput(raw, "queries/example.sql", ".");
 		expect(diags).toHaveLength(2);
 		for (const d of diags) {
 			expect(d.tool).toBe("sqlfluff");
@@ -57,7 +57,7 @@ describe("parseSqlfluffOutput — fixable propagation (#112 slice)", () => {
 				line_pos: 3,
 			},
 		]);
-		const diags = parseSqlfluffOutput(raw, "queries/example.sql");
+		const diags = parseSqlfluffOutput(raw, "queries/example.sql", ".");
 		expect(diags).toHaveLength(2);
 		for (const d of diags) {
 			expect(d.fixable).toBe(false);
@@ -66,9 +66,11 @@ describe("parseSqlfluffOutput — fixable propagation (#112 slice)", () => {
 	});
 
 	it("handles empty and malformed JSON gracefully", () => {
-		expect(parseSqlfluffOutput("", "queries/example.sql")).toEqual([]);
-		expect(parseSqlfluffOutput("not json", "queries/example.sql")).toEqual([]);
-		expect(parseSqlfluffOutput("{}", "queries/example.sql")).toEqual([]);
+		expect(parseSqlfluffOutput("", "queries/example.sql", ".")).toEqual([]);
+		expect(parseSqlfluffOutput("not json", "queries/example.sql", ".")).toEqual(
+			[],
+		);
+		expect(parseSqlfluffOutput("{}", "queries/example.sql", ".")).toEqual([]);
 	});
 
 	it("falls back to code 'SQL' when sqlfluff omits a code (never matches the allowlist)", () => {
@@ -84,7 +86,7 @@ describe("parseSqlfluffOutput — fixable propagation (#112 slice)", () => {
 				],
 			},
 		]);
-		const diags = parseSqlfluffOutput(raw, "queries/example.sql");
+		const diags = parseSqlfluffOutput(raw, "queries/example.sql", ".");
 		expect(diags).toHaveLength(1);
 		expect(diags[0].rule).toBe("SQL");
 		expect(diags[0].fixable).toBe(false);

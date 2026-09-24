@@ -50,6 +50,11 @@ vi.mock("../../../clients/latency-logger.js", async (importOriginal) => {
 import { CacheManager } from "../../../clients/cache-manager.js";
 import { resetBoundedTelemetry } from "../../../clients/bounded-telemetry.js";
 import {
+	_resetDeferredForTests,
+	_resetStateCacheForTests,
+} from "../../../clients/diagnostic-dispositions.js";
+import { createLensDiagnosticMarkTool } from "../../../tools/lens-diagnostic-mark.js";
+import {
 	getDegradationSummary,
 	resetDegradationLedger,
 } from "../../../clients/degradation-ledger.js";
@@ -1082,6 +1087,265 @@ describe("turn-end late-auxiliary findings (#2001/#2002)", () => {
 				coverageGapReRaised: 0,
 			});
 		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+/**
+ * #3102 member 1. This advisory rendered raw LSP findings with no stored
+ * disposition filter, no `.pi-lens.json` rule policy and no inline
+ * `pi-lens-ignore` suppression — so a finding the agent marked
+ * `false-positive` re-reported on every turn that drained a late pair, while
+ * `mode=delta`/`mode=full`/the per-edit dispatcher and (since #3088) the
+ * `source=lsp` probe lane all hid it. It also converted with a hardcoded
+ * `tool: "lsp"`, so the identity a mark anchors on — `opengrep`, the
+ * auxiliary's real tool id on every other surface — never matched this one
+ * (#3046/#3047).
+ *
+ * Every case drives the production `handleTurnEnd` drain against a real mark
+ * written by the production `lens_diagnostic_mark` tool.
+ */
+describe("turn-end late-auxiliary advisory applies the finding policy (#3102)", () => {
+	const MARKED = "late finding the agent dismissed";
+	const OTHER = "late finding nobody marked";
+	/** Two lines, so the marked finding's STRICT anchor hashes real content and
+	 * the unmarked sibling keeps the absence assertion from passing vacuously. */
+	const BODY = "const marked = 1;\nconst other = 2;\n";
+	/** The spelling every OTHER surface renders once `retagAuxiliaryDiagnostics`
+	 * gives the auxiliary its real tool id — and therefore the spelling of a
+	 * mark made from the widget, `mode=full` or `mode=delta`. */
+	const CANONICAL_MARK = { tool: "opengrep", rule: "opengrep:rule-x" };
+
+	function otherDiag(line: number): LSPDiagnostic {
+		return { ...diag(line, OTHER), code: "rule-y" };
+	}
+
+	async function mark(cwd: string, params: Record<string, unknown>) {
+		const markTool = createLensDiagnosticMarkTool(() => cwd);
+		return markTool.execute("mark-3102", params, undefined, () => {}, { cwd });
+	}
+
+	/** One production turn_end drain over a single late pair carrying `diags`,
+	 * returning the advisory text the agent would receive. */
+	async function drain(
+		env: { tmpDir: string },
+		file: string,
+		diags: LSPDiagnostic[],
+	): Promise<string> {
+		const runtime = new RuntimeCoordinator();
+		runtime.setTelemetryIdentity({ sessionId: "late-aux-3102" });
+		runtime.beginTurn();
+		const cacheManager = new CacheManager(false);
+		cacheManager.addModifiedRange(
+			file,
+			{ start: 1, end: 1 },
+			false,
+			env.tmpDir,
+			"late-aux-3102",
+		);
+		markPendingAuxiliaryCoverage(file, ["opengrep"], Date.now() - 2000);
+		readCachedDiagnosticsForServers.mockImplementation(
+			async (_p: string, serverIds: ReadonlySet<string>) => {
+				const out = new Map<
+					string,
+					{ diags: LSPDiagnostic[]; publishedAt: number }
+				>();
+				if (serverIds.has("opengrep"))
+					out.set("opengrep", { diags, publishedAt: Date.now() });
+				return out;
+			},
+		);
+		await handleTurnEnd(makeDeps(runtime, cacheManager, env.tmpDir));
+		return turnEndContent(cacheManager, env.tmpDir);
+	}
+
+	/** A temp project whose scanned file is written with `body` and pinned 10s
+	 * in the past, so the freshness gate reports it live against the mark. */
+	function setup(body = BODY) {
+		const env = setupTestEnvironment("pi-lens-3102-late-aux-") as any;
+		const file = path.join(env.tmpDir, "scanned.ts");
+		fs.writeFileSync(file, body);
+		const past = new Date(Date.now() - 10_000);
+		fs.utimesSync(file, past, past);
+		_resetDeferredForTests();
+		_resetStateCacheForTests();
+		return { env, file };
+	}
+
+	it("premise: both findings reach the agent before anything is marked", async () => {
+		const { env, file } = setup();
+		try {
+			const content = await drain(env, file, [diag(0, MARKED), otherDiag(1)]);
+			expect(content).toContain("Late auxiliary diagnostics");
+			expect(content).toContain(MARKED);
+			expect(content).toContain(OTHER);
+		} finally {
+			_resetStateCacheForTests();
+			env.cleanup();
+		}
+	});
+
+	it("drops a finding marked false-positive under the auxiliary's real tool id", async () => {
+		const { env, file } = setup();
+		try {
+			const marked = await mark(env.tmpDir, {
+				filePath: file,
+				line: 1,
+				message: MARKED,
+				...CANONICAL_MARK,
+				disposition: "false-positive",
+			});
+			expect(marked.isError).toBeFalsy();
+
+			const content = await drain(env, file, [diag(0, MARKED), otherDiag(1)]);
+			expect(content).not.toContain(MARKED);
+			expect(content).toContain(OTHER);
+		} finally {
+			_resetStateCacheForTests();
+			env.cleanup();
+		}
+	});
+
+	it("drops a finding marked from the advisory's own rendering, which prints no tool", async () => {
+		// The advisory line is `file:line:col [rule] message` — no tool for the
+		// agent to pass on, and `lens_diagnostic_mark`'s `tool` is optional.
+		const { env, file } = setup();
+		try {
+			const marked = await mark(env.tmpDir, {
+				filePath: file,
+				line: 1,
+				message: MARKED,
+				rule: "opengrep:rule-x",
+				disposition: "false-positive",
+			});
+			expect(marked.isError).toBeFalsy();
+
+			const content = await drain(env, file, [diag(0, MARKED), otherDiag(1)]);
+			expect(content).not.toContain(MARKED);
+			expect(content).toContain(OTHER);
+		} finally {
+			_resetStateCacheForTests();
+			env.cleanup();
+		}
+	});
+
+	it("drops a rule the project disabled in .pi-lens.json", async () => {
+		const { env, file } = setup();
+		try {
+			fs.writeFileSync(
+				path.join(env.tmpDir, ".pi-lens.json"),
+				JSON.stringify({
+					rules: { security: { disable: ["opengrep:rule-x"] } },
+				}),
+			);
+			const content = await drain(env, file, [diag(0, MARKED), otherDiag(1)]);
+			expect(content).not.toContain(MARKED);
+			expect(content).toContain(OTHER);
+		} finally {
+			_resetStateCacheForTests();
+			env.cleanup();
+		}
+	});
+
+	it("drops a finding an inline pi-lens-ignore comment suppresses", async () => {
+		// The comment is line 1; the suppressed finding is on line 2.
+		const { env, file } = setup(
+			"// pi-lens-ignore: opengrep:rule-x\nconst marked = 1;\nconst other = 2;\n",
+		);
+		try {
+			const content = await drain(env, file, [diag(1, MARKED), otherDiag(2)]);
+			expect(content).not.toContain(MARKED);
+			expect(content).toContain(OTHER);
+		} finally {
+			_resetStateCacheForTests();
+			env.cleanup();
+		}
+	});
+
+	it("honors the auxiliary's own native nosemgrep suppression", async () => {
+		const { env, file } = setup(
+			"const marked = 1; // nosemgrep: rule-x\nconst other = 2;\n",
+		);
+		try {
+			const content = await drain(env, file, [diag(0, MARKED), otherDiag(1)]);
+			expect(content).not.toContain(MARKED);
+			expect(content).toContain(OTHER);
+			expect(lateAuxRecord()?.metadata).toMatchObject({ auxSuppressed: 1 });
+		} finally {
+			_resetStateCacheForTests();
+			env.cleanup();
+		}
+	});
+
+	it("says nothing at all when every late finding was suppressed", async () => {
+		const { env, file } = setup();
+		try {
+			await mark(env.tmpDir, {
+				filePath: file,
+				line: 1,
+				message: MARKED,
+				...CANONICAL_MARK,
+				disposition: "false-positive",
+			});
+			const content = await drain(env, file, [diag(0, MARKED)]);
+			expect(content).not.toContain("Late auxiliary diagnostics");
+			expect(lateAuxRecord()?.metadata).toMatchObject({
+				delivered: 0,
+				dispositionSuppressed: 1,
+			});
+		} finally {
+			_resetStateCacheForTests();
+			env.cleanup();
+		}
+	});
+
+	it("states the drop count on the delivery and in the bounded turn record", async () => {
+		const { env, file } = setup();
+		try {
+			await mark(env.tmpDir, {
+				filePath: file,
+				line: 1,
+				message: MARKED,
+				...CANONICAL_MARK,
+				disposition: "false-positive",
+			});
+			const content = await drain(env, file, [diag(0, MARKED), otherDiag(1)]);
+			expect(content).toContain("suppressed by disposition: 1 finding(s)");
+			expect(lateAuxRecord()?.metadata).toMatchObject({
+				delivered: 1,
+				dispositionSuppressed: 1,
+			});
+		} finally {
+			_resetStateCacheForTests();
+			env.cleanup();
+		}
+	});
+
+	it("keeps findings visible when the cited file cannot be read (fail open)", async () => {
+		// A weak-anchored mark would still apply without content; a STRICT
+		// false-positive anchor must not, so an unreadable file leaves the
+		// finding VISIBLE rather than hiding it on an I/O error (shape 48).
+		// Replacing the file with a directory keeps the stat (the freshness gate
+		// passes) while the read fails.
+		const { env, file } = setup();
+		try {
+			await mark(env.tmpDir, {
+				filePath: file,
+				line: 1,
+				message: MARKED,
+				...CANONICAL_MARK,
+				disposition: "false-positive",
+			});
+			fs.rmSync(file);
+			fs.mkdirSync(file);
+			const past = new Date(Date.now() - 10_000);
+			fs.utimesSync(file, past, past);
+
+			const content = await drain(env, file, [diag(0, MARKED)]);
+			expect(content).toContain(MARKED);
+		} finally {
+			_resetStateCacheForTests();
 			env.cleanup();
 		}
 	});

@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { pathsEqual } from "../../path-utils.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import { resolveRunnerCwd } from "../../tool-cwd.js";
 import { getLinterPolicyForCwd } from "../../tool-policy.js";
@@ -27,20 +28,26 @@ const HTMLHINT_RULES = {
 	"id-unique": true,
 };
 
-function parseHtmlhintOutput(raw: string, filePath: string): Diagnostic[] {
+function parseHtmlhintOutput(
+	raw: string,
+	filePath: string,
+	cwd: string,
+): Diagnostic[] {
 	const diagnostics: Diagnostic[] = [];
+	const absTarget = path.resolve(cwd, filePath);
 	// unix format: "file:line:col: message [severity/rule]"
-	const lineRe = /^.+?:(\d+):(\d+): (.+?) \[(error|warning)\/([^\]]+)\]/;
+	const lineRe = /^(.+?):(\d+):(\d+): (.+?) \[(error|warning)\/([^\]]+)\]/;
 
 	for (const line of raw.split("\n")) {
 		const match = line.match(lineRe);
 		if (!match) continue;
+		if (!pathsEqual(path.resolve(cwd, match[1]!), absTarget)) continue;
 
-		const lineNum = parseInt(match[1], 10);
-		const col = parseInt(match[2], 10);
-		const message = match[3].trim();
-		const level = match[4];
-		const rule = match[5].trim();
+		const lineNum = parseInt(match[2]!, 10);
+		const col = parseInt(match[3]!, 10);
+		const message = match[4]!.trim();
+		const level = match[5]!;
+		const rule = match[6]!.trim();
 		const severity = level === "error" ? "error" : "warning";
 
 		diagnostics.push({
@@ -110,8 +117,15 @@ const htmlhintRunner: RunnerDefinition = {
 		// #1948: htmlhint exits 1 when it finds errors and prints them in `unix`
 		// format on stdout. Zero parsed out of a nonzero exit is a parser break.
 		const output = result.stdout || result.stderr || "";
-		const run = parseToolRun("htmlhint", { result, output }, (out) =>
-			parseHtmlhintOutput(out, ctx.filePath),
+		const run = parseToolRun(
+			"htmlhint",
+			{
+				result,
+				output,
+				// EXIT TABLE (HTMLHint 1.1 measured fixture): 0 clean; 1 findings; 2 error; other nonzero rejected.
+				exitCodes: { ran: [1, 2] },
+			},
+			(out) => parseHtmlhintOutput(out, ctx.filePath, cwd),
 		);
 		if (run.skipped) return run.skipped;
 

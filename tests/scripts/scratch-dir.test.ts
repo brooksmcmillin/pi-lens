@@ -6,6 +6,7 @@ import {
 	claimScratchDir,
 	SCRATCH_DIR_ROOT,
 	SCRATCH_OWNER_FILE,
+	SWEEP_ANY_AGE,
 	sweepScratchDirs,
 } from "../../scripts/lib/scratch-dir.mjs";
 import { sweepLeftovers } from "../../scripts/smoke-tools.mjs";
@@ -40,6 +41,29 @@ describe("scratch directory ownership (#2688/#2687)", () => {
 		} finally {
 			fs.rmSync(live, { recursive: true, force: true });
 		}
+	});
+
+	// #3083 / PR #3100 round 5: `maxAgeMs: 0` does NOT mean "any age" — the gate
+	// is `Date.now() - mtimeMs < maxAgeMs`, so a future-dated entry has a
+	// negative age and is skipped. Both callers whose rule is the prefix alone
+	// (tests/support/vitest-setup.ts's own-run backstop sweep and
+	// tests/support/real-pi-harness.ts's leftover sweep) pass SWEEP_ANY_AGE
+	// instead; this pins what that constant has to mean.
+	it("SWEEP_ANY_AGE sweeps an owner-less directory whose mtime is in the future", () => {
+		const root = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-scratch-test-"),
+		);
+		roots.push(root);
+		const future = fs.mkdtempSync(path.join(root, "pi-lens-smoke-future-"));
+		const soon = new Date(Date.now() + 2_000);
+		fs.utimesSync(future, soon, soon);
+
+		expect(sweepScratchDirs(root, "pi-lens-smoke-", { maxAgeMs: 0 })).toBe(0);
+		expect(fs.existsSync(future)).toBe(true);
+		expect(
+			sweepScratchDirs(root, "pi-lens-smoke-", { maxAgeMs: SWEEP_ANY_AGE }),
+		).toBe(1);
+		expect(fs.existsSync(future)).toBe(false);
 	});
 
 	it("uses the age fallback only for directories without owner.pid", () => {

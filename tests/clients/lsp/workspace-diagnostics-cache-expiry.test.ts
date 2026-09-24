@@ -330,7 +330,9 @@ describe("runWorkspaceDiagnostics honors the expiry bound end to end (#1782 AC3)
 		vi.resetModules();
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
-		tmpSweep = fs.mkdtempSync(path.join(os.tmpdir(), "lsp-sweep-expiry-"));
+		tmpSweep = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-sweep-expiry-"),
+		);
 		fs.mkdirSync(path.join(tmpSweep, ".pi-lens"));
 	});
 	afterEach(() => removeTempDirSync(tmpSweep));

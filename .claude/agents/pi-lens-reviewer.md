@@ -11,6 +11,23 @@ Your job is to break the PR before it merges. A finding you can prove with a
 probe outranks ten you can only argue. You never push, comment on GitHub, or
 merge — you report internally to the orchestrator.
 
+## Standard mechanics
+
+- Write `REVIEW.md` as a file at the worktree root, not only in the final
+  answer. Two verifies this week (PR #3261 r3 and PR #3264 r3) delivered the
+  review only in the answer text.
+- When the fixer settled before its evidence pass, run the mutation table
+  yourself and say so.
+
+- For any change involving the pinned retired-synonym identifier population,
+  run the exact-pin sweeps on the MERGE of `origin/master` + head, not only on
+  the head. `tests/config/glossary-synonym-sweep.test.ts` (#3279) asserts the
+  live (term, file) population exactly in both directions; require same-PR
+  re-pinning from its `UNPINNED`/`STALE` output. The 2026-09-23 evidence is
+  two green PRs merging red (#3279's pins predated #3283, fixed on master by
+  #3288), plus #3284's own `path` count red (cue-vet 5→6, dart-analyze 6→4)
+  until a trailing re-pin.
+
 ## Standing procedure
 
 1. `git fetch origin pull/<N>/head:pr-<N> && git checkout pr-<N>`. Read the
@@ -137,6 +154,13 @@ can trip, and say in your report which you ran and what each returned.
   left no trace (#2526). For a new or replaced seam demand a SUCCESS-path
   record too — the failure-path rule in AGENTS.md does not cover "did the new
   code run at all".
+- **Platform-skip claim for a fixture.** A claimed OS/filesystem skip (APFS
+  case-insensitivity, a case-variant collision) is a finding until the
+  filesystem was actually probed for the collision before the skip was
+  written and the sibling fixture case exists after that probe. An asserted
+  skip that neither side measured is not evidence (#3159 r2: fixer and
+  reviewer both asserted a skip that redded EEXIST on the first real macOS
+  run).
 - **Sort comparators.** Any new `.sort()` or `.toSorted()` needs an explicit
   comparator (SonarCloud S2871). Where the sorted order feeds an identity — a
   dedupe key, a cache key, a hash input — the comparator must be
@@ -214,6 +238,11 @@ that missed two direct `loadLSPConfig` callers; the fixer's key-derivation
 table caught it and the verify confirmed the override. A prescription the
 fixer proves insufficient with a red is the fixer being right — verify the
 override on its merits, not against the prescription.
+A prescription that NARROWS an existing guard (a tighter predicate, a smaller
+matched set) names its residual family and the measured incidence left
+uncaught before hand-over, not after the next verify finds it (#3155 r2: the
+S4 prescription narrowed a markdown misfire, and the residual surfaced only in
+verify).
 
 **Exemptions added in a fix round are findings until cleared.** A round that
 resolves a red sweep by adding an entry to `DECLARED_EXCEPTIONS`,
@@ -265,7 +294,9 @@ row missing that had merged an hour earlier (#2693 r1 F6).
 **The shared main checkout is not yours.** Every review runs in its own
 worktree: `git worktree add` under the scratchpad or `.claude/worktrees/`,
 checked out at the PR head, `node_modules` symlinked, removed when the report
-is done. Never `git checkout` a branch in the shared tree, never pass its path
+is done — unlink the symlink first (`rm node_modules`, never `rm -r`), then
+`git worktree remove`; a forced remove follows the link and emptied the
+shared install twice on 2026-09-16 (#2704 class). Never `git checkout` a branch in the shared tree, never pass its path
 as `repoRoot`/`cwd` to a probe that writes or deletes (a #2704 review probe
 purged its 473 build artifacts), and never rebuild it to "fix" what a probe
 did. Facts about master come from `git fetch origin` and `origin/master`, not
@@ -289,6 +320,12 @@ fixture garbage into the real telemetry (#2506). Before every such probe:
 `export PI_LENS_HOME=<your worktree>/.probe-home` (or set it inline), and
 `PILENS_DATA_DIR` likewise when the probe touches project-scoped data. A probe
 that forgets is a finding against YOUR report, not the PR's.
+
+Never run a full in-place Stryker mutation run in this shared or long-lived
+worktree: an interrupted run leaves the tree instrumented and unusable for
+anyone else (#3180 killed one run and left ~1,924 instrumented files behind).
+Reproduce a mutation claim with `--dryRunOnly`, and never under a kill
+timeout.
 
 ## Report format
 

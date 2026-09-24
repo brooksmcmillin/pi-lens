@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { pathsEqual } from "../../path-utils.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import { resolveRunnerCwd } from "../../tool-cwd.js";
 import { PRIORITY } from "../priorities.js";
@@ -107,9 +108,14 @@ const SWIFTLINT_FIXABLE_RULES = new Set<string>([
 	"yoda_condition",
 ]);
 
-function parseSwiftLintOutput(raw: string, filePath: string): Diagnostic[] {
+function parseSwiftLintOutput(
+	raw: string,
+	filePath: string,
+	cwd: string,
+): Diagnostic[] {
 	const diagnostics: Diagnostic[] = [];
 	if (!raw.trim()) return diagnostics;
+	const absTarget = path.resolve(cwd, filePath);
 
 	try {
 		const parsed = JSON.parse(raw) as SwiftLintViolation[];
@@ -117,6 +123,9 @@ function parseSwiftLintOutput(raw: string, filePath: string): Diagnostic[] {
 
 		for (const item of parsed) {
 			if (!item.reason) continue;
+			// #3295: `.swiftlint.yml` `included:` widens the run past the argv.
+			if (item.file && !pathsEqual(path.resolve(cwd, item.file), absTarget))
+				continue;
 
 			const severityMap: Record<string, "error" | "warning" | "info"> = {
 				error: "error",
@@ -184,8 +193,14 @@ const swiftlintRunner: RunnerDefinition = {
 		// never ran.
 		// SwiftLint exits non-zero on violations — stdout still has the JSON, so
 		// a nonzero exit whose JSON yields nothing is a parser break (#1948).
-		const run = parseToolRun("swiftlint", { result }, (out) =>
-			parseSwiftLintOutput(out, ctx.filePath),
+		const run = parseToolRun(
+			"swiftlint",
+			{
+				result,
+				// EXIT TABLE (SwiftLint 0.56 measured fixture): 0 clean; 1 findings; 2 error; other nonzero rejected.
+				exitCodes: { ran: [1, 2] },
+			},
+			(out) => parseSwiftLintOutput(out, ctx.filePath, cwd),
 		);
 		if (run.skipped) return run.skipped;
 

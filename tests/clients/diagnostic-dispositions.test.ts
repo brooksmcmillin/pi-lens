@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { removeTempDirSync } from "./test-utils.js";
+import { createCaseAliasFixture, removeTempDirSync } from "./test-utils.js";
 
 // The NDJSON disposition logger is isTestMode-gated (like every pi-lens
 // logger), so asserting the fields markDisposition passes requires mocking
@@ -740,35 +740,29 @@ describe("anchor path-form stability (#1024 — write raw vs read normalized)", 
 	// so write and read derive identical anchors regardless of the form held.
 	it("finds a false-positive mark written under a raw (mis-cased) path form when applied via the normalizeMapKey form", (ctx) => {
 		const projectDir = cwd();
-		// Real on-disk casing: lowercase `sub`.
-		const subDirOnDisk = path.join(projectDir, "sub");
-		fs.mkdirSync(subDirOnDisk, { recursive: true });
-		const fileOnDisk = path.join(subDirOnDisk, "a.ts");
+		fs.mkdirSync(projectDir, { recursive: true });
 		const content = "const target = bad();\n";
-		fs.writeFileSync(fileOnDisk, content);
+		// Two spellings of ONE file, with the kernel reporting the on-disk one:
+		// natively on a case-insensitive filesystem (macOS APFS — where this case
+		// FAILED before #3098, the report in #3090), and via a case-variant
+		// symlink on the case-sensitive ubuntu Unit tests lane, which supplies
+		// `realpathSync.native` with the byte-identical answer APFS gives. That
+		// is what lets this case run UNSKIPPED on the lane CI actually has,
+		// instead of skipping everywhere the defect isn't reachable.
+		const alias = createCaseAliasFixture(projectDir, { content });
+		// Skip VISIBLY (a bare return reports a pass, #2089) only where the
+		// kernel cannot supply that contract at all: a Linux casefold directory
+		// aliases the spellings but `realpath(3)` echoes the QUERIED casing, so
+		// #3098's arm has nothing to canonicalize toward (measured in #3154).
+		ctx.skip(alias.skipReason !== undefined, alias.skipReason ?? "");
 
-		// WRITE form: a mis-cased segment (`SUB`), as a raw path.resolve(cwd, arg)
+		// WRITE form: the mis-cased spelling, as a raw path.resolve(cwd, arg)
 		// that never went through realpath canonicalization would carry.
-		const rawFile = path.join(projectDir, "SUB", "a.ts");
+		const rawFile = alias.rawMisCased;
 		// READ form: the normalizeMapKey-canonicalized cwd/filePath the dispatcher
 		// derives in createDispatchContext.
 		const normalizedCwd = normalizeMapKey(projectDir);
-		const normalizedFile = normalizeMapKey(fileOnDisk);
-
-		// This mis-cased scenario only reproduces the bug on a CASE-INSENSITIVE
-		// filesystem, where `SUB/a.ts` and the real `sub/a.ts` are the SAME file —
-		// so a raw mis-cased write and a realpath-canonicalized read SHOULD collapse
-		// to one anchor. On a case-sensitive FS (Linux CI) they are genuinely
-		// DIFFERENT files: realpath of the non-existent `SUB` can't unify them and
-		// must not, so there is nothing to regress. Probe the actual filesystem (not
-		// the OS name) and skip VISIBLY when mis-casing doesn't alias — a bare
-		// return would report a pass (#2089). (The prior `rawRel === normRel` guard
-		// mis-fired on Linux — the forms differ textually there but never alias —
-		// which surfaced as a CI failure on #1024's PR.)
-		ctx.skip(
-			!fs.existsSync(rawFile),
-			"case-sensitive filesystem: SUB/a.ts does not alias sub/a.ts",
-		);
+		const normalizedFile = normalizeMapKey(alias.onDisk);
 
 		const diag = {
 			tool: "eslint",
@@ -782,10 +776,11 @@ describe("anchor path-form stability (#1024 — write raw vs read normalized)", 
 			"false-positive",
 		);
 
-		// Pre-fix: the raw-form write anchored under `SUB/a.ts` while this
+		// Pre-#3098: the raw-form write anchored under `SUB/a.ts` while this
 		// normalized-form read derives `sub/a.ts`, so the mark is not found and the
-		// diagnostic survives (kept === [diag]). Post-fix both derive the same
-		// canonical anchor, so the mark is found and the diagnostic is suppressed.
+		// diagnostic survives (kept === [diag]) — on POSIX the normalizer was
+		// case-preserving, so it could not collapse the two. Post-fix both derive
+		// the same canonical anchor and the diagnostic is suppressed.
 		const kept = applyDispositions(
 			[diag],
 			normalizedCwd,

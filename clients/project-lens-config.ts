@@ -70,6 +70,8 @@ import {
 	assignFlagConfigSection,
 	flagConfigSectionKeys,
 	GLOBAL_NON_FLAG_CONFIG_SECTIONS,
+	GLOBAL_ONLY_NON_FLAG_KEYS,
+	hasFlagConfigPath,
 	LENS_FLAGS,
 	type LensFlagSpec,
 	PROJECT_FOREIGN_CONFIG_NAMESPACES,
@@ -82,6 +84,7 @@ import {
 	type ConfigLocation,
 	configSearchDirs,
 	getPiLensGlobalConfigPath,
+	isResolvedGlobalConfigPath,
 	PROJECT_CONFIG_BASENAMES,
 	PROJECT_CONFIG_LOCATIONS,
 } from "./config-locations.js";
@@ -572,6 +575,11 @@ function discoverPiLensProjectConfig(startDir: string): DiscoveryCacheEntry {
 		if (!info) {
 			for (const name of PROJECT_CONFIG_BASENAMES) {
 				const candidate = path.join(dir, name);
+				// The global tier reads its file by absolute path; a candidate that
+				// IS that file is refused here rather than adopted as a project
+				// config, which would double-read and double-validate it
+				// (global-config-location PR, refs #2457).
+				if (isResolvedGlobalConfigPath(candidate)) continue;
 				const stat = safeFileStat(candidate);
 				if (stat?.isFile()) {
 					info = {
@@ -586,6 +594,7 @@ function discoverPiLensProjectConfig(startDir: string): DiscoveryCacheEntry {
 		}
 		for (const location of LEGACY_PROJECT_LOCATIONS) {
 			const file = path.join(dir, location.relativePath);
+			if (isResolvedGlobalConfigPath(file)) continue;
 			const stat = safeFileStat(file);
 			if (!stat?.isFile()) continue;
 			legacySources.push({
@@ -985,6 +994,15 @@ function parseConfigFile(configPath: string): ParsedConfigFile {
 	const globalScopeOnlyFlagKeys = LENS_FLAGS.map(
 		(spec) => spec.configKey,
 	).filter((configKey) => !projectScoped.has(configKey));
+	// Non-flag global-only keys sitting inside an otherwise project-recognized
+	// section (#3131) — `actionableWarnings.autoFix.maxFixes` is not a
+	// `LENS_FLAGS` entry (no CLI flag, not boolean), so it is invisible to the
+	// derivation above. `GLOBAL_ONLY_NON_FLAG_KEYS` is the single place that
+	// population is enumerated instead of a second hand-typed list here.
+	const globalScopeOnlyDottedKeys: readonly string[] = [
+		...globalScopeOnlyFlagKeys,
+		...GLOBAL_ONLY_NON_FLAG_KEYS,
+	];
 	// The literal path is derived, not hand-typed (#2426 review round 3, S1):
 	// under `PI_LENS_CONFIG_PATH` the canonical global config is NOT
 	// `~/.pi-lens/config.json`, and a hardcoded string in this notice would name
@@ -1022,12 +1040,44 @@ function parseConfigFile(configPath: string): ParsedConfigFile {
 			const dotted = `${namespace}.${key}`;
 			warnUnhonoredKey(
 				dotted,
-				globalScopeOnlyFlagKeys.some(
+				globalScopeOnlyDottedKeys.some(
 					(configKey) =>
 						configKey === dotted || configKey.startsWith(`${dotted}.`),
 				),
 			);
 		}
+	}
+
+	// MIXED-SCOPE SECTIONS (#3112, #3131). A section can be project-scoped as a
+	// whole and still hold a global-only setting: `tools` carries the
+	// project-owned per-tool `enabled` leaves AND the global `tools.lazy`
+	// (`--no-lazy-tools`), the same split `lsp` has (#2426 review round 2, F3);
+	// `actionableWarnings` carries the project-owned `autoFix.enabled` AND the
+	// global-only `autoFix.maxFixes`, which is not even a flag (#3131). The
+	// top-level scan above sees only the SECTION name, so a global-only setting
+	// written inside a recognized project section was dropped with no signal at
+	// all — the thing `docs/configuration.md` promises never happens.
+	//
+	// WHICH sub-keys those are is DERIVED from the registry — `LENS_FLAGS` for
+	// flag keys, `GLOBAL_ONLY_NON_FLAG_KEYS` for the rest — never listed here,
+	// so there is no second scope table to drift from the first. A key whose
+	// SECTION is not recognized at project scope is skipped: the top-level
+	// scan already reported that whole section, and a second notice naming the
+	// same setting twice under two spellings is the duplicate-notice noise #2426
+	// review round 6 removed. Everything else under a recognized section is left
+	// to that section's own parser — `readToolConfig` reports an unknown tool
+	// name under its own code (`PILENS_CFG_0009`).
+	//
+	// An enumerated-honored-keys namespace (`lsp`) needs no skip here: the loop
+	// above reports the very same dotted key with the very same reason, and
+	// `warnIgnoredConfigOnce`'s latch collapses the two into one notice. A skip
+	// for it was written and then deleted — mutating it out changed no output.
+	for (const configKey of globalScopeOnlyDottedKeys) {
+		const dotIndex = configKey.indexOf(".");
+		if (dotIndex < 0) continue;
+		if (!knownProjectKeys.has(configKey.slice(0, dotIndex))) continue;
+		if (!hasFlagConfigPath(obj, configKey)) continue;
+		warnUnhonoredKey(configKey, true);
 	}
 
 	return {

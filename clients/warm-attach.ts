@@ -25,6 +25,7 @@ import {
 	WARM_CODE_ACTION_LOOKUP_LIMIT,
 	WARM_DIAGNOSTICS_SCHEMA_VERSION,
 } from "./mcp/ipc.js";
+import { recordDegradationOnce } from "./degradation-ledger.js";
 import { normalizeFilePath } from "./path-utils.js";
 
 interface AttachState {
@@ -272,6 +273,21 @@ export async function tryWarmAttachedDiagnostics(
 		timeoutMs,
 	);
 	if (!result.available) {
+		// #3255 H1: a confirmed-alive incumbent whose endpoint has no listener is
+		// the upgrade-stranded shape — narrowing the workspace-id case fold
+		// renamed the socket, so a peer that registered before the upgrade is
+		// still serving the previous name. `promoteToLocal` alone left that in the
+		// latency log only; this is the entry `/lens-perf` renders. Bounded twice
+		// over: once per kind/subject by the ledger, and once per session by
+		// `promoteToLocal`'s latch, which returns early on every later call.
+		if (result.reason === "no-listener") {
+			recordDegradationOnce({
+				kind: "warm-ipc-endpoint-missing",
+				subject: diagnosticsIpcPathForCwd(state.cwd, state.incumbentPid),
+				reason:
+					"the registry confirms this incumbent is alive but nothing is listening on its derived endpoint — if pi-lens was upgraded while it was running, restart it",
+			});
+		}
 		promoteToLocal(result.reason);
 	} else {
 		record("diagnostics-served", file, undefined, state.incumbentPid, source);

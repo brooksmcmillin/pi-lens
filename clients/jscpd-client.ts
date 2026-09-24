@@ -117,6 +117,15 @@ export class JscpdClient {
 	}
 
 	/**
+	 * Wait for scans already started by this client to settle. Test owners use
+	 * this as the lifecycle barrier before removing fixture roots; the scan
+	 * promise includes the jscpd child and its report-directory cleanup.
+	 */
+	async shutdown(): Promise<void> {
+		await Promise.allSettled(this.inFlight.values());
+	}
+
+	/**
 	 * Fast recursive source file presence check.
 	 * Avoids running jscpd when repo has no relevant source files.
 	 *

@@ -433,6 +433,10 @@ export interface ResolvedFoundNeighbor {
 	filePath: string;
 	serverId: string;
 	diagnostics: LSPDiagnostic[];
+	/** #3168 F3: the #1444 publish stamp, threaded so a run built from this
+	 * neighbor carries its own observation time — the carried-run age label
+	 * renders from it instead of claiming no stamp exists. */
+	publishedAt?: number;
 }
 
 export interface CascadeTierReconcileOptions {
@@ -487,6 +491,9 @@ export function registerCascadeTierReconcileTask(
 						filePath: o.filePath,
 						serverId: o.serverId,
 						diagnostics: o.diagnostics,
+						...(o.publishedAt !== undefined
+							? { publishedAt: o.publishedAt }
+							: {}),
 					});
 				} else if (o.outcome === "resolved-clean" && o.publishedAt != null) {
 					// #1444: the stale-footer half of the same honesty problem — the

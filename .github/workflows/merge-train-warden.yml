@@ -41,6 +41,10 @@ jobs:
   warden:
     name: Sweep open PRs
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 30s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
     # contents: write is for the PUT pulls/N/update-branch call, not checkout:
     # that endpoint has GitHub create a merge commit ON the PR branch, which
     # needs write access to repository contents -- pull-requests: write alone

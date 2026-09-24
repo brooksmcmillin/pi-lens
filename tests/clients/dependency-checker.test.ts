@@ -21,7 +21,7 @@ describe("buildMadgeArgs", () => {
 	let tmp: string;
 
 	beforeEach(() => {
-		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pilens-madge-"));
+		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-pilens-madge-"));
 	});
 	afterEach(() => {
 		removeTempDirSync(tmp);

@@ -1115,3 +1115,207 @@ describe("#2423 review round 4 (F5) — the hashline anchor memo drops at the to
 		}
 	});
 });
+
+// #3052: the indent-autopatch bridge (handleToolCall -> tryCorrectIndentation-
+// MismatchFromContent -> retargetReplacementIndentation) must not pick a
+// block comment's alignment as the base nesting unit when it patches
+// newText for a real "edit" tool call. Drives the actual production
+// sequence end to end (no hand-rolled reimplementation of either function).
+describe("#3052 indent autopatch does not retarget from a comment's alignment", () => {
+	it("patches newText's deeper nesting from the code's own indent unit, not the JSDoc's", async () => {
+		mockPipelineSucceeds();
+		const env = setupTestEnvironment("pi-lens-3052-premise-");
+		try {
+			// The real file already has the corrected indentation: a 1-space
+			// JSDoc continuation (comment ratio 1->2) and a 4-space code line
+			// whose OWN ratio (4->3) differs from the comment's.
+			const corrected = "/**\n  * doc\n  */\nfunction f() {\n   go();\n}\n";
+			const filePath = createTempFile(env.tmpDir, "src/f.ts", corrected);
+			// The model's oldText guess (mismatched vs. the real file) and a
+			// newText whose second line nests one level deeper than anything
+			// oldText showed the corrector.
+			const oldText = "/**\n * doc\n */\nfunction f() {\n    go();\n}";
+			const newText = "function g() {\n    a();\n        b();\n}";
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			const event = {
+				toolName: "edit",
+				input: { path: filePath, oldText, newText },
+			};
+
+			await handleToolCall(
+				baseDeps({ runtime, ctx: { cwd: env.tmpDir }, event }),
+			);
+
+			// applyNewText patches event.input.newText in place (the host then
+			// applies this replacement text) — assert the PATCHED value, the
+			// same field production hands back to the caller.
+			expect((event.input as { newText: string }).newText).toBe(
+				"function g() {\n   a();\n      b();\n}",
+			);
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+// #3116: the same indent-autopatch bridge must not pick a multi-line
+// template literal's interior alignment as the base nesting unit either
+// (AGENTS.md defect 49, fifth member; #3052's own case for block comments).
+// Drives the actual production sequence end to end (no hand-rolled
+// reimplementation of retargetReplacementIndentation).
+describe("#3116 indent autopatch does not retarget from a template literal's alignment", () => {
+	it("patches newText's deeper nesting from the code's own indent unit, not the template's", async () => {
+		mockPipelineSucceeds();
+		const env = setupTestEnvironment("pi-lens-3116-premise-");
+		try {
+			// The real file already has the corrected indentation: a 1-space
+			// template-literal interior (template ratio 1->2) and a 4-space code
+			// line whose OWN ratio (4->3) differs from the template's.
+			const corrected =
+				"const HELP = `\n  text\n`;\nfunction f() {\n   go();\n}\n";
+			const filePath = createTempFile(env.tmpDir, "src/f.ts", corrected);
+			// The model's oldText guess (mismatched vs. the real file) and a
+			// newText whose second line nests one level deeper than anything
+			// oldText showed the corrector.
+			const oldText = "const HELP = `\n text\n`;\nfunction f() {\n    go();\n}";
+			const newText = "function g() {\n    a();\n        b();\n}";
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			const event = {
+				toolName: "edit",
+				input: { path: filePath, oldText, newText },
+			};
+
+			await handleToolCall(
+				baseDeps({ runtime, ctx: { cwd: env.tmpDir }, event }),
+			);
+
+			// Pre-fix, this exact input patched `b();` to 16 literal spaces (the
+			// template's 1-space unit doubled 8 times) instead of the
+			// code-derived 6 — quoted in the PR body's premise transcript.
+			expect((event.input as { newText: string }).newText).toBe(
+				"function g() {\n   a();\n      b();\n}",
+			);
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+// #3116 review round 2, F1 probe (b): the same bridge must not mis-scale
+// when the agent's oldText fragment crosses a template-literal boundary —
+// here, from one template's closer, through real code, into a SECOND
+// template's own interior line. Drives the actual production sequence (real
+// file on disk, real handleToolCall -> tryCorrectIndentationMismatchFromContent
+// -> retargetReplacementIndentation) so the fix is proven through the same
+// matchNormalizedContent/findUniqueMatchLineRange wiring runtime-tool-call.ts
+// uses, not a hand-fed fileContext.
+describe("#3116 review round 2 — indent autopatch resolves a boundary-crossing fragment via the real file", () => {
+	it("resolves the deeper newText line from the code's own ratio, not the second template's", async () => {
+		mockPipelineSucceeds();
+		const env = setupTestEnvironment("pi-lens-3116-r2-f1b-");
+		try {
+			// Real file: template A (interior "   p", 3sp), real code ("go();",
+			// 2sp), template B (interior "   q", 3sp).
+			const corrected =
+				"const A = `\n   p\n`;\nfunction f() {\n  go();\n}\nconst B = `\n   q\n`;\n";
+			const filePath = createTempFile(env.tmpDir, "src/f.ts", corrected);
+			// The agent's oldText fragment starts at template A's CLOSER and ends
+			// at template B's interior line — crossing straight through B's
+			// opener. Both indentation-mismatched vs. the real file: "go();" at
+			// 4sp (real: 2sp) and "q" at 2sp (real: 3sp).
+			const oldText = "`;\nfunction f() {\n    go();\n}\nconst B = `\n  q";
+			const newText = "function g() {\n    a();\n        b();\n}";
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			const event = {
+				toolName: "edit",
+				input: { path: filePath, oldText, newText },
+			};
+
+			await handleToolCall(
+				baseDeps({ runtime, ctx: { cwd: env.tmpDir }, event }),
+			);
+
+			// A fragment-only lexer reads A's closer backtick as an opener and
+			// B's opener backtick as a closer, wrongly excluding "go();"'s
+			// indent from the base pick while wrongly leaving "q"'s indent
+			// eligible — producing 12 literal spaces for `b();` (the template's
+			// 2->3 ratio, scaled x4) instead of the code-derived 4 (its own
+			// 4->2 ratio, halved twice). Reproduced directly against
+			// retargetReplacementIndentation before this test was written (PR
+			// body, F1 probe b transcript).
+			expect((event.input as { newText: string }).newText).toBe(
+				"function g() {\n  a();\n    b();\n}",
+			);
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+/**
+ * #1193 P3: `shouldSkipLspAutoTouch` hand-rolled `.replace(/\\/g, "/")` — the
+ * ~55th inline copy of the idiom `toPosix` exists to own. These cases drive the
+ * real `handleToolCall` entry point and observe the seam through the LSP
+ * double's `touchFile`, so the separator fold and the marker case-fold are each
+ * pinned by an independent effect rather than by reading the source.
+ *
+ * The fold is behaviour-preserving by construction (`toPosix` IS the deleted
+ * expression). On a POSIX host `path.resolve` already answers forward slashes,
+ * so the separator case below is the ONLY one whose verdict the fold decides on
+ * this lane — a Windows-shaped spelling reaching a POSIX host, which is the
+ * cross-platform variant of the Windows-only property (AGENTS.md shape 35)
+ * rather than a `skipIf(process.platform)` the ubuntu lane never runs.
+ */
+describe("LSP auto-touch skip path folding (#1193)", () => {
+	async function touchedFor(relativePath: string): Promise<boolean> {
+		touchFileMock.mockClear();
+		const env = setupTestEnvironment("pi-lens-autotouch-fold-");
+		try {
+			const filePath = createTempFile(env.tmpDir, relativePath, "export {};\n");
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			await handleToolCall(
+				baseDeps({
+					runtime,
+					event: { toolName: "read", input: { path: filePath } },
+					ctx: { cwd: env.tmpDir },
+				}),
+			);
+			return touchFileMock.mock.calls.length > 0;
+		} finally {
+			env.cleanup();
+		}
+	}
+
+	it("auto-touches an ordinary source file", async () => {
+		expect(await touchedFor("src/a.ts")).toBe(true);
+	});
+
+	it("skips an internal artifact under a forward-slash marker directory", async () => {
+		expect(await touchedFor(".pi-lens/scratch.ts")).toBe(false);
+	});
+
+	it("skips an internal artifact whose marker segment is mis-cased", async () => {
+		// The marker match is deliberately case-folded: on a case-insensitive
+		// filesystem `.PI-Lens` and `.pi-lens` are ONE directory, and an
+		// artifact under it must not be handed to the LSP either way.
+		expect(await touchedFor(".PI-Lens/scratch.ts")).toBe(false);
+	});
+
+	it("skips an internal artifact whose marker separator is a backslash", async () => {
+		// A Windows-shaped spelling arriving on a POSIX host, where a backslash
+		// is an ordinary filename character: only the separator fold turns
+		// `<tmp>/.pi-lens\\scratch.ts` into a path containing `/.pi-lens/`.
+		// This is the one case on this lane whose verdict `toPosix` decides.
+		expect(await touchedFor(".pi-lens\\scratch.ts")).toBe(false);
+	});
+
+	it("does not skip a non-path sentinel basename outside its marker directory", async () => {
+		// `case.json` is only an internal artifact under a `/cases/` directory;
+		// elsewhere `case.*` is an ordinary project file.
+		expect(await touchedFor("cases/case.ts")).toBe(true);
+	});
+});

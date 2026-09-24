@@ -2151,7 +2151,8 @@ describe("managed shim resolution verifies the binary (#1657)", () => {
 			const first = await findManagedNodeToolBinary("concurrenttool");
 
 			expect(first).toBe(shim);
-			expect(await racer).toBe(shim);
+			expect(racer).not.toBeNull();
+			expect(await Promise.resolve(racer)).toBe(shim);
 			expect(installerMod.verifyToolBinary).toHaveBeenCalledTimes(1);
 		} finally {
 			vi.mocked(installerMod.verifyToolBinary).mockReset();

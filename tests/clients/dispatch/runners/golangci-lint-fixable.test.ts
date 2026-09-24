@@ -47,7 +47,7 @@ describe("parseGolangciJson — fixable propagation (#112 slice)", () => {
 				Inline: { StartCol: 5, Length: 3, NewString: "fmt.Println" },
 			},
 		});
-		const diags = parseGolangciJson(raw, "main.go");
+		const diags = parseGolangciJson(raw, "main.go", process.cwd());
 		expect(diags).toHaveLength(1);
 		expect(diags[0]).toMatchObject({
 			tool: "golangci-lint",
@@ -69,7 +69,7 @@ describe("parseGolangciJson — fixable propagation (#112 slice)", () => {
 				NewLines: ["package main", "", 'import "fmt"'],
 			},
 		});
-		const diags = parseGolangciJson(raw, "main.go");
+		const diags = parseGolangciJson(raw, "main.go", process.cwd());
 		expect(diags).toHaveLength(1);
 		expect(diags[0].fixable).toBe(true);
 		expect(diags[0].fixSuggestion).toBe(
@@ -86,7 +86,7 @@ describe("parseGolangciJson — fixable propagation (#112 slice)", () => {
 			column: 5,
 			replacement: { NeedOnlyDelete: true },
 		});
-		const diags = parseGolangciJson(raw, "main.go");
+		const diags = parseGolangciJson(raw, "main.go", process.cwd());
 		expect(diags).toHaveLength(1);
 		expect(diags[0].fixable).toBe(true);
 		expect(diags[0].fixSuggestion).toBe("Delete this code");
@@ -100,7 +100,7 @@ describe("parseGolangciJson — fixable propagation (#112 slice)", () => {
 			line: 12,
 			column: 3,
 		});
-		const diags = parseGolangciJson(raw, "main.go");
+		const diags = parseGolangciJson(raw, "main.go", process.cwd());
 		expect(diags).toHaveLength(1);
 		expect(diags[0].fixable).toBe(false);
 		expect(diags[0].fixSuggestion).toBeUndefined();
@@ -113,7 +113,7 @@ describe("parseGolangciJson — fixable propagation (#112 slice)", () => {
 			file: "main.go",
 			replacement: null,
 		});
-		const diags = parseGolangciJson(raw, "main.go");
+		const diags = parseGolangciJson(raw, "main.go", process.cwd());
 		expect(diags[0].fixable).toBe(false);
 		expect(diags[0].fixSuggestion).toBeUndefined();
 	});
@@ -132,16 +132,20 @@ describe("parseGolangciJson — fixable propagation (#112 slice)", () => {
 				file: "main.go",
 			},
 		);
-		const diags = parseGolangciJson(raw, "main.go");
+		const diags = parseGolangciJson(raw, "main.go", process.cwd());
 		expect(diags).toHaveLength(1);
 		expect(diags[0].rule).toBe("errcheck");
 	});
 
 	it("handles empty / malformed output gracefully", () => {
-		expect(parseGolangciJson("", "main.go")).toEqual([]);
-		expect(parseGolangciJson("not json", "main.go")).toEqual([]);
+		expect(parseGolangciJson("", "main.go", process.cwd())).toEqual([]);
+		expect(parseGolangciJson("not json", "main.go", process.cwd())).toEqual([]);
 		expect(
-			parseGolangciJson(JSON.stringify({ Issues: null }), "main.go"),
+			parseGolangciJson(
+				JSON.stringify({ Issues: null }),
+				"main.go",
+				process.cwd(),
+			),
 		).toEqual([]);
 	});
 });

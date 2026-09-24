@@ -36,7 +36,7 @@ describe("runWorkspaceDiagnostics — per-server serialization (#387)", () => {
 		vi.resetModules();
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
-		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "wsd-perserver-"));
+		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-wsd-perserver-"));
 	});
 	afterEach(() => removeTempDirSync(tmp));
 

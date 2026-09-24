@@ -70,6 +70,7 @@ import {
 	CANONICAL_GLOBAL_CONFIG_FILE,
 	CANONICAL_PROJECT_CONFIG_FILE,
 	GLOBAL_CONFIG_LOCATIONS,
+	isResolvedGlobalConfigPath,
 	LEGACY_ROOT_LSP_KEYS,
 	LSP_NAMESPACE_KEY,
 	PROJECT_CONFIG_LOCATIONS,
@@ -231,6 +232,11 @@ function collectDocuments(
 	const documents: ConfigDocument[] = [];
 	for (const location of locations) {
 		const file = path.join(dir, location.relativePath);
+		// The global tier reads its file by absolute path; a candidate that IS
+		// that file is refused rather than adopted as a project/nested-project
+		// document, which would double-read and double-validate it
+		// (global-config-location PR, refs #2457).
+		if (tier !== "global" && isResolvedGlobalConfigPath(file)) continue;
 		const outcome = readConfigDocument(file);
 		if (outcome.status === "missing") continue;
 		if (outcome.status === "error") {

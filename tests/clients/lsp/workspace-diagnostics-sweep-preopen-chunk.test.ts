@@ -58,7 +58,7 @@ describe("runWorkspaceDiagnostics — pre-open is chunked, not whole-group (#621
 		vi.resetModules();
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
-		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "wsd-preopen-chunk-"));
+		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-wsd-preopen-chunk-"));
 	});
 
 	afterEach(() => {

@@ -12,8 +12,8 @@
  * budget with no publish, and whose live capability snapshot classifies as
  * `tier3-silent` (`classifyCascadeWaitTier`, #458 — push-only AND
  * `silentOnClean`) is now CONFIRMED clean, not inconclusive. These tests
- * exercise that gate directly via `touchFile`, using marksman's real
- * strategy (silentOnClean since #799) as the concrete example.
+ * exercise that gate directly via `touchFile`, using marked push-only
+ * strategies as concrete examples.
  */
 
 import * as fs from "node:fs";
@@ -136,7 +136,7 @@ describe("touchFile silent-clean push-only confirm (#799)", () => {
 		vi.resetModules();
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
-		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "lsp-silent-clean-"));
+		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-silent-clean-"));
 		// Flat, tiny diagnostics-wait budget so the mocked servers' real
 		// waitForDiagnostics sleep resolves in ~50ms instead of paying marksman's
 		// real 1500ms strategy budget — keeps these tests fast without changing
@@ -186,6 +186,34 @@ describe("touchFile silent-clean push-only confirm (#799)", () => {
 		const warmup = await service.ensureWarmForSweep(filePath);
 		expect(warmup.performedWarmup).toBe(false);
 		expect(warmup.failedServerIds).toEqual([]);
+	});
+
+	it("#3347: the newly marked lua strategy takes the tier-3 clean-confirm path", async () => {
+		const filePath = path.join(tmp, "main.lua");
+		fs.writeFileSync(filePath, "local value = 1\n");
+		const lua = makeServer("lua", ".lua", tmp);
+		getServersForFileWithConfig.mockImplementation((fp: string) =>
+			fp.endsWith(".lua") ? [lua] : [],
+		);
+		const { client, waitCalls } = makeSilentPushOnlyClient("lua", tmp);
+		createLSPClient.mockResolvedValue(client);
+
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+		const result = await service.touchFile(filePath, "local value = 1\n", {
+			diagnostics: "document",
+			collectDiagnostics: true,
+			clientScope: "primary",
+			source: "test-3347-lua",
+		});
+
+		// Independent production-path effect: a tier-3 decision confirms clean
+		// despite the silent wait, and the requested strategy budget is passed to
+		// the client instead of an unbounded fallback.
+		expect(result?.confirmation).toBe("confirmed");
+		expect(result?.diags).toEqual([]);
+		expect(waitCalls).toHaveLength(1);
+		expect(waitCalls[0]!.ms).toBe(50);
 	});
 
 	it("#1277: a WEDGED marksman (accepts the notify write, then never answers anything) stays INCONCLUSIVE, not confirmed clean", async () => {
@@ -259,7 +287,9 @@ describe("touchFile capability-aware AGGREGATE wait (#814)", () => {
 		vi.resetModules();
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
-		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "lsp-silent-clean-agg-"));
+		tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-silent-clean-agg-"),
+		);
 		// Flat, tiny diagnostics-wait budget so the mocked servers' real
 		// waitForDiagnostics sleep resolves in ~50ms instead of paying their real
 		// (1000-1500ms) strategy budgets — keeps these tests fast without
@@ -538,7 +568,9 @@ describe("touch debounce after a failed notify write (#1253)", () => {
 		vi.resetModules();
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
-		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "lsp-silent-clean-debounce-"));
+		tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-silent-clean-debounce-"),
+		);
 		process.env.PI_LENS_LSP_DIAGNOSTICS_MAX_WAIT_MS = "50";
 		prevNotifyBudget = process.env.PI_LENS_LSP_NOTIFY_BUDGET_MS;
 		process.env.PI_LENS_LSP_NOTIFY_BUDGET_MS = "50";

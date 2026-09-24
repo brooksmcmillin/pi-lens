@@ -35,6 +35,10 @@ jobs:
   psscriptanalyzer-classification:
     name: Lane 1 — PSScriptAnalyzer real-host classification
     runs-on: windows-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 263s (4m23s); sized at
+    # ~2x + margin.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -78,6 +82,10 @@ jobs:
   availability-lifecycle:
     name: Lane 2 — availability lifecycle (latch + degradation + recovery)
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 66s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -103,6 +111,10 @@ jobs:
   gitleaks-scratch-exclusion:
     name: Lane 4 — gitleaks exclusion scope (tracked visible, scratch demoted)
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 30s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:

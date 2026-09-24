@@ -258,6 +258,284 @@ metavars: [X]
 	});
 });
 
+// #3054: the hand-rolled line-regex scanner (its own inline-comment stripper,
+// its own inline `[a, b]` array branch, its own multi-line `- item` branch,
+// its own nested-object branch) is gone; `yaml.load` — the same real parser
+// `clients/dispatch/runners/yaml-rule-parser.ts` already used for ast-grep
+// rules (#206) — parses the whole document now. One fixture exercises every
+// construct the deleted scanner special-cased, in the shape #3046 showed
+// disagreeing: an inline array, a multi-line list, BOTH multi-line quote
+// spellings (the exact defect: the inline-array branch unquoted, the
+// multi-line branch didn't, so `console-statement.yml`'s quoted
+// `ignore_paths` glob carried its quote marks and the #965 carve-out never
+// matched a path), a nested object, and both an inline comment on an
+// unquoted scalar and a literal `#` preserved inside a quoted one.
+describe("fold onto js-yaml (#3054)", () => {
+	it("parses inline arrays, multi-line lists in both quote spellings, nested objects, and inline/quoted comments in one document", async () => {
+		const root = makeTempRulesRoot();
+		writeRule(
+			root,
+			"rules/tree-sitter-queries/typescript/all-constructs.yml",
+			`id: all-constructs
+name: All Constructs
+severity: warning
+category: correctness
+language: typescript
+message: "keeps a # inside a quoted string"
+post_filter: not_in_test_block  # trailing comment stripped
+query: |
+  (identifier) @X
+metavars: [X, Y]
+tags:
+  - alpha
+  - beta
+ignore_paths:
+  - "scripts/**"
+  - 'bin/**'
+post_filter_params:
+  KEY: "value"
+has_fix: false
+`,
+		);
+
+		const loader = new TreeSitterQueryLoader();
+		await loader.loadQueries(root);
+		const query = loader.getQueryById("all-constructs");
+		expect(query).toBeTruthy();
+		expect(query?.message).toBe("keeps a # inside a quoted string");
+		expect(query?.post_filter).toBe("not_in_test_block");
+		expect(query?.metavars).toEqual(["X", "Y"]);
+		expect(query?.tags).toEqual(["alpha", "beta"]);
+		expect(query?.ignore_paths).toEqual(["scripts/**", "bin/**"]);
+		expect(query?.post_filter_params).toEqual({ KEY: "value" });
+	});
+});
+
+// #3054 review F1: `yaml.load` throws on realistic authoring mistakes the
+// deleted hand-rolled scanner tolerated (a colon in an unquoted scalar, a
+// duplicate key, an unclosed quote, …), which widened the skip surface with
+// no observability — the only sink was `dbg()`, gated behind `verbose`, and
+// both production instantiations construct with the `verbose = false`
+// default. A malformed rule must now leave a durable signal.
+describe("malformed query files are recorded once per file (#3054 review F1)", () => {
+	beforeEach(() => resetDegradationLedger());
+	afterEach(() => resetDegradationLedger());
+
+	function parseFailureGroup() {
+		return getDegradationSummary().find(
+			(g) => g.kind === "tree-sitter-query-parse-failed",
+		);
+	}
+
+	it("records a degradation for a rule file yaml.load rejects, even with verbose:false (the production default)", async () => {
+		const root = makeTempRulesRoot();
+		writeRule(
+			root,
+			"rules/tree-sitter-queries/typescript/broken-colon.yml",
+			`id: broken-colon
+name: Broken Colon
+severity: warning
+category: quality
+language: typescript
+message: some: unquoted colon breaks YAML
+query: |
+  (identifier) @X
+`,
+		);
+
+		const loader = new TreeSitterQueryLoader(); // verbose defaults to false
+		await loader.loadQueries(root);
+
+		expect(loader.getQueryById("broken-colon")).toBeUndefined();
+		const group = parseFailureGroup();
+		expect(group?.count).toBe(1);
+		expect(
+			group?.latestReasons.some((r) => r.subject.endsWith("broken-colon.yml")),
+		).toBe(true);
+	});
+
+	it("records a degradation for a syntactically valid document with a mapping-valued query (#3054 review F2)", async () => {
+		const root = makeTempRulesRoot();
+		writeRule(
+			root,
+			"rules/tree-sitter-queries/typescript/mapping-query.yml",
+			`id: mapping-query
+name: Mapping Query
+severity: warning
+category: quality
+language: typescript
+message: forgot the block-scalar pipe
+query:
+  not: a string
+`,
+		);
+
+		const loader = new TreeSitterQueryLoader();
+		await loader.loadQueries(root);
+
+		// The old truthy-only check let this sail through as the literal
+		// string "[object Object]"; the type-checked guard skips it instead.
+		expect(loader.getQueryById("mapping-query")).toBeUndefined();
+		const group = parseFailureGroup();
+		expect(group?.count).toBe(1);
+		expect(group?.latestReasons[0]?.reason).toContain("'query'");
+	});
+
+	// #3070 N1: `loadQueries` short-circuits on `this.loaded && this.loadedRoot
+	// === resolvedRoot` before `parseQueryFile` runs, so a memoized (no
+	// `force`) return in a LATER session never re-parses and never replays the
+	// `tree-sitter-query-parse-failed` record for this session's generation.
+	// `handleSessionStart` -> `resetDegradationLedger()` clears the once-keys
+	// every session, but the loader's shared client (`clients/tree-sitter-shared.ts:39`)
+	// and its `loaded`/`loadedRoot` memo are deliberately kept across
+	// sessions, so the SECOND session's health summary silently loses the row
+	// the first session recorded — the exact "silently drops to zero" shape
+	// `getBundledQueriesRootHealth` (this file, generation-keyed) already
+	// solves correctly.
+	it("replays the parse-failure record on a memoized (no-force) reload after a session boundary (#3070 N1)", async () => {
+		const root = makeTempRulesRoot();
+		writeRule(
+			root,
+			"rules/tree-sitter-queries/typescript/broken-colon.yml",
+			`id: broken-colon
+name: Broken Colon
+severity: warning
+category: quality
+language: typescript
+message: some: unquoted colon breaks YAML
+query: |
+  (identifier) @X
+`,
+		);
+
+		const loader = new TreeSitterQueryLoader();
+		await loader.loadQueries(root);
+		expect(parseFailureGroup()?.count).toBe(1);
+
+		// Session boundary: handleSessionStart's resetDegradationLedger() call,
+		// simulated directly. The loader instance itself is NOT recreated —
+		// tree-sitter-shared.ts deliberately keeps the client across sessions.
+		resetDegradationLedger();
+		expect(parseFailureGroup()).toBeUndefined();
+
+		// No `force`: this is the memoized return path every non-RuleCache-miss
+		// call takes. It must still carry the row in the NEW session's ledger.
+		await loader.loadQueries(root);
+		const group = parseFailureGroup();
+		expect(group?.count).toBe(1);
+		expect(
+			group?.latestReasons.some((r) => r.subject.endsWith("broken-colon.yml")),
+		).toBe(true);
+	});
+
+	// #3070 N2: `str()` (clients/tree-sitter-query-loader.ts) refuses a
+	// mapping-valued scalar field so `message` falls back to the id-derived
+	// default rather than stringifying to the literal text "[object Object]"
+	// a user would otherwise read in the diagnostic. Unlike the `id`/`query`
+	// mapping cases above (both load-blocking), a mapping-valued `message` is
+	// non-fatal — the rule still loads — so this pins the FALLBACK behavior on
+	// a field no other test in this file exercises with a non-scalar value.
+	it("falls back to the id-derived message for a mapping-valued `message` field (#3070 N2)", async () => {
+		const root = makeTempRulesRoot();
+		writeRule(
+			root,
+			"rules/tree-sitter-queries/typescript/mapping-message.yml",
+			`id: mapping-message
+name: Mapping Message
+severity: warning
+category: quality
+language: typescript
+message:
+  not: a string
+query: |
+  (identifier) @X
+`,
+		);
+
+		const loader = new TreeSitterQueryLoader();
+		await loader.loadQueries(root);
+
+		const query = loader.getQueryById("mapping-message");
+		expect(query).toBeTruthy();
+		// A loosened guard would stringify the mapping to "[object Object]".
+		expect(query?.message).toBe("Pattern: mapping-message");
+	});
+
+	// #3070 N1 companion: a FIXED rule must stop replaying once a fresh
+	// (`force`) load re-parses it clean — the per-file memo the replay draws
+	// on is repopulated on every non-memoized load, not merely appended to,
+	// or a file corrected on disk keeps reporting its stale failure forever
+	// across every later session boundary.
+	it("stops replaying a parse failure once the rule file is fixed and force-reloaded", async () => {
+		const root = makeTempRulesRoot();
+		const relPath = "rules/tree-sitter-queries/typescript/fixable.yml";
+		writeRule(
+			root,
+			relPath,
+			`id: fixable
+name: Fixable
+severity: warning
+category: quality
+language: typescript
+message: some: unquoted colon breaks YAML
+query: |
+  (identifier) @X
+`,
+		);
+
+		const loader = new TreeSitterQueryLoader();
+		await loader.loadQueries(root);
+		expect(parseFailureGroup()?.count).toBe(1);
+
+		// Fix the file on disk, then force-reload (the RuleCache-miss path).
+		writeRule(
+			root,
+			relPath,
+			`id: fixable
+name: Fixable
+severity: warning
+category: quality
+language: typescript
+message: "no more colon problem"
+query: |
+  (identifier) @X
+`,
+		);
+		await loader.loadQueries(root, { force: true });
+		expect(loader.getQueryById("fixable")).toBeTruthy();
+
+		// A later session must not resurrect the stale failure for a file
+		// that is clean now.
+		resetDegradationLedger();
+		await loader.loadQueries(root);
+		expect(parseFailureGroup()).toBeUndefined();
+	});
+});
+
+// #3054 review F2: pins the corpus-wide equivalence claim in CI, not only in
+// the PR body — a bundled rule that silently fails to parse (thrown syntax
+// error, or a shape the type-checked `id`/`query` guard now rejects) shows up
+// as a count mismatch here.
+describe("bundled corpus loads in full (#3054 review F2)", () => {
+	it("loads every .yml under rules/tree-sitter-queries/ — count mismatch means a bundled rule silently failed to parse", async () => {
+		const fileCount = fs
+			.readdirSync(BUNDLED_QUERIES_ROOT, { recursive: true })
+			.filter(
+				(entry): entry is string =>
+					typeof entry === "string" && entry.endsWith(".yml"),
+			).length;
+		expect(fileCount).toBeGreaterThan(0);
+
+		// An isolated, empty project root: loadQueries also scans
+		// `rootDir/rules/tree-sitter-queries` when it exists, which would
+		// double-count or shadow the bundled directory this test pins.
+		const root = makeTempRulesRoot();
+		const loader = new TreeSitterQueryLoader();
+		await loader.loadQueries(root);
+		expect(loader.getAllQueries().length).toBe(fileCount);
+	});
+});
+
 describe("queriesForLanguage", () => {
 	const rule = (id: string, filePath: string): TreeSitterQuery =>
 		({ id, filePath }) as TreeSitterQuery;

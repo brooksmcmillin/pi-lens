@@ -21,6 +21,7 @@ import { describe, expect, it } from "vitest";
 import {
 	assertNonEmptyScan,
 	listSourceFiles,
+	readWalkedFiles,
 	relativePosix,
 } from "../support/sweep-kit.js";
 import {
@@ -51,8 +52,10 @@ function scan(): ViMockExportFinding[] {
 	// which routine processes (e.g. the 4.1.4 `.changelog/` roll that consumed
 	// 151 fragments) never delete, so the floor cannot be swept away with it.
 	assertNonEmptyScan("#2281 vi.mock export sweep", files.length, 900);
-	return files.flatMap((file) =>
-		findViMockExportGaps(file, fs.readFileSync(file, "utf8")),
+	// readWalkedFiles: a path that vanished between the walk and the read is
+	// out of the population, not a finding (#3082).
+	return readWalkedFiles(files).flatMap(({ file, source }) =>
+		findViMockExportGaps(file, source),
 	);
 }
 
@@ -67,8 +70,9 @@ function scanLatencyLoggerSurface(): ViMockExportFinding[] {
 	// `isLatencyLoggerSpecifier`), tested in both directions below — the sweep
 	// holds no inline predicate to delete.
 	assertNonEmptyScan("#2281 latency-logger mock surface", files.length, 900);
-	return files.flatMap((file) =>
-		findLatencyLoggerGapsForFile(file, fs.readFileSync(file, "utf8")),
+	// readWalkedFiles: see `scan()` above (#3082).
+	return readWalkedFiles(files).flatMap(({ file, source }) =>
+		findLatencyLoggerGapsForFile(file, source),
 	);
 }
 

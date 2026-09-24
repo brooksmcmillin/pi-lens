@@ -1,3 +1,19 @@
+## Why
+
+Exactly one sentence explaining the user or maintainer outcome.
+
+## Notes for the reviewer
+
+- Key review constraint, risk, or decision.
+
+## Change outline
+
+```text
+- caller above
+  + changed symbol
+    + callee below
+```
+
 ## Summary
 
 Describe what this PR changes, why it changes it, and any non-obvious design

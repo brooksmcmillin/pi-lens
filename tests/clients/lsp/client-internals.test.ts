@@ -161,7 +161,7 @@ describe("client workspace edit normalization", () => {
 		try {
 			const normalized = await normalizeClientWorkspaceEdit(state, edit);
 			const textChange = (
-				normalized.documentChanges?.[1] as {
+				normalized.documentChanges![1] as {
 					edits: Array<{
 						range: { start: { character: number }; end: { character: number } };
 					}>;
@@ -287,7 +287,7 @@ describe("client workspace edit normalization", () => {
 				],
 			});
 			const textDocument = (
-				normalized.documentChanges?.[0] as {
+				normalized.documentChanges![0] as {
 					textDocument: { version: unknown };
 				}
 			).textDocument;
@@ -517,15 +517,29 @@ describe("resolveConfigurationSection (#983)", () => {
 		expect(resolveConfigurationSection(initialization, "scan.jobs")).toBe(16);
 	});
 
-	it("returns null for an unknown section instead of the whole blob", () => {
-		expect(resolveConfigurationSection(initialization, "unknown.section")).toBe(
-			null,
+	// #3217 recurrence: this used to answer `null`, and a server that reads the
+	// answer without a null guard loses its diagnostics (vscode-css-language-
+	// server swallowed its own `Cannot read properties of null (reading
+	// 'validProperties')` and returned an empty pull report, so every css-kind
+	// file went undiagnosed for the whole life of the #2780 clean gate) or dies
+	// outright (@prisma/language-server reads `settings.enableDiagnostics` in
+	// `validateTextDocument` and the process exits on the uncaught TypeError).
+	// The invariant #983 added — never the WHOLE BLOB for a section the server
+	// did not ask for — is what these two cases still pin.
+	it("returns empty settings, never the whole blob, for an unknown section", () => {
+		expect(
+			resolveConfigurationSection(initialization, "unknown.section"),
+		).toEqual({});
+		expect(resolveConfigurationSection(initialization, "scan.nope")).toEqual(
+			{},
 		);
-		expect(resolveConfigurationSection(initialization, "scan.nope")).toBe(null);
+		expect(
+			resolveConfigurationSection(initialization, "unknown.section"),
+		).not.toBe(initialization);
 	});
 
-	it("returns null for an unknown section when initialization is undefined", () => {
-		expect(resolveConfigurationSection(undefined, "anything")).toBe(null);
+	it("returns empty settings for an unknown section when initialization is undefined", () => {
+		expect(resolveConfigurationSection(undefined, "anything")).toEqual({});
 	});
 });
 
@@ -558,7 +572,7 @@ describe("workspace/configuration handler (#983)", () => {
 			],
 		});
 
-		expect(result).toEqual([{ jobs: 16 }, false, null, initialization]);
+		expect(result).toEqual([{ jobs: 16 }, false, {}, initialization]);
 	});
 
 	it("returns an empty array when the server requests zero items", async () => {
@@ -977,7 +991,7 @@ describe("handleNotifyOpen", () => {
 			(c) => c[0] === "workspace/didChangeWatchedFiles",
 		);
 		expect(watched).toBeDefined();
-		expect((watched?.[1] as { changes: unknown[] }).changes).toHaveLength(1);
+		expect((watched![1] as { changes: unknown[] }).changes).toHaveLength(1);
 	});
 
 	it("coalesces multiple file opens into ONE didChangeWatchedFiles (#271)", async () => {
@@ -1077,7 +1091,7 @@ describe("handleNotifyExternalChange (#1668)", () => {
 		);
 		expect(watched).toBeDefined();
 		const changes = (
-			watched?.[1] as { changes: Array<{ uri: string; type: number }> }
+			watched![1] as { changes: Array<{ uri: string; type: number }> }
 		).changes;
 		expect(changes).toEqual([{ uri: pathToFileURL(TEST_FILE).href, type: 3 }]);
 	});
@@ -1116,7 +1130,7 @@ describe("handleNotifyExternalChange (#1668)", () => {
 			(c) => c[0] === "workspace/didChangeWatchedFiles",
 		);
 		expect(
-			(watched?.[1] as { changes: Array<{ uri: string }> }).changes,
+			(watched![1] as { changes: Array<{ uri: string }> }).changes,
 		).toEqual([{ uri, type: 1 }]);
 	});
 

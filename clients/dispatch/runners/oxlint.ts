@@ -7,7 +7,9 @@
  * Requires: oxlint (npm install -g oxlint)
  */
 
+import * as path from "node:path";
 import { findLocalBinUpwards } from "../../package-manager.js";
+import { pathsEqual } from "../../path-utils.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import { resolveRunnerCwd } from "../../tool-cwd.js";
 import { truncatedByOutputCap } from "../../spawn-output-cap.js";
@@ -163,7 +165,12 @@ const oxlintRunner: RunnerDefinition = {
 			Diagnostic | typeof OXLINT_NO_FILES | typeof OXLINT_NO_FILES_UNCONFIRMED
 		>(
 			"oxlint",
-			{ result, output: parsedOutput },
+			{
+				result,
+				output: parsedOutput,
+				// EXIT TABLE (oxlint 0.8 measured fixture): 0 clean; 1 findings; 2 error; other nonzero rejected.
+				exitCodes: { ran: [1, 2] },
+			},
 			() => {
 				if (noFilesDecision.kind === "expected-no-files") {
 					return [OXLINT_NO_FILES];
@@ -174,9 +181,9 @@ const oxlintRunner: RunnerDefinition = {
 				) {
 					return [OXLINT_NO_FILES_UNCONFIRMED];
 				}
-				let parsed = parseOxlintJson(stdout, ctx.filePath);
+				let parsed = parseOxlintJson(stdout, ctx.filePath, cwd);
 				if (parsed.length === 0 && stdout.length > 0) {
-					parsed = parseOxlintUnix(parsedOutput, ctx.filePath);
+					parsed = parseOxlintUnix(parsedOutput, ctx.filePath, cwd);
 				}
 				return parsed;
 			},
@@ -442,7 +449,11 @@ function extractOxlintRule(code: string | undefined): string {
 	return code.slice(open + 1, close);
 }
 
-function parseOxlintJson(raw: string, filePath: string): Diagnostic[] {
+function parseOxlintJson(
+	raw: string,
+	filePath: string,
+	cwd: string,
+): Diagnostic[] {
 	const trimmed = raw.trim();
 	if (!trimmed.startsWith("{")) return [];
 	let parsed: OxlintJsonReport;
@@ -453,7 +464,11 @@ function parseOxlintJson(raw: string, filePath: string): Diagnostic[] {
 	}
 	if (!Array.isArray(parsed.diagnostics)) return [];
 	const diagnostics: Diagnostic[] = [];
+	const absTarget = path.resolve(cwd, filePath);
 	for (const d of parsed.diagnostics) {
+		if (!d.filename || !pathsEqual(path.resolve(cwd, d.filename!), absTarget)) {
+			continue;
+		}
 		const rule = extractOxlintRule(d.code);
 		const label = d.labels?.[0]?.span;
 		const lineNum = label?.line ?? 1;
@@ -480,13 +495,20 @@ function parseOxlintJson(raw: string, filePath: string): Diagnostic[] {
 	return diagnostics;
 }
 
-function parseOxlintUnix(raw: string, filePath: string): Diagnostic[] {
+function parseOxlintUnix(
+	raw: string,
+	filePath: string,
+	cwd: string,
+): Diagnostic[] {
 	const diagnostics: Diagnostic[] = [];
+	const absTarget = path.resolve(cwd, filePath);
 	for (const line of raw.split("\n")) {
 		// Parse: file:line:column: message (rule)
 		const match = line.match(/^(.+):(\d+):(\d+):\s*(.+?)\s*\(([^)]+)\)$/);
 		if (match) {
-			const [, _file, lineStr, _col, message, rule] = match;
+			const [, reportedPath, lineStr, _col, message, rule] = match;
+			if (!reportedPath || !lineStr || !message || !rule) continue;
+			if (!pathsEqual(path.resolve(cwd, reportedPath), absTarget)) continue;
 			diagnostics.push({
 				id: `oxlint-${rule}-${lineStr}`,
 				message: `${message} (${rule})`,

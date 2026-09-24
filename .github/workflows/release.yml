@@ -21,6 +21,12 @@ concurrency:
 jobs:
   prepare:
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # The last-10-master sample is dominated by non-release merges where
+    # should_release is false and this job short-circuits (~12s); the real
+    # dry-run-publish path measured 45s on an actual release run (34530690014,
+    # 2026-09-10) -- timeout = floor of 10 min.
+    timeout-minutes: 10
     permissions:
       contents: read
     outputs:
@@ -139,6 +145,10 @@ jobs:
 
   release:
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default. This job only
+    # runs when should_release is true; measured 28s on the last actual release
+    # run (34530690014, 2026-09-10) -- timeout = floor of 10 min.
+    timeout-minutes: 10
     needs: prepare
     if: needs.prepare.outputs.should_release == 'true'
     permissions:
@@ -181,6 +191,10 @@ jobs:
 
   publish-npm:
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default. This job only
+    # runs when should_publish is true; measured 47s on the last successful
+    # publish run (34533001889, 2026-09-10) -- timeout = floor of 10 min.
+    timeout-minutes: 10
     needs: [prepare, release]
     # Runs after a real release (release job succeeded) or on a manual
     # `republish` (release job skipped because the tag already exists).

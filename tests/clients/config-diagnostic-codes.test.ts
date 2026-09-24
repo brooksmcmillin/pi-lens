@@ -66,6 +66,21 @@ describe("config diagnostic code namespace (#2418)", () => {
 		}
 	});
 
+	it("documents every registered code in the public stability table", () => {
+		const policy = fs.readFileSync(
+			path.join(REPO_ROOT, "docs/public-api-stability.md"),
+			"utf8",
+		);
+		// Keep a docs comment or prose mention from satisfying the table contract.
+		const tableRows = policy
+			.split("\n")
+			.filter((line) => /^\s*\|/.test(line))
+			.join("\n");
+		for (const code of Object.keys(CONFIG_DIAGNOSTIC_CODES)) {
+			expect(tableRows).toContain(`| \`${code}\` |`);
+		}
+	});
+
 	it("recognizes registered codes and rejects everything else", () => {
 		expect(isConfigDiagnosticCode("PILENS_CFG_0001")).toBe(true);
 		expect(isConfigDiagnosticCode("PILENS_CFG_9999")).toBe(false);

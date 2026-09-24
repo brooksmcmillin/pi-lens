@@ -59,7 +59,9 @@ describe("runWorkspaceDiagnostics — opengrep excluded from the bulk sweep (#58
 		vi.resetModules();
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
-		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "wsd-opengrep-exclude-"));
+		tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-wsd-opengrep-exclude-"),
+		);
 	});
 	afterEach(() => removeTempDirSync(tmp));
 

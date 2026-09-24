@@ -114,7 +114,9 @@ d("pi-lens self-scan (#1718)", () => {
 	// it claims to, on synthetic source outside pi-lens's own tree, so this
 	// keeps failing even on a day pi-lens's own code happens to be clean. ──
 	it("flags a synthetic no-raw-json-store-write violation outside the repo tree", () => {
-		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pilens-selfscan-"));
+		const dir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-pilens-selfscan-"),
+		);
 		try {
 			fs.writeFileSync(
 				path.join(dir, "violation.ts"),
@@ -141,7 +143,9 @@ d("pi-lens self-scan (#1718)", () => {
 	});
 
 	it("does not flag the atomic-write seam itself on the same synthetic snippet, negative control", () => {
-		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pilens-selfscan-"));
+		const dir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-pilens-selfscan-"),
+		);
 		try {
 			fs.writeFileSync(
 				path.join(dir, "clean.ts"),
@@ -187,7 +191,7 @@ d("pi-lens self-scan (#1718)", () => {
 
 		it("exits NONZERO through the wrapper on a synthetic untriaged violation", () => {
 			const dir = fs.mkdtempSync(
-				path.join(os.tmpdir(), "pilens-selfscan-wrapper-"),
+				path.join(os.tmpdir(), "pi-lens-pilens-selfscan-wrapper-"),
 			);
 			try {
 				fs.writeFileSync(

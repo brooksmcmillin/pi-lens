@@ -5,11 +5,11 @@
 // have caught immediately. These pin the fixed matching algorithm
 // (`buildRekeyPlan`) directly, via synthetic key lists (no real files, no
 // child process for a-c), plus one integration test (d) that spawns the
-// real CLI to prove the `.js` -> `.ts` sibling-resolution hook actually
-// works under a bare `node` process — the whole reason
-// scripts/lib/ts-sibling-loader.mjs exists.
+// real CLI to prove the JavaScript scan seam works under a bare `node`
+// process without Node's optional built-in TypeScript support.
 import { describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import * as path from "node:path";
 import {
 	applyPlan,
@@ -193,22 +193,35 @@ const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
 	});
 });
 
-// (d) The loader is the only reason `main()` can `import()` a `.ts` test
-// helper from a bare `node` process at all -- vitest's own resolver would
-// mask a regression here, so this has to spawn the real CLI. Node's
-// unflagged type-stripping only exists from 22.18/23.6 onward.
-function nodeSupportsUnflaggedTypeStripping(): boolean {
-	const [major, minor] = process.versions.node.split(".").map(Number);
-	if (major >= 24) return true;
-	if (major === 23) return minor >= 6;
-	if (major === 22) return minor >= 18;
-	return false;
+// (d) Vitest's own resolver would mask a regression here, so this has to
+// spawn the real CLI. CI's Node build has the optional TypeScript feature;
+// skip there explicitly, and assert its absence on the distro build that
+// exposed #3363.
+function nodeHasTypeScriptSupport(): boolean {
+	try {
+		const strip =
+			process.getBuiltinModule?.("node:module")?.stripTypeScriptTypes;
+		strip?.("let a: number = 1");
+		return typeof strip === "function";
+	} catch {
+		return false;
+	}
 }
 
-describe.runIf(nodeSupportsUnflaggedTypeStripping())(
-	"CLI entry point (real ts-sibling-loader.mjs hook)",
-	() => {
-		it("runs against the live tree via a bare `node` process without a module-resolution error", () => {
+describe("CLI entry point (bare node, no TypeScript feature)", () => {
+	it.skipIf(nodeHasTypeScriptSupport())(
+		"runs against the live tree via a bare `node` process without a module-resolution error",
+		() => {
+			expect(nodeHasTypeScriptSupport()).toBe(false);
+			// #3363: keep the bare-Node entry on the plain-JavaScript seam;
+			// re-pointing it at the .ts facade must make this regression red.
+			const scriptSource = readFileSync(SCRIPT_PATH, "utf8");
+			expect(scriptSource).toMatch(
+				/pathToFileURL\(path\.join\(REPO_ROOT, "tests\/support\/hook-await-scan\.mjs"\)/,
+			);
+			expect(scriptSource).not.toMatch(
+				/pathToFileURL\(path\.join\(REPO_ROOT, "tests\/support\/hook-await-scan\.ts"\)/,
+			);
 			let stdout: string;
 			try {
 				stdout = execFileSync(process.execPath, [SCRIPT_PATH], {
@@ -224,11 +237,10 @@ describe.runIf(nodeSupportsUnflaggedTypeStripping())(
 				);
 				stdout = err.stdout ?? "";
 			}
-			// Proves the dynamic `import()` of tests/support/hook-await-scan.ts
-			// (which itself imports "./sweep-kit.js", resolved to sweep-kit.ts
-			// only via the sibling-loader hook) actually ran the real detector.
+			// Proves the dynamic import of the JavaScript scan seam ran the real
+			// detector.
 			expect(stdout).toMatch(/^exemption keys in table: \d+$/m);
 			expect(stdout).toMatch(/^scan produced occurrences: \d+$/m);
-		});
-	},
-);
+		},
+	);
+});

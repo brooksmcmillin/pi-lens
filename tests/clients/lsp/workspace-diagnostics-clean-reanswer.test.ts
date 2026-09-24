@@ -72,7 +72,7 @@ describe("a clean re-answer evicts a cache-served entry (#1782 defect C)", () =>
 		clearWidgetState();
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
-		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "wsd-clean-reanswer-"));
+		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-wsd-clean-reanswer-"));
 		fs.mkdirSync(path.join(tmp, ".pi-lens"));
 		process.env.PI_LENS_LSP_WORKSPACE_PULL = "1";
 
@@ -304,7 +304,7 @@ describe("duplicate and unrelated report entries (#1786 review F2/F3)", () => {
 		clearWidgetState();
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
-		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "wsd-dup-report-"));
+		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-wsd-dup-report-"));
 		fs.mkdirSync(path.join(tmp, ".pi-lens"));
 		process.env.PI_LENS_LSP_WORKSPACE_PULL = "1";
 		ghost = path.join(tmp, "ghost.ts");

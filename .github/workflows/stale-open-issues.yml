@@ -11,6 +11,10 @@ jobs:
   detect:
     name: Detect stale open issues
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over the workflow's entire run history (5 successful runs
+    # total; weekly cron): 45s; timeout = floor of 10 min.
+    timeout-minutes: 10
     permissions:
       contents: read # checkout
       issues: write # single detector summary comment

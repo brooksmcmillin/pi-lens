@@ -46,7 +46,7 @@ describe("runWorkspaceDiagnostics — service destroyed mid-sweep (#1618)", () =
 		vi.resetModules();
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
-		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "wsd-destroyed-"));
+		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-wsd-destroyed-"));
 	});
 	afterEach(() => removeTempDirSync(tmp));
 

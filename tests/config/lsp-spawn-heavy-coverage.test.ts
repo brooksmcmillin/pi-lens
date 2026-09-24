@@ -54,6 +54,7 @@ import vitestConfig from "../../vitest.config.ts";
 import {
 	auditRegistry,
 	listSourceFiles,
+	readWalkedFiles,
 	relativePosix,
 	stripSource,
 } from "../support/sweep-kit.js";
@@ -146,6 +147,8 @@ const SPAWN_EXEMPTIONS: Readonly<Record<string, string>> = {
 		"real wedged child and CPU sampling run in the serialized wall-clock-budget phase; the lower-bound wedge assertion needs that quiet phase",
 	"tests/clients/lsp/headless-tool-call-keepalive.test.ts":
 		"#2507: the real LSP child is spawned by a headless NODE child this test runs, not by this process; it is phased in the serialized wall-clock-budget lane (the flake-shape admission gate requires that lane), and its assertions are the child's exit code and stdout, not a handshake budget",
+	"tests/clients/lsp/kill-process-tree-real-child.test.ts":
+		"#2042/#3091: the real child is `/bin/sh` launched through `launchLSP` purely to obtain a pid whose `/proc` PPid is this process — there is no language server, no handshake and no diagnostics wait to starve; the leader is killed within milliseconds and the assertions read which signal `killProcessTree` issued. It is already phased in the serialized wall-clock-budget lane, which the flake-shape admission gate requires, and a file cannot sit in both lanes without running twice (same shape as the two entries above).",
 	"tests/clients/lsp/initialize-timeout-backstop.test.ts":
 		"POSIX-only real-child initialize-timeout backstop; waits on a 50ms timeout firing then sleeps past kill escalation — deterministic and short",
 	"tests/clients/lsp/launch.test.ts":
@@ -195,11 +198,12 @@ describe("lsp-spawn-heavy Vitest project coverage", () => {
 			exclude: (rel) => rel.startsWith("tests/fixtures/"),
 		}).filter((file) => file.endsWith(".test.ts"));
 
-		const candidates = files
-			.map((file) => relativePosix(repoRoot, file))
-			.filter((file) =>
-				isLspSpawnHeavy(fs.readFileSync(path.join(repoRoot, file), "utf8")),
-			);
+		// readWalkedFiles: a path that vanished between the walk and the read is
+		// out of the population, not a finding (#3082 — this scan was one of the
+		// four rotating ENOENT victims).
+		const candidates = readWalkedFiles(files)
+			.filter(({ source }) => isLspSpawnHeavy(source))
+			.map(({ file }) => relativePosix(repoRoot, file));
 
 		const audit = auditRegistry({
 			sweepName: "lsp-spawn-heavy lane coverage",

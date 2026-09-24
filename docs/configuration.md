@@ -5,7 +5,7 @@ There are **two** pi-lens config files:
 | File | Scope | Notes |
 | --- | --- | --- |
 | `.pi-lens.json` | the project | Committed or not, your call. Nearest one wins **per field** — a package can override one setting without restating the repo root's. |
-| `~/.pi-lens/config.json` | the machine | Your defaults across every project. `PI_LENS_CONFIG_PATH` relocates it. |
+| `~/.pi-lens/config.json` | the machine | Your defaults across every project. The winning global location is selected by the [global-location table](#global-config-location); see [environment variables](environment-variables.md) for the knobs. |
 
 Both files have the same shape, with one exception noted below the example:
 everything LSP-related lives under an `lsp` namespace inside them.
@@ -85,6 +85,60 @@ Subsystem-specific env overrides follow the same shape: a
 `PI_LENS_REVIEW_GRAPH_MAX_FILES` beats a `.pi-lens.json`'s
 `reviewGraph.maxFiles`. `docs/environment-variables.md` and `docs/settings.md`
 are the per-setting references.
+
+### Global config location
+
+The global file is selected by this order, highest precedence first. The
+canonical default is still `~/.pi-lens/config.json`; `PI_LENS_HOME` relocates
+machine-generated data and state, not this file. This is the complete truth
+table for the three existence axes.
+
+| `PI_LENS_CONFIG_PATH` | `~/.pi-lens/config.json` exists | `PI_CODING_AGENT_DIR` set and `extensions/pi-lens.json` exists | Winner |
+| --- | --- | --- | --- |
+| unset | no | no | `~/.pi-lens/config.json` (canonical default) |
+| unset | no | yes | `$PI_CODING_AGENT_DIR/extensions/pi-lens.json` |
+| unset | yes | no | `~/.pi-lens/config.json` (grandfathered existing file) |
+| unset | yes | yes | `~/.pi-lens/config.json` (the host file is shadowed; shadowed file reported once per session (#3299)) |
+| set | no | no | the explicit `PI_LENS_CONFIG_PATH` file |
+| set | no | yes | the explicit `PI_LENS_CONFIG_PATH` file |
+| set | yes | no | the explicit `PI_LENS_CONFIG_PATH` file |
+| set | yes | yes | the explicit `PI_LENS_CONFIG_PATH` file |
+
+If an existence probe for a recognized candidate errors (for example,
+`ENOTDIR`, `EACCES`, or `ELOOP`), that candidate's tier is retained rather
+than falling through to a lower location. The subsequent read reports the
+degraded config under `PILENS_CFG_0001`; a probe error is not treated as
+absence.
+
+pi-lens does not write this file. Create or edit it yourself, then start a new
+process. For an XDG-like setup, put generated data and state at a durable data
+root and choose one config surface:
+
+```sh
+export PI_LENS_HOME="$HOME/.local/share/pi-lens"
+
+# XDG-shaped host: use its config directory.
+export PI_CODING_AGENT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/pi"
+mkdir -p "$PI_CODING_AGENT_DIR/extensions"
+```
+
+For hosts without `PI_CODING_AGENT_DIR`, use an explicit config path instead:
+
+```sh
+export PI_LENS_CONFIG_PATH="${XDG_CONFIG_HOME:-$HOME/.config}/pi-lens/config.json"
+mkdir -p "$(dirname "$PI_LENS_CONFIG_PATH")"
+```
+
+When migrating an existing `~/.pi-lens/config.json`, create the new file first
+and delete the old file second. While both exist, the old file wins by design;
+deleting it first would leave the process without the intended settings. Copy
+the file (or hand-author it, since pi-lens has no writer), verify the new
+location, then run `rm "$HOME/.pi-lens/config.json"` to opt out of
+grandfathering. If the new host file is later deleted, the old file wins again
+while it exists; with neither file present, the canonical default path is used.
+
+See also the [environment-variable reference](environment-variables.md#config-location)
+and [settings overview](settings.md#the-three-ways-to-configure-pi-lens).
 
 ### One exception: `lsp.disabledServers` is a denial, not a value
 

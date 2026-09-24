@@ -6,7 +6,10 @@ import { _resetSubagentModeForTests } from "../clients/subagent-mode.js";
 import { getEffectiveLspIdleResetMs } from "../clients/runtime-turn.js";
 import { createPiMock } from "./support/pi-mock.js";
 import { removeTempDirSync } from "./clients/test-utils.js";
-import { makeLspServiceDouble } from "./support/lsp-service-double.js";
+import {
+	aliveServerHolder,
+	lspStatusRecorder,
+} from "./support/lsp-status-repaint.js";
 
 const INTEGRATION_TIMEOUT_MS = 45_000;
 
@@ -26,6 +29,45 @@ function createMockPi(overrides: Record<string, boolean> = {}) {
 				typeof prop === "string" ? mock.handlers.get(prop) : undefined,
 		}),
 	};
+}
+
+/**
+ * Shared fixture for every LSP status-repaint case (#3099): install the
+ * LSP-service and bootstrap doubles, register the extension, and hand back the
+ * `turn_end` handler plus a `pi-lens-lsp` status recorder. The idle-reset double
+ * empties the alive set, which is what makes the second repaint observable
+ * (#281).
+ */
+async function setupLspStatusRepaint(
+	options: { flags?: Record<string, boolean> } = {},
+) {
+	const { resetLSPService, service } = aliveServerHolder();
+	vi.doMock("../clients/lsp/index.js", () => ({
+		getLSPService: service,
+		resetLSPService,
+	}));
+	vi.doMock("../clients/bootstrap.js", async () => {
+		const { bootstrapSeamMock } = await import("./support/bootstrap-mock.js");
+		return bootstrapSeamMock(async () => ({
+			knipClient: { isAvailable: () => false },
+			depChecker: { isAvailable: () => false },
+			testRunnerClient: { detectRunner: () => null },
+		}));
+	});
+
+	const { default: registerExtension } = await import("../index.js");
+	const { pi, handlers } = createMockPi({
+		"no-lsp": false,
+		...options.flags,
+	});
+	registerExtension(pi);
+
+	const turnEnd = handlers.turn_end?.[0];
+	expect(turnEnd).toBeTypeOf("function");
+
+	const { ui, lspStatuses } = lspStatusRecorder();
+
+	return { turnEnd, ui, lspStatuses, resetLSPService };
 }
 
 vi.mock("../clients/read-guard.js", () => {
@@ -81,43 +123,10 @@ describe("index.ts LSP idle reset", () => {
 	it(
 		"does not touch a stale event ctx when the detached idle timer fires",
 		async () => {
-			let aliveIds: string[] = ["typescript"];
-			const resetLSPService = vi.fn(() => {
-				aliveIds = [];
-			});
-			vi.doMock("../clients/lsp/index.js", () => ({
-				getLSPService: () =>
-					makeLspServiceDouble({
-						getAliveClientCount: () => aliveIds.length,
-						getAliveServerIds: () => aliveIds,
-					}),
-				resetLSPService,
-			}));
-			vi.doMock("../clients/bootstrap.js", async () => {
-				const { bootstrapSeamMock } =
-					await import("./support/bootstrap-mock.js");
-				return bootstrapSeamMock(async () => ({
-					knipClient: { isAvailable: () => false },
-					depChecker: { isAvailable: () => false },
-					testRunnerClient: { detectRunner: () => null },
-				}));
-			});
+			const { turnEnd, ui, lspStatuses, resetLSPService } =
+				await setupLspStatusRepaint();
 
-			const { default: registerExtension } = await import("../index.js");
-			const { pi, handlers } = createMockPi({ "no-lsp": false });
-			registerExtension(pi);
-
-			const turnEnd = handlers.turn_end?.[0];
-			expect(turnEnd).toBeTypeOf("function");
-
-			const statusUpdates: Array<[string, string | undefined]> = [];
 			let stale = false;
-			const ui = {
-				notify: vi.fn(),
-				setStatus: (id: string, text: string | undefined) =>
-					statusUpdates.push([id, text]),
-				theme: { fg: (_color: string, text: string) => text },
-			};
 			const ctx = {
 				cwd: tmpDir,
 				get ui() {
@@ -129,10 +138,6 @@ describe("index.ts LSP idle reset", () => {
 					return ui;
 				},
 			};
-			const lspStatuses = () =>
-				statusUpdates.flatMap(([id, text]) =>
-					id === "pi-lens-lsp" ? [text] : [],
-				);
 
 			vi.useFakeTimers();
 			try {
@@ -147,6 +152,133 @@ describe("index.ts LSP idle reset", () => {
 			} finally {
 				vi.useRealTimers();
 			}
+		},
+		INTEGRATION_TIMEOUT_MS,
+	);
+
+	// #3099: the opt-in compact status must reach `updateLspStatus` through the
+	// real turn_end → status-repaint path, and it must render BOTH glyphs (active
+	// on the turn, dim after the idle timer releases the servers). Server names
+	// stay the default, which the tests above keep asserting with the flag off.
+	it(
+		"renders the compact LSP status glyphs when lens-compact-lsp-status is on (#3099)",
+		async () => {
+			const { turnEnd, ui, lspStatuses, resetLSPService } =
+				await setupLspStatusRepaint({
+					flags: { "lens-compact-lsp-status": true },
+				});
+			const ctx = { cwd: tmpDir, ui };
+
+			vi.useFakeTimers();
+			try {
+				await turnEnd?.({}, ctx);
+				// One glyph, not `LSP Active: typescript`.
+				expect(lspStatuses().at(-1)).toBe("LSP ✓");
+
+				await vi.advanceTimersByTimeAsync(getEffectiveLspIdleResetMs());
+
+				expect(resetLSPService).toHaveBeenCalledTimes(1);
+				expect(lspStatuses().at(-1)).toBe("LSP ✗");
+			} finally {
+				vi.useRealTimers();
+			}
+		},
+		INTEGRATION_TIMEOUT_MS,
+	);
+
+	// #3099: the compact FAILED branch has no coverage above — that case only
+	// records an idle-released active server, never a failed one. Mutating
+	// `failedText`'s compact arm (`"LSP ✗"` → `"LSP ✓"`) leaves the suite
+	// green without this. Drives the real turn_end → updateLspStatus path
+	// with a recorded failure (`recordLsp` + `setSessionLanguages`, the same
+	// seam `selectLspStatus` reads) so it observes the published string, not
+	// the branch. One turn covers both states the review asked for: mixed
+	// (typescript alive + python failed) while the default alive server is
+	// still up, then failed-alone once the idle timer releases it.
+	it(
+		"renders the compact LSP status glyph for a failed server, alone and mixed with an active one (#3099)",
+		async () => {
+			const { turnEnd, ui, lspStatuses, resetLSPService } =
+				await setupLspStatusRepaint({
+					flags: { "lens-compact-lsp-status": true },
+				});
+			const { recordLsp, setSessionLanguages } =
+				await import("../clients/widget-state.js");
+			setSessionLanguages(["python"]);
+			recordLsp("python", tmpDir, "spawn_failed");
+			const ctx = { cwd: tmpDir, ui };
+
+			vi.useFakeTimers();
+			try {
+				await turnEnd?.({}, ctx);
+				// typescript alive (default) + python failed, side by side.
+				expect(lspStatuses().at(-1)).toBe("LSP ✓ · LSP ✗");
+
+				await vi.advanceTimersByTimeAsync(getEffectiveLspIdleResetMs());
+
+				expect(resetLSPService).toHaveBeenCalledTimes(1);
+				// typescript released; python's failure is all that remains, with
+				// no live server to show alongside it.
+				expect(lspStatuses().at(-1)).toBe("LSP ✗");
+			} finally {
+				vi.useRealTimers();
+			}
+		},
+		INTEGRATION_TIMEOUT_MS,
+	);
+
+	// #3099: off mode publishes no status at all — `undefined`, not a dim
+	// "LSP Inactive" — so a host that renders extension statuses stops showing
+	// the `pi-lens-lsp` key entirely. Drives the real turn_end →
+	// updateLspStatus path and asserts the published value across BOTH the
+	// active turn and the idle-released repaint: neutering the guard (making
+	// it a no-op) would make the first assertion see `"LSP Active: typescript"`
+	// instead of `undefined`, and the second would still see a live server
+	// name/dim text rather than staying `undefined` after the idle timer.
+	it(
+		"publishes no status at all when lens-hide-lsp-status is on, and stays unpublished across the idle repaint (#3099)",
+		async () => {
+			const { turnEnd, ui, lspStatuses, resetLSPService } =
+				await setupLspStatusRepaint({
+					flags: { "lens-hide-lsp-status": true },
+				});
+			const ctx = { cwd: tmpDir, ui };
+
+			vi.useFakeTimers();
+			try {
+				await turnEnd?.({}, ctx);
+				expect(lspStatuses().at(-1)).toBeUndefined();
+
+				await vi.advanceTimersByTimeAsync(getEffectiveLspIdleResetMs());
+
+				expect(resetLSPService).toHaveBeenCalledTimes(1);
+				// Still unpublished after the repaint that would otherwise flip to
+				// "LSP Inactive" (or its compact dim glyph) — the flag never changed.
+				expect(lspStatuses().at(-1)).toBeUndefined();
+			} finally {
+				vi.useRealTimers();
+			}
+		},
+		INTEGRATION_TIMEOUT_MS,
+	);
+
+	// #3099: precedence — off wins when both flags are set, since there is
+	// nothing left to render compactly once the key itself is gone. Mutating
+	// the off-check's placement (checking compact first, or dropping the
+	// early `return`) would let the compact glyph ("LSP ✓") leak out.
+	it(
+		"off outranks compact when both lens-hide-lsp-status and lens-compact-lsp-status are on (#3099)",
+		async () => {
+			const { turnEnd, ui, lspStatuses } = await setupLspStatusRepaint({
+				flags: {
+					"lens-hide-lsp-status": true,
+					"lens-compact-lsp-status": true,
+				},
+			});
+			const ctx = { cwd: tmpDir, ui };
+
+			await turnEnd?.({}, ctx);
+			expect(lspStatuses().at(-1)).toBeUndefined();
 		},
 		INTEGRATION_TIMEOUT_MS,
 	);
@@ -167,36 +299,8 @@ describe("index.ts LSP idle reset", () => {
 			_resetSubagentModeForTests();
 
 			try {
-				const resetLSPService = vi.fn();
-				vi.doMock("../clients/lsp/index.js", () => ({
-					getLSPService: () => makeLspServiceDouble(),
-					resetLSPService,
-				}));
-				vi.doMock("../clients/bootstrap.js", async () => {
-					const { bootstrapSeamMock } =
-						await import("./support/bootstrap-mock.js");
-					return bootstrapSeamMock(async () => ({
-						knipClient: { isAvailable: () => false },
-						depChecker: { isAvailable: () => false },
-						testRunnerClient: { detectRunner: () => null },
-					}));
-				});
-
-				const { default: registerExtension } = await import("../index.js");
-				const { pi, handlers } = createMockPi({ "no-lsp": false });
-				registerExtension(pi);
-
-				const turnEnd = handlers.turn_end?.[0];
-				expect(turnEnd).toBeTypeOf("function");
-
-				const ctx = {
-					cwd: tmpDir,
-					ui: {
-						notify: vi.fn(),
-						setStatus: vi.fn(),
-						theme: { fg: (_color: string, text: string) => text },
-					},
-				};
+				const { turnEnd, ui, resetLSPService } = await setupLspStatusRepaint();
+				const ctx = { cwd: tmpDir, ui };
 
 				const expectedMs = getEffectiveLspIdleResetMs();
 				// Still meaningfully shorter than the base 240s floor — proves the
@@ -234,36 +338,8 @@ describe("index.ts LSP idle reset", () => {
 			delete process.env.PI_SUBAGENT_PARENT_PID;
 			_resetSubagentModeForTests();
 
-			const resetLSPService = vi.fn();
-			vi.doMock("../clients/lsp/index.js", () => ({
-				getLSPService: () => makeLspServiceDouble(),
-				resetLSPService,
-			}));
-			vi.doMock("../clients/bootstrap.js", async () => {
-				const { bootstrapSeamMock } =
-					await import("./support/bootstrap-mock.js");
-				return bootstrapSeamMock(async () => ({
-					knipClient: { isAvailable: () => false },
-					depChecker: { isAvailable: () => false },
-					testRunnerClient: { detectRunner: () => null },
-				}));
-			});
-
-			const { default: registerExtension } = await import("../index.js");
-			const { pi, handlers } = createMockPi({ "no-lsp": false });
-			registerExtension(pi);
-
-			const turnEnd = handlers.turn_end?.[0];
-			expect(turnEnd).toBeTypeOf("function");
-
-			const ctx = {
-				cwd: tmpDir,
-				ui: {
-					notify: vi.fn(),
-					setStatus: vi.fn(),
-					theme: { fg: (_color: string, text: string) => text },
-				},
-			};
+			const { turnEnd, ui, resetLSPService } = await setupLspStatusRepaint();
+			const ctx = { cwd: tmpDir, ui };
 
 			vi.useFakeTimers();
 			try {
@@ -297,36 +373,8 @@ describe("index.ts LSP idle reset", () => {
 			_resetSubagentModeForTests();
 
 			try {
-				const resetLSPService = vi.fn();
-				vi.doMock("../clients/lsp/index.js", () => ({
-					getLSPService: () => makeLspServiceDouble(),
-					resetLSPService,
-				}));
-				vi.doMock("../clients/bootstrap.js", async () => {
-					const { bootstrapSeamMock } =
-						await import("./support/bootstrap-mock.js");
-					return bootstrapSeamMock(async () => ({
-						knipClient: { isAvailable: () => false },
-						depChecker: { isAvailable: () => false },
-						testRunnerClient: { detectRunner: () => null },
-					}));
-				});
-
-				const { default: registerExtension } = await import("../index.js");
-				const { pi, handlers } = createMockPi({ "no-lsp": false });
-				registerExtension(pi);
-
-				const turnEnd = handlers.turn_end?.[0];
-				expect(turnEnd).toBeTypeOf("function");
-
-				const ctx = {
-					cwd: tmpDir,
-					ui: {
-						notify: vi.fn(),
-						setStatus: vi.fn(),
-						theme: { fg: (_color: string, text: string) => text },
-					},
-				};
+				const { turnEnd, ui, resetLSPService } = await setupLspStatusRepaint();
+				const ctx = { cwd: tmpDir, ui };
 
 				vi.useFakeTimers();
 				try {

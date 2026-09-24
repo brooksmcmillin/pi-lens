@@ -8,3 +8,7 @@ def add(a, b):
 
 
 result = add(1, 2)
+
+# LSP gate seed (#3217): pyright reports the incompatible assignment through
+# `lsp_diagnostics`; the F401 above is a ruff finding, not an LSP one.
+gate_seed: int = "not a number"

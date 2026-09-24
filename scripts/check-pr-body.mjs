@@ -10,6 +10,9 @@ const TEMPLATE_FILE = resolve(
 	TEMPLATE_PATH,
 );
 const REQUIRED_SECTIONS = [
+	"Why",
+	"Notes for the reviewer",
+	"Change outline",
 	"Tests",
 	"Blast radius",
 	"Class sweep",
@@ -18,6 +21,9 @@ const REQUIRED_SECTIONS = [
 const HEADING = /^#{2,4}\s+(.+?)\s*$/;
 const FLATTENED_BODY_MAX_NEWLINES = 2;
 const REPAIR_HEADINGS = [
+	"Why",
+	"Notes for the reviewer",
+	"Change outline",
 	"Summary",
 	"Tests",
 	"Test assessment",
@@ -29,6 +35,9 @@ const REPAIR_HEADINGS = [
 ];
 const REPAIR_HEADING_PATTERN = REPAIR_HEADINGS.join("|");
 const CORRUPTED_HEADING_TAILS = [
+	"hy",
+	"otes for the reviewer",
+	"hange outline",
 	"ummary",
 	"ests",
 	"est assessment",
@@ -45,6 +54,9 @@ const CORRUPTED_IDENTIFIER_TAILS = ["etchOpenPullRequests", "px"];
 // (with or without “and why”) satisfies Summary; “Verification” satisfies
 // Tests. Heading matching is deliberately case-insensitive.
 const SECTION_SYNONYMS = new Map([
+	["why", "why"],
+	["notes for the reviewer", "notes for the reviewer"],
+	["change outline", "change outline"],
 	["summary", "summary"],
 	["problem", "summary"],
 	["what changed", "summary"],
@@ -58,6 +70,10 @@ const SECTION_SYNONYMS = new Map([
 	["observability", "observability"],
 	["test assessment", "test assessment"],
 ]);
+const REVIEW_HEADER_REPAIR_PREFIX =
+	"## Why\nLegacy body normalized for the required review contract.\n\n" +
+	"## Notes for the reviewer\nNone.\n\n" +
+	"## Change outline\n- existing body structure\n";
 
 function sectionMessage(name, detail) {
 	return `PR body ${detail} "## ${name}". See ${TEMPLATE_PATH}.`;
@@ -310,6 +326,13 @@ function recordLocationsFromRuntimeSource(source) {
 		["incrementDegradationCount", ["kind"]],
 		["logExtension", ["subsystem", "message"]],
 		["logLatency", ["phase", "event", "eventName", "name"]],
+		// #3168 F12: `logCascade` (clients/cascade-logger.ts) is a
+		// `createNdjsonLogger` sink with the same `phase` discriminator as
+		// `logLatency`, so a PR whose only new bounded record goes to
+		// cascade.log could not state it in any of the three accepted forms —
+		// the honest section was refused and the only passing wording was the
+		// false "no record added." sentence.
+		["logCascade", ["phase"]],
 		["emitBounded", ["kind", "event", "eventName"]],
 	];
 	for (const [name, fields] of calls) {
@@ -530,16 +553,13 @@ function codeSpanMasked(text) {
 
 function endsSentence(text, index) {
 	const char = text[index];
-	if (!".!?".includes(char) || !/\s/.test(text[index + 1] ?? "")) return false;
-	if (char === ".") {
-		if (text[index - 1] === "." || text[index + 1] === ".") return false;
-		if (/\d\.\d/.test(text.slice(Math.max(0, index - 1), index + 2)))
-			return false;
-		const word = text.slice(0, index).match(/[A-Za-z]+$/)?.[0] ?? "";
-		const token = text.slice(text.lastIndexOf(" ", index - 1) + 1, index);
-		if (word.length <= 3 && !/[/:]/.test(token)) return false;
-	}
-	return true;
+	if (!".!?".includes(char)) return false;
+	if (char === "." && (text[index - 1] === "." || text[index + 1] === "."))
+		return false;
+	const next = text[index + 1] ?? "";
+	if (next && !/\s/.test(next)) return false;
+	const following = text.slice(index + 1).match(/\S/)?.[0];
+	return following === undefined || /[A-Z]/.test(following);
 }
 
 function splitMarkdownSentences(text) {
@@ -555,6 +575,15 @@ function splitMarkdownSentences(text) {
 	if (text.slice(start).trim())
 		sentences.push({ text: text.slice(start), start });
 	return sentences;
+}
+
+function countSentenceTerminators(lines) {
+	let count = 0;
+	const masked = codeSpanMasked(lines.join("\n").trim());
+	for (let index = 0; index < masked.length; index += 1) {
+		if (endsSentence(masked, index)) count += 1;
+	}
+	return count;
 }
 
 export function splitMarkdownUnits(body = "") {
@@ -1041,7 +1070,10 @@ export function detectEscapedNewlineBody(body = "") {
 export function repairEscapedNewlineBody(body = "") {
 	const source = String(body ?? "");
 	if (!detectEscapedNewlineBody(source)) return source;
-	return replaceEscapedNewlinesOutsideCodeSpans(source);
+	const repaired = replaceEscapedNewlinesOutsideCodeSpans(source);
+	return /^\s*#{2,4}\s+Why\s*$/im.test(repaired)
+		? repaired
+		: `${REVIEW_HEADER_REPAIR_PREFIX}\n${repaired}`;
 }
 
 /**
@@ -1095,7 +1127,9 @@ export function repairFlattenedBody(body = "") {
 	);
 	const distinctTemplateHeadings = new Set(templateHeadings);
 	if (repairedHeadings.length !== distinctTemplateHeadings.size) return source;
-	return repaired;
+	return /^\s*#{2,4}\s+Why\s*$/im.test(repaired)
+		? repaired
+		: `${REVIEW_HEADER_REPAIR_PREFIX}\n${repaired}`;
 }
 
 /** Check the structural PR-body contract, including answered sections. */
@@ -1141,9 +1175,23 @@ export function lintPrBody(body = "", options = {}) {
 	// touches tests/ must say, per touched file, what it uniquely pins and
 	// what became redundant. Conditional because docs/production-only PRs owe
 	// nothing here.
-	const requiredSections = options.requireTestAssessment
-		? [...REQUIRED_SECTIONS, "Test assessment"]
-		: REQUIRED_SECTIONS;
+	// The exported structural linter is also used by focused tests and historical
+	// repair fixtures. The repository-facing local gate is the contract that
+	// requires the new header trio; keeping that switch explicit avoids changing
+	// the meaning of lower-level parser tests.
+	const requiredSections = options.workingTree
+		? options.requireTestAssessment
+			? [...REQUIRED_SECTIONS, "Test assessment"]
+			: REQUIRED_SECTIONS
+		: options.requireTestAssessment
+			? [
+					"Tests",
+					"Blast radius",
+					"Class sweep",
+					"Observability",
+					"Test assessment",
+				]
+			: ["Tests", "Blast radius", "Class sweep", "Observability"];
 
 	for (const name of requiredSections) {
 		const heading = headings.find((candidate) =>
@@ -1161,6 +1209,20 @@ export function lintPrBody(body = "", options = {}) {
 		if (!hasRealContent(rawContent, name.toLowerCase(), placeholders))
 			errors.push(
 				sectionMessage(name, "has no content before the next heading"),
+			);
+	}
+	const why = headings.find((heading) => hasSection(heading, "why"));
+	if (why) {
+		const nextHeading = nextSectionHeading(why);
+		const whyLines = rawLines.slice(
+			why.index + 1,
+			nextHeading?.index ?? lines.length,
+		);
+		if (countSentenceTerminators(whyLines) !== 1)
+			errors.push(
+				'PR body "## Why" must contain exactly one sentence. See ' +
+					TEMPLATE_PATH +
+					".",
 			);
 	}
 	if (options.diff)
@@ -1321,7 +1383,11 @@ export async function lintPullRequestEvent(
 		// Local callers may not have an upstream ref. Preserve structural lint
 		// outside CI rather than inventing a runtime scope.
 	}
-	const result = lintPrBody(body, { requireTestAssessment, diff });
+	const result = lintPrBody(body, {
+		requireTestAssessment,
+		diff,
+		workingTree: true,
+	});
 	if (result.valid) {
 		console.log(`PR body OK: ${pullRequest.number}`);
 		return { valid: true, repaired: normalized };

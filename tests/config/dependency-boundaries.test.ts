@@ -10,9 +10,18 @@ const require = createRequire(import.meta.url);
 const { parse: parseJson5 } = require("json5") as {
 	parse: (source: string) => unknown;
 };
-const depcruiseBin = resolve(
+const dependencyCruiserPackagePath = resolve(
 	repoRoot,
-	"node_modules/dependency-cruiser/bin/dependency-cruise.mjs",
+	"node_modules/dependency-cruiser/package.json",
+);
+const dependencyCruiserPackage = JSON.parse(
+	readFileSync(dependencyCruiserPackagePath, "utf8"),
+) as { bin: { depcruise: string } };
+// Regression: dependency-cruiser 18.3.1 renamed its private entry file while
+// preserving the public depcruise command declared in package metadata.
+const depcruiseBin = resolve(
+	dirname(dependencyCruiserPackagePath),
+	dependencyCruiserPackage.bin.depcruise,
 );
 
 function cruiseBuiltGraph(): {

@@ -116,6 +116,10 @@ describe("scratch-tree-policy — secrets-lane tier is narrower than walker-pari
 		for (const scratchDir of [
 			".claude",
 			".codex",
+			// #3112: the rebranded pi config dir, same `<configDir>/agent/sessions`
+			// history as `.pi` — a session transcript is not a first-party leak
+			// surface, and scanning one reads user session content.
+			".omp",
 			".agents",
 			"node_modules",
 			".git",

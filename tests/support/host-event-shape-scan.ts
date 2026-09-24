@@ -38,11 +38,15 @@
  * `.emit(...)` with one of these five event-type strings.
  */
 
-import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { toPosix } from "../../clients/path-utils.js";
 import { stripCommentsAndStrings } from "./session-state-scan.ts";
+import {
+	listSourceFiles,
+	matchingCloseIndex,
+	readWalkedFiles,
+} from "./sweep-kit.js";
 
 const repoRoot = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -51,13 +55,14 @@ const repoRoot = path.resolve(
 
 const TESTS_ROOT = path.join(repoRoot, "tests");
 
-/** Every `.ts`/`.mjs` file under `tests/`. */
+/** Every `.ts`/`.mjs` file under `tests/`, through the shared walker (#3082):
+ *  this module used to hand-roll the identical recursive `readdirSync` walk.
+ *  `skipDeclarations: false` keeps the population byte-identical to that walk
+ *  — `.d.ts` files were part of it and the 400-file floor is calibrated on it. */
 function testFiles(dir = TESTS_ROOT): string[] {
-	return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
-		const entryPath = path.join(dir, entry.name);
-		if (entry.isDirectory()) return testFiles(entryPath);
-		if (!/\.(ts|mjs)$/.test(entry.name)) return [];
-		return [entryPath];
+	return listSourceFiles(dir, {
+		extensions: [".ts", ".mjs"],
+		skipDeclarations: false,
 	});
 }
 
@@ -106,16 +111,12 @@ function eventArgLiteral(
 	// later, unrelated argument (e.g. a third `ctx` argument's own literal).
 	const between = source.slice(matchEnd, openBrace);
 	if (!/^[\s,]*$/.test(between)) return undefined;
-	let depth = 0;
-	for (let i = openBrace; i < source.length; i++) {
-		if (source[i] === "{") depth++;
-		else if (source[i] === "}") {
-			depth--;
-			if (depth === 0)
-				return { text: source.slice(openBrace, i + 1), start: openBrace };
-		}
-	}
-	return undefined;
+	// #3134: the depth count is `sweep-kit.ts`'s `matchingCloseIndex`; the
+	// slice+start wrapper and the undefined-on-unbalanced fallback stay
+	// local, matching `session-state-scan.ts`'s `functionBody` brace match.
+	const close = matchingCloseIndex(source, openBrace, "{", "}");
+	if (close === -1) return undefined;
+	return { text: source.slice(openBrace, close + 1), start: openBrace };
 }
 
 /**
@@ -158,10 +159,11 @@ export function scanSourceForHostEventShapeViolations(
 /** Every fixture literal, across the five {@link EVENT_TYPES}, carrying a forbidden field. */
 export function scanHostEventShapeViolations(): HostEventShapeViolation[] {
 	const violations: HostEventShapeViolation[] = [];
-	for (const absolute of testFiles()) {
-		const raw = fs.readFileSync(absolute, "utf8");
+	// readWalkedFiles: a path that vanished between the walk and the read is out
+	// of the population, not a finding (#3082).
+	for (const { file, source } of readWalkedFiles(testFiles())) {
 		violations.push(
-			...scanSourceForHostEventShapeViolations(testsRelative(absolute), raw),
+			...scanSourceForHostEventShapeViolations(testsRelative(file), source),
 		);
 	}
 	return violations;

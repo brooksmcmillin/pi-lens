@@ -17,7 +17,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { stripSource } from "./sweep-kit.js";
+import { matchingCloseIndex, stripSource } from "./sweep-kit.js";
 
 export interface AvailabilityDecisionSite {
 	/** Repo-relative path, forward slashes, so findings read the same on any OS. */
@@ -101,28 +101,24 @@ export function scanSource(
 	return sites.sort((a, b) => a.line - b.line);
 }
 
-/** Argument text between `(` at `openIndex` and its matching `)`. */
+/**
+ * Argument text between `(` at `openIndex` and its matching `)` — or, when
+ * unbalanced, the rest of `source` from just past `openIndex`. Quote-aware
+ * (a `cause`/`classifiedBy` string can itself contain an unbalanced paren):
+ * #3134 folds the depth count onto `sweep-kit.ts`'s `matchingCloseIndex` with
+ * `quoteAware: true`, the one shared quote-aware variant also used by
+ * `latency-logger-mock-shape.test.ts`'s `callEnd`. Only this
+ * unbalanced-to-rest-of-source fallback stays local, matching the
+ * non-quote-aware copy in `bounded-telemetry-scan.ts` /
+ * `session-event-guard-sweep.test.ts`.
+ */
 function readBalancedArgs(source: string, openIndex: number): string {
-	let depth = 0;
-	let quote: string | undefined;
-	for (let i = openIndex; i < source.length; i++) {
-		const ch = source[i];
-		if (quote !== undefined) {
-			if (ch === "\\") i++;
-			else if (ch === quote) quote = undefined;
-			continue;
-		}
-		if (ch === '"' || ch === "'" || ch === "`") {
-			quote = ch;
-			continue;
-		}
-		if (ch === "(") depth++;
-		else if (ch === ")") {
-			depth--;
-			if (depth === 0) return source.slice(openIndex + 1, i);
-		}
-	}
-	return source.slice(openIndex + 1);
+	const close = matchingCloseIndex(source, openIndex, "(", ")", {
+		quoteAware: true,
+	});
+	return close === -1
+		? source.slice(openIndex + 1)
+		: source.slice(openIndex + 1, close);
 }
 
 interface TopLevelProperty {

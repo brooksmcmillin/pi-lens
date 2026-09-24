@@ -58,7 +58,7 @@ let minifiedFile: string;
 let registry: RunnerRegistry;
 
 beforeAll(() => {
-	tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pilens-2346-"));
+	tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-pilens-2346-"));
 	// A saved/scraped page: a handful of multi-KB lines, no generated name,
 	// no generated-code banner.
 	const longLine = "a".repeat(10_000);

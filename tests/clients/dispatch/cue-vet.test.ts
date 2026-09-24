@@ -9,6 +9,11 @@ import {
 } from "../../../clients/dispatch/runners/cue-vet.js";
 import { makeRunnerCtx } from "../../support/runner-ctx.js";
 
+// The directory `cue vet` runs in — `cue` prints every position relative to
+// its own cwd (`cue/errors/errors.go:586` at v0.11.0), so it is the base the
+// filter resolves a reported location against (#3278).
+const VET_CWD = path.resolve("/cue-pkg");
+
 // ── appliesTo ────────────────────────────────────────────────────────────────
 
 describe("cue-vet appliesTo", () => {
@@ -112,7 +117,7 @@ describe("filterToTouchedFile (#1522 review round 1, F1)", () => {
 				"    .\\bad.cue:3:10",
 			].join("\n"),
 		);
-		const diagnostics = filterToTouchedFile(errors, "bad.cue");
+		const diagnostics = filterToTouchedFile(errors, "bad.cue", VET_CWD);
 		expect(diagnostics).toHaveLength(1);
 		expect(diagnostics?.[0].line).toBe(3);
 		expect(diagnostics?.[0].column).toBe(4);
@@ -126,7 +131,7 @@ describe("filterToTouchedFile (#1522 review round 1, F1)", () => {
 	// so there is nothing to filter — this asserts the empty-input case is
 	// itself the fix, not a masking layer.
 	it("produces zero findings when the package-wide vet already found nothing", () => {
-		expect(filterToTouchedFile([], "values.cue")).toBeUndefined();
+		expect(filterToTouchedFile([], "values.cue", VET_CWD)).toBeUndefined();
 	});
 
 	it("filters out an error whose ONLY location is a sibling file (the missed-finding tradeoff)", () => {
@@ -137,7 +142,7 @@ describe("filterToTouchedFile (#1522 review round 1, F1)", () => {
 				"    .\\sibling.cue:4:8",
 			].join("\n"),
 		);
-		expect(filterToTouchedFile(errors, "values.cue")).toEqual([]);
+		expect(filterToTouchedFile(errors, "values.cue", VET_CWD)).toEqual([]);
 	});
 
 	it("keeps a cross-file error when the touched file is ANY of its locations, at that location", () => {
@@ -150,7 +155,7 @@ describe("filterToTouchedFile (#1522 review round 1, F1)", () => {
 			].join("\n"),
 		);
 		// Touching the primary offender.
-		expect(filterToTouchedFile(errors, "bad-values.cue")).toEqual([
+		expect(filterToTouchedFile(errors, "bad-values.cue", VET_CWD)).toEqual([
 			expect.objectContaining({
 				filePath: "bad-values.cue",
 				line: 3,
@@ -158,18 +163,18 @@ describe("filterToTouchedFile (#1522 review round 1, F1)", () => {
 			}),
 		]);
 		// Touching the implicated sibling — still a real signal, at ITS location.
-		expect(filterToTouchedFile(errors, "schema.cue")).toEqual([
+		expect(filterToTouchedFile(errors, "schema.cue", VET_CWD)).toEqual([
 			expect.objectContaining({ filePath: "schema.cue", line: 4, column: 8 }),
 		]);
 		// An unrelated third file in the same package sees neither.
-		expect(filterToTouchedFile(errors, "unrelated.cue")).toEqual([]);
+		expect(filterToTouchedFile(errors, "unrelated.cue", VET_CWD)).toEqual([]);
 	});
 
 	it("falls back to undefined (never false-clean) when nothing in the output could be file-attributed", () => {
 		const errors = parseCueVetOutput(
 			"some instances are incomplete; use the -c flag to show errors or -c=false to allow incomplete instances",
 		);
-		expect(filterToTouchedFile(errors, "values.cue")).toBeUndefined();
+		expect(filterToTouchedFile(errors, "values.cue", VET_CWD)).toBeUndefined();
 	});
 
 	// F7 (review round 2): the mixed case. One error has a location (in a
@@ -186,7 +191,7 @@ describe("filterToTouchedFile (#1522 review round 1, F1)", () => {
 				"    .\\sibling.cue:3:11",
 			].join("\n"),
 		);
-		const diagnostics = filterToTouchedFile(errors, "values.cue");
+		const diagnostics = filterToTouchedFile(errors, "values.cue", VET_CWD);
 		// Never undefined (there WAS attributable evidence) and never empty
 		// (the unattributable error must not be dropped).
 		expect(diagnostics).toBeDefined();
@@ -208,7 +213,7 @@ describe("filterToTouchedFile (#1522 review round 1, F1)", () => {
 				"    .\\values.cue:3:10",
 			].join("\n"),
 		);
-		const diagnostics = filterToTouchedFile(errors, "values.cue");
+		const diagnostics = filterToTouchedFile(errors, "values.cue", VET_CWD);
 		expect(diagnostics).toHaveLength(2);
 		expect(diagnostics?.some((d) => d.line === 3 && d.column === 4)).toBe(true);
 		expect(

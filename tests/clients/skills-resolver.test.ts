@@ -103,7 +103,9 @@ afterEach(() => {
 
 /** A fresh, unique package root under a real temp dir — see the shape-38 note above. */
 function freshPackageRoot(): string {
-	const dir = fsSync.mkdtempSync(path.join(os.tmpdir(), "pilens-skills-test-"));
+	const dir = fsSync.mkdtempSync(
+		path.join(os.tmpdir(), "pi-lens-pilens-skills-test-"),
+	);
 	tmpDirs.push(dir);
 	fsSync.writeFileSync(path.join(dir, "package.json"), "{}");
 	return dir;
@@ -257,7 +259,12 @@ describe("resolveSkillPaths (#2626) — layout table against pi's real loader", 
 		const group = skillsDegradationGroup();
 		expect(group?.count).toBe(1);
 		expect(group?.latestReasons.at(-1)?.subject).toBe(expectedSkillsDir);
-		expect(group?.latestReasons.at(-1)?.reason).toContain(expectedSkillsDir);
+		// #3175: `reason` is NOT re-checked for `expectedSkillsDir` here —
+		// `subject` (just above) already carries it verbatim, and once TMPDIR
+		// is long enough that `skillsDir` + the entry directory can't both fit
+		// under the ledger's 200-char cap, `reason`'s own repeat of
+		// `skillsDir` is exactly the part `skills-resolver.ts` now lets go
+		// (see its comment) — the case F2 test below pins that trade-off.
 		expect(group?.latestReasons.at(-1)?.reason).toContain(
 			path.join(cacheRoot, "ext"),
 		);
@@ -279,6 +286,49 @@ describe("resolveSkillPaths (#2626) — layout table against pi's real loader", 
 				metadata: { status: "absent", entryCount: 0 },
 			}),
 		]);
+	});
+
+	it("F2 (#3175): under a long root, the entry directory survives the ledger's 200-char cap even though skillsDir's own repeat inside `reason` does not", () => {
+		// Reproduces the shape #3175 found on the dry-roll/CI-lane environment
+		// (TMPDIR ~60+ chars) WITHOUT depending on the ambient TMPDIR: pad one
+		// segment so `entryDir` lands at a fixed ~150 chars regardless of how
+		// long the real `os.tmpdir()` prefix already is, so this test reds
+		// pre-fix and stays green post-fix on a short CI /tmp AND on the long
+		// lane path alike.
+		const base = fsSync.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-pilens-skills-test-"),
+		);
+		tmpDirs.push(base);
+		const TARGET_ENTRY_DIR_LEN = 150;
+		const prefix = "long-managed-cache-segment-";
+		const padLen = Math.max(
+			prefix.length,
+			TARGET_ENTRY_DIR_LEN - base.length - 1 - "/ext".length,
+		);
+		const cacheRoot = path.join(base, prefix.padEnd(padLen, "x"));
+		fsSync.mkdirSync(cacheRoot, { recursive: true });
+		fsSync.writeFileSync(path.join(cacheRoot, "package.json"), "{}");
+		const expectedSkillsDir = path.join(cacheRoot, "skills");
+		const entryDir = path.join(cacheRoot, "ext");
+		const entryFile = path.join(entryDir, "pi-lens.js");
+		// Pin the fixture actually hits the shape under test, rather than
+		// silently passing because the environment happened not to overflow:
+		// the fix's own stated bound (skills-resolver.ts's comment) is that
+		// `entryDir` alone stays well under 200 while entryDir + skillsDir's
+		// classification text together do not.
+		expect(entryDir.length).toBeLessThan(180);
+		expect(
+			`no such directory: ${expectedSkillsDir} (entry loaded from ${entryDir})`
+				.length,
+		).toBeGreaterThan(200);
+
+		resolveSkillPaths(entryUrl(entryFile));
+
+		const reason = skillsDegradationGroup()?.latestReasons.at(-1)?.reason ?? "";
+		// The one fact nothing else in the ledger records — subject only ever
+		// carries `skillsDir`, never `entryDir` — must survive the cap.
+		expect(reason).toContain(entryDir);
+		expect(reason).toContain("no such directory");
 	});
 
 	it("G: skills/ exists but is completely empty — records the degradation", () => {
@@ -367,7 +417,7 @@ describe("resolveSkillPaths (#2626) — F3: notify-once gate", () => {
 		// finds walking up from the entry, so a long segment past that point
 		// would never appear in `skillsDir` at all.
 		const base = fsSync.mkdtempSync(
-			path.join(os.tmpdir(), "pilens-skills-test-"),
+			path.join(os.tmpdir(), "pi-lens-pilens-skills-test-"),
 		);
 		tmpDirs.push(base);
 		// One filesystem NAME component is capped well under 200 chars (NAME_MAX

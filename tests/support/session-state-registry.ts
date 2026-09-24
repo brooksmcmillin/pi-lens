@@ -1682,7 +1682,25 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	// own, is not a candidate on its own account — the pre-#2455 status quo,
 	// and MISS 3 in SWEEP_HEURISTIC_LIMITS.
 	"rust-client.ts": 1,
-	"safe-spawn.ts": 3,
+	// #2042/#3091 F1: rose to 4 with `verifiedOwnPids`, the FIFO-bounded memo of
+	// pids this PROCESS has proved, from the kernel, to be its own live
+	// children. Deliberately NOT reset at session_start, and a reset would be a
+	// regression rather than hygiene: the facts it holds are about the OS
+	// process tree, not the session — an LSP server spawned last session and
+	// still running is still this process's child — and dropping a verdict is
+	// exactly what re-breaks #2026's host-exit group kill for a leader that has
+	// since died. It cannot grow (BoundedFifoMap, 512 entries, FIFO eviction)
+	// and a stale entry cannot mislead: a pid alive under a different parent is
+	// refused by the /proc read before the memo is ever consulted.
+	//
+	// #3091 F1-r2b: rose to 5 with `heldOwnPids`, the companion store for
+	// RESOURCE-scoped verdicts — the LSP children `lsp/launch.ts` spawns with
+	// `nodeSpawn`. Same no-reset reasoning, and the same axis argument one step
+	// further: this set is retired by resource STATE (`releaseOwnChildPid` when
+	// the shutdown ladder is done, plus a sweep that drops every pid whose
+	// process GROUP no longer exists), never by age, because age is exactly
+	// what evicted a long-lived server's verdict from the FIFO above.
+	"safe-spawn.ts": 5,
 	// #2146 moved the four registration fields onto the process singleton, so the
 	// scan sees no module-scope container here either.
 	"session-lifecycle.ts": 0,

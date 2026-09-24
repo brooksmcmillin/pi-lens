@@ -16,11 +16,46 @@
 import { describe, expect, it } from "vitest";
 import {
 	mergeBulletSection,
+	renderServerCapabilitiesDoc,
 	mergeServerCapabilitiesDoc,
 	parseBulletSection,
 	parseTable,
 	reshapeRowsByName,
 } from "../../scripts/lib/md-matrix.mjs";
+
+const OPS = [
+	["definition", "def"],
+	["hover", "hov"],
+] as const;
+
+describe("server capability rendering", () => {
+	it("renders byte-identically when inventory set members arrive in another order", () => {
+		// Recurrence #3342: handshake/set iteration order changed docs without
+		// changing capability membership, creating no-op nightly PRs.
+		const make = (commands: string[], keys: string[]) => ({
+			serverId: "tinymist",
+			workspaceDiagnosticsSupport: { mode: "pull", workspaceDiagnostics: true },
+			operationSupport: { definition: true, hover: false },
+			advertisedCommands: commands,
+			rawCapabilityKeys: keys,
+		});
+		const common = {
+			unavailable: new Set(["z-server", "a-server"]),
+			date: "2026-09-23",
+			platform: "linux",
+			ops: OPS,
+		};
+		const first = renderServerCapabilitiesDoc({
+			...common,
+			rows: [make(["b", "a"], ["zProvider", "aProvider"])],
+		});
+		const second = renderServerCapabilitiesDoc({
+			...common,
+			rows: [make(["a", "b"], ["aProvider", "zProvider"])],
+		});
+		expect(second).toBe(first);
+	});
+});
 
 describe("reshapeRowsByName", () => {
 	it("carries prior columns by name and fills a newly-added column with the placeholder", () => {
@@ -301,15 +336,65 @@ describe("mergeServerCapabilitiesDoc (#469)", () => {
 
 		expect(text).toContain("- **php**: definitionProvider, hoverProvider");
 		expect(text).toContain(
-			"- **rust**: definitionProvider, callHierarchyProvider",
+			"- **rust**: callHierarchyProvider, definitionProvider",
 		);
 		expect(text).toContain(
-			"- **rust** (3): rust-analyzer.runSingle, rust-analyzer.debugSingle, rust-analyzer.showReferences",
+			"- **rust** (3): rust-analyzer.debugSingle, rust-analyzer.runSingle, rust-analyzer.showReferences",
 		);
 		// the host-truth "Unavailable" section is untouched (regenerated as-is)
 		expect(text).toContain("- rust-analyzer");
 		expect(text).toContain("- intelephense");
 		expect(text).not.toContain("- clangd");
+	});
+
+	it("keeps preserved rows and bullets in locale-independent order", () => {
+		// Recurrence #3342/#390: locale-sensitive preserved-value sorting made
+		// identical nightly inputs produce different documentation bytes.
+		const prior = [
+			"# doc",
+			"",
+			tableBlock(OLD_HEADER, [
+				["ä", "pull", "✓", "0"],
+				["z", "pull", "✓", "0"],
+			]),
+			"",
+			"## Raw advertised capability keys",
+			"",
+			"- **ä**: oldKey",
+			"- **z**: oldKey",
+			"",
+			"## Advertised executeCommand allowlists",
+			"",
+			"- **ä** (1): old.command",
+			"- **z** (1): old.command",
+			"",
+		].join("\n");
+		const fresh = [
+			"# doc",
+			"",
+			tableBlock(OLD_HEADER, [["z", "pull", "✓", "1"]]),
+			"",
+			"## Raw advertised capability keys",
+			"",
+			"- **z**: freshKey",
+			"",
+			"## Advertised executeCommand allowlists",
+			"",
+			"- **z** (1): fresh.command",
+			"",
+		].join("\n");
+
+		const { text } = mergeServerCapabilitiesDoc(prior, fresh);
+		const lines = text.split("\n");
+		expect(lines.indexOf("| z | pull | ✓ | 1 |")).toBeLessThan(
+			lines.indexOf("| ä | pull | ✓ | 0 |"),
+		);
+		expect(lines.indexOf("- **z**: freshKey")).toBeLessThan(
+			lines.indexOf("- **ä**: oldKey"),
+		);
+		expect(lines.indexOf("- **z** (1): fresh.command")).toBeLessThan(
+			lines.indexOf("- **ä** (1): old.command"),
+		);
 	});
 
 	it("(d) captured-this-run servers always win over prior rows", () => {

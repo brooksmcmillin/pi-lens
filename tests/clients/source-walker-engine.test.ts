@@ -38,7 +38,7 @@ afterEach(() => {
  *   root/dirB/d.txt
  */
 function buildTree(): string {
-	const root = fs.mkdtempSync(path.join(os.tmpdir(), "walker-engine-"));
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-walker-engine-"));
 	cleanups.push(() => removeTempDirSync(root));
 	fs.writeFileSync(path.join(root, "a.txt"), "a");
 	fs.writeFileSync(path.join(root, "b.txt"), "b");

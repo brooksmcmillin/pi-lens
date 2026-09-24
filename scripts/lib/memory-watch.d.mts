@@ -35,3 +35,26 @@ export declare function formatVerdict(
 	exit: { code: number | null; signal: string | null },
 	watch: MemoryWatchState,
 ): string;
+
+export declare function resolveCgroupDir(
+	cgroupRoot?: string,
+	procCgroupPath?: string,
+): string | null;
+
+export interface CgroupSample {
+	memCurrentMb: number | null;
+	memPeakMb: number | null;
+	pidsCurrent: number | null;
+	memPressureSomeTotal: number | null;
+	cpuPressureSomeTotal: number | null;
+}
+
+export declare function readCgroupSample(
+	cgroupDir: string | null,
+): CgroupSample;
+
+export declare function formatSampleLine(
+	atMs: string,
+	hostSample: { availableMb: number; totalMb: number },
+	cgroupSample: CgroupSample,
+): string;

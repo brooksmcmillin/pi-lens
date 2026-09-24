@@ -1,3 +1,4 @@
+// flake-shape: real-process-spawn — fresh Node imports prove log routing; real Git verifies checkout cleanliness and ignore rules.
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";

@@ -450,7 +450,7 @@ describe("session degradation ledger", () => {
 			const os = await import("node:os");
 			const fs = await import("node:fs");
 			const tmpDir = fs.mkdtempSync(
-				path.join(os.tmpdir(), "degradation-ledger-sink-fold-"),
+				path.join(os.tmpdir(), "pi-lens-degradation-ledger-sink-fold-"),
 			);
 			const logFile = path.join(tmpDir, "test.log");
 
@@ -495,7 +495,7 @@ describe("session degradation ledger", () => {
 			const os = await import("node:os");
 			const fs = await import("node:fs");
 			const tmpDir = fs.mkdtempSync(
-				path.join(os.tmpdir(), "degradation-ledger-sink-"),
+				path.join(os.tmpdir(), "pi-lens-degradation-ledger-sink-"),
 			);
 			const logFile = path.join(tmpDir, "test.log");
 			const appendFileSpy = vi

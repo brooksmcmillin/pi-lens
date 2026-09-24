@@ -45,6 +45,10 @@ jobs:
   compat-smoke:
     name: Subagent compat smoke
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 91s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
     permissions:
       contents: read
       issues: write # create-or-update the single drift-alert issue

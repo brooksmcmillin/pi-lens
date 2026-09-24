@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
 	biomeRuleNameFromCategory,
@@ -20,8 +21,11 @@ import {
  ****************************************************************/
 
 describe("biome-check JSON parser", () => {
+	// #3295: the parser now filters on the reported `location.path`, so these
+	// parser-level cells pass the directory the fixture paths are relative to.
 	function parseBiomeJson(raw: string, filePath: string) {
-		return parseBiomeJsonImpl(raw, filePath).diagnostics;
+		return parseBiomeJsonImpl(raw, filePath, path.posix.dirname(filePath))
+			.diagnostics;
 	}
 
 	describe("parseBiomeJson", () => {
@@ -141,7 +145,7 @@ describe("biome-check JSON parser", () => {
 						category: "e1",
 						message: "Error",
 						location: {
-							path: "f",
+							path: "test.ts",
 							start: { line: 1, column: 1 },
 							end: { line: 1, column: 1 },
 						},
@@ -151,7 +155,7 @@ describe("biome-check JSON parser", () => {
 						category: "w1",
 						message: "Warning",
 						location: {
-							path: "f",
+							path: "test.ts",
 							start: { line: 2, column: 1 },
 							end: { line: 2, column: 1 },
 						},
@@ -167,7 +171,7 @@ describe("biome-check JSON parser", () => {
 						category: "i1",
 						message: "Info",
 						location: {
-							path: "f",
+							path: "test.ts",
 							start: { line: 3, column: 1 },
 							end: { line: 3, column: 1 },
 						},
@@ -185,7 +189,7 @@ describe("biome-check JSON parser", () => {
 						category: "h1",
 						message: "Hint",
 						location: {
-							path: "f",
+							path: "test.ts",
 							start: { line: 4, column: 1 },
 							end: { line: 4, column: 1 },
 						},
@@ -219,7 +223,7 @@ describe("biome-check JSON parser", () => {
 						category: "i1",
 						message: "Info",
 						location: {
-							path: "f",
+							path: "test.ts",
 							start: { line: 1, column: 1 },
 							end: { line: 1, column: 1 },
 						},
@@ -229,7 +233,7 @@ describe("biome-check JSON parser", () => {
 						category: "h1",
 						message: "Hint",
 						location: {
-							path: "f",
+							path: "test.ts",
 							start: { line: 2, column: 1 },
 							end: { line: 2, column: 1 },
 						},
@@ -330,6 +334,7 @@ describe("biome-check JSON parser", () => {
 			const result = parseBiomeJsonImpl(
 				REAL_USE_CONST_OUTPUT,
 				"/project/src/example.ts",
+				"/project",
 			);
 			expect(result.diagnostics).toHaveLength(1);
 			expect(result.diagnostics[0].line).toBe(1);
@@ -341,6 +346,7 @@ describe("biome-check JSON parser", () => {
 			const result = parseBiomeJsonImpl(
 				REAL_USE_CONST_OUTPUT,
 				"/project/src/example.ts",
+				"/project",
 				fixKindByRule,
 			);
 
@@ -368,6 +374,7 @@ describe("biome-check JSON parser", () => {
 			const result = parseBiomeJsonImpl(
 				biomeOutput,
 				"/project/src/example.ts",
+				"/project",
 				fixKindByRule,
 			);
 
@@ -398,6 +405,7 @@ describe("biome-check JSON parser", () => {
 			const result = parseBiomeJsonImpl(
 				biomeOutput,
 				"/project/src/example.ts",
+				"/project",
 				fixKindByRule,
 			);
 
@@ -413,6 +421,7 @@ describe("biome-check JSON parser", () => {
 			const result = parseBiomeJsonImpl(
 				REAL_USE_CONST_OUTPUT,
 				"/project/src/example.ts",
+				"/project",
 			);
 			expect(result.diagnostics[0].fixable).toBe(false);
 			expect(result.diagnostics[0].autoFixAvailable).toBe(false);
@@ -514,6 +523,7 @@ describe("biome-check JSON parser", () => {
 			const result = parseBiomeJsonImpl(
 				REAL_TIERED_OUTPUT,
 				"/project/.probe-biome/tiers.ts",
+				"/project",
 			);
 			expect(result.diagnostics).toHaveLength(3);
 			const useTemplateDiag = result.diagnostics.find(

@@ -51,16 +51,26 @@ vi.mock("../../clients/project-diagnostics/scanner.js", () => ({
 	scanProjectDiagnostics: projectDiagnosticsMocks.scanProjectDiagnostics,
 }));
 
-vi.mock("../../clients/project-diagnostics/cache.js", () => ({
-	PROJECT_DIAGNOSTICS_CACHE_VERSION: 2,
-	loadProjectDiagnosticsSnapshot:
-		projectDiagnosticsMocks.loadProjectDiagnosticsSnapshot,
-	loadProjectDiagnosticsDeltaReport:
-		projectDiagnosticsMocks.loadProjectDiagnosticsDeltaReport,
-	reconcileProjectDiagnosticsSnapshot: (
-		snapshot: import("../../clients/project-diagnostics/types.js").ProjectDiagnosticsSnapshot,
-	) => ({ snapshot, staleDropped: 0 }),
-}));
+// #2154: the version comes from the REAL module. A hand-copied `2` here
+// silently drifted the moment the constant moved to 3, leaving these tests
+// asserting against a version production no longer writes.
+vi.mock(
+	"../../clients/project-diagnostics/cache.js",
+	async (importOriginal) => ({
+		PROJECT_DIAGNOSTICS_CACHE_VERSION: (
+			await importOriginal<
+				typeof import("../../clients/project-diagnostics/cache.js")
+			>()
+		).PROJECT_DIAGNOSTICS_CACHE_VERSION,
+		loadProjectDiagnosticsSnapshot:
+			projectDiagnosticsMocks.loadProjectDiagnosticsSnapshot,
+		loadProjectDiagnosticsDeltaReport:
+			projectDiagnosticsMocks.loadProjectDiagnosticsDeltaReport,
+		reconcileProjectDiagnosticsSnapshot: (
+			snapshot: import("../../clients/project-diagnostics/types.js").ProjectDiagnosticsSnapshot,
+		) => ({ snapshot, staleDropped: 0 }),
+	}),
+);
 
 const mockSummaries: ReturnType<
 	(typeof import("../../clients/widget-state.js"))["getFileDiagnosticSummaries"]

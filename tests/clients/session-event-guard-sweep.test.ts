@@ -34,6 +34,7 @@ import { describe, expect, it } from "vitest";
 import {
 	assertNonEmptyScan,
 	auditRegistry,
+	matchingCloseIndex,
 	stripSource,
 } from "../support/sweep-kit.js";
 
@@ -70,17 +71,18 @@ interface Registration {
 	wrapped: boolean;
 }
 
+/**
+ * Argument text between `(` at `openIndex` and its matching `)` — or, when
+ * unbalanced, the rest of `source` from just past `openIndex`. #3134: the
+ * depth count is `sweep-kit.ts`'s `matchingCloseIndex`; the
+ * unbalanced-to-rest-of-source fallback stays local, byte-for-byte the same
+ * copy `bounded-telemetry-scan.ts` carries.
+ */
 function readBalancedArgs(source: string, openIndex: number): string {
-	let depth = 0;
-	for (let i = openIndex; i < source.length; i++) {
-		const ch = source[i];
-		if (ch === "(") depth++;
-		else if (ch === ")") {
-			depth--;
-			if (depth === 0) return source.slice(openIndex + 1, i);
-		}
-	}
-	return source.slice(openIndex + 1);
+	const close = matchingCloseIndex(source, openIndex, "(", ")");
+	return close === -1
+		? source.slice(openIndex + 1)
+		: source.slice(openIndex + 1, close);
 }
 
 function scanRegistrations(): Registration[] {

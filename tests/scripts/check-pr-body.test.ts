@@ -29,7 +29,7 @@ import {
 } from "../../scripts/check-pr-body.mjs";
 import { blankCommentsAndStrings } from "../../scripts/check-pr-body.mjs";
 
-const body = `Summary\nOpening context.\n\n## Tests\nTargeted tests pass.\n\n## Blast radius\nNo runtime module touched.\n\n## Class sweep\nWhole-tree grep completed.\n\n## Observability\nThe advisory check run is the record.`;
+const body = `## Why\nThe body gate makes review intent explicit.\n\n## Notes for the reviewer\nNone.\n\n## Change outline\n- caller\n  + changed symbol\n    + callee\n\n## Summary\nOpening context.\n\n## Tests\nTargeted tests pass.\n\n## Blast radius\nNo runtime module touched.\n\n## Class sweep\nWhole-tree grep completed.\n\n## Observability\nThe advisory check run is the record.`;
 const repositoryRoot = process.cwd();
 type MergedRuntimeRecord = { name: string; kind: string; diff: string };
 const mergedRuntimeRecords = JSON.parse(
@@ -1341,6 +1341,61 @@ describe("PR body lint (#1844)", () => {
 		expect(lintPrBody(body)).toEqual({ valid: true, errors: [] });
 	});
 
+	it("rejects two sentences in Why but accepts one", () => {
+		const rejected = lintPrBody(
+			body.replace(
+				"The body gate makes review intent explicit.",
+				"The body gate makes review intent explicit. It keeps the contract strict.",
+			),
+		);
+		expect(rejected.valid).toBe(false);
+		expect(rejected.errors.join(" ")).toContain(
+			'"## Why" must contain exactly one sentence',
+		);
+		expect(lintPrBody(body)).toEqual({ valid: true, errors: [] });
+	});
+
+	it.each([
+		["e.g. abbreviation", "The change handles e.g. ordinary input."],
+		["i.e. abbreviation", "The change handles i.e. ordinary input."],
+		["etc. abbreviation", "The change handles etc. ordinary input."],
+		["vs. abbreviation", "The change handles vs. ordinary input."],
+		["cf. abbreviation", "The change handles cf. ordinary input."],
+		["version", "The change handles version 4.2.1 correctly."],
+		["file path", "The change handles foo.ts correctly."],
+		["nested file path", "The change handles scripts/x.mjs correctly."],
+		["issue reference", "The change addresses issue #3262 directly."],
+		["trailing terminator", "The change needs one clear rule."],
+		["question ending", "The change answers the question?"],
+		["exclamation ending", "The change works!"],
+		["quoted period", 'The change preserves the quoted "foo.bar" string.'],
+	])(
+		"accepts one Why sentence without counting %s (#3262 F-3262-V1)",
+		(_name, whyText) => {
+			expect(
+				lintPrBody(
+					body.replace("The body gate makes review intent explicit.", whyText),
+				),
+			).toEqual({
+				valid: true,
+				errors: [],
+			});
+		},
+	);
+
+	it("rejects two real Why sentences (#3262 F-3262-V1)", () => {
+		const result = lintPrBody(
+			body.replace(
+				"The body gate makes review intent explicit.",
+				"The body gate makes review intent explicit. It keeps the contract strict.",
+			),
+		);
+		expect(result.valid).toBe(false);
+		expect(result.errors.join(" ")).toContain(
+			'"## Why" must contain exactly one sentence',
+		);
+	});
+
 	it.each(["Tests", "Blast radius", "Class sweep", "Observability"])(
 		"rejects a missing %s section",
 		(section) => {
@@ -1360,6 +1415,12 @@ describe("PR body lint (#1844)", () => {
 			expect(result.errors.join(" ")).toContain(`## ${section}`);
 		},
 	);
+
+	it("rejects a local body missing Why", () => {
+		const result = lintLocalPrBody(body.replace("## Why\n", ""));
+		expect(result.valid).toBe(false);
+		expect(result.errors.join(" ")).toContain('"## Why"');
+	});
 
 	it("accepts not applicable with a reason", () => {
 		expect(
@@ -1447,7 +1508,9 @@ describe("PR body lint (#1844)", () => {
 	it("accepts an opening paragraph instead of a Summary heading", () => {
 		expect(
 			lintPrBody(
-				body.replace("Summary\nOpening context.\n\n", "Opening context.\n\n"),
+				body
+					.replace("## Why\n", "Opening context.\n\n## Why\n")
+					.replace("## Summary\nOpening context.\n\n", ""),
 			),
 		).toMatchObject({ valid: true });
 	});

@@ -98,8 +98,8 @@ describe("parseActionlintJson", () => {
 	it("returns empty array for empty input", async () => {
 		const { parseActionlintJson } =
 			await import("../../../../clients/dispatch/runners/actionlint.js");
-		expect(parseActionlintJson("", filePath)).toEqual([]);
-		expect(parseActionlintJson("   ", filePath)).toEqual([]);
+		expect(parseActionlintJson("", filePath, ".")).toEqual([]);
+		expect(parseActionlintJson("   ", filePath, ".")).toEqual([]);
 	});
 
 	it("parses a JSON array of issues", async () => {
@@ -114,7 +114,7 @@ describe("parseActionlintJson", () => {
 				kind: "expression",
 			},
 		]);
-		const result = parseActionlintJson(raw, filePath);
+		const result = parseActionlintJson(raw, filePath, ".");
 		expect(result).toHaveLength(2);
 		expect(result[0].message).toBe("unknown workflow key");
 		expect(result[0].line).toBe(5);
@@ -135,7 +135,7 @@ describe("parseActionlintJson", () => {
 			column: 1,
 			kind: "id",
 		});
-		const result = parseActionlintJson(raw, filePath);
+		const result = parseActionlintJson(raw, filePath, ".");
 		expect(result).toHaveLength(1);
 		expect(result[0].message).toBe("bad step id");
 	});
@@ -155,7 +155,7 @@ describe("parseActionlintJson", () => {
 			column: 1,
 			kind: "syntax",
 		});
-		const result = parseActionlintJson(`${line1}\n${line2}`, filePath);
+		const result = parseActionlintJson(`${line1}\n${line2}`, filePath, ".");
 		expect(result).toHaveLength(2);
 		expect(result[0].message).toBe("err one");
 		expect(result[1].message).toBe("err two");
@@ -171,7 +171,7 @@ describe("parseActionlintJson", () => {
 			kind: "syntax",
 		});
 		const raw = `actionlint: some preamble text\n${validLine}\nanother stray line`;
-		const result = parseActionlintJson(raw, filePath);
+		const result = parseActionlintJson(raw, filePath, ".");
 		expect(result).toHaveLength(1);
 		expect(result[0].message).toBe("real error");
 	});
@@ -180,7 +180,7 @@ describe("parseActionlintJson", () => {
 		const { parseActionlintJson } =
 			await import("../../../../clients/dispatch/runners/actionlint.js");
 		const raw = JSON.stringify([{ message: "" }]);
-		const result = parseActionlintJson(raw, filePath);
+		const result = parseActionlintJson(raw, filePath, ".");
 		expect(result[0].line).toBe(1);
 		expect(result[0].column).toBe(1);
 		expect(result[0].rule).toBe("actionlint");
@@ -193,7 +193,7 @@ describe("parseActionlintJson", () => {
 		const raw = JSON.stringify([
 			{ message: "bad key", line: 1, column: 1, snippet: "on: push" },
 		]);
-		const result = parseActionlintJson(raw, filePath);
+		const result = parseActionlintJson(raw, filePath, ".");
 		expect(result[0].matchedText).toBe("on: push");
 	});
 });
@@ -253,7 +253,7 @@ describe("actionlintRunner.run", () => {
 		expect(result.diagnostics[0].tool).toBe("actionlint");
 	});
 
-	it("synthesises a fallback diagnostic on non-zero exit with no JSON", async () => {
+	it("returns the shared parse-error diagnostic on non-zero unparseable output", async () => {
 		safeSpawnAsync.mockResolvedValue({
 			status: 1,
 			stdout: "",
@@ -266,7 +266,7 @@ describe("actionlintRunner.run", () => {
 		const result = await runner.run(ctx as never);
 		expect(result.status).toBe("failed");
 		expect(result.diagnostics[0].message).toBe(
-			"actionlint: no such file or directory",
+			"actionlint exited 1 but its output could not be parsed",
 		);
 		expect(result.diagnostics[0].line).toBe(1);
 	});

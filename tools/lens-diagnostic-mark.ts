@@ -50,11 +50,12 @@ import {
 	type Disposition,
 } from "../clients/diagnostic-dispositions.js";
 import { insertSuppressComment } from "../clients/dispatch/suppress-writer.js";
+import { normalizeMapKey } from "../clients/path-utils.js";
+import { resolveLensToolName } from "../clients/tool-config.js";
 import {
 	getFileDiagnostics,
 	type WidgetDiagnostic,
 } from "../clients/widget-state.js";
-import { resolveLensToolName } from "../clients/tool-config.js";
 
 const DISPOSITIONS = [
 	"false-positive",
@@ -82,6 +83,17 @@ function isBlank(text: string | undefined): boolean {
  * violation) are ambiguous; per #802 this picks the match CLOSEST to the
  * caller's line rather than guessing — the conservative choice for suppress,
  * which must never place a comment above the wrong site.
+ *
+ * #3160: `getFileDiagnostics` keys with `normalizeEphemeralMapKey` — case-
+ * preserving on POSIX by design (no filesystem I/O on that hot path) — but
+ * the widget's own writers key from `ctx.filePath`, which
+ * `createDispatchContext` already canonicalizes to the on-disk casing
+ * (#2016/#3098). `absPath` here is the caller's RAW spelling, so on a
+ * case-insensitive filesystem a mis-cased mark call must derive the same
+ * canonical key the writers used or it silently misses the live diagnostic
+ * and falls through to the fuzzy fallback below — do NOT case-fold
+ * `normalizeEphemeralMapKey` itself for this: on a case-sensitive filesystem
+ * that would merge two genuinely different files.
  */
 function widgetCrossCheck(
 	absPath: string,
@@ -92,7 +104,7 @@ function widgetCrossCheck(
 ): { line: number; ambiguous: boolean } | undefined {
 	let diagnostics: WidgetDiagnostic[] | undefined;
 	try {
-		diagnostics = getFileDiagnostics(absPath);
+		diagnostics = getFileDiagnostics(normalizeMapKey(absPath));
 	} catch {
 		return undefined;
 	}

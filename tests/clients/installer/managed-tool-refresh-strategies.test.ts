@@ -163,6 +163,7 @@ import {
 import {
 	checkProbeCache,
 	getRefreshableManagedTools,
+	installTool,
 	resetProbeCacheStateForTesting,
 	swapExtractedDir,
 	TOOLS,
@@ -173,6 +174,10 @@ import {
 	runManagedToolRefresh,
 } from "../../../clients/installer/managed-tool-refresh.js";
 import { resetManagedToolRefreshSession } from "../../../clients/installer/managed-tool-refresh-session.js";
+import {
+	resetZizmorTokenAvailability,
+	resolveZizmorGitHubToken,
+} from "../../../clients/zizmor-config.js";
 import {
 	resetProjectTrust,
 	setProjectTrustState,
@@ -235,7 +240,7 @@ function readState(): Record<
 
 interface FakeResponse {
 	statusCode: number;
-	headers?: Record<string, string>;
+	headers?: Record<string, string | string[] | undefined>;
 	body?: Buffer | string;
 }
 
@@ -278,7 +283,7 @@ httpsGetMock.mockImplementation(
 			}
 			const res = new EventEmitter() as EventEmitter & {
 				statusCode: number;
-				headers: Record<string, string>;
+				headers: Record<string, string | string[] | undefined>;
 				resume: () => void;
 			};
 			res.statusCode = outcome.statusCode;
@@ -343,6 +348,24 @@ function routeGitHubRelease(
 	});
 }
 
+function routeGitHubFailure(
+	statusCode = 403,
+	headers: Record<string, string | string[] | undefined> = {},
+): void {
+	httpsRoutes.push({
+		match: (url) => url.startsWith("https://api.github.com/"),
+		respond: () => ({
+			statusCode,
+			headers,
+			body: "rate limit details must not leak",
+		}),
+	});
+}
+
+function routeGitHubRateLimit(): void {
+	routeGitHubFailure(403, { "x-ratelimit-remaining": "0" });
+}
+
 function assetDownloads(): string[] {
 	return httpsUrls().filter((url) => url.includes("/releases/download/"));
 }
@@ -384,6 +407,28 @@ function degradationCount(): number {
 	return (
 		getDegradationSummary().find((g) => g.kind === "managed-tool-refresh")
 			?.count ?? 0
+	);
+}
+
+function githubRateLimitCount(): number {
+	return (
+		getDegradationSummary().find((g) => g.kind === "github-api-rate-limit")
+			?.count ?? 0
+	);
+}
+
+function zizmorSuppressionCount(): number {
+	return (
+		getDegradationSummary().find((g) => g.kind === "mode-suppression")?.count ??
+		0
+	);
+}
+
+function zizmorSuppressionSubjects(): string[] {
+	return (
+		getDegradationSummary()
+			.find((g) => g.kind === "mode-suppression")
+			?.latestReasons.map((reason) => reason.subject) ?? []
 	);
 }
 
@@ -431,6 +476,7 @@ beforeEach(() => {
 	sessionLogSpy.mockReset();
 	resetDegradationLedger();
 	resetManagedToolRefreshSession();
+	resetZizmorTokenAvailability();
 	resetProbeCacheStateForTesting();
 	stubSpawn();
 	// `installMavenTool` gates on a JRE via a PATH walk, so give it one.
@@ -526,6 +572,345 @@ describe("candidate derivation covers every strategy", () => {
 // --- github ---------------------------------------------------------------
 
 describe("github strategy", () => {
+	it("uses explicit GITHUB_TOKEN before GH_TOKEN and never probes gh on initial install", async () => {
+		const restoreEnv = withEnv({
+			GITHUB_TOKEN: "github-token",
+			GH_TOKEN: "legacy-token",
+		});
+		try {
+			routeGitHubRelease("v3.12.0");
+			expect(await installTool("shfmt")).toBe(true);
+			expect(httpsHeadersFor("api.github.com").Authorization).toBe(
+				"Bearer github-token",
+			);
+			expect(
+				spawnLines().filter((line) => line.startsWith("gh auth token")),
+			).toEqual([]);
+			const assetCall = httpsGetMock.mock.calls.find(([url]) =>
+				String(url).includes("/releases/download/"),
+			);
+			expect(
+				(assetCall?.[1] as { headers?: Record<string, string> } | undefined)
+					?.headers?.Authorization,
+			).toBeUndefined();
+		} finally {
+			restoreEnv();
+		}
+	});
+
+	it("uses the authenticated gh credential for initial install metadata", async () => {
+		spawnMock.mockImplementation(async (command: string, args: string[]) =>
+			command === "gh" && args.join(" ") === "auth token"
+				? { stdout: "initial-keyring-token\n", stderr: "", status: 0 }
+				: { stdout: "1.2.3", stderr: "", status: 0 },
+		);
+		routeGitHubRelease("v3.12.0");
+
+		expect(await installTool("shfmt")).toBe(true);
+		expect(httpsHeadersFor("api.github.com").Authorization).toBe(
+			"Bearer initial-keyring-token",
+		);
+		expect(
+			spawnLines().filter((line) => line.startsWith("gh auth token")),
+		).toHaveLength(1);
+	});
+
+	it("uses the authenticated gh credential for refresh metadata only", async () => {
+		installManagedBin("shfmt");
+		freshenAllExcept("shfmt", {
+			shfmt: { checkedAt: NOW - 8 * DAY_MS, resolutionId: "v3.7.0" },
+		});
+		spawnMock.mockImplementation(async (command: string, args: string[]) =>
+			command === "gh" && args.join(" ") === "auth token"
+				? { stdout: "keyring-token\n", stderr: "", status: 0 }
+				: { stdout: "1.2.3", stderr: "", status: 0 },
+		);
+		routeGitHubRelease("v3.12.0");
+
+		await runManagedToolRefresh(NOW);
+
+		expect(httpsHeadersFor("api.github.com").Authorization).toBe(
+			"Bearer keyring-token",
+		);
+		const assetCall = httpsGetMock.mock.calls.find(([url]) =>
+			String(url).includes("/releases/download/"),
+		);
+		expect(
+			(assetCall?.[1] as { headers?: Record<string, string> } | undefined)
+				?.headers?.Authorization,
+		).toBeUndefined();
+		expect(
+			spawnLines().filter((line) => line.startsWith("gh auth token")),
+		).toHaveLength(1);
+	});
+
+	it("does not attribute an installer-only transient gh probe to zizmor", async () => {
+		spawnMock.mockImplementation(async (command: string) =>
+			command === "gh"
+				? {
+						stdout: "",
+						stderr: "probe stalled",
+						status: null,
+						error: new Error("timed out"),
+						failure: "timeout",
+						spawnFailure: { kind: "timeout" },
+					}
+				: { stdout: "1.2.3", stderr: "", status: 0 },
+		);
+		routeGitHubRelease("v3.12.0");
+
+		expect(await installTool("shfmt")).toBe(true);
+		expect(
+			getDegradationSummary().some((group) =>
+				group.latestReasons.some((reason) => reason.subject === "zizmor"),
+			),
+		).toBe(false);
+		expect(logRows().join("\n")).not.toContain("zizmor-gh-token");
+	});
+
+	it("attributes a cached installer transient only when zizmor consumes it", async () => {
+		spawnMock.mockImplementation(async (command: string) =>
+			command === "gh"
+				? {
+						stdout: "",
+						stderr: "probe stalled",
+						status: null,
+						error: new Error("timed out"),
+						failure: "timeout",
+						spawnFailure: { kind: "timeout" },
+					}
+				: { stdout: "1.2.3", stderr: "", status: 0 },
+		);
+		routeGitHubRelease("v3.12.0");
+
+		expect(await installTool("shfmt")).toBe(true);
+		expect(zizmorSuppressionCount()).toBe(0);
+		expect(await resolveZizmorGitHubToken()).toBeUndefined();
+		expect(zizmorSuppressionCount()).toBe(1);
+		expect(zizmorSuppressionSubjects()).toEqual(["zizmor"]);
+		expect(
+			spawnLines().filter((line) => line.startsWith("gh auth token")),
+		).toHaveLength(1);
+	});
+
+	it("does not replay a cached zizmor transient for installer consumption", async () => {
+		spawnMock.mockImplementation(async (command: string) =>
+			command === "gh"
+				? {
+						stdout: "",
+						stderr: "probe stalled",
+						status: null,
+						error: new Error("timed out"),
+						failure: "timeout",
+						spawnFailure: { kind: "timeout" },
+					}
+				: { stdout: "1.2.3", stderr: "", status: 0 },
+		);
+		expect(await resolveZizmorGitHubToken()).toBeUndefined();
+		expect(zizmorSuppressionCount()).toBe(1);
+		routeGitHubRelease("v3.12.0");
+
+		expect(await installTool("shfmt")).toBe(true);
+		expect(zizmorSuppressionCount()).toBe(1);
+		expect(zizmorSuppressionSubjects()).toEqual(["zizmor"]);
+		expect(
+			spawnLines().filter((line) => line.startsWith("gh auth token")),
+		).toHaveLength(1);
+	});
+
+	it("re-arms consumer attribution after the session reset", async () => {
+		spawnMock.mockImplementation(async (command: string) =>
+			command === "gh"
+				? {
+						stdout: "",
+						stderr: "probe stalled",
+						status: null,
+						error: new Error("timed out"),
+						failure: "timeout",
+						spawnFailure: { kind: "timeout" },
+					}
+				: { stdout: "1.2.3", stderr: "", status: 0 },
+		);
+		routeGitHubRelease("v3.12.0");
+		expect(await installTool("shfmt")).toBe(true);
+		expect(zizmorSuppressionCount()).toBe(0);
+
+		resetZizmorTokenAvailability();
+		expect(await resolveZizmorGitHubToken()).toBeUndefined();
+		expect(zizmorSuppressionCount()).toBe(1);
+		expect(
+			spawnLines().filter((line) => line.startsWith("gh auth token")),
+		).toHaveLength(2);
+	});
+
+	it("keeps anonymous metadata honest when gh has no authenticated token", async () => {
+		installManagedBin("shfmt");
+		freshenAllExcept("shfmt", {
+			shfmt: { checkedAt: NOW - 8 * DAY_MS, resolutionId: "v3.7.0" },
+		});
+		spawnMock.mockImplementation(async (command: string) =>
+			command === "gh"
+				? { stdout: "", stderr: "not logged in", status: 1 }
+				: { stdout: "1.2.3", stderr: "", status: 0 },
+		);
+		routeGitHubRelease("v3.12.0");
+
+		const outcome = await runManagedToolRefresh(NOW);
+
+		expect(outcome.refreshed[0]).toMatchObject({ ok: true, changed: true });
+		expect(httpsHeadersFor("api.github.com").Authorization).toBeUndefined();
+	});
+
+	it("reports an actionable bounded diagnostic for anonymous GitHub rate limits", async () => {
+		installManagedBin("shfmt");
+		freshenAllExcept("shfmt", {
+			shfmt: { checkedAt: NOW - 8 * DAY_MS, resolutionId: "v3.7.0" },
+		});
+		spawnMock.mockResolvedValue({
+			stdout: "",
+			stderr: "not logged in",
+			status: 1,
+		});
+		routeGitHubRateLimit();
+
+		const outcome = await runManagedToolRefresh(NOW);
+
+		expect(outcome.refreshed[0]).toMatchObject({ ok: false, changed: false });
+		expect(logRows().join("\n")).toContain("rate limit exhausted");
+		expect(logRows().join("\n")).toContain("gh auth login");
+		expect(logRows().join("\n")).not.toContain("rate limit details");
+		expect(degradationCount()).toBe(1);
+	});
+
+	it("recognizes mixed-case rate-limit response headers", async () => {
+		installManagedBin("shfmt");
+		freshenAllExcept("shfmt", {
+			shfmt: { checkedAt: NOW - 8 * DAY_MS, resolutionId: "v3.7.0" },
+		});
+		spawnMock.mockResolvedValue({
+			stdout: "",
+			stderr: "not logged in",
+			status: 1,
+		});
+		routeGitHubFailure(403, { "X-RateLimit-Remaining": "0" });
+
+		const outcome = await runManagedToolRefresh(NOW);
+
+		expect(outcome.refreshed[0]).toMatchObject({ ok: false, changed: false });
+		expect(logRows().join("\n")).toContain("rate limit exhausted");
+		expect(githubRateLimitCount()).toBe(1);
+	});
+
+	it("recognizes an array-valued rate-limit response header", async () => {
+		installManagedBin("shfmt");
+		freshenAllExcept("shfmt", {
+			shfmt: { checkedAt: NOW - 8 * DAY_MS, resolutionId: "v3.7.0" },
+		});
+		spawnMock.mockResolvedValue({
+			stdout: "",
+			stderr: "not logged in",
+			status: 1,
+		});
+		routeGitHubFailure(403, { "x-ratelimit-remaining": ["0", "1"] });
+
+		const outcome = await runManagedToolRefresh(NOW);
+
+		expect(outcome.refreshed[0]).toMatchObject({ ok: false, changed: false });
+		expect(logRows().join("\n")).toContain("rate limit exhausted");
+		expect(githubRateLimitCount()).toBe(1);
+	});
+
+	it("does not classify an exhausted response as anonymous when Authorization is present", async () => {
+		const restoreEnv = withEnv({ GITHUB_TOKEN: "explicit-token" });
+		try {
+			routeGitHubFailure(403, { "X-Ratelimit-Remaining": "0" });
+			expect(await installTool("shfmt")).toBe(false);
+			expect(logRows().join("\n")).toContain(
+				"release fetch failed: GitHub API HTTP 403",
+			);
+			expect(githubRateLimitCount()).toBe(0);
+		} finally {
+			restoreEnv();
+		}
+	});
+
+	it("strips Authorization on a cross-host metadata redirect", async () => {
+		const restoreEnv = withEnv({ GITHUB_TOKEN: "explicit-token" });
+		let redirectedHeaders: Record<string, string> | undefined;
+		try {
+			httpsRoutes.push({
+				match: (url) => url.startsWith("https://api.github.com/"),
+				respond: () => ({
+					statusCode: 302,
+					headers: { location: "https://github.com/redirected-release" },
+				}),
+			});
+			httpsRoutes.push({
+				match: (url) => url === "https://github.com/redirected-release",
+				respond: (_url, headers) => {
+					redirectedHeaders = headers;
+					return {
+						statusCode: 200,
+						body: JSON.stringify({
+							tag_name: "v3.12.0",
+							assets: [
+								{
+									name: "shfmt_v3.12.0_linux_amd64",
+									browser_download_url:
+										"https://github.com/mvdan/sh/releases/download/v3.12.0/shfmt_v3.12.0_linux_amd64",
+								},
+							],
+						}),
+					};
+				},
+			});
+			httpsRoutes.push({
+				match: (url) => url.includes("github.com/mvdan/sh/releases/download"),
+				respond: () => ({ statusCode: 200, body: Buffer.from("fake-binary") }),
+			});
+
+			expect(await installTool("shfmt")).toBe(true);
+			expect(redirectedHeaders?.Authorization).toBeUndefined();
+		} finally {
+			restoreEnv();
+		}
+	});
+
+	it("keeps an anonymous unrelated GitHub 403 generic", async () => {
+		installManagedBin("shfmt");
+		freshenAllExcept("shfmt", {
+			shfmt: { checkedAt: NOW - 8 * DAY_MS, resolutionId: "v3.7.0" },
+		});
+		spawnMock.mockResolvedValue({
+			stdout: "",
+			stderr: "not logged in",
+			status: 1,
+		});
+		routeGitHubFailure();
+
+		const outcome = await runManagedToolRefresh(NOW);
+
+		expect(outcome.refreshed[0]).toMatchObject({ ok: false, changed: false });
+		expect(logRows().join("\n")).toContain(
+			"release query failed: GitHub API HTTP 403",
+		);
+		expect(githubRateLimitCount()).toBe(0);
+	});
+
+	it("keeps an authenticated exhausted GitHub 403 generic", async () => {
+		const restoreEnv = withEnv({ GITHUB_TOKEN: "explicit-token" });
+		try {
+			routeGitHubFailure(403, { "x-ratelimit-remaining": "0" });
+			expect(await installTool("shfmt")).toBe(false);
+			expect(logRows().join("\n")).toContain(
+				"release fetch failed: GitHub API HTTP 403",
+			);
+			expect(githubRateLimitCount()).toBe(0);
+		} finally {
+			restoreEnv();
+		}
+	});
+
 	it("re-resolves a stale release and installs the new tag", async () => {
 		installManagedBin("shfmt");
 		freshenAllExcept("shfmt", {

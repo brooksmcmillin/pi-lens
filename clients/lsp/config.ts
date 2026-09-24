@@ -404,13 +404,15 @@ export async function loadLSPConfig(
 	const resolution = resolvePiLensConfig({
 		cwd,
 		globalDir: getGlobalPiLensDir(),
-		// `homeDir` is threaded, not dropped: it is the `$HOME` this call resolves
-		// against, and the canonical global config is `$HOME/.pi-lens/config.json`
-		// whenever `PI_LENS_CONFIG_PATH` does not override it. Production behavior
-		// is unchanged (the default IS `os.homedir()`); what it buys is that the
-		// seam means the same `$HOME` on both sides of the resolution, so a test
-		// can exercise a relocated `PI_LENS_HOME` without reaching the real one.
-		globalConfigPath: getPiLensGlobalConfigPath(homeDir),
+		// The global tier reads the PRODUCTION resolution (global-config-location
+		// PR, refs #2457): which file supplies it is an env fact (PI_LENS_CONFIG_PATH,
+		// then a legacy default, then PI_CODING_AGENT_DIR, then the
+		// PI_LENS_HOME-relocated canonical default), not a property of the
+		// `$HOME` this call's project walk is ceiling-bounded by. `homeDir`
+		// stays threaded below for the walk and `globalDir`; a test redirecting
+		// the global tier does it through the env, the same way production is
+		// controlled.
+		globalConfigPath: getPiLensGlobalConfigPath(),
 		homeDir,
 		// The subsystem comes from the failing DOCUMENT, not from this loader
 		// (#2445). This resolution opens `~/.pi-lens/config.json` and

@@ -58,7 +58,7 @@ describe("runWorkspaceDiagnostics pull-sweep content binding (#1104)", () => {
 		vi.resetModules();
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
-		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "wsd-pull-binding-"));
+		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-wsd-pull-binding-"));
 		fs.mkdirSync(path.join(tmp, ".pi-lens"));
 		process.env.PI_LENS_LSP_WORKSPACE_PULL = "1";
 	});

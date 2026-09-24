@@ -81,6 +81,7 @@ import { makeLspServiceDouble } from "../support/lsp-service-double.js";
 import {
 	assertNonEmptyScan,
 	listSourceFiles,
+	readWalkedFiles,
 	relativePosix,
 } from "../support/sweep-kit.js";
 
@@ -141,10 +142,12 @@ async function liveCounts(): Promise<Record<string, number>> {
 	});
 	assertNonEmptyScan("#2582 LSP service-double test walk", files.length, 200);
 	const counts: Record<string, number> = {};
-	for (const file of files) {
+	// readWalkedFiles: a path that vanished between the walk and the read is
+	// out of the population, not a finding (#3082).
+	for (const { file, source } of readWalkedFiles(files)) {
 		const rel = relativePosix(repoRoot, file);
 		if (NOT_SUBJECTS.has(rel)) continue;
-		const hits = await findHandRolledLspDoubles(fs.readFileSync(file, "utf8"));
+		const hits = await findHandRolledLspDoubles(source);
 		if (hits.length > 0) counts[rel] = hits.length;
 	}
 	return counts;

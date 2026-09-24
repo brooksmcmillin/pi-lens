@@ -177,7 +177,9 @@ const AMPLE_BUDGET = 512 * 1024 * 1024;
 
 describe("live review-graph in-memory bound (#2255)", () => {
 	beforeAll(() => {
-		fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), "memcap-fixture-"));
+		fixtureDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-memcap-fixture-"),
+		);
 		fs.mkdirSync(path.join(fixtureDir, "src"), { recursive: true });
 		for (let i = 0; i < FIXTURE_FILES; i += 1) {
 			fs.writeFileSync(
@@ -397,7 +399,7 @@ describe("live review-graph in-memory bound (#2255)", () => {
 	// objects a `cloneGraph` apart, so each ran its own centrality pass and retained
 	// its own trimmed copy — two budgets resident, not one.
 	it("retains ONE budget when both sites are fed by one build", async () => {
-		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "memcap-once-"));
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-memcap-once-"));
 		try {
 			const facts = new FactStore();
 			const files: string[] = [];
@@ -473,7 +475,7 @@ describe("live review-graph in-memory bound (#2255)", () => {
 	// a base put an over-budget repository on a full O(project) walk every turn,
 	// which is worse than the pre-bound behavior it replaced.
 	it("rebuilds incrementally from a cap-trimmed graph instead of walking again", async () => {
-		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "memcap-base-"));
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-memcap-base-"));
 		try {
 			const facts = new FactStore();
 			const a = path.join(dir, "a.ts");

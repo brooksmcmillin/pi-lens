@@ -397,9 +397,14 @@ describe("pi-lens-analyze turn-end mode", { retry: 2 }, () => {
 	// Absent server / slow pass / schema skew have different remedies, so the
 	// wire reason must reach the transcript.
 	it("names the reason a skip happened", async () => {
+		// #3255 H1: "nothing is listening" is now its OWN reason, split out of
+		// `ipc-error` the same way #1272 split schema skew out of it. After the
+		// case-fold narrowing this is also what an upgrade-stranded server looks
+		// like from a fresh hook, so the remedy line has to name the restart.
 		const noServer = await runBin(["--turn-end", `--cwd=${turnDir}`]);
-		expect(noServer.stdout).toContain("(ipc-error)");
-		expect(noServer.stdout).toMatch(/start the MCP server|build is stale/);
+		expect(noServer.stdout).toContain("(no-listener)");
+		expect(noServer.stdout).toMatch(/restart it|start the MCP server/);
+		expect(noServer.stdout).toContain("upgraded");
 
 		// A server that answers with the WRONG schema version: warm, reachable,
 		// and still unusable — the pre-fix message called this an absent server.
@@ -421,7 +426,10 @@ describe("pi-lens-analyze turn-end mode", { retry: 2 }, () => {
 		const afterSkip = readTurnEndStatus(turnDir);
 		expect(afterSkip?.skipped).toBe(1);
 		expect(afterSkip?.ran).toBe(0);
-		expect(afterSkip?.lastSkipReason).toBe("ipc-error");
+		// #3255 H1: this field IS the `pilens_health` surface for a hook-process
+		// skip (rendered as "last skip: …"), so the discriminating reason has to
+		// land here and not just on stdout.
+		expect(afterSkip?.lastSkipReason).toBe("no-listener");
 		expect(afterSkip?.lastSkipAt).toBeTypeOf("string");
 
 		stub = await startTurnEndStub(turnDir, {

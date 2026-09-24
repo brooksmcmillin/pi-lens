@@ -424,7 +424,7 @@ describe("LSP Client Integration — nested capability gates (#1971)", () => {
 
 	it("honors complete file-operation filters on the protocol wire", async () => {
 		const tempRoot = fs.mkdtempSync(
-			path.join(os.tmpdir(), "pi-lsp-rename-filter-"),
+			path.join(os.tmpdir(), "pi-lens-pi-lsp-rename-filter-"),
 		);
 		const oldFile = path.join(tempRoot, "OLD.TS");
 		const newFile = path.join(tempRoot, "NEW.TS");

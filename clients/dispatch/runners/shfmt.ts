@@ -1,6 +1,5 @@
-import * as fs from "node:fs";
-import * as path from "node:path";
 import { safeSpawnAsync } from "../../safe-spawn.js";
+import { findNearestContaining } from "../../path-utils.js";
 import { resolveRunnerCwd } from "../../tool-cwd.js";
 import { PRIORITY } from "../priorities.js";
 import type {
@@ -21,14 +20,7 @@ const shfmt = createAvailabilityChecker("shfmt", ".exe");
 // reports genuine parse errors instead of nagging every unformatted shell file
 // against shfmt's built-in defaults (#211).
 function hasEditorConfig(cwd: string): boolean {
-	let current = path.resolve(cwd);
-	while (true) {
-		if (fs.existsSync(path.join(current, ".editorconfig"))) return true;
-		const parent = path.dirname(current);
-		if (parent === current) break;
-		current = parent;
-	}
-	return false;
+	return findNearestContaining(cwd, [".editorconfig"]) !== undefined;
 }
 
 /**

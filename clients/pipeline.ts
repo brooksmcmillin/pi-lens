@@ -53,6 +53,7 @@ import {
 } from "./dispatch/runners/utils/runner-helpers.js";
 import { findDetektConfig } from "./dispatch/runners/detekt.js";
 import type { Diagnostic, PiAgentAPI } from "./dispatch/types.js";
+import { formatDiagnostics } from "./dispatch/utils/format-utils.js";
 import { detectFileKind, getFileKindLabel } from "./file-kinds.js";
 import {
 	detectFileChangedAfterCommand,
@@ -82,7 +83,10 @@ import { bounded } from "./deadline-utils.js";
 import { HOOK_WALL_BUDGET_MS } from "./hook-budgets.js";
 import type { LedgerHookKey } from "./hook-budgets.js";
 import { enabledAuxiliaryLspServerIds } from "./dispatch/auxiliary-lsp.js";
-import { recordDegradationOnce } from "./degradation-ledger.js";
+import {
+	incrementDegradationCount,
+	recordDegradationOnce,
+} from "./degradation-ledger.js";
 import { establishToolAgreement } from "./tool-agreement.js";
 import { dropFindingsForMissingPaths } from "./advisory-provenance.js";
 import {
@@ -123,10 +127,6 @@ function lspSyncBudgetMs(): number {
 
 type FileSnapshot = Map<string, { mtimeMs: number; size: number }>;
 
-// Scan one directory's entries into `snapshot`, pushing walkable subdirs onto
-// `stack`. Extracted from the walk loop to keep each function's cognitive
-// complexity low. Excluded/ignored dirs are not descended; ignored/vanished
-// files are skipped.
 // Files stat'd between event-loop yields. The walk stays on the tool_result
 // hot path; yielding every N keeps its longest synchronous stretch well under
 // the <50ms hook-burst budget even at the AUTOFIX_CHANGED_FILE_SCAN_LIMIT cap.
@@ -264,6 +264,12 @@ export interface PipelineContext {
 	toolName: string;
 	/** Receipt-time decision; never infer this after debounce coalescing. */
 	autofixMode?: "immediate" | "deferred";
+	/**
+	 * Whether this producer explicitly owns the bytes as an agent-authored
+	 * mutation. Opaque observation is still analyzed, but it cannot authorize
+	 * pi-lens writers or edit-directed finding delivery (#3226).
+	 */
+	allowAutonomousWriters?: boolean;
 	modifiedRanges?: { start: number; end: number }[];
 	telemetry?: {
 		model: string;
@@ -362,6 +368,17 @@ export interface PipelineResult {
 	 * e.g. a whole-file secret finding).
 	 */
 	inlineBlockerLines?: number[];
+	/**
+	 * #3246: the blocking diagnostics `inlineBlockerSummary` was rendered from,
+	 * carried structurally so a LATER `lens_diagnostic_mark` can be applied to
+	 * the record at turn end. Without them the turn-end replay had only the
+	 * rendered string and no diagnostic identity to anchor a disposition
+	 * against, so a marked finding re-surfaced on every subsequent turn
+	 * (`clients/inline-blocker-dispositions.ts`). Deliberately the SAME array
+	 * `blockerOutput` was rendered from — cross-file blockers included — so the
+	 * re-render of an unmarked record is byte-identical to the stored summary.
+	 */
+	inlineBlockerDiagnostics?: Diagnostic[];
 	/** Content baseline captured from the pipeline read used to render blockers. */
 	inlineBlockerFileContent?: { size: number; sha256: string };
 	/** Fixable warning diagnostics introduced by this pipeline run. */
@@ -1372,6 +1389,14 @@ function buildEnrichedBlockerOutput(
 	blockers: Diagnostic[],
 	fileContent = "",
 ): string {
+	// #3188: no blockers, no banner. The delivery gate above can retract every
+	// blocker (all cited files deleted), and the header interpolates the count,
+	// so without this the agent reads "🔴 STOP — 0 issue(s) must be fixed:" with
+	// nothing under it. Same guard, same reason, as `formatDiagnostics` in
+	// dispatch/utils/format-utils.ts — it belongs to the renderer, not to each
+	// call site, because the #2028 branch below cannot gate on the count without
+	// falling through to the UNGATED raw output.
+	if (blockers.length === 0) return "";
 	// Empty fileContent (readback failed, e.g. deleted-file race) still
 	// renders the gated blocker list - just without per-line snippets.
 	const fileLines = fileContent ? fileContent.split("\n") : [];
@@ -1408,6 +1433,14 @@ export async function runPipeline(
 ): Promise<PipelineResult> {
 	const { filePath, cwd, toolName, getFlag, getFlagSource, dbg } = ctx;
 	const { getFormatService } = deps;
+	const allowAutonomousWriters = ctx.allowAutonomousWriters !== false;
+	if (!allowAutonomousWriters) {
+		incrementDegradationCount({
+			kind: "opaque-mutation-ownership-boundary",
+			subject: "pipeline",
+			reason: `observed mutation is not evidence of agent authorship (${filePath})`,
+		});
+	}
 	admitWidgetDiagnosticsWrite(filePath, ctx.telemetry?.writeIndex);
 
 	const phase = createPhaseTracker(toolName, filePath);
@@ -1434,8 +1467,16 @@ export async function runPipeline(
 	const autoformatDisabled = !!getFlag("no-autoformat", filePath);
 	const immediateFormat = !!getFlag("immediate-format");
 	const formatDeferred =
-		!autoformatDisabled && !immediateFormat && !!fileContent;
-	if (!autoformatDisabled && immediateFormat && fileContent) {
+		allowAutonomousWriters &&
+		!autoformatDisabled &&
+		!immediateFormat &&
+		!!fileContent;
+	if (
+		allowAutonomousWriters &&
+		!autoformatDisabled &&
+		immediateFormat &&
+		fileContent
+	) {
 		const formatResult = await runFormatPhase(
 			filePath,
 			getFormatService,
@@ -1463,6 +1504,8 @@ export async function runPipeline(
 		}
 	} else if (formatDeferred) {
 		dbg(`autoformat: deferred until agent_end for ${filePath}`);
+	} else if (!allowAutonomousWriters) {
+		dbg(`autoformat: skipped for ${filePath} (mutation ownership is unproven)`);
 	} else if (autoformatDisabled) {
 		const source = getFlagSource?.("no-autoformat", filePath);
 		dbg(
@@ -1483,7 +1526,10 @@ export async function runPipeline(
 	let autofixChangedFiles: string[] = [];
 	let fixRefresh = false;
 	let autofixSkipReason: string | undefined;
-	if (ctx.autofixMode === "deferred") {
+	if (!allowAutonomousWriters) {
+		autofixSkipReason = "mutation_ownership_unproven";
+		dbg(`autofix: skipped for ${filePath} (mutation ownership is unproven)`);
+	} else if (ctx.autofixMode === "deferred") {
 		autofixSkipReason = "deferred_to_agent_end";
 		dbg(`autofix: deferred until agent_end for ${filePath}`);
 	} else
@@ -1640,42 +1686,25 @@ export async function runPipeline(
 			});
 		}
 	}
-	const hasBlockers = dispatchResult.hasBlockers;
-	const actionableWarnings = dispatchResult.warnings
-		.map((diagnostic) => recordFromDispatchDiagnostic(diagnostic, cwd))
-		.filter((warning): warning is ActionableWarningRecord => Boolean(warning));
+	// Opaque recovery is a valid analysis input, but its bytes are not an agent
+	// authored surface. Keep diagnostics and advisory output visible while
+	// withholding the edit-directed channels that would tell the agent to mutate
+	// the observed artifact (#3226).
+	const hasBlockers = allowAutonomousWriters && dispatchResult.hasBlockers;
+	const actionableWarnings = allowAutonomousWriters
+		? dispatchResult.warnings
+				.map((diagnostic) => recordFromDispatchDiagnostic(diagnostic, cwd))
+				.filter((warning): warning is ActionableWarningRecord =>
+					Boolean(warning),
+				)
+		: [];
 	const codeQualityWarnings = dispatchResult.warnings
 		.map((diagnostic) => recordFromCodeQualityDiagnostic(diagnostic, cwd))
 		.filter((warning): warning is CodeQualityWarningRecord => Boolean(warning));
 
 	if (dispatchResult.diagnostics.length > 0) {
-		const logger = getDiagnosticLogger();
 		const tracker = getDiagnosticTracker();
 		tracker.trackShown(dispatchResult.diagnostics);
-		const toKey = (d: (typeof dispatchResult.diagnostics)[number]) =>
-			[
-				d.tool || "",
-				d.id || "",
-				d.rule || "",
-				d.filePath || "",
-				d.line || 0,
-				d.column || 0,
-			].join("|");
-		const inlineKeys = new Set(
-			[...dispatchResult.blockers, ...dispatchResult.fixed].map(toKey),
-		);
-		for (const d of dispatchResult.diagnostics) {
-			logger.logCaught(
-				d,
-				{
-					model: ctx.telemetry?.model ?? "unknown",
-					sessionId: ctx.telemetry?.sessionId ?? "unknown",
-					turnIndex: ctx.telemetry?.turnIndex ?? 0,
-					writeIndex: ctx.telemetry?.writeIndex ?? 0,
-				},
-				inlineKeys.has(toKey(d)),
-			);
-		}
 	}
 
 	if (fixedCount > 0) getDiagnosticTracker().trackAutoFixed(fixedCount);
@@ -1690,15 +1719,56 @@ export async function runPipeline(
 	// the deleted file's content), so it is dropped here rather than re-asserted.
 	// One bounded stat per unique cited path, only when blockers exist — zero
 	// cost on the clean/fast paths.
-	const deliverableBlockers = dispatchResult.hasBlockers
+	const deliverableBlockers = hasBlockers
 		? dropFindingsForMissingPaths({
 				store: "stop-blocker",
 				findings: dispatchResult.blockers,
 				cwd,
 				citedPath: (b) => b.filePath || undefined,
 			})
-		: dispatchResult.blockers;
-	if (dispatchResult.hasBlockers && fileContent) {
+		: [];
+	// #3190: ONE gate, applied once here, for EVERY surface. The durable record
+	// this function hands `runtime.recordInlineBlockers` (and through it the
+	// turn-end `Unresolved from this turn` re-serve) used to be built from the
+	// UNGATED `dispatchResult.blockerOutput`/`blockers`, so a blocker retracted
+	// from the tool result above was re-delivered at turn end — and the ungated
+	// verdict still latched the commit gate through `updateGitGuardStatus`. It is
+	// exactly `hasBlockers && nothing-survived-the-gate` inverted: the gate
+	// returns `[]` whenever `hasBlockers` is false, so this one expression is the
+	// whole condition.
+	const hasDeliverableBlockers = deliverableBlockers.length > 0;
+	if (dispatchResult.diagnostics.length > 0) {
+		const logger = getDiagnosticLogger();
+		const toKey = (d: (typeof dispatchResult.diagnostics)[number]) =>
+			[
+				d.tool || "",
+				d.id || "",
+				d.rule || "",
+				d.filePath || "",
+				d.line || 0,
+				d.column || 0,
+			].join("|");
+		const inlineKeys = new Set(
+			[...deliverableBlockers, ...dispatchResult.fixed].map(toKey),
+		);
+		for (const d of dispatchResult.diagnostics) {
+			logger.logCaught(
+				d,
+				{
+					model: ctx.telemetry?.model ?? "unknown",
+					sessionId: ctx.telemetry?.sessionId ?? "unknown",
+					turnIndex: ctx.telemetry?.turnIndex ?? 0,
+					writeIndex: ctx.telemetry?.writeIndex ?? 0,
+				},
+				inlineKeys.has(toKey(d)),
+			);
+		}
+	}
+	const deliveredOutput =
+		!allowAutonomousWriters && dispatchResult.hasBlockers
+			? dispatchResult.output.slice(dispatchResult.blockerOutput.length)
+			: dispatchResult.output;
+	if (hasBlockers && fileContent) {
 		// Enrich blocker output with a code snippet so the agent can see the
 		// exact line it wrote that caused each violation — no re-read needed.
 		if (deliverableBlockers.length > 0) {
@@ -1710,12 +1780,12 @@ export async function runPipeline(
 			dispatchResult.blockerOutput.length,
 		);
 		if (rest) output += rest;
-	} else if (dispatchResult.output) {
+	} else if (deliveredOutput) {
 		// #2028 review P3: this path fires when readback FAILED - raw output
 		// still cites possibly-deleted files. Re-render from the gated set
 		// (no snippets without fileContent) and keep the post-blocker slice.
 		if (
-			dispatchResult.hasBlockers &&
+			hasBlockers &&
 			deliverableBlockers.length !== dispatchResult.blockers.length
 		) {
 			let gatedOut = buildEnrichedBlockerOutput(deliverableBlockers);
@@ -1723,9 +1793,13 @@ export async function runPipeline(
 				dispatchResult.blockerOutput.length,
 			);
 			if (rest) gatedOut += rest;
-			output += `\n\n${gatedOut}`;
+			// #3188: every blocker retracted and nothing after the blocker
+			// section leaves nothing to say — appending the separator alone would
+			// still deliver a (whitespace-only) tool-result block, because
+			// `handleToolResult` decides delivery on `output` truthiness.
+			if (gatedOut) output += `\n\n${gatedOut}`;
 		} else {
-			output += `\n\n${dispatchResult.output}`;
+			output += `\n\n${deliveredOutput}`;
 		}
 	}
 	if (fixedCount > 0) {
@@ -1777,6 +1851,11 @@ export async function runPipeline(
 				dbg,
 				turnSeq: ctx.telemetry?.turnIndex,
 				writeSeq: ctx.telemetry?.writeIndex,
+				// #3157: `cwd` here is the LANGUAGE root. The cascade's display
+				// filter reads the disposition store and the `.pi-lens.json` rule
+				// policy, both written under the PROJECT root (#1030) — the same
+				// pair the dispatcher is handed above.
+				projectRoot: ctx.projectRoot,
 				seqState: ctx.seqState,
 				turnEndCascadeSettleStart: ctx.turnEndCascadeSettleStart,
 				fileContent,
@@ -1824,7 +1903,7 @@ export async function runPipeline(
 		turnIndex: ctx.telemetry?.turnIndex ?? 0,
 		writeIndex: ctx.telemetry?.writeIndex ?? 0,
 		diagnostics: dispatchResult.diagnostics,
-		blockers: dispatchResult.blockers,
+		blockers: hasBlockers ? dispatchResult.blockers : [],
 		warnings: dispatchResult.warnings,
 		fixed: dispatchResult.fixed,
 		resolvedCount: dispatchResult.resolvedCount,
@@ -1836,30 +1915,46 @@ export async function runPipeline(
 
 	return {
 		output,
-		hasBlockers,
+		// #3190: the verdict every consumer reads — `updateGitGuardStatus`'s commit
+		// latch above all — is what was DELIVERED, not what the dispatch found. The
+		// two disagreed whenever the deleted-path gate retracted every blocker: the
+		// tool result said `✓ clean` while the commit gate stayed latched, its
+		// summary falling back to that very all-clear line. `emitLensAnalysisComplete`
+		// above deliberately keeps the raw dispatch counts — it records what was
+		// observed, not what was served.
+		hasBlockers: hasDeliverableBlockers,
 		cascadePromise,
 		isError: false,
 		fileModified,
 		postWriteStateHash,
 		changedFiles,
-		inlineBlockerSummary: dispatchResult.hasBlockers
-			? dispatchResult.blockerOutput.trim() || undefined
+		// #3190: re-rendered from the GATED set with `formatDiagnostics(...,
+		// "blocking")` — the very expression `dispatcher.ts:1409` builds
+		// `blockerOutput` with, over a subset of the very array it rendered. When
+		// the gate drops nothing the two are byte-identical (same renderer, same
+		// array, same display cap), so an unretracted record is unchanged; when it
+		// drops something the stored text can no longer disagree with the tool
+		// result, and `inline-blocker-dispositions.ts`' re-render at turn end still
+		// matches this string exactly.
+		inlineBlockerSummary: hasDeliverableBlockers
+			? formatDiagnostics(deliverableBlockers, "blocking").trim() || undefined
 			: undefined,
 		// #1561 F1: taken from the very diagnostics `blockerOutput` was rendered
 		// from, so the provenance can never disagree with the text it guards. An
 		// untagged diagnostic contributes the literal "unknown", which no verdict
 		// claims coverage for — it pins the entry rather than silently widening
 		// what an LSP check is allowed to clear.
-		inlineBlockerSources: dispatchResult.hasBlockers
+		inlineBlockerSources: hasDeliverableBlockers
 			? [
 					...new Set(
-						dispatchResult.blockers.map((d) => d.tool?.trim() || "unknown"),
+						deliverableBlockers.map((d) => d.tool?.trim() || "unknown"),
 					),
 				]
 			: undefined,
-		inlineBlockerLines: dispatchResult.hasBlockers
-			? dispatchResult.blockers
-					// #1641 review F2: `dispatchResult.blockers` is NOT guaranteed to be
+		inlineBlockerLines: hasDeliverableBlockers
+			? deliverableBlockers
+					// #1641 review F2: the blocker array (#3190: the deliverable subset
+					// of `dispatchResult.blockers`) is NOT guaranteed to be
 					// scoped to THIS file — a chart-wide runner (helm-lint, helm-render)
 					// reports blocking diagnostics against other files in the chart
 					// (e.g. `values.yaml`) alongside `ctx.filePath`. The precedent every
@@ -1911,8 +2006,15 @@ export async function runPipeline(
 						source: "autofix",
 					}
 				: undefined,
-		inlineBlockerFileContent: dispatchResult.hasBlockers
+		inlineBlockerFileContent: hasBlockers
 			? inlineBlockerFileContent
+			: undefined,
+		// #3246: the very array `blockerOutput` above was rendered from, so the
+		// turn-end policy filter and its re-render can never disagree with the
+		// text they guard — the same provenance argument `inlineBlockerSources`
+		// makes one field up.
+		inlineBlockerDiagnostics: hasDeliverableBlockers
+			? deliverableBlockers
 			: undefined,
 	};
 }

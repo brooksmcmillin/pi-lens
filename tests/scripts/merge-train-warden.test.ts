@@ -3698,7 +3698,8 @@ describe("merge-lane sweep (#2185)", () => {
 		const request = calls.find(
 			(call) => call.method === "POST" && call.url.endsWith("/comments"),
 		);
-		expect(String((request?.body as { body: string }).body)).toContain(
+		expect(request).toBeDefined();
+		expect(String((request!.body as { body: string }).body)).toContain(
 			"attempt=1:generation=1",
 		);
 	});
@@ -4327,7 +4328,8 @@ describe("merge-lane sweep (#2185)", () => {
 		const comment = calls.find(
 			(c) => c.method === "POST" && c.url.endsWith("/issues/7/comments"),
 		);
-		expect(String((comment?.body as { body: string }).body)).toContain(
+		expect(comment).toBeDefined();
+		expect(String((comment!.body as { body: string }).body)).toContain(
 			"label stays on",
 		);
 	});

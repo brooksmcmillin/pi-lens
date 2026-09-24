@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import {
 	claimScratchDir,
 	SCRATCH_DIR_ROOT,
+	SWEEP_ANY_AGE,
 	sweepScratchDirs,
 } from "../../scripts/lib/scratch-dir.mjs";
 
@@ -100,10 +101,33 @@ export function validateScript(value: unknown, source = "script.json"): Script {
 	return value as Script;
 }
 
-function fixtureProject(scenario: string, root: string): string {
+/**
+ * Claim a scratch copy of a scenario's `project/` tree.
+ *
+ * `startRealPi` calls this for the per-child project it owns, which is the
+ * default and is unchanged: one child, one project, removed on close. A test
+ * that needs TWO LIVE `pi` children in ONE repository — the #2154 "second
+ * active session/worktree" case, whose whole point is that both sessions
+ * resolve the same project root and therefore the same `getProjectDataDir`
+ * slug — calls this itself and passes the directory back through
+ * `withRealPi({ project })`. The caller then owns the directory's lifetime
+ * (see `close()`): neither child may delete a tree the other is still
+ * scanning.
+ *
+ * Exported rather than duplicated: a second copy of the claim + seed + copy
+ * sequence inside a test file is the parallel-setup shape this harness exists
+ * to prevent, and `sweepScratchDirs` only recognises trees under this prefix.
+ */
+export function createRealPiProject(
+	scenario: string,
+	root: string = SCRATCH_DIR_ROOT,
+): string {
 	const dir = claimScratchDir(root, `real-pi-${scenario}-project`);
 	writeFileSync(path.join(dir, "guarded.ts"), "export const value = 1;\n");
 	writeFileSync(path.join(dir, "package.json"), '{"type":"module"}\n');
+	cpSync(path.join(fixtureRoot, scenario, "project"), dir, {
+		recursive: true,
+	});
 	return dir;
 }
 
@@ -113,14 +137,12 @@ function startRealPi(
 	homeOverride?: string,
 	args: readonly string[] = [],
 	env: Record<string, string> = {},
+	projectOverride?: string,
 ) {
 	const scratchRoot = homeOverride ?? SCRATCH_DIR_ROOT;
-	sweepScratchDirs(scratchRoot, "real-pi-", { maxAgeMs: 0 });
-	const project = fixtureProject(scenario, scratchRoot);
+	sweepScratchDirs(scratchRoot, "real-pi-", { maxAgeMs: SWEEP_ANY_AGE });
+	const project = projectOverride ?? createRealPiProject(scenario, scratchRoot);
 	const home = homeOverride ?? claimScratchDir(scratchRoot, "real-pi-home");
-	cpSync(path.join(fixtureRoot, scenario, "project"), project, {
-		recursive: true,
-	});
 	const providerLog = path.join(home, "provider.jsonl");
 	const child: ChildProcessWithoutNullStreams = spawn(
 		"pi",
@@ -255,7 +277,9 @@ function startRealPi(
 		async close() {
 			child.stdin.end();
 			child.kill("SIGKILL");
-			rmSync(project, { recursive: true, force: true });
+			// A caller-supplied project (and home) outlives this child by
+			// construction — a concurrent sibling session is still reading it.
+			if (!projectOverride) rmSync(project, { recursive: true, force: true });
 			if (!homeOverride) rmSync(home, { recursive: true, force: true });
 		},
 	};
@@ -268,6 +292,15 @@ export async function withRealPi<T>(
 		home?: string;
 		args?: readonly string[];
 		env?: Record<string, string>;
+		/**
+		 * Reuse an EXISTING project directory (from {@link createRealPiProject})
+		 * instead of claiming and seeding a fresh one. The caller owns it: it is
+		 * neither re-seeded from the fixture on entry nor removed on close, so a
+		 * second `withRealPi` can run against the same project root — and, with
+		 * `home`, the same `PI_LENS_HOME` — while the first child is still alive.
+		 * That pair is what makes two sessions share one repository (#2154 AC1).
+		 */
+		project?: string;
 	},
 	callback: (pi: RealPi) => Promise<T>,
 ): Promise<T> {
@@ -282,6 +315,7 @@ export async function withRealPi<T>(
 		options.home,
 		options.args,
 		options.env,
+		options.project,
 	);
 	try {
 		let cursor = harness.events.length;

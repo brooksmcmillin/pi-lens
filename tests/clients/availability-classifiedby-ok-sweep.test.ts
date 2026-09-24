@@ -132,4 +132,18 @@ describe("availability-classifiedby scanner self-test", () => {
 		const site = found.find((s) => s.line === 11);
 		expect(site).toMatchObject({ causeOk: false, hasClassifiedBy: false });
 	});
+
+	it("keeps the arg boundary quote-aware when a string carries a bare `)` (#3145 review round 2)", () => {
+		// Regression pin for the #3145 review finding: the `quoteAware` option
+		// on `matchingCloseIndex` looked dead by mutation (neutering it reds no
+		// existing test) until the reviewer probed a `note`-style string
+		// containing an unbalanced `)`. Without quote-awareness, that `)` reads
+		// as the call's OWN closing paren, truncating the argument text BEFORE
+		// `classifiedBy` — misreading a stamped call as unstamped.
+		const [site] = scanSource(
+			'logAvailabilityDecision({ tool: "x", verdict: "available", outcome: "success", cause: "ok", note: "manifest missing key)", classifiedBy: "probe" });',
+			"fixture.ts",
+		);
+		expect(site).toMatchObject({ causeOk: true, hasClassifiedBy: true });
+	});
 });

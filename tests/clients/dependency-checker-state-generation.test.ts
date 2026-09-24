@@ -57,7 +57,7 @@ describe("DependencyChecker shared-state generation guard (#766)", () => {
 
 	beforeEach(() => {
 		vi.resetAllMocks();
-		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pilens-madge-gen-"));
+		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-pilens-madge-gen-"));
 		findNodeToolBinary.mockResolvedValue("/fake/bin/madge");
 		ensureTool.mockResolvedValue(undefined);
 	});

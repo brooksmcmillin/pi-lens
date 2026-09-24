@@ -19,7 +19,7 @@ describe("#1549 workspace sweep per-server verdict", () => {
 	beforeEach(() => {
 		vi.resetModules();
 		getServersForFileWithConfig.mockReset();
-		root = fs.mkdtempSync(path.join(os.tmpdir(), "lsp-sweep-verdict-"));
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-sweep-verdict-"));
 	});
 
 	afterEach(() => removeTempDirSync(root));

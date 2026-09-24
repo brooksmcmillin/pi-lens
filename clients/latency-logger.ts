@@ -126,6 +126,12 @@ let recentPhases: Array<{ phase: string; ts: string }> = [];
  * zero-duration session-end summary of records already logged individually,
  * not new work of its own.
  *
+ * #3310: `lsp_empty_first_publish_held` is the same shape as the #1459
+ * scanner-coverage rows — a decision record written from inside a live
+ * `lsp_touch_file` wait whose `durationMs` is ANOTHER write's age (how long
+ * after `didOpen` the server's pre-index empty publish arrived), not its own
+ * work. The touch it fires inside owns any real stall.
+ *
  * #2044: `test_runner_failed_target_state` is a zero-duration decision after a
  * bounded filesystem probe. The surrounding turn-end test-selection phase owns
  * any real work, so this row must not replace it in stall attribution.
@@ -145,6 +151,7 @@ const LAST_PHASE_EXCLUDED = new Set([
 	"availability_decision",
 	"finding_dead_path_drop",
 	"finding_stale_line_demote",
+	"finding_path_stat_budget_exhausted",
 	"lsp_scanner_coverage_gap",
 	"lsp_notify_resync_deferred",
 	"lsp_notify_write_late_landed",
@@ -153,6 +160,7 @@ const LAST_PHASE_EXCLUDED = new Set([
 	"path_attribution_verified_rollup",
 	"concurrent_session_bind_rollup",
 	"auxiliary_readiness",
+	"lsp_empty_first_publish_held",
 ]);
 
 /**

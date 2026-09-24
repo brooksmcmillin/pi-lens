@@ -2,21 +2,30 @@
 /**
  * scripts/hooks/guard-bash.mjs (#2699, refs umbrella #2697)
  *
- * PreToolUse hook for the Bash tool. Mechanically enforces four
+ * PreToolUse hook for the Bash tool. Mechanically enforces six
  * non-negotiables that previously lived only as prose in CLAUDE.md and the
  * fixer/reviewer playbooks -- a fixer ran `git stash` on 2026-09-07 (the
- * #2686 lane) and two review probes wrote into the real `~/.pi-lens` on
- * 2026-09-02 (#2506), both rules a hook can catch that prose could not:
+ * #2686 lane), two review probes wrote into the real `~/.pi-lens` on
+ * 2026-09-02 (#2506), a fixer pointed TMPDIR at the vitest harness home
+ * on 2026-09-15 (#3026), and twice on 2026-09-16 a fixer ran
+ * `git worktree remove` on a tree whose `node_modules` was a symlink into
+ * the shared checkout, so git followed the link and emptied the shared
+ * install (#3173), all rules a hook can catch that prose could not:
  *
  *   - `git stash` in any form (CLAUDE.md non-negotiable)
  *   - `git reset --soft origin/<branch>` / `git reset --hard <anything>`
  *   - a HAND-typed `git worktree remove` with two force flags (the
  *     sanctioned removal is `node scripts/prune-agent-worktrees.mjs`,
  *     liveness-checked, or unlock + single force)
+ *   - ANY `git worktree remove` (force or not) on a worktree whose
+ *     `node_modules` is a symlink pointing OUTSIDE that worktree (#3173,
+ *     the #2704 class) -- see {@link hasNodeModulesSymlinkOutside}
  *   - an unpinned `node` probe that LOADS built runtime code from clients/
  *     or dist/ (not merely a payload that mentions "clients/" in passing --
  *     review round 2 F5) with no PI_LENS_HOME pin (AGENTS.md "Probe
  *     hygiene")
+ *   - `TMPDIR`/`TMP`/`TEMP` aimed at the vitest harness's own home
+ *     (AGENTS.md "Probe hygiene", #3026) -- see {@link classifyTempDirVars}
  *
  * ## Contract source
  *
@@ -123,10 +132,18 @@
  * and allows. (Round 2 capped nesting at depth 8, which silently ALLOWED
  * anything nested deeper; the cap is deleted rather than raised.)
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, readlinkSync, readSync, writeSync } from "node:fs";
+import {
+	dirname,
+	isAbsolute,
+	join,
+	relative,
+	resolve,
+	sep as SEP,
+} from "node:path";
 import { fileURLToPath } from "node:url";
 
-/** @typedef {"stash"|"reset"|"worktreeForce"|"probe"} DenyRule */
+/** @typedef {"stash"|"reset"|"worktreeForce"|"worktreeSymlink"|"probe"|"tmpdirCollision"} DenyRule */
 
 /** @type {Record<DenyRule, string>} */
 export const RULE_MESSAGES = {
@@ -136,8 +153,12 @@ export const RULE_MESSAGES = {
 		"`git reset --soft origin/<branch>` / `git reset --hard` is forbidden (fixer playbook rule) -- use `git checkout HEAD -- <path>` to discard a single file instead.",
 	worktreeForce:
 		"a HAND-typed `git worktree remove` with two force flags is forbidden (fixer playbook rule) -- use `node scripts/prune-agent-worktrees.mjs` (liveness-checked; it applies the same double force internally once a tree is confirmed dead) for a stuck worktree, or `git worktree unlock` then a single-force remove.",
+	worktreeSymlink:
+		"git worktree remove on a tree whose node_modules is a symlink into another checkout is forbidden (#3173, the #2704 class -- git follows the link and empties the SHARED install, not just this worktree's copy) -- unlink it first: `rm <tree>/node_modules` (removes only the symlink, not the shared install), then retry the remove.",
 	probe:
 		"an unpinned node probe that LOADS runtime code from clients/ or dist/ is forbidden (AGENTS.md Probe hygiene) -- prefix `PI_LENS_HOME=<worktree>/.probe-home`.",
+	tmpdirCollision:
+		"TMPDIR/TMP/TEMP must not point at the vitest harness home (AGENTS.md Probe hygiene) -- tests/support/vitest-setup.ts keeps the real TMPDIR on purpose and mkdtemps PI_LENS_HOME under os.tmpdir(), so a TMPDIR inside `.probe-home` moves the harness home into a git-ignored directory in the worktree and reds unrelated suites (#3026). Pin PI_LENS_HOME/PILENS_DATA_DIR there; give TMPDIR its own directory.",
 };
 
 /**
@@ -699,16 +720,96 @@ export function stripEnvAssignments(words) {
 const GIT_TWO_TOKEN_FLAGS = new Set(["-C", "-c"]);
 
 /**
+ * Does `dir` look like a git WORKTREE checkout -- checked the same way git
+ * itself tells a linked worktree apart from the main repository: only a
+ * linked worktree's top-level `.git` is a FILE whose content starts with
+ * `gitdir:` (the main checkout's `.git` is a directory; an ordinary
+ * directory that happens to share a name has no `.git` at all). Never
+ * throws: a missing `.git`, or `readFileSync` on it failing for ANY reason
+ * -- ENOENT, or EISDIR (reading a directory as a file, exactly what the
+ * MAIN checkout's own `.git` is) -- both land in the one catch below, so
+ * it is simply "not a worktree" -- acceptance #3, a path that is not a
+ * worktree is left to git, never a false deny. A separate `lstatSync`
+ * "is this a file?" pre-check was tried and DELETED: `readFileSync`
+ * already throws EISDIR for exactly the directory case that pre-check
+ * existed to catch (measured directly: `fs.readFileSync` on a real
+ * directory throws `EISDIR`), so the pre-check never changed the verdict
+ * and mutating it out left every test in this file green.
+ *
+ * @param {string} dir
+ * @returns {boolean}
+ */
+function looksLikeGitWorktree(dir) {
+	try {
+		return readFileSync(join(dir, ".git"), "utf8")
+			.trimStart()
+			.startsWith("gitdir:");
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Does `worktreeDir` contain a `node_modules` entry that is a SYMLINK whose
+ * target resolves OUTSIDE `worktreeDir` -- the #3173 hazard (twice on
+ * 2026-09-16, the #2704 class): the fixer playbook's own speed convention
+ * (`ln -s <main checkout>/node_modules node_modules`) means a plain
+ * `git worktree remove` on that tree makes git follow the link and empty
+ * the SHARED install it points at, not just this worktree's own copy. A
+ * real `node_modules` DIRECTORY, a missing entry, and a symlink that stays
+ * INSIDE the worktree are all fine and return false -- deliberately
+ * narrower than "any symlink", since only an OUTSIDE target can empty
+ * something other than this worktree.
+ *
+ * `readlinkSync` alone decides "is this even a symlink" -- no separate
+ * `lstatSync` type check, the same deletion as {@link looksLikeGitWorktree}'s:
+ * measured directly, `readlinkSync` throws ENOENT for a missing entry and
+ * EINVAL for a REAL directory or file, both caught below, so a pre-check
+ * never changed the verdict and mutating it out left every test green. Its
+ * raw link text (not `realpathSync`'s resolved target), so a dangling
+ * symlink (target does not exist) is still classified correctly instead of
+ * throwing ENOENT on the target.
+ *
+ * @param {string} worktreeDir
+ * @returns {boolean}
+ */
+function hasNodeModulesSymlinkOutside(worktreeDir) {
+	const nodeModulesPath = join(worktreeDir, "node_modules");
+	let target;
+	try {
+		target = readlinkSync(nodeModulesPath);
+	} catch {
+		return false;
+	}
+	const resolvedTarget = resolve(dirname(nodeModulesPath), target);
+	const rel = relative(worktreeDir, resolvedTarget);
+	return rel === ".." || rel.startsWith(`..${SEP}`) || isAbsolute(rel);
+}
+
+/**
  * Classify a `git` invocation's args (after the leading "git" word).
  * Walks past global options (`-C <dir>` and `-c <key>=<value>` are treated
  * as taking a separate value; every other `-x`/`--x` global option is
  * assumed to take none, which is all #2699's deny/allow strings need) to
  * find the subcommand.
  *
+ * `cwd` (the PreToolUse payload's own `cwd`, threaded down from
+ * {@link classifyPayload}) resolves a RELATIVE `git worktree remove <path>`
+ * argument the same way git itself would, for the {@link
+ * hasNodeModulesSymlinkOutside} check -- an absolute argument is used as
+ * given. NOT handled (documented, not fixed, matching this file's other
+ * blind spots): a leading `-C <dir>` global option changes git's own
+ * working directory, which would change what a relative worktree argument
+ * resolves against; this scan does not track it, so a `-C`-relative
+ * worktree path resolves against the PAYLOAD cwd instead -- proportionate,
+ * since every fixer/orchestrator convention in this repo names the
+ * worktree by its absolute path.
+ *
  * @param {string[]} args
+ * @param {string} [cwd]
  * @returns {DenyRule | null}
  */
-function classifyGit(args) {
+function classifyGit(args, cwd) {
 	let i = 0;
 	while (i < args.length) {
 		if (GIT_TWO_TOKEN_FLAGS.has(args[i])) {
@@ -733,11 +834,24 @@ function classifyGit(args) {
 	if (subcommand === "worktree" && args[i + 1] === "remove") {
 		const rest = args.slice(i + 2);
 		let forceCount = 0;
+		const positionals = [];
 		for (const a of rest) {
 			if (a === "-f" || a === "--force") forceCount++;
 			else if (/^-f{2,}$/.test(a)) forceCount += a.length - 1;
+			else if (!a.startsWith("-")) positionals.push(a);
 		}
 		if (forceCount >= 2) return "worktreeForce";
+		const worktreeArg = positionals[0];
+		if (worktreeArg) {
+			const worktreeDir = isAbsolute(worktreeArg)
+				? worktreeArg
+				: resolve(cwd ?? process.cwd(), worktreeArg);
+			if (
+				looksLikeGitWorktree(worktreeDir) &&
+				hasNodeModulesSymlinkOutside(worktreeDir)
+			)
+				return "worktreeSymlink";
+		}
 		return null;
 	}
 	return null;
@@ -821,6 +935,68 @@ function classifyNode(args, env, rawSegment) {
 }
 
 /**
+ * The environment variables Node's `os.tmpdir()` consults. MEASURED, not
+ * assumed -- one child process per variable on node v22.22.1 (this repo's
+ * runtime), Linux: `TMPDIR=/a` -> `/a`, `TMP=/b` -> `/b`, `TEMP=/c` ->
+ * `/c`, all three set -> `/a`, none -> `/tmp`. All three reach the harness,
+ * so the guard covers all three rather than only the one the incident used.
+ */
+const TEMP_DIR_VARS = ["TMPDIR", "TMP", "TEMP"];
+
+/**
+ * The directory name AGENTS.md "Probe hygiene" prescribes for a pinned
+ * `PI_LENS_HOME` (and the {@link RULE_MESSAGES}.probe message hands out).
+ */
+const HARNESS_HOME_SEGMENT = ".probe-home";
+
+/** `$PI_LENS_HOME` / `${PI_LENS_HOME}` -- the same directory under its
+ *  variable spelling, which is what an agent reaches for right after
+ *  reading the `probe` rule's message. The name boundary matters: without
+ *  it `$PI_LENS_HOME_TMP` and `$PI_LENS_HOMEDIR/x` -- different variables,
+ *  naming different directories -- were both denied (review round 2 T3). */
+const HARNESS_HOME_VARIABLE =
+	/\$\{PI_LENS_HOME\}|\$PI_LENS_HOME(?![A-Za-z0-9_])/;
+
+/**
+ * Deny a `TMPDIR`/`TMP`/`TEMP` assignment that aims Node's temp directory
+ * at the vitest harness's own `PI_LENS_HOME` (#3026, 2026-09-15).
+ *
+ * `tests/support/vitest-setup.ts` deliberately keeps the REAL `TMPDIR` and
+ * mkdtemps the per-worker `PI_LENS_HOME` under `os.tmpdir()`. Point
+ * `TMPDIR` at `<worktree>/.probe-home` and that home lands inside the
+ * checkout, in a directory `.gitignore` ignores -- so every suite whose
+ * fixtures live under `os.tmpdir()` is suddenly reading ignored paths. The
+ * #3026 fixer did exactly that and reported "16 suites red on
+ * origin/master"; the tree was green. Measured again on this branch:
+ * `tests/clients/ext-gate-before-ignore.test.ts` is 8/8 green with TMPDIR
+ * elsewhere and 7 failed / 1 passed with `TMPDIR=$PWD/.probe-home`, same
+ * build, same tree.
+ *
+ * Matching is by path SEGMENT ({@link fileArgUnderDir}), never substring,
+ * so `$PWD/.probe-home`, `/abs/.probe-home` and `.probe-home/sub` all
+ * match while `.probe-home-2` does not.
+ *
+ * Known limit (review round 2): the offending path has to appear in the
+ * assignment's own text. A third variable hides it --
+ * `export PROBE_HOME=$PWD/.probe-home; export TMPDIR=$PROBE_HOME` allows,
+ * because resolving it would mean evaluating the shell's variable
+ * environment, which this static scan does not do (the same class as the
+ * header's "command word assembled by expansion" blind spot).
+ *
+ * @param {Record<string, string>} env
+ * @returns {DenyRule | null}
+ */
+function classifyTempDirVars(env) {
+	for (const name of TEMP_DIR_VARS) {
+		const value = env[name];
+		if (value === undefined) continue;
+		if (fileArgUnderDir(value, HARNESS_HOME_SEGMENT)) return "tmpdirCollision";
+		if (HARNESS_HOME_VARIABLE.test(value)) return "tmpdirCollision";
+	}
+	return null;
+}
+
+/**
  * Words that just mean "run the following command", stripped before the
  * command word is identified. `command`/`exec`/`env` came from review
  * round 2 F7; `sudo`/`time` from round 3's V5 (both confirmed against real
@@ -875,9 +1051,10 @@ function commandBasename(cmd) {
  *
  * @param {string} rawSegment
  * @param {Record<string, string>} sharedEnv
+ * @param {string} [cwd] the PreToolUse payload's own cwd, for {@link classifyGit}'s worktree-path resolution
  * @returns {DenyRule | null}
  */
-export function classifySegment(rawSegment, sharedEnv = {}) {
+export function classifySegment(rawSegment, sharedEnv = {}, cwd) {
 	const rawWords = splitWords(rawSegment);
 	if (rawWords.length === 0) return null;
 	const words = stripCommandGroupAndRunnerPrefixes(rawWords);
@@ -885,9 +1062,15 @@ export function classifySegment(rawSegment, sharedEnv = {}) {
 	if (words[0] === "export") {
 		const { env: exported } = stripEnvAssignments(words.slice(1));
 		Object.assign(sharedEnv, exported);
-		return null;
+		return classifyTempDirVars(exported);
 	}
 	const { env: segmentEnv, rest } = stripEnvAssignments(words);
+	// Before the command dispatch: the #3026 incident's own command was
+	// `TMPDIR=$PWD/.probe-home npx vitest run …`, and `npx` is a command this
+	// guard classifies as nothing at all. The assignment is the offence, so
+	// it is judged where it is written, whatever follows it.
+	const tempDirCollision = classifyTempDirVars(segmentEnv);
+	if (tempDirCollision) return tempDirCollision;
 	if (rest.length === 0) {
 		// A standalone (non-exported) `VAR=val` with no command -- lenient:
 		// persist it too (real bash would keep it a local shell variable, not
@@ -899,7 +1082,7 @@ export function classifySegment(rawSegment, sharedEnv = {}) {
 	const effectiveEnv = { ...sharedEnv, ...segmentEnv };
 	const cmd = commandBasename(rest[0]);
 	const args = rest.slice(1);
-	if (cmd === "git") return classifyGit(args);
+	if (cmd === "git") return classifyGit(args, cwd);
 	if (cmd === "node" || cmd === "nodejs")
 		return classifyNode(args, effectiveEnv, rawSegment);
 	return null;
@@ -915,16 +1098,17 @@ export function classifySegment(rawSegment, sharedEnv = {}) {
  * `$( )`/backtick span (#2699 review round 2 F2).
  *
  * @param {string} commandText
+ * @param {string} [cwd] the PreToolUse payload's own cwd, threaded to every segment
  * @returns {DenyRule | null}
  */
-export function findDeny(commandText) {
+export function findDeny(commandText, cwd) {
 	const regions = scannableRegions(commandText);
 	/** @type {Record<string, string>} */
 	const sharedEnv = {};
 	for (let index = 0; index < regions.length; index++) {
 		const env = index === 0 ? sharedEnv : { ...sharedEnv };
 		for (const segment of splitSegments(regions[index])) {
-			const rule = classifySegment(segment, env);
+			const rule = classifySegment(segment, env, cwd);
 			if (rule) return rule;
 		}
 	}
@@ -944,31 +1128,117 @@ export function findDeny(commandText) {
  */
 export function classifyPayload(payload) {
 	if (!payload || typeof payload !== "object") return null;
-	const p = /** @type {{ tool_name?: unknown; tool_input?: unknown }} */ (
-		payload
-	);
+	const p =
+		/** @type {{ tool_name?: unknown; tool_input?: unknown; cwd?: unknown }} */ (
+			payload
+		);
 	if (p.tool_name !== "Bash") return null;
 	const toolInput = p.tool_input;
 	if (!toolInput || typeof toolInput !== "object") return null;
 	const command = /** @type {{ command?: unknown }} */ (toolInput).command;
 	if (typeof command !== "string" || !command.trim()) return null;
-	return findDeny(command);
+	const cwd = typeof p.cwd === "string" ? p.cwd : undefined;
+	return findDeny(command, cwd);
+}
+
+// #3089: nothing in the stdlib waits for fd 0 to become readable
+// synchronously, and a bare retry loop would spin a core while the payload
+// is still arriving. `Atomics.wait` is the one sleep that yields the CPU --
+// same mechanism scripts/with-memory-watch.mjs uses for its own EAGAIN
+// retry on the write side.
+const READ_RETRY_SLEEP_MS = 5;
+const readRetryPark = new Int32Array(new SharedArrayBuffer(4));
+
+// #3089 review round 2 F3: the three ALLOW-BY-FAILURE paths in run() below
+// (empty-or-unparseable raw text, a JSON.parse failure, and this function's
+// own crash guard) used to exit 0 with empty stderr -- indistinguishable
+// from a genuine "nothing to check" allow, which is exactly why the
+// original readFileSync(0) short read was invisible for a release cycle.
+// This note fires on the two paths that saw SOME input and failed to make
+// sense of it; a genuinely empty stream (nothing ever arrived, no error) is
+// still silent -- that is the ordinary "hook invoked with no payload" case,
+// not a failure. Used ONLY on the JSON.parse failure path -- the payload
+// genuinely could not be parsed there. The crash guard (any other throw,
+// including a classifier crash on a payload that WAS read and parsed fine)
+// gets its own cause-bearing message instead (#3089 review round 3 N1):
+// labeling a classifier crash "unreadable or unparseable" is a wrong label
+// on the most important fail-open this hook has -- worse than the silence
+// it replaced, because it actively misdescribes what happened.
+const UNREADABLE_PAYLOAD_NOTE =
+	"guard-bash: payload unreadable or unparseable; allowing\n";
+
+// #3089 review round 3 N2: a closed or read-only stderr fd (EBADF, EPIPE,
+// ...) must never turn an intended exit-0 allow into an uncaught-exception
+// exit 1. `process.stderr.write` is the wrong primitive to guard here --
+// verified directly: it goes through Node's Writable stream machinery,
+// which never throws synchronously for an I/O failure (it reports one via
+// an async `'error'` event instead), so `try { process.stderr.write(text)
+// } catch {}` alone still crashed with exit 1 in the read-only-fd
+// reproduction below. `fs.writeSync(2, text)` bypasses that machinery and
+// writes the fd directly -- confirmed to throw EBADF SYNCHRONOUSLY for the
+// same read-only fd, which a try/catch can actually catch. Every stderr
+// write in this file's hook path goes through this helper so a broken
+// stderr can never be the thing that blocks (or crashes) the tool -- the
+// same "must never throw" promise the file's header already makes for a
+// classification crash.
+function note(text) {
+	try {
+		writeSync(2, text);
+	} catch {
+		// The record is lost, but losing a record must never cost the exit
+		// code that record was trying to explain.
+	}
 }
 
 /**
- * Read stdin synchronously. Never blocks on an interactive terminal and
- * never throws -- any read failure is "no payload", which {@link run}
- * treats as allow.
+ * Read stdin synchronously, draining fd 0 to EOF. Never blocks on an
+ * interactive terminal. Returns "" for a genuine empty stream (a read that
+ * cleanly hits EOF on the first call, no bytes ever seen); THROWS a
+ * genuine, non-retryable read error (EBADF, a closed fd, ...) instead of
+ * swallowing it, so {@link run}'s own crash guard can tell "nothing to
+ * read" apart from "reading failed" and note the latter (review round 2
+ * F3) while keeping the never-throws contract at the run() boundary.
+ *
+ * #3089: `readFileSync(0, "utf8")` fails open on a payload larger than a
+ * pipe buffer. Node's spawnSync sets the child's stdin pipe to
+ * non-blocking once the parent starts pumping its own synchronous event
+ * loop to feed `input`; a `read(2)` issued before the next chunk has
+ * landed then returns EAGAIN, `readFileSync` does not retry, and the
+ * thrown error was swallowed by this function's own catch-all, returning
+ * "" for a payload that was still arriving. Measured on this host,
+ * reproducible from ~500 KB: `spawnSync(HOOK, { input })` for a
+ * >=1 MB PreToolUse JSON payload throws
+ * `EAGAIN: resource temporarily unavailable, read` out of
+ * `readFileSync(0, "utf8")`, and the hook exits 0 instead of denying. A
+ * `read(2)` loop that retries EAGAIN (this function) and keeps
+ * accumulating chunks until a read returns 0 -- true EOF, not "nothing
+ * available yet" -- closes that gap regardless of how many chunks the
+ * payload arrives in or how far apart in time they land.
  *
  * @returns {string}
  */
 function readStdin() {
 	if (process.stdin.isTTY) return "";
-	try {
-		return readFileSync(0, "utf8");
-	} catch {
-		return "";
+	const chunks = [];
+	const chunk = Buffer.alloc(65536);
+	for (;;) {
+		let bytesRead;
+		try {
+			bytesRead = readSync(0, chunk, 0, chunk.length, null);
+		} catch (error) {
+			if (error?.code === "EAGAIN") {
+				Atomics.wait(readRetryPark, 0, 0, READ_RETRY_SLEEP_MS);
+				continue;
+			}
+			// A read error that is not "try again" (EBADF, a closed fd, ...)
+			// propagates to run()'s crash guard, which notes it and still
+			// exits 0 -- never throws past that boundary.
+			throw error;
+		}
+		if (bytesRead === 0) break; // true EOF: the writer closed its end.
+		chunks.push(Buffer.from(chunk.subarray(0, bytesRead)));
 	}
+	return Buffer.concat(chunks).toString("utf8");
 }
 
 /**
@@ -983,14 +1253,28 @@ export function run() {
 		try {
 			payload = JSON.parse(raw);
 		} catch {
+			note(UNREADABLE_PAYLOAD_NOTE);
 			return 0;
 		}
 		const rule = classifyPayload(payload);
 		if (!rule) return 0;
-		process.stderr.write(`${RULE_MESSAGES[rule]}\n`);
+		note(`${RULE_MESSAGES[rule]}\n`);
 		return 2;
-	} catch {
-		// A crash in this hook must never be the thing that blocks the tool.
+	} catch (error) {
+		// A crash in this hook -- a genuine readStdin() read error (EBADF, a
+		// closed fd, ...) OR a classifier crash on a payload that WAS read
+		// and parsed fine (the #2699 r3 depth-5000 nesting case throws
+		// RangeError here, not in readStdin or JSON.parse) -- must never be
+		// the thing that blocks the tool, but it also must not be silently
+		// indistinguishable from an ordinary allow (#3089 review round 2
+		// F3), and it must not claim the payload was "unreadable or
+		// unparseable" when it demonstrably was read and parsed (#3089
+		// review round 3 N1) -- error.code (a read error) or error.name (a
+		// RangeError, or anything else classification can throw) names the
+		// actual cause instead.
+		note(
+			`guard-bash: ${error?.code ?? error?.name ?? "error"} while checking payload; allowing\n`,
+		);
 		return 0;
 	}
 }

@@ -1,6 +1,25 @@
 // Prevents the install-smoke regression from run 34880209347: pnpm 11.15.1
 // reads the checkout's `packageManager: npm@...` when global-bin setup is
 // project-scoped, so the pnpm global install coverage fails before pi starts.
+//
+// #3043: and prevents run 35013232780's regression, which THIS file (as
+// written by #3033) could not see, because it asserted the broken command's
+// literal text. pnpm 11 resolves the global bin directory as
+// `globalBinDir ?? path.join(pnpmHomeDir, "bin")` with `pnpmHomeDir` =
+// $PNPM_HOME (pnpm/config/reader's checkGlobalBinDir, verified against
+// pnpm 11.15.1 and 11.21.0 -- the two versions this workflow installs), and
+// refuses EVERY `--global` command whose resolved bin dir is not already on
+// PATH:
+//
+//   + export PATH=/home/runner/.pnpm-global:...
+//   + pnpm config set --global global-bin-dir /home/runner/.pnpm-global
+//   [ERROR] The configured global bin directory
+//           "/home/runner/.pnpm-global/bin" is not in PATH
+//
+// So the contract below is not "this literal command appears" but "every
+// place the step names the pnpm global bin directory names the SAME directory
+// pnpm resolves" -- $PNPM_HOME/bin, in the PATH export, in the configured
+// value, and in the GITHUB_PATH entry later steps inherit.
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -69,16 +88,97 @@ function caseArm(script: string, label: string): string {
 	return lines.slice(start, end < 0 ? lines.length : end).join("\n");
 }
 
+// Every directory this snippet treats as "pnpm's global bin dir", read off
+// the REAL step text: the PATH entry it prepends, the value it writes with
+// `pnpm config set --global global-bin-dir`, and the entry it hands to later
+// steps through GITHUB_PATH. Missing pieces stay `undefined` so the caller
+// reds with the whole picture rather than a thrown regex error.
+type PnpmGlobalBinFacts = {
+	pnpmHome?: string;
+	pathEntry?: string;
+	configuredBinDir?: string;
+	githubPathEntry?: string;
+	pathExportLine: number;
+	globalConfigLine: number;
+};
+
+const PATH_EXPORT = /export PATH="([^":]+):\$PATH"/;
+const GLOBAL_CONFIG_WRITE = /pnpm config set --global global-bin-dir "([^"]+)"/;
+
+function pnpmGlobalBinFacts(script: string): PnpmGlobalBinFacts {
+	const lines = executableLines(script);
+	const text = lines.join("\n");
+	return {
+		pnpmHome: text.match(/export PNPM_HOME="([^"]+)"/)?.[1],
+		pathEntry: text.match(PATH_EXPORT)?.[1],
+		configuredBinDir: text.match(GLOBAL_CONFIG_WRITE)?.[1],
+		githubPathEntry: text.match(/echo "([^"]+)" >> "\$GITHUB_PATH"/)?.[1],
+		pathExportLine: lines.findIndex((line) => PATH_EXPORT.test(line)),
+		globalConfigLine: lines.findIndex((line) => GLOBAL_CONFIG_WRITE.test(line)),
+	};
+}
+
+// The invariant #3043 broke: pnpm 11 will resolve `$PNPM_HOME/bin`, so the
+// PATH entry, the configured value and the GITHUB_PATH entry must all BE
+// `$PNPM_HOME/bin`. Any one of them reverting to bare `$PNPM_HOME` is the
+// exact shape that failed all six pnpm cells of run 35013232780.
+function assertGlobalBinDirAgreesWithPnpm(script: string, label: string): void {
+	const facts = pnpmGlobalBinFacts(script);
+	const pnpmHome = facts.pnpmHome;
+	expect(pnpmHome, `${label}: no PNPM_HOME export`).toBeDefined();
+	// Compare DIRECTORIES, not spellings: `$PNPM_HOME/bin` and the literal
+	// `$HOME/.pnpm-global/bin` are the same directory to the shell.
+	const expand = (value?: string): string | undefined =>
+		value?.replace("$PNPM_HOME", String(pnpmHome));
+	const resolvedByPnpm = `${pnpmHome}/bin`;
+	expect({
+		label,
+		pathEntry: expand(facts.pathEntry),
+		configuredBinDir: expand(facts.configuredBinDir),
+		githubPathEntry: expand(facts.githubPathEntry),
+	}).toEqual({
+		label,
+		pathEntry: resolvedByPnpm,
+		configuredBinDir: resolvedByPnpm,
+		githubPathEntry: resolvedByPnpm,
+	});
+	// ORDER is part of the same invariant, not decoration: pnpm reads PATH at
+	// the moment the --global command runs, so writing the config first reds
+	// with the very #3043 error even when all three directories are correct.
+	// Measured on pnpm 11.15.1 and 11.21.0 with the two lines swapped:
+	//   + pnpm config set --global global-bin-dir …/.pnpm-global/bin
+	//   [ERROR] The configured global bin directory "…/.pnpm-global/bin" is
+	//           not in PATH
+	//   ##[step exit] 1
+	// mise-repro has no pull_request cell, so nothing but this line would
+	// catch that swap before it reached master (review F1 on #3049).
+	expect(
+		facts.pathExportLine,
+		`${label}: no PATH export`,
+	).toBeGreaterThanOrEqual(0);
+	expect(
+		facts.globalConfigLine,
+		`${label}: no --global write`,
+	).toBeGreaterThanOrEqual(0);
+	expect({
+		label,
+		pathBeforeConfig: facts.pathExportLine < facts.globalConfigLine,
+	}).toEqual({
+		label,
+		pathBeforeConfig: true,
+	});
+}
+
 function assertPnpmInstallPath(workflow: Workflow, jobName: string): void {
-	const job = workflow.jobs?.[jobName];
-	const matrix = job?.strategy?.matrix;
+	// Neither job's matrix is restated here. #3043 made pi-load's
+	// `pi_install` an event-dependent expression, and the 2026-09-15 retro's
+	// F2 sweep did the same to mise-repro's `pi_via` and `os` exclusions (one
+	// PR cell each, the full matrix otherwise). Both per-event populations are
+	// asserted ONCE, by evaluating the real expressions, in
+	// tests/config/install-smoke-gates.test.ts -- restating them here would be
+	// a second copy of the same table. What this file owns is the STEP
+	// ordering and content of the pnpm path, which no matrix value changes.
 	if (jobName === "pi-load") {
-		expect(matrix?.pi_install).toEqual([
-			"npm-global",
-			"pnpm-global",
-			"bun-global",
-			"curl",
-		]);
 		const setup = stepIndex(workflow, jobName, "Setup pnpm");
 		const install = stepIndex(workflow, jobName, "Install pi");
 		expect(stepIndex(workflow, jobName, "Setup Node")).toBeLessThan(setup);
@@ -88,14 +188,13 @@ function assertPnpmInstallPath(workflow: Workflow, jobName: string): void {
 			caseArm(installScript, "pnpm-global"),
 		).join("\n");
 		expect(pnpmInstallLines).toContain("pnpm-global)");
-		expect(pnpmInstallLines).toContain(
-			'pnpm config set --global global-bin-dir "$PNPM_HOME"',
-		);
+		assertGlobalBinDirAgreesWithPnpm(pnpmInstallLines, "pi-load pnpm-global");
+		// #3032's half of the contract: the write stays GLOBAL (a project-scoped
+		// one dies on the checkout's `packageManager: npm@...`).
+		expect(pnpmInstallLines).toContain("pnpm config set --global");
 		expect(pnpmInstallLines).toContain('pnpm add -g --ignore-scripts "$PKG"');
 		expect(pnpmInstallLines).toContain('echo "NPMCMD=pnpm" >> "$GITHUB_ENV"');
 	} else {
-		expect(matrix?.os).toEqual(["ubuntu-latest", "macos-latest"]);
-		expect(matrix?.pi_via).toEqual(["mise-node", "mise-npm-backend"]);
 		const installPnpm = stepIndex(workflow, jobName, "Install pnpm");
 		const configure = stepIndex(workflow, jobName, "Configure pnpm global");
 		expect(installPnpm).toBeLessThan(configure);
@@ -113,9 +212,15 @@ function assertPnpmInstallPath(workflow: Workflow, jobName: string): void {
 		const configureLines = executableLines(
 			stepRun(workflow, jobName, "Configure pnpm global"),
 		).join("\n");
-		expect(configureLines).toContain(
-			'pnpm config set --global global-bin-dir "$PNPM_HOME"',
+		assertGlobalBinDirAgreesWithPnpm(
+			configureLines,
+			"mise-repro Configure pnpm global bin dir",
 		);
+		// The `--global` scope is what #3032 fixed (a project-scoped write dies
+		// on the checkout's `packageManager: npm@...`); pnpm 11.21.0 still
+		// answers a --global write with "[WARN] Using --global skips the
+		// package manager check for this project", so the scope stays pinned.
+		expect(configureLines).toContain("pnpm config set --global");
 	}
 
 	const piConfigure = stepIndex(workflow, jobName, "Configure pi");

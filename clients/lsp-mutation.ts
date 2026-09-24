@@ -234,9 +234,11 @@ function uniqueDetails(
 	const byPath = new Map<string, AppliedWorkspaceEdit["fileDetails"][number]>();
 	// #2016: `files` and `fileDetails` name the same paths, so without this the
 	// map-build loop and the lookup below each pay `realpathSync.native` for the
-	// same path (~200 microseconds per call on Windows; POSIX short-circuits, so
-	// CI cannot see it). The memo lives for one call, so it has no staleness
-	// window at all and needs no freshness design.
+	// same path (~200 microseconds per call on Windows; since #3098 POSIX pays it
+	// too, measured at 1.8 microseconds for an existing path — still under any CI
+	// timing gate, so the waste stays invisible either way). The memo lives for
+	// one call, so it has no staleness window at all and needs no freshness
+	// design.
 	const keyMemo = new Map<string, string>();
 	const keyFor = (filePath: string): string => {
 		let key = keyMemo.get(filePath);

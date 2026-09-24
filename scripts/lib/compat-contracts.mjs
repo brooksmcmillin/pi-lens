@@ -16,7 +16,9 @@
  * pi-lens depends on for BEHAVIOR — light mode gating). Verified against
  * `src/runs/shared/pi-args.ts` pre-0.65.0, `src/runs/shared/
  * child-runtime-config.ts` (the const) + `src/runs/background/
- * subagent-runner.ts` (the assignment) at 0.66.0 — the caller concatenates
+ * subagent-runner.ts` (the assignment) at 0.66.0. From 0.70.0 these are
+ * published as `child-runtime-config.js` and `subagent-runner.js` — the
+ * caller concatenates
  * both files' sources (`compat-contract-locator.mjs`'s `locateContractSources`,
  * #2581) since they split apart in pi-subagents@0.65.0's native-AgentSession
  * rewrite.
@@ -239,6 +241,10 @@ export const CONTRACTS = [
 						path: "src/runs/shared/child-runtime-config.ts",
 						observedAt: "0.65.0",
 					},
+					{
+						path: "src/runs/shared/child-runtime-config.js",
+						observedAt: "0.70.0",
+					},
 				],
 			},
 			{
@@ -248,6 +254,10 @@ export const CONTRACTS = [
 					{
 						path: "src/runs/background/subagent-runner.ts",
 						observedAt: "0.65.0",
+					},
+					{
+						path: "src/runs/background/subagent-runner.js",
+						observedAt: "0.70.0",
 					},
 				],
 			},

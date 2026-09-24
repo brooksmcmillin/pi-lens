@@ -45,8 +45,8 @@
  * keyed map it is a compare while nothing has been invalidated, and a
  * normalize plus one `Map.get` once something has. The hand-rolled form it
  * replaces normalized on EVERY call, and this repo's normalizer runs
- * `realpathSync.native` on Windows, so an uninterrupted sweep pays that
- * syscall once rather than once per file. See
+ * `realpathSync.native` on Windows and, since #3098, on POSIX as well, so an
+ * uninterrupted sweep pays that syscall once rather than once per file. See
  * `GenerationMapOptions.normalizeKey` for the correctness reason the slow
  * path exists at all.
  */
@@ -237,8 +237,9 @@ export interface GenerationMapOptions {
 	 * uses for its own map, or two spellings of one cwd get two stamps.
 	 *
 	 * The normalizer MAY consult the filesystem, and the repo's does:
-	 * `normalizeMapKey` runs `realpathSync.native` on Windows, which answers
-	 * differently once a path that did not exist comes into existence. A
+	 * `normalizeMapKey` runs `realpathSync.native` on Windows and, since #3098,
+	 * on POSIX as well — on BOTH it answers differently once a path that did not
+	 * exist comes into existence (HISTORY.md defect shape 1). A
 	 * handle therefore re-runs the normalizer whenever the map has been
 	 * invalidated since that handle was captured, and skips it otherwise.
 	 *

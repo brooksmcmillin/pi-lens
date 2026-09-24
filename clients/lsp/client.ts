@@ -39,7 +39,11 @@ import {
 	newLspMutationCorrelationId,
 } from "../lsp-mutation.js";
 import { getProcessSingleton } from "../process-singletons.js";
-import { getAmbientAbortSignal } from "../safe-spawn.js";
+import {
+	getAmbientAbortSignal,
+	isOwnLiveChild,
+	releaseOwnChildPid,
+} from "../safe-spawn.js";
 import { raceToCompletion } from "./aggregation.js";
 import {
 	hashDiagnosticContent,
@@ -1038,6 +1042,15 @@ export interface LSPClientState {
 		}
 	>;
 	readonly openDocuments: Set<string>;
+	/**
+	 * #3310: whether this client's ONE-SHOT empty-first-publish hold has been
+	 * spent. Only ever set for a server the matrix measures as
+	 * `emptyFirstPublish: "indexing"`. The cold whole-workspace index builds once
+	 * per session, so holding at most one publish bounds the hold's cost to that
+	 * one index window: every later touch — warm, or a server that never
+	 * re-publishes — resolves on its first publish exactly as before.
+	 */
+	emptyFirstPublishHoldSpent: boolean;
 	/** Paths explicitly closed during this client lifetime; late publishes are dropped. */
 	readonly closedDocuments?: Set<string>;
 	/** Original URI spelling for each open document; path keys are normalized. */
@@ -1270,6 +1283,9 @@ export async function killProcessTree(
 		(proc.exitCode != null || proc.signalCode != null) &&
 		!options.processExiting
 	) {
+		// #3091 F1-r2b: this pid will never be signalled again, so retire the
+		// ownership hold taken at spawn rather than leaving it to age out.
+		releaseOwnChildPid(pid);
 		proc.unref?.();
 		return;
 	}
@@ -1344,7 +1360,20 @@ export async function killProcessTree(
 	}
 
 	const killPosixProcessGroup = (signal: NodeJS.Signals): boolean => {
-		if (pid <= 0) return false;
+		// #2042: one ownership predicate for every kill-by-raw-pid, replacing
+		// the `pid <= 0` sign check that let a test double's invented pid
+		// through. A pid we do not own falls back to `killDirectChild` below,
+		// which signals through the retained handle and can only ever reach
+		// our own child.
+		//
+		// #3091 F1: `proc` is deliberately NOT passed. The handle arm means
+		// "already exited ⇒ refuse", and this group kill must still fire when
+		// the direct child is dead — the early return at :1269 is skipped under
+		// `options.processExiting`, and a POSIX group outlives its leader, so
+		// the group signal is the only thing that reaps surviving grandchildren
+		// at host exit (#2026). Ownership here comes from the kernel and, once
+		// the leader is gone, from the verdict recorded while it was alive.
+		if (!isOwnLiveChild(pid, "lsp-stop-posix-group")) return false;
 		try {
 			process.kill(-pid, signal);
 			return true;
@@ -1400,6 +1429,11 @@ export async function killProcessTree(
 						killDirectChild("SIGKILL");
 					}
 				}
+				// AFTER the escalation, never before it: this tick issues the
+				// last signal this pid can receive, and retiring the ownership
+				// hold first would make that very SIGKILL the thing that gets
+				// refused (#3091 F1-r2b).
+				releaseOwnChildPid(pid);
 			}, 1500);
 			timer.unref?.();
 			proc.unref?.();
@@ -1437,6 +1471,7 @@ export async function killProcessTree(
 				killDirectChild("SIGKILL");
 			}
 		}
+		releaseOwnChildPid(pid);
 	} catch {
 		// ignore
 	}
@@ -2194,8 +2229,29 @@ export function applyDynamicCapabilities(state: LSPClientState): void {
  * e.g. "scan.jobs") against the server's `initializationOptions` blob.
  * - No section (undefined/empty) → the whole blob, per spec ("if a scope
  *   isn't asked for" the client returns the full settings for that scope).
- * - An unresolvable path → `null`, never the whole blob — a server asking
- *   for a section it doesn't get must not silently receive unrelated config.
+ * - An unresolvable path → an EMPTY settings object, never the whole blob — a
+ *   server asking for a section it doesn't get must not silently receive
+ *   unrelated config.
+ *
+ * #3217: that second case used to answer `null`, and a server that reads the
+ * answer without a null guard loses its diagnostics or dies outright. Both
+ * shapes are live in the nightly LSP fixture set:
+ *   - vscode-css-language-server hands the answer to
+ *     `new LintConfigurationSettings(settings && settings.lint)` whose
+ *     `constructor(conf = {})` default only fires for `undefined`, then throws
+ *     `Cannot read properties of null (reading 'validProperties')` INSIDE its
+ *     own diagnostics computation and answers the pull with an empty report —
+ *     visible to a client only as a `window/logMessage`. Every `.css`/`.scss`/
+ *     `.less`/`.sass` file was silently undiagnosed, which is why the #2780
+ *     clean gate read "0 diagnostic(s)" for css on every nightly since it
+ *     landed.
+ *   - @prisma/language-server reads `settings.enableDiagnostics` in
+ *     `validateTextDocument` with no guard and the whole SERVER PROCESS exits
+ *     on the uncaught `TypeError`.
+ * `{}` is what a client with no value for that section actually means ("no
+ * settings here"), it is already what this function answers for an item with
+ * no section at all against an absent blob, and it leaves the "never the whole
+ * blob" invariant #983 added untouched.
  * Exported for the #983 regression test.
  */
 export type ConfigurationSection =
@@ -2210,12 +2266,12 @@ export function resolveConfigurationSection(
 	initialization: Record<string, unknown> | undefined,
 	section: string | undefined,
 ): ConfigurationSection {
-	if (!initialization) return section ? null : {};
+	if (!initialization) return {};
 	if (!section) return initialization;
 	let cur: unknown = initialization;
 	for (const part of section.split(".")) {
 		if (typeof cur !== "object" || cur === null || !Object.hasOwn(cur, part)) {
-			return null;
+			return {};
 		}
 		cur = (cur as Record<string, unknown>)[part];
 	}
@@ -2392,6 +2448,66 @@ export function setupIncomingHandlers(
 				const currentVersion = state.documentVersions.get(normalizedPath);
 				return currentVersion !== undefined && docVersion < currentVersion;
 			};
+
+			// #3310: HOLD the empty first publish of an asynchronously-indexing
+			// server. Measured (docs/lsp-capability-matrix.md's `first-publish`
+			// column): intelephense answers `didOpen` with `[]` while its
+			// whole-workspace index builds and publishes the real set once
+			// indexing ends, so letting that first publish through cached an empty
+			// set, bumped the publication stamp and emitted — which resolved the
+			// push wait AND satisfied the "answered" evidence check in
+			// `clients/lsp/index.ts`, rendering a file with an error as "confirmed
+			// clean". A timeout is not a false clean; an empty pre-index publish
+			// must not become one either.
+			//
+			// Held means: not cached, no version bump, no emit — so it can neither
+			// resolve a wait nor count as evidence. Nothing is scheduled and
+			// nothing is awaited: the server's OWN next publish releases the hold
+			// (it is no longer a first publish), and the existing per-server budget
+			// stays the only bound, so there is no new timer, listener or
+			// cancellation path. A genuinely clean file still gets an affirmative
+			// clean, because the measured server re-publishes `[]` at the end of
+			// indexing.
+			//
+			// Three conditions, each load-bearing:
+			//  - the MEASURED class (never every push server): a Tier 2/2* server
+			//    that publishes `[]` once for a clean file keeps resolving the wait
+			//    on it, with no added latency (#3310 AC2);
+			//  - one-shot per client session: the cold index builds once, so a warm
+			//    touch — or a class server that never re-publishes — pays nothing;
+			//  - FIRST publication for this document: no cached push AND no pending
+			//    debounce timer. An empty publish that CLEARS an earlier non-empty
+			//    one (a fix landing) is never held, in either arrival order.
+			if (
+				strategy.emptyFirstPublish === "indexing" &&
+				!state.emptyFirstPublishHoldSpent &&
+				newDiags.length === 0 &&
+				!state.pushDiagnostics.has(normalizedPath) &&
+				!state.pendingDiagnostics.has(normalizedPath)
+			) {
+				state.emptyFirstPublishHoldSpent = true;
+				// Bounded by construction: one record per client session, because
+				// the hold itself is one-shot.
+				logLatency({
+					type: "phase",
+					phase: "lsp_empty_first_publish_held",
+					filePath: normalizedPath,
+					durationMs: Math.max(
+						0,
+						publishReceivedAt -
+							(state.documentOpenedAt.get(normalizedPath) ?? publishReceivedAt),
+					),
+					metadata: {
+						serverId: state.serverId,
+						emptyFirstPublish: strategy.emptyFirstPublish,
+						// `pubVersion`, the `[lsp-pub]` trace's own field name for the
+						// publish's LSP document version — not a lifecycle identity, and
+						// not the retired glossary spelling (AGENTS.md "generation").
+						pubVersion: docVersion ?? "push-unversioned",
+					},
+				});
+				return;
+			}
 
 			// Seed on first push for servers whose first push is known complete.
 			// Bypasses the debounce timer entirely — resolves waiting promises immediately.
@@ -2576,7 +2692,9 @@ export function setupIncomingHandlers(
 	// dot-path into the server's config, e.g. "scan.jobs") — not a fixed
 	// single-element array duplicating the whole blob for every item. An item
 	// with no `section` gets the whole blob (that's what "no section" means
-	// per spec); an unresolvable section gets `null`, never the whole blob.
+	// per spec); an unresolvable section gets `{}` (never `null`: strict consumers such as
+	// vscode-css-language-server and @prisma/language-server throw or exit on
+	// null), never the whole blob.
 	state.connection.onRequest(
 		"workspace/configuration",
 		async (params: { items?: Array<{ section?: string }> }) => {
@@ -5301,6 +5419,8 @@ export async function createLSPClient(options: {
 		pullRequestSequences: new Map(),
 		workspacePullResultCache: new Map(),
 		openDocuments: new Set(),
+		// #3310: one-shot, per client session.
+		emptyFirstPublishHoldSpent: false,
 		closedDocuments: new Set(),
 		openDocumentUris: new Map(),
 		pendingOpens: new Set(),

@@ -63,9 +63,12 @@ describe("detectFileRole", () => {
 	});
 
 	// Refs #2880: hand-written pins for the test-file conventions the
-	// test-runner client dispatches on (informed by SOURCE_TO_TEST_PATTERNS
-	// + RUNNERS kinds in clients/test-runner-client.ts, not iterated from
-	// them — see #2928 for the single-classifier fold). A convention
+	// test-runner client dispatches on. The table-derived rows are covered
+	// by tests/clients/test-file-classifier-parity.test.ts, which imports
+	// and iterates the REAL SOURCE_TO_TEST_PATTERNS table (#2928 fold);
+	// this hand-written set remains for the conventions BEYOND the table
+	// (`*Test.java`, `*Test.kt`, `*Tests.cs`, `_spec.rb` — runners whose
+	// discovery rows the table does not carry). A convention
 	// missing here lets an edited test file take the related-discovery
 	// path and run the wrong tests or none. Each row pairs the convention with a co-located
 	// source file the same convention must NOT claim, so a row proves its
@@ -114,6 +117,31 @@ describe("detectFileRole", () => {
 		for (const [file, expected] of cases) {
 			expect(detectFileRole(file), file).toBe(expected);
 		}
+	});
+
+	// Refs #2928: `__tests__` is matched as a FULL path segment. The old
+	// `dir.includes("/__tests__/")` arm could never see a file DIRECTLY under
+	// `__tests__` — `dirname` yields no trailing slash — so
+	// `/proj/__tests__/foo.ts` classified as "source" while every sibling
+	// classifier (file-utils' substring arm, word-index's directory
+	// alternation) said test. The fold makes `isTestFile` delegate to this
+	// classifier, so the arm must cover every shape the old substring arm
+	// did before the delegation can be behavior-preserving. Pre-fix, the
+	// direct-child rows below FAILED (classified "source").
+	it("classifies a file under a __tests__ directory as test on every path shape", () => {
+		for (const filePath of [
+			"/proj/__tests__/foo.ts",
+			"/proj/__tests__/unit/foo.ts",
+			"__tests__/foo.ts",
+			"__tests__/unit/foo.ts",
+			"C:\\proj\\__tests__\\foo.ts",
+		]) {
+			expect(detectFileRole(filePath), filePath).toBe("test");
+		}
+		// Anchor precision: the token inside a longer segment is not the
+		// `__tests__` convention.
+		expect(detectFileRole("/proj/x__tests__/foo.ts")).toBe("source");
+		expect(detectFileRole("/proj/__tests__x/foo.ts")).toBe("source");
 	});
 
 	// #2346 negative proof: the longest-line real file in `clients/` that

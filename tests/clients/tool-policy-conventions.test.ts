@@ -8,6 +8,7 @@ import {
 import {
 	buildProjectSnapshotFromRuntime,
 	saveProjectSnapshot,
+	waitForProjectSnapshotPersistsForTests,
 } from "../../clients/project-snapshot.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
@@ -21,12 +22,22 @@ beforeEach(() => {
 	process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
 });
 
-afterEach(() => {
+afterEach(async () => {
 	if (previousDataDir === undefined) {
 		delete process.env.PILENS_DATA_DIR;
 	} else {
 		process.env.PILENS_DATA_DIR = previousDataDir;
 	}
+	// #3186: saveProjectSnapshot (called from saveSnapshotWithConventions below)
+	// dispatches its body persist to a worker thread/main-thread fallback the
+	// caller never awaits; that persist's write path recreates whatever
+	// ancestor directory env.cleanup() below is about to remove if it lands
+	// after cleanup (measured directly: ~10-50ms after removal, unforced).
+	// Draining through the seam every persist call already has
+	// (waitForProjectSnapshotPersistsForTests, clients/project-snapshot.ts)
+	// before cleanup closes the race at its source instead of admitting the
+	// resulting directory in the tmp-hygiene governance baseline.
+	await waitForProjectSnapshotPersistsForTests();
 	env?.cleanup();
 	env = undefined;
 });

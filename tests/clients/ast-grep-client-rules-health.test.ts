@@ -105,7 +105,7 @@ afterEach(() => {
 
 function tempCwdWithoutRules(): string {
 	const dir = fsSync.mkdtempSync(
-		path.join(os.tmpdir(), "pilens-ast-grep-client-cwd-"),
+		path.join(os.tmpdir(), "pi-lens-pilens-ast-grep-client-cwd-"),
 	);
 	tmpDirs.push(dir);
 	return dir;

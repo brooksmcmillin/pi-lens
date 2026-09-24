@@ -465,8 +465,15 @@ export async function analyzeFile(
 
 	if (options.record !== false) {
 		// Mirror pipeline.ts's recording so pilens_diagnostics (mode=all) and
-		// pilens_health see what this analysis found.
-		recordDiagnostics(absPath, result.diagnostics);
+		// pilens_health see what this analysis found. #3160 F1: `absPath` here
+		// is derived raw from the agent-supplied `file` arg (path.resolve above)
+		// — unlike pipeline.ts, which always records ctx.filePath, already
+		// canonicalized to on-disk casing by createDispatchContext (#2016/
+		// #3098). Normalize before recording so a mis-cased analyze call lands
+		// under the SAME widget-state key a canonical per-edit write already
+		// uses, instead of an orphaned key no reader (raw or normalized) can
+		// reach.
+		recordDiagnostics(normalizeMapKey(absPath), result.diagnostics);
 		if (result.diagnostics.length > 0) {
 			getDiagnosticTracker().trackShown(result.diagnostics);
 		}

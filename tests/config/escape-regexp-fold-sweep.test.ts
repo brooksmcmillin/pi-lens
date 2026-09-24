@@ -70,6 +70,7 @@ import { describe, expect, it } from "vitest";
 import {
 	assertNonEmptyScan,
 	listSourceFiles,
+	readWalkedFile,
 	relativePosix,
 	stripSource,
 } from "../support/sweep-kit.js";
@@ -155,10 +156,15 @@ describe("escapeRegExp single-source-of-truth (#2558)", () => {
 		);
 
 		const offenders: string[] = [];
+		// readWalkedFile: this population includes the tests/ tree
+		// (`{ dir: "tests", floor: 900 }` above), which a concurrently running
+		// test can mutate; a path that vanished between the walk and the read is
+		// out of the population, not a finding (#3082).
 		for (const file of files) {
 			const rel = relativePosix(root, file);
 			if (rel === CANONICAL_FILE) continue;
-			const raw = readFileSync(file, "utf8");
+			const raw = readWalkedFile(file);
+			if (raw === undefined) continue;
 			const stripped = stripSource(raw, { strings: "keep" });
 			if (FUNCTION_SHAPE.test(stripped) || ARROW_SHAPE.test(stripped)) {
 				offenders.push(rel);

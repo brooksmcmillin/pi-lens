@@ -31,12 +31,36 @@
 // covering test), this builds only and skips the test run — never silently
 // skips the build too.
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { quoteForWindowsCmd } from "./with-test-lock.mjs";
 
 export const MAX_SELECTED_TESTS = 25;
+
+function writeStepSummary(summary) {
+	const file = process.env.GITHUB_STEP_SUMMARY;
+	if (!file) return;
+	appendFileSync(file, `${summary}\n`, "utf8");
+}
+
+function writeSelectionSummary({
+	changedCount,
+	selectedCount,
+	totalBeforeCap,
+	status,
+}) {
+	writeStepSummary(
+		[
+			"### Targeted test selection",
+			"",
+			`- Changed TypeScript files: ${changedCount}`,
+			`- Selected test files: ${selectedCount}`,
+			`- Matches before cap: ${totalBeforeCap}`,
+			`- Result: ${status}`,
+		].join("\n"),
+	);
+}
 
 // Matches `from "…"`, `import("…")`, and `require("…")` — the three ways a
 // vitest file (or a module it imports) pulls in another module.
@@ -241,14 +265,30 @@ function runTargetedTests(selected) {
 export async function main() {
 	const range = resolveDiffRange();
 	const changed = changedTsFiles(range);
+	const skipBuild = process.argv.includes("--skip-build");
 
-	console.log("[pre-push] building...");
-	runInherit("npm", ["run", "build"], { needsShimShell: true });
+	if (skipBuild) {
+		console.log(
+			"[pre-push] build already completed; skipping duplicate build.",
+		);
+	} else {
+		console.log("[pre-push] building...");
+		runInherit("npm", ["run", "build"], { needsShimShell: true });
+	}
 
 	if (changed === null || changed.length === 0) {
 		console.log(
 			"[pre-push] no TypeScript changes to target; build-only pass complete.",
 		);
+		writeSelectionSummary({
+			changedCount: changed?.length ?? 0,
+			selectedCount: 0,
+			totalBeforeCap: 0,
+			status:
+				changed === null
+					? "selection unavailable; build-only"
+					: "no TypeScript changes; build-only",
+		});
 		return 0;
 	}
 
@@ -265,6 +305,12 @@ export async function main() {
 		console.warn(
 			`[pre-push] selection too broad (${totalBeforeCap} test files matched ${changed.length} changed file(s), over the ${MAX_SELECTED_TESTS}-file cap); rely on CI.`,
 		);
+		writeSelectionSummary({
+			changedCount: changed.length,
+			selectedCount: 0,
+			totalBeforeCap,
+			status: `cap exceeded (${MAX_SELECTED_TESTS}); build-only`,
+		});
 		return 0;
 	}
 
@@ -272,8 +318,21 @@ export async function main() {
 		console.log(
 			`[pre-push] no test files matched ${changed.length} changed .ts file(s); build-only pass complete.`,
 		);
+		writeSelectionSummary({
+			changedCount: changed.length,
+			selectedCount: 0,
+			totalBeforeCap,
+			status: "no matches; build-only",
+		});
 		return 0;
 	}
+
+	writeSelectionSummary({
+		changedCount: changed.length,
+		selectedCount: selected.length,
+		totalBeforeCap,
+		status: "selected",
+	});
 
 	console.log(
 		`[pre-push] running ${selected.length} targeted test file(s) for ${changed.length} changed .ts file(s):`,

@@ -404,7 +404,7 @@ describe("LSPService race hardening", () => {
 				await expect(touch).resolves.toBeUndefined();
 			} else {
 				let settled = false;
-				touch.then(() => {
+				void touch.then(() => {
 					settled = true;
 				});
 				await vi.advanceTimersByTimeAsync(749);

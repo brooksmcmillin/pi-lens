@@ -90,6 +90,38 @@ describe("shfmt runner — format-diff warning is .editorconfig-gated (#211)", (
 		}
 	});
 
+	it("warns when the .editorconfig sits in an ancestor directory", async () => {
+		// Recurrence this pins (#3038 review): shfmt reads .editorconfig the way
+		// editorconfig itself resolves it — by walking up from the file — so a
+		// monorepo that keeps one .editorconfig at the root opted every package
+		// in. Nothing proved that walk after the lookup folded onto
+		// `findNearestContaining`; collapsing it to a cwd-only check was silent.
+		fs.writeFileSync(
+			path.join(env.tmpDir, ".editorconfig"),
+			"[*.sh]\nindent_size = 2\n",
+		);
+		const nested = path.join(env.tmpDir, "packages", "cli");
+		fs.mkdirSync(nested, { recursive: true });
+		filePath = path.join(nested, "script.sh");
+		fs.writeFileSync(filePath, "echo hi\n");
+		safeSpawnAsync.mockResolvedValue({
+			error: null,
+			status: 1,
+			stdout: "@@ -3 +3 @@\n",
+			stderr: "",
+		});
+		try {
+			const runner = (
+				await import("../../../../clients/dispatch/runners/shfmt.js")
+			).default;
+			const result = await runner.run(ctx(filePath, nested) as never);
+			expect(result.diagnostics).toHaveLength(1);
+			expect(result.diagnostics[0].rule).toBe("shfmt-unformatted");
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("ALWAYS reports parse errors, even without .editorconfig", async () => {
 		safeSpawnAsync.mockResolvedValue({
 			error: null,

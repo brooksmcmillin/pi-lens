@@ -388,6 +388,24 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 		},
 	],
 	[
+		".typ",
+		{
+			formatterNames: ["typstyle"],
+			defaultFormatter: "typstyle",
+			defaultWhenUnconfigured: true,
+			gate: "smart-default",
+		},
+	],
+	[
+		".typc",
+		{
+			formatterNames: ["typstyle"],
+			defaultFormatter: "typstyle",
+			defaultWhenUnconfigured: true,
+			gate: "smart-default",
+		},
+	],
+	[
 		".c",
 		{
 			formatterNames: ["clang-format"],
@@ -761,6 +779,7 @@ const AUTO_INSTALLABLE_DEFAULT_FORMATTERS = new Map<string, string>([
 	["shfmt", "shfmt"],
 	["taplo", "taplo"],
 	["ktlint", "ktlint"],
+	["typstyle", "typstyle"],
 ]);
 
 // `gate: "smart-default"` so a matched file is formatted only when nothing else

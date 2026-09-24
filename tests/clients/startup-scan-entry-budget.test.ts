@@ -181,3 +181,109 @@ describe("isStartupScanVerdictFresh — too-many-entries is TTL'd (#758)", () =>
 		expect(isStartupScanVerdictFresh(v)).toBe(false);
 	});
 });
+
+/**
+ * #3112 — a nested coding-agent data directory must not be charged against the
+ * startup entry budget.
+ *
+ * The reporter's project carried a `.omp/agent/sessions` tree (the same
+ * `<configDir>/agent/...` layout `~/.pi/agent` has: pi 0.85.1 derives its
+ * config-dir name as `pkg.piConfig?.configDir || ".pi"`, so a rebranded
+ * distribution spells it `.omp`). `EXCLUDED_DIRS` already carried `.pi`,
+ * `.claude` and `.codex` but not `.omp`, so the startup walk descended into the
+ * session history and spent the whole entry budget there — a five-file project
+ * came back `too-many-entries` and never warmed its caches.
+ *
+ * The three cases below are one triple: exclusion by NAME during recursion, the
+ * control that proves the budget itself still fires, and the #3112 non-goal
+ * that an explicitly selected `.omp` scan ROOT is still scanned.
+ */
+describe("nested agent-data directories and the startup entry budget (#3112)", () => {
+	const cleanups: Array<() => void> = [];
+	afterEach(() => {
+		while (cleanups.length) cleanups.pop()?.();
+	});
+
+	/** A small source project whose bulk lives under `bulkDir`. */
+	function makeProjectWithBulkDir(prefix: string, bulkDir: string) {
+		const env = setupTestEnvironment(prefix);
+		fs.mkdirSync(path.join(env.tmpDir, ".git"));
+		for (let i = 0; i < 3; i++) {
+			fs.writeFileSync(path.join(env.tmpDir, `script${i}.ts`), "export {};\n");
+		}
+		const bulk = path.join(env.tmpDir, bulkDir);
+		fs.mkdirSync(bulk, { recursive: true });
+		for (let i = 0; i < 200; i++) {
+			fs.writeFileSync(path.join(bulk, `session-${i}.jsonl`), "{}\n");
+		}
+		const homeEnv = setupTestEnvironment(`${prefix}home-`);
+		cleanups.push(env.cleanup, homeEnv.cleanup);
+		return { root: env.tmpDir, homeDir: homeEnv.tmpDir };
+	}
+
+	it("stays eligible for warmup with a large nested .omp/agent/sessions tree", () => {
+		const { root, homeDir } = makeProjectWithBulkDir(
+			"pi-lens-omp-nested-",
+			path.join(".omp", "agent", "sessions"),
+		);
+		const ctx = resolveStartupScanContext(root, {
+			homeDir,
+			maxScanEntries: 20,
+		});
+		expect(ctx.reason).toBeUndefined();
+		expect(ctx.canWarmCaches).toBe(true);
+		expect(ctx.sourceFileCount).toBe(3);
+	});
+
+	it("stays eligible on the async path too", async () => {
+		const { root, homeDir } = makeProjectWithBulkDir(
+			"pi-lens-omp-nested-async-",
+			path.join(".omp", "agent", "sessions"),
+		);
+		const ctx = await resolveStartupScanContextAsync(root, {
+			homeDir,
+			maxScanEntries: 20,
+		});
+		expect(ctx.reason).toBeUndefined();
+		expect(ctx.canWarmCaches).toBe(true);
+		expect(ctx.sourceFileCount).toBe(3);
+	});
+
+	it("still trips the budget on an equally large ORDINARY data directory", () => {
+		// The control for the case above: the fix excludes one agent-data
+		// directory NAME, it does not weaken the #758 budget. An oversized tree
+		// keeps its `too-many-entries` verdict.
+		const { root, homeDir } = makeProjectWithBulkDir(
+			"pi-lens-omp-control-",
+			path.join("data", "sessions"),
+		);
+		const ctx = resolveStartupScanContext(root, {
+			homeDir,
+			maxScanEntries: 20,
+		});
+		expect(ctx.canWarmCaches).toBe(false);
+		expect(ctx.reason).toBe("too-many-entries");
+	});
+
+	it("still SCANS a .omp directory that is itself the project root (#3112 non-goal)", () => {
+		// Excluding a directory by name during recursion must not exclude it when
+		// the user opened it AS the workspace: `isExcludedDirName` is asked about
+		// child entries only, never about the scan root's own basename. A fix that
+		// matched the root's path segments instead would silently refuse to
+		// analyse anyone working inside `~/.omp`.
+		const env = setupTestEnvironment("pi-lens-omp-as-root-");
+		const homeEnv = setupTestEnvironment("pi-lens-omp-as-root-home-");
+		cleanups.push(env.cleanup, homeEnv.cleanup);
+		const ompRoot = path.join(env.tmpDir, ".omp");
+		fs.mkdirSync(path.join(ompRoot, ".git"), { recursive: true });
+		for (let i = 0; i < 3; i++) {
+			fs.writeFileSync(path.join(ompRoot, `script${i}.ts`), "export {};\n");
+		}
+		const ctx = resolveStartupScanContext(ompRoot, {
+			homeDir: homeEnv.tmpDir,
+			maxScanEntries: 1_000_000,
+		});
+		expect(ctx.canWarmCaches).toBe(true);
+		expect(ctx.sourceFileCount).toBe(3);
+	});
+});

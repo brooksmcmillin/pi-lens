@@ -128,7 +128,9 @@ describe("MCP connection-scoped situational dead-weight lifecycle", () => {
 			});
 			const rows = await readDeadWeightRows(home);
 			expect(rows).toHaveLength(1);
-			expect((rows[0]?.metadata as { tools: string[] }).tools).not.toContain(
+			const row = rows[0];
+			expect(row).toBeDefined();
+			expect((row!.metadata as { tools: string[] }).tools).not.toContain(
 				"ast_grep_search",
 			);
 		} finally {

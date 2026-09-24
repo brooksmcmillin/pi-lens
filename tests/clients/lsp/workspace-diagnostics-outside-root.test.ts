@@ -50,11 +50,15 @@ describe("#2052 sweep over a foreign root does not report or cache a clean", () 
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 
-		sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "wsd-2052-session-"));
+		sessionDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-wsd-2052-session-"),
+		);
 		fs.mkdirSync(path.join(sessionDir, ".pi-lens"));
 		// A sibling worktree with its OWN tsconfig — the exact shape from the
 		// issue's evidence (a `pi-agent-*` temp worktree).
-		foreignDir = fs.mkdtempSync(path.join(os.tmpdir(), "wsd-2052-foreign-"));
+		foreignDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-wsd-2052-foreign-"),
+		);
 		fs.mkdirSync(path.join(foreignDir, ".pi-lens"));
 		fs.writeFileSync(path.join(foreignDir, "tsconfig.json"), "{}\n");
 		foreignFile = path.join(foreignDir, "app.ts");
