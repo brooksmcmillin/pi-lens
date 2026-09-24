@@ -23,7 +23,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { safeSpawn } from "../../../../clients/safe-spawn.js";
-import { removeTempDirSync } from "../../test-utils.js";
+import { resolveBaselineSgconfig } from "../../../../clients/sgconfig.js";
+import {
+	createTempFile,
+	removeTempDirSync,
+	setupTestEnvironment,
+} from "../../test-utils.js";
 
 const RULES_DIR = path.join(process.cwd(), "rules", "ast-grep-rules", "rules");
 
@@ -291,7 +296,7 @@ function runAstGrep(
 	exitCode: number;
 	fired: boolean;
 } {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pilens-sg-"));
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-pilens-sg-"));
 	const snippet = path.join(dir, `fixture.${ext}`);
 	fs.writeFileSync(snippet, code, "utf-8");
 	// #902: `safeSpawn` (see probeCli comment) instead of a raw
@@ -419,7 +424,9 @@ d("catalog rules with `fix:` field — CLI rewrite end-to-end", () => {
 			});
 
 			it("ast-grep engine emits the expected `replacement` in the diagnostic JSON", () => {
-				const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pilens-sg-fix-"));
+				const dir = fs.mkdtempSync(
+					path.join(os.tmpdir(), "pi-lens-pilens-sg-fix-"),
+				);
 				const snippet = path.join(dir, `fixture.${rule.ext}`);
 				fs.writeFileSync(snippet, rule.before, "utf-8");
 				// The CLI exits non-zero when the rule fires (a finding
@@ -478,4 +485,65 @@ d("catalog-derived ast-grep rules fire via CLI", () => {
 			});
 		});
 	}
+});
+
+// #3240: keep the Go nested-directory population in this already-admitted
+// real-CLI suite. The rule is CLI/LSP-only, and only the real project walk
+// applies its `ignores` globs to paths at nested package depth.
+d("go-no-fmt-println nested ignore directories (#3240)", () => {
+	it("ignores nested fixtures/cases but keeps similarly named application code", () => {
+		const env = setupTestEnvironment("pi-lens-go-rule-ignores-");
+		try {
+			const source = [
+				"package example",
+				"",
+				'import "fmt"',
+				"",
+				'func Run() { fmt.Println("output") }',
+				"",
+			].join("\n");
+			createTempFile(
+				env.tmpDir,
+				"packages/alpha/tests/fixtures/example.go",
+				source,
+			);
+			createTempFile(env.tmpDir, "packages/beta/cases/example.go", source);
+			createTempFile(
+				env.tmpDir,
+				"packages/gamma/test-fixtures/example.go",
+				source,
+			);
+			const configPath = resolveBaselineSgconfig(env.tmpDir);
+			if (!configPath) throw new Error("no ast-grep rule sources found");
+			const result = safeSpawn("ast-grep", [
+				"scan",
+				"--config",
+				configPath,
+				"--json",
+				env.tmpDir,
+			]);
+			if (result.error) throw result.error;
+			const findings = JSON.parse(result.stdout || "[]") as Array<{
+				file: string;
+				ruleId: string;
+			}>;
+			const normalized = findings.map((finding) => ({
+				...finding,
+				file: finding.file.split("\\").join("/"),
+			}));
+			const forRule = (suffix: string) =>
+				normalized.filter(
+					(finding) =>
+						finding.ruleId === "go-no-fmt-println" &&
+						finding.file.endsWith(suffix),
+				);
+			expect(forRule("packages/alpha/tests/fixtures/example.go")).toEqual([]);
+			expect(forRule("packages/beta/cases/example.go")).toEqual([]);
+			expect(forRule("packages/gamma/test-fixtures/example.go")).toHaveLength(
+				1,
+			);
+		} finally {
+			env.cleanup();
+		}
+	}, 60_000);
 });

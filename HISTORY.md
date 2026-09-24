@@ -13,6 +13,111 @@ guidance those sections carried stayed in `AGENTS.md`.
 - **Async-spawn migration (#197)** completed; the deliberate sync residue and
   its mocking guidance remain live in AGENTS.md under the same heading.
 
+## 2026-09-15 — retrospective contract (`docs/pi-lens-retro.md`)
+
+Why it exists: one session produced four mistakes that a prose rule had
+already covered and no check enforced. (1) A fixer pinned `TMPDIR` to the
+harness `.probe-home` and reported 16 unrelated suites red on `origin/master`;
+the tree was green, the environment was wrong (`tests/support/vitest-setup.ts`
+keeps the real `TMPDIR` on purpose). (2) `install-smoke`'s `pi-load` and
+`mise-repro` jobs skip on `pull_request`, so #3033 changed those very steps
+and shipped untested; master was red for a day (#3043). (3) The infra-kill
+auto-rerun fires only on `run_attempt == 1`, so a second kill needed a hand
+rerun (#2042). (4) A runtime vitest case was added as "regression evidence"
+for a type-only compile defect (#3026); it could never red and was deleted.
+Each is mechanical: a preflight row, a governance test over workflow gates, a
+one-line workflow condition, and a reviewer duty. The contract makes the
+mechanical-versus-judgement classification the first step so the deliverable
+is the check, not the sentence. The inspiration was an external retro skill
+(mattpocock/skills, `retro`); what it lacked, and this contract adds, is the
+red-transcript requirement on the check itself and a single home for rules.
+
+
+## 2026-09-16 — first retro under `docs/pi-lens-retro.md`
+
+Run over the 2026-09-15/16 orchestration session (16 PRs merged, 14 issues
+closed, 2 master reds, 2 refuted claims). Fifteen findings, one refutation.
+Mechanical deliverables: the infra-kill auto-rerun gate now covers a second
+kill; a sweep reds any workflow job that only runs off `pull_request`; the bash
+guard denies `TMPDIR=<…>/.probe-home`; the git-fixture gate rejects raw
+commit-ish spawns under `tests/`; three more were built inside the session
+itself (#3061 cgroup probe, #3062 peak-RSS gate, #3066 shared-home detector).
+Filed: #3073 (branch protection, human decision), #3074, #3075, #3076,
+plegma #436. Judgement lines added: reviewer fold rule, sweep-brief routing.
+Steering audit deleted five lines that had an occasion and changed no
+decision: the fixer contract's preflight-table line (0 of 13 bodies), its
+non-TypeScript twin of the reviewer line (0 hits over four dispatch PRs), its
+copy of the interleaving-kit sentence (AGENTS.md is the source), the
+orchestration "run the warden" clause (0 warden runs across 16 merges), and the
+reviewer's three-value strength vocabulary (0 labels on 2 named outputs).
+Refuted: "close keywords in PR titles are ungated" —
+`lintCloseKeywordPlacement` already gates it and redded #3044.
+
+## 2026-09-16 — merge train to v4.2.0, and the post-tag patch window
+
+Forty-five PRs merged in the calendar day; v4.2.0 shipped at 21:30Z from bump
+PR #3177 (110 fragments: Added 6 / Changed 23 / Fixed 80 / Removed 1) with
+release-qa SHIP 13/13 on pi 0.85.1 and on the 0.80.10 host floor, both against
+the pushed base. The release gate the maintainer set — clear external issues,
+then land #3157 and #3163 — was met by #3166 (in-lane cascade finding policy,
+three rounds) and #3169 (read-guard pendingCreations keyed by the syntactic
+spelling on both sides; the win32 red-first was waived on the POSIX transcript
+plus the Windows lane's post-fix green). #2042 (CI exit-137 kill) closed after
+sixteen consecutive kill-free master runs following #3091. The external
+report #3090 closed via #3159, which also added the first macOS APFS test leg;
+its first run redded two new guards that both fixer and reviewer had asserted
+would skip, because the fixture created the case-variant sibling before the
+skip probe. Typst, the newest language, gained a diagnostic-bearing nightly
+LSP-gate fixture (#3171) after a local smoke showed the nightly only proved a
+handshake.
+
+What the train taught, mostly through reviewers attacking their own
+prescriptions: a fold onto a shared seam moved the finding-policy filter after
+a pre-existing display cap, so marked findings consumed the cap and genuine
+ones vanished (#3166 r1), then the bound added to fix it hid the same loss one
+threshold up until the block itself disclosed it (r2/r3); a reader-side
+normalizer change on a path-keyed map inverted two writer arms it never
+probed and then swapped a transformation on an unmeasured "subsumes" claim
+(#3178, four rounds — path-key changes now route to the strongest model
+regardless of label); a narrowing prescription was handed over without its
+residual family measured (#3155); a changelog fragment kept a retracted
+narrative while the body was rewritten; a body quoted "mutated in both
+directions" with one direction missing (#3156). Two teardown incidents where
+`git worktree remove --force` followed the `node_modules` symlink and emptied
+the shared checkout produced the contract line in #3174 (unlink first) and the
+Bash-hook mechanisation #3173. A recursive `fs.watch` in the tests-tree write
+guard emitted an unhandled ENOENT and killed a whole Unit-tests job with no
+failing test (#3179). Two external PRs (#3168, #3176) arrived after the
+release base was cut and go into 4.2.1 after full reviews; their reviews
+surfaced a delivery inversion (an extra in-band publish spending the carry
+marker) and a false-clean on empty server answers, both caught by the repo's
+own #2504 guards once run. Post-tag lanes landed the same evening: #3180
+(mutation-lane dry run under in-place Stryker), #3181 (widget suppressed-chip
+retention, window filed as #3183), #3178 (mark/analyze/paths-mode key parity,
+class filed as #3184).
+
+## 2026-09-17 — rules adopted from the train's retro rows
+
+Rules adopted 2026-09-17 from the train's retro rows: prescribed-narrowing
+residual family (reviewer contract, verification-rounds section, #3155 r2);
+changelog re-read on body rework (fixer contract's Fix rounds section, and a
+merge-train Mistake|Fix row, #3155 r2); one mutation-table row per direction
+(fixer contract, step 1, #3156 r2 / #3168 r1); measured platform-skip claims
+for case-variant fixtures (fixer contract step 1 and reviewer Standing probes,
+#3159 r2); fold-verdict ordered stages per site (AGENTS.md "Issue and PR
+design contract", #3166 r1); one phase, one semantic, own-call timers
+(AGENTS.md "Commit, prose, issue, and observability conventions", #3166 r1);
+bound disclosure on the rendered surface (AGENTS.md shape 10, #3166 r2);
+commit tests before the mutation loop, restore names source only (fixer
+contract step 4, #3166 r2); normalizer writer/reader tables and measured
+"subsumes" claims routed to the strongest model (AGENTS.md shape 1 and
+"Orchestration and delegated work", #3178); PI_LENS_HOME/PILENS_DATA_DIR
+pinned for probes only, never a blanket vitest export (fixer contract's Probe
+hygiene section, #3178 r3); no full in-place Stryker runs in a shared
+worktree, `--dryRunOnly` for reproductions (fixer and reviewer Probe hygiene
+sections, #3180); and the release-bump PR title format (release-qa skill's
+pre-bump dry-roll step, the 4.2.0 retitle).
+
 ## Archived pre-trim agent context (2026-09-14)
 
 The detailed incident narratives, closed decisions, and subsystem evidence below

@@ -1,6 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
+	type ActionableWarningsReport,
+	type ActionableWarningsAdvisoryFilterResult,
 	buildActionableWarningsReport,
 	formatActionableWarningsAdvisory,
 	publishActionableWarningsReport,
@@ -10,14 +12,16 @@ import { logActionableWarningsEvent } from "./actionable-warnings-logger.js";
 import {
 	appendCodeQualityWarningsHistory,
 	buildCodeQualityWarningsReport,
+	type CodeQualityWarningRecord,
 	formatCodeQualityWarningsAdvisory,
 	writeCodeQualityWarningsReport,
 } from "./code-quality-warnings.js";
-import type { CacheManager } from "./cache-manager.js";
+import type { CacheEntry, CacheManager } from "./cache-manager.js";
 import type { CascadeSkipReason } from "./cascade-types.js";
 import {
 	clearGitGuardTestFailure,
 	mergeGitGuardTestFailure,
+	resyncGitGuardAfterInlinePolicy,
 	writeGitGuardRecord,
 	type TurnEndFindingsCache,
 } from "./git-guard.js";
@@ -42,20 +46,11 @@ import {
 	SWEEP_IDLE_SAFETY_MARGIN_MS,
 } from "./lsp/workspace-sweep-hold.js";
 import { isTestRoleCollateral } from "./collateral-test-role.js";
-import {
-	classifyAndFilterFindings,
-	type GitleaksResult,
-} from "./gitleaks-client.js";
-import type { GovulncheckResult } from "./govulncheck-client.js";
 import type { TrivyResult } from "./trivy-client.js";
-import {
-	dedupeSecretFindings,
-	fromAstGrepWarnings,
-	fromGitleaks,
-	fromTrivySecrets,
-	isSecretWarning,
-	secretLocationKey,
-} from "./secret-findings.js";
+import { isSecretWarning, secretLocationKey } from "./secret-findings.js";
+import { govulncheckLane } from "./turn-end/lanes/govulncheck.js";
+import { secretsLane } from "./turn-end/lanes/secrets.js";
+import type { TurnEndLaneContext } from "./turn-end/lane.js";
 import type { KnipClient, KnipIssue, KnipResult } from "./knip-client.js";
 import type { DeadCodeClient, DeadCodeResult } from "./dead-code-client.js";
 import {
@@ -70,15 +65,9 @@ import {
 	writeProjectDiagnosticsDeltaReport,
 } from "./project-diagnostics/cache.js";
 import { deadCodeIssueToProjectDiagnostic } from "./project-diagnostics/runner-adapters/dead-code.js";
-import { gitleaksFindingToProjectDiagnostic } from "./project-diagnostics/runner-adapters/gitleaks.js";
-import { govulncheckFindingToProjectDiagnostic } from "./project-diagnostics/runner-adapters/govulncheck.js";
-import {
-	trivyFindingToProjectDiagnostic,
-	trivySecretFindingToProjectDiagnostic,
-} from "./project-diagnostics/runner-adapters/trivy.js";
+import { trivyFindingToProjectDiagnostic } from "./project-diagnostics/runner-adapters/trivy.js";
 import { knipIssuesToProjectDiagnostics } from "./project-diagnostics/runner-adapters/knip.js";
 import type { ProjectDiagnostic } from "./project-diagnostics/types.js";
-import { applyDispositionsMultiFile } from "./diagnostic-dispositions.js";
 import { logLatency } from "./latency-logger.js";
 import {
 	getLspBudgetIdleTimeoutMs,
@@ -121,6 +110,22 @@ import {
 } from "./lsp/pending-aux-coverage.js";
 import type { LSPDiagnostic } from "./lsp/client.js";
 import { convertLspDiagnostics } from "./dispatch/utils/lsp-diagnostics.js";
+import { retagAuxiliaryDiagnostics } from "./dispatch/auxiliary-lsp.js";
+import {
+	type PersistentReverifyResult,
+	runPersistentReverify,
+} from "./persistent-reverify.js";
+import { cascadeCarrySuffix } from "./cascade-format.js";
+import {
+	applyPushedFindingPolicy,
+	filterFindingsByDisposition,
+} from "./dispatch/finding-policy.js";
+import { detectFileRole } from "./file-role.js";
+import {
+	applyInlineBlockerPolicy,
+	type InlineBlockerPolicyTallyEntry,
+	summarizeInlineBlockerPolicy,
+} from "./inline-blocker-dispositions.js";
 import {
 	drainPendingRunnerFindings,
 	dropStaleRunnerFindings,
@@ -458,50 +463,6 @@ interface TurnEndDeps {
 	signal?: AbortSignal;
 	/** Delivery adapter whose tool names appear in agent-facing advisories. */
 	host?: LensToolHost;
-}
-
-/**
- * #1617: turn_end reads gitleaks/govulncheck/trivy straight from their
- * session-scan caches and formats them into advisory/blocker text — a
- * reporting lane parallel to (and, before this fix, entirely bypassing)
- * `dispatcher.ts:924`'s `applyDispositions` filter. An agent-marked
- * false-positive/won't-fix on one of these findings never suppressed it
- * here, so it re-reported on every turn.
- *
- * Filters `findings` through the SAME anchor derivation the dispatch path
- * and `lens_diagnostics mode=full` use (`applyDispositionsMultiFile` in
- * `diagnostic-dispositions.ts`), keyed off each lane's own canonical
- * `ProjectDiagnostic` adapter (`toDiagnostic`) — the exact tool/rule/message
- * identity `lens_diagnostics` already surfaces and `lens_diagnostic_mark`
- * already anchors a mark against, not a second, cloned identity that would
- * silently diverge from what the agent actually marked.
- *
- * Returns the surviving findings plus how many were dropped, so a caller can
- * still surface a "suppressed by disposition: N" trace (the #1616
- * suppressed-bucket rule — a security finding must never vanish with no
- * trace, even when the disposition that dropped it is working as intended).
- */
-function filterFindingsByDisposition<F>(
-	findings: F[],
-	cwd: string,
-	toDiagnostic: (finding: F) => ProjectDiagnostic,
-): { kept: F[]; suppressed: number } {
-	if (findings.length === 0) return { kept: findings, suppressed: 0 };
-	const candidates = findings.map((finding) => ({
-		finding,
-		diagnostic: toDiagnostic(finding),
-	}));
-	const survivors = new Set(
-		applyDispositionsMultiFile(
-			candidates.map((c) => c.diagnostic),
-			cwd,
-			(d) => d.filePath,
-		),
-	);
-	const kept = candidates
-		.filter((c) => survivors.has(c.diagnostic))
-		.map((c) => c.finding);
-	return { kept, suppressed: findings.length - kept.length };
 }
 
 /**
@@ -1018,14 +979,21 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	 * branch below.
 	 */
 	const pendingDependencyDriftDeliveries: Array<() => void> = [];
-	for (const {
-		filePath: bPath,
-		summary,
-		stale,
-		staleReason,
-	} of unresolvedBlockers) {
+	/** #3246: one bounded record per TURN for the policy pass, never per finding. */
+	const inlinePolicyEntries: InlineBlockerPolicyTallyEntry[] = [];
+	/**
+	 * #3248: files whose EVERY blocker this pass suppressed — the post-policy
+	 * survivor set, emptied per file. The commit gate is recomputed from it
+	 * below, once, after the loop.
+	 */
+	const policySuppressedPaths: string[] = [];
+	const inlinePolicyStart = Date.now();
+	for (const record of unresolvedBlockers) {
+		const { filePath: bPath, summary, stale, staleReason } = record;
 		const displayPath = toRunnerDisplayPath(cwd, bPath);
+		const tally = { displayPath, sources: record.sources };
 		if (stale) {
+			inlinePolicyEntries.push({ ...tally, stale: true });
 			// #1631: demoted — out of the authoritative blocker channel and into the
 			// advisory channel with a stale marker, so the agent is told to re-run
 			// rather than pressured by a verdict that may already be resolved.
@@ -1092,11 +1060,63 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					(retirementNote ? `\n${retirementNote}` : ""),
 			);
 		} else {
+			// #3246: the agent may have marked one of these blockers
+			// `false-positive` AFTER the record was written, via
+			// `lens_diagnostic_mark` — which every other findings surface honors.
+			// Re-derive the body from the record's structured diagnostics through
+			// the shared `dispatch/finding-policy.ts` stack against the file's
+			// CURRENT bytes, exactly as the late-auxiliary lane below does.
+			const policy = applyInlineBlockerPolicy(record, cwd);
+			inlinePolicyEntries.push({ ...tally, stale: false, outcome: policy });
+			if (policy.body === undefined) {
+				// Every blocker on this file was suppressed. This is a PUSH
+				// surface: silence after a mark is the mark working, not a clean
+				// verdict, so the count rides the bounded per-turn record below
+				// instead of announcing the suppression on every later turn.
+				policySuppressedPaths.push(bPath);
+				continue;
+			}
+			// #1616 suppressed-bucket rule: a delivery that still has something to
+			// say states what it dropped, once per delivery.
+			const suppressedNote =
+				policy.suppressed > 0
+					? ` (suppressed by disposition: ${policy.suppressed} finding(s))`
+					: "";
 			// @delivery-surface: runtime-turn:unresolved-inline-blocker
 			blockerParts.push(
-				`Unresolved from this turn — ${displayPath}:\n${summary}`,
+				`Unresolved from this turn — ${displayPath}${suppressedNote}:\n${policy.body}`,
 			);
 		}
+	}
+	// #3248: the post-policy survivor set per file is FINAL here. The commit
+	// gate reads a latch (`gitGuardHasBlockers`) before it ever reads the
+	// persisted record, and the policy wrote neither — so a file whose every
+	// blocker was just suppressed kept blocking `git commit` while the banner
+	// above said nothing about it. Recompute the latch from this set; the
+	// persisted record is rewritten or cleared further down by the writer that
+	// already owns it (`:4287` / `:4379`), from the same survivor set, and that
+	// clear is gated on the latch recomputed here.
+	const guardLatchBefore = runtime.gitGuardHasBlockers;
+	resyncGitGuardAfterInlinePolicy({
+		runtime,
+		suppressedFilePaths: policySuppressedPaths,
+	});
+	if (inlinePolicyEntries.length > 0) {
+		logLatency({
+			type: "phase",
+			toolName: "turn_end",
+			filePath: cwd,
+			phase: "inline_blocker_policy",
+			durationMs: Date.now() - inlinePolicyStart,
+			metadata: {
+				...summarizeInlineBlockerPolicy(inlinePolicyEntries),
+				// #3248: one row per TURN for the gate outcome, never per finding
+				// — the flip is the event a reader needs to explain why a commit
+				// that was blocked is now allowed.
+				guardFilesSuppressed: policySuppressedPaths.length,
+				guardLatchCleared: guardLatchBefore && !runtime.gitGuardHasBlockers,
+			},
+		});
 	}
 
 	// Drain the deferred cascade computes kicked off this turn (#450). They ran
@@ -1186,6 +1206,27 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	const cascadeResults = cascadeRuns.flatMap((r) =>
 		r.result ? [r.result] : [],
 	);
+	// Fix B (#3167): which results belong to a CARRIED run — the label is
+	// per-result at render time, so the run→result pairing must survive the
+	// flatMap above (which discards the wrapper).
+	// Fix B (#3168 F6): the success-path record — latency.log could not show
+	// the feature ever rendered without it (the only phases were the drop/
+	// settle records). One bounded record per turn, emitted after both render
+	// sections below.
+	let carriedRunsRendered = 0;
+	let labeledAdvisories = 0;
+	const carriedMetaByResult = new Map<
+		NonNullable<(typeof cascadeRuns)[number]["result"]>,
+		{ carriedTurns: number; observedAt: number | undefined }
+	>();
+	for (const r of cascadeRuns) {
+		if (r.result && (r.carriedTurns ?? 0) > 0 && r.carriedTurns !== undefined) {
+			carriedMetaByResult.set(r.result, {
+				carriedTurns: r.carriedTurns,
+				observedAt: r.observedAt,
+			});
+		}
+	}
 	// #1550 class sweep: every cascade record below summarises `cascadeResults`
 	// — runs, which carry their own paths and can be carried across turns
 	// (#1443) — so labelling them with the turn's first EDITED file is the same
@@ -1224,7 +1265,20 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				(n) => neighborOwner.get(normalizeMapKey(n.filePath)) === pk,
 			);
 			if (ownsAny && result.formatted) {
-				parts.push(result.formatted);
+				// Fix B (#3167/#3168): a carried run's re-rendered blocker is labeled
+				// so the agent can tell it from a fresh observation — with the
+				// run's own observation age (#3168 F3).
+				const carryMeta = carriedMetaByResult.get(result);
+				const carrySuffix = cascadeCarrySuffix(
+					carryMeta?.carriedTurns,
+					carryMeta?.observedAt,
+				);
+				parts.push(
+					carrySuffix
+						? `${result.formatted}\n${carrySuffix}`
+						: result.formatted,
+				);
+				if (carrySuffix) carriedRunsRendered += 1;
 				injectedNeighborCount += result.neighbors.length;
 				injectedDiagnosticCount += result.neighbors.reduce(
 					(s, n) => s + n.diagnostics.length,
@@ -1403,43 +1457,85 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		// "ℹ️ Advisory — no action required this turn:" label, so an imperative
 		// ("review dependents manually") would contradict it. The #533 substance
 		// stays: a clean cascade result does NOT cover these files' dependents.
-		const graphAdvisory = buildAdvisory(graphRuns, {
-			lead: (fileCount, reasons) =>
-				`Cascade could not compute downstream impact for ${fileCount} edited file(s) this turn — ` +
-				`the review graph was unavailable (${reasons}), so their dependents were not ` +
-				`cascade-checked and a clean cascade result does not cover them.`,
-			fallbackDetail: (r) =>
-				r.indeterminate?.reason === "missing_node"
-					? "changed file not in the review graph"
-					: "review graph unavailable",
-		});
+		// Fix B (#3167/#3168 F4): a coverage advisory computed from a CARRIED
+		// indeterminate run describes the previous turn's evidence — label it so
+		// the absence-of-coverage statement is not read as current. A MIXED
+		// bucket (some carried, some fresh) is left UNLABELED: a Math.max
+		// suffix on the finished multi-line advisory would attach the carry to
+		// a file that was not carried.
+		const withCarryLabel = (
+			advisory: string | undefined,
+			runs: ReadonlyArray<{ carriedTurns?: number; observedAt?: number }>,
+		): string | undefined => {
+			if (advisory === undefined) return undefined;
+			const carried = runs.filter((r) => (r.carriedTurns ?? 0) > 0);
+			if (carried.length === 0 || carried.length !== runs.length) {
+				return advisory;
+			}
+			// #3168 F13: the bucket's age is the OLDEST carried observation, and
+			// only when EVERY carried run carries one. A `Math.min` sentinel
+			// (`?? Number.MAX_SAFE_INTEGER`) silently ignored the unstamped runs
+			// and stated a confident age for a bucket that contains an unaged
+			// one; one missing stamp collapses the age half to the helper's
+			// neutral "scan age unknown" wording instead.
+			const stamps = carried.map((r) => r.observedAt);
+			const observedAt = stamps.every((s): s is number => s !== undefined)
+				? Math.min(...stamps)
+				: undefined;
+			const suffix = cascadeCarrySuffix(carried[0]?.carriedTurns, observedAt);
+			if (!suffix) return advisory;
+			labeledAdvisories += 1;
+			// #3168 F11: newline, as the blocker path does above. A space join
+			// welded the suffix onto the LAST bullet of a multi-bullet advisory,
+			// so the carry label read as a property of that one file.
+			return `${advisory}\n${suffix}`;
+		};
+		const graphAdvisory = withCarryLabel(
+			buildAdvisory(graphRuns, {
+				lead: (fileCount, reasons) =>
+					`Cascade could not compute downstream impact for ${fileCount} edited file(s) this turn — ` +
+					`the review graph was unavailable (${reasons}), so their dependents were not ` +
+					`cascade-checked and a clean cascade result does not cover them.`,
+				fallbackDetail: (r) =>
+					r.indeterminate?.reason === "missing_node"
+						? "changed file not in the review graph"
+						: "review graph unavailable",
+			}),
+			graphRuns,
+		);
 		// @delivery-surface: runtime-turn:cascade-coverage-advisory
 		if (graphAdvisory) advisoryParts.push(graphAdvisory);
 
-		const bindingAdvisory = buildAdvisory(bindingRuns, {
-			lead: (fileCount, reasons) =>
-				`Cascade identified dependents for ${fileCount} edited file(s) this turn, but their ` +
-				`diagnostics could not be freshly confirmed (${reasons}) and were withheld — a clean ` +
-				`cascade result does not cover them.`,
-			fallbackDetail: () => "cascade diagnostics withheld (binding rejected)",
-		});
+		const bindingAdvisory = withCarryLabel(
+			buildAdvisory(bindingRuns, {
+				lead: (fileCount, reasons) =>
+					`Cascade identified dependents for ${fileCount} edited file(s) this turn, but their ` +
+					`diagnostics could not be freshly confirmed (${reasons}) and were withheld — a clean ` +
+					`cascade result does not cover them.`,
+				fallbackDetail: () => "cascade diagnostics withheld (binding rejected)",
+			}),
+			bindingRuns,
+		);
 		// @delivery-surface: runtime-turn:cascade-coverage-advisory
 		if (bindingAdvisory) advisoryParts.push(bindingAdvisory);
 
-		const budgetAdvisory = buildAdvisory(budgetRuns, {
-			lead: (fileCount, reasons) =>
-				`Cascade checked the selected neighbors for ${fileCount} edited file(s) this turn, ` +
-				`but some eligible dependents were not checked because the cascade budget ` +
-				`was exhausted (${reasons}); a clean cascade result does not cover them.`,
-			fallbackDetail: (r) => {
-				const budget = r.indeterminate?.budget;
-				if (!budget) return "cascade budget omitted eligible dependents";
-				const detail = `cascade budget checked ${budget.selectedCount} of ${budget.eligibleCount} eligible dependents (${budget.truncatedCount} omitted)`;
-				return budget.transitiveTruncated
-					? `${detail}; transitive expansion was capped before all eligible dependents were enumerated`
-					: detail;
-			},
-		});
+		const budgetAdvisory = withCarryLabel(
+			buildAdvisory(budgetRuns, {
+				lead: (fileCount, reasons) =>
+					`Cascade checked the selected neighbors for ${fileCount} edited file(s) this turn, ` +
+					`but some eligible dependents were not checked because the cascade budget ` +
+					`was exhausted (${reasons}); a clean cascade result does not cover them.`,
+				fallbackDetail: (r) => {
+					const budget = r.indeterminate?.budget;
+					if (!budget) return "cascade budget omitted eligible dependents";
+					const detail = `cascade budget checked ${budget.selectedCount} of ${budget.eligibleCount} eligible dependents (${budget.truncatedCount} omitted)`;
+					return budget.transitiveTruncated
+						? `${detail}; transitive expansion was capped before all eligible dependents were enumerated`
+						: detail;
+				},
+			}),
+			budgetRuns,
+		);
 		// @delivery-surface: runtime-turn:cascade-coverage-advisory
 		if (budgetAdvisory) advisoryParts.push(budgetAdvisory);
 
@@ -1480,6 +1576,15 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		});
 	}
 
+	// Fix B (#3168 F6): the success-path record — see the counters above.
+	if (carriedRunsRendered > 0 || labeledAdvisories > 0) {
+		logCascade({
+			phase: "cascade_carry_rendered",
+			filePath: cascadeLogFilePath,
+			metadata: { carriedRunsRendered, labeledAdvisories },
+		});
+	}
+
 	const cascadeSkipped: Record<CascadeSkipReason, number> = {
 		blockers: 0,
 		non_code: 0,
@@ -1515,6 +1620,8 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		totalIssues?: number;
 		newIssues?: number;
 		blockerIssues?: number;
+		/** #3248: findings dropped by a stored disposition before rendering. */
+		dispositionSuppressed?: number;
 		reason?: string;
 		/** Set when the failure was an availability verdict, not a knip run. */
 		failureKind?: string;
@@ -1568,6 +1675,9 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				totalIssues: knipResult.issues.length,
 				newIssues: 0,
 				blockerIssues: 0,
+				// #3248: bounded per-turn, on the row this lane already writes —
+				// never one record per finding.
+				dispositionSuppressed: 0,
 				...(!knipResult.success && { reason: knipResult.summary }),
 				...(knipResult.failureKind && { failureKind: knipResult.failureKind }),
 				...(knipWouldPoison && { cacheKept: true }),
@@ -1597,7 +1707,37 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					projectDiagnosticsSources.add("knip");
 				}
 
-				const blockerIssues = newIssues.filter(
+				// #3248: what the agent READS goes through the same stored-
+				// disposition filter every other findings surface applies, keyed off
+				// knip's OWN `ProjectDiagnostic` adapter — the identity
+				// `lens_diagnostics` surfaces and `lens_diagnostic_mark` anchors
+				// against — so a marked finding stops re-reporting here. The
+				// `projectDiagnosticsDelta` push above deliberately keeps the
+				// UNFILTERED set: that record is what the scan found, and its reader
+				// (`lens_diagnostics`) applies dispositions on read, so filtering it
+				// here would apply the same policy twice on one lane.
+				// Paired through `flatMap` rather than indexing the adapter's array:
+				// `knipIssuesToProjectDiagnostics` is a straight `issues.map(...)`
+				// (one diagnostic per issue, never empty), so this keeps the pairing
+				// total while staying honest under `noUncheckedIndexedAccess`.
+				const knipPaired = newIssues.flatMap((issue) =>
+					knipIssuesToProjectDiagnostics(cwd, [issue]).map((diagnostic) => ({
+						issue,
+						diagnostic,
+					})),
+				);
+				const knipFiltered = filterFindingsByDisposition(
+					knipPaired,
+					cwd,
+					(pair) => pair.diagnostic,
+				);
+				const knipDeliverable = {
+					kept: knipFiltered.kept.map((pair) => pair.issue),
+					suppressed: knipFiltered.suppressed,
+				};
+				knipMeta.dispositionSuppressed = knipDeliverable.suppressed;
+
+				const blockerIssues = knipDeliverable.kept.filter(
 					(i) => i.type === "unlisted" || i.type === "bin",
 				);
 				knipMeta.blockerIssues = blockerIssues.length;
@@ -1627,7 +1767,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				// drown the blockers and burn context every turn); it's available
 				// on demand via lens_diagnostics. The delta also feeds the session-slop
 				// record (`projectDiagnosticsDelta`) above.
-				const unusedExportDelta = newIssues.filter(
+				const unusedExportDelta = knipDeliverable.kept.filter(
 					(i) => i.type === "export" || i.type === "enumMember",
 				);
 				if (unusedExportDelta.length > 0) {
@@ -1667,6 +1807,8 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		success?: boolean;
 		totalIssues?: number;
 		newIssues?: number;
+		/** #3248: findings dropped by a stored disposition before rendering. */
+		dispositionSuppressed?: number;
 		/** Why this turn produced no delta — the five states are otherwise identical. */
 		reason?: string;
 		/** True when a failed run left the previous good cache in place (#1467). */
@@ -1687,6 +1829,8 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		const modifiedFiles = (): Set<string> =>
 			(modifiedSet ??= new Set(files.map((f) => resolveRunnerPath(cwd, f))));
 		let newIssueTotal = 0;
+		/** #3248: bounded per-turn on this lane's own row, never per finding. */
+		let deadCodeDispositionSuppressed = 0;
 		const reasons: string[] = [];
 		// A malformed client or deps object must never abort turn_end. Before the
 		// per-turn delta this block only read a cache; now it iterates and awaits,
@@ -1781,8 +1925,28 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 						),
 					);
 					projectDiagnosticsSources.add("dead-code");
+					// #3248: the rendered advisory takes the stored-disposition
+					// filter, keyed off this lane's OWN adapter. The delta record
+					// above keeps the unfiltered set — its reader applies the policy
+					// on read, so filtering both would double-apply on one lane.
+					const deadCodeDeliverable = filterFindingsByDisposition(
+						newIssues,
+						cwd,
+						(issue) =>
+							deadCodeIssueToProjectDiagnostic(cwd, issue, result.language),
+					);
+					deadCodeDispositionSuppressed += deadCodeDeliverable.suppressed;
+					// Every finding on this scan was marked: a PUSH surface stays
+					// silent rather than re-announcing that the mark is working; the
+					// count rides this lane's bounded per-turn row.
+					if (deadCodeDeliverable.kept.length === 0) {
+						reasons.push(`${client.id}:all_disposed`);
+						continue;
+					}
 					// @delivery-surface: runtime-turn:dead-code-advisory
-					advisoryParts.push(formatDeadCodeDelta(newIssues, result.language));
+					advisoryParts.push(
+						formatDeadCodeDelta(deadCodeDeliverable.kept, result.language),
+					);
 				} catch (err) {
 					dbg(`turn_end: dead-code(${client.id}) failed: ${err}`);
 					reasons.push(`${client.id}:threw`);
@@ -1793,6 +1957,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			reasons.push("block_threw");
 		}
 		deadCodeMeta.newIssues = newIssueTotal;
+		deadCodeMeta.dispositionSuppressed = deadCodeDispositionSuppressed;
 		if (reasons.length > 0) deadCodeMeta.reason = reasons.join(",");
 	}
 	logLatency({
@@ -1820,263 +1985,185 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			(dispositionSuppressedByLane[lane] ?? 0) + count;
 	}
 
-	// govulncheck — surface session_start-cached Go CVE findings as advisory.
-	// No per-turn re-run in this slice; the cache refreshes at next session_start.
-	const govCacheEntry = cacheManager.readCache<GovulncheckResult>(
-		"govulncheck",
-		cwd,
-	);
-	// #1622: govulncheck renders a call site as `file:line`, and the cache is a
-	// session_start snapshot — the same stale-line shape as gitleaks, one tier
-	// lower. A CVE is pinned by go.mod, NOT by the call site, so neither an edit
-	// nor a deletion may drop it: `onMissing: "demote"` routes a vanished traced
-	// file into the same arm as an edited one. This gate only ever decides
-	// whether the cited LINE is still worth printing. (Review round H1: the first
-	// cut let a deleted trace file drop the CVE, contradicting this comment, and
-	// `citedPath` reads only the FIRST filename frame — so one deleted file in a
-	// long trace silently killed a CVE that go.mod still pins.)
-	const govGate = gateFindingsByPathFreshness({
-		store: "govulncheck",
-		findings: govCacheEntry?.data?.findings ?? [],
-		cwd,
-		scannedAt: govCacheEntry?.data?.scannedAt,
-		citedPath: (finding) => finding.trace.find((t) => t.filename)?.filename,
-		onMissing: "demote",
-	});
-	const govStale = new Set(govGate.stale);
-	// #1625 review round: the #1622 freshness gate runs FIRST — the disposition
-	// filter's anchor is derived from each finding's post-demotion identity
-	// (this array is already the gate's live+stale partition, never the raw
-	// pre-gate cache). #1627's own post-gate guard (`if (govFindings.length)`)
-	// and this round's disposition guard are the SAME guard — compose them,
-	// never fall back to a raw-cache-length check (that would print the header
-	// with zero rows beneath it whenever either filter empties the list).
-	const govFiltered = filterFindingsByDisposition(
-		[...govGate.live, ...govGate.stale],
-		cwd,
-		(f) => govulncheckFindingToProjectDiagnostic(cwd, f),
-	);
-	recordDispositionSuppressed("govulncheck", govFiltered.suppressed);
-	const govFindings = govFiltered.kept;
-	if (govFindings.length) {
-		const findings = govFindings.slice(0, 5);
-		let report =
-			"🛡️ Go CVEs reachable from this code (govulncheck) — upgrade where possible:\n";
-		for (const f of findings) {
-			const callSite = f.trace.find((t) => t.filename);
-			const stale = govStale.has(f);
-			const where = callSite?.filename
-				? `${toRunnerDisplayPath(cwd, callSite.filename)}${!stale && callSite.line ? `:${callSite.line}` : ""}${stale ? ` ${STALE_LINE_MARKER}` : ""}`
-				: (f.module ?? f.packageName ?? "(module)");
-			const fix = f.fixedVersion
-				? ` — upgrade to ${f.fixedVersion} or later`
-				: " — no fix yet, track upstream";
-			report += `  ${f.osv} (${where})${fix}\n`;
+	// #1892: ONE read per scanner store per turn_end. The inline lanes got this
+	// for free by reading each cache into a local; now that a lane reads its own
+	// stores (`TurnEndLaneContext.readScannerCache`), the composer and the lanes
+	// must still share one envelope per store — two reads of one store inside
+	// one delivery is the parallel-store shape this umbrella exists to kill, and
+	// the cache's TTL boundary can fall between them, so the secrets tier and
+	// the CVE tier would disagree about the trivy store they both read.
+	//
+	// #3274: the memo holds the PROMISE of each store's envelope, not the
+	// envelope. The read itself moved to `CacheManager.readCacheAsync`, which
+	// suspends on `fs.promises`, so `bounded()` finally has something to bound:
+	// the sync `readCache` completed during ARGUMENT EVALUATION, before
+	// `bounded()` was ever handed a promise, and a wrapper around it registered
+	// a turn_end budget that could never be spent (probed on #3274 with an
+	// already-aborted signal and `ms: 0` — bounded returned undefined and the
+	// read had already parsed). Memoizing the promise is also what keeps the
+	// one-envelope-per-store rule under concurrency: two lanes that await the
+	// same store share ONE read and ONE TTL boundary even when neither has
+	// settled yet, which a value memo could not do.
+	//
+	// An abandoned read yields null, never a throw and never a late envelope:
+	// `bounded()` resolves `undefined` on the budget or the hook's signal and
+	// records ONE `hook-await-exceeded` row per (hook, label) for the deadline
+	// arm, and the memoized promise is already settled by the time the
+	// abandoned read resolves, so nothing mutates after the delivery composed.
+	// A lane that receives null behaves exactly as it does for a cold cache.
+	const scannerCacheReads = new Map<
+		string,
+		Promise<CacheEntry<unknown> | null>
+	>();
+	// Stores this delivery composed WITHOUT because a bound fired, in read
+	// order. `bounded()` records the AWAIT's own row (`hook-await-exceeded`),
+	// but only for the deadline arm and only about the await; the agent-facing
+	// consequence — the secrets tier went out with no gitleaks store behind it,
+	// which looks exactly like a clean scan (AGENTS.md defect shape 10) — has no
+	// record otherwise, on either arm. One row per DELIVERY, below, never one
+	// per store and never on a healthy turn.
+	const scannerStoresUnread: string[] = [];
+	function readScannerCache<T>(scanner: string): Promise<CacheEntry<T> | null> {
+		let pending = scannerCacheReads.get(scanner);
+		if (pending === undefined) {
+			// An already-aborted turn does not start the read at all. `bounded()`
+			// abandons the await but cannot cancel work already dispatched, so
+			// without this the cancelled turn still pays six file reads whose
+			// result nothing can use. Checked AFTER the memo lookup: a signal that
+			// fires mid-delivery must not give the second lane a different answer
+			// from the first (that is the TTL-boundary split this memo exists for).
+			// It records nothing, on purpose: an already-cancelled turn is Escape,
+			// which `bounded()` also keeps off the ledger — the row below is for a
+			// delivery that went out degraded, not one the user stopped.
+			pending = deps.signal?.aborted
+				? Promise.resolve(null)
+				: bounded(cacheManager.readCacheAsync<unknown>(scanner, cwd), {
+						ms: HOOK_WALL_BUDGET_MS.turn_end,
+						signal: deps.signal,
+						hook: "turn_end",
+						label: `readScannerCache:${scanner}`,
+					}).then((entry) => {
+						if (entry === undefined) scannerStoresUnread.push(scanner);
+						return entry ?? null;
+					});
+			scannerCacheReads.set(scanner, pending);
 		}
-		if (govFindings.length > findings.length) {
-			report += `  … and ${govFindings.length - findings.length} more\n`;
-		}
-		// @delivery-surface: runtime-turn:govulncheck-advisory
-		advisoryParts.push(report);
+		return pending as Promise<CacheEntry<T> | null>;
 	}
+	const laneCtx: TurnEndLaneContext = {
+		cwd,
+		signal: deps.signal,
+		readScannerCache,
+		peekActionableWarnings: () => runtime.peekActionableWarnings(),
+	};
 
-	const trivyCacheEntry = cacheManager.readCache<TrivyResult>("trivy", cwd);
+	// govulncheck — the session_start-cached Go CVE store, delivered as ONE
+	// advisory tier by the govulncheck LANE
+	// (`clients/turn-end/lanes/govulncheck.ts`), which owns every rule this block
+	// used to state inline: the `onMissing: "demote"` freshness declaration and
+	// its first-filename-frame `citedPath` (#1622 H1), the disposition anchor
+	// over BOTH freshness arms (#1694 F1), the stale-line withholding and marker,
+	// the module/package fallback, the fix hint and the display cap. No per-turn
+	// re-run in this slice; the cache refreshes at next session_start. Like every
+	// lane it does NOT gate itself — the freshness pass below is shared.
+	const govSources = await govulncheckLane.collect(laneCtx);
+	const trivyCacheEntry = await readScannerCache<TrivyResult>("trivy");
+	// The secrets lane (`clients/turn-end/lanes/secrets.ts`) reads the gitleaks
+	// and trivy stores, classifies, and states the freshness policy its rows
+	// need; every rendering and disposition rule for the two secrets tiers lives
+	// there. It does NOT gate itself either.
+	const secretsSources = await secretsLane.collect(laneCtx);
+	// #1892: ONE freshness pass for the three cached scanner stores that cite a
+	// file. Each store keeps its own `scannedAt` and its own `onMissing` — the
+	// gate carries source identity, so gitleaks' older scan cannot demote a
+	// trivy secret its newer scan covers, and govulncheck's `demote` verdict for
+	// a deleted path cannot reach gitleaks, which must drop it. What IS shared
+	// is the filesystem: one `statSync` per unique cited path per delivery, one
+	// stat budget, and one bounded drop/demote record instead of up to six.
+	//
+	// #1461 slice 1 (#1460) on gitleaks: the cache is TTL-only, so a finding for
+	// a file deleted after the scan was served as a 🔴 blocker for the rest of
+	// the 30-minute window — 119 of 126 findings in pi-lens's own cache. This
+	// read is the single agent-facing consumer of that store (session_start's
+	// read only decides whether to re-scan; the project-diagnostics path
+	// re-scans fresh and reconciles at load), so the drop belongs here, before
+	// the findings enter the shared secret pipeline. #1622 extends the gate from
+	// existence to freshness, and adds trivy secrets — the sibling store with
+	// the identical shape. A cited file edited after the scan keeps its finding
+	// but loses its line number: the credential may still be there, just not
+	// where the snapshot says. Dropping instead would let any edit — malicious
+	// or accidental — mute a real secret.
+	if (scannerStoresUnread.length > 0) {
+		logLatency({
+			type: "phase",
+			toolName: "turn_end",
+			filePath: cwd,
+			phase: "scanner_cache_read_abandoned",
+			durationMs: 0,
+			metadata: {
+				stores: scannerStoresUnread.join("+"),
+				aborted: deps.signal?.aborted === true,
+			},
+		});
+	}
+	const scannerGates = gateFindingsByPathFreshness({
+		cwd,
+		sources: {
+			...govSources,
+			...secretsSources,
+		},
+	});
+	const govGate = scannerGates.govulncheck;
+	const gitleaksGate = scannerGates.gitleaks;
+	const trivySecretsGate = scannerGates["trivy-secrets"];
+	const govDelivery = govulncheckLane.render(
+		govulncheckLane.gate({ govulncheck: govGate }, laneCtx),
+		laneCtx,
+	);
+	for (const [store, count] of Object.entries(
+		govDelivery.dispositionSuppressed ?? {},
+	)) {
+		recordDispositionSuppressed(store, count);
+	}
+	// @delivery-surface: runtime-turn:govulncheck-advisory
+	advisoryParts.push(...(govDelivery.advisoryParts ?? []));
 
 	// Secrets — UNIFIED surfacing (#131 Mode 3). gitleaks, trivy secret, and the
 	// ast-grep hardcoded-secret rules can each flag the SAME line with different
 	// rule ids, which the rule-keyed diagnostic dedup can't collapse. Collapse by
 	// location so a committed/hardcoded secret is reported ONCE (with combined
 	// provenance) — a blocker, since credentials need rotation before merge.
-	const gitleaksData = cacheManager.readCache<GitleaksResult>(
-		"gitleaks",
-		cwd,
-	)?.data;
-	const trivySecretsData = trivyCacheEntry?.data;
-	// Gitleaks deliberately scans gitignored local files and nested repositories
-	// so an explicit security audit can still inspect them. The adapter is the
-	// source of truth for whether a finding belongs in a blocking delivery lane;
-	// filter here before freshness handling so demoted findings cannot leak into
-	// either the blocker or stale-secret turn context.
-	const boundedClassification = await bounded(
-		classifyAndFilterFindings(gitleaksData?.findings ?? [], cwd),
-		{
-			ms: HOOK_WALL_BUDGET_MS.turn_end,
-			signal: deps.signal,
-			hook: "turn_end",
-			label: "classifyAndFilterFindings",
-		},
-	);
-	const classifiedGitleaksFindings =
-		boundedClassification ?? gitleaksData?.findings ?? [];
-	if (boundedClassification === undefined) {
-		recordDegradationOnce({
-			kind: "gitleaks_classification_timeout",
-			subject: cwd,
-			reason:
-				"gitleaks classification exceeded the turn_end budget; retained raw findings to fail open",
-		});
-	}
-	const blockingGitleaksFindings = classifiedGitleaksFindings.filter(
-		(finding) =>
-			gitleaksFindingToProjectDiagnostic(cwd, finding).semantic === "blocking",
-	);
-	// #1461 slice 1 (#1460): the gitleaks cache is TTL-only, so a finding for a
-	// file deleted after the scan is still served as a 🔴 blocker for the rest
-	// of the 30-minute window — the live case, and 119 of 126 findings in
-	// pi-lens's own cache. This read is the single agent-facing consumer of that
-	// store (session_start's read only decides whether to re-scan; the
-	// project-diagnostics path re-scans fresh and reconciles at load), so the
-	// drop belongs here, before the findings enter the shared secret pipeline.
-	// #1622 extends that gate from existence to freshness, and adds trivy
-	// secrets — the sibling store with the identical shape. A cited file edited
-	// after the scan keeps its finding but loses its line number: the credential
-	// may still be there, just not where the snapshot says. Dropping instead
-	// would let any edit — malicious or accidental — mute a real secret.
-	const gitleaksGate = gateFindingsByPathFreshness({
-		store: "gitleaks",
-		findings: blockingGitleaksFindings,
-		cwd,
-		scannedAt: gitleaksData?.scannedAt,
-		citedPath: (finding) => finding.file,
-	});
-	const trivySecretsGate = gateFindingsByPathFreshness({
-		store: "trivy-secrets",
-		findings: trivySecretsData?.secrets ?? [],
-		cwd,
-		scannedAt: trivySecretsData?.scannedAt,
-		citedPath: (finding) => finding.file,
-	});
-	// #1617: THE bug this issue exists for — gitleaks findings never passed
-	// through `applyDispositions`, so an agent-marked false-positive/won't-fix
-	// re-reported as a 🔴 STOP blocker on every turn. Filter through the SAME
-	// `gitleaksFindingToProjectDiagnostic` identity `lens_diagnostics
-	// mode=full` surfaces (tool="gitleaks", rule="gitleaks:<ruleId>", the
-	// exact "Potential secret: …" message) so a mark made against what the
-	// agent was shown is honored here too.
 	//
-	// #1625 review round: filtered AFTER the #1622 freshness gate above — the
-	// anchor is derived from each finding's post-demotion identity, never the
-	// raw pre-gate cache. Applied to BOTH `gitleaksGate.live` AND
-	// `gitleaksGate.stale`: `staleSecretEntries` below derives from the stale
-	// arm, and an fp-marked finding that later goes stale must not reappear
-	// there — a suppression escape (and a double count against
-	// `dispositionSuppressedTotal`) that a live-only filter would have missed.
-	//
-	// #1628: trivy-secret findings get the SAME treatment, now that
-	// `trivySecretFindingToProjectDiagnostic` (project-diagnostics/runner-
-	// adapters/trivy.ts) gives them a `lens_diagnostics`-surfaced identity
-	// (tool="trivy", rule="trivy-secret:<ruleId>") to anchor a mark against —
-	// same pattern as gitleaks above, applied to both the live and stale arms
-	// for the same reason.
-	//
-	// ast-grep secret findings need no filtering here — they already went
-	// through dispatch's applyDispositions before reaching
-	// `peekActionableWarnings()`.
-	const gitleaksLiveFiltered = filterFindingsByDisposition(
-		gitleaksGate.live,
-		cwd,
-		(f) => gitleaksFindingToProjectDiagnostic(cwd, f),
+	// #1892: both tiers are rendered by the secrets LANE
+	// (`clients/turn-end/lanes/secrets.ts`), which owns every rule this block
+	// used to state inline — the two stores' disposition anchors over BOTH
+	// freshness arms (#1617/#1625/#1628), the location dedupe and ast-grep
+	// provenance enrichment, the demoted tier's file+rule+source identity
+	// (#1622 M1) and its own-tier placement (#1622 M2). The composer keeps only
+	// what is not one lane's rule: the gated arms it hands over, the order the
+	// tiers are pushed in, and the per-lane suppression counts that fold into
+	// the one notice below.
+	const secretsDelivery = secretsLane.render(
+		secretsLane.gate(
+			{
+				gitleaks: gitleaksGate,
+				"trivy-secrets": trivySecretsGate,
+			},
+			laneCtx,
+		),
+		laneCtx,
 	);
-	const gitleaksStaleFiltered = filterFindingsByDisposition(
-		gitleaksGate.stale,
-		cwd,
-		(f) => gitleaksFindingToProjectDiagnostic(cwd, f),
-	);
-	recordDispositionSuppressed(
-		"gitleaks",
-		gitleaksLiveFiltered.suppressed + gitleaksStaleFiltered.suppressed,
-	);
-	const trivySecretsLiveFiltered = filterFindingsByDisposition(
-		trivySecretsGate.live,
-		cwd,
-		(f) => trivySecretFindingToProjectDiagnostic(cwd, f),
-	);
-	const trivySecretsStaleFiltered = filterFindingsByDisposition(
-		trivySecretsGate.stale,
-		cwd,
-		(f) => trivySecretFindingToProjectDiagnostic(cwd, f),
-	);
-	recordDispositionSuppressed(
-		"trivy-secrets",
-		trivySecretsLiveFiltered.suppressed + trivySecretsStaleFiltered.suppressed,
-	);
-	const astSecretWarnings = runtime
-		.peekActionableWarnings()
-		.filter(isSecretWarning);
-	const sessionSecrets = dedupeSecretFindings([
-		...fromGitleaks(gitleaksLiveFiltered.kept),
-		...fromTrivySecrets(trivySecretsLiveFiltered.kept),
-	]);
-	// Demoted secrets are addressed by FILE, never by line — the line is the one
-	// field the edit invalidated. Rule id and source survive it and must be
-	// carried through (review round M1): an agent triages an `aws-access-token`
-	// differently from a low-confidence `generic-api-key`, and cannot do that
-	// from a bare path. Deduped on file+rule+source so a file with twenty stale
-	// hits of one rule is named once.
-	const staleSecretEntries = [
-		...gitleaksStaleFiltered.kept.map((f) => ({
-			file: toRunnerDisplayPath(cwd, f.file),
-			rule: f.ruleId,
-			source: "gitleaks",
-		})),
-		...trivySecretsStaleFiltered.kept.map((f) => ({
-			file: toRunnerDisplayPath(cwd, f.file),
-			rule: f.ruleId,
-			source: "trivy",
-		})),
-	];
-	const staleSecrets = [
-		...new Map(
-			staleSecretEntries.map((e) => [`${e.file}|${e.rule}|${e.source}`, e]),
-		).values(),
-	];
-	// Locations already surfaced as session-scan secret blockers — used to enrich
-	// provenance where ast-grep agrees and to suppress the duplicate ast-grep copy
-	// from the actionable-warnings advisory below.
-	const secretBlockedLocations = new Set(
-		sessionSecrets.map((f) => secretLocationKey(f.file, f.line)),
-	);
-	if (sessionSecrets.length) {
-		// Fold in ast-grep provenance ONLY where it coincides with a session
-		// secret — don't promote ast-grep-only findings out of their advisory tier.
-		const enriched = dedupeSecretFindings([
-			...sessionSecrets,
-			...fromAstGrepWarnings(astSecretWarnings).filter((a) =>
-				secretBlockedLocations.has(secretLocationKey(a.file, a.line)),
-			),
-		]);
-		const shown = enriched.slice(0, 5);
-		let report =
-			"🔴 STOP — hardcoded secrets detected. Rotate the credentials and remove them from source:\n";
-		for (const f of shown) {
-			const where = `${toRunnerDisplayPath(cwd, f.file)}:${f.line}`;
-			report += `  ${where} — ${f.rule} [${f.sources.join(" + ")}]${f.description ? `: ${f.description}` : ""}\n`;
-		}
-		if (enriched.length > shown.length) {
-			report += `  … and ${enriched.length - shown.length} more\n`;
-		}
-		// @delivery-surface: runtime-turn:secrets-gitleaks,runtime-turn:secrets-trivy
-		blockerParts.push(report);
+	for (const [store, count] of Object.entries(
+		secretsDelivery.dispositionSuppressed ?? {},
+	)) {
+		recordDispositionSuppressed(store, count);
 	}
-	if (staleSecrets.length) {
-		// Its OWN tier, never `advisoryParts` (review round M2). The advisory tier
-		// is labelled "no action required this turn", which would sit directly
-		// above copy telling the agent to re-scan — a section that contradicts its
-		// own heading. This preamble is imperative because the action is real: the
-		// finding is unverified, not dismissed.
-		const shown = staleSecrets.slice(0, 5);
-		let report =
-			`🔑 ACTION NEEDED — secrets were flagged in files that changed after the scan. ${STALE_LINE_MARKER}\n` +
-			"The cached line numbers are no longer trustworthy, so they are withheld. Re-run a secrets scan to confirm or clear these:\n";
-		for (const entry of shown) {
-			report += `  ${entry.file} — ${entry.rule} [${entry.source}]\n`;
-		}
-		if (staleSecrets.length > shown.length) {
-			report += `  … and ${staleSecrets.length - shown.length} more\n`;
-		}
-		// @delivery-surface: runtime-turn:stale-secrets-tier
-		staleSecretParts.push(report);
-	}
+	const secretBlockedLocations =
+		secretsDelivery.deliveredLocationKeys ?? new Set<string>();
+	// @delivery-surface: runtime-turn:secrets-gitleaks,runtime-turn:secrets-trivy
+	blockerParts.push(...(secretsDelivery.blockerParts ?? []));
+	// @delivery-surface: runtime-turn:stale-secrets-tier
+	staleSecretParts.push(...(secretsDelivery.staleSecretParts ?? []));
 
 	// trivy — surface session_start-cached dependency CVEs (#131, Phase 1).
 	// CRITICAL is a blocker (a known-exploitable CVE in a shipped dep is real
@@ -3183,12 +3270,15 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					"the affected files may have unreported callers.",
 			);
 		} else {
+			const callGraphStart = Date.now();
 			try {
 				const { impact, formatImpact, parseSymbolKey } =
 					await import("./call-graph.js");
 				const { callGraphImpactToProjectDiagnostics } =
 					await import("./project-diagnostics/runner-adapters/call-graph-impact.js");
 				const impactLines: string[] = [];
+				/** #3248: bounded per-turn, never per finding. */
+				let callGraphDispositionSuppressed = 0;
 				const impactFindings: {
 					calleeKey: string;
 					results: ReturnType<typeof impact>;
@@ -3227,7 +3317,43 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 						});
 						if (results.length > 0) {
 							impactFindings.push({ calleeKey, results });
-							const summary = formatImpact(results, cwd);
+							// #3248: the rendered line takes the stored-disposition
+							// filter. A result is mapped to its diagnostic by the
+							// lane's OWN adapter, ONE result at a time, so the
+							// identity can never diverge from the one
+							// `lens_diagnostics` surfaces and a mark anchors against
+							// — and a result the adapter does not map (the Review
+							// tier, an unattributable key, a test-role caller) is
+							// kept unconditionally: it is not markable, so nothing
+							// may suppress it. Re-rendered with `formatImpact`, the
+							// same renderer, never a second one.
+							// `flatMap` rather than a push-under-an-`if`: an entry the
+							// adapter does not map simply yields nothing, so the array
+							// is well-typed with no branch whose removal changes no
+							// behaviour (there is nothing here to mutate).
+							const markable = results.flatMap((result) =>
+								callGraphImpactToProjectDiagnostics(cwd, [
+									{ calleeKey, results: [result] },
+								]).map((diagnostic) => ({ result, diagnostic })),
+							);
+							const filtered = filterFindingsByDisposition(
+								markable,
+								cwd,
+								(entry) => entry.diagnostic,
+							);
+							callGraphDispositionSuppressed += filtered.suppressed;
+							const keptEntries = new Set(filtered.kept);
+							const dropped = new Set(
+								markable
+									.filter((entry) => !keptEntries.has(entry))
+									.map((entry) => entry.result),
+							);
+							const survivors =
+								dropped.size === 0
+									? results
+									: results.filter((r) => !dropped.has(r));
+							const summary =
+								survivors.length > 0 ? formatImpact(survivors, cwd) : "";
 							if (summary)
 								impactLines.push(
 									`  ${parseSymbolKey(calleeKey).symbolName ?? calleeKey}: ${summary}`,
@@ -3250,6 +3376,23 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 						projectDiagnosticsDelta.push(...impactDiagnostics);
 						projectDiagnosticsSources.add("call-graph");
 					}
+				}
+				// #3248: this lane wrote nothing per turn, so its delivery decision
+				// — including how many callers a stored disposition dropped — was
+				// unobservable. One bounded row per turn, only when the lane ran.
+				if (impactFindings.length > 0 || callGraphDispositionSuppressed > 0) {
+					logLatency({
+						type: "phase",
+						toolName: "turn_end",
+						filePath: cwd,
+						phase: "call_graph_impact",
+						durationMs: Date.now() - callGraphStart,
+						metadata: {
+							callees: impactFindings.length,
+							lines: impactLines.length,
+							dispositionSuppressed: callGraphDispositionSuppressed,
+						},
+					});
 				}
 				// Non-fatal — call graph is best-effort
 			} catch {
@@ -3289,7 +3432,44 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			fileSeqByPath.set(filePath, getFileSeq.call(runtime, filePath));
 		}
 	}
+	let reverify: PersistentReverifyResult | undefined;
 	if (getFlag("lens-actionable-warnings")) {
+		// #3170: re-verify carried deferred findings before the advisory
+		// assembles — a finding whose file is unchanged re-serves from the
+		// persisted report without ever being re-observed; root-cause-fixed-
+		// elsewhere findings converge here instead of repeating. Bounded in the
+		// module (≤4 files, wall budget, abort signal). #3176 F1: the
+		// replacement entries fold into THIS turn's single in-band publish
+		// below — a separate replacement publish spends the carry marker and
+		// this publish then drops the entries at the scope guard (the blocker
+		// the review caught).
+		const persistedReport = cacheManager.readCache<ActionableWarningsReport>(
+			"actionable-warnings",
+			cwd,
+			Number.MAX_SAFE_INTEGER,
+		)?.data;
+		if (persistedReport?.files?.some((entry) => entry.origin === "deferred")) {
+			const reverifyLspService = getLSPService();
+			if (reverifyLspService) {
+				// #2523: the hook-path await is bound-wrapped with the hook's own
+				// budget and signal; the pass's internal deadline (3s) is the
+				// tighter of the two.
+				reverify = await bounded(
+					runPersistentReverify({
+						report: persistedReport,
+						cwd,
+						lspService: reverifyLspService,
+						signal: getAmbientAbortSignal(),
+					}),
+					{
+						ms: HOOK_WALL_BUDGET_MS.turn_end,
+						signal: getAmbientAbortSignal(),
+						hook: "turn_end",
+						label: "persistent_reverify",
+					},
+				);
+			}
+		}
 		try {
 			const report = await buildActionableWarningsReport({
 				cwd,
@@ -3297,21 +3477,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				turnIndex: runtime.turnIndex,
 				files,
 				modifiedRangesByFile,
-				// Suppress the ast-grep secret advisory at any location already
-				// surfaced in the unified secrets blocker above (#131 Mode 3) — the
-				// secret is reported once, not twice.
-				dispatchWarnings: runtime
-					.peekActionableWarnings()
-					.filter(
-						(w) =>
-							!(
-								isSecretWarning(w) &&
-								typeof w.line === "number" &&
-								secretBlockedLocations.has(
-									secretLocationKey(w.filePath, w.line),
-								)
-							),
-					),
+				dispatchWarnings: runtime.peekActionableWarnings(),
 				includeLspCodeActions: !!getFlag("lens-actionable-warning-actions"),
 				projectSeqStart: runtime.turnStartProjectSeq,
 				projectSeqEnd: runtime.projectSeq,
@@ -3376,6 +3542,34 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			// forward only entries a DEFERRAL produced, and only while their
 			// file has not moved, so a `turn_delta` report does not accumulate
 			// every prior turn's findings.
+			// #3176 F1: the re-verify replacements fold into THIS report — one
+			// in-band publish total, so the carry marker is spent exactly once and
+			// the merged report cannot drop the entries behind the publish (the
+			// blocker the review caught).
+			if (reverify?.replacementFiles.length) {
+				const replacementByPath = new Map(
+					reverify.replacementFiles.map((file) => [
+						normalizeMapKey(file.filePath),
+						file,
+					]),
+				);
+				const files = (report.files ?? []).map(
+					(file) =>
+						replacementByPath.get(normalizeMapKey(file.filePath)) ?? file,
+				);
+				for (const replacement of reverify.replacementFiles) {
+					if (
+						!files.some(
+							(file) =>
+								normalizeMapKey(file.filePath) ===
+								normalizeMapKey(replacement.filePath),
+						)
+					) {
+						files.push(replacement);
+					}
+				}
+				report.files = files;
+			}
 			const publishResult = publishActionableWarningsReport(
 				cacheManager,
 				cwd,
@@ -3400,6 +3594,52 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				publishResult.report,
 				cwd,
 				host,
+				(report): ActionableWarningsAdvisoryFilterResult => {
+					let dispositionSuppressed = 0;
+					const files = report.files
+						.map((file) => {
+							const policy = filterFindingsByDisposition(
+								file.warnings,
+								cwd,
+								(warning) => {
+									const { line, column, rule, code } = warning;
+									return {
+										filePath: warning.filePath,
+										severity: warning.severity,
+										semantic: "warning",
+										tool: warning.tool,
+										runner: warning.tool,
+										message: warning.message,
+										source: warning.origin === "lsp" ? "lsp" : "dispatch",
+										...(line === undefined ? {} : { line: warning.line }),
+										...(column === undefined ? {} : { column: warning.column }),
+										...(rule === undefined ? {} : { rule: warning.rule }),
+										...(code === undefined ? {} : { code }),
+									};
+								},
+							);
+							dispositionSuppressed += policy.suppressed;
+							const kept = policy.kept.filter(
+								(warning) =>
+									!(
+										isSecretWarning(warning) &&
+										typeof warning.line === "number" &&
+										secretBlockedLocations.has(
+											secretLocationKey(warning.filePath, warning.line),
+										)
+									),
+							);
+							return kept.length > 0 ? { ...file, warnings: kept } : undefined;
+						})
+						.filter(
+							(file): file is NonNullable<typeof file> => file !== undefined,
+						);
+					recordDispositionSuppressed(
+						"actionable-warnings",
+						dispositionSuppressed,
+					);
+					return { files, suppressed: dispositionSuppressed };
+				},
 			);
 			// @delivery-surface: runtime-turn:actionable-warnings-advisory
 			if (advisory) advisoryParts.push(advisory);
@@ -3443,11 +3683,43 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 
 	const t5 = Date.now();
 	try {
+		// #3248: the code-quality records were filtered at DISPATCH time, before
+		// any `lens_diagnostic_mark`. `lens_diagnostics mode=delta` re-applies
+		// dispositions when it re-serves this same cache
+		// (`tools/lens-diagnostics.ts`'s `visibleWarningFiles`), so without this
+		// the turn-end advisory counted warnings the delta view had already
+		// dropped — the two surfaces disagreed about the same records. Filtered
+		// at the report INPUT so the advisory, the persisted report and the delta
+		// view all agree; the delta view's own filter then re-applies to the same
+		// set and is idempotent. Per file, because the anchor is content-bound.
+		const qualityWarningsByFile = new Map<string, CodeQualityWarningRecord[]>();
+		for (const warning of runtime.peekCodeQualityWarnings()) {
+			const group = qualityWarningsByFile.get(warning.filePath);
+			if (group) group.push(warning);
+			else qualityWarningsByFile.set(warning.filePath, [warning]);
+		}
+		const qualityWarnings: CodeQualityWarningRecord[] = [];
+		let qualityDispositionSuppressed = 0;
+		for (const [filePath, group] of qualityWarningsByFile) {
+			let content: string | undefined;
+			try {
+				content = fs.readFileSync(filePath, "utf-8");
+			} catch {
+				content = undefined;
+			}
+			const { kept, suppressed } = applyPushedFindingPolicy(group, {
+				cwd,
+				filePath,
+				content,
+			});
+			qualityWarnings.push(...kept);
+			qualityDispositionSuppressed += suppressed;
+		}
 		const qualityReport = buildCodeQualityWarningsReport({
 			cwd,
 			sessionId: runtime.telemetrySessionId,
 			turnIndex: runtime.turnIndex,
-			warnings: runtime.peekCodeQualityWarnings(),
+			warnings: qualityWarnings,
 			modifiedRangesByFile,
 			projectSeqStart: runtime.turnStartProjectSeq,
 			projectSeqEnd: runtime.projectSeq,
@@ -3468,7 +3740,11 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			filePath: cwd,
 			phase: "code_quality_warnings_report",
 			durationMs: Date.now() - t5,
-			metadata: qualityReport.summary,
+			metadata: {
+				...qualityReport.summary,
+				// #3248: bounded per-turn on this lane's own row.
+				dispositionSuppressed: qualityDispositionSuppressed,
+			},
 		});
 	} catch (err) {
 		dbg(`turn_end: code quality warning report failed: ${err}`);
@@ -3500,6 +3776,8 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	let runnerFindingsStale = 0;
 	let runnerFindingsFailed = 0;
 	let runnerFindingsDropped = 0;
+	/** #3248: bounded per-turn on this lane's own row, never per finding. */
+	let runnerFindingsDispositionSuppressed = 0;
 	const runnerFindingsDeliveredIds: string[] = [];
 	for (const pending of pendingRunnerFindings) {
 		const result = pending.result;
@@ -3523,12 +3801,15 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		}
 		const findings = result.diagnostics;
 		if (findings.length === 0) continue;
-		const gate = gateFindingsByPathFreshness({
-			store: "late-runner-findings",
-			findings,
+		const { "late-runner-findings": gate } = gateFindingsByPathFreshness({
 			cwd,
-			scannedAt: pending.markedAtMs,
-			citedPath: (finding) => finding.filePath,
+			sources: {
+				"late-runner-findings": {
+					findings,
+					scannedAt: pending.markedAtMs,
+					citedPath: (finding: (typeof findings)[number]) => finding.filePath,
+				},
+			},
 		});
 		runnerFindingsStale += gate.stale.length;
 		if (gate.stale.length > 0) {
@@ -3540,19 +3821,51 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		}
 		if (gate.live.length === 0) continue;
 		const displayPath = toRunnerDisplayPath(cwd, pending.filePath);
-		const lines = gate.live.map(
+		// #3248: the survivors are what the agent READS, so they take the same
+		// policy stack the late-AUXILIARY drain below applies — this lane is its
+		// twin (same post-gate `Diagnostic[]`, same rendering) and was the one
+		// push surface still re-reporting a finding the agent had marked. AFTER
+		// the freshness gate, like every other lane: the anchor is derived from
+		// the post-gate identity, never the raw pre-gate set. The file's CURRENT
+		// bytes; an unreadable file fails open inside the helper.
+		let runnerContent: string | undefined;
+		try {
+			runnerContent = fs.readFileSync(pending.filePath, "utf-8");
+		} catch {
+			runnerContent = undefined;
+		}
+		const { kept: runnerKept, suppressed: runnerSuppressedHere } =
+			applyPushedFindingPolicy(gate.live, {
+				cwd,
+				filePath: pending.filePath,
+				content: runnerContent,
+			});
+		runnerFindingsDispositionSuppressed += runnerSuppressedHere;
+		if (runnerKept.length === 0) {
+			// Every late finding was marked. A PUSH surface stays silent rather
+			// than re-announcing that the mark is working; the count rides this
+			// lane's bounded per-turn row below.
+			continue;
+		}
+		const lines = runnerKept.map(
 			(finding) =>
 				`  ${displayPath}:${finding.line ?? 1}:${finding.column ?? 1} [${finding.rule ?? finding.id}] ${finding.message}`,
 		);
-		runnerFindingsDelivered += gate.live.length;
-		for (const finding of gate.live) {
+		runnerFindingsDelivered += runnerKept.length;
+		for (const finding of runnerKept) {
 			if (runnerFindingsDeliveredIds.length < 50) {
 				runnerFindingsDeliveredIds.push(finding.id);
 			}
 		}
+		// #1616 suppressed-bucket rule: a delivery that still has something to
+		// say states what it dropped, once per delivery.
+		const runnerSuppressedNote =
+			runnerSuppressedHere > 0
+				? `; suppressed by disposition: ${runnerSuppressedHere} finding(s)`
+				: "";
 		// @delivery-surface: runtime-turn:late-runner-findings
 		advisoryParts.push(
-			`⏱️ Late runner diagnostics (${pending.runnerId} completed after the edit):\n${lines.join("\n")}`,
+			`⏱️ Late runner diagnostics (${pending.runnerId} completed after the edit${runnerSuppressedNote}):\n${lines.join("\n")}`,
 		);
 	}
 	logLatency({
@@ -3567,6 +3880,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			stale: runnerFindingsStale,
 			failed: runnerFindingsFailed,
 			dropped: runnerFindingsDropped,
+			dispositionSuppressed: runnerFindingsDispositionSuppressed,
 			deliveredIds: runnerFindingsDeliveredIds,
 		},
 	});
@@ -3597,6 +3911,13 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	let lateAuxCeilingExhausted = 0;
 	let lateAuxAnswered = 0;
 	let lateAuxNotifyStallDemoted = 0;
+	// #3102: dropped by the shared finding-policy stack (inline `pi-lens-ignore`
+	// / stored disposition / `.pi-lens.json` rule policy) and, separately, by the
+	// auxiliary profile's OWN native suppression inside `retagAuxiliaryDiagnostics`.
+	// Both are reported in the one bounded per-turn record below — a drop is
+	// never silent (shape 10).
+	let lateAuxDispositionSuppressed = 0;
+	let lateAuxAuxSuppressed = 0;
 	const lateAuxCoverageGapPairs: Array<{
 		filePath: string;
 		serverId: string;
@@ -3655,6 +3976,31 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					continue;
 				}
 				const displayLateAuxPath = toRunnerDisplayPath(cwd, lateAuxPath);
+				// #3102: the file's CURRENT bytes, for the two content-bound halves
+				// of the policy stack (inline `pi-lens-ignore` and the STRICT
+				// `false-positive` anchor) and for the auxiliary profile's own
+				// native suppression. Read at most ONCE per file per drain, lazily:
+				// a turn that drains nothing, finds no live client, re-arms, or
+				// confirms clean pays no I/O at all, and a file with several pending
+				// servers pays one read for all of them. Measured cost on the one
+				// file that does publish: 0.10-0.20 ms typical, 4.0 ms worst case
+				// (a 180 KB file, 5 findings, a populated disposition store) against
+				// the 3000 ms `HOOK_WALL_BUDGET_MS.turn_end`. A read failure yields
+				// `undefined`: the content-free half still applies and nothing is
+				// hidden on an I/O error (shape 48).
+				let lateAuxContentRead = false;
+				let lateAuxContentValue: string | undefined;
+				const readLateAuxContent = (): string | undefined => {
+					if (!lateAuxContentRead) {
+						lateAuxContentRead = true;
+						try {
+							lateAuxContentValue = fs.readFileSync(lateAuxPath, "utf-8");
+						} catch {
+							lateAuxContentValue = undefined;
+						}
+					}
+					return lateAuxContentValue;
+				};
 				for (const pair of pairs) {
 					const cachedEntry = cached.get(pair.serverId);
 					if (cachedEntry === undefined) {
@@ -3749,11 +4095,33 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 						lateAuxCleanConfirmed += 1;
 						continue;
 					}
-					const converted = convertLspDiagnostics(rawDiags, lateAuxPath, {
-						tool: "lsp",
-					});
-					if (converted.length === 0) {
+					// `convertLspDiagnostics` drops entries with no start line, which
+					// would break the 1:1 index alignment `retagAuxiliaryDiagnostics`
+					// needs. Partition first so `converted[i]` IS `anchored[i]` —
+					// the same pre-partition `applyLspFindingPolicy` does.
+					const anchored = rawDiags.filter(
+						(d) => d.range?.start?.line !== undefined,
+					);
+					if (anchored.length === 0) {
 						lateAuxMissing += rawDiags.length;
+						lateAuxAnswered += 1;
+						continue;
+					}
+					const lateAuxContent = readLateAuxContent();
+					const converted = convertLspDiagnostics(anchored, lateAuxPath);
+					// #3046/#3047: the auxiliary's REAL tool id (and its own native
+					// inline suppression — opengrep's `# nosemgrep`, ast-grep's
+					// test-file gate), from the ONE shared derivation every other
+					// surface anchors a mark against. These diagnostics come straight
+					// off the aux client's cache, so nothing upstream applied it.
+					const retained = retagAuxiliaryDiagnostics(
+						converted,
+						anchored,
+						lateAuxContent ?? "",
+						{ cwd, fileRole: detectFileRole(lateAuxPath, lateAuxContent) },
+					);
+					lateAuxAuxSuppressed += converted.length - retained.length;
+					if (retained.length === 0) {
 						lateAuxAnswered += 1;
 						continue;
 					}
@@ -3766,16 +4134,20 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					// one), so a stale-arm replay would double-report old content.
 					// Both drops are COUNTED here and in the latency record below —
 					// never silent (shape 10).
-					const gate = gateFindingsByPathFreshness({
-						store: "late-auxiliary-findings",
-						findings: converted,
-						cwd,
-						scannedAt: pair.markedAtMs,
-						citedPath: () => lateAuxPath,
-					});
+					const { "late-auxiliary-findings": gate } =
+						gateFindingsByPathFreshness({
+							cwd,
+							sources: {
+								"late-auxiliary-findings": {
+									findings: retained,
+									scannedAt: pair.markedAtMs,
+									citedPath: () => lateAuxPath,
+								},
+							},
+						});
 					lateAuxStale += gate.stale.length;
 					lateAuxMissing +=
-						converted.length - gate.live.length - gate.stale.length;
+						retained.length - gate.live.length - gate.stale.length;
 					if (gate.live.length === 0) {
 						if (gate.stale.length > 0) {
 							// Stale findings mean the scan predates the last edit. Re-arm
@@ -3806,15 +4178,49 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					// merged one). Late findings reach the agent as the gated advisory
 					// below; the turn-end hash-guarded fast path stays cold for a file
 					// whose touch was partial, which is exactly what #1470 requires.
-					const lines = gate.live.map(
+					// #3102: the survivors are what the agent READS, so they take the
+					// same `clients/dispatch/finding-policy.ts` stack — inline
+					// `pi-lens-ignore` → stored dispositions → `.pi-lens.json` rule
+					// policy — the per-edit dispatcher, `mode=full` and the
+					// `source=lsp` probe lane apply. Without it a finding the agent
+					// marked `false-positive` re-reported on every turn that drained
+					// a late pair. Runs AFTER the freshness gate, like the #1625
+					// govulncheck/secrets filters: the anchor is derived from the
+					// post-gate identity, never the raw pre-gate set.
+					// #3248: the four arguments moved into
+					// `applyPushedFindingPolicy` so the late-RUNNER drain below
+					// cannot make a second copy of them. Same stack, same
+					// identities, same fail-open content rule.
+					const { kept: lateAuxKept, suppressed: lateAuxSuppressedHere } =
+						applyPushedFindingPolicy(gate.live, {
+							cwd,
+							filePath: lateAuxPath,
+							content: lateAuxContent,
+						});
+					lateAuxDispositionSuppressed += lateAuxSuppressedHere;
+					if (lateAuxKept.length === 0) {
+						// Every late finding was suppressed. This is a PUSH surface:
+						// silence after a mark is the mark working, not a clean
+						// verdict, so the count rides the bounded per-turn record below
+						// instead of re-announcing the suppression every single turn.
+						lateAuxAnswered += 1;
+						continue;
+					}
+					const lines = lateAuxKept.map(
 						(f) =>
 							`  ${displayLateAuxPath}:${f.line}:${f.column} [${f.rule}] ${f.message}`,
 					);
-					lateAuxDelivered += gate.live.length;
+					lateAuxDelivered += lateAuxKept.length;
 					lateAuxAnswered += 1;
+					// #1616 suppressed-bucket rule: a delivery that still has
+					// something to say states what it dropped, once per delivery.
+					const lateAuxSuppressedNote =
+						lateAuxSuppressedHere > 0
+							? `; suppressed by disposition: ${lateAuxSuppressedHere} finding(s)`
+							: "";
 					// @delivery-surface: runtime-turn:late-auxiliary-findings
 					advisoryParts.push(
-						`🕐 Late auxiliary diagnostics (${pair.serverId} answered after its grace window):\n${lines.join("\n")}`,
+						`🕐 Late auxiliary diagnostics (${pair.serverId} answered after its grace window${lateAuxSuppressedNote}):\n${lines.join("\n")}`,
 					);
 				}
 			}
@@ -3872,6 +4278,8 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				expired: lateAuxExpired,
 				ceilingExhausted: lateAuxCeilingExhausted,
 				answered: lateAuxAnswered,
+				dispositionSuppressed: lateAuxDispositionSuppressed,
+				auxSuppressed: lateAuxAuxSuppressed,
 				notifyStallDemoted: lateAuxNotifyStallDemoted,
 				coverageGapReRaised: lateAuxCoverageGapPairs.length,
 				coverageGapReRaisedDetailed: lateAuxCoverageGapDetailCount,

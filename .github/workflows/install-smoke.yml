@@ -70,10 +70,13 @@ on:
       # not just transitively through the `prepare` lifecycle script.
       - "scripts/download-grammars.js"
       - ".github/workflows/install-smoke.yml"
-  # PR-gating (#2613): only the host-range-smoke job below runs on
-  # pull_request (guarded by `if: github.event_name != 'pull_request'` on
-  # every pre-existing job) -- the full os x pm x pi-install matrices stay
-  # push/nightly/dispatch-only, unchanged from before this lane existed.
+  # PR-gating (#2613): host-range-smoke runs on pull_request, and (#3043,
+  # then the 2026-09-15 retro F2 sweep) ONE cell each of pi-load, smoke and
+  # mise-repro -- because the lane a change edits must be a lane some
+  # pre-merge run can execute. No job in this file is gated off pull_request
+  # any more; `host-latest-smoke` is the one remaining event-gated job and is
+  # the nightly/dispatch drift lane by construction, registered as such in
+  # tests/config/workflow-pull-request-reachability.test.ts.
   pull_request:
     branches: [master]
     paths: *install-smoke-paths
@@ -108,6 +111,9 @@ jobs:
   validate-merge-train-dispatch:
     name: Validate merge-train dispatch
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 4s; timeout = floor of 10 min.
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -133,6 +139,12 @@ jobs:
     needs:
       [validate-merge-train-dispatch, smoke, pi-load, mise-repro, host-range-smoke]
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # No successful run found (job requires github.event_name ==
+    # 'repository_dispatch'; it has failed 3/3 times it has ever run, never
+    # succeeded, across the visible history) -- defaulted to the floor of 10 min
+    # for this single-step job.
+    timeout-minutes: 10
     permissions:
       issues: write
     steps:
@@ -168,18 +180,41 @@ jobs:
 
   smoke:
     name: ${{ matrix.os }} · ${{ matrix.pm }}
-    # Unchanged from before #2613: this os x pm x pm-flavor matrix stays off
-    # pull_request entirely -- host-range-smoke is the new PR-gating lane.
-    if: github.event_name != 'pull_request'
+    # #3043's shape, swept (2026-09-15 retro F2): this job carried
+    # `if: github.event_name != 'pull_request'`, so an edit to any of its four
+    # package-manager arms reached master with NO pre-merge lane able to
+    # execute it -- the same state that broke six pi-load cells for a day when
+    # #3033 edited its pnpm arm. host-range-smoke covers the build/pack/
+    # selftest SEQUENCE on a PR, but not the pm axis, which is what these arms
+    # exist for.
+    #
+    # PR-time this job now runs EXACTLY ONE cell (ubuntu-latest x pnpm, via
+    # the matrix expressions below); push/nightly/dispatch keep the full 2x4.
+    # pnpm is the chosen arm because its symlink store and blocked build
+    # scripts are the #285 axis the other three do not exercise. Measured cost
+    # of that cell on master run 35024302385: 36 s wall (21:13:32Z ->
+    # 21:14:08Z), in parallel with the PR cells already present.
+    #
+    # The `os` list stays a literal array so the macOS-reachability sweep in
+    # tests/support/workflow-shell-portability.ts still sees this job as
+    # macOS-capable; the PR-time narrowing is done with `exclude`.
     needs: validate-merge-train-dispatch
     runs-on: ${{ matrix.os }}
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max leg over last 10 successful master runs (220 matrix legs):
+    # 60s; timeout = floor of 10 min.
+    timeout-minutes: 10
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        pm: [npm, pnpm, bun, yarn]
+        pm: ${{ github.event_name == 'pull_request' && fromJSON('["pnpm"]') || fromJSON('["npm", "pnpm", "bun", "yarn"]') }}
+        # NOTE: no space after the JSON colon -- a plain YAML scalar may not
+        # contain ": ", so `{"os": "macos-latest"}` makes this whole file
+        # unparseable (every tests/config workflow test yaml.loads it).
+        exclude: ${{ github.event_name == 'pull_request' && fromJSON('[{"os":"macos-latest"}]') || fromJSON('[]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -288,16 +323,32 @@ jobs:
   # users get) — guards the shipped artifact; the `smoke` job guards current code.
   pi-load:
     name: pi-load · ${{ matrix.os }} · ${{ matrix.pi_install }}
-    if: github.event_name != 'pull_request'
+    # #3043: this job carried `if: github.event_name != 'pull_request'`, so
+    # #3033 -- which edited the pnpm-global arm below and nothing else that
+    # runs on a PR -- shipped to master with NO lane able to execute it, and
+    # broke six matrix cells on every master push for a day. PR-time this job
+    # now runs EXACTLY ONE cell (ubuntu-latest x pnpm-global, via the matrix
+    # expressions below); push/nightly/dispatch keep the full 2x4 matrix. The
+    # `os` list stays a literal array so the macOS-reachability sweep in
+    # tests/support/workflow-shell-portability.ts still sees this job as
+    # macOS-capable; the PR-time narrowing is done with `exclude`.
     needs: validate-merge-train-dispatch
     runs-on: ${{ matrix.os }}
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max leg over last 10 successful master runs (80 matrix legs):
+    # 51s; timeout = floor of 10 min.
+    timeout-minutes: 10
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        pi_install: [npm-global, pnpm-global, bun-global, curl]
+        pi_install: ${{ github.event_name == 'pull_request' && fromJSON('["pnpm-global"]') || fromJSON('["npm-global", "pnpm-global", "bun-global", "curl"]') }}
+        # NOTE: no space after the JSON colon -- a plain YAML scalar may not
+        # contain ": ", so `{"os": "macos-latest"}` makes this whole file
+        # unparseable (every tests/config workflow test yaml.loads it).
+        exclude: ${{ github.event_name == 'pull_request' && fromJSON('[{"os":"macos-latest"}]') || fromJSON('[]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 # for the RPC driver
         with:
@@ -361,15 +412,24 @@ jobs:
               echo "$(npm prefix -g)/bin" >> "$GITHUB_PATH"
               echo "NPMCMD=npm" >> "$GITHUB_ENV" ;;
             pnpm-global)
-              # pnpm refuses `add -g` unless the global bin dir is ON PATH *now*
-              # (GITHUB_PATH only affects later steps), so export it here too.
-              export PNPM_HOME="$HOME/.pnpm-global"; mkdir -p "$PNPM_HOME"
-              export PATH="$PNPM_HOME:$PATH"
-              pnpm config set --global global-bin-dir "$PNPM_HOME"
+              # pnpm refuses ANY --global command unless the global bin dir is
+              # ON PATH *now* (GITHUB_PATH only affects later steps), so export
+              # it here too. That directory is "$PNPM_HOME/bin", NOT $PNPM_HOME:
+              # pnpm 11 resolves it as `globalBinDir ?? join(pnpmHomeDir,'bin')`
+              # with pnpmHomeDir = $PNPM_HOME (pnpm/config/reader,
+              # checkGlobalBinDir). #3043: putting bare $PNPM_HOME on PATH
+              # failed every pnpm-global cell with GLOBAL_BIN_DIR_NOT_IN_PATH
+              # ("The configured global bin directory .../bin is not in PATH").
+              # The --global write is what keeps LATER steps (which have no
+              # PNPM_HOME of ours -- pnpm/action-setup owns that variable)
+              # resolving the same, GITHUB_PATH-exported directory.
+              export PNPM_HOME="$HOME/.pnpm-global"; mkdir -p "$PNPM_HOME/bin"
+              export PATH="$PNPM_HOME/bin:$PATH"
+              pnpm config set --global global-bin-dir "$PNPM_HOME/bin"
               # --ignore-scripts: pi's own lifecycle scripts aren't needed for
               # this smoke test (same as the npm-global case above).
               pnpm add -g --ignore-scripts "$PKG" || echo "::notice::pnpm add -g exit $? (blocked scripts?)"
-              echo "$PNPM_HOME" >> "$GITHUB_PATH"
+              echo "$PNPM_HOME/bin" >> "$GITHUB_PATH"
               echo "NPMCMD=pnpm" >> "$GITHUB_ENV" ;;
             bun-global)
               bun add -g "$PKG" || echo "::notice::bun blocked scripts (expected)"
@@ -434,9 +494,31 @@ jobs:
   # of #285 coverage.
   mise-repro:
     name: mise repro (#285) · ${{ matrix.os }} · ${{ matrix.pi_via }}
-    if: github.event_name != 'pull_request'
+    # #3049 review F1, swept (2026-09-15 retro F2): with
+    # `if: github.event_name != 'pull_request'` here, moving the
+    # `export PATH="$PNPM_HOME/bin:$PATH"` line of "Configure pnpm global bin
+    # dir" back BELOW the `pnpm config set --global` it exists to unblock
+    # (#3043's own bug) would have reached master unseen -- no pre-merge lane
+    # could run the step at all.
+    #
+    # PR-time this job now runs EXACTLY ONE cell (ubuntu-latest x mise-node);
+    # push/nightly/dispatch keep the full 2x2. That cell is enough for the
+    # pnpm steps because "Install pnpm (the npmCommand) under mise node" and
+    # "Configure pnpm global bin dir" are unconditional -- they run
+    # identically under both `pi_via` arms. Measured cost on master run
+    # 35024302385: 31 s wall (21:13:57Z -> 21:14:28Z).
+    #
+    # The job stays NON-BLOCKING on every event (continue-on-error below, for
+    # the reason in the block comment above this job): the PR cell's job is to
+    # EXECUTE the edited lines and put them in a log a reviewer can read, not
+    # to gate the merge. `os` stays a literal array for the macOS
+    # portability sweep; the narrowing is done with `exclude`.
     needs: validate-merge-train-dispatch
     runs-on: ${{ matrix.os }}
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max leg over last 10 successful master runs (40 matrix legs):
+    # 44s; timeout = floor of 10 min.
+    timeout-minutes: 10
     permissions:
       contents: read
     continue-on-error: true
@@ -444,7 +526,11 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        pi_via: [mise-node, mise-npm-backend]
+        pi_via: ${{ github.event_name == 'pull_request' && fromJSON('["mise-node"]') || fromJSON('["mise-node", "mise-npm-backend"]') }}
+        # NOTE: no space after the JSON colon -- a plain YAML scalar may not
+        # contain ": ", so `{"os": "macos-latest"}` makes this whole file
+        # unparseable (every tests/config workflow test yaml.loads it).
+        exclude: ${{ github.event_name == 'pull_request' && fromJSON('[{"os":"macos-latest"}]') || fromJSON('[]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 # RPC driver
         with:
@@ -535,12 +621,16 @@ jobs:
         run: |
           set -uxo pipefail
           # Keep pnpm's global setup outside the checkout's npm project config.
+          # The global bin dir pnpm 11 resolves is "$PNPM_HOME/bin", and pnpm
+          # refuses any --global command unless THAT directory is already on
+          # PATH (#3043 -- bare $PNPM_HOME failed with
+          # GLOBAL_BIN_DIR_NOT_IN_PATH before the config could be written).
           export PNPM_HOME="$HOME/.pnpm-global"
-          mkdir -p "$PNPM_HOME"
-          export PATH="$PNPM_HOME:$PATH"
-          pnpm config set --global global-bin-dir "$PNPM_HOME"
+          mkdir -p "$PNPM_HOME/bin"
+          export PATH="$PNPM_HOME/bin:$PATH"
+          pnpm config set --global global-bin-dir "$PNPM_HOME/bin"
           echo "PNPM_HOME=$PNPM_HOME" >> "$GITHUB_ENV"
-          echo "$PNPM_HOME" >> "$GITHUB_PATH"
+          echo "$PNPM_HOME/bin" >> "$GITHUB_PATH"
 
       - name: Install pi (${{ matrix.pi_via }})
         shell: bash
@@ -618,6 +708,10 @@ jobs:
     name: host range · ${{ matrix.pi_host }}
     needs: validate-merge-train-dispatch
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max leg over last 10 successful master runs (20 matrix legs):
+    # 59s; timeout = floor of 10 min.
+    timeout-minutes: 10
     permissions:
       contents: read
       actions: read # read master's last install-smoke run to classify drift
@@ -802,6 +896,10 @@ jobs:
     name: host latest nightly (advisory)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Only 1 successful master run in the window; measured 40s; timeout = floor
+    # of 10 min.
+    timeout-minutes: 10
     permissions:
       contents: read
       issues: write # file/refresh/close the drift tracking issue

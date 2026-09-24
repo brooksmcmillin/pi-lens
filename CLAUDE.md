@@ -36,3 +36,5 @@ Deliberately thin. The canonical engineering contract for this repo lives in
 - `docs/pi-lens-monitor.md` — role contract for the live-session readout
   (observe only; the standing numbers a maintainer would otherwise read by hand).
 - `.claude/skills/merge-train/SKILL.md` — the review → verify → merge policy.
+- `.claude/skills/retro/SKILL.md` — the retrospective: environment changes,
+  not advice (contract in `docs/pi-lens-retro.md`).

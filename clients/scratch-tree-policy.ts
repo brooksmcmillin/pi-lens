@@ -99,6 +99,12 @@ export function getScratchTreeFnmatchPatterns(): string[] {
 export const SECRETS_LANE_SCRATCH_DIR_NAMES: readonly string[] = [
 	// pi-ecosystem / coding-agent data + cache directories.
 	".pi",
+	// The same agent's rebranded config dir (#3112) — pi's config-dir name is
+	// `pkg.piConfig?.configDir || ".pi"`, so `.omp/agent/sessions` is the very
+	// history `.pi/agent/sessions` holds. Without it the secrets lane READS a
+	// project-local session history and can report a key a user pasted into a
+	// transcript as a blocking first-party leak.
+	".omp",
 	".pi-lens",
 	".claude",
 	".codex",

@@ -553,13 +553,16 @@ export class ReadGuard {
 	private readonly unchangedThisSession = new Set<string>();
 	// Existence-independent index for hasKnownPath/forgetPath (#1668 review
 	// F1). `this.key()` (normalizeFilePath) branches on whether `filePath`
-	// currently exists on disk: an existing file resolves to realpathSync
-	// canonical casing, a missing one to a lowercased tail. recordRead/
-	// recordWritten always key while the file is still on disk (real
-	// casing); hasKnownPath/forgetPath are queried AFTER an external delete
-	// already landed, when the path no longer exists — recomputing
+	// currently exists on disk, on EVERY platform since #3098 — an existing
+	// file resolves to its on-disk casing (win32: `realpathSync.native`;
+	// POSIX: the on-disk casing of the trailing segments), a missing one to a
+	// lowercased tail on win32 and to the caller's own spelling on POSIX.
+	// recordRead/recordWritten always key while the file is still on disk
+	// (real casing); hasKnownPath/forgetPath are queried AFTER an external
+	// delete already landed, when the path no longer exists — recomputing
 	// `this.key()` at that point returns a DIFFERENT string for any
-	// mixed-case basename (`MyModule.ts` → `mymodule.ts`), so a lookup
+	// mixed-case basename (win32 `MyModule.ts` → `mymodule.ts`; POSIX
+	// `Components/x.ts` held against an on-disk `components/`), so a lookup
 	// against `reads`/`writtenThisSession` silently misses. This index maps
 	// a purely syntactic key (`normalizeEphemeralMapKey` — slash-fold +
 	// lowercase, no filesystem access, so it never depends on current disk
@@ -567,6 +570,17 @@ export class ReadGuard {
 	// time, so a post-delete lookup finds the same entry regardless of what
 	// happened to the file since. Pruned inside `evictFile` so it never
 	// outlives the record it points at.
+	//
+	// ONLY hasKnownPath/forgetPath route through this index, because only they
+	// need the real key BACK. `noteCreatedFile` (keys while the file is still
+	// absent) and `recordWritten` (keys after it exists) straddle the same
+	// state change, and used to do it through `this.key()` directly — a
+	// spelling whose key moved orphaned the `pendingCreations` entry and the
+	// creation read was never injected (#3163, pre-existing on win32 and
+	// reachable on POSIX since #3098). They now key `pendingCreations` by the
+	// same existence-independent `normalizeEphemeralMapKey` spelling this index
+	// is keyed by; no index is needed there, since the real key is derived by
+	// `recordWritten` itself at the moment it is used.
 	private readonly knownPathIndex = new Map<string, string>();
 	/** Running per-file record-cap trim totals for this session (#1913 F1). */
 	private readonly trimAccumulators = new Map<string, FileTrimStats>();
@@ -1257,13 +1271,30 @@ export class ReadGuard {
 	 * Must be called from the tool_call handler before the write lands so
 	 * isNewFile() still returns true. recordWritten will inject a synthetic
 	 * read so immediate follow-up edits are not blocked by zero_read.
+	 *
+	 * Keyed by the existence-INDEPENDENT syntactic spelling
+	 * (`normalizeEphemeralMapKey`, the same key `knownPathIndex` uses), NOT by
+	 * `this.key()` (#3163). This entry is written while the file is still
+	 * ABSENT and read back by `recordWritten` once it EXISTS — the one state
+	 * change `normalizeFilePath` itself branches on — so a `this.key()` on each
+	 * side answered with two different strings for any spelling whose key moves
+	 * when the file appears (win32: a mixed-case basename, lower-cased in the
+	 * absent branch by `resolveNonExisting`; POSIX since #3098: a parent whose
+	 * canonical casing is adopted once `realpathSync.native` succeeds). The
+	 * entry was then orphaned — nothing prunes `pendingCreations` — and the
+	 * creation read never injected. The syntactic key never touches the
+	 * filesystem, so it cannot move; the REAL key the injected read needs is
+	 * derived by `recordWritten` itself and is not stored here.
 	 */
 	noteCreatedFile(
 		filePath: string,
 		turnIndex: number,
 		writeIndex: number,
 	): void {
-		this.pendingCreations.set(this.key(filePath), { turnIndex, writeIndex });
+		this.pendingCreations.set(normalizeEphemeralMapKey(filePath), {
+			turnIndex,
+			writeIndex,
+		});
 	}
 
 	/**
@@ -1283,9 +1314,14 @@ export class ReadGuard {
 		if (this.reads.has(filePath)) this.consumedReadFiles.add(filePath);
 		this.touchFile(filePath);
 		this.enforceFileCap();
-		const creation = this.pendingCreations.get(filePath);
+		// #3163: `noteCreatedFile` announced this creation while the file was
+		// still absent, so the announcement is keyed by the syntactic spelling —
+		// look it up the same way, never through the existence-dependent
+		// `filePath` above. `injectCreationRead` still receives the real key.
+		const creationKey = normalizeEphemeralMapKey(rawFilePath);
+		const creation = this.pendingCreations.get(creationKey);
 		if (creation) {
-			this.pendingCreations.delete(filePath);
+			this.pendingCreations.delete(creationKey);
 			this.injectCreationRead(
 				filePath,
 				creation.turnIndex,

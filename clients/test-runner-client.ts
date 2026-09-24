@@ -146,11 +146,18 @@ export interface RunnerConfig {
 	 * `go.mod`. A WHOLE-PROJECT runner names nothing: moving its cwd changes
 	 * WHICH project is built. `gradle` launches the literal `./gradlew`, so a
 	 * module carrying `build.gradle.kts` but no wrapper would fail with `spawn
-	 * ./gradlew ENOENT`; `maven`'s reactor may not resolve a submodule's
-	 * parent at all. Both therefore anchor on their LAUNCHER instead: a module
-	 * that carries its own wrapper is a self-contained build and runs there,
-	 * anything else walks up to the build that owns the wrapper (in practice
-	 * the dispatch root), which is what these runners did before #2871.
+	 * ./gradlew ENOENT` — it anchors on its LAUNCHER: a module that carries
+	 * its own wrapper is a self-contained build and runs there, anything else
+	 * walks up to the build that owns the wrapper, which is what it did
+	 * before #2871. `maven` must NOT launcher-anchor (#2944): its command is
+	 * the PATH binary `mvn`, which never reads `mvnw`, so wrapper-only
+	 * markers left a wrapper-less project with no anchor at all and dropped
+	 * the child on the dispatch root instead of the module's `pom.xml`.
+	 * Maven keeps the default and anchors on the module manifest; a wrapper
+	 * is never a reason to anchor elsewhere, since `mvn` does not invoke it
+	 * and a wrapper without a `pom.xml` beside it has nothing for `mvn` to
+	 * build. `tests/clients/test-runner-spawn-cwd.test.ts` derives this
+	 * contract over the whole `RUNNERS` table.
 	 */
 	spawnCwdMarkers?: readonly string[];
 	command: string;
@@ -165,8 +172,8 @@ export interface RunnerConfig {
 	parseJson: boolean;
 }
 
-// Source file → test file patterns (reverse lookup)
-const SOURCE_TO_TEST_PATTERNS: Array<{
+// Discovery table; exported so the #2928 parity test enumerates its conventions.
+export const SOURCE_TO_TEST_PATTERNS: Array<{
 	ext: string;
 	testExts: string[];
 	dirs: string[];

@@ -117,6 +117,7 @@ export const FORMATTER_MARKERS: Readonly<Record<string, readonly string[]>> = {
 		"settings.gradle.kts",
 		".gitignore",
 	],
+	typstyle: [".gitignore"],
 };
 
 const toolCwdGeneration = createGenerationSource("tool-cwd");

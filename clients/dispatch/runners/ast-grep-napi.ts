@@ -20,7 +20,8 @@ import {
 	loadAstGrepNapi,
 	type SgRoot,
 } from "../../deps/ast-grep-napi.js";
-import { minimatch } from "../../deps/minimatch.js";
+import { buildEffectiveAstGrepCatalog } from "../ast-grep-catalog.js";
+import { isRuleIgnoredForPath } from "../rule-ignores.js";
 import { logLatency } from "../../latency-logger.js";
 import { hasAuxiliaryLspPublishedForRoot } from "../../lsp/index.js";
 import {
@@ -28,10 +29,7 @@ import {
 	hasPendingAuxiliaryCoverage,
 	recordNapiFallbackCoverage,
 } from "../../lsp/pending-aux-coverage.js";
-import {
-	type AstGrepRuleSource,
-	getAstGrepRuleSources,
-} from "../../sgconfig.js";
+import type { AstGrepRuleSource } from "../../sgconfig.js";
 import { hasEslintConfig } from "../../tool-policy.js";
 import { enabledAuxiliaryLspServerIds } from "../auxiliary-lsp.js";
 import { classifyDefect } from "../diagnostic-taxonomy.js";
@@ -46,8 +44,6 @@ import {
 	calculateRuleComplexity,
 	isOverlyBroadPattern,
 	isStructuredRule,
-	loadYamlRules,
-	loadYamlRulesFresh,
 	MAX_BLOCKING_RULE_COMPLEXITY,
 	type YamlRule,
 } from "./yaml-rule-parser.js";
@@ -466,27 +462,6 @@ function normalizeRuleId(ruleId: string): string {
 	return ruleId.replace(/-js$/, "");
 }
 
-/**
- * `filePath` relative to `root`, forward-slashed, for matching a rule's
- * `ignores` globs (#965). Falls back to the absolute (slash-normalized) path
- * when `filePath` isn't under `root` (e.g. an out-of-tree temp file), so a
- * glob like `scripts/**` simply never matches rather than throwing.
- */
-function relativeForIgnoreGlob(filePath: string, root: string): string {
-	const rel = path.relative(root, filePath);
-	return (rel.startsWith("..") ? filePath : rel).split(path.sep).join("/");
-}
-
-function matchesRuleIgnores(
-	filePath: string,
-	root: string,
-	patterns: string[] | undefined,
-): boolean {
-	if (!patterns || patterns.length === 0) return false;
-	const rel = relativeForIgnoreGlob(filePath, root);
-	return patterns.some((pattern) => minimatch(rel, pattern, { dot: true }));
-}
-
 export function canHandle(filePath: string): boolean {
 	return BINDING_BY_EXTENSION.has(path.extname(filePath).toLowerCase());
 }
@@ -872,7 +847,7 @@ function emitHtmlScriptDegradations(
 	}
 }
 
-function duplicateRuleIds(rules: YamlRule[]): string[] {
+function duplicateRuleIds(rules: readonly YamlRule[]): string[] {
 	const counts = new Map<string, number>();
 	for (const rule of rules) {
 		counts.set(rule.id, (counts.get(rule.id) ?? 0) + 1);
@@ -885,7 +860,6 @@ function duplicateRuleIds(rules: YamlRule[]): string[] {
 
 function appendDuplicateRuleDiagnostics(
 	diagnostics: Diagnostic[],
-	seenRuleIds: Set<string>,
 	duplicateIds: string[],
 	source: AstGrepRuleSource,
 	filePath: string,
@@ -908,7 +882,6 @@ function appendDuplicateRuleDiagnostics(
 			autoFixAvailable: false,
 			fixSuggestion: `Give every rule in ${sourceLabel} a unique id`,
 		});
-		seenRuleIds.add(ruleId);
 		if (diagnostics.length >= maxTotalDiagnostics) return true;
 	}
 	return false;
@@ -966,7 +939,6 @@ export function evaluateAstGrepRules(
 		options.unsupportedLanguageLog ?? defaultUnsupportedLanguageLog;
 
 	const diagnostics: Diagnostic[] = [];
-	const seenRuleIds = new Set<string>();
 	const suppressLinterOverlap = kind === "jsts" && hasEslintConfig(cwd);
 	const fileLang = ruleLanguageForFile(filePath);
 	// Embedded `<script>` coverage (#2347): on an HTML file, every script body
@@ -1063,28 +1035,17 @@ export function evaluateAstGrepRules(
 		newlyUnsupported.clear();
 	};
 
-	// Shared with the raw sgconfig materializer so both surfaces walk the same
-	// workspace-rooted sources in the same precedence order.
+	// Same walk and precedence the LSP-seam matcher uses
+	// (clients/dispatch/rule-ignores.ts), folded onto one derivation by #3053
+	// after #3046 shipped them as two independently-drifting copies.
 	const ignoreRoot = options.projectRoot ?? cwd;
-	const ruleSources = getAstGrepRuleSources(ignoreRoot);
+	const catalog = buildEffectiveAstGrepCatalog(ignoreRoot);
 
-	for (const source of ruleSources) {
-		let rules: YamlRule[];
-		try {
-			// Project rules are mutable during a session, so their cache fingerprints
-			// relative paths and contents. Bundled catalogs are immutable per install.
-			const loader =
-				source.origin === "project" ? loadYamlRulesFresh : loadYamlRules;
-			rules = loader(source.dir);
-		} catch {
-			continue;
-		}
-
+	for (const { source, rules } of catalog.sources) {
 		const duplicates = duplicateRuleIds(rules);
 		if (
 			appendDuplicateRuleDiagnostics(
 				diagnostics,
-				seenRuleIds,
 				duplicates,
 				source,
 				filePath,
@@ -1098,14 +1059,21 @@ export function evaluateAstGrepRules(
 
 		for (const rule of rules) {
 			if (duplicateSet.has(rule.id)) continue;
-			// Cross-layer collisions keep the first (higher-precedence) source.
-			if (seenRuleIds.has(rule.id)) continue;
-			seenRuleIds.add(rule.id);
+			// Cross-layer collisions keep the first (higher-precedence) source —
+			// resolved once by `buildEffectiveAstGrepCatalog`, not per-rule here.
+			// Compares the winning DOCUMENT (object identity), not merely its
+			// source: comparing `.source` alone can't tell a within-source
+			// duplicate's two copies apart (they share one source), so it gave
+			// no defense if `duplicateSet.has` above were ever the only guard
+			// standing (#3053 round 2 F1). Every `rule` iterated here is the
+			// same object instance the catalog recorded, since both read the
+			// identical `rules` arrays off `catalog.sources`.
+			if (catalog.effectiveRules.get(rule.id)?.rule !== rule) continue;
 			if (blockingOnly && rule.severity !== "error") continue;
 			// Per-rule path carve-out (#965): a rule that's noise on CLI scripts or
 			// a project's own logging sink (e.g. no-console-except-error firing
 			// inside scripts/** or lib/logger.ts) opts out via `ignores`.
-			if (matchesRuleIgnores(filePath, ignoreRoot, rule.ignores)) continue;
+			if (isRuleIgnoredForPath(filePath, ignoreRoot, rule.ignores)) continue;
 
 			if (
 				suppressLinterOverlap &&

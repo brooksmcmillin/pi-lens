@@ -18,7 +18,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { getProjectDataDir } from "./file-utils.js";
 import { writeFileAtomic } from "./atomic-write.js";
-import { readJsonCache } from "./json-cache-read.js";
+import { readJsonCache, readJsonCacheAsync } from "./json-cache-read.js";
 import { isUnderDir, normalizeMapKey } from "./path-utils.js";
 
 // --- Types ---
@@ -168,7 +168,89 @@ export class CacheManager {
 	// ---- Scanner Cache ----
 
 	/**
+	 * The ONE staleness rule both scanner reads apply (#3274): the envelope's
+	 * age in ms when it is inside `maxAgeMs`, or `null` — having logged the
+	 * stale verdict — when it is not.
+	 *
+	 * Extracted rather than copied into {@link readCacheAsync} because the TTL
+	 * boundary is exactly what the two seams must not disagree about while
+	 * #3300 migrates callers across: a delivery that read one store through
+	 * each method would otherwise be able to see it fresh and stale at once.
+	 */
+	private freshAgeMs(
+		scanner: string,
+		meta: CacheMeta,
+		maxAgeMs: number,
+	): number | null {
+		const age = Date.now() - new Date(meta.timestamp).getTime();
+		if (age > maxAgeMs) {
+			this.log(
+				`Cache stale: ${scanner} (age: ${Math.round(age / 1000)}s, max: ${maxAgeMs / 1000}s)`,
+			);
+			return null;
+		}
+		return age;
+	}
+
+	/**
+	 * Read a scanner cache entry WITHOUT blocking the event loop (#3274).
+	 *
+	 * `readCache` below is synchronous: two `existsSync` plus two
+	 * `readFileSync`+`JSON.parse`, all of which complete during ARGUMENT
+	 * EVALUATION. `bounded()` (`clients/deadline-utils.ts`) takes a promise, so
+	 * a hook that wrapped the sync read registered a budget that could never be
+	 * spent — probed on #3274 with an already-aborted signal and `ms: 0`:
+	 * `bounded()` returned `undefined` and the read had already parsed its JSON.
+	 * This sibling suspends on `fs.promises`, so the turn_end budget and the
+	 * hook's `ctx.signal` can actually abandon it.
+	 *
+	 * Same outcomes as the sync seam — an envelope, or `null` for missing,
+	 * stale, corrupt or unreadable — and the same parser
+	 * (`readJsonCacheAsync`, the async sibling in `clients/json-cache-read.ts`;
+	 * there is no second parser). ONE deliberate difference, in the verbose log
+	 * only: a missing store is reported as `Cache miss: <scanner> — <err>` from
+	 * the read's own ENOENT instead of a preceding `existsSync` pair, because
+	 * the pair is half the blocking cost this method exists to remove.
+	 */
+	async readCacheAsync<T>(
+		scanner: string,
+		cwd: string,
+		maxAgeMs = DEFAULT_MAX_AGE_MS,
+	): Promise<CacheEntry<T> | null> {
+		const cachePath = path.join(getCacheDir(cwd), `${scanner}.json`);
+		const metaPath = path.join(getCacheDir(cwd), `${scanner}.meta.json`);
+		const onReadError = (err: unknown) => {
+			this.log(`Cache miss: ${scanner} — ${err}`);
+		};
+
+		const meta = await readJsonCacheAsync<CacheMeta>(
+			metaPath,
+			(parsed) => parsed as CacheMeta,
+			onReadError,
+		);
+		if (meta === undefined) return null;
+
+		const age = this.freshAgeMs(scanner, meta, maxAgeMs);
+		if (age === null) return null;
+
+		const data = await readJsonCacheAsync<T>(
+			cachePath,
+			(parsed) => parsed as T,
+			onReadError,
+		);
+		if (data === undefined) return null;
+
+		this.log(`Cache hit: ${scanner} (age: ${Math.round(age / 1000)}s)`);
+		return { data, meta };
+	}
+
+	/**
 	 * Read a scanner cache entry. Returns null if not found or stale.
+	 *
+	 * Synchronous, and therefore unboundable on a hook path — see
+	 * {@link readCacheAsync}, and the `sync-hook-read` population in
+	 * `tests/config/hook-await-bounds.test.ts` that counts the callers still
+	 * on it. #3300 migrates them and deletes this method in its last slice.
 	 */
 	readCache<T>(
 		scanner: string,
@@ -195,13 +277,8 @@ export class CacheManager {
 			);
 			if (meta === undefined) return null;
 
-			const age = Date.now() - new Date(meta.timestamp).getTime();
-			if (age > maxAgeMs) {
-				this.log(
-					`Cache stale: ${scanner} (age: ${Math.round(age / 1000)}s, max: ${maxAgeMs / 1000}s)`,
-				);
-				return null;
-			}
+			const age = this.freshAgeMs(scanner, meta, maxAgeMs);
+			if (age === null) return null;
 
 			const data = readJsonCache<T>(
 				cachePath,

@@ -26,6 +26,10 @@ jobs:
   detect-lockfile-change:
     name: Detect lockfile change
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 8 successful master runs (fewer than 10 exist):
+    # 8s; timeout = floor of 10 min.
+    timeout-minutes: 10
     permissions:
       contents: read
     outputs:
@@ -70,6 +74,10 @@ jobs:
     needs: [detect-lockfile-change]
     if: needs.detect-lockfile-change.outputs.changed == 'true'
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 4 successful master runs (only 4 runs of this
+    # conditional job exist): 9s; timeout = floor of 10 min.
+    timeout-minutes: 10
     permissions:
       contents: read
     # Advisory to start (see PR body / #1844): this job is NOT wired into

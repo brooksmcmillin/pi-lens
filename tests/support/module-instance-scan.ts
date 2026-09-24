@@ -27,6 +27,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { toPosix } from "../../clients/path-utils.js";
+import { readWalkedFile } from "./sweep-kit.js";
 
 export const repoRoot = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -123,7 +124,10 @@ export function scanDualInstanceImports(): DualInstanceImport[] {
 	const found: DualInstanceImport[] = [];
 	for (const absolute of testSourceFiles()) {
 		const file = toPosix(path.relative(repoRoot, absolute));
-		const source = fs.readFileSync(absolute, "utf8");
+		// readWalkedFile: a path that vanished between the walk and the read is
+		// out of the population, not a finding (#3082).
+		const source = readWalkedFile(absolute);
+		if (source === undefined) continue;
 		for (const specifier of importSpecifiers(source)) {
 			if (!specifier.startsWith(".")) continue;
 			const target = toPosix(

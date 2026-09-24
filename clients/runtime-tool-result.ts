@@ -250,6 +250,8 @@ interface ToolResultDeps {
 	_opaqueCaptureOptions?: Pick<CaptureOptions, "forcedUnknownReason">;
 	/** Internal: synthetic dispatch inherits the parent's read-guard evidence. */
 	_readGuardAuthorship?: boolean;
+	/** Internal: synthetic dispatch inherits the parent's ownership decision. */
+	_allowAutonomousWriters?: boolean;
 }
 
 function ensureToolResultClients(
@@ -809,8 +811,10 @@ async function dispatchPipelineAnalysis(args: {
 	 */
 	nativeAppliedPairs: Array<{ oldText: string; newText: string | undefined }>;
 	// The original bash result can reach this helper without authorship
-	// evidence; synthetic write results deliberately set this true.
-	allowReadGuardWrites: boolean;
+	// evidence; synthetic opaque writes deliberately set this false. This same
+	// identity gates read-guard credit and all autonomous writer/instruction
+	// surfaces (#3226).
+	allowAutonomousWriters: boolean;
 }): Promise<
 	| { crashed: false; result: PipelineResult }
 	| {
@@ -837,7 +841,7 @@ async function dispatchPipelineAnalysis(args: {
 		isPartialApplyResult,
 		toolResultStart,
 		nativeAppliedPairs,
-		allowReadGuardWrites,
+		allowAutonomousWriters,
 	} = args;
 	const {
 		event,
@@ -858,6 +862,7 @@ async function dispatchPipelineAnalysis(args: {
 			projectRoot: turnStateCwd,
 			toolName: event.toolName,
 			autofixMode,
+			allowAutonomousWriters,
 			modifiedRanges,
 			telemetry: {
 				model: runtime.telemetryModel,
@@ -1075,7 +1080,7 @@ async function dispatchPipelineAnalysis(args: {
 	// The model's write/edit and pi-lens' own immediate format/autofix are now
 	// reflected on disk. Refresh read-guard staleness stamps so a follow-up edit
 	// is judged by read-range coverage, not by our own previous write.
-	if (!getFlag("no-read-guard") && allowReadGuardWrites) {
+	if (!getFlag("no-read-guard") && allowAutonomousWriters) {
 		const changedForReadGuard = new Set([
 			path.resolve(filePath),
 			...(result.changedFiles ?? []).map((changedFile) =>
@@ -1109,7 +1114,9 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	const rawFilePath = (event.input as { path?: string }).path;
 	const workspaceRoot = runtime.projectRoot || process.cwd();
 	let bashAuthorshipConfirmed =
-		deps._readGuardAuthorship ?? event.toolName !== "bash";
+		deps._allowAutonomousWriters ??
+		deps._readGuardAuthorship ??
+		event.toolName !== "bash";
 
 	// #1642: a gitignored worktree edit got re-attributed onto a
 	// same-relative-path file in the parent checkout because this handler
@@ -1396,13 +1403,9 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		const opaqueSet = new Set(opaquePaths);
 		const written = [...recognizedWritten, ...opaquePaths];
 		const recognizedAuthoredSet = new Set(recognizedAuthored);
-		bashAuthorshipConfirmed =
-			recognizedAuthored.length > 0 || opaquePaths.length > 0;
+		bashAuthorshipConfirmed = recognizedAuthored.length > 0;
 		for (const wp of written) {
-			if (
-				!getFlag("no-read-guard") &&
-				(opaqueSet.has(wp) || recognizedAuthoredSet.has(wp))
-			)
+			if (!getFlag("no-read-guard") && recognizedAuthoredSet.has(wp))
 				deps.readGuard?.recordWritten(wp);
 			else if (!getFlag("no-read-guard") && recognizedWritten.includes(wp))
 				deps.readGuard?.recordUnchanged?.(wp);
@@ -1436,8 +1439,11 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 				_autofixMode: autofixMode,
 				_attachmentBudget: syntheticAttachmentBudget,
 				_mutationSourceOverride: isOpaque ? "opaque-script" : undefined,
-				_readGuardAuthorship:
-					opaqueSet.has(wp) || recognizedAuthoredSet.has(wp),
+				_readGuardAuthorship: recognizedAuthoredSet.has(wp),
+				// Opaque recovery is mutation evidence only. The synthetic call still
+				// records freshness and runs diagnostics, but it cannot format/autofix
+				// or issue an edit-directed blocker/actionable instruction.
+				_allowAutonomousWriters: recognizedAuthoredSet.has(wp),
 			});
 			if (syntheticResult) {
 				// #1590: forward verbatim. The synthetic call already charged the
@@ -1957,7 +1963,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 							// bridge, so the dispatch's read-guard write refresh
 							// carries evidence and stays enabled on every
 							// per-path dispatch.
-							allowReadGuardWrites: true,
+							allowAutonomousWriters: true,
 						}),
 						{
 							ms: HOOK_WALL_BUDGET_MS.tool_result_edit,
@@ -2342,7 +2348,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			participantTotal,
 			toolResultStart,
 			nativeAppliedPairs,
-			allowReadGuardWrites: bashAuthorshipConfirmed,
+			allowAutonomousWriters: bashAuthorshipConfirmed,
 		}),
 		{
 			ms: HOOK_WALL_BUDGET_MS.tool_result_edit,
@@ -2366,6 +2372,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	let autofixNewlyQueued = false;
 	if (
 		!result.isError &&
+		bashAuthorshipConfirmed &&
 		autofixMode === "deferred" &&
 		nodeFs.existsSync(filePath)
 	) {
@@ -2386,6 +2393,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 
 	if (
 		!result.isError &&
+		bashAuthorshipConfirmed &&
 		!getFlag("no-autoformat", filePath) &&
 		(autofixMode === "deferred" || !getFlag("immediate-format")) &&
 		nodeFs.existsSync(filePath)
@@ -2447,7 +2455,17 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			source: "autofix",
 			dbg,
 		});
-		if (resolvedChanged === path.resolve(filePath)) continue;
+		// Workspace-edit paths come from fileURLToPath and are normally absolute,
+		// so the turn-state cwd is inert for those values. Keep it in the resolve
+		// call because the producer's contract is cwd-relative URI resolution, and
+		// let pathsEqual ask the filesystem-aware path identity question (#3294).
+		if (
+			pathsEqual(
+				path.resolve(turnStateCwd, changedFile),
+				path.resolve(filePath),
+			)
+		)
+			continue;
 		try {
 			const content = nodeFs.readFileSync(resolvedChanged, "utf-8");
 			const lineCount = content.split("\n").length;
@@ -2526,6 +2544,10 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			result.inlineBlockerSources,
 			result.inlineBlockerLines,
 			result.inlineBlockerFileContent,
+			// #3246: the structured blockers the summary was rendered from, so a
+			// later `lens_diagnostic_mark` can be applied to this record at turn
+			// end instead of replaying pre-mark text.
+			result.inlineBlockerDiagnostics,
 		);
 	} else {
 		runtime.clearInlineBlockers(filePath);

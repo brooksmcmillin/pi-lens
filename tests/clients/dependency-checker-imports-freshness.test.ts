@@ -20,7 +20,9 @@ describe("DependencyChecker.importsChanged freshness (#1105)", () => {
 	let tmp: string;
 
 	beforeEach(() => {
-		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pilens-dep-freshness-"));
+		tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-pilens-dep-freshness-"),
+		);
 	});
 	afterEach(() => {
 		removeTempDirSync(tmp);

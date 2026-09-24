@@ -194,8 +194,11 @@ export interface RunnerResult {
  *
  * So `normalizeMapKey(ctx.filePath)` is a pure `realpathSync.native` syscall
  * that returns its own input. On Windows that measures ~200 microseconds per
- * call, and POSIX short-circuits it, which is why CI timing gates cannot see
- * the waste. Use these three fields directly as map keys, fact keys, once-keys,
+ * call; since #3098 POSIX pays that syscall too (measured at 1.8 microseconds
+ * for an existing path, 4.7 for an absent one) rather than short-circuiting —
+ * still too small for a CI timing gate to see, which is a reason to delete the
+ * redundant call, not to tolerate it. Use these three fields directly as map
+ * keys, fact keys, once-keys,
  * and degradation subjects. `tests/clients/dispatch-context-normalized.test.ts`
  * pins both halves: that the constructor normalizes, and that no call site
  * re-normalizes.

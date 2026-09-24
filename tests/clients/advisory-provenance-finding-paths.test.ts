@@ -22,8 +22,18 @@ import {
 	dropFindingsForMissingPaths,
 	findingPathExistence,
 	partitionFindingsByCitedPath,
-	type FindingPathExistence,
+	type FindingPathFacts,
 } from "../../clients/advisory-provenance.js";
+
+/**
+ * #1892: the injected probe answers with the path's FACTS, not a verdict — the
+ * verdict is the asking store's, derived per source from its own `scannedAt`
+ * and `onMissing`, so it is no longer something a test (or a sibling store) can
+ * hand the partition ready-made.
+ */
+const PRESENT: FindingPathFacts = { state: "present", mtimeMs: 0 };
+const MISSING: FindingPathFacts = { state: "missing" };
+const UNKNOWN: FindingPathFacts = { state: "unknown" };
 import { setupTestEnvironment } from "./test-utils.js";
 
 interface Finding {
@@ -87,7 +97,7 @@ describe("partitionFindingsByCitedPath (#1461 slice 1)", () => {
 	});
 
 	it("stats each unique path once — a 256-finding record over one dead dir costs one stat", () => {
-		const probe = vi.fn((): FindingPathExistence => "missing");
+		const probe = vi.fn((): FindingPathFacts => MISSING);
 		const findings: Finding[] = Array.from({ length: 256 }, (_, i) => ({
 			file: `/gone/dir/file-${i % 4}.ts`,
 			rule: `rule-${i}`,
@@ -96,7 +106,7 @@ describe("partitionFindingsByCitedPath (#1461 slice 1)", () => {
 			findings,
 			cwd: "/repo",
 			citedPath,
-			existence: probe,
+			probePath: probe,
 		});
 		expect(result.dropped).toHaveLength(256);
 		expect(result.statCount).toBe(4);
@@ -112,7 +122,7 @@ describe("partitionFindingsByCitedPath (#1461 slice 1)", () => {
 			],
 			cwd: "/repo",
 			citedPath,
-			existence: () => "unknown",
+			probePath: () => UNKNOWN,
 		});
 		expect(result.dropped).toEqual([]);
 		expect(result.live).toHaveLength(3);
@@ -130,7 +140,7 @@ describe("partitionFindingsByCitedPath (#1461 slice 1)", () => {
 			cwd: "/repo",
 			citedPath,
 			maxUniquePaths: 1,
-			existence: () => "missing",
+			probePath: () => MISSING,
 		});
 		expect(result.dropped.map((f) => f.rule)).toEqual([
 			"probed-dead",
@@ -234,8 +244,8 @@ describe("dropFindingsForMissingPaths drop record (#1432 Gap 1)", () => {
 			],
 			cwd: "/repo",
 			citedPath,
-			existence: (resolved) =>
-				resolved.replace(/\\/g, "/").includes("/gone/") ? "missing" : "live",
+			probePath: (resolved) =>
+				resolved.replace(/\\/g, "/").includes("/gone/") ? MISSING : PRESENT,
 		});
 		expect(delivered.map((f) => f.rule)).toEqual(["kept"]);
 		expect(logLatency).toHaveBeenCalledTimes(1);
@@ -263,7 +273,7 @@ describe("dropFindingsForMissingPaths drop record (#1432 Gap 1)", () => {
 				findings,
 				cwd: "/repo",
 				citedPath,
-				existence: () => "live",
+				probePath: () => PRESENT,
 			}),
 		).toEqual(findings);
 		expect(logLatency).not.toHaveBeenCalled();

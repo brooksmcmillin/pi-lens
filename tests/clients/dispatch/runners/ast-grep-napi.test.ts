@@ -48,6 +48,13 @@ vi.mock("../../../../clients/tool-policy.js", () => ({
 
 vi.mock("../../../../clients/dispatch/runners/yaml-rule-parser.js", () => ({
 	loadYamlRules: vi.fn().mockReturnValue([]),
+	// #3053 round 2 F3: the fold's shared `ast-grep-catalog.ts` calls this for
+	// every "project"-origin source (`buildEffectiveAstGrepCatalog`), which
+	// `evaluateAstGrepRules` now reaches transitively — no case in this file
+	// creates a project rules dir today, so the gap was silent, but any
+	// future one would hit vitest's "No export defined on the mock" instead
+	// of a clean empty-array skip.
+	loadYamlRulesFresh: vi.fn().mockReturnValue([]),
 	isOverlyBroadPattern: vi.fn().mockReturnValue(false),
 	isStructuredRule: vi.fn().mockReturnValue(false),
 	calculateRuleComplexity: vi.fn().mockReturnValue(1),

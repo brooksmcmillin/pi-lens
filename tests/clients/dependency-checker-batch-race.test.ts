@@ -58,7 +58,7 @@ describe("DependencyChecker.checkFilesBatch — concurrency race guard (#766)", 
 
 	beforeEach(() => {
 		vi.resetAllMocks();
-		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pilens-madge-batch-"));
+		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-pilens-madge-batch-"));
 		aPath = path.join(tmp, "a.ts");
 		cPath = path.join(tmp, "c.ts");
 		fs.writeFileSync(

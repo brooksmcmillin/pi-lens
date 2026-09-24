@@ -25,6 +25,7 @@ import {
 	cljfmtFormatter,
 	clearFormatterRuntimeState,
 	formatFile,
+	diagnosticTail,
 	getFormattersForFile,
 	googleJavaFormatFormatter,
 	invalidateFormatterCacheForPath,
@@ -40,8 +41,12 @@ import {
 	ALL_FORMATTERS,
 	styluaFormatter,
 	ktlintFormatter,
+	typstyleFormatter,
 } from "../../clients/formatters.js";
-import { resetDegradationLedger } from "../../clients/degradation-ledger.js";
+import {
+	getDegradationSummary,
+	resetDegradationLedger,
+} from "../../clients/degradation-ledger.js";
 import { FORMATTER_MARKERS } from "../../clients/tool-cwd.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 import { _getSpotlessGradleReadCountForTests } from "../../clients/tool-policy.js";
@@ -146,6 +151,45 @@ it("formatFile declines before spawning when agreement evidence is unreadable (#
 	});
 });
 
+it("retains the bounded formatter traceback tail (#3312)", async () => {
+	const longDiagnostic = "x".repeat(301);
+	const traceback = [
+		"Traceback (most recent call last):",
+		'  File "cmake-format", line 5, in <module>',
+		"    from cmakelang.format.__main__ import main",
+		"ModuleNotFoundError: No module named 'cmakelang'",
+		longDiagnostic,
+	].join("\n");
+
+	// Enter through formatFile: this is the recurrence from #3312, where the
+	// nightly rendered only the traceback header and hid the import failure.
+	await withPathShim("cmake-format", async () => {
+		const executable = path.join(tmpDir, "shims", "cmake-format");
+		fs.writeFileSync(
+			executable,
+			`#!/bin/sh\nprintf '%s\\n' 'Traceback (most recent call last):' '  File "cmake-format", line 5, in <module>' '    from cmakelang.format.__main__ import main' "ModuleNotFoundError: No module named 'cmakelang'" '${longDiagnostic}' >&2\nexit 1\n`,
+		);
+		fs.chmodSync(executable, 0o755);
+		const filePath = fileIn(tmpDir, "CMakeLists.cmake");
+		fs.writeFileSync(filePath, "add_library(foo bar.c)\n");
+		fs.writeFileSync(
+			path.join(tmpDir, ".cmake-format.yaml"),
+			"line_width: 80\n",
+		);
+
+		const result = await formatFile(filePath, cmakeFormatFormatter);
+		expect(result).toMatchObject({
+			success: false,
+			outcome: "failed",
+			error: `${traceback.slice(0, -longDiagnostic.length)}${"x".repeat(300)}`,
+		});
+	});
+
+	expect(diagnosticTail(`${"noise\n".repeat(25)}last line`, 20)).toBe(
+		`${"noise\n".repeat(19)}last line`.trimEnd(),
+	);
+});
+
 // ---------------------------------------------------------------------------
 // 1: node_modules/.bin resolution (biome, prettier)
 // ---------------------------------------------------------------------------
@@ -163,6 +207,27 @@ describe("resolveCommand — node_modules/.bin", () => {
 		expect(cmd).toContain("space");
 		expect(cmd).toContain("--indent-width");
 		expect(cmd).toContain("2");
+	});
+
+	it("biome: ancestor editorconfig disables inferred style flags", async () => {
+		const binPath = nodeModulesBin(tmpDir, "biome");
+		makeFakeExe(binPath);
+		const nestedDir = path.join(tmpDir, "packages", "app");
+		fs.mkdirSync(nestedDir, { recursive: true });
+		fs.writeFileSync(path.join(tmpDir, ".editorconfig"), "root = true\n");
+		const filePath = fileIn(nestedDir, "index.ts");
+		fs.writeFileSync(filePath, "function f() {\n      return 1;\n}\n");
+
+		const cmd = await biomeFormatter.resolveCommand!(filePath, nestedDir);
+
+		expect(cmd).toEqual([
+			binPath,
+			"format",
+			"--write",
+			"--no-errors-on-unmatched",
+			"--use-editorconfig=true",
+			filePath,
+		]);
 	});
 
 	it("biome: prefers local node_modules/.bin/biome over npx", async () => {
@@ -254,6 +319,7 @@ describe("managed formatter absence is typed (#2767)", () => {
 		["php-cs-fixer", phpCsFixerFormatter, "main.php"],
 		["google-java-format", googleJavaFormatFormatter, "Main.java"],
 		["oxfmt", oxfmtFormatter, "main.ts"],
+		["typstyle", typstyleFormatter, "main.typ"],
 	] as const)(
 		"returns formatter-unavailable for %s when every candidate is absent",
 		async (_toolId, formatter, fileName) => {
@@ -265,6 +331,11 @@ describe("managed formatter absence is typed (#2767)", () => {
 					tmpDir,
 				);
 				expect(command).toBe("formatter-unavailable");
+				if (_toolId === "typstyle") {
+					expect(getDegradationSummary()).toContainEqual(
+						expect.objectContaining({ kind: "formatter-unavailable" }),
+					);
+				}
 			});
 		},
 	);
@@ -303,6 +374,7 @@ describe("formatter child cwd", () => {
 			"shfmt",
 			"ktlint",
 			"ktfmt",
+			"typstyle",
 		];
 		const missing = expected.filter((name) => !(name in FORMATTER_MARKERS));
 		const unknown = Object.keys(FORMATTER_MARKERS).filter(
@@ -868,6 +940,32 @@ describe("getFormattersForFile — policy selection", () => {
 			const filePath = path.join(tmpDir, "src", "app.gleam");
 			const formatters = await getFormattersForFile(filePath, tmpDir);
 			expect(formatters.map((f) => f.name)).toEqual(["gleam"]);
+		});
+	});
+
+	it("uses typstyle as the smart default for Typst files when available", async () => {
+		const filePath = path.join(tmpDir, "main.typ");
+		createTempFile(tmpDir, "main.typ", "#let x=1+2\n");
+		await withPathShim("typstyle", async () => {
+			const formatters = await getFormattersForFile(filePath, tmpDir);
+			expect(formatters.map((f) => f.name)).toEqual(["typstyle"]);
+			const command = await typstyleFormatter.resolveCommand!(filePath, tmpDir);
+			expect(command).not.toBeNull();
+			expect(command?.[0]).toMatch(/(?:^|[\\/])typstyle(?:\.exe)?$/);
+			expect(command?.slice(1)).toEqual(["-i", filePath]);
+		});
+	});
+
+	it("uses typstyle for Typst code files when available", async () => {
+		const filePath = path.join(tmpDir, "main.typc");
+		createTempFile(tmpDir, "main.typc", "#let x=1+2\n");
+		await withPathShim("typstyle", async () => {
+			const formatters = await getFormattersForFile(filePath, tmpDir);
+			expect(formatters.map((f) => f.name)).toEqual(["typstyle"]);
+			const command = await typstyleFormatter.resolveCommand!(filePath, tmpDir);
+			expect(command).not.toBeNull();
+			expect(command?.[0]).toMatch(/(?:^|[\\/])typstyle(?:\.exe)?$/);
+			expect(command?.slice(1)).toEqual(["-i", filePath]);
 		});
 	});
 

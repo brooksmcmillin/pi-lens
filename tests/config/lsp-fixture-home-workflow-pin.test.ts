@@ -52,15 +52,16 @@ describe.each(WORKFLOWS)(
 	(workflowPath, jobName, expectedInstallSteps) => {
 		const workflow = loadWorkflow(workflowPath);
 		const jobEnv = workflow.jobs?.[jobName]?.env;
+		expect(jobEnv).toBeDefined();
 
 		it("carries a non-empty PI_LENS_HOME", () => {
 			expect(typeof jobEnv?.PI_LENS_HOME).toBe("string");
-			expect((jobEnv?.PI_LENS_HOME as string).trim().length).toBeGreaterThan(0);
+			expect((jobEnv!.PI_LENS_HOME as string).trim().length).toBeGreaterThan(0);
 		});
 
 		it("carries a non-empty PILENS_DATA_DIR", () => {
 			expect(typeof jobEnv?.PILENS_DATA_DIR).toBe("string");
-			expect((jobEnv?.PILENS_DATA_DIR as string).trim().length).toBeGreaterThan(
+			expect((jobEnv!.PILENS_DATA_DIR as string).trim().length).toBeGreaterThan(
 				0,
 			);
 		});

@@ -28,7 +28,7 @@ import { removeTempDirSync } from "./test-utils.js";
 let tmp: string;
 
 beforeEach(() => {
-	tmp = fs.mkdtempSync(path.join(os.tmpdir(), "opengrep-cfg-"));
+	tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-opengrep-cfg-"));
 });
 
 afterEach(() => {

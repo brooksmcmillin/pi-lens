@@ -24,6 +24,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetIgnoredConfigWarnCache } from "../../clients/config-warn.js";
+import { resetGlobalConfigLocationCache } from "../../clients/lens-config.js";
 import { removeTempDirSync } from "./test-utils.js";
 
 const notices: string[] = [];
@@ -54,12 +55,30 @@ function write(file: string, value: unknown): void {
 
 let previousConfigPath: string | undefined;
 let previousHome: string | undefined;
+let previousAgentDir: string | undefined;
+let previousRealHome: string | undefined;
+let previousRealUserProfile: string | undefined;
 
 beforeEach(() => {
 	notices.length = 0;
 	previousConfigPath = process.env.PI_LENS_CONFIG_PATH;
 	previousHome = process.env.PI_LENS_HOME;
+	previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	delete process.env.PI_CODING_AGENT_DIR;
+	// The production resolution is homedir-anchored (the canonical default and
+	// its grandfathering probe read `$HOME/.pi-lens/config.json`), and THIS
+	// suite writes the notice's named destination. Without adopting a fixture
+	// home, that destination is the maintainer's real global config — seen
+	// live during development: the F1 test below created and wrote the real
+	// file twice. `os.homedir()` reads `$HOME` on POSIX and `USERPROFILE` on
+	// Windows, so both spellings are adopted.
+	const adoptedHome = tmpRoot("pi-lens-notice-fakehome-");
+	previousRealHome = process.env.HOME;
+	previousRealUserProfile = process.env.USERPROFILE;
+	process.env.HOME = adoptedHome;
+	process.env.USERPROFILE = adoptedHome;
 	resetIgnoredConfigWarnCache();
+	resetGlobalConfigLocationCache();
 });
 
 afterEach(async () => {
@@ -67,7 +86,17 @@ afterEach(async () => {
 	else process.env.PI_LENS_CONFIG_PATH = previousConfigPath;
 	if (previousHome === undefined) delete process.env.PI_LENS_HOME;
 	else process.env.PI_LENS_HOME = previousHome;
+	if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+	else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+	if (previousRealHome === undefined) delete process.env.HOME;
+	else process.env.HOME = previousRealHome;
+	if (previousRealUserProfile === undefined) {
+		delete process.env.USERPROFILE;
+	} else {
+		process.env.USERPROFILE = previousRealUserProfile;
+	}
 	resetIgnoredConfigWarnCache();
+	resetGlobalConfigLocationCache();
 	const { resetProjectLensConfigCache } =
 		await import("../../clients/project-lens-config.js");
 	resetProjectLensConfigCache();

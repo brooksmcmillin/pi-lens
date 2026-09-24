@@ -84,6 +84,7 @@ import {
 	recordDegradationOnce,
 } from "./degradation-ledger.js";
 import { getGlobalPiLensDir } from "./file-utils.js";
+import { resolveBackstopStateDir } from "./instance-reaper-state.js";
 import {
 	type InstanceEntry,
 	isInstanceRegistryEnabled,
@@ -1286,7 +1287,10 @@ function scheduleGraceRetryIfNeeded(
 async function acquireBackstopLock(): Promise<(() => Promise<void>) | null> {
 	try {
 		return await acquireQuarantinePidFileLock(
-			path.join(getGlobalPiLensDir(), "orphan-backstop.lock"),
+			path.join(
+				resolveBackstopStateDir(getGlobalPiLensDir()),
+				"orphan-backstop.lock",
+			),
 			{
 				waitMs: 0,
 				retryMs: 50,
@@ -1360,7 +1364,10 @@ function logBackstopOutcome(
  *  machine-scoped (every pi-lens process shares one OS process table), and
  *  process-lifetime state cannot express "30 minutes have passed". */
 function backstopStampPath(): string {
-	return path.join(getGlobalPiLensDir(), "orphan-backstop.json");
+	return path.join(
+		resolveBackstopStateDir(getGlobalPiLensDir()),
+		"orphan-backstop.json",
+	);
 }
 
 async function readBackstopStamp(): Promise<number | undefined> {
@@ -1380,7 +1387,9 @@ async function readBackstopStamp(): Promise<number | undefined> {
 
 async function writeBackstopStamp(at: number): Promise<void> {
 	try {
-		await fs.promises.mkdir(getGlobalPiLensDir(), { recursive: true });
+		await fs.promises.mkdir(resolveBackstopStateDir(getGlobalPiLensDir()), {
+			recursive: true,
+		});
 		await writeFileAtomicAsync(
 			backstopStampPath(),
 			JSON.stringify({ lastSweepAt: at }),

@@ -20,6 +20,7 @@ const workflow = yaml.load(
 			steps?: Array<Record<string, unknown>>;
 		}
 	>;
+	on?: { pull_request?: { types?: string[] } };
 };
 const mutationWorkflow = yaml.load(
 	readFileSync(resolve(ROOT, ".github/workflows/mutation.yml"), "utf8"),
@@ -123,11 +124,13 @@ describe("#2714 dependabot skips the human PR-policy checks", () => {
 
 	it("skips pr-title-lint and pr-body-lint for dependabot and no other lint.yml job", () => {
 		const policyJobs = ["pr-title-lint", "pr-body-lint"];
-		for (const key of policyJobs) {
-			expect(workflow.jobs[key]?.if, `${key} must skip dependabot`).toBe(
-				dependabotSkip,
-			);
-		}
+		expect(workflow.jobs["pr-title-lint"]?.if).toBe(dependabotSkip);
+		expect(workflow.jobs["pr-body-lint"]?.if).toContain(
+			"github.event_name == 'pull_request'",
+		);
+		expect(workflow.jobs["pr-body-lint"]?.if).toContain(
+			"github.event.pull_request.user.login != 'dependabot[bot]'",
+		);
 		const others = Object.keys(workflow.jobs).filter(
 			(key) => !policyJobs.includes(key),
 		);
@@ -150,5 +153,46 @@ describe("#2714 dependabot skips the human PR-policy checks", () => {
 			closeKeywords.jobs.lint?.if,
 			"close-keyword must skip dependabot",
 		).toBe(dependabotSkip);
+	});
+});
+
+describe("#3030 PR body lint event coverage", () => {
+	function bodyJobRunsFor(action: string): boolean {
+		const condition = workflow.jobs["pr-body-lint"]?.if ?? "";
+		return (
+			condition.includes("github.event_name == 'pull_request'") &&
+			!condition.includes(`github.event.action != '${action}'`)
+		);
+	}
+
+	it("keeps the workflow event matrix and PR-body action matrix exact", () => {
+		// Recurrence: ordinary synchronize events need not revalidate an unchanged
+		// PR body, but edited metadata/body events must still run the advisory check.
+		expect(workflow.on?.pull_request?.types).toEqual([
+			"opened",
+			"synchronize",
+			"reopened",
+			"edited",
+		]);
+		const actionMatrix = {
+			opened: true,
+			reopened: true,
+			edited: true,
+			synchronize: false,
+		} as const;
+		for (const [action, expected] of Object.entries(actionMatrix)) {
+			expect(bodyJobRunsFor(action), `${action} PR-body validation`).toBe(
+				expected,
+			);
+		}
+	});
+
+	it("keeps the synchronize exclusion exclusive to PR-body lint", () => {
+		const excludedJobs = Object.entries(workflow.jobs)
+			.filter(([, job]) =>
+				(job.if ?? "").includes("github.event.action != 'synchronize'"),
+			)
+			.map(([key]) => key);
+		expect(excludedJobs).toEqual(["pr-body-lint"]);
 	});
 });

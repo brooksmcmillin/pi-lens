@@ -16,6 +16,11 @@ jobs:
   verify:
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default. This job runs
+    # on pull_request_target so --branch master matched only 1 run; measured
+    # max over the last 10 successful runs regardless of branch: 13s; timeout =
+    # floor of 10 min.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:

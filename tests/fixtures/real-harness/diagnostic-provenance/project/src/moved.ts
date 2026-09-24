@@ -40,3 +40,6 @@
 // filler 40
 export const staleExport = 2;
 export const entry = true;
+export function trip(): void {
+	debugger;
+}

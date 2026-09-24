@@ -12,6 +12,12 @@ description: Run the pi-lens review → verify → merge policy over one or more
 The policy that landed the 2026-08-17 arc (11 PRs, every one adversarially
 reviewed, zero unreviewed merges). Apply it to each PR in the queue.
 
+Every PR body starts with `## Why`, `## Notes for the reviewer`, and
+`## Change outline`, followed by the existing `## Summary`, `## Tests`,
+`## Blast radius`, `## Class sweep`, and `## Observability` sections. The
+change outline is the changed symbol's caller/callee tree with `+`/`-` on
+moved lines; include only structural views that changed.
+
 ## The loop, per PR
 
 1. **Review.** Spawn `pi-lens-reviewer` (worktree isolation) with the PR
@@ -57,7 +63,9 @@ reviewed, zero unreviewed merges). Apply it to each PR in the queue.
    them, absent is not green); every failing check
    was read and judged (infra failures — codeload 429/503, SARIF-upload
    errors, Initialize-CodeQL outages — may be waved through only with the
-   log read and the judgment recorded).
+   log read and the judgment recorded). A PR that is green on its head but
+   whose merge with `origin/master` was not tested against the exact-pin
+   sweeps is not green — run the sweep on the merge before merging.
 5. **Merge.** `gh pr merge <N> --merge` (merge commit, repo convention).
    If "not up to date", `gh api -X PUT .../pulls/<N>/update-branch`, wait for
    CI, re-gate, merge. On GitHub 503s: retry with backoff, never switch to
@@ -198,8 +206,13 @@ operator's private notes, so a different orchestrator can run the same train.
   | a field on a durable or shared record (cache entry, diagnostic, ledger row) | old-record parse proof, cache schema version, and every test that deep-equals or snapshots the record — #2783 r1/r3 |
   | a test that spawns a real child (LSP fake server, tool smoke, installer) | the lane admission (header + `vitest.config.ts` project + coverage baseline) and `tests/config/` — #2783 r5 |
   | a new fixture under `tests/fixtures/` | the fixture-contract sweeps for that directory (style-preserving, population guards) — #2782 r2 |
-  | a changelog fragment | exactly one top-level entry, never `CHANGELOG.md` — #2775 r4, two hand-edits today |
+  | a change that touches identifier uses of a glossary-retired synonym | run `tests/config/glossary-synonym-sweep.test.ts` on the head AND on the merge with `origin/master`, then re-pin in the PR from the sweep's own `UNPINNED`/`STALE` output — #3279, #3283, #3284, #3288 |
+  | a new `vi.mock` in a test file | run `tests/config/vi-mock-export-sweep.test.ts`; whole-module mocks of a production module must spread `importOriginal` — PR #3268's CI red, fixed by trailing commit `621d61c5c` |
+  | a changelog fragment | front matter `section: <Section>` and exactly one top-level `- **Title (refs #N)** —` entry, never `CHANGELOG.md`, validated by `node scripts/check-changelog-fragments.mjs` — PR #3268 r1 shipped `category:` and a paragraph |
+  | a PR body | the header gate: exactly one-sentence `## Why`, `## Notes for the reviewer`, `## Change outline`, plus Summary / Tests with `### Test assessment` / Blast radius / Class sweep / Observability; run `node scripts/check-pr-body.mjs --lint-local` before pushing — three PRs this week needed orchestrator body edits |
+  | a whole-tree docs restructure of `AGENTS.md` | every governance test that reads `AGENTS.md`, with markers on their own lines — PR #3265 r1 |
   | a raw poll in a test | the flake-shape ratchet; the fix is the governed wait, never a header admission — #2781 r1 |
+  | a new, renamed or deleted rule file under `rules/` | `npm run docs:rule-catalogs` and commit the generated catalog; `tests/scripts/rule-catalogs.test.ts` is a strict consumer of every rule file, not of rule ids — #3214 r1 |
 
 - **Sandbox by test shape (2026-09-09).** A lane whose tests spawn children
   (LSP fake server, tool smoke, installer, formatter wire) is dispatched with
@@ -217,6 +230,10 @@ operator's private notes, so a different orchestrator can run the same train.
   while its handle is alive: it keeps the diff and the reasoning, and the
   brief shrinks to the findings. Release only when the lane moves to review.
   A fresh worker on a resume loses uncommitted work.
+- **Release a reviewer handle only after reading a merge-ready verdict.** A fix
+  round resumes the SAME reviewer via `resumeFrom` with the model pinned. Twice
+  this week (PRs #3263 r2 and #3261 r2), release ran in the same batch as the
+  read and continuity was lost.
 - **Fleet inventory at every settlement.** A one-shot watch misses anything
   that settles while it is disarmed: after each settlement,
   list live workers and read every `done` handle not yet consumed. Two lanes
@@ -302,20 +319,14 @@ operator's private notes, so a different orchestrator can run the same train.
   from the auto-fix-mechanical rule in aromanarguello/roman-skills
   `final-review`; NOT borrowed from it: auto-fixing null checks, error
   handling or cleanup hooks, which change meaning.
-- **Reserve the catalog number at DISPATCH, not at write time (2026-09-12).**
-  AGENTS.md's defect-shape catalog is a contended global counter: every brief
-  says "append at the tail with the next free number", so two concurrent lanes
-  both read the same tail and both claim it. #2946 and #2953 collided on 49;
-  #2987 and #2988 are both still sitting on 49 with 50 and 51 already taken;
-  and the same mid-list edits produced markdownlint MD029 three times in one
-  day. The counter is the orchestrator's to allocate, not the fixer's to
-  discover. When a brief authorises a catalog entry, name the exact number in
-  the brief and record the reservation in the ledger beside the lane; when a
-  lane is dropped, release the number there too. A lane must never pick its
-  own. The same rule blocks the orchestrator: a docs change cannot claim N+1
-  while an open PR holds N, because the gap reds MD029 on its own branch
-  before the holder merges — stack it on that branch or hold it until the
-  holder lands.
+- **Allocate the catalog number at MERGE, not at dispatch (2026-09-15).**
+  AGENTS.md's defect-shape catalog is a markdownlint MD029 ordered list: the
+  number is the list position, so dispatch-time reservations create a gap on
+  branches whose holder has not merged. The orchestrator owns allocation; a
+  lane may draft a shape but must not claim a number. At merge, insert or
+  renumber the shape at the next valid sequential position and recheck the
+  whole catalog. This prevents concurrent lanes from colliding without
+  shipping a gap.
 - **On a CROSS-REPOSITORY PR, `action_required` is not `absent` (2026-09-12).**
   A fork PR's workflow runs sit unstarted until a maintainer approves them, and
   `ci-verdict` correctly reports the required checks as absent and therefore
@@ -486,6 +497,17 @@ Each row cost a lane at least once; the prose above carries the record.
 | Accepting a worker's "pre-existing red on master" | Run the file on origin/master in YOUR environment before believing it; four workers reported env-specific reds as master reds (2026-09-10) |
 | Letting a fix round enumerate cases instead of deriving the rule | #2877 took 7 rounds; the brief for a rule fix demands derivation from the source of truth (grammar table, measured host sequence) |
 | Accepting a state-space table on its claims | Grep every test id in the table before accepting the round; #2877 r3 and #2868 r3 (2026-09-10) shipped 48–72-cell tables with zero real ids |
+| Believing a worker's "N suites red on origin/master" without auditing its probe ENV | #3026's fixer pinned `TMPDIR` to the harness `.probe-home` and reported 16 unrelated suites red; the tree was green (2026-09-15). Ask for the A/B with the variable held fixed; the `tmpdirCollision` deny rule in `scripts/hooks/guard-bash.mjs` blocks the command |
+| Merging a PR before its own CI has been read on the exact head | #3051 landed 20:05Z with the gitignore negation commit missing; `gitignore-tracked-shadow` redded on every open lane for ~30 min (#3055). `node scripts/ci-verdict.mjs <sha>` before every merge, admin merges included |
+| Hand-triggering attempt 3 after a second infra kill | `ci-infra-kill-rerun.yml`'s classify job was gated `run_attempt == 1`, so it never covered the second kill on one head; #3048 and #3040 each needed a manual rerun (2026-09-15). The gate now covers attempt 2; a third kill is a hand rerun by design |
+| Merging a workflow edit whose only executing lane is master-only | #3033 edited install-smoke's `pnpm-global`/`mise-repro` steps, both gated `!= 'pull_request'`; six cells failed on every master push for a day (#3043). Give the edited lane a PR-eligible cell, or run `gh workflow run <file> --ref <branch>` and quote the run id |
+| Sending a governance-sweep brief to a Sonnet fixer | Two rounds cost 765k tokens / 459 tool uses on #3066 and 587k on round 1 alone (2026-09-15). A brief that adds or edits a `tests/support/sweep-kit.ts` registered-or-fail sweep goes to the strongest available fixer |
+| Dispatching into a backend session window that cannot hold the brief | commandcode's undocumented 5-hour cap killed #2928's worker after 42 turns with uncommitted work and no `COMMIT_MSG.txt`, and gave #3045 r2's worker 0 turns (2026-09-16 00:07Z). Check the backend's cap and reset time before dispatch; re-route on reset (plegma #436) |
+| Accepting a derived guard whose mutations are all neutered-guard rows | #3045 r1's guard accepted a junk marker and a substring launcher with M3/M4/M6 green. Demand one negative-population row: an input the guard must reject (#3075) |
+| Merging a fold PR without mutating what the deleted sibling used to back | Four folds in one session each shipped a newly-sole predicate that was untested (#3064 F1, #3065 F3, #3066 F3, #3068 F2). Mutate every predicate the fold promoted, not only the new code |
+| Accepting a runtime test as red-first evidence for a type-only defect | #3026's case could never red — `tsc` erased both changed lines and the emitted JS was byte-identical. The compile transcript on both `tsconfig.build.json` and `tsconfig.json` is the evidence (#3074) |
+| Admitting a real `git show <sha>` in a test to read historical content | #3066 r1 ran it at MODULE SCOPE; CI checks out at depth 1, so the file would have collected zero tests including three pre-existing #525 cases. Commit the content as a fixture under `tests/fixtures/` |
+| Letting a heavy governance test land without a measured peak RSS | `bounded-container-guard` landed at 9.2 GB on 2026-09-14 and drove the CI kill rate 7.1% → 30.4% in five days (#3058). The `worker-peak-rss` gate (#3062) now fails a `default`-project file over budget; keep it gating, not advisory (#3067) |
 | Arming `plegma watch --next` after the lane already settled | The watch only sees settlements newer than itself; check `plegma_status` by handle first and process a done lane directly (three lanes sat settled for hours, 2026-09-10) |
 | Pruning trees with `merge-base --is-ancestor` | Prune only trees whose branch is the head of the PR just merged (#2358's tree, 2026-09-06) |
 | Retargeting a PR base and waiting for CI | `edited` does not fire ci.yml; push a commit or close/reopen |
@@ -512,6 +534,7 @@ Each row cost a lane at least once; the prose above carries the record.
 | Sweeping a shape by grep-counting tokens | A ratchet reads the exact literal it governs (#2693: four sites counted, six real) |
 | `npx <tool>@latest` inside the repo to measure something | It rewrote package-lock.json (108 deletions) on 2026-09-07; run one-off tools from a scratch prefix, and `git diff --stat` before every commit |
 | `git add -A` in a worktree that links `node_modules` | The ignore rule `node_modules/` does not match a SYMLINK; #2703 committed one and broke the clean-clone install and the tracked-shadow test. `git add <paths>`, and `.gitignore` now says `node_modules` without the slash |
+| `git worktree remove --force` on a tree whose `node_modules` is a symlink | Git follows the link and empties the shared checkout's install (twice on 2026-09-16, #2704 class; every other lane's build broke). `rm node_modules` first (unlink, never `rm -r`), then remove; mechanisation in the Bash hook is filed |
 | Checking a branch out in the shared main tree for your own fix | Reviewers saw the checkout switch under them three times on 2026-09-07; use a throwaway `git worktree add` under the scratchpad, remove it after the push |
 | `gh run rerun --failed` while the run is still in progress | GitHub refuses it; wait for the run to complete (poll `gh run view --json status`), then rerun, then re-read the verdict |
 | Reading a failed job's log before its run completes | Empty output; the log is withheld until the whole run finishes |
@@ -526,3 +549,4 @@ Each row cost a lane at least once; the prose above carries the record.
 | Running a governance suite in the main checkout after merges without rebuilding | Vitest loads compiled `.js`; a stale build makes the run fail closed (or worse, test old code). `npm run build` before any test run in a checkout that has moved |
 | Accepting a lifecycle round on `-t`-only mutation reds | #2853 r6/r7 quoted reds that only reproduced under `-t`; nine awaits never returned whole-file (#2859). Whole-file mutation runs are the acceptance shape (AGENTS.md round-routing) |
 | Sending a scope `note` to a worker about to finish | The #2854 r2 worker settled before the note was read; the round shipped without H2/M1. Check `plegma_status` first; a worker with no turns left gets a new round, not a note |
+| Rewriting a PR body's narrative without re-reading the `.changelog/` fragment | The fragment kept the retracted round-1 story after the body moved on to a different remedy (#3155 r2); re-read the fragment on every body rework, not just the body |

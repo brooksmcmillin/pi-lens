@@ -46,7 +46,7 @@ afterEach(() => {
 
 function freshRuleDir(): string {
 	const dir = fsSync.mkdtempSync(
-		path.join(os.tmpdir(), "pilens-ast-grep-rules-health-"),
+		path.join(os.tmpdir(), "pi-lens-pilens-ast-grep-rules-health-"),
 	);
 	tmpDirs.push(dir);
 	return dir;

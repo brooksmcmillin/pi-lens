@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Minimatch, type MinimatchOptions } from "./deps/minimatch.js";
+import { detectFileRole } from "./file-role.js";
 import { FRESHNESS_CADENCE_MS } from "./freshness-cadence.js";
 import {
 	isInSpawnTimeoutCooldown,
@@ -358,6 +359,14 @@ export const EXCLUDED_DIRS = [
 	".next",
 	".pi-lens",
 	".pi", // pi agent directory
+	// The SAME agent, rebranded: pi derives its config-dir name as
+	// `pkg.piConfig?.configDir || ".pi"` (pi-coding-agent 0.85.1,
+	// `dist/bundle/chunks/chunk-JVUZSMYM.js`), so a redistribution spells its
+	// `<configDir>/agent/sessions` history `.omp/agent/sessions` instead.
+	// #3112: a project-local one was walked entry-by-entry and spent the whole
+	// startup-scan entry budget, so a five-file project reported
+	// `too-many-entries` and never warmed its caches.
+	".omp",
 	".ruff_cache", // Python linter cache
 	".worktrees",
 	".claude",
@@ -1270,15 +1279,14 @@ export async function detectFileChangedAfterCommand(
  * Check if file path is a test/fixture/mock file.
  * Used by secrets scanner, rate command, and dispatch runners
  * to skip these files (false positives on fake credentials, etc).
+ *
+ * Delegate naming/directory classification to file-role (#2928). Fixtures,
+ * mocks and test helpers remain this skip gate's separate policy.
  */
 export function isTestFile(filePath: string): boolean {
+	if (detectFileRole(filePath) === "test") return true;
 	const normalized = filePath.replace(/\\/g, "/");
 	return (
-		normalized.includes(".test.") ||
-		normalized.includes(".spec.") ||
-		normalized.includes("/test/") ||
-		normalized.includes("/tests/") ||
-		normalized.includes("__tests__/") ||
 		normalized.includes("test-utils") ||
 		normalized.startsWith("test-") ||
 		normalized.includes(".fixture.") ||

@@ -378,9 +378,10 @@ describe("lsp_navigation tool", () => {
 			const executeCall = (
 				mocked.service as { executeCommand: ReturnType<typeof vi.fn> }
 			).executeCommand.mock.calls[0];
+			expect(executeCall).toBeDefined();
 			expect(
 				(
-					executeCall?.[3] as {
+					executeCall![3] as {
 						isRecordable: (filePath: string) => boolean;
 					}
 				).isRecordable(siblingPath),

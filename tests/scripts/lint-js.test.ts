@@ -161,6 +161,114 @@ describe("lint:js (#2439 — oxlint wired over .mjs/.cjs)", () => {
 	);
 });
 
+describe("lint:js:tests (#3244 — required type-aware test population)", () => {
+	const TEST_SCRIPT = "lint:js:tests";
+	const RULES = [
+		[
+			"typescript/no-floating-promises",
+			"async function probe() { Promise.resolve(); }\n",
+		],
+		["typescript/await-thenable", "async function probe() { await 1; }\n"],
+		[
+			"eslint/no-unsafe-optional-chaining",
+			"function probe(value) { return (value?.property).nested; }\n",
+		],
+	] as const;
+
+	it("is wired through the real lint wrapper and required by npm run lint", () => {
+		const pkg = JSON.parse(
+			fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8"),
+		);
+		expect(pkg.scripts.lint).toContain(`npm run ${TEST_SCRIPT}`);
+		expect(pkg.scripts[TEST_SCRIPT]).toMatch(
+			/^node scripts\/lint-js-advisory\.mjs\s+--deny-warnings\s+--format unix\s+--type-aware/,
+		);
+		for (const [rule] of RULES)
+			expect(pkg.scripts[TEST_SCRIPT]).not.toContain(`-D ${rule}`);
+	});
+
+	it("the committed config enables all three rules for tests", () => {
+		const config = JSON.parse(fs.readFileSync(OXLINT_CONFIG, "utf8"));
+		const testOverride = config.overrides.find(
+			(override: { files?: string[] }) =>
+				override.files?.includes("tests/**/*.ts"),
+		);
+		expect(testOverride?.rules).toMatchObject({
+			"typescript/no-floating-promises": "error",
+			"typescript/await-thenable": "error",
+			"eslint/no-unsafe-optional-chaining": "error",
+		});
+	});
+
+	it.each(RULES)(
+		"the real required command fails on a planted %s recurrence",
+		(rule, source) => {
+			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-lint-js-3244-");
+			const fixture = path.join(tmpDir, "tests", "probe.ts");
+			fs.mkdirSync(path.dirname(fixture), { recursive: true });
+			const configPath = path.join(tmpDir, ".oxlintrc.json");
+			fs.copyFileSync(OXLINT_CONFIG, configPath);
+			fs.symlinkSync(
+				path.join(REPO_ROOT, "node_modules"),
+				path.join(tmpDir, "node_modules"),
+				"dir",
+			);
+			fs.writeFileSync(
+				path.join(tmpDir, "tsconfig.json"),
+				JSON.stringify({ compilerOptions: { strict: true } }),
+			);
+			try {
+				fs.writeFileSync(fixture, source);
+				const commandArgs = [
+					path.join(REPO_ROOT, "scripts/lint-js-advisory.mjs"),
+					"--deny-warnings",
+					"--format",
+					"unix",
+					"--type-aware",
+					"-A",
+					"correctness",
+					"-A",
+					"suspicious",
+					"-A",
+					"perf",
+					"--ignore-pattern",
+					"tests/fixtures/**",
+					"--config",
+					configPath,
+					fixture,
+				];
+				const run = (args: string[]) =>
+					spawnSync(process.execPath, args, {
+						encoding: "utf8",
+						cwd: tmpDir,
+						env: {
+							...process.env,
+							PATH: `${path.dirname(OXLINT_ENTRY)}${path.delimiter}${process.env.PATH ?? ""}`,
+						},
+						timeout: SPAWN_TIMEOUT_MS * 2,
+					});
+				const result = run(commandArgs);
+				expect(result.status, result.stdout + result.stderr).not.toBe(0);
+				expect(result.stdout + result.stderr).toContain(
+					rule.replace(/^.*\//, ""),
+				);
+
+				const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+				const override = config.overrides.find((entry: { files?: string[] }) =>
+					entry.files?.includes("tests/**/*.ts"),
+				);
+				override.rules[rule] = "off";
+				fs.writeFileSync(configPath, JSON.stringify(config));
+				const disabled = run(commandArgs);
+				expect(disabled.status, disabled.stdout + disabled.stderr).toBe(0);
+			} finally {
+				cleanup();
+			}
+		},
+		SPAWN_TIMEOUT_MS * 2 + 5_000,
+	);
+});
+
 /**
  * #2700 — two tiers: `lint:js` (gating) enumerates individually-promoted
  * rules with zero findings on master, `lint:js:advisory` (continue-on-error

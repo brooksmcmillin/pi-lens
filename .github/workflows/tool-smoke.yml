@@ -22,9 +22,77 @@ on:
   workflow_dispatch:
 
 jobs:
+  test-history-rollup:
+    name: Roll up durable unit-test history
+    # History is a nightly concern. In particular, a PR must never become red
+    # because its historical artifacts are unavailable or a data-branch push
+    # loses a race with another bot.
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: true
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: '22'
+      - name: Download unit-test result artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/test-history-artifacts"
+          gh api --paginate "/repos/${GITHUB_REPOSITORY}/actions/artifacts?name=unit-test-results-linux&per_page=100" \
+            --jq '.artifacts[] | select(.expired == false) | .id' > "$RUNNER_TEMP/test-history-artifact-ids"
+          while read -r artifact_id; do
+            [ -n "$artifact_id" ] || continue
+            mkdir -p "$RUNNER_TEMP/test-history-artifacts/$artifact_id"
+            gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/$artifact_id/zip" > "$RUNNER_TEMP/$artifact_id.zip"
+            unzip -q "$RUNNER_TEMP/$artifact_id.zip" -d "$RUNNER_TEMP/test-history-artifacts/$artifact_id"
+          done < "$RUNNER_TEMP/test-history-artifact-ids"
+      - name: Append history and publish data branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          script_copy="$RUNNER_TEMP/test-history-rollup.mjs"
+          cp scripts/test-history-rollup.mjs "$script_copy"
+          git fetch origin data/test-history || true
+          for attempt in 1 2 3; do
+            echo "test-history push attempt ${attempt}/3"
+            git checkout --detach "$GITHUB_SHA"
+            old_history="$RUNNER_TEMP/test-history.ndjson"
+            : > "$old_history"
+            if git show origin/data/test-history:history/test-results.ndjson > "$old_history" 2>/dev/null; then :; fi
+            node "$script_copy" --artifact-dir "$RUNNER_TEMP/test-history-artifacts" \
+              --history "$old_history" --summary "$RUNNER_TEMP/test-history-summary.json"
+            if git show-ref --verify --quiet refs/remotes/origin/data/test-history; then
+              git checkout -B data/test-history origin/data/test-history
+            else
+              git checkout --orphan data/test-history
+              git rm -rf . >/dev/null 2>&1 || true
+            fi
+            mkdir -p history
+            cp "$old_history" history/test-results.ndjson
+            cp "$RUNNER_TEMP/test-history-summary.json" history/summary.json
+            git add history
+            git -c user.name='pi-lens nightly' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'chore(nightly): append test history' || true
+            if git push origin HEAD:data/test-history; then exit 0; fi
+            git fetch origin data/test-history
+          done
+          echo 'data/test-history push lost three consecutive races' >&2
+          exit 1
+
   tool-smoke:
     name: Live tool + LSP smoke
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 855s (14m15s); sized at
+    # ~2x + margin.
+    timeout-minutes: 35
     permissions:
       contents: write # commit-back branch for the LSP-docs refresh PR (#390)
       pull-requests: write # open/update the auto-refresh PR (#390)
@@ -80,7 +148,7 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
-      - uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1
+      - uses: ruby/setup-ruby@a0102e0972be65f351c307e2d64b9314a57c8073 # v1
         continue-on-error: true
         with:
           ruby-version: '3.3'
@@ -98,6 +166,14 @@ jobs:
           otp-version: '27'
           elixir-version: '1.18'
           gleam-version: '1'
+
+      # fish-lsp requires the fish executable to start its server. Pin the
+      # package so the nightly's fish proof is reproducible across runner
+      # images, alongside the other runner-tool provisioning above (#3359).
+      - name: Install fish for fish-lsp
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes fish=3.7.0-1
 
       - name: Install dependencies
         run: npm install --no-audit --no-fund
@@ -185,6 +261,7 @@ jobs:
       # own internal try/catch — same "always exit 0, telemetry only" contract
       # as the probe itself).
       - name: Notify on silentOnClean drift (file/update/close tracking issue)
+        if: always() && (github.event_name == 'schedule' || github.ref == 'refs/heads/master')
         continue-on-error: true
         run: node scripts/notify-clean-signal-drift.mjs
 
@@ -196,12 +273,24 @@ jobs:
         continue-on-error: true
         run: node scripts/server-capabilities.mjs --install
 
+      - name: Check LSP docs refresh diff
+        id: docs_diff
+        shell: bash
+        run: |
+          if git diff --quiet -- docs/lsp-capability-matrix.md docs/servercapabilities.md; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "LSP docs are byte-identical to master; skipping refresh PR."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
       # Commit-back (#390 item 2): the three steps above regenerate the LSP docs
       # in-place. master has required checks the schedule's GITHUB_TOKEN can't
       # bypass, so we open/UPDATE a single auto-PR (fixed branch, force-pushed each
       # run) instead of pushing to master. Docs change rarely (only when a server's
       # caps/tier change), so this is low-noise. No-ops when nothing changed.
       - name: Open/update LSP-docs refresh PR
+        if: steps.docs_diff.outputs.changed == 'true'
         continue-on-error: true
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
@@ -212,7 +301,7 @@ jobs:
             docs/lsp-capability-matrix.md
             docs/servercapabilities.md
           commit-message: 'docs(nightly): refresh LSP capability docs'
-          title: 'docs(nightly): refresh LSP capability docs'
+          title: 'docs(nightly): refresh LSP capability docs (refs #3217)'
           body: |
             Automated refresh of the LSP capability docs from the nightly tool-smoke run.
 
@@ -224,6 +313,10 @@ jobs:
             can't regress a richer run (#390).
 
             Refs #460, #390, #529.
+
+            This PR is created with the repository `GITHUB_TOKEN`, which cannot
+            trigger workflow runs. After the bot opens or updates it, a
+            maintainer must close and reopen the PR to arm CI.
           delete-branch: false
 
       - name: Format layer (select + reformat through formatter pipeline)
@@ -231,6 +324,21 @@ jobs:
         run: |
           set -o pipefail
           node scripts/smoke-tools.mjs --format --install --verbose 2>&1 | tee "$RUNNER_TEMP/tool-smoke-format-layer.log"
+
+      # #3319: PR analyses cover only their diff, so a master-only SonarCloud
+      # quality regression otherwise stays invisible to the merge train. Keep
+      # this as a real gate, but let the script classify SonarCloud transport
+      # outages as visible fail-open warnings. `always()` ensures the master
+      # read happens even when an earlier smoke layer already failed; the
+      # final notifier below still runs after either result.
+      # Reads MASTER's gate, so it is meaningful only on the schedule and on
+      # master itself: a branch dispatch (a PR's exact-head nightly) must not
+      # go red on master's Sonar state. Same scoping as the drift notifier
+      # below (#3346/#3352).
+      - name: SonarCloud master quality gate
+        id: sonar_master_gate
+        if: always() && (github.event_name == 'schedule' || github.ref == 'refs/heads/master')
+        run: node scripts/sonar-master-gate.mjs
 
       # #2723: the ONLY tracking-issue writer this workflow had before this
       # step (`Notify on silentOnClean drift` above) sits behind the LSP
@@ -253,7 +361,7 @@ jobs:
       # exits 0) — filing/updating/closing an issue must never change the
       # nightly's own conclusion (acceptance #5).
       - name: Notify on tool-smoke red (file/update/close tracking issue)
-        if: always()
+        if: always() && (github.event_name == 'schedule' || github.ref == 'refs/heads/master')
         continue-on-error: true
         env:
           TOOL_LAYER_OUTCOME: ${{ steps.tool_layer.outcome }}

@@ -33,7 +33,9 @@ afterEach(() => {
  * that any small entry budget trips long before the walk completes.
  */
 function createMixedTree(): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "source-filter-budget-"));
+	const dir = fs.mkdtempSync(
+		path.join(os.tmpdir(), "pi-lens-source-filter-budget-"),
+	);
 	cleanups.push(() => removeTempDirSync(dir));
 
 	fs.writeFileSync(path.join(dir, "main.ts"), "export const a = 1;\n");

@@ -27,7 +27,7 @@ import { normalizeMapKey } from "../../../clients/path-utils.js";
 // fixture directory has no cleanup path, so runs kept `skip-record-bounding-fixture/`
 // behind and its marker file was once committed as a test artifact.
 const FIXTURE_ROOT = fs.mkdtempSync(
-	path.join(os.tmpdir(), "skip-record-bounding-"),
+	path.join(os.tmpdir(), "pi-lens-skip-record-bounding-"),
 );
 const FIXTURE_FILE = path.join(FIXTURE_ROOT, "main.fake");
 const OTHER_FILE = path.join(FIXTURE_ROOT, "other.fake");

@@ -248,7 +248,8 @@ export function clearWorkspaceDiagnosticsCacheAtAndAbove(
 //   "recompute", the same outcome a real refresh produces. The pre-#1754 map
 //   was unbounded; the bound is new and costs at most one extra sweep for a
 //   cwd that fell off the end.
-// - `normalizeMapKey` runs `realpathSync.native` on Windows. A handle re-runs
+// - `normalizeMapKey` runs `realpathSync.native` on Windows and, since #3098,
+//   on POSIX as well. A handle re-runs
 //   it only after the map has been invalidated, so an uninterrupted sweep pays
 //   that syscall once at context creation rather than once per `lookup()`, and
 //   an interrupted one pays it per check to stay correct if the cwd's realpath

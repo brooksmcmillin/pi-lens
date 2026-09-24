@@ -3,7 +3,13 @@
 // side effects (`run`, the main-guard block) are exercised only by spawning
 // the real script as a child process, not by importing it.
 
-export type DenyRule = "stash" | "reset" | "worktreeForce" | "probe";
+export type DenyRule =
+	| "stash"
+	| "reset"
+	| "worktreeForce"
+	| "worktreeSymlink"
+	| "probe"
+	| "tmpdirCollision";
 
 export const RULE_MESSAGES: Readonly<Record<DenyRule, string>>;
 
@@ -26,9 +32,10 @@ export function stripEnvAssignments(words: string[]): {
 export function classifySegment(
 	rawSegment: string,
 	sharedEnv?: Record<string, string>,
+	cwd?: string,
 ): DenyRule | null;
 
-export function findDeny(commandText: string): DenyRule | null;
+export function findDeny(commandText: string, cwd?: string): DenyRule | null;
 
 export function classifyPayload(payload: unknown): DenyRule | null;
 

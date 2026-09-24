@@ -19,6 +19,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { CONTRACTS } from "../../scripts/lib/compat-contracts.mjs";
 import { resolveAndCheckContracts } from "../../scripts/lib/compat-contract-resolution.mjs";
 
 // A minimal 3-contract fixture registry exercising each of the three
@@ -78,7 +79,7 @@ describe("resolveAndCheckContracts", () => {
 
 	beforeEach(() => {
 		installDir = fs.mkdtempSync(
-			path.join(os.tmpdir(), "compat-resolution-fixture-"),
+			path.join(os.tmpdir(), "pi-lens-compat-resolution-fixture-"),
 		);
 		fs.mkdirSync(path.join(installDir, "node_modules/fixture-pkg-a/src"), {
 			recursive: true,
@@ -160,5 +161,40 @@ describe("resolveAndCheckContracts", () => {
 		const results = resolveAndCheckContracts(installDir);
 		expect(results).toHaveLength(7);
 		expect(results.every((r) => r.outcome === "infra")).toBe(true);
+	});
+
+	it("locates pi-subagents 0.70.0 compiled contract parts", () => {
+		// Regression for #3222: pi-subagents kept the contract shape but
+		// published the split source files as .js, which the old candidates
+		// treated as infra and never checked.
+		fs.mkdirSync(
+			path.join(installDir, "node_modules/pi-subagents/src/runs/shared"),
+			{ recursive: true },
+		);
+		fs.mkdirSync(
+			path.join(installDir, "node_modules/pi-subagents/src/runs/background"),
+			{ recursive: true },
+		);
+		fs.writeFileSync(
+			path.join(
+				installDir,
+				"node_modules/pi-subagents/src/runs/shared/child-runtime-config.js",
+			),
+			'export const SUBAGENT_CHILD_ENV = "PI_SUBAGENT_CHILD";',
+		);
+		fs.writeFileSync(
+			path.join(
+				installDir,
+				"node_modules/pi-subagents/src/runs/background/subagent-runner.js",
+			),
+			'process.env[SUBAGENT_CHILD_ENV] = "1";',
+		);
+
+		const results = resolveAndCheckContracts(installDir, {
+			contracts: [CONTRACTS[0]],
+		});
+		expect(results).toMatchObject([
+			expect.objectContaining({ outcome: "verified", pass: true }),
+		]);
 	});
 });

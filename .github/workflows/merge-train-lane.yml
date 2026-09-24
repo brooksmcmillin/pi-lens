@@ -52,6 +52,10 @@ jobs:
   lane:
     name: Merge train:approved PRs
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 15s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
     permissions:
       contents: write # the merge commit, and the update-branch kick on a BEHIND head
       pull-requests: write # merge the PR object, and comment the verdict

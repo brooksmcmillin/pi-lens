@@ -263,7 +263,18 @@ describe("widget disposition reconciliation (#1616)", () => {
 			blocking: 0,
 			errors: 0,
 		});
-		expect(getFileDiagnostics(filePath)).toEqual([]);
+		// #3158: the later producer's snapshot IS published — the record's live
+		// rows are gone and its counts are recomputed from the empty set — but the
+		// disposition-tagged row survives as a RETAINED one, because deleting it
+		// here is exactly what took the file out of the footer's `suppressed: N`
+		// chip. `suppressedRetained` marks it "no live scan reports this", which is
+		// what makes it retirable.
+		expect(getFileDiagnostics(filePath)).toEqual([
+			expect.objectContaining({
+				disposition: "false-positive",
+				suppressedRetained: true,
+			}),
+		]);
 	});
 
 	it("rejects a host disposition event with a non-string message", () => {

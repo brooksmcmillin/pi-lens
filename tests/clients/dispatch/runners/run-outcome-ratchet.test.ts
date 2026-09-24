@@ -31,29 +31,15 @@ const NOT_YET_ON_PRIMITIVE: Record<string, string> = {
 
 	// Spawning runners that already consult the spawn outcome with their own
 	// per-tool check. Correct today, not yet unified. #1737.
-	"actionlint.ts": "reads its own exit status; #1737 strangler",
-	"cpp-check.ts": "reads its own exit status; #1737 strangler",
-	"credo.ts": "reads its own exit status; #1737 strangler",
-	"dart-analyze.ts": "reads its own exit status; #1737 strangler",
-	"dotnet-build.ts": "reads its own exit status; #1737 strangler",
-	"elixir-check.ts": "reads its own exit status; #1737 strangler",
-	"eslint.ts": "reads its own exit status; #1737 strangler",
 	"fish-indent.ts": "reads its own exit status; #1737 strangler",
 	"gleam-check.ts": "reads its own exit status; #1737 strangler",
-	"golangci-lint.ts": "reads its own exit status; #1737 strangler",
 	"helm-lint.ts": "reads its own exit status; #1737 strangler",
 	"helm-render.ts": "reads its own exit status; #1737 strangler",
-	"javac.ts": "reads its own exit status; #1737 strangler",
-	"ktlint.ts": "reads its own exit status; #1737 strangler",
-	"php-lint.ts": "reads its own exit status; #1737 strangler",
 	"prisma-validate.ts": "reads its own exit status; #1737 strangler",
 	"psscriptanalyzer.ts": "reads its own exit status; #1737 strangler",
-	"rubocop.ts": "reads its own exit status; #1737 strangler",
-	"ruff.ts": "reads its own exit status; #1737 strangler",
 	"rust-clippy.ts": "reads its own exit status; #1737 strangler",
 	"shfmt.ts": "reads its own exit status; #1737 strangler",
 	"spotbugs.ts": "reads its own exit status; #1737 strangler",
-	"zig-check.ts": "reads its own exit status; #1737 strangler",
 };
 
 function runnerFiles(): string[] {
@@ -124,6 +110,16 @@ describe("run-outcome primitive ratchet", () => {
 			"swiftlint.ts",
 			"vale.ts",
 			"yamllint.ts",
+			"dart-analyze.ts",
+			"elixir-check.ts",
+			"cpp-check.ts",
+			"zig-check.ts",
+			"rubocop.ts",
+			"ruff.ts",
+			"eslint.ts",
+			"golangci-lint.ts",
+			"ktlint.ts",
+			"php-lint.ts",
 		]) {
 			expect(usesPrimitive(readRunner(name)), `${name}`).toBe(true);
 			expect(NOT_YET_ON_PRIMITIVE[name]).toBeUndefined();

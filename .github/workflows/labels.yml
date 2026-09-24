@@ -20,6 +20,10 @@ jobs:
   validate-merge-train-dispatch:
     name: Validate merge-train dispatch
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 6 successful master runs (fewer than 10 exist):
+    # 4s; timeout = floor of 10 min.
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -44,6 +48,11 @@ jobs:
     if: always() && github.event_name == 'repository_dispatch' && needs.validate-merge-train-dispatch.result == 'success'
     needs: [validate-merge-train-dispatch, sync]
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default. No successful
+    # run found -- this job has run and failed 3/3 times (always failure, never
+    # success) across the visible history -- defaulted to the floor of 10 min
+    # for this single-step job.
+    timeout-minutes: 10
     permissions:
       issues: write
     steps:
@@ -70,6 +79,10 @@ jobs:
   sync:
     needs: validate-merge-train-dispatch
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 29s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
     permissions:
       contents: read
       issues: write

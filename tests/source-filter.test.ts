@@ -44,7 +44,9 @@ function createTempDir(files: Record<string, string>): {
 	dir: string;
 	cleanup: () => void;
 } {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "source-filter-test-"));
+	const dir = fs.mkdtempSync(
+		path.join(os.tmpdir(), "pi-lens-source-filter-test-"),
+	);
 
 	for (const [filePath, content] of Object.entries(files)) {
 		const fullPath = path.join(dir, filePath);

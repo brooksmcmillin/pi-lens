@@ -16,10 +16,15 @@ export interface Classification {
 export type RerunState = "true" | "false" | `failed:${number}`;
 export interface ClassifierMarker {
 	sha: string;
-	// Optional on the TYPE (shouldTriggerRerun's guard only reads sha +
-	// rerunTriggered) even though parseClassifierMarker always sets it.
+	// Optional on the TYPE (shouldTriggerRerun's guard only reads sha,
+	// rerunTriggered and runAttempt) even though parseClassifierMarker always
+	// sets it.
 	rerunState?: string;
 	rerunTriggered: boolean;
+	// The CI run attempt a `rerun=true` belongs to (#2042). Optional on the
+	// type because a pre-#2042 marker carries no `attempt=` field; readers
+	// default it to 1, which is what those markers always were.
+	runAttempt?: number;
 }
 export interface ClassifierDecision {
 	classification: Classification;
@@ -35,13 +40,19 @@ export declare const NET_PATTERN: RegExp;
 export declare function classifyFailureLog(rawLog: string): Classification;
 export declare function readCgroupOomKillCount(log: string): number | null;
 export declare function describeKernelKillEvidence(log: string): string | null;
-export declare function buildMarker(sha: string, rerunState: string): string;
+export declare const MAX_AUTO_RERUN_ATTEMPT: number;
+export declare function buildMarker(
+	sha: string,
+	rerunState: string,
+	runAttempt?: number,
+): string;
 export declare function parseClassifierMarker(
 	commentBody: string | null | undefined,
 ): ClassifierMarker | null;
 export declare function shouldTriggerRerun(args: {
 	classification: Classification;
 	sha: string;
+	runAttempt?: number;
 	existingMarker: ClassifierMarker | null;
 	rerunKinds?: ClassificationKind[];
 }): boolean;
@@ -49,16 +60,12 @@ export declare function buildCommentBody(args: {
 	classification: Classification;
 	sha: string;
 	rerunState: string;
+	runAttempt?: number;
 }): string;
-export declare function decideClassifierAction(args: {
-	rawLog: string;
-	sha: string;
-	existingCommentBody: string | null | undefined;
-}): ClassifierDecision;
-
 export interface FetchedJob {
 	sha: string;
 	prNumber: number | null;
+	runAttempt: number;
 	jobId: number;
 	jobName: string;
 }

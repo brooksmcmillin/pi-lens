@@ -16,6 +16,7 @@ import {
 	resolveAvailableOrInstall,
 } from "./dispatch/runners/utils/runner-helpers.js";
 import { isFileKind } from "./file-kinds.js";
+import { pathsEqual } from "./path-utils.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
 import { resolveToolCwd } from "./tool-cwd.js";
 import { ruffConfigArgs } from "./tool-policy.js";
@@ -149,7 +150,7 @@ export class RuffClient {
 				{ timeout: 10000, cwd: ruffCwd },
 			);
 			const beforeDiags = pre.stdout?.trim()
-				? this.parseOutput(pre.stdout, absolutePath)
+				? this.parseOutput(pre.stdout, ruffCwd, absolutePath)
 				: [];
 			const fixableCount = beforeDiags.filter((d) => d.fixable).length;
 
@@ -185,7 +186,30 @@ export class RuffClient {
 
 	// --- Internal ---
 
-	private parseOutput(output: string, filterFile?: string): RuffDiagnostic[] {
+	/**
+	 * `cwd` is the directory ruff RAN in, and it is REQUIRED: a default would
+	 * hide the wrong base at a call site that forgot it (#3284's D11).
+	 *
+	 * ruff's JSON `filename` is the `SourceFile`'s name verbatim — the JSON
+	 * renderer reads `span.file().path(resolver)` (ruff 0.16.8
+	 * `crates/ruff_db/src/diagnostic/render/json.rs:58,120`), which for a ruff
+	 * (not `ty`) diagnostic is `file.name()` (`crates/ruff_db/src/diagnostic/
+	 * mod.rs:1187-1193`), NOT the cwd-relative `relative_path` the text
+	 * renderers use (`mod.rs:1195-1204`). That name is
+	 * `SourceFileBuilder::new(path.to_string_lossy(), …)`
+	 * (`crates/ruff_linter/src/linter.rs:1049`) over a path the resolver has
+	 * already absolutized ("Normalize every path (e.g., convert from relative to
+	 * absolute)", `crates/ruff_workspace/src/resolver.rs:484`). So ruff echoes
+	 * the absolute path we hand it as argv: the BASE was already right here and
+	 * the fold deletes a `path.resolve` with no base — which silently meant the
+	 * EXTENSION's `process.cwd()`, not ruff's — rather than leaving it for a
+	 * future relative invocation to re-enable.
+	 */
+	private parseOutput(
+		output: string,
+		cwd: string,
+		filterFile?: string,
+	): RuffDiagnostic[] {
 		if (!output.trim()) return [];
 
 		try {
@@ -193,8 +217,18 @@ export class RuffClient {
 			const diagnostics: RuffDiagnostic[] = [];
 
 			for (const item of items) {
-				// Filter to single file if requested
-				if (filterFile && path.resolve(item.filename) !== filterFile) continue;
+				// Filter to single file if requested. #3278/#3286: one seam answers
+				// "is this reported diagnostic about the file I ran for?" — resolve
+				// the tool's spelling against the cwd the tool RAN in and compare
+				// through `pathsEqual`, the repo's on-disk identity predicate. A bare
+				// `!==` treats a spelling that differs only in case (the SAME file on
+				// Windows and on a case-folding POSIX mount) as a different file and
+				// drops every finding for the edited file (#209, #3277).
+				if (
+					filterFile &&
+					!pathsEqual(path.resolve(cwd, item.filename), filterFile)
+				)
+					continue;
 
 				diagnostics.push({
 					line: item.location.row - 1, // ruff is 1-indexed

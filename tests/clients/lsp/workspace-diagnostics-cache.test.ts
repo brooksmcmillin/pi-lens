@@ -33,7 +33,11 @@ import {
 	PROJECT_SNAPSHOT_VERSION,
 	saveProjectSnapshot,
 } from "../../../clients/project-snapshot.js";
-import { removeTempDirSync } from "../test-utils.js";
+import {
+	cleanupTestEnvironmentsDrained,
+	removeTempDirSync,
+	setupTestEnvironment,
+} from "../test-utils.js";
 import {
 	getDegradationSummary,
 	resetDegradationLedger,
@@ -1010,13 +1014,17 @@ function makeTsServer(root: string, id = "typescript", extension = ".ts") {
 	};
 }
 
-function makeFakeClient(root: string, serverId = "typescript") {
+function makeFakeClient(
+	root: string,
+	serverId = "typescript",
+	shutdown: () => Promise<void> = async () => {},
+) {
 	const waitCalls: Array<{ filePath: string; ms: number }> = [];
 	return {
 		client: {
 			isAlive: () => true,
 			isDocumentOpen: () => true,
-			shutdown: async () => {},
+			shutdown,
 			getWorkspaceDiagnosticsSupport: () => ({
 				advertised: false,
 				mode: "push-only" as const,
@@ -1038,15 +1046,23 @@ function makeFakeClient(root: string, serverId = "typescript") {
 
 describe("runWorkspaceDiagnostics cache integration (#671)", () => {
 	let tmpSweep: string;
+	const services: LSPService[] = [];
+	const shutdownServices = async (): Promise<void> => {
+		await Promise.all(services.splice(0).map((service) => service.shutdown()));
+	};
 
 	beforeEach(() => {
 		vi.resetModules();
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
-		tmpSweep = fs.mkdtempSync(path.join(os.tmpdir(), "lsp-sweep-cache-"));
+		tmpSweep = setupTestEnvironment("pi-lens-lsp-sweep-cache-").tmpDir;
 		fs.mkdirSync(path.join(tmpSweep, ".pi-lens"));
 	});
-	afterEach(() => removeTempDirSync(tmpSweep));
+	afterEach(async () => {
+		await cleanupTestEnvironmentsDrained("pi-lens-lsp-sweep-cache-", {
+			beforeDrain: shutdownServices,
+		});
+	});
 
 	it("a second identical sweep performs zero fresh diagnostics-wait calls (full cache hit)", async () => {
 		const names = ["a.ts", "b.ts", "c.ts"];
@@ -1062,6 +1078,7 @@ describe("runWorkspaceDiagnostics cache integration (#671)", () => {
 
 		const { LSPService } = await import("../../../clients/lsp/index.js");
 		const service = new LSPService();
+		services.push(service);
 
 		const first = await service.runWorkspaceDiagnostics(tmpSweep);
 		expect(first.length).toBe(3);
@@ -1072,6 +1089,32 @@ describe("runWorkspaceDiagnostics cache integration (#671)", () => {
 		expect(second.length).toBe(3);
 		// No new diagnostics-wait round trips — every file was served from cache.
 		expect(waitCalls.length).toBe(callsAfterFirstSweep);
+	});
+
+	it("drain waits for an in-flight LSP shutdown before fixture cleanup", async () => {
+		let releaseShutdown!: () => void;
+		const shutdownGate = new Promise<void>((resolve) => {
+			releaseShutdown = resolve;
+		});
+		let shutdownSettled = false;
+		const tsServer = makeTsServer(tmpSweep);
+		getServersForFileWithConfig.mockReturnValue([tsServer]);
+		const { client } = makeFakeClient(tmpSweep, "typescript", async () => {
+			await shutdownGate;
+			shutdownSettled = true;
+		});
+		createLSPClient.mockResolvedValue(client);
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+		services.push(service);
+		fs.writeFileSync(path.join(tmpSweep, "held.ts"), "const held = 1;\n");
+		await service.runWorkspaceDiagnostics(tmpSweep);
+		const shutdown = shutdownServices();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(shutdownSettled).toBe(false);
+		releaseShutdown();
+		await shutdown;
+		expect(shutdownSettled).toBe(true);
 	});
 
 	it("freshly touches an uncovered language instead of serving its cache entry", async () => {
@@ -1086,6 +1129,7 @@ describe("runWorkspaceDiagnostics cache integration (#671)", () => {
 
 		const { LSPService } = await import("../../../clients/lsp/index.js");
 		const service = new LSPService();
+		services.push(service);
 		await service.runWorkspaceDiagnostics(tmpSweep, { files: [file] });
 		const callsAfterFirstSweep = waitCalls.length;
 		const touchFile = vi.spyOn(service, "touchFile");
@@ -1116,6 +1160,7 @@ describe("runWorkspaceDiagnostics cache integration (#671)", () => {
 
 		const { LSPService } = await import("../../../clients/lsp/index.js");
 		const service = new LSPService();
+		services.push(service);
 
 		await service.runWorkspaceDiagnostics(tmpSweep);
 		const callsAfterFirstSweep = waitCalls.length;
@@ -1189,6 +1234,7 @@ describe("runWorkspaceDiagnostics cache integration (#671)", () => {
 		createLSPClient.mockResolvedValue(client);
 		const { LSPService } = await import("../../../clients/lsp/index.js");
 		const service = new LSPService();
+		services.push(service);
 		for (const dependency of dependencies) {
 			await service.touchFile(
 				dependency,
@@ -1313,6 +1359,7 @@ describe("runWorkspaceDiagnostics cache integration (#671)", () => {
 
 		const { LSPService } = await import("../../../clients/lsp/index.js");
 		const service = new LSPService();
+		services.push(service);
 
 		await service.runWorkspaceDiagnostics(tmpSweep);
 		// The mismatched entry was NOT served — a.ts (the only file) fell through to
@@ -1354,6 +1401,7 @@ describe("runWorkspaceDiagnostics cache integration (#671)", () => {
 		createLSPClient.mockResolvedValue(client);
 		const { LSPService } = await import("../../../clients/lsp/index.js");
 		const service = new LSPService();
+		services.push(service);
 		await service.runWorkspaceDiagnostics(tmpSweep);
 
 		expect(waitCalls.length).toBeGreaterThan(0);

@@ -86,7 +86,8 @@ export function createLiveBusEmitter(): LiveBusEmitter {
  *
  * `entry` is a THUNK, not a value (M1, #1415 review): building the log entry
  * (every producer's version normalizes `cwd` via `normalizeFilePath`, a sync
- * `realpathSync.native` call on Windows) is real per-publish cost that used
+ * `realpathSync.native` call on Windows and, since #3098, on POSIX too) is
+ * real per-publish cost that used
  * to be paid on EVERY call regardless of outcome, even though it is only
  * consumed on the `stale-session` branch. Invoking the thunk only there means
  * the common `ready` path pays nothing for it.

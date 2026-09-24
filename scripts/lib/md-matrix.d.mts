@@ -24,6 +24,29 @@ export function mergeRows(
 
 export function mergeSrc(existing: string, measured: string): string;
 
+export function compareStableStrings(a: string, b: string): number;
+
+export function sortedStrings(values: readonly unknown[] | undefined): string[];
+
+export interface ServerCapabilityRow {
+	serverId: string;
+	workspaceDiagnosticsSupport?: {
+		mode?: string;
+		workspaceDiagnostics?: boolean;
+	};
+	operationSupport?: Record<string, boolean | undefined>;
+	advertisedCommands?: readonly string[];
+	rawCapabilityKeys?: readonly string[];
+}
+
+export function renderServerCapabilitiesDoc(options: {
+	rows: readonly ServerCapabilityRow[];
+	unavailable: Iterable<string>;
+	date: string;
+	platform: string;
+	ops: readonly (readonly [string, string])[];
+}): string;
+
 export function replaceTable(
 	text: string,
 	headerMarker: string,

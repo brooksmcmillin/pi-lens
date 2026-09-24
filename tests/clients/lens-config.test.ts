@@ -7,6 +7,7 @@ import {
 	getGlobalWidgetDefaultVisible,
 	getPiLensGlobalConfigPath,
 	loadPiLensGlobalConfig,
+	resetGlobalConfigLocationCache,
 	resetGlobalConfigWarnCache,
 	resolvePiLensFlag,
 	resolvePiLensFlagWithSource,
@@ -37,12 +38,27 @@ vi.mock("../../clients/extension-log.js", async (importOriginal) => {
 
 const tmpDirs: string[] = [];
 let previousConfigPath: string | undefined;
+let previousAgentDir: string | undefined;
+let previousHome: string | undefined;
+let previousUserProfile: string | undefined;
 let previousEnvValues = new Map<string, string | undefined>();
 
 function makeTempHome(): string {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-config-"));
 	tmpDirs.push(dir);
 	return dir;
+}
+
+/**
+ * Point the process's real homedir at the fixture home for tests that
+ * exercise the PRODUCTION (no-arg) resolution: its grandfathering probe reads
+ * `$HOME/.pi-lens/config.json`, and the real home must not decide what a
+ * test observes (the #525 hermeticity class). Both spellings are set because
+ * `os.homedir()` reads `$HOME` on POSIX and `USERPROFILE` on Windows.
+ */
+function adoptHomeEnv(home: string): void {
+	process.env.HOME = home;
+	process.env.USERPROFILE = home;
 }
 
 function writeConfig(home: string, contents: string): string {
@@ -73,6 +89,8 @@ function enablingConfigValue(spec: LensFlagSpec): unknown {
 
 beforeEach(() => {
 	previousConfigPath = process.env.PI_LENS_CONFIG_PATH;
+	previousHome = process.env.HOME;
+	previousUserProfile = process.env.USERPROFILE;
 	previousEnvValues = new Map(
 		LENS_FLAGS.filter((spec) => spec.env).map((spec) => [
 			spec.env as string,
@@ -81,7 +99,13 @@ beforeEach(() => {
 	);
 	for (const name of previousEnvValues.keys()) delete process.env[name];
 	delete process.env.PI_LENS_CONFIG_PATH;
+	// The global-config-location PR (refs #2457) reads PI_CODING_AGENT_DIR in
+	// the resolution's agent-dir tier; the ambient value (set by a pi host)
+	// must not decide which file these assertions read.
+	previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	delete process.env.PI_CODING_AGENT_DIR;
 	resetGlobalConfigWarnCache();
+	resetGlobalConfigLocationCache();
 	vi.spyOn(console, "error").mockImplementation(() => {});
 });
 
@@ -90,6 +114,13 @@ afterEach(() => {
 	resetGlobalConfigWarnCache();
 	if (previousConfigPath === undefined) delete process.env.PI_LENS_CONFIG_PATH;
 	else process.env.PI_LENS_CONFIG_PATH = previousConfigPath;
+	if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+	else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+	if (previousHome === undefined) delete process.env.HOME;
+	else process.env.HOME = previousHome;
+	if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+	else process.env.USERPROFILE = previousUserProfile;
+	resetGlobalConfigLocationCache();
 	for (const [name, value] of previousEnvValues) {
 		if (value === undefined) delete process.env[name];
 		else process.env[name] = value;
@@ -100,10 +131,58 @@ afterEach(() => {
 });
 
 describe("global pi-lens config", () => {
-	it("uses ~/.pi-lens/config.json", () => {
+	// The canonical default keeps its released spelling: ~/.pi-lens/config.json.
+	// PI_LENS_HOME does not participate in the global-config resolution (the
+	// #2457 split-brain stays a separate issue). Production (no-arg)
+	// resolution; the existence probes target the adopted home so the real
+	// one is not read.
+	it("uses ~/.pi-lens/config.json as the canonical default", () => {
 		const home = makeTempHome();
+		adoptHomeEnv(home);
+		resetGlobalConfigLocationCache();
 
-		expect(getPiLensGlobalConfigPath(home)).toBe(
+		expect(getPiLensGlobalConfigPath()).toBe(
+			path.join(home, ".pi-lens", "config.json"),
+		);
+	});
+
+	it("keeps a legacy ~/.pi-lens/config.json while it exists, before any later tier", () => {
+		const home = makeTempHome();
+		adoptHomeEnv(home);
+		fs.mkdirSync(path.join(home, ".pi-lens"), { recursive: true });
+		fs.writeFileSync(path.join(home, ".pi-lens", "config.json"), "{}");
+		process.env.PI_CODING_AGENT_DIR = path.join(home, "agent-dir");
+		resetGlobalConfigLocationCache();
+
+		expect(getPiLensGlobalConfigPath()).toBe(
+			path.join(home, ".pi-lens", "config.json"),
+		);
+	});
+
+	it("resolves the agent-dir location when PI_CODING_AGENT_DIR is set, the legacy default is missing, and the agent-dir file exists", () => {
+		const home = makeTempHome();
+		adoptHomeEnv(home);
+		const agentFile = path.join(
+			home,
+			"agent-dir",
+			"extensions",
+			"pi-lens.json",
+		);
+		fs.mkdirSync(path.dirname(agentFile), { recursive: true });
+		fs.writeFileSync(agentFile, "{}");
+		process.env.PI_CODING_AGENT_DIR = path.join(home, "agent-dir");
+		resetGlobalConfigLocationCache();
+
+		expect(getPiLensGlobalConfigPath()).toBe(agentFile);
+	});
+
+	it("does NOT choose an absent agent-dir file for reading", () => {
+		const home = makeTempHome();
+		adoptHomeEnv(home);
+		process.env.PI_CODING_AGENT_DIR = path.join(home, "agent-dir");
+		resetGlobalConfigLocationCache();
+
+		expect(getPiLensGlobalConfigPath()).toBe(
 			path.join(home, ".pi-lens", "config.json"),
 		);
 	});

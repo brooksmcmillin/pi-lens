@@ -178,6 +178,11 @@ body. Also read the rolled section for a "next version" literal that the
 fragments assumed (`4.2.0` in a `Deprecated since …` line when the release is
 a patch) and correct it in code, docs and the rolled section together.
 
+The bump PR title is `chore(release): <version> (refs #<tracker>)` — the
+PR-title lint requires the conventional prefix AND an issue ref, and a title
+missing either reds `ci-verdict` on an otherwise green workflow (the 4.2.0
+bump was retitled after exactly that).
+
 ### 4. Report
 
 The runner writes `release-qa-report.md` and `release-qa-evidence/<row-id>.*`.

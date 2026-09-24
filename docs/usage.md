@@ -112,6 +112,8 @@ pi --no-opengrep         # Disable the Opengrep security scanner (default-on aux
 pi --no-read-guard       # Disable the read-before-edit behavior monitor
 pi --lens-turn-summary   # Persist a per-turn summary of diagnostics, autofixes, and autoformats
 pi --lens-compact-tool-line   # Render tool results as one compact, theme-aware line (closes #1327)
+pi --lens-compact-lsp-status  # Collapse the footer LSP status to one state glyph instead of the server names (refs #3099)
+pi --lens-hide-lsp-status     # Publish no pi-lens-lsp footer status at all, so a status-rendering host stops showing the key (closes #3099)
 pi --no-lazy-tools       # Keep every pi-lens tool active instead of activating the situational ones on demand
 pi --lens-turn-end-madge # Run the madge circular-dependency check at every turn end, not just at session start
 pi --no-knip             # Disable the knip session-start analyzer

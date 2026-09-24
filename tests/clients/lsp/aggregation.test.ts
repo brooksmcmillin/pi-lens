@@ -77,7 +77,7 @@ describe("raceToCompletion", () => {
 		await vi.advanceTimersByTimeAsync(1);
 
 		let resolved = false;
-		resultPromise.then(() => {
+		void resultPromise.then(() => {
 			resolved = true;
 		});
 		await vi.advanceTimersByTimeAsync(1);

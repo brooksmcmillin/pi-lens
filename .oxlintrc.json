@@ -9,6 +9,14 @@
   ],
   "overrides": [
     {
+      "files": ["tests/**/*.ts", "tests/**/*.tsx"],
+      "rules": {
+        "typescript/no-floating-promises": "error",
+        "typescript/await-thenable": "error",
+        "eslint/no-unsafe-optional-chaining": "error"
+      }
+    },
+    {
       "files": ["*.mjs", "*.cjs", "*.js"],
       "env": {
         "node": true

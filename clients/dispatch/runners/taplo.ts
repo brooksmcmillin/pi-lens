@@ -1,5 +1,7 @@
 import * as path from "node:path";
+import { pathsEqual } from "../../path-utils.js";
 import { findLocalBinUpwards } from "../../package-manager.js";
+import { stripAnsi } from "../../sanitize.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import { resolveRunnerCwd } from "../../tool-cwd.js";
 import { getLinterPolicyForCwd } from "../../tool-policy.js";
@@ -25,6 +27,7 @@ const taplo = createAvailabilityChecker("taplo", ".exe");
 //
 // #1937 round 2: the parser fix alone turned the old silent-clean into a false
 // BLOCKING diagnostic. clap prints `error: unexpected argument '--output'
+// EXIT TABLE (taplo 0.9 measured fixture): 0 clean; 1 findings; other nonzero rejected/error.
 // found`, which starts with the same lowercase `error:` a real taplo
 // diagnostic does, so a mistyped flag would have reddened every valid TOML
 // file. Both readings are wrong; the exit code is what separates them.
@@ -37,7 +40,7 @@ const HEADER_PATTERN = /^\s*(error|warning):(.*)$/;
 const LOCATION_LEAD = "┌─";
 
 /** The `:line:column` tail of a codespan location line. */
-const LOCATION_PATTERN = /:(\d+):(\d+)$/;
+const LOCATION_PATTERN = /^\s*┌─\s+(.+?):(\d+):(\d+)$/;
 
 /**
  * Parse `taplo lint` output (#1937).
@@ -65,9 +68,14 @@ const LOCATION_PATTERN = /:(\d+):(\d+)$/;
  * (#1937 round 2). The exit-code table in the runner is the primary guard;
  * this is the structural one, and each covers a case the other does not.
  */
-export function parseTaploOutput(raw: string, filePath: string): Diagnostic[] {
+export function parseTaploOutput(
+	raw: string,
+	filePath: string,
+	cwd: string,
+): Diagnostic[] {
 	const diagnostics: Diagnostic[] = [];
-	const lines = (raw ?? "").split(/\r?\n/);
+	const absTarget = path.resolve(cwd, filePath);
+	const lines = stripAnsi(raw ?? "").split(/\r?\n/);
 
 	for (let i = 0; i < lines.length; i++) {
 		// Lowercase `error:`/`warning:` starts a diagnostic. taplo's tracing
@@ -94,8 +102,10 @@ export function parseTaploOutput(raw: string, filePath: string): Diagnostic[] {
 			if (!lines[j].includes(LOCATION_LEAD)) continue;
 			const location = LOCATION_PATTERN.exec(lines[j].trimEnd());
 			if (!location) continue;
-			line = Number.parseInt(location[1], 10) || 1;
-			column = Number.parseInt(location[2], 10) || 1;
+			if (!pathsEqual(path.resolve(cwd, location[1]!.trim()), absTarget))
+				continue;
+			line = Number.parseInt(location[2]!, 10) || 1;
+			column = Number.parseInt(location[3]!, 10) || 1;
 			break;
 		}
 		if (line === null) continue;
@@ -183,7 +193,7 @@ const taploRunner: RunnerDefinition = {
 		const run = parseToolRun(
 			"taplo",
 			{ result, output: raw, exitCodes: TAPLO_EXIT_CODES },
-			(out) => parseTaploOutput(out, ctx.filePath),
+			(out) => parseTaploOutput(out, ctx.filePath, cwd),
 			{ skipWhenParsedNothing: true },
 		);
 		if (run.skipped) return run.skipped;

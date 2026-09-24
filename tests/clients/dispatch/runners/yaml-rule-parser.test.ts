@@ -68,7 +68,9 @@ afterEach(() => {
  */
 describe("yaml-rule-parser cache freshness (#2262)", () => {
 	it("reloads an edited existing rule when the directory mtime is unchanged", () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pilens-rules-cache-"));
+		const root = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-pilens-rules-cache-"),
+		);
 		ruleCacheTempDirs.push(root);
 		const file = path.join(root, "existing.yml");
 		writeRule(file, "existing", "old");
@@ -91,7 +93,7 @@ describe("yaml-rule-parser cache freshness (#2262)", () => {
 
 	it("discovers a nested rule file when the root directory mtime is unchanged", () => {
 		const root = fs.mkdtempSync(
-			path.join(os.tmpdir(), "pilens-rules-cache-nested-"),
+			path.join(os.tmpdir(), "pi-lens-pilens-rules-cache-nested-"),
 		);
 		ruleCacheTempDirs.push(root);
 		writeRule(path.join(root, "root.yml"), "root", "root");
@@ -109,7 +111,7 @@ describe("yaml-rule-parser cache freshness (#2262)", () => {
 
 	it("performs one metadata sweep and no content reads per cadence window", () => {
 		const root = fs.mkdtempSync(
-			path.join(os.tmpdir(), "pilens-rules-cache-bounded-"),
+			path.join(os.tmpdir(), "pi-lens-pilens-rules-cache-bounded-"),
 		);
 		ruleCacheTempDirs.push(root);
 		writeRule(path.join(root, "a.yml"), "a", "a");
@@ -154,7 +156,7 @@ describe("yaml-rule-parser cache freshness (#2262)", () => {
 
 	it("orders discovered rule files by code unit, not by locale collation", () => {
 		const root = fs.mkdtempSync(
-			path.join(os.tmpdir(), "pilens-rules-cache-order-"),
+			path.join(os.tmpdir(), "pi-lens-pilens-rules-cache-order-"),
 		);
 		ruleCacheTempDirs.push(root);
 		// Ordinal order puts 'B' (0x42) before 'a' (0x61); default locale

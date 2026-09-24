@@ -19,6 +19,10 @@ jobs:
   validate-merge-train-dispatch:
     name: Validate merge-train dispatch
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 9s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -42,6 +46,10 @@ jobs:
     name: Dependency boundaries
     needs: validate-merge-train-dispatch
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 23s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
     permissions:
       contents: read
 
@@ -97,6 +105,10 @@ jobs:
     needs: validate-merge-train-dispatch
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default. This job runs
+    # on pull_request so --branch master matched no runs; measured max over 6
+    # successful runs regardless of branch: 10s; timeout = floor of 10 min.
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -134,6 +146,10 @@ jobs:
     name: Lint & type-check
     needs: validate-merge-train-dispatch
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 32s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
     permissions:
       contents: read
 
@@ -211,10 +227,54 @@ jobs:
       - name: ast-grep rule pair audit
         run: npm run audit:astgrep-rule-pairs
 
+  targeted-tests-advisory:
+    name: Targeted tests (advisory)
+    needs: validate-merge-train-dispatch
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: '22'
+
+      # Lockfile-locked and script-free (SonarCloud githubactions:S8543 /
+      # S6505 flagged the copied `npm install` here); the one piece of
+      # `prepare` the targeted vitest files need is the grammar download, run
+      # explicitly below. The Unit job keeps `npm install` because its
+      # lockfile-in-sync check depends on it.
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund --ignore-scripts
+
+      - name: Download core grammars
+        run: node scripts/download-grammars.js --core --dest grammars
+
+      - name: Build
+        run: npm run build
+
+      - name: Run targeted tests
+        run: node scripts/pre-push-targeted-tests.mjs --skip-build
+
   test:
     name: Unit tests
     needs: validate-merge-train-dispatch
     runs-on: ubuntu-latest
+    # Bounds the job so a reader that is alive but never drains (e.g. an
+    # unbounded stdout stall in the mem-watch wrapper, #3106) cannot hold the
+    # runner for GitHub's 360-minute default. Sized at measured-max x2 plus margin
+    # headroom: the longest Unit job over 9 successful master runs
+    # (2026-09-15/16) was 12m42s; 26m would sit exactly on a 2x-slow runner, so 30m (refs #3111).
+    timeout-minutes: 30
     permissions:
       contents: read
 
@@ -281,7 +341,29 @@ jobs:
         run: |
           echo "nproc=$(nproc)"
           free -m
-          cat /sys/fs/cgroup/memory.max 2>/dev/null || true
+          # 2026-09-15: this read the ROOT cgroup's memory.max, which cgroup v2
+          # never populates, so it printed nothing on every run in the dataset
+          # the 2026-09-15 diagnosis assembled — the same defect the sibling
+          # kernel-kill-evidence step further down was fixed for (#2230 round 2
+          # F1), four lines away, and never swept onto this one. Walk to this
+          # process's own cgroup the same way that step does.
+          cg=$(awk -F: '$1=="0"{print $3}' /proc/self/cgroup 2>/dev/null || true)
+          p="$cg"
+          found=""
+          while [ -n "$p" ]; do
+            f="/sys/fs/cgroup${p%/}/memory.max"
+            if [ -r "$f" ]; then
+              echo "cgroup=${p} file=${f}"
+              cat "$f"
+              found=1
+              break
+            fi
+            if [ "$p" = "/" ]; then break; fi
+            p=$(dirname "$p")
+          done
+          if [ -z "$found" ]; then
+            echo "(memory.max absent or unreadable from '${cg:-unknown}' up to root)"
+          fi
 
       - name: Run tests
         env:
@@ -294,12 +376,74 @@ jobs:
           # never contention to serialize — skip it explicitly rather than
           # relying on it being harmless.
           PI_LENS_TEST_NO_LOCK: '1'
+          # #2042 2026-09-15 cheapest probe: a 2s MemAvailable poll cannot see a
+          # sub-2-second spike, so sample five times faster. The env var already
+          # existed for exactly this; only the value is new.
+          PI_LENS_MEM_WATCH_INTERVAL_MS: '200'
+          # Shared with the "Memory sample tail" step below so both read/write
+          # the same file. runner.temp, not the checkout, so it never shows up
+          # in `git status` and is cleaned up with the rest of the job's scratch
+          # space regardless of how the job ends.
+          PI_LENS_MEM_WATCH_SAMPLE_FILE: ${{ runner.temp }}/pi-lens-mem-watch-samples.log
         # #2042: the wrapper changes nothing about what runs and forwards the
         # child's exit code unchanged. It prints the host's memory low-water
         # mark and a verdict line, so the next `Killed npm test` / exit 137 —
         # which carries no failing assertion and reads as infrastructure noise —
         # arrives with a number attached.
-        run: node scripts/with-memory-watch.mjs -- npm test
+        run: node scripts/with-memory-watch.mjs -- npm test -- --reporter=default --reporter=json --outputFile=${{ runner.temp }}/vitest-results.json
+
+      # Listener input for #3215. The default reporter remains explicit above,
+      # so this adds a file reporter in the same invocation and preserves the
+      # existing result sections and npm/vitest exit status. Vitest also emits
+      # one `JSON report written to <path>` line; that additive console
+      # contract is pinned in `tests/scripts/test-history-rollup.test.ts` by
+      # driving the installed vitest JsonReporter directly, and the local
+      # `npm test` script adds no JSON reporter at all.
+      #
+      # The metadata basename below is `METADATA_FILENAME` from
+      # `scripts/test-history-rollup.mjs` — the consumer's own constant.
+      # `tests/config/test-history-workflow.test.ts` asserts this step against
+      # it, because a producer/consumer basename drift made the nightly rollup
+      # exit 2 on every real artifact (round 3, F8).
+      - name: Write test-history artifact metadata
+        if: always()
+        env:
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: 'node -e "require(\"node:fs\").writeFileSync(process.env.RUNNER_TEMP + \"/test-history-metadata.json\", JSON.stringify({headSha: process.env.HEAD_SHA, runId: process.env.GITHUB_RUN_ID, lane: \"linux\", recordedAt: new Date().toISOString()}))"'
+
+      - name: Upload per-file test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unit-test-results-linux
+          path: |
+            ${{ runner.temp }}/vitest-results.json
+            ${{ runner.temp }}/test-history-metadata.json
+          if-no-files-found: warn
+
+      # #2042 2026-09-15: the wrapper's console line is a step-crossing summary
+      # of host memory only — it cannot show per-cgroup RSS, PID-count churn, or
+      # PSI stall, and the 1701d01 red proved the console line can be lost
+      # entirely when the wrapper itself is the kill's victim. The wrapper
+      # appends every sample (per-cgroup memory.current/memory.peak/pids.current
+      # plus PSI) to the file below regardless; `if: always()` reads it even
+      # when the job never reaches a later step, so a killed run still yields
+      # its samples. Round-2 review F2: the file itself is unbounded (append-
+      # only, so an earlier low-water sample can never be scrolled out by a
+      # rewrite); `tail` bounds only what THIS step prints.
+      - name: Memory sample tail
+        if: always()
+        env:
+          PI_LENS_MEM_WATCH_SAMPLE_FILE: ${{ runner.temp }}/pi-lens-mem-watch-samples.log
+        run: |
+          f="$PI_LENS_MEM_WATCH_SAMPLE_FILE"
+          if [ -r "$f" ]; then
+            total=$(wc -l < "$f")
+            echo "--- mem-sample tail (last 300 of ${total} lines) ---"
+            tail -n 300 "$f"
+          else
+            echo "(no sample file at $f - the wrapper wrote nothing before the job ended)"
+          fi
 
       # #2042 round 2: the low-water mark falsified the memory story (three
       # kills at 13.0-13.3 GB available of 16 GB, a green run LOWER at 13.1 GB)
@@ -456,6 +600,10 @@ jobs:
     name: Production install build (--omit=dev, from source)
     needs: validate-merge-train-dispatch
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 72s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
     permissions:
       contents: read
 
@@ -659,6 +807,12 @@ jobs:
     needs:
       [validate-merge-train-dispatch, dependency-boundaries, lint-and-typecheck, test, prod-install-build, install-test]
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # No successful run found (job requires github.event_name ==
+    # 'repository_dispatch'; 0 repository_dispatch-triggered runs of this
+    # workflow exist in the last 300 runs) -- defaulted to the floor of 10 min
+    # for this single-step job.
+    timeout-minutes: 10
     permissions:
       issues: write
     steps:
@@ -696,6 +850,13 @@ jobs:
   install-test:
     name: Install test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max leg over last 10 successful master runs (30 matrix legs,
+    # windows-latest slowest): 272s (4m32s); sized at ~2x + margin.
+    # refs #3098: that 272s PREDATES the macOS-only build + Vitest step below,
+    # which is not covered by the measurement above. The value is left alone
+    # and re-measured from the first green macOS legs before it is resized.
+    timeout-minutes: 15
     needs: [validate-merge-train-dispatch, lint-and-typecheck, test]
     permissions:
       contents: read
@@ -739,6 +900,26 @@ jobs:
 
       - name: Install dependencies
         run: npm install --no-audit --no-fund
+
+      # refs #3098: the ONLY case-insensitive POSIX filesystem in CI is this
+      # leg's macOS APFS. The cross-case anchor cases in these two files
+      # manufacture their fixture with a case-variant symlink on the
+      # case-sensitive ubuntu lane; here they exercise the real aliasing, which
+      # is where #1024 was actually live. No extra install cost: `npm install`
+      # above already ran `prepare`, so devDependencies and the core grammars
+      # the vitest globalSetup pre-warms are already present.
+      # ADVISORY for now (`continue-on-error`), like the Windows Vitest subset
+      # above: this job's install/pack/smoke steps gate, and a macOS-only unit
+      # flake must not block an unrelated PR on its first outings. Promotion to
+      # gating is a separate decision after several green legs (#3159 round 3).
+      - name: POSIX case-insensitive anchors (APFS)
+        if: matrix.os == 'macos-latest'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run build
+          node_modules/.bin/vitest run tests/clients/path-utils.test.ts tests/clients/diagnostic-dispositions.test.ts --configLoader runner
 
       - name: Rule catalog report (non-blocking)
         continue-on-error: true

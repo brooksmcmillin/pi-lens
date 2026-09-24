@@ -66,8 +66,11 @@ import { getDiagnosticTracker } from "../../../clients/diagnostic-tracker.js";
 import {
 	clearWidgetState,
 	getFileDiagnosticSummaries,
+	recordRunner,
 } from "../../../clients/widget-state.js";
 import { analyzeFile } from "../../../clients/mcp/analyze.js";
+import { createLensDiagnosticMarkTool } from "../../../tools/lens-diagnostic-mark.js";
+import { createCaseAliasFixture } from "../test-utils.js";
 
 const warningDiagnostic = {
 	id: "warn-1",
@@ -575,5 +578,164 @@ describe("analyzeFile", () => {
 		mockBuildOrUpdateGraph.mockRejectedValueOnce(new Error("graph boom"));
 		const result = await analyzeFile(tsFile, tmpDir, { updateGraph: true });
 		expect(result.counts.diagnostics).toBe(0);
+	});
+});
+
+// #3160 F1: `analyzeFile` records into widget-state with the RAW absPath it
+// derives from `pilens_analyze`'s agent-supplied `file` arg
+// (clients/mcp/analyze.ts:437-439/469) — unlike clients/pipeline.ts:1612,
+// which always records `ctx.filePath`, already canonicalized to on-disk
+// casing by `createDispatchContext` (#2016/#3098). Two production writers,
+// one raw and one canonical, for the SAME `allDiagnostics` map. Before this
+// fix a mis-cased `pilens_analyze` call created a SEPARATE, orphaned
+// widget-state record that `lens_diagnostic_mark`'s #3160 cross-check fix
+// (normalizing the READ side only) could never reach under ANY caller
+// spelling. `recordDiagnostics` is now normalized at the write side too
+// (clients/mcp/analyze.ts:469), so the analyze-written record collapses
+// onto the SAME canonical key a prior canonical write (e.g. the dispatcher's
+// `recordRunner`, simulated directly here) already established — the mark
+// tool must reanchor under EITHER spelling of the file.
+describe("analyzeFile — widget cross-check key parity across writers (#3160 F1)", () => {
+	it("a mis-cased pilens_analyze write and a canonical dispatcher write land under ONE widget-state key", async (ctx) => {
+		const fixture = createCaseAliasFixture(tmpDir, {
+			content: "const a = 1;\nconst b = 2;\nconst target = bad();\n",
+		});
+		ctx.skip(fixture.skipReason !== undefined, fixture.skipReason ?? "");
+
+		// A prior per-edit dispatch already touched this file canonically —
+		// clients/pipeline.ts always keys from ctx.filePath (#2016/#3098).
+		// Modeled directly via the same widget-state primitive
+		// clients/dispatch/dispatcher.ts calls (recordRunner(ctx.filePath, ...)).
+		recordRunner(fixture.onDisk, "eslint", "succeeded", 0, 5, 1);
+
+		// The agent now calls pilens_analyze with the MIS-CASED spelling it
+		// typed; analyzeFile resolves this to fixture.rawMisCased and (after
+		// the F1 fix) records under normalizeMapKey(absPath).
+		vi.mocked(dispatchForFile).mockResolvedValue({
+			diagnostics: [
+				{
+					id: "bad-1",
+					message: "bad call",
+					filePath: fixture.rawMisCased,
+					line: 3,
+					column: 1,
+					severity: "error" as const,
+					semantic: "blocking" as const,
+					tool: "eslint",
+					rule: "no-bad",
+				},
+			],
+			blockers: [],
+			warnings: [],
+			baselineWarningCount: 0,
+			fixed: [],
+			resolvedCount: 0,
+			output: "",
+			blockerOutput: "",
+			hasBlockers: false,
+		});
+
+		const misCasedRelative = path.relative(tmpDir, fixture.rawMisCased);
+		await analyzeFile(misCasedRelative, tmpDir);
+
+		const markTool = createLensDiagnosticMarkTool(() => tmpDir);
+		const runMark = (filePath: string) =>
+			markTool.execute(
+				"call-1",
+				{
+					filePath,
+					line: 2, // stale
+					message: "bad call",
+					rule: "no-bad",
+					tool: "eslint",
+					disposition: "false-positive",
+				},
+				undefined,
+				() => {},
+				{ cwd: tmpDir },
+			);
+
+		const onDiskRelative = path.relative(tmpDir, fixture.onDisk);
+		const viaCanonical = await runMark(onDiskRelative);
+		expect(viaCanonical.isError).toBeFalsy();
+		expect(String(viaCanonical.content[0]?.text)).toMatch(
+			/reanchored from line 2 to 3/,
+		);
+
+		const viaMisCased = await runMark(misCasedRelative);
+		expect(viaMisCased.isError).toBeFalsy();
+		expect(String(viaMisCased.content[0]?.text)).toMatch(
+			/reanchored from line 2 to 3/,
+		);
+	});
+});
+
+describe("analyzeFile — absolute dot-segment `file` argument (#3184)", () => {
+	// #3184: the SAME `path.isAbsolute(x) ? x : path.resolve(cwd, x)` line
+	// (clients/mcp/analyze.ts:437-439) also passes an already-ABSOLUTE agent
+	// argument through untouched, and before the path-utils fix
+	// `normalizeMapKey` did not fold dot segments on POSIX — so an absolute
+	// `file` argument containing `/../` recorded the analysis under a key no
+	// reader derives (every canonical writer keys through `path.resolve`
+	// first). The dot segment is built by string CONCATENATION;
+	// `path.join`/`path.resolve` would fold it and make the fixture vacuous.
+	it("an absolute pilens_analyze `file` argument with a dot segment lands under the canonical widget-state key", async () => {
+		fs.mkdirSync(path.join(tmpDir, "sub"), { recursive: true });
+		const plainAbs = path.join(tmpDir, "sub", "a.ts");
+		fs.writeFileSync(
+			plainAbs,
+			"const a = 1;\nconst b = 2;\nconst t = bad();\n",
+		);
+		const dotSegmentAbs = `${path.join(tmpDir, "sub")}${path.sep}..${path.sep}sub${path.sep}a.ts`;
+		expect(dotSegmentAbs).toContain("..");
+		expect(fs.realpathSync.native(dotSegmentAbs)).toBe(
+			fs.realpathSync.native(plainAbs),
+		);
+
+		vi.mocked(dispatchForFile).mockResolvedValue({
+			diagnostics: [
+				{
+					id: "bad-1",
+					message: "bad call",
+					filePath: dotSegmentAbs,
+					line: 3,
+					column: 1,
+					severity: "error" as const,
+					semantic: "blocking" as const,
+					tool: "eslint",
+					rule: "no-bad",
+				},
+			],
+			blockers: [],
+			warnings: [],
+			baselineWarningCount: 0,
+			fixed: [],
+			resolvedCount: 0,
+			output: "",
+			blockerOutput: "",
+			hasBlockers: false,
+		});
+
+		await analyzeFile(dotSegmentAbs, tmpDir);
+
+		const markTool = createLensDiagnosticMarkTool(() => tmpDir);
+		const result = await markTool.execute(
+			"call-1",
+			{
+				filePath: path.relative(tmpDir, plainAbs),
+				line: 2, // stale
+				message: "bad call",
+				rule: "no-bad",
+				tool: "eslint",
+				disposition: "false-positive",
+			},
+			undefined,
+			() => {},
+			{ cwd: tmpDir },
+		);
+		expect(result.isError).toBeFalsy();
+		expect(String(result.content[0]?.text)).toMatch(
+			/reanchored from line 2 to 3/,
+		);
 	});
 });

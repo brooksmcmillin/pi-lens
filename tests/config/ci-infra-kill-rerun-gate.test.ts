@@ -147,8 +147,9 @@ function ctx(overrides: Partial<WorkflowRunContext>): WorkflowRunContext {
 	};
 }
 
-// The 12-row truth table review F3 named, each row independently a
-// pass/exclude case for the real, loaded if: expression.
+// The truth table review F3 named (12 rows then, 18 now after #2042's
+// run_attempt rows), each row independently a pass/exclude case for the
+// real, loaded if: expression.
 const ROWS: Array<[string, WorkflowRunContext, boolean]> = [
 	["same-repo PR", ctx({ event: "pull_request" }), true],
 	[
@@ -172,14 +173,40 @@ const ROWS: Array<[string, WorkflowRunContext, boolean]> = [
 		ctx({ event: "workflow_dispatch" }),
 		false,
 	],
+	// #2042 (2026-09-15): the SECOND infra kill on one head. This gate read
+	// `run_attempt == 1`, so the second 137-kill of #3048 and of #3040 was
+	// never classified and attempt 3 had to be started BY HAND both times.
+	// Attempts 1 and 2 are eligible; attempt 3 is the bound.
 	[
-		"pull_request run on its SECOND attempt (already rerun once)",
+		"pull_request run on its SECOND attempt (a second infra kill on one head)",
 		ctx({ event: "pull_request", runAttempt: 2 }),
+		true,
+	],
+	[
+		"push-to-master run on its SECOND attempt (a second infra kill on one head)",
+		ctx({ event: "push", headBranch: "master", runAttempt: 2 }),
+		true,
+	],
+	[
+		"repository_dispatch run on its SECOND attempt (a second infra kill on one head)",
+		ctx({ event: "repository_dispatch", headBranch: "master", runAttempt: 2 }),
+		true,
+	],
+	// The bound: a rerun can only be issued FROM attempt 1 or 2, so at most
+	// two automatic reruns exist per head and attempt 3 is terminal.
+	[
+		"pull_request run on its THIRD attempt (the two-rerun bound)",
+		ctx({ event: "pull_request", runAttempt: 3 }),
 		false,
 	],
 	[
-		"push-to-master run on its SECOND attempt (already rerun once)",
-		ctx({ event: "push", headBranch: "master", runAttempt: 2 }),
+		"push-to-master run on its THIRD attempt (the two-rerun bound)",
+		ctx({ event: "push", headBranch: "master", runAttempt: 3 }),
+		false,
+	],
+	[
+		"push-to-master run on a FOURTH attempt (still bounded)",
+		ctx({ event: "push", headBranch: "master", runAttempt: 4 }),
 		false,
 	],
 	[
@@ -224,6 +251,41 @@ describe("ci-infra-kill-rerun.yml classify job gate (#2668 review F3)", () => {
 		expect(evaluateIf(withoutForkGuard, forkRow)).toBe(true);
 	});
 
+	// Mutation-proof for #2042's own gate, both directions. Reverting
+	// `run_attempt <= 2` to the shipped `run_attempt == 1` must flip the
+	// second-kill row from eligible to excluded -- the exact state that made
+	// #3048's and #3040's second 137-kill on one head a HAND rerun on
+	// 2026-09-15. Dropping the conjunct altogether must stop excluding
+	// attempt 3, which is the runaway-loop direction.
+	it("mutation-proof: run_attempt <= 2 is the only reading that covers a second infra kill and still bounds the lane (#2042)", () => {
+		const secondKill = ctx({
+			event: "push",
+			headBranch: "master",
+			runAttempt: 2,
+		});
+		const thirdAttempt = ctx({
+			event: "push",
+			headBranch: "master",
+			runAttempt: 3,
+		});
+		expect(evaluateIf(ifExpr, secondKill)).toBe(true);
+		expect(evaluateIf(ifExpr, thirdAttempt)).toBe(false);
+
+		const preFix = ifExpr.replace(
+			/github\.event\.workflow_run\.run_attempt\s*<=\s*2/,
+			"github.event.workflow_run.run_attempt == 1",
+		);
+		expect(preFix).not.toBe(ifExpr);
+		expect(evaluateIf(preFix, secondKill)).toBe(false);
+
+		const unbounded = ifExpr.replace(
+			/\s*&&\s*github\.event\.workflow_run\.run_attempt\s*<=\s*2/,
+			"",
+		);
+		expect(unbounded).not.toBe(ifExpr);
+		expect(evaluateIf(unbounded, thirdAttempt)).toBe(true);
+	});
+
 	// Review round 2, MUT J: the `if:` truth table above cannot see this --
 	// it only pins whether the JOB runs, not what the STEP's own `elif` does
 	// once it has. Both `push` and `repository_dispatch` must appear in the
@@ -243,9 +305,10 @@ describe("ci-infra-kill-rerun.yml synchronize label cleanup (#2856)", () => {
 		const job = (workflow.jobs as Record<string, WorkflowJob>)[
 			"clear-stale-verdict-labels"
 		];
+		expect(job).toBeDefined();
 		expect(job?.if).toContain("github.event_name == 'pull_request'");
 		expect(job?.if).toContain("github.event.action == 'synchronize'");
-		const run = (job?.steps as WorkflowStep[]).find((step) => step.run)?.run;
+		const run = (job!.steps as WorkflowStep[]).find((step) => step.run)?.run;
 		expect(run).toContain("--remove-label 'ci:infra'");
 		expect(run).toContain("--remove-label 'ci:real'");
 		expect(job?.env).toMatchObject({ GH_REPO: "${{ github.repository }}" });
@@ -259,25 +322,41 @@ describe("ci-infra-kill-rerun.yml terminal rerun path (#2806 F3)", () => {
 		throw new Error(`${WORKFLOW_PATH}: jobs.finalize-rerun.if is not a string`);
 	}
 
+	// #2042 (2026-09-15): keyed on the TERMINAL attempt, not on the literal
+	// number 2. With `classify` now firing on attempts 1 AND 2, an attempt-2
+	// FAILURE is an intermediate state (classify reruns it), so swapping the
+	// terminal labels there would announce a verdict the lane is still
+	// working on. Terminal = attempt 2 that SUCCEEDED, or attempt 3 either
+	// way (the two-rerun bound forbids a fourth automatic attempt).
 	const terminalRows: Array<[string, WorkflowRunContext, boolean]> = [
 		[
-			"pull_request success attempt 2",
+			"pull_request success attempt 2 (green; no third attempt will exist)",
 			ctx({ conclusion: "success", runAttempt: 2 }),
 			true,
 		],
 		[
-			"pull_request failure attempt 2",
+			"pull_request failure attempt 2 (intermediate: classify reruns it)",
 			ctx({ conclusion: "failure", runAttempt: 2 }),
-			true,
-		],
-		[
-			"pull_request success attempt 3",
-			ctx({ conclusion: "success", runAttempt: 3 }),
 			false,
 		],
 		[
-			"pull_request failure attempt 3",
+			"pull_request success attempt 3 (terminal)",
+			ctx({ conclusion: "success", runAttempt: 3 }),
+			true,
+		],
+		[
+			"pull_request failure attempt 3 (terminal)",
 			ctx({ conclusion: "failure", runAttempt: 3 }),
+			true,
+		],
+		[
+			"pull_request attempt 1 failure (classify's own label swap owns this)",
+			ctx({ conclusion: "failure", runAttempt: 1 }),
+			false,
+		],
+		[
+			"pull_request cancelled attempt 3 (neither failure nor success)",
+			ctx({ conclusion: "cancelled", runAttempt: 3 }),
 			false,
 		],
 		[
@@ -291,34 +370,34 @@ describe("ci-infra-kill-rerun.yml terminal rerun path (#2806 F3)", () => {
 			true,
 		],
 		[
-			"push failure attempt 2",
+			"push failure attempt 2 (intermediate)",
 			ctx({
 				event: "push",
 				headBranch: "master",
 				conclusion: "failure",
 				runAttempt: 2,
 			}),
-			true,
+			false,
 		],
 		[
-			"push success attempt 3",
+			"push success attempt 3 (terminal)",
 			ctx({
 				event: "push",
 				headBranch: "master",
 				conclusion: "success",
 				runAttempt: 3,
 			}),
-			false,
+			true,
 		],
 		[
-			"push failure attempt 3",
+			"push failure attempt 3 (terminal)",
 			ctx({
 				event: "push",
 				headBranch: "master",
 				conclusion: "failure",
 				runAttempt: 3,
 			}),
-			false,
+			true,
 		],
 		[
 			"repository_dispatch success attempt 2",
@@ -331,32 +410,42 @@ describe("ci-infra-kill-rerun.yml terminal rerun path (#2806 F3)", () => {
 			true,
 		],
 		[
-			"repository_dispatch failure attempt 2",
+			"repository_dispatch failure attempt 2 (intermediate)",
 			ctx({
 				event: "repository_dispatch",
 				headBranch: "master",
 				conclusion: "failure",
 				runAttempt: 2,
 			}),
-			true,
+			false,
 		],
 		[
-			"repository_dispatch success attempt 3",
+			"repository_dispatch success attempt 3 (terminal)",
 			ctx({
 				event: "repository_dispatch",
 				headBranch: "master",
 				conclusion: "success",
 				runAttempt: 3,
 			}),
-			false,
+			true,
 		],
 		[
-			"repository_dispatch failure attempt 3",
+			"repository_dispatch failure attempt 3 (terminal)",
 			ctx({
 				event: "repository_dispatch",
 				headBranch: "master",
 				conclusion: "failure",
 				runAttempt: 3,
+			}),
+			true,
+		],
+		[
+			"push failure attempt 4 (cannot exist under the bound; still excluded)",
+			ctx({
+				event: "push",
+				headBranch: "master",
+				conclusion: "failure",
+				runAttempt: 4,
 			}),
 			false,
 		],
@@ -366,8 +455,35 @@ describe("ci-infra-kill-rerun.yml terminal rerun path (#2806 F3)", () => {
 		expect(evaluateIf(ifExpr, context)).toBe(expected);
 	});
 
+	// Mutation-proof for the re-key (#2042). Leaving this job on the shipped
+	// `run_attempt == 2` once classify covers attempt 2 makes attempt 2 the
+	// SECOND rerun trigger's own finalizer: a failing attempt 2 -- which
+	// classify is about to rerun -- would get the terminal `ci:real` label,
+	// and the genuinely terminal attempt 3 would get none at all.
+	it("mutation-proof: reverting the terminal key to run_attempt == 2 mislabels the intermediate attempt and drops the terminal one (#2042)", () => {
+		const failingAttempt2 = ctx({ conclusion: "failure", runAttempt: 2 });
+		const terminalAttempt3 = ctx({ conclusion: "failure", runAttempt: 3 });
+		expect(evaluateIf(ifExpr, failingAttempt2)).toBe(false);
+		expect(evaluateIf(ifExpr, terminalAttempt3)).toBe(true);
+
+		// A YAML `>-` block folds some newlines and keeps others (the more
+		// -indented continuation lines), so the mutation is applied to a
+		// whitespace-flattened copy of the SAME loaded string rather than to a
+		// hand-copied restatement of it.
+		const flat = ifExpr.replace(/\s+/g, " ");
+		expect(evaluateIf(flat, terminalAttempt3)).toBe(true);
+		const preFix = flat.replace(
+			/\( github\.event\.workflow_run\.run_attempt == 3 \|\| \(github\.event\.workflow_run\.run_attempt == 2 && github\.event\.workflow_run\.conclusion == 'success'\) \)/,
+			"github.event.workflow_run.run_attempt == 2",
+		);
+		expect(preFix).not.toBe(flat);
+		expect(evaluateIf(preFix, failingAttempt2)).toBe(true);
+		expect(evaluateIf(preFix, terminalAttempt3)).toBe(false);
+	});
+
 	it("loads the terminal label swap and no-PR summary path", () => {
-		const run = (job?.steps as WorkflowStep[]).find((step) => step.run)?.run;
+		expect(job).toBeDefined();
+		const run = (job!.steps as WorkflowStep[]).find((step) => step.run)?.run;
 		expect(run).toContain("--remove-label 'ci:infra'");
 		expect(run).toContain("--add-label 'ci:real'");
 		expect(run).toContain("GITHUB_STEP_SUMMARY");

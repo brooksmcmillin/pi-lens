@@ -32,9 +32,12 @@ export const WARM_CODE_ACTION_LOOKUP_LIMIT = 6;
  * resolved root (lowercased for case-insensitive filesystems), so when they're
  * the same project they meet. Mismatch → the client just falls back to cold.
  */
-export function ipcPathForCwd(cwd: string): string {
-	const hash = workspaceHash(cwd);
-	if (process.platform === "win32") {
+export function ipcPathForCwd(
+	cwd: string,
+	platform: NodeJS.Platform = process.platform,
+): string {
+	const hash = workspaceHash(cwd, platform);
+	if (platform === "win32") {
 		return `\\\\.\\pipe\\pi-lens-mcp-${hash}`;
 	}
 	return path.join(os.tmpdir(), `pi-lens-mcp-${hash}.sock`);
@@ -44,9 +47,69 @@ export function ipcPathForCwd(cwd: string): string {
  * The single stable per-workspace id both endpoint derivations key on. Every
  * per-workspace side-channel name (socket/pipe, turn-end status file) must come
  * from HERE, so the hook process and the server process cannot drift apart.
+ *
+ * #1193 P3 decision: this input is NOT a map key and neither path-utils seam
+ * belongs here. Writers and readers of this id, and what each one holds:
+ *
+ * | process            | site                                          | input |
+ * |--------------------|-----------------------------------------------|-------|
+ * | MCP server (warm)  | `mcp/server.ts` `IPC_PATH` — listen            | its launch cwd |
+ * | pi session (warm)  | `clients/warm-attach.ts` — listen (pid-scoped) | runtime cwd |
+ * | PostToolUse hook   | `requestWarmAnalyze` — connect                 | hook cwd |
+ * | Stop hook          | `requestWarmTurnEnd` — connect                 | hook cwd |
+ * | Stop hook / health | `turnEndStatusPathForCwd` — write + read a file in tmpdir | cwd |
+ *
+ * Every row is a SEPARATE process that must reproduce the same 16 hex
+ * characters with no shared state, and the rows do not run at the same time —
+ * the server derives its id at launch, a hook derives its own minutes or hours
+ * later. `normalizeMapKey`/`normalizeFilePath` would make the id depend on
+ * filesystem state (`realpathSync.native`, on-disk casing) read at two
+ * different moments: a case-only rename, a remounted symlink, or a hook running
+ * in a different mount namespace than the server would silently stop the two
+ * from meeting. That is the exact staleness PR #2193 was rejected for on the
+ * LSP seam. `normalizeEphemeralMapKey` is excluded by its own contract — it is
+ * scoped to process-local, same-run keys and says so.
+ *
+ * So the derivation stays pure string math — and #3255 narrowed its case fold
+ * to the platforms whose FILESYSTEM folds case, because "pure" and
+ * "unconditional" are not the same thing:
+ *
+ * - case-INSENSITIVE default (`win32`, `darwin` APFS/HFS+): `Alpha` and `alpha`
+ *   are ONE directory, so the only failure mode is a MISS. The server row and
+ *   the hook rows can hold different spellings of it — the server's cwd can be
+ *   a hand-written `--cwd=` / `PI_LENS_MCP_CWD` while the hook's comes from the
+ *   payload (see `tests/mcp/turn-end-route.smoke.test.ts`'s win32 case) — so the
+ *   fold is what makes them meet, and it stays. `darwin` belongs here for a
+ *   reason in this tree, not by analogy: the incumbent selection that decides
+ *   two sessions share a root already compares through `normalizeFilePath`
+ *   (`clients/instance-registry.ts:837`), whose `realpathSync.native` returns
+ *   on-disk casing on Darwin. A pair that SELECTS each other case-insensitively
+ *   must be able to MEET.
+ * - case-SENSITIVE (Linux, *BSD): `Alpha` and `alpha` are TWO directories, and
+ *   two spellings of one workspace cannot occur (a mis-cased `--cwd=` names a
+ *   directory that does not exist). Folding there bought nothing and collided
+ *   two workspaces onto one socket and one status file — #3255.
+ *
+ * Known residuals, both fail-safe and both un-closable without a filesystem
+ * read this derivation is forbidden to do: a case-insensitive MOUNT on a
+ * case-sensitive platform (`nocase` vfat/ntfs3/cifs, ext4 `chattr +F`) now
+ * misses instead of meeting — the same blind spot `normalizeFilePath` has
+ * there, measured and filed as #3154 — and a case-SENSITIVE APFS volume keeps
+ * today's collision.
+ *
+ * `platform` is an argument, not a `process.platform` read, so every arm is
+ * testable from one lane (the seam `normalizePathEntry` uses in
+ * `clients/lsp/launch.ts`).
  */
-function workspaceHash(cwd: string): string {
-	const root = path.resolve(cwd).toLowerCase();
+function workspaceHash(
+	cwd: string,
+	platform: NodeJS.Platform = process.platform,
+): string {
+	const resolved = path.resolve(cwd);
+	const root =
+		platform === "win32" || platform === "darwin"
+			? resolved.toLowerCase()
+			: resolved;
 	// sha256 (not for security — just a stable short id for the IPC socket/pipe
 	// name keyed by cwd; sha256 over sha1 keeps SonarCloud's weak-hash check quiet)
 	return crypto.createHash("sha256").update(root).digest("hex").slice(0, 16);
@@ -54,9 +117,13 @@ function workspaceHash(cwd: string): string {
 
 /** PID-scoped endpoint used by pi sessions. The legacy MCP analyze endpoint
  * remains workspace-scoped for compatibility with the PostToolUse hook. */
-export function diagnosticsIpcPathForCwd(cwd: string, pid: number): string {
-	const base = ipcPathForCwd(cwd);
-	if (process.platform === "win32") return `${base}-diagnostics-${pid}`;
+export function diagnosticsIpcPathForCwd(
+	cwd: string,
+	pid: number,
+	platform: NodeJS.Platform = process.platform,
+): string {
+	const base = ipcPathForCwd(cwd, platform);
+	if (platform === "win32") return `${base}-diagnostics-${pid}`;
 	return base.replace(/\.sock$/, `-diagnostics-${pid}.sock`);
 }
 
@@ -136,8 +203,28 @@ export type WarmCodeActionsResult =
 export type WarmDiagnosticsFailureReason =
 	| "timeout"
 	| "ipc-error"
+	/**
+	 * Nothing is listening on the endpoint this process derived — the connect
+	 * itself never landed. Split out of `ipc-error` by #3255 for the same reason
+	 * #1272 split `schema-mismatch` out of it: the remedies differ. An
+	 * answering-but-broken server needs a rebuild; an absent one needs a start;
+	 * and after #3255 narrowed the case fold, a server that was ALREADY RUNNING
+	 * when pi-lens was upgraded still owns the previous endpoint name, so it
+	 * needs a restart and nothing else will fix it.
+	 */
+	| "no-listener"
 	| "schema-mismatch"
 	| "stale-answer";
+
+/**
+ * A connect that never landed, as opposed to a socket that opened and then
+ * failed. `ENOENT` is the POSIX "no socket file there"; `ECONNREFUSED` is a
+ * socket file (or named pipe) with no live listener behind it.
+ */
+function isNoListenerError(error: unknown): boolean {
+	const code = (error as NodeJS.ErrnoException | null)?.code;
+	return code === "ENOENT" || code === "ECONNREFUSED";
+}
 
 export type WarmDiagnosticsResult =
 	| { available: true; response: WarmDiagnosticsResponse }
@@ -215,7 +302,12 @@ function requestOverWarmIpc<TResponse, TRequest extends object = object>(
 				finish({ available: false, reason: "schema-mismatch" });
 			}
 		});
-		socket.on("error", () => finish({ available: false, reason: "ipc-error" }));
+		socket.on("error", (error) =>
+			finish({
+				available: false,
+				reason: isNoListenerError(error) ? "no-listener" : "ipc-error",
+			}),
+		);
 		socket.on("close", () => finish({ available: false, reason: "ipc-error" }));
 	});
 }
@@ -415,13 +507,22 @@ export interface TurnEndStatus {
 }
 
 /** Per-workspace status file, keyed by the same hash as the IPC endpoint. */
-export function turnEndStatusPathForCwd(cwd: string): string {
-	return path.join(os.tmpdir(), `pi-lens-turn-end-${workspaceHash(cwd)}.json`);
+export function turnEndStatusPathForCwd(
+	cwd: string,
+	platform: NodeJS.Platform = process.platform,
+): string {
+	return path.join(
+		os.tmpdir(),
+		`pi-lens-turn-end-${workspaceHash(cwd, platform)}.json`,
+	);
 }
 
-export function readTurnEndStatus(cwd: string): TurnEndStatus | undefined {
+export function readTurnEndStatus(
+	cwd: string,
+	platform: NodeJS.Platform = process.platform,
+): TurnEndStatus | undefined {
 	try {
-		const raw = fs.readFileSync(turnEndStatusPathForCwd(cwd), "utf8");
+		const raw = fs.readFileSync(turnEndStatusPathForCwd(cwd, platform), "utf8");
 		const parsed = JSON.parse(raw) as Partial<TurnEndStatus> | null;
 		if (!parsed || typeof parsed !== "object") return undefined;
 		return {
@@ -454,10 +555,11 @@ export function readTurnEndStatus(cwd: string): TurnEndStatus | undefined {
 export function recordTurnEndOutcome(
 	cwd: string,
 	outcome: { ran: true } | { ran: false; reason: string },
+	platform: NodeJS.Platform = process.platform,
 ): void {
 	try {
 		const now = new Date().toISOString();
-		const previous = readTurnEndStatus(cwd) ?? { ran: 0, skipped: 0 };
+		const previous = readTurnEndStatus(cwd, platform) ?? { ran: 0, skipped: 0 };
 		const next: TurnEndStatus = outcome.ran
 			? { ...previous, ran: previous.ran + 1, lastRunAt: now }
 			: {
@@ -466,7 +568,18 @@ export function recordTurnEndOutcome(
 					lastSkipReason: outcome.reason,
 					lastSkipAt: now,
 				};
-		writeFileAtomic(turnEndStatusPathForCwd(cwd), `${JSON.stringify(next)}\n`);
+		// Writes THIS workspace's file and nothing else. #3255 round 2 also deleted
+		// the file at the retired always-fold name; round 3 removed that, because
+		// on a case-sensitive host that name is not an orphan — it is the live
+		// current file of the case-variant sibling workspace, and the record
+		// carries no ownership field that could tell the two apart. The
+		// pre-upgrade file is left to the same existence gate every other stale
+		// tmp artifact has: nothing derives that name any more, so nothing reads
+		// it except a still-running pre-upgrade server, for which it is correct.
+		writeFileAtomic(
+			turnEndStatusPathForCwd(cwd, platform),
+			`${JSON.stringify(next)}\n`,
+		);
 	} catch {
 		// telemetry only — a read-only tmpdir must not break the Stop hook
 	}

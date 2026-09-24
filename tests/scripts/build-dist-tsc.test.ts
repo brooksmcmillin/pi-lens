@@ -39,7 +39,7 @@ import { createIsolatedExecPrefix } from "../../scripts/lib/exec-isolation.mjs";
 describe("resolveLocalTsc (#2593 review round 2, F1)", () => {
 	function makeFixtureRoot(tscVersion: string | undefined) {
 		const root = fs.mkdtempSync(
-			path.join(os.tmpdir(), "pilens-resolve-local-tsc-"),
+			path.join(os.tmpdir(), "pi-lens-pilens-resolve-local-tsc-"),
 		);
 		if (tscVersion !== undefined) {
 			const tsDir = path.join(root, "node_modules", "typescript");

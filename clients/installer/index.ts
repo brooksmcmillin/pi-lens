@@ -87,6 +87,7 @@ import {
 } from "../safe-spawn.js";
 import { probeToolAsync } from "../tool-probe.js";
 import { logSessionStart } from "../sessionstart-logger.js";
+import { resolveGitHubToken } from "../zizmor-config.js";
 
 // Global installation directory for pi-lens tools
 const TOOLS_DIR = path.join(getGlobalPiLensDir(), "tools");
@@ -437,7 +438,15 @@ const MANAGED_PACKAGE_FORMATTERS = [
 		id: "cmake-format",
 		name: "cmake-format",
 		installStrategy: "pip",
-		packageName: "cmakelang",
+		// The `yaml` EXTRA, never the bare distribution (#3312). cmakelang reads a
+		// `.cmake-format.yaml` project config through `import yaml`, and upstream
+		// puts PyYAML behind an extra: cmakelang 0.6.13's PyPI metadata declares
+		// `pyyaml (>=5.3) ; extra == 'yaml'`. A bare install still answers
+		// `cmake-format --version` with status 0 and then dies with
+		// `ModuleNotFoundError: No module named 'yaml'` on the first YAML config —
+		// the nightly's red cmake row. Every rung of the pip ladder passes this
+		// string verbatim to pip/pipx, which both accept the `pkg[extra]` spec.
+		packageName: "cmakelang[yaml]",
 	},
 	{ id: "oxfmt", name: "oxfmt", installStrategy: "npm", packageName: "oxfmt" },
 ] satisfies ManagedPackageFormatterSpec[];
@@ -473,6 +482,27 @@ function managedGitHubFormatterTool(
 }
 
 const MANAGED_GITHUB_FORMATTERS = [
+	{
+		id: "typstyle",
+		name: "typstyle",
+		owner: "typstyle-rs",
+		repo: "typstyle",
+		assetPattern: archAssetMatch({
+			linux: {
+				x64: "typstyle-x86_64-unknown-linux-gnu",
+				arm64: "typstyle-aarch64-unknown-linux-gnu",
+			},
+			darwin: {
+				x64: "typstyle-x86_64-apple-darwin",
+				arm64: "typstyle-aarch64-apple-darwin",
+			},
+			win32: {
+				x64: "typstyle-x86_64-pc-windows-msvc.exe",
+				arm64: "typstyle-aarch64-pc-windows-msvc.exe",
+			},
+		}),
+		kind: "binary",
+	},
 	{
 		id: "stylua",
 		name: "StyLua",
@@ -1623,6 +1653,34 @@ export const TOOLS: ToolDefinition[] = [
 				return undefined;
 			},
 			binaryInArchive: "gleam",
+		},
+	},
+	{
+		// Tinymist publishes cargo-dist archives containing the `tinymist` binary
+		// for the supported desktop targets. The LSP server uses `tinymist lsp`.
+		id: "tinymist",
+		name: "Tinymist",
+		checkCommand: "tinymist",
+		checkArgs: ["--version"],
+		installStrategy: "github",
+		binaryName: "tinymist",
+		github: {
+			repo: "Myriad-Dreamin/tinymist",
+			assetMatch: archAssetMatch({
+				linux: {
+					x64: "tinymist-x86_64-unknown-linux-gnu.tar.gz",
+					arm64: "tinymist-aarch64-unknown-linux-gnu.tar.gz",
+				},
+				darwin: {
+					x64: "tinymist-x86_64-apple-darwin.tar.gz",
+					arm64: "tinymist-aarch64-apple-darwin.tar.gz",
+				},
+				win32: {
+					x64: "tinymist-x86_64-pc-windows-msvc.zip",
+					arm64: "tinymist-aarch64-pc-windows-msvc.zip",
+				},
+			}),
+			binaryInArchive: "tinymist",
 		},
 	},
 	{
@@ -3384,9 +3442,57 @@ async function getPythonUserBaseCandidates(): Promise<string[]> {
  * call, never the asset download (see installGitHubTool) — the release CDN must
  * not receive the token.
  */
-function githubApiAuthHeaders(): Record<string, string> {
-	const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
+async function githubApiAuthHeaders(): Promise<Record<string, string>> {
+	const token = await resolveGitHubToken();
 	return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+class HttpStatusError extends Error {
+	readonly statusCode: number;
+
+	constructor(statusCode: number, url?: string) {
+		super(url ? `HTTP ${statusCode} for ${url}` : `HTTP ${statusCode}`);
+		this.name = "HttpStatusError";
+		this.statusCode = statusCode;
+	}
+}
+
+class GitHubHttpError extends HttpStatusError {
+	readonly anonymousRateLimitExhausted: boolean;
+
+	constructor(
+		statusCode: number,
+		requestHeaders: Record<string, string>,
+		responseHeaders: Record<string, string | string[] | undefined>,
+	) {
+		super(statusCode);
+		this.name = "GitHubHttpError";
+		this.message = `GitHub API HTTP ${statusCode}`;
+		this.anonymousRateLimitExhausted =
+			statusCode === 403 &&
+			!Object.keys(requestHeaders).some(
+				(key) => key.toLowerCase() === "authorization",
+			) &&
+			readHeader(responseHeaders, "x-ratelimit-remaining") === "0";
+	}
+}
+
+function readHeader(
+	headers: Record<string, string | string[] | undefined>,
+	name: string,
+): string | undefined {
+	const entry = Object.entries(headers).find(
+		([key]) => key.toLowerCase() === name.toLowerCase(),
+	)?.[1];
+	return Array.isArray(entry) ? entry[0]?.trim() : entry?.trim();
+}
+
+function isGitHubApiUrl(url: string): boolean {
+	try {
+		return new URL(url).host.toLowerCase() === "api.github.com";
+	} catch {
+		return false;
+	}
 }
 
 function sameHost(a: string, b: string): boolean {
@@ -3456,7 +3562,11 @@ function httpsGetWithMeta(
 					}
 					if (res.statusCode !== 200) {
 						res.resume();
-						return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
+						return reject(
+							isGitHubApiUrl(url)
+								? new GitHubHttpError(res.statusCode ?? 0, headers, res.headers)
+								: new HttpStatusError(res.statusCode ?? 0, url),
+						);
 					}
 					const chunks: Buffer[] = [];
 					res.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -3556,13 +3666,22 @@ async function installGitHubTool(
 			const body = await httpsGet(
 				`https://api.github.com/repos/${spec.repo}/releases/latest`,
 				5,
-				githubApiAuthHeaders(),
+				await githubApiAuthHeaders(),
 			);
 			releaseJson = JSON.parse(body.toString("utf8"));
 		} catch (err) {
-			logSessionStart(
-				`github-install ${tool.id}: release fetch failed: ${(err as Error).message}`,
-			);
+			const reason =
+				err instanceof GitHubHttpError && err.anonymousRateLimitExhausted
+					? "GitHub API rate limit exhausted; authenticate with `gh auth login` or set GITHUB_TOKEN/GH_TOKEN and retry"
+					: `release fetch failed: ${(err as Error).message}`;
+			if (err instanceof GitHubHttpError && err.anonymousRateLimitExhausted) {
+				recordDegradationOnce({
+					kind: "github-api-rate-limit",
+					subject: tool.id,
+					reason,
+				});
+			}
+			logSessionStart(`github-install ${tool.id}: ${reason}`);
 			return undefined;
 		}
 	}
@@ -4294,15 +4413,26 @@ async function refreshGitHubManagedTool(
 			`https://api.github.com/repos/${spec.repo}/releases/latest`,
 			5,
 			{
-				...githubApiAuthHeaders(),
+				...(await githubApiAuthHeaders()),
 				...(known.etag ? { "If-None-Match": known.etag } : {}),
 			},
 		);
 	} catch (err) {
+		const reason =
+			err instanceof GitHubHttpError && err.anonymousRateLimitExhausted
+				? "GitHub API rate limit exhausted; authenticate with `gh auth login` or set GITHUB_TOKEN/GH_TOKEN and retry"
+				: `release query failed: ${(err as Error).message}`;
+		if (err instanceof GitHubHttpError && err.anonymousRateLimitExhausted) {
+			recordDegradationOnce({
+				kind: "github-api-rate-limit",
+				subject: tool.id,
+				reason,
+			});
+		}
 		return {
 			ok: false,
 			unchanged: true,
-			reason: `release query failed: ${(err as Error).message}`,
+			reason,
 		};
 	}
 
@@ -5420,10 +5550,20 @@ async function installPipTool(
 		};
 
 		if (await isCommandAvailable("pipx")) {
-			const result = await run("pipx", [
-				options.upgrade ? "upgrade" : "install",
-				packageName,
-			]);
+			// `--force` on the install verb (#3312): this function runs ONLY when the
+			// tool was not resolvable, yet plain `pipx install <pkg>` over an
+			// existing venv exits 0 while printing "not modifying existing
+			// installation. Pass '--force' …" — so an install that changes nothing
+			// reports success and hands back the same unusable launcher. That is the
+			// #2638/#2661 shape (an install that installs nothing reporting like a
+			// real one) and it also swallows a changed package spec, e.g. a venv
+			// created before `cmakelang` grew its `[yaml]` extra above.
+			const result = await run(
+				"pipx",
+				options.upgrade
+					? ["upgrade", packageName]
+					: ["install", "--force", packageName],
+			);
 			const error = (result.error?.message ?? result.stderr).trim();
 			if (result.status === 0) {
 				const location = await run("pipx", [
@@ -6250,6 +6390,8 @@ export const GITHUB_TOOLS = [
 	"clojure-lsp",
 	"cue",
 	"gleam",
+	"typstyle",
+	"tinymist",
 	"marksman",
 	"expert",
 ] as const;

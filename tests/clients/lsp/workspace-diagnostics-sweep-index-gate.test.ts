@@ -51,7 +51,7 @@ describe("runWorkspaceDiagnostics — sweep-scoped index gate for workspaceIndex
 		vi.resetModules();
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
-		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "wsd-indexgate-"));
+		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-wsd-indexgate-"));
 	});
 	afterEach(() => removeTempDirSync(tmp));
 

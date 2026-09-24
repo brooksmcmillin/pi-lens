@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { pathsEqual } from "../../path-utils.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import { resolveRunnerCwd } from "../../tool-cwd.js";
 import { PRIORITY } from "../priorities.js";
@@ -9,17 +10,42 @@ import type {
 	RunnerResult,
 } from "../types.js";
 import { createAvailabilityChecker } from "./utils/runner-helpers.js";
+import { finishParsedRun, parseToolRun } from "./utils/tool-failure.js";
+
+// PHP's `-l` exit contract, declared HERE rather than in the shared classifier
+// (#3291 r3): an admission is a property of this tool. The manual documents
+// `-l` as syntax-check-only with a nonzero return on failure; the captured
+// PHP 8.3.32 wire exits 1 in the usual CLI path and 255 (the shell reading of
+// PHP's documented -1) for the parse-error wire. Both are completed analyses
+// whose output must reach the parser; any other nonzero status stays a
+// rejected invocation.
+const PHP_LINT_EXIT_CODES = { ran: [1, 255] } as const;
 
 const php = createAvailabilityChecker("php", ".exe");
 
-function parsePhpLintOutput(raw: string, filePath: string): Diagnostic[] {
+function parsePhpLintOutput(
+	raw: string,
+	filePath: string,
+	cwd: string,
+): Diagnostic[] {
 	const output = raw.trim();
-	if (!output) return [];
+	if (!output || !/(?:PHP )?Parse error:/i.test(output)) return [];
 
 	const lineMatch = output.match(/on line (\d+)/i);
 	const messageMatch =
-		output.match(/PHP Parse error:\s*(.+?)(?:\s+in\s+.+?\s+on line \d+)?$/im) ??
-		output.match(/Parse error:\s*(.+?)(?:\s+in\s+.+?\s+on line \d+)?$/im);
+		output.match(
+			/PHP Parse error:\s*(.+?)(?:\s+in\s+(.+?)\s+on line \d+)?$/im,
+		) ??
+		output.match(/Parse error:\s*(.+?)(?:\s+in\s+(.+?)\s+on line \d+)?$/im);
+	// #3295: PHP names the file it could not parse in the same sentence. `php -l`
+	// follows no includes today, so this drops nothing under our argv — it pins
+	// the attribution the parser was asserting without asking.
+	const reported = messageMatch?.[2]?.trim();
+	if (
+		reported &&
+		!pathsEqual(path.resolve(cwd, reported), path.resolve(cwd, filePath))
+	)
+		return [];
 
 	return [
 		{
@@ -59,23 +85,27 @@ const phpLintRunner: RunnerDefinition = {
 			timeout: 15000,
 			cwd,
 		});
-		if (result.status === 0) {
-			return { status: "succeeded", diagnostics: [], semantic: "none" };
-		}
-
-		const diagnostics = parsePhpLintOutput(
-			`${result.stdout ?? ""}\n${result.stderr ?? ""}`,
-			ctx.filePath,
+		// `output` is what the classifier judges AND what the parser reads: the
+		// parse error arrives on stderr, so both streams are one wire here. The
+		// exit table rides in this same per-runner input, never in a shared
+		// option (#3291 r3).
+		const run = parseToolRun<Diagnostic>(
+			"php-lint",
+			{
+				result,
+				output: `${result.stdout ?? ""}\n${result.stderr ?? ""}`,
+				exitCodes: PHP_LINT_EXIT_CODES,
+			},
+			(output) => parsePhpLintOutput(output, ctx.filePath, cwd),
 		);
-		if (diagnostics.length === 0) {
-			return { status: "skipped", diagnostics: [], semantic: "none" };
-		}
-
-		return {
-			status: "failed",
-			diagnostics,
-			semantic: "blocking",
-		};
+		if (run.skipped) return run.skipped;
+		return finishParsedRun({
+			tool: "php-lint",
+			ctx,
+			result,
+			diagnostics: run.diagnostics,
+			classify: () => ({ status: "failed", semantic: "blocking" }),
+		});
 	},
 };
 

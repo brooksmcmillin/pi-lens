@@ -20,7 +20,12 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { BiomeClient } from "../../clients/biome-client.js";
+import { CacheManager } from "../../clients/cache-manager.js";
+import { extractWrittenPathsFromCommand } from "../../clients/bash-file-access.js";
+import { getProjectChangeLogPath } from "../../clients/project-changes.js";
+import type { ProjectChangeEntry } from "../../clients/project-changes.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
+import { handleToolCall } from "../../clients/runtime-tool-call.js";
 import { handleToolResult } from "../../clients/runtime-tool-result.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 
@@ -33,7 +38,11 @@ vi.mock("../../clients/dispatch/integration.js", () => ({
 	dispatchLintWithResult: vi.fn(),
 	computeCascadeForFile: vi.fn().mockResolvedValue(undefined),
 }));
-vi.mock("../../clients/lsp/index.js", () => ({ getLSPService: vi.fn() }));
+vi.mock("../../clients/lsp/index.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../../clients/lsp/index.js")>()),
+	getLSPService: vi.fn(),
+	resyncGitChangedFiles: vi.fn().mockResolvedValue(undefined),
+}));
 vi.mock("../../clients/recent-touches.js", () => ({
 	appendRecentTouches: vi.fn().mockResolvedValue(undefined),
 }));
@@ -80,6 +89,22 @@ function fixingBiome(content: (filePath: string) => string): BiomeClient {
 }
 
 function toolDeps(runtime: RuntimeCoordinator, biomeClient: BiomeClient) {
+	// #3005 fixture recurrence: the real pipeline must reach the Biome writer
+	// before attachment-budget behavior is observed.
+	fs.writeFileSync(
+		path.join(runtime.projectRoot, "package.json"),
+		JSON.stringify({ devDependencies: { "@biomejs/biome": "^2.4.10" } }),
+	);
+	fs.writeFileSync(
+		path.join(runtime.projectRoot, "package-lock.json"),
+		JSON.stringify({
+			lockfileVersion: 3,
+			packages: {
+				"": {},
+				"node_modules/@biomejs/biome": { version: "2.4.10" },
+			},
+		}),
+	);
 	return {
 		getFlag: (name: string) => name === "no-lsp",
 		dbg: () => {},
@@ -95,6 +120,31 @@ function toolDeps(runtime: RuntimeCoordinator, biomeClient: BiomeClient) {
 		agentBehaviorRecord: () => [],
 		formatBehaviorWarnings: () => "",
 	} as unknown as Parameters<typeof handleToolResult>[0];
+}
+
+function bashCallDeps(runtime: RuntimeCoordinator, command: string) {
+	return {
+		event: { toolName: "bash", input: { command } },
+		ctx: { cwd: runtime.projectRoot },
+		lensEnabled: true,
+		getFlag: (name: string) => name === "no-lsp",
+		dbg: () => {},
+		runtime,
+		cacheManager: new CacheManager(false),
+		ensureLSPConfigInitialized: async () => {},
+		updateLspStatus: () => {},
+		resetLSPService: () => {},
+	} as Parameters<typeof handleToolCall>[0];
+}
+
+function changeLogEntries(cwd: string): ProjectChangeEntry[] {
+	const logPath = getProjectChangeLogPath(cwd);
+	if (!fs.existsSync(logPath)) return [];
+	return fs
+		.readFileSync(logPath, "utf8")
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => JSON.parse(line) as ProjectChangeEntry);
 }
 
 describe("#1590 post-autofix instruction has one author", () => {
@@ -117,7 +167,7 @@ describe("#1590 post-autofix instruction has one author", () => {
 			baselineWarningCount: 0,
 			fixed: [],
 			resolvedCount: 0,
-			output: "",
+			output: "pipeline analysis visible",
 			blockerOutput: "",
 			hasBlockers: false,
 		} as never);
@@ -187,51 +237,114 @@ describe("#1590 post-autofix instruction has one author", () => {
 		}
 	});
 
-	it("an aggregate-degraded path in a bash write says re-read once", async () => {
+	it("opaque bash recovery preserves analysis without claiming authorship", async () => {
 		const env = setupTestEnvironment("pi-lens-1590-aggregate-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
 		try {
-			// Each file fits the 2 MiB per-file cap alone; the pair does not, so
-			// the second path degrades to the re-read warning. Its pipeline half
-			// used to still call its own attachment authoritative.
-			const big = `${"x".repeat(1.5 * 1024 * 1024)}\n`;
-			const fileA = createTempFile(env.tmpDir, "agg-a.ts", "const a=1;\n");
-			const fileB = createTempFile(env.tmpDir, "agg-b.ts", "const b=1;\n");
+			// #3226 recurrence: a parser-recognized bash redirect plus a direct
+			// handleToolResult call can pass without exercising opaque baseline,
+			// recovery, or ownership gating. Keep the host/bash boundary mocked by
+			// deterministic in-process writes; no child or timing is involved.
+			const fileA = createTempFile(
+				env.tmpDir,
+				"opaque-existing.ts",
+				"const a=1;\n",
+			);
+			const fileB = path.join(env.tmpDir, "opaque-created.ts");
+			const command = `opaque-mutator --existing "${fileA}" --create "${fileB}"`;
+			expect(extractWrittenPathsFromCommand(command, env.tmpDir)).toEqual([]);
 			const runtime = new RuntimeCoordinator();
 			runtime.projectRoot = env.tmpDir;
+			const resultDeps = toolDeps(
+				runtime,
+				fixingBiome(() => "const shouldNotRun = true;\n"),
+			);
+			expect(
+				await handleToolCall(bashCallDeps(runtime, command)),
+			).toBeUndefined();
+			fs.writeFileSync(fileA, "const a = 2;\n");
+			fs.writeFileSync(fileB, "export const created = true;\n");
 
 			const returned = await handleToolResult({
-				...toolDeps(
-					runtime,
-					fixingBiome(() => big),
-				),
+				...resultDeps,
 				event: {
 					toolName: "bash",
-					input: { command: `echo x > "${fileA}"; echo x > "${fileB}"` },
-					content: [],
+					input: { command },
+					content: [{ type: "text", text: "bash complete" }],
 				},
 			} as never);
 
+			expect(returned).toBeDefined();
+			const returnedText = (returned?.content ?? [])
+				.map((part) => part.text ?? "")
+				.join("\n");
+			expect(returnedText).toContain("pipeline analysis visible");
 			const attachments = (returned?.content ?? []).filter((part) =>
 				part.text?.startsWith(ATTACHMENT_PREFIX),
 			);
-			expect(attachments).toHaveLength(1);
-			expect(attachments[0].text).toContain(path.basename(fileA));
+			expect(attachments).toHaveLength(0);
 
 			const lines = instructions(returned);
-			expect(lines).toHaveLength(2);
-			const attachedLines = lines.filter((line) =>
-				line.includes(ATTACHED_CLAIM),
+			expect(lines).toHaveLength(0);
+			expect(lines.some((line) => line.includes(AGGREGATE_CLAIM))).toBe(false);
+			expect(returnedText).not.toContain("authoritative");
+			const opaqueEntries = changeLogEntries(env.tmpDir).filter(
+				(entry) => entry.source === "opaque-script",
 			);
-			expect(attachedLines).toHaveLength(1);
-			expect(attachedLines[0]).toContain(path.basename(fileA));
-			const degraded = lines.filter((line) => line.includes(AGGREGATE_CLAIM));
-			expect(degraded).toHaveLength(1);
-			expect(degraded[0]).toContain(path.basename(fileB));
-			// One row per path, and the reason is on the row.
-			expect(decisionRows().map((row) => row.decision)).toEqual([
-				"attached",
-				"aggregate-budget-degraded",
-			]);
+			expect(
+				opaqueEntries.map((entry) => path.resolve(entry.filePath)).sort(),
+			).toEqual([fileA, fileB].map((file) => path.resolve(file)).sort());
+			expect(runtime.getMutationsSince(0)).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						filePath: path.resolve(fileA),
+						source: "opaque-script",
+					}),
+					expect.objectContaining({
+						filePath: path.resolve(fileB),
+						source: "opaque-script",
+					}),
+				]),
+			);
+			expect(decisionRows()).toEqual([]);
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+
+	it("recognized direct bash authorship still attaches autofix content", async () => {
+		const env = setupTestEnvironment("pi-lens-1590-recognized-");
+		try {
+			const filePath = createTempFile(
+				env.tmpDir,
+				"direct.ts",
+				"const direct=1;\n",
+			);
+			const command = `echo direct > "${filePath}"`;
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			const resultDeps = toolDeps(
+				runtime,
+				fixingBiome(() => "const direct = 1;\n"),
+			);
+			await handleToolCall(bashCallDeps(runtime, command));
+			fs.writeFileSync(filePath, "const direct=2;\n");
+
+			const returned = await handleToolResult({
+				...resultDeps,
+				event: { toolName: "bash", input: { command }, content: [] },
+			} as never);
+
+			expect(returned).toBeDefined();
+			const text = (returned?.content ?? [])
+				.map((part) => part.text ?? "")
+				.join("\n");
+			expect(text).toContain(ATTACHMENT_PREFIX);
+			expect(text).toContain("const direct = 1;");
+			expect(text).toContain(ATTACHED_CLAIM);
 		} finally {
 			env.cleanup();
 		}

@@ -23,6 +23,7 @@ import {
 } from "./cooperative-budget.js";
 import { incrementDegradationCount } from "./degradation-ledger.js";
 import { KIND_EXTENSIONS, type FileKind } from "./file-kinds.js";
+import { isTestFileName } from "./file-role.js";
 import { PathKeyedMap } from "./path-keyed-map.js";
 import { isAtOrAboveHomeDir, normalizeEphemeralMapKey } from "./path-utils.js";
 import { createSingleFlight, type SingleFlight } from "./single-flight.js";
@@ -220,8 +221,10 @@ const STOPWORDS = new Set([
 	"with",
 ]);
 
-const TEST_VENDOR_RE =
-	/(?:(^|[\\/])(?:tests?|__tests__|spec|specs|__mocks__|vendor|node_modules|examples?|fixtures?|\.git|dist|build|coverage)([\\/]|$))|(?:\.(?:test|spec)\.[a-z]+$)/i;
+// Retain the old directory alternatives and anchors; filename classification
+// belongs to file-role (#2928). The relevance multiplier remains 0.3.
+const VENDOR_DIR_RE =
+	/(^|[\\/])(?:tests?|__tests__|spec|specs|__mocks__|vendor|node_modules|examples?|fixtures?|\.git|dist|build|coverage)([\\/]|$)/i;
 
 const DOC_FILE_RE =
 	/\.(?:md|mdx|markdown|json|json5|jsonc|txt|rst|lock|ya?ml|toml|csv)$/i;
@@ -232,7 +235,7 @@ const BM25_K1 = 1.2;
 const BM25_B = 0.75;
 
 function isTestOrVendor(file: string): boolean {
-	return TEST_VENDOR_RE.test(file);
+	return isTestFileName(file) || VENDOR_DIR_RE.test(file);
 }
 
 function isDocFile(file: string): boolean {

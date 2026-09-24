@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import extension from "../index.js";
+import { getGlobalPiLensDir } from "../clients/file-utils.js";
 import { _resetSessionLifecycleForTests } from "../clients/session-lifecycle.js";
 import { createPiMock, makeCtx } from "./support/pi-mock.js";
 import { removeTempDirSync } from "./clients/test-utils.js";
@@ -18,8 +19,31 @@ import { removeTempDirSync } from "./clients/test-utils.js";
  * `isTestMode()` — see clients/sessionstart-logger.ts) so the exact line is
  * observable without depending on real sessionstart.log I/O.
  *
- * The synthetic pid below is made dead deterministically by the test's
- * process.kill(pid, 0) seam; it never relies on the runner's process table.
+ * Two mechanisms make the assertions below deterministic. Both are stated
+ * here because #3042 is what a WRONG version of this paragraph cost:
+ *
+ * 1. LIVENESS. `process.kill(pid, 0)` is the ONE liveness seam this path
+ *    uses — `clients/instance-reaper.ts`'s `realIsPidAlive` is the single
+ *    liveness function, and both consumers reached from session_start take
+ *    it (`logVanishedInstances`'s default argument, and
+ *    `decideOrphanReaping`'s). The OS process-table queries in that file
+ *    (`queryCommandLines`/`findPidsByMarkerWindows`) only ever run over a
+ *    registry entry's recorded `lspChildren`, and the fixture below records
+ *    none. So spying `process.kill` genuinely settles the synthetic pid's
+ *    liveness on every path the sweep takes, whatever the runner's process
+ *    table says about that number.
+ *
+ * 2. THE REGISTRY FILE. Since #2912 `PI_LENS_HOME` is ONE directory for the
+ *    whole vitest run (`<repo>/.probe-home`), not a per-worker temp dir, so
+ *    `instances.json` and its `.lock` are shared by every test file running
+ *    concurrently. The reaper's prune is best-effort: it gives up after
+ *    `withInstanceRegistryLock`'s 500 ms deadline and returns
+ *    "could-not-acquire", which `instance-reaper.ts` discards. Asserting
+ *    that write against the run-shared registry therefore reds whenever
+ *    sibling forks happen to hold the lock — #3042, reproduced with
+ *    `PRUNE-RESULT could-not-acquire` under eight concurrent holders. Each
+ *    case below runs against its OWN `PI_LENS_HOME` instead, which also
+ *    stops this fixture clobbering the registry those siblings are using.
  */
 
 vi.mock("../clients/bootstrap.js", async () => {
@@ -113,13 +137,38 @@ function waitForSweepOrphansSettled(): Promise<void> {
 	});
 }
 
+/** The registry file the PRODUCTION resolver picks, not a paraphrase of it —
+ *  `clients/instance-registry.ts` spells this exact join. */
 function registryFilePath(): string {
-	return path.join(process.env.PI_LENS_HOME as string, "instances.json");
+	return path.join(getGlobalPiLensDir(), "instances.json");
 }
+
+/** `projectRoot` values recorded in the registry under `home`. An absent or
+ *  unreadable file means "nothing recorded" — a concurrent fork is always
+ *  mid-rename somewhere in the run-shared one. */
+function projectRootsInRegistryUnder(home: string): string[] {
+	try {
+		const raw = JSON.parse(
+			fs.readFileSync(path.join(home, "instances.json"), "utf-8"),
+		);
+		return (raw.instances as { projectRoot: string }[]).map(
+			(entry) => entry.projectRoot,
+		);
+	} catch {
+		return [];
+	}
+}
+
+/** The run-shared home vitest-setup pins for every worker, captured before
+ *  any per-case override below replaces it. */
+const runSharedHome = process.env.PI_LENS_HOME as string;
 
 describe("index session_start vanished-instance wiring (#1123 item 2)", () => {
 	let tmp: string;
 	let prevDataDir: string | undefined;
+	let prevHome: string | undefined;
+	let caseHome: string;
+	let caseIndex = 0;
 
 	beforeEach(() => {
 		logSessionStartSpy.mockClear();
@@ -132,11 +181,30 @@ describe("index session_start vanished-instance wiring (#1123 item 2)", () => {
 		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vanished-wiring-"));
 		prevDataDir = process.env.PILENS_DATA_DIR;
 		process.env.PILENS_DATA_DIR = path.join(tmp, "data");
+		// #3042, mechanism 2 in the module docstring: a registry this case
+		// owns outright. A FRESH directory per case, not per file — the
+		// session_start chain is fire-and-forget, so a late write from the
+		// previous case must not be able to land in this one's registry
+		// either. Same shape as tests/index-multi-root-session-start.test.ts,
+		// which pins its own home under `.probe-home` for the same reason.
+		prevHome = process.env.PI_LENS_HOME;
+		caseHome = path.join(
+			process.cwd(),
+			".probe-home",
+			"index-vanished-instance-wiring",
+			String(++caseIndex),
+		);
+		removeTempDirSync(caseHome);
+		fs.mkdirSync(caseHome, { recursive: true });
+		process.env.PI_LENS_HOME = caseHome;
 	});
 
 	afterEach(() => {
 		if (prevDataDir === undefined) delete process.env.PILENS_DATA_DIR;
 		else process.env.PILENS_DATA_DIR = prevDataDir;
+		if (prevHome === undefined) delete process.env.PI_LENS_HOME;
+		else process.env.PI_LENS_HOME = prevHome;
+		removeTempDirSync(caseHome);
 		removeTempDirSync(tmp);
 		vi.restoreAllMocks();
 		vi.clearAllMocks();
@@ -151,7 +219,6 @@ describe("index session_start vanished-instance wiring (#1123 item 2)", () => {
 			}
 			return realProcessKill(pid, signal);
 		});
-		fs.mkdirSync(process.env.PI_LENS_HOME as string, { recursive: true });
 		fs.writeFileSync(
 			registryFilePath(),
 			JSON.stringify({
@@ -168,6 +235,18 @@ describe("index session_start vanished-instance wiring (#1123 item 2)", () => {
 				],
 			}),
 			"utf-8",
+		);
+		// #3042 guard — the recurrence: this seed used to land in the
+		// run-shared `<repo>/.probe-home/instances.json`, the one file every
+		// other concurrently-running fork registers into. That made the prune
+		// below race sibling forks for a 500 ms lock deadline it silently
+		// loses ("could-not-acquire", dropped by instance-reaper.ts), and
+		// blew away their entries on the way in — the seed takes no lock.
+		// `/dead-project` is this fixture's own sentinel root: no real
+		// instance can record it, so finding it in the run-shared registry
+		// means the per-case `PI_LENS_HOME` above stopped applying.
+		expect(projectRootsInRegistryUnder(runSharedHome)).not.toContain(
+			"/dead-project",
 		);
 
 		const pi = createPiMock();

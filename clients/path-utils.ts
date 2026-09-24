@@ -7,7 +7,9 @@
  * Approach (inspired by OpenCode's Filesystem.normalizePath):
  * - On Windows: try realpathSync.native() for canonical casing
  * - Falls back to lowercase for files that don't exist yet
- * - On non-Windows: return path as-is (case-sensitive filesystem)
+ * - On non-Windows: adopt the on-disk casing of an existing path (#3098 — a
+ *   case-insensitive POSIX filesystem otherwise derives two Map keys for one
+ *   file); a path that does not exist is returned as-is, case-preserving
  * - Always convert backslashes to forward slashes for Map key consistency
  */
 
@@ -107,6 +109,64 @@ export function splitPathSegments(filePath: string): string[] {
 }
 
 /**
+ * Adopt `canonical`'s CASING for the trailing segments of `held`, stopping at
+ * the first segment that differs by more than case.
+ *
+ * `realpathSync.native` answers a different question than the one the POSIX
+ * arm of `normalizeFilePath` asks: it resolves symlinks AND reports on-disk
+ * casing, and we want only the second half. Walking from the tail and halting
+ * at the first structural divergence separates them with no extra syscall:
+ *
+ *   held      /var/folders/T/x/SUB/a.ts   (macOS tmpdir, mis-cased segment)
+ *   canonical /private/var/folders/T/x/sub/a.ts
+ *   result    /var/folders/T/x/sub/a.ts   (case fixed, symlink prefix kept)
+ *
+ * The symlink prefix matters: macOS's `os.tmpdir()` is `/var/folders/...`,
+ * a symlink into `/private/var`, so a whole-string "is this a case variant"
+ * test would decline to canonicalize exactly the paths the #1024 regression
+ * test (and any macOS temp-dir workflow) runs on. Keeping the prefix is also
+ * what bounds this change: on POSIX, `normalizeFilePath` still never resolves
+ * a symlink, so a symlinked monorepo package keeps keying under the path the
+ * caller held (refs #2490 — a cwd fold for its own sake broke every monorepo).
+ *
+ * PURE string algebra: this pins what the rewrite DOES, never what the kernel
+ * reports — and from two strings alone it cannot tell "the same file, spelled
+ * with different case" from "a different file whose name happens to be a case
+ * variant". Any symlink whose BASENAME is a case variant of its target's
+ * basename (`<root>/MyProject` → `work/myproject`, `node_modules/Foo` →
+ * `../pkgs/foo`) has its name replaced while its own parent is kept, so the
+ * result names a different place — or no place at all. Measured in #3159
+ * review round 2 (F1): two different inodes collapsed onto ONE key (the #1024
+ * defect inverted — false suppression), and a symlinked package keyed under a
+ * path that does not exist on disk, breaking the #2490 bound above. The caller
+ * therefore CONFIRMS every rewrite against the filesystem before adopting it
+ * (see `normalizeFilePath`); do not use this function without that step.
+ */
+function adoptCanonicalCasing(held: string, canonical: string): string {
+	const heldParts = held.split("/");
+	const realParts = canonical.split("/");
+	let i = heldParts.length - 1;
+	let j = realParts.length - 1;
+	let changed = false;
+	while (i >= 0 && j >= 0) {
+		const a = heldParts[i] as string;
+		const b = realParts[j] as string;
+		if (a !== b) {
+			if (a.toLowerCase() !== b.toLowerCase()) break;
+			heldParts[i] = b;
+			changed = true;
+		}
+		i--;
+		j--;
+	}
+	// Identity-preserving when nothing moved — this runs on every POSIX map-key
+	// derivation and the overwhelmingly common answer is "already canonical".
+	// NOT a behavioural branch (both arms produce an equal string): it is the
+	// same allocation guard `normalizeEphemeralMapKey` documents below.
+	return changed ? heldParts.join("/") : held;
+}
+
+/**
  * Normalize a file path for consistent Map key usage.
  *
  * On Windows:
@@ -115,7 +175,54 @@ export function splitPathSegments(filePath: string): string[] {
  * - If the file doesn't exist: resolves the path and lowercases
  *   (needed for new files where we haven't written yet)
  *
- * On non-Windows: returns path as-is (case-sensitive filesystem).
+ * On POSIX:
+ * - Folds `.`, `..` and duplicate separators first (#3184, see below).
+ * - If the file exists: adopts the on-disk CASING of the trailing segments
+ *   (see `adoptCanonicalCasing`) — no lowercasing, no symlink resolution.
+ * - If the file doesn't exist: returns the path as-is, case-PRESERVING. On a
+ *   case-sensitive filesystem `SUB/a.ts` and `sub/a.ts` are two different
+ *   files, and nothing may fold one into the other; only the filesystem's own
+ *   answer for a path that EXISTS can tell the two apart, and for a path that
+ *   does not exist there is no such answer to ask for.
+ *
+ * Why the POSIX arm folds dot segments (#3184): the casing arm returns the
+ * caller's own spelling whenever `adoptCanonicalCasing` changes nothing, and
+ * for `<base>/src/../src/a.ts` it always changes nothing — `realpath` answers
+ * a string with FEWER segments, which a casing-only rewrite cannot express, so
+ * it declines and the caller's un-folded spelling came back as the map key.
+ * Every canonical writer keys through `path.resolve` first (`ctx.filePath` =
+ * `normalizeMapKey(resolveAgainstAncestors(...))`, `clients/dispatch/
+ * runner-context.ts:49`), so a consumer that passes an ALREADY-absolute
+ * agent-typed path straight in (`tools/lens-diagnostic-mark.ts`,
+ * `clients/mcp/analyze.ts`) derived an orphan key that no reader could reach.
+ * Folding here is pure string algebra — no cwd, no filesystem — so a relative
+ * path stays relative (`src/../x` → `x`, `../x` → `../x`, never resolved
+ * against `process.cwd()`; refs #2490, where a cwd fold broke every monorepo)
+ * and a symlinked package still keys under the path the caller held. These
+ * are `path.resolve`'s own TEXTUAL `..` semantics, which is exactly what
+ * makes a folded reader key equal to the canonical writer's key: where a
+ * `..` sits right after a symlinked directory, textual folding and the
+ * kernel disagree, and both sides of every comparison take the textual
+ * answer because every canonical writer already resolved that way.
+ *
+ * Why POSIX canonicalizes casing at all (#3098, the #1024 defect's live half):
+ * a case-insensitive POSIX filesystem — macOS's default APFS, `nocase` vfat /
+ * ntfs3 / cifs mounts — makes `SUB/a.ts` and `sub/a.ts` ONE file, so a raw
+ * mis-cased write (`lens_diagnostic_mark` anchors under `path.resolve(cwd,
+ * arg)`) and a `normalizeMapKey` read derived two anchors for one file and the
+ * agent's own disposition mark silently never applied. A case-preserving POSIX
+ * arm cannot close that: the two keys only become one if the normalizer asks
+ * the filesystem which name is really on disk.
+ *
+ * `realpathSync.native` is `realpath(3)`. On Darwin it rebuilds every
+ * component from the filesystem's own `ATTR_CMN_NAME` — Libc-1669.0.4
+ * `stdlib/FreeBSD/realpath.c:233` (`getattrlist(resolved, &_rp_alist, …,
+ * FSOPT_NOFOLLOW)` with `ATTR_CMN_NAME`) and `:348-354` ("attrs already has
+ * the real name") — which is why it returns on-disk casing on APFS/HFS+.
+ * MEASURED counter-example (#3098): a Linux ext4/tmpfs `chattr +F` casefold
+ * directory aliases the two spellings but `realpath(3)` there returns the
+ * spelling the caller asked with, so this arm is a no-op on casefolded Linux
+ * directories — filed with the transcript as #3154.
  *
  * Always converts backslashes to forward slashes for consistent Map keys.
  */
@@ -124,7 +231,50 @@ export function normalizeFilePath(filePath: string): string {
 	const normalized = filePath.replace(/\\/g, "/");
 
 	if (process.platform !== "win32" && !isWindowsPath(normalized)) {
-		return normalized;
+		// #3184. `path.posix`, not the host default: this branch is already
+		// committed to POSIX parsing of a slash-folded string (shape 2). Only
+		// the POSIX arm needs this — the win32 arm below reaches `realpath` or
+		// `win32.resolve`/`win32.normalize` on every path, all of which fold
+		// dot segments already (measured: `C:\repo\src\..\src\a.ts` →
+		// `c:/repo/src/a.ts` on this POSIX host, before this change) — and
+		// folding BEFORE the arms would also move which arm a degenerate
+		// drive-letter path selects (`path.posix.normalize("C:/repo/../..")`
+		// is `"."`, no longer Windows-shaped).
+		// Two inputs keep the caller's spelling instead:
+		// - "" is a non-path sentinel in this codebase's path-typed fields
+		//   (see `normalizeLoggedPath`'s doc); `posix.normalize("")` invents
+		//   ".", the process cwd.
+		// - a UNC root (`\\server\share`, slash-folded to `//server/share`)
+		//   reaches THIS arm on a POSIX host, because `isWindowsPath` tests
+		//   the already-folded string and sees no backslash; POSIX
+		//   `normalize` collapses its leading `//` to `/`, renaming the path
+		//   to an unrelated local one.
+		const folded =
+			normalized === "" || normalized.startsWith("//")
+				? normalized
+				: path.posix.normalize(normalized);
+		try {
+			const canonical = realpathSync.native(folded);
+			// Fast path, not a guard: both arms answer `folded` when the
+			// strings match, but skipping the two `split`s there is a measured
+			// 1.9 vs 2.3 microseconds per call on the per-edit seam (#3098).
+			if (canonical === folded) return folded;
+			const adopted = adoptCanonicalCasing(folded, canonical);
+			if (adopted === folded) return folded;
+			// The rewrite is string algebra and can land on a DIFFERENT file
+			// (#3159 review round 2, F1 — see `adoptCanonicalCasing`). Adopt it
+			// only once the filesystem agrees it still names the file the caller
+			// held: `canonical` IS `realpath(normalized)`, so this asks exactly
+			// "does the rewritten spelling resolve to the same file?". One extra
+			// syscall, and only on the rare branch where casing actually moved —
+			// never on an already-canonical path. A throw here (the rewritten
+			// path does not exist, the #2490 monorepo case) lands in the catch
+			// below and keeps the caller's spelling, which is the same answer.
+			return realpathSync.native(adopted) === canonical ? adopted : folded;
+		} catch {
+			// Does not exist (or is unreadable): case-preserving, as above.
+			return folded;
+		}
 	}
 
 	// Windows: try realpathSync.native() for canonical casing

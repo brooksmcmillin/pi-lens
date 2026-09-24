@@ -82,6 +82,76 @@ export async function cleanupTestEnvironmentsDrained(
 	}
 }
 
+/**
+ * A file reachable under TWO spellings that differ only in case, where the
+ * kernel reports the on-disk spelling for both — the exact contract
+ * `normalizeFilePath`'s POSIX arm depends on (#3098, the live half of #1024:
+ * a raw mis-cased `lens_diagnostic_mark` write and a `normalizeMapKey` read
+ * deriving two anchors for one file, so the agent's own mark never applies).
+ *
+ * Built natively where the filesystem is case-insensitive (macOS APFS/HFS+,
+ * Windows, `nocase` vfat/ntfs3/cifs). On a case-sensitive filesystem — the
+ * ubuntu Unit tests lane — the same observable contract is manufactured with a
+ * case-variant symlink (`SUB` → `sub`): `existsSync(SUB/a.ts)` is true and
+ * `realpathSync.native` returns `sub/a.ts`, byte-identical to what APFS
+ * answers, so the seam under test cannot tell the two fixtures apart and the
+ * guard runs on EVERY lane instead of skipping on the one CI actually has.
+ *
+ * `skipReason` is set — and the case cases must skip visibly — only where the
+ * kernel cannot supply that contract: a Linux ext4/tmpfs casefold directory
+ * aliases the spellings but `realpath(3)` returns the QUERIED casing (measured
+ * in #3154), so there is nothing for the normalizer to canonicalize toward.
+ */
+export function createCaseAliasFixture(
+	baseDir: string,
+	options: { dirName?: string; fileName?: string; content?: string } = {},
+): {
+	/** Mis-cased spelling, as a raw `path.resolve(cwd, arg)` would carry it. */
+	rawMisCased: string;
+	/** The spelling really on disk. */
+	onDisk: string;
+	/** Set when this filesystem cannot report on-disk casing (see above). */
+	skipReason?: string;
+} {
+	const dirName = options.dirName ?? "sub";
+	const fileName = options.fileName ?? "a.ts";
+	const onDiskDir = path.join(baseDir, dirName);
+	fs.mkdirSync(onDiskDir, { recursive: true });
+	const onDisk = path.join(onDiskDir, fileName);
+	fs.writeFileSync(onDisk, options.content ?? "const target = bad();\n");
+
+	const misCasedDir = path.join(baseDir, dirName.toUpperCase());
+	const rawMisCased = path.join(misCasedDir, fileName);
+	if (!fs.existsSync(rawMisCased)) {
+		try {
+			fs.symlinkSync(dirName, misCasedDir, "dir");
+		} catch (err) {
+			return {
+				rawMisCased,
+				onDisk,
+				skipReason: `cannot alias ${dirName} as ${dirName.toUpperCase()}: ${
+					err instanceof Error ? err.message : String(err)
+				}`,
+			};
+		}
+	}
+	let canonical: string | undefined;
+	try {
+		canonical = fs.realpathSync.native(rawMisCased);
+	} catch {
+		canonical = undefined;
+	}
+	return canonical === undefined || canonical === rawMisCased
+		? {
+				rawMisCased,
+				onDisk,
+				skipReason:
+					"filesystem aliases the two spellings but reports the QUERIED casing, " +
+					"not the on-disk one (Linux casefold directory) — refs #3154",
+			}
+		: { rawMisCased, onDisk };
+}
+
 export function createTempFile(
 	baseDir: string,
 	relativePath: string,

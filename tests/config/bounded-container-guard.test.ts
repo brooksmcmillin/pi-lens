@@ -52,6 +52,27 @@ function walk(node: any, visit: (node: any) => void): void {
 	for (const child of node.children()) walk(child, visit);
 }
 
+/**
+ * One parse and ONE pre-order walk per source text. Every predicate below
+ * reads this document-ordered node array instead of parsing and walking the
+ * tree itself.
+ *
+ * #3058: the predicates used to take the source STRING, so `scan()` re-parsed
+ * and re-walked each whole file up to six times per container occurrence --
+ * 302 occurrences over 121 files, ~1,800 whole-file passes. An
+ * `@ast-grep/napi` root holds a native tree-sitter arena and every
+ * `children()` call materialises a NAPI handle per node, none of which V8
+ * accounts for and so none of which it ever feels pressure to collect.
+ * Measured 9,207 MB peak RSS against 62 MB of V8 heap. Passing the node array
+ * makes the per-call pass structurally impossible to re-introduce: a
+ * predicate has no source string to parse and no root to walk.
+ */
+export function parseNodes(source: string): any[] {
+	const nodes: any[] = [];
+	walk(parse(Lang.TypeScript, source).root(), (node) => nodes.push(node));
+	return nodes;
+}
+
 function identifier(node: any): string | undefined {
 	return node?.kind() === "identifier" ? node.text() : undefined;
 }
@@ -83,59 +104,58 @@ function isLiteralVocabularyValue(node: any): boolean {
  * again is an import-time vocabulary. Built-in cells with writes, or with a
  * non-literal source, remain in the growth-shaped population.
  */
-export function isGrowthShapedContainer(source: string, name: string): boolean {
-	const root = parse(Lang.TypeScript, source).root();
+export function isGrowthShapedContainer(nodes: any[], name: string): boolean {
 	let declared = false;
 	let builtin = false;
 	let written = false;
-	walk(root, (node) => {
+	for (const node of nodes) {
 		if (
 			node.kind() === "variable_declarator" &&
 			identifier(node.field("name")) === name
 		) {
 			const value = node.field("value");
-			if (value?.kind() !== "new_expression") return;
+			if (value?.kind() !== "new_expression") continue;
 			const ctor = identifier(value.field("constructor"));
-			if (!BUILTINS.has(ctor ?? "") && !BOUNDED_HELPERS.has(ctor ?? "")) return;
+			if (!BUILTINS.has(ctor ?? "") && !BOUNDED_HELPERS.has(ctor ?? ""))
+				continue;
 			declared = true;
 			builtin = BUILTINS.has(ctor ?? "");
 		}
-		if (node.kind() !== "call_expression") return;
+		if (node.kind() !== "call_expression") continue;
 		const fn = node.field("function");
 		if (
 			fn?.kind() !== "member_expression" ||
 			identifier(fn.field("object")) !== name
 		)
-			return;
-		if (!["set", "add"].includes(fn.field("property")?.text() ?? "")) return;
+			continue;
+		if (!["set", "add"].includes(fn.field("property")?.text() ?? "")) continue;
 		const key = node.field("arguments")?.namedChildren()[0];
 		// Literal keys/entries can be vocabulary initialization. Every other
 		// expression is dynamic, including an opaque identifier such as `key`;
 		// do not turn the AST population into a path-name heuristic (#2981).
-		if (!key) return;
-		if (isLiteralVocabularyValue(key)) return;
+		if (!key) continue;
+		if (isLiteralVocabularyValue(key)) continue;
 		// A non-literal write is growth-shaped regardless of where the AST puts
 		// it. Module-scope writes are unusual, but filtering them by function
 		// ancestry loses the same arbitrary-key evidence as filtering by a
 		// filename-shaped identifier (#2981 / BCG-1-R1).
 		written = true;
-	});
+	}
 	return declared && (!builtin || written);
 }
 
-function keyExpressionFor(source: string, name: string): string | undefined {
-	const root = parse(Lang.TypeScript, source).root();
+function keyExpressionFor(nodes: any[], name: string): string | undefined {
 	let expression: string | undefined;
-	walk(root, (node) => {
+	for (const node of nodes) {
 		if (expression || node.kind() === "subscript_expression") {
 			if (
 				node.kind() === "subscript_expression" &&
 				identifier(node.field("argument")) === name
 			)
 				expression = node.field("index")?.text();
-			return;
+			continue;
 		}
-		if (node.kind() !== "call_expression") return;
+		if (node.kind() !== "call_expression") continue;
 		const fn = node.field("function");
 		if (
 			fn?.kind() !== "member_expression" ||
@@ -144,9 +164,9 @@ function keyExpressionFor(source: string, name: string): string | undefined {
 				fn.field("property")?.text() ?? "",
 			)
 		)
-			return;
+			continue;
 		expression = node.field("arguments")?.namedChildren()[0]?.text();
-	});
+	}
 	return expression;
 }
 
@@ -201,18 +221,17 @@ export function determineKeyAxis(expression: string | undefined): KeyAxis {
 	return axis;
 }
 
-export function hasBoundedConstructor(source: string, name: string): boolean {
-	const root = parse(Lang.TypeScript, source).root();
+export function hasBoundedConstructor(nodes: any[], name: string): boolean {
 	let result = false;
-	walk(root, (node) => {
+	for (const node of nodes) {
 		if (
 			result ||
 			node.kind() !== "variable_declarator" ||
 			identifier(node.field("name")) !== name
 		)
-			return;
+			continue;
 		const value = node.field("value");
-		if (value?.kind() !== "new_expression") return;
+		if (value?.kind() !== "new_expression") continue;
 		const ctor = identifier(value.field("constructor"));
 		if (
 			["BoundedFifoMap", "BoundedLruCache", "BoundedSet"].includes(ctor ?? "")
@@ -223,18 +242,17 @@ export function hasBoundedConstructor(source: string, name: string): boolean {
 			(value.field("arguments")?.namedChildren().length ?? 0) >= 2
 		)
 			result = true;
-	});
+	}
 	return result;
 }
 
-export function hasNamedSizeComparison(source: string, name: string): boolean {
-	const root = parse(Lang.TypeScript, source).root();
+export function hasNamedSizeComparison(nodes: any[], name: string): boolean {
 	let result = false;
-	walk(root, (node) => {
-		if (result || node.kind() !== "binary_expression") return;
+	for (const node of nodes) {
+		if (result || node.kind() !== "binary_expression") continue;
 		const left = node.field("left");
 		if (![">", ">=", "<", "<="].includes(node.field("operator")?.text() ?? ""))
-			return;
+			continue;
 		if (
 			identifier(left?.field("object")) === name &&
 			left?.field("property")?.text() === "size" &&
@@ -267,22 +285,21 @@ export function hasNamedSizeComparison(source: string, name: string): boolean {
 				parent = parent.parent();
 			}
 		}
-	});
+	}
 	return result;
 }
 
-export function hasDeletingTimer(source: string, name: string): boolean {
-	const root = parse(Lang.TypeScript, source).root();
+export function hasDeletingTimer(nodes: any[], name: string): boolean {
 	let result = false;
-	walk(root, (node) => {
-		if (result || node.kind() !== "call_expression") return;
+	for (const node of nodes) {
+		if (result || node.kind() !== "call_expression") continue;
 		const fn = node.field("function");
 		if (
 			fn?.kind() !== "member_expression" ||
 			fn.field("property")?.text() !== "delete" ||
 			identifier(fn.field("object")) !== name
 		)
-			return;
+			continue;
 		let parent = node.parent();
 		while (parent) {
 			if (
@@ -292,7 +309,7 @@ export function hasDeletingTimer(source: string, name: string): boolean {
 				result = true;
 			parent = parent.parent();
 		}
-	});
+	}
 	return result;
 }
 
@@ -316,27 +333,30 @@ export function scan(
 			const source = fs.readFileSync(absolute, "utf8");
 			const key = path.relative(scanRoot, absolute).split(path.sep).join("/");
 			const candidate = candidates.get(key);
-			for (const container of candidate?.containerDetails ?? []) {
+			const containers = candidate?.containerDetails ?? [];
+			if (containers.length === 0) continue;
+			// Parsed and walked once for the whole file and shared by every
+			// container in it, and the source lines split once (#3058).
+			const nodes = parseNodes(source);
+			const lines = source.split("\n");
+			for (const container of containers) {
 				scanned++;
-				if (!isGrowthShapedContainer(source, container.name)) continue;
-				const verdict: Verdict = hasBoundedConstructor(source, container.name)
+				if (!isGrowthShapedContainer(nodes, container.name)) continue;
+				const verdict: Verdict = hasBoundedConstructor(nodes, container.name)
 					? 1
-					: hasNamedSizeComparison(source, container.name)
+					: hasNamedSizeComparison(nodes, container.name)
 						? 2
-						: hasDeletingTimer(source, container.name)
+						: hasDeletingTimer(nodes, container.name)
 							? 3
 							: 5;
+				const keyExpression = keyExpressionFor(nodes, container.name);
 				sites.push({
-					key: stableOccurrenceKey(
-						relative,
-						source.split("\n"),
-						container.line - 1,
-					),
+					key: stableOccurrenceKey(relative, lines, container.line - 1),
 					detail: `${relative}:${container.line}`,
 					name: container.name,
 					verdict,
-					keyExpression: keyExpressionFor(source, container.name),
-					keyAxis: determineKeyAxis(keyExpressionFor(source, container.name)),
+					keyExpression,
+					keyAxis: determineKeyAxis(keyExpression),
 				});
 			}
 		}
@@ -680,31 +700,39 @@ describe("#2981 long-lived containers are bounded or admitted", () => {
 	it("accepts semantic bounds and rejects read-only TTL prose", () => {
 		expect(
 			hasBoundedConstructor(
-				"const cache = new BoundedFifoMap<string, string>(8);",
+				parseNodes("const cache = new BoundedFifoMap<string, string>(8);"),
 				"cache",
 			),
 		).toBe(true);
 		expect(
 			hasNamedSizeComparison(
-				"const cache = new Map<string, string>(); if (cache.size > MAX) log(cache.size);",
+				parseNodes(
+					"const cache = new Map<string, string>(); if (cache.size > MAX) log(cache.size);",
+				),
 				"cache",
 			),
 		).toBe(false);
 		expect(
 			hasNamedSizeComparison(
-				'const cache = new Map<string, string>(); const MAX = 8; if (cache.size > MAX) cache.delete("x");',
+				parseNodes(
+					'const cache = new Map<string, string>(); const MAX = 8; if (cache.size > MAX) cache.delete("x");',
+				),
 				"cache",
 			),
 		).toBe(true);
 		expect(
 			hasDeletingTimer(
-				'const cache = new Map<string, string>(); setTimeout(() => cache.delete("x"), TTL);',
+				parseNodes(
+					'const cache = new Map<string, string>(); setTimeout(() => cache.delete("x"), TTL);',
+				),
 				"cache",
 			),
 		).toBe(true);
 		expect(
 			hasDeletingTimer(
-				'const cache = new Map<string, string>(); const TTL = 8; if (Date.now() > TTL) cache.get("x");',
+				parseNodes(
+					'const cache = new Map<string, string>(); const TTL = 8; if (Date.now() > TTL) cache.get("x");',
+				),
 				"cache",
 			),
 		).toBe(false);
@@ -712,7 +740,9 @@ describe("#2981 long-lived containers are bounded or admitted", () => {
 	it("keeps dynamic keys and values visible as undetermined", () => {
 		expect(
 			isGrowthShapedContainer(
-				"const cache = new Map(); function put(key, value) { cache.set(makeKey(key), makeValue(value)); }",
+				parseNodes(
+					"const cache = new Map(); function put(key, value) { cache.set(makeKey(key), makeValue(value)); }",
+				),
 				"cache",
 			),
 		).toBe(true);
@@ -720,20 +750,30 @@ describe("#2981 long-lived containers are bounded or admitted", () => {
 	});
 	it("excludes lifecycle singletons and never-written literal vocabularies", () => {
 		expect(
-			isGrowthShapedContainer("const client = new GoClient();", "client"),
-		).toBe(false);
-		expect(
-			isGrowthShapedContainer('const names = new Set(["ts", "js"]);', "names"),
+			isGrowthShapedContainer(
+				parseNodes("const client = new GoClient();"),
+				"client",
+			),
 		).toBe(false);
 		expect(
 			isGrowthShapedContainer(
-				'const names = new Set(["ts"]); const add = () => names.add(filePath);',
+				parseNodes('const names = new Set(["ts", "js"]);'),
+				"names",
+			),
+		).toBe(false);
+		expect(
+			isGrowthShapedContainer(
+				parseNodes(
+					'const names = new Set(["ts"]); const add = () => names.add(filePath);',
+				),
 				"names",
 			),
 		).toBe(true);
 		expect(
 			isGrowthShapedContainer(
-				'const names = new Set(); const add = () => names.add("ts");',
+				parseNodes(
+					'const names = new Set(); const add = () => names.add("ts");',
+				),
 				"names",
 			),
 		).toBe(false);
@@ -744,8 +784,9 @@ describe("#2981 long-lived containers are bounded or admitted", () => {
 			"// cache.size > MAX and setTimeout(() => cache.delete(key))",
 			'const note = "cache.size > MAX; cache.delete(key)";',
 		].join("\n");
-		expect(hasNamedSizeComparison(prose, "cache")).toBe(false);
-		expect(hasDeletingTimer(prose, "cache")).toBe(false);
+		const proseNodes = parseNodes(prose);
+		expect(hasNamedSizeComparison(proseNodes, "cache")).toBe(false);
+		expect(hasDeletingTimer(proseNodes, "cache")).toBe(false);
 	});
 	it("keeps the registry and population floors mutation-sensitive", () => {
 		const floor = auditRegistry({

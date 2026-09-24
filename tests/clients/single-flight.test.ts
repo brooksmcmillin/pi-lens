@@ -433,6 +433,7 @@ describe("singleFlight — reentrancy", () => {
 		const outer = await sf.run("k", fn);
 		expect(calls).toBe(1);
 		expect(outer).toBe(1);
-		expect(await inner).toBe(1);
+		expect(inner).not.toBeNull();
+		expect(await inner!).toBe(1);
 	});
 });

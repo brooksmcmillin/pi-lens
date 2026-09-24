@@ -107,7 +107,7 @@ describe("getDiagnostics — mode-aware grace (1B)", () => {
 		// Fast resolves at 100ms — grace timer (400ms) starts.
 		await vi.advanceTimersByTimeAsync(100);
 		let resolved = false;
-		p.then(() => {
+		void p.then(() => {
 			resolved = true;
 		});
 		await vi.advanceTimersByTimeAsync(1);
@@ -144,7 +144,7 @@ describe("getDiagnostics — mode-aware grace (1B)", () => {
 		const p = svc.getDiagnostics(FILE); // default "full"
 		await vi.advanceTimersByTimeAsync(50);
 		let resolved = false;
-		p.then(() => {
+		void p.then(() => {
 			resolved = true;
 		});
 		await vi.advanceTimersByTimeAsync(1);
@@ -184,7 +184,7 @@ describe("getDiagnostics — result-aware racing (1E)", () => {
 
 		await vi.advanceTimersByTimeAsync(50);
 		let resolved = false;
-		p.then(() => {
+		void p.then(() => {
 			resolved = true;
 		});
 		await vi.advanceTimersByTimeAsync(1);
@@ -215,7 +215,7 @@ describe("getDiagnostics — result-aware racing (1E)", () => {
 		const p = svc.getDiagnostics(FILE, "document");
 		await vi.advanceTimersByTimeAsync(100);
 		let resolved = false;
-		p.then(() => {
+		void p.then(() => {
 			resolved = true;
 		});
 		await vi.advanceTimersByTimeAsync(1);

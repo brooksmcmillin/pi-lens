@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
 	GITHUB_TOOLS,
 	GitHubToolId,
+	TOOLS,
 	resolveGitHubAssetLauncher,
 } from "../../../clients/installer/index.js";
 
@@ -19,6 +20,20 @@ describe("GitHub release asset selection", () => {
 		["cljfmt", "darwin", "arm64", "standalone.jar", "java"],
 		["cljfmt", "linux", "arm64", "standalone.jar", "java"],
 		["cljfmt", "linux", "x64", "linux-amd64-static.tar.gz", undefined],
+		[
+			"typstyle",
+			"linux",
+			"x64",
+			"typstyle-x86_64-unknown-linux-gnu",
+			undefined,
+		],
+		[
+			"tinymist",
+			"win32",
+			"arm64",
+			"tinymist-aarch64-pc-windows-msvc.zip",
+			undefined,
+		],
 	] as const)(
 		"maps %s %s/%s asset %s to launcher %s",
 		(toolId, platform, _arch, asset, launcher) => {
@@ -201,6 +216,22 @@ describe("GitHub release asset selection", () => {
 				await import("../../../clients/installer/index.js");
 			expect(resolveGitHubAsset("terragrunt", platform, arch)).toBe(expected);
 		});
+	});
+
+	it("treats typstyle release assets as bare binaries", async () => {
+		const { resolveGitHubArchiveBinaryCandidates } =
+			await import("../../../clients/installer/index.js");
+		// Prevent recurrence of #3037: typstyle release assets are bare binaries,
+		// so the registry must not reintroduce a misleading archive member name.
+		const typstyle = TOOLS.find((tool) => tool.id === "typstyle");
+		expect(typstyle?.github?.binaryInArchive).toBeUndefined();
+		expect(
+			resolveGitHubArchiveBinaryCandidates(
+				"typstyle",
+				"linux",
+				"typstyle-x86_64-unknown-linux-gnu",
+			),
+		).toEqual(["typstyle"]);
 	});
 
 	describe("windows archive binary names", () => {

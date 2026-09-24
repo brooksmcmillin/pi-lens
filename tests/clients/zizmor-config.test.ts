@@ -69,7 +69,7 @@ describe("isZizmorAuditTarget (#636)", () => {
 describe("findLocalZizmorConfig (#272)", () => {
 	let root: string;
 	beforeEach(() => {
-		root = fs.mkdtempSync(path.join(os.tmpdir(), "zizmor-cfg-"));
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-zizmor-cfg-"));
 	});
 	afterEach(() => {
 		removeTempDirSync(root);

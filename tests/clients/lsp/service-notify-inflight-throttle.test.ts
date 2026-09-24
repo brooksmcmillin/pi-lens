@@ -582,7 +582,9 @@ describe("#1714 — sweep notify volume must not out-run an auxiliary", () => {
 		// same volume, so a scanner at its ceiling must be left out of the burst
 		// rather than handed the whole chunk on top of what it already holds.
 		process.env.PI_LENS_LSP_AUX_NOTIFY_INFLIGHT = "2";
-		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "inflight-preopen-"));
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-inflight-preopen-"),
+		);
 		try {
 			for (let i = 0; i < 12; i += 1) {
 				fs.writeFileSync(path.join(tmp, `f${i}.ts`), "export const x = 1;\n");

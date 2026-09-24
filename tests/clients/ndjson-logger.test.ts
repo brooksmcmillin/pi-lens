@@ -43,7 +43,7 @@ let logFile: string;
 
 beforeEach(() => {
 	resetDegradationLedger();
-	tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ndjson-logger-"));
+	tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-ndjson-logger-"));
 	logFile = path.join(tmpDir, "test.log");
 });
 

@@ -81,9 +81,12 @@ migrate-*.js
 !CONTRIBUTING.md
 !LICENSE
 !SECURITY.md
+!docs/adr/*.md
+!docs/engineering-principles.md
 !docs/pi-lens-subagent.md
 !docs/pi-lens-monitor.md
 !docs/pi-lens-fixer.md
+!docs/pi-lens-retro.md
 !docs/pi-lens-reviewer.md
 !docs/pi-lens-investigator.md
 !docs/pi-lens-warden.md

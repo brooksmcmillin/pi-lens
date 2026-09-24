@@ -10,6 +10,11 @@ jobs:
   mutation:
     name: mutation (advisory)
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default. This job runs
+    # on pull_request so --branch master matched no runs; measured max over the
+    # last 8 successful runs regardless of branch: 2184s (36m24s, run 35117203202,
+    # the stryker-diff.mjs step itself); sized at ~2x + margin.
+    timeout-minutes: 90
     continue-on-error: true
     permissions:
       contents: read

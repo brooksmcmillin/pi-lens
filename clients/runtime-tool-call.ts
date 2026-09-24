@@ -9,7 +9,7 @@ import { evaluateGitGuard, isGitCommitOrPushAttempt } from "./git-guard.js";
 import { dropHashlineAnchorMemo } from "./hashline-anchor.js";
 import { evaluateSharedCheckoutGuard } from "./shared-checkout-guard.js";
 import { logLatency } from "./latency-logger.js";
-import { normalizeMapKey } from "./path-utils.js";
+import { normalizeMapKey, toPosix } from "./path-utils.js";
 import {
 	captureFileStats,
 	getOpaqueBaselineStore,
@@ -246,7 +246,12 @@ function shouldSkipLspAutoTouch(
 	filePath: string,
 	projectRoot: string,
 ): boolean {
-	const normalized = path.resolve(filePath).replace(/\\/g, "/").toLowerCase();
+	// #1193 P3: the separator fold is `toPosix`, not a fourth inline copy of
+	// `.replace(/\\/g, "/")`. The `toLowerCase` stays and is NOT a path-key case
+	// fold: `normalized` is never a map key, only the haystack for the
+	// lowercase marker substrings below, which must match a mis-cased spelling
+	// of the same marker directory on a case-insensitive filesystem.
+	const normalized = toPosix(path.resolve(filePath)).toLowerCase();
 	const base = path.basename(filePath).toLowerCase();
 
 	if (normalized.includes("/.pi-lens/")) return true;
@@ -1356,11 +1361,32 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 				entry.correctedMatchCount === 1
 			) {
 				entry.apply(entry.corrected);
+				// The same unique-match span the synthetic-read bridge below
+				// resolves, computed once and reused: it also anchors the
+				// interior-mask lexer to the real file (#3116 review round 2,
+				// F1) so a template literal the oldText fragment crosses the
+				// boundary of is read correctly instead of ambiguously — a
+				// fragment-only lexer can misread which side of a boundary a
+				// line falls on when the fragment doesn't carry the opener or
+				// closer that resolves it. Falls back to fragment-only masking
+				// inside retargetReplacementIndentation when no unique span is
+				// found (file unreadable, or the corrected text isn't unique in
+				// the host's fuzzy-match space).
+				const matchedRange =
+					matchNormalizedContent !== undefined
+						? findUniqueMatchLineRange(matchNormalizedContent, entry.corrected)
+						: undefined;
 				const correctedNewText = entry.newText
 					? retargetReplacementIndentation(
 							entry.newText,
 							entry.value,
 							entry.corrected,
+							matchNormalizedContent !== undefined && matchedRange
+								? {
+										content: matchNormalizedContent,
+										startLine: matchedRange.startLine,
+									}
+								: undefined,
 						)
 					: undefined;
 				if (correctedNewText !== undefined) {
@@ -1382,10 +1408,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 				// for the matched range so a zero_read block downstream isn't
 				// thrown after the autopatch already verified the content.
 				if (matchNormalizedContent !== undefined && runtime.readGuard) {
-					const range = findUniqueMatchLineRange(
-						matchNormalizedContent,
-						entry.corrected,
-					);
+					const range = matchedRange;
 					if (range) {
 						runtime.readGuard.recordRead({
 							filePath,

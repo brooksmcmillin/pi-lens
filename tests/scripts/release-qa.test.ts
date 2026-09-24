@@ -248,7 +248,9 @@ describe("release-QA tool-smoke install lane (#2663)", () => {
 	});
 
 	function stubSmoke(report: Record<string, unknown>, exitCode = 0) {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "release-qa-smoke-"));
+		const root = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-release-qa-smoke-"),
+		);
 		const scripts = path.join(root, "scripts");
 		fs.mkdirSync(scripts);
 		fs.writeFileSync(
@@ -266,7 +268,7 @@ describe("release-QA tool-smoke install lane (#2663)", () => {
 			results: [{ toolId: "dead-tool", state: "fail", detail: "E404" }],
 		});
 		const installedRoot = fs.mkdtempSync(
-			path.join(os.tmpdir(), "release-qa-installed-"),
+			path.join(os.tmpdir(), "pi-lens-release-qa-installed-"),
 		);
 		try {
 			const raw = runToolSmokeInstallProbe({
@@ -301,7 +303,7 @@ describe("release-QA tool-smoke install lane (#2663)", () => {
 			1,
 		);
 		const installedRoot = fs.mkdtempSync(
-			path.join(os.tmpdir(), "release-qa-installed-"),
+			path.join(os.tmpdir(), "pi-lens-release-qa-installed-"),
 		);
 		try {
 			const raw = runToolSmokeInstallProbe({
@@ -320,10 +322,10 @@ describe("release-QA tool-smoke install lane (#2663)", () => {
 
 	it("passes the distinct installed root to the export smoke process", () => {
 		const exportRoot = fs.mkdtempSync(
-			path.join(os.tmpdir(), "release-qa-export-"),
+			path.join(os.tmpdir(), "pi-lens-release-qa-export-"),
 		);
 		const installedRoot = fs.mkdtempSync(
-			path.join(os.tmpdir(), "release-qa-installed-"),
+			path.join(os.tmpdir(), "pi-lens-release-qa-installed-"),
 		);
 		fs.mkdirSync(path.join(exportRoot, "scripts"));
 		fs.writeFileSync(
@@ -448,7 +450,7 @@ describe("release-QA publish toolchain lane (#2940)", () => {
 
 	it("marks a pinned npm resolution failure as unmeasured", () => {
 		const root = fs.mkdtempSync(
-			path.join(os.tmpdir(), "release-qa-npx-unreachable-"),
+			path.join(os.tmpdir(), "pi-lens-release-qa-npx-unreachable-"),
 		);
 		try {
 			fs.writeFileSync(
@@ -501,7 +503,9 @@ describe("release-QA publish toolchain lane (#2940)", () => {
 	// the subject and nothing reaches the registry. `reports` is what the stub
 	// answers for `--version`; `dryRunExit` is the dry run's exit code.
 	function stubNpx(reports: string, dryRunExit = 0) {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "release-qa-npx-"));
+		const root = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-release-qa-npx-"),
+		);
 		const binDir = path.join(root, "bin");
 		fs.mkdirSync(binDir);
 		const argvLog = path.join(root, "argv.log");
@@ -971,7 +975,9 @@ describe("release-QA scratch hermeticity (#2619 review F1)", () => {
 		// package whose `prepare` writes through `os.homedir()` — the same shape
 		// as scripts/warm-loader-cache.mjs — through the REAL npm() helper, and
 		// checks where the record landed.
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "release-qa-canary-"));
+		const root = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-release-qa-canary-"),
+		);
 		const ambient = path.join(root, "ambient-home");
 		const fixture = path.join(root, "fixture");
 		fs.mkdirSync(ambient, { recursive: true });

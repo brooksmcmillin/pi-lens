@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { resetGlobalConfigLocationCache } from "../../clients/lens-config.js";
 import {
 	findPiLensProjectConfig,
 	loadPiLensConfigInDir,
@@ -13,6 +14,7 @@ import {
 	getDegradationSummary,
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
+import { resolveLensToolEnabled } from "../../clients/tool-config.js";
 import { removeTempDirSync } from "./test-utils.js";
 
 // #1333: these config/telemetry warnings no longer reach the terminal — pi owns
@@ -995,15 +997,26 @@ describe("a global-only setting's notice names the file the resolver actually re
 			.some((arg) => typeof arg === "string" && arg.includes(substring));
 	}
 
-	it("names the ~/.pi-lens/config.json default when PI_LENS_CONFIG_PATH is unset", () => {
-		delete process.env.PI_LENS_CONFIG_PATH;
-		fs.writeFileSync(
-			path.join(tmpDir, ".pi-lens.json"),
-			JSON.stringify({ delta: { enabled: false } }),
-		);
-		loadPiLensProjectConfig(tmpDir);
-		expect(warnedFor("set it in ~/.pi-lens/config.json")).toBe(true);
-	});
+	it.skipIf(fs.existsSync(path.join(os.homedir(), ".pi-lens", "config.json")))(
+		"names the ~/.pi-lens/config.json default when PI_LENS_CONFIG_PATH is unset",
+		() => {
+			// Premise (the skip condition above): the maintainer's real home carries
+			// no legacy config — a real one would win the grandfathering tier and
+			// change the named file. The production resolution is
+			// homedir-anchored: PI_LENS_HOME does not participate (the #2457
+			// split-brain stays a separate issue), and vitest-setup neutralizes the
+			// agent-dir env the resolution does read.
+			delete process.env.PI_LENS_CONFIG_PATH;
+			resetGlobalConfigLocationCache();
+			fs.writeFileSync(
+				path.join(tmpDir, ".pi-lens.json"),
+				JSON.stringify({ delta: { enabled: false } }),
+			);
+			loadPiLensProjectConfig(tmpDir);
+			expect(warnedFor("set it in ~/.pi-lens/config.json")).toBe(true);
+			resetGlobalConfigLocationCache();
+		},
+	);
 
 	it("names the PI_LENS_CONFIG_PATH override, not the hardcoded ~/.pi-lens/config.json", () => {
 		// Under the override the resolver reads THIS file for the global tier,
@@ -1027,5 +1040,193 @@ describe("a global-only setting's notice names the file the resolver actually re
 		// whether `tmpDir` happens to sit under the real home directory).
 		expect(warnedFor("pi-lens-config.json")).toBe(true);
 		expect(warnedFor("elsewhere")).toBe(true);
+	});
+});
+
+/**
+ * #3112 — `tools.<name>.enabled` is documented as a PROJECT-scope setting
+ * (`docs/settings.md`, `docs/globalconfig.md`) and is read out of the project
+ * document by `resolveLensToolEnabled`, but the loader's scope scan derived its
+ * accepted set from the flag registry alone. The only registry flag under
+ * `tools` is the global `tools.lazy` (`--no-lazy-tools`), so the whole `tools`
+ * section landed in `globalScopeOnlyKeys` and every project-scope per-tool
+ * override was announced as `ignoring invalid project config … "tools" is a
+ * global-only pi-lens setting … ignored` (`PILENS_CFG_0001`) — a warning that
+ * told the user their honoured setting was being dropped.
+ *
+ * `tools` is a MIXED-SCOPE section: the per-tool leaves are project-owned and
+ * validated by `readToolConfig` against `TOOL_REGISTRY`; `tools.lazy` is not.
+ */
+describe("project-scope tools.<name>.enabled (#3112)", () => {
+	function warnedFor(substring: string): boolean {
+		return (console.error as ReturnType<typeof vi.fn>).mock.calls
+			.flat()
+			.some((arg) => typeof arg === "string" && arg.includes(substring));
+	}
+
+	function warnCountFor(substring: string): number {
+		return (console.error as ReturnType<typeof vi.fn>).mock.calls
+			.flat()
+			.filter((arg) => typeof arg === "string" && arg.includes(substring))
+			.length;
+	}
+
+	it("accepts a per-tool override with no ignored-config warning, and it takes effect", () => {
+		fs.writeFileSync(
+			path.join(tmpDir, ".pi-lens.json"),
+			JSON.stringify({ tools: { ast_grep_replace: { enabled: false } } }),
+		);
+		const cfg = loadPiLensProjectConfig(tmpDir);
+		expect(warnedFor('"tools" is a global-only')).toBe(false);
+		expect(warnedFor("ignoring invalid project config")).toBe(false);
+		expect(console.error).not.toHaveBeenCalled();
+		// Effective through the production resolver the pi and MCP hosts call.
+		expect(resolveLensToolEnabled("ast_grep_replace", undefined, cfg.raw)).toBe(
+			false,
+		);
+		expect(resolveLensToolEnabled("symbol_search", undefined, cfg.raw)).toBe(
+			true,
+		);
+	});
+
+	it("still says tools.lazy is global-only at project scope", () => {
+		// The other half of a mixed-scope section: `tools.lazy` IS `scope:
+		// "global"` (`--no-lazy-tools`), and `readToolConfig` skips it, so without
+		// the sub-key scan a project file setting it would be ignored in silence —
+		// the #2426 review-round-2 F3 defect (`lsp.enabled`) arriving through a
+		// second namespace.
+		fs.writeFileSync(
+			path.join(tmpDir, ".pi-lens.json"),
+			JSON.stringify({ tools: { lazy: false } }),
+		);
+		loadPiLensProjectConfig(tmpDir);
+		expect(warnedFor('"tools.lazy" is a global-only')).toBe(true);
+		expect(warnedFor('unknown key "tools.lazy"')).toBe(false);
+	});
+
+	it("reports a MALFORMED global-only sub-key too — presence, not validity", () => {
+		// `{"tools":{"lazy":"yes"}}` is a global-only setting written in a project
+		// file exactly as `false` would be, and the user deserves the same notice.
+		// Resolving the key by its VALUE (`readFlagConfigValue`, which returns
+		// `undefined` for a non-boolean leaf) would drop this one in silence, so
+		// the scan asks `hasFlagConfigPath` whether the key is PRESENT.
+		fs.writeFileSync(
+			path.join(tmpDir, ".pi-lens.json"),
+			JSON.stringify({ tools: { lazy: "yes" } }),
+		);
+		loadPiLensProjectConfig(tmpDir);
+		expect(warnedFor('"tools.lazy" is a global-only')).toBe(true);
+	});
+
+	it("reports a global-only sub-key ONCE, however many scans see it", () => {
+		// `lsp.enabled` is reported by the enumerated-honored-keys scan AND by the
+		// mixed-scope scan, with the same key and the same reason; the warn-once
+		// latch is what collapses them. This pins that: it is why the mixed-scope
+		// loop needs no per-namespace skip, and it is the assertion that reds if a
+		// future scan grows a second spelling for one setting.
+		fs.writeFileSync(
+			path.join(tmpDir, ".pi-lens.json"),
+			JSON.stringify({ lsp: { enabled: false, disabledServers: ["go"] } }),
+		);
+		loadPiLensProjectConfig(tmpDir);
+		expect(warnCountFor('"lsp.enabled" is a global-only')).toBe(1);
+	});
+
+	it("leaves an unknown tool name to readToolConfig — one notice, not two", () => {
+		// `readToolConfig` already reports an unrecognized tool name with its own
+		// code (`PILENS_CFG_0009`). A second, generic "check for a typo" notice
+		// from the scope scan for the same key is the duplicate-notice noise
+		// #2426 review round 6 called out.
+		fs.writeFileSync(
+			path.join(tmpDir, ".pi-lens.json"),
+			JSON.stringify({ tools: { no_such_tool: { enabled: false } } }),
+		);
+		loadPiLensProjectConfig(tmpDir);
+		expect(warnedFor("is not a recognized pi-lens tool")).toBe(true);
+		expect(warnCountFor("no_such_tool")).toBe(1);
+	});
+
+	it("keeps warning about a genuinely global-only section", () => {
+		// The scope table did not get looser: a section with no project-scoped
+		// surface at all still reports itself.
+		fs.writeFileSync(
+			path.join(tmpDir, ".pi-lens.json"),
+			JSON.stringify({
+				tools: { ast_grep_replace: { enabled: false } },
+				delta: { enabled: false },
+			}),
+		);
+		loadPiLensProjectConfig(tmpDir);
+		expect(warnedFor('"delta" is a global-only')).toBe(true);
+		expect(warnedFor('"tools" is a global-only')).toBe(false);
+		// Once, as the SECTION — the mixed-scope scan must not report
+		// `delta.enabled` as a second notice for the same setting.
+		expect(warnCountFor("delta")).toBe(1);
+	});
+});
+
+describe("non-flag global-only key inside a mixed-scope section (#3131)", () => {
+	function warnedFor(substring: string): boolean {
+		return (console.error as ReturnType<typeof vi.fn>).mock.calls
+			.flat()
+			.some((arg) => typeof arg === "string" && arg.includes(substring));
+	}
+
+	function warnCountFor(substring: string): number {
+		return (console.error as ReturnType<typeof vi.fn>).mock.calls
+			.flat()
+			.filter((arg) => typeof arg === "string" && arg.includes(substring))
+			.length;
+	}
+
+	it("warns that actionableWarnings.autoFix.maxFixes is global-only, and drops the value", () => {
+		// `actionableWarnings` is recognized at project scope only because its
+		// SIBLING `autoFix.enabled` is a project-scoped flag — `maxFixes` is not a
+		// `LENS_FLAGS` entry at all (no CLI flag, not boolean), documented global
+		// (docs/settings.md), read only through
+		// `getGlobalActionableWarningMaxFixes()`. Before #3131 it was parsed away
+		// with no signal.
+		fs.writeFileSync(
+			path.join(tmpDir, ".pi-lens.json"),
+			JSON.stringify({
+				actionableWarnings: { autoFix: { enabled: true, maxFixes: 99 } },
+			}),
+		);
+		const cfg = loadPiLensProjectConfig(tmpDir);
+		expect(
+			warnedFor('"actionableWarnings.autoFix.maxFixes" is a global-only'),
+		).toBe(true);
+		expect(warnCountFor("actionableWarnings.autoFix.maxFixes")).toBe(1);
+		// The value never reaches the parsed project config — same non-goal #3126
+		// left this key with: the notice is new, the scope is not.
+		expect(
+			(cfg.actionableWarnings?.autoFix as { maxFixes?: number } | undefined)
+				?.maxFixes,
+		).toBeUndefined();
+		expect(cfg.actionableWarnings?.autoFix?.enabled).toBe(true);
+	});
+
+	it("control: the project-scoped sibling autoFix.enabled stays silent", () => {
+		fs.writeFileSync(
+			path.join(tmpDir, ".pi-lens.json"),
+			JSON.stringify({ actionableWarnings: { autoFix: { enabled: false } } }),
+		);
+		const cfg = loadPiLensProjectConfig(tmpDir);
+		expect(warnedFor("global-only")).toBe(false);
+		expect(console.error).not.toHaveBeenCalled();
+		expect(cfg.actionableWarnings?.autoFix?.enabled).toBe(false);
+	});
+
+	it("does not duplicate the notice alongside a genuinely global-only sibling section", () => {
+		fs.writeFileSync(
+			path.join(tmpDir, ".pi-lens.json"),
+			JSON.stringify({
+				actionableWarnings: { autoFix: { enabled: true, maxFixes: 1 } },
+				delta: { enabled: false },
+			}),
+		);
+		loadPiLensProjectConfig(tmpDir);
+		expect(warnCountFor("actionableWarnings.autoFix.maxFixes")).toBe(1);
+		expect(warnCountFor('"delta" is a global-only')).toBe(1);
 	});
 });

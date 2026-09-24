@@ -60,7 +60,6 @@
  *   `codeMatches`.
  */
 
-import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Lang, parse } from "@ast-grep/napi";
@@ -70,6 +69,7 @@ import {
 	codeMatches,
 	firstCommentMatch,
 	listSourceFiles,
+	readWalkedFile,
 	relativePosix,
 	stripSource,
 } from "./sweep-kit.js";
@@ -656,7 +656,10 @@ export function countsByDetector(
 		): void => {
 			const file = testsRelative(absolute);
 			if (SCAN_INFRASTRUCTURE.has(file)) return;
-			const source = fs.readFileSync(absolute, "utf8");
+			// readWalkedFile: a path that vanished between the walk and the read
+			// is out of the population, not a finding (#3082).
+			const source = readWalkedFile(absolute);
+			if (source === undefined) return;
 			const context = scanContext(source);
 			for (const name of detectors) {
 				const hits = DETECTORS[name](file, source, context);

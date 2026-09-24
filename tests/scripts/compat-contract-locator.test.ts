@@ -28,7 +28,7 @@ describe("locateContractSource", () => {
 
 	beforeEach(() => {
 		packageDir = fs.mkdtempSync(
-			path.join(os.tmpdir(), "compat-locator-fixture-"),
+			path.join(os.tmpdir(), "pi-lens-compat-locator-fixture-"),
 		);
 	});
 
@@ -141,7 +141,7 @@ describe("locateContractSources", () => {
 
 	beforeEach(() => {
 		packageDir = fs.mkdtempSync(
-			path.join(os.tmpdir(), "compat-locator-multipart-fixture-"),
+			path.join(os.tmpdir(), "pi-lens-compat-locator-multipart-fixture-"),
 		);
 	});
 

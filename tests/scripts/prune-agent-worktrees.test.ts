@@ -1699,7 +1699,7 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 								/* the tree may already be gone */
 							}
 						}, 20);
-						cliRun.finally(() => {
+						void cliRun.finally(() => {
 							clearInterval(timer);
 							resolve();
 						});

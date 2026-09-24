@@ -26,7 +26,8 @@ const mypy = createAvailabilityChecker("mypy", "");
 // [syntax]`). A bad flag or unreadable config also exits 2, but writes its
 // message to STDERR and leaves stdout empty.
 //
-// So the exit code cannot separate the two, and the STREAM does: the gate below
+// EXIT TABLE (mypy 1.11 docs https://mypy.readthedocs.io/en/stable/command_line.html): 0 clean; 1 findings; 2 findings/error; other
+// nonzero rejected. The exit code cannot separate the two, and the STREAM does:
 // judges "nothing to parse" on stdout alone, while the parser still reads both.
 // The table's remaining job is to reject any OTHER nonzero status.
 const MYPY_EXIT_CODES: ToolExitCodes = { ran: [1, 2] };

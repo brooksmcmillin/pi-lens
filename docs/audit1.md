@@ -38,16 +38,16 @@ This document records structural inconsistencies and centralization gaps found w
 
 ---
 
-### 3. Tree-sitter query loader uses a hand-rolled YAML parser
+### 3. Tree-sitter query loader uses a hand-rolled YAML parser (partially resolved)
 
 **Files:**
-- `clients/tree-sitter-query-loader.ts` — `parseYaml()` and `extractMultilineValue()` are custom
+- `clients/tree-sitter-query-loader.ts` — `parseYaml()` now calls `yaml.load` directly (refs #3054); the hand-rolled scanner and `extractMultilineValue()` are deleted.
 - `clients/dispatch/runners/yaml-rule-parser.ts` — uses `js-yaml` for ast-grep rules
-- `scripts/validate-rule-catalog.mjs` — uses regex to scrape YAML scalars
+- `scripts/validate-rule-catalog.mjs` — still uses regex to scrape YAML scalars (unchanged by #3054; out of that PR's scope)
 
-**Impact:** The tree-sitter loader does not support multiple YAML documents per file, complex nested objects, or arrays the way `js-yaml` does. A contributor writing a tree-sitter rule with richer metadata may hit silent parse failures. The three rule loaders do not share code, so fixes and behavior diverge.
+**Impact:** `scripts/validate-rule-catalog.mjs` remains its own regex-based reader, so the tree-sitter and ast-grep rule catalogs now share one parser (`js-yaml`) while the validation script is a third, still-divergent implementation.
 
-**Recommended fix:** Replace the hand-rolled parser in `tree-sitter-query-loader.ts` with `js-yaml` (already a runtime dependency), or reuse `parseSimpleYaml` from `yaml-rule-parser.ts`.
+**Recommended fix:** Fold `scripts/validate-rule-catalog.mjs`'s scraping onto `js-yaml` too, the same shape #3054 applied to the query loader.
 
 ---
 

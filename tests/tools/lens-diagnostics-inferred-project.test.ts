@@ -51,15 +51,25 @@ vi.mock("../../clients/project-diagnostics/scanner.js", () => ({
 	scanProjectDiagnostics: vi.fn(),
 }));
 
-vi.mock("../../clients/project-diagnostics/cache.js", () => ({
-	PROJECT_DIAGNOSTICS_CACHE_VERSION: 2,
-	loadProjectDiagnosticsSnapshot: vi.fn(),
-	loadProjectDiagnosticsDeltaReport: vi.fn(),
-	reconcileProjectDiagnosticsSnapshot: (snapshot: unknown) => ({
-		snapshot,
-		staleDropped: 0,
+// #2154: the version comes from the REAL module. A hand-copied `2` here
+// silently drifted the moment the constant moved to 3, leaving these tests
+// asserting against a version production no longer writes.
+vi.mock(
+	"../../clients/project-diagnostics/cache.js",
+	async (importOriginal) => ({
+		PROJECT_DIAGNOSTICS_CACHE_VERSION: (
+			await importOriginal<
+				typeof import("../../clients/project-diagnostics/cache.js")
+			>()
+		).PROJECT_DIAGNOSTICS_CACHE_VERSION,
+		loadProjectDiagnosticsSnapshot: vi.fn(),
+		loadProjectDiagnosticsDeltaReport: vi.fn(),
+		reconcileProjectDiagnosticsSnapshot: (snapshot: unknown) => ({
+			snapshot,
+			staleDropped: 0,
+		}),
 	}),
-}));
+);
 
 // Spread the real module rather than hand-listing its exports; see the same
 // note in tests/tools/lens-diagnostics-rule-policy.test.ts.

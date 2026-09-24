@@ -12,6 +12,41 @@ instructions say so.
 
 ## Standing procedure
 
+### Standard mechanics
+
+- Commit the code as soon as the targeted suite is green, then add evidence in
+  a later commit. A worker can be settled mid-evidence-pass; on PR #3268 the
+  orchestrator had to commit the tree.
+- A whole-module `vi.mock` of a production module must spread `importOriginal`.
+  Run `tests/config/vi-mock-export-sweep.test.ts`.
+- Exact-pin sweeps and merge state: `tests/config/glossary-synonym-sweep.test.ts`
+  (#3279) pins the live retired-synonym identifier population per (term, file)
+  exactly, in both directions. If a change adds or removes one of the pinned
+  identifier uses, run the sweep on the head and on the merge of
+  `origin/master` + head before pushing, then re-pin in the same PR using the
+  sweep's own `UNPINNED`/`STALE` output. On 2026-09-23, two green PRs merged
+  red (#3279's pins predated #3283, leaving master red until #3288), and #3284
+  was red on its own `path` count changes (cue-vet 5→6, dart-analyze 6→4)
+  until an orchestrator trailing commit re-pinned.
+
+### Failure list before code
+
+Before the first edit of any fix, write the list of ways the change could fail
+(the directions the mutation table will later prove) in the PR body. The
+mutation table is that list with transcripts, never a list invented after the
+code. This week's evidence: #3252 r1 shipped an exit table whose inverse
+direction (nonzero WITH findings) was never listed and was caught by the
+reviewer.
+
+Seams are named in the brief before the round; no test is written at an
+unconfirmed seam — a fixer that needs a new seam stops and reports it as a
+finding, not as a test.
+
+A fix round does not deepen: no refactor, no helper extraction, no rename
+beyond the fix's own lines; deepening is its own slice under the owning
+umbrella. #3254 and #3256 stayed inside their briefs; #3178's four rounds show
+the cost of not doing so.
+
 1. `gh issue view <N>` with comments — the issue body is the spec; its
    acceptance criteria are the contract. Read AGENTS.md, especially
    "Recurring defect shapes — screen against these BEFORE you write code",
@@ -28,12 +63,20 @@ instructions say so.
    2026-09-03 wave six of six first-round PRs shipped at least one guard whose
    removal left the suite green while the box was ticked. If a guard cannot
    be made to red, it does not need to exist — delete it.
+   Quote the mutation TABLE, one row per direction per new conditional — a
+   single quoted direction proves only that direction, not the guard (#3156
+   r2 and #3168 r1 each shipped a one-directional pin under a ticked box).
    Platform rule: a test that asserts a Windows-only property runs ONLY on
    Windows dev boxes; the authoritative Unit tests lane is ubuntu. Every
    `skipIf(process.platform …)` names the lane that runs it or reads
    `// lane: dev-box-only`; a cross-platform variant through the test's own
    seam is preferred whenever the divergence is a technique artifact, not a
    real platform difference.
+   A platform-skip claim for a case-variant fixture (APFS, a case-insensitive
+   mount) is measured, not asserted: probe the real filesystem for the
+   collision before writing the skip, and create the sibling fixture case
+   AFTER the probe confirms it, never before (#3159 r2: both fixer and
+   reviewer asserted a skip that redded EEXIST on the first real macOS run).
    **Premise first.** When the issue reports a defect, reproduce it from the
    PRODUCTION call path before writing any fix — drive the real context
    builder / dispatcher / loader, never a hand-fed input shaped to hit the
@@ -70,6 +113,10 @@ instructions say so.
    `sweep-floor-coverage` red). A red is environmental ONLY when the same
    file is red on `origin/master` in the same tree — run it there and quote
    both results, or treat it as yours.
+   Tear the tree down in this order: `rm node_modules` (unlinks the symlink;
+   never `rm -r`), then `git worktree remove`. `git worktree remove --force`
+   follows the symlink and empties the main checkout's install — it did so
+   twice on 2026-09-16 (#2704 class), breaking every other live lane's build.
    Commit after every proven step, on your branch, before the next probe. Two
    trees lost uncommitted work the same day: #2358's was removed by a prune
    that saw a branch with no commits, and #2518 r2's edits died under a
@@ -108,6 +155,11 @@ instructions say so.
    your index. Three agents lost work to this in one night. After any bulk
    restore, run `git status` and re-verify your edits survived; if they did
    not, re-apply from context and commit immediately.
+   A restore command names the mutated SOURCE path only — `clients`, `tools`,
+   wherever the guard lives — never `tests`: `git checkout HEAD -- clients
+   tests` wiped the round's own tests along with the source (#3166 r2).
+   Committing tests before the mutation loop is what makes that recoverable
+   either way.
    Quote every red proof and every CI line VERBATIM from your own runs, with
    the job id for CI lines — never from memory. A worker once attributed its
    local numbers to CI as a fabricated log quote; the reviewer diffs quoted
@@ -200,8 +252,11 @@ touched, push the same branch, verify every gating check genuinely executes on
 the new head (merge origin/master first if the PR reads DIRTY — additive
 resolutions, and screen the merged result SEMANTICALLY: a textually clean merge
 can still recombine into a bug when master moved the seam you built on), and
-update the PR body with an honest review-round section. Report what changed per
-finding with its red-run evidence.
+update the PR body with an honest review-round section. Before writing that
+section, re-read the `.changelog/` fragment for any claim the round retracts —
+a fragment that still narrates the withdrawn round-1 story is a stale claim the
+reviewer will catch (#3155 r2). Report what changed per finding with its
+red-run evidence.
 
 **A mid-task message from the orchestrator carries the brief's authority when
 the issue mirrors it.** Scope additions and constraints can arrive while you
@@ -346,6 +401,19 @@ Before `npm install` or `npm ci` in an agent worktree, export
 `PILENS_DATA_DIR=<your worktree>/.probe-home`. The install lifecycle's warm
 loader log honors that home, but an explicit `PI_LENS_INSTALL_LOG` pin remains
 the clearest choice for tests that inspect the record.
+
+Pin `PI_LENS_HOME`/`PILENS_DATA_DIR` for probes and smoke scripts only — never
+as a blanket export for a `vitest` run. `tests/support/vitest-setup.ts`
+deliberately keeps the real `TMPDIR`/home for the suite; an exported override
+reds unrelated tests that then get mislabeled as environmental (#3178 r3:
+`tests/tools/lsp-diagnostics-cache.test.ts` redded under the export and was
+excluded as "environmental").
+
+Never run a full in-place Stryker mutation run in this shared or long-lived
+worktree: an interrupted run leaves the tree instrumented and unusable for
+anyone else (#3180 killed one run and left ~1,924 instrumented files behind).
+Use `--dryRunOnly` for any mutation reproduction, and never run Stryker — dry
+or full — under a kill timeout.
 
 ## Never `git add -A` (2026-09-12)
 

@@ -88,7 +88,7 @@ describe("LSPService.ensureWarmForSweep (#667)", () => {
 		vi.resetModules();
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
-		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "lsp-warmup-"));
+		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-warmup-"));
 	});
 	afterEach(() => removeTempDirSync(tmp));
 
@@ -201,7 +201,7 @@ describe("runWorkspaceDiagnostics sweep-level warm-up behavior (#667)", () => {
 		vi.resetModules();
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
-		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "lsp-warmup-sweep-"));
+		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-warmup-sweep-"));
 	});
 	afterEach(() => removeTempDirSync(tmp));
 
@@ -353,7 +353,7 @@ describe("LSPService.ensureWarmForSweep warm-up retry/skip (#744)", () => {
 		vi.resetModules();
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
-		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "lsp-warmup-744-"));
+		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-warmup-744-"));
 		// Flat, tiny per-server diagnostics budget so a scripted "timeout" resolves
 		// in ~50ms instead of a real multi-second strategy budget — keeps the tests
 		// fast and deterministic without changing the code path under test.
@@ -495,7 +495,7 @@ describe("LSPService.ensureWarmForSweep negative cache (#799)", () => {
 		vi.resetModules();
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
-		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "lsp-warmup-799-"));
+		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-warmup-799-"));
 		process.env.PI_LENS_LSP_DIAGNOSTICS_MAX_WAIT_MS = "50";
 		process.env.PI_LENS_LSP_WARMUP_RETRY_BACKOFF_MS = "0";
 	});
@@ -632,7 +632,9 @@ describe("ensureWarmForSweep warmupOverride floor scoping (#799)", () => {
 		vi.resetModules();
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
-		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "lsp-warmup-floor-799-"));
+		tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-warmup-floor-799-"),
+		);
 		process.env.PI_LENS_LSP_WARMUP_RETRY_BACKOFF_MS = "0";
 	});
 	afterEach(() => {
@@ -680,7 +682,7 @@ describe("LSP warm-up telemetry pairing (#1374)", () => {
 		logLatency.mockReset();
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
-		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "lsp-warmup-1374-"));
+		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-warmup-1374-"));
 		process.env.PI_LENS_LSP_WARMUP_RETRY_BACKOFF_MS = "0";
 	});
 	afterEach(() => {

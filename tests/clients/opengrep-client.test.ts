@@ -212,7 +212,9 @@ describe("opengrep report outcomes (#2943)", () => {
 	it.each(outcomeRows)(
 		"classifies $name through the real client",
 		async (row) => {
-			const root = fs.mkdtempSync(path.join(os.tmpdir(), "p2943-client-"));
+			const root = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-p2943-client-"),
+			);
 			const scanRoot = row.symlinkRoot ? `${root}-link` : root;
 			if (row.symlinkRoot) fs.symlinkSync(root, scanRoot, "dir");
 			vi.spyOn(safeSpawn, "safeSpawnAsync").mockImplementationOnce(

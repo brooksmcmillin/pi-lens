@@ -1,6 +1,11 @@
 # Configuration
 
-pi-lens reads optional user preferences from `~/.pi-lens/config.json` (`%USERPROFILE%\\.pi-lens\\config.json` on Windows). An unrecognized top-level key is logged once (to surface a typo like `lps` for `lsp`) and then ignored; `$schema` is always allowed for editor JSON-schema association. Missing or invalid config falls back to defaults.
+pi-lens reads optional user preferences from the global file selected by the
+[winning-location table](configuration.md#global-config-location) (`~/.pi-lens/config.json`
+by default; `%USERPROFILE%\\.pi-lens\\config.json` on Windows). An unrecognized
+top-level key is logged once (to surface a typo like `lps` for `lsp`) and then
+ignored; `$schema` is always allowed for editor JSON-schema association. Missing
+or invalid config falls back to defaults.
 
 ## Every toggle, both ways
 
@@ -26,6 +31,8 @@ Each runtime toggle is settable from the CLI *and* from `config.json`. The two a
 | `--lens-actionable-warning-autofix` | `actionableWarnings.autoFix.enabled` | `false` |
 | `--lens-actionable-warning-all` | `actionableWarnings.deltaOnly` (`false`) | `true` |
 | `--lens-compact-tool-line` | `ui.compactToolLine` | `false` |
+| `--lens-compact-lsp-status` | `ui.compactLspStatus` | `false` |
+| `--lens-hide-lsp-status` | `ui.hideLspStatus` | `false` |
 | `--no-lazy-tools` | `tools.lazy` | `true` |
 | `--lens-turn-end-madge` | `turnEnd.madge.enabled` | `false` |
 | `--no-knip` | `knip.enabled` | `true` |
@@ -137,7 +144,7 @@ disabled.
 
 In addition to the user-level `~/.pi-lens/config.json` above, pi-lens reads a per-project `.pi-lens.json` (or `pi-lens.json`) at the project root. Walked upward from the cwd, so a monorepo can keep the config at the repo root and have every subdir pick it up. The schema is intentionally small — only fields pi-lens actually honors:
 
-Note that most toggles from the table above are **user-level only**. Of them, a project config honors just the three [mutation controls](#mutation-controls) (`format.enabled`, `autofix.enabled`, `actionableWarnings.autoFix.enabled`). Putting a user-level toggle such as `"lsp": { "enabled": false }` in a `.pi-lens.json` is **not** honored at project scope; pi-lens now logs a one-time warning saying so rather than dropping it silently, so you get a signal instead of a setting that quietly does nothing. Set it in `~/.pi-lens/config.json` or pass `--no-lsp` instead. A genuinely unrecognized key (a typo) is likewise logged once. Foreign namespaces that a shared `.pi-lens.json` legitimately carries for the LSP loader (`servers`, `serverOverrides`, `disabledServers`, `warmFiles`) and `$schema` are tolerated without warning.
+Note that most toggles from the table above are **user-level only**. Of them, a project config honors the three [mutation controls](#mutation-controls) (`format.enabled`, `autofix.enabled`, `actionableWarnings.autoFix.enabled`) and the per-tool switches `tools.<name>.enabled` — but not `tools.lazy`, which stays user-level and is reported as such when a project file sets it. Putting a user-level toggle such as `"lsp": { "enabled": false }` in a `.pi-lens.json` is **not** honored at project scope; pi-lens now logs a one-time warning saying so rather than dropping it silently, so you get a signal instead of a setting that quietly does nothing. Set it in `~/.pi-lens/config.json` or pass `--no-lsp` instead. A genuinely unrecognized key (a typo) is likewise logged once. Foreign namespaces that a shared `.pi-lens.json` legitimately carries for the LSP loader (`servers`, `serverOverrides`, `disabledServers`, `warmFiles`) and `$schema` are tolerated without warning.
 
 ```json
 {

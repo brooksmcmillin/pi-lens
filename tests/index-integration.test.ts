@@ -7,6 +7,10 @@ import { getEffectiveLspIdleResetMs } from "../clients/runtime-turn.js";
 import { createPiMock, makeCtx, makeStaleCtx } from "./support/pi-mock.js";
 import { removeTempDirSync } from "./clients/test-utils.js";
 import { makeLspServiceDouble } from "./support/lsp-service-double.js";
+import {
+	aliveServerHolder,
+	lspStatusRecorder,
+} from "./support/lsp-status-repaint.js";
 import { makeSessionStartEvent } from "./support/host-event-factory.js";
 // #2146: process-scope state (the primary-session registration, the instance
 // registry's mutation tail) now lives on `globalThis`, so `vi.resetModules()`
@@ -1533,16 +1537,9 @@ describe("index.ts integration", () => {
 			// The idle reset releases the warm servers from a detached timer with no pi
 			// event in flight; without the wrapped reset the footer would keep showing a
 			// stale "LSP Active" until the next turn. Assert the timer firing repaints it.
-			let aliveIds: string[] = ["typescript"];
-			const resetLSPService = vi.fn(() => {
-				aliveIds = [];
-			});
+			const { resetLSPService, service } = aliveServerHolder();
 			vi.doMock("../clients/lsp/index.js", () => ({
-				getLSPService: () =>
-					makeLspServiceDouble({
-						getAliveClientCount: () => aliveIds.length,
-						getAliveServerIds: () => aliveIds,
-					}),
+				getLSPService: service,
 				resetLSPService,
 			}));
 			vi.doMock("../clients/bootstrap.js", async () => {
@@ -1569,19 +1566,9 @@ describe("index.ts integration", () => {
 			const turnEnd = handlers.turn_end?.[0];
 			expect(turnEnd).toBeTypeOf("function");
 
-			const statusUpdates: Array<[string, string | undefined]> = [];
-			const ctx = {
-				cwd: tmpDir,
-				ui: {
-					notify: vi.fn(),
-					setStatus: (id: string, text: string | undefined) =>
-						statusUpdates.push([id, text]),
-					// identity theme so the asserted strings are the raw labels
-					theme: { fg: (_c: string, s: string) => s },
-				},
-			};
-			const lspStatuses = () =>
-				statusUpdates.filter(([id]) => id === "pi-lens-lsp").map(([, t]) => t);
+			// identity theme so the asserted strings are the raw labels
+			const { ui, lspStatuses } = lspStatusRecorder();
+			const ctx = { cwd: tmpDir, ui };
 
 			vi.useFakeTimers();
 			try {
@@ -2608,6 +2595,51 @@ describe("index.ts integration", () => {
 			expect(message).toContain("Cascade runs: 5");
 			expect(message).toContain("Cascade diagnostics surfaced: 3");
 			expect(message).toContain("Cold-snapshot touches: 2");
+		},
+		INTEGRATION_TIMEOUT_MS,
+	);
+
+	// #3255 round-3 verify: the warm-attach ledger row was only reachable through
+	// `/lens-perf` and MCP `pilens_health`, so a plain pi user with no Stop hook
+	// got no notice that this session had silently lost its warm incumbent to a
+	// renamed endpoint — and the remedy, restarting that peer, is not something
+	// the local fallback can discover on its own.
+	it(
+		"lens-health renders the warm-ipc-endpoint-missing degradation row",
+		async () => {
+			const { default: registerExtension } = await import("../index.js");
+			const { recordDegradationOnce, resetDegradationLedger } =
+				await import("../clients/degradation-ledger.js");
+			const { pi, commands } = createMockPi();
+			registerExtension(pi as any);
+
+			resetDegradationLedger();
+			try {
+				recordDegradationOnce({
+					kind: "warm-ipc-endpoint-missing",
+					subject: "/tmp/pi-lens-mcp-abc-diagnostics-42.sock",
+					reason: "nothing is listening on its derived endpoint — restart it",
+				});
+				// An unrelated live ledger row. This round added ONE bounded row to
+				// `/lens-health`, not a degradation dashboard: the full ledger has
+				// its own surfaces (`/lens-perf`, MCP `pilens_health`), and widening
+				// this command is a behaviour change nobody asked for.
+				recordDegradationOnce({
+					kind: "wasm-abort",
+					subject: "tree-sitter",
+					reason: "unrelated row that must not reach /lens-health",
+				});
+
+				const notify = vi.fn();
+				await commands.get("lens-health")?.handler?.({}, { ui: { notify } });
+
+				const [message] = notify.mock.calls[0];
+				expect(message).toContain("warm-ipc-endpoint-missing");
+				expect(message).toContain("restart it");
+				expect(message).not.toContain("wasm-abort");
+			} finally {
+				resetDegradationLedger();
+			}
 		},
 		INTEGRATION_TIMEOUT_MS,
 	);

@@ -93,12 +93,86 @@ describe("project diagnostics cache", () => {
 		expect(loadProjectDiagnosticsSnapshot(tmp)).toEqual(saved);
 	});
 
+	// #2154 AC2 (project-root axis). Two worktrees of one repo — the reported
+	// incident's shape — run under one user, so they share `PILENS_DATA_DIR`
+	// (or the default `~/.pi-lens/projects`) and therefore one store BASE.
+	// What keeps their diagnostics apart is that the store's PATH is derived
+	// per root by `getProjectDataDir`, so this is the root half of the
+	// cache-key provenance AC2 asks for: a finding written under one root must
+	// be invisible to a reader in the other, and each root's own record must
+	// survive the sibling's scan. Both directions are asserted, because a fold
+	// that collapsed the two roots onto one slug would otherwise show up only
+	// as a missing finding in whichever session wrote second.
+	it("never serves one project root's snapshot to a sibling root sharing the data dir", () => {
+		const rootA = path.join(tmp, "worktree-a");
+		const rootB = path.join(tmp, "worktree-b");
+		fs.mkdirSync(path.join(rootA, "src"), { recursive: true });
+		fs.mkdirSync(path.join(rootB, "src"), { recursive: true });
+		const saved = snapshot({
+			cwd: rootA,
+			diagnostics: [
+				{
+					filePath: path.join(rootA, "src/a.ts"),
+					line: 1,
+					severity: "warning",
+					semantic: "warning",
+					tool: "fact-rules",
+					runner: "fact-rules",
+					rule: "pass-through-wrappers",
+					message: "wrapper",
+					source: "project-scan",
+				},
+			],
+		});
+
+		saveProjectDiagnosticsSnapshot(rootA, saved);
+
+		expect(loadProjectDiagnosticsSnapshot(rootB)).toBeUndefined();
+		expect(loadProjectDiagnosticsSnapshot(rootA)?.cwd).toBe(rootA);
+		// The other direction: B's own scan must not overwrite A's record.
+		saveProjectDiagnosticsSnapshot(rootB, snapshot({ cwd: rootB }));
+		expect(loadProjectDiagnosticsSnapshot(rootA)).toEqual(saved);
+	});
+
 	it("ignores stale cache versions", () => {
 		// Deliberately pinned to the literal 0, below PROJECT_DIAGNOSTICS_CACHE_VERSION,
 		// to exercise the stale-version rejection path itself (the #1082/#1106
 		// vacuous-fixture class: a future bump to 0 would silently un-exercise this).
 		expect(PROJECT_DIAGNOSTICS_CACHE_VERSION).not.toBe(0);
 		saveProjectDiagnosticsSnapshot(tmp, snapshot({ version: 0 }));
+		expect(loadProjectDiagnosticsSnapshot(tmp)).toBeUndefined();
+	});
+
+	// #2154 (#3060 review F1): what happens to a record written before the
+	// content axis existed. A v2 snapshot carries no `fileFingerprints`, so its
+	// rows can only be judged by `mtime <= scannedAt` — the test that just
+	// proved unable to separate "unchanged" from "changed mid-scan". Every row
+	// in this store is a POSITIVE claim, so the version guard REJECTS such a
+	// record and the project is re-scanned, rather than serving it under the
+	// failed axis. The cost is one cold cheap scan after upgrade, reported
+	// through the tool's existing "no cached scan" channel.
+	it("rejects a pre-fingerprint v2 snapshot instead of serving its mtime-only rows", () => {
+		expect(PROJECT_DIAGNOSTICS_CACHE_VERSION).toBeGreaterThan(2);
+		saveProjectDiagnosticsSnapshot(
+			tmp,
+			snapshot({
+				version: 2,
+				diagnostics: [
+					{
+						filePath: path.join(tmp, "src/a.ts"),
+						line: 1,
+						severity: "warning",
+						semantic: "warning",
+						tool: "fact-rules",
+						runner: "fact-rules",
+						rule: "pass-through-wrappers",
+						message: "wrapper",
+						source: "project-scan",
+					},
+				],
+			}),
+		);
+
 		expect(loadProjectDiagnosticsSnapshot(tmp)).toBeUndefined();
 	});
 
@@ -176,6 +250,48 @@ describe("reconcileProjectDiagnosticsSnapshot (#298 staleness)", () => {
 			reconcileProjectDiagnosticsSnapshot(snap);
 		expect(reconciled.diagnostics).toHaveLength(0);
 		expect(staleDropped).toBe(1);
+	});
+
+	// #2154: a row whose file carries NO fingerprint keeps the mtime rule. A
+	// rule may cite a path the scan never opened, so there is no content claim
+	// to check — the same fail-open posture `WorkspaceDiagnosticsCacheEntry`
+	// takes for a pre-#2300 entry with no `sizeBytes`. Pinned so the fallback
+	// branch cannot go dead unnoticed.
+	it("falls back to the mtime rule for a row with no recorded fingerprint", () => {
+		const file = path.join(tmp, "unfingerprinted.ts");
+		fs.writeFileSync(file, "export const a = 1;\n");
+		const past = new Date(Date.now() - 60_000);
+		fs.utimesSync(file, past, past);
+		const withoutFingerprints = snapshot({
+			scannedAt: new Date().toISOString(),
+			diagnostics: [
+				{
+					filePath: file,
+					line: 1,
+					severity: "warning",
+					semantic: "warning",
+					tool: "fact-rules",
+					runner: "fact-rules",
+					rule: "pass-through-wrappers",
+					message: "wrapper",
+					source: "project-scan",
+				},
+			],
+		});
+
+		// Unchanged since the scan by the only axis it has: kept.
+		expect(
+			reconcileProjectDiagnosticsSnapshot(withoutFingerprints).snapshot
+				.diagnostics.length,
+		).toBe(1);
+
+		// Touched after the scan: dropped, as before this change.
+		const future = new Date(Date.now() + 60_000);
+		fs.utimesSync(file, future, future);
+		expect(
+			reconcileProjectDiagnosticsSnapshot(withoutFingerprints).snapshot
+				.diagnostics,
+		).toEqual([]);
 	});
 
 	it("drops a diagnostic for a deleted file", () => {
@@ -786,6 +902,148 @@ describe("scanProjectDiagnostics", () => {
 		expect(loadProjectDiagnosticsSnapshot(tmp)?.diagnostics.length).toBe(
 			result.diagnostics.length,
 		);
+	});
+
+	// #2154 (#3060 review F1). `scannedAt` is stamped AFTER the whole file loop,
+	// so an edit that lands while the scan is still running leaves the file with
+	// new bytes and an mtime at or before that timestamp — which the mtime-only
+	// rule reads as fresh forever, in this session and every later one, because
+	// this snapshot is the cross-session cache. The real scanner records what it
+	// read; the real reconcile must judge the row by that, not by the clock.
+	// `utimesSync` reproduces the race's observable state deterministically.
+	it("drops a row whose file changed without an mtime bump after the scan", async () => {
+		const srcDir = path.join(tmp, "src");
+		fs.mkdirSync(srcDir, { recursive: true });
+		const file = path.join(srcDir, "wrap.ts");
+		fs.writeFileSync(
+			file,
+			[
+				"function inner(value: number) { return value; }",
+				"function wrap(value: number) {",
+				"  return inner(value);",
+				"}",
+			].join("\n"),
+		);
+
+		const scanned = await scanProjectDiagnostics({
+			cwd: tmp,
+			tier: "cheap",
+			maxFiles: 10,
+		});
+		expect(scanned.diagnostics.length).toBeGreaterThan(0);
+
+		const before = fs.statSync(file);
+		fs.writeFileSync(file, "export const clean = 1;\n");
+		fs.utimesSync(file, before.atime, before.mtime);
+
+		const persisted = loadProjectDiagnosticsSnapshot(tmp);
+		expect(persisted?.diagnostics.length).toBe(scanned.diagnostics.length);
+		const reconciled = reconcileProjectDiagnosticsSnapshot(
+			persisted as ProjectDiagnosticsSnapshot,
+		);
+		expect(reconciled.snapshot.diagnostics).toEqual([]);
+		expect(reconciled.staleDropped).toBe(1);
+	});
+
+	// #2154: the same-SIZE rewrite — the case `sizeBytes` alone cannot see and
+	// `contentHash` exists for (the LSP store's own #2300 note names the
+	// NTFS-granularity version of it). Without the hash, a replacement of
+	// identical length with the mtime preserved reads as the very bytes the
+	// scan analysed. Padded to the original length on purpose; the assertion
+	// below proves the two really are the same size.
+	it("drops a row whose file was rewritten to the same length", async () => {
+		const srcDir = path.join(tmp, "src");
+		fs.mkdirSync(srcDir, { recursive: true });
+		const file = path.join(srcDir, "wrap.ts");
+		const source = [
+			"function inner(value: number) { return value; }",
+			"function wrap(value: number) {",
+			"  return inner(value);",
+			"}",
+		].join("\n");
+		fs.writeFileSync(file, source);
+
+		const scanned = await scanProjectDiagnostics({
+			cwd: tmp,
+			tier: "cheap",
+			maxFiles: 10,
+		});
+		expect(scanned.diagnostics.length).toBeGreaterThan(0);
+
+		const before = fs.statSync(file);
+		const clean = "export const clean = 1;".padEnd(source.length, " ");
+		expect(Buffer.byteLength(clean)).toBe(Buffer.byteLength(source));
+		fs.writeFileSync(file, clean);
+		fs.utimesSync(file, before.atime, before.mtime);
+		expect(fs.statSync(file).size).toBe(before.size);
+
+		const reconciled = reconcileProjectDiagnosticsSnapshot(
+			loadProjectDiagnosticsSnapshot(tmp) as ProjectDiagnosticsSnapshot,
+		);
+		expect(reconciled.snapshot.diagnostics).toEqual([]);
+		expect(reconciled.staleDropped).toBe(1);
+	});
+
+	// The same seam in the other direction: bytes that still match what the scan
+	// read keep their row, so the content axis is a real discriminator and not a
+	// blanket drop. The file is rewritten, restored, and then stamped a minute
+	// INTO THE FUTURE, well past `scannedAt` and its drift tolerance — so this
+	// also pins the behaviour change the fix makes in the other direction: a
+	// touched-but-identical file used to lose its row and no longer does,
+	// because for per-file syntax rules identical bytes mean identical
+	// findings whatever the clock says.
+	it("keeps a row whose file still holds the bytes the scan read", async () => {
+		const srcDir = path.join(tmp, "src");
+		fs.mkdirSync(srcDir, { recursive: true });
+		const file = path.join(srcDir, "wrap.ts");
+		const source = [
+			"function inner(value: number) { return value; }",
+			"function wrap(value: number) {",
+			"  return inner(value);",
+			"}",
+		].join("\n");
+		fs.writeFileSync(file, source);
+
+		// #3060 round 2 F1: a file whose bytes are not valid UTF-8 — one
+		// latin-1 0xE9 in a comment. The scan decodes it lossily (one byte
+		// becomes a 3-byte U+FFFD), so a fingerprint measured on the DECODED
+		// string can never equal the on-disk size and the row is retired on
+		// every cached read, for a file nobody touched. The size recorded must
+		// be the bytes the file actually holds.
+		const latin1File = path.join(srcDir, "wrap-latin1.ts");
+		const latin1Source = Buffer.concat([
+			Buffer.from("// caf", "utf-8"),
+			Buffer.from([0xe9]),
+			Buffer.from(
+				"\nfunction innerL(value: number) { return value; }\nfunction wrapL(value: number) {\n  return innerL(value);\n}\n",
+				"utf-8",
+			),
+		]);
+		fs.writeFileSync(latin1File, latin1Source);
+
+		const scanned = await scanProjectDiagnostics({
+			cwd: tmp,
+			tier: "cheap",
+			maxFiles: 10,
+		});
+		const latin1Rows = scanned.diagnostics.filter(
+			(d) => d.filePath === latin1File,
+		);
+		expect(latin1Rows.length).toBeGreaterThan(0);
+		expect(fs.statSync(latin1File).size).toBe(latin1Source.length);
+
+		fs.writeFileSync(file, "export const clean = 1;\n");
+		fs.writeFileSync(file, source);
+		const future = new Date(Date.now() + 60_000);
+		fs.utimesSync(file, future, future);
+
+		const reconciled = reconcileProjectDiagnosticsSnapshot(
+			loadProjectDiagnosticsSnapshot(tmp) as ProjectDiagnosticsSnapshot,
+		);
+		expect(reconciled.snapshot.diagnostics.length).toBe(
+			scanned.diagnostics.length,
+		);
+		expect(reconciled.staleDropped).toBe(0);
 	});
 
 	it("runs ast-grep-napi project-wide without the ast-grep binary (#308)", async () => {

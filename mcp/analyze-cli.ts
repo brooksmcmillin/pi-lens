@@ -197,6 +197,11 @@ function formatTurnEnd(response: WarmTurnEndResponse): string | undefined {
 const TURN_END_SKIP_REASONS: Record<WarmDiagnosticsFailureReason, string> = {
 	"ipc-error":
 		"no warm pi-lens MCP server answered for this workspace, or its build is stale — start the MCP server, or run `npm run build` if you have edited pi-lens sources",
+	// #3255: split out of `ipc-error` because its remedy is different and no
+	// rebuild reaches it. A server that was already running when pi-lens was
+	// upgraded still owns the endpoint name the previous build derived.
+	"no-listener":
+		"nothing is listening on this workspace's warm endpoint — start the MCP server; if pi-lens was upgraded while a server was running, that server still owns the endpoint name of the previous build, so restart it",
 	timeout:
 		"the warm pi-lens MCP server did not finish the pass within the hook budget — the turn-end findings are kept and will be delivered on a later Stop",
 	"schema-mismatch":

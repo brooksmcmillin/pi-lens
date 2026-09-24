@@ -59,6 +59,7 @@ vi.mock("../../clients/extension-log.js", async (importOriginal) => ({
 	logExtension,
 }));
 
+import { loadAstGrepNapi } from "../../clients/deps/ast-grep-napi.js";
 import { resetDegradationLedger } from "../../clients/degradation-ledger.js";
 import { RUNNERS, TestRunnerClient } from "../../clients/test-runner-client.js";
 import { removeTempDirSync } from "./test-utils.js";
@@ -356,4 +357,161 @@ describe("#2871 the test-runner child's cwd comes from resolveToolCwd", () => {
 		expect(result.error).toBe("Runner go exited with 1");
 		expect(result.failures).toEqual([]);
 	});
+});
+
+describe("#2944 every runner's spawn-marker set names the build its command runs", () => {
+	// Recurrence this file prevents (#2944): `RUNNERS.maven.spawnCwdMarkers`
+	// was `["mvnw", "mvnw.cmd"]` while `RUNNERS.maven.command` is `mvn` — the
+	// cwd anchor was a proxy for the wrapper, not the module. A Maven project
+	// without the wrapper found NO marker at all, so the seam fell through to
+	// the dispatch root instead of the module's `pom.xml`. Measured on the
+	// recurrence state with the real seam and a root `pom.xml` + nested module
+	// `pom.xml`:
+	//
+	//   effective rootMarkers = ["mvnw","mvnw.cmd"]
+	//   resolved spawn cwd    = <dispatch root>
+	//   anchoring marker      = undefined
+	//
+	// The derived contract over the whole table: the child runs at the
+	// nearest directory carrying an effective marker, so that marker set must
+	// name a file that DEFINES the build the command runs — either one of the
+	// entry's own `configFiles` (the manifests detection itself accepts) or
+	// the launcher script the command literally invokes (`./gradlew` ENOENTs
+	// without it in cwd, so the wrapper IS the build definition for that
+	// child). Any other override re-introduces #2944: a marker the command
+	// never uses, anchoring wrapper-less projects on the dispatch root.
+	it("anchors every runner on one of its own manifests or the launcher its command invokes", async () => {
+		// #2944 round 2: an added bad marker must not hide behind a good one,
+		// a command substring is not a launcher, and a deleted runner must red.
+		expect(Object.keys(RUNNERS).sort()).toEqual([
+			"cargo",
+			"dotnet",
+			"go",
+			"gradle",
+			"jest",
+			"maven",
+			"minitest",
+			"mix",
+			"phpunit",
+			"pytest",
+			"rspec",
+			"vitest",
+		]);
+		expect(Object.keys(RUNNERS)).toHaveLength(12);
+
+		// Runtime evaluation loses the other platform's launcher. Read command
+		// expression leaves from the AST instead; comments and condition strings
+		// cannot become launchers. Unknown expression shapes fail visibly.
+		const { parse, Lang } = await loadAstGrepNapi();
+		const source = parse(
+			Lang.TypeScript,
+			fs.readFileSync(
+				new URL("../../clients/test-runner-client.ts", import.meta.url),
+				"utf8",
+			),
+		).root();
+		const table = source
+			.find({
+				rule: {
+					kind: "variable_declarator",
+					has: {
+						field: "name",
+						regex: "^RUNNERS$",
+					},
+				},
+			})!
+			.field("value")!;
+		type Node = typeof table;
+		const commands = (node: Node): string[] => {
+			if (node.kind() === "ternary_expression") {
+				return [
+					...commands(node.field("consequence")!),
+					...commands(node.field("alternative")!),
+				];
+			}
+			if (node.kind() === "parenthesized_expression")
+				return commands(node.children().find((child) => child.isNamed())!);
+			expect(node.kind(), node.text()).toBe("string");
+			return [
+				node
+					.children()
+					.filter((child) => child.kind() === "string_fragment")
+					.map((child) => child.text())
+					.join(""),
+			];
+		};
+		const violations: string[] = [];
+		for (const [name, config] of Object.entries(RUNNERS)) {
+			const entry = table
+				.children()
+				.find((node) => node.field("key")?.text() === name)!;
+			const command = entry
+				.field("value")!
+				.children()
+				.find((node) => node.field("key")?.text() === "command")!
+				.field("value")!;
+			// The launcher escape only applies to a command with a
+			// path-relative alternative (`./gradlew`, ENOENT without cwd in its
+			// own directory) -- the wrapper IS the build definition there. A
+			// bare PATH binary (`mvn`, `cargo`, `mix`, ...) has no such
+			// alternative, so its basename is not evidence of anything: it is
+			// the same string wherever the command runs and anchors no
+			// directory. Gating on "any alternative", not "every alternative",
+			// is what keeps gradle's non-separator win32 alternative
+			// (`gradlew.bat`) inside the escape once the Linux alternative
+			// (`./gradlew`) has opened it.
+			const commandAlternatives = commands(command);
+			const hasPathRelativeLauncher = commandAlternatives.some((alt) =>
+				/[/\\]/.test(alt),
+			);
+			const launchers = hasPathRelativeLauncher
+				? new Set(commandAlternatives.map((alt) => path.win32.basename(alt)))
+				: new Set<string>();
+			const markers = config.spawnCwdMarkers ?? config.configFiles;
+			if (
+				markers.length === 0 ||
+				!markers.every(
+					(marker) =>
+						config.configFiles.includes(marker) || launchers.has(marker),
+				)
+			)
+				violations.push(`${name}: ${markers.join(", ")}`);
+		}
+		expect(violations).toEqual([]);
+	});
+
+	it.each([false, true])(
+		"anchors the maven child on the module pom.xml with root wrapper present=%s",
+		async (wrapperPresent) => {
+			// The defect's own shape, end to end through the real `runTestFileAsync`
+			// (mocked only at the process boundary): a wrapper-less multi-module
+			// Maven tree must anchor the child on the module the test file belongs
+			// to, not on the dispatch root.
+			const root = makeRoot("pi-lens-2944-maven-");
+			if (wrapperPresent) write(root, "mvnw", "#!/bin/sh\n");
+			write(root, "pom.xml", "<project/>\n");
+			const module = path.join(root, "mod");
+			write(root, "mod/pom.xml", "<project/>\n");
+			const testFile = write(
+				root,
+				"mod/src/test/java/com/x/FooTest.java",
+				"class FooTest {}\n",
+			);
+
+			await new TestRunnerClient(false).runTestFileAsync(
+				testFile,
+				root,
+				"maven",
+				RUNNERS.maven,
+			);
+
+			expect(spawned).toHaveLength(1);
+			expect(spawned[0].cwd).toBe(module);
+			expect(spawned[0].command).toBe("mvn");
+			expect(fs.existsSync(path.join(spawned[0].cwd!, "mvnw"))).toBe(false);
+			// The invariant, not just the path: the child runs where its own
+			// build file is.
+			expect(fs.existsSync(path.join(spawned[0].cwd!, "pom.xml"))).toBe(true);
+		},
+	);
 });

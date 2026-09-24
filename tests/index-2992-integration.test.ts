@@ -10,6 +10,23 @@ import {
 
 const workerHome = process.env.PI_LENS_HOME;
 
+// #3105: filePath/recoveredPath below live under this test-owned scratch
+// dir, not the repo root and not a gitignored dir. The real read/mutation
+// bridges this test drives require a path both under the project root and
+// NOT matched by .gitignore (isRecordableProjectPath, clients/file-utils.ts)
+// — measured directly: a path here is recordable, a path under this same
+// test's gitignored .probe-home (used for PI_LENS_HOME below) is not. This
+// dir sits inside tests/, which tests/support/tests-tree-write-guard.ts
+// already watches for exactly this shape (a source file appearing mid-run);
+// tests-tree-write-guard-setup.ts's isUnderIndex2992Scratch excuses it by
+// directory prefix.
+const SCRATCH_DIR = path.join(
+	process.cwd(),
+	"tests",
+	"support",
+	".index-2992-scratch",
+);
+
 describe("#2992 read bridge lifecycle", () => {
 	let probeHome: string;
 	let filePath: string;
@@ -27,12 +44,13 @@ describe("#2992 read bridge lifecycle", () => {
 		removeTempDirSync(probeHome);
 		fs.mkdirSync(probeHome, { recursive: true });
 		process.env.PI_LENS_HOME = probeHome;
-		filePath = path.join(process.cwd(), "index-2992-probe.ts");
+		fs.mkdirSync(SCRATCH_DIR, { recursive: true });
+		filePath = path.join(SCRATCH_DIR, "index-2992-probe.ts");
 		fs.writeFileSync(filePath, "export const guarded = true;\n");
 	});
 
 	afterEach(async () => {
-		fs.rmSync(filePath, { force: true });
+		fs.rmSync(SCRATCH_DIR, { recursive: true, force: true });
 		for (let tick = 0; tick < 3; tick++) {
 			await new Promise<void>((resolve) => setImmediate(resolve));
 			removeTempDirSync(probeHome);
@@ -128,7 +146,7 @@ describe("#2992 read bridge lifecycle", () => {
 			{ reason: "reload" },
 			makeCtx({ cwd: process.cwd(), sessionId: "session-after" }),
 		);
-		const recoveredPath = path.join(process.cwd(), "index-2992-recovered.ts");
+		const recoveredPath = path.join(SCRATCH_DIR, "index-2992-recovered.ts");
 		fs.writeFileSync(recoveredPath, "export const recovered = true;\n");
 		try {
 			// The replacement session re-arms the session ledger; reset explicitly

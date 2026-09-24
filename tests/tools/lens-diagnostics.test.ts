@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createLensDiagnosticsTool } from "../../tools/lens-diagnostics.js";
 import { createLensDiagnosticMarkTool } from "../../tools/lens-diagnostic-mark.js";
 import { hashDiagnosticContent } from "../../clients/lsp/diagnostic-binding.js";
+import { PROJECT_DIAGNOSTICS_CACHE_VERSION } from "../../clients/project-diagnostics/cache.js";
 import {
 	_resetDeferredForTests,
 	_resetStateCacheForTests,
@@ -68,18 +69,28 @@ vi.mock("../../clients/project-diagnostics/scanner.js", () => ({
 	scanProjectDiagnostics: projectDiagnosticsMocks.scanProjectDiagnostics,
 }));
 
-vi.mock("../../clients/project-diagnostics/cache.js", () => ({
-	PROJECT_DIAGNOSTICS_CACHE_VERSION: 2,
-	loadProjectDiagnosticsSnapshot:
-		projectDiagnosticsMocks.loadProjectDiagnosticsSnapshot,
-	loadProjectDiagnosticsDeltaReport:
-		projectDiagnosticsMocks.loadProjectDiagnosticsDeltaReport,
-	// Identity passthrough — these tests exercise ignore-filtering, not on-disk
-	// staleness (covered in project-diagnostics.test.ts).
-	reconcileProjectDiagnosticsSnapshot: (
-		snapshot: import("../../clients/project-diagnostics/types.js").ProjectDiagnosticsSnapshot,
-	) => ({ snapshot, staleDropped: 0 }),
-}));
+// #2154: the version comes from the REAL module. A hand-copied `2` here
+// silently drifted the moment the constant moved to 3, leaving these tests
+// asserting against a version production no longer writes.
+vi.mock(
+	"../../clients/project-diagnostics/cache.js",
+	async (importOriginal) => ({
+		PROJECT_DIAGNOSTICS_CACHE_VERSION: (
+			await importOriginal<
+				typeof import("../../clients/project-diagnostics/cache.js")
+			>()
+		).PROJECT_DIAGNOSTICS_CACHE_VERSION,
+		loadProjectDiagnosticsSnapshot:
+			projectDiagnosticsMocks.loadProjectDiagnosticsSnapshot,
+		loadProjectDiagnosticsDeltaReport:
+			projectDiagnosticsMocks.loadProjectDiagnosticsDeltaReport,
+		// Identity passthrough — these tests exercise ignore-filtering, not on-disk
+		// staleness (covered in project-diagnostics.test.ts).
+		reconcileProjectDiagnosticsSnapshot: (
+			snapshot: import("../../clients/project-diagnostics/types.js").ProjectDiagnosticsSnapshot,
+		) => ({ snapshot, staleDropped: 0 }),
+	}),
+);
 
 // ── Mock widget state ─────────────────────────────────────────────────────────
 
@@ -175,6 +186,32 @@ function run(
 	return tool.execute("1", params, new AbortController().signal, null, { cwd });
 }
 
+/**
+ * #3196: maps every indented row/label line in a mode=delta render to the
+ * unindented header line immediately above it — the exact pairing the
+ * `lines.includes(rel)` header-suppression bug broke, since a later tier's
+ * rows for a file already headed elsewhere in the buffer land under
+ * whichever OTHER header the buffer's tail happens to sit under instead of
+ * their own file's.
+ */
+function deltaBlocksByHeader(text: string): Record<string, string[]> {
+	const out: Record<string, string[]> = {};
+	let header: string | undefined;
+	for (const line of text.split("\n")) {
+		if (
+			line.length > 0 &&
+			!line.startsWith(" ") &&
+			!line.startsWith("Summary")
+		) {
+			header = line;
+			out[header] ??= [];
+		} else if (header !== undefined && line.startsWith(" ")) {
+			out[header]?.push(line.trim());
+		}
+	}
+	return out;
+}
+
 describe("lens_diagnostics compact filename", () => {
 	it("names a real one-file paths request", async () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-one-file-"));
@@ -188,8 +225,9 @@ describe("lens_diagnostics compact filename", () => {
 		try {
 			const tool = makeTool({}, service);
 			const result = await run(tool, { source: "lsp", paths: [file] }, cwd);
+			expect(tool.renderResult).toBeDefined();
 			const rendered = (
-				tool.renderResult?.(result, { expanded: false }, {} as Theme, {
+				tool.renderResult!(result, { expanded: false }, {} as Theme, {
 					args: { source: "lsp", paths: [file] },
 				}) as any
 			)
@@ -219,8 +257,9 @@ describe("lens_diagnostics compact filename", () => {
 				{ source: "lsp", path: unrelated, paths: [diagnosed] },
 				cwd,
 			);
+			expect(tool.renderResult).toBeDefined();
 			const rendered = (
-				tool.renderResult?.(result, { expanded: false }, {} as Theme, {
+				tool.renderResult!(result, { expanded: false }, {} as Theme, {
 					args: { source: "lsp", path: unrelated, paths: [diagnosed] },
 				}) as any
 			)
@@ -918,6 +957,256 @@ describe("lens_diagnostics mode=delta", () => {
 		const text = String(result.content[0].text);
 		expect(text).toContain("fixable");
 		expect(text).toContain("quality");
+	});
+
+	/**
+	 * #3196: `formatDeltaMode`'s quality loop suppressed a file's header with
+	 * `if (!lines.includes(rel)) lines.push(rel)` — true whenever the
+	 * actionable loop already pushed that exact path, even though the quality
+	 * rows are appended to the END of `lines`, not under that earlier header.
+	 * `src/a.ts` is in both reports, `src/b.ts` in actionable only (both
+	 * demoted, so every row renders): a.ts's quality row landed under
+	 * whichever file's header was last in the buffer (b.ts here) instead of
+	 * a.ts's own. Mutation: restoring `lines.includes(rel)` reds this.
+	 */
+	it("#3196: a file demoted in both reports renders its quality row under its OWN header, not another file's", async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-delta-group-"));
+		try {
+			const aPath = path.join(cwd, "src", "a.ts");
+			const bPath = path.join(cwd, "src", "b.ts");
+			fs.mkdirSync(path.dirname(aPath), { recursive: true });
+			fs.writeFileSync(aPath, "const a = 1;\n");
+			fs.writeFileSync(bPath, "const b = 1;\n");
+			const editedAtSec = (Date.now() - 5 * 60_000) / 1000;
+			fs.utimesSync(aPath, editedAtSec, editedAtSec);
+			fs.utimesSync(bPath, editedAtSec, editedAtSec);
+			const observedAt = new Date(Date.now() - 10 * 60_000).toISOString();
+			const warn = (message: string) => ({
+				line: 1,
+				rule: "no-unused-vars",
+				tool: "eslint",
+				message,
+			});
+			const tool = makeTool({
+				"actionable-warnings": {
+					files: [
+						{ filePath: aPath, warnings: [warn("a is unused")] },
+						{ filePath: bPath, warnings: [warn("b is unused")] },
+					],
+					generatedAt: observedAt,
+					summary: { warnings: 2 },
+				},
+				"code-quality-warnings": {
+					files: [{ filePath: aPath, warnings: [warn("a quality nit")] }],
+					generatedAt: observedAt,
+					summary: { warnings: 1 },
+				},
+			});
+			const result = await run(tool, { mode: "delta" }, cwd);
+			const text = String(result.content[0].text);
+			const blocks = deltaBlocksByHeader(text);
+			expect(
+				blocks["src/a.ts"]?.some((l) => l.includes("a quality nit")),
+				text,
+			).toBe(true);
+			expect(
+				blocks["src/b.ts"]?.some((l) => l.includes("a quality nit")),
+				text,
+			).toBe(false);
+		} finally {
+			removeTempDirSync(cwd);
+		}
+	});
+
+	/**
+	 * #3196: same shape with a.ts demoted in actionable but LIVE in quality
+	 * (the report postdates the edit) — the quality row is not demoted, but
+	 * it must still render under a.ts's own header rather than b.ts's, which
+	 * the header-suppression bug did not distinguish (it fires on path
+	 * membership alone, independent of staleness).
+	 */
+	it("#3196: a file demoted in actionable but live in quality still renders its live quality row under its OWN header", async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-delta-group-"));
+		try {
+			const aPath = path.join(cwd, "src", "a.ts");
+			const bPath = path.join(cwd, "src", "b.ts");
+			fs.mkdirSync(path.dirname(aPath), { recursive: true });
+			fs.writeFileSync(aPath, "const a = 1;\n");
+			fs.writeFileSync(bPath, "const b = 1;\n");
+			const editedAtSec = (Date.now() - 5 * 60_000) / 1000;
+			fs.utimesSync(aPath, editedAtSec, editedAtSec);
+			fs.utimesSync(bPath, editedAtSec, editedAtSec);
+			const warn = (message: string) => ({
+				line: 1,
+				rule: "no-unused-vars",
+				tool: "eslint",
+				message,
+			});
+			const tool = makeTool({
+				"actionable-warnings": {
+					files: [
+						{ filePath: aPath, warnings: [warn("a is unused")] },
+						{ filePath: bPath, warnings: [warn("b is unused")] },
+					],
+					// Predates the edit: demoted.
+					generatedAt: new Date(Date.now() - 10 * 60_000).toISOString(),
+					summary: { warnings: 2 },
+				},
+				"code-quality-warnings": {
+					files: [{ filePath: aPath, warnings: [warn("a quality nit")] }],
+					// Postdates the edit: live.
+					generatedAt: new Date(Date.now() - 60_000).toISOString(),
+					summary: { warnings: 1 },
+				},
+			});
+			const result = await run(tool, { mode: "delta" }, cwd);
+			const text = String(result.content[0].text);
+			// Premise: a's actionable row IS demoted and its quality row is not.
+			expect(text).toContain("⚠ [stale");
+			expect(text).toContain("ℹ L1");
+			const blocks = deltaBlocksByHeader(text);
+			expect(
+				blocks["src/a.ts"]?.some((l) => l.includes("a quality nit")),
+				text,
+			).toBe(true);
+			expect(
+				blocks["src/b.ts"]?.some((l) => l.includes("a quality nit")),
+				text,
+			).toBe(false);
+		} finally {
+			removeTempDirSync(cwd);
+		}
+	});
+
+	/**
+	 * #3196: a file present ONLY in the quality report (never in actionable)
+	 * cannot collide with an earlier header under the OLD `lines.includes`
+	 * predicate either — its path was never pushed before, so this case does
+	 * not independently red on pre-fix code. Kept as a coverage case for the
+	 * new grouping pass: its header must still appear exactly once, grouped
+	 * correctly, alongside an interleaved actionable-only file.
+	 */
+	it("#3196: a file present only in the quality report renders under its own header, exactly once", async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-delta-group-"));
+		try {
+			const aPath = path.join(cwd, "src", "a.ts");
+			const bPath = path.join(cwd, "src", "b.ts");
+			fs.mkdirSync(path.dirname(aPath), { recursive: true });
+			fs.writeFileSync(aPath, "const a = 1;\n");
+			fs.writeFileSync(bPath, "const b = 1;\n");
+			const editedAtSec = (Date.now() - 5 * 60_000) / 1000;
+			fs.utimesSync(aPath, editedAtSec, editedAtSec);
+			fs.utimesSync(bPath, editedAtSec, editedAtSec);
+			const observedAt = new Date(Date.now() - 10 * 60_000).toISOString();
+			const warn = (message: string) => ({
+				line: 1,
+				rule: "no-unused-vars",
+				tool: "eslint",
+				message,
+			});
+			const tool = makeTool({
+				"actionable-warnings": {
+					files: [{ filePath: bPath, warnings: [warn("b is unused")] }],
+					generatedAt: observedAt,
+					summary: { warnings: 1 },
+				},
+				"code-quality-warnings": {
+					files: [{ filePath: aPath, warnings: [warn("a quality nit")] }],
+					generatedAt: observedAt,
+					summary: { warnings: 1 },
+				},
+			});
+			const result = await run(tool, { mode: "delta" }, cwd);
+			const text = String(result.content[0].text);
+			const headerCount = text
+				.split("\n")
+				.filter((line) => line === "src/a.ts").length;
+			expect(headerCount, text).toBe(1);
+			const blocks = deltaBlocksByHeader(text);
+			expect(
+				blocks["src/a.ts"]?.some((l) => l.includes("a quality nit")),
+				text,
+			).toBe(true);
+		} finally {
+			removeTempDirSync(cwd);
+		}
+	});
+
+	/**
+	 * #3196: a file with rows in BOTH tiers plus #3170's re-verify-incomplete
+	 * marker renders one header, actionable rows then quality rows, then one
+	 * trailer carrying both labels — never split across two files' headers,
+	 * and never in the wrong tier order. Mutation: restoring
+	 * `lines.includes(rel)` reds this by moving a.ts's quality row (and its
+	 * label) under b.ts.
+	 */
+	it("#3196: a file with an actionable row, a quality row, and a re-verify-incomplete marker renders one header with rows in tier order and one trailer", async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-delta-group-"));
+		try {
+			const aPath = path.join(cwd, "src", "a.ts");
+			const bPath = path.join(cwd, "src", "b.ts");
+			fs.mkdirSync(path.dirname(aPath), { recursive: true });
+			fs.writeFileSync(aPath, "const a = 1;\n");
+			fs.writeFileSync(bPath, "const b = 1;\n");
+			const editedAtSec = (Date.now() - 5 * 60_000) / 1000;
+			fs.utimesSync(aPath, editedAtSec, editedAtSec);
+			fs.utimesSync(bPath, editedAtSec, editedAtSec);
+			const observedAt = new Date(Date.now() - 10 * 60_000).toISOString();
+			const warn = (message: string) => ({
+				line: 1,
+				rule: "no-unused-vars",
+				tool: "eslint",
+				message,
+			});
+			const tool = makeTool({
+				"actionable-warnings": {
+					files: [
+						{
+							filePath: aPath,
+							warnings: [warn("a is unused")],
+							reVerifyIncomplete: true,
+						},
+						{ filePath: bPath, warnings: [warn("b is unused")] },
+					],
+					generatedAt: observedAt,
+					summary: { warnings: 2 },
+				},
+				"code-quality-warnings": {
+					files: [{ filePath: aPath, warnings: [warn("a quality nit")] }],
+					generatedAt: observedAt,
+					summary: { warnings: 1 },
+				},
+			});
+			const result = await run(tool, { mode: "delta" }, cwd);
+			const text = String(result.content[0].text);
+			const blocks = deltaBlocksByHeader(text);
+			const aBlock = blocks["src/a.ts"] ?? [];
+			const actionableIdx = aBlock.findIndex((l) => l.includes("a is unused"));
+			const qualityIdx = aBlock.findIndex((l) => l.includes("a quality nit"));
+			const ageIdx = aBlock.findIndex((l) => l.startsWith("(scanned"));
+			const incompleteIdx = aBlock.findIndex(
+				(l) => l === "(re-verify incomplete)",
+			);
+			expect(actionableIdx, text).toBeGreaterThanOrEqual(0);
+			expect(qualityIdx, text).toBeGreaterThan(actionableIdx);
+			expect(ageIdx, text).toBeGreaterThan(qualityIdx);
+			expect(incompleteIdx, text).toBeGreaterThan(ageIdx);
+			// Both labels render exactly once, and only under a.ts's own header.
+			const bBlock = blocks["src/b.ts"] ?? [];
+			expect(
+				bBlock.some((l) => l.includes("a quality nit")),
+				text,
+			).toBe(false);
+			expect(
+				bBlock.some((l) => l === "(re-verify incomplete)"),
+				text,
+			).toBe(false);
+			expect((text.match(/\(re-verify incomplete\)/g) ?? []).length, text).toBe(
+				1,
+			);
+		} finally {
+			removeTempDirSync(cwd);
+		}
 	});
 
 	it("severity=error excludes warnings in delta mode", async () => {
@@ -2386,7 +2675,7 @@ describe("lens_diagnostics mode=full", () => {
 			]),
 		};
 		projectDiagnosticsMocks.scanProjectDiagnostics.mockResolvedValue({
-			version: 2,
+			version: PROJECT_DIAGNOSTICS_CACHE_VERSION,
 			cwd: "/proj",
 			tier: "cheap",
 			scannedAt: "2026-08-20T14:30:14.000Z",
@@ -3310,7 +3599,7 @@ describe("lens_diagnostics mode=full", () => {
 		projectDiagnosticsMocks.loadProjectDiagnosticsSnapshot.mockReturnValue({
 			// cache.js is mocked in this file, so the version constant isn't in scope;
 			// the tool path doesn't validate it (loader is mocked, reconcile is identity).
-			version: 2,
+			version: PROJECT_DIAGNOSTICS_CACHE_VERSION,
 			cwd: "/proj",
 			tier: "cheap",
 			scannedAt: "2026-01-01T00:00:00.000Z",
@@ -4597,6 +4886,67 @@ describe("lens_diagnostics disposition read-filter (#755)", () => {
 	function runMark(params: Record<string, unknown>) {
 		return markTool().execute("m", params, undefined, () => {}, { cwd: ddTmp });
 	}
+
+	it("mode=full applies a stored disposition to an auxiliary LSP finding (#3041)", async () => {
+		// #3041 recurrence: the full-mode merge converted a SECOND copy of the same
+		// raw LSP diagnostics with a hardcoded `tool: "lsp"`, while the footer
+		// reconcile loop beside it already re-tagged them through
+		// `retagAuxiliaryDiagnostics` (#692). Dispositions anchor on `tool`, so a
+		// `false-positive` mark recorded against the per-edit `ast-grep` finding
+		// never matched the copy mode=full rendered.
+		const filePath = path.join(ddTmp, "app.ts");
+		fs.writeFileSync(filePath, "console.log('debug');\n");
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([
+				{
+					filePath,
+					diagnostics: [
+						{
+							severity: 2,
+							message: "debug output",
+							range: {
+								start: { line: 0, character: 0 },
+								end: { line: 0, character: 11 },
+							},
+							source: "ast-grep",
+							code: "some-project-rule",
+						},
+					],
+					count: 1,
+				},
+			]),
+		};
+		const tool = createLensDiagnosticsTool(
+			makeCacheManager({}) as any,
+			() => ddTmp,
+			() => lspService as any,
+		);
+
+		const before = await tool.execute(
+			"1",
+			{ mode: "full", paths: [filePath] },
+			new AbortController().signal,
+			null,
+			{ cwd: ddTmp },
+		);
+		expect(String(before.content[0].text)).toContain("debug output");
+		await runMark({
+			filePath,
+			line: 1,
+			message: "debug output",
+			rule: "ast-grep:some-project-rule",
+			tool: "ast-grep",
+			disposition: "false-positive",
+		});
+		const after = await tool.execute(
+			"1",
+			{ mode: "full", paths: [filePath] },
+			new AbortController().signal,
+			null,
+			{ cwd: ddTmp },
+		);
+		expect(String(after.content[0].text)).not.toContain("debug output");
+	});
 
 	it("mode=delta hides a finding suppressed via the mark tool without a re-dispatch", async () => {
 		const filePath = path.join(ddTmp, "a.ts");

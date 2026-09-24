@@ -23,16 +23,23 @@ describe("TypeScript diagnostic strategies (#1412)", () => {
 });
 
 describe("cue diagnostic strategy (#1522) — measured against the real v0.17.1 binary", () => {
-	it("is push-only, seeds the first push, and is silent on a clean cold open", () => {
+	it("is push-only, seeds the first push, and publishes on clean transitions", () => {
 		const strategy = getStrategy("cue");
 		expect(strategy.pullRetryBudgetMs).toBe(0);
 		expect(strategy.seedFirstPush).toBe(true);
-		// The load-bearing measurement: a clean file's cold didOpen publishes
-		// nothing at all, so the shared push-only clean-confirm gate needs this
-		// flag to read "no publish, notify succeeded" as confirmed clean rather
-		// than inconclusive (#1520's original review concern).
-		expect(strategy.silentOnClean).toBe(true);
+		// Run 35914033696 measured a versioned clean-transition publish; keeping
+		// this marker absent prevents the cascade from skipping that signal.
+		expect(strategy.silentOnClean).toBeUndefined();
 		expect(strategy.reopenOnResync).toBeFalsy();
+	});
+});
+
+describe("lua diagnostic strategy (#3347)", () => {
+	it("marks the measured clean-transition silence", () => {
+		const strategy = getStrategy("lua");
+		// Run 35914033696 measured two dirty publishes and no clean-transition
+		// publish; the marker is the cascade's tier-3 wait-policy decision.
+		expect(strategy.silentOnClean).toBe(true);
 	});
 });
 

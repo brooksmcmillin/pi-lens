@@ -63,6 +63,28 @@ function isTypeStub(content: string): boolean {
 	return typeOnlyLines.length / lines.length >= 0.75;
 }
 
+// Shared filename predicate (#2928). The parity test iterates the runner's
+// discovery table; additional conventions are pinned in file-role.test.ts.
+// Keep the case-preserved basename for CamelCase suffixes (contest.java is source).
+function testFileNameMatches(rawBase: string, base: string): boolean {
+	return (
+		base.includes(".test.") ||
+		base.includes(".spec.") ||
+		base.includes("_test.") ||
+		base.includes("_spec.") ||
+		base.startsWith("test_") ||
+		base.startsWith("spec_") ||
+		/(Test|Tests|TestCase)\.(java|kt|kts|cs|fs|php)$/.test(rawBase)
+	);
+}
+
+/** Filename-only classification for consumers with their own directory policy. */
+export function isTestFileName(filePath: string): boolean {
+	const windowsShaped = isWindowsPath(filePath);
+	const rawBase = windowsShaped ? win32.basename(filePath) : basename(filePath);
+	return testFileNameMatches(rawBase, rawBase.toLowerCase());
+}
+
 /**
  * Classify the structural role of a file. Pass `content` for higher
  * accuracy (enables generated-code detection, barrel detection, etc.).
@@ -87,28 +109,10 @@ export function detectFileRole(filePath: string, content?: string): FileRole {
 		.toLowerCase();
 
 	// --- Test ---
-	// Suffix conventions informed by the test-runner table
-	// (SOURCE_TO_TEST_PATTERNS + RUNNERS kinds in
-	// clients/test-runner-client.ts); hand-written, not iterated from it —
-	// see #2928 for the single-classifier fold:
-	// - `_test.` infix: Go (`*_test.go`), pytest (`*_test.py`), ExUnit
-	//   (`*_test.exs`), Dart (`*_test.dart`). The underscore anchor keeps
-	//   this precise: `contest.py` and `latest.ts` do not match.
-	// - `_spec.` infix: RSpec (`*_spec.rb`).
-	// - CamelCase `*Test(s).<ext>` suffix, matched case-SENSITIVELY on the
-	//   raw basename: JUnit/Surefire (`*Test.java`, `*TestCase.java`),
-	//   Kotlin (`*Test.kt`), dotnet (`*Test.cs`/`*Tests.cs`), PHPUnit
-	//   (`*Test.php`). Case matters: Surefire's `*Test.java` does not match
-	//   `contest.java`, so neither do we.
+	// #2928: dirname has no trailing slash; match direct __tests__ children too.
 	if (
-		base.includes(".test.") ||
-		base.includes(".spec.") ||
-		base.includes("_test.") ||
-		base.includes("_spec.") ||
-		base.startsWith("test_") ||
-		base.startsWith("spec_") ||
-		/(Test|Tests|TestCase)\.(java|kt|kts|cs|fs|php)$/.test(rawBase) ||
-		dir.includes("/__tests__/") ||
+		testFileNameMatches(rawBase, base) ||
+		/(^|[\\/])__tests__([\\/]|$)/.test(dir) ||
 		dir.includes("/test/") ||
 		dir.includes("/tests/") ||
 		dir.includes("/spec/") ||

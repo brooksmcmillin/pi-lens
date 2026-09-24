@@ -39,6 +39,38 @@ import { setupTestEnvironment } from "./test-utils.js";
 /** Basenames whose `getDiagnostics` never settles — a wedged server. */
 let wedgedFiles = new Set<string>();
 /**
+ * Basenames whose fresh pull blocks until the test RELEASES it, as opposed to
+ * {@link wedgedFiles}'s never-settling promise (#3274).
+ *
+ * The distinction is the interleaving. A never-settling pull can only be ended
+ * by a bound, so a case that wants "in flight while the next turn runs, then
+ * lands" depends on the loop not having REACHED the pull yet when the test
+ * un-wedges — and turn_end's scanner reads became asynchronous in #3274, which
+ * yields the event loop where it previously did not, so the deferred loop's
+ * first pull now starts one turn earlier. That flipped this file's
+ * back-to-back-turns case from "lands in 2 ms" to "lands when the 10 s
+ * per-round-trip timeout fires", i.e. red on an 8 s window, with no change in
+ * what was delivered. A releasable gate states the choreography the case
+ * actually means and is immune to when the loop starts.
+ */
+let gatedPulls = new Map<
+	string,
+	{ promise: Promise<void>; release: () => void }
+>();
+
+/** Gate `basename`'s fresh pull until the returned release function is called. */
+function gatePull(basename: string): () => void {
+	let release!: () => void;
+	const promise = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	gatedPulls.set(basename, { promise, release });
+	return () => {
+		gatedPulls.delete(basename);
+		release();
+	};
+}
+/**
  * Basenames whose `openFile` never settles (#2504 review round 3, F-B). A
  * server that never acknowledges `didOpen` is the #240 shape: the document
  * the next pull asks about was never received, so an empty pull answers
@@ -72,6 +104,7 @@ const getDiagnostics = vi.fn(async (filePath: string) => {
 		// Never settles. Only a per-round-trip bound can get past this.
 		await new Promise(() => {});
 	}
+	await gatedPulls.get(base)?.promise;
 	pullStartedAt.set(base, Date.now());
 	if (pullDelayMs > 0) {
 		await new Promise((resolve) => setTimeout(resolve, pullDelayMs));
@@ -153,6 +186,8 @@ beforeEach(() => {
 	pullDelayMs = 0;
 	pullStartedAt = new Map();
 	pullReturnedAt = new Map();
+	for (const gate of gatedPulls.values()) gate.release();
+	gatedPulls = new Map();
 	openFile.mockClear();
 	getDiagnostics.mockClear();
 	codeAction.mockClear();
@@ -1122,8 +1157,10 @@ describe("#2504 r4 F1 — two back-to-back cold turns both deliver", () => {
 			runtime.telemetrySessionId,
 		);
 		armOneActionableWarning(path.basename(deferredFile));
-		// Wedged, so turn 0's loop is still in flight when turn 1 runs.
-		wedgedFiles.add(path.basename(deferredFile));
+		// Gated, so turn 0's loop is still in flight when turn 1 runs — and lands
+		// when this test releases it, whether or not it had already reached the
+		// pull (#3274 made turn_end yield the event loop, so it now has).
+		const releaseDeferredPull = gatePull(path.basename(deferredFile));
 		// biome-ignore lint/suspicious/noExplicitAny: minimal turn_end deps
 		await handleTurnEnd(turnEndDeps(runtime, cacheManager) as any);
 		const turnZeroIndex = runtime.turnIndex;
@@ -1165,7 +1202,7 @@ describe("#2504 r4 F1 — two back-to-back cold turns both deliver", () => {
 		).toEqual(["turn1-dispatch"]);
 
 		// ── turn 0's incumbent loop finally lands.
-		wedgedFiles.clear();
+		releaseDeferredPull();
 		expect(await settlesWithin(_awaitDeferredLspPullForTest(), 8_000)).toBe(
 			"settled",
 		);

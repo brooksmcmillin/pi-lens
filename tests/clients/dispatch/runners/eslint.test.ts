@@ -283,7 +283,7 @@ describe("eslint runner", () => {
 		}
 	});
 
-	it("skips on exit 2 (fatal/config error) rather than misreporting findings", async () => {
+	it("reports an exit-2 config error instead of claiming a clean file", async () => {
 		const env = setupTestEnvironment("pi-lens-eslint-fatal-");
 		try {
 			const filePath = path.join(env.tmpDir, "sample.ts");
@@ -301,8 +301,10 @@ describe("eslint runner", () => {
 			).default;
 			const result = await runner.run(createCtx(filePath, env.tmpDir) as never);
 
-			expect(result.status).toBe("skipped");
-			expect(result.diagnostics).toHaveLength(0);
+			expect(result.status).toBe("failed");
+			expect(result.diagnostics).toMatchObject([
+				{ id: "eslint:parse-error:1", severity: "warning" },
+			]);
 		} finally {
 			env.cleanup();
 		}

@@ -24,6 +24,7 @@ vi.mock("../../clients/latency-logger.js", async (importOriginal) => ({
 }));
 
 import { CacheManager } from "../../clients/cache-manager.js";
+import { markDisposition } from "../../clients/diagnostic-dispositions.js";
 import { consumeTurnEndFindings } from "../../clients/runtime-context.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { handleTurnEnd } from "../../clients/runtime-turn.js";
@@ -454,30 +455,49 @@ describe("turn_end govulncheck deleted call site (#1622 review H1)", () => {
 		}
 	});
 
-	// The header guard must read the POST-gate list. Guarding on the raw cache
-	// length can print "Go CVEs reachable from this code" with nothing under it.
+	// The header guard must read the POST-gate, POST-disposition list — the one
+	// it is about to print — never the raw cache length, or "Go CVEs reachable
+	// from this code" prints with nothing under it (#1627 + #1625 review).
+	//
+	// #1892 govulncheck-lane round: this case used to build its empty list with
+	// a DELETED call site, which `onMissing: "demote"` deliberately KEEPS — so
+	// the list was never empty, the assertion sat inside `if (headerIndex !==
+	// -1)`, and the case redded under no mutation of the guard it names. The
+	// emptier that actually empties this lane is the disposition filter, so
+	// that is what it uses now, and the assertion is unconditional.
 	it("never prints the govulncheck header with zero rows beneath it", async () => {
 		const { env, runtime, cacheManager } = setupSecretTurn("pi-lens-gov-hdr-");
 		try {
 			const goFile = writeSecretFile(
 				env.tmpDir,
-				"cmd/gone/main.go",
+				"cmd/live/main.go",
 				SCANNED_AT_MS - 5_000,
 			);
 			writeGovCacheAt(cacheManager, env.tmpDir, goFile);
-			fs.rmSync(path.dirname(goFile), { recursive: true, force: true });
+			// The one cached finding, marked through the identity
+			// `govulncheckFindingToProjectDiagnostic` derives — so the raw cache
+			// still holds a row while the list the render sees is empty.
+			markDisposition(
+				env.tmpDir,
+				{
+					cwd: env.tmpDir,
+					filePath: goFile,
+					tool: "govulncheck",
+					rule: "govulncheck:GO-2024-1234",
+					message:
+						"Vulnerability GO-2024-1234: reachable vulnerable dependency (fixed in v1.2.3)",
+					line: 88,
+					content: fs.readFileSync(goFile, "utf-8"),
+				},
+				"false-positive",
+			);
 
 			const content = await turnEndContent(runtime, cacheManager, env.tmpDir);
 
-			const headerIndex = content.indexOf("Go CVEs reachable from this code");
-			if (headerIndex !== -1) {
-				const after = content.slice(headerIndex);
-				const rows = after
-					.split("\n")
-					.slice(1)
-					.filter((line) => line.startsWith("  ") && line.trim().length > 0);
-				expect(rows.length).toBeGreaterThan(0);
-			}
+			expect(content).not.toContain("Go CVEs reachable from this code");
+			// The drop stays visible as a trace (#1616), so the turn is not
+			// silently clean — this is the case's other half.
+			expect(content).toContain("govulncheck 1");
 		} finally {
 			env.cleanup();
 		}
@@ -628,7 +648,17 @@ describe("turn_end demoted-secret rendering (#1622 review M1/M2)", () => {
 
 			const entry = turnEndResult();
 			expect(entry.result).toBeDefined();
-			expect(entry.result).not.toBe("clean");
+			// #1892 mutation M1b: `not "clean"` alone left the tier itself
+			// unpinned — pushing the demoted section into `blockerParts` is
+			// text-invariant at the delivery seam (the message concatenates the
+			// blocker tier and then the stale tier), so the only thing that can
+			// catch the promotion the source comment forbids is this
+			// discriminator. Assert it exactly.
+			expect(entry.result).toBe("stale_secrets_pending");
+			expect(entry.metadata).toMatchObject({
+				blockerSections: 0,
+				staleSecretSections: 1,
+			});
 		} finally {
 			env.cleanup();
 		}

@@ -10,7 +10,11 @@ import { toPosix } from "../../clients/path-utils.js";
 // root, so this guard would silently read a stale config (verified 2026-08-12:
 // commenting an entry out of the .ts left the imported list unchanged).
 import vitestConfig, { wallClockBudgetInclude } from "../../vitest.config.ts";
-import { assertNonEmptyScan } from "../support/sweep-kit.js";
+import {
+	assertNonEmptyScan,
+	listSourceFiles,
+	readWalkedFiles,
+} from "../support/sweep-kit.js";
 
 const repoRoot = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -48,12 +52,12 @@ const timingSensitiveNonSamplerMembers: Readonly<Record<string, string>> = {
 const samplerHelper = "measureMaxSyncBlock" + "Ms";
 const cpuUsageCall = "process." + "cpuUsage(";
 
+/** Every `*.test.ts` under `dir`, through the shared walker (#3082): this file
+ *  used to hand-roll the identical recursive `readdirSync` walk. */
 function testFiles(dir: string): string[] {
-	return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
-		const entryPath = path.join(dir, entry.name);
-		if (entry.isDirectory()) return testFiles(entryPath);
-		return entry.name.endsWith(".test.ts") ? [entryPath] : [];
-	});
+	return listSourceFiles(dir, { extensions: [".ts"] }).filter((file) =>
+		file.endsWith(".test.ts"),
+	);
 }
 
 /** The `include` list of the "timing-sensitive" project, read from the live config. */
@@ -101,11 +105,11 @@ function isTimingSensitive(source: string): boolean {
 describe("timing-sensitive Vitest project coverage", () => {
 	it("phases every sync-block-sampler and process.cpuUsage budget test", () => {
 		const included = timingSensitiveInclude();
-		const timingFiles = testFiles(path.join(repoRoot, "tests"))
-			.map((file) => toPosix(path.relative(repoRoot, file)))
-			.filter((file) =>
-				isTimingSensitive(fs.readFileSync(path.join(repoRoot, file), "utf8")),
-			);
+		// readWalkedFiles: a path that vanished between the walk and the read is
+		// out of the population, not a finding (#3082).
+		const timingFiles = readWalkedFiles(testFiles(path.join(repoRoot, "tests")))
+			.filter(({ source }) => isTimingSensitive(source))
+			.map(({ file }) => toPosix(path.relative(repoRoot, file)));
 		// Calibration: 14 sampler/CPU-usage tests on 2026-08-26; half is 7.
 		assertNonEmptyScan("timing-sensitive detection", timingFiles.length, 7);
 

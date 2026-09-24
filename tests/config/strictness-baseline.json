@@ -1,10 +1,10 @@
 {
 	"tsconfig.strict-indexed.json": {
-		"clients": 470,
+		"clients": 444,
 		"clients/config-core": 18,
 		"clients/dispatch": 29,
 		"clients/dispatch/rules": 12,
-		"clients/dispatch/runners": 95,
+		"clients/dispatch/runners": 82,
 		"clients/dispatch/runners/utils": 3,
 		"clients/lsp": 44,
 		"clients/lsp/wait-policy": 1,
@@ -16,7 +16,7 @@
 		"tools": 4
 	},
 	"tsconfig.strict-optional.json": {
-		"clients": 357,
+		"clients": 355,
 		"clients/config-core": 1,
 		"clients/dispatch": 18,
 		"clients/dispatch/facts": 1,
@@ -32,6 +32,6 @@
 		"clients/review-graph": 42,
 		"mcp": 10,
 		"scripts": 1,
-		"tools": 49
+		"tools": 48
 	}
 }

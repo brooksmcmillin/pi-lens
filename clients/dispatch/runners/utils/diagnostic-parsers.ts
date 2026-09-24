@@ -5,6 +5,8 @@
  * Supports the common `file:line:col: message` format used by most linters.
  */
 
+import * as path from "node:path";
+import { pathsEqual } from "../../../path-utils.js";
 import { stripAnsi } from "../../../sanitize.js";
 
 import { getAutofixCapability } from "../../../tool-policy.js";
@@ -50,8 +52,13 @@ export interface LineParserConfig {
  * Common format: file:line:col: message (with variations)
  */
 function createLineParser(config: LineParserConfig) {
-	return (raw: string, filePath: string): Diagnostic[] => {
+	return (raw: string, filePath: string, cwd: string): Diagnostic[] => {
 		const diagnostics: Diagnostic[] = [];
+		// #3295: `config.regex` is documented above as capturing the FILE in group
+		// 1, and every parser built here then dropped it and stamped the dispatched
+		// path on every line. This is the shared factory, so the predicate lives
+		// here once rather than in each `createLineParser` caller.
+		const absTarget = path.resolve(cwd, filePath);
 
 		// Optionally strip ANSI codes (for tools that output colored text)
 		const clean = config.stripAnsi !== false ? stripAnsi(raw) : raw;
@@ -61,6 +68,9 @@ function createLineParser(config: LineParserConfig) {
 		for (const line of lines) {
 			const match = line.match(config.regex);
 			if (!match) continue;
+			const reported = match[1];
+			if (reported && !pathsEqual(path.resolve(cwd, reported), absTarget))
+				continue;
 
 			const lineNum = parseInt(match[2], 10);
 			const colNum = parseInt(match[3], 10);

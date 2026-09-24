@@ -14,6 +14,10 @@ permissions:
 jobs:
   greeting:
     runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 71s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
     steps:
       # yamllint disable-line rule:line-length
       - uses: actions/first-interaction@1c4688942c71f71d4f5502a26ea67c331730fa4d # v3.1.0

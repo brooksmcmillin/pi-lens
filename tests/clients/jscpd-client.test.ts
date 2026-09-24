@@ -614,4 +614,36 @@ describe("jscpd-client in-flight ABA release (#1968)", () => {
 			await cleanupTestEnvironmentsDrained("pi-lens-jscpd-");
 		}
 	});
+
+	it("drain waits for an in-flight scan before fixture cleanup", async () => {
+		// #3338: a drained fixture root must not be removed while a jscpd scan
+		// still owns work that can recreate its report directory.
+		const { JscpdClient } = await import("../../clients/jscpd-client.js");
+		const { tmpDir } = setupTestEnvironment("pi-lens-jscpd-shutdown-");
+		const client = new JscpdClient(false);
+		const internals = client as unknown as Internals;
+		const scanGate = gatedPromise<unknown>();
+		try {
+			vi.spyOn(internals, "ensureAvailable").mockResolvedValue(true);
+			vi.spyOn(internals, "hasSourceFilesRecursive").mockReturnValue(true);
+			vi.spyOn(internals, "runScan").mockReturnValue(scanGate.promise);
+
+			void client.scan(tmpDir, 5, 50, false);
+			await tick();
+			let shutdownSettled = false;
+			const shutdown = client.shutdown().then(() => {
+				shutdownSettled = true;
+			});
+			await tick();
+			expect(shutdownSettled).toBe(false);
+
+			scanGate.resolve({});
+			await shutdown;
+			expect(shutdownSettled).toBe(true);
+		} finally {
+			await cleanupTestEnvironmentsDrained("pi-lens-jscpd-", {
+				beforeDrain: () => client.shutdown(),
+			});
+		}
+	});
 });

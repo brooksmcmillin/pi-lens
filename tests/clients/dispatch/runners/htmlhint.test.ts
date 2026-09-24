@@ -40,7 +40,7 @@ function createCtx(filePath: string, cwd: string) {
 
 // Real htmlhint 1.x unix-format bytes (captured live from the fixture run).
 const REAL_UNIX_OUTPUT = [
-	"/tmp/ws/bad.html:6:5: Tag must be paired, missing: [ </div> ], start tag match failed [ <div> ] on line 6. [error/tag-pair]",
+	"bad.html:6:5: Tag must be paired, missing: [ </div> ], start tag match failed [ <div> ] on line 6. [error/tag-pair]",
 	"",
 	"\u001b[31m1 problems\u001b[0m",
 	"",

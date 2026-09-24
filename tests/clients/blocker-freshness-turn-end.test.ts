@@ -11,7 +11,15 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+	afterAll,
+	afterEach,
+	beforeAll,
+	describe,
+	expect,
+	it,
+	vi,
+} from "vitest";
 
 const logLatency = vi.hoisted(() => vi.fn());
 vi.mock("../../clients/latency-logger.js", async (importOriginal) => {
@@ -32,6 +40,7 @@ import {
 	getDegradationSummary,
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
+import { _resetInstanceRegistryEnabledForTests } from "../../clients/instance-registry.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import {
 	cancelLSPIdleReset,
@@ -77,6 +86,37 @@ function driftIntoFuture(filePath: string): void {
 	const future = new Date(Date.now() + 60_000);
 	fs.utimesSync(filePath, future, future);
 }
+
+/**
+ * #3274: turn_end fires the instance-registry heartbeat as fire-and-forget
+ * (`void updateHeartbeat()`, clients/runtime-turn.ts) and never waits for it.
+ * When its file lock is contended, `withInstanceRegistryLock` arms a ~20 ms
+ * backoff timer — a timer the hook neither owns nor awaits, but one the
+ * `vi.getTimerCount()` pin below counts.
+ *
+ * That was invisible while turn_end ran its scanner-cache reads synchronously:
+ * the hook returned before the heartbeat's first `await` continuation. #3274's
+ * async reads yield the event loop, so the heartbeat chain now advances DURING
+ * the turn, and the case below failed 2 of 6 parallel runs with
+ * `expected 2 to be 1`. Measured, not inferred — a `setTimeout` trace on the
+ * failing runs named `withInstanceRegistryLock` ← `updateHeartbeat` both
+ * times, at 18 ms and 22 ms, while all five `bounded()` deadline timers were
+ * armed AND cleared in the same run.
+ *
+ * The registry is a cross-process file the hook only writes to best-effort, so
+ * this file turns it off through its own shipped kill switch rather than
+ * mocking a module or loosening the assertion: the count then measures what it
+ * is meant to measure, the timers turn_end itself schedules.
+ */
+beforeAll(() => {
+	vi.stubEnv("PI_LENS_INSTANCE_REGISTRY", "0");
+	_resetInstanceRegistryEnabledForTests();
+});
+
+afterAll(() => {
+	vi.unstubAllEnvs();
+	_resetInstanceRegistryEnabledForTests();
+});
 
 afterEach(() => {
 	cancelLSPIdleReset();
@@ -279,12 +319,15 @@ describe("turn-end blocker freshness (#1631)", () => {
 			driftIntoFuture(filePath);
 			expect(
 				gateFindingsByPathFreshness({
-					store: "test-runner",
-					findings: [{ filePath }],
 					cwd: env.tmpDir,
-					scannedAt: markedAtMs,
-					citedPath: (finding) => finding.filePath,
-				}).stale,
+					sources: {
+						"test-runner": {
+							findings: [{ filePath }],
+							scannedAt: markedAtMs,
+							citedPath: (finding: { filePath: string }) => finding.filePath,
+						},
+					},
+				})["test-runner"].stale,
 			).toHaveLength(1);
 
 			await handleTurnEnd(

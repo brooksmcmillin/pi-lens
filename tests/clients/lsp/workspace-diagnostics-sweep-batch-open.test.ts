@@ -74,7 +74,7 @@ describe("runWorkspaceDiagnostics — batch-open restores #271 coalescing for a 
 		vi.resetModules();
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
-		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "wsd-batchopen-"));
+		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-wsd-batchopen-"));
 	});
 
 	afterEach(() => removeTempDirSync(tmp));
@@ -198,7 +198,7 @@ describe("runWorkspaceDiagnostics — pre-open is bounded, not just fast (#615)"
 		vi.resetModules();
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
-		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "wsd-preopen-bound-"));
+		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-wsd-preopen-bound-"));
 		// These tests' fake client's notify.open never resolves, so the #667
 		// pre-sweep warm-up touch pays the full notify-write budget on both its
 		// initial attempt and its retry, plus the backoff between them — flatten

@@ -52,6 +52,58 @@ per-disposition binding strength:
   edits to the line and drift elsewhere in the file. (`suppress` is enforced
   by the inline comment anyway; the store entry is an audit mirror.)
 
+Both anchors also hash the producing `tool`, so a finding that changes hands
+between tools gets a fresh anchor. One such change shipped in #3041: `mode:
+"full"` used to render auxiliary-scanner findings (ast-grep, opengrep, zizmor,
+typos) under the generic `tool: "lsp"` while every other surface already showed
+them under their real tool id. It now shows the real id everywhere, so a mark
+recorded against the old `lsp`-labelled copy no longer matches and the finding
+gets one fresh chance to be re-marked — under the same `tool` the per-edit path
+has always used.
+
+## Which surfaces honor a mark
+
+Every model-facing surface that renders a diagnostic applies the same filter
+stack, in the same order: inline `pi-lens-ignore` comments, then the stored
+dispositions, then the project's `.pi-lens.json` `rules.<id>.disable`/`select`
+policy (`clients/dispatch/finding-policy.ts`). That covers the per-edit
+feedback, `lens_diagnostics` `mode=delta`/`mode=all`/`mode=full`, and — since
+#3088 — the `lens_diagnostics` `source=lsp` probe lane together with the legacy
+`lsp_diagnostics` tool and the MCP `pilens_lsp_diagnostics` shim that share it.
+Since #3102 it also covers the two PUSH surfaces that were still unfiltered:
+the turn-end **late-auxiliary advisory** (findings an auxiliary LSP published
+after its grace window, drained at the next `turn_end`) and the **cold-neighbour
+cascade run** (`buildResolvedFoundCascadeRun`, built in the quiet-window
+reconcile). Both are pushed rather than asked for, so when a mark suppresses
+everything they had to say they say nothing at all — silence on a push surface
+is not a claim that the file is clean, and the drop count is recorded in the
+lane's own `late_auxiliary_findings` / `cascade_finding_policy` latency row. A
+delivery that still has something to say states what it dropped inline.
+
+Before #3088 the probe lane was the one exception: it returned the raw LSP
+result, so a finding marked `false-positive` stayed hidden in `delta`/`full`
+and re-appeared on every probe — the lane
+`skills/pi-lens-lsp-navigation` steers agents to as PRIMARY. It now filters
+like every other surface, its footer reconcile writes the FILTERED set (so a
+probe can no longer re-arm a finding the mark demoted), and a drop is always
+stated as a count:
+
+```text
+suppressed by disposition: 1 finding(s) dropped from this result …
+```
+
+Two properties of the probe lane are worth knowing:
+
+- **A mark converges whichever surface you made it from.** The probe renders a
+  finding as `[<source>] (<code>)` while the widget footer and `mode=full`
+  render the canonical `tool: "lsp"` / `rule: "<source>:<code>"`, and `tool` is
+  optional on the mark tool. The probe filter matches every one of those
+  spellings, so a mark made from the probe's own output works, and so does one
+  made from any other surface.
+- **A blocking finding still needs a strict mark.** `semantic: "blocking"`
+  findings are dropped only by a content-bound `false-positive` match, never by
+  a weak `suppress`/`defer` — on this lane too (#1625 F1).
+
 ## Suppression comments
 
 `suppress` writes a pi-lens-owned ignore comment on the line immediately

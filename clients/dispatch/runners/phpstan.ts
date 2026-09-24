@@ -17,7 +17,7 @@ import type { ToolExitCodes } from "./utils/spawn-outcome.js";
 import { parseToolRun } from "./utils/tool-failure.js";
 import { finishParsedRun } from "./utils/tool-failure.js";
 
-// phpstan's documented exit codes: 0 = no errors, 1 = errors found, 2 = a
+// EXIT TABLE (PHPStan 1.12 docs https://phpstan.org/user-guide/command-line-usage): 0 = no errors, 1 = errors found, 2 = a
 // fatal/internal error that stopped the analysis. Only 1 is a run that carries
 // findings.
 const PHPSTAN_EXIT_CODES: ToolExitCodes = { ran: [1] };

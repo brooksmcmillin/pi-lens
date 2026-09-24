@@ -380,3 +380,72 @@ describe("CI memory attribution (#2042)", () => {
 		expect(step).toContain("memory.events absent or unreadable");
 	});
 });
+
+// #2042 2026-09-15 diagnosis, section A: the cheapest probe.
+describe("CI cheapest-probe wiring (#2042 2026-09-15)", () => {
+	const ci = fs.readFileSync(
+		path.join(repoRoot, ".github/workflows/ci.yml"),
+		"utf8",
+	);
+	const tailStepMarker = "- name: Memory sample tail";
+	const runTestsStep = ci.slice(
+		ci.indexOf("- name: Run tests"),
+		ci.indexOf(tailStepMarker),
+	);
+	// Bounded to this ONE step's own body, not left open to end-of-file --
+	// round-2 review self-catch: an earlier version of this slice ran to EOF
+	// and a `not.toContain('cat "$f"')` assertion tripped on an unrelated
+	// `cat "$f"` in a wholly different job later in ci.yml.
+	const tailStep = ci.slice(
+		ci.indexOf(tailStepMarker),
+		ci.indexOf("- name: Kernel kill evidence"),
+	);
+
+	it("samples five times faster than the 2s default that could miss a spike", () => {
+		// The env var already existed (PI_LENS_MEM_WATCH_INTERVAL_MS); only the
+		// CI value is new. A 2s poll cannot see a sub-2-second spike -- that gap
+		// is exactly what every "H4 untested" line in the diagnosis names.
+		expect(runTestsStep).toContain("PI_LENS_MEM_WATCH_INTERVAL_MS: '200'");
+	});
+
+	it("shares one sample-file path between the writer and the reader step", () => {
+		const pathPattern = /PI_LENS_MEM_WATCH_SAMPLE_FILE:\s*(.+)/;
+		const writerPath = pathPattern.exec(runTestsStep)?.[1]?.trim();
+		const readerPath = pathPattern.exec(tailStep)?.[1]?.trim();
+		expect(writerPath, "Run tests must set the sample file path").toBeTruthy();
+		expect(writerPath).toBe(readerPath);
+	});
+
+	// The master 1701d01 red lost its low-water line entirely because the
+	// WRAPPER was the process killed -- a step gated on failure() alone would
+	// never run if the job never reaches a later step in some future reorder,
+	// but `if: always()` is what makes it survive that AND a cancelled job.
+	it("tails the sample file from an if: always() step, so a killed run still yields it", () => {
+		expect(ci).toContain(tailStepMarker);
+		expect(tailStep.slice(0, 120)).toContain("if: always()");
+	});
+
+	// #2230 round 2 F1 fixed the identical defect on "Kernel kill evidence"
+	// four lines away; this is the sibling that stayed broken until 2026-09-15
+	// (the diagnosis's own "(4) what it cannot prove" section).
+	it("resolves Runner capacity's memory.max through the job's own cgroup, not the unpopulated root", () => {
+		const step = ci.slice(
+			ci.indexOf("Runner capacity"),
+			ci.indexOf("- name: Run tests"),
+		);
+		expect(step).toContain("/proc/self/cgroup");
+		expect(step).not.toContain(
+			"cat /sys/fs/cgroup/memory.max 2>/dev/null || true",
+		);
+	});
+
+	// Round-2 review F2: the sample file is append-only and therefore
+	// unbounded on disk (deliberately -- see scripts/with-memory-watch.mjs's
+	// own comment), so the ONLY place output volume is bounded is this read
+	// step. `cat` on an hours-long run would flood the job log; `tail` is the
+	// bound.
+	it("bounds what the tail step PRINTS with tail -n, not what the sampler writes", () => {
+		expect(tailStep).toContain('tail -n 300 "$f"');
+		expect(tailStep).not.toContain('cat "$f"');
+	});
+});

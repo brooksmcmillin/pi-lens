@@ -186,7 +186,7 @@ describe("index session_start wiring — classification logged with mode (#2129)
 		clearLatencyLog();
 		await flushLatencyLog();
 		const tempWorktree = fs.mkdtempSync(
-			path.join(os.tmpdir(), "pi-agent-worktree-"),
+			path.join(os.tmpdir(), "pi-lens-pi-agent-worktree-"),
 		);
 		try {
 			const hostCtx = makeCtx({ cwd: hostRoot, sessionId: "host-session" });

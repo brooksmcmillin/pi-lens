@@ -43,10 +43,26 @@ const EXEMPT: Record<string, string> = {
 		"advisory text built here but delivered by runtime-turn.ts (registered)",
 	"demoted-finding-render.ts":
 		"transforms pipeline stop-blocker output; follows that registration",
+	// #3246, the same shape as demoted-finding-render.ts one line up: this
+	// module re-derives the body of the blocker that runtime-turn.ts's
+	// registered `runtime-turn:unresolved-inline-blocker` seam delivers, and
+	// pushes nothing itself. The marker appears only in its doc comment, which
+	// the sibling test below keeps honest.
+	"inline-blocker-dispositions.ts":
+		"re-derives the unresolved-blocker body; delivered by runtime-turn.ts (registered)",
 	"runtime-context.ts":
 		"framing wrapper over registered context injections; no own delivery",
 	"format-utils.ts":
 		"shared emoji lookup table consumed by registered render paths",
+	// #1892, the same shape as actionable-warnings.ts and
+	// demoted-finding-render.ts above: a turn-end LANE renders the sections
+	// that `clients/runtime-turn.ts`'s registered `runtime-turn:secrets-*` /
+	// `runtime-turn:stale-secrets-tier` seams deliver, and pushes nothing
+	// itself (`tests/config/turn-end-lane-boundaries.test.ts` reds if it ever
+	// does). Keyed by its path under clients/, not by basename, so this
+	// exemption cannot silently cover a future unrelated `secrets.ts`.
+	"turn-end/lanes/secrets.ts":
+		"turn-end lane; sections delivered by runtime-turn.ts (registered)",
 };
 
 function collectSourceFiles(dir: string, out: string[] = []): string[] {
@@ -95,7 +111,13 @@ describe("delivery-surface adoption ratchet (#2028/#2029)", () => {
 		// Resolve each exempt key to its actual location (some are nested).
 		const allFiles = collectSourceFiles(CLIENTS_DIR);
 		for (const base of Object.keys(EXEMPT)) {
-			const match = allFiles.find((f) => path.basename(f) === base);
+			// A key is either a basename or a clients/-relative path (#1892: a
+			// nested lane needs the narrower spelling, and a stale exemption of
+			// either spelling must still be reported by this test).
+			const match = allFiles.find(
+				(f) =>
+					path.basename(f) === base || path.relative(CLIENTS_DIR, f) === base,
+			);
 			expect(
 				match,
 				`exempt file not found under clients/: ${base}`,

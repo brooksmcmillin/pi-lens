@@ -56,7 +56,7 @@ describe("parseDartMachineOutput — fixable propagation (#112 slice)", () => {
 			}),
 		].join("\n");
 
-		const diags = parseDartMachineOutput(raw, "lib/main.dart");
+		const diags = parseDartMachineOutput(raw, "lib/main.dart", process.cwd());
 		expect(diags).toHaveLength(3);
 		for (const d of diags) {
 			expect(d.tool).toBe("dart");
@@ -86,7 +86,7 @@ describe("parseDartMachineOutput — fixable propagation (#112 slice)", () => {
 			}),
 		].join("\n");
 
-		const diags = parseDartMachineOutput(raw, "lib/main.dart");
+		const diags = parseDartMachineOutput(raw, "lib/main.dart", process.cwd());
 		expect(diags).toHaveLength(2);
 		for (const d of diags) {
 			expect(d.fixable).toBe(false);
@@ -103,7 +103,7 @@ describe("parseDartMachineOutput — fixable propagation (#112 slice)", () => {
 			col: 5,
 			message: "Promoted to error by analysis_options.",
 		});
-		const diags = parseDartMachineOutput(raw, "lib/main.dart");
+		const diags = parseDartMachineOutput(raw, "lib/main.dart", process.cwd());
 		expect(diags).toHaveLength(1);
 		expect(diags[0].severity).toBe("error");
 		expect(diags[0].semantic).toBe("blocking");
@@ -130,14 +130,18 @@ describe("parseDartMachineOutput — fixable propagation (#112 slice)", () => {
 			}),
 		].join("\n");
 
-		const diags = parseDartMachineOutput(raw, "lib/main.dart");
+		const diags = parseDartMachineOutput(raw, "lib/main.dart", process.cwd());
 		expect(diags).toHaveLength(1);
 		expect(diags[0].message).toContain("right file");
 	});
 
 	it("handles empty input gracefully", () => {
-		expect(parseDartMachineOutput("", "lib/main.dart")).toEqual([]);
-		expect(parseDartMachineOutput("\n\n", "lib/main.dart")).toEqual([]);
+		expect(parseDartMachineOutput("", "lib/main.dart", process.cwd())).toEqual(
+			[],
+		);
+		expect(
+			parseDartMachineOutput("\n\n", "lib/main.dart", process.cwd()),
+		).toEqual([]);
 	});
 
 	it("the allowlist covers core dart-fix lints and skips judgment-call rules", () => {

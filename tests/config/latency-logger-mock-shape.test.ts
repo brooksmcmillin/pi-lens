@@ -10,47 +10,49 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { repoRoot } from "../support/module-instance-scan.js";
-import { assertNonEmptyScan, stripSource } from "../support/sweep-kit.js";
+import {
+	assertNonEmptyScan,
+	listSourceFiles,
+	matchingCloseIndex,
+	readWalkedFiles,
+	stripSource,
+} from "../support/sweep-kit.js";
 
+/** Every `*.test.ts` under `root`, through the shared walker (#3082): this
+ *  file used to hand-roll the identical recursive `readdirSync` walk. */
 function walkTestFiles(root: string): string[] {
 	if (!fs.existsSync(root)) return [];
-	const files: string[] = [];
-	const walk = (directory: string): void => {
-		for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-			const file = path.join(directory, entry.name);
-			if (entry.isDirectory()) walk(file);
-			else if (entry.isFile() && entry.name.endsWith(".test.ts"))
-				files.push(file);
-		}
-	};
-	walk(root);
-	return files.sort();
+	return listSourceFiles(root, { extensions: [".ts"] }).filter((file) =>
+		file.endsWith(".test.ts"),
+	);
 }
 
 type LatencyMock = { relativePath: string; factory: string };
 
+/**
+ * Index of the `)` balancing the `(` at `openParen`, quote-aware. #3134: the
+ * depth count is `sweep-kit.ts`'s `matchingCloseIndex` with the same
+ * `quoteAware: true` option `availability-classifiedby-scan.ts`'s
+ * `readBalancedArgs` uses; only this member throws instead of returning -1
+ * on an unclosed call, so that convention stays local to this caller.
+ */
 function callEnd(source: string, openParen: number): number {
-	let depth = 0;
-	let quote = "";
-	for (let index = openParen; index < source.length; index += 1) {
-		const character = source[index];
-		if (quote) {
-			if (character === "\\") index += 1;
-			else if (character === quote) quote = "";
-			continue;
-		}
-		if (character === '"' || character === "'" || character === "`") {
-			quote = character;
-			continue;
-		}
-		if (character === "(") depth += 1;
-		if (character === ")" && --depth === 0) return index;
+	const close = matchingCloseIndex(source, openParen, "(", ")", {
+		quoteAware: true,
+	});
+	if (close === -1) {
+		throw new Error(`Unclosed vi.mock call in ${source.slice(0, openParen)}`);
 	}
-	throw new Error(`Unclosed vi.mock call in ${source.slice(0, openParen)}`);
+	return close;
 }
 
-function findLatencyMocks(file: string): LatencyMock[] {
-	const source = fs.readFileSync(file, "utf8");
+function findLatencyMocks({
+	file,
+	source,
+}: {
+	file: string;
+	source: string;
+}): LatencyMock[] {
 	const code = stripSource(source);
 	const mocks: LatencyMock[] = [];
 	const pattern = /vi\.mock\s*\(/g;
@@ -81,7 +83,10 @@ describe("latency-logger mock shape (#2281)", () => {
 		// `.changelog/` roll) never delete.
 		const files = walkTestFiles(path.join(repoRoot, "tests"));
 		assertNonEmptyScan("latency-logger test file walk", files.length, 900);
-		const mocks = files.flatMap(findLatencyMocks);
+		// readWalkedFiles: a path that vanished between the walk and the read is
+		// out of the population, not a finding (#3082 — this scan was one of the
+		// four rotating ENOENT victims).
+		const mocks = readWalkedFiles(files).flatMap(findLatencyMocks);
 		assertNonEmptyScan("latency-logger mock scan", mocks.length, 80);
 		const bare = mocks.filter(
 			({ factory }) =>
@@ -89,5 +94,28 @@ describe("latency-logger mock shape (#2281)", () => {
 				!factory.includes("importOriginal"),
 		);
 		expect(bare).toEqual([]);
+	});
+
+	it("keeps the factory boundary quote-aware when a string inside it carries a bare `)` (#3145 review round 2)", () => {
+		// Regression pin for the #3145 review finding: the `quoteAware` option
+		// on `matchingCloseIndex` looked dead by mutation (neutering it reds no
+		// existing test) until the reviewer probed a factory whose own body
+		// contains a string with an unbalanced `)`. Without quote-awareness,
+		// that `)` reads as the call's OWN closing paren, truncating `factory`
+		// long before the real end — dropping the `importActual` call this
+		// sweep exists to require, and silently passing a bare-replacement mock
+		// the sweep is supposed to catch.
+		const source = [
+			'vi.mock("../../clients/latency-logger.js", () => {',
+			'\tconst note = "see docs)";',
+			"\treturn {",
+			'\t\t...vi.importActual("../../clients/latency-logger.js"),',
+			"\t\tlogLatency: vi.fn(),",
+			"\t};",
+			"});",
+		].join("\n");
+		const mocks = findLatencyMocks({ file: "fixture.test.ts", source });
+		expect(mocks).toHaveLength(1);
+		expect(mocks[0]?.factory).toContain("importActual");
 	});
 });

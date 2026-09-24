@@ -427,3 +427,146 @@ fi
 		}
 	});
 });
+
+/**
+ * The install SPEC, not just the strategy (#3312).
+ *
+ * cmake-format's console script answers `--version` from a bare `cmakelang`
+ * install and then dies on the first `.cmake-format.yaml` with
+ * `ModuleNotFoundError: No module named 'yaml'`: upstream ships PyYAML behind an
+ * extra (`pyyaml (>=5.3) ; extra == 'yaml'` in cmakelang 0.6.13's metadata). The
+ * nightly's cmake row was that failure.
+ *
+ * The fake pipx below is production-faithful on the axis under test — measured
+ * against pipx 1.17.6 in a scratch PIPX_HOME:
+ *
+ *   $ pipx install "cmakelang[yaml]"      # over an existing bare venv
+ *   modifying existing installation … Pass '--force' to force installation
+ *   $ echo $?
+ *   0
+ *   $ cmake-format --dump-config yaml     # still broken
+ *   ModuleNotFoundError: No module named 'yaml'  (exit 1)
+ *
+ * so a double that quietly re-installed on every call would turn an inert fix
+ * green.
+ */
+function writeFakePipx(binDir: string, root: string): string {
+	const log = path.join(root, "pipx.log");
+	const venvs = path.join(root, "pipx-venvs");
+	const pipxBin = path.join(root, "pipx-bin");
+	writeExecutable(
+		path.join(binDir, "pipx"),
+		`#!/bin/sh
+echo "$*" >> "${log}"
+if [ "$1" = "environment" ]; then echo "${pipxBin}"; exit 0; fi
+[ "$1" = "install" ] || exit 1
+force=no
+spec=""
+shift
+for arg in "$@"; do
+  if [ "$arg" = "--force" ]; then force=yes; else spec="$arg"; fi
+done
+if [ -d "${venvs}/cmakelang" ] && [ "$force" = no ]; then
+  echo "'cmakelang' already seems to be installed. Not modifying existing installation in '${venvs}/cmakelang'. Pass '--force' to force installation"
+  exit 0
+fi
+/bin/mkdir -p "${venvs}/cmakelang" "${pipxBin}"
+case "$spec" in
+  *"[yaml]"*) echo ok > "${venvs}/cmakelang/yaml-state" ;;
+  *) echo missing > "${venvs}/cmakelang/yaml-state" ;;
+esac
+printf '#!/bin/sh\\nif [ "$1" = "--version" ]; then echo 0.6.13; exit 0; fi\\nif [ "$(/bin/cat "${venvs}/cmakelang/yaml-state")" = ok ]; then echo yaml-ok; exit 0; fi\\necho "ModuleNotFoundError: No module named yaml" >&2; exit 1\\n' > "${pipxBin}/cmake-format"
+/bin/chmod 750 "${pipxBin}/cmake-format"
+exit 0
+`,
+	);
+	return log;
+}
+
+/**
+ * Run the launcher the installer resolved, through the PATH the installer
+ * exported — production resolves a pipx console script by name, so the resolved
+ * value is bare (`cmake-format`), not a path the test could invent.
+ */
+async function runResolved(result: {
+	resolved: string;
+	path: string;
+}): Promise<string> {
+	const { stdout } = await execFileAsync(result.resolved, ["--dump-config"], {
+		env: { ...process.env, PATH: result.path },
+	});
+	return stdout.trim();
+}
+
+describe("pip install spec carries the extra the tool actually needs (#3312)", () => {
+	it("installs cmakelang with its yaml extra through pipx", async () => {
+		const root = scratchDir();
+		const bin = path.join(root, "bin");
+		fs.mkdirSync(bin, { recursive: true });
+		const log = writeFakePipx(bin, root);
+
+		const program = await runInstaller(root, bin, "cmake-format");
+
+		expect(program.result.installed).toBe(true);
+		expect(fs.readFileSync(log, "utf-8").split("\n")[0]).toBe(
+			"install --force cmakelang[yaml]",
+		);
+		// The independent effect: the launcher the installer resolved can run the
+		// YAML path, not merely `--version`.
+		expect(await runResolved(program.result)).toBe("yaml-ok");
+	});
+
+	it("repairs a cmakelang venv that predates the extra instead of reporting a no-op install", async () => {
+		const root = scratchDir();
+		const bin = path.join(root, "bin");
+		fs.mkdirSync(bin, { recursive: true });
+		writeFakePipx(bin, root);
+		// A venv from before the extra was added to the registry entry — the state
+		// a dev box reaches after any earlier `pipx install cmakelang`. Plain
+		// `pipx install` exits 0 here and changes nothing.
+		fs.mkdirSync(path.join(root, "pipx-venvs", "cmakelang"), {
+			recursive: true,
+		});
+		fs.writeFileSync(
+			path.join(root, "pipx-venvs", "cmakelang", "yaml-state"),
+			"missing\n",
+		);
+
+		const program = await runInstaller(root, bin, "cmake-format");
+
+		expect(program.result.installed).toBe(true);
+		expect(await runResolved(program.result)).toBe("yaml-ok");
+	});
+
+	it("keeps the extra on the pip --user rung when pipx is absent", async () => {
+		const root = scratchDir();
+		const bin = path.join(root, "bin");
+		const userBase = path.join(root, "user-base");
+		fs.mkdirSync(bin, { recursive: true });
+		const log = path.join(root, "pip.log");
+		writeExecutable(
+			path.join(bin, "pip3"),
+			`#!/bin/sh
+echo "$*" >> "$FAKE_PIP_LOG"
+if [ "$1" = "install" ] && [ "$2" = "--user" ]; then
+  /bin/mkdir -p "$FAKE_USER_BASE/bin"
+  printf '#!/bin/sh\\necho 0.6.13\\n' > "$FAKE_USER_BASE/bin/cmake-format"
+  /bin/chmod 750 "$FAKE_USER_BASE/bin/cmake-format"
+  exit 0
+fi
+exit 1
+`,
+		);
+		writeFakePythonWithoutVenv(bin, "pep668");
+
+		const program = await runInstaller(root, bin, "cmake-format", {
+			FAKE_PIP_LOG: log,
+			FAKE_USER_BASE: userBase,
+		});
+
+		expect(program.result.installed).toBe(true);
+		expect(fs.readFileSync(log, "utf-8")).toContain(
+			"install --user cmakelang[yaml]",
+		);
+	});
+});

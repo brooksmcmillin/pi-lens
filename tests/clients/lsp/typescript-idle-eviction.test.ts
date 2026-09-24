@@ -273,7 +273,7 @@ describe("TypeScript language-service idle eviction (#1332 b2)", () => {
 			);
 			expect("release" in claimB).toBe(true);
 			const tokenB = harness.outstandingAuxNotifyWrites.get(key as string);
-			await callbackA?.();
+			callbackA!();
 			await Promise.resolve();
 			expect(harness.outstandingAuxNotifyWrites.get(key as string)).toBe(
 				tokenB,

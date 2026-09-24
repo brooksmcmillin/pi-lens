@@ -16,18 +16,31 @@
 // stdin shape, the exit code, or which stream carries the message.
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import {
+	closeSync,
+	mkdirSync,
+	mkdtempSync,
+	openSync,
+	readFileSync,
+	rmSync,
+	symlinkSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
 	classifyPayload,
 	findDeny,
+	RULE_MESSAGES,
 	scannableRegions,
 	splitSegments,
 	splitWords,
 	stripEnvAssignments,
 } from "../../scripts/hooks/guard-bash.mjs";
+import type { DenyRule } from "../../scripts/hooks/guard-bash.d.mts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, "..", "..");
@@ -138,6 +151,33 @@ const DENY_CASES: Array<[command: string, ruleNeedle: string]> = [
 	// W1 (#2726): a here-string is not a heredoc marker.  The command after
 	// it remains live and must still be classified.
 	["grep x <<< foo\ngit stash", "stash"],
+	// #3026 (2026-09-15), the recurrence this rule prevents: a fixer aimed
+	// TMPDIR at the vitest harness's own PI_LENS_HOME, then reported "16
+	// suites red on origin/master" from a tree that was green. The command
+	// is VERBATIM from that PR body. Measured on this branch:
+	// tests/clients/ext-gate-before-ignore.test.ts is 8/8 green with TMPDIR
+	// elsewhere and 7 failed / 1 passed with this prefix.
+	[
+		"TMPDIR=$PWD/.probe-home npx vitest run tests/clients/ext-gate-before-ignore.test.ts",
+		"tmpdir",
+	],
+	// The export spelling of the same offence -- a separate branch of
+	// classifySegment (the export builtin never runs a trailing command, so
+	// it returns before the command dispatch).
+	["export TMPDIR=$PWD/.probe-home && npm test", "tmpdir"],
+	// A quoted value, and an absolute path: segment membership, not a
+	// $PWD-prefix string match, is what decides.
+	['TMPDIR="/home/dev/wt/.probe-home" npm test', "tmpdir"],
+	// A directory UNDER the harness home is the same collision.
+	["TMPDIR=$PWD/.probe-home/tmp npm test", "tmpdir"],
+	// TMP and TEMP reach os.tmpdir() too (measured; see TEMP_DIR_VARS).
+	["TMP=$PWD/.probe-home npm test", "tmpdir"],
+	["TEMP=$PWD/.probe-home npm test", "tmpdir"],
+	// The variable spelling of the same directory -- what an agent reaches
+	// for straight after reading the `probe` rule's own message.
+	["TMPDIR=$PI_LENS_HOME npx vitest run tests/config", "tmpdir"],
+	["TMPDIR=${PI_LENS_HOME}/x npx vitest run tests/config", "tmpdir"],
+	["TMPDIR=$PI_LENS_HOME/sub npx vitest run tests/config", "tmpdir"],
 ];
 
 // Every allow string the issue lists, which must stay green.
@@ -212,6 +252,29 @@ const ALLOW_CASES: string[] = [
 	// Real bash reports the malformed outer substitution and does not run a
 	// nested substitution inside it.
 	"cat <<EOF\n$(echo x\n$(git stash)\nEOF",
+	// #3026: the COMPLIANT shapes of the tmpdirCollision rule. TMPDIR aimed
+	// at its own directory, with PI_LENS_HOME still pinned at .probe-home
+	// exactly as AGENTS.md "Probe hygiene" prescribes.
+	"PI_LENS_HOME=$PWD/.probe-home TMPDIR=$PWD/.tmp-disk npx vitest run tests/config",
+	"export TMPDIR=/home/dev/.cache/lane-tmp\nnpx vitest run tests/config",
+	// TMPDIR untouched -- the harness keeps the real one on purpose.
+	"PI_LENS_HOME=$PWD/.probe-home npx vitest run tests/config",
+	// A neighbouring directory whose NAME merely starts with the harness
+	// segment is a different directory (segment equality, not prefix).
+	"TMPDIR=$PWD/.probe-home-2 npm test",
+	// PI_LENS_HOME itself pointed at .probe-home is the PRESCRIBED form and
+	// must never be caught by the TMPDIR rule.
+	"PI_LENS_HOME=$PWD/.probe-home npm test",
+	"export PI_LENS_HOME=$PWD/.probe-home && npm test",
+	// Review round 2 T3: a DIFFERENT variable whose name merely starts with
+	// PI_LENS_HOME names a different directory. Both were denied before the
+	// name boundary landed.
+	"TMPDIR=$PI_LENS_HOME_TMP npm test",
+	"TMPDIR=$PI_LENS_HOMEDIR/x npm test",
+	// Review round 2, named limit: a third variable hides the path from a
+	// static scan, so this ALLOWS. The row exists so the limit is a pinned,
+	// visible behaviour rather than an untested claim in a docblock.
+	"export PROBE_HOME=$PWD/.probe-home; export TMPDIR=$PROBE_HOME; npm test",
 ];
 
 // Round-2 survey harness retained as a regression fixture for #2705. The
@@ -266,6 +329,170 @@ describe("scripts/hooks/guard-bash.mjs -- allow list (#2699)", () => {
 	});
 });
 
+describe("scripts/hooks/guard-bash.mjs -- rule declarations (review round 2 T1)", () => {
+	it("declares tmpdirCollision in the DenyRule union the .d.mts exports", () => {
+		// The union in scripts/hooks/guard-bash.d.mts is what every .ts caller
+		// sees. It shipped without the fifth rule in round 1, so this typed
+		// binding is the guard: remove "tmpdirCollision" from the union and
+		// `npm run lint` fails with TS2322 before the suite even runs.
+		const rule: DenyRule = "tmpdirCollision";
+		expect(RULE_MESSAGES[rule]).toContain("TMPDIR");
+	});
+
+	it("declares worktreeSymlink in the DenyRule union the .d.mts exports", () => {
+		// Same guard as the tmpdirCollision case above, for the sixth rule
+		// (#3173): remove "worktreeSymlink" from the union and `npm run lint`
+		// fails with TS2322 before the suite even runs.
+		const rule: DenyRule = "worktreeSymlink";
+		expect(RULE_MESSAGES[rule]).toContain("node_modules");
+	});
+});
+
+// #3173 (twice on 2026-09-16): a fixer ran `git worktree remove` on a tree
+// whose node_modules was a symlink into the shared checkout
+// (`ln -s <main checkout>/node_modules node_modules`, the fixer playbook's
+// own speed convention). Git followed the link and emptied the SHARED
+// install; any other agent building or testing in that window saw spurious
+// ERR_MODULE_NOT_FOUND. This is a real filesystem check (not pure text
+// classification like every other rule above), so each case builds a real
+// fixture directory rather than a fictitious path string.
+describe("scripts/hooks/guard-bash.mjs -- git worktree remove node_modules symlink hazard (#3173)", () => {
+	// A linked git worktree's top-level .git is a FILE containing
+	// "gitdir: ..." (never a directory -- that is the main checkout). This
+	// is the only thing {@link looksLikeGitWorktree} checks; the content
+	// need not resolve to a real repository for the classifier to accept it.
+	function makeWorktreeDir(prefix: string): string {
+		const dir = mkdtempSync(join(tmpdir(), prefix));
+		writeFileSync(
+			join(dir, ".git"),
+			"gitdir: /some/main/checkout/.git/worktrees/fixture\n",
+		);
+		return dir;
+	}
+
+	it("denies git worktree remove on a tree whose node_modules is a symlink OUTSIDE it", () => {
+		const shared = mkdtempSync(join(tmpdir(), "pi-lens-guard-bash-shared-nm-"));
+		const tree = makeWorktreeDir("guard-bash-worktree-symlink-");
+		symlinkSync(shared, join(tree, "node_modules"));
+		try {
+			const result = runHook(`git worktree remove ${tree}`);
+			expect(result.status).toBe(2);
+			expect(result.stderr.toLowerCase()).toContain("worktree");
+			// The note names the fix (acceptance #1).
+			expect(result.stderr).toContain(`rm <tree>/node_modules`);
+		} finally {
+			rmSync(tree, { recursive: true, force: true });
+			rmSync(shared, { recursive: true, force: true });
+		}
+	});
+
+	it("allows the SAME tree once node_modules is unlinked (the note's own prescribed fix)", () => {
+		const shared = mkdtempSync(join(tmpdir(), "pi-lens-guard-bash-shared-nm-"));
+		const tree = makeWorktreeDir("guard-bash-worktree-symlink-");
+		const nodeModules = join(tree, "node_modules");
+		symlinkSync(shared, nodeModules);
+		unlinkSync(nodeModules);
+		try {
+			const result = runHook(`git worktree remove ${tree}`);
+			expect(result.status).toBe(0);
+			expect(result.stderr).toBe("");
+		} finally {
+			rmSync(tree, { recursive: true, force: true });
+			rmSync(shared, { recursive: true, force: true });
+		}
+	});
+
+	it("allows a tree with a REAL node_modules directory (not a symlink)", () => {
+		const tree = makeWorktreeDir("guard-bash-worktree-real-nm-");
+		mkdirSync(join(tree, "node_modules"));
+		try {
+			const result = runHook(`git worktree remove ${tree}`);
+			expect(result.status).toBe(0);
+			expect(result.stderr).toBe("");
+		} finally {
+			rmSync(tree, { recursive: true, force: true });
+		}
+	});
+
+	it("allows a symlinked node_modules whose target stays INSIDE the worktree (only an OUTSIDE target is the hazard)", () => {
+		const tree = makeWorktreeDir("guard-bash-worktree-inside-symlink-");
+		const realInside = join(tree, "vendor", "node_modules");
+		mkdirSync(dirname(realInside), { recursive: true });
+		mkdirSync(realInside);
+		symlinkSync(realInside, join(tree, "node_modules"));
+		try {
+			const result = runHook(`git worktree remove ${tree}`);
+			expect(result.status).toBe(0);
+			expect(result.stderr).toBe("");
+		} finally {
+			rmSync(tree, { recursive: true, force: true });
+		}
+	});
+
+	it("allows a git worktree remove on a path that does not exist -- left to git, no false deny", () => {
+		const doesNotExist = join(
+			tmpdir(),
+			"guard-bash-worktree-does-not-exist-3173",
+		);
+		const result = runHook(`git worktree remove ${doesNotExist}`);
+		expect(result.status).toBe(0);
+		expect(result.stderr).toBe("");
+	});
+
+	it("allows a git worktree remove on an ordinary directory that is NOT a git worktree, even with a hazard-shaped symlink", () => {
+		// Same symlink-outside shape as the deny case above, but with no .git
+		// file at all -- looksLikeGitWorktree must gate BEFORE the symlink
+		// check runs, or an ordinary directory that merely contains a
+		// "node_modules" symlink (e.g. a project's own dependency symlink)
+		// would be denied.
+		const shared = mkdtempSync(join(tmpdir(), "pi-lens-guard-bash-shared-nm-"));
+		const dir = mkdtempSync(
+			join(tmpdir(), "pi-lens-guard-bash-not-a-worktree-"),
+		);
+		symlinkSync(shared, join(dir, "node_modules"));
+		try {
+			const result = runHook(`git worktree remove ${dir}`);
+			expect(result.status).toBe(0);
+			expect(result.stderr).toBe("");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+			rmSync(shared, { recursive: true, force: true });
+		}
+	});
+
+	it("still detects git worktree remove embedded in a chained command (&&, ;)", () => {
+		const shared = mkdtempSync(join(tmpdir(), "pi-lens-guard-bash-shared-nm-"));
+		const tree = makeWorktreeDir("guard-bash-worktree-symlink-chained-");
+		symlinkSync(shared, join(tree, "node_modules"));
+		try {
+			const chainedAnd = runHook(`cd /tmp && git worktree remove ${tree}`);
+			expect(chainedAnd.status).toBe(2);
+			expect(chainedAnd.stderr.toLowerCase()).toContain("worktree");
+
+			const chainedSemi = runHook(`echo hi; git worktree remove ${tree}`);
+			expect(chainedSemi.status).toBe(2);
+			expect(chainedSemi.stderr.toLowerCase()).toContain("worktree");
+		} finally {
+			rmSync(tree, { recursive: true, force: true });
+			rmSync(shared, { recursive: true, force: true });
+		}
+	});
+
+	it("still denies with a single --force (this rule is not gated by the double-force worktreeForce rule)", () => {
+		const shared = mkdtempSync(join(tmpdir(), "pi-lens-guard-bash-shared-nm-"));
+		const tree = makeWorktreeDir("guard-bash-worktree-symlink-force-");
+		symlinkSync(shared, join(tree, "node_modules"));
+		try {
+			const result = runHook(`git worktree remove --force ${tree}`);
+			expect(result.status).toBe(2);
+			expect(result.stderr.toLowerCase()).toContain("worktree");
+		} finally {
+			rmSync(tree, { recursive: true, force: true });
+			rmSync(shared, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("scripts/hooks/guard-bash.mjs -- ambient PI_LENS_HOME (#2699)", () => {
 	it("allows an unpinned-looking node probe when PI_LENS_HOME is only in process.env, not the command text", () => {
 		const result = runHook("node -e \"require('./clients/foo.js')\"", {
@@ -287,7 +514,7 @@ describe("scripts/hooks/guard-bash.mjs -- round-2 survey corpus (#2705)", () => 
 			} else {
 				expect(result.status, command).toBe(2);
 				expect(result.stderr.toLowerCase(), command).toMatch(
-					/stash|reset|worktree|probe/,
+					/stash|reset|worktree|probe|tmpdir/,
 				);
 			}
 		},
@@ -388,6 +615,220 @@ describe("scripts/hooks/guard-bash.mjs -- never throws (#2699)", () => {
 		});
 		expect(result.status).toBe(0);
 	}, 180_000);
+});
+
+// #3089: readStdin drains fd 0 to EOF instead of a single readFileSync(0)
+// call. Measured on this host: spawnSync's `input` option pumps the
+// child's stdin pipe non-blocking while its own synchronous event loop
+// feeds it, so a `read(2)` issued before the next chunk has landed can
+// throw EAGAIN -- reproducible from ~500 KB of JSON payload, reliably at
+// the 1 MB+ sizes below. Pre-fix, `readFileSync(0, "utf8")` does not retry
+// that EAGAIN; the throw was swallowed by readStdin's own catch-all,
+// producing "no payload" for a payload that was still arriving, and the
+// hook failed OPEN (exit 0) on a command it would otherwise have denied.
+// This is the real script (HOOK, spawned exactly as runHook() above does)
+// over a real OS pipe (spawnSync's own child stdio pipe) -- not a hand-fed
+// classifyPayload() call, which never touches readStdin at all.
+describe("scripts/hooks/guard-bash.mjs -- drains stdin to EOF on a large payload (#3089)", () => {
+	function payloadOfAtLeast(bytes: number, tailCommand: string): string {
+		const pad = "x".repeat(bytes);
+		return `echo ${pad} && ${tailCommand}`;
+	}
+
+	it.each([
+		["~500 KB", 500_000],
+		["1 MB", 1_000_000],
+		["2 MB", 2_000_000],
+		["9 MB", 9_000_000],
+	])(
+		"still denies a %s payload (a single readFileSync(0) fails open here)",
+		(_label, bytes) => {
+			const command = payloadOfAtLeast(bytes, "git stash");
+			const result = runHook(command);
+			expect(result.status, `payload length ${command.length}`).toBe(2);
+			expect(result.stderr.toLowerCase()).toContain("stash");
+		},
+		// review round 2 F1: no explicit timeout inherits vitest's 5000ms
+		// default (vitest.config.ts sets hookTimeout, not testTimeout), which
+		// the 2 MB/9 MB cases blow through under Stryker's dry run -- Stryker
+		// then aborts before mutating this PR's own file. The file's own
+		// convention for a real spawn this size is 180_000 (see :391, :453).
+		60_000,
+	);
+
+	// The never-throws contract from #2699 is unchanged by the drain loop:
+	// a read error or a genuinely empty stream is still "no payload", not a
+	// crash and not a deny.
+	it("still exits 0 on a genuinely empty stream", () => {
+		const result = spawnSync(process.execPath, [HOOK], {
+			input: "",
+			encoding: "utf8",
+			env: BASE_ENV,
+		});
+		expect(result.status).toBe(0);
+		expect(result.stderr).toBe("");
+	});
+
+	it("still exits 0 on a genuine read error (EBADF, not EAGAIN) -- and notes it (#3089 review round 2 F2/F3)", () => {
+		// review round 2 F2: stdio: "ignore" hands the child /dev/null, which
+		// reads 0 bytes cleanly -- the same EOF branch as the empty-stream
+		// case above, never reaching readStdin's `throw error` at :1079-ish.
+		// A WRITE-ONLY fd handed to the child as fd 0 instead produces a
+		// GENUINE EBADF on the child's first read(2) (probed directly:
+		// fs.readSync on a write-only fd throws
+		// "EBADF: bad file descriptor, read"), which is the branch that
+		// mutation-tests `throw error` -- reverting it to `break` would
+		// silently fold this case into the empty-stream case (chunks stays
+		// [], "" is returned instead of the error propagating), losing the
+		// note asserted below.
+		const dir = mkdtempSync(join(tmpdir(), "pi-lens-guard-bash-ebadf-"));
+		const writeOnlyFile = join(dir, "write-only");
+		const writeOnlyFd = openSync(writeOnlyFile, "w");
+		try {
+			const result = spawnSync(process.execPath, [HOOK], {
+				stdio: [writeOnlyFd, "pipe", "pipe"],
+				encoding: "utf8",
+				env: BASE_ENV,
+			});
+			expect(result.status).toBe(0);
+			// review round 2 F3: a genuine read error is a FAILURE, not an
+			// ordinary "nothing to check" allow -- unlike the true-empty-
+			// stream case above, it is noted so the hook's own stderr says
+			// why nothing was checked instead of looking identical to every
+			// other allow. review round 3 N1: the note names the actual
+			// cause (error.code, EBADF here) via the crash guard's shared
+			// template -- NOT the JSON.parse-only "unreadable or
+			// unparseable" wording, which this path never reaches (readStdin
+			// throws before run() ever gets to `raw.trim()` or JSON.parse).
+			expect(result.stderr).toBe(
+				"guard-bash: EBADF while checking payload; allowing\n",
+			);
+		} finally {
+			closeSync(writeOnlyFd);
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	// #3089 review round 2 F3: the JSON.parse failure path is the OTHER
+	// "saw real input, failed to make sense of it" failure (distinct from
+	// the read-error case above) -- a payload cut off mid-document, the
+	// literal shape a short read produces. Built directly (sliced valid
+	// JSON) rather than raced through spawnSync's own EAGAIN timing, so the
+	// truncation point is deterministic.
+	it("notes an unparseable (truncated) payload instead of allowing silently", () => {
+		const fullPayload = JSON.stringify({
+			session_id: "probe",
+			cwd: repoRoot,
+			permission_mode: "default",
+			hook_event_name: "PreToolUse",
+			tool_name: "Bash",
+			tool_input: { command: `echo ${"x".repeat(1_000_000)} && git stash` },
+		});
+		const truncated = fullPayload.slice(0, 500_105);
+		expect(truncated.length).toBeLessThan(fullPayload.length);
+		expect(() => JSON.parse(truncated)).toThrow();
+		const result = spawnSync(process.execPath, [HOOK], {
+			input: truncated,
+			encoding: "utf8",
+			env: BASE_ENV,
+		});
+		expect(result.status).toBe(0);
+		expect(result.stderr).toBe(
+			"guard-bash: payload unreadable or unparseable; allowing\n",
+		);
+	});
+
+	// #3089 review round 3 N2: the note() write itself must never be the
+	// thing that turns an intended exit-0 allow into an uncaught-exception
+	// exit 1. A read-only fd handed to the child as stderr reproduces this:
+	// the crash-guard path (forced here via the same depth-5000 nesting
+	// that crashes the tokenizer, a real command containing `git stash`)
+	// tries to note the failure, that write itself fails, and pre-fix that
+	// second failure was unguarded.
+	it("still exits 0 (not 1) when the crash-guard's own note write fails (read-only stderr fd)", () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-lens-guard-bash-stderr-ro-"));
+		const readOnlyFile = join(dir, "stderr-ro");
+		writeFileSync(readOnlyFile, "");
+		const readOnlyFd = openSync(readOnlyFile, "r");
+		try {
+			const deep = `${"$(".repeat(5000)}git stash${")".repeat(5000)}`;
+			const result = spawnSync(process.execPath, [HOOK], {
+				input: JSON.stringify({
+					session_id: "probe",
+					cwd: repoRoot,
+					permission_mode: "default",
+					hook_event_name: "PreToolUse",
+					tool_name: "Bash",
+					tool_input: { command: `echo ${deep}` },
+				}),
+				stdio: ["pipe", "pipe", readOnlyFd],
+				encoding: "utf8",
+				env: BASE_ENV,
+			});
+			// Pre-fix (`try { process.stderr.write(text) } catch {}` alone):
+			// exit 1, an uncaught 'error' event from the Writable stream's
+			// own async I/O failure, which a synchronous try/catch around
+			// process.stderr.write cannot catch -- confirmed exit 1 in that
+			// configuration. Post-fix (fs.writeSync, which throws EBADF
+			// synchronously for this same fd): exit 0.
+			expect(result.status).toBe(0);
+		} finally {
+			closeSync(readOnlyFd);
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+// #3089 review trailing round (#3121): the ALLOW-path notes (round 2/3)
+// were mutation-tested against a broken stderr; the DENY path's OWN write
+// -- `note(`${RULE_MESSAGES[rule]}\n`)` -- never was. Reverting just that
+// one call site to `process.stderr.write` (note() itself untouched) keeps
+// every prior test in this file green (none of them deny through a broken
+// stderr) while reintroducing exactly #3121's bug: a `git stash` a caller
+// asked to have denied gets ALLOWED (exit 1, an uncaught exception, not
+// exit 2) whenever stderr happens to be unwritable. The verdict (deny) and
+// the message (why) are two different guarantees; only the message may be
+// lost to a broken stderr, never the verdict.
+describe("scripts/hooks/guard-bash.mjs -- deny verdict survives a broken stderr (#3121)", () => {
+	const DENY_RULE_COMMANDS: Array<[rule: string, command: string]> = [
+		["stash", "git stash"],
+		["reset", "git reset --hard HEAD"],
+		["worktree", "git worktree remove -f -f /tmp/tree"],
+		[
+			"tmpdirCollision",
+			"TMPDIR=$PWD/.probe-home npx vitest run tests/clients/ext-gate-before-ignore.test.ts",
+		],
+		["probe", "node -e \"require('./clients/foo.js')\""],
+	];
+
+	it.each(DENY_RULE_COMMANDS)(
+		"still denies (%s) when stderr is a read-only fd -- message lost, verdict kept",
+		(_rule, command) => {
+			const dir = mkdtempSync(join(tmpdir(), "pi-lens-guard-bash-deny-ro-"));
+			const readOnlyFile = join(dir, "stderr-ro");
+			writeFileSync(readOnlyFile, "");
+			const readOnlyFd = openSync(readOnlyFile, "r");
+			try {
+				const result = spawnSync(process.execPath, [HOOK], {
+					input: JSON.stringify({
+						session_id: "probe",
+						cwd: repoRoot,
+						permission_mode: "default",
+						hook_event_name: "PreToolUse",
+						tool_name: "Bash",
+						tool_input: { command },
+					}),
+					stdio: ["pipe", "pipe", readOnlyFd],
+					encoding: "utf8",
+					env: BASE_ENV,
+				});
+				expect(result.status).toBe(2);
+			} finally {
+				closeSync(readOnlyFd);
+				rmSync(dir, { recursive: true, force: true });
+			}
+		},
+	);
 });
 
 describe("scripts/hooks/guard-bash.mjs -- registration (review round 2 F3)", () => {
@@ -1061,5 +1502,29 @@ describe("scripts/hooks/guard-bash.mjs -- unbounded nesting never throws (review
 	it("catches nesting far deeper than round 2's depth cap of 8", () => {
 		const deep = `${"$(".repeat(20)}git stash${")".repeat(20)}`;
 		expect(findDeny(`echo ${deep}`)).toBe("stash");
+	});
+
+	// #3089 review round 3 N1: the depth-5000 case above IS this hook's most
+	// important fail-open -- the payload is read and JSON.parse'd perfectly
+	// (it contains a real `git stash`, which should have been denied), and
+	// ONLY the tokenizer crashes (RangeError: Maximum call stack size
+	// exceeded, confirmed directly against classifyPayload on this host).
+	// Before this round the crash guard's note claimed the payload was
+	// "unreadable or unparseable" -- false; a wrong label on the most
+	// important fail-open is worse than the silence it replaced. The note
+	// must name the real cause (error.name here, since a RangeError has no
+	// .code) instead.
+	it("names RangeError, not 'unreadable or unparseable', when the classifier (not the read) crashes", () => {
+		const deep = `${"$(".repeat(5000)}git stash${")".repeat(5000)}`;
+		const result = runHook(`echo ${deep}`);
+		// Measured on this host (and required by the finding this test
+		// pins): depth 5000 deterministically overflows the tokenizer's own
+		// recursion, so the crash guard is what's under test, not the
+		// tokenizer's variable stack-depth tolerance the sibling test above
+		// allows for.
+		expect(result.status).toBe(0);
+		expect(result.stderr).toContain("RangeError");
+		expect(result.stderr).not.toContain("unreadable");
+		expect(result.stderr).not.toContain("unparseable");
 	});
 });

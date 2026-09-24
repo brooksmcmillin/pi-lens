@@ -7,6 +7,7 @@
 import { relative, resolve, sep, posix } from "node:path";
 
 import { goClient } from "../../go-client.js";
+import { pathsEqual } from "../../path-utils.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import { resolveRunnerCwd } from "../../tool-cwd.js";
 import { stripAnsi } from "../../sanitize.js";
@@ -85,16 +86,29 @@ const goVetRunner: RunnerDefinition = {
 		// cwd before comparing, so go's path FORM (a leading `./` for the
 		// module-root package, an absolute path, `.` segments) can't cause the
 		// edited file's OWN diagnostics to be silently dropped.
+		//
+		// #3277: resolving is not enough — the two sides are SPELLED by
+		// different actors. `ctx.filePath` is `normalizeMapKey`-canonical
+		// (#2016) while go prints its own spelling: `cmd/go` rewrites the
+		// package-dir prefix to a cwd-relative one only when the rewrite
+		// matches byte-for-byte (`replacePrefix`), even though the check that
+		// authorized it (`filepath.Rel`) compares case-insensitively on
+		// Windows, so a differently-cased ABSOLUTE path reaches this filter.
+		// A bare `===` then drops every line for the edited file and the run
+		// is reported clean — the #209 defect. `pathsEqual` asks the
+		// filesystem instead of a platform list, so it is also right on a
+		// case-folding POSIX mount. It does NOT resolve symlinks on POSIX
+		// (`clients/path-utils.ts:181`); nothing here relies on that.
 		const absTarget = resolve(ctx.filePath);
 		const relevant = raw
 			.split("\n")
 			.filter((line) => {
 				const m = line.match(/^(.+?):(\d+):(\d+):\s*(.+)/);
-				return m != null && resolve(cwd, m[1].trim()) === absTarget;
+				return m != null && pathsEqual(resolve(cwd, m[1].trim()), absTarget);
 			})
 			.join("\n");
 
-		const diagnostics = parseGoVetOutput(relevant, ctx.filePath);
+		const diagnostics = parseGoVetOutput(relevant, ctx.filePath, cwd);
 
 		// Edited file clean → succeeded: a sibling-file error no longer flags
 		// the edited file's turn (it surfaces when that file is itself edited).

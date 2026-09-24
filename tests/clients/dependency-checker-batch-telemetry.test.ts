@@ -53,7 +53,7 @@ describe("DependencyChecker.checkFilesBatch telemetry (#766)", () => {
 
 	beforeEach(() => {
 		vi.resetAllMocks();
-		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pilens-madge-stats-"));
+		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-pilens-madge-stats-"));
 		findNodeToolBinary.mockResolvedValue(undefined);
 		ensureTool.mockResolvedValue(undefined);
 		safeSpawnAsync.mockImplementation(async (_cmd: string, args: string[]) => {

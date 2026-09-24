@@ -1032,6 +1032,7 @@ describe("isAdvisoryCheck — every job name from a PR-triggered workflow is cla
 		"complexity (advisory)",
 		// #2697 item 9: the strictness census lane (two scratch tsconfigs) is advisory.
 		"strictness (advisory)",
+		"Targeted tests (advisory)",
 		"host latest nightly (advisory)",
 		"greeting",
 		// #2993: stale verdict-label cleanup is metadata bookkeeping, not a
@@ -1138,6 +1139,7 @@ describe("isAdvisoryCheck — every job name from a PR-triggered workflow is cla
 				"taplo (advisory)",
 				"mutation (advisory)",
 				"complexity (advisory)",
+				"Targeted tests (advisory)",
 			]),
 		);
 	});

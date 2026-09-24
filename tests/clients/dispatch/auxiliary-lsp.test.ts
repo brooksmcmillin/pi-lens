@@ -1,3 +1,6 @@
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { LSPDiagnostic } from "../../../clients/lsp/client.js";
 import {
@@ -9,6 +12,7 @@ import {
 	retagAuxiliaryDiagnostics,
 } from "../../../clients/dispatch/auxiliary-lsp.js";
 import { convertLspDiagnostics } from "../../../clients/dispatch/utils/lsp-diagnostics.js";
+import { removeTempDirSync } from "../test-utils.js";
 import { _resetSubagentModeForTests } from "../../../clients/subagent-mode.js";
 
 const diag = (over: Partial<LSPDiagnostic>): LSPDiagnostic =>
@@ -506,5 +510,161 @@ describe("retagAuxiliaryDiagnostics (#692)", () => {
 		});
 		expect(retagged).toHaveLength(1);
 		expect(retagged[0].tool).toBe("lsp");
+	});
+});
+
+// #3041 recurrence: ast-grep's LSP publishes per-document diagnostics WITHOUT
+// applying a rule's own `ignores` globs (its `scan` walk does — verified against
+// ast-grep 0.45.3), so every pi-lens route that delivers those diagnostics
+// re-surfaced findings the NAPI runner correctly skips. Guarding it here, at the
+// one shared drop-decision seam both routes call, is what keeps `source=lsp` and
+// `mode=full` from drifting apart again the way #586 and #692 did.
+describe("applyAuxiliarySuppressions per-rule ignores gate (#3041)", () => {
+	const astGrepDiag = (code: string): LSPDiagnostic =>
+		diag({ source: "ast-grep", code });
+	// The shipped catalog rule whose own YAML carves out `scripts/**`, `bin/**`
+	// and `**/logger.ts` (#965).
+	const RULE = "no-console-except-error";
+	const root = path.resolve("/repo");
+	const content = "console.log('x');\n";
+
+	it("drops a catalog rule finding on a path the rule ignores globs carve out", () => {
+		expect(
+			applyAuxiliarySuppressions([astGrepDiag(RULE)], content, {
+				filePath: path.join(root, "scripts", "cli.ts"),
+				scanRoot: root,
+			}),
+		).toEqual([]);
+	});
+
+	it("keeps the same rule finding on a path it does not carve out", () => {
+		const kept = applyAuxiliarySuppressions([astGrepDiag(RULE)], content, {
+			filePath: path.join(root, "src", "app.ts"),
+			scanRoot: root,
+		});
+		expect(kept).toHaveLength(1);
+	});
+
+	it("keeps a rule that declares no ignores at all on the same carved-out path", () => {
+		const kept = applyAuxiliarySuppressions(
+			[astGrepDiag("no-alert")],
+			content,
+			{ filePath: path.join(root, "scripts", "cli.ts"), scanRoot: root },
+		);
+		expect(kept).toHaveLength(1);
+	});
+
+	it("leaves every diagnostic in place when the caller supplies no scan root", () => {
+		const kept = applyAuxiliarySuppressions([astGrepDiag(RULE)], content, {
+			filePath: path.join(root, "scripts", "cli.ts"),
+		});
+		expect(kept).toHaveLength(1);
+	});
+});
+
+// #3041: the seam must read the SAME effective catalog the NAPI runner reads —
+// project rule trees first, bundled second, first source wins per rule id. A
+// project that redefines a bundled rule id with its own `ignores` would
+// otherwise be carved out by the bundled globs over LSP and by its own globs
+// per-edit, which is the drift this change exists to remove.
+describe("rule-ignore catalog precedence (#3041)", () => {
+	let tmp: string;
+	const RULE = "no-console-except-error";
+	const content = "console.log('x');\n";
+
+	beforeEach(() => {
+		tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-rule-ignores-precedence-"),
+		);
+	});
+	afterEach(() => removeTempDirSync(tmp));
+
+	/** Redefine the bundled rule id in the project tree, with or without ignores. */
+	const writeProjectRule = (ignores?: readonly string[]) => {
+		const dir = path.join(tmp, "rules", "ast-grep-rules", "rules");
+		fs.mkdirSync(dir, { recursive: true });
+		fs.writeFileSync(
+			path.join(dir, `${RULE}.yml`),
+			[
+				`id: ${RULE}`,
+				"language: TypeScript",
+				"severity: warning",
+				'message: "project override"',
+				...(ignores
+					? ["ignores:", ...ignores.map((glob) => `  - "${glob}"`)]
+					: []),
+				"rule:",
+				"  pattern: console.log($$$)",
+				"",
+			].join("\n"),
+		);
+	};
+
+	const keptCount = (relative: string) =>
+		applyAuxiliarySuppressions(
+			[diag({ source: "ast-grep", code: RULE })],
+			content,
+			{ filePath: path.join(tmp, relative), scanRoot: tmp },
+		).length;
+
+	it("uses the project rule's ignores, not the bundled rule's, for the same id", () => {
+		writeProjectRule(["vendor/**"]);
+		expect(keptCount(path.join("vendor", "dep.ts"))).toBe(0);
+		expect(keptCount(path.join("scripts", "cli.ts"))).toBe(1);
+	});
+
+	// #3041 r2 F1: the winning document declaring NO `ignores` is the inverted
+	// case. `ast-grep-napi.ts` claims the id (`seenRuleIds.add`) BEFORE its own
+	// ignore check, so a project rule that redefines a bundled id to fire
+	// everywhere fires on scripts/** per-edit. Skipping a no-ignores document
+	// without claiming its id let the LOWER-precedence bundled copy register its
+	// `scripts/**` globs, so mode=full and source=lsp dropped what the runner
+	// delivered — the same two surfaces disagreeing that this PR exists to fix,
+	// only inverted.
+	it("lets a project rule that declares no ignores override the bundled carve-out", () => {
+		writeProjectRule();
+		expect(keptCount(path.join("scripts", "cli.ts"))).toBe(1);
+		expect(keptCount(path.join("src", "app.ts"))).toBe(1);
+	});
+
+	// #3041 r2 F2: a file outside `scanRoot` is matched by its ABSOLUTE path, not
+	// by the `../..`-prefixed relative one — measured: with real catalog globs the
+	// two forms disagree on 12 of 24 (root, file, pattern) combinations, e.g.
+	// `**/logger.ts` matches `/elsewhere/lib/logger.ts` and never matches
+	// `../../elsewhere/lib/logger.ts`. Without the fallback an out-of-tree logger
+	// sink loses its carve-out entirely.
+	it("matches an out-of-tree file by its absolute path", () => {
+		const outside = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-rule-ignores-out-"),
+		);
+		try {
+			const keptFor = (relative: string) =>
+				applyAuxiliarySuppressions(
+					[diag({ source: "ast-grep", code: RULE })],
+					content,
+					{ filePath: path.join(outside, relative), scanRoot: tmp },
+				).length;
+			// `**/logger.ts` reaches an absolute path; directory carve-outs
+			// deliberately remain contained by the scan root.
+			expect(keptFor(path.join("lib", "logger.ts"))).toBe(0);
+			expect(keptFor(path.join("lib", "logger.js"))).toBe(0);
+			expect(keptFor(path.join("lib", "logger.mjs"))).toBe(0);
+			expect(keptFor(path.join("scripts", "cli.ts"))).toBe(1);
+			expect(keptFor(path.join("bin", "cli.ts"))).toBe(1);
+		} finally {
+			removeTempDirSync(outside);
+		}
+	});
+
+	// #3041 r2 F4: the map is built from the AST-GREP catalog, so a colliding rule
+	// id from any other producer must NOT inherit its carve-out — a silently
+	// dropped finding is the harm this change exists to stop.
+	it("never drops a non-ast-grep finding whose code collides with a catalog id", () => {
+		const kept = applyAuxiliarySuppressions(
+			[diag({ source: "eslint", code: RULE })],
+			content,
+			{ filePath: path.join(tmp, "scripts", "cli.ts"), scanRoot: tmp },
+		);
+		expect(kept).toHaveLength(1);
 	});
 });

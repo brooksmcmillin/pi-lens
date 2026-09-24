@@ -16,7 +16,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { BoundedLruCache } from "./bounded-cache.js";
 import { createGenerationSource } from "./generation-guard.js";
-import { normalizeMapKey } from "./path-utils.js";
+import { findNearestContaining, normalizeMapKey } from "./path-utils.js";
 import { resolveToolCwd } from "./tool-cwd.js";
 import { resolveCargoPackageEdition } from "./cargo-manifest.js";
 import { resolveKtfmtGradleStyle } from "./gradle-ktfmt-style.js";
@@ -693,12 +693,20 @@ async function resolveManagedSmartDefaultCommand(
 	formatterName: string,
 	filePath: string,
 	args: string[],
-): Promise<string[] | null> {
+): Promise<string[] | typeof FORMATTER_UNAVAILABLE> {
 	const toolId = getAutoInstallToolIdForFormatter(formatterName);
-	if (!toolId) return null;
+	if (!toolId) return FORMATTER_UNAVAILABLE;
 	const { ensureTool } = await import("./installer/index.js");
 	const installed = await ensureTool(toolId);
-	if (!installed) return null;
+	if (!installed) {
+		recordDegradationOnce({
+			kind: "formatter-unavailable",
+			subject: formatterName,
+			reason:
+				"managed formatter lookup and installation returned no executable",
+		});
+		return FORMATTER_UNAVAILABLE;
+	}
 	return [installed, ...args, filePath];
 }
 
@@ -842,12 +850,7 @@ export const FORMATTERS_WITH_EXPLICIT_CONFIG_CHECK = new Set<string>(
 // --- Formatter Definitions ---
 
 async function hasEditorConfig(cwd: string): Promise<boolean> {
-	try {
-		await fs.access(path.join(cwd, ".editorconfig"));
-		return true;
-	} catch {
-		return false;
-	}
+	return findNearestContaining(cwd, [".editorconfig"]) !== undefined;
 }
 
 async function indentationArgs(
@@ -870,6 +873,20 @@ async function indentationArgs(
 	}
 	if (!hasDetectableIndentation(content)) return null;
 	const indentation = detectIndentation(content);
+	if (!indentation) {
+		// #3038: the file HAS indentation, but only nested runs, so no unit can be
+		// proven. The caller turns this into SKIP_FORMATTING — a file the user
+		// expected to be formatted silently is not — so the refusal gets one
+		// bounded row. Subject is the tool (four possible values, recorded once
+		// per session each) rather than the path: a session that edits many such
+		// files must not write one ledger key per file.
+		recordDegradationOnce({
+			kind: "formatter-skip",
+			subject: tool,
+			reason: "indentation evidence is ambiguous; formatter style not pinned",
+		});
+		return null;
+	}
 	if (tool === "shfmt")
 		return indentation.style === "tab"
 			? ["-i", "0"]
@@ -1422,6 +1439,22 @@ export const gleamFormatter: FormatterInfo = {
 	},
 };
 
+export const typstyleFormatter: FormatterInfo = {
+	name: "typstyle",
+	command: ["typstyle", "-i", "$FILE"],
+	extensions: [".typ", ".typc"],
+	async resolveCommand(filePath) {
+		const inPath = await which("typstyle");
+		if (inPath) return [inPath, "-i", filePath];
+		return resolveManagedSmartDefaultCommand("typstyle", filePath, ["-i"]);
+	},
+	detect: managedToolDetect(
+		"typstyle",
+		undefined,
+		async () => (await which("typstyle")) !== null,
+	),
+};
+
 export const terraformFormatter: FormatterInfo = {
 	name: "terraform",
 	command: ["terraform", "fmt", "$FILE"],
@@ -1751,6 +1784,7 @@ export const ALL_FORMATTERS: FormatterInfo[] = [
 	rubocopFormatter,
 	standardrbFormatter,
 	gleamFormatter,
+	typstyleFormatter,
 	taploFormatter,
 	googleJavaFormatFormatter,
 	cljfmtFormatter,
@@ -2215,7 +2249,10 @@ export function clearFormatterRuntimeState(): void {
 }
 
 const BOX_DRAWING_GLOBAL = /[\u2500-\u257F]/g;
-const HAS_BOX_DRAWING = /[\u2500-\u257F]/;
+/** Blank, or a rule made of box-drawing characters and spacing alone. */
+const DECORATION_RULE = /^[\u2500-\u257F\s]*$/;
+/** The renderer's section heading: one word, then box-drawing to end of line. */
+const DECORATION_HEADING = /^\S+[ \t]+[\u2500-\u257F][\u2500-\u257F\s]*$/;
 
 /**
  * First line of `text` that actually carries a diagnostic.
@@ -2234,15 +2271,55 @@ export function firstDiagnosticLine(
 ): string | undefined {
 	for (const raw of (text ?? "").split("\n")) {
 		const line = stripAnsi(raw).trimEnd();
-		const stripped = line.replace(BOX_DRAWING_GLOBAL, "").trim();
-		if (!stripped) continue;
-		// "format ━━━━━━━━" is a section banner, not a diagnostic. Require a rule
-		// AND a short remainder so a real one-line error containing a box
-		// character is not discarded.
-		if (HAS_BOX_DRAWING.test(line) && stripped.length <= 24) continue;
-		return stripped.slice(0, 300);
+		if (isDecorativeLine(line)) continue;
+		return line.replace(BOX_DRAWING_GLOBAL, "").trim().slice(0, 300);
 	}
 	return undefined;
+}
+
+/**
+ * The two decoration SHAPES a renderer emits, and nothing else: a rule made of
+ * box-drawing characters alone (blank lines included), and a `<word> ━━━━`
+ * section heading whose remainder after the word is box-drawing only.
+ *
+ * The single normalization both readers above and below share, so the bounded
+ * tail cannot surface what the first-line reader already rejects (#3312 review
+ * R3-4: the tail put biome's `format ━━━━` banner back in front of the strict
+ * #1337 seam). Matching SHAPES rather than "contains a box character and is
+ * short" is #3312 review R4-1: the length heuristic deleted
+ * `━ traceback source excerpt`, a diagnostic whose own text opens with a box
+ * character. A line carrying any non-decorative text is never decoration.
+ */
+function isDecorativeLine(line: string): boolean {
+	return DECORATION_RULE.test(line) || DECORATION_HEADING.test(line);
+}
+
+const FORMATTER_ERROR_TAIL_LINES = 20;
+
+/**
+ * Preserve a bounded tail of a formatter's diagnostic output.
+ *
+ * A traceback's first line is not actionable on its own (#3312). Keep the
+ * final lines, which include the exception and its message, while bounding
+ * the model-facing error when a formatter emits an unexpectedly large log.
+ *
+ * Decorative lines are dropped FIRST, by the same predicate `firstDiagnosticLine`
+ * uses: a tail that kept them would hand the strict #1337 seam the banner this
+ * module already decided is not a diagnostic, and every banner line it kept
+ * would evict a real traceback line from the bound.
+ */
+export function diagnosticTail(
+	text: string | undefined,
+	maxLines = FORMATTER_ERROR_TAIL_LINES,
+): string | undefined {
+	const lines: string[] = [];
+	for (const raw of (text ?? "").split("\n")) {
+		const line = stripAnsi(raw).trimEnd();
+		if (isDecorativeLine(line)) continue;
+		lines.push(line.slice(0, 300));
+	}
+	if (lines.length === 0) return undefined;
+	return lines.slice(-maxLines).join("\n");
 }
 
 /**
@@ -2381,11 +2458,11 @@ export async function formatFile(
 				outcome: "failed",
 				error:
 					result.error?.message ||
-					firstDiagnosticLine(result.stderr) ||
+					diagnosticTail(result.stderr) ||
 					// biome, ktlint and `mix format` report on STDOUT; without this
 					// their diagnostic is discarded and the user is told only that
 					// the tool "exited with status 1".
-					firstDiagnosticLine(result.stdout) ||
+					diagnosticTail(result.stdout) ||
 					`${formatter.name} exited with status ${result.status}`,
 			};
 		}

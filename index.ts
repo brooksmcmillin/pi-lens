@@ -844,6 +844,17 @@ function activateExtension(hostPi: ExtensionAPI) {
 		theme: LspStatusTheme,
 	) {
 		try {
+			// #3099: opt-in off mode. Publishing undefined removes the key entirely
+			// so a host that renders extension statuses stops showing it at all —
+			// stronger than compact, which still publishes a glyph. Checked first
+			// and before any of the selection work below: off outranks compact
+			// when both are set, since there is nothing left to render compactly
+			// once the key itself is gone. Nothing leaves the surface — the ids
+			// stay reachable through /lens-tools and lens_health.
+			if (getLensFlag("lens-hide-lsp-status") === true) {
+				setStatus("pi-lens-lsp", undefined);
+				return;
+			}
 			// Active and Failed coexist (#170): show the working servers in green
 			// AND any language whose servers all failed in red, side by side. A
 			// failed server is suppressed when a live sibling covers its language
@@ -854,18 +865,30 @@ function activateExtension(hostPi: ExtensionAPI) {
 				getSessionLanguages(),
 			);
 			const parts: string[] = [];
+			// #3099: opt-in compact rendering. Server names stay the default (#267);
+			// the compact form trades them for one glyph per state group so the line
+			// fits a statusline that cannot spare the width. Nothing leaves the
+			// surface — the ids stay reachable through /lens-tools and lens_health.
+			const compact = getLensFlag("lens-compact-lsp-status") === true;
+			const activeText = compact
+				? "LSP ✓"
+				: `LSP Active: ${activeIds.join(", ")}`;
+			const failedText = compact
+				? "LSP ✗"
+				: `LSP Failed: ${failedIds.join(", ")}`;
+			const inactiveText = compact ? "LSP ✗" : "LSP Inactive";
 			if (activeIds.length > 0) {
-				parts.push(theme.fg("success", `LSP Active: ${activeIds.join(", ")}`));
+				parts.push(theme.fg("success", activeText));
 			}
 			if (failedIds.length > 0) {
-				parts.push(theme.fg("error", `LSP Failed: ${failedIds.join(", ")}`));
+				parts.push(theme.fg("error", failedText));
 			}
 			// Inactive is a passive state (no server running for this file, or the
 			// idle timer released them) — not a fault. Render it neutral/grey, not
 			// red, only when there is nothing else to show.
 			setStatus(
 				"pi-lens-lsp",
-				parts.length > 0 ? parts.join(" · ") : theme.fg("dim", "LSP Inactive"),
+				parts.length > 0 ? parts.join(" · ") : theme.fg("dim", inactiveText),
 			);
 		} catch (err) {
 			// Theme may not be fully initialized during early session startup.
@@ -1474,6 +1497,26 @@ function activateExtension(hostPi: ExtensionAPI) {
 					const pathSuffix = samplePath ? ` (e.g. ${samplePath})` : "";
 					lines.push(`  ${v.ruleId}: ${v.count}${pathSuffix}`);
 				}
+			}
+
+			// #3255 round-3 verify: a pi user with no Stop hook and no `/lens-perf`
+			// read had no automatic notice that this session lost its warm
+			// incumbent to a renamed endpoint — the remedy (restart the peer) is
+			// not something the local fallback can discover. Rendered through the
+			// SHARED renderer on a summary filtered to that one kind, so the
+			// wording cannot drift from `/lens-perf` and `pilens_health` (the
+			// #2515 divergence this repo already paid for once) and `/lens-health`
+			// gains no output for any other degradation.
+			try {
+				lines.push(
+					...renderDegradationLines(
+						getDegradationSummary().filter(
+							(group) => group.kind === "warm-ipc-endpoint-missing",
+						),
+					),
+				);
+			} catch {
+				// best-effort — a health-line render must never break /lens-health
 			}
 
 			// LSP status
@@ -3353,10 +3396,11 @@ function activateExtension(hostPi: ExtensionAPI) {
 	// next turn_end merges), reusing the existing neighbor→turn-end formatting —
 	// previously this outcome was logs-only, a silent under-report (#533).
 	registerCascadeTierReconcileTask(() => getLSPService(), {
-		onResolvedFound: ({ filePath, diagnostics }) => {
+		onResolvedFound: ({ filePath, diagnostics, publishedAt }) => {
 			const run = buildResolvedFoundCascadeRun(runtime.projectRoot, {
 				filePath,
 				diagnostics,
+				publishedAt,
 			});
 			// #1443: the appended run outlives this turn's consumption —
 			// `beginTurn` carries it into the next turn_end exactly once instead

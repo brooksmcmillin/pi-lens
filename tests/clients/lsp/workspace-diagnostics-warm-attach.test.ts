@@ -49,7 +49,7 @@ describe("runWorkspaceDiagnostics warm attach sweeps (#822)", () => {
 		createLSPClient.mockReset();
 		tryWarmAttachedDiagnostics.mockReset();
 		warmAttached = true;
-		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "wsd-warm-attach-"));
+		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-wsd-warm-attach-"));
 		const server = makeServer();
 		getServersForFileWithConfig.mockImplementation((filePath: string) =>
 			filePath.endsWith(".ts") ? [server] : [],

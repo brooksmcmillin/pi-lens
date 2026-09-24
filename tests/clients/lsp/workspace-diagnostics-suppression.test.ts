@@ -66,7 +66,7 @@ describe("runWorkspaceDiagnostics — auxiliary inline-suppression (#586)", () =
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		delete process.env.PI_LENS_LSP_WORKSPACE_PULL;
-		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "wsd-nosemgrep-"));
+		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-wsd-nosemgrep-"));
 	});
 	afterEach(() => removeTempDirSync(tmp));
 
@@ -133,6 +133,77 @@ describe("runWorkspaceDiagnostics — auxiliary inline-suppression (#586)", () =
 		const results = await new LSPService().runWorkspaceDiagnostics(tmp);
 
 		expect(results.length).toBe(1);
+		expect(results[0]?.count).toBe(1);
+	});
+});
+
+/**
+ * #3041 recurrence: the `mode=full` sweep re-surfaced ast-grep findings on
+ * paths the rule's OWN `ignores` globs carve out (#965). ast-grep applies those
+ * globs during its `scan` walk but not to the per-document diagnostics its LSP
+ * publishes (measured against ast-grep 0.45.3), so the sweep has to apply them —
+ * the third member of the same class as #586 (nosemgrep) and #692 (skipTestFiles)
+ * above.
+ */
+describe("runWorkspaceDiagnostics — per-rule ignores carve-out (#3041)", () => {
+	let tmp: string;
+	// The shipped catalog rule that carves out `scripts/**` (#965).
+	const RULE = "no-console-except-error";
+	const consoleDiag = () => ({
+		severity: 2,
+		message: "Avoid console.log/debug/warn in production code",
+		range: {
+			start: { line: 0, character: 0 },
+			end: { line: 0, character: 11 },
+		},
+		source: "ast-grep",
+		code: RULE,
+	});
+
+	beforeEach(() => {
+		vi.resetModules();
+		getServersForFileWithConfig.mockReset();
+		createLSPClient.mockReset();
+		delete process.env.PI_LENS_LSP_WORKSPACE_PULL;
+		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-wsd-rule-ignores-"));
+	});
+	afterEach(() => removeTempDirSync(tmp));
+
+	async function sweep(relative: string) {
+		const file = path.join(tmp, relative);
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(file, "console.log('cli output');\n");
+		const server = makeServer("ast-grep", ".ts");
+		getServersForFileWithConfig.mockReturnValue([server]);
+		createLSPClient.mockResolvedValue({
+			isAlive: () => true,
+			shutdown: async () => {},
+			serverId: "ast-grep",
+			getWorkspaceDiagnosticsSupport: () => ({
+				advertised: false,
+				mode: "push-only" as const,
+				diagnosticProviderKind: "none",
+			}),
+			getOperationSupport: () => ({}),
+			notify: { open: vi.fn(async () => {}) },
+			waitForDiagnostics: vi.fn().mockResolvedValue(undefined),
+			getDiagnostics: vi.fn(() => [consoleDiag()]),
+		});
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		return await new LSPService().runWorkspaceDiagnostics(tmp);
+	}
+
+	it("drops a finding whose rule carves out the swept path", async () => {
+		const results = await sweep(path.join("scripts", "cli.ts"));
+		expect(results.length).toBe(1);
+		expect(results[0]?.diagnostics).toEqual([]);
+		expect(results[0]?.count).toBe(0);
+	});
+
+	it("keeps the same finding on a path the rule does not carve out", async () => {
+		const results = await sweep(path.join("src", "app.ts"));
+		expect(results.length).toBe(1);
+		expect(results[0]?.diagnostics).toHaveLength(1);
 		expect(results[0]?.count).toBe(1);
 	});
 });

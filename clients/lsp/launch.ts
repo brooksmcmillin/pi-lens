@@ -22,7 +22,12 @@ import { getGlobalPiLensLogDir } from "../probe-home-state.js";
 import { isFullyQualified } from "../path-utils.js";
 import { findGlobalBinary } from "../package-manager.js";
 import { redactSecrets } from "../redact/secrets.js";
-import { classifySpawnFailure, SpawnFailureError } from "../safe-spawn.js";
+import {
+	classifySpawnFailure,
+	holdOwnChildPid,
+	isOwnLiveChild,
+	SpawnFailureError,
+} from "../safe-spawn.js";
 import { getRubyVersionDirNamesAsync } from "./ruby-drive-dirs.js";
 
 export interface LSPProcess {
@@ -103,9 +108,29 @@ function splitPathEntries(
 		.filter((entry) => entry.length > 0);
 }
 
+/**
+ * Dedupe key for one PATH entry, under `platform`'s rules.
+ *
+ * #1193 P3: the body used the HOST-DEFAULT `path.normalize` inside a branch
+ * already committed to `platform` (AGENTS.md defect shape 2), so on the ubuntu
+ * lane the win32 arm lowercased without folding separators or dot segments and
+ * `C:\Tools` / `C:/Tools` / `C:\x\..\Tools` were three keys for one directory.
+ * Each arm now parses with its own `path` flavor. That is the whole fix: a
+ * `toPosix` call on the win32 arm would be INERT — `win32.normalize` already
+ * answers backslashes for either input separator (measured: adding it left
+ * every case green) — and the POSIX arm must NOT fold separators at all,
+ * because a backslash is a legal POSIX filename character and `/opt/a\b` and
+ * `/opt/a/b` are two directories there.
+ *
+ * Ephemeral by construction: the key exists only inside one
+ * `combinePathValuesForPlatform` call's `seen` set — the ORIGINAL entry string
+ * is what survives into the joined PATH — so it never reaches a persisted or
+ * cross-process record and `normalizeEphemeralMapKey`'s `process.platform` read
+ * would defeat the explicit-`platform` seam these arms exist for.
+ */
 function normalizePathEntry(entry: string, platform: NodeJS.Platform): string {
-	const normalized = path.normalize(entry);
-	return platform === "win32" ? normalized.toLowerCase() : normalized;
+	if (platform !== "win32") return path.posix.normalize(entry);
+	return path.win32.normalize(entry).toLowerCase();
 }
 
 export function combinePathValuesForPlatform(
@@ -394,6 +419,15 @@ function trySpawn(
 				`The binary may be missing or corrupted.`,
 		);
 	}
+
+	// #3091 F1-r2: take ownership HERE, while the child is provably alive. LSP
+	// servers are the one long-lived child pi-lens spawns outside
+	// `safeSpawnAsync`, so without this their first offer of verification is
+	// `stopLSP`'s group kill — by which time, on the `processExiting` path, the
+	// leader can already be dead, `/proc` is gone, and the group signal that
+	// reaps surviving grandchildren (#2026) is refused. The verdict is released
+	// by `killProcessTree` when the shutdown ladder is done with the pid.
+	holdOwnChildPid(proc.pid, "lsp-spawn");
 
 	return proc;
 }
@@ -802,7 +836,7 @@ export async function stopLSP(handle: LSPProcess): Promise<void> {
 		handle.process.once("error", done);
 
 		const killWindowsTree = (): boolean => {
-			if (!isWindows || handle.pid <= 0) return false;
+			if (!isWindows) return false;
 			// If our child has already exited, its PID is dead and the OS may have
 			// RECYCLED it to an unrelated process. `taskkill /F /T` on a recycled PID
 			// force-kills that process AND its whole tree — in the test suite this
@@ -812,10 +846,12 @@ export async function stopLSP(handle: LSPProcess): Promise<void> {
 			// tree-kill a PID we no longer own — fall back to handle.process.kill(),
 			// which on Windows signals via the retained process HANDLE (not the raw
 			// PID), so it's a safe no-op on an already-exited child.
-			if (
-				handle.process.exitCode !== null ||
-				handle.process.signalCode !== null
-			)
+			//
+			// #2042 folded the sign check and this exited check into the one
+			// ownership predicate every kill-by-raw-pid now shares; the handle
+			// arm below IS this paragraph, and on Windows it is the only
+			// ownership evidence available (there is no /proc to read).
+			if (!isOwnLiveChild(handle.pid, "lsp-stop-windows-tree", handle.process))
 				return false;
 			try {
 				// Absolute path avoids PATH-resolution substitution on Windows.

@@ -133,6 +133,29 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"the hook remainder is the defect; fake timers isolate the delayed pre-snapshot work from scheduler contention",
 	},
+	// #3176 F4: the budget test's contract is REAL elapsed time —
+	// `bounded()` races the touch against a live wall deadline; fake timers
+	// would settle the bound instantly and the budget semantics would be
+	// unmeasurable. The assertion is on outcomes and counts, never elapsed ms.
+	"raw-timer-wait:clients/persistent-reverify.test.ts": {
+		detector: "raw-timer-wait",
+		reason:
+			"bounded() races the touch against a live wall budget; fake timers settle the bound instantly and the budget semantics are unmeasurable",
+	},
+	// 2026-09-15 (#2042 cheapest probe): the sample-tail file is written by the
+	// wrapper's own real setInterval loop in a separate process; a poll waits
+	// for that file's first write rather than a fixed sleep, and one case kills
+	// the wrapper's real process to prove the tail survives that exact victim
+	// shape (master 1701d01). 2026-09-16 (#3110 round 2 S1): the same shape
+	// from two more angles -- a slow reader's resume cadence has to be a real
+	// timer against a real OS pipe's backpressure (no fake clock drains a
+	// kernel buffer), and the note-write retry cap and the hang/exit-code
+	// bound both wait on a real, separately spawned process's real exit.
+	"raw-timer-wait:scripts/with-memory-watch.test.ts": {
+		detector: "raw-timer-wait",
+		reason:
+			"real interval loop / real pipe backpressure / real spawned-process exit in a separate process; polls, resume cadences, and hang bounds are the subject, not fakeable",
+	},
 	"raw-timer-wait:support/fault-injection.ts": {
 		detector: "raw-timer-wait",
 		reason:
@@ -142,6 +165,15 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "raw-timer-wait",
 		reason:
 			"the harness timeout models real child-process progress and must remain bounded across teardown",
+	},
+	// 2026-09-16 (#3082): a recursive fs.watch event arrives on the kernel's
+	// schedule, in another process than the one that wrote the file. There is
+	// no fake clock for inotify, and a stubbed watcher would prove only that
+	// the stub calls its own callback.
+	"raw-timer-wait:support/tests-tree-write-guard.test.ts": {
+		detector: "raw-timer-wait",
+		reason:
+			"a real recursive fs.watch delivery is the subject; no fake clock delivers an inotify event and a stubbed watcher proves nothing",
 	},
 	"real-process-spawn:clients/biome-config-decorator-metadata.test.ts": {
 		detector: "real-process-spawn",
@@ -208,6 +240,11 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"a real child's exit code is the observation; no in-process double can watch an event loop decide to drain",
 	},
+	"real-process-spawn:clients/lsp/kill-process-tree-real-child.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"a real, live direct child is the only pid whose /proc PPid is this process, so the Linux ownership arm of the kill-by-pid predicate cannot be observed through any double",
+	},
 	"real-process-spawn:clients/metrics-history-stderr.test.ts": {
 		detector: "real-process-spawn",
 		reason:
@@ -258,6 +295,16 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"real gitignore rules and index entries decide shadow files outside the test process",
 	},
+	"real-process-spawn:config/global-dir-probe-redirect.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"fresh Node processes exercise import-time log routing; real git init/status proves a foreign checkout stays clean and check-ignore verifies the committed legacy rule",
+	},
+	"real-process-spawn:config/oxlint-advisory-rule-floor-gate.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the real advisory argv and counter process are the only faithful proof that CI sees a nonzero type-aware rule population",
+	},
 	"real-process-spawn:config/tracked-control-bytes.test.ts": {
 		detector: "real-process-spawn",
 		reason:
@@ -274,6 +321,19 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "real-process-spawn",
 		reason:
 			"real pi child death is the process-boundary failure that must reject a governed waiter promptly",
+	},
+	// 2026-09-15 (#2154 AC1): 1 -> 3, then 3 -> 7 in #3060 round 2 (review F1 +
+	// F2). The reported defect needs TWO LIVE pi sessions over one project root
+	// and one PI_LENS_HOME — the durable stores they share are keyed by exactly
+	// that pair, so one child (or a pair of in-process doubles) cannot reach
+	// the crossing at all. Round 2 adds two more pairs: the same two sessions
+	// with the clean edit's mtime preserved (the edit-during-scan state), and
+	// the reporter's own two-WORKTREE configuration, which needs two roots
+	// under one home and therefore two more children.
+	"real-process-spawn:real-harness/diagnostic-provenance.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"two concurrent real pi children must share one project root and one PI_LENS_HOME; the cross-session stores are keyed by that pair",
 	},
 	"real-process-spawn:real-harness/negative.test.ts": {
 		detector: "real-process-spawn",
@@ -393,6 +453,11 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"the fixture-ordering defect lives in the CLI's own module-load order; no in-process call is the script under test",
 	},
+	"real-process-spawn:scripts/sonar-master-gate.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the CLI's exit codes and rendered stdout/stderr are the process-boundary contract; an in-process fetch call cannot certify the real entry point",
+	},
 	// 2026-09-06 (#2586 review F1): proves the actual delimiter
 	// supply-host-provided-deps.mjs prints in its own stdout bytes; an
 	// in-process double would just re-assert the test author's assumption.
@@ -423,6 +488,15 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "real-process-spawn",
 		reason:
 			"real git children prove the support-side fixture scrubs GIT_DIR/GIT_WORK_TREE and pins cwd before a test spawns git",
+	},
+	// 2026-09-17 (#3179): the race is cross-process by construction —
+	// readdirSync/statSync inside node's own recursive-watch polyfill are
+	// blocking syscalls on one thread, so only a separately spawned process
+	// removing the watched directory can land inside that window.
+	"real-process-spawn:support/tests-tree-write-guard-race.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"a real cross-process directory removal races node's own recursive-watch readdirSync; no in-process stand-in can occupy the other side of that window",
 	},
 };
 

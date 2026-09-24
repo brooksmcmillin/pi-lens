@@ -40,6 +40,7 @@ Dispatch is diagnostics-oriented: automatic formatting and safe autofix happen i
 | Haskell               | ✓   | lsp                                                                                                            | ormolu                  |
 | Elixir                | ✓ (ElixirLS default, Expert alternate) | lsp, elixir-check, credo                                                                   | mix format              |
 | Gleam                 | ✓   | lsp, gleam-check                                                                                               | gleam format            |
+| Typst                 | ✓ (tinymist) | —                                                                                                         | typstyle (`.typ`, `.typc`) |
 | OCaml                 | ✓   | lsp                                                                                                            | ocamlformat             |
 | Clojure               | ✓   | lsp                                                                                                            | cljfmt                  |
 | Terraform             | ✓   | lsp, tflint, trivy-config (opt-in)                                                                             | terraform fmt           |

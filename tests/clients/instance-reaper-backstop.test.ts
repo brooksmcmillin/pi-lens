@@ -22,8 +22,19 @@
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	afterAll,
+	afterEach,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	vi,
+} from "vitest";
+import { removeTempDirSync } from "./test-utils.js";
 
 interface SpawnRecord {
 	command: string;
@@ -222,6 +233,30 @@ const ORPHAN_COMMAND = isWindows
  *  kill-verification budget of one immediate probe. */
 const FAST = { force: true, verifyAttempts: 1, verifyIntervalMs: 0 } as const;
 
+// #3042 recurrence, found by the #3050 sweep: this file used to rely on a
+// stale assumption (see the beforeEach comment this replaces) that
+// `PI_LENS_HOME` was a per-worker temp dir. Since #2912 it is ONE directory
+// shared by the whole vitest run, so this file's every-test
+// `fs.rmSync(.../orphan-backstop.{json,lock})` was deleting — and
+// `scheduleUntrackedOrphanSweep`/`sweepUntrackedOrphans` below were racing —
+// the SAME orphan-backstop lock/state file every other concurrent Vitest
+// fork's real reaper sweep depends on. A private, per-file home removes both
+// hazards: the rest of this file's assertions are unchanged.
+let previousBackstopHome: string | undefined;
+let backstopHome: string;
+
+beforeAll(() => {
+	previousBackstopHome = process.env.PI_LENS_HOME;
+	backstopHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-backstop-"));
+	process.env.PI_LENS_HOME = backstopHome;
+});
+
+afterAll(() => {
+	if (previousBackstopHome === undefined) delete process.env.PI_LENS_HOME;
+	else process.env.PI_LENS_HOME = previousBackstopHome;
+	removeTempDirSync(backstopHome);
+});
+
 beforeEach(() => {
 	h.spawns.length = 0;
 	h.latency.length = 0;
@@ -235,8 +270,8 @@ beforeEach(() => {
 	h.state.scannerPids.length = 0;
 	h.state.bareKills.length = 0;
 	// Each test gets a fresh cooldown stamp and sweep lock. PI_LENS_HOME is
-	// redirected per worker (tests/support/vitest-setup.ts), so this only ever
-	// touches the worker's own temp dir.
+	// this file's OWN private dir (pinned in beforeAll above, #3042/#3050) —
+	// never the run-shared home other Vitest forks' real reaper sweeps use.
 	fs.rmSync(path.join(process.env.PI_LENS_HOME ?? "", "orphan-backstop.json"), {
 		force: true,
 	});
