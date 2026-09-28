@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Controllable `os.homedir()` override for the mutation-proof HOME-default
 // test below — `vi.spyOn(os, "homedir")` fails under Vitest's ESM
@@ -44,6 +44,10 @@ import {
 	uriToPath,
 	walkUpDirs,
 } from "../../clients/path-utils.js";
+import {
+	getDegradationSummary,
+	resetDegradationLedger,
+} from "../../clients/degradation-ledger.js";
 import { createCaseAliasFixture, setupTestEnvironment } from "./test-utils.js";
 
 describe("isWindowsPath (#1213 review pins)", () => {
@@ -1769,6 +1773,123 @@ describe("matchesWorkspaceMemberPattern dialect table (#2591)", () => {
 				new Set([vector.cargo, vector.uvMembers, vector.uvExclude]).size > 1,
 		);
 		expect(separating.length).toBeGreaterThanOrEqual(12);
+	});
+});
+
+describe("workspace glob memo cell cap (#2629)", () => {
+	beforeEach(() => resetDegradationLedger());
+	afterEach(() => resetDegradationLedger());
+
+	it("preserves a below-cap workspace glob match", () => {
+		expect(
+			matchesWorkspaceMemberPattern(
+				"crates/*",
+				"crates/widget",
+				UV_WORKSPACE_MEMBERS_DIALECT,
+			),
+		).toBe(true);
+		expect(
+			getDegradationSummary().filter(
+				(group) => group.kind === "workspace-glob-cap",
+			),
+		).toHaveLength(0);
+	});
+
+	it("declines over-cap matching literals and reports the cap statelessly", () => {
+		// Recurrence prevented: #2629 allocated an unbounded matcher table even when a literal glob matched.
+		// 1,414 literal steps times 1,415 positions is 2,002,225 cells, above the 2,000,000-cell cap.
+		const capReports: number[] = [];
+		const patternA = "a".repeat(1_414);
+		const patternB = "b".repeat(1_414);
+		expect(
+			matchesWorkspaceMemberPattern(
+				patternA,
+				patternA,
+				UV_WORKSPACE_MEMBERS_DIALECT,
+				() => capReports.push(patternA.length),
+			),
+		).toBe(false);
+		expect(
+			matchesWorkspaceMemberPattern(
+				patternB,
+				patternB,
+				UV_WORKSPACE_MEMBERS_DIALECT,
+				() => capReports.push(patternB.length),
+			),
+		).toBe(false);
+		expect(capReports).toEqual([1414, 1414]);
+		expect(getDegradationSummary()).toHaveLength(0);
+
+		resetDegradationLedger();
+		expect(getDegradationSummary()).toHaveLength(0);
+		expect(
+			matchesWorkspaceMemberPattern(
+				patternA,
+				patternA,
+				UV_WORKSPACE_MEMBERS_DIALECT,
+			),
+		).toBe(false);
+		expect(getDegradationSummary()).toHaveLength(0);
+	});
+
+	it("reports distinct over-cap lengths without retaining matcher state", () => {
+		// Recurrence prevented: unique huge pattern lengths cannot grow a matcher-local latch.
+		const capReports: number[] = [];
+		for (let length = 1_414; length <= 1_434; length += 1) {
+			const pattern = "x".repeat(length);
+			expect(
+				matchesWorkspaceMemberPattern(
+					pattern,
+					pattern,
+					UV_WORKSPACE_MEMBERS_DIALECT,
+					() => capReports.push(length),
+				),
+			).toBe(false);
+		}
+
+		expect(capReports).toHaveLength(21);
+		expect(getDegradationSummary()).toHaveLength(0);
+
+		// A length already in the retained set does not count as dropped when the cap is full.
+		const retainedPattern = "x".repeat(1_414);
+		expect(
+			matchesWorkspaceMemberPattern(
+				retainedPattern,
+				retainedPattern,
+				UV_WORKSPACE_MEMBERS_DIALECT,
+				() => capReports.push(retainedPattern.length),
+			),
+		).toBe(false);
+		expect(capReports.at(-1)).toBe(1414);
+
+		resetDegradationLedger();
+		for (let length = 1_414; length <= 1_434; length += 1) {
+			const pattern = "x".repeat(length);
+			matchesWorkspaceMemberPattern(
+				pattern,
+				pattern,
+				UV_WORKSPACE_MEMBERS_DIALECT,
+				() => capReports.push(pattern.length),
+			);
+		}
+		expect(capReports.slice(-21)).toHaveLength(21);
+	});
+
+	it("keeps a realistic upper-size matching glob under the cap", () => {
+		// Recurrence prevented: lowering the cap below realistic manifest work must
+		// not silently turn a valid deep workspace member into a non-member.
+		const relativePath = Array.from({ length: 2049 }, (_, index) =>
+			index % 2 === 0 ? "a" : "b",
+		).join("/");
+		const pattern = "**/".repeat(66) + "**";
+		expect(relativePath.length).toBeGreaterThanOrEqual(4096);
+		expect(
+			matchesWorkspaceMemberPattern(
+				pattern,
+				relativePath,
+				UV_WORKSPACE_MEMBERS_DIALECT,
+			),
+		).toBe(true);
 	});
 });
 

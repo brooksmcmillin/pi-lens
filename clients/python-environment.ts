@@ -15,6 +15,7 @@ import {
 	walkUpDirs,
 	type WorkspaceMemberGlobDialect,
 } from "./path-utils.js";
+import { recordDegradationOnce } from "./degradation-ledger.js";
 
 export type PythonEnvironmentSource =
 	| "virtual-env"
@@ -160,7 +161,13 @@ function isUvWorkspaceMember(
 	const matches =
 		(dialect: WorkspaceMemberGlobDialect) =>
 		(pattern: string): boolean =>
-			matchesWorkspaceMemberPattern(pattern, relative, dialect);
+			matchesWorkspaceMemberPattern(pattern, relative, dialect, () =>
+				recordDegradationOnce({
+					kind: "workspace-glob-cap",
+					subject: String(pattern.length),
+					reason: "workspace glob matcher exceeded its memo-table cell cap",
+				}),
+			);
 	return (
 		!workspace.exclude.some(matches(UV_WORKSPACE_EXCLUDE_DIALECT)) &&
 		workspace.members.some(matches(UV_WORKSPACE_MEMBERS_DIALECT))

@@ -53,6 +53,7 @@ import {
 	readProjectSnapshotMeta,
 	resetLastNarrowParseDigestForTests,
 	resetProjectSnapshotPersistWorkerForTests,
+	runSnapshotPersistExitFlushForTests,
 	setProjectSnapshotGenerationGateForTests,
 	setProjectSnapshotPromotionSeamForTests,
 	saveProjectSnapshot,
@@ -62,6 +63,10 @@ import {
 } from "../../clients/project-snapshot.js";
 import type { ProjectSnapshot } from "../../clients/project-snapshot.js";
 import { fingerprintProjectSnapshotJson } from "../../clients/project-snapshot-fingerprint.js";
+import {
+	releaseGeneration,
+	tryAcquireGeneration,
+} from "../../clients/generation-lock.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { buildWordIndex, searchWordIndex } from "../../clients/word-index.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
@@ -1008,6 +1013,39 @@ describe("project snapshot", () => {
 			expect(laundered?.wordIndex).toBeUndefined();
 		}));
 
+	it("carries a same-seq word index only from a snapshot at least as complete (#3511)", () =>
+		withProjectDataDir((cwd) => {
+			// A runtime whose view missed logged entries up to seq 4: seq 5,
+			// incomplete. It persists a word index.
+			const incompleteView = () => {
+				const runtime = new RuntimeCoordinator();
+				runtime.seedProjectSequence(2);
+				runtime.bumpFileSeq(path.join(cwd, "a.ts"), 4);
+				return runtime;
+			};
+			const withIndex = incompleteView();
+			withIndex.wordIndex = buildWordIndex([
+				{ path: path.join(cwd, "a.ts"), content: "function partial() {}" },
+			]);
+			saveRuntimeProjectSnapshot({ cwd, runtime: withIndex });
+			expect(loadProjectSnapshot(cwd)).toMatchObject({
+				seq: 5,
+				incomplete: true,
+			});
+
+			// Another incomplete view at seq 5 keeps it: nothing is claimed fresh.
+			saveRuntimeProjectSnapshot({ cwd, runtime: incompleteView() });
+			expect(loadProjectSnapshot(cwd)?.wordIndex).toBeDefined();
+
+			// A complete view at seq 5 must not stamp it fresh.
+			const complete = new RuntimeCoordinator();
+			complete.seedProjectSequence(5);
+			saveRuntimeProjectSnapshot({ cwd, runtime: complete });
+			const saved = loadProjectSnapshot(cwd);
+			expect(saved?.incomplete).toBeUndefined();
+			expect(saved?.wordIndex).toBeUndefined();
+		}));
+
 	it("rejects wrong-version, stale, and future snapshots", () =>
 		withProjectDataDir((cwd) => {
 			const badPath = getProjectSnapshotPath(cwd);
@@ -1812,10 +1850,24 @@ describe("project snapshot worker persist (#958)", () => {
 					buildProjectSnapshotFromRuntime({ cwd, runtime: old }),
 				);
 				await suspension.admitted;
-				saveProjectSnapshot(
-					cwd,
-					buildProjectSnapshotFromRuntime({ cwd, runtime: fresh }),
+				// #3509: an admitted newer seq raises the durable meta, and the
+				// promotion compare-and-set then refuses the stale view on its own.
+				// The gate alone stands between them only when that admission
+				// write was skipped because another process held the cache lock.
+				const hold = tryAcquireGeneration(
+					`${getProjectSnapshotPath(cwd)}.locks`,
+					5_000,
 				);
+				expect(hold).toBeDefined();
+				try {
+					saveProjectSnapshot(
+						cwd,
+						buildProjectSnapshotFromRuntime({ cwd, runtime: fresh }),
+					);
+				} finally {
+					if (hold) releaseGeneration(hold);
+				}
+				expect(readProjectSnapshotMeta(cwd)?.seq).toBe(3);
 				// Delay the queued write so the stale promotion is observable on disk.
 				process.env.PI_LENS_TEST_SNAPSHOT_PERSIST_WORKER_DELAY_MS = "1000";
 				setProjectSnapshotPromotionSeamForTests(undefined);
@@ -1886,6 +1938,60 @@ describe("project snapshot worker persist (#958)", () => {
 			}
 		}));
 
+	/**
+	 * Recurrence: #3560. Forcing the sync writer's gate
+	 * (`pendingSnapshotIsCurrent`) to true left both snapshot suites green.
+	 * It is the only guard when a held cache lock kept the newer save's
+	 * admission meta write out, so the promotion compare-and-set still finds
+	 * the older seq on disk and would let the superseded body land.
+	 */
+	it("the sync writer drops a superseded save whose newer admission skipped its meta write (#3560)", async () =>
+		withProjectDataDirAsync(async (cwd) => {
+			process.env.PI_LENS_SNAPSHOT_PERSIST_SYNC = "1";
+			const parked: Array<() => void> = [];
+			setProjectSnapshotPromotionSeamForTests(
+				() => new Promise<void>((resolve) => parked.push(resolve)),
+			);
+			const at = (seq: number) => {
+				const runtime = new RuntimeCoordinator();
+				runtime.seedProjectSequence(seq);
+				return buildProjectSnapshotFromRuntime({ cwd, runtime });
+			};
+			try {
+				saveProjectSnapshot(cwd, at(3));
+				expect(parked).toHaveLength(1);
+				const hold = tryAcquireGeneration(
+					`${getProjectSnapshotPath(cwd)}.locks`,
+					5_000,
+				);
+				expect(hold).toBeDefined();
+				try {
+					saveProjectSnapshot(cwd, at(4));
+				} finally {
+					if (hold) releaseGeneration(hold);
+				}
+				expect(readProjectSnapshotMeta(cwd)?.seq).toBe(3);
+
+				// The seq-3 write runs; the queued seq-4 write then parks.
+				parked.shift()?.();
+				await waitFor(
+					() => parked.length,
+					(count) => count === 1,
+				);
+				expect(fs.existsSync(getProjectSnapshotPath(cwd))).toBe(false);
+				expect(loadProjectSnapshot(cwd)?.seq).toBe(4);
+
+				parked.shift()?.();
+				await waitForProjectSnapshotPersistsForTests();
+				_resetProjectSnapshotParseCacheForTests();
+				expect(loadProjectSnapshot(cwd)?.seq).toBe(4);
+			} finally {
+				delete process.env.PI_LENS_SNAPSHOT_PERSIST_SYNC;
+				setProjectSnapshotPromotionSeamForTests(undefined);
+				for (const release of parked.splice(0)) release();
+			}
+		}));
+
 	it("read-your-writes across the legacy-upgrade window: an in-flight write shadows a stale legacy .json (#958)", async () =>
 		withProjectDataDirAsync(async (cwd) => {
 			resetProjectSnapshotPersistWorkerForTests();
@@ -1946,5 +2052,70 @@ describe("project snapshot worker persist (#958)", () => {
 			);
 			_resetProjectSnapshotParseCacheForTests();
 			expect(loadProjectSnapshot(cwd)?.seq).toBe(5);
+		}));
+
+	/**
+	 * Recurrence this guards: the exit hook's own generation-match check
+	 * (deleted, #3594) duplicated `writeSnapshotBodyOnMainThread`'s own
+	 * `pendingSnapshotIsCurrent` gate. This drives the flush end to end — two
+	 * concurrent saves for one key: the first goes "active" (dispatched to
+	 * the worker), and the second, issued before the worker's async response
+	 * can land, is coalesced into the queue behind it. `latestByKey`'s merge
+	 * must still pick the newer, queued save, and the writer's own gate must
+	 * still be the only thing standing between that pick and the write.
+	 */
+	it("the exit flush writes only the newer of two concurrent saves for one key (#3594)", async () =>
+		withProjectDataDirAsync(async (cwd) => {
+			resetProjectSnapshotPersistWorkerForTests();
+			const older = new RuntimeCoordinator();
+			older.seedProjectSequence(5);
+			const newer = new RuntimeCoordinator();
+			newer.seedProjectSequence(6);
+
+			saveProjectSnapshot(
+				cwd,
+				buildProjectSnapshotFromRuntime({ cwd, runtime: older }),
+			);
+			saveProjectSnapshot(
+				cwd,
+				buildProjectSnapshotFromRuntime({ cwd, runtime: newer }),
+			);
+			// The shape this test needs: one save active on the worker, a
+			// newer one queued behind it — not yet resolved either way.
+			expect(getProjectSnapshotPersistStateForTests(cwd)).toEqual(
+				expect.objectContaining({ active: true, queued: true }),
+			);
+
+			runSnapshotPersistExitFlushForTests();
+
+			_resetProjectSnapshotParseCacheForTests();
+			expect(loadProjectSnapshot(cwd)?.seq).toBe(6);
+			expect(getProjectSnapshotPersistStateForTests(cwd)).toEqual(
+				expect.objectContaining({ active: false, queued: false }),
+			);
+		}));
+
+	/**
+	 * A single save, never coalesced: the ordinary case, uncovered before
+	 * #3594 added `runSnapshotPersistExitFlushForTests`. Proves the flush
+	 * still writes the one pending it has when nothing was queued behind it.
+	 */
+	it("the exit flush writes a single pending save (#3594)", async () =>
+		withProjectDataDirAsync(async (cwd) => {
+			resetProjectSnapshotPersistWorkerForTests();
+			const runtime = new RuntimeCoordinator();
+			runtime.seedProjectSequence(9);
+			saveProjectSnapshot(
+				cwd,
+				buildProjectSnapshotFromRuntime({ cwd, runtime }),
+			);
+			expect(getProjectSnapshotPersistStateForTests(cwd)).toEqual(
+				expect.objectContaining({ active: true, queued: false }),
+			);
+
+			runSnapshotPersistExitFlushForTests();
+
+			_resetProjectSnapshotParseCacheForTests();
+			expect(loadProjectSnapshot(cwd)?.seq).toBe(9);
 		}));
 });

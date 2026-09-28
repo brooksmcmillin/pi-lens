@@ -1,4 +1,12 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	afterAll,
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	vi,
+} from "vitest";
 import { withEnv } from "../../support/with-env.js";
 
 vi.unmock("../../../clients/installer/index.js");
@@ -14,9 +22,19 @@ vi.hoisted(() => {
 });
 
 // ── os mock ────────────────────────────────────────────────────────────
-const TEST_HOME = vi.hoisted(() =>
-	process.platform === "win32" ? String.raw`C:\Users\test` : "/home/test",
-);
+// A real, writable per-file directory, not a fixed "/home/test": since #3476
+// the install and probe-cache locks create their generation directories with
+// sync node:fs, which this file does not mock, under the home the node:os
+// mock names. A fixed path was unwritable for CI's non-root user (EACCES from
+// every install) and left real lock directories behind on a root box.
+const TEST_HOME = vi.hoisted(() => {
+	const nodeFs = require("node:fs") as typeof import("node:fs");
+	const nodeOs = require("node:os") as typeof import("node:os");
+	const nodePath = require("node:path") as typeof import("node:path");
+	return nodeFs.mkdtempSync(
+		nodePath.join(nodeOs.tmpdir(), "pi-lens-tool-discovery-home-"),
+	);
+});
 
 vi.mock("node:os", () => ({
 	default: {
@@ -155,8 +173,23 @@ vi.mock("node:child_process", () => ({ spawn: mockSpawn }));
 // #2015: verifyToolBinary probes (and installNpmTool's npm-install spawn)
 // route through `safeSpawnAsync`, so this file mocks that seam directly and
 // records every invocation into the same `spawnCalls` log the raw-spawn mock
-// above feeds. Probes and installs both answer success; tests that need a
-// failure simulate it at their own seams (network, fs access).
+// above feeds. Probes and installs both answer success by default; a test that
+// needs a probe VERDICT sets `spawnVerdict` (#3311 — the PATH rung now verifies
+// its candidate, so the probe's answer decides PATH resolution as well).
+const spawnVerdict = vi.hoisted(() => ({
+	status: 0 as number | null,
+	stdout: "",
+	stderr: "",
+	signal: undefined as string | undefined,
+	// #3515: an optional hook a test can set to react to (and mutate the
+	// verdict of) a SPECIFIC spawn call, decided by its own args — used to
+	// simulate a competing installer taking the lock's generation between
+	// installNpmTool's ERESOLVE attempt and its --legacy-peer-deps retry,
+	// which nothing else in this shared mock can express (the two calls
+	// happen inside one `await`, with no tick back to the test in between).
+	// Undefined by default: every other test in this file is unaffected.
+	onCall: undefined as ((command: string, args: string[]) => void) | undefined,
+}));
 vi.mock("../../../clients/safe-spawn.js", () => ({
 	safeSpawn: vi.fn(() => ({ stdout: "", stderr: "", status: 0 })),
 	safeSpawnAsync: async (
@@ -169,7 +202,15 @@ vi.mock("../../../clients/safe-spawn.js", () => ({
 			args: args ?? [],
 			timeout: options?.timeout,
 		});
-		return { stdout: "", stderr: "", status: 0 };
+		spawnVerdict.onCall?.(String(command), args ?? []);
+		return {
+			stdout: spawnVerdict.stdout,
+			stderr: spawnVerdict.stderr,
+			status: spawnVerdict.status,
+			...(spawnVerdict.signal === undefined
+				? {}
+				: { signal: spawnVerdict.signal }),
+		};
 	},
 	resetSafeSpawnWindowsCommandCache: vi.fn(),
 }));
@@ -215,7 +256,12 @@ vi.mock("../../../clients/dependency-checker.js", () => ({
 	resetMadgeManagedPathMemo: mockResetMadgeManagedPathMemo,
 }));
 
+import * as realFs from "node:fs";
 import * as path from "node:path";
+import {
+	getDegradationSummary,
+	resetDegradationLedger,
+} from "../../../clients/degradation-ledger.js";
 import {
 	_peekEnsureInFlightForTesting,
 	checkProbeCache,
@@ -228,6 +274,22 @@ import {
 
 const GITHUB_BIN = path.join(TEST_HOME, ".pi-lens", "bin");
 const EXE = process.platform === "win32" ? ".exe" : "";
+
+/**
+ * A real directory holding a real, non-empty file named `command` — what
+ * `isCommandAvailable` walks PATH for (`statSync().isFile() && size > 0`). It is
+ * never executed here: the spawn boundary is mocked, and `spawnVerdict` decides
+ * what the probe of it answers.
+ */
+const pathDirs: string[] = [];
+function pathDirWith(command: string): string {
+	const dir = realFs.mkdtempSync(path.join(process.cwd(), ".tmp-path-cand-"));
+	pathDirs.push(dir);
+	realFs.writeFileSync(path.join(dir, command), "#!/bin/sh\nexit 1\n", {
+		mode: 0o750,
+	});
+	return dir;
+}
 
 function ghPath(name: string): string {
 	return path.join(GITHUB_BIN, `${name}${EXE}`);
@@ -284,8 +346,18 @@ beforeEach(() => {
 	httpsBlocker.enabled = false;
 	httpsBlocker.errorHandler = undefined;
 	resetProbeCacheStateForTesting();
+	spawnVerdict.status = 0;
+	spawnVerdict.stdout = "";
+	spawnVerdict.stderr = "";
+	spawnVerdict.signal = undefined;
+	spawnVerdict.onCall = undefined;
 	mockFsReadFile.mockRejectedValue(new Error("ENOENT"));
 	fakeAccess(/* nothing */);
+	resetDegradationLedger();
+});
+
+afterAll(() => {
+	realFs.rmSync(TEST_HOME, { recursive: true, force: true });
 });
 
 afterEach(() => {
@@ -336,6 +408,88 @@ describe("getToolPath ordering", () => {
 			const result = await getToolPath("ruff");
 			expect([undefined, "ruff"]).toContain(result);
 		});
+	});
+});
+
+// ═════════════════════════════════════════════════════════════════════════
+// #3311: a PATH candidate that cannot RUN is not a resolution
+//
+// Recurrence this guards: the nightly census reported `ensureTool(rust-analyzer)
+// → rust-analyzer` and then `no client ready in 30000ms` on every run, because
+// rustup installs a `rust-analyzer` PROXY into ~/.cargo/bin whether or not the
+// component behind it is installed (rustup 1.29.1 `DUP_TOOLS`, src/lib.rs:32),
+// and the PATH rung of the resolution ladder returned that file unverified —
+// shadowing the github-release install pi-lens would otherwise have downloaded.
+// The same rung returned a pipx-installed `cmake-language-server` whose venv had
+// resolved pygls 2, which cannot import.
+// ═════════════════════════════════════════════════════════════════════════
+
+describe("PATH candidate verification (#3311)", () => {
+	afterEach(() => {
+		for (const dir of pathDirs.splice(0))
+			realFs.rmSync(dir, { recursive: true, force: true });
+	});
+
+	it("does not resolve a PATH candidate whose own check returns a verdict", async () => {
+		const dir = pathDirWith(`rust-analyzer${EXE}`);
+		spawnVerdict.status = 1;
+		spawnVerdict.stderr =
+			"error: the 'rust-analyzer' component which provides the command 'rust-analyzer' is not available for the 'stable-x86_64-unknown-linux-gnu' toolchain";
+		const restorePath = withEnv({ PATH: dir });
+		try {
+			const result = await getToolPath("rust-analyzer");
+
+			expect(result).toBeUndefined();
+			expect(spawnCalls.map((call) => call.args)).toContainEqual(["--version"]);
+		} finally {
+			restorePath();
+		}
+	});
+
+	it("lets the managed install be attempted for a shadowed github-strategy server", async () => {
+		const dir = pathDirWith(`rust-analyzer${EXE}`);
+		spawnVerdict.status = 1;
+		const restorePath = withEnv({ PATH: dir });
+		try {
+			await ensureTool("rust-analyzer");
+
+			// The github release lookup — the install this PATH file used to
+			// shadow — was reached. (It then fails: node:https is mocked.)
+			expect(httpsGetCalls.join(" ")).toContain("rust-analyzer");
+		} finally {
+			restorePath();
+		}
+	});
+
+	it("keeps a PATH candidate whose probe was killed (a stall is not a verdict)", async () => {
+		const dir = pathDirWith(`rust-analyzer${EXE}`);
+		spawnVerdict.status = null;
+		spawnVerdict.signal = "SIGTERM";
+		const restorePath = withEnv({ PATH: dir });
+		try {
+			const result = await getToolPath("rust-analyzer");
+
+			expect(result).toBe("rust-analyzer");
+		} finally {
+			restorePath();
+		}
+	});
+
+	it("resolves a package-entry entry from PATH without probing it", async () => {
+		// #2722: a `verification: "package-entry"` entry is verified from the
+		// installed tree beside its shim, which a bare PATH name does not have —
+		// so this rung must not manufacture a verdict from that absence.
+		const dir = pathDirWith(`intelephense${EXE}`);
+		spawnVerdict.status = 1;
+		const restorePath = withEnv({ PATH: dir });
+		try {
+			const result = await getToolPath("intelephense");
+
+			expect(result).toBe("intelephense");
+			expect(spawnCalls).toEqual([]);
+		} finally {
+			restorePath();
+		}
 	});
 });
 
@@ -738,5 +892,101 @@ describe("ensureTool force-reinstall", () => {
 		// Reaching installTool means it attempted the GitHub-release fetch. (The
 		// fetch is mocked to fail, so no real network — hermetic.)
 		expect(httpsGetCalls.length).toBeGreaterThan(0);
+	});
+});
+
+// ═════════════════════════════════════════════════════════════════════════
+// install lock lost mid-install (#3515)
+// ═════════════════════════════════════════════════════════════════════════
+
+describe("install lock lost mid-install aborts before a second write (#3515)", () => {
+	// The generation-lock heartbeat (clients/generation-lock.ts,
+	// tests/clients/generation-lock-heartbeat.test.ts) is what USUALLY keeps
+	// an ERESOLVE-length hold from ever going stale — this exercises the
+	// belt-and-suspenders half: installNpmTool re-checks ownership right
+	// before its second critical write (the --legacy-peer-deps retry spawn)
+	// and must never race a competing holder's writes into TOOLS_DIR even if
+	// the heartbeat somehow missed the tick. `spawnVerdict.onCall` simulates
+	// exactly that miss by creating a competing generation the instant the
+	// FIRST attempt's spawn is reached — before installNpmTool's own
+	// ownership re-check runs for the retry.
+	it("never spawns the --legacy-peer-deps retry once a competing generation has taken the lock", async () => {
+		process.env.PI_LENS_TEST_MODE = "1";
+		process.env.PI_LENS_TEST_NPM_SCRIPT = "install";
+		const GENERATIONS_DIR = path.join(
+			TEST_HOME,
+			".pi-lens",
+			"tools",
+			".install.locks",
+		);
+		// A clean generations directory: this test's own hold becomes
+		// generation 1, so the competing generation below is unambiguously
+		// "lock.2" rather than a number read off whatever an earlier case in
+		// this file left behind.
+		realFs.rmSync(GENERATIONS_DIR, { recursive: true, force: true });
+		let stolen = false;
+		spawnVerdict.onCall = (_command, args) => {
+			if (!stolen && args.includes("madge")) {
+				stolen = true;
+				// A competing installer judged this hold stale and took over.
+				realFs.writeFileSync(
+					path.join(GENERATIONS_DIR, "lock.2"),
+					"999999 0\n",
+					{ flag: "wx" },
+				);
+				spawnVerdict.status = 1;
+				spawnVerdict.stderr =
+					"npm error ERESOLVE could not resolve dependency tree";
+			}
+		};
+
+		const result = await ensureTool("madge", { forceReinstall: true });
+
+		expect(result).toBeUndefined();
+		const installSpawns = spawnCalls.filter(({ args }) =>
+			args.includes("madge"),
+		);
+		// Exactly the FIRST attempt: the retry that would have raced the new
+		// holder's writes into TOOLS_DIR never spawns.
+		expect(installSpawns).toHaveLength(1);
+		expect(
+			getDegradationSummary().find(
+				(group) => group.kind === "install-lock-lost-mid-install",
+			)?.count,
+		).toBe(1);
+	});
+
+	// Mutation / red-first: with the competing generation removed, the SAME
+	// ERESOLVE failure retries normally — proving the abort above is caused
+	// by the lock loss, not by the ERESOLVE stderr or the mock plumbing.
+	it("mutation: the same ERESOLVE failure DOES retry when nobody has taken the lock", async () => {
+		process.env.PI_LENS_TEST_MODE = "1";
+		process.env.PI_LENS_TEST_NPM_SCRIPT = "install";
+		let calls = 0;
+		spawnVerdict.onCall = (_command, args) => {
+			if (args.includes("madge")) {
+				calls += 1;
+				if (calls === 1) {
+					spawnVerdict.status = 1;
+					spawnVerdict.stderr =
+						"npm error ERESOLVE could not resolve dependency tree";
+				} else {
+					spawnVerdict.status = 0;
+					spawnVerdict.stderr = "";
+				}
+			}
+		};
+
+		await ensureTool("madge", { forceReinstall: true });
+
+		const installSpawns = spawnCalls.filter(({ args }) =>
+			args.includes("madge"),
+		);
+		expect(installSpawns).toHaveLength(2);
+		expect(
+			getDegradationSummary().find(
+				(group) => group.kind === "install-lock-lost-mid-install",
+			),
+		).toBeUndefined();
 	});
 });

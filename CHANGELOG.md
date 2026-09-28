@@ -16,6 +16,504 @@ All notable changes to pi-lens will be documented in this file.
 
 ### Security
 
+## [4.3.0] - 2026-09-25
+
+### Added
+
+- Read SonarCloud's master quality gate and open vulnerabilities in the nightly tool-smoke workflow, failing loudly for quality errors while treating SonarCloud outages as visible, fail-open warnings (closes #3319).
+
+- **Report shadowed global config files (closes #3299)** — When both supported global config files exist, pi-lens keeps the legacy winner and records the shadowed agent-dir path once per session.
+
+- **Read (and edit) the global config from the host's config dir (refs #2457)** — When `PI_CODING_AGENT_DIR` is set, `$PI_CODING_AGENT_DIR/extensions/pi-lens.json` is read when it exists and the legacy `~/.pi-lens/config.json` does not; a file at the legacy default keeps winning while it exists, so current users never move. Settings editors resolve through the same seam and create in the agent-dir location when NEITHER file exists ("edit the one that exists; prefer the new one if neither does"). The canonical default and `PI_LENS_CONFIG_PATH` semantics are unchanged.
+
+- Added an advisory CI lane that runs the existing capped targeted-test selector on every pull request and publishes its selection result in the step summary (refs #3215).
+
+- **Durable CI test history.** Record bounded per-file Vitest results for nightly flake analysis.
+
+### Changed
+
+- Folded three hand-rolled path-key transformations in the LSP server, LSP
+  launch and tool-call seams onto `clients/path-utils.ts` and added a
+  comment- and string-blanked source sweep that pins every remaining raw `\` → `/` fold and
+  path-key case fold per file, so a new copy fails CI (refs #1193). The PATH
+  entry dedupe key now parses with `path.win32`/`path.posix` chosen from its own
+  `platform` argument instead of the host default, so two spellings of one
+  Windows directory dedupe on every lane.
+
+- Extracted the turn-end govulncheck delivery (the 🛡️ Go CVE advisory tier) out
+  of `clients/runtime-turn.ts` into `clients/turn-end/lanes/govulncheck.ts`
+  behind the same `TurnEndLane` interface as the secrets lane, and added the
+  advisory tier to `TurnEndLaneParts` with it — the first lane that renders one,
+  so the field, the composer's tagged push and the registered surface arrive
+  together rather than as a slot nothing reads (refs #1892, ADR 0008
+  amendment). The six rules the block stated inline — the `onMissing: "demote"`
+  first-trace-frame freshness declaration, the disposition anchor over both
+  freshness arms, the withheld stale line and its marker, the module/package
+  fallback, the upgrade hint and the display cap — now live once, in the lane.
+  Agent-facing text is byte-identical: both committed witness goldens are
+  unchanged and a third pins this lane's live rows, demoted rows, deleted
+  call-site demotion, module fallback, cap and suppression notice through the
+  real pi host entry.
+
+- Extracted the turn-end secrets delivery (the gitleaks and trivy-secrets
+  blocker and demoted tiers) out of `clients/runtime-turn.ts` into
+  `clients/turn-end/lanes/secrets.ts` behind one `TurnEndLane` interface —
+  collect the stores, gate them with the composer's shared freshness pass, then
+  render — so the ten rendering and disposition rules that block used to state
+  inline now live once, in the lane, and the composer states none of them
+  (refs #1892, ADR 0008). Agent-facing text is byte-identical: the committed
+  witness golden for the scanner lanes is unchanged and a second golden pins the
+  lane's own live tier, demoted tier, combined ast-grep provenance and
+  suppressed-by-disposition notice through the real pi host entry.
+
+- **Type-aware async and optional-chain checks now lint the test population (refs #3244)** — `npm run lint` now runs the pinned type-aware test lane, using a stable Unix formatter compatible with the repository's oxlint-tsgolint toolchain.
+
+- Restrict tool-smoke drift ticket side effects to scheduled and default-branch runs while preserving branch-dispatch reports.
+
+- Internal-only maintenance: extend the socket listener sweep to reusable test support fixtures and remove an inert MCP socket teardown call.
+
+- Reuse the shared directory-mtime freshness predicate for project-config discovery.
+
+- **Mechanise train lessons (refs #3426)** — pre-commit now checks staged files with the pinned formatter, and pre-push selects production tree-scanning governance suites. Real-spawn suites that exceed the pre-push budget move to a reasoned CI-only tier, and a mechanical tree-scanner census fails any unregistered scanner rather than trusting a hand list.
+
+- **Close the pre-4.3.0 docs gap audit (closes #3431)** — document the LSP
+  sync content bound (2 MiB / 5000 lines) and the new `textDocument/didSave`
+  behaviour in `docs/agent-tools.md`; add the missing `pilens_session_end`
+  row and the review-graph/config-core nodes to the README architecture
+  diagram; correct the "a dozen-plus language servers" figure to 46; index
+  ADR 0008; document the `PILENS_PROBE`/`PILENS_UNSAFE_FORCE_GRAMMAR_LOAD`/
+  `PILENS_PUB_DEBUG` diagnostic env vars and widen the recovery grep; bring
+  the pre-commit hook description and the contributor path (guard-bash.mjs,
+  `PI_LENS_TEST_MAX_WORKERS`, the mutation lane, release-QA) up to date; and
+  rename the retired `lsp_diagnostics` tool name to `lens_diagnostics` in two
+  earlier changelog fragments.
+
+- Make nightly LSP capability documentation deterministic and skip byte-identical refresh PRs.
+
+- **Glossary, witness, and seam contracts (refs #3259, refs #3260)** — Document the shared pi-lens vocabulary and seven accepted architecture decisions, add the end-to-end witness ADR and adapter heuristic, require the fixer boundaries and PR-body structure, and make the `Why` section's one-sentence contract executable.
+
+- **Docs: require exact-pin sweeps on the merge with master (refs #3259, refs #3260)** — Fixer, reviewer, and merge-train contracts now require glossary synonym sweeps on both the PR head and the merge with `origin/master`, with same-PR re-pinning from the sweep's `UNPINNED`/`STALE` evidence.
+
+- **Trigger-based agent guidance (refs #3259)** — Group the recurring defect
+  catalog and conditional repository procedures under explicit `<important if>`
+  triggers, require investigator slices to verify already-shipped work, and
+  enforce standalone paired markers plus Markdown-comment- and string-blanked
+  catalog scanning so hidden counterfeits cannot satisfy the 52-shape contract.
+
+- **Docs contract pre-flight and reviewer/fixer mechanics (refs #3260)** —
+  Record the merge-train pre-flight rows, reviewer continuity rule, and
+  evidence-pass mechanics harvested from the 2026-09-22/23 train.
+
+- Docs: the winning global-config-location table (every combination of `PI_LENS_CONFIG_PATH`, the legacy file and the agent-dir file), the probe-error tier note, and the XDG-like setup recipe with the migration order (closes #3250).
+
+- AGENTS.md points at the engineering-principles repository first, and a vendored copy of PRINCIPLES.md lives at docs/engineering-principles.md for readers without a global instruction file (regenerated by that repo's sync script).
+
+- The three cached scanner lanes turn_end reads — gitleaks, trivy secrets and
+  govulncheck — now share ONE cited-path freshness pass instead of calling the
+  gate once each (refs #1892). A file both secret scanners flag was stat'd
+  twice and wrote two `finding_stale_line_demote` rows for one decision about
+  one file; it is now one stat and one bounded record per delivery, carrying a
+  `byStore` breakdown so the row still says which store's findings were
+  retired. The stat allowance stays per store — a shared pool would let one
+  lane spend it and leave another re-rendering an edited cited line as current
+  — and a delivery that exhausts one now writes a bounded
+  `finding_path_stat_budget_exhausted` row naming every store affected, which
+  nothing disclosed before. Source identity survives the fold: each store's own `scannedAt`
+  decides its own findings' staleness, and each store's own missing-path policy
+  decides its own findings' deletion, so a govulncheck CVE still survives a
+  deleted call site on the same path that drops a gitleaks secret. Scanner
+  cache records written by 4.2.1 parse and render unchanged.
+
+- **Pin the glossary synonym-retirement inventory (refs #3259)** — A
+  comment- and string-blanked governance sweep now holds the per-file retired
+  identifier population to exact equality across the runtime TypeScript
+  sources, with distinct failures for an unpinned new use and for a stale pin,
+  and it pins the canonical-collision exclusions with the module that owns each
+  canonical sense.
+
+- Every `parseToolRun` runner now documents its nonzero exit table, its
+  documented `ran` codes are pinned exactly so neither adding nor removing one
+  passes silently, and each documented code needs an executable status fixture
+  in the runner's test matrix (refs #3292).
+
+- Improve nightly LSP clean-gate fixture coverage for project-backed Vue, Svelte, F#, and Mix workspaces.
+
+- Refreshed measured LSP clean-transition markers: cue retains its publish
+  signal, while lua-language-server and marksman are recognized as silent on
+  clean transitions (refs #3347).
+
+- The lint workflow installs yamllint with `--only-binary=:all:`, so pip can never fall back to running a source distribution's setup script on the runner (SonarCloud githubactions:S8541; the only open finding failing the master quality gate since 2026-09-08).
+
+- **Release-QA rows for the global config location and the shadowed-global record (refs #2608)** — the matrix now drives a real pi-lens MCP server with `PI_CODING_AGENT_DIR` set and `extensions/pi-lens.json` present and witnesses that the agent-dir file supplies the global tier, and with both global files present witnesses the once-per-session `config-location-shadowed` record (`PILENS_CFG_0010`) holding its count at 1 across repeated config loads.
+
+### Fixed
+
+- `elixir-check` now decides whether a compiler diagnostic belongs to the
+  edited file through `pathsEqual`, the shared on-disk path identity seam,
+  instead of its own win32 case fold. Findings whose reported spelling differs
+  from the dispatched one — a lowercase drive letter on Windows, a backslash
+  segment anywhere — reach the agent as the blocking error they are instead of
+  a generic unparseable-output warning (refs #1193).
+
+- **Share actionlint and Credo runner outcome parsing (refs #1816)** — failed
+  CLI output now reaches the common empty-result and parsed-nothing gates.
+
+- **Share ESLint and golangci-lint runner outcome parsing (refs #1816)** — failed
+  JSON output now reaches the common empty-result and parsed-nothing gates.
+
+- The marker-root seam's "a nearer project marker created below an
+  already-resolved root wins" behaviour is now pinned through the production
+  paths that consume it: the real `rust-clippy` runner (so `cargo clippy`
+  follows a crate scaffolded by `cargo init crates/engine` mid-session instead
+  of staying at the workspace root), the real `BiomeClient` autofix as a
+  non-runner consumer, and one derived case over every runner in the marker
+  vocabulary baseline. The behaviour itself shipped in #2948; nothing above the
+  seam had proven it, and the positive-hit direction was untested (refs #2922).
+
+- `lens_diagnostics mode=full` no longer retires retained opengrep findings
+  across the whole project when an opengrep scan completed but scanned zero
+  files (an empty `paths.scanned`, e.g. no rule language matched the root).
+  A coverage producer that declares zero scanned files now has file-level
+  authority over nothing instead of falling back to whole-root authority, so
+  a finding is only retired when a scan actually covered its file. The
+  one-per-session `runner-coverage-empty` ledger row says when that happened
+  (refs #2962).
+
+- Make the mutation-diff lane actually evaluate mutants: mutate only the diff's changed lines, give instrumented related tests their own timeout, and bound the run below the job cap so a lane that evaluated nothing says so.
+
+- **The `suppressed: N` chip counts a mark for as long as the mark stands (closes #3183)** —
+  a `false-positive`/`suppress` mark stopped contributing to the pi-lens footer's
+  suppressed count at the marked file's next edit, even an edit that left the
+  marked line byte-identical and the mark still applying, with no way to get it
+  back. The retained row's lifetime is now the mark's own: it stands while the
+  marked line is still in the file and is retired when that line changes, the
+  file is deleted, a scan reports the finding again, or the per-file retention
+  cap truncates it. A second finding of the same rule with the same message no
+  longer displaces the marked one, and `lens_diagnostics mode=all` never lists a
+  marked finding as a live warning.
+
+- A blocking finding whose cited file no longer exists is now retracted from
+  every surface, not just the tool result it was rendered into: the durable
+  record `pi-lens` re-serves at turn end (`Unresolved from this turn — <path>`)
+  and the verdict that latches the `--lens-guard` commit gate are both built
+  from the same deleted-path-gated set the per-edit 🔴 STOP block renders. A
+  retracted finding no longer comes back a moment later, and no longer blocks
+  `git commit` under a summary quoting the pipeline's own all-clear line
+  (closes #3190).
+
+- **CSS, SCSS, LESS, SASS and Prisma files get LSP diagnostics again (refs #3217)** — pi-lens answered a language server's `workspace/configuration` request with `null` when it had no value for the requested section. `vscode-css-language-server` passes that answer straight into its own lint configuration and threw `Cannot read properties of null (reading 'validProperties')` inside its diagnostics computation, returning an empty report for every css-kind file and surfacing the error only as a `window/logMessage`; `@prisma/language-server` reads `settings.enableDiagnostics` unguarded and its process exited outright. pi-lens now answers an unresolvable section with an empty settings object, which is what "no value for this section" means, and still never leaks the whole configuration blob for a section the server did not ask for (#983). The nightly `Tool smoke` clean gate had reported 0 diagnostics for css on every run since the gate landed; it now reports real findings for both servers, and the gate itself went from 7 opted-in fixtures to 41 with a `gated N / handshake-only M / unavailable K` census line and a governance test that refuses a new fixture carrying neither `lspGate` nor an explicit `lspGateExempt` reason.
+
+- Keep the subagent compatibility smoke aligned with pi-subagents' compiled contract source layout.
+
+- **Preserve opaque mutation ownership (refs #3226)** — Opaque bash recovery
+  still records freshness and runs analysis, but observed paths no longer
+  receive read-guard authorship, autonomous format/autofix, or edit-directed
+  blocker/actionable delivery. Explicit native and recognized direct bash writes
+  retain their configured writer policy. Repeated opaque paths use one counted
+  ledger subject with bounded representative evidence instead of retaining one
+  once-key per artifact path.
+
+- **Nested bundled rule ignores (refs #3240)** — Console and Go rule directory carve-outs now apply at nested package depths without hiding similarly named application paths; the shared matcher now treats POSIX, drive-letter, and UNC paths with segment-aware containment on every host OS.
+
+- **Turn-end scanner-cache reads no longer block the hook (refs #3274)** — the
+  gitleaks, trivy and govulncheck stores `turn_end` reads once per delivery were
+  read synchronously, so a slow or wedged filesystem held the whole hook and no
+  deadline or Escape could release it. They now read through
+  `CacheManager.readCacheAsync` under the turn_end budget and the hook's abort
+  signal; a read that cannot finish inside the budget is abandoned, delivers the
+  same output as a cold cache, and is recorded — once per turn, naming the
+  stores the turn was composed without — instead of stalling the turn.
+
+- `go vet` findings for the file you just edited are no longer dropped when
+  go's spelling of that file's path differs from the dispatcher's. The runner
+  now decides "is this line about the edited file?" through `pathsEqual`, the
+  shared on-disk path identity seam, instead of a bare string compare, so a
+  differently-cased path on Windows or a case-folding macOS volume is
+  recognised as the same file and the run is no longer reported clean
+  (closes #3277, refs #1193).
+
+- The go-vet filesystem case-identity regression test is explicitly admitted to
+  the Windows Vitest lane, so its real Windows case-folding arm is executed.
+
+- Runner diagnostics are attributed to the edited file through one seam:
+  `pathsEqual` against the path the tool itself reported, resolved from the cwd
+  the tool ran in. `golangci-lint`, `rust-clippy`, `javac`, `zig-check`,
+  `detekt`, `cpp-check`, `dotnet-build`, `dart-analyze` and `cue-vet` each
+  decided it locally before — a bare `===`, a `path.resolve` with no base, a
+  basename compare, an `endsWith` — so a `golangci-lint` run in any project
+  whose Go module root is not the extension's own working directory dropped
+  every finding for the edited file and reported it clean, and a `cue vet` error
+  in a sibling directory whose file shared the touched file's name was reported
+  as the touched file's own failure (refs #3278).
+
+- `gleam check` diagnostics and `ruff` autofix findings are now attributed to the
+  edited file through the same seam every other tool uses (`pathsEqual` against
+  the path the tool reported, resolved from the cwd it ran in). gleam's location
+  line arrives inside `codespan_reporting`'s `┌─` gutter, which a suffix compare
+  was tolerating, so on Windows — and on any case-folding mount — a spelling
+  that differed only in case dropped every gleam diagnostic for the edited file;
+  ruff's JSON `filename` was compared with a bare `!==` against a path resolved
+  with no base at all, which silently meant the extension's own working
+  directory (refs #3285, refs #3286).
+
+- Gleam diagnostics now carry their error or warning title and inline label instead of codespan's border glyph, and locationless project output is left unattributed rather than charged to the dispatched file (refs #3293).
+
+- LSP workspace-edit changed paths are compared with the dispatched file through
+  the filesystem-aware path identity seam instead of a bare string equality, so a
+  differently spelled path to the same file is no longer announced as a
+  collateral change of itself (refs #3294).
+
+- The LSP clean gate now reuses the handshake layer's per-server availability decision, so unavailable servers remain ⚠ while handshaking servers are gated (refs #3309).
+
+- Added real LSP gate-entry coverage for handshake-census admission and handler-owned unavailability.
+
+- A language server that answers `didOpen` with an empty diagnostic set while it
+  indexes no longer makes pi-lens report the file clean. intelephense publishes
+  `[]` before its whole-workspace index is warm and the real findings once
+  indexing ends, so `lsp_diagnostics` reported a php file carrying an undefined
+  variable as "confirmed clean". pi-lens now holds such a server's empty first
+  publish — once per session, released by the server's own next publish — so the
+  finding is reported, while every server that publishes `[]` for a genuinely
+  clean file keeps confirming it with no added wait (refs #3310).
+
+- Launch fish-lsp through its stdio transport so standalone Fish diagnostics reach the LSP smoke gate (refs #3311).
+
+- Prepare LSP smoke fixtures before gating C#, F#, Elixir, Expert, and Vue diagnostics, and give csharp-ls the measured 6s diagnostic budget its restored project needs (the 1.5s default read a real compiler error as clean).
+
+- A tool the installer finds on `PATH` is now probed with that tool's own
+  check before it is resolved, the way every other rung of the resolution
+  ladder already was. A file on `PATH` that cannot actually run — rustup's
+  `rust-analyzer` proxy on a box where that component was never installed, a
+  `pipx`-installed `cmake-language-server` whose venv resolved a pygls that
+  removed the symbol it imports — no longer shadows the managed install that
+  works, and no longer reports as an available server that then never answers.
+  A probe that stalls or cannot be read still resolves as before: a kill is not
+  a verdict. `cmake-language-server` also pins its pygls floor, and that pin now
+  reaches whichever resolver pipx picked — pip and uv each read the same
+  constraints file through their own environment variable — so the install stops
+  producing a launcher that cannot start (refs #3311).
+
+- The tmp-fixture hygiene census now judges only the temp entries the running
+  vitest invocation created: a root left by another invocation sharing the same
+  `TMPDIR` is neither reported as this run's leak nor deleted from under it, a
+  leak report names the test file behind a raw `mkdtempSync` prefix instead of
+  `owner: tests/unknown`, and the owner-marker liveness cases read only the
+  markers they wrote, so a fully skipped test file in the same invocation no
+  longer reds them (refs #3314, refs #3316, refs #3306).
+
+- Provision the pinned `fish` executable in the nightly tool-smoke runner so `fish-lsp` can complete its handshake and clean-gate diagnostics.
+
+- `scripts/ci-verdict.mjs` now reads every check-run page and reports an exact rerun command for a latest cancelled check (closes #3373).
+
+- A child process that writes without limit can no longer terminate the Pi
+  host. `safeSpawnAsync` now caps retained output at 32 MiB when the caller
+  passes no `maxOutputBytes` — 98 of its 110 call sites passed none, and an
+  absent cap grew one JavaScript string until V8 threw `RangeError: Invalid
+  string length` from inside a stdout/stderr `data` handler, where no caller's
+  `try`/`catch` could reach it. The noisy child is now truncated, terminated
+  and reported through the existing `outputTruncated` / `killedForOutputCap`
+  result, and any other fault in that handler becomes the same bounded result
+  instead of an uncaught exception. A ledger row names the command, the cap,
+  the bytes observed and whether the child was terminated (closes #3375).
+
+- Fix `ci-verdict` rerun hints to pass the workflow run id instead of the check-run job id.
+
+- A degradation row whose subject is blank now reads `unknown` instead of
+  rendering as `⚠ <kind>: 1 — : <reason>` with an empty discriminator, and its
+  once-latch and tally key agree with the row. Any subject that normalizes to
+  empty or whitespace is folded at the ledger's write paths; metadata values and
+  reasons are untouched, so a genuinely empty value is still recorded as itself
+  (refs #3389).
+
+- A pi session serving warm diagnostics to a peer no longer dies when a client
+  disconnects mid-reply. Every `requestWarmDiagnostics` timeout, schema refusal
+  and validation refusal destroys the client's socket, and the incumbent's
+  accepted socket had no `error` listener — so a routine `read ECONNRESET`
+  became an uncaught exception in the host. The event is now handled and
+  counted in the degradation ledger as `warm-attach-socket-error`, keyed by
+  errno (closes #3389).
+
+- **Elixir diagnostics refresh again after an edit (refs [#3405](https://github.com/apmantza/pi-lens/issues/3405))** — pi-lens advertised `textDocument/didSave` but never sent one, so a language server whose diagnose pass runs on save (Expert, which recompiles the Mix project on save and on nothing else) never reported anything for a file edited through pi-lens. The post-write sync and the explicit `lens_diagnostics` (`source=lsp`) query now send the notification to every server that asked for it, carrying the document text when the server requested it and the file is inside the same 2 MiB / 5000-line bound the rest of the LSP sync already honours; servers that declare no `save` capability are unaffected, as are warm-up, cascade and workspace-sweep touches.
+
+- **Non-core tree-sitter grammars on a compiled host (closes #3409)** — On a
+  runtime that cannot resolve a bare package specifier — pi ships as a
+  `bun build --compile` binary — pi-lens could not work out where to put a
+  lazily fetched grammar, so no non-core language (C#, C++, OCaml, …) could
+  ever be analysed: symbol search, module reports and structural rules stayed
+  degraded forever while the notification blamed package-manager build scripts
+  and the network. Both the read and the write path now resolve web-tree-sitter
+  through a subpath that works there — and only accept a directory that really is
+  that package, so a fetched grammar can never land in an unrelated tree — the
+  report names the real cause (nothing resolved, or the directory is not
+  writable), a tree-sitter run whose grammar never loaded is recorded as a skip
+  instead of a clean pass, and `scripts/install-selftest.mjs` stops reporting the
+  grammar asset missing on those same hosts.
+
+- LSP root detection no longer trusts a resolved project root for the rest of
+  the session. Every memoized root carries the mtime of each directory its
+  marker walk probed and is re-walked as soon as one of them changes, so a
+  manifest scaffolded below an already-resolved root (`swift package init` in a
+  subdirectory, a new `package.json`, `prisma/schema.prisma` written into an
+  existing `prisma/`) moves the root on the next file touch, and a manifest
+  deleted at the resolved root falls back to the outer project. A hit also
+  expires on the shared 2 s re-check cadence, so even a change a directory mtime
+  cannot see — one made inside the same timestamp tick on a 1 s-granularity
+  volume — costs one window instead of a restart. All 45 marker detectors share
+  the one seam (refs #3412).
+
+- Revalidate Git repository identity when repository metadata is created or removed during a process (closes #3417).
+
+- **`lens_diagnostics mode=full` pointed circular-dependency findings at a file that does not exist (closes [#3428](https://github.com/apmantza/pi-lens/issues/3428))** — the project scan read madge's `--circular --json` output as a dependency graph while the turn-end lane read it correctly as an array of cycle arrays, so `Object.entries([["src/a.ts","src/b.ts"]])` handed the scan the array INDEX as the file name: every cycle was reported on `<root>/0`, `<root>/1`, … with its members resolved against the extension host's working directory instead of the scanned project root. The cycle COUNT was right either way, which is why it went unnoticed. Both sites now share one reader of madge's contract — the hand-rolled parses are deleted, so the number of readers goes from two to one — anchored at the cycle's first real file and resolved against the root that was scanned. The shape is pinned by fixtures captured from madge 8.0.0 (the install pi-lens manages) driven with the client's own argv, and the new test asserts the client still spawns that argv, so the captured bytes cannot silently become evidence for an invocation the client abandoned. Two neighbouring defects the upstream read surfaced are filed rather than folded in: madge resolves a single-file scan's members against that file's directory, not the project root ([#3435](https://github.com/apmantza/pi-lens/issues/3435)), and `--warning` is inert under `--json`, so the "skipped local file" count was structurally always zero ([#3436](https://github.com/apmantza/pi-lens/issues/3436)).
+
+- **The turn-end circular-dependency pass keyed nested files by paths that do not exist (closes [#3435](https://github.com/apmantza/pi-lens/issues/3435))** — the single-file madge lane (`checkFilesBatch`, the pass `runtime-turn` runs) points madge at one file, and madge prints that file's cycle members relative to the target's directory. The client resolved them against the project root instead, so a cycle between `src/a.ts` and `src/b.ts` seeded the shared circular-file set with `<root>/a.ts` and `<root>/b.ts` — neither exists — and `isInCircular`/`getCircularForFile` answered false for the real nested files (`hasCircular` was right by accident, since it counts parsed cycles). Members now resolve against the target file's directory through the shared `parseMadgeCycles` reader, including `../` members for cycles that leave that directory. Pinned by fixtures captured from madge 8.0.0 with the client's own argv.
+
+- **The madge circular-dependency pass reported a "skipped local file" count that was always zero (closes [#3436](https://github.com/apmantza/pi-lens/issues/3436))** — `buildMadgeArgs` passed `--warning`, but madge 8.0.0 gates that flag on `!program.json` (bin/cli.js) and the client always passes `--json`, so nothing reached stderr and `parseMadgeSkips` / `DepCheckResult.localSkips` could only ever return `{ total: 0, local: [] }`; ungated, the skip list prints to stdout and would corrupt the JSON this reader parses. The flag, the parser, the count field and the "possible silent cycle-miss" log line are deleted. Because madge cannot be asked for its skipped-file list under `--json`, that lost visibility is recorded once per session/root as `madge-skip-visibility-unavailable`, from `parseMadgeCycles` — the one reader both the turn-end and session-start lanes pass through — instead of being read as a clean graph. Pinned by a captured madge 8.0.0 invocation from a workspace with an unresolvable local import.
+
+- Keep preserved LSP capability rows and bullets deterministic across locales.
+
+- Share runner outcome parsing for ktlint and PHP lint so nonzero findings are
+  delivered instead of being mistaken for skipped output (refs #1816).
+
+- **Share runner outcome parsing for Dart Analyze and Elixir Check (refs #1816)** — Nonzero empty, malformed, stderr-only, or signaled runs no longer report a clean file; valid findings remain visible through the shared bounded outcome path.
+
+- **Share compiler runner outcome parsing (refs #1816)** — `cpp-check` and `zig-check` now distinguish failed, skipped, and clean invocations through the shared runner outcome seam.
+
+- **Share compiler runner outcome parsing (refs #1816)** — Route `javac` and `dotnet-build` through the shared runner outcome parser so failed compiler invocations cannot be reported as clean files.
+
+- **Consolidate RuboCop and Ruff run outcomes (refs #1816)** — Nonzero empty or unparsable tool output no longer reports a clean file, while status-2 findings and bounded failure context retain their existing semantics.
+
+- **Carry Spotless ktfmt styles into the standalone formatter (closes #2481)** — `googleStyle()` and `kotlinlangStyle()` now map to ktfmt CLI flags. `dropboxStyle()` records the CLI limitation and falls back to the bare invocation.
+
+- **Worker-side test diagnostics now reach passing-run logs (closes #3128)** — replaced the scoped warning/error paths with newline-terminated `process.stderr.write` records, including the tests-tree guard's two sites, so Vitest's default worker reporter cannot silently drop them.
+
+- Skip formatter style inference when indentation exists only inside masked comment or template interiors.
+
+- The temporary-fixture hygiene sweep now waits for live test owners to finish
+  their bounded cleanup drain and attributes remaining entries to the owner
+  file, preventing cross-worker false leaks without adding prefix admissions.
+  Owner markers authenticate themselves with a heartbeat the worker refreshes
+  from its own test lifecycle, so an orphaned or PID-reused worker is attributed
+  after the bound on every platform, not only where `/proc` exists (refs #3186).
+
+- **Three Python ast-grep rules no longer false-positive (closes #3211)** —
+  `no-boolean-in-except` stops its `boolean_operator` search at the handler's
+  own block, so an `or`/`and` inside the handler *body* (`return 2 or 3`) is
+  no longer mistaken for a boolean exception-type condition.
+  `no-http-headers-bracket-access` now excludes `headers[...]` writes
+  (`resp.headers["X"] = v`, `+=`, `del`) — only reads can raise `KeyError`.
+  `unchecked-throwing-call-python`'s `int()`/`float()` patterns moved to a
+  new `unchecked-numeric-parse-python` rule (`warning` severity) that also
+  excludes numeric-literal and already-numeric-constructor (`int`/`float`/
+  `Decimal`) arguments.
+
+- **Parse inline suppression reasons (closes #3213)** - `pi-lens-ignore` comments now suppress their listed rule ids when followed by a supported trailing reason.
+
+- **GitHub CLI authentication for release tools (closes #3221)** — GitHub-release
+  tool installation and refresh now reuse authenticated `gh` CLI credentials for
+  API metadata requests, while keeping release asset downloads unauthenticated
+  and reporting evidence-supported anonymous rate-limit failures with an
+  actionable remedy.
+
+- **`no-assert-tuple` now checks only the assertion condition (closes #3223).**
+  Tuple literals used in comparisons, calls, comprehensions, containers, and
+  assertion messages no longer produce false-positive diagnostics.
+
+- **Avoid unsupported Windows SIGHUP re-raise (refs #3239)** — Console-close cleanup now preserves tracked-child termination without recording a false crash from `kill ENOSYS`.
+
+- **Honor `lens_diagnostic_mark` on turn-end unresolved blockers (refs #3246)** — The "Unresolved from this turn" section now applies the shared disposition/rule/inline-suppression policy to the blockers it re-serves, so a finding marked `false-positive` stops coming back on later turns; when every blocker on a file is marked, the section and its `🔴 STOP` text are dropped entirely.
+
+- **Filter the built actionable-warnings advisory (closes #3270, refs #3248)** — the turn-end advisory now applies stored dispositions and suppresses ast-grep secret duplicates after LSP enrichment, while the raw cache remains available for `mode=delta`.
+
+- **The commit gate honors a turn-end disposition mark (refs #3248)** — when every blocker on a file is marked `false-positive`, turn end now recomputes the `--lens-guard` commit-gate latch from the surviving findings instead of from the raw blocker map, so the gate stops quoting findings pi-lens no longer prints, and the persisted turn-end record stops re-serving them; a blocker the policy did not suppress, a file demoted by the freshness sweep, and a freshly dispatched blocker all keep gating exactly as before, and a marked file whose bytes change outside pi-lens blocks again as `blocker state is unknown` until a fresh check judges the new content, rather than committing on a verdict that no longer describes the file.
+
+- **Apply stored dispositions at six more turn-end surfaces (refs #3248)** — knip's blocker and advisory, the dead-code advisory, the call-graph impact advisory, the late-runner drain and the code-quality warnings advisory now filter through the shared disposition/rule policy before rendering, so a finding marked `false-positive` stops re-reporting there; a mark that names no tool — the only spelling those surfaces' own text can carry — is honored too.
+
+- **Two case-distinct workspaces no longer share one warm-IPC endpoint (closes #3255)**
+  — the per-workspace id behind the warm socket/pipe and the
+  `pi-lens-turn-end-*.json` status file lowercased the resolved cwd on every
+  platform, so on a case-sensitive filesystem `/repo/Alpha` and `/repo/alpha`
+  collided: a PostToolUse or Stop hook in one project could reach the other
+  project's warm server, and `pilens_health` reported one workspace's turn-end
+  activity under the other's name. The fold now runs only on the platforms
+  whose filesystem folds case (Windows, macOS), where it is what lets the
+  server and the hook meet. On Linux and the BSDs the id changes for any
+  workspace path containing an uppercase letter, so the upgrade is now
+  reported rather than silent: a warm endpoint with nothing listening is its
+  own skip reason (`no-listener`) instead of the generic `ipc-error`, the Stop
+  hook prints and records it for `pilens_health` with the remedy (an MCP
+  server that was already running owns the previous endpoint name — restart
+  it), and a warm-attached session records it once per session, now also shown
+  by `/lens-health`. A status file written before the upgrade is simply left
+  alone: it is no longer derived by anything, and on a case-sensitive host that
+  name can belong to a live case-variant sibling workspace.
+
+- The finding-delivery governance detector no longer lets an arm-shaped
+  evidence read borrow a nearby, unrelated gate call; it now follows the
+  occurrence's binding chain, while preserving genuine inline gate results
+  and existing surface coverage (refs #3266).
+
+- `--lens-guard` no longer blocks every `git commit` for the rest of a session
+  once pi-lens has reported a blocker. The commit gate validated its own
+  persisted blocker record one line at a time while both writers of that record
+  render multi-line blocker text, so from the first blocker onward every commit
+  was refused with `blocker state is unknown
+  (blocking_provenance_untrusted)` — including after the blocker was fixed, and
+  with no re-run able to clear it (#3282).
+
+- **Restore strictness in the actionable-warnings advisory (refs #3248)** —
+  disposition identity fields that are absent from a warning are no longer
+  emitted as explicit `undefined` values, keeping the strict optional-property
+  ratchet at its existing floor.
+
+- Runner parsers now attribute a diagnostic only when the tool-reported path
+  matches the dispatched file, resolved from the cwd the tool actually ran in:
+  taplo, yamllint, htmlhint, oxlint, shellcheck, trivy-config, stylelint,
+  rubocop, eslint, biome, tflint, swiftlint, ktlint, hadolint, actionlint,
+  typos, sqlfluff, vale, markdownlint, php -l, and the shared line-parser
+  factory behind ruff's text fallback. A second file's finding is no longer
+  delivered as the edited file's problem (refs #3295, #3278, #1193).
+
+- Gate Terraform and Svelte tool-smoke fixtures with seeded diagnostics, correcting the Terraform defect seed and the Svelte diagnostic wait budget (refs #3311).
+
+- Install `cmake-format` as `cmakelang[yaml]` so it can read a
+  `.cmake-format.yaml` project config instead of dying with
+  `ModuleNotFoundError: No module named 'yaml'`, force a pipx install that would
+  otherwise be a silent no-op over an existing venv, and keep a bounded,
+  banner-free formatter traceback tail for actionable failures (refs #3312).
+
+- **Align shown-inline telemetry with deleted-path filtering (closes #3361)** — Retracted blockers are no longer recorded as shown to the agent.
+
+- Make the hook-await exemption rekey script work on Node builds without built-in TypeScript support.
+
+- **Nightly LSP docs refreshes now ignore date-only changes and never open refresh PRs from branch dispatches (closes #3380).**
+
+- Bounded every remaining stream `data` handler that grew a string without a
+  ceiling (#3383): the forked analyze worker's pipes, the unref'd process-table
+  collector, the installer's two interpreter user-base probes, and all four
+  newline-framing readers (the MCP host's stdin loop, the warm IPC clients and
+  the shared server-side reader). A peer that never sends a newline, or a child
+  that never stops writing, now ends in a bounded failure with a ledger row
+  instead of an uncatchable `RangeError` raised inside the handler. The
+  self-signal re-raise at host shutdown is likewise total.
+
+- Scope clean-signal probe publishes to the server measured by each row, and reset the vue capability-matrix row that had counted another server's publishes.
+
+- Prevented the Elixir smoke row from reporting a fallback Expert handshake as ElixirLS success.
+
+- Files over the shared LSP content bound now receive an explicit message from `lens_diagnostics` (`source=lsp`) instead of being synced in full.
+
+- The installer now gives users the same jscpd 5.3.0 version used by pi-lens itself.
+
+- Await in-flight jscpd scans before test fixture cleanup so deferred report-directory work cannot leave temporary roots behind.
+
+- Await LSP workspace-diagnostics service shutdown before removing sweep test fixtures.
+
+- Keep nightly fish runner provisioning resilient to distro package version bumps by installing the apt package unpinned.
+
+- **Ignore abbreviations, versions, and file paths in the PR-body Why sentence check (refs #3262)** — The gate now recognizes sentence boundaries by following context instead of counting every terminator.
+
+- The tool-smoke workflow's SonarCloud master-gate read now runs only on the nightly schedule and on master, so a branch dispatch no longer goes red on master's Sonar state; the advisory targeted-tests CI job installs lockfile-locked and script-free (refs #3319, #3346).
+
 ## [4.2.1] - 2026-09-17
 
 ### Added

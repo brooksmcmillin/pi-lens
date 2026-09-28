@@ -42,7 +42,9 @@ Update this file in the same change as the behavior, structure, command, or
 invariant it documents. Keep live rules short and load-bearing. Put dated
 narratives and completed arcs in `HISTORY.md`; do not delete their decision
 record. Place new invariants in the matching subsystem section, not at the file
-end. Cite symbols and section headings, not line numbers.
+end. Cite symbols and section headings, not line numbers. A defect shape that
+claims enforcement names its guard by path; a guard that is only planned is
+named by its open issue, never described as if it runs.
 
 Keep project instructions consistent with `CLAUDE.md`, role contracts, skills,
 and tests. The repository wins when a runner-side copy differs.
@@ -65,7 +67,10 @@ Every bug fix has a regression test that fails on the pre-fix production path.
 Read the failure and preserve its transcript. Every new guard, branch, filter,
 cap, or fallback gets a compile-valid mutation that turns at least one test
 red. A test that passes before the fix, or remains green after the guard is
-neutered, is not evidence.
+neutered, is not evidence. For a behaviour-preserving refactor declared in the
+PR, the red-first proof is instead an old-vs-new probe table through the built
+seam plus a shared-seam mutation that reds a caller-side witness; a passing
+pre-fix run is expected and is not a finding.
 
 Tests use real in-process stores, sinks, coordinators, and dispatchers. Mock
 only true process or host boundaries. Test telemetry by flushing and reading
@@ -137,6 +142,8 @@ conflicted PR can silently skip required jobs. Use:
 
 ```text
 node scripts/ci-verdict.mjs <pr-number|sha>
+
+ci-verdict reads every page; a truncation message no longer exists.
 ```
 
 Never merge on absent checks, stale checks, or a green advisory row alone.
@@ -180,6 +187,7 @@ ADR: docs/adr/0004-disposition-policy-seam.md
 ADR: docs/adr/0005-tool-availability-enforcement-seam.md
 ADR: docs/adr/0006-derived-state-benchmark-first.md
 ADR: docs/adr/0007-end-to-end-witness-per-seam-slice.md
+ADR: docs/adr/0008-turn-end-lane-interface.md
 ADR: docs/adr/0009-reported-path-attribution.md
 
 <!-- markdownlint-disable MD029 -->
@@ -202,12 +210,9 @@ ADR: docs/adr/0009-reported-path-attribution.md
 
 32. **Mixed path comparison:** use one platform-aware containment expression;
     do not combine case-sensitive equality with case-folded relative paths. A
-    runner OR TOOL CLIENT deciding whether a TOOL-REPORTED path names the
-    dispatched file asks `pathsEqual` against the cwd the tool ran in, never
-    `path.resolve` with no base and never `===`. The reported path is whatever
-    the tool's RENDERER emits, so the CAPTURE comes first: decoration around the
-    path (codespan's `┌─` locus gutter, #3285) belongs outside the captured
-    group, never tolerated by a suffix compare that then blocks the fold.
+    tool-reported path is attributed with `pathsEqual` against the tool's cwd,
+    capturing only the path the tool's renderer emits. Enforced by
+    `tests/config/reported-path-attribution-sweep.test.ts` (shrink-only census).
     ADR: docs/adr/0009-reported-path-attribution.md
 
 39. **Walk-up result used as eligibility:** return ownership and start-directory
@@ -251,13 +256,9 @@ ADR: docs/adr/0009-reported-path-attribution.md
 41. **Hot bound reached at p50:** record hit rate and prefer adaptive or
     demotion behavior over a constant that has become the work.
 
-46. **Long-lived container without a bound:** module-level or bootstrap-lived
-    `Map`/`Set` state can grow per file, project, or request despite a reset.
-    Classify each live occurrence as bounded, evicted, or content-keyed and
-    keep the inventory shrink-only; a read-only TTL check or session reset is
-    not a bound without a finite key-space argument. The bounded-container
-    sweep scans `clients/`, `tools/`, `mcp/`, and `index.ts` with AST evidence
-    and retains non-zero population and flagged floors.
+46. **Long-lived container without a bound:** module-level `Map`/`Set` state
+    is bounded, evicted, or content-keyed; a reset or TTL read is not a bound.
+    Enforced by `tests/config/bounded-container-guard.test.ts` (shrink-only).
 
 47. **Retry or drain loop consumes its own work list:** a bounded retry or
     drain loop must not remove its tracked item from the collection it iterates
@@ -266,17 +267,11 @@ ADR: docs/adr/0009-reported-path-attribution.md
     between attempts.
 
 51. **Cross-request derived-state cache where a request-local pass is
-    affordable:** a signature, line count, content hash, import graph or other
-    DERIVED value is memoised across requests, and its invalidation key cannot
-    express the truth (rename, existence flip, casing, generation). The
-    2026-08 staleness arc (#1461, #1622, #1630, #1631, #1633, #1634) was six
-    fixes to keys that could not say when they were wrong. Rule, from #1644:
-    for derived state on a hot path, first measure a request-local bounded
-    recompute; add a persistent cache only when the fresh-process benchmark
+    affordable:** for a derived value on a hot path, measure a request-local
+    bounded recompute first; persist it only when the fresh-process benchmark
     shows the recompute is the cost, and then the entry carries the generation
-    it was derived from. Tool-run caches (gitleaks, knip, trivy) are not
-    derived state; their freshness is governed by the delivery gate. A cache
-    that does not exist cannot serve stale. ADR: docs/adr/0006-derived-state-benchmark-first.md
+    it was derived from. Tool-run caches are governed by the delivery gate
+    instead. ADR: docs/adr/0006-derived-state-benchmark-first.md
 
 </important>
 
@@ -306,15 +301,18 @@ ADR: docs/adr/0009-reported-path-attribution.md
     reachability before scanning shell, workflow, or source text.
 
 49. **Whitespace counted as structure when it is alignment:** a leading run can
-    be alignment, not one nesting unit. Known members: an aligned continuation
-    inside a call (#3038), the interior of a block comment, whose ` * ` lines
-    sit one column past their opener (#3039), the same block-comment interior
-    picked as `indent-retarget.ts`'s extrapolation base unit (#3052), a
-    multi-line template literal's interior (#3059), and the same
-    template-literal interior picked as `indent-retarget.ts`'s extrapolation
-    base unit (#3116). Name which lines carry structure and exclude the rest
-    before counting; decline rather than pin a style when only ambiguous runs
-    remain.
+    be alignment, not one nesting unit (call continuations, block-comment and
+    template-literal interiors; #3038, #3039, #3052, #3059, #3116). Name which
+    lines carry structure and exclude the rest before counting; decline rather
+    than pin a style when only ambiguous runs remain.
+
+54. **One-direction filter proof:** a filter that drops stale input is proven
+    in both directions: it never passes stale input and never drops the only
+    fresh answer. The model carries a no-drop invariant beside the safety one,
+    and the test double emits in the real server's measured order, not the
+    order the fix assumes (#3484 r1: the fence dropped docker-langserver's only
+    publish; the model checked `FreshResult` alone and the fake published after
+    the fence reply).
 
 </important>
 
@@ -333,6 +331,7 @@ ADR: docs/adr/0009-reported-path-attribution.md
 
 40. **Tool root drift:** all runner, formatter, and LSP child spawns use
     `resolveToolCwd`; mutation of the seam, log, or fallback must turn a test red.
+    Enforced by `tests/support/spawn-cwd-scan.ts` and its runner sweep.
 
 42. **Language-specific rule:** use `LANGUAGES` and registry facts; add a
     non-TypeScript row whenever the rule is language-neutral.
@@ -342,6 +341,14 @@ ADR: docs/adr/0009-reported-path-attribution.md
     or default, name the concrete failure that reaches the user and choose the
     direction from that harm; test unreadable, absent, and thrown lookup states
     where the seam supports both directions.
+
+53. **Unhandled stream or process event is a host-fatal throw:** every callback
+    on a child process, socket, or stream is total (catch, bound, record); a
+    throw there bypasses the caller's `try/catch` and kills the pi host (#3375,
+    #3383, #3389). `data` handlers are enforced by
+    `tests/clients/data-handler-bounds-sweep.test.ts` and socket `error`
+    listeners by `tests/clients/socket-error-listener-sweep.test.ts`; screen
+    `close` and timer callbacks by hand.
 
 </important>
 
@@ -358,7 +365,8 @@ ADR: docs/adr/0009-reported-path-attribution.md
 11. **Skipped CI as green:** absent required checks are not passing checks.
 
 14. **Duplicate module instance:** tests import the same `.js` artifact as the
-    runtime and never reset a private `.ts` twin.
+    runtime and never reset a private `.ts` twin. Enforced by
+    `tests/config/module-instance-coverage.test.ts`.
 
 33. **Source assertion for runtime behavior:** prefer a runtime probe; source
     scans need proof that runtime observation is impossible.
@@ -385,21 +393,11 @@ ADR: docs/adr/0009-reported-path-attribution.md
     and are checked against direct root resolution.
 
 50. **Test double's fabricated identifier reaching code that acts on it:** a
-    pid, fd, port, lock path or handle invented by a mock is handed to
-    PRODUCTION code that registers, signals, writes or deletes by that
-    identifier, and the identifier is real to the OS even though the object is
-    not. `tests/clients/lsp/launch.test.ts`'s `spawn: () => new
-    MockChildProcess(2468)` reached `safeSpawnAsync`, which registered 2468 for
-    lifetime cleanup; at fork teardown the suite SIGKILLed pid 2468, which on
-    ~10 % of runners was one of the CI job's own processes (#2042, five weeks
-    of unexplained exit 137; fixed in #3091). A sign or range check is not the
-    guard — the value is plausible; OWNERSHIP is. Verify the identifier against
-    the OS at the moment it is admitted (`/proc/<pid>/status` PPid), refuse and
-    record what fails, and keep the verdict for the lifetime of the resource
-    rather than re-deriving it after the resource is gone. The class is
-    mechanised for pids by `tests/support/kill-guard.ts`, which fails any test
-    file that hands an unowned pid to a production kill or spawn seam; the
-    other identifier kinds have no detector yet, so screen them by hand.
+    pid, fd, port, lock path or handle invented by a mock reaches production
+    code that registers, signals, writes or deletes by it (#2042, #3091).
+    Verify ownership against the OS when the identifier is admitted, not its
+    range. Pids are enforced by `tests/support/kill-guard.ts`; screen the
+    other identifier kinds by hand.
 
 </important>
 
@@ -431,6 +429,13 @@ ADR: docs/adr/0009-reported-path-attribution.md
 30. **Load-time platform constant:** use a live platform read or an isolated
     fresh import for every platform branch test.
 
+55. **Field inherited across entry kinds:** when a coalescing queue carries a
+    field from a replaced entry into its replacement (a read stamp, a save
+    flag), check every kind the replacement can be, not only the kind the fix
+    was written for (#3491: a queued close inherited a stale touch's read stamp
+    and the stale-read drop discarded the close). No model composes the two
+    fixes yet; that is #3495.
+
 </important>
 
 <important if="availability policy or installer">
@@ -438,15 +443,12 @@ ADR: docs/adr/0009-reported-path-attribution.md
 ### availability or installer
 
 52. **A second store answering the same availability question:** a new latch,
-    map or cache that answers "can `<tool>` run right now, at what path"
-    beside the shared availability policy (`availability-policy.ts`,
-    `createAvailabilityLatch`). Nine such stores existed on 2026-08-20; with no
-    cross-store invalidation a mid-session uninstall is seen by the dispatch
-    runner and not by the formatter, which keeps spawning the vanished binary
-    (#1894). Rule: every store of that shape is pinned by name in the #1894
-    registry ratchet, the registry never grows, and a change that touches a
-    registered store moves it onto the shared policy and deletes it from the
-    registry in the same change. ADR: docs/adr/0005-tool-availability-enforcement-seam.md
+    map or cache answering "can `<tool>` run, at what path" beside the shared
+    policy (`availability-policy.ts`, `createAvailabilityLatch`). A consumer the
+    gate can see is enforced by `tests/clients/availability-policy-coverage.test.ts`
+    (shrink-only `KNOWN_GAPS`); the named-store registry ratchet is still open
+    in #1894, so a change touching another store moves it onto the shared
+    policy by hand. ADR: docs/adr/0005-tool-availability-enforcement-seam.md
 
 </important>
 
@@ -540,9 +542,18 @@ ADR: docs/adr/0009-reported-path-attribution.md
 - Per-path LSP notifications serialize read/build/send/record work. Pull
   cancellation blocks a same-path replacement until settlement. Waits are
   deadline- and abort-bounded, and silence is never clean.
+- A capability the client advertises has a sender, or the advertisement states
+  why it has none. `textDocument/didSave` follows a landed didOpen/didChange
+  only when the server declared `textDocumentSync.save` and the caller declared
+  the touch a save — the post-write sync and the explicit `lsp_diagnostics`
+  query, never a warm-up, cascade or sweep touch.
 - `touchFile` freezes content-bound auxiliary coverage at merge time. A later
   publication cannot undo a finding drop. Auxiliary gaps narrow coverage and
   never turn a primary answer inconclusive.
+- The explicit `lsp_diagnostics` read checks `exceedsLspSyncLimits` once before
+  warm attachment or `touchFile`; an over-bound file returns a `too_large`
+  result with its byte/line measurement and records
+  `lsp-diagnostics-file-too-large` once per file per session.
 - Every new LSP server has a smoke fixture or a documented alternate/toolchain
   exemption. Real LSP-spawn tests belong in the serialized `lsp-spawn-heavy`
   lane.
@@ -580,6 +591,10 @@ ADR: docs/adr/0009-reported-path-attribution.md
 - `clients/dispatch/runners/runner-spawn-cwd-sweep.test.ts` is the population
   guard for child cwd derivation. Add a reasoned migration row instead of a
   pin-only update.
+- Every `parseToolRun` runner documents its nonzero-exit table; the documented
+  `ran` codes are pinned exactly so adding or removing one does not pass
+  silently, and each documented code needs an executable status fixture in the
+  runner's own test matrix (#3292).
 
 </important>
 <important if="touching caches, stores, and project intelligence rules">
@@ -651,8 +666,14 @@ ADR: docs/adr/0009-reported-path-attribution.md
 - Raw components fit every rendered line with `clients/tui-fit.ts`. Read the
   mode from the event context: widgets require `tui`; proactive notifications
   are suppressed only in `print` and `json`.
-- Host SDK imports are type-only. Runtime dependencies belong in
-  `dependencies`, not `devDependencies`.
+- Host SDK imports are type-only, except the one lazy, caught lookup of pi's
+  `withFileMutationQueue` in `index.ts` (#3506) that
+  `tests/host-sdk-type-only.test.ts` admits by count. It reaches pi's running
+  instance only because jiti's native import of `dist/index.js` fails on the
+  host-provided static imports and jiti falls back to transpiling; where
+  those resolve natively it can load a second SDK copy, which
+  `clients/file-mutation-queue.ts` detects and records. Runtime dependencies
+  belong in `dependencies`, not `devDependencies`.
 
 </important>
 ## Key source layout
@@ -802,6 +823,12 @@ processes. Real elapsed-time assertions belong in the serialized
 `lsp-spawn-heavy`. Any admitted real spawn or timer carries the flake-shape
 header, baseline row, and lane membership.
 
+When the defect is an ordering of awaits on one seam (a coalescing queue, a
+per-key serializer), or the seam has regressed before, write a scheduler
+property with `fc.scheduler()` instead of one more replay:
+`tests/support/scheduler-properties.md`, worked example
+`tests/clients/lsp/notify-queue-properties.test.ts`.
+
 Use `tests/support/fault-injection.ts` for wedged children, deterministic
 seam delays, starved budgets, gates, and reset hooks. Use `makeRunnerCtx` for
 dispatch tests, `makeLspServiceDouble` for typed LSP doubles, and
@@ -914,3 +941,16 @@ live contract unless it changes a future decision.
 ## Contributing
 
 Bare-Node scripts import only `.js`/`.mjs`; type stripping is not assumed.
+
+Every `Bash` call an agent makes under Claude Code runs through the
+`PreToolUse` hook `scripts/hooks/guard-bash.mjs` (`.claude/settings.json`),
+mechanically enforcing six non-negotiables that used to live only as prose:
+no `git stash` in any form; no `git reset --soft`/`--hard`; no hand-typed
+`git worktree remove` with two force flags (use
+`node scripts/prune-agent-worktrees.mjs`); no `git worktree remove` at all on
+a worktree whose `node_modules` is a symlink pointing outside it; no unpinned
+`node` probe loading built runtime code from `clients/`/`dist/` without a
+`PI_LENS_HOME` pin; and no `TMPDIR`/`TMP`/`TEMP` aimed at the vitest harness's
+own home. See `CONTRIBUTING.md` "Local git hooks" for the human-facing
+version and `docs/pi-lens-subagent.md` for the fuller worktree/probe-hygiene
+contract.

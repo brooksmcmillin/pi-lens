@@ -37,19 +37,33 @@ describe("tree-sitter-client wasm resolution", () => {
 			client as unknown as {
 				grammarDirResolutionDeps: {
 					cwd: () => string;
+					packageRoot: () => string;
 					resolvePackage: (specifier: string) => string;
 					resolveAsset: (asset: string) => string | undefined;
 				};
 			}
 		).grammarDirResolutionDeps;
 		expect(deps.cwd()).toBe(process.cwd());
+		// #3409: the package-root rung is injected too, so no rung of the shared
+		// web-tree-sitter ladder is invisible to a test.
+		expect(fs.existsSync(path.join(deps.packageRoot(), "package.json"))).toBe(
+			true,
+		);
 		expect(path.isAbsolute(deps.resolvePackage("vitest/package.json"))).toBe(
 			true,
 		);
-		expect(deps.resolveAsset("grammars")).toBe(
-			path.resolve(
-				path.dirname(fileURLToPath(import.meta.url)),
-				"../../node_modules/web-tree-sitter/grammars",
+		// #3409: the grammars dir now comes from the package directory the module
+		// RESOLVER reports, so it is realpath-canonical. Where `node_modules` is a
+		// symlink (a pnpm store layout, a git worktree) that differs textually
+		// from the same directory reached through this file's own path, and both
+		// spellings name one directory — hence realpath on both sides. The pin
+		// that matters is unchanged: not a fixed path relative to import.meta.url.
+		expect(fs.realpathSync(deps.resolveAsset("grammars") as string)).toBe(
+			fs.realpathSync(
+				path.resolve(
+					path.dirname(fileURLToPath(import.meta.url)),
+					"../../node_modules/web-tree-sitter/grammars",
+				),
 			),
 		);
 		// Must NOT assume the wasm lives nested under pi-lens's own node_modules
@@ -82,6 +96,11 @@ describe("tree-sitter-client wasm resolution", () => {
 			);
 			const client = new TreeSitterClient(false, undefined, {
 				resolveAsset: () => path.dirname(wasmPath),
+				// findGrammarsDir must not consult pi-lens's package root (#3409 added
+				// that rung to the web-tree-sitter ladder, not to this one).
+				packageRoot: () => {
+					throw new Error("package-root resolver must not run");
+				},
 				resolvePackage: () => {
 					throw new Error("package resolver must not run");
 				},
@@ -115,6 +134,9 @@ describe("tree-sitter-client wasm resolution", () => {
 			);
 			const client = new TreeSitterClient(false, undefined, {
 				resolveAsset: () => undefined,
+				packageRoot: () => {
+					throw new Error("package-root resolver must not run");
+				},
 				resolvePackage: (specifier) => {
 					expect(specifier).toBe("tree-sitter-wasms/package.json");
 					return packageJson;
@@ -139,6 +161,9 @@ describe("tree-sitter-client wasm resolution", () => {
 			fs.mkdirSync(expectedDir, { recursive: true });
 			const client = new TreeSitterClient(false, undefined, {
 				resolveAsset: () => undefined,
+				packageRoot: () => {
+					throw new Error("package-root resolver must not run");
+				},
 				resolvePackage: () => {
 					throw new Error("package resolver must not run");
 				},
@@ -153,6 +178,9 @@ describe("tree-sitter-client wasm resolution", () => {
 	it("findGrammarsDir returns empty when no branch resolves", () => {
 		const client = new TreeSitterClient(false, undefined, {
 			resolveAsset: () => undefined,
+			packageRoot: () => {
+				throw new Error("package-root resolver must not run");
+			},
 			resolvePackage: () => {
 				throw new Error("package unavailable");
 			},

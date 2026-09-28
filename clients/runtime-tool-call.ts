@@ -862,6 +862,8 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 	}
 	if (shouldAutoTouch) {
 		try {
+			// #3481: when the synced bytes were read, for the notify queue's order.
+			const readStamp = performance.now();
 			const fileContent = nodeFs.readFileSync(filePath, "utf-8");
 			const maxClientWaitMs =
 				toolName === "lsp_navigation"
@@ -877,6 +879,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 					source: `tool_call:${toolName}`,
 					clientScope: "primary",
 					maxClientWaitMs,
+					readStamp,
 				})
 				.then((result) => {
 					if (toolName === "read") {
@@ -927,9 +930,17 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 		  }
 		| undefined;
 
+	// #3555: a widening whose tool_result never came (a later extension
+	// blocked the call, a batch was aborted) must not label a new call that
+	// reuses its id.
+	if (toolName === "read" && toolCallId !== undefined)
+		runtime.takeReadWidening(toolCallId);
+	// #3555: the widening serves the read guard, so it is off with the guard
+	// (`--no-read-guard`, or `readGuard.enabled=false`, lens-flag-registry.ts).
 	const readExpansionClient =
 		toolName === "read" &&
 		!getFlag("no-lsp") &&
+		!getFlag("no-read-guard") &&
 		!isExternalOrVendor &&
 		filePath &&
 		readInput &&
@@ -992,6 +1003,24 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 					enriched = true;
 				} else {
 					enclosingSymbol = expansion.enclosingSymbol;
+				}
+				// #3555: the tool_result tells the agent it was shown more than
+				// it asked for. A Markdown section is named by its heading, as the
+				// fast path found it, whatever an LSP calls it.
+				if (toolCallId !== undefined) {
+					runtime.recordReadWidening(toolCallId, {
+						filePath,
+						inputPath: rawFilePath,
+						requested: {
+							offset: requestedReadOffset,
+							limit: requestedReadLimit,
+						},
+						shown: { offset: expansion.newOffset, limit: expansion.newLimit },
+						boundary:
+							expansion.enclosingSymbol.kind === "markdown_section"
+								? { heading: expansion.enclosingSymbol.name }
+								: { symbol: enclosingSymbol },
+					});
 				}
 				logToolReadGuardEvent({
 					event: "ts_range_expanded",
@@ -1108,9 +1137,15 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 				// budgeted families rather than leaving this site to spell its
 				// own axis value (#2557 review F7).
 				hook: "tool_call",
-				// The ambient slot is populated by tool_result, after this hook has
-				// already run. Use the live tool_call signal so Escape can release
-				// this await (#2523 AC4).
+				// The ambient slot is populated by tool_result, AFTER this hook has
+				// already run, so the live `tool_call` signal is the only one that
+				// can release this await when the user presses Escape (#2523 AC4).
+				// #2939 round 2 restored this after round 2's own measurement: with
+				// the signal absent, an aborted caller waits the demand's whole
+				// `BOOTSTRAP_LOAD_TIMEOUT_MS` out and the cancel then surfaces on the
+				// ledger as a `timeout` degradation — the exact inversion
+				// `requestBootstrapClients`'s `unavailableReason !== "aborted"` guard
+				// exists to prevent.
 				signal: deps.ctx.signal,
 			})
 		)?.complexityClient;
@@ -1635,6 +1670,10 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 					block: true,
 					reason: verdict.reason,
 				};
+			} else if (toolCallId !== undefined) {
+				// #3523: the edit lands at the agent's own line numbers, so its
+				// tool_result may record the written lines as read.
+				runtime.markToolCallEditInPlace(toolCallId);
 			}
 		}
 	}

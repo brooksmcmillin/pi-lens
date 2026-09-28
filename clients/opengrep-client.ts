@@ -245,15 +245,20 @@ export class OpengrepClient extends SecurityScanClient<OpengrepResult> {
 				success: true,
 				// A warning-level partial report with no scanned paths proves that
 				// the producer went cold. A complete empty report still proves a
-				// genuine scan, so it remains authoritative for the id-only fallback.
+				// genuine scan, so it is still "analysed" for the render layer's
+				// analysed-and-found-nothing state (#2970) — but it carries no
+				// FILE-level authority, which `analyzedFiles: []` below is what
+				// says.
 				analyzed: !report.partial || report.scanned.length > 0,
-				...(report.scanned.length > 0
-					? {
-							analyzedFiles: report.scanned.map((file) =>
-								realpathOrResolve(path.resolve(cwd, file)),
-							),
-						}
-					: {}),
+				// #2962: the set is ALWAYS carried, empty included. "This producer
+				// declared its coverage and it was zero files" and "this producer
+				// declares no coverage at all" are different facts; dropping the
+				// empty array collapses them into the second, and the second is
+				// what hands a zero-file scan whole-root retirement authority
+				// downstream (`runnerRetirementDecision`, tools/lens-diagnostics.ts).
+				analyzedFiles: report.scanned.map((file) =>
+					realpathOrResolve(path.resolve(cwd, file)),
+				),
 				...(report.partial ? { partial: true } : {}),
 				...(report.partial ? { summary: report.partial.reason } : {}),
 				...(report.partial && report.scanned.length === 0

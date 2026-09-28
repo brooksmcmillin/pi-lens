@@ -26,6 +26,8 @@ export function mergeSrc(existing: string, measured: string): string;
 
 export function compareStableStrings(a: string, b: string): number;
 
+export function compareGeneratedDocs(a: string, b: string): boolean;
+
 export function sortedStrings(values: readonly unknown[] | undefined): string[];
 
 export interface ServerCapabilityRow {
@@ -37,6 +39,8 @@ export interface ServerCapabilityRow {
 	operationSupport?: Record<string, boolean | undefined>;
 	advertisedCommands?: readonly string[];
 	rawCapabilityKeys?: readonly string[];
+	/** #3407: `textDocumentSync.save` as the snapshot reports it. */
+	textDocumentSave?: "none" | "save" | "save+text";
 }
 
 export function renderServerCapabilitiesDoc(options: {
@@ -60,7 +64,7 @@ export function reshapeRowsByName(
 	priorHeader: string[],
 	newHeader: string[],
 	keyCol: string,
-	placeholder?: string,
+	placeholder?: string | ((column: string) => string),
 ): string[][];
 
 export function parseBulletSection(

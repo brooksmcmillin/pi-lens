@@ -28,11 +28,17 @@ export declare function lintPrBody(
 		cwd?: string;
 		git?: (args: string[], options?: Record<string, unknown>) => string;
 		headFiles?: Map<string, string>;
+		testCorpus?: { paths: Set<string>; titles: Set<string> };
 	},
 ): {
 	valid: boolean;
 	errors: string[];
 };
+export declare function testCorpus(options?: {
+	cwd?: string;
+	workingTree?: boolean;
+	git?: (args: string[], options?: Record<string, unknown>) => string;
+}): { paths: Set<string>; titles: Set<string> };
 export declare function localTouchesTests(
 	cwd?: string,
 	git?: (args: string[], options?: Record<string, unknown>) => string,

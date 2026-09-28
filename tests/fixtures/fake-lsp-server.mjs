@@ -217,6 +217,13 @@ const PUBLISH_SEQUENCE = (process.env.FAKE_LSP_PUBLISH_SEQUENCE ?? "")
 const PUBLISH_SEQUENCE_GAP_MS = Number(
 	process.env.FAKE_LSP_PUBLISH_SEQUENCE_GAP_MS ?? "300",
 );
+// #3484: delay before the FIRST publish (default 0: published while the
+// didOpen/didChange is handled, before any request sent after it is read).
+// Measured intelephense answers a documentSymbol sent in the same tick first
+// (+2..4 ms) and publishes ~1 s later, which a positive delay reproduces.
+const PUBLISH_SEQUENCE_FIRST_MS = Number(
+	process.env.FAKE_LSP_PUBLISH_SEQUENCE_FIRST_MS ?? "0",
+);
 
 function publishSequenceFor(uri) {
 	if (PUBLISH_SEQUENCE.length === 0) return false;
@@ -245,11 +252,14 @@ function publishSequenceFor(uri) {
 				},
 			});
 		};
-		if (index === 0) {
+		if (index === 0 && PUBLISH_SEQUENCE_FIRST_MS <= 0) {
 			emit();
 			return;
 		}
-		const timer = setTimeout(emit, index * PUBLISH_SEQUENCE_GAP_MS);
+		const timer = setTimeout(
+			emit,
+			PUBLISH_SEQUENCE_FIRST_MS + index * PUBLISH_SEQUENCE_GAP_MS,
+		);
 		timer.unref?.();
 	});
 	return true;
@@ -445,6 +455,21 @@ function handle(raw) {
 						change: process.env.FAKE_LSP_SYNC_KIND
 							? Number(process.env.FAKE_LSP_SYNC_KIND)
 							: 1,
+						// #3405: `save` is ABSENT by default, the shape this fixture has
+						// always advertised — upstream's rule is "If omitted the
+						// notification should not be sent", so the default fixture must
+						// receive no `textDocument/didSave`. `FAKE_LSP_SAVE=true` declares
+						// the bare boolean (Expert's shape), `=includeText` declares
+						// `{ includeText: true }`, `=false` declares an explicit refusal.
+						...(process.env.FAKE_LSP_SAVE === "true"
+							? { save: true }
+							: process.env.FAKE_LSP_SAVE === "includeText"
+								? { save: { includeText: true } }
+								: process.env.FAKE_LSP_SAVE === "emptyObject"
+									? { save: {} }
+									: process.env.FAKE_LSP_SAVE === "false"
+										? { save: false }
+										: {}),
 					},
 					// #269: only advertise a non-default position encoding when asked,
 					// so the bulk of the integration tests stay on the UTF-16 default.
@@ -652,6 +677,23 @@ function handle(raw) {
 				jsonrpc: "2.0",
 				method: "$/test/didChangeReceived",
 				params: { contentChanges: data.params?.contentChanges ?? [] },
+			});
+		}
+		return;
+	}
+	// #3405: twin of the didChange echo above — a real-init integration test
+	// asserts WHETHER a didSave arrived and whether it carried `text`, so the
+	// capability gate is proved over the wire and not only in the negotiation
+	// unit. Off by default.
+	if (data.method === "textDocument/didSave") {
+		if (process.env.FAKE_LSP_ECHO_DID_SAVE) {
+			send({
+				jsonrpc: "2.0",
+				method: "$/test/didSaveReceived",
+				params: {
+					uri: data.params?.textDocument?.uri,
+					hasText: typeof data.params?.text === "string",
+				},
 			});
 		}
 		return;

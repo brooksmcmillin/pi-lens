@@ -22,9 +22,24 @@ export function classifyCleanBehavior(obs: CleanSignalObservations): {
 	reason: string;
 };
 
+export function createPublishTraceDrainer(options: {
+	readLog: (offset: number) => {
+		size: number;
+		read: (offset: number) => { chunk: string; bytesRead: number } | null;
+	};
+	echoTrace?: boolean;
+}): {
+	(sink: Array<{ server?: string }>, serverId: string): void;
+	reset(offset: number): void;
+};
+
 export interface DriftInput {
 	lang: string;
 	behavior: string;
+	/** #3444: the first-publish class of the same trace, when measured. */
+	firstPublish?: string;
+	/** #3444: a `clean: true` fixture, whose empty dirty phase is by design. */
+	cleanFixture?: boolean;
 }
 
 export interface DriftResult {
@@ -41,6 +56,13 @@ export function checkCleanSignalDrift(
 	row: DriftInput,
 	silentOnClean: boolean | undefined,
 ): DriftResult;
+
+export function isDegenerateSilent(row: DriftInput): boolean;
+
+export function aggregateDriftRows<R extends DriftInput>(
+	rows: R[],
+	keyOf?: (lang: string) => string,
+): Array<R & { fixtures: string[] }>;
 
 export function findCleanSignalDrift(
 	rows: DriftInput[],

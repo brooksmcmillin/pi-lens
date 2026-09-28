@@ -72,6 +72,7 @@ migrate-*.js
 !tests/fixtures/ci-pr-bodies/*.md
 !CLAUDE.md
 !tests/fixtures/changelog-entries/*.md
+!tests/support/scheduler-properties.md
 !.changelog/*.md
 !AGENTS.md
 !HISTORY.md
@@ -200,3 +201,6 @@ tests/native-ts7-live-*/
 
 # Probe hygiene home for tests and scripts (AGENTS.md "Probe hygiene"); never tracked.
 .probe-home/
+
+# TLA+ tools jar fetched by scripts/check-tla-models.mjs (#3447)
+/.cache/

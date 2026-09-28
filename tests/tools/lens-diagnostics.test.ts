@@ -18,6 +18,7 @@ import {
 import {
 	_setRecentPhasesForTest,
 	getRecentLoggedPhases,
+	resetOncePerSessionPhases,
 } from "../../clients/latency-logger.js";
 import { resetProjectLensConfigCache } from "../../clients/project-lens-config.js";
 import { removeTempDirSync } from "../clients/test-utils.js";
@@ -680,6 +681,28 @@ describe("lens_diagnostics source=lsp compact render", () => {
 				outcomeCounts: { unavailable: 1 },
 			}),
 		).toContain("not confirmed");
+	});
+
+	it("preserves oversized files in the compact LSP summary (#3408)", () => {
+		const line = render({
+			source: "lsp",
+			totalDiagnostics: 0,
+			filesChecked: 1,
+			cleanFiles: 0,
+			outcomeCounts: { too_large: 1 },
+			outcomes: [
+				{
+					file: "/tmp/huge.ts",
+					outcome: "too_large",
+					reason:
+						"file too large for LSP diagnostics (2097153 bytes > 2097152 limit)",
+				},
+			],
+		});
+		expect(line).toContain("too large");
+		expect(line).toContain("huge.ts");
+		expect(line).toContain("2097153 bytes");
+		expect(line).not.toContain("0 diagnostics");
 	});
 });
 
@@ -1788,6 +1811,73 @@ describe("lens_diagnostics mode=full", () => {
 			{ mode: "full", refreshRunners: "cached" },
 		);
 		expect(getRecentLoggedPhases().map((entry) => entry.phase)).not.toContain(
+			"runner_coverage_retired",
+		);
+	});
+
+	// #2962: a zero-file coverage declaration retires nothing, so it must not
+	// write this row AND must not consume the once-per-session claim — the
+	// session's first real coverage row would otherwise be suppressed by the
+	// call that proved there was no coverage.
+	it("an empty coverage entry does not burn the once-per-session coverage row", async () => {
+		// Re-arm the claim so this case does not depend on which sibling test
+		// consumed opengrep's row earlier in the file.
+		resetOncePerSessionPhases();
+		mockSummaries.push(
+			sum(
+				"/proj/src/clean.py",
+				{ warnings: 1 },
+				{
+					diagnostics: [
+						{
+							severity: "warning",
+							message: "retained",
+							line: 1,
+							rule: "opengrep:x",
+							tool: "opengrep",
+						},
+					],
+				},
+			),
+		);
+		freshFetchMocks.fetchFreshProjectDiagnostics.mockResolvedValue({
+			diagnostics: [],
+			runners: [],
+			analyzed: ["opengrep"],
+			cold: [],
+			timings: {},
+			authoritativeCoverage: [
+				{ runnerId: "opengrep", root: "/proj", files: new Set() },
+			],
+		});
+		_setRecentPhasesForTest([]);
+		await run(
+			makeTool({}, { runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]) }),
+			{ mode: "full", refreshRunners: "cached" },
+		);
+		expect(getRecentLoggedPhases().map((entry) => entry.phase)).not.toContain(
+			"runner_coverage_retired",
+		);
+		freshFetchMocks.fetchFreshProjectDiagnostics.mockResolvedValue({
+			diagnostics: [],
+			runners: [],
+			analyzed: ["opengrep"],
+			cold: [],
+			timings: {},
+			authoritativeCoverage: [
+				{
+					runnerId: "opengrep",
+					root: "/proj",
+					files: new Set(["/proj/src/clean.py"]),
+				},
+			],
+		});
+		_setRecentPhasesForTest([]);
+		await run(
+			makeTool({}, { runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]) }),
+			{ mode: "full", refreshRunners: "cached" },
+		);
+		expect(getRecentLoggedPhases().map((entry) => entry.phase)).toContain(
 			"runner_coverage_retired",
 		);
 	});

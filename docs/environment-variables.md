@@ -283,12 +283,46 @@ Days to keep rotated logs before cleanup. **Default:** `7`.
 
 Maximum log size (MB) before rotation. **Default:** `10`.
 
+## Diagnostic-only knobs
+
+These use the `PILENS_` (no underscore after `PI`) prefix, so they are
+invisible to a `grep PI_LENS_` sweep — use the wider `grep -E 'PI_?LENS_'`
+below to find them and anything like them. Not part of the supported surface;
+each exists for a narrow diagnostic or escape-hatch purpose, not everyday
+tuning.
+
+### `PILENS_PROBE`
+
+Set to `1` to force an ad-hoc probe (a bare `node -e` or throwaway script
+against built `clients/*.js`, run outside a test harness and without
+`PI_LENS_HOME` set) to redirect its home/log directory away from the real
+`~/.pi-lens`, the same way running from an agent worktree or `os.tmpdir()`
+already does automatically (`clients/probe-home-state.ts`). Prefer setting
+`PI_LENS_HOME` explicitly; this is the forced opt-in for a probe run from an
+ordinary project checkout, where the automatic detection would not fire.
+
+### `PILENS_UNSAFE_FORCE_GRAMMAR_LOAD`
+
+Diagnostic escape hatch for the grammar-health probe only (`clients/grammar-source.ts`).
+Set to `1` to force-load a tree-sitter grammar this runtime has blocklisted,
+to test whether a newer build/runtime lifts the block. Disables the crash
+protection the blocklist provides and can abort the process. Never set in
+normal operation.
+
+### `PILENS_PUB_DEBUG`
+
+Set to `1` to trace each LSP server's `publishDiagnostics` behavior (version +
+diagnostic count) to diagnose the clean-file affirmative-signal question:
+which servers publish an empty-with-version set on a clean scan vs. go silent
+(`clients/lsp/client.ts`). Off by default.
+
 ## Advanced tuning knobs
 
 pi-lens also has many advanced/internal tuning variables — LSP timeouts and
 memory budgets, debounce intervals (`PI_LENS_LSP_*`, and others). These are for
 edge-case tuning, are not part of the supported surface above, and are documented
-in the source; enumerate them with `grep PI_LENS_ clients/`.
+in the source; enumerate them with `grep -E 'PI_?LENS_' clients/` (the wider
+pattern catches the `PILENS_` diagnostic-only knobs above too).
 
 ## Related
 

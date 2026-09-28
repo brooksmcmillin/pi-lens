@@ -8,7 +8,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import lspRunner from "../../../../clients/dispatch/runners/lsp.js";
 import {
 	initLSPConfig,
@@ -28,16 +28,35 @@ const fakeServerPath = path.resolve(
 	fixtureDir,
 	"../../../fixtures/fake-lsp-server.mjs",
 );
-const serverAvailable =
+export const serverAvailable =
 	fs.existsSync(process.execPath) && fs.existsSync(fakeServerPath);
 const d = serverAvailable ? describe : describe.skip;
 
-if (!serverAvailable) {
-	console.warn(
+function reportUnavailableServer(): void {
+	process.stderr.write(
 		`[CI LOUD] skipping real LSP runner tests: Node or fake server unavailable ` +
-			`(node=${process.execPath}, server=${fakeServerPath})`,
+			`(node=${process.execPath}, server=${fakeServerPath})\n`,
 	);
 }
+
+if (!serverAvailable) reportUnavailableServer();
+
+describe("worker console channel (#3128)", () => {
+	it("writes the unavailable-server notice to stderr with a newline", () => {
+		const write = vi
+			.spyOn(process.stderr, "write")
+			.mockImplementation(() => true);
+		try {
+			reportUnavailableServer();
+			expect(write).toHaveBeenCalledTimes(1);
+			const message = String(write.mock.calls[0]?.[0]);
+			expect(message).toContain("fake server unavailable");
+			expect(message.endsWith("\n")).toBe(true);
+		} finally {
+			write.mockRestore();
+		}
+	});
+});
 
 d("LSP dispatch runner — real server (#873)", () => {
 	let env: RealRunnerEnv;

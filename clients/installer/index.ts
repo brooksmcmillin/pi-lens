@@ -48,8 +48,15 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync, statSync, unlinkSync } from "node:fs";
+import {
+	existsSync,
+	readFileSync,
+	statSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import fs from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import https from "node:https";
 import { createRequire } from "node:module";
 import os from "node:os";
@@ -74,6 +81,18 @@ import {
 import { commitDurableStoreAsync } from "../durable-store.js";
 import { getGlobalPiLensDir } from "../file-utils.js";
 import { createGenerationMap } from "../generation-guard.js";
+import {
+	type GenerationHeartbeat,
+	type GenerationHold,
+	heartbeatIntervalMs,
+	isLockContention,
+	ownsTopGeneration,
+	recordGenerationTakeover,
+	recordLegacyLockHeld,
+	releaseGeneration,
+	startGenerationHeartbeat,
+	tryAcquireGeneration,
+} from "../generation-lock.js";
 import { resolveToolCwd } from "../tool-cwd.js";
 import {
 	allAvailableGlobalBinDirs,
@@ -85,6 +104,11 @@ import {
 	resetSafeSpawnWindowsCommandCache,
 	safeSpawnAsync,
 } from "../safe-spawn.js";
+import {
+	type BoundedOutputSink,
+	createBoundedOutputSink,
+	DEFAULT_MAX_OUTPUT_BYTES,
+} from "../spawn-output-cap.js";
 import { probeToolAsync } from "../tool-probe.js";
 import { logSessionStart } from "../sessionstart-logger.js";
 import { resolveGitHubToken } from "../zizmor-config.js";
@@ -92,7 +116,8 @@ import { resolveGitHubToken } from "../zizmor-config.js";
 // Global installation directory for pi-lens tools
 const TOOLS_DIR = path.join(getGlobalPiLensDir(), "tools");
 const INSTALL_LOCK_PATH = path.join(TOOLS_DIR, ".install.lock");
-const activeInstallLocks = new Set<string>();
+const INSTALL_LOCK_GENERATIONS = `${INSTALL_LOCK_PATH}s`;
+const activeInstallLocks = new Set<InstallLockHold>();
 let installLockExitCleanupRegistered = false;
 
 /**
@@ -109,6 +134,20 @@ interface InstallLockOwner {
 	createdAt: number;
 }
 
+/**
+ * A held install lock: its generation, the exact text it wrote to the old
+ * file, and the heartbeat keeping the generation's mtime fresh for the whole
+ * hold (#3515). Release compares that text, as the bounded lock compares its
+ * token: a pid alone also matches a newer hold of this same process (#3476
+ * review F3). The `nonce` keeps two holds created in one millisecond apart;
+ * older installers read only `pid` and `createdAt`.
+ */
+interface InstallLockHold {
+	generation: GenerationHold;
+	token: string;
+	heartbeat: GenerationHeartbeat;
+}
+
 function isProcessAlive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
@@ -118,11 +157,152 @@ function isProcessAlive(pid: number): boolean {
 	}
 }
 
+/**
+ * How old a lock may be before it is stale whatever its pid says: longer than
+ * any legitimate install (the owner's install bound plus slack). #946 review
+ * F1: pid liveness alone cannot detect a hard-killed owner whose pid Windows
+ * has recycled, and that lock would poison every later install.
+ */
+function installLockMaxAgeMs(): number {
+	return (Number(process.env.PI_LENS_INSTALL_TIMEOUT_MS) || 120_000) + 60_000;
+}
+
+/**
+ * The pre-#3476 install lock file. Installers from older versions take only
+ * this file, so while mixed versions run a generation holder holds it too: an
+ * older installer blocks on it, and a live older installer blocks the holder.
+ * Only a generation holder creates or removes it, so installers of this
+ * version never race each other for it. A stale one is removed by path,
+ * which races only an older installer's own takeover.
+ */
+function legacyInstallLockIsStale(maxAgeMs: number): boolean {
+	try {
+		const owner = JSON.parse(
+			readFileSync(INSTALL_LOCK_PATH, "utf8"),
+		) as InstallLockOwner;
+		const expired =
+			Number.isFinite(owner.createdAt) &&
+			Date.now() - owner.createdAt > maxAgeMs;
+		return (
+			expired ||
+			(Number.isInteger(owner.pid) &&
+				owner.pid > 0 &&
+				!isProcessAlive(owner.pid))
+		);
+	} catch {
+		// An unreadable/empty lock has no createdAt to age out: fall back to the
+		// file's own mtime so it is eventually recoverable (#946 review F1/F6).
+		try {
+			return Date.now() - statSync(INSTALL_LOCK_PATH).mtimeMs > maxAgeMs;
+		} catch {
+			return false;
+		}
+	}
+}
+
+function createLegacyInstallLock(token: string): boolean {
+	try {
+		writeFileSync(INSTALL_LOCK_PATH, token, { flag: "wx" });
+		return true;
+	} catch (cause) {
+		if (isLockContention(cause)) return false;
+		throw cause;
+	}
+}
+
+function takeLegacyInstallLock(maxAgeMs: number, token: string): boolean {
+	if (createLegacyInstallLock(token)) return true;
+	if (!legacyInstallLockIsStale(maxAgeMs)) return false;
+	try {
+		unlinkSync(INSTALL_LOCK_PATH);
+	} catch {
+		// Gone since the create, or (Windows) still open elsewhere: retry.
+		return false;
+	}
+	return createLegacyInstallLock(token);
+}
+
+function installLockOwner(): string {
+	try {
+		const owner = JSON.parse(
+			readFileSync(INSTALL_LOCK_PATH, "utf8"),
+		) as InstallLockOwner;
+		return `pid=${owner.pid} createdAt=${owner.createdAt}`;
+	} catch {
+		return "unknown owner";
+	}
+}
+
+/**
+ * One attempt at the install lock (#3476): a generation in
+ * `TOOLS_DIR/.install.locks` with the install max age as its lease, then the
+ * pre-#3476 file. Of two takers of one stale generation exactly one exclusive
+ * create succeeds; the old takeover removed the lock by path, and a taker
+ * acting on an earlier judgement could remove a live successor's lock.
+ *
+ * #3515: the generation's mtime is kept fresh by a heartbeat for as long as
+ * the hold lives — an ERESOLVE npm install can run two 120s
+ * `runInstallAttempt`s inside `maxAgeMs` (180s by default), and nothing
+ * previously renewed the generation while that ran.
+ */
+function tryAcquireInstallLock(
+	maxAgeMs: number,
+): InstallLockHold | "busy" | "legacy-held" {
+	const hold = tryAcquireGeneration(INSTALL_LOCK_GENERATIONS, maxAgeMs);
+	if (!hold) return "busy";
+	if (hold.tookOverStale) recordGenerationTakeover(hold);
+	const heartbeat = startGenerationHeartbeat(
+		hold,
+		heartbeatIntervalMs(maxAgeMs),
+	);
+	const token = JSON.stringify({
+		pid: process.pid,
+		createdAt: Date.now(),
+		nonce: randomUUID(),
+	});
+	let took: boolean;
+	try {
+		took = takeLegacyInstallLock(maxAgeMs, token);
+	} catch (cause) {
+		heartbeat.stop();
+		releaseGeneration(hold);
+		throw cause;
+	}
+	if (took) return { generation: hold, token, heartbeat };
+	heartbeat.stop();
+	releaseGeneration(hold);
+	return "legacy-held";
+}
+
+/**
+ * Release a held install lock. The old file is removed only while it still
+ * holds this hold's own text: after an age-out takeover it names the new
+ * holder, an older installer or a newer hold of this process.
+ */
+function releaseInstallLock(hold: InstallLockHold): void {
+	activeInstallLocks.delete(hold);
+	hold.heartbeat.stop();
+	try {
+		if (readFileSync(INSTALL_LOCK_PATH, "utf8") === hold.token)
+			unlinkSync(INSTALL_LOCK_PATH);
+	} catch {
+		// Already gone: nothing of ours to remove.
+	}
+	releaseGeneration(hold.generation);
+}
+
 async function acquireInstallLock(): Promise<{
 	release?: () => Promise<void>;
 	reason?: string;
+	/**
+	 * Present only when `release` is: whether this hold is still the live top
+	 * generation right now (#3515). The heartbeat is what usually keeps this
+	 * true for the hold's whole lifetime; a strategy with more than one
+	 * critical write inside one hold (npm's ERESOLVE retry) checks this
+	 * between them and aborts rather than risk racing a second holder.
+	 */
+	ownsLock?: () => boolean;
 }> {
-	await fs.mkdir(TOOLS_DIR, { recursive: true });
 	// #946 review F2: the waiter's bound must exceed the owner's install bound
 	// (PI_LENS_INSTALL_TIMEOUT_MS, default 120s) — a 30s waiter gave up on a
 	// legitimate slow install and reported the tool unavailable for the whole
@@ -130,26 +310,21 @@ async function acquireInstallLock(): Promise<{
 	const timeoutMs =
 		Number(process.env.PI_LENS_INSTALL_LOCK_TIMEOUT_MS) || 150_000;
 	const deadline = Date.now() + timeoutMs;
-	let lastOwner = "unknown owner";
+	const maxAgeMs = installLockMaxAgeMs();
+	let legacyHeldRecorded = false;
 
 	while (Date.now() < deadline) {
-		try {
-			const handle = await fs.open(INSTALL_LOCK_PATH, "wx");
-			await handle.writeFile(
-				JSON.stringify({ pid: process.pid, createdAt: Date.now() }),
-			);
-			await handle.close();
-			activeInstallLocks.add(INSTALL_LOCK_PATH);
+		const hold = tryAcquireInstallLock(maxAgeMs);
+		if (hold === "legacy-held" && !legacyHeldRecorded) {
+			legacyHeldRecorded = true;
+			recordLegacyLockHeld(INSTALL_LOCK_PATH);
+		}
+		if (typeof hold === "object") {
+			activeInstallLocks.add(hold);
 			if (!installLockExitCleanupRegistered) {
 				installLockExitCleanupRegistered = true;
 				process.once("exit", () => {
-					for (const lockPath of activeInstallLocks) {
-						try {
-							unlinkSync(lockPath);
-						} catch {
-							// Best effort; the next owner verifies this PID is dead.
-						}
-					}
+					for (const held of activeInstallLocks) releaseInstallLock(held);
 				});
 			}
 			let released = false;
@@ -157,60 +332,15 @@ async function acquireInstallLock(): Promise<{
 				release: async () => {
 					if (released) return;
 					released = true;
-					activeInstallLocks.delete(INSTALL_LOCK_PATH);
-					await fs.rm(INSTALL_LOCK_PATH, { force: true });
+					releaseInstallLock(hold);
 				},
+				ownsLock: () => ownsTopGeneration(hold.generation),
 			};
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			try {
-				const owner = JSON.parse(
-					await fs.readFile(INSTALL_LOCK_PATH, "utf8"),
-				) as InstallLockOwner;
-				lastOwner = `pid=${owner.pid} createdAt=${owner.createdAt}`;
-				// #946 review F1: PID liveness alone cannot detect a hard-killed
-				// owner whose PID Windows has recycled — that lock would poison
-				// every future install with a full-timeout wait. A lock older
-				// than any legitimate install (owner install bound + slack) is
-				// stale regardless of what the PID now points at.
-				const maxAgeMs =
-					(Number(process.env.PI_LENS_INSTALL_TIMEOUT_MS) || 120_000) + 60_000;
-				const expired =
-					Number.isFinite(owner.createdAt) &&
-					Date.now() - owner.createdAt > maxAgeMs;
-				if (
-					expired ||
-					(Number.isInteger(owner.pid) &&
-						owner.pid > 0 &&
-						!isProcessAlive(owner.pid))
-				) {
-					await fs.rm(INSTALL_LOCK_PATH, { force: true });
-					continue;
-				}
-			} catch (readError) {
-				lastOwner = "unreadable owner";
-				// An unreadable/empty lock has no createdAt to age out — fall
-				// back to the file's own mtime for the max-age check so it is
-				// eventually recoverable (#946 review F1/F6).
-				try {
-					const stat = await fs.stat(INSTALL_LOCK_PATH);
-					const maxAgeMs =
-						(Number(process.env.PI_LENS_INSTALL_TIMEOUT_MS) || 120_000) +
-						60_000;
-					if (Date.now() - stat.mtimeMs > maxAgeMs) {
-						await fs.rm(INSTALL_LOCK_PATH, { force: true });
-						continue;
-					}
-				} catch {
-					// stat raced a release — loop and retry acquisition.
-				}
-				void readError;
-			}
-			await new Promise((resolve) => setTimeout(resolve, 100));
 		}
+		await new Promise((resolve) => setTimeout(resolve, 100));
 	}
 	return {
-		reason: `timed out after ${timeoutMs}ms waiting for shared tools install lock (${lastOwner})`,
+		reason: `timed out after ${timeoutMs}ms waiting for shared tools install lock (${installLockOwner()})`,
 	};
 }
 
@@ -362,6 +492,18 @@ export interface ToolDefinition {
 	 * mechanism for any npm/pnpm/bun-distributed platform-CLI tool.
 	 */
 	platformPackage?: PlatformPackageSpec;
+	/**
+	 * Extra requirement specifiers that bound what pip may resolve for a
+	 * `"pip"`-strategy entry, applied through pip's own `PIP_CONSTRAINT` (#3311).
+	 * For a package whose published metadata under-constrains a dependency that
+	 * then breaks it: `cmake-language-server` 0.1.11 declares `pygls>=1.1.1`,
+	 * pip resolves pygls 2.x, and pygls 2 removed `pygls.server.LanguageServer`
+	 * — so every invocation of the installed launcher, `--version` included, dies
+	 * in an ImportError. A constraint, not a `packageName` pin: the app version
+	 * is fine, its dependency floor is what is wrong, and `packageName` is a
+	 * single argv token that cannot say anything about a dependency.
+	 */
+	pipConstraints?: string[];
 	/**
 	 * How the managed binary is verified. Absent (the default) spawns
 	 * `checkArgs`. `"package-entry"` verifies SPAWN-FREE — see
@@ -682,7 +824,7 @@ export const TOOLS: ToolDefinition[] = [
 		checkCommand: "jscpd",
 		checkArgs: ["--version"],
 		installStrategy: "npm",
-		packageName: "jscpd@5.0.12", // v4's packaging bug (reprism dep missing lib/languages/) is gone in v5's ground-up Rust rewrite — verified: real per-platform native binary (jscpd-windows-x64-msvc etc. via optionalDependencies, no missing-dir regression), --min-lines/--min-tokens/--reporters/--output/--ignore all unchanged, JSON schema fields read by clients/jscpd-client.ts's parseReport() (statistics.total.*, duplicates[].firstFile/secondFile.name+start, .lines, .tokens) are identical, and it's ~50x faster on this repo (4.1s -> 76ms detection time) — closes #582
+		packageName: "jscpd@5.3.2", // v5.3.2 is the repository's exact devDependency; the v4 packaging defect that required the older v5.0.12 pin is gone, and parseReport() reads the unchanged clone-report fields.
 		binaryName: "jscpd",
 	},
 	// Structural search and dead code detection
@@ -766,6 +908,15 @@ export const TOOLS: ToolDefinition[] = [
 		installStrategy: "pip",
 		packageName: "cmake-language-server",
 		binaryName: "cmake-language-server",
+		// Upstream 0.1.11 (the latest release) imports `LanguageServer` from
+		// `pygls.server`, a symbol pygls 2 removed, while declaring only
+		// `pygls>=1.1.1` — so an unconstrained install resolves pygls 2.1.1 and
+		// produces a launcher that cannot start. Measured against PyPI for the
+		// nightly's interpreter (#3311): `pip download --python-version 3.12
+		// cmake-language-server` → `pygls-2.1.1`; with this constraint →
+		// `pygls-1.3.1` + `lsprotocol-2023.0.1`, and `cmake-language-server
+		// --version` then prints `cmake-language-server 0.1.11` and exits 0.
+		pipConstraints: ["pygls<2"],
 	},
 	{
 		id: "yaml-language-server",
@@ -3123,9 +3274,66 @@ async function getToolPathResolved(
 		if (githubPath) return githubPath;
 	}
 
-	// Check if global
-	if (await isCommandAvailable(tool.checkCommand, tool.checkArgs)) {
-		return tool.checkCommand;
+	// Check if global. `isCommandAvailable` is a PATH walk plus a stat — it
+	// ignores its `_args` parameter by construction — so it answers "a file with
+	// that name is on PATH", never "that command runs". Every OTHER rung of this
+	// ladder spawn-verifies its candidate with the entry's own `checkArgs` before
+	// resolving to it; this rung did not, and a PATH entry that is a file but
+	// cannot run then SHADOWED the managed install that would have worked
+	// (#3311 lane C):
+	//   - rust-analyzer: rustup's `DUP_TOOLS` proxy (rustup 1.29.1 src/lib.rs:32)
+	//     sits in ~/.cargo/bin on every rustup box whether or not the
+	//     `rust-analyzer` COMPONENT is installed. Where it is not, the proxy
+	//     errors out instead of speaking LSP — and the github-release install
+	//     pi-lens would have downloaded was never attempted.
+	//   - cmake-language-server: `pipx install` exits 0 and drops a launcher on
+	//     PATH whose venv resolved pygls 2.x, which removed the symbol the 0.1.11
+	//     server imports. This rung returned it ahead of the pip-user rung, whose
+	//     verification would have caught it.
+	// A VERDICT — the binary ran and rejected its own check (nonzero exit) —
+	// falls through to the rungs below and, for an installable strategy, to the
+	// managed install. A STALL (timeout/signal, or a spawn-boundary refusal the
+	// binary never saw) and an INCONCLUSIVE probe are not verdicts (#1569/#2722
+	// semantics), so those keep the pre-#3311 behaviour and resolve to PATH —
+	// dropping a working-but-slow tool on a kill would be a worse lie than the
+	// one this fixes. `recordVersion` is deliberately NOT passed: version-pin
+	// drift (#589) is about pi-lens's own managed installs, and feeding a
+	// system-installed version into it would turn every PATH tool at another
+	// version into a forced reinstall.
+	if (await isCommandAvailable(tool.checkCommand)) {
+		// A `verification: "package-entry"` entry (#2722) is verified from the
+		// installed tree BESIDE its shim — `verifyNpmPackageEntry` derives the
+		// package dir from `<…>/node_modules/.bin/<shim>`. A bare PATH name has no
+		// such tree to read, so that evidence is unavailable here and its absence
+		// says nothing about the command: this rung keeps the pre-#3311 behaviour
+		// for those entries rather than inventing a verdict from a failed lookup.
+		if (packageEntryVerification(tool) !== undefined) return tool.checkCommand;
+		let probeStalled = false;
+		const verified = await verifyToolBinary(
+			tool.checkCommand,
+			undefined,
+			() => {
+				probeStalled = true;
+				onTransient();
+			},
+			getToolVerificationTimeout(tool),
+			tool.checkArgs,
+			undefined,
+			() => {
+				probeStalled = true;
+			},
+		);
+		if (verified || probeStalled) return tool.checkCommand;
+		// One record per tool per session: the rejected candidate and the check
+		// that rejected it. verifyToolBinary already logged the kind/exit code.
+		recordDegradationOnce({
+			kind: "installer-path-candidate-unrunnable",
+			subject: toolId,
+			reason: `${tool.checkCommand} on PATH failed its own check (${tool.checkArgs.join(" ")}); ignoring PATH for this tool`,
+		});
+		logSessionStart(
+			`auto-install ${toolId}: PATH candidate ${tool.checkCommand} failed ${tool.checkArgs.join(" ")} — ignoring PATH, trying managed install`,
+		);
 	}
 
 	if (tool.installStrategy === "npm") {
@@ -3373,6 +3581,44 @@ async function findPipUserToolPath(
 	return undefined;
 }
 
+/**
+ * The verdict of one `<interpreter> -m site --user-base` probe (#3383).
+ *
+ * Both probes accumulate through {@link createBoundedOutputSink} instead of
+ * `stdout += data`: the concatenation ran inside a `data` handler, where V8's
+ * `RangeError: Invalid string length` is an uncaught exception rather than this
+ * promise's value, and nothing bounded an interpreter that decides to write
+ * forever. A TRUNCATED probe resolves EMPTY rather than trimming a prefix,
+ * because the prefix of a path is a different path: `addBinToPath` would put a
+ * plausible-looking wrong directory on PATH. Empty is the value both probes
+ * already resolve when an interpreter is missing, and every caller handles it.
+ *
+ * Exported for `tests/clients/off-seam-output-bounds.test.ts`: both `data`
+ * handlers that feed it sit inside module-private probe loops that only a real
+ * `python3` on PATH can drive, so this is the seam the bound is pinned at.
+ */
+export function userBaseProbeResult(
+	command: string,
+	code: number | null,
+	stdout: BoundedOutputSink,
+): string {
+	if (stdout.truncated) {
+		recordDegradationOnce({
+			kind: "spawn-output-cap-truncated",
+			subject: `user-base-probe:${command}`,
+			reason: `\`${command} -m site --user-base\` reached the ${DEFAULT_MAX_OUTPUT_BYTES}-byte default cap after ${stdout.observedBytes} bytes; the probed user base is unusable`,
+			metadata: {
+				capBytes: DEFAULT_MAX_OUTPUT_BYTES,
+				capSource: "default",
+				observedBytes: stdout.observedBytes,
+				killed: false,
+			},
+		});
+		return "";
+	}
+	return code === 0 ? stdout.text.trim() : "";
+}
+
 async function getPythonUserBaseCandidates(): Promise<string[]> {
 	const candidates: string[] = [];
 	const seen = new Set<string>();
@@ -3421,9 +3667,11 @@ async function getPythonUserBaseCandidates(): Promise<string[]> {
 				return;
 			}
 
-			let stdout = "";
-			proc.stdout?.on("data", (data: Buffer | string) => (stdout += data));
-			proc.on("exit", (code) => resolve(code === 0 ? stdout.trim() : ""));
+			const stdout = createBoundedOutputSink();
+			proc.stdout?.on("data", (data: Buffer | string) => stdout.append(data));
+			proc.on("exit", (code) =>
+				resolve(userBaseProbeResult(probe.command, code, stdout)),
+			);
 			proc.on("error", () => resolve(""));
 		});
 		add(userBase);
@@ -5210,6 +5458,16 @@ function boundInstallError(
 	return line.length > limit ? `${line.slice(0, limit - 3)}...` : line;
 }
 
+/**
+ * #3515: thrown when a re-check right before a second critical write finds
+ * the install lock's generation no longer owned — a competing installer
+ * judged this hold stale (the heartbeat missed enough ticks, or the process
+ * was suspended) and took over. Caught by `installNpmTool`'s own outer catch
+ * like any other install failure; never continues to spawn a second npm
+ * process that would race the new holder's writes into `TOOLS_DIR`.
+ */
+class InstallLockLostError extends Error {}
+
 async function installNpmTool(
 	toolId: string,
 	packageName: string,
@@ -5218,7 +5476,21 @@ async function installNpmTool(
 	verificationTimeoutMs = 10_000,
 	/** See {@link packageEntryVerification} — spawn-free verification (#2722). */
 	packageEntryOf?: string,
+	/** See {@link installTool}'s `ownsLock` parameter. */
+	ownsLock?: () => boolean,
 ): Promise<string | undefined> {
+	const assertOwnsLock = (context: string): void => {
+		if (ownsLock && !ownsLock()) {
+			recordDegradationOnce({
+				kind: "install-lock-lost-mid-install",
+				subject: toolId,
+				reason: `install lock generation lost before ${context}; aborting rather than risk a second writer in TOOLS_DIR`,
+			});
+			throw new InstallLockLostError(
+				`install lock lost before ${context} for ${packageName} (#3515)`,
+			);
+		}
+	};
 	try {
 		// Ensure tools directory exists
 		await fs.mkdir(TOOLS_DIR, { recursive: true });
@@ -5267,6 +5539,7 @@ async function installNpmTool(
 			};
 		};
 
+		assertOwnsLock(`spawning ${pmCommand} install`);
 		let outcome = await runInstallAttempt([
 			...(testNpmScript ? [testNpmScript] : []),
 			...baseInstallArgs,
@@ -5280,6 +5553,12 @@ async function installNpmTool(
 			);
 
 		if (pm === "npm" && erResolve) {
+			// #3515: the first attempt alone can run up to INSTALL_TIMEOUT_MS
+			// (120s default); a second attempt on top of it is exactly the hold
+			// the fixed 180s lease used to be too short for. The heartbeat above
+			// is what keeps the lock's generation from going stale for real, but
+			// this re-check is what stops a WRITE if it ever did anyway.
+			assertOwnsLock(`retrying ${pmCommand} install with --legacy-peer-deps`);
 			const retryArgs = installArgs(pm, packageName, {
 				ignoreScripts: !needsScripts,
 				legacyPeerDeps: true,
@@ -5449,6 +5728,78 @@ export function pipScriptsDir(
 const pipPep668LoggedRefusals = createGenerationMap("installer-pep668-log");
 
 /**
+ * The constraints environment for `toolId` — `PIP_CONSTRAINT` **and**
+ * `UV_CONSTRAINT`, both naming the same written file — or `{}` when its registry
+ * entry declares no `pipConstraints` (#3311).
+ *
+ * Each resolver's own mechanism, not a pi-lens one, and BOTH are needed because
+ * `installPipTool`'s first rung is pipx, which chooses its own resolver:
+ * - `PIP_CONSTRAINT` is pip's environment form of `-c/--constraint`, and covers
+ *   pipx's pip backend, the pi-lens venv rung, `pip --user` and the
+ *   private-prefix rung.
+ * - `UV_CONSTRAINT` is uv's ("Equivalent to the `--constraints` command-line
+ *   argument", uv 0.12.10 `crates/uv-static/src/env_vars.rs`, added in uv
+ *   0.1.36) and covers pipx's uv backend — which pipx 1.17.6 makes the DEFAULT
+ *   "when uv is available … else 'pip'" (`pipx install --help`). That backend
+ *   ignores `PIP_CONSTRAINT` entirely, and its `--pip-args` translation covers
+ *   an allowlist (`--index-url`, `--extra-index-url`, `--find-links`,
+ *   `--trusted-host`, `--no-binary`, `--only-binary`, `--pre`, `--upgrade`,
+ *   `--no-cache-dir`) that does not include constraints — so neither the pip env
+ *   var nor a pip argv flag can reach it. Measured on pipx 1.17.6 + uv 0.12.10;
+ *   the transcripts are in the PR body (#3396 round 2).
+ *
+ * Both variables carry a WHITESPACE-SEPARATED LIST of files, so a path with a
+ * space in it is not a path to either resolver: uv fails the install outright
+ * (`error: File not found: …/space`, measured). The file therefore goes to the
+ * first whitespace-free directory, and without one the install proceeds
+ * unconstrained rather than broken — which the ladder's PATH verification then
+ * judges on its merits.
+ *
+ * The file is (re)written from the registry on every install, so a constraint
+ * that is edited or removed in the registry cannot be served from a stale file.
+ * A write failure is recorded and the install proceeds unconstrained — the same
+ * resolution as before this field existed.
+ */
+async function pipConstraintEnvFor(toolId: string): Promise<NodeJS.ProcessEnv> {
+	const constraints = TOOLS.find((t) => t.id === toolId)?.pipConstraints;
+	if (!constraints || constraints.length === 0) return {};
+	const directories = [
+		path.join(getGlobalPiLensDir(), "pip-constraints"),
+		path.join(os.tmpdir(), "pi-lens-pip-constraints"),
+	];
+	const directory = directories.find((candidate) => !/\s/.test(candidate));
+	if (!directory) {
+		recordDegradationOnce({
+			kind: "pip-constraint-path-unusable",
+			subject: toolId,
+			reason: `no whitespace-free directory for the constraints file (tried ${directories.join(", ")}); installing unconstrained`,
+		});
+		return {};
+	}
+	const file = path.join(directory, `${toolId}.txt`);
+	try {
+		await fs.mkdir(path.dirname(file), { recursive: true });
+		// The shared atomic seam (#1609), not a raw write: a second pi-lens process
+		// may be reading this file as pip's `PIP_CONSTRAINT` while this one
+		// rewrites it, and a torn read would silently under-constrain the install.
+		await writeFileAtomicAsync(file, `${constraints.join("\n")}\n`, {
+			bestEffort: false,
+		});
+	} catch (err) {
+		recordDegradationOnce({
+			kind: "pip-constraint-file-unwritable",
+			subject: toolId,
+			reason: `${file}: ${err instanceof Error ? err.message : String(err)}`,
+		});
+		return {};
+	}
+	logSessionStart(
+		`auto-install pip ${toolId}: constraining resolution with ${constraints.join(", ")} (${file})`,
+	);
+	return { PIP_CONSTRAINT: file, UV_CONSTRAINT: file };
+}
+
+/**
  * Install a pip package tool
  */
 async function installPipTool(
@@ -5466,6 +5817,10 @@ async function installPipTool(
 	try {
 		const isWindows = installerPlatform() === "win32";
 		const verb = options.upgrade ? ["install", "-U"] : ["install"];
+		// Read from the registry entry rather than added to this function's
+		// signature: every pip rung below, and pipx's OWN internal pip, is bounded
+		// by one env var, so there is nothing per-call to thread through.
+		const pipConstraintEnv = await pipConstraintEnvFor(toolId);
 		// Built from `pipCommandCandidates()` — the single source of truth this
 		// module and any other caller (the tool-smoke lane's toolchain-presence
 		// probe, #2661 review) share, rather than a second, independently
@@ -5503,8 +5858,19 @@ async function installPipTool(
 			});
 			return binaryPath;
 		};
-		const run = (command: string, args: string[], env?: NodeJS.ProcessEnv) =>
-			safeSpawnAsync(command, args, {
+		const run = (command: string, args: string[], env?: NodeJS.ProcessEnv) => {
+			// `pipConstraintEnv` is empty unless the entry declares
+			// `pipConstraints`, and it is applied HERE — the single spawn seam every
+			// rung of the ladder (pipx, venv, --user, private-prefix) goes through —
+			// so no rung can be reached with the constraint missing. pipx forwards
+			// it: its `run_subprocess` starts from `dict(os.environ)` and blocklists
+			// only PYTHONPATH/__PYVENV_LAUNCHER__ (pipx 1.16.7 src/pipx/util.py
+			// `_fix_subprocess_env`), so PIP_CONSTRAINT reaches the pip it drives.
+			const spawnEnv =
+				Object.keys(pipConstraintEnv).length > 0
+					? { ...(env ?? process.env), ...pipConstraintEnv }
+					: env;
+			return safeSpawnAsync(command, args, {
 				timeout: 120_000,
 				ignoreAmbientSignal: true,
 				lifetimeCoupled: true,
@@ -5512,8 +5878,9 @@ async function installPipTool(
 					cwd: getGlobalPiLensDir(),
 					suppressTelemetry: true,
 				}).cwd,
-				...(env ? { env } : {}),
+				...(spawnEnv ? { env: spawnEnv } : {}),
 			});
+		};
 		const addBinToPath = async (
 			binDir: string,
 		): Promise<string | undefined> => {
@@ -5651,9 +6018,11 @@ async function installPipTool(
 						resolve("");
 						return;
 					}
-					let stdout = "";
-					probe.stdout?.on("data", (data) => (stdout += data));
-					probe.on("exit", (code) => resolve(code === 0 ? stdout.trim() : ""));
+					const stdout = createBoundedOutputSink();
+					probe.stdout?.on("data", (data) => stdout.append(data));
+					probe.on("exit", (code) =>
+						resolve(userBaseProbeResult(candidate.command, code, stdout)),
+					);
 					probe.on("error", () => resolve(""));
 				});
 				const binaryPath = base
@@ -5834,7 +6203,16 @@ async function finishInstallAttempt(
 /**
  * Install a tool by ID
  */
-export async function installTool(toolId: string): Promise<boolean> {
+export async function installTool(
+	toolId: string,
+	/**
+	 * #3515: whether the caller's install-lock hold is still the live top
+	 * generation, threaded down to the npm strategy so it can abort its
+	 * ERESOLVE retry rather than risk a second write past a lost lock.
+	 * Undefined for a caller with no lock context (there is none today).
+	 */
+	ownsLock?: () => boolean,
+): Promise<boolean> {
 	if (process.env.PI_LENS_DISABLE_TOOL_INSTALL === "1") {
 		installFailureReasons.set(
 			toolId,
@@ -5873,6 +6251,7 @@ export async function installTool(toolId: string): Promise<boolean> {
 					tool.checkArgs,
 					getToolVerificationTimeout(tool),
 					packageEntryVerification(tool),
+					ownsLock,
 				);
 				if (npmPath !== undefined) {
 					// #1746 review F4: an install just resolved this package's range
@@ -6070,7 +6449,7 @@ async function ensureToolResolved(
 		}
 		let installed: boolean;
 		try {
-			installed = await installTool(toolId);
+			installed = await installTool(toolId, lock.ownsLock);
 		} finally {
 			await lock.release();
 		}
@@ -6244,7 +6623,7 @@ async function ensureToolResolved(
 				);
 				return installedByPeer;
 			}
-			installed = await installTool(toolId);
+			installed = await installTool(toolId, lock.ownsLock);
 		} finally {
 			await lock.release();
 		}

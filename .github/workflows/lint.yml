@@ -167,6 +167,8 @@ jobs:
     timeout-minutes: 5
     # Advisory to start: this job is not in required-checks branch protection.
     # A finding stays visible as a red check without blocking a merge.
+    # Promotion bound (#2904): it stays advisory until it has been green on ten
+    # consecutive merged PRs; only then is it a candidate for required checks.
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -420,7 +422,9 @@ jobs:
     # for this single-step job.
     timeout-minutes: 10
     permissions:
-      issues: write
+      # #3151: the comment target is a pull request; `issues: write` alone
+      # was refused with 403 "Resource not accessible by integration".
+      pull-requests: write
     steps:
       - name: Record exact-SHA terminal state
         env:
@@ -754,7 +758,7 @@ jobs:
         with:
           ref: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || github.ref }}
           persist-credentials: false
-      - uses: crate-ci/typos@512fc24f32f44ab01972217aaaf3dc86ec234d53 # v1.50.2
+      - uses: crate-ci/typos@00f422f3b19c57bc6338715ebfe3316d38768461 # v1.50.3
         with:
           args: --force-exclude
 

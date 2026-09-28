@@ -2,7 +2,6 @@
   "success": true,
   "scannedAt": "2026-08-18T07:00:00.000Z",
   "analyzed": true,
-  "analyzedFiles": ["__PROJECT_ROOT__/package.json"],
   "summary": "1 CVE, 1 secret, 1 license",
   "findings": [
     {

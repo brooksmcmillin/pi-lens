@@ -61,6 +61,7 @@ import {
 import { RuntimeCoordinator } from "../../../clients/runtime-coordinator.js";
 import { handleTurnEnd } from "../../../clients/runtime-turn.js";
 import {
+	captureAuxPublicationBacklog,
 	drainPendingAuxiliaryCoverage,
 	markPendingAuxiliaryCoverage,
 	MAX_LATE_AUX_REARMS,
@@ -68,7 +69,19 @@ import {
 	readLateAuxRearmTtlMs,
 	resetPendingAuxiliaryCoverage,
 } from "../../../clients/lsp/pending-aux-coverage.js";
-import type { LSPDiagnostic } from "../../../clients/lsp/client.js";
+import {
+	closeDocument,
+	handleNotifyChange,
+	handleNotifyOpen,
+	publicationCountsForPath,
+	setupIncomingHandlers,
+	type LSPClientState,
+	type LSPDiagnostic,
+} from "../../../clients/lsp/client.js";
+import { normalizeMapKey } from "../../../clients/path-utils.js";
+import { getStrategy } from "../../../clients/lsp/wait-policy/strategies.js";
+import { pathToFileURL } from "node:url";
+import { createMockState } from "./mock-client-state.js";
 import { setupTestEnvironment } from "../test-utils.js";
 
 // The fixed behavior admits 20 detailed gap rows per turn. The regression uses
@@ -395,9 +408,8 @@ describe("turn-end late-auxiliary findings (#2001/#2002)", () => {
 			const file = path.join(env.tmpDir, "src", "stale-ceiling.ts");
 
 			// Write the file ONCE and pin its mtime far in the future so every
-			// turn's freshness gate sees it as edited-after-the-scan (stale),
-			// independent of how many times the pair's baseline gets refreshed
-			// by the stale-path re-arm (which stamps a fresh `markedAtMs`).
+			// turn's freshness gate sees it as edited-after-the-scan (stale)
+			// on every re-arm.
 			fs.mkdirSync(path.dirname(file), { recursive: true });
 			fs.writeFileSync(file, "export const value = 1;\n");
 			const future = new Date(Date.now() + 600_000);
@@ -1086,6 +1098,1377 @@ describe("turn-end late-auxiliary findings (#2001/#2002)", () => {
 				clientGone: 0,
 				coverageGapReRaised: 0,
 			});
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+/**
+ * #3482: the drain's freshness was two timestamps plus an mtime gate, and a
+ * version-less publish cannot say which revision it scanned. These cases drive
+ * the real publish handler, resync clear and per-path counts (only the service
+ * lookup is a double, reading that real client state) into the real
+ * `handleTurnEnd`.
+ */
+describe("turn-end late-auxiliary drain never delivers an older revision's scan (#3482)", () => {
+	function cachedFrom(state: LSPClientState, file: string) {
+		const key = normalizeMapKey(file);
+		// Same shape as LSPService.readCachedDiagnosticsForServers:
+		// `getAllDiagnostics().get(key)` -> { diags: entry?.diags ?? [], publishedAt: entry?.ts }.
+		// #3548: keyed by the scanner's OWN serverId (not a literal "opengrep")
+		// so the same helper drives a #3548 typos/zizmor replay; every existing
+		// call site passes an opengrep-armed scanner, so this is the same key
+		// as before for all of them.
+		return async () =>
+			new Map([
+				[
+					state.serverId,
+					{
+						diags: state.pushDiagnostics.get(key) ?? [],
+						publishedAt: state.pushDiagnosticTimestamps.get(key),
+					},
+				],
+			]);
+	}
+
+	function armOpengrep(root: string, serverId = "opengrep") {
+		const state = createMockState({ serverId, root });
+		setupIncomingHandlers(state, {});
+		const calls = vi.mocked(state.connection.onNotification).mock
+			.calls as unknown as Array<[string, (params: unknown) => void]>;
+		const handler = calls.find(
+			(call) => call[0] === "textDocument/publishDiagnostics",
+		)?.[1];
+		expect(handler).toBeDefined();
+		const client = {
+			getPublicationCountsForPath: (filePath: string) =>
+				publicationCountsForPath(state, normalizeMapKey(filePath)),
+		};
+		return {
+			state,
+			client,
+			/** A raw version-less receipt, NOT flushed through the debounce. */
+			receive: (file: string, diagnostics: LSPDiagnostic[]) =>
+				handler?.({ uri: pathToFileURL(file).href, diagnostics }),
+			/** #3490: opengrep's param-less `semgrep/rulesRefreshed`
+			 *  (opengrep@1a5fd9d `Scan_helpers.refresh_rules`); a no-op when no
+			 *  handler is registered, so a missing handler reds on behaviour. */
+			rulesRefreshed: () =>
+				calls.find((call) => call[0] === "semgrep/rulesRefreshed")?.[1]?.(
+					undefined,
+				),
+			/** A versioned publish (ast-grep's shape), flushed through the debounce. */
+			publishVersioned: (
+				file: string,
+				version: number,
+				diagnostics: LSPDiagnostic[],
+			) => {
+				vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+				try {
+					handler?.({ uri: pathToFileURL(file).href, version, diagnostics });
+					vi.advanceTimersByTime(300);
+				} finally {
+					vi.useRealTimers();
+				}
+			},
+			/** A version-less publish, flushed through opengrep's 250 ms debounce. */
+			publish: (file: string, diagnostics: LSPDiagnostic[]) => {
+				vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+				try {
+					handler?.({ uri: pathToFileURL(file).href, diagnostics });
+					vi.advanceTimersByTime(300);
+				} finally {
+					vi.useRealTimers();
+				}
+			},
+		};
+	}
+
+	function writeAt(file: string, content: string, mtimeMs: number): void {
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(file, content);
+		fs.utimesSync(file, new Date(mtimeMs), new Date(mtimeMs));
+	}
+
+	async function turnEnd(
+		runtime: RuntimeCoordinator,
+		cacheManager: CacheManager,
+		cwd: string,
+		sessionId: string,
+		file: string,
+	): Promise<{ content: string; metadata: any }> {
+		logLatency.mockClear();
+		cacheManager.addModifiedRange(
+			file,
+			{ start: 1, end: 1 },
+			false,
+			cwd,
+			sessionId,
+		);
+		await handleTurnEnd(makeDeps(runtime, cacheManager, cwd));
+		return {
+			content: turnEndContent(cacheManager, cwd),
+			metadata: lateAuxRecord()?.metadata,
+		};
+	}
+
+	it("counts sends and STORED publications per open lifetime (#3482 backlog axis)", async () => {
+		// The binding is only as good as these two counts: a count taken at raw
+		// receipt lets a debounced receipt satisfy the backlog while the cache
+		// still holds the older scan, and a count that outlives its document
+		// lifetime (or a store for a path never opened) under-counts the backlog.
+		const scanner = armOpengrep("/project");
+		const file = "/project/src/counted.ts";
+		const other = "/project/src/fallback.ts";
+		const counts = (target: string) =>
+			publicationCountsForPath(scanner.state, normalizeMapKey(target));
+
+		const key = normalizeMapKey(file);
+
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		try {
+			scanner.receive(file, []); // a store before any open (e.g. a workspace pull)
+			vi.advanceTimersByTime(300);
+			expect(counts(file)).toEqual({ sent: 0, published: 0 });
+			// A receipt still pending when the first open clears it belongs to no
+			// send of this lifetime.
+			scanner.receive(file, [diag(0, "pre-open")]);
+			await handleNotifyOpen(scanner.state, file, "a", "ts", false, true);
+			expect(counts(file)).toEqual({ sent: 1, published: 0 });
+
+			scanner.receive(file, [diag(0, "received")]);
+			expect(counts(file)).toEqual({ sent: 1, published: 0 });
+			vi.advanceTimersByTime(300);
+			expect(counts(file)).toEqual({ sent: 1, published: 1 });
+			// #3482 r1 F1: a surplus while nothing is outstanding (opengrep's
+			// rule-load [] then its post-rulesRefreshed republish) is absorbed.
+			scanner.receive(file, [diag(0, "republished")]);
+			vi.advanceTimersByTime(300);
+			expect(counts(file)).toEqual({ sent: 1, published: 1 });
+
+			// A resync clears the cache but not the count.
+			await handleNotifyOpen(scanner.state, file, "b", "ts", false, true);
+			expect(counts(file)).toEqual({ sent: 2, published: 1 });
+			// #3482 lifetime: the counts span a close, and a receipt still pending
+			// at close answered its send, so it counts.
+			scanner.receive(file, [diag(0, "at close")]);
+			await closeDocument(scanner.state, file);
+			expect(counts(file)).toEqual({ sent: 2, published: 2 });
+			expect(scanner.state.publicationStoreCountsByPath.has(key)).toBe(true);
+
+			// The didChange fallback open starts a lifetime too.
+			scanner.receive(other, []);
+			vi.advanceTimersByTime(300);
+			await handleNotifyChange(scanner.state, other, "x");
+			expect(counts(other)).toEqual({ sent: 1, published: 0 });
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	/** One agent touch: write, resync-send, and mark with the captured backlog. */
+	async function touchAndMark(
+		scanner: ReturnType<typeof armOpengrep>,
+		file: string,
+		content: string,
+		notifiedAtMs: number,
+		saved = false,
+	): Promise<void> {
+		writeAt(file, content, notifiedAtMs);
+		await handleNotifyOpen(
+			scanner.state,
+			file,
+			content,
+			"ts",
+			false,
+			true,
+			saved,
+		);
+		// #3548: the scanner's own serverId, not a literal "opengrep" — every
+		// existing call site is opengrep-armed, so this is unchanged for them.
+		markPendingAuxiliaryCoverage(
+			file,
+			[scanner.state.serverId],
+			notifiedAtMs,
+			undefined,
+			undefined,
+			captureAuxPublicationBacklog(scanner.client, file),
+		);
+	}
+
+	const V1 = `${Array.from({ length: 20 }, (_, i) => `const a${i} = ${i};`).join("\n")}\n`;
+	const V2 = "export const v = 2;\n";
+
+	it("CLOSE-PUBLISH-SKIPPED: typos' close-triggered publish does not count as an owed scan, and a later real backlog publish still does (#3548)", async () => {
+		const scanner = armOpengrep("/project", "typos");
+		const file = "/project/src/close-typos.ts";
+		const counts = () =>
+			publicationCountsForPath(scanner.state, normalizeMapKey(file));
+		await handleNotifyOpen(scanner.state, file, "a", "ts", false, true);
+		expect(counts()).toEqual({ sent: 1, published: 0 });
+		await closeDocument(scanner.state, file);
+		// tekumara/typos-lsp `did_close`: an empty, version-less publish, sent
+		// unconditionally on every close, that answers no send.
+		scanner.publish(file, []);
+		expect(counts()).toEqual({ sent: 1, published: 0 });
+		// A genuine backlog answer — VERSIONED, like every real typos answer
+		// (verified against tekumara/typos-lsp `main`; only `did_close`'s
+		// artifact is version-less) — arriving after the close artifact still
+		// counts, same as before this fix.
+		scanner.publishVersioned(file, 0, [diag(0, "late real scan")]);
+		expect(counts()).toEqual({ sent: 1, published: 1 });
+	});
+
+	it("CLOSE-PUBLISH-UNMARKED-STILL-COUNTS: a close-time publish for a server without publishesOnClose still answers the closed lifetime's owed scan (#3548 inverse)", async () => {
+		const scanner = armOpengrep("/project", "eslint");
+		const file = "/project/src/close-inverse.ts";
+		const counts = () =>
+			publicationCountsForPath(scanner.state, normalizeMapKey(file));
+		await handleNotifyOpen(scanner.state, file, "a", "ts", false, true);
+		expect(counts()).toEqual({ sent: 1, published: 0 });
+		await closeDocument(scanner.state, file);
+		// The same empty, version-less shape typos' close-triggered publish
+		// carries — but eslint carries no `publishesOnClose` marker, so it is
+		// never granted a skip and this still counts, exactly as before #3548.
+		scanner.publish(file, []);
+		expect(counts()).toEqual({ sent: 1, published: 1 });
+	});
+
+	it("CLOSE-PUBLISH-MULTI-CLOSE-SAFE: two closes each produce their own close-triggered publish, and neither leaves residual state that swallows a later genuine, versioned answer (#3548 review r1 B1 — structurally moot under the stateless, version-based filter: there is no credit to leak)", async () => {
+		// #3477's `closedAndGone` drops a reopen for a closed path whose file
+		// is also gone from disk — a real file is required for the reopens
+		// below to actually run rather than being silently skipped.
+		const env = setupTestEnvironment("pi-lens-close-multi-") as any;
+		try {
+			const scanner = armOpengrep(env.tmpDir, "typos");
+			const file = path.join(env.tmpDir, "src", "multi-close.ts");
+			fs.mkdirSync(path.dirname(file), { recursive: true });
+			fs.writeFileSync(file, "a");
+			const counts = () =>
+				publicationCountsForPath(scanner.state, normalizeMapKey(file));
+			await handleNotifyOpen(scanner.state, file, "a", "ts", false, true);
+			await closeDocument(scanner.state, file);
+			await handleNotifyOpen(scanner.state, file, "b", "ts", false, true);
+			await closeDocument(scanner.state, file);
+			// Both closes' own close-triggered publishes: version-less, dropped
+			// unconditionally before storage or counting — no per-close credit is
+			// tracked at all, so nothing accumulates across them either way.
+			scanner.publish(file, []);
+			scanner.publish(file, []);
+			expect(counts()).toEqual({ sent: 2, published: 0 });
+			// A genuine, VERSIONED backlog answer (typos never sends a real
+			// answer version-less) still counts after both closes.
+			scanner.publishVersioned(file, 0, [diag(0, "real finding")]);
+			expect(counts()).toEqual({ sent: 2, published: 1 });
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	// #3548 review r2 (blocking): the prior "admitted residual" here asserted
+	// only raw storage state and never ran `turnEnd` — it missed that a stale
+	// close-triggered publish landing on the OPEN path after a reopen used to
+	// overwrite an already-stored, genuine finding via "latest publish wins"
+	// AND satisfy the backlog count that gates the late-auxiliary drain,
+	// producing a false clean (PROBE-STALE-EMPTY-OVERWRITES-REAL below). The
+	// three probes replacing it drive the fix end-to-end through
+	// `surplusReplay`/`turnEnd`, for both arrival orders plus the required
+	// inverse (a genuine clean answer must still be delivered, never
+	// permanently withheld — shape 54).
+
+	it("PROBE-STALE-EMPTY-SAFE-BEFORE-REAL: typos' stale close-triggered publish, arriving on the open path after a reopen but BEFORE the reopened file's real answer, is dropped and the real answer still delivers once it lands (#3548 review r2, probe 1)", async () => {
+		await surplusReplay(
+			"stale-before-real",
+			async ({ scanner, file, turn }) => {
+				const key = normalizeMapKey(file);
+				const counts = () => publicationCountsForPath(scanner.state, key);
+				await touchAndMark(scanner, file, V1, Date.now() - 20_000);
+				// #3477: renamed away while v1's scan is still in flight and
+				// never answers it before the close below.
+				await closeDocument(scanner.state, file);
+				await touchAndMark(scanner, file, V2, Date.now() - 10_000);
+				const beforeStale = counts().published;
+				const storedBeforeStale = scanner.state.pushDiagnostics.get(key);
+				// The EARLIER close's own close-triggered publish, arriving late,
+				// now that the path is open again — BEFORE V2's real answer.
+				scanner.publish(file, []);
+				// Dropped: neither stored nor counted.
+				expect(scanner.state.pushDiagnostics.get(key)).toEqual(
+					storedBeforeStale,
+				);
+				expect(counts().published).toBe(beforeStale);
+
+				const first = await turn();
+				expect(first.metadata).toMatchObject({
+					delivered: 0,
+					backlogPending: 1,
+					cleanConfirmed: 0,
+				});
+
+				// V2's real, versioned answer lands and is unaffected by the
+				// earlier stale artifact.
+				scanner.publishVersioned(file, 0, [diag(0, "V2 REAL finding")]);
+				const second = await turn();
+				expect(second.metadata).toMatchObject({
+					delivered: 0,
+					backlogPending: 1,
+					cleanConfirmed: 0,
+				});
+
+				// The mark's second (and last) owed publish lands and delivers —
+				// the earlier stale, dropped artifact left no residue behind.
+				scanner.publishVersioned(file, 0, [diag(0, "V2 REAL finding")]);
+				const third = await turn();
+				expect(third.metadata).toMatchObject({
+					delivered: 1,
+					backlogPending: 0,
+					cleanConfirmed: 0,
+				});
+				expect(third.content).toContain("V2 REAL finding");
+			},
+			"typos",
+		);
+	});
+
+	it("PROBE-STALE-EMPTY-OVERWRITES-REAL: typos' stale close-triggered publish, arriving on the open path AFTER the reopened file's real answer is already stored, must not erase it or report a false clean (#3548 review r2, probe 2, blocking)", async () => {
+		await surplusReplay(
+			"stale-overwrites-real",
+			async ({ scanner, file, turn }) => {
+				const key = normalizeMapKey(file);
+				await touchAndMark(scanner, file, V1, Date.now() - 20_000);
+				// #3477: renamed away while v1's scan is still in flight and
+				// never answers it before the close below.
+				await closeDocument(scanner.state, file);
+				await touchAndMark(scanner, file, V2, Date.now() - 10_000);
+				// The reopened file's REAL, versioned answer lands first and is
+				// stored, but the mark's backlog is not yet satisfied (one more
+				// publish is still owed for this lifetime) — same shape as every
+				// other REPLAY-* single-publish-then-second-satisfies pattern in
+				// this file.
+				scanner.publishVersioned(file, 0, [diag(0, "V2 REAL finding")]);
+				const first = await turn();
+				expect(first.metadata).toMatchObject({
+					delivered: 0,
+					backlogPending: 1,
+					cleanConfirmed: 0,
+				});
+				expect(scanner.state.pushDiagnostics.get(key)).toEqual([
+					diag(0, "V2 REAL finding"),
+				]);
+
+				// The EARLIER close's own stale, version-less close-triggered
+				// publish lands late, on the now-open path, AFTER the real
+				// answer already landed.
+				scanner.publish(file, []);
+
+				// Pre-fix: this overwrote pushDiagnostics with [] (unconditional
+				// "latest publish wins") and counted toward the backlog, so the
+				// next turn reported a false cleanConfirmed with the real finding
+				// gone. Fixed: dropped before either happens — the real finding
+				// survives verbatim and the backlog is unmoved.
+				expect(scanner.state.pushDiagnostics.get(key)).toEqual([
+					diag(0, "V2 REAL finding"),
+				]);
+				const second = await turn();
+				expect(second.metadata).toMatchObject({
+					delivered: 0,
+					backlogPending: 1,
+					cleanConfirmed: 0,
+				});
+				expect(second.content).not.toContain("V2 REAL finding");
+
+				// The genuinely owed second real publish for this mark still
+				// lands and delivers — the fix does not leave the pair stuck.
+				scanner.publishVersioned(file, 0, [diag(0, "V2 REAL finding")]);
+				const third = await turn();
+				expect(third.metadata).toMatchObject({
+					delivered: 1,
+					backlogPending: 0,
+					cleanConfirmed: 0,
+				});
+				expect(third.content).toContain("V2 REAL finding");
+			},
+			"typos",
+		);
+	});
+
+	it("PROBE-STALE-EMPTY-GENUINE-CLEAN-NOT-WITHHELD: a genuine, VERSIONED empty answer for the reopened file is still delivered as cleanConfirmed, never permanently withheld by the version-based filter (#3548 review r2, shape 54 inverse)", async () => {
+		await surplusReplay(
+			"genuine-clean-not-withheld",
+			async ({ scanner, file, turn }) => {
+				await touchAndMark(scanner, file, V1, Date.now() - 20_000);
+				// #3477: renamed away while v1's scan is still in flight and
+				// never answers it before the close below.
+				await closeDocument(scanner.state, file);
+				await touchAndMark(scanner, file, V2, Date.now() - 10_000);
+				// Genuinely clean, but VERSIONED — typos never sends a real
+				// answer (clean included) version-less; only its did_close
+				// artifact is. The filter checks `docVersion === undefined`, not
+				// content, so this must pass through untouched.
+				scanner.publishVersioned(file, 0, []);
+				const first = await turn();
+				expect(first.metadata).toMatchObject({
+					delivered: 0,
+					backlogPending: 1,
+					cleanConfirmed: 0,
+				});
+
+				scanner.publishVersioned(file, 0, []);
+				const second = await turn();
+				expect(second.metadata).toMatchObject({
+					backlogPending: 0,
+					cleanConfirmed: 1,
+					delivered: 0,
+				});
+			},
+			"typos",
+		);
+	});
+
+	it("REPLAY-RULE-LOAD-SURPLUS: opengrep's rule-load [] plus its refresh republish cannot shorten a later backlog (#3482 r1 F1)", async () => {
+		const env = setupTestEnvironment("pi-lens-late-aux-rule-load-") as any;
+		const sessionId = "late-aux-rule-load";
+		try {
+			process.env.PI_LENS_LATE_AUX_REARM_TTL_MS = "600000";
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId });
+			runtime.beginTurn();
+			const cacheManager = new CacheManager(false);
+			const file = path.join(env.tmpDir, "src", "scanned.ts");
+			const scanner = armOpengrep(env.tmpDir);
+			readCachedDiagnosticsForServers.mockImplementation(
+				cachedFrom(scanner.state, file),
+			);
+			// v0 is opened during the one-time rule load: an empty answer, then
+			// the real scan after `semgrep/rulesRefreshed`.
+			writeAt(file, "export const v = 0;\n", Date.now() - 30_000);
+			await handleNotifyOpen(
+				scanner.state,
+				file,
+				"export const v = 0;\n",
+				"ts",
+				false,
+				true,
+			);
+			scanner.publish(file, []);
+			scanner.publish(file, [diag(0, "V0 finding")]);
+			await touchAndMark(scanner, file, V1, Date.now() - 20_000);
+			await touchAndMark(scanner, file, V2, Date.now() - 10_000);
+			scanner.publish(file, [diag(11, "V1-ONLY finding on line 12")]);
+
+			const first = await turnEnd(
+				runtime,
+				cacheManager,
+				env.tmpDir,
+				sessionId,
+				file,
+			);
+			expect(first.content).not.toContain("V1-ONLY");
+			expect(first.metadata).toMatchObject({ delivered: 0, backlogPending: 1 });
+
+			scanner.publish(file, [diag(0, "V2 finding on line 1")]);
+			const second = await turnEnd(
+				runtime,
+				cacheManager,
+				env.tmpDir,
+				sessionId,
+				file,
+			);
+			expect(second.content).toContain("V2 finding on line 1");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("REPLAY-RULES-REFRESHED-INFLIGHT: the refresh republish cannot answer v1's outstanding send, so v1 is withheld after a re-touch (#3490)", async () => {
+		const env = setupTestEnvironment(
+			"pi-lens-late-aux-rules-refreshed-",
+		) as any;
+		const sessionId = "late-aux-rules-refreshed";
+		try {
+			process.env.PI_LENS_LATE_AUX_REARM_TTL_MS = "600000";
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId });
+			runtime.beginTurn();
+			const cacheManager = new CacheManager(false);
+			const file = path.join(env.tmpDir, "src", "scanned.ts");
+			const scanner = armOpengrep(env.tmpDir);
+			readCachedDiagnosticsForServers.mockImplementation(
+				cachedFrom(scanner.state, file),
+			);
+			// #3490's sequence. 1: v0 is opened during rule load; its [] arrives.
+			writeAt(file, "export const v = 0;\n", Date.now() - 30_000);
+			await handleNotifyOpen(
+				scanner.state,
+				file,
+				"export const v = 0;\n",
+				"ts",
+				false,
+				true,
+			);
+			scanner.publish(file, []);
+			// 2: touch 1 sends v1.
+			await touchAndMark(scanner, file, V1, Date.now() - 20_000);
+			// 3: the rules load; the refresh republish lands before v1's answer.
+			scanner.rulesRefreshed();
+			scanner.publish(file, [diag(0, "V0 REPUBLISH finding")]);
+			// 4: touch 2 sends v2 and re-marks.
+			await touchAndMark(scanner, file, V2, Date.now() - 10_000);
+			// 5: v1's answer lands.
+			scanner.publish(file, [diag(11, "V1-ONLY finding on line 12")]);
+
+			const first = await turnEnd(
+				runtime,
+				cacheManager,
+				env.tmpDir,
+				sessionId,
+				file,
+			);
+			expect(first.content).not.toContain("V1-ONLY");
+			expect(first.metadata).toMatchObject({ delivered: 0, backlogPending: 1 });
+
+			scanner.publish(file, [diag(0, "V2 finding on line 1")]);
+			const second = await turnEnd(
+				runtime,
+				cacheManager,
+				env.tmpDir,
+				sessionId,
+				file,
+			);
+			expect(second.content).toContain("V2 finding on line 1");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("REPLAY-RULES-REFRESHED-THEN-ANSWER: after the refresh republish, the next answer still counts and is delivered (#3490 inverse)", async () => {
+		const env = setupTestEnvironment("pi-lens-late-aux-refresh-answer-") as any;
+		const sessionId = "late-aux-refresh-answer";
+		try {
+			process.env.PI_LENS_LATE_AUX_REARM_TTL_MS = "600000";
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId });
+			runtime.beginTurn();
+			const cacheManager = new CacheManager(false);
+			const file = path.join(env.tmpDir, "src", "scanned.ts");
+			const scanner = armOpengrep(env.tmpDir);
+			readCachedDiagnosticsForServers.mockImplementation(
+				cachedFrom(scanner.state, file),
+			);
+			writeAt(file, "export const v = 0;\n", Date.now() - 30_000);
+			await handleNotifyOpen(
+				scanner.state,
+				file,
+				"export const v = 0;\n",
+				"ts",
+				false,
+				true,
+			);
+			scanner.publish(file, []);
+			await touchAndMark(scanner, file, V1, Date.now() - 20_000);
+			scanner.publish(file, [diag(11, "V1 finding on line 12")]);
+			// Two publications stored, nothing outstanding: the refresh takes one
+			// back (not all of them) and its republish restores it.
+			scanner.rulesRefreshed();
+			scanner.publish(file, [diag(11, "V1 REPUBLISH finding")]);
+			await touchAndMark(scanner, file, V2, Date.now() - 10_000);
+			scanner.publish(file, [diag(0, "V2 finding on line 1")]);
+
+			const first = await turnEnd(
+				runtime,
+				cacheManager,
+				env.tmpDir,
+				sessionId,
+				file,
+			);
+			expect(first.content).toContain("V2 finding on line 1");
+			expect(first.metadata).toMatchObject({ delivered: 1, backlogPending: 0 });
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("REPLAY-RULES-REFRESHED-DURING-DEBOUNCE: a first answer still inside the debounce at the notification is taken back too (#3490 r1 F1)", async () => {
+		const env = setupTestEnvironment(
+			"pi-lens-late-aux-refresh-debounce-",
+		) as any;
+		const sessionId = "late-aux-refresh-debounce";
+		try {
+			process.env.PI_LENS_LATE_AUX_REARM_TTL_MS = "600000";
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId });
+			runtime.beginTurn();
+			const cacheManager = new CacheManager(false);
+			const file = path.join(env.tmpDir, "src", "scanned.ts");
+			const scanner = armOpengrep(env.tmpDir);
+			readCachedDiagnosticsForServers.mockImplementation(
+				cachedFrom(scanner.state, file),
+			);
+			writeAt(file, "export const v = 0;\n", Date.now() - 30_000);
+			await handleNotifyOpen(
+				scanner.state,
+				file,
+				"export const v = 0;\n",
+				"ts",
+				false,
+				true,
+			);
+			// v0's rule-load [] has arrived (so opengrep recorded the scan and
+			// will republish it) but is still inside the 250 ms debounce when
+			// the notification lands.
+			vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+			try {
+				scanner.receive(file, []);
+				scanner.rulesRefreshed();
+				vi.advanceTimersByTime(300);
+			} finally {
+				vi.useRealTimers();
+			}
+			// A touch after the notification; the republish lands before its answer.
+			await touchAndMark(scanner, file, V1, Date.now() - 20_000);
+			scanner.publish(file, [diag(0, "V0 REPUBLISH finding")]);
+			await touchAndMark(scanner, file, V2, Date.now() - 10_000);
+			scanner.publish(file, [diag(11, "V1-ONLY finding on line 12")]);
+
+			const first = await turnEnd(
+				runtime,
+				cacheManager,
+				env.tmpDir,
+				sessionId,
+				file,
+			);
+			expect(first.content).not.toContain("V1-ONLY");
+			expect(first.metadata).toMatchObject({ delivered: 0, backlogPending: 1 });
+
+			scanner.publish(file, [diag(0, "V2 finding on line 1")]);
+			const second = await turnEnd(
+				runtime,
+				cacheManager,
+				env.tmpDir,
+				sessionId,
+				file,
+			);
+			expect(second.content).toContain("V2 finding on line 1");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("REFRESH-DEBOUNCED-RECEIPT-COUNTS: a debounced receipt is taken back once, and only on a path with a send (#3490 r1 F1)", async () => {
+		const scanner = armOpengrep("/project");
+		const counted = "/project/src/counted.ts";
+		const first = "/project/src/first.ts";
+		const unopened = "/project/src/unopened.ts";
+		const counts = (target: string) =>
+			publicationCountsForPath(scanner.state, normalizeMapKey(target));
+		await handleNotifyOpen(scanner.state, counted, "a", "ts", false, true);
+		scanner.publish(counted, []);
+		await handleNotifyOpen(scanner.state, first, "b", "ts", false, true);
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		try {
+			// Receipts still inside the debounce at the notification: a second
+			// one on a counted path, a first one, and one for a path never opened.
+			scanner.receive(counted, [diag(0, "again")]);
+			scanner.receive(first, []);
+			scanner.receive(unopened, []);
+			scanner.rulesRefreshed();
+			expect(counts(counted)).toEqual({ sent: 1, published: 0 });
+			expect(counts(first)).toEqual({ sent: 1, published: -1 });
+			expect(
+				scanner.state.publicationStoreCountsByPath.has(
+					normalizeMapKey(unopened),
+				),
+			).toBe(false);
+			vi.advanceTimersByTime(300);
+		} finally {
+			vi.useRealTimers();
+		}
+		// The flushed receipts count; each republish then restores its path.
+		expect(counts(counted)).toEqual({ sent: 1, published: 1 });
+		expect(counts(first)).toEqual({ sent: 1, published: 0 });
+		scanner.publish(first, [diag(0, "republish")]);
+		expect(counts(first)).toEqual({ sent: 1, published: 1 });
+	});
+
+	it("REFRESH-LEAVES-UNANSWERED-PATH: rulesRefreshed takes one publication back only from paths that already had one (#3490)", async () => {
+		// A path with no publication yet in its lifetime may not be republished
+		// (opengrep republishes the files it has a scan recorded for); taking one
+		// back from it would swallow its first real answer for good.
+		const scanner = armOpengrep("/project");
+		const answered = "/project/src/answered.ts";
+		const unanswered = "/project/src/unanswered.ts";
+		const counts = (target: string) =>
+			publicationCountsForPath(scanner.state, normalizeMapKey(target));
+		await handleNotifyOpen(scanner.state, answered, "a", "ts", false, true);
+		scanner.publish(answered, []);
+		await handleNotifyOpen(scanner.state, unanswered, "b", "ts", false, true);
+		expect(counts(answered)).toEqual({ sent: 1, published: 1 });
+		expect(counts(unanswered)).toEqual({ sent: 1, published: 0 });
+
+		logLatency.mockClear();
+		scanner.rulesRefreshed();
+		expect(counts(answered)).toEqual({ sent: 1, published: 0 });
+		expect(counts(unanswered)).toEqual({ sent: 1, published: 0 });
+		expect(
+			logLatency.mock.calls
+				.map(([entry]) => entry)
+				.filter((entry) => entry.phase === "lsp_rules_refreshed"),
+		).toEqual([
+			expect.objectContaining({
+				type: "phase",
+				filePath: "/project",
+				durationMs: 0,
+				metadata: { serverId: "opengrep", rebaselinedPaths: 1 },
+			}),
+		]);
+
+		scanner.publish(answered, [diag(0, "republish")]);
+		scanner.publish(unanswered, [diag(0, "first answer")]);
+		expect(counts(answered)).toEqual({ sent: 1, published: 1 });
+		expect(counts(unanswered)).toEqual({ sent: 1, published: 1 });
+	});
+
+	/**
+	 * #3482's surplus publishes that pi-lens itself triggers, read from
+	 * opengrep@1a5fd9d `Notification_handler.on_notification`: a didSave runs
+	 * `scan_file` again, and a scan queued before a close publishes after it.
+	 * v0 is open and answered in each replay.
+	 */
+	async function surplusReplay(
+		prefix: string,
+		body: (ctx: {
+			scanner: ReturnType<typeof armOpengrep>;
+			file: string;
+			turn: () => Promise<{ content: string; metadata: any }>;
+		}) => Promise<void>,
+		// #3548: which server's strategy this replay arms — defaults to
+		// opengrep (every pre-#3548 call site) so existing replays are
+		// unaffected; typos' close-publish replay passes "typos".
+		serverId = "opengrep",
+	): Promise<void> {
+		const env = setupTestEnvironment(`pi-lens-late-aux-${prefix}-`) as any;
+		const sessionId = `late-aux-${prefix}`;
+		try {
+			process.env.PI_LENS_LATE_AUX_REARM_TTL_MS = "600000";
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId });
+			runtime.beginTurn();
+			const cacheManager = new CacheManager(false);
+			const file = path.join(env.tmpDir, "src", "scanned.ts");
+			const scanner = armOpengrep(env.tmpDir, serverId);
+			// opengrep declares `save: true` (opengrep@1a5fd9d LS.ml); harmless
+			// for a serverId that never sends a save-marked touch.
+			scanner.state.saveOptions = { includeText: false };
+			readCachedDiagnosticsForServers.mockImplementation(
+				cachedFrom(scanner.state, file),
+			);
+			const v0 = "export const v = 0;\n";
+			writeAt(file, v0, Date.now() - 30_000);
+			await handleNotifyOpen(scanner.state, file, v0, "ts", false, true);
+			// #3548 review r2: a `publishesOnClose` server (typos) never sends a
+			// version-less REAL answer — only its close-triggered artifact is
+			// version-less (verified against tekumara/typos-lsp `main`). v0's own
+			// open-time answer must carry a version here too, or every typos-armed
+			// replay's "real" traffic is itself the unrealistic double the review
+			// flagged.
+			if (getStrategy(serverId, undefined).publishesOnClose) {
+				scanner.publishVersioned(file, 0, []);
+			} else {
+				scanner.publish(file, []);
+			}
+			await body({
+				scanner,
+				file,
+				turn: () => turnEnd(runtime, cacheManager, env.tmpDir, sessionId, file),
+			});
+		} finally {
+			env.cleanup();
+		}
+	}
+
+	const didSaves = (scanner: ReturnType<typeof armOpengrep>) =>
+		vi
+			.mocked(scanner.state.connection.sendNotification)
+			.mock.calls.filter(([method]) => method === "textDocument/didSave")
+			.length;
+
+	it("REPLAY-SAVE-RESCAN: opengrep's didSave rescan of v1 cannot answer v2's send, so v1 is withheld after a re-touch (#3482 surplus)", async () => {
+		await surplusReplay("save-rescan", async ({ scanner, file, turn }) => {
+			// Touch 1 is a save (#3405, lsp_diagnostics): opengrep scans v1 on
+			// the reopen and again on didSave.
+			await touchAndMark(scanner, file, V1, Date.now() - 20_000, true);
+			expect(didSaves(scanner)).toBe(1);
+			scanner.publish(file, [diag(11, "V1-ONLY finding on line 12")]);
+			await touchAndMark(scanner, file, V2, Date.now() - 10_000);
+			// v1's save rescan lands after touch 2's send.
+			scanner.publish(file, [diag(11, "V1-ONLY finding on line 12")]);
+
+			const first = await turn();
+			expect(first.content).not.toContain("V1-ONLY");
+			expect(first.metadata).toMatchObject({ delivered: 0, backlogPending: 1 });
+
+			scanner.publish(file, [diag(0, "V2 finding on line 1")]);
+			expect((await turn()).content).toContain("V2 finding on line 1");
+		});
+	});
+
+	it("REPLAY-SAVE-RESCAN-THEN-ANSWER: after a save's two publications, the next answer still counts and is delivered (#3482 surplus inverse)", async () => {
+		await surplusReplay("save-answer", async ({ scanner, file, turn }) => {
+			await touchAndMark(scanner, file, V1, Date.now() - 20_000, true);
+			scanner.publish(file, [diag(0, "V1 open scan")]);
+			scanner.publish(file, [diag(0, "V1 save rescan")]);
+			await touchAndMark(scanner, file, V2, Date.now() - 10_000);
+			scanner.publish(file, [diag(0, "V2 finding on line 1")]);
+
+			const first = await turn();
+			expect(first.content).toContain("V2 finding on line 1");
+			expect(first.metadata).toMatchObject({ delivered: 1, backlogPending: 0 });
+		});
+	});
+
+	it("SAVE-RESCAN-EXPECTED: a save adds one expected publication on a rescansOnSave server only, the held-document save included (#3482 surplus)", async () => {
+		const scanner = armOpengrep("/project");
+		scanner.state.saveOptions = { includeText: false };
+		const file = "/project/src/saved.ts";
+		const counts = () =>
+			publicationCountsForPath(scanner.state, normalizeMapKey(file));
+		await handleNotifyOpen(scanner.state, file, "a", "ts", false, true, true);
+		expect(counts()).toEqual({ sent: 2, published: 0 });
+		// #3481: an entry read before the content last sent is dropped, and its
+		// save goes out for the document the server holds.
+		await handleNotifyOpen(
+			scanner.state,
+			file,
+			"c",
+			"ts",
+			false,
+			true,
+			false,
+			2,
+		);
+		await handleNotifyOpen(
+			scanner.state,
+			file,
+			"b",
+			"ts",
+			false,
+			true,
+			true,
+			1,
+		);
+		expect(didSaves(scanner)).toBe(2);
+		expect(counts()).toEqual({ sent: 4, published: 0 });
+
+		// ast-grep declares no rescan on save: its didSave expects nothing.
+		const other = armOpengrep("/project", "ast-grep");
+		other.state.saveOptions = { includeText: false };
+		await handleNotifyOpen(other.state, file, "a", "ts", false, true, true);
+		expect(didSaves(other)).toBe(1);
+		expect(
+			publicationCountsForPath(other.state, normalizeMapKey(file)),
+		).toEqual({ sent: 1, published: 0 });
+	});
+
+	it("ZIZMOR-SAVE-RESCAN-EXPECTED: a save adds one expected publication on zizmor now that rescansOnSave is set, for whenever dynamic didSave registration is honoured (#3548)", async () => {
+		// zizmor@main `crates/zizmor/src/lsp.rs` registers `textDocument/didSave`
+		// DYNAMICALLY (`initialized()`); `applyDynamicCapabilities` (client.ts)
+		// does not honour that registration today, so nothing sets
+		// `state.saveOptions` for zizmor at runtime. Set directly here, same
+		// shape as SAVE-RESCAN-EXPECTED above, to prove the counting side of
+		// the #3548 fix independent of the unbuilt dynamic-capability wiring.
+		const scanner = armOpengrep("/project", "zizmor");
+		scanner.state.saveOptions = { includeText: true };
+		const file = "/project/.github/workflows/ci.yml";
+		const counts = () =>
+			publicationCountsForPath(scanner.state, normalizeMapKey(file));
+		await handleNotifyOpen(scanner.state, file, "a", "yaml", false, true, true);
+		expect(didSaves(scanner)).toBe(1);
+		expect(counts()).toEqual({ sent: 2, published: 0 });
+	});
+
+	it("REPLAY-REOPEN-INFLIGHT: a scan queued before a close cannot answer the reopened file's send (#3482 lifetime)", async () => {
+		await surplusReplay("reopen-inflight", async ({ scanner, file, turn }) => {
+			await touchAndMark(scanner, file, V1, Date.now() - 20_000);
+			// #3477: renamed away while v1's scan runs, then back with v2 (a fresh
+			// didOpen, a new open lifetime).
+			await closeDocument(scanner.state, file);
+			await touchAndMark(scanner, file, V2, Date.now() - 10_000);
+			scanner.publish(file, [diag(11, "V1-ONLY finding on line 12")]);
+
+			const first = await turn();
+			expect(first.content).not.toContain("V1-ONLY");
+			expect(first.metadata).toMatchObject({ delivered: 0, backlogPending: 1 });
+
+			scanner.publish(file, [diag(0, "V2 finding on line 1")]);
+			expect((await turn()).content).toContain("V2 finding on line 1");
+		});
+	});
+
+	it("REPLAY-CLOSE-PUBLISH-INFLIGHT: typos' close-triggered publish cannot answer an in-flight scan, so the reopened file's send is still owed one (#3548)", async () => {
+		await surplusReplay(
+			"close-publish-inflight",
+			async ({ scanner, file, turn }) => {
+				await touchAndMark(scanner, file, V1, Date.now() - 20_000);
+				// #3477: renamed away while v1's scan runs. typos' did_close
+				// publishes an empty, version-less set unconditionally, landing
+				// before v1's real (slower) scan finishes.
+				await closeDocument(scanner.state, file);
+				scanner.publish(file, []);
+				// Renamed back with v2 (a fresh didOpen, a new open lifetime).
+				await touchAndMark(scanner, file, V2, Date.now() - 10_000);
+				// v1's real, stale scan finally lands — VERSIONED, like every
+				// real typos answer (only did_close's artifact is version-less).
+				// documentVersions resets to 0 on each fresh open in this
+				// harness, so v1's own (now-stale) version and v2's current one
+				// collide on the same number — deliberately: the freshness gate
+				// here is the backlog COUNT, not the version, and this is exactly
+				// the collision that makes that so.
+				scanner.publishVersioned(file, 0, [
+					diag(11, "V1-ONLY finding on line 12"),
+				]);
+
+				const first = await turn();
+				expect(first.content).not.toContain("V1-ONLY");
+				expect(first.metadata).toMatchObject({
+					delivered: 0,
+					backlogPending: 1,
+				});
+
+				scanner.publishVersioned(file, 0, [diag(0, "V2 finding on line 1")]);
+				expect((await turn()).content).toContain("V2 finding on line 1");
+			},
+			"typos",
+		);
+	});
+
+	it("REPLAY-CLOSE-PUBLISH-DOUBLE-CLOSE-SAFE: two closes' own close-triggered publishes, and a genuine backlog finding published while closed between them, do not disturb the late-auxiliary delivery across the eventual reopen (#3548 review r1 B1 — the credit this once tested leaking no longer exists; kept as a double-close regression)", async () => {
+		await surplusReplay(
+			"close-publish-double-close-safe",
+			async ({ scanner, file, turn }) => {
+				// Close #1: typos owes one close-triggered publish. The reopen
+				// below happens before it ever arrives.
+				await closeDocument(scanner.state, file);
+				await touchAndMark(scanner, file, V1, Date.now() - 30_000);
+				// Close #2: typos owes ANOTHER close-triggered publish, for
+				// THIS close.
+				await closeDocument(scanner.state, file);
+				// typos' own close-triggered publish for close #2 arrives —
+				// version-less, dropped before storage or counting.
+				scanner.publish(file, []);
+				// A GENUINE backlog finding — VERSIONED, like every real typos
+				// answer — the real, late answer this pair's mark is actually
+				// waiting on, arrives while still closed.
+				scanner.publishVersioned(file, 0, [diag(11, "REAL-FINDING")]);
+				await touchAndMark(scanner, file, V2, Date.now() - 10_000);
+
+				const first = await turn();
+				expect(first.content).not.toContain("REAL-FINDING");
+				expect(first.metadata).toMatchObject({
+					delivered: 0,
+					backlogPending: 1,
+				});
+
+				// v2's real, versioned answer lands and is the last publish the
+				// mark needed (REAL-FINDING already counted while closed) — it
+				// delivers.
+				scanner.publishVersioned(file, 0, [diag(0, "V2 finding on line 1")]);
+				const second = await turn();
+				expect(second.metadata).toMatchObject({
+					delivered: 1,
+					backlogPending: 0,
+				});
+				expect(second.content).toContain("V2 finding on line 1");
+			},
+			"typos",
+		);
+	});
+
+	it("REPLAY-REOPEN-DROPPED-WHILE-CLOSED: a scan that publishes while the path is closed still counts, so the reopened file's answer is delivered (#3482 lifetime inverse)", async () => {
+		await surplusReplay("reopen-dropped", async ({ scanner, file, turn }) => {
+			await touchAndMark(scanner, file, V1, Date.now() - 20_000);
+			await closeDocument(scanner.state, file);
+			scanner.publish(file, [diag(11, "V1-ONLY finding on line 12")]);
+			expect(scanner.state.pushDiagnostics.has(normalizeMapKey(file))).toBe(
+				false,
+			);
+			await touchAndMark(scanner, file, V2, Date.now() - 10_000);
+			scanner.publish(file, [diag(0, "V2 finding on line 1")]);
+
+			const first = await turn();
+			expect(first.content).toContain("V2 finding on line 1");
+			expect(first.metadata).toMatchObject({ delivered: 1, backlogPending: 0 });
+		});
+	});
+
+	it("REPLAY-RULES-REFRESHED-ACROSS-REOPEN: the refresh take-back survives a close and reopen, so the republish cannot answer the reopened file's send (#3482 lifetime, #3513 residual 4)", async () => {
+		await surplusReplay("refresh-reopen", async ({ scanner, file, turn }) => {
+			scanner.rulesRefreshed();
+			await closeDocument(scanner.state, file);
+			await touchAndMark(scanner, file, V2, Date.now() - 10_000);
+			// The refresh republish for v0 lands after the reopen.
+			scanner.publish(file, [diag(11, "V0 REPUBLISH finding on line 12")]);
+
+			const first = await turn();
+			expect(first.content).not.toContain("V0 REPUBLISH");
+			expect(first.metadata).toMatchObject({ delivered: 0, backlogPending: 1 });
+
+			scanner.publish(file, [diag(0, "V2 finding on line 1")]);
+			expect((await turn()).content).toContain("V2 finding on line 1");
+		});
+	});
+
+	it("REPLAY-RESYNC-DROPS-PENDING-RECEIPT: a receipt the resync clear drops still counts, so v2 is delivered (#3482 r1 F2)", async () => {
+		const env = setupTestEnvironment("pi-lens-late-aux-resync-drop-") as any;
+		const sessionId = "late-aux-resync-drop";
+		try {
+			process.env.PI_LENS_LATE_AUX_REARM_TTL_MS = "600000";
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId });
+			runtime.beginTurn();
+			const cacheManager = new CacheManager(false);
+			const file = path.join(env.tmpDir, "src", "scanned.ts");
+			const scanner = armOpengrep(env.tmpDir);
+			readCachedDiagnosticsForServers.mockImplementation(
+				cachedFrom(scanner.state, file),
+			);
+			vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+			try {
+				await touchAndMark(scanner, file, V1, Date.now() - 20_000);
+				// v1's scan answers, but touch 2's resync clears it inside the
+				// 250 ms debounce, before it is stored.
+				scanner.receive(file, [diag(11, "V1-ONLY finding on line 12")]);
+				await touchAndMark(scanner, file, V2, Date.now() - 10_000);
+				scanner.receive(file, [diag(0, "V2 CURRENT finding")]);
+				vi.advanceTimersByTime(300);
+			} finally {
+				vi.useRealTimers();
+			}
+
+			const first = await turnEnd(
+				runtime,
+				cacheManager,
+				env.tmpDir,
+				sessionId,
+				file,
+			);
+			expect(first.content).toContain("V2 CURRENT finding");
+			expect(first.metadata).toMatchObject({ delivered: 1, backlogPending: 0 });
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("REPLAY-DEBOUNCE-COALESCES-TWO-SCANS: two receipts inside one debounce window count twice, so v2 is delivered (#3482 r1 F2)", async () => {
+		const env = setupTestEnvironment("pi-lens-late-aux-coalesce-") as any;
+		const sessionId = "late-aux-coalesce";
+		try {
+			process.env.PI_LENS_LATE_AUX_REARM_TTL_MS = "600000";
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId });
+			runtime.beginTurn();
+			const cacheManager = new CacheManager(false);
+			const file = path.join(env.tmpDir, "src", "scanned.ts");
+			const scanner = armOpengrep(env.tmpDir);
+			readCachedDiagnosticsForServers.mockImplementation(
+				cachedFrom(scanner.state, file),
+			);
+			await touchAndMark(scanner, file, V1, Date.now() - 20_000);
+			await touchAndMark(scanner, file, V2, Date.now() - 10_000);
+			vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+			try {
+				// Both queued scans answer after touch 2, 100 ms apart: the second
+				// receipt replaces the first's debounce timer, one store.
+				scanner.receive(file, [diag(11, "V1-ONLY finding on line 12")]);
+				vi.advanceTimersByTime(100);
+				scanner.receive(file, [diag(0, "V2 CURRENT finding")]);
+				vi.advanceTimersByTime(300);
+			} finally {
+				vi.useRealTimers();
+			}
+
+			const first = await turnEnd(
+				runtime,
+				cacheManager,
+				env.tmpDir,
+				sessionId,
+				file,
+			);
+			expect(first.content).toContain("V2 CURRENT finding");
+			expect(first.content).not.toContain("V1-ONLY");
+			expect(first.metadata).toMatchObject({ delivered: 1, backlogPending: 0 });
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("REPLAY-SUPERSEDED-VERSIONED-PUSH: a versioned answer dropped as superseded still counts, so v2 is delivered (#3482 r2)", async () => {
+		const env = setupTestEnvironment("pi-lens-late-aux-superseded-") as any;
+		const sessionId = "late-aux-superseded";
+		try {
+			process.env.PI_LENS_LATE_AUX_REARM_TTL_MS = "600000";
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId });
+			runtime.beginTurn();
+			const cacheManager = new CacheManager(false);
+			const file = path.join(env.tmpDir, "src", "scanned.ts");
+			const scanner = armOpengrep(env.tmpDir);
+			readCachedDiagnosticsForServers.mockImplementation(
+				cachedFrom(scanner.state, file),
+			);
+			// A versioned scanner (ast-grep publishes document versions): v0 is
+			// opened and answered, then v1 and v2 are sent before v1's answer.
+			writeAt(file, "export const v = 0;\n", Date.now() - 30_000);
+			await handleNotifyOpen(
+				scanner.state,
+				file,
+				"export const v = 0;\n",
+				"ts",
+				false,
+				true,
+			);
+			scanner.publishVersioned(file, 0, [diag(0, "V0 finding")]);
+			await touchAndMark(scanner, file, V1, Date.now() - 20_000);
+			await touchAndMark(scanner, file, V2, Date.now() - 10_000);
+			// v1's answer lands after v2 was sent: dropped as superseded, never
+			// stored. v2's answer is stored.
+			scanner.publishVersioned(file, 1, [
+				diag(11, "V1-ONLY finding on line 12"),
+			]);
+			scanner.publishVersioned(file, 2, [diag(0, "V2 CURRENT finding")]);
+
+			const first = await turnEnd(
+				runtime,
+				cacheManager,
+				env.tmpDir,
+				sessionId,
+				file,
+			);
+			expect(first.content).toContain("V2 CURRENT finding");
+			expect(first.content).not.toContain("V1-ONLY");
+			expect(first.metadata).toMatchObject({ delivered: 1, backlogPending: 0 });
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("REPLAY-SUPERSEDED-SEEDED-PUSH: on a seed-first-push server the superseded answer still counts (#3482 r2)", async () => {
+		const env = setupTestEnvironment(
+			"pi-lens-late-aux-superseded-seed-",
+		) as any;
+		const sessionId = "late-aux-superseded-seed";
+		try {
+			process.env.PI_LENS_LATE_AUX_REARM_TTL_MS = "600000";
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId });
+			runtime.beginTurn();
+			const cacheManager = new CacheManager(false);
+			const file = path.join(env.tmpDir, "src", "scanned.ts");
+			// eslint seeds its first push after a clear: the SEED path, not the debounce.
+			const scanner = armOpengrep(env.tmpDir, "eslint");
+			readCachedDiagnosticsForServers.mockImplementation(
+				cachedFrom(scanner.state, file),
+			);
+			// A versioned scanner (ast-grep publishes document versions): v0 is
+			// opened and answered, then v1 and v2 are sent before v1's answer.
+			writeAt(file, "export const v = 0;\n", Date.now() - 30_000);
+			await handleNotifyOpen(
+				scanner.state,
+				file,
+				"export const v = 0;\n",
+				"ts",
+				false,
+				true,
+			);
+			scanner.publishVersioned(file, 0, [diag(0, "V0 finding")]);
+			await touchAndMark(scanner, file, V1, Date.now() - 20_000);
+			await touchAndMark(scanner, file, V2, Date.now() - 10_000);
+			// v1's answer lands after v2 was sent: dropped as superseded, never
+			// stored. v2's answer is stored.
+			scanner.publishVersioned(file, 1, [
+				diag(11, "V1-ONLY finding on line 12"),
+			]);
+			scanner.publishVersioned(file, 2, [diag(0, "V2 CURRENT finding")]);
+
+			const first = await turnEnd(
+				runtime,
+				cacheManager,
+				env.tmpDir,
+				sessionId,
+				file,
+			);
+			expect(first.content).toContain("V2 CURRENT finding");
+			expect(first.content).not.toContain("V1-ONLY");
+			expect(first.metadata).toMatchObject({ delivered: 1, backlogPending: 0 });
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("REPLAY-RETOUCH-REMARK: withholds v1's publish after a re-touch re-marks, then delivers v2's", async () => {
+		const env = setupTestEnvironment("pi-lens-late-aux-retouch-") as any;
+		const sessionId = "late-aux-retouch";
+		try {
+			process.env.PI_LENS_LATE_AUX_REARM_TTL_MS = "600000";
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId });
+			runtime.beginTurn();
+			const cacheManager = new CacheManager(false);
+			const file = path.join(env.tmpDir, "src", "scanned.ts");
+			const scanner = armOpengrep(env.tmpDir);
+			readCachedDiagnosticsForServers.mockImplementation(
+				cachedFrom(scanner.state, file),
+			);
+
+			// Touch 1 sends v1 (20 lines); its grace lapses and marks the pair.
+			const v1 = Array.from({ length: 20 }, (_, i) => `const a${i} = ${i};`);
+			writeAt(file, `${v1.join("\n")}\n`, Date.now() - 20_000);
+			await handleNotifyOpen(
+				scanner.state,
+				file,
+				v1.join("\n"),
+				"ts",
+				false,
+				true,
+			);
+			markPendingAuxiliaryCoverage(
+				file,
+				["opengrep"],
+				Date.now() - 20_000,
+				undefined,
+				undefined,
+				captureAuxPublicationBacklog(scanner.client, file),
+			);
+			// Touch 2: the agent edits to a one-line v2 while v1's scan runs. The
+			// resync clears, sends v2, finds no evidence and re-marks.
+			writeAt(file, "export const v = 2;\n", Date.now() - 10_000);
+			await handleNotifyOpen(
+				scanner.state,
+				file,
+				"export const v = 2;\n",
+				"ts",
+				false,
+				true,
+			);
+			markPendingAuxiliaryCoverage(
+				file,
+				["opengrep"],
+				Date.now() - 10_000,
+				undefined,
+				undefined,
+				captureAuxPublicationBacklog(scanner.client, file),
+			);
+			// v1's scan publishes, with no version, after the re-mark.
+			scanner.publish(file, [diag(11, "V1-ONLY finding on line 12")]);
+
+			const first = await turnEnd(
+				runtime,
+				cacheManager,
+				env.tmpDir,
+				sessionId,
+				file,
+			);
+			expect(first.content).not.toContain("V1-ONLY");
+			expect(first.metadata).toMatchObject({
+				delivered: 0,
+				rearmed: 1,
+				backlogPending: 1,
+			});
+			// The re-arm carries the binding: a second turn end still withholds it.
+			const second = await turnEnd(
+				runtime,
+				cacheManager,
+				env.tmpDir,
+				sessionId,
+				file,
+			);
+			expect(second.content).not.toContain("V1-ONLY");
+			expect(second.metadata).toMatchObject({
+				delivered: 0,
+				backlogPending: 1,
+			});
+
+			// v2's own scan publishes: the binding releases and v2's finding lands.
+			scanner.publish(file, [diag(0, "V2 finding on line 1")]);
+			const third = await turnEnd(
+				runtime,
+				cacheManager,
+				env.tmpDir,
+				sessionId,
+				file,
+			);
+			expect(third.content).toContain("V2 finding on line 1");
+			expect(third.content).not.toContain("V1-ONLY");
+			expect(third.metadata).toMatchObject({ delivered: 1, backlogPending: 0 });
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("keeps the baseline on a stale re-arm, so a later publish cannot absorb an external edit", async () => {
+		// FixRefreshOnStale: the stale verdict used to re-arm with a baseline of
+		// "now", which moved past the external edit's mtime; an older queued scan
+		// that published afterwards then passed both the publishedAt and mtime
+		// gates against content it never saw.
+		const env = setupTestEnvironment("pi-lens-late-aux-stale-keep-") as any;
+		const sessionId = "late-aux-stale-keep";
+		try {
+			process.env.PI_LENS_LATE_AUX_REARM_TTL_MS = "600000";
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId });
+			runtime.beginTurn();
+			const cacheManager = new CacheManager(false);
+			const file = path.join(env.tmpDir, "src", "external.ts");
+			// Marked at the touch's notify; an external edit lands afterwards.
+			markPendingAuxiliaryCoverage(file, ["opengrep"], Date.now() - 20_000);
+			writeAt(file, "export const external = 1;\n", Date.now() - 10_000);
+			readCachedDiagnosticsForServers.mockImplementation(
+				async () =>
+					new Map([
+						[
+							"opengrep",
+							{
+								diags: [diag(4, "SCANNED-BEFORE-EDIT")],
+								publishedAt: Date.now() - 5_000,
+							},
+						],
+					]),
+			);
+			const first = await turnEnd(
+				runtime,
+				cacheManager,
+				env.tmpDir,
+				sessionId,
+				file,
+			);
+			expect(first.content).not.toContain("SCANNED-BEFORE-EDIT");
+			expect(first.metadata).toMatchObject({ delivered: 0, rearmed: 1 });
+			expect(first.metadata.stale).toBeGreaterThan(0);
+
+			// An older queued scan publishes after that drain.
+			const laterPublish = Date.now() + 1;
+			readCachedDiagnosticsForServers.mockImplementation(
+				async () =>
+					new Map([
+						[
+							"opengrep",
+							{
+								diags: [diag(4, "QUEUED-OLDER-SCAN")],
+								publishedAt: laterPublish,
+							},
+						],
+					]),
+			);
+			const second = await turnEnd(
+				runtime,
+				cacheManager,
+				env.tmpDir,
+				sessionId,
+				file,
+			);
+			expect(second.content).not.toContain("QUEUED-OLDER-SCAN");
+			expect(second.metadata).toMatchObject({ delivered: 0 });
+			expect(second.metadata.stale).toBeGreaterThan(0);
 		} finally {
 			env.cleanup();
 		}

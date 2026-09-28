@@ -41,7 +41,8 @@ import {
 	vendoredGrammarRefusal,
 	vendoredGrammarsDir,
 } from "./grammar-source.js";
-import { resolvePackagePath } from "./package-root.js";
+import { getPackageRoot, resolvePackagePath } from "./package-root.js";
+import { resolveWebTreeSitterPackageDir } from "../scripts/lib/web-tree-sitter-dir.mjs";
 import {
 	assertInstallAllowed,
 	getProjectTrustGeneration,
@@ -191,6 +192,9 @@ interface QueryBatch {
 interface GrammarDirResolutionDeps {
 	resolveAsset: (asset: string) => string | undefined;
 	resolvePackage: (specifier: string) => string;
+	/** pi-lens's own installed package root — the rung that survives pi's
+	 *  temp-dir compile (#20), and the one a hoisted install misses (#3409). */
+	packageRoot: () => string;
 	cwd: () => string;
 }
 
@@ -200,6 +204,37 @@ function createParserCounters(): TreeSitterParserCounters {
 		parserDurationMs: 0,
 		parserFailures: 0,
 	};
+}
+
+/**
+ * Where a runtime grammar fetch failed (#3409). Reported in the durable
+ * `tree-sitter.log` record and used to pick the remedy the user is given:
+ * "nowhere to write" and "cannot write there" are neither download failures
+ * nor package-manager build-script gaps, which is all the message used to name.
+ */
+type GrammarFetchFailureCause =
+	| "write-dir-unresolvable"
+	| "write-dir-unwritable"
+	| "download-failed";
+
+/**
+ * The errno that blocks writing into `dir`, or undefined when a write can be
+ * attempted (#3409). The directory itself need not exist yet — the lazy fetch
+ * creates it — so the nearest EXISTING ancestor is what gets probed.
+ */
+function grammarWriteBlockedReason(dir: string): string | undefined {
+	let probe = dir;
+	while (!fs.existsSync(probe)) {
+		const parent = path.dirname(probe);
+		if (parent === probe) return "ENOENT";
+		probe = parent;
+	}
+	try {
+		fs.accessSync(probe, fs.constants.W_OK);
+		return undefined;
+	} catch (err) {
+		return (err as { code?: string })?.code ?? "EACCES";
+	}
 }
 
 /**
@@ -501,6 +536,7 @@ export class TreeSitterClient {
 		this.grammarDirResolutionDeps = grammarDirResolutionDeps ?? {
 			resolveAsset: (asset) => this.resolveWebTreeSitterAsset(asset),
 			resolvePackage: (specifier) => _require.resolve(specifier),
+			packageRoot: () => getPackageRoot(import.meta.url),
 			cwd: () => process.cwd(),
 		};
 		this.grammarsDir = this.findGrammarsDir();
@@ -643,45 +679,44 @@ export class TreeSitterClient {
 	}
 
 	/**
-	 * Resolve a web-tree-sitter asset path using multiple strategies:
-	 * 1. Node module resolution via createRequire (handles hoisted installs — issue #20)
-	 * 2. Package-root walk from import.meta.url (handles on-the-fly TS compilation by pi)
-	 * 3. process.cwd() fallback
+	 * web-tree-sitter's installed package directory, through the one shared
+	 * ladder in `scripts/lib/web-tree-sitter-dir.mjs` (#3409). Routed through
+	 * `grammarDirResolutionDeps` so the resolver context — the thing that
+	 * differs on a compiled host — stays the injected seam (#2112/#2136).
+	 */
+	private webTreeSitterPackageDir(): string | undefined {
+		return resolveWebTreeSitterPackageDir({
+			resolve: (specifier) =>
+				this.grammarDirResolutionDeps.resolvePackage(specifier),
+			packageRoot: () => this.grammarDirResolutionDeps.packageRoot(),
+			cwd: () => this.grammarDirResolutionDeps.cwd(),
+		});
+	}
+
+	/**
+	 * Resolve a web-tree-sitter asset path:
+	 * 1. the asset's own subpath, authoritative when the package `exports` it
+	 *    (`tree-sitter.wasm` is exported; `grammars` is NOT in 0.25.10, so this
+	 *    rung is dead for the grammars dir — #3409's second symptom);
+	 * 2. the asset inside the package directory the shared ladder resolves. That
+	 *    ladder's own last two rungs are the package-root walk (#20, for pi's
+	 *    temp-dir compile) and the cwd fallback this method used to spell out.
 	 */
 	private resolveWebTreeSitterAsset(asset: string): string | undefined {
-		// Strategy 1: Node module resolution (hoisted installs, pnpm workspaces)
 		try {
-			const resolved = _require.resolve(`web-tree-sitter/${asset}`);
+			const resolved = this.grammarDirResolutionDeps.resolvePackage(
+				`web-tree-sitter/${asset}`,
+			);
 			if (fs.existsSync(resolved)) return resolved;
 		} catch {
 			/* fall through */
 		}
 
-		// Strategy 2: Walk up from this module to find package.json, then into node_modules.
-		// This is required when pi compiles TS on-the-fly to a temp directory —
-		// createRequire(import.meta.url) resolves from the temp dir and can't find
-		// web-tree-sitter, but the package root (where package.json lives) still has
-		// the correct node_modules layout.
-		try {
-			const candidate = resolvePackagePath(
-				import.meta.url,
-				"node_modules",
-				"web-tree-sitter",
-				asset,
-			);
+		const pkgDir = this.webTreeSitterPackageDir();
+		if (pkgDir) {
+			const candidate = path.join(pkgDir, asset);
 			if (fs.existsSync(candidate)) return candidate;
-		} catch {
-			/* fall through */
 		}
-
-		// Strategy 3: cwd fallback
-		const cwdCandidate = path.join(
-			process.cwd(),
-			"node_modules",
-			"web-tree-sitter",
-			asset,
-		);
-		if (fs.existsSync(cwdCandidate)) return cwdCandidate;
 
 		return undefined;
 	}
@@ -968,23 +1003,16 @@ export class TreeSitterClient {
 	 * whether or not it exists yet — so we can create + populate it when the
 	 * postinstall download was skipped (pnpm/bun). Returns undefined if
 	 * web-tree-sitter itself can't be located.
+	 *
+	 * #3409: this used to resolve the BARE `web-tree-sitter` specifier and
+	 * nothing else, which throws MODULE_NOT_FOUND inside the `bun
+	 * build --compile` binary pi ships — so on every such host it returned
+	 * undefined and NO non-core grammar could ever be fetched. It now shares the
+	 * read path's ladder, whose first rung is a subpath that does resolve there.
 	 */
 	private grammarsWriteDir(): string | undefined {
-		try {
-			let dir = path.dirname(_require.resolve("web-tree-sitter"));
-			while (
-				path.basename(dir) !== "web-tree-sitter" &&
-				dir !== path.dirname(dir)
-			) {
-				dir = path.dirname(dir);
-			}
-			if (path.basename(dir) === "web-tree-sitter") {
-				return path.join(dir, "grammars");
-			}
-		} catch {
-			/* fall through */
-		}
-		return undefined;
+		const pkgDir = this.webTreeSitterPackageDir();
+		return pkgDir ? path.join(pkgDir, "grammars") : undefined;
 	}
 
 	/**
@@ -1057,6 +1085,7 @@ export class TreeSitterClient {
 					grammarFile,
 					`The runtime grammar fetch threw an unexpected error (${message}).`,
 					/* retryable */ true,
+					"download-failed",
 				);
 				return false;
 			}
@@ -1114,17 +1143,38 @@ export class TreeSitterClient {
 				? this.grammarsDir
 				: this.grammarsWriteDir();
 		if (!dir) {
-			// No writable grammars directory could be located (e.g. pi compiled
-			// this module to a temp dir and web-tree-sitter isn't resolvable
-			// from there yet). This is an environment condition, not a CDN
-			// verdict — #1536 review F2: it must get the same cooldown +
-			// notification treatment as a download failure, not a silent
-			// unmemoized `false` that re-does the same failing resolution
-			// sweep on every single demand.
+			// Nothing to write into: web-tree-sitter is not locatable by ANY rung
+			// of the shared ladder (this runtime's resolver, pi-lens's own package
+			// root, the working directory), so the package is missing from this
+			// install. Still an environment condition, not a CDN verdict — #1536
+			// review F2: it gets the same cooldown + notification treatment as a
+			// download failure rather than a silent unmemoized `false` that re-does
+			// the same failing resolution sweep on every demand.
+			//
+			// #3409: before the shared ladder, this arm ALSO caught every host
+			// whose runtime cannot resolve a bare specifier — where the package was
+			// present and the wasm downloadable — and told the user to approve
+			// build scripts or restore network access. Hence the cause.
 			this.recordGrammarFailure(
 				grammarFile,
-				"No writable grammars directory could be located for the runtime fetch.",
+				"No grammars directory could be resolved for the runtime fetch: the web-tree-sitter package is not locatable from this runtime, from pi-lens's own package root, or from the working directory.",
 				/* retryable */ true,
+				"write-dir-unresolvable",
+			);
+			return false;
+		}
+		// A destination that cannot be written to is not a download problem
+		// either (#3409): a root-owned `node_modules` under a global install
+		// reaches `downloadGrammarDetailed`'s catch-all, which reports no reason
+		// at all, so the user was sent to inspect their package manager and
+		// network for an EACCES.
+		const writeBlock = grammarWriteBlockedReason(dir);
+		if (writeBlock) {
+			this.recordGrammarFailure(
+				grammarFile,
+				`The grammars directory ${dir} cannot be written to (${writeBlock}), so the runtime fetch has nowhere to land.`,
+				/* retryable */ true,
+				"write-dir-unwritable",
 			);
 			return false;
 		}
@@ -1163,6 +1213,7 @@ export class TreeSitterClient {
 				reason ??
 					"The package manager skipped install scripts and the runtime download failed.",
 				retryable,
+				"download-failed",
 			);
 		}
 		return ok;
@@ -1175,11 +1226,18 @@ export class TreeSitterClient {
 	 * by the "no writable directory" and "download failed" arms of
 	 * `ensureGrammar` — both are failures of the SAME ensure attempt, just
 	 * with a different point of failure.
+	 *
+	 * `cause` is that point of failure (#3409). It picks the REMEDY the user is
+	 * told and lands in the durable record, so `~/.pi-lens` forensics can tell
+	 * "this host has nowhere to write" from "this download failed" — the two
+	 * were one string, and the one it carried named build scripts and the
+	 * network for a cause that is neither.
 	 */
 	private recordGrammarFailure(
 		grammarFile: string,
 		detail: string,
 		retryable: boolean,
+		cause?: GrammarFetchFailureCause,
 	): void {
 		const attempts = (this.grammarFailureAttempts.get(grammarFile) ?? 0) + 1;
 		this.grammarFailureAttempts.set(grammarFile, attempts);
@@ -1196,17 +1254,31 @@ export class TreeSitterClient {
 				: Date.now() + retryDelayMs,
 		);
 
-		const unavailable = retryable
-			? `tree-sitter grammar '${grammarFile}' is unavailable — symbol search, ` +
-				`module reports and structural rules for this language will be degraded. ` +
-				`${detail} pi-lens will retry automatically in ${Math.round((retryDelayMs as number) / 1000)}s; ` +
-				`if the problem persists, allow the package manager's build scripts ` +
-				`(pnpm approve-builds / bun trustedDependencies) or restore network access.`
-			: `tree-sitter grammar '${grammarFile}' is unavailable — symbol search, ` +
-				`module reports and structural rules for this language will be degraded. ` +
-				`${detail} The grammar source reports it does not exist (not a network problem), so this will not ` +
-				`resolve on retry. Fix: reinstall with a manager that runs postinstall, allow its build scripts ` +
-				`(pnpm approve-builds / bun trustedDependencies), or restore network access.`;
+		// The remedy the user is given, keyed to WHERE the attempt failed. The
+		// last two arms are the pre-existing strings, byte for byte; the first
+		// two exist because sending someone to `pnpm approve-builds` and their
+		// network for a resolution or permission fault is the #3409 complaint.
+		const remedy =
+			cause === "write-dir-unresolvable"
+				? `This is a packaging/module-resolution fault, not a download problem: reinstall pi-lens so its ` +
+					`web-tree-sitter dependency is present, or drop the wasm into pi-lens's own grammars/ directory.`
+				: cause === "write-dir-unwritable"
+					? `This is a filesystem-permission fault, not a download problem: make that directory writable ` +
+						`for the user pi-lens runs as, or reinstall pi-lens as that user.`
+					: retryable
+						? `if the problem persists, allow the package manager's build scripts ` +
+							`(pnpm approve-builds / bun trustedDependencies) or restore network access.`
+						: `Fix: reinstall with a manager that runs postinstall, allow its build scripts ` +
+							`(pnpm approve-builds / bun trustedDependencies), or restore network access.`;
+		const unavailable =
+			`tree-sitter grammar '${grammarFile}' is unavailable — symbol search, ` +
+			`module reports and structural rules for this language will be degraded. ` +
+			`${detail} ` +
+			(retryable
+				? `pi-lens will retry automatically in ${Math.round((retryDelayMs as number) / 1000)}s; `
+				: `The grammar source reports it does not exist (not a network problem), so this will not ` +
+					`resolve on retry. `) +
+			remedy;
 
 		logTreeSitterDiagnostic({
 			subsystem: "tree-sitter-client",
@@ -1217,6 +1289,12 @@ export class TreeSitterClient {
 				retryable,
 				retryDelayMs,
 				attempts,
+				// Omitted, not defaulted, for the arms that are neither a fetch
+				// destination nor a download verdict (a vendored grammar is never
+				// downloaded; a decode failure happened AFTER a successful one), so
+				// those records keep their pre-#3409 shape rather than carrying a
+				// cause that is not true of them.
+				...(cause ? { cause } : {}),
 			},
 		});
 		// #1536 review F1: incrementDegradationCount keeps ONE ring-buffer slot

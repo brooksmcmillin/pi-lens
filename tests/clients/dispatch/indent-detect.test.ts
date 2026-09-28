@@ -137,13 +137,20 @@ const ROWS: Array<{
 		expected: { style: "space", width: 2 },
 	},
 	{
-		// #3039 F1: with the block comment removed from the evidence this file
-		// has no indented line at all, so it falls to the safe default instead of
-		// certifying width 1 from its ` * ` lines.
+		// #3161: the raw gate sees the comment continuation, but structural
+		// evidence has no indented line. The detector must decline so the caller's
+		// skip valve records the refusal instead of pinning the default width.
 		id: "R15 block-comment continuations are the only indented lines",
 		content:
 			"/**\n * A module with no indented code.\n */\nexport const x = 1;\n",
-		expected: { style: "space", width: 2 },
+		expected: undefined,
+	},
+	{
+		// #3161 also covers the template mask: its indented text is not a
+		// structural formatter signal when no code line carries indentation.
+		id: "R15b template-literal interiors are the only indented lines",
+		content: "const help = `\n  usage\n`;\nexport const x = 1;\n",
+		expected: undefined,
 	},
 	{
 		id: "R16 2-space file with a nested JSDoc",

@@ -1,6 +1,8 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as v8 from "node:v8";
+import * as vm from "node:vm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CacheManager } from "../clients/cache-manager.js";
 import { getEffectiveLspIdleResetMs } from "../clients/runtime-turn.js";
@@ -134,6 +136,76 @@ vi.mock("../clients/read-guard.js", async (importOriginal) => {
 		ReadGuard: MockReadGuard,
 		createReadGuard: () => new MockReadGuard(),
 	};
+});
+
+// #3506 (PR #3561) made index.ts register a lazy `import()` of the host SDK
+// for pi's per-file mutation queue, and a case here that drives a pi-lens
+// write resolves it. The real package costs ~110 MB of RSS in this fork and
+// put the file over the #3058 per-worker peak-RSS budget. No case here is
+// about the queue (tests/index-3506-file-mutation-queue-wiring.test.ts drives
+// the real one), so a pass-through stands in. `SessionManager` is left out on
+// purpose: without it the lookup reports "unverified", not a second copy.
+vi.mock("@earendil-works/pi-coding-agent", () => ({
+	withFileMutationQueue: <T>(_filePath: string, fn: () => Promise<T>) => fn(),
+}));
+
+// Cases install their own doubles for these modules with vi.doMock;
+// resetModules does not clear the mock registry, so drop them after each case
+// in every describe below (#2883).
+afterEach(() => {
+	vi.doUnmock("../clients/bootstrap.js");
+	vi.doUnmock("../clients/bus-events-logger.js");
+	vi.doUnmock("../clients/cache-observability.js");
+	vi.doUnmock("../clients/debug-handles.js");
+	vi.doUnmock("../clients/degradation-ledger.js");
+	vi.doUnmock("../clients/diagnostic-tracker.js");
+	vi.doUnmock("../clients/dispatch/integration.js");
+	vi.doUnmock("../clients/extension-log.js");
+	vi.doUnmock("../clients/pipeline.js");
+	vi.doUnmock("../clients/quiet-window.js");
+	vi.doUnmock("../clients/runtime-agent-end.js");
+	vi.doUnmock("../clients/runtime-turn.js");
+});
+
+/**
+ * #3565: collect the previous cases' extension graphs before the next case
+ * builds its own. Every case cold-imports `index.js` after
+ * `vi.resetModules()`, leaving 35-140 MB of old-generation garbage, and V8
+ * only runs a full collection when its own heuristics decide to. The file's
+ * peak therefore depended on when that happened: 1,873-2,065 MB across CI
+ * runs of the same code, against the 2,048 MB per-worker budget (#3058),
+ * while the live heap after a collection stayed near 500 MB. One collection
+ * per case measured 882-916 MB peaks locally; the 65 collections summed to
+ * 13.7 s in the one run that timed them.
+ *
+ * The collector is exposed the way `word-index-posting-memory.test.ts`
+ * exposes it: `setFlagsFromString` for this fork only, and the flag is turned
+ * back off at once. `tests/config/worker-budget.test.ts` pins every worker's
+ * `execArgv`, so `--expose-gc` is not added there. It throws when the
+ * collector cannot be exposed; skipping silently would let the peak drift
+ * back to the budget unnoticed.
+ */
+function resolveForcedCollector(): () => void {
+	const ambient = (globalThis as { gc?: () => void }).gc;
+	if (typeof ambient === "function") return ambient;
+	v8.setFlagsFromString("--expose-gc");
+	try {
+		const collect = vm.runInNewContext("gc") as unknown;
+		if (typeof collect !== "function") {
+			throw new Error(
+				"could not expose gc(); #3565's per-case collection cannot run",
+			);
+		}
+		return collect as () => void;
+	} finally {
+		v8.setFlagsFromString("--no-expose-gc");
+	}
+}
+
+const forceCollect = resolveForcedCollector();
+
+afterEach(() => {
+	forceCollect();
 });
 
 describe("index.ts integration", () => {

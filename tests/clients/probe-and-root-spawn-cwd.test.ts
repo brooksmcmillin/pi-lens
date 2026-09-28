@@ -236,6 +236,79 @@ describe("#2894 root seam: a hand-derived package root resolves through resolveT
 		).toEqual([]);
 	});
 
+	it("cargo clippy follows a nearer crate marker created below an already-resolved root", async () => {
+		// Recurrence (#2922, probe PA): the seam memoized POSITIVE marker roots
+		// per start directory and revalidated only that the marker at the cached
+		// root still existed. With a workspace `Cargo.toml` above, the first
+		// resolution cached `<ws>`; `cargo init crates/engine` then scaffolded a
+		// nearer manifest that stayed invisible for the rest of the session, so
+		// `cargo clippy` kept compiling from the workspace root — never linting
+		// the new crate, which is not in `[workspace] members` yet — while the
+		// runner still reported `succeeded`. The sibling case below starts from an
+		// ABSENT marker (#2911's half); this one starts from a positive hit, the
+		// direction no test in the tree exercised.
+		const root = makeTree("clippy-nearer-later", {
+			"Cargo.toml": "[workspace]\n",
+			"crates/engine/src/lib.rs": "pub fn f() {}\n",
+		});
+		const crateRoot = path.join(root, "crates", "engine");
+		const filePath = path.join(crateRoot, "src", "lib.rs");
+		const runner = (
+			await import("../../clients/dispatch/runners/rust-clippy.js")
+		).default;
+
+		const first = await runner.run(
+			makeRunnerCtx(filePath, root, { kind: "rust" }) as never,
+		);
+		expect(first.status).toBe("succeeded");
+
+		// `cargo init crates/engine`, mid-session.
+		fs.writeFileSync(
+			path.join(crateRoot, "Cargo.toml"),
+			'[package]\nname = "engine"\n',
+		);
+
+		const second = await runner.run(
+			makeRunnerCtx(filePath, root, { kind: "rust" }) as never,
+		);
+		expect(second.status).toBe("succeeded");
+
+		expect(
+			spawned
+				.filter((call) => call.args[1] === "--message-format=json")
+				.map((call) => call.cwd),
+		).toEqual([root, crateRoot]);
+	});
+
+	it("biome autofix follows a nearer package marker in parity with the runner seam", async () => {
+		// #2922 acceptance, the parity half, on a NON-runner consumer.
+		// `BiomeClient.fixFileAsync` reaches the same seam through its own
+		// `resolveToolCwd("runner", "biome", ...)` call, so the memo hid a
+		// `biome.json` scaffolded in a nested package from biome's own config
+		// discovery exactly as it hid `Cargo.toml` from clippy — and the two
+		// consumers must answer the same question with the same directory.
+		const root = makeTree("biome-nearer-later", {
+			"biome.json": "{}\n",
+			"packages/ui/src/index.ts": "export const a = 1;\n",
+		});
+		const pkgRoot = path.join(root, "packages", "ui");
+		const filePath = path.join(pkgRoot, "src", "index.ts");
+		const { BiomeClient } = await import("../../clients/biome-client.js");
+		const { resolveToolCwd } = await import("../../clients/tool-cwd.js");
+		const client = new BiomeClient();
+
+		await client.fixFileAsync(filePath, root);
+		fs.writeFileSync(path.join(pkgRoot, "biome.json"), "{}\n");
+		await client.fixFileAsync(filePath, root);
+
+		expect(
+			spawned.filter((call) => call.args.includes("lint")).map((c) => c.cwd),
+		).toEqual([root, pkgRoot]);
+		expect(resolveToolCwd("runner", "biome", filePath, { cwd: root }).cwd).toBe(
+			pkgRoot,
+		);
+	});
+
 	it("cargo clippy sees a crate marker created after its first resolution", async () => {
 		const root = makeTree("clippy-created-later", {
 			"crates/engine/src/lib.rs": "pub fn f() {}\n",

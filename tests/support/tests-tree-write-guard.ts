@@ -211,16 +211,16 @@ export function installTestsTreeWriteGuard(
 				}
 				if (warnedUnexpectedError) return;
 				warnedUnexpectedError = true;
-				console.warn(
-					`[tests-tree-write-guard] fs.watch error on ${root}: ${String(error)}`,
+				process.stderr.write(
+					`[tests-tree-write-guard] fs.watch error on ${root}: ${String(error)}\n`,
 				);
 			});
 		} catch (error) {
 			// Recursive watch is unavailable on some platforms/filesystems. Say
 			// so once rather than failing the run over a missing detector, and
 			// never pretend the tree was clean (shape 10).
-			console.warn(
-				`[tests-tree-write-guard] not watching ${root}: ${String(error)} — #3082 recurrences will not be caught on this platform`,
+			process.stderr.write(
+				`[tests-tree-write-guard] not watching ${root}: ${String(error)} — #3082 recurrences will not be caught on this platform\n`,
 			);
 		}
 	}

@@ -572,11 +572,15 @@ describe("resolveCommand — .venv", () => {
 	});
 
 	it("black: returns formatter-unavailable when no candidate resolves", async () => {
-		const cmd = await blackFormatter.resolveCommand!(
-			fileIn(tmpDir, "main.py"),
-			tmpDir,
-		);
-		expect(cmd).toBe("formatter-unavailable");
+		// #3372: keep this absence assertion independent of a host-installed
+		// black executable discovered through the ambient PATH.
+		await withIsolatedPath(async () => {
+			const cmd = await blackFormatter.resolveCommand!(
+				fileIn(tmpDir, "main.py"),
+				tmpDir,
+			);
+			expect(cmd).toBe("formatter-unavailable");
+		});
 	});
 });
 

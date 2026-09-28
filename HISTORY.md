@@ -118,6 +118,171 @@ worktree, `--dryRunOnly` for reproductions (fixer and reviewer Probe hygiene
 sections, #3180); and the release-bump PR title format (release-qa skill's
 pre-bump dry-roll step, the 4.2.0 retitle).
 
+## 2026-09-25 — merge train to v4.3.0
+
+115 PRs merged 2026-09-22 through 2026-09-25, closing 107 issues; the release
+carries 106 changelog fragments (Added 5 / Changed 23 / Fixed 78) and is cut as
+v4.3.0. Seventeen more PRs merged 2026-09-18 through 2026-09-21, before the
+counted window: #3207, #3214, #3216, #3220, #3225, #3228, #3229, #3230, #3231,
+#3232, #3233, #3234, #3235, #3236, #3238, #3241, #3242 — contract and rule
+work, two fix branches, and dependency bumps.
+
+A host-crash defect class closed this train: an unbounded stream `data`
+handler between a child process and the pi host turns a peer's misbehavior
+into an uncaught `RangeError`/`ECONNRESET` a caller's `try`/`catch` cannot
+reach, because the throw happens off the call stack the catch is on. #3375
+(`safeSpawnAsync`'s 98-of-110 uncapped call sites; PR #3384, 32 MiB default
+output cap, a `trySend` signal sink, the `spawn-kill-failed` kind and
+`killFailed` field) was the first report; #3383 (PR #3388) bounded the
+remaining off-seam accumulators — the forked analyze worker's pipes, the
+unref'd process-table collector, the installer's interpreter probes, and all
+four newline-framing readers; #3389 (PR #3395) added the missing `error`
+listener on warm-attach's accepted socket (`warm-attach-socket-error`, keyed
+by errno); #3397 (PR #3399, stacked on #3389) extended the socket-listener
+sweep to test fixtures. AGENTS.md gained catalog shape 53 (PR #3398): make
+every `data`/`error`/`close`/timer callback on a child process, socket, or
+stream total, and grep `on("data"|on("error"|on("close"` at every new stream
+site.
+
+#3311 (nine LSP fixtures exempted from the clean gate) closed its
+investigation-and-fix arc: a per-server table posted on the issue (2 gateable
+as-is, 5 needing scaffold, 1 launch/availability, 1 server-property, 1
+unsettled — only cmake genuinely has no diagnostics) drove three lanes. Lane
+A (PR #3392) gated terraform and svelte (the latter at a measured 4 s
+budget); lane C (PR #3396) added a PATH-rung spawn-verify for the installer
+and pinned pygls<2 via `PIP_CONSTRAINT`/`UV_CONSTRAINT`; lane B (PR #3402,
+three rounds) gated csharp at a measured 6 s and left fsharp/expert/vue as
+honest exemptions after its round-2 verify found the 8 s strategy-wait
+entries were uncapped production waits, not test slop. Census moved 28/11/6
+to 31/8/6. Standing lesson recorded on the issue: every "server limit"
+exemption re-probed turned out to be a harness gap — launch args, project
+shape, or wait budget — never accept "publishes nothing" without checking
+the transport, shape and budget.
+
+SonarCloud's master gate, red since 2026-09-08 on one vulnerability, closed
+via #3358 (`--only-binary` pin on a lint.yml pip install; the fix PR first
+redded Unit tests itself because `js-yaml` parsed an unquoted `run:` scalar
+as a key — now a standing "run tests/config before pushing workflow edits"
+reminder). `ci-verdict.mjs` gained two fixes: #3373 (PR #3377) paginated
+required-check reads past its 100-check-run truncation, and #3386 (PR #3387)
+made a superseded run (cancelled by a body/title edit re-triggering lint)
+print `gh run rerun <run id>` instead of reporting the truncated run as the
+verdict.
+
+The user's "clear the four p2s" pass closed #2922 (PR #3414 — probes only,
+already fixed by #2948), #2962 (PR #3415, a coverage producer that scanned
+zero files), #2939 (PR #3411 — an Opus round 2 restored two live guards a
+first pass had deleted as "vacuous"), and #3417 (PR #3420, a stale-negative
+git-identity memo filed from the #2922 sweep), plus #3408 (PR #3410, a
+shared 2 MiB/5000-line content bound on `lsp_diagnostics` frames) and #3412
+(PR #3421, two rounds — a NearestRoot positive memo that never expired,
+fixed with a same-tick freshness cadence and two newly-bounded hook-path stat
+awaits). #2991 (mutation lane dry run, PR #3413) took two Opus rounds to find
+the lane was instrumenting 2,220 mutants and evaluating zero before the
+runner's 90-minute cap cancelled it; the fix bounds mutation ranges to
+changed lines and adds an in-lane time budget (advisory run: 82 instrumented,
+45 killed / 37 survived, 54.88%). #3409, reported externally by `glyh` (bare
+`require.resolve` can't find non-core grammars under `bun --compile`,
+misattributing the failure and retrying forever), took two Opus rounds on PR
+#3418 to land a package-identity-checked resolution ladder shared across
+every cwd/package-root rung.
+
+Four PRs from external contributor AngriestBird merged: #3368 (closes
+#3213), #3369 (closes #3128), #3370 (closes #2481) and #3371 (closes #3161)
+— the first two arrived as drafts the orchestrator marked ready on the
+user's "merge cleared externals" instruction, then flagged to the user
+afterward. A plegma worktree-cleanup finding went upstream as plegma #405:
+124 released, already-pushed worktrees / 8.3 GB retained under
+`~/.plegma/work` after one day, and `prune` refuses to run under a live
+daemon.
+
+Follow-ups filed this train and still open: #3400 (archive-tree LSP servers
+— jdtls, kotlin-language-server, elixir-ls, OmniSharp — need a verification
+seam before a TOOLS spec; deferred by the user), #3401 (LSP capability-matrix
+`first-publish` cells with no expiry; held), the #3405 remainder (Expert/
+Elixir needs a project-activation readiness rung before `didSave` is useful
+— BEAM boot exceeds the gate ceiling; deferred by the user, PR #3406
+delivered the rest of #3405), and #3407 (inventory `textDocumentSync.save`
+per server; held). #3416 (the second `analyzedFiles` producer, PR #3427) and
+#3419 (the discovery-cache fold, PR #3425) closed inside the train.
+
+Contract and process lessons: `resumeFrom` does not carry model, sandbox,
+approvals or passthrough — an omitted `model` silently re-resolved to a
+different backend mid-round on the #3418 verify (plegma#414/#452, restated
+2026-09-25) — so every `resumeFrom` now passes all four explicitly; `npm
+install <pkg> --no-save` inside a worktree replaces the shared `node_modules`
+symlink with a real directory, a teardown hazard found via the oxfmt
+install; a docs-only PR opened by a branch dispatch or a bot with no issue
+reference repeatedly redded the PR-title close-keyword gate (#3380, #3382)
+until docs-only sweeps started carrying a tracking issue up front; and the
+#3402 lane-B finding generalizes — an uncapped wait strategy is a production
+wait wherever it runs, not just under test. The train's own lessons were then
+mechanised in #3432: the pre-commit hook checks staged files with the pinned
+formatter, the pre-push hook selects the production tree-scanning suites
+under budget, and a tree-scanner census fails any unregistered scanner instead
+of trusting a hand list.
+
+## 2026-09-25 — defect-catalog freshness pass (retro)
+
+A retro under `docs/pi-lens-retro.md` folded the `AGENTS.md` shapes whose
+rule is now enforced by a named guard into the rule plus a pointer to that
+guard, and moved their incident narrative here. The numbering is unchanged
+(`tests/config/agents-governance.test.ts` pins all 53). The moved record:
+
+- **Shape 32 (mixed path comparison).** The capture comes first: decoration
+  the tool's renderer puts around a reported path (codespan's `┌─` locus
+  gutter, #3285) belongs outside the captured group, never tolerated by a
+  suffix compare that then blocks the fold. Never `path.resolve` with no base,
+  never `===`.
+- **Shape 46 (unbounded long-lived container).** The bounded-container sweep
+  scans `clients/`, `tools/`, `mcp/` and `index.ts` with AST evidence and keeps
+  non-zero population and flagged floors; a read-only TTL check or session
+  reset is not a bound without a finite key-space argument.
+- **Shape 49 (whitespace as structure).** Known members: an aligned
+  continuation inside a call (#3038); a block comment's interior, whose ` * `
+  lines sit one column past their opener (#3039), and the same interior picked
+  as `indent-retarget.ts`'s extrapolation base unit (#3052); a multi-line
+  template literal's interior (#3059) and the same interior picked as that base
+  unit (#3116).
+- **Shape 50 (fabricated identifier).** `tests/clients/lsp/launch.test.ts`'s
+  `spawn: () => new MockChildProcess(2468)` reached `safeSpawnAsync`, which
+  registered 2468 for lifetime cleanup; at fork teardown the suite SIGKILLed
+  pid 2468, which on ~10 % of runners was one of the CI job's own processes
+  (#2042, five weeks of unexplained exit 137; fixed in #3091). A sign or range
+  check is not the guard, ownership is: verify against `/proc/<pid>/status`
+  PPid when admitted, refuse and record what fails, and keep the verdict for
+  the resource's lifetime.
+- **Shape 51 (derived-state cache).** The 2026-08 staleness arc (#1461,
+  #1622, #1630, #1631, #1633, #1634) was six fixes to invalidation keys that
+  could not say when they were wrong; #1644 set the benchmark-first rule. A
+  cache that does not exist cannot serve stale.
+- **Shape 52 (second availability store).** Nine such stores existed on
+  2026-08-20; with no cross-store invalidation a mid-session uninstall was seen
+  by the dispatch runner and not by the formatter, which kept spawning the
+  vanished binary (#1894).
+
+- **Shape 53 (host-fatal stream throw).** The line told agents to grep
+  `on("data"|on("error"|on("close"` at every new stream site by hand, although
+  #3383's `data-handler-bounds-sweep` and #3389's `socket-error-listener-sweep`
+  already pin those populations; it now points at both and leaves only `close`
+  and timer callbacks to hand screening.
+
+Finding the pass also fixed: shape 52 stated that every store "is pinned by
+name in the #1894 registry ratchet". No such ratchet exists in the tree (no
+file references #1894; the issue is open and ADR 0005 records it as a decision,
+not a built check). The line now names the guard that does exist,
+`tests/clients/availability-policy-coverage.test.ts`, and the open issue for
+the ratchet. "Maintaining this file" now says a shape names its guard by path.
+
+The same retro read the session that ran it. Four mistakes were caught by
+existing guards and needed nothing new: `git stash` inside a command (twice),
+a worktree removal over a symlinked `node_modules`, and an unpinned `dist/`
+probe. Three were not: a check chained to a commit or push with `;` or a pipe
+(three incidents, guard filed as #3471), a PR opened without `npm run
+preflight` (#3468's rejected `build:` title), and a spawn-count ratchet
+pre-push never selects (#3472). Each is a row in the merge-train mistake
+table.
+
 ## Archived pre-trim agent context (2026-09-14)
 
 The detailed incident narratives, closed decisions, and subsystem evidence below

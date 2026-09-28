@@ -15,7 +15,6 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { BoundedLruCache } from "../bounded-cache.js";
 import { normalizeFilePath, walkUpDirs } from "../path-utils.js";
 
 export interface GitIdentity {
@@ -23,6 +22,19 @@ export interface GitIdentity {
 	headCommit: string;
 	/** The git worktree top-level directory (parent of the resolved `.git` entry). */
 	worktreeRoot: string;
+}
+
+export type GitIdentityResolver = (cwd: string) => GitIdentity | undefined;
+
+/** A build-local memo: it is discarded when the build settles. */
+export function createGitIdentityResolver(): GitIdentityResolver {
+	const memo = new Map<string, GitIdentity | undefined>();
+	return (cwd) => {
+		if (memo.has(cwd)) return memo.get(cwd);
+		const identity = resolveGitIdentity(cwd);
+		memo.set(cwd, identity);
+		return identity;
+	};
 }
 
 interface ResolvedGitDir {
@@ -33,13 +45,12 @@ interface ResolvedGitDir {
 	worktreeRoot: string;
 }
 
-// Per-process cache of resolved gitdir location keyed by cwd — the gitdir
-// location itself is stable for the life of the process; only HEAD's
-// CONTENT changes (on commit/checkout), so that's re-read fresh every call.
-const _gitDirCache = new BoundedLruCache<string, ResolvedGitDir | null>(32);
-
+// Kept as a compatibility no-op for tests that reset the former memo. Git
+// repository creation/removal is a process-lifecycle change, so the lookup
+// below must walk the filesystem on every call rather than cache presence or
+// absence by cwd.
 export function _resetGitIdentityCacheForTests(): void {
-	_gitDirCache.clear();
+	return;
 }
 
 function readCommonDir(gitDir: string): string {
@@ -99,15 +110,12 @@ function resolveGitDir(cwd: string): ResolvedGitDir | null {
 }
 
 function getResolvedGitDir(cwd: string): ResolvedGitDir | null {
-	const key = normalizeFilePath(path.resolve(cwd));
-	if (_gitDirCache.has(key)) return _gitDirCache.get(key) ?? null;
 	let resolved: ResolvedGitDir | null;
 	try {
 		resolved = resolveGitDir(cwd);
 	} catch {
 		resolved = null;
 	}
-	_gitDirCache.set(key, resolved);
 	return resolved;
 }
 

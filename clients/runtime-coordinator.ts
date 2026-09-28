@@ -7,7 +7,7 @@ import type { WordIndex } from "./word-index.js";
 import type { CascadeRun } from "./cascade-types.js";
 import { logCascade } from "./cascade-logger.js";
 import {
-	appendProjectChange,
+	appendProjectChangeAllocated,
 	type ProjectChangeRange,
 	type ProjectChangeSource,
 } from "./project-changes.js";
@@ -26,6 +26,11 @@ import { TurnSummaryCollector } from "./turn-summary.js";
 import { deriveProviderFromModelId } from "./model-provider.js";
 import { beginTurnContext, setTurnContextSession } from "./turn-context.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
+import { WriteOrderingGuard, writeOrderToken } from "./write-ordering-guard.js";
+import {
+	createGenerationSource,
+	type GenerationHandle,
+} from "./generation-guard.js";
 
 /** Keep deferred cascade admission bounded without dropping late findings. */
 export const MAX_PENDING_CASCADE_RUNS = 32;
@@ -67,6 +72,28 @@ export interface MutationReceipt {
  * incomplete (#936 honesty rule).
  */
 const MAX_MUTATION_RECEIPTS = 512;
+
+/**
+ * #3511 review S2: once per session and project, record why this runtime's
+ * snapshots stopped being servable as fresh. Without it a monitor sees only
+ * never-fresh snapshots. A runtime at seq 0 cannot tell a sibling from a
+ * timed-out session_start read; the timeout has its own ledger kind.
+ */
+function recordViewIncomplete(
+	cwd: string,
+	cause: { ownSeq: number; logMaxSeq: number },
+): void {
+	const why = `the change log reached seq ${cause.logMaxSeq} while this runtime was at ${cause.ownSeq} (${
+		cause.ownSeq === 0
+			? "a sibling process, or a timed-out session_start read that seeded 0; see snapshot-sequence-read-timeout"
+			: "a sibling process logged above it"
+	})`;
+	recordDegradationOnce({
+		kind: "snapshot-view-incomplete",
+		subject: path.resolve(cwd),
+		reason: `snapshots are stamped incomplete (never fresh) until the next seed from the change log: ${why}`,
+	});
+}
 
 export type DeferredMutationKind = "autofix" | "format";
 
@@ -163,6 +190,11 @@ export interface InlineBlockerRecord {
 	 */
 	writeIndex?: number;
 	/**
+	 * #3540: `writeIndex` with the turn it was drawn in (`writeOrderToken`).
+	 * `writeIndex` restarts at every `beginTurn`, so a retire orders on this.
+	 */
+	writeOrder?: number;
+	/**
 	 * #1561 F1: the `tool` ids of the blocking diagnostics behind this
 	 * summary. Inline blockers are NOT an LSP-only concept — `dispatcher.ts`
 	 * builds them from `semantic === "blocking"` across EVERY runner, so an
@@ -175,10 +207,11 @@ export interface InlineBlockerRecord {
 	 */
 	sources?: readonly string[];
 	/**
-	 * #1631: wall-clock ms when the verdict was recorded. Baseline for the
-	 * turn-boundary freshness sweep, which compares the file's and its forward
-	 * imports' on-disk mtime against it. Unstamped (legacy) records are left
-	 * untouched by the sweep.
+	 * #1631: wall-clock ms baseline for the turn-boundary freshness sweep, which
+	 * compares the file's and its forward imports' on-disk mtime against it.
+	 * #3503: the moment the analysed bytes were read, not the moment the verdict
+	 * was recorded; a write during the dispatch is newer than the verdict.
+	 * Unstamped (legacy) records are left untouched by the sweep.
 	 */
 	recordedAtMs?: number;
 	/**
@@ -306,8 +339,32 @@ export interface ToolCallAttribution {
 	 * collapse.
 	 */
 	originCwd: string;
+	/**
+	 * #3523: the read guard allowed this call's edit at the agent's own line
+	 * numbers. Unset for a relocated or unchecked edit, whose written lines
+	 * are not where the agent believes they are.
+	 */
+	editInPlace?: true;
 	/** `Date.now()` when recorded — see `TOOL_CALL_ATTRIBUTION_TTL_MS`. */
 	recordedAt: number;
+}
+
+/**
+ * #3555: a read the tool_call widened to its enclosing symbol or Markdown
+ * section, carried by tool-call identity to its tool_result, which labels it.
+ */
+export interface ReadWidening {
+	/** The file the tool_call resolved (absolute), for the record. */
+	filePath: string;
+	/**
+	 * The read's raw file input as the tool_call left it. The tool_result
+	 * matches on this, since it resolves paths without the tool_call's host
+	 * variant ladder, and a reused id may name another file.
+	 */
+	inputPath: string | undefined;
+	requested: { offset: number; limit: number };
+	shown: { offset: number; limit: number };
+	boundary: { heading: string } | { symbol: { name: string; kind: string } };
 }
 
 /**
@@ -329,7 +386,8 @@ const TOOL_CALL_ATTRIBUTION_TTL_MS = 5 * 60_000;
 
 export class RuntimeCoordinator {
 	private _projectRoot = normalizeMapKey(process.cwd());
-	private _sessionGeneration = 0;
+	private readonly _sessionGeneration =
+		createGenerationSource("runtime-session");
 	private _sessionStartedAt = Date.now();
 	private _errorDebtBaseline: ErrorDebtBaseline | null = null;
 	private _pipelineCrashCounts = new Map<string, number>();
@@ -378,8 +436,24 @@ export class RuntimeCoordinator {
 	// claude-sonnet-4-5) doesn't leave a stale provider from the old model.
 	private _telemetryProviderIsExplicit = false;
 	private _turnIndex = 0;
+	/**
+	 * #3540 r2: the turn half of a write order token (`writeOrderToken`).
+	 * `beginTurn` advances it and `resetForSession` never restarts it: the
+	 * widget's write guards outlive a session reset (`/reload` keeps them),
+	 * so a later turn's token must outrank every earlier one in the process.
+	 * `_turnIndex` restarts per session for telemetry.
+	 */
+	private _writeOrderTurn = 0;
 	private _writeIndex = 0;
 	private _projectSeq = 0;
+	// #3511: the highest logged seq this runtime's view is known to have missed
+	// (a sibling process logged it above our seq); 0 when none. Cleared by a
+	// seed from the log, or by a late read that covers it.
+	private _viewMissingThrough = 0;
+	// #3511 review round 2: the change-log entries folded by this session's
+	// seed or late merge. An `unlocked` entry after it may share a seq we
+	// hold, so a snapshot stamped with it is judged against the log's tags.
+	private _viewLogEntries = 0;
 	private _turnStartProjectSeq = 0;
 	private readonly _fileSeq = new Map<string, number>();
 	// File key → the projectSeq value at that file's most recent bump (#451). Lets
@@ -400,12 +474,32 @@ export class RuntimeCoordinator {
 		string,
 		ToolCallAttribution
 	>(TOOL_CALL_ATTRIBUTION_CAPACITY);
+	/**
+	 * #3555: reads carry no {@link ToolCallAttribution} (it is recorded for
+	 * mutations, and its origin cwd would change how a read's path resolves),
+	 * so a widening rides its own correlation, with the same bound.
+	 */
+	private readonly _readWidenings = new BoundedLruCache<string, ReadWidening>(
+		TOOL_CALL_ATTRIBUTION_CAPACITY,
+	);
 	private readonly _lspReadWarmState = new Map<
 		string,
 		{ status: "warming" | "ready"; ts: number }
 	>();
 	private readonly _pendingInlineBlockers =
 		new PathKeyedMap<InlineBlockerRecord>(normalizeMapKey);
+	/**
+	 * #3507: one per-path order for BOTH verbs on `_pendingInlineBlockers`,
+	 * the widget store's guard shape (`widget-state.ts` diagnosticsWriteGuard).
+	 * Pipelines of two same-file edits overlap under pi's parallel tools, so
+	 * an older run that settles last must neither erase nor replace the newer
+	 * run's verdict (#1198 invariants 1-2). The last applied token lives here,
+	 * not on the record, so it survives a clear.
+	 */
+	private readonly _inlineBlockerWriteOrder = new WriteOrderingGuard<
+		string,
+		number
+	>();
 	private readonly _actionableWarningsThisTurn = new Map<
 		string,
 		ActionableWarningRecord
@@ -427,7 +521,7 @@ export class RuntimeCoordinator {
 	readonly partialApplyRecords = new PartialApplyRecordStore();
 
 	resetForSession(startedAt = Date.now()): void {
-		this._sessionGeneration += 1;
+		this._sessionGeneration.bump();
 		this._sessionStartedAt = startedAt;
 		this._complexityBaselines.clear();
 		this._pipelineCrashCounts.clear();
@@ -457,6 +551,8 @@ export class RuntimeCoordinator {
 		this._turnIndex = 0;
 		this._writeIndex = 0;
 		this._projectSeq = 0;
+		this._viewMissingThrough = 0;
+		this._viewLogEntries = 0;
 		this._turnStartProjectSeq = 0;
 		this._fileSeq.clear();
 		this._fileLastProjectSeq.clear();
@@ -469,8 +565,10 @@ export class RuntimeCoordinator {
 		// per-session-numbered host reusing tool-call ids across sessions must
 		// not let a NEW session inherit a DEAD session's recorded skip verdict.
 		this._toolCallAttributions.clear();
+		this._readWidenings.clear();
 		this._lspReadWarmState.clear();
 		this._pendingInlineBlockers.clear();
+		this._inlineBlockerWriteOrder.clear();
 		this._actionableWarningsThisTurn.clear();
 		this._codeQualityWarningsThisTurn.clear();
 		this._turnSummary.clear();
@@ -622,6 +720,7 @@ export class RuntimeCoordinator {
 		// by resetForSession().
 		this._turnStartProjectSeq = this._projectSeq;
 		this._turnIndex += 1;
+		this._writeOrderTurn += 1;
 		beginTurnContext(this._telemetrySessionId);
 		this._writeIndex = 0;
 		this._reportedThisTurn.clear();
@@ -649,7 +748,35 @@ export class RuntimeCoordinator {
 		changedRange?: ProjectChangeRange;
 		onAppendError?: (err: unknown) => void;
 	}): { projectSeq: number; fileSeq: number } {
-		const { projectSeq, fileSeq, key } = this.bumpFileSeq(args.filePath);
+		// #3511: a logged mutation takes its seq from the shared change log,
+		// under the log's lock, so a sibling process never logs the same seq.
+		let logged: ReturnType<RuntimeCoordinator["bumpFileSeq"]> | undefined;
+		if (args.cwd !== undefined) {
+			try {
+				const cwd = args.cwd;
+				appendProjectChangeAllocated(cwd, (logMaxSeq) => {
+					const ownSeq = this._projectSeq;
+					logged = this.bumpFileSeq(args.filePath, logMaxSeq);
+					if (this._viewMissingThrough > 0) {
+						recordViewIncomplete(cwd, { ownSeq, logMaxSeq });
+					}
+					return {
+						seq: logged.projectSeq,
+						timestamp: new Date().toISOString(),
+						sessionId: this.telemetrySessionId,
+						turnIndex: this.turnIndex,
+						source: args.source,
+						filePath: path.resolve(args.filePath),
+						fileSeq: logged.fileSeq,
+						changedRange: args.changedRange,
+					};
+				});
+			} catch (err) {
+				args.onAppendError?.(err);
+			}
+		}
+		const { projectSeq, fileSeq, key } =
+			logged ?? this.bumpFileSeq(args.filePath);
 		if (this._mutationReceipts.length >= MAX_MUTATION_RECEIPTS) {
 			this._mutationReceipts.shift();
 			this._droppedMutationReceipts += 1;
@@ -663,22 +790,6 @@ export class RuntimeCoordinator {
 			turnIndex: this._turnIndex,
 			ts: Date.now(),
 		});
-		if (args.cwd !== undefined) {
-			try {
-				appendProjectChange(args.cwd, {
-					seq: projectSeq,
-					timestamp: new Date().toISOString(),
-					sessionId: this.telemetrySessionId,
-					turnIndex: this.turnIndex,
-					source: args.source,
-					filePath: path.resolve(args.filePath),
-					fileSeq,
-					changedRange: args.changedRange,
-				});
-			} catch (err) {
-				args.onAppendError?.(err);
-			}
-		}
 		return { projectSeq, fileSeq };
 	}
 
@@ -738,6 +849,18 @@ export class RuntimeCoordinator {
 
 	peekWriteIndex(): number {
 		return this._writeIndex;
+	}
+
+	/**
+	 * #3540: draw the next write index as an order token that spans turns
+	 * (`writeOrderToken`), for a writer whose token is compared against
+	 * another turn's: the widget store and the inline-blocker retire.
+	 */
+	nextWriteOrderToken(): number {
+		return writeOrderToken(
+			this._writeOrderTurn,
+			this.nextWriteIndex(),
+		) as number;
 	}
 
 	setTelemetryIdentity(identity: {
@@ -824,8 +947,23 @@ export class RuntimeCoordinator {
 		return this._turnIndex;
 	}
 
+	/** #3540 r2: the order turn a write token is drawn in; never restarts. */
+	get writeOrderTurn(): number {
+		return this._writeOrderTurn;
+	}
+
 	get projectSeq(): number {
 		return this._projectSeq;
+	}
+
+	/** True when a snapshot of this runtime must not claim `projectSeq` (#3511). */
+	get viewMissesLoggedEntries(): boolean {
+		return this._viewMissingThrough > 0;
+	}
+
+	/** The change-log entries this session's seed or merge folded (#3511). */
+	get viewLogEntries(): number {
+		return this._viewLogEntries;
 	}
 
 	get turnStartProjectSeq(): number {
@@ -835,8 +973,12 @@ export class RuntimeCoordinator {
 	seedProjectSequence(
 		projectSeq: number,
 		fileSeqByPath?: Map<string, number>,
+		/** The log entries the read folded (#3511 review round 2). */
+		logEntries = 0,
 	): void {
 		this._projectSeq = Math.max(0, Math.floor(projectSeq));
+		this._viewMissingThrough = 0;
+		this._viewLogEntries = logEntries;
 		this._turnStartProjectSeq = this._projectSeq;
 		this._fileSeq.clear();
 		// Seeded per-file counters carry no projectSeq provenance, so start the
@@ -851,7 +993,36 @@ export class RuntimeCoordinator {
 		}
 	}
 
-	bumpFileSeq(filePath: string): {
+	/**
+	 * #3511 review B2: fold a late sequence read (session_start's deferred one,
+	 * after a timed-out read seeded 0) into a session that has already
+	 * advanced. Unlike `seedProjectSequence` it never lowers the seq or a
+	 * file's seq, and keeps the in-window changed-since marks. It clears the
+	 * incomplete mark only when the read reaches every entry the view missed:
+	 * locked allocation appends entries in rising seq order, so a read whose
+	 * max is at or above that seq saw all of them. An unlocked entry breaks
+	 * that order; readers catch it by its tag after the fold point, which the
+	 * merge only ever advances (review round 2).
+	 */
+	mergeProjectSequence(
+		projectSeq: number,
+		fileSeqByPath: Map<string, number>,
+		logEntries = 0,
+	): void {
+		this._projectSeq = Math.max(this._projectSeq, Math.floor(projectSeq));
+		this._viewLogEntries = Math.max(this._viewLogEntries, logEntries);
+		for (const [filePath, seq] of fileSeqByPath) {
+			const key = normalizeMapKey(path.resolve(filePath));
+			this._fileSeq.set(key, Math.max(this._fileSeq.get(key) ?? 0, seq));
+		}
+		if (projectSeq >= this._viewMissingThrough) this._viewMissingThrough = 0;
+	}
+
+	bumpFileSeq(
+		filePath: string,
+		/** The shared change log's max seq, when this bump is logged (#3511). */
+		logMaxSeq = 0,
+	): {
 		projectSeq: number;
 		fileSeq: number;
 		/** The normalized key the bump was recorded under — reuse, never re-derive. */
@@ -861,6 +1032,12 @@ export class RuntimeCoordinator {
 		// ~1.8us on POSIX since #3098; every caller that also needs the key must
 		// reuse this one instead of paying it twice.
 		const key = normalizeMapKey(path.resolve(filePath));
+		// #3511: a sibling process logged entries above our seq. Allocate above
+		// them, and remember that this runtime's view has not folded them.
+		if (logMaxSeq > this._projectSeq) {
+			this._projectSeq = logMaxSeq;
+			this._viewMissingThrough = Math.max(this._viewMissingThrough, logMaxSeq);
+		}
 		this._projectSeq += 1;
 		const fileSeq = (this._fileSeq.get(key) ?? 0) + 1;
 		this._fileSeq.set(key, fileSeq);
@@ -892,11 +1069,19 @@ export class RuntimeCoordinator {
 	}
 
 	get sessionGeneration(): number {
-		return this._sessionGeneration;
+		return this._sessionGeneration.current();
+	}
+
+	/**
+	 * #3499: a handle on the current session, for a write that lands after an
+	 * await which can outlive the session (a fire-and-forget quiet window).
+	 */
+	captureSessionGeneration(): GenerationHandle {
+		return this._sessionGeneration.capture();
 	}
 
 	isCurrentSession(generation: number): boolean {
-		return this._sessionGeneration === generation;
+		return this._sessionGeneration.current() === generation;
 	}
 
 	markStartupScanInFlight(name: string, generation: number): void {
@@ -962,7 +1147,20 @@ export class RuntimeCoordinator {
 		this._cascadeRuns.push(run);
 	}
 
-	appendCascadePromise(p: Promise<CascadeRun>): void {
+	/**
+	 * #3512: `generation` is the session the compute was dispatched in. The
+	 * admitting handler awaits the pipeline first and can resume after a
+	 * same-cwd replacement's reset, so a capture taken here would name the new
+	 * session; it is therefore required. `filePath` is the edited file the
+	 * compute belongs to, the subject of a dropped admission's ledger row.
+	 */
+	appendCascadePromise(
+		p: Promise<CascadeRun>,
+		generation: GenerationHandle,
+		filePath: string,
+	): void {
+		// A stale admission is dropped on both branches below.
+		if (generation.guardedWrite(filePath, () => true) === undefined) return;
 		if (this._pendingCascadeRuns.length < MAX_PENDING_CASCADE_RUNS) {
 			this._pendingCascadeRuns.push(p);
 			return;
@@ -975,8 +1173,13 @@ export class RuntimeCoordinator {
 			subject: "runtime-coordinator",
 			reason: `deferred cascade admission capped at ${MAX_PENDING_CASCADE_RUNS}`,
 		});
+		// #3512: the reset cannot reach this detached append, so a compute
+		// admitted in one session and settling after a same-cwd replacement is
+		// dropped here instead of landing in the new session's runs.
 		void p
-			.then((run) => this.appendCascadeRun(run))
+			.then((run) =>
+				generation.guardedWrite(run.filePath, () => this.appendCascadeRun(run)),
+			)
 			.catch(() => {
 				// Pipeline promises are normally non-rejecting; preserve the existing
 				// failure sink if a caller violates that contract.
@@ -1011,7 +1214,15 @@ export class RuntimeCoordinator {
 	 */
 	async settleCascadeRuns(
 		maxWaitMs: number,
-		settleOptions: { trackTurnEndClock?: boolean } = {},
+		settleOptions: {
+			trackTurnEndClock?: boolean;
+			/**
+			 * #3499: the session this settle belongs to. The quiet window runs
+			 * fire-and-forget and can outlive its session; after a replacement,
+			 * both the append and the re-park are dropped.
+			 */
+			generation?: GenerationHandle | undefined;
+		} = {},
 	): Promise<{ settled: number; timedOut: number }> {
 		const pending = this._pendingCascadeRuns;
 		if (pending.length === 0) return { settled: 0, timedOut: 0 };
@@ -1048,14 +1259,23 @@ export class RuntimeCoordinator {
 				timeout,
 			]);
 
+			const { generation } = settleOptions;
+			const commit = (subject: string, write: () => void): void => {
+				if (generation) generation.guardedWrite(subject, write);
+				else write();
+			};
 			let settled = 0;
 			let timedOut = 0;
 			for (const entry of tracked) {
-				if (entry.done && entry.run) {
-					this.appendCascadeRun(entry.run);
+				const { run } = entry;
+				if (entry.done && run) {
+					commit(run.filePath, () => this.appendCascadeRun(run));
 					settled += 1;
 				} else {
-					this._pendingCascadeRuns.push(entry.promise);
+					// An unsettled compute has no file yet; the ledger row counts them.
+					commit("cascade-pending", () =>
+						this._pendingCascadeRuns.push(entry.promise),
+					);
 					timedOut += 1;
 				}
 			}
@@ -1094,6 +1314,12 @@ export class RuntimeCoordinator {
 		return this._cascadeRuns.length > 0;
 	}
 
+	/**
+	 * Record a file's blocking verdict. Returns its freshness baseline, or
+	 * undefined when a newer dispatch of the same file already recorded or
+	 * cleared it (#3507). `recordedAtMs` is the pipeline's analysis read time
+	 * (#3503); a caller without one stamps now.
+	 */
 	recordInlineBlockers(
 		filePath: string,
 		summary: string,
@@ -1102,12 +1328,22 @@ export class RuntimeCoordinator {
 		lines?: readonly number[],
 		contentBaseline?: { size: number; sha256: string },
 		diagnostics?: readonly Diagnostic[],
-	): number {
-		const recordedAtMs = Date.now();
+		orderTurn = this._writeOrderTurn,
+		recordedAtMs = Date.now(),
+	): number | undefined {
+		const writeOrder = writeOrderToken(orderTurn, writeIndex);
+		if (
+			!this._inlineBlockerWriteOrder.shouldWrite(
+				normalizeMapKey(filePath),
+				writeOrder,
+			)
+		)
+			return undefined;
 		this._pendingInlineBlockers.set(path.resolve(filePath), {
 			filePath,
 			summary,
 			writeIndex,
+			writeOrder,
 			sources,
 			lines,
 			diagnostics,
@@ -1123,8 +1359,24 @@ export class RuntimeCoordinator {
 		return recordedAtMs;
 	}
 
-	clearInlineBlockers(filePath: string): void {
+	/**
+	 * Clear a file's verdict after a clean dispatch. Returns false when a newer
+	 * dispatch of the same file already recorded or cleared it (#3507).
+	 */
+	clearInlineBlockers(
+		filePath: string,
+		writeIndex?: number,
+		orderTurn = this._writeOrderTurn,
+	): boolean {
+		if (
+			!this._inlineBlockerWriteOrder.shouldWrite(
+				normalizeMapKey(filePath),
+				writeOrderToken(orderTurn, writeIndex),
+			)
+		)
+			return false;
 		this._pendingInlineBlockers.delete(path.resolve(filePath));
+		return true;
 	}
 
 	/**
@@ -1351,7 +1603,8 @@ export class RuntimeCoordinator {
 	 * clean from the authoritative current view retires the stale verdict.
 	 *
 	 * Ordering (#1198 invariants 1-2). Both stores draw from the same
-	 * `nextWriteIndex()` counter, so when both sides are stamped the retire
+	 * `nextWriteIndex()` counter, ordered turn first (#3540: the counter
+	 * restarts at every turn), so when both sides are stamped the retire
 	 * requires the clean verdict to be strictly NEWER. A slow old clean that
 	 * settles after a fresh dispatch found real blockers must not erase them.
 	 * When either side is unstamped the two cannot be ordered at all; the fresh
@@ -1375,16 +1628,17 @@ export class RuntimeCoordinator {
 	 */
 	retireInlineBlockerOnConfirmedClean(
 		filePath: string,
-		confirmedAtWriteIndex?: number,
+		/** #3540: a `nextWriteOrderToken()` reservation, turn first. */
+		confirmedAtWriteOrder?: number,
 		coveredSources?: readonly string[],
 	): boolean {
 		const key = path.resolve(filePath);
 		const existing = this._pendingInlineBlockers.get(key);
 		if (!existing) return false;
 		if (
-			existing.writeIndex !== undefined &&
-			confirmedAtWriteIndex !== undefined &&
-			confirmedAtWriteIndex <= existing.writeIndex
+			existing.writeOrder !== undefined &&
+			confirmedAtWriteOrder !== undefined &&
+			confirmedAtWriteOrder <= existing.writeOrder
 		) {
 			return false;
 		}
@@ -1525,6 +1779,24 @@ export class RuntimeCoordinator {
 			...attribution,
 			recordedAt: Date.now(),
 		});
+	}
+
+	/** #3555: note the widening the tool_call applied to this read. */
+	recordReadWidening(toolCallId: string, widening: ReadWidening): void {
+		this._readWidenings.set(toolCallId, widening);
+	}
+
+	/** #3555: one-shot claim of a read's widening, as with an attribution. */
+	takeReadWidening(toolCallId: string): ReadWidening | undefined {
+		const widening = this._readWidenings.get(toolCallId);
+		this._readWidenings.delete(toolCallId);
+		return widening;
+	}
+
+	/** #3523: see {@link ToolCallAttribution.editInPlace}. */
+	markToolCallEditInPlace(toolCallId: string): void {
+		const attribution = this._toolCallAttributions.get(toolCallId);
+		if (attribution) attribution.editInPlace = true;
 	}
 
 	/**

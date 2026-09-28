@@ -162,19 +162,24 @@ describe("tests-tree write guard (#3082)", () => {
 
 	it("warns once and stays inert when the platform cannot watch recursively", () => {
 		const root = fixtureTree();
-		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const write = vi
+			.spyOn(process.stderr, "write")
+			.mockImplementation(() => true);
 		try {
 			const guard = installTestsTreeWriteGuard(root, {
+				// SAFETY: The injected callback intentionally throws before returning an FSWatcher to exercise the unavailable-platform path.
 				watch: (() => {
 					throw new Error("ERR_FEATURE_UNAVAILABLE_ON_PLATFORM");
 				}) as unknown as typeof fs.watch,
 			});
-			expect(warn).toHaveBeenCalledTimes(1);
-			expect(warn.mock.calls[0]?.[0]).toMatch(/will not be caught/);
+			expect(write).toHaveBeenCalledTimes(1);
+			const message = String(write.mock.calls[0]?.[0]);
+			expect(message).toMatch(/will not be caught/);
+			expect(message.endsWith("\n")).toBe(true);
 			expect(guard.report()).toBeUndefined();
 			guard.close();
 		} finally {
-			warn.mockRestore();
+			write.mockRestore();
 		}
 	});
 
@@ -290,11 +295,15 @@ describe("tests-tree write guard (#3082)", () => {
 	 * itself lives in the last case below.
 	 */
 	function fakeWatcher(): fs.FSWatcher & { emitError(error: unknown): void } {
+		// SAFETY: EventEmitter supplies the event API; the two assigned methods below supply the FSWatcher methods used by the production seam.
 		const emitter = new EventEmitter() as unknown as fs.FSWatcher & {
 			emitError(error: unknown): void;
 		};
+		// SAFETY: The fake watcher intentionally implements only the teardown methods exercised by installTestsTreeWriteGuard.
 		(emitter as unknown as { unref(): void }).unref = () => {};
+		// SAFETY: The fake watcher intentionally implements only the teardown methods exercised by installTestsTreeWriteGuard.
 		(emitter as unknown as { close(): void }).close = () => {};
+		// SAFETY: emitError is a test-only convenience that forwards to EventEmitter.emit, matching FSWatcher error delivery.
 		(emitter as unknown as { emitError(error: unknown): void }).emitError = (
 			error,
 		) => emitter.emit("error", error);
@@ -315,6 +324,7 @@ describe("tests-tree write guard (#3082)", () => {
 	) {
 		const instances: Array<ReturnType<typeof fakeWatcher>> = [];
 		const guard = installTestsTreeWriteGuard(root, {
+			// SAFETY: The factory returns the EventEmitter-backed FSWatcher double built above for deterministic error delivery.
 			watch: (() => {
 				const instance = fakeWatcher();
 				instances.push(instance);
@@ -331,14 +341,16 @@ describe("tests-tree write guard (#3082)", () => {
 			root,
 			isUnderIndex2992Scratch,
 		);
-		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const write = vi
+			.spyOn(process.stderr, "write")
+			.mockImplementation(() => true);
 		try {
 			instance().emitError(
 				enoentAt(root, path.join("support", ".index-2992-scratch")),
 			);
-			expect(warn).not.toHaveBeenCalled();
+			expect(write).not.toHaveBeenCalled();
 		} finally {
-			warn.mockRestore();
+			write.mockRestore();
 			guard.close();
 		}
 	});
@@ -349,16 +361,20 @@ describe("tests-tree write guard (#3082)", () => {
 			root,
 			isUnderIndex2992Scratch,
 		);
-		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const write = vi
+			.spyOn(process.stderr, "write")
+			.mockImplementation(() => true);
 		try {
 			// A path OUTSIDE the allowed prefix — same error code, not excused.
 			const outside = enoentAt(root, "clients");
 			instance().emitError(outside);
 			instance().emitError(outside);
-			expect(warn).toHaveBeenCalledTimes(1);
-			expect(warn.mock.calls[0]?.[0]).toContain(root);
+			expect(write).toHaveBeenCalledTimes(1);
+			const message = String(write.mock.calls[0]?.[0]);
+			expect(message).toContain(root);
+			expect(message.endsWith("\n")).toBe(true);
 		} finally {
-			warn.mockRestore();
+			write.mockRestore();
 			guard.close();
 		}
 	});
@@ -369,16 +385,18 @@ describe("tests-tree write guard (#3082)", () => {
 			root,
 			isUnderIndex2992Scratch,
 		);
-		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const write = vi
+			.spyOn(process.stderr, "write")
+			.mockImplementation(() => true);
 		try {
 			const eacces = Object.assign(new Error("EACCES: permission denied"), {
 				code: "EACCES",
 				path: path.join(root, "support", ".index-2992-scratch"),
 			});
 			instance().emitError(eacces);
-			expect(warn).toHaveBeenCalledTimes(1);
+			expect(write).toHaveBeenCalledTimes(1);
 		} finally {
-			warn.mockRestore();
+			write.mockRestore();
 			guard.close();
 		}
 	});

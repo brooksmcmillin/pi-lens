@@ -32,6 +32,7 @@ import {
 import { logExtension } from "./extension-log.js";
 import { isFullyQualifiedWin32 } from "./path-utils.js";
 import { startSpawnUsageSampler } from "./resource-sampler.js";
+import { DEFAULT_MAX_OUTPUT_BYTES } from "./spawn-output-cap.js";
 import { compareOrdinal } from "./string-utils.js";
 
 export interface SpawnResourceUsage {
@@ -157,6 +158,14 @@ export interface SpawnResult {
 	outputTruncated?: boolean;
 	/** True when the output cap started terminating the child. */
 	killedForOutputCap?: boolean;
+	/**
+	 * #3375 round 2 (H3384-1): every signal available for this spawn's teardown
+	 * was refused by the OS, so the child may STILL BE RUNNING. Present only on
+	 * that path — absent means teardown was never attempted or it succeeded, so
+	 * a 4.2.1 result parses unchanged. `killedForOutputCap` keeps its meaning
+	 * (we STARTED terminating the child); this field says the attempt failed.
+	 */
+	killFailed?: boolean;
 	/** True when the optional streaming matcher saw a matching chunk. */
 	streamingMatch?: boolean;
 	/** Peak/average CPU%+RSS sampled across this spawn's lifetime (#620).
@@ -352,7 +361,12 @@ export interface SafeSpawnOptions {
 	 * affects spawn behavior.
 	 */
 	resourceLabel?: string;
-	/** Maximum bytes retained across stdout and stderr for this child. */
+	/**
+	 * Maximum bytes retained across stdout and stderr for this child.
+	 * Omitted, zero, negative or non-finite falls back to
+	 * `DEFAULT_MAX_OUTPUT_BYTES` (#3375) — there is deliberately no way to opt
+	 * out of a cap, because an absent cap is what crashed the host.
+	 */
 	maxOutputBytes?: number;
 	/** Match output chunks before output-cap truncation can discard them. */
 	matchWhileStreaming?: RegExp;
@@ -670,7 +684,32 @@ function installLifetimeCleanup(): void {
 				});
 				return;
 			}
-			process.kill(process.pid, signal);
+			try {
+				process.kill(process.pid, signal);
+			} catch (error) {
+				// #3383: this runs inside a `process.once(signal)` handler, so a
+				// throw here is an uncaughtException DURING SHUTDOWN, not a
+				// rejection anyone can see. The one failure measured in the field
+				// (Windows SIGHUP ENOSYS) is declined in advance just above; this
+				// covers every other platform/signal/errno pair the OS can refuse —
+				// same ledger kind, `reason: "refused"` instead of "unsupported",
+				// because a reader of either row wants the same fact: the host
+				// exited without the signal's default disposition. The child
+				// cleanup above has already run either way.
+				recordDegradationOnce({
+					kind: "safe-spawn-signal-reraise-unsupported",
+					subject: `${process.platform}:${signal}`,
+					reason: `${process.platform} ${signal}: self signal re-raise was refused (${
+						(error as { code?: string }).code ?? (error as Error).message
+					})`,
+					metadata: {
+						platform: process.platform,
+						signal,
+						reason: "refused",
+						code: (error as { code?: string }).code ?? null,
+					},
+				});
+			}
 		});
 	}
 }
@@ -1469,6 +1508,24 @@ export async function safeSpawnAsync(
 		let killed = false;
 		let outputTruncated = false;
 		let killedForOutputCap = false;
+		// #3375: bytes the child actually EMITTED (not what survived the cap) —
+		// the one number the field crash report could not supply, so the ledger
+		// row below can name how chatty the offending command really was.
+		let observedOutputBytes = 0;
+		// #3375: bytes RETAINED so far, kept incrementally. The cap check used to
+		// re-measure `Buffer.byteLength(stdout) + Buffer.byteLength(stderr)` on
+		// every chunk, which flattens both accumulated strings each time — O(n^2)
+		// in total output. Harmless while only 12 of 110 call sites passed a cap;
+		// with the cap now on by default it would tax every spawn (measured: a
+		// 32 MiB child resolved in 7944 ms before this counter, 469 ms after).
+		// Equal to the two byte lengths by construction: before
+		// truncation `stdout`/`stderr` are exactly the appended texts, and after
+		// it the branch that renders from the retained head/tail never reads it.
+		let retainedOutputBytes = 0;
+		// #3375: latched the first time a chunk handler throws. Later chunks
+		// return immediately, so the same fault cannot be re-entered and
+		// `refreshRetainedOutputs` can never overwrite the bytes already kept.
+		let outputHandlerFailed = false;
 		let streamingMatch = false;
 		// #1651 review: a single boolean the close/error handlers both check
 		// AND set, so whichever one decides the outcome first wins outright —
@@ -1511,12 +1568,15 @@ export async function safeSpawnAsync(
 		// re-arm the grace timer on every chunk. `undefined` before exit / after
 		// the wait settles, so the calls below are no-ops outside that window.
 		let rearmIdleGrace: (() => void) | undefined;
-		const maxOutputBytes =
-			options?.maxOutputBytes !== undefined &&
-			Number.isFinite(options.maxOutputBytes) &&
-			options.maxOutputBytes > 0
-				? Math.floor(options.maxOutputBytes)
-				: undefined;
+		// #3375: never `undefined`. An omitted or unusable cap resolves to the
+		// module default instead of to unbounded retention, so `appendOutput`
+		// below has no arm that concatenates without a ceiling.
+		const callerCap = options?.maxOutputBytes;
+		const capFromCaller =
+			callerCap !== undefined && Number.isFinite(callerCap) && callerCap > 0;
+		const maxOutputBytes: number = capFromCaller
+			? Math.floor(callerCap)
+			: DEFAULT_MAX_OUTPUT_BYTES;
 		const outputTruncationMarker = "\n...[output truncated]...\n";
 		type OutputStream = "stdout" | "stderr";
 		type OutputPart = { stream: OutputStream; text: string };
@@ -1578,15 +1638,16 @@ export async function safeSpawnAsync(
 			chunk: string | Buffer,
 		): string => {
 			const text = typeof chunk === "string" ? chunk : chunk.toString();
-			if (maxOutputBytes === undefined || outputTruncated) {
-				if (maxOutputBytes === undefined) return current + text;
+			if (outputTruncated) {
 				appendTail({ stream, text }, retainedTailLimit);
 				truncationStream = stream;
 				return renderOutput(stream);
 			}
-			const used = Buffer.byteLength(stdout) + Buffer.byteLength(stderr);
 			const bytes = Buffer.byteLength(text);
-			if (used + bytes <= maxOutputBytes) return current + text;
+			if (retainedOutputBytes + bytes <= maxOutputBytes) {
+				retainedOutputBytes += bytes;
+				return current + text;
+			}
 			outputTruncated = true;
 			truncationStream = stream;
 			const available = Math.max(
@@ -1836,10 +1897,56 @@ export async function safeSpawnAsync(
 		}
 		const resourceLabel = options?.resourceLabel ?? command;
 
+		// #3375 round 2 (H3384-1). `killTree`'s promise is AWAITED by `finalize`
+		// from a `void finalize(...)` callback, FIRED AND FORGOTTEN by `onAbort`
+		// (`void killTree()`), and its escalation runs in a bare `setTimeout`
+		// callback — three structurally different ways a throwing `kill` escaped
+		// this spawn: as a rejection that left the public promise pending
+		// forever, as an `unhandledRejection`, and (from the timer) as an
+		// uncaught exception, which is the very shape #3375 exists to close.
+		// So no signal is sent except through `trySend`, which cannot throw.
+		type KillPhase = "abort" | "output-cap" | "handler-fault" | "timeout";
+		let killFailed = false;
+		/** Send one signal. INVARIANT (#3375 r3 / M3384-2): every signal SEND in
+		 *  `killTree` goes through this function. Exactly two `try`/`catch`
+		 *  blocks remain in there and neither contains a bare send: the Windows
+		 *  `await` guard around the taskkill child (its `catch` body sends only
+		 *  through `trySend`), and the group LIVENESS PROBE, whose `catch`
+		 *  computes a predicate rather than sending anything — the same shape as
+		 *  the module-level `groupIsGone`. Returns false instead of throwing, and
+		 *  records nothing itself: a refused signal is often ORDINARY (a negative-pid
+		 *  ESRCH means the group already exited and the direct-child fallback
+		 *  takes over), so only a send with no fallback left behind it pairs
+		 *  with `noteKillFailure`. */
+		const trySend = (send: () => void): boolean => {
+			try {
+				send();
+				return true;
+			} catch {
+				return false;
+			}
+		};
+		/** Every signal for this teardown was refused, so the child may still be
+		 *  running. One record per spawn — the reviewer's reproduction refused
+		 *  two kills (the fault's and then the timeout's) and a row per attempt
+		 *  would be a flood. A kind of its own rather than a field on
+		 *  `spawn-output-cap-truncated`: this fires on the abort and timeout
+		 *  teardowns too, which have nothing to do with an output cap. */
+		const noteKillFailure = (phase: KillPhase): void => {
+			if (killFailed) return;
+			killFailed = true;
+			incrementDegradationCount({
+				kind: "spawn-kill-failed",
+				subject: resourceLabel,
+				reason: `every signal available for the ${phase} teardown was refused; the child may still be running`,
+				metadata: { phase, pid: child.pid },
+			});
+		};
+
 		// On Windows, shell:true means child.pid is cmd.exe — child.kill() only
 		// kills the wrapper, leaving the actual subprocess (e.g. knip/npx) alive
 		// as an orphan. Use taskkill /F /T to kill the full process tree instead.
-		const killTree = async (): Promise<void> => {
+		const killTree = async (phase: KillPhase): Promise<void> => {
 			if (isWindows && child.pid && child.pid > 0) {
 				const taskkill = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\taskkill.exe`;
 				try {
@@ -1855,22 +1962,31 @@ export async function safeSpawnAsync(
 						);
 						killer.once("close", () => done());
 						killer.once("error", () => {
-							child.kill("SIGKILL");
+							// E4: a throw HERE would leave the EventEmitter as an
+							// uncaught exception, not a rejection.
+							if (!trySend(() => child.kill("SIGKILL"))) noteKillFailure(phase);
 							done();
 						});
 					});
 				} catch {
-					child.kill("SIGKILL");
+					if (!trySend(() => child.kill("SIGKILL"))) noteKillFailure(phase);
 				}
 			} else if (posixProcessGroup && ownsChildPid) {
 				// #2026: signal the whole process group. Grandchildren spawned
 				// by the tool share its group, so one signal reaches the whole
 				// tree; a negative-pid ESRCH means it already exited.
 				const pgid = -(child.pid as number);
-				try {
-					process.kill(pgid, "SIGTERM");
-				} catch {
-					child.kill("SIGTERM");
+				// #3375 round 3 (M3384-2): through the one sink, like every other
+				// send. A second ad-hoc `try`/`catch` here would be a rival
+				// signal-safety mechanism inside the same teardown — the shape this
+				// change deleted four of — and a later edit to this branch would not
+				// inherit `trySend`'s total send or its failure accounting.
+				// `trySend` returning false here is ORDINARY, not a failure: #2026's
+				// negative-pid ESRCH means the group already exited, so the direct
+				// child below is the normal fallback and nothing is recorded. Only
+				// the last-resort send can fail the teardown.
+				if (!trySend(() => process.kill(pgid, "SIGTERM"))) {
+					if (!trySend(() => child.kill("SIGTERM"))) noteKillFailure(phase);
 				}
 				// #2027 round-1: gate the SIGKILL escalation on GROUP liveness,
 				// not direct-child death - a tool can exit instantly on SIGTERM
@@ -1879,34 +1995,42 @@ export async function safeSpawnAsync(
 				// it is the only backstop for this group once finalize deletes
 				// the pid from lifetimeState.
 				escalationTimer = setTimeout(() => {
-					let groupAlive = true;
-					try {
-						process.kill(pgid, 0);
-					} catch {
-						groupAlive = false;
-					}
-					if (!groupAlive) return;
-					teardownEscalated = true;
-					logLatency({
-						type: "phase",
-						phase: "spawn_group_kill_escalation",
-						filePath: "",
-						durationMs: 0,
-						metadata: { pgid: child.pid },
+					// The WHOLE body, not just the signal: this runs in a bare
+					// timer callback, where any throw is an uncaught exception.
+					const escalated = trySend(() => {
+						let groupAlive = true;
+						try {
+							process.kill(pgid, 0);
+						} catch {
+							groupAlive = false;
+						}
+						if (!groupAlive) return;
+						teardownEscalated = true;
+						logLatency({
+							type: "phase",
+							phase: "spawn_group_kill_escalation",
+							filePath: "",
+							durationMs: 0,
+							metadata: { pgid: child.pid },
+						});
+						// Through the sink too (#3375 r3 / M3384-2): one vocabulary
+						// for every send in this function. A false here is ORDINARY
+						// — the group raced its own exit — so it is deliberately not
+						// escalated to `noteKillFailure`; the enclosing `trySend`
+						// already guarantees nothing escapes this timer callback.
+						trySend(() => process.kill(pgid, "SIGKILL"));
 					});
-					try {
-						process.kill(pgid, "SIGKILL");
-					} catch {
-						// Raced with group exit.
-					}
+					if (!escalated) noteKillFailure(phase);
 				}, 1000);
 			} else {
-				child.kill("SIGTERM");
+				// E2/E3. This branch runs whenever `/proc` cannot prove pid
+				// ownership — every macOS host, and any Linux host with an
+				// unreadable `/proc` — so it is not a hypothetical path.
+				if (!trySend(() => child.kill("SIGTERM"))) noteKillFailure(phase);
 				escalationTimer = setTimeout(() => {
-					if (!closed) {
-						teardownEscalated = true;
-						child.kill("SIGKILL");
-					}
+					if (closed) return;
+					teardownEscalated = true;
+					if (!trySend(() => child.kill("SIGKILL"))) noteKillFailure(phase);
 				}, 1000);
 			}
 		};
@@ -1916,7 +2040,7 @@ export async function safeSpawnAsync(
 			aborted = true;
 			if (!killed && !child.killed) {
 				killed = true;
-				void killTree();
+				void killTree("abort");
 			}
 		};
 		abortSignal?.addEventListener("abort", onAbort, { once: true });
@@ -1937,27 +2061,99 @@ export async function safeSpawnAsync(
 			) {
 				killedForOutputCap = true;
 				killed = true;
-				killPromise = killTree();
+				killPromise = killTree("output-cap");
+			}
+		};
+
+		// #3375: one bounded, counted ledger row per command label the moment the
+		// cap first bites - the crash report named no command, no byte count and
+		// no cap value, so nothing in it could identify the chatty producer.
+		// `incrementDegradationCount` keeps one latest-reason entry per subject
+		// with an exact tally and writes durable rows only at powers of two, so a
+		// tool that trips the cap on every dispatch cannot flood the sink.
+		const recordOutputCapTrip = (): void => {
+			incrementDegradationCount({
+				kind: "spawn-output-cap-truncated",
+				subject: resourceLabel,
+				reason: `retained output reached the ${maxOutputBytes}-byte ${
+					capFromCaller ? "caller" : "default"
+				} cap after ${observedOutputBytes} bytes; child ${
+					killedForOutputCap ? "terminated" : "left running"
+				}`,
+				metadata: {
+					capBytes: maxOutputBytes,
+					capSource: capFromCaller ? "caller" : "default",
+					observedBytes: observedOutputBytes,
+					killed: killedForOutputCap,
+				},
+			});
+		};
+
+		// #3375: the fault path for a chunk handler that threw. Every statement
+		// here is total by construction - plain assignments, a ledger call that
+		// swallows its own failures, and `killTree()`, which is `async` so a
+		// synchronous fault inside it becomes a rejected promise rather than a
+		// throw - because a throw raised HERE would escape the same way the
+		// original RangeError did.
+		const failOutputHandler = (stream: OutputStream, error: Error): void => {
+			outputHandlerFailed = true;
+			// Retention is over. The bytes already in `stdout`/`stderr` stay as
+			// the bounded output: nothing renders from the retained head/tail
+			// again, because the re-entry guard returns before that can happen.
+			// That is also why `truncationStream` is deliberately NOT set here —
+			// only `renderOutput` reads it, and nothing renders after a fault, so
+			// the assignment was mutation-inert (removing it reds nothing).
+			outputTruncated = true;
+			incrementDegradationCount({
+				kind: "spawn-output-handler-fault",
+				subject: resourceLabel,
+				reason: `${stream} chunk handling threw ${error.name} after ${observedOutputBytes} bytes; retention stopped and the child was terminated`,
+				metadata: {
+					stream,
+					error: error.name,
+					capBytes: maxOutputBytes,
+					observedBytes: observedOutputBytes,
+				},
+			});
+			if (!killed && !child.killed) {
+				killedForOutputCap = true;
+				killed = true;
+				killPromise = killTree("handler-fault");
 			}
 		};
 
 		// Collect output
 		child.stdout?.setEncoding("utf-8");
 		child.stderr?.setEncoding("utf-8");
-		child.stdout?.on("data", (data) => {
-			matchStreamingChunk("stdout", data);
-			stdout = appendOutput("stdout", stdout, data);
-			if (outputTruncated) refreshRetainedOutputs();
-			stopForOutputLimit();
-			rearmIdleGrace?.();
-		});
-		child.stderr?.on("data", (data) => {
-			matchStreamingChunk("stderr", data);
-			stderr = appendOutput("stderr", stderr, data);
-			if (outputTruncated) refreshRetainedOutputs();
-			stopForOutputLimit();
-			rearmIdleGrace?.();
-		});
+		// #3375: a throw raised inside a stream `data` handler is delivered to
+		// the process, not to the caller awaiting this spawn - no `try`/`catch`
+		// around `await safeSpawnAsync(...)` can contain it, which is why a
+		// `RangeError: Invalid string length` from `appendOutput` terminated the
+		// Pi host on 2026-09-22. Every statement the handler runs lives inside
+		// this `try`, so ANY fault in the retention path (not just that one
+		// RangeError) becomes the bounded output-cap result the caller already
+		// knows how to read.
+		const onOutputChunk = (
+			stream: OutputStream,
+			data: string | Buffer,
+		): void => {
+			if (outputHandlerFailed) return;
+			try {
+				observedOutputBytes += Buffer.byteLength(data);
+				const wasTruncated = outputTruncated;
+				matchStreamingChunk(stream, data);
+				if (stream === "stdout") stdout = appendOutput(stream, stdout, data);
+				else stderr = appendOutput(stream, stderr, data);
+				if (outputTruncated) refreshRetainedOutputs();
+				stopForOutputLimit();
+				if (!wasTruncated && outputTruncated) recordOutputCapTrip();
+				rearmIdleGrace?.();
+			} catch (error) {
+				failOutputHandler(stream, toError(error));
+			}
+		};
+		child.stdout?.on("data", (data) => onOutputChunk("stdout", data));
+		child.stderr?.on("data", (data) => onOutputChunk("stderr", data));
 
 		// #1673 review round 3 (F2): registered HERE, at spawn time, alongside
 		// the other handlers above — not inside `waitForPipeIdle`. Real Node
@@ -1988,7 +2184,7 @@ export async function safeSpawnAsync(
 			if (!killed && !child.killed) {
 				killed = true;
 				teardownStartedAtMs = Date.now();
-				killPromise = killTree();
+				killPromise = killTree("timeout");
 			}
 		}, timeout);
 
@@ -2156,6 +2352,7 @@ export async function safeSpawnAsync(
 			const outputInfo = {
 				...(outputTruncated ? { outputTruncated: true } : {}),
 				...(killedForOutputCap ? { killedForOutputCap: true } : {}),
+				...(killFailed ? { killFailed: true } : {}),
 			};
 			const streamingMatchInfo = streamingMatch ? { streamingMatch: true } : {};
 			// #1816: surface the signal name as a field on every path where one
@@ -2296,6 +2493,7 @@ export async function safeSpawnAsync(
 					spawnFailure,
 					...(outputTruncated ? { outputTruncated: true } : {}),
 					...(killedForOutputCap ? { killedForOutputCap: true } : {}),
+					...(killFailed ? { killFailed: true } : {}),
 					...(streamingMatch ? { streamingMatch: true } : {}),
 					resourceUsage,
 				});

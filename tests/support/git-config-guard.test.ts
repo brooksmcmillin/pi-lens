@@ -184,15 +184,18 @@ describe("runGitConfigGuardSetup one-time warn (#2251 fix round F2)", () => {
 			"[user]\n\tname = t\n\temail = t@t.local\n",
 		);
 
-		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const write = vi
+			.spyOn(process.stderr, "write")
+			.mockImplementation(() => true);
 		try {
 			runGitConfigGuardSetup(dir);
-			expect(warn).toHaveBeenCalledTimes(1);
-			const message = warn.mock.calls[0]?.[0] as string;
+			expect(write).toHaveBeenCalledTimes(1);
+			const message = String(write.mock.calls[0]?.[0]);
 			expect(message).toContain("t");
 			expect(message).toContain("t@t.local");
+			expect(message.endsWith("\n")).toBe(true);
 		} finally {
-			warn.mockRestore();
+			write.mockRestore();
 		}
 	});
 
@@ -207,12 +210,14 @@ describe("runGitConfigGuardSetup one-time warn (#2251 fix round F2)", () => {
 			"[user]\n\tname = Real Maintainer\n",
 		);
 
-		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const write = vi
+			.spyOn(process.stderr, "write")
+			.mockImplementation(() => true);
 		try {
 			runGitConfigGuardSetup(dir);
-			expect(warn).not.toHaveBeenCalled();
+			expect(write).not.toHaveBeenCalled();
 		} finally {
-			warn.mockRestore();
+			write.mockRestore();
 		}
 	});
 
@@ -234,7 +239,9 @@ describe("runGitConfigGuardSetup one-time warn (#2251 fix round F2)", () => {
 		// make the afterEach cleanup's rmSync fail (EPERM: can't remove a
 		// directory that is the current working directory on Windows).
 		const originalCwd = process.cwd();
-		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const write = vi
+			.spyOn(process.stderr, "write")
+			.mockImplementation(() => true);
 		try {
 			process.chdir(dir);
 			const teardown = runGitConfigGuardSetup(dir);
@@ -247,7 +254,7 @@ describe("runGitConfigGuardSetup one-time warn (#2251 fix round F2)", () => {
 			expect(() => teardown()).toThrow(/known fixture identity/);
 		} finally {
 			process.chdir(originalCwd);
-			warn.mockRestore();
+			write.mockRestore();
 		}
 	});
 });

@@ -48,7 +48,24 @@ same gate rather than bypassing it.
   `workspace`; explicit `paths` always win over `scope`). `severity` is a
   threshold, not an exact filter: `error` shows only errors; `warning` adds
   warnings; `information` adds information; `hint`/`all` (default) show every
-  tier. Legacy `mode`: `delta` (current turn), `all` (resurfaces stale
+  tier. `source=lsp` reads a file's on-disk content and will not sync it to a
+  language server past **2 MiB or 5000 lines** (`clients/runtime-config.ts`
+  `pipeline.lspMaxFileBytes`/`lspMaxFileLines`, checked in
+  `clients/lsp/content-limits.ts`) — not env-tunable today. A file over that
+  bound gets an explicit `file too large for LSP diagnostics (<N> bytes/lines
+  > <limit>)` result instead of stale or partial diagnostics. This is a
+  *different* 2 MiB from the auto-fix full-content attachment cap described in
+  [agent-guide.md](agent-guide.md), section 6 ("Auto-format / auto-fix
+  timing") — the two caps currently share one constant
+  (`RUNTIME_CONFIG.pipeline.lspMaxFileBytes`) but gate unrelated behaviors
+  (LSP sync vs. tool-result content attachment) and can diverge independently
+  in the future. Separately, every save-triggered edit now sends the server a
+  `textDocument/didSave` when it declared `textDocumentSync.save` — with the
+  file text when the server asked for it (`includeText`) and the file is
+  within the same bound, otherwise the save is still sent but without `text`
+  (never dropped outright); this is what makes save-triggered servers like
+  Expert (Elixir) re-diagnose an edit made through pi-lens (refs #3405,
+  #3408). Legacy `mode`: `delta` (current turn), `all` (resurfaces stale
   blockers dropped from turn context), `full` (project-wide scan).
 - **`lens_diagnostic_mark`** — Triage a diagnostic: `false-positive` /
   `suppress` (writes an inline `pi-lens-ignore` comment) / `defer`

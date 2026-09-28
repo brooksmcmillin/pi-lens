@@ -23,3 +23,4 @@ complete.
 | [0006](0006-derived-state-benchmark-first.md) | No cross-request derived-state cache without a fresh-process benchmark. | 51 | Accepted |
 | [0007](0007-end-to-end-witness-per-seam-slice.md) | Every seam slice commits an end-to-end host witness and degradation ledger artifact. | #1605 umbrella; #1892, #1816, #1193, #1894, #1844 | Accepted |
 | [0009](0009-reported-path-attribution.md) | Reported-path attribution is `pathsEqual` against the runner cwd, inline at each call site. | 2, 34, 38; #1193, #3278 | Accepted |
+| [0008](0008-turn-end-lane-interface.md) | One `TurnEndLane` interface; `handleTurnEnd` stays a thin orchestrator over lane modules. | #1892 umbrella; #3264, #3269 | Accepted |

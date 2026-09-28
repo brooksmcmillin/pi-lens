@@ -10,6 +10,9 @@ import {
 } from "../../clients/sgconfig.js";
 import { removeTempDirSync } from "./test-utils.js";
 
+// flake-shape: elapsed-time-assertion — #3403 measures the real scratch-tree
+// filesystem work; fake timers cannot observe cold CI disk latency.
+
 // Entry-cap bound on the shared sgconfig scratch dir (#2912: it held
 // ~703,000 entries after one merge train). Drives the real
 // resolveBaselineSgconfig writer and asserts the independent observables: the
@@ -31,6 +34,7 @@ describe("sgconfig scratch bound", () => {
 	});
 
 	it("caps baseline entries and records the eviction once per session", async () => {
+		const startedAt = Date.now();
 		_resetBaselineSgconfigForTests();
 		prevTestMode = process.env.PI_LENS_TEST_MODE;
 		process.env.PI_LENS_TEST_MODE = "0";
@@ -54,7 +58,8 @@ describe("sgconfig scratch bound", () => {
 			.split("\n")
 			.filter((line) => line.includes("sgconfig-baseline-cap-evict"));
 		expect(rows.length).toBeGreaterThan(0);
-	});
+		expect(Date.now() - startedAt).toBeLessThan(10_000);
+	}, 10_000);
 
 	it("evicts the oldest baselines first and keeps the newest", () => {
 		_resetBaselineSgconfigForTests();

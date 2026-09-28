@@ -9,12 +9,27 @@ export declare const POLL_INTERVAL_SECONDS: number;
 export declare const HARD_CAP_SECONDS: number;
 export declare const DEFAULT_GH_TIMEOUT_MS: number;
 export declare const MIN_GH_TIMEOUT_MS: number;
+export declare const TRANSIENT_BACKOFF_INITIAL_SECONDS: number;
+export declare const TRANSIENT_BACKOFF_MAX_SECONDS: number;
+
+export declare function isTransientGhError(error: unknown): boolean;
+
+export declare function isGhMissingError(error: unknown): boolean;
+
+export declare function resolveGithubToken(
+	env?: Record<string, string | undefined>,
+): string | null;
+
+export declare function resolveGithubApiBase(
+	env?: Record<string, string | undefined>,
+): string;
 
 export declare function isPrNumber(arg: unknown): boolean;
 
 export interface VerdictRow {
 	name: string;
 	present: boolean;
+	id: number | null;
 	status: string | null;
 	conclusion: string | null;
 	url: string | null;
@@ -26,7 +41,6 @@ export interface Verdict {
 	rows: VerdictRow[];
 	reason: string;
 	mergeState: string;
-	truncated: boolean;
 }
 
 export declare function computeVerdict(
@@ -48,6 +62,11 @@ export declare function computeVerdict(
 ): Verdict;
 
 export declare function formatVerdictTable(rows: VerdictRow[]): string;
+
+export declare function formatRerunHint(row: {
+	name?: string;
+	details_url?: string;
+}): string;
 
 export declare function resolveWaitCapSeconds(
 	waitSecondsArg: number | null,
@@ -87,6 +106,7 @@ export declare function pollVerdict(args: {
 		| null;
 	sleepImpl?: (ms: number) => Promise<void>;
 	now?: () => number;
+	onRetry?: (line: string) => void;
 }): Promise<{ verdict: Verdict; polls: number }>;
 
 export type GhExec = (
@@ -134,11 +154,96 @@ export declare function fetchRerunState(
 
 export declare const PROTECTED_BRANCH: string;
 
+export declare function extractRequiredCheckNames(
+	requiredStatusChecks: unknown,
+): string[] | null;
+
 export declare function resolveRequiredCheckNames(
 	repository: string,
 	ghExec?: GhExec,
 	timeoutMs?: number,
 ): string[] | null;
+
+export declare const TRANSPORT_GH: string;
+export declare const TRANSPORT_REST: string;
+
+export declare function parseOwnerRepoFromGitRemote(
+	remoteUrl: unknown,
+): string | null;
+
+export type GitExec = (
+	command: string,
+	args: string[],
+	options?: Record<string, unknown>,
+) => string;
+
+export declare function resolveRepositoryViaGit(
+	execFileSyncImpl?: GitExec,
+): string;
+
+export declare function mapRestMergeableState(
+	pullRequest:
+		| { mergeable?: boolean | null; mergeable_state?: string | null }
+		| null
+		| undefined,
+): string;
+
+// Narrower than `typeof fetch` (mirrors `scripts/lib/stale-open-issues.d.mts`'s
+// own `fetcher` type) so a test double only needs to satisfy the three
+// members `restGet` actually reads, not the full `Response` interface.
+export type RestFetch = (
+	url: string,
+	init?: RequestInit,
+) => Promise<{ ok: boolean; status: number; text(): Promise<string> }>;
+
+export type RestOptions = {
+	token?: string | null;
+	fetchImpl?: RestFetch;
+	timeoutMs?: number;
+	apiBase?: string;
+};
+
+export declare function restResolveHeadSha(
+	repository: string,
+	target: string,
+	options?: RestOptions,
+): Promise<{ sha: string | undefined; mergeable: string | null }>;
+
+export declare function restFetchCheckRunsPayload(
+	repository: string,
+	sha: string,
+	options?: RestOptions,
+): Promise<{ total_count?: number; check_runs?: unknown[] }>;
+
+export declare function restResolveRequiredCheckNames(
+	repository: string,
+	options?: RestOptions,
+): Promise<string[] | null>;
+
+export declare function resolveTransport(
+	usesDefaultGhExec: boolean,
+	token: string | null,
+	probe?: () => boolean,
+): string;
+
+export declare function nodeSupportsUseEnvProxy(
+	versionString?: string | null,
+): boolean;
+
+export declare const REEXEC_RUN: string;
+export declare const REEXEC_REEXEC: string;
+export declare const REEXEC_VERSION_TOO_OLD: string;
+
+export declare function resolveReexecPlan(options: {
+	usesRestTransport: boolean;
+	proxyUrl: string | null;
+	envProxyFlagAlreadySet: boolean;
+	nodeVersion?: string;
+}): string;
+
+export declare function formatVersionTooOldMessage(
+	nodeVersion?: string,
+): string;
 
 export declare function parseArgs(argv: string[]): {
 	target: string | null;
@@ -148,6 +253,20 @@ export declare function parseArgs(argv: string[]): {
 export declare function run(args?: {
 	argv?: string[];
 	ghExec?: GhExec;
+	gitExec?: GitExec;
+	fetchImpl?: RestFetch;
 	stdout?: (line: string) => void;
 	stderr?: (line: string) => void;
+	sleepImpl?: (ms: number) => Promise<void>;
+	now?: () => number;
 }): Promise<number>;
+
+export declare function callWithTransientRetry<T>(
+	call: (remainingMs: number | undefined) => T | Promise<T>,
+	options?: {
+		deadline?: number;
+		now?: () => number;
+		sleepImpl?: (ms: number) => Promise<void>;
+		onRetry?: (line: string) => void;
+	},
+): Promise<T>;

@@ -355,6 +355,29 @@ const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
 			"queue, not the work it admits — #2523 says so explicitly.",
 		owner: "#2523 slice 2",
 	},
+	"clients/runtime-agent-end.ts#0b7eb0bf~12dfd718": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"#3529's post-exit resync awaits the abandoned format phase's " +
+			"`abandoned` promise inside a `void`-launched task that starts " +
+			"only after `agent_settled`'s own `bounded()` gave up on the " +
+			"phase; the hook never awaits it. It settles when the abandoned " +
+			"formatter run does: its spawn has a 15 s timeout, the command " +
+			"resolution before the spawn has none. #3558 moved that " +
+			"resolution out of pi's queue; bounding the wait is #3599.",
+		owner: "#3599",
+	},
+	"clients/runtime-agent-end.ts#0e5eaed5~b2556cb0": {
+		family: "hook-await",
+		site: "agent_settled",
+		reason:
+			"`resyncLspFile` after a deferred write: the LSP touch has its " +
+			"own wait bound, the resync above it does not. #3528 r1 F1 and " +
+			"#3576 run it through the drain's session and LSP-service guard " +
+			"(`syncDrainWrite`, same await).",
+		owner: "#2523 slice 2",
+	},
 	"clients/runtime-agent-end.ts#1f35703b~52cc4490": {
 		family: "hook-await",
 		site: "agent_settled",
@@ -363,6 +386,38 @@ const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
 			"agent_settled list (runtime-agent-end.ts:871): count-capped at " +
 			"5 fixes, with no time bound at all.",
 		owner: "#2523 slice 2",
+	},
+	"clients/runtime-agent-end.ts#3595d62d~d453dc5f": {
+		family: "hook-await",
+		site: "agent_settled",
+		reason:
+			"`resyncLspFile` after a deferred write: the LSP touch has its " +
+			"own wait bound, the resync above it does not. #3528 r1 F1 and " +
+			"#3576 run it through the drain's session and LSP-service guard " +
+			"(`syncDrainWrite`, same await).",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-agent-end.ts#458b366b~893f7563": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"#3529's post-exit `resyncLspFile` of a fresh stamped read, run only " +
+			"while the drain's session (#3528 r1 F1) and LSP service (#3576) " +
+			"are current, inside a `void`-launched task the hook never awaits " +
+			"(it starts after `agent_settled`'s `bounded()` gave up on the " +
+			"phase). The resync races its own touch against the LSP sync " +
+			"budget. #3576 re-keyed it: the same await, through `syncDrainWrite`.",
+		owner: "#3529",
+	},
+	"clients/runtime-agent-end.ts#5f7b6a40~380334ff": {
+		family: "hook-await",
+		site: "off-hook",
+		reason:
+			"#3529's post-exit resync awaits the abandoned format phase " +
+			"itself inside a `void`-launched task that starts only after " +
+			"`agent_settled`'s own `bounded()` gave up on that phase; the " +
+			"hook never awaits it.",
+		owner: "#3529",
 	},
 	"clients/runtime-agent-end.ts#846909f2~82252dcb": {
 		family: "hook-await",
@@ -374,22 +429,6 @@ const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
 			"per-item 30s timers, no aggregate cap and no signal in the " +
 			"race; the 3-wedged-formatter probe measured `still-blocked " +
 			"after 45011ms`.",
-		owner: "#2523 slice 2",
-	},
-	"clients/runtime-agent-end.ts#b2e21790~677753f9": {
-		family: "hook-await",
-		site: "agent_settled",
-		reason:
-			"`resyncLspFile` after a deferred write: the LSP touch has its " +
-			"own wait bound, the resync above it does not.",
-		owner: "#2523 slice 2",
-	},
-	"clients/runtime-agent-end.ts#e36d39b8~05b260ce": {
-		family: "hook-await",
-		site: "agent_settled",
-		reason:
-			"`resyncLspFile` after a deferred write: the LSP touch has its " +
-			"own wait bound, the resync above it does not.",
 		owner: "#2523 slice 2",
 	},
 	"clients/runtime-agent-end.ts#f0b9e5ad~c7623832": {
@@ -418,7 +457,21 @@ const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
 		site: "agent_settled",
 		reason:
 			"`runAutofix` on the deferred drain: per-runner spawn timeouts " +
-			"exist at the leaf, nothing bounds the phase above them.",
+			"exist at the leaf, nothing bounds the phase above them. #3506 " +
+			"hands it a hold on pi's per-file mutation queue, which each " +
+			"fixer branch enters after its resolver (same await, same key).",
+		owner: "#2523 slice 2",
+	},
+	"clients/runtime-agent-end.ts#handleAgentEnd:b8100bef~7c97ebe3": {
+		family: "hook-await",
+		site: "agent_settled",
+		reason:
+			"#3576 R1: once the drain's session or LSP service was replaced, " +
+			"`syncDrainWrite` resyncs only a document a live client of the " +
+			"current service already holds (`resyncGitChangedFiles`): it never " +
+			"builds a service or spawns, and each resync is one bounded notify " +
+			"write, at most four per drift pass. The pass above it has no " +
+			"aggregate bound, like the live resync it replaces.",
 		owner: "#2523 slice 2",
 	},
 	"clients/runtime-coordinator.ts#f1693e28~c40c7404": {
@@ -1617,15 +1670,6 @@ const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
 			"walking reachability.",
 		owner: "#2523 slice 2",
 	},
-	"index.ts#652343ba~0f4cd6ac": {
-		family: "hook-await",
-		site: "agent_settled",
-		reason:
-			"`onAgentSettled` awaits its three phases in sequence with no " +
-			"aggregate bound; the 10000ms budget is a TOTAL, not a " +
-			"per-phase allowance.",
-		owner: "#2523 slice 2",
-	},
 	"index.ts#65b51dab~a327124f": {
 		family: "hook-await",
 		site: "off-hook",
@@ -1652,6 +1696,16 @@ const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
 			"`flushDebouncedToolResults` on the turn_end path: the same " +
 			"unbounded pipeline re-entry as the agent_end copy, under the " +
 			"3000ms turn_end budget.",
+		owner: "#2523 slice 2",
+	},
+	"index.ts#6cb74f81~1f6fe236": {
+		family: "hook-await",
+		site: "agent_settled",
+		reason:
+			"`onAgentSettled` awaits its three phases in sequence with no " +
+			"aggregate bound; the 10000ms budget is a TOTAL, not a " +
+			"per-phase allowance. #3576 re-keyed the refresh: the same await, " +
+			"through the settle's session guard.",
 		owner: "#2523 slice 2",
 	},
 	"index.ts#889073a2~ebe0e096": {
@@ -2175,6 +2229,12 @@ const HELPER_UNBOUNDED: Readonly<Record<string, number>> = {
 	// the npm-shim rung beside them, and none can take a hook's signal until
 	// #2523 AC4 threads it through the deps types.
 	"clients/dispatch/runners/utils/runner-helpers.ts": 37,
+	// #3541: `withHostFileMutationQueues` awaits the realpath of each path an
+	// LSP workspace edit names, which keys it the way pi keys its queue. It
+	// runs inside `applyWorkspaceEdit`, which the agent_settled actionable fix
+	// already awaits without a bound (#2523 slice 2's row for
+	// `applyConservativeActionableWarningFixes`); no hook signal reaches it.
+	"clients/file-mutation-queue.ts": 1,
 	"clients/file-time.ts": 1,
 	"clients/file-utils.ts": 1,
 	"clients/format-service.ts": 4,
@@ -2197,7 +2257,12 @@ const HELPER_UNBOUNDED: Readonly<Record<string, number>> = {
 	// the other 43 `await which(...)` sites in this module spend, which is
 	// exactly the "bound at the leaf, unreachable from the hook" shape this
 	// pin exists to keep visible rather than to bless.
-	"clients/formatters.ts": 115,
+	// then 115 → 116 (#3558): `formatFile` awaits entering pi's per-file
+	// mutation queue (`enter`) once the command is resolved, where
+	// `runFormatPhase` used to await it before the resolution (pipeline.ts
+	// below loses that await). The wait is the fix: an agent edit of the same
+	// file finishes first. The run is inside the format service's `bounded()`.
+	"clients/formatters.ts": 116,
 	"clients/gitleaks-client.ts": 4,
 	// #1892: the turn-end secrets LANE, extracted out of `runtime-turn.ts` with
 	// no behaviour change. Its one unbounded await is `collect`'s
@@ -2255,10 +2320,36 @@ const HELPER_UNBOUNDED: Readonly<Record<string, number>> = {
 	// probes and is reset at session_start. The helper deliberately ignores the
 	// ambient hook signal, so wrapping here would duplicate the wall bound
 	// without adding cancellation and would misstate the credential contract.
-	"clients/installer/index.ts": 221,
+	// #3311 adds four: the resolution ladder's PATH rung now awaits
+	// verifyToolBinary (itself bounded by getToolVerificationTimeout through
+	// safeSpawnAsync, default 10s) and the pip ladder awaits
+	// pipConstraintEnvFor plus its mkdir/writeFile of one small constraints
+	// file under PI_LENS_HOME. Each is intrinsically bounded or a local write;
+	// none can take the hook's signal until #2523 AC4 threads it, so this
+	// records the measured increase rather than hiding it.
+	// 225 → 216 (#3476): acquireInstallLock takes the install lock with the
+	// synchronous generation lock, so its awaited mkdir, open, write, close,
+	// read, stat and removes are gone; only its 100 ms retry wait remains.
+	"clients/installer/index.ts": 216,
 	"clients/installer/managed-tool-refresh.ts": 29,
-	"clients/instance-reaper.ts": 26,
-	"clients/instance-registry.ts": 23,
+	// #3538/#3539 add five in each. The reaper reads start times and owner
+	// tags before its backstop decision and asks again before every signal
+	// (the identity query, its re-check, and the kill's own confirm await);
+	// the registry reads this process's start once per mutation and a new
+	// child's start. Each is a process-table query under
+	// BACKSTOP_SCAN_TIMEOUT_MS with the reaper's tree-kill on timeout, or a
+	// synchronous /proc read on Linux; none can take the hook's signal until
+	// #2523 AC4 threads it. Review round 1 (F2) adds one more in the reaper:
+	// the re-check also re-reads the owner tag, the same bounded query.
+	"clients/instance-reaper.ts": 32,
+	// 28 → 33 (#3498): the removal deregisterInstance queues when its sync
+	// wait cannot take the lock adds four (this process's start, the lock, the
+	// read, the write), and writeRegistryWithRetry's read and write now sit on
+	// two lines so a registration whose session ended can skip the write. The
+	// queued removal runs on the registry tail, never awaited by a hook; each
+	// is a local file operation or the registry lock's own bounded wait, and
+	// none can take the hook's signal until #2523 AC4 threads it.
+	"clients/instance-registry.ts": 33,
 	"clients/language-profile.ts": 3,
 	"clients/lens-engine.ts": 1,
 	"clients/lens-map.ts": 2,
@@ -2284,7 +2375,22 @@ const HELPER_UNBOUNDED: Readonly<Record<string, number>> = {
 	"clients/package-manager.ts": 8,
 	"clients/partial-edit-apply.ts": 2,
 	"clients/performance-report.ts": 8,
-	"clients/pipeline.ts": 45,
+	// #3506: 45 -> 61. `runPipeline` awaits its body inside the try whose
+	// finally releases pi's per-file mutation queue (1), `runFormatPhase`
+	// awaits entering that queue before the formatter (1), and each of the
+	// fourteen fixer branches of `runAutofix` awaits entering it after its
+	// own resolver and before its writer (14; review round 1 moved the entry
+	// below the availability probes and installs, so those never hold pi's
+	// edits back). The queue wait is the fix (an agent edit of the same file
+	// must finish first); the pipeline itself stays inside the handler's
+	// bounded(). #3576: 61 -> 63. `resyncHeldLspDocument` awaits the lazy LSP
+	// module (1) and the held-only resync (1) of a drain whose session or LSP
+	// service was replaced; it replaces a skipped resync, never spawns, and
+	// each resync is one bounded notify write.
+	// 63 -> 62 (#3558): `runFormatPhase` no longer enters the queue before the
+	// formatter; `formatters.formatFile` enters it after the command
+	// resolution (formatters.ts above gains that await).
+	"clients/pipeline.ts": 62,
 	"clients/project-changes.ts": 2,
 	"clients/project-snapshot.ts": 2,
 	"clients/quiet-window.ts": 6,
@@ -2319,7 +2425,11 @@ const HELPER_UNBOUNDED: Readonly<Record<string, number>> = {
 	"tools/lens-diagnostic-mark.ts": 2,
 	// #2846/#2800: the folded LSP probe adds one awaited internal tool path;
 	// it remains bounded by the tool call lifecycle.
-	"tools/lens-diagnostics.ts": 14,
+	// #3573: `getProjectDiagnosticsSnapshotForFullMode` now awaits the fresh
+	// scan it used to return, to reconcile it before its rows reach the
+	// widget. The same promise `formatFullMode`'s `Promise.all` already
+	// awaited, under the same signal: no new wait.
+	"tools/lens-diagnostics.ts": 15,
 	// #2598 lowered both by one: `collectDiagnosticsForFile` and
 	// `openFileBestEffort` each dropped their `await lspService.openFile(…)`
 	// arm — the fallback for "a service shape without touchFile", which the
@@ -2365,7 +2475,7 @@ const BOUNDED_CALL_SITES: Readonly<Record<string, string>> = {
 		"separate a same-length edit from a `touch`; it is additionally capped by " +
 		"the per-sweep hash budget so the aggregate read is " +
 		"bounded on the count axis too (#2982, defect shape 9).",
-	"call:clients/blocker-freshness.ts#sweepInlineBlockerFreshness:b262cffc~3ca0bfa4":
+	"call:clients/blocker-freshness.ts#sweepInlineBlockerFreshness:b262cffc~b69fb70f":
 		"Same `BlockerFreshnessOptions.signal`. Wraps the whole per-entry " +
 		"`detectSelfDrift` call so an expiry maps to `unverifiable` at one place " +
 		"rather than leaving a half-finished verdict; the inner bounds above are " +
@@ -2397,6 +2507,22 @@ const BOUNDED_CALL_SITES: Readonly<Record<string, string>> = {
 		"abandons auxiliary warmup without gating the edit hook) and defaulted to the " +
 		"ambient signal on the touchFile with-auxiliary path. LSP_SPAWN_BUDGET_MS wall-clock " +
 		"bound is live per server.",
+	"call:clients/lsp/server.ts#NearestRoot:1969971c~30941cd1":
+		"`undefined`, and that is the whole decision: `RootFunction` is " +
+		"`(file: string) => Promise<string | undefined>`, so no hook signal reaches " +
+		"the root detector at all until #2523 AC4 threads one through the LSP deps. " +
+		"The wall clock is the live half, on the edit `tool_result` budget — the " +
+		"hook the per-file touch path runs under, and the only one the contract " +
+		"lets block the host. This is the memo's freshness read: a fired bound " +
+		"resolves `undefined`, which the caller treats as NOT fresh, so the worst " +
+		"case is the marker walk it was trying to skip (#3412 review round 1).",
+	"call:clients/lsp/server.ts#NearestRoot:7cc367bc~c3bf473d":
+		"Same `undefined` signal and the same edit `tool_result` budget as the " +
+		"freshness read above, for the walk's own per-step directory-mtime " +
+		"recording. A fired bound here records the step's directories as " +
+		"unreadable rather than dropping them, so the walk still answers and its " +
+		"answer is simply not memoized — never a partial signature that would hide " +
+		"a later change in the missing directory (#3412 review round 1).",
 	"call:clients/mcp/session.ts#runSessionStart:8d9498e9~c78f4265":
 		"The public MCP session_start result fallback is also wall-bounded; " +
 		"its signal is explicitly absent because MCP has no host abort signal.",

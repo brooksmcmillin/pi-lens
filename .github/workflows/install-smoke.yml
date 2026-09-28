@@ -141,12 +141,14 @@ jobs:
     runs-on: ubuntu-latest
     # refs #3123: bounds a hang against GitHub's 360-min default.
     # No successful run found (job requires github.event_name ==
-    # 'repository_dispatch'; it has failed 3/3 times it has ever run, never
-    # succeeded, across the visible history) -- defaulted to the floor of 10 min
-    # for this single-step job.
+    # 'repository_dispatch'; its 3 runs all failed on a 403 from the comment
+    # POST, fixed in #3151) -- defaulted to the floor of 10 min for this
+    # single-step job.
     timeout-minutes: 10
     permissions:
-      issues: write
+      # #3151: the comment target is a pull request; `issues: write` alone
+      # was refused with 403 "Resource not accessible by integration".
+      pull-requests: write
     steps:
       - name: Record exact-SHA terminal state
         env:
@@ -493,7 +495,10 @@ jobs:
   # mise.run curl + npm backend are external-dep-heavy, and a green cell is not proof
   # of #285 coverage.
   mise-repro:
-    name: mise repro (#285) · ${{ matrix.os }} · ${{ matrix.pi_via }}
+    # "(advisory)" is load-bearing (#3087): this job is continue-on-error on
+    # every event, so its check always concludes success. The suffix is how
+    # scripts/lib/ci-checks.mjs and ci-verdict tell advisory from gating.
+    name: mise repro (#285) · ${{ matrix.os }} · ${{ matrix.pi_via }} (advisory)
     # #3049 review F1, swept (2026-09-15 retro F2): with
     # `if: github.event_name != 'pull_request'` here, moving the
     # `export PATH="$PNPM_HOME/bin:$PATH"` line of "Configure pnpm global bin

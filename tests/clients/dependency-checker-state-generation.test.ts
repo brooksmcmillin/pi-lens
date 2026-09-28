@@ -188,7 +188,13 @@ describe("DependencyChecker shared-state generation guard (#766)", () => {
 				return {
 					status: 0,
 					error: null,
-					stdout: JSON.stringify({ [y]: [path.join(tmp, "z.ts")] }),
+					// madge's real `--circular --json` shape: an array of cycles,
+					// each an array of members. This double used to hand the scan a
+					// GRAPH object, which the scan's own parse then read the same
+					// wrong way — the double agreed with the defect (#3428), so the
+					// generation axis this test owns was being pinned against output
+					// madge never emits.
+					stdout: JSON.stringify([[y, path.join(tmp, "z.ts")]]),
 					stderr: "",
 				};
 			}

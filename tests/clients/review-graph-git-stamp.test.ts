@@ -1,5 +1,4 @@
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -24,7 +23,12 @@ import {
 	getDegradationSummary,
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
-import { removeTempDirSync } from "./test-utils.js";
+import { setupTestEnvironment, useTrackedTempDirs } from "./test-utils.js";
+
+vi.mock("node:fs", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:fs")>();
+	return { ...actual, statSync: vi.fn(actual.statSync) };
+});
 
 // Mock out the expensive file system scanning — we only care about persist/
 // stamp behaviour, not real symbol extraction.
@@ -32,12 +36,8 @@ vi.mock("../../clients/scan-utils.js", () => ({
 	getSourceFiles: vi.fn().mockReturnValue([]),
 }));
 
-const dirs: string[] = [];
-
 function tmpDir(): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-graph-stamp-"));
-	dirs.push(dir);
-	return dir;
+	return setupTestEnvironment("pi-lens-graph-stamp-").tmpDir;
 }
 
 /** Minimal hand-built `.git` (normal, non-worktree) repo — no git binary needed. */
@@ -81,16 +81,33 @@ beforeEach(() => {
 	previousDataDir = process.env.PILENS_DATA_DIR;
 });
 
+// A build queues a persist into the project's data dir; the drain lets it
+// land before the root is removed.
+useTrackedTempDirs("pi-lens-graph-stamp-");
+
 afterEach(() => {
-	for (const dir of dirs.splice(0)) {
-		removeTempDirSync(dir);
-	}
 	if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
 	else process.env.PILENS_DATA_DIR = previousDataDir;
 	vi.restoreAllMocks();
 });
 
 describe("review-graph snapshot git stamp (#300)", () => {
+	it("resolves git identity once per cwd within one build (#3417)", async () => {
+		const cwd = tmpDir();
+		process.env.PILENS_DATA_DIR = path.join(cwd, "data");
+		makeFakeRepo(cwd, "a".repeat(40));
+		const stat = vi.spyOn(fs, "statSync");
+
+		// #3417 recurrence: persistence/checkpoint/revision checks must not turn
+		// one build into repeated upward `.git` walks.
+		await buildOrUpdateGraph(cwd, [], new FactStore());
+
+		const gitEntryChecks = stat.mock.calls.filter(([file]) =>
+			String(file).endsWith(`${path.sep}.git`),
+		);
+		expect(gitEntryChecks).toHaveLength(1);
+	});
+
 	it("persists a stamp in a git repo and reloads warm when HEAD is unchanged", async () => {
 		const cwd = tmpDir();
 		const dataDir = path.join(cwd, "data");
@@ -401,6 +418,24 @@ describe("review-graph snapshot git stamp (#300)", () => {
 
 		clearReviewGraphWorkspaceCache();
 		await expect(buildOrUpdateGraph(cwd, [], facts)).resolves.toBeDefined();
+	});
+
+	it("revalidates git repository lifecycle changes within one process (#3417)", () => {
+		const cwd = tmpDir();
+
+		// Regression for #3417: a negative lookup must not hide a repository
+		// initialized later in the same process.
+		expect(resolveGitIdentity(cwd)).toBeUndefined();
+		makeFakeRepo(cwd, "a".repeat(40));
+		expect(resolveGitIdentity(cwd)).toEqual({
+			headCommit: "a".repeat(40),
+			worktreeRoot: path.resolve(cwd).replace(/\\/g, "/"),
+		});
+
+		// The inverse lifecycle direction is equally important: a positive
+		// lookup must not survive removal of the repository metadata.
+		fs.rmSync(path.join(cwd, ".git"), { recursive: true });
+		expect(resolveGitIdentity(cwd)).toBeUndefined();
 	});
 
 	it("malformed .git file / unreadable HEAD is treated as non-git (no throw)", () => {

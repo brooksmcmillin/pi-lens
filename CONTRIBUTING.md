@@ -26,8 +26,11 @@ Pull requests must pass `npm run lint`. Run targeted test files for touched seam
 
 `npm install` wires Husky-managed hooks:
 
-- **pre-commit** — changelog fragment validation (`npm run changelog:check`)
-  plus `npm run lint`. Measured around 5.5s on this repo.
+- **pre-commit** — `npm run check:lockfile`, then changelog fragment
+  validation (`npm run changelog:check`), then `npm run lint`. Also refuses to
+  commit a staged handoff file (`PR_BODY.md`, `COMMIT_MSG.txt`, `REVIEW.md`,
+  `INVESTIGATION.md`, `MONITOR.md`) before running any of the above — `git rm
+  --cached` it and retry (#2807). Measured around 5.5s on this repo.
 - **pre-push** — a build, then targeted `vitest` runs for the changed `.ts`
   files (never the full suite; see `scripts/pre-push-targeted-tests.mjs`).
   Waits at most 2 minutes on the shared machine-wide test-suite lock
@@ -51,6 +54,32 @@ their commit cadence across concurrent worktrees is too high for a lint pass
 on every commit, and CI runs the real gates anyway. Humans committing
 directly should leave hooks on; they catch the exact class of failure
 (unused vars, changelog-format violations) that used to slip through to CI.
+
+An agent driven through Claude Code also runs under a `PreToolUse` hook on
+every `Bash` call, `scripts/hooks/guard-bash.mjs` (wired in
+`.claude/settings.json`), which denies `git stash` in any form, a `git reset
+--soft`/`--hard`, a hand-typed `git worktree remove` with two force flags (use
+`node scripts/prune-agent-worktrees.mjs` instead), any `git worktree remove`
+on a worktree whose `node_modules` is a symlink pointing outside it, an
+unpinned `node` probe that loads built runtime code from `clients/`/`dist/`
+without a `PI_LENS_HOME` pin, and a `TMPDIR`/`TMP`/`TEMP` aimed at the vitest
+harness's own home. It exists so these six rules (previously prose-only) are
+mechanically enforced rather than relied on.
+
+## Other tooling
+
+- **Test workers.** `PI_LENS_TEST_MAX_WORKERS` caps the vitest worker-fork
+  count (`vitest.config.ts`); set it (`=6` is what CI and agent worktrees use)
+  on a memory-constrained host to avoid an OOM under a full or targeted run.
+- **Mutation testing.** `npm run mutation:diff` runs Stryker over only the
+  lines changed against `origin/master` (`scripts/stryker-diff.mjs
+  --base origin/master --max-files 6`), bounded to a
+  `--budget-minutes`/`MUTATION_BUDGET_MINUTES` wall-clock budget (60 minutes
+  by default). See "Mutation output is quoted, not ticked" in `AGENTS.md` for
+  when a mutation proof is required.
+- **Release QA.** `node scripts/release-qa.mjs` runs the pre-release
+  readiness pass documented in `docs/release-qa-baseline.md` and
+  `.claude/skills/release-qa/SKILL.md`; there is no `npm run` alias.
 
 ## What belongs here?
 

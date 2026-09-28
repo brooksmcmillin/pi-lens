@@ -20,7 +20,7 @@ import { detectFileKind, KIND_EXTENSIONS } from "../file-kinds.js";
 import { detectFileRole } from "../file-role.js";
 import { getProjectDataDir } from "../file-utils.js";
 import { collectUntrackedIgnoredIds } from "../git-tracked-ignore.js";
-import { realIsPidAlive } from "../instance-reaper.js";
+import { isStaleStageFile } from "../instance-reaper.js";
 import { logLatency } from "../latency-logger.js";
 import {
 	containerNameChain,
@@ -68,7 +68,12 @@ import {
 } from "../tree-sitter-symbol-extractor.js";
 import { withTreeSitterRoot } from "../tree-sitter-shared.js";
 import { incrementDegradationCount } from "../degradation-ledger.js";
-import { resolveGitIdentity } from "./git-identity.js";
+import {
+	createGitIdentityResolver,
+	resolveGitIdentity,
+	type GitIdentityResolver,
+} from "./git-identity.js";
+
 import {
 	formatReviewGraphRevisionDriftNote,
 	type ReviewGraphRevisionDrift,
@@ -953,19 +958,22 @@ export function getReviewGraphCacheIdentity(
 // path, that assumption silently breaks. This doesn't hard-fail (the issue
 // is explicit: log-once observability is enough) — it just makes the
 // assumption visible. The Set records every cwd whose check has RUN (not just
-// mismatches), so resolveGitIdentity's fs reads happen once per cwd per
-// process — zero per-build cost after the first, mismatch or not.
+// mismatches), so a build-local resolver keeps repeated checks in one build
+// bounded without retaining repository presence across builds.
 const _cwdWorktreeCheckedCwds = new Set<string>();
 
 export function _resetCwdWorktreeMismatchLogForTests(): void {
 	_cwdWorktreeCheckedCwds.clear();
 }
 
-function logCwdWorktreeMismatchOnce(cwd: string): void {
+function logCwdWorktreeMismatchOnce(
+	cwd: string,
+	resolveIdentity: GitIdentityResolver = resolveGitIdentity,
+): void {
 	const key = normalizeMapKey(cwd);
 	if (_cwdWorktreeCheckedCwds.has(key)) return;
 	_cwdWorktreeCheckedCwds.add(key);
-	const identity = resolveGitIdentity(cwd);
+	const identity = resolveIdentity(cwd);
 	if (!identity) return; // not a git repo — nothing to compare against
 	if (identity.worktreeRoot === normalizeFilePath(path.resolve(cwd))) return;
 	logLatency({
@@ -1788,6 +1796,7 @@ function logSnapshotReadVerdict(
 function loadPersistedGraph(
 	cwd: string,
 	opts?: { verifyWorktreeIdentity?: boolean; allowPartial?: boolean },
+	resolveIdentity: GitIdentityResolver = resolveGitIdentity,
 ): {
 	signature: string;
 	fileSignatures: Map<string, string>;
@@ -1839,7 +1848,7 @@ function loadPersistedGraph(
 		// "can't verify," not a mismatch, so it does not drop the snapshot.
 		let stampedHead: string | undefined;
 		if (opts?.verifyWorktreeIdentity && data.gitStamp) {
-			const current = resolveGitIdentity(cwd);
+			const current = resolveIdentity(cwd);
 			if (current && current.worktreeRoot !== data.gitStamp.worktreeRoot) {
 				logSnapshotReadVerdict(
 					cwd,
@@ -2547,11 +2556,14 @@ function resolvePersistWorkerPath(): string | undefined {
 	// the bundled dist/index.js a sibling ./persist-worker.js resolves beside
 	// the BUNDLE where nothing exists (#950 review F1 — the worker silently
 	// never ran in production). Try the compiled-sibling layout first (source
-	// checkout / unbundled dist/clients tree), then the dist-tree path
-	// relative to the bundle entry.
+	// checkout / tsc emit), then the bundled worker entry (#3219:
+	// dist/workers/, never the unbundled dist/clients tree, which the package
+	// no longer ships) — from dist/index.js or a dist/ chunk, then from a bin
+	// under dist/mcp/.
 	const candidates = [
 		new URL("./persist-worker.js", import.meta.url),
-		new URL("./clients/review-graph/persist-worker.js", import.meta.url),
+		new URL("./workers/review-graph-persist-worker.js", import.meta.url),
+		new URL("../workers/review-graph-persist-worker.js", import.meta.url),
 	];
 	for (const url of candidates) {
 		try {
@@ -2703,24 +2715,10 @@ function ensurePersistExitHook(): void {
 // artifact-specific pass.
 //
 // Liveness: an entry whose embedded stage pid is still alive belongs to a
-// concurrent healthy owner (or to us) and is skipped, reusing the reaper's
-// conservative `realIsPidAlive` (ESRCH-only-means-dead) rather than inventing
-// a second liveness probe. A recycled pid can therefore leave one stale stage
-// file behind instead of destroying a live one — deliberately the safe
-// direction; a later process whose pid table has moved on sweeps it.
+// concurrent healthy owner (or to us) and is skipped, through the reaper's
+// shared `isStaleStageFile` (the project snapshot sweeps with it too, #3510).
 const _sweptStageDirs = new Set<string>();
 const REVIEW_GRAPH_ARTIFACT_PREFIX = "review-graph.";
-const STAGE_PID_PATTERN = /\.stage-(\d+)-/;
-
-/** True only for a review-graph stage artifact left behind by a dead process. */
-function isStaleReviewGraphStageFile(entry: string): boolean {
-	if (!entry.startsWith(REVIEW_GRAPH_ARTIFACT_PREFIX)) return false;
-	const match = STAGE_PID_PATTERN.exec(entry);
-	if (!match) return false;
-	const pid = Number(match[1]);
-	if (pid === process.pid) return false; // our own live stage file
-	return !realIsPidAlive(pid);
-}
 
 function sweepStaleStageFiles(cacheDir: string): void {
 	if (_sweptStageDirs.has(cacheDir)) return;
@@ -2728,7 +2726,7 @@ function sweepStaleStageFiles(cacheDir: string): void {
 	fs.readdir(cacheDir, (err, entries) => {
 		if (err) return;
 		for (const entry of entries) {
-			if (!isStaleReviewGraphStageFile(entry)) continue;
+			if (!isStaleStageFile(entry, REVIEW_GRAPH_ARTIFACT_PREFIX)) continue;
 			fs.rm(path.join(cacheDir, entry), { force: true }, () => {});
 		}
 	});
@@ -2750,6 +2748,7 @@ function persistGraph(
 		projectSeq?: number;
 		seqHint?: boolean;
 		mode?: ReviewGraphBuildMode;
+		resolveIdentity?: GitIdentityResolver;
 		sourceFileCount?: number;
 		sourceFilesTruncated?: boolean;
 		sourceFilePaths?: Iterable<string>;
@@ -2805,11 +2804,11 @@ function persistGraph(
 	const cacheDir = path.join(getProjectDataDir(cwd), "cache");
 	const cachePath = path.join(cacheDir, GRAPH_CACHE_FILENAME);
 	sweepStaleStageFiles(cacheDir);
-	// #300: resolve the git stamp fresh at persist time (HEAD changes on
-	// commit/checkout, so it isn't cached like the gitdir location — but these
-	// are plain fs reads, cheap even called per-persist). undefined for
+	// #300: resolve the git stamp at persist time. The build-local resolver
+	// deduplicates repeated checks within this build, while a later build gets a
+	// fresh lifecycle view. undefined for
 	// non-git cwds, which serializes as `gitStamp: undefined` → omitted key.
-	const gitStamp = resolveGitIdentity(cwd);
+	const gitStamp = (options.resolveIdentity ?? resolveGitIdentity)(cwd);
 	// Retain the immutable snapshot inputs and build their O(graph) serializable
 	// arrays only after the quiet window. Replacing a pending entry during an edit
 	// burst now avoids both serialization and the pre-serialization full copies.
@@ -2999,6 +2998,7 @@ function buildReviewGraphCheckpointData(
 	processedHashes: Map<string, string>,
 	targetFileCount: number,
 	ignoredIds: ReadonlySet<string> | undefined,
+	resolveIdentity: GitIdentityResolver = resolveGitIdentity,
 ): ReviewGraphCheckpointData {
 	return {
 		version: REVIEW_GRAPH_VERSION,
@@ -3009,7 +3009,7 @@ function buildReviewGraphCheckpointData(
 		ignoredIdsHash: hashIgnoredIds(ignoredIds),
 		nodes: Array.from(graph.nodes.entries()),
 		edges: graph.edges,
-		gitStamp: resolveGitIdentity(cwd),
+		gitStamp: resolveIdentity(cwd),
 	};
 }
 
@@ -3028,6 +3028,7 @@ function writeReviewGraphCheckpoint(
 	processedHashes: Map<string, string>,
 	targetFileCount: number,
 	ignoredIds: ReadonlySet<string> | undefined,
+	resolveIdentity: GitIdentityResolver = resolveGitIdentity,
 ): void {
 	const generation = (_checkpointGenerations.get(cwd) ?? 0) + 1;
 	_checkpointGenerations.set(cwd, generation);
@@ -3039,6 +3040,7 @@ function writeReviewGraphCheckpoint(
 			processedHashes,
 			targetFileCount,
 			ignoredIds,
+			resolveIdentity,
 		);
 	} catch {
 		return; // best-effort — building the DTO failed, skip this stride
@@ -3162,6 +3164,7 @@ interface LoadedReviewGraphCheckpoint {
  */
 function loadReviewGraphCheckpoint(
 	cwd: string,
+	resolveIdentity: GitIdentityResolver = resolveGitIdentity,
 ): LoadedReviewGraphCheckpoint | null {
 	const checkpointPath = reviewGraphCheckpointPath(cwd);
 	let data: ReviewGraphCheckpointData;
@@ -3190,7 +3193,7 @@ function loadReviewGraphCheckpoint(
 		return null;
 	}
 	if (data.gitStamp) {
-		const current = resolveGitIdentity(cwd);
+		const current = resolveIdentity(cwd);
 		if (current && current.worktreeRoot !== data.gitStamp.worktreeRoot) {
 			logReviewGraph({
 				cwd,
@@ -3287,8 +3290,9 @@ async function tryResumeFromCheckpoint(
 	cwd: string,
 	filesToBuild: string[],
 	ignoredIds: ReadonlySet<string> | undefined,
+	resolveIdentity: GitIdentityResolver = resolveGitIdentity,
 ): Promise<ResumedBuild | null> {
-	const loaded = loadReviewGraphCheckpoint(cwd);
+	const loaded = loadReviewGraphCheckpoint(cwd, resolveIdentity);
 	if (!loaded) return null;
 	if (loaded.ignoredIdsHash !== hashIgnoredIds(ignoredIds)) {
 		logReviewGraph({
@@ -3501,6 +3505,30 @@ export function flushReviewGraphPersist(
 				workerCompleted: false,
 			}),
 		});
+	}
+	// #3536: the generation gate binds the forced write too. The worker serves
+	// requests concurrently, so a newer generation can already have promoted
+	// while this one was in flight; writing it would put the older view back.
+	// persistGraph sets the key's generation before it queues any request and
+	// nothing clears it, so it is defined whenever a candidate exists.
+	const currentGeneration = _persistGenerations.get(key)!;
+	if (pending && pending.generation !== currentGeneration) {
+		logReviewGraph({
+			cwd: key,
+			phase: "persist_skipped",
+			reason: "superseded",
+			observability: persistObservability(pending, {
+				status: "superseded",
+				supersededByGeneration: currentGeneration,
+				reason: "forced_flush_superseded",
+				workerStarted: true,
+				workerCompleted: false,
+			}),
+		});
+		return {
+			ok: false,
+			reason: `queued snapshot generation ${pending.generation} was superseded by generation ${currentGeneration}`,
+		};
 	}
 	if (!pending) {
 		return {
@@ -4988,6 +5016,7 @@ interface IncrementalCtx {
 	/** #694: untracked-AND-ignored ids, fetched once per build — see `_doBuildGraph`. */
 	ignoredIds?: ReadonlySet<string>;
 	cacheEpoch?: number;
+	resolveIdentity?: GitIdentityResolver;
 }
 
 /**
@@ -5127,6 +5156,7 @@ async function tryIncrementalFromCache(
 			projectSeq: ctx.seqAtBuildStart,
 			seqHint: ctx.seqHint,
 			mode: ctx.mode,
+			resolveIdentity: ctx.resolveIdentity,
 		},
 	);
 	setGraphBuildInfo(graph, {
@@ -5170,6 +5200,7 @@ async function trySeqFastpath(
 	seqAtBuildStart: number,
 	ignoredIds?: ReadonlySet<string>,
 	cacheEpoch?: number,
+	resolveIdentity?: GitIdentityResolver,
 ): Promise<SeqFastpathResult> {
 	const cached = _workspaceGraphCache.get(normalizedCwd);
 	// Condition 2: need an in-process entry that recorded a build seq and whose
@@ -5249,6 +5280,11 @@ async function trySeqFastpath(
 	// A pi-observed write can advance projectSeq without changing bytes (format
 	// no-op, save, or an idempotent edit). Confirm content before re-extracting so
 	// the seq fast path does not refresh builtAt or claim graphChanged for drift.
+	// #3535: stat BEFORE any read. A stat taken after the read signs bytes the
+	// graph never saw, and every sweep-path build then serves it as current.
+	const candidateStats = candidateFiles.map(
+		(file) => [file, sourceSignatureEntry(file)] as const,
+	);
 	const { trulyChanged, hashes } = await confirmContentChanged(
 		candidateFiles,
 		cached.fileHashes,
@@ -5265,8 +5301,8 @@ async function trySeqFastpath(
 		// Stamp the seq captured at BUILD START — a bump that raced in during this
 		// build has seq > stamp and is re-diffed next build, never missed.
 		const nextSignatures = new Map(cached.fileSignatures);
-		for (const file of candidateFiles) {
-			nextSignatures.set(file, sourceSignatureEntry(file));
+		for (const [file, stat] of candidateStats) {
+			nextSignatures.set(file, stat);
 		}
 		cached.signature = sourceSignatureFromMap(nextSignatures);
 		cached.fileSignatures = nextSignatures;
@@ -5309,8 +5345,8 @@ async function trySeqFastpath(
 	// those — the whole point of the fast path). Recompute the aggregate signature
 	// the same way the incremental branch does (sourceSignatureFromMap).
 	const nextSignatures = new Map(cached.fileSignatures);
-	for (const file of candidateFiles) {
-		nextSignatures.set(file, sourceSignatureEntry(file));
+	for (const [file, stat] of candidateStats) {
+		nextSignatures.set(file, stat);
 	}
 	const nextSignature = sourceSignatureFromMap(nextSignatures);
 
@@ -5344,6 +5380,7 @@ async function trySeqFastpath(
 			projectSeq: seqAtBuildStart,
 			seqHint: true,
 			mode: "seq-fastpath",
+			resolveIdentity,
 		},
 	);
 	// #459: filesToUpdate was non-empty — this fastpath re-extracted real files,
@@ -5369,6 +5406,7 @@ async function _doBuildGraph(
 	seqHint?: GraphSeqHint,
 	buildId?: number,
 ): Promise<ReviewGraph> {
+	const resolveIdentity = createGitIdentityResolver();
 	const normalizedCwd = normalizeMapKey(cwd);
 	const cacheEpoch = workspaceCacheEpoch(normalizedCwd);
 	// `await undefined` still yields a microtask, which reorders overlapping
@@ -5377,7 +5415,7 @@ async function _doBuildGraph(
 	if (_reviewGraphBuildGateForTests) await _reviewGraphBuildGateForTests();
 	const normalizedChanged = changedFiles.map((file) => normalizeMapKey(file));
 	const normalizedChangedSet = new Set(normalizedChanged);
-	logCwdWorktreeMismatchOnce(cwd);
+	logCwdWorktreeMismatchOnce(cwd, resolveIdentity);
 
 	// #622: reject a cwd that IS (or is an ancestor of) $HOME before any walk is
 	// attempted. The 3 real per-edit callers (dispatch/integration.ts's
@@ -5444,6 +5482,7 @@ async function _doBuildGraph(
 			seqAtBuildStart,
 			await ignoredIdsPromise,
 			cacheEpoch,
+			resolveIdentity,
 		);
 		if ("graph" in fast) return fast.graph;
 		seqFastpathFallback = fast.fallback;
@@ -5590,6 +5629,7 @@ async function _doBuildGraph(
 			seqAtBuildStart,
 			ignoredIds,
 			cacheEpoch,
+			resolveIdentity,
 		});
 		if (incremental) {
 			updateGraphBuildInfo(incremental, { seqFastpathFallback });
@@ -5602,7 +5642,9 @@ async function _doBuildGraph(
 	// #202 content-hash confirm below already content-verify the load, and
 	// dropping on every HEAD move would force a full whole-repo rebuild after
 	// each plain `git commit` (HEAD moves, files unchanged).
-	const diskCached = sourceFilesTruncated ? null : loadPersistedGraph(cwd);
+	const diskCached = sourceFilesTruncated
+		? null
+		: loadPersistedGraph(cwd, undefined, resolveIdentity);
 	if (diskCached?.signature === signature) {
 		const graph = cloneGraph(diskCached.graph);
 		rebuildIndexes(graph);
@@ -5660,6 +5702,7 @@ async function _doBuildGraph(
 				facts,
 				seqAtBuildStart,
 				ignoredIds,
+				resolveIdentity,
 			},
 		);
 		if (incremental) {
@@ -5672,7 +5715,12 @@ async function _doBuildGraph(
 	// present and still current (#936 limit 2), else cold from an empty graph.
 	const resumed = sourceFilesTruncated
 		? null
-		: await tryResumeFromCheckpoint(cwd, filesToBuild, ignoredIds);
+		: await tryResumeFromCheckpoint(
+				cwd,
+				filesToBuild,
+				ignoredIds,
+				resolveIdentity,
+			);
 	const graph = resumed?.graph ?? createEmptyGraph();
 	const filesToExtract = resumed?.remaining ?? filesToBuild;
 	const treeSitterClient = getSharedTreeSitterClient();
@@ -5734,6 +5782,7 @@ async function _doBuildGraph(
 						fileHashes,
 						filesToBuild.length,
 						ignoredIds,
+						resolveIdentity,
 					),
 					{
 						nodes: graph.nodes.size,
@@ -5756,6 +5805,7 @@ async function _doBuildGraph(
 					fileHashes,
 					filesToBuild.length,
 					ignoredIds,
+					resolveIdentity,
 				);
 				filesSinceCheckpoint = 0;
 				lastCheckpointMs = Date.now();
@@ -5864,6 +5914,7 @@ async function _doBuildGraph(
 			mode: "full",
 			sourceFileCount,
 			sourceFilesTruncated,
+			resolveIdentity,
 		},
 	); // fire-and-forget
 	setGraphBuildInfo(graph, {

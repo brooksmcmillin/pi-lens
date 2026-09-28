@@ -712,6 +712,29 @@ const treeSitterRunner: RunnerDefinition = {
 		}
 
 		if (diagnostics.length === 0) {
+			// #3409: zero diagnostics because the language's GRAMMAR never loaded is
+			// not a clean file, and `runQueriesOnFile` returns [] for both. The
+			// honest discriminator, once the run has already demanded the language,
+			// is the client's own loaded-language map: a grammar that could not be
+			// resolved, fetched, or decoded is absent from it. Reported through this
+			// runner's existing "the analysis did not run" arm (the same
+			// `runner_skip` + `status: "skipped"` shape as client-unavailable,
+			// init-failed and unsupported-extension) instead of as a pass with
+			// nothing found — which is what made a degraded language on a compiled
+			// host indistinguishable from a clean file in `runner_complete`.
+			//
+			// The abort term keeps a mid-run WASM abort (#402, its own
+			// `runtime_abort` record) from being misreported as a missing grammar.
+			if (!isTreeSitterWasmAborted() && !client.getLanguage(languageId)) {
+				logTreeSitter({
+					phase: "runner_skip",
+					filePath,
+					languageId,
+					reason: "grammar_unavailable",
+					status: "skipped",
+				});
+				return { status: "skipped", diagnostics: [], semantic: "none" };
+			}
 			logTreeSitter({
 				phase: "runner_complete",
 				filePath,

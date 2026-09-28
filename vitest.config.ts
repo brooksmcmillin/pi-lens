@@ -287,6 +287,15 @@ const timingSensitiveInclude = [
 const lspSpawnHeavyInclude = [
 	"tests/clients/ast-grep-rule-precedence-followups.test.ts",
 	"tests/clients/dispatch/runners/lsp-real-runner.test.ts",
+	// #3501: two real fake-server children (the second a respawn after the
+	// first is SIGKILLed), each through a real initialize handshake, then a
+	// first-diagnostics wait on the replacement — the #1022/#2332 shape.
+	"tests/clients/lsp/crash-respawn-debounce-wire.test.ts",
+	// #3405: its last describe spawns two real fake-server children through
+	// `spawnFakeLspServer` and waits on a real initialize handshake before
+	// asserting which notifications reached the server — the same #1022/#2332
+	// contention class as its lane siblings.
+	"tests/clients/lsp/did-save-notification.test.ts",
 	"tests/clients/lsp/fake-lsp-server-parent-watchdog.test.ts",
 	"tests/clients/lsp/integration.test.ts",
 	"tests/clients/lsp/workspace-diagnostics-language-neutral.test.ts",
@@ -360,6 +369,9 @@ export const wallClockBudgetInclude = [
 	"tests/clients/installer/pip-pep668.test.ts",
 	"tests/clients/installer/posix-group-kill.test.ts",
 	"tests/clients/installer/verify-binary-semantics.test.ts",
+	// #3538/#3539: real children stand for the pids the reaper judges and
+	// kills (flake-shape admission).
+	"tests/clients/instance-reaper-pid-reuse.test.ts",
 	// #2507: a real headless child whose own exit decision is the subject — it
 	// must not drain mid `lsp_diagnostics`, and must still exit by itself
 	// afterwards. Real child spawn (flake-shape admission), and it also spawns a
@@ -388,6 +400,9 @@ export const wallClockBudgetInclude = [
 	"tests/clients/persistent-reverify.test.ts",
 	"tests/clients/pipeline-lsp-sync.test.ts",
 	"tests/clients/project-data-dir-slug.test.ts",
+	// #3510: a real sibling node process with its own pid shares the project
+	// snapshot cache dir (flake-shape admission).
+	"tests/clients/project-snapshot-cross-process.test.ts",
 	"tests/clients/read-expansion-enrichment.test.ts",
 	// #2622: adjacent read-guard stars previously produced exponential regex
 	// backtracking against a long non-matching path; the test measures the real
@@ -402,8 +417,15 @@ export const wallClockBudgetInclude = [
 	"tests/clients/safe-spawn-resource-usage.test.ts",
 	"tests/clients/safe-spawn-timeout-teardown.test.ts",
 	"tests/clients/safe-spawn-windows-command.test.ts",
+	// #3403: real scratch-tree rotation performs cold-disk filesystem work;
+	// measured p95 is 3.63s under six workers and eight CPU hogs, so the 10s
+	// assertion/budget leaves bounded CI scheduling headroom.
+	"tests/clients/sgconfig-scratch-bound.test.ts",
 	"tests/clients/shared-checkout-guard.test.ts",
 	"tests/clients/startup-overhead.test.ts",
+	// #3511 review round 3: the quick-mode warmup witness joins session_start's
+	// background save with vi.waitFor (flake-shape admission).
+	"tests/clients/word-index-lifecycle.test.ts",
 	// #2603 (was #2591 review round 2, F1): the workspace-member matcher's
 	// budget asserts a real elapsed-time bound through detectPythonEnvironment;
 	// the defect it pins is wall-clock (2^N regex backtracking on an interleaved
@@ -448,6 +470,10 @@ export const wallClockBudgetInclude = [
 	// admission).
 	"tests/scripts/lint-js.test.ts",
 	"tests/scripts/lockfile-completeness.test.ts",
+	// #3531: the mutation-report CLI smoke test spawns a real node child to
+	// prove its own argv parsing (--report/--out), not just the exported
+	// render function (flake-shape admission).
+	"tests/scripts/mutation-report-render.test.ts",
 	// #2613 review S2/T3: the drift-notifier CLI's --dry-run env-reading and
 	// report-building wiring is the subject; no in-process double is faithful.
 	"tests/scripts/notify-install-smoke-drift.test.ts",
@@ -459,6 +485,9 @@ export const wallClockBudgetInclude = [
 	// #2613 review S3a: the retry wrapper's real exit code and distinct
 	// `::error::infra:` label on exhaustion are the subject under test.
 	"tests/scripts/npm-retry.test.ts",
+	// #3451: runs the real pre-commit hook through git and xargs (flake-shape
+	// admission).
+	"tests/scripts/pre-commit-hook.test.ts",
 	"tests/scripts/prune-agent-worktrees.test.ts",
 	// #2619 review F1: the release-QA hermeticity canary spawns a REAL child
 	// under scratchEnv() and reads back what that child resolved. The defect it
@@ -475,6 +504,10 @@ export const wallClockBudgetInclude = [
 	// #3322: the Sonar gate CLI's exit codes and rendered stdout/stderr are the
 	// process-boundary contract; keep its real child out of the fork storm.
 	"tests/scripts/sonar-master-gate.test.ts",
+	// #3592 round 2 F1: the driver's own temporal-dead-zone regression only
+	// exists in its real top-level execution order; a real child process
+	// against a throwaway git fixture is the only thing that reproduces it.
+	"tests/scripts/stryker-diff.test.ts",
 	// #2586 review F1: proves the ACTUAL stdout bytes supply-host-provided-deps.mjs
 	// prints (real child process, flake-shape admission).
 	"tests/scripts/supply-host-provided-deps.test.ts",

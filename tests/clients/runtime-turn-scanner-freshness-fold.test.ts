@@ -343,6 +343,20 @@ const FIXTURE_DIR = path.join(
 	import.meta.dirname,
 	"../fixtures/scanner-cache-4.2.1",
 );
+const FIXTURE_ROOT = path.join(import.meta.dirname, "../fixtures");
+
+interface ScannerCacheFieldManifest {
+	version: string;
+	records: Record<string, string[]>;
+}
+
+function loadScannerCacheFieldManifest(
+	directory: string,
+): ScannerCacheFieldManifest {
+	return JSON.parse(
+		fs.readFileSync(path.join(directory, "manifest.json"), "utf-8"),
+	) as ScannerCacheFieldManifest;
+}
 
 function loadFixture<T>(name: string, cwd: string): T {
 	const raw = fs.readFileSync(path.join(FIXTURE_DIR, `${name}.json`), "utf-8");
@@ -350,6 +364,41 @@ function loadFixture<T>(name: string, cwd: string): T {
 }
 
 describe("#1892: scanner cache records written by 4.2.1 still parse and render", () => {
+	it("keeps every versioned scanner-cache fixture within its producer field manifest", () => {
+		// Prevents #3429: a fixture must not claim fields its named version's
+		// client never persisted. The manifest is checked in beside the corpus so
+		// this test remains independent of Git history and the current clients.
+		const directories = fs
+			.readdirSync(FIXTURE_ROOT, { withFileTypes: true })
+			.filter(
+				(entry) =>
+					entry.isDirectory() && entry.name.startsWith("scanner-cache-"),
+			);
+
+		for (const directory of directories) {
+			const fixtureDirectory = path.join(FIXTURE_ROOT, directory.name);
+			const version = directory.name.slice("scanner-cache-".length);
+			const manifest = loadScannerCacheFieldManifest(fixtureDirectory);
+			expect(manifest.version).toBe(version);
+
+			const fixtureNames = fs
+				.readdirSync(fixtureDirectory)
+				.filter((name) => name.endsWith(".json") && name !== "manifest.json")
+				.sort();
+			expect(Object.keys(manifest.records).sort()).toEqual(fixtureNames);
+
+			for (const fixtureName of fixtureNames) {
+				const record = JSON.parse(
+					fs.readFileSync(path.join(fixtureDirectory, fixtureName), "utf-8"),
+				) as Record<string, unknown>;
+				const allowedFields = manifest.records[fixtureName];
+				expect(
+					Object.keys(record).every((field) => allowedFields.includes(field)),
+				).toBe(true);
+			}
+		}
+	});
+
 	// The reader changed, the record did not. A 4.2.1 cache left on disk across
 	// an upgrade must come back field-for-field and still reach the agent — the
 	// failure mode a refactor of the READ path can introduce silently, because

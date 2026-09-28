@@ -91,7 +91,10 @@ import { applyDispositionsMultiFile } from "../diagnostic-dispositions.js";
 import { getKnipIgnorePatterns } from "../file-utils.js";
 import { isAtOrAboveHomeDir, realpathOrResolve } from "../path-utils.js";
 import { isSameOrWithin } from "../lsp/server.js";
-import { incrementDegradationCount } from "../degradation-ledger.js";
+import {
+	incrementDegradationCount,
+	recordDegradationOnce,
+} from "../degradation-ledger.js";
 import { GitleaksClient } from "../gitleaks-client.js";
 import { GovulncheckClient } from "../govulncheck-client.js";
 import {
@@ -129,10 +132,13 @@ export interface FreshProjectDiagnosticsResult {
 	 */
 	analyzed: string[];
 	/**
-	 * File-level authority established by this fetch. A complete entry covers
-	 * every file below `root`; a file-set entry covers only its listed files.
-	 * The legacy `analyzed` list remains the conservative fallback for callers
-	 * that have no coverage entry yet (#2887).
+	 * File-level authority established by this fetch: an entry covers exactly
+	 * the files it lists. An entry is present for every producer that DECLARED
+	 * its coverage this call, so an entry with an EMPTY set means "this producer
+	 * analysed the root and proved zero files" — file-level authority over
+	 * nothing, not absent authority (#2962). The legacy `analyzed` list remains
+	 * the conservative fallback only for runners that declare no coverage at all
+	 * (#2887).
 	 */
 	authoritativeCoverage?: ProjectRunnerCoverage[];
 	/** Extractor ids skipped this run (not applicable / tool unavailable, OR
@@ -417,10 +423,15 @@ export async function fetchFreshProjectDiagnostics(
 	): void {
 		if (analysedRoot) {
 			pushUnique(analyzed, id);
-			if (
-				analysis?.analyzedFiles !== undefined &&
-				analysis.analyzedFiles.length > 0
-			) {
+			// #2962: the entry is pushed on the DECLARATION, not on its size. A
+			// coverage producer that analysed the root and proved zero files is a
+			// third state, distinct from both "covered, file absent from the set"
+			// and "this runner declares no coverage" — and it is the only one of
+			// the three that used to fall through to the whole-root id-only arm in
+			// `runnerRetirementDecision`, retiring findings for files nothing
+			// scanned. The eight non-producer runners pass no `analyzedFiles` at
+			// all and are untouched by this.
+			if (analysis?.analyzedFiles !== undefined) {
 				const root = realpathOrResolve(analysisRoot);
 				authoritativeCoverage.push({
 					runnerId: id,
@@ -431,6 +442,17 @@ export async function fetchFreshProjectDiagnostics(
 						}),
 					),
 				});
+				if (analysis.analyzedFiles.length === 0) {
+					// Bounded at one row per (producer, root) per session: the kept
+					// finding is otherwise indistinguishable from a healthy run, and
+					// "the only coverage producer proved nothing" is the fact an
+					// operator needs when mode=full keeps showing a stale finding.
+					recordDegradationOnce({
+						kind: "runner-coverage-empty",
+						subject: `${id}:${root}`,
+						reason: `${id} analysed this root but declared zero scanned files, so retained ${id} findings are kept rather than retired`,
+					});
+				}
 			}
 		}
 		timings[id] = (timings[id] ?? 0) + elapsedMs;

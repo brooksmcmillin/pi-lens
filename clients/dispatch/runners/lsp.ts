@@ -14,6 +14,7 @@
 
 import { logExtension } from "../../extension-log.js";
 import { getLspCapableKinds } from "../../language-policy.js";
+import { exceedsLspSyncLimits } from "../../lsp/content-limits.js";
 import { touchCoverageGap } from "../../lsp/diagnostic-binding.js";
 import { getLSPService } from "../../lsp/index.js";
 import { LSP_SERVERS } from "../../lsp/server.js";
@@ -39,8 +40,6 @@ import {
 } from "../../warm-attach.js";
 import { contentHash, WARM_CODE_ACTION_LOOKUP_LIMIT } from "../../mcp/ipc.js";
 
-const LSP_MAX_FILE_BYTES = RUNTIME_CONFIG.pipeline.lspMaxFileBytes;
-const LSP_MAX_FILE_LINES = RUNTIME_CONFIG.pipeline.lspMaxFileLines;
 const LSP_SPAWN_BUDGET_MS = RUNTIME_CONFIG.pipeline.lspSpawnBudgetMs;
 
 // Diagnostics-wait cap for the dispatch lsp-runner. Bounded so a slow LSP
@@ -164,14 +163,18 @@ const lspRunner: RunnerDefinition = {
 		let deferredServerIds: readonly string[] = [];
 		let usedWarmAttach = false;
 		let failureReason = "";
+		// #3481: when the synced bytes were read, for the notify queue's order.
+		const readStamp = performance.now();
 		const content = readFileContent(ctx.filePath);
 		if (!content) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
-		const sizeBytes = Buffer.byteLength(content, "utf-8");
-		const lineCount = content.split("\n").length;
-		if (sizeBytes > LSP_MAX_FILE_BYTES || lineCount > LSP_MAX_FILE_LINES) {
+		// #3405 r2: was an inline second copy of the pipeline's byte/line
+		// predicate. One module owns the bound now (M3406-1's root cause was that
+		// a third writer could be added with neither copy); the SKIP is still this
+		// runner's own policy.
+		if (exceedsLspSyncLimits(content).tooLarge) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
@@ -217,6 +220,7 @@ const lspRunner: RunnerDefinition = {
 						maxClientWaitMs: LSP_SPAWN_BUDGET_MS,
 						maxDiagnosticsWaitMs: LSP_DIAGNOSTICS_WAIT_MS,
 						source: "dispatch-lsp-runner",
+						readStamp,
 					});
 			if (touched === undefined) {
 				lspClientReady = false;

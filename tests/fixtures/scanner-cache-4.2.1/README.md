@@ -12,3 +12,8 @@ drives the real `CacheManager.readCache` + real `handleTurnEnd` over them.
 temp root, writes the sibling `.meta.json` (the TTL stamp is wall-clock, so a
 committed one would always read stale) and reads them back through the real
 reader.
+
+`manifest.json` is the checked-in 4.2.1 producer-field manifest. It records the
+fields each named client could persist at that version; in particular,
+`analyzedFiles` is intentionally absent because none of the three v4.2.1 client
+sources wrote it.

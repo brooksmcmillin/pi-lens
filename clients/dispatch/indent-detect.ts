@@ -21,7 +21,14 @@ export function detectIndentation(content: string): Indentation | undefined {
 		.map((line) => line.match(/^ +(?=\S)/)?.[0].length ?? 0)
 		.filter((count) => count > 0);
 
-	if (tabs === 0 && spaceCounts.length === 0) return DEFAULT_INDENTATION;
+	if (tabs === 0 && spaceCounts.length === 0) {
+		// The formatter gate uses the shared hasDetectableIndentation predicate. If
+		// that predicate fired but structural masking removed every candidate line,
+		// there is no style to pin and the caller must take the #3038 skip valve
+		// instead of imposing the default width. Keep the historical default for
+		// content with no raw indentation, whose callers never enter this path.
+		return hasDetectableIndentation(content) ? undefined : DEFAULT_INDENTATION;
+	}
 	if (tabs > spaceCounts.length) return { style: "tab", width: 1 };
 	if (spaceCounts.length > tabs) {
 		const minimum = Math.min(...spaceCounts);

@@ -124,12 +124,27 @@ export type DegradationKind =
 	 */
 	| "bash-view-clipped"
 	| "biome-explain-unavailable"
+	/**
+	 * #3594: `acquireBoundedPidFileLock`'s wait (the durable-store sync
+	 * waiter) was skipped because the same top-generation holder an earlier
+	 * wait ran out on is still there. The call falls back at once, same as
+	 * a timed-out wait — throwing, or returning `null` under `skip-log`.
+	 * Once per session; subject is the lock's generation directory.
+	 */
+	| "bounded-pid-lock-wait-skipped"
 	| "bus-stale"
 	| "cache-usage-attribution-stale"
 	| "cascade-budget-override-disarmed"
 	/** Deferred cascade admission reached its bounded in-memory queue. */
 	| "cascade-pending-cap"
 	| "cascade-tier3-backlog-evicted"
+	/**
+	 * #3511: the change-log lock stayed held past its bounded wait (or its
+	 * directory failed), so a mutation's seq was allocated and appended without
+	 * it, and that runtime stops stamping fresh snapshots until its next seed.
+	 * Subject is the change-log path.
+	 */
+	| "change-log-lock-unavailable"
 	/**
 	 * A per-file touch skipped a language server because that server is in the
 	 * breaker cooldown or is latched permanently broken (#1743). During an
@@ -260,6 +275,27 @@ export type DegradationKind =
 	 */
 	| "generation-guard-stale-write"
 	/**
+	 * #3476: a generation-lock holder (the bounded, quarantine or installer
+	 * lock) backed off because that lock's pre-generation file is held: by a
+	 * writer from an older version, or by this version's own holder whose
+	 * generation outlived the lease. Once per acquisition. Subject is the old
+	 * lock's path.
+	 */
+	| "generation-lock-legacy-held"
+	/**
+	 * #3476: a generation-lock acquisition (the bounded, quarantine or
+	 * installer lock) took over a generation whose holder was dead or past the
+	 * lock's lease. Subject is the generation directory.
+	 */
+	| "generation-lock-stale-takeover"
+	/**
+	 * #3578: a sync generation-lock wait (the change-log and snapshot cache
+	 * locks) was skipped because the holder an earlier wait ran out on is
+	 * still inside. The call fell back as a timed-out wait does. Once per
+	 * session; subject is the lock directory.
+	 */
+	| "generation-lock-wait-skipped"
+	/**
 	 * Failed-first test state was retired only after ENOENT/ENOTDIR evidence,
 	 * retained when the filesystem probe was indeterminate, or evicted at the
 	 * state cap (#2044). Subject is outcome + runner + bounded path, so repeated
@@ -304,6 +340,16 @@ export type DegradationKind =
 	 */
 	| "hook-handler-crash"
 	/**
+	 * #3506: the pi host adapter could not reach pi's `withFileMutationQueue`
+	 * (the host SDK import failed, exported no such function, or loaded a
+	 * second copy of the package whose `SessionManager` is not the host's), so
+	 * pi-lens' own format and autofix writers run outside pi's per-file queue
+	 * and can race a parallel agent edit of the same file. Subject is
+	 * `withFileMutationQueue`, recorded ONCE: the lookup is resolved once per
+	 * process.
+	 */
+	| "host-file-mutation-queue-unavailable"
+	/**
 	 * #3246: a live inline-blocker record re-served at turn end carried no
 	 * structured diagnostics, so the shared finding policy had no identity to
 	 * anchor a stored disposition against and the record's rendered summary was
@@ -317,17 +363,69 @@ export type DegradationKind =
 	 * (`runtime-tool-result.ts`); a row here names a producer that did not.
 	 */
 	| "inline-blocker-unstructured"
+	/**
+	 * #3515: the install lock's generation was no longer owned when
+	 * `installNpmTool` re-checked right before a second critical write (the
+	 * ERESOLVE `--legacy-peer-deps` retry spawn) — a competing installer
+	 * judged this hold stale and took over. The heartbeat that keeps the
+	 * generation's mtime fresh for the whole hold is what USUALLY prevents
+	 * this; this fires only on the tick it missed. Subject is the tool id,
+	 * once per session (`recordDegradationOnce`) since the same install
+	 * cannot lose the lock twice in one attempt.
+	 */
+	| "install-lock-lost-mid-install"
 	| "install-retry-exhausted"
+	/**
+	 * #3311: a command the resolution ladder found on PATH failed the registry
+	 * entry's own check (`checkArgs`) with a verdict, so PATH was ignored for that
+	 * tool and the rungs below it (including the managed install) were tried
+	 * instead. The two shipped members: rustup's `rust-analyzer` proxy on a box
+	 * with no `rust-analyzer` component installed, and a pipx-installed
+	 * `cmake-language-server` whose venv resolved pygls 2. Subject is the tool id,
+	 * recorded once per session — the condition is a property of the box, not of
+	 * the call.
+	 */
+	| "installer-path-candidate-unrunnable"
 	| "installer-verification-inconclusive"
 	| "installer-verification-output-truncated"
 	/** A busy notify-stall discriminator was deferred; detail is rising-edge bounded. */
 	| "instance-registry-corrupt"
+	/**
+	 * #3498: the removal `deregisterInstance` queued took the registry lock
+	 * and ran, whether or not the entry was still there. A queued removal
+	 * with no landed record was lost (host exit, or the lock never came).
+	 * Subject is this process's pid.
+	 */
+	| "instance-registry-deregister-landed"
+	/**
+	 * #3498: `deregisterInstance`'s sync removal could not take the registry
+	 * lock, so the removal was queued on the registry tail behind the holder.
+	 * Subject is this process's pid.
+	 */
+	| "instance-registry-deregister-queued"
 	/**
 	 * #3071: a registration-record write fell back to the process cwd because
 	 * the session's identity carried no `projectRoot` — `instance-registry.ts`
 	 * still records the child, just without the caller-supplied root.
 	 */
 	| "instance-registry-identity-fallback"
+	/**
+	 * #3476: a registry-lock acquisition hit a filesystem error other than
+	 * contention (e.g. EACCES on a root-owned `<registry>.locks/`); the write
+	 * was skipped instead of throwing. Subject is the resolved lock target.
+	 */
+	| "instance-registry-lock-failed"
+	/**
+	 * #3476: a registry-lock holder backed off because the pre-generation
+	 * `<registry>.lock` file is held by a live writer from an older version.
+	 * Subject is that lock file's resolved path.
+	 */
+	| "instance-registry-lock-legacy-held"
+	/**
+	 * #3476: a registry-lock acquisition took over a generation whose holder
+	 * was dead or past the 5 s lease. Subject is the resolved lock target.
+	 */
+	| "instance-registry-lock-stale-takeover"
 	/**
 	 * #3071: a registry-file lock acquisition exhausted its retry budget
 	 * (`instance-registry-lock.ts`'s `recordLockTimeout`). Subject is the
@@ -340,6 +438,26 @@ export type DegradationKind =
 	 * synthesizes a minimal host entry so the child stays tracked.
 	 */
 	| "instance-registry-registration-missing"
+	/**
+	 * #3498: a registration made before `deregisterInstance` reached its
+	 * intent or its write after it, and dropped itself. Subject is the
+	 * normalized root it would have registered.
+	 */
+	| "instance-registry-registration-superseded"
+	/**
+	 * #3383: a newline-framed reader (`createWarmIpcLineReader`) discarded an
+	 * unterminated line that had grown past `MAX_FRAMED_LINE_BYTES`. The peer is
+	 * either broken or hostile: before this bound, one `buffer += chunk` per
+	 * `data` event grew a single JS string with no ceiling — a 64 MiB
+	 * newline-free reply measured +929 MiB of heap and ended only when the
+	 * request's own timeout fired. Subject is the reader's label
+	 * (`mcp-stdio`, `mcp-warm-server`, `warm-attach-server`,
+	 * `warm-diagnostics-reply`, `warm-analyze-reply`) — a fixed set of five, so
+	 * the ledger stays bounded however often a peer misframes. Counted: a peer
+	 * that misframes once usually misframes every request, and the tally is what
+	 * identifies it.
+	 */
+	| "ipc-frame-overflow"
 	/**
 	 * #2042: a kill-by-raw-pid was REFUSED because `/proc/<pid>/status` showed
 	 * the pid alive under a different parent — someone else's process. Subject
@@ -395,8 +513,20 @@ export type DegradationKind =
 	 */
 	/** A retired LSP diagnostics call was redirected to lens_diagnostics. */
 	| "lsp-diagnostics-compatibility"
+	| "lsp-diagnostics-file-too-large"
 	| "lsp-diagnostics-timeout"
 	| "lsp-diagnostics-unsupported"
+	/**
+	 * #3405: a `textDocument/didSave` was sent WITHOUT its `text` to a server
+	 * that negotiated `includeText: true`, because the document exceeded the
+	 * shared `exceedsLspSyncLimits` bound. The save itself still went out (the
+	 * server already received these exact bytes in the didOpen/didChange it
+	 * follows), so this is a dropped redundancy, not a dropped notification.
+	 * Subject is the server id and `recordDegradationOnce` keeps it at one row
+	 * per server per session — never one per edit, which is what a per-save
+	 * record on a large file would be.
+	 */
+	| "lsp-did-save-text-omitted"
 	/**
 	 * #3071: a live client's `onDrift` observer fired for a real resync or a
 	 * pacing-deferred heal (never for `unchanged`/`vanished`/`unheld`
@@ -405,6 +535,14 @@ export type DegradationKind =
 	 */
 	| "lsp-document-drift"
 	| "lsp-document-send-order"
+	/**
+	 * #3541: an LSP workspace edit computed from a read of a file met other
+	 * bytes on disk when its turn in pi's mutation queue came (an agent edit
+	 * landed in between), so it was refused before any write rather than
+	 * applied at stale positions. Subject is the file path;
+	 * `incrementDegradationCount` keeps one bounded entry per file.
+	 */
+	| "lsp-edit-stale-content"
 	| "lsp-liveness-probe-unsupported"
 	/**
 	 * A pi-lens `tool_call` handler threw. pi's `emitToolCall` has no
@@ -572,6 +710,19 @@ export type DegradationKind =
 	 * `clients/installer/index.ts`'s `recordArchiveExtractionDegradation`.
 	 * Subject is `<toolId>:<format>`, reason names the extraction failure.
 	 */
+	/**
+	 * #3436: madge's `--warning` is inert under `--json` (its CLI gates the flag
+	 * on `!program.json`) and, ungated, prints the skip list to STDOUT where it
+	 * would corrupt the parsed JSON — so neither madge lane (the turn-end
+	 * `checkFilesBatch` and the session-start `scanProject`) can see which LOCAL
+	 * files madge failed to resolve, and such a file could hide a cycle.
+	 * Recorded from `parseMadgeCycles`, the one reader both lanes pass through,
+	 * ONCE per session/root (`recordDegradationOnce`), because the gap is a
+	 * property of the argv, not of any one scan. Subject is the project root.
+	 * Replaces the removed `parseMadgeSkips`/`localSkips` discriminator, which
+	 * was structurally always zero.
+	 */
+	| "madge-skip-visibility-unavailable"
 	| "managed-tool-install"
 	| "managed-tool-refresh"
 	/** A complete MCP result exceeded the hard input budget (#2848). */
@@ -589,6 +740,14 @@ export type DegradationKind =
 	 */
 	| "mode-suppression"
 	| "native-read-clipped"
+	/**
+	 * #3524: the file moved between a native read's tool_call and its
+	 * tool_result, so the read is recorded from the text pi delivered and
+	 * FileTime keeps the tool_call's stamp. Subject is the file, counted per
+	 * occurrence (`incrementDegradationCount`): a writer racing the agent's
+	 * reads repeatedly shows as a rising count.
+	 */
+	| "native-read-raced-writer"
 	/**
 	 * A shell-out runner's tool DID produce output, exited nonzero, and the
 	 * runner's parser extracted ZERO diagnostics from it (#1948). The adjacent
@@ -646,6 +805,23 @@ export type DegradationKind =
 	 * (#1857 class sweep).
 	 */
 	| "path-variant-unresolved"
+	/**
+	 * #3311: a registry entry declares `pipConstraints`, but the constraints file
+	 * the pip ladder hands to `PIP_CONSTRAINT` could not be written. The install
+	 * then proceeds UNCONSTRAINED — the pre-#3311 resolution — so this row is the
+	 * only place that says the declared bound was not in force. Subject is the
+	 * tool id.
+	 */
+	| "pip-constraint-file-unwritable"
+	/**
+	 * #3311 round 2: a registry entry declares `pipConstraints`, but every
+	 * candidate directory for the constraints file has whitespace in its path.
+	 * `PIP_CONSTRAINT`/`UV_CONSTRAINT` both carry a whitespace-separated LIST, so
+	 * such a path is not a path to either resolver — uv fails the install
+	 * outright. The install then proceeds UNCONSTRAINED, and this row is the only
+	 * place that says the declared bound was not in force. Subject is the tool id.
+	 */
+	| "pip-constraint-path-unusable"
 	| "pip-install-strategy-succeeded"
 	| "pip-pep668-strategy-refused"
 	/**
@@ -664,6 +840,13 @@ export type DegradationKind =
 	 * `recordDegradation`. One entry per family per process.
 	 */
 	| "process-singleton-reset"
+	/**
+	 * #3509: the project snapshot's cache-dir lock stayed held past its bounded
+	 * wait (or its directory failed), so an admission meta write was skipped or
+	 * a body promotion was dropped as a failed persist. Subject is the gz body
+	 * path; reason names which of the two.
+	 */
+	| "project-snapshot-lock-unavailable"
 	/**
 	 * The orphan backstop's OWN process-table scanner blew the scan timeout and
 	 * had to be tree-killed (#1864 review F3). Reason carries the kill verdict,
@@ -801,6 +984,18 @@ export type DegradationKind =
 	 */
 	| "runner-collect-later"
 	/**
+	 * #2962: a project-runner COVERAGE PRODUCER analysed the analysis root and
+	 * declared zero scanned files (`AnalysedRootSignal.analyzedFiles === []` —
+	 * today only `OpengrepClient`, e.g. a complete report whose `paths.scanned`
+	 * is empty because no rule language matched). Its retained findings are
+	 * therefore KEPT rather than retired: nothing was scanned, so nothing was
+	 * proved gone. Without this row that kept finding is indistinguishable from
+	 * a healthy mode=full run that simply re-found it — the same clean-vs-did-
+	 * not-look discrimination `runner-empty-result` makes for shell-out runners.
+	 * Subject is `<runnerId>:<analysisRoot>`, once per session per pair.
+	 */
+	| "runner-coverage-empty"
+	/**
 	 * `ndjson-logger.ts`'s shared file-sink lost a write even after its one
 	 * reopen-and-retry (#1970) — the pi-analyze #15 shape, catching the
 	 * `ERR_STREAM_DESTROYED` writes that were vanishing silently after a sink
@@ -856,7 +1051,16 @@ export type DegradationKind =
 	 * the per-kind entry bound is reached.
 	 */
 	| "runner-parsed-nothing"
-	/** Windows/libuv cannot self-send SIGHUP after console-close cleanup. */
+	/**
+	 * The self-signal re-raise at the end of `installLifetimeCleanup`'s signal
+	 * handler did not happen, so the host exits without the signal's default
+	 * disposition. Two metadata `reason`s: `unsupported` — declined in advance,
+	 * the measured Windows/libuv case where `process.kill(pid, "SIGHUP")` after
+	 * console-close cleanup throws ENOSYS (#3239) — and `refused` (#3383), the
+	 * attempt itself throwing on any other platform/signal/errno pair. Subject
+	 * is `<platform>:<signal>`, a fixed tiny set. Once per subject: it fires
+	 * while the host is already exiting, so a second row would never be read.
+	 */
 	| "safe-spawn-signal-reraise-unsupported"
 	/** A duplicate RPC session start was suppressed after its first full pass. */
 	/** A self-drift baseline could not be verified within its available evidence. */
@@ -924,6 +1128,14 @@ export type DegradationKind =
 	 */
 	| "snapshot-sequence-read-timeout"
 	/**
+	 * #3511: a runtime's view missed a logged change-log entry at or below its
+	 * seq (a sibling process logged it, or the runtime was seeded at 0 by a
+	 * timed-out read), so its snapshots are stamped incomplete and never
+	 * served fresh until the next seed. Once per session; subject is the
+	 * project root, reason names which.
+	 */
+	| "snapshot-view-incomplete"
+	/**
 	 * A `<script>` body of an HTML file the napi runner was evaluating (#2347)
 	 * refused to parse as JavaScript, so that body contributed no embedded
 	 * findings. Subject is the file path; counted so the totals survive the
@@ -932,6 +1144,41 @@ export type DegradationKind =
 	 * recorded as such, never as a clean empty result.
 	 */
 	| "spawn-failure"
+	/**
+	 * #3375: a spawn's retained output was truncated at its cap. Emitted by
+	 * `safeSpawnAsync` (which, unless a streaming matcher was still waiting, then
+	 * terminated the child) and, since #3383, by the two off-seam accumulators
+	 * that report a producer rather than kill it: the forked analyze worker in
+	 * `clients/mcp/review.ts` and the installer's interpreter user-base probes.
+	 * Subject is the command label (`resourceLabel`, else the command), a
+	 * bounded set; the reason names the cap, whether it came from the caller or
+	 * the module default, how many bytes the child had emitted, and whether the
+	 * child was terminated. Counted, because a chatty tool trips it on every
+	 * dispatch and the tally is what identifies the producer - the crash entry
+	 * that motivated the cap carried no command, byte count or cap value.
+	 */
+	/**
+	 * #3375 round 2 (H3384-1): every signal available for one spawn's teardown
+	 * was refused by the OS, so the child may still be running. Its own kind
+	 * rather than a field on `spawn-output-cap-truncated`, because it fires on
+	 * the abort and timeout teardowns too, which have nothing to do with an
+	 * output cap. Subject is the command label; the reason names which teardown
+	 * (`abort` / `output-cap` / `handler-fault` / `timeout`). Recorded at most
+	 * once per spawn — a refused kill is usually refused again on the next
+	 * teardown attempt, and a row per attempt would flood the sink.
+	 */
+	| "spawn-kill-failed"
+	| "spawn-output-cap-truncated"
+	/**
+	 * #3375: a stdout/stderr chunk handler inside `safeSpawnAsync` THREW. Such a
+	 * throw is delivered to the process, not to the awaiting caller, so before
+	 * the handler became total one (`RangeError: Invalid string length` from an
+	 * uncapped output string) terminated the Pi host. Retention stops and the
+	 * child is killed, reported as an ordinary output-cap result; this row is
+	 * the only evidence that the ending was a fault rather than a volume cap.
+	 * Subject is the command label; the reason names the stream and the error.
+	 */
+	| "spawn-output-handler-fault"
 	/**
 	 * The loaded addon exposed no `js` grammar while an HTML file's embedded
 	 * `language: JavaScript` evaluation asked for one (#2347). The embedded
@@ -1086,6 +1333,19 @@ export type DegradationKind =
 	 */
 	| "unclassified-mutating-tool"
 	/**
+	 * #3389: an accepted socket on the warm diagnostics server emitted `error`.
+	 * A `net.Socket` with no `error` listener RETHROWS, so before this kind
+	 * existed the event was an uncaught exception in the pi host: every
+	 * `requestWarmDiagnostics` timeout, schema refusal and validation refusal
+	 * destroys its socket, and a peer that walks away while the incumbent is
+	 * still answering leaves a routine `read ECONNRESET` with nowhere to go.
+	 * Subject is the errno (`ECONNRESET`, `EPIPE`, `unknown` for a non-system
+	 * failure) — a tiny fixed set, so the ledger stays bounded however often a
+	 * peer resets. Counted: a client whose deadline is too short resets EVERY
+	 * request, and the tally is what identifies it.
+	 */
+	| "warm-attach-socket-error"
+	/**
 	 * #3255: nothing is listening on the pid-scoped warm endpoint this session
 	 * derived for its incumbent, while the instance registry still confirms that
 	 * incumbent is alive. Narrowing the workspace-id case fold renamed the
@@ -1161,7 +1421,8 @@ export type DegradationKind =
 	 * `tree-sitter-shared.ts`) resolves zero files from a HEALTHY root and
 	 * must never be confused with the root itself being gone.
 	 */
-	| "word-index-orphan-file-id";
+	| "word-index-orphan-file-id"
+	| "workspace-glob-cap";
 
 export interface DegradationRecord {
 	kind: unknown;
@@ -1230,7 +1491,7 @@ export function _getDegradationLedgerStateForTests(): {
 export function recordDegradation(record: DegradationRecord): boolean {
 	try {
 		const kind = boundedKind(record.kind);
-		const subject = truncateForLedger(record.subject);
+		const subject = subjectForLedger(record.subject);
 		const reason = truncateForLedger(record.reason);
 		let group = groups.get(kind);
 		if (!group) {
@@ -1256,7 +1517,7 @@ export function recordDegradation(record: DegradationRecord): boolean {
 export function recordDegradationOnce(record: DegradationRecord): void {
 	try {
 		const kind = boundedKind(record.kind);
-		const subject = truncateForLedger(record.subject);
+		const subject = subjectForLedger(record.subject);
 		const key = `${kind}\0${subject}`;
 		if (onceKeys.has(key)) return;
 		onceKeys.add(key);
@@ -1284,7 +1545,7 @@ export function recordDegradationOnce(record: DegradationRecord): void {
 export function incrementDegradationCount(record: DegradationRecord): boolean {
 	try {
 		const kind = boundedKind(record.kind);
-		const subject = truncateForLedger(record.subject);
+		const subject = subjectForLedger(record.subject);
 		const reason = truncateForLedger(record.reason);
 		const key = `${kind}\0${subject}`;
 		const count = (tallies.get(key) ?? 0) + 1;
@@ -1370,6 +1631,26 @@ function boundLedgerMetadata(
 
 function isPowerOfTwo(value: number): boolean {
 	return value > 0 && (value & (value - 1)) === 0;
+}
+
+/**
+ * A subject is an IDENTITY: it is the row's discriminator, the `filePath` of
+ * its durable latency row, and the text `renderDegradationLines` prints after
+ * the count. A blank one names nothing — `⚠ kind: 1 — : reason` — so blank and
+ * missing are the same case and both read `unknown` (#3389 verify round 2,
+ * F3395-02: a socket error carrying `code: ""` wrote an empty subject).
+ *
+ * This is deliberately NOT `normalizeForLedger`'s job, though every ledger
+ * field passes through it: that normalizer keeps falsy primitives on purpose
+ * (`tests/clients/ledger-bounds.test.ts` "keeps primitives, including falsy
+ * ones"), because a metadata VALUE of `""` or `0` is data, not absence. Only
+ * the identity fields fold blank into missing, and `0`/`false` still name
+ * something here too — the check reads the NORMALIZED text, never the caller's
+ * truthiness.
+ */
+function subjectForLedger(value: unknown): string {
+	const subject = truncateForLedger(value);
+	return subject.trim() === "" ? "unknown" : subject;
 }
 
 function boundedKind(value: unknown): string {
@@ -1540,6 +1821,9 @@ const INFORMATIONAL_DEGRADATION_KINDS: ReadonlySet<string> = new Set([
 	// #2874: a successful legacy-directory migration is an upgrade tally, not
 	// a call to action. The hash-only subject avoids exposing the project path.
 	"data_dir_migrated",
+	// #3498: a queued registry removal that landed is the retry working; the
+	// `instance-registry-deregister-queued` beside it is the line that stands out.
+	"instance-registry-deregister-landed",
 ]);
 
 export function renderDegradationLines(

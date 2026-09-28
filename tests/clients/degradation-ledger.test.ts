@@ -528,3 +528,98 @@ describe("session degradation ledger", () => {
 		});
 	});
 });
+
+describe("a blank subject is the same as a missing one (#3389 verify round 2)", () => {
+	// Recurrence this guards: F3395-02. `normalizeForLedger` maps `null` and
+	// `undefined` to `"unknown"` but deliberately KEEPS falsy primitives, so a
+	// caller handing over an empty string — a socket error whose `code` is `""`
+	// — wrote `subject: ""`, a row that discriminates nothing and renders as
+	// `⚠ kind: 1 — : reason`. A subject is an identity, so blank and missing
+	// are one case; a metadata VALUE of `""` is data and stays untouched, which
+	// is why the rule lives here and not in `normalizeForLedger`.
+	it.each([
+		["empty", ""],
+		["whitespace only", "   "],
+		["tab and newline", "\t\n"],
+	])("writes unknown for a %s subject on every write path", (_label, blank) => {
+		recordDegradation({ kind: "spawn-failure", subject: blank, reason: "a" });
+		recordDegradationOnce({
+			kind: "trust-refusal",
+			subject: blank,
+			reason: "b",
+		});
+		incrementDegradationCount({
+			kind: "runner-parsed-nothing",
+			subject: blank,
+			reason: "c",
+		});
+
+		const subjects = getDegradationSummary().map(
+			(group) => group.latestReasons[0]?.subject,
+		);
+		expect(subjects).toEqual(["unknown", "unknown", "unknown"]);
+	});
+
+	it("keeps a falsy but informative subject", () => {
+		// The over-reach direction: `0` and `false` NAME something, so the blank
+		// rule must read the normalized text, not the caller's truthiness.
+		recordDegradation({ kind: "spawn-failure", subject: 0, reason: "zero" });
+		recordDegradation({ kind: "trust-refusal", subject: false, reason: "no" });
+
+		expect(
+			getDegradationSummary().map((group) => group.latestReasons[0]?.subject),
+		).toEqual(["0", "false"]);
+	});
+
+	it("still renders an OLD row that was written with an empty subject", () => {
+		// Old-record proof for the write-side change: the fold applies when a row
+		// is WRITTEN, and nothing rewrites stored rows. A summary carried over
+		// from a session that recorded `subject: ""` — the shape this PR stops
+		// producing — must still parse and render exactly as it did before.
+		expect(
+			renderDegradationLines([
+				{
+					kind: "warm-attach-socket-error",
+					count: 1,
+					droppedCount: 0,
+					latestReasons: [{ subject: "", reason: "Error: malformed errno" }],
+				},
+			]),
+		).toEqual([
+			"Degradations:",
+			"  ⚠ warm-attach-socket-error: 1 — : Error: malformed errno",
+		]);
+	});
+
+	it("keys the once-latch and the tally by the normalized subject", () => {
+		// Two blank spellings are ONE row, not two: the key is derived from the
+		// same normalization the row carries, so a peer that reports `""` once
+		// and `"  "` next does not split its own tally.
+		incrementDegradationCount({
+			kind: "spawn-failure",
+			subject: "",
+			reason: "a",
+		});
+		incrementDegradationCount({
+			kind: "spawn-failure",
+			subject: "  ",
+			reason: "b",
+		});
+		recordDegradationOnce({ kind: "trust-refusal", subject: "", reason: "c" });
+		recordDegradationOnce({
+			kind: "trust-refusal",
+			subject: "\t",
+			reason: "d",
+		});
+
+		const summary = getDegradationSummary();
+		const counted = summary.find((group) => group.kind === "spawn-failure");
+		const once = summary.find((group) => group.kind === "trust-refusal");
+		expect(counted?.count).toBe(2);
+		expect(counted?.latestReasons).toEqual([
+			{ subject: "unknown", reason: "b (count: 2)" },
+		]);
+		expect(once?.count).toBe(1);
+		expect(once?.latestReasons).toEqual([{ subject: "unknown", reason: "c" }]);
+	});
+});

@@ -11,14 +11,18 @@
  * new-code-duplication finding: two near-identical spawn→collect-stdout
  * blocks in `clients/resource-sampler.ts` collapsed to one shared helper).
  *
- * Deliberately has NO imports beyond `node:child_process` types, so both
+ * Deliberately has NO imports beyond `node:child_process` types and
+ * `spawn-output-cap.ts` (itself import-free, #3383), so both
  * `clients/instance-reaper.ts` and `clients/resource-sampler.ts` (which
  * `clients/safe-spawn.ts` itself depends on) can import this without risking
- * a circular-import chain.
+ * a circular-import chain. That is also why the output bound below reports
+ * nothing to the degradation ledger: importing the ledger here would put
+ * `safe-spawn.ts`'s own dependency above it in the graph.
  */
 
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { spawn as nodeSpawn } from "node:child_process";
+import { createBoundedOutputSink } from "./spawn-output-cap.js";
 
 /**
  * Detach a best-effort, fire-and-forget child process from the event loop.
@@ -139,10 +143,15 @@ export function spawnCollectStdoutResult(
 		try {
 			const child = nodeSpawn(command, args, options);
 			unrefChildAndPipes(child);
-			let out = "";
-			child.stdout?.on("data", (chunk) => {
-				out += chunk.toString();
-			});
+			// #3383: bounded, not `out += chunk`. The producer is a process-table
+			// query (`ps`, `wmic`, `powershell`) whose output nothing else limits,
+			// and the concatenation runs inside a `data` handler where V8's
+			// `RangeError: Invalid string length` would be an uncaught exception
+			// rather than this promise's result. A truncated table is the ending
+			// this contract already documents for a timed-out child: whatever was
+			// kept is parsed, and the caller reads `status`.
+			const out = createBoundedOutputSink();
+			child.stdout?.on("data", (chunk) => out.append(chunk));
 			child.once("error", (error) =>
 				settle({ stdout: "", status: "spawn-error", error }),
 			);
@@ -151,7 +160,7 @@ export function spawnCollectStdoutResult(
 				(code: number | null, signal: NodeJS.Signals | null) =>
 					settle(
 						code === 0 && signal === null
-							? { stdout: out, status: "ok" }
+							? { stdout: out.text, status: "ok" }
 							: {
 									stdout: "",
 									status: "exit-error",
@@ -168,7 +177,7 @@ export function spawnCollectStdoutResult(
 					// child, which is the leak this timeout exists to prevent.
 					void terminateTimedOutChild(child, collectOptions.onTimeout).then(
 						(timeoutKill) =>
-							settle({ stdout: out, status: "timeout", timeoutKill }),
+							settle({ stdout: out.text, status: "timeout", timeoutKill }),
 					);
 				}, timeoutMs);
 				timer.unref();

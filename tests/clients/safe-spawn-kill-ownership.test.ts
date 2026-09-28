@@ -208,6 +208,31 @@ describe("lifetime signal cleanup (#3239)", () => {
 				)?.count,
 			).toBe(1);
 
+			// #3383: the re-raise the OS REFUSES, as opposed to the Windows SIGHUP
+			// case declined in advance above. `process.kill` throwing here used to
+			// be an uncaughtException raised inside a `process.once(signal)`
+			// handler, during shutdown, where nothing can catch it; the same ledger
+			// kind now carries `reason: "refused"`.
+			Object.defineProperty(process, "platform", {
+				value: "linux",
+				configurable: true,
+			});
+			freshReset();
+			selfKill.mockClear();
+			selfKill.mockImplementation(((pid: number) => {
+				if (pid === process.pid)
+					throw Object.assign(new Error("kill EPERM"), { code: "EPERM" });
+				return true;
+			}) as typeof process.kill);
+			expect(() => cleanupListeners.get("SIGTERM")?.()).not.toThrow();
+			expect(selfKill).toHaveBeenCalledWith(process.pid, "SIGTERM");
+			const refused = freshSummary().find(
+				(entry) => entry.kind === "safe-spawn-signal-reraise-unsupported",
+			);
+			expect(refused?.count).toBe(1);
+			expect(refused?.latestReasons[0]?.subject).toBe("linux:SIGTERM");
+			expect(refused?.latestReasons[0]?.reason).toContain("refused (EPERM)");
+
 			child.emit("close", 0, null);
 			await pending;
 		} finally {

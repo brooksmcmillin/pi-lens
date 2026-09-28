@@ -45,6 +45,26 @@ describe("insertSuppressComment (#690)", () => {
 		expect(updated.split("\n")[0]).toBe("// pi-lens-ignore: no-bad");
 	});
 
+	it("recognizes a rule before its trailing reason when appending", () => {
+		const content =
+			"// pi-lens-ignore: no-bad -- controlled fixture\nconst target = bad();\n";
+		const updated = insertSuppressComment(content, "/proj/a.ts", 2, "no-bad");
+		expect(updated.split("\n")[0]).toBe(
+			"// pi-lens-ignore: no-bad -- controlled fixture",
+		);
+	});
+
+	it("appends a new rule before a trailing reason on a multi-rule comment", () => {
+		// Regression: appending after the raw suffix stranded the reason between
+		// rule ids, so the updated comment no longer round-tripped.
+		const content =
+			"// pi-lens-ignore: no-a, no-b -- controlled fixture\nconst target = bad();\n";
+		const updated = insertSuppressComment(content, "/proj/a.ts", 2, "no-c");
+		expect(updated.split("\n")[0]).toBe(
+			"// pi-lens-ignore: no-a, no-b, no-c -- controlled fixture",
+		);
+	});
+
 	it("round-trips with applyInlineSuppressions: the shifted (line+1) diagnostic is dropped", () => {
 		const content = "const a = 1;\nconst target = bad();\n";
 		const updated = insertSuppressComment(content, "/proj/a.ts", 2, "no-bad");

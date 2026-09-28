@@ -398,6 +398,89 @@ describe("Pipeline", () => {
 		);
 	});
 
+	it("hands the cascade the session generation captured at dispatch (#3512)", async () => {
+		// The cascade's tier-3 touch record drops a touch whose dispatch session
+		// was replaced. The handle comes from runtime-tool-result.ts; if this hop
+		// drops it, the guard is inert in production.
+		const filePath = createTempFile(tmpDir, "cascade-generation.ts", "x");
+		vi.mocked(dispatchLintWithResult).mockResolvedValue({
+			diagnostics: [],
+			blockers: [],
+			warnings: [],
+			baselineWarningCount: 0,
+			fixed: [],
+			resolvedCount: 0,
+			output: "",
+			blockerOutput: "",
+			hasBlockers: false,
+		});
+		const sessionGeneration = {
+			generation: 7,
+			isCurrent: () => true,
+			guardedWrite: <T>(_subject: string, write: () => T) => write(),
+		};
+
+		await runPipeline(
+			createMockContext(filePath, { sessionGeneration }),
+			createMockDeps(),
+		);
+
+		expect(computeCascadeForFile).toHaveBeenCalledWith(
+			filePath,
+			tmpDir,
+			expect.objectContaining({ sessionGeneration }),
+		);
+		// #3568: and the dispatch, whose collect-later runner defers its result
+		// to a turn end through the same handle
+		// (tests/clients/dispatch/runner-collect-later.test.ts pins the drop).
+		expect(dispatchLintWithResult).toHaveBeenCalledWith(
+			filePath,
+			tmpDir,
+			expect.anything(),
+			undefined,
+			expect.anything(),
+			expect.objectContaining({ sessionGeneration }),
+		);
+	});
+
+	it("hands the cascade the dispatch's order turn beside its session turn (#3540 r2)", async () => {
+		// The cascade's widget reconcile orders by the order turn, which a
+		// session reset never restarts; `turnSeq` (the session's turn) keeps
+		// scoping its caches. If this hop drops `orderTurn`, the reconcile is
+		// unordered in production.
+		const filePath = createTempFile(tmpDir, "cascade-order-turn.ts", "x");
+		vi.mocked(dispatchLintWithResult).mockResolvedValue({
+			diagnostics: [],
+			blockers: [],
+			warnings: [],
+			baselineWarningCount: 0,
+			fixed: [],
+			resolvedCount: 0,
+			output: "",
+			blockerOutput: "",
+			hasBlockers: false,
+		});
+
+		await runPipeline(
+			createMockContext(filePath, {
+				telemetry: {
+					model: "m",
+					sessionId: "s",
+					turnIndex: 1,
+					orderTurn: 6,
+					writeIndex: 2,
+				},
+			}),
+			createMockDeps(),
+		);
+
+		expect(computeCascadeForFile).toHaveBeenCalledWith(
+			filePath,
+			tmpDir,
+			expect.objectContaining({ turnSeq: 1, orderTurn: 6, writeSeq: 2 }),
+		);
+	});
+
 	describe("Format phase", () => {
 		it("defers format by default", async () => {
 			const filePath = createTempFile(tmpDir, "unformatted.ts", "const x=1");
@@ -1177,6 +1260,11 @@ describe("Pipeline", () => {
 					source: "lsp_sync",
 					clientScope: "primary",
 					maxClientWaitMs: 5000,
+					// #3405: the post-write sync is the touch that knows pi-lens wrote
+					// the file, so it is the one that declares a save.
+					saved: true,
+					// #3481: when the synced bytes were read.
+					readStamp: expect.any(Number),
 				},
 			);
 			// The old openFile path (which never registered the touch) must not run.
@@ -1284,6 +1372,90 @@ describe("Pipeline", () => {
 
 			expect(result.output).toContain("Auto-fixed");
 			expect(result.fileModified).toBe(true);
+		});
+	});
+
+	// #3481: the LSP sync carries WHEN its content was read, so the per-path
+	// notify queue can refuse to land it over a newer read of the same file.
+	// A stamp taken before the read that produced the synced bytes (the
+	// pre-format read, say) would rank post-format bytes as older than they are.
+	describe("LSP sync read stamp (#3481)", () => {
+		const cleanDispatch = {
+			diagnostics: [],
+			blockers: [],
+			warnings: [],
+			baselineWarningCount: 0,
+			fixed: [],
+			resolvedCount: 0,
+			output: "",
+			blockerOutput: "",
+			hasBlockers: false,
+		};
+		const syncedStamp = () => {
+			const calls = (
+				mockLSPService.touchFile as unknown as {
+					mock: {
+						calls: Array<
+							[string, string, { source?: string; readStamp?: number }]
+						>;
+					};
+				}
+			).mock.calls;
+			return calls.find(([, , opts]) => opts?.source === "lsp_sync")?.[2]
+				.readStamp;
+		};
+
+		it("stamps the sync with the read after an immediate format", async () => {
+			const filePath = createTempFile(tmpDir, "stamp-format.ts", "const x=1");
+			vi.mocked(dispatchLintWithResult).mockResolvedValue(cleanDispatch);
+			const formatService = getFormatService("test", true);
+			let formattedAt = Number.POSITIVE_INFINITY;
+			formatService.formatFile = async (fp: string) => {
+				fs.writeFileSync(fp, "const x = 1;\n");
+				formattedAt = performance.now();
+				return {
+					filePath: fp,
+					formatters: [
+						{
+							name: "biome",
+							success: true,
+							changed: true,
+							outcome: "formatted" as const,
+						},
+					],
+					anyChanged: true,
+					allSucceeded: true,
+				};
+			};
+
+			await runPipeline(
+				createMockContext(filePath, {
+					getFlag: (name) => name === "immediate-format",
+				}),
+				createMockDeps({ getFormatService: () => formatService }),
+			);
+
+			expect(syncedStamp()).toBeGreaterThanOrEqual(formattedAt);
+		});
+
+		it("stamps the sync with the read after an autofix", async () => {
+			const filePath = createTempFile(tmpDir, "stamp-fix.ts", "const x=1");
+			vi.mocked(dispatchLintWithResult).mockResolvedValue(cleanDispatch);
+			const deps = createMockDeps();
+			let fixedAt = Number.POSITIVE_INFINITY;
+			deps.biomeClient = {
+				isSupportedFile: () => true,
+				ensureAvailable: async () => true,
+				fixFileAsync: async () => {
+					fs.writeFileSync(filePath, "const x = 1;\n");
+					fixedAt = performance.now();
+					return { success: true, changed: true, fixed: 1 };
+				},
+			} as unknown as BiomeClient;
+
+			await runPipeline(createMockContext(filePath), deps);
+
+			expect(syncedStamp()).toBeGreaterThanOrEqual(fixedAt);
 		});
 	});
 

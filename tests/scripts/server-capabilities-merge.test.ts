@@ -15,6 +15,7 @@
 
 import { describe, expect, it } from "vitest";
 import {
+	compareGeneratedDocs,
 	mergeBulletSection,
 	renderServerCapabilitiesDoc,
 	mergeServerCapabilitiesDoc,
@@ -22,6 +23,20 @@ import {
 	parseTable,
 	reshapeRowsByName,
 } from "../../scripts/lib/md-matrix.mjs";
+
+describe("generated docs comparison", () => {
+	it("treats a date-only refresh as unchanged while retaining changed rows", () => {
+		// Recurrence #3380: the nightly date marker changed every run and opened
+		// a bot PR even when every measured capability row was identical.
+		const before =
+			"# doc\n\n_Last generated: 2026-09-23 on linux; 1 servers captured, 0 unavailable._\n\n| row | old |\n";
+		const dateOnly = before.replace("2026-09-23", "2026-09-24");
+		const changedRow = dateOnly.replace("| row | old |", "| row | new |");
+
+		expect(compareGeneratedDocs(before, dateOnly)).toBe(false);
+		expect(compareGeneratedDocs(before, changedRow)).toBe(true);
+	});
+});
 
 const OPS = [
 	["definition", "def"],
@@ -439,5 +454,60 @@ describe("mergeServerCapabilitiesDoc (#469)", () => {
 		const result = mergeServerCapabilitiesDoc(prior, fresh);
 		expect(result.text).toBe(fresh);
 		expect(result.preservedCount).toBe(0);
+	});
+});
+
+describe("textDocumentSync.save column (#3407)", () => {
+	const render = (rows: Array<Record<string, unknown>>) =>
+		renderServerCapabilitiesDoc({
+			rows: rows.map((row) => ({
+				workspaceDiagnosticsSupport: { mode: "push-only" },
+				operationSupport: {},
+				advertisedCommands: [],
+				rawCapabilityKeys: [],
+				...row,
+			})) as never,
+			unavailable: new Set<string>(),
+			date: "2026-09-25",
+			platform: "linux",
+			ops: OPS,
+		});
+	const saveCells = (text: string) => {
+		const table = parseTable(text, "| server | mode |");
+		const saveIdx = table!.header.indexOf("save");
+		const serverIdx = table!.header.indexOf("server");
+		return Object.fromEntries(
+			table!.rows.map((cells) => [cells[serverIdx], cells[saveIdx]]),
+		);
+	};
+
+	it("renders each save shape, and an unreported one as unknown", () => {
+		expect(
+			saveCells(
+				render([
+					{ serverId: "expert", textDocumentSave: "save" },
+					{ serverId: "fsharp", textDocumentSave: "save+text" },
+					{ serverId: "vue", textDocumentSave: "none" },
+					{ serverId: "old-client" },
+				]),
+			),
+		).toEqual({
+			expert: "save",
+			fsharp: "save+text",
+			vue: "·",
+			"old-client": "?",
+		});
+	});
+
+	it("carries a row captured before the column existed as unknown, not as declaring none", () => {
+		const prior = [
+			"| server | mode | ws-pull | def | hov | cmds |",
+			"|---|---|---|---|---|---|",
+			"| jdtls | push-only | · | ✓ | ✓ | 3 |",
+			"",
+		].join("\n");
+		const fresh = render([{ serverId: "expert", textDocumentSave: "save" }]);
+		const { text } = mergeServerCapabilitiesDoc(prior, fresh);
+		expect(saveCells(text)).toEqual({ expert: "save", jdtls: "?" });
 	});
 });

@@ -118,3 +118,6 @@ ba = "ba"
 # All-contributors table entry — a real contributor's surname
 # (README.md), not "Stubs".
 stubbs = "stubbs"
+# All-contributors table entry — a real contributor's GitHub login
+# (README.md, .all-contributorsrc), not "glyph".
+glyh = "glyh"
