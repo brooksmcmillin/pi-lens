@@ -386,7 +386,7 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 	"real-process-spawn:scripts/check-pr-body.test.ts": {
 		detector: "real-process-spawn",
 		reason:
-			"the exact local CLI, shallow checkout and `git check-ignore` (#2904) are the subjects; an in-process double cannot prove any of those command boundaries",
+			"the exact local CLI, shallow checkout, `git check-ignore` (#2904), and large-diff buffer overflow (refs #17) are the subjects; real Git add/commit calls author the overflow fixture because a double cannot exercise child-process output bounds",
 	},
 	"real-process-spawn:scripts/git-fixture-env.test.ts": {
 		detector: "real-process-spawn",

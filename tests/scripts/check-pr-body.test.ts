@@ -2456,7 +2456,13 @@ describe("head-tree citations and test references", () => {
 	it("includes every declaration title found by the test census", () => {
 		const runGit = gitExecFileSync;
 		const grep = runGit(
-			["grep", "-nE", "\\b(it|test|describe)(\\.each)?\\s*\\(", "--", "tests/"],
+			[
+				"grep",
+				"-nE",
+				"(^|[^[:alnum:]_])(it|test|describe)(\\.each)?[[:space:]]*\\(",
+				"--",
+				"tests/",
+			],
 			{ encoding: "utf8", maxBuffer: 20 * 1024 * 1024 } as never,
 		);
 		const titles = new Set<string>();
