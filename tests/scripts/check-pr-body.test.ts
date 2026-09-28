@@ -75,6 +75,37 @@ function createOriginMasterFixture() {
 	return directory;
 }
 
+describe("large PR diff capture", () => {
+	it("preserves the end of an upstream sync diff beyond Node's default buffer", () => {
+		const directory = createOriginMasterFixture();
+		try {
+			writeFileSync(
+				join(directory, "large.md"),
+				`${"upstream change\n".repeat(100_000)}end-of-sync\n`,
+			);
+			gitExecFileSync(["add", "large.md"], { cwd: directory });
+			gitExecFileSync(
+				[
+					"-c",
+					"user.name=pi-lens-test",
+					"-c",
+					"user.email=pi-lens-test@example.com",
+					"commit",
+					"--quiet",
+					"-m",
+					"large sync",
+				],
+				{ cwd: directory },
+			);
+			const diff = localDiff(directory);
+			expect(diff.length).toBeGreaterThan(1024 * 1024);
+			expect(diff).toContain("+end-of-sync\n");
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("flattened PR body repair", () => {
 	it("detects the clearly flattened real-world shape and repairs it", () => {
 		expect(lintPrBody(flattenedBody)).toMatchObject({ valid: false });

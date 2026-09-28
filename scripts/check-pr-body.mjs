@@ -1513,6 +1513,8 @@ export function localDiff(cwd = process.cwd(), git = gitExecFileSync) {
 	return git(["diff", "--unified=0", "--no-color", "origin/master...HEAD"], {
 		cwd,
 		encoding: "utf8",
+		// Upstream syncs exceed Node's 1 MiB default; retain a finite bound.
+		maxBuffer: 16 * 1024 * 1024,
 	});
 }
 
