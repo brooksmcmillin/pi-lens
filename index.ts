@@ -323,6 +323,10 @@ import {
 import { normalizeToolDefinition } from "./clients/tool-definition.js";
 import { warmFormatters } from "./clients/formatters-lazy.js";
 import { filterInactivePiLensSkills } from "./clients/conditional-skills.js";
+import {
+	noteHostSessionManager,
+	setHostFileMutationQueueLoader,
+} from "./clients/file-mutation-queue.js";
 
 type DispatchIntegration = Awaited<ReturnType<typeof loadDispatchIntegration>>;
 let loadedDispatchIntegration: DispatchIntegration | undefined;
@@ -730,6 +734,15 @@ function activateExtension(hostPi: ExtensionAPI) {
 	// the log instead of pi's frame. Host-initiated output stays on the real
 	// console, because it runs outside every window.
 	const pi = withConsoleCaptureWindows(hostPi);
+	// #3506: pi-lens' format and autofix writers join pi's per-file mutation
+	// queue. The lookup runs on the first write. It reaches the running host's
+	// copy of the package when jiti transpiles pi-lens (its native import fails
+	// on the host-provided static imports) and can reach a second copy where
+	// those resolve natively; clients/file-mutation-queue.ts checks which, and
+	// a host without the export records a degradation.
+	setHostFileMutationQueueLoader(
+		() => import("@earendil-works/pi-coding-agent"),
+	);
 	const testRunnerDeliveryOwnerId = `activation-${++_nextTestRunnerDeliveryOwnerId}`;
 	// Event contexts belong to the activation that owns this factory closure.
 	// The process-global latest ctx remains only a boot-window fallback.
@@ -1732,8 +1745,8 @@ function activateExtension(hostPi: ExtensionAPI) {
 			// (widget-state's allDiagnostics) using the SAME write-ordering token
 			// source pipeline.ts's per-edit recordDiagnostics calls draw from, so
 			// a scan-originated write can't clobber a concurrent newer per-edit
-			// write (or vice versa).
-			() => runtime.nextWriteIndex(),
+			// write (or vice versa). #3540: ordered turn first, as the pipeline's.
+			() => runtime.nextWriteOrderToken(),
 			captureLspStatusRepaint,
 			() => runtime,
 			() => Boolean(getLensFlag("lens-guard")),
@@ -2037,6 +2050,8 @@ function activateExtension(hostPi: ExtensionAPI) {
 								};
 							}
 						)?.sessionManager;
+						// #3506: the host's own instance, to tell its SDK copy apart.
+						noteHostSessionManager(sessionManager);
 						return {
 							sessionId: sessionManager?.getSessionId?.(),
 							sessionFile: getSessionFile(ctx),
@@ -2749,6 +2764,12 @@ function activateExtension(hostPi: ExtensionAPI) {
 						label: "tool-result-bootstrap",
 					})
 				: peekBootstrapClients();
+			// `return await`, not `return`: this `try` has a `finally` that clears
+			// the ambient abort signal. Without the await the `finally` runs the
+			// instant the promise is RETURNED, so the slot is empty for the whole
+			// pipeline and an Escape mid-edit no longer kills its child processes
+			// (#2897 round 2 V2; #2939 round 2 restored it after measuring the
+			// deletion observable).
 			return await bounded(
 				handleToolResult({
 					signal: ctx.signal,
@@ -3550,6 +3571,10 @@ function activateExtension(hostPi: ExtensionAPI) {
 		// production-unreachable.
 		try {
 			setAmbientAbortSignal(ctx?.signal);
+			// #3576: the session this settle's drain runs in. `/new`, fork and
+			// resume can land while the drain awaits its formatter; the refresh
+			// below then belongs to a session that no longer exists.
+			const settleSession = runtime.captureSessionGeneration();
 			try {
 				// #2430 item 3: the turn-boundary net runs BEFORE the drain, so a
 				// file a path-less third-party tool changed is queued in time to be
@@ -3563,8 +3588,12 @@ function activateExtension(hostPi: ExtensionAPI) {
 				// The drain just wrote formatted/autofixed bytes to files pi-lens
 				// itself owns. Re-baseline them, or the NEXT settle reads our own
 				// formatter output as unexplained third-party drift and requeues the
-				// same files forever.
-				await refreshObservedLedgerSafely(ctx);
+				// same files forever. #3576: with this session's read guard and
+				// handled set only.
+				await settleSession.guardedWrite(
+					`observed-ledger-refresh:${ctx?.cwd ?? runtime.projectRoot}`,
+					() => refreshObservedLedgerSafely(ctx),
+				);
 			} catch (drainErr) {
 				// #1924 classified the stale-ctx case inline here. #1925 moved the
 				// classifier and its record to clients/session-event-guard.ts, so

@@ -24,6 +24,7 @@ const WORKFLOW_PATH = ".github/workflows/tool-smoke.yml";
 const JOB_NAME = "tool-smoke";
 const NOTIFY_STEP_NAME = "Notify on tool-smoke red";
 const CLEAN_SIGNAL_NOTIFY_STEP_NAME = "Notify on silentOnClean drift";
+const DOCS_REFRESH_STEP_NAME = "Open/update LSP-docs refresh PR";
 const NOTIFY_IF =
 	"always() && (github.event_name == 'schedule' || github.ref == 'refs/heads/master')";
 
@@ -65,6 +66,7 @@ describe("tool-smoke.yml's issue writers are scoped to nightly/default runs (#33
 		workflow,
 		CLEAN_SIGNAL_NOTIFY_STEP_NAME,
 	);
+	const docsRefreshStep = findStep(workflow, DOCS_REFRESH_STEP_NAME);
 
 	it.each([
 		["silentOnClean drift", cleanSignalNotifyStep],
@@ -79,6 +81,12 @@ describe("tool-smoke.yml's issue writers are scoped to nightly/default runs (#33
 	it("is the LAST step in the job (must observe every gating layer, including Format layer)", () => {
 		const steps = workflow.jobs?.[JOB_NAME]?.steps as Step[];
 		expect(steps[steps.length - 1].name).toContain(NOTIFY_STEP_NAME);
+	});
+
+	it("runs the docs refresh writer only for scheduled/default-branch runs (#3380)", () => {
+		expect(docsRefreshStep.if).toBe(
+			`${NOTIFY_IF} && steps.docs_diff.outputs.changed == 'true'`,
+		);
 	});
 
 	it("carries continue-on-error: true (a notifier failure must never redden the nightly)", () => {
@@ -198,6 +206,26 @@ describe("tool-smoke.yml's issue writers are scoped to nightly/default runs (#33
 			expect(step.if).toBe(NOTIFY_IF);
 			expect(step.if).not.toBe("always()");
 		}
+	});
+
+	it("mutation-proof: dropping the docs refresh event/ref guard reds the #3380 gate", () => {
+		const source = readFileSync(resolve(REPO_ROOT, WORKFLOW_PATH), "utf8");
+		const lines = source.split("\n");
+		const stepNameIdx = lines.findIndex((line) =>
+			line.includes(DOCS_REFRESH_STEP_NAME),
+		);
+		const ifLineIdx = lines.findIndex(
+			(line, index) =>
+				index > stepNameIdx &&
+				/^\s*if:\s*always\(\) && \(github\.event_name/.test(line),
+		);
+		expect(ifLineIdx).toBeGreaterThan(stepNameIdx);
+		const mutatedLines = [...lines];
+		mutatedLines.splice(ifLineIdx, 1);
+		const mutatedWorkflow = loadWorkflow(mutatedLines.join("\n"));
+		expect(
+			findStep(mutatedWorkflow, DOCS_REFRESH_STEP_NAME).if,
+		).toBeUndefined();
 	});
 });
 

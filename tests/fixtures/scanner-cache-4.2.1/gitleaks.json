@@ -2,7 +2,6 @@
   "success": true,
   "scannedAt": "2026-08-18T07:00:00.000Z",
   "analyzed": true,
-  "analyzedFiles": ["__PROJECT_ROOT__/src/config.ts"],
   "summary": "1 finding",
   "findings": [
     {

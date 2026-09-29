@@ -236,8 +236,10 @@ describe("a missing vendored grammar on a host with no writable dir (#1520 F5)",
 		expect(recorded[0].file).toBe(CUE_GRAMMAR);
 		expect(recorded[0].retryable).toBe(false);
 		expect(recorded[0].detail).toContain("vendor/grammars");
-		// The regression wrote the write-dir message instead.
-		expect(recorded[0].detail).not.toContain("No writable grammars directory");
+		// The regression wrote the write-dir message instead (#3409 renamed it to
+		// "No grammars directory could be resolved", since a resolution failure is
+		// not a writability failure and the two now report different causes).
+		expect(recorded[0].detail).not.toContain("No grammars directory could be");
 	});
 
 	// The control. Without it, "everything is non-retryable" would also pass,
@@ -252,6 +254,6 @@ describe("a missing vendored grammar on a host with no writable dir (#1520 F5)",
 		expect(recorded).toHaveLength(1);
 		expect(recorded[0].file).toBe("tree-sitter-python.wasm");
 		expect(recorded[0].retryable).toBe(true);
-		expect(recorded[0].detail).toContain("No writable grammars directory");
+		expect(recorded[0].detail).toContain("No grammars directory could be");
 	});
 });

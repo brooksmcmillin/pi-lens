@@ -148,7 +148,7 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
-      - uses: ruby/setup-ruby@a0102e0972be65f351c307e2d64b9314a57c8073 # v1
+      - uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1
         continue-on-error: true
         with:
           ruby-version: '3.3'
@@ -167,13 +167,18 @@ jobs:
           elixir-version: '1.18'
           gleam-version: '1'
 
-      # fish-lsp requires the fish executable to start its server. Pin the
-      # package so the nightly's fish proof is reproducible across runner
-      # images, alongside the other runner-tool provisioning above (#3359).
+      # fish-lsp requires the fish executable to start its server. This is
+      # runner provisioning, so keep the distro package unpinned like the
+      # dependency installs below (`npm install --no-audit --no-fund`) and the
+      # same runner setup in grammar-health.yml and compat-smoke.yml. The
+      # The fish-lsp npm package follows the registry policy for npm LSP
+      # servers: its package identity is tested, but its version floats unless
+      # a host compatibility floor requires a pin. This pin policy only
+      # applies to the runner's distro prerequisite (#3374).
       - name: Install fish for fish-lsp
         run: |
           sudo apt-get update
-          sudo apt-get install --yes fish=3.7.0-1
+          sudo apt-get install --yes fish
 
       - name: Install dependencies
         run: npm install --no-audit --no-fund
@@ -247,6 +252,8 @@ jobs:
       # probe already; the drift check can't fail the job either way).
       - name: LSP clean-signal probe (Tier 2 vs 3 among push servers) + silentOnClean drift check
         continue-on-error: true
+        env:
+          PILENS_PUB_DEBUG: "1"
         run: node scripts/probe-clean-signal.mjs --install
 
       # #594: make a genuine #529 drift finding ACTIONABLE instead of it only
@@ -275,14 +282,7 @@ jobs:
 
       - name: Check LSP docs refresh diff
         id: docs_diff
-        shell: bash
-        run: |
-          if git diff --quiet -- docs/lsp-capability-matrix.md docs/servercapabilities.md; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "LSP docs are byte-identical to master; skipping refresh PR."
-          else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          fi
+        run: node scripts/check-generated-docs-diff.mjs
 
       # Commit-back (#390 item 2): the three steps above regenerate the LSP docs
       # in-place. master has required checks the schedule's GITHUB_TOKEN can't
@@ -290,7 +290,7 @@ jobs:
       # run) instead of pushing to master. Docs change rarely (only when a server's
       # caps/tier change), so this is low-noise. No-ops when nothing changed.
       - name: Open/update LSP-docs refresh PR
-        if: steps.docs_diff.outputs.changed == 'true'
+        if: always() && (github.event_name == 'schedule' || github.ref == 'refs/heads/master') && steps.docs_diff.outputs.changed == 'true'
         continue-on-error: true
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:

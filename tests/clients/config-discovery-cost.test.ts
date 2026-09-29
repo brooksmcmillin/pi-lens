@@ -250,6 +250,23 @@ describe("#2483: a warm load with NO config found anywhere is bearing-scoped too
 		const config = loadPiLensProjectConfig(projectDir);
 		expect(config.maxProjectFiles).toBe(42);
 	});
+
+	it("invalidates discovery when a recorded directory mtime becomes stale", async () => {
+		const home = tmpRoot("pi-lens-stale-dir-home-");
+		process.env.PI_LENS_HOME = tmpRoot("pi-lens-stale-dir-global-");
+		process.env.PI_LENS_CONFIG_PATH = path.join(home, "absent", "config.json");
+		const projectDir = path.join(home, "proj");
+		fs.mkdirSync(projectDir, { recursive: true });
+
+		const { loadPiLensProjectConfig } = await loader();
+		expect(loadPiLensProjectConfig(projectDir).maxProjectFiles).toBeUndefined();
+
+		// Regression witness for #3419: a changed recorded bearing directory must
+		// invalidate the discovery cache through dirMtimesStillFresh, so a config
+		// created after the first walk is found on the next load.
+		write(path.join(projectDir, ".pi-lens.json"), { maxProjectFiles: 84 });
+		expect(loadPiLensProjectConfig(projectDir).maxProjectFiles).toBe(84);
+	});
 });
 
 describe("#2483 round 2: a no-config entry re-checks the full ancestor chain at most once per cadence window", () => {

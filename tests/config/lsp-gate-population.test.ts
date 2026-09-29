@@ -23,17 +23,90 @@ import { describe, expect, it } from "vitest";
 import { assertNonEmptyScan } from "../support/sweep-kit.js";
 import {
 	formatGateCensus,
+	LSP_DIAGNOSTICS_WAIT_MS,
 	LSP_FIXTURES,
 	lspGatePopulation,
 } from "../../scripts/smoke-tools.mjs";
+import { LSP_SERVERS } from "../../clients/lsp/server.js";
+import { SERVER_DIAGNOSTIC_STRATEGIES } from "../../clients/lsp/wait-policy/strategies.js";
 
 type Fixture = (typeof LSP_FIXTURES)[number] & {
 	lspGate?: boolean;
 	lspGateMarker?: string;
 	lspGateExempt?: string;
+	setup?: string | string[];
+	serverId?: string;
+	expectServerId?: string;
+	disableServers?: string[];
 	clean?: boolean;
 	auxiliaryServerIds?: string[];
 };
+
+type FallbackAdmission = {
+	serverId: string;
+	reason: string;
+	until: string;
+};
+
+// #3391 review r1: OmniSharp is registered as a fallback but has no committed
+// smoke fixture yet. This is an admission, not a silent gap: lane C (#3311)
+// owns adding the fixture and must remove this row in the same change.
+const FALLBACK_ADMISSIONS: readonly FallbackAdmission[] = [
+	{
+		serverId: "omnisharp",
+		reason: "no smoke fixture yet; lane C (#3311) adds it",
+		until: "#3311 lane C",
+	},
+];
+
+function fallbackPopulationIssues(
+	fixtures: readonly Fixture[],
+	servers: readonly Pick<(typeof LSP_SERVERS)[number], "id" | "fallbackFor">[],
+	admissions: readonly FallbackAdmission[],
+): string[] {
+	const pairs = servers
+		.filter((server) => server.fallbackFor)
+		.map((server) => [server.fallbackFor!, server.id] as const);
+	const familyIds = new Set(pairs.flat());
+	const labeled = fixtures.filter((fixture) =>
+		familyIds.has(fixture.serverId ?? ""),
+	);
+	const labeledIds = new Set(labeled.map((fixture) => fixture.serverId));
+	const admissionIds = new Set(
+		admissions.map((admission) => admission.serverId),
+	);
+	const issues: string[] = [];
+
+	for (const fixture of fixtures) {
+		if (!fixture.serverId && familyIds.has(fixture.expectServerId ?? "")) {
+			issues.push(`${fixture.lang} is an unlabelled fallback-family row`);
+		}
+	}
+	for (const admission of admissions) {
+		if (!familyIds.has(admission.serverId)) {
+			issues.push(`${admission.serverId} admission is not a fallback member`);
+		} else if (labeledIds.has(admission.serverId)) {
+			issues.push(
+				`${admission.serverId} admission is stale; fixture is present`,
+			);
+		}
+		if (admission.reason.trim().length < 20 || !admission.until.trim()) {
+			issues.push(`${admission.serverId} admission lacks reason or expiry`);
+		}
+	}
+	for (const id of familyIds) {
+		if (!labeledIds.has(id) && !admissionIds.has(id)) {
+			issues.push(`${id} is neither pinned by a fixture nor admitted`);
+		}
+	}
+	const expectedLabeledCount = familyIds.size - admissionIds.size;
+	if (labeled.length !== expectedLabeledCount) {
+		issues.push(
+			`fallback fixture count ${labeled.length} !== registry members minus admissions ${expectedLabeledCount}`,
+		);
+	}
+	return issues;
+}
 
 const repoRoot = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -47,7 +120,7 @@ describe("LSP clean-gate population (#3217)", () => {
 		// A floor, not a pin: if the fixture table or the eligibility filter ever
 		// yields (almost) nothing, every assertion below passes on an empty set
 		// and the guard reads clean while covering nothing. 45 eligible fixtures
-		// on 2026-09-23 (26 gated, 19 exempt); the floor is deliberately well under
+		// on 2026-09-24 (28 gated, 17 exempt); the floor is deliberately well under
 		// that so ordinary fixture churn never touches it.
 		assertNonEmptyScan("LSP gate-eligible fixtures", eligible.length, 30);
 		const undecided = eligible
@@ -112,6 +185,71 @@ describe("LSP clean-gate population (#3217)", () => {
 		}
 	});
 
+	// #3311 lane B recurrence: a fixture-local dependency must be prepared in
+	// the copied scratch workspace before the server is touched. Pin the five
+	// intended lane-B consumers so a future row cannot silently regain a
+	// server-property exemption or add an ad-hoc script. The pre-existing TS7
+	// setup rows are a separate native-server fixture contract.
+	it("keeps lane B setup on exactly the five scaffolded servers", () => {
+		const laneB = ["csharp", "elixir", "expert", "fsharp", "vue"];
+		for (const lang of laneB) {
+			const fixture = fixtures.find((candidate) => candidate.lang === lang)!;
+			expect(
+				fixture.setup,
+				`${lang} must use the shared setup hook`,
+			).toBeTruthy();
+			expect(
+				fixture.lspGate === true || typeof fixture.lspGateExempt === "string",
+				`${lang} must be gated or carry a measured exemption`,
+			).toBe(true);
+			expect(
+				fixture.lspGateMarker,
+				`${lang} must retain a removable seed`,
+			).toBeTruthy();
+		}
+	});
+
+	// #3402 r2 recurrence: four servers were given `aggregateWaitMs: 8000`
+	// because that is the number this gate passes as `waitMs` — but `waitMs` is a
+	// CEILING over each server's own budget (`clients/lsp/index.ts`
+	// `perServerTimeout`), never a floor, and `lsp_diagnostics` leaves it
+	// undefined by default, so the strategy value is what an ordinary production
+	// call pays in full on a file the server never publishes for. A budget above
+	// this ceiling is therefore unwitnessable here AND unbounded there: the gate
+	// would clip it while every uncapped production call paid it. Keeping the
+	// declared budgets at or under the number this harness actually grants is what
+	// makes "the nightly proved this budget" a true sentence.
+	it("declares no diagnostic budget the gate itself cannot grant (#3402)", () => {
+		const entries = Object.entries(SERVER_DIAGNOSTIC_STRATEGIES);
+		expect(entries.length).toBeGreaterThan(0);
+		for (const [serverId, strategy] of entries) {
+			expect(
+				strategy.aggregateWaitMs,
+				`${serverId}: aggregateWaitMs (${strategy.aggregateWaitMs}) exceeds the ` +
+					`gate's own waitMs ceiling (${LSP_DIAGNOSTICS_WAIT_MS}), so this gate ` +
+					`can never observe that budget while production pays it in full`,
+			).toBeLessThanOrEqual(LSP_DIAGNOSTICS_WAIT_MS);
+		}
+	});
+
+	it("keeps the Vue gate fixture project-shaped for Volar", () => {
+		// M-3402-1 recurrence: a ready Volar server with no publish was first
+		// classified as a server property, but the fixture had no tsconfig project.
+		const vue = fixtures.find((fixture) => fixture.lang === "vue")!;
+		const config = JSON.parse(
+			readFileSync(path.join(repoRoot, vue.dir, "tsconfig.json"), "utf8"),
+		) as {
+			include?: string[];
+			compilerOptions?: { plugins?: Array<{ name?: string }> };
+			vueCompilerOptions?: Record<string, unknown>;
+		};
+		expect(config.include).toContain("App.vue");
+		expect(config.compilerOptions?.plugins).toContainEqual({
+			name: "@vue/typescript-plugin",
+		});
+		expect(config.vueCompilerOptions).toBeDefined();
+	});
+
 	// #3217 F7: `java` and `java-lombok` are two fixtures over one server
 	// (jdtls). A duplicated `lang` would let one server be counted twice in the
 	// census line below, or let a fixture be edited while its twin silently
@@ -149,5 +287,76 @@ describe("LSP clean-gate population (#3217)", () => {
 		expect(gated + handshakeOnly + unavailable).toBe(
 			population.eligible.length,
 		);
+	});
+
+	// #3391 recurrence guard: when a primary server is unavailable, its
+	// fallback can answer the handshake and produce a false green unless every
+	// fixture in a fallback family pins the server identity it intends to test.
+	it("pins the identity of every fixture in a fallback-server family", () => {
+		const fallbackPairs = LSP_SERVERS.filter(
+			(server) => server.fallbackFor,
+		).map((server) => [server.fallbackFor!, server.id] as const);
+		const fallbackIds = new Set(fallbackPairs.flat());
+		const familyFixtures = fixtures.filter((fixture) =>
+			fallbackIds.has(fixture.serverId ?? ""),
+		);
+		expect(
+			fallbackPopulationIssues(fixtures, LSP_SERVERS, FALLBACK_ADMISSIONS),
+		).toEqual([]);
+		expect(familyFixtures).toHaveLength(
+			fallbackIds.size - FALLBACK_ADMISSIONS.length,
+		);
+		for (const fixture of familyFixtures) {
+			expect(fixture.expectServerId, `${fixture.lang} expected server`).toBe(
+				fixture.serverId,
+			);
+			expect(
+				fixture.disableServers,
+				`${fixture.lang} must disable fallback siblings`,
+			).toEqual(
+				fallbackPairs
+					.filter(([primary, fallback]) =>
+						[primary, fallback].includes(fixture.serverId!),
+					)
+					.map(([primary, fallback]) =>
+						fixture.serverId === primary ? fallback : primary,
+					),
+			);
+		}
+	});
+
+	it("rejects an unlabelled fallback-family row", () => {
+		const unlabelled = fixtures.map((fixture) =>
+			fixture.lang === "elixir" ? { ...fixture, serverId: undefined } : fixture,
+		);
+		expect(
+			fallbackPopulationIssues(unlabelled, LSP_SERVERS, FALLBACK_ADMISSIONS),
+		).toEqual([
+			"elixir is an unlabelled fallback-family row",
+			"elixir is neither pinned by a fixture nor admitted",
+			"fallback fixture count 6 !== registry members minus admissions 7",
+		]);
+	});
+
+	it("rejects an admission after its fixture arrives", () => {
+		const withOmnisharp = [
+			...fixtures,
+			{
+				lang: "omnisharp",
+				serverId: "omnisharp",
+				expectServerId: "omnisharp",
+			},
+		] as Fixture[];
+		const stale = [
+			...FALLBACK_ADMISSIONS,
+			{
+				serverId: "omnisharp",
+				reason: "lane C fixture landed",
+				until: "#3311 lane C",
+			},
+		];
+		expect(
+			fallbackPopulationIssues(withOmnisharp, LSP_SERVERS, stale),
+		).toContain("omnisharp admission is stale; fixture is present");
 	});
 });

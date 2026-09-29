@@ -1,8 +1,8 @@
 {
 	"tsconfig.strict-indexed.json": {
-		"clients": 444,
+		"clients": 443,
 		"clients/config-core": 18,
-		"clients/dispatch": 29,
+		"clients/dispatch": 27,
 		"clients/dispatch/rules": 12,
 		"clients/dispatch/runners": 82,
 		"clients/dispatch/runners/utils": 3,

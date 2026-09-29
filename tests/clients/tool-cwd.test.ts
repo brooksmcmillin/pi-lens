@@ -1,14 +1,15 @@
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { LANGUAGES } from "../../clients/language-registry.js";
+import { rootMarkersForFile } from "../../clients/language-profile.js";
 import {
 	LSP_SERVERS,
 	resolveLspServerCwd,
 	type LSPServerInfo,
 } from "../../clients/lsp/server.js";
 import { LSPService } from "../../clients/lsp/index.js";
+import { setupTestEnvironment, useTrackedTempDirs } from "./test-utils.js";
 
 let home: string;
 let toolCwd: typeof import("../../clients/tool-cwd.js");
@@ -16,8 +17,11 @@ let ledger: typeof import("../../clients/degradation-ledger.js");
 let log: typeof import("../../clients/extension-log.js");
 let pathUtils: typeof import("../../clients/path-utils.js");
 
+let previousHome: string | undefined;
+
 beforeEach(async () => {
-	home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-tool-cwd-"));
+	home = setupTestEnvironment("pi-lens-tool-cwd-").tmpDir;
+	previousHome = process.env.PI_LENS_HOME;
 	process.env.PI_LENS_HOME = home;
 	process.env.PI_LENS_TEST_MODE = "0";
 	vi.resetModules();
@@ -28,8 +32,13 @@ beforeEach(async () => {
 	ledger.resetDegradationLedger();
 });
 
+// Log writes under this home are queued; the drain lets them land before the
+// home is removed.
+useTrackedTempDirs("pi-lens-tool-cwd-");
+
 afterEach(() => {
-	fs.rmSync(home, { recursive: true, force: true });
+	if (previousHome === undefined) delete process.env.PI_LENS_HOME;
+	else process.env.PI_LENS_HOME = previousHome;
 	delete process.env.PI_LENS_TEST_MODE;
 });
 
@@ -396,6 +405,69 @@ describe("resolveToolCwd (#2777)", () => {
 				cwd: project,
 			}).cwd,
 		).toBe(nested);
+	});
+
+	it("re-walks a POSITIVE marker root for every baseline runner when a nearer marker appears (#2922)", () => {
+		// Recurrence: the positive marker memo, keyed by start directory and
+		// revalidated only at the cached root, pinned the first root it resolved
+		// for the whole session — so a marker scaffolded in a nested package was
+		// never seen again. The sibling case above starts from an ABSENT marker
+		// (#2911's half, negative entries are not cached); this is the positive
+		// half, which is the one #2922 reported.
+		//
+		// Derived, not per-tool: the runner population and its markers come from
+		// the historical vocabulary baseline `tests/config/runner-marker-
+		// containment.test.ts` pins, and the file extension for each runner is
+		// PROBED through `rootMarkersForFile` rather than hand-mapped, so a
+		// runner or marker added to the baseline is covered here with no edit and
+		// an unreachable marker throws instead of silently skipping.
+		const baseline = JSON.parse(
+			fs.readFileSync(
+				path.join(
+					import.meta.dirname,
+					"../fixtures/tool-cwd-runner-markers.json",
+				),
+				"utf8",
+			),
+		) as { markers: Record<string, readonly string[]> };
+		const runners = Object.entries(baseline.markers);
+		expect(runners.length, "the baseline runner population").toBe(8);
+
+		const probeExtensions = [".ts", ".py", ".yaml", ".sql", ".rs", ".md"];
+		const observed: Record<string, readonly string[]> = {};
+		const expected: Record<string, readonly string[]> = {};
+
+		for (const [tool, markers] of runners) {
+			const marker = markers[0];
+			const extension = probeExtensions.find((candidate) =>
+				rootMarkersForFile(
+					path.join(home, `marker-probe${candidate}`),
+					tool,
+				).includes(marker),
+			);
+			if (!extension)
+				throw new Error(`no probe extension reaches ${marker} for ${tool}`);
+
+			const workspace = path.join(home, "derived", tool.replace("/", "-"));
+			const nested = path.join(workspace, "packages", "app");
+			const file = path.join(nested, "src", `index${extension}`);
+			fs.mkdirSync(path.dirname(file), { recursive: true });
+			fs.writeFileSync(file, "\n");
+			fs.writeFileSync(path.join(workspace, marker), "\n");
+
+			const before = toolCwd.resolveToolCwd("runner", tool, file, {
+				cwd: workspace,
+			}).cwd;
+			fs.writeFileSync(path.join(nested, marker), "\n");
+			const after = toolCwd.resolveToolCwd("runner", tool, file, {
+				cwd: workspace,
+			}).cwd;
+
+			observed[tool] = [before, after];
+			expected[tool] = [workspace, nested];
+		}
+
+		expect(observed).toEqual(expected);
 	});
 
 	it("covers shared language marker fallback and fresh marker creation (#2965)", () => {

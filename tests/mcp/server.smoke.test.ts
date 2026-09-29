@@ -451,22 +451,29 @@ describe("pi-lens MCP server (stdio smoke)", { retry: 2 }, () => {
 	}, 60_000);
 
 	it("answers tools/call pilens_analyze (warm) with a real dispatch result", async () => {
-		// no-lsp keeps it fast (skips the cold LSP spawn) while still running the
-		// real tree-sitter/ast-grep/oxlint pipeline on a clean repo file.
-		const target = path.join(repoRoot, "clients", "mcp", "host-shim.ts");
-		const res = await harness.request(7, "tools/call", {
-			name: "pilens_analyze",
-			arguments: { file: target, mode: "warm", flags: { "no-lsp": true } },
-		});
-		const result = res.result as {
-			content: { type: string; text: string }[];
-			isError?: boolean;
-		};
-		expect(result.isError).toBeFalsy();
-		expect(result.content[0].text).toContain("[warm]");
-		expect(result.content[0].text).toContain("host-shim.ts");
-		// The structured JSON payload (fenced) carries the latency record.
-		expect(result.content[0].text).toContain('"latency"');
+		// Stryker annotates repository sources with @ts-nocheck, which makes
+		// dispatch classify them as generated. Author the input after instrumentation.
+		const directory = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-mcp-analyze-"),
+		);
+		try {
+			const target = path.join(directory, "analyze-input.ts");
+			fs.writeFileSync(target, "export const answer = 42;\n");
+			const res = await harness.request(7, "tools/call", {
+				name: "pilens_analyze",
+				arguments: { file: target, mode: "warm", flags: { "no-lsp": true } },
+			});
+			const result = res.result as {
+				content: { type: string; text: string }[];
+				isError?: boolean;
+			};
+			expect(result.isError).toBeFalsy();
+			expect(result.content[0].text).toContain("[warm]");
+			expect(result.content[0].text).toContain("analyze-input.ts");
+			expect(result.content[0].text).toContain('"latency"');
+		} finally {
+			fs.rmSync(directory, { recursive: true, force: true });
+		}
 	}, 60_000);
 
 	// pilens_module_report + pilens_read_symbol execute against a tiny project in

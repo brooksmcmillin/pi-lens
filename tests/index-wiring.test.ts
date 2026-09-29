@@ -181,6 +181,7 @@ import {
 	resetDegradationLedger,
 } from "../clients/degradation-ledger.js";
 import { _resetSessionLifecycleForTests } from "../clients/session-lifecycle.js";
+import { _settleRegistryMutationsForTests } from "../clients/instance-registry.js";
 import { makeSessionStartEvent } from "./support/host-event-factory.js";
 import { createPiMock, makeCtx, makeStaleCtx } from "./support/pi-mock.js";
 import {
@@ -346,6 +347,15 @@ describe("index.ts extension wiring", () => {
 				{ reason: "startup" },
 				makeCtx({ cwd: process.cwd(), sessionId: "parent" }),
 			);
+			// #3623: model the legitimate unrelated producer that can finish
+			// during the same real session_start. This uses the production ledger
+			// seam, not a fake ledger, and keeps the bus assertion honest about
+			// multi-producer lifecycle callbacks.
+			recordDegradation({
+				kind: "instance-registry-lock-stale-takeover",
+				subject: path.join(process.cwd(), ".probe-home", "instances.json"),
+				reason: "test fault injection: unrelated registry lock takeover",
+			});
 
 			const dbg = vi.fn();
 			wireBusEmitter(() => {
@@ -360,9 +370,19 @@ describe("index.ts extension wiring", () => {
 				dbg,
 			});
 			expect(dbg).toHaveBeenCalledTimes(1);
-			expect(getDegradationSummary()).toEqual([
-				expect.objectContaining({ kind: "bus-stale", count: 1 }),
-			]);
+			const busStaleRecords = getDegradationSummary().filter(
+				(record) => record.kind === "bus-stale",
+			);
+			expect(busStaleRecords).toHaveLength(1);
+			expect(busStaleRecords[0]).toEqual(
+				expect.objectContaining({
+					kind: "bus-stale",
+					count: 1,
+					latestReasons: [
+						expect.objectContaining({ subject: "pilens:files:touched" }),
+					],
+				}),
+			);
 
 			const recoveredEmit = vi.fn();
 			const subagent = createPiMock();
@@ -1626,6 +1646,12 @@ describe("index.ts extension wiring", () => {
 		});
 
 		it("renders degradations through the shared renderDegradationLines seam, agreeing with pilens_health (#2515 S3)", async () => {
+			// #3498 (PR #3593): an earlier test's session shutdown can leave a
+			// queued registry removal or a superseded registration on the
+			// registry tail, which records its ledger row after a bare reset.
+			// Join the tail first so this test's exact-list assertion only sees
+			// what it records itself.
+			await _settleRegistryMutationsForTests();
 			resetDegradationLedger();
 			try {
 				// `log-sink-rotated` is an INFORMATIONAL kind (see

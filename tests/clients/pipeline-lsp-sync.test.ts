@@ -60,6 +60,52 @@ afterEach(() => {
 });
 
 describe("resyncLspFile — bounded pre-dispatch LSP sync", () => {
+	// #3405: this is the ONE touch in the tree that knows pi-lens just wrote the
+	// file, so it is the one that declares a save. Recurrence it prevents: the
+	// client advertised `didSave` for months with no caller emitting one, so a
+	// save-triggered server (Expert recompiles the project on didSave and on
+	// nothing else) published nothing for an edit made through pi-lens.
+	it("declares the post-write touch a save so didSave is sent", async () => {
+		const touch = vi.fn(async () => ({ diags: [] }));
+		mockService(touch);
+		await resyncLspFile("/proj/a.ts", "content", true, false, getFlag, dbg);
+		expect(touch).toHaveBeenCalledWith(
+			"/proj/a.ts",
+			"content",
+			expect.objectContaining({ source: "lsp_sync", saved: true }),
+		);
+	});
+
+	// #3405 r2: the byte/line bound moved to `clients/lsp/content-limits.ts`, so
+	// the pipeline now CALLS a shared predicate instead of owning a private copy.
+	// Recurrence this prevents: deleting that call along with the copy — which is
+	// what "delete the pipeline-local check" reads as — would start handing the
+	// server whole-file didOpen frames for documents this pipeline has always
+	// refused to sync. The save seam's policy (drop the redundant text, still
+	// send the save) is deliberately NOT this one.
+	// #3481: the read stamp reaches touchFile, where the notify queue orders
+	// the sync against other reads of the file.
+	it("passes the caller's read stamp to the touch", async () => {
+		const touch = vi.fn(async () => ({ diags: [] }));
+		mockService(touch);
+		await resyncLspFile("/proj/a.ts", "content", true, false, getFlag, dbg, 42);
+		expect(touch).toHaveBeenCalledWith(
+			"/proj/a.ts",
+			"content",
+			expect.objectContaining({ readStamp: 42 }),
+		);
+	});
+
+	it("does not sync a document past the shared content bound", async () => {
+		const touch = vi.fn(async () => ({ diags: [] }));
+		mockService(touch);
+		// Few lines, past the BYTE bound only — so neutering the shared byte
+		// branch reds this writer too, not just the save writer.
+		const oversized = `${"x".repeat(3 * 1024 * 1024)}\n`;
+		await resyncLspFile("/proj/huge.ts", oversized, true, false, getFlag, dbg);
+		expect(touch).not.toHaveBeenCalled();
+	});
+
 	it("abandons a wedged touch after the budget instead of hanging", async () => {
 		// touchFile that never resolves = a server whose didChange write backpressures.
 		// Kit-gated (#1838): the wedge is an explicit gatedPromise, so "the budget
@@ -321,7 +367,102 @@ describe("resyncLspFile — bounded pre-dispatch LSP sync", () => {
 		);
 
 		// resyncLspFile resolves immediately without waiting on auxiliary warmup
-		await expect(resyncPromise).resolves.toBeUndefined();
+		await expect(resyncPromise).resolves.toBe("synced");
 		expect(getAuxSpy).toHaveBeenCalledTimes(1);
+	});
+});
+
+// #3528 r1 F1: the deferred drain's post-exit row reported `synced` for a
+// resync that returned before touching anything. Each return path names what
+// it did, so a caller can record `synced` only when a touch went out.
+describe("resyncLspFile — its outcome names what it did (#3528 r1 F1)", () => {
+	const resync = (
+		content = "content",
+		flag: (name: string) => boolean | undefined = () => undefined,
+		needsContentRefresh = true,
+		lspSyncCompleted = false,
+	) =>
+		resyncLspFile(
+			"/proj/a.ts",
+			content,
+			needsContentRefresh,
+			lspSyncCompleted,
+			flag,
+			dbg,
+		);
+
+	it("synced: the touch completed", async () => {
+		mockService(async () => ({ diags: [] }));
+		await expect(resync()).resolves.toBe("synced");
+	});
+
+	it("no-lsp: the flag turned the LSP off", async () => {
+		mockService(async () => ({ diags: [] }));
+		await expect(resync("content", (name) => name === "no-lsp")).resolves.toBe(
+			"no-lsp",
+		);
+	});
+
+	it("up-to-date: no refresh needed and the sync already ran", async () => {
+		mockService(async () => ({ diags: [] }));
+		await expect(resync("content", () => undefined, false, true)).resolves.toBe(
+			"up-to-date",
+		);
+	});
+
+	it("too-large: past the shared content bound", async () => {
+		mockService(async () => ({ diags: [] }));
+		await expect(resync(`${"x".repeat(3 * 1024 * 1024)}\n`)).resolves.toBe(
+			"too-large",
+		);
+	});
+
+	it("unsupported: no server serves the file", async () => {
+		vi.mocked(getLSPService).mockReturnValue(
+			makeLspServiceDouble({ supportsLSP: () => false }) as any,
+		);
+		await expect(resync()).resolves.toBe("unsupported");
+	});
+
+	it("aborted: the turn was already aborted", async () => {
+		const controller = new AbortController();
+		controller.abort();
+		setAmbientAbortSignal(controller.signal);
+		mockService(async () => ({ diags: [] }));
+		await expect(resync()).resolves.toBe("aborted");
+	});
+
+	it("abandoned: the bound gave up on a wedged touch", async () => {
+		const gate = gatedPromise<unknown>();
+		mockService(() => gate.promise);
+		await expect(resync()).resolves.toBe("abandoned");
+		gate.resolve(null);
+	});
+
+	it("failed: the service lookup threw", async () => {
+		vi.mocked(getLSPService).mockImplementation(() => {
+			throw new Error("service unavailable");
+		});
+		await expect(resync()).resolves.toBe("failed");
+	});
+
+	it("not-sent: the touch reached no client", async () => {
+		mockService(async () => undefined);
+		await expect(resync()).resolves.toBe("not-sent");
+	});
+
+	it("superseded: the notify queue dropped this read as older than one it sent", async () => {
+		mockService(async () => ({
+			diags: [],
+			supersededServerIds: ["typescript"],
+		}));
+		await expect(resync()).resolves.toBe("superseded");
+	});
+
+	it("failed: the touch rejected", async () => {
+		mockService(async () => {
+			throw new Error("server gone");
+		});
+		await expect(resync()).resolves.toBe("failed");
 	});
 });

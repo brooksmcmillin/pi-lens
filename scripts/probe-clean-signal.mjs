@@ -45,11 +45,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
-	checkCleanSignalDrift,
 	classifyCleanBehavior,
 	classifyFirstPublish,
 	COMPARABLE_FIRST_PUBLISH,
 	DRIFT_SUMMARY_PATH,
+	createPublishTraceDrainer,
+	findCleanSignalDrift,
 	strategyKeyForLang,
 } from "./lib/clean-signal.mjs";
 import {
@@ -89,7 +90,9 @@ const { LSP_FIXTURES } = await imp("scripts/smoke-tools.mjs");
 const { getLSPService, resetLSPService } = await imp(
 	"dist/clients/lsp/index.js",
 );
-const { initLSPConfig } = await imp("dist/clients/lsp/config.js");
+const { getServersForFileWithConfig, initLSPConfig } = await imp(
+	"dist/clients/lsp/config.js",
+);
 const { SERVER_DIAGNOSTIC_STRATEGIES } = await imp(
 	"dist/clients/lsp/wait-policy/strategies.js",
 );
@@ -152,14 +155,10 @@ const src = process.env.CI ? "ci" : "dev";
 // alive while the instrument was dead (#3310). Read the sink the client
 // actually writes: the log is append-only, so a byte offset taken at each phase
 // boundary attributes every publish to exactly one phase.
-const PUB_MESSAGE_RE =
-	/^server=(\S+) pubVersion=(\S+) docVersion=(\S+) diags=(\d+)/;
 const PUB_LOG_PATH = path.join(
 	process.env.PI_LENS_HOME ?? os.tmpdir(),
 	"extension.log",
 );
-let pubLogOffset = 0;
-
 function pubLogSize() {
 	try {
 		return fs.statSync(PUB_LOG_PATH).size;
@@ -168,59 +167,33 @@ function pubLogSize() {
 	}
 }
 
-/** Start a new phase: everything already in the log belongs to the previous one. */
-function resetPublishTrace() {
-	pubLogOffset = pubLogSize();
-}
-
-/** Drain every publish appended since the last drain into `sink`. */
-function drainPublishTrace(sink) {
-	const size = pubLogSize();
-	// A rotated/truncated log must not be read from a stale offset.
-	if (size < pubLogOffset) pubLogOffset = 0;
-	if (size === pubLogOffset) return;
-	let chunk = "";
-	try {
-		const fd = fs.openSync(PUB_LOG_PATH, "r");
-		try {
-			const buf = Buffer.alloc(size - pubLogOffset);
-			const read = fs.readSync(fd, buf, 0, buf.length, pubLogOffset);
-			chunk = buf.subarray(0, read).toString("utf8");
-			pubLogOffset += read;
-		} finally {
-			fs.closeSync(fd);
-		}
-	} catch {
-		return;
-	}
-	// A trailing partial line stays unconsumed: rewind to the last newline.
-	const lastNewline = chunk.lastIndexOf("\n");
-	if (lastNewline < 0) {
-		pubLogOffset -= Buffer.byteLength(chunk, "utf8");
-		return;
-	}
-	const consumed = chunk.slice(0, lastNewline + 1);
-	pubLogOffset -= Buffer.byteLength(chunk.slice(lastNewline + 1), "utf8");
-	for (const line of consumed.split("\n")) {
-		if (!line.trim()) continue;
-		let row;
-		try {
-			row = JSON.parse(line);
-		} catch {
-			continue;
-		}
-		if (row?.subsystem !== "lsp-pub") continue;
-		const m = PUB_MESSAGE_RE.exec(String(row.message ?? ""));
-		if (!m) continue;
-		if (ECHO_TRACE) console.error(`[lsp-pub] ${row.message}`);
-		sink.push({
-			server: m[1],
-			pubVersion: m[2],
-			diags: Number(m[4]),
-			versioned: m[2] !== "undefined",
-		});
-	}
-}
+const drainPublishTrace = createPublishTraceDrainer({
+	echoTrace: ECHO_TRACE,
+	readLog(offset) {
+		const size = pubLogSize();
+		if (size === offset) return { size, read: () => null };
+		return {
+			size,
+			read(start) {
+				try {
+					const fd = fs.openSync(PUB_LOG_PATH, "r");
+					try {
+						const buf = Buffer.alloc(size - start);
+						const bytesRead = fs.readSync(fd, buf, 0, buf.length, start);
+						return {
+							chunk: buf.subarray(0, bytesRead).toString("utf8"),
+							bytesRead,
+						};
+					} finally {
+						fs.closeSync(fd);
+					}
+				} catch {
+					return null;
+				}
+			},
+		};
+	},
+});
 
 // A byte-changing, diagnostic-neutral edit: append a trailing comment line in the
 // file's comment syntax (falls back to a blank line). Keeps the diagnostic SET
@@ -265,6 +238,7 @@ for (const fx of fixtures) {
 	const row = {
 		lang: fx.lang,
 		server: fx.serverHint,
+		serverId: undefined,
 		behavior: "unknown",
 		tier: 0,
 		tierLabel: "",
@@ -301,6 +275,9 @@ async function probeFixture(fx, dst, row) {
 		repoRoot,
 		workspace: dst,
 	});
+	row.serverId = getServersForFileWithConfig(absFile).find(
+		(server) => server.role !== "auxiliary",
+	)?.id;
 	if (install && ensureTool) {
 		for (const t of fx.tools ?? []) await ensureTool(t).catch(() => undefined);
 	}
@@ -341,13 +318,13 @@ async function probeFixture(fx, dst, row) {
 	let dirtyResult;
 	let support;
 	try {
-		resetPublishTrace();
+		drainPublishTrace.reset(pubLogSize());
 		dirtyResult = await touch(dirtyContent, PROVE_LIVE_WAIT_MS);
 		await sleep(SETTLE_MS);
 		support = await lsp.getWorkspaceDiagnosticsSupport(absFile);
 		await sleep(SETTLE_MS);
 		// Phase boundary: every publish written so far is the dirty touch's.
-		drainPublishTrace(dirtyPubs);
+		drainPublishTrace(dirtyPubs, row.serverId);
 
 		fs.writeFileSync(
 			absFile,
@@ -357,7 +334,7 @@ async function probeFixture(fx, dst, row) {
 		await touch(fs.readFileSync(absFile, "utf8"), STEP_WAIT_MS);
 		await sleep(SETTLE_MS);
 	} finally {
-		drainPublishTrace(cleanPubs);
+		drainPublishTrace(cleanPubs, row.serverId);
 	}
 
 	row.mode = support?.mode ?? "unknown";
@@ -424,7 +401,7 @@ const unk = rows.filter((r) => r.behavior === "unknown").length;
 // /strategies.ts's `silentOnClean` marker. Telemetry only — NEVER a CI gate (this script
 // always exit(0)s regardless); a mismatch is logged to stdout and written as a
 // matrix footnote so a human decides whether to flip the marker. `unknown`
-// rows are never fed in (checkCleanSignalDrift already guards this).
+// rows are never fed in (findCleanSignalDrift's per-row check guards this).
 //
 // Resolved to the same `targetLang` the matrix merge uses (clean fixture wins
 // over its dirty sibling for the same base lang — resolveTargetLangRows is
@@ -440,11 +417,13 @@ const unk = rows.filter((r) => r.behavior === "unknown").length;
 // means today's publishes-* observation compares clean (no false alarm), and
 // a future TS7 build going silent again would surface as `silent-not-marked`
 // — a real signal, not a skipped row.
-const driftWarnings = resolveTargetLangRows(rows)
-	.map((r) => checkCleanSignalDrift(r, lookupSilentOnClean(r.lang)))
-	.filter(
-		(d) => d.kind === "silent-not-marked" || d.kind === "marked-not-silent",
-	);
+// #3444: one row per strategy key (findCleanSignalDrift aggregates), so two fixtures of one
+// server (ast-grep, ast-grep-baseline) are judged together against its single
+// marker, and a degenerate silent row never counts.
+const driftWarnings = findCleanSignalDrift(
+	resolveTargetLangRows(rows),
+	lookupSilentOnClean,
+);
 if (driftWarnings.length) {
 	console.log(
 		`\n  Drift vs wait-policy/strategies.ts silentOnClean marker (${driftWarnings.length} — telemetry only, never a CI gate):`,
@@ -621,11 +600,10 @@ function updateMatrix(measuredRows) {
 	// agree. NEVER a CI gate — this only rewrites a footnote section in the doc.
 	// #558: native-ts7 rows are compared too, against an explicit `false`
 	// expectation (see the drift-check comment above), not classic's marker.
-	const footnoteWarnings = targetLangRows
-		.map((r) => checkCleanSignalDrift(r, lookupSilentOnClean(r.lang)))
-		.filter(
-			(d) => d.kind === "silent-not-marked" || d.kind === "marked-not-silent",
-		);
+	const footnoteWarnings = findCleanSignalDrift(
+		targetLangRows,
+		lookupSilentOnClean,
+	);
 	out = writeDriftFootnote(out, footnoteWarnings);
 
 	if (out !== text) {

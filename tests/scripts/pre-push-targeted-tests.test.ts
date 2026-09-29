@@ -24,8 +24,13 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+	CI_ONLY_PRE_PUSH_TESTS,
 	collectTestFiles,
 	MAX_SELECTED_TESTS,
+	TEST_TREE_GOVERNANCE_TESTS,
+	TREE_SCANNING_GOVERNANCE_TESTS,
+	changesProductionFile,
+	changesTestTreeFile,
 	selectTargetedTests,
 } from "../../scripts/pre-push-targeted-tests.mjs";
 
@@ -54,6 +59,30 @@ afterEach(() => {
 });
 
 describe("selectTargetedTests — path-mirror pass", () => {
+	it("selects the registered tree scanners for production changes", () => {
+		enterFixture();
+		for (const test of TREE_SCANNING_GOVERNANCE_TESTS)
+			write(test, "it('governance');\n");
+		write("clients/review-graph/git-identity.ts", "export {}\n");
+
+		const result = selectTargetedTests(
+			["clients/review-graph/git-identity.ts"],
+			collectTestFiles("tests"),
+		);
+
+		// Prevents tree scanners from disappearing from a production-file push
+		// because they do not import the changed module (#3426).
+		expect(changesProductionFile("clients/review-graph/git-identity.ts")).toBe(
+			true,
+		);
+		expect(result.selected).toEqual(TREE_SCANNING_GOVERNANCE_TESTS);
+	});
+
+	it("arms the registry for tools, mcp, scripts, and the root index", () => {
+		for (const file of ["tools/x.ts", "mcp/x.ts", "scripts/x.mjs", "index.ts"])
+			expect(changesProductionFile(file)).toBe(true);
+	});
+
 	it("selects the exact mirrored test path for a changed source file", () => {
 		enterFixture();
 		write("clients/foo/bar.ts", "export const x = 1;\n");
@@ -68,6 +97,83 @@ describe("selectTargetedTests — path-mirror pass", () => {
 		expect(result.selected).toEqual(["tests/clients/foo/bar.test.ts"]);
 		expect(result.unmatched).toEqual([]);
 		expect(result.capped).toBe(false);
+	});
+
+	it("defers a CI-only real-spawn suite to CI and reports it (#3426 H3432-1)", () => {
+		enterFixture();
+		const ciOnlyFile = Object.keys(CI_ONLY_PRE_PUSH_TESTS)[0];
+		expect(ciOnlyFile).toBeDefined();
+		write(ciOnlyFile as string, "it('hook', () => {});\n");
+
+		const allTests = collectTestFiles("tests");
+		const prePush = selectTargetedTests([ciOnlyFile as string], allTests);
+		// The budget-busting suite never enters the local pre-push selection…
+		expect(prePush.selected).toEqual([]);
+		// …and its deferral is disclosed, never silently dropped.
+		expect(prePush.excludedCiOnly).toEqual([ciOnlyFile]);
+		expect(prePush.capped).toBe(false);
+
+		// The CI job admits it through the same production entry point.
+		const ci = selectTargetedTests([ciOnlyFile as string], allTests, {
+			includeCiOnly: true,
+		});
+		expect(ci.selected).toEqual([ciOnlyFile]);
+		expect(ci.excludedCiOnly).toEqual([]);
+	});
+
+	// #3472 recurrence (#3492, 2026-09-26): a new test's real 60 s setTimeout
+	// pushed with the flake-shape ratchet red, because the ratchet scans the
+	// tests tree and neither the mirror nor the import pass selects it. The
+	// changed files are 0b5cb182a's own.
+	it("arms the tests-tree ratchet when a pushed change touches the tests tree", () => {
+		enterFixture();
+		for (const test of TEST_TREE_GOVERNANCE_TESTS)
+			write(test, "it('ratchet');\n");
+		write("clients/lsp/client.ts", "export {}\n");
+		write("tests/clients/lsp/diagnostics-fence.test.ts", "it('x');\n");
+
+		const changed = [
+			".changelog/3484-fence-hold-record.md",
+			"clients/lsp/client.ts",
+			"tests/clients/lsp/diagnostics-fence.test.ts",
+		];
+		const result = selectTargetedTests(changed, collectTestFiles("tests"));
+
+		expect(TEST_TREE_GOVERNANCE_TESTS).toContain(
+			"tests/clients/flake-shape-ratchet.test.ts",
+		);
+		expect([...result.selected].sort()).toEqual(
+			[
+				"tests/clients/lsp/diagnostics-fence.test.ts",
+				...TEST_TREE_GOVERNANCE_TESTS,
+			].sort(),
+		);
+		// A support-module change reaches the ratchet too: it counts helpers
+		// under tests/support (the #2885 never-settling-promise detector).
+		expect(changesTestTreeFile("tests/support/fake-child.ts")).toBe(true);
+		expect(
+			selectTargetedTests(
+				["tests/support/fake-child.ts"],
+				collectTestFiles("tests"),
+			).selected,
+		).toEqual(TEST_TREE_GOVERNANCE_TESTS);
+	});
+
+	it("leaves the tests-tree ratchet out of a push that touches no test file", () => {
+		enterFixture();
+		for (const test of TEST_TREE_GOVERNANCE_TESTS)
+			write(test, "it('ratchet');\n");
+		write("clients/foo/bar.ts", "export const x = 1;\n");
+
+		const allTests = collectTestFiles("tests");
+		expect(changesTestTreeFile("clients/foo/bar.ts")).toBe(false);
+		expect(changesTestTreeFile("docs/tests/x.md")).toBe(false);
+		expect(
+			selectTargetedTests(["clients/foo/bar.ts"], allTests).selected,
+		).toEqual([]);
+		expect(selectTargetedTests(["docs/tests/x.md"], allTests).selected).toEqual(
+			[],
+		);
 	});
 
 	it("always includes a changed test file itself", () => {
@@ -164,6 +270,52 @@ describe("selectTargetedTests — the >25-file cap (F1)", () => {
 		expect(result.totalBeforeCap).toBe(testCount);
 	});
 
+	// #3492 (2026-09-26): 0b5cb182a changed clients/lsp/client.ts, which 71
+	// test files match, so the heuristic selection capped and the hook ran
+	// NOTHING; the raw 60 s timer it added reached CI. The registries are
+	// bounded by construction, so a capped push still runs them.
+	it("still runs the armed governance registries when the heuristic selection caps", () => {
+		enterFixture();
+		for (const test of [
+			...TREE_SCANNING_GOVERNANCE_TESTS,
+			...TEST_TREE_GOVERNANCE_TESTS,
+		])
+			write(test, "it('governance');\n");
+		write("clients/lsp/client.ts", "export const shared = 1;\n");
+		for (let i = 0; i < MAX_SELECTED_TESTS + 1; i++) {
+			write(
+				`tests/clients/lsp/generated-${i}.test.ts`,
+				`import { shared } from '../../../clients/lsp/client.js';\n`,
+			);
+		}
+		write("tests/clients/lsp/diagnostics-fence.test.ts", "it('x');\n");
+
+		const result = selectTargetedTests(
+			[
+				".changelog/3484-fence-hold-record.md",
+				"clients/lsp/client.ts",
+				"tests/clients/lsp/diagnostics-fence.test.ts",
+			],
+			collectTestFiles("tests"),
+		);
+
+		expect(result.capped).toBe(true);
+		expect([...result.selected].sort()).toEqual(
+			[...TREE_SCANNING_GOVERNANCE_TESTS, ...TEST_TREE_GOVERNANCE_TESTS].sort(),
+		);
+		// The registries never push the heuristic selection over the cap.
+		for (let i = MAX_SELECTED_TESTS - 1; i <= MAX_SELECTED_TESTS + 1; i++)
+			fs.rmSync(`tests/clients/lsp/generated-${i}.test.ts`, { force: true });
+		const underCap = selectTargetedTests(
+			["clients/lsp/client.ts", "tests/clients/lsp/diagnostics-fence.test.ts"],
+			collectTestFiles("tests"),
+		);
+		expect(underCap.capped).toBe(false);
+		expect(underCap.selected).toContain(
+			"tests/clients/lsp/generated-0.test.ts",
+		);
+	});
+
 	it("does not cap when the match count is exactly at the limit", () => {
 		enterFixture();
 		write("clients/shared.ts", "export const shared = 1;\n");
@@ -199,6 +351,20 @@ describe("selectTargetedTests — no-match fallback (F7)", () => {
 });
 
 describe(".husky hooks — PI_LENS_SKIP_HOOKS accepts any non-empty value (F8)", () => {
+	it("pre-commit formats only staged files through the pinned binary (#3426)", () => {
+		const hook = fs.readFileSync(
+			path.join(repoRoot, ".husky/pre-commit"),
+			"utf8",
+		);
+		expect(hook).toContain(
+			"git diff --cached --name-only --diff-filter=ACMR -z",
+		);
+		expect(hook).toContain(
+			"npx --no-install oxfmt --check --no-error-on-unmatched-pattern",
+		);
+		expect(hook).not.toContain("npm install oxfmt --no-save");
+	});
+
 	it.each(["1", "true"])(
 		"pre-commit exits 0 and skips without running checks when PI_LENS_SKIP_HOOKS=%s",
 		(value) => {

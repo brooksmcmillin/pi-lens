@@ -34,6 +34,7 @@ import {
 	admitWidgetDiagnosticsWrite,
 	recordDiagnostics,
 } from "./widget-state.js";
+import { writeOrderToken } from "./write-ordering-guard.js";
 import { getDiagnosticLogger } from "./diagnostic-logger.js";
 import { getDiagnosticTracker } from "./diagnostic-tracker.js";
 import { loadDispatchIntegration } from "./dispatch/lazy.js";
@@ -61,6 +62,7 @@ import {
 	isExcludedDirName,
 } from "./file-utils.js";
 import type { FormatService } from "./format-service.js";
+import type { GenerationHandle } from "./generation-guard.js";
 import { logLatency } from "./latency-logger.js";
 import type { PostAutofixNotice } from "./post-autofix-notice.js";
 import { emitLensAnalysisComplete } from "./lens-events.js";
@@ -87,6 +89,10 @@ import {
 	incrementDegradationCount,
 	recordDegradationOnce,
 } from "./degradation-ledger.js";
+import {
+	type FileMutationHold,
+	holdFileMutationQueue,
+} from "./file-mutation-queue.js";
 import { establishToolAgreement } from "./tool-agreement.js";
 import { dropFindingsForMissingPaths } from "./advisory-provenance.js";
 import {
@@ -106,9 +112,8 @@ import {
 	markdownlintConfigArgs,
 } from "./tool-policy.js";
 import type { PathSetLike } from "./runtime-coordinator.js";
+import { exceedsLspSyncLimits } from "./lsp/content-limits.js";
 
-const LSP_MAX_FILE_BYTES = RUNTIME_CONFIG.pipeline.lspMaxFileBytes;
-const LSP_MAX_FILE_LINES = RUNTIME_CONFIG.pipeline.lspMaxFileLines;
 const LSP_SPAWN_BUDGET_MS = RUNTIME_CONFIG.pipeline.lspSpawnBudgetMs;
 const AUTOFIX_CHANGED_FILE_SCAN_LIMIT = 5000;
 
@@ -225,32 +230,6 @@ async function diffProjectSnapshot(
 	return [...changed].sort((a, b) => a.localeCompare(b));
 }
 
-function exceedsLspSyncLimits(
-	_filePath: string,
-	content: string,
-): {
-	tooLarge: boolean;
-	reason: string;
-} {
-	const sizeBytes = Buffer.byteLength(content, "utf-8");
-	if (sizeBytes > LSP_MAX_FILE_BYTES) {
-		return {
-			tooLarge: true,
-			reason: `${Math.round(sizeBytes / 1024)}KB exceeds ${Math.round(LSP_MAX_FILE_BYTES / 1024)}KB`,
-		};
-	}
-
-	const lineCount = content.split("\n").length;
-	if (lineCount > LSP_MAX_FILE_LINES) {
-		return {
-			tooLarge: true,
-			reason: `${lineCount} lines exceeds ${LSP_MAX_FILE_LINES}`,
-		};
-	}
-
-	return { tooLarge: false, reason: "" };
-}
-
 // --- Types ---
 
 export interface PipelineContext {
@@ -276,6 +255,13 @@ export interface PipelineContext {
 		sessionId: string;
 		turnIndex: number;
 		writeIndex: number;
+		/**
+		 * #3540 r2: the order turn `writeIndex` was drawn in
+		 * (`RuntimeCoordinator.writeOrderTurn`). Unlike `turnIndex` it never
+		 * restarts at a session reset, so it, not `turnIndex`, orders writes
+		 * into stores that outlive the session (the widget).
+		 */
+		orderTurn?: number;
 		/** Raw model id / provider, separate from the combined `model` display
 		 * string above — worklog attribution (#1448) wants the two apart. */
 		modelId?: string;
@@ -316,6 +302,23 @@ export interface PipelineContext {
 	wordIndex?: WordIndex | null;
 	/** Debounced-persist hook fired after a successful per-edit update. */
 	onWordIndexUpdated?: (index: WordIndex) => void;
+	/**
+	 * #3512: the session current when this pipeline was dispatched, handed to
+	 * the deferred cascade so a touch it records after a same-cwd replacement
+	 * is dropped. Absent ⇒ the cascade records unguarded.
+	 */
+	sessionGeneration?: GenerationHandle;
+	/**
+	 * #3506: draws a fresh `telemetry.writeIndex` when the bytes this pipeline
+	 * analyses are not the bytes its handler's token was drawn for. #3559: with
+	 * the turn it is drawn in, which is later than the handler's when the
+	 * pipeline outlived its turn.
+	 */
+	nextWriteIndex?: () => {
+		turnIndex: number;
+		orderTurn: number;
+		writeIndex: number;
+	};
 }
 
 export interface PipelineDeps {
@@ -345,6 +348,12 @@ export interface PipelineResult {
 	fileModified: boolean;
 	/** Hash captured after this pipeline's own writes, before analysis awaits. */
 	postWriteStateHash?: string;
+	/** #3506: the write token the analysis was recorded under. */
+	writeIndex?: number;
+	/** #3559: the order turn `writeIndex` was drawn in (#3540 r2). */
+	orderTurn?: number;
+	/** #3503: `Date.now()` taken before the bytes the analysis ran on were read. */
+	analysisReadAtMs?: number;
 	/** Files modified by pi-lens format/autofix, including side-effect files. */
 	changedFiles?: string[];
 	/** Blocking-only formatted output for turn_end re-surfacing if agent didn't fix */
@@ -473,7 +482,11 @@ const _eslintCache = new BoundedLruCache<
  * Returns 1 if the file changed, 0 if ESLint is not configured / not available /
  * made no changes.
  */
-async function tryEslintFix(filePath: string, cwd: string): Promise<number> {
+async function tryEslintFix(
+	filePath: string,
+	cwd: string,
+	writeHold?: FileMutationHold,
+): Promise<number> {
 	const userHasConfig = hasEslintConfig(cwd);
 	if (!userHasConfig) return 0;
 	// PATH is part of command resolution; include it so an install or PATH
@@ -550,6 +563,7 @@ async function tryEslintFix(filePath: string, cwd: string): Promise<number> {
 	}
 	if (cached.latch.read() !== true || !cached.bin) return 0;
 	const cmd = cached.bin;
+	if (writeHold) await writeHold.acquire();
 
 	return detectFileChangedAfterCommand(
 		filePath,
@@ -560,9 +574,14 @@ async function tryEslintFix(filePath: string, cwd: string): Promise<number> {
 	);
 }
 
-async function tryStylelintFix(filePath: string, cwd: string): Promise<number> {
+async function tryStylelintFix(
+	filePath: string,
+	cwd: string,
+	writeHold?: FileMutationHold,
+): Promise<number> {
 	const cmd = await resolveToolCommandWithInstallFallback(cwd, "stylelint");
 	if (!cmd) return 0;
+	if (writeHold) await writeHold.acquire();
 
 	return detectFileChangedAfterCommand(
 		filePath,
@@ -573,9 +592,14 @@ async function tryStylelintFix(filePath: string, cwd: string): Promise<number> {
 	);
 }
 
-async function trySqlfluffFix(filePath: string, cwd: string): Promise<number> {
+async function trySqlfluffFix(
+	filePath: string,
+	cwd: string,
+	writeHold?: FileMutationHold,
+): Promise<number> {
 	const cmd = await resolveToolCommandWithInstallFallback(cwd, "sqlfluff");
 	if (!cmd) return 0;
+	if (writeHold) await writeHold.acquire();
 
 	const args = ["fix", "--force", filePath];
 	if (!hasSqlfluffConfig(cwd)) {
@@ -584,7 +608,11 @@ async function trySqlfluffFix(filePath: string, cwd: string): Promise<number> {
 	return detectFileChangedAfterCommand(filePath, cmd, args, cwd);
 }
 
-async function tryRubocopFix(filePath: string, cwd: string): Promise<number> {
+async function tryRubocopFix(
+	filePath: string,
+	cwd: string,
+	writeHold?: FileMutationHold,
+): Promise<number> {
 	const resolved = await resolveCommandArgsWithInstallFallback(
 		getRubocopCommand(cwd),
 		"rubocop",
@@ -593,6 +621,7 @@ async function tryRubocopFix(filePath: string, cwd: string): Promise<number> {
 		10000,
 	);
 	if (!resolved) return 0;
+	if (writeHold) await writeHold.acquire();
 
 	return detectFileChangedAfterCommand(
 		filePath,
@@ -603,9 +632,14 @@ async function tryRubocopFix(filePath: string, cwd: string): Promise<number> {
 	);
 }
 
-async function tryKtlintFix(filePath: string, cwd: string): Promise<number> {
+async function tryKtlintFix(
+	filePath: string,
+	cwd: string,
+	writeHold?: FileMutationHold,
+): Promise<number> {
 	const cmd = await resolveToolCommandWithInstallFallback(cwd, "ktlint");
 	if (!cmd) return 0;
+	if (writeHold) await writeHold.acquire();
 
 	return detectFileChangedAfterCommand(
 		filePath,
@@ -625,7 +659,11 @@ const golangciAutofixChecker = createAvailabilityChecker(
 const detektAutofixChecker = createAvailabilityChecker("detekt", ".bat");
 const ktfmtAutofixChecker = createAvailabilityChecker("ktfmt", ".bat");
 
-async function tryKtfmtFix(filePath: string, cwd: string): Promise<number> {
+async function tryKtfmtFix(
+	filePath: string,
+	cwd: string,
+	writeHold?: FileMutationHold,
+): Promise<number> {
 	// Config-first: the autofix policy only reaches here when the project opted
 	// into ktfmt, so resolveAvailableOrInstall honors that gate. ktfmt writes the
 	// formatted file in place and exits 0; treat any byte change as the fix.
@@ -635,6 +673,7 @@ async function tryKtfmtFix(filePath: string, cwd: string): Promise<number> {
 		cwd,
 	);
 	if (!cmd) return 0;
+	if (writeHold) await writeHold.acquire();
 	const absPath = path.resolve(cwd, filePath);
 	return detectFileChangedAfterCommand(filePath, cmd, [absPath], cwd, [0]);
 }
@@ -642,6 +681,7 @@ async function tryKtfmtFix(filePath: string, cwd: string): Promise<number> {
 async function tryGolangciLintFix(
 	filePath: string,
 	cwd: string,
+	writeHold?: FileMutationHold,
 ): Promise<number> {
 	// Config-first: the autofix policy only reaches here when a .golangci.* config
 	// exists. resolveAvailableOrInstall honors that gate (won't auto-install a
@@ -653,6 +693,7 @@ async function tryGolangciLintFix(
 		cwd,
 	);
 	if (!cmd) return 0;
+	if (writeHold) await writeHold.acquire();
 	return detectFileChangedAfterCommand(
 		filePath,
 		cmd,
@@ -662,12 +703,17 @@ async function tryGolangciLintFix(
 	);
 }
 
-async function tryDetektFix(filePath: string, cwd: string): Promise<number> {
+async function tryDetektFix(
+	filePath: string,
+	cwd: string,
+	writeHold?: FileMutationHold,
+): Promise<number> {
 	const configPath = findDetektConfig(cwd);
 	if (!configPath) return 0;
 	if (!(await detektAutofixChecker.isAvailableAsync(cwd))) return 0;
 	const cmd = detektAutofixChecker.getCommand(cwd);
 	if (!cmd) return 0;
+	if (writeHold) await writeHold.acquire();
 	const absPath = path.resolve(cwd, filePath);
 	return detectFileChangedAfterCommand(
 		filePath,
@@ -681,9 +727,11 @@ async function tryDetektFix(filePath: string, cwd: string): Promise<number> {
 async function tryMarkdownlintFix(
 	filePath: string,
 	cwd: string,
+	writeHold?: FileMutationHold,
 ): Promise<number> {
 	const cmd = await resolveToolCommandWithInstallFallback(cwd, "markdownlint");
 	if (!cmd) return 0;
+	if (writeHold) await writeHold.acquire();
 	// Shared config-args seam (#1247): the lint runner consumes the same
 	// builder, so the bare --fix here can never fall back to markdownlint's
 	// default all-rules-on config again (the whole-file CHANGELOG/AGENTS
@@ -698,9 +746,14 @@ async function tryMarkdownlintFix(
 	);
 }
 
-async function tryOxlintFix(filePath: string, cwd: string): Promise<number> {
+async function tryOxlintFix(
+	filePath: string,
+	cwd: string,
+	writeHold?: FileMutationHold,
+): Promise<number> {
 	const cmd = await resolveToolCommandWithInstallFallback(cwd, "oxlint");
 	if (!cmd) return 0;
+	if (writeHold) await writeHold.acquire();
 	return detectFileChangedAfterCommand(
 		filePath,
 		cmd,
@@ -710,7 +763,10 @@ async function tryOxlintFix(filePath: string, cwd: string): Promise<number> {
 	);
 }
 
-async function tryRustClippyFix(filePath: string): Promise<string[]> {
+async function tryRustClippyFix(
+	filePath: string,
+	writeHold?: FileMutationHold,
+): Promise<string[]> {
 	const check = await probeToolAsync("cargo", ["--version"], { timeout: 5000 });
 	if (check.error || check.status !== 0) return [];
 
@@ -718,6 +774,7 @@ async function tryRustClippyFix(filePath: string): Promise<string[]> {
 		"Cargo.toml",
 	]);
 	if (!cargoDir) return [];
+	if (writeHold) await writeHold.acquire();
 
 	const before = await snapshotProjectFiles(cargoDir);
 	const result = await safeSpawnAsync(
@@ -729,7 +786,10 @@ async function tryRustClippyFix(filePath: string): Promise<string[]> {
 	return diffProjectSnapshot(cargoDir, before);
 }
 
-async function tryDartFix(filePath: string): Promise<string[]> {
+async function tryDartFix(
+	filePath: string,
+	writeHold?: FileMutationHold,
+): Promise<string[]> {
 	const check = await probeToolAsync("dart", ["--version"], { timeout: 5000 });
 	if (check.error || check.status !== 0) return [];
 
@@ -738,6 +798,7 @@ async function tryDartFix(filePath: string): Promise<string[]> {
 		["pubspec.yaml"],
 	);
 	if (!pubspecDir) return [];
+	if (writeHold) await writeHold.acquire();
 
 	const before = await snapshotProjectFiles(pubspecDir);
 	const result = await safeSpawnAsync("dart", ["fix", "--apply"], {
@@ -757,6 +818,7 @@ export async function runAutofix(
 	dbg: PipelineContext["dbg"],
 	deps: Pick<PipelineDeps, "biomeClient" | "ruffClient" | "fixedThisTurn">,
 	getFlagSource?: PipelineContext["getFlagSource"],
+	writeHold?: FileMutationHold,
 ): Promise<{
 	fixedCount: number;
 	autofixTools: string[];
@@ -847,6 +909,10 @@ export async function runAutofix(
 		};
 	}
 
+	// #3506: a fixer rewrites the file in place, so it runs inside pi's
+	// per-file mutation queue. Each branch enters the queue only once its tool
+	// is resolved, so an availability probe or an install never holds pi's
+	// edits back.
 	for (const toolName of preferredAutofixTools) {
 		attemptedTools.push(toolName);
 		const agreement = establishToolAgreement(toolName, cwd);
@@ -869,6 +935,7 @@ export async function runAutofix(
 				dbg(`autofix: ruff unavailable for ${filePath}`);
 				continue;
 			}
+			if (writeHold) await writeHold.acquire();
 			const result = await ruffClient.fixFileAsync(filePath, cwd);
 			if (result.success && result.fixed > 0) {
 				fixedCount += result.fixed;
@@ -889,6 +956,7 @@ export async function runAutofix(
 				dbg(`autofix: biome unavailable or unsupported for ${filePath}`);
 				continue;
 			}
+			if (writeHold) await writeHold.acquire();
 			const result = await biomeClient.fixFileAsync(filePath, cwd);
 			if (result.success && result.fixed > 0) {
 				fixedCount += result.fixed;
@@ -902,7 +970,7 @@ export async function runAutofix(
 		}
 
 		if (toolName === "eslint") {
-			const eslintFixed = await tryEslintFix(filePath, cwd);
+			const eslintFixed = await tryEslintFix(filePath, cwd, writeHold);
 			if (eslintFixed > 0) {
 				fixedCount += eslintFixed;
 				autofixTools.push(`eslint:${eslintFixed}`);
@@ -915,7 +983,7 @@ export async function runAutofix(
 		}
 
 		if (toolName === "stylelint") {
-			const stylelintFixed = await tryStylelintFix(filePath, cwd);
+			const stylelintFixed = await tryStylelintFix(filePath, cwd, writeHold);
 			if (stylelintFixed > 0) {
 				fixedCount += stylelintFixed;
 				autofixTools.push(`stylelint:${stylelintFixed}`);
@@ -930,7 +998,7 @@ export async function runAutofix(
 		}
 
 		if (toolName === "sqlfluff") {
-			const sqlfluffFixed = await trySqlfluffFix(filePath, cwd);
+			const sqlfluffFixed = await trySqlfluffFix(filePath, cwd, writeHold);
 			if (sqlfluffFixed > 0) {
 				fixedCount += sqlfluffFixed;
 				autofixTools.push(`sqlfluff:${sqlfluffFixed}`);
@@ -943,7 +1011,7 @@ export async function runAutofix(
 		}
 
 		if (toolName === "rubocop") {
-			const rubocopFixed = await tryRubocopFix(filePath, cwd);
+			const rubocopFixed = await tryRubocopFix(filePath, cwd, writeHold);
 			if (rubocopFixed > 0) {
 				fixedCount += rubocopFixed;
 				autofixTools.push(`rubocop:${rubocopFixed}`);
@@ -956,7 +1024,7 @@ export async function runAutofix(
 		}
 
 		if (toolName === "ktlint") {
-			const ktlintFixed = await tryKtlintFix(filePath, cwd);
+			const ktlintFixed = await tryKtlintFix(filePath, cwd, writeHold);
 			if (ktlintFixed > 0) {
 				fixedCount += ktlintFixed;
 				autofixTools.push(`ktlint:${ktlintFixed}`);
@@ -969,7 +1037,7 @@ export async function runAutofix(
 		}
 
 		if (toolName === "rust-clippy") {
-			const clippyChangedFiles = await tryRustClippyFix(filePath);
+			const clippyChangedFiles = await tryRustClippyFix(filePath, writeHold);
 			if (clippyChangedFiles.length > 0) {
 				fixedCount += clippyChangedFiles.length;
 				autofixTools.push(`rust-clippy:${clippyChangedFiles.length}`);
@@ -985,7 +1053,7 @@ export async function runAutofix(
 		}
 
 		if (toolName === "dart-analyze") {
-			const dartChangedFiles = await tryDartFix(filePath);
+			const dartChangedFiles = await tryDartFix(filePath, writeHold);
 			if (dartChangedFiles.length > 0) {
 				fixedCount += dartChangedFiles.length;
 				autofixTools.push(`dart-analyze:${dartChangedFiles.length}`);
@@ -1001,7 +1069,7 @@ export async function runAutofix(
 		}
 
 		if (toolName === "golangci-lint") {
-			const fixed = await tryGolangciLintFix(filePath, cwd);
+			const fixed = await tryGolangciLintFix(filePath, cwd, writeHold);
 			if (fixed > 0) {
 				fixedCount += fixed;
 				autofixTools.push(`golangci-lint:${fixed}`);
@@ -1014,7 +1082,7 @@ export async function runAutofix(
 		}
 
 		if (toolName === "detekt") {
-			const fixed = await tryDetektFix(filePath, cwd);
+			const fixed = await tryDetektFix(filePath, cwd, writeHold);
 			if (fixed > 0) {
 				fixedCount += fixed;
 				autofixTools.push(`detekt:${fixed}`);
@@ -1027,7 +1095,7 @@ export async function runAutofix(
 		}
 
 		if (toolName === "ktfmt") {
-			const fixed = await tryKtfmtFix(filePath, cwd);
+			const fixed = await tryKtfmtFix(filePath, cwd, writeHold);
 			if (fixed > 0) {
 				fixedCount += fixed;
 				autofixTools.push(`ktfmt:${fixed}`);
@@ -1040,7 +1108,7 @@ export async function runAutofix(
 		}
 
 		if (toolName === "markdownlint") {
-			const fixed = await tryMarkdownlintFix(filePath, cwd);
+			const fixed = await tryMarkdownlintFix(filePath, cwd, writeHold);
 			if (fixed > 0) {
 				fixedCount += fixed;
 				autofixTools.push(`markdownlint:${fixed}`);
@@ -1053,7 +1121,7 @@ export async function runAutofix(
 		}
 
 		if (toolName === "oxlint") {
-			const fixed = await tryOxlintFix(filePath, cwd);
+			const fixed = await tryOxlintFix(filePath, cwd, writeHold);
 			if (fixed > 0) {
 				fixedCount += fixed;
 				autofixTools.push(`oxlint:${fixed}`);
@@ -1080,6 +1148,40 @@ export async function runAutofix(
 	};
 }
 
+/**
+ * #3528 r1 F1: what `resyncLspFile` did; every early return names its own
+ * reason. `synced`: `touchFile` reached a client and every server's notify
+ * queue took this content (a write still in flight past its own timeout is
+ * named in that touch's `lsp_touch_file` row). `not-sent` (#3528 r2): it
+ * reached no client (none could start). `superseded` (#3528 r2): a server's
+ * queue did not send it, because a newer read was already sent, the path was
+ * closing, or the client was dead.
+ */
+export type LspResyncOutcome =
+	| "synced"
+	| "not-sent"
+	| "superseded"
+	| "failed"
+	| "abandoned"
+	| "no-lsp"
+	| "up-to-date"
+	| "too-large"
+	| "unsupported"
+	| "aborted";
+
+/**
+ * #3576 R1: resync `filePath` only where a live client of the current service
+ * already holds it open, from a fresh read of the disk; never build a service,
+ * never spawn. For a drain whose session or LSP service was replaced: the next
+ * session may already hold the file (a read-warm touch), and the drain's write
+ * would otherwise leave that document behind the disk until the next drift
+ * sweep. `resyncGitChangedFiles` owns the held-only filter and the drift read.
+ */
+export async function resyncHeldLspDocument(filePath: string): Promise<void> {
+	const lsp = await loadLspService();
+	await lsp.peekLSPService()?.resyncGitChangedFiles([filePath]);
+}
+
 export async function resyncLspFile(
 	filePath: string,
 	fileContent: string,
@@ -1087,12 +1189,20 @@ export async function resyncLspFile(
 	lspSyncCompleted: boolean,
 	getFlag: PipelineContext["getFlag"],
 	dbg: PipelineContext["dbg"],
-): Promise<void> {
-	if (getFlag("no-lsp")) return;
-	if (!needsContentRefresh && lspSyncCompleted) return;
+	/** #3481: `performance.now()` taken before `fileContent` was read. */
+	readStamp?: number,
+): Promise<LspResyncOutcome> {
+	if (getFlag("no-lsp")) return "no-lsp";
+	if (!needsContentRefresh && lspSyncCompleted) return "up-to-date";
 
-	const limitCheck = exceedsLspSyncLimits(filePath, fileContent);
-	if (limitCheck.tooLarge) return;
+	// #3405 r2: the bound is `clients/lsp/content-limits.ts` now, shared with the
+	// dispatch runner and the didSave payload. THIS call stays: a file past the
+	// bound is not synced to the server AT ALL, which is a stricter policy than
+	// the save seam's (drop the redundant text, still send the save) and the one
+	// a post-write sync owes — removing it would start writing whole-file
+	// didOpen frames for files this pipeline has always refused.
+	const limitCheck = exceedsLspSyncLimits(fileContent);
+	if (limitCheck.tooLarge) return "too-large";
 
 	try {
 		const lspService = (await loadLspService()).getLSPService();
@@ -1116,7 +1226,7 @@ export async function resyncLspFile(
 			// the edit proceeds. A wedged server no longer parks the pipeline.
 			const budgetMs = lspSyncBudgetMs();
 			const abort = getAmbientAbortSignal();
-			if (abort?.aborted) return;
+			if (abort?.aborted) return "aborted";
 
 			const startedAt = Date.now();
 			const touch = lspService
@@ -1125,11 +1235,20 @@ export async function resyncLspFile(
 					source: "lsp_sync",
 					clientScope: "primary",
 					maxClientWaitMs: LSP_SPAWN_BUDGET_MS,
+					// #3405: pi-lens just wrote these bytes to disk, so this is the one
+					// touch that is a save. A save-triggered server (Expert recompiles
+					// the project on didSave and on nothing else) publishes for the edit
+					// only because of this flag.
+					saved: true,
+					readStamp,
 				})
-				.then(() => "done" as const)
+				.then((result): LspResyncOutcome => {
+					if (result === undefined) return "not-sent";
+					return result.supersededServerIds?.length ? "superseded" : "synced";
+				})
 				.catch((err) => {
 					dbg(`LSP resync after autofix error: ${err}`);
-					return "done" as const;
+					return "failed" as const;
 				});
 
 			// #2540: Kick off auxiliary server acquisition concurrently and unawaited
@@ -1223,10 +1342,14 @@ export async function resyncLspFile(
 						? `timed out after ${budgetMs}ms; reason: spawn-in-flight (server still cold-spawning)`
 						: `timed out after ${budgetMs}ms; server slow/wedged`;
 				dbg(`LSP resync ${cause} for ${filePath}`);
+				return "abandoned";
 			}
+			return outcome;
 		}
+		return "unsupported";
 	} catch (err) {
 		dbg(`LSP resync after autofix error: ${err}`);
+		return "failed";
 	}
 }
 
@@ -1278,6 +1401,17 @@ export interface FormatPhaseResult {
 	 */
 	formatUnavailable: Array<{ formatter: string; reason: string }>;
 	fileContent: string | undefined;
+	/** #3574: the bytes `fileContent` was decoded from. */
+	fileBytes: Buffer | undefined;
+	/** #3481: `performance.now()` taken before `fileContent` was read. */
+	fileReadStamp: number;
+	/**
+	 * #3529: settles once every formatter the service's bound gave up on has
+	 * settled, so a caller can sync what that child wrote after `fileContent`.
+	 */
+	abandoned?: Promise<void>;
+	/** #3503: `Date.now()` taken before `fileContent` was read. */
+	fileReadAtMs: number;
 }
 
 export async function runFormatPhase(
@@ -1287,21 +1421,28 @@ export async function runFormatPhase(
 	signal?: AbortSignal,
 	budgetMs = HOOK_WALL_BUDGET_MS.tool_result_edit,
 	hook: LedgerHookKey = "tool_result_edit",
+	writeHold?: FileMutationHold,
 ): Promise<FormatPhaseResult> {
 	let formatChanged = false;
 	let formattersUsed: string[] = [];
 	const formatFailures: string[] = [];
 	const formatUnavailable: Array<{ formatter: string; reason: string }> = [];
 	let fileContent: string | undefined;
+	let abandoned: Promise<void> | undefined;
 
 	const formatService = getFormatService();
 	try {
 		formatService.recordRead(filePath);
+		// #3506: the formatter rewrites the file in place (see runAutofix). It
+		// enters the hold once its command is resolved (#3558), and one the
+		// budget gave up on keeps its entry until its child settles.
 		const result = await formatService.formatFile(filePath, {
 			signal,
 			budgetMs,
 			hook,
+			...(writeHold ? { writeHold } : {}),
 		});
+		abandoned = result.abandoned;
 		// An unavailable tool is NOT a formatter that ran (#2413): keep it out of
 		// `formattersUsed` (which drives change bookkeeping / turn summaries) and
 		// out of `formatFailures` (which requeues). Record it once, distinctly.
@@ -1361,8 +1502,12 @@ export async function runFormatPhase(
 		dbg(`autoformat error: ${err}`);
 	}
 
+	const fileReadStamp = performance.now();
+	const fileReadAtMs = Date.now();
+	let fileBytes: Buffer | undefined;
 	try {
-		fileContent = nodeFs.readFileSync(filePath, "utf-8");
+		fileBytes = nodeFs.readFileSync(filePath);
+		fileContent = fileBytes.toString("utf-8");
 	} catch {
 		fileContent = undefined;
 	}
@@ -1373,6 +1518,10 @@ export async function runFormatPhase(
 		formatFailures,
 		formatUnavailable,
 		fileContent,
+		fileBytes,
+		fileReadStamp,
+		...(abandoned === undefined ? {} : { abandoned }),
+		fileReadAtMs,
 	};
 }
 
@@ -1431,6 +1580,22 @@ export async function runPipeline(
 	ctx: PipelineContext,
 	deps: PipelineDeps,
 ): Promise<PipelineResult> {
+	// #3506: taken at the first format/autofix write, released once the
+	// pipeline has read back and hashed its own write; the finally is the
+	// backstop for a throw in between.
+	const writeHold = holdFileMutationQueue(ctx.filePath);
+	try {
+		return await analysePipeline(ctx, deps, writeHold);
+	} finally {
+		writeHold?.release();
+	}
+}
+
+async function analysePipeline(
+	ctx: PipelineContext,
+	deps: PipelineDeps,
+	writeHold: FileMutationHold | undefined,
+): Promise<PipelineResult> {
 	const { filePath, cwd, toolName, getFlag, getFlagSource, dbg } = ctx;
 	const { getFormatService } = deps;
 	const allowAutonomousWriters = ctx.allowAutonomousWriters !== false;
@@ -1441,7 +1606,11 @@ export async function runPipeline(
 			reason: `observed mutation is not evidence of agent authorship (${filePath})`,
 		});
 	}
-	admitWidgetDiagnosticsWrite(filePath, ctx.telemetry?.writeIndex);
+	// #3540: the widget's order spans turns; read at each use, since the
+	// re-token below replaces the pair.
+	const widgetOrder = () =>
+		writeOrderToken(ctx.telemetry?.orderTurn, ctx.telemetry?.writeIndex);
+	admitWidgetDiagnosticsWrite(filePath, widgetOrder());
 
 	const phase = createPhaseTracker(toolName, filePath);
 	const pipelineStart = Date.now();
@@ -1451,11 +1620,25 @@ export async function runPipeline(
 	// --- 1. Read file content ---
 	phase.start("read_file");
 	let fileContent: string | undefined;
+	// #3481: when `fileContent` was read, so the LSP sync below cannot land
+	// these bytes after a newer read of the same file (a same-turn pipeline).
+	let fileReadStamp = performance.now();
+	// #3503: the wall-clock twin, the reference every freshness gate compares
+	// mtimes against. A write that lands after this read is newer than the
+	// verdict, even when it lands while the dispatch below is still awaited.
+	let analysisReadAtMs = Date.now();
+	// #3574: the bytes `fileContent` was decoded from, kept in step with it. The
+	// inline blocker's size and hash baseline is taken from these: a decoded
+	// string re-encodes a non-UTF-8 byte as three, so a baseline built from it
+	// never matches the file and the blocker self-drifts every turn.
+	let fileBytes: Buffer | undefined;
 	try {
-		fileContent = nodeFs.readFileSync(filePath, "utf-8");
+		fileBytes = nodeFs.readFileSync(filePath);
+		fileContent = fileBytes.toString("utf-8");
 	} catch {
 		// File may not exist (e.g., deleted)
 	}
+	const readContent = fileContent;
 	phase.end("read_file");
 
 	// --- 2. Auto-format ---
@@ -1482,11 +1665,17 @@ export async function runPipeline(
 			getFormatService,
 			dbg,
 			ctx.signal,
+			undefined,
+			undefined,
+			writeHold,
 		);
 		formatChanged = formatResult.formatChanged;
 		formattersUsed = formatResult.formattersUsed;
 		formatFailures = formatResult.formatFailures;
 		fileContent = formatResult.fileContent;
+		fileBytes = formatResult.fileBytes;
+		fileReadStamp = formatResult.fileReadStamp;
+		analysisReadAtMs = formatResult.fileReadAtMs;
 		if (formatChanged) {
 			const absPath = path.resolve(filePath);
 			piChangedFiles.add(absPath);
@@ -1540,7 +1729,15 @@ export async function runPipeline(
 			changedFiles: autofixChangedFiles,
 			needsContentRefresh: fixRefresh,
 			skipReason: autofixSkipReason,
-		} = await runAutofix(filePath, cwd, getFlag, dbg, deps, getFlagSource));
+		} = await runAutofix(
+			filePath,
+			cwd,
+			getFlag,
+			dbg,
+			deps,
+			getFlagSource,
+			writeHold,
+		));
 	for (const changedFile of autofixChangedFiles) {
 		piChangedFiles.add(path.resolve(changedFile));
 	}
@@ -1564,9 +1761,13 @@ export async function runPipeline(
 		});
 	}
 	if (fixRefresh) {
+		fileReadStamp = performance.now();
+		analysisReadAtMs = Date.now();
 		try {
-			fileContent = nodeFs.readFileSync(filePath, "utf-8");
+			fileBytes = nodeFs.readFileSync(filePath);
+			fileContent = fileBytes.toString("utf-8");
 		} catch {
+			fileBytes = undefined;
 			fileContent = undefined;
 		}
 	}
@@ -1601,6 +1802,13 @@ export async function runPipeline(
 					}
 				})()
 			: undefined;
+	// #3506: the token belongs to the read. When the analysed bytes are not the
+	// ones first read (this pipeline's own write, or an edit queued ahead of
+	// it), draw a fresh one while the queue still holds the file.
+	if (fileContent !== readContent && ctx.telemetry && ctx.nextWriteIndex) {
+		ctx.telemetry = { ...ctx.telemetry, ...ctx.nextWriteIndex() };
+	}
+	writeHold?.release();
 
 	// --- 4. LSP file sync ---
 	// Sync once with final post-format/post-fix content so dispatch and cascade
@@ -1608,7 +1816,15 @@ export async function runPipeline(
 	phase.start("lsp_sync");
 	let lspSyncCompleted = false;
 	if (fileContent) {
-		await resyncLspFile(filePath, fileContent, true, false, getFlag, dbg);
+		await resyncLspFile(
+			filePath,
+			fileContent,
+			true,
+			false,
+			getFlag,
+			dbg,
+			fileReadStamp,
+		);
 		lspSyncCompleted = true;
 	}
 	phase.end("lsp_sync", { completed: lspSyncCompleted, finalContent: true });
@@ -1626,9 +1842,9 @@ export async function runPipeline(
 	// promise can yield to another writer. The blocker evidence below belongs to
 	// this analysis input, not to whatever happens to be on disk when the whole
 	// pipeline returns.
-	const inlineBlockerFileContent = fileContent
+	const inlineBlockerFileContent = fileBytes?.byteLength
 		? (() => {
-				const content = Buffer.from(fileContent, "utf8");
+				const content = fileBytes;
 				return content.byteLength <= 2 * 1024 * 1024
 					? {
 							size: content.byteLength,
@@ -1650,7 +1866,10 @@ export async function runPipeline(
 		},
 		{
 			projectRoot: ctx.projectRoot,
-			writeIndex: ctx.telemetry?.writeIndex,
+			// The runners' widget order (#3540).
+			writeIndex: widgetOrder(),
+			// #3568: a collect-later runner defers its result to a turn end.
+			sessionGeneration: ctx.sessionGeneration,
 			telemetryModel: ctx.telemetry?.modelId,
 			telemetryProvider: ctx.telemetry?.provider,
 		},
@@ -1658,7 +1877,8 @@ export async function runPipeline(
 	recordDiagnostics(
 		filePath,
 		dispatchResult.diagnostics,
-		ctx.telemetry?.writeIndex,
+		widgetOrder(),
+		analysisReadAtMs,
 	);
 	// #502: emit the write batch's FINAL diagnostic state immediately after
 	// recordDiagnostics commits it — this call site runs after format,
@@ -1850,6 +2070,7 @@ export async function runPipeline(
 				hasBlockers,
 				dbg,
 				turnSeq: ctx.telemetry?.turnIndex,
+				orderTurn: ctx.telemetry?.orderTurn,
 				writeSeq: ctx.telemetry?.writeIndex,
 				// #3157: `cwd` here is the LANGUAGE root. The cascade's display
 				// filter reads the disposition store and the `.pi-lens.json` rule
@@ -1861,6 +2082,7 @@ export async function runPipeline(
 				fileContent,
 				wordIndex: ctx.wordIndex,
 				onWordIndexUpdated: ctx.onWordIndexUpdated,
+				sessionGeneration: ctx.sessionGeneration,
 			})
 				.then((run) => ({ ...run, origin: cascadeOrigin }))
 				.catch((err): import("./cascade-types.js").CascadeRun => {
@@ -1927,6 +2149,9 @@ export async function runPipeline(
 		isError: false,
 		fileModified,
 		postWriteStateHash,
+		writeIndex: ctx.telemetry?.writeIndex,
+		orderTurn: ctx.telemetry?.orderTurn,
+		analysisReadAtMs,
 		changedFiles,
 		// #3190: re-rendered from the GATED set with `formatDiagnostics(...,
 		// "blocking")` — the very expression `dispatcher.ts:1409` builds

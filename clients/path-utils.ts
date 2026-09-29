@@ -1113,6 +1113,8 @@ function compileWorkspaceMemberPattern(
 	return steps;
 }
 
+const WORKSPACE_GLOB_MEMO_CELL_CAP = 2_000_000;
+
 /**
  * Does the whole of `subject` match the whole of `steps`?
  *
@@ -1133,12 +1135,19 @@ function compileWorkspaceMemberPattern(
  * `(?:.+/)?` groups, which denote the same language as one and cost the same
  * table.
  */
+
 function matchesWorkspaceMemberSteps(
 	steps: readonly WorkspaceGlobStep[],
 	subject: string,
+	onCap?: () => void,
 ): boolean {
 	const stepCount = steps.length;
 	const width = subject.length + 1;
+	// 2,000,000 cells is above real ~8e5-cell globs and below the issue's ~1.6e7-cell row.
+	if ((stepCount + 1) * width > WORKSPACE_GLOB_MEMO_CELL_CAP) {
+		onCap?.();
+		return false;
+	}
 	// One byte per (step, position) cell; `1` means "the rest matches from here".
 	const table = new Uint8Array((stepCount + 1) * width);
 	for (let p = subject.length; p >= 0; p -= 1) {
@@ -1240,6 +1249,7 @@ export function matchesWorkspaceMemberPattern(
 	pattern: string,
 	relativePath: string,
 	dialect: WorkspaceMemberGlobDialect,
+	onCap?: () => void,
 ): boolean {
 	const normalized = dialect.normalizePattern(pattern);
 	if (
@@ -1250,7 +1260,8 @@ export function matchesWorkspaceMemberPattern(
 	}
 	const steps = compileWorkspaceMemberPattern(normalized, dialect);
 	return (
-		steps !== undefined && matchesWorkspaceMemberSteps(steps, relativePath)
+		steps !== undefined &&
+		matchesWorkspaceMemberSteps(steps, relativePath, onCap)
 	);
 }
 

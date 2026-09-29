@@ -37,12 +37,28 @@ describe("project runner coverage state space (#2887)", () => {
 			),
 		).toBe("keep");
 	});
-	it("coverage state: scanned-set ok empty falls back to id gate", () => {
+	// Recurrence (#2962): a producer that analysed the root and declared ZERO
+	// scanned files used to select itself out of its own coverage arm
+	// (`entry.files.size > 0`) and land in the whole-root id-only arm, retiring
+	// every retained finding of that runner although no file was scanned.
+	it("coverage state: an empty declared scanned set keeps, it does not fall back to the id gate", () => {
 		expect(
 			runnerRetirementDecision(
 				diagnostic("opengrep"),
 				"/proj/retained.py",
 				new Set(["opengrep"]),
+				covered("opengrep"),
+			),
+		).toBe("keep");
+	});
+	// The other direction of the same guard: the empty declaration belongs to ONE
+	// runner. The eight runners that declare no coverage keep the id-only arm.
+	it("coverage state: an empty declared set does not change another runner's decision", () => {
+		expect(
+			runnerRetirementDecision(
+				diagnostic("knip"),
+				"/proj/retained.ts",
+				new Set(["knip", "opengrep"]),
 				covered("opengrep"),
 			),
 		).toBe("retire");
@@ -89,16 +105,6 @@ describe("project runner coverage state space (#2887)", () => {
 		).toBe("keep");
 	});
 
-	it("coverage state: complete empty scan retires by runner identity", () => {
-		expect(
-			runnerRetirementDecision(
-				diagnostic("opengrep"),
-				"/proj/retained.py",
-				new Set(["opengrep"]),
-				covered("opengrep"),
-			),
-		).toBe("retire");
-	});
 	it("coverage state: no evidence ok fresh uses id gate", () => {
 		expect(
 			runnerRetirementDecision(

@@ -15,7 +15,12 @@ import {
 } from "../../../clients/project-trust.js";
 import { RuntimeCoordinator } from "../../../clients/runtime-coordinator.js";
 import { OpengrepClient } from "../../../clients/opengrep-client.js";
+import { realpathOrResolve } from "../../../clients/path-utils.js";
 import * as safeSpawn from "../../../clients/safe-spawn.js";
+// #2962: the retirement consumer is imported so the coverage this fetch
+// produces is judged by the REAL decision function, not by a restatement of it.
+import { runnerRetirementDecision } from "../../../tools/lens-diagnostics.js";
+import type { WidgetDiagnostic } from "../../../clients/widget-state.js";
 import { removeTempDirSync } from "../test-utils.js";
 import {
 	_resetStateCacheForTests,
@@ -1323,7 +1328,11 @@ describe("fetchFreshProjectDiagnostics (#585)", () => {
 		expect(result.authoritativeCoverage).toEqual([]);
 	});
 
-	it("does not record coverage for a captured successful empty opengrep scan", async () => {
+	// #2962: the zero-scanned DECLARATION is now carried (an entry with an empty
+	// set) instead of being dropped. `analyzed` still contains opengrep so the
+	// render layer keeps #2970's analysed-and-found-nothing state; the empty set
+	// is what removes its file-level retirement authority.
+	it("records an empty coverage declaration for a captured successful empty opengrep scan", async () => {
 		const client = new OpengrepClient();
 		client.ensureAvailable = vi.fn().mockResolvedValue(true);
 		vi.spyOn(safeSpawn, "safeSpawnAsync").mockImplementationOnce(
@@ -1346,7 +1355,144 @@ describe("fetchFreshProjectDiagnostics (#585)", () => {
 			clients,
 		);
 		expect(result.analyzed).toContain("opengrep");
-		expect(result.authoritativeCoverage).toEqual([]);
+		expect(result.authoritativeCoverage).toEqual([
+			{
+				runnerId: "opengrep",
+				root: realpathOrResolve(tmp),
+				files: new Set(),
+			},
+		]);
+	});
+
+	// #2962, driven through the production path: the REAL
+	// `fetchFreshProjectDiagnostics` result is handed to the REAL
+	// `runnerRetirementDecision` — the two production units joined at their own
+	// interface, never a hand-shaped coverage array.
+	// Captured from opengrep 1.29.0 --json: a complete report (no `errors`) whose
+	// `paths.scanned` is empty because no rule language matched the root.
+	const COMPLETE_ZERO_SCANNED =
+		'{"version":"1.29.0","results":[],"errors":[],"paths":{"scanned":[]},"interfile_languages_used":[],"skipped_rules":[]}';
+	// Captured from opengrep's warning-level partial shape: one unlexable file
+	// zeroed the scanned set.
+	const PARTIAL_ZERO_SCANNED =
+		'{"results":[],"errors":[{"level":"warn","message":"invalid UTF-8"}],"paths":{"scanned":[]}}';
+
+	function retained(tool: string): WidgetDiagnostic {
+		return {
+			tool,
+			severity: "warning",
+			message: "retained",
+			uri: "",
+			rule: `${tool}:finding`,
+		};
+	}
+
+	async function fetchWithOpengrepReport(reportJson: string | undefined) {
+		const client = new OpengrepClient();
+		client.ensureAvailable = vi
+			.fn()
+			.mockResolvedValue(reportJson !== undefined);
+		vi.spyOn(safeSpawn, "safeSpawnAsync").mockImplementation(
+			async (_command, args: string[]) => {
+				const flag = args.indexOf("--json-output");
+				// Only opengrep's own invocation writes a report; any other spawn
+				// this fetch makes must not be handed one.
+				if (flag >= 0 && reportJson !== undefined) {
+					fs.writeFileSync(args[flag + 1], reportJson);
+				}
+				return { status: 0, stdout: "", stderr: "" };
+			},
+		);
+		const clients = makeClients();
+		(clients as unknown as { opengrepClient: OpengrepClient }).opengrepClient =
+			client;
+		return await fetchFreshProjectDiagnostics(makeCacheManager(), tmp, clients);
+	}
+
+	// Recurrence: one complete opengrep report with `paths.scanned: []` used to
+	// retire EVERY retained opengrep finding in the tree, because the missing
+	// coverage entry fell through to the whole-root id-only arm.
+	it("a complete zero-scanned opengrep report keeps a retained finding", async () => {
+		const result = await fetchWithOpengrepReport(COMPLETE_ZERO_SCANNED);
+		expect(result.analyzed).toContain("opengrep");
+		expect(
+			runnerRetirementDecision(
+				retained("opengrep"),
+				path.join(tmp, "src", "never-scanned.py"),
+				new Set(result.analyzed),
+				result.authoritativeCoverage,
+			),
+		).toBe("keep");
+	});
+
+	// The over-reach direction: the zero-file declaration belongs to opengrep
+	// alone. knip declares no coverage, so its own id-only arm still retires.
+	it("a zero-coverage opengrep scan does not change another runner's decision", async () => {
+		const result = await fetchWithOpengrepReport(COMPLETE_ZERO_SCANNED);
+		expect(result.analyzed).toContain("knip");
+		expect(
+			runnerRetirementDecision(
+				retained("knip"),
+				path.join(tmp, "src", "never-scanned.ts"),
+				new Set(result.analyzed),
+				result.authoritativeCoverage,
+			),
+		).toBe("retire");
+	});
+
+	// #2962's headline premise, measured rather than asserted: a COLD opengrep
+	// does not convert another runner's retained findings into keep-forever —
+	// coverage is filtered by `entry.runnerId`, so knip still retires. Pinned so
+	// the cross-runner leak the issue describes cannot appear later.
+	it("coverage state: a cold coverage producer does not change another runner's decision", async () => {
+		const result = await fetchWithOpengrepReport(undefined);
+		expect(result.cold).toContain("opengrep");
+		expect(result.analyzed).not.toContain("opengrep");
+		expect(
+			runnerRetirementDecision(
+				retained("knip"),
+				path.join(tmp, "src", "never-scanned.ts"),
+				new Set(result.analyzed),
+				result.authoritativeCoverage,
+			),
+		).toBe("retire");
+		expect(
+			runnerRetirementDecision(
+				retained("opengrep"),
+				path.join(tmp, "src", "never-scanned.py"),
+				new Set(result.analyzed),
+				result.authoritativeCoverage,
+			),
+		).toBe("keep");
+	});
+
+	// The unlexable-file case from #2962: the warning-level report zeroes the
+	// scanned set, the producer is partial rather than analysed, and the retained
+	// finding is kept.
+	it("a partial zero-scanned report keeps a retained finding", async () => {
+		const result = await fetchWithOpengrepReport(PARTIAL_ZERO_SCANNED);
+		expect(result.partial).toContain("opengrep");
+		expect(result.analyzed).not.toContain("opengrep");
+		expect(
+			runnerRetirementDecision(
+				retained("opengrep"),
+				path.join(tmp, "src", "never-scanned.py"),
+				new Set(result.analyzed),
+				result.authoritativeCoverage,
+			),
+		).toBe("keep");
+	});
+
+	it("records the zero-coverage producer once per session", async () => {
+		await fetchWithOpengrepReport(COMPLETE_ZERO_SCANNED);
+		await fetchWithOpengrepReport(COMPLETE_ZERO_SCANNED);
+		const group = getDegradationSummary().find(
+			({ kind }) => kind === "runner-coverage-empty",
+		);
+		expect(group?.count).toBe(1);
+		expect(group?.latestReasons[0]?.subject).toBe(
+			`opengrep:${realpathOrResolve(tmp)}`,
+		);
 	});
 
 	// Recurrence: a successful partial report used to enter `analyzed` without

@@ -66,6 +66,31 @@ the cost of not doing so.
    Quote the mutation TABLE, one row per direction per new conditional — a
    single quoted direction proves only that direction, not the guard (#3156
    r2 and #3168 r1 each shipped a one-directional pin under a ticked box).
+   **Read the PR's Stryker report first, once one exists (#3531).** The
+   `Mutation diff` workflow mutates the PR's changed lines under
+   `scripts/**/*.mjs`, `clients/**/*.ts`, `tools/**/*.ts`, `mcp/**/*.ts`, and
+   `index.ts` (the last four through their compiled `.js`, mapped back to
+   `.ts` file:line) and posts a sticky PR comment listing every survivor. A
+   fixer starting a FRESH round from an issue has no PR yet, so there is no
+   comment to read — the report only exists once you push and the workflow
+   runs. If you're returning to an already-open PR for a fix round, read its
+   sticky comment before hand-mutating anything yourself; otherwise, run the
+   driver locally (`node scripts/stryker-diff.mjs --base origin/master
+   --max-files 6`) and read `reports/mutation/mutation.json` with `node
+   scripts/mutation-report.mjs`, or read a downloaded `mutation-report`
+   artifact the same way. Hand-mutate only what Stryker cannot express or
+   didn't get to: a seam the diff didn't touch, a multi-line or
+   cross-statement mutant, a guard on a line the diff's own hunk doesn't
+   cover, a range the deterministic sampler dropped over budget, a file
+   skipped over `--max-files` or with no covering test, or a mutant a
+   **partial** (budget-killed) run never reached. Every survivor Stryker
+   lists on your diff is either killed by a new test in this round or named
+   and justified in the PR body — a survivor left unaddressed with no comment
+   is a finding the next review round will raise. The lane is advisory and
+   can evaluate 0 mutants (over `--max-files`, no covering test, a
+   type-only/comment-only hunk, or a budget timeout) -- its comment always
+   says which, and neither a 0-mutant nor a partial run is ever grounds to
+   skip the hand-mutation table above for whatever they didn't cover.
    Platform rule: a test that asserts a Windows-only property runs ONLY on
    Windows dev boxes; the authoritative Unit tests lane is ubuntu. Every
    `skipIf(process.platform …)` names the lane that runs it or reads
@@ -113,10 +138,12 @@ the cost of not doing so.
    `sweep-floor-coverage` red). A red is environmental ONLY when the same
    file is red on `origin/master` in the same tree — run it there and quote
    both results, or treat it as yours.
-   Tear the tree down in this order: `rm node_modules` (unlinks the symlink;
-   never `rm -r`), then `git worktree remove`. `git worktree remove --force`
-   follows the symlink and empties the main checkout's install — it did so
-   twice on 2026-09-16 (#2704 class), breaking every other live lane's build.
+   Tear the tree down after `ls -ld node_modules`: unlink a symlink with
+   `rm node_modules`; if it is a directory, confirm the main checkout's
+   `node_modules` is intact, then remove only this worktree's copy with
+   `rm -rf node_modules`. Finally run `git worktree remove`; never use
+   `git worktree remove --force`, which follows symlinks and emptied the main
+   checkout's install twice on 2026-09-16 (#2704 class).
    Commit after every proven step, on your branch, before the next probe. Two
    trees lost uncommitted work the same day: #2358's was removed by a prune
    that saw a branch with no commits, and #2518 r2's edits died under a
@@ -135,7 +162,10 @@ the cost of not doing so.
    reproduction that goes red for the bug's reason BEFORE you form a theory of
    the fix — a fix asserted from code inspection without a reproducing loop is
    the failure mode reviews keep catching.
-4. Tests are red-first: write them, prove them red on pre-fix code
+4. Before writing the fix, or a unit tested in isolation, list the ways it can
+   fail (inputs, states, orderings, platforms) in the PR body; a space with two
+   axes is a table. The tests cover that list, not only the happy path.
+   Tests are red-first: write them, prove them red on pre-fix code
    — with one honest exception. When the only red-first path would need broad
    harness setup, brittle mocks, or a test you would delete right after it
    proves the fix (shape 7's record: #1114's mock missing `.once`/`.killed`,
@@ -212,6 +242,10 @@ the cost of not doing so.
    `Test assessment` whenever `tests/` is touched). Free-form bodies fail the
    `PR body (advisory)` check (`scripts/check-pr-body.mjs`); a red on that
    check is a fix-before-review item, not advisory to you.
+   Every code fact in the body is a `` `path:line` `` citation the check
+   verifies: the file must be in the committed tree (never an untracked or
+   git-ignored path, which CI cannot read), and a fenced quote after it must
+   match within ±20 lines. Prose about code with no citation is unverified.
 8. After the push: verify that every gating check actually EXECUTES on your
    exact head SHA with ONE REST read —
    `node scripts/ci-verdict.mjs <pr-number|sha>` (#2539; does the same
@@ -352,14 +386,21 @@ verify brief asked for exactly that judgement).
   claiming it; reviewers diff reports against reality and a false claim costs
   a full extra round.
 
-- **Run the pinned oxfmt on your diff before push.** Agent worktrees usually
-  lack the oxfmt binary, so CI's gating format check is the first time your
-  files meet the formatter — and two fixers in one day shipped unformatted
-  test files while calling the red check "a pre-existing environment gap."
-  Before push: `npm install oxfmt --no-save` at the devDependency-pinned
-  version if absent, `npx oxfmt --check` on every file you touched, format
-  and re-test if it flags. Never attribute a red format check to the
-  environment without reading which files it names.
+- **Run the pinned oxfmt on your diff before push.** Use `npx oxfmt` against
+  the symlinked devDependency and run `npx oxfmt --check` on every file you
+  touched. Never install a replacement with `npm install oxfmt --no-save`:
+  it replaces the worktree's dependency symlink and can leave a large real
+  directory that must be handled by the teardown check above. Format and
+  re-test if it flags; never attribute a red format check to the environment
+  without reading which files it names.
+- **CI-lane acceptance is lane-owned.** A fix to a CI lane or workflow is
+  accepted only when that lane's own run on the PR's exact head completes
+  inside its `timeout-minutes`, with the acceptance surface quoted from its
+  log; any self-bound must sit below the job cap by a stated margin.
+- **Behaviour-preserving refactors use a different red-first proof.** When the
+  PR declares the change behaviour-preserving, provide an old-vs-new probe
+  table through the built seam and mutate the shared seam so a caller-side
+  witness reds. A passing pre-fix run is expected and is not a finding.
 - **Small batches run vitest directly; the shared slot is for big ones.**
   `npm run test:targeted` queues on a machine-wide slot that twelve
   concurrent lanes keep busy; three fixers on 2026-09-03 backgrounded it and

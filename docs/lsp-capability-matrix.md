@@ -77,7 +77,7 @@ refresh cannot merge until the marker is updated with it.
 |---|---|---|---|
 | **1 — pull** | `textDocument/diagnostic` returns an authoritative report (empty = clean) | YES, deterministic | rust-analyzer |
 | **2 — push, publishes-versioned** | `publishDiagnostics([])` **with version** on every scan, incl. clean→clean | YES, currency-proven via version | ast-grep |
-| **2\* — push, publishes-unversioned** | re-publishes on a clean scan but **version-less** — the wait still early-returns (the client accepts a version-less publish as fresh: it can't be proven stale), but currency is only *temporally correlated*, not proven | YES at runtime, with a staleness-risk caveat (not a latency cost) | opengrep |
+| **2\* — push, publishes-unversioned** | re-publishes on a clean scan but **version-less** — the wait still early-returns (the client accepts a version-less publish as fresh: it can't be proven stale), but currency is only *temporally correlated*, not proven. Since #3484 the client fences a server measured to answer a `documentSymbol` fence before it publishes (`diagnosticsFence: "reply-first"`: yaml, intelephense): a pre-edit publish is dropped until the fence's reply. Every other 2\* server (docker publishes before answering; prisma, taplo, zls, dart, gleam, clojure unmarked) keeps this behaviour | YES at runtime, with a staleness-risk caveat (not a latency cost) | opengrep |
 | **3 — push, silent on clean** | server publishes nothing when nothing changed | **NO** — budget-wait floor (safe; a timeout is *not* a false clean). **This tier is #458's learned-deadline target set.** | typescript-language-server |
 | **Navigation-only — custom, no evidence** | custom `lsp.servers.*` entry has no pull provider and has not published in this session | **NO** — diagnostics are unsupported; skip the wait and report navigation-only | Dexter |
 
@@ -107,6 +107,15 @@ nightly steps, **dev** = the dev box (a row measured on both reads `dev+ci`).
 Merges never blank a prior good value, so a CI non-result leaves the dev
 classification standing.
 
+`vue`'s `clean-behavior` was hand-reset to `unknown` (#3390): its
+`publishes-unversioned` cell came from 58/45 publishes that the shared
+`extension.log` window had attributed to vue but that belonged to `tinymist`.
+With the sink scoped per server, nightly 36046209160 measured vue 0/0, and an
+`unknown` result is never written by the merge above — so the refuted value had
+to be cleared by hand. It stays `unknown` until a run observes
+`@vue/language-server` publish; `tests/config/lsp-clean-behavior-census.test.ts`
+carries the named admission until then.
+
 | lang | server | mode | clean-behavior | first-publish | tier | src |
 |---|---|---|---|---|---|---|
 | json | vscode-json-language-server | pull | — | n/a (pull) | 1 | dev+ci |
@@ -130,7 +139,7 @@ classification standing.
 | prisma | @prisma/language-server | push-only | publishes-unversioned | direct | 2* | dev+ci |
 | php | intelephense | push-only | publishes-unversioned | empty-first | 2* | dev+ci |
 | zig | zls | push-only | publishes-unversioned | direct | 2* | dev+ci |
-| vue | @vue/language-server | push-only | publishes-unversioned | direct | 2* | dev+ci |
+| vue | @vue/language-server | push-only | unknown | direct | 2/3? | dev+ci |
 | dart | dart language-server | push-only | publishes-unversioned | direct | 2* | ci |
 | gleam | gleam lsp | push-only | publishes-unversioned | direct | 2* | ci |
 | clojure | clojure-lsp | push-only | publishes-unversioned | direct | 2* | ci |

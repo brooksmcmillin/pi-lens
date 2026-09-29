@@ -1,9 +1,9 @@
 /**
- * #2468: `clients/formatters.ts` invoked bare `ktfmt <file>` with no style
- * flag, so ktfmt formatted under its own default style instead of the
- * project's actual Gradle `ktfmt { googleStyle() | kotlinLangStyle() }`
- * selection — the same manifest-detected-but-not-carried defect shape #2466
- * fixed for rustfmt `--edition`.
+ * #2468/#2481: `clients/formatters.ts` invoked bare `ktfmt <file>` with no
+ * style flag, so ktfmt formatted under its own default style instead of the
+ * project's actual Gradle or Spotless style selection — the same
+ * manifest-detected-but-not-carried defect shape #2466 fixed for rustfmt
+ * `--edition`.
  *
  * The two argv cases (the carried `--google-style`, and the fallback that
  * must carry nothing) call `ktfmtFormatter.resolveCommand` (the same pattern
@@ -19,6 +19,14 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import {
+	getDegradationSummary,
+	resetDegradationLedger,
+} from "../../clients/degradation-ledger.js";
+import {
+	flushExtensionLog,
+	getExtensionLogPath,
+} from "../../clients/extension-log.js";
 import { ktfmtFormatter } from "../../clients/formatters.js";
 import { resolveKtfmtGradleStyle } from "../../clients/gradle-ktfmt-style.js";
 import { removeTempDirSync, setupTestEnvironment } from "./test-utils.js";
@@ -37,6 +45,16 @@ function newTmpDir(prefix: string): string {
 	const env = setupTestEnvironment(prefix);
 	tmpDirs.push(env.tmpDir);
 	return env.tmpDir;
+}
+
+function readExtensionLogRows(): Array<Record<string, unknown>> {
+	const logPath = getExtensionLogPath();
+	if (!fs.existsSync(logPath)) return [];
+	return fs
+		.readFileSync(logPath, "utf8")
+		.split("\n")
+		.filter(Boolean)
+		.map((line: string) => JSON.parse(line) as Record<string, unknown>);
 }
 
 function makeFakeKtfmtExe(shimDir: string): void {
@@ -64,7 +82,7 @@ async function withKtfmtOnPath(
 	}
 }
 
-describe("ktfmtFormatter — Gradle ktfmt{} style carriage (#2468)", () => {
+describe("ktfmtFormatter — Gradle and Spotless style carriage (#2468/#2481)", () => {
 	it("passes --google-style from the nearest ktfmt {} block's googleStyle()", async () => {
 		const tmpDir = newTmpDir("pi-lens-ktfmt-google-");
 		fs.writeFileSync(
@@ -87,6 +105,111 @@ describe("ktfmtFormatter — Gradle ktfmt{} style carriage (#2468)", () => {
 			expect(binary.toLowerCase()).toContain("ktfmt");
 			expect(rest).toEqual(["--google-style", filePath]);
 		});
+	});
+
+	it("passes --google-style from a Spotless ktfmt fluent chain", async () => {
+		const tmpDir = newTmpDir("pi-lens-spotless-ktfmt-google-");
+		fs.writeFileSync(
+			path.join(tmpDir, "build.gradle.kts"),
+			'spotless {\n  kotlin {\n    ktfmt("0.63").googleStyle()\n  }\n}\n',
+		);
+		const filePath = path.join(tmpDir, "src", "main", "Main.kt");
+		fs.mkdirSync(path.dirname(filePath), { recursive: true });
+		fs.writeFileSync(filePath, "fun main() {}\n");
+
+		await withKtfmtOnPath(path.join(tmpDir, "shims"), async () => {
+			const resolved = await ktfmtFormatter.resolveCommand?.(filePath, tmpDir);
+			expect(resolved).not.toBeNull();
+			expect(resolved).not.toBeUndefined();
+			const [, ...args] = resolved as string[];
+			expect(args).toEqual(["--google-style", filePath]);
+		});
+	});
+
+	it("passes --kotlinlang-style from Spotless kotlinlangStyle()", async () => {
+		const tmpDir = newTmpDir("pi-lens-spotless-ktfmt-kotlinlang-");
+		fs.writeFileSync(
+			path.join(tmpDir, "build.gradle"),
+			"spotless {\n  kotlin {\n    ktfmt('0.63').kotlinlangStyle()\n  }\n}\n",
+		);
+		const filePath = path.join(tmpDir, "src", "Main.kt");
+		fs.mkdirSync(path.dirname(filePath), { recursive: true });
+		fs.writeFileSync(filePath, "fun main() {}\n");
+
+		await withKtfmtOnPath(path.join(tmpDir, "shims"), async () => {
+			const resolved = await ktfmtFormatter.resolveCommand?.(filePath, tmpDir);
+			expect(resolved).not.toBeNull();
+			expect(resolved).not.toBeUndefined();
+			const [, ...args] = resolved as string[];
+			expect(args).toEqual(["--kotlinlang-style", filePath]);
+		});
+	});
+
+	it("logs the Spotless dropboxStyle() limitation and falls back to bare ktfmt", async () => {
+		const tmpDir = newTmpDir("pi-lens-spotless-ktfmt-dropbox-");
+		fs.writeFileSync(
+			path.join(tmpDir, "build.gradle.kts"),
+			'spotless {\n  kotlin {\n    ktfmt("0.63").dropboxStyle()\n  }\n}\n',
+		);
+		const filePath = path.join(tmpDir, "src", "Main.kt");
+		const secondFilePath = path.join(tmpDir, "src", "Other.kt");
+		fs.mkdirSync(path.dirname(filePath), { recursive: true });
+		fs.writeFileSync(filePath, "fun main() {}\n");
+		fs.writeFileSync(secondFilePath, "fun other() {}\n");
+
+		resetDegradationLedger();
+		const originalTestMode = process.env.PI_LENS_TEST_MODE;
+		process.env.PI_LENS_TEST_MODE = "0";
+		try {
+			await withKtfmtOnPath(path.join(tmpDir, "shims"), async () => {
+				const resolved = await ktfmtFormatter.resolveCommand?.(
+					filePath,
+					tmpDir,
+				);
+				expect(resolved).not.toBeNull();
+				expect(resolved).not.toBeUndefined();
+				expect((resolved as string[]).slice(1)).toEqual([filePath]);
+
+				const second = await ktfmtFormatter.resolveCommand?.(
+					secondFilePath,
+					tmpDir,
+				);
+				expect(second).not.toBeNull();
+				expect(second).not.toBeUndefined();
+				expect((second as string[]).slice(1)).toEqual([secondFilePath]);
+			});
+
+			await flushExtensionLog();
+			const message =
+				"Spotless ktfmt dropboxStyle(): pi-lens standalone CLI cannot express " +
+				"the style; falling back to bare ktfmt";
+			const emitted = readExtensionLogRows().filter((row) => {
+				const metadata = row.metadata as
+					| { filePath?: unknown; gradleDir?: unknown }
+					| undefined;
+				return (
+					row.message === message &&
+					metadata?.filePath === filePath &&
+					metadata?.gradleDir === tmpDir
+				);
+			});
+			expect(emitted).toHaveLength(1);
+			expect(emitted[0]).toMatchObject({
+				level: "debug",
+				subsystem: "format",
+				message,
+				metadata: { filePath, gradleDir: tmpDir },
+			});
+			expect(
+				getDegradationSummary().find(
+					(group) => group.kind === "formatter-skip",
+				),
+			).toMatchObject({ count: 2 });
+		} finally {
+			if (originalTestMode === undefined) delete process.env.PI_LENS_TEST_MODE;
+			else process.env.PI_LENS_TEST_MODE = originalTestMode;
+			resetDegradationLedger();
+		}
 	});
 
 	it("resolves --kotlinlang-style for a kotlinLangStyle() declaration", async () => {

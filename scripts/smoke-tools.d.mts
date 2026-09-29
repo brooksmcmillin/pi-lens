@@ -294,5 +294,8 @@ export function runInstallRegistrySmoke(options?: {
 }>;
 export const FIXTURES: SmokeFixture[];
 export const LSP_FIXTURES: LspFixture[];
+/** The `waitMs` the gate/handshake layers pass — a CEILING over each server's
+ *  `aggregateWaitMs`, never a floor (#3402). */
+export const LSP_DIAGNOSTICS_WAIT_MS: number;
 export const FORMAT_FIXTURES: FormatFixture[];
 export const AUTOFIX_FIXTURES: AutofixFixture[];

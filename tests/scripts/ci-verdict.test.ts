@@ -1,11 +1,7 @@
-import { readFileSync, readdirSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import * as yaml from "js-yaml";
 import { describe, expect, it } from "vitest";
-import {
-	ADVISORY_CHECKS,
-	isAdvisoryCheck,
-} from "../../scripts/lib/ci-checks.mjs";
 import {
 	computeVerdict,
 	DEFAULT_GH_TIMEOUT_MS,
@@ -19,18 +15,23 @@ import {
 	formatVerdictTable,
 	HARD_CAP_SECONDS,
 	isPrNumber,
+	isTransientGhError,
 	MIN_GH_TIMEOUT_MS,
+	POLL_INTERVAL_SECONDS,
 	parseArgs,
 	pollVerdict,
-	POLL_INTERVAL_SECONDS,
+	resolveClassification,
 	resolveGhTimeoutMs,
 	resolveHeadSha,
-	resolveClassification,
 	resolveRepository,
 	resolveRequiredCheckNames,
 	resolveWaitCapSeconds,
 	run,
 } from "../../scripts/ci-verdict.mjs";
+import {
+	ADVISORY_CHECKS,
+	isAdvisoryCheck,
+} from "../../scripts/lib/ci-checks.mjs";
 
 function checkRun({
 	name,
@@ -39,6 +40,7 @@ function checkRun({
 	started_at = "2026-09-03T00:00:00Z",
 	id = 1,
 	html_url = `https://github.com/apmantza/pi-lens/actions/runs/${id}`,
+	details_url = `${html_url}/job/${id}`,
 }: {
 	name: string;
 	status?: string;
@@ -46,8 +48,9 @@ function checkRun({
 	started_at?: string;
 	id?: number;
 	html_url?: string;
+	details_url?: string;
 }) {
-	return { name, status, conclusion, started_at, id, html_url };
+	return { name, status, conclusion, started_at, id, html_url, details_url };
 }
 
 const BOTH_SUCCESS = {
@@ -56,6 +59,19 @@ const BOTH_SUCCESS = {
 		checkRun({ name: "Lint & type-check", id: 2 }),
 	],
 };
+
+const REAL_CHECK_RUNS = JSON.parse(
+	readFileSync(
+		join(process.cwd(), "tests/fixtures/ci-verdict/real-check-runs.json"),
+		"utf8",
+	),
+);
+const PR_3382_CANCELLED = JSON.parse(
+	readFileSync(
+		join(process.cwd(), "tests/fixtures/ci-verdict/pr-3382-cancelled.json"),
+		"utf8",
+	),
+);
 
 describe("computeVerdict — the four exit codes (#2539 acceptance criterion)", () => {
 	it("reports an armed infrastructure rerun only while its later attempt runs", () => {
@@ -287,37 +303,28 @@ describe("computeVerdict — DIRTY fires on CONFLICTING regardless of check pres
 	});
 });
 
-// #2539 round 2, F7: `per_page=100` is not paginated, but `total_count` in
-// the same response says whether the fetched page was actually complete.
-describe("computeVerdict — truncated check-runs response (#2539 round 2, F7)", () => {
-	it("exits 3 (pending), not DIRTY, when total_count exceeds the fetched check_runs", () => {
-		const payload = {
-			total_count: 150,
-			check_runs: [checkRun({ name: "Unit tests", id: 1 })],
+// #3373: the real PR #3358 response crossed the REST page boundary. The
+// regression is that a complete two-page read must expose all 162 names to
+// the production fetch seam, without a synthetic truncation verdict.
+describe("fetchCheckRunsPayload — complete pagination (#3373)", () => {
+	it("reads every page until total_count is covered", () => {
+		const calls: string[] = [];
+		const ghExec = (args: string[]) => {
+			calls.push(args[1]);
+			const page = Number(
+				new URLSearchParams(args[1].split("?")[1]).get("page"),
+			);
+			return JSON.stringify({
+				total_count: REAL_CHECK_RUNS.source.total_count,
+				check_runs: REAL_CHECK_RUNS.pages[page - 1] ?? [],
+			});
 		};
-		// Even with a confirmed conflict, truncation wins: the missing required
-		// check might simply be sitting past the fetched page.
-		const verdict = computeVerdict(payload, undefined, "CONFLICTING");
-		expect(verdict.exitCode).toBe(EXIT_PENDING);
-		expect(verdict.reason).toMatch(/truncated/);
-	});
-
-	it("total_count equal to the fetched count is NOT truncated", () => {
-		const payload = { total_count: 2, ...BOTH_SUCCESS };
-		expect(computeVerdict(payload).exitCode).toBe(EXIT_SUCCESS);
-	});
-
-	it("a non-numeric total_count is ignored, not treated as truncation", () => {
-		// A malformed real-world payload (the field is present but not a
-		// number) -- deliberately mistyped to exercise computeVerdict's own
-		// `typeof totalCount === "number"` runtime guard.
-		const payload = {
-			total_count: "not-a-number" as unknown as number,
-			check_runs: [checkRun({ name: "Unit tests", id: 1 })],
-		};
-		expect(computeVerdict(payload, undefined, "CONFLICTING").exitCode).toBe(
-			EXIT_DIRTY,
-		);
+		const payload = fetchCheckRunsPayload("apmantza/pi-lens", "head", ghExec);
+		expect(calls).toEqual([
+			"repos/apmantza/pi-lens/commits/head/check-runs?per_page=100&page=1",
+			"repos/apmantza/pi-lens/commits/head/check-runs?per_page=100&page=2",
+		]);
+		expect(payload.check_runs).toHaveLength(REAL_CHECK_RUNS.source.total_count);
 	});
 });
 
@@ -626,7 +633,7 @@ describe("computeVerdict — every check-run gates unless advisory (#2609)", () 
 //  ------------|------------|----------------------|-------------------|--------------------
 //  required    | success    | --                   | 0 (existing)      | 2 (existing)
 //  required    | failure    | --                   | 1 (existing)      | 2 (existing)
-//  required    | cancelled  | --                   | 1  F1             | 2  NEW
+//  required    | cancelled  | latest              | 3  #3373          | 2  NEW
 //  required    | skipped    | --                   | 1  F1             | 2  (covered by table-driven test)
 //  required    | neutral    | --                   | 1  F1             | 2  (covered by table-driven test)
 //  required    | timed_out  | --                   | 1  (sanity)       | 2  (covered by table-driven test)
@@ -640,7 +647,7 @@ describe("computeVerdict — every check-run gates unless advisory (#2609)", () 
 //  discovered  | timed_out  | --                   | 1  (sanity)       | 2 (existing)
 //  discovered  | absent     | --                   | impossible by construction -- a discovered row's name, by definition, appeared in the payload
 //  advisory    | any incl. failure | --            | 0 (existing)      | 2 (existing)
-describe("computeVerdict — required rows demand literal success, no skip/neutral/cancelled grace (#2618 fix-round-2, F1)", () => {
+describe("computeVerdict — required rows reject skip/neutral/failure while latest cancellation reruns (#3373)", () => {
 	// The exact reported shape: ci.yml:253's `test` job (`Unit tests`) has
 	// `needs: validate-merge-train-dispatch` with no `if:` -- a failed/skipped
 	// dependency skips it outright, and the pre-fix-round-2 code (which
@@ -660,13 +667,13 @@ describe("computeVerdict — required rows demand literal success, no skip/neutr
 
 	it.each([
 		["failure", EXIT_FAILURE],
-		["cancelled", EXIT_FAILURE],
+		["cancelled", EXIT_PENDING],
 		["skipped", EXIT_FAILURE],
 		["neutral", EXIT_FAILURE],
 		["timed_out", EXIT_FAILURE],
 		["success", EXIT_SUCCESS],
 	])(
-		"a required row concluding %s exits %i regardless of the skip/neutral/cancelled discovered-row grace",
+		"a required row concluding %s exits %i regardless of the discovered-row grace",
 		(conclusion, expectedExit) => {
 			const payload = {
 				check_runs: [
@@ -722,11 +729,11 @@ describe("computeVerdict — a discovered row's cancelled conclusion is uncertai
 		// cancelled` -- that reads as a contradiction. It gets its own clause.
 		expect(verdict.reason).not.toMatch(/still queued or in progress/);
 		expect(verdict.reason).toContain(
-			"cancelled and not yet re-reported (a superseded run; pends until the replacement posts -- this does not time out on its own): Record post-merge validation",
+			"superseded run cancelled and not replaced: rerun 101527303167 (gh run rerun 101527303167)",
 		);
 	});
 
-	it("a still-running row and an uncertain cancelled row get separate clauses in the same reason", () => {
+	it("a latest cancelled row gets an explicit rerun even beside a still-running row", () => {
 		const payload = {
 			check_runs: [
 				checkRun({ name: "Unit tests", id: 1 }),
@@ -747,10 +754,7 @@ describe("computeVerdict — a discovered row's cancelled conclusion is uncertai
 		const verdict = computeVerdict(payload, undefined, "MERGEABLE");
 		expect(verdict.exitCode).toBe(EXIT_PENDING);
 		expect(verdict.reason).toContain(
-			"still queued or in progress: Production install build (--omit=dev, from source)",
-		);
-		expect(verdict.reason).toContain(
-			"cancelled and not yet re-reported (a superseded run; pends until the replacement posts -- this does not time out on its own): Record post-merge validation",
+			"superseded run cancelled and not replaced: rerun 3 (gh run rerun 3)",
 		);
 	});
 
@@ -808,6 +812,131 @@ describe("computeVerdict — a discovered row's cancelled conclusion is uncertai
 		};
 		expect(computeVerdict(payload, undefined, "CONFLICTING").exitCode).toBe(
 			EXIT_DIRTY,
+		);
+	});
+
+	it("uses the newer success when an older cancelled lint run is present (#3373)", () => {
+		const verdict = computeVerdict(
+			{
+				check_runs: [
+					...BOTH_SUCCESS.check_runs.filter(
+						(run) => run.name !== "Lint & type-check",
+					),
+					...REAL_CHECK_RUNS.cancelledReplacement.check_runs,
+				],
+			},
+			undefined,
+			"MERGEABLE",
+		);
+		expect(verdict.exitCode).toBe(EXIT_SUCCESS);
+		expect(
+			verdict.rows.find((row) => row.name === "Lint & type-check")?.conclusion,
+		).toBe("success");
+	});
+
+	it("reports the latest cancelled lint run with its rerun command (#3373)", () => {
+		const verdict = computeVerdict(
+			{
+				check_runs: [
+					...BOTH_SUCCESS.check_runs,
+					...REAL_CHECK_RUNS.cancelledLatest.check_runs,
+				],
+			},
+			undefined,
+			"MERGEABLE",
+		);
+		expect(verdict.exitCode).toBe(EXIT_PENDING);
+		expect(verdict.reason).toBe(
+			"superseded run cancelled and not replaced: rerun 107416999999 (gh run rerun 107416999999)",
+		);
+	});
+
+	it("uses the workflow run id from the #3382 check-run details URL (#3386)", () => {
+		const verdict = computeVerdict(
+			{
+				check_runs: [
+					...BOTH_SUCCESS.check_runs.filter(
+						(run) => run.name !== "Lint & type-check",
+					),
+					...PR_3382_CANCELLED.check_runs,
+				],
+			},
+			undefined,
+			"MERGEABLE",
+		);
+		expect(verdict.exitCode).toBe(EXIT_PENDING);
+		expect(verdict.reason).toBe(
+			"superseded run cancelled and not replaced: rerun 36022234159 (gh run rerun 36022234159)",
+		);
+	});
+
+	it("uses --job only when details_url verifies the check-run id is the job id", () => {
+		const verdict = computeVerdict(
+			{
+				check_runs: [
+					...BOTH_SUCCESS.check_runs.filter(
+						(run) => run.name !== "Lint & type-check",
+					),
+					checkRun({
+						name: "Lint & type-check",
+						conclusion: "cancelled",
+						id: 77,
+						details_url: "https://github.com/acme/repo/actions/job/77",
+					}),
+				],
+			},
+			undefined,
+			"MERGEABLE",
+		);
+		expect(verdict.exitCode).toBe(EXIT_PENDING);
+		expect(verdict.reason).toContain("rerun 77 (gh run rerun --job 77)");
+	});
+
+	it("names a third-party check that cannot be rerun via gh", () => {
+		const detailsUrl = "https://sonarcloud.io/project/status/acme";
+		const verdict = computeVerdict(
+			{
+				check_runs: [
+					...BOTH_SUCCESS.check_runs,
+					checkRun({
+						name: "CodeQL",
+						conclusion: "cancelled",
+						id: 88,
+						details_url: detailsUrl,
+					}),
+				],
+			},
+			["Unit tests", "Lint & type-check", "CodeQL"],
+			"MERGEABLE",
+		);
+		expect(verdict.exitCode).toBe(EXIT_PENDING);
+		expect(verdict.reason).toBe(
+			`superseded run cancelled and not replaced: CodeQL cannot be rerun via gh (not a GitHub Actions job; details: ${detailsUrl})`,
+		);
+	});
+
+	it("names a mismatched Actions job that cannot be rerun via gh", () => {
+		const detailsUrl = "https://github.com/acme/repo/actions/job/88";
+		const verdict = computeVerdict(
+			{
+				check_runs: [
+					...BOTH_SUCCESS.check_runs.filter(
+						(run) => run.name !== "Lint & type-check",
+					),
+					checkRun({
+						name: "Lint & type-check",
+						conclusion: "cancelled",
+						id: 77,
+						details_url: detailsUrl,
+					}),
+				],
+			},
+			undefined,
+			"MERGEABLE",
+		);
+		expect(verdict.exitCode).toBe(EXIT_PENDING);
+		expect(verdict.reason).toBe(
+			`superseded run cancelled and not replaced: Lint & type-check cannot be rerun via gh (not a GitHub Actions job; details: ${detailsUrl})`,
 		);
 	});
 
@@ -1029,6 +1158,9 @@ describe("isAdvisoryCheck — every job name from a PR-triggered workflow is cla
 		"typos (advisory)",
 		"taplo (advisory)",
 		"mutation (advisory)",
+		// #3531: posts the mutation job's survivors as a sticky PR comment;
+		// continue-on-error like the job it reports on, so never gating.
+		"mutation comment (advisory)",
 		"complexity (advisory)",
 		// #2697 item 9: the strictness census lane (two scratch tsconfigs) is advisory.
 		"strictness (advisory)",
@@ -1048,6 +1180,11 @@ describe("isAdvisoryCheck — every job name from a PR-triggered workflow is cla
 		// an explicit allowlist entry" case below for the proof that this
 		// name carries NO entry in `ADVISORY_CHECKS`.
 		"oxlint (advisory)",
+		// #3087: install-smoke's mise-repro is continue-on-error on every event,
+		// so its cells always conclude success; the "(advisory)" suffix makes
+		// ci-verdict read them as advisory instead of a gating pass.
+		"mise repro (#285) · ubuntu-latest · ${{ matrix.pi_via }} (advisory)",
+		"mise repro (#285) · macos-latest · ${{ matrix.pi_via }} (advisory)",
 		...EXTERNAL_ADVISORY_NAMES,
 	]);
 
@@ -1492,7 +1629,7 @@ describe("fetchCheckRunsPayload — timeout wiring (#2539 round 2, F4)", () => {
 		expect(calls[0].options).toEqual({ timeoutMs: 12_345 });
 		expect(calls[0].args).toEqual([
 			"api",
-			"repos/acme/repo/commits/deadbeef/check-runs?per_page=100",
+			"repos/acme/repo/commits/deadbeef/check-runs?per_page=100&page=1",
 		]);
 	});
 
@@ -1745,5 +1882,392 @@ describe("parseArgs", () => {
 
 	it("returns a null target when no positional argument is given", () => {
 		expect(parseArgs([])).toEqual({ target: null, waitSeconds: null });
+	});
+});
+
+// #2935: a GitHub API outage used to kill every armed `--wait` at once with
+// exit 70. A transient `gh` failure (network, 5xx, a gh call that hit its own
+// timeout) now backs off and keeps waiting inside the remaining budget; an
+// auth/repo error still exits 70 on the spot.
+describe("run --wait — transient gh errors back off instead of exiting 70 (#2935)", () => {
+	function ghError(stderr: string, extra: Record<string, unknown> = {}) {
+		return Object.assign(new Error(`Command failed: gh api\n${stderr}`), {
+			status: 1,
+			stderr,
+			...extra,
+		});
+	}
+
+	// A fake `gh` whose check-runs read throws `failures` in order, then
+	// answers green. Every other call answers normally.
+	function flakyGh(failures: Error[]) {
+		let checkRunsCalls = 0;
+		const ghExec = (args: string[]) => {
+			if (args[0] === "repo") return "acme/repo";
+			if (args[0] === "pr")
+				return JSON.stringify({
+					headRefOid: "c0ffee",
+					mergeable: "MERGEABLE",
+					labels: [],
+					comments: [],
+				});
+			if (String(args[1]).endsWith("/protection")) throw ghError("HTTP 404");
+			checkRunsCalls += 1;
+			const failure = failures[checkRunsCalls - 1];
+			if (failure) throw failure;
+			return JSON.stringify(BOTH_SUCCESS);
+		};
+		return { ghExec, checkRunsCalls: () => checkRunsCalls };
+	}
+
+	function fakeClock() {
+		let clock = 0;
+		const sleeps: number[] = [];
+		return {
+			now: () => clock,
+			sleepImpl: async (ms: number) => {
+				sleeps.push(ms);
+				clock += ms;
+			},
+			sleeps,
+		};
+	}
+
+	const CONNECT =
+		"error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com";
+
+	it("fails N times, then succeeds: exit 0, one line per retry, 30 s doubling", async () => {
+		const { ghExec, checkRunsCalls } = flakyGh([
+			ghError(CONNECT),
+			ghError("HTTP 502: Bad Gateway (https://api.github.com/repos/acme/repo)"),
+			ghError(CONNECT),
+		]);
+		const clock = fakeClock();
+		const stderrLines: string[] = [];
+		const exitCode = await run({
+			argv: ["2935", "--wait", "600"],
+			ghExec,
+			stdout: () => {},
+			stderr: (line: string) => stderrLines.push(line),
+			now: clock.now,
+			sleepImpl: clock.sleepImpl,
+		});
+		expect(exitCode).toBe(EXIT_SUCCESS);
+		expect(checkRunsCalls()).toBe(4);
+		expect(clock.sleeps).toEqual([30_000, 60_000, 120_000]);
+		const retryLines = stderrLines.filter((line) => /transient/.test(line));
+		expect(retryLines).toHaveLength(3);
+		expect(retryLines[0]).toMatch(/retrying in 30s/);
+	});
+
+	it("resets the backoff after a successful read", async () => {
+		const PENDING = JSON.stringify({
+			check_runs: [
+				checkRun({
+					name: "Unit tests",
+					status: "in_progress",
+					conclusion: null,
+					id: 1,
+				}),
+				checkRun({ name: "Lint & type-check", id: 2 }),
+			],
+		});
+		const answers: Array<Error | string> = [
+			ghError(CONNECT),
+			ghError(CONNECT),
+			PENDING,
+			ghError(CONNECT),
+			JSON.stringify(BOTH_SUCCESS),
+		];
+		const ghExec = (args: string[]) => {
+			if (args[0] === "repo") return "acme/repo";
+			if (args[0] === "pr")
+				return JSON.stringify({ headRefOid: "c0ffee", mergeable: "MERGEABLE" });
+			if (String(args[1]).endsWith("/protection")) throw ghError("HTTP 404");
+			const answer = answers.shift();
+			if (answer instanceof Error) throw answer;
+			return answer as string;
+		};
+		const clock = fakeClock();
+		const exitCode = await run({
+			argv: ["2935", "--wait", "600"],
+			ghExec,
+			stdout: () => {},
+			stderr: () => {},
+			now: clock.now,
+			sleepImpl: clock.sleepImpl,
+		});
+		expect(exitCode).toBe(EXIT_SUCCESS);
+		// 30, 60 (backoff), 30 (poll interval), then 30 again, not 120.
+		expect(clock.sleeps).toEqual([
+			30_000,
+			60_000,
+			POLL_INTERVAL_SECONDS * 1000,
+			30_000,
+		]);
+	});
+
+	it("caps the backoff at 5 minutes", async () => {
+		const { ghExec } = flakyGh(
+			Array.from({ length: 5 }, () => ghError(CONNECT)),
+		);
+		const clock = fakeClock();
+		const exitCode = await run({
+			argv: ["2935", "--wait", String(HARD_CAP_SECONDS)],
+			ghExec,
+			stdout: () => {},
+			stderr: () => {},
+			now: clock.now,
+			sleepImpl: clock.sleepImpl,
+		});
+		expect(exitCode).toBe(EXIT_SUCCESS);
+		expect(clock.sleeps).toEqual([30_000, 60_000, 120_000, 240_000, 300_000]);
+	});
+
+	it("exits 70 only once the budget is exhausted while still unreachable, never sleeping past it", async () => {
+		const { ghExec, checkRunsCalls } = flakyGh(
+			Array.from({ length: 100 }, () => ghError(CONNECT)),
+		);
+		const clock = fakeClock();
+		const stderrLines: string[] = [];
+		const exitCode = await run({
+			argv: ["2935", "--wait", "100"],
+			ghExec,
+			stdout: () => {},
+			stderr: (line: string) => stderrLines.push(line),
+			now: clock.now,
+			sleepImpl: clock.sleepImpl,
+		});
+		expect(exitCode).toBe(EXIT_TRANSPORT);
+		// 30 + 60, then only the 10 s left, then one last read at the deadline.
+		expect(clock.sleeps).toEqual([30_000, 60_000, 10_000]);
+		expect(checkRunsCalls()).toBe(4);
+		expect(stderrLines.at(-1)).toMatch(/error connecting to api\.github\.com/);
+	});
+
+	it("keeps the immediate exit 70 for an auth or repo error inside --wait", async () => {
+		for (const stderr of [
+			"HTTP 401: Bad credentials (https://api.github.com/repos/acme/repo)",
+			"HTTP 404: Not Found (https://api.github.com/repos/acme/repo/commits/c0ffee/check-runs)",
+			"To get started with GitHub CLI, please run:  gh auth login",
+		]) {
+			const { ghExec, checkRunsCalls } = flakyGh([ghError(stderr)]);
+			const clock = fakeClock();
+			const exitCode = await run({
+				argv: ["2935", "--wait", "600"],
+				ghExec,
+				stdout: () => {},
+				stderr: () => {},
+				now: clock.now,
+				sleepImpl: clock.sleepImpl,
+			});
+			expect(exitCode, stderr).toBe(EXIT_TRANSPORT);
+			expect(checkRunsCalls(), stderr).toBe(1);
+			expect(clock.sleeps, stderr).toEqual([]);
+		}
+	});
+
+	it("a one-shot read (no --wait) still exits 70 on a transient error", async () => {
+		const { ghExec, checkRunsCalls } = flakyGh([ghError(CONNECT)]);
+		const clock = fakeClock();
+		const exitCode = await run({
+			argv: ["2935"],
+			ghExec,
+			stdout: () => {},
+			stderr: () => {},
+			now: clock.now,
+			sleepImpl: clock.sleepImpl,
+		});
+		expect(exitCode).toBe(EXIT_TRANSPORT);
+		expect(checkRunsCalls()).toBe(1);
+		expect(clock.sleeps).toEqual([]);
+	});
+
+	// #2935 remainder: the two startup lookups (`gh repo view`, `gh pr view`)
+	// ran before the retry loop, so a wait armed while GitHub was already
+	// down still exited 70 at once.
+	function startupFlakyGh(repoFailures: Error[], prFailures: Error[]) {
+		const calls = { repo: 0, pr: 0 };
+		const ghExec = (args: string[]) => {
+			if (args[0] === "repo") {
+				calls.repo += 1;
+				const failure = repoFailures[calls.repo - 1];
+				if (failure) throw failure;
+				return "acme/repo";
+			}
+			if (args[0] === "pr" && args.join(" ").includes("headRefOid,mergeable")) {
+				calls.pr += 1;
+				const failure = prFailures[calls.pr - 1];
+				if (failure) throw failure;
+				return JSON.stringify({ headRefOid: "c0ffee", mergeable: "MERGEABLE" });
+			}
+			if (args[0] === "pr")
+				return JSON.stringify({
+					headRefOid: "c0ffee",
+					labels: [],
+					comments: [],
+				});
+			if (String(args[1]).endsWith("/protection")) throw ghError("HTTP 404");
+			return JSON.stringify(BOTH_SUCCESS);
+		};
+		return { ghExec, calls };
+	}
+
+	it("retries the startup lookups on a transient error inside --wait", async () => {
+		const { ghExec, calls } = startupFlakyGh(
+			[ghError(CONNECT), ghError(CONNECT)],
+			[ghError("HTTP 503: Service Unavailable")],
+		);
+		const clock = fakeClock();
+		const stderrLines: string[] = [];
+		const exitCode = await run({
+			argv: ["2935", "--wait", "600"],
+			ghExec,
+			stdout: () => {},
+			stderr: (line: string) => stderrLines.push(line),
+			now: clock.now,
+			sleepImpl: clock.sleepImpl,
+		});
+		expect(exitCode).toBe(EXIT_SUCCESS);
+		expect(calls).toEqual({ repo: 3, pr: 2 });
+		// Each lookup backs off from 30 s on its own.
+		expect(clock.sleeps).toEqual([30_000, 60_000, 30_000]);
+		expect(stderrLines.filter((line) => /transient/.test(line))).toHaveLength(
+			3,
+		);
+	});
+
+	it("counts startup retries against the same --wait budget", async () => {
+		// 100 s budget: 30 + 60 s spent getting the repo leaves 10 s, so the
+		// head-SHA lookup gets one 10 s wait and one final try at the deadline.
+		const { ghExec, calls } = startupFlakyGh(
+			[ghError(CONNECT), ghError(CONNECT)],
+			Array.from({ length: 10 }, () => ghError(CONNECT)),
+		);
+		const clock = fakeClock();
+		const exitCode = await run({
+			argv: ["2935", "--wait", "100"],
+			ghExec,
+			stdout: () => {},
+			stderr: () => {},
+			now: clock.now,
+			sleepImpl: clock.sleepImpl,
+		});
+		expect(exitCode).toBe(EXIT_TRANSPORT);
+		expect(clock.sleeps).toEqual([30_000, 60_000, 10_000]);
+		expect(calls.pr).toBe(2);
+	});
+
+	it("startup retries and the poll share one --wait budget", async () => {
+		// One 30 s startup retry, then checks that stay pending: every sleep
+		// together must fit inside the 120 s asked for, not 30 s + 120 s.
+		let repoCalls = 0;
+		const ghExec = (args: string[]) => {
+			if (args[0] === "repo") {
+				repoCalls += 1;
+				if (repoCalls === 1) throw ghError(CONNECT);
+				return "acme/repo";
+			}
+			if (args[0] === "pr")
+				return JSON.stringify({
+					headRefOid: "c0ffee",
+					mergeable: "MERGEABLE",
+					labels: [],
+					comments: [],
+				});
+			if (String(args[1]).endsWith("/protection")) throw ghError("HTTP 404");
+			return JSON.stringify({
+				check_runs: [
+					checkRun({
+						name: "Unit tests",
+						status: "in_progress",
+						conclusion: null,
+						id: 1,
+					}),
+					checkRun({ name: "Lint & type-check", id: 2 }),
+				],
+			});
+		};
+		const clock = fakeClock();
+		const exitCode = await run({
+			argv: ["2935", "--wait", "120"],
+			ghExec,
+			stdout: () => {},
+			stderr: () => {},
+			now: clock.now,
+			sleepImpl: clock.sleepImpl,
+		});
+		expect(exitCode).toBe(EXIT_PENDING);
+		expect(clock.sleeps[0]).toBe(30_000);
+		expect(clock.sleeps.reduce((sum, ms) => sum + ms, 0)).toBeLessThanOrEqual(
+			120_000,
+		);
+	});
+
+	it("a one-shot read still exits 70 when a startup lookup fails transiently", async () => {
+		const { ghExec, calls } = startupFlakyGh([ghError(CONNECT)], []);
+		const clock = fakeClock();
+		const exitCode = await run({
+			argv: ["2935"],
+			ghExec,
+			stdout: () => {},
+			stderr: () => {},
+			now: clock.now,
+			sleepImpl: clock.sleepImpl,
+		});
+		expect(exitCode).toBe(EXIT_TRANSPORT);
+		expect(calls.repo).toBe(1);
+		expect(clock.sleeps).toEqual([]);
+	});
+});
+
+describe("isTransientGhError (#2935)", () => {
+	const withStderr = (stderr: string, extra: Record<string, unknown> = {}) =>
+		Object.assign(new Error("Command failed: gh"), { stderr, ...extra });
+
+	it.each([
+		["connect failure", withStderr("error connecting to api.github.com")],
+		["HTTP 500", withStderr("HTTP 500: Internal Server Error")],
+		["HTTP 502", withStderr("HTTP 502: Bad Gateway")],
+		["HTTP 503", withStderr("HTTP 503: Service Unavailable")],
+		["HTTP 504", withStderr("HTTP 504: Gateway Timeout")],
+		[
+			"connection reset",
+			withStderr("read tcp 1.2.3.4:5: connection reset by peer"),
+		],
+		["i/o timeout", withStderr("dial tcp: i/o timeout")],
+		["TLS handshake timeout", withStderr("net/http: TLS handshake timeout")],
+		[
+			"gh hit its own timeout",
+			withStderr("", { code: "ETIMEDOUT", signal: "SIGTERM" }),
+		],
+		[
+			"stderr as a Buffer",
+			withStderr(Buffer.from("HTTP 503: x") as unknown as string),
+		],
+	])("%s is transient", (_label, error) => {
+		expect(isTransientGhError(error)).toBe(true);
+	});
+
+	it.each([
+		["HTTP 401", withStderr("HTTP 401: Bad credentials")],
+		[
+			"HTTP 403",
+			withStderr("HTTP 403: Resource not accessible by integration"),
+		],
+		["HTTP 404", withStderr("HTTP 404: Not Found")],
+		["gh auth login", withStderr("please run:  gh auth login")],
+		[
+			"gh not on PATH",
+			Object.assign(new Error("spawnSync gh ENOENT"), { code: "ENOENT" }),
+		],
+		[
+			"malformed JSON",
+			new SyntaxError("Unexpected token < in JSON at position 0"),
+		],
+		["a non-Error value", "boom"],
+		["undefined", undefined],
+	])("%s is not transient", (_label, error) => {
+		expect(isTransientGhError(error)).toBe(false);
 	});
 });

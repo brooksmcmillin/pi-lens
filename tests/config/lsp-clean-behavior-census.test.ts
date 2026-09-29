@@ -54,13 +54,23 @@ const MEASURED_CLEAN_BEHAVIORS = new Set([
  * classified: `lang` → why. `unknown`/`TBD` is evidence in neither direction
  * (the #240 doctrine), but it has to be admitted BY NAME rather than filtered
  * out, or a measured row escapes the census simply by losing its cell.
- * Shrink-only: the population test reds when an admitted row becomes measured,
+ * Shrink-only: `staleAdmissions` reds when an admitted row becomes measured,
  * so a landed measurement cannot leave a stale exemption behind.
+ *
+ * The reason string is documentation for a human reader ONLY. Nothing reads it:
+ * #3390 round 2 shipped a stale filter that skipped any admission whose reason
+ * contained `docs-refresh bot`, so an admission survived the exact transition
+ * the shrink-only claim is about — prose satisfying a guard, the self-excuse
+ * direction AGENTS.md's detector rule forbids.
  */
 const UNMEASURED_PUSH_ADMISSIONS = new Map<string, string>([
 	[
 		"terraform",
 		"terraform-ls: clean-behavior not yet classified by probe-clean-signal.mjs (the matrix tier cell is still `2/3?`); no silentOnClean marker may be set for it until it is",
+	],
+	[
+		"vue",
+		"@vue/language-server: the `publishes-unversioned` cell was an artifact of #3390 (58/45 publishes attributed to vue were tinymist's); nightly 36046209160 re-measured 0/0 with the sink scoped, so the cell is `unknown` until a run observes vue itself publish",
 	],
 ]);
 
@@ -101,35 +111,58 @@ function markedServers(): string[] {
 		.map(([serverId]) => serverId);
 }
 
+/**
+ * Push rows that are neither measured nor admitted by name. Pure so the live
+ * matrix and the state-table fixture below run the SAME predicate.
+ */
+function unaccountedPushRows(
+	pushRows: MatrixRow[],
+	admissions: Map<string, string>,
+): string[] {
+	return pushRows
+		.filter(
+			(row) =>
+				!MEASURED_CLEAN_BEHAVIORS.has(row.cleanBehavior) &&
+				!admissions.has(row.lang),
+		)
+		.map(
+			(row) =>
+				`${row.lang} (${row.server}): clean-behavior=${JSON.stringify(row.cleanBehavior)} is neither measured nor admitted — a push row that leaves the measured population takes its silentOnClean coverage with it`,
+		);
+}
+
+/**
+ * Admissions whose justification is gone: TOTAL over the reason text. An
+ * admission is stale the moment no unmeasured push row for that lang exists —
+ * the row became measured, changed mode, or left the matrix. The reason string
+ * is never consulted (see UNMEASURED_PUSH_ADMISSIONS).
+ */
+function staleAdmissions(
+	pushRows: MatrixRow[],
+	admissions: Map<string, string>,
+): string[] {
+	return [...admissions.keys()]
+		.filter(
+			(lang) =>
+				!pushRows.some(
+					(row) =>
+						row.lang === lang &&
+						!MEASURED_CLEAN_BEHAVIORS.has(row.cleanBehavior),
+				),
+		)
+		.map(
+			(lang) =>
+				`${lang}: stale unmeasured-push admission — the row is now measured (or gone), so the admission must be deleted`,
+		);
+}
+
 describe("#3347 clean-behavior marker census", () => {
 	it("measures or admits by name every push row", () => {
 		const pushRows = matrixRows().filter((row) => row.mode === "push-only");
-		const unaccounted = pushRows
-			.filter(
-				(row) =>
-					!MEASURED_CLEAN_BEHAVIORS.has(row.cleanBehavior) &&
-					!UNMEASURED_PUSH_ADMISSIONS.has(row.lang),
-			)
-			.map(
-				(row) =>
-					`${row.lang} (${row.server}): clean-behavior=${JSON.stringify(row.cleanBehavior)} is neither measured nor admitted — a push row that leaves the measured population takes its silentOnClean coverage with it`,
-			);
-		expect(unaccounted).toEqual([]);
-
-		const stale = [...UNMEASURED_PUSH_ADMISSIONS.keys()]
-			.filter(
-				(lang) =>
-					!pushRows.some(
-						(row) =>
-							row.lang === lang &&
-							!MEASURED_CLEAN_BEHAVIORS.has(row.cleanBehavior),
-					),
-			)
-			.map(
-				(lang) =>
-					`${lang}: stale unmeasured-push admission — the row is now measured (or gone), so the admission must be deleted`,
-			);
-		expect(stale).toEqual([]);
+		expect(unaccountedPushRows(pushRows, UNMEASURED_PUSH_ADMISSIONS)).toEqual(
+			[],
+		);
+		expect(staleAdmissions(pushRows, UNMEASURED_PUSH_ADMISSIONS)).toEqual([]);
 
 		// A floor, not a ratchet: the census must never pass by comparing nothing
 		// (defect shape 10 — an empty census fails loud).
@@ -137,6 +170,45 @@ describe("#3347 clean-behavior marker census", () => {
 			MEASURED_CLEAN_BEHAVIORS.has(row.cleanBehavior),
 		);
 		expect(comparable.length).toBeGreaterThanOrEqual(3);
+	});
+
+	it("expires an admission on measurement whatever its reason says", () => {
+		// #3390 round 2 recurrence: the stale filter skipped any admission whose
+		// reason contained "docs-refresh bot", so an admission outlived the very
+		// transition the shrink-only claim covers (rows 3 and 9 below). The state
+		// table is row state × admission present/absent × reason wording; the two
+		// wordings must be indistinguishable in every arm.
+		const row = (cleanBehavior: string): MatrixRow => ({
+			lang: "fixturelang",
+			server: "fixture-language-server",
+			mode: "push-only",
+			cleanBehavior,
+		});
+		const measured = [row("publishes-unversioned")];
+		const unmeasured = [row("unknown")];
+		const gone: MatrixRow[] = [];
+		const none = new Map<string, string>();
+		for (const reason of [
+			"plain reason with no special wording",
+			"awaits the docs-refresh bot after nightly 36046209160",
+		]) {
+			const admitted = new Map<string, string>([["fixturelang", reason]]);
+			// 1: measured, no admission → nothing to report.
+			expect(unaccountedPushRows(measured, none), reason).toEqual([]);
+			expect(staleAdmissions(measured, none), reason).toEqual([]);
+			// 2 and 3: measured row keeps an admission → stale, both wordings.
+			expect(staleAdmissions(measured, admitted), reason).toHaveLength(1);
+			// 4: unmeasured row with no admission → unaccounted.
+			expect(unaccountedPushRows(unmeasured, none), reason).toHaveLength(1);
+			// 5 and 6: unmeasured row with an admission → the admission's purpose.
+			expect(unaccountedPushRows(unmeasured, admitted), reason).toEqual([]);
+			expect(staleAdmissions(unmeasured, admitted), reason).toEqual([]);
+			// 7: no push row, no admission → nothing to account for.
+			expect(unaccountedPushRows(gone, none), reason).toEqual([]);
+			expect(staleAdmissions(gone, none), reason).toEqual([]);
+			// 8 and 9: the row left the push population → stale, both wordings.
+			expect(staleAdmissions(gone, admitted), reason).toHaveLength(1);
+		}
 	});
 
 	it("matches every measured push server in both directions", () => {

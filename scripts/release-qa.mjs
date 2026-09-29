@@ -535,6 +535,60 @@ export function rowProbeRequest(run) {
 }
 
 /**
+ * The server the `global-config-location` row disables from the agent-dir
+ * global file (#3446 F1). The fixture project never names it, so only the
+ * global tier can supply the setting.
+ */
+export const GLOBAL_CONFIG_LOCATION_SERVER = "typescript";
+
+/**
+ * Judge the `global-config-location` row from a `pilens_effective_config`
+ * answer for `a.ts` (#3446 F1). Reading the file is not enough: the row passes
+ * only when the global tier decided at least one leaf AND the file's setting
+ * decided the server it names. The view is the fenced JSON the tool appends to
+ * its text.
+ *
+ * @param {string} text
+ * @param {string} agentConfigPath
+ * @returns {{ status: "pass" | "fail", shows: string }}
+ */
+export function classifyGlobalConfigLocation(text, agentConfigPath) {
+	const fences = [...String(text).matchAll(/```json\n([\s\S]*?)\n```/g)];
+	let view;
+	try {
+		view = fences.length > 0 ? JSON.parse(fences.at(-1)[1]) : undefined;
+	} catch {
+		view = undefined;
+	}
+	if (!view || typeof view !== "object") {
+		return {
+			status: "fail",
+			shows: "no structured effective-config view in the answer",
+		};
+	}
+	const globalLeaves = Number(view.provenanceCounts?.global ?? 0);
+	const server = (view.file?.servers ?? []).find(
+		(candidate) => candidate?.id === GLOBAL_CONFIG_LOCATION_SERVER,
+	);
+	// Decided BY the agent-dir file is the proof its value applied: that path is
+	// only ever the global tier, so the tier needs no separate check.
+	const decided = server?.decidedBy;
+	if (globalLeaves >= 1 && decided?.file === agentConfigPath) {
+		return {
+			status: "pass",
+			shows: `global tier decided ${globalLeaves} leaf/leaves; ${GLOBAL_CONFIG_LOCATION_SERVER} disabled by ${agentConfigPath} (${decided.key})`,
+		};
+	}
+	const serverState = server
+		? `${server.selected ? "selected" : "not selected"}, reason ${server.reason}, decided by ${decided ? `${decided.tier} ${decided.file ?? "(no file)"}` : "nothing"}`
+		: "absent from the file view";
+	return {
+		status: "fail",
+		shows: `global value not applied: provenanceCounts.global=${globalLeaves}; ${GLOBAL_CONFIG_LOCATION_SERVER} ${serverState}`,
+	};
+}
+
+/**
  * The `install-selftest` row's verdict, as a pure function of the packaged
  * selftest's exit code and stdout (#2619 review N6).
  *
@@ -1560,6 +1614,80 @@ export async function pollToTerminal(attempt, { capMs, intervalMs }) {
 	};
 }
 
+/**
+ * The installed MCP server entrypoint the `mcp-stdio` config rows drive.
+ */
+function installedServerJs(ctx) {
+	return path.join(ctx.installedPkgDir, "dist", "mcp", "server.js");
+}
+
+/**
+ * Write the agent-dir global config fixture (`PI_CODING_AGENT_DIR` resolution,
+ * refs #2457): `<agentDir>/extensions/pi-lens.json` carrying a distinguishable
+ * global setting. Returns the exact path the resolver reads, so a row asserts
+ * that path by name rather than re-deriving its spelling.
+ */
+function writeAgentDirGlobalConfig(agentDir, value) {
+	const extensions = path.join(agentDir, "extensions");
+	fs.mkdirSync(extensions, { recursive: true });
+	const file = path.join(extensions, "pi-lens.json");
+	fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
+	return file;
+}
+
+/**
+ * A row-private HOME with every scratch pin re-pointed under it, derived from
+ * the runner's own `ctx.env`.
+ *
+ * The two global-config rows cannot share the fixture MCP session: the global
+ * config choice is memoized for the life of a server process, and one row needs
+ * the agent-dir file to WIN while the other needs BOTH files present. Each row
+ * therefore owns its process and a resolution context it controls.
+ */
+function rowHomeEnv(ctx, name, extra = {}) {
+	const home = path.join(ctx.scratchRoot, `${name}-home`);
+	fs.mkdirSync(path.join(home, ".pi-lens"), { recursive: true });
+	return {
+		home,
+		env: {
+			...ctx.env,
+			HOME: home,
+			USERPROFILE: home,
+			PI_LENS_HOME: path.join(home, ".pi-lens"),
+			PILENS_DATA_DIR: path.join(home, ".pilens-data"),
+			PI_LENS_INSTALL_LOG: path.join(home, ".pi-lens", "install.log"),
+			npm_config_cache: path.join(ctx.scratchRoot, `${name}-npm-cache`),
+			...extra,
+		},
+	};
+}
+
+/**
+ * Open and initialize an MCP stdio session against the installed candidate;
+ * the caller closes it. The one `initialize` handshake in this script: `main()`
+ * opens the shared session through it and rows open row-private ones. The
+ * initialize failure closes the session and is thrown (never a PASS), so an
+ * unreachable server reads FAIL.
+ */
+async function openScopedMcpSession(serverJs, cwd, env) {
+	const session = new McpSession(serverJs, cwd, env);
+	const init = await session.request(
+		"initialize",
+		{
+			protocolVersion: "2024-11-05",
+			capabilities: {},
+			clientInfo: { name: "release-qa", version: "1" },
+		},
+		60_000,
+	);
+	if (init.error) {
+		await session.close();
+		throw new Error(`MCP initialize failed: ${init.error.message}`);
+	}
+	session.notify("notifications/initialized", {});
+	return session;
+}
+
 // --- Row probes ------------------------------------------------------------
 //
 // One entry per baseline row id. A row id present here but absent from
@@ -1818,6 +1946,105 @@ const ROW_PROBES = {
 			shows,
 			witness: { ext: "txt", content: result.text },
 		};
+	},
+
+	"global-config-location": async (ctx) => {
+		// #2457: with `PI_CODING_AGENT_DIR` set and the agent-dir file present
+		// while the legacy default is absent, the resolution must select
+		// `pi-coding-agent-dir` and load THAT file. #3446 F1: naming the file
+		// is not enough, so it carries a setting only the global tier supplies,
+		// and the row asserts that setting was applied.
+		const agentDir = path.join(ctx.scratchRoot, "global-config-location-agent");
+		const agentConfigPath = writeAgentDirGlobalConfig(agentDir, {
+			lsp: { disabledServers: [GLOBAL_CONFIG_LOCATION_SERVER] },
+		});
+		const { env } = rowHomeEnv(ctx, "global-config-location", {
+			PI_CODING_AGENT_DIR: agentDir,
+		});
+		let session;
+		try {
+			session = await openScopedMcpSession(
+				installedServerJs(ctx),
+				ctx.projectDir,
+				env,
+			);
+			const result = await session.callToolText("pilens_effective_config", {
+				file: "a.ts",
+			});
+			const judged = classifyGlobalConfigLocation(result.text, agentConfigPath);
+			return {
+				status: result.ok ? judged.status : "fail",
+				detail: judged.shows,
+				shows: judged.shows,
+				witness: { ext: "txt", content: result.text },
+			};
+		} finally {
+			if (session) await session.close();
+		}
+	},
+
+	"config-shadow-record": async (ctx) => {
+		// #3299: when BOTH global files exist the legacy default wins and the
+		// shadowed agent-dir file is recorded ONCE per session under
+		// `config-location-shadowed` (code PILENS_CFG_0010, `recordDegradationOnce`).
+		// Each config load re-fires the reporter, so two health reads after
+		// three loads prove the count stayed at 1.
+		const agentDir = path.join(ctx.scratchRoot, "config-shadow-record-agent");
+		const agentConfigPath = writeAgentDirGlobalConfig(agentDir, {
+			lsp: { enabled: true },
+		});
+		// Realpath the shadowed path the record carries: `canonicalPathIdentity`
+		// resolves aliases, so the raw spelling is not the identity to match.
+		const shadowedIdentity = fs.realpathSync(agentConfigPath);
+		const { home, env } = rowHomeEnv(ctx, "config-shadow-record", {
+			PI_CODING_AGENT_DIR: agentDir,
+		});
+		const legacyConfigPath = path.join(home, ".pi-lens", "config.json");
+		fs.writeFileSync(legacyConfigPath, "{}\n");
+		let session;
+		try {
+			session = await openScopedMcpSession(
+				installedServerJs(ctx),
+				ctx.projectDir,
+				env,
+			);
+			// A config query loads the global tier (and so fires the reporter);
+			// health then renders the ledger it recorded.
+			await session.callToolText("pilens_effective_config", { file: "a.ts" });
+			const first = await session.callToolText("pilens_health", {});
+			const second = await session.callToolText("pilens_health", {});
+			const shadowLine = (text) =>
+				text
+					.split(/\r?\n/)
+					.find((candidate) => candidate.includes("config-location-shadowed"));
+			const firstLine = shadowLine(first.text);
+			const secondLine = shadowLine(second.text);
+			const namesShadowed = (line) =>
+				Boolean(line) && line.includes(shadowedIdentity);
+			const single = (line) =>
+				Boolean(line) && /config-location-shadowed: 1\b/.test(line);
+			const witnessed =
+				first.ok &&
+				second.ok &&
+				namesShadowed(firstLine) &&
+				single(firstLine) &&
+				namesShadowed(secondLine) &&
+				single(secondLine);
+			const shows = witnessed
+				? `one config-location-shadowed record naming ${shadowedIdentity}, count 1 on two consecutive health reads`
+				: `shadow record not witnessed once-per-session: first=${(firstLine ?? "none").trim().slice(0, 200)} second=${(secondLine ?? "none").trim().slice(0, 200)}`;
+			return {
+				status: witnessed ? "pass" : "fail",
+				detail: shows,
+				shows,
+				witness: {
+					ext: "txt",
+					content: `--- health #1 ---\n${first.text}\n\n--- health #2 ---\n${second.text}`,
+				},
+			};
+		} finally {
+			if (session) await session.close();
+		}
 	},
 
 	"git-install-loads": async (ctx) => {
@@ -2167,18 +2394,7 @@ async function main() {
 	if (!blocked && !candidateFailure) {
 		const serverJs = path.join(installedPkgDir, "dist", "mcp", "server.js");
 		try {
-			mcp = new McpSession(serverJs, projectDir, env);
-			const init = await mcp.request(
-				"initialize",
-				{
-					protocolVersion: "2024-11-05",
-					capabilities: {},
-					clientInfo: { name: "release-qa", version: "1" },
-				},
-				60_000,
-			);
-			if (init.error) throw new Error(init.error.message);
-			mcp.notify("notifications/initialized", {});
+			mcp = await openScopedMcpSession(serverJs, projectDir, env);
 			const listed = await mcp.request("tools/list", {}, 60_000);
 			mcpTools = listed.error
 				? { ok: false, reason: listed.error.message }

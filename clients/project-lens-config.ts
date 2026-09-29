@@ -108,7 +108,10 @@ import {
 	isAtOrAboveHomeDir,
 	walkUpDirs,
 } from "./path-utils.js";
-import { findPiLensConfigMarkerInDir } from "./workspace-topology.js";
+import {
+	dirMtimesStillFresh,
+	findPiLensConfigMarkerInDir,
+} from "./workspace-topology.js";
 import { readToolConfig } from "./tool-config.js";
 
 /**
@@ -509,11 +512,7 @@ function safeDirMtimeMs(dir: string): number {
 }
 
 function discoveryCacheStillFresh(entry: DiscoveryCacheEntry): boolean {
-	if (
-		!entry.dirMtimes.every(
-			(cached) => safeDirMtimeMs(cached.dir) === cached.mtimeMs,
-		)
-	) {
+	if (!dirMtimesStillFresh(entry.dirMtimes)) {
 		return false;
 	}
 	// #2483 round 2. When no config was found anywhere, `bearingDirMtimes`'s

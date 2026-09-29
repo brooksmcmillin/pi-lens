@@ -614,7 +614,16 @@ export interface WorkspaceDiagnosticsCacheContext {
 		 *  when unavailable — `isEntryFresh` then fails open to mtime-only for
 		 *  this entry. */
 		sizeBytes?: number,
+		/** #3505: `Date.now()` taken before the file was read, the entry's
+		 *  `scannedAt`. Omit to stamp now. */
+		scannedAt?: number,
 	): void;
+	/**
+	 * #3505 (b): drop `filePath`'s entry. For a confirmed answer the sweep may
+	 * not persist (a workspace pull not bound to bytes pi-lens sent): the entry
+	 * it supersedes must not stay behind to be replayed.
+	 */
+	forget(filePath: string): void;
 	/** Best-effort disk write of everything recorded so far. Swallows any
 	 * write failure — a failed cache write should never fail the sweep that
 	 * produced the data. Safe to call more than once (subsequent calls are a
@@ -797,13 +806,20 @@ export function createWorkspaceDiagnosticsCacheContext(
 				scannedAt: entry.scannedAt,
 			};
 		},
-		record(filePath, scopeKey, diagnostics, mtimeMs, contentHash, sizeBytes) {
-			const scanGeneration = Date.now();
+		record(
+			filePath,
+			scopeKey,
+			diagnostics,
+			mtimeMs,
+			contentHash,
+			sizeBytes,
+			scannedAt = Date.now(),
+		) {
 			entries[cacheKeyFor(filePath)] = {
 				diagnostics,
 				count: diagnostics.length,
 				mtimeMs,
-				scannedAt: scanGeneration,
+				scannedAt,
 				scopeKey,
 				// #1793: stamp whether THIS FILE actually had dependency
 				// knowledge this sweep (not just whether SOME index was
@@ -814,6 +830,10 @@ export function createWorkspaceDiagnosticsCacheContext(
 				...(contentHash !== undefined && { contentHash }),
 				...(sizeBytes !== undefined && { sizeBytes }),
 			};
+			dirty = true;
+		},
+		forget(filePath) {
+			delete entries[cacheKeyFor(filePath)];
 			dirty = true;
 		},
 		persist() {

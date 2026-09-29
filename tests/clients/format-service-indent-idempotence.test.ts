@@ -227,6 +227,43 @@ describe("formatter indentation inference through FormatService (#3038)", () => 
 		}
 	});
 
+	it("declines when block-comment interiors are the only indentation evidence (#3161)", async () => {
+		const env = setupTestEnvironment("pi-lens-format-indent-masked-");
+		try {
+			writeBiomeEvidence(env.tmpDir);
+			const filePath = path.join(env.tmpDir, "comment-only.ts");
+			fs.writeFileSync(
+				filePath,
+				[
+					"/**",
+					" * only comment indentation",
+					" */",
+					"export const x = 1;",
+					"",
+				].join("\n"),
+			);
+			safeSpawnAsync.mockResolvedValue({ status: 0, stdout: "", stderr: "" });
+
+			const service = new FormatService("format-indent-masked", true);
+			service.recordRead(filePath);
+			const summary = await service.formatFile(filePath);
+
+			expect(summary.formatters).toEqual([
+				expect.objectContaining({ name: "biome", outcome: "skipped" }),
+			]);
+			expect(safeSpawnAsync).not.toHaveBeenCalled();
+			expect(getDegradationSummary()).toEqual([
+				expect.objectContaining({
+					kind: "formatter-skip",
+					count: 1,
+					latestReasons: [expect.objectContaining({ subject: "biome" })],
+				}),
+			]);
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("honors an ancestor editorconfig through the selected formatter", async () => {
 		const env = setupTestEnvironment("pi-lens-format-indent-config-");
 		try {

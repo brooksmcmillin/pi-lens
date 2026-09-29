@@ -50,6 +50,8 @@ Dispatch is diagnostics-oriented: automatic formatting and safe autofix happen i
 | CMake                 | ✓ (cmake-language-server) | lsp                                                                                      | cmake-format            |
 | CUE                   | ✓ (syntax via cue lsp, evaluation via cue vet) | lsp, cue-vet                                                              | cue fmt                 |
 
+### CUE tree-sitter grammar
+
 `cue lsp` reports load and parse errors as you type but leaves conflicting
 values and failed constraints to `cue vet` — the `cue-vet` auxiliary runner
 (#1522) covers that gap, so together they give full coverage: syntax/parse
@@ -78,6 +80,21 @@ this repo's queries):
 Both are upstream grammar limitations (tracked among
 [eonpatapon/tree-sitter-cue](https://github.com/eonpatapon/tree-sitter-cue)'s
 open issues), not something a query change here can fix.
+
+## Non-core grammars
+
+The `tree-sitter` runner and `symbol_search`/`module_report` structural
+extraction ship a fixed set of core grammars; grammars for the other
+languages in the table above (CUE included) are fetched lazily on first use
+into web-tree-sitter's resolved package directory, verified against
+`scripts/grammars.lock.json`. This resolution works on a runtime that cannot
+resolve a bare package specifier — pi shipped as a `bun build --compile`
+binary — via one shared subpath-based ladder
+(`scripts/lib/web-tree-sitter-dir.mjs`, #3409); before that fix, non-core
+languages could never be analysed on those hosts. A grammar that never loads
+(fetch failure, unwritable target, an unsupported runtime) is recorded as a
+`grammar_unavailable` **skip**, never a clean pass
+(`clients/dispatch/runners/tree-sitter.ts`).
 
 ## Considered and skipped (2026-08-20 survey, closed out by #1757)
 

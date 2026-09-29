@@ -69,6 +69,7 @@ import {
 	extensionsForLanguage,
 	SCAN_LANGUAGE_PRIORITY,
 } from "../clients/language-registry.js";
+import { exceedsLspSyncLimits } from "../clients/lsp/content-limits.js";
 
 const MAX_FILES = 100;
 export const MAX_BATCH_FILES = 100;
@@ -151,6 +152,7 @@ type FileDiagnosticResult = {
 	 * analyzing" or "never asked". Never render this bucket as "0 diagnostics".
 	 */
 	confirmation?: "clean" | "unconfirmed";
+	tooLargeReason?: string;
 	/**
 	 * #570: true when `confirmation === "unconfirmed"` specifically because
 	 * the priming LSP check TIMED OUT (notify write and/or diagnostics wait
@@ -179,13 +181,55 @@ type FileDiagnosticResult = {
 };
 
 /** The only per-file states an explicit batch exposes to an agent. */
-type BatchFileOutcome =
+export type BatchFileOutcome =
 	| "clean"
 	| "findings"
 	| "unsupported"
 	| "unavailable"
 	| "failed"
+	| "too_large"
 	| "inconclusive";
+
+export type BatchOutcomeDetail = {
+	file: string;
+	outcome: BatchFileOutcome;
+	// Absent when the detail arrives through the compact renderer's `details`
+	// plumbing (tools/lens-diagnostics.ts), explicitly `undefined` when a
+	// producer folds four optional result fields into one reason. Both are the
+	// same "no reason" state to `renderBatchOutcomeLines`.
+	reason?: string | undefined;
+};
+
+function assertNeverBatchFileOutcome(value: never): never {
+	throw new Error(`Unhandled batch file outcome: ${String(value)}`);
+}
+
+/** Render the bounded per-file outcomes shared by batch, directory, and fold surfaces. */
+export function renderBatchOutcomeLines(
+	outcomes: readonly BatchOutcomeDetail[],
+	formatFile: (file: string) => string = (file) => file,
+): string[] {
+	const lines: string[] = [];
+	for (const outcome of outcomes) {
+		switch (outcome.outcome) {
+			case "too_large":
+				lines.push(
+					`${formatFile(outcome.file)}: ${outcome.reason ?? "file too large for LSP diagnostics"}`,
+				);
+				break;
+			case "clean":
+			case "findings":
+			case "unsupported":
+			case "unavailable":
+			case "failed":
+			case "inconclusive":
+				break;
+			default:
+				assertNeverBatchFileOutcome(outcome.outcome);
+		}
+	}
+	return lines;
+}
 
 function batchFileDeadlineMs(): number {
 	const raw = Number(process.env.PI_LENS_LSP_BATCH_FILE_MS);
@@ -514,6 +558,7 @@ export function createLspDiagnosticsTool(
 
 type DiagnosticsCollectionResult = {
 	diagnostics: LSPDiagnostic[];
+	tooLargeReason?: string;
 	skipReason?: "outside-project-root";
 	/**
 	 * #570: true when the priming `touchFile` call could not confirm its
@@ -596,6 +641,24 @@ async function collectDiagnosticsForFile(
 	let touched: TouchFileResult | undefined;
 	try {
 		content = fs.readFileSync(absPath, "utf-8");
+		const contentLimit = exceedsLspSyncLimits(content);
+		if (contentLimit.tooLarge) {
+			const reason = `file too large for LSP diagnostics (${contentLimit.reason})`;
+			recordDegradationOnce({
+				kind: "lsp-diagnostics-file-too-large",
+				subject: absPath,
+				reason,
+			});
+			return {
+				diagnostics: [],
+				timedOut: false,
+				confirmedByTouch: false,
+				unconfirmedServerIds: [],
+				diagnosticsUnsupportedServerIds: [],
+				content,
+				tooLargeReason: reason,
+			};
+		}
 		if (isWarmAttached()) {
 			// The local sweep's default service wait is bounded to the same
 			// 15-second per-file envelope used by the workspace sweep. An explicit
@@ -656,6 +719,12 @@ async function collectDiagnosticsForFile(
 			maxClientWaitMs: waitMs,
 			source: "lsp_diagnostics",
 			clientScope: serverScope,
+			// #3405: the caller asked whether THIS file is clean right now, and the
+			// content above was just read from disk — so it is the file's saved
+			// state. Without the save a save-triggered server answers zero
+			// diagnostics for every file in the query, which this path would report
+			// as clean.
+			saved: true,
 		});
 		timedOut = touched?.inconclusive === true;
 	} catch {
@@ -1139,6 +1208,9 @@ async function collectFileDiagnosticResult(
 	// its LSP promise settles. A slower old result must not receive a newer token
 	// merely because it completed later (#1198).
 	const writeIndex = nextWriteIndex?.();
+	// #3505: the cache entry's `scannedAt`, taken before the stat and the read,
+	// so a dependency written while this file is analysed is newer than it.
+	const scannedAt = Date.now();
 	let stat: ReturnType<typeof fs.statSync>;
 	try {
 		stat = fs.statSync(file);
@@ -1223,6 +1295,7 @@ async function collectFileDiagnosticResult(
 		diagnosticsUnsupportedServerIds,
 		content: collectedContent,
 		binding,
+		tooLargeReason,
 		skipReason,
 	} = await collectDiagnosticsForFile(
 		file,
@@ -1231,6 +1304,9 @@ async function collectFileDiagnosticResult(
 		waitMs,
 		serverScope,
 	);
+	if (tooLargeReason !== undefined) {
+		return { file, diagnostics: [], outcome: "too_large", tooLargeReason };
+	}
 	const health = lspService.getDiagnosticsHealth?.(file) as
 		| LspHealthLike
 		| undefined;
@@ -1308,6 +1384,9 @@ async function collectFileDiagnosticResult(
 		cwd,
 		collectedContent,
 		boundMismatch,
+		// #3505 r1 F1: the widget row is observed at the read, as the cache
+		// entry recorded below is.
+		scannedAt,
 	);
 	if (verdict.confirmed && !verdict.blocking) {
 		onConfirmedNoBlockers?.({
@@ -1351,6 +1430,7 @@ async function collectFileDiagnosticResult(
 				? hashDiagnosticContent(collectedContent)
 				: undefined,
 			stat.size,
+			scannedAt,
 		);
 	}
 	return {
@@ -1383,6 +1463,8 @@ async function runFileDiagnostics(
 	// Reserve the token before awaiting this file's LSP result. The direct-file
 	// path performs its own confirmation/reconciliation below (#1198).
 	const writeIndex = nextWriteIndex?.();
+	// #3505 r2: the widget row is observed at the read, not after the touch.
+	const observedAt = Date.now();
 	const {
 		diagnostics: rawDiags,
 		timedOut,
@@ -1391,6 +1473,7 @@ async function runFileDiagnostics(
 		diagnosticsUnsupportedServerIds,
 		content: collectedContent,
 		binding,
+		tooLargeReason,
 		skipReason,
 	} = await collectDiagnosticsForFile(
 		absPath,
@@ -1399,6 +1482,21 @@ async function runFileDiagnostics(
 		waitMs,
 		serverScope,
 	);
+	if (tooLargeReason !== undefined) {
+		return {
+			content: [{ type: "text" as const, text: tooLargeReason }],
+			details: {
+				filePath: absPath,
+				mode: "file",
+				severity,
+				serverScope,
+				outcome: "too_large",
+				tooLargeReason,
+				diagnostics: [],
+				totalDiagnostics: 0,
+			},
+		};
+	}
 	const lspHealth = lspService.getDiagnosticsHealth?.(absPath) as
 		| LspHealthLike
 		| undefined;
@@ -1483,6 +1581,7 @@ async function runFileDiagnostics(
 		cwd,
 		collectedContent,
 		boundMismatch,
+		observedAt,
 	);
 	// #1561: a confirmed current view with nothing at the blocking tier retires
 	// this file's stale inline blocker — the store #571 corrected the footer for
@@ -1633,12 +1732,18 @@ function tallyConfirmation(results: FileDiagnosticResult[]): {
 	unconfirmed: number;
 	timedOut: number;
 	navigationOnly: number;
+	tooLarge: number;
 } {
 	let clean = 0;
 	let unconfirmed = 0;
 	let timedOut = 0;
 	let navigationOnly = 0;
+	let tooLarge = 0;
 	for (const result of results) {
+		if (result.tooLargeReason) {
+			tooLarge += 1;
+			continue;
+		}
 		if (result.diagnosticsUnsupported) {
 			navigationOnly += 1;
 			continue;
@@ -1653,13 +1758,14 @@ function tallyConfirmation(results: FileDiagnosticResult[]): {
 			clean += 1;
 		}
 	}
-	return { clean, unconfirmed, timedOut, navigationOnly };
+	return { clean, unconfirmed, timedOut, navigationOnly, tooLarge };
 }
 
 function classifyBatchFileOutcome(
 	result: FileDiagnosticResult,
 ): BatchFileOutcome {
 	if (result.error) return "failed";
+	if (result.tooLargeReason) return "too_large";
 	if (result.diagnosticsUnsupported) return "unsupported";
 	// A timed-out/unconfirmed answer may contain partial findings, but it cannot
 	// honestly be called a complete findings result. Keep the raw findings for
@@ -1879,6 +1985,7 @@ async function collectBatchDiagnostics(
 				"unsupported",
 				"unavailable",
 				"failed",
+				"too_large",
 				"inconclusive",
 			] as const
 		).map((outcome) => [
@@ -1972,6 +2079,7 @@ async function runBatchFileDiagnostics(
 		outcomeCounts.unavailable +
 		outcomeCounts.unsupported +
 		outcomeCounts.failed +
+		outcomeCounts.too_large +
 		incompleteFiles;
 	if (notConfirmed > 0) {
 		lines.push(
@@ -1986,6 +2094,19 @@ async function runBatchFileDiagnostics(
 		);
 	}
 	if (fileErrors.length > 0) lines.push("", "File errors:", ...fileErrors);
+	const outcomeDetails: BatchOutcomeDetail[] = results.map((result) => ({
+		file: result.file,
+		outcome: result.outcome!,
+		reason:
+			result.tooLargeReason ??
+			result.inconclusiveReason ??
+			result.error ??
+			result.unavailable,
+	}));
+	const tooLargeLines = renderBatchOutcomeLines(outcomeDetails);
+	if (tooLargeLines.length > 0) {
+		lines.push("", "Files too large for LSP diagnostics:", ...tooLargeLines);
+	}
 	if (lspHealthWarnings.length > 0) {
 		lines.push("", "LSP health warnings:", ...lspHealthWarnings.slice(0, 10));
 	}
@@ -2003,7 +2124,7 @@ async function runBatchFileDiagnostics(
 		);
 	}
 	if (display.length === 0) {
-		if (unconfirmed === 0) {
+		if (unconfirmed === 0 && outcomeCounts.clean === results.length) {
 			lines.push("", "No diagnostics found.");
 		}
 	} else {
@@ -2047,7 +2168,11 @@ async function runBatchFileDiagnostics(
 			outcomes: results.map((result) => ({
 				file: result.file,
 				outcome: result.outcome,
-				reason: result.inconclusiveReason ?? result.error ?? result.unavailable,
+				reason:
+					result.tooLargeReason ??
+					result.inconclusiveReason ??
+					result.error ??
+					result.unavailable,
 				primaryDiagnosticsCount: result.diagnostics.filter(
 					(diagnostic) => diagnostic.serverId === result.primaryServerId,
 				).length,
@@ -2147,6 +2272,7 @@ async function runDirectoryDiagnostics(
 		clean,
 		unconfirmed,
 		timedOut,
+		outcomeCounts,
 	} = await collectBatchDiagnostics(
 		filesToProcess,
 		severity,
@@ -2162,6 +2288,18 @@ async function runDirectoryDiagnostics(
 		0,
 	);
 	const suppressedLine = dispositionSuppressedLine(dispositionSuppressed);
+	const outcomeDetails: BatchOutcomeDetail[] = results.map((result) => ({
+		file: result.file,
+		outcome: result.outcome!,
+		reason:
+			result.tooLargeReason ??
+			result.inconclusiveReason ??
+			result.error ??
+			result.unavailable,
+	}));
+	const tooLargeLines = renderBatchOutcomeLines(outcomeDetails, (file) =>
+		path.relative(absPath, file),
+	);
 
 	let text: string;
 	if (total === 0) {
@@ -2181,7 +2319,12 @@ async function runDirectoryDiagnostics(
 						"LSP unavailable for one or more files:",
 						...lspHealthWarnings.slice(0, 10),
 					]
-				: [cleanLine]),
+				: unconfirmed > 0 || outcomeCounts.clean === filesToProcess.length
+					? [cleanLine]
+					: []),
+			...(tooLargeLines.length > 0
+				? ["", "Files too large for LSP diagnostics:", ...tooLargeLines]
+				: []),
 			...(suppressedLine ? ["", suppressedLine] : []),
 		].join("\n");
 	} else {
@@ -2225,6 +2368,9 @@ async function runDirectoryDiagnostics(
 			);
 		}
 		if (suppressedLine) lines.push("", suppressedLine);
+		if (tooLargeLines.length > 0) {
+			lines.push("", "Files too large for LSP diagnostics:", ...tooLargeLines);
+		}
 		text = lines.join("\n");
 	}
 
@@ -2253,6 +2399,8 @@ async function runDirectoryDiagnostics(
 			truncated,
 			cleanFiles: clean,
 			unconfirmedFiles: unconfirmed,
+			outcomes: outcomeDetails,
+			outcomeCounts,
 			navigationOnlyFiles: navigationOnly > 0 ? navigationOnly : undefined,
 			timedOutFiles: timedOut > 0 ? timedOut : undefined,
 			fileErrors: fileErrors.length > 0 ? fileErrors : undefined,

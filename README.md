@@ -86,6 +86,8 @@ flowchart TD
 
     SESSION["Session lifecycle<br/>primary, sequential replacement, concurrent secondary"]
     SINKS["Observability sinks<br/>latency.log, degradation ledger, bounded telemetry,<br/>cache observability, cascade and tree-sitter logs"]
+    CONFIG["Config-core<br/>resolve, merge, deny"]
+    REVIEWGRAPH["Review-graph intelligence<br/>call graph, reverse deps, import resolution"]
 
     HOST --> WRAP
     HOST -->|tool_call, raw| RG
@@ -100,6 +102,10 @@ flowchart TD
     PLAN --> STRUCT
     PIPE --> POOL
     PIPE --> BUS
+    CONFIG --> PIPE
+    CONFIG --> PLAN
+    STRUCT --> REVIEWGRAPH
+    REVIEWGRAPH --> CASC
     POOL --> DIAGS
     DIAGS --> CASC
     RUN --> STORES
@@ -130,8 +136,8 @@ flowchart TD
 Architecture-level view, updated when a lane changes. Per-tool inventories live
 in [features](docs/features.md) and
 [language coverage](docs/language-coverage.md). Today the edit-time lane carries
-45+ runner modules over 35+ file kinds, and the LSP lane speaks to a dozen-plus
-language servers.
+45+ runner modules over 35+ file kinds, and the LSP lane speaks to 46
+language server definitions.
 
 The gating box is an abstraction, not a call order. Freshness covers several
 independent mechanisms: path freshness against scan time, past-EOF line checks,
@@ -194,6 +200,8 @@ expects to be operated.
 - [Custom rules](docs/custom-rules.md) — project ast-grep and tree-sitter rules
 - [MCP server](docs/mcp.md) — experimental MCP server for Claude Code and
   other MCP clients
+- [Architecture decision records](docs/adr/README.md) — settled design
+  decisions, linked from the engineering-defect catalog
 
 ## Contributing
 
@@ -349,6 +357,41 @@ Thanks goes to these wonderful people:
     <tr>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/amasen02"><img src="https://avatars.githubusercontent.com/u/97525823?v=4" width="100px;" alt=""/><br /><sub><b>Ama Senevirathne</b></sub></a><br /><a href="#code-amasen02" title="Code">💻</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/AcademyKUB8"><img src="https://avatars.githubusercontent.com/u/217174854?v=4" width="100px;" alt=""/><br /><sub><b>AcademyKUB8</b></sub></a><br /><a href="#code-AcademyKUB8" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/soulocker"><img src="https://avatars.githubusercontent.com/u/9692331?v=4" width="100px;" alt=""/><br /><sub><b>soulocker</b></sub></a><br /><a href="#bug-soulocker" title="Bug reports">🐛</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/sonic182"><img src="https://avatars.githubusercontent.com/u/4070466?v=4" width="100px;" alt=""/><br /><sub><b>Johanderson Mogollon</b></sub></a><br /><a href="#ideas-sonic182" title="Ideas & Planning">🤔</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/kurihada"><img src="https://avatars.githubusercontent.com/u/63988604?v=4" width="100px;" alt=""/><br /><sub><b>kurihada</b></sub></a><br /><a href="#bug-kurihada" title="Bug reports">🐛</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/Giraffe224"><img src="https://avatars.githubusercontent.com/u/193071526?v=4" width="100px;" alt=""/><br /><sub><b>Giraffe224</b></sub></a><br /><a href="#bug-Giraffe224" title="Bug reports">🐛</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="http://www.crshman.com"><img src="https://avatars.githubusercontent.com/u/39948?v=4" width="100px;" alt=""/><br /><sub><b>Robert Navarro</b></sub></a><br /><a href="#bug-rnavarro" title="Bug reports">🐛</a> <a href="#code-rnavarro" title="Code">💻</a></td>
+    </tr>
+    <tr>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/kapkema"><img src="https://avatars.githubusercontent.com/u/774573?v=4" width="100px;" alt=""/><br /><sub><b>Marc</b></sub></a><br /><a href="#bug-kapkema" title="Bug reports">🐛</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://javymarmol.com"><img src="https://avatars.githubusercontent.com/u/3501269?v=4" width="100px;" alt=""/><br /><sub><b>Heyner Javier Marmol Verbel</b></sub></a><br /><a href="#bug-javymarmol" title="Bug reports">🐛</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/Stijnus"><img src="https://avatars.githubusercontent.com/u/72551117?v=4" width="100px;" alt=""/><br /><sub><b>Stijnus</b></sub></a><br /><a href="#bug-Stijnus" title="Bug reports">🐛</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/Macrox"><img src="https://avatars.githubusercontent.com/u/571851?v=4" width="100px;" alt=""/><br /><sub><b>macroxing</b></sub></a><br /><a href="#bug-Macrox" title="Bug reports">🐛</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/jwtracy"><img src="https://avatars.githubusercontent.com/u/58991818?v=4" width="100px;" alt=""/><br /><sub><b>John Tracy</b></sub></a><br /><a href="#code-jwtracy" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/woyxiang"><img src="https://avatars.githubusercontent.com/u/119841810?v=4" width="100px;" alt=""/><br /><sub><b>woyxiang</b></sub></a><br /><a href="#ideas-woyxiang" title="Ideas & Planning">🤔</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/Juncanthia"><img src="https://avatars.githubusercontent.com/u/17041926?v=4" width="100px;" alt=""/><br /><sub><b>Juncanthia</b></sub></a><br /><a href="#bug-Juncanthia" title="Bug reports">🐛</a></td>
+    </tr>
+    <tr>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/kevinkirkup"><img src="https://avatars.githubusercontent.com/u/38406?v=4" width="100px;" alt=""/><br /><sub><b>Kevin S Kirkup</b></sub></a><br /><a href="#bug-kevinkirkup" title="Bug reports">🐛</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/georgeharker"><img src="https://avatars.githubusercontent.com/u/2169888?v=4" width="100px;" alt=""/><br /><sub><b>George Harker</b></sub></a><br /><a href="#code-georgeharker" title="Code">💻</a> <a href="#bug-georgeharker" title="Bug reports">🐛</a> <a href="#ideas-georgeharker" title="Ideas & Planning">🤔</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://zuey.me"><img src="https://avatars.githubusercontent.com/u/6857382?v=4" width="100px;" alt=""/><br /><sub><b>Duy /zuey/</b></sub></a><br /><a href="#ideas-mrgoonie" title="Ideas & Planning">🤔</a> <a href="#code-mrgoonie" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/luw2007"><img src="https://avatars.githubusercontent.com/u/1415541?v=4" width="100px;" alt=""/><br /><sub><b>luw2007</b></sub></a><br /><a href="#bug-luw2007" title="Bug reports">🐛</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/WrongWorry"><img src="https://avatars.githubusercontent.com/u/188037855?v=4" width="100px;" alt=""/><br /><sub><b>WrongWorry</b></sub></a><br /><a href="#bug-WrongWorry" title="Bug reports">🐛</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/nanaxx131-gif"><img src="https://avatars.githubusercontent.com/u/310295749?v=4" width="100px;" alt=""/><br /><sub><b>nanaxx131-gif</b></sub></a><br /><a href="#bug-nanaxx131-gif" title="Bug reports">🐛</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/CIECJS"><img src="https://avatars.githubusercontent.com/u/130489549?v=4" width="100px;" alt=""/><br /><sub><b>MateusCx</b></sub></a><br /><a href="#bug-CIECJS" title="Bug reports">🐛</a></td>
+    </tr>
+    <tr>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/HughZadora"><img src="https://avatars.githubusercontent.com/u/32498443?v=4" width="100px;" alt=""/><br /><sub><b>Hugh Zadora</b></sub></a><br /><a href="#bug-HughZadora" title="Bug reports">🐛</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/cxh0312"><img src="https://avatars.githubusercontent.com/u/10069427?v=4" width="100px;" alt=""/><br /><sub><b>撑伞的鱼</b></sub></a><br /><a href="#bug-cxh0312" title="Bug reports">🐛</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/LvGitHub-9"><img src="https://avatars.githubusercontent.com/u/69997168?v=4" width="100px;" alt=""/><br /><sub><b>Lv</b></sub></a><br /><a href="#bug-LvGitHub-9" title="Bug reports">🐛</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/apmcodes"><img src="https://avatars.githubusercontent.com/u/13360356?v=4" width="100px;" alt=""/><br /><sub><b>apmcodes</b></sub></a><br /><a href="#bug-apmcodes" title="Bug reports">🐛</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/jondong"><img src="https://avatars.githubusercontent.com/u/700736?v=4" width="100px;" alt=""/><br /><sub><b>Jonathan Dong</b></sub></a><br /><a href="#bug-jondong" title="Bug reports">🐛</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/alchemistklk"><img src="https://avatars.githubusercontent.com/u/56862773?v=4" width="100px;" alt=""/><br /><sub><b>Caprika</b></sub></a><br /><a href="#bug-alchemistklk" title="Bug reports">🐛</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/dmontague-crwv"><img src="https://avatars.githubusercontent.com/u/289768493?v=4" width="100px;" alt=""/><br /><sub><b>dmontague-crwv</b></sub></a><br /><a href="#bug-dmontague-crwv" title="Bug reports">🐛</a></td>
+    </tr>
+    <tr>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/glyh"><img src="https://avatars.githubusercontent.com/u/12870742?v=4" width="100px;" alt=""/><br /><sub><b>Yihang "Corvo" Liu</b></sub></a><br /><a href="#bug-glyh" title="Bug reports">🐛</a></td>
     </tr>
   </tbody>
 </table>

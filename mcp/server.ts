@@ -354,103 +354,119 @@ function startIpcServer(): void {
 		// line and ignores anything after it.
 		socket.on(
 			"data",
-			createWarmIpcLineReader((line) => {
-				void requestQueue.enqueue(async () => {
-					try {
-						if (isWarmBuildStale()) {
-							console.error(
-								"[pi-lens-mcp] warm request: build stale, replying with an error",
-							);
-							socket.end(`${JSON.stringify({ error: "warm build stale" })}\n`);
-							return;
-						}
-						const parsed = JSON.parse(line) as Partial<
-							WarmTurnEndRequest & WarmAnalyzeRequest
-						>;
-						if ((parsed as { route?: string }).route === "turn-end-ack") {
-							if (
-								parsed.version !== WARM_TURN_END_SCHEMA_VERSION ||
-								typeof (parsed as { deliveryId?: unknown }).deliveryId !==
-									"string"
-							) {
-								socket.end(
-									`${JSON.stringify({ error: `turn-end ack schema ${parsed.version} != ${WARM_TURN_END_SCHEMA_VERSION}` })}\n`,
-								);
-								return;
-							}
-							const turnCwd = parsed.cwd ?? DEFAULT_CWD;
-							if (!isWithinServerWorkspace(turnCwd)) {
-								socket.end(
-									`${JSON.stringify({ error: rejectForeignTurnCwd("turn-end-ack", turnCwd) })}\n`,
-								);
-								return;
-							}
-							const acknowledged = acknowledgeTurnEnd(
-								turnCwd,
-								(parsed as { deliveryId: string }).deliveryId,
-							);
-							socket.end(
-								`${JSON.stringify({
-									result: {
-										route: "turn-end-ack",
-										version: WARM_TURN_END_SCHEMA_VERSION,
-										acknowledged,
-									},
-								})}\n`,
-							);
-							return;
-						}
-						if (parsed.route === "turn-end") {
-							if (parsed.version !== WARM_TURN_END_SCHEMA_VERSION) {
-								socket.end(
-									`${JSON.stringify({ error: `turn-end schema ${parsed.version} != ${WARM_TURN_END_SCHEMA_VERSION}` })}\n`,
-								);
-								return;
-							}
-							const turnCwd = parsed.cwd ?? DEFAULT_CWD;
-							if (!isWithinServerWorkspace(turnCwd)) {
-								socket.end(
-									`${JSON.stringify({ error: rejectForeignTurnCwd("turn-end", turnCwd) })}\n`,
-								);
-								return;
-							}
-							// #1274: a client that already gave up (hook timeout, killed
-							// Claude Code) leaves a destroyed socket. Starting a heavy
-							// pass whose reply nobody can read is pure waste; the findings
-							// stay in the cache for the next Stop either way.
-							if (socket.destroyed) {
+			createWarmIpcLineReader(
+				(line) => {
+					void requestQueue.enqueue(async () => {
+						try {
+							if (isWarmBuildStale()) {
 								console.error(
-									`[pi-lens-mcp] warm turn-end: client gone before the pass started (${turnCwd})`,
+									"[pi-lens-mcp] warm request: build stale, replying with an error",
+								);
+								socket.end(
+									`${JSON.stringify({ error: "warm build stale" })}\n`,
 								);
 								return;
 							}
-							console.error(`[pi-lens-mcp] warm turn-end: ${turnCwd}`);
-							await ensureReady(turnCwd);
-							const delivery = await runTurnEndForIpc(turnCwd);
-							const result: WarmTurnEndResponse = {
-								route: "turn-end",
-								version: WARM_TURN_END_SCHEMA_VERSION,
-								turnEnd: delivery.outcome.turnEnd,
-								tests: delivery.outcome.tests,
-								deliveryId: delivery.deliveryId,
-							};
+							const parsed = JSON.parse(line) as Partial<
+								WarmTurnEndRequest & WarmAnalyzeRequest
+							>;
+							if ((parsed as { route?: string }).route === "turn-end-ack") {
+								if (
+									parsed.version !== WARM_TURN_END_SCHEMA_VERSION ||
+									typeof (parsed as { deliveryId?: unknown }).deliveryId !==
+										"string"
+								) {
+									socket.end(
+										`${JSON.stringify({ error: `turn-end ack schema ${parsed.version} != ${WARM_TURN_END_SCHEMA_VERSION}` })}\n`,
+									);
+									return;
+								}
+								const turnCwd = parsed.cwd ?? DEFAULT_CWD;
+								if (!isWithinServerWorkspace(turnCwd)) {
+									socket.end(
+										`${JSON.stringify({ error: rejectForeignTurnCwd("turn-end-ack", turnCwd) })}\n`,
+									);
+									return;
+								}
+								const acknowledged = acknowledgeTurnEnd(
+									turnCwd,
+									(parsed as { deliveryId: string }).deliveryId,
+								);
+								socket.end(
+									`${JSON.stringify({
+										result: {
+											route: "turn-end-ack",
+											version: WARM_TURN_END_SCHEMA_VERSION,
+											acknowledged,
+										},
+									})}\n`,
+								);
+								return;
+							}
+							if (parsed.route === "turn-end") {
+								if (parsed.version !== WARM_TURN_END_SCHEMA_VERSION) {
+									socket.end(
+										`${JSON.stringify({ error: `turn-end schema ${parsed.version} != ${WARM_TURN_END_SCHEMA_VERSION}` })}\n`,
+									);
+									return;
+								}
+								const turnCwd = parsed.cwd ?? DEFAULT_CWD;
+								if (!isWithinServerWorkspace(turnCwd)) {
+									socket.end(
+										`${JSON.stringify({ error: rejectForeignTurnCwd("turn-end", turnCwd) })}\n`,
+									);
+									return;
+								}
+								// #1274: a client that already gave up (hook timeout, killed
+								// Claude Code) leaves a destroyed socket. Starting a heavy
+								// pass whose reply nobody can read is pure waste; the findings
+								// stay in the cache for the next Stop either way.
+								if (socket.destroyed) {
+									console.error(
+										`[pi-lens-mcp] warm turn-end: client gone before the pass started (${turnCwd})`,
+									);
+									return;
+								}
+								console.error(`[pi-lens-mcp] warm turn-end: ${turnCwd}`);
+								await ensureReady(turnCwd);
+								const delivery = await runTurnEndForIpc(turnCwd);
+								const result: WarmTurnEndResponse = {
+									route: "turn-end",
+									version: WARM_TURN_END_SCHEMA_VERSION,
+									turnEnd: delivery.outcome.turnEnd,
+									tests: delivery.outcome.tests,
+									deliveryId: delivery.deliveryId,
+								};
+								socket.end(`${JSON.stringify({ result })}\n`);
+								return;
+							}
+							const req = parsed as WarmAnalyzeRequest;
+							console.error(`[pi-lens-mcp] warm analyze: ${req.file}`);
+							const result = await analyzeFile(req.file, req.cwd, {
+								registerTurnState: true,
+								updateGraph: true,
+							});
 							socket.end(`${JSON.stringify({ result })}\n`);
-							return;
+						} catch (err) {
+							socket.end(`${JSON.stringify({ error: String(err) })}\n`);
 						}
-						const req = parsed as WarmAnalyzeRequest;
-						console.error(`[pi-lens-mcp] warm analyze: ${req.file}`);
-						const result = await analyzeFile(req.file, req.cwd, {
-							registerTurnState: true,
-							updateGraph: true,
-						});
-						socket.end(`${JSON.stringify({ result })}\n`);
-					} catch (err) {
-						socket.end(`${JSON.stringify({ error: String(err) })}\n`);
-					}
-				});
-			}),
+					});
+				},
+				{
+					label: "mcp-warm-server",
+					// #3383: a peer that never terminates its request line gets the same
+					// error reply every other unusable request gets, instead of this
+					// process holding its bytes until the client's timeout.
+					onOverflow: () =>
+						socket.end(
+							`${JSON.stringify({ error: "warm request line exceeded the framing limit" })}\n`,
+						),
+				},
+			),
 		);
-		socket.on("error", () => socket.destroy());
+		// The stream is already destroyed when this handler runs; the listener
+		// remains the surviving teardown witness, while destroy() was a no-op.
+		socket.on("error", () => {});
 	});
 
 	ipc.on("error", (err) => {
@@ -1995,15 +2011,20 @@ async function handleRequest(request: JsonRpcRequest): Promise<void> {
 
 // --- stdio read loop (newline-delimited JSON) --------------------------------
 
-let buffer = "";
 process.stdin.setEncoding("utf8");
-process.stdin.on("data", (chunk: string) => {
-	buffer += chunk;
-	let newlineIndex = buffer.indexOf("\n");
-	while (newlineIndex !== -1) {
-		const line = buffer.slice(0, newlineIndex).trim();
-		buffer = buffer.slice(newlineIndex + 1);
-		if (line.length > 0) {
+// #3383: framed by the shared reader, so the partial line this loop holds
+// between chunks has a ceiling. It used to be `buffer += chunk` with none: a
+// host that never sent a newline grew one JS string until V8 refused the next
+// concatenation with `RangeError: Invalid string length` — raised inside this
+// `data` handler, where nothing can catch it, which is the ending #3375 fixed
+// for child output. `continuous` because this is a stream of requests, not one
+// request per connection like every socket reader.
+process.stdin.on(
+	"data",
+	createWarmIpcLineReader(
+		(raw) => {
+			const line = raw.trim();
+			if (line.length === 0) return;
 			let request: JsonRpcRequest | undefined;
 			try {
 				request = JSON.parse(line) as JsonRpcRequest;
@@ -2011,10 +2032,19 @@ process.stdin.on("data", (chunk: string) => {
 				sendError(null, -32700, "Parse error");
 			}
 			if (request) void handleRequest(request);
-		}
-		newlineIndex = buffer.indexOf("\n");
-	}
-});
+		},
+		{
+			label: "mcp-stdio",
+			continuous: true,
+			onOverflow: () =>
+				sendError(
+					null,
+					-32700,
+					"Parse error: request line exceeded the framing limit",
+				),
+		},
+	),
+);
 process.stdin.on("end", () => {
 	endSituationalToolTelemetry();
 	void flushExtensionLog().finally(() => process.exit(0));

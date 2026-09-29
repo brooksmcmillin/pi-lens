@@ -10,6 +10,7 @@ import {
 import {
 	PROJECT_SNAPSHOT_VERSION,
 	saveProjectSnapshot,
+	waitForProjectSnapshotPersistsForTests,
 } from "../../clients/project-snapshot.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import {
@@ -28,9 +29,17 @@ import {
 import { handleSessionStart } from "../../clients/runtime-session.js";
 import { _resetSlowFsForTests } from "../../clients/slow-fs.js";
 import { _resetSubagentModeForTests } from "../../clients/subagent-mode.js";
-import { createTempFile, setupTestEnvironment } from "./test-utils.js";
+import {
+	createTempFile,
+	setupTestEnvironment,
+	useTrackedTempDirs,
+} from "./test-utils.js";
 import { waitFor as waitForCondition } from "./interleaving-kit.js";
 import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+
+// `handleSessionStart` queues project-snapshot body writes that can recreate a
+// fixture root after its `env.cleanup()`; the drain lets them land first.
+useTrackedTempDirs("pi-lens-session-snapshot-");
 
 /** A pid guaranteed dead on this machine, for orphan-staging-file tests
  *  (mirrors tests/clients/atomic-write-stage-gc.test.ts's helper). */
@@ -825,6 +834,11 @@ describe(
 				} else {
 					process.env.PILENS_DATA_DIR = previousDataDir;
 				}
+				// #2912: saveProjectSnapshot's body persist runs off-thread and its
+				// write path recreates the root with a recursive mkdir. Unawaited,
+				// it landed after cleanup every run (6/6), leaking this root --
+				// the #3186 shape.
+				await waitForProjectSnapshotPersistsForTests();
 				env.cleanup();
 			}
 		});

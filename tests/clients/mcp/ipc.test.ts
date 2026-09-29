@@ -672,7 +672,11 @@ describe("requestWarmTurnEnd", () => {
 describe("createWarmIpcLineReader", () => {
 	it("dispatches exactly one line for one request followed by stray bytes (#1219)", () => {
 		const lines: string[] = [];
-		const handler = createWarmIpcLineReader((line) => lines.push(line));
+		const handler = createWarmIpcLineReader((line) => lines.push(line), {
+			// #3383 made the reader's label required: it is the ledger subject for
+			// an over-long line, so no reader can record under a generic name.
+			label: "mcp-warm-server",
+		});
 		handler(`${JSON.stringify({ file: "/x/a.ts" })}\n`);
 		// Pre-fix, the socket handler kept the consumed line in its buffer and
 		// re-dispatched it on any further data event — stray bytes after the
@@ -685,7 +689,11 @@ describe("createWarmIpcLineReader", () => {
 
 	it("ignores a second newline-terminated request (one-shot per connection)", () => {
 		const lines: string[] = [];
-		const handler = createWarmIpcLineReader((line) => lines.push(line));
+		const handler = createWarmIpcLineReader((line) => lines.push(line), {
+			// #3383 made the reader's label required: it is the ledger subject for
+			// an over-long line, so no reader can record under a generic name.
+			label: "mcp-warm-server",
+		});
 		handler(`${JSON.stringify({ file: "/x/a.ts" })}\n`);
 		handler(`${JSON.stringify({ file: "/x/b.ts" })}\n`);
 		expect(lines).toHaveLength(1);
@@ -694,7 +702,11 @@ describe("createWarmIpcLineReader", () => {
 
 	it("dispatches only the first request when two arrive in one chunk (#1219)", () => {
 		const lines: string[] = [];
-		const handler = createWarmIpcLineReader((line) => lines.push(line));
+		const handler = createWarmIpcLineReader((line) => lines.push(line), {
+			// #3383 made the reader's label required: it is the ledger subject for
+			// an over-long line, so no reader can record under a generic name.
+			label: "mcp-warm-server",
+		});
 		handler(
 			`${JSON.stringify({ file: "/x/a.ts" })}\n${JSON.stringify({ file: "/x/b.ts" })}\n`,
 		);
@@ -704,7 +716,11 @@ describe("createWarmIpcLineReader", () => {
 
 	it("assembles a request split across chunks before dispatching", () => {
 		const lines: string[] = [];
-		const handler = createWarmIpcLineReader((line) => lines.push(line));
+		const handler = createWarmIpcLineReader((line) => lines.push(line), {
+			// #3383 made the reader's label required: it is the ledger subject for
+			// an over-long line, so no reader can record under a generic name.
+			label: "mcp-warm-server",
+		});
 		handler('{"file":');
 		handler('"/x/a.ts"}\n');
 		expect(lines).toHaveLength(1);
@@ -713,7 +729,11 @@ describe("createWarmIpcLineReader", () => {
 
 	it("does not dispatch when no newline ever arrives", () => {
 		const lines: string[] = [];
-		const handler = createWarmIpcLineReader((line) => lines.push(line));
+		const handler = createWarmIpcLineReader((line) => lines.push(line), {
+			// #3383 made the reader's label required: it is the ledger subject for
+			// an over-long line, so no reader can record under a generic name.
+			label: "mcp-warm-server",
+		});
 		handler("partial");
 		expect(lines).toHaveLength(0);
 	});

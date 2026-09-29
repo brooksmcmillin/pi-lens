@@ -118,7 +118,7 @@ pi-lens enforces a **read-before-edit** policy on all file writes and edits. Bef
 - **Out-of-range block** — blocks if the edit target lines fall outside the ranges previously read, ensuring the agent cannot modify code it hasn't seen
 - **Snapshot validation** — covered edit ranges are hash-checked against the lines the agent actually saw at read time; stale-range edits are rejected even when range coverage exists. Hash capture covers reads up to 3 000 lines
 
-Coverage is tracked across multiple reads: two reads of lines 1–100 and 101–200 together satisfy a full-file write. Symbol-expanded reads (small reads silently widened to the enclosing symbol via tree-sitter) count toward coverage at the symbol level. Markdown files generate a warning instead of blocking (edits outside the section-expanded read range are warned, not silently passed). Plain-text (`.txt`) and log (`.log`) files remain fully exempt.
+Coverage is tracked across multiple reads: two reads of lines 1–100 and 101–200 together satisfy a full-file write. Symbol-expanded reads (small reads widened to the enclosing symbol via tree-sitter, labelled with a leading note) count toward coverage at the symbol level. Markdown files generate a warning instead of blocking (edits outside the section-expanded read range are warned, not silently passed). Plain-text (`.txt`) and log (`.log`) files remain fully exempt.
 
 Override for a single edit: `/lens-allow-edit <path>`
 
@@ -294,7 +294,7 @@ Late-joiners are a non-problem in-process — extensions activate at `session_st
 
 ### Opportunistic Read Expansion
 
-When the agent reads a small slice of a file (≤ 60 lines), pi-lens transparently expands the read to the full enclosing symbol (function, method, or class) using the tree-sitter AST. The agent receives the full symbol as context, and the read guard records symbol-level coverage so edits anywhere within that symbol pass without requiring the agent to have read every line individually. Expansion runs within a 200 ms budget and falls back silently on unsupported file types or parse failures.
+When the agent reads a small slice of a file (≤ 100 lines), pi-lens expands the read to the full enclosing symbol (function, method, or class) using the tree-sitter AST, or to the enclosing heading section of a Markdown file. The result starts with a `[pi-lens: read widened ...]` note naming the requested and the returned lines; a `limit` above 100 reads the exact range. Expansion is off with the read guard (`--no-read-guard` or `readGuard.enabled=false`). The agent receives the full symbol as context, and the read guard records symbol-level coverage so edits anywhere within that symbol pass without requiring the agent to have read every line individually. Expansion runs within a 200 ms budget and falls back silently on unsupported file types or parse failures.
 
 Supported: TypeScript, TSX, JavaScript, JSX, Python, Go, Rust, Ruby, Java, Kotlin, Dart, Elixir, C, C++, C#, PHP, Swift, Lua, OCaml, Zig, Bash.
 
@@ -316,7 +316,7 @@ Covers JavaScript/TypeScript, Python, Go, Rust, Ruby, Shell, and CMake. A TypeSc
 
 Structural rules organized by language in `rules/tree-sitter-queries/<language>/`. Rules marked **🔴** block the agent inline at write time (only for lines in the current edit); others are advisory.
 
-**Suppressing a finding:** add `// pi-lens-ignore: rule-id` on the flagged line or the line above (JS/TS), or `# pi-lens-ignore: rule-id` for Python/Ruby/Shell. This suppresses that specific rule at that location only.
+**Suppressing a finding:** add `// pi-lens-ignore: rule-id` on the flagged line or the line above (JS/TS), or `# pi-lens-ignore: rule-id` for Python/Ruby/Shell. Rule ids are comma-separated. A supported separator (` -- `, ` — `, or `: `) starts one trailing reason suffix for the whole payload; all remaining text, including commas, stays in the reason and is not parsed as another rule id. This suppresses each listed rule at that location only.
 
 **Bring your own rules:** drop YAML query files into `rules/tree-sitter-queries/<language>/` in your project — pi-lens merges them with the built-ins on session start. The schema, predicates (`eq`, `match`, `any-of`), and `inline_tier` (`blocking` | `warning` | `review`) are documented in [`custom-rules.md`](custom-rules.md). A `rules/tree-sitter-queries/rule-schema.json` JSON Schema is bundled for editor autocomplete via `.vscode/settings.json`.
 
@@ -401,7 +401,7 @@ pi-lens ships an MCP (Model Context Protocol) server so Claude Code — or any M
 | **Per-turn** | `pilens_turn_end` | Drives the **real** `handleTurnEnd` (knip incremental, dep-circular, cascade, tests, actionable+code-quality warnings) — not a re-implementation. Caller-supplied edited files are auto-registered into turn-state via `addModifiedRange`. |
 | **Per-session** | `pilens_session_start` | Drives the **real** `handleSessionStart` — full jscpd/knip/madge/govulncheck/gitleaks/trivy scans + complexity baselines + LSP warm. The error-debt baseline is not currently populated by the production session-start path. |
 | **Project / observability** | `pilens_project_scan`, `pilens_project_report`, `pilens_diagnostics`, `pilens_health`, `pilens_latency`, `pilens_symbol_search`, `pilens_effective_config` | Cheap project-wide scans, cached diagnostic state, latency telemetry, ranked identifier search (BM25 over the persisted word index — see [docs/word-index.md](word-index.md)). Cross-file blast radius now lives in `pilens_module_report`'s `blastRadius` option. `pilens_health` (and its pi-side `/lens-health` counterpart) also reports a bounded, process-local **degradation ledger** — trust refusals, mode suppressions, LSP breaker trips, formatter skips/failures, TypeScript/word-index/review-graph/project-snapshot idle evictions, WASM aborts, and diagnostics-timeout tallies — so silently degraded behavior stays visible instead of vanishing into a log. `pilens_effective_config` answers **“why is X running / why is X not running”** from one query — the resolved configuration with the provenance of every setting, and for a file you name, its language plus every LSP server with the reason it was selected or denied and the runners that would dispatch. It reports sources, never values. |
-| **Lifecycle / loop** | `pilens_rebuild` | Runs `npm run build:dist` so `pilens_analyze mode=fresh` reflects the latest commit. Makes the review loop self-contained: commit → `pilens_rebuild` → `pilens_analyze mode=fresh` → `pilens_latency`. |
+| **Lifecycle / loop** | `pilens_rebuild`, `pilens_session_end` | `pilens_rebuild` runs `npm run build:dist` so `pilens_analyze mode=fresh` reflects the latest commit. Makes the review loop self-contained: commit → `pilens_rebuild` → `pilens_analyze mode=fresh` → `pilens_latency`. `pilens_session_end` ends the MCP connection's telemetry session and writes its bounded situational-tool telemetry line; terminal for the connection. |
 
 **Honest limits** (live-tested, documented in `mcp.md`):
 

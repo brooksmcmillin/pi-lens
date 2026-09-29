@@ -27,9 +27,9 @@ export function runGitConfigGuardSetup(cwd: string): () => void {
 	// coincidental identity.
 	if (baseline.fixtureNames.size > 0 || baseline.fixtureEmails.size > 0) {
 		const values = [...baseline.fixtureNames, ...baseline.fixtureEmails];
-		console.warn(
+		process.stderr.write(
 			`[git-config-guard] fixture-shaped git identity already present at suite start: ${values.join(", ")}. ` +
-				"If this is not your real identity, a prior run may have left contamination.",
+				"If this is not your real identity, a prior run may have left contamination.\n",
 		);
 	}
 	return () => teardown(baseline);

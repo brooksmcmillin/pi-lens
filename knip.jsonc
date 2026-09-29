@@ -46,6 +46,11 @@
 		// The Windows CI job invokes this population source directly, and the
 		// governance test imports it as the same executable seam.
 		"scripts/lib/win32-gate-population.mjs",
+		// #3531: Stryker's `buildCommand` invokes this by file path
+		// (`node scripts/lib/mutation-touch-build.mjs`) from the mutation
+		// lane's generated per-run config -- a string in a JSON-serialized
+		// object, never a static import knip's graph can trace.
+		"scripts/lib/mutation-touch-build.mjs",
 		// scripts/lib/merge-train-dispatch-validation.mjs — the one
 		// scripts/lib/*.mjs a workflow `run:` step invokes directly — is
 		// NOT listed here despite that: it's already reached through
@@ -153,11 +158,22 @@
 		// see that step's own comment. Declaring it a real devDependency
 		// would undo that deliberate choice.
 		"markdownlint-cli2",
+		// scripts/check-tla-models.mjs runs TLC with the JDK on the CI runner
+		// image (#3447); it is a system tool, not an npm package.
+		"java",
 		// scripts/playground-chrome.mjs shells out to OS-level port-checking
 		// utilities (Windows `netstat`, POSIX `ss`) — system binaries, never
 		// npm-installable, so there is no dependency that could ever provide
 		// them.
+		// tests/scripts/with-memory-watch.test.ts (#3141) builds real kernel
+		// FIFOs with the POSIX `mkfifo` utility -- a system binary, never
+		// npm-installable.
+		"mkfifo",
 		"netstat",
-		"ss"
+		"ss",
+		// tests/clients/instance-reaper-pid-reuse.test.ts (#3538 R4-F1) runs
+		// the reaper confined under util-linux `unshare --pid --time` -- a
+		// system binary, never npm-installable; the case skips when absent.
+		"unshare"
 	]
 }

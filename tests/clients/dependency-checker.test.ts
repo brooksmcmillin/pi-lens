@@ -11,10 +11,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import {
-	buildMadgeArgs,
-	parseMadgeSkips,
-} from "../../clients/dependency-checker.js";
+import { buildMadgeArgs } from "../../clients/dependency-checker.js";
 import { removeTempDirSync } from "./test-utils.js";
 
 describe("buildMadgeArgs", () => {
@@ -50,39 +47,11 @@ describe("buildMadgeArgs", () => {
 		expect(args).not.toContain("--ts-config");
 	});
 
-	it("requests --warning so skipped files aren't silent", () => {
-		expect(buildMadgeArgs(tmp, tmp)).toContain("--warning");
-	});
-});
-
-describe("parseMadgeSkips", () => {
-	const STDERR = [
-		"- Finding files",
-		"Processed 1125 files (8.2s) (8 warnings)",
-		"",
-		"✔ No circular dependency found!",
-		"",
-		"✖ Skipped 8 files",
-		"",
-		"vscode-jsonrpc/node",
-		"web-tree-sitter",
-		"vitest/config",
-		"./test-utils.js",
-		"../shared/helpers.ts",
-	].join("\n");
-
-	it("counts total skips and isolates LOCAL ones (external are expected)", () => {
-		const { total, local } = parseMadgeSkips(STDERR);
-		expect(total).toBe(8);
-		// only relative/absolute specifiers are flagged; bare packages are not
-		expect(local).toEqual(["./test-utils.js", "../shared/helpers.ts"]);
-	});
-
-	it("returns zero when madge reports no skips", () => {
-		expect(parseMadgeSkips("✔ No circular dependency found!\n")).toEqual({
-			total: 0,
-			local: [],
-		});
-		expect(parseMadgeSkips("")).toEqual({ total: 0, local: [] });
+	it("does not request --warning (inert under --json; skip visibility is disclosed by the ledger)", () => {
+		// #3436: bin/cli.js:195 gates --warning on `!program.json`, so with the
+		// --json this builder always passes it produced nothing on stderr; the
+		// lost visibility is recorded once per root by `parseMadgeCycles` (the
+		// reader both lanes share), not parsed here.
+		expect(buildMadgeArgs(tmp, tmp)).not.toContain("--warning");
 	});
 });

@@ -4,7 +4,7 @@
  * Three deflake PRs in two days (#2531 alone fixed three shared-slot races)
  * and nothing counted the contention surface those PRs kept fixing, so the
  * set only grew. This ratchet counts it: `tests/support/flake-shape-scan.ts`
- * runs four detectors over every `tests/**\/*.test.ts` file —
+ * runs five detectors over every `tests/**\/*.test.ts` file —
  *
  * 1. `real-process-spawn` — a real child process (`child_process` import,
  *    `execFileSync`/`spawnSync`/`execSync`, a support spawn-helper call, or a
@@ -14,6 +14,10 @@
  * 3. `raw-timer-wait` — a raw `setTimeout`/`setInterval` wait outside a
  *    `vi.useFakeTimers()` scope.
  * 4. `ungoverned-wait-for` — a `vi.waitFor` call outside a fake-timer scope.
+ * 5. `never-settling-wait` — a `new Promise` with an empty executor outside a
+ *    fake-timer scope (#2885): only a real timer, often a production helper's
+ *    budget the other detectors cannot read, ends an await on it. Minted with
+ *    37 files / 73 hits.
  *
  * `FLAKE_SHAPE_BASELINE` (`tests/support/flake-shape-baseline.json`) is
  * today's population, content-keyed as `file → count` per detector — the
@@ -54,7 +58,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 
 import vitestConfig, { realHarnessInclude } from "../../vitest.config.ts";
 import {
@@ -65,6 +69,7 @@ import {
 	DETECTORS,
 	repoRoot,
 	scanElapsedTimeAssertion,
+	scanNeverSettlingWait,
 	scanRawTimerWait,
 	scanRealProcessSpawn,
 	scanUngovernedWaitFor,
@@ -107,6 +112,11 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "elapsed-time-assertion",
 		reason:
 			"the defect is wall-clock only (2^N regex backtracking); a fake clock measures nothing",
+	},
+	"elapsed-time-assertion:clients/sgconfig-scratch-bound.test.ts": {
+		detector: "elapsed-time-assertion",
+		reason:
+			"#3403 measures real scratch-tree filesystem latency; fake timers cannot observe cold CI disk work",
 	},
 	// 2026-09-06 (#2603, was #2591 review round 2, F1): the defect is 2^N regex
 	// backtracking through detectPythonEnvironment — the ANSWER was always
@@ -235,6 +245,14 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 	// libuv finding no referenced handle mid `lsp_diagnostics` and Node exiting
 	// 0. A process cannot watch its own loop decide to drain, so the exit code
 	// and stdout of a real headless child are the only faithful observation.
+	// #3538/#3539: the reaper's kill decision reads a pid's command line and
+	// kernel start time, and its POSIX backstop reads a child's inherited
+	// environment. Only a real process carries all three.
+	"real-process-spawn:clients/instance-reaper-pid-reuse.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the reaper's evidence is a real pid's command line, kernel start time and inherited environment; a double would encode the very identity guess the fix removes",
+	},
 	"real-process-spawn:clients/lsp/headless-tool-call-keepalive.test.ts": {
 		detector: "real-process-spawn",
 		reason:
@@ -255,10 +273,15 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"two real Node children must contend on the production rename; an in-process mock cannot expose the cross-process ENOENT",
 	},
+	"real-process-spawn:clients/project-snapshot-cross-process.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the sibling snapshot writer must be a second real process: the stage sweep keys on its pid, and a second module instance here shares ours",
+	},
 	"real-process-spawn:clients/safe-spawn-ambient-signal.test.ts": {
 		detector: "real-process-spawn",
 		reason:
-			"real children receive ambient abort signals through the OS boundary, not an in-process double",
+			"real children receive ambient abort signals through the OS boundary, not an in-process double; #3375 adds two more - the default output cap needs a real pipe delivering tens of megabytes, and killTree's POSIX group arm is selected by /proc verifying that a REAL pid is this process's child, which no fabricated pid can satisfy",
 	},
 	"real-process-spawn:clients/safe-spawn-failure-taxonomy.test.ts": {
 		detector: "real-process-spawn",
@@ -315,7 +338,7 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 	"real-process-spawn:packaging-pack-manifest.test.ts": {
 		detector: "real-process-spawn",
 		reason:
-			"observes the real npm pack lifecycle (prepack/postpack); no in-process double is faithful",
+			"observes the real npm pack lifecycle (prepack/postpack), and unpacks that real tarball to check what ships (#3219); no in-process double is faithful",
 	},
 	"real-process-spawn:real-harness/child-exit.test.ts": {
 		detector: "real-process-spawn",
@@ -363,7 +386,7 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 	"real-process-spawn:scripts/check-pr-body.test.ts": {
 		detector: "real-process-spawn",
 		reason:
-			"the exact local CLI and shallow checkout are the subjects; an in-process double cannot prove either command boundary",
+			"the exact local CLI, shallow checkout, `git check-ignore` (#2904), and large-diff buffer overflow (refs #17) are the subjects; real Git add/commit calls author the overflow fixture because a double cannot exercise child-process output bounds",
 	},
 	"real-process-spawn:scripts/git-fixture-env.test.ts": {
 		detector: "real-process-spawn",
@@ -402,6 +425,15 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"the real pinned npm child is required to reproduce lockfile optional-binding rewrites; a process double cannot validate npm behavior",
 	},
+	// 2026-09-26 (#3531): the CLI smoke test spawns a real node child to prove
+	// scripts/mutation-report.mjs's own argv parsing (--report/--out) and
+	// file I/O; an in-process call would just re-exercise the exported render
+	// function the other describe block already covers.
+	"real-process-spawn:scripts/mutation-report-render.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the CLI entry script's own argv parsing and file I/O is the subject; an in-process call re-tests only the exported render function",
+	},
 	// 2026-09-07 (#2613 review S2/T3): --dry-run env-reading/report-building
 	// wiring is the subject; the real `gh` calls stay untested, same
 	// documented exception as the sibling scripts/notify-clean-signal-drift.mjs.
@@ -425,6 +457,14 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "real-process-spawn",
 		reason:
 			"the CLI's real exit code and distinct infra label on exhaustion are unobservable from an in-process stub",
+	},
+	// #3451: the hook's format step is a shell pipeline (git diff | xargs
+	// oxfmt); the bug was xargs turning oxfmt's exit 2 into 123 at the process
+	// boundary, which only the real hook run shows.
+	"real-process-spawn:scripts/pre-commit-hook.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the real hook pipes git through xargs into the pinned oxfmt; the exit-123 refusal is a process-boundary fact",
 	},
 	"real-process-spawn:scripts/prune-agent-worktrees.test.ts": {
 		detector: "real-process-spawn",
@@ -457,6 +497,17 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "real-process-spawn",
 		reason:
 			"the CLI's exit codes and rendered stdout/stderr are the process-boundary contract; an in-process fetch call cannot certify the real entry point",
+	},
+	// 2026-09-27 (#3592 round 2 F1): the driver's temporal-dead-zone crash
+	// (`baseMeta` reading a `let costEstimate` still in the TDZ from four
+	// early-exit call sites) only exists in the real module's own top-level
+	// execution order; a source-text assertion on the driver already passed
+	// under the crash, so only spawning the actual script against a real,
+	// throwaway git fixture reproduces it.
+	"real-process-spawn:scripts/stryker-diff.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the defect is a temporal-dead-zone crash in the driver's own top-level execution order; no source-text or in-process substitute reproduces it",
 	},
 	// 2026-09-06 (#2586 review F1): proves the actual delimiter
 	// supply-host-provided-deps.mjs prints in its own stdout bytes; an
@@ -498,6 +549,14 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"a real cross-process directory removal races node's own recursive-watch readdirSync; no in-process stand-in can occupy the other side of that window",
 	},
+	// 2026-09-26 (#3511 review round 3): the quick-mode warmup witness must
+	// run the real warmup timer and background word-index save, which no
+	// test hook awaits.
+	"ungoverned-wait-for:clients/word-index-lifecycle.test.ts": {
+		detector: "ungoverned-wait-for",
+		reason:
+			"session_start's background tasks and the quick-mode warmup timer expose no awaitable, so a real-time vi.waitFor is the only join on their snapshot save",
+	},
 };
 
 /** The `wallClockBudgetInclude` project's `include` list, read from the live config — not a hand-copied mirror of it (single-source-of-truth). */
@@ -527,15 +586,44 @@ function wallClockBudgetInclude(): string[] {
 	return include.map(String);
 }
 
+// #3546: `supportHelperHasLaneProof` re-walks the whole `tests/**/*.test.ts`
+// import graph, from scratch, once per admitted/pinned `support/` entry the
+// caller asks about — and `localImportTargets` (hook-await-scan.mjs:291) has
+// no cache of its own, so every candidate file it touches is re-read and
+// re-parsed on every call. Same shape as #3514/PR #3542: a per-file walk's
+// shared cost, billed to a single test's own budget instead of a budget
+// sized for the walk. `cachedTestFiles`/`importTargetsCache` memoize the two
+// per-file costs (the file list, and each file's import targets) across
+// every call this test file makes, keyed by absolute path, so the second
+// admitted entry (and any repeated BFS visit inside one entry's own walk)
+// pays nothing beyond a Map lookup.
+let cachedTestFiles: string[] | undefined;
+function cachedAllTestFiles(): string[] {
+	if (cachedTestFiles === undefined) {
+		cachedTestFiles = allTestSourceFiles().filter((file) =>
+			file.endsWith(".test.ts"),
+		);
+	}
+	return cachedTestFiles;
+}
+
+const importTargetsCache = new Map<string, string[]>();
+function cachedLocalImportTargets(absolute: string): string[] {
+	let targets = importTargetsCache.get(absolute);
+	if (targets === undefined) {
+		targets = localImportTargets(absolute);
+		importTargetsCache.set(absolute, targets);
+	}
+	return targets;
+}
+
 /** Support helpers inherit the serialized lane from an importing test. */
 function supportHelperHasLaneProof(
 	relativePath: string,
 	included: ReadonlySet<string>,
 ): boolean {
 	const target = path.join(repoRoot, "tests", relativePath);
-	const files = allTestSourceFiles().filter((file) =>
-		file.endsWith(".test.ts"),
-	);
+	const files = cachedAllTestFiles();
 	const visited = new Set<string>();
 	const walk = (absolute: string): boolean => {
 		if (visited.has(absolute)) return false;
@@ -546,12 +634,13 @@ function supportHelperHasLaneProof(
 		if (absolute.endsWith(".test.ts") && included.has(relative)) return true;
 		return files.some(
 			(candidate) =>
-				localImportTargets(candidate).includes(absolute) && walk(candidate),
+				cachedLocalImportTargets(candidate).includes(absolute) &&
+				walk(candidate),
 		);
 	};
 	return files.some(
 		(candidate) =>
-			localImportTargets(candidate).includes(target) && walk(candidate),
+			cachedLocalImportTargets(candidate).includes(target) && walk(candidate),
 	);
 }
 
@@ -625,7 +714,25 @@ function describeProblem(p: RatchetProblem): string {
 	return `${p.detector}: ${p.file} rose from ${p.before} to ${p.after} hit(s)${admittedNote}`;
 }
 
+// #3514: `countsByDetector` already shares one walk + one parse per file
+// across all five detectors (`countsCache`, flake-shape-scan.ts) — the walk
+// itself is not redone. But that shared cost is only PAID on the first call,
+// and `it.each(DETECTOR_NAMES)` below calls it in DETECTOR_NAMES order, so
+// whichever detector is first (`real-process-spawn`) absorbed the FULL
+// five-detector cost inside its own 30s per-test budget, not just its own
+// share. Measured on this box (4 cores, load average ~27, run 2026-09-26):
+// real-process-spawn's own detector work is ~22s of a ~117s total — raw-
+// timer-wait's AST walk (`timerBindings` + its own call-site visit) is the
+// biggest single share at ~84s. Paying the whole thing once here, under its
+// own budget decoupled from any one detector's timeout, means no single
+// "detector %s" case is billed for work that belongs to all five.
+const WALK_TIMEOUT_MS = 180_000;
+
 describe("flake-shape ratchet (#2547)", () => {
+	beforeAll(() => {
+		for (const detector of DETECTOR_NAMES) countsByDetector(detector);
+	}, WALK_TIMEOUT_MS);
+
 	it("keeps every admission map sorted", () => {
 		// #2671 recurrence: an unsorted admission is a merge-conflict magnet.
 		expect(() => assertSortedRegistry("fixture", ["b", "a"])).toThrow(
@@ -792,6 +899,7 @@ describe("flake-shape ratchet — the compare function", () => {
 			"elapsed-time-assertion": {},
 			"raw-timer-wait": { [file]: 5 },
 			"ungoverned-wait-for": {},
+			"never-settling-wait": {},
 		};
 
 		// Drops to 2 (an improvement — but the ceiling is now stale at 5).
@@ -863,7 +971,19 @@ function validateAdmission(
 	return problems;
 }
 
+// #3546: the import-graph walk `supportHelperHasLaneProof` drives (see its
+// own comment above) is billed to this describe block's single 30s `it`
+// budget even though it is a whole-tests-tree walk, not that test's own
+// work. Pre-warm the shared cache here, under its own measured timeout,
+// decoupled from the `it` below the same way `WALK_TIMEOUT_MS` decouples
+// `countsByDetector`'s pre-warm from each `detector %s` case's 30s budget.
+const SUPPORT_LANE_WALK_TIMEOUT_MS = 180_000;
+
 describe("flake-shape ratchet — admission gate", () => {
+	beforeAll(() => {
+		for (const file of cachedAllTestFiles()) cachedLocalImportTargets(file);
+	}, SUPPORT_LANE_WALK_TIMEOUT_MS);
+
 	// #2857: the admission sweep reads every admitted file's source and timed
 	// out at vitest's 5 s default under full-suite load; give it a real budget.
 	it("ADMITTED_AFTER_BASELINE entries carry the header and wallClockBudgetInclude membership", () => {
@@ -899,6 +1019,67 @@ describe("flake-shape ratchet — admission gate", () => {
 		}
 		expect(problems).toEqual([]);
 	}, 30_000);
+
+	// #3546: the caching above is a behaviour-preserving refactor — every
+	// value it returns must equal what the uncached production calls
+	// (`allTestSourceFiles`, `localImportTargets`) return for the same
+	// input. Old-vs-new probe through the real seam, not a re-derived copy
+	// of the caching logic, per the behaviour-preserving-refactor proof
+	// shape.
+	it("(#3546) the cached file list and import targets equal the uncached scan", () => {
+		const uncachedFiles = allTestSourceFiles().filter((file) =>
+			file.endsWith(".test.ts"),
+		);
+		expect(cachedAllTestFiles()).toEqual(uncachedFiles);
+		for (const file of uncachedFiles) {
+			expect(cachedLocalImportTargets(file)).toEqual(localImportTargets(file));
+		}
+	});
+
+	// #3546 MUTATION: the cache must be load-bearing, not dead code — poison
+	// it and show `supportHelperHasLaneProof`'s answer for a REAL admitted
+	// entry flips, then show it flips back once the cache is restored. This
+	// is the guard's own red-on-neuter proof (AGENTS.md "mutation-proof").
+	it("MUTATION (#3546): a poisoned import-targets cache flips supportHelperHasLaneProof's answer", () => {
+		const included = new Set([
+			...wallClockBudgetInclude(),
+			...realHarnessInclude,
+		]);
+		expect(
+			supportHelperHasLaneProof("support/fault-injection.ts", included),
+		).toBe(true);
+
+		const saved = new Map(importTargetsCache);
+		for (const key of importTargetsCache.keys())
+			importTargetsCache.set(key, []);
+		try {
+			expect(
+				supportHelperHasLaneProof("support/fault-injection.ts", included),
+			).toBe(false);
+		} finally {
+			importTargetsCache.clear();
+			for (const [key, value] of saved) importTargetsCache.set(key, value);
+		}
+		expect(
+			supportHelperHasLaneProof("support/fault-injection.ts", included),
+		).toBe(true);
+	});
+
+	// #3546 planted offender: a target nothing imports must be flagged
+	// (no lane proof) — same conclusion the uncached walk would reach, since
+	// the equivalence test above proves the cache returns identical data.
+	it("ATTACK (#3546): a support/ target no test imports has no lane proof — planted offender", () => {
+		const included = new Set([
+			...wallClockBudgetInclude(),
+			...realHarnessInclude,
+		]);
+		expect(
+			supportHelperHasLaneProof(
+				"support/__3546-planted-offender-never-imported.ts",
+				included,
+			),
+		).toBe(false);
+	});
 
 	// `ADMITTED_AFTER_BASELINE` is empty in steady state, so the test above
 	// alone never proves `validateAdmission` catches anything. These fixtures
@@ -1369,7 +1550,7 @@ describe("flake-shape scan — ungoverned-wait-for", () => {
 });
 
 describe("flake-shape scan — mutation-proof self-test", () => {
-	it("has exactly the three declared detectors, each catching its own canonical fixture", () => {
+	it("has exactly the declared detectors, each catching its own canonical fixture", () => {
 		const canonicalFixtures: Record<DetectorName, string> = {
 			"real-process-spawn": 'execFileSync("npx", ["vitest", "run"]);\n',
 			"elapsed-time-assertion":
@@ -1377,6 +1558,8 @@ describe("flake-shape scan — mutation-proof self-test", () => {
 			"raw-timer-wait": "setTimeout(() => {}, 10);\n",
 			"ungoverned-wait-for":
 				"await vi.waitFor(() => expect(ready).toBe(true));\n",
+			"never-settling-wait":
+				"await expect(run(() => new Promise(() => {}))).rejects.toThrow();\n",
 		};
 		expect(Object.keys(canonicalFixtures).sort()).toEqual(
 			[...DETECTOR_NAMES].sort(),
@@ -1392,6 +1575,55 @@ describe("flake-shape scan — mutation-proof self-test", () => {
 				`detector "${name}" must flag its own canonical fixture`,
 			).toBeGreaterThan(0);
 		}
+	});
+});
+
+describe("flake-shape scan — never-settling-wait (#2885)", () => {
+	const hitsIn = (body: string) =>
+		scanNeverSettlingWait(
+			"fixture.test.ts",
+			`it("x", async () => {\n${body}\n});\n`,
+		);
+
+	it.each([
+		["an empty arrow executor", "await run(() => new Promise(() => {}));"],
+		[
+			"a typed executor with an unused param",
+			"await run(() => new Promise<never>((_resolve) => {}));",
+		],
+		[
+			"a comment-only executor body",
+			"await run(() => new Promise<void>(() => {\n// never resolves\n}));",
+		],
+		["a function executor", "await run(() => new Promise(function () {}));"],
+		[
+			"an undefined expression body",
+			"await run(() => new Promise(() => undefined));",
+		],
+	])("ATTACK: flags %s", (_name, body) => {
+		expect(hitsIn(body)).toHaveLength(1);
+	});
+
+	it("does not flag an executor that can settle", () => {
+		expect(
+			hitsIn("await new Promise<void>((resolve) => queueMicrotask(resolve));"),
+		).toEqual([]);
+	});
+
+	it("does not flag a never-settling promise under fake timers", () => {
+		expect(
+			hitsIn(
+				"vi.useFakeTimers();\nconst p = run(() => new Promise(() => {}));\nawait vi.advanceTimersByTimeAsync(5000);",
+			),
+		).toEqual([]);
+	});
+
+	it("does not flag the shape named in a comment or a string", () => {
+		expect(
+			hitsIn(
+				'// new Promise(() => {}) would hang\nconst s = "new Promise(() => {})";',
+			),
+		).toEqual([]);
 	});
 });
 
