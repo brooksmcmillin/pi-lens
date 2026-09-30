@@ -391,15 +391,19 @@ export type DegradationKind =
 	/** A busy notify-stall discriminator was deferred; detail is rising-edge bounded. */
 	| "instance-registry-corrupt"
 	/**
-	 * #3498: the removal `deregisterInstance` queued took the registry lock
-	 * and ran, whether or not the entry was still there. A queued removal
-	 * with no landed record was lost (host exit, or the lock never came).
-	 * Subject is this process's pid.
+	 * #3498: a removal queued by `deregisterInstance` (whole entry, at
+	 * shutdown) or `deregisterInstanceRoot` (one root, #3587) took the
+	 * registry lock and ran, whether or not there was still anything to
+	 * remove. A queued removal with no landed record was lost (host exit, or
+	 * the lock never came). Subject is this process's pid.
 	 */
 	| "instance-registry-deregister-landed"
 	/**
-	 * #3498: `deregisterInstance`'s sync removal could not take the registry
-	 * lock, so the removal was queued on the registry tail behind the holder.
+	 * #3498: the sync removal `deregisterInstance` or `deregisterInstanceRoot`
+	 * (#3587) attempts first could not take the registry lock, so it was
+	 * queued behind the holder — on the registry tail for `deregisterInstance`
+	 * (which itself runs off the tail, at shutdown), or in place on the same
+	 * tail slot for `deregisterInstanceRoot` (which already runs on it).
 	 * Subject is this process's pid.
 	 */
 	| "instance-registry-deregister-queued"
@@ -1068,6 +1072,14 @@ export type DegradationKind =
 	| "self-drift-unverifiable"
 	| "session-start-duplicate"
 	/**
+	 * #3662: a primary replacement shutdown left the process with no primary
+	 * and a successor pending. Subject `declined`: a `startup` start in that
+	 * gap was classified `concurrent-secondary` instead of taking the primary
+	 * slot. Subject `expired`: no successor started within
+	 * `SUCCESSOR_PENDING_TTL_MS`, so the marker stopped declining starts.
+	 */
+	| "session-successor-pending"
+	/**
 	 * #3071: `clients/sgconfig.ts` evicted the oldest sg-config baseline
 	 * entries over its retained-entry cap. Subject is the baseline directory;
 	 * reason carries the evicted count.
@@ -1364,6 +1376,14 @@ export type DegradationKind =
 	 * re-observes the file.
 	 */
 	| "wasm-abort"
+	/**
+	 * #3605: web-tree-sitter trapped (`memory access out of bounds`, `table
+	 * index is out of bounds`, ...) while parsing or querying one file. That
+	 * file degrades to not-parsed, and the parsers and tree cache are
+	 * recycled. Counted; past `WASM_TRAP_BUDGET` the next trap becomes a
+	 * `wasm-abort`. Subject is always `web-tree-sitter`.
+	 */
+	| "wasm-trap"
 	/**
 	 * #2626: `resources_discover` (#205) resolved `<packageRoot>/skills` to a
 	 * directory that is absent, unreadable, or holds no `SKILL.md` — pi then

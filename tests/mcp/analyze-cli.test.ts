@@ -121,7 +121,8 @@ function runBinWithOpenStdin(
 // #2420: a file whose only finding is the hint-tier `no-any-type` rule. Before
 // #2420 this rendered "0 blocking, 1 warning(s)" — a style opinion folded into
 // the model-facing warning count via the dispatch semantic axis.
-const HINT_ONLY = "export const y: any = 1;\n";
+const HINT_ONLY =
+	"// biome-ignore lint/suspicious/noExplicitAny: exercise the hint-tier rule\nexport const y: any = 1;\n";
 
 let tmpDir: string;
 let smellyFile: string;

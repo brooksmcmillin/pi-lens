@@ -1359,6 +1359,8 @@ export async function computeCascadeForFile(
 			if (
 				(graphBuildInfo.mode === "skipped" ||
 					graph.persistCoverage?.partial === true ||
+					// #3605: a wasm trap cost some file its symbols and imports.
+					(graphBuildInfo.wasmTrappedFiles ?? 0) > 0 ||
 					!graphBuildInfoTrustworthy) &&
 				!impact.indeterminate
 			) {
@@ -1379,9 +1381,11 @@ export async function computeCascadeForFile(
 								: graphBuildInfo.skipReason === "unsafe_root"
 									? "review graph skipped — workspace root is at/above home dir"
 									: `review graph unavailable (${graphBuildInfo.skipReason ?? "skipped"})`
-							: coverage?.sourceFilesTruncated
-								? "review graph partial — source walk stopped at its visited-entry budget"
-								: "review graph partial — persisted graph coverage is incomplete",
+							: graphBuildInfo.wasmTrappedFiles
+								? `review graph degraded — tree-sitter wasm runtime failure in ${graphBuildInfo.wasmTrappedFiles} file(s)`
+								: coverage?.sourceFilesTruncated
+									? "review graph partial — source walk stopped at its visited-entry budget"
+									: "review graph partial — persisted graph coverage is incomplete",
 					sourceFileCount: graphBuildInfo.sourceFileCount,
 					maxFileCount: graphBuildInfo.maxFileCount,
 				};

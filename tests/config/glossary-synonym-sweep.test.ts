@@ -474,7 +474,9 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/test-runner-delivery.ts": 6,
 		"clients/tool-agreement.ts": 2,
 		"clients/tree-sitter-cache.ts": 4,
-		"clients/tree-sitter-client.ts": 18,
+		// #3605: 18 -> 6. The rewritten wasm classifier, `reportWasmAbort` and
+		// the `parseFileAndUse` consume catch name their parameter `thrown`.
+		"clients/tree-sitter-client.ts": 6,
 		"clients/tree-sitter-logger.ts": 1,
 		"clients/tree-sitter-symbol-extractor.ts": 3,
 		"clients/trivy-client.ts": 3,
@@ -572,7 +574,10 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/installer/index.ts": 4,
 		"clients/installer/managed-tool-refresh.ts": 2,
 		"clients/instance-reaper.ts": 3,
-		"clients/instance-registry.ts": 11,
+		// 11 → 10 (#3587): deregisterInstanceRootNow's whole-entry removal now
+		// shares withoutOwnEntry's own `.filter(` instead of inlining a second
+		// one; the net `.filter(` count in the file drops by one.
+		"clients/instance-registry.ts": 10,
 		"clients/knip-client.ts": 3,
 		"clients/language-policy.ts": 2,
 		"clients/language-profile.ts": 2,
@@ -887,7 +892,9 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/lsp/server.ts": 121,
 		"clients/lsp/session-roots.ts": 6,
 		"clients/lsp/workspace-diagnostics-cache.ts": 13,
-		"clients/mcp/analyze.ts": 6,
+		// 6 -> 5 (#3643): removed the obsolete ring path-comparison branch;
+		// dispatch identity now arrives on DispatchResult.
+		"clients/mcp/analyze.ts": 5,
 		"clients/mcp/ipc.ts": 4,
 		"clients/mcp/session.ts": 3,
 		"clients/metrics-client.ts": 6,

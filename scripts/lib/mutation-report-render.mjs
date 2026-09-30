@@ -30,7 +30,29 @@ function metaTable(meta) {
 	if ((meta.filesUncovered?.length ?? 0) > 0) {
 		rows.push(["No covering test", meta.filesUncovered.join(", ")]);
 	}
-	return rows.map(([k, v]) => `- **${k}:** ${v}`).join("\n");
+	const rendered = rows.map(([k, v]) => `- **${k}:** ${v}`);
+	if ((meta.testsExcluded?.length ?? 0) > 0) {
+		rendered.push(
+			"- **Excluded tests:**",
+			...meta.testsExcluded.map(
+				({ file, reason }) => `  - \`${file}\` — ${reason}`,
+			),
+		);
+	}
+	return rendered.join("\n");
+}
+
+function testCapNotice(meta) {
+	const cap = meta.testCap;
+	if (
+		!cap ||
+		typeof cap.selected !== "number" ||
+		typeof cap.total !== "number" ||
+		typeof cap.dropped !== "number" ||
+		cap.dropped <= 0
+	)
+		return null;
+	return `**Bounded evidence:** ${cap.selected} of ${cap.total} related tests selected; ${cap.dropped} dropped. The score is from a truncated test population.`;
 }
 
 /**
@@ -102,6 +124,8 @@ export function renderMutationMarkdown(report) {
 			"",
 		);
 		if (samplingNote) lines.push(samplingNote, "");
+		const capNote = testCapNotice(meta);
+		if (capNote) lines.push(capNote, "");
 		lines.push(metaTable(meta));
 		return lines.join("\n");
 	}
@@ -161,8 +185,9 @@ export function renderMutationMarkdown(report) {
 		);
 	}
 
+	const capNote = testCapNotice(meta);
 	lines.push(
-		`**Score: ${meta.score ?? "n/a"}%** -- ${counts.Killed ?? 0} killed, ${counts.Survived ?? 0} survived, ${counts.Timeout ?? 0} timeout, ${counts.NoCoverage ?? 0} no coverage (${total} total)`,
+		`**Score: ${meta.score ?? "n/a"}%** -- ${counts.Killed ?? 0} killed, ${counts.Survived ?? 0} survived, ${counts.Timeout ?? 0} timeout, ${counts.NoCoverage ?? 0} no coverage (${total} total)${capNote ? ` — ${capNote.replaceAll("**", "")}` : ""}`,
 		"",
 	);
 

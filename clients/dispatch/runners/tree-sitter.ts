@@ -14,7 +14,10 @@ import {
 	computeImpactCascade,
 	recordEntitySnapshotDiff,
 } from "../../review-graph/service.js";
-import type { TreeSitterClient } from "../../tree-sitter-client.js";
+import {
+	classifyTreeSitterWasmError,
+	type TreeSitterClient,
+} from "../../tree-sitter-client.js";
 import {
 	getSharedTreeSitterClient,
 	isTreeSitterWasmAborted,
@@ -622,7 +625,7 @@ const treeSitterRunner: RunnerDefinition = {
 			const msg = err instanceof Error ? err.message : String(err);
 			// Emscripten abort() corrupts the entire module-level wasm heap.
 			// Poison the singleton so no further queries attempt to use the dead runtime.
-			if (msg.includes("Aborted") || msg.includes("abort()")) {
+			if (classifyTreeSitterWasmError(err) === "abort") {
 				markTreeSitterWasmAborted();
 				logTreeSitter({
 					phase: "query_error",

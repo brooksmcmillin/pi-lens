@@ -2212,6 +2212,9 @@ function activateExtension(hostPi: ExtensionAPI) {
 						ctx,
 						stableSessionId,
 						sessionStartCwd,
+						// #3662: a `startup` start in a replacement gap is not the
+						// successor, so it must not take the primary slot.
+						sessionStartReason,
 					);
 					ownedSessionRole = sessionStartDecision.runFullSessionStart
 						? "primary"
@@ -3764,7 +3767,8 @@ function activateExtension(hostPi: ExtensionAPI) {
 		// never a full start, no re-arm. This is the process-lifetime-latch shape
 		// the catalog names. Only the PRIMARY path reaches here; a secondary
 		// returned above precisely because the primary is still live.
-		releasePrimarySession();
+		// #3662: a replacement reason leaves the slot pending for its successor.
+		releasePrimarySession(shutdownReason);
 		// #2467: no analyzer bootstrap may START loading from here on. A demand
 		// already in flight keeps its promise and still settles — the gate is
 		// checked only when no flight exists. Nothing is spawned, which is what

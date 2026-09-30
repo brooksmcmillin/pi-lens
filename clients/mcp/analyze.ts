@@ -18,7 +18,6 @@ import { CacheManager, MCP_TURN_STATE_OWNER_ID } from "../cache-manager.js";
 import {
 	CASCADE_GRAPH_KINDS,
 	dispatchLintWithResult,
-	getLatencyReports,
 } from "../dispatch/integration.js";
 import { FactStore } from "../dispatch/fact-store.js";
 import type { Diagnostic } from "../dispatch/types.js";
@@ -449,7 +448,6 @@ export async function analyzeFile(
 		await warmLspForFile(absPath, host);
 	}
 
-	const reportsBefore = getLatencyReports().length;
 	const start = Date.now();
 	// No telemetryModel/telemetryProvider here (#1448): this MCP facade has no
 	// RuntimeCoordinator to hold a host-reported identity (see the module doc
@@ -572,13 +570,7 @@ export async function analyzeFile(
 		}
 	}
 
-	// dispatchForFile appended a latency report during the call above. Match the
-	// newly-added report for this exact path; fall back to the most recent new
-	// report if the path normalization differs.
-	const newReports = getLatencyReports().slice(reportsBefore);
-	const latencyReport =
-		newReports.find((report) => path.resolve(report.filePath) === absPath) ??
-		newReports[newReports.length - 1];
+	const latencyReport = result.latencyReport;
 
 	const lspRunner = latencyReport?.runners.find(
 		(runner) => runner.runnerId === "lsp",

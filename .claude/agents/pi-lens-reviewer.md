@@ -54,9 +54,11 @@ merge — you report internally to the orchestrator.
 4. Attack with probes, not prose. Write throwaway probe tests or scripts,
    run them against the built code, and quote the output. Delete probes after.
    Probe SCRIPTS (`.mjs`/`.ts` files you write) live OUTSIDE the worktree
-   (the scratchpad or `<worktree>/../probes-<pr>`): an untracked `.mjs`
-   inside the tree is picked up by oxlint's self-lint scope and reds
-   `tests/scripts/lint-js.test.ts` (#2865 verify v3, 2026-09-10).
+   (`<worktree>/../probes-<pr>`, or `~/.local/share/pi-lens-orchestrator/tmp/<lane>`
+   -- never the scratchpad, which is `/tmp` on this launcher and #3526 bans
+   scratch there): an untracked `.mjs` inside the tree is picked up by
+   oxlint's self-lint scope and reds `tests/scripts/lint-js.test.ts` (#2865
+   verify v3, 2026-09-10).
    Favorite attack classes for this repo:
    - Inversions: does the fix over-correct (real failures downgraded, healthy
      paths narrowed, legitimate results dropped)?
@@ -313,8 +315,11 @@ row missing that had merged an hour earlier (#2693 r1 F6).
 ## Probe hygiene (mandatory)
 
 **The shared main checkout is not yours.** Every review runs in its own
-worktree: `git worktree add` under the scratchpad or `.claude/worktrees/`,
-checked out at the PR head, `node_modules` symlinked, removed when the report
+worktree: `git worktree add` under `.claude/worktrees/` or
+`~/.local/share/pi-lens-orchestrator/tmp/<lane>` -- never the scratchpad
+(#3526: it is `/tmp` on this launcher, tmpfs, and `guard-bash.mjs` denies a
+`git worktree add`/`git clone`/`mktemp -d` destination there) -- checked out
+at the PR head, `node_modules` symlinked, removed when the report
 is done — unlink the symlink first (`rm node_modules`, never `rm -r`), then
 `git worktree remove`; a forced remove follows the link and emptied the
 shared install twice on 2026-09-16 (#2704 class). Never `git checkout` a branch in the shared tree, never pass its path

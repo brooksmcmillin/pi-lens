@@ -29,6 +29,7 @@
  * `subagent-mode.ts` / `runtime-config.ts`).
  */
 
+import { recordDegradationOnce } from "./degradation-ledger.js";
 import { normalizeFilePath } from "./path-utils.js";
 import { getProcessSingleton } from "./process-singletons.js";
 
@@ -52,6 +53,15 @@ interface SessionLifecycleState {
 	activeSessionId: string | undefined;
 	activeRoot: string | undefined;
 	secondarySessionCount: number;
+	/**
+	 * #3662: when a primary replacement shutdown released the registration
+	 * (`Date.now()`), until the next release rewrites it. Read only while no
+	 * primary is registered. Additive: a cell from a build without it reads
+	 * `undefined` (nothing pending, today's behavior), so the version stays 1;
+	 * a bump would make two builds in one process discard each other's
+	 * registration on every read.
+	 */
+	successorPendingSince?: number | undefined;
 }
 
 const SESSION_LIFECYCLE_FAMILY = "session-lifecycle.primary-registration";
@@ -70,6 +80,15 @@ function state(): SessionLifecycleState {
 		}),
 	);
 }
+
+/**
+ * #3662: how long a replacement shutdown's successor-pending marker declines
+ * `startup` starts. pi's replacement gap is one awaited sequence (teardown,
+ * `createRuntime`, rebind, `session_start`), so a marker older than this means
+ * the successor is not coming (pi `reload()` with no bindings, a host without
+ * `rebindSession`) and starts classify exactly as they did before #3662.
+ */
+export const SUCCESSOR_PENDING_TTL_MS = 60_000;
 
 /** The stable id of the currently registered primary session, if known. */
 export function getActiveSessionId(): string | undefined {
@@ -117,6 +136,12 @@ export interface ClassifySessionStartInput {
 	 * DIFFERENT root may suppress a full session start.
 	 */
 	sameRoot?: boolean | undefined;
+	/**
+	 * #3662: no primary is registered because a primary replacement shut down,
+	 * its successor has not started yet, and this start's reason is `startup`
+	 * (so it cannot be that successor). Only consulted when `hasPrior` is false.
+	 */
+	successorPending?: boolean;
 }
 
 /**
@@ -124,7 +149,10 @@ export interface ClassifySessionStartInput {
  *
  * Branches (fail-safe order matters):
  *  1. No prior primary registered → `primary` (first session_start this
- *     process has seen; zero behavior change for the single-session case).
+ *     process has seen; zero behavior change for the single-session case),
+ *     unless `successorPending` → `concurrent-secondary` (#3662: a subagent
+ *     binding in a replacement gap must not take the slot the successor is
+ *     about to claim, or the successor would probe its live ctx and decline).
  *  2. Prior exists, same stable session id → `sequential-replacement` (the
  *     same session re-announcing itself, e.g. resume/reload paths — must
  *     keep today's behavior, NOT be mistaken for a sibling).
@@ -175,9 +203,15 @@ export interface ClassifySessionStartInput {
 export function classifySessionStart(
 	input: ClassifySessionStartInput,
 ): SessionStartClassification {
-	const { hasPrior, priorCtxActive, sameSessionId, sameRoot } = input;
+	const {
+		hasPrior,
+		priorCtxActive,
+		sameSessionId,
+		sameRoot,
+		successorPending,
+	} = input;
 
-	if (!hasPrior) return "primary";
+	if (!hasPrior) return successorPending ? "concurrent-secondary" : "primary";
 	if (sameSessionId) return "sequential-replacement";
 	if (priorCtxActive === true) return "concurrent-secondary";
 	if (sameRoot === false) return "secondary-root";
@@ -315,19 +349,28 @@ function normalizeRootForCompare(root: string | undefined): string | undefined {
  * Zeroing it here under-reports for the window between the primary's release
  * and the next primary's registration. That is real and accepted: the only
  * reader is `concurrent_session_bind.metadata.secondaryCount` in `latency.log`,
- * and during that window no primary is registered, so every arriving start
- * classifies `primary` and re-registers — which zeroes the count anyway —
- * instead of emitting a bind record. `decrementSecondarySessionCount` clamps at
+ * and during that window no primary is registered, so an arriving start either
+ * classifies `primary` and re-registers — which zeroes the count anyway — or,
+ * inside a replacement gap (#3662), declines and counts up from zero until the
+ * successor registers and zeroes it. `decrementSecondarySessionCount` clamps at
  * zero, so a late secondary's shutdown cannot underflow it. Documented rather
  * than changed, because a count that outlived the registration it is scoped to
  * would disagree with `getActivePrimaryRoot()` in the same record.
  */
-export function releasePrimarySession(): void {
+export function releasePrimarySession(shutdownReason?: string): void {
 	const s = state();
 	s.activeCtx = undefined;
 	s.activeSessionId = undefined;
 	s.activeRoot = undefined;
 	s.secondarySessionCount = 0;
+	// #3662: every pi shutdown reason except `quit` is followed by a start of
+	// the same reason (pi 0.85.1 `agent-session-runtime.js`, `reload()`), so the
+	// next primary is that successor. `quit` and a missing reason promise no
+	// successor and keep the #2129 F3 re-arm above.
+	s.successorPendingSince =
+		shutdownReason !== undefined && shutdownReason !== "quit"
+			? Date.now()
+			: undefined;
 }
 
 /** Register a concurrently-bound secondary (subagent) session. Does not
@@ -501,6 +544,7 @@ export function _resetSessionLifecycleForTests(): void {
 	s.activeSessionId = undefined;
 	s.activeRoot = undefined;
 	s.secondarySessionCount = 0;
+	s.successorPendingSince = undefined;
 }
 
 export interface SessionStartGuardDecision {
@@ -537,9 +581,14 @@ export function decideSessionStart(
 	ctx: unknown,
 	sessionId: string | undefined,
 	root?: string | undefined,
+	/** #3662: this start's `event.reason`. pi sends `startup` only for a
+	 *  runtime's first bind, never for a replacement's successor. */
+	reason?: string | undefined,
 ): SessionStartGuardDecision {
 	const s = state();
 	const hasPrior = s.activeCtx !== undefined || s.activeSessionId !== undefined;
+	const successorPending =
+		!hasPrior && reason === "startup" && successorStillPending(s);
 	const priorCtxActive = hasPrior ? probeCtxActive(s.activeCtx) : undefined;
 	// ctx OBJECT IDENTITY: if the SDK ever hands the SAME ctx object to a
 	// repeated session_start, that is by definition the same session
@@ -570,12 +619,21 @@ export function decideSessionStart(
 		priorCtxActive,
 		sameSessionId,
 		sameRoot,
+		successorPending,
 	});
 
 	if (
 		classification === "concurrent-secondary" ||
 		classification === "secondary-root"
 	) {
+		if (successorPending) {
+			recordDegradationOnce({
+				kind: "session-successor-pending",
+				subject: "declined",
+				reason:
+					"a startup session_start arrived after a primary replacement shutdown and before its successor; declined as concurrent-secondary",
+			});
+		}
 		registerSecondarySession();
 		return {
 			classification,
@@ -596,4 +654,19 @@ export function decideSessionStart(
 		sameRoot,
 		primaryRoot: primaryRootAtDecision,
 	};
+}
+
+/** #3662: whether a replacement shutdown's marker is younger than the bound.
+ *  An expired marker records once and stops declining. */
+function successorStillPending(s: SessionLifecycleState): boolean {
+	if (s.successorPendingSince === undefined) return false;
+	if (Date.now() - s.successorPendingSince < SUCCESSOR_PENDING_TTL_MS) {
+		return true;
+	}
+	recordDegradationOnce({
+		kind: "session-successor-pending",
+		subject: "expired",
+		reason: `no successor session_start within ${SUCCESSOR_PENDING_TTL_MS}ms of a primary replacement shutdown; a startup start classifies primary again`,
+	});
+	return false;
 }

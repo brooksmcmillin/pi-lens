@@ -505,6 +505,13 @@ ADR: docs/adr/0009-reported-path-attribution.md
   `PI_LENS_HOME` under `os.tmpdir()`, so a `TMPDIR` aimed at `.probe-home` moves
   the harness home into a git-ignored directory inside the checkout and reds
   unrelated suites (#3026). `scripts/hooks/guard-bash.mjs` denies it.
+- A review/merge scratch checkout or `mktemp -d` never lands under `/tmp`:
+  it is tmpfs (RAM + swap) on the maintainer host, and ~20 accumulated
+  review/merge trees there filled swap to 8/8 GB (#3526). Use
+  `~/.local/share/pi-lens-orchestrator/tmp/<lane>` for orchestrator/reviewer
+  scratch, `<worktree>/../probes-<pr>` for probe files, or
+  `.claude/worktrees/` for a fixer's own worktree. `scripts/hooks/guard-bash.mjs`
+  denies a `git worktree add`/`git clone`/`mktemp -d` destination under `/tmp`.
 - Vitest keeps the #2912 run-shared home; `vitest-setup.ts` pins only the
   orphan-backstop directory through `resolveBackstopStateDir` (#3083). Explicit
   per-case homes remain authoritative. Never bypass this seam for its lock or stamp.
@@ -944,13 +951,34 @@ Bare-Node scripts import only `.js`/`.mjs`; type stripping is not assumed.
 
 Every `Bash` call an agent makes under Claude Code runs through the
 `PreToolUse` hook `scripts/hooks/guard-bash.mjs` (`.claude/settings.json`),
-mechanically enforcing six non-negotiables that used to live only as prose:
+mechanically enforcing nine non-negotiables that used to live only as prose:
 no `git stash` in any form; no `git reset --soft`/`--hard`; no hand-typed
 `git worktree remove` with two force flags (use
 `node scripts/prune-agent-worktrees.mjs`); no `git worktree remove` at all on
 a worktree whose `node_modules` is a symlink pointing outside it; no unpinned
 `node` probe loading built runtime code from `clients/`/`dist/` without a
-`PI_LENS_HOME` pin; and no `TMPDIR`/`TMP`/`TEMP` aimed at the vitest harness's
-own home. See `CONTRIBUTING.md` "Local git hooks" for the human-facing
-version and `docs/pi-lens-subagent.md` for the fuller worktree/probe-hygiene
-contract.
+`PI_LENS_HOME` pin; no `TMPDIR`/`TMP`/`TEMP` aimed at the vitest harness's
+own home; no `pkill`/`killall` with a bare, unscoped pattern -- it matches
+machine-wide and can kill another concurrent session's TLC/vitest/etc run
+(#3556; kill the recorded PID of your own job instead, or scope `pkill -f`
+with a pattern that includes your worktree's absolute path -- that scoped
+form only allows when run FROM a linked worktree: the shared main checkout's
+own path is a prefix of every worktree's path, so a pattern scoped to it
+would still match every worktree's TLC, and is denied there. `kill $(pgrep -f
+…)` and `pgrep -f … | xargs kill` carry the same machine-wide-match risk
+through a shape this hook does not recognize as killing anything at all --
+a documented blind spot, never scoped by this guard); no `git
+worktree add`/`git clone`/`mktemp -d` landing under `/tmp` -- tmpfs on the
+maintainer host, filled to 8/8 GB swap by review scratch checkouts (#3526;
+see "Paths, data, and operating systems" for where those belong); and no
+`git commit`/`git push` chained after a check (`npm run
+lint`/`build`/`test`/`fmt:check`/`preflight`, `npx vitest`, `tsc`, `node
+scripts/check-*.mjs`) through `;` or a pipe rather than `&&` -- the check's
+exit code gates nothing that way (#3471; gate with `&&`, or read the
+check's result in its own call). Concretely: `npm run build >log 2>&1;
+echo build=$?; test "$(git rev-parse HEAD)" = SHA && git push …` is denied
+(the build's real exit code is thrown away by `;`); rewrite it as `npm run
+build >log 2>&1 && test "$(git rev-parse HEAD)" = SHA && git push …`, or
+split the build and the push into two calls. See `CONTRIBUTING.md` "Local
+git hooks" for the human-facing version and `docs/pi-lens-subagent.md` for
+the fuller worktree/probe-hygiene contract.

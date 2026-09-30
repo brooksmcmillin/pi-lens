@@ -2349,7 +2349,15 @@ const HELPER_UNBOUNDED: Readonly<Record<string, number>> = {
 	// queued removal runs on the registry tail, never awaited by a hook; each
 	// is a local file operation or the registry lock's own bounded wait, and
 	// none can take the hook's signal until #2523 AC4 threads it.
-	"clients/instance-registry.ts": 33,
+	// 33 → 37 (#3587): deregisterInstanceRootAfterHolder, the queued fallback
+	// deregisterInstanceRoot's own sync-wait failure now falls back to, adds
+	// the same four awaits deregisterInstance's #3498 fallback did (this
+	// process's start, the lock, the read, the write). Same reasoning as
+	// #3498's four: this op runs on the registry tail, never awaited by a
+	// hook; each is a local file operation or the registry lock's own
+	// bounded wait, and none can take the hook's signal until #2523 AC4
+	// threads it.
+	"clients/instance-registry.ts": 37,
 	"clients/language-profile.ts": 3,
 	"clients/lens-engine.ts": 1,
 	"clients/lens-map.ts": 2,

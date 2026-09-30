@@ -363,6 +363,11 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"real pi must surface provider exhaustion and malformed tool arguments across the process boundary",
 	},
+	"real-process-spawn:real-harness/provider-compatibility.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the installed pi host must load the built extension and expose its provider roster across the process boundary",
+	},
 	"real-process-spawn:real-harness/scenario-1.test.ts": {
 		detector: "real-process-spawn",
 		reason:
@@ -466,6 +471,11 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"the real hook pipes git through xargs into the pinned oxfmt; the exit-123 refusal is a process-boundary fact",
 	},
+	"real-process-spawn:scripts/pre-push-targeted-tests.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"git's pre-push stdin and the hook script's exit/skip contract are the subject; the union witness needs a real git fixture",
+	},
 	"real-process-spawn:scripts/prune-agent-worktrees.test.ts": {
 		detector: "real-process-spawn",
 		reason:
@@ -483,6 +493,13 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "real-process-spawn",
 		reason:
 			"the CLI's real exit code (2 vs. 4) and GITHUB_OUTPUT side effect are unobservable from an in-process stub",
+	},
+	// #3674: git's own per-worktree resolution of core.hooksPath and the real
+	// husky binary are the subject; a double would restate the path it wrote.
+	"real-process-spawn:scripts/setup-git-hooks.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"git resolves core.hooksPath per worktree at its own process boundary; the real script and husky binary are the subject",
 	},
 	// 2026-09-06 (#2369): the fixture-ordering defect (an earlier LSP_FIXTURES
 	// entry registering a foreign session root, declining a later one) lives

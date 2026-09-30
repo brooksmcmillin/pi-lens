@@ -140,6 +140,34 @@ describe("instance registry across a session replacement (#3498)", () => {
 		expect(shutdownRan).toBe(true);
 	}
 
+	/**
+	 * The #3587 sibling of `shutdownDuringHeartbeat`: a declined secondary's
+	 * root removal is requested while the heartbeat's read of the registry is
+	 * in flight. `deregisterInstanceRoot` (unlike `deregisterInstance`)
+	 * already runs on the registry tail — and since #3602, so does
+	 * `updateHeartbeat` — so this no longer races the heartbeat for the file
+	 * lock: it queues behind it and starts its sync attempt only once the
+	 * heartbeat's mutation has fully resolved (lock released). See "queues a
+	 * secondary root's removal behind an in-flight heartbeat" below.
+	 */
+	async function rootRemovalDuringHeartbeat(root: string): Promise<void> {
+		const readFile = fs.promises.readFile.bind(fs.promises);
+		let removalStarted = false;
+		vi.spyOn(fs.promises, "readFile").mockImplementation((async (
+			...args: Parameters<typeof fs.promises.readFile>
+		) => {
+			if (!removalStarted && args[0] === registryFilePath()) {
+				removalStarted = true;
+				void registry.deregisterInstanceRoot(root);
+			}
+			return readFile(...args);
+		}) as typeof fs.promises.readFile);
+		await registry.updateHeartbeat();
+		vi.restoreAllMocks();
+		await registry._settleRegistryMutationsForTests();
+		expect(removalStarted).toBe(true);
+	}
+
 	it("removes the entry when shutdown lands while this process's heartbeat holds the lock", async () => {
 		await registry.registerInstance(ROOT_A);
 		await shutdownDuringHeartbeat();
@@ -223,6 +251,27 @@ describe("instance registry across a session replacement (#3498)", () => {
 		await expectSessionTwoRegistersAlone();
 	});
 
+	// #3602: before that fix, `updateHeartbeat` took the registry lock
+	// directly (off the tail), so a root removal requested while it held the
+	// lock met this process's OWN hold — the #3587 shape this file's own
+	// mutation table (PR #3593/#3587's R1) exercises via a peer instead below.
+	// Now `updateHeartbeat` is queued through the SAME tail as
+	// `deregisterInstanceRoot`, so the two can never hold the lock at once:
+	// the removal simply waits its turn and its first sync attempt succeeds
+	// uncontended, once it is the removal's turn.
+	it("queues a secondary root's removal behind an in-flight heartbeat instead of racing it for the lock", async () => {
+		await registry.registerInstance(ROOT_A);
+		await registry.registerInstanceRoot(ROOT_SECONDARY);
+		await rootRemovalDuringHeartbeat(ROOT_SECONDARY);
+
+		// Queued behind the heartbeat's own tail slot, not contended for the
+		// lock: none of the own-hold retry machinery fires.
+		expect(degradationCount("instance-registry-lock-timeout")).toBe(0);
+		expect(degradationCount("instance-registry-deregister-queued")).toBe(0);
+		expect(degradationCount("instance-registry-deregister-landed")).toBe(0);
+		expect(ownEntry()?.projectRoots).toEqual([normalizeFilePath(ROOT_A)]);
+	});
+
 	it("still points the heartbeat's repair at a root the live session keeps serving", async () => {
 		// The inverse of the case above: with no shutdown in between, removing
 		// one root re-arms the intent on a root the host still serves (#2130),
@@ -230,6 +279,8 @@ describe("instance registry across a session replacement (#3498)", () => {
 		await registry.registerInstance(ROOT_A);
 		await registry.registerInstance(ROOT_B);
 		await registry.deregisterInstanceRoot(ROOT_B);
+		// The sync attempt took the lock uncontended (#3587): nothing was queued.
+		expect(degradationCount("instance-registry-deregister-queued")).toBe(0);
 		fs.writeFileSync(registryFilePath(), JSON.stringify({ instances: [] }));
 
 		await registry.updateHeartbeat();
@@ -300,5 +351,19 @@ describe("instance registry across a session replacement (#3498)", () => {
 
 		expect(ownEntry()).toBeUndefined();
 		await expectSessionTwoRegistersAlone();
+	}, 15_000);
+
+	it("removes a secondary root after a peer holds the lock past the sync wait and one async wait", async () => {
+		await registry.registerInstance(ROOT_A);
+		await registry.registerInstanceRoot(ROOT_SECONDARY);
+		// Same shape as the whole-entry case above: the peer's lock ages out of
+		// the 5 s lease about 2 s from now, past the 500 ms sync wait and one
+		// ordinary 500 ms async wait, but inside `LOCK_WAIT_THROUGH_LEASE_MS`.
+		peerHolds(3_000);
+		const removal = registry.deregisterInstanceRoot(ROOT_SECONDARY);
+		await removal;
+		await registry._settleRegistryMutationsForTests();
+
+		expect(ownEntry()?.projectRoots).toEqual([normalizeFilePath(ROOT_A)]);
 	}, 15_000);
 });

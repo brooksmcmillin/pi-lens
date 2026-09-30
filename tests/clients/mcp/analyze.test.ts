@@ -2,8 +2,8 @@
  * analyzeFile facade: runs the dispatch pipeline and maps the DispatchResult +
  * latency report into the JSON contract the MCP server returns.
  *
- * dispatchForFile + getLatencyReports are mocked (as in the dispatch-integration
- * suite) so the test asserts the *mapping* and the Tier-1 behaviours (warm LSP,
+ * dispatchForFile is mocked (as in the dispatch-integration suite) so the test
+ * asserts the *mapping* and the Tier-1 behaviours (warm LSP,
  * full/blocking-only, recording), not real runner execution. getLSPService is
  * mocked so warm-up never spawns a real language server.
  */
@@ -24,7 +24,6 @@ vi.mock("../../../clients/dispatch/dispatcher.js", async (importOriginal) => {
 	return {
 		...mod,
 		dispatchForFile: vi.fn(),
-		getLatencyReports: vi.fn(() => []),
 	};
 });
 
@@ -56,10 +55,7 @@ vi.mock("../../../clients/review-graph/service.js", () => ({
 	buildOrUpdateGraph: mockBuildOrUpdateGraph,
 }));
 
-import {
-	dispatchForFile,
-	getLatencyReports,
-} from "../../../clients/dispatch/dispatcher.js";
+import { dispatchForFile } from "../../../clients/dispatch/dispatcher.js";
 import { CacheManager } from "../../../clients/cache-manager.js";
 import { resetDispatchBaselines } from "../../../clients/dispatch/integration.js";
 import { getDiagnosticTracker } from "../../../clients/diagnostic-tracker.js";
@@ -118,8 +114,6 @@ beforeEach(() => {
 	resetDispatchBaselines();
 	clearWidgetState();
 	vi.mocked(dispatchForFile).mockReset();
-	vi.mocked(getLatencyReports).mockReset();
-	vi.mocked(getLatencyReports).mockReturnValue([]);
 	mockTouchFile.mockClear();
 	mockSupportsLSP.mockReset();
 	mockSupportsLSP.mockReturnValue(false);
@@ -177,23 +171,21 @@ describe("analyzeFile", () => {
 	});
 
 	it("counts a deferred LSP runner as ran while preserving its status", async () => {
-		vi.mocked(dispatchForFile).mockResolvedValue(emptyResult);
-		vi.mocked(getLatencyReports)
-			.mockReturnValueOnce([])
-			.mockReturnValueOnce([
-				{
-					filePath: tsFile,
-					fileKind: "jsts",
-					runners: [
-						{
-							runnerId: "lsp",
-							status: "deferred",
-							diagnosticCount: 0,
-							durationMs: 10,
-						},
-					],
-				},
-			] as never);
+		vi.mocked(dispatchForFile).mockResolvedValue({
+			...emptyResult,
+			latencyReport: {
+				filePath: tsFile,
+				fileKind: "jsts",
+				runners: [
+					{
+						runnerId: "lsp",
+						status: "deferred",
+						diagnosticCount: 0,
+						durationMs: 10,
+					},
+				],
+			},
+		} as never);
 
 		const result = await analyzeFile(tsFile, tmpDir);
 
@@ -226,9 +218,10 @@ describe("analyzeFile", () => {
 			warnings: 0,
 		};
 
-		vi.mocked(getLatencyReports)
-			.mockReturnValueOnce([])
-			.mockReturnValueOnce([report]);
+		vi.mocked(dispatchForFile).mockResolvedValue({
+			...emptyResult,
+			latencyReport: report,
+		});
 
 		const result = await analyzeFile(tsFile, tmpDir);
 
@@ -252,6 +245,102 @@ describe("analyzeFile", () => {
 				},
 			],
 		});
+	});
+
+	it("attaches the latency report even when the ring is already at its 100-entry cap (#3642)", async () => {
+		// dispatcher.ts:1444-1449 pushes then shifts once length > 100, so a
+		// full ring's length is UNCHANGED by this dispatch's push (100 -> 100).
+		// analyzeFile must still find the report it just caused, not rely on a
+		// length delta.
+		const newestReport: DispatchLatencyReport = {
+			filePath: tsFile,
+			fileKind: "jsts",
+			overallStartMs: 0,
+			overallEndMs: 1200,
+			totalDurationMs: 1200,
+			runners: [
+				{
+					runnerId: "lsp",
+					startTime: 0,
+					endTime: 1000,
+					durationMs: 1000,
+					status: "succeeded",
+					diagnosticCount: 0,
+					semantic: "blocking",
+				},
+			],
+			stoppedEarly: false,
+			totalDiagnostics: 0,
+			blockers: 0,
+			warnings: 0,
+		};
+		// The returned object is the dispatch identity even when the ring evicts
+		// an older entry and keeps its length at 100.
+		vi.mocked(dispatchForFile).mockResolvedValue({
+			...emptyResult,
+			latencyReport: newestReport,
+		});
+
+		const result = await analyzeFile(tsFile, tmpDir);
+
+		expect(result.latency).toBeDefined();
+		expect(result.latency).toEqual({
+			totalDurationMs: 1200,
+			stoppedEarly: false,
+			runners: [
+				{
+					runnerId: "lsp",
+					durationMs: 1000,
+					status: "succeeded",
+					diagnosticCount: 0,
+				},
+			],
+		});
+	});
+
+	it("does not attach a foreign report when dispatch appends nothing", async () => {
+		vi.mocked(dispatchForFile).mockResolvedValue(emptyResult);
+
+		const result = await analyzeFile(tsFile, tmpDir);
+
+		expect(result.latency).toBeUndefined();
+		expect(result.fileKind).toBeUndefined();
+	});
+
+	it("keeps below-cap attribution from the dispatch identity", async () => {
+		const report = {
+			filePath: "app\\ts",
+			fileKind: "jsts",
+			runners: [],
+			totalDurationMs: 12,
+			stoppedEarly: false,
+		};
+		vi.mocked(dispatchForFile).mockResolvedValue({
+			...emptyResult,
+			latencyReport: report,
+		} as never);
+
+		const result = await analyzeFile(tsFile, tmpDir);
+
+		expect(result.latency?.totalDurationMs).toBe(12);
+	});
+
+	it("uses the carried dispatch report instead of a ring neighbour", async () => {
+		const carried = {
+			filePath: tsFile,
+			fileKind: "jsts",
+			runners: [],
+			totalDurationMs: 22,
+			stoppedEarly: false,
+		};
+		vi.mocked(dispatchForFile).mockResolvedValue({
+			...emptyResult,
+			latencyReport: carried,
+		} as never);
+
+		const result = await analyzeFile(tsFile, tmpDir);
+
+		expect(result.latency?.totalDurationMs).toBe(22);
 	});
 
 	it("returns an empty result (no latency) for an unsupported file kind", async () => {

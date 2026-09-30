@@ -1,6 +1,17 @@
 export declare const DEFAULT_MAX_FILES: 6;
 export declare const DEFAULT_MAX_RANGES: 40;
+export declare const DEFAULT_MAX_TESTS: 47;
 export declare const MUTATION_BUDGET_MINUTES: 60;
+export declare class MutationLaneExclusionError extends Error {
+	constructor(file: string);
+}
+export declare function mutationLaneExclusion(
+	file: string,
+	options?: {
+		readFile?: (file: string) => string;
+		exclusions?: Record<string, { reason?: string }>;
+	},
+): { file: string; reason: string } | null;
 export declare function capMutationFiles(
 	files: string[],
 	maxFiles?: number,
@@ -10,6 +21,15 @@ export declare function formatCapNotice(
 	totalCount: number,
 	skipped: string[],
 ): string;
+export declare function formatTestCapNotice(
+	selectedCount: number,
+	totalCount: number,
+): string;
+export declare function capRelatedTests(
+	tests: string[],
+	maxTests?: number,
+	priorities?: Map<string, number>,
+): { selected: string[]; dropped: string[] };
 export declare const isScriptMutationFile: (file: string) => boolean;
 export declare const isCompiledMutationSource: (file: string) => boolean;
 export declare const isMutationSourceFile: (file: string) => boolean;
@@ -19,12 +39,15 @@ export declare function mapRelatedTests(
 	options?: {
 		testFiles?: string[];
 		readFile?: (file: string) => string;
+		exclusions?: Record<string, { reason?: string }>;
 	},
 ): {
 	related: Map<string, Set<string>>;
 	covered: string[];
 	uncovered: string[];
 	tests: string[];
+	excluded: Array<{ file: string; reason: string }>;
+	priorities: Map<string, number>;
 };
 export declare function parseChangedLineRanges(
 	diffText: string,
@@ -40,6 +63,7 @@ export declare function describeStrykerFailure(
 		error?: Error & { code?: string };
 	},
 	budgetMinutes: number,
+	options?: { tests?: string[]; output?: string },
 ): string;
 export declare function describePartialInterruptCause(
 	result: {

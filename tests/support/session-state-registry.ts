@@ -1662,7 +1662,11 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"quiet-window-config.ts": 0,
 	"quiet-window.ts": 0,
 	"recent-touches.ts": 1,
-	"review-graph/builder.ts": 19,
+	// #3605: 19 -> 20 for _wasmTrappedFiles, process-lifetime like the
+	// tree-sitter client's trap map it follows: a session boundary resets
+	// neither the wasm heap nor the client's charges, and each extraction
+	// rewrites its file's entry, so a session_start clear would re-arm nothing.
+	"review-graph/builder.ts": 20,
 	// #3417: the module-level git-dir memo is gone; the count is pinned at 0 so a
 	// re-hoisted memo (the stale-negative shape) fails this sweep, not just the
 	// lifecycle test.

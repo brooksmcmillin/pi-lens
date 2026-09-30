@@ -1,10 +1,51 @@
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { normalizeEphemeralMapKey } from "../../clients/path-utils.js";
 import { mapGeneratedLineToOriginal } from "./mutation-source-map.mjs";
 
 const IMPORT_SPECIFIER_RE =
 	/(?:from\s+|import\s*(?:\(\s*)?|require\(\s*)["']([^"']+)["']/g;
+const MUTATION_LANE_EXCLUSION_RE = /^\s*\/\/\s*mutation-lane:\s*exclude\s*$/m;
+const MUTATION_LANE_EXCLUSIONS_PATH =
+	"tests/config/stryker-diff-exclusions.json";
+
+export class MutationLaneExclusionError extends Error {
+	constructor(file) {
+		super(`mutation lane exclusion marker has no checked reason: ${file}`);
+		this.name = "MutationLaneExclusionError";
+	}
+}
+
+function mutationLaneExclusions() {
+	try {
+		return JSON.parse(readFileSync(MUTATION_LANE_EXCLUSIONS_PATH, "utf8"));
+	} catch {
+		return {};
+	}
+}
+
+/** @param {string} file @param {{readFile?: (file: string) => string, exclusions?: Record<string, {reason?: string}>}} [options] */
+export function mutationLaneExclusion(
+	file,
+	{
+		readFile = (candidate) => readFileSync(candidate, "utf8"),
+		exclusions = mutationLaneExclusions(),
+	} = {},
+) {
+	let source;
+	try {
+		source = readFile(file);
+	} catch {
+		return null;
+	}
+	if (!MUTATION_LANE_EXCLUSION_RE.test(source)) return null;
+	const admission = exclusions[file];
+	if (!admission?.reason) {
+		throw new MutationLaneExclusionError(file);
+	}
+	return { file, reason: admission.reason };
+}
 
 export const DEFAULT_MAX_FILES = 6;
 
@@ -16,6 +57,15 @@ export const DEFAULT_MAX_FILES = 6;
  * ranges themselves.
  */
 export const DEFAULT_MAX_RANGES = 40;
+
+// Bounded 2026-09-29 command-run measurement and its raw output are recorded
+// in tests/fixtures/mutation-test-cap-measurement.json. Three fixed LSP suites
+// 1.51 seconds per suite process; 47 therefore projects to about 71 seconds,
+// leaving about 58 minutes 49 seconds of the 60-minute budget for mutants and
+// build/report overhead. Stryker's dry-run server was EPERM-blocked in this
+// sandbox, so this is explicitly a bounded process-cost proxy, not a claim
+// about mutant execution cost.
+export const DEFAULT_MAX_TESTS = 47;
 
 /**
  * Wall-clock bound the driver puts on the Stryker child, in minutes. It must
@@ -227,8 +277,24 @@ function strykerFailureCause(result, budgetMinutes) {
  * @param {{status: number|null, signal?: string|null, error?: Error & {code?: string}}} result
  * @param {number} budgetMinutes
  */
-export function describeStrykerFailure(result, budgetMinutes) {
-	return `mutation diff: no mutants evaluated; ${strykerFailureCause(result, budgetMinutes)}`;
+export function describeStrykerFailure(
+	result,
+	budgetMinutes,
+	{ tests = [], output = "" } = {},
+) {
+	const failed = [
+		...new Set(
+			[...output.matchAll(/(?:FAIL|×|❯)\s+(tests\/[^\s:]+)/g)].map(
+				(match) => match[1],
+			),
+		),
+	];
+	const named = failed.length > 0 ? failed : tests;
+	const suffix =
+		named.length > 0
+			? `; tests involved: ${named.join(", ")}`
+			: "; no related test file was identified";
+	return `mutation diff: dry run failed; no mutants evaluated; ${strykerFailureCause(result, budgetMinutes)}${suffix}`;
 }
 
 /**
@@ -245,6 +311,56 @@ export function describePartialInterruptCause(result, budgetMinutes) {
 
 export function formatCapNotice(selectedCount, totalCount, skipped) {
 	return `capped: ${selectedCount} of ${totalCount} changed files mutated; skipped: ${skipped.join(", ")}`;
+}
+
+export function formatTestCapNotice(selectedCount, totalCount) {
+	return `capped: ${selectedCount} of ${totalCount} related tests selected; dropped: ${totalCount - selectedCount}`;
+}
+
+/**
+ * Bound the test population without changing any under-cap selection. Sibling
+ * tests are first, then tests with a direct import, then any future incidental
+ * relations. Ties use the normalized path and then the original index for
+ * exact duplicate paths, making a capped selection reproducible even when
+ * directory enumeration changes.
+ *
+ * @param {string[]} tests
+ * @param {number} maxTests
+ * @param {Map<string, number>} [priorities]
+ */
+export function capRelatedTests(
+	tests,
+	maxTests = DEFAULT_MAX_TESTS,
+	priorities = new Map(),
+) {
+	if (!Number.isInteger(maxTests) || maxTests < 0) {
+		throw new RangeError("maxTests must be a non-negative integer");
+	}
+	if (tests.length <= maxTests) return { selected: tests, dropped: [] };
+	const ranked = tests
+		.map((test, index) => ({
+			test,
+			index,
+			pathKey: normalizeEphemeralMapKey(test),
+			priority: priorities.get(test) ?? 2,
+		}))
+		.sort(
+			(a, b) =>
+				a.priority - b.priority ||
+				(a.pathKey < b.pathKey ? -1 : a.pathKey > b.pathKey ? 1 : 0) ||
+				a.index - b.index,
+		);
+	const selectedSet = new Set(
+		ranked.slice(0, maxTests).map(({ test }) => test),
+	);
+	return {
+		selected: ranked
+			.filter(({ test }) => selectedSet.has(test))
+			.map(({ test }) => test),
+		dropped: ranked
+			.filter(({ test }) => !selectedSet.has(test))
+			.map(({ test }) => test),
+	};
 }
 
 /**
@@ -286,31 +402,53 @@ export function mapRelatedTests(
 	{
 		testFiles = collectTestFiles("tests"),
 		readFile = (file) => readFileSync(file, "utf8"),
+		exclusions = mutationLaneExclusions(),
 	} = {},
 ) {
 	const sources = changedFiles.filter(isMutationSourceFile);
 	const related = new Map(sources.map((file) => [file, new Set()]));
+	const priorities = new Map();
+	const excluded = new Map();
 	const testContents = testFiles.map((test) => {
+		let content;
 		try {
-			return [test, readFile(test)];
+			content = readFile(test);
 		} catch {
-			return [test, null];
+			return [test, null, null];
 		}
+		const exclusion = mutationLaneExclusion(test, {
+			readFile: () => content,
+			exclusions,
+		});
+		return [test, content, exclusion];
 	});
 
 	for (const file of sources) {
 		const sibling = conventionalTestSibling(file);
-		if (testFiles.some((test) => normalized(test) === normalized(sibling))) {
-			related.get(file).add(sibling);
+		const siblingEntry = testContents.find(
+			([test]) => normalized(test) === normalized(sibling),
+		);
+		if (siblingEntry) {
+			const siblingExclusion = siblingEntry[2];
+			if (siblingExclusion) excluded.set(sibling, siblingExclusion);
+			else {
+				related.get(file).add(sibling);
+				priorities.set(sibling, 0);
+			}
 		}
 		const target = normalized(file);
-		for (const [test, content] of testContents) {
+		for (const [test, content, exclusion] of testContents) {
 			if (content === null) continue;
 			for (const specifier of extractRelativeSpecifiers(content)) {
 				const imported = normalized(
 					path.resolve(path.dirname(test), specifier),
 				);
-				if (imported === target) related.get(file).add(test);
+				if (imported !== target) continue;
+				if (exclusion) excluded.set(test, exclusion);
+				else {
+					related.get(file).add(test);
+					if (!priorities.has(test)) priorities.set(test, 1);
+				}
 			}
 		}
 	}
@@ -320,6 +458,8 @@ export function mapRelatedTests(
 		covered: sources.filter((file) => related.get(file).size > 0),
 		uncovered: sources.filter((file) => related.get(file).size === 0),
 		tests: [...new Set([...related.values()].flatMap((files) => [...files]))],
+		priorities,
+		excluded: [...excluded.values()],
 	};
 }
 

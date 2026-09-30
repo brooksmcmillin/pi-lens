@@ -116,6 +116,20 @@ export function classifyCleanBehavior(obs) {
 }
 
 /**
+ * The server id a probe row's publish trace is scoped to. `servers` is what
+ * `getServersForFileWithConfig(absFile)` returned. #3665: an auxiliary fixture
+ * (ast-grep, opengrep, zizmor, typos) measures the AUXILIARY's publishes, so
+ * the id comes from the fixture's own declaration; resolving it by role picked
+ * the file's primary (typescript, yaml, marksman) and scoped the row to the
+ * wrong server's trace.
+ */
+export function resolveProbeServerId(fx, servers) {
+	const auxId = fx.auxiliaryServerIds?.[0];
+	if (auxId) return auxId;
+	return servers.find((server) => server.role !== "auxiliary")?.id;
+}
+
+/**
  * Keep a phase trace scoped to the server whose row is being measured. The
  * extension log is shared by every live LSP client in the process.
  */

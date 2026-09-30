@@ -40,6 +40,10 @@ const NOT_A_FIXTURE = [
 	// #2758: runs `git diff` on the real CI checkout to find changed files
 	// for Stryker mutation testing — drives the real checkout, not a fixture.
 	"scripts/stryker-diff.mjs",
+	// #3674: asks the real clone for its main worktree and writes the real
+	// clone's core.hooksPath -- the fixture env pins GIT_CONFIG_GLOBAL at
+	// `<cwd>/gitconfig` and would hide the config this script must honour.
+	"scripts/setup-git-hooks.mjs",
 ] as const;
 
 const REPO_ROOT = path.resolve(__dirname, "../..");

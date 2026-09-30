@@ -20,6 +20,7 @@ import extension from "../index.js";
 import {
 	_resetSessionLifecycleForTests,
 	getActivePrimaryRoot,
+	getActiveSessionId,
 	getSecondarySessionCount,
 } from "../clients/session-lifecycle.js";
 import {
@@ -289,6 +290,53 @@ describe("session_start keys on the project root (#2129 wiring)", () => {
 		expect(getSecondarySessionCount()).toBe(0);
 		expect(getActivePrimaryRoot()).toContain(path.basename(tempWorktree));
 	}, 30_000);
+
+	for (const gapRoot of ["host", "temp"] as const) {
+		it(`a ${gapRoot}-root subagent in the reload gap does not demote the primary (#3662)`, async () => {
+			// The release above (#2129 F3) leaves no registered primary between a
+			// replacement shutdown and its successor's start. A subagent binding in
+			// that gap used to register as primary, so the reloaded session's own
+			// start probed a live foreign ctx, classified concurrent-secondary and
+			// skipped handleSessionStart.
+			const pi = createPiMock();
+			extension(pi.asExtensionAPI());
+			const hostCtx = makeCtx({ cwd: hostRoot, sessionId: "host-session" });
+			await pi.emit("session_start", makeSessionStartEvent(), hostCtx);
+			// pi `reload()`: session_shutdown{reason:"reload"}, then invalidate.
+			await pi.emit("session_shutdown", { reason: "reload" }, hostCtx);
+			invalidate(hostCtx);
+
+			const subagent = createPiMock();
+			extension(subagent.asExtensionAPI());
+			const subagentCtx = makeCtx({
+				cwd: gapRoot === "host" ? hostRoot : tempWorktree,
+				sessionId: "subagent-session",
+			});
+			await subagent.emit(
+				"session_start",
+				makeSessionStartEvent(),
+				subagentCtx,
+			);
+			expect(getActiveSessionId()).toBeUndefined();
+			expect(getSecondarySessionCount()).toBe(1);
+
+			// The factory re-runs on reload; the same session announces itself.
+			const reloaded = createPiMock();
+			extension(reloaded.asExtensionAPI());
+			await reloaded.emit(
+				"session_start",
+				makeSessionStartEvent({ reason: "reload" }),
+				makeCtx({ cwd: hostRoot, sessionId: "host-session" }),
+			);
+			expect(getActiveSessionId()).toBe("host-session");
+			expect(getActivePrimaryRoot()).toContain(path.basename(hostRoot));
+
+			// The gap subagent owns a secondary role: its shutdown must not
+			// release the successor's registration.
+			await subagent.emit("session_shutdown", {}, subagentCtx);
+			expect(getActiveSessionId()).toBe("host-session");
+		}, 30_000);
+	}
 
 	it("still runs a same-root replacement as the primary", async () => {
 		const pi = createPiMock();

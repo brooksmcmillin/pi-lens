@@ -24,10 +24,13 @@ import {
 	COMPARABLE_FIRST_PUBLISH,
 	createPublishTraceDrainer,
 	findCleanSignalDrift,
+	resolveProbeServerId,
 	strategyKeyForLang,
 } from "../../scripts/lib/clean-signal.mjs";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
+import { createProbeFixture } from "../../scripts/lib/probe-fixture.mjs";
 import {
 	mergeRows,
 	mergeSrc,
@@ -78,6 +81,139 @@ describe("classifyCleanBehavior (phase-aware 4-way)", () => {
 				cleanTransitionVersioned: 1,
 			}).behavior,
 		).toBe("publishes-versioned");
+	});
+	it("scopes an auxiliary fixture's trace to the auxiliary, not the file's primary (#3665)", () => {
+		// #3665 recurrence (the inverse of #3390): the probe resolved serverId by
+		// `role !== "auxiliary"`, so the ast-grep row read typescript's two
+		// unversioned publishes instead of ast-grep's three versioned ones.
+		const bytes = fs.readFileSync(
+			path.join(
+				process.cwd(),
+				"tests/fixtures/extension-logs/probe-clean-signal-interleaved.log",
+			),
+		);
+		const drainFor = (serverId: string | undefined) => {
+			const drain = createPublishTraceDrainer({
+				readLog() {
+					return {
+						size: bytes.length,
+						read(start) {
+							const chunk = bytes.subarray(start).toString("utf8");
+							return { chunk, bytesRead: bytes.length - start };
+						},
+					};
+				},
+			});
+			const sink: DrainedPublish[] = [];
+			drain(sink, serverId as string);
+			return sink;
+		};
+		// `getServersForFileWithConfig` order for a .ts file with the ast-grep aux.
+		const servers = [
+			{ id: "typescript" },
+			{ id: "ast-grep", role: "auxiliary" },
+		];
+		const auxFixture = { lang: "ast-grep", auxiliaryServerIds: ["ast-grep"] };
+		const primaryFixture = { lang: "typescript" };
+
+		const auxId = resolveProbeServerId(auxFixture, servers);
+		expect(auxId).toBe("ast-grep");
+		const auxTrace = drainFor(auxId);
+		expect(auxTrace.map((p) => p.versioned)).toEqual([true, true, true]);
+		expect(auxTrace.every((p) => p.server === "ast-grep")).toBe(true);
+
+		// #3390 behaviour kept: a non-auxiliary fixture still resolves the primary.
+		const primaryId = resolveProbeServerId(primaryFixture, servers);
+		expect(primaryId).toBe("typescript");
+		expect(drainFor(primaryId).map((p) => p.versioned)).toEqual([false, false]);
+	});
+	it("probeFixture attributes an auxiliary row to the auxiliary's own publishes (#3665 call site)", async () => {
+		// #3665 recurrence: the unit test above pinned the helper, while a revert
+		// of the CALL SITE to the primary-by-role expression stayed green. This
+		// drives the production row construction (`createProbeFixture`, the step
+		// scripts/probe-clean-signal.mjs runs per fixture) with a fake LSP whose
+		// touches append the saved interleaved typescript/ast-grep window to the
+		// log the real drainer reads: dirty touch = ts(unversioned), ast-grep v1,
+		// ast-grep v2; clean touch = ts(unversioned), ast-grep v3.
+		const lines = fs
+			.readFileSync(
+				path.join(
+					process.cwd(),
+					"tests/fixtures/extension-logs/probe-clean-signal-interleaved.log",
+				),
+				"utf8",
+			)
+			.trimEnd()
+			.split("\n")
+			.slice(4);
+		const phases = [lines.slice(0, 3), lines.slice(3)];
+		let log = Buffer.alloc(0);
+		const drain = createPublishTraceDrainer({
+			readLog() {
+				return {
+					size: log.length,
+					read(start) {
+						const chunk = log.subarray(start).toString("utf8");
+						return { chunk, bytesRead: log.length - start };
+					},
+				};
+			},
+		});
+		const dst = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-probe-fixture-"),
+		);
+		try {
+			const absFile = path.join(dst, "sample.ts");
+			fs.writeFileSync(absFile, "export const x = 1;\n");
+			let touches = 0;
+			const probeFixture = createProbeFixture({
+				lsp: {
+					supportsLSP: () => true,
+					async touchFile() {
+						const next = phases[touches++] ?? [];
+						log = Buffer.concat([log, Buffer.from(`${next.join("\n")}\n`)]);
+						return [];
+					},
+					getWorkspaceDiagnosticsSupport: async () => ({ mode: "push-only" }),
+				},
+				repoRoot: process.cwd(),
+				install: false,
+				initLSPConfig: undefined,
+				getServersForFileWithConfig: () => [
+					{ id: "typescript" },
+					{ id: "ast-grep", role: "auxiliary" },
+				],
+				bootstrapFixtureWorkspace: async () => ({ absFile }),
+				drainPublishTrace: drain,
+				pubLogSize: () => log.length,
+				sleep: async () => undefined,
+			});
+			const row = {
+				lang: "ast-grep",
+				serverId: undefined as string | undefined,
+				behavior: "unknown",
+				tier: 0,
+				tierLabel: "",
+				mode: "?",
+				detail: "",
+				firstPublish: "unknown",
+				cleanFixture: false,
+			};
+			await probeFixture(
+				{
+					lang: "ast-grep",
+					file: "sample.ts",
+					auxiliaryServerIds: ["ast-grep"],
+				},
+				dst,
+				row,
+			);
+			expect(row.serverId).toBe("ast-grep");
+			expect(row.behavior).toBe("publishes-versioned");
+			expect(row.detail).toContain("dirtyPubs=2(v:2) cleanPubs=1(v:1)");
+		} finally {
+			fs.rmSync(dst, { recursive: true, force: true });
+		}
 	});
 	it("classifies a versioned clean-transition publisher as publishes-versioned (tier 2)", () => {
 		// ast-grep-shaped: re-publishes WITH a version on a clean transition.

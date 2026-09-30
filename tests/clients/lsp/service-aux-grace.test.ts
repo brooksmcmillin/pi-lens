@@ -47,6 +47,17 @@ vi.mock("../../../clients/lsp/client.js", () => ({
 	createLSPClient,
 }));
 
+// #3570: load the real lens_diagnostics graph once at collection, outside any
+// budget. The #2776 case below imports it after `vi.resetModules()`, and the
+// fork's first load measured 5.5 s of that case's 5.8 s (Vitest transforming
+// each module the first time); an already-transformed graph re-evaluates in
+// about 0.2 s. On a loaded host the first load alone crossed the 5 s test
+// default, and the timed-out body then ran on into later cases and consumed
+// their `createLSPClient` answers. A top-level `await`, not a static import:
+// the mock factories above read `const`s that a hoisted import would reach
+// before they are initialized.
+await import("../../../tools/lens-diagnostics.js");
+
 const FILE = "C:/repo/main.ts";
 /** A second file under the SAME root, so both share one auxiliary client. */
 const OTHER_FILE = "C:/repo/other.ts";
@@ -73,6 +84,7 @@ function makePrimaryServer(id: string, ext = ".ts") {
 		id,
 		name: id,
 		extensions: [ext],
+		idleEviction: "resident",
 		root: async () => "C:/repo",
 		spawn: vi.fn(async () => ({
 			process: makeFakeProcess(),
@@ -87,6 +99,7 @@ function makeAuxServer(id: string, ext = ".ts", projectRoot = "C:/repo") {
 		id,
 		name: id,
 		extensions: [ext],
+		idleEviction: "resident",
 		role: "auxiliary" as const,
 		root: async () => projectRoot,
 		spawn: vi.fn(async () => ({

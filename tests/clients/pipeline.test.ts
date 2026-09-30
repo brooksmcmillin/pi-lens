@@ -1459,6 +1459,52 @@ describe("Pipeline", () => {
 		});
 	});
 
+	describe("Cascade compute rejection (#3605)", () => {
+		const { WebAssembly } = globalThis as unknown as {
+			WebAssembly: { RuntimeError: new (message: string) => Error };
+		};
+
+		async function cascadeAfterRejection(error: Error) {
+			const filePath = createTempFile(tmpDir, "cascade-throws.ts", "x");
+			vi.mocked(dispatchLintWithResult).mockResolvedValue({
+				diagnostics: [],
+				blockers: [],
+				warnings: [],
+				baselineWarningCount: 0,
+				fixed: [],
+				resolvedCount: 0,
+				output: "",
+				blockerOutput: "",
+				hasBlockers: false,
+			});
+			vi.mocked(computeCascadeForFile).mockRejectedValueOnce(error);
+			const result = await runPipeline(
+				createMockContext(filePath),
+				createMockDeps(),
+			);
+			return (await result.cascadePromise)?.indeterminate;
+		}
+
+		it("reports a tree-sitter wasm trap as a degraded graph, not a compute error", async () => {
+			// The per-edit cascade turned the reporter's wasm trap into
+			// `cascade_indeterminate` / `error`.
+			expect(
+				await cascadeAfterRejection(
+					new WebAssembly.RuntimeError("table index is out of bounds"),
+				),
+			).toEqual({
+				reason: "graph_degraded",
+				detail: "review graph degraded — tree-sitter wasm runtime failure",
+			});
+		});
+
+		it("still reports any other rejection as a compute error", async () => {
+			expect(await cascadeAfterRejection(new TypeError("cascade bug"))).toEqual(
+				{ reason: "error", detail: "cascade computation failed" },
+			);
+		});
+	});
+
 	describe("Test runner", () => {
 		it("skips tests when --no-tests flag is set", async () => {
 			const filePath = createTempFile(tmpDir, "app.ts", "const x = 1;");

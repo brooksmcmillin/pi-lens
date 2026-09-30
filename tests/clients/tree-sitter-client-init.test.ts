@@ -281,7 +281,7 @@ describe("tree-sitter-client wasm resolution", () => {
 		expect(trees[0].delete).toHaveBeenCalledTimes(1);
 	});
 
-	it("reports an abort thrown by a cache-safe consumer", async () => {
+	it("reports an abort thrown by a cache-safe consumer and degrades that file", async () => {
 		const onWasmAbort = vi.fn();
 		const client = new TreeSitterClient(false, onWasmAbort);
 		const state = client as unknown as {
@@ -291,6 +291,8 @@ describe("tree-sitter-client wasm resolution", () => {
 			parse: () => ({ rootNode: { type: "program" } }),
 		});
 
+		// #3605: not-parsed, like an abort during the parse itself. The rethrow
+		// rejected a whole review-graph build for one file.
 		await expect(
 			client.withParsedTree(
 				"virtual.ts",
@@ -300,7 +302,7 @@ describe("tree-sitter-client wasm resolution", () => {
 					throw new Error("Aborted()");
 				},
 			),
-		).rejects.toThrow("Aborted()");
+		).resolves.toEqual({ parsed: false });
 		expect(onWasmAbort).toHaveBeenCalledTimes(1);
 		expect(client.isAvailable()).toBe(false);
 	});

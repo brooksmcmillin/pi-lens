@@ -119,6 +119,10 @@
  *     `${G} stash`, `$(which git) stash`): no static text scan can resolve
  *     a runtime-computed word.
  *   - `require(mod)` with a variable specifier, for the probe rule.
+ *   - `kill $(pgrep -f tlc2.TLC)` and `pgrep -f tlc2 | xargs kill` (#3556
+ *     review F6): the same machine-wide kill harm `sharedKill` denies, but
+ *     `pgrep` alone only lists PIDs -- nothing in this scan currently
+ *     recognizes the KILLING half of that two-command shape.
  *
  * These are documented blind spots, not silent ones: the guard's threat
  * model is an agent's own slip, not a party deliberately hiding a command
@@ -143,7 +147,7 @@ import {
 } from "node:path";
 import { fileURLToPath } from "node:url";
 
-/** @typedef {"stash"|"reset"|"worktreeForce"|"worktreeSymlink"|"probe"|"tmpdirCollision"} DenyRule */
+/** @typedef {"stash"|"reset"|"worktreeForce"|"worktreeSymlink"|"probe"|"tmpdirCollision"|"sharedKill"|"tmpCheckout"|"checkUngated"} DenyRule */
 
 /** @type {Record<DenyRule, string>} */
 export const RULE_MESSAGES = {
@@ -159,6 +163,12 @@ export const RULE_MESSAGES = {
 		"an unpinned node probe that LOADS runtime code from clients/ or dist/ is forbidden (AGENTS.md Probe hygiene) -- prefix `PI_LENS_HOME=<worktree>/.probe-home`.",
 	tmpdirCollision:
 		"TMPDIR/TMP/TEMP must not point at the vitest harness home (AGENTS.md Probe hygiene) -- tests/support/vitest-setup.ts keeps the real TMPDIR on purpose and mkdtemps PI_LENS_HOME under os.tmpdir(), so a TMPDIR inside `.probe-home` moves the harness home into a git-ignored directory in the worktree and reds unrelated suites (#3026). Pin PI_LENS_HOME/PILENS_DATA_DIR there; give TMPDIR its own directory.",
+	sharedKill:
+		"pkill/killall with a bare (unscoped) pattern is forbidden (#3556) -- it matches machine-wide and can kill another concurrent session's TLC/vitest/etc run on this shared host -- kill the recorded PID of your own background job instead (`kill <pid>`), or use `pkill -f` with a pattern that includes your worktree's absolute path so only your own processes match.",
+	tmpCheckout:
+		"a checkout or scratch directory under /tmp is forbidden (#3526) -- /tmp on the maintainer host is tmpfs (RAM + swap; #2912 saw inode exhaustion there) and review/merge scratch checkouts filled it to 8/8 GB swap -- use `~/.local/share/pi-lens-orchestrator/tmp/<lane>` for orchestrator/reviewer scratch, `<worktree>/../probes-<pr>` for probe files, or `.claude/worktrees/` for a fixer's own worktree.",
+	checkUngated:
+		"a `git commit`/`git push` chained after a check (`npm run lint`/`build`/`test`/`fmt:check`/`preflight`, `npx vitest`, `tsc`, `node scripts/check-*.mjs`) through `;` or a pipe, rather than `&&`, is forbidden (#3471) -- the check's exit code gates nothing that way, so a real failure can still get committed or pushed; gate it with `&&`, or read the check's result in its own separate call.",
 };
 
 /**
@@ -179,6 +189,44 @@ const WORD_BREAK = /[\s;&|<>]/;
  * makes `(git stash)` and `( cd x && git stash )` reachable.
  */
 const SEGMENT_SEPARATOR = /[;&|()\n]/;
+
+/**
+ * Is `text[i]` (already known to match {@link SEGMENT_SEPARATOR}) actually a
+ * live separator, or a `&` that is part of a REDIRECTION rather than the
+ * background operator / half of `&&`? Found while building #3471's
+ * `checkUngated` rule: `npm run lint >/dev/null 2>&1 && git commit …` (the
+ * issue's own case 1, rewritten with `&&` -- exactly the form the rule must
+ * ALLOW) split into three bogus segments ("…2>", "1", "… git commit …")
+ * because the lone `&` inside `2>&1` matched {@link SEGMENT_SEPARATOR}
+ * unconditionally; the accumulated separator text on the segment after it
+ * happened to still read "&&" only by coincidence of THIS example's spacing,
+ * which is exactly why measuring caught it, not code review. MEASURED
+ * against real bash (`bash -c 'echo A 2>&1 && echo B'`, `'echo A >f 2>&1 &&
+ * echo B'`, `'echo A &> f && echo B'`, `'echo A 1>&2 && echo B'`, all in the
+ * PR body): `N>&M`/`>&M`/`<&M` (an fd-duplication target) and `&>`/`&>>`
+ * (bash's redirect-both form) are single redirection tokens, never a
+ * background operator or half of `&&` -- the following `&&` still gates on
+ * the command BEFORE the redirection, not split by it. Detected the same
+ * way a heredoc delimiter already is elsewhere in this file: by the RAW
+ * source characters immediately before/after `text[i]`, which segment
+ * splitting can read directly without a separate quote/comment-aware pass
+ * (this scan only ever runs after {@link lexRegions} has already resolved
+ * quotes, comments, and substitutions, so no quoted `&` reaches here).
+ *
+ * @param {string} text
+ * @param {number} i
+ * @returns {boolean}
+ */
+function isLiveSeparator(text, i) {
+	const ch = text[i];
+	if (!SEGMENT_SEPARATOR.test(ch)) return false;
+	if (
+		ch === "&" &&
+		(text[i - 1] === ">" || text[i - 1] === "<" || text[i + 1] === ">")
+	)
+		return false;
+	return true;
+}
 
 /**
  * Characters a backslash escapes INSIDE a double-quoted span (bash: every
@@ -546,66 +594,20 @@ export function scannableRegions(commandText) {
 }
 
 /**
- * Split one scannable region into simple-command segments. Only quote
- * state matters here: {@link lexRegions} has already removed every
- * substitution, heredoc body and comment, so there is nothing else left
- * that could hide a separator.
+ * Split one scannable region into simple-command segments -- a one-line map
+ * over {@link splitSegmentsWithSeparators} (#3526 review S2: the two lexer
+ * bodies were near-duplicates, 0 diffs measured over the full 1,850-region
+ * transcript corpus, and after `checkUngated` this function has no
+ * production caller left -- {@link findDeny} uses the separator-tagged
+ * version -- so the 5 redirection tests pinning `splitSegments`'s own
+ * output now exercise the SAME lexer the hook actually runs, not a stale
+ * duplicate of it).
  *
  * @param {string} region
  * @returns {string[]}
  */
 export function splitSegments(region) {
-	/** @type {string[]} */
-	const segments = [];
-	let buf = "";
-	/** @type {"single"|"double"|null} */
-	let quote = null;
-	let i = 0;
-	const push = () => {
-		if (buf.trim()) segments.push(buf);
-		buf = "";
-	};
-	while (i < region.length) {
-		const ch = region[i];
-		if (quote === "single") {
-			buf += ch;
-			if (ch === "'") quote = null;
-			i++;
-			continue;
-		}
-		if (ch === "\\" && i + 1 < region.length) {
-			buf += ch + region[i + 1];
-			i += 2;
-			continue;
-		}
-		if (quote === "double") {
-			buf += ch;
-			if (ch === '"') quote = null;
-			i++;
-			continue;
-		}
-		if (ch === "'") {
-			quote = "single";
-			buf += ch;
-			i++;
-			continue;
-		}
-		if (ch === '"') {
-			quote = "double";
-			buf += ch;
-			i++;
-			continue;
-		}
-		if (SEGMENT_SEPARATOR.test(ch)) {
-			push();
-			i++;
-			continue;
-		}
-		buf += ch;
-		i++;
-	}
-	push();
-	return segments;
+	return splitSegmentsWithSeparators(region).map((s) => s.text);
 }
 
 /**
@@ -787,29 +789,18 @@ function hasNodeModulesSymlinkOutside(worktreeDir) {
 }
 
 /**
- * Classify a `git` invocation's args (after the leading "git" word).
- * Walks past global options (`-C <dir>` and `-c <key>=<value>` are treated
- * as taking a separate value; every other `-x`/`--x` global option is
- * assumed to take none, which is all #2699's deny/allow strings need) to
- * find the subcommand.
- *
- * `cwd` (the PreToolUse payload's own `cwd`, threaded down from
- * {@link classifyPayload}) resolves a RELATIVE `git worktree remove <path>`
- * argument the same way git itself would, for the {@link
- * hasNodeModulesSymlinkOutside} check -- an absolute argument is used as
- * given. NOT handled (documented, not fixed, matching this file's other
- * blind spots): a leading `-C <dir>` global option changes git's own
- * working directory, which would change what a relative worktree argument
- * resolves against; this scan does not track it, so a `-C`-relative
- * worktree path resolves against the PAYLOAD cwd instead -- proportionate,
- * since every fixer/orchestrator convention in this repo names the
- * worktree by its absolute path.
+ * Walk past a `git` invocation's global options (`-C <dir>` and
+ * `-c <key>=<value>` take a separate value; every other `-x`/`--x` global
+ * option is assumed to take none, which is all #2699's deny/allow strings
+ * need) and return the index of the subcommand word. Shared by
+ * {@link classifyGit} (deciding stash/reset/worktree/clone) and
+ * {@link classifyCheckOrWrite} (deciding commit/push for #3471), so the
+ * global-option skip lives in exactly one place.
  *
  * @param {string[]} args
- * @param {string} [cwd]
- * @returns {DenyRule | null}
+ * @returns {number}
  */
-function classifyGit(args, cwd) {
+function gitSubcommandIndex(args) {
 	let i = 0;
 	while (i < args.length) {
 		if (GIT_TWO_TOKEN_FLAGS.has(args[i])) {
@@ -822,6 +813,236 @@ function classifyGit(args, cwd) {
 		}
 		break;
 	}
+	return i;
+}
+
+/** `/tmp` -- the tmpfs root #3526's `tmpCheckout` rule keeps scratch checkouts
+ *  and mktemp directories off of. A literal string, not `os.tmpdir()`: the
+ *  rule is specifically about the FILESYSTEM PATH `/tmp` (tmpfs on the
+ *  maintainer host), not "wherever this process's own temp dir happens to
+ *  be" -- those coincide when TMPDIR is unset, which is the common case. */
+const TMP_ROOT = "/tmp";
+
+/**
+ * Does `targetDir` (already resolved to an absolute path) sit AT or UNDER
+ * `TMP_ROOT` -- the same relative-path shape as {@link
+ * hasNodeModulesSymlinkOutside}'s outside-check, inverted: here "under" is
+ * the hazard, not "outside".
+ *
+ * @param {string} absoluteDir
+ * @returns {boolean}
+ */
+function isUnderTmpRoot(absoluteDir) {
+	const rel = relative(TMP_ROOT, absoluteDir);
+	return (
+		rel === "" ||
+		(!rel.startsWith(`..${SEP}`) && rel !== ".." && !isAbsolute(rel))
+	);
+}
+
+/**
+ * A leading `$NAME`/`${NAME}` reference on `pathArg` -- the text a shell
+ * would expand before running the command, which this static scanner never
+ * runs. Substituted with whatever THIS command's own env assignments
+ * (threaded down as `env`, the same `effectiveEnv` {@link classifyNode}
+ * reads, which already carries forward standalone `VAR=val` segments via
+ * `sharedEnv` -- #2699 review round 2 F2) set that variable to.
+ *
+ * Loops (bounded by {@link VAR_PREFIX_EXPANSION_CAP}) so an indirected chain
+ * resolves through every hop: found auditing the real transcript corpus
+ * (#3526 review F1) -- `S=/tmp/…/scratchpad; W=$S/wt; git worktree add $W`
+ * is the ACTUAL shape of all 14 historical `/tmp` worktree-adds in it (the
+ * reviewer playbook said "under the scratchpad", never spelling `$TMPDIR`
+ * literally). One substitution alone leaves `$W` expanded to the literal
+ * text `$S/wt`, still unresolved; the loop re-tests that result, finds the
+ * next `$S` reference, and resolves it too. A cap bounds a pathological or
+ * self-referential chain (`A=$A`) the same way {@link lexRegions}'s
+ * recursion is bounded by the crash guard rather than trusted to terminate
+ * on its own.
+ *
+ * `TMPDIR`/`TMP`/`TEMP` get a SPECIAL default when unset -- this hook's own
+ * `process.env` (the same two-tier lookup {@link classifyNode}'s
+ * `PI_LENS_HOME` check already uses: the guard runs as a real child process
+ * inheriting the shell's actual ambient environment, which a command-text-
+ * only scan would otherwise miss -- measured directly: a bare `mktemp -d`
+ * with an ambient, non-command-text `TMPDIR` pointed off /tmp must allow,
+ * and it does not without this fallback), then `TMP_ROOT` -- the real
+ * default `os.tmpdir()`/bash/mktemp all fall back to. Any OTHER variable
+ * with no known value leaves the reference as a literal `undefined`-prefixed
+ * string, and the loop then finds no further `$NAME` match and stops on its
+ * own next iteration (a documented blind spot, matching this file's others:
+ * an unknown `$NAME` cannot be resolved by a static scan, and this fallthrough
+ * is the safe direction -- the literal text still resolves as a relative path
+ * segment against `cwd` in {@link pathResolvesUnderTmp}, which allows unless
+ * `cwd` itself is under `/tmp`, never a false allow of a genuine `/tmp`
+ * destination this scan COULD have resolved; measured mutation-inert against
+ * the alternative of an explicit early `break` -- both leave the same final
+ * under-/tmp verdict, so the special case was deleted). The name boundary
+ * matches {@link HARNESS_HOME_VARIABLE}'s reasoning: `$TMPDIRECTORY` names a
+ * different variable.
+ *
+ * @param {string} pathArg
+ * @param {Record<string, string>} env
+ * @returns {string}
+ */
+function substituteTempDirPrefix(pathArg, env) {
+	let current = expandHomePrefix(pathArg);
+	for (let hop = 0; hop < VAR_PREFIX_EXPANSION_CAP; hop++) {
+		const m =
+			/^\$\{([A-Za-z_][A-Za-z0-9_]*)\}|^\$([A-Za-z_][A-Za-z0-9_]*)(?![A-Za-z0-9_])/.exec(
+				current,
+			);
+		if (!m) break;
+		const name = m[1] ?? m[2];
+		const value = TEMP_DIR_VARS.includes(name)
+			? (env[name] ?? process.env[name] ?? TMP_ROOT)
+			: env[name];
+		// An unresolvable OTHER variable is left as literal text (documented
+		// blind spot: `value` stays `undefined`, so `current` gains the
+		// literal substring "undefined" in its place) -- measured to be
+		// behaviorally inert for this function's only observable output
+		// (whether the final resolved path sits under /tmp): neither
+		// "$UNKNOWN" nor "undefined" is absolute or means anything special to
+		// {@link resolve}, so both fall through to the SAME relative-path
+		// resolution against `cwd`. An earlier version special-cased this
+		// with its own `break`; deleted after mutating it out left every
+		// test in this file green (#3526 review round 2 self-check).
+		current = expandHomePrefix(value + current.slice(m[0].length));
+	}
+	return current;
+}
+
+/** Bounds {@link substituteTempDirPrefix}'s indirection loop -- generous for
+ *  the real shapes this repo's own sessions use (`S=...; W=$S/wt` is one
+ *  hop) while still terminating a pathological or self-referential chain. */
+const VAR_PREFIX_EXPANSION_CAP = 8;
+
+/**
+ * A leading `~` or `~/…` on `pathArg`, expanded from this hook's own
+ * `process.env.HOME` -- bash performs tilde expansion on the raw WORD
+ * before the program ever sees argv, so by the time a real `git worktree
+ * add ~/.cache/…` runs, the `~` is already gone; this static scanner reads
+ * the pre-expansion text and has to redo that step itself (#3526 review
+ * S1). Only the bare `~` and `~/…` forms are handled -- `~user/…` (a named
+ * user's home) is a documented blind spot, the same class as an unresolved
+ * `$NAME` in {@link substituteTempDirPrefix}: left as literal text, which
+ * resolves relative to `cwd` and is the safe (non-false-negative) direction
+ * since none of this repo's own named exemption paths use it. `HOME` unset
+ * also leaves it literal, for the same reason.
+ *
+ * @param {string} pathArg
+ * @returns {string}
+ */
+function expandHomePrefix(pathArg) {
+	const home = process.env.HOME;
+	if (home === undefined) return pathArg;
+	if (pathArg === "~") return home;
+	if (pathArg.startsWith("~/")) return home + pathArg.slice(1);
+	return pathArg;
+}
+
+/**
+ * Does `pathArg` (a `git worktree add`/`git clone` destination, or an
+ * `mktemp` `-p`/`--tmpdir=` value or absolute template's directory) resolve
+ * under `/tmp`, after {@link substituteTempDirPrefix} expands a leading `~`
+ * and every `$TMPDIR`/`$NAME`-shaped reference (recursively, so a `~`
+ * picked up mid-chain -- `S=~/.local/…; W=$S/wt` -- is also expanded, not
+ * just one on the original argument), and resolving a relative remainder
+ * against `cwd` the same way {@link classifyGit}'s worktree-path resolution
+ * already does?
+ *
+ * @param {string} pathArg
+ * @param {string | undefined} cwd
+ * @param {Record<string, string>} env
+ * @returns {boolean}
+ */
+function pathResolvesUnderTmp(pathArg, cwd, env) {
+	const substituted = substituteTempDirPrefix(pathArg, env);
+	const absolute = isAbsolute(substituted)
+		? substituted
+		: resolve(cwd ?? process.cwd(), substituted);
+	return isUnderTmpRoot(absolute);
+}
+
+/** `git worktree add [flags] <path> [<commit-ish>]` flags that consume a
+ *  separate following token as their value. */
+const WORKTREE_ADD_VALUE_FLAGS = new Set(["-b", "-B", "--reason"]);
+
+/** `git clone [flags] <repository> [<directory>]` flags that consume a
+ *  separate following token as their value. Proportionate, matching this
+ *  file's other argv-parsing sets: the common two-token forms, not every
+ *  clone flag -- an unlisted value-taking flag's value would be
+ *  misidentified as a positional, the same documented-blind-spot shape as
+ *  {@link RUNNER_PREFIX_WORDS}. */
+const CLONE_VALUE_FLAGS = new Set([
+	"-b",
+	"--branch",
+	"-o",
+	"--origin",
+	"--depth",
+	"--shallow-since",
+	"--shallow-exclude",
+	"--template",
+	"--reference",
+	"--reference-if-able",
+	"--separate-git-dir",
+	"--filter",
+	"--server-option",
+	"--bundle-uri",
+	"-j",
+	"--jobs",
+	"-c",
+	"--config",
+]);
+
+/**
+ * Collect every positional (non-flag) argument, skipping each flag in
+ * `valueFlags` together with its separate value token.
+ *
+ * @param {string[]} args
+ * @param {Set<string>} valueFlags
+ * @returns {string[]}
+ */
+function collectPositionals(args, valueFlags) {
+	const positionals = [];
+	let i = 0;
+	while (i < args.length) {
+		const a = args[i];
+		if (valueFlags.has(a)) {
+			i += 2;
+			continue;
+		}
+		if (a.startsWith("-")) {
+			i += 1;
+			continue;
+		}
+		positionals.push(a);
+		i += 1;
+	}
+	return positionals;
+}
+
+/**
+ * Classify a `git` invocation's args (after the leading "git" word).
+ *
+ * `cwd` (the PreToolUse payload's own `cwd`, threaded down from
+ * {@link classifyPayload}) resolves a RELATIVE `git worktree remove <path>`
+ * / `git worktree add <path>` / `git clone … <path>` argument the same way
+ * git itself would -- an absolute argument is used as given. NOT handled
+ * (documented, not fixed, matching this file's other blind spots): a
+ * leading `-C <dir>` global option changes git's own working directory,
+ * which would change what a relative path argument resolves against; this
+ * scan does not track it, so a `-C`-relative path resolves against the
+ * PAYLOAD cwd instead -- proportionate, since every fixer/orchestrator
+ * convention in this repo names the worktree by its absolute path.
+ *
+ * @param {string[]} args
+ * @param {string} [cwd]
+ * @param {Record<string, string>} [env]
+ * @returns {DenyRule | null}
+ */
+function classifyGit(args, cwd, env = {}) {
+	const i = gitSubcommandIndex(args);
 	const subcommand = args[i];
 	if (subcommand === "stash") return "stash";
 	if (subcommand === "reset") {
@@ -854,7 +1075,240 @@ function classifyGit(args, cwd) {
 		}
 		return null;
 	}
+	// #3526: a `git worktree add`/`git clone` destination under /tmp -- see
+	// pathResolvesUnderTmp's own doc for the $TMPDIR-substitution and cwd
+	// resolution this shares with the mktemp rule below.
+	if (subcommand === "worktree" && args[i + 1] === "add") {
+		const rest = args.slice(i + 2);
+		const [pathArg] = collectPositionals(rest, WORKTREE_ADD_VALUE_FLAGS);
+		if (pathArg !== undefined && pathResolvesUnderTmp(pathArg, cwd, env))
+			return "tmpCheckout";
+		return null;
+	}
+	if (subcommand === "clone") {
+		const rest = args.slice(i + 1);
+		const positionals = collectPositionals(rest, CLONE_VALUE_FLAGS);
+		// Only an EXPLICIT destination directory (the second positional) is
+		// judged -- `git clone <repo>` with no directory derives one from the
+		// repo name, which this static scan cannot resolve (the same
+		// documented-blind-spot shape as a command word built by expansion).
+		if (
+			positionals.length >= 2 &&
+			pathResolvesUnderTmp(positionals[1], cwd, env)
+		)
+			return "tmpCheckout";
+		return null;
+	}
 	return null;
+}
+
+// `-d`/`--directory` (bare or bundled, e.g. `-qd`) are the flags that make
+// `mktemp` create a DIRECTORY -- parsed in {@link forEachBundledMktempFlag}
+// and {@link classifyMktemp}'s own `--directory` check. A bare `mktemp` (no
+// such flag) creates a FILE and is always allowed -- #3526's acceptance list
+// says so explicitly, and a file cannot become the kind of multi-hundred-MB
+// scratch checkout the incident was about.
+
+/**
+ * Classify an `mktemp` invocation's args for #3526's `tmpCheckout` rule.
+ * File-mode (no `-d`/`--directory`) always allows.
+ *
+ * Directory-mode landing spot, MEASURED against GNU coreutils 9.4 mktemp
+ * (this repo's `/tmp` probe, in the PR body) rather than assumed from the
+ * man page's prose (AGENTS.md shape 16):
+ *   - `-p <dir>` / `--tmpdir=<dir>` (bare `--tmpdir` with no `=`, GNU's own
+ *     "use $TMPDIR" spelling, is folded into the same path via {@link
+ *     pathResolvesUnderTmp}'s `$TMPDIR` sentinel below) -- lands in that dir,
+ *     joined with the template if one was given.
+ *   - An ABSOLUTE template with no `-p`/`--tmpdir=` -- lands in the
+ *     template's own directory (`-p`/`--tmpdir=` wins if both are given;
+ *     untested combination, not claimed).
+ *   - A RELATIVE template with no `-p`/`--tmpdir=`/bare `--tmpdir` -- lands
+ *     in mktemp's OWN cwd, never `$TMPDIR` (measured: `TMPDIR=/elsewhere
+ *     mktemp -d foo.XXXXXX` still creates `foo.XXXXXX` in the current
+ *     directory) -- the one place this rule's behaviour deviates from the
+ *     issue's own prose ("no -p and no absolute template ⇒ deny, default is
+ *     $TMPDIR or /tmp"), which does not hold for a RELATIVE template; only a
+ *     template-omitting invocation actually defaults to $TMPDIR/tmp.
+ *   - No template at all -- lands in `$TMPDIR`, or `/tmp` when unset
+ *     (measured); folded through the same `$TMPDIR`-sentinel path.
+ *
+ * @param {string[]} args
+ * @param {string | undefined} cwd
+ * @param {Record<string, string>} env
+ * @returns {DenyRule | null}
+ */
+/**
+ * Short mktemp options bundled into ONE token (`-dt`, `-dp`, `-qd`) are
+ * common in this repo's own transcripts and were a false-allow blind spot
+ * (#3526 review F2, measured against real GNU coreutils 9.4 -- the PR body
+ * has the probe transcript): `mktemp -dt X`, `-dp DIR X` and `-qd /tmp/X`
+ * all created a directory under `/tmp`, and the hook allowed every one.
+ * Walks `a`'s characters (after the leading `-`) one at a time, exactly the
+ * way GNU getopt bundles single-character short options, and calls back
+ * for each recognized letter. `p`'s value is the token immediately AFTER
+ * the whole bundled flag (`-dp DIR`, `-dp` alone with DIR as the next argv
+ * word) -- real GNU mktemp does not accept `-pDIR` glued to the same token,
+ * measured directly (`-pDIR` is rejected as an unrecognized option), so
+ * only the separate-token form is claimed here.
+ *
+ * @param {string} a a single `-`-prefixed argv word (never `--x`)
+ * @param {{ onDir: () => void; onTmpdirFlag: () => void; onForceTmpdirRelative: () => void }} handlers
+ * @returns {boolean} whether `a` carried a `p` needing the next token as its value
+ */
+function forEachBundledMktempFlag(a, handlers) {
+	let needsTmpdirValue = false;
+	for (const ch of a.slice(1)) {
+		if (ch === "d") handlers.onDir();
+		else if (ch === "p") needsTmpdirValue = true;
+		else if (ch === "t") handlers.onForceTmpdirRelative();
+		// "q" (quiet) and "u" (dry-run, --dry-run) are accepted and ignored --
+		// documented blind spot: neither changes WHERE the directory lands
+		// among the cases this rule claims to handle. Any other letter is
+		// likewise ignored rather than rejected, matching this file's
+		// fail-open-on-unrecognized stance elsewhere.
+	}
+	return needsTmpdirValue;
+}
+
+/**
+ * Classify an `mktemp` invocation's args for #3526's `tmpCheckout` rule.
+ * File-mode (no `-d`/`--directory`, bundled or not) always allows.
+ *
+ * @param {string[]} args
+ * @param {string | undefined} cwd
+ * @param {Record<string, string>} env
+ * @returns {DenyRule | null}
+ */
+function classifyMktemp(args, cwd, env) {
+	let isDir = false;
+	/** @type {string | undefined} */
+	let tmpdirOverride;
+	/** @type {string | undefined} */
+	let template;
+	// `-t`/bundled `t`: interpret a RELATIVE template as a single component
+	// rooted at $TMPDIR (else /tmp) rather than mktemp's own cwd -- measured
+	// against real GNU coreutils 9.4 (PR body has the transcript): TMPDIR is
+	// consulted with `-t` even for a relative template, unlike the bare
+	// relative-template default this file already measured.
+	let forceTmpdirRelative = false;
+	let i = 0;
+	while (i < args.length) {
+		const a = args[i];
+		if (a === "--tmpdir") {
+			// Bare form (no "="): GNU mktemp's own "use $TMPDIR" spelling.
+			tmpdirOverride = "$TMPDIR";
+			i++;
+			continue;
+		}
+		if (a.startsWith("--tmpdir=")) {
+			tmpdirOverride = a.slice("--tmpdir=".length);
+			i++;
+			continue;
+		}
+		if (a === "--directory") {
+			isDir = true;
+			i++;
+			continue;
+		}
+		if (a.startsWith("-") && a !== "-" && !a.startsWith("--")) {
+			const needsTmpdirValue = forEachBundledMktempFlag(a, {
+				onDir: () => {
+					isDir = true;
+				},
+				onForceTmpdirRelative: () => {
+					forceTmpdirRelative = true;
+				},
+			});
+			i++;
+			if (needsTmpdirValue) {
+				tmpdirOverride = args[i];
+				i++;
+			}
+			continue;
+		}
+		if (a.startsWith("-")) {
+			// Every other long flag (--suffix=X, --dry-run, ...) is ignored --
+			// documented blind spot, matching this file's other argv-parsing
+			// sets: none of them change WHERE the directory lands among the
+			// cases this rule claims to handle.
+			i++;
+			continue;
+		}
+		template = a;
+		i++;
+	}
+	if (!isDir) return null;
+	/** @type {string} */
+	let targetDir;
+	if (tmpdirOverride !== undefined) targetDir = tmpdirOverride;
+	else if (template !== undefined && isAbsolute(template))
+		targetDir = dirname(template);
+	else if (template === undefined || forceTmpdirRelative) targetDir = "$TMPDIR";
+	else targetDir = cwd ?? process.cwd();
+	return pathResolvesUnderTmp(targetDir, cwd, env) ? "tmpCheckout" : null;
+}
+
+/** `pkill`/`killall` (#3556): neither has a way to scope by PID the way
+ *  plain `kill <pid>` does, so this file never classifies `kill` itself --
+ *  a bare PID target is inherently already scoped to one process. */
+const SHARED_KILL_COMMANDS = new Set(["pkill", "killall"]);
+
+/**
+ * Classify a `pkill`/`killall` invocation's args for #3556's `sharedKill`
+ * rule. `killall` matches by process NAME only (no full-command-line mode),
+ * so no pattern text can scope it to one worktree -- always denied.
+ * `pkill` is denied UNLESS it is given `-f`/`--full` (full-command-line
+ * match, the mode where a worktree's absolute path can actually appear in
+ * what is matched), `cwd` (the PreToolUse payload's own cwd) is itself a
+ * LINKED worktree, and its pattern argument contains `cwd` as a literal
+ * substring. The linked-worktree check (#3526/#3556 review F6) is load-
+ * bearing, not redundant with the substring check: the orchestrator and
+ * every subagent that has not entered a worktree run with `cwd` pointed at
+ * the shared main checkout, a path PREFIX of every `.claude/worktrees/*`
+ * path, so `pattern.includes(cwd)` alone was satisfiable by a pattern that
+ * matches every worktree's TLC -- the exact harm this rule exists to stop.
+ * NOT handled (documented, not fixed): a flag that consumes a separate
+ * value token (`-u <user>`, `--signal <name>`) -- only the bare,
+ * single-token forms are recognized; a two-token flag's value is
+ * misidentified as the pattern and very unlikely to contain `cwd`, so this
+ * degrades to "denied" rather than a false allow. Also not handled: `kill
+ * $(pgrep -f tlc2.TLC)` and `pgrep -f tlc2 | xargs kill` carry the same
+ * machine-wide-match harm through a different command shape this scan does
+ * not recognize as killing anything (`pgrep` alone only lists PIDs).
+ *
+ * @param {string} cmd
+ * @param {string[]} args
+ * @param {string | undefined} cwd
+ * @returns {DenyRule | null}
+ */
+function classifyPkillKillall(cmd, args, cwd) {
+	if (cmd === "killall") return "sharedKill";
+	let fullMatch = false;
+	/** @type {string | undefined} */
+	let pattern;
+	for (const a of args) {
+		if (a === "-f" || a === "--full") {
+			fullMatch = true;
+			continue;
+		}
+		if (a.startsWith("-")) continue;
+		pattern = a;
+	}
+	if (!fullMatch || pattern === undefined) return "sharedKill";
+	// #3526/#3556 review F6: `cwd` alone is not enough. The orchestrator and
+	// every subagent that has not entered a worktree run with payload cwd
+	// pointed at the SHARED main checkout, which is a path PREFIX of every
+	// `.claude/worktrees/*` path -- `pattern.includes(cwd)` was true for
+	// `pkill -f '<shared-checkout>.*tlc2'` and it matches every worktree's
+	// TLC, the exact harm this rule exists to stop. Scoping is only
+	// meaningful from INSIDE a linked worktree (checked the same way {@link
+	// classifyGit}'s `git worktree remove` symlink-hazard check already
+	// does): the shared main checkout's own `.git` is a directory, never a
+	// file, so `looksLikeGitWorktree` is false there and the scoped form
+	// never allows from it.
+	if (cwd && looksLikeGitWorktree(cwd) && pattern.includes(cwd)) return null;
+	return "sharedKill";
 }
 
 /**
@@ -1082,9 +1536,279 @@ export function classifySegment(rawSegment, sharedEnv = {}, cwd) {
 	const effectiveEnv = { ...sharedEnv, ...segmentEnv };
 	const cmd = commandBasename(rest[0]);
 	const args = rest.slice(1);
-	if (cmd === "git") return classifyGit(args, cwd);
+	if (cmd === "git") return classifyGit(args, cwd, effectiveEnv);
 	if (cmd === "node" || cmd === "nodejs")
 		return classifyNode(args, effectiveEnv, rawSegment);
+	if (cmd === "mktemp") return classifyMktemp(args, cwd, effectiveEnv);
+	if (SHARED_KILL_COMMANDS.has(cmd))
+		return classifyPkillKillall(cmd, args, cwd);
+	return null;
+}
+
+/**
+ * {@link splitSegments}'s sibling for #3471's `checkUngated` rule: the same
+ * split, but each segment carries the separator text that preceded it
+ * (`null` for the region's first segment). `&&`/`||` fall out of {@link
+ * SEGMENT_SEPARATOR} as two consecutive single-char separators with an
+ * EMPTY segment between them (splitSegments discards that empty segment;
+ * here its two characters are accumulated into `pendingSep` instead of
+ * being dropped, so they reach the NEXT real segment as one two-character
+ * string) -- `splitSegments` itself is left untouched because existing
+ * tests pin its plain string-array return shape.
+ *
+ * @param {string} region
+ * @returns {Array<{ text: string; sep: string | null }>}
+ */
+export function splitSegmentsWithSeparators(region) {
+	/** @type {Array<{ text: string; sep: string | null }>} */
+	const segments = [];
+	let buf = "";
+	/** @type {"single"|"double"|null} */
+	let quote = null;
+	let pendingSep = "";
+	let i = 0;
+	const push = () => {
+		if (buf.trim()) {
+			segments.push({ text: buf, sep: pendingSep || null });
+			pendingSep = "";
+		}
+		buf = "";
+	};
+	while (i < region.length) {
+		const ch = region[i];
+		if (quote === "single") {
+			buf += ch;
+			if (ch === "'") quote = null;
+			i++;
+			continue;
+		}
+		if (ch === "\\" && i + 1 < region.length) {
+			buf += ch + region[i + 1];
+			i += 2;
+			continue;
+		}
+		if (quote === "double") {
+			buf += ch;
+			if (ch === '"') quote = null;
+			i++;
+			continue;
+		}
+		if (ch === "'") {
+			quote = "single";
+			buf += ch;
+			i++;
+			continue;
+		}
+		if (ch === '"') {
+			quote = "double";
+			buf += ch;
+			i++;
+			continue;
+		}
+		if (isLiveSeparator(region, i)) {
+			push();
+			pendingSep += ch;
+			i++;
+			continue;
+		}
+		buf += ch;
+		i++;
+	}
+	push();
+	return segments;
+}
+
+/** `npm run <script>` scripts #3471 treats as a "check" -- named in the
+ *  issue itself, not a spelling-enumerated guess. */
+const CHECK_NPM_SCRIPTS = new Set([
+	"lint",
+	"build",
+	"test",
+	"fmt:check",
+	"preflight",
+]);
+
+/**
+ * Does `fileArg` name a `scripts/check-*.mjs` file -- segment-membership
+ * check for the directory (reusing {@link fileArgUnderDir}, so a leading
+ * `./` or an absolute path is still recognized) plus a basename pattern for
+ * the `check-*.mjs` part.
+ *
+ * @param {string} fileArg
+ * @returns {boolean}
+ */
+function isCheckScriptPath(fileArg) {
+	const segments = fileArg.split(/[\\/]+/);
+	const base = segments[segments.length - 1];
+	return (
+		fileArgUnderDir(fileArg, "scripts") && /^check-[^/\\]*\.mjs$/.test(base)
+	);
+}
+
+/**
+ * Classify one segment as a #3471 "check" or "write" (a `git commit`/
+ * `git push`), or neither. A "check" is exactly the set the issue names:
+ * `npm run (lint|build|test|fmt:check|preflight)`, `npx vitest`, `tsc`, or
+ * `node scripts/check-*.mjs`.
+ *
+ * @param {string} rawSegment
+ * @returns {"check" | "write" | null}
+ */
+function classifyCheckOrWrite(rawSegment) {
+	const rawWords = splitWords(rawSegment);
+	if (rawWords.length === 0) return null;
+	const words = stripCommandGroupAndRunnerPrefixes(rawWords);
+	if (words.length === 0) return null;
+	const { rest: afterEnv } = stripEnvAssignments(words);
+	if (afterEnv.length === 0) return null;
+	// `timeout <duration> <command>…` (bare form only, no options before the
+	// duration -- #3526 review F4: this repo's own vitest convention is
+	// `timeout 400 node_modules/.bin/vitest run …`, and 33 corpus rows use
+	// it. A `timeout` carrying its own options stops the search, the same
+	// documented-blind-spot shape as this file's other runner prefixes.
+	const rest = afterEnv[0] === "timeout" ? afterEnv.slice(2) : afterEnv;
+	if (rest.length === 0) return null;
+	const cmd = commandBasename(rest[0]);
+	const args = rest.slice(1);
+	if (cmd === "git") {
+		const i = gitSubcommandIndex(args);
+		const subcommand = args[i];
+		if (subcommand === "commit" || subcommand === "push") return "write";
+		return null;
+	}
+	if (
+		cmd === "npm" &&
+		((args[0] === "run" && CHECK_NPM_SCRIPTS.has(args[1])) ||
+			args[0] === "test" ||
+			args[0] === "t")
+	)
+		return "check";
+	if (cmd === "npx" && args[0] === "vitest") return "check";
+	// A bare `vitest`/`node_modules/.bin/vitest` (#3526 review F4: 33 corpus
+	// rows use the `.bin/vitest` spelling, none of them `npx vitest`) --
+	// resolved by {@link commandBasename} the same way `/usr/bin/git` already
+	// resolves to `git`.
+	if (cmd === "vitest") return "check";
+	if (cmd === "tsc") return "check";
+	if (cmd === "node" || cmd === "nodejs") {
+		const scriptArg = args.find((a) => !a.startsWith("-"));
+		if (scriptArg !== undefined && isCheckScriptPath(scriptArg)) return "check";
+	}
+	return null;
+}
+
+/**
+ * Bash keywords that OPEN a control-flow construct still active at the
+ * point they appear -- `then`/`elif`/`else`/`do` mark being INSIDE an
+ * `if`/`while`/`until`/`for`/`case` body, and a bare `if`/`while`/`until`/
+ * `case` starting a segment is the same (its own `then`/`do` may be on the
+ * SAME segment, `if cond; then`, already past by the time a later segment
+ * is reached). Found auditing the REAL 2026-09-07..08 transcript corpus
+ * (the PR body has the transcript): this repo's own convention for running
+ * a check, saving its status, and deciding afterward is `vexit=$?; …; if
+ * [ $vexit -eq 0 ]; then git add … && git commit … && git push …; fi` --
+ * the commit IS properly gated, just not through `&&`, and a chain scan
+ * that only understands `;`/`|`/`&&` cannot tell that apart from an
+ * actually-ungated write.
+ */
+const CONTROL_FLOW_OPENERS = new Set([
+	"if",
+	"then",
+	"elif",
+	"else",
+	"while",
+	"until",
+	"case",
+	"do",
+]);
+
+/**
+ * Bash keywords that CLOSE a control-flow construct -- `fi`/`done`/`esac`.
+ * Walking backward from a write, hitting one of these before any {@link
+ * CONTROL_FLOW_OPENERS} word means a construct closed BEFORE the write, so
+ * it does not enclose it (#3526 review F3: `… for f in a; do :; done; git
+ * push` and `… for f in a; do :; done; git push` -- an EARLIER, unrelated
+ * `for…do…done` loop must not exempt a later, real ungated write; the whole-
+ * region skip this replaces could not tell the difference).
+ */
+const CONTROL_FLOW_CLOSERS = new Set(["fi", "done", "esac"]);
+
+/**
+ * Is the write at `segments[j]` inside an unclosed control-flow construct?
+ * Walks backward from `j` (the WHOLE region, not stopping at an earlier
+ * write the way the check-search below does -- a shell construct's scope is
+ * lexical, not reset by a completed commit/push inside it) for the nearest
+ * segment whose first word is a {@link CONTROL_FLOW_OPENERS} or {@link
+ * CONTROL_FLOW_CLOSERS} word. An opener found first means the write sits
+ * inside that construct (own the check inside it too, so this scan stands
+ * aside rather than guess at how it is really gated); a closer found first
+ * means the nearest construct already ended, so it does NOT enclose the
+ * write and the normal chain scan applies.
+ *
+ * @param {Array<{ text: string; sep: string | null }>} segments
+ * @param {number} j
+ * @returns {boolean}
+ */
+function writeIsInsideControlFlow(segments, j) {
+	for (let m = j - 1; m >= 0; m--) {
+		const first = segments[m].text.trim().split(/\s+/, 1)[0];
+		if (first === undefined) continue;
+		if (CONTROL_FLOW_CLOSERS.has(first)) return false;
+		if (CONTROL_FLOW_OPENERS.has(first)) return true;
+	}
+	return false;
+}
+
+/**
+ * #3471's `checkUngated` rule: scan one region's separator-tagged segments
+ * for a `git commit`/`git push` ("write") segment whose NEAREST preceding
+ * "check" segment is not connected to it by an unbroken chain of `&&`
+ * separators. The backward search for that nearest check STOPS at an
+ * earlier write (a completed commit/push is a fresh boundary -- #3471's own
+ * proposal is about a check's result never gating ITS OWN following write,
+ * not every write for the rest of the command; this is also what keeps an
+ * ordinary `git commit -m x; git status` -- a sequential status check after
+ * a commit, with no check anywhere -- allowed: no check precedes it at all,
+ * so no write is judged).
+ *
+ * A `null` return for a write with NO preceding check (case 3 of #3471: a
+ * bare `git push` with nothing gating it because nothing was ever supposed
+ * to) is deliberate, not a gap this scan tries to close -- see the PR body
+ * for why a general "a write must be command-final or &&-only" rule was
+ * rejected (it denies that same sanctioned pattern).
+ *
+ * {@link writeIsInsideControlFlow} exempts a write PER-WRITE, not per-region
+ * (#3526 review F3): a region can carry an earlier, CLOSED control-flow
+ * construct (a `for…do…done` loop that finished before the check even
+ * starts) alongside a later, genuinely ungated check-then-write that must
+ * still deny -- a whole-region skip could not tell the two apart.
+ *
+ * @param {Array<{ text: string; sep: string | null }>} segments
+ * @returns {DenyRule | null}
+ */
+function findUngatedWriteInChain(segments) {
+	const shapes = segments.map((s) => classifyCheckOrWrite(s.text));
+	for (let j = 0; j < segments.length; j++) {
+		if (shapes[j] !== "write") continue;
+		if (writeIsInsideControlFlow(segments, j)) continue;
+		let k = -1;
+		for (let m = j - 1; m >= 0; m--) {
+			if (shapes[m] === "check") {
+				k = m;
+				break;
+			}
+			if (shapes[m] === "write") break;
+		}
+		if (k === -1) continue;
+		let gated = true;
+		for (let n = k + 1; n <= j; n++) {
+			if (segments[n].sep !== "&&") {
+				gated = false;
+				break;
+			}
+		}
+		if (!gated) return "checkUngated";
+	}
 	return null;
 }
 
@@ -1095,7 +1819,9 @@ export function classifySegment(rawSegment, sharedEnv = {}, cwd) {
  * assignments; each substitution region then starts from a COPY of that
  * state -- an approximation of bash's left-to-right export visibility, not
  * a fully-ordered interleaving with what appears textually inside a
- * `$( )`/backtick span (#2699 review round 2 F2).
+ * `$( )`/backtick span (#2699 review round 2 F2). #3471's chain scan runs
+ * per region too, ahead of the per-segment classification, since it needs
+ * every segment of the region at once rather than one at a time.
  *
  * @param {string} commandText
  * @param {string} [cwd] the PreToolUse payload's own cwd, threaded to every segment
@@ -1107,7 +1833,10 @@ export function findDeny(commandText, cwd) {
 	const sharedEnv = {};
 	for (let index = 0; index < regions.length; index++) {
 		const env = index === 0 ? sharedEnv : { ...sharedEnv };
-		for (const segment of splitSegments(regions[index])) {
+		const segments = splitSegmentsWithSeparators(regions[index]);
+		const chainRule = findUngatedWriteInChain(segments);
+		if (chainRule) return chainRule;
+		for (const { text: segment } of segments) {
 			const rule = classifySegment(segment, env, cwd);
 			if (rule) return rule;
 		}

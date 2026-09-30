@@ -142,19 +142,38 @@ function readStdin() {
 	}
 }
 
-export function resolveDiffRange() {
-	const stdin = readStdin().trim();
-	if (stdin) {
-		const firstLine = stdin.split("\n")[0]?.trim();
-		const parts = firstLine ? firstLine.split(/\s+/) : [];
-		const [, localSha, , remoteSha] = parts;
-		if (localSha && remoteSha && !/^0+$/.test(remoteSha)) {
-			return `${remoteSha}...${localSha}`;
+export function resolveDiffRange(input = readStdin()) {
+	const lines = input
+		.trim()
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter(Boolean);
+	if (lines.length > 0) {
+		const ranges = [];
+		for (const line of lines) {
+			const parts = line.split(/\s+/);
+			const [, localSha, , remoteSha] = parts;
+			if (!localSha || !remoteSha) {
+				return ["origin/master...HEAD"];
+			}
+			// A zero local sha is a branch deletion. It has no changed files and
+			// must not trigger a build or a failed `git diff` (#3661).
+			if (/^0+$/.test(localSha)) continue;
+			if (/^0+$/.test(remoteSha)) {
+				// New branch (no remote tracking ref yet): retain the baseline
+				// used by CI, while continuing to retain other pushed updates.
+				if (!ranges.includes("origin/master...HEAD"))
+					ranges.push("origin/master...HEAD");
+				continue;
+			}
+			const range = `${remoteSha}...${localSha}`;
+			if (!ranges.includes(range)) ranges.push(range);
 		}
+		return ranges.length > 0 ? ranges : null;
 	}
 	// New branch (no remote tracking ref yet) or unreadable stdin: diff
 	// against origin/master, same baseline CI compares PRs against.
-	return "origin/master...HEAD";
+	return ["origin/master...HEAD"];
 }
 
 export function changedFiles(range) {
@@ -361,8 +380,22 @@ function runTargetedTests(selected) {
 }
 
 export async function main() {
-	const range = resolveDiffRange();
-	const changed = changedFiles(range);
+	const ranges = resolveDiffRange();
+	if (ranges === null) {
+		console.log("[pre-push] deletion-only push; skipping build and tests.");
+		return 0;
+	}
+	let changed = [];
+	for (const range of ranges) {
+		const files = changedFiles(range);
+		if (files === null) {
+			changed = null;
+			break;
+		}
+		for (const file of files) {
+			if (!changed.includes(file)) changed.push(file);
+		}
+	}
 	const skipBuild = process.argv.includes("--skip-build");
 
 	if (skipBuild) {

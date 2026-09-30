@@ -584,10 +584,28 @@ export interface HeartbeatPatch {
 }
 
 /** Update this process's heartbeat/rss (and, since #620, host CPU% + live
- *  LSP children's rss/CPU%). Cheap — safe to call every turn end. */
+ *  LSP children's rss/CPU%). Cheap — safe to call every turn end.
+ *
+ * #3602: runs on the SAME tail as `registerInstance`/`registerInstanceRoot`/
+ * `deregisterInstance` (`queueRegistryMutation`) rather than taking the
+ * registry lock directly. Before this, a heartbeat queued behind a
+ * still-in-flight `registerInstance` (session_start's `void
+ * registerInstance(...)`, not awaited) could win the race to the lock: it
+ * would read the registry before that registration's write landed, find no
+ * own entry, and — because `registerInstanceNow` had already set the
+ * repair-intent root via `rememberRegistrationRoot` BEFORE its write — record
+ * a spurious `instance-registry-registration-missing` on an ordinary first
+ * turn and queue a redundant re-register. Sharing the tail makes the two
+ * mutations' submission order (session_start's registration, then
+ * turn_end's/agent_settled's heartbeat) their EXECUTION order too, so a
+ * heartbeat can never observe that half-registered state again. */
 export async function updateHeartbeat(
 	patch: HeartbeatPatch = {},
 ): Promise<void> {
+	return queueRegistryMutation(() => updateHeartbeatNow(patch));
+}
+
+async function updateHeartbeatNow(patch: HeartbeatPatch): Promise<void> {
 	if (!isInstanceRegistryEnabled()) return;
 	const pid = process.pid;
 	const selfStart = await ownProcessStart(startReadOptions());
@@ -1046,6 +1064,12 @@ function withoutOwnEntry(
  * teardown paths may fire and forget it — the tail still orders the write —
  * but they can no longer read the file straight afterwards and expect the
  * removal to be visible.
+ *
+ * The sync attempt below can meet this process's OWN hold, the same shape
+ * #3498 fixed for `deregisterInstance` (#3587): this op already runs on the
+ * tail, so unlike `deregisterInstance` it never needs to bypass the tail to
+ * retry — it just waits through the lock lease in place, on the same tail
+ * slot, before giving the next queued op its turn.
  */
 export function deregisterInstanceRoot(projectRoot: string): Promise<void> {
 	const generation = registrationGeneration().capture();
@@ -1054,55 +1078,122 @@ export function deregisterInstanceRoot(projectRoot: string): Promise<void> {
 	);
 }
 
+/**
+ * The write this root removal must make (or none), plus the intent-cell side
+ * effect, from a fresh read (#3587). Shared by the sync attempt and its
+ * queued fallback so a holder that outlasts the sync wait gets the identical
+ * decision, not a second, possibly-stale one. Keys the entry through
+ * `isOwnEntry`, and the whole-entry removal through `withoutOwnEntry`, exactly
+ * as `deregisterInstance` does (#3498).
+ */
+function planRootRemoval(
+	file: RegistryFile,
+	normalizedRoot: string,
+	selfStart: string | undefined,
+	generation: GenerationHandle,
+): RegistryFile | undefined {
+	const idx = file.instances.findIndex((entry) => isOwnEntry(entry, selfStart));
+	if (idx === -1) {
+		// Entry already gone (e.g. a dropped registration): still stop a
+		// heartbeat from re-registering the root this host just left.
+		const intent = registrationIntent();
+		if (
+			intent.root !== undefined &&
+			normalizeFilePath(intent.root) === normalizedRoot
+		)
+			rememberRegistrationRoot(undefined);
+		return undefined;
+	}
+	const current = file.instances[idx];
+	const priorRoots = getInstanceRoots(current);
+	const remainingRoots = priorRoots.filter((root) => root !== normalizedRoot);
+	if (remainingRoots.length === priorRoots.length) return undefined;
+	if (remainingRoots.length === 0) {
+		// The host serves no root: a heartbeat must not bring it back.
+		rememberRegistrationRoot(undefined);
+		return withoutOwnEntry(file, selfStart);
+	}
+	// Keep a heartbeat re-registration on a root the host still serves,
+	// unless the host session ended since this removal was queued (#3498):
+	// its roots are no longer served, and the intent must stay clear.
+	if (generation.isCurrent()) rememberRegistrationRoot(remainingRoots[0]);
+	return {
+		instances: file.instances.map((entry, i) =>
+			i === idx
+				? {
+						...current,
+						projectRoot: remainingRoots[0],
+						projectRoots: remainingRoots,
+					}
+				: entry,
+		),
+	};
+}
+
 function deregisterInstanceRootNow(
 	projectRoot: string,
 	generation: GenerationHandle,
-): void {
+): Promise<void> | void {
 	if (!isInstanceRegistryEnabled()) return;
 	const normalizedRoot = normalizeFilePath(projectRoot);
 	const selfStart = ownProcessStartIfKnown();
-	withInstanceRegistryLockSync(registryPath(), () => {
-		const file = readRegistrySync();
-		const idx = file.instances.findIndex((entry) =>
-			isOwnEntry(entry, selfStart),
+	const applied = withInstanceRegistryLockSync(registryPath(), () => {
+		const next = planRootRemoval(
+			readRegistrySync(),
+			normalizedRoot,
+			selfStart,
+			generation,
 		);
-		if (idx === -1) {
-			// Entry already gone (e.g. a dropped registration): still stop a
-			// heartbeat from re-registering the root this host just left.
-			const intent = registrationIntent();
-			if (
-				intent.root !== undefined &&
-				normalizeFilePath(intent.root) === normalizedRoot
-			)
-				rememberRegistrationRoot(undefined);
-			return;
-		}
-		const current = file.instances[idx];
-		const remainingRoots = getInstanceRoots(current).filter(
-			(root) => root !== normalizedRoot,
-		);
-		if (remainingRoots.length === getInstanceRoots(current).length) return;
-		if (remainingRoots.length === 0) {
-			// The host serves no root: a heartbeat must not bring it back.
-			rememberRegistrationRoot(undefined);
-			writeRegistrySync({
-				instances: file.instances.filter(
-					(entry) => !isOwnEntry(entry, selfStart),
-				),
-			});
-			return;
-		}
-		file.instances[idx] = {
-			...current,
-			projectRoot: remainingRoots[0],
-			projectRoots: remainingRoots,
-		};
-		// Keep a heartbeat re-registration on a root the host still serves,
-		// unless the host session ended since this removal was queued (#3498):
-		// its roots are no longer served, and the intent must stay clear.
-		if (generation.isCurrent()) rememberRegistrationRoot(remainingRoots[0]);
-		writeRegistrySync(file);
+		if (next) writeRegistrySync(next);
+		return true;
 	});
+	if (applied) return;
+	// #3587: the sync wait can meet this process's own hold (the heartbeat, or
+	// a registration under the lock) or a peer past 500ms, exactly as #3498
+	// found for `deregisterInstance`. This op already runs on the registry
+	// tail, so there is nothing to bypass: queue the same op behind the
+	// holder, on this tail slot, waiting through the lock lease instead of
+	// leaking the root for the rest of the session.
+	incrementDegradationCount({
+		kind: "instance-registry-deregister-queued",
+		subject: String(process.pid),
+		reason:
+			"the sync removal could not take the registry lock; queued behind the holder",
+	});
+	return deregisterInstanceRootAfterHolder(normalizedRoot, generation);
+}
+
+/**
+ * The removal `deregisterInstanceRootNow` could not make in its sync wait
+ * (#3587), mirroring `deregisterInstanceAfterHolder` (#3498): waits through
+ * the lock lease, so a holder that outlives the sync wait and one ordinary
+ * async wait still cannot make it drop.
+ */
+async function deregisterInstanceRootAfterHolder(
+	normalizedRoot: string,
+	generation: GenerationHandle,
+): Promise<void> {
+	const selfStart = await ownProcessStart(startReadOptions());
+	await withInstanceRegistryLock(
+		registryPath(),
+		async () => {
+			const next = planRootRemoval(
+				await readRegistryAsync(),
+				normalizedRoot,
+				selfStart,
+				generation,
+			);
+			if (next) await writeRegistryAsync(next);
+			incrementDegradationCount({
+				kind: "instance-registry-deregister-landed",
+				subject: String(process.pid),
+				reason: next
+					? "the queued removal took the lock and updated this process's entry"
+					: "the queued removal took the lock; there was nothing left to remove",
+			});
+		},
+		LOCK_WAIT_THROUGH_LEASE_MS,
+	);
 }
 
 /**

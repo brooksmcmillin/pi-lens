@@ -22,6 +22,11 @@ export function classifyCleanBehavior(obs: CleanSignalObservations): {
 	reason: string;
 };
 
+export function resolveProbeServerId(
+	fx: { lang?: string; auxiliaryServerIds?: readonly string[] },
+	servers: ReadonlyArray<{ id: string; role?: string }>,
+): string | undefined;
+
 export function createPublishTraceDrainer(options: {
 	readLog: (offset: number) => {
 		size: number;

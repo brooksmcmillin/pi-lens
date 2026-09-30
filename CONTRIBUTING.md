@@ -38,15 +38,20 @@ Pull requests must pass `npm run lint`. Run targeted test files for touched seam
   CI runs the real gate either way.
 
 `core.hooksPath` is `git config` — shared by every worktree of the same
-clone, not scoped per worktree. What IS per-worktree is `.husky/_` (the
-directory husky installs at that path), which is git-ignored and only
-created by running `npm install` in that specific worktree. A worktree
-where nobody has run `npm install` yet has the hook FILES checked out but
-nothing wired to `core.hooksPath` there, so `git commit`/`git push` silently
-run no hooks. This is accepted behavior, not a bug to route around: hooks
-serve human checkouts, where `npm install` has run; agent worktrees can opt
-out with `PI_LENS_SKIP_HOOKS` (see below), and CI is authoritative either
-way.
+clone — and `.husky/_` (the directory husky installs at that path) is
+git-ignored, so it exists only where husky ran. Husky's own value is the
+relative `.husky/_`, which git resolves against each worktree's root; every
+linked worktree then ran no pre-commit or pre-push at all (#3674: two PRs
+reached CI with oxfmt and tsc failures). `scripts/setup-git-hooks.mjs`
+therefore runs husky in the MAIN worktree (first entry of `git worktree list`)
+and pins `core.hooksPath` to that absolute `.husky/_`, even when `npm install`
+runs inside a linked worktree that may be deleted later. Linked worktrees run
+the main checkout's `.husky/` scripts, in their own cwd. Moving the clone
+leaves the absolute path dangling until the next `npm install` rewrites it;
+`HUSKY=0` and `PI_LENS_SKIP_HOOKS` still skip the wiring, and so does any
+checkout that is not pi-lens's own (package name `pi-lens`, and Git's toplevel
+equal to the script's package root): an `npm link`, a workspace or a package
+nested in another repo is never rewritten.
 
 Skip either hook with `PI_LENS_SKIP_HOOKS=<anything> git commit ...` /
 `git push ...` (any non-empty value works). Agents and CI should set this —

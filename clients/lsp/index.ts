@@ -1777,7 +1777,7 @@ export class LSPService {
 	private async acquireClientLeases(
 		entries: readonly SpawnedServer[],
 		filePath: string,
-	): Promise<string[] | undefined> {
+	): Promise<{ key: string; server: LSPServerInfo }[] | undefined> {
 		const keys = await Promise.all(
 			entries.map((entry) => this.clientKeyFor(entry, filePath)),
 		);
@@ -1797,11 +1797,11 @@ export class LSPService {
 			for (const [key] of keyed) {
 				this.clientLeases.set(key, (this.clientLeases.get(key) ?? 0) + 1);
 			}
-			return keyed.map(([key]) => key);
+			return keyed.map(([key, entry]) => ({ key, server: entry.info }));
 		});
 	}
 
-	private releaseClientLease(key: string): void {
+	private releaseClientLease(key: string, server: LSPServerInfo): void {
 		const remaining = (this.clientLeases.get(key) ?? 1) - 1;
 		if (remaining > 0) {
 			this.clientLeases.set(key, remaining);
@@ -1810,7 +1810,7 @@ export class LSPService {
 		this.clientLeases.delete(key);
 		if (this.state.clients.has(key)) {
 			this.clientLastUsedAt.set(key, Date.now());
-			this.scheduleTypeScriptIdleEviction(key);
+			this.scheduleTypeScriptIdleEviction(key, server);
 		}
 	}
 
@@ -1828,7 +1828,7 @@ export class LSPService {
 			try {
 				return await use(entry);
 			} finally {
-				this.releaseClientLease(leaseKey);
+				this.releaseClientLease(leaseKey, entry.info);
 			}
 		}
 		return undefined;
@@ -1868,13 +1868,11 @@ export class LSPService {
 		}
 
 		const [victimKey, victimClient] = victim;
+		// Released BEFORE the awaited shutdown so a waiter never parks on a client
+		// that is already going down; retireClient's own release is then a no-op.
 		this.releaseOutstandingAuxNotifyWrite(victimKey);
 		await victimClient.shutdown({ reason: "client_ceiling_lru" });
-		this.state.clients.delete(victimKey);
-		this.state.clientSpawnedAt.delete(victimKey);
-		this.forgetReadiness(victimKey);
-		this.clientLastUsedAt.delete(victimKey);
-		this.clearTypeScriptIdleTimer(victimKey);
+		this.retireClient(victimKey);
 		logSessionStart(
 			`lsp client ceiling ${getLspClientCeiling()}: evicted idle LRU ${victimKey}`,
 		);
@@ -1885,6 +1883,30 @@ export class LSPService {
 		const timer = this.typeScriptIdleTimers.get(key);
 		if (timer) clearTimeout(timer);
 		this.typeScriptIdleTimers.delete(key);
+	}
+
+	/**
+	 * #3585: the ONE retirement of a client generation, used by capacity
+	 * eviction, TypeScript idle eviction, notify-stall demotion and the
+	 * dead-client respawn. Everything keyed to the retired client's lifetime is
+	 * dropped here, so a replacement starts cold: a path that forgot one entry
+	 * was the defect shape behind #3502 (readiness) and #3537 (timeout streak).
+	 * Synchronous on purpose: idle eviction publishes the cold state before it
+	 * awaits teardown. Callers keep only what differs per path (the shutdown
+	 * call and its ordering, breaker cooldowns, demotion stamps).
+	 */
+	private retireClient(key: string): void {
+		this.releaseOutstandingAuxNotifyWrite(key);
+		this.state.clients.delete(key);
+		this.state.clientSpawnedAt.delete(key);
+		this.forgetReadiness(key);
+		this.clientLastUsedAt.delete(key);
+		this.clearTypeScriptIdleTimer(key);
+		// #1714: the backlog count describes a process that no longer exists.
+		this.auxNotifyInflight.delete(key);
+		// #3585: a per-write latency estimate belongs to a client generation; a
+		// replacement inheriting it would be priced by its predecessor's wedge window.
+		this.auxNotifyDrainLatencyEwma.delete(key);
 	}
 
 	/** Release a notify token and its timer when its client generation retires. */
@@ -1899,8 +1921,12 @@ export class LSPService {
 		current.resolveSettled();
 	}
 
-	private scheduleTypeScriptIdleEviction(key: string): void {
-		if (!key.startsWith("typescript:")) return;
+	private scheduleTypeScriptIdleEviction(
+		key: string,
+		server: LSPServerInfo,
+	): void {
+		// The registry owns this policy. Unmeasured and resident servers stay resident.
+		if (server.idleEviction !== "transparent") return;
 		// Pressure-gating these timers would require a separate reconciliation pass
 		// when the manager crosses the threshold; keep ownership simple and use the
 		// warm-LSP-friendly 20-minute default instead.
@@ -1917,18 +1943,14 @@ export class LSPService {
 					(this.clientLeases.get(key) ?? 0) > 0 ||
 					(this.clientLastUsedAt.get(key) ?? 0) !== lastUsedAt
 				) {
-					this.scheduleTypeScriptIdleEviction(key);
+					this.scheduleTypeScriptIdleEviction(key, server);
 					return;
 				}
 
 				// Publish the cold state synchronously before awaiting teardown. A request
 				// arriving while shutdown is in progress therefore waits on the spawn gate
 				// and creates a fresh client; it can never receive this retiring one.
-				this.releaseOutstandingAuxNotifyWrite(key);
-				this.state.clients.delete(key);
-				this.state.clientSpawnedAt.delete(key);
-				this.forgetReadiness(key);
-				this.clientLastUsedAt.delete(key);
+				this.retireClient(key);
 				try {
 					await client.shutdown({ reason: "typescript_idle_eviction" });
 				} catch {
@@ -2155,7 +2177,7 @@ export class LSPService {
 		const verdict = await this.notifyStallCpuVerdict(entry);
 		if (verdict.cpuVerdict === "busy") {
 			if (this.state.clients.get(key) === entry.client) {
-				this.scheduleTypeScriptIdleEviction(key);
+				this.scheduleTypeScriptIdleEviction(key, entry.info);
 			}
 			this.logNotifyStallCpuBusy(key, entry, filePath, 0, verdict);
 			return;
@@ -2270,20 +2292,12 @@ export class LSPService {
 		// An async verdict belongs to one client generation. Never let a
 		// predecessor's decision delete or cool down its replacement.
 		if (this.state.clients.get(key) !== entry.client) return;
-		this.notifyWriteBackpressureStreak.delete(key);
-		this.releaseOutstandingAuxNotifyWrite(key);
-		// #1714: the demoted client is torn down, so its backlog count describes a
-		// process that no longer exists. Leaving it would make the replacement start
-		// at the ceiling and pay a barrier on its first file.
-		this.auxNotifyInflight.delete(key);
+		// #1714: retireClient also drops the backlog count; leaving it would make
+		// the replacement start at the ceiling and pay a barrier on its first file.
 		this.state.broken.set(key, Date.now() + BROKEN_BASE_COOLDOWN_MS);
 		this.notifyStallDemotions.set(key, Date.now());
 		void entry.client.shutdown().catch(() => {});
-		this.state.clients.delete(key);
-		this.state.clientSpawnedAt.delete(key);
-		this.forgetReadiness(key);
-		this.clientLastUsedAt.delete(key);
-		this.clearTypeScriptIdleTimer(key);
+		this.retireClient(key);
 		logLatency({
 			type: "phase",
 			phase: "lsp_notify_backpressure_broken",
@@ -4049,7 +4063,7 @@ export class LSPService {
 			if (existing.isAlive()) {
 				this.unavailableLogged.delete(key);
 				this.clientLastUsedAt.set(key, Date.now());
-				this.scheduleTypeScriptIdleEviction(key);
+				this.scheduleTypeScriptIdleEviction(key, server);
 				if (!this.warmStartLogged.has(key)) {
 					logSessionStart(
 						`lsp warm-start ${server.id}: reused root=${root} file=${filePath}`,
@@ -4105,12 +4119,8 @@ export class LSPService {
 			} catch {
 				/* ignore dead client shutdown errors */
 			}
-			this.state.clients.delete(key);
-			this.state.clientSpawnedAt.delete(key);
 			// #3502: the replacement is cold and earns its own readiness verdict.
-			this.forgetReadiness(key);
-			this.clientLastUsedAt.delete(key);
-			this.clearTypeScriptIdleTimer(key);
+			this.retireClient(key);
 			this.state.broken.delete(key);
 
 			// #1127: count EARLY, non-intentional runtime exits toward the circuit
@@ -4539,7 +4549,7 @@ export class LSPService {
 			this.lastSpawnVerdict.delete(key);
 			this.state.clientSpawnedAt.set(key, Date.now());
 			this.clientLastUsedAt.set(key, Date.now());
-			this.scheduleTypeScriptIdleEviction(key);
+			this.scheduleTypeScriptIdleEviction(key, server);
 			this.failureCounts.delete(key);
 			if (isOptionalServer) {
 				this.optionalDisabled.delete(key);
@@ -7322,7 +7332,8 @@ export class LSPService {
 			});
 			return result;
 		} finally {
-			for (const key of leaseKeys) this.releaseClientLease(key);
+			for (const lease of leaseKeys)
+				this.releaseClientLease(lease.key, lease.server);
 		}
 	}
 
@@ -9375,8 +9386,16 @@ export class LSPService {
 								}
 							}
 							try {
-								await entry.client.notify.open(filePath, content, languageId);
-								if (auxKey) this.noteAuxNotifyIssued(auxKey, entry.client);
+								const sent = await entry.client.notify.open(
+									filePath,
+									content,
+									languageId,
+								);
+								// #3585: a refused write (`false`) never reached the server's
+								// input queue, so it is not part of the backlog.
+								if (auxKey && sent !== false) {
+									this.noteAuxNotifyIssued(auxKey, entry.client);
+								}
 								// #1783: deliberately NOT recorded for the drift backstop.
 								// This pass can skip a scanner at its backlog ceiling, so its
 								// coverage is partial by design, and `processFile` runs

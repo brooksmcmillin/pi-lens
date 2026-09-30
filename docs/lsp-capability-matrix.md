@@ -135,7 +135,7 @@ carries the named admission until then.
 | shell | bash-language-server | push-only | publishes-versioned | direct | 2 | dev+ci |
 | dockerfile | docker-langserver | push-only | publishes-unversioned | direct | 2* | dev+ci |
 | toml | taplo | push-only | publishes-unversioned | direct | 2* | dev+ci |
-| terraform | terraform-ls | push-only | TBD | TBD | 2/3? | dev+ci |
+| terraform | terraform-ls | push-only | publishes-unversioned | empty-first | 2* | dev+ci |
 | prisma | @prisma/language-server | push-only | publishes-unversioned | direct | 2* | dev+ci |
 | php | intelephense | push-only | publishes-unversioned | empty-first | 2* | dev+ci |
 | zig | zls | push-only | publishes-unversioned | direct | 2* | dev+ci |

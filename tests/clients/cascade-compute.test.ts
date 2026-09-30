@@ -2149,6 +2149,49 @@ describe("computeCascadeForFile", () => {
 		}
 	});
 
+	// #3605 review F3: a web-tree-sitter trap cost a file in the graph its
+	// symbols and imports, and the build completed. The dependents of that file
+	// are missing from every cascade, so a clean verdict would be a silent
+	// all-clear; only the build's count says so.
+	it("returns indeterminate when a wasm trap cost a file in the graph its extraction", async () => {
+		const env = setupTestEnvironment("cascade-wasm-trap-");
+		try {
+			const primary = path.join(env.tmpDir, "primary.py");
+			fs.writeFileSync(primary, "x = 1\n");
+			mocks.computeImpactCascade.mockReturnValue(impact(primary, []));
+			mocks.getLSPService.mockReturnValue({
+				...makeLspServiceDouble(),
+				getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
+				touchFile: vi.fn(),
+				getDiagnostics: vi.fn(),
+			});
+
+			const { computeCascadeForFile } =
+				await import("../../clients/dispatch/integration.js");
+			const { _setLastGraphBuildInfoForTests } =
+				await import("../../clients/review-graph/builder.js");
+			_setLastGraphBuildInfoForTests({
+				reused: true,
+				mode: "cached",
+				graphChanged: false,
+				wasmTrappedFiles: 2,
+			});
+
+			const run = await computeCascadeForFile(primary, env.tmpDir, {
+				turnSeq: 1,
+				writeSeq: 1,
+			});
+			expect(run.skipReason).toBe("indeterminate");
+			expect(run.indeterminate).toMatchObject({
+				reason: "graph_degraded",
+				detail:
+					"review graph degraded — tree-sitter wasm runtime failure in 2 file(s)",
+			});
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	// #1093/#1092: the cascade computes the correcting cross-file truth for every
 	// edited file's dependents, but that truth used to be display-only and was
 	// never reconciled into the footer widget. So a finding in A caused by B,

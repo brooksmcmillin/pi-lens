@@ -33,6 +33,30 @@ describe("renderMutationMarkdown", () => {
 		expect(markdown).not.toMatch(/score/i);
 	});
 
+	it("renders excluded tests and their reasons on the delivered scored summary", () => {
+		// Recurrence (#3625 F3): metadata-only exclusions made the scored report
+		// look as though the entire related population had been evaluated.
+		const markdown = renderMutationMarkdown({
+			files: {},
+			piLensMutationDiff: {
+				base: "origin/master",
+				headSha: "abc1234567890",
+				zeroMutants: null,
+				counts: { Killed: 1 },
+				score: "100.00",
+				testsExcluded: [
+					{
+						file: "tests/mcp/server.smoke.test.ts",
+						reason: "real stdio scheduling",
+					},
+				],
+			},
+		});
+		expect(markdown).toContain("Excluded tests:");
+		expect(markdown).toContain("tests/mcp/server.smoke.test.ts");
+		expect(markdown).toContain("real stdio scheduling");
+	});
+
 	it("round 4 R3-1: renders 0/no-zeroMutants/no-partial as not a clean pass, backstopping a driver branch that failed to set either", () => {
 		// Recurrence: the round-4 review mutated the driver's OWN success/zero
 		// branch (`if (mutants.length > 0)` -> `>= 0`) and its partial branch
@@ -319,6 +343,37 @@ describe("renderMutationMarkdown", () => {
 
 		expect(markdown).toContain("Sampled 40 of 212");
 		expect(markdown).toContain("deadbeef0000".slice(0, 12));
+	});
+
+	it("discloses a truncated related-test population on scored, partial, and zero reports", () => {
+		// Recurrence M3648-2: a bounded test population must not render as a
+		// complete score or an unexplained zero/partial result in the PR comment.
+		const testCap = { selected: 47, total: 155, dropped: 108 };
+		const scored = renderMutationMarkdown({
+			files: {},
+			piLensMutationDiff: { counts: { Killed: 1 }, score: "100.00", testCap },
+		});
+		const partial = renderMutationMarkdown({
+			files: {},
+			piLensMutationDiff: {
+				partial: { evaluated: 1, total: 2, reason: "budget expired" },
+				counts: { Killed: 1 },
+				score: "100.00",
+				testCap,
+			},
+		});
+		const zero = renderMutationMarkdown({
+			files: {},
+			piLensMutationDiff: {
+				zeroMutants: { reason: "no mutable lines" },
+				testCap,
+			},
+		});
+		for (const markdown of [scored, partial, zero]) {
+			expect(markdown).toContain("47 of 155 related tests selected");
+			expect(markdown).toContain("108 dropped");
+			expect(markdown).toContain("truncated test population");
+		}
 	});
 
 	it("carries the sticky-comment marker so the workflow can find and update its own comment", () => {

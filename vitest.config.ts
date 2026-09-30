@@ -342,6 +342,7 @@ export const realHarnessInclude = [
 	"tests/real-harness/child-exit.test.ts",
 	"tests/real-harness/tools-enabled.test.ts",
 	"tests/real-harness/diagnostic-provenance.test.ts",
+	"tests/real-harness/provider-compatibility.test.ts",
 ];
 
 // #1920: files that assert REAL wall-clock elapsed-time budgets (Date.now()
@@ -488,6 +489,10 @@ export const wallClockBudgetInclude = [
 	// #3451: runs the real pre-commit hook through git and xargs (flake-shape
 	// admission).
 	"tests/scripts/pre-commit-hook.test.ts",
+	// #3661: the pre-push hook's own stdin parsing and deletion-only early exit
+	// are the subject; the union witness runs the real script over a real git
+	// fixture (flake-shape admission).
+	"tests/scripts/pre-push-targeted-tests.test.ts",
 	"tests/scripts/prune-agent-worktrees.test.ts",
 	// #2619 review F1: the release-QA hermeticity canary spawns a REAL child
 	// under scratchEnv() and reads back what that child resolved. The defect it
@@ -498,6 +503,8 @@ export const wallClockBudgetInclude = [
 	// #2613: the resolver CLI's real exit code (2 vs. 4) and GITHUB_OUTPUT
 	// write are the subject under test; no in-process double is faithful.
 	"tests/scripts/resolve-newest-in-range-host.test.ts",
+	// #3674: real git worktrees and the real hook script (flake-shape admission).
+	"tests/scripts/setup-git-hooks.test.ts",
 	// #2369: the fixture-ordering defect lives in the CLI's own module-load
 	// order; only a real child process is the script under test.
 	"tests/scripts/smoke-tools-lsp-fixture-registration.test.ts",

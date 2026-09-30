@@ -62,6 +62,10 @@ import {
 } from "../review-graph-logger.js";
 import { getSharedTreeSitterClient } from "../tree-sitter-shared.js";
 import {
+	classifyTreeSitterWasmError,
+	type WasmTrapState,
+} from "../tree-sitter-client.js";
+import {
 	type ExtractedSymbols,
 	symbolExtractionGrammar,
 	TreeSitterSymbolExtractor,
@@ -355,6 +359,68 @@ function touchWorkspaceGraph(key: string): void {
 	scheduleWorkspaceGraphEviction(key, entry);
 }
 
+/**
+ * #3605: files whose last tree-sitter extraction a web-tree-sitter trap cost,
+ * with the trapped input's state. `addFileToGraph` is the only writer: each
+ * extraction sets or deletes its file. Keys are the build's normalized paths.
+ * Only paths whose content is one of the client's trapped inputs (at most
+ * `WASM_TRAP_BUDGET + 1` distinct inputs) get an entry, so the map is
+ * bounded by the paths holding a trapped input. Many identical files can
+ * share one input, and an entry for a deleted path is only overwritten,
+ * never evicted, until the process ends.
+ */
+const _wasmTrappedFiles = new Map<string, WasmTrapState>();
+
+/**
+ * Replace each trapped file's stored signature or hash, so the next build that
+ * reads `entries` re-extracts it (#3605). The in-memory cache stamps `retry`
+ * files only: a `charged` input is skipped by the client until it changes, so
+ * re-extracting it would only churn. What a restart reads stamps both.
+ */
+function stampWasmTrapped(
+	entries: Map<string, string>,
+	includeCharged: boolean,
+): Map<string, string> {
+	let stamped: Map<string, string> | undefined;
+	for (const [file, state] of _wasmTrappedFiles) {
+		if ((includeCharged || state === "retry") && entries.has(file)) {
+			stamped ??= new Map(entries);
+			stamped.set(file, "wasm-trapped");
+		}
+	}
+	return stamped ?? entries;
+}
+
+function stampWasmTrappedFiles<
+	T extends {
+		signature: string;
+		fileSignatures: Map<string, string>;
+		fileHashes?: Map<string, string> | undefined;
+	},
+>(stored: T, includeCharged: boolean): T {
+	const fileSignatures = stampWasmTrapped(
+		stored.fileSignatures,
+		includeCharged,
+	);
+	if (fileSignatures === stored.fileSignatures) return stored;
+	return {
+		...stored,
+		signature: sourceSignatureFromMap(fileSignatures),
+		fileSignatures,
+		fileHashes:
+			stored.fileHashes && stampWasmTrapped(stored.fileHashes, includeCharged),
+	};
+}
+
+/** Files in `graph` whose extraction a wasm trap cost (#3605). */
+function wasmTrappedFileCount(graph: ReviewGraph): number {
+	let count = 0;
+	for (const file of _wasmTrappedFiles.keys()) {
+		if (graph.fileNodes.has(file)) count++;
+	}
+	return count;
+}
+
 function setWorkspaceGraph(
 	key: string,
 	entry: Omit<WorkspaceGraphCacheEntry, "lastUsedAt" | "idleTimer">,
@@ -368,7 +434,7 @@ function setWorkspaceGraph(
 	// over-budget repo never accumulates an unbounded graph across the process.
 	const boundedGraph = retainedGraph(key, entry.graph);
 	const resident: WorkspaceGraphCacheEntry = {
-		...entry,
+		...stampWasmTrappedFiles(entry, false),
 		graph: boundedGraph,
 		lastUsedAt: Date.now(),
 	};
@@ -432,6 +498,8 @@ export type GraphBuildInfo = {
 	persistReason?: string;
 	/** When the seq fast path was attempted but fell back to the sweep (#451). */
 	seqFastpathFallback?: SeqFastpathFallback;
+	/** #3605: files in this graph whose extraction a wasm trap cost. */
+	wasmTrappedFiles?: number;
 	/**
 	 * #459: whether this build changed the graph content. `mode` alone is NOT
 	 * enough to tell — both "cached" and "seq-fastpath" cover a real no-op AND
@@ -2841,9 +2909,8 @@ function persistGraph(
 	const pending: PendingPersist = {
 		cacheDir,
 		cachePath,
-		signature,
-		fileSignatures,
-		fileHashes,
+		// #3605: a restart re-extracts every trapped file.
+		...stampWasmTrappedFiles({ signature, fileSignatures, fileHashes }, true),
 		graph: persistedGraph,
 		gitStamp,
 		elementCount,
@@ -3005,7 +3072,7 @@ function buildReviewGraphCheckpointData(
 		builtAt: new Date().toISOString(),
 		inProgress: true,
 		targetFileCount,
-		processedFiles: Array.from(processedHashes.entries()),
+		processedFiles: Array.from(stampWasmTrapped(processedHashes, true)),
 		ignoredIdsHash: hashIgnoredIds(ignoredIds),
 		nodes: Array.from(graph.nodes.entries()),
 		edges: graph.edges,
@@ -4033,7 +4100,7 @@ async function extractTreeSitterSymbols(
 	filePath: string,
 	languageId: string,
 	contentOverride?: string | null,
-): Promise<ExtractedSymbols> {
+): Promise<ExtractedSymbols & { wasmTrap?: WasmTrapState | undefined }> {
 	const empty: ExtractedSymbols = {
 		symbols: [],
 		refs: [],
@@ -4058,7 +4125,9 @@ async function extractTreeSitterSymbols(
 		content,
 		(tree) => extractor.extract(tree, filePath, content),
 	);
-	return extracted.parsed ? extracted.value : empty;
+	return extracted.parsed
+		? extracted.value
+		: { ...empty, wasmTrap: extracted.wasmTrap };
 }
 
 /**
@@ -4653,9 +4722,12 @@ async function addFileToGraph(
 		sharedIr?.kind === "tree-sitter" && sharedIr.languageId === languageId
 			? sharedIr.extracted
 			: undefined;
-	const extracted =
+	const extracted: ExtractedSymbols & { wasmTrap?: WasmTrapState | undefined } =
 		irExtracted ??
 		(await extractTreeSitterSymbols(file, languageId, contentOverride));
+	// #3605: remember a file a wasm trap cost, so a later build retries it.
+	if (extracted.wasmTrap) _wasmTrappedFiles.set(file, extracted.wasmTrap);
+	else _wasmTrappedFiles.delete(file);
 	addTreeSitterFile(graph, cwd, file, languageId, extracted, ignoredIds);
 	// Zero symbols consults the warm/open LSP fallback REGARDLESS of whether
 	// the symbols came from shared IR or direct extraction (#955 review): a
@@ -5241,6 +5313,11 @@ async function trySeqFastpath(
 			.map((file) => normalizeMapKey(file)),
 	);
 	for (const file of normalizedChanged) changedSet.add(file);
+	// #3605: a trapped file of this workspace is a candidate. A `retry` file's
+	// stored hash is stamped, so it re-extracts; a `charged` one costs a hash.
+	for (const file of _wasmTrappedFiles.keys()) {
+		if (cached.fileSignatures.has(file)) changedSet.add(file);
+	}
 	const changed = [...changedSet];
 	if (changed.length > SEQ_FASTPATH_MAX_CHANGES) {
 		return { fallback: "too-many-changes" };
@@ -6004,7 +6081,11 @@ export function buildOrUpdateGraph(
 	});
 	const promise = _doBuildGraph(cwd, changedFiles, facts, seqHint, buildId)
 		.then((graph) => {
-			const buildInfo = getGraphBuildInfoForGraph(graph);
+			let buildInfo = getGraphBuildInfoForGraph(graph);
+			const wasmTrappedFiles = wasmTrappedFileCount(graph);
+			if (wasmTrappedFiles > 0) {
+				buildInfo = updateGraphBuildInfo(graph, { wasmTrappedFiles });
+			}
 			if (buildInfo.mode === "skipped") {
 				const reason = buildInfo.skipReason ?? "skipped";
 				recordBuildAttempt(cwd, "skipped", reason, buildId);
@@ -6052,10 +6133,13 @@ export function buildOrUpdateGraph(
 		})
 		.catch((err) => {
 			const reason = err instanceof Error ? err.message : String(err);
+			const wasmFailure = classifyTreeSitterWasmError(err);
 			recordBuildAttempt(cwd, "failed", reason, buildId);
 			logReviewGraph({
 				cwd,
 				phase: "build_failed",
+				// #3605: an internal wasm failure, not a failed build.
+				failureClass: wasmFailure ? `wasm-${wasmFailure}` : "error",
 				reason,
 				durationMs: Date.now() - startedAt,
 				error: reason,

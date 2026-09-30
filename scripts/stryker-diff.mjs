@@ -11,6 +11,7 @@ import {
 	augmentAndSummarize,
 	buildRunConfig,
 	capMutationFiles,
+	capRelatedTests,
 	compiledJsPath,
 	decideMutationOutcome,
 	dedupePatterns,
@@ -20,10 +21,12 @@ import {
 	describeStrykerFailure,
 	estimateAffordableMutants,
 	formatCapNotice,
+	formatTestCapNotice,
 	isCompiledMutationSource,
 	isMutationSourceFile,
 	isScriptMutationFile,
 	mapRelatedTests,
+	DEFAULT_MAX_TESTS,
 	MUTATION_BUDGET_MINUTES,
 	mutationRangePatterns,
 	parseChangedLineRanges,
@@ -198,6 +201,7 @@ function writeReport(strykerReport, meta) {
 // with a `zeroMutants` report (reproduced live at 69413b03e -- see
 // "no PR-changed lines" in the spawn test below).
 let costEstimate = null;
+let relatedTestCapMeta = null;
 
 function baseMeta(extra) {
 	return {
@@ -217,6 +221,7 @@ function baseMeta(extra) {
 		// zero-mutant paths above) or when Stryker's dry-run output could not
 		// be parsed (`parseDryRunCost` returned null).
 		measuredTotalMutants: costEstimate?.totalMutants ?? null,
+		testCap: relatedTestCapMeta,
 		...extra,
 	};
 }
@@ -246,7 +251,38 @@ if (files.length === 0) {
 	process.exit(0);
 }
 
-const { covered, uncovered, tests } = mapRelatedTests(files);
+let selection;
+try {
+	selection = mapRelatedTests(files);
+} catch (error) {
+	const reason = `mutation diff: invalid mutation-lane exclusion registry (${error.name ?? "Error"}): ${error.message}`;
+	console.error(reason);
+	writeReport(
+		null,
+		baseMeta({ zeroMutants: { reason }, filesSkippedOverCap: skipped }),
+	);
+	process.exit(1);
+}
+const { covered, uncovered, excluded } = selection;
+const relatedTestCap = capRelatedTests(
+	selection.tests,
+	DEFAULT_MAX_TESTS,
+	selection.priorities,
+);
+const tests = relatedTestCap.selected;
+relatedTestCapMeta = {
+	selected: tests.length,
+	total: selection.tests.length,
+	dropped: relatedTestCap.dropped.length,
+};
+if (relatedTestCap.dropped.length > 0) {
+	console.log(formatTestCapNotice(tests.length, selection.tests.length));
+}
+for (const { file, reason } of excluded) {
+	console.log(
+		`mutation diff: excluding ${file} from dry-run gating (${reason})`,
+	);
+}
 for (const file of uncovered) {
 	console.log(`mutation diff: no covering test for ${file}`);
 }
@@ -260,6 +296,7 @@ if (covered.length === 0) {
 			zeroMutants: { reason },
 			filesSkippedOverCap: skipped,
 			filesUncovered: uncovered,
+			testsExcluded: excluded,
 		}),
 	);
 	process.exit(0);
@@ -400,7 +437,10 @@ if (measureResult.error || measureResult.status !== 0) {
 	// The measurement dry run IS the real run's own dry run (same tests, same
 	// code): if it fails here, the real run would fail identically, so report
 	// that failure now instead of spending a second, redundant dry run.
-	const reason = describeStrykerFailure(measureResult, budgetMinutes);
+	const reason = describeStrykerFailure(measureResult, budgetMinutes, {
+		tests,
+		output: measureOutput,
+	});
 	console.error(reason);
 	writeReport(
 		null,
@@ -410,6 +450,7 @@ if (measureResult.error || measureResult.status !== 0) {
 			filesUncovered: uncovered,
 			rangesTotal: allPatterns.length,
 			testsRun: tests,
+			testsExcluded: excluded,
 		}),
 	);
 	process.exit(1);
@@ -509,7 +550,11 @@ for (;;) {
 	rmSync(INCREMENTAL_PATH, { force: true });
 
 	console.log(`mutation diff: mutating ${patterns.join(", ")}`);
-	console.log(`mutation diff: running related tests ${tests.join(", ")}`);
+	const testSummary =
+		tests.join(", ").length <= 240 ? `; selected: ${tests.join(", ")}` : "";
+	console.log(
+		`mutation diff: running ${tests.length} of ${selection.tests.length} related tests${testSummary}`,
+	);
 	console.log(`mutation diff: budget ${budgetMinutes} minute(s)`);
 	const result = spawnSync(
 		"node_modules/.bin/stryker",
@@ -559,10 +604,10 @@ for (;;) {
 			rangesEvaluated: triedPatterns.length,
 			rangesTotal: allPatterns.length,
 			totalMutants: costEstimate?.totalMutants ?? null,
-			failureReason: describeStrykerFailure(result, budgetMinutes),
+			failureReason: describeStrykerFailure(result, budgetMinutes, { tests }),
 			partialReason: describePartialInterruptCause(result, budgetMinutes),
 		});
-		console.error(describeStrykerFailure(result, budgetMinutes));
+		console.error(describeStrykerFailure(result, budgetMinutes, { tests }));
 		if (outcome.partial) {
 			console.log(
 				`mutation diff: partial report -- ${outcome.partial.evaluated} of ${outcome.partial.total ?? "an unknown total of"} mutant(s) evaluated before the interrupt`,
@@ -658,6 +703,7 @@ for (;;) {
 				rangesEvaluated: triedPatterns.length,
 				rangesSampled: sampled,
 				testsRun: tests,
+				testsExcluded: excluded,
 				counts,
 				score,
 			}),

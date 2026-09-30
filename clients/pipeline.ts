@@ -75,6 +75,7 @@ import {
 import { loadLspService } from "./lsp-lazy.js";
 import type { MetricsClient } from "./metrics-client.js";
 import { clearGraphCache } from "./review-graph/builder.js";
+import { classifyTreeSitterWasmError } from "./tree-sitter-client.js";
 import { BoundedLruCache } from "./bounded-cache.js";
 import type { RuffClient } from "./ruff-client.js";
 import { RUNTIME_CONFIG } from "./runtime-config.js";
@@ -2097,10 +2098,18 @@ async function analysePipeline(
 						// #1023: a thrown compute is ALSO "couldn't compute downstream
 						// impact" — carry an indeterminate marker so turn_end surfaces an
 						// honest advisory instead of the error skip being logs-only.
-						indeterminate: {
-							reason: "error",
-							detail: "cascade computation failed",
-						},
+						// #3605: a tree-sitter wasm failure degraded the graph; it is
+						// not a compute error.
+						indeterminate: classifyTreeSitterWasmError(err)
+							? {
+									reason: "graph_degraded",
+									detail:
+										"review graph degraded — tree-sitter wasm runtime failure",
+								}
+							: {
+									reason: "error",
+									detail: "cascade computation failed",
+								},
 					};
 				});
 

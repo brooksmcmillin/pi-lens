@@ -440,6 +440,12 @@ describe("#2981 long-lived containers are bounded or admitted", () => {
 		"clients/review-graph/builder.ts#_persistGenerations:fe391d04",
 		"clients/review-graph/builder.ts#_lastWorkerFallbackReasonForTests:ae62be11",
 		"clients/review-graph/builder.ts#_checkpointGenerations:7a0f0107",
+		// #3605: `_wasmTrappedFiles`. An entry exists only for a file whose
+		// extraction a web-tree-sitter trap cost, i.e. a path whose content is
+		// one of the client's at most WASM_TRAP_BUDGET + 1 trapped inputs (bounded
+		// by the paths holding a trapped input, not by the input count), and the
+		// file's next extraction without a trap deletes it.
+		"clients/review-graph/builder.ts#touchWorkspaceGraph:cef88570",
 		"clients/review-graph/workspace-modules.ts#getDownstreamModules:49987247",
 		"clients/runtime-tool-result.ts#parseDiffRanges:eb9b9896",
 		"clients/runtime-tool-result.ts#inFlightPipelines:5e20396b",
