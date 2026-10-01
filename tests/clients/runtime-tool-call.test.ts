@@ -343,6 +343,79 @@ describe("handleToolCall", () => {
 		}
 	});
 
+	it.each(["7078", "task_7078"])(
+		"allows first receipt creation for %s with present or missing scratchpad",
+		async (taskId) => {
+			const env = setupTestEnvironment("pi-lens-receipt-create-");
+			try {
+				const filePath = path.join(
+					env.tmpDir,
+					".scratchpad",
+					"claim-receipt-7078.json",
+				);
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+				const recordRead = vi.spyOn(runtime.readGuard, "recordRead");
+				const noteCreatedFile = vi.spyOn(runtime.readGuard, "noteCreatedFile");
+				for (const present of [false, true]) {
+					if (present) fs.mkdirSync(path.dirname(filePath));
+					const result = await handleToolCall(
+						baseDeps({
+							runtime,
+							ctx: { cwd: env.tmpDir },
+							event: {
+								toolName: "write_taskmanager_claim_receipt",
+								input: { task_id: taskId, path: filePath },
+							},
+						}),
+					);
+					expect(result).toBeUndefined();
+					expect(fs.existsSync(filePath)).toBe(false);
+				}
+				expect(recordRead).not.toHaveBeenCalled();
+				expect(noteCreatedFile).not.toHaveBeenCalled();
+			} finally {
+				env.cleanup();
+			}
+		},
+	);
+
+	it.each(["directory target", "file parent", "dangling parent"])(
+		"blocks receipt creation with a %s",
+		async (kind) => {
+			const env = setupTestEnvironment("pi-lens-receipt-unsafe-create-");
+			try {
+				const scratchpad = path.join(env.tmpDir, ".scratchpad");
+				const filePath = path.join(scratchpad, "claim-receipt-7078.json");
+				if (kind === "directory target")
+					fs.mkdirSync(filePath, { recursive: true });
+				else if (kind === "file parent")
+					fs.writeFileSync(scratchpad, "not a directory");
+				else
+					fs.symlinkSync(
+						path.join(env.tmpDir, "missing-directory"),
+						scratchpad,
+						"dir",
+					);
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+				const result = await handleToolCall(
+					baseDeps({
+						runtime,
+						ctx: { cwd: env.tmpDir },
+						event: {
+							toolName: "write_taskmanager_claim_receipt",
+							input: { task_id: "7078", path: filePath },
+						},
+					}),
+				);
+				expect(result).toMatchObject({ block: true });
+			} finally {
+				env.cleanup();
+			}
+		},
+	);
+
 	it("allows the dedicated claim-receipt replacement without exposing stale contents as a read", async () => {
 		const env = setupTestEnvironment("pi-lens-runtime-tool-call-receipt-");
 		try {
@@ -521,6 +594,7 @@ describe("handleToolCall", () => {
 				".scratchpad",
 				"claim-receipt-7078.json",
 			);
+			fs.mkdirSync(filePath, { recursive: true });
 			const runtime = new RuntimeCoordinator();
 			runtime.projectRoot = env.tmpDir;
 			const recordAttribution = vi

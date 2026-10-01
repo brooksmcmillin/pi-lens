@@ -1,5 +1,5 @@
 import * as nodeFs from "node:fs";
-import * as path from "node:path";
+import path, { dirname } from "node:path";
 import { loadBootstrapClients, requestBootstrapClients } from "./bootstrap.js";
 import type { CacheManager } from "./cache-manager.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
@@ -239,6 +239,26 @@ function isOpaqueReplaceTargetStable(filePath: string): boolean {
 		);
 	} catch {
 		return false;
+	}
+}
+
+function isClaimReceiptTargetStable(filePath: string): boolean {
+	let candidate = filePath;
+	while (true) {
+		try {
+			const entry = nodeFs.lstatSync(candidate);
+			return (
+				(candidate === filePath ? entry.isFile() : entry.isDirectory()) &&
+				isOpaqueReplaceTargetStable(candidate)
+			);
+		} catch (probeFailure) {
+			// Only genuine absence permits creation; dangling links and probe failures block.
+			if ((probeFailure as NodeJS.ErrnoException).code !== "ENOENT")
+				return false;
+			const parent = dirname(candidate);
+			if (parent === candidate) return false;
+			candidate = parent;
+		}
 	}
 }
 
@@ -546,10 +566,16 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 		} catch {
 			filePath = undefined;
 		}
-		if (!filePath || !isOpaqueReplaceTargetStable(filePath)) {
+		const isClaimReceipt = mutation?.source === "taskmanager-claim-receipt";
+		const stableTarget =
+			filePath &&
+			(isClaimReceipt
+				? isClaimReceiptTargetStable(filePath)
+				: isOpaqueReplaceTargetStable(filePath));
+		if (!stableTarget) {
 			return {
 				block: true,
-				reason: `Opaque replacement requires a stable existing target: ${filePath ?? "unresolved"}`,
+				reason: `Opaque replacement requires a stable existing target${isClaimReceipt ? " or stable receipt creation ancestry" : ""}: ${filePath ?? "unresolved"}`,
 			};
 		}
 	}
