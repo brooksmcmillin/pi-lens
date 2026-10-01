@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-	MISSING_ISSUE_REF_MESSAGE,
 	MISSING_PREFIX_MESSAGE,
 	lintPrTitle,
 	resolveLivePrTitle,
@@ -32,15 +31,11 @@ describe("PR title lint (#1844)", () => {
 		});
 	});
 
-	// Policy (#1917 review F1): the issue ref must live in the TITLE. Merges
-	// are merge commits from the PR title, so a ref sitting only in the body
-	// never survives into the merge-commit subject line -- it must not
-	// rescue an otherwise-unreferenced title. This is the regression case
-	// for the fallback (`|| ISSUE_REF.test(body)`) that used to live here.
-	it("rejects a title with no issue ref even when the body has one", () => {
-		const result = lintPrTitle("chore: tidy scripts", "Refs #789");
-		expect(result.valid).toBe(false);
-		expect(result.errors).toContain(MISSING_ISSUE_REF_MESSAGE);
+	it("accepts a title with an issue ref only in the body", () => {
+		expect(lintPrTitle("chore: tidy scripts", "Refs #789")).toEqual({
+			valid: true,
+			errors: [],
+		});
 	});
 
 	it("rejects a title with no conventional prefix", () => {
@@ -55,10 +50,11 @@ describe("PR title lint (#1844)", () => {
 		expect(result.errors).toContain(MISSING_PREFIX_MESSAGE);
 	});
 
-	it("rejects a title with no issue reference", () => {
-		const result = lintPrTitle("fix: repair the widget cache");
-		expect(result.valid).toBe(false);
-		expect(result.errors).toContain(MISSING_ISSUE_REF_MESSAGE);
+	it("accepts a title with no issue reference", () => {
+		expect(lintPrTitle("fix: repair the widget cache")).toEqual({
+			valid: true,
+			errors: [],
+		});
 	});
 
 	it("rejects a prefix with no colon-space separator", () => {
@@ -67,13 +63,10 @@ describe("PR title lint (#1844)", () => {
 		expect(result.errors).toContain(MISSING_PREFIX_MESSAGE);
 	});
 
-	it("reports both errors when both are missing", () => {
+	it("reports only the prefix error for an unreferenced plain title", () => {
 		const result = lintPrTitle("repair the cache");
 		expect(result.valid).toBe(false);
-		expect(result.errors).toEqual([
-			MISSING_PREFIX_MESSAGE,
-			MISSING_ISSUE_REF_MESSAGE,
-		]);
+		expect(result.errors).toEqual([MISSING_PREFIX_MESSAGE]);
 	});
 
 	it("accepts a cross-repo style issue ref count in the title (# followed by digits only)", () => {

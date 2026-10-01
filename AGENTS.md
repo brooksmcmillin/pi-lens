@@ -55,7 +55,9 @@ Every issue and PR states the outcome first, then evidence, root cause or a
 labeled hypothesis, acceptance criteria, non-goals, failure semantics, test
 matrix, observability, and class-sweep coverage. Use `refs #N` unless every
 acceptance criterion is complete; use `closes #N` only for a complete fix.
-Issue references belong in PR titles.
+Issue references are optional in PR titles and commit subjects; conventional
+PR-title prefixes remain required. CI and local preflight do not validate PR-body
+structure, and CI does not gate on production dependency audit findings.
 
 Before coding, trace the production entry point and write the invariants and
 state-space table for stateful, ordered, resource-mutating, or security work.

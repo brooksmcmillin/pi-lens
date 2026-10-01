@@ -20,6 +20,9 @@ npm run lint
 npm test
 ```
 
+CI retains lint and type-checking, but does not gate on production dependency
+audit findings or PR-body structure. The PR template is reviewer guidance.
+
 Pull requests must pass `npm run lint`. Run targeted test files for touched seams locally after `npm run build`; the full `npm test` suite is CI's job. CI also runs `npm run check:lockfile` and a production `--omit=dev` build (`npm run build:dist`), so keep `package-lock.json` in sync with `package.json`.
 
 ## Local git hooks
@@ -122,7 +125,7 @@ This avoids spending time on a direction the maintainers may not accept.
 - [ ] `npm run build:dist` succeeds if you changed code under `clients/`, `commands/`, `tools/`, or `index.ts`
 - [ ] `package-lock.json` is in sync with `package.json` (run `npm install` after dep changes)
 - [ ] New rules, runners, or LSP servers follow the wiring checklists below
-- [ ] Commit subject includes the issue number: `(closes #NNN)` or `(refs #NNN)`
+- [ ] PR title uses a conventional prefix; issue references are optional
 - [ ] `AGENTS.md` is updated if your change changes behavior, commands, conventions, or invariants documented there
 
 ## How the codebase is organized
@@ -269,7 +272,7 @@ Issue labels use one **type** + one or more **area** labels:
 - Types: `bug`, `feature`, `enhancement`, `documentation`
 - Areas: `area:lsp`, `area:dispatch`, `area:installer`, `area:diagnostics`, `area:read-guard`, `area:project-intelligence`, `area:perf`, `area:observability`, `area:session`, `area:config`, `area:security`, `area:tests`
 
-Commit subjects must include the issue number: `(closes #NNN)` only when the commit fully resolves the issue; otherwise `(refs #NNN)`.
+Issue references are optional in PR titles and commit subjects. If referencing an issue, use `(closes #NNN)` only when the change fully resolves it; otherwise use `(refs #NNN)`.
 
 When fixing a bug, add a regression test that would have caught it.
 

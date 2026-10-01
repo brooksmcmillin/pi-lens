@@ -220,16 +220,6 @@ export function runPreflight({
 				],
 				job: "Close-keyword syntax",
 			},
-			{
-				name: "check-pr-body",
-				command: [
-					process.execPath,
-					"scripts/check-pr-body.mjs",
-					"--lint-local",
-					"PR_BODY.md",
-				],
-				job: "PR body (advisory)",
-			},
 		);
 	}
 	validateSelectors({ only, skip }, gates);
