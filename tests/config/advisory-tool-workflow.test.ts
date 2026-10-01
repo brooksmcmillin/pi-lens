@@ -113,24 +113,13 @@ describe("#2706 advisory tooling workflow contracts", () => {
 });
 
 describe("#2714 dependabot skips the human PR-policy checks", () => {
-	// Recurrence: Dependabot PRs can never carry an issue ref in the title or
-	// the PR-body template, so `PR title` and `PR body (advisory)` went red on
-	// every bump and the merge train ignored them by hand. The skip must stay
-	// on exactly the three policy jobs (pr-title-lint, pr-body-lint in
-	// lint.yml plus the close-keyword job in close-keywords.yml); no other job
-	// may inherit it, or a bump would skip a check that still applies to it.
+	// Dependabot bypasses the human title convention, not code checks.
 	const dependabotSkip =
 		"github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]'";
 
-	it("skips pr-title-lint and pr-body-lint for dependabot and no other lint.yml job", () => {
-		const policyJobs = ["pr-title-lint", "pr-body-lint"];
+	it("skips pr-title-lint for dependabot and no other lint.yml job", () => {
+		const policyJobs = ["pr-title-lint"];
 		expect(workflow.jobs["pr-title-lint"]?.if).toBe(dependabotSkip);
-		expect(workflow.jobs["pr-body-lint"]?.if).toContain(
-			"github.event_name == 'pull_request'",
-		);
-		expect(workflow.jobs["pr-body-lint"]?.if).toContain(
-			"github.event.pull_request.user.login != 'dependabot[bot]'",
-		);
 		const others = Object.keys(workflow.jobs).filter(
 			(key) => !policyJobs.includes(key),
 		);
@@ -156,43 +145,36 @@ describe("#2714 dependabot skips the human PR-policy checks", () => {
 	});
 });
 
-describe("#3030 PR body lint event coverage", () => {
-	function bodyJobRunsFor(action: string): boolean {
-		const condition = workflow.jobs["pr-body-lint"]?.if ?? "";
-		return (
-			condition.includes("github.event_name == 'pull_request'") &&
-			!condition.includes(`github.event.action != '${action}'`)
+describe("fork CI policy", () => {
+	it("does not run PR-body validation", () => {
+		expect(workflow.jobs["pr-body-lint"]).toBeUndefined();
+		const commands = Object.values(workflow.jobs).flatMap((job) =>
+			(job.steps ?? []).map((step) => String(step.run ?? "")),
 		);
-	}
+		expect(commands.join("\n")).not.toContain("check-pr-body.mjs");
+	});
 
-	it("keeps the workflow event matrix and PR-body action matrix exact", () => {
-		// Recurrence: ordinary synchronize events need not revalidate an unchanged
-		// PR body, but edited metadata/body events must still run the advisory check.
+	it("retains lint and type-checking without a dependency-audit gate", () => {
+		const ci = yaml.load(
+			readFileSync(resolve(ROOT, ".github/workflows/ci.yml"), "utf8"),
+		) as typeof workflow;
+		const lint = Object.values(ci.jobs).find(
+			(job) => job.name === "Lint & type-check",
+		);
+		expect(lint).toBeDefined();
+		expect(lint?.steps?.some((step) => step.run === "npm run lint")).toBe(true);
+		const commands = Object.values(ci.jobs).flatMap((job) =>
+			(job.steps ?? []).map((step) => String(step.run ?? "")),
+		);
+		expect(commands.join("\n")).not.toContain("audit-prod-deps.mjs");
+	});
+
+	it("retains edited-metadata events for title validation", () => {
 		expect(workflow.on?.pull_request?.types).toEqual([
 			"opened",
 			"synchronize",
 			"reopened",
 			"edited",
 		]);
-		const actionMatrix = {
-			opened: true,
-			reopened: true,
-			edited: true,
-			synchronize: false,
-		} as const;
-		for (const [action, expected] of Object.entries(actionMatrix)) {
-			expect(bodyJobRunsFor(action), `${action} PR-body validation`).toBe(
-				expected,
-			);
-		}
-	});
-
-	it("keeps the synchronize exclusion exclusive to PR-body lint", () => {
-		const excludedJobs = Object.entries(workflow.jobs)
-			.filter(([, job]) =>
-				(job.if ?? "").includes("github.event.action != 'synchronize'"),
-			)
-			.map(([key]) => key);
-		expect(excludedJobs).toEqual(["pr-body-lint"]);
 	});
 });

@@ -1,40 +1,18 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-// Repo convention: conventional-commit-style prefix, then an issue
-// reference, BOTH IN THE TITLE. Merges are merge commits from the PR title
-// (see AGENTS.md), so a malformed title becomes the permanent commit
-// subject -- catch it before merge, not after. A ref that lives only in the
-// body doesn't survive into the merge-commit subject line, so it doesn't
-// satisfy the convention (policy decision, #1844 PR #1917 review F1): the
-// body is never consulted here, on purpose.
+// Keep merge-commit subjects conventional; issue references are optional.
 const CONVENTIONAL_PREFIX =
 	/^(feat|fix|chore|docs|refactor|test|ci|perf)(\([^)]+\))?: .+/;
-const ISSUE_REF = /#\d+/;
 
 export const MISSING_PREFIX_MESSAGE =
-	'PR title must start with a conventional prefix and a colon, for example "fix: repair the widget cache (refs #123)". ' +
+	'PR title must start with a conventional prefix and a colon, for example "fix: repair the widget cache". ' +
 	"Allowed prefixes: feat, fix, chore, docs, refactor, test, ci, perf.";
 
-export const MISSING_ISSUE_REF_MESSAGE =
-	'PR title must reference an issue (e.g. "#123"). Use "Closes #123" when the PR fully resolves the issue, or "Refs #123" when work remains. A reference in the PR body alone does not count -- the title becomes the merge-commit subject.';
-
-/**
- * Lint a PR title against the repo's conventional-prefix + issue-ref
- * convention. Both requirements are checked against the TITLE ONLY. `body`
- * is accepted but intentionally never read -- it stays in the signature so
- * a caller can pass it through unchanged, and so the regression test for
- * this policy (#1917 review F1: dropping the old title-or-body fallback)
- * can prove a ref sitting only in the body no longer rescues the title.
- * Pure function so it is unit-testable without a GitHub event payload.
- */
 export function lintPrTitle(title = "") {
 	const errors = [];
 	if (!CONVENTIONAL_PREFIX.test(title.trim())) {
 		errors.push(MISSING_PREFIX_MESSAGE);
-	}
-	if (!ISSUE_REF.test(title)) {
-		errors.push(MISSING_ISSUE_REF_MESSAGE);
 	}
 	return { valid: errors.length === 0, errors };
 }

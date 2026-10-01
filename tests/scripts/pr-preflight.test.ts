@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CI_JOB_NAMES } from "../../scripts/lib/ci-checks.mjs";
 
@@ -108,6 +111,31 @@ describe("pr preflight", () => {
 		expect(exitCode).toBe(1);
 		expect(log.mock.calls[0][0]).toContain("ENOENT injected");
 		log.mockRestore();
+	});
+	it("omits PR-body validation from metadata-enabled local preflight", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "pi-lens-preflight-policy-"));
+		const log = vi.spyOn(console, "log").mockImplementation(() => {});
+		try {
+			writeFileSync(join(cwd, "COMMIT_MSG.txt"), "ci: simplify gates\n");
+			writeFileSync(join(cwd, "PR_BODY.md"), "A policy change.\n");
+			spawnSync.mockReturnValue({ status: 0, stdout: "", stderr: "" });
+			expect(runPreflight({ cwd, spawn: spawnSync, env: {} })).toBe(0);
+			const args = spawnSync.mock.calls.flatMap((call) => call[1]);
+			expect(args).toContain("scripts/check-pr-title.mjs");
+			expect(args).toContain("scripts/check-close-keywords.mjs");
+			expect(args).not.toContain("scripts/check-pr-body.mjs");
+			expect(() =>
+				runPreflight({
+					cwd,
+					argv: ["--only", "check-pr-body"],
+					spawn: spawnSync,
+					env: {},
+				}),
+			).toThrow(/--only check-pr-body.*valid gate names/);
+		} finally {
+			log.mockRestore();
+			rmSync(cwd, { recursive: true, force: true });
+		}
 	});
 	it("runs Vitest gates through the shared test lock", () => {
 		spawnSync.mockReturnValue({ status: 0, stdout: "", stderr: "" });
