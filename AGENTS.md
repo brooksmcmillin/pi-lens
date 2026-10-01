@@ -733,6 +733,13 @@ search, LSP, bridge, bash-view, and authored-write evidence, but name-only
 `ls`/`find` output is not file content. Partial edits consume preflight-approved
 spans and never re-search stale bytes.
 
+Canonical TaskManager claim receipts stay opaque to read coverage. Their
+create-or-replace preflight admits a missing target only beneath stable
+existing directory ancestry. Reject symlinks, non-file targets, non-directory
+ancestors, and probe errors other than absence. Generic opaque replacements
+still require an existing stable target; the receipt writer owns permissions
+and execution-time validation.
+
 </important>
 ## Commands and gates
 
