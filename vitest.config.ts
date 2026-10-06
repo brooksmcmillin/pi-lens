@@ -307,6 +307,14 @@ const lspSpawnHeavyInclude = [
 	// project unless it is explicitly phased here. `test:integration` still
 	// selects the same file positionally, while `test:unit` excludes it below.
 	"tests/clients/lsp/workspace-diagnostics-sweep-attribution.integration.test.ts",
+	// #3961: the `--lsp` cold-path witness spawns the real bin, which spawns
+	// real LSP children (deno `lsp`, opengrep `lsp`, typos-lsp, ast-grep `lsp`)
+	// for the file. The indirect spawn is invisible to this lane's marker census
+	// (a bare `launchLSP(`, a `getServerById(` lookup, or the fake-LSP fixture
+	// import) because the bin is a separate process, so the membership is stated
+	// here by hand rather than pretended to be derived. The file runs once: the
+	// default project excludes this list.
+	"tests/mcp/analyze-cli.test.ts",
 	"tests/support/fake-lsp-server.test.ts",
 	// #873/#448: the dispatch LSP runner against a real stdio JSON-RPC server
 	// — a real child spawn through the production LSPService plus a

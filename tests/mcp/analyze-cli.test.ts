@@ -27,6 +27,7 @@ import {
 	turnEndStatusPathForCwd,
 	WARM_TURN_END_SCHEMA_VERSION,
 } from "../../clients/mcp/ipc.js";
+import { getProjectDataDir } from "../../clients/file-utils.js";
 import { AUTOMATION_FRAMING } from "../../clients/runtime-context.js";
 import { removeTempDirSync } from "../clients/test-utils.js";
 import { McpHarness } from "./harness.js";
@@ -51,10 +52,12 @@ function runBin(
 	stdin?: string,
 	nodeArgs: string[] = [],
 	home = path.join(testIsolationDir, "home"),
+	cwd?: string,
 ): Promise<{ stdout: string; stderr: string; code: number }> {
 	return new Promise((resolve, reject) => {
 		const child = spawn(process.execPath, [...nodeArgs, binJs, ...args], {
 			stdio: ["pipe", "pipe", "pipe"],
+			cwd,
 			env: {
 				...process.env,
 				HOME: home,
@@ -254,6 +257,320 @@ describe("pi-lens-analyze bin", { retry: 2 }, () => {
 		expect(stdout).toContain("pi-lens:");
 		expect(stdout).toMatch(/deep-nesting|console-statement/);
 	}, 45_000);
+});
+
+/** The `metadata.runners[].id` set of the last `dispatch_complete` record per file in a latency sink. */
+function readDispatchRunnerIds(logPath: string): Map<string, string[]> {
+	const byFile = new Map<string, string[]>();
+	if (!fs.existsSync(logPath)) return byFile;
+	for (const line of fs.readFileSync(logPath, "utf8").trim().split("\n")) {
+		if (!line) continue;
+		let row: {
+			type?: string;
+			result?: string;
+			filePath?: string;
+			metadata?: { runners?: { id?: unknown }[] };
+		};
+		try {
+			row = JSON.parse(line) as typeof row;
+		} catch {
+			continue;
+		}
+		if (row.type !== "tool_result" || row.result !== "dispatch_complete") {
+			continue;
+		}
+		if (!row.filePath) continue;
+		byFile.set(
+			row.filePath,
+			(row.metadata?.runners ?? []).map((runner) => String(runner.id)),
+		);
+	}
+	return byFile;
+}
+
+interface AnalyzeFailureRecord {
+	metadata: { cwd: string; operation: string; reason: string };
+}
+
+/** The last `analyze-cli-failed` extension-log record written under `home`. */
+function readFailureRecord(home: string): AnalyzeFailureRecord | undefined {
+	const logPath = path.join(home, "extension.log");
+	if (!fs.existsSync(logPath)) return undefined;
+	let last: AnalyzeFailureRecord | undefined;
+	for (const line of fs.readFileSync(logPath, "utf8").trim().split("\n")) {
+		if (!line) continue;
+		try {
+			const row = JSON.parse(line) as {
+				message?: string;
+				metadata?: { cwd?: string; operation?: string; reason?: string };
+			};
+			if (
+				row.message === "analyze-cli-failed" &&
+				typeof row.metadata?.cwd === "string" &&
+				typeof row.metadata.reason === "string" &&
+				typeof row.metadata.operation === "string"
+			) {
+				last = {
+					metadata: {
+						cwd: row.metadata.cwd,
+						operation: row.metadata.operation,
+						reason: row.metadata.reason,
+					},
+				};
+			}
+		} catch {
+			/* not a record */
+		}
+	}
+	return last;
+}
+
+/**
+ * #3961 — deterministic witnesses for the #3935 added-line mutation survivors,
+ * driven through the real built bin (`node mcp/analyze-cli.js`). Each case
+ * asserts an independent effect of the real cold analyzer — the rendered
+ * header, the `analyze-cli-failed` record, the dispatch latency sink, or the
+ * durable `turn-state.json` — never a captured options object and never an
+ * in-process library/store double. Only true external boundaries are faked
+ * (the stdin stream here).
+ */
+describe("pi-lens-analyze cold-path witnesses", { retry: 2 }, () => {
+	let coldDir: string;
+	// Every cwd a case hands to the bin, so the describe can remove exactly the
+	// `turnEndStatusPathForCwd` artifacts those cases own (#3961 F3). `coldDir`
+	// plus the two argv cwds the failure/fallback cases create; no glob, no
+	// foreign deletion.
+	const ownedCwds = new Set<string>();
+
+	const ownCwd = (cwd: string): string => {
+		ownedCwds.add(cwd);
+		return cwd;
+	};
+
+	beforeEach(() => {
+		coldDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-cli-cold-"));
+		ownedCwds.add(coldDir);
+	});
+
+	afterEach(() => {
+		for (const cwd of ownedCwds) {
+			try {
+				fs.rmSync(turnEndStatusPathForCwd(cwd), { force: true });
+			} catch {
+				/* best effort, same as the turn-end describe's own cleanup */
+			}
+		}
+		ownedCwds.clear();
+		vi.unstubAllEnvs();
+		removeTempDirSync(coldDir);
+	});
+
+	const writeFindingFile = (name: string): string => {
+		const file = path.join(coldDir, name);
+		fs.writeFileSync(file, SMELLY);
+		return file;
+	};
+
+	// ids 21 and 33: with no `--cwd` and no stdin payload, cwd falls back to
+	// process.cwd() through the optional chain — it must not crash or be lost.
+	it("renders the report relative to the child cwd when --cwd is omitted", async () => {
+		const file = writeFindingFile("smelly.ts");
+		const { stdout, code } = await runBin(
+			[`--file=${file}`],
+			undefined,
+			[],
+			undefined,
+			coldDir,
+		);
+		expect(code).toBe(0);
+		expect(stdout.split("\n")[0]).toContain("🔎 pi-lens: smelly.ts ");
+	}, 45_000);
+
+	// ids 21 and 22: a stdin read failure must record the `--cwd` argv value,
+	// not the child's process.cwd().
+	it("records the --cwd value when the stdin read fails", async () => {
+		vi.stubEnv("PI_LENS_TEST_MODE", "0");
+		const argvCwd = ownCwd(path.join(coldDir, "argv-cwd"));
+		const childCwd = path.join(coldDir, "child-cwd");
+		fs.mkdirSync(argvCwd);
+		fs.mkdirSync(childCwd);
+		const home = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-cli-stdin-home-"),
+		);
+		const preload = new URL(
+			"../fixtures/mcp/analyze-cli-stdin-error.mjs",
+			import.meta.url,
+		);
+		try {
+			const { code } = await runBin(
+				[`--cwd=${argvCwd}`],
+				undefined,
+				["--import", preload.href],
+				home,
+				childCwd,
+			);
+			expect(code).toBe(2);
+			const record = readFailureRecord(home);
+			expect(record?.metadata.cwd).toBe(argvCwd);
+			expect(record?.metadata.operation).toBe("analyze");
+			expect(readTurnEndStatus(argvCwd)?.failed).toBe(1);
+			expect(readTurnEndStatus(argvCwd)?.lastFailureReason).toContain(
+				"stdin probe boom",
+			);
+		} finally {
+			removeTempDirSync(home);
+		}
+	}, 30_000);
+
+	// id 32: the argv `--cwd` wins over a stdin payload's cwd; the report must be
+	// relative to the argv cwd.
+	it("prefers the argv --cwd over the stdin payload cwd", async () => {
+		const argvCwd = ownCwd(path.join(coldDir, "argv"));
+		const payloadCwd = path.join(coldDir, "payload");
+		fs.mkdirSync(argvCwd);
+		fs.mkdirSync(payloadCwd);
+		const file = path.join(argvCwd, "smelly.ts");
+		fs.writeFileSync(file, SMELLY);
+		const payload = JSON.stringify({
+			cwd: payloadCwd,
+			tool_input: { path: file },
+		});
+		const { stdout, code } = await runBin([`--cwd=${argvCwd}`], payload);
+		expect(code).toBe(0);
+		expect(stdout.split("\n")[0]).toContain("🔎 pi-lens: smelly.ts ");
+	}, 45_000);
+
+	// ids 58 and 59: no file, no --turn-end, and empty stdin is a silent no-op.
+	it("exits silently with no file, no --turn-end, and empty stdin", async () => {
+		const { stdout, stderr, code } = await runBin(
+			[],
+			"",
+			[],
+			undefined,
+			coldDir,
+		);
+		expect(code).toBe(0);
+		expect(stdout).toBe("");
+		expect(stderr).toBe("");
+		expect(readTurnEndStatus(coldDir)).toBeUndefined();
+	}, 20_000);
+
+	// ids 64, 65, and 66: the fast default must not schedule the lsp runner; an
+	// explicit `--lsp` must. The witness is the real dispatch latency sink, not a
+	// captured options object, so it holds whether or not a language server is
+	// installed (a skipped lsp runner still records its row).
+	it("defaults to the no-lsp path and schedules lsp only with --lsp", async () => {
+		vi.stubEnv("PI_LENS_DISABLE_LSP_INSTALL", "1");
+		vi.stubEnv("PI_LENS_DISABLE_TOOL_INSTALL", "1");
+		vi.stubEnv("PI_LENS_TEST_MODE", "0");
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-cli-latency-"));
+		const plainFile = writeFindingFile("plain.ts");
+		const lspFile = writeFindingFile("lsp.ts");
+		try {
+			const plain = await runBin(
+				[`--file=${plainFile}`, `--cwd=${coldDir}`],
+				undefined,
+				[],
+				home,
+			);
+			expect(plain.code).toBe(0);
+			const lsp = await runBin(
+				[`--file=${lspFile}`, `--cwd=${coldDir}`, "--lsp"],
+				undefined,
+				[],
+				home,
+			);
+			expect(lsp.code).toBe(0);
+			const runnersByFile = readDispatchRunnerIds(
+				path.join(home, "latency.log"),
+			);
+			// The plain run must have dispatched at all, so "no lsp" is meaningful.
+			expect(runnersByFile.get(plainFile)).toBeDefined();
+			expect(runnersByFile.get(plainFile) ?? []).not.toContain("lsp");
+			expect(runnersByFile.get(lspFile) ?? []).toContain("lsp");
+		} finally {
+			removeTempDirSync(home);
+		}
+	}, 60_000);
+
+	// ids 64 and 68: a cold one-shot analyze registers the edited file in the
+	// durable turn-state so a later Stop can pick it up.
+	it("writes turn-state.json for a cold one-shot analyze", async () => {
+		const file = writeFindingFile("smelly.ts");
+		const { code } = await runBin([`--file=${file}`, `--cwd=${coldDir}`]);
+		expect(code).toBe(0);
+		vi.stubEnv("PILENS_DATA_DIR", path.join(testIsolationDir, "data"));
+		const turnStatePath = path.join(
+			getProjectDataDir(coldDir),
+			"turn-state.json",
+		);
+		expect(fs.existsSync(turnStatePath)).toBe(true);
+		const state = JSON.parse(fs.readFileSync(turnStatePath, "utf8")) as {
+			files?: Record<string, unknown>;
+		};
+		expect(Object.keys(state.files ?? {})).toContain("smelly.ts");
+	}, 30_000);
+
+	// id 74: every whitespace run in a failure reason collapses to one space.
+	it("collapses whitespace runs in a failure reason", async () => {
+		vi.stubEnv("PI_LENS_TEST_MODE", "0");
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-cli-ws-home-"));
+		const preload = new URL(
+			"../fixtures/mcp/analyze-cli-failure.mjs",
+			import.meta.url,
+		);
+		preload.searchParams.set("message", "p   q\t\n\tz");
+		const file = writeFindingFile("smelly.ts");
+		try {
+			const { stderr, code } = await runBin(
+				[`--cwd=${coldDir}`, `--file=${file}`],
+				undefined,
+				["--import", preload.href],
+				home,
+			);
+			expect(code).toBe(2);
+			expect(stderr.trim()).toBe("pi-lens-analyze failed: p q z");
+			expect(readFailureRecord(home)?.metadata.reason).toBe("p q z");
+			expect(readTurnEndStatus(coldDir)?.lastFailureReason).toBe("p q z");
+		} finally {
+			removeTempDirSync(home);
+		}
+	}, 20_000);
+
+	// id 79: the 1000-code-unit cap is strict — exactly 1000 stays whole, 1001
+	// truncates.
+	it("keeps exactly 1000 code units and truncates 1001", async () => {
+		vi.stubEnv("PI_LENS_TEST_MODE", "0");
+		for (const [length, truncated] of [
+			[1000, false],
+			[1001, true],
+		] as const) {
+			const home = fs.mkdtempSync(
+				path.join(os.tmpdir(), `pi-lens-cli-cap-${length}-`),
+			);
+			const preload = new URL(
+				"../fixtures/mcp/analyze-cli-failure.mjs",
+				import.meta.url,
+			);
+			preload.searchParams.set("message", "x".repeat(length));
+			const file = writeFindingFile(`cap-${length}.ts`);
+			try {
+				const { stderr, code } = await runBin(
+					[`--cwd=${coldDir}`, `--file=${file}`],
+					undefined,
+					["--import", preload.href],
+					home,
+				);
+				expect(code).toBe(2);
+				const reason = readFailureRecord(home)?.metadata.reason ?? "";
+				expect(reason.length).toBe(truncated ? 1013 : 1000);
+				expect(reason.includes("… (truncated)")).toBe(truncated);
+				expect(stderr.trim()).toBe(`pi-lens-analyze failed: ${reason}`);
+			} finally {
+				removeTempDirSync(home);
+			}
+		}
+	}, 30_000);
 });
 
 interface TurnEndStub {

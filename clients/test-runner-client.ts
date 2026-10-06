@@ -564,7 +564,11 @@ export const RUNNERS: Record<string, RunnerConfig> = {
 			"settings.gradle",
 			"settings.gradle.kts",
 		],
-		command: process.platform === "win32" ? "gradlew.bat" : "./gradlew",
+		// #3956: a cwd-relative launcher must carry a separator, or the Windows
+		// resolver treats it as a PATH-only name and never looks in the child cwd
+		// where the wrapper actually lives. Forward slash is the platform-neutral
+		// spelling the resolver accepts on win32 (same #2870 lesson as ./gradlew).
+		command: process.platform === "win32" ? "./gradlew.bat" : "./gradlew",
 		// The child's cwd must be a directory the wrapper actually lives in.
 		spawnCwdMarkers: ["gradlew", "gradlew.bat"],
 		args: (_testFile, _cwd) => ["test", "--no-daemon"],

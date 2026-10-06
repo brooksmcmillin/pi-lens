@@ -15,7 +15,7 @@ respawned server reports every finding it reported before eviction; the
 content-bound coverage check the auxiliary freeze depends on. A server that
 cannot demonstrate it is never proposed for eviction on perf grounds alone.
 
-_Last generated: 2026-10-03 on linux; 46 registry servers: 32 eligible, 0 vetoed, 2 inconclusive, 12 unavailable (0 not reached: budget)._
+_Last generated: 2026-10-06 on linux; 46 registry servers: 32 eligible, 0 vetoed, 2 inconclusive, 12 unavailable (0 not reached: budget)._
 
 ## Per-server rows
 
@@ -36,24 +36,24 @@ step log only, because it flaps.
 | server | role | declared | result | reason | respawn | coverage |
 |---|---|---|---|---|---|---|
 | ast-grep | auxiliary | unmeasured | eligible | · | ok | preserved |
-| bash | primary | unmeasured | eligible | · | ok | preserved |
-| clojure | primary | unmeasured | eligible | · | ok | preserved |
+| bash | primary | transparent | eligible | · | ok | preserved |
+| clojure | primary | transparent | eligible | · | ok | preserved |
 | cmake | primary | unmeasured | inconclusive | no-baseline | n/a | unproven |
-| cpp | primary | unmeasured | eligible | · | ok | preserved |
+| cpp | primary | transparent | eligible | · | ok | preserved |
 | csharp | primary | unmeasured | unavailable | tool-unavailable | n/a | n/a |
-| css | primary | unmeasured | eligible | · | ok | preserved |
+| css | primary | transparent | eligible | · | ok | preserved |
 | cue | primary | unmeasured | eligible | · | ok | preserved |
 | dart | primary | unmeasured | unavailable | tool-unavailable | n/a | n/a |
-| deno | primary | unmeasured | eligible | · | ok | preserved |
+| deno | primary | transparent | eligible | · | ok | preserved |
 | docker | primary | unmeasured | eligible | · | ok | preserved |
 | elixir | primary | unmeasured | unavailable | tool-unavailable | n/a | n/a |
 | expert | primary | unmeasured | eligible | · | ok | preserved |
-| fish | primary | unmeasured | eligible | · | ok | preserved |
+| fish | primary | transparent | eligible | · | ok | preserved |
 | fsharp | primary | unmeasured | unavailable | tool-unavailable | n/a | n/a |
 | gleam | primary | unmeasured | eligible | · | ok | preserved |
 | go | primary | unmeasured | unavailable | tool-unavailable | n/a | n/a |
 | haskell | primary | unmeasured | unavailable | tool-unavailable | n/a | n/a |
-| html | primary | unmeasured | eligible | · | ok | preserved |
+| html | primary | transparent | eligible | · | ok | preserved |
 | java | primary | unmeasured | unavailable | tool-unavailable | n/a | n/a |
 | json | primary | unmeasured | eligible | · | ok | preserved |
 | kotlin | primary | unmeasured | eligible | · | ok | preserved |
@@ -63,9 +63,9 @@ step log only, because it flaps.
 | ocaml | primary | unmeasured | unavailable | tool-unavailable | n/a | n/a |
 | omnisharp | primary | unmeasured | unavailable | no-fixture | n/a | n/a |
 | opengrep | auxiliary | transparent | eligible | · | ok | preserved |
-| php | primary | unmeasured | eligible | · | ok | preserved |
+| php | primary | transparent | eligible | · | ok | preserved |
 | powershell | primary | unmeasured | eligible | · | ok | preserved |
-| prisma | primary | unmeasured | eligible | · | ok | preserved |
+| prisma | primary | transparent | eligible | · | ok | preserved |
 | python | primary | transparent | eligible | · | ok | preserved |
 | python-jedi | primary | unmeasured | eligible | · | ok | preserved |
 | ruby | primary | unmeasured | unavailable | tool-unavailable | n/a | n/a |
@@ -78,7 +78,7 @@ step log only, because it flaps.
 | typescript | primary | transparent | eligible | · | ok | preserved |
 | typos | auxiliary | unmeasured | eligible | · | ok | preserved |
 | vue | primary | unmeasured | inconclusive | no-baseline | n/a | unproven |
-| yaml | primary | unmeasured | eligible | · | ok | preserved |
+| yaml | primary | transparent | eligible | · | ok | preserved |
 | zig | primary | unmeasured | eligible | · | ok | preserved |
 | zizmor | auxiliary | unmeasured | eligible | · | ok | preserved |
 
@@ -89,23 +89,14 @@ or `info` line is for a maintainer to act on in a follow-up; this run changed
 nothing.
 
 - **ast-grep** [proposal] declared unmeasured but eviction and respawn preserved its findings
-- **bash** [proposal] declared unmeasured but eviction and respawn preserved its findings
-- **clojure** [proposal] declared unmeasured but eviction and respawn preserved its findings
-- **cpp** [proposal] declared unmeasured but eviction and respawn preserved its findings
-- **css** [proposal] declared unmeasured but eviction and respawn preserved its findings
 - **cue** [proposal] declared unmeasured but eviction and respawn preserved its findings
-- **deno** [proposal] declared unmeasured but eviction and respawn preserved its findings
 - **docker** [proposal] declared unmeasured but eviction and respawn preserved its findings
 - **expert** [proposal] declared unmeasured but eviction and respawn preserved its findings
-- **fish** [proposal] declared unmeasured but eviction and respawn preserved its findings
 - **gleam** [proposal] declared unmeasured but eviction and respawn preserved its findings
-- **html** [proposal] declared unmeasured but eviction and respawn preserved its findings
 - **json** [proposal] declared unmeasured but eviction and respawn preserved its findings
 - **kotlin** [proposal] declared unmeasured but eviction and respawn preserved its findings
 - **lua** [proposal] declared unmeasured but eviction and respawn preserved its findings
-- **php** [proposal] declared unmeasured but eviction and respawn preserved its findings
 - **powershell** [proposal] declared unmeasured but eviction and respawn preserved its findings
-- **prisma** [proposal] declared unmeasured but eviction and respawn preserved its findings
 - **python-jedi** [proposal] declared unmeasured but eviction and respawn preserved its findings
 - **rust** [proposal] declared unmeasured but eviction and respawn preserved its findings
 - **svelte** [proposal] declared unmeasured but eviction and respawn preserved its findings
@@ -113,7 +104,6 @@ nothing.
 - **tinymist** [proposal] declared unmeasured but eviction and respawn preserved its findings
 - **toml** [proposal] declared unmeasured but eviction and respawn preserved its findings
 - **typos** [proposal] declared unmeasured but eviction and respawn preserved its findings
-- **yaml** [proposal] declared unmeasured but eviction and respawn preserved its findings
 - **zig** [proposal] declared unmeasured but eviction and respawn preserved its findings
 - **zizmor** [proposal] declared unmeasured but eviction and respawn preserved its findings
 
