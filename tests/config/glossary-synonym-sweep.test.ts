@@ -687,7 +687,7 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"tools/render-compact.ts": 3,
 		"mcp/analyze-cli.ts": 1,
 		"mcp/server.ts": 9,
-		"mcp/tool-arguments.ts": 3,
+		"mcp/tool-arguments.ts": 4,
 		"index.ts": 21,
 	},
 	ignore: {
