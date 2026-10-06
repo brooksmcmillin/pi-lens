@@ -3,6 +3,7 @@ import fs from "node:fs";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import yaml from "../../clients/deps/js-yaml.js";
 import { gitExecFileSync } from "../../scripts/lib/git-fixture-env.mjs";
 import {
 	addedChangelogFragments,
@@ -13,6 +14,42 @@ import { parseEntry } from "../../scripts/rollup-changelog.mjs";
 const entriesDir = path.resolve(process.cwd(), ".changelog");
 
 describe("changelog entry guard", () => {
+	// GitHub owns execution; this pins the trusted input to the runtime tests below.
+	it("fetches trusted upstream history before admitting imported fragments", () => {
+		const workflow = yaml.load(
+			fs.readFileSync(".github/workflows/ci.yml", "utf8"),
+		) as {
+			jobs: Record<
+				string,
+				{
+					steps: Array<{
+						uses?: string;
+						with?: Record<string, unknown>;
+						run?: string;
+					}>;
+				}
+			>;
+		};
+		const steps = workflow.jobs["changelog-fragment-fastfail"].steps;
+		expect(
+			steps.find((step) => step.uses?.startsWith("actions/checkout@"))?.with?.[
+				"fetch-depth"
+			],
+		).toBe(0);
+		const fetchIndex = steps.findIndex((step) =>
+			step.run?.includes(
+				"git fetch --no-tags https://github.com/apmantza/pi-lens.git refs/heads/master:refs/remotes/changelog-upstream/master",
+			),
+		);
+		const checkIndex = steps.findIndex((step) =>
+			step.run?.includes("node scripts/check-changelog-fragments.mjs"),
+		);
+		expect(fetchIndex).toBeGreaterThan(-1);
+		expect(checkIndex).toBeGreaterThan(fetchIndex);
+		expect(steps[checkIndex].run).toContain(
+			"--merge-ref --upstream refs/remotes/changelog-upstream/master",
+		);
+	});
 	it("validates every checked-in entry file", () => {
 		const files = fs
 			.readdirSync(entriesDir)
@@ -184,7 +221,7 @@ describe("one changelog fragment per PR (#3795)", () => {
 	const runCli = (args: string[], cwd: string) =>
 		spawnSync(process.execPath, [cli, ...args], { cwd, encoding: "utf8" });
 	const usage =
-		"usage: node scripts/check-changelog-fragments.mjs [--base <ref> [--merge-ref]] [--cwd <dir>]";
+		"usage: node scripts/check-changelog-fragments.mjs [--base <ref> [--merge-ref] [--upstream <ref>]] [--cwd <dir>]";
 
 	it("spawns the CLI in a fixture repo and fails closed on its real output", () => {
 		const dir = makeRepo();
@@ -228,6 +265,9 @@ describe("one changelog fragment per PR (#3795)", () => {
 		for (const args of [
 			["--base", "--cwd", dir],
 			["--merge-ref", "--cwd", dir],
+			["--upstream", "HEAD", "--cwd", dir],
+			["--base", "HEAD", "--upstream"],
+			["--base", "HEAD", "--upstream", "--cwd", dir],
 		]) {
 			const misuse = runCli(args, dir);
 			expect(misuse.status).toBe(1);
@@ -422,6 +462,105 @@ describe("one changelog fragment per PR (#3795)", () => {
 		expect(result.status).toBe(1);
 		expect(result.stderr).toBe(
 			`unable to resolve changelog comparison base: ${baseSha}\n`,
+		);
+	});
+
+	// Fork sync #22 imports release records, not newly authored PR notes.
+	it.each([
+		["unchanged imports", 0, false, false, 0],
+		["one new note", 1, false, false, 0],
+		["two new notes", 2, false, false, 1],
+		["edited import and new note", 1, true, false, 1],
+		["malformed import", 0, false, true, 1],
+	] as const)(
+		"preserves upstream history but checks local changes: %s",
+		(_name, localCount, editImport, invalidImport, status) => {
+			const dir = makeRepo();
+			const git = gitFor(dir);
+			const base = String(git(["rev-parse", "HEAD"])).trim();
+			addFragment(dir, "up-a.md", "upstream change A");
+			addFragment(dir, "up-b.md", "upstream change B");
+			if (invalidImport)
+				fs.writeFileSync(path.join(dir, ".changelog/up-a.md"), "- invalid\n");
+			git(["add", "."]);
+			commit(dir, "upstream changes");
+			git(["branch", "upstream"]);
+			if (editImport) addFragment(dir, "up-a.md", "local edit");
+			for (let i = 0; i < localCount; i++)
+				fs.writeFileSync(
+					path.join(dir, `.changelog/local-${i}.md`),
+					fragment("local note"),
+				);
+			const result = runCli(
+				["--base", base, "--merge-ref", "--upstream", "upstream", "--cwd", dir],
+				dir,
+			);
+			expect(result.status, result.stderr).toBe(status);
+			if (status === 0)
+				expect(result.stdout).toContain("2 unchanged upstream fragments");
+			else if (invalidImport)
+				expect(result.stderr).toContain("Invalid changelog entry up-a.md");
+			else
+				expect(result.stderr).toContain("PR diff adds 2 changelog fragments");
+		},
+	);
+
+	it("uses imported ancestry after upstream rolls up and does not exempt untracked newer notes", () => {
+		const dir = makeRepo();
+		const git = gitFor(dir);
+		const base = String(git(["rev-parse", "HEAD"])).trim();
+		addFragment(dir, "up-a.md", "upstream A");
+		addFragment(dir, "up-b.md", "upstream B");
+		commit(dir, "imported");
+		git(["branch", "integration"]);
+		fs.rmSync(path.join(dir, ".changelog/up-a.md"));
+		fs.rmSync(path.join(dir, ".changelog/up-b.md"));
+		addFragment(dir, "future.md", "future note");
+		git(["add", "-A"]);
+		commit(dir, "upstream rollup");
+		git(["branch", "upstream"]);
+		git(["checkout", "-q", "integration"]);
+		const args = ["--base", base, "--upstream", "upstream", "--cwd", dir];
+		expect(runCli(args, dir).status).toBe(0);
+		fs.writeFileSync(
+			path.join(dir, ".changelog/future.md"),
+			fragment("future note"),
+		);
+		fs.writeFileSync(
+			path.join(dir, ".changelog/local.md"),
+			fragment("local note"),
+		);
+		const result = runCli(args, dir);
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain(
+			".changelog/future.md, .changelog/local.md",
+		);
+	});
+
+	it("rejects an unresolved upstream instead of admitting unknown history", () => {
+		const dir = makeRepo();
+		const result = runCli(
+			["--base", "HEAD", "--upstream", "missing-upstream", "--cwd", dir],
+			dir,
+		);
+		expect(result.status).toBe(1);
+		expect(result.stderr).toBe(
+			"unable to resolve changelog upstream: missing-upstream\n",
+		);
+	});
+
+	it("rejects upstream admission without shared history", () => {
+		const { clone, baseSha } = mergeRefCheckout(
+			{ ".changelog/pr.md": fragment("note") },
+			"depth-1",
+		);
+		const result = runCli(
+			["--base", baseSha, "--merge-ref", "--upstream", baseSha, "--cwd", clone],
+			clone,
+		);
+		expect(result.status).toBe(1);
+		expect(result.stderr).toBe(
+			`unable to resolve changelog upstream: ${baseSha}\n`,
 		);
 	});
 

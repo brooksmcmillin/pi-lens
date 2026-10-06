@@ -114,15 +114,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.ref }}
+          fetch-depth: 0
           persist-credentials: false
 
-      - name: Fetch the PR base for the fragment-diff check
-        run: git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.base.sha }}"
+      - name: Fetch changelog comparison history
+        run: |
+          git fetch --no-tags origin "${{ github.event.pull_request.base.sha }}"
+          git fetch --no-tags https://github.com/apmantza/pi-lens.git refs/heads/master:refs/remotes/changelog-upstream/master
 
-      # The checkout is the depth-1 pull_request merge ref, which already
-      # contains the base, so `--merge-ref` diffs from the base itself.
+      # Only records unchanged from shared upstream history escape the count.
+      # Every fragment still passes schema validation.
       - name: Validate changelog fragments
-        run: node scripts/check-changelog-fragments.mjs --base "${{ github.event.pull_request.base.sha }}" --merge-ref
+        run: node scripts/check-changelog-fragments.mjs --base "${{ github.event.pull_request.base.sha }}" --merge-ref --upstream refs/remotes/changelog-upstream/master
 
   # #3918: TLC over formal/*/*.cfg runs as parallel `--shard i/N` jobs, N being
   # the matrix length (`strategy.job-total`, so the count has ONE source). The

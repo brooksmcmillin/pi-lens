@@ -40,7 +40,7 @@
 		"clients/safe-spawn-input.test.ts": 4,
 		"clients/safe-spawn-resource-usage.test.ts": 8,
 		"clients/safe-spawn-timeout-teardown.test.ts": 3,
-		"clients/safe-spawn-windows-command.test.ts": 13,
+		"clients/safe-spawn-windows-command.test.ts": 15,
 		"clients/shared-checkout-guard.test.ts": 3,
 		"clients/tracked-aware-ignore-matcher.test.ts": 5,
 		"clients/turn-scenarios.test.ts": 2,

@@ -306,7 +306,7 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 	"real-process-spawn:clients/safe-spawn-windows-command.test.ts": {
 		detector: "real-process-spawn",
 		reason:
-			"real Windows command-line parsing decides argument boundaries no in-process parser can validate",
+			"real Windows command-line parsing decides argument boundaries and /s outer-quote stripping; the added spawnSync import/call witnesses a quoted SystemRoot prefix on the Windows lane",
 	},
 	"real-process-spawn:clients/shared-checkout-guard.test.ts": {
 		detector: "real-process-spawn",

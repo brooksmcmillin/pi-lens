@@ -418,11 +418,11 @@ const ORIGIN_ADMISSION_ROWS: ReadonlyArray<readonly [string, string]> = [
 		"the synchronous safe-spawn path derives its cwd from its own compatibility options, not the dispatch resolveToolCwd seam",
 	],
 	[
-		"clients/lsp/launch.ts#trySpawn:e7bf6cb1~dbf27697",
+		"clients/lsp/launch.ts#trySpawn:94ea224d~dbf27697",
 		"LSP launch helper receives its own cwd parameter from the server launch boundary",
 	],
 	[
-		"clients/lsp/launch.ts#trySpawn:86ab761d~dbf27697",
+		"clients/lsp/launch.ts#trySpawn:842c77c2~dbf27697",
 		"LSP launch helper receives its own cwd parameter from the server launch boundary",
 	],
 	[

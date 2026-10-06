@@ -4,6 +4,16 @@ Each user-facing change gets one Markdown file in this directory. The file name
 must be `<branch-or-slug>-<short-desc>.md`, for example
 `feat-1321-changelog-entries.md`.
 
+A PR adds at most one new fragment. Upstream syncs preserve imported records:
+`check-changelog-fragments.mjs --base <base> --upstream <trusted-ref>` excludes
+only additions unchanged from HEAD's common ancestor with that ref. CI fetches
+`apmantza/pi-lens` master explicitly and keeps full history; local sync checks
+may use the verified `upstream/master` ref. Edited imports and untracked notes
+still count, and every entry still passes schema validation. Missing comparison
+history fails the check rather than skipping it. For a local sync, use
+`npm run preflight -- --upstream upstream/master` after verifying that ref;
+ordinary preflight remains strict unless this option is explicitly supplied.
+
 Use YAML front matter to select one Keep a Changelog section, followed by one
 entry in any of the repository's existing styles:
 

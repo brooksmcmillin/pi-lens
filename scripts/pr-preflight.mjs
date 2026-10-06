@@ -61,11 +61,16 @@ const HARD_GATE_SKIP_REASON =
 	"hard gate: unformatted files merged and redded master twice on 2026-09-09";
 
 export function parseArgs(argv) {
-	const result = { only: undefined, skip: undefined };
+	const result = { only: undefined, skip: undefined, upstream: undefined };
 	for (let index = 0; index < argv.length; index++) {
 		if (argv[index] === "--only") result.only = argv[++index];
 		else if (argv[index] === "--skip") result.skip = argv[++index];
-		else throw new Error(`Unknown argument: ${argv[index]}`);
+		else if (argv[index] === "--upstream") {
+			const ref = argv[++index];
+			if (!ref || ref.startsWith("--"))
+				throw new Error("--upstream requires a trusted ref");
+			result.upstream = ref;
+		} else throw new Error(`Unknown argument: ${argv[index]}`);
 	}
 	if (!result.only && !result.skip) return result;
 	if (result.only === "" || result.skip === "")
@@ -181,7 +186,7 @@ export function runPreflight({
 	spawn = spawnSync,
 	env = process.env,
 } = {}) {
-	const { only, skip } = parseArgs(argv);
+	const { only, skip, upstream } = parseArgs(argv);
 	const childEnv = {
 		...env,
 		PI_LENS_HOME: env.PI_LENS_HOME ?? resolve(cwd, ".probe-home"),
@@ -200,7 +205,9 @@ export function runPreflight({
 					"--configLoader",
 					"runner",
 				]
-			: command,
+			: name === "check-changelog-fragments" && upstream
+				? [...command, "--upstream", upstream]
+				: command,
 		job,
 	}));
 	const localEnv = makeLocalEvent(cwd, childEnv);

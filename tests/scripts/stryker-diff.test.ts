@@ -549,6 +549,50 @@ const sha256 = (value: string) =>
 	createHash("sha256").update(value).digest("hex");
 
 describe("driver early-exit paths, spawned for real (#3592 round 2 F1)", () => {
+	// Fork sync #22 exceeded execFileSync's default 1 MiB before mutation selection.
+	it.each([
+		[2, 0],
+		[17, 1],
+	])(
+		"bounds a %i MiB integration diff without silently truncating selection",
+		(mib, status) => {
+			const root = mkdtempSync(
+				join(repositoryRoot, ".tmp-stryker-diff-fixture-"),
+			);
+			try {
+				fixtureGit(root, ["init", "-q"]);
+				fixtureGit(root, ["commit", "--allow-empty", "-qm", "base"]);
+				mkdirSync(join(root, "scripts"));
+				writeFileSync(
+					join(root, "scripts", "large.mjs"),
+					`export const huge = "${"x".repeat(mib * 1024 * 1024)}";\n`,
+				);
+				writeFileSync(
+					join(root, "scripts", "z-tail.mjs"),
+					"export const tail = true;\n",
+				);
+				fixtureGit(root, ["add", "."]);
+				fixtureGit(root, ["commit", "-qm", "large integration"]);
+				const result = runDriverResult(root, ["--base", "HEAD~1"], 30_000);
+				expect(result.status, result.stderr).toBe(status);
+				const reportPath = join(root, "reports/mutation/mutation.json");
+				if (status === 0) {
+					const report = JSON.parse(readFileSync(reportPath, "utf8"));
+					expect(report.piLensMutationDiff.filesUncovered).toEqual([
+						"scripts/large.mjs",
+						"scripts/z-tail.mjs",
+					]);
+				} else {
+					expect(result.stderr).toContain(
+						"could not read changed lines of HEAD~1...HEAD",
+					);
+					expect(existsSync(reportPath)).toBe(false);
+				}
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
 	// Recurrence this guards: `baseMeta` (called from four early-exit paths --
 	// no changed mutation source, no covering test, a source-map build
 	// failure, no mutation range) read a `let costEstimate` that was declared

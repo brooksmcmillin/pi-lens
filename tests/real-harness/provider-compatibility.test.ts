@@ -1,5 +1,12 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
+import { pathToFileURL } from "node:url";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { withRealPi } from "../support/real-pi-harness.js";
@@ -153,6 +160,83 @@ async function observeProviderContext(
 // flake-shape: real-process-spawn — the installed pi host must load the built extension and expose its provider roster across the process boundary
 // #3636 regression: pi 0.86 moved provider tools from Context.tools into transcript system messages.
 describe("real pi scripted-provider compatibility", () => {
+	// SDK 1.0 removed the shrinkwrap layout; do not borrow another host's pi-ai.
+	it.each(["hoisted", "nested", "override"])(
+		"loads the scripted provider from the %s SDK dependency layout",
+		async (layout) => {
+			const root = mkdtempSync(
+				path.join(repoRoot, ".probe-home", "provider-resolution-"),
+			);
+			const previous = process.env.REAL_PI_HARNESS_PI_AI_INDEX;
+			try {
+				const sdk = path.join(
+					root,
+					"node_modules/@earendil-works/pi-coding-agent",
+				);
+				const ai = path.join(
+					layout === "nested" ? sdk : root,
+					"node_modules/@earendil-works/pi-ai",
+				);
+				for (const dir of [sdk, ai]) {
+					mkdirSync(path.join(dir, "dist"), { recursive: true });
+					writeFileSync(
+						path.join(dir, "package.json"),
+						JSON.stringify({
+							type: "module",
+							exports: { ".": { import: "./dist/index.js" } },
+						}),
+					);
+					writeFileSync(
+						path.join(dir, "dist/index.js"),
+						"export const createAssistantMessageEventStream = () => null;\n",
+					);
+				}
+				if (layout === "nested") {
+					const wrong = path.join(root, "node_modules/@earendil-works/pi-ai");
+					mkdirSync(wrong, { recursive: true });
+					writeFileSync(
+						path.join(wrong, "package.json"),
+						'{"type":"module","exports":"./index.js"}',
+					);
+					writeFileSync(
+						path.join(wrong, "index.js"),
+						'throw new Error("wrong SDK dependency");\n',
+					);
+				}
+				if (layout === "override") {
+					const explicit = path.join(root, "external-ai.mjs");
+					writeFileSync(
+						explicit,
+						"export const createAssistantMessageEventStream = () => null;\n",
+					);
+					process.env.REAL_PI_HARNESS_PI_AI_INDEX = explicit;
+					writeFileSync(
+						path.join(ai, "dist/index.js"),
+						'throw new Error("default SDK replaced explicit override");\n',
+					);
+				} else delete process.env.REAL_PI_HARNESS_PI_AI_INDEX;
+				const provider = path.join(root, "provider.mjs");
+				writeFileSync(
+					provider,
+					readFileSync(
+						path.join(
+							repoRoot,
+							"tests/fixtures/real-harness/scripted-provider.mjs",
+						),
+						"utf8",
+					),
+				);
+				expect((await import(pathToFileURL(provider).href)).default).toBeTypeOf(
+					"function",
+				);
+			} finally {
+				if (previous === undefined)
+					delete process.env.REAL_PI_HARNESS_PI_AI_INDEX;
+				else process.env.REAL_PI_HARNESS_PI_AI_INDEX = previous;
+				rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
 	it("replays legacy and transcript tool contexts at the provider boundary", async () => {
 		const transcriptContext = {
 			messages: [

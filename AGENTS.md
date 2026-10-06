@@ -523,6 +523,10 @@ the surface they bite; each block loads only when its trigger applies.
 - `safeSpawnAsync` is the subprocess seam. It carries ambient abort behavior,
   process-tree cleanup, output caps, typed failure kinds, and bounded timeouts.
   Installs pass `ignoreAmbientSignal: true` and remain trust-gated.
+- Windows shell payloads, including long-lived LSP launches, use
+  `buildWindowsShellCommand`: validate command, arguments, and SystemRoot
+  before quoting. Spawn explicit cmd.exe with `shell: false`; `.exe`/`.com`
+  paths use direct argv even when they contain spaces.
 - Project trust is consumed through `isProjectTrusted`; pi-lens never registers
   the host's trust-answer handler. Missing trust APIs are unknown/fail-open for
   compatibility; a throwing accessor is fail-closed.
@@ -886,7 +890,10 @@ Runtime imports must be production dependencies. The pi SDK is an optional
 peer/dev dependency and must be imported type-only. Lockfiles use the pinned
 npm version. Release notes use one `.changelog/<slug>.md` fragment per PR
 (`audience: user` or `internal`; the release body lists only `user`); never
-edit `CHANGELOG.md` for ordinary PR notes.
+edit `CHANGELOG.md` for ordinary PR notes. Upstream syncs retain unchanged
+imported fragments; `check-changelog-fragments.mjs --upstream <trusted-ref>`
+excludes only shared-ancestor records from the count, never schema validation.
+CI pins the upstream repository; see `.changelog/README.md`.
 
 </important>
 ## Test requirements

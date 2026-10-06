@@ -59,14 +59,54 @@ describe("pr preflight", () => {
 			CI_JOB_NAMES.UNIT_TESTS,
 		);
 	});
+	it("forwards explicit trusted upstream only to the fragment gate and keeps the default strict", () => {
+		spawnSync.mockReturnValue({ status: 0, stdout: "", stderr: "" });
+		const log = vi.spyOn(console, "log").mockImplementation(() => {});
+		try {
+			expect(
+				runPreflight({
+					argv: ["--upstream", "upstream/master"],
+					spawn: spawnSync,
+					env: {},
+				}),
+			).toBe(0);
+			const calls = spawnSync.mock.calls.map((call) => call[1] as string[]);
+			expect(calls.filter((args) => args.includes("--upstream"))).toEqual([
+				[
+					"scripts/check-changelog-fragments.mjs",
+					"--base",
+					"origin/master",
+					"--upstream",
+					"upstream/master",
+				],
+			]);
+			spawnSync.mockClear();
+			expect(runPreflight({ spawn: spawnSync, env: {} })).toBe(0);
+			expect(spawnSync.mock.calls.flatMap((call) => call[1])).not.toContain(
+				"--upstream",
+			);
+		} finally {
+			log.mockRestore();
+		}
+	});
+	it.each([["--upstream"], ["--upstream", "--only", "lint"]])(
+		"rejects an absent trusted upstream ref in %j",
+		(...argv) => {
+			expect(() => parseArgs(argv)).toThrow(
+				"--upstream requires a trusted ref",
+			);
+		},
+	);
 	it("parses only and skip selectors", () => {
 		expect(parseArgs(["--only", "lint"])).toEqual({
 			only: "lint",
 			skip: undefined,
+			upstream: undefined,
 		});
 		expect(parseArgs(["--skip", "lint"])).toEqual({
 			only: undefined,
 			skip: "lint",
+			upstream: undefined,
 		});
 	});
 	it("rejects an unknown selector with the effective gate names", () => {

@@ -1,15 +1,21 @@
 import { readFileSync, appendFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
+import { findPackageJSON } from "node:module";
+import { dirname, join } from "node:path";
 
 // release-qa (#3805) drives a pi that is not this repo's devDependency, so it
 // names that pi's own pi-ai here; the default is the repo's dev baseline.
+let piAiIndex = process.env.REAL_PI_HARNESS_PI_AI_INDEX;
+if (!piAiIndex) {
+	const sdk = findPackageJSON(
+		"@earendil-works/pi-coding-agent",
+		import.meta.url,
+	);
+	const ai = findPackageJSON("@earendil-works/pi-ai", pathToFileURL(sdk));
+	piAiIndex = join(dirname(ai), "dist/index.js");
+}
 const { createAssistantMessageEventStream } = await import(
-	process.env.REAL_PI_HARNESS_PI_AI_INDEX
-		? pathToFileURL(process.env.REAL_PI_HARNESS_PI_AI_INDEX).href
-		: new URL(
-				"../../../node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/index.js",
-				import.meta.url,
-			).href
+	pathToFileURL(piAiIndex).href
 );
 
 const scriptPath = process.env.REAL_PI_HARNESS_SCRIPT;

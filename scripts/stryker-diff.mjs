@@ -72,6 +72,8 @@ import {
 import { acquireSharedSlot } from "./lib/suite-lock.mjs";
 
 const startedAt = Date.now();
+// Upstream syncs exceed Node's 1 MiB default; overflow still fails visibly.
+const GIT_DIFF_MAX_BUFFER = 16 * 1024 * 1024;
 
 // The PR-body corpus is deliberately real and its cold scan is slower under
 // Stryker instrumentation than in the ordinary suite. Keep this budget local
@@ -143,7 +145,7 @@ function changedMutationFiles() {
 		return execFileSync(
 			"git",
 			["diff", "--name-only", "--diff-filter=AM", `${baseRef}...HEAD`],
-			{ encoding: "utf8" },
+			{ encoding: "utf8", maxBuffer: GIT_DIFF_MAX_BUFFER },
 		)
 			.split("\n")
 			.map((file) => file.trim())
@@ -162,6 +164,7 @@ function changedPaths() {
 		return parseNameList(
 			execFileSync("git", ["diff", "--name-only", `${baseRef}...HEAD`], {
 				encoding: "utf8",
+				maxBuffer: GIT_DIFF_MAX_BUFFER,
 			}),
 		);
 	} catch (error) {
@@ -187,7 +190,7 @@ function changedLineRanges(files, { ignoreWhitespace = false } = {}) {
 					"--",
 					...files,
 				],
-				{ encoding: "utf8" },
+				{ encoding: "utf8", maxBuffer: GIT_DIFF_MAX_BUFFER },
 			),
 		);
 	} catch (error) {

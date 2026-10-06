@@ -616,6 +616,8 @@ Each row cost a lane at least once; the prose above carries the record.
 
 | Mistake | Fix |
 |---------|-----|
+| Assuming an SDK dependency remains nested after a major upgrade | Fork PR #22 removed the SDK shrinkwrap; the scripted provider now resolves SDK-owned pi-ai through Node's ESM-aware package resolver. Hoisted, nested, and explicit-host fixtures cover ownership; wrong-owner and ignored-override mutations fail. |
+| Quoting the first cmd.exe `/c` token without accounting for `/s` | Fork PR #22's SystemRoot hardening needs an extra outer pair when the prefix is quoted. The builder tests reject always/never wrapping, and the Windows lane drives the real interpreter through the quoted-prefix case. |
 | Reading a CI verdict without checking the SHA it judged | `ci-verdict --wait` returned exit 0 for the PREVIOUS head seconds after a push (#2878 trailing, 2026-09-10); compare the verdict's SHA with `gh pr view --json headRefOid` before merging |
 | Reporting "pushed" before `git log -1` shows the commit | Two trailing commits failed the pre-commit hook (changelog one-entry rule, unused vars) and the ledger/body already said pushed; verify the head, then write the row |
 | Folding a worker's extra changelog fragment into an existing one | One fragment = one top-level entry (`rollup-changelog --check`); keep a second fragment separate or drop it |

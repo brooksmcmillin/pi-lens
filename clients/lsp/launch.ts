@@ -24,6 +24,7 @@ import { findGlobalBinary } from "../package-manager.js";
 import { OWNER_TAG_ENV, ownerTagForChildren } from "../process-snapshot.js";
 import { redactSecrets } from "../redact/secrets.js";
 import {
+	buildWindowsShellCommand,
 	classifySpawnFailure,
 	holdOwnChildPid,
 	isOwnLiveChild,
@@ -52,16 +53,11 @@ const OWNER_TAG_READ_MS = 5_000;
 
 /**
  * Whether a resolved command must be spawned through a shell on Windows.
- * `.cmd`/`.bat` are scripts cmd.exe must interpret; extensionless or spaced-path
- * commands also go through the shell so cmd resolves/quotes them.
+ * `.cmd`/`.bat` and unresolved commands need cmd.exe; `.exe`/`.com`
+ * use direct argv even when their paths contain spaces.
  */
 function computeNeedsShell(resolvedCommand: string): boolean {
-	return (
-		isWindows &&
-		(resolvedCommand.includes(" ") ||
-			/\.(cmd|bat)$/i.test(resolvedCommand) ||
-			!/\.(exe|cmd|bat)$/i.test(resolvedCommand))
-	);
+	return isWindows && !/\.(exe|com)$/i.test(resolvedCommand);
 }
 
 const DEFAULT_STARTUP_FAILURE_WINDOW_MS = 50;
@@ -377,30 +373,25 @@ function trySpawn(
 	let proc: ChildProcess;
 
 	if (needsShell) {
-		// Build a cmd.exe-safe command string: wrap in double quotes, escape internal
-		// quotes by doubling them, and escape cmd metacharacters (& | < > ^ ( ) !) with ^
-		const escapeCmdArg = (s: string): string => {
-			// Escape cmd.exe metacharacters first, then wrap in quotes if needed
-			const escaped = s.replace(/([&|<>^()!])/g, "^$1");
-			return /[\s"]/.test(escaped)
-				? `"${escaped.replace(/"/g, '""')}"`
-				: escaped;
-		};
-		// shell:true justified: Windows .cmd/.bat LSP binaries (e.g. typescript-language-server.cmd)
-		// cannot be spawned via execFile — cmd.exe must interpret the script wrapper.
-		const shellCommand = `"${command}" ${args.map(escapeCmdArg).join(" ")}`;
+		// Share validation with short-lived runners without changing LSP lifetime.
+		const shellCommand = buildWindowsShellCommand(command, args);
 		// #2015 class-sweep exemption: this is a LONG-LIVED language-server launch,
 		// not a bounded probe - killing it on a timeout would be wrong, and its
 		// lifetime is owned by the LSP lifecycle, not the spawner. Exempt from the
 		// verifyToolBinary/probe tree-kill migration.
-		proc = nodeSpawn(shellCommand, [], {
-			cwd,
-			env,
-			stdio: ["pipe", "pipe", "pipe"],
-			detached: !isWindows,
-			windowsHide: true,
-			shell: true,
-		});
+		proc = nodeSpawn(
+			`${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\cmd.exe`,
+			["/d", "/s", "/c", shellCommand],
+			{
+				cwd,
+				env,
+				stdio: ["pipe", "pipe", "pipe"],
+				detached: !isWindows,
+				windowsHide: true,
+				shell: false,
+				windowsVerbatimArguments: true,
+			},
+		);
 	} else {
 		// Use normal spawn without shell
 		proc = nodeSpawn(command, args, {
@@ -409,6 +400,7 @@ function trySpawn(
 			stdio: ["pipe", "pipe", "pipe"],
 			detached: !isWindows,
 			windowsHide: isWindows,
+			shell: false,
 		});
 	}
 
@@ -551,7 +543,7 @@ function _attachErrorHandler(
  *
  * Key fixes for Windows:
  * - Uses absolute paths (relative paths fail in shell mode)
- * - Uses shell: true for .cmd files
+ * - Uses the shared validated cmd.exe payload for Windows scripts
  * - Uses windowsHide to prevent console window popup
  * - Detects immediate spawn failures (ENOENT) before returning
  *
@@ -597,8 +589,7 @@ export async function launchLSP(
 			: explicitCommand;
 
 	// Compute needsShell based on command
-	// On Windows, shell: true is needed for .cmd/.bat files and extensionless binaries
-	// .exe files can be spawned directly, but .cmd/.bat require shell interpretation
+	// Windows scripts need the explicit validated cmd wrapper; executables use argv.
 	let needsShell = computeNeedsShell(resolvedCommand);
 
 	// Try to spawn the process

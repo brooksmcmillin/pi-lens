@@ -18,7 +18,9 @@
 // contains the base: the diff starts at the base itself, because that
 // checkout is depth 1 and has no merge-base (#3795 verify r3).
 //
-// Usage: node scripts/check-changelog-fragments.mjs [--base <ref> [--merge-ref]]
+// --upstream admits unchanged records from HEAD's common ancestor with a
+// trusted upstream ref. CI supplies that ref, never the PR author.
+// Usage: node scripts/check-changelog-fragments.mjs [--base <ref> [--merge-ref] [--upstream <ref>]]
 
 import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -87,21 +89,53 @@ export function addedChangelogFragments({
  * The PR-level changelog gate for the repository at `cwd`. Fails when the
  * diff adds more than one fragment; otherwise runs the shared shape
  * validation, whose error becomes the one-line message. `fragments` is the
- * added set when Git answered, else `null`.
+ * added set after upstream admission when Git answered, else `null`.
  */
 export function checkChangelogFragments({
 	base,
 	cwd,
 	git = runGit,
 	mergeRef = false,
+	upstream,
 } = {}) {
-	const fragments = addedChangelogFragments({ base, cwd, git, mergeRef });
+	let fragments = addedChangelogFragments({ base, cwd, git, mergeRef });
 	if (base && fragments === null) {
 		return {
 			valid: false,
 			fragments: null,
 			message: `unable to resolve changelog comparison base: ${base}`,
 		};
+	}
+	let importedCount = 0;
+	if (upstream) {
+		try {
+			const options = {
+				cwd,
+				encoding: "utf8",
+				stdio: ["ignore", "pipe", "pipe"],
+			};
+			const ancestor = String(
+				git(["merge-base", "HEAD", upstream], options),
+			).trim();
+			const changed = git(
+				["diff", "--name-only", ancestor, "--", ".changelog/"],
+				options,
+			);
+			const untracked = git(
+				["ls-files", "--others", "--exclude-standard", "--", ".changelog/"],
+				options,
+			);
+			const local = new Set(`${changed}\n${untracked}`.split(/\r?\n/));
+			const authored = fragments.filter((file) => local.has(file));
+			importedCount = fragments.length - authored.length;
+			fragments = authored;
+		} catch {
+			return {
+				valid: false,
+				fragments,
+				message: `unable to resolve changelog upstream: ${upstream}`,
+			};
+		}
 	}
 	if (fragments && fragments.length > 1) {
 		return {
@@ -123,7 +157,7 @@ export function checkChangelogFragments({
 	return {
 		valid: true,
 		fragments,
-		message: `changelog fragments OK (${entries.length} entr${entries.length === 1 ? "y" : "ies"} in .changelog/)`,
+		message: `changelog fragments OK (${entries.length} entr${entries.length === 1 ? "y" : "ies"} in .changelog/)${upstream ? `; ${importedCount} unchanged upstream fragments excluded from PR count` : ""}`,
 	};
 }
 
@@ -133,20 +167,25 @@ if (
 ) {
 	const baseIndex = process.argv.indexOf("--base");
 	const cwdIndex = process.argv.indexOf("--cwd");
+	const upstreamIndex = process.argv.indexOf("--upstream");
+	const upstream =
+		upstreamIndex === -1 ? undefined : process.argv[upstreamIndex + 1];
 	const mergeRef = process.argv.includes("--merge-ref");
 	const base = baseIndex === -1 ? undefined : process.argv[baseIndex + 1];
 	const cwd = cwdIndex === -1 ? SCRIPT_ROOT : process.argv[cwdIndex + 1];
 	const invalidArgument =
 		(baseIndex !== -1 && (!base || base.startsWith("--"))) ||
 		(cwdIndex !== -1 && (!cwd || cwd.startsWith("--"))) ||
+		(upstreamIndex !== -1 &&
+			(!upstream || upstream.startsWith("--") || baseIndex === -1)) ||
 		(mergeRef && baseIndex === -1);
 	const result = invalidArgument
 		? {
 				valid: false,
 				message:
-					"usage: node scripts/check-changelog-fragments.mjs [--base <ref> [--merge-ref]] [--cwd <dir>]",
+					"usage: node scripts/check-changelog-fragments.mjs [--base <ref> [--merge-ref] [--upstream <ref>]] [--cwd <dir>]",
 			}
-		: checkChangelogFragments({ base, cwd, mergeRef });
+		: checkChangelogFragments({ base, cwd, mergeRef, upstream });
 	if (result.valid) {
 		console.log(result.message);
 	} else {

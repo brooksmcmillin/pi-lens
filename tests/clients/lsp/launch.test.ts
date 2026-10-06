@@ -36,8 +36,14 @@ class MockChildProcess extends EventEmitter {
 }
 
 describe("lsp launch", () => {
+	const realPlatform = process.platform;
 	afterEach(() => {
 		vi.useRealTimers();
+		Object.defineProperty(process, "platform", {
+			value: realPlatform,
+			configurable: true,
+		});
+		vi.unstubAllEnvs();
 		// resetModules does not clear the mock registry (#2883).
 		vi.doUnmock("node:child_process");
 		vi.resetModules();
@@ -45,6 +51,78 @@ describe("lsp launch", () => {
 	});
 	// Spawns are mocked, so nothing but this file owns the fixture roots.
 	useTrackedTempDirs("pi-lens-shim-", "pi-lens-ps1-", "pi-lens-launch-");
+
+	// CodeQL #2: reproduce through launchLSP on every authoritative OS.
+	it.each([
+		"%EXPAND%",
+		"!EXPAND!",
+		'embedded"quote',
+		"line\rbreak",
+		"line\nbreak",
+	])(
+		"refuses unsafe Windows LSP shim input %j before spawning",
+		async (unsafe) => {
+			Object.defineProperty(process, "platform", {
+				value: "win32",
+				configurable: true,
+			});
+			const spawnMock = vi.fn(() => {
+				throw new Error("spawn sentinel");
+			});
+			vi.doMock("node:child_process", async (importOriginal) => ({
+				...(await importOriginal<typeof import("node:child_process")>()),
+				execFileSync: vi.fn(() => ""),
+				spawn: spawnMock,
+			}));
+			const { launchLSP } = await import("../../../clients/lsp/launch.js");
+			await expect(
+				launchLSP("C:\\tools\\server.cmd", [unsafe], { cwd: "C:\\project" }),
+			).rejects.toThrow(/cmd\.exe/);
+			expect(spawnMock).not.toHaveBeenCalled();
+		},
+	);
+
+	it.each([
+		"C:\\tools\\server.cmd",
+		"C:\\Program Files\\server.exe",
+		"C:\\tools\\server.com",
+	])("keeps Node shell expansion disabled for %s", async (command) => {
+		Object.defineProperty(process, "platform", {
+			value: "win32",
+			configurable: true,
+		});
+		vi.stubEnv("SystemRoot", "C:\\Windows");
+		vi.stubEnv("ComSpec", "C:\\untrusted\\cmd.exe");
+		const spawnMock = vi.fn(() => {
+			throw new Error("spawn sentinel");
+		});
+		vi.doMock("node:child_process", async (importOriginal) => ({
+			...(await importOriginal<typeof import("node:child_process")>()),
+			execFileSync: vi.fn(() => ""),
+			spawn: spawnMock,
+		}));
+		const { launchLSP } = await import("../../../clients/lsp/launch.js");
+		const args = command.endsWith(".cmd") ? ["a & b"] : ['literal"%!'];
+		await expect(
+			launchLSP(command, args, { cwd: "C:\\project" }),
+		).rejects.toThrow("spawn sentinel");
+		if (command.endsWith(".cmd")) {
+			expect(spawnMock).toHaveBeenCalledWith(
+				"C:\\Windows\\System32\\cmd.exe",
+				["/d", "/s", "/c", expect.stringContaining('"a & b"')],
+				expect.objectContaining({
+					shell: false,
+					windowsVerbatimArguments: true,
+				}),
+			);
+		} else {
+			expect(spawnMock).toHaveBeenCalledWith(
+				command,
+				args,
+				expect.objectContaining({ shell: false }),
+			);
+		}
+	});
 
 	it.runIf(process.platform !== "win32")(
 		"spawns LSP servers in their own process group on POSIX",
@@ -315,7 +393,7 @@ describe("lsp launch", () => {
 			await vi.advanceTimersByTimeAsync(600);
 			const result = await launchPromise;
 
-			expect(spawnedCommand).toContain("test.cmd");
+			expect(spawnedCommand).toMatch(/\\cmd\.exe$/i);
 			expect(result.pid).toBe(1234);
 		},
 	);
