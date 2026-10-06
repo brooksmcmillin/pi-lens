@@ -658,6 +658,56 @@ describe("upstream-aware mandatory mutation tests", () => {
 		40_000,
 	);
 
+	it.each([false, true])(
+		"invalidates cached verdicts when ownership changes from upstream admission=%s",
+		(admit) => {
+			const fixture = buildDriverFixture({
+				covering: true,
+				includeCompiled: false,
+				fakeVitest: true,
+			});
+			try {
+				writeFileSync(
+					join(fixture.root, "tests/scripts/imported-only.test.ts"),
+					'import { it } from "vitest";\nit("independent", () => {});\n',
+				);
+				fixture.git(["add", "tests"]);
+				fixture.git(["commit", "-qm", "import upstream test"]);
+				fixture.git(["branch", "upstream"]);
+				mkdirSync(join(fixture.root, ".fake-vitest"), { recursive: true });
+				writeFileSync(
+					join(fixture.root, ".fake-vitest/control.json"),
+					JSON.stringify({ exitCode: 1 }),
+				);
+				const commands: string[] = [];
+				for (const [index, mode] of [admit, !admit, !admit].entries()) {
+					const output = runDriver(
+						fixture.root,
+						["--base", "main", ...(mode ? ["--upstream", "upstream"] : [])],
+						30_000,
+					);
+					const calls = fakeStrykerInvocations(fixture.root).filter(
+						(call) => !call.dryRun,
+					);
+					expect(calls).toHaveLength(index + 1);
+					const call = calls[index];
+					commands.push(call.command);
+					expect(call.command.includes("imported-only.test.ts")).toBe(!mode);
+					expect(call.force).toBe(index !== 2);
+					expect(call.incrementalPresent).toBe(index === 2);
+					expect(output).toContain(
+						`incremental cache ${["cold-no-cache", "cold-inputs-changed (selected-tests)", "warm"][index]}`,
+					);
+				}
+				expect(commands[0]).not.toBe(commands[1]);
+				expect(commands[1]).toBe(commands[2]);
+			} finally {
+				fixture.cleanup();
+			}
+		},
+		40_000,
+	);
+
 	it.each(["missing-value", "option-value", "unknown-ref", "unrelated-ref"])(
 		"rejects %s before mutation execution",
 		(kind) => {

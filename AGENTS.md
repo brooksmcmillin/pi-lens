@@ -903,6 +903,8 @@ PR-changed tests that differ from shared upstream ancestry mandatory. Related
 coverage and mutation source ranges remain fork-relative; ordinary runs without
 the option keep every PR-owned test. CI fetches the fixed upstream repository,
 not a PR-supplied URL. Missing or unrelated refs fail before mutation execution.
+Incremental fingerprints encode the selected-test list independently of the
+union of fingerprinted file contents, so ownership changes invalidate reuse.
 
 Every logic change has relevant tests. New tests use fake clocks and
 `tests/clients/interleaving-kit.ts` before real time, raw sleeps, or real child

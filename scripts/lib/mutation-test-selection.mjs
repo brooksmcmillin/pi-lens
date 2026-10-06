@@ -415,9 +415,9 @@ const ABSENT_FILE = "<absent>";
 /**
  * The fingerprint of everything a reused result depends on that Stryker does
  * not watch: where the PR forked from the base, the node version, the Stryker
- * config and the lockfile (vitest and Stryker versions), the kept tests, and
- * every other changed file. `read` returns a file's text and throws for a
- * missing one, which is fingerprinted as absent.
+ * config and the lockfile (vitest and Stryker versions), the selected-test list,
+ * the kept tests' contents, and every other changed file. `read` returns a
+ * file's text and throws for a missing one, which is fingerprinted as absent.
  *
  * @param {{
  *   forkPoint: string,
@@ -446,6 +446,7 @@ export function buildFingerprint({
 	const entries = [
 		["fork-point", forkPoint],
 		["node", nodeVersion],
+		["selected-tests", JSON.stringify(keptTests)],
 		["stryker.config.mjs", read("stryker.config.mjs")],
 		["package-lock.json", read("package-lock.json")],
 		...fingerprintPaths({ changedFiles, mutatedFiles, keptTests }).map(

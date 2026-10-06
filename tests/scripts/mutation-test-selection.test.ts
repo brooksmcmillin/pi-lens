@@ -1485,6 +1485,7 @@ describe("incremental cache rules", () => {
 				"node",
 				"package-lock.json",
 				"scripts/helper.mjs",
+				"selected-tests",
 				"stryker.config.mjs",
 				"tests/kept.test.ts",
 			]);
