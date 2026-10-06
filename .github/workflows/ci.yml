@@ -1262,7 +1262,9 @@ jobs:
           key: mutation-incremental-${{ github.event.pull_request.number }}-${{ github.event.pull_request.base.sha }}-${{ github.event.pull_request.head.sha }}
           restore-keys: |
             mutation-incremental-${{ github.event.pull_request.number }}-${{ github.event.pull_request.base.sha }}-
-      - run: node scripts/stryker-diff.mjs --base "origin/${{ github.base_ref }}" --max-files 6 --head-sha "${{ github.event.pull_request.head.sha }}"
+      - name: Fetch trusted upstream test ancestry
+        run: git fetch --no-tags https://github.com/apmantza/pi-lens.git refs/heads/master:refs/remotes/mutation-upstream/master
+      - run: node scripts/stryker-diff.mjs --base "origin/${{ github.base_ref }}" --max-files 6 --head-sha "${{ github.event.pull_request.head.sha }}" --upstream refs/remotes/mutation-upstream/master
       # Saved even when the driver exits non-zero: a budget kill leaves the
       # partial results Stryker wrote, and the next push resumes from them.
       - name: Save the incremental mutation cache

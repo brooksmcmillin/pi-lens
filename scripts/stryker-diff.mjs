@@ -104,6 +104,14 @@ function argumentValue(name, fallback) {
 }
 
 const baseRef = argumentValue("--base", "origin/master");
+const upstreamIndex = process.argv.lastIndexOf("--upstream");
+const upstreamRef = upstreamIndex < 0 ? null : process.argv[upstreamIndex + 1];
+if (upstreamIndex >= 0 && (!upstreamRef || upstreamRef.startsWith("-"))) {
+	console.error(
+		"mutation diff: invalid --upstream: expected a trusted Git ref",
+	);
+	process.exit(1);
+}
 const maxFiles = Number(argumentValue("--max-files", DEFAULT_MAX_FILES));
 const maxRanges = Number(argumentValue("--max-ranges", DEFAULT_MAX_RANGES));
 const budgetMinutes = Number(
@@ -159,18 +167,16 @@ function changedMutationFiles() {
 	}
 }
 
-function changedPaths() {
+function changedPaths(range = `${baseRef}...HEAD`) {
 	try {
 		return parseNameList(
-			execFileSync("git", ["diff", "--name-only", `${baseRef}...HEAD`], {
+			execFileSync("git", ["diff", "--name-only", range], {
 				encoding: "utf8",
 				maxBuffer: GIT_DIFF_MAX_BUFFER,
 			}),
 		);
 	} catch (error) {
-		console.error(
-			`mutation diff: could not read ${baseRef}...HEAD: ${error.message}`,
-		);
+		console.error(`mutation diff: could not read ${range}: ${error.message}`);
 		process.exit(1);
 	}
 }
@@ -309,6 +315,25 @@ function logSurvivors(mutants) {
 }
 
 const allChangedPaths = changedPaths();
+let ownChangedPaths = allChangedPaths;
+if (upstreamRef !== null) {
+	let ancestor;
+	try {
+		ancestor = execFileSync("git", ["merge-base", "HEAD", upstreamRef], {
+			encoding: "utf8",
+		}).trim();
+	} catch (error) {
+		console.error(
+			`mutation diff: invalid --upstream ${upstreamRef}: ${error.message}`,
+		);
+		process.exit(1);
+	}
+	const authoredPaths = new Set(changedPaths(`${ancestor}..HEAD`));
+	ownChangedPaths = allChangedPaths.filter((file) => authoredPaths.has(file));
+	console.log(
+		`mutation diff: mandatory test ownership baseline ${ancestor} (shared with ${upstreamRef}); mutation ranges and related coverage remain ${baseRef}-relative`,
+	);
+}
 const allFiles = changedMutationFiles();
 // #3810 (from the #3797 review): which files the cap keeps is a matter of how
 // much each changed, ignoring whitespace-only lines, not of how it sorts.
@@ -339,7 +364,7 @@ try {
 	// tests whose survivors the author can act on. A file carrying the
 	// mutation-lane exclusion marker is excluded for its registered reason, same
 	// as a related one.
-	const partition = partitionOwnTests(allChangedPaths, {
+	const partition = partitionOwnTests(ownChangedPaths, {
 		exists: existsSync,
 		exclusionOf: (file) => mutationLaneExclusion(file),
 		alreadyExcluded: selection.excluded,

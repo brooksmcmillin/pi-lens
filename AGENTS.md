@@ -898,6 +898,12 @@ CI pins the upstream repository; see `.changelog/README.md`.
 </important>
 ## Test requirements
 
+For upstream syncs, `stryker-diff.mjs --upstream <trusted-ref>` makes only
+PR-changed tests that differ from shared upstream ancestry mandatory. Related
+coverage and mutation source ranges remain fork-relative; ordinary runs without
+the option keep every PR-owned test. CI fetches the fixed upstream repository,
+not a PR-supplied URL. Missing or unrelated refs fail before mutation execution.
+
 Every logic change has relevant tests. New tests use fake clocks and
 `tests/clients/interleaving-kit.ts` before real time, raw sleeps, or real child
 processes. Real elapsed-time assertions belong in the serialized

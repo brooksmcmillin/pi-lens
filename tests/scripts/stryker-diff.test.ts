@@ -82,7 +82,15 @@ const mutationJob = (
 			resolve(import.meta.dirname, "../../.github/workflows/ci.yml"),
 			"utf8",
 		),
-	) as { jobs: Record<string, { "timeout-minutes"?: number }> }
+	) as {
+		jobs: Record<
+			string,
+			{
+				"timeout-minutes"?: number;
+				steps: Array<{ name?: string; run?: string }>;
+			}
+		>;
+	}
 ).jobs.mutation;
 
 // lane: mutation (advisory) -- dry run and mutant runs. That lane mutates the
@@ -547,6 +555,147 @@ function fakeStrykerInvocations(root: string) {
 
 const sha256 = (value: string) =>
 	createHash("sha256").update(value).digest("hex");
+
+describe("upstream-aware mandatory mutation tests", () => {
+	// GitHub executes this wiring; inspect parsed run fields rather than comments.
+	it("fetches fixed trusted ancestry before passing it to the mutation driver", () => {
+		const steps = mutationJob.steps;
+		const fetchIndex = steps.findIndex(
+			(step) => step.name === "Fetch trusted upstream test ancestry",
+		);
+		const runIndex = steps.findIndex((step) =>
+			step.run?.startsWith("node scripts/stryker-diff.mjs "),
+		);
+		expect(fetchIndex).toBeGreaterThanOrEqual(0);
+		expect(fetchIndex).toBeLessThan(runIndex);
+		expect(steps[fetchIndex].run?.trim()).toBe(
+			"git fetch --no-tags https://github.com/apmantza/pi-lens.git refs/heads/master:refs/remotes/mutation-upstream/master",
+		);
+		expect(steps[runIndex].run).toContain(
+			"--upstream refs/remotes/mutation-upstream/master",
+		);
+	});
+	// Fork sync #22 retained 300 imported tests and timed out before evaluating mutants.
+	it.each([false, true])(
+		"preserves coverage and fork ownership with upstream admission=%s",
+		(admit) => {
+			const fixture = buildDriverFixture({
+				covering: true,
+				includeCompiled: false,
+				fakeVitest: true,
+			});
+			const { root, git } = fixture;
+			const body =
+				'import { it } from "vitest";\nit("independent", () => {});\n';
+			const put = (name: string, text = body) =>
+				writeFileSync(join(root, "tests/scripts", name), text);
+			try {
+				put("imported-only.test.ts");
+				put("fork-edited.test.ts");
+				const related = join(root, "tests/scripts/thing-other.test.ts");
+				writeFileSync(
+					related,
+					readFileSync(related, "utf8") + "// imported change\n",
+				);
+				git(["add", "tests"]);
+				git(["commit", "-qm", "import upstream tests"]);
+				git(["branch", "upstream"]);
+				const ancestor = String(git(["rev-parse", "upstream"])).trim();
+				git(["checkout", "main"]);
+				put("historical-fork.test.ts");
+				git(["add", "tests"]);
+				git(["commit", "-qm", "existing fork test"]);
+				git(["checkout", "feature"]);
+				git(["merge", "main", "-m", "integrate fork"]);
+				put("fork-owned.test.ts");
+				put("fork-edited.test.ts", body + "// fork edit\n");
+				git(["add", "tests"]);
+				git(["commit", "-qm", "fork authored tests"]);
+				git(["checkout", "upstream"]);
+				put("fork-owned.test.ts");
+				put("fork-edited.test.ts", body + "// fork edit\n");
+				git(["add", "tests"]);
+				git(["commit", "-qm", "upstream advances to matching contents"]);
+				git(["checkout", "feature"]);
+				mkdirSync(join(root, ".fake-vitest"), { recursive: true });
+				writeFileSync(
+					join(root, ".fake-vitest/control.json"),
+					JSON.stringify({
+						exitCode: 1,
+					}),
+				);
+				const stdout = runDriver(
+					root,
+					["--base", "main", ...(admit ? ["--upstream", "upstream"] : [])],
+					30_000,
+				);
+				const calls = fakeStrykerInvocations(root);
+				expect(calls.length).toBeGreaterThan(0);
+				for (const call of calls) {
+					expect(call.command).toContain("fork-owned.test.ts");
+					expect(call.command).toContain("fork-edited.test.ts");
+					expect(call.command).toContain("thing-other.test.ts");
+					expect(call.command).not.toContain("historical-fork.test.ts");
+					expect(call.command.includes("imported-only.test.ts")).toBe(!admit);
+					expect(
+						call.patterns.some((pattern: string) =>
+							pattern.startsWith("scripts/thing.mjs:"),
+						),
+					).toBe(true);
+				}
+				const report = JSON.parse(
+					readFileSync(join(root, "reports/mutation/mutation.json"), "utf8"),
+				);
+				expect(report.piLensMutationDiff.testSelection.own).toBe(admit ? 2 : 4);
+				if (admit)
+					expect(stdout).toContain(
+						`mandatory test ownership baseline ${ancestor}`,
+					);
+			} finally {
+				fixture.cleanup();
+			}
+		},
+		40_000,
+	);
+
+	it.each(["missing-value", "option-value", "unknown-ref", "unrelated-ref"])(
+		"rejects %s before mutation execution",
+		(kind) => {
+			const fixture = buildDriverFixture({
+				covering: true,
+				includeCompiled: false,
+				fakeVitest: true,
+			});
+			try {
+				const unrelated = String(
+					fixture.git(["commit-tree", "HEAD^{tree}", "-m", "unrelated root"]),
+				).trim();
+				const args =
+					kind === "missing-value"
+						? ["--upstream"]
+						: kind === "option-value"
+							? ["--upstream", "--max-files", "1"]
+							: [
+									"--upstream",
+									kind === "unrelated-ref" ? unrelated : "absent-upstream",
+								];
+				const result = runDriverResult(
+					fixture.root,
+					["--base", "main", ...args],
+					30_000,
+				);
+				expect(result.status).toBe(1);
+				expect(result.stderr).toContain("mutation diff: invalid --upstream");
+				if (kind === "missing-value" || kind === "option-value") {
+					expect(result.stderr).toContain("expected a trusted Git ref");
+				}
+				expect(fakeStrykerInvocations(fixture.root)).toEqual([]);
+			} finally {
+				fixture.cleanup();
+			}
+		},
+	);
+});
 
 describe("driver early-exit paths, spawned for real (#3592 round 2 F1)", () => {
 	// Fork sync #22 exceeded execFileSync's default 1 MiB before mutation selection.
@@ -1937,7 +2086,7 @@ describe.skipIf(underStryker)(
 		const code = stripSource(driver);
 
 		it("feeds the PR's own tests and the import-graph priorities into the selector, with probed coverage", () => {
-			expect(code).toContain("partitionOwnTests(allChangedPaths,");
+			expect(code).toContain("partitionOwnTests(ownChangedPaths,");
 			// A test both related and own is reported once: the partition must see what
 			// the related scan already excluded.
 			expect(code).toContain("alreadyExcluded: selection.excluded,");
