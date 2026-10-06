@@ -11,7 +11,9 @@ import {
 	drainPendingRunnerFindings,
 	deferRunnerFindings,
 	dropStaleRunnerFindings,
+	peekSettledRunnerFindings,
 	pendingRunnerFindingsSize,
+	requeueRunnerFindings,
 	resetPendingRunnerFindings,
 } from "../../../clients/dispatch/pending-runner-findings.js";
 import { createGenerationSource } from "../../../clients/generation-guard.js";
@@ -352,5 +354,99 @@ describe("observed runner collect-later tier (#2116)", () => {
 		it("no-drop (shape 54): a dispatch still in its session defers its runner", async () => {
 			expect(await deferAfterGate(false)).toBe(1);
 		});
+	});
+
+	it("drops a requeued, capacity-held result once its scope has retired (#3758/#3813)", async () => {
+		const sessions = createGenerationSource("test-runtime-session");
+		deferRunnerFindings({
+			filePath,
+			cwd: projectRoot,
+			projectRoot,
+			runnerId: "requeue-runner",
+			markedAtMs: Date.now(),
+			promise: Promise.resolve({
+				status: "succeeded",
+				diagnostics: [],
+				semantic: "warning",
+			}),
+			session: sessions.capture(),
+		});
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		// The turn-end cap cut the part that carried this settled answer, so the
+		// delivery hold hands it back for the next turn end (#3813). The drained
+		// entry carries the producer's handle; without it the requeue re-enters
+		// unfenced and the next drain delivers it into the successor scope.
+		const drained = (await drainPendingRunnerFindings(0))[0]!;
+		requeueRunnerFindings({ ...drained, result: drained.result! });
+		// `/new`: the scope that owned the result retired before the next turn end.
+		sessions.bump();
+
+		// The snapshot preserved the producer's handle, so both the gate's peek
+		// and the turn-end drain reject the requeued entry after the retire.
+		expect(peekSettledRunnerFindings()).toEqual([]);
+		expect(await drainPendingRunnerFindings(0)).toEqual([]);
+		expect(pendingRunnerFindingsSize()).toBe(0);
+		expect(
+			getDegradationSummary()
+				.filter((entry) => entry.kind === "generation-guard-stale-write")
+				.flatMap((entry) => entry.latestReasons.map((row) => row.subject)),
+		).toEqual([
+			expect.stringContaining("commit-gate:requeue-runner"),
+			expect.stringContaining("turn-end:requeue-runner"),
+		]);
+	});
+
+	it("drops a retired scope's settled answer from the gate's peek (#3758/#3814)", async () => {
+		const sessions = createGenerationSource("test-runtime-session");
+		deferRunnerFindings({
+			filePath,
+			cwd: projectRoot,
+			projectRoot,
+			runnerId: "peek-runner",
+			markedAtMs: Date.now(),
+			promise: Promise.resolve({
+				status: "succeeded",
+				diagnostics: [],
+				semantic: "warning",
+			}),
+			session: sessions.capture(),
+		});
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		sessions.bump();
+
+		// The commit gate's read is non-draining and applies the same owned
+		// admission the turn-end drain does.
+		expect(peekSettledRunnerFindings()).toEqual([]);
+		expect(pendingRunnerFindingsSize()).toBe(1);
+		expect(
+			getDegradationSummary()
+				.filter((entry) => entry.kind === "generation-guard-stale-write")
+				.flatMap((entry) => entry.latestReasons.map((row) => row.subject)),
+		).toEqual([expect.stringContaining("commit-gate:peek-runner")]);
+	});
+
+	it("no-drop (shape 54): admits a released writer's deferral with no captured handle", async () => {
+		// Shape 57: a producer from a released version defers without a session.
+		// The fence narrows known-retired answers; it never drops an unfenced one.
+		deferRunnerFindings({
+			filePath,
+			cwd: projectRoot,
+			projectRoot,
+			runnerId: "released-runner",
+			markedAtMs: Date.now(),
+			promise: Promise.resolve({
+				status: "succeeded",
+				diagnostics: [],
+				semantic: "warning",
+			}),
+		});
+		await new Promise<void>((resolve) => setImmediate(resolve));
+
+		expect(peekSettledRunnerFindings().map((entry) => entry.filePath)).toEqual([
+			filePath,
+		]);
+		expect(
+			(await drainPendingRunnerFindings(0)).map((entry) => entry.filePath),
+		).toEqual([filePath]);
 	});
 });

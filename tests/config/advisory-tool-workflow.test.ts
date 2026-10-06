@@ -22,8 +22,21 @@ const workflow = yaml.load(
 	>;
 	on?: { pull_request?: { types?: string[] } };
 };
+// #3801: the mutation lane lives in ci.yml (behind `heavy-gate`), not in a
+// separate workflow, because only a same-workflow `needs:` can hold it until
+// the required checks pass.
+// #3838: the PR title / body / close-keyword jobs live in pr-metadata.yml.
+const metadataWorkflow = yaml.load(
+	readFileSync(resolve(ROOT, ".github/workflows/pr-metadata.yml"), "utf8"),
+) as {
+	jobs: Record<
+		string,
+		{ name?: string; if?: string; steps?: Array<Record<string, unknown>> }
+	>;
+	on?: { pull_request?: { types?: string[] } };
+};
 const mutationWorkflow = yaml.load(
-	readFileSync(resolve(ROOT, ".github/workflows/mutation.yml"), "utf8"),
+	readFileSync(resolve(ROOT, ".github/workflows/ci.yml"), "utf8"),
 ) as { jobs: Record<string, { name?: string; "continue-on-error"?: boolean }> };
 
 const tools = [
@@ -43,6 +56,17 @@ describe("#2706 advisory tooling workflow contracts", () => {
 		expect(isAdvisoryCheck("oxfmt format check")).toBe(false);
 	});
 
+	// Recurrence: #2837 -- master went red after #2827/#2829 merged unused
+	// exports while knip was advisory. Once gating, a rename back to
+	// "(advisory)", a continue-on-error, or an ADVISORY_CHECKS entry would
+	// silently let that class merge again.
+	it("keeps knip as a gating, named job", () => {
+		const job = workflow.jobs.knip;
+		expect(job?.name).toBe("knip");
+		expect(job?.["continue-on-error"]).not.toBe(true);
+		expect(isAdvisoryCheck("knip")).toBe(false);
+	});
+
 	it("keeps the mutation lane advisory and named", () => {
 		const job = mutationWorkflow.jobs.mutation;
 		expect(job?.name).toBe("mutation (advisory)");
@@ -50,10 +74,7 @@ describe("#2706 advisory tooling workflow contracts", () => {
 	});
 
 	it("pins the mutation report upload action by SHA and keeps the report path explicit", () => {
-		const raw = readFileSync(
-			resolve(ROOT, ".github/workflows/mutation.yml"),
-			"utf8",
-		);
+		const raw = readFileSync(resolve(ROOT, ".github/workflows/ci.yml"), "utf8");
 		// Recurrence: PR #2751 round 1 and PR #2758 round 1 both shipped a test
 		// asserting the offline `<SHA-TO-PIN>` placeholder; the pin must be a
 		// full commit SHA with the release comment.
@@ -113,44 +134,39 @@ describe("#2706 advisory tooling workflow contracts", () => {
 });
 
 describe("#2714 dependabot skips the human PR-policy checks", () => {
-	// Dependabot bypasses the human title convention, not code checks.
+	// Dependabot bypasses the human metadata policy, not code checks.
 	const dependabotSkip =
 		"github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]'";
 
-	it("skips pr-title-lint for dependabot and no other lint.yml job", () => {
-		const policyJobs = ["pr-title-lint"];
-		expect(workflow.jobs["pr-title-lint"]?.if).toBe(dependabotSkip);
-		const others = Object.keys(workflow.jobs).filter(
-			(key) => !policyJobs.includes(key),
-		);
-		for (const key of others) {
-			expect(
-				workflow.jobs[key]?.if ?? "",
-				`${key} must not skip dependabot`,
-			).not.toContain("dependabot");
-		}
-	});
-
-	it("skips the close-keyword job for dependabot", () => {
-		const closeKeywords = yaml.load(
-			readFileSync(
-				resolve(ROOT, ".github/workflows/close-keywords.yml"),
-				"utf8",
-			),
-		) as { jobs: Record<string, { if?: string }> };
+	it("skips the two policy jobs for dependabot", () => {
+		expect(metadataWorkflow.jobs["pr-title-lint"]?.if).toBe(dependabotSkip);
 		expect(
-			closeKeywords.jobs.lint?.if,
+			metadataWorkflow.jobs["close-keyword-lint"]?.if,
 			"close-keyword must skip dependabot",
 		).toBe(dependabotSkip);
+		expect(Object.keys(metadataWorkflow.jobs).sort()).toEqual([
+			"close-keyword-lint",
+			"pr-title-lint",
+		]);
+	});
+
+	it("lets no lint.yml job skip dependabot", () => {
+		for (const [key, job] of Object.entries(workflow.jobs)) {
+			expect(job.if ?? "", `${key} must not skip dependabot`).not.toContain(
+				"dependabot",
+			);
+		}
 	});
 });
 
 describe("fork CI policy", () => {
-	it("does not run PR-body validation", () => {
+	it("does not restore PR-body validation after the metadata workflow migration", () => {
 		expect(workflow.jobs["pr-body-lint"]).toBeUndefined();
-		const commands = Object.values(workflow.jobs).flatMap((job) =>
-			(job.steps ?? []).map((step) => String(step.run ?? "")),
-		);
+		expect(metadataWorkflow.jobs["pr-body-lint"]).toBeUndefined();
+		const commands = [
+			...Object.values(workflow.jobs),
+			...Object.values(metadataWorkflow.jobs),
+		].flatMap((job) => (job.steps ?? []).map((step) => String(step.run ?? "")));
 		expect(commands.join("\n")).not.toContain("check-pr-body.mjs");
 	});
 
@@ -170,7 +186,7 @@ describe("fork CI policy", () => {
 	});
 
 	it("retains edited-metadata events for title validation", () => {
-		expect(workflow.on?.pull_request?.types).toEqual([
+		expect(metadataWorkflow.on?.pull_request?.types).toEqual([
 			"opened",
 			"synchronize",
 			"reopened",

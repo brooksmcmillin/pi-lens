@@ -13,6 +13,11 @@ import {
 } from "./project-changes.js";
 import type { CodeQualityWarningRecord } from "./code-quality-warnings.js";
 import type { Diagnostic } from "./dispatch/types.js";
+import { formatDiagnostics } from "./dispatch/utils/format-utils.js";
+import {
+	inlineBlockerLines,
+	inlineBlockerSources,
+} from "./inline-blocker-fields.js";
 import type { FileComplexity } from "./complexity-client.js";
 import type { MutationKind } from "./mutating-tool.js";
 import { normalizeMapKey, pathsEqual } from "./path-utils.js";
@@ -27,10 +32,14 @@ import { deriveProviderFromModelId } from "./model-provider.js";
 import { beginTurnContext, setTurnContextSession } from "./turn-context.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
 import { WriteOrderingGuard, writeOrderToken } from "./write-ordering-guard.js";
+import type { GenerationHandle } from "./generation-guard.js";
 import {
-	createGenerationSource,
-	type GenerationHandle,
-} from "./generation-guard.js";
+	beginScope,
+	type LineageHandle,
+	nextOrderTurn,
+	retireScope,
+	type SessionScope,
+} from "./session-scope.js";
 
 /** Keep deferred cascade admission bounded without dropping late findings. */
 export const MAX_PENDING_CASCADE_RUNS = 32;
@@ -163,6 +172,14 @@ export interface DeferredMutationRecord {
 	 * the orphan fallback instead of `tool_result`'s path resolution.
 	 */
 	originCwd: string;
+	/**
+	 * #3521: the read guard's branch epoch when this record was queued. The
+	 * drain credits its write only while the epoch is unchanged, so a record
+	 * requeued before a `/tree` is not credited to the new branch. A merge
+	 * keeps the newer epoch: that branch touched the file after every older
+	 * branch's write to it.
+	 */
+	readGuardBranchEpoch: number;
 }
 
 /** @deprecated Use DeferredMutationRecord. */
@@ -307,6 +324,43 @@ export interface InlineBlockerRecord {
 }
 
 /**
+ * #3218 criterion 2: the render cap for the turn-end "Resolved this turn"
+ * lines. One line per retired FILE (never per finding); a session that
+ * retires more than this in one turn says "… and N more".
+ */
+const MAX_RESOLVED_BLOCKER_FILES = 10;
+
+/**
+ * #3218 criterion 2: one file whose inline blocker a fresh clean verdict
+ * retired during the turn, as recorded by the retire seam itself. The seam
+ * knows the retired record (for `blockerCount`) and the retiring write (for
+ * `writeIndex`); the turn-end composer only formats these rows, it never
+ * re-derives which files were resolved from counts.
+ */
+export interface ResolvedBlockerFile {
+	/** The path as the blocker was recorded, for the composer to display. */
+	filePath: string;
+	/** How many blocking diagnostics the retired record carried. */
+	blockerCount: number;
+	/**
+	 * The retiring write's index, from `clearInlineBlockers`'s own order.
+	 * `undefined` when no write retired it: a confirmed-clean check takes a
+	 * write slot but performs no write, and a legacy caller may supply no order.
+	 * Never the RECORDING write's index, which would name the write that created
+	 * the blocker as the one that cleared it.
+	 */
+	writeIndex: number | undefined;
+	/** Retired by `retireInlineBlockerOnConfirmedClean`, not by a clean write. */
+	confirmedClean: boolean;
+	/**
+	 * `turnIndex` when the retire happened. The composer says "this turn" only
+	 * for an entry from its own turn; a carried entry (a turn_end that delivered
+	 * nothing, or a retire that landed mid-handler) says "since the last report".
+	 */
+	turnIndex: number;
+}
+
+/**
  * The canonical target `tool_call` resolved for one specific call, recorded
  * by tool-call identity (#1642). `tool_result`'s paired handler MUST look
  * this up and use `resolvedPath` as-is instead of re-deriving a path from its
@@ -345,6 +399,11 @@ export interface ToolCallAttribution {
 	 * are not where the agent believes they are.
 	 */
 	editInPlace?: true;
+	/**
+	 * #3525: FileTime had moved when the read guard checked this call's edit
+	 * (`ReadGuard.fileTimeMoved`), so its write must not re-stamp it.
+	 */
+	fileTimeStale?: true;
 	/** `Date.now()` when recorded — see `TOOL_CALL_ATTRIBUTION_TTL_MS`. */
 	recordedAt: number;
 }
@@ -386,8 +445,12 @@ const TOOL_CALL_ATTRIBUTION_TTL_MS = 5 * 60_000;
 
 export class RuntimeCoordinator {
 	private _projectRoot = normalizeMapKey(process.cwd());
-	private readonly _sessionGeneration =
-		createGenerationSource("runtime-session");
+	// #3611: the session generation is this scope's ticket, drawn from one
+	// process counter, so two coordinators (two entry evaluations) never hold
+	// the same number (N4). The construction scope's ticket is the
+	// coordinator's id on the `session_scope_transition` row.
+	private _scope: SessionScope = beginScope({ role: "primary" });
+	private readonly _coordinatorId = this._scope.scopeId;
 	private _sessionStartedAt = Date.now();
 	private _errorDebtBaseline: ErrorDebtBaseline | null = null;
 	private _pipelineCrashCounts = new Map<string, number>();
@@ -442,6 +505,9 @@ export class RuntimeCoordinator {
 	 * widget's write guards outlive a session reset (`/reload` keeps them),
 	 * so a later turn's token must outrank every earlier one in the process.
 	 * `_turnIndex` restarts per session for telemetry.
+	 * #3611 (N3): drawn from the process counter (`nextOrderTurn`), because a
+	 * `/reload` that re-evaluates the entry builds a new coordinator while the
+	 * widget module keeps its guards.
 	 */
 	private _writeOrderTurn = 0;
 	private _writeIndex = 0;
@@ -500,6 +566,18 @@ export class RuntimeCoordinator {
 		string,
 		number
 	>();
+	/**
+	 * #3218 criterion 2: inline blockers a fresh clean verdict retired this
+	 * turn, keyed by resolved path so a file is named once. Bounded at
+	 * `MAX_RESOLVED_BLOCKER_FILES`; the overflow is counted so the delivery can
+	 * still say "… and N more" (counting retire events past the cap). The
+	 * turn-end composer consumes it, so a retire is delivered exactly once; an
+	 * entry no turn_end delivered stays until one does, and session reset clears
+	 * it.
+	 */
+	private readonly _resolvedBlockerFilesThisTurn =
+		new PathKeyedMap<ResolvedBlockerFile>(normalizeMapKey);
+	private _resolvedBlockerFilesDropped = 0;
 	private readonly _actionableWarningsThisTurn = new Map<
 		string,
 		ActionableWarningRecord
@@ -521,7 +599,13 @@ export class RuntimeCoordinator {
 	readonly partialApplyRecords = new PartialApplyRecordStore();
 
 	resetForSession(startedAt = Date.now()): void {
-		this._sessionGeneration.bump();
+		const previous = this._scope;
+		retireScope(previous, "superseded");
+		this._scope = beginScope({
+			role: "primary",
+			parentScopeId: previous.scopeId,
+			coordinatorId: this._coordinatorId,
+		});
 		this._sessionStartedAt = startedAt;
 		this._complexityBaselines.clear();
 		this._pipelineCrashCounts.clear();
@@ -569,6 +653,8 @@ export class RuntimeCoordinator {
 		this._lspReadWarmState.clear();
 		this._pendingInlineBlockers.clear();
 		this._inlineBlockerWriteOrder.clear();
+		this._resolvedBlockerFilesThisTurn.clear();
+		this._resolvedBlockerFilesDropped = 0;
 		this._actionableWarningsThisTurn.clear();
 		this._codeQualityWarningsThisTurn.clear();
 		this._turnSummary.clear();
@@ -618,7 +704,7 @@ export class RuntimeCoordinator {
 		let changed = 0;
 		for (const [key, entry] of this._pendingInlineBlockers.entries()) {
 			const policySuppressed = suppressed.has(path.resolve(entry.filePath));
-			if (!!entry.policySuppressed === policySuppressed) continue;
+			if ((entry.policySuppressed ?? false) === policySuppressed) continue;
 			this._pendingInlineBlockers.set(key, { ...entry, policySuppressed });
 			changed += 1;
 		}
@@ -720,7 +806,7 @@ export class RuntimeCoordinator {
 		// by resetForSession().
 		this._turnStartProjectSeq = this._projectSeq;
 		this._turnIndex += 1;
-		this._writeOrderTurn += 1;
+		this._writeOrderTurn = nextOrderTurn();
 		beginTurnContext(this._telemetrySessionId);
 		this._writeIndex = 0;
 		this._reportedThisTurn.clear();
@@ -1069,19 +1155,25 @@ export class RuntimeCoordinator {
 	}
 
 	get sessionGeneration(): number {
-		return this._sessionGeneration.current();
+		return this._scope.scopeId;
+	}
+
+	/** #3611: the session scope this coordinator serves. */
+	get sessionScope(): SessionScope {
+		return this._scope;
 	}
 
 	/**
 	 * #3499: a handle on the current session, for a write that lands after an
 	 * await which can outlive the session (a fire-and-forget quiet window).
+	 * #3611: a `LineageHandle` on the current scope.
 	 */
-	captureSessionGeneration(): GenerationHandle {
-		return this._sessionGeneration.capture();
+	captureSessionGeneration(): LineageHandle {
+		return this._scope.capture();
 	}
 
 	isCurrentSession(generation: number): boolean {
-		return this._sessionGeneration.current() === generation;
+		return this._scope.scopeId === generation && this._scope.isLive();
 	}
 
 	markStartupScanInFlight(name: string, generation: number): void {
@@ -1339,6 +1431,10 @@ export class RuntimeCoordinator {
 			)
 		)
 			return undefined;
+		// #3218 criterion 2: a newer blocking verdict supersedes an earlier
+		// retirement of the same file — the agent is blocked on it again, so a
+		// carried "Resolved" entry would be a false claim.
+		this._resolvedBlockerFilesThisTurn.delete(filePath);
 		this._pendingInlineBlockers.set(path.resolve(filePath), {
 			filePath,
 			summary,
@@ -1360,6 +1456,112 @@ export class RuntimeCoordinator {
 	}
 
 	/**
+	 * #3814: add a settled collect-later runner's blocking findings to the file's
+	 * inline-blocker record, the one channel the commit gate's latch
+	 * (`updateGitGuardStatus`) and the turn-end replay both read. A deferred
+	 * runner answers after `recordInlineBlockers` has run for its edit, so it
+	 * MERGES into the record instead of replacing it: the fast runners' blockers
+	 * for the same bytes stay.
+	 *
+	 * Idempotent by finding identity, because two callers hand the same answer
+	 * here: the commit gate (before turn end) and the turn-end drain (after).
+	 * Ordering needs no token of its own: the caller admits only answers the
+	 * path-freshness gate called current, and a later write to the file replaces
+	 * or clears the whole record (`recordInlineBlockers` / `clearInlineBlockers`).
+	 * A new record carries the analysed bytes' baseline, so a disposition verdict
+	 * on it is confirmable by the gate (`firstExpiredSuppressionVerdict`); a
+	 * merge keeps the existing baseline and its stale demotion. An existing
+	 * record with no structured diagnostics is left alone: the file already
+	 * blocks, and merging into text alone would drop it from the replay.
+	 *
+	 * @returns how many findings were new to the record (0 = a replay).
+	 */
+	recordDeferredInlineBlockers(
+		filePath: string,
+		blocking: readonly Diagnostic[],
+		analysed: {
+			recordedAtMs: number;
+			contentBaseline?: { size: number; sha256: string };
+		},
+	): number {
+		const key = path.resolve(filePath);
+		const existing = this._pendingInlineBlockers.get(key);
+		if (existing && !existing.diagnostics) return 0;
+		const identity = (d: Diagnostic) =>
+			JSON.stringify([d.tool, d.id, d.line, d.message]);
+		const known = new Set((existing?.diagnostics ?? []).map(identity));
+		const added = blocking.flatMap((d) => (known.has(identity(d)) ? [] : [d]));
+		if (added.length === 0) return 0;
+		const diagnostics = [...(existing?.diagnostics ?? []), ...added];
+		this._pendingInlineBlockers.set(key, {
+			...(existing ?? {
+				filePath,
+				recordedAtMs: analysed.recordedAtMs,
+				stale: false,
+				...(analysed.contentBaseline
+					? {
+							recordedSize: analysed.contentBaseline.size,
+							recordedHash: analysed.contentBaseline.sha256,
+						}
+					: {}),
+			}),
+			summary: formatDiagnostics(diagnostics, "blocking").trim(),
+			diagnostics,
+			// The same two derivations the pipeline's writer uses: `lines` keeps only
+			// this file's own rows, `sources` pins an untagged finding as "unknown".
+			sources: [
+				...new Set([
+					...(existing?.sources ?? []),
+					...inlineBlockerSources(added),
+				]),
+			],
+			lines: [
+				...(existing?.lines ?? []),
+				...inlineBlockerLines(added, filePath),
+			],
+			// The turn-end policy verdict was about the OLD set; the added findings
+			// passed the policy already and the next turn end re-derives the rest.
+			policySuppressed: false,
+		});
+		return added.length;
+	}
+
+	/**
+	 * #3218 criterion 2: remember one file whose blocker a clean verdict just
+	 * retired, for the turn-end "Resolved" line. Called from the two retire
+	 * seams (`clearInlineBlockers` and `retireInlineBlockerOnConfirmedClean`)
+	 * with the record that was removed and the retiring write's order, so the
+	 * composer never has to re-derive the count from rendered text. Bounded at
+	 * `MAX_RESOLVED_BLOCKER_FILES`; the overflow is counted for the "… and N
+	 * more" tail.
+	 */
+	private noteResolvedBlockerFile(
+		record: InlineBlockerRecord,
+		retiringWriteOrder: number | undefined,
+		confirmedClean: boolean,
+	): void {
+		if (
+			!this._resolvedBlockerFilesThisTurn.has(record.filePath) &&
+			this._resolvedBlockerFilesThisTurn.size >= MAX_RESOLVED_BLOCKER_FILES
+		) {
+			this._resolvedBlockerFilesDropped += 1;
+			return;
+		}
+		this._resolvedBlockerFilesThisTurn.set(record.filePath, {
+			filePath: record.filePath,
+			blockerCount: record.diagnostics?.length ?? record.lines?.length ?? 1,
+			// A write order token carries its turn above the write index
+			// (`writeOrderToken`); the line names only the write.
+			writeIndex:
+				confirmedClean || retiringWriteOrder === undefined
+					? undefined
+					: retiringWriteOrder % 2 ** 32,
+			confirmedClean,
+			turnIndex: this._turnIndex,
+		});
+	}
+
+	/**
 	 * Clear a file's verdict after a clean dispatch. Returns false when a newer
 	 * dispatch of the same file already recorded or cleared it (#3507).
 	 */
@@ -1375,6 +1577,14 @@ export class RuntimeCoordinator {
 			)
 		)
 			return false;
+		const existing = this._pendingInlineBlockers.get(path.resolve(filePath));
+		if (existing) {
+			this.noteResolvedBlockerFile(
+				existing,
+				writeOrderToken(orderTurn, writeIndex),
+				false,
+			);
+		}
 		this._pendingInlineBlockers.delete(path.resolve(filePath));
 		return true;
 	}
@@ -1505,17 +1715,41 @@ export class RuntimeCoordinator {
 		filePath: string,
 		deadLines: readonly number[],
 	): boolean {
-		if (deadLines.length === 0) return false;
+		const key = this.pastEofRetireKey(filePath, deadLines);
+		if (key === undefined) return false;
+		this._pendingInlineBlockers.delete(key);
+		return true;
+	}
+
+	/**
+	 * #3813: the retire rule of {@link retireDemotedPastEofBlocker}, without
+	 * the delete. The turn-end composer asks it at render time (to word the
+	 * retirement note) and only retires once the cap has let the delivery
+	 * through; the rule stays here, in one place.
+	 */
+	wouldRetireDemotedPastEofBlocker(
+		filePath: string,
+		deadLines: readonly number[],
+	): boolean {
+		return this.pastEofRetireKey(filePath, deadLines) !== undefined;
+	}
+
+	/** The store key of the record the past-EOF retire rule admits, if any. */
+	private pastEofRetireKey(
+		filePath: string,
+		deadLines: readonly number[],
+	): string | undefined {
+		if (deadLines.length === 0) return undefined;
 		const key = path.resolve(filePath);
 		const existing = this._pendingInlineBlockers.get(key);
-		if (!existing) return false;
+		if (!existing) return undefined;
 		// Only this gate's own demotion. A dependency-drift demotion (#1631)
 		// keeps in-bounds coordinates the agent CAN re-run against, so it stays
 		// in the store until a fresh verdict clears it.
-		if (!existing.stale) return false;
-		if ((existing.staleReason ?? "past-eof") !== "past-eof") return false;
-		this._pendingInlineBlockers.delete(key);
-		return true;
+		if (!existing.stale) return undefined;
+		return (existing.staleReason ?? "past-eof") === "past-eof"
+			? key
+			: undefined;
 	}
 
 	/**
@@ -1648,8 +1882,51 @@ export class RuntimeCoordinator {
 		if (!existing.sources || existing.sources.length === 0) return false;
 		const covered = new Set(coveredSources ?? []);
 		if (!existing.sources.every((source) => covered.has(source))) return false;
+		// #3218 criterion 2: this retire is a resolution — name it at turn end.
+		this.noteResolvedBlockerFile(existing, undefined, true);
 		this._pendingInlineBlockers.delete(key);
 		return true;
+	}
+
+	/**
+	 * #3218 criterion 2: a retirement no turn_end has delivered yet. The
+	 * read-only turn_end path uses it to fall through to the composer instead of
+	 * returning early, so a `lens_diagnostics` confirmation reaches the agent.
+	 */
+	hasResolvedBlockerFiles(): boolean {
+		return this._resolvedBlockerFilesThisTurn.size > 0;
+	}
+
+	/**
+	 * #3218 criterion 2: hand the turn-end composer the retired files it can
+	 * deliver, and remove exactly those, so a retire is delivered once. An entry
+	 * `holdBack` names STAYS for the next turn_end: the composer holds back a
+	 * file its own message still lists as unresolved (a retire that landed after
+	 * the blockers were snapshotted), because one message must never say both,
+	 * and a line that would not fit the message cap (called in list order).
+	 * The "… and N more" overflow count rides with a batch that lists files and
+	 * is otherwise kept, so a bare tail is never delivered.
+	 */
+	consumeResolvedBlockerFiles(
+		holdBack: (entry: ResolvedBlockerFile) => boolean,
+	): {
+		files: ResolvedBlockerFile[];
+		dropped: number;
+	} {
+		const files: ResolvedBlockerFile[] = [];
+		const held: ResolvedBlockerFile[] = [];
+		for (const entry of this._resolvedBlockerFilesThisTurn.values()) {
+			(holdBack(entry) ? held : files).push(entry);
+		}
+		// Rebuild, never delete-in-place (see `reconcileInlineBlockers`).
+		this._resolvedBlockerFilesThisTurn.clear();
+		for (const entry of held) {
+			this._resolvedBlockerFilesThisTurn.set(entry.filePath, entry);
+		}
+		if (files.length === 0) return { files, dropped: 0 };
+		const dropped = this._resolvedBlockerFilesDropped;
+		this._resolvedBlockerFilesDropped = 0;
+		return { files, dropped };
 	}
 
 	reconcileInlineBlockers(): void {
@@ -1761,7 +2038,11 @@ export class RuntimeCoordinator {
 	}
 
 	get readGuard(): ReadGuard {
-		this._readGuard ??= new ReadGuard(this._telemetrySessionId);
+		this._readGuard ??= new ReadGuard(
+			this._telemetrySessionId,
+			{},
+			this._scope,
+		);
 		return this._readGuard;
 	}
 
@@ -1799,6 +2080,12 @@ export class RuntimeCoordinator {
 		if (attribution) attribution.editInPlace = true;
 	}
 
+	/** #3525: see {@link ToolCallAttribution.fileTimeStale}. */
+	markToolCallFileTimeStale(toolCallId: string): void {
+		const attribution = this._toolCallAttributions.get(toolCallId);
+		if (attribution) attribution.fileTimeStale = true;
+	}
+
 	/**
 	 * One-shot claim of a previously recorded tool-call attribution. Removed
 	 * on read: a given `tool_call`/`tool_result` pair correlates exactly once,
@@ -1833,12 +2120,18 @@ export class RuntimeCoordinator {
 		kind: DeferredMutationKind,
 		ownerSessionId?: string,
 		originCwd?: string,
+		/** #3521: a producer that awaited since it captured the epoch passes it. */
+		readGuardBranchEpoch = this.readGuard.currentBranchEpoch,
 	): boolean {
 		const key = path.resolve(filePath);
 		const now = Date.now();
 		const resolvedOriginCwd = originCwd ?? turnStateCwd;
 		const existing = this._pendingDeferredMutations.get(key);
 		if (existing) {
+			existing.readGuardBranchEpoch = Math.max(
+				existing.readGuardBranchEpoch,
+				readGuardBranchEpoch,
+			);
 			const addedKind = !existing.kinds.has(kind);
 			existing.lastTouchedAt = now;
 			existing.cwd = cwd;
@@ -1863,6 +2156,7 @@ export class RuntimeCoordinator {
 			queuedTurnId: `${this._telemetrySessionId}:${this._turnIndex}`,
 			ownerSessionId,
 			originCwd: resolvedOriginCwd,
+			readGuardBranchEpoch,
 		});
 		return true;
 	}
@@ -1997,6 +2291,10 @@ export class RuntimeCoordinator {
 				for (const kind of record.kinds) existing.kinds.add(kind);
 				for (const toolName of record.toolNames)
 					existing.toolNames.add(toolName);
+				existing.readGuardBranchEpoch = Math.max(
+					existing.readGuardBranchEpoch,
+					record.readGuardBranchEpoch,
+				);
 				continue;
 			}
 			this._pendingDeferredMutations.set(key, {

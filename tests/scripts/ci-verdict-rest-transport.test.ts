@@ -327,6 +327,30 @@ describe("restFetchCheckRunsPayload (#3497)", () => {
 		expect(payload.check_runs).toHaveLength(REAL_CHECK_RUNS.source.total_count);
 	});
 
+	// N2 (#3861): a 200 body that is not JSON is a contract violation, not an
+	// empty answer; the thrown error names the path and keeps the raw stderr.
+	it("a non-JSON 200 body throws a named error with the path and raw stderr", async () => {
+		const fetchImpl = async () =>
+			new Response("<<html>not json</html>", { status: 200 });
+		let message = "";
+		let stderr = "";
+		try {
+			await restFetchCheckRunsPayload("acme/repo", "sha", {
+				token: "tok",
+				fetchImpl,
+			});
+		} catch (error) {
+			message = (error as Error).message;
+			stderr = (error as { stderr?: string }).stderr ?? "";
+		}
+		expect(message).toContain(
+			"GitHub REST API returned invalid JSON for repos/acme/repo/commits/sha/check-runs?per_page=100&page=1",
+		);
+		expect(stderr).toContain(
+			"invalid JSON from repos/acme/repo/commits/sha/check-runs?per_page=100&page=1",
+		);
+	});
+
 	// The four acceptance-criterion fixtures: computeVerdict must reach the
 	// SAME exit code from a REST-shaped payload as it does from the
 	// equivalent gh-shaped one (already proven correct by the 132
@@ -745,9 +769,9 @@ describe("run() — REST transport end to end (#3497)", () => {
 			);
 		};
 		const stdoutLines: string[] = [];
-		let exitCode: number | undefined;
+		let result: { code: number; kind: string } | undefined;
 		await withEmptyPathAndToken(async () => {
-			exitCode = await run({
+			result = await run({
 				argv: ["2539"],
 				gitExec,
 				fetchImpl,
@@ -755,9 +779,59 @@ describe("run() — REST transport end to end (#3497)", () => {
 				stderr: () => {},
 			});
 		});
-		expect(exitCode).toBe(EXIT_SUCCESS);
+		expect(result?.code).toBe(EXIT_SUCCESS);
 		expect(stdoutLines).toContain("Transport: rest");
 		expect(stdoutLines.join("\n")).toContain("acme/repo@c0ffee");
+	});
+
+	// #3700: the failed-job log read is `gh api --allow-escape-sequences`, which
+	// this transport has no REST twin for. A red head must still exit 1 with the
+	// plain table -- not spawn a `gh` that is not there and print its ENOENT as
+	// a note under every failed row.
+	it("a red head on the REST transport exits 1 without trying to read job logs through gh", async () => {
+		const gitExec = () => "https://github.com/acme/repo.git\n";
+		const fetchImpl = async (url: string) => {
+			if (url.includes("/pulls/2539")) {
+				return new Response(
+					JSON.stringify({
+						head: { sha: "c0ffee" },
+						mergeable: true,
+						mergeable_state: "clean",
+					}),
+				);
+			}
+			if (url.includes("/branches/master/protection")) {
+				return new Response("", { status: 403 });
+			}
+			return new Response(
+				JSON.stringify({
+					total_count: 2,
+					check_runs: [
+						checkRun({ name: "Unit tests", id: 1, conclusion: "failure" }),
+						checkRun({ name: "Lint & type-check", id: 2 }),
+					],
+				}),
+			);
+		};
+		const stdoutLines: string[] = [];
+		let result: { code: number; kind: string } | undefined;
+		await withEmptyPathAndToken(async () => {
+			result = await run({
+				argv: ["2539"],
+				gitExec,
+				fetchImpl,
+				stdout: (line: string) => stdoutLines.push(line),
+				stderr: () => {},
+			});
+		});
+		expect(result?.code).toBe(EXIT_FAILURE);
+		expect(result?.kind).toBe("red");
+		expect(stdoutLines).toContain("Transport: rest");
+		expect(stdoutLines.join("\n")).not.toContain("failed step");
+		expect(stdoutLines.join("\n")).not.toContain("could not read the job");
+		// #3779: the MUTATION line reads a PR comment through `gh` only; the REST
+		// transport adds no network path for it.
+		expect(stdoutLines.join("\n")).not.toContain("MUTATION");
 	});
 
 	it("still exits 70 when gh is missing and NO token is set (unchanged acceptance case)", async () => {
@@ -767,9 +841,9 @@ describe("run() — REST transport end to end (#3497)", () => {
 		process.env.PATH = "";
 		delete process.env.GH_TOKEN;
 		delete process.env.GITHUB_TOKEN;
-		let exitCode: number | undefined;
+		let result: { code: number; kind: string } | undefined;
 		try {
-			exitCode = await run({
+			result = await run({
 				argv: ["2539"],
 				stdout: () => {},
 				stderr: () => {},
@@ -781,7 +855,7 @@ describe("run() — REST transport end to end (#3497)", () => {
 			if (originalGithubToken === undefined) delete process.env.GITHUB_TOKEN;
 			else process.env.GITHUB_TOKEN = originalGithubToken;
 		}
-		expect(exitCode).toBe(EXIT_TRANSPORT);
+		expect(result?.code).toBe(EXIT_TRANSPORT);
 	});
 
 	function fakeClock(start = 0) {
@@ -813,9 +887,9 @@ describe("run() — REST transport end to end (#3497)", () => {
 				status: 401,
 			});
 		const stderrLines: string[] = [];
-		let exitCode: number | undefined;
+		let result: { code: number; kind: string } | undefined;
 		await withEmptyPathAndToken(async () => {
-			exitCode = await run({
+			result = await run({
 				argv: ["2539"],
 				gitExec,
 				fetchImpl,
@@ -823,8 +897,8 @@ describe("run() — REST transport end to end (#3497)", () => {
 				stderr: (line: string) => stderrLines.push(line),
 			});
 		});
-		expect(exitCode).toBe(EXIT_TRANSPORT);
-		expect(exitCode).not.toBe(EXIT_PENDING);
+		expect(result?.code).toBe(EXIT_TRANSPORT);
+		expect(result?.code).not.toBe(EXIT_PENDING);
 		expect(stderrLines.join("\n")).toContain("401");
 	});
 
@@ -847,9 +921,9 @@ describe("run() — REST transport end to end (#3497)", () => {
 			}
 			return new Response("Bad Gateway", { status: 502 });
 		};
-		let exitCode: number | undefined;
+		let result: { code: number; kind: string } | undefined;
 		await withEmptyPathAndToken(async () => {
-			exitCode = await run({
+			result = await run({
 				argv: ["2539", "--wait", "65"],
 				gitExec,
 				fetchImpl,
@@ -859,7 +933,7 @@ describe("run() — REST transport end to end (#3497)", () => {
 				sleepImpl: clock.sleepImpl,
 			});
 		});
-		expect(exitCode).toBe(EXIT_TRANSPORT);
+		expect(result?.code).toBe(EXIT_TRANSPORT);
 		expect(stderrLines.some((line) => /transient/i.test(line))).toBe(true);
 		expect(stderrLines.some((line) => /HTTP 502/.test(line))).toBe(true);
 		expect(clock.sleeps.length).toBeGreaterThan(0);
@@ -905,6 +979,20 @@ describe("run() — REST transport end to end (#3497)", () => {
 			fetchImpl,
 		});
 		expect(seenAuthHeaders).toEqual(["Bearer sekrit-token"]);
+	});
+});
+
+// #3861 J: a REST 200 with an EMPTY body is the documented empty answer (`{}`),
+// not a JSON contract violation; the `text.length === 0` early return keeps an
+// empty body from reaching `JSON.parse("")`.
+describe("restFetchCheckRunsPayload — an empty 200 body is an empty answer (#3861 J)", () => {
+	it("returns the empty payload for a 200 with no body", async () => {
+		const fetchImpl = async () => new Response("", { status: 200 });
+		const payload = await restFetchCheckRunsPayload("acme/repo", "sha-empty", {
+			token: "tok",
+			fetchImpl,
+		});
+		expect(payload).toEqual({ total_count: 0, check_runs: [] });
 	});
 });
 

@@ -1,4 +1,5 @@
-import * as fs from "node:fs";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -24,6 +25,8 @@ import {
 	findLocalToolConfig,
 	findNearestContaining,
 	findNearestMarkerRoot,
+	findNearestMarkerRootDetailed,
+	isRealGitMarker,
 	homeRelativePath,
 	matchesWorkspaceMemberPattern,
 	UV_WORKSPACE_EXCLUDE_DIALECT,
@@ -853,6 +856,252 @@ describe("findLocalToolConfig (refs #680)", () => {
 			}
 		} finally {
 			env.cleanup();
+		}
+	});
+});
+
+describe("Git ownership certainty preserves the legacy marker API", () => {
+	it.each(["missing", "invalid-file", "headless-directory"])(
+		"keeps boolean callback results when the later marker is %s",
+		(shape) => {
+			const env = setupTestEnvironment("pi-lens-marker-callback-");
+			try {
+				const valid = path.join(env.tmpDir, "valid");
+				const absent = path.join(env.tmpDir, "absent");
+				fs.writeFileSync(valid, "gitdir: ../metadata\n");
+				if (shape === "invalid-file") {
+					fs.writeFileSync(absent, "not a Git marker\n");
+				} else if (shape === "headless-directory") {
+					fs.mkdirSync(absent);
+				}
+				const candidates = [valid, absent];
+				// Array supplies an index. A legacy predicate must not interpret it
+				// as an opt-in, on either the successful-stat or exception path.
+				const mapped: boolean[] = candidates.map(isRealGitMarker);
+				expect({
+					mapped,
+					filtered: candidates.filter(isRealGitMarker),
+					every: candidates.every(isRealGitMarker),
+					some: [absent, absent].some(isRealGitMarker),
+				}).toEqual({
+					mapped: [true, false],
+					filtered: [valid],
+					every: false,
+					some: false,
+				});
+				expect(isRealGitMarker(valid, true)).toEqual({ kind: "valid" });
+				expect(isRealGitMarker(absent, true)).toEqual({ kind: "absent" });
+			} finally {
+				env.cleanup();
+			}
+		},
+	);
+
+	it.each(["ENOENT", "ENOTDIR", "EACCES", "ESTALE"])(
+		"keeps %s distinct from a successful marker validation",
+		(code) => {
+			const env = setupTestEnvironment("pi-lens-marker-certainty-");
+			const marker = path.join(env.tmpDir, ".git");
+			const failure = Object.assign(new Error("fixture marker failure"), {
+				code,
+			});
+			const stat = fs.statSync;
+			const spy = vi
+				.spyOn(fs, "statSync")
+				.mockImplementation((file, options) => {
+					if (String(file) === marker) throw failure;
+					return stat(file, options);
+				});
+			syncBuiltinESMExports();
+			try {
+				// R3: legacy false is an API projection, not proof of marker absence.
+				expect(isRealGitMarker(marker)).toBe(false);
+				const detailed = isRealGitMarker(marker, true);
+				if (code === "ENOENT" || code === "ENOTDIR") {
+					expect(detailed).toEqual({ kind: "absent" });
+				} else {
+					expect(detailed).toEqual({ kind: "unavailable", cause: failure });
+					expect(
+						findNearestMarkerRootDetailed(env.tmpDir, [".git"], {
+							markerPredicate: (file) => isRealGitMarker(file, true),
+						}),
+					).toEqual({
+						kind: "unavailable",
+						markerPath: marker,
+						cause: failure,
+					});
+				}
+			} finally {
+				spy.mockRestore();
+				syncBuiltinESMExports();
+				env.cleanup();
+			}
+		},
+	);
+
+	it("retains valid and invalid file/directory marker semantics in both modes", () => {
+		const env = setupTestEnvironment("pi-lens-marker-certainty-shapes-");
+		try {
+			const marker = path.join(env.tmpDir, ".git");
+			const check = (valid: boolean) => {
+				expect(isRealGitMarker(marker)).toBe(valid);
+				expect(isRealGitMarker(marker, true)).toEqual({
+					kind: valid ? "valid" : "absent",
+				});
+			};
+			check(false);
+			fs.writeFileSync(marker, "not a Git marker\n");
+			check(false);
+			fs.writeFileSync(marker, "gitdir: ../metadata\n");
+			check(true);
+			fs.unlinkSync(marker);
+			fs.mkdirSync(marker);
+			check(false);
+			fs.writeFileSync(path.join(marker, "HEAD"), "ref: refs/heads/main\n");
+			check(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("keeps legacy predicate existence ordering and propagates its exceptions", () => {
+		const env = setupTestEnvironment("pi-lens-marker-certainty-legacy-");
+		try {
+			const marker = path.join(env.tmpDir, "present");
+			fs.writeFileSync(marker, "marker\n");
+			const observed: string[] = [];
+			expect(
+				findNearestMarkerRoot(env.tmpDir, ["missing", "present"], {
+					markerPredicate: (file) => {
+						observed.push(file);
+						return true;
+					},
+				}),
+			).toBe(env.tmpDir);
+			expect(observed).toEqual([marker]);
+			expect(() =>
+				findNearestMarkerRoot(env.tmpDir, ["present"], {
+					markerPredicate: () => {
+						throw new Error("legacy predicate failure");
+					},
+				}),
+			).toThrow("legacy predicate failure");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("does not probe a detailed marker at or above the home ceiling", () => {
+		const env = setupTestEnvironment("pi-lens-marker-detailed-ceiling-");
+		try {
+			// Recurrence: a detailed walk that probes before the ceiling would read
+			// a marker at or above $HOME and report an escaped owner.
+			const probed: string[] = [];
+			expect(
+				findNearestMarkerRootDetailed(env.tmpDir, ["present"], {
+					homeDir: env.tmpDir,
+					markerPredicate: (file) => {
+						probed.push(file);
+						return { kind: "valid" };
+					},
+				}),
+			).toEqual({ kind: "not-found", reason: "home-ceiling" });
+			expect(probed).toEqual([]);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("probes markers in order per directory and climbs past an absent one", () => {
+		const env = setupTestEnvironment("pi-lens-marker-detailed-order-");
+		try {
+			const project = path.join(env.tmpDir, "project");
+			const nested = path.join(project, "src");
+			fs.mkdirSync(nested, { recursive: true });
+			fs.writeFileSync(path.join(project, ".git"), "gitdir: ../metadata\n");
+			const visited: string[] = [];
+			expect(
+				findNearestMarkerRootDetailed(nested, [".git", "missing"], {
+					homeDir: env.tmpDir,
+					markerPredicate: (file) => {
+						visited.push(file);
+						return isRealGitMarker(file, true);
+					},
+				}),
+			).toEqual({ kind: "found", root: project });
+			expect(visited).toEqual([
+				path.join(nested, ".git"),
+				path.join(nested, "missing"),
+				path.join(project, ".git"),
+			]);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("exposes the exact 64-iteration boundary and home ceiling without changing legacy null", () => {
+		const env = setupTestEnvironment("pi-lens-marker-certainty-depth-");
+		try {
+			fs.mkdirSync(path.join(env.tmpDir, ".git"));
+			fs.writeFileSync(
+				path.join(env.tmpDir, ".git", "HEAD"),
+				"ref: refs/heads/main\n",
+			);
+			const nested = path.join(env.tmpDir, ...Array<string>(64).fill("d"));
+			fs.mkdirSync(nested, { recursive: true });
+			const options = {
+				markerPredicate: (file: string) => isRealGitMarker(file, true),
+			} as const;
+			expect(
+				findNearestMarkerRootDetailed(path.dirname(nested), [".git"], options),
+			).toEqual({ kind: "found", root: env.tmpDir });
+			expect(findNearestMarkerRootDetailed(nested, [".git"], options)).toEqual({
+				kind: "not-found",
+				reason: "depth-limit",
+			});
+			expect(findNearestMarkerRoot(nested, [".git"])).toBeNull();
+			expect(
+				findNearestMarkerRootDetailed(env.tmpDir, [".git"], {
+					...options,
+					homeDir: env.tmpDir,
+				}),
+			).toEqual({ kind: "not-found", reason: "home-ceiling" });
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("reports reason root when the walk reaches the filesystem root below an unrelated home", async () => {
+		// Recurrence (#3691 F4): `parent === current` was never exercised. On posix
+		// "/" is an ancestor of every home, so the ceiling always fires first; a
+		// win32 project on another drive from home reaches the root. Load the real
+		// walker under win32 path semantics so every lane runs the same branch.
+		vi.resetModules();
+		vi.doMock("node:path", () => ({
+			...path.win32,
+			default: path.win32,
+		}));
+		try {
+			const win = await import("../../clients/path-utils.js");
+			const probed: string[] = [];
+			expect(
+				win.findNearestMarkerRootDetailed("C:\\work\\proj\\src", [".git"], {
+					homeDir: "D:\\home\\user",
+					markerPredicate: (file) => {
+						probed.push(file);
+						return { kind: "absent" };
+					},
+				}),
+			).toEqual({ kind: "not-found", reason: "root" });
+			expect(probed).toEqual([
+				"C:\\work\\proj\\src\\.git",
+				"C:\\work\\proj\\.git",
+				"C:\\work\\.git",
+				"C:\\.git",
+			]);
+		} finally {
+			vi.doUnmock("node:path");
+			vi.resetModules();
 		}
 	});
 });

@@ -215,7 +215,9 @@ function reportGlobalConfigProbeRetention(): void {
 	recordDegradationOnce({
 		kind: "config-location-probe-failed",
 		subject: resolution.path,
-		reason: `existence probe for ${resolution.existsProbeFailed?.path} failed (${resolution.existsProbeFailed?.errorClassName}); the location is retained as the config source and its read failures report through PILENS_CFG_0001`,
+		// #3704/#3696: subject already carries the unbounded path; keep the
+		// fixed diagnostic ahead of it so the ledger cap cannot erase it.
+		reason: `existence probe failed (${resolution.existsProbeFailed?.errorClassName}); the location is retained as the config source and its read failures report through PILENS_CFG_0001`,
 		metadata: { subsystem: "lens-config", configPath: resolution.path },
 	});
 }

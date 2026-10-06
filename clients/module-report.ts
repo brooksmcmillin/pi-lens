@@ -559,6 +559,7 @@ async function extractFile(
 					warnings,
 				};
 			},
+			"module-report",
 		);
 		if (!extracted.parsed) {
 			return {

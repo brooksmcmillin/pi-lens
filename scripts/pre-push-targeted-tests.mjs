@@ -35,6 +35,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { appendFileSync, existsSync, readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { getLockPath, getSlotPath } from "./lib/suite-lock.mjs";
 import { quoteForWindowsCmd } from "./with-test-lock.mjs";
 
 export const MAX_SELECTED_TESTS = 25;
@@ -61,6 +62,9 @@ export const CI_ONLY_PRE_PUSH_TESTS = {
 // import resolution cannot discover them. The governance suite pins this
 // executable population against the scanner shape.
 export const TREE_SCANNING_GOVERNANCE_TESTS = [
+	// #3937: walks clients/tools/mcp/scripts + index.ts for bridge-entry
+	// construction sites (provenance fold over the source tree).
+	"tests/clients/mutation-bridge-lineage-epoch-sweep.test.ts",
 	"tests/clients/session-state-conformance.test.ts",
 	"tests/config/glossary-synonym-sweep.test.ts",
 	"tests/config/strictness-ratchet.test.ts",
@@ -72,6 +76,11 @@ export const TREE_SCANNING_GOVERNANCE_TESTS = [
 	"tests/config/degradation-kind-order.test.ts",
 	"tests/config/sweep-floor-coverage.test.ts",
 	"tests/config/tracked-control-bytes.test.ts",
+	// #3612: walks clients/ for `defineSessionStore` call sites (§3.8 item 1).
+	"tests/config/session-scope-sweep.test.ts",
+	// Reads scripts/measure-lsp-idle-eviction.mjs as source (the script runs on
+	// load and cannot be imported), so no import path selects this test (#3645).
+	"tests/config/lsp-idle-eviction-measurement.test.ts",
 ];
 
 // Suites that scan the TESTS tree for a test shape (a real spawn, a raw timer
@@ -142,19 +151,38 @@ function readStdin() {
 	}
 }
 
-export function resolveDiffRange() {
-	const stdin = readStdin().trim();
-	if (stdin) {
-		const firstLine = stdin.split("\n")[0]?.trim();
-		const parts = firstLine ? firstLine.split(/\s+/) : [];
-		const [, localSha, , remoteSha] = parts;
-		if (localSha && remoteSha && !/^0+$/.test(remoteSha)) {
-			return `${remoteSha}...${localSha}`;
+export function resolveDiffRange(input = readStdin()) {
+	const lines = input
+		.trim()
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter(Boolean);
+	if (lines.length > 0) {
+		const ranges = [];
+		for (const line of lines) {
+			const parts = line.split(/\s+/);
+			const [, localSha, , remoteSha] = parts;
+			if (!localSha || !remoteSha) {
+				return ["origin/master...HEAD"];
+			}
+			// A zero local sha is a branch deletion. It has no changed files and
+			// must not trigger a build or a failed `git diff` (#3661).
+			if (/^0+$/.test(localSha)) continue;
+			if (/^0+$/.test(remoteSha)) {
+				// New branch (no remote tracking ref yet): retain the baseline
+				// used by CI, while continuing to retain other pushed updates.
+				if (!ranges.includes("origin/master...HEAD"))
+					ranges.push("origin/master...HEAD");
+				continue;
+			}
+			const range = `${remoteSha}...${localSha}`;
+			if (!ranges.includes(range)) ranges.push(range);
 		}
+		return ranges.length > 0 ? ranges : null;
 	}
 	// New branch (no remote tracking ref yet) or unreadable stdin: diff
 	// against origin/master, same baseline CI compares PRs against.
-	return "origin/master...HEAD";
+	return ["origin/master...HEAD"];
 }
 
 export function changedFiles(range) {
@@ -326,21 +354,46 @@ function runInherit(command, args, { needsShimShell = false } = {}) {
 	}
 }
 
-const LOCK_TIMEOUT_RE = /timed out after \d+ms waiting for test-suite lock/;
+// Anchored to the wrapper's own line (`console.error("[with-test-lock] ...")`)
+// so a failing test whose output merely quotes the timeout text is a test
+// failure, not contention (#3717 F5). Groups: waited ms, holder/slot detail.
+const LOCK_TIMEOUT_RE =
+	/^\[with-test-lock\] timed out after (\d+)ms waiting for test-suite lock:? ?(.*)$/m;
+const WRAPPER_LINE_PREFIX = "[with-test-lock] ";
 
-// Runs the targeted vitest selection through with-test-lock.mjs, streaming
+// A lock timeout throws before the wrapped command runs, so its stderr is
+// wrapper lines only. Any other non-empty line means a test ran and printed
+// (even the exact prefix at a line start, #3738), so it is not contention.
+function matchLockTimeout(stderr) {
+	const lines = stderr.split(/\r?\n/).filter((line) => line !== "");
+	if (!lines.every((line) => line.startsWith(WRAPPER_LINE_PREFIX))) return null;
+	return stderr.match(LOCK_TIMEOUT_RE);
+}
+
+// Runs the targeted vitest selection through with-test-lock.mjs in SHARED
+// mode (#3839): it is always a batch of named files, which is what a shared
+// slot is for, and the exclusive lock stays with full-suite runs. No slot
+// count is passed, so the ceiling stays the one DEFAULT_SHARED_SLOTS
+// (scripts/lib/suite-lock.mjs); the exclusive holder drains every possible
+// slot, so a hook-side count could not hide a slot from a full suite either. Streaming
 // stdout live and mirroring stderr live while also buffering it — the
 // buffer is only needed to tell "the shared machine-wide lock timed out"
 // (with-test-lock.mjs's own message, PI_LENS_TEST_LOCK_TIMEOUT_MS in
 // .husky/pre-push) apart from "the tests actually failed". A lock timeout
-// must let the push proceed (the hook is a convenience layer, CI is
-// authoritative, and a blocked push queue on a shared machine is worse than
-// a skipped local run); a real test failure must still block the push.
+// fails the push unless the named opt-out is explicit; a real test failure
+// always blocks the push.
 function runTargetedTests(selected) {
 	return new Promise((resolve) => {
 		const child = spawn(
 			process.execPath,
-			["scripts/with-test-lock.mjs", "--", "vitest", "run", ...selected],
+			[
+				"scripts/with-test-lock.mjs",
+				"--shared",
+				"--",
+				"vitest",
+				"run",
+				...selected,
+			],
 			{
 				stdio: ["ignore", "inherit", "pipe"],
 			},
@@ -351,18 +404,32 @@ function runTargetedTests(selected) {
 			stderrBuffer += chunk.toString();
 		});
 		child.on("error", (error) => {
-			resolve({ code: 1, timedOut: false, error });
+			resolve({ code: 1, lockTimeout: null, error });
 		});
 		child.on("close", (code) => {
-			const timedOut = code !== 0 && LOCK_TIMEOUT_RE.test(stderrBuffer);
-			resolve({ code: code ?? 1, timedOut });
+			const lockTimeout = code !== 0 ? matchLockTimeout(stderrBuffer) : null;
+			resolve({ code: code ?? 1, lockTimeout });
 		});
 	});
 }
 
 export async function main() {
-	const range = resolveDiffRange();
-	const changed = changedFiles(range);
+	const ranges = resolveDiffRange();
+	if (ranges === null) {
+		console.log("[pre-push] deletion-only push; skipping build and tests.");
+		return 0;
+	}
+	let changed = [];
+	for (const range of ranges) {
+		const files = changedFiles(range);
+		if (files === null) {
+			changed = null;
+			break;
+		}
+		for (const file of files) {
+			if (!changed.includes(file)) changed.push(file);
+		}
+	}
 	const skipBuild = process.argv.includes("--skip-build");
 
 	if (skipBuild) {
@@ -372,6 +439,11 @@ export async function main() {
 	} else {
 		console.log("[pre-push] building...");
 		runInherit("npm", ["run", "build"], { needsShimShell: true });
+		// #3886: the self-scan imports compiled `clients/` modules, so it must
+		// follow the build. `--skip-build` (CI's Targeted-tests job) means the
+		// Unit-tests job already ran the scan, so it is skipped too.
+		console.log("[pre-push] running ast-grep self-scan...");
+		runInherit("npm", ["run", "astgrep:self-scan"], { needsShimShell: true });
 	}
 
 	if (changed === null || changed.length === 0) {
@@ -452,18 +524,40 @@ export async function main() {
 	);
 	for (const test of selected) console.log(`  - ${test}`);
 
-	const { code, timedOut, error } = await runTargetedTests(selected);
-	if (timedOut) {
-		console.warn(
-			"[pre-push] the shared machine-wide test-suite lock (#1101) timed out; letting the push proceed without the targeted run. CI runs the real gate.",
+	const { code, lockTimeout, error } = await runTargetedTests(selected);
+	if (lockTimeout) {
+		const waitedMs = Number(lockTimeout[1]);
+		const holder = lockTimeout[2];
+		const lockPath = getLockPath();
+		const logPath = path.join(path.dirname(lockPath), "pre-push.log");
+		if (process.env.PI_LENS_PREPUSH_LOCK_SKIP === "1") {
+			// The opt-out is a decision, so it leaves a durable trace beside the
+			// lock (#3717): stderr scrolls away, the push does not. The lock
+			// directory exists: the wrapper just waited on a file inside it.
+			appendFileSync(
+				logPath,
+				`${JSON.stringify({ ts: new Date().toISOString(), event: "lock-skip", waitedMs, holder, lockPath, selected: selected.length })}\n`,
+			);
+			console.error(
+				`[pre-push] WARNING: PI_LENS_PREPUSH_LOCK_SKIP=1 opted out of the targeted test run after ${waitedMs / 1000} s (${holder}); the push is ungated, recorded in ${logPath}, and CI remains the real gate.`,
+			);
+			return 0;
+		}
+		// A slot block names no PID and its stuck file is a slot file, not the
+		// exclusive lock (#3839 review B).
+		const blockedFile = /shared slot\(s\)/.test(holder)
+			? getSlotPath(lockPath, "N")
+			: lockPath;
+		console.error(
+			`[pre-push] test lock busy after ${waitedMs / 1000} s (${holder}); push blocked. Lock file: ${blockedFile}. Wait and push again (to wait longer: PI_LENS_TEST_LOCK_TIMEOUT_MS=600000 git push); if it names a PID that is not a test run, delete the lock file. To push without the targeted run: PI_LENS_PREPUSH_LOCK_SKIP=1 git push (recorded in ${logPath}; CI remains the gate).`,
 		);
-		return 0;
+		return 1;
 	}
 	if (error) {
 		console.warn(
-			`[pre-push] could not run targeted tests (${error.message}); letting the push proceed. CI runs the real gate.`,
+			`[pre-push] could not run targeted tests (${error.message}); push blocked.`,
 		);
-		return 0;
+		return 1;
 	}
 	return code;
 }

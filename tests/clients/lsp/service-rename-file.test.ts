@@ -822,3 +822,57 @@ describe("LSPService.renameFile", () => {
 		}
 	});
 });
+
+describe("LSPService.getTrackedContent (#3601)", () => {
+	// `lsp_navigation`'s rename binds each touched file to what a live client
+	// last sent for it. The lookup must skip a dead client, a client rooted
+	// elsewhere, and one that does not track the document, and must report
+	// nothing when no client does (the caller refuses such a file).
+	it("returns the send of the first live in-root client that tracks the document", () => {
+		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-tracked-"));
+		const other = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-tracked-o-"));
+		try {
+			const filePath = path.join(tmpDir, "a.ts");
+			const service = new LSPService();
+			const untracking = {
+				...makeClient(tmpDir, null),
+				getSentContent: vi.fn(() => undefined),
+			};
+			const tracking = {
+				...makeClient(tmpDir, null),
+				getSentContent: vi.fn(
+					(): { hash: string; changedAtMs?: number } | undefined => ({
+						hash: "hash-in-root",
+						changedAtMs: 7,
+					}),
+				),
+			};
+			const dead = {
+				...makeClient(tmpDir, null),
+				isAlive: vi.fn(() => false),
+				getSentContent: vi.fn(() => ({ hash: "hash-dead" })),
+			};
+			const elsewhere = {
+				...makeClient(other, null),
+				getSentContent: vi.fn(() => ({ hash: "hash-other-root" })),
+			};
+			addClient(service, "aux-a", tmpDir, untracking);
+			addClient(service, "aux-b", tmpDir, tracking);
+			addClient(service, "aux-c", tmpDir, dead);
+			addClient(service, "aux-d", other, elsewhere);
+
+			expect(service.getTrackedContent(filePath, tmpDir)).toEqual({
+				hash: "hash-in-root",
+				changedAtMs: 7,
+			});
+			expect(dead.getSentContent).not.toHaveBeenCalled();
+			expect(elsewhere.getSentContent).not.toHaveBeenCalled();
+
+			tracking.getSentContent.mockReturnValue(undefined);
+			expect(service.getTrackedContent(filePath, tmpDir)).toBeUndefined();
+		} finally {
+			removeTempDirSync(tmpDir);
+			removeTempDirSync(other);
+		}
+	});
+});

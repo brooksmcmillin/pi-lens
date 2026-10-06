@@ -7,7 +7,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 import { beforeEach, describe, expect, it, afterEach, vi } from "vitest";
 import {
@@ -67,10 +67,15 @@ const motivatingFlattenedBodies = [
 	flattenedBody,
 ].map((candidate) => candidate.replaceAll("\\n", " "));
 
-function createOriginMasterFixture() {
+function createOriginMasterFixture(mappedFile?: string) {
 	const directory = mkdtempSync(join(repositoryRoot, ".tmp-pr-body-origin-"));
+	// `mappedFile` (#3802 F3) commits one extra repo-relative file in the same
+	// shell command, so a mapped-path diff costs no additional git spawn.
+	const mapped = mappedFile
+		? ` && mkdir -p '${directory}/${dirname(mappedFile)}' && printf 'touched\\n' > '${directory}/${mappedFile}' && git -C '${directory}' add '${mappedFile}' && git -C '${directory}' -c user.name=pi-lens-test -c user.email=pi-lens-test@example.com commit --quiet -m fixture-mapped`
+		: "";
 	gitExecSync(
-		`git init --quiet --initial-branch=main '${directory}' && git -C '${directory}' -c user.name=pi-lens-test -c user.email=pi-lens-test@example.com commit --quiet --allow-empty -m fixture-base && git -C '${directory}' update-ref refs/remotes/origin/master HEAD && printf 'fixture change\n' > '${directory}/fixture.md' && git -C '${directory}' add fixture.md && git -C '${directory}' -c user.name=pi-lens-test -c user.email=pi-lens-test@example.com commit --quiet -m fixture-head`,
+		`git init --quiet --initial-branch=main '${directory}' && git -C '${directory}' -c user.name=pi-lens-test -c user.email=pi-lens-test@example.com commit --quiet --allow-empty -m fixture-base && git -C '${directory}' update-ref refs/remotes/origin/master HEAD && printf 'fixture change\n' > '${directory}/fixture.md' && git -C '${directory}' add fixture.md && git -C '${directory}' -c user.name=pi-lens-test -c user.email=pi-lens-test@example.com commit --quiet -m fixture-head${mapped}`,
 	);
 	return directory;
 }
@@ -761,6 +766,39 @@ describe("test-reference positive recognition (#3013)", () => {
 		}
 	});
 
+	// #3902: the corpus is a whole-tree `git ls-files` plus a read-and-lex of
+	// every test file. A body with no test reference never needs it, so the
+	// corpus is computed on first use. The getter counts reads; the TLA+
+	// coverage integration cases red on the 5 s default when a plain prose
+	// body pays for the scan under CI load.
+	it("does not read the test corpus for a body with no test reference", () => {
+		let reads = 0;
+		const result = lintPrBody(body, {
+			cwd: repositoryRoot,
+			get testCorpus() {
+				reads += 1;
+				return { paths: new Set<string>(), titles: new Set<string>() };
+			},
+		});
+		expect(result).toEqual({ valid: true, errors: [] });
+		expect(reads).toBe(0);
+	});
+
+	it("reads the test corpus when the body names a test reference", () => {
+		let reads = 0;
+		const result = lintPrBody(`${body}\nSee \`tests/missing-3902.test.ts\`.`, {
+			cwd: repositoryRoot,
+			get testCorpus() {
+				reads += 1;
+				return { paths: new Set<string>(), titles: new Set<string>() };
+			},
+		});
+		expect(result.errors).toEqual([
+			"PR body test reference is missing under tests/: tests/missing-3902.test.ts",
+		]);
+		expect(reads).toBe(1);
+	});
+
 	// End-to-end proof: three real merged bodies that fail pre-fix pass
 	// post-fix. Only test-reference errors are asserted — the citation and
 	// master-claim surfaces belong to #2904 and are unaffected.
@@ -1038,6 +1076,21 @@ describe("PR body lint (#1844)", () => {
 		rmSync(fixtureCwd, { recursive: true, force: true });
 	});
 
+	// #3780 (#3688 survivors, check-pr-body.mjs `lintLocalPrBody`): a comma-list
+	// close keyword is rejected WITH the line that holds it. `lintCloseKeywords`
+	// pins the line in isolation; the local preflight (`--lint-local`) is what a
+	// fixer reads before pushing, and dropping the line from its errors kept the
+	// suite green.
+	it("names the offending close-keyword line in the local lint result", () => {
+		const result = lintLocalPrBody(
+			`${body}\nCloses #12, #13\n`,
+			process.cwd(),
+			() => "",
+		);
+		expect(result.valid).toBe(false);
+		expect(result.errors).toContain("  offending line: Closes #12, #13");
+	});
+
 	it("requires a diff record literal for runtime changes", () => {
 		const runtimeDiff = [
 			"diff --git a/clients/example.ts b/clients/example.ts",
@@ -1152,6 +1205,24 @@ describe("PR body lint (#1844)", () => {
 			).toBe(false);
 		});
 
+		it("harvests a read-time fold row's kind (#3721)", () => {
+			const diff = [
+				"diff --git a/clients/degradation-ledger.ts b/clients/degradation-ledger.ts",
+				"@@ -1,0 +1,4 @@",
+				"+\tsummary.push({",
+				'+\t\tkind: "fold-row-kind",',
+				"+\t\tcount: 1,",
+				"+\t});",
+			].join("\n");
+			expect(
+				lintPrBody(withObservability("The record is fold-row-kind."), { diff }),
+			).toEqual({ valid: true, errors: [] });
+			expect(
+				lintPrBody(withObservability("The record is not-in-diff."), { diff })
+					.valid,
+			).toBe(false);
+		});
+
 		it("harvests recordDegradation's kind", () => {
 			const diff = [
 				"diff --git a/clients/example.ts b/clients/example.ts",
@@ -1163,6 +1234,475 @@ describe("PR body lint (#1844)", () => {
 					diff,
 				}),
 			).toEqual({ valid: true, errors: [] });
+		});
+	});
+
+	describe("decision branches on a session, lifecycle or delivery seam (#3875)", () => {
+		const sentence = "No new failure path; no record added.";
+		const withObservability = (text: string) =>
+			body.replace("The advisory check run is the record.", text);
+		const diffAdding = (file: string, ...added: string[]) =>
+			[
+				`diff --git a/${file} b/${file}`,
+				`@@ -1,0 +1,${added.length} @@`,
+				...added.map((line) => `+${line}`),
+			].join("\n");
+		// Recurrence: #3873 — the S2/S3 session-scope fixes (#3819, #3855, #3758,
+		// #3759) added adopt/reset/skip branches that are not failure paths, so
+		// the exact no-record sentence passed and the records never existed.
+		const seamBranch = diffAdding(
+			"clients/session-scope.ts",
+			"\tif (slot.sessionFile === sessionFile) adoptHandoff(slot);",
+		);
+		const refusal = "decision branch";
+
+		it("refuses the no-record sentence for a branch added to a seam file", () => {
+			const result = lintPrBody(withObservability(sentence), {
+				diff: seamBranch,
+			});
+			expect(result.valid).toBe(false);
+			expect(result.errors.join(" ")).toContain(refusal);
+			expect(result.errors.join(" ")).toContain("clients/session-scope.ts: 1");
+		});
+
+		it.each([
+			["if", "\tif (adopt) apply(slot);"],
+			["if without a space", "\tif(adopt) apply(slot);"],
+			["else", "\t} else {"],
+			["switch", "\tswitch (slot.kind) {"],
+			["switch without a space", "\tswitch(slot.kind) {"],
+			["case", '\t\tcase "adopt":'],
+		])("detects a %s branch", (_name, line) => {
+			expect(
+				lintPrBody(withObservability(sentence), {
+					diff: diffAdding("clients/session-scope.ts", line),
+				}).errors.join(" "),
+			).toContain(refusal);
+		});
+
+		// Recurrence: r1 of #3905 pinned `clients/fix-run-restore.ts` as "the
+		// unmodelled row"; the pin decays when a TLA lane models that file. Every
+		// row of the real map is the population, so a hub, an `unmodelled` value
+		// and a single-family row are all in it with no file named here.
+		it("treats every coverage-map row, whatever its value, as a seam", () => {
+			const rows = Object.keys(
+				JSON.parse(
+					readFileSync(
+						join(repositoryRoot, "formal", "coverage-map.json"),
+						"utf8",
+					),
+				).map,
+			);
+			expect(rows.length).toBeGreaterThan(0);
+			const missed = rows.filter(
+				(file) =>
+					!lintPrBody(withObservability(sentence), {
+						diff: diffAdding(file, "\tif (adopt) apply(slot);"),
+					})
+						.errors.join(" ")
+						.includes(refusal),
+			);
+			expect(missed).toEqual([]);
+		});
+
+		it("accepts the same diff when the body names a record literal the diff adds", () => {
+			const diff = diffAdding(
+				"clients/session-scope.ts",
+				"\tif (slot.sessionFile === sessionFile) {",
+				'\t\tlogLatency({ phase: "session_handoff_adopt" });',
+				"\t}",
+			);
+			expect(
+				lintPrBody(withObservability("The record is session_handoff_adopt."), {
+					diff,
+				}),
+			).toEqual({ valid: true, errors: [] });
+			expect(
+				lintPrBody(withObservability(sentence), { diff }).errors.join(" "),
+			).toContain(refusal);
+		});
+
+		// Recurrence: r1 of #3905 F2: `none: yes yes yes` and the template text
+		// `none: <reason> goes here` passed, so one throwaway line answered every
+		// branch in every file. The reason now names each flagged file.
+		const none = (reason: string) =>
+			lintPrBody(withObservability(reason), { diff: seamBranch });
+
+		it("accepts `none: <reason>` that names the flagged file", () => {
+			expect(
+				none(
+					"none: session-scope.ts only selects between two already-recorded outcomes",
+				),
+			).toEqual({ valid: true, errors: [] });
+		});
+
+		it.each([
+			["a bullet", "- none: session-scope.ts only picks a recorded outcome"],
+			["bold", "**none:** session-scope.ts only picks a recorded outcome"],
+			["upper case", "None: session-scope.ts only picks a recorded outcome"],
+			[
+				"a later line",
+				"Prose first.\nnone: session-scope.ts only picks a recorded one",
+			],
+			[
+				"CRLF",
+				"Prose first.\r\nnone: session-scope.ts only picks a recorded one",
+			],
+			["three words", "none: guards the session-scope.ts"],
+			[
+				"an honest none-of reason",
+				"none: none of session-scope.ts decides delivery",
+			],
+			[
+				"an honest placeholder-word suffix",
+				"none: the guard in session-scope.ts is not applicable here",
+			],
+		])("accepts a reason written as %s", (_name, text) => {
+			expect(none(text)).toEqual({ valid: true, errors: [] });
+		});
+
+		// R-a (#3905 r2): the file check was a plain substring, so a longer
+		// basename satisfied a flagged file. The reviewer's three probes:
+		// `lsp-server.ts` satisfied `clients/lsp/server.ts`, a root-prefixed
+		// `index.ts` satisfied `clients/lsp/index.ts`, and
+		// `tree-sitter-client.ts` satisfied `clients/lsp/client.ts`.
+		it.each([
+			["clients/lsp/server.ts", "lsp-server.ts"],
+			["clients/lsp/index.ts", "rootindex.ts"],
+			["clients/lsp/index.ts", "clients/lsp/other-index.ts"],
+			["clients/lsp/client.ts", "tree-sitter-client.ts"],
+		])("refuses %s when the reason only names %s", (flagged, token) => {
+			const diff = diffAdding(flagged, "\tif (ready) adopt(slot);");
+			const result = lintPrBody(
+				withObservability(
+					`none: ${token} only forwards the already-recorded outcome`,
+				),
+				{ diff },
+			);
+			expect(result.valid).toBe(false);
+			expect(result.errors.join(" ")).toContain(refusal);
+		});
+
+		it("accepts the flagged basename at a path boundary", () => {
+			const diff = diffAdding(
+				"clients/lsp/server.ts",
+				"\tif (ready) adopt(slot);",
+			);
+			expect(
+				lintPrBody(
+					withObservability(
+						"none: clients/lsp/server.ts only forwards the recorded outcome",
+					),
+					{ diff },
+				),
+			).toEqual({ valid: true, errors: [] });
+		});
+
+		it("accepts one none line per flagged file", () => {
+			const diff = [
+				seamBranch,
+				diffAdding("clients/agent-nudge.ts", "\tif (queued) flush();"),
+			].join("\n");
+			const reasons = (text: string) =>
+				lintPrBody(withObservability(text), { diff });
+			expect(
+				reasons(
+					"none: session-scope.ts only selects a recorded outcome\nnone: agent-nudge.ts only flushes an already counted queue",
+				),
+			).toEqual({ valid: true, errors: [] });
+			const refused = reasons(
+				"none: session-scope.ts only selects a recorded outcome",
+			).errors.join(" ");
+			expect(refused).toContain(
+				"clients/session-scope.ts: 1, clients/agent-nudge.ts: 1",
+			);
+		});
+
+		it.each([
+			["nothing after the colon", "none:"],
+			["a bare n/a", "none: n/a"],
+			["a bare none", "none: none"],
+			["too short", "none: session-scope.ts only"],
+			["a trailing space after two words", "none: skips session-scope.ts "],
+			["a double space between two words", "none: skips  session-scope.ts"],
+			[
+				"the template placeholder",
+				"none: <reason> goes here in session-scope.ts",
+			],
+			["no flagged file named", "none: yes yes yes"],
+			[
+				"a different file named",
+				"none: agent-nudge.ts only picks a recorded outcome",
+			],
+			["n/a repeated", "none: n/a n/a n/a"],
+			["na repeated", "none: na na na"],
+			["none repeated", "none: none none none"],
+			["not applicable", "none: not applicable here"],
+			["tbd repeated", "none: tbd tbd tbd"],
+			["todo repeated", "none: todo todo todo"],
+			[
+				"not mid-line",
+				"see the none: session-scope.ts only picks a recorded outcome",
+			],
+		])("refuses a reason that is %s", (_name, text) => {
+			expect(none(text).errors.join(" ")).toContain(refusal);
+		});
+
+		// With a seam file the basename requirement already refuses placeholder
+		// words; on a diff with no flagged file only the placeholder test stands.
+		it.each([
+			"n/a n/a n/a",
+			"na na na",
+			"none none none",
+			"not applicable here",
+			"tbd tbd tbd",
+			"todo todo todo",
+		])(
+			"refuses the placeholder reason %j when no file is flagged",
+			(reason) => {
+				expect(
+					lintPrBody(withObservability(`none: ${reason}`), {
+						diff: diffAdding("clients/example.ts", "\tif (ready) go();"),
+					}).valid,
+				).toBe(false);
+			},
+		);
+
+		it("tells the author to name each flagged file", () => {
+			expect(none("none: yes yes yes").errors.join(" ")).toContain(
+				"naming each file above by basename",
+			);
+		});
+
+		it("still requires a record for a failure path, whatever the reason says", () => {
+			const diff = diffAdding(
+				"clients/session-scope.ts",
+				"\ttry { adopt(); } catch (error) { warn(error); }",
+			);
+			expect(
+				lintPrBody(
+					withObservability("none: the catch only forwards to the host"),
+					{ diff },
+				).errors.join(" "),
+			).toContain("not valid when the added lines contain a failure path");
+		});
+
+		it("leaves a branch in a file outside the coverage map on the old form", () => {
+			const diff = diffAdding("clients/example.ts", "\tif (ready) go();");
+			expect(lintPrBody(withObservability(sentence), { diff })).toEqual({
+				valid: true,
+				errors: [],
+			});
+		});
+
+		it("leaves a seam file without an added branch on the old form", () => {
+			const diff = diffAdding(
+				"clients/session-scope.ts",
+				"\tconst keyHash = hashKey(slot.sessionFile);",
+			);
+			expect(lintPrBody(withObservability(sentence), { diff })).toEqual({
+				valid: true,
+				errors: [],
+			});
+		});
+
+		// Recurrence: r1 of #3905 F1: dropping every `*`-led line also dropped a
+		// block's closer, so the blanker read an unterminated comment and hid all
+		// later code, which let #3770's `catch` blocks pass the bare sentence.
+		it.each([
+			[
+				"a whole block, then code",
+				["/**", " * a note", " */", "\tif (adopt) apply(slot);"],
+			],
+			[
+				"an orphan closer, then code",
+				[" * the end of a note", " */", "\tif (adopt) apply(slot);"],
+			],
+			[
+				"an orphan closer sharing a line with code",
+				[" * the end of a note", " */ if (adopt) apply(slot);"],
+			],
+			[
+				"a one-line block, then code",
+				["/** a note */", "\tif (adopt) apply(slot);"],
+			],
+			[
+				"an inline block before code",
+				["\t/* a note */ if (adopt) apply(slot);"],
+			],
+			[
+				"a block closer sharing a line with code",
+				["/**", " * a note", " */ if (adopt) apply(slot);"],
+			],
+			[
+				"a line comment, then code",
+				["\t// a note", "\tif (adopt) apply(slot);"],
+			],
+			["a multiplication line", ["\tconst n = a * b; if (adopt) apply(slot);"]],
+		])("still sees a seam branch after %s", (_name, lines) => {
+			expect(
+				lintPrBody(withObservability(sentence), {
+					diff: diffAdding("clients/session-scope.ts", ...lines),
+				}).errors.join(" "),
+			).toContain(refusal);
+		});
+
+		it("still sees a failure path after a whole JSDoc block", () => {
+			const diff = diffAdding(
+				"clients/example.ts",
+				"/**",
+				" * installs the thing",
+				" */",
+				"\ttry { install(); } catch (error) { warn(error); }",
+			);
+			expect(
+				lintPrBody(withObservability(sentence), { diff }).errors.join(" "),
+			).toContain("not valid when the added lines contain a failure path");
+		});
+
+		it("does not let an opener without a closer in one hunk hide the next hunk", () => {
+			const diff = [
+				"diff --git a/clients/session-scope.ts b/clients/session-scope.ts",
+				"@@ -1,0 +1,2 @@",
+				"+/**",
+				"+ * an opener whose closer is an unchanged context line",
+				"@@ -40,0 +42,1 @@",
+				"+\tif (adopt) apply(slot);",
+			].join("\n");
+			expect(
+				lintPrBody(withObservability(sentence), { diff }).errors.join(" "),
+			).toContain(refusal);
+		});
+
+		// A file's hunks are separate lexing units that sum back to one verdict.
+		const twoHunks = (first: string, second: string) =>
+			[
+				"diff --git a/clients/session-scope.ts b/clients/session-scope.ts",
+				"@@ -1,0 +1,1 @@",
+				`+${first}`,
+				"@@ -40,0 +41,1 @@",
+				`+${second}`,
+			].join("\n");
+
+		it("keeps a failure path found in an earlier hunk when the last hunk has none", () => {
+			expect(
+				lintPrBody(withObservability(sentence), {
+					diff: twoHunks("\ttry { adopt(); } catch { warn(); }", "\tnext();"),
+				}).errors.join(" "),
+			).toContain("not valid when the added lines contain a failure path");
+		});
+
+		it("sums a file's branches over its hunks", () => {
+			expect(
+				lintPrBody(withObservability(sentence), {
+					diff: twoHunks("\tif (a) adopt();", "\tif (b) reset();"),
+				}).errors.join(" "),
+			).toContain("clients/session-scope.ts: 2");
+		});
+
+		it("reads #3770's real installer diff as a failure path again", () => {
+			// Real `--unified=0` diff of #3770: `} catch {` and `.catch(() => {})`
+			// follow added JSDoc blocks. origin/master refused it under the bare
+			// sentence; the r1 filter accepted it.
+			const diff = readFileSync(
+				join(
+					repositoryRoot,
+					"tests",
+					"fixtures",
+					"ci-pr-bodies",
+					"pr-3770-runtime.diff",
+				),
+				"utf8",
+			);
+			expect(
+				lintPrBody(withObservability(sentence), { diff }).errors.join(" "),
+			).toContain("not valid when the added lines contain a failure path");
+		});
+
+		it("reads code, not prose: comments, strings and JSDoc continuations never count", () => {
+			const diff = diffAdding(
+				"clients/session-scope.ts",
+				"\t// if (adopt) the other case wins, else reset",
+				'\tconst note = "if (adopt) else switch (kind) case";',
+				"\t * is the unverifiable case above and else nothing",
+			);
+			expect(lintPrBody(withObservability(sentence), { diff })).toEqual({
+				valid: true,
+				errors: [],
+			});
+		});
+
+		// Same lexer, same `--unified=0` blind spot, on the failure-path scan the
+		// sentence also depends on: a JSDoc continuation line carries no opener.
+		it("does not read a failure path out of a JSDoc continuation line", () => {
+			const diff = diffAdding(
+				"clients/example.ts",
+				" * a retry may throw here and the caller must catch it",
+			);
+			expect(lintPrBody(withObservability(sentence), { diff })).toEqual({
+				valid: true,
+				errors: [],
+			});
+		});
+
+		it("does not let a backtick in a JSDoc continuation line hide a failure path", () => {
+			const diff = diffAdding(
+				"clients/example.ts",
+				" * the `findRelocation`'s window saturates at",
+				"\ttry { adopt(); } catch (error) { warn(error); }",
+			);
+			expect(
+				lintPrBody(withObservability(sentence), { diff }).errors.join(" "),
+			).toContain("not valid when the added lines contain a failure path");
+		});
+
+		it("refuses merged #3785's honest sentence over its read-guard branches", () => {
+			// Real runtime hunks of #3785: `if (opts?.stampFileTime !== false)` and
+			// `if (fileTimeMoved && toolCallId !== undefined)` shipped under this
+			// exact sentence with no record of the FileTime decision.
+			const diff = readFileSync(
+				join(
+					repositoryRoot,
+					"tests",
+					"fixtures",
+					"ci-pr-bodies",
+					"pr-3785-runtime.diff",
+				),
+				"utf8",
+			);
+			expect(
+				lintPrBody(withObservability(sentence), { diff }).errors.join(" "),
+			).toContain("clients/read-guard.ts");
+		});
+
+		it("does not flag #3774's comment-only edit, whose prose said `case`", () => {
+			// Real `--unified=0` hunk: the block comment's opener is not in the
+			// diff, so the continuation line `unverifiable case above` read as a
+			// `case` label in the first calibration run.
+			const diff = readFileSync(
+				join(
+					repositoryRoot,
+					"tests",
+					"fixtures",
+					"ci-pr-bodies",
+					"pr-3774-comment-runtime.diff",
+				),
+				"utf8",
+			);
+			expect(lintPrBody(withObservability(sentence), { diff })).toEqual({
+				valid: true,
+				errors: [],
+			});
+		});
+
+		it("reaches the local preflight entry point", () => {
+			const result = lintLocalPrBody(
+				withObservability(sentence),
+				process.cwd(),
+				() => seamBranch,
+			);
+			expect(result.valid).toBe(false);
+			expect(result.errors.join(" ")).toContain(refusal);
 		});
 	});
 
@@ -1479,12 +2019,49 @@ describe("PR body lint (#1844)", () => {
 				titlePath,
 				"ci(test): verify local body lint (refs #2807)\n",
 			);
+			mkdirSync(join(fixtureCwd, "clients"), { recursive: true });
+			writeFileSync(
+				join(fixtureCwd, "clients", "ref.ts"),
+				"const local = true;\n",
+			);
+			const localBody = `${body}\n\nEvidence: \`clients/ref.ts:1\`\n\`\`\`ts\nconst local = true;\n\`\`\``;
+			writeFileSync(
+				bodyPath,
+				`${localBody}\n\n### Test assessment\nThe targeted test covers the local CLI.`,
+			);
 			for (const args of [
 				[checker, "--lint-local", bodyPath],
+				[
+					checker,
+					"--lint-local",
+					bodyPath,
+					"--title",
+					"ci(test): verify local body lint (refs #2807)",
+				],
 				[checker, "--body", bodyPath, "--title", titlePath],
 			]) {
 				execFileSync(process.execPath, args, { cwd: fixtureCwd });
 			}
+			expect(() =>
+				execFileSync(
+					process.execPath,
+					[
+						checker,
+						"--lint-local",
+						bodyPath,
+						"--title",
+						"ci(test): verify local body lint (closes #2807)",
+					],
+					{ cwd: fixtureCwd, stdio: "pipe" },
+				),
+			).toThrow();
+			expect(() =>
+				execFileSync(
+					process.execPath,
+					[checker, "--lint-local", bodyPath, "--ref", "HEAD"],
+					{ cwd: fixtureCwd, stdio: "pipe" },
+				),
+			).toThrow();
 		} finally {
 			rmSync(directory, { recursive: true, force: true });
 		}
@@ -2561,6 +3138,52 @@ describe("local lint parity", () => {
 		expect(result.valid).toBe(false);
 		expect(result.errors.join(" ")).toContain("Test assessment");
 	});
+
+	it("matches CI close-keyword placement and rejects comma lists (#3681)", () => {
+		const withTitle = `${body}\n\nCloses #3680, #3681.`;
+		const result = lintLocalPrBody(withTitle, process.cwd(), () => "", {
+			title: "fix: tooling (closes #3680)",
+		});
+		expect(result.valid).toBe(false);
+		expect(result.errors.join(" ")).toContain("comma-separated close list");
+		const missing = lintLocalPrBody(body, process.cwd(), () => "", {
+			title: "fix: tooling (closes #3680)",
+		});
+		expect(missing.valid).toBe(false);
+		expect(missing.errors.join(" ")).toContain("#3680");
+		expect(missing.errors.join(" ")).toContain("Alternatively, use refs #3680");
+	});
+
+	it("resolves path citations from --ref instead of the working tree (#3681)", () => {
+		const result = lintPrBody(
+			`${body}\nEvidence: \`clients/ref.ts:1\`\n\`\`\`ts\nconst fromRef = true;\n\`\`\``,
+			{
+				ref: "release-ref",
+				git: (args: string[], options?: { maxBuffer?: number }) => {
+					expect(args).toEqual(["show", "release-ref:clients/ref.ts"]);
+					expect(options?.maxBuffer).toBe(16 * 1024 * 1024);
+					return "const fromRef = true;";
+				},
+			},
+		);
+		expect(result).toEqual({ valid: true, errors: [] });
+	});
+
+	it("reports a bad --ref before trying to read its cited file (#3681)", () => {
+		const result = lintPrBody(
+			`${body}\nEvidence: \`clients/ref.ts:1\`\n\`\`\`ts\nconst ref = true;\n\`\`\``,
+			{
+				ref: "missing-ref",
+				git: () => {
+					throw new Error("bad ref");
+				},
+			},
+		);
+		expect(result.valid).toBe(false);
+		expect(result.errors.join(" ")).toContain(
+			"revision missing-ref does not exist or is not a commit",
+		);
+	});
 	it("falls back to HEAD~1 when the upstream range is unavailable", () => {
 		const ranges: string[][] = [];
 		const result = lintLocalPrBody(body, process.cwd(), (args) => {
@@ -2773,5 +3396,136 @@ foo.test.ts uniquely pins the retry ladder.`;
 		);
 		expect(result).toMatchObject({ valid: true });
 		warning.mockRestore();
+	});
+});
+
+// #3795 item 1. Recurrence: #3768's Round 3 body shipped with the shell-eaten
+// inline code spans and npm-script / oxlint output pasted outside any fence.
+// The structural lint passed those two garble symptoms; only the missing
+// test references redded it. The fixture below is that body's Round 3 block
+// (edit-2 of its userContentEdits, before the orchestrator rewrite).
+describe("PR body garble from shell-expanded quotes (#3795)", () => {
+	// The real block: emptied spans on the `fixed`/`Red proof` lines, then the
+	// pasted `npm run lint` banner and oxlint command line, unfenced.
+	const garbledRound3 = [
+		"## Round 3",
+		"",
+		"- N1 fixed: skip-only exit 1 is now scoped to  and ; other smoke lanes retain exit 0.",
+		"- Red proof, removing the gated option:  in .",
+		"- Targeted tests: 23 passed; ",
+		"> pi-lens@4.3.0 lint",
+		"> tsc --project tsconfig.json && npm run lint:js && npm run lint:js:tests",
+		"",
+		"> pi-lens@4.3.0 lint:js",
+		"> oxlint --deny-warnings --import-plugin -D block-scoped-var .",
+	].join("\n");
+
+	it("rejects the real Round 3 body's pasted npm banner and oxlint line", () => {
+		const errors = lintPrBody(`${body}\n\n${garbledRound3}`).errors.join("\n");
+		expect(errors).toContain("npm-script");
+		expect(errors).toContain("oxlint");
+	});
+
+	it("rejects an emptied inline code span outside a fence", () => {
+		const errors = lintPrBody(
+			`${body}\n\nThe span \`\` lost its name.`,
+		).errors.join("\n");
+		expect(errors).toContain("empty inline code span");
+	});
+
+	it("accepts the same tool output inside a fenced block", () => {
+		const fenced = `${body}\n\n## Round 3\n\n\`\`\`text\n> pi-lens@4.3.0 lint\n> oxlint --deny-warnings .\n\`\`\``;
+		const errors = lintPrBody(fenced).errors.join("\n");
+		expect(errors).not.toContain("npm-script");
+		expect(errors).not.toContain("oxlint");
+	});
+
+	it("ignores tilde fences and four-space indented code", () => {
+		const fenced = `${body}\n\n~~~text\n> pi-lens@4.3.0 lint\n> oxlint --deny-warnings .\n~~~`;
+		const indented = `${body}\n\n    > pi-lens@4.3.0 lint\n    > oxlint --deny-warnings .`;
+		expect(lintPrBody(fenced).errors.join("\n")).not.toContain("oxlint");
+		expect(lintPrBody(indented).errors.join("\n")).not.toContain("oxlint");
+	});
+
+	it("ignores tab-indented code and a tilde line inside a backtick fence", () => {
+		const tabbed = `${body}\n\n\t> pi-lens@4.3.0 lint`;
+		// A `~~~` line does not close a ``` fence, so the banner stays fenced.
+		const mixed = `${body}\n\n\`\`\`text\n~~~\n> pi-lens@4.3.0 lint\n\`\`\``;
+		expect(lintPrBody(tabbed).errors.join("\n")).not.toContain("npm-script");
+		expect(lintPrBody(mixed).errors.join("\n")).not.toContain("npm-script");
+	});
+
+	// Verify r3 regression: the indented-code rule landed in the helper that
+	// the citation and test-reference lints share, so a fabricated citation in
+	// a nested bullet passed. Those lints keep master's backtick-only fences.
+	it("still validates citations and test references in nested bullets and tilde fences", () => {
+		const headFiles = new Map([
+			["clients/citation.ts", "export const a = 1;\n"],
+		]);
+		const nested = `${body}\n\n- Evidence:\n    - \`clients/missing.ts:1\` holds it.\n    - Pinned by \`tests/missing.test.ts\`.`;
+		const tilde = `${body}\n\n~~~text\n\`clients/missing.ts:1\` holds it.\n~~~`;
+		const missingCitation =
+			"PR body citation clients/missing.ts:1 does not exist in the HEAD tree.";
+		const nestedErrors = lintPrBody(nested, { headFiles }).errors;
+		expect(nestedErrors).toContain(missingCitation);
+		expect(nestedErrors).toContain(
+			"PR body test reference is missing under tests/: tests/missing.test.ts",
+		);
+		expect(lintPrBody(tilde, { headFiles }).errors).toContain(missingCitation);
+	});
+
+	it("accepts a legitimate inline mention of the oxlint flag", () => {
+		const errors = lintPrBody(
+			`${body}\n\nThe \`oxlint --deny-warnings\` flag stays in the transcript.`,
+		).errors.join("\n");
+		expect(errors).not.toContain("outside a fenced block");
+	});
+});
+
+describe("TLA+ coverage through the CI entry point (#3802 F3)", () => {
+	// The diff touches a runtime file, so the Observability section must carry
+	// the literal the runtime-observability lint accepts; the coverage rule is
+	// then the only open question.
+	const runtimeBody = body.replace(
+		"The advisory check run is the record.",
+		"No new failure path; no record added.",
+	);
+	// Recurrence: PR #3864 r1 wired `lintTlaCoverage` into `lintPullRequestEvent`
+	// with no test through that entry; deleting the wire left 293 tests green,
+	// because the existing coverage case drove only `lintLocalPrBody`.
+	let previousCwd: string;
+	let fixtureCwd: string;
+	beforeEach(() => {
+		previousCwd = process.cwd();
+		fixtureCwd = createOriginMasterFixture("clients/read-guard.ts");
+		process.chdir(fixtureCwd);
+		vi.stubEnv("GITHUB_TOKEN", "t");
+		vi.stubEnv("GITHUB_API_URL", "https://api.example");
+		vi.stubEnv("GITHUB_REPOSITORY", "o/r");
+	});
+	afterEach(() => {
+		vi.unstubAllEnvs();
+		vi.restoreAllMocks();
+		process.chdir(previousCwd);
+		rmSync(fixtureCwd, { recursive: true, force: true });
+	});
+
+	it("fails a mapped change with no model move and no declaration", async () => {
+		const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+		const result = await lintPullRequestEvent(fetchForEvent(runtimeBody, []), {
+			pull_request: { number: 7, body: runtimeBody },
+		});
+		expect(result.valid).toBe(false);
+		expect(errors.mock.calls.flat().join("\n")).toContain("formal/read-guard/");
+	});
+
+	it("passes the same diff once the body declares one listed family", async () => {
+		const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+		const declared = `${runtimeBody}\n\nTLA+ unaffected: read-guard — only a local helper moved.`;
+		const result = await lintPullRequestEvent(fetchForEvent(declared, []), {
+			pull_request: { number: 7, body: declared },
+		});
+		expect(errors.mock.calls.flat().join("\n")).not.toContain("formal/");
+		expect(result).toMatchObject({ valid: true });
 	});
 });

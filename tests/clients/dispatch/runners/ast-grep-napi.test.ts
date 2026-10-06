@@ -469,6 +469,44 @@ describe("ast-grep-napi runner — aux-runner-findings-lost degradation (#2324 R
 		}
 	});
 
+	it("keeps the complete diagnostic before a 200-character file path (#3704/#3696)", async () => {
+		const env = setupTestEnvironment("pi-lens-ast-grep-long-loss-");
+		try {
+			const filePath = path.join(env.tmpDir, `file-${"x".repeat(180)}.ts`);
+			fs.writeFileSync(filePath, "const x = 1;\n");
+			const ledger = await import("../../../../clients/degradation-ledger.js");
+			ledger.resetDegradationLedger();
+			const pendingAux =
+				await import("../../../../clients/lsp/pending-aux-coverage.js");
+			pendingAux.resetPendingAuxiliaryCoverage();
+			pendingAux.markPendingAuxiliaryCoverage(filePath, ["ast-grep"]);
+			mockAuxiliaryLspPublished.mockResolvedValue(true);
+			mockWorkingSgLoad();
+			const mod =
+				await import("../../../../clients/dispatch/runners/ast-grep-napi.js");
+			await mod.default.run(
+				createCtx(filePath, { hasTool: async () => false }) as any,
+			);
+
+			const reason = ledger
+				.getDegradationSummary()
+				.find((g) => g.kind === "aux-runner-findings-lost")
+				?.latestReasons[0]?.reason;
+			expect(reason).toContain("Gate B skipped napi:");
+			expect(reason).toContain("EARLIER touch");
+			expect(reason).toContain("prior publication satisfies per-file gate");
+			// incrementDegradationCount appends its bounded count suffix after
+			// truncateForLedger's 200-character reason field.
+			expect(reason?.length).toBeLessThanOrEqual(212);
+			expect(reason?.endsWith("(count: 1)")).toBe(true);
+			expect(reason?.startsWith("Gate B skipped napi:")).toBe(true);
+			pendingAux.resetPendingAuxiliaryCoverage();
+			ledger.resetDegradationLedger();
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("does not record the loss when no pending pair exists (a clean skip)", async () => {
 		const env = setupTestEnvironment("pi-lens-ast-grep-loss-");
 		try {

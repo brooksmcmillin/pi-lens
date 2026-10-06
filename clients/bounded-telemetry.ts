@@ -101,7 +101,8 @@ export const BOUNDED_TELEMETRY_PHASES = [
 	/**
 	 * #2044: failed-first test state was retired after a confirmed missing path,
 	 * retained because the filesystem verdict was indeterminate, or evicted at
-	 * the state cap. Selection checks and detailed rows are both capped per turn.
+	 * the state cap. Foreign-checkout failures, including aliases, are rejected
+	 * at admission or retired at selection. Selection work and rows stay bounded.
 	 */
 	"test_runner_failed_target_state",
 	/** #2366: bounded lifecycle records for automatic test-result delivery. */

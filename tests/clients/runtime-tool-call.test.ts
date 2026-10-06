@@ -737,6 +737,7 @@ describe("handleToolCall", () => {
 				filePath,
 				runtime.turnIndex,
 				runtime.peekWriteIndex(),
+				undefined,
 			);
 		} finally {
 			env.cleanup();
@@ -1089,9 +1090,12 @@ describe("#2402 partial-apply contract (mixed-validity preflight)", () => {
 			expect(entries).toHaveLength(1);
 			expect(entries[0].source).toBe("partial-apply");
 
-			// The synthetic post-edit dispatch stamps the read guard so a
-			// follow-up edit is not judged stale against our own commit.
-			expect(recordWritten).toHaveBeenCalledWith(filePath);
+			// The synthetic post-edit dispatch credits the commit to the read
+			// guard. The file was never read, so there is no FileTime to keep
+			// fresh (#3525).
+			expect(recordWritten).toHaveBeenCalledWith(filePath, {
+				stampFileTime: false,
+			});
 		} finally {
 			env.cleanup();
 		}

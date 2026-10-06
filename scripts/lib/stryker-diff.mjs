@@ -5,6 +5,53 @@ import { mapGeneratedLineToOriginal } from "./mutation-source-map.mjs";
 
 const IMPORT_SPECIFIER_RE =
 	/(?:from\s+|import\s*(?:\(\s*)?|require\(\s*)["']([^"']+)["']/g;
+// A test can reach a mutation source through `path.resolve(...)`/`path.join(...)`
+// instead of an import specifier (e.g. analyze-pi-lens-logs-detectors.test.ts).
+// The argument window runs to end of line, so a nested `path.dirname(...)` does
+// not hide the relative literal that follows it.
+const PATH_RESOLVER_LINE_RE =
+	/(?:\bpath\s*\.\s*)?\b(?:resolve|join)\s*\(([^\n]*)/g;
+const STRING_LITERAL_RE = /["']([^"']+)["']/g;
+const MUTATION_LANE_EXCLUSION_RE = /^\s*\/\/\s*mutation-lane:\s*exclude\s*$/m;
+const MUTATION_LANE_EXCLUSIONS_PATH =
+	"tests/config/stryker-diff-exclusions.json";
+
+export class MutationLaneExclusionError extends Error {
+	constructor(file) {
+		super(`mutation lane exclusion marker has no checked reason: ${file}`);
+		this.name = "MutationLaneExclusionError";
+	}
+}
+
+function mutationLaneExclusions() {
+	try {
+		return JSON.parse(readFileSync(MUTATION_LANE_EXCLUSIONS_PATH, "utf8"));
+	} catch {
+		return {};
+	}
+}
+
+/** @param {string} file @param {{readFile?: (file: string) => string, exclusions?: Record<string, {reason?: string}>}} [options] */
+export function mutationLaneExclusion(
+	file,
+	{
+		readFile = (candidate) => readFileSync(candidate, "utf8"),
+		exclusions = mutationLaneExclusions(),
+	} = {},
+) {
+	let source;
+	try {
+		source = readFile(file);
+	} catch {
+		return null;
+	}
+	if (!MUTATION_LANE_EXCLUSION_RE.test(source)) return null;
+	const admission = exclusions[file];
+	if (!admission?.reason) {
+		throw new MutationLaneExclusionError(file);
+	}
+	return { file, reason: admission.reason };
+}
 
 export const DEFAULT_MAX_FILES = 6;
 
@@ -17,15 +64,25 @@ export const DEFAULT_MAX_FILES = 6;
  */
 export const DEFAULT_MAX_RANGES = 40;
 
+// Bounded 2026-09-29 command-run measurement and its raw output are recorded
+// in tests/fixtures/mutation-test-cap-measurement.json. Three fixed LSP suites
+// 1.51 seconds per suite process; 47 therefore projects to about 71 seconds,
+// leaving about 58 minutes 49 seconds of the 60-minute budget for mutants and
+// build/report overhead. Stryker's dry-run server was EPERM-blocked in this
+// sandbox, so this is explicitly a bounded process-cost proxy, not a claim
+// about mutant execution cost.
+export const DEFAULT_MAX_TESTS = 47;
+
 /**
  * Wall-clock bound the driver puts on the Stryker child, in minutes. It must
- * stay strictly below .github/workflows/mutation.yml's `timeout-minutes`, or
+ * stay strictly below .github/workflows/ci.yml's `mutation` job `timeout-minutes`, or
  * the runner cancels the job first and the driver never gets to say that it
  * evaluated nothing (advisory run 36098718085). The margin also covers
  * `npm ci`, `npm run build`, Stryker's in-place sandbox restore on SIGTERM,
  * and the report upload.
  */
 export const MUTATION_BUDGET_MINUTES = 60;
+export const DEFAULT_MUTATION_FIXED_OVERHEAD_MS = 5 * 60_000;
 
 // `git diff --unified=0` headers. Only the "+" side is used: it numbers lines
 // in HEAD, which is the tree Stryker mutates in place.
@@ -77,6 +134,17 @@ function extractRelativeSpecifiers(content) {
 		if (match[1].startsWith(".")) specifiers.push(match[1]);
 		match = IMPORT_SPECIFIER_RE.exec(content);
 	}
+	PATH_RESOLVER_LINE_RE.lastIndex = 0;
+	let call = PATH_RESOLVER_LINE_RE.exec(content);
+	while (call) {
+		STRING_LITERAL_RE.lastIndex = 0;
+		let literal = STRING_LITERAL_RE.exec(call[1]);
+		while (literal) {
+			if (literal[1].startsWith(".")) specifiers.push(literal[1]);
+			literal = STRING_LITERAL_RE.exec(call[1]);
+		}
+		call = PATH_RESOLVER_LINE_RE.exec(content);
+	}
 	return specifiers;
 }
 
@@ -87,11 +155,28 @@ function normalized(file) {
 		.replace(/\.(?:mjs|js|cjs|ts)$/, "");
 }
 
-export function capMutationFiles(files, maxFiles = DEFAULT_MAX_FILES) {
+/**
+ * The heaviest `maxFiles` files by changed-line weight (#3810, from the #3797
+ * review): the old alphabetical cut skipped the four files holding #3706's
+ * actual change and mutated its label plumbing and an oxfmt reflow. Equal
+ * weights fall back to the path so the choice stays deterministic.
+ *
+ * @param {string[]} files
+ * @param {number} [maxFiles]
+ * @param {Map<string, number>} [weights] changed lines per file (see changedLineWeights)
+ */
+export function capMutationFiles(
+	files,
+	maxFiles = DEFAULT_MAX_FILES,
+	weights = new Map(),
+) {
 	if (!Number.isInteger(maxFiles) || maxFiles < 0) {
 		throw new RangeError("maxFiles must be a non-negative integer");
 	}
-	const ordered = [...files].sort();
+	// Path order first, then a stable sort by weight: equal weights keep it.
+	const ordered = [...files]
+		.sort()
+		.sort((a, b) => (weights.get(b) ?? 0) - (weights.get(a) ?? 0));
 	return {
 		selected: ordered.slice(0, maxFiles),
 		skipped: ordered.slice(maxFiles),
@@ -128,6 +213,21 @@ export function parseChangedLineRanges(diffText) {
 		ranges.get(file).push([start, Math.max(start, newStart + count - 1)]);
 	}
 	return ranges;
+}
+
+/**
+ * Changed lines per file, from the ranges of `parseChangedLineRanges`.
+ *
+ * @param {Map<string, Array<[number, number]>>} rangesByFile
+ * @returns {Map<string, number>}
+ */
+export function changedLineWeights(rangesByFile) {
+	return new Map(
+		[...rangesByFile].map(([file, ranges]) => [
+			file,
+			ranges.reduce((sum, [start, end]) => sum + (1 + end - start), 0),
+		]),
+	);
 }
 
 /**
@@ -207,9 +307,9 @@ export function extractSnippet(sourceLines, location) {
  * The bare cause clause a Stryker child's failed/interrupted exit maps to
  * (round 2 R2-4), shared by `describeStrykerFailure` (a full, zero-mutant
  * failure -- prefixed "no mutants evaluated") and
- * `describePartialInterruptCause` (a PARTIAL result -- some mutants WERE
- * evaluated, so that prefix would contradict the "N of M evaluated" banner
- * shown right above it). `spawnSync` marks an expired budget with
+ * a PARTIAL result -- some mutants WERE evaluated, so that prefix would
+ * contradict the "N of M evaluated" banner shown right above it).
+ * `spawnSync` marks an expired budget with
  * `error.code === "ETIMEDOUT"`; `signal` is null when the child exits on the
  * signal itself, which Stryker's UnexpectedExitHandler does, so the signal is
  * not a usable discriminator.
@@ -227,20 +327,47 @@ function strykerFailureCause(result, budgetMinutes) {
  * @param {{status: number|null, signal?: string|null, error?: Error & {code?: string}}} result
  * @param {number} budgetMinutes
  */
-export function describeStrykerFailure(result, budgetMinutes) {
-	return `mutation diff: no mutants evaluated; ${strykerFailureCause(result, budgetMinutes)}`;
+export function describeStrykerFailure(
+	result,
+	budgetMinutes,
+	{ tests = [], output = "" } = {},
+) {
+	const failed = [
+		...new Set(
+			[...output.matchAll(/(?:FAIL|×|❯)\s+(tests\/[^\s:]+)/g)].map(
+				(match) => match[1],
+			),
+		),
+	];
+	const named = failed.length > 0 ? failed : tests;
+	const suffix =
+		named.length > 0
+			? `; tests involved: ${named.join(", ")}`
+			: "; no related test file was identified";
+	return `mutation diff: dry run failed; no mutants evaluated; ${strykerFailureCause(result, budgetMinutes)}${suffix}`;
 }
 
 /**
- * The reason text for a PARTIAL run's interrupt (round 2 R2-4): unlike
- * `describeStrykerFailure`, this never says "no mutants evaluated" -- some
- * mutants were, which is exactly why a partial report exists to show them.
+ * The user-facing verdict for a partial report. A timed-out child has already
+ * completed its initial test run, so the zero-mutant dry-run failure wording
+ * is false and hides the score and survivors that the incremental report
+ * contains (#3683).
  *
  * @param {{status: number|null, signal?: string|null, error?: Error & {code?: string}}} result
  * @param {number} budgetMinutes
+ * @param {{evaluated: number, total: number|null}} partial
  */
-export function describePartialInterruptCause(result, budgetMinutes) {
-	return `mutation diff: ${strykerFailureCause(result, budgetMinutes)}`;
+export function describePartialMutationOutcome(
+	result,
+	budgetMinutes,
+	{ evaluated, total },
+) {
+	const totalText =
+		total === null ? "an unknown number of mutants" : `${total} mutants`;
+	if (result.error?.code === "ETIMEDOUT") {
+		return `mutation diff: budget expired after ${evaluated} of ${totalText} evaluated (M = measured mutant population)`;
+	}
+	return `mutation diff: partial run interrupted after ${evaluated} of ${totalText} evaluated (M = measured mutant population); ${strykerFailureCause(result, budgetMinutes)}`;
 }
 
 export function formatCapNotice(selectedCount, totalCount, skipped) {
@@ -271,12 +398,14 @@ function conventionalTestSibling(file) {
 /**
  * Select tests that cover changed mutation sources (scripts/**\/*.mjs and
  * the compiled-source classes in isCompiledMutationSource) through one-hop
- * relative imports or the conventional tests/<dir>/<name>.test.ts sibling.
- * Compiled sources are matched the same way scripts are: test files import
- * them with a relative specifier (typically ending in `.js`, since that is
- * what TypeScript's `nodenext` resolution and the repo's own tests use to
- * reach a compiled `clients/*.ts` module -- e.g. `tests/index-wiring.test.ts`
- * imports `../index.js`), which `normalized()` compares extension-agnostically.
+ * relative imports, the conventional tests/<dir>/<name>.test.ts sibling, a
+ * `<name>-*.test.ts` sibling beside it, or a relative literal a test resolves
+ * by path (`path.resolve`/`path.join`). Compiled sources are matched the same
+ * way scripts are: test files import them with a relative specifier (typically
+ * ending in `.js`, since that is what TypeScript's `nodenext` resolution and
+ * the repo's own tests use to reach a compiled `clients/*.ts` module -- e.g.
+ * `tests/index-wiring.test.ts` imports `../index.js`), which `normalized()`
+ * compares extension-agnostically.
  *
  * @param {string[]} changedFiles
  * @param {{ testFiles?: string[], readFile?: (file: string) => string }} [options]
@@ -286,31 +415,56 @@ export function mapRelatedTests(
 	{
 		testFiles = collectTestFiles("tests"),
 		readFile = (file) => readFileSync(file, "utf8"),
+		exclusions = mutationLaneExclusions(),
 	} = {},
 ) {
 	const sources = changedFiles.filter(isMutationSourceFile);
 	const related = new Map(sources.map((file) => [file, new Set()]));
+	const priorities = new Map();
+	const excluded = new Map();
 	const testContents = testFiles.map((test) => {
+		let content;
 		try {
-			return [test, readFile(test)];
+			content = readFile(test);
 		} catch {
-			return [test, null];
+			return [test, null, null];
 		}
+		const exclusion = mutationLaneExclusion(test, {
+			readFile: () => content,
+			exclusions,
+		});
+		return [test, content, exclusion];
 	});
 
 	for (const file of sources) {
 		const sibling = conventionalTestSibling(file);
-		if (testFiles.some((test) => normalized(test) === normalized(sibling))) {
-			related.get(file).add(sibling);
+		const siblingKey = normalized(sibling);
+		const prefixKey = siblingKey.replace(/\.test$/, "") + "-";
+		for (const [test, , exclusion] of testContents) {
+			const testKey = normalized(test);
+			const isSibling =
+				testKey === siblingKey ||
+				(testKey.startsWith(prefixKey) && testKey.endsWith(".test"));
+			if (!isSibling) continue;
+			if (exclusion) excluded.set(test, exclusion);
+			else {
+				related.get(file).add(test);
+				priorities.set(test, 0);
+			}
 		}
 		const target = normalized(file);
-		for (const [test, content] of testContents) {
+		for (const [test, content, exclusion] of testContents) {
 			if (content === null) continue;
 			for (const specifier of extractRelativeSpecifiers(content)) {
 				const imported = normalized(
 					path.resolve(path.dirname(test), specifier),
 				);
-				if (imported === target) related.get(file).add(test);
+				if (imported !== target) continue;
+				if (exclusion) excluded.set(test, exclusion);
+				else {
+					related.get(file).add(test);
+					if (!priorities.has(test)) priorities.set(test, 1);
+				}
 			}
 		}
 	}
@@ -320,6 +474,8 @@ export function mapRelatedTests(
 		covered: sources.filter((file) => related.get(file).size > 0),
 		uncovered: sources.filter((file) => related.get(file).size === 0),
 		tests: [...new Set([...related.values()].flatMap((files) => [...files]))],
+		priorities,
+		excluded: [...excluded.values()],
 	};
 }
 
@@ -340,20 +496,25 @@ export function mapRelatedTests(
  * during sandbox init, BEFORE `buildCommand` runs, so the base config's
  * `"npm run build"` would silently discard every mutant for a compiled
  * target before a single test executes (see scripts/lib/mutation-touch-
- * build.mjs's own header). `force: true` keeps `incremental` enabled (so a
- * budget-killed run still saves a partial report, round 2 S2) while never
- * reading a STALE `.stryker/incremental.json` left by an earlier, unrelated
- * local run (round 2 T4) -- `force` makes Stryker treat any existing
- * incremental file as absent on the read side, without disabling the
- * write-on-interrupt behavior that depends on `options.incremental` alone.
+ * build.mjs's own header). `force` keeps `incremental` enabled (so a
+ * budget-killed run still saves a partial report, round 2 S2) while making
+ * Stryker treat any existing incremental file as absent on the read side,
+ * without disabling the write-on-interrupt behavior that depends on
+ * `options.incremental` alone. It is true unless the caller proved the file
+ * belongs to this run's tests and inputs (`reuse`, #3810): otherwise a STALE
+ * `.stryker/incremental.json` from an earlier, unrelated local run (round 2
+ * T4) or an earlier push with different tests would be read. `fileLogLevel`
+ * makes Stryker write its "N of M mutant result(s) are reused" line to
+ * `stryker.log`, the only place the reuse count exists.
  *
  * @param {object} baseConfig stryker.config.mjs's default export
- * @param {{command: string}} options the per-run test command
+ * @param {{command: string, reuse?: boolean}} options the per-run test command
  */
-export function buildRunConfig(baseConfig, { command }) {
+export function buildRunConfig(baseConfig, { command, reuse = false }) {
 	return {
 		...baseConfig,
-		force: true,
+		force: !reuse,
+		fileLogLevel: "info",
 		buildCommand: "node scripts/lib/mutation-touch-build.mjs",
 		commandRunner: { ...baseConfig.commandRunner, command },
 	};
@@ -389,25 +550,26 @@ export function parseDryRunCost(output) {
 
 /**
  * How many mutants the remaining budget affords, from a real measured dry
- * run (round 2 S2's arithmetic: `allowed = budget × concurrency ÷ dry-run
- * seconds`, the command runner reruns the WHOLE related-test dry run for
- * every mutant at the configured concurrency). `safetyFactor` (< 1) reserves
- * headroom for the real run's own overhead the estimate cannot see (report
- * writing, sandbox teardown, timing variance between runs) -- without it, a
- * budget sized exactly to the point estimate still overruns in practice.
+ * run. Vitest runners are CPU-bound in this lane: the #3649 measurement saw
+ * only 1.11x wall-clock speedup at Stryker concurrency 2 (#3810 measured the
+ * CI runner again: concurrency 3 and 4 ran the mutation phase 1.10x and 1.13x
+ * faster than 2), so this estimator deliberately models one effective worker. `safetyFactor` (< 1) reserves
+ * headroom for timing variance and fixed run overhead.
  *
- * @param {{remainingMs: number, concurrency: number, dryRunMs: number, safetyFactor?: number}} args
- * @returns {number} at least 1
+ * @param {{remainingMs: number, dryRunMs: number, fixedOverheadMs?: number, safetyFactor?: number}} args
+ * @returns {number} zero when fixed overhead leaves no capacity, otherwise at least 1
  */
 export function estimateAffordableMutants({
 	remainingMs,
-	concurrency,
 	dryRunMs,
+	fixedOverheadMs = 0,
 	safetyFactor = 0.7,
 }) {
 	if (dryRunMs <= 0) return 1;
+	const budgetAfterOverhead = remainingMs - fixedOverheadMs;
+	if (budgetAfterOverhead <= 0) return 0;
 	const affordable = Math.floor(
-		((remainingMs / 1000) * concurrency * safetyFactor) / (dryRunMs / 1000),
+		((budgetAfterOverhead / 1000) * safetyFactor) / (dryRunMs / 1000),
 	);
 	return Math.max(1, affordable);
 }
@@ -474,7 +636,7 @@ export function describeZeroMutantOutcome({
  *   failureReason?: string,
  *   partialReason?: string,
  * }} args `failureReason` (`describeStrykerFailure`'s output) and
- *   `partialReason` (`describePartialInterruptCause`'s output) matter only
+ *   `partialReason` (`describePartialMutationOutcome`'s output) matter only
  *   when `interrupted` is true.
  * @returns {{
  *   zeroMutants: {reason: string} | null,

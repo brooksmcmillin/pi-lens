@@ -6,7 +6,7 @@ import { constants as zlibConstants, gunzipSync, gzipSync } from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { writeFileAtomic } from "../atomic-write.js";
 import type { CallGraphEvidenceCoverage } from "../call-graph.js";
-import type { FactStore } from "../dispatch/fact-store.js";
+import { FactStore, type ReadonlyFactStore } from "../dispatch/fact-store.js";
 import { fileContentProvider } from "../dispatch/facts/file-content.js";
 import type { FunctionSummary } from "../dispatch/facts/function-facts.js";
 import type {
@@ -61,6 +61,10 @@ import {
 	type ReviewGraphPersistenceMetadata,
 } from "../review-graph-logger.js";
 import { getSharedTreeSitterClient } from "../tree-sitter-shared.js";
+import {
+	classifyTreeSitterWasmError,
+	type WasmTrapState,
+} from "../tree-sitter-client.js";
 import {
 	type ExtractedSymbols,
 	symbolExtractionGrammar,
@@ -355,6 +359,78 @@ function touchWorkspaceGraph(key: string): void {
 	scheduleWorkspaceGraphEviction(key, entry);
 }
 
+/**
+ * #3605: files whose last tree-sitter extraction a web-tree-sitter trap cost,
+ * with the trapped input's state. `addFileToGraph` is the only writer: each
+ * extraction sets or deletes its file. Keys are the build's normalized paths.
+ * Only paths whose content is one of the client's trapped inputs (at most
+ * `WASM_TRAP_BUDGET + 1` distinct inputs) get an entry, so the map is
+ * bounded by the paths holding a trapped input. Many identical files can
+ * share one input, and an entry for a deleted path is only overwritten,
+ * never evicted, until the process ends.
+ */
+const _wasmTrappedFiles = new Map<string, WasmTrapState>();
+
+/**
+ * Replace each trapped file's stored signature or hash, so the next build that
+ * reads `entries` re-extracts it (#3605). The in-memory cache stamps `retry`
+ * files only: a `charged` input is skipped by the client until it changes, so
+ * re-extracting it would only churn. What a restart reads stamps both.
+ */
+function stampWasmTrapped(
+	entries: Map<string, string>,
+	includeCharged: boolean,
+): Map<string, string> {
+	let stamped: Map<string, string> | undefined;
+	for (const [file, state] of _wasmTrappedFiles) {
+		if ((includeCharged || state === "retry") && entries.has(file)) {
+			stamped ??= new Map(entries);
+			stamped.set(file, "wasm-trapped");
+		}
+	}
+	return stamped ?? entries;
+}
+
+function stampWasmTrappedFiles<
+	T extends {
+		signature: string;
+		fileSignatures: Map<string, string>;
+		fileHashes?: Map<string, string> | undefined;
+	},
+>(stored: T, includeCharged: boolean): T {
+	const fileSignatures = stampWasmTrapped(
+		stored.fileSignatures,
+		includeCharged,
+	);
+	if (fileSignatures === stored.fileSignatures) return stored;
+	return {
+		...stored,
+		signature: sourceSignatureFromMap(fileSignatures),
+		fileSignatures,
+		fileHashes:
+			stored.fileHashes && stampWasmTrapped(stored.fileHashes, includeCharged),
+	};
+}
+
+/** Files in `graph` whose extraction a wasm trap cost (#3605). */
+function wasmTrappedFileCount(graph: ReviewGraph): number {
+	let count = 0;
+	for (const file of _wasmTrappedFiles.keys()) {
+		if (graph.fileNodes.has(file)) count++;
+	}
+	return count;
+}
+
+/**
+ * #3678: the one wording source for a review graph degraded by a
+ * web-tree-sitter trap. Shared by the per-edit cascade advisory
+ * (`dispatch/integration.ts`) and the standalone `build-graph` CLI, so the two
+ * model-facing surfaces cannot drift apart.
+ */
+export function graphWasmTrapDetail(wasmTrappedFiles: number): string {
+	return `review graph degraded — tree-sitter wasm runtime failure in ${wasmTrappedFiles} file(s)`;
+}
+
 function setWorkspaceGraph(
 	key: string,
 	entry: Omit<WorkspaceGraphCacheEntry, "lastUsedAt" | "idleTimer">,
@@ -368,7 +444,7 @@ function setWorkspaceGraph(
 	// over-budget repo never accumulates an unbounded graph across the process.
 	const boundedGraph = retainedGraph(key, entry.graph);
 	const resident: WorkspaceGraphCacheEntry = {
-		...entry,
+		...stampWasmTrappedFiles(entry, false),
 		graph: boundedGraph,
 		lastUsedAt: Date.now(),
 	};
@@ -432,6 +508,8 @@ export type GraphBuildInfo = {
 	persistReason?: string;
 	/** When the seq fast path was attempted but fell back to the sweep (#451). */
 	seqFastpathFallback?: SeqFastpathFallback;
+	/** #3605: files in this graph whose extraction a wasm trap cost. */
+	wasmTrappedFiles?: number;
 	/**
 	 * #459: whether this build changed the graph content. `mode` alone is NOT
 	 * enough to tell — both "cached" and "seq-fastpath" cover a real no-op AND
@@ -2841,9 +2919,8 @@ function persistGraph(
 	const pending: PendingPersist = {
 		cacheDir,
 		cachePath,
-		signature,
-		fileSignatures,
-		fileHashes,
+		// #3605: a restart re-extracts every trapped file.
+		...stampWasmTrappedFiles({ signature, fileSignatures, fileHashes }, true),
 		graph: persistedGraph,
 		gitStamp,
 		elementCount,
@@ -3005,7 +3082,7 @@ function buildReviewGraphCheckpointData(
 		builtAt: new Date().toISOString(),
 		inProgress: true,
 		targetFileCount,
-		processedFiles: Array.from(processedHashes.entries()),
+		processedFiles: Array.from(stampWasmTrapped(processedHashes, true)),
 		ignoredIdsHash: hashIgnoredIds(ignoredIds),
 		nodes: Array.from(graph.nodes.entries()),
 		edges: graph.edges,
@@ -3698,6 +3775,15 @@ function upsertChangedSymbols(
 	}
 }
 
+/**
+ * Derive one file's structural facts into `facts`, which MUST be a run-local
+ * store that only this graph run touches (#3552). The providers await (dynamic
+ * import, tree-sitter parse), so a same-file dispatch can land between any two
+ * awaits: anything written into the shared dispatch store would replace that
+ * dispatch's `file.content` and derived facts, and anything read back from it
+ * could be the dispatch's version. Callers construct the store; nothing here
+ * accepts the shared one.
+ */
 async function ensureReviewGraphFacts(
 	filePath: string,
 	cwd: string,
@@ -4033,7 +4119,7 @@ async function extractTreeSitterSymbols(
 	filePath: string,
 	languageId: string,
 	contentOverride?: string | null,
-): Promise<ExtractedSymbols> {
+): Promise<ExtractedSymbols & { wasmTrap?: WasmTrapState | undefined }> {
 	const empty: ExtractedSymbols = {
 		symbols: [],
 		refs: [],
@@ -4057,8 +4143,11 @@ async function extractTreeSitterSymbols(
 		languageId,
 		content,
 		(tree) => extractor.extract(tree, filePath, content),
+		"review-graph",
 	);
-	return extracted.parsed ? extracted.value : empty;
+	return extracted.parsed
+		? extracted.value
+		: { ...empty, wasmTrap: extracted.wasmTrap };
 }
 
 /**
@@ -4070,21 +4159,35 @@ export async function captureReviewGraphStructuralIr(
 	filePath: string,
 	cwd: string,
 	content: string,
-	facts: FactStore,
+	borrowed: ReadonlyFactStore,
 ): Promise<{ complete: boolean; structural?: ReviewGraphStructuralIr }> {
 	const kind = detectFileKind(filePath);
 	if (!kind || !MAIN_KINDS.has(kind) || detectFileRole(filePath) === "test") {
 		return { complete: true };
 	}
 	if (kind === "jsts") {
-		if (
-			!facts.hasFileFact(filePath, "file.imports") ||
-			!facts.hasFileFact(filePath, "file.reexports") ||
-			!facts.hasFileFact(filePath, "file.functionSummaries")
-		) {
-			await ensureReviewGraphFacts(filePath, cwd, facts, content);
+		// `borrowed` is the caller's store (the scanner's own, never the dispatch
+		// store) and is only READ: its derived facts are reused when they are
+		// present AND its `file.content` is the very bytes being captured. Facts
+		// derived from other bytes are never taken. Otherwise derive into a
+		// run-local store, so the caller's store is never written (#3552).
+		const borrowable =
+			borrowed.hasFileFact(filePath, "file.imports") &&
+			borrowed.hasFileFact(filePath, "file.reexports") &&
+			borrowed.hasFileFact(filePath, "file.functionSummaries") &&
+			borrowed.getFileFact<string | null>(filePath, "file.content") === content;
+		let facts: ReadonlyFactStore = borrowed;
+		if (!borrowable) {
+			const run = new FactStore("review-graph-run");
+			await ensureReviewGraphFacts(filePath, cwd, run, content);
+			facts = run;
 		}
-		const parsed = await withTreeSitterRoot(filePath, content, () => true);
+		const parsed = await withTreeSitterRoot(
+			filePath,
+			content,
+			() => true,
+			"review-graph-ir",
+		);
 		if (!parsed.parsed) return { complete: false };
 		const functionCoverage: ReviewGraphExtractionStatus =
 			(facts.getFileFact<string>(filePath, "file.functionFactsCoverage") as
@@ -4133,6 +4236,7 @@ export async function captureReviewGraphStructuralIr(
 		languageId,
 		content,
 		(tree) => extractor.extract(tree, filePath, content),
+		"review-graph",
 	);
 	if (!result.parsed) return { complete: false };
 	return {
@@ -4590,7 +4694,6 @@ async function addFileToGraph(
 	graph: ReviewGraph,
 	cwd: string,
 	file: string,
-	facts: FactStore,
 	ignoredIds?: ReadonlySet<string>,
 	contentOverride?: string | null,
 ): Promise<void> {
@@ -4607,44 +4710,33 @@ async function addFileToGraph(
 		? getFreshReviewGraphFileIr(cwd, file, contentHash)?.structural
 		: undefined;
 	if (kind === "jsts") {
-		// Release content ONLY when this builder seeded it. The incremental
-		// per-edit path receives the LIVE dispatch FactStore (via the
-		// fire-and-forget blast-radius build), and the dispatch still reads
-		// file.content after its runner groups settle — inline suppressions,
-		// dispositions, and fact rules would race a delete and silently see
-		// undefined. Content the dispatch put there is the dispatch's to free.
-		const dispatchOwnsContent =
-			facts.getFileFact<string>(file, "file.content") !== undefined &&
-			contentOverride == null;
-		try {
-			if (sharedIr?.kind === "jsts") {
-				facts.setFileFact(file, "file.content", contentOverride ?? "");
-				facts.setFileFact(file, "file.imports", sharedIr.imports);
-				facts.setFileFact(file, "file.reexports", sharedIr.reexports);
-				facts.setFileFact(
-					file,
-					"file.functionSummaries",
-					sharedIr.functionSummaries,
-				);
-				facts.setFileFact(
-					file,
-					"file.functionFactsCoverage",
-					sharedIr.coverage.calls,
-				);
-				facts.setFileFact(
-					file,
-					"file.importFactsCoverage",
-					sharedIr.coverage.imports,
-				);
-			} else {
-				await ensureReviewGraphFacts(file, cwd, facts, contentOverride);
-			}
-			addJsTsFile(graph, cwd, file, facts, ignoredIds);
-		} finally {
-			// The graph has copied every durable value it needs. Keep derived facts
-			// available to callers, but do not retain full source in a shared store.
-			if (!dispatchOwnsContent) facts.deleteFileFact(file, "file.content");
+		// #3552: per-file extraction state lives in a store only this run touches
+		// (see ensureReviewGraphFacts). The shared dispatch store is never written
+		// or released here, so a live dispatch's `file.content` and derived facts
+		// are exactly what they would be with no graph running.
+		const run = new FactStore("review-graph-run");
+		if (sharedIr?.kind === "jsts") {
+			run.setFileFact(file, "file.content", contentOverride ?? "");
+			run.setFileFact(file, "file.imports", sharedIr.imports);
+			run.setFileFact(
+				file,
+				"file.functionSummaries",
+				sharedIr.functionSummaries,
+			);
+			run.setFileFact(
+				file,
+				"file.functionFactsCoverage",
+				sharedIr.coverage.calls,
+			);
+			run.setFileFact(
+				file,
+				"file.importFactsCoverage",
+				sharedIr.coverage.imports,
+			);
+		} else {
+			await ensureReviewGraphFacts(file, cwd, run, contentOverride);
 		}
+		addJsTsFile(graph, cwd, file, run, ignoredIds);
 		return;
 	}
 	const languageId = mapKindToTreeSitterLanguage(kind, file);
@@ -4653,9 +4745,12 @@ async function addFileToGraph(
 		sharedIr?.kind === "tree-sitter" && sharedIr.languageId === languageId
 			? sharedIr.extracted
 			: undefined;
-	const extracted =
+	const extracted: ExtractedSymbols & { wasmTrap?: WasmTrapState | undefined } =
 		irExtracted ??
 		(await extractTreeSitterSymbols(file, languageId, contentOverride));
+	// #3605: remember a file a wasm trap cost, so a later build retries it.
+	if (extracted.wasmTrap) _wasmTrappedFiles.set(file, extracted.wasmTrap);
+	else _wasmTrappedFiles.delete(file);
 	addTreeSitterFile(graph, cwd, file, languageId, extracted, ignoredIds);
 	// Zero symbols consults the warm/open LSP fallback REGARDLESS of whether
 	// the symbols came from shared IR or direct extraction (#955 review): a
@@ -4875,7 +4970,7 @@ async function updateGraphFiles(
 		preservedIncoming.push(
 			...removeFileOwnedGraphData(graph, file, removedEdges),
 		);
-		await addFileToGraph(graph, cwd, file, facts, ignoredIds);
+		await addFileToGraph(graph, cwd, file, ignoredIds);
 	}
 	if (removedEdges.size > 0) {
 		unindexEdges(graph, removedEdges);
@@ -5241,6 +5336,11 @@ async function trySeqFastpath(
 			.map((file) => normalizeMapKey(file)),
 	);
 	for (const file of normalizedChanged) changedSet.add(file);
+	// #3605: a trapped file of this workspace is a candidate. A `retry` file's
+	// stored hash is stamped, so it re-extracts; a `charged` one costs a hash.
+	for (const file of _wasmTrappedFiles.keys()) {
+		if (cached.fileSignatures.has(file)) changedSet.add(file);
+	}
 	const changed = [...changedSet];
 	if (changed.length > SEQ_FASTPATH_MAX_CHANGES) {
 		return { fallback: "too-many-changes" };
@@ -5759,7 +5859,7 @@ async function _doBuildGraph(
 				content = null;
 				fileHashes.set(file, "missing");
 			}
-			await addFileToGraph(graph, cwd, file, facts, ignoredIds, content);
+			await addFileToGraph(graph, cwd, file, ignoredIds, content);
 			if (normalizedChangedSet.has(file)) {
 				upsertChangedSymbols(graph, facts, file);
 			}
@@ -6004,7 +6104,11 @@ export function buildOrUpdateGraph(
 	});
 	const promise = _doBuildGraph(cwd, changedFiles, facts, seqHint, buildId)
 		.then((graph) => {
-			const buildInfo = getGraphBuildInfoForGraph(graph);
+			let buildInfo = getGraphBuildInfoForGraph(graph);
+			const wasmTrappedFiles = wasmTrappedFileCount(graph);
+			if (wasmTrappedFiles > 0) {
+				buildInfo = updateGraphBuildInfo(graph, { wasmTrappedFiles });
+			}
 			if (buildInfo.mode === "skipped") {
 				const reason = buildInfo.skipReason ?? "skipped";
 				recordBuildAttempt(cwd, "skipped", reason, buildId);
@@ -6052,10 +6156,13 @@ export function buildOrUpdateGraph(
 		})
 		.catch((err) => {
 			const reason = err instanceof Error ? err.message : String(err);
+			const wasmFailure = classifyTreeSitterWasmError(err);
 			recordBuildAttempt(cwd, "failed", reason, buildId);
 			logReviewGraph({
 				cwd,
 				phase: "build_failed",
+				// #3605: an internal wasm failure, not a failed build.
+				failureClass: wasmFailure ? `wasm-${wasmFailure}` : "error",
 				reason,
 				durationMs: Date.now() - startedAt,
 				error: reason,

@@ -59,13 +59,13 @@ pre-existing-red claims carry the
 - [ ] The change has tests (happy path, edge cases, regression test for bugs)
 - [ ] Targeted test files for the touched seams pass locally after `npm run build`; the full suite is CI's job.
 - [ ] Every NEW regression test is proven RED on pre-fix code; the red output is quoted in this PR
-- [ ] Every new guard/branch/filter is mutation-proof: deleting or neutering it reds at least one test
+- [ ] New guards/branches/filters/caps/fallbacks have compile-valid mutation proof; exact-head exploratory findings have bounded dispositions, and demonstrated correctness gaps are fixed (AGENTS.md two-layer acceptance)
 - [ ] PR title carries a conventional prefix
 - [ ] `npm run lint` passes
 - [ ] `npm run build:dist` succeeds if I changed code under `clients/`, `commands/`, `tools/`, or `index.ts`
 - [ ] `package-lock.json` is in sync with `package.json` (regenerate with the exact npm pin in `package.json`'s `packageManager` field)
 - [ ] `AGENTS.md` is updated if this PR changes behavior, commands, conventions, or invariants documented there
-- [ ] `.changelog/<branch-or-slug>-<short-desc>.md` has one valid entry **in this PR** for any user-facing change (Added/Changed/Deprecated/Removed/Fixed/Security) — see [.changelog/README.md](../.changelog/README.md); internal-only test/refactor PRs may skip it
+- [ ] `.changelog/<branch-or-slug>-<short-desc>.md` has one valid entry **in this PR** for any user-facing change (Added/Changed/Deprecated/Removed/Fixed/Security), with `audience: user` or `audience: internal` — see [.changelog/README.md](../.changelog/README.md); internal-only test/refactor PRs may skip it
 
 ## Tests
 

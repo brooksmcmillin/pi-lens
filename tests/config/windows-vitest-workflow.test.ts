@@ -75,7 +75,27 @@ describe("Windows Vitest workflow contract (#2536)", () => {
 		expect(raw).toContain("Windows Vitest subset step outcome:");
 		expect(raw).toContain("windows_vitest=$outcome");
 		expect(raw).toContain("PI_LENS_TEST_TIMEOUT_SCALE: '3'");
-		expect(raw).toContain("Validate merge-train dispatch payload");
+	});
+
+	// #3926: a failed checkout leaves no repository and the enumeration step is
+	// skipped, so the summary must not invoke the checked-out population script;
+	// it reports "Not executed" and still writes the outcome keys the job output
+	// reads. The node invocation stays inside the list-present branch.
+	it("guards the Windows summary on the executed-file list", () => {
+		const job = readWorkflow().jobs["unit-tests-windows"];
+		const outcome = (job?.steps ?? []).find(
+			(step) => step.name === "Record Windows Vitest outcome",
+		);
+		const run = String(outcome?.run ?? "");
+		expect(outcome?.if).toBe("always()");
+		const guard = run.indexOf('[ -f "$RUNNER_TEMP/windows-vitest-files.txt" ]');
+		const population = run.indexOf("win32-gate-population.mjs --summary");
+		const unavailable = run.indexOf("Not executed");
+		const key = run.indexOf("windows_vitest=$outcome");
+		expect(guard).toBeGreaterThan(-1);
+		expect(population).toBeGreaterThan(guard);
+		expect(unavailable).toBeGreaterThan(population);
+		expect(key).toBeGreaterThan(-1);
 	});
 
 	it("pins the sibling action revisions and the isolated home", () => {

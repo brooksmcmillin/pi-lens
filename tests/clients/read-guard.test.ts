@@ -12,7 +12,6 @@ import { normalizeFilePath } from "../../clients/path-utils.js";
 import {
 	createReadGuard,
 	currentLinesMatchReadSnapshot,
-	READ_GUARD_STATE_VERSION,
 	type ReadRecord,
 } from "../../clients/read-guard.js";
 import { logReadGuardEvent } from "../../clients/read-guard-logger.js";
@@ -737,13 +736,12 @@ describe("ReadGuard", () => {
 			}
 		});
 
-		it("suppresses stale mismatch when a newer re-read covers most of the edit range via context-zone boundary", () => {
-			// Scenario: agent had a large old read [1-3] that is now stale (file changed).
-			// Agent re-reads [1-2] (newer timestamp) and then edits [2-3]:
-			//   - Old read [1-3]: effective candidate, mismatch (line 2 changed)
-			//   - New re-read [1-2]: contextual candidate (line 3 in context zone), unavailable
-			// Expected: do NOT block — the re-read is newer than the mismatch.
-			const env = setupTestEnvironment("read-guard-snapshot-rereed-suppress-");
+		it("allows an edit whose lines each match the newest read that delivered them, though an older read is stale on one", () => {
+			// Old read [1-3] is stale on line 2 (the file changed); the agent then
+			// re-read [1-2]. Editing [2-3]: line 2's newest view is the re-read
+			// (matches), line 3's is the old read (matches). #3522 replaced the
+			// "a newer read cancels the mismatch" rule with this per-line question.
+			const env = setupTestEnvironment("read-guard-snapshot-rereed-per-line-");
 			try {
 				const filePath = path.join(env.tmpDir, "api.ts");
 				fs.writeFileSync(filePath, "one\ntwo\nthree\n");
@@ -752,7 +750,6 @@ describe("ReadGuard", () => {
 				const t1 = Date.now() - 1000;
 				const t2 = Date.now();
 
-				// Old large read (stale — will mismatch after file changes)
 				guard.recordRead(
 					createReadRecord(filePath, {
 						effectiveOffset: 1,
@@ -761,11 +758,9 @@ describe("ReadGuard", () => {
 					}),
 				);
 
-				// File changes (simulating a prior successful edit shifting content)
 				fs.writeFileSync(filePath, "one\nTWO\nthree\n");
 				fileTimeState.hasChanged = false;
 
-				// Agent re-reads [1-2] after the change (newer timestamp)
 				guard.recordRead(
 					createReadRecord(filePath, {
 						effectiveOffset: 1,
@@ -774,9 +769,6 @@ describe("ReadGuard", () => {
 					}),
 				);
 
-				// Edit at [2-3]: line 3 is 1 beyond the re-read boundary [1-2],
-				// falls in context zone (contextLines=3), so re-read is "unavailable"
-				// for line 3 but should still suppress the old mismatch.
 				const verdict = guard.checkEdit(filePath, [2, 3]);
 				expect(verdict.action).toBe("allow");
 			} finally {
@@ -784,7 +776,45 @@ describe("ReadGuard", () => {
 			}
 		});
 
-		it("does not carry missing lines from one snapshot candidate into mismatch telemetry", () => {
+		it("blocks a line only a newer read context-covers, whatever that read's timestamp", () => {
+			// #3522 ContextSuppress: the newer read [4-4] shows line 3 only through
+			// its context zone, so it cannot cancel the old read's mismatch on 3.
+			const env = setupTestEnvironment("read-guard-snapshot-ctx-only-");
+			try {
+				const filePath = path.join(env.tmpDir, "api.ts");
+				fs.writeFileSync(filePath, "one\ntwo\nthree\nfour\n");
+				const guard = createReadGuard("test-session");
+				guard.recordRead(
+					createReadRecord(filePath, {
+						effectiveOffset: 1,
+						effectiveLimit: 3,
+						timestamp: Date.now() - 1000,
+					}),
+				);
+				fs.writeFileSync(filePath, "one\ntwo\nTHREE\nfour\n");
+				fileTimeState.hasChanged = false;
+				guard.recordRead(
+					createReadRecord(filePath, {
+						effectiveOffset: 4,
+						effectiveLimit: 1,
+						timestamp: Date.now(),
+					}),
+				);
+				vi.mocked(logReadGuardEvent).mockClear();
+
+				expect(guard.checkEdit(filePath, [3, 3]).action).toBe("block");
+				expect(lastValidationMetadata()).toMatchObject({
+					status: "mismatch",
+					mismatchedLines: [3],
+					enforced: true,
+					outcome: "enforced-block",
+				});
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("does not carry missing lines from an older unhashed read into mismatch telemetry", () => {
 			const env = setupTestEnvironment("read-guard-snapshot-telemetry-");
 			try {
 				const filePath = path.join(env.tmpDir, "api.ts");
@@ -807,7 +837,9 @@ describe("ReadGuard", () => {
 				vi.mocked(logReadGuardEvent).mockClear();
 
 				fs.writeFileSync(filePath, "one\nTWO\nthree\n");
-				expect(guard.checkEdit(filePath, [2, 2]).action).toBe("allow");
+				// The newest read that delivered line 2 is the hashed one, and it
+				// no longer matches: the older unhashed read cannot speak for it.
+				expect(guard.checkEdit(filePath, [2, 2]).action).toBe("block");
 
 				const validationEntry = vi
 					.mocked(logReadGuardEvent)
@@ -817,15 +849,246 @@ describe("ReadGuard", () => {
 
 				expect(validationEntry?.metadata).toMatchObject({
 					status: "mismatch",
-					candidateReadCount: 2,
-					checkedCandidateCount: 1,
-					unavailableCandidateCount: 1,
+					viewRunCount: 1,
+					checkedLineCount: 1,
 					missingLineCount: 0,
 					mismatchedLineCount: 1,
 					missingLines: [],
 					mismatchedLines: [2],
+					enforced: true,
+				});
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("does not let an older hashed read block a line whose newest view carries no hashes", () => {
+			// Unchanged not-decidable rule: the newest view of the line cannot be
+			// checked, and the older read it replaced no longer stands for it.
+			const env = setupTestEnvironment("read-guard-snapshot-unhashed-newest-");
+			try {
+				const filePath = path.join(env.tmpDir, "api.ts");
+				fs.writeFileSync(filePath, "one\ntwo\nthree\n");
+				const guard = createReadGuard("test-session");
+				guard.recordRead(
+					createReadRecord(filePath, {
+						effectiveOffset: 1,
+						effectiveLimit: 3,
+					}),
+				);
+				guard.recordRead(
+					createReadRecord(filePath, {
+						effectiveOffset: 1,
+						effectiveLimit: 3,
+						lineHashes: {},
+					}),
+				);
+				fs.writeFileSync(filePath, "one\nTWO\nthree\n");
+				vi.mocked(logReadGuardEvent).mockClear();
+
+				expect(guard.checkEdit(filePath, [2, 2]).action).toBe("allow");
+				expect(lastValidationMetadata()).toMatchObject({
+					status: "unavailable",
+					missingLines: [2],
+					enforced: false,
+					outcome: "not-decidable",
+				});
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("never takes a provisional record for the agent's view of a line", () => {
+			// A provisional native read was requested, not delivered. Its hashes
+			// come from the disk at tool_call, so counting it would vouch for bytes
+			// the agent never saw.
+			const env = setupTestEnvironment("read-guard-snapshot-provisional-");
+			try {
+				const filePath = path.join(env.tmpDir, "api.ts");
+				fs.writeFileSync(filePath, "one\ntwo\nthree\n");
+				const guard = createReadGuard("test-session");
+				guard.recordRead(
+					createReadRecord(filePath, {
+						effectiveOffset: 1,
+						effectiveLimit: 3,
+					}),
+				);
+				fs.writeFileSync(filePath, "one\nTWO\nthree\n");
+				fileTimeState.hasChanged = false;
+				guard.recordRead(
+					createReadRecord(filePath, {
+						effectiveOffset: 1,
+						effectiveLimit: 3,
+						provisional: true,
+					}),
+				);
+
+				expect(guard.checkEdit(filePath, [2, 2]).action).toBe("block");
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("checks each line only against its own newest read when an older read brackets a newer one", () => {
+			// Old read A [1-6]; line 5 changes and the agent re-reads it alone (B).
+			// Editing [4-6]: 4 and 6 come from A, 5 from B. A's stale hash for line
+			// 5 must not be held against the edit (one run per read, not one span).
+			const env = setupTestEnvironment("read-guard-snapshot-bracket-");
+			try {
+				const filePath = path.join(env.tmpDir, "api.ts");
+				fs.writeFileSync(filePath, "l1\nl2\nl3\nl4\nl5\nl6\n");
+				const guard = createReadGuard("test-session");
+				guard.recordRead(
+					createReadRecord(filePath, {
+						effectiveOffset: 1,
+						effectiveLimit: 6,
+					}),
+				);
+				fs.writeFileSync(filePath, "l1\nl2\nl3\nl4\nL5\nl6\n");
+				fileTimeState.hasChanged = false;
+				guard.recordRead(
+					createReadRecord(filePath, {
+						effectiveOffset: 5,
+						effectiveLimit: 1,
+					}),
+				);
+				vi.mocked(logReadGuardEvent).mockClear();
+
+				expect(guard.checkEdit(filePath, [4, 6]).action).toBe("allow");
+				expect(lastValidationMetadata()).toMatchObject({
+					status: "match",
+					viewRunCount: 3,
+					checkedLineCount: 3,
+					enforced: true,
+				});
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("blocks a stale hashed line even when the range also holds lines the read has no hash for", () => {
+			// The read's effective range (1-10) outruns the 6-line file it hashed,
+			// so lines 7-8 (appended later) have no hash. They are missing, not a
+			// reason to stop checking line 5.
+			const env = setupTestEnvironment("read-guard-snapshot-partial-hash-");
+			try {
+				const filePath = path.join(env.tmpDir, "api.ts");
+				fs.writeFileSync(filePath, "l1\nl2\nl3\nl4\nl5\nl6");
+				const guard = createReadGuard("test-session");
+				guard.recordRead(
+					createReadRecord(filePath, {
+						effectiveOffset: 1,
+						effectiveLimit: 10,
+					}),
+				);
+				fs.writeFileSync(filePath, "l1\nl2\nl3\nl4\nL5\nl6\nl7\nl8");
+				vi.mocked(logReadGuardEvent).mockClear();
+
+				expect(guard.checkEdit(filePath, [5, 8]).action).toBe("block");
+				expect(lastValidationMetadata()).toMatchObject({
+					status: "mismatch",
+					viewRunCount: 1,
+					checkedLineCount: 2,
+					mismatchedLines: [5],
+					missingLines: [7, 8],
+				});
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("does not judge a line whose newest view is unhashed by the older read on both sides of it", () => {
+			// A [1-6] hashed; line 5 changes and the agent re-reads it unhashed (B).
+			// Line 5 is missing, so [4-6] is two runs of A (4 and 6): merging them
+			// would hold A's stale hash for line 5 against the edit.
+			const env = setupTestEnvironment("read-guard-snapshot-gap-run-");
+			try {
+				const filePath = path.join(env.tmpDir, "api.ts");
+				fs.writeFileSync(filePath, "l1\nl2\nl3\nl4\nl5\nl6");
+				const guard = createReadGuard("test-session");
+				guard.recordRead(
+					createReadRecord(filePath, {
+						effectiveOffset: 1,
+						effectiveLimit: 6,
+					}),
+				);
+				fs.writeFileSync(filePath, "l1\nl2\nl3\nl4\nL5\nl6");
+				fileTimeState.hasChanged = false;
+				guard.recordRead(
+					createReadRecord(filePath, {
+						effectiveOffset: 5,
+						effectiveLimit: 1,
+						lineHashes: {},
+					}),
+				);
+				vi.mocked(logReadGuardEvent).mockClear();
+
+				expect(guard.checkEdit(filePath, [4, 6]).action).toBe("allow");
+				expect(lastValidationMetadata()).toMatchObject({
+					status: "unavailable",
+					viewRunCount: 2,
+					checkedLineCount: 2,
+					missingLines: [5],
 					enforced: false,
 				});
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("reports a line only a context zone covers as unavailable and blocks nothing", () => {
+			// ContextSlack (admitted): line 3 was never delivered, so nothing can
+			// check it, and it must not read as a match.
+			const env = setupTestEnvironment("read-guard-snapshot-ctx-line-");
+			try {
+				const filePath = path.join(env.tmpDir, "api.ts");
+				fs.writeFileSync(filePath, "l1\nl2\nl3\nl4\nl5\nl6");
+				const guard = createReadGuard("test-session");
+				guard.recordRead(
+					createReadRecord(filePath, {
+						effectiveOffset: 5,
+						effectiveLimit: 2,
+					}),
+				);
+				vi.mocked(logReadGuardEvent).mockClear();
+
+				expect(guard.checkEdit(filePath, [3, 3]).action).toBe("allow");
+				expect(lastValidationMetadata()).toMatchObject({
+					status: "unavailable",
+					missingLines: [3],
+					enforced: false,
+					outcome: "not-decidable",
+				});
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("does not hash-check an edit the coverage gate refuses", () => {
+			// The per-line check walks the range line by line, so it must only ever
+			// run on a range some read covers, never on a caller-supplied
+			// [1, 50_000].
+			const env = setupTestEnvironment("read-guard-snapshot-after-coverage-");
+			try {
+				const filePath = path.join(env.tmpDir, "api.ts");
+				fs.writeFileSync(filePath, "one\ntwo\nthree\n");
+				const guard = createReadGuard("test-session");
+				guard.recordRead(
+					createReadRecord(filePath, {
+						effectiveOffset: 1,
+						effectiveLimit: 3,
+					}),
+				);
+				vi.mocked(logReadGuardEvent).mockClear();
+
+				expect(guard.checkEdit(filePath, [1, 50_000]).action).toBe("block");
+				expect(
+					vi
+						.mocked(logReadGuardEvent)
+						.mock.calls.some(
+							([entry]) => entry.event === "range_snapshot_validation",
+						),
+				).toBe(false);
 			} finally {
 				env.cleanup();
 			}
@@ -1791,165 +2054,6 @@ describe("ReadGuard eviction-path telemetry (#1918)", () => {
 		guard.recordRead(createReadRecord(filePath));
 		guard.forgetPath(filePath);
 		expect(evictionEvents("read_file_evicted")).toHaveLength(2);
-	});
-});
-
-// #1041: export/import of the read-set across a session resume.
-describe("ReadGuard export/import across resume (#1041)", () => {
-	// Write, then backdate mtime to BEFORE any guard's session start so the file
-	// reads as authored in a prior session (not "written this session"), which is
-	// exactly the resume scenario. Otherwise a just-written file's now-ish mtime
-	// makes wasWrittenThisSession() true and every edit is session-authored.
-	const LONG_AGO = new Date("2000-01-01T00:00:00Z");
-	function writeNumberedLines(filePath: string, count: number): void {
-		fs.writeFileSync(
-			filePath,
-			`${Array.from({ length: count }, (_, i) => `line${i + 1}`).join("\n")}\n`,
-		);
-		fs.utimesSync(filePath, LONG_AGO, LONG_AGO);
-	}
-
-	it("rehydrates a prior read so the first post-resume edit is allowed", () => {
-		const env = setupTestEnvironment("read-guard-resume-");
-		try {
-			const filePath = path.join(env.tmpDir, "foo.ts");
-			writeNumberedLines(filePath, 100);
-
-			// Session 1: read lines 1..100, then editing 40..50 is allowed.
-			const guard1 = createReadGuard("session-1");
-			guard1.recordRead(
-				createReadRecord(filePath, {
-					requestedOffset: 1,
-					requestedLimit: 100,
-					effectiveOffset: 1,
-					effectiveLimit: 100,
-				}),
-			);
-			expect(guard1.checkEdit(filePath, [40, 50]).action).toBe("allow");
-
-			// Session 2: a FRESH guard (models resetForSession wiping state) starts
-			// with no reads → would zero-read-block. After importing the persisted
-			// read-set, the same edit is allowed again.
-			const guard2 = createReadGuard("session-2");
-			expect(guard2.checkEdit(filePath, [40, 50]).action).toBe("block");
-
-			const result = guard2.importState(guard1.exportState());
-			expect(result).toEqual({ imported: 1, dropped: 0 });
-			expect(guard2.getReadHistory(filePath)).toHaveLength(1);
-			expect(guard2.checkEdit(filePath, [40, 50]).action).toBe("allow");
-		} finally {
-			env.cleanup();
-		}
-	});
-
-	it("drops a rehydrated read whose file content changed on disk (staleness preserved)", () => {
-		const env = setupTestEnvironment("read-guard-resume-stale-");
-		try {
-			const filePath = path.join(env.tmpDir, "foo.ts");
-			writeNumberedLines(filePath, 100);
-
-			const guard1 = createReadGuard("session-1");
-			guard1.recordRead(
-				createReadRecord(filePath, {
-					requestedOffset: 1,
-					requestedLimit: 100,
-					effectiveOffset: 1,
-					effectiveLimit: 100,
-				}),
-			);
-			const exported = guard1.exportState();
-
-			// The file changes on disk between sessions (line 45 rewritten). Keep the
-			// mtime backdated so the drop is driven by the hash mismatch, not by a
-			// now-ish mtime tripping the session-authored allow.
-			const lines = fs.readFileSync(filePath, "utf-8").split("\n");
-			lines[44] = "line45-CHANGED";
-			fs.writeFileSync(filePath, lines.join("\n"));
-			fs.utimesSync(filePath, LONG_AGO, LONG_AGO);
-
-			// A rehydrated read must never mask a real staleness: the changed read
-			// is dropped, so the edit is (correctly) blocked as zero-read.
-			const guard2 = createReadGuard("session-2");
-			const result = guard2.importState(exported);
-			expect(result).toEqual({ imported: 0, dropped: 1 });
-			expect(guard2.getReadHistory(filePath)).toHaveLength(0);
-			expect(guard2.checkEdit(filePath, [40, 50]).action).toBe("block");
-		} finally {
-			env.cleanup();
-		}
-	});
-
-	it("drops rehydrated reads for a file that no longer exists", () => {
-		const env = setupTestEnvironment("read-guard-resume-missing-");
-		try {
-			const filePath = path.join(env.tmpDir, "gone.ts");
-			writeNumberedLines(filePath, 10);
-			const guard1 = createReadGuard("session-1");
-			guard1.recordRead(
-				createReadRecord(filePath, {
-					requestedOffset: 1,
-					requestedLimit: 10,
-					effectiveOffset: 1,
-					effectiveLimit: 10,
-				}),
-			);
-			const exported = guard1.exportState();
-			fs.rmSync(filePath);
-
-			const guard2 = createReadGuard("session-2");
-			expect(guard2.importState(exported)).toEqual({ imported: 0, dropped: 1 });
-			expect(guard2.getReadHistory(filePath)).toHaveLength(0);
-		} finally {
-			env.cleanup();
-		}
-	});
-
-	it("import is a null-safe no-op for undefined / mismatched version", () => {
-		const env = setupTestEnvironment("read-guard-resume-compat-");
-		try {
-			const guard = createReadGuard("session-x");
-			expect(guard.importState(undefined)).toEqual({ imported: 0, dropped: 0 });
-			expect(guard.importState({ version: 999, reads: [] })).toEqual({
-				imported: 0,
-				dropped: 0,
-			});
-		} finally {
-			env.cleanup();
-		}
-	});
-
-	it("degrades to a no-op on a malformed payload instead of throwing", () => {
-		const env = setupTestEnvironment("read-guard-resume-malformed-");
-		try {
-			const guard = createReadGuard("session-x");
-
-			// `reads` is not an array (corrupt / hand-edited sidecar).
-			const nonArrayReads = {
-				version: READ_GUARD_STATE_VERSION,
-				reads: {} as unknown,
-			} as unknown as import("../../clients/read-guard.js").PersistedReadGuardState;
-			expect(() => guard.importState(nonArrayReads)).not.toThrow();
-			expect(guard.importState(nonArrayReads)).toEqual({
-				imported: 0,
-				dropped: 0,
-			});
-
-			// `reads` array with a non-tuple element mixed in with a valid one.
-			const badElement = {
-				version: READ_GUARD_STATE_VERSION,
-				reads: [[normalizeFilePath("/src/x.ts"), []], 5],
-			} as unknown as import("../../clients/read-guard.js").PersistedReadGuardState;
-			expect(() => guard.importState(badElement)).not.toThrow();
-			expect(guard.importState(badElement)).toEqual({
-				imported: 0,
-				dropped: 0,
-			});
-
-			// The map is uncorrupted — nothing was recorded.
-			expect(guard.getReadHistory("/src/x.ts")).toHaveLength(0);
-		} finally {
-			env.cleanup();
-		}
 	});
 });
 

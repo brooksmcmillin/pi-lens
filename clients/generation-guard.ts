@@ -212,19 +212,28 @@ function makeHandle(
  * `name` appears in the stale-write ledger subject and in the sweep's
  * declaration list, so it must name the STORE, not the module.
  */
-export function createGenerationSource(name: string): GenerationSource {
+export function createGenerationSource(
+	name: string,
+	store?: () => { generation: number },
+): GenerationSource {
 	declare(name);
-	let generation = 0;
-	const read = (): number => generation;
+	// `store` puts the counter in a process singleton for state that lives per
+	// process while its source is built per module evaluation (#3733; N4 of
+	// #3609): two evaluations then bump and read ONE counter. Called on every
+	// read, so a cell another build replaced is still the one read.
+	const local = { generation: 0 };
+	const cell = store ?? (() => local);
+	const read = (): number => cell().generation;
 	return {
 		name,
 		current: read,
 		bump(): number {
-			generation += 1;
-			return generation;
+			const held = cell();
+			held.generation += 1;
+			return held.generation;
 		},
 		capture(): GenerationHandle {
-			return makeHandle(name, generation, read);
+			return makeHandle(name, read(), read);
 		},
 	};
 }

@@ -37,26 +37,37 @@ Pull requests must pass `npm run lint`. Run targeted test files for touched seam
 - **pre-push** — a build, then targeted `vitest` runs for the changed `.ts`
   files (never the full suite; see `scripts/pre-push-targeted-tests.mjs`).
   Waits at most 2 minutes on the shared machine-wide test-suite lock
-  (#1101); if that times out, the push proceeds anyway with a warning —
-  CI runs the real gate either way.
+  (#1101); if that times out, the push is blocked (#3717) with the holder,
+  the lock path and the retry options. `PI_LENS_PREPUSH_LOCK_SKIP=1 git push`
+  is the explicit opt-out: it warns and appends a line to `pre-push.log` beside
+  the lock, and CI remains the real gate.
 
 `core.hooksPath` is `git config` — shared by every worktree of the same
-clone, not scoped per worktree. What IS per-worktree is `.husky/_` (the
-directory husky installs at that path), which is git-ignored and only
-created by running `npm install` in that specific worktree. A worktree
-where nobody has run `npm install` yet has the hook FILES checked out but
-nothing wired to `core.hooksPath` there, so `git commit`/`git push` silently
-run no hooks. This is accepted behavior, not a bug to route around: hooks
-serve human checkouts, where `npm install` has run; agent worktrees can opt
-out with `PI_LENS_SKIP_HOOKS` (see below), and CI is authoritative either
-way.
+clone — and `.husky/_` (the directory husky installs at that path) is
+git-ignored, so it exists only where husky ran. Husky's own value is the
+relative `.husky/_`, which git resolves against each worktree's root; every
+linked worktree then ran no pre-commit or pre-push at all (#3674: two PRs
+reached CI with oxfmt and tsc failures). `scripts/setup-git-hooks.mjs`
+therefore runs husky in the MAIN worktree (first entry of `git worktree list`)
+and pins `core.hooksPath` to that absolute `.husky/_`, even when `npm install`
+runs inside a linked worktree that may be deleted later. Linked worktrees run
+the main checkout's `.husky/` scripts, in their own cwd. Moving the clone
+leaves the absolute path dangling until the next `npm install` rewrites it;
+`HUSKY=0` and `PI_LENS_SKIP_HOOKS` still skip the wiring, and so does any
+checkout that is not pi-lens's own (package name `pi-lens`, and Git's toplevel
+equal to the script's package root): an `npm link`, a workspace or a package
+nested in another repo is never rewritten.
 
-Skip either hook with `PI_LENS_SKIP_HOOKS=<anything> git commit ...` /
-`git push ...` (any non-empty value works). Agents and CI should set this —
-their commit cadence across concurrent worktrees is too high for a lint pass
-on every commit, and CI runs the real gates anyway. Humans committing
-directly should leave hooks on; they catch the exact class of failure
-(unused vars, changelog-format violations) that used to slip through to CI.
+`PI_LENS_SKIP_HOOKS=<anything>` (any non-empty value) makes either hook exit
+0 and also skips the hook wiring at install, so `PI_LENS_SKIP_HOOKS=1 npm ci`
+is fine. It is not a way to commit, push, merge or rebase: hooks always run
+there, for agents and humans alike, because they catch the exact class of
+failure (unused vars, changelog-format violations) that used to slip through
+to CI (#3703: a `--no-verify` push put 56 red files into CI). Under Claude
+Code, `guard-bash` denies `PI_LENS_SKIP_HOOKS=`, `HUSKY=0`, `--no-verify`,
+`git commit -n` and `-c core.hooksPath=` on those four commands (#3778). For a
+red that looks unrelated, prove it with `node scripts/red-on-base.mjs`; to
+repair a wrong `core.hooksPath`, run `node scripts/setup-git-hooks.mjs`.
 
 An agent driven through Claude Code also runs under a `PreToolUse` hook on
 every `Bash` call, `scripts/hooks/guard-bash.mjs` (wired in
@@ -83,6 +94,9 @@ mechanically enforced rather than relied on.
 - **Release QA.** `node scripts/release-qa.mjs` runs the pre-release
   readiness pass documented in `docs/release-qa-baseline.md` and
   `.claude/skills/release-qa/SKILL.md`; there is no `npm run` alias.
+- **Contributors list.** Before a release, run `npm run contributors:update -- --dry-run`
+  to preview, then `npm run contributors:update` to credit new PR authors and
+  issue reporters in `.all-contributorsrc` and the README table (refs #3772).
 
 ## What belongs here?
 
@@ -150,7 +164,7 @@ A runner is a tool that runs on a file write/edit and produces `Diagnostic`s. Ex
    - Pick a unique `id`.
    - Set `appliesTo` to the relevant `FileKind`(s) from `clients/file-kinds.ts`. An empty array means "all kinds".
    - Set `priority` using values from `clients/dispatch/priorities.ts`.
-   - Return `status: "succeeded"` with diagnostics (even for findings), or `status: "failed"` only when the runner itself broke. Use `failureKind` to distinguish real crashes from "found blocking diagnostics".
+   - `status` is not a severity channel: severity lives in each diagnostic's `semantic`. A run that completed with findings returns `status: "succeeded"`, or `status: "failed"` when the runner's own threshold says the findings fail the check (in a multi-member `fallback` group, `failed` is what lets the next runner run). Build every findings verdict with `findingsResult` (`clients/dispatch/types.ts`) or `finishParsedRun`, which stamps a findings `failed` with `failureKind: "blocking_diagnostics"`. A `failed` without that kind means the runner itself broke; give it its own kind (`timeout`, `server_error`, …) where the cause is known. `tests/clients/dispatch/runners/runner-findings-failure-kind.test.ts` drives every registered runner, so a new one needs a row there.
    - Prefer `safeSpawnAsync` and `createAvailabilityChecker`/`resolveAvailableOrInstall` from `clients/dispatch/runners/utils/runner-helpers.ts`.
    - If the tool has auto-fix, set `fixable`/`autoFixAvailable` correctly so the diagnostic lands in actionable warnings rather than code-quality history only (see [Actionable warnings routing](#actionable-warnings-routing)).
 

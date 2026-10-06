@@ -120,6 +120,23 @@ export interface ApplyWorkspaceEditOptions {
  */
 export class StaleWorkspaceEditContentError extends Error {}
 
+/**
+ * #3541/#3601: refuse an edit whose content cannot be shown to be what it was
+ * computed from. One ledger count and one {@link StaleWorkspaceEditContentError}
+ * naming the file, for the preflight's own mismatch and for a caller that
+ * refuses a file it cannot bind (`lsp_navigation`'s rename).
+ */
+export function refuseStaleWorkspaceEdit(filePath: string, why: string): never {
+	incrementDegradationCount({
+		kind: "lsp-edit-stale-content",
+		subject: filePath,
+		reason: `${why}; the edit was not applied`,
+	});
+	throw new StaleWorkspaceEditContentError(
+		`stale text document content for ${filePath}: ${why}`,
+	);
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -719,6 +736,16 @@ export function workspaceEditDiskPaths(edit: {
 	return plannedDiskPaths(planWorkspaceEdit(edit));
 }
 
+/** #3601: the on-disk path of every file `edit` writes TEXT to (the only files the content preflight compares). */
+export function workspaceEditTextPaths(edit: {
+	changes?: Record<string, unknown[]>;
+	documentChanges?: unknown[];
+}): string[] {
+	return planWorkspaceEdit(edit).flatMap((op) =>
+		op.kind === "text" ? [uriToDiskPath(op.uri)] : [],
+	);
+}
+
 function planWorkspaceEdit(
 	edit: { changes?: Record<string, unknown[]>; documentChanges?: unknown[] },
 	trackOrigins = false,
@@ -1211,14 +1238,9 @@ async function preflightWorkspaceEdit(
 			await fs.realpath(physicalPath),
 		);
 		if (expected !== undefined && expected !== content) {
-			incrementDegradationCount({
-				kind: "lsp-edit-stale-content",
-				subject: filePath,
-				reason:
-					"the file changed after the edit was computed from it; the edit was not applied",
-			});
-			throw new StaleWorkspaceEditContentError(
-				`stale text document content for ${filePath}: it changed after the edit was computed`,
+			refuseStaleWorkspaceEdit(
+				filePath,
+				"the file changed after the edit was computed from it",
 			);
 		}
 		state.content = content;

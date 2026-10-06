@@ -623,20 +623,64 @@ export interface FindNearestMarkerRootOptions {
 	markerPredicate?: (markerPath: string) => boolean;
 }
 
+export type GitMarkerResult =
+	| { kind: "valid" | "absent" }
+	| { kind: "unavailable"; cause: unknown };
+
+export type MarkerRootResult =
+	| { kind: "found"; root: string }
+	| { kind: "not-found"; reason: "home-ceiling" | "root" | "depth-limit" }
+	| { kind: "unavailable"; markerPath: string; cause: unknown };
+
+/** Detailed ownership walks require a probe that can distinguish I/O failure. */
+export interface FindNearestMarkerRootDetailedOptions {
+	homeDir?: string;
+	markerPredicate: (markerPath: string) => GitMarkerResult;
+}
+
 /**
  * Accept only a real Git repository marker: a directory with HEAD, or a
  * worktree/submodule marker file whose first line starts with `gitdir:`.
+ * Ownership callers request details: absence may permit climbing, but a read
+ * error must not invent an enclosing owner. Legacy callers retain a boolean.
  */
-export function isRealGitMarker(markerPath: string): boolean {
+export function isRealGitMarker(
+	markerPath: string,
+	details: true,
+): GitMarkerResult;
+export function isRealGitMarker(markerPath: string): boolean;
+export function isRealGitMarker(
+	markerPath: string,
+	details?: true,
+): boolean | GitMarkerResult {
+	// Array callbacks supply an index here; only the documented true opts in.
+	const detailed = details === true;
 	try {
 		const marker = statSync(markerPath);
-		if (marker.isDirectory()) return existsSync(path.join(markerPath, "HEAD"));
-		if (!marker.isFile()) return false;
-		return readFileSync(markerPath, "utf8")
-			.split(/\r?\n/, 1)[0]
-			.startsWith("gitdir:");
-	} catch {
-		return false;
+		let valid = false;
+		if (marker.isDirectory()) {
+			// existsSync hides EACCES as false. HEAD is part of ownership evidence,
+			// so detailed callers need its failure just as much as the marker's.
+			statSync(path.join(markerPath, "HEAD"));
+			valid = true;
+		} else if (marker.isFile()) {
+			valid = readFileSync(markerPath, "utf8")
+				.split(/\r?\n/, 1)[0]
+				.startsWith("gitdir:");
+		}
+		if (!detailed) return valid;
+		return { kind: valid ? "valid" : "absent" };
+	} catch (cause) {
+		if (!detailed) return false;
+		if (
+			typeof cause === "object" &&
+			cause !== null &&
+			"code" in cause &&
+			(cause.code === "ENOENT" || cause.code === "ENOTDIR")
+		) {
+			return { kind: "absent" };
+		}
+		return { kind: "unavailable", cause };
 	}
 }
 
@@ -687,6 +731,40 @@ export function findNearestMarkerRoot(
 		current = parent;
 	}
 	return null;
+}
+
+/**
+ * Ownership walk for callers that must tell "no marker here" from "could not
+ * tell" (refs #3644, #3691). Same climb as `findNearestMarkerRoot` (home
+ * ceiling, 64-step cap) but the predicate returns a `GitMarkerResult`, so an I/O
+ * failure stops the walk as `unavailable` instead of becoming "absent" and
+ * letting an enclosing root be mistaken for the owner. It takes no
+ * `boundaries`, so `"boundary"` is not a reason it can return. Kept separate
+ * from the legacy walker so the legacy callers' `existsSync` precheck and
+ * boolean predicate contract cannot drift with it.
+ */
+export function findNearestMarkerRootDetailed(
+	startDir: string,
+	markers: readonly string[],
+	options: FindNearestMarkerRootDetailedOptions,
+): MarkerRootResult {
+	const homeDir = path.resolve(options.homeDir ?? os.homedir());
+	let current = path.resolve(startDir);
+	for (let depth = 0; depth < 64; depth++) {
+		if (isAtOrAboveHomeDir(current, homeDir))
+			return { kind: "not-found", reason: "home-ceiling" };
+		for (const marker of markers) {
+			const markerPath = path.join(current, marker);
+			const checked = options.markerPredicate(markerPath);
+			if (checked.kind === "unavailable")
+				return { kind: "unavailable", markerPath, cause: checked.cause };
+			if (checked.kind === "valid") return { kind: "found", root: current };
+		}
+		const parent = path.dirname(current);
+		if (parent === current) return { kind: "not-found", reason: "root" };
+		current = parent;
+	}
+	return { kind: "not-found", reason: "depth-limit" };
 }
 
 /**

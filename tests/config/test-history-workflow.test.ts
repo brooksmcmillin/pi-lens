@@ -46,7 +46,12 @@ describe("#3215 durable test-history workflow contract", () => {
 			"Upload per-file test results",
 		);
 		const uploadWith = upload.with as Record<string, unknown>;
-		expect(uploadWith.name).toBe("unit-test-results-linux");
+		// #3753: one artifact per Unit tests shard; the unsuffixed name is the
+		// pre-sharding one (tests/config/unit-tests-shard-workflow.test.ts pins
+		// the nightly's download list against the matrix).
+		expect(uploadWith.name).toBe(
+			"unit-test-results-linux-shard-${{ matrix.shard }}",
+		);
 		expect(upload.if).toBe("always()");
 		const metadata = step(
 			".github/workflows/ci.yml",

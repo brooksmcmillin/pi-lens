@@ -61,6 +61,15 @@ export interface DeadCodeResult extends AnalysedRootSignal {
 	summary: string;
 	/** Total wall-clock of the scan; populated by analyze() for telemetry. */
 	durationMs?: number;
+	/**
+	 * #3600: the wall-clock time this run READ the bytes its issues were
+	 * computed from, stamped at the top of `runAnalyze` before the spawn. A
+	 * caller that JOINS the in-flight promise reads the initiator's stamp, so a
+	 * row folded into the widget is judged against the real read rather than
+	 * the joiner's later lane start. Absent on an early skip or an error result;
+	 * neither shape produces a widget row.
+	 */
+	scannedAt?: string;
 }
 
 export interface DeadCodeClient {
@@ -438,6 +447,9 @@ export class PythonDeadCodeClient implements DeadCodeClient {
 	}
 
 	private async runAnalyze(root: string): Promise<DeadCodeResult> {
+		// #3600: stamp the read time at the top of the run body, before vulture
+		// reads any file a widget row's freshness is judged against.
+		const scannedAt = new Date().toISOString();
 		const startMs = Date.now();
 		const invocation = this.resolved ?? { cmd: "vulture", prefix: [] };
 		// Let the project's own [tool.vulture] config win (#1731, discipline A):
@@ -514,9 +526,10 @@ export class PythonDeadCodeClient implements DeadCodeClient {
 				analyzed: true,
 				summary: "No dead code found",
 				durationMs,
+				scannedAt,
 			};
 		}
-		return { ...this.parseOutput(output, root), durationMs };
+		return { ...this.parseOutput(output, root), durationMs, scannedAt };
 	}
 
 	private parseOutput(output: string, root: string): DeadCodeResult {

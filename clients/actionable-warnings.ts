@@ -157,6 +157,23 @@ export interface ActionableWarningsReportFile {
 	 * otherwise have erased it -- and is then the report's own business.
 	 */
 	origin?: "deferred";
+	/**
+	 * #3676: the read guard's branch epoch when THIS entry's build began; an
+	 * entry that merged two observations carries the older epoch, like
+	 * {@link generatedAt}. `/tree` moves neither `projectSeqEnd` nor any
+	 * `fileSeq`, so this is the only axis on which an entry can tell the quick
+	 * fix that the conversation moved since it was observed. The quick fix
+	 * credits its writes with the oldest epoch among the entries it acts on
+	 * ({@link quickFixCreditEpoch}). Absent on a cache file from before #3676.
+	 */
+	branchEpoch?: number;
+	/**
+	 * #3676: the read guard's {@link ReadGuard.lineageKey} when this entry's
+	 * build began. The epoch alone is not an identity across guards (a new guard
+	 * restarts it at 0), and this cache file outlives guards. Entries that merged
+	 * across two keys carry none. Absent on a cache file from before this stamp.
+	 */
+	branchScope?: string;
 	warnings: ActionableWarningRecord[];
 }
 
@@ -632,6 +649,14 @@ export interface BuildActionableWarningsArgs {
 	includeLspCodeActions: boolean;
 	projectSeqStart?: number;
 	projectSeqEnd?: number;
+	/**
+	 * #3676: the read guard's branch epoch, read where `projectSeqEnd` is, before
+	 * the build's first await. The deferred report is assembled from these same
+	 * args, so it carries the epoch of the build that armed it.
+	 */
+	branchEpoch?: number;
+	/** #3676: the guard's `lineageKey`, read beside `branchEpoch`. */
+	branchScope?: string;
 	fileSeqByPath?: Map<string, number>;
 	deltaOnly?: boolean;
 	dbg?: (msg: string) => void;
@@ -1384,6 +1409,8 @@ function assembleReport(
 				stamps?.observedAtByPath.get(normalizeMapKey(filePath)) ??
 				stamps?.fallbackObservedAt ??
 				generatedAt,
+			branchEpoch: args.branchEpoch,
+			branchScope: args.branchScope,
 			warnings,
 		}),
 	);
@@ -1635,6 +1662,14 @@ export function mergeActionableWarningsReports(args: {
 							incumbent.generatedAt ?? newerReport?.generatedAt,
 							entry.generatedAt ?? olderReport?.generatedAt,
 						),
+						branchEpoch: olderBranchEpoch(
+							incumbent.branchEpoch,
+							entry.branchEpoch,
+						),
+						branchScope:
+							incumbent.branchScope === entry.branchScope
+								? incumbent.branchScope
+								: undefined,
 						warnings: mergeWarnings([...incumbent.warnings, ...entry.warnings]),
 					}
 			: { ...entry };
@@ -1771,12 +1806,13 @@ export function publishActionableWarningsReport(
 		// without any file having moved -- name the actual cause instead of
 		// asserting a change that may not have happened.
 		const cause = merged.droppedForSessionMismatch
-			? "the publish crossed a session boundary (a different session's write, or a resumed process) before this turn's in-band publish could keep them"
+			? "the publish crossed a session boundary"
 			: "changed before this turn's in-band publish could keep them";
+		const reason = `${merged.droppedFiles.length} carried-forward entries: findings are LOST on this channel; ${cause} (files: ${merged.droppedFiles.slice(0, 3).join(", ")}${merged.droppedFiles.length > 3 ? ", ..." : ""})`;
 		incrementDegradationCount({
 			kind: "actionable-warnings-inband-superseded",
 			subject: `${path.resolve(cwd)}:inband-carry-superseded`,
-			reason: `${merged.droppedFiles.length} carried-forward deferred file entry/entries ${cause} (${merged.droppedFiles.slice(0, 3).join(", ")}${merged.droppedFiles.length > 3 ? ", ..." : ""}); their earlier findings are LOST on this channel rather than published against content that has since moved`,
+			reason,
 		});
 		opts.dbg?.(
 			`actionable_warnings: in-band publish dropped ${merged.droppedFiles.length} superseded carried-forward file entry/entries (${merged.droppedFiles.slice(0, 3).join(", ")}${merged.droppedFiles.length > 3 ? ", ..." : ""})`,
@@ -1801,6 +1837,46 @@ function newerStamp(a?: string, b?: string): string | undefined {
 	if (a === undefined) return b;
 	if (b === undefined) return a;
 	return older === a ? b : a;
+}
+
+/**
+ * #3676: the older of two entries' branch epochs. Unlike {@link minDefined}, a
+ * missing half poisons the result: an unstamped entry (a cache file from before
+ * the stamp) has no epoch to vouch for, so the entry that absorbed it vouches
+ * for none.
+ */
+function olderBranchEpoch(a?: number, b?: number): number | undefined {
+	if (typeof a !== "number" || typeof b !== "number") return undefined;
+	return Math.min(a, b);
+}
+
+/**
+ * #3676: the branch epoch the quick fix credits its writes with: the oldest
+ * epoch among the entries it acts on, or `undefined` when there are none, any
+ * one of them was built under another guard than `liveScope` (its
+ * {@link ActionableWarningsReportFile.branchScope}), or carries no valid epoch
+ * (not an integer `>= 0`). One entry that cannot vouch for the live branch
+ * withholds the credit from the whole pass: the pass cannot tell which of its
+ * writes belongs to which entry.
+ */
+export function quickFixCreditEpoch(
+	files: ReadonlyArray<
+		Pick<ActionableWarningsReportFile, "branchEpoch" | "branchScope">
+	>,
+	liveScope: string,
+): number | undefined {
+	let oldest: number | undefined;
+	for (const { branchEpoch, branchScope } of files) {
+		if (branchScope !== liveScope || !isBranchEpoch(branchEpoch))
+			return undefined;
+		oldest = oldest === undefined ? branchEpoch : Math.min(oldest, branchEpoch);
+	}
+	return oldest;
+}
+
+/** An epoch a cache file can legitimately carry: an integer `>= 0`. */
+function isBranchEpoch(value: unknown): value is number {
+	return Number.isInteger(value) && (value as number) >= 0;
 }
 
 function minDefined(a?: number, b?: number): number | undefined {
@@ -1853,7 +1929,7 @@ export function writeDeferredActionableWarningsReport(args: {
 		incrementDegradationCount({
 			kind: "actionable-warnings-deferred-superseded",
 			subject: `${path.resolve(args.cwd)}:deferred-file-superseded`,
-			reason: `${droppedFiles.length} file(s) changed while the deferred LSP pull was reading them (${droppedFiles.slice(0, 3).join(", ")}${droppedFiles.length > 3 ? ", ..." : ""}); their warnings are LOST on this channel rather than published against content that has since moved. Every file that did NOT change was merged into the persisted report`,
+			reason: `${droppedFiles.length} changed file(s): warnings are LOST; unchanged files were merged into the persisted report (files: ${droppedFiles.slice(0, 3).join(", ")}${droppedFiles.length > 3 ? ", ..." : ""})`,
 		});
 		args.dbg?.(
 			`turn_end: deferred actionable-warnings dropped ${droppedFiles.length} superseded file entry/entries`,

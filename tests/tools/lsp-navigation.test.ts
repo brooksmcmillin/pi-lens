@@ -6,6 +6,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { removeTempDirSync } from "../clients/test-utils.js";
 import { makeLspServiceDouble } from "../support/lsp-service-double.js";
 import { CacheManager } from "../../clients/cache-manager.js";
+import { hashDiagnosticContent } from "../../clients/lsp/diagnostic-binding.js";
 import { normalizeMapKey } from "../../clients/path-utils.js";
 import { readChangesSince } from "../../clients/project-changes.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
@@ -55,6 +56,14 @@ describe("lsp_navigation tool", () => {
 					{ title: "Move to new file", kind: "refactor.move.newFile" },
 				]),
 			rename: vi.fn().mockResolvedValue(null),
+			// #3601: a rename edit that writes a file besides its target is applied
+			// only to a file the client tracks. These cases are about provenance,
+			// not staleness, so every file reads as tracked in sync with the disk,
+			// sent long before the rename.
+			getTrackedContent: vi.fn((filePath: string) => ({
+				hash: hashDiagnosticContent(fs.readFileSync(filePath, "utf-8")),
+				changedAtMs: 0,
+			})),
 			renameFile: vi.fn().mockResolvedValue({
 				applied: false,
 				serverIds: [],

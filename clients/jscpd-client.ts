@@ -49,6 +49,15 @@ export interface JscpdResult extends AnalysedRootSignal {
 	duplicatedLines: number;
 	totalLines: number;
 	percentage: number;
+	/**
+	 * #3600: the wall-clock time this run READ the bytes its clones were
+	 * computed from, stamped at the top of `runScan` before the spawn. A caller
+	 * that JOINS the in-flight promise reads the initiator's stamp, so a row
+	 * folded into the widget is judged against the real read rather than the
+	 * joiner's later lane start. Absent on an early refusal or an error result;
+	 * neither shape produces a widget row.
+	 */
+	scannedAt?: string;
 }
 
 const EMPTY_RESULT: JscpdResult = {
@@ -290,6 +299,9 @@ export class JscpdClient {
 		minTokens: number,
 		isTsProject: boolean,
 	): Promise<JscpdResult> {
+		// #3600: stamp the read time at the top of the run body, before the scan
+		// reads any file a widget row's freshness is judged against.
+		const scannedAt = new Date().toISOString();
 		const outDir = mkdtempSync(`${os.tmpdir()}${path.sep}pi-lens-jscpd-`);
 
 		// Build ignore pattern from shared exclusions + scanner-specific patterns.
@@ -392,7 +404,7 @@ export class JscpdClient {
 				return { ...EMPTY_RESULT, success: true };
 			}
 
-			return this.parseReport(reportPath);
+			return { ...this.parseReport(reportPath), scannedAt };
 		} catch (err: any) {
 			this.log(`Scan error: ${err.message}`);
 			return { ...EMPTY_RESULT };

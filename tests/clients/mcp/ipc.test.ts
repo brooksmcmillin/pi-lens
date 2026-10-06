@@ -52,6 +52,49 @@ afterEach(() => {
 	}
 });
 
+// #3922: records written before failure tracking remain readable and writable.
+describe("unrunnable invocation status", () => {
+	it("extends a released turn-end record without losing its counters", () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-ipc-status-"));
+		const statusPath = turnEndStatusPathForCwd(cwd);
+		try {
+			fs.writeFileSync(
+				statusPath,
+				fs.readFileSync(
+					new URL(
+						"../../fixtures/mcp/turn-end-status-v1.json",
+						import.meta.url,
+					),
+				),
+			);
+			expect(readTurnEndStatus(cwd)).toMatchObject({
+				ran: 3,
+				skipped: 2,
+				failed: 0,
+			});
+			recordTurnEndOutcome(cwd, {
+				failed: true,
+				operation: "analyze",
+				reason: "host peer unavailable",
+			});
+			recordTurnEndOutcome(cwd, { ran: true });
+			recordTurnEndOutcome(cwd, { ran: false, reason: "no-listener" });
+			expect(readTurnEndStatus(cwd)).toMatchObject({
+				ran: 4,
+				skipped: 3,
+				failed: 1,
+				lastFailureOperation: "analyze",
+				lastFailureReason: "host peer unavailable",
+				lastFailureAt: expect.any(String),
+				lastSkipReason: "no-listener",
+			});
+		} finally {
+			fs.rmSync(statusPath, { force: true });
+			removeTempDirSync(cwd);
+		}
+	});
+});
+
 describe("requestWarmDiagnostics", () => {
 	it("round-trips a versioned, content-bound response", async () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-ipc-diag-"));

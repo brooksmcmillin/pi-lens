@@ -463,6 +463,15 @@ describe("loadPiLensProjectConfig", () => {
 				.some((arg) => typeof arg === "string" && arg.includes(substring));
 		}
 
+		function noticeFor(substring: string): string | undefined {
+			return (console.error as ReturnType<typeof vi.fn>).mock.calls
+				.flat()
+				.find(
+					(arg): arg is string =>
+						typeof arg === "string" && arg.includes(substring),
+				);
+		}
+
 		it("warns on a typo'd top-level key", () => {
 			fs.writeFileSync(
 				path.join(tmpDir, ".pi-lens.json"),
@@ -565,12 +574,28 @@ describe("loadPiLensProjectConfig", () => {
 				JSON.stringify({
 					delta: { enabled: false },
 					tests: { enabled: false },
+					dispatch: { runnerTimeoutFloorMs: 180_000 },
+					widget: { visible: false },
 				}),
 			);
 			loadPiLensProjectConfig(tmpDir);
 			expect(warnedFor("not honored in a project")).toBe(true);
 			expect(warnedFor('"delta"')).toBe(true);
 			expect(warnedFor('"tests"')).toBe(true);
+			expect(warnedFor('"dispatch"')).toBe(true);
+			expect(warnedFor('"widget"')).toBe(true);
+			const deltaNotice = noticeFor('"delta" is a global-only');
+			const testsNotice = noticeFor('"tests" is a global-only');
+			const dispatchNotice = noticeFor('"dispatch" is a global-only');
+			const widgetNotice = noticeFor('"widget" is a global-only');
+			expect(deltaNotice).toBeDefined();
+			expect(testsNotice).toBeDefined();
+			expect(dispatchNotice).toBeDefined();
+			expect(widgetNotice).toBeDefined();
+			expect(deltaNotice).toContain("pass the matching CLI flag");
+			expect(testsNotice).toContain("pass the matching CLI flag");
+			expect(dispatchNotice).not.toContain("pass the matching CLI flag");
+			expect(widgetNotice).not.toContain("pass the matching CLI flag");
 			// It is NOT reported as a typo — it is a real key, wrong scope.
 			expect(warnedFor('unknown key "delta"')).toBe(false);
 		});
@@ -612,6 +637,8 @@ describe("loadPiLensProjectConfig", () => {
 			loadPiLensProjectConfig(tmpDir);
 			expect(warnedFor("not honored in a project")).toBe(true);
 			expect(warnedFor('"lsp.enabled"')).toBe(true);
+			expect(warnedFor('"lsp.enabled" is a global-only')).toBe(true);
+			expect(warnedFor("pass the matching CLI flag")).toBe(true);
 			// The four honored LSP settings stay silent — they are read from this
 			// very file by the LSP loader.
 			for (const key of [
@@ -1196,6 +1223,12 @@ describe("non-flag global-only key inside a mixed-scope section (#3131)", () => 
 		expect(
 			warnedFor('"actionableWarnings.autoFix.maxFixes" is a global-only'),
 		).toBe(true);
+		expect(
+			warnedFor(
+				'"actionableWarnings.autoFix.maxFixes" is a global-only pi-lens setting and is not honored in a project',
+			),
+		).toBe(true);
+		expect(warnedFor("pass the matching CLI flag")).toBe(false);
 		expect(warnCountFor("actionableWarnings.autoFix.maxFixes")).toBe(1);
 		// The value never reaches the parsed project config — same non-goal #3126
 		// left this key with: the notice is new, the scope is not.

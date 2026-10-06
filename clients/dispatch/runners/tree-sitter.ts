@@ -14,7 +14,10 @@ import {
 	computeImpactCascade,
 	recordEntitySnapshotDiff,
 } from "../../review-graph/service.js";
-import type { TreeSitterClient } from "../../tree-sitter-client.js";
+import {
+	classifyTreeSitterWasmError,
+	type TreeSitterClient,
+} from "../../tree-sitter-client.js";
 import {
 	getSharedTreeSitterClient,
 	isTreeSitterWasmAborted,
@@ -38,6 +41,7 @@ import type {
 	RunnerDefinition,
 	RunnerResult,
 } from "../types.js";
+import { findingsResult } from "../types.js";
 
 const blastCooldownByFile = new Map<string, number>();
 const BLAST_COOLDOWN_MS = 5_000;
@@ -622,7 +626,7 @@ const treeSitterRunner: RunnerDefinition = {
 			const msg = err instanceof Error ? err.message : String(err);
 			// Emscripten abort() corrupts the entire module-level wasm heap.
 			// Poison the singleton so no further queries attempt to use the dead runtime.
-			if (msg.includes("Aborted") || msg.includes("abort()")) {
+			if (classifyTreeSitterWasmError(err) === "abort") {
 				markTreeSitterWasmAborted();
 				logTreeSitter({
 					phase: "query_error",
@@ -765,11 +769,10 @@ const treeSitterRunner: RunnerDefinition = {
 			effectiveQueryCount: effectiveQueries.length,
 		});
 
-		return {
+		return findingsResult(diagnostics, {
 			status: hasBlocking ? "failed" : "succeeded",
-			diagnostics,
 			semantic: hasBlocking ? "blocking" : "warning",
-		};
+		});
 	},
 };
 

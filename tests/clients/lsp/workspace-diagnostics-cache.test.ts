@@ -27,6 +27,7 @@ import {
 	WORKSPACE_DIAGNOSTICS_CACHE_VERSION,
 	type WorkspaceDiagnosticsCacheEntry,
 } from "../../../clients/lsp/workspace-diagnostics-cache.js";
+import { getProjectDataDir } from "../../../clients/file-utils.js";
 import { MTIME_DRIFT_TOLERANCE_MS } from "../../../clients/blocker-freshness.js";
 import { hashDiagnosticContent } from "../../../clients/lsp/diagnostic-binding.js";
 import {
@@ -49,8 +50,12 @@ let tmp: string;
 beforeEach(() => {
 	resetDegradationLedger();
 	tmp = setupTestEnvironment("pi-lens-lsp-cache-").tmpDir;
-	// Legacy per-project data dir marker so the cache file writes INSIDE tmp
-	// (cleaned up by afterEach) instead of the real global ~/.pi-lens dir.
+	// Legacy per-project data dir marker: with no PILENS_DATA_DIR override this
+	// makes `getProjectDataDir` resolve the cache INSIDE tmp (cleaned up by
+	// afterEach) instead of the real global ~/.pi-lens dir. Under a relocated
+	// PILENS_DATA_DIR the production owner wins, and every fixture path below
+	// is built from `getProjectDataDir(tmp)`, so the write and read never
+	// disagree about which data root owns the cache.
 	fs.mkdirSync(path.join(tmp, ".pi-lens"));
 });
 
@@ -108,8 +113,7 @@ describe("loadWorkspaceDiagnosticsCache / saveWorkspaceDiagnosticsCache (#671)",
 
 	it("fails open on a corrupt cache file", () => {
 		const cacheFile = path.join(
-			tmp,
-			".pi-lens",
+			getProjectDataDir(tmp),
 			"cache",
 			"lsp-workspace-diagnostics.json",
 		);
@@ -138,8 +142,7 @@ describe("loadWorkspaceDiagnosticsCache / saveWorkspaceDiagnosticsCache (#671)",
 
 	it("fails open when entries is missing/malformed", () => {
 		const cacheFile = path.join(
-			tmp,
-			".pi-lens",
+			getProjectDataDir(tmp),
 			"cache",
 			"lsp-workspace-diagnostics.json",
 		);
@@ -1010,6 +1013,7 @@ function makeTsServer(root: string, id = "typescript", extension = ".ts") {
 		id,
 		name: id,
 		extensions: [extension],
+		idleEviction: "resident",
 		root: async () => root,
 		spawn: vi.fn(async () => ({ process: {}, source: "test" })),
 	};
@@ -1429,8 +1433,7 @@ describe("persist() write-failure retry (#1239)", () => {
 		// tmp-write-then-rename cannot replace a directory on any OS, so the
 		// save deterministically fails without mocks.
 		const target = path.join(
-			tmp,
-			".pi-lens",
+			getProjectDataDir(tmp),
 			"cache",
 			"lsp-workspace-diagnostics.json",
 		);

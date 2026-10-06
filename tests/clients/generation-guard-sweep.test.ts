@@ -82,6 +82,9 @@ const HAND_ROLLED_GENERATION_GUARDS: Readonly<Record<string, string>> = {
 	"observed-mutation.ts":
 		"the settle rejects a baseline whose sessionGeneration no longer matches the one the tool_result carries. This IS the capture-before/check-after shape, but the counter is RuntimeCoordinator.sessionGeneration — captured at tool_call, handed back at tool_result, and owned by runtime-coordinator.ts, whose own migration is deferred above. Declaring a GenerationSource here would mint a SECOND counter mirroring the session's, which is the single-source-of-truth defect the ratchet exists to prevent. Since #3499 that counter IS a GenerationSource (RuntimeCoordinator.captureSessionGeneration), but this file carries the captured value as a plain number on the pending baseline across tool_call -> tool_result and compares it there; moving that record to a handle is its own migration, not yet filed",
 
+	"read-guard.ts":
+		"#3521's branch epoch: retainBranch bumps it, the agent_settled writers capture it before they await, and recordWritten refuses a write whose captured epoch is stale, with a counted read-guard-write-after-branch-move record. This IS the capture-before/check-after shape. The captured value travels as a plain number on BridgeMutationEntry.readGuardBranchEpoch (a field of the versioned cross-extension mutation bridge) and on DeferredMutationRecord (queued in one settle, drained in a later one), so a GenerationSource handle cannot carry it; the same position as observed-mutation.ts above. Moving the in-process writers to a handle is its own migration",
+
 	// --- Not the shape: a generation is compared, but no post-await write
 	// hangs on the answer. ---
 	"dispatch/runners/utils/runner-helpers.ts":
@@ -96,6 +99,8 @@ const HAND_ROLLED_GENERATION_GUARDS: Readonly<Record<string, string>> = {
 		"#2636 review round 2, F3: getBundledQueriesRootHealth compares the CURRENT degradation-ledger generation against the one its memo was computed under, to decide whether to re-probe the bundled root's health (clear-on-transition, same shape as ast-grep-client.ts's ensureRulesHealthReported and tree-sitter-client.ts's trust-notification set above) — not a write racing an await. The compare only decides whether to recompute a READ-side memo; nothing downstream is a pending write that could land stale.",
 	"dispatch/integration.ts":
 		"reverse-dependency reuse eligibility compares a PERSISTED graph build generation read off disk against a cached index's, to decide whether a one-step import delta is contiguous. A read-side eligibility test, and the primitive has no persisted form — see workspace-diagnostics-cache.ts's #1669 review R2 note on why an inert persisted generation was reverted there",
+	"session-scope.ts":
+		"#3611 r2 F1: recordDroppedRead compares a dropped write's queue-time branch epoch with the epoch its drop's lineage captured, to decide whether the drop is COUNTED as a false block (session-scope-read-dropped). The write itself was already dropped by the handle's own GenerationSource; this compare only chooses between two records, so no write hangs on it. The scope's liveness and branch fences themselves go through createGenerationSource",
 	"review-graph-logger.ts":
 		"copies a persisted graph build generation into log metadata. Nothing is guarded; the value is a field in a record",
 	"lsp/index.ts":

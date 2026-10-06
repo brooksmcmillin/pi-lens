@@ -16,11 +16,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { setupTestEnvironment } from "../clients/test-utils.js";
 
 const fixture = fileURLToPath(
 	new URL("../fixtures/fake-lsp-server.mjs", import.meta.url),
 );
-const root = fs.mkdtempSync(path.join(process.cwd(), ".probe-2776-"));
+const probe = setupTestEnvironment("pi-lens-2776-");
+const root = probe.tmpDir;
 const probeFixture = path.join(root, "fake-lsp-server.mjs");
 const fixtureSource = fs.readFileSync(fixture, "utf8");
 fs.writeFileSync(
@@ -36,9 +38,16 @@ fs.writeFileSync(
 		),
 );
 
-process.env.PI_LENS_HOME = path.join(root, ".pi-lens-home");
-process.env.FAKE_LSP_NOTIFY_BACKLOG_WEDGE = "1";
-process.env.PROBE_IGNORE_PULL = "1";
+// #3715: module-scope pins, restored in afterAll so nothing here outlives the file.
+const ENV_PINS = {
+	PI_LENS_HOME: path.join(root, ".pi-lens-home"),
+	FAKE_LSP_NOTIFY_BACKLOG_WEDGE: "1",
+	PROBE_IGNORE_PULL: "1",
+};
+const previousEnv = Object.fromEntries(
+	Object.keys(ENV_PINS).map((key) => [key, process.env[key]]),
+);
+Object.assign(process.env, ENV_PINS);
 
 describe("#2776 custom primary diagnostic provenance", () => {
 	const workspace = path.join(root, "workspace");
@@ -70,8 +79,12 @@ describe("#2776 custom primary diagnostic provenance", () => {
 	});
 
 	afterAll(async () => {
+		for (const [key, value] of Object.entries(previousEnv)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
 		await service?.shutdown();
-		fs.rmSync(root, { recursive: true, force: true });
+		probe.cleanup();
 	});
 
 	it("reports a pushed primary diagnostic even when source is server-authored", async () => {

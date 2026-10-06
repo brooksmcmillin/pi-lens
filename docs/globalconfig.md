@@ -33,6 +33,7 @@ Each runtime toggle is settable from the CLI *and* from `config.json`. The two a
 | `--lens-compact-tool-line` | `ui.compactToolLine` | `false` |
 | `--lens-compact-lsp-status` | `ui.compactLspStatus` | `false` |
 | `--lens-hide-lsp-status` | `ui.hideLspStatus` | `false` |
+| `--lens-compact-widget` | `ui.compactWidget` | `false` |
 | `--no-lazy-tools` | `tools.lazy` | `true` |
 | `--lens-turn-end-madge` | `turnEnd.madge.enabled` | `false` |
 | `--no-knip` | `knip.enabled` | `true` |

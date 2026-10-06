@@ -1674,6 +1674,42 @@ describe("lsp server policy", () => {
 		expect(launchLSP.mock.calls[0]?.[0]).toBe("kotlin-lsp");
 	});
 
+	// #3400: KotlinServer had PATH-only candidates, so a box without either
+	// command had no managed fallback and the nightly `kotlin` row stayed
+	// `ensureTool(kotlin-language-server) -> UNAVAILABLE`.
+	it("launches kotlin-language-server from the managed install when no PATH candidate exists", async () => {
+		const { KotlinServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-kotlin-managed-"),
+		);
+		dirs.push(tmp);
+		const managed = path.join(tmp, "bin", "kotlin-language-server");
+
+		ensureTool.mockResolvedValue(managed);
+		launchLSP.mockImplementation(async (command: string) => {
+			if (command === managed) {
+				return {
+					process: { killed: false } as never,
+					stdin: {} as never,
+					stdout: {} as never,
+					stderr: {} as never,
+					pid: 1357,
+				};
+			}
+			throw toolNotFound(`unexpected command: ${command}`);
+		});
+
+		const spawned = await KotlinServer.spawn(tmp, { allowInstall: true });
+
+		expect(spawned).toBeDefined();
+		expect(ensureTool).toHaveBeenCalledWith("kotlin-language-server");
+		expect(launchLSP).toHaveBeenLastCalledWith(
+			managed,
+			[],
+			expect.objectContaining({ cwd: tmp }),
+		);
+	});
+
 	it("launches zls from managed install when direct command is unavailable", async () => {
 		const { ZigServer } = await import("../../../clients/lsp/server.js");
 		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-zls-managed-"));

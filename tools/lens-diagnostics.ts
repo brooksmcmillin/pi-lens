@@ -29,7 +29,10 @@ import {
 	applyFindingPolicy,
 	loadProjectRulePolicyMap,
 } from "../clients/dispatch/finding-policy.js";
-import { gateFindingsByPathFreshness } from "../clients/advisory-provenance.js";
+import {
+	gateFindingsByPathFreshness,
+	parseScannedAtMs,
+} from "../clients/advisory-provenance.js";
 import {
 	formatCacheAgeLabel,
 	markUnreconciledFindings,
@@ -1649,6 +1652,13 @@ function projectDiagnosticToWidget(
 		rule: diagnostic.rule ?? diagnostic.code,
 		tool: diagnostic.runner || diagnostic.tool,
 		uri: widgetDiagnosticUri(filePath, diagnostic.line, diagnostic.column),
+		// #3600: carry the analyzer's own read stamp through the #1888
+		// correlated commit, which otherwise re-stamps the row with the project
+		// scan's `scannedAt` or the fold's `Date.now()`. Absent for the cheap
+		// scan's rows, whose freshness is settled by a content fingerprint.
+		...(diagnostic.observedAt !== undefined && {
+			observedAt: diagnostic.observedAt,
+		}),
 	};
 }
 
@@ -2043,17 +2053,33 @@ function mergeDiagnosticsWithWidgetSummaries(
 		}
 	}
 
+	// #3600: the delta report's own `generatedAt`, never the fold's `now`. A row
+	// that already carries its own `observedAt` keeps it; the report stamp is
+	// only a fallback for rows the delta writer did not stamp. An unparseable
+	// `generatedAt` is recorded rather than silently widened to `Date.now()`.
+	const deltaDiagnostics = projectDelta?.diagnostics ?? [];
+	const deltaObservedAt = parseScannedAtMs(projectDelta?.generatedAt);
+	if (deltaDiagnostics.length > 0 && deltaObservedAt === undefined) {
+		recordDegradationOnce({
+			kind: "project-delta-generatedat-unparseable",
+			subject: String(projectDelta?.generatedAt),
+			reason:
+				"projectDelta rows fell back to the fold time because generatedAt could not be parsed",
+		});
+	}
 	for (const diagnostic of projectSnapshot?.diagnostics ?? []) {
 		addDiagnostic(
 			path.resolve(diagnostic.filePath),
 			projectDiagnosticToWidget(diagnostic, diagnostic.filePath),
 		);
 	}
-	for (const diagnostic of projectDelta?.diagnostics ?? []) {
-		addDiagnostic(
-			path.resolve(diagnostic.filePath),
-			projectDiagnosticToWidget(diagnostic, diagnostic.filePath),
-		);
+	for (const diagnostic of deltaDiagnostics) {
+		const widget = projectDiagnosticToWidget(diagnostic, diagnostic.filePath);
+		const observedAt = widget.observedAt ?? deltaObservedAt;
+		addDiagnostic(path.resolve(diagnostic.filePath), {
+			...widget,
+			...(observedAt !== undefined && { observedAt }),
+		});
 	}
 
 	return [...byFile.values()];

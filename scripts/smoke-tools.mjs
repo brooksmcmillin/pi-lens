@@ -36,6 +36,7 @@
  *   node scripts/smoke-tools.mjs [lang ...] [--step2] [--tier1] [--install] [--verbose]
  *   node scripts/smoke-tools.mjs --lsp [lang ...] [--install] [--verbose]
  *   node scripts/smoke-tools.mjs --lsp-gate [lang ...] [--install] [--verbose]
+ *   node scripts/smoke-tools.mjs --lens-full [lang ...] [--install] [--verbose]
  *   node scripts/smoke-tools.mjs --format [lang ...] [--install] [--verbose]
  *   node scripts/smoke-tools.mjs --install --install-registry --installer-root=<path>
  *
@@ -142,6 +143,59 @@ export function classifyLspGateResult(result, fx, unavailable = false) {
 		state: "fail",
 		detail: `lsp_diagnostics returned ${diags} diagnostic(s) but 0 primary findings (auxiliary=${details.auxiliaryDiagnosticsCount ?? 0})`,
 		diags,
+	};
+}
+
+/**
+ * The nightly `lens_diagnostics mode=full` row's fixture population (#2780).
+ * `lens_diagnostics` is the tool agents call by default and its verdict
+ * shaping mirrors `lsp_diagnostics`', so ONE cheap seeded fixture is enough to
+ * catch a divergence between the two handlers. Opt-in via `lensFull: true`,
+ * mirroring `lspGate`; `tests/config/lsp-gate-population.test.ts` pins that
+ * exactly one gate-eligible fixture opts in.
+ */
+export function lensFullPopulation(fixtures = LSP_FIXTURES) {
+	return fixtures.filter((f) => f.lensFull === true);
+}
+
+/**
+ * Classify the nightly `lens_diagnostics mode=full` row (#2780). Mirrors
+ * `classifyLspGateResult`: it counts the fresh LSP sweep's PRIMARY bucket
+ * (`lspPrimaryDiagnosticsCount`) so an auxiliary-only result (ast-grep,
+ * opengrep, ...) cannot be mistaken for the configured primary answering —
+ * exactly the #2776 provenance shape. Handshake availability is admitted by
+ * the census in `runLensFull`, before this classifier is called.
+ */
+export function classifyLensFullResult(result, fx) {
+	if (!result) {
+		return {
+			state: "fail",
+			detail: "lens_diagnostics mode=full returned no result",
+			diags: 0,
+		};
+	}
+	const details = result.details ?? {};
+	const primary = Number(details.lspPrimaryDiagnosticsCount ?? 0);
+	const auxiliary = Number(details.lspAuxiliaryDiagnosticsCount ?? 0);
+	const projectFindings =
+		Number(details.totalBlocking ?? 0) + Number(details.totalErrors ?? 0);
+	const renderedText = result.content?.[0]?.text ?? "";
+	const renderedMessage = fx.expectedMessage;
+	const renderedMessageMissing =
+		typeof renderedMessage === "string" &&
+		renderedMessage.length > 0 &&
+		!renderedText.includes(renderedMessage);
+	if (primary > 0 && projectFindings > 0 && !renderedMessageMissing) {
+		return {
+			state: "pass",
+			detail: `lens_diagnostics mode=full returned ${primary} primary finding${primary === 1 ? "" : "s"}`,
+			diags: primary + auxiliary,
+		};
+	}
+	return {
+		state: "fail",
+		detail: `lens_diagnostics mode=full returned ${projectFindings} finding(s) but ${primary} primary LSP findings (auxiliary=${auxiliary}, lspFilesUnconfirmed=${details.lspFilesUnconfirmed ?? 0}, auxPartial=${details.lspFilesPartiallyCovered ?? 0}${renderedMessageMissing ? `, rendered text missing expected message "${renderedMessage}"` : ""})`,
+		diags: primary + auxiliary,
 	};
 }
 
@@ -483,6 +537,12 @@ const LSP_FIXTURES = [
 		expectServerId: "typescript",
 		lspGate: true,
 		lspGateMarker: '"not a number"',
+		expectedMessage: "Type 'string' is not assignable to type 'number'.",
+		// The single fixture the nightly `lens_diagnostics mode=full` row drives
+		// (#2780). Cheap (typescript-language-server, no toolchain setup) and
+		// seeded with a type error only the real LSP can see, so a zero primary
+		// bucket means the tool's verdict shaping diverged.
+		lensFull: true,
 	},
 	{
 		// #2777: the nested package marker must become the LSP root for this file.
@@ -1595,6 +1655,7 @@ function parseArgs(argv) {
 	let install = false;
 	let lsp = false;
 	let lspGate = false;
+	let lensFull = false;
 	let format = false;
 	let autofix = false;
 	let tier1 = false;
@@ -1608,6 +1669,7 @@ function parseArgs(argv) {
 		else if (arg === "--install") install = true;
 		else if (arg === "--lsp") lsp = true;
 		else if (arg === "--lsp-gate") lspGate = true;
+		else if (arg === "--lens-full") lensFull = true;
 		else if (arg === "--format") format = true;
 		else if (arg === "--tier1") tier1 = true;
 		else if (arg === "--install-registry") installRegistry = true;
@@ -1625,6 +1687,7 @@ function parseArgs(argv) {
 		install,
 		lsp,
 		lspGate,
+		lensFull,
 		format,
 		autofix,
 		tier1,
@@ -2180,7 +2243,7 @@ export function fixtureDispatchCwd(fixture, workspace) {
 // toward the failure exit code so it can't silently pass the nightly.
 const ICON = { pass: "✓", fail: "✗", skip: "⚠", "setup-failed": "✗" };
 
-function report(rows, title) {
+export function report(rows, title, { failOnSkipOnly = false } = {}) {
 	const pad = (s, n) => String(s).padEnd(n);
 	console.log(`\nLive tool-smoke (#209) — ${title}\n`);
 	console.log(
@@ -2193,13 +2256,19 @@ function report(rows, title) {
 	}
 	const counts = { pass: 0, fail: 0, skip: 0, "setup-failed": 0 };
 	for (const r of rows) counts[r.state]++;
-	console.log(
-		`\n${counts.pass} passed · ${counts.fail} failed · ${counts["setup-failed"]} setup-failed · ${counts.skip} skipped (tool/config unavailable)`,
-	);
+	const summary = `${counts.pass} passed · ${counts.fail} failed · ${counts["setup-failed"]} setup-failed · ${counts.skip} skipped (tool/config unavailable)`;
+	const skippedOnly =
+		counts.pass === 0 &&
+		counts.fail === 0 &&
+		counts["setup-failed"] === 0 &&
+		counts.skip > 0;
+	console.log(`\n${skippedOnly ? "SKIPPED: " : ""}${summary}`);
 	console.log(
 		"Legend: ✓ ok  ✗ failure/setup-failed  ⚠ unavailable (not a failure)\n",
 	);
-	return counts.fail + counts["setup-failed"];
+	return failOnSkipOnly && skippedOnly
+		? 1
+		: counts.fail + counts["setup-failed"];
 }
 
 /**
@@ -2351,6 +2420,7 @@ export async function runLspGate({ langs = [], install, verbose, deps } = {}) {
 	const failures = report(
 		rows,
 		"LSP clean-gate (lsp_diagnostics primary findings)",
+		{ failOnSkipOnly: true },
 	);
 	console.log(formatGateCensus(population, rows, langs));
 	return failures;
@@ -2374,6 +2444,182 @@ export function formatGateCensus(population, rows, langs = []) {
 	const gated = rows.length - unavailable;
 	const handshakeOnly = scoped.length - rows.length;
 	return `LSP clean-gate census: gated ${gated} / handshake-only ${handshakeOnly} / unavailable ${unavailable}`;
+}
+
+/**
+ * Nightly `lens_diagnostics mode=full` row (#2780, recurrence #2776 shape).
+ * The clean gate above drives `lsp_diagnostics`; this drives
+ * `lens_diagnostics`, the tool agents call by default, over ONE cheap seeded
+ * fixture with `mode=full refreshRunners=cheap`. It requires a fresh
+ * LSP-sweep PRIMARY finding, so a divergence between the two handlers'
+ * verdict shaping reds the nightly. One row, not per server: the clean gate
+ * already owns the per-server provenance question.
+ */
+export async function runLensFull({ langs = [], install, verbose, deps } = {}) {
+	const lensToolEntry = path.join(
+		repoRoot,
+		"dist",
+		"tools",
+		"lens-diagnostics.js",
+	);
+	const configEntry = path.join(
+		repoRoot,
+		"dist",
+		"clients",
+		"lsp",
+		"config.js",
+	);
+	const cacheManagerEntry = path.join(
+		repoRoot,
+		"dist",
+		"clients",
+		"cache-manager.js",
+	);
+	if (
+		!deps &&
+		(!fs.existsSync(lensToolEntry) ||
+			!fs.existsSync(configEntry) ||
+			!fs.existsSync(cacheManagerEntry))
+	) {
+		console.error(
+			`dist build missing: ${lensToolEntry}\nRun \`npm run build:dist\` first.`,
+		);
+		process.exit(2);
+	}
+	let createLensDiagnosticsTool;
+	let initLSPConfig;
+	let CacheManager;
+	if (deps) {
+		({ createLensDiagnosticsTool, initLSPConfig, CacheManager } = deps);
+	} else {
+		({ createLensDiagnosticsTool } = await import(
+			pathToFileURL(lensToolEntry).href
+		));
+		({ initLSPConfig } = await import(pathToFileURL(configEntry).href));
+		({ CacheManager } = await import(pathToFileURL(cacheManagerEntry).href));
+	}
+	let ensureTool;
+	let getInstallAttempt;
+	if (deps) {
+		({ ensureTool, getInstallAttempt } = deps);
+	} else {
+		const installerEntry = path.join(
+			repoRoot,
+			"dist",
+			"clients",
+			"installer",
+			"index.js",
+		);
+		({ ensureTool, getInstallAttempt } = await import(
+			pathToFileURL(installerEntry).href
+		));
+	}
+	const population = deps?.population ?? lensFullPopulation();
+	const selected = population.filter(
+		(f) => !langs.length || langs.includes(f.lang),
+	);
+	if (selected.length === 0) {
+		console.log(
+			`No lens_diagnostics mode=full fixture matched: ${langs.join(", ")}`,
+		);
+		return 0;
+	}
+	const rows = [];
+	let handshakeCensus = {};
+	const censusPath = process.env.PI_LENS_HOME
+		? path.join(process.env.PI_LENS_HOME, "lsp-handshake-census.json")
+		: undefined;
+	if (censusPath && fs.existsSync(censusPath)) {
+		try {
+			handshakeCensus = JSON.parse(fs.readFileSync(censusPath, "utf8"));
+		} catch {
+			// A missing or malformed census cannot admit a row.
+		}
+	}
+	for (const fx of selected) {
+		await ensureFixtureTools(
+			fx.tools ?? [],
+			install
+				? ensureTool
+				: (toolId) => ensureTool(toolId, { allowInstall: false }),
+			getInstallAttempt,
+			(toolId, resolved) =>
+				verbose &&
+				console.error(
+					`[${fx.lang}] ensureTool(${toolId}) → ${resolved ?? "UNAVAILABLE"}`,
+				),
+		);
+		const handshakeUnavailable = handshakeCensus[fx.lang]?.state !== "pass";
+		if (handshakeUnavailable) {
+			rows.push({
+				lang: fx.lang,
+				runner: fx.serverHint,
+				state: "skip",
+				detail: `${fx.serverHint} unavailable (handshake did not complete)`,
+				diags: 0,
+			});
+			continue;
+		}
+		let workspace;
+		let absFile;
+		let cleanup;
+		try {
+			({ workspace, absFile, cleanup } = await (
+				deps?.bootstrapFixtureWorkspace ?? bootstrapFixtureWorkspace
+			)(fx, {
+				initLSPConfig,
+				repoRoot,
+				tmpPrefix: "pi-lens-smoke-lens-full-",
+			}));
+			if (fx.setup) {
+				const setupResult = runFixtureSetup(fx.setup, workspace, verbose);
+				if (!setupResult.ok) {
+					rows.push({
+						lang: fx.lang,
+						runner: fx.serverHint,
+						state: "setup-failed",
+						detail: setupResult.detail,
+						diags: 0,
+					});
+					continue;
+				}
+			}
+			const tool = createLensDiagnosticsTool(
+				new CacheManager(false),
+				() => workspace,
+			);
+			const result = await tool.execute(
+				`smoke-lens-full-${fx.lang}`,
+				{
+					mode: "full",
+					refreshRunners: "cheap",
+					paths: [absFile],
+				},
+				undefined,
+				null,
+				{ cwd: workspace },
+			);
+			const verdict = classifyLensFullResult(result, fx);
+			rows.push({ lang: fx.lang, runner: fx.serverHint, ...verdict });
+			if (verbose) console.error(`[${fx.lang}] ${verdict.detail}`);
+		} catch (err) {
+			rows.push({
+				lang: fx.lang,
+				runner: fx.serverHint,
+				state: "fail",
+				detail: `lens_diagnostics error: ${err?.message ?? err}`,
+				diags: 0,
+			});
+		} finally {
+			cleanup?.();
+		}
+	}
+	const failures = report(
+		rows,
+		"lens_diagnostics mode=full (LSP primary findings)",
+		{ failOnSkipOnly: true },
+	);
+	return failures;
 }
 
 /**
@@ -3044,6 +3290,7 @@ async function main() {
 		install,
 		lsp,
 		lspGate,
+		lensFull,
 		format,
 		autofix,
 		tier1,
@@ -3071,6 +3318,10 @@ async function main() {
 
 	if (lspGate) {
 		process.exit((await runLspGate({ langs, install, verbose })) > 0 ? 1 : 0);
+	}
+
+	if (lensFull) {
+		process.exit((await runLensFull({ langs, install, verbose })) > 0 ? 1 : 0);
 	}
 
 	if (format) {
@@ -3255,4 +3506,11 @@ if (invokedDirectly) {
 	});
 }
 
-export { AUTOFIX_FIXTURES, FIXTURES, FORMAT_FIXTURES, LSP_FIXTURES };
+export {
+	AUTOFIX_FIXTURES,
+	ensureSmokeLombokJar,
+	FIXTURES,
+	FORMAT_FIXTURES,
+	LSP_FIXTURES,
+	runFixtureSetup,
+};

@@ -16,7 +16,10 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { BoundedFifoMap } from "./bounded-cache.js";
 import { emitBounded } from "./bounded-telemetry.js";
-import { LEDGER_FIELD_MAX } from "./degradation-ledger.js";
+import {
+	LEDGER_FIELD_MAX,
+	recordDegradationOnce,
+} from "./degradation-ledger.js";
 import { minimatch } from "./deps/minimatch.js";
 import { createSubsystemLogger } from "./extension-log.js";
 import { detectFileKind, type FileKind } from "./file-kinds.js";
@@ -29,15 +32,20 @@ import {
 	detectPythonEnvironment,
 } from "./python-environment.js";
 import {
+	findNearestMarkerRootDetailed,
+	type MarkerRootResult,
+	isRealGitMarker,
 	isUnderDir,
 	normalizeEphemeralMapKey,
 	normalizeMapKey,
+	pathsEqual,
 	toPosix,
 } from "./path-utils.js";
 import { findNearestDirWithAnyBasename } from "./workspace-topology.js";
 import { isMeasuredDuration, toMeasuredDurationMs } from "./run-duration.js";
 import { safeSpawn, safeSpawnAsync } from "./safe-spawn.js";
 import { stripAnsi } from "./sanitize.js";
+import { resolveGitCheckout } from "./review-graph/git-identity.js";
 import { resolveToolCwd } from "./tool-cwd.js";
 
 // --- Types ---
@@ -71,6 +79,13 @@ export interface TestResult {
 	 */
 	duration?: number; // ms; absent = not measured
 	error?: string; // if runner itself failed
+	/**
+	 * Set when the run was deliberately not started (#3871 r2): the target's
+	 * checkout root has no install of its own for this runner, so running it
+	 * would fetch an unpinned tool or use the wrong environment. Not a pass and
+	 * not a failure; the turn-end consumer counts it and publishes nothing.
+	 */
+	notRun?: "no-runner-install";
 }
 
 /**
@@ -269,18 +284,139 @@ export const TURN_END_EXCLUDED_TEST_GLOBS: readonly string[] = [
 	"**/*.e2e.*",
 ];
 
+/** One hash-before-clipping record for both filesystem and ownership-walk gaps. */
+function recordCheckoutIdentityGap(
+	metadata: {
+		cwd: string;
+		candidate: string;
+		lookup: "filesystem" | "target-root" | "dispatch-root";
+		markerPath?: string;
+	} & (
+		| { detail: "realpath" | "marker-error"; errorCode: string | undefined }
+		| { detail: Extract<MarkerRootResult, { kind: "not-found" }>["reason"] }
+	),
+): void {
+	recordDegradationOnce({
+		kind: "test-checkout-identity-unavailable",
+		subject: createHash("sha256")
+			.update(JSON.stringify(metadata))
+			.digest("hex"),
+		reason: "cannot establish automatic test checkout identity",
+		metadata,
+	});
+}
+
+/** A positively identified foreign checkout, including targets reached via aliases. */
+function foreignGitRoot(testFilePath: string, cwd: string): string | null {
+	let realCwd: string;
+	let realTarget: string;
+	try {
+		// Both sides need filesystem identity. Walking the alias's lexical parents
+		// skips a Git boundary when a file or a directory below that root is linked.
+		realCwd = fs.realpathSync.native(path.resolve(cwd));
+		realTarget = fs.realpathSync.native(
+			path.resolve(cwd, toPosix(testFilePath)),
+		);
+	} catch (error_) {
+		// Missing/unreadable paths do not prove foreign ownership. The existing
+		// missing-target classifier and spawn checks retain their own decisions.
+		const errorCode = filesystemErrorCode(error_);
+		// A deleted or renamed target is ordinary and already reaches
+		// `retired-missing`; recording it would fill the ledger's per-kind cap
+		// and hide a real EACCES identity failure (#3691 F1).
+		if (errorCode === "ENOENT" || errorCode === "ENOTDIR") return null;
+		recordCheckoutIdentityGap({
+			cwd,
+			candidate: testFilePath,
+			lookup: "filesystem",
+			detail: "realpath",
+			errorCode,
+		});
+		return null;
+	}
+	const targetWalk = findNearestMarkerRootDetailed(
+		path.dirname(realTarget),
+		[".git"],
+		{
+			markerPredicate: (marker) => isRealGitMarker(marker, true),
+		},
+	);
+	if (targetWalk.kind !== "found") {
+		if (targetWalk.kind === "unavailable") {
+			recordCheckoutIdentityGap({
+				cwd,
+				candidate: testFilePath,
+				lookup: "target-root",
+				detail: "marker-error",
+				markerPath: targetWalk.markerPath,
+				errorCode: filesystemErrorCode(targetWalk.cause),
+			});
+		} else if (targetWalk.reason === "depth-limit") {
+			recordCheckoutIdentityGap({
+				cwd,
+				candidate: testFilePath,
+				lookup: "target-root",
+				detail: targetWalk.reason,
+			});
+		}
+		// Ordinary Gitless absence is not an incident. Error/cap uncertainty is
+		// disclosed, but neither may delete an otherwise usable own-checkout test.
+		return null;
+	}
+	const root = targetWalk.root;
+	// A root below or disjoint from cwd cannot own cwd, even if cwd is Gitless.
+	if (!isUnderDir(realCwd, root)) return root;
+	// A marker error on EITHER walk must not turn an enclosing root into proof
+	// of foreign ownership. In particular, do not retire cached failures on it.
+	const dispatchWalk = findNearestMarkerRootDetailed(realCwd, [".git"], {
+		markerPredicate: (marker) => isRealGitMarker(marker, true),
+	});
+	if (dispatchWalk.kind !== "found") {
+		recordCheckoutIdentityGap({
+			cwd,
+			candidate: testFilePath,
+			lookup: "dispatch-root",
+			...(dispatchWalk.kind === "unavailable"
+				? {
+						detail: "marker-error",
+						markerPath: dispatchWalk.markerPath,
+						errorCode: filesystemErrorCode(dispatchWalk.cause),
+					}
+				: { detail: dispatchWalk.reason }),
+		});
+		return null;
+	}
+	return !pathsEqual(root, dispatchWalk.root) ? root : null;
+}
+
 /**
- * Whether a resolved test target falls under the built-in turn-end
- * exclusion list (#2522). `testFilePath` may be absolute or relative, and
- * may use either path-separator form — folded through `toPosix` after being
- * made cwd-relative so `\`- and `/`-separated inputs match identically
- * (AGENTS.md cross-form-path screen).
+ * Whether the excluded checkout is another working tree of the dispatch root's
+ * own repository (a sibling linked worktree, #3871) rather than an unrelated
+ * repository: the one fact that tells a maintainer reading the record whether
+ * the exclusion is the #3649 crossover guard or a selection gap. Unresolvable
+ * on either side is `false`, never a guess.
+ */
+function sharesCommonDir(cwd: string, checkoutRoot: string): boolean {
+	const dispatch = resolveGitCheckout(cwd);
+	const excluded = resolveGitCheckout(checkoutRoot);
+	return (
+		dispatch !== null &&
+		excluded !== null &&
+		pathsEqual(dispatch.commonDir, excluded.commonDir)
+	);
+}
+
+/**
+ * Turn-end exclusion policy: out-of-tree files, foreign Git checkouts, and the
+ * built-in integration/e2e globs (#2522). Absolute and cwd-relative inputs
+ * share the same policy; explicit test execution does not use this gate.
  */
 export function isExcludedTestTarget(
 	testFilePath: string,
 	cwd: string,
 ): boolean {
-	const rel = toPosix(path.relative(cwd, path.resolve(cwd, testFilePath)));
+	const absolute = path.resolve(cwd, toPosix(testFilePath));
+	let rel = toPosix(path.relative(cwd, absolute));
 	// #2522 review round 2, F6: a target that resolves OUTSIDE the project root
 	// yields a `..`-leading relative path (or, across Windows drives, a still
 	// absolute one), which matches none of the globs — so the bare `some()`
@@ -292,8 +428,38 @@ export function isExcludedTestTarget(
 		rel === ".." ||
 		rel.startsWith("../") ||
 		path.isAbsolute(rel)
-	)
+	) {
+		// Different aliases can spell an in-tree target as lexically outside cwd.
+		const realTarget = canonicalFailedPath(absolute);
+		const realCwd = canonicalFailedPath(cwd);
+		if (pathsEqual(realTarget, realCwd) || !isUnderDir(realTarget, realCwd))
+			return true;
+		// R4: ../other-spelling/... cannot match the existing globs. Only this
+		// alias exception needs physical policy coordinates; display/cache keys
+		// and ordinary in-tree spelling semantics remain unchanged.
+		rel = toPosix(path.relative(realCwd, realTarget));
+	}
+	// A separate Git checkout remains foreign through an in-tree alias. Explicit
+	// execution does not use this policy, and keeps its original display spelling.
+	const checkoutRoot = foreignGitRoot(testFilePath, cwd);
+	if (checkoutRoot) {
+		// R6: self/deferred targets can reach this gate without discovery or
+		// failed-cache records, and the MCP caller's dbg is deliberately a no-op.
+		recordDegradationOnce({
+			kind: "test-target-foreign-checkout",
+			subject: createHash("sha256")
+				.update(JSON.stringify([cwd, testFilePath, checkoutRoot]))
+				.digest("hex"),
+			reason: "automatic test target belongs to another Git checkout",
+			metadata: {
+				cwd,
+				candidate: testFilePath,
+				checkoutRoot,
+				sameCommonDir: sharesCommonDir(cwd, checkoutRoot),
+			},
+		});
 		return true;
+	}
 	// #2522 review round 2, F5: case-INSENSITIVE. `tests/Integration/`,
 	// `tests/E2E/` and `foo.E2E.test.ts` are the same hazard as their lowercase
 	// spellings, and on the case-insensitive filesystems Windows and macOS ship
@@ -500,14 +666,34 @@ interface TestRunRequest {
 	 * ambient turn signal exactly as before.
 	 */
 	signal?: AbortSignal;
+	/**
+	 * #3871 r2: the directory failure locations are rendered relative to. The
+	 * dispatch root is the checkout that owns the test, but the reader is in the
+	 * session checkout, which may hold a file at the same relative path; a
+	 * worktree failure must read `.worktrees/x/tests/a.test.ts:12`. Absent
+	 * renders against the dispatch root, as before.
+	 */
+	displayRoot?: string;
+	/**
+	 * #3871 r2: refuse to start the run when this root has no install of its own
+	 * for the runner (resolution would reach `npx` or a bare interpreter). Set
+	 * for linked-worktree roots only; the session checkout keeps its fallbacks.
+	 */
+	requireOwnInstall?: boolean;
 }
 
 interface FailedTargetStateRecord {
-	outcome: "retired-missing" | "retained-indeterminate" | "capacity-evicted";
+	outcome:
+		| "retired-missing"
+		| "retained-indeterminate"
+		| "capacity-evicted"
+		| "rejected-nested-checkout"
+		| "retired-nested-checkout";
 	runner: string;
 	candidate: string;
 	errorCode?: string;
-	turnIndex?: number;
+	/** Every writer supplies this; explicit runs may have no turn context. */
+	turnIndex: number | undefined;
 }
 
 interface FailedTargetEntry {
@@ -1018,6 +1204,7 @@ export class TestRunnerClient {
 		pattern: string,
 		basename: string,
 		maxDepth: number,
+		acceptCandidate: (testFile: string) => boolean,
 	): string | null {
 		const queue: Array<{ dir: string; depth: number }> = [
 			{ dir: rootDir, depth: 0 },
@@ -1039,10 +1226,11 @@ export class TestRunnerClient {
 				const fullPath = path.join(dir, entry.name);
 				if (entry.isFile()) {
 					if (
-						entry.name === pattern ||
-						(entry.name.startsWith("test_") &&
-							entry.name.endsWith(".py") &&
-							entry.name.includes(basename))
+						(entry.name === pattern ||
+							(entry.name.startsWith("test_") &&
+								entry.name.endsWith(".py") &&
+								entry.name.includes(basename))) &&
+						acceptCandidate(fullPath)
 					) {
 						return fullPath;
 					}
@@ -1288,12 +1476,15 @@ export class TestRunnerClient {
 
 	/**
 	 * Find test file for a given source file
-	 * Returns the test file path if it exists, null otherwise
+	 * Returns the test file path if it exists, null otherwise.
+	 * Automatic selection supplies eligibility before each first-match return;
+	 * ordinary discovery, existence checks, and suggestions remain unfiltered.
 	 */
 	findTestFile(
 		sourceFilePath: string,
 		cwd: string,
 		runnerOverride?: string,
+		acceptCandidate: (testFile: string) => boolean = () => true,
 	): { testFile: string; runner: string } | null {
 		const ext = path.extname(sourceFilePath);
 		const basename = path.basename(sourceFilePath, ext);
@@ -1339,10 +1530,11 @@ export class TestRunnerClient {
 
 					const match = files.find(
 						(f) =>
-							f === pattern ||
-							(f.startsWith("test_") &&
-								f.endsWith(".py") &&
-								f.includes(basename)),
+							(f === pattern ||
+								(f.startsWith("test_") &&
+									f.endsWith(".py") &&
+									f.includes(basename))) &&
+							acceptCandidate(path.join(searchDir, f)),
 					);
 					if (match) {
 						const testPath = path.join(searchDir, match);
@@ -1364,6 +1556,7 @@ export class TestRunnerClient {
 						pattern,
 						basename,
 						MAX_PYTEST_RECURSE_DEPTH,
+						acceptCandidate,
 					);
 					if (recursiveMatch) {
 						this.log(`Found test file (recursive): ${recursiveMatch}`);
@@ -1394,7 +1587,7 @@ export class TestRunnerClient {
 				];
 
 				for (const testPath of searchPaths) {
-					if (fs.existsSync(testPath)) {
+					if (fs.existsSync(testPath) && acceptCandidate(testPath)) {
 						this.log(`Found test file: ${testPath}`);
 						return { testFile: testPath, runner: detected.runner };
 					}
@@ -1403,7 +1596,11 @@ export class TestRunnerClient {
 		}
 
 		// Basename lookup found nothing — try import scanning as a fallback.
-		const importMatch = this.findTestFileByImport(sourceFilePath, cwd);
+		const importMatch = this.findTestFileByImport(
+			sourceFilePath,
+			cwd,
+			acceptCandidate,
+		);
 		if (importMatch) {
 			return { testFile: importMatch, runner: detected.runner };
 		}
@@ -1440,10 +1637,22 @@ export class TestRunnerClient {
 		const selfIsTest = this.isTestFile(sourceFilePath, cwd, detected.runner);
 		const related = selfIsTest
 			? null
-			: this.findTestFile(sourceFilePath, cwd, detected.runner);
+			: this.findTestFile(sourceFilePath, cwd, detected.runner, (candidate) => {
+					const checkoutRoot = foreignGitRoot(candidate, cwd);
+					if (!checkoutRoot) return true;
+					recordDegradationOnce({
+						kind: "test-discovery-foreign-checkout",
+						subject: createHash("sha256")
+							.update(JSON.stringify([cwd, candidate, checkoutRoot]))
+							.digest("hex"),
+						reason: "automatic test candidate belongs to another Git checkout",
+						metadata: { cwd, candidate, checkoutRoot, runner: detected.runner },
+					});
+					return false;
+				});
 
 		if (failedSet && failedSet.size > 0) {
-			const failedFirst = this.retireMissingFailedTargets({
+			const failedFirst = this.retireIneligibleFailedTargets({
 				cwd,
 				runner: detected.runner,
 				failedTargets: failedSet,
@@ -1548,7 +1757,14 @@ export class TestRunnerClient {
 		} else {
 			request = runnerOrRequest;
 		}
-		const { runner, config, turnIndex, signal } = request;
+		const {
+			runner,
+			config,
+			turnIndex,
+			signal,
+			displayRoot,
+			requireOwnInstall,
+		} = request;
 		if (!fs.existsSync(absoluteTestFile)) {
 			return this.emptyResult(
 				absoluteTestFile,
@@ -1563,13 +1779,19 @@ export class TestRunnerClient {
 				cwd: path.resolve(cwd),
 				rootMarkers: config.spawnCwdMarkers ?? config.configFiles,
 			}).cwd;
-			const { command, args, env } = await this.resolveExec(
+			const { command, args, env, ownInstall } = await this.resolveExec(
 				runner,
 				config,
 				absoluteTestFile,
 				cwd,
 				spawnCwd,
 			);
+			if (requireOwnInstall && !ownInstall) {
+				return {
+					...this.emptyResult(absoluteTestFile, "", runner),
+					notRun: "no-runner-install",
+				};
+			}
 			this.log(
 				`Running (async): ${command} ${args.join(" ")} (cwd ${spawnCwd})`,
 			);
@@ -1603,7 +1825,7 @@ export class TestRunnerClient {
 						stdout,
 						stderr,
 						absoluteTestFile,
-						cwd,
+						displayRoot ?? cwd,
 						runner,
 					);
 					break;
@@ -1612,7 +1834,7 @@ export class TestRunnerClient {
 						stdout,
 						stderr,
 						absoluteTestFile,
-						cwd,
+						displayRoot ?? cwd,
 						runner,
 					);
 					break;
@@ -1792,12 +2014,12 @@ export class TestRunnerClient {
 	}
 
 	/**
-	 * Retire only confirmed-missing failed-first paths, then return one usable
-	 * target. A bounded prefix is checked per selection; remaining candidates
+	 * Retire confirmed-missing or foreign-checkout failed-first entries, then
+	 * return one usable target. A bounded prefix is checked; remaining candidates
 	 * carry over to the next selection instead of adding unbounded synchronous
 	 * filesystem work to turn_end. Related/self targets keep priority.
 	 */
-	private retireMissingFailedTargets(
+	private retireIneligibleFailedTargets(
 		selection: FailedTargetSelection,
 	): string | undefined {
 		const { cwd, runner, failedTargets, relatedAbs, selfAbs, turnIndex } =
@@ -1812,6 +2034,18 @@ export class TestRunnerClient {
 			checked += 1;
 			inspected.add(identity);
 			const candidate = entry.displayPath;
+			// A Git boundary can appear after admission. Retire here, before
+			// selection, so the turn-end spawn gate cannot starve parent failures.
+			if (foreignGitRoot(candidate, cwd)) {
+				failedTargets.delete(identity);
+				this.recordFailedTargetState({
+					outcome: "retired-nested-checkout",
+					runner,
+					candidate,
+					turnIndex,
+				});
+				return undefined;
+			}
 			const verdict = this.classifyFailedTarget(candidate);
 			if (verdict.status === "missing") {
 				failedTargets.delete(identity);
@@ -2994,6 +3228,7 @@ export class TestRunnerClient {
 	private findTestFileByImport(
 		sourceFilePath: string,
 		cwd: string,
+		acceptCandidate: (testFile: string) => boolean,
 	): string | null {
 		const ext = path.extname(sourceFilePath);
 		const basename = path.basename(sourceFilePath, ext);
@@ -3013,8 +3248,8 @@ export class TestRunnerClient {
 				continue;
 			}
 			for (const entry of entries) {
-				if (!testPattern.test(entry)) continue;
 				const testPath = path.join(dir, entry);
+				if (!testPattern.test(entry) || !acceptCandidate(testPath)) continue;
 				let content: string;
 				try {
 					content = fs.readFileSync(testPath, "utf-8");
@@ -3063,7 +3298,20 @@ export class TestRunnerClient {
 		 * Defaults to `cwd`, which is every call where the two are the same.
 		 */
 		spawnCwd: string = cwd,
-	): Promise<{ command: string; args: string[]; env?: NodeJS.ProcessEnv }> {
+	): Promise<{
+		command: string;
+		args: string[];
+		env?: NodeJS.ProcessEnv;
+		/**
+		 * #3871 r2: false when resolution reached a fallback that needs no
+		 * install under `cwd` because it fetches (`npx`) or borrows (a bare
+		 * interpreter or `phpunit` on PATH) the tool. Toolchain runners
+		 * (`go`, `cargo`, ...) have no per-project install and are always own.
+		 */
+		ownInstall: boolean;
+	}> {
+		const needsInstall =
+			config.command === "npx" || runner === "pytest" || runner === "phpunit";
 		// Run pytest through the project interpreter itself, not a generic `python`
 		// resolved from the host PATH. The child-only environment also keeps tools
 		// spawned by tests inside the same project environment.
@@ -3074,6 +3322,7 @@ export class TestRunnerClient {
 					command: pythonEnvironment.pythonPath,
 					args: config.args(testFile, spawnCwd),
 					env: augmentPythonEnvironment(process.env, pythonEnvironment),
+					ownInstall: true,
 				};
 			}
 		}
@@ -3085,9 +3334,17 @@ export class TestRunnerClient {
 			const suffix = process.platform === "win32" ? ".bat" : "";
 			const vendorBin = path.join(cwd, "vendor", "bin", `phpunit${suffix}`);
 			if (fs.existsSync(vendorBin)) {
-				return { command: vendorBin, args: config.args(testFile, spawnCwd) };
+				return {
+					command: vendorBin,
+					args: config.args(testFile, spawnCwd),
+					ownInstall: true,
+				};
 			}
-			return { command: "phpunit", args: config.args(testFile, spawnCwd) };
+			return {
+				command: "phpunit",
+				args: config.args(testFile, spawnCwd),
+				ownInstall: false,
+			};
 		}
 
 		const binName = config.binName ?? runner;
@@ -3101,6 +3358,7 @@ export class TestRunnerClient {
 			return {
 				command: localBin,
 				args: stripWrapperArgs(binName, config.args(testFile, spawnCwd)),
+				ownInstall: true,
 			};
 		}
 
@@ -3110,10 +3368,15 @@ export class TestRunnerClient {
 			return {
 				command: globalBin,
 				args: stripWrapperArgs(binName, config.args(testFile, spawnCwd)),
+				ownInstall: !needsInstall,
 			};
 		}
 
-		return { command: config.command, args: config.args(testFile, spawnCwd) };
+		return {
+			command: config.command,
+			args: config.args(testFile, spawnCwd),
+			ownInstall: !needsInstall,
+		};
 	}
 
 	private emptyResult(
@@ -3146,6 +3409,17 @@ export class TestRunnerClient {
 	private recordResult(record: TestResultRecord): void {
 		const { cwd, runner, testFile, result, turnIndex } = record;
 		const targetPath = path.resolve(testFile);
+		// Explicit execution still returns the failure, but a separate checkout
+		// must not seed the parent's automatic retry state or evict its failures.
+		if (result.failed > 0 && foreignGitRoot(targetPath, cwd)) {
+			this.recordFailedTargetState({
+				outcome: "rejected-nested-checkout",
+				runner,
+				candidate: targetPath,
+				turnIndex,
+			});
+			return;
+		}
 		const target = canonicalFailedPath(targetPath);
 		let failedTargets = this.getFailedTargets(cwd, runner, result.failed > 0);
 		if (!failedTargets) return;

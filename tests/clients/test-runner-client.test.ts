@@ -3070,6 +3070,43 @@ describe("#2522 — turn-end selection excludes integration/e2e test targets", (
 		});
 	});
 
+	it("does not auto-fire a self target from a nested Git worktree", () => {
+		// A direct edit in a nested checkout still reaches the final turn-end
+		// gate, independently of the failed-first cache admission/retirement.
+		const { tmpDir, cleanup } = setupTestEnvironment(
+			"pi-lens-nested-worktree-",
+		);
+		exclusionCleanups.push(cleanup);
+		fs.mkdirSync(path.join(tmpDir, ".git"));
+		fs.writeFileSync(
+			path.join(tmpDir, ".git", "HEAD"),
+			"ref: refs/heads/main\n",
+		);
+		fs.writeFileSync(path.join(tmpDir, "go.mod"), "module example.com/main\n");
+		const nestedRoot = path.join(tmpDir, ".worktrees", "other");
+		fs.mkdirSync(nestedRoot, { recursive: true });
+		fs.writeFileSync(
+			path.join(nestedRoot, ".git"),
+			"gitdir: /git/worktrees/other\n",
+		);
+		const nestedTest = path.join(nestedRoot, "tests", "other_test.go");
+		fs.mkdirSync(path.dirname(nestedTest));
+		fs.writeFileSync(nestedTest, "package main\n");
+		const ordinaryTest = path.join(tmpDir, "tests", "main_test.go");
+		fs.mkdirSync(path.dirname(ordinaryTest));
+		fs.writeFileSync(ordinaryTest, "package main\n");
+
+		const client = new TestRunnerClient(false);
+		const target = client.getTestRunTarget(nestedTest, tmpDir);
+		expect(target).toMatchObject({
+			testFile: nestedTest,
+			strategy: "self",
+		});
+		expect(isExcludedTestTarget(target!.testFile, tmpDir)).toBe(true);
+		expect(isExcludedTestTarget(ordinaryTest, tmpDir)).toBe(false);
+		expect(isExcludedTestTarget(nestedTest, nestedRoot)).toBe(false);
+	});
+
 	it("a real self-strategy match under tests/integration/ is reported as excluded by the real getTestRunTarget resolution", () => {
 		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-2522-");
 		exclusionCleanups.push(cleanup);

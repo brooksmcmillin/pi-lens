@@ -398,13 +398,13 @@ export function createVenvFinder(
 	command: string,
 	windowsExt = "",
 	verificationArgs: string[] = ["--version"],
-): (cwd: string) => Promise<string> {
-	return async (cwd: string): Promise<string> => {
+): (cwd: string) => Promise<VenvResolution> {
+	return async (cwd: string): Promise<VenvResolution> => {
 		const venvBin = findLocalBinAt(command, cwd, {
 			windowsExt,
 			binDirs: VENV_BIN_DIRS,
 		});
-		if (venvBin) return venvBin;
+		if (venvBin) return { path: venvBin, rung: "venv" };
 
 		// Managed-dir install (~/.pi-lens/tools/node_modules/.bin/<command>) — the
 		// same shim `ensureTool()` installs npm-strategy tools into. Checked BEFORE
@@ -417,16 +417,16 @@ export function createVenvFinder(
 		// session, so a shim that cannot run falls through to PATH instead of
 		// shadowing a working binary (#1657).
 		const managed = await findManagedNodeToolBinary(command, verificationArgs);
-		if (managed) return managed;
+		if (managed) return { path: managed, rung: "managed-dir" };
 
 		// Release-managed install (`~/.pi-lens/bin/<command>`) — where `ensureTool`
 		// puts every github/maven/archive-strategy tool. Same rung, same reason as
 		// the npm shim above, for the other half of the managed families (#2140).
 		const release = await findManagedReleaseBinary(command, verificationArgs);
-		if (release) return release;
+		if (release) return { path: release, rung: "managed-release" };
 
 		// Fall back to global
-		return command;
+		return { path: command, rung: "path" };
 	};
 }
 
@@ -742,41 +742,38 @@ function sourceTagForToolId(toolId: string): ProbeEvidence["source"] {
 	}
 }
 
+/** Which rung in `createVenvFinder` supplied the command for this probe. */
+type VenvResolution = {
+	path: string;
+	rung: "venv" | "managed-dir" | "managed-release" | "path";
+};
+
 /**
- * `binary`/`source` for a probe that resolved through one of pi-lens's OWN
- * managed installs rather than through PATH or a project venv (#2140). A reader
- * of latency.log could otherwise not tell the two apart, and the whole point of
- * the fix is that the managed directories now answer where PATH used to miss.
- *
- * BOTH managed rungs are asked, in the order `createVenvFinder` walks them
- * (#2140 review F1). The first version asked only about the release directory,
- * so every npm-shim hit — knip, jscpd, madge, pyright, biome, htmlhint,
- * stylelint — logged an evidence-free row indistinguishable from a PATH hit,
- * while the doc claimed the opposite. Each rung is asked of THE function that
- * produced its own paths (`managedNodeToolCandidates`, `findManagedToolBinary`)
- * and settled by string identity, never by a path-prefix predicate over a
- * directory: a second opinion about which paths are managed is exactly the
- * parallel-list drift `sourceTagForToolId` exists to avoid, and it would answer
- * differently for case or separator variants.
+ * Add managed-binary evidence from the exact rung that resolved the command
+ * (#2140, #2660). Re-checking the installer here repeated the resolution and
+ * could disagree with the answer the probe actually launched.
  *
  * `binary` present IS the managed hit; `source` names the family whenever the
  * command is a registry id (`sourceTagForToolId` reads the registry's own
  * `installStrategy`). A managed shim whose COMMAND is not itself a registry id
  * — `markdownlint-cli2`, installed under registry id `markdownlint` — carries
- * `binary` alone rather than a guessed family. `binary` is a BASENAME, never
- * the absolute path — same rule as every other evidence field (#1568 review).
+ * `binary` alone rather than a guessed family. Venv and PATH answers have no
+ * managed-binary evidence. `binary` is a BASENAME, never an absolute path
+ * (#1568 review).
  */
-async function describeManagedResolution(
+function describeManagedResolution(
 	tool: string,
-	resolved: string,
-): Promise<ProbeEvidence> {
-	const managed =
-		managedNodeToolCandidates(tool).includes(resolved) ||
-		(await findManagedToolBinary(tool)) === resolved;
-	if (!managed) return {};
+	resolution: VenvResolution,
+): ProbeEvidence {
+	if (
+		resolution.rung !== "managed-dir" &&
+		resolution.rung !== "managed-release"
+	) {
+		return {};
+	}
 	const source = sourceTagForToolId(tool);
 	return {
-		binary: path.basename(resolved),
+		binary: path.basename(resolution.path),
 		...(source !== undefined && { source }),
 	};
 }
@@ -1141,7 +1138,8 @@ export function createAvailabilityChecker(
 			// `durationMs` would instead charge the probe budget for work that
 			// budget does not govern, so the two spans are reported side by side.
 			const resolveStartedAt = Date.now();
-			const cmd = await findCommand(resolvedCwd);
+			const resolution = await findCommand(resolvedCwd);
+			const cmd = resolution.path;
 			const resolveMs = Date.now() - resolveStartedAt;
 			// #1995: a command cooling down after a RUNTIME timeout (lint or
 			// autofix lane blew its real budget) must not re-probe on every
@@ -1209,7 +1207,7 @@ export function createAvailabilityChecker(
 					classifiedBy: probeJoined ? "joined" : "probe",
 					evidence: {
 						...describeProbeEvidence(result),
-						...(await describeManagedResolution(command, cmd)),
+						...describeManagedResolution(command, resolution),
 						resolveMs,
 					},
 				});

@@ -395,6 +395,7 @@ export async function extractForwardImportPaths(
 		languageId,
 		content,
 		(tree) => extractor.extract(tree, filePath, content).imports,
+		"blocker-freshness",
 	);
 	if (!outcome.parsed) return [];
 

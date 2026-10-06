@@ -57,6 +57,9 @@ export interface LspFixture {
 	/** Why this gate-eligible fixture cannot opt in (#3217). Mutually exclusive
 	 *  with `lspGate`; the reason is asserted, not just the key's presence. */
 	lspGateExempt?: string;
+	/** The one fixture the nightly `lens_diagnostics mode=full` row drives
+	 *  (#2780), mirroring `lspGate`. */
+	lensFull?: boolean;
 	lombokJar?: boolean;
 	expectNoMessageMatch?: string;
 	/** A diagnostic message that MUST arrive. The lane's default verdict passes
@@ -157,10 +160,34 @@ export function runLspGate(options?: {
 	verbose?: boolean;
 	deps?: unknown;
 }): Promise<number>;
+/** The fixtures the nightly `lens_diagnostics mode=full` row drives (#2780). */
+export function lensFullPopulation(fixtures?: LspFixture[]): LspFixture[];
+/** Classify one real `lens_diagnostics mode=full` LSP-primary-finding result. */
+export function classifyLensFullResult(
+	result: unknown,
+	fixture: Pick<LspFixture, "serverHint">,
+): { state: "pass" | "fail"; detail: string; diags: number };
+/** Run the nightly `lens_diagnostics mode=full` row, optionally with test seams. */
+export function runLensFull(options?: {
+	langs?: string[];
+	install?: boolean;
+	verbose?: boolean;
+	deps?: unknown;
+}): Promise<number>;
 /** One reported row from a smoke lane, as far as the pass floor is concerned. */
 export interface SmokeRow {
+	lang?: string;
+	runner?: string;
 	state: "pass" | "fail" | "skip" | "setup-failed";
+	detail?: string;
+	diags?: number;
 }
+/** Render a smoke lane report and return its failure count. */
+export function report(
+	rows: SmokeRow[],
+	title: string,
+	options?: { failOnSkipOnly?: boolean },
+): number;
 /**
  * The message for a run that passed fewer than `minPass` rows, or null when the
  * floor holds. Exported so the floor is testable without a live tool install.
@@ -299,3 +326,15 @@ export const LSP_FIXTURES: LspFixture[];
 export const LSP_DIAGNOSTICS_WAIT_MS: number;
 export const FORMAT_FIXTURES: FormatFixture[];
 export const AUTOFIX_FIXTURES: AutofixFixture[];
+
+/** Run a fixture's `setup` step in its copied workspace (#530); bounded. */
+export function runFixtureSetup(
+	setup: string | string[],
+	cwd: string,
+	verbose: boolean,
+): { ok: boolean; detail?: string };
+/** Copy the cached lombok.jar into a fixture workspace, downloading it once. */
+export function ensureSmokeLombokJar(
+	workspace: string,
+	verbose: boolean,
+): Promise<string>;
