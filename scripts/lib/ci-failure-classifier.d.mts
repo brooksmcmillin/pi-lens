@@ -37,6 +37,10 @@ export interface ClassifierDecision {
 
 /** Network-shaped failure needles shared with scripts/npm-retry.mjs (#2684). */
 export declare const NET_PATTERN: RegExp;
+export declare const BARE_FAIL_LINE: RegExp;
+export declare const ASSERTION_LINE: RegExp;
+export declare function stripAnsi(text: string): string;
+export declare function stripLineTimestamps(text: string): string;
 export declare function classifyFailureLog(rawLog: string): Classification;
 export declare function readCgroupOomKillCount(log: string): number | null;
 export declare function describeKernelKillEvidence(log: string): string | null;
@@ -91,7 +95,12 @@ export type SuccessfulClassifierRun = ClassifierDecision & {
 	jobName: string;
 	supersededByCommentId?: number;
 };
-export type SkippedClassifierRun = { skipped: true; reason: string };
+export type SkippedClassifierRun = {
+	skipped: true;
+	reason: string;
+	advisoryOnly?: true;
+};
+export declare const ADVISORY_ONLY_MARKER: string;
 export declare function runClassifier(
 	args: RunClassifierArgs & { skipMissingJob?: false },
 ): Promise<SuccessfulClassifierRun>;

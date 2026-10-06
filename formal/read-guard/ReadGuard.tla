@@ -1,10 +1,11 @@
 ------------------------------ MODULE ReadGuard ------------------------------
 (***************************************************************************)
-(* The read-before-edit guard (clients/read-guard.ts) for one file F, seen *)
+(* The read-before-edit guard (clients/read-guard.ts checkEdit) for one    *)
+(* file F, seen                                                            *)
 (* from a POSITIONAL edit tool (oldRange / edits[].range / hashline): the  *)
 (* class of edit the guard fully enforces. An oldText edit is content-     *)
 (* validated by the host and skips FileTime, snapshot and (as a block)     *)
-(* coverage (runtime-tool-call.ts ~1545 skipSnapshotCheck/oldTextResolved),*)
+(* coverage (runtime-tool-call.ts skipSnapshotCheck/oldTextResolved),      *)
 (* so it is out of scope.                                                  *)
 (*                                                                         *)
 (* A file is a sequence of line tokens. Every write mints fresh tokens, so *)
@@ -13,32 +14,40 @@
 (*                                                                         *)
 (* Actors:                                                                 *)
 (*  - the agent (one tool at a time; pi awaits each handler):              *)
-(*      read   : tool_call provisional record (runtime-tool-call.ts ~1017, *)
+(*      read   : tool_call provisional record (runtime-tool-call.ts,       *)
 (*               hashes + FileTime taken at tool_call), host read, then    *)
-(*               the tool_result record (runtime-tool-result.ts ~1797)     *)
+(*               the tool_result record (runtime-tool-result.ts            *)
+(*               handleToolResult)                                         *)
 (*               that supersedes it (from the delivered bytes when the     *)
 (*               file moved after the tool_call's stamp, #3524);           *)
 (*      edit   : positional edit of 1 or 2 lines; checkEdit at tool_call   *)
-(*               (runtime-tool-call.ts ~1543), optional relocation (~1560) *)
+(*               (runtime-tool-call.ts handleToolCall), optional           *)
+(*               relocation                                                *)
 (*               then host apply, then recordWritten at tool_result        *)
-(*               (runtime-tool-result.ts ~2305), with the written lines    *)
-(*               recorded as read when not relocated (#3523, ~2254);       *)
-(*      write  : noteCreatedFile at tool_call (~1123), host write,         *)
-(*               recordWritten (injects the creation read, read-guard.ts   *)
-(*               ~1305-1331), the turn's first write runs the immediate    *)
-(*               autofix (pipeline.ts ~1527), recordWritten again          *)
-(*               (runtime-tool-result.ts ~1083-1094), and the post-fix     *)
-(*               bytes are attached as "authoritative" (~2814) and         *)
-(*               recorded as a whole-file read (#3519, ~2874).             *)
+(*               (runtime-tool-result.ts handleToolResult), with the       *)
+(*               written lines                                             *)
+(*               recorded as read when not relocated (#3523);              *)
+(*      write  : noteCreatedFile at tool_call, host write,                 *)
+(*               recordWritten (injects the creation read,                 *)
+(*               read-guard.ts).                                           *)
+(*               The turn's first write runs the immediate                 *)
+(*               autofix (pipeline.ts runAutofix), recordWritten again     *)
+(*               (runtime-tool-result.ts handleToolResult), and the        *)
+(*               post-fix                                                  *)
+(*               bytes are attached as "authoritative" and                 *)
+(*               recorded as a whole-file read (#3519).                    *)
 (*  - another writer (external editor, second pi-lens instance, git):      *)
 (*    changes F between any two steps.                                     *)
-(*  - pi-lens' deferred agent_end format drain (runtime-agent-end.ts ~710):*)
-(*    rewrites F, then recordWritten.                                      *)
+(*  - pi-lens' deferred agent_end format drain (runtime-agent-end.ts       *)
+(*  handleAgentEnd):                                                       *)
+(*    rewrites F, then recordWritten: authorship only since #3525, which   *)
+(*    leaves FileTime where it was (FormatStamp).                          *)
 (*  - boundaries: user turn (kTurn = what the agent knew before the        *)
-(*    prompt), /new (fresh guard), /fork (fresh guard + importState of the *)
-(*    parent's read-set, index.ts ~2510-2525; the conversation restarts    *)
-(*    BEFORE a chosen user message), /tree (conversation moves, guard      *)
-(*    untouched: no pi-lens handler).                                      *)
+(*    prompt), /new (fresh guard), /fork (the conversation restarts BEFORE *)
+(*    a chosen user message) and /tree (the conversation moves). Since     *)
+(*    #3521 both keep exactly the records whose tool result is on the new  *)
+(*    branch (BranchFilter); before it, /fork imported nothing and /tree   *)
+(*    left the guard untouched.                                            *)
 (*                                                                         *)
 (* The agent's knowledge `know` is what the conversation shows it: read    *)
 (* results, its own edits and writes, the authoritative attachment.        *)
@@ -62,19 +71,28 @@ CONSTANTS
     Ctx,            \* contextLines (DEFAULT_CONFIG: 3)
     \* ---- current-code switches ----
     HandlerEvidence,\* TRUE (pre-#3524 code): a native read's hashes, range and FileTime come from disk at tool_result
-    CreationHandlerEvidence, \* TRUE (code): the injected creation read is hashed from disk at tool_result
+    CreationHandlerEvidence, \* TRUE (code before #3524's remainder): the injected creation read is hashed from disk at tool_result
     MtimeAuthored,  \* TRUE (code): zero-read allow when mtime >= guard construction
-    OwnEditRescue,  \* TRUE (code): canTreatStalenessAsOwnPriorEdit
-    ForkImport,     \* TRUE (code): a fork imports the parent's whole read-set
-    SuppressByNewerContext, \* TRUE (code): a newer context-only candidate cancels a snapshot mismatch
-    FormatStamp,    \* TRUE (code): the agent_end format drain calls recordWritten
+    OwnEditRescue,  \* TRUE (code before #3525): canTreatStalenessAsOwnPriorEdit
+    ForkImport,     \* FALSE (code before #3521): pi re-runs the factory for a fork, so the closure stash died and the fork imported nothing
+    SuppressByNewerContext, \* TRUE (code before #3522): a newer context-only candidate cancels a snapshot mismatch; read only when SpanSnapshot = FALSE
+    FormatStamp,    \* TRUE (code before #3525): the agent_end format drain's recordWritten also stamps FileTime
+                    \* (FALSE: it credits authorship, `written`, only)
     \* ---- candidate fixes ----
     RecordAuthoritative, \* record the attached post-autofix bytes as a full read (code since #3519)
     RecordOwnEdit,       \* record the lines an allowed positional edit wrote as read (code since #3523)
     OwnEditSkipsReloc,   \* TRUE (code): ... but not when the edit was relocated
-    SpanSnapshot,        \* check each line of the range against the newest read that delivered it
-    RelocFromLatest,     \* relocate only from a read that is the agent's latest view of every line
+    SpanSnapshot,        \* TRUE (code since #3522): check each line of the range against the newest read that delivered it
+    RelocFromLatest,     \* TRUE (code since #3522): relocate only from a read that is the agent's latest view of every line
+    WholeVouchesPastEnd, \* FALSE (code): a whole-file view also vouches that lines past its end do not exist (#3522 part 3; no invariant needs it)
     ForkAtBoundary,      \* fork/tree: forget reads made after the fork point
+    BranchFilter,        \* TRUE (code since #3521): fork/tree keep the branch's records whole, clear FileTime, written, pendCreate and the own-edit rescue, and re-anchor born
+    DrainMode,           \* "atomic": the format drain runs inside Turn (no /tree can interleave);
+                         \* "unfenced": it is queued at settle and may land after a /tree (code before #3521 round 2);
+                         \* "settle": the same, and its recordWritten is refused once a /tree moved the branch
+                         \*   since the settle that dequeued it (#3521 round 2);
+                         \* "fenced": the refusal is against the epoch the work was queued with, which a
+                         \*   Requeue keeps (code since #3521 round 3)
     \* ---- existing guards (FALSE = mutant with the guard removed) ----
     FileTimeCheck, CoverageCheck, SnapshotCheck
 
@@ -104,13 +122,15 @@ VARIABLES
     know, kTurn,                \* agent knowledge; knowledge before the current prompt
     reads, ft, written, pendCreate, lastEditOk, born, turnNo,  \* guard state
     pc, pend, ops, ext, nb, fixedTurn, mutatedTurn,
+    dr,                         \* settle drain: queued (q), branch epoch it carries (ep), current epoch (cur),
+                                \* work put back by an aborted or failed drain (rq)
     staleAllow, blindAllow, falseBlock  \* ghost verdict flags
 
 vars == <<disk, rev, tok, know, kTurn, reads, ft, written, pendCreate, lastEditOk,
-          born, turnNo, pc, pend, ops, ext, nb, fixedTurn, mutatedTurn,
+          born, turnNo, pc, pend, ops, ext, nb, fixedTurn, mutatedTurn, dr,
           staleAllow, blindAllow, falseBlock>>
 
-guardVars == <<reads, ft, written, pendCreate, lastEditOk, born, turnNo>>
+guardVars == <<reads, ft, written, pendCreate, lastEditOk, born, turnNo, dr>>
 
 \* g = turn the record was made in (ReadRecord.turnIndex); whole = whole-file view.
 Rec(lo, hi, h, prov) == [lo |-> lo, hi |-> hi, h |-> h, prov |-> prov, g |-> turnNo, whole |-> FALSE]
@@ -122,6 +142,7 @@ Init ==
     /\ lastEditOk = FALSE /\ born = 0 /\ turnNo = 0
     /\ pc = "idle" /\ pend = [k |-> "none"] /\ ops = 0 /\ ext = 0 /\ nb = 0
     /\ fixedTurn = FALSE /\ mutatedTurn = FALSE
+    /\ dr = [q |-> FALSE, ep |-> 0, cur |-> 0, rq |-> FALSE]
     /\ staleAllow = FALSE /\ blindAllow = FALSE /\ falseBlock = FALSE
 
 KnowAll(c) == [l \in Lines |-> IF l <= Len(c) THEN c[l] ELSE 0]
@@ -131,9 +152,9 @@ KnowAll(c) == [l \in Lines |-> IF l <= Len(c) THEN c[l] ELSE 0]
 AddRec(S, r, whole) == Append(S, [r EXCEPT !.whole = whole])
 
 ----------------------------------------------------------------------------
-\* Guard predicates (read-guard.ts). Record order in `reads` is timestamp order.
+\* Guard predicates (read-guard.ts checkEdit). Record order in `reads` is timestamp order.
 Max(a, b) == IF a > b THEN a ELSE b
-\* readCoversRange (~1600): the effective range widened by contextLines.
+\* readCoversRange: the effective range widened by contextLines.
 CtxCovers(r, lo, hi) == Max(1, r.lo - Ctx) <= lo /\ hi <= r.hi + Ctx
 EffCovers(r, lo, hi) == r.lo <= lo /\ hi <= r.hi
 HashesMatch(r, lo, hi) ==                                       \* readRangeHashesStillMatch
@@ -144,18 +165,18 @@ AllHashesMatch(r) ==                                            \* readHashesSti
 Idx(S) == 1..Len(S)
 LastIdx(S) == IF S = {} THEN 0 ELSE CHOOSE i \in S : \A j \in S : j <= i
 
-\* checkCoverage (~1867): the union of non-provisional, context-widened ranges.
+\* checkCoverage: the union of non-provisional, context-widened ranges.
 Covered(lo, hi) ==
     \A l \in lo..hi : \E i \in Idx(reads) :
         ~reads[i].prov /\ Max(1, reads[i].lo - Ctx) <= l /\ l <= reads[i].hi + Ctx
 
-\* canIgnoreStalenessByHashes (~1567).
+\* canIgnoreStalenessByHashes.
 HashRescueCode(lo, hi) == \E i \in Idx(reads) : CtxCovers(reads[i], lo, hi) /\ HashesMatch(reads[i], lo, hi)
 
-\* validateRangeSnapshot (~1618). A candidate is "checked" when it delivered
+\* validateRangeSnapshot. A candidate is "checked" when it delivered
 \* and hashed every line of the range (currentLinesMatchReadSnapshot);
 \* otherwise it is "unavailable". The block is suppressed when an unavailable
-\* candidate is newer than the newest mismatch (~1690-1697).
+\* candidate is newer than the newest mismatch.
 Cands(lo, hi) == {i \in Idx(reads) : CtxCovers(reads[i], lo, hi)}
 Checked(lo, hi) ==
     {i \in Cands(lo, hi) : EffCovers(reads[i], lo, hi) /\ \A l \in lo..hi : reads[i].h[l] # 0}
@@ -169,11 +190,11 @@ SnapBlock(lo, hi) ==
     /\ (SuppressByNewerContext => LastIdx(Unavail(lo, hi)) <= LastIdx(Checked(lo, hi)))
     /\ HashUnavail(lo, hi) = {}
 
-\* Candidate fix (SpanSnapshot): every line of the range is compared with the
+\* SpanSnapshot (code since #3522): every line of the range is compared with the
 \* newest read that DELIVERED it (the agent's latest view of that line).
 NewestDeliv(l) == LastIdx({i \in Idx(reads) : ~reads[i].prov
                               /\ ((reads[i].lo <= l /\ l <= reads[i].hi /\ reads[i].h[l] # 0)
-                                  \/ reads[i].whole)})
+                                  \/ (WholeVouchesPastEnd /\ reads[i].whole))})
 SpanBlock(lo, hi) ==
     /\ SnapshotCheck
     /\ \E l \in lo..hi : NewestDeliv(l) # 0
@@ -186,7 +207,7 @@ HashRescue(lo, hi) ==
                              /\ reads[NewestDeliv(l)].h[l] = disk[l]
       ELSE HashRescueCode(lo, hi)
 
-\* findRelocation (~1770): newest read with hashes for the whole range; its
+\* findRelocation: newest read with hashes for the whole range; its
 \* sequence must occur exactly once in the current file (the window is wider
 \* than the file here).
 HasSeq(i, lo, hi) == \A l \in lo..hi : reads[i].h[l] # 0
@@ -204,7 +225,7 @@ Reloc(lo, hi) ==
                  IN IF Cardinality(M) = 1 /\ (CHOOSE s \in M : TRUE) # lo
                       THEN CHOOSE s \in M : TRUE ELSE 0
 
-\* checkEdit (~927) for a positional edit of lo..hi.
+\* checkEdit for a positional edit of lo..hi.
 \* Returns [act |-> "allow"|"block"|"reloc", to |-> start, inject |-> BOOLEAN].
 Verdict(lo, hi) ==
     IF Len(reads) = 0
@@ -240,7 +261,7 @@ ReadCall(full, lo, hi) ==
     /\ pc' = "readExec" /\ pend' = [k |-> "read", full |-> full, lo |-> lo, hi |-> hi]
     /\ ops' = ops + 1
     /\ UNCHANGED <<disk, rev, tok, know, kTurn, written, pendCreate, born, turnNo,
-                   ext, nb, fixedTurn, mutatedTurn, staleAllow, blindAllow, falseBlock>>
+                   ext, nb, fixedTurn, mutatedTurn, dr, staleAllow, blindAllow, falseBlock>>
 
 \* host read: the bytes delivered to the agent.
 ReadExec ==
@@ -277,7 +298,7 @@ ReadResult ==
     /\ lastEditOk' = FALSE
     /\ pc' = "idle" /\ pend' = [k |-> "none"]
     /\ UNCHANGED <<disk, rev, tok, kTurn, written, pendCreate, born, turnNo,
-                   ops, ext, nb, fixedTurn, mutatedTurn, staleAllow, blindAllow, falseBlock>>
+                   ops, ext, nb, fixedTurn, mutatedTurn, dr, staleAllow, blindAllow, falseBlock>>
 
 \* ---- positional edit of lo..lo+span-1 (checkEdit at tool_call, host apply) ----
 Edit(lo, span) ==
@@ -319,7 +340,7 @@ Edit(lo, span) ==
                     /\ lastEditOk' = (v.act # "block")
                     /\ pc' = "idle"
     /\ ops' = ops + 1
-    /\ UNCHANGED <<kTurn, ft, written, pendCreate, born, turnNo, ext, nb, fixedTurn>>
+    /\ UNCHANGED <<kTurn, ft, written, pendCreate, born, turnNo, ext, nb, fixedTurn, dr>>
 
 \* tool_result of the edit: recordWritten (FileTime from disk now).
 EditRW ==
@@ -334,7 +355,7 @@ EditRW ==
                      ELSE r0
     /\ pc' = "idle" /\ pend' = [k |-> "none"]
     /\ UNCHANGED <<disk, rev, tok, know, kTurn, lastEditOk, born, turnNo, ops, ext,
-                   nb, fixedTurn, mutatedTurn, staleAllow, blindAllow, falseBlock>>
+                   nb, fixedTurn, mutatedTurn, dr, staleAllow, blindAllow, falseBlock>>
 
 \* ---- write (whole file) ----
 Write ==
@@ -346,7 +367,7 @@ Write ==
     /\ pendCreate' = TRUE                              \* noteCreatedFile at tool_call
     /\ pc' = "writeRW1" /\ ops' = ops + 1 /\ mutatedTurn' = TRUE
     /\ UNCHANGED <<kTurn, reads, ft, written, lastEditOk, born, turnNo, ext, nb,
-                   fixedTurn, staleAllow, blindAllow, falseBlock>>
+                   fixedTurn, dr, staleAllow, blindAllow, falseBlock>>
 
 \* recordWritten before the pipeline: stamps FileTime, injects the creation read.
 WriteRW1 ==
@@ -360,7 +381,7 @@ WriteRW1 ==
     /\ pc' = IF FixKind # "none" /\ ~fixedTurn THEN "fix" ELSE "idle"
     /\ pend' = IF FixKind # "none" /\ ~fixedTurn THEN pend ELSE [k |-> "none"]
     /\ UNCHANGED <<disk, rev, tok, know, kTurn, lastEditOk, born, turnNo, ops, ext,
-                   nb, fixedTurn, mutatedTurn, staleAllow, blindAllow, falseBlock>>
+                   nb, fixedTurn, mutatedTurn, dr, staleAllow, blindAllow, falseBlock>>
 
 \* The turn's first write: immediate autofix rewrites line 1.
 Fix ==
@@ -384,7 +405,7 @@ WriteRW2 ==
                   ELSE reads
     /\ pc' = "idle" /\ pend' = [k |-> "none"]
     /\ UNCHANGED <<disk, rev, tok, kTurn, pendCreate, lastEditOk, born, turnNo, ops,
-                   ext, nb, fixedTurn, mutatedTurn, staleAllow, blindAllow, falseBlock>>
+                   ext, nb, fixedTurn, mutatedTurn, dr, staleAllow, blindAllow, falseBlock>>
 
 ----------------------------------------------------------------------------
 \* Another writer (external editor, second pi-lens instance, git checkout).
@@ -398,18 +419,67 @@ External ==
     /\ UNCHANGED <<know, kTurn, guardVars, pc, pend, ops, nb, fixedTurn, mutatedTurn,
                    staleAllow, blindAllow, falseBlock>>
 
+\* A settle drain is due: the run wrote, and agent_settled has not queued it yet.
+SettleDue == DrainMode # "atomic" /\ FormatDrain # "none" /\ mutatedTurn
+
 \* A user turn boundary: agent_end's deferred format drain, then the next prompt.
+\* With DrainMode # "atomic" the drain is queued at Settle instead and lands
+\* in Drain, which the conversation can have moved past.
 Turn ==
-    /\ Idle /\ "turn" \in Bounds /\ nb < MaxBounds
-    /\ IF FormatDrain # "none" /\ mutatedTurn /\ ModOk(FormatDrain, disk, 1)
+    /\ Idle /\ "turn" \in Bounds /\ nb < MaxBounds /\ ~SettleDue
+    /\ IF DrainMode = "atomic" /\ FormatDrain # "none" /\ mutatedTurn /\ ModOk(FormatDrain, disk, 1)
          THEN /\ disk' = Mod(FormatDrain, disk, 1, tok) /\ rev' = rev + 1 /\ tok' = tok + 1
-              /\ IF FormatStamp                               \* recordWritten after the format
-                   THEN ft' = rev + 1 /\ written' = TRUE
-                   ELSE UNCHANGED <<ft, written>>
+              /\ written' = TRUE                              \* recordWritten after the format
+              /\ ft' = IF FormatStamp THEN rev + 1 ELSE ft
          ELSE UNCHANGED <<disk, rev, tok, ft, written>>
     /\ kTurn' = know /\ turnNo' = turnNo + 1
     /\ fixedTurn' = FALSE /\ mutatedTurn' = FALSE /\ nb' = nb + 1
-    /\ UNCHANGED <<know, reads, pendCreate, lastEditOk, born, pc, pend, ops, ext,
+    /\ UNCHANGED <<know, reads, pendCreate, lastEditOk, born, pc, pend, ops, ext, dr,
+                   staleAllow, blindAllow, falseBlock>>
+
+\* agent_settled (#3521 review F1): the run is over but the next prompt has not
+\* come, and pi already accepts /tree. The drain for this turn's writes is
+\* queued with the branch epoch it captured. pi marks the run inactive and
+\* then invokes the handlers, so pi-lens's handler captures the epoch before
+\* any /tree can land (SettleDue gates the boundaries below); an earlier
+\* extension's handler that awaits first is not modelled (README Limits).
+\* Requeued work is drained by the next settle, whenever it comes. "fenced"
+\* keeps the epoch the work was queued with, unless this branch wrote the file
+\* again (mutatedTurn): the merged record then carries the newer epoch.
+Settle ==
+    /\ Idle /\ (SettleDue \/ dr.rq) /\ ~dr.q
+    /\ dr' = [dr EXCEPT !.q = TRUE, !.rq = FALSE,
+                        !.ep = IF DrainMode = "fenced" /\ dr.rq /\ ~mutatedTurn
+                                 THEN dr.ep ELSE dr.cur]
+    /\ mutatedTurn' = FALSE
+    /\ UNCHANGED <<disk, rev, tok, know, kTurn, reads, ft, written, pendCreate, lastEditOk,
+                   born, turnNo, pc, pend, ops, ext, nb, fixedTurn,
+                   staleAllow, blindAllow, falseBlock>>
+
+\* The queued drain lands: the formatter rewrites line 1, then recordWritten.
+\* "fenced" refuses the stamp when a /tree bumped the epoch since Settle.
+Drain ==
+    /\ Idle /\ dr.q
+    /\ dr' = [dr EXCEPT !.q = FALSE]
+    /\ IF ModOk(FormatDrain, disk, 1)
+         THEN /\ disk' = Mod(FormatDrain, disk, 1, tok) /\ rev' = rev + 1 /\ tok' = tok + 1
+              /\ IF DrainMode = "unfenced" \/ dr.ep = dr.cur
+                   THEN /\ written' = TRUE
+                        /\ ft' = IF FormatStamp THEN rev + 1 ELSE ft
+                   ELSE UNCHANGED <<ft, written>>
+         ELSE UNCHANGED <<disk, rev, tok, ft, written>>
+    /\ UNCHANGED <<know, kTurn, reads, pendCreate, lastEditOk, born, turnNo, pc, pend,
+                   ops, ext, nb, fixedTurn, mutatedTurn, staleAllow, blindAllow, falseBlock>>
+
+\* An aborted or failed drain puts its work back without writing (#3521
+\* round-2 verify R2-F1): ESC, a formatter or autofix failure, missing
+\* clients. pi's /tree awaits abort() first, so an aborted settle then a
+\* /tree is the common order.
+Requeue ==
+    /\ Idle /\ dr.q
+    /\ dr' = [dr EXCEPT !.q = FALSE, !.rq = TRUE]
+    /\ UNCHANGED <<disk, rev, tok, know, kTurn, reads, ft, written, pendCreate, lastEditOk,
+                   born, turnNo, pc, pend, ops, ext, nb, fixedTurn, mutatedTurn,
                    staleAllow, blindAllow, falseBlock>>
 
 FreshGuard ==
@@ -418,37 +488,55 @@ FreshGuard ==
 
 \* /new: fresh guard, empty conversation.
 New ==
-    /\ Idle /\ "new" \in Bounds /\ nb < MaxBounds
+    /\ Idle /\ "new" \in Bounds /\ nb < MaxBounds /\ ~SettleDue
     /\ reads' = <<>> /\ FreshGuard /\ UNCHANGED turnNo
     /\ know' = [l \in Lines |-> 0] /\ kTurn' = know'
     /\ nb' = nb + 1 /\ fixedTurn' = FALSE /\ mutatedTurn' = FALSE
+    /\ dr' = [dr EXCEPT !.q = FALSE, !.rq = FALSE]   \* the session generation drops the old drain (#3528)
     /\ UNCHANGED <<disk, rev, tok, pc, pend, ops, ext, staleAllow, blindAllow, falseBlock>>
 
-\* /fork: the conversation restarts before the current prompt (kTurn); the new
-\* guard imports the parent's read-set, reconciled against disk only.
+\* /fork: the conversation restarts before the current prompt (kTurn).
+\* BranchFilter (#3521): the fork keeps the records made before the point,
+\* whole, with no FileTime stamp (importBranch). Otherwise the candidates the
+\* switches name: import the parent's read-set reconciled against disk only
+\* (ForkImport), or nothing (the code before #3521).
 Kept(S) == SelectSeq(S, AllHashesMatch)
 BeforePrompt(r) == r.g < turnNo
 Fork ==
-    /\ Idle /\ "fork" \in Bounds /\ nb < MaxBounds
-    /\ LET src == IF ForkAtBoundary THEN SelectSeq(reads, BeforePrompt) ELSE reads
-           imp == IF ForkImport THEN Kept(src) ELSE <<>>
-       IN /\ reads' = imp
-          /\ ft' = IF Len(imp) > 0 THEN rev ELSE -1      \* recordRead stamps FileTime
+    /\ Idle /\ "fork" \in Bounds /\ nb < MaxBounds /\ ~SettleDue
+    /\ IF BranchFilter
+         THEN /\ reads' = SelectSeq(reads, BeforePrompt)
+              /\ ft' = -1
+         ELSE LET src == IF ForkAtBoundary THEN SelectSeq(reads, BeforePrompt) ELSE reads
+                  imp == IF ForkImport THEN Kept(src) ELSE <<>>
+              IN /\ reads' = imp
+                 /\ ft' = IF Len(imp) > 0 THEN rev ELSE -1      \* recordRead stamps FileTime
     /\ UNCHANGED turnNo
     /\ written' = FALSE /\ pendCreate' = FALSE /\ lastEditOk' = FALSE /\ born' = rev
     /\ know' = kTurn
     /\ nb' = nb + 1 /\ fixedTurn' = FALSE /\ mutatedTurn' = FALSE
+    /\ dr' = [dr EXCEPT !.q = FALSE, !.rq = FALSE]   \* the session generation drops the old drain (#3528)
     /\ UNCHANGED <<disk, rev, tok, kTurn, pc, pend, ops, ext, staleAllow, blindAllow, falseBlock>>
 
-\* /tree: the conversation moves to an earlier point; pi-lens has no handler.
+\* /tree: the conversation moves to an earlier point in the same activation.
+\* BranchFilter (#3521, retainBranch): keep the branch's records whole, clear
+\* the FileTime stamp (so each kept record passes the per-line hash rescue),
+\* writtenThisSession, pending creations and the edit history, and re-anchor
+\* the mtime fallback. Without it (the code before #3521), no handler.
 Tree ==
-    /\ Idle /\ "tree" \in Bounds /\ nb < MaxBounds
+    /\ Idle /\ "tree" \in Bounds /\ nb < MaxBounds /\ ~SettleDue
     /\ know' = kTurn
-    /\ reads' = IF ForkAtBoundary THEN SelectSeq(reads, BeforePrompt) ELSE reads
+    /\ IF BranchFilter
+         THEN /\ reads' = SelectSeq(reads, BeforePrompt)
+              /\ ft' = -1 /\ written' = FALSE /\ pendCreate' = FALSE
+              /\ lastEditOk' = FALSE /\ born' = rev
+              /\ dr' = [dr EXCEPT !.cur = dr.cur + 1]      \* the branch epoch
+         ELSE /\ reads' = IF ForkAtBoundary THEN SelectSeq(reads, BeforePrompt) ELSE reads
+              /\ written' = IF ForkAtBoundary THEN FALSE ELSE written   \* writtenThisSession
+              /\ UNCHANGED <<ft, pendCreate, lastEditOk, born, dr>>
     /\ UNCHANGED turnNo
-    /\ written' = IF ForkAtBoundary THEN FALSE ELSE written   \* writtenThisSession
     /\ nb' = nb + 1
-    /\ UNCHANGED <<disk, rev, tok, kTurn, ft, pendCreate, lastEditOk, born,
+    /\ UNCHANGED <<disk, rev, tok, kTurn,
                    pc, pend, ops, ext, fixedTurn, mutatedTurn,
                    staleAllow, blindAllow, falseBlock>>
 
@@ -459,7 +547,7 @@ Next ==
     \/ \E lo \in 1..MaxLen, s \in Spans : Edit(lo, s)
     \/ EditRW
     \/ Write \/ WriteRW1 \/ Fix \/ WriteRW2
-    \/ External \/ Turn \/ New \/ Fork \/ Tree
+    \/ External \/ Turn \/ Settle \/ Requeue \/ Drain \/ New \/ Fork \/ Tree
 
 Spec == Init /\ [][Next]_vars
 

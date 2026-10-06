@@ -306,7 +306,7 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 	"real-process-spawn:clients/safe-spawn-windows-command.test.ts": {
 		detector: "real-process-spawn",
 		reason:
-			"real Windows command-line parsing decides argument boundaries no in-process parser can validate",
+			"real Windows command-line parsing decides argument boundaries and /s outer-quote stripping; the added spawnSync import/call witnesses a quoted SystemRoot prefix on the Windows lane",
 	},
 	"real-process-spawn:clients/shared-checkout-guard.test.ts": {
 		detector: "real-process-spawn",
@@ -322,6 +322,11 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "real-process-spawn",
 		reason:
 			"fresh Node processes exercise import-time log routing; real git init/status proves a foreign checkout stays clean and check-ignore verifies the committed legacy rule",
+	},
+	"real-process-spawn:config/heavy-advisory-gate-workflow.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the subject is the real `Record Windows Vitest outcome` bash block under GitHub's bash flags (a fixture Node program at the population-script path runs under the real `node`, so no PATH, delimiter, or executable name is mocked) and the ref-deleted Git fetch form through the git-fixture-env seam",
 	},
 	"real-process-spawn:config/oxlint-advisory-rule-floor-gate.test.ts": {
 		detector: "real-process-spawn",
@@ -363,6 +368,11 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"real pi must surface provider exhaustion and malformed tool arguments across the process boundary",
 	},
+	"real-process-spawn:real-harness/provider-compatibility.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the installed pi host must load the built extension and expose its provider roster across the process boundary",
+	},
 	"real-process-spawn:real-harness/scenario-1.test.ts": {
 		detector: "real-process-spawn",
 		reason:
@@ -381,12 +391,42 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"the provider wire roster is produced by a real pi host loading the built extension; an in-process double cannot certify tools.<name>.enabled",
 	},
+	// #3870: the detector tests drive the analyzer's real CLI entry point as a
+	// real node subprocess over redacted fixture logs; an in-process call could
+	// not prove the --root/--json/--since argv or the JSON report boundary.
+	"real-process-spawn:scripts/analyze-pi-lens-logs-detectors.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the tests spawn the analyzer's real CLI over fixture logs; an in-process call cannot prove the --root/--json argv or the JSON report boundary (same seam as analyze-pi-lens-logs.test.ts)",
+	},
+	// #3684: the advisory scope is the wrapper's own `git diff` against a real
+	// throwaway fixture repo; an in-process call cannot prove the git boundary
+	// or the wrapper's argv/env (GITHUB_BASE_REF) handling.
+	"real-process-spawn:scripts/astgrep-self-scan.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the wrapper's advisory scope runs a real `git diff` in a throwaway fixture repo and reads argv/env; an in-process double proves neither boundary",
+	},
+	// #3795: the one-fragment-per-PR check diffs a real fixture repo through
+	// real `git` (`git diff` plus `git ls-files --others`); that command
+	// boundary is the subject, and no in-process double reproduces git's own
+	// tracked-vs-untracked split.
+	"real-process-spawn:scripts/changelog-entries.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the PR-diff fragment count shells out to real `git` against a fixture repo; an in-process double cannot prove git's tracked-vs-untracked split",
+	},
 	// #2807 review F1/F4: the local CLI's exact argv and a shallow checkout's
 	// missing diff are the subjects; an in-process call cannot prove either.
 	"real-process-spawn:scripts/check-pr-body.test.ts": {
 		detector: "real-process-spawn",
 		reason:
 			"the exact local CLI, shallow checkout, `git check-ignore` (#2904), and large-diff buffer overflow (refs #17) are the subjects; real Git add/commit calls author the overflow fixture because a double cannot exercise child-process output bounds",
+	},
+	"real-process-spawn:scripts/ci-verdict.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"#3883 F3: the final exit line and process status live at the real main() boundary; only a spawned CLI observes them",
 	},
 	"real-process-spawn:scripts/git-fixture-env.test.ts": {
 		detector: "real-process-spawn",
@@ -458,6 +498,15 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"the CLI's real exit code and distinct infra label on exhaustion are unobservable from an in-process stub",
 	},
+	// #3723: the open/close CLI's own process entry against a real git
+	// fixture -- the worktree registry, the on-disk node_modules symlink, the
+	// #3173 unlink-before-remove ordering, and the exit code decide the run;
+	// no in-process double reaches those command boundaries.
+	"real-process-spawn:scripts/pr-worktree.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the CLI's real git fixture, node_modules symlink state, unlink-before-remove ordering, and exit code are the subject; an in-process double restates none of them",
+	},
 	// #3451: the hook's format step is a shell pipeline (git diff | xargs
 	// oxfmt); the bug was xargs turning oxfmt's exit 2 into 123 at the process
 	// boundary, which only the real hook run shows.
@@ -466,15 +515,27 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"the real hook pipes git through xargs into the pinned oxfmt; the exit-123 refusal is a process-boundary fact",
 	},
+	"real-process-spawn:scripts/pre-push-targeted-tests.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"git's pre-push stdin and the hook script's exit/skip/lock-timeout contract are the subject; the union and lock-admission witnesses need a real git fixture and the real hook chain",
+	},
 	"real-process-spawn:scripts/prune-agent-worktrees.test.ts": {
 		detector: "real-process-spawn",
 		reason:
 			"real git worktree commands own pruning locks and exit status beyond in-process filesystem state",
 	},
+	// #3724: the real CLI and Git worktree lifecycle are the behavior under test;
+	// an in-process substitute cannot prove child argv, cwd, or cleanup ordering.
+	"real-process-spawn:scripts/red-on-base.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the real CLI and Git worktree lifecycle are the behavior under test; an in-process substitute cannot prove child argv, cwd, or cleanup ordering",
+	},
 	"real-process-spawn:scripts/release-qa.test.ts": {
 		detector: "real-process-spawn",
 		reason:
-			"npm ignoring a handed env, a child's own os.homedir(), and main()'s CLI exit code are each unobservable in-process",
+			"npm ignoring a handed env, a child's own os.homedir(), and main()'s CLI pack call site and exit code are each unobservable in-process",
 	},
 	// 2026-09-07 (#2613): the CLI's real exit code (2 vs. 4) and its
 	// GITHUB_OUTPUT write are the subject under test; header on the file
@@ -483,6 +544,20 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "real-process-spawn",
 		reason:
 			"the CLI's real exit code (2 vs. 4) and GITHUB_OUTPUT side effect are unobservable from an in-process stub",
+	},
+	// #3401: the seed script's default git argv (depth-2 fetch, refspec, blob
+	// specs) only means something against a real repo and a depth-1 clone.
+	"real-process-spawn:scripts/seed-matrix-from-bot-branch-real-git.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the fetch depth, refspec and rev-parse specs are the subject; an in-memory git restates them instead of proving them against real git",
+	},
+	// #3674: git's own per-worktree resolution of core.hooksPath and the real
+	// husky binary are the subject; a double would restate the path it wrote.
+	"real-process-spawn:scripts/setup-git-hooks.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"git resolves core.hooksPath per worktree at its own process boundary; the real script and husky binary are the subject",
 	},
 	// 2026-09-06 (#2369): the fixture-ordering defect (an earlier LSP_FIXTURES
 	// entry registering a foreign session root, declining a later one) lives
@@ -503,11 +578,18 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 	// early-exit call sites) only exists in the real module's own top-level
 	// execution order; a source-text assertion on the driver already passed
 	// under the crash, so only spawning the actual script against a real,
-	// throwaway git fixture reproduces it.
+	// throwaway git fixture reproduces it. The count moved 3 -> 4 with the
+	// #3853 lock test: whether the real driver waits behind a live exclusive
+	// holder (and refuses to fork vitest) is only observable by spawning the
+	// real script, since the lock lives in the driver's own top-level order.
+	// The count moved 4 -> 8 with #3856 F3: the heartbeat/refusal behind a live
+	// exclusive holder, the budget-signal abort, the absent and partial
+	// coverage reports, and the skipped/corrupt compiled source are each only
+	// observable by spawning the real driver against the throwaway fixture.
 	"real-process-spawn:scripts/stryker-diff.test.ts": {
 		detector: "real-process-spawn",
 		reason:
-			"the defect is a temporal-dead-zone crash in the driver's own top-level execution order; no source-text or in-process substitute reproduces it",
+			"the defect is a temporal-dead-zone crash in the driver's own top-level execution order; the #3853 lock wait/refusal and the #3856 F3 stage dispositions (heartbeat/refusal behind a live holder, the budget-signal abort, the absent and partial coverage reports, the skipped/corrupt compiled source) are only observable by spawning the real script, and no source-text or in-process substitute reproduces them",
 	},
 	// 2026-09-06 (#2586 review F1): proves the actual delimiter
 	// supply-host-provided-deps.mjs prints in its own stdout bytes; an
@@ -548,6 +630,11 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "real-process-spawn",
 		reason:
 			"a real cross-process directory removal races node's own recursive-watch readdirSync; no in-process stand-in can occupy the other side of that window",
+	},
+	"real-process-spawn:support/vitest-setup-registry-teardown.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"#3617: the subject is Vitest's own fork teardown (the pool SIGTERMs the worker after the shared afterAll); no in-process double reproduces that kill or a hook timeout",
 	},
 	// 2026-09-26 (#3511 review round 3): the quick-mode warmup witness must
 	// run the real warmup timer and background word-index save, which no

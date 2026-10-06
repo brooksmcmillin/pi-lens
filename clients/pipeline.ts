@@ -17,10 +17,11 @@ import * as nodeFs from "node:fs";
 import * as nodeCrypto from "node:crypto";
 import * as path from "node:path";
 import type { PiLensFlagSource } from "./lens-config.js";
+import { findNearestContaining } from "./path-utils.js";
 import {
-	findNearestContaining,
-	normalizeEphemeralMapKey,
-} from "./path-utils.js";
+	inlineBlockerLines,
+	inlineBlockerSources,
+} from "./inline-blocker-fields.js";
 import {
 	recordFromDispatchDiagnostic,
 	type ActionableWarningRecord,
@@ -54,7 +55,10 @@ import {
 } from "./dispatch/runners/utils/runner-helpers.js";
 import { findDetektConfig } from "./dispatch/runners/detekt.js";
 import type { Diagnostic, PiAgentAPI } from "./dispatch/types.js";
-import { formatDiagnostics } from "./dispatch/utils/format-utils.js";
+import {
+	formatDiagnostics,
+	formatPromotionNotes,
+} from "./dispatch/utils/format-utils.js";
 import { detectFileKind, getFileKindLabel } from "./file-kinds.js";
 import {
 	detectFileChangedAfterCommand,
@@ -75,12 +79,18 @@ import {
 import { loadLspService } from "./lsp-lazy.js";
 import type { MetricsClient } from "./metrics-client.js";
 import { clearGraphCache } from "./review-graph/builder.js";
+import { classifyTreeSitterWasmError } from "./tree-sitter-client.js";
 import { BoundedLruCache } from "./bounded-cache.js";
 import type { RuffClient } from "./ruff-client.js";
 import { RUNTIME_CONFIG } from "./runtime-config.js";
 import type { WordIndex } from "./word-index.js";
 import { getAmbientAbortSignal, safeSpawnAsync } from "./safe-spawn.js";
 import { probeToolAsync } from "./tool-probe.js";
+import {
+	type FixRunReport,
+	renderFixRunLoss,
+	runWithFixRestore,
+} from "./fix-run-restore.js";
 import { bounded } from "./deadline-utils.js";
 import { HOOK_WALL_BUDGET_MS } from "./hook-budgets.js";
 import type { LedgerHookKey } from "./hook-budgets.js";
@@ -113,6 +123,8 @@ import {
 } from "./tool-policy.js";
 import type { PathSetLike } from "./runtime-coordinator.js";
 import { exceedsLspSyncLimits } from "./lsp/content-limits.js";
+import { surfaceHandlerCrash } from "./session-event-guard.js";
+import type { DriftDisposition } from "./lsp/document-drift.js";
 
 const LSP_SPAWN_BUDGET_MS = RUNTIME_CONFIG.pipeline.lspSpawnBudgetMs;
 const AUTOFIX_CHANGED_FILE_SCAN_LIMIT = 5000;
@@ -267,6 +279,14 @@ export interface PipelineContext {
 		modelId?: string;
 		provider?: string;
 	};
+	/**
+	 * #3830: receives the notice for agent edits a whole-package fixer
+	 * overwrote and its restore could not put back. It fires after the pipeline
+	 * has returned, because the restore waits for pi's queue entries; the host
+	 * queues it as an advisory for the agent's next turn. Absent: the notice is
+	 * dropped, the degradation record still lands.
+	 */
+	onFixRunLoss?: (notice: string) => void;
 	/** pi.getFlag accessor */
 	getFlag: (name: string, filePath?: string) => boolean | string | undefined;
 	/**
@@ -763,50 +783,126 @@ async function tryOxlintFix(
 	);
 }
 
+/** What a whole-package fixer's restore could not put back, as display paths (#3598). */
+interface FixRunLoss {
+	lost: string[];
+	possiblyLost: string[];
+}
+
+function displayLoss(
+	cwd: string,
+	restoring: Promise<FixRunReport>,
+): Promise<FixRunLoss> {
+	return restoring.then((report) => ({
+		lost: report.lost.map((f) => toRunnerDisplayPath(cwd, f)),
+		possiblyLost: report.possiblyLost.map((f) => toRunnerDisplayPath(cwd, f)),
+	}));
+}
+
+/**
+ * Hand a settled restore's loss to `ctx.onFixRunLoss`, detached from the
+ * pipeline's result. Total: a callback that throws is a debug line, never an
+ * unhandled rejection (AGENTS.md shape 53).
+ */
+function deliverFixRunLoss(
+	restoring: Promise<FixRunLoss>,
+	ctx: Pick<PipelineContext, "onFixRunLoss" | "dbg">,
+): void {
+	void restoring
+		.then((loss) => {
+			if (loss.lost.length > 0 || loss.possiblyLost.length > 0)
+				ctx.onFixRunLoss?.(renderFixRunLoss(loss));
+		})
+		.catch((failure: unknown) =>
+			ctx.dbg(
+				`fix-run loss notice failed: ${failure instanceof Error ? failure.message : String(failure)}`,
+			),
+		);
+}
+
+interface WholePackageFixOutcome {
+	changedFiles: string[];
+	/**
+	 * The restore of agent edits the fixer overwrote (#3598). It started after
+	 * the project diff and takes pi's queue entry for each sibling (#3830), so
+	 * the caller awaits it only after the target's hold is released.
+	 */
+	restoring?: Promise<FixRunReport>;
+}
+
+/**
+ * What a whole-package fixer changed, minus the agent's own edits (#3598). An
+ * agent-edited file is the agent's change, restored or not; counting it would
+ * report a restored file as an autofix result.
+ */
+async function wholePackageChangedFiles(
+	root: string,
+	before: FileSnapshot,
+	result: Awaited<ReturnType<typeof safeSpawnAsync>>,
+	agentEdited: readonly string[],
+): Promise<string[]> {
+	if (result.error || result.status !== 0) return [];
+	const edited = new Set(agentEdited);
+	const changed = await diffProjectSnapshot(root, before);
+	return changed.flatMap((file) => (edited.has(file) ? [] : [file]));
+}
+
 async function tryRustClippyFix(
 	filePath: string,
 	writeHold?: FileMutationHold,
-): Promise<string[]> {
+): Promise<WholePackageFixOutcome> {
+	const none = { changedFiles: [] };
 	const check = await probeToolAsync("cargo", ["--version"], { timeout: 5000 });
-	if (check.error || check.status !== 0) return [];
+	if (check.error || check.status !== 0) return none;
 
 	const cargoDir = findNearestContaining(path.dirname(path.resolve(filePath)), [
 		"Cargo.toml",
 	]);
-	if (!cargoDir) return [];
+	if (!cargoDir) return none;
 	if (writeHold) await writeHold.acquire();
 
 	const before = await snapshotProjectFiles(cargoDir);
-	const result = await safeSpawnAsync(
-		"cargo",
-		["clippy", "--fix", "--allow-dirty", "--allow-staged", "-q"],
-		{ timeout: 30000, cwd: cargoDir },
+	const { result: changedFiles, restoring } = await runWithFixRestore(
+		{ tool: "rust-clippy", extension: ".rs", candidates: before.keys() },
+		() =>
+			safeSpawnAsync(
+				"cargo",
+				["clippy", "--fix", "--allow-dirty", "--allow-staged", "-q"],
+				{ timeout: 30000, cwd: cargoDir },
+			),
+		(result, agentEdited) =>
+			wholePackageChangedFiles(cargoDir, before, result, agentEdited),
 	);
-	if (result.error || result.status !== 0) return [];
-	return diffProjectSnapshot(cargoDir, before);
+	return { changedFiles, restoring };
 }
 
 async function tryDartFix(
 	filePath: string,
 	writeHold?: FileMutationHold,
-): Promise<string[]> {
+): Promise<WholePackageFixOutcome> {
+	const none = { changedFiles: [] };
 	const check = await probeToolAsync("dart", ["--version"], { timeout: 5000 });
-	if (check.error || check.status !== 0) return [];
+	if (check.error || check.status !== 0) return none;
 
 	const pubspecDir = findNearestContaining(
 		path.dirname(path.resolve(filePath)),
 		["pubspec.yaml"],
 	);
-	if (!pubspecDir) return [];
+	if (!pubspecDir) return none;
 	if (writeHold) await writeHold.acquire();
 
 	const before = await snapshotProjectFiles(pubspecDir);
-	const result = await safeSpawnAsync("dart", ["fix", "--apply"], {
-		timeout: 30000,
-		cwd: pubspecDir,
-	});
-	if (result.error || result.status !== 0) return [];
-	return diffProjectSnapshot(pubspecDir, before);
+	const { result: changedFiles, restoring } = await runWithFixRestore(
+		{ tool: "dart-analyze", extension: ".dart", candidates: before.keys() },
+		() =>
+			safeSpawnAsync("dart", ["fix", "--apply"], {
+				timeout: 30000,
+				cwd: pubspecDir,
+			}),
+		(result, agentEdited) =>
+			wholePackageChangedFiles(pubspecDir, before, result, agentEdited),
+	);
+	return { changedFiles, restoring };
 }
 
 // --- Pipeline phase helpers ---
@@ -825,6 +921,13 @@ export async function runAutofix(
 	attemptedTools: string[];
 	changedFiles: string[];
 	needsContentRefresh: boolean;
+	/**
+	 * Display paths of files a whole-package fixer overwrote an agent edit of
+	 * (unrestorable), or where one may not have survived (#3598). The restore
+	 * takes pi's queue entry for each sibling (#3830): await this only after
+	 * `writeHold` is released.
+	 */
+	restoring?: Promise<FixRunLoss> | undefined;
 	skipReason?: string;
 }> {
 	const { biomeClient, ruffClient, fixedThisTurn } = deps;
@@ -833,6 +936,7 @@ export async function runAutofix(
 	const autofixTools: string[] = [];
 	const attemptedTools: string[] = [];
 	const changedFiles = new Set<string>();
+	const restorings: Promise<FixRunLoss>[] = [];
 	const markTargetChanged = () => changedFiles.add(path.resolve(filePath));
 	let needsContentRefresh = false;
 
@@ -1037,7 +1141,9 @@ export async function runAutofix(
 		}
 
 		if (toolName === "rust-clippy") {
-			const clippyChangedFiles = await tryRustClippyFix(filePath, writeHold);
+			const clippy = await tryRustClippyFix(filePath, writeHold);
+			const clippyChangedFiles = clippy.changedFiles;
+			if (clippy.restoring) restorings.push(displayLoss(cwd, clippy.restoring));
 			if (clippyChangedFiles.length > 0) {
 				fixedCount += clippyChangedFiles.length;
 				autofixTools.push(`rust-clippy:${clippyChangedFiles.length}`);
@@ -1053,7 +1159,9 @@ export async function runAutofix(
 		}
 
 		if (toolName === "dart-analyze") {
-			const dartChangedFiles = await tryDartFix(filePath, writeHold);
+			const dart = await tryDartFix(filePath, writeHold);
+			const dartChangedFiles = dart.changedFiles;
+			if (dart.restoring) restorings.push(displayLoss(cwd, dart.restoring));
 			if (dartChangedFiles.length > 0) {
 				fixedCount += dartChangedFiles.length;
 				autofixTools.push(`dart-analyze:${dartChangedFiles.length}`);
@@ -1145,6 +1253,13 @@ export async function runAutofix(
 		attemptedTools,
 		changedFiles: [...changedFiles],
 		needsContentRefresh,
+		restoring:
+			restorings.length > 0
+				? Promise.all(restorings).then((losses) => ({
+						lost: losses.flatMap((loss) => loss.lost),
+						possiblyLost: losses.flatMap((loss) => loss.possiblyLost),
+					}))
+				: undefined,
 	};
 }
 
@@ -1176,10 +1291,70 @@ export type LspResyncOutcome =
  * session may already hold the file (a read-warm touch), and the drain's write
  * would otherwise leave that document behind the disk until the next drift
  * sweep. `resyncGitChangedFiles` owns the held-only filter and the drift read.
+ *
+ * #3828 r3: the drain wrote these bytes, so the push is a save, as in
+ * `resyncLspFile` (#3405: a save-triggered server recompiles on didSave and on
+ * nothing else). The answer is the drift pass's disposition of F, or
+ * `no-service` when no current service exists to hold it.
  */
-export async function resyncHeldLspDocument(filePath: string): Promise<void> {
-	const lsp = await loadLspService();
-	await lsp.peekLSPService()?.resyncGitChangedFiles([filePath]);
+export async function resyncHeldLspDocument(
+	filePath: string,
+): Promise<DriftDisposition | "no-service"> {
+	const service = (await loadLspService()).peekLSPService();
+	if (!service) return "no-service";
+	const dispositions = await service.resyncGitChangedFiles([filePath], {
+		saved: true,
+	});
+	// Empty only from a destroyed service, which `resetLSPService` unpublishes
+	// before it shuts it down.
+	return dispositions.get(filePath) ?? "no-service";
+}
+
+/**
+ * #3828, #3858: a formatter its bound gave up on writes F when its child
+ * settles, after the caller synced the bytes from before. Chain one
+ * `resyncHeldLspDocument` onto `settled` (the run's `FormatSummary.abandoned`):
+ * a reaction on a promise the formatter already owns, so it parks no awaiting
+ * task and holds no queue entry or timer, and a run that never settles leaves
+ * it inert. Held-only in every case, current session or not: it opens no file
+ * and spawns no server, and it reads no ambient abort signal (another turn's
+ * Escape must not stop it). It never stamps the read guard or a `FileTime`,
+ * so the formatter's bytes stay unseen by the agent. The row names what
+ * happened to F; a throw is one bounded `hook-handler-crash` and no rethrow:
+ * nothing awaits this.
+ */
+export function chainLateFormatResync(
+	settled: Promise<unknown>,
+	which: "deferred" | "inband",
+	row: { toolName: string; filePath: string; startedAt: number },
+	dbg: PipelineContext["dbg"],
+): void {
+	const inband = which === "inband";
+	const logLate = (outcome: string) => {
+		const common = {
+			type: "phase" as const,
+			toolName: row.toolName,
+			filePath: row.filePath,
+			durationMs: Date.now() - row.startedAt,
+			metadata: { outcome },
+		};
+		// One row per caller (#3828 the deferred drain, #3858 the in-band
+		// pipeline): they share one stated meaning, what became of F.
+		if (inband) logLatency({ ...common, phase: "inband_format_late_resync" });
+		else logLatency({ ...common, phase: "deferred_format_late_resync" });
+	};
+	void settled
+		.then(async () => {
+			logLate(await resyncHeldLspDocument(row.filePath));
+		})
+		.catch((err) => {
+			surfaceHandlerCrash(
+				inband ? "inband-format-late-resync" : "deferred-format-late-resync",
+				err,
+				{ dbg, rethrow: false },
+			);
+			logLate("failed");
+		});
 }
 
 export async function resyncLspFile(
@@ -1571,6 +1746,8 @@ function buildEnrichedBlockerOutput(
 		out += `  ... and ${blockers.length - 10} more\n`;
 	}
 
+	out += formatPromotionNotes(blockers);
+
 	return out;
 }
 
@@ -1669,6 +1846,15 @@ async function analysePipeline(
 			undefined,
 			writeHold,
 		);
+		// #3858: a formatter the budget (or Escape) gave up on writes F later,
+		// after the sync below pushed the bytes from before. Sync that write too.
+		if (formatResult.abandoned)
+			chainLateFormatResync(
+				formatResult.abandoned,
+				"inband",
+				{ toolName, filePath, startedAt: pipelineStart },
+				dbg,
+			);
 		formatChanged = formatResult.formatChanged;
 		formattersUsed = formatResult.formattersUsed;
 		formatFailures = formatResult.formatFailures;
@@ -1713,6 +1899,7 @@ async function analysePipeline(
 	let autofixTools: string[] = [];
 	let attemptedTools: string[] = [];
 	let autofixChangedFiles: string[] = [];
+	let autofixRestoring: Promise<FixRunLoss> | undefined;
 	let fixRefresh = false;
 	let autofixSkipReason: string | undefined;
 	if (!allowAutonomousWriters) {
@@ -1728,6 +1915,7 @@ async function analysePipeline(
 			attemptedTools,
 			changedFiles: autofixChangedFiles,
 			needsContentRefresh: fixRefresh,
+			restoring: autofixRestoring,
 			skipReason: autofixSkipReason,
 		} = await runAutofix(
 			filePath,
@@ -1738,6 +1926,13 @@ async function analysePipeline(
 			getFlagSource,
 			writeHold,
 		));
+	// The restore waits for pi's queue entries (#3830), so this result never
+	// waits for it: F's diagnostics and blockers must not wait on whoever holds a
+	// sibling. Attach its loss notice here, immediately after the fix run, so a
+	// later dispatch throw cannot drop it. It ends on its own, and a loss it
+	// finds goes to the agent through the advisory queue, like the `agent_end`
+	// drain's.
+	if (autofixRestoring) deliverFixRunLoss(autofixRestoring, ctx);
 	for (const changedFile of autofixChangedFiles) {
 		piChangedFiles.add(path.resolve(changedFile));
 	}
@@ -2097,10 +2292,18 @@ async function analysePipeline(
 						// #1023: a thrown compute is ALSO "couldn't compute downstream
 						// impact" — carry an indeterminate marker so turn_end surfaces an
 						// honest advisory instead of the error skip being logs-only.
-						indeterminate: {
-							reason: "error",
-							detail: "cascade computation failed",
-						},
+						// #3605: a tree-sitter wasm failure degraded the graph; it is
+						// not a compute error.
+						indeterminate: classifyTreeSitterWasmError(err)
+							? {
+									reason: "graph_degraded",
+									detail:
+										"review graph degraded — tree-sitter wasm runtime failure",
+								}
+							: {
+									reason: "error",
+									detail: "cascade computation failed",
+								},
 					};
 				});
 
@@ -2170,47 +2373,10 @@ async function analysePipeline(
 		// claims coverage for — it pins the entry rather than silently widening
 		// what an LSP check is allowed to clear.
 		inlineBlockerSources: hasDeliverableBlockers
-			? [
-					...new Set(
-						deliverableBlockers.map((d) => d.tool?.trim() || "unknown"),
-					),
-				]
+			? inlineBlockerSources(deliverableBlockers)
 			: undefined,
 		inlineBlockerLines: hasDeliverableBlockers
-			? deliverableBlockers
-					// #1641 review F2: the blocker array (#3190: the deliverable subset
-					// of `dispatchResult.blockers`) is NOT guaranteed to be
-					// scoped to THIS file — a chart-wide runner (helm-lint, helm-render)
-					// reports blocking diagnostics against other files in the chart
-					// (e.g. `values.yaml`) alongside `ctx.filePath`. The precedent every
-					// per-file runner already follows (dotnet-build.ts, javac.ts) is to
-					// drop cross-file rows before they reach a per-file record; this is
-					// that same filter applied at the aggregation point instead, since
-					// `blockers` is pooled across every runner dispatched for this file.
-					// Without it, a cross-file line count gets attributed to THIS
-					// file's past-EOF check and can demote an in-bounds, fully valid
-					// blocker for content the diagnostic never described.
-					//
-					// #1641 review round 2 (LOW): `path.resolve` equality doesn't fold
-					// case, and an LSP-sourced diagnostic's `filePath` is stamped with
-					// realpath canonical casing (dispatch/runners/lsp.ts ->
-					// normalizeMapKey) while `ctx.filePath` can arrive lowercase-drive
-					// on Windows — the drive-letter class from #1139/#1150. A bare
-					// `path.resolve` equality then drops EVERY LSP blocker line and
-					// this record silently skips the past-EOF gate (fail-open, but
-					// exactly the pre-fix behavior on the surface #1641 targets).
-					// `normalizeEphemeralMapKey` slash-folds and (on win32)
-					// lowercase-folds both sides with no filesystem I/O — cheap enough
-					// for this per-blocker hot-path filter. `pathsEqual` was
-					// deliberately NOT used here: it calls `realpathSync` per
-					// comparison, which this filter cannot afford per blocker.
-					.filter(
-						(d) =>
-							normalizeEphemeralMapKey(d.filePath) ===
-							normalizeEphemeralMapKey(filePath),
-					)
-					.map((d) => d.line)
-					.filter((line): line is number => typeof line === "number")
+			? inlineBlockerLines(deliverableBlockers, filePath)
 			: undefined,
 		actionableWarnings,
 		codeQualityWarnings,

@@ -113,12 +113,46 @@ function withRootMarkers(
 	return root;
 }
 
+/**
+ * #3750: the server could not name a project root for a file, so its client is
+ * hosted at the file's own directory (or at a marker the root policy refused).
+ * For a server that needs a project (`requiresProjectRoot`) an empty answer
+ * from that state is not evidence of clean: rust-analyzer answers an empty
+ * result for a detached file.
+ *
+ * `failed`: the root function threw. `unselected`: a marker exists (`marker`)
+ * but the root function returned nothing, e.g. a test-fixture or git-ignored
+ * directory. `none`: no marker was found.
+ */
+export type LspRootFallback = {
+	serverId: string;
+	serverName: string;
+	rootMarkers: readonly string[];
+	requiresProjectRoot: boolean;
+	cause: "failed" | "unselected" | "none";
+	marker?: string;
+};
+
+/** The reason text for a root fallback, worded by what actually happened. */
+export function describeRootFallback(fallback: LspRootFallback): string {
+	const tail = "so pi-lens cannot confirm the server analysed the file";
+	if (fallback.cause === "failed") {
+		return `${fallback.serverName}: resolving the project root for this file failed, ${tail}`;
+	}
+	if (fallback.cause === "unselected") {
+		return `${fallback.serverName}: found ${fallback.marker} for this file but pi-lens did not select it as the project root (a test-fixture or git-ignored directory is never used as one), ${tail}`;
+	}
+	return `${fallback.serverName}: no project root found for this file (looked for ${fallback.rootMarkers.join(" / ")}); the server was started at the file's directory and may not have analysed it`;
+}
+
 /** Resolve a server identity cwd through the shared tool-cwd seam. */
 export async function resolveLspServerCwd(
-	server: Pick<LSPServerInfo, "id" | "root" | "rootMarkers">,
+	server: Pick<LSPServerInfo, "id" | "root" | "rootMarkers"> &
+		Partial<Pick<LSPServerInfo, "name" | "requiresProjectRoot">>,
 	filePath: string,
 	sessionCwd: string,
 	onRootFailure?: (reason: string) => void,
+	onRootFallback?: (fallback: LspRootFallback) => void,
 ): Promise<string | undefined> {
 	const rootMarkers = server.rootMarkers ?? server.root.rootMarkers;
 	let serverRoot: string | undefined;
@@ -135,18 +169,50 @@ export async function resolveLspServerCwd(
 		rootMarkers?.length &&
 		path.resolve(serverRoot) === path.resolve(path.dirname(filePath));
 	if (!serverRoot || isFileDirFallback) {
+		// A marker the root policy refused (fixture / ignored directory) is worded
+		// differently from no marker at all; `suppressTelemetry`: a wording probe.
+		// The resolver's own `.git` fallback marker only counts when it is one of
+		// this server's markers (#3750 F4); the probe runs only for a listener.
+		const probedMarker =
+			onRootFallback && !rootFailed && rootMarkers?.length
+				? resolveToolCwd("lsp", server.id, filePath, {
+						cwd: sessionCwd,
+						rootMarkers,
+						suppressTelemetry: true,
+					}).marker
+				: undefined;
+		const refusedMarker =
+			probedMarker !== undefined && rootMarkers?.includes(probedMarker)
+				? probedMarker
+				: undefined;
+		const fallbackCwd = rootMarkers?.length
+			? resolveToolCwd("lsp", server.id, filePath, {
+					cwd: path.dirname(path.resolve(filePath)),
+					rootMarkers,
+				})
+			: undefined;
 		if (!serverRoot) {
 			recordDegradationOnce({
 				kind: "tool-cwd-resolution",
 				subject: server.id,
 				reason: `lsp:server-root-${rootFailed ? "failed" : "fallback"}:${filePath}`,
 			});
+			// Not gated by the once-only record above: every caller that asks
+			// learns the verdict, not only the first one per file.
+			onRootFallback?.({
+				serverId: server.id,
+				serverName: server.name ?? server.id,
+				rootMarkers: rootMarkers ?? [],
+				requiresProjectRoot: server.requiresProjectRoot === true,
+				cause: rootFailed
+					? "failed"
+					: refusedMarker !== undefined
+						? "unselected"
+						: "none",
+				...(refusedMarker !== undefined && { marker: refusedMarker }),
+			});
 		}
-		if (!rootMarkers?.length) return undefined;
-		return resolveToolCwd("lsp", server.id, filePath, {
-			cwd: path.dirname(path.resolve(filePath)),
-			rootMarkers,
-		}).cwd;
+		return fallbackCwd?.cwd;
 	}
 	const boundedServerRoot = enforceLspRootCeiling(
 		serverRoot,
@@ -409,6 +475,14 @@ export interface LSPServerInfo {
 	id: string;
 	name: string;
 	extensions: readonly string[];
+	/**
+	 * Idle-eviction policy for this server's clients. `transparent` = the client
+	 * may be released after the shared idle window and rebuilds on the next
+	 * request; it requires measured per-server evidence. `resident` = deliberately
+	 * kept resident. `unmeasured` = no evidence yet; treated as resident so an
+	 * unmeasured server is never evicted by omission.
+	 */
+	idleEviction: "transparent" | "resident" | "unmeasured";
 	/** True for entries supplied through `lsp.servers.*`, not the built-in table. */
 	custom?: boolean;
 	root: RootFunction;
@@ -429,6 +503,16 @@ export interface LSPServerInfo {
 	 * alongside a working preferred server.
 	 */
 	fallbackFor?: string;
+	/**
+	 * #3750: true when the server analyses nothing for a file outside a project
+	 * (rust-analyzer: detached files; csharp-ls/OmniSharp/FSAutocomplete need a
+	 * solution or project). Only then is an empty answer under a root fallback
+	 * demoted to unconfirmed. Omitted/false for servers whose root markers are
+	 * optional config (lua-language-server, nixd, deno, ...): they analyse
+	 * standalone files, so their verdict is unchanged. Claim only measured or
+	 * documented behaviour.
+	 */
+	requiresProjectRoot?: boolean;
 	/** Simple command name whose absence disables spawn attempts briefly across roots. */
 	availabilityKey?: string;
 	/**
@@ -517,8 +601,43 @@ const directLspCommandSkipLoggedUntil = new Map<string, number>();
 // live LSP generation. A session reset can retire that generation while a
 // managed lookup, install, or launch is still awaiting; stale work must not
 // publish into the replacement session (#2351, shape 22).
+//
+// The LSP service is a process singleton, so this counter is one too: a source
+// built per module evaluation would give a second evaluation a second counter
+// for one service, and a handle captured through the first would stay current
+// after the second's `resetLSPService` (#3733, N4 of #3609). The cell shares
+// the `lsp.service` lifetime; it is a sibling family because `lsp/index.ts`,
+// which owns that cell, imports this module.
+const LSP_SERVICE_GENERATION_FAMILY = "lsp.service.generation";
+/**
+ * The counter name `generation` is frozen: a cell of another version hands it
+ * over by name, so a renamed or nested counter would restart its sequence
+ * within the process. Add a field beside it; never rename or move it.
+ */
+const LSP_SERVICE_GENERATION_VERSION = 1;
+
+function lspServiceGenerationCell(): { generation: number } {
+	let seed = 0;
+	return getProcessSingleton(
+		LSP_SERVICE_GENERATION_FAMILY,
+		LSP_SERVICE_GENERATION_VERSION,
+		() => ({ generation: seed }),
+		(previous) => {
+			// A cell from another build is replaced, but its count seeds the new
+			// one: a generation never repeats within a process.
+			const value = (previous as { generation?: unknown } | undefined)
+				?.generation;
+			seed =
+				typeof value === "number" && Number.isSafeInteger(value) && value > 0
+					? value
+					: 0;
+		},
+	);
+}
+
 const lspLaunchAvailabilityGeneration = createGenerationSource(
 	"lsp-launch-availability",
+	lspServiceGenerationCell,
 );
 
 export function resetLspLaunchAvailabilityGeneration(): void {
@@ -1359,6 +1478,7 @@ interface InteractiveServerSpec {
 	root: RootFunction;
 	language: string;
 	fallbackFor?: string;
+	requiresProjectRoot?: boolean;
 	command: string | ((root: string) => string);
 	args?: string[] | ((root: string) => string[]);
 	initialization?:
@@ -1378,9 +1498,11 @@ function createInteractiveServer(spec: InteractiveServerSpec): LSPServerInfo {
 		id: spec.id,
 		name: spec.name,
 		extensions: spec.extensions,
+		idleEviction: "unmeasured",
 		root: spec.root,
 		rootMarkers: spec.root.rootMarkers,
 		fallbackFor: spec.fallbackFor,
+		requiresProjectRoot: spec.requiresProjectRoot,
 		availabilityKey:
 			typeof spec.command === "string" && isSimpleCommand(spec.command)
 				? spec.command
@@ -2356,6 +2478,7 @@ const TypeScriptRoot: RootFunction = withRootMarkers(
 
 export const TypeScriptServer: LSPServerInfo = {
 	id: "typescript",
+	idleEviction: "transparent",
 	name: "TypeScript Language Server",
 	extensions: JS_TS_LSP_EXTENSIONS,
 	autoPropagateDiagnostics: true,
@@ -2444,6 +2567,7 @@ export const TypeScriptServer: LSPServerInfo = {
 
 export const DenoServer: LSPServerInfo = {
 	id: "deno",
+	idleEviction: "transparent",
 	name: "Deno Language Server",
 	fallbackFor: "typescript",
 	extensions: JS_TS_LSP_EXTENSIONS,
@@ -2464,6 +2588,7 @@ export const DenoServer: LSPServerInfo = {
 
 export const PythonServer: LSPServerInfo = {
 	id: "python",
+	idleEviction: "transparent",
 	name: "Pyright Language Server",
 	extensions: KIND_EXTENSIONS["python"],
 	root: RootWithFallback(
@@ -2610,6 +2735,7 @@ export const PythonServer: LSPServerInfo = {
 
 export const PythonJediServer: LSPServerInfo = {
 	id: "python-jedi",
+	idleEviction: "unmeasured",
 	name: "Jedi Language Server",
 	fallbackFor: "python",
 	extensions: KIND_EXTENSIONS["python"],
@@ -2647,6 +2773,7 @@ export const PythonJediServer: LSPServerInfo = {
 
 export const GoServer: LSPServerInfo = {
 	id: "go",
+	idleEviction: "unmeasured",
 	name: "gopls",
 	extensions: KIND_EXTENSIONS["go"],
 	root: RootWithFallback(
@@ -2890,6 +3017,9 @@ function JavaWorkspaceRoot(): RootFunction {
 
 export const RustServer: LSPServerInfo = {
 	id: "rust",
+	idleEviction: "unmeasured",
+	// Measured (#3750): rust-analyzer answers an empty result for a detached file.
+	requiresProjectRoot: true,
 	name: "rust-analyzer",
 	extensions: KIND_EXTENSIONS["rust"],
 	// No FileDirRoot fallback (#201): rust-analyzer is a heavy workspace server
@@ -2928,6 +3058,7 @@ export const RustServer: LSPServerInfo = {
 
 export const RubyServer: LSPServerInfo = {
 	id: "ruby",
+	idleEviction: "unmeasured",
 	name: "Ruby LSP",
 	extensions: KIND_EXTENSIONS["ruby"],
 	root: RootWithFallback(
@@ -2989,6 +3120,7 @@ export const RubyServer: LSPServerInfo = {
 
 export const PHPServer: LSPServerInfo = {
 	id: "php",
+	idleEviction: "transparent",
 	name: "Intelephense",
 	extensions: KIND_EXTENSIONS["php"],
 	root: RootWithFallback(
@@ -3070,6 +3202,7 @@ function buildPsesArgs(bundleDir: string): string[] {
 
 export const PowerShellServer: LSPServerInfo = {
 	id: "powershell",
+	idleEviction: "unmeasured",
 	name: "PowerShell Editor Services",
 	extensions: KIND_EXTENSIONS["powershell"],
 	// Index at the workspace (script modules reference siblings); fall back to the
@@ -3094,6 +3227,9 @@ export const PowerShellServer: LSPServerInfo = {
 
 export const CSharpServer: LSPServerInfo = {
 	id: "csharp",
+	idleEviction: "unmeasured",
+	// Documented (#3750): csharp-ls needs a solution or project.
+	requiresProjectRoot: true,
 	name: "csharp-ls",
 	extensions: KIND_EXTENSIONS["csharp"],
 	// No FileDirRoot fallback (#201): csharp-ls is a workspace server and should
@@ -3123,6 +3259,8 @@ export const CSharpServer: LSPServerInfo = {
 export const OmniSharpServer = createInteractiveServer({
 	id: "omnisharp",
 	name: "OmniSharp",
+	// Documented (#3750): OmniSharp needs a solution or project.
+	requiresProjectRoot: true,
 	fallbackFor: "csharp",
 	extensions: KIND_EXTENSIONS["csharp"],
 	root: createRootDetector([...DOTNET_CSHARP_ROOT_MARKERS]),
@@ -3133,6 +3271,9 @@ export const OmniSharpServer = createInteractiveServer({
 
 export const FSharpServer: LSPServerInfo = {
 	id: "fsharp",
+	idleEviction: "unmeasured",
+	// Documented (#3750): FSAutocomplete needs a project.
+	requiresProjectRoot: true,
 	name: "FSAutocomplete",
 	extensions: KIND_EXTENSIONS["fsharp"],
 	root: createRootDetector([...DOTNET_FSHARP_ROOT_MARKERS]),
@@ -3171,6 +3312,7 @@ export const JavaServer = createInteractiveServer({
 
 export const KotlinServer: LSPServerInfo = {
 	id: "kotlin",
+	idleEviction: "unmeasured",
 	name: "Kotlin Language Server",
 	extensions: KIND_EXTENSIONS["kotlin"],
 	root: RootWithFallback(
@@ -3184,6 +3326,11 @@ export const KotlinServer: LSPServerInfo = {
 				candidates: ["kotlin-lsp", "kotlin-language-server"],
 				args: [],
 				cwd: root,
+				// #3400: a managed fwcd install when no PATH candidate launches. The
+				// managed shim is consulted FIRST, but only exists once no PATH
+				// candidate answered, so a PATH `kotlin-lsp` wins on a box that had
+				// it before the managed install; one added afterwards does not.
+				managedToolId: "kotlin-language-server",
 			},
 			options?.allowInstall,
 		);
@@ -3232,11 +3379,14 @@ function createTreeBinaryServer(spec: {
 	/** Path to the executable inside the extracted bundle, e.g. "bin/clangd". */
 	binRelPath: string;
 	args?: string[];
+	/** Idle-eviction policy override; defaults to `unmeasured` (resident). */
+	idleEviction?: "transparent" | "resident" | "unmeasured";
 }): LSPServerInfo {
 	return {
 		id: spec.id,
 		name: spec.name,
 		extensions: spec.extensions,
+		idleEviction: spec.idleEviction ?? "unmeasured",
 		root: spec.root,
 		spawn(root, options) {
 			return resolveAndLaunchTreeBinary(
@@ -3273,6 +3423,7 @@ export const LuaServer: LSPServerInfo = createTreeBinaryServer({
 // neither is available (→ coverage notice); cpp-check stays the fallback.
 export const CppServer: LSPServerInfo = createTreeBinaryServer({
 	id: "cpp",
+	idleEviction: "transparent",
 	name: "clangd",
 	extensions: KIND_EXTENSIONS["cxx"],
 	root: RootWithFallback(
@@ -3290,6 +3441,7 @@ export const CppServer: LSPServerInfo = createTreeBinaryServer({
 
 export const ZigServer: LSPServerInfo = {
 	id: "zig",
+	idleEviction: "unmeasured",
 	name: "ZLS",
 	extensions: KIND_EXTENSIONS["zig"],
 	root: RootWithFallback(createRootDetector(["build.zig"])),
@@ -3327,6 +3479,7 @@ export const ElixirServer = createInteractiveServer({
 
 export const ElixirExpertServer: LSPServerInfo = {
 	id: "expert",
+	idleEviction: "unmeasured",
 	name: "Expert",
 	fallbackFor: "elixir",
 	extensions: KIND_EXTENSIONS["elixir"],
@@ -3348,6 +3501,7 @@ export const ElixirExpertServer: LSPServerInfo = {
 
 export const GleamServer: LSPServerInfo = {
 	id: "gleam",
+	idleEviction: "unmeasured",
 	name: "Gleam LSP",
 	extensions: KIND_EXTENSIONS["gleam"],
 	root: RootWithFallback(createRootDetector(["gleam.toml"])),
@@ -3368,6 +3522,7 @@ export const GleamServer: LSPServerInfo = {
 
 export const TinymistServer: LSPServerInfo = {
 	id: "tinymist",
+	idleEviction: "unmeasured",
 	name: "Tinymist",
 	extensions: extensionsForLanguage("typst"),
 	root: RootWithFallback(createRootDetector(["typst.toml", ".git"])),
@@ -3387,6 +3542,7 @@ export const TinymistServer: LSPServerInfo = {
 
 export const MarksmanServer: LSPServerInfo = {
 	id: "marksman",
+	idleEviction: "transparent",
 	name: "Marksman",
 	extensions: KIND_EXTENSIONS["markdown"],
 	// Index at the workspace root so cross-file checks (broken intra-repo links,
@@ -3419,6 +3575,7 @@ export const OCamlServer = createInteractiveServer({
 
 export const ClojureServer: LSPServerInfo = {
 	id: "clojure",
+	idleEviction: "transparent",
 	name: "Clojure LSP",
 	extensions: KIND_EXTENSIONS["clojure"],
 	root: createRootDetector(["deps.edn", "project.clj"]),
@@ -3439,6 +3596,7 @@ export const ClojureServer: LSPServerInfo = {
 
 export const CueServer: LSPServerInfo = {
 	id: "cue",
+	idleEviction: "unmeasured",
 	name: "CUE Language Server",
 	extensions: KIND_EXTENSIONS["cue"],
 	root: RootWithFallback(createRootDetector(["cue.mod", ".git"])),
@@ -3457,6 +3615,7 @@ export const CueServer: LSPServerInfo = {
 
 export const TerraformServer: LSPServerInfo = {
 	id: "terraform",
+	idleEviction: "unmeasured",
 	name: "Terraform LSP",
 	extensions: KIND_EXTENSIONS["terraform"],
 	root: RootWithFallback(
@@ -3486,6 +3645,7 @@ export const NixServer = createInteractiveServer({
 
 export const BashServer: LSPServerInfo = {
 	id: "bash",
+	idleEviction: "transparent",
 	name: "Bash Language Server",
 	extensions: [".bash", ".sh", ".zsh"],
 	root: FileDirRoot,
@@ -3517,6 +3677,7 @@ export const BashServer: LSPServerInfo = {
 
 export const FishServer: LSPServerInfo = {
 	id: "fish",
+	idleEviction: "transparent",
 	name: "Fish Language Server",
 	extensions: KIND_EXTENSIONS["fish"],
 	root: RootWithFallback(createRootDetector([".git"])),
@@ -3535,6 +3696,7 @@ export const FishServer: LSPServerInfo = {
 
 export const CMakeServer: LSPServerInfo = {
 	id: "cmake",
+	idleEviction: "unmeasured",
 	name: "CMake Language Server",
 	// CMake's canonical project file has no .cmake suffix. The configured-server
 	// matcher supports exact basenames as well as extensions.
@@ -3555,6 +3717,7 @@ export const CMakeServer: LSPServerInfo = {
 
 export const DockerServer: LSPServerInfo = {
 	id: "docker",
+	idleEviction: "unmeasured",
 	name: "Dockerfile Language Server",
 	extensions: [".dockerfile", "Dockerfile"],
 	root: RootWithFallback(
@@ -3583,6 +3746,7 @@ export const DockerServer: LSPServerInfo = {
 
 export const YamlServer: LSPServerInfo = {
 	id: "yaml",
+	idleEviction: "transparent",
 	name: "YAML Language Server",
 	extensions: KIND_EXTENSIONS["yaml"],
 	root: RootWithFallback(
@@ -3606,6 +3770,7 @@ export const YamlServer: LSPServerInfo = {
 
 export const JsonServer: LSPServerInfo = {
 	id: "json",
+	idleEviction: "unmeasured",
 	name: "VSCode JSON Language Server",
 	extensions: KIND_EXTENSIONS["json"],
 	root: RootWithFallback(
@@ -3636,6 +3801,7 @@ export const JsonServer: LSPServerInfo = {
 
 export const HtmlServer: LSPServerInfo = {
 	id: "html",
+	idleEviction: "transparent",
 	name: "VSCode HTML Language Server",
 	extensions: KIND_EXTENSIONS["html"],
 	root: RootWithFallback(
@@ -3658,6 +3824,7 @@ export const HtmlServer: LSPServerInfo = {
 
 export const TomlServer: LSPServerInfo = {
 	id: "toml",
+	idleEviction: "unmeasured",
 	name: "Taplo",
 	extensions: KIND_EXTENSIONS["toml"],
 	root: RootWithFallback(
@@ -3678,6 +3845,7 @@ export const TomlServer: LSPServerInfo = {
 
 export const PrismaServer: LSPServerInfo = {
 	id: "prisma",
+	idleEviction: "transparent",
 	name: "Prisma Language Server",
 	extensions: KIND_EXTENSIONS["prisma"],
 	root: RootWithFallback(
@@ -3711,6 +3879,7 @@ export const PrismaServer: LSPServerInfo = {
 
 export const VueServer: LSPServerInfo = {
 	id: "vue",
+	idleEviction: "unmeasured",
 	name: "Vue Language Server",
 	extensions: [".vue"],
 	root: RootWithFallback(
@@ -3770,6 +3939,7 @@ export const VueServer: LSPServerInfo = {
 
 export const SvelteServer: LSPServerInfo = {
 	id: "svelte",
+	idleEviction: "unmeasured",
 	name: "Svelte Language Server",
 	extensions: [".svelte"],
 	root: RootWithFallback(
@@ -3818,6 +3988,7 @@ export const SvelteServer: LSPServerInfo = {
 
 export const CssServer: LSPServerInfo = {
 	id: "css",
+	idleEviction: "transparent",
 	name: "CSS Language Server",
 	extensions: KIND_EXTENSIONS["css"],
 	root: RootWithFallback(
@@ -3902,6 +4073,7 @@ function opengrepInitialization(root: string): Record<string, unknown> {
 
 export const OpengrepServer: LSPServerInfo = {
 	id: "opengrep",
+	idleEviction: "transparent",
 	name: "Opengrep Security Scanner",
 	role: "auxiliary",
 	extensions: OPENGREP_EXTENSIONS,
@@ -3978,6 +4150,7 @@ const AST_GREP_EXTENSIONS: readonly string[] = Array.from(
 
 export const AstGrepServer: LSPServerInfo = {
 	id: "ast-grep",
+	idleEviction: "unmeasured",
 	name: "ast-grep structural linter",
 	role: "auxiliary",
 	extensions: AST_GREP_EXTENSIONS,
@@ -4047,6 +4220,7 @@ const ZIZMOR_EXTENSIONS: readonly string[] = KIND_EXTENSIONS["yaml"];
 
 export const ZizmorServer: LSPServerInfo = {
 	id: "zizmor",
+	idleEviction: "unmeasured",
 	name: "zizmor Actions Security Scanner",
 	role: "auxiliary",
 	extensions: ZIZMOR_EXTENSIONS,
@@ -4135,6 +4309,7 @@ function typosInitialization(
 
 export const TyposServer: LSPServerInfo = {
 	id: "typos",
+	idleEviction: "unmeasured",
 	name: "typos Spell Checker",
 	role: "auxiliary",
 	extensions: TYPOS_EXTENSIONS,

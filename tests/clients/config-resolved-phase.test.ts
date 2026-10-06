@@ -52,6 +52,12 @@ import {
 import { normalizeFilePath } from "../../clients/path-utils.js";
 import { removeTempDirSync } from "./test-utils.js";
 
+// This file truncates and reads latency.log and reads sessionstart.log by byte
+// offset; a concurrent real session_start writer appends its own rows, which
+// made a neighbouring file red under the pre-#3721 shared home. The harness's
+// per-worker PI_LENS_HOME keeps those writers off this file's sink; the loggers
+// bind their paths at load, so the home is the harness's.
+
 interface ConfigResolvedMetadata {
 	sessionId: string;
 	documents: Array<{ tier: string; file: string; legacy: boolean }>;

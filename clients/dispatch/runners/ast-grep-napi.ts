@@ -40,6 +40,7 @@ import type {
 	RunnerDefinition,
 	RunnerResult,
 } from "../types.js";
+import { findingsResult } from "../types.js";
 import {
 	calculateRuleComplexity,
 	isOverlyBroadPattern,
@@ -1334,7 +1335,9 @@ const astGrepNapiRunner: RunnerDefinition = {
 				incrementDegradationCount({
 					kind: "aux-runner-findings-lost",
 					subject: "ast-grep",
-					reason: `Gate B skipped napi for ${ctx.filePath}: a pending late-auxiliary pair from an EARLIER touch is still undelivered while a prior publication satisfies the per-file gate`,
+					// #3704/#3696: retain the complete diagnostic before the
+					// unbounded file path reaches truncateForLedger.
+					reason: `Gate B skipped napi: pending late-auxiliary pair from an EARLIER touch remains undelivered while prior publication satisfies per-file gate (file: ${ctx.filePath})`,
 				});
 			}
 			return { status: "skipped", diagnostics: [], semantic: "none" };
@@ -1491,11 +1494,10 @@ const astGrepNapiRunner: RunnerDefinition = {
 		} else if (diagnostics.length > 0) {
 			semantic = "warning";
 		}
-		return {
+		return findingsResult(diagnostics, {
 			status: hasBlocking ? "failed" : "succeeded",
-			diagnostics,
 			semantic,
-		};
+		});
 	},
 };
 

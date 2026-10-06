@@ -51,14 +51,17 @@
  * at call time, so a replaced runtime or cache manager is picked up without
  * re-registration — the same live-getter discipline the read bridge uses.
  */
+import { recordDegradationOnce } from "./degradation-ledger.js";
 import {
 	classifyBridgeMutation,
 	type BridgeMutationEntry,
 	type MutatingToolClassification,
 } from "./mutating-tool.js";
+import { noteAgentMutation } from "./fix-run-restore.js";
 import { noteMutationHandled } from "./observed-mutation.js";
 import type { ProjectChangeSource } from "./project-changes.js";
 import { getProcessBridge, registerProcessBridge } from "./process-bridge.js";
+import { recordDroppedRead } from "./session-scope.js";
 
 /** Stable Symbol key — identical across module reloads in the same process. */
 export const MUTATION_BRIDGE_KEY: unique symbol = Symbol.for(
@@ -84,7 +87,19 @@ export interface MutationBridgeDeps {
 	getRuntime(): {
 		turnIndex: number;
 		telemetrySessionId?: string;
-		readGuard?: { recordWritten?: (filePath: string) => void };
+		/**
+		 * The live read guard. Required: the real `RuntimeCoordinator` always
+		 * exposes it (a lazily-built getter), and #3677's bound needs its
+		 * `currentBranchEpoch` on every call.
+		 */
+		readGuard: {
+			/** #3677: the live epoch a forwarded epoch is validated against. */
+			currentBranchEpoch: number;
+			recordWritten?: (
+				filePath: string,
+				opts?: { branchEpoch?: number; stampFileTime?: boolean },
+			) => void;
+		};
 		recordProjectMutation?: (args: {
 			filePath: string;
 			source: ProjectChangeSource;
@@ -100,6 +115,7 @@ export interface MutationBridgeDeps {
 			kind: "autofix" | "format",
 			ownerSessionId?: string,
 			originCwd?: string,
+			readGuardBranchEpoch?: number,
 		) => boolean;
 	};
 	getCacheManager(): {
@@ -209,6 +225,51 @@ export function isValidMutationEntry(
 }
 
 /**
+ * #3677: a foreign producer may pass the read guard's branch epoch it captured
+ * before it awaited. Resolve it into the epoch the bridge forwards to both
+ * consumers: `ReadGuard.recordWritten` (a concrete epoch makes the guard
+ * refuse to credit a write that landed on a different branch, #3521) and
+ * `RuntimeCoordinator.deferMutation`, whose `Math.max` merge a foreign value
+ * must never reach (#3677's poison).
+ *
+ * Only an integer from 0 to the live guard's `currentBranchEpoch` is a
+ * capture this scope can hold: `branchEpoch` only counts up within a scope.
+ * Anything else is ignored for BOTH consumers, with one bounded degradation
+ * record per session, the same fail-open-to-current treatment a producer that
+ * omits the field gets. That includes a well-formed epoch ABOVE the live one
+ * (#3763 item 5). #3677 round 3 read such a value as a dead session's capture
+ * (a new `ReadGuard` restarts at 0 after `resetForSession`) and skipped the
+ * stamp and the deferral, silently under `no-read-guard`. Session currency is
+ * the entry's lineage since S3 (#3759): the one in-process producer that
+ * sends an epoch, the settled sweep, sends the lineage it captured with it,
+ * and the fence in {@link recordMutationThroughSeam} drops a dead session's
+ * replay before this runs. A producer without a lineage cannot learn an epoch
+ * at all (the bridge exposes none), so a value above the live one is
+ * invented. Recorded once per session: the count is not the signal, the
+ * producer bug is.
+ */
+function resolveReadGuardBranchEpoch(
+	value: unknown,
+	currentEpoch: number,
+): number | undefined {
+	if (value === undefined) return undefined;
+	const wellFormed =
+		typeof value === "number" && Number.isInteger(value) && value >= 0;
+	if (wellFormed && value <= currentEpoch) return value;
+	recordDegradationOnce({
+		kind: "mutation-bridge-invalid-branch-epoch",
+		subject: "readGuardBranchEpoch",
+		// #3677 review round 1 F3: `typeof`, never `String(value)` — a
+		// null-proto object has no `toString`, and the throw dropped the whole
+		// record (turn state, receipt, deferral) out of the bridge's try.
+		reason: wellFormed
+			? `ignored a readGuardBranchEpoch above the live epoch (${value} > ${currentEpoch})`
+			: `ignored a foreign readGuardBranchEpoch (typeof ${typeof value}) (current ${currentEpoch})`,
+	});
+	return undefined;
+}
+
+/**
  * The one range the change log records for this mutation. A multi-range edit
  * records its bounding box, matching how `runtime-tool-result.ts` collapses a
  * multi-hunk diff (`singleRange`) — the change log carries one range per entry.
@@ -251,6 +312,10 @@ export function recordMutationThroughSeam(
 		return false;
 	}
 
+	// #3598: an observed or bridged producer's write is an agent mutation a
+	// running whole-package fixer must not erase. Read it before the bookkeeping.
+	noteAgentMutation(entry.filePath);
+
 	const classification = classifyBridgeMutation(entry);
 	const filePath = entry.filePath;
 	const runtime = deps.getRuntime();
@@ -258,13 +323,50 @@ export function recordMutationThroughSeam(
 	const dispatchCwd = deps.getDispatchCwd(filePath);
 
 	try {
+		const stampReadGuard = deps.shouldStampReadGuard?.() ?? true;
+		// #3620/#3709: once the producer's scope has retired, the replay writes
+		// none of the live session's state (the stamp, turn state and deferral
+		// below); the receipt and the handled mark are disk facts and stay. The
+		// epoch alone cannot refuse it: it restarts at 0 in every scope. No
+		// lineage (every external producer): fail-open, as before.
+		const lineage = entry.lineage;
+		let sessionLive = true;
+		if (
+			lineage !== undefined &&
+			lineage.guardedWrite(filePath, () => true) !== true
+		) {
+			sessionLive = false;
+			// The write's own queue-time epoch is the entry's, when it has one.
+			if (stampReadGuard)
+				recordDroppedRead(
+					lineage,
+					entry.provenance ?? classification.toolName,
+					entry.readGuardBranchEpoch ?? lineage.branchEpoch,
+				);
+		}
+		// #3677: resolve the foreign epoch BEFORE either consumer sees it, so the
+		// `Math.max` merge of the deferred queue never gets a value this scope
+		// cannot hold. A dead session's replay was dropped above, unresolved.
+		const stamp = sessionLive
+			? resolveReadGuardBranchEpoch(
+					entry.readGuardBranchEpoch,
+					runtime.readGuard.currentBranchEpoch,
+				)
+			: undefined;
 		// 1. Staleness stamp: the file changed under pi-lens, so a later edit is
 		//    judged by read coverage rather than by this write. #2465: gated on
 		//    `shouldStampReadGuard` (the `no-read-guard` flag) ALONE — the
 		//    `isRecordable` check above already passed, so the write itself is
 		//    still bookkept below whether or not the stamp fires.
-		if (deps.shouldStampReadGuard?.() ?? true) {
-			runtime.readGuard?.recordWritten?.(filePath);
+		if (sessionLive && stampReadGuard) {
+			runtime.readGuard.recordWritten?.(filePath, {
+				...(stamp !== undefined && {
+					branchEpoch: stamp,
+				}),
+				// #3525: settled-sweep drift is unattributed, and the agent never
+				// saw it: authorship, not FileTime.
+				...(entry.provenance === "settled-sweep" && { stampFileTime: false }),
+			});
 		}
 
 		// 2. Turn state: this is the insert that leaves `turn-state.json` `files`
@@ -274,15 +376,16 @@ export function recordMutationThroughSeam(
 		//    that DOES know the real value threads it through the entry instead
 		//    of this seam silently understating it (#2450 review round 2, F1).
 		const changedRange = resolveChangedRange(classification, deps, filePath);
-		deps
-			.getCacheManager()
-			.addModifiedRange?.(
-				filePath,
-				changedRange,
-				entry.importsChanged ?? false,
-				projectRoot,
-				runtime.telemetrySessionId,
-			);
+		if (sessionLive)
+			deps
+				.getCacheManager()
+				.addModifiedRange?.(
+					filePath,
+					changedRange,
+					entry.importsChanged ?? false,
+					projectRoot,
+					runtime.telemetrySessionId,
+				);
 
 		// 3. Attributed change-log receipt. The source carries the producer's
 		//    identity instead of collapsing onto `agent-edit`, so a report can
@@ -318,7 +421,7 @@ export function recordMutationThroughSeam(
 		//    behaviorally equivalent for the same write. Every other producer
 		//    (ast_grep_replace, a third-party extension) omits the field and
 		//    keeps deferring, unchanged.
-		if (entry.deferAutofix !== false) {
+		if (sessionLive && entry.deferAutofix !== false) {
 			for (const kind of ["autofix", "format"] as const) {
 				runtime.deferMutation?.(
 					filePath,
@@ -328,6 +431,11 @@ export function recordMutationThroughSeam(
 					kind,
 					runtime.telemetrySessionId,
 					projectRoot,
+					// #3521: the settled sweep's epoch, so a record it queues after
+					// a /tree is not credited to the new branch. #3677: a value this
+					// scope cannot hold is dropped (undefined), so the merge uses the
+					// current epoch.
+					stamp,
 				);
 			}
 		}

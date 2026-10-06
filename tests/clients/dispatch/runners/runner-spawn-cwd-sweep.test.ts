@@ -418,11 +418,11 @@ const ORIGIN_ADMISSION_ROWS: ReadonlyArray<readonly [string, string]> = [
 		"the synchronous safe-spawn path derives its cwd from its own compatibility options, not the dispatch resolveToolCwd seam",
 	],
 	[
-		"clients/lsp/launch.ts#trySpawn:e7bf6cb1~dbf27697",
+		"clients/lsp/launch.ts#trySpawn:94ea224d~dbf27697",
 		"LSP launch helper receives its own cwd parameter from the server launch boundary",
 	],
 	[
-		"clients/lsp/launch.ts#trySpawn:86ab761d~dbf27697",
+		"clients/lsp/launch.ts#trySpawn:842c77c2~dbf27697",
 		"LSP launch helper receives its own cwd parameter from the server launch boundary",
 	],
 	[
@@ -654,11 +654,11 @@ const ORIGIN_ADMISSION_ROWS: ReadonlyArray<readonly [string, string]> = [
 		"cwd is tryEslintFix's own `cwd` parameter, used for the eslint `--version` probe; the checked site is runAutofix in this file",
 	],
 	[
-		"clients/pipeline.ts#tryRustClippyFix:cabb2369~86686e4d",
+		"clients/pipeline.ts#tryRustClippyFix:3944a385~86686e4d",
 		'cwd is `cargoDir` = findNearestContaining(dirname(filePath), ["Cargo.toml"]): `cargo clippy --fix` must run at the package root',
 	],
 	[
-		"clients/pipeline.ts#tryDartFix:656dd10b~7514b242",
+		"clients/pipeline.ts#tryDartFix:d1ac8a0b~7514b242",
 		'cwd is `pubspecDir` = findNearestContaining(dirname(filePath), ["pubspec.yaml"]): `dart fix --apply` must run at the package root',
 	],
 	[

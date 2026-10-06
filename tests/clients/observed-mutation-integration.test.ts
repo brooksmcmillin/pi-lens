@@ -584,9 +584,9 @@ describe("#2430 item 3 — the settled sweep is wired ahead of the deferred drai
 			path.join(import.meta.dirname, "..", "..", "index.ts"),
 			"utf-8",
 		);
-		const sweepAt = indexSource.indexOf(
-			"await runObservedSettledSweepSafely(ctx)",
-		);
+		// #3521: both now take the settle's branch epoch as a second argument
+		// (#3620: the sweep also its lineage, so its call wraps).
+		const sweepAt = indexSource.indexOf("await runObservedSettledSweepSafely(");
 		const drainAt = indexSource.indexOf("await runDeferredMutationDrain(ctx)");
 		// #3576: the refresh runs through the settle's session guard.
 		const refreshAt = indexSource.indexOf(
@@ -896,7 +896,9 @@ describe("#2464 — the observed-settle path also dispatches pipeline analysis",
 			).toEqual(["agent-tool:patch_retry", "agent-tool:patch_retry"]);
 			// 1. The staleness stamp is re-taken over the file the pipeline itself
 			//    rewrote, so the agent's next edit is judged by read coverage.
-			expect(recordWritten).toHaveBeenCalledWith(path.resolve(filePath));
+			expect(recordWritten).toHaveBeenCalledWith(path.resolve(filePath), {
+				stampFileTime: true,
+			});
 			// 2. The #2402 record is re-stamped with the POST-pipeline hash, so an
 			//    identical retry against the formatted bytes is still recognized as
 			//    already applied instead of escalating the oldText ladder.
@@ -1323,11 +1325,13 @@ describe("#2464 review round 3 — F2: the observed dispatch targets a RECORDED 
 });
 
 describe("#3568: the observed path's dispatches share the handler's session", () => {
-	it("a later observed path dispatched after session_start carries the session its handler entered in", async () => {
+	it("stops dispatching observed paths once the handler's session is replaced (#3596)", async () => {
 		// index.ts abandons a handler at its bound without cancelling it. The
 		// observed loop awaits each path's dispatch before the next, so a
 		// replacement during path 1 used to hand path 2 session 2's generation,
-		// and its cascade touch and admission then landed in session 2.
+		// and its cascade touch and admission then landed in session 2 (#3568).
+		// #3596: path 2 is not dispatched at all once the session is replaced;
+		// every write it would make is dropped, so the run is wasted work.
 		const env = setupTestEnvironment("pi-lens-3568-observed-");
 		const previousDataDir = process.env.PILENS_DATA_DIR;
 		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
@@ -1375,12 +1379,85 @@ describe("#3568: the observed path's dispatches share the handler's session", ()
 				};
 				return { generation: handle.generation, current: handle.isCurrent() };
 			});
-			expect(sessions).toEqual([
-				{ generation: entered, current: false },
-				{ generation: entered, current: false },
-			]);
+			expect(sessions).toEqual([{ generation: entered, current: false }]);
 		} finally {
 			ungatePipeline(vi.mocked(runPipeline) as never);
+			_setObservedTimeBoundsForTests({});
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+
+	it("a settle replay that lands after the replacement credits nothing in the new session (#3596)", async () => {
+		// The settle replays each changed file through the mutation bridge after
+		// its own capture and range awaits. With no lineage on the entry the
+		// bridge stamped, queued and listed the dead session's write in the new
+		// session. The reset is driven from the settle's stored-hash lookup,
+		// which runs between those awaits and the replay: a deterministic
+		// stand-in for a `session_start` that lands while the settle awaits.
+		const env = setupTestEnvironment("pi-lens-3596-settle-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		_setObservedTimeBoundsForTests({ captureMs: 30_000, settleMs: 30_000 });
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		vi.mocked(runPipeline).mockClear();
+		try {
+			const targetDir = path.join(env.tmpDir, "codemod-target");
+			fs.mkdirSync(targetDir, { recursive: true });
+			const files = ["a.ts", "b.ts"].map((name) => {
+				const filePath = path.join(targetDir, name);
+				fs.writeFileSync(filePath, SOURCE);
+				return filePath;
+			});
+			const { runtime, cacheManager } = newSession(env.tmpDir);
+			const event = {
+				toolName: "dir_codemod_3596",
+				toolCallId: "call-3596-settle",
+				input: { path: targetDir, rule: "rename" },
+				content: [{ type: "text", text: "rewrote 2 files" }],
+			};
+			await handleToolCall(
+				toolCallDeps({ event, cwd: env.tmpDir, runtime, cacheManager }),
+			);
+			const longAgo = new Date("2000-01-01T00:00:00Z");
+			for (const filePath of files) {
+				fs.writeFileSync(filePath, `${SOURCE}const d = 4;\n`);
+				// Aged, so only an explicit credit can make session 2 allow an edit.
+				fs.utimesSync(filePath, longAgo, longAgo);
+			}
+			const sessionOneGuard = runtime.readGuard;
+			vi.spyOn(sessionOneGuard, "getReadHistory").mockImplementationOnce(() => {
+				runtime.resetForSession();
+				runtime.beginTurn();
+				return [];
+			});
+			await handleToolResult({
+				...toolResultDeps({ event, runtime, cacheManager }),
+				readGuard: sessionOneGuard,
+			});
+			expect({
+				verdicts: files.map(
+					(filePath) => runtime.readGuard.checkEdit(filePath, [1, 1]).action,
+				),
+				queued: runtime.pendingDeferredFormatCount,
+				turnFiles: Object.keys(
+					cacheManager.readTurnState(env.tmpDir).files ?? {},
+				).length,
+				dispatched: vi.mocked(runPipeline).mock.calls.length,
+				// The tool did change both files: the change log keeps them (I5).
+				receipts: readChangesSince(env.tmpDir, 0).map((c) => c.source),
+			}).toEqual({
+				verdicts: ["block", "block"],
+				queued: 0,
+				turnFiles: 0,
+				dispatched: 0,
+				receipts: [
+					"agent-tool:dir_codemod_3596",
+					"agent-tool:dir_codemod_3596",
+				],
+			});
+		} finally {
 			_setObservedTimeBoundsForTests({});
 			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
 			else process.env.PILENS_DATA_DIR = previousDataDir;
@@ -1407,6 +1484,9 @@ describe("#3568: the observed path's dispatches share the handler's session", ()
 			});
 			const { runtime, cacheManager } = newSession(env.tmpDir);
 			for (let turn = 0; turn < 3; turn += 1) runtime.beginTurn();
+			// #3611: the order turn is a process counter, so its value depends on
+			// every coordinator this file ran; the pin is that it did not restart.
+			const orderTurnBeforeReload = runtime.writeOrderTurn;
 			runtime.resetForSession();
 			runtime.beginTurn();
 			const event = {
@@ -1443,7 +1523,7 @@ describe("#3568: the observed path's dispatches share the handler's session", ()
 				[1, runtime.writeOrderTurn],
 				[1, runtime.writeOrderTurn],
 			]);
-			expect(runtime.writeOrderTurn).toBe(5);
+			expect(runtime.writeOrderTurn).toBeGreaterThan(orderTurnBeforeReload);
 		} finally {
 			ungatePipeline(vi.mocked(runPipeline) as never);
 			_setObservedTimeBoundsForTests({});
@@ -1451,5 +1531,96 @@ describe("#3568: the observed path's dispatches share the handler's session", ()
 			else process.env.PILENS_DATA_DIR = previousDataDir;
 			env.cleanup();
 		}
+	});
+});
+
+/**
+ * #3763 item 1: `recordMutationToolReceipt` writes the live coordinator's
+ * per-turn maps (the write-then-edit transition that demotes a file's
+ * autofix to the deferred pass). A handler that resumes from the settle after
+ * a replacement wrote its receipt into session 2's turn, so a file session 2
+ * wrote was demoted by session 1's edit of it. The recurrence: a receipt that
+ * ignores the handler's own session.
+ */
+describe("#3763 a dead handler's mutation receipt stays out of session 2's turn", () => {
+	async function acrossSettle(
+		slug: string,
+		body: (args: { tmpDir: string; filePath: string }) => Promise<void>,
+	): Promise<void> {
+		const env = setupTestEnvironment(`pi-lens-3763-${slug}-`);
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		ungatePipeline(vi.mocked(runPipeline));
+		try {
+			const filePath = path.join(env.tmpDir, "observed.ts");
+			fs.writeFileSync(filePath, SOURCE);
+			await body({ tmpDir: env.tmpDir, filePath });
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	}
+
+	/** Session 2 wrote `filePath` this turn; its next write's autofix mode. */
+	function sessionTwoWriteMode(
+		runtime: RuntimeCoordinator,
+		filePath: string,
+	): "immediate" | "deferred" {
+		return runtime.recordMutationToolReceipt(filePath, "write").autofixMode;
+	}
+
+	it("an observed edit settling after the replacement leaves session 2's write immediate", async () => {
+		await acrossSettle("observed", async ({ tmpDir, filePath }) => {
+			const { runtime, cacheManager } = newSession(tmpDir);
+			const event = patchEvent(filePath, "call-3763-observed");
+			await handleToolCall(
+				toolCallDeps({ event, cwd: tmpDir, runtime, cacheManager }),
+			);
+			fs.writeFileSync(filePath, `${SOURCE}const d = 4;\n`);
+			const handler = handleToolResult(
+				toolResultDeps({ event, runtime, cacheManager }),
+			);
+			// The handler is parked on the settle's first await.
+			runtime.resetForSession();
+			runtime.beginTurn();
+			sessionTwoWriteMode(runtime, filePath);
+			await handler;
+			expect(sessionTwoWriteMode(runtime, filePath)).toBe("immediate");
+		});
+	});
+
+	it("a learned tool's classified receipt after the replacement leaves session 2's write immediate", async () => {
+		await acrossSettle("classified", async ({ tmpDir, filePath }) => {
+			const { runtime, cacheManager } = newSession(tmpDir);
+			// Call one teaches the name; call two is classified by it and still
+			// armed, so it awaits the settle, which finds no change.
+			const first = patchEvent(filePath, "call-3763-learn");
+			await handleToolCall(
+				toolCallDeps({ event: first, cwd: tmpDir, runtime, cacheManager }),
+			);
+			fs.writeFileSync(filePath, `${SOURCE}const d = 4;\n`);
+			await handleToolResult(
+				toolResultDeps({ event: first, runtime, cacheManager }),
+			);
+			const second = patchEvent(filePath, "call-3763-classified");
+			await handleToolCall(
+				toolCallDeps({ event: second, cwd: tmpDir, runtime, cacheManager }),
+			);
+			const { runPipeline } = await import("../../clients/pipeline.js");
+			const dispatchedBefore = vi.mocked(runPipeline).mock.calls.length;
+			const handler = handleToolResult(
+				toolResultDeps({ event: second, runtime, cacheManager }),
+			);
+			runtime.resetForSession();
+			runtime.beginTurn();
+			sessionTwoWriteMode(runtime, filePath);
+			await handler;
+			expect(sessionTwoWriteMode(runtime, filePath)).toBe("immediate");
+			// The dead handler dispatches nothing, so the autofix mode its
+			// dropped receipt falls back to never reaches a pipeline.
+			expect(vi.mocked(runPipeline).mock.calls.length).toBe(dispatchedBefore);
+		});
 	});
 });

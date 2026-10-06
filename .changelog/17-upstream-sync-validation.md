@@ -1,5 +1,6 @@
 ---
 section: Fixed
+audience: internal
 ---
 
 - Allow PR-body validation to capture upstream-sync diffs up to 16 MiB instead

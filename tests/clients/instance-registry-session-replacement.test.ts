@@ -100,23 +100,24 @@ async function expectSessionTwoRegistersAlone(): Promise<void> {
 	});
 }
 
+// Shared by both describes below: a fresh registry dir and module graph per case.
+beforeEach(async () => {
+	dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-instreg-"));
+	vi.resetModules();
+	registry = await import("../../clients/instance-registry.js");
+	ledger = await import("../../clients/degradation-ledger.js");
+});
+
+afterEach(async () => {
+	vi.restoreAllMocks();
+	peerReleases();
+	// The tail is a process singleton: settle it here so nothing queued by
+	// one case lands in the next case's directory.
+	await registry._settleRegistryMutationsForTests();
+	removeTempDirSync(dir);
+});
+
 describe("instance registry across a session replacement (#3498)", () => {
-	beforeEach(async () => {
-		dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-instreg-3498-"));
-		vi.resetModules();
-		registry = await import("../../clients/instance-registry.js");
-		ledger = await import("../../clients/degradation-ledger.js");
-	});
-
-	afterEach(async () => {
-		vi.restoreAllMocks();
-		peerReleases();
-		// The tail is a process singleton: settle it here so nothing queued by
-		// one case lands in the next case's directory.
-		await registry._settleRegistryMutationsForTests();
-		removeTempDirSync(dir);
-	});
-
 	/**
 	 * session_shutdown arrives while the heartbeat's read of the registry is in
 	 * flight, i.e. while the heartbeat holds the registry lock. The sync
@@ -138,6 +139,34 @@ describe("instance registry across a session replacement (#3498)", () => {
 		vi.restoreAllMocks();
 		await registry._settleRegistryMutationsForTests();
 		expect(shutdownRan).toBe(true);
+	}
+
+	/**
+	 * The #3587 sibling of `shutdownDuringHeartbeat`: a declined secondary's
+	 * root removal is requested while the heartbeat's read of the registry is
+	 * in flight. `deregisterInstanceRoot` (unlike `deregisterInstance`)
+	 * already runs on the registry tail — and since #3602, so does
+	 * `updateHeartbeat` — so this no longer races the heartbeat for the file
+	 * lock: it queues behind it and starts its sync attempt only once the
+	 * heartbeat's mutation has fully resolved (lock released). See "queues a
+	 * secondary root's removal behind an in-flight heartbeat" below.
+	 */
+	async function rootRemovalDuringHeartbeat(root: string): Promise<void> {
+		const readFile = fs.promises.readFile.bind(fs.promises);
+		let removalStarted = false;
+		vi.spyOn(fs.promises, "readFile").mockImplementation((async (
+			...args: Parameters<typeof fs.promises.readFile>
+		) => {
+			if (!removalStarted && args[0] === registryFilePath()) {
+				removalStarted = true;
+				void registry.deregisterInstanceRoot(root);
+			}
+			return readFile(...args);
+		}) as typeof fs.promises.readFile);
+		await registry.updateHeartbeat();
+		vi.restoreAllMocks();
+		await registry._settleRegistryMutationsForTests();
+		expect(removalStarted).toBe(true);
 	}
 
 	it("removes the entry when shutdown lands while this process's heartbeat holds the lock", async () => {
@@ -223,6 +252,26 @@ describe("instance registry across a session replacement (#3498)", () => {
 		await expectSessionTwoRegistersAlone();
 	});
 
+	// #3602: before that fix, `updateHeartbeat` took the registry lock
+	// directly (off the tail), so a root removal requested while it held the
+	// lock met this process's OWN hold — the #3587 shape this file's own
+	// mutation table (PR #3593/#3587's R1) exercises via a peer instead below.
+	// Now `updateHeartbeat` is queued through the SAME tail as
+	// `deregisterInstanceRoot`, so the two can never hold the lock at once:
+	// the removal simply waits its turn and takes the single async lock path
+	// once it is the removal's turn.
+	it("queues a secondary root's removal behind an in-flight heartbeat instead of racing it for the lock", async () => {
+		await registry.registerInstance(ROOT_A);
+		await registry.registerInstanceRoot(ROOT_SECONDARY);
+		await rootRemovalDuringHeartbeat(ROOT_SECONDARY);
+
+		// Queued behind the heartbeat's own tail slot, not contended for the
+		// lock: the single async lock path lands without a retry or timeout.
+		expect(degradationCount("instance-registry-lock-timeout")).toBe(0);
+		expect(degradationCount("instance-registry-deregister-landed")).toBe(1);
+		expect(ownEntry()?.projectRoots).toEqual([normalizeFilePath(ROOT_A)]);
+	});
+
 	it("still points the heartbeat's repair at a root the live session keeps serving", async () => {
 		// The inverse of the case above: with no shutdown in between, removing
 		// one root re-arms the intent on a root the host still serves (#2130),
@@ -301,4 +350,126 @@ describe("instance registry across a session replacement (#3498)", () => {
 		expect(ownEntry()).toBeUndefined();
 		await expectSessionTwoRegistersAlone();
 	}, 15_000);
+
+	it("removes a secondary root after a peer holds the lock past the sync wait and one async wait", async () => {
+		await registry.registerInstance(ROOT_A);
+		await registry.registerInstanceRoot(ROOT_SECONDARY);
+		// Same shape as the whole-entry case above: the peer's lock ages out of
+		// the 5 s lease about 2 s from now, but inside
+		// `LOCK_WAIT_THROUGH_LEASE_MS`.
+		peerHolds(3_000);
+		const removal = registry.deregisterInstanceRoot(ROOT_SECONDARY);
+		await removal;
+		await registry._settleRegistryMutationsForTests();
+
+		expect(ownEntry()?.projectRoots).toEqual([normalizeFilePath(ROOT_A)]);
+		// #3618 recurrence: scoped removal must not perform a discarded
+		// synchronous lock spin before its lease-waiting lock.
+		expect(degradationCount("instance-registry-lock-timeout")).toBe(0);
+	}, 15_000);
+});
+
+/**
+ * #3780 (the #3657 mutation survivors): what a scoped root removal decides,
+ * observed through the real registry, its ledger and the heartbeat's repair.
+ * The recurrence guarded: `planRootRemoval` kept every branch of its decision
+ * alive under mutation because each case above reads only the happy outcome
+ * (the entry lost its root) and never the records, the peer entries beside it,
+ * or the intent a removal of a root that was never served must leave alone.
+ */
+describe("a scoped root removal's decision (#3587)", () => {
+	function landedReasons(): string[] {
+		return (
+			ledger
+				.getDegradationSummary()
+				.find((group) => group.kind === "instance-registry-deregister-landed")
+				?.latestReasons.map((row) => row.reason) ?? []
+		);
+	}
+
+	it("says it updated this process's entry when a served root was removed", async () => {
+		await registry.registerInstance(ROOT_A);
+		await registry.registerInstanceRoot(ROOT_SECONDARY);
+
+		await registry.deregisterInstanceRoot(ROOT_SECONDARY);
+
+		expect(landedReasons()).toEqual([
+			expect.stringContaining("updated this process's entry"),
+		]);
+	});
+
+	it("says there was nothing left to remove, and writes nothing, for a root never served", async () => {
+		await registry.registerInstance(ROOT_A);
+		const before = fs.readFileSync(registryFilePath(), "utf8");
+
+		await registry.deregisterInstanceRoot(ROOT_B);
+
+		expect(landedReasons()).toEqual([
+			expect.stringContaining("nothing left to remove"),
+		]);
+		expect(fs.readFileSync(registryFilePath(), "utf8")).toBe(before);
+	});
+
+	it("leaves a peer's entry alone when it rewrites this process's entry", async () => {
+		await registry.registerInstance(ROOT_A);
+		await registry.registerInstanceRoot(ROOT_SECONDARY);
+		const file = JSON.parse(fs.readFileSync(registryFilePath(), "utf8")) as {
+			instances: Array<Record<string, unknown>>;
+		};
+		const peer = {
+			...file.instances[0],
+			pid: process.ppid,
+			processStart: "a-peer",
+			projectRoot: "/repo/peer",
+			projectRoots: ["/repo/peer", "/repo/peer-second"],
+		};
+		file.instances.push(peer);
+		fs.writeFileSync(registryFilePath(), JSON.stringify(file));
+
+		await registry.deregisterInstanceRoot(ROOT_SECONDARY);
+
+		const after = JSON.parse(fs.readFileSync(registryFilePath(), "utf8")) as {
+			instances: Array<{ pid: number; projectRoots: string[] }>;
+		};
+		expect(after.instances.find((e) => e.pid === process.ppid)).toEqual(peer);
+		expect(ownEntry()?.projectRoots).toEqual([normalizeFilePath(ROOT_A)]);
+	});
+
+	describe("when this process's entry is already gone", () => {
+		async function entryGoneAfterRegistering(): Promise<void> {
+			await registry.registerInstance(ROOT_A);
+			fs.writeFileSync(registryFilePath(), JSON.stringify({ instances: [] }));
+		}
+
+		it("stops the heartbeat from re-registering the root that was just removed", async () => {
+			await entryGoneAfterRegistering();
+
+			await registry.deregisterInstanceRoot(ROOT_A);
+			await registry.updateHeartbeat();
+			await registry._settleRegistryMutationsForTests();
+
+			expect(ownEntry()).toBeUndefined();
+		});
+
+		it("keeps the heartbeat's repair intent when the removed root is another one", async () => {
+			await entryGoneAfterRegistering();
+
+			await registry.deregisterInstanceRoot(ROOT_B);
+			await registry.updateHeartbeat();
+			await registry._settleRegistryMutationsForTests();
+
+			expect(ownEntry()?.projectRoots).toEqual([normalizeFilePath(ROOT_A)]);
+		});
+
+		it("lands the removal with no intent to consult", async () => {
+			await registry.registerInstance(ROOT_A);
+			registry.deregisterInstance();
+
+			await registry.deregisterInstanceRoot(ROOT_B);
+
+			expect(landedReasons()).toEqual([
+				expect.stringContaining("nothing left to remove"),
+			]);
+		});
+	});
 });

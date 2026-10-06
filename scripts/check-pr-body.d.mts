@@ -27,6 +27,7 @@ export declare function lintPrBody(
 		diff?: string;
 		cwd?: string;
 		git?: (args: string[], options?: Record<string, unknown>) => string;
+		ref?: string;
 		headFiles?: Map<string, string>;
 		testCorpus?: { paths: Set<string>; titles: Set<string> };
 	},
@@ -47,7 +48,12 @@ export declare function lintLocalPrBody(
 	body: string,
 	cwd?: string,
 	git?: (args: string[], options?: Record<string, unknown>) => string,
+	options?: { title?: string; ref?: string },
 ): { valid: boolean; errors: string[] };
+export declare function lintTlaCoverage(
+	body?: string,
+	options?: { diff?: string; cwd?: string },
+): { errors: string[]; advisories: string[] };
 export declare function fetchLivePrBody(
 	payloadPr: { number: number; body?: string | null },
 	fetchImpl: typeof fetch,

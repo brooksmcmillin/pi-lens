@@ -273,13 +273,27 @@ export function createPiMock(
 				);
 				return;
 			}
+			// The rebuilt session announces itself with `ctx`, so the replacement
+			// file pi names at shutdown IS that ctx's own file (#3612: the
+			// hand-off slot is keyed by it). A reload keeps its file and sends
+			// no target.
+			const replacementFile = (() => {
+				try {
+					return (
+						ctx as {
+							sessionManager?: { getSessionFile?: () => string | undefined };
+						}
+					)?.sessionManager?.getSessionFile?.();
+				} catch {
+					return undefined;
+				}
+			})();
 			await mock.emit(
 				"session_shutdown",
 				{
 					type: "session_shutdown",
 					reason,
-					targetSessionFile:
-						reason === "reload" ? undefined : "replacement-session-file",
+					targetSessionFile: reason === "reload" ? undefined : replacementFile,
 				},
 				ctx,
 			);

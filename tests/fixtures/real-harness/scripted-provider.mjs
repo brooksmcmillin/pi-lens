@@ -1,10 +1,26 @@
 import { readFileSync, appendFileSync } from "node:fs";
-import {
-	createAssistantMessageEventStream,
-} from "../../../node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/index.js";
+import { pathToFileURL } from "node:url";
+import { findPackageJSON } from "node:module";
+import { dirname, join } from "node:path";
+
+// release-qa (#3805) drives a pi that is not this repo's devDependency, so it
+// names that pi's own pi-ai here; the default is the repo's dev baseline.
+let piAiIndex = process.env.REAL_PI_HARNESS_PI_AI_INDEX;
+if (!piAiIndex) {
+	const sdk = findPackageJSON(
+		"@earendil-works/pi-coding-agent",
+		import.meta.url,
+	);
+	const ai = findPackageJSON("@earendil-works/pi-ai", pathToFileURL(sdk));
+	piAiIndex = join(dirname(ai), "dist/index.js");
+}
+const { createAssistantMessageEventStream } = await import(
+	pathToFileURL(piAiIndex).href
+);
 
 const scriptPath = process.env.REAL_PI_HARNESS_SCRIPT;
 const observationPath = process.env.REAL_PI_HARNESS_PROVIDER_LOG;
+let contextShapeDiagnosticRecorded = false;
 
 function loadScript() {
 	if (!scriptPath) throw new Error("REAL_PI_HARNESS_SCRIPT is required");
@@ -15,6 +31,43 @@ function providerError(message) {
 	const error = new Error(message);
 	error.name = "ScriptedProviderError";
 	return error;
+}
+
+function providerTools(context) {
+	if (Array.isArray(context?.tools)) return context.tools;
+
+	if (Array.isArray(context?.messages)) {
+		const tools = new Map();
+		let hasTranscriptTools = false;
+		for (const message of context.messages) {
+			if (message?.role !== "system") continue;
+			if (Array.isArray(message.toolsRemoved)) {
+				hasTranscriptTools = true;
+				for (const tool of message.toolsRemoved) {
+					if (typeof tool?.name === "string") tools.delete(tool.name);
+				}
+			}
+			if (Array.isArray(message.toolsAdded)) {
+				hasTranscriptTools = true;
+				for (const tool of message.toolsAdded) {
+					if (typeof tool?.name === "string") tools.set(tool.name, tool);
+				}
+			}
+		}
+		if (hasTranscriptTools) return [...tools.values()];
+		return [];
+	}
+
+	return undefined;
+}
+
+function recordContextShapeDiagnostic() {
+	if (contextShapeDiagnosticRecorded || !observationPath) return;
+	contextShapeDiagnosticRecorded = true;
+	appendFileSync(
+		observationPath,
+		`${JSON.stringify({ kind: "scripted-provider-context-shape-unavailable" })}\n`,
+	);
 }
 
 export default function scriptedProvider(pi) {
@@ -40,14 +93,26 @@ export default function scriptedProvider(pi) {
 			const stream = createAssistantMessageEventStream();
 			const action = script[turn++];
 			if (observationPath) {
-				const tools = context.tools?.map((tool) => ({
+				const providerContextTools = providerTools(context);
+				if (providerContextTools === undefined) recordContextShapeDiagnostic();
+				const tools = (providerContextTools ?? []).map((tool) => ({
 					name: tool.name,
 					descriptionBytes: Buffer.byteLength(tool.description ?? ""),
 					schemaBytes: Buffer.byteLength(JSON.stringify(tool.parameters ?? {})),
 					surfaceBytes: Buffer.byteLength(tool.description ?? "") +
 						Buffer.byteLength(JSON.stringify(tool.parameters ?? {})),
 				})) ?? [];
-				appendFileSync(observationPath, `${JSON.stringify({ turn: turn - 1, tools })}\n`);
+				// What the model would SEE as user text, so a row can witness an injected
+				// turn_end check (the `context` hook adds it to this request only).
+				const userMessages = (context?.messages ?? [])
+					.filter((message) => message?.role === "user")
+					.map((message) =>
+						(typeof message.content === "string"
+							? message.content
+							: JSON.stringify(message.content)
+						).slice(0, 2000),
+					);
+				appendFileSync(observationPath, `${JSON.stringify({ turn: turn - 1, tools, userMessages })}\n`);
 			}
 			(async () => {
 				const output = {

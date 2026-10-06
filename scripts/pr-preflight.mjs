@@ -2,16 +2,23 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { CI_JOB_NAMES } from "./lib/ci-checks.mjs";
 
 export const GATES = [
 	["build", ["npm", "run", "build"], CI_JOB_NAMES.LINT_AND_TYPECHECK],
+	["self-scan", ["npm", "run", "astgrep:self-scan"], CI_JOB_NAMES.UNIT_TESTS],
 	["lint", ["npm", "run", "lint"], CI_JOB_NAMES.LINT_AND_TYPECHECK],
 	["fmt:check", ["npm", "run", "fmt:check"], "oxfmt format check"],
 	["changelog:check", ["npm", "run", "changelog:check"], "Unit tests"],
 	[
 		"check-changelog-fragments",
-		[process.execPath, "scripts/check-changelog-fragments.mjs"],
+		[
+			process.execPath,
+			"scripts/check-changelog-fragments.mjs",
+			"--base",
+			"origin/master",
+		],
 		CI_JOB_NAMES.CHANGELOG_FRAGMENT,
 	],
 	[
@@ -54,11 +61,16 @@ const HARD_GATE_SKIP_REASON =
 	"hard gate: unformatted files merged and redded master twice on 2026-09-09";
 
 export function parseArgs(argv) {
-	const result = { only: undefined, skip: undefined };
+	const result = { only: undefined, skip: undefined, upstream: undefined };
 	for (let index = 0; index < argv.length; index++) {
 		if (argv[index] === "--only") result.only = argv[++index];
 		else if (argv[index] === "--skip") result.skip = argv[++index];
-		else throw new Error(`Unknown argument: ${argv[index]}`);
+		else if (argv[index] === "--upstream") {
+			const ref = argv[++index];
+			if (!ref || ref.startsWith("--"))
+				throw new Error("--upstream requires a trusted ref");
+			result.upstream = ref;
+		} else throw new Error(`Unknown argument: ${argv[index]}`);
 	}
 	if (!result.only && !result.skip) return result;
 	if (result.only === "" || result.skip === "")
@@ -174,7 +186,7 @@ export function runPreflight({
 	spawn = spawnSync,
 	env = process.env,
 } = {}) {
-	const { only, skip } = parseArgs(argv);
+	const { only, skip, upstream } = parseArgs(argv);
 	const childEnv = {
 		...env,
 		PI_LENS_HOME: env.PI_LENS_HOME ?? resolve(cwd, ".probe-home"),
@@ -193,7 +205,9 @@ export function runPreflight({
 					"--configLoader",
 					"runner",
 				]
-			: command,
+			: name === "check-changelog-fragments" && upstream
+				? [...command, "--upstream", upstream]
+				: command,
 		job,
 	}));
 	const localEnv = makeLocalEvent(cwd, childEnv);
@@ -236,7 +250,7 @@ export function runPreflight({
 
 if (
 	process.argv[1] &&
-	resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname)
+	pathToFileURL(resolve(process.argv[1])).href === import.meta.url
 ) {
 	try {
 		process.exitCode = runPreflight({ argv: process.argv.slice(2) });

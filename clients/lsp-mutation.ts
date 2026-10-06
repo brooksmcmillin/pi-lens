@@ -10,7 +10,7 @@ import {
 	type ProjectChangeRange,
 	type ProjectChangeSource,
 } from "./project-changes.js";
-import type { GenerationHandle } from "./generation-guard.js";
+import type { LineageHandle } from "./session-scope.js";
 import type { AppliedWorkspaceEdit } from "./lsp/edits.js";
 import { normalizeMapKey } from "./path-utils.js";
 import { getMutationBridge } from "./mutation-bridge.js";
@@ -68,6 +68,11 @@ interface LspMutationRuntime {
 	 * behavior of falling back to `cwd`.
 	 */
 	projectRoot?: string;
+	/**
+	 * #3763: the session a tool call runs in, captured at its `execute` entry
+	 * into `LspMutationContext.session`.
+	 */
+	captureSessionGeneration?: () => LineageHandle;
 }
 
 interface LspMutationCacheManager {
@@ -102,7 +107,9 @@ export interface LspMutationContext {
 	 */
 	source: "lsp-edit" | "lsp-rename" | "lsp-execute-command" | "autofix";
 	runtime?: LspMutationRuntime;
-	readGuard?: { recordWritten: (filePath: string) => void };
+	readGuard?: {
+		recordWritten: (filePath: string, opts: { stampFileTime: false }) => void;
+	};
 	cacheManager?: LspMutationCacheManager;
 	/** Existing autonomous-write publishers. Agent-owned navigation edits do not set these. */
 	publishFilesTouched?: (paths: string[]) => void;
@@ -115,7 +122,7 @@ export interface LspMutationContext {
 	 * pass) belongs to. Its bookkeeping, which follows the edit's file-write
 	 * awaits, drops once that session is replaced; the bytes still land.
 	 */
-	session?: GenerationHandle;
+	session?: LineageHandle;
 	/** True once at least one bounded mutation summary has been emitted. */
 	summaryEmitted?: boolean;
 	/** Number of per-request summaries emitted for this outer mutation (max 100). */
@@ -311,11 +318,13 @@ function bookkeepLspMutation(
 	const useBridgeFallback = !context.runtime || !context.cacheManager;
 	for (const detail of details) {
 		const filePath = path.resolve(detail.filePath);
-		if (
-			context.session &&
-			context.session.guardedWrite(filePath, () => true) === undefined
-		)
-			continue;
+		// #3576, narrowed by #3763 r2: once the caller's session is replaced its
+		// session state (the read-guard stamp, the turn-state entry, the turn
+		// summary) is dropped; the receipt, the file's seq and the handled mark
+		// are facts about the bytes and stay, as the bridge keeps them.
+		const sessionLive =
+			!context.session ||
+			context.session.guardedWrite(filePath, () => true) !== undefined;
 		// #2450 review round 2 (F4): the SAME recordability gate the bridge
 		// fallback below already applies internally (`isRecordable`, mounted in
 		// index.ts). Applied here too so the direct (deps-threaded) branch
@@ -327,9 +336,11 @@ function bookkeepLspMutation(
 			context.dbg?.(`lsp mutation not recordable, skipping ${filePath}`);
 			continue;
 		}
-		if (context.readGuard) {
+		if (sessionLive && context.readGuard) {
 			try {
-				context.readGuard.recordWritten(filePath);
+				// #3525: the server computed these bytes; the agent never saw
+				// them: authorship, not FileTime.
+				context.readGuard.recordWritten(filePath, { stampFileTime: false });
 			} catch (err) {
 				context.dbg?.(
 					`lsp mutation read-guard stamp failed for ${filePath}: ${err}`,
@@ -385,6 +396,7 @@ function bookkeepLspMutation(
 						// enqueues a deferred autofix/format pass for an LSP-applied
 						// edit (#2450 review round 2, F3).
 						deferAutofix: false,
+						...(context.session && { lineage: context.session }),
 					});
 					if (!recorded) {
 						context.dbg?.(
@@ -414,7 +426,7 @@ function bookkeepLspMutation(
 						`lsp mutation project change append failed for ${filePath}: ${err}`,
 					),
 			});
-			if (context.cacheManager) {
+			if (sessionLive && context.cacheManager) {
 				try {
 					context.cacheManager.addModifiedRange(
 						filePath,
@@ -458,7 +470,7 @@ function bookkeepLspMutation(
 		// fallback above — a half-threaded caller (one that provides
 		// `recordAutofix` but not `runtime`/`cacheManager`) must not lose its
 		// turn-summary publisher just because SOME other surface fell back.
-		if (context.recordAutofix && context.source === "autofix") {
+		if (sessionLive && context.recordAutofix && context.source === "autofix") {
 			const key = normalizeMapKey(filePath);
 			const seen =
 				context.autofixRecordedPaths ?? new BoundedSet<string>(MAX_SAMPLES);

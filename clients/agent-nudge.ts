@@ -46,9 +46,15 @@
  * behavior change beyond "no nudges".
  */
 import type { FilesTouchedPayload } from "./bus-publish.js";
+import { incrementDegradationCount } from "./degradation-ledger.js";
 import { logLatency } from "./latency-logger.js";
 import { normalizeMapKey } from "./path-utils.js";
 import type { ReadGuard } from "./read-guard.js";
+import {
+	defineSessionStore,
+	type LineageHandle,
+	type SessionScope,
+} from "./session-scope.js";
 
 const BUS_FILES_TOUCHED_EVENT = "pilens:files:touched";
 const MAX_NAMES_SHOWN = 5;
@@ -107,8 +113,105 @@ const _touched = new Map<string, AccumulatedFile>();
 // "only nudge for files the session saw" rule.
 let _relevanceFilteredCount = 0;
 
+// #3598: model-facing advisories a producer cannot put in a tool result because
+// its tool result was already delivered (the deferred agent_end drain). Same
+// `context` channel as `_touched`, but drained per session scope (#3748): the
+// queue is process-global while sessions are not, so an untagged advisory was
+// delivered to, or drained by, whichever session's `context` call came first.
+// Bounded so a wedged producer cannot grow it.
+const MAX_QUEUED_ADVISORIES = 8;
+
+interface QueuedAdvisory {
+	/** The scope that queued it; current while that scope is live. */
+	readonly scope: LineageHandle;
+	readonly text: string;
+}
+
+const _advisories: QueuedAdvisory[] = [];
+
+/** One counted row per distinct (why, scope) a queued advisory never reached the model. */
+function countDroppedAdvisory(
+	why: "cap" | "scope-retired",
+	scopeId: number,
+): void {
+	incrementDegradationCount({
+		kind: "agent-advisory-dropped",
+		subject: `${why}:${scopeId}`,
+		reason:
+			why === "cap"
+				? `an agent advisory of scope ${scopeId} was dropped: ${MAX_QUEUED_ADVISORIES} were already queued`
+				: `an agent advisory of scope ${scopeId} was dropped: its session scope retired before its next context call`,
+	});
+}
+
+/** Drop what a retired scope queued: no later `context` call belongs to it. */
+function pruneRetiredAdvisories(): void {
+	const live: QueuedAdvisory[] = [];
+	for (const entry of _advisories) {
+		if (entry.scope.isCurrent()) live.push(entry);
+		else countDroppedAdvisory("scope-retired", entry.scope.scopeId);
+	}
+	_advisories.splice(0, _advisories.length, ...live);
+}
+
+/**
+ * Queue one advisory for the next `context` call of `scope`, the session the
+ * producer ran in (capture it before the first await). Not gated by the nudge
+ * kill switch: it reports that an edit of the agent's may be gone, which is a
+ * correctness signal, not a formatting nudge.
+ */
+export function queueAgentAdvisory(text: string, scope: LineageHandle): void {
+	pruneRetiredAdvisories();
+	if (_advisories.length >= MAX_QUEUED_ADVISORIES) {
+		countDroppedAdvisory("cap", scope.scopeId);
+		return;
+	}
+	_advisories.push({ scope, text });
+}
+
+/**
+ * #3612: a scope's undelivered advisories, as a session store. A `/reload`
+ * continues the conversation under a new scope, so they move to it; every
+ * other start leaves them to the session that queued them (#3748).
+ */
+export const agentAdvisoryStore = defineSessionStore<string[]>({
+	name: "agent-advisories",
+	policy: {
+		startup: "none",
+		new: "none",
+		resume: "none",
+		fork: "none",
+		reload: "adopt",
+	},
+	snapshot: (scope) => {
+		const texts: string[] = [];
+		for (const entry of _advisories)
+			if (entry.scope.scopeId === scope.scopeId) texts.push(entry.text);
+		return texts;
+	},
+	restore: (scope, payload, ctx) => {
+		// Only the slot is the queue as the predecessor's shutdown left it; a
+		// sidecar is a past turn's, whose advisories may have been delivered.
+		if (ctx.source !== "slot" || !Array.isArray(payload)) return;
+		const handle = scope.capture();
+		for (const text of payload) {
+			if (typeof text !== "string") continue;
+			// Re-tag the predecessor's entry, so the prune does not count a
+			// carried advisory as dropped.
+			const at = _advisories.findIndex(
+				(entry) => !entry.scope.isCurrent() && entry.text === text,
+			);
+			if (at === -1) queueAgentAdvisory(text, handle);
+			else _advisories[at] = { scope: handle, text };
+		}
+	},
+	reason:
+		"the advisories a session queued and has not seen; a reload keeps the conversation, so they reach its next context call",
+});
+
 /** Test-only: clear accumulator state between test files/cases. */
 export function _resetAgentNudgeForTests(): void {
+	_advisories.length = 0;
 	_touched.clear();
 	_relevanceFilteredCount = 0;
 	_enabledCache = undefined;
@@ -349,6 +452,27 @@ export function wireAgentNudgeSubscriber(
  * batch that is ENTIRELY such paths injects nothing.
  */
 export function consumeAgentNudge(
+	dbg?: (msg: string) => void,
+	/** The session scope of this `context` call; none drains no advisory. */
+	scope?: SessionScope,
+): { messages: Array<{ role: "user"; content: string }> } | undefined {
+	const touched = consumeTouchedNudge(dbg);
+	pruneRetiredAdvisories();
+	const own: QueuedAdvisory[] = [];
+	const others: QueuedAdvisory[] = [];
+	for (const entry of _advisories) {
+		(scope && entry.scope.scopeId === scope.scopeId ? own : others).push(entry);
+	}
+	_advisories.splice(0, _advisories.length, ...others);
+	const advisories = own.map((entry) => ({
+		role: "user" as const,
+		content: `[pi-lens automated context — not a user request] ${entry.text}`,
+	}));
+	const messages = [...(touched?.messages ?? []), ...advisories];
+	return messages.length > 0 ? { messages } : undefined;
+}
+
+function consumeTouchedNudge(
 	dbg?: (msg: string) => void,
 ): { messages: Array<{ role: "user"; content: string }> } | undefined {
 	const drained = Array.from(_touched.values());

@@ -764,6 +764,7 @@ function cmdEscapeArg(arg: string): string {
 
 /**
  * Build the cmd.exe command string used for Windows wrapper spawning.
+ * Reject shell-unsafe command, argument, and SystemRoot values before quoting.
  *
  * The COMMAND must be escaped the same way as the args — escaping only the args
  * (the bug behind #214) means a tool whose resolved path contains a space (e.g.
@@ -773,7 +774,8 @@ function cmdEscapeArg(arg: string): string {
  * that already worked. The `chcp 65001` prefix forces the UTF-8 code page (so
  * tool output isn't mangled by the system code page) and, as a side benefit,
  * keeps the (possibly quoted) command off the front of the line, avoiding
- * cmd.exe's `/s` outer-quote-stripping quirk. #2023: chcp is invoked via its
+ * cmd.exe's `/s` outer-quote-stripping quirk. A quoted SystemRoot requires
+ * an additional outer pair for `/s` to strip. #2023: chcp is invoked via its
  * absolute `%SystemRoot%\System32\chcp.com` path and chained with `&`, not
  * `&&` — a child environment whose PATH cannot resolve System32 used to fail
  * the bare `chcp` lookup, and `&&` then short-circuited EVERY .cmd/.bat spawn
@@ -784,8 +786,18 @@ export function buildWindowsShellCommand(
 	command: string,
 	args: string[],
 ): string {
-	const chcp = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\chcp.com`;
-	return `${chcp} 65001 >nul 2>&1 & ${[command, ...args].map(cmdEscapeArg).join(" ")}`;
+	const systemRoot = process.env.SystemRoot ?? "C:\\Windows";
+	const unsafeValue = findCmdUnsafeValue(command, [systemRoot, ...args]);
+	if (unsafeValue !== undefined) {
+		throw new Error(
+			`Refusing to spawn "${command}" via cmd.exe: ` +
+				`${JSON.stringify(unsafeValue)} contains a character (", %, !, or CR/LF) ` +
+				"that cannot be safely escaped on a cmd.exe /c command line (CWE-78).",
+		);
+	}
+	const chcp = `${systemRoot}\\System32\\chcp.com`;
+	const payload = `${cmdEscapeArg(chcp)} 65001 >nul 2>&1 & ${[command, ...args].map(cmdEscapeArg).join(" ")}`;
+	return payload.startsWith('"') ? `"${payload}"` : payload;
 }
 
 // ============================================================================
@@ -1751,20 +1763,7 @@ export async function safeSpawnAsync(
 			if (!resolved) {
 				resolutionError = synthesizeEnoentError(command);
 			} else if (resolved.ext === ".cmd" || resolved.ext === ".bat") {
-				// Validate the RESOLVED path (what actually gets interpolated
-				// into the /c line via buildWindowsShellCommand below), not the
-				// caller's original `command` string — a resolved path
-				// containing `%`/`!` would otherwise reach the shell unvalidated.
-				const unsafeValue = findCmdUnsafeValue(resolved.resolvedPath, args);
-				if (unsafeValue !== undefined) {
-					resolutionError = new Error(
-						`Refusing to spawn "${resolved.resolvedPath}" via cmd.exe: ` +
-							`${JSON.stringify(unsafeValue)} contains a character ("` +
-							`, %, !, or CR/LF) that cannot be safely escaped on a ` +
-							`cmd.exe /c command line (CWE-78, #817). Rename/quote the ` +
-							"value or invoke the tool without going through cmd.exe.",
-					);
-				} else {
+				try {
 					// Pin the interpreter — never trust ComSpec/COMSPEC (#18): an
 					// env-controlled ComSpec could point anywhere.
 					spawnCmd = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\cmd.exe`;
@@ -1778,6 +1777,8 @@ export async function safeSpawnAsync(
 					// Prevent Node from escaping those quotes a second time when it
 					// builds cmd.exe's Windows command line.
 					windowsVerbatimArguments = true;
+				} catch (cause) {
+					resolutionError = toError(cause);
 				}
 			} else {
 				// .exe / .com: direct spawn, no cmd.exe anywhere in the picture.
@@ -2589,8 +2590,8 @@ export async function findCommandAsync(
  * as the async version had. It now shares the exact same resolution/
  * validation seams as `safeSpawnAsync` — `resolveWindowsCommand` (cached
  * PATH+PATHEXT walk), direct `spawnSync(resolvedPath, args, { shell: false })`
- * for `.exe`/`.com`, the pinned-cmd.exe wrapper + `findCmdUnsafeValue`
- * rejection for `.cmd`/`.bat`, and a synthesized ENOENT when unresolvable.
+ * for `.exe`/`.com`, the validated `buildWindowsShellCommand` wrapper
+ * for `.cmd`/`.bat`, and a synthesized ENOENT when unresolvable.
  * No `shell: true` anywhere.
  */
 export function safeSpawn(
@@ -2630,18 +2631,17 @@ export function safeSpawn(
 		let windowsVerbatimArguments = false;
 
 		if (resolved.ext === ".cmd" || resolved.ext === ".bat") {
-			// Validate the value that actually gets interpolated into the /c
-			// line — the RESOLVED path, not the caller's original (possibly
-			// extensionless) `command` string — plus every arg.
-			const unsafeValue = findCmdUnsafeValue(resolved.resolvedPath, args);
-			if (unsafeValue !== undefined) {
-				const error = new Error(
-					`Refusing to spawn "${resolved.resolvedPath}" via cmd.exe: ` +
-						`${JSON.stringify(unsafeValue)} contains a character ("` +
-						`, %, !, or CR/LF) that cannot be safely escaped on a ` +
-						`cmd.exe /c command line (CWE-78, #817). Rename/quote the ` +
-						"value or invoke the tool without going through cmd.exe.",
-				);
+			try {
+				spawnCmd = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\cmd.exe`;
+				spawnArgs = [
+					"/d",
+					"/s",
+					"/c",
+					buildWindowsShellCommand(resolved.resolvedPath, args),
+				];
+				windowsVerbatimArguments = true;
+			} catch (cause) {
+				const error = toError(cause);
 				return {
 					stdout: "",
 					stderr: "",
@@ -2654,14 +2654,6 @@ export function safeSpawn(
 					}),
 				};
 			}
-			spawnCmd = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\cmd.exe`;
-			spawnArgs = [
-				"/d",
-				"/s",
-				"/c",
-				buildWindowsShellCommand(resolved.resolvedPath, args),
-			];
-			windowsVerbatimArguments = true;
 		} else {
 			ensureUtf8ConsoleCodePageOnce();
 			spawnCmd = resolved.resolvedPath;

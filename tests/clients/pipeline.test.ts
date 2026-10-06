@@ -357,6 +357,50 @@ describe("Pipeline", () => {
 		});
 	});
 
+	it("states why a delta-promoted unused finding blocks in the enriched STOP block (#3218)", async () => {
+		// The turn-end replay renders through `formatDiagnostics`, but the inline
+		// tool result renders the enriched variant. Both must carry the seam's
+		// rationale, or the agent sees a hint-severity finding labelled a blocker
+		// with no explanation during the edit itself.
+		const filePath = createTempFile(
+			tmpDir,
+			"promoted-blocker.ts",
+			"const tmpdir = 1;\n",
+		);
+		const blocker: Diagnostic = {
+			id: "promoted-unused",
+			message: "'tmpdir' is declared but its value is never read.",
+			filePath,
+			severity: "error",
+			semantic: "blocking",
+			tool: "lsp",
+			line: 1,
+			promotionNote:
+				"new in this edit → blocks in delta mode; pre-existing unused declarations only advise.",
+		};
+		vi.mocked(dispatchLintWithResult).mockResolvedValue({
+			diagnostics: [blocker],
+			blockers: [blocker],
+			warnings: [],
+			baselineWarningCount: 0,
+			fixed: [],
+			resolvedCount: 0,
+			output: "",
+			blockerOutput: "",
+			hasBlockers: true,
+		});
+
+		const result = await runPipeline(
+			createMockContext(filePath),
+			createMockDeps(),
+		);
+
+		expect(result.output).toContain("🔴 STOP — 1 issue(s) must be fixed");
+		expect(result.output).toContain(
+			"new in this edit → blocks in delta mode; pre-existing unused declarations only advise.",
+		);
+	});
+
 	it("hands the cascade the PROJECT root alongside the language cwd (#3157)", async () => {
 		// The cascade's display filter reads the disposition store and the
 		// `.pi-lens.json` rule policy, both written under the project root
@@ -1456,6 +1500,52 @@ describe("Pipeline", () => {
 			await runPipeline(createMockContext(filePath), deps);
 
 			expect(syncedStamp()).toBeGreaterThanOrEqual(fixedAt);
+		});
+	});
+
+	describe("Cascade compute rejection (#3605)", () => {
+		const { WebAssembly } = globalThis as unknown as {
+			WebAssembly: { RuntimeError: new (message: string) => Error };
+		};
+
+		async function cascadeAfterRejection(error: Error) {
+			const filePath = createTempFile(tmpDir, "cascade-throws.ts", "x");
+			vi.mocked(dispatchLintWithResult).mockResolvedValue({
+				diagnostics: [],
+				blockers: [],
+				warnings: [],
+				baselineWarningCount: 0,
+				fixed: [],
+				resolvedCount: 0,
+				output: "",
+				blockerOutput: "",
+				hasBlockers: false,
+			});
+			vi.mocked(computeCascadeForFile).mockRejectedValueOnce(error);
+			const result = await runPipeline(
+				createMockContext(filePath),
+				createMockDeps(),
+			);
+			return (await result.cascadePromise)?.indeterminate;
+		}
+
+		it("reports a tree-sitter wasm trap as a degraded graph, not a compute error", async () => {
+			// The per-edit cascade turned the reporter's wasm trap into
+			// `cascade_indeterminate` / `error`.
+			expect(
+				await cascadeAfterRejection(
+					new WebAssembly.RuntimeError("table index is out of bounds"),
+				),
+			).toEqual({
+				reason: "graph_degraded",
+				detail: "review graph degraded — tree-sitter wasm runtime failure",
+			});
+		});
+
+		it("still reports any other rejection as a compute error", async () => {
+			expect(await cascadeAfterRejection(new TypeError("cascade bug"))).toEqual(
+				{ reason: "error", detail: "cascade computation failed" },
+			);
 		});
 	});
 

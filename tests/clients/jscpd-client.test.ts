@@ -523,6 +523,57 @@ describe("jscpd-client", () => {
 			await cleanupTestEnvironmentsDrained("pi-lens-jscpd-");
 		}
 	});
+
+	// #3600: the widget's stale gate judges a folded jscpd row against the time
+	// the scan READ its bytes. The stamp is taken at the top of `runScan`, before
+	// the spawn reads; the spawn mock advances the faked clock, so a stamp moved
+	// to the parse/return site would carry the later time.
+	it("stamps scannedAt at the run body, before jscpd reads its files (#3600)", async () => {
+		const { JscpdClient } = await import("../../clients/jscpd-client.js");
+		const safeSpawnMod = await import("../../clients/safe-spawn.js");
+		const { tmpDir } = setupTestEnvironment("pi-lens-jscpd-stamp-");
+		const T0 = 1_900_000_000_000;
+		vi.useFakeTimers({ toFake: ["Date"] });
+		vi.setSystemTime(T0);
+		try {
+			fs.writeFileSync(path.join(tmpDir, "src.ts"), "const x = 1;\n");
+			const client = new JscpdClient(false) as unknown as {
+				scan: (
+					cwd: string,
+					minLines: number,
+					minTokens: number,
+					isTsProject: boolean,
+				) => Promise<{ success: boolean; scannedAt?: string }>;
+				ensureAvailable: () => Promise<boolean>;
+			};
+			await client.ensureAvailable();
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mockClear();
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mockImplementation(
+				async (_cmd, args) => {
+					const argv = args as string[];
+					const outIndex = argv.indexOf("--output");
+					if (outIndex === -1) {
+						return { error: undefined, status: 0, stdout: "", stderr: "" };
+					}
+					fs.writeFileSync(
+						path.join(argv[outIndex + 1]!, "jscpd-report.json"),
+						"{}",
+					);
+					// The scan has now read; a stamp taken after this would be later.
+					vi.setSystemTime(T0 + 2_000);
+					return { error: undefined, status: 0, stdout: "", stderr: "" };
+				},
+			);
+
+			const result = await client.scan(tmpDir, 5, 50, true);
+
+			expect(result.success).toBe(true);
+			expect(result.scannedAt).toBe(new Date(T0).toISOString());
+		} finally {
+			vi.useRealTimers();
+			await cleanupTestEnvironmentsDrained("pi-lens-jscpd-");
+		}
+	});
 });
 
 /**

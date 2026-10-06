@@ -13,7 +13,8 @@ export function changesTestTreeFile(file: string): boolean;
 /** CI-only suites (file → why it cannot run in pre-push), #3426 H3432-1. */
 export const CI_ONLY_PRE_PUSH_TESTS: Record<string, string>;
 
-export function resolveDiffRange(): string;
+/** Returns pushed diff ranges, or null for a deletion-only push. */
+export function resolveDiffRange(input?: string): string[] | null;
 
 export function changesProductionFile(file: string): boolean;
 

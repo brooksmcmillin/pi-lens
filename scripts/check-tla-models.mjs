@@ -27,7 +27,18 @@
  * it is the only source of concurrency, and TLC's own threading never
  * competes with it for the same cores.
  *
- * Usage: node scripts/check-tla-models.mjs [--jar <tla2tools.jar>] [--concurrency <n>]
+ * `--shard i/N` (#3918) runs only the configs at sorted positions p with
+ * p % N === i - 1, so N CI jobs together run every config exactly once
+ * (ci.yml `tla-shards`; `tests/config/tla-models-shard-workflow.test.ts`
+ * pins the partition). Round-robin over the sorted list, not contiguous
+ * blocks: the slow models cluster in a few `formal/` directories, and
+ * stepping through the list spreads each directory across the shards.
+ *
+ * Usage: node scripts/check-tla-models.mjs [--jar <tla2tools.jar>] [--concurrency <n>] [--shard <i/N>]
+ * Every flag's value may use the space or the equals form (`--shard 1/4` and
+ * `--shard=1/4` are the same). An unknown flag, a missing value, or a
+ * positional argument is rejected before any download or JVM spawn, so a typo
+ * can never silently run the full, unsharded population (#3920).
  * Without --jar, the pinned release is downloaded to .cache/ and verified.
  * Without --concurrency, the pool is sized to the host's CPU count.
  */
@@ -37,6 +48,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseArgs as parseNodeArgs } from "node:util";
 
 export const TLA_TOOLS = Object.freeze({
 	release: "v1.7.4",
@@ -72,6 +84,10 @@ export function parseModelHeader(text) {
 export function classifyTlcOutput(output) {
 	const violated = /Error: Invariant (\w+) is violated/.exec(output);
 	if (violated) return { status: "violated", invariant: violated[1] };
+	// A config with `CHECK_DEADLOCK TRUE` (a lock-order model, #3830) reports a
+	// cycle as `Error: Deadlock reached.`; a config expects it as `violated Deadlock`.
+	if (/^Error: Deadlock reached\./m.test(output))
+		return { status: "violated", invariant: "Deadlock" };
 	if (/Model checking completed\. No error has been found\./.test(output))
 		return { status: "pass" };
 	const errorLine = output
@@ -106,6 +122,71 @@ export function listModelConfigs(root) {
 		}
 	}
 	return configs.sort();
+}
+
+/**
+ * Validates a `--shard i/N` value: integers with 1 <= i <= N. A malformed
+ * value must throw here, never fall back to "all configs": a sharded CI job
+ * that silently ran everything would not fail, it would just stop being a
+ * shard.
+ */
+export function parseShardArg(raw) {
+	const match = /^(\d+)\/(\d+)$/.exec(String(raw));
+	const index = match ? Number(match[1]) : 0;
+	const total = match ? Number(match[2]) : 0;
+	if (index < 1 || index > total)
+		throw new Error(
+			`--shard must be i/N with 1 <= i <= N, got ${JSON.stringify(raw)}`,
+		);
+	return { index, total };
+}
+
+/** Shard `index` (1-based) of `total`: round-robin over the given order. */
+export function selectShard(configs, { index, total }) {
+	return configs.filter((_, position) => position % total === index - 1);
+}
+
+const CLI_OPTIONS = Object.freeze({
+	jar: { type: "string" },
+	concurrency: { type: "string" },
+	shard: { type: "string" },
+});
+
+/**
+ * Parse the checker's flags strictly. Every flag takes a value, so the
+ * `--shard 1/4` and `--shard=1/4` forms are equivalent; `node:util`'s parser
+ * handles both, leaving no second spelling to drift. `strict` rejects an
+ * unknown flag, a missing value, and a positional argument, each by throwing.
+ * `main()` calls this before the network or a JVM starts, so a typo can never
+ * silently fall through to the full, unsharded population (#3920).
+ */
+export function parseCliArgs(argv) {
+	const { values } = parseNodeArgs({
+		args: [...argv],
+		options: CLI_OPTIONS,
+		strict: true,
+		allowPositionals: false,
+	});
+	return { ...values };
+}
+
+/**
+ * The configs one run covers: every `.cfg` under `formal/`, narrowed by `--shard`
+ * when present. Throws on an empty selection so a shard with nothing to run
+ * (more shards than configs) is loud, not a green no-op.
+ */
+export function selectConfigs(argv, root) {
+	const { shard } = parseCliArgs(argv);
+	const all = listModelConfigs(root);
+	const configs =
+		shard === undefined ? all : selectShard(all, parseShardArg(shard));
+	if (configs.length === 0)
+		throw new Error(
+			shard === undefined
+				? "no formal/*/*.cfg found"
+				: `--shard ${shard} selects no formal/*/*.cfg`,
+		);
+	return configs;
 }
 
 /**
@@ -160,6 +241,34 @@ export function parseConcurrencyArg(raw) {
 			`--concurrency must be an integer >= 1, got ${JSON.stringify(raw)}`,
 		);
 	return n;
+}
+
+/**
+ * The pool size for this run: an explicit valid `--concurrency` wins; without
+ * the flag, the host's parallelism and the config count bound the pool. Split
+ * out of `main` (#3927) so both the absent and the explicit branch are
+ * testable without a JVM or a network: `main` cannot reach this point in a
+ * test because `ensureJar` downloads or reads a real jar first.
+ */
+export function resolveConcurrency(
+	concurrencyRaw,
+	numConfigs,
+	availableParallelism,
+) {
+	return concurrencyRaw === undefined
+		? computeConcurrency(numConfigs, availableParallelism)
+		: parseConcurrencyArg(concurrencyRaw);
+}
+
+/**
+ * The run's final summary line. Split out of `main` (#3927) so the whole-run
+ * and sharded renderings are directly testable: it is the run's only
+ * observable account of how many configs ran, at what shard and concurrency,
+ * so a mutation here must red.
+ */
+export function formatSummary(configCount, shard, wallSeconds, concurrency) {
+	const shardSuffix = shard === undefined ? "" : ` (shard ${shard})`;
+	return `${configCount} configs${shardSuffix}, ${wallSeconds.toFixed(1)}s wall (concurrency=${concurrency}, 1 TLC worker/config).`;
 }
 
 /**
@@ -257,24 +366,26 @@ export async function runPool(items, concurrency, task) {
 
 async function main() {
 	const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-	const argv = process.argv;
-	const jarIndex = argv.indexOf("--jar");
-	const jar = await ensureJar(
-		jarIndex === -1 ? undefined : argv[jarIndex + 1],
-		root,
-	);
-	const concurrencyIndex = argv.indexOf("--concurrency");
-	const configs = listModelConfigs(root);
-	if (configs.length === 0) throw new Error("no formal/*/*.cfg found");
+	const argv = process.argv.slice(2);
+	// Every flag is parsed and validated before any download or JVM spawn
+	// (#3920): a typo must fail loudly here, never run the full population.
+	const {
+		jar: jarArg,
+		concurrency: concurrencyRaw,
+		shard,
+	} = parseCliArgs(argv);
+	const configs = selectConfigs(argv, root);
 
 	const availableParallelism =
 		typeof os.availableParallelism === "function"
 			? os.availableParallelism()
 			: os.cpus().length;
-	const concurrency =
-		concurrencyIndex === -1
-			? computeConcurrency(configs.length, availableParallelism)
-			: parseConcurrencyArg(argv[concurrencyIndex + 1]);
+	const concurrency = resolveConcurrency(
+		concurrencyRaw,
+		configs.length,
+		availableParallelism,
+	);
+	const jar = await ensureJar(jarArg, root);
 
 	const wallStarted = Date.now();
 	const outcomes = await runPool(configs, concurrency, async (config) => {
@@ -310,9 +421,7 @@ async function main() {
 				`  ${dir}: ${totals.seconds.toFixed(1)}s summed over ${totals.count} configs`,
 		);
 	console.log("");
-	console.log(
-		`${configs.length} configs, ${wallSeconds.toFixed(1)}s wall (concurrency=${concurrency}, 1 TLC worker/config).`,
-	);
+	console.log(formatSummary(configs.length, shard, wallSeconds, concurrency));
 	console.log("Per-directory TLC time (summed, not wall time):");
 	for (const line of dirLines) console.log(line);
 

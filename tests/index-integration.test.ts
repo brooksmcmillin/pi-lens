@@ -99,7 +99,7 @@ function createMockPi(overrides: Record<string, boolean> = {}) {
 // `exportState` is production-faithful: the same `version` field
 // `clients/read-guard.ts` writes, read off the real module so a version bump
 // cannot silently make the double lie. Nothing else was added — a probe that
-// made `importState`/`hasKnownPath`/`forgetPath`/`recordSymbolRead` throw left
+// made `hasKnownPath`/`forgetPath`/`recordSymbolRead` throw left
 // the file green at 61 passed, so no path here reaches them, and a future path
 // that does now crashes LOUDLY rather than silently (that is this PR).
 vi.mock("../clients/read-guard.js", async (importOriginal) => {
@@ -122,6 +122,14 @@ vi.mock("../clients/read-guard.js", async (importOriginal) => {
 			version: actual.READ_GUARD_STATE_VERSION,
 			reads: [],
 		});
+		// #3521: every primary session_start imports the branch's reads.
+		importBranch = () => ({ imported: 0, dropped: 0 });
+		// #3612: a /reload hands the guard's authorship to the reloaded one.
+		exportAuthorship = () => ({
+			written: [],
+			sessionStartMs: 0,
+		});
+		importAuthorship = () => {};
 		getSummary = () => ({
 			totalEdits: 0,
 			totalBlocks: 0,
@@ -165,6 +173,7 @@ afterEach(() => {
 	vi.doUnmock("../clients/quiet-window.js");
 	vi.doUnmock("../clients/runtime-agent-end.js");
 	vi.doUnmock("../clients/runtime-turn.js");
+	vi.doUnmock("../clients/session-scope.js");
 });
 
 /**
@@ -601,7 +610,13 @@ describe("index.ts integration", () => {
 			const { default: registerExtension } = await import("../index.js");
 			const { mock, pi, handlers } = createMockPi();
 			registerExtension(pi as any);
-			const ctx = makeCtx({ cwd: tmpDir, sessionId: "pi-reload-dead-weight" });
+			// A session file: the mock names it as the replacement's at shutdown
+			// (#3612), and a file switch is what ends a telemetry set.
+			const ctx = makeCtx({
+				cwd: tmpDir,
+				sessionId: "pi-reload-dead-weight",
+				sessionFile: path.join(tmpDir, "pi-reload-dead-weight.jsonl"),
+			});
 
 			await handlers.session_start?.[0]?.({}, ctx);
 			const activation = mock.getTool("pi_lens_activate_tools") as {
@@ -827,7 +842,11 @@ describe("index.ts integration", () => {
 			const { default: registerExtension } = await import("../index.js");
 			const { mock, pi, handlers } = createMockPi();
 			registerExtension(pi as any);
-			const ctx = makeCtx({ cwd: tmpDir, sessionId: "pi-new-replacement" });
+			const ctx = makeCtx({
+				cwd: tmpDir,
+				sessionId: "pi-new-replacement",
+				sessionFile: path.join(tmpDir, "pi-new-replacement.jsonl"),
+			});
 
 			await handlers.session_start?.[0]?.({}, ctx);
 			const activation = mock.getTool("pi_lens_activate_tools") as {
@@ -959,6 +978,53 @@ describe("index.ts integration", () => {
 			shutdown?.({ reason: "quit" }, { cwd: tmpDir });
 
 			expect(order).toEqual(["reset_lsp_service", "dump:session_shutdown"]);
+		},
+		INTEGRATION_TIMEOUT_MS,
+	);
+
+	it(
+		"session_shutdown retires the session's scope even when a teardown step throws (#3611 r2)",
+		async () => {
+			// The recurrence: the retire ran last and unguarded, so a throw from
+			// any teardown step above it left the scope live. After a /reload that
+			// re-evaluated the entry, nothing else ever ends the old scope.
+			vi.doMock("../clients/lsp/index.js", () => ({
+				getLSPService: () => makeLspServiceDouble(),
+				resetLSPService: vi.fn(),
+			}));
+			vi.doMock("../clients/debug-handles.js", () => ({
+				dumpActiveHandles: () => {
+					throw new Error("teardown step failed");
+				},
+			}));
+			const retireScope = vi.fn();
+			vi.doMock("../clients/session-scope.js", async (importActual) => {
+				const actual =
+					await importActual<typeof import("../clients/session-scope.js")>();
+				retireScope.mockImplementation(actual.retireScope);
+				return { ...actual, retireScope };
+			});
+
+			const { default: registerExtension } = await import("../index.js");
+			const { pi, handlers } = createMockPi();
+			registerExtension(pi as any);
+			await handlers.session_start?.[0]?.(
+				{},
+				{ cwd: tmpDir, ui: { notify: vi.fn() } },
+			);
+
+			expect(() =>
+				handlers.session_shutdown?.[0]?.({ reason: "quit" }, { cwd: tmpDir }),
+			).toThrow("teardown step failed");
+
+			// The last retire is the shutdown's (the start's resetForSession
+			// retired the coordinator's construction scope first).
+			expect(retireScope).toHaveBeenLastCalledWith(expect.anything(), "quit");
+			const [scope] = retireScope.mock.calls.at(-1) as [
+				{ isLive(): boolean; retiredBy(): string | undefined },
+			];
+			expect(scope.isLive()).toBe(false);
+			expect(scope.retiredBy()).toBe("quit");
 		},
 		INTEGRATION_TIMEOUT_MS,
 	);
@@ -1685,7 +1751,7 @@ describe("index.ts integration", () => {
 	});
 
 	it(
-		"context handler injects guidance immediately before the final user prompt",
+		"context handler appends guidance to the active user prompt (#3693)",
 		async () => {
 			const context = await loadContextHandler();
 
@@ -1697,9 +1763,7 @@ describe("index.ts integration", () => {
 			);
 
 			// A realistic multi-turn transcript: assistant + prior user turns precede
-			// the current user prompt. (With a single-message transcript the old
-			// prepend and the new before-final placement coincide, so a multi-message
-			// transcript is required to actually exercise the #1016 change.)
+			// the current user prompt.
 			const firstUser = { role: "user", content: "Start the task" };
 			const assistant = { role: "assistant", content: "On it." };
 			const finalUser = { role: "user", content: "Fix the bug" };
@@ -1710,38 +1774,31 @@ describe("index.ts integration", () => {
 				{ cwd: tmpDir },
 			)) as { messages: Array<{ role: string; content: unknown }> };
 
-			// Full expected ordering: prior turns, then injected block, then the final
-			// user prompt — [firstUser, assistant, <injected>, finalUser].
-			expect(result).toEqual({
-				messages: [firstUser, assistant, injectedMatcher, finalUser],
-			});
-
-			// (1) #1016 index-0 stability: messages[0] is untouched. This is the
-			// property that FAILS on the old prepend code (injected findings landed at
-			// index 0), and it is the actual prompt-cache win.
+			// Full expected ordering: prior turns, then updated final user prompt
+			// with guidance appended — [firstUser, assistant, updatedFinalUser].
+			expect(result.messages).toHaveLength(3);
 			expect(result.messages[0]).toEqual(firstUser);
+			expect(result.messages[1]).toEqual(assistant);
 
-			// (2) Final message unchanged: same role + content as the incoming prompt.
-			const last = result.messages[result.messages.length - 1];
-			expect(last).toEqual(finalUser);
+			const last = result.messages[2];
 			expect(last.role).toBe("user");
-
-			// (3) Injected block sits at length - 2, immediately before the final msg.
-			expect(result.messages[result.messages.length - 2]).toEqual(
-				injectedMatcher,
+			expect(last.content).toContain(
+				"Fix the bug\n\n[pi-lens automated context — not a user request]",
 			);
+			expect(last.content).toContain("Use pi-lens tools when useful.");
 
-			// (5) Non-empty input preserved (fe0ed5da): every existing message survives.
-			expect(result.messages).toHaveLength(existing.length + 1);
-			for (const msg of existing) {
-				expect(result.messages).toContainEqual(msg);
-			}
+			// Original user message is not mutated in place (#3693 constraint 1)
+			expect(finalUser.content).toBe("Fix the bug");
+			expect(last).not.toBe(finalUser);
+
+			// Non-empty input preserved (fe0ed5da)
+			expect(result.messages.length).toBeGreaterThan(0);
 		},
 		INTEGRATION_TIMEOUT_MS,
 	);
 
 	it(
-		"context injection keeps the prior-conversation prefix byte-identical across turns (#1016 cache win)",
+		"context injection keeps the prior-conversation prefix byte-identical across turns (#1016 & #3693 cache win)",
 		async () => {
 			const firstUser = { role: "user", content: "Start the task" };
 			const assistant = { role: "assistant", content: "On it." };
@@ -1778,21 +1835,24 @@ describe("index.ts integration", () => {
 				{ cwd: tmpDir },
 			)) as { messages: Array<{ role: string; content: unknown }> };
 
-			// The prior conversation prefix (everything up to but excluding the
-			// injection point at length - 2) is identical between the two turns — this
-			// is exactly what a prefix-caching provider reuses.
-			const prefixA = resultA.messages.slice(0, resultA.messages.length - 2);
-			const prefixB = resultB.messages.slice(0, resultB.messages.length - 2);
-			expect(prefixA).toEqual(prefixB);
+			// The prior conversation prefix (everything up to the trailing user prompt)
+			// is identical between the two turns — this is what prefix-caching providers reuse.
+			const prefixA = resultA.messages.slice(0, -1);
+			const prefixB = resultB.messages.slice(0, -1);
+			// Assert that turn 2's prefix equals turn 1's prefix byte-for-byte:
+			expect(prefixB).toEqual(prefixA);
 			expect(prefixA).toEqual([firstUser, assistant]);
 
-			// They diverge only at the injection slot.
-			expect(resultA.messages[resultA.messages.length - 2]).not.toEqual(
-				resultB.messages[resultB.messages.length - 2],
+			// The trailing message starts with the same user prompt text across turns
+			const lastA = resultA.messages[resultA.messages.length - 1];
+			const lastB = resultB.messages[resultB.messages.length - 1];
+			expect((lastA.content as string).startsWith("Fix the bug\n\n")).toBe(
+				true,
 			);
-			// ...and reconverge on the trailing user prompt.
-			expect(resultA.messages[resultA.messages.length - 1]).toEqual(finalUser);
-			expect(resultB.messages[resultB.messages.length - 1]).toEqual(finalUser);
+			expect((lastB.content as string).startsWith("Fix the bug\n\n")).toBe(
+				true,
+			);
+			expect(lastA.content).not.toEqual(lastB.content);
 		},
 		INTEGRATION_TIMEOUT_MS,
 	);

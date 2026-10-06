@@ -235,6 +235,39 @@ function scratchCwd(): string {
 	return dir;
 }
 
+/**
+ * #3609 §3.8 item 1 (#3612): the state declared as a session store
+ * (`defineSessionStore` in `clients/session-scope.ts`), by store name. A
+ * store's transition behaviour is its declared policy, not a reset, so it has
+ * no `SESSION_STATE_REGISTRY` row. `tests/config/session-scope-sweep.test.ts`
+ * diffs this table both ways against the declared stores.
+ */
+export const SESSION_STORE_REGISTRY: Readonly<
+	Record<string, { module: string; state: string }>
+> = {
+	"agent-advisories": {
+		module: "agent-nudge.ts",
+		state: "the scope's queued, undelivered agent advisories (_advisories)",
+	},
+	"lazy-tool-memory": {
+		module: "tool-set-policy.ts",
+		state: "a per-scope Set of the lazy tools the conversation activated",
+	},
+	"read-guard": {
+		module: "read-guard-branch.ts",
+		state:
+			"the reads of the ReadGuard bound to the scope (RuntimeCoordinator._readGuard)",
+	},
+	"read-guard-authorship": {
+		module: "read-guard-branch.ts",
+		state: "the ReadGuard's writtenThisSession and its mtime anchor",
+	},
+	widget: {
+		module: "widget-state.ts",
+		state: "the widget's files and sessionLanguages",
+	},
+};
+
 export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 	{
 		id: "ast-grep-napi:loadState",
@@ -1154,15 +1187,6 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 			"#2366: staged test results belong to their owning session and must not cross a primary session replacement; the durable findings cache remains available to pull diagnostics.",
 	},
 	{
-		id: "tool-set-policy:rememberedLazyToolsBySessionFile",
-		module: "tool-set-policy.ts",
-		state: "rememberedLazyToolsBySessionFile",
-		policy: "process_lifetime",
-		resetName: "resetRememberedLazyToolsForTests",
-		reason:
-			"Activation posture must survive factory rebuilds and return-to-session transitions; the bounded FIFO cap limits process-lifetime retention without clearing live conversation memory.",
-	},
-	{
 		id: "tree-sitter-shared:webTreeSitterLoadFailed",
 		module: "tree-sitter-shared.ts",
 		state:
@@ -1662,7 +1686,11 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"quiet-window-config.ts": 0,
 	"quiet-window.ts": 0,
 	"recent-touches.ts": 1,
-	"review-graph/builder.ts": 19,
+	// #3605: 19 -> 20 for _wasmTrappedFiles, process-lifetime like the
+	// tree-sitter client's trap map it follows: a session boundary resets
+	// neither the wasm heap nor the client's charges, and each extraction
+	// rewrites its file's entry, so a session_start clear would re-arm nothing.
+	"review-graph/builder.ts": 20,
 	// #3417: the module-level git-dir memo is gone; the count is pinned at 0 so a
 	// re-hoisted memo (the stale-negative shape) fails this sweep, not just the
 	// lifecycle test.
@@ -1730,7 +1758,6 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	// `let`) plus its `_resetBundledQueriesRootHealthForTests` export (the
 	// scan's reset-signal detector) — see this file's EXEMPT_SESSION_STATE_FILES
 	// entry above for why it is exempt rather than registered.
-	"tool-set-policy.ts": 1,
 	"tree-sitter-query-loader.ts": 2,
 	"tree-sitter-shared.ts": 0,
 	"turn-context.ts": 0,

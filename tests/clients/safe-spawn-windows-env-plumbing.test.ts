@@ -100,7 +100,34 @@ describe("Windows resolution honors the CALLER's env, not just ambient process.e
 			configurable: true,
 		});
 		vi.restoreAllMocks();
+		vi.unstubAllEnvs();
 	});
+
+	// CodeQL #3: builder refusals remain structured results, never rejected promises.
+	it.each(["argument", "SystemRoot"])(
+		"returns a spawn failure for unsafe %s on both Windows APIs",
+		async (source) => {
+			const tool = "C:\\tools\\server.cmd";
+			markFilesAsPresent(tool);
+			spawnSyncMock.mockClear();
+			const args = source === "argument" ? ["%EXPAND%"] : [];
+			vi.stubEnv(
+				"SystemRoot",
+				source === "SystemRoot" ? "%ROOT%" : "C:\\Windows",
+			);
+			for (const result of [
+				safeSpawn(tool, args),
+				await safeSpawnAsync(tool, args),
+			]) {
+				expect(result.failure).toBe("spawn");
+				expect(result.error?.message).toContain("cmd.exe");
+				expect(result.status).toBeNull();
+				expect(result.stdout).toBe("");
+			}
+			expect(spawnMock).not.toHaveBeenCalled();
+			expect(spawnSyncMock).not.toHaveBeenCalled();
+		},
+	);
 
 	it("safeSpawnAsync resolves the command from options.env.PATH, not ambient process.env.PATH", async () => {
 		const managedBin = "C:\\__pi_lens_env_plumbing__\\managed\\bin";

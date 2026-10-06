@@ -30,7 +30,94 @@ function metaTable(meta) {
 	if ((meta.filesUncovered?.length ?? 0) > 0) {
 		rows.push(["No covering test", meta.filesUncovered.join(", ")]);
 	}
-	return rows.map(([k, v]) => `- **${k}:** ${v}`).join("\n");
+	const selectionRow = testSelectionRow(meta);
+	if (selectionRow) rows.push(selectionRow);
+	const incrementalRow = incrementalRowOf(meta);
+	if (incrementalRow) rows.push(incrementalRow);
+	const rendered = rows.map(([k, v]) => `- **${k}:** ${v}`);
+	if ((meta.testsExcluded?.length ?? 0) > 0) {
+		rendered.push(
+			"- **Excluded tests:**",
+			...meta.testsExcluded.map(
+				({ file, reason }) => `  - \`${file}\` — ${reason}`,
+			),
+		);
+	}
+	return rendered.join("\n");
+}
+
+/**
+ * The `related N → covering M → kept K` line the driver logs and the report's
+ * metadata table shows (#3810). `covering` is null when no coverage probe was
+ * usable and the kept set came from the import graph alone.
+ *
+ * @param {{pool: number, covering: number | null, kept: number, own?: number, unknown?: number}} selection
+ */
+export function formatTestSelection(selection) {
+	const covering =
+		selection.covering === null
+			? "coverage unavailable (import-graph ranking)"
+			: String(selection.covering);
+	const extras = [
+		selection.own > 0 ? `${selection.own} own` : null,
+		selection.unknown > 0 ? `${selection.unknown} probe failed` : null,
+	].filter(Boolean);
+	return `related ${selection.pool} → covering ${covering} → kept ${selection.kept}${extras.length > 0 ? ` (${extras.join(", ")})` : ""}`;
+}
+
+function validTestSelection(meta) {
+	const selection = meta.testSelection;
+	return selection &&
+		typeof selection.pool === "number" &&
+		typeof selection.kept === "number" &&
+		typeof selection.dropped === "number" &&
+		(selection.covering === null || typeof selection.covering === "number")
+		? selection
+		: null;
+}
+
+function testSelectionRow(meta) {
+	const selection = validTestSelection(meta);
+	return selection ? ["Test selection", formatTestSelection(selection)] : null;
+}
+
+const INCREMENTAL_STATES = {
+	"cold-no-cache": "cold (no restored cache)",
+	"cold-inputs-changed":
+		"cold (a kept test or another changed file differs from the cached run)",
+};
+
+function incrementalRowOf(meta) {
+	const incremental = meta.incremental;
+	if (!incremental) return null;
+	if (incremental.state === "warm") {
+		return [
+			"Incremental",
+			typeof incremental.reused === "number" &&
+			typeof incremental.total === "number"
+				? `${incremental.reused} of ${incremental.total} mutant result(s) reused from the previous push`
+				: "restored cache accepted (reuse count unavailable)",
+		];
+	}
+	const text = INCREMENTAL_STATES[incremental.state];
+	if (!text) return null;
+	const changed = Array.isArray(incremental.changed)
+		? incremental.changed.filter((input) => typeof input === "string")
+		: [];
+	if (incremental.state !== "cold-inputs-changed" || changed.length === 0) {
+		return ["Incremental", text];
+	}
+	const shown = changed.slice(0, 5).map((input) => `\`${input}\``);
+	const more = changed.length > 5 ? ` and ${changed.length - 5} more` : "";
+	return ["Incremental", `${text}: ${shown.join(", ")}${more}`];
+}
+
+// Only a DROPPED test makes the population truncated: kept < covering is not
+// the test, since a PR's own tests are kept whether or not they cover a line.
+function testCapNotice(meta) {
+	const selection = validTestSelection(meta);
+	if (!selection || selection.dropped <= 0) return null;
+	return `**Bounded evidence:** ${selection.dropped} ${selection.covering === null ? "related" : "covering"} test(s) dropped by the test cap (${selection.kept} kept). The score is from a truncated test population.`;
 }
 
 /**
@@ -102,6 +189,8 @@ export function renderMutationMarkdown(report) {
 			"",
 		);
 		if (samplingNote) lines.push(samplingNote, "");
+		const capNote = testCapNotice(meta);
+		if (capNote) lines.push(capNote, "");
 		lines.push(metaTable(meta));
 		return lines.join("\n");
 	}
@@ -154,15 +243,16 @@ export function renderMutationMarkdown(report) {
 	// range it set out to.
 	if (meta.partial) {
 		lines.push(
-			`**Partial run** -- ${meta.partial.evaluated} of ${meta.partial.total ?? "an unknown total of"} mutant(s) evaluated before the budget expired.`,
+			`**Partial run** -- ${meta.partial.evaluated} of ${meta.partial.total ?? "an unknown total of"} mutant(s) evaluated before the interrupt.`,
 			"",
 			`> ${meta.partial.reason}`,
 			"",
 		);
 	}
 
+	const capNote = testCapNotice(meta);
 	lines.push(
-		`**Score: ${meta.score ?? "n/a"}%** -- ${counts.Killed ?? 0} killed, ${counts.Survived ?? 0} survived, ${counts.Timeout ?? 0} timeout, ${counts.NoCoverage ?? 0} no coverage (${total} total)`,
+		`**Score: ${meta.score ?? "n/a"}%** -- ${counts.Killed ?? 0} killed, ${counts.Survived ?? 0} survived, ${counts.Timeout ?? 0} timeout, ${counts.NoCoverage ?? 0} no coverage (${total} total)${capNote ? ` — ${capNote.replaceAll("**", "")}` : ""}`,
 		"",
 	);
 

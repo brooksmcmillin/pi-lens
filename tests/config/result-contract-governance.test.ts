@@ -1,7 +1,15 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+// #3567: load the extension graph once at collection, outside any budget.
+// The fork's first load measured 6.6 s of the `beforeAll` below's 7.2 s
+// (0.85 s in plain node; the rest is Vitest transforming each module the
+// first time), and it scales with CPU contention, so it timed that hook out
+// at Vitest's 10 s default on a loaded host. The hook still evaluates its own
+// copy after `chdir`, because module state captured at evaluation differs by
+// cwd; re-evaluating an already-transformed graph costs about 0.2 s.
+import "../../index.js";
 import { TOOL_REGISTRY } from "../../clients/tool-config.js";
 import { MAX_RESULT_BYTES } from "../../tools/render-compact.js";
 import { McpHarness } from "../mcp/harness.js";
@@ -62,6 +70,7 @@ describe("result contract across registered tool surfaces", () => {
 		fs.writeFileSync(path.join(cwd, "big.ts"), `${bigLines.join("\n")}\n`);
 		process.chdir(cwd);
 		pi = createPiMock();
+		vi.resetModules();
 		const { default: extension } = await import("../../index.js");
 		extension(pi.asExtensionAPI());
 		mcp = new McpHarness({ cwd });
@@ -106,6 +115,18 @@ describe("result contract across registered tool surfaces", () => {
 			effective_config: { file: "fixture.ts" },
 		};
 
+		// #3749: the MCP dispatcher reports any argument key a tool's schema does
+		// not declare, and that report leads the result text. Send each MCP tool
+		// only the keys it advertises, so the parity comparison below stays a
+		// comparison of the two surfaces' renderings.
+		const advertised = (
+			(await mcp.request(99, "tools/list", {})).result as {
+				tools: {
+					name: string;
+					inputSchema: { properties?: Record<string, unknown> };
+				}[];
+			}
+		).tools;
 		for (const entry of TOOL_REGISTRY) {
 			if (!entry.piName || !entry.mcpName) continue;
 			const args = fixtures[entry.name];
@@ -129,7 +150,18 @@ describe("result contract across registered tool surfaces", () => {
 				"tools/call",
 				{
 					name: entry.mcpName,
-					arguments: { ...args, ...(args.path ? { file: args.path } : {}) },
+					arguments: Object.fromEntries(
+						Object.entries({
+							...args,
+							...(args.path ? { file: args.path } : {}),
+						}).filter(([key]) =>
+							Object.hasOwn(
+								advertised.find((tool) => tool.name === entry.mcpName)
+									?.inputSchema.properties ?? {},
+								key,
+							),
+						),
+					),
 				},
 			);
 			const mcpText = (mcpResult.result as ToolResult).content?.[0]?.text;

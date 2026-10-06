@@ -15,13 +15,22 @@
 // module turns "read the log, decide" into a function a human or an
 // orchestrator can call on a run id.
 
+import {
+	CI_JOB_NAMES,
+	isAdvisoryCheck,
+	isBlockingConclusion,
+	isUnitTestsShardJobName,
+} from "./ci-checks.mjs";
+
 /** Strips the ANSI color/cursor codes vitest's reporter and GitHub Actions
  * both wrap every line in. Every pattern below matches against the stripped
  * text -- matching raw escape-coded text is what makes log heuristics
  * brittle across reporter versions. */
+// Every CSI sequence (colour, cursor), not only `m`: `scripts/ci-verdict.mjs`
+// reads job logs through this same helper (#3700).
 // oxlint-disable-next-line no-control-regex -- ESC (\x1b) is the literal ANSI escape-sequence lead byte this pattern strips, not accidental input.
-const ANSI_PATTERN = /\x1b\[[0-9;]*m/g;
-function stripAnsi(text) {
+const ANSI_PATTERN = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
+export function stripAnsi(text) {
 	return text.replace(ANSI_PATTERN, "");
 }
 
@@ -38,7 +47,7 @@ function stripAnsi(text) {
  * line".
  */
 const LINE_TIMESTAMP_PREFIX = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z ?/gm;
-function stripLineTimestamps(text) {
+export function stripLineTimestamps(text) {
 	return text.replace(LINE_TIMESTAMP_PREFIX, "");
 }
 
@@ -90,10 +99,12 @@ const FAIL_LINE = /^\s*FAIL\s+\S+\s+(\S+\.test\.tsx?)\s*>\s*(.+)$/gm;
 // elsewhere in the same log under a fake real classification (safe
 // direction, but reimposes the manual-read tax this classifier exists to
 // remove). See the "V4 fabricated FAIL in a passing test title" fixture.
-const BARE_FAIL_LINE = /^\s*FAIL\b.*?(\S+\.test\.tsx?)(?=\s|$)/m;
+export const BARE_FAIL_LINE =
+	/^\s*FAIL\b.*?(\S+\.(?:test|spec)\.[cm]?[jt]sx?)(?=\s|$)/m;
 // (real log, same run) "AssertionError: expected false to be true //
 // Object.is equality"
-const ASSERTION_LINE = /^\s*AssertionError:\s*(.+)$/m;
+export const ASSERTION_LINE =
+	/^\s*AssertionError(?: \[ERR_ASSERTION\])?:\s*(.+)$/m;
 // vitest prints this inline, AS EACH FILE FINISHES, before the end-of-run
 // "Failed Tests" summary block ever gets a chance to print (real log, run
 // 32913518938, job 98012237782, line 536): " ❯  default
@@ -751,13 +762,25 @@ async function fetchRunAndFailedJob({ fetcher, owner, repo, runId, jobName }) {
 		`${base}/actions/runs/${runId}/jobs`,
 	);
 	const jobs = jobsResponse.jobs ?? [];
-	const failedJob = jobName
-		? jobs.find((job) => job.conclusion === "failure" && job.name === jobName)
-		: jobs.find((job) => job.conclusion === "failure");
+	const failedJobs = jobName
+		? failedJobsNamed(jobs, jobName)
+		: jobs.filter((job) => job.conclusion === "failure").slice(0, 1);
+	const failedJob = failedJobs[0];
 	if (!failedJob) {
-		throw new Error(
-			`run ${runId} has no failed job${jobName ? ` named "${jobName}"` : ""}`,
+		// #3801 (verify r2 V3): a CI run that failed ONLY on advisory jobs (a
+		// not-ready `Heavy advisory gate`, the Windows run) is not a `real`
+		// failure of the change; the caller must not label the PR `ci:real`.
+		// Every job with a BLOCKING conclusion (failure, timed_out, cancelled, ...)
+		// must be advisory: a required job that timed out beside a red gate is
+		// not "only advisory" (verify r3 V6).
+		const blocking = jobs.filter((job) => isBlockingConclusion(job.conclusion));
+		const advisoryOnly =
+			blocking.length > 0 && blocking.every((job) => isAdvisoryCheck(job.name));
+		const error = new Error(
+			`run ${runId} has no failed job${jobName ? ` named "${jobName}"` : ""}${advisoryOnly ? `; ${ADVISORY_ONLY_MARKER} (${blocking.map((job) => job.name).join(", ")})` : ""}`,
 		);
+		error.advisoryOnly = advisoryOnly;
+		throw error;
 	}
 	const prNumber = run.pull_requests?.[0]?.number ?? null;
 	return {
@@ -769,14 +792,41 @@ async function fetchRunAndFailedJob({ fetcher, owner, repo, runId, jobName }) {
 		// (or a hand-rolled fixture) reads as attempt 1.
 		runAttempt: Number(run.run_attempt) || 1,
 		jobId: failedJob.id,
-		jobName: failedJob.name,
+		jobName: failedJobs.map((job) => job.name).join(", "),
+		jobIds: failedJobs.map((job) => job.id),
 	};
+}
+
+/**
+ * The failed jobs a `--job-name` selects. #3753: `Unit tests` is an aggregate
+ * check-run over `Unit tests (shard k/N)` matrix jobs, and the log the
+ * classifier must read (the failing test names, the exit-137 kill) is the
+ * shard's, not the aggregate's. Failed shard rows win when any exist; with
+ * none, an exact-name failure is the pre-sharding shape (a run from before
+ * #3753, or the aggregate failing on its own).
+ */
+function failedJobsNamed(jobs, jobName) {
+	const failed = jobs.filter((job) => job.conclusion === "failure");
+	const shards =
+		jobName === CI_JOB_NAMES.UNIT_TESTS
+			? failed.filter((job) => isUnitTestsShardJobName(job.name))
+			: [];
+	return shards.length > 0
+		? shards
+		: failed.filter((job) => job.name === jobName);
 }
 
 async function fetchJobLog({ fetcher, owner, repo, jobId }) {
 	const base = `https://api.github.com/repos/${owner}/${repo}`;
 	return fetchText(fetcher, `${base}/actions/jobs/${jobId}/logs`);
 }
+
+/**
+ * The phrase a skipped classification carries when every failed job of the run
+ * is advisory. ci-infra-kill-rerun.yml's label step greps the CLI output for
+ * it (tests/config/ci-infra-kill-rerun-gate.test.ts pins the two together).
+ */
+export const ADVISORY_ONLY_MARKER = "only advisory jobs failed";
 
 /**
  * Find this PR's existing classifier comment, if any -- there is at most one
@@ -951,7 +1001,11 @@ export async function runClassifier({
 			error instanceof Error &&
 			error.message.includes("has no failed job")
 		) {
-			return { skipped: true, reason: error.message };
+			return {
+				skipped: true,
+				reason: error.message,
+				...(error.advisoryOnly === true ? { advisoryOnly: true } : {}),
+			};
 		}
 		await commentClassificationFailure({
 			fetcher,
@@ -968,6 +1022,7 @@ export async function runClassifier({
 		prNumber: resolvedPrNumber,
 		runAttempt,
 		jobId,
+		jobIds,
 		jobName: resolvedJobName,
 	} = runAndJob;
 	const prNumber = prNumberOverride ?? resolvedPrNumber;
@@ -977,9 +1032,12 @@ export async function runClassifier({
 		);
 	}
 
-	let rawLog;
+	let rawLogs;
 	try {
-		rawLog = await fetchJobLog({ fetcher, owner, repo, jobId });
+		rawLogs = [];
+		for (const id of jobIds) {
+			rawLogs.push(await fetchJobLog({ fetcher, owner, repo, jobId: id }));
+		}
 	} catch (error) {
 		await commentClassificationFailure({
 			fetcher,
@@ -1004,7 +1062,12 @@ export async function runClassifier({
 		: null;
 	let classification;
 	try {
-		classification = classifyFailureLog(rawLog);
+		// One log per failed job (several failed shards, #3753). A real failure
+		// in ANY of them wins: a rerun that would only replay the infra-killed
+		// shard cannot fix a shard that is genuinely red.
+		const classified = rawLogs.map((rawLog) => classifyFailureLog(rawLog));
+		classification =
+			classified.find((entry) => entry.kind === "real") ?? classified[0];
 	} catch (error) {
 		await commentClassificationFailure({
 			fetcher,

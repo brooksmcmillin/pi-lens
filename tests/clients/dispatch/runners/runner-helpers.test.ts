@@ -1122,7 +1122,7 @@ describe("runner-helpers availability checker", () => {
 			// quote-wrapped path is a literal filename that ENOENTs on every
 			// platform.
 			const resolved = await createVenvFinder("ruff", ".exe")(env.tmpDir);
-			expect(resolved).toBe(toolPath);
+			expect(resolved).toEqual({ path: toolPath, rung: "venv" });
 		} finally {
 			env.cleanup();
 		}
@@ -1177,7 +1177,7 @@ describe("createVenvFinder: managed tools dir (#1638)", () => {
 					"pyright",
 					".exe",
 				)(cwdWithNoVenv.tmpDir);
-				expect(resolved).toBe(managedBin);
+				expect(resolved).toEqual({ path: managedBin, rung: "managed-dir" });
 			} finally {
 				cwdWithNoVenv.cleanup();
 			}
@@ -1220,7 +1220,7 @@ describe("createVenvFinder: managed tools dir (#1638)", () => {
 				"managedtool",
 				".exe",
 			)(env.tmpDir);
-			expect(resolved).toBe(managedBin);
+			expect(resolved).toEqual({ path: managedBin, rung: "managed-dir" });
 			expect(safeSpawnMod.safeSpawnAsync).not.toHaveBeenCalled();
 		} finally {
 			env.cleanup();
@@ -1235,7 +1235,7 @@ describe("createVenvFinder: managed tools dir (#1638)", () => {
 			fs.writeFileSync(venvBin, "#!/bin/sh\nexit 0\n");
 
 			const resolved = await createVenvFinder("ruff")(env.tmpDir);
-			expect(resolved).toBe(venvBin);
+			expect(resolved).toEqual({ path: venvBin, rung: "venv" });
 		} finally {
 			env.cleanup();
 		}
@@ -1266,7 +1266,10 @@ describe("createVenvFinder: managed tools dir (#1638)", () => {
 			fs.mkdirSync(path.dirname(venvBin), { recursive: true });
 			fs.writeFileSync(venvBin, "#!/bin/sh\nexit 0\n");
 
-			expect(await createVenvFinder("ruff", ".exe")(pkg)).toBe("ruff");
+			expect(await createVenvFinder("ruff", ".exe")(pkg)).toEqual({
+				path: "ruff",
+				rung: "path",
+			});
 		} finally {
 			env.cleanup();
 		}
@@ -1295,9 +1298,10 @@ describe("createVenvFinder: managed tools dir (#1638)", () => {
 
 			// Falls through to the bare name (PATH), never to `$HOME`'s venv —
 			// which can only be some unrelated user-level virtualenv.
-			expect(await createVenvFinder("homeonlytool", ".exe")(project)).toBe(
-				"homeonlytool",
-			);
+			expect(await createVenvFinder("homeonlytool", ".exe")(project)).toEqual({
+				path: "homeonlytool",
+				rung: "path",
+			});
 		} finally {
 			if (originalHome === undefined) delete process.env.HOME;
 			else process.env.HOME = originalHome;
@@ -1313,7 +1317,7 @@ describe("createVenvFinder: managed tools dir (#1638)", () => {
 			const resolved = await createVenvFinder("totally-unknown-tool")(
 				env.tmpDir,
 			);
-			expect(resolved).toBe("totally-unknown-tool");
+			expect(resolved).toEqual({ path: "totally-unknown-tool", rung: "path" });
 		} finally {
 			env.cleanup();
 		}
@@ -1930,7 +1934,7 @@ describe("managed shim resolution verifies the binary (#1657)", () => {
 					"brokentool",
 					".exe",
 				)(cwdWithNoVenv.tmpDir);
-				expect(resolved).toBe("brokentool");
+				expect(resolved).toEqual({ path: "brokentool", rung: "path" });
 			} finally {
 				cwdWithNoVenv.cleanup();
 			}
@@ -1964,7 +1968,7 @@ describe("managed shim resolution verifies the binary (#1657)", () => {
 					"stalledtool",
 					".exe",
 				)(cwdWithNoVenv.tmpDir);
-				expect(resolved).toBe(shim);
+				expect(resolved).toEqual({ path: shim, rung: "managed-dir" });
 			} finally {
 				cwdWithNoVenv.cleanup();
 			}
@@ -1988,9 +1992,18 @@ describe("managed shim resolution verifies the binary (#1657)", () => {
 			const finder = createVenvFinder("memotool", ".exe");
 			const cwdWithNoVenv = setupTestEnvironment("pi-lens-managed-memo-cwd-");
 			try {
-				expect(await finder(cwdWithNoVenv.tmpDir)).toBe(shim);
-				expect(await finder(cwdWithNoVenv.tmpDir)).toBe(shim);
-				expect(await finder(cwdWithNoVenv.tmpDir)).toBe(shim);
+				expect(await finder(cwdWithNoVenv.tmpDir)).toEqual({
+					path: shim,
+					rung: "managed-dir",
+				});
+				expect(await finder(cwdWithNoVenv.tmpDir)).toEqual({
+					path: shim,
+					rung: "managed-dir",
+				});
+				expect(await finder(cwdWithNoVenv.tmpDir)).toEqual({
+					path: shim,
+					rung: "managed-dir",
+				});
 				// #1467's no-spawn fast path survives: one verification, then the
 				// memo answers.
 				expect(installerMod.verifyToolBinary).toHaveBeenCalledTimes(1);
@@ -2032,7 +2045,10 @@ describe("managed shim resolution verifies the binary (#1657)", () => {
 			);
 			try {
 				for (let i = 0; i < 5; i += 1) {
-					expect(await finder(cwdWithNoVenv.tmpDir)).toBe(shim);
+					expect(await finder(cwdWithNoVenv.tmpDir)).toEqual({
+						path: shim,
+						rung: "managed-dir",
+					});
 				}
 				expect(installerMod.verifyToolBinary).toHaveBeenCalledTimes(1);
 			} finally {
@@ -2066,12 +2082,18 @@ describe("managed shim resolution verifies the binary (#1657)", () => {
 			);
 			const realNow = Date.now;
 			try {
-				expect(await finder(cwdWithNoVenv.tmpDir)).toBe(shim);
+				expect(await finder(cwdWithNoVenv.tmpDir)).toEqual({
+					path: shim,
+					rung: "managed-dir",
+				});
 				// A stall is not a durable verdict, so the cooldown must expire —
 				// otherwise one slow first touch pins "cannot verify" all session.
 				const later = realNow() + 61_000;
 				vi.spyOn(Date, "now").mockImplementation(() => later);
-				expect(await finder(cwdWithNoVenv.tmpDir)).toBe(shim);
+				expect(await finder(cwdWithNoVenv.tmpDir)).toEqual({
+					path: shim,
+					rung: "managed-dir",
+				});
 				expect(installerMod.verifyToolBinary).toHaveBeenCalledTimes(2);
 			} finally {
 				Date.now = realNow;

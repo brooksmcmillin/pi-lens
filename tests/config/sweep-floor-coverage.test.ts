@@ -80,6 +80,8 @@ function sweepShapeFiles(): Array<{ file: string; source: string }> {
 }
 
 const DECLARED_EXCEPTIONS: Readonly<Record<string, string>> = {
+	"tests/config/lsp-idle-eviction-registry.test.ts":
+		"LSP registry policy census; its registry-specific boundary tests are not a sweep-kit floor",
 	"tests/config/github-token-write-gates.test.ts":
 		"workflow population governance sweep; its own detector is not a production registry sweep",
 	// #2725: two-direction set equality over every .d.mts/.mjs sibling pair; the
@@ -96,6 +98,8 @@ const DECLARED_EXCEPTIONS: Readonly<Record<string, string>> = {
 		"runtime seam behavior cases; filesystem counters verify re-detection, not a population sweep",
 	"tests/clients/sg-runner.test.ts":
 		"fault-injection cases enumerate one real temporary namespace seam; the test asserts cleanup for each setup operation, not a source population sweep",
+	"tests/support/tmp-root-teardown.test.ts":
+		"lists the private tmpdir of one child Vitest run to assert what its forks left behind; a fixture-behaviour check, not a registered-or-fail source population sweep (#2912)",
 	"tests/clients/language-policy.test.ts":
 		"policy unit cases over synthetic language definitions, not a production walk",
 	"tests/clients/lsp/lsp-primary-reachability.test.ts":
@@ -197,6 +201,13 @@ const DECLARED_EXCEPTIONS: Readonly<Record<string, string>> = {
 		"enumerates .github/workflows/*.yml job names for gating/advisory " +
 		"classification (#2618 F3) -- an external CI-contract governance " +
 		"walk, not a clients/ production module registry sweep",
+	"tests/scripts/red-on-base.test.ts":
+		"lists one TMPDIR-scoped scratch directory of a CLI fixture run and " +
+		"asserts it is empty after cleanup; not a production population sweep",
+	"tests/scripts/stryker-diff.test.ts":
+		"fake-Stryker fixture; linkRealNodeModules enumerates the local " +
+		"node_modules install and the emptiness assertions are on mapRelatedTests " +
+		"result sets (behavior cases), not a production source-population sweep",
 	"tests/scripts/no-hardcoded-machine-paths.test.ts":
 		"carries its own declared floor at the 'scans a nonzero number of " +
 		"script files' check (files.length > 10)",

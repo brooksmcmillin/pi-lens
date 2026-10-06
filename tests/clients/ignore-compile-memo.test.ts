@@ -58,6 +58,25 @@ afterEach(() => {
 });
 
 describe("#1976 compiled-glob memo", () => {
+	// CodeQL #1 confused Minimatch.match(path) with String.match(regexp).
+	it("treats regex-shaped filenames as data without compiling them as patterns", () => {
+		const env = setupTestEnvironment("pi-lens-1976-regex-data-");
+		try {
+			fs.mkdirSync(path.join(env.tmpDir, ".git"));
+			const matcher = createProjectIgnoreMatcher(env.tmpDir, ["literal.ts"]);
+			const counter = compileCounter();
+			expect(matcher.isIgnored(path.join(env.tmpDir, "ordinary.js"))).toBe(
+				false,
+			);
+			const compiled = counter.count;
+			for (const name of [".*", "[", "(a+)+$"])
+				expect(matcher.isIgnored(path.join(env.tmpDir, name))).toBe(false);
+			expect(matcher.isIgnored(path.join(env.tmpDir, "literal.ts"))).toBe(true);
+			expect(counter.count).toBe(compiled);
+		} finally {
+			env.cleanup();
+		}
+	});
 	it("refreshes a previously ignored path after a nested .gitignore edit", () => {
 		const env = setupTestEnvironment("pi-lens-2071-ignore-");
 		try {

@@ -1051,9 +1051,13 @@ export class DependencyChecker {
 	/**
 	 * Full project scan (for /check-deps command)
 	 */
-	async scanProject(
-		cwd?: string,
-	): Promise<{ circular: CircularDep[]; count: number } & AnalysedRootSignal> {
+	async scanProject(cwd?: string): Promise<
+		{
+			circular: CircularDep[];
+			count: number;
+			scannedAt?: string;
+		} & AnalysedRootSignal
+	> {
 		const projectRoot = path.resolve(cwd || process.cwd());
 
 		// Return early for non-existent or empty directories before probing/installing.
@@ -1095,7 +1099,16 @@ export class DependencyChecker {
 	private async runScanProject(
 		projectRoot: string,
 		gen: number,
-	): Promise<{ circular: CircularDep[]; count: number } & AnalysedRootSignal> {
+	): Promise<
+		{
+			circular: CircularDep[];
+			count: number;
+			scannedAt?: string;
+		} & AnalysedRootSignal
+	> {
+		// #3600: stamp the read time at the top of the run body, before madge
+		// reads the import graph a widget row's freshness is judged against.
+		const scannedAt = new Date().toISOString();
 		try {
 			const { cmd, prefix } = await this.resolveMadge(projectRoot);
 			const result = await safeSpawnAsync(
@@ -1127,7 +1140,7 @@ export class DependencyChecker {
 			// Every other return here (missing root, no top-level source file,
 			// madge unavailable, spawn error, parse throw) is the SAME empty shape
 			// and must not be read as "no cycles in this project".
-			return { circular, count: circular.length, analyzed: true };
+			return { circular, count: circular.length, analyzed: true, scannedAt };
 		} catch (err: any) {
 			this.log(`Scan error: ${err.message}`);
 			return { circular: [], count: 0 };

@@ -1901,6 +1901,9 @@ describe("publishDiagnostics handler — superseded push guard (cache-poisoning 
 		expect(state.documentContentHashes.get(TEST_KEY)).toEqual({
 			version: 2,
 			hash: hashDiagnosticContent(content),
+			changedAtMs: expect.any(Number),
+			openedAtMs: expect.any(Number),
+			openedHash: hashDiagnosticContent(content),
 		});
 
 		emitPublishDiagnostics({

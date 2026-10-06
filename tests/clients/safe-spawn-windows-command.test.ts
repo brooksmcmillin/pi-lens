@@ -7,10 +7,11 @@
  * now escaped like the args.
  */
 
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
 	buildWindowsShellCommand,
 	resetSafeSpawnWindowsCommandCache,
@@ -19,6 +20,38 @@ import {
 } from "../../clients/safe-spawn.js";
 
 describe("buildWindowsShellCommand (Windows cmd.exe quoting — #214)", () => {
+	// CodeQL #2/#3: every caller, including LSP, needs validation at the builder.
+	it.each([
+		"%EXPAND%",
+		"!EXPAND!",
+		'embedded"quote',
+		"line\rbreak",
+		"line\nbreak",
+	])("rejects shell-unsafe input %j at the shared boundary", (unsafe) => {
+		expect(() => buildWindowsShellCommand(unsafe, [])).toThrow(/cmd\.exe/);
+		expect(() => buildWindowsShellCommand("tool.cmd", [unsafe])).toThrow(
+			/cmd\.exe/,
+		);
+		vi.stubEnv("SystemRoot", unsafe);
+		try {
+			expect(() => buildWindowsShellCommand("tool.cmd", [])).toThrow(
+				/cmd\.exe/,
+			);
+		} finally {
+			vi.unstubAllEnvs();
+		}
+	});
+
+	it("quotes the SystemRoot-derived prefix so its metacharacters stay literal", () => {
+		vi.stubEnv("SystemRoot", "C:\\Windows & extra");
+		try {
+			expect(buildWindowsShellCommand("tool.cmd", [])).toBe(
+				'""C:\\Windows & extra\\System32\\chcp.com" 65001 >nul 2>&1 & tool.cmd"',
+			);
+		} finally {
+			vi.unstubAllEnvs();
+		}
+	});
 	it("quotes a command path containing spaces", () => {
 		const s = buildWindowsShellCommand("C:\\Program Files\\Go\\bin\\go.exe", [
 			"vet",
@@ -112,6 +145,34 @@ describe.runIf(process.platform === "win32")(
 
 		afterAll(() => {
 			fs.rmSync(fixtureDir, { recursive: true, force: true });
+		});
+
+		// flake-shape: real-process-spawn — only cmd.exe can witness /s quote stripping
+		it("keeps a quoted code-page prefix intact through native cmd /s parsing", () => {
+			const interpreter = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\cmd.exe`;
+			vi.stubEnv("SystemRoot", path.join(fixtureDir, "missing & root"));
+			try {
+				const result = spawnSync(
+					interpreter,
+					[
+						"/d",
+						"/s",
+						"/c",
+						buildWindowsShellCommand(echoArgsCmd, ["safe & literal"]),
+					],
+					{
+						encoding: "utf8",
+						windowsVerbatimArguments: true,
+						shell: false,
+						timeout: 5000,
+					},
+				);
+				expect(result.error).toBeUndefined();
+				expect(result.status).toBe(0);
+				expect(JSON.parse(result.stdout)).toEqual(["safe & literal"]);
+			} finally {
+				vi.unstubAllEnvs();
+			}
 		});
 
 		it("(a) resolves a bare command via PATH+PATHEXT and spawns the .exe directly, no cmd.exe involved", async () => {

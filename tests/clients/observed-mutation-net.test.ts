@@ -23,6 +23,7 @@ import {
 } from "../../clients/mutation-attribution.js";
 import {
 	_observedMutationStateForTests,
+	_setObservedTimeBoundsForTests,
 	_setObservedTurnBudgetForTests,
 	armObservedMutation,
 	deriveObservedEditRanges,
@@ -835,6 +836,7 @@ describe("#2449 review round 2 — the observation universe is the target path",
 		// off for the rest of the session — de-attributing a real codemod on
 		// evidence the net never collected (catalog shape 10).
 		const env = setupTestEnvironment("pi-lens-2449-dircap-");
+		_setObservedTimeBoundsForTests({ captureMs: 30_000, settleMs: 30_000 });
 		try {
 			const dir = path.join(env.tmpDir, "wide");
 			fs.mkdirSync(dir);
@@ -882,6 +884,7 @@ describe("#2449 review round 2 — the observation universe is the target path",
 			// not spend the tool's clean-observation budget.
 			expect(shouldArmObservationForTool("wide_codemod")).toBe(true);
 		} finally {
+			_setObservedTimeBoundsForTests({});
 			env.cleanup();
 		}
 	});
@@ -1543,6 +1546,7 @@ describe("#2449 review round 4 — handled marks, bounds and budget honesty", ()
 		// a large fixture, so the split is the same on any box: the stats capture
 		// takes one read and the line-hash capture takes the other.
 		const env = setupTestEnvironment("pi-lens-2449-charge-");
+		_setObservedTimeBoundsForTests({ captureMs: 30_000 });
 		try {
 			const filePath = path.join(env.tmpDir, "charged.ts");
 			fs.writeFileSync(filePath, SOURCE);
@@ -1573,6 +1577,7 @@ describe("#2449 review round 4 — handled marks, bounds and budget honesty", ()
 				_observedMutationStateForTests().turnSpentMs,
 			).toBeGreaterThanOrEqual(wallMs - 10);
 		} finally {
+			_setObservedTimeBoundsForTests({});
 			env.cleanup();
 		}
 	});

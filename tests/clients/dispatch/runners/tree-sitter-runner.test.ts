@@ -46,7 +46,7 @@ async function loadRunnerWithClient(isAvailable: boolean, initResult: boolean) {
 			set() {}
 		},
 	}));
-	vi.doMock("../../../../clients/tree-sitter-client.js", () => {
+	vi.doMock("../../../../clients/tree-sitter-client.js", async (orig) => {
 		function MockTreeSitterClient() {
 			return {
 				isAvailable: () => isAvailable,
@@ -55,7 +55,12 @@ async function loadRunnerWithClient(isAvailable: boolean, initResult: boolean) {
 				query: () => [],
 			};
 		}
-		return { TreeSitterClient: MockTreeSitterClient };
+		return {
+			...(await orig<
+				typeof import("../../../../clients/tree-sitter-client.js")
+			>()),
+			TreeSitterClient: MockTreeSitterClient,
+		};
 	});
 
 	const mod =
@@ -137,7 +142,7 @@ async function loadRunnerWithQueries(
 			set() {}
 		},
 	}));
-	vi.doMock("../../../../clients/tree-sitter-client.js", () => {
+	vi.doMock("../../../../clients/tree-sitter-client.js", async (orig) => {
 		function MockTreeSitterClient() {
 			return {
 				isAvailable: () => true,
@@ -149,7 +154,12 @@ async function loadRunnerWithQueries(
 				runQueryOnFile,
 			};
 		}
-		return { TreeSitterClient: MockTreeSitterClient };
+		return {
+			...(await orig<
+				typeof import("../../../../clients/tree-sitter-client.js")
+			>()),
+			TreeSitterClient: MockTreeSitterClient,
+		};
 	});
 
 	const mod =
@@ -428,5 +438,39 @@ describe("tree-sitter runner — degraded grammar is not a clean file (#3409)", 
 
 		expect(result.status).toBe("succeeded");
 		expect(result.diagnostics).toHaveLength(0);
+	});
+
+	describe("a rejected query run goes through the shared wasm classifier (#3605)", () => {
+		const { WebAssembly } = globalThis as unknown as {
+			WebAssembly: { RuntimeError: new (message: string) => Error };
+		};
+
+		async function abortedAfterRejection(error: Error): Promise<boolean> {
+			const { runner, runQueriesOnFile } = await loadRunnerWithQueries([
+				fakeQuery,
+			]);
+			runQueriesOnFile.mockRejectedValue(error);
+			await runner.run(createCtx("/fake/file.ts") as any);
+			const shared = await import("../../../../clients/tree-sitter-shared.js");
+			const aborted = shared.isTreeSitterWasmAborted();
+			shared._resetSharedTreeSitterClientForTests();
+			return aborted;
+		}
+
+		it("poisons the runtime for an abort", async () => {
+			expect(
+				await abortedAfterRejection(
+					new WebAssembly.RuntimeError("Aborted(OOM)"),
+				),
+			).toBe(true);
+		});
+
+		it("leaves the runtime alive for a trap", async () => {
+			expect(
+				await abortedAfterRejection(
+					new WebAssembly.RuntimeError("table index is out of bounds"),
+				),
+			).toBe(false);
+		});
 	});
 });

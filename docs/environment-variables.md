@@ -219,10 +219,22 @@ Several in-memory caches release their contents after a period of inactivity so 
 long-running session does not retain hydrated state indefinitely. Each has an
 env-tunable window; all default to 20 minutes (`1200000` ms).
 
+### `PI_LENS_LSP_IDLE_EVICT_MS`
+
+Shared idle window (ms) after which every language-service client whose registry
+`idleEviction` is `transparent` releases its hydrated program and shuts down,
+rebuilding transparently on the next request. Servers declared `resident` or
+`unmeasured` are never evicted. Which servers are declared which way, and the
+nightly measurement behind each declaration, is in
+[`lsp-idle-eviction.md`](lsp-idle-eviction.md).
+When unset or invalid, `PI_LENS_TS_IDLE_EVICT_MS` (below) is read.
+**Default:** 20 minutes (`1200000`).
+
 ### `PI_LENS_TS_IDLE_EVICT_MS`
 
-Idle window (ms) after which TypeScript language-service clients release their
-hydrated program and shut down, rebuilding transparently on the next request.
+The original, TypeScript-named spelling of the same window, retained for
+compatibility with existing configuration. It has exactly the semantics above
+and is ignored when `PI_LENS_LSP_IDLE_EVICT_MS` holds a valid value.
 **Default:** 20 minutes (`1200000`).
 
 ### `PI_LENS_WORD_INDEX_IDLE_EVICT_MS`

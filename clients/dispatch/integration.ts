@@ -84,13 +84,17 @@ import {
 	resetAstGrepNapiLoadState,
 	resetAstGrepUnsupportedLanguageLog,
 } from "./runners/ast-grep-napi.js";
-import { resetTreeSitterClientLoadState } from "../tree-sitter-shared.js";
+import {
+	isTreeSitterWasmAborted,
+	resetTreeSitterClientLoadState,
+} from "../tree-sitter-shared.js";
 import { isTestRoleCollateral } from "../collateral-test-role.js";
 import {
 	clearReviewGraphWorkspaceCache,
 	getGraphBuildInfoForGraph,
 	getGraphImportChanges,
 	graphBuildInfoIsTrustworthy,
+	graphWasmTrapDetail,
 } from "../review-graph/builder.js";
 import {
 	buildReverseDependencyIndexFromGraph,
@@ -1359,6 +1363,11 @@ export async function computeCascadeForFile(
 			if (
 				(graphBuildInfo.mode === "skipped" ||
 					graph.persistCoverage?.partial === true ||
+					// #3605: a wasm trap cost some file its symbols and imports.
+					(graphBuildInfo.wasmTrappedFiles ?? 0) > 0 ||
+					// #3678 F-B: once the process-wide runtime aborts, later builds
+					// contain no tree-sitter symbols and may have no trapped-file count.
+					isTreeSitterWasmAborted() ||
 					!graphBuildInfoTrustworthy) &&
 				!impact.indeterminate
 			) {
@@ -1379,9 +1388,13 @@ export async function computeCascadeForFile(
 								: graphBuildInfo.skipReason === "unsafe_root"
 									? "review graph skipped — workspace root is at/above home dir"
 									: `review graph unavailable (${graphBuildInfo.skipReason ?? "skipped"})`
-							: coverage?.sourceFilesTruncated
-								? "review graph partial — source walk stopped at its visited-entry budget"
-								: "review graph partial — persisted graph coverage is incomplete",
+							: isTreeSitterWasmAborted()
+								? "review graph degraded — tree-sitter is disabled for this process until restart"
+								: graphBuildInfo.wasmTrappedFiles
+									? graphWasmTrapDetail(graphBuildInfo.wasmTrappedFiles)
+									: coverage?.sourceFilesTruncated
+										? "review graph partial — source walk stopped at its visited-entry budget"
+										: "review graph partial — persisted graph coverage is incomplete",
 					sourceFileCount: graphBuildInfo.sourceFileCount,
 					maxFileCount: graphBuildInfo.maxFileCount,
 				};
@@ -2861,6 +2874,12 @@ export async function dispatchLintWithResult(
 		 * DispatchContext.telemetryModel's doc. */
 		telemetryModel?: string;
 		telemetryProvider?: string;
+		/**
+		 * Pull surface (`pilens_analyze`): emit the coverage notice on every call
+		 * instead of latching it once per session (refs #3791). Leave unset for
+		 * the pi push surface, which keeps the once-per-session latch.
+		 */
+		dedupeCoverageNotice?: boolean;
 	},
 ): Promise<DispatchResult> {
 	// Default true preserves the per-edit fast path (errors only). Callers that
@@ -2917,7 +2936,19 @@ export async function dispatchLintWithResult(
 		}
 
 		await runProviders(ctx);
-		const result = await dispatchForFile(ctx, groups, sessionRunnerRegistry);
+		const result = await dispatchForFile(
+			ctx,
+			groups,
+			sessionRunnerRegistry,
+			undefined,
+			// exactOptionalPropertyTypes: omit the key rather than pass
+			// `undefined`, which the target option type rejects (#3791).
+			{
+				...(options?.dedupeCoverageNotice !== undefined && {
+					dedupeCoverageNotice: options.dedupeCoverageNotice,
+				}),
+			},
+		);
 		trackSessionSlopStats(ctx, result.diagnostics);
 
 		// Schedule debounced ast-grep warning scan for jsts files.

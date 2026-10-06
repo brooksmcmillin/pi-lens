@@ -26,6 +26,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { getProjectDataDir } from "../../../clients/file-utils.js";
 import { hashDiagnosticContent } from "../../../clients/lsp/diagnostic-binding.js";
 import {
 	cacheKeyFor,
@@ -46,6 +47,7 @@ function makeServer(id: string, ext: string, root: string) {
 		id,
 		name: id,
 		extensions: [ext],
+		idleEviction: "resident",
 		root: async () => root,
 		spawn: vi.fn(async () => ({ process: {}, source: "test" })),
 	};
@@ -155,8 +157,7 @@ describe("runWorkspaceDiagnostics pull-sweep content binding (#1104)", () => {
 		// invalidation shape (recorded fingerprint no longer matches disk under
 		// a matching mtime).
 		const cachePath = path.join(
-			tmp,
-			".pi-lens",
+			getProjectDataDir(tmp),
 			"cache",
 			"lsp-workspace-diagnostics.json",
 		);

@@ -18,6 +18,7 @@ import {
 } from "./opaque-mutation-scan.js";
 import { normalizeForGuardMatch } from "./host-edit-normalize.js";
 import { retargetReplacementIndentation } from "./indent-retarget.js";
+import { noteAgentCallEnd, noteAgentCallStart } from "./fix-run-restore.js";
 import { LANGUAGE_POLICY } from "./language-policy.js";
 import { isComplexitySupportedFile } from "./tree-sitter-shared.js";
 import {
@@ -204,7 +205,7 @@ function getEffectiveReadLimit(
 	readInput: ReadToolInput | undefined,
 ): number | undefined {
 	if (!filePath || !readInput) return undefined;
-	const requestedOffset = readInput.offset ?? 1;
+	const requestedOffset = Math.max(1, readInput.offset ?? 1);
 	const requestedLimit = readInput.limit;
 	return (
 		requestedLimit ??
@@ -472,6 +473,7 @@ export async function handleToolCall(
 				if (toolCallId !== undefined) {
 					deps.runtime.takeToolCallAttribution(toolCallId);
 				}
+				noteAgentCallEnd(toolCallId);
 			} catch (cleanupError) {
 				const reason =
 					cleanupError instanceof Error
@@ -814,6 +816,10 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 			skipped: targetIgnored,
 			originCwd: ctx.cwd ?? runtime.projectRoot,
 		});
+		// #3598: this mutation is now in flight, so a running whole-package fixer
+		// must not write an older capture over it. Cleared at its tool_result, or
+		// below when the call is blocked.
+		noteAgentCallStart(toolCallId, filePath);
 	}
 	if (targetMissing) {
 		// #1655 item 5: this early return used to be the whole story — pi-lens
@@ -938,7 +944,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 	}
 
 	const readInput = getReadToolInput(toolName, event.input);
-	const requestedReadOffset = readInput?.offset ?? 1;
+	const requestedReadOffset = Math.max(1, readInput?.offset ?? 1);
 	const requestedReadLimit = readInput?.limit;
 	let effectiveReadOffset = requestedReadOffset;
 	let effectiveReadLimit = getEffectiveReadLimit(filePath, readInput);
@@ -1219,6 +1225,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 			filePath,
 			runtime.turnIndex,
 			runtime.peekWriteIndex(),
+			toolCallId,
 		);
 	}
 
@@ -1516,6 +1523,10 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 			);
 			if (preflightError) {
 				if (partiallyApplicable && partiallyApplicable.length > 0) {
+					// #3525: the same fresh-at-check rule as a whole edit.
+					const partialStamp = {
+						stampFileTime: readGuard.fileTimeMoved?.(filePath) !== true,
+					};
 					try {
 						const partial = await applyPartiallyApplicableEdits({
 							filePath,
@@ -1558,6 +1569,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 									metricsClient,
 									resetLSPService,
 									readGuard: runtime.readGuard,
+									_ownWriteStamp: partialStamp,
 									agentBehaviorRecord: (toolName, analyzedPath) =>
 										agentBehaviorClient.recordToolCall(toolName, analyzedPath),
 									formatBehaviorWarnings: (warnings) =>
@@ -1643,6 +1655,8 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 					isExistingFile,
 				},
 			});
+			// #3525: read before the verdict, whose session_authored path stamps.
+			const fileTimeMoved = readGuard.fileTimeMoved?.(filePath) === true;
 			const verdict =
 				typeof readGuard.checkEdit === "function"
 					? readGuard.checkEdit(filePath, touchedLines, editRanges, {
@@ -1650,6 +1664,9 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 							oldTextResolved: !!contentMatchValidated,
 						})
 					: { action: "allow" as const };
+			// #3525: an edit that passes a moved FileTime leaves it moved.
+			if (fileTimeMoved && toolCallId !== undefined)
+				runtime.markToolCallFileTimeStale(toolCallId);
 			// Content-verified range-stale relocation: the lines the agent meant
 			// to edit moved (read-time line hashes uniquely match the new spot),
 			// so re-target the positional edit to where the content now lives
@@ -1698,7 +1715,10 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 				};
 			} else if (toolCallId !== undefined) {
 				// #3523: the edit lands at the agent's own line numbers, so its
-				// tool_result may record the written lines as read.
+				// tool_result may record the written lines as read. A relocated
+				// edit is not marked (#3760): its next edit, at the agent's own
+				// numbering, would pass against the record on the wrong line of
+				// the agent's text (formal/read-guard OwnEditRelocInsertRecorded).
 				runtime.markToolCallEditInPlace(toolCallId);
 			}
 		}

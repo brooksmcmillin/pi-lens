@@ -1,5 +1,8 @@
 // Per-worker test environment defaults (vitest `setupFiles`).
 import * as fs from "node:fs";
+import nodeFs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { spawnSync } from "node:child_process";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterAll, afterEach, beforeEach, expect, vi } from "vitest";
@@ -7,6 +10,18 @@ import { installGitFixtureEnv } from "./git-fixture-env.js";
 import { installKillGuard, killGuardReport } from "./kill-guard.js";
 import { reportPeakRss } from "./worker-peak-rss.js";
 import { removeTempDirSync } from "../clients/test-utils.js";
+import {
+	formatTmpRootSweep,
+	getTmpRootRegistry,
+	installTmpRootInterposer,
+	sampleTmpRoots,
+	sweepTmpRoots,
+	type MkdtempTarget,
+} from "./tmp-root-registry.js";
+// The tail's dependency leaf, never `instance-registry.js`: this file loads
+// before every test file's `vi.mock`, so whatever it imports is cached before
+// the mock registers (#3703 round 1: 56 files red).
+import { _settleRegistryMutationsForTests } from "../../clients/instance-registry-tail.js";
 import {
 	SWEEP_ANY_AGE,
 	sweepScratchDirs,
@@ -65,6 +80,29 @@ const tmpHygieneHome = process.env.PI_LENS_HOME
 	? path.resolve(process.env.PI_LENS_HOME)
 	: path.join(process.cwd(), ".probe-home");
 fs.mkdirSync(tmpHygieneHome, { recursive: true });
+/** The run-shared directory: harness state every worker and the serialized
+ *  hygiene owner must see (owner markers, baselines, the tmp-hygiene records,
+ *  `install.log`, the agent dir). Since #3721 it is NOT what `PI_LENS_HOME`
+ *  names inside a worker: that is {@link TMP_HYGIENE_WORKER_HOME}. Tests whose
+ *  subject is the run-shared directory read it from here. */
+export const TMP_HYGIENE_HOME = tmpHygieneHome;
+// #3721: the log sinks bind their paths at module load from PI_LENS_HOME, and
+// one home for every worker meant the 33 files that run with
+// PI_LENS_TEST_MODE=0 shared one `latency.log`: a neighbour's rows leaked into
+// this file's reads ("got 5") and its `clearLatencyLog()` cut this file's rows
+// ("got 1", "got 2"; #3880: 15 of 15 runs red for
+// test-runner-python-environment beside session-root-config-eviction at 4
+// workers). Vitest's forks pool with isolate:true gives every test FILE its
+// own process, so the process id names the worker, and a directory per worker
+// makes cross-worker sharing impossible by construction instead of file by file.
+// Removed by this worker's own teardown; the serialized owner sweeps what a
+// deferred writer recreated and what a killed run left (`removeRunBackstopDirs`).
+const tmpHygieneWorkerHomePrefix = `worker-home-${process.env.PI_LENS_TMP_HYGIENE_RUN_ID}-`;
+export const TMP_HYGIENE_WORKER_HOME = path.join(
+	tmpHygieneHome,
+	`${tmpHygieneWorkerHomePrefix}${process.pid}`,
+);
+fs.mkdirSync(TMP_HYGIENE_WORKER_HOME, { recursive: true });
 const tmpHygieneBaselinePath = path.join(
 	process.cwd(),
 	".probe-home",
@@ -210,6 +248,70 @@ export function touchTmpHygieneOwnerMarker(
 beforeEach(() => touchTmpHygieneOwnerMarker());
 afterEach(() => touchTmpHygieneOwnerMarker());
 
+/**
+ * #2912: the worker's own tmp roots are removed by THIS file, at teardown and on
+ * SIGTERM, not only by the owner at the end of the run. See
+ * `tests/support/tmp-root-registry.ts` for the two rules and the recurrences.
+ *
+ * The interposer is published to ESM importers (`import { mkdtempSync }`, `import
+ * * as fs`) by `syncBuiltinESMExports`. The `fs` functions are captured here,
+ * at load, so a test that spies or mocks `node:fs` later cannot redirect the
+ * sweep. The hook below is registered first, so under the default `stack`
+ * hook order it runs AFTER the test file's own `afterEach`: a root the file
+ * just removed is seen absent, which is what marks a later reappearance as a
+ * straggler.
+ */
+const tmpRootRegistry = getTmpRootRegistry();
+installTmpRootInterposer(
+	tmpRootRegistry,
+	nodeFs as unknown as MkdtempTarget,
+	tmpHygieneRealTmp,
+);
+syncBuiltinESMExports();
+const tmpRootIo = {
+	exists: (dir: string): boolean => fs.existsSync(dir),
+	remove: (dir: string): void =>
+		fs.rmSync(dir, { recursive: true, force: true }),
+};
+const tmpRootExists = tmpRootIo.exists;
+afterEach(() => sampleTmpRoots(tmpRootRegistry, tmpRootExists));
+
+function sweepOwnTmpRoots(via: "afterAll" | "SIGTERM"): void {
+	const line = formatTmpRootSweep(
+		tmpHygieneOwnFile,
+		sweepTmpRoots(tmpRootRegistry, tmpRootIo),
+		tmpRootRegistry,
+		via,
+	);
+	// Synchronous and unbuffered: this can be the last thing the fork does.
+	if (line)
+		try {
+			fs.writeSync(2, line);
+		} catch {
+			// stderr closed under a teardown race; the sweep itself already ran.
+		}
+}
+
+// Vitest SIGTERMs a fork after its file ends, with no `exit` event and a 500 ms
+// SIGKILL fallback; a deferred write can land in that window. Sweep, then
+// re-raise as `clients/safe-spawn.ts` does so the fork still dies at once.
+process.once("SIGTERM", () => {
+	sweepOwnTmpRoots("SIGTERM");
+	// #3721: the worker home too: a deferred writer (the probe cache's 300ms
+	// timer) can recreate it between the file's teardown and this signal, and a
+	// nested vitest run a test launched has no owner to sweep its homes.
+	try {
+		tmpRootIo.remove(TMP_HYGIENE_WORKER_HOME);
+	} catch {
+		// Best effort, like the sweep above: the owner reclaims what is left.
+	}
+	try {
+		process.kill(process.pid, "SIGTERM");
+	} catch {
+		// Already dying; the sweep has run.
+	}
+});
+
 /** Root-level `orphan-backstop*` entries of a home, each with its mtime: the
  *  stamp, the transient lock, and the `orphan-backstop.lock.quarantine-…/`
  *  directory a contended lock leaves behind. One definition, used by the
@@ -249,14 +351,20 @@ function rootBackstopSnapshot(
 interface TmpHygieneBaseline {
 	tmp: string[];
 	backstopRoot: Record<string, number>;
+	/** The repo root's top-level names at run start (#3715). Optional: a record
+	 *  written by a run of an older checkout has none, and the census then says
+	 *  so instead of guessing. */
+	repoRoot?: string[];
 }
 
 let tmpHygieneBefore: Set<string>;
 let backstopRootBefore: Record<string, number>;
+let repoRootBefore: readonly string[] | undefined;
 
 function adoptBaseline(baseline: TmpHygieneBaseline): void {
 	tmpHygieneBefore = new Set(baseline.tmp);
 	backstopRootBefore = baseline.backstopRoot;
+	repoRootBefore = baseline.repoRoot;
 }
 
 try {
@@ -269,6 +377,7 @@ try {
 	const baseline: TmpHygieneBaseline = {
 		tmp: snapshotTmpPiLensEntries(readTmpDirEntries(tmpHygieneRealTmp)),
 		backstopRoot: rootBackstopSnapshot(),
+		repoRoot: readTmpDirEntries(process.cwd()),
 	};
 	try {
 		const fd = fs.openSync(tmpHygieneBaselinePath, "wx");
@@ -291,7 +400,7 @@ try {
 		}
 	}
 }
-process.env.PI_LENS_HOME = tmpHygieneHome;
+process.env.PI_LENS_HOME = TMP_HYGIENE_WORKER_HOME;
 // #2651: scripts/warm-loader-cache.mjs appends to PI_LENS_INSTALL_LOG before
 // it falls back to PI_LENS_HOME/install.log, so an ambient value (a
 // developer's shell pointing it at the real ~/.pi-lens/install.log) would
@@ -299,7 +408,10 @@ process.env.PI_LENS_HOME = tmpHygieneHome;
 // Pinned here once, for every worker and every inheriting child, instead of
 // one `env:` pin per call site. A test that exercises the fallback deletes it
 // from the child's env explicitly.
-process.env.PI_LENS_INSTALL_LOG = path.join(tmpHygieneHome, "install.log");
+process.env.PI_LENS_INSTALL_LOG = path.join(
+	TMP_HYGIENE_WORKER_HOME,
+	"install.log",
+);
 
 // Hermeticity, same class as PI_LENS_CONFIG_PATH above: the global-config-
 // location PR (refs #2457) reads the host's config dir in the resolution's
@@ -420,6 +532,14 @@ export function removeRunBackstopDirs(
 ): void {
 	sweepScratchDirs(home, backstopRunPrefix, { maxAgeMs: SWEEP_ANY_AGE });
 	sweepScratchDirs(home, "backstop-", { maxAgeMs: BACKSTOP_STALE_MS });
+	// #3721: the per-worker homes, same two arms and same reasons: this run's
+	// (a deferred writer recreated one after its worker removed it) by prefix
+	// alone, any other run's (killed, or a targeted run without this owner) by
+	// the generous stale window so a live sibling invocation keeps its own.
+	sweepScratchDirs(home, tmpHygieneWorkerHomePrefix, {
+		maxAgeMs: SWEEP_ANY_AGE,
+	});
+	sweepScratchDirs(home, "worker-home-", { maxAgeMs: BACKSTOP_STALE_MS });
 	// Round 4 F4, second half: the baseline stops root-level residue accusing an
 	// innocent file, but only this reclaims it — otherwise it sits under the
 	// persistent home for ever, exactly the leak F1 closed one directory over.
@@ -468,6 +588,110 @@ export function unadmittedRootBackstopEntries(
 	return Object.entries(rootBackstopSnapshot(home))
 		.filter(([name, mtimeMs]) => before[name] !== mtimeMs)
 		.map(([name]) => name);
+}
+
+/**
+ * #3715: the top-level entries a run added to the REPO ROOT: what is there now,
+ * minus what was there at run start (`repoRootBaseline()`), `undefined` when the
+ * baseline predates the census. `before` and `root` are parameters so the owner's guard can drive the
+ * real directory read against a synthetic baseline and a fixture directory
+ * (the real baseline is captured at setup, before any test can plant anything).
+ *
+ * The recurrence: `workspace-diagnostics-language-neutral` created its probe
+ * home under the cwd and left a `.probe-lsp-language-<id>` directory holding a
+ * `.pi-lens-home` in the worktree root (seen twice on 2026-09-30, #3699 and #3706); nothing observed
+ * the repo root, because the tmp census watches `os.tmpdir()` only and the
+ * mkdtemp-parent sweep ALLOWS repo-rooted parents (a dozen fixtures legitimately
+ * live there and clean up after themselves).
+ */
+export function newRepoRootEntries(
+	before: readonly string[] | undefined,
+	root: string = process.cwd(),
+): string[] | undefined {
+	if (before === undefined) return undefined;
+	const known = new Set(before);
+	return readTmpDirEntries(root)
+		.filter((name) => !known.has(name))
+		.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+}
+
+/** The repo-root names this run's baseline recorded at start, or `undefined`
+ *  when the record predates the census. */
+export function repoRootBaseline(): readonly string[] | undefined {
+	return repoRootBefore;
+}
+
+/**
+ * The subset of `names` (top-level entries of `root`) that git neither tracks
+ * nor ignores: what a later `git status` shows and what #3715 reported.
+ * Run-created ignored entries (`.probe-home`, `.tmp`, `reports`, `dist`, ...)
+ * are legitimate and filtered by git itself, not by a name list that would
+ * drift from `.gitignore`. A name that is tracked is not new. One spawn, and
+ * only when the run added something, so a clean run pays nothing.
+ *
+ * Returns `undefined` when git cannot answer (not a checkout, git absent): the
+ * caller reports that, it does not read it as clean.
+ */
+export function untrackedUnignoredEntries(
+	names: readonly string[],
+	root: string = process.cwd(),
+): string[] | undefined {
+	if (names.length === 0) return [];
+	const withSlash = names.map((name) => {
+		const stat = fs.lstatSync(path.join(root, name), { throwIfNoEntry: false });
+		return stat?.isDirectory() ? `${name}/` : name;
+	});
+	const run = (args: string[], input?: string) =>
+		spawnSync("git", args, {
+			cwd: root,
+			encoding: "utf8",
+			timeout: 15_000,
+			input,
+		});
+	const ignored = run(
+		["check-ignore", "--stdin", "-z"],
+		`${withSlash.join("\0")}\0`,
+	);
+	// 0: some ignored, 1: none ignored, anything else: git could not answer.
+	if (ignored.status !== 0 && ignored.status !== 1) return undefined;
+	const ignoredNames = new Set(
+		String(ignored.stdout)
+			.split("\0")
+			.filter(Boolean)
+			.map((entry) => entry.replace(/\/$/, "")),
+	);
+	const tracked = run(["ls-files", "-z", "--", ...names]);
+	if (tracked.status !== 0) return undefined;
+	const trackedTop = new Set(
+		String(tracked.stdout)
+			.split("\0")
+			.filter(Boolean)
+			.map((entry) => entry.split("/")[0]),
+	);
+	return names.filter(
+		(name) => !ignoredNames.has(name) && !trackedTop.has(name),
+	);
+}
+
+/** What this run left in the repo root (#3715), or `undefined` when it cannot
+ *  be known, with the reason in `unknown`. */
+export function unadmittedRepoRootEntries(
+	before: readonly string[] | undefined,
+	root: string = process.cwd(),
+): { leaked: string[]; unknown?: string } {
+	const added = newRepoRootEntries(before, root);
+	if (added === undefined)
+		return {
+			leaked: [],
+			unknown: "the run's baseline predates the repo-root census",
+		};
+	const leaked = untrackedUnignoredEntries(added, root);
+	if (leaked === undefined)
+		return {
+			leaked: [],
+			unknown: `git could not classify ${added.length} new entr${added.length === 1 ? "y" : "ies"} (${added.join(", ")})`,
+		};
+	return { leaked };
 }
 
 // #2042: per-file peak memory, for the files big enough to matter.
@@ -1090,8 +1314,51 @@ export function runTeardownWithMemReport(
 	}
 }
 
-afterAll(() => {
+// Captured when the worker loads this file, before the test file can install
+// fake timers: the bound below must still fire in a file that leaves them on.
+const realSetTimeout = globalThis.setTimeout;
+
+/**
+ * How long the teardown waits for the registry tail (#3703 round 2): one
+ * lease-waiting lock (`LOCK_WAIT_THROUGH_LEASE_MS`, 5.5 s) plus 1 s, so a
+ * queued op waiting out a peer's lease still lands. It stays under Vitest's
+ * default 10 s hook timeout, so the checks after it keep 3.5 s.
+ */
+export const REGISTRY_SETTLE_BOUND_MS = 6_500;
+
+/**
+ * Join the real registry tail before the fork is SIGTERM'd (#3617), for at
+ * most {@link REGISTRY_SETTLE_BOUND_MS}. A file that leaves fake timers on,
+ * or mocks a write that never settles, keeps a queued op pending forever; an
+ * unbounded join timed the hook out and skipped every check after it. On
+ * give-up it writes one stderr line and returns.
+ */
+async function settleRegistryMutationsBeforeTeardown(): Promise<void> {
+	// Not cleared on success: the pool kills the fork right after this hook.
+	const gaveUp = new Promise<true>((resolve) => {
+		realSetTimeout(() => resolve(true), REGISTRY_SETTLE_BOUND_MS);
+	});
+	const timedOut = await Promise.race([
+		_settleRegistryMutationsForTests().then(() => false),
+		gaveUp,
+	]);
+	if (timedOut) {
+		process.stderr.write(
+			`[registry-settle] a registry mutation was still pending after ${REGISTRY_SETTLE_BOUND_MS}ms (fake timers left on, or a write that never settles); teardown continues without it (#3617)\n`,
+		);
+	}
+}
+
+afterAll(async () => {
 	try {
+		// #3617: Vitest SIGTERMs fork workers without a Node `exit` event. Join
+		// the real registry mutation tail before teardown, including the quiet-
+		// window heartbeat's queued updateHeartbeat, so no live worker's lock
+		// generation is left behind for the next file to take over. Bounded,
+		// and it never throws, so the checks below always run.
+		await settleRegistryMutationsBeforeTeardown();
+		// #2912: before the checks, so the leak notice below names what is left.
+		sweepOwnTmpRoots("afterAll");
 		runTeardownWithMemReport(
 			[checkKillGuard, checkTmpHygiene, checkBackstop],
 			emitMemReport,
@@ -1102,6 +1369,7 @@ afterAll(() => {
 		} finally {
 			tmpHygieneAfterAllProbeForTests = undefined;
 			removeTmpHygieneOwnerMarker();
+			removeTempDirSync(TMP_HYGIENE_WORKER_HOME);
 		}
 	}
 });

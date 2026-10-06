@@ -2,6 +2,10 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, vi } from "vitest";
+import {
+	getTmpRootRegistry,
+	registerTmpRoot,
+} from "../support/tmp-root-registry.js";
 
 // Windows keeps a file handle inside a just-used temp dir alive briefly after
 // a child process/watcher/background scan exits (AV scanning, delayed handle
@@ -39,6 +43,9 @@ export function setupTestEnvironment(prefix = "pi-lens-test-"): {
 } {
 	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 	activeTestEnvironments.add(tmpDir);
+	// #2912: the shared setup removes this root at file teardown and on SIGTERM,
+	// so a timeout or a failed assertion before `cleanup()` cannot leak it.
+	registerTmpRoot(getTmpRootRegistry(), tmpDir, "registered");
 	return {
 		tmpDir,
 		cleanup: () => {

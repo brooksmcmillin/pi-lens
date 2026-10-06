@@ -508,9 +508,13 @@ export async function requestWarmTurnEnd(
 export interface TurnEndStatus {
 	ran: number;
 	skipped: number;
+	failed: number;
 	lastSkipReason?: string;
 	lastRunAt?: string;
 	lastSkipAt?: string;
+	lastFailureOperation?: "analyze" | "turn-end";
+	lastFailureReason?: string;
+	lastFailureAt?: string;
 }
 
 /** Per-workspace status file, keyed by the same hash as the IPC endpoint. */
@@ -535,9 +539,13 @@ export function readTurnEndStatus(
 		return {
 			ran: typeof parsed.ran === "number" ? parsed.ran : 0,
 			skipped: typeof parsed.skipped === "number" ? parsed.skipped : 0,
+			failed: typeof parsed.failed === "number" ? parsed.failed : 0,
 			lastSkipReason: parsed.lastSkipReason,
 			lastRunAt: parsed.lastRunAt,
 			lastSkipAt: parsed.lastSkipAt,
+			lastFailureOperation: parsed.lastFailureOperation,
+			lastFailureReason: parsed.lastFailureReason,
+			lastFailureAt: parsed.lastFailureAt,
 		};
 	} catch {
 		// never written, unreadable, or corrupt — "no turn-end activity recorded"
@@ -546,7 +554,7 @@ export function readTurnEndStatus(
 }
 
 /**
- * Append one turn-end outcome from the hook process. Never throws.
+ * Append a turn-end outcome or an unrunnable CLI/hook invocation. Never throws.
  *
  * Read-modify-write against a shared per-workspace tmpdir file: two Stop
  * hooks for the same workspace can race this concurrently (separate
@@ -561,20 +569,38 @@ export function readTurnEndStatus(
  */
 export function recordTurnEndOutcome(
 	cwd: string,
-	outcome: { ran: true } | { ran: false; reason: string },
+	outcome:
+		| { ran: true }
+		| { ran: false; reason: string }
+		| { failed: true; operation: "analyze" | "turn-end"; reason: string },
 	platform: NodeJS.Platform = process.platform,
 ): void {
 	try {
 		const now = new Date().toISOString();
-		const previous = readTurnEndStatus(cwd, platform) ?? { ran: 0, skipped: 0 };
-		const next: TurnEndStatus = outcome.ran
-			? { ...previous, ran: previous.ran + 1, lastRunAt: now }
-			: {
-					...previous,
-					skipped: previous.skipped + 1,
-					lastSkipReason: outcome.reason,
-					lastSkipAt: now,
-				};
+		const previous = readTurnEndStatus(cwd, platform) ?? {
+			ran: 0,
+			skipped: 0,
+			failed: 0,
+		};
+		let next: TurnEndStatus;
+		if ("failed" in outcome) {
+			next = {
+				...previous,
+				failed: previous.failed + 1,
+				lastFailureOperation: outcome.operation,
+				lastFailureReason: outcome.reason,
+				lastFailureAt: now,
+			};
+		} else {
+			next = outcome.ran
+				? { ...previous, ran: previous.ran + 1, lastRunAt: now }
+				: {
+						...previous,
+						skipped: previous.skipped + 1,
+						lastSkipReason: outcome.reason,
+						lastSkipAt: now,
+					};
+		}
 		// Writes THIS workspace's file and nothing else. #3255 round 2 also deleted
 		// the file at the retired always-fold name; round 3 removed that, because
 		// on a case-sensitive host that name is not an orphan — it is the live

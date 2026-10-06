@@ -69,6 +69,7 @@ migrate-*.js
 
 # Documentation files - only keep specific docs in public repo
 *.md
+!.handoff/**
 !tests/fixtures/ci-pr-bodies/*.md
 !CLAUDE.md
 !tests/fixtures/changelog-entries/*.md
@@ -90,7 +91,9 @@ migrate-*.js
 !docs/pi-lens-retro.md
 !docs/pi-lens-reviewer.md
 !docs/pi-lens-investigator.md
+!docs/pi-lens-merge-policy.md
 !docs/pi-lens-warden.md
+!docs/merge-queue-rollout.md
 !docs/pi-lens-monitor.md
 !docs/real-harness.md
 !docs/audit1.md
@@ -109,6 +112,7 @@ migrate-*.js
 !docs/lsp-capability-matrix.md
 !docs/lsp-latency-benchmark.md
 !docs/servercapabilities.md
+!docs/lsp-idle-eviction.md
 !docs/mcp.md
 !docs/module-report-read-symbol.md
 !docs/environment-variables.md

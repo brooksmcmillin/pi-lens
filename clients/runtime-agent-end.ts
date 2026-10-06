@@ -4,6 +4,7 @@ import {
 	type ActionableWarningsReport,
 	applyConservativeActionableWarningFixes,
 	checkActionableWarningsReportFresh,
+	quickFixCreditEpoch,
 } from "./actionable-warnings.js";
 import { publishFilesTouched } from "./bus-publish.js";
 import type { CacheManager } from "./cache-manager.js";
@@ -18,6 +19,7 @@ import { logLatency } from "./latency-logger.js";
 import { isPathIgnoredByProject } from "./file-utils.js";
 import { admitBounded, emitBounded } from "./bounded-telemetry.js";
 import { bounded } from "./deadline-utils.js";
+import { recordDegradationOnce } from "./degradation-ledger.js";
 import { HOOK_WALL_BUDGET_MS } from "./hook-budgets.js";
 import {
 	newLspMutationCorrelationId,
@@ -30,15 +32,22 @@ import {
 import { captureLspServiceGeneration } from "./lsp/server.js";
 import {
 	type LspResyncOutcome,
+	chainLateFormatResync,
 	resyncHeldLspDocument,
 	resyncLspFile,
 	runAutofix,
 	runFormatPhase,
 } from "./pipeline.js";
+import { queueAgentAdvisory } from "./agent-nudge.js";
 import { holdFileMutationQueue } from "./file-mutation-queue.js";
+import { renderFixRunLoss } from "./fix-run-restore.js";
 import { getAmbientAbortSignal } from "./safe-spawn.js";
 import { type ProjectChangeSource } from "./project-changes.js";
-import type { PathSetLike, RuntimeCoordinator } from "./runtime-coordinator.js";
+import type { RuntimeCoordinator } from "./runtime-coordinator.js";
+import {
+	recordDroppedRead,
+	sessionFencedFixedThisTurn,
+} from "./session-scope.js";
 import {
 	getAutofixPolicyForFile,
 	hasBiomeConfig,
@@ -63,6 +72,15 @@ import {
  */
 const DEFERRED_FORMAT_STALE_AFTER_MS = 10 * 60_000;
 const DEFERRED_FORMAT_CONCURRENCY = 3;
+/**
+ * The formatter aggregate budget the deferred drain hands each file. The
+ * post-exit resync waits for the formatter the hook bound gave up on under
+ * this same budget, so a command resolution that outlives it (an auto-install
+ * has no leaf bound) settles as an abandoned resync instead of parking the
+ * detached task forever (#3599). The formatter's later write is then synced by
+ * a continuation chained onto its settlement (#3828).
+ */
+const DEFERRED_FORMAT_BUDGET_MS = 30_000;
 
 interface AgentEndDeps {
 	/** Abort signal owned by the agent_end/agent_settled hook. */
@@ -395,16 +413,10 @@ export async function handleAgentEnd({
 	const deferredAutofixChanged = new Set<string>();
 	// #3576: runAutofix marks a file fixed after its fixer awaits; a replaced
 	// session's mark would skip the next session's own autofix of that file.
-	const sessionFixedThisTurn = runtime.fixedThisTurn;
-	const fixedThisTurn: PathSetLike = {
-		...sessionFixedThisTurn,
-		add: (fixedPath) => {
-			session.guardedWrite(fixedPath, () =>
-				sessionFixedThisTurn.add(fixedPath),
-			);
-			return fixedThisTurn;
-		},
-	};
+	const fixedThisTurn = sessionFencedFixedThisTurn(
+		runtime.fixedThisTurn,
+		session,
+	);
 	// #3528 r2: every claimed file a replaced session's drain does not start is
 	// named once, not only the first one each loop meets.
 	const skipReplaced = (filePath: string): void => {
@@ -495,6 +507,7 @@ export async function handleAgentEnd({
 		// #3506: the fixer rewrites the file in place, inside pi's queue, which
 		// runAutofix enters only once the fixer is resolved.
 		const fixHold = holdFileMutationQueue(filePath);
+		let restoring: Awaited<ReturnType<typeof runAutofix>>["restoring"];
 		try {
 			const result = await runAutofix(
 				filePath,
@@ -505,6 +518,7 @@ export async function handleAgentEnd({
 				getFlagSource,
 				fixHold,
 			);
+			restoring = result.restoring;
 			const tools = result.autofixTools.map((label) => label.split(":")[0]);
 			for (const changed of result.changedFiles) {
 				const changedPath = path.resolve(changed);
@@ -516,8 +530,11 @@ export async function handleAgentEnd({
 						kind: "autofix",
 					});
 				if (!nodeFs.existsSync(changedPath)) continue;
+				// The loop index is in range; `!` keeps the strict-indexed spike
+				// count flat (tests/config/strictness-baseline.json).
+				const queuedBranchEpoch = record!.readGuardBranchEpoch;
 				// #3528: this session's change log, read guard and turn state only.
-				session.guardedWrite(changedPath, () => {
+				const landed = session.guardedWrite(changedPath, () => {
 					recordProjectChange({
 						runtime,
 						cwd: record.turnStateCwd,
@@ -525,8 +542,12 @@ export async function handleAgentEnd({
 						source: "autofix",
 						dbg,
 					});
+					// #3525: bytes the agent never saw; authorship, not FileTime.
 					if (!getFlag("no-read-guard"))
-						runtime.readGuard.recordWritten(changedPath);
+						runtime.readGuard.recordWritten(changedPath, {
+							branchEpoch: queuedBranchEpoch,
+							stampFileTime: false,
+						});
 					const content = nodeFs.readFileSync(changedPath, "utf-8");
 					cacheManager.addModifiedRange(
 						changedPath,
@@ -536,7 +557,11 @@ export async function handleAgentEnd({
 						currentSessionId ?? runtime.telemetrySessionId,
 						"pi",
 					);
+					return true;
 				});
+				// #3611 F1: the read guard lost this authorship; count it by reason.
+				if (landed === undefined && !getFlag("no-read-guard"))
+					recordDroppedRead(session, "deferred-autofix", queuedBranchEpoch);
 			}
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
@@ -553,6 +578,18 @@ export async function handleAgentEnd({
 			);
 		} finally {
 			fixHold?.release();
+		}
+		// The restore of agent edits the fixer overwrote waits for pi's queue
+		// entries (#3830), so it is awaited here, after the hold is released,
+		// never inside it.
+		const loss = await restoring;
+		if (loss && (loss.lost.length > 0 || loss.possiblyLost.length > 0)) {
+			// The agent's turn is over, so a UI notify alone reaches nobody it
+			// could act through (and print/json modes drop it): queue the same
+			// text for the model's next `context` call as well.
+			const text = renderFixRunLoss(loss);
+			queueAgentAdvisory(text, session);
+			notify(`pi-lens: ${text}`, "warning");
 		}
 	}
 	if (deferredAutofixFixes.length > 0) {
@@ -667,7 +704,7 @@ export async function handleAgentEnd({
 						getFormatService,
 						dbg,
 						ambientSignal,
-						30_000,
+						DEFERRED_FORMAT_BUDGET_MS,
 						"agent_settled",
 						formatHold,
 					).finally(() => formatHold?.release());
@@ -691,19 +728,49 @@ export async function handleAgentEnd({
 							let outcome: LspResyncOutcome | "stale-session" | "read-failed" =
 								"stale-session";
 							try {
-								await (
-									await phase
-								).abandoned;
-								// #3528 r1 F1, #3576: a replaced session or a retired LSP
-								// service gets no touch that would spawn a server.
-								outcome =
-									(await syncDrainWrite(filePath, () => {
-										const readStamp = performance.now();
-										return {
-											readStamp,
-											content: nodeFs.readFileSync(filePath, "utf-8"),
-										};
-									})) ?? "stale-session";
+								// #3599: the abandoned formatter's command resolution can outlive
+								// every leaf bound (an auto-install has none), so wait for the
+								// formatter under the drain's own budget instead of forever. A
+								// wait that expires is a degradation, recorded once by
+								// `bounded()` as `off_hook:deferred-format-post-exit-resync`.
+								const formatterSettling = phase
+									.then((summary) => summary.abandoned)
+									.then(() => true as const);
+								const formatterSettled = await bounded(formatterSettling, {
+									ms: DEFERRED_FORMAT_BUDGET_MS,
+									signal: ambientSignal,
+									hook: "off_hook",
+									label: "deferred-format-post-exit-resync",
+								});
+								if (formatterSettled === undefined) {
+									// The formatter is still running, so a read now could publish
+									// bytes it is about to replace. Report this resync as abandoned
+									// and chain the same resync onto the formatter's settlement
+									// instead (#3828): it parks no awaiting task and holds no
+									// resource, it is one more reaction on a promise the formatter
+									// already owns.
+									outcome = "abandoned";
+									// Held-only in every case (#3828): the install can outlive
+									// the client (idle eviction), and this must never open a
+									// file or spawn for it.
+									chainLateFormatResync(
+										formatterSettling,
+										"deferred",
+										{ toolName: "agent_end", filePath, startedAt: fileStart },
+										dbg,
+									);
+								} else {
+									// #3528 r1 F1, #3576: a replaced session or a retired LSP
+									// service gets no touch that would spawn a server.
+									outcome =
+										(await syncDrainWrite(filePath, () => {
+											const readStamp = performance.now();
+											return {
+												readStamp,
+												content: nodeFs.readFileSync(filePath, "utf-8"),
+											};
+										})) ?? "stale-session";
+								}
 							} catch (err) {
 								outcome = "read-failed";
 								dbg(
@@ -838,9 +905,10 @@ export async function handleAgentEnd({
 				// previous fallback chain through ctxCwd / projectRoot / record.cwd
 				// could silently regress the monorepo cwd-mismatch fix from PR #105.
 				const bookkeepingCwd = record.turnStateCwd;
+				const queuedBranchEpoch = record.readGuardBranchEpoch;
 				// #3528: this session's change log, read guard, turn state and turn
 				// summary only.
-				session.guardedWrite(filePath, () => {
+				const landed = session.guardedWrite(filePath, () => {
 					recordProjectChange({
 						runtime,
 						cwd: bookkeepingCwd,
@@ -848,8 +916,12 @@ export async function handleAgentEnd({
 						source: "format",
 						dbg,
 					});
+					// #3525: bytes the agent never saw; authorship, not FileTime.
 					if (!getFlag("no-read-guard")) {
-						runtime.readGuard.recordWritten(filePath);
+						runtime.readGuard.recordWritten(filePath, {
+							branchEpoch: queuedBranchEpoch,
+							stampFileTime: false,
+						});
 					}
 					try {
 						const content = nodeFs.readFileSync(filePath, "utf-8");
@@ -878,7 +950,11 @@ export async function handleAgentEnd({
 							runtime.turnSummary.recordFormat(filePath, { tool });
 						}
 					}
+					return true;
 				});
+				// #3611 F1: the read guard lost this authorship; count it by reason.
+				if (landed === undefined && !getFlag("no-read-guard"))
+					recordDroppedRead(session, "deferred-format", queuedBranchEpoch);
 			}
 
 			if (result.fileContent) {
@@ -1046,22 +1122,40 @@ export async function handleAgentEnd({
 				// publishFormatStart — only fires when the report is fresh AND
 				// has at least one autofix-eligible warning, right before
 				// applyConservativeActionableWarningFixes actually starts.
+				const fixableFiles = eligibleReport.files.filter((file) =>
+					file.warnings.some(
+						(warning) =>
+							!warning.suppressed &&
+							warning.actions.some((action) => action.autoFixEligible),
+					),
+				);
 				publishAutofixStart({
 					cwd: ctxCwd ?? runtime.projectRoot,
-					paths: eligibleReport.files
-						.filter((file) =>
-							file.warnings.some(
-								(warning) =>
-									!warning.suppressed &&
-									warning.actions.some((action) => action.autoFixEligible),
-							),
-						)
-						.map((file) => file.filePath),
+					paths: fixableFiles.map((file) => file.filePath),
 					eligibleCount: eligibleReport.summary.autoFixEligible,
 					dbg,
 				});
 				const fixStart = Date.now();
 				const fixCwd = ctxCwd ?? runtime.projectRoot;
+				// #3676: the fix acts on report entries, and they are its evidence:
+				// it is credited with the oldest branch epoch among the entries it
+				// can fix (`ReadGuard.recordWritten` refuses it once a /tree moved
+				// the branch since), never with this settle's own epoch. An entry
+				// built under another read guard (a /fork, /new or resume restarts
+				// the epoch at 0), or with no valid stamp, has no branch to vouch
+				// for; the fix is applied and credited to none.
+				const credit = quickFixCreditEpoch(
+					fixableFiles,
+					runtime.readGuard.lineageKey,
+				);
+				if (credit === undefined && !getFlag("no-read-guard")) {
+					recordDegradationOnce({
+						kind: "actionable-warnings-quickfix-uncredited",
+						subject: fixCwd,
+						reason:
+							"an actionable-warnings entry the quick fix acts on was built under another read guard, or carries no valid branch stamp; its fixes are applied and credited to no branch",
+					});
+				}
 				const mutationContext: LspMutationContext = {
 					cwd: fixCwd,
 					correlationId: newLspMutationCorrelationId(),
@@ -1069,7 +1163,17 @@ export async function handleAgentEnd({
 					source: "autofix",
 					runtime,
 					cacheManager,
-					readGuard: getFlag("no-read-guard") ? undefined : runtime.readGuard,
+					readGuard:
+						getFlag("no-read-guard") || credit === undefined
+							? undefined
+							: {
+									// #3525: bytes the agent never saw; authorship, not FileTime.
+									recordWritten: (filePath: string) =>
+										runtime.readGuard.recordWritten(filePath, {
+											branchEpoch: credit,
+											stampFileTime: false,
+										}),
+								},
 					// #3576: a /new during the pass stops it and its bookkeeping.
 					session,
 					recordAutofix: getFlag("lens-turn-summary")

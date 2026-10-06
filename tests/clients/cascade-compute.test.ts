@@ -2105,6 +2105,55 @@ describe("computeCascadeForFile", () => {
 		}
 	});
 
+	// Recurrence (#3780, #3673/#3679 survivors): the "persisted graph coverage
+	// is incomplete" advisory was replaced by "" with every test green, because
+	// the only partial-coverage case set `sourceFilesTruncated` and so never
+	// reached the arm. Coverage that is partial for any OTHER reason (a
+	// persisted-entry cap) must still say why, not hand the turn-end seam an
+	// empty advisory.
+	it("names incomplete persisted coverage when the graph is partial without a truncated source walk", async () => {
+		const env = setupTestEnvironment("cascade-persist-partial-");
+		try {
+			const primary = path.join(env.tmpDir, "primary.ts");
+			fs.writeFileSync(primary, "export const x = 1;\n");
+			mocks.buildOrUpdateGraph.mockResolvedValue({
+				...emptyGraph(),
+				persistCoverage: {
+					partial: true,
+					cap: 500_000,
+					totalNodes: 10,
+					totalEdges: 10,
+					persistedNodes: 5,
+					persistedEdges: 5,
+					totalFiles: 2,
+					persistedFiles: 1,
+				},
+			});
+			mocks.computeImpactCascade.mockReturnValue(impact(primary, []));
+			mocks.getLSPService.mockReturnValue({
+				...makeLspServiceDouble(),
+				getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
+				touchFile: vi.fn(),
+				getDiagnostics: vi.fn(),
+			});
+
+			const { computeCascadeForFile } =
+				await import("../../clients/dispatch/integration.js");
+			const run = await computeCascadeForFile(primary, env.tmpDir, {
+				turnSeq: 1,
+				writeSeq: 1,
+			});
+			expect(run.result).toBeUndefined();
+			expect(run.skipReason).toBe("indeterminate");
+			expect(run.indeterminate?.reason).toBe("graph_degraded");
+			expect(run.indeterminate?.detail).toBe(
+				"review graph partial — persisted graph coverage is incomplete",
+			);
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	// #1023: a SIZE-SKIPPED graph (getLastGraphBuildInfo().mode === "skipped",
 	// too_many_files) — the ALREADY-KNOWN degraded state is threaded onto the
 	// result at the compute site. Every edit computes zero neighbors against the
@@ -2144,6 +2193,100 @@ describe("computeCascadeForFile", () => {
 			expect(run.skipReason).toBe("indeterminate");
 			expect(run.indeterminate?.reason).toBe("graph_degraded");
 			expect(run.indeterminate?.detail).toContain("5000");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	// #3605 review F3: a web-tree-sitter trap cost a file in the graph its
+	// symbols and imports, and the build completed. The dependents of that file
+	// are missing from every cascade, so a clean verdict would be a silent
+	// all-clear; only the build's count says so.
+	it("returns indeterminate when a wasm trap cost a file in the graph its extraction", async () => {
+		const env = setupTestEnvironment("cascade-wasm-trap-");
+		try {
+			const primary = path.join(env.tmpDir, "primary.py");
+			fs.writeFileSync(primary, "x = 1\n");
+			mocks.computeImpactCascade.mockReturnValue(impact(primary, []));
+			mocks.getLSPService.mockReturnValue({
+				...makeLspServiceDouble(),
+				getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
+				touchFile: vi.fn(),
+				getDiagnostics: vi.fn(),
+			});
+
+			const { computeCascadeForFile } =
+				await import("../../clients/dispatch/integration.js");
+			const { _setLastGraphBuildInfoForTests } =
+				await import("../../clients/review-graph/builder.js");
+			_setLastGraphBuildInfoForTests({
+				reused: true,
+				mode: "cached",
+				graphChanged: false,
+				wasmTrappedFiles: 2,
+			});
+
+			const run = await computeCascadeForFile(primary, env.tmpDir, {
+				turnSeq: 1,
+				writeSeq: 1,
+			});
+			expect(run.skipReason).toBe("indeterminate");
+			expect(run.indeterminate).toMatchObject({
+				reason: "graph_degraded",
+				detail:
+					"review graph degraded — tree-sitter wasm runtime failure in 2 file(s)",
+			});
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	// #3678 F-B: after the process-wide WASM abort, later builds have no
+	// tree-sitter symbols and may have no per-file trap count. Keep that state
+	// from becoming a silent `no_neighbors` all-clear.
+	it("returns indeterminate after the process-wide tree-sitter abort", async () => {
+		const env = setupTestEnvironment("cascade-wasm-aborted-");
+		try {
+			const primary = path.join(env.tmpDir, "primary.py");
+			fs.writeFileSync(primary, "x = 1\n");
+			mocks.computeImpactCascade.mockReturnValue(impact(primary, []));
+			mocks.getLSPService.mockReturnValue({
+				...makeLspServiceDouble(),
+				getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
+				touchFile: vi.fn(),
+				getDiagnostics: vi.fn(),
+			});
+
+			const {
+				_resetSharedTreeSitterClientForTests,
+				getSharedTreeSitterClient,
+			} = await import("../../clients/tree-sitter-shared.js");
+			const client = getSharedTreeSitterClient();
+			expect(client).not.toBeNull();
+			for (let i = 0; i < 4; i++) {
+				expect(
+					client!.reportWasmAbort(new Error("table index is out of bounds"), {
+						languageId: "python",
+						source: `def trap_${i}():\\n    return ${i}\\n`,
+					} as never),
+				).toBe(i === 3);
+			}
+			try {
+				const { computeCascadeForFile } =
+					await import("../../clients/dispatch/integration.js");
+				const run = await computeCascadeForFile(primary, env.tmpDir, {
+					turnSeq: 1,
+					writeSeq: 1,
+				});
+				expect(run.skipReason).toBe("indeterminate");
+				expect(run.indeterminate).toEqual({
+					reason: "graph_degraded",
+					detail:
+						"review graph degraded — tree-sitter is disabled for this process until restart",
+				});
+			} finally {
+				_resetSharedTreeSitterClientForTests();
+			}
 		} finally {
 			env.cleanup();
 		}

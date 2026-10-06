@@ -71,6 +71,12 @@ import { makeSessionStartEvent } from "./support/host-event-factory.js";
 import { createPiMock, makeCtx } from "./support/pi-mock.js";
 import { removeTempDirSync } from "./clients/test-utils.js";
 
+// This file drives real session_starts with test mode off: each appends a
+// `config_resolved` row to latency.log and `config resolved` lines to
+// sessionstart.log, and beforeEach truncates latency.log. The harness's
+// per-worker PI_LENS_HOME (#3721) keeps those writes off every other worker's
+// sink; the loggers bind their paths at load, so the home is the harness's.
+
 interface ConfigResolvedRow {
 	filePath: string;
 	metadata: { sessionId?: string; documents?: unknown[]; recordCount?: number };

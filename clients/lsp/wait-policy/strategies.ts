@@ -496,6 +496,26 @@ export const SERVER_DIAGNOSTIC_STRATEGIES: Record<string, DiagnosticStrategy> =
 			// #3484: the fence reply (+2..4 ms) precedes the publish (~+1 s).
 			diagnosticsFence: "reply-first",
 		},
+		// terraform-ls (#3310). The nightly tool-smoke measurement was identical
+		// on 2026-09-27, 2026-09-28, and 2026-09-29:
+		//
+		//   [terraform] clean-behavior=publishes-unversioned (tier 2*)
+		//   dirtyPubs=2(v:0) cleanPubs=2(v:0) first-publish=empty-first
+		//   provisional pre-index publish
+		//
+		// The first empty, unversioned publish is the cold-index artifact, so hold
+		// it once and let terraform-ls's next publish resolve the wait. A held
+		// clean-only trace therefore reaches the caller as unanswered/indeterminate
+		// at the wait ceiling rather than a false clean, by design (#3310). The
+		// marker is measured policy, not a blanket rule for Tier 2* push servers.
+		terraform: {
+			seedFirstPush: false,
+			pullRetryBudgetMs: 0,
+			debounceMs: 150,
+			aggregateWaitMs: 1500,
+			expectSemanticSecondPush: false,
+			emptyFirstPublish: "indexing",
+		},
 		// yaml-language-server (#3484): the default strategy plus the measured
 		// fence order — reply +3..6 ms, publish +207..242 ms after didChange.
 		yaml: {

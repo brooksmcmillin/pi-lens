@@ -8,6 +8,7 @@ import {
 	CACHE_VERSION,
 	RuleCache,
 } from "../../../clients/cache/rule-cache.js";
+import { getProjectDataDir } from "../../../clients/file-utils.js";
 import {
 	getDegradationSummary,
 	resetDegradationLedger,
@@ -138,7 +139,11 @@ describe("RuleCache", () => {
 	// version bumped. `set()` now prunes stale-version siblings after writing.
 	it("prunes an orphaned prior-version cache file on set()", () => {
 		const { cwd, ruleFile } = setupProject();
-		const staleFile = path.join(cwd, ".pi-lens", "cache", "go-rules-v3.json");
+		const staleFile = path.join(
+			getProjectDataDir(cwd),
+			"cache",
+			"go-rules-v3.json",
+		);
 		fs.mkdirSync(path.dirname(staleFile), { recursive: true });
 		fs.writeFileSync(staleFile, JSON.stringify({ version: "v3" }), "utf-8");
 
@@ -161,8 +166,7 @@ describe("RuleCache", () => {
 		);
 
 		const currentFile = path.join(
-			cwd,
-			".pi-lens",
+			getProjectDataDir(cwd),
 			"cache",
 			`go-rules-${CACHE_VERSION}.json`,
 		);
@@ -258,8 +262,7 @@ describe("RuleCache", () => {
 		);
 
 		const cacheFile = path.join(
-			cwd,
-			".pi-lens",
+			getProjectDataDir(cwd),
 			"cache",
 			`typescript-rules-${CACHE_VERSION}.json`,
 		);
@@ -406,8 +409,7 @@ describe("RuleCache", () => {
 		const stat = fs.statSync(ruleFile);
 
 		const cacheFile = path.join(
-			cwd,
-			".pi-lens",
+			getProjectDataDir(cwd),
 			"cache",
 			`typescript-rules-${CACHE_VERSION}.json`,
 		);

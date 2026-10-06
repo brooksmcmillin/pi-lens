@@ -11,8 +11,30 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import {
+	afterAll,
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	vi,
+} from "vitest";
+
+// The latency writer captures its path through these production imports.
+// Own it before import, independently of the per-case project/machine homes.
+const logHome = await vi.hoisted(async () => {
+	const { mkdtempSync } = await import("node:fs");
+	const { tmpdir } = await import("node:os");
+	const { join } = await import("node:path");
+	const home = mkdtempSync(join(tmpdir(), "pi-lens-runner-bounds-log-"));
+	vi.stubEnv("PI_LENS_HOME", home);
+	return home;
+});
+
 import { CacheManager } from "../../clients/cache-manager.js";
+import { DependencyChecker } from "../../clients/dependency-checker.js";
+import { KnipClient } from "../../clients/knip-client.js";
 import { mergeGitGuardTestFailure } from "../../clients/git-guard.js";
 import { setAmbientAbortSignal } from "../../clients/safe-spawn.js";
 import { TestRunnerClient } from "../../clients/test-runner-client.js";
@@ -36,7 +58,7 @@ import {
 	handleTurnEnd,
 	runTestTargetsBounded,
 } from "../../clients/runtime-turn.js";
-import { setupTestEnvironment } from "./test-utils.js";
+import { removeTempDirSync, setupTestEnvironment } from "./test-utils.js";
 
 const EMPTY_KNIP_RESULT = {
 	success: true,
@@ -71,6 +93,21 @@ beforeEach(() => {
 afterEach(() => {
 	env.cleanup();
 	resetDegradationLedger();
+});
+afterAll(async () => {
+	await flushLatencyLog();
+	vi.unstubAllEnvs();
+	removeTempDirSync(logHome);
+});
+
+it("keeps the captured latency sink private after per-case home changes", () => {
+	// #3644: the parent-companion witness's late pin did not isolate its clear.
+	vi.stubEnv("PI_LENS_HOME", path.join(env.tmpDir, "machine"));
+	try {
+		expect(getLatencyLogPath()).toBe(path.join(logHome, "latency.log"));
+	} finally {
+		vi.unstubAllEnvs();
+	}
 });
 
 const delay = (ms: number): Promise<void> =>
@@ -365,7 +402,7 @@ describe("#2504 AC2 — turn_end wires the bounds into the real fan-out", () => 
  * hand-fed input shaped to hit the guard.
  */
 describe("#2522 AC1 — turn_end selection excludes integration/e2e targets", () => {
-	it("never spawns a target resolved under tests/integration/, and dbg names the excluded target", async () => {
+	it("never spawns a target resolved under tests/integration/, and dbg reports the exclusion without guessing its cause", async () => {
 		const runtime = new RuntimeCoordinator();
 		const cacheManager = new CacheManager(false);
 
@@ -437,9 +474,169 @@ describe("#2522 AC1 — turn_end selection excludes integration/e2e targets", ()
 		await delay(200);
 
 		expect(ran).toHaveLength(0);
-		expect(
-			dbgLines.some((l) => l.includes("excluded") && l.includes("integration")),
-		).toBe(true);
+		expect(dbgLines).toContainEqual(
+			expect.stringContaining(
+				`test target excluded by the built-in turn-end policy, skipping spawn (${path.relative(env.tmpDir, integrationTest)})`,
+			),
+		);
+	});
+
+	it("reports a nested worktree exclusion without mislabelling it integration/e2e", async () => {
+		// Regression: the turn-end gate now excludes a nested Git checkout as
+		// well as integration/e2e suites; its debug record must not invent a reason.
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+		fs.writeFileSync(
+			path.join(env.tmpDir, "vitest.config.ts"),
+			"export default {};\n",
+		);
+		const worktree = path.join(env.tmpDir, ".worktrees", "other");
+		fs.mkdirSync(worktree, { recursive: true });
+		fs.writeFileSync(
+			path.join(worktree, ".git"),
+			"gitdir: /git/worktrees/other\n",
+		);
+		const nestedTest = path.join(worktree, "tests", "other.test.ts");
+		fs.mkdirSync(path.dirname(nestedTest));
+		fs.writeFileSync(nestedTest, "export {};\n");
+		cacheManager.addModifiedRange(
+			nestedTest,
+			{ start: 1, end: 1 },
+			false,
+			env.tmpDir,
+			runtime.telemetrySessionId,
+		);
+
+		const realClient = new TestRunnerClient(false);
+		expect(realClient.getTestRunTarget(nestedTest, env.tmpDir)?.strategy).toBe(
+			"self",
+		);
+		// Keep typed real clients; only replace the external test execution. This
+		// fixture has no package.json/knip config, and the madge flag is disabled.
+		const run = vi.spyOn(realClient, "runTestFileAsync").mockResolvedValue({
+			file: nestedTest,
+			sourceFile: nestedTest,
+			runner: "vitest",
+			passed: 1,
+			failed: 0,
+			skipped: 0,
+			duration: 1,
+			failures: [],
+		});
+		const dbgLines: string[] = [];
+		try {
+			await handleTurnEnd({
+				ctxCwd: env.tmpDir,
+				getFlag: () => false,
+				dbg: (msg: string) => dbgLines.push(msg),
+				runtime,
+				cacheManager,
+				knipClient: new KnipClient(false),
+				deadCodeClients: [],
+				depChecker: new DependencyChecker(false),
+				testRunnerClient: realClient,
+				resetLSPService: () => {},
+				resetFormatService: () => {},
+			});
+
+			expect(run).not.toHaveBeenCalled();
+			expect(dbgLines).toContainEqual(
+				expect.stringContaining(
+					"test target excluded by the built-in turn-end policy",
+				),
+			);
+			expect(dbgLines.join("\n")).not.toContain("integration/e2e");
+		} finally {
+			run.mockRestore();
+		}
+	});
+
+	it("runs the parent companion when a foreign checkout supplies the first discovery match", async () => {
+		// R2: a late veto used to discard the foreign match without recovering
+		// its parent alternative. Enter through real turn-end selection and state.
+		// Pin per-case state before construction; the log sink was pinned at import.
+		vi.stubEnv("PI_LENS_TEST_MODE", "0");
+		vi.stubEnv("PI_LENS_HOME", path.join(env.tmpDir, "machine"));
+		try {
+			const runtime = new RuntimeCoordinator();
+			const cacheManager = new CacheManager(false);
+			fs.mkdirSync(path.join(env.tmpDir, ".git"));
+			fs.writeFileSync(
+				path.join(env.tmpDir, ".git", "HEAD"),
+				"ref: refs/heads/main\n",
+			);
+			fs.writeFileSync(path.join(env.tmpDir, "pytest.ini"), "[pytest]\n");
+			const source = path.join(env.tmpDir, "widget.py");
+			fs.writeFileSync(source, "VALUE = 1\n");
+			const nested = path.join(env.tmpDir, "tests", "a-checkout");
+			fs.mkdirSync(nested, { recursive: true });
+			fs.writeFileSync(
+				path.join(nested, ".git"),
+				"gitdir: /git/worktrees/other\n",
+			);
+			const foreign = path.join(nested, "test_widget.py");
+			fs.writeFileSync(foreign, "def test_foreign(): pass\n");
+			const parent = path.join(
+				env.tmpDir,
+				"tests",
+				"z-parent",
+				"test_widget.py",
+			);
+			fs.mkdirSync(path.dirname(parent));
+			fs.writeFileSync(parent, "def test_parent(): pass\n");
+			cacheManager.addModifiedRange(
+				source,
+				{ start: 1, end: 1 },
+				false,
+				env.tmpDir,
+				runtime.telemetrySessionId,
+			);
+
+			const client = new TestRunnerClient(false);
+			expect(client.findTestFile(source, env.tmpDir)?.testFile).toBe(foreign);
+			const ran: string[] = [];
+			const run = vi
+				.spyOn(client, "runTestFileAsync")
+				.mockImplementation(async (testFile) => {
+					ran.push(testFile);
+					return {
+						file: testFile,
+						sourceFile: source,
+						runner: "pytest",
+						passed: 1,
+						failed: 0,
+						skipped: 0,
+						duration: 1,
+						failures: [],
+					};
+				});
+			// Clear the real, file-owned sink captured before production imports.
+			clearLatencyLog();
+			try {
+				await handleTurnEnd({
+					ctxCwd: env.tmpDir,
+					getFlag: () => false,
+					dbg: () => {},
+					runtime,
+					cacheManager,
+					knipClient: new KnipClient(false),
+					deadCodeClients: [],
+					depChecker: new DependencyChecker(false),
+					testRunnerClient: client,
+					resetLSPService: () => {},
+					resetFormatService: () => {},
+				});
+				await flushLatencyLog();
+				expect(ran).toEqual([parent]);
+				expect(fs.readFileSync(getLatencyLogPath(), "utf8")).toContain(
+					'"kind":"test-discovery-foreign-checkout"',
+				);
+			} finally {
+				run.mockRestore();
+			}
+		} finally {
+			vi.unstubAllEnvs();
+		}
 	});
 });
 
@@ -988,7 +1185,7 @@ describe("#2522 R2/R3 — a target that never fits the budget is retired, not ca
 	 * `related` strategy on every turn that touches its source) and `fresh.ts` +
 	 * `fresh.test.ts` (an ordinary target that must keep running).
 	 */
-	function seedRetirementProject(): {
+	function seedRetirementProject(longTarget = false): {
 		fresh: string;
 		freshTest: string;
 		foreverSource: string;
@@ -1002,7 +1199,13 @@ describe("#2522 R2/R3 — a target that never fits the budget is retired, not ca
 		const fresh = path.join(env.tmpDir, "src", "fresh.ts");
 		const freshTest = path.join(env.tmpDir, "src", "fresh.test.ts");
 		const foreverSource = path.join(env.tmpDir, "src", "forever.ts");
-		const forever = path.join(env.tmpDir, "src", "forever.test.ts");
+		const forever = path.join(
+			env.tmpDir,
+			"src",
+			longTarget
+				? `forever.test.ts${"x".repeat(70)}.test.ts`
+				: "forever.test.ts",
+		);
 		fs.writeFileSync(fresh, "export const fresh = 1;\n");
 		fs.writeFileSync(freshTest, "export {};\n");
 		fs.writeFileSync(foreverSource, "export const forever = 1;\n");
@@ -1223,6 +1426,40 @@ describe("#2522 R2/R3 — a target that never fits the budget is retired, not ca
 			setAmbientAbortSignal(undefined);
 		}
 		await delay(300);
+	});
+
+	it("keeps the retirement remedy with a long test target path (#3712)", async () => {
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+		const { fresh, foreverSource, forever } = seedRetirementProject(true);
+		markEdited(cacheManager, runtime, [fresh, foreverSource]);
+		cacheManager.writeCache(
+			"test-runner-findings",
+			{
+				content: "1 test target(s) deferred to the next turn",
+				deferredTargets: [
+					{
+						testFile: forever,
+						runner: "vitest",
+						attempts: TEST_RUNNER_MAX_DEFERRALS,
+						sessionId: runtime.telemetrySessionId,
+					},
+				],
+			},
+			env.tmpDir,
+		);
+		await runTurn({
+			cacheManager,
+			runtime,
+			client: recordingClient([]),
+			dbgLines: [],
+		});
+		const reason =
+			getDegradationSummary().find(
+				(group) => group.kind === "test-runner-batch-capped",
+			)?.latestReasons[0]?.reason ?? "";
+		// #3712: the remedy must precede the long relative target path.
+		expect(reason).toContain("run it explicitly");
 	});
 
 	it("keeps the target retired on the NEXT turn, with no deferral list left to read", async () => {
@@ -2174,8 +2411,8 @@ describe("#2522 R4 — the deferral record across sessions, generations and caps
 
 		// `logLatency` short-circuits under `isTestMode()`, so the record can only
 		// be observed with the same opt-out the other latency-log tests in this
-		// repo use. `PI_LENS_HOME` stays pinned by the shared vitest setup, so
-		// this still writes into the per-worker temp home, never `~/.pi-lens`.
+		// repo use. The captured sink stays in this file's pre-import logHome,
+		// independently of later per-case home changes or parallel suites.
 		const previousTestMode = process.env.PI_LENS_TEST_MODE;
 		process.env.PI_LENS_TEST_MODE = "0";
 		clearLatencyLog();
