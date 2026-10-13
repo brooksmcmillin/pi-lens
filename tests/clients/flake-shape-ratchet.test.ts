@@ -97,6 +97,13 @@ const FLAKE_SHAPE_BASELINE: Baseline = JSON.parse(
 const ADMITTED_AFTER_BASELINE: Readonly<
 	Record<string, { detector: DetectorName; reason: string }>
 > = {
+	// 2026-10-08 (#4148): blank-heavy YAML language extraction is a synchronous
+	// event-loop path, so only a real-clock assertion sees its quadratic stall.
+	"elapsed-time-assertion:clients/ast-grep-rule-regex-budget.test.ts": {
+		detector: "elapsed-time-assertion",
+		reason:
+			"the defect is wall-clock only (super-linear ast-grep rule YAML language extraction); a fake clock measures nothing",
+	},
 	// 2026-09-11 (#2886 round 2): the /lens-perf occupancy row keeps one
 	// real-clock sampler assertion alongside its deterministic yield count —
 	// event-loop occupancy has no deterministic proxy; the yield count is
@@ -105,6 +112,13 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "elapsed-time-assertion",
 		reason:
 			"event-loop occupancy has no deterministic proxy; the sampler row guards per-chunk block size the yield count cannot see",
+	},
+	// 2026-10-08 (#4148): 100K blank lines expose the real event-loop stall in
+	// pytest traceback and go.mod regex parsing; a fake clock cannot measure it.
+	"elapsed-time-assertion:clients/pytest-gomod-regex-budget.test.ts": {
+		detector: "elapsed-time-assertion",
+		reason:
+			"the defect is wall-clock only (quadratic pytest traceback and go.mod regex backtracking); a fake clock measures nothing",
 	},
 	// 2026-09-08 (#2622): the defect is wall-clock only — 2^N regex
 	// backtracking in both glob compilers; a fake clock measures nothing.
@@ -118,6 +132,14 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"#3403 measures real scratch-tree filesystem latency; fake timers cannot observe cold CI disk work",
 	},
+	// 2026-10-08 (#3871 r2, moved to its own file in r3): depth-30 runner
+	// paths, 100K blank runs and 100K tokens are real event-loop occupancy
+	// witnesses for super-linear location-regex backtracking.
+	"elapsed-time-assertion:clients/test-runner-location-regex-budget.test.ts": {
+		detector: "elapsed-time-assertion",
+		reason:
+			"the defect is wall-clock only (super-linear runner-location regex backtracking); a fake clock measures nothing",
+	},
 	// 2026-09-06 (#2603, was #2591 review round 2, F1): the defect is 2^N regex
 	// backtracking through detectPythonEnvironment — the ANSWER was always
 	// right, only the time was wrong, so no non-clock assertion separates
@@ -128,6 +150,11 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 			reason:
 				"the defect is wall-clock only (2^N globstar backtracking); a fake clock measures nothing",
 		},
+	"never-settling-wait:scripts/mutate-fixture.test.ts": {
+		detector: "never-settling-wait",
+		reason:
+			"the interrupt witness must hold a real child open until SIGINT; replacing the wait with a settled promise would erase the lifecycle under test",
+	},
 	// 2026-09-07 (#2703 review r1): an unhandled derived-promise rejection is
 	// only observable through Node's `unhandledRejection` event, which fires
 	// on a real macrotask; the file drains one real `setImmediate` tick.
@@ -184,6 +211,11 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "raw-timer-wait",
 		reason:
 			"a real recursive fs.watch delivery is the subject; no fake clock delivers an inotify event and a stubbed watcher proves nothing",
+	},
+	"real-process-spawn:clients/analysis-root-writers.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"real git worktree metadata is written and registered by Git; an in-process double cannot prove linked-worktree ownership",
 	},
 	"real-process-spawn:clients/biome-config-decorator-metadata.test.ts": {
 		detector: "real-process-spawn",
@@ -253,6 +285,15 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"the reaper's evidence is a real pid's command line, kernel start time and inherited environment; a double would encode the very identity guess the fix removes",
 	},
+	// #4046 interim: six real Node writers rendezvous on an OS barrier and
+	// persist registrations through the production cross-process lock; an
+	// in-process double cannot reproduce the race, and serialization prevents
+	// it from overlapping the timing-sensitive occupancy sampler.
+	"real-process-spawn:clients/instance-registry-race.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"six real Node writers must rendezvous on an OS barrier and contend through the production cross-process lock; an in-process double cannot reproduce the race",
+	},
 	"real-process-spawn:clients/lsp/headless-tool-call-keepalive.test.ts": {
 		detector: "real-process-spawn",
 		reason:
@@ -262,6 +303,11 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "real-process-spawn",
 		reason:
 			"a real, live direct child is the only pid whose /proc PPid is this process, so the Linux ownership arm of the kill-by-pid predicate cannot be observed through any double",
+	},
+	"real-process-spawn:clients/lsp/lean-real-smoke.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"real Lean elaboration and diagnostic publication require Lake and elan across the child-process boundary; the serialized wall-clock lane isolates the handshake and diagnostic wait",
 	},
 	"real-process-spawn:clients/metrics-history-stderr.test.ts": {
 		detector: "real-process-spawn",
@@ -345,10 +391,32 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"observes the real npm pack lifecycle (prepack/postpack), and unpacks that real tarball to check what ships (#3219); no in-process double is faithful",
 	},
+	// #4169: the TypeScript-source entry (`pi -e index.ts`) is transpiled by the
+	// real host's jiti loader rather than native-imported, so /reload re-evaluates
+	// the pi-lens graph and only a real child reaches the orphaned module-scope
+	// runtime; no in-process double produces a fresh module instance.
+	"real-process-spawn:real-harness/bridge-reload-ts.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the real pi host must transpile the TypeScript-source pi-lens entry, re-evaluate its module graph on /reload, and keep a third-party v1 bridge read connected to the live runtime (#4169)",
+	},
+	"real-process-spawn:real-harness/bridge-reload.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the shipped real pi host must reload the built extension and keep a third-party v1 bridge read connected to the live runtime across that lifecycle boundary (#4169)",
+	},
+	// 2026-10-07 (#4081): 1 -> 3. Whether teardown waits for, tree-kills and
+	// bounds a real child and its detached grandchildren, and whether removal
+	// outlasts a live writer, are only observable against real processes: an
+	// EventEmitter double has no pid, no reparenting and no files to write.
+	// 3 -> 7 in #4082 round 3: four child scripts build the process trees the
+	// tree kill and the kill guard are tested against (a self-exiting mid
+	// process, a root forking during the kill, a reparented orphan); the
+	// guard's verdict reads the kernel's PPid, which no double has.
 	"real-process-spawn:real-harness/child-exit.test.ts": {
 		detector: "real-process-spawn",
 		reason:
-			"real pi child death is the process-boundary failure that must reject a governed waiter promptly",
+			"real pi child death is the process-boundary failure that must reject a governed waiter promptly; real child/grandchild processes are the only evidence that teardown reaps a process tree, that the kill guard admits exactly that tree, and that removal outlasts a live writer (#4081)",
 	},
 	// 2026-09-15 (#2154 AC1): 1 -> 3, then 3 -> 7 in #3060 round 2 (review F1 +
 	// F2). The reported defect needs TWO LIVE pi sessions over one project root
@@ -368,15 +436,39 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"real pi must surface provider exhaustion and malformed tool arguments across the process boundary",
 	},
+	"real-process-spawn:real-harness/outside-root.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the real pi host must deliver the out-of-root advisory and degradation record through the process boundary, including the second edit and owned-path exemptions; #4292 also kills a real startup jscpd scan with caller TMPDIR overrides to prove scanner-root cleanup",
+	},
 	"real-process-spawn:real-harness/provider-compatibility.test.ts": {
 		detector: "real-process-spawn",
 		reason:
 			"the installed pi host must load the built extension and expose its provider roster across the process boundary",
 	},
+	// 2026-10-08 (#4138, #3831, #4185 round 2): the branch a read record is
+	// admitted to is pi's own session branch after a real RPC clone rebinds the
+	// extension, and the nested ids (`c1/1`, parent `c1`) and the toolResult pi
+	// persists for a codemode call exist only in the real host. Round 4 adds
+	// four: pi's own agent loop decides that a call a later extension blocked
+	// gets tool_execution_end and no tool_result, in what order, top-level,
+	// parallel and nested. Round 5 adds one: a later extension's tool_result
+	// hook rewrites a failed read's isError after pi-lens saw it, which only
+	// pi's own hook chain produces.
+	"real-process-spawn:real-harness/read-guard-moves.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the read guard's branch admission after a real RPC clone, the nested-call ids pi mints, and the tool_execution_end pi's agent loop emits for a call a later extension blocked cannot be produced by an in-process double",
+	},
 	"real-process-spawn:real-harness/scenario-1.test.ts": {
 		detector: "real-process-spawn",
 		reason:
 			"the real pi RPC host and extension lifecycle cannot be certified by an in-process double",
+	},
+	"real-process-spawn:real-harness/scenario-2.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the expired successor hand-off and activation roster must cross the real pi process boundary",
 	},
 	"real-process-spawn:real-harness/scenario-3.test.ts": {
 		detector: "real-process-spawn",
@@ -389,7 +481,7 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 	"real-process-spawn:real-harness/tools-enabled.test.ts": {
 		detector: "real-process-spawn",
 		reason:
-			"the provider wire roster is produced by a real pi host loading the built extension; an in-process double cannot certify tools.<name>.enabled",
+			"the provider wire roster and session-start log are produced by a real pi host loading the built extension; an in-process double cannot certify tools.<name>.enabled (#1416)",
 	},
 	// #3870: the detector tests drive the analyzer's real CLI entry point as a
 	// real node subprocess over redacted fixture logs; an in-process call could
@@ -423,10 +515,22 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"the exact local CLI, shallow checkout, `git check-ignore` (#2904), and large-diff buffer overflow (refs #17) are the subjects; real Git add/commit calls author the overflow fixture because a double cannot exercise child-process output bounds",
 	},
+	// 2026-10-07 (#4072 review F2): the executable CLI's exit status is the
+	// contract; an in-process main() call cannot prove the entry-point boundary.
+	"real-process-spawn:scripts/ci-test-diff.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the executable CLI exit status is the contract; an in-process main call cannot prove the entry-point boundary",
+	},
 	"real-process-spawn:scripts/ci-verdict.test.ts": {
 		detector: "real-process-spawn",
 		reason:
 			"#3883 F3: the final exit line and process status live at the real main() boundary; only a spawned CLI observes them",
+	},
+	"real-process-spawn:scripts/download-test-history-artifacts.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"a real gh child is required to prove transient API failure recovery, persistent failure, and a ZIP over the default spawn buffer at the process boundary",
 	},
 	"real-process-spawn:scripts/git-fixture-env.test.ts": {
 		detector: "real-process-spawn",
@@ -442,6 +546,11 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"the hook's real stdin/exit-code/stderr contract is unobservable from an in-process call to the exported classify functions",
 	},
+	"real-process-spawn:scripts/guard-bash-probe.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the real hook stdin/exit-code contract and head-to-head differential are unobservable through an in-process classifier call",
+	},
 	// #2698: gitignore/tracked-vs-untracked resolution (git init/add/commit/
 	// ls-files against a throwaway fixture repo) is the exact mechanism
 	// scripts/lib/knip-sibling-purge.mjs depends on and this file tests.
@@ -449,6 +558,14 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "real-process-spawn",
 		reason:
 			"gitignore/tracked-vs-untracked resolution is the mechanism under test; no mock reproduces git's own resolution faithfully",
+	},
+	// #4047: the CLI's verdict and exit code are what a delegated lane acts on;
+	// they come from parsing the real selector, red-on-base and vitest
+	// transcripts over a real Git fixture, which an in-process stub restates.
+	"real-process-spawn:scripts/lane-check.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the CLI's verdict and exit code are parsed from the real selector, red-on-base and vitest transcripts over a real Git fixture; an in-process stub restates the transcript instead of proving the parse",
 	},
 	// 2026-09-07 (#2700): the gating/advisory subset test resolves oxlint's
 	// REAL `--print-config` for both npm scripts (never a hand-copied rule
@@ -469,6 +586,11 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 	// scripts/mutation-report.mjs's own argv parsing (--report/--out) and
 	// file I/O; an in-process call would just re-exercise the exported render
 	// function the other describe block already covers.
+	"real-process-spawn:scripts/mutate.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the mutation CLI's child Vitest process and signal path are the process boundary; an in-process call cannot prove restoration after SIGINT",
+	},
 	"real-process-spawn:scripts/mutation-report-render.test.ts": {
 		detector: "real-process-spawn",
 		reason:
@@ -513,7 +635,7 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 	"real-process-spawn:scripts/pre-commit-hook.test.ts": {
 		detector: "real-process-spawn",
 		reason:
-			"the real hook pipes git through xargs into the pinned oxfmt; the exit-123 refusal is a process-boundary fact",
+			"the real hook pipes git through xargs into the pinned oxfmt; the exit-123 refusal and handoff refusal are process-boundary facts",
 	},
 	"real-process-spawn:scripts/pre-push-targeted-tests.test.ts": {
 		detector: "real-process-spawn",
@@ -590,6 +712,14 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "real-process-spawn",
 		reason:
 			"the defect is a temporal-dead-zone crash in the driver's own top-level execution order; the #3853 lock wait/refusal and the #3856 F3 stage dispositions (heartbeat/refusal behind a live holder, the budget-signal abort, the absent and partial coverage reports, the skipped/corrupt compiled source) are only observable by spawning the real script, and no source-text or in-process substitute reproduces them",
+	},
+	// 2026-10-07 (#4038 r5): run 37601788256's publish step crashed in the
+	// script's process-entry block, which only a real `node` process runs;
+	// the in-process `main()` tests never reached it.
+	"real-process-spawn:scripts/stryker-nightly.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the defect lived in the CLI entry block (`import.meta.url === argv[1]`), which only a real node process executes",
 	},
 	// 2026-09-06 (#2586 review F1): proves the actual delimiter
 	// supply-host-provided-deps.mjs prints in its own stdout bytes; an
@@ -816,8 +946,8 @@ function describeProblem(p: RatchetProblem): string {
 const WALK_TIMEOUT_MS = 180_000;
 
 describe("flake-shape ratchet (#2547)", () => {
-	beforeAll(() => {
-		for (const detector of DETECTOR_NAMES) countsByDetector(detector);
+	beforeAll(async () => {
+		for (const detector of DETECTOR_NAMES) await countsByDetector(detector);
 	}, WALK_TIMEOUT_MS);
 
 	it("keeps every admission map sorted", () => {
@@ -839,10 +969,10 @@ describe("flake-shape ratchet (#2547)", () => {
 	});
 	it.each(DETECTOR_NAMES)(
 		"detector %s: no new files, no risen counts vs. the baseline",
-		(detector) => {
+		async (detector) => {
 			const problems = auditAgainstBaseline(
 				detector,
-				countsByDetector(detector),
+				await countsByDetector(detector),
 			);
 			expect(problems.map(describeProblem)).toEqual([]);
 		},
@@ -851,14 +981,14 @@ describe("flake-shape ratchet (#2547)", () => {
 
 	// Whole-tree scan performs AST parsing and can exceed Vitest's default under
 	// CI contention (run 34195211598, head 5c0aa5a4).
-	it("the baseline names no file that has vanished from the live scan", () => {
+	it("the baseline names no file that has vanished from the live scan", async () => {
 		// Stated asymmetrically on purpose (see module doc): a count FALLING is
 		// not a failure above, but a baseline entry for a file the scan no
 		// longer touches AT ALL is dead weight worth flagging here, same as
 		// `auditRegistry`'s stale-exemption check one layer up.
 		const stale: string[] = [];
 		for (const detector of DETECTOR_NAMES) {
-			const live = countsByDetector(detector);
+			const live = await countsByDetector(detector);
 			for (const file of Object.keys(FLAKE_SHAPE_BASELINE[detector] ?? {})) {
 				if (!(file in live)) stale.push(`${detector}:${file}`);
 			}
@@ -1472,26 +1602,23 @@ describe("flake-shape scan — raw-timer-wait", () => {
 		expect(scanRawTimerWait("interleaving-kit.ts", source)).toEqual([]);
 	});
 
-	it("(#2563) the live scan walks tests/support helpers: fault-injection.ts sits in the population", () => {
+	it("(#2563) the live scan walks tests/support helpers: fault-injection.ts sits in the population", async () => {
 		// Mutation-sensitive population proof: dropping the support walk from
 		// countsByDetector makes this red. fault-injection.ts is the one
 		// existing helper the extended scan flags (its sanctioned delayInside
 		// timer + teardown failsafe are baselined, not admitted).
-		expect(countsByDetector("raw-timer-wait")).toHaveProperty(
+		expect(await countsByDetector("raw-timer-wait")).toHaveProperty(
 			"support/fault-injection.ts",
 		);
 	});
 
-	it("(#2563) the spawn detector stays test-file-only: support helpers are the sanctioned spawn boundary", () => {
+	it("(#2563) the spawn detector stays test-file-only: support helpers are the sanctioned spawn boundary", async () => {
 		// git-fixture-env.ts / fake-child.ts / spawn-shapes.ts import
 		// node:child_process by design — they are the fixture boundary the
 		// test-side detector routes callers toward, not a flake shape.
-		expect(
-			countsByDetector("real-process-spawn")["support/git-fixture-env.ts"],
-		).toBeUndefined();
-		expect(
-			countsByDetector("real-process-spawn")["support/fake-child.ts"],
-		).toBeUndefined();
+		const spawnCounts = await countsByDetector("real-process-spawn");
+		expect(spawnCounts["support/git-fixture-env.ts"]).toBeUndefined();
+		expect(spawnCounts["support/fake-child.ts"]).toBeUndefined();
 	});
 
 	it("ATTACK (#2563): a raw timer inside a tests/support helper is a NEW flagged file", () => {

@@ -91,8 +91,9 @@
  *
  * - {@link listSourceFiles}'s `exclude` filters FILES only. It never prunes a
  *   directory walk, so excluding `vendor/x.ts` still descends into `vendor/`.
- *   That is cheap on these trees; a sweep over a `node_modules`-sized tree
- *   needs directory pruning this kit does not offer (#1755 review F5).
+ *   That is cheap on these trees. The one pruning it does offer is the fixed
+ *   {@link RUNTIME_SCRATCH_DIRS} set (#4097); a sweep over any other
+ *   `node_modules`-sized tree still needs more (#1755 review F5).
  * - RESOLVED by #2502: under `strings: "blank"`, a call written inside a
  *   TEMPLATE EXPRESSION (`` `${resetThing()}` ``) used to be blanked with the
  *   rest of the template — a false NEGATIVE, the direction that matters for a
@@ -615,6 +616,22 @@ export function firstCommentMatch(
 	return undefined;
 }
 
+/**
+ * Directories {@link listSourceFiles} never descends into: runtime scratch and
+ * third-party trees that hold no repo source and that sibling processes
+ * create and delete while a sweep walks. Named recurrence (#4097): the
+ * bounded-container guard walked the repo root, `.probe-home/` included, and
+ * died with ENOENT when a sibling vitest worker removed its
+ * `worker-home-*` mid-walk. Matched by directory name at any depth below the
+ * walk root (the root itself is always walked).
+ */
+export const RUNTIME_SCRATCH_DIRS: ReadonlySet<string> = new Set([
+	".git",
+	".probe-home",
+	".claude",
+	"node_modules",
+]);
+
 export interface ListSourceFilesOptions {
 	/** File extensions to include, with the dot. Default `[".ts"]`. */
 	extensions?: readonly string[];
@@ -639,16 +656,32 @@ export function listSourceFiles(
 	const extensions = options.extensions ?? [".ts"];
 	const skipDeclarations = options.skipDeclarations ?? true;
 	const skipTests = options.skipTests ?? false;
-	const walk = (dir: string): string[] =>
-		fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+	const walk = (dir: string): string[] => {
+		let entries: fs.Dirent[];
+		try {
+			entries = fs.readdirSync(dir, { withFileTypes: true });
+		} catch (error) {
+			// A directory listed by its parent but gone before its own listing
+			// (#4097) is out of the population, like a vanished file (#3082).
+			// The root itself must exist: a missing root is the caller's bug.
+			if (dir === root || (error as NodeJS.ErrnoException).code !== "ENOENT") {
+				throw error;
+			}
+			recordVanishedPath(dir, "its descent");
+			return [];
+		}
+		return entries.flatMap((entry) => {
 			const entryPath = path.join(dir, entry.name);
-			if (entry.isDirectory()) return walk(entryPath);
+			if (entry.isDirectory()) {
+				return RUNTIME_SCRATCH_DIRS.has(entry.name) ? [] : walk(entryPath);
+			}
 			if (!extensions.some((ext) => entry.name.endsWith(ext))) return [];
 			if (skipDeclarations && /\.d\.[cm]?ts$/.test(entry.name)) return [];
 			if (skipTests && /\.test\.[cm]?[jt]s$/.test(entry.name)) return [];
 			if (options.exclude?.(relativePosix(root, entryPath))) return [];
 			return [entryPath];
 		});
+	};
 	return walk(root).sort();
 }
 
@@ -725,17 +758,26 @@ export function readWalkedFile(file: string): string | undefined {
 		return fs.readFileSync(file, "utf8");
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-		if (!vanishedBetweenWalkAndRead.has(file)) {
-			vanishedBetweenWalkAndRead.add(file);
-			// Raw stderr write, not console.warn (#3107): Vitest's default
-			// reporter swallows a worker's console.warn on a passing run, so
-			// this line would never reach CI's log. See the docstring above.
-			process.stderr.write(
-				`[sweep-kit] ${file} vanished between the walk and the read; skipped (#3082)\n`,
-			);
-		}
+		recordVanishedPath(file, "the read");
 		return undefined;
 	}
+}
+
+/**
+ * Record a path the walk found gone, once per distinct path per fork, via a
+ * raw stderr write (#3107, see {@link readWalkedFile}). Shared by the read
+ * and the directory-descent tolerance so both land in
+ * {@link walkedFilesVanished}.
+ */
+function recordVanishedPath(file: string, phase: string): void {
+	if (vanishedBetweenWalkAndRead.has(file)) return;
+	vanishedBetweenWalkAndRead.add(file);
+	// Raw stderr write, not console.warn (#3107): Vitest's default
+	// reporter swallows a worker's console.warn on a passing run, so
+	// this line would never reach CI's log. See readWalkedFile's docstring.
+	process.stderr.write(
+		`[sweep-kit] ${file} vanished between the walk and ${phase}; skipped (#3082)\n`,
+	);
 }
 
 /**

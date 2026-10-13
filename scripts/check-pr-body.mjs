@@ -3,17 +3,21 @@ import { basename, dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gitExecFileSync } from "./lib/git-fixture-env.mjs";
 import {
+	changedHookAnchors,
 	evaluateTlaCoverage,
 	loadCoverageMap,
 	matchGlob,
 	parseChangedFiles,
 } from "./lib/tla-coverage.mjs";
+import { evaluateWorkflowRunEvidence } from "./lib/workflow-run-evidence.mjs";
 import {
 	INVALID_CLOSE_KEYWORD_MESSAGE,
 	closeKeywordPlacementMessage,
 	lintCloseKeywordPlacement,
 	lintCloseKeywords,
+	parseCloseKeywords,
 } from "./lib/close-keywords.mjs";
+import { checkProse, proseSections } from "./check-prose.mjs";
 
 const TEMPLATE_PATH = ".github/PULL_REQUEST_TEMPLATE.md";
 const TEMPLATE_FILE = resolve(
@@ -36,6 +40,9 @@ const REQUIRED_SECTIONS = [
 ];
 const HEADING = /^#{2,4}\s+(.+?)\s*$/;
 const FLATTENED_BODY_MAX_NEWLINES = 2;
+// One post-image read bound, shared by the git and working-tree branches of
+// `headFileSource`: a file-count bound alone is not a byte bound.
+const MAX_SOURCE_BYTES = 16 * 1024 * 1024;
 const REPAIR_HEADINGS = [
 	"Why",
 	"Notes for the reviewer",
@@ -85,6 +92,12 @@ const SECTION_SYNONYMS = new Map([
 	["class sweep", "class sweep"],
 	["observability", "observability"],
 	["test assessment", "test assessment"],
+	// #4288: required only when the PR closes a bug-labelled issue, so it stays
+	// out of REQUIRED_SECTIONS and is added per-request in `lintPrBody`.
+	["detection", "detection"],
+	// The merge policy calls it a "detection retrospective"; accept that heading
+	// so an author following the prose is not answered with the generic message.
+	["detection retrospective", "detection"],
 ]);
 const REVIEW_HEADER_REPAIR_PREFIX =
 	"## Why\nLegacy body normalized for the required review contract.\n\n" +
@@ -101,18 +114,60 @@ function hasSection(heading, section) {
 		: heading?.section === section;
 }
 
+// Fenced (``` / ~~~) and 4-space indented code blocks are stripped, so a quoted
+// example cannot satisfy a body section (#4288 R3). An indented block cannot
+// interrupt a paragraph (CommonMark), so a 4-space line that follows body text
+// stays: list continuations and nested bullets are content, not code. The
+// closing fence must repeat the opener's character (>=3 of them).
 function sourceWithoutFencedBlocks(source) {
-	let fenced = false;
-	return String(source ?? "")
-		.split(/\r?\n/)
-		.map((line) => {
-			if (/^\s*```/.test(line)) {
-				fenced = !fenced;
-				return "";
+	const lines = String(source ?? "").split(/\r?\n/);
+	const output = [];
+	let fenceChar = null;
+	let fenceLength = 0;
+	let inIndented = false;
+	// "start" | "blank" | "heading" | "text": whether the previous emitted
+	// line can precede an indented code block.
+	let previous = "start";
+	for (const line of lines) {
+		if (fenceChar) {
+			const close = new RegExp(`^\\s*\\${fenceChar}{${fenceLength},}\\s*$`);
+			if (close.test(line)) {
+				fenceChar = null;
+				fenceLength = 0;
 			}
-			return fenced ? "" : line;
-		})
-		.join("\n");
+			output.push("");
+			continue;
+		}
+		const open = /^\s*(`{3,}|~{3,})/.exec(line);
+		if (open) {
+			fenceChar = open[1][0];
+			fenceLength = open[1].length;
+			inIndented = false;
+			output.push("");
+			previous = "blank";
+			continue;
+		}
+		if (/^(?: {4,}|\t)/.test(line)) {
+			if (
+				inIndented ||
+				previous === "start" ||
+				previous === "blank" ||
+				previous === "heading"
+			) {
+				inIndented = true;
+				output.push("");
+				continue;
+			}
+		} else {
+			inIndented = false;
+		}
+		output.push(line);
+		const trimmed = line.trim();
+		if (trimmed === "") previous = "blank";
+		else if (HEADING.test(line)) previous = "heading";
+		else previous = "text";
+	}
+	return output.join("\n");
 }
 
 function templatePlaceholderLines() {
@@ -159,8 +214,9 @@ function blankCommentsAndStrings(source) {
 	let result = "";
 	const strings = [];
 	let stringStart = -1;
+	let stringPrefixEnd = 0;
 	let previousToken = null;
-	let stringPrefix = "";
+	const prefixEnds = [];
 	// ECMAScript's lexical grammar permits a RegularExpressionLiteral where an
 	// expression starts. Classify the preceding token by whether it can end an
 	// expression; this covers expression-start keywords and punctuators without
@@ -235,8 +291,9 @@ function blankCommentsAndStrings(source) {
 					end: index + 1,
 					quote: state,
 					text: decoded(source.slice(stringStart + 1, index)),
-					prefix: stringPrefix,
+					prefix: "",
 				});
+				prefixEnds.push(stringPrefixEnd);
 				state = "code";
 				previousToken = "value";
 			}
@@ -256,7 +313,7 @@ function blankCommentsAndStrings(source) {
 		} else if (char === "'" || char === '"' || char === "`") {
 			result += " ";
 			stringStart = index;
-			stringPrefix = result.slice(-256).trimEnd();
+			stringPrefixEnd = result.length;
 			state = char;
 			previousToken = "string";
 		} else {
@@ -275,6 +332,13 @@ function blankCommentsAndStrings(source) {
 			} else if (!/\s/.test(char)) previousToken = char;
 		}
 	}
+	// The 256 blanked characters before each string's opening quote are read
+	// from the finished text: slicing `result` inside the loop flattened the
+	// whole concatenation per string, quadratic in the file (#4088).
+	strings.forEach((string, at) => {
+		const end = prefixEnds[at];
+		string.prefix = result.slice(Math.max(0, end - 256), end).trimEnd();
+	});
 	return { text: result, strings };
 }
 
@@ -314,114 +378,252 @@ function isSeamFile(file, map) {
 	return Object.keys(map?.map ?? {}).some((glob) => matchGlob(glob, file));
 }
 
-// `git diff --unified=0` hands the lexer a block comment's continuation lines
-// without the opener it needs, so prose such as `case` in a JSDoc body read as
-// a `case` label (#3774), and a backtick in one opened a template string that
-// hid the code after it. oxfmt keeps a continuation line's `*` first, so those
-// orphan lines are dropped. A whole block is dropped too, opener and closer
-// together: dropping the closer alone left an unterminated comment that hid
-// every later line (#3905 r1 F1; #3770's `catch` blocks). Text after a
-// closer, and a block that opens and closes on one line, stay for the blanker.
-// One call covers one hunk, so a block left open at a hunk's end cannot hide
-// the next hunk.
-function withoutCommentContinuations(text) {
-	let inBlock = false;
-	const kept = [];
-	for (const line of text.split("\n")) {
-		if (inBlock) {
-			const close = line.indexOf("*/");
-			if (close === -1) continue;
-			inBlock = false;
-			kept.push(line.slice(close + 2));
-		} else if (/^\s*\/\*/.test(line) && !line.includes("*/")) inBlock = true;
-		else if (/^\s*\*/.test(line)) {
-			const close = line.indexOf("*/");
-			if (close !== -1) kept.push(line.slice(close + 2));
-		} else kept.push(line);
+// `git diff --unified=0` hands a hunk to a lexer without the block-comment
+// opener its continuation lines belong to, so prose such as `case` in a JSDoc
+// body read as code, a backtick in one opened a template string that hid the
+// code after it (#3774), and a prose `recordDegradationOnce(...)` satisfied the
+// record check (#3906). The opener cannot be recovered from the hunk: the line
+// ` * name(...) {` is lexically identical as a JSDoc continuation and as a JS
+// generator head, so no line-local predicate can decide it (#3906 N1).
+//
+// The harvest therefore carries the post-image identity the diff names — the
+// `index <post>` blob oid, read back with `git cat-file -p` — where the
+// `/**` opener IS present, lexes it once with `blankCommentsAndStrings`, and
+// intersects the evidence it finds with the hunk's added POST-image lines. The
+// line numbers come from the hunk's `+start` offset and are checked against the
+// post-image text before use, so a renamed or concurrently edited image is
+// refused instead of misread (never a false clean, never a wrong
+// "no record added"). Carrying the blob oid — not re-reading the working tree —
+// is what keeps an unchanged opener outside the diff from flipping the lexical
+// state (#3906 r4 R3-A).
+
+// Git quotes a `diff --git` path that holds a non-ASCII byte, a `"`, a `\\`,
+// or a control character, and C-escapes it. A quoted runtime path must still be
+// read or the harvest silently skips the file (a false clean).
+function unquoteGitPath(raw) {
+	const value = String(raw);
+	if (!value.startsWith('"')) return value;
+	// Git C-quotes path bytes, so an octal escape is one UTF-8 byte, not a
+	// code point: collect bytes and decode the path once.
+	const bytes = [];
+	for (let index = 1; index < value.length; index += 1) {
+		const char = value[index];
+		if (char === '"') break;
+		if (char !== "\\") {
+			bytes.push(char.charCodeAt(0));
+			continue;
+		}
+		const escaped = value[++index];
+		if (escaped === "n") bytes.push(0x0a);
+		else if (escaped === "t") bytes.push(0x09);
+		else if (escaped === "r") bytes.push(0x0d);
+		else if (escaped !== undefined && /[0-7]/.test(escaped)) {
+			bytes.push(Number.parseInt(value.slice(index, index + 3), 8));
+			index += 2;
+		} else if (escaped !== undefined) bytes.push(escaped.charCodeAt(0));
 	}
-	return kept.join("\n");
+	return Buffer.from(bytes).toString("utf8");
 }
 
-function newHunk(file) {
-	return { file, lines: [], added: new Set(), text: "" };
+function readQuotedPath(source, start) {
+	if (source[start] !== '"') return null;
+	let raw = '"';
+	for (let index = start + 1; index < source.length; index += 1) {
+		const char = source[index];
+		raw += char;
+		if (char === "\\") {
+			index += 1;
+			if (index < source.length) raw += source[index];
+			continue;
+		}
+		if (char === '"') return { value: unquoteGitPath(raw), end: index + 1 };
+	}
+	return null;
 }
 
-// Records are harvested from each hunk's post-image (added plus context
-// lines), because a new call whose closing braces are unchanged context has
-// its literal split across both (#2915). Only a call whose span contains an
-// added line counts, so an untouched record in the context never passes as
-// new. The failure-path test still reads added lines alone.
-function runtimeObservabilityFromDiff(diff, seamMap) {
-	const records = new Set();
-	let runtime = false;
-	let currentRuntime = false;
-	let currentFile = "";
-	const hunks = [];
-	let hunk = null;
+// `diff --git` path pair: two quoted tokens, or `a/<pre> b/<post>`. The
+// pre-image path is kept so a rename away from a runtime path still counts.
+function gitHeaderPaths(rest) {
+	if (rest.startsWith('"')) {
+		const first = readQuotedPath(rest, 0);
+		if (!first || rest[first.end] !== " ") return null;
+		const second = readQuotedPath(rest, first.end + 1);
+		if (!second) return null;
+		return {
+			pre: first.value.replace(/^a\//, ""),
+			post: second.value.replace(/^b\//, ""),
+		};
+	}
+	const match = /^a\/(.+) b\/(.+)$/.exec(rest);
+	if (!match) return null;
+	return { pre: match[1], post: match[2] };
+}
+
+// Every file in the diff with the post-image line number of each added line and
+// the immutable post-image blob oid the diff names. A real hunk resets the
+// cursor from its `+start`; a bare fixture with no `@@` numbers its `+` lines
+// from the top. `inHunk` separates the file header (`diff --git`, `index`,
+// `rename to`, `--- a/…`, `+++ b/…`) from the hunk body: only in the header is
+// a leading `+++`/`---` a file header. Inside a hunk an added code line that
+// itself starts with `++` is emitted as `+++…` and must be harvested, not
+// skipped (#3906 R3-B), and a removed `--…` line likewise must not advance the
+// POST cursor.
+export function parseRuntimeHunks(diff) {
+	const files = [];
+	let current = null;
+	let inHunk = false;
 	for (const line of String(diff).split(/\r?\n/)) {
-		const header = /^diff --git a\/(.+) b\/(.+)$/.exec(line);
-		if (header) {
-			currentRuntime = [header[1], header[2]].some(isRuntimeObservabilityPath);
-			currentFile = header[2];
-			runtime ||= currentRuntime;
-			hunk = currentRuntime ? newHunk(currentFile) : null;
-			if (hunk) hunks.push(hunk);
+		if (line.startsWith("diff --git ")) {
+			const paths = gitHeaderPaths(line.slice("diff --git ".length));
+			current = {
+				pre: paths?.pre ?? "",
+				post: paths?.post ?? "",
+				postBlob: null,
+				postLine: 1,
+				added: new Map(),
+				deletedAfter: new Set(),
+				removed: [],
+			};
+			files.push(current);
+			inHunk = false;
 			continue;
 		}
-		if (!currentRuntime) continue;
-		if (line.startsWith("@@")) {
-			hunk = newHunk(currentFile);
-			hunks.push(hunk);
+		if (!current) continue;
+		if (!inHunk) {
+			const rename = /^rename to (.+)$/.exec(line);
+			if (rename) {
+				current.post = unquoteGitPath(rename[1]);
+				continue;
+			}
+			// `index <pre>..<post> [mode]` names the immutable post-image blob.
+			const index = /^index ([0-9a-f]+)\.\.([0-9a-f]+)/.exec(line);
+			if (index) {
+				current.postBlob = index[2];
+				continue;
+			}
+		}
+		const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+		if (hunk) {
+			current.postLine = Number(hunk[1]);
+			inHunk = true;
 			continue;
 		}
-		if (/^\+(?!\+\+)/.test(line)) {
-			hunk.text += `${line.slice(1)}\n`;
-			hunk.lines.push(line.slice(1));
-			hunk.added.add(hunk.lines.length);
-		} else if (line.startsWith(" ") || line === "") {
-			hunk.lines.push(line.slice(1));
+		if (!inHunk && (line.startsWith("+++") || line.startsWith("---"))) continue;
+		if (line.startsWith("+")) {
+			current.added.set(current.postLine, line.slice(1));
+			current.postLine += 1;
+		} else if (line.startsWith(" ")) current.postLine += 1;
+		else if (inHunk && line.startsWith("-")) {
+			// A deletion sits between post-image lines `postLine - 1` and `postLine`.
+			current.deletedAfter.add(current.postLine - 1);
+			current.removed.push(line.slice(1));
 		}
 	}
-	if (!runtime)
-		return { runtime: false, records, failurePath: false, seamBranches: [] };
-	for (const { lines, added: addedLines } of hunks) {
-		if (!addedLines.size) continue;
+	return files;
+}
+
+// Records are harvested from the post-image the diff names, because under
+// `--unified=0` a call's closing brace may be unchanged and the opener may be
+// outside the hunk (#2915, #3906). Only a call whose span contains an added
+// POST-image line counts, so an untouched record never passes as new. The
+// failure-path and seam-branch scans read the added lines alone. A file whose
+// post-image is missing, unreadable, oversize, or does not match the diff's own
+// added text is reported `indeterminate` (visibly inconclusive), never
+// classified from the ambiguous hunk.
+function runtimeObservabilityFromDiff(diff, seamMap, options = {}) {
+	const files = parseRuntimeHunks(diff);
+	const runtimeTouched = files.some(
+		(file) =>
+			isRuntimeObservabilityPath(file.post) ||
+			isRuntimeObservabilityPath(file.pre),
+	);
+	const addedRuntime = files.filter(
+		(file) =>
+			file.added.size > 0 &&
+			(isRuntimeObservabilityPath(file.post) ||
+				isRuntimeObservabilityPath(file.pre)),
+	);
+	if (!addedRuntime.length)
+		return {
+			runtime: runtimeTouched,
+			records: new Set(),
+			failurePath: false,
+			seamBranches: [],
+			indeterminate: [],
+		};
+	const records = new Set();
+	let failurePath = false;
+	const branchesByFile = new Map();
+	const indeterminate = [];
+	for (const file of addedRuntime) {
+		// The post-image is the blob the diff's `index <post>` names, never the
+		// caller's citation `ref` (a base revision for `--ref` path checks) and
+		// never a mutable working tree the diff does not mention. When the diff
+		// names no blob (a hand-built hunk), `headFileSource` falls back to the
+		// caller-supplied image, HEAD, or the working tree.
+		const source = headFileSource(file.post, {
+			headFiles: options.headFiles,
+			workingTree: options.workingTree,
+			cwd: options.cwd,
+			git: options.git,
+			postBlob: file.postBlob,
+		});
+		if (typeof source !== "string") {
+			indeterminate.push({ file: file.post, line: null });
+			continue;
+		}
+		const rows = sourceLines(source);
+		let mismatch = false;
+		for (const [postLine, text] of file.added) {
+			if (rows[postLine - 1] !== text) {
+				indeterminate.push({ file: file.post, line: postLine });
+				mismatch = true;
+				break;
+			}
+		}
+		if (mismatch) continue;
+		const blanked = blankCommentsAndStrings(source).text;
+		const blankedRows = blanked.split("\n");
 		for (const {
 			value,
 			startLine,
 			endLine,
-		} of recordLocationsFromRuntimeSource(lines.join("\n"))) {
-			for (let line = startLine; line <= endLine; line++) {
-				if (addedLines.has(line)) {
+		} of recordLocationsFromRuntimeSource(source, blanked)) {
+			for (let line = startLine; line <= endLine; line += 1) {
+				if (file.added.has(line)) {
 					records.add(value);
 					break;
 				}
 			}
 		}
-	}
-	// Each hunk lexes alone: lexer state must not leak from one hunk's added
-	// lines into the next, and a file's seam count is the sum over its hunks.
-	let failurePath = false;
-	const branchesByFile = new Map();
-	for (const { file, text } of hunks) {
-		const blanked = blankCommentsAndStrings(
-			withoutCommentContinuations(text),
-		).text;
-		failurePath ||=
-			/\bcatch\b|\brecordDegradationOnce\b|\bthrow\b|\breturn\s+null\b/.test(
-				blanked,
-			);
-		const count = isSeamFile(file, seamMap)
-			? (blanked.match(DECISION_BRANCH_G)?.length ?? 0)
-			: 0;
-		if (count)
-			branchesByFile.set(file, (branchesByFile.get(file) ?? 0) + count);
+		for (const postLine of file.added.keys()) {
+			failurePath ||=
+				/\bcatch\b|\brecordDegradationOnce\b|\bthrow\b|\breturn\s+null\b/.test(
+					blankedRows[postLine - 1] ?? "",
+				);
+		}
+		if (isSeamFile(file.post, seamMap)) {
+			let count = 0;
+			for (const postLine of file.added.keys())
+				count +=
+					(blankedRows[postLine - 1] ?? "").match(DECISION_BRANCH_G)?.length ??
+					0;
+			if (count)
+				branchesByFile.set(
+					file.post,
+					(branchesByFile.get(file.post) ?? 0) + count,
+				);
+		}
 	}
 	return {
 		runtime: true,
 		records,
 		failurePath,
-		seamBranches: [...branchesByFile].map(([file, count]) => ({ file, count })),
+		seamBranches: [...branchesByFile].map(([file, count]) => ({
+			file,
+			count,
+		})),
+		indeterminate,
 	};
 }
 
@@ -452,9 +654,13 @@ function closeParenIndex(blanked, open) {
 	return -1;
 }
 
-function recordLocationsFromRuntimeSource(source) {
+function recordLocationsFromRuntimeSource(source, blankedText) {
 	const records = [];
-	const blanked = blankCommentsAndStrings(source).text;
+	// `blankedText` is the caller's single whole-post-image lex; the fallback
+	// keeps the exported-free helper usable on its own. Line numbers index the
+	// source itself, so a record's span still maps back to the diff's added
+	// POST-image lines.
+	const blanked = blankedText ?? blankCommentsAndStrings(source).text;
 	const push = (value, valueIndex, start, end) =>
 		records.push({
 			value,
@@ -470,6 +676,9 @@ function recordLocationsFromRuntimeSource(source) {
 		["recordDegradation", ["kind"]],
 		["logExtension", ["subsystem", "message"]],
 		["logLatency", ["phase", "event", "eventName", "name"]],
+		// The pi event bus NDJSON sink is the bounded record for bus
+		// publications, including format lifecycle observations.
+		["logBusEvent", ["event", "outcome"]],
 		// #3168 F12: `logCascade` (clients/cascade-logger.ts) is a
 		// `createNdjsonLogger` sink with the same `phase` discriminator as
 		// `logLatency`, so a PR whose only new bounded record goes to
@@ -541,16 +750,40 @@ const CODE_CITATION = /`([^`\s:]+):((?:~?\d+)(?:-\d+)?)`/g;
 const MASTER_CLAIM =
 	/pre-existing|red on master|also fails on origin\/master|environment-specific/i;
 
+// One post-image read per changed runtime file, bounded by the same byte
+// ceiling on every branch: `git cat-file -p` for the diff's own blob,
+// `git show` for a ref or HEAD, and a stat-gated working-tree read. A
+// file-count bound alone is not a byte bound.
+//
+// The `index <post>` blob is the identity carried from the diff producer to
+// the reader. Reading exactly that object means an unchanged line the diff
+// never mentions (a block-comment opener) cannot flip the lexical state even
+// when the working tree has drifted from the diff's post-image (#3906 r4
+// R3-A). A named-but-unreadable blob declines (null → `indeterminate`); it
+// never falls through to a mutable source that would look authoritative.
 function headFileSource(file, options = {}) {
 	if (options.headFiles?.has?.(file)) return options.headFiles.get(file);
 	if (/(?:^|\/)\.\.(?:\/|$)/.test(file) || isAbsolute(file)) return null;
+	if (options.postBlob && !/^0+$/.test(options.postBlob)) {
+		try {
+			return String(
+				(options.git ?? gitExecFileSync)(["cat-file", "-p", options.postBlob], {
+					cwd: options.cwd ?? process.cwd(),
+					encoding: "utf8",
+					maxBuffer: MAX_SOURCE_BYTES,
+				}),
+			);
+		} catch {
+			return null;
+		}
+	}
 	if (options.ref) {
 		try {
 			return String(
 				(options.git ?? gitExecFileSync)(["show", `${options.ref}:${file}`], {
 					cwd: options.cwd ?? process.cwd(),
 					encoding: "utf8",
-					maxBuffer: 16 * 1024 * 1024,
+					maxBuffer: MAX_SOURCE_BYTES,
 				}),
 			);
 		} catch {
@@ -559,7 +792,9 @@ function headFileSource(file, options = {}) {
 	}
 	if (options.workingTree) {
 		try {
-			return readFileSync(resolve(options.cwd ?? process.cwd(), file), "utf8");
+			const path = resolve(options.cwd ?? process.cwd(), file);
+			if (statSync(path).size > MAX_SOURCE_BYTES) return null;
+			return readFileSync(path, "utf8");
 		} catch {
 			return null;
 		}
@@ -569,6 +804,7 @@ function headFileSource(file, options = {}) {
 			(options.git ?? gitExecFileSync)(["show", `HEAD:${file}`], {
 				cwd: options.cwd ?? process.cwd(),
 				encoding: "utf8",
+				maxBuffer: MAX_SOURCE_BYTES,
 			}),
 		);
 	} catch {
@@ -783,15 +1019,19 @@ function codeSpanMasked(text) {
 	);
 }
 
-function endsSentence(text, index) {
+function endsSentence(text, index, original = text) {
 	const char = text[index];
 	if (!".!?".includes(char)) return false;
 	if (char === "." && (text[index - 1] === "." || text[index + 1] === "."))
 		return false;
 	const next = text[index + 1] ?? "";
 	if (next && !/\s/.test(next)) return false;
-	const following = text.slice(index + 1).match(/\S/)?.[0];
-	return following === undefined || /[A-Z]/.test(following);
+	const remainder = original.slice(index + 1);
+	const following = remainder.match(/\S/)?.[0];
+	if (following === undefined || /[A-Z]/.test(following)) return true;
+	const afterWhitespace = remainder.replace(/^\s+/, "");
+	if (afterWhitespace.startsWith("`")) return true;
+	return /^\d/.test(afterWhitespace);
 }
 
 function splitMarkdownSentences(text) {
@@ -799,7 +1039,7 @@ function splitMarkdownSentences(text) {
 	let start = 0;
 	const masked = codeSpanMasked(text);
 	for (let index = 0; index < text.length; index += 1) {
-		if (endsSentence(masked, index)) {
+		if (endsSentence(masked, index, text)) {
 			sentences.push({ text: text.slice(start, index + 1), start });
 			start = index + 1;
 		}
@@ -813,7 +1053,7 @@ function countSentenceTerminators(lines) {
 	let count = 0;
 	const masked = codeSpanMasked(lines.join("\n").trim());
 	for (let index = 0; index < masked.length; index += 1) {
-		if (endsSentence(masked, index)) count += 1;
+		if (endsSentence(masked, index, lines.join("\n").trim())) count += 1;
 	}
 	return count;
 }
@@ -1186,9 +1426,28 @@ function lintMasterClaims(body) {
 	return errors;
 }
 
-function lintRuntimeObservability(lines, headings, diff, cwd = process.cwd()) {
-	const observation = runtimeObservabilityFromDiff(diff, loadSeamMap());
+function lintRuntimeObservability(lines, headings, diff, options = {}) {
+	const observation = runtimeObservabilityFromDiff(
+		diff,
+		loadSeamMap(),
+		options,
+	);
 	if (!observation.runtime) return [];
+	// A post-image the reader could not obtain or match leaves the added lines
+	// unclassifiable. Refuse visibly: never a false clean, never a wrong
+	// "no record added". The author can re-run with the changed files present.
+	if (observation.indeterminate.length) {
+		const shown = observation.indeterminate
+			.slice(0, 5)
+			.map(({ file, line }) => (line ? `${file}:${line}` : file));
+		const extra =
+			observation.indeterminate.length > shown.length
+				? ` (+${observation.indeterminate.length - shown.length} more)`
+				: "";
+		return [
+			`PR body Observability could not classify the added lines of ${shown.join(", ")}${extra}: the post-image is missing, could not be read, or does not match the diff, so a record or a decision branch cannot be confirmed. Re-run with the changed files present, or name the record on a line the diff adds.`,
+		];
+	}
 	const content = observabilitySectionContent(lines, headings);
 	if ([...observation.records].some((record) => content.includes(record)))
 		return [];
@@ -1213,7 +1472,7 @@ function lintRuntimeObservability(lines, headings, diff, cwd = process.cwd()) {
 		const { file, line: lineNumber } = existingRecordCitation;
 		try {
 			const source = readFileSync(
-				isAbsolute(file) ? file : resolve(cwd, file),
+				isAbsolute(file) ? file : resolve(options.cwd ?? process.cwd(), file),
 				"utf8",
 			);
 			if (
@@ -1464,6 +1723,304 @@ export function repairFlattenedBody(body = "") {
 		: `${REVIEW_HEADER_REPAIR_PREFIX}\n${repaired}`;
 }
 
+// #4288 (docs/pi-lens-merge-policy.md, "Detection retrospective on every
+// merged bug fix"): a PR that closes a bug-labelled issue states which layer
+// caught the bug, which layer should have caught it, and what gap remains.
+// The layer vocabulary is ONE exported list so the body lint, the template
+// hint, and the orchestrator's ledger copy cannot drift.
+export const DETECTION_LAYERS = Object.freeze([
+	"external user",
+	"reviewer probe",
+	"CI unit",
+	"governance sweep",
+	"smoke",
+	"nightly",
+	"dogfood",
+	"release gate",
+]);
+const DETECTION_LAYER_SET = new Set(
+	DETECTION_LAYERS.map((layer) => layer.toLowerCase()),
+);
+// "This layer caught it in time" is a valid detection lesson (issue #4288,
+// "Valid verdicts"): the gate must not demand new tests for every bug.
+const DETECTION_SHOULD_SET = new Set([...DETECTION_LAYER_SET, "this layer"]);
+
+export const DETECTION_MESSAGE =
+	'PR body "## Detection" must state the bug-detection lesson in three lines: ' +
+	'"Caught by: <layer>", "Should have been caught by: <layer|this layer>", ' +
+	'and "Gap: <issue ref> | exists: <test path> | none: <reason>". ' +
+	`Layers: ${DETECTION_LAYERS.join(", ")}. See ${TEMPLATE_PATH}.`;
+
+// A field value is found by its line prefix, never a sentence mention: a
+// prose line that merely contains "caught by" is not the field. Leading list
+// markers and bold/code emphasis are tolerated because the template sanctions
+// them; the value itself is returned raw for per-field validation.
+function detectionFieldValue(content, field) {
+	for (const raw of String(content ?? "").split(/\r?\n/)) {
+		const candidate = raw.replace(/^\s*(?:[-*+]\s+|\d+[.)]\s+)?/, "").trim();
+		const match =
+			/^(?:\*\*|__)?([A-Za-z ]+?)(?:\*\*|__)?\s*:(?:\*\*|__)?\s*(.*)$/.exec(
+				candidate,
+			);
+		if (match && match[1].trim().toLowerCase() === field)
+			return match[2].trim();
+	}
+	return null;
+}
+
+function normalizeDetectionLayer(value) {
+	return String(value ?? "")
+		.replace(/[*_`]/g, "")
+		.replace(/[\s.,;:!]+$/, "")
+		.replace(/\s+/g, " ")
+		.trim()
+		.toLowerCase();
+}
+
+// `Gap:` names a follow-up issue, an existing test that now covers the bug, or
+// a reasoned `none:`. `exists:` must name a test path (under tests/ or a test
+// extension), so "exists: TBD" is refused.
+function validDetectionGap(value) {
+	const text = String(value ?? "").trim();
+	if (/(?:^|\s|[(])#\d+\b/.test(text)) return true;
+	const exists = /^exists\s*:\s*(.+)$/i.exec(text);
+	if (exists) {
+		const testPath = exists[1].replace(/[*_`]/g, "").trim();
+		return (
+			testPath.startsWith("tests/") ||
+			/(?:^|\/)test_[^/]+$/.test(testPath) ||
+			/\.(?:test|spec)\.[cm]?[jt]sx?$/.test(testPath) ||
+			/_test\.(?:py|go|rs)$/.test(testPath)
+		);
+	}
+	const none = /^none\s*:\s*(.+)$/i.exec(text);
+	// A one-word reason ("none: oversight") is legitimate; the shape only
+	// requires a reason to be present (#4288 R5).
+	if (none) return wordCount(none[1]) >= 1;
+	return false;
+}
+
+/**
+ * #4288: the `## Detection` contract. Returns [] when the section is absent
+ * (the missing-section error stays owned by `lintPrBody`), otherwise one
+ * message when any of the three lines is missing or invalid. Parsing runs over
+ * the fenced-block-free body, so a quoted example inside a code fence never
+ * satisfies the requirement (issue #4288, "Red first").
+ */
+export function lintDetectionSection(body = "") {
+	const lines = sourceWithoutFencedBlocks(body).split(/\r?\n/);
+	const headings = [];
+	for (let index = 0; index < lines.length; index += 1) {
+		const match = HEADING.exec(lines[index]);
+		if (match)
+			headings.push({
+				index,
+				level: match[0].match(/^#+/)[0].length,
+				section: SECTION_SYNONYMS.get(match[1].trim().toLowerCase()),
+			});
+	}
+	const heading = headings.find((candidate) =>
+		hasSection(candidate, "detection"),
+	);
+	if (!heading) return [];
+	const nextHeading = headings.find(
+		(candidate) =>
+			candidate.index > heading.index && candidate.level <= heading.level,
+	);
+	const content = lines
+		.slice(heading.index + 1, nextHeading?.index ?? lines.length)
+		.join("\n");
+	const caughtBy = detectionFieldValue(content, "caught by");
+	const shouldBy = detectionFieldValue(content, "should have been caught by");
+	const gap = detectionFieldValue(content, "gap");
+	if (
+		caughtBy === null ||
+		!DETECTION_LAYER_SET.has(normalizeDetectionLayer(caughtBy))
+	)
+		return [DETECTION_MESSAGE];
+	if (
+		shouldBy === null ||
+		!DETECTION_SHOULD_SET.has(normalizeDetectionLayer(shouldBy))
+	)
+		return [DETECTION_MESSAGE];
+	if (gap === null || !validDetectionGap(gap)) return [DETECTION_MESSAGE];
+	return [];
+}
+
+const CLASS_SWEEP_MESSAGE =
+	'PR body "## Class sweep" must name the defect shape (Shape:, Defect shape:, ' +
+	"Defect class:, or Class:), quote the search command that defines its " +
+	"population (rg, grep, git grep, ugrep, ast-grep run, or sg run), and give " +
+	'a per-member or fold/stay verdict, or say "none: <reason>" (three words ' +
+	"minimum; refused when the diff changes runtime code). " +
+	`See ${TEMPLATE_PATH}.`;
+
+// #4273: the shape label, with optional bold or code emphasis. AGENTS.md
+// numbers its defect shapes and PR prose cites them as `Defect shape 25` (no
+// colon); the repository also writes `Defect class:` and `Class:` for the same
+// concept, so the label is a synonym set rather than one literal (#4273 F2).
+const CLASS_SWEEP_SHAPE_LABEL =
+	/(?:\*\*|__|`)?\b(?:defect\s+shape|defect\s+class|shape|class)\b(?:\s*\d+)?(?:\*\*|__|`)*\s*:/i;
+const CLASS_SWEEP_SHAPE_CITATION =
+	/(?:\*\*|__|`)?\b(?:defect\s+shape|defect\s+class)\b\s*\d+\b/i;
+
+// The accepted search commands, longest first so `ugrep` beats `grep` and
+// `git grep` beats a bare `grep` (#4273 F2/D).
+const CLASS_SWEEP_SEARCH_TOOL =
+	"git\\s+grep|ast-grep\\s+run|sg\\s+run|ugrep|grep|rg";
+
+// A search command counts when it is quoted in a code span or a fenced block,
+// or when it is written as an invocation (a flag or a path-like operand).
+function classSweepSearchCommand(text) {
+	const source = String(text ?? "");
+	const quoted = [
+		...source.matchAll(/`+[^`]*`+/g),
+		...source.matchAll(
+			/^[ \t]*(?:```|~~~)[^\n]*\n([\s\S]*?)^[ \t]*(?:```|~~~)[ \t]*$/gm,
+		),
+	].map((match) => match[1] ?? match[0]);
+	const search = new RegExp(
+		`(?:^|\\W)(?:${CLASS_SWEEP_SEARCH_TOOL})(?:\\W|$)`,
+		"i",
+	);
+	if (quoted.some((value) => search.test(value))) return true;
+	const invocation = new RegExp(
+		`(?:${CLASS_SWEEP_SEARCH_TOOL})\\s+(?:--?[a-z]|['"\`]|\\S*[./*])`,
+		"i",
+	);
+	return source.split(/\r?\n/).some((line) => invocation.test(line));
+}
+
+// The per-member line prefixes the template sanctions: a bullet, a numbered
+// item, or a markdown table row (#4273 F1).
+const CLASS_SWEEP_MEMBER_LINE = /^\s*(?:[-*+]|\d+\.)\s+\S/;
+const CLASS_SWEEP_TABLE_ROW = /^\s*\|.*\|\s*$/;
+
+// A verdict is a fold/stay statement, or a per-member line whose outcome is
+// observable (an arrow target or a coverage note). The bare word "admitted"
+// is deliberately not a verdict: PR #4248 used it while enumerating changed
+// files. `unaffected` is excluded because `TLA+ unaffected: <family>` is a
+// different governance statement (#4273 F3).
+function classSweepVerdict(text) {
+	const source = String(text ?? "");
+	if (
+		/\b(?:fold|folds|folded|folding|consolidat\w*|verdict|widen\w*)\b/i.test(
+			source,
+		) ||
+		/\b(?:stays?|stayed|staying)\b/i.test(source)
+	)
+		return true;
+	const outcome =
+		/(?:→|->|=>|\bcovered\b|\buncovered\b|\bnot a member\b|\bnot a runtime\b|\bno member\b|\bexcluded\b|\bout of scope\b|\bin scope\b|\bclean\b|\bsame target\b|\bnot found\b)/i;
+	return source.split(/\r?\n/).some((line) => {
+		const perMember =
+			CLASS_SWEEP_MEMBER_LINE.test(line) || CLASS_SWEEP_TABLE_ROW.test(line);
+		return perMember && outcome.test(line);
+	});
+}
+
+function classSweepShape(text) {
+	const source = String(text ?? "");
+	return (
+		CLASS_SWEEP_SHAPE_LABEL.test(source) ||
+		CLASS_SWEEP_SHAPE_CITATION.test(source)
+	);
+}
+
+// package.json's `files` is the shipped surface (AGENTS.md, "Build, packaging,
+// and release"); only its `scripts/**/*.mjs` entries are runtime for the
+// `none:` escape. Governance scripts such as this one are not shipped, so a
+// diff that edits only them may still say `none:` (#4273 F3). Derived from
+// package.json so the list cannot drift, cached because it is per-process
+// constant.
+let shippedRuntimeScriptsCache;
+function shippedRuntimeScripts() {
+	if (shippedRuntimeScriptsCache) return shippedRuntimeScriptsCache;
+	const paths = new Set();
+	try {
+		const pkg = JSON.parse(
+			readFileSync(resolve(REPO_ROOT, "package.json"), "utf8"),
+		);
+		for (const entry of pkg.files ?? [])
+			if (/^scripts\/.*\.mjs$/.test(entry)) paths.add(entry);
+	} catch {
+		// An unreadable package.json cannot widen the runtime scope; the
+		// `none:` reason check still applies.
+	}
+	shippedRuntimeScriptsCache = paths;
+	return paths;
+}
+
+// #4273 F3: a `none:` escape is refused when the diff changes runtime code,
+// because a runtime diff with no named shape is almost always an unfound
+// population. Runtime scope is `clients/**`, `index.ts`, and the `scripts/`
+// modules package.json ships.
+function classSweepRuntimeTouched(diff) {
+	const shipped = shippedRuntimeScripts();
+	return parseChangedFiles(diff).some(
+		(file) =>
+			file === "index.ts" || file.startsWith("clients/") || shipped.has(file),
+	);
+}
+
+function wordCount(text) {
+	return text.trim().split(/\s+/).filter(Boolean).length;
+}
+
+/**
+ * #4273: a `## Class sweep` must take one of two forms. It names the defect
+ * shape, quotes the search that defines its population, and gives a verdict
+ * per member or a fold/stay verdict; or it says `none: <reason>` for a diff
+ * with no shape. A section that only enumerates the files this PR changed is
+ * a change list, not a tree-wide sweep, and is refused (PR #4248: its shape
+ * population went unfound until #4268). The missing-section and empty-section
+ * cases stay owned by `lintPrBody`, so this returns nothing for them.
+ *
+ * `none:` is bounded (#4273 F3): it needs a reason of at least three words,
+ * and it is refused when the diff changes runtime code. Without a diff (a
+ * local caller with no upstream ref) only the reason check applies.
+ */
+export function lintClassSweep(body = "", { diff } = {}) {
+	const rawLines = String(body ?? "").split(/\r?\n/);
+	const lines = sourceWithoutFencedBlocks(body).split(/\r?\n/);
+	const headings = [];
+	for (let index = 0; index < lines.length; index += 1) {
+		const match = HEADING.exec(lines[index]);
+		if (match)
+			headings.push({
+				index,
+				level: match[0].match(/^#+/)[0].length,
+				section: SECTION_SYNONYMS.get(match[1].trim().toLowerCase()),
+			});
+	}
+	const heading = headings.find((candidate) =>
+		hasSection(candidate, "class sweep"),
+	);
+	if (!heading) return [];
+	const nextHeading = headings.find(
+		(candidate) =>
+			candidate.index > heading.index && candidate.level <= heading.level,
+	);
+	const content = rawLines
+		.slice(heading.index + 1, nextHeading?.index ?? lines.length)
+		.join("\n")
+		.trim();
+	if (!content) return [];
+	const none = /^\s*none\s*:\s*(.+?)\s*$/im.exec(content);
+	if (none) {
+		if (wordCount(none[1]) < 3) return [CLASS_SWEEP_MESSAGE];
+		if (diff && classSweepRuntimeTouched(diff)) return [CLASS_SWEEP_MESSAGE];
+		return [];
+	}
+	if (
+		classSweepShape(content) &&
+		classSweepSearchCommand(content) &&
+		classSweepVerdict(content)
+	)
+		return [];
+	return [CLASS_SWEEP_MESSAGE];
+}
+
 /** Check the structural PR-body contract, including answered sections. */
 export function lintPrBody(body = "", options = {}) {
 	const rawLines = String(body ?? "").split(/\r?\n/);
@@ -1512,18 +2069,13 @@ export function lintPrBody(body = "", options = {}) {
 	// requires the new header trio; keeping that switch explicit avoids changing
 	// the meaning of lower-level parser tests.
 	const requiredSections = options.workingTree
-		? options.requireTestAssessment
-			? [...REQUIRED_SECTIONS, "Test assessment"]
-			: REQUIRED_SECTIONS
-		: options.requireTestAssessment
-			? [
-					"Tests",
-					"Blast radius",
-					"Class sweep",
-					"Observability",
-					"Test assessment",
-				]
-			: ["Tests", "Blast radius", "Class sweep", "Observability"];
+		? [...REQUIRED_SECTIONS]
+		: ["Tests", "Blast radius", "Class sweep", "Observability"];
+	if (options.requireTestAssessment) requiredSections.push("Test assessment");
+	// #4288: only a bug-closing PR owes the detection retrospective. The
+	// tri-state resolution lives at the callers; `true` is the only value that
+	// requires the section, so an unreadable label never blocks.
+	if (options.bugClosing) requiredSections.push("Detection");
 
 	for (const name of requiredSections) {
 		const heading = headings.find((candidate) =>
@@ -1557,14 +2109,23 @@ export function lintPrBody(body = "", options = {}) {
 					".",
 			);
 	}
+	if (options.bugClosing) errors.push(...lintDetectionSection(body));
 	if (options.diff)
 		errors.push(
-			...lintRuntimeObservability(lines, headings, options.diff, options.cwd),
+			...lintRuntimeObservability(lines, headings, options.diff, options),
 		);
 	errors.push(...lintCodeCitations(body, options));
 	errors.push(...lintTestReferences(body, options));
 	errors.push(...lintMasterClaims(body));
 	errors.push(...lintShellExpansionGarble(body));
+	const prose = checkProse(proseSections(body), {
+		// Historical structural fixtures call lintPrBody without workingTree.
+		// Keep those calls advisory; local and event gates set workingTree and block.
+		mode: options.proseMode ?? (options.workingTree ? "block" : "warn"),
+	});
+	errors.push(...prose.errors.map((error) => `PR body prose ${error}`));
+	for (const warning of prose.warnings)
+		console.warn(`PR body prose warning: ${warning}`);
 	return { valid: errors.length === 0, errors };
 }
 
@@ -1676,6 +2237,51 @@ export async function resolveTouchesTests(
 	}
 }
 
+/**
+ * #4288: does the PR close an issue carrying the `bug` label? Returns `true`
+ * (some closed issue is bug-labelled), `false` (no closed issue is), or `null`
+ * when the label cannot be read (no API credentials, a non-2xx, or a malformed
+ * body). A `null` never blocks the lint: the callers warn and skip the
+ * `## Detection` requirement rather than demanding a section they cannot
+ * justify (issue #4288, "Detecting the bug label").
+ */
+export async function resolveBugClosing(body, fetchImpl = globalThis.fetch) {
+	const issues = parseCloseKeywords(body).issues;
+	if (issues.length === 0) return false;
+	const token = process.env.GITHUB_TOKEN;
+	const apiUrl = process.env.GITHUB_API_URL;
+	const repository = process.env.GITHUB_REPOSITORY;
+	if (!token || !apiUrl || !repository) return null;
+	for (const number of issues) {
+		let data;
+		try {
+			const response = await fetchImpl(
+				`${apiUrl}/repos/${repository}/issues/${number}`,
+				{
+					signal: AbortSignal.timeout(10_000),
+					headers: {
+						Accept: "application/vnd.github+json",
+						Authorization: `Bearer ${token}`,
+						"X-GitHub-Api-Version": "2022-11-28",
+					},
+				},
+			);
+			if (!response.ok) return null;
+			data = await response.json();
+		} catch {
+			return null;
+		}
+		const labels = Array.isArray(data?.labels) ? data.labels : [];
+		if (
+			labels.some(
+				(label) => (typeof label === "string" ? label : label?.name) === "bug",
+			)
+		)
+			return true;
+	}
+	return false;
+}
+
 function eventPayload() {
 	const eventPath = process.env.GITHUB_EVENT_PATH;
 	if (!eventPath) throw new Error("GITHUB_EVENT_PATH is required");
@@ -1706,6 +2312,7 @@ function eventPayload() {
 export async function lintPullRequestEvent(
 	fetchImpl = globalThis.fetch,
 	event = eventPayload(),
+	diffImpl = localDiff,
 ) {
 	const pullRequest = event.pull_request;
 	if (!pullRequest || !process.env.GITHUB_REPOSITORY)
@@ -1713,9 +2320,21 @@ export async function lintPullRequestEvent(
 	const { body, normalized } = await resolveLivePrBody(pullRequest, fetchImpl);
 	const requireTestAssessment =
 		(await resolveTouchesTests(pullRequest, fetchImpl)) === true;
+	// #4288: a bug-closing PR owes a detection retrospective. The label read is
+	// best-effort; an unreadable label warns and skips the requirement.
+	let bugClosing = null;
+	try {
+		bugClosing = await resolveBugClosing(body, fetchImpl);
+	} catch {
+		bugClosing = null;
+	}
+	if (bugClosing === null && parseCloseKeywords(body).issues.length > 0)
+		console.warn(
+			'::warning::PR body check could not read the closed issue label(s), so the "## Detection" section is not required (#4288).',
+		);
 	let diff = "";
 	try {
-		diff = localDiff();
+		diff = diffImpl();
 	} catch (error) {
 		if (process.env.GITHUB_ACTIONS) {
 			const reason = error instanceof Error ? error.message : String(error);
@@ -1726,14 +2345,26 @@ export async function lintPullRequestEvent(
 	}
 	const result = lintPrBody(body, {
 		requireTestAssessment,
+		bugClosing: bugClosing === true,
 		diff,
 		workingTree: true,
+		// Existing open bodies were authored before #4280. Set PI_LENS_PROSE_GRACE=1
+		// for the transition job; local preflight remains blocking by default.
+		proseMode: process.env.PI_LENS_PROSE_GRACE === "1" ? "warn" : "block",
 	});
+	const classSweep = lintClassSweep(body, { diff });
+	if (classSweep.length) {
+		result.valid = false;
+		result.errors.push(...classSweep);
+	}
 	const coverage = lintTlaCoverage(body, { diff });
 	result.errors.push(...coverage.errors);
 	if (coverage.errors.length) result.valid = false;
 	for (const advisory of coverage.advisories)
 		console.warn(`::notice::${advisory}`);
+	const workflowEvidence = lintWorkflowRunEvidence(body, { diff });
+	result.errors.push(...workflowEvidence);
+	if (workflowEvidence.length) result.valid = false;
 	if (result.valid) {
 		console.log(`PR body OK: ${pullRequest.number}`);
 		return { valid: true, repaired: normalized };
@@ -1758,7 +2389,10 @@ export function localDiff(cwd = process.cwd(), git = gitExecFileSync) {
  * rows stay advisory. The map logic is dependency-free because this script
  * runs with no `npm install` in the PR-body lane.
  */
-export function lintTlaCoverage(body, { diff, cwd = REPO_ROOT } = {}) {
+export function lintTlaCoverage(
+	body,
+	{ diff, cwd = REPO_ROOT, sourceCwd, headFiles, git } = {},
+) {
 	if (!diff) return { errors: [], advisories: [] };
 	let map;
 	try {
@@ -1771,11 +2405,115 @@ export function lintTlaCoverage(body, { diff, cwd = REPO_ROOT } = {}) {
 			advisories: [],
 		};
 	}
-	return evaluateTlaCoverage({
+	const anchors = hookAnchorsFromDiff(diff, map, {
+		cwd: sourceCwd,
+		headFiles,
+		git,
+	});
+	const result = evaluateTlaCoverage({
 		map,
 		changedFiles: parseChangedFiles(diff),
+		changedAnchors: anchors.fired,
 		body,
 	});
+	return {
+		errors: result.errors,
+		advisories: [...result.advisories, ...anchors.notes].sort(),
+	};
+}
+
+/**
+ * The `<file>#<hook>` anchors an anchored map row (index.ts, #3878) sees
+ * changed. `git diff --unified=0` carries no hook name for a hunk inside a
+ * handler, so the hunk's post-image lines are placed against the handler ranges
+ * of the post-image the diff names. A post-image that is unreadable or does not
+ * carry the diff's added lines cannot place a hunk: every hook of that file
+ * counts as changed (the any-of declaration still satisfies it) and one note
+ * says so, never a silent pass.
+ */
+function hookAnchorsFromDiff(diff, map, options) {
+	const fired = [];
+	const notes = [];
+	const rows = Object.entries(map?.map ?? {}).filter(
+		([, row]) => row && typeof row === "object" && !Array.isArray(row),
+	);
+	if (!rows.length) return { fired, notes };
+	for (const file of parseRuntimeHunks(diff)) {
+		const row = rows.find(([glob]) => matchGlob(glob, file.post))?.[1];
+		if (!row?.anchors) continue;
+		const names = Object.keys(row.anchors);
+		const source = headFileSource(file.post, {
+			headFiles: options.headFiles,
+			workingTree: true,
+			cwd: options.cwd,
+			git: options.git,
+			postBlob: file.postBlob,
+		});
+		const hooks =
+			typeof source === "string"
+				? changedHookAnchors(source, file, names)
+				: null;
+		if (hooks === null)
+			notes.push(
+				`TLA+ note: the post-image of ${file.post} could not be read against the diff, so every lifecycle hook counts as changed.`,
+			);
+		for (const hook of hooks ?? names) fired.push(`${file.post}#${hook}`);
+	}
+	return { fired, notes };
+}
+
+/**
+ * #3085 gap 1: a PR that edits a workflow no pull request executes must quote
+ * the branch run (`gh workflow run <file> --ref <branch>`) with its run id.
+ * The post-image is read from the checkout the lint runs in, which is the PR's
+ * own head tree in CI and the working tree locally; `cwd` defaults to the
+ * directory `localDiff` diffs, so the diff and the post-image agree. The
+ * merge-base image lets the rule verify a comment-only edit.
+ */
+export function lintWorkflowRunEvidence(
+	body,
+	{ diff, cwd = process.cwd() } = {},
+) {
+	if (!diff) return [];
+	const unreadable = [];
+	// The merge base is what `localDiff` diffs from; no base image (an added
+	// file, a shallow checkout) reads as "not a comment-only edit".
+	let mergeBase = null;
+	try {
+		mergeBase = gitExecFileSync(["merge-base", "origin/master", "HEAD"], {
+			cwd,
+			encoding: "utf8",
+		}).trim();
+	} catch {
+		mergeBase = null;
+	}
+	const errors = evaluateWorkflowRunEvidence({
+		changedFiles: parseChangedFiles(diff),
+		body,
+		readBaseWorkflow: (file) => {
+			if (!mergeBase) return null;
+			try {
+				return gitExecFileSync(["show", `${mergeBase}:${file}`], {
+					cwd,
+					encoding: "utf8",
+				});
+			} catch {
+				return null;
+			}
+		},
+		readWorkflow: (file) => {
+			try {
+				return readFileSync(resolve(cwd, file), "utf8");
+			} catch (error) {
+				if (error?.code === "ENOENT") return null;
+				unreadable.push(
+					`Changed workflow ${file} could not be read to judge whether a pull request runs it: ${error instanceof Error ? error.message : String(error)}`,
+				);
+				return null;
+			}
+		},
+	});
+	return [...errors, ...unreadable];
 }
 
 export function localTouchesTests(cwd = process.cwd(), git = gitExecFileSync) {
@@ -1815,17 +2553,47 @@ export function lintLocalPrBody(
 		// upstream ref, retain structural lint rather than inventing scope.
 		diff = "";
 	}
+	// #4288: the local preflight is offline. An injected resolver (tests) or an
+	// explicit tri-state wins; otherwise the label is unknown and a body that
+	// closes an issue warns instead of demanding a Detection section it cannot
+	// justify.
+	let bugClosing = options.bugClosing;
+	if (bugClosing === undefined)
+		bugClosing =
+			typeof options.resolveBugClosing === "function"
+				? options.resolveBugClosing(body)
+				: null;
+	if (bugClosing === null && parseCloseKeywords(body).issues.length > 0)
+		console.warn(
+			'::warning::PR body check could not read the closed issue label offline, so the "## Detection" section is not required (#4288).',
+		);
 	const result = lintPrBody(body, {
 		requireTestAssessment: localTouchesTests(cwd, git),
+		bugClosing: bugClosing === true,
 		diff,
 		cwd,
 		workingTree: true,
 		ref: options.ref,
+		headFiles: options.headFiles,
+		proseMode: options.proseMode,
 	});
-	const coverage = lintTlaCoverage(body, { diff });
+	const classSweep = lintClassSweep(body, { diff });
+	if (classSweep.length) {
+		result.valid = false;
+		result.errors.push(...classSweep);
+	}
+	const coverage = lintTlaCoverage(body, {
+		diff,
+		sourceCwd: cwd,
+		headFiles: options.headFiles,
+		git,
+	});
 	result.errors.push(...coverage.errors);
 	if (coverage.errors.length) result.valid = false;
 	for (const advisory of coverage.advisories) console.warn(advisory);
+	const workflowEvidence = lintWorkflowRunEvidence(body, { diff, cwd });
+	result.errors.push(...workflowEvidence);
+	if (workflowEvidence.length) result.valid = false;
 	const closeSyntax = lintCloseKeywords(body);
 	if (!closeSyntax.valid) {
 		result.valid = false;
@@ -1852,6 +2620,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
 	const refIndex = process.argv.indexOf("--ref");
 	const title = titleIndex === -1 ? "" : process.argv[titleIndex + 1];
 	const ref = refIndex === -1 ? undefined : process.argv[refIndex + 1];
+	const proseMode = process.argv.includes("--prose-grace") ? "warn" : "block";
 	if (titleIndex !== -1 && !title) throw new Error("--title requires text");
 	if (refIndex !== -1 && !ref) throw new Error("--ref requires a revision");
 	if (bodyIndex !== -1) {
@@ -1863,7 +2632,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
 			readFileSync(bodyPath, "utf8"),
 			process.cwd(),
 			gitExecFileSync,
-			{ title, ref },
+			{ title, ref, proseMode },
 		);
 		for (const error of result.errors) console.error(error);
 		process.exitCode = result.valid ? 0 : 1;
@@ -1874,7 +2643,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
 			readFileSync(bodyPath, "utf8"),
 			process.cwd(),
 			gitExecFileSync,
-			{ title, ref },
+			{ title, ref, proseMode },
 		);
 		for (const error of result.errors) console.error(error);
 		process.exitCode = result.valid ? 0 : 1;

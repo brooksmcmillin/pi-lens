@@ -227,6 +227,18 @@ function adoptCanonicalCasing(held: string, canonical: string): string {
  * Always converts backslashes to forward slashes for consistent Map keys.
  */
 export function normalizeFilePath(filePath: string): string {
+	if (process.platform === "win32") {
+		// Relative values and the empty sentinel are not filesystem identities.
+		// In particular, win32.resolve() would silently anchor them to the
+		// process cwd, which makes a path-only key depend on the runner's drive
+		// (#2490). Keep this guard inside the Windows arm so POSIX relative
+		// inputs still receive their realpath/casing treatment.
+		if (filePath === "") return "";
+		if (!isFullyQualifiedWin32(filePath)) {
+			return win32.normalize(filePath).replace(/\\/g, "/");
+		}
+	}
+
 	// Convert backslashes to forward slashes first
 	const normalized = filePath.replace(/\\/g, "/");
 
@@ -462,10 +474,27 @@ export function toProjectRelativePath(
 ): string {
 	const p = isWindowsPath(filePath) ? win32 : path;
 	if (!p.isAbsolute(filePath)) return filePath.replace(/\\/g, "/");
-	const relative = p.relative(p.resolve(projectRoot), filePath);
-	return relative && !relative.startsWith("..") && !p.isAbsolute(relative)
-		? relative.replace(/\\/g, "/")
-		: filePath.replace(/\\/g, "/");
+	const inside = (root: string, file: string): string | undefined => {
+		const relative = p.relative(p.resolve(root), file);
+		return relative &&
+			relative !== ".." &&
+			!relative.startsWith(`..${p.sep}`) &&
+			!p.isAbsolute(relative)
+			? relative.replace(/\\/g, "/")
+			: undefined;
+	};
+	const direct = inside(projectRoot, filePath);
+	if (direct !== undefined) return direct;
+	// #4101: a canonical key (`normalizeMapKey`: realpath on win32, so 8.3 names,
+	// junctions and subst drives are expanded) set against a root the caller
+	// spelled differently. Canonicalize both sides before giving up; a file
+	// that really is outside the root stays outside.
+	const canonical = inside(
+		normalizeFilePath(projectRoot),
+		normalizeFilePath(filePath),
+	);
+	if (canonical !== undefined) return canonical;
+	return filePath.replace(/\\/g, "/");
 }
 
 /**
@@ -862,13 +891,31 @@ export function isUnderDir(child: string, parent: string): boolean {
 	return normChild === normParent || normChild.startsWith(parentPrefix);
 }
 
+/** True when a path is outside the session's project root. */
+export function isOutsideProjectRoot(
+	filePath: string,
+	projectRoot: string,
+): boolean {
+	return !isUnderDir(filePath, projectRoot);
+}
+
 const VENDOR_DIR_NAMES = new Set([
 	"node_modules",
 	"vendor",
 	"vendors",
 	"third_party",
 	"third-party",
+	".venv",
+	"site-packages",
+	"bower_components",
 ]);
+
+/** True when any path segment names an installed or vendored dependency tree. */
+export function isVendorPath(filePath: string): boolean {
+	return normalizeFilePath(filePath)
+		.split("/")
+		.some((segment) => VENDOR_DIR_NAMES.has(segment.toLowerCase()));
+}
 
 /**
  * Returns true when a file should be treated as external/vendor and excluded
@@ -882,13 +929,8 @@ export function isExternalOrVendorFile(
 	filePath: string,
 	projectRoot: string,
 ): boolean {
-	if (!isUnderDir(filePath, projectRoot)) return true;
-	const normalized = normalizeFilePath(filePath);
-	const rootNorm = normalizeFilePath(projectRoot);
-	const rel = normalized.startsWith(rootNorm + "/")
-		? normalized.slice(rootNorm.length + 1)
-		: normalized;
-	return rel.split("/").some((seg) => VENDOR_DIR_NAMES.has(seg));
+	if (isOutsideProjectRoot(filePath, projectRoot)) return true;
+	return isVendorPath(filePath);
 }
 
 /**

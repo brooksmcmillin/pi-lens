@@ -126,6 +126,11 @@ migrate-*.js
 !docs/api-ports-inventory.md
 !docs/astplayground.md
 !docs/public-api-stability.md
+# #3654: the io-bridge migration guide is a referenced deliverable, and the
+# RFC ships as this lane's design record. Negations (not `git add -f`) so the
+# diff stays reviewable and the files are ordinary tracked docs.
+!docs/io-bridge-v2-migration.md
+!docs/rfcs/*.md
 !docs/configuration.md
 !docs/release-qa-baseline.md
 
@@ -170,6 +175,9 @@ BUG_*.md
 # but shadowed by the global *.js ignore above (#2250 sweep).
 !tests/fixtures/call-graph/**
 !tests/fixtures/function-facts/**
+# grammar-health corpus (#4012) — one real multi-construct file per grammar;
+# un-ignored so javascript.js is not hidden by the global *.js ignore above.
+!tests/fixtures/grammar-health/**
 
 clients/dispatch/debug.log
 clients/lsp/.intelephense/

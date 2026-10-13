@@ -34,6 +34,11 @@ import { basename, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { isAdvisoryCheck } from "../../scripts/lib/ci-checks.mjs";
 import {
+	classifyWorkflowEdit,
+	evaluateWorkflowRunEvidence,
+	readWorkflowTriggers,
+} from "../../scripts/lib/workflow-run-evidence.mjs";
+import {
 	assertSortedRegistry,
 	auditRegistry,
 	listSourceFiles,
@@ -227,6 +232,8 @@ const EXEMPTIONS: Readonly<Record<string, string>> = {
 		"workflow_run-triggered terminal-label swap, same lane and same reason as classify above; its if: is evaluated pre-merge in tests/config/ci-infra-kill-rerun-gate.test.ts",
 	".github/workflows/close-keyword-verification.yml::verify":
 		"pull_request_target gated on github.event.pull_request.merged == true: it verifies what the close keywords DID once the PR is merged, which cannot be observed before the merge",
+	".github/workflows/install-smoke.yml::host-latest-notify":
+		"the tracking-issue writer for the advisory nightly drift lane above (#4077): it files, refreshes or closes one issue from that lane's outcomes, scoped to the schedule or master, so a pull request has no drift to report and must not write the issue",
 	".github/workflows/install-smoke.yml::host-latest-smoke":
 		"advisory nightly drift lane: it installs the newest published host to detect upstream drift on a schedule, a signal about the ecosystem's state at a point in time rather than about the PR's diff (#2613)",
 };
@@ -1061,5 +1068,165 @@ describe("matrix-level evasion is the same unreachability (#3085)", () => {
 		expect(findPullRequestUnreachableJobs([file]).flagged).toEqual([
 			".github/workflows/fixture.yml::split",
 		]);
+	});
+});
+
+// #3085 gap 1: the sweep above judges the JOBS of workflows a pull request can
+// trigger, so a workflow file with no `pull_request` trigger is invisible to it
+// (jobsExamined stays 0 over it). The file-level rule lives in
+// scripts/check-pr-body.mjs (an edit must quote a `gh workflow run` id); this
+// block drives it over the real tree and a fixture, and pins its
+// dependency-free `on:` reader against js-yaml, because the PR-body lane has no
+// `npm install`.
+//
+// Net-count verdict: the support helper `triggersOnPullRequest` stays (it needs
+// full YAML for `if:`/matrix and counts pull_request_target on purpose, since
+// the sweep asks whether a PR event can run the job); the new reader answers a
+// different question (does the EDITED post-image run on the PR) with no
+// dependencies, so folding either into the other relocates lines rather than
+// concentrating them. The parity case below is what stops them drifting.
+describe("workflow files no pull request executes (#3085 gap 1)", () => {
+	const files = repoWorkflowFiles();
+
+	it("reads every workflow's triggers exactly as js-yaml does", () => {
+		for (const file of files) {
+			const expected = loadWorkflow(file.text).on;
+			const expectedNames = Array.isArray(expected)
+				? expected.map(String)
+				: typeof expected === "string"
+					? [expected]
+					: Object.keys((expected ?? {}) as Record<string, unknown>);
+			const triggers = readWorkflowTriggers(file.text);
+			expect(triggers, file.path).not.toBeNull();
+			expect([...(triggers?.keys() ?? [])].sort(), file.path).toEqual(
+				expectedNames.sort(),
+			);
+			const pr = (expected as Record<string, Record<string, unknown> | null>)
+				?.pull_request;
+			if (pr && typeof pr === "object") {
+				const read = triggers?.get("pull_request");
+				expect(read?.paths, file.path).toEqual(pr.paths);
+				expect(read?.types, file.path).toEqual(pr.types);
+				expect(read?.unparsed, file.path).toBeUndefined();
+			}
+		}
+	});
+
+	// Recurrence: PR #4020 round 1 read `pull_request: *pr` as an empty trigger
+	// (a `types: [closed]` workflow avoided the rule). Every alias form the
+	// reader resolves must equal js-yaml's reading; the form it cannot resolve
+	// (a merge key) must fail closed (null) while js-yaml sees the merged keys.
+	const aliasForms: Array<[string, string]> = [
+		[
+			"a mapping alias",
+			"on:\n  defaults: &pr\n    types: [closed]\n  pull_request: *pr\njobs: {}\n",
+		],
+		[
+			"a block-sequence alias",
+			"on:\n  push:\n    paths: &p\n      - 'a/**'\n  pull_request:\n    paths: *p\njobs: {}\n",
+		],
+		[
+			"a flow-sequence alias",
+			"on:\n  workflow_run:\n    types: &t [closed]\n  pull_request:\n    types: *t\njobs: {}\n",
+		],
+	];
+	it.each(aliasForms)("reads %s exactly as js-yaml does", (_name, text) => {
+		const expected = loadWorkflow(text).on as Record<
+			string,
+			Record<string, unknown>
+		>;
+		const triggers = readWorkflowTriggers(text);
+		expect([...(triggers?.keys() ?? [])].sort()).toEqual(
+			Object.keys(expected).sort(),
+		);
+		const pr = triggers?.get("pull_request");
+		expect(pr?.paths).toEqual(expected.pull_request.paths);
+		expect(pr?.types).toEqual(expected.pull_request.types);
+	});
+	it("fails closed on a merge key whose filters js-yaml carries under `<<`", () => {
+		const text =
+			"on:\n  base: &b\n    types: [closed]\n  pull_request:\n    <<: *b\njobs: {}\n";
+		// js-yaml 5 keeps `<<` as a literal key holding the aliased mapping; a
+		// merge-aware parser lifts `types` into the trigger. Either way the
+		// closed-only filter exists and the reader must not read it as empty.
+		expect(
+			JSON.stringify(
+				(loadWorkflow(text).on as Record<string, unknown>).pull_request,
+			),
+		).toContain("closed");
+		expect(readWorkflowTriggers(text)).toBeNull();
+		expect(classifyWorkflowEdit(text, ".github/workflows/x.yml")).toMatchObject(
+			{ executes: false },
+		);
+	});
+
+	it("classifies the real tree into PR-executed and not, with the known members on each side", () => {
+		const notExecuting = files
+			.filter((file) => !classifyWorkflowEdit(file.text, file.path).executes)
+			.map((file) => basename(file.path));
+		const executing = files
+			.filter((file) => classifyWorkflowEdit(file.text, file.path).executes)
+			.map((file) => basename(file.path));
+		// Measured 2026-10-07 on 20 files: 6 execute on a PR (ci-infra-kill-rerun,
+		// ci, install-smoke, lint, osv-scan, pr-metadata); 14 do not (12 with no
+		// pull_request trigger, 2 pull_request_target only). Floors, not an exact
+		// registry: a registry of every no-PR workflow is what the issue refused
+		// to build, and a narrowed walk or a reader that stops seeing triggers
+		// must still red (AGENTS.md shape 10).
+		expect(notExecuting.length).toBeGreaterThanOrEqual(14);
+		expect(notExecuting).toEqual(
+			expect.arrayContaining([
+				"tool-smoke.yml",
+				"release.yml",
+				"stale.yml",
+				// pull_request_target only: the base branch's copy runs, not the edit.
+				"greetings.yml",
+				"close-keyword-verification.yml",
+			]),
+		);
+		expect(executing).toEqual(
+			expect.arrayContaining([
+				"ci.yml",
+				"lint.yml",
+				"pr-metadata.yml",
+				"install-smoke.yml",
+			]),
+		);
+		expect(executing.length).toBeGreaterThanOrEqual(6);
+	});
+
+	// The blind spot as a fixture: the job-level sweep reads clean over a
+	// schedule + workflow_dispatch file (stryker-nightly's shape, never on
+	// master as of 2026-10-07) while the file-level rule demands evidence.
+	const nightly: WorkflowFile = {
+		path: ".github/workflows/stryker-nightly.yml",
+		text: [
+			"name: nightly",
+			"on:",
+			"  schedule:",
+			"    - cron: '0 3 * * *'",
+			"  workflow_dispatch:",
+			"jobs:",
+			"  mutate:",
+			"    if: github.event_name != 'pull_request'",
+			"    runs-on: ubuntu-latest",
+			"    steps:",
+			"      - run: echo mutate",
+			"",
+		].join("\n"),
+	};
+
+	it("the job sweep examines nothing in a no-PR-trigger file, the file rule does not", () => {
+		expect(findPullRequestUnreachableJobs([nightly])).toEqual({
+			flagged: [],
+			jobsExamined: 0,
+		});
+		const errors = evaluateWorkflowRunEvidence({
+			changedFiles: [nightly.path],
+			body: "No run quoted.",
+			readWorkflow: () => nightly.text,
+		});
+		expect(errors).toHaveLength(1);
+		expect(errors[0]).toContain("it has no pull_request trigger");
 	});
 });

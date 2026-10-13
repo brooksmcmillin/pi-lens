@@ -25,7 +25,12 @@ import { createSubsystemLogger } from "./extension-log.js";
 import { detectFileKind, type FileKind } from "./file-kinds.js";
 import { detectFileRole } from "./file-role.js";
 import { resolveLanguageRootForFile } from "./language-profile.js";
-import { findGlobalBinary } from "./package-manager.js";
+import {
+	findGlobalBinary,
+	findLocalBinAt,
+	localBinPath,
+} from "./package-manager.js";
+import { getIsolatedNpxSpawnOptions } from "./tool-probe.js";
 import { PathKeyedMap } from "./path-keyed-map.js";
 import {
 	augmentPythonEnvironment,
@@ -1789,6 +1794,7 @@ export class TestRunnerClient {
 				absoluteTestFile,
 				cwd,
 				spawnCwd,
+				requireOwnInstall,
 			);
 			if (requireOwnInstall && !ownInstall) {
 				return {
@@ -1804,6 +1810,11 @@ export class TestRunnerClient {
 				cwd: spawnCwd,
 				timeout: 60000,
 				env,
+				// ONE neutral-cwd seam for npx/bunx fallbacks (#4193, #4268
+				// acceptance 3); a resolved runner binary keeps the project cwd.
+				...(command === "npx" || command === "bunx"
+					? getIsolatedNpxSpawnOptions()
+					: {}),
 				// #2522 R2 F1. `safeSpawnAsync` resolves `options.signal ?? ambient`,
 				// so an absent batch signal keeps the pre-#2522 ambient behaviour.
 				signal,
@@ -1850,6 +1861,8 @@ export class TestRunnerClient {
 						absoluteTestFile,
 						cwd,
 						runner,
+						displayRoot ?? cwd,
+						spawnCwd,
 					);
 					break;
 				case "phpunit":
@@ -1859,6 +1872,9 @@ export class TestRunnerClient {
 						result.status ?? 0,
 						absoluteTestFile,
 						runner,
+						displayRoot ?? cwd,
+						cwd,
+						spawnCwd,
 					);
 					break;
 				case "mix":
@@ -1868,6 +1884,9 @@ export class TestRunnerClient {
 						result.status ?? 0,
 						absoluteTestFile,
 						runner,
+						displayRoot ?? cwd,
+						cwd,
+						spawnCwd,
 					);
 					break;
 				default:
@@ -1877,6 +1896,9 @@ export class TestRunnerClient {
 						result.status ?? 0,
 						absoluteTestFile,
 						runner,
+						displayRoot ?? cwd,
+						cwd,
+						spawnCwd,
 					);
 					break;
 			}
@@ -2322,13 +2344,37 @@ export class TestRunnerClient {
 
 	// --- Pytest Parser (text-based, no JSON dependency) ---
 
+	/**
+	 * #3871: a text runner prints a path relative to the directory it ran in
+	 * (`spawnCwd`, first in `bases`) or to the dispatch root. The first base
+	 * that holds the file wins; a path that resolves nowhere stays as printed,
+	 * and an absent capture is no location.
+	 */
+	private renderTextLocation(
+		displayRoot: string,
+		bases: readonly string[],
+		file: string | undefined,
+		line: string | undefined,
+	): string | undefined {
+		if (file === undefined || line === undefined) return undefined;
+		for (const base of bases) {
+			const resolved = path.resolve(base, file);
+			if (fs.existsSync(resolved)) {
+				return `${toPosix(path.relative(displayRoot, resolved))}:${line}`;
+			}
+		}
+		return `${file}:${line}`;
+	}
+
 	private parsePytestOutput(
 		stdout: string,
 		stderr: string,
 		exitCode: number,
 		testFile: string,
-		_cwd: string,
+		cwd: string,
 		runner: string,
+		displayRoot: string = cwd,
+		spawnCwd: string = cwd,
 	): TestResult {
 		const failures: TestFailure[] = [];
 		const output = `${stdout}\n${stderr}`;
@@ -2341,15 +2387,25 @@ export class TestRunnerClient {
 		const failureRegex = /FAILED\s+(\S+::\S+)\s*-\s*(.+?)(?:\n|$)/g;
 		let match;
 		while ((match = failureRegex.exec(output)) !== null) {
+			const [file, ...testParts] = match[1].split("::");
+			const location = this.renderTextLocation(
+				displayRoot,
+				[spawnCwd, cwd],
+				file,
+				testParts.join("::"),
+			);
 			failures.push({
 				name: match[1],
 				message: match[2].trim().slice(0, 500),
-				location: match[1].replace("::", ":"),
+				...(location === undefined ? {} : { location }),
 			});
 		}
 
 		// Also look for assertion errors with traceback
-		const tracebackRegex = /_{10,}\s*\n\s*(\w+Error:\s*.+?)(?:\n|$)/gs;
+		// #4148: `\s*\n\s*` was ambiguous over a blank run and `_{10,}` rescanned
+		// its run from every offset; same matches, linear time.
+		const tracebackRegex =
+			/(?<!_)_{10,}[^\S\n]*\n\s*(\w+Error:\s*.+?)(?:\n|$)/gs;
 		while ((match = tracebackRegex.exec(output)) !== null) {
 			// Add to last failure if exists, or create generic
 			if (failures.length > 0 && !failures[failures.length - 1].stack) {
@@ -2383,6 +2439,9 @@ export class TestRunnerClient {
 		exitCode: number,
 		testFile: string,
 		runner: string,
+		displayRoot: string = path.dirname(testFile),
+		cwd: string = path.dirname(testFile),
+		spawnCwd: string = cwd,
 	): TestResult {
 		const output = `${stdout}\n${stderr}`;
 		let passed = 0;
@@ -2417,7 +2476,26 @@ export class TestRunnerClient {
 		const failureRegex = /^\d+\)\s+(\S+)/gm;
 		let match;
 		while ((match = failureRegex.exec(output)) !== null) {
-			failures.push({ name: match[1], message: match[1] });
+			// #3871 r3: `[^\S\n]*`, not `\s*`, after a line anchor. `\s*` crossed
+			// newlines, so every line of a blank run rescanned the whole run.
+			const afterFailure = output.slice(match.index + match[0].length);
+			const nextFailure = afterFailure.search(/(?:^|\n)[^\S\n]*\d+\)\s/);
+			const failureBlock =
+				nextFailure === -1 ? afterFailure : afterFailure.slice(0, nextFailure);
+			const locationMatch = /(?:^|\n)[^\S\n]*([^\s:]+\.php):(\d+)/.exec(
+				failureBlock,
+			);
+			const location = this.renderTextLocation(
+				displayRoot,
+				[spawnCwd, cwd],
+				locationMatch?.[1],
+				locationMatch?.[2],
+			);
+			failures.push({
+				name: match[1],
+				message: match[1],
+				...(location === undefined ? {} : { location }),
+			});
 		}
 
 		// #1452: PHPUnit prints its own elapsed time and this parser dropped it,
@@ -2489,6 +2567,9 @@ export class TestRunnerClient {
 		exitCode: number,
 		testFile: string,
 		runner: string,
+		displayRoot: string = path.dirname(testFile),
+		cwd: string = path.dirname(testFile),
+		spawnCwd: string = cwd,
 	): TestResult {
 		const output = `${stdout}\n${stderr}`;
 		let passed = 0;
@@ -2524,13 +2605,28 @@ export class TestRunnerClient {
 
 		// Individual failures: "  1) test some behavior (MyModuleTest)"
 		const failures: TestFailure[] = [];
-		const failureRegex = /^\s*\d+\)\s+(.+?)\s*\(([^)]+)\)\s*$/gm;
+		// #3871 r3: `^[^\S\n]*`, not `^\s*`: the multiline anchor restarted at
+		// every line of a blank run and `\s*` rescanned the rest of it.
+		const failureRegex = /^[^\S\n]*\d+\)\s+(.+?)\s*\(([^)]+)\)\s*$/gm;
 		let match;
 		while ((match = failureRegex.exec(output)) !== null) {
+			const afterFailure = output.slice(match.index + match[0].length);
+			const nextFailure = afterFailure.search(/(?:^|\n)[^\S\n]*\d+\)\s/);
+			const failureBlock =
+				nextFailure === -1 ? afterFailure : afterFailure.slice(0, nextFailure);
+			const locationMatch = /(?:^|\n)[^\S\n]*([^\s:]+\.exs):(\d+)/.exec(
+				failureBlock,
+			);
 			failures.push({
 				name: match[1].trim(),
 				message: match[1].trim(),
-				location: match[2].trim(),
+				location:
+					this.renderTextLocation(
+						displayRoot,
+						[spawnCwd, cwd],
+						locationMatch?.[1],
+						locationMatch?.[2],
+					) ?? match[2].trim(),
 			});
 		}
 
@@ -2792,6 +2888,9 @@ export class TestRunnerClient {
 		exitCode: number,
 		testFile: string,
 		runner: string,
+		displayRoot: string = path.dirname(testFile),
+		cwd: string = path.dirname(testFile),
+		spawnCwd: string = cwd,
 	): TestResult {
 		const output = `${stdout}\n${stderr}`;
 		const lower = output.toLowerCase();
@@ -3017,7 +3116,25 @@ export class TestRunnerClient {
 		];
 		for (const m of otherNames) {
 			if (failures.length >= 5) break;
-			failures.push({ name: m[1].trim(), message: m[1].trim() });
+			const name = m[1].trim();
+			// #3871 r3: `(?<!\S)` starts a location only at a token start. The
+			// unanchored match restarted at every offset of a long token, and
+			// took `//host/a.py:80` out of a prose URL.
+			const locationMatch =
+				/(?<!\S)([^\s:]+\.(?:go|rs|rb|java|kt|cs|fs|py|php|exs)):(\d+)/.exec(
+					name,
+				);
+			const location = this.renderTextLocation(
+				displayRoot,
+				[spawnCwd, cwd],
+				locationMatch?.[1],
+				locationMatch?.[2],
+			);
+			failures.push({
+				name,
+				message: name,
+				...(location === undefined ? {} : { location }),
+			});
 		}
 
 		// #1487: gated on `!matched`, not on `failed === 0`. A non-zero exit
@@ -3302,6 +3419,7 @@ export class TestRunnerClient {
 		 * Defaults to `cwd`, which is every call where the two are the same.
 		 */
 		spawnCwd: string = cwd,
+		requireOwnInstall = false,
 	): Promise<{
 		command: string;
 		args: string[];
@@ -3320,7 +3438,9 @@ export class TestRunnerClient {
 		// resolved from the host PATH. The child-only environment also keeps tools
 		// spawned by tests inside the same project environment.
 		if (runner === "pytest") {
-			const pythonEnvironment = await detectPythonEnvironment(cwd);
+			const pythonEnvironment = await detectPythonEnvironment(cwd, undefined, {
+				allowAmbient: !requireOwnInstall,
+			});
 			if (pythonEnvironment) {
 				return {
 					command: pythonEnvironment.pythonPath,
@@ -3336,8 +3456,13 @@ export class TestRunnerClient {
 		// explicitly before falling back to a global `phpunit` on PATH.
 		if (runner === "phpunit") {
 			const suffix = process.platform === "win32" ? ".bat" : "";
-			const vendorBin = path.join(cwd, "vendor", "bin", `phpunit${suffix}`);
-			if (fs.existsSync(vendorBin)) {
+			const vendorBin = localBinPath(
+				findLocalBinAt("phpunit", cwd, {
+					windowsExt: suffix,
+					binDirs: [path.join("vendor", "bin")],
+				}),
+			);
+			if (vendorBin) {
 				return {
 					command: vendorBin,
 					args: config.args(testFile, spawnCwd),
@@ -3353,12 +3478,17 @@ export class TestRunnerClient {
 
 		const binName = config.binName ?? runner;
 		const suffix = process.platform === "win32" ? ".cmd" : "";
-		const localBin = path.join(cwd, "node_modules", ".bin", binName + suffix);
+		const localBin = localBinPath(
+			findLocalBinAt(binName, cwd, {
+				windowsExt: suffix,
+				binDirs: [path.join("node_modules", ".bin")],
+			}),
+		);
 
 		// A resolved binary (local, or any manager's global bin) becomes the command
 		// itself, so the leading wrapper-name arg(s) that named it (e.g. "vitest",
 		// or "-m pytest") are stripped from args() — see stripWrapperArgs.
-		if (fs.existsSync(localBin)) {
+		if (localBin) {
 			return {
 				command: localBin,
 				args: stripWrapperArgs(binName, config.args(testFile, spawnCwd)),

@@ -9,6 +9,7 @@ import {
 	type LSPServerInfo,
 } from "../../clients/lsp/server.js";
 import { LSPService } from "../../clients/lsp/index.js";
+import { withPlatform } from "../support/platform-stub.js";
 import { setupTestEnvironment, useTrackedTempDirs } from "./test-utils.js";
 
 let home: string;
@@ -46,12 +47,7 @@ describe("resolveToolCwd (#2777)", () => {
 	it("folds Win32 case and separator variants into one ephemeral key", () => {
 		// #2782 win-shape review: divergent Win32 spellings must not duplicate
 		// the marker-walk memo or once-per-session resolution log record.
-		const originalPlatform = process.platform;
-		Object.defineProperty(process, "platform", {
-			configurable: true,
-			value: "win32",
-		});
-		try {
+		withPlatform("win32", () => {
 			const fileKey = toolCwd._toolCwdEphemeralKey([
 				path.win32.resolve("C:\\proj\\src\\a.ts"),
 			]);
@@ -76,12 +72,7 @@ describe("resolveToolCwd (#2777)", () => {
 			expect(fileKey).toBe(
 				pathUtils.normalizeEphemeralMapKey("C:\\proj\\src\\a.ts"),
 			);
-		} finally {
-			Object.defineProperty(process, "platform", {
-				configurable: true,
-				value: originalPlatform,
-			});
-		}
+		});
 	});
 
 	it("selects a nearer marker through the real synchronous seam", () => {
@@ -306,6 +297,7 @@ describe("resolveToolCwd (#2777)", () => {
 			name: "Markerless test server",
 			extensions: [".ts"],
 			idleEviction: "unmeasured",
+			role: "language",
 			root: async () => computedRoot,
 			spawn: vi.fn(),
 		};
@@ -329,6 +321,7 @@ describe("resolveToolCwd (#2777)", () => {
 			name: "Failing root test server",
 			extensions: [".ts"],
 			idleEviction: "unmeasured",
+			role: "language",
 			root: async () => {
 				calls++;
 				if (calls === 1) throw new Error("root probe failed");
@@ -365,6 +358,7 @@ describe("resolveToolCwd (#2777)", () => {
 			name: "Fallback callback test server",
 			extensions: [".ts"],
 			idleEviction: "unmeasured",
+			role: "language",
 			root: failing,
 			rootMarkers: ["missing.marker"],
 			requiresProjectRoot: true,
@@ -401,6 +395,7 @@ describe("resolveToolCwd (#2777)", () => {
 			name: "Flag test server",
 			extensions: [".rs"],
 			idleEviction: "unmeasured",
+			role: "language",
 			root: async () => undefined,
 			rootMarkers: ["Cargo.toml"],
 			...(requires === undefined ? {} : { requiresProjectRoot: requires }),
@@ -533,6 +528,7 @@ describe("resolveToolCwd (#2777)", () => {
 			name: "Resolved root test server",
 			extensions: [".ts"],
 			idleEviction: "unmeasured",
+			role: "language",
 			root: async () => project,
 			rootMarkers: ["missing.marker"],
 			spawn: vi.fn(),

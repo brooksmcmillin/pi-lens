@@ -13,7 +13,7 @@ import { isAdvisoryCheck } from "../../scripts/lib/ci-checks.mjs";
 
 const ROOT = resolve(import.meta.dirname, "../..");
 
-type Step = { uses?: string; with?: Record<string, string> };
+type Step = { uses?: string; with?: Record<string, string | boolean> };
 type Job = {
 	name?: string;
 	needs?: string | string[];
@@ -49,6 +49,7 @@ function expandNames(job: Job): string[] {
 
 const codeqlJob = () => load("ci.yml").jobs.codeql;
 const baselineJob = () => load("codeql.yml").jobs.analyze;
+const uploadJob = () => load("codeql.yml").jobs.upload;
 const codeqlSteps = (job: Job) =>
 	(job.steps ?? []).filter((entry) =>
 		String(entry.uses).startsWith("github/codeql-action/"),
@@ -160,24 +161,82 @@ describe("#3801 CodeQL advanced-setup workflow contract", () => {
 			actions: "read",
 			contents: "read",
 		});
+		expect(load("codeql.yml").permissions).toEqual({ contents: "read" });
+	});
+
+	// Recurrence: #4077, the baseline analysis job held `security-events: write`
+	// and a `schedule || master` job guard, so a branch dispatch could not run the
+	// analysis at all. The analysis is read-only (SARIF kept as a run artifact);
+	// the one upload job holds the write scope behind the guard.
+	it("splits the baseline into a read-only analysis and a guarded SARIF upload", () => {
 		expect(baselineJob().permissions).toEqual({
+			"security-events": "read",
+			actions: "read",
+			contents: "read",
+		});
+		expect(baselineJob().if).toBeUndefined();
+		const analyze = codeqlSteps(baselineJob())[1];
+		expect(analyze.with?.upload).toBe("never");
+		expect(analyze.with?.["upload-database"]).toBe(false);
+		expect(uploadJob().permissions).toEqual({
 			"security-events": "write",
 			actions: "read",
 			contents: "read",
 		});
-		expect(load("codeql.yml").permissions).toEqual({ contents: "read" });
+		expect(asList(uploadJob().needs)).toEqual(["analyze"]);
+		expect(String(uploadJob().if)).toContain(
+			"github.event_name == 'schedule' || github.ref == 'refs/heads/master'",
+		);
+	});
+
+	// Recurrence: #4077, the artifact name or the SARIF category drifting between
+	// the analysis and the upload would upload nothing, or a result under a
+	// category code scanning does not compare against master.
+	it("uploads the analysis' own SARIF artifact under the analysis' own category", () => {
+		const analyzeSteps = baselineJob().steps ?? [];
+		const analyze = analyzeSteps.find((s) =>
+			String(s.uses).startsWith("github/codeql-action/analyze@"),
+		);
+		const artifact = analyzeSteps.find((s) =>
+			String(s.uses).startsWith("actions/upload-artifact@"),
+		);
+		const steps = uploadJob().steps ?? [];
+		const download = steps.find((s) =>
+			String(s.uses).startsWith("actions/download-artifact@"),
+		);
+		const sarif = steps.find((s) =>
+			String(s.uses).startsWith("github/codeql-action/upload-sarif@"),
+		);
+		expect(artifact?.with?.name).toBe(download?.with?.name);
+		expect(artifact?.with?.path).toBe(analyze?.with?.output);
+		expect(download?.with?.path).toBe(sarif?.with?.sarif_file);
+		expect(sarif?.with?.category).toBe(analyze?.with?.category);
+		expect(sarif?.uses?.split("@")[0]).toBe(
+			"github/codeql-action/upload-sarif",
+		);
+		// The same pinned engine as init and analyze.
+		expect(sarif?.uses?.split("@")[1]).toBe(analyze?.uses?.split("@")[1]);
+		expect(uploadJob().strategy?.matrix?.language).toEqual(
+			baselineJob().strategy?.matrix?.language,
+		);
 	});
 
 	// Recurrence: a new CodeQL job name that scripts/lib/ci-checks.mjs does not
 	// classify as advisory is a GATING check to ci-verdict and the merge train,
 	// so an unrelated alert or an upload refusal would block every merge.
 	it("ends every expanded CodeQL job name in (advisory) and classifies each as advisory", () => {
-		const names = [...expandNames(codeqlJob()), ...expandNames(baselineJob())];
+		const names = [
+			...expandNames(codeqlJob()),
+			...expandNames(baselineJob()),
+			...expandNames(uploadJob()),
+		];
 		expect(names.sort()).toEqual([
 			"CodeQL (actions) (advisory)",
 			"CodeQL (javascript-typescript) (advisory)",
 			"CodeQL baseline (actions) (advisory)",
 			"CodeQL baseline (javascript-typescript) (advisory)",
+			"CodeQL baseline upload (actions) (advisory)",
+			"CodeQL baseline upload (javascript-typescript) (advisory)",
 		]);
 		for (const name of names) {
 			expect(name.endsWith("(advisory)")).toBe(true);
@@ -193,5 +252,6 @@ describe("#3801 CodeQL advanced-setup workflow contract", () => {
 	it("bounds both CodeQL jobs with timeout-minutes", () => {
 		expect(codeqlJob()["timeout-minutes"]).toBe(20);
 		expect(baselineJob()["timeout-minutes"]).toBe(20);
+		expect(uploadJob()["timeout-minutes"]).toBe(10);
 	});
 });

@@ -104,6 +104,7 @@ const CONTEXT_PATHS: Array<
 	[string, (ctx: PullRequestContext) => ScalarLiteralValue]
 > = [
 	["github.event_name", (ctx) => ctx.eventName],
+	["github.ref", () => "refs/pull/123/merge"],
 	["github.event.action", (ctx) => ctx.action],
 	["github.event.pull_request.merged", (ctx) => ctx.merged],
 	// Same-repo PR by a human: the common case, and the permissive one for

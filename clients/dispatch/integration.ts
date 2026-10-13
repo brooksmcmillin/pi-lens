@@ -77,7 +77,7 @@ import {
 	touchCoverageGap,
 } from "../lsp/diagnostic-binding.js";
 import { getServersForFileWithConfig } from "../lsp/config.js";
-import { getLSPService } from "../lsp/index.js";
+import { getLSPService } from "../lsp/capabilities.js";
 import { isExternalOrVendorFile, normalizeMapKey } from "../path-utils.js";
 import { getProjectIgnoreMatcher } from "../file-utils.js";
 import {
@@ -2870,10 +2870,13 @@ export async function dispatchLintWithResult(
 		writeIndex?: number;
 		/** #3568: the tool_result handler's session. */
 		sessionGeneration?: GenerationHandle;
+		/** Stable session identity for deferred runner delivery. */
+		sessionId?: string;
 		/** Runtime telemetry identity, when known (#1448) — see
 		 * DispatchContext.telemetryModel's doc. */
 		telemetryModel?: string;
 		telemetryProvider?: string;
+		analysisRootMode?: import("../analysis-root.js").AnalysisRootMode;
 		/**
 		 * Pull surface (`pilens_analyze`): emit the coverage notice on every call
 		 * instead of latching it once per session (refs #3791). Leave unset for
@@ -2897,6 +2900,8 @@ export async function dispatchLintWithResult(
 		options?.telemetryModel,
 		options?.telemetryProvider,
 		options?.sessionGeneration,
+		options?.sessionId,
+		options?.analysisRootMode,
 	);
 	sessionFacts.clearFileFactsFor(ctx.filePath);
 	// #2243 item 2: release the pin when the dispatch settles.

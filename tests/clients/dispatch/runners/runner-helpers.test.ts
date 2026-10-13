@@ -22,7 +22,13 @@ import {
 } from "../../../../clients/dispatch/runners/utils/runner-helpers.js";
 import type { DispatchContext } from "../../../../clients/dispatch/types.js";
 import { findGlobalBinary } from "../../../../clients/package-manager.js";
+import { setProjectTrustState } from "../../../../clients/project-trust.js";
 import { setupTestEnvironment } from "../../test-utils.js";
+
+// This sweep plants project-local rungs on purpose; the trust gate itself is
+// exercised by the dedicated witnesses (`package-manager.test.ts`), so the
+// resolution suites run trusted.
+beforeEach(() => setProjectTrustState("trusted"));
 
 const { logSessionStartSpy, logLatencySpy } = vi.hoisted(() => ({
 	logSessionStartSpy: vi.fn(),
@@ -728,6 +734,115 @@ describe("runner-helpers availability checker", () => {
 		}
 	});
 
+	// #4193: the executable name alone selects the unrelated npm ast-grep package.
+	it("selects the scoped CLI package for the shared cache-only fallback (#4193)", async () => {
+		const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
+		const scopedProbeOptions: Array<{
+			cwd?: string;
+			stripNpmConfig?: boolean;
+		}> = [];
+		vi.mocked(safeSpawnMod.safeSpawnAsync).mockImplementation(
+			async (cmd, args, options) => {
+				const scoped =
+					cmd === "npx" &&
+					args?.includes("--no") &&
+					args[args.indexOf("--package") + 1] === "@ast-grep/cli";
+				if (scoped) scopedProbeOptions.push(options ?? {});
+				return scoped
+					? { stdout: "ast-grep 0.45.3", stderr: "", status: 0 }
+					: { stdout: "", stderr: "missing", status: 1 };
+			},
+		);
+		expect(await isSgAvailableAsync()).toBe(true);
+		expect(getSgCommand()).toEqual({
+			cmd: "npx",
+			args: ["--no", "--package", "@ast-grep/cli", "--", "ast-grep"],
+		});
+		// The one shared seam isolates the cache-only probe from the project's
+		// `.npmrc`, matching `SgRunner` (#4193, #4268).
+		expect(scopedProbeOptions).not.toHaveLength(0);
+		for (const options of scopedProbeOptions)
+			expect(options.stripNpmConfig).toBe(true);
+	});
+
+	it("keeps structural replaceWithRule on the scoped fallback before probing (#4193)", async () => {
+		const env = setupTestEnvironment("pi-lens-scoped-rule-");
+		try {
+			const file = path.join(env.tmpDir, "a.ts");
+			fs.writeFileSync(file, "var x = 1;\n");
+			const match = {
+				file,
+				text: "var x = 1;",
+				range: { start: { line: 0, column: 0 }, end: { line: 0, column: 10 } },
+			};
+			vi.stubEnv("PI_LENS_HOME", path.join(env.tmpDir, "pi-lens-home"));
+			const scanOptions: Array<{ cwd?: string; stripNpmConfig?: boolean }> = [];
+			const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mockImplementation(
+				async (cmd, args, options) => {
+					if (
+						cmd !== "npx" ||
+						!args?.includes("--no") ||
+						args[args.indexOf("--package") + 1] !== "@ast-grep/cli"
+					) {
+						return {
+							stdout: "",
+							stderr: "unscoped package rejected",
+							status: 1,
+						};
+					}
+					scanOptions.push(options ?? {});
+					return { stdout: JSON.stringify([match]), stderr: "", status: 0 };
+				},
+			);
+			const { AstGrepClient } =
+				await import("../../../../clients/ast-grep-client.js");
+			const result = await new AstGrepClient().replaceWithRule(
+				"id: scoped\nlanguage: TypeScript\nrule:\n  pattern: var $X = $Y\nfix: let $X = $Y\n",
+				[file],
+				false,
+			);
+			expect(result.error).toBeUndefined();
+			expect(result.totalMatches).toBe(1);
+			expect(result.matches).toEqual([match]);
+			// #4233 V3-HIGH-02: the temp-scan npx child uses the same isolated seam
+			// as the exec path, so a hostile project `.npmrc` is never read.
+			expect(scanOptions.length).toBeGreaterThan(0);
+			for (const options of scanOptions) {
+				expect(options.cwd).toBe(
+					path.join(env.tmpDir, "pi-lens-home", "tools"),
+				);
+				expect(options.cwd).not.toBe(env.tmpDir);
+				expect(options.stripNpmConfig).toBe(true);
+			}
+		} finally {
+			vi.unstubAllEnvs();
+			env.cleanup();
+		}
+	});
+
+	it("never retries an unscoped package when the CLI fallback is missing (#4193)", async () => {
+		const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
+		vi.mocked(safeSpawnMod.safeSpawnAsync).mockResolvedValue({
+			stdout: "",
+			stderr: "missing",
+			status: 1,
+		});
+		expect(await isSgAvailableAsync()).toBe(false);
+		const npmCalls = vi
+			.mocked(safeSpawnMod.safeSpawnAsync)
+			.mock.calls.filter(([cmd]) => cmd === "npx");
+		expect(npmCalls).toHaveLength(1);
+		expect(npmCalls[0]?.[1]).toEqual([
+			"--no",
+			"--package",
+			"@ast-grep/cli",
+			"--",
+			"ast-grep",
+			"--version",
+		]);
+	});
+
 	it("resets the shared ast-grep availability memo at session start", async () => {
 		const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
 		const installerMod = await import("../../../../clients/installer/index.js");
@@ -965,36 +1080,63 @@ describe("runner-helpers availability checker", () => {
 		);
 	});
 
-	it("lspPrimaryCoversFile: true when the named server is the file's primary (#233)", () => {
+	it("lspPrimaryCoversFile: matches the builtin covers fact for the file's primary (#233, #3968)", () => {
 		const ctx = {
 			filePath: "/proj/config.toml",
 			pi: { getFlag: () => false },
 		} as unknown as DispatchContext;
-		// the `toml` LSP server (taplo lsp) is the sole primary for .toml
-		expect(lspPrimaryCoversFile(ctx, "toml")).toBe(true);
+		// the `toml` LSP server (taplo lsp) is the sole primary for .toml, and
+		// the fact table maps it onto the taplo RUNNER capability with that
+		// binary as the availability gate.
+		const taploCover = lspPrimaryCoversFile(ctx, "taplo");
+		expect(taploCover?.serverId).toBe("toml");
+		expect(taploCover?.gateCommands).toEqual(["taplo"]);
 		const sh = {
 			filePath: "/proj/deploy.sh",
 			pi: { getFlag: () => false },
 		} as unknown as DispatchContext;
-		expect(lspPrimaryCoversFile(sh, "bash")).toBe(true);
+		const shellCover = lspPrimaryCoversFile(sh, "shellcheck");
+		expect(shellCover?.serverId).toBe("bash");
+		expect(shellCover?.gateCommands).toEqual(["bash-language-server"]);
 	});
 
-	it("lspPrimaryCoversFile: false when no-lsp kills the runner (#233)", () => {
+	it("lspPrimaryCoversFile: the shuck builtin fact covers shellcheck for .zsh (no-lsp stays kill-switched) (#3968)", () => {
+		const ctx = {
+			filePath: "/proj/zshrc.zsh",
+			pi: { getFlag: () => false },
+		} as unknown as DispatchContext;
+		// bash's `.zsh` claim narrowed (#3968), so shuck is the lone primary.
+		const cover = lspPrimaryCoversFile(ctx, "shellcheck");
+		expect(cover?.serverId).toBe("shuck");
+		expect(cover?.gateCommands).toEqual(["shuck"]);
+	});
+
+	it("lspPrimaryCoversFile: undefined when no-lsp kills the runner (#233)", () => {
 		const ctx = {
 			filePath: "/proj/config.toml",
 			pi: { getFlag: (f: string) => f === "no-lsp" },
 		} as unknown as DispatchContext;
-		expect(lspPrimaryCoversFile(ctx, "toml")).toBe(false);
+		expect(lspPrimaryCoversFile(ctx, "taplo")).toBeUndefined();
 	});
 
-	it("lspPrimaryCoversFile: false when the server is not this file's primary (#233)", () => {
+	it("lspPrimaryCoversFile: undefined when the covering server is not this file's primary (#233)", () => {
 		// a .py file's primary is the python server, not toml — so the taplo CLI
 		// must NOT self-skip on it.
 		const ctx = {
 			filePath: "/proj/main.py",
 			pi: { getFlag: () => false },
 		} as unknown as DispatchContext;
-		expect(lspPrimaryCoversFile(ctx, "toml")).toBe(false);
+		expect(lspPrimaryCoversFile(ctx, "taplo")).toBeUndefined();
+	});
+
+	it("lspPrimaryCoversFile: undefined when the primary claims no such runner capability (#3968)", () => {
+		// a .sh file's primary (bash) covers shellcheck but NOT taplo — the
+		// capability question is per-runner, never per-server-id.
+		const ctx = {
+			filePath: "/proj/deploy.sh",
+			pi: { getFlag: () => false },
+		} as unknown as DispatchContext;
+		expect(lspPrimaryCoversFile(ctx, "taplo")).toBeUndefined();
 	});
 
 	it("resolveLocalFirstAsync: local node_modules/.bin wins without any probe", async () => {

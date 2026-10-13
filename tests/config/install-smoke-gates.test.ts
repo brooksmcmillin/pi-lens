@@ -472,3 +472,62 @@ describe.each(MATRIX_GATED_JOBS)(
 		});
 	},
 );
+
+// #4077: `host-latest-smoke` is read-only and runs on any dispatched ref (the
+// gate table above); its tracking issue is written by `host-latest-notify`,
+// scoped to the schedule or master. GitHub permissions are job-scoped, so the
+// old single job held `issues: write` while it ran unreviewed branch code.
+describe("install-smoke.yml host-latest split (#4077)", () => {
+	type SplitJob = {
+		if?: unknown;
+		needs?: unknown;
+		permissions?: unknown;
+		outputs?: Record<string, string>;
+		steps?: Array<{ id?: string; name?: string; env?: Record<string, string> }>;
+	};
+	const jobs = (loadWorkflow() as unknown as { jobs: Record<string, SplitJob> })
+		.jobs;
+	const smoke = jobs["host-latest-smoke"];
+	const notify = jobs["host-latest-notify"];
+	const notifyStep = notify.steps?.find((s) =>
+		s.name?.startsWith("Notify install drift"),
+	);
+
+	// Recurrence: the write scope sitting on the smoke job, so a branch dispatch
+	// held it while running branch code.
+	it("keeps the smoke read-only and the notify job at issues: write behind the schedule/master guard", () => {
+		expect(smoke.permissions).toEqual({ contents: "read" });
+		expect(notify.permissions).toEqual({ contents: "read", issues: "write" });
+		expect(notify.needs).toBe("host-latest-smoke");
+		// `always()` so a red smoke still files, `!= 'skipped'` so the push and
+		// pull_request events that skip the smoke do not reach the writer.
+		expect(notify.if).toBe(
+			"always() && (github.event_name == 'schedule' || github.ref == 'refs/heads/master') && needs.host-latest-smoke.result != 'skipped'",
+		);
+	});
+
+	// Recurrence: an output wired to the wrong step id, or a notifier env var
+	// left reading `steps.*` (undefined in another job), reaches the notifier as
+	// an empty outcome, which it treats as a wiring bug and takes no action on.
+	it("feeds every notifier outcome from the smoke job's own step outcomes", () => {
+		const env = notifyStep?.env ?? {};
+		const outcomeVars = Object.entries(env).filter(([name]) =>
+			/_OUTCOME$|^RESOLVED_VERSION$/.test(name),
+		);
+		expect(outcomeVars).toHaveLength(9);
+		const stepIds = new Set(smoke.steps?.map((s) => s.id));
+		for (const [, value] of outcomeVars) {
+			const output =
+				/^\$\{\{ needs\.host-latest-smoke\.outputs\.(\w+) \}\}$/.exec(
+					value,
+				)?.[1];
+			expect(output, value).toBeDefined();
+			const source = smoke.outputs?.[output as string] ?? "";
+			const id =
+				/^\$\{\{ steps\.(\w+)\.(?:outcome|outputs\.version) \}\}$/.exec(
+					source,
+				)?.[1];
+			expect(stepIds.has(id), `${output} -> ${source}`).toBe(true);
+		}
+	});
+});

@@ -84,6 +84,10 @@ candidates. A test may be REMOVED only when a named surviving test reds on
 the same mutations — demonstrate the redundancy, never assert it. Removal
 candidates you do not delete here go to the corpus value ledger issue.
 
+## Detection
+
+Optional unless this PR closes a bug-labelled issue: name `Caught by:` (one layer), `Should have been caught by:` (a layer or `this layer`), and `Gap:` (`#NNN`, `exists: <test path>`, or `none: <reason>`).
+
 ## Blast radius
 
 State affected dependents for each touched production module (from
@@ -99,10 +103,22 @@ or observability gap. If no runtime behavior changes, say so.
 
 ## Class sweep
 
-Name the defect class or shape and record a pattern sweep across the WHOLE
-tree — `clients/`, `tools/`, `mcp/`, `scripts/`, `index.ts`, never
-`clients/` alone — plus a population sweep with a per-member verdict when
-the site belongs to an enumerable family. Cite AGENTS.md's defect-shape
-catalog. "Class of size 1" requires the grep that proves it. End a
-population sweep with a consolidation verdict: fold the family onto one
-seam (issue ref) or state why it stays distributed.
+The `PR body` check requires one of two forms here:
+
+1. a named shape (`Shape:`, `Defect shape:`, a numbered `Defect shape <n>`, `Defect class:`, or `Class:`), the quoted search
+   command that defines the population (`rg`, `grep`, `git grep`, `ugrep`,
+   `ast-grep run`, or `sg run` in backticks or a fence), and a verdict: a
+   per-member line (an arrow, a coverage note, or a markdown table row) or a
+   fold/stay statement (`folds onto ...`, `stays distributed because ...`).
+   The sweep covers the WHOLE tree — `clients/`, `tools/`, `mcp/`, `scripts/`,
+   `index.ts`, never `clients/` alone. Cite AGENTS.md's defect-shape catalog.
+   "Class of size 1" requires the grep that proves it. End a population sweep
+   with a consolidation verdict: fold the family onto one seam (issue ref) or
+   state why it stays distributed.
+2. `none: <reason>` — a reason of at least three words, for a diff with no
+   shape (documentation, renames). It is refused when the diff changes runtime
+   code (`clients/**`, `index.ts`, or a `scripts/**/*.mjs` module the package
+   ships): a runtime diff with no named shape is usually an unfound population.
+
+A section that only lists the files this PR changed is refused: that is a
+change list, not a tree-wide sweep (#4248, #4273).

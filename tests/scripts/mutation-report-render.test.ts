@@ -6,11 +6,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import {
-	renderMutationMarkdown,
-	renderStaleMarkdown,
-	STICKY_MARKER,
-} from "../../scripts/lib/mutation-report-render.mjs";
+import { renderMutationMarkdown } from "../../scripts/lib/mutation-report-render.mjs";
 
 describe("renderMutationMarkdown", () => {
 	it("never reads a 0-mutant run as a clean pass, and states the reason", () => {
@@ -472,6 +468,45 @@ describe("renderMutationMarkdown", () => {
 		expect(truncated).toContain("25 related test(s) dropped by the test cap");
 	});
 
+	// Recurrence (#4092): the runtime cap drops tests the count cap never
+	// does (the window's own tests), and a report that dropped them without a
+	// word would read a truncated test population as the whole one.
+	it("discloses tests dropped by the runtime cap, on its own and beside the count cap", () => {
+		const render = (extra: Record<string, number>) =>
+			renderMutationMarkdown({
+				files: {},
+				piLensMutationDiff: {
+					counts: { Killed: 1 },
+					score: "100.00",
+					testSelection: {
+						mode: "coverage",
+						pool: 122,
+						covering: 100,
+						kept: 90,
+						dropped: 0,
+						overBudget: 0,
+						estimatedSeconds: 239.4,
+						own: 80,
+						unknown: 0,
+						...extra,
+					},
+				},
+			});
+		expect(render({ overBudget: 32 })).toContain(
+			"Bounded evidence: 32 test(s) dropped by the runtime cap (~239 s of estimated test time kept) (90 kept). The score is from a truncated test population.",
+		);
+		expect(render({ overBudget: 32 })).toMatch(
+			/^- \*\*Test selection:\*\* .* kept 90 \(80 own, 32 over the runtime cap, ~239 s kept\)$/m,
+		);
+		expect(render({ dropped: 25, overBudget: 32 })).toContain(
+			"Bounded evidence: 25 covering test(s) dropped by the test cap; 32 test(s) dropped by the runtime cap (~239 s of estimated test time kept) (90 kept).",
+		);
+		// An uncapped report (and a pre-#4092 report with no such field) says nothing.
+		expect(render({})).not.toContain("Bounded evidence");
+		const old = render({});
+		expect(old).not.toContain("runtime cap");
+	});
+
 	it("renders the exact selection line: bare without extras, comma-joined with both", () => {
 		const render = (extra: { own?: number; unknown?: number }) =>
 			renderMutationMarkdown({
@@ -624,12 +659,6 @@ describe("renderMutationMarkdown", () => {
 		);
 		expect(render({ state: "mystery" })).not.toContain("Incremental");
 		expect(render(null)).not.toContain("Incremental");
-	});
-
-	it("carries the sticky-comment marker so the workflow can find and update its own comment", () => {
-		expect(
-			renderMutationMarkdown({ files: {}, piLensMutationDiff: {} }),
-		).toContain(STICKY_MARKER);
 	});
 
 	it("round 2 S2: labels a partial (budget-killed) run distinctly, alongside whatever DID run", () => {
@@ -918,67 +947,43 @@ describe("renderMutationMarkdown", () => {
 	});
 });
 
-describe("renderStaleMarkdown (#3531 round 2 T6, round 3/4 R2-4 wording)", () => {
-	it("names the head that produced no report, and carries the sticky marker so a later run finds and updates it", () => {
-		const markdown = renderStaleMarkdown({
-			headSha: "deadbeef00001234",
-			runUrl: undefined,
-		});
-
-		expect(markdown).toContain(STICKY_MARKER);
-		expect(markdown).toContain("Stale");
-		expect(markdown).toContain("deadbeef0000");
-		expect(markdown).toContain("no longer reflects this PR's current head");
-		// Recurrence (round 3 R2-4): the PATCH this very call produces
-		// OVERWRITES the comment with this notice -- "left over" implied no
-		// action was taken, when the update is happening right now.
-		expect(markdown).not.toContain("left over");
-		// Recurrence (round 4, cosmetic): the neutral cause clause used to
-		// read "produced no mutation report -- it did not produce one (…)",
-		// a doubled sentence.
-		expect(markdown).not.toContain("it did not produce one");
+describe("renderMutationMarkdown bounded survivors (#4005)", () => {
+	const survivor = (index: number, original = "a") => ({
+		status: "Survived",
+		mutatorName: "ConditionalExpression",
+		original,
+		replacement: "b",
+		location: { start: { line: index + 1 } },
+	});
+	const report = (mutants: unknown[]) => ({
+		files: { "clients/x.js": { mutants } },
+		piLensMutationDiff: { counts: { Survived: mutants.length }, partial: null },
 	});
 
-	it("links the job run when a run URL is given", () => {
-		const markdown = renderStaleMarkdown({
-			headSha: "abc123",
-			runUrl: "https://github.com/apmantza/pi-lens/actions/runs/123",
-		});
-
-		expect(markdown).toContain(
-			"[Job run](https://github.com/apmantza/pi-lens/actions/runs/123)",
+	// Recurrence: an issue body over GitHub's 65536-character limit failing the
+	// nightly's only write. Unbounded stays the default for every other caller.
+	it("keeps the full count in the heading, shows only maxSurvivors rows and points at the artifact", () => {
+		const markdown = renderMutationMarkdown(
+			report(Array.from({ length: 9 }, (_, i) => survivor(i))),
+			{ maxSurvivors: 3 },
 		);
+		expect(markdown).toContain("#### Survivors (9)");
+		expect(markdown.match(/^\| `clients\/x\.js:/gm)).toHaveLength(3);
+		expect(markdown).toContain("Showing the first 3 of 9 survivors");
+		expect(
+			renderMutationMarkdown(
+				report(Array.from({ length: 9 }, (_, i) => survivor(i))),
+			).match(/^\| `clients\/x\.js:/gm),
+		).toHaveLength(9);
 	});
 
-	it("renders without throwing when given no context at all", () => {
-		expect(() => renderStaleMarkdown()).not.toThrow();
-		expect(renderStaleMarkdown()).toContain(STICKY_MARKER);
-	});
-
-	it("names BOTH possible causes of a 'cancelled' upstream result -- a superseding push or the job's own time limit", () => {
-		// Recurrence (round 4): `needs.mutation.result` reads "cancelled" both
-		// when the workflow's own per-PR concurrency group supersedes a run
-		// AND when the job runs past its `timeout-minutes` -- this job cannot
-		// tell those two apart, so naming only "superseded" would misattribute
-		// a genuine timeout to a push that never happened.
-		const markdown = renderStaleMarkdown({
-			headSha: "abc123",
-			upstreamResult: "cancelled",
-		});
-
-		expect(markdown).toContain(
-			"cancelled: a newer push superseded it, or the job hit its time limit",
+	it("clips a long replaced expression so one row cannot be the whole budget", () => {
+		const markdown = renderMutationMarkdown(
+			report([survivor(0, "x".repeat(5000))]),
+			{ maxSurvivors: 5 },
 		);
-		expect(markdown).not.toContain("crash");
-	});
-
-	it("words it neutrally (not a specific crash/cancellation claim) when the upstream result is unknown or a genuine failure", () => {
-		const markdown = renderStaleMarkdown({
-			headSha: "abc123",
-			upstreamResult: "failure",
-		});
-
-		expect(markdown).not.toContain("superseded");
+		expect(markdown).toContain(`${"x".repeat(160)}...`);
+		expect(markdown).not.toContain("x".repeat(161));
 	});
 });
 

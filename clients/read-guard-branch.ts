@@ -106,10 +106,31 @@ export async function readSessionHeaderId(
 }
 
 /**
+ * The reads a persisted read-set holds before the branch filter (#3873 O2),
+ * whatever its version: `undefined` when there is no payload, `0` for an empty
+ * set or a payload whose `reads` is not a list.
+ */
+function persistedReadCount(payload: unknown): number | undefined {
+	if (payload === undefined) return undefined;
+	const reads = (payload as { reads?: unknown } | null)?.reads;
+	if (!Array.isArray(reads)) return 0;
+	let count = 0;
+	for (const entry of reads)
+		if (Array.isArray(entry) && Array.isArray(entry[1]))
+			count += entry[1].length;
+	return count;
+}
+
+/**
  * One `read_guard_branch_retained` latency row per conversation move: which
  * move, where the read-set came from, and how many records the branch kept.
  * A move that drops every read (an unreadable branch included) is otherwise
  * indistinguishable from a guard that was never populated.
+ *
+ * `payloadReads` (#3873 O2) is the count BEFORE the branch filter, so `kept 0,
+ * dropped 0` reads as one of: no payload (`null`), an empty set (`0`), or a
+ * payload the importer ignored whole (a count above 0 with `payloadVersion`
+ * not the current one). A `/tree` has no payload and omits both.
  */
 export function logReadGuardBranchMove(args: {
 	trigger: string;
@@ -118,6 +139,7 @@ export function logReadGuardBranchMove(args: {
 	dropped: number;
 	branch: BranchToolResults;
 	cwd: string;
+	payload?: { reads: number | undefined; version: unknown };
 }): void {
 	logLatency({
 		type: "phase",
@@ -131,6 +153,10 @@ export function logReadGuardBranchMove(args: {
 			dropped: args.dropped,
 			branchToolResults: args.branch.ids.size,
 			branchReadable: args.branch.readable,
+			...(args.payload && {
+				payloadReads: args.payload.reads ?? null,
+				payloadVersion: args.payload.version ?? null,
+			}),
 		},
 	});
 }
@@ -172,6 +198,7 @@ defineSessionStore<PersistedReadGuardState>({
 			payload as PersistedReadGuardState | undefined,
 			branch.ids,
 		);
+		const payloadReads = persistedReadCount(payload);
 		logReadGuardBranchMove({
 			trigger: ctx.reason,
 			source: ctx.source,
@@ -179,29 +206,44 @@ defineSessionStore<PersistedReadGuardState>({
 			dropped: imported.dropped,
 			branch,
 			cwd: ctx.cwd,
+			payload: {
+				reads: payloadReads,
+				version: (payload as { version?: unknown } | null | undefined)?.version,
+			},
 		});
+		return { itemsIn: payloadReads ?? 0, itemsKept: imported.imported };
 	},
 	reason:
 		"the reads the conversation shows the agent; a move keeps exactly those whose tool result is on the new branch",
 });
 
 /**
- * The files the session authored (D5): carried across `/reload`, which keeps
- * the conversation; reset by every other start, as `/tree` resets it
- * (`retainBranch`).
+ * The files the session authored (D5), each with the content identity and
+ * transcript id of its write. Every start that keeps a conversation adopts
+ * them through the branch filter (`importAuthorship`, #3603), as the
+ * read-set store does: an entry crosses iff its write's tool result is on the
+ * starting branch, and its bytes must still match at the next check (#4131).
+ * `/new` starts an empty conversation and resets them.
  */
 defineSessionStore({
 	name: "read-guard-authorship",
 	policy: {
-		startup: "reset",
+		startup: "adopt",
 		new: "reset",
-		resume: "reset",
-		fork: "reset",
+		resume: "adopt",
+		fork: "adopt",
 		reload: "adopt",
 	},
 	snapshot: (scope) => guardOf(scope)?.exportAuthorship(),
-	restore: (scope, payload) =>
-		(guardOf(scope) as ReadGuard).importAuthorship(payload),
+	restore: (scope, payload, ctx: AdoptContext) => {
+		const guard = guardOf(scope) as ReadGuard;
+		const branch = branchToolResultIds(ctx.sessionManager);
+		const imported = guard.importAuthorship(payload, branch.ids);
+		return {
+			itemsIn: imported.imported + imported.dropped,
+			itemsKept: imported.imported,
+		};
+	},
 	reason:
-		"the files this session wrote; a reload keeps the conversation, so they stay authored",
+		"the files this session wrote, with the bytes it wrote; a move keeps exactly those whose write's tool result is on the new branch",
 });

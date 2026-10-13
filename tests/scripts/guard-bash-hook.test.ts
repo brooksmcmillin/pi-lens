@@ -30,9 +30,9 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
 	classifySegment,
 	classifyPayload,
@@ -92,6 +92,39 @@ function runHook(
 		encoding: "utf8",
 		env,
 	});
+}
+
+/**
+ * A real `git init` + `git worktree add` fixture: `main` is the main checkout,
+ * `<root>/<linkedRelative>` a linked worktree registered with it. Hoisted from
+ * the pkill block so the #3988 path-resolver rows reuse it (#3556, #3988).
+ */
+function makeLinkedWorktreeFixture(linkedRelative = "linked"): {
+	root: string;
+	main: string;
+	linked: string;
+} {
+	const root = mkdtempSync(join(tmpdir(), "pi-lens-guard-bash-git-"));
+	const main = join(root, "main");
+	const linked = join(root, linkedRelative);
+	mkdirSync(main);
+	gitExecFileSync("git", ["init", "-q"], { cwd: main });
+	writeFileSync(join(main, "README.md"), "fixture\n");
+	gitExecFileSync("git", ["add", "README.md"], { cwd: main });
+	gitExecFileSync("git", ["commit", "-q", "-m", "seed"], {
+		cwd: main,
+		env: {
+			...process.env,
+			GIT_AUTHOR_NAME: "pi-lens test",
+			GIT_AUTHOR_EMAIL: "test@example.com",
+			GIT_COMMITTER_NAME: "pi-lens test",
+			GIT_COMMITTER_EMAIL: "test@example.com",
+		},
+	});
+	gitExecFileSync("git", ["worktree", "add", "-q", linked], {
+		cwd: main,
+	});
+	return { root, main, linked };
 }
 
 // Every deny string the issue lists, with the rule keyword its message must
@@ -552,6 +585,19 @@ function commandHash(command: string): string {
 //     set entirely (the `timeout` word was an unrecognized command, not
 //     stripped).
 const EXPECTED_TRANSCRIPT_DENIES = new Set([
+	// #3988: six real historical orchestrator commands that run
+	// `git worktree remove --force "$w"` / `…/$w` with a LOOP variable (`for w
+	// in …; do`, `while read w`) or a glob (`.claude/worktrees/agent-2670-*`).
+	// The path is unknowable to a static scan, so the destructive remove now
+	// fails closed with `worktreeUnresolved`; each remove was read in full and
+	// none carries a literal path. The sanctioned bulk removal is `node
+	// scripts/prune-agent-worktrees.mjs`.
+	"8bc8a4c462c564042423fff3baf78f05f2d88b6b2048ada41d5a04ff42047b28",
+	"e70b2e5ae55217946e9eb793a8cf4af8ab0abc8cfa31763c0fa747829e7662ab",
+	"af560ff2bb6809fb75e9ca40ce445e248b43795ff2d7f9532be6cde38290bfcf",
+	"a3576fba5be22edefa148b8a98c06257fe1b01451392c4b33fbc90d598f1beac",
+	"893583dbbe1c42779753301c1af6c9545958e36e492d264dfc537e81fafc8773",
+	"3c4bd55c640f77611b546c28f1fcfa2e2b0045336c5edd3875f37c6e81a0fa8f",
 	// #3888 audit: no executable historical `git push --force`, `+refspec`,
 	// or `git rebase` rows were present; prose and commit-message mentions are
 	// inert and remain correctly allowed by the corpus test.
@@ -608,6 +654,25 @@ const EXPECTED_TRANSCRIPT_DENIES = new Set([
 	"a22ad5af048cb1448818b448f7c18287dbfeea08df29e05b0bf05e254ca0eaba",
 	"94854ee02d361bd93e7e8b4020fb49cb30573937b576e435abffb6a1734827dd",
 	"6ffdccbc34f482d728a5d85c70a93409ce0fd45ebf315a0fb8c931ef2aa4d4d5",
+	// #3997 review round 3: sixteen real prune-loop removals with a variable
+	// or glob path. The resolver must fail closed on each unknown destination.
+	"b822082d3c03828f5e6589eb36eb83ac6660bd263432f06135c5035cc85e45a3",
+	"afeca36779b64436851458b39454f955acacd385b03daa0b7be858d05723a0d4",
+	"c2f6c24b1f1fdb4838fa9e8693009458671a74ef3f804d6ff2fba2ee371b986e",
+	"4a35050e22495d98d1ebbde8fda95c2d6b96f24eabf726b7fdc8cb759d837128",
+	"4be227e85b9819a6f2c829da3ee9ed1b7c5073ee83dfa3c686583f09d82f3ae3",
+	"74b13dcd7ed03e7dc93d8522267a5f77f00cb98ca2ca3bb362426a294cd112b2",
+	"18d80ce9728adc956d5e5a17538faecf6531ea551d2687ba7d9990b25a8a9b9b",
+	"7e02e1dc1a511467cc0f9313d40f0a12636988eb88cc6cb6a1b895bc81c33f0c",
+	"fe0c92cc4745cfae37cd0c22487a9a3b038358131d80947f2353426278d41370",
+	"a06f9ee2f394ed05803ae46a0229b777051a02e1d34280f1990f32db74a6abf1",
+	"0973763cd67dd37adbdab186ec3249f0215ac3c26b6973644512d9f44273ed0a",
+	"26da3d3934a1a12faed2daeaf5d10738455de223bd86e0290056347df4e5cc5a",
+	"ee140c03b7ca31650f3e72d7bed92cb32f77c45b744894ed7e60993c1d434620",
+	"8fe3ac723bfecd13bbb15cf14fa8483430099c6edf8f0b12e56f46fda5a8271f",
+	"fc4a33caaa9bc458f4dd3a8fafe3bf352d4f06c51917ee176ffb389bafad6c3b",
+	"3ffb74708189595c9f09295c5b4a3725c4c76624b659af7065dea9f385a7056f",
+	"a06f9ee2f394ed05803ae46a0229b777051a02e1d34280f1990f32db74a6abf1",
 ]);
 
 const EXPECTED_TRANSCRIPT_ALLOWS = new Set([
@@ -720,6 +785,91 @@ describe("scripts/hooks/guard-bash.mjs -- git worktree remove node_modules symli
 		}
 	});
 
+	it("denies git worktree remove through a two-hop node_modules symlink (#4080)", () => {
+		const shared = mkdtempSync(join(tmpdir(), "pi-lens-guard-bash-shared-nm-"));
+		const tree = makeWorktreeDir("guard-bash-worktree-two-hop-");
+		const inner = join(tree, "inner");
+		symlinkSync(inner, join(tree, "node_modules"));
+		symlinkSync(shared, inner);
+		try {
+			const result = runHook(`git worktree remove ${tree}`);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("rm <tree>/node_modules");
+		} finally {
+			rmSync(tree, { recursive: true, force: true });
+			rmSync(shared, { recursive: true, force: true });
+		}
+	});
+
+	const BROKEN_CHAIN_ROWS = [
+		{
+			label: "self-loop",
+			setup: (tree: string) =>
+				symlinkSync("node_modules", join(tree, "node_modules")),
+		},
+		{
+			label: "two-cycle",
+			setup: (tree: string) => {
+				const nodeModules = join(tree, "node_modules");
+				const inner = join(tree, "inner");
+				symlinkSync("inner", nodeModules);
+				symlinkSync("node_modules", inner);
+			},
+		},
+		{
+			label: "dangling in-project link",
+			setup: (tree: string) => {
+				const inner = join(tree, "inner");
+				symlinkSync("inner", join(tree, "node_modules"));
+				symlinkSync("missing", inner);
+			},
+		},
+		{
+			label: "ENOTDIR",
+			setup: (tree: string) => {
+				writeFileSync(join(tree, "package.json"), "{}\n");
+				symlinkSync("package.json/child", join(tree, "node_modules"));
+			},
+		},
+	] as const;
+
+	it.each(BROKEN_CHAIN_ROWS)(
+		"fails closed for $label chains across npm and delete callers (#4080)",
+		({ setup }) => {
+			const tree = mkdtempSync(
+				join(tmpdir(), "pi-lens-guard-bash-broken-chain-"),
+			);
+			writeFileSync(join(tree, "package.json"), "{}\n");
+			setup(tree);
+			try {
+				for (const command of [
+					"npm ci",
+					"rm -rf node_modules/",
+					"rm -rf node_modules/*",
+				]) {
+					const result = runHook(command, BASE_ENV, tree);
+					expect(result.status, command).toBe(2);
+					expect(result.stderr, command).toMatch(/#4044|#3173/);
+				}
+			} finally {
+				rmSync(tree, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it("fails closed for a dangling in-project chain on git worktree remove (#4080)", () => {
+		const tree = makeWorktreeDir("guard-bash-worktree-dangling-chain-");
+		symlinkSync("inner", join(tree, "node_modules"));
+		symlinkSync("missing", join(tree, "inner"));
+		try {
+			const result = runHook(`git worktree remove ${tree}`);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("#3173");
+		} finally {
+			rmSync(tree, { recursive: true, force: true });
+		}
+	});
+
 	it("allows the SAME tree once node_modules is unlinked (the note's own prescribed fix)", () => {
 		const shared = mkdtempSync(join(tmpdir(), "pi-lens-guard-bash-shared-nm-"));
 		const tree = makeWorktreeDir("guard-bash-worktree-symlink-");
@@ -824,6 +974,1669 @@ describe("scripts/hooks/guard-bash.mjs -- git worktree remove node_modules symli
 			rmSync(tree, { recursive: true, force: true });
 			rmSync(shared, { recursive: true, force: true });
 		}
+	});
+});
+
+// #4044 (2026-10-07 09:16:22Z): a worker ran `npm ci --ignore-scripts
+// --dry-run` in a lane whose node_modules was a symlink to the main
+// checkout's install. npm 9.2.0 ignores --dry-run for the clean-install
+// family and removes node_modules/* through the link, so every lane lost its
+// dependencies. Recurrence these cases catch: the #3173 shape (a delete
+// through a node_modules link) reached by a different verb, or by a spelling
+// the first guard missed (`cd <lane> && …`, `--prefix`, `npx npm@…`, a
+// subdirectory of the lane). Real filesystem fixtures, driven through the
+// real hook entry.
+describe("scripts/hooks/guard-bash.mjs -- npm writers and deletes through a linked node_modules (#4044)", () => {
+	function makeLane(linked: boolean): {
+		tree: string;
+		shared: string;
+		cleanup: () => void;
+	} {
+		const shared = mkdtempSync(
+			join(tmpdir(), "pi-lens-guard-bash-npm-shared-nm-"),
+		);
+		const tree = mkdtempSync(join(tmpdir(), "pi-lens-guard-bash-npm-lane-"));
+		writeFileSync(join(tree, "package.json"), "{}\n");
+		if (linked) symlinkSync(shared, join(tree, "node_modules"));
+		else mkdirSync(join(tree, "node_modules"));
+		return {
+			tree,
+			shared,
+			cleanup: () => {
+				rmSync(tree, { recursive: true, force: true });
+				rmSync(shared, { recursive: true, force: true });
+			},
+		};
+	}
+
+	const MUTATING = [
+		"npm ci",
+		"npm ci --ignore-scripts --dry-run",
+		"npm clean-install",
+		"npm install",
+		"npm i",
+		"npm add left-pad",
+		"npm uninstall left-pad",
+		"npm rm left-pad",
+		"npm update",
+		"npm up",
+		"npm prune",
+		"npm dedupe",
+		"npm rebuild",
+		"npm install-ci-test",
+		"npm cit",
+		"npm audit fix",
+		"npm link",
+		"npm install --no-save oxfmt",
+		"npm install --dry-run",
+	];
+
+	it.each(MUTATING)(
+		"denies `%s` when node_modules links outside the lane, and names the safe forms",
+		(command) => {
+			const { tree, cleanup } = makeLane(true);
+			try {
+				const result = runHook(command, BASE_ENV, tree);
+				expect(result.status).toBe(2);
+				expect(result.stderr).toContain("#4044");
+				expect(result.stderr).toContain("scratch copy");
+				expect(result.stderr).toContain("--prefix");
+			} finally {
+				cleanup();
+			}
+		},
+	);
+
+	it("denies npm writers and deletes through a two-hop node_modules symlink (#4080)", () => {
+		const { tree, shared, cleanup } = makeLane(true);
+		const nodeModules = join(tree, "node_modules");
+		const inner = join(tree, "inner");
+		unlinkSync(nodeModules);
+		symlinkSync(inner, nodeModules);
+		symlinkSync(shared, inner);
+		try {
+			for (const command of [
+				"npm ci",
+				"rm -rf node_modules/",
+				"rm -rf node_modules/*",
+			]) {
+				const result = runHook(command, BASE_ENV, tree);
+				expect(result.status, command).toBe(2);
+				expect(result.stderr, command).toContain("#4044");
+			}
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("allows a chain whose first hop leaves the lane but resolves back inside (#4080)", () => {
+		const tree = mkdtempSync(
+			join(tmpdir(), "pi-lens-guard-bash-inside-chain-"),
+		);
+		const outsideSpelling = join(dirname(tree), `${basename(tree)}-link`);
+		mkdirSync(join(tree, "inner"));
+		symlinkSync(tree, outsideSpelling);
+		symlinkSync(
+			join("..", basename(outsideSpelling), "inner"),
+			join(tree, "node_modules"),
+		);
+		try {
+			const result = runHook("npm ci", BASE_ENV, tree);
+			expect(result.status).toBe(0);
+			expect(result.stderr).toBe("");
+		} finally {
+			rmSync(tree, { recursive: true, force: true });
+			unlinkSync(outsideSpelling);
+		}
+	});
+
+	it("denies the incident's own shape: `cd <lane> && npm ci --dry-run` from an unrelated payload cwd", () => {
+		const { tree, cleanup } = makeLane(true);
+		try {
+			const result = runHook(`cd ${tree} && npm ci --dry-run`);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("#4044");
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("denies `npm --prefix <linked lane> ci` and `npm ci --prefix=<linked lane>` from another cwd", () => {
+		const { tree, cleanup } = makeLane(true);
+		try {
+			for (const command of [
+				`npm --prefix ${tree} ci`,
+				`npm ci --prefix=${tree}`,
+				`npm ci --prefix ${tree}`,
+			]) {
+				const result = runHook(command);
+				expect(result.status, command).toBe(2);
+				expect(result.stderr, command).toContain("#4044");
+			}
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("resolves a relative --prefix against the payload cwd", () => {
+		const { tree, cleanup } = makeLane(true);
+		try {
+			const result = runHook(
+				`npm --prefix ./${tree.split("/").pop()} ci`,
+				BASE_ENV,
+				dirname(tree),
+			);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("#4044");
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("denies `npx -y npm@11.18.0 ci` and bare `npx npm ci` in a linked lane", () => {
+		const { tree, cleanup } = makeLane(true);
+		try {
+			for (const command of [
+				"npx -y npm@11.18.0 ci",
+				"npx --yes npm@11 ci --dry-run",
+				"npx npm ci",
+				"npx -p npm@11.18.0 -y npm ci",
+			]) {
+				const result = runHook(command, BASE_ENV, tree);
+				expect(result.status, command).toBe(2);
+				expect(result.stderr, command).toContain("#4044");
+			}
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("denies from a subdirectory of the lane, where npm walks up to the lane's node_modules", () => {
+		const { tree, cleanup } = makeLane(true);
+		const sub = join(tree, "scripts", "deep");
+		mkdirSync(sub, { recursive: true });
+		try {
+			const result = runHook("npm ci", BASE_ENV, sub);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("#4044");
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("denies behind an env assignment and a runner prefix", () => {
+		const { tree, cleanup } = makeLane(true);
+		try {
+			for (const command of ["CI=1 npm ci", "env npm ci", "echo go; npm ci"]) {
+				const result = runHook(command, BASE_ENV, tree);
+				expect(result.status, command).toBe(2);
+				expect(result.stderr, command).toContain("#4044");
+			}
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("allows every mutating verb where node_modules is a REAL directory", () => {
+		const { tree, cleanup } = makeLane(false);
+		try {
+			for (const command of [
+				...MUTATING,
+				"npx -y npm@11.18.0 ci",
+				`cd ${tree} && npm ci`,
+			]) {
+				const result = runHook(command, BASE_ENV, tree);
+				expect(result.status, command).toBe(0);
+				expect(result.stderr, command).toBe("");
+			}
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("allows read-only and non-install npm/npx verbs through a linked node_modules", () => {
+		const { tree, cleanup } = makeLane(true);
+		try {
+			for (const command of [
+				"npm ls",
+				"npm run build",
+				"npm test",
+				"npm view left-pad version",
+				"npm audit",
+				"npm outdated",
+				"npm pack --dry-run",
+				"npm exec vitest",
+				"npx vitest run tests/x.test.ts",
+				"npx -y tsc --noEmit",
+				"npm config get registry",
+				"npm --prefix . ls",
+			]) {
+				const result = runHook(command, BASE_ENV, tree);
+				expect(result.status, command).toBe(0);
+				expect(result.stderr, command).toBe("");
+			}
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("allows the message's own safe forms: --prefix into a real directory, and a global install", () => {
+		const linked = makeLane(true);
+		const real = makeLane(false);
+		try {
+			for (const command of [
+				`npm --prefix ${real.tree} ci`,
+				`npm ci --prefix=${real.tree}`,
+				"npm install -g left-pad",
+			]) {
+				const result = runHook(command, BASE_ENV, linked.tree);
+				expect(result.status, command).toBe(0);
+				expect(result.stderr, command).toBe("");
+			}
+		} finally {
+			linked.cleanup();
+			real.cleanup();
+		}
+	});
+
+	it("allows `npm ci` in a lane with no node_modules yet, and where the link stays INSIDE the lane", () => {
+		const bare = makeLane(false);
+		rmSync(join(bare.tree, "node_modules"), { recursive: true });
+		const inside = makeLane(false);
+		rmSync(join(inside.tree, "node_modules"), { recursive: true });
+		const vendor = join(inside.tree, "vendor", "node_modules");
+		mkdirSync(vendor, { recursive: true });
+		symlinkSync(vendor, join(inside.tree, "node_modules"));
+		try {
+			for (const tree of [bare.tree, inside.tree]) {
+				const result = runHook("npm ci", BASE_ENV, tree);
+				expect(result.status, tree).toBe(0);
+				expect(result.stderr, tree).toBe("");
+			}
+		} finally {
+			bare.cleanup();
+			inside.cleanup();
+		}
+	});
+
+	it("stops the walk-up at the nearest package.json, so a nested project with its own install is judged on its own", () => {
+		const { tree, cleanup } = makeLane(true);
+		const nested = join(tree, "packages", "x");
+		mkdirSync(join(nested, "node_modules"), { recursive: true });
+		writeFileSync(join(nested, "package.json"), "{}\n");
+		try {
+			const result = runHook("npm ci", BASE_ENV, nested);
+			expect(result.status).toBe(0);
+			expect(result.stderr).toBe("");
+		} finally {
+			cleanup();
+		}
+	});
+
+	// Recurrence: the #4044 sibling measured with GNU coreutils on 2026-10-07:
+	// `rm -rf node_modules/`, `rm -rf node_modules/*` and `find node_modules/
+	// -delete` follow a link and empty its target, while the no-slash forms
+	// only unlink the link. The npm rule alone left these open, and each is
+	// one keystroke from the form that is safe.
+	const DELETES_THROUGH = [
+		"rm -rf node_modules/",
+		"rm -rf node_modules/*",
+		"rm -rf ./node_modules/",
+		"rm -rf -- node_modules/",
+		"rm -r node_modules/.cache",
+		"rmdir node_modules/x",
+		"unlink node_modules/x",
+		"env rm -rf node_modules/",
+		"find node_modules/ -delete",
+		"find node_modules/ -type f -delete",
+		"find -L node_modules -delete",
+		"find -H node_modules -delete",
+		"find node_modules/ -exec rm -rf {} +",
+		"find node_modules/ -execdir unlink {} ;",
+	];
+
+	it.each(DELETES_THROUGH)(
+		"denies `%s` when node_modules links outside the lane, and names the unlink form",
+		(command) => {
+			const { tree, cleanup } = makeLane(true);
+			try {
+				const result = runHook(command, BASE_ENV, tree);
+				expect(result.status).toBe(2);
+				expect(result.stderr).toContain("#4044");
+				expect(result.stderr).toContain("rm node_modules");
+			} finally {
+				cleanup();
+			}
+		},
+	);
+
+	it("resolves the operand through the cwd the command really runs in: cd, absolute, relative and subdirectory spellings", () => {
+		const { tree, cleanup } = makeLane(true);
+		const sub = join(tree, "scripts");
+		mkdirSync(sub);
+		const laneName = tree.split("/").pop();
+		try {
+			const cases: Array<[string, string]> = [
+				[`cd ${tree} && rm -rf node_modules/`, PAYLOAD_CWD],
+				[`rm -rf ${tree}/node_modules/`, PAYLOAD_CWD],
+				[`rm -rf ${tree}/node_modules/*`, PAYLOAD_CWD],
+				[`find ${tree}/node_modules/ -delete`, PAYLOAD_CWD],
+				[`rm -rf ./${laneName}/node_modules/`, dirname(tree)],
+				["rm -rf ../node_modules/", sub],
+				["rm -rf ../node_modules/*", sub],
+				// cd INTO the link, then delete by glob or by `.`.
+				[`cd ${tree}/node_modules && rm -rf ./*`, PAYLOAD_CWD],
+				[`cd ${tree}/node_modules && find . -delete`, PAYLOAD_CWD],
+				[`cd ${tree}/node_modules && find -delete`, PAYLOAD_CWD],
+			];
+			for (const [command, cwd] of cases) {
+				const result = runHook(command, BASE_ENV, cwd);
+				expect(result.status, command).toBe(2);
+				expect(result.stderr, command).toContain("#4044");
+			}
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("allows unlinking the link itself and every delete that does not pass through it", () => {
+		const { tree, cleanup } = makeLane(true);
+		try {
+			for (const command of [
+				"rm node_modules",
+				"rm -rf node_modules",
+				"rm -f ./node_modules",
+				"unlink node_modules",
+				`rm -rf ${tree}/node_modules`,
+				"find node_modules -delete",
+				"find node_modules -name x -print",
+				"find node_modules/ -name x -print",
+				"find . -delete",
+				"find node_modules/ -exec ls {} +",
+				"rm -rf dist src/*",
+				"ls node_modules/",
+			]) {
+				const result = runHook(command, BASE_ENV, tree);
+				expect(result.status, command).toBe(0);
+				expect(result.stderr, command).toBe("");
+			}
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("allows `rm -rf node_modules/` where node_modules is a real directory, absent, or links INSIDE the lane", () => {
+		const real = makeLane(false);
+		const bare = makeLane(false);
+		rmSync(join(bare.tree, "node_modules"), { recursive: true });
+		const inside = makeLane(false);
+		rmSync(join(inside.tree, "node_modules"), { recursive: true });
+		const vendor = join(inside.tree, "vendor", "node_modules");
+		mkdirSync(vendor, { recursive: true });
+		symlinkSync(vendor, join(inside.tree, "node_modules"));
+		try {
+			for (const tree of [real.tree, bare.tree, inside.tree]) {
+				for (const command of [
+					"rm -rf node_modules/",
+					"rm -rf node_modules/*",
+					"find node_modules/ -delete",
+				]) {
+					const result = runHook(command, BASE_ENV, tree);
+					expect(result.status, `${tree} ${command}`).toBe(0);
+					expect(result.stderr, `${tree} ${command}`).toBe("");
+				}
+			}
+		} finally {
+			real.cleanup();
+			bare.cleanup();
+			inside.cleanup();
+		}
+	});
+
+	// Round 3 (#3997 merged). Recurrence: #3997's `cwdAfterSegment` hands a rule
+	// `cwd === null` after a `cd` it cannot resolve, and the #4054 rules read
+	// `cwd ?? process.cwd()` -- the HOOK's cwd, a real node_modules -- so
+	// `cd $(pwd) && npm ci` in a linked lane allowed (verify-3997-r4 section 5).
+	// An unknown cwd is judged as the payload's own cwd, failing closed.
+	it.each([
+		"cd $UNSET_4044_DIR && npm ci",
+		"popd; npm ci",
+		"cd - ; npm ci",
+		"cd $(pwd) && npm ci",
+		"cd `pwd` && npm install",
+		"cd $(pwd) && rm -rf node_modules/",
+		"cd $(pwd) && find node_modules/ -delete",
+	])(
+		"denies `%s` in a linked lane: an unknown cwd is the payload cwd",
+		(command) => {
+			const { tree, cleanup } = makeLane(true);
+			try {
+				const result = runHook(command, BASE_ENV, tree);
+				expect(result.status).toBe(2);
+				expect(result.stderr).toContain("#4044");
+			} finally {
+				cleanup();
+			}
+		},
+	);
+
+	it("allows the same unknown-cwd commands when the payload cwd holds a real node_modules", () => {
+		const { tree, cleanup } = makeLane(false);
+		try {
+			for (const command of [
+				"cd $UNSET_4044_DIR && npm ci",
+				"popd; npm ci",
+				"cd $(pwd) && rm -rf node_modules/",
+			]) {
+				const result = runHook(command, BASE_ENV, tree);
+				expect(result.status, command).toBe(0);
+				expect(result.stderr, command).toBe("");
+			}
+		} finally {
+			cleanup();
+		}
+	});
+
+	// Recurrence: the rules resolved operands with plain `resolve`, so a
+	// `$PWD`/`$VAR`/`~` spelling of the same path was allowed (#3988's one
+	// resolver, #3997). Logical mode: a physical realpath collapses
+	// `lane/node_modules/` onto the target and the link vanishes from the path.
+	it("resolves `$PWD`, exported/assigned variables and `~` in delete operands and --prefix", () => {
+		const { tree, cleanup } = makeLane(true);
+		try {
+			const cases: Array<[string, NodeJS.ProcessEnv]> = [
+				["rm -rf $PWD/node_modules/", BASE_ENV],
+				["rm -rf ${PWD}/node_modules/*", BASE_ENV],
+				["npm ci --prefix $PWD", BASE_ENV],
+				["npm --prefix=$PWD ci", BASE_ENV],
+				["D=node_modules; rm -rf $D/", BASE_ENV],
+				["export NM=$PWD/node_modules; rm -rf $NM/", BASE_ENV],
+				["P=$PWD; npm --prefix $P ci", BASE_ENV],
+				["cd $PWD && rm -rf node_modules/", BASE_ENV],
+				["rm -rf ~/node_modules/", { ...BASE_ENV, HOME: tree }],
+				["npm ci --prefix ~", { ...BASE_ENV, HOME: tree }],
+			];
+			for (const [command, env] of cases) {
+				const result = runHook(command, env, tree);
+				expect(result.status, command).toBe(2);
+				expect(result.stderr, command).toContain("#4044");
+			}
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("allows in-lane deletes that resolve past the link without passing through it", () => {
+		const { tree, cleanup } = makeLane(true);
+		try {
+			for (const command of [
+				"rm -rf $PWD/dist/",
+				"rm -rf $PWD/node_modules",
+				"rm -rf ~/dist/",
+			]) {
+				const result = runHook(command, { ...BASE_ENV, HOME: tree }, tree);
+				expect(result.stderr, command).toBe("");
+				expect(result.status, command).toBe(0);
+			}
+		} finally {
+			cleanup();
+		}
+	});
+
+	// Round 4 state table (PR #4054 body, "Round 4"): value form x lane x verb.
+	// Recurrence: round 3 let `npm --prefix "$(pwd)" ci` through in a linked
+	// lane while `D=$(pwd); npm --prefix $D ci` denied (R3-1, a regression it
+	// introduced), and resolved `../lnk/../node_modules/` lexically while the
+	// kernel follows `lnk` first (R3-2). One rule covers every row: a directory
+	// is tested where the program lands (kernel walk for deletes, npm's own
+	// resolution for --prefix and the walk-up), and a part the resolver cannot
+	// read is the project the command runs in.
+	function makeTableFixture(): { root: string; cleanup: () => void } {
+		const root = mkdtempSync(join(tmpdir(), "pi-lens-guard-bash-r4-"));
+		const shared = join(root, "main", "node_modules");
+		mkdirSync(shared, { recursive: true });
+		for (const name of ["lane", "real"]) {
+			mkdirSync(join(root, name, "scripts"), { recursive: true });
+			writeFileSync(join(root, name, "package.json"), "{}\n");
+		}
+		symlinkSync(shared, join(root, "lane", "node_modules"));
+		mkdirSync(join(root, "real", "node_modules"));
+		mkdirSync(join(root, "sib"));
+		mkdirSync(join(root, "scratch"));
+		symlinkSync(join(root, "lane", "scripts"), join(root, "lnk"));
+		symlinkSync(join(root, "real", "scripts"), join(root, "rlnk"));
+		return {
+			root,
+			cleanup: () => rmSync(root, { recursive: true, force: true }),
+		};
+	}
+
+	const OFF_TMP_SCRATCH = "/home/dev/pi-lens-guard-bash-r4-scratch";
+
+	// [id, command ({dir} = the lane, {lnk} = its scripts link), payload cwd,
+	//  HOME is the lane, expected in the linked lane, expected in the real one]
+	const ROUND4_TABLE: Array<
+		[string, string, "lane" | "sib", boolean, "deny" | "allow", "allow"]
+	> = [
+		["N1 literal", "npm --prefix {dir} ci", "sib", false, "deny", "allow"],
+		[
+			"N2 known var",
+			"P={dir}; npm --prefix $P ci",
+			"sib",
+			false,
+			"deny",
+			"allow",
+		],
+		[
+			"N3 unknown var",
+			'npm --prefix "$UNSET_4054_R4" ci',
+			"lane",
+			false,
+			"deny",
+			"allow",
+		],
+		[
+			"N3b unknown var",
+			"npm ci --prefix $UNSET_4054_R4/x",
+			"lane",
+			false,
+			"deny",
+			"allow",
+		],
+		["N4 $(cmd)", 'npm --prefix "$(pwd)" ci', "lane", false, "deny", "allow"],
+		["N4b $(cmd)", "npm ci --prefix=$(pwd)", "lane", false, "deny", "allow"],
+		[
+			"N4c $(cmd)",
+			'npm ci --prefix "$(git rev-parse --show-toplevel)"',
+			"lane",
+			false,
+			"deny",
+			"allow",
+		],
+		[
+			"N4d $(cmd)",
+			'npm --prefix "$(mktemp -d)" ci',
+			"lane",
+			false,
+			"deny",
+			"allow",
+		],
+		[
+			"N4e $(cmd) via var",
+			"D=$(pwd); npm --prefix $D ci",
+			"lane",
+			false,
+			"deny",
+			"allow",
+		],
+		["N5 backtick", "npm ci --prefix `pwd`", "lane", false, "deny", "allow"],
+		["N6 ~", "npm --prefix ~ ci", "sib", true, "deny", "allow"],
+		["N6b $HOME", "npm --prefix $HOME ci", "sib", true, "deny", "allow"],
+		[
+			"N6c ~+ (bash: $PWD)",
+			"npm --prefix ~+ ci",
+			"lane",
+			false,
+			"deny",
+			"allow",
+		],
+		[
+			"N7 $TMPDIR",
+			"npm --prefix $TMPDIR/s ci",
+			"lane",
+			false,
+			"allow",
+			"allow",
+		],
+		[
+			"N7b $TMPDIR cd",
+			"cd $TMPDIR/s && npm ci",
+			"lane",
+			false,
+			"allow",
+			"allow",
+		],
+		["N8 $PWD", "npm --prefix $PWD ci", "lane", false, "deny", "allow"],
+		[
+			"N9 symlink+.. cd",
+			"cd ../{lnk} && npm ci",
+			"sib",
+			false,
+			"deny",
+			"allow",
+		],
+		[
+			"N9b symlink+.. prefix",
+			"npm --prefix ../{lnk}/.. ci",
+			"sib",
+			false,
+			"allow",
+			"allow",
+		],
+		[
+			"N10 cwd inside the link",
+			"cd {dir}/node_modules && npm ci",
+			"sib",
+			false,
+			"deny",
+			"allow",
+		],
+		[
+			"N10b prefix inside the link",
+			"npm --prefix {dir}/node_modules ci",
+			"sib",
+			false,
+			"deny",
+			"allow",
+		],
+		["D1 literal", "rm -rf node_modules/", "lane", false, "deny", "allow"],
+		[
+			"D1b literal link only",
+			"rm -rf node_modules",
+			"lane",
+			false,
+			"allow",
+			"allow",
+		],
+		[
+			"D2 known var",
+			"D={dir}; rm -rf $D/node_modules/",
+			"sib",
+			false,
+			"deny",
+			"allow",
+		],
+		[
+			"D3 unknown var",
+			'rm -rf "$UNSET_4054_R4/node_modules/"',
+			"lane",
+			false,
+			"deny",
+			"allow",
+		],
+		[
+			"D4 $(cmd)",
+			'rm -rf "$(pwd)/node_modules/"',
+			"lane",
+			false,
+			"deny",
+			"allow",
+		],
+		[
+			"D4b $(cmd)",
+			'rm -rf "$(git rev-parse --show-toplevel)/node_modules/"',
+			"lane",
+			false,
+			"deny",
+			"allow",
+		],
+		[
+			"D4c $(cmd) via var",
+			"S=$(pwd); rm -rf $S/node_modules/",
+			"lane",
+			false,
+			"deny",
+			"allow",
+		],
+		[
+			"D4d $(cmd) find",
+			'find "$(pwd)/node_modules/" -delete',
+			"lane",
+			false,
+			"deny",
+			"allow",
+		],
+		[
+			"D4e $(cmd) find -L",
+			"find -L $(pwd) -delete",
+			"lane",
+			false,
+			"deny",
+			"allow",
+		],
+		[
+			"D5 backtick",
+			"rm -rf `pwd`/node_modules/",
+			"lane",
+			false,
+			"deny",
+			"allow",
+		],
+		["D6 ~", "rm -rf ~/node_modules/", "sib", true, "deny", "allow"],
+		["D6b $HOME", "rm -rf $HOME/node_modules/*", "sib", true, "deny", "allow"],
+		[
+			"D6c ~+ (bash: $PWD)",
+			"rm -rf ~+/node_modules/",
+			"lane",
+			false,
+			"deny",
+			"allow",
+		],
+		[
+			"D7 $TMPDIR",
+			"rm -rf $TMPDIR/s/node_modules/",
+			"lane",
+			false,
+			"allow",
+			"allow",
+		],
+		["D8 $PWD", "rm -rf $PWD/node_modules/", "lane", false, "deny", "allow"],
+		[
+			"D9 symlink+..",
+			"rm -rf ../{lnk}/../node_modules/",
+			"sib",
+			false,
+			"deny",
+			"allow",
+		],
+		[
+			"D9b symlink+.. cd",
+			"cd ../{lnk} && rm -rf ../node_modules/",
+			"sib",
+			false,
+			"deny",
+			"allow",
+		],
+	];
+
+	it.each(ROUND4_TABLE)(
+		"round-4 state table %s: `%s` (cwd %s) in a linked and a real lane",
+		(_id, template, cwdKind, homeIsLane, linkedVerdict, realVerdict) => {
+			const { root, cleanup } = makeTableFixture();
+			try {
+				for (const [lane, link, verdict] of [
+					["lane", "lnk", linkedVerdict],
+					["real", "rlnk", realVerdict],
+				] as const) {
+					const dir = join(root, lane);
+					const command = template
+						.replaceAll("{dir}", dir)
+						.replaceAll("{lnk}", link);
+					const { UNSET_4054_R4: _unset, ...env } = BASE_ENV;
+					const result = runHook(
+						command,
+						{
+							...env,
+							// A `mktemp` row reads TMPDIR as where mktemp lands: a
+							// fixture root under /tmp (the CI runner's os.tmpdir())
+							// would add the unrelated #3526 tmpCheckout deny to the
+							// real-lane allow (round 5, N4d). The hook only reads the
+							// string, so those rows get a path off /tmp.
+							TMPDIR: template.includes("mktemp")
+								? OFF_TMP_SCRATCH
+								: join(root, "scratch"),
+							...(homeIsLane ? { HOME: dir } : {}),
+						},
+						cwdKind === "sib" ? join(root, "sib") : dir,
+					);
+					if (verdict === "deny") {
+						expect(result.status, `${lane}: ${command}`).toBe(2);
+						expect(result.stderr, `${lane}: ${command}`).toContain("#4044");
+					} else {
+						expect(result.stderr, `${lane}: ${command}`).toBe("");
+						expect(result.status, `${lane}: ${command}`).toBe(0);
+					}
+				}
+			} finally {
+				cleanup();
+			}
+		},
+	);
+
+	// Recurrence (round 5, CI on 4440b2e8): N4d passed locally and reds on the
+	// runner, because the table's real-lane allow silently depended on the
+	// host's os.tmpdir(). The /tmp half of that dependence is pinned here by
+	// reason: a `mktemp -d` prefix lands under TMPDIR, and under /tmp it is the
+	// #3526 tmpCheckout deny, never the #4044 one, in a real lane.
+	it("names the #3526 reason for a mktemp -d --prefix when TMPDIR is under /tmp", () => {
+		const { root, cleanup } = makeTableFixture();
+		try {
+			const { UNSET_4054_R4: _unset, ...env } = BASE_ENV;
+			const result = runHook(
+				'npm --prefix "$(mktemp -d)" ci',
+				{ ...env, TMPDIR: "/tmp/pi-lens-guard-bash-r5-scratch" },
+				join(root, "real"),
+			);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toBe(`${RULE_MESSAGES.tmpCheckout}\n`);
+		} finally {
+			cleanup();
+		}
+	});
+
+	// Recurrence: round 3 resolved `node_modules/..` lexically to the lane,
+	// while the kernel follows the link first and lands in the shared
+	// install's parent (`find node_modules/.. -delete` would empty the main
+	// checkout); the same holds for a relative path from a cwd inside the link.
+	it("denies a path the kernel resolves through the link before a `..`, and not through a real node_modules", () => {
+		const linked = makeLane(true);
+		const real = makeLane(false);
+		try {
+			for (const [command, cwd] of [
+				["find node_modules/.. -delete", linked.tree],
+				["rm -rf node_modules/../x", linked.tree],
+				[`cd ${linked.tree}/node_modules && rm -rf ../x`, PAYLOAD_CWD],
+			]) {
+				const result = runHook(command, BASE_ENV, cwd);
+				expect(result.status, command).toBe(2);
+				expect(result.stderr, command).toContain("#4044");
+			}
+			for (const command of [
+				"find node_modules/.. -delete",
+				`cd ${real.tree}/node_modules && rm -rf ../x`,
+			]) {
+				const result = runHook(command, BASE_ENV, real.tree);
+				expect(result.stderr, command).toBe("");
+				expect(result.status, command).toBe(0);
+			}
+		} finally {
+			linked.cleanup();
+			real.cleanup();
+		}
+	});
+
+	it("points an unreadable --prefix at a $TMPDIR scratch directory", () => {
+		const { tree, cleanup } = makeLane(true);
+		try {
+			const result = runHook('npm --prefix "$(pwd)" ci', BASE_ENV, tree);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("--prefix $TMPDIR/<name>");
+		} finally {
+			cleanup();
+		}
+	});
+
+	// Recurrence (review-4054 F1): `find -L .`/`-follow` descend INTO the link
+	// from any operand that merely holds it, and the PR claimed `-L/-H` were
+	// covered only for an operand named node_modules itself.
+	it.each([
+		"find -L . -delete",
+		"find -L . -name f -delete",
+		"find . -follow -delete",
+		"find node_modules -follow -delete",
+		"find -L . -exec rm -f {} +",
+	])("denies `%s` in a linked lane", (command) => {
+		const { tree, cleanup } = makeLane(true);
+		try {
+			const result = runHook(command, BASE_ENV, tree);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("#4044");
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("allows following find forms that do not delete, or whose operand holds no link, and the same in a real lane", () => {
+		const linked = makeLane(true);
+		mkdirSync(join(linked.tree, "dist"));
+		const real = makeLane(false);
+		try {
+			for (const [command, cwd] of [
+				["find -L . -name f -print", linked.tree],
+				["find -L dist -delete", linked.tree],
+				["find . -follow -name f", linked.tree],
+				["find . -delete", linked.tree],
+				["find -L . -delete", real.tree],
+				["find . -follow -delete", real.tree],
+			]) {
+				const result = runHook(command, BASE_ENV, cwd);
+				expect(result.status, command).toBe(0);
+				expect(result.stderr, command).toBe("");
+			}
+		} finally {
+			linked.cleanup();
+			real.cleanup();
+		}
+	});
+
+	// Recurrence (review-4054 F4): `NPM_VALUE_FLAGS` was a closed list, so an
+	// unlisted value flag ("--audit false", "--maxsockets 3") became the verb.
+	it.each([
+		"npm --audit false ci",
+		"npm --fund false ci",
+		"npm --ignore-scripts false ci",
+		"npm --fetch-retries 3 ci",
+		"npm --maxsockets 3 install",
+		"npm --audit-level high ci",
+		"npm --lockfile-version 3 install",
+		"npm --proxy http://x:8080 ci",
+	])(
+		"denies `%s` in a linked lane: an unlisted value flag does not hide the verb",
+		(command) => {
+			const { tree, cleanup } = makeLane(true);
+			try {
+				const result = runHook(command, BASE_ENV, tree);
+				expect(result.status).toBe(2);
+				expect(result.stderr).toContain("#4044");
+			} finally {
+				cleanup();
+			}
+		},
+	);
+
+	it("allows read-only verbs and a script named like a writer behind unlisted value flags", () => {
+		const { tree, cleanup } = makeLane(true);
+		try {
+			for (const command of [
+				"npm --audit false ls",
+				"npm --maxsockets 3 run build",
+				"npm run ci",
+				"npm run install",
+				"npm test ci",
+				"npm view install version",
+			]) {
+				const result = runHook(command, BASE_ENV, tree);
+				expect(result.status, command).toBe(0);
+				expect(result.stderr, command).toBe("");
+			}
+		} finally {
+			cleanup();
+		}
+	});
+
+	// Recurrence (review-4054 F6): the message said "or `rm node_modules`
+	// first", but `rm node_modules && npm ci` is judged statically and denied
+	// as one command; the remedy needs two calls.
+	it("tells the reader the unlink and the install are separate commands", () => {
+		const { tree, cleanup } = makeLane(true);
+		try {
+			const result = runHook("npm ci", BASE_ENV, tree);
+			expect(result.stderr).toContain("in a separate command");
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("declares linkedNodeModulesDelete in the DenyRule union the .d.mts exports", () => {
+		// Same typed-binding guard as npmLinkedInstall below.
+		const rule: DenyRule = "linkedNodeModulesDelete";
+		expect(RULE_MESSAGES[rule]).toContain("unlink");
+	});
+
+	it("declares npmLinkedInstall in the DenyRule union the .d.mts exports", () => {
+		// Same typed-binding guard as the rule declarations above: remove the
+		// member from scripts/hooks/guard-bash.d.mts and `npm run lint` reds.
+		const rule: DenyRule = "npmLinkedInstall";
+		expect(RULE_MESSAGES[rule]).toContain("node_modules");
+	});
+});
+
+// #3988: every guard-bash rule that tests a PATH argument resolves it through
+// ONE resolver (`expandShellWord` / `resolveShellPath` in guard-bash.mjs): the
+// shell expansions bash performs before the program sees argv (`~`, `$HOME`,
+// `${HOME}`, `$VAR`, `$PWD`), then the command's effective cwd (a preceding
+// `cd`, `git -C`, else the hook payload's cwd). Recurrence this block names:
+// 2026-10-06, `git worktree remove --force ~/.local/share/.../3967-final` ran
+// unblocked against a tree whose node_modules was a symlink into the main
+// checkout (#3173 hole); the tmp-checkout, mktemp and node-probe rules each
+// carried a partial expander of their own and had the same hole. A path that
+// cannot be resolved statically fails CLOSED for the destructive rule
+// (`git worktree remove`), with its own named rule.
+//
+// Every row goes through the real hook entry (stdin JSON -> exit code ->
+// stderr), against a REAL registered linked worktree whose node_modules is a
+// symlink into a shared directory, the reviewer's probe from the issue body.
+describe("scripts/hooks/guard-bash.mjs -- path-argument resolver (#3988)", () => {
+	type PathRow = {
+		label: string;
+		/** `@W@` symlinked worktree, `@CLEAN@` worktree with a real node_modules, `@HOME@`, `@ROOT@`, `@SCRATCH@` (HOME/scratch). */
+		command: string;
+		/** payload cwd, same placeholders; default PAYLOAD_CWD */
+		cwd?: string;
+		/** extra hook env; `undefined` removes the variable */
+		env?: Record<string, string | undefined>;
+		rule: DenyRule | null;
+	};
+
+	let fixture: ReturnType<typeof makeLinkedWorktreeFixture>;
+	let home: string;
+	let scratch: string;
+	let clean: string;
+	let shared: string;
+
+	beforeAll(() => {
+		fixture = makeLinkedWorktreeFixture(join("home", "scratch", "wt"));
+		home = join(fixture.root, "home");
+		scratch = join(home, "scratch");
+		shared = join(fixture.root, "shared-node-modules");
+		mkdirSync(shared);
+		symlinkSync(shared, join(fixture.linked, "node_modules"));
+		// A second registered-looking tree whose node_modules is a REAL
+		// directory: the allow arm that proves a resolved path is judged, not
+		// blanket-denied.
+		clean = join(scratch, "clean");
+		mkdirSync(join(clean, "node_modules"), { recursive: true });
+		writeFileSync(
+			join(clean, ".git"),
+			"gitdir: /some/main/checkout/.git/worktrees/clean\n",
+		);
+		// HOME/away/lnk -> HOME/scratch/wt: `away/lnk/../wt` names the
+		// symlinked tree to the kernel and `away/wt` (absent) lexically (#3997 H3).
+		mkdirSync(join(home, "away"));
+		symlinkSync(join("..", "scratch", "wt"), join(home, "away", "lnk"));
+	});
+
+	afterAll(() => {
+		rmSync(fixture.root, { recursive: true, force: true });
+	});
+
+	function fill(text: string): string {
+		return text
+			.replaceAll("@W@", fixture.linked)
+			.replaceAll("@CLEAN@", clean)
+			.replaceAll("@SCRATCH@", scratch)
+			.replaceAll("@HOME@", home)
+			.replaceAll("@ROOT@", fixture.root);
+	}
+
+	function decide(row: PathRow) {
+		const env: NodeJS.ProcessEnv = { ...BASE_ENV, HOME: home };
+		for (const [key, value] of Object.entries(row.env ?? {}))
+			if (value === undefined) delete env[key];
+			else env[key] = fill(value);
+		return runHook(fill(row.command), env, fill(row.cwd ?? PAYLOAD_CWD));
+	}
+
+	function expectRule(row: PathRow) {
+		const result = decide(row);
+		if (row.rule === null) {
+			expect(result.stderr).toBe("");
+			expect(result.status).toBe(0);
+		} else {
+			expect(result.stderr).toBe(`${RULE_MESSAGES[row.rule]}\n`);
+			expect(result.status).toBe(2);
+		}
+	}
+
+	const OFF_TMP_HOME = "/home/dev/guard-bash-3988-home";
+	const TMP_HOME = "/tmp/guard-bash-3988-home";
+
+	// -- git worktree remove: spelling x cwd context -> #3173 deny -----------
+	const REMOVE_DENY_ROWS: PathRow[] = [
+		{
+			label: "absolute path (baseline)",
+			command: "git worktree remove --force @W@",
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "~/ spelling",
+			command: "git worktree remove ~/scratch/wt",
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "$HOME/ spelling",
+			command: "git worktree remove $HOME/scratch/wt",
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "${HOME}/ spelling",
+			command: "git worktree remove ${HOME}/scratch/wt",
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "~/ spelling after a chained `echo x;`",
+			command: "echo x; git worktree remove --force ~/scratch/wt",
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "double-quoted $HOME spelling",
+			command: 'git worktree remove "$HOME/scratch/wt"',
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "relative path from the payload cwd",
+			command: "git worktree remove wt",
+			cwd: "@SCRATCH@",
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "relative ../ path with a trailing slash",
+			command: "git worktree remove ../scratch/wt/",
+			cwd: "@SCRATCH@",
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "`.` with the payload cwd inside the tree",
+			command: "git worktree remove .",
+			cwd: "@W@",
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "relative path after `cd <relative> &&`",
+			command: "cd scratch && git worktree remove wt",
+			cwd: "@HOME@",
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "relative path after `cd <relative>;`",
+			command: "cd scratch; git worktree remove wt",
+			cwd: "@HOME@",
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "relative path after `cd ~/dir &&`",
+			command: "cd ~/scratch && git worktree remove wt",
+			cwd: "@ROOT@",
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "relative path after `cd $HOME/dir &&`",
+			command: "cd $HOME/scratch && git worktree remove wt",
+			cwd: "@ROOT@",
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "relative path after `cd -P dir &&`",
+			command: "cd -P scratch && git worktree remove wt",
+			cwd: "@HOME@",
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "relative path inside `(cd dir && ...)`",
+			command: "(cd scratch && git worktree remove wt)",
+			cwd: "@HOME@",
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "relative path after `git -C <relative>`",
+			command: "git -C scratch worktree remove wt",
+			cwd: "@HOME@",
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "relative path after `git -C ~/dir`",
+			command: "git -C ~/scratch worktree remove wt",
+			cwd: "@ROOT@",
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "relative path after chained `git -C a -C b`",
+			command: "git -C @HOME@ -C scratch worktree remove wt",
+			cwd: "@ROOT@",
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "$PWD-anchored path",
+			command: "git worktree remove $PWD/wt",
+			cwd: "@SCRATCH@",
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "variable assigned earlier in the command (tilde in the value)",
+			command: "S=~/scratch; git worktree remove $S/wt",
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "exported variable holding a $HOME path",
+			command: 'export V=$HOME/scratch/wt; git worktree remove "$V"',
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "~/ spelling with HOME exported in the command, not the hook env",
+			command: "export HOME=@HOME@; git worktree remove ~/scratch/wt",
+			env: { HOME: "/nonexistent-3988" },
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "variable that exists only in the hook's ambient env",
+			command: "git worktree remove $WT_3988",
+			env: { WT_3988: "@W@" },
+			rule: "worktreeSymlink",
+		},
+	];
+
+	// -- git worktree remove: unresolvable -> fail CLOSED (#3988) ------------
+	const REMOVE_UNRESOLVED_ROWS: PathRow[] = [
+		{
+			label: "variable with no known value",
+			command: "git worktree remove $OTHERVAR_3988/scratch/wt",
+			rule: "worktreeUnresolved",
+		},
+		{
+			label: "$(...) inside the path",
+			command: "git worktree remove $(pwd)/scratch/wt",
+			rule: "worktreeUnresolved",
+		},
+		{
+			label: "whole path from a quoted $(...)",
+			command: 'git worktree remove "$(cat wt.txt)"',
+			rule: "worktreeUnresolved",
+		},
+		{
+			label: "backticks inside the path",
+			command: "git worktree remove `pwd`/scratch/wt",
+			rule: "worktreeUnresolved",
+		},
+		{
+			label: "~user spelling",
+			command: "git worktree remove ~nobody/scratch/wt",
+			rule: "worktreeUnresolved",
+		},
+		{
+			label: "parameter expansion with an operator",
+			command: "git worktree remove ${HOME:-x}/scratch/wt",
+			rule: "worktreeUnresolved",
+		},
+		{
+			label: "glob that expands to the tree",
+			command: "git worktree remove ~/scratch/w*",
+			rule: "worktreeUnresolved",
+		},
+		{
+			label: "HOME unset in the hook env",
+			command: "git worktree remove $HOME/scratch/wt",
+			env: { HOME: undefined },
+			rule: "worktreeUnresolved",
+		},
+		{
+			label: "~/ spelling with HOME unset in the hook env",
+			command: "git worktree remove ~/scratch/wt",
+			env: { HOME: undefined },
+			rule: "worktreeUnresolved",
+		},
+		{
+			label: "self-referential variable chain",
+			command: "A=$A; git worktree remove $A/wt",
+			rule: "worktreeUnresolved",
+		},
+		{
+			label: "variable chain that bottoms out in an unknown variable",
+			command: "A=$B_3988; git worktree remove $A/wt",
+			rule: "worktreeUnresolved",
+		},
+		{
+			label: "relative path after `cd $UNKNOWN &&` (cwd unknown)",
+			command: "cd $OTHERVAR_3988 && git worktree remove wt",
+			cwd: "@SCRATCH@",
+			rule: "worktreeUnresolved",
+		},
+		{
+			label: "relative path after `cd ~user &&` (cwd unknown)",
+			command: "cd ~nobody && git worktree remove wt",
+			cwd: "@SCRATCH@",
+			rule: "worktreeUnresolved",
+		},
+		{
+			label: "relative path after `cd $(...) &&` (cwd unknown)",
+			command: "cd $(git rev-parse --show-toplevel) && git worktree remove wt",
+			cwd: "@SCRATCH@",
+			rule: "worktreeUnresolved",
+		},
+		{
+			label: "relative path after `popd` (cwd unknown)",
+			command: "popd >/dev/null && git worktree remove wt",
+			cwd: "@SCRATCH@",
+			rule: "worktreeUnresolved",
+		},
+		{
+			label: "relative path after `git -C $UNKNOWN`",
+			command: "git -C $OTHERVAR_3988 worktree remove wt",
+			cwd: "@SCRATCH@",
+			rule: "worktreeUnresolved",
+		},
+		{
+			label: 'relative path after `git -C "$(...)"`',
+			command: 'git -C "$(pwd)" worktree remove wt',
+			cwd: "@SCRATCH@",
+			rule: "worktreeUnresolved",
+		},
+	];
+
+	// -- git worktree remove: resolved, and judged on its merits -> allow ----
+	const REMOVE_ALLOW_ROWS: PathRow[] = [
+		{
+			label: "~/ spelling of a tree with a real node_modules",
+			command: "git worktree remove ~/scratch/clean",
+			rule: null,
+		},
+		{
+			label: "$HOME/ spelling of a tree with a real node_modules",
+			command: "git worktree remove $HOME/scratch/clean",
+			rule: null,
+		},
+		{
+			label: "relative path of a tree with a real node_modules",
+			command: "git worktree remove clean",
+			cwd: "@SCRATCH@",
+			rule: null,
+		},
+		{
+			label: "`cd dir &&` relative path of a clean tree",
+			command: "cd scratch && git worktree remove clean",
+			cwd: "@HOME@",
+			rule: null,
+		},
+		{
+			label: "`git -C dir` relative path of a clean tree",
+			command: "git -C scratch worktree remove clean",
+			cwd: "@HOME@",
+			rule: null,
+		},
+		{
+			label: "ambient variable naming a clean tree",
+			command: "git worktree remove $WT_3988",
+			env: { WT_3988: "@CLEAN@" },
+			rule: null,
+		},
+		{
+			label: "~/ path that is not a worktree at all",
+			command: "git worktree remove ~/scratch/gone",
+			rule: null,
+		},
+		{
+			// Recurrence: a `cd` inside `( ... )` leaked its directory to every
+			// later segment, so this resolved `wt` under scratch and denied.
+			label: "a subshell's `cd` does not leak out of its parentheses",
+			command: "(cd scratch && true); git worktree remove wt",
+			cwd: "@HOME@",
+			rule: null,
+		},
+		{
+			label: "no path argument at all",
+			command: "git worktree remove --help",
+			rule: null,
+		},
+	];
+
+	it.each(REMOVE_DENY_ROWS)("denies the #3173 hazard through $label", (row) =>
+		expectRule(row),
+	);
+
+	it.each(REMOVE_UNRESOLVED_ROWS)(
+		"fails closed (named rule) on an unresolvable path: $label",
+		(row) => {
+			expectRule(row);
+			expect(RULE_MESSAGES.worktreeUnresolved).toContain("#3988");
+		},
+	);
+
+	it.each(REMOVE_ALLOW_ROWS)("allows a resolved clean path: $label", (row) =>
+		expectRule(row),
+	);
+
+	// -- #3997 round 4: the remove rows c0184f1 got wrong ---------------------
+	// Each row is a cell of the PR body's "Round 4" table that c0184f1 allowed
+	// (or denied for the wrong reason). H2: c0184f1 stripped a whole-word
+	// substitution to "", which skipped the check. H3: `path.resolve` drops
+	// `lnk/..` lexically, but git removed the tree `lnk` points at (measured).
+	// F4: bash expands `~` before an inline `HOME=` applies. F5: a real `$`
+	// chain, plus the identifier-valued spelling bash reads as a literal word.
+	const ROUND4_REMOVE_ROWS: PathRow[] = [
+		{
+			label: "H2 unquoted $(...) as the whole path",
+			command: "git worktree remove $(echo wt)",
+			cwd: "@SCRATCH@",
+			rule: "worktreeUnresolved",
+		},
+		{
+			label: "H2 backticks as the whole path",
+			command: "git worktree remove `echo wt`",
+			cwd: "@SCRATCH@",
+			rule: "worktreeUnresolved",
+		},
+		{
+			label: "H2 --force, then a quoted $(...)",
+			command: 'git worktree remove --force "$(echo wt)"',
+			cwd: "@SCRATCH@",
+			rule: "worktreeUnresolved",
+		},
+		{
+			label: "H2 --, then a quoted $(...)",
+			command: 'git worktree remove -- "$(echo wt)"',
+			cwd: "@SCRATCH@",
+			rule: "worktreeUnresolved",
+		},
+		{
+			label: "H2 a $(...) word before the path",
+			command: "git worktree remove $(echo -f) wt",
+			cwd: "@SCRATCH@",
+			rule: "worktreeUnresolved",
+		},
+		{
+			label: "H2 an unquoted $(...) as the git -C directory",
+			command: "git -C $(pwd) worktree remove wt",
+			cwd: "@SCRATCH@",
+			rule: "worktreeUnresolved",
+		},
+		{
+			label: "H3 a relative path through a symlink, then ..",
+			command: "git worktree remove away/lnk/../wt",
+			cwd: "@HOME@",
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "H3 a $PWD path through a symlink, then ..",
+			command: "git worktree remove $PWD/away/lnk/../wt",
+			cwd: "@HOME@",
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "H3 symlink, then .. after git -C",
+			command: "git -C away worktree remove lnk/../wt",
+			cwd: "@HOME@",
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "H3 symlink, then .. as the git -C directory",
+			command: "git -C away/lnk/.. worktree remove wt",
+			cwd: "@HOME@",
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "H3 symlink, then .. after a cd",
+			command: "cd away; git worktree remove lnk/../wt",
+			cwd: "@HOME@",
+			rule: "worktreeSymlink",
+		},
+		{
+			// bash's `cd` is logical (`cd away/lnk/.. && pwd` prints HOME/away),
+			// so `wt` names the absent HOME/away/wt, not the symlinked tree.
+			label: "H3 a cd target stays logical",
+			command: "cd away/lnk/.. && git worktree remove wt",
+			cwd: "@HOME@",
+			rule: null,
+		},
+		{
+			label: "F4 an inline HOME= does not change what ~ expands to",
+			command: "HOME=/nonexistent-3997 git worktree remove ~/scratch/wt",
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "F5 an 8-variable $ chain ending in ~ resolves",
+			command:
+				"H=~/scratch/wt; G=$H; F=$G; E=$F; D=$E; C=$D; B=$C; A=$B; git worktree remove $A",
+			rule: "worktreeSymlink",
+		},
+		{
+			label: "F5 a 9-variable $ chain fails closed at the bound",
+			command:
+				"I=~/scratch/wt; H=$I; G=$H; F=$G; E=$F; D=$E; C=$D; B=$C; A=$B; git worktree remove $A",
+			rule: "worktreeUnresolved",
+		},
+		{
+			// `$A` is the literal word `B` to bash: a relative path that is absent.
+			label: "F5 an identifier-valued variable is a literal word, not a chain",
+			command:
+				"A=B; B=C; C=D; D=E; E=F; F=G; G=H; H=~/scratch/wt; git worktree remove $A",
+			rule: null,
+		},
+	];
+
+	it.each(ROUND4_REMOVE_ROWS)("round 4 remove cell: $label", (row) =>
+		expectRule(row),
+	);
+
+	// -- the other path-taking rules go through the SAME resolver ------------
+	// tmpCheckout (#3526): worktree add, clone, mktemp -d, plus `cd`/`-C`.
+	// An unresolvable variable stays a documented fail-OPEN there: it is a
+	// hygiene rule, and denying every `git worktree add "$WT"` would block
+	// ordinary fixer work for a path that cannot be shown to be under /tmp.
+	const TMP_ROWS: PathRow[] = [
+		{
+			label: "worktree add after `git -C /tmp` with a relative path",
+			command: "git -C /tmp worktree add wt",
+			rule: "tmpCheckout",
+		},
+		{
+			label: "clone into a relative directory after `git -C /tmp`",
+			command: "git -C /tmp clone https://example.invalid/r.git x",
+			rule: "tmpCheckout",
+		},
+		{
+			label: "worktree add after `cd $VAR &&` where VAR=/tmp",
+			command: "T=/tmp; cd $T && git worktree add wt",
+			rule: "tmpCheckout",
+		},
+		{
+			label: "worktree add at $HOME/ with HOME under /tmp",
+			command: "git worktree add $HOME/wt",
+			env: { HOME: TMP_HOME },
+			rule: "tmpCheckout",
+		},
+		{
+			label: "clone into ${HOME}/ with HOME under /tmp",
+			command: "git clone https://example.invalid/r.git ${HOME}/x",
+			env: { HOME: TMP_HOME },
+			rule: "tmpCheckout",
+		},
+		{
+			label: "mktemp -d with a $TMPDIR/ template under /tmp",
+			command: "mktemp -d $TMPDIR/x.XXXXXX",
+			env: { TMPDIR: "/tmp/guard-bash-3988-tmpdir" },
+			rule: "tmpCheckout",
+		},
+		{
+			label: "mktemp -d with a ~/ template and HOME under /tmp",
+			command: "mktemp -d ~/x.XXXXXX",
+			env: { HOME: TMP_HOME },
+			rule: "tmpCheckout",
+		},
+		{
+			label: "worktree add after `cd ~ &&` with HOME under /tmp",
+			command: "cd ~ && git worktree add wt",
+			env: { HOME: TMP_HOME },
+			rule: "tmpCheckout",
+		},
+		{
+			label: "worktree add at $HOME/ with HOME off /tmp",
+			command: "git worktree add $HOME/wt",
+			env: { HOME: OFF_TMP_HOME },
+			rule: null,
+		},
+		{
+			label: "worktree add after `git -C ~/dir` with HOME off /tmp",
+			command: "git -C ~/proj worktree add wt",
+			env: { HOME: OFF_TMP_HOME },
+			rule: null,
+		},
+		{
+			label: "mktemp -d with a ~/ template and HOME off /tmp",
+			command: "mktemp -d ~/x.XXXXXX",
+			env: { HOME: OFF_TMP_HOME },
+			rule: null,
+		},
+		{
+			label: "worktree add at an unresolvable variable (documented fail-open)",
+			command: "git worktree add $OTHERVAR_3988/wt",
+			rule: null,
+		},
+	];
+
+	it.each(TMP_ROWS)(
+		"tmp-checkout rule resolves through the shared resolver: $label",
+		(row) => expectRule(row),
+	);
+
+	// node probe (#3680): a `~`/`$HOME` file argument was resolved as a RELATIVE
+	// path under cwd, so the repository-ownership check judged the wrong file.
+	describe("node probe file argument", () => {
+		let otherRepo: string;
+		let foreignDir: string;
+
+		beforeAll(() => {
+			otherRepo = mkdtempSync(join(tmpdir(), "pi-lens-guard-bash-3988-other-"));
+			foreignDir = mkdtempSync(
+				join(tmpdir(), "pi-lens-guard-bash-3988-foreign-"),
+			);
+			mkdirSync(join(otherRepo, "dist"));
+			// An empty `.git` directory is all repositoryRoot/repositoryIdentity read;
+			// no `git init` spawn, so the real-process-spawn ratchet does not rise.
+			mkdirSync(join(otherRepo, ".git"));
+		});
+
+		afterAll(() => {
+			rmSync(otherRepo, { recursive: true, force: true });
+			rmSync(foreignDir, { recursive: true, force: true });
+		});
+
+		it.each([
+			["~", "~/dist/cli.js"],
+			["$HOME", "$HOME/dist/cli.js"],
+		])(
+			"allows a %s spelling of a runtime file in ANOTHER repository",
+			(_label, spelling) => {
+				const result = runHook(
+					`node ${spelling} --help`,
+					{ ...BASE_ENV, HOME: otherRepo },
+					repoRoot,
+				);
+				expect(result.stderr).toBe("");
+				expect(result.status).toBe(0);
+			},
+		);
+
+		it.each([
+			["~", "~/clients/probe.mjs"],
+			["$HOME", "$HOME/clients/probe.mjs"],
+		])(
+			"denies a %s spelling of a runtime file in THIS repository, from a foreign cwd",
+			(_label, spelling) => {
+				const result = runHook(
+					`node ${spelling}`,
+					{ ...BASE_ENV, HOME: repoRoot },
+					foreignDir,
+				);
+				expect(result.stderr).toBe(`${RULE_MESSAGES.probe}\n`);
+				expect(result.status).toBe(2);
+			},
+		);
+	});
+});
+
+// #3997 round 4: a substitution's output is unknown, so the hook reads it
+// both as empty (the text master scanned) and as one opaque word piece, and
+// denies when either reading denies. Each deny row is a cell master denied and
+// c0184f1 allowed: the substitution's mark split or fused a rule word, or
+// (H1) the inline hook-bypass env never reached classifyGit.
+describe("scripts/hooks/guard-bash.mjs -- substitution next to a rule word (#3997)", () => {
+	it.each([
+		["git $(:) stash", "stash"],
+		["$(:) git stash", "stash"],
+		["sudo $(:) git stash", "stash"],
+		["env $(:) git stash", "stash"],
+		["git -C . $(:) stash", "stash"],
+		["git `:` stash", "stash"],
+		["npm$(:) run lint; git$(:) commit -m x", "checkUngated"],
+		["mktemp $(:)-d /tmp/x.XXXX", "tmpCheckout"],
+		["git worktree add /tm$(:)p/wt", "tmpCheckout"],
+		["git clone r /tm$(:)p/x", "tmpCheckout"],
+		["HUSKY=0 git $(:) commit -m x", "hookBypass"],
+		["PI_LENS_SKIP_HOOKS=1 git co$(:)mmit -m x", "hookBypass"],
+	] as Array<[string, DenyRule]>)("denies %s", (command, rule) => {
+		const result = runHook(command);
+		expect(result.stderr).toBe(`${RULE_MESSAGES[rule]}\n`);
+		expect(result.status).toBe(2);
+	});
+
+	// The opaque reading must not turn an ordinary substitution into a deny.
+	it.each([
+		'git commit -m "$(cat msg.txt)"',
+		"echo $(git rev-parse HEAD)",
+		'git -C "$(git rev-parse --show-toplevel)" status',
+	])("allows %s", (command) => {
+		const result = runHook(command);
+		expect(result.stderr).toBe("");
+		expect(result.status).toBe(0);
 	});
 });
 
@@ -1226,18 +3039,21 @@ describe("scripts/hooks/guard-bash.mjs -- tokenizer unit behavior (#2699)", () =
 	});
 
 	it("scannableRegions returns the top level first, then every substitution body, flattened", () => {
+		// Each subtracted span leaves one SUBSTITUTION_MARK (U+E000) behind
+		// (#3988), so a word that held a `$( … )`/backtick span is known to be
+		// incomplete instead of collapsing into a shorter, wrong path.
 		expect(scannableRegions("echo $(git stash) `git log`")).toEqual([
-			"echo  ",
+			"echo \uE000 \uE000",
 			"git stash",
 			"git log",
 		]);
 		// Flattened at ANY depth -- round 2 recursed with a depth cap of 8,
 		// which silently ALLOWED anything nested deeper.
 		expect(scannableRegions("echo $(echo $(echo $(git stash)))")).toEqual([
-			"echo ",
+			"echo \uE000",
 			"git stash",
-			"echo ",
-			"echo ",
+			"echo \uE000",
+			"echo \uE000",
 		]);
 	});
 
@@ -1264,6 +3080,31 @@ describe("scripts/hooks/guard-bash.mjs -- tokenizer unit behavior (#2699)", () =
 
 	it("splitWords fuses a quoted span into one opaque word", () => {
 		expect(splitWords('echo "git stash"')).toEqual(["echo", "git stash"]);
+	});
+
+	it("keeps a substitution mark from fusing into the surrounding rule word (#3997 F1)", () => {
+		for (const command of [
+			"git stash$(true)",
+			"git reset --hard$(:)",
+			"git push --force$(:) origin x",
+			"git commit --no-verify$(:) -m x",
+		]) {
+			expect(findDeny(command), command).not.toBeNull();
+		}
+	});
+
+	it("fails closed for the reviewed resolver blind spots (#3997 F3-F6)", () => {
+		for (const command of [
+			"A=$(pwd); git worktree remove $A/wt",
+			"export A=$(pwd); git worktree remove $A/wt",
+			"git worktree remove $OLDPWD/wt",
+			"git worktree remove {-q,/path/wt}",
+		]) {
+			expect(
+				findDeny(command, "/home/dev/pi-lens-guard-bash-fixed-cwd"),
+				command,
+			).toBe("worktreeUnresolved");
+		}
 	});
 
 	it("(review round 2 F1) drops a QUOTED-delimiter heredoc body -- its backtick span is never collected as a substitution", () => {
@@ -1893,34 +3734,6 @@ describe("scripts/hooks/guard-bash.mjs -- unbounded nesting never throws (review
 // a real linked worktree -- #3526/#3556 review F6 needs a REAL one for the
 // scoped-allow direction).
 describe("scripts/hooks/guard-bash.mjs -- pkill/killall shared-tool kill guard (#3556)", () => {
-	function makeLinkedWorktreeFixture(): {
-		root: string;
-		main: string;
-		linked: string;
-	} {
-		const root = mkdtempSync(join(tmpdir(), "pi-lens-guard-bash-git-"));
-		const main = join(root, "main");
-		const linked = join(root, "linked");
-		mkdirSync(main);
-		gitExecFileSync("git", ["init", "-q"], { cwd: main });
-		writeFileSync(join(main, "README.md"), "fixture\n");
-		gitExecFileSync("git", ["add", "README.md"], { cwd: main });
-		gitExecFileSync("git", ["commit", "-q", "-m", "seed"], {
-			cwd: main,
-			env: {
-				...process.env,
-				GIT_AUTHOR_NAME: "pi-lens test",
-				GIT_AUTHOR_EMAIL: "test@example.com",
-				GIT_COMMITTER_NAME: "pi-lens test",
-				GIT_COMMITTER_EMAIL: "test@example.com",
-			},
-		});
-		gitExecFileSync("git", ["worktree", "add", "-q", linked], {
-			cwd: main,
-		});
-		return { root, main, linked };
-	}
-
 	it("denies a scoped pattern from the fixture's non-linked main checkout", () => {
 		// #3663: keep the CI/plain-clone negative arm explicit so a test cannot
 		// pass merely because this suite happens to run in a linked worktree.
@@ -2137,13 +3950,22 @@ describe("scripts/hooks/guard-bash.mjs -- checkout/scratch directory under /tmp 
 		expect(result.status).toBe(2);
 	});
 
-	it("the SAME $TMPDIR-shaped destination allows once this command's own TMPDIR= points off /tmp", () => {
-		expect(
-			findDeny(
-				'TMPDIR=/home/dev/scratch git worktree add "$TMPDIR/foo"',
-				PAYLOAD_CWD,
-			),
-		).toBeNull();
+	// Bash expands `$TMPDIR` before the inline `TMPDIR=` reaches git (measured:
+	// `TMPDIR=/home/dev/scratch printf %s "$TMPDIR/foo"` prints the shell's
+	// value), so the destination follows the SHELL's TMPDIR. The ambient TMPDIR
+	// is set explicitly in both rows: the row it replaces read the runner's own
+	// TMPDIR, so it passed with a lane TMPDIR off /tmp and redded in CI (#3997).
+	it("an inline TMPDIR= does not move a $TMPDIR-shaped destination: bash expands the word first", () => {
+		const command = 'TMPDIR=/home/dev/scratch git worktree add "$TMPDIR/foo"';
+		expect(runHook(command, NO_AMBIENT_TMPDIR_ENV).stderr).toBe(
+			`${RULE_MESSAGES.tmpCheckout}\n`,
+		);
+		const offTmp = runHook(command, {
+			...NO_AMBIENT_TMPDIR_ENV,
+			TMPDIR: "/home/dev/elsewhere",
+		});
+		expect(offTmp.stderr).toBe("");
+		expect(offTmp.status).toBe(0);
 	});
 
 	it("a /tmp string inside a comment, a heredoc body, or echo text never trips the rule -- this rule reads argv WORDS, not raw text", () => {
@@ -2557,6 +4379,26 @@ describe("scripts/hooks/guard-bash.mjs -- node probe repository ownership (#3680
 		}
 	});
 
+	it("denies a relative node probe after cd fails inside another repository", () => {
+		const foreignRepo = mkdtempSync(
+			join(tmpdir(), "pi-lens-3680-foreign-repo-"),
+		);
+		try {
+			gitExecFileSync("git", ["init", "--quiet", foreignRepo], {
+				stdio: "ignore",
+			});
+			expect(
+				runHook(
+					`cd ${join(foreignRepo, "missing")} && node dist/cli.js --help`,
+					BASE_ENV,
+					repoRoot,
+				).status,
+			).toBe(2);
+		} finally {
+			rmSync(foreignRepo, { recursive: true, force: true });
+		}
+	});
+
 	it("denies a runtime file in this checkout, including a plain clone", () => {
 		expect(
 			runHook(
@@ -2787,6 +4629,379 @@ describe("scripts/hooks/guard-bash.mjs -- git hook bypass (#3778)", () => {
 		);
 		expect(dispatcher).toContain('[ "${HUSKY-}" = "0" ] && exit 0');
 		expect(findDeny("HUSKY=0 git commit -m x")).toBe("hookBypass");
+	});
+});
+
+// #3787: two helpers every git rule shares. Both populations were measured
+// against real bash 5.3 and git 2.53, not read from the issue:
+//   - Keywords that run the NEXT word as a command: do, then, else, elif, if,
+//     while, until, `!`, coproc (each created its side-effect file in a probe).
+//     Excluded on purpose: case/esac/fi/done/in/select and `function f {`,
+//     which run nothing at that word (a `case` arm is split off by `)`).
+//   - Git globals that take a SEPARATE value token: -C, -c, --git-dir,
+//     --work-tree, --namespace, --config-env, --attr-source. Excluded:
+//     --exec-path (its value form is `=` only; a bare one just prints the
+//     path) and --super-prefix (git 2.53 rejects it as an unknown option).
+describe("scripts/hooks/guard-bash.mjs -- shell keywords and separate-token git globals (#3787)", () => {
+	const KEYWORD_SHAPES: Array<[name: string, wrap: (cmd: string) => string]> = [
+		["do", (c) => `for b in x; do ${c}; done`],
+		["then", (c) => `if true; then ${c}; fi`],
+		["else", (c) => `if false; then :; else ${c}; fi`],
+		["elif", (c) => `if false; then :; elif ${c}; then :; fi`],
+		["if", (c) => `if ${c}; then :; fi`],
+		["while", (c) => `while ${c}; do break; done`],
+		["until", (c) => `until ${c}; do break; done`],
+		["bang", (c) => `! ${c}`],
+		["coproc", (c) => `coproc ${c}`],
+		["keyword then runner prefix", (c) => `if true; then command ${c}; fi`],
+		["keyword then brace", (c) => `if true; then { ${c}; }; fi`],
+	];
+	const GUARDED: Array<[command: string, rule: DenyRule]> = [
+		["git stash", "stash"],
+		["git reset --hard", "reset"],
+		["git worktree remove -f -f ../w", "worktreeForce"],
+		["git push --no-verify origin y", "hookBypass"],
+		["git commit -n -m x", "hookBypass"],
+		["git push --force origin y", "forcePush"],
+		["git rebase origin/master", "rebase"],
+	];
+
+	describe.each(KEYWORD_SHAPES)("after %s", (_name, wrap) => {
+		it.each(GUARDED)("denies %j", (command, rule) => {
+			expect(findDeny(wrap(command))).toBe(rule);
+		});
+	});
+
+	it("denies a keyword-led hook bypass through the real hook entry", () => {
+		const result = runHook("for b in x; do git push --no-verify; done");
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("scripts/red-on-base.mjs");
+		expect(runHook("if true; then git commit -n; fi").status).toBe(2);
+	});
+
+	it("classifies a guarded command in a named brace-form coproc", () => {
+		// Pure parser seam: neither this fixture nor the test launches Bash or
+		// executes its payload.
+		const command = 'coproc C { git stash; }; wait "$COPROC_PID"';
+		expect(findDeny(command)).toBe("stash");
+	});
+
+	it.each([
+		['coproc $USER { git stash; }; wait "$COPROC_PID"', "USER"],
+		['coproc ${X:-C} { git stash; }; wait "$COPROC_PID"', "X default"],
+		['coproc "$USER" { git stash; }; wait "$COPROC_PID"', "double-quoted USER"],
+		['coproc $1 { git stash; }; wait "$COPROC_PID"', "positional parameter"],
+		['coproc $- { git stash; }; wait "$COPROC_PID"', "shell option flags"],
+		[
+			"coproc $'\\x43' { git stash; }; wait \"$COPROC_PID\"",
+			"ANSI-C hexadecimal escape",
+		],
+		[
+			"coproc $'\\u43' { git stash; }; wait \"$COPROC_PID\"",
+			"ANSI-C short Unicode escape",
+		],
+		[
+			"coproc $'C\\0!' { git stash; }; wait \"$COPROC_PID\"",
+			"ANSI-C NUL-truncated",
+		],
+		[
+			"coproc $'\\x{43}' { git stash; }; wait \"$COPROC_PID\"",
+			"ANSI-C braced hexadecimal escape",
+		],
+		['coproc $@ { git stash; }; wait "$COPROC_PID"', "positional list"],
+		['coproc $* { git stash; }; wait "$COPROC_PID"', "positional star"],
+		[
+			'coproc "$@" { git stash; }; wait "$COPROC_PID"',
+			"quoted positional list",
+		],
+		[
+			'coproc "$*" { git stash; }; wait "$COPROC_PID"',
+			"quoted positional star",
+		],
+		['coproc C$SUFFIX { git stash; }; wait "$COPROC_PID"', "suffix expansion"],
+		["coproc $'C' { git stash; }; wait \"$COPROC_PID\"", "ANSI-C quoted label"],
+		['coproc $"C" { git stash; }; wait "$COPROC_PID"', "locale-quoted label"],
+		[
+			'coproc "$(printf C)" { git stash; }; wait "$COPROC_PID"',
+			"command substitution",
+		],
+		[
+			'coproc "`printf C`" { git stash; }; wait "$COPROC_PID"',
+			"backtick substitution",
+		],
+		[
+			'coproc $(printf C)9 { git stash; }; wait "$COPROC_PID"',
+			"unquoted command substitution with digit suffix",
+		],
+		[
+			'coproc `printf C`9 { git stash; }; wait "$COPROC_PID"',
+			"unquoted backtick substitution with digit suffix",
+		],
+		['coproc C$? { git stash; }; wait "$COPROC_PID"', "status suffix"],
+		[
+			'coproc $!A { git stash; }; wait "$COPROC_PID"',
+			"nullable process suffix",
+		],
+		[
+			'coproc C$! { git stash; }; wait "$COPROC_PID"',
+			"nullable process with prefix",
+		],
+		['coproc C$((65)) { git stash; }; wait "$COPROC_PID"', "arithmetic suffix"],
+		[
+			'coproc C$[65] { git stash; }; wait "$COPROC_PID"',
+			"old arithmetic suffix",
+		],
+	])(
+		"denies git stash through the real hook for a %s coproc label",
+		(command) => {
+			// Review #3949 found Bash accepts expanded and special-quoted
+			// optional labels, so scan their guarded bodies at the real hook.
+			const result = runHook(command);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("stash");
+		},
+	);
+
+	it("denies a coproc label with a dynamic prefix and digit suffix", () => {
+		const result = runHook(
+			'coproc ${PREFIX}1 { git stash; }; wait "$COPROC_PID"',
+			{ ...BASE_ENV, PREFIX: "C" },
+		);
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("stash");
+	});
+
+	it.each([
+		["if", "coproc C if git stash; then :; fi"],
+		["while", "coproc C while git stash; do break; done"],
+		["until", "coproc C until git stash; do break; done"],
+		["a subshell", "coproc C ( git stash )"],
+		["for", "coproc C for x in 1; do git stash; done"],
+		["case", "coproc C case x in x) git stash;; esac"],
+		["if, with an expanded label", "coproc $USER if git stash; then :; fi"],
+	])(
+		"denies git stash through the real hook in a named coproc before %s",
+		(_body, command) => {
+			// Bash takes the optional label before any compound command, not only
+			// a brace group: each form ran its body in a bash 5.3 probe.
+			const result = runHook(command);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("stash");
+		},
+	);
+
+	it.each(["coproc C git stash", "coproc C ! git stash"])(
+		"allows %j, which bash never runs as git",
+		(command) => {
+			// Probed in bash 5.3: the first runs `C` (command not found), the
+			// second is a syntax error.
+			expect(findDeny(command)).toBeNull();
+		},
+	);
+
+	it.each([
+		["coproc '$USER' { git stash; }; wait \"$COPROC_PID\"", "single-quoted"],
+		['coproc \\$USER { git stash; }; wait "$COPROC_PID"', "escaped"],
+		[
+			'coproc "$"USER { git stash; }; wait "$COPROC_PID"',
+			"double-quoted dollar boundary",
+		],
+	])(
+		"allows git stash when a coproc label has a %s literal dollar",
+		(command) => {
+			// Bash rejects these labels and skips the body; the hook must retain
+			// quote/escape evidence instead of treating the dollar as expansion.
+			const result = runHook(command);
+			expect(result.status).toBe(0);
+		},
+	);
+
+	it("allows a literal-dollar residue followed by an empty expansion", () => {
+		const env = { ...BASE_ENV };
+		delete env.SUFFIX;
+		const result = runHook(
+			'coproc "$"USER$SUFFIX { git stash; }; wait "$COPROC_PID"',
+			env,
+		);
+		expect(result.status).toBe(0);
+	});
+
+	it("denies an ANSI-C escape in a coproc label without decoding it", () => {
+		// Fails closed: bash rejects this label, but the hook does not decode
+		// escapes, so an escaped span could spell anything.
+		expect(findDeny("coproc C$'\\U00110000' { git stash; }")).toBe("stash");
+	});
+
+	it.each([
+		['coproc $? { git stash; }; wait "$COPROC_PID"', "status"],
+		['coproc $# { git stash; }; wait "$COPROC_PID"', "argument count"],
+		['coproc $$ { git stash; }; wait "$COPROC_PID"', "process id"],
+		['coproc $! { git stash; }; wait "$COPROC_PID"', "last process id"],
+		['coproc $?A { git stash; }; wait "$COPROC_PID"', "status plus suffix"],
+		['coproc $#A { git stash; }; wait "$COPROC_PID"', "count plus suffix"],
+		['coproc $$A { git stash; }; wait "$COPROC_PID"', "pid plus suffix"],
+		['coproc $[65] { git stash; }; wait "$COPROC_PID"', "old arithmetic"],
+	])("allows a fixed non-identifier coproc expansion: %s", (command) => {
+		expect(runHook(command).status).toBe(0);
+	});
+
+	it("accepts digits and underscores in named coproc labels", () => {
+		// Bash labels permit identifier tails; keep the guard from dropping a
+		// valid label when a future identifier regex mutation rejects them.
+		const command = 'coproc _C9 { git stash; }; wait "$COPROC_PID"';
+		expect(findDeny(command)).toBe("stash");
+	});
+
+	it.each(["!C", "C!", "$'C!'"])(
+		"does not treat the invalid coproc label %j as a named brace group",
+		(label) => {
+			// Bash reports these as invalid identifiers and does not run the body;
+			// both regex anchors must therefore remain exact.
+			expect(findDeny(`coproc ${label} { git stash; }`)).toBeNull();
+		},
+	);
+
+	it.each([
+		["git stash --include-untracked", "stash"],
+		["git commit -n -m x", "hookBypass"],
+		["git push --force origin main", "forcePush"],
+	] as const)("keeps git arguments in named coproc groups: %s", (git, rule) => {
+		expect(findDeny(`coproc C { ${git}; }`)).toBe(rule);
+	});
+
+	it.each([
+		["git stash --include-untracked", "stash"],
+		["git commit -n -m x", "hookBypass"],
+		["git push --force origin main", "forcePush"],
+	] as const)(
+		"keeps git arguments in unnamed coproc groups: %s",
+		(git, rule) => {
+			expect(findDeny(`coproc { ${git}; }`)).toBe(rule);
+		},
+	);
+
+	it.each([
+		["git stash '{'", "stash"],
+		["git commit -n '{'", "hookBypass"],
+		["git push --force '{'", "forcePush"],
+	] as const)(
+		"does not treat a quoted brace argument as coproc syntax: %s",
+		(git, rule) => {
+			expect(findDeny(git)).toBe(rule);
+		},
+	);
+
+	// #3787 mutation follow-up: braces group commands but do not gate a
+	// failed check; excluding every keyword must not also exclude `{`.
+	it.each(["git commit -m x", "git push"])(
+		"denies an ungated %s after a brace-led check",
+		(write) => {
+			expect(findDeny(`{ npm test; }; ${write}`)).toBe("checkUngated");
+			expect(findDeny(`{ npm test && ${write}; }`)).toBeNull();
+		},
+	);
+
+	const GLOBAL_FLAGS: string[] = [
+		"--git-dir x",
+		"--work-tree x",
+		"--namespace x",
+		"--config-env k=V",
+		"--attr-source HEAD",
+		"-C x --git-dir y --work-tree z",
+	];
+
+	describe.each(GLOBAL_FLAGS)("after the global %s", (flags) => {
+		it.each(GUARDED)("denies %j", (command, rule) => {
+			const [, ...rest] = command.split(" ");
+			expect(findDeny(`git ${flags} ${rest.join(" ")}`)).toBe(rule);
+		});
+	});
+
+	// The other direction: a global that takes NO separate value must not
+	// swallow the subcommand after it.
+	it.each([
+		"--no-pager",
+		"--bare",
+		"-p",
+		"--literal-pathspecs",
+		"--exec-path=/x",
+		"--git-dir=x",
+	])("a valueless global %s does not hide the subcommand", (flag) => {
+		expect(findDeny(`git ${flag} stash`)).toBe("stash");
+	});
+
+	it("sees core.hooksPath given as a separate --config-env value", () => {
+		expect(
+			findDeny("git --config-env core.hooksPath=NOHOOKS commit -m x"),
+		).toBe("hookBypass");
+		expect(
+			findDeny("git --config-env core.hooksPath=NOHOOKS push origin y"),
+		).toBe("hookBypass");
+		expect(
+			findDeny(
+				"for b in x; do git --git-dir x --config-env core.hooksPath=H commit; done",
+			),
+		).toBe("hookBypass");
+	});
+
+	const ALLOW: string[] = [
+		// the keyword word as an argument, not a command word
+		"echo then git stash",
+		"echo do; git status",
+		'grep -n "then git stash" notes.txt',
+		"printf '%s' else",
+		// keyword-led commands that are not guarded
+		"for b in x; do git status; done",
+		"if true; then git log -n 5; fi",
+		"if git diff --quiet; then git commit -m x; fi",
+		"while git fetch origin; do break; done",
+		"! git diff --quiet",
+		"for b in x; do git push origin y; done",
+		'if true; then git commit -m "mentions --no-verify and -n"; fi',
+		"for b in x; do git reset --mixed HEAD; done",
+		"for b in x; do git worktree remove -f ../w; done",
+		// a loop or branch that gates on a check stays a gate for the chain
+		// scan (#3471): the keyword word is not itself a check segment
+		"if ! npm test; then exit 1; fi; git commit -m x",
+		"if npm test; then echo ok; fi; git commit -m x",
+		"while ! npm test; do sleep 1; done; git push",
+		"until npm test; do sleep 1; done && git commit -m x",
+		// a separate global's value that spells a guarded subcommand
+		"git --git-dir stash status",
+		"git --work-tree stash status",
+		"git --namespace stash log",
+		"git --config-env user.name=stash status",
+		"git --attr-source stash status",
+		// global options that are not a bypass
+		"git --git-dir x commit -m x",
+		"git --work-tree x push origin y",
+		"git --namespace ns push origin y",
+		"git --config-env user.name=NAME commit -m x",
+		'git --git-dir x commit -m "--no-verify"',
+		"git --git-dir=x --work-tree=y status",
+		"git --no-pager log -n 5",
+		"git --config-env core.hooksPath=H status",
+	];
+
+	it.each(ALLOW)("allows %j through the real hook entry", (command) => {
+		const result = runHook(command);
+		expect(result.status).toBe(0);
+		expect(result.stderr).toBe("");
+	});
+
+	it("still does not claim sh -c, eval, xargs or nice/timeout/env -i prefixes", () => {
+		expect(findDeny("sh -c 'git stash'")).toBeNull();
+		expect(findDeny('eval "git stash"')).toBeNull();
+		expect(findDeny("echo x | xargs git stash")).toBeNull();
+		expect(findDeny("nice -n 10 git stash")).toBeNull();
+		expect(findDeny("timeout 30 git stash")).toBeNull();
+		expect(findDeny("env -i git stash")).toBeNull();
+		expect(findDeny("GIT_CONFIG_KEY_0=core.hooksPath git commit")).toBeNull();
+	});
+
+	it("reads a plain ANSI-C quoted command word but decodes no escape", () => {
+		expect(findDeny("$'git' stash")).toBe("stash");
+		expect(findDeny("$'\\x67it' stash")).toBeNull();
 	});
 });
 

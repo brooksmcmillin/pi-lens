@@ -4,7 +4,9 @@ Read first: the engineering principles (`docs/engineering-principles.md`), then
 `AGENTS.md`, then `docs/pi-lens-subagent.md`, then this contract. Then read the
 issue's acceptance criteria, the full merge-base diff
 (`git diff origin/master...HEAD`), the PR body, and merge state. Principles §3
-("Reviewing and delegating") is the base of this role and is not repeated.
+("Reviewing and delegating") is the base of this role and is not repeated. Lane mechanics (checkout, `TMPDIR`, push forms, Git grants,
+summary shape) are `docs/pi-lens-subagent.md` "Orchestrator lane mechanics";
+a brief supplies only `lane=<name>`, scope, and the grant.
 
 ## Mission
 
@@ -31,8 +33,7 @@ issue's acceptance criteria, the full merge-base diff
    exception). When the fixer settled before its evidence pass, run the
    mutation table yourself and say so.
 4. Attack with probes and quote the output. Probe scripts live outside the
-   worktree (`<worktree>/../probes-<pr>` or
-   `~/.local/share/pi-lens-orchestrator/tmp/<lane>`): an untracked `.mjs`
+   worktree (`<worktree>/../probes-<pr>` or the lane's `$TMPDIR`): an untracked `.mjs`
    inside it reds `tests/scripts/lint-js.test.ts` (#2865). Attack inversions
    (real failures downgraded, healthy paths narrowed); concurrency (shared
    state, retained settled promises, check-then-act across an await); session
@@ -51,6 +52,11 @@ issue's acceptance criteria, the full merge-base diff
 
 ## Verification
 
+For each new or changed `vi.mock` or hand-built double of a `clients/` module,
+check whether a real test seam exists (`set*`, `adopt*`, or `reset*`). If it
+does, treat the double as a finding and require the behavior to run through the
+real seam. Check that every gate the diff adds is exercised through that path.
+
 - **Name the behaviour population.** When a change replaces, moves, or widens
   a lifecycle, dispatch, or ownership seam, run EVERY suite that exercises the
   behaviour the seam governs and name the list; a curated file set cannot
@@ -65,19 +71,19 @@ issue's acceptance criteria, the full merge-base diff
   runs the same gate after its build.
 - Require the exact-pin rule in `docs/pi-lens-subagent.md` on the MERGE of
   `origin/master` and the head.
-- Read the `Mutation diff` comment for the EXACT head: check its `Head:` line
-  (`node scripts/ci-verdict.mjs <pr>` prints `MUTATION` with `STALE` or
-  `PENDING`). Apply AGENTS.md's two-layer acceptance: required new-guard proof
-  and demonstrated correctness gaps gate the review; exploratory score,
-  incidental survivors, and unevaluated population do not. Attack behavioural
-  survivor dispositions with bounded real-caller probes and name unresolved
-  cases with reason and owner. A truncated population is not equivalence and
-  never auto-clears a guard. Spot-check at most one of the fixer's hand mutations. When the comment is absent or stale, read the
-  `mutation-report` artifact (`node scripts/mutation-report.mjs --report
-  <mutation.json>`). Absent, stale, `0 mutants evaluated`, partial, or
-  `no report` evidence goes under `Could not verify`.
+- Apply AGENTS.md's two-layer mutation acceptance: required new-guard proof
+  and demonstrated correctness gaps gate the review. Spot-check a hand
+  mutation and disposition exact-head per-PR Stryker findings through real
+  callers. Absent, stale, partial, and zero-mutant reports are not clean;
+  scores and unevaluated populations alone do not gate. The nightly report
+  complements the per-PR report.
 - Repeat the pattern and population sweeps. Check blast radius, bounded
   observability, changelog, commit, and PR-body requirements.
+- Re-run the PR's `## Class sweep` search yourself and widen it when the
+  named shape is broader than the touched seam (#4273, #4268).
+- On a bug-closing PR, check the `## Detection` lesson: the layer named under
+  `Should have been caught by:` must be one that would actually have caught
+  the bug, and `Gap:` must be a real issue, test, or reason (#4288).
 - For LSP, dispatch, cache, runner, or tool changes, test one non-TypeScript
   registry entry through the same seam.
 - On a net-count fold, mutate every predicate the deleted sibling used to
@@ -105,9 +111,10 @@ Run every probe the diff can trip and say which ran and what each returned.
 - **Model covers the change, not only TLC green (#3802).** When the diff
   touches a file mapped in `formal/coverage-map.json`, require a `.tla`/`.cfg`
   change under any one of the row's families or a `TLA+ unaffected: <family> —
-  <reason>` line for any one of them; rows of 4+ families only print a note. A
-  green `TLA+ models` run over an unchanged model proves nothing about the new
-  code.
+  <reason>` line for any one of them; rows of 4+ families only print a note,
+  except `index.ts`, which gates on the lifecycle hook handler a hunk lands in.
+  A green `TLA+ models` run over an unchanged model proves nothing about the
+  new code.
 - **Red-proof audit.** A claimed red without its quoted transcript is a finding
   of its own; reproduce it (step 3).
 - **Quoted-evidence audit.** Diff every CI line the body quotes against the job
@@ -156,8 +163,7 @@ each claim's edge, re-run the targeted suites, and read CI on that head. Attack
 the round's changed lines as a fresh PR; fix rounds introduce defects at about
 the rate they remove them.
 
-- First spot-check one previous round's mutation on the new head and read its
-  `Mutation diff` comment (#2583).
+- First spot-check one previous round's mutation on the new head (#2583).
 - When a round retunes a threshold, tier, or predicate, drive the boundary
   input the new condition cannot separate through the real seam: a cure for
   over-triggering tends to ship silent under-triggering (#2983).
@@ -215,3 +221,11 @@ merge-order interactions with other open PRs, plus:
 - Cleared categories (one compact list) and exact-head identity.
 
 Use short, active, plain prose.
+
+## Documentation and prose standard
+
+Apply this standard to PR and issue bodies, review comments, commit messages, documentation, and changelog entries. Lead with the outcome. Remove words that do no work. Use active voice and present tense. Use second person for instructions, and use the imperative for steps. Keep one idea per sentence, with about 20–25 words and no more than 30 words. Use consistent terminology and sentence-case headings. Define acronyms on first use. Prefer plain words over jargon. Avoid `please`, filler, noun piles, nested parentheticals, and em-dash chains. Use the Oxford comma.
+
+The mechanical rules are checked by `scripts/check-prose.mjs`. The checker ignores fenced code, inline code, URLs, quoted log lines, blockquotes, and tables. It blocks long sentences, filler, and title-case headings. It warns on passive voice. The CLI accepts a body file or standard input and supports `--json`.
+
+Reviewers judge clarity, terminology, active voice, sentence structure, and whether each list uses parallel grammar. Treat a mechanically clean result as necessary, not sufficient. Report prose that obscures the outcome or makes a user infer the action.

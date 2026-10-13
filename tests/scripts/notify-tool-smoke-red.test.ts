@@ -75,6 +75,8 @@ describe("notify-tool-smoke-red.mjs --dry-run (#2723)", () => {
 			LENS_FULL_LOG: writeLog(dir, "lens-full.log", ""),
 			FORMAT_LAYER_OUTCOME: "skipped",
 			FORMAT_LAYER_LOG: writeLog(dir, "format-layer.log", ""),
+			RESOLUTION_LAYER_OUTCOME: "skipped",
+			RESOLUTION_LAYER_LOG: writeLog(dir, "resolution.log", ""),
 		});
 		expect(out).toContain("action=file-or-refresh");
 		expect(out).toContain("Failing layer: **LSP handshake layer**");
@@ -84,7 +86,7 @@ describe("notify-tool-smoke-red.mjs --dry-run (#2723)", () => {
 		expect(out).toContain("36 passed · 1 failed · 0 setup-failed · 12 skipped");
 	});
 
-	it("plans a close when all five gating layers succeeded", () => {
+	it("plans a close when all six gating layers succeeded", () => {
 		const dir = mkTempDir("pi-lens-tool-smoke-clean-");
 		const out = runDryRun({
 			TOOL_LAYER_OUTCOME: "success",
@@ -117,6 +119,12 @@ describe("notify-tool-smoke-red.mjs --dry-run (#2723)", () => {
 				"fmt.log",
 				"10 passed · 0 failed · 0 setup-failed · 0 skipped (tool/config unavailable)\n",
 			),
+			RESOLUTION_LAYER_OUTCOME: "success",
+			RESOLUTION_LAYER_LOG: writeLog(
+				dir,
+				"resolution.log",
+				"4 passed · 0 failed · 0 setup-failed · 0 skipped (tool/config unavailable)\n",
+			),
 		});
 		expect(out).toContain("action=close-if-open");
 	});
@@ -146,6 +154,8 @@ describe("notify-tool-smoke-red.mjs --dry-run (#2723)", () => {
 			LENS_FULL_LOG: writeLog(dir, "lens-full.log", ""),
 			FORMAT_LAYER_OUTCOME: "skipped",
 			FORMAT_LAYER_LOG: writeLog(dir, "fmt.log", ""),
+			RESOLUTION_LAYER_OUTCOME: "skipped",
+			RESOLUTION_LAYER_LOG: writeLog(dir, "resolution.log", ""),
 		});
 		expect(out).toContain("Failing layer: **LSP diagnostics clean-gate**");
 		expect(out).toContain("lua-language-server");
@@ -184,9 +194,45 @@ describe("notify-tool-smoke-red.mjs --dry-run (#2723)", () => {
 				"fmt.log",
 				"1 passed · 0 failed · 0 setup-failed · 0 skipped\n",
 			),
+			RESOLUTION_LAYER_OUTCOME: "success",
+			RESOLUTION_LAYER_LOG: writeLog(
+				dir,
+				"resolution.log",
+				"4 passed · 0 failed · 0 setup-failed · 0 skipped (tool/config unavailable)\n",
+			),
 		});
 		expect(out).toContain("Failing layer: **lens_diagnostics mode=full row**");
 		expect(out).toContain("lspFilesUnconfirmed=1, auxPartial=1");
+	});
+
+	// #1513: the Resolution layer is a gating step; a red there must file with
+	// its own layer name and the row that names the lost resolution rung. Red
+	// pre-wire: with the layer absent from LAYERS the run reads as a clean
+	// close-if-open and the issue never names the rung.
+	it("files a Resolution layer red with its layer and the lost rung", () => {
+		const dir = mkTempDir("pi-lens-tool-smoke-resolution-red-");
+		const ok = "1 passed · 0 failed · 0 setup-failed · 0 skipped\n";
+		const out = runDryRun({
+			TOOL_LAYER_OUTCOME: "success",
+			TOOL_LAYER_LOG: writeLog(dir, "tool.log", ok),
+			LSP_HANDSHAKE_OUTCOME: "success",
+			LSP_HANDSHAKE_LOG: writeLog(dir, "lsp.log", ok),
+			LSP_GATE_OUTCOME: "success",
+			LSP_GATE_LOG: writeLog(dir, "lsp-gate.log", ok),
+			LENS_FULL_OUTCOME: "success",
+			LENS_FULL_LOG: writeLog(dir, "lens-full.log", ok),
+			FORMAT_LAYER_OUTCOME: "success",
+			FORMAT_LAYER_LOG: writeLog(dir, "fmt.log", ok),
+			RESOLUTION_LAYER_OUTCOME: "failure",
+			RESOLUTION_LAYER_LOG: writeLog(
+				dir,
+				"resolution.log",
+				'✗  venv         runner:ruff                  0     expected .venv/bin/ruff via rung "venv", got "ruff" via rung "path"\n3 passed · 1 failed · 0 setup-failed · 0 skipped (tool/config unavailable)\n',
+			),
+		});
+		expect(out).toContain("action=file-or-refresh");
+		expect(out).toContain("Failing layer: **Resolution layer**");
+		expect(out).toContain('got "ruff" via rung "path"');
 	});
 
 	// Acceptance #3, the green-path-only regression this file's own module
@@ -210,6 +256,8 @@ describe("notify-tool-smoke-red.mjs --dry-run (#2723)", () => {
 			LENS_FULL_LOG: writeLog(dir, "lens-full.log", ""),
 			FORMAT_LAYER_OUTCOME: "skipped",
 			FORMAT_LAYER_LOG: writeLog(dir, "fmt.log", ""),
+			RESOLUTION_LAYER_OUTCOME: "skipped",
+			RESOLUTION_LAYER_LOG: writeLog(dir, "resolution.log", ""),
 		});
 		expect(out).toContain("action=file-or-refresh");
 		expect(out).toContain("Failing layer: **Tool layer**");
@@ -237,6 +285,8 @@ describe("notify-tool-smoke-red.mjs --dry-run (#2723)", () => {
 			LENS_FULL_LOG: writeLog(dir, "lens-full.log", ""),
 			FORMAT_LAYER_OUTCOME: "skipped",
 			FORMAT_LAYER_LOG: writeLog(dir, "fmt.log", ""),
+			RESOLUTION_LAYER_OUTCOME: "skipped",
+			RESOLUTION_LAYER_LOG: writeLog(dir, "resolution.log", ""),
 		});
 		expect(out).toContain("taking no action");
 		expect(out).not.toContain("action=");
@@ -251,6 +301,7 @@ describe("notify-tool-smoke-red.mjs --dry-run (#2723)", () => {
 				LSP_GATE_OUTCOME: undefined as unknown as string,
 				LENS_FULL_OUTCOME: undefined as unknown as string,
 				FORMAT_LAYER_OUTCOME: undefined as unknown as string,
+				RESOLUTION_LAYER_OUTCOME: undefined as unknown as string,
 			},
 			encoding: "utf-8",
 		});
@@ -339,6 +390,8 @@ const RED_ENV = (dir: string) => ({
 	LENS_FULL_LOG: writeLog(dir, "lens-full.log", ""),
 	FORMAT_LAYER_OUTCOME: "skipped",
 	FORMAT_LAYER_LOG: writeLog(dir, "fmt.log", ""),
+	RESOLUTION_LAYER_OUTCOME: "skipped",
+	RESOLUTION_LAYER_LOG: writeLog(dir, "resolution.log", ""),
 });
 
 const GREEN_ENV = (dir: string) => ({
@@ -371,6 +424,12 @@ const GREEN_ENV = (dir: string) => ({
 		dir,
 		"fmt.log",
 		"10 passed · 0 failed · 0 setup-failed · 0 skipped (tool/config unavailable)\n",
+	),
+	RESOLUTION_LAYER_OUTCOME: "success",
+	RESOLUTION_LAYER_LOG: writeLog(
+		dir,
+		"resolution.log",
+		"4 passed · 0 failed · 0 setup-failed · 0 skipped (tool/config unavailable)\n",
 	),
 });
 

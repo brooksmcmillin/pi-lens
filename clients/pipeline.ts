@@ -67,6 +67,8 @@ import {
 } from "./file-utils.js";
 import type { FormatService } from "./format-service.js";
 import type { GenerationHandle } from "./generation-guard.js";
+import { resolveAnalysisRoot, type AnalysisRootMode } from "./analysis-root.js";
+import { emitBounded } from "./bounded-telemetry.js";
 import { logLatency } from "./latency-logger.js";
 import type { PostAutofixNotice } from "./post-autofix-notice.js";
 import { emitLensAnalysisComplete } from "./lens-events.js";
@@ -245,6 +247,8 @@ async function diffProjectSnapshot(
 // --- Types ---
 
 export interface PipelineContext {
+	/** Root classification is carried from the single analysis-root seam. */
+	analysisRootMode?: AnalysisRootMode;
 	/** Live tool_result signal for aggregate formatter and dispatch bounds. */
 	signal?: AbortSignal;
 	filePath: string;
@@ -408,7 +412,13 @@ export interface PipelineResult {
 	 * re-render of an unmarked record is byte-identical to the stored summary.
 	 */
 	inlineBlockerDiagnostics?: Diagnostic[];
-	/** Content baseline captured from the pipeline read used to render blockers. */
+	/**
+	 * Content baseline of the bytes the analysis read (#3574): the inline blocker
+	 * record's `recordedHash` when the result carries blockers, and what a clean
+	 * result without authorship is compared against before it may clear such a
+	 * record (#4137 round 3). Absent when the file was unreadable or over the
+	 * baseline cap.
+	 */
 	inlineBlockerFileContent?: { size: number; sha256: string };
 	/** Fixable warning diagnostics introduced by this pipeline run. */
 	actionableWarnings?: ActionableWarningRecord[];
@@ -915,6 +925,7 @@ export async function runAutofix(
 	deps: Pick<PipelineDeps, "biomeClient" | "ruffClient" | "fixedThisTurn">,
 	getFlagSource?: PipelineContext["getFlagSource"],
 	writeHold?: FileMutationHold,
+	sessionRoot = cwd,
 ): Promise<{
 	fixedCount: number;
 	autofixTools: string[];
@@ -930,6 +941,26 @@ export async function runAutofix(
 	restoring?: Promise<FixRunLoss> | undefined;
 	skipReason?: string;
 }> {
+	if (resolveAnalysisRoot(filePath, sessionRoot) === "adopted") {
+		emitBounded(
+			"adopted_root_writer_skipped",
+			`${filePath}:autofix`,
+			{
+				filePath,
+				durationMs: 0,
+				metadata: { writer: "autofix" },
+			},
+			{ ledgerKind: "adopted-root-writer-skipped", risingEdgePer: "identity" },
+		);
+		return {
+			fixedCount: 0,
+			autofixTools: [],
+			attemptedTools: [],
+			changedFiles: [],
+			needsContentRefresh: false,
+			skipReason: "adopted_root",
+		};
+	}
 	const { biomeClient, ruffClient, fixedThisTurn } = deps;
 	const noAutofix = getFlag("no-autofix", filePath);
 	let fixedCount = 0;
@@ -1321,14 +1352,16 @@ export async function resyncHeldLspDocument(
  * Escape must not stop it). It never stamps the read guard or a `FileTime`,
  * so the formatter's bytes stay unseen by the agent. The row names what
  * happened to F; a throw is one bounded `hook-handler-crash` and no rethrow:
- * nothing awaits this.
+ * nothing awaits this. A `format_late_resync_chained` row (#3873) marks the
+ * give-up at chain time, for both callers, so a never-settling formatter is
+ * countable by file.
  */
 export function chainLateFormatResync(
 	settled: Promise<unknown>,
 	which: "deferred" | "inband",
 	row: { toolName: string; filePath: string; startedAt: number },
 	dbg: PipelineContext["dbg"],
-): void {
+): Promise<void> {
 	const inband = which === "inband";
 	const logLate = (outcome: string) => {
 		const common = {
@@ -1343,7 +1376,19 @@ export function chainLateFormatResync(
 		if (inband) logLatency({ ...common, phase: "inband_format_late_resync" });
 		else logLatency({ ...common, phase: "deferred_format_late_resync" });
 	};
-	void settled
+	// #3873 F1: the give-up itself, one row per file at chain time. The late
+	// rows below come only when the formatter settles; a formatter that never
+	// does, or an Escape, left no per-file record of the give-up at all.
+	// Bound: one per abandoned formatter run.
+	logLatency({
+		type: "phase",
+		phase: "format_late_resync_chained",
+		toolName: row.toolName,
+		filePath: row.filePath,
+		durationMs: Date.now() - row.startedAt,
+		metadata: { which },
+	});
+	return settled
 		.then(async () => {
 			logLate(await resyncHeldLspDocument(row.filePath));
 		})
@@ -1597,6 +1642,7 @@ export async function runFormatPhase(
 	budgetMs = HOOK_WALL_BUDGET_MS.tool_result_edit,
 	hook: LedgerHookKey = "tool_result_edit",
 	writeHold?: FileMutationHold,
+	sessionRoot?: string,
 ): Promise<FormatPhaseResult> {
 	let formatChanged = false;
 	let formattersUsed: string[] = [];
@@ -1605,78 +1651,96 @@ export async function runFormatPhase(
 	let fileContent: string | undefined;
 	let abandoned: Promise<void> | undefined;
 
-	const formatService = getFormatService();
-	try {
-		formatService.recordRead(filePath);
-		// #3506: the formatter rewrites the file in place (see runAutofix). It
-		// enters the hold once its command is resolved (#3558), and one the
-		// budget gave up on keeps its entry until its child settles.
-		const result = await formatService.formatFile(filePath, {
-			signal,
-			budgetMs,
-			hook,
-			...(writeHold ? { writeHold } : {}),
-		});
-		abandoned = result.abandoned;
-		// An unavailable tool is NOT a formatter that ran (#2413): keep it out of
-		// `formattersUsed` (which drives change bookkeeping / turn summaries) and
-		// out of `formatFailures` (which requeues). Record it once, distinctly.
-		for (const f of result.formatters) {
-			if (f.outcome !== "unavailable") continue;
-			if (f.error?.includes("project tool agreement could not be established"))
-				continue;
-			const reason = f.error ?? "formatter executable not found";
-			formatUnavailable.push({ formatter: f.name, reason });
-			recordDegradationOnce({
-				kind: "formatter-unavailable",
-				subject: `${f.name}:${path.basename(filePath)}`,
-				reason,
+	const adopted =
+		sessionRoot !== undefined &&
+		resolveAnalysisRoot(filePath, sessionRoot) === "adopted";
+	if (adopted)
+		emitBounded(
+			"adopted_root_writer_skipped",
+			`${filePath}:format`,
+			{
+				filePath,
+				durationMs: 0,
+				metadata: { writer: "format" },
+			},
+			{ ledgerKind: "adopted-root-writer-skipped", risingEdgePer: "identity" },
+		);
+	if (!adopted) {
+		const formatService = getFormatService();
+		try {
+			formatService.recordRead(filePath);
+			// #3506: the formatter rewrites the file in place (see runAutofix). It
+			// enters the hold once its command is resolved (#3558), and one the
+			// budget gave up on keeps its entry until its child settles.
+			const result = await formatService.formatFile(filePath, {
+				signal,
+				budgetMs,
+				hook,
+				...(writeHold ? { writeHold } : {}),
 			});
-		}
-		formattersUsed = result.formatters
-			.filter((f) => f.outcome !== "unavailable")
-			.map((f) => f.name);
-		if (result.anyChanged) {
-			formatChanged = true;
-			dbg(
-				"autoformat: " +
-					result.formatters
-						.map(
-							(f) => f.name + "(" + (f.changed ? "changed" : "unchanged") + ")",
-						)
-						.join(", "),
-			);
-		}
-		if (!result.allSucceeded) {
-			const failures = result.formatters.filter((f) => !f.success);
-			for (const failure of failures) {
+			abandoned = result.abandoned;
+			// An unavailable tool is NOT a formatter that ran (#2413): keep it out of
+			// `formattersUsed` (which drives change bookkeeping / turn summaries) and
+			// out of `formatFailures` (which requeues). Record it once, distinctly.
+			for (const f of result.formatters) {
+				if (f.outcome !== "unavailable") continue;
+				if (
+					f.error?.includes("project tool agreement could not be established")
+				)
+					continue;
+				const reason = f.error ?? "formatter executable not found";
+				formatUnavailable.push({ formatter: f.name, reason });
 				recordDegradationOnce({
-					kind: "formatter-failure",
-					subject: `${failure.name}:${path.basename(filePath)}`,
-					reason: failure.error ?? "unknown error",
+					kind: "formatter-unavailable",
+					subject: `${f.name}:${path.basename(filePath)}`,
+					reason,
 				});
 			}
-			formatFailures.push(
-				...failures.map((f) => `${f.name}: ${f.error ?? "unknown error"}`),
-			);
-			dbg(
-				"autoformat: " +
-					failures
-						.map((f) => f.name + " failed: " + (f.error ?? "unknown error"))
-						.join("; "),
-			);
+			formattersUsed = result.formatters
+				.filter((f) => f.outcome !== "unavailable")
+				.map((f) => f.name);
+			if (result.anyChanged) {
+				formatChanged = true;
+				dbg(
+					"autoformat: " +
+						result.formatters
+							.map(
+								(f) =>
+									f.name + "(" + (f.changed ? "changed" : "unchanged") + ")",
+							)
+							.join(", "),
+				);
+			}
+			if (!result.allSucceeded) {
+				const failures = result.formatters.filter((f) => !f.success);
+				for (const failure of failures) {
+					recordDegradationOnce({
+						kind: "formatter-failure",
+						subject: `${failure.name}:${path.basename(filePath)}`,
+						reason: failure.error ?? "unknown error",
+					});
+				}
+				formatFailures.push(
+					...failures.map((f) => `${f.name}: ${f.error ?? "unknown error"}`),
+				);
+				dbg(
+					"autoformat: " +
+						failures
+							.map((f) => f.name + " failed: " + (f.error ?? "unknown error"))
+							.join("; "),
+				);
+			}
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			recordDegradationOnce({
+				kind: "formatter-failure",
+				subject: `format-service:${path.basename(filePath)}`,
+				reason: message,
+			});
+			formatFailures.push(message);
+			dbg(`autoformat error: ${err}`);
 		}
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		recordDegradationOnce({
-			kind: "formatter-failure",
-			subject: `format-service:${path.basename(filePath)}`,
-			reason: message,
-		});
-		formatFailures.push(message);
-		dbg(`autoformat error: ${err}`);
 	}
-
 	const fileReadStamp = performance.now();
 	const fileReadAtMs = Date.now();
 	let fileBytes: Buffer | undefined;
@@ -1824,7 +1888,9 @@ async function analysePipeline(
 	let formattersUsed: string[] = [];
 	let formatFailures: string[] = [];
 	const piChangedFiles = new Set<string>();
-	const autoformatDisabled = !!getFlag("no-autoformat", filePath);
+	const autoformatDisabled =
+		resolveAnalysisRoot(filePath, ctx.projectRoot ?? cwd) === "adopted" ||
+		!!getFlag("no-autoformat", filePath);
 	const immediateFormat = !!getFlag("immediate-format");
 	const formatDeferred =
 		allowAutonomousWriters &&
@@ -1845,11 +1911,13 @@ async function analysePipeline(
 			undefined,
 			undefined,
 			writeHold,
+			ctx.projectRoot ?? cwd,
 		);
 		// #3858: a formatter the budget (or Escape) gave up on writes F later,
 		// after the sync below pushed the bytes from before. Sync that write too.
 		if (formatResult.abandoned)
-			chainLateFormatResync(
+			// The chain owns rejection handling; this continuation is intentionally detached.
+			void chainLateFormatResync(
 				formatResult.abandoned,
 				"inband",
 				{ toolName, filePath, startedAt: pipelineStart },
@@ -1925,6 +1993,7 @@ async function analysePipeline(
 			deps,
 			getFlagSource,
 			writeHold,
+			ctx.projectRoot ?? cwd,
 		));
 	// The restore waits for pi's queue entries (#3830), so this result never
 	// waits for it: F's diagnostics and blockers must not wait on whoever holds a
@@ -2061,10 +2130,12 @@ async function analysePipeline(
 		},
 		{
 			projectRoot: ctx.projectRoot,
+			analysisRootMode: ctx.analysisRootMode,
 			// The runners' widget order (#3540).
 			writeIndex: widgetOrder(),
 			// #3568: a collect-later runner defers its result to a turn end.
 			sessionGeneration: ctx.sessionGeneration,
+			sessionId: ctx.telemetry?.sessionId,
 			telemetryModel: ctx.telemetry?.modelId,
 			telemetryProvider: ctx.telemetry?.provider,
 		},
@@ -2397,9 +2468,7 @@ async function analysePipeline(
 						source: "autofix",
 					}
 				: undefined,
-		inlineBlockerFileContent: hasBlockers
-			? inlineBlockerFileContent
-			: undefined,
+		inlineBlockerFileContent,
 		// #3246: the very array `blockerOutput` above was rendered from, so the
 		// turn-end policy filter and its re-render can never disagree with the
 		// text they guard — the same provenance argument `inlineBlockerSources`

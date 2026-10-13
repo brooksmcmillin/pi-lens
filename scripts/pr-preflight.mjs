@@ -27,6 +27,11 @@ export const GATES = [
 		CI_JOB_NAMES.LINT_AND_TYPECHECK,
 	],
 	[
+		"check:allow-scripts",
+		["npm", "run", "check:allow-scripts"],
+		CI_JOB_NAMES.LINT_AND_TYPECHECK,
+	],
+	[
 		"lockfile:complete",
 		["npm", "run", "check:lockfile", "--", "--complete"],
 		CI_JOB_NAMES.LINT_AND_TYPECHECK,

@@ -21,20 +21,6 @@ import { rowsFromArtifacts } from "./test-history-rollup.mjs";
 import { median } from "./lib/test-shard-assignment.mjs";
 
 /**
- * Repo-relative posix id of a vitest JSON `name`: everything from the first
- * `/tests/` on (every test file lives under tests/; the prefix is the CI
- * checkout or a local worktree).
- *
- * @param {string} name
- * @returns {string|null}
- */
-export function testFileId(name) {
-	const posix = String(name).replaceAll("\\", "/");
-	const at = posix.indexOf("/tests/");
-	return at === -1 ? null : posix.slice(at + 1);
-}
-
-/**
  * The artifact walk and the per-file duration rule are the nightly test-history
  * rollup's (`rowsFromArtifacts`), so a report shape that rollup reads is read
  * here identically. Each run directory holds the shards' `vitest-results.json`
@@ -50,8 +36,10 @@ export function buildWeights(runDirs) {
 		/** @type {Map<string, number>} */
 		const thisRun = new Map();
 		for (const row of rowsFromArtifacts([dir])) {
-			const id = testFileId(row.file);
-			if (id !== null) thisRun.set(id, row.durationMs / 1000);
+			// `row.file` is already the journal's repo-relative id (#3367); a name
+			// outside `tests/` is not a test file and carries no weight.
+			if (row.file.startsWith("tests/"))
+				thisRun.set(row.file, row.durationMs / 1000);
 		}
 		for (const [id, seconds] of thisRun) {
 			const list = samples.get(id) ?? [];

@@ -1,5 +1,6 @@
 export declare function addedChangelogFragments(options: {
 	base?: string;
+	head?: string;
 	cwd: string;
 	git?: (
 		args: string[],
@@ -10,6 +11,7 @@ export declare function addedChangelogFragments(options: {
 
 export declare function checkChangelogFragments(options: {
 	base?: string;
+	head?: string;
 	cwd: string;
 	git?: (
 		args: string[],

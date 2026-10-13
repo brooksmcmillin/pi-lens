@@ -101,6 +101,12 @@ const CRITICAL_STEPS: [
 	// Fork #21 intentionally omits the production dependency audit gate.
 	["ci.yml", "lint-and-typecheck", "Lockfile complete under the CI npm pin"],
 	["ci.yml", "lint-and-typecheck", "Lockfile in sync with package.json"],
+	// #1185: the allowScripts policy check is a required verdict of this job.
+	[
+		"ci.yml",
+		"lint-and-typecheck",
+		"allowScripts policy matches the resolved lockfile",
+	],
 	["ci.yml", "lint-and-typecheck", "Grammar provenance in sync with manifest"],
 	["ci.yml", "lint-and-typecheck", "TypeScript & JS lint"],
 	["ci.yml", "lint-and-typecheck", "ast-grep rule pair audit"],
@@ -136,6 +142,10 @@ const PRODUCERS: Producer[] = [
 			},
 			{ id: "Install dependencies", stepClass: "setup" },
 			{ id: "Lockfile in sync with package.json", stepClass: "verdict" },
+			{
+				id: "allowScripts policy matches the resolved lockfile",
+				stepClass: "verdict",
+			},
 			{
 				id: "Grammar provenance in sync with manifest",
 				stepClass: "verdict",
@@ -176,7 +186,7 @@ const PRODUCER_STEP_COUNTS: Record<
 	`${StepWorkflow}:${string}`,
 	Record<StepClass, number>
 > = {
-	"ci.yml:lint-and-typecheck": { verdict: 5, setup: 3, "best-effort": 0 },
+	"ci.yml:lint-and-typecheck": { verdict: 6, setup: 3, "best-effort": 0 },
 	"lint.yml:knip": { verdict: 1, setup: 3, "best-effort": 0 },
 	"lint.yml:oxfmt": { verdict: 1, setup: 3, "best-effort": 0 },
 };

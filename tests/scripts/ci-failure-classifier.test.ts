@@ -1903,3 +1903,22 @@ describe("buildCommentBody (#2103)", () => {
 		});
 	});
 });
+
+describe("classifier summary evidence reads through the Vitest parser (#4087)", () => {
+	// Recurrence: the classifier kept two private `Tests`/`Test Files` patterns
+	// beside the shared parser; the tally pattern missed `2 passed | 1 failed`
+	// (a count that is not first on the line).
+	it("names a failed count that is not first on the Tests line", () => {
+		const result = classifyFailureLog("      Tests  2 passed | 1 failed (3)\n");
+		expect(result.kind).toBe("real");
+		expect(result.detail).toContain("1 test(s) failed (overall tally line");
+	});
+
+	it("names failing test files from the Test Files line", () => {
+		const result = classifyFailureLog(
+			"  Test Files  3 failed | 1 passed (4)\n",
+		);
+		expect(result.kind).toBe("real");
+		expect(result.detail).toBe("Test Files 3 failed");
+	});
+});

@@ -73,6 +73,26 @@ export const DEFAULT_MAX_RANGES = 40;
 // about mutant execution cost.
 export const DEFAULT_MAX_TESTS = 47;
 
+// #4092: the count cap above never bound the nightly. The PR's own test files
+// (every test file changed in the window) are exempt from it, so both shards of
+// run 37629970371 ran 122 test files, not 47, and the initial test run took
+// 358 s on 4 cores and 449 s on 2, past Stryker's 5-minute default. The run is
+// now also bounded by estimated runtime: each coverage probe records the test
+// time vitest reports for its file, and the kept tests are fitted into
+// MAX_DRY_RUN_SECONDS. 240 s is where the four initial runs that passed in CI
+// sat (231 to 254 s, run 37605896822), and stryker.config.mjs's
+// `dryRunTimeoutMinutes` (10) is 2.5x it. A test with no timing counts
+// UNKNOWN_TEST_SECONDS and every file adds TEST_FILE_OVERHEAD_SECONDS (import
+// and transform; 58 s over 122 files at 2 cores). The unknown cost is the p95 of
+// the 122 measured files (12 s), not their mean (3.2 s, half of it one 169 s
+// file; median 0.13 s): an all-unknown own set costed at the mean kept 64 files
+// of which the actual seconds reached 360 s (p95 over 400 shuffles), costed at
+// 12 s the p95 is 221 s, inside the cap (R2 F2 of #4108). Raw measurements:
+// tests/fixtures/mutation-dry-run-measurement.json.
+export const MAX_DRY_RUN_SECONDS = 240;
+export const UNKNOWN_TEST_SECONDS = 12;
+export const TEST_FILE_OVERHEAD_SECONDS = 0.5;
+
 /**
  * Wall-clock bound the driver puts on the Stryker child, in minutes. It must
  * stay strictly below .github/workflows/ci.yml's `mutation` job `timeout-minutes`, or
@@ -103,6 +123,46 @@ export const isCompiledMutationSource = (file) =>
 	(/^(?:clients|tools|mcp)\/.*\.ts$/.test(file) || file === "index.ts") &&
 	!file.endsWith(".test.ts") &&
 	!file.endsWith(".d.ts");
+
+/**
+ * A path that may sit on the nightly carry-over queue (#4005): a runtime source
+ * spelled as a plain repository-relative path. The queue lives in an issue body
+ * a maintainer can edit, so the list is validated on read: no `..`, absolute,
+ * backslash, comma, `-->` or whitespace spelling gets through.
+ */
+export const isQueueablePath = (file) =>
+	typeof file === "string" &&
+	/^[A-Za-z0-9_./@+-]+$/.test(file) &&
+	file
+		.split("/")
+		.every((part) => part !== "" && part !== "." && part !== "..") &&
+	isCompiledMutationSource(file);
+
+const QUEUE_BASE_RE = /^[0-9a-f]{40}$/;
+
+/**
+ * One carry-over queue entry (#4005 r4): `path@sha`, the sha being the base the
+ * file's unevaluated changes start from, or a bare `path` (no base: read
+ * against the window base). Only a full lowercase sha is split off; any other
+ * suffix stays part of the spelling, which then has to be a queueable path by
+ * itself. Returns null when the spelling is not an entry.
+ *
+ * @param {unknown} spelling
+ * @returns {{file: string, base: string | null} | null}
+ */
+export function parseQueueEntry(spelling) {
+	const text = typeof spelling === "string" ? spelling.trim() : "";
+	const at = text.lastIndexOf("@");
+	const split = at > 0 && QUEUE_BASE_RE.test(text.slice(at + 1));
+	const file = split ? text.slice(0, at) : text;
+	return isQueueablePath(file)
+		? { file, base: split ? text.slice(at + 1) : null }
+		: null;
+}
+
+/** @param {{file: string, base: string | null}} entry */
+export const formatQueueEntry = ({ file, base }) =>
+	base ? `${file}@${base}` : file;
 
 export const isMutationSourceFile = (file) =>
 	isScriptMutationFile(file) || isCompiledMutationSource(file);
@@ -181,6 +241,91 @@ export function capMutationFiles(
 		selected: ordered.slice(0, maxFiles),
 		skipped: ordered.slice(maxFiles),
 	};
+}
+
+/**
+ * The mutate set of one nightly run (#4005): files carried over from earlier
+ * nights first, in their queue order, then the new window's files by changed-
+ * line weight, under the one `maxFiles` cap. What the cap leaves out, pending
+ * files first, is `skipped` and goes back on the queue.
+ *
+ * @param {{pending?: string[], windowFiles: string[], maxFiles?: number, weights?: Map<string, number>}} options
+ */
+export function selectMutationFiles({
+	pending = [],
+	windowFiles,
+	maxFiles = DEFAULT_MAX_FILES,
+	weights = new Map(),
+}) {
+	const queue = [...new Set(pending)];
+	const queued = new Set(queue);
+	const head = queue.slice(0, maxFiles);
+	const rest = capMutationFiles(
+		windowFiles.filter((file) => !queued.has(file)),
+		maxFiles - head.length,
+		weights,
+	);
+	return {
+		selected: [...head, ...rest.selected],
+		skipped: [...queue.slice(maxFiles), ...rest.skipped],
+	};
+}
+
+/**
+ * Split one globally selected population into disjoint deterministic shards.
+ * Selection happens before splitting so queue order and path@sha bases have
+ * one canonical decision (#4035 r2).
+ *
+ * @param {{selected: string[], skipped: string[], shardIndex?: number, shardCount?: number}} options
+ */
+export function partitionMutationFiles({
+	selected,
+	skipped,
+	shardIndex = 0,
+	shardCount = 1,
+}) {
+	if (
+		!Number.isInteger(shardIndex) ||
+		!Number.isInteger(shardCount) ||
+		shardCount < 1 ||
+		shardIndex < 0 ||
+		shardIndex >= shardCount
+	)
+		throw new RangeError("invalid mutation shard");
+	return {
+		selected: selected.filter((_, index) => index % shardCount === shardIndex),
+		// One shard owns skipped files so combined reports do not duplicate them.
+		skipped: shardIndex === 0 ? skipped : [],
+	};
+}
+
+/**
+ * Changed line ranges per file, each file against its own base (#4005 r4): a
+ * carried-over file against the base its queue entry carries (its earlier
+ * changes are outside the current window), every other file against the
+ * window base. One `diff(base, files)` call per distinct base; it is the git
+ * call, injected so the split is testable.
+ *
+ * @param {{files: string[], baseRef: string, baseOf?: Map<string, string>, diff: (base: string, files: string[]) => Map<string, Array<[number, number]>>}} options
+ */
+export function collectChangedRanges({
+	files,
+	baseRef,
+	baseOf = new Map(),
+	diff,
+}) {
+	const groups = new Map([[baseRef, []]]);
+	for (const file of files) {
+		const base = baseOf.get(file) ?? baseRef;
+		if (!groups.has(base)) groups.set(base, []);
+		groups.get(base).push(file);
+	}
+	const out = new Map();
+	for (const [base, subset] of groups) {
+		if (subset.length === 0) continue;
+		for (const [k, v] of diff(base, subset)) out.set(k, v);
+	}
+	return out;
 }
 
 /**
@@ -316,21 +461,54 @@ export function extractSnippet(sourceLines, location) {
  *
  * @param {{status: number|null, signal?: string|null, error?: Error & {code?: string}}} result
  * @param {number} budgetMinutes
+ * @param {{minutes?: number} | null} [dryRunTimeout] set when Stryker's own
+ *   initial-test-run bound fired (#4092), which no spawn error reveals
  */
-function strykerFailureCause(result, budgetMinutes) {
+function strykerFailureCause(result, budgetMinutes, dryRunTimeout = null) {
+	if (dryRunTimeout) {
+		return `the initial test run exceeded Stryker's dryRunTimeoutMinutes${dryRunTimeout.minutes === undefined ? "" : ` (${dryRunTimeout.minutes})`} before any mutant was evaluated`;
+	}
 	return result.error?.code === "ETIMEDOUT"
 		? `the ${budgetMinutes}-minute mutation budget expired before Stryker produced a result`
 		: `dry run or mutation execution failed (Stryker status ${result.status ?? "unknown"}${result.error ? `: ${result.error.message}` : ""})`;
 }
 
+// Stryker's DryRunExecutor logs this at ERROR when the initial test run passes
+// `dryRunTimeoutMinutes` (@stryker-mutator/core 3-dry-run-executor.js
+// logTimeoutInitialRun), then throws, so the child exits 1 like any other
+// dry-run failure; the text is the only discriminator (#4092). Anchored to the
+// logger's own line (`HH:MM:SS (pid) ERROR DryRunExecutor <message>`, with the
+// ANSI colour codes chalk adds, verbatim from run 37629970371): Stryker's
+// command runner puts the whole vitest output into the "One or more tests
+// failed in the initial test run" log, and a test that asserts or prints the
+// literal (this lane's own tests do) would otherwise read as a timeout and hide
+// a real failure. The two logs are exclusive in Stryker (a Complete run with
+// failures, or a Timeout), so the failed-tests line also vetoes.
+const ANSI = String.raw`(?:\x1b\[[0-9;]*m)*`;
+const DRY_RUN_TIMEOUT_RE = new RegExp(
+	String.raw`^${ANSI}\d{2}:\d{2}:\d{2} \(\d+\) ERROR DryRunExecutor${ANSI} Initial test run timed out!\s*$`,
+	"m",
+);
+const DRY_RUN_TESTS_FAILED_RE =
+	/One or more tests failed in the initial test run/;
+
+/**
+ * @param {string} [output] Stryker's console output or its file log
+ */
+export const isDryRunTimeout = (output = "") =>
+	DRY_RUN_TIMEOUT_RE.test(output) && !DRY_RUN_TESTS_FAILED_RE.test(output);
+
 /**
  * @param {{status: number|null, signal?: string|null, error?: Error & {code?: string}}} result
  * @param {number} budgetMinutes
+ * @param {{tests?: string[], output?: string, dryRunTimeoutMinutes?: number}} [details]
+ *   `output` is Stryker's console text or file log: it names the failing tests
+ *   and tells a dry-run timeout (`isDryRunTimeout`) from any other failure
  */
 export function describeStrykerFailure(
 	result,
 	budgetMinutes,
-	{ tests = [], output = "" } = {},
+	{ tests = [], output = "", dryRunTimeoutMinutes } = {},
 ) {
 	const failed = [
 		...new Set(
@@ -344,7 +522,10 @@ export function describeStrykerFailure(
 		named.length > 0
 			? `; tests involved: ${named.join(", ")}`
 			: "; no related test file was identified";
-	return `mutation diff: dry run failed; no mutants evaluated; ${strykerFailureCause(result, budgetMinutes)}${suffix}`;
+	const dryRunTimeout = isDryRunTimeout(output)
+		? { minutes: dryRunTimeoutMinutes }
+		: null;
+	return `mutation diff: dry run ${dryRunTimeout ? "timed out" : "failed"}; no mutants evaluated; ${strykerFailureCause(result, budgetMinutes, dryRunTimeout)}${suffix}`;
 }
 
 /**

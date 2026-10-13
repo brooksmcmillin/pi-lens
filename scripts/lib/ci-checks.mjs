@@ -2,16 +2,14 @@
  * scripts/lib/ci-checks.mjs (#2539 round 2, F2): the ONE required-checks name
  * list and the ONE fail-closed "latest check-run per name" resolver, shared
  * by every consumer that reads GitHub check-runs for this repo's two gating
- * checks -- merge-train-warden.mjs (GraphQL rollup: `startedAt`, UPPERCASE
- * `status`/`conclusion`) and ci-verdict.mjs (REST `commits/<sha>/check-runs`:
- * `started_at`, lowercase `status`/`conclusion`). A third consumer,
- * The retired merge lane no longer consumes this module.
+ * checks -- ci-verdict.mjs (REST `commits/<sha>/check-runs`: `started_at`,
+ * lowercase `status`/`conclusion`). The retired merge lane and the retired
+ * merge-train warden (#4105) no longer consume this module.
  *
  * Before this round, ci-verdict.mjs hand-rolled its own `latestRunNamed`
  * with an `id`-as-tiebreak policy that is NOT fail-closed (a superseded
- * SUCCESS with the higher id could win a tie over an unresolved duplicate),
- * while merge-train-warden.mjs already carried the correct policy. Two
- * required-check name lists and two different tie policies for the same
+ * SUCCESS with the higher id could win a tie over an unresolved duplicate).
+ * Two required-check name lists and two different tie policies for the same
  * real-world duplicate-check-run shape (a rerun, or the classify-ci-failure
  * auto-rerun, #2103) is the single-source-of-truth defect this module fixes.
  */
@@ -108,6 +106,22 @@ export const DEFERRED_ADVISORY_CHECKS = Object.freeze([
 	"CodeQL (actions) (advisory)",
 	"CodeQL (javascript-typescript) (advisory)",
 ]);
+
+// #4090: the events whose workflow runs are NOT a commit's PR/push CI. A
+// scheduled run attaches its check-runs to master's head and a dispatched run
+// to the dispatched branch's head, so without this a nightly lane or a
+// label-triage job turns a PR or master red. A run of any other (or unknown)
+// event keeps today's gating.
+const NON_PR_CI_EVENTS = new Set([
+	"schedule",
+	"workflow_dispatch",
+	"repository_dispatch",
+	"workflow_run",
+]);
+
+export function isNonPrCiEvent(event) {
+	return NON_PR_CI_EVENTS.has(String(event ?? ""));
+}
 
 export function isAdvisoryCheck(name) {
 	return (

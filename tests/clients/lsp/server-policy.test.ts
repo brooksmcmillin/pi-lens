@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { removeTempDirSync } from "../test-utils.js";
 
 const toolNotFound = (message = "ENOENT: command not found") =>
@@ -30,6 +30,7 @@ vi.mock("../../../clients/installer/index.js", () => ({
 
 vi.mock("../../../clients/lsp/launch.js", () => ({
 	launchLSP,
+	admitProjectSuppliedTsserver: (tsserverPath: string) => tsserverPath,
 }));
 
 // Suppress sync disk I/O from logLatency — prevents timeout under full-suite load
@@ -122,6 +123,17 @@ afterEach(() => {
 	observedReadFileSync.mockClear();
 	logSessionStart.mockClear();
 	vi.resetModules();
+});
+
+// The suite plants project-local interpreters (`.venv`) and binaries on
+// purpose; the trust gate itself is witnessed by
+// `tests/clients/project-local-bin-trust.test.ts`.
+//
+// `afterEach` resets the module graph, so this re-imports the fresh trust
+// module before each case; every module under test then shares that instance.
+beforeEach(async () => {
+	const trust = await import("../../../clients/project-trust.js");
+	trust.setProjectTrustState("trusted");
 });
 
 describe("lsp server policy", () => {
@@ -774,6 +786,72 @@ describe("lsp server policy", () => {
 		await expect(NearestRoot(["package.json"])(file)).resolves.toBe(tmp);
 	});
 
+	it("declines pi-agent staging roots and records the declined root (#1129)", async () => {
+		const { resolveLspServerCwd } =
+			await import("../../../clients/lsp/server.js");
+		const { getDegradationSummary, resetDegradationLedger } =
+			await import("../../../clients/degradation-ledger.js");
+		const fixtureRoot = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-1129-agent-"),
+		);
+		const tmp = path.join(fixtureRoot, "pi-agent-1129");
+		fs.mkdirSync(tmp);
+		dirs.push(fixtureRoot);
+		const file = path.join(tmp, "src", "index.ts");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(file, "export const value = 1;\n");
+		resetDegradationLedger();
+
+		const server = {
+			id: "test",
+			root: async () => tmp,
+			rootMarkers: ["package.json"],
+		};
+		expect(await resolveLspServerCwd(server, file, tmp)).toBeUndefined();
+		expect(await resolveLspServerCwd(server, file, tmp)).toBeUndefined();
+		const declined = getDegradationSummary().find(
+			(group) => group.kind === "lsp-root-declined",
+		);
+		expect(declined?.count).toBe(1);
+		expect(declined?.latestReasons[0]?.subject).toBe(fs.realpathSync(tmp));
+	});
+
+	// Recurrence (#1129 F5, review probe p4): a real checkout named
+	// pi-agent-sdk under the tmpdir got no LSP cwd at all.
+	it("keeps the LSP root of a real checkout named like a pi-agent staging dir (#1129)", async () => {
+		const { resolveLspServerCwd } =
+			await import("../../../clients/lsp/server.js");
+		const { getDegradationSummary, resetDegradationLedger } =
+			await import("../../../clients/degradation-ledger.js");
+		const fixtureRoot = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-1129-agent-sdk-"),
+		);
+		dirs.push(fixtureRoot);
+		const checkout = path.join(fixtureRoot, "pi-agent-sdk");
+		fs.mkdirSync(path.join(checkout, ".git", "objects"), { recursive: true });
+		fs.writeFileSync(
+			path.join(checkout, ".git", "HEAD"),
+			"ref: refs/heads/main\n",
+		);
+		fs.writeFileSync(path.join(checkout, "package.json"), "{}\n");
+		const file = path.join(checkout, "src", "index.ts");
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(file, "export const value = 1;\n");
+		resetDegradationLedger();
+
+		const server = {
+			id: "test",
+			root: async () => checkout,
+			rootMarkers: ["package.json"],
+		};
+		expect(await resolveLspServerCwd(server, file, checkout)).toBe(checkout);
+		expect(
+			getDegradationSummary().some(
+				(group) => group.kind === "lsp-root-declined",
+			),
+		).toBe(false);
+	});
+
 	it("does not classify a testdata substring as a fixture segment (#1328)", async () => {
 		const { NearestRoot } = await import("../../../clients/lsp/server.js");
 		const tmp = fs.mkdtempSync(
@@ -1068,6 +1146,11 @@ describe("lsp server policy", () => {
 		fs.mkdirSync(tsserverDir, { recursive: true });
 		const tsserverPath = path.join(tsserverDir, "tsserver.js");
 		fs.writeFileSync(tsserverPath, "// fake tsserver\n");
+		// #4299: the real wrapper requires a package version for an explicit compiler.
+		fs.writeFileSync(
+			path.join(tsserverDir, "..", "package.json"),
+			JSON.stringify({ name: "typescript", version: "5.9.3" }),
+		);
 
 		const nestedRoot = path.join(tmp, "cypress");
 		fs.mkdirSync(nestedRoot, { recursive: true });
@@ -1147,15 +1230,10 @@ describe("lsp server policy", () => {
 		const first = await TypeScriptServer.spawn(tree.tmp);
 		const second = await TypeScriptServer.spawn(tree.tmp);
 
-		expect(first?.initialization).toBeUndefined();
-		expect(second?.initialization).toBeUndefined();
-		expect(launchLSP).toHaveBeenCalledWith(
-			tree.lspPath,
-			["--stdio"],
-			expect.objectContaining({
-				env: expect.objectContaining({ TSSERVER_PATH: undefined }),
-			}),
-		);
+		// #4299: an unsuccessful repair cannot authorize implicit workspace fallback.
+		expect(first).toBeUndefined();
+		expect(second).toBeUndefined();
+		expect(launchLSP).not.toHaveBeenCalled();
 		expect(
 			ensureTool.mock.calls.filter(
 				(call) => call[0] === "typescript" && call[1]?.forceReinstall === true,
@@ -1297,6 +1375,8 @@ describe("lsp server policy", () => {
 	it("keeps custom LSP config scoped per workspace", async () => {
 		const { getServersForFileWithConfig, initLSPConfig } =
 			await import("../../../clients/lsp/config.js");
+		const trust = await import("../../../clients/project-trust.js");
+		trust.setProjectTrustState("trusted");
 
 		const workspaceA = fs.mkdtempSync(
 			path.join(os.tmpdir(), "pi-lens-lsp-config-a-"),

@@ -22,9 +22,6 @@ const workflow = yaml.load(
 	>;
 	on?: { pull_request?: { types?: string[] } };
 };
-// #3801: the mutation lane lives in ci.yml (behind `heavy-gate`), not in a
-// separate workflow, because only a same-workflow `needs:` can hold it until
-// the required checks pass.
 // #3838: the PR title / body / close-keyword jobs live in pr-metadata.yml.
 const metadataWorkflow = yaml.load(
 	readFileSync(resolve(ROOT, ".github/workflows/pr-metadata.yml"), "utf8"),
@@ -35,10 +32,6 @@ const metadataWorkflow = yaml.load(
 	>;
 	on?: { pull_request?: { types?: string[] } };
 };
-const mutationWorkflow = yaml.load(
-	readFileSync(resolve(ROOT, ".github/workflows/ci.yml"), "utf8"),
-) as { jobs: Record<string, { name?: string; "continue-on-error"?: boolean }> };
-
 const tools = [
 	["complexity", "complexity (advisory)"],
 	["strictness", "strictness (advisory)"],
@@ -65,23 +58,6 @@ describe("#2706 advisory tooling workflow contracts", () => {
 		expect(job?.name).toBe("knip");
 		expect(job?.["continue-on-error"]).not.toBe(true);
 		expect(isAdvisoryCheck("knip")).toBe(false);
-	});
-
-	it("keeps the mutation lane advisory and named", () => {
-		const job = mutationWorkflow.jobs.mutation;
-		expect(job?.name).toBe("mutation (advisory)");
-		expect(job?.["continue-on-error"]).toBe(true);
-	});
-
-	it("pins the mutation report upload action by SHA and keeps the report path explicit", () => {
-		const raw = readFileSync(resolve(ROOT, ".github/workflows/ci.yml"), "utf8");
-		// Recurrence: PR #2751 round 1 and PR #2758 round 1 both shipped a test
-		// asserting the offline `<SHA-TO-PIN>` placeholder; the pin must be a
-		// full commit SHA with the release comment.
-		expect(raw).toMatch(
-			/actions\/upload-artifact@[0-9a-f]{40} # v\d+\.\d+\.\d+\b/,
-		);
-		expect(raw).toContain("path: reports/mutation/mutation.json");
 	});
 
 	it.each(tools)("keeps the %s job advisory and named", (key, name) => {

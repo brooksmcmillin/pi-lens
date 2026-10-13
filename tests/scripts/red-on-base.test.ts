@@ -37,6 +37,9 @@ type Scenario = {
 	noReport?: boolean;
 	failExit?: boolean;
 	signalParent?: boolean;
+	// Every test reds unless `git ls-files` lists the tree's files (a governance
+	// test that reads Git state).
+	needsGitIndex?: boolean;
 };
 type Repo = ReturnType<typeof makeRepo>;
 
@@ -71,6 +74,7 @@ function makeRepo(base: Scenario, head: Scenario) {
 			JSON.stringify({ scripts: { build: `node ${FAKE} --build` } }),
 		);
 		fs.writeFileSync(path.join(root, ".gitignore"), "node_modules\n");
+		fs.writeFileSync(path.join(root, ".gitattributes"), "*.mjs text eol=lf\n");
 		fs.writeFileSync(
 			path.join(root, "scenario.json"),
 			JSON.stringify(scenario),
@@ -112,7 +116,22 @@ function makeRepo(base: Scenario, head: Scenario) {
 			'  echo unlink-before-remove >> "$CLEANUP_LOG"',
 			"fi",
 			"if [ \"$1 $2\" = 'worktree add' ] && [ -n \"$FAIL_WORKTREE_ADD\" ]; then echo 'add refused' >&2; exit 92; fi",
+			"if [ \"$1\" = 'archive' ] && [ -n \"$FAIL_ARCHIVE\" ]; then echo 'archive refused' >&2; exit 93; fi",
 			'exec "$real" "$@"',
+		].join("\n"),
+		{ mode: 0o755 },
+	);
+	// `tar` that, on request, drops .gitattributes after extracting: an archive
+	// that loses a file a future `export-ignore` or ignore rule would lose.
+	const realTar = spawnSync("sh", ["-c", "command -v tar"], {
+		encoding: "utf8",
+	}).stdout.trim();
+	fs.writeFileSync(
+		path.join(bin, "tar"),
+		[
+			"#!/bin/sh",
+			`"${realTar}" "$@" || exit $?`,
+			'if [ -n "$DROP_GITATTRIBUTES" ]; then for a; do dir=$a; done; rm -f "$dir/.gitattributes"; fi',
 		].join("\n"),
 		{ mode: 0o755 },
 	);
@@ -491,13 +510,72 @@ describe("red-on-base usage and build failures", () => {
 		expectCleanedUp(repo);
 	});
 
-	it("a tool failure (git refuses the base worktree) is exit 3, never 0, and prints no verdict", () => {
+	// Recurrence (#4047 review H1): a plegma lane refuses `git worktree add`, so
+	// every comparison was INCONCLUSIVE and the gate above read it as success.
+	it("a lane that refuses `git worktree add` still gets a real verdict from an archive base tree", () => {
+		const repo = makeRepo(
+			{ files: { [A]: file(pass("t")) } },
+			{ files: { [A]: file(red("t")) } },
+		);
+		const result = run(repo, [A, "--base", "HEAD~1"], {
+			FAIL_WORKTREE_ADD: "1",
+		});
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain("git worktree add refused");
+		expect(result.stdout).toContain("BASE-TREE git-archive");
+		expect(result.stdout).toContain(`CAUSED-BY-CHANGE  ${A} > t`);
+		expect(verdictLine(result.stdout)).toBe("VERDICT: CAUSED-BY-CHANGE");
+		// Nothing registered, nothing left behind, the shared install untouched.
+		expectCleanedUp(repo);
+		expect(cleanupLines(repo)).toEqual([]);
+		expect(fs.existsSync(path.join(repo.root, "node_modules"))).toBe(true);
+	});
+
+	it("the archive base tree is a Git index, or a Git-reading governance test reds on base and masks a real red", () => {
+		// The review measured 5 false reds in 4 governance files on a bare
+		// archive tree; each would have read RED-ON-BASE (unrelated) for a head red.
+		const repo = makeRepo(
+			{ files: { [A]: file(pass("t")) }, needsGitIndex: true },
+			{ files: { [A]: file(red("t")) }, needsGitIndex: true },
+		);
+		const result = run(repo, [A, "--base", "HEAD~1"], {
+			FAIL_WORKTREE_ADD: "1",
+		});
+		expect(result.status).toBe(1);
+		expect(verdictLine(result.stdout)).toBe("VERDICT: CAUSED-BY-CHANGE");
+		expect(result.stdout).not.toContain("RED-ON-BASE");
+	});
+
+	// Recurrence (#4074 verify r2 F2b): the archive tree's fidelity was true
+	// only by luck; a tar that drops a file left all 33 tests green.
+	it("an archive base tree whose Git tree differs from the base's is exit 3 naming both tree ids, never a verdict", () => {
+		const repo = makeRepo(
+			{ files: { [A]: file(pass("t")) } },
+			{ files: { [A]: file(red("t")) } },
+		);
+		const result = run(repo, [A, "--base", "HEAD~1"], {
+			FAIL_WORKTREE_ADD: "1",
+			DROP_GITATTRIBUTES: "1",
+		});
+		const expected = git(repo.root, "rev-parse", "HEAD~1^{tree}");
+		expect(result.status).toBe(3);
+		expect(result.stderr).toMatch(
+			new RegExp(
+				`archive base tree [0-9a-f]{40} differs from HEAD~1\\^\\{tree\\} ${expected}`,
+			),
+		);
+		expect(result.stdout).not.toContain("VERDICT");
+		expectCleanedUp(repo);
+	});
+
+	it("a lane that refuses both `git worktree add` and `git archive` is exit 3, never 0, with no verdict", () => {
 		const repo = makeRepo(
 			{ files: { [A]: file(pass("t")) } },
 			{ files: { [A]: file(pass("t")) } },
 		);
 		const result = run(repo, [A, "--base", "HEAD~1"], {
 			FAIL_WORKTREE_ADD: "1",
+			FAIL_ARCHIVE: "1",
 		});
 		expect(result.status).toBe(3);
 		expect(result.stderr).toContain("red-on-base:");
@@ -608,6 +686,31 @@ describe("red-on-base interruption", () => {
 			"unlink-before-remove",
 			"unlink-before-remove",
 		]);
+	});
+
+	// An archive base tree is not a registered worktree: the reaper must not ask
+	// Git to remove it (a "worktree remove failed" line on every stale run) and
+	// must still unlink the shared node_modules before deleting the directory.
+	it("a SIGKILLed archive-tree run is reaped by the next run without a git worktree remove", () => {
+		const repo = makeRepo(interrupted, green);
+		const killed = run(repo, [A, "--base", "HEAD~1"], {
+			FAKE_SIGNAL_PARENT: "SIGKILL",
+			FAIL_WORKTREE_ADD: "1",
+		});
+		expect(killed.signal).toBe("SIGKILL");
+		const [stranded] = baseTests(repo);
+		expect(worktrees(repo)).toBe(1);
+		expect(
+			fs.lstatSync(path.join(stranded.cwd, "node_modules")).isSymbolicLink(),
+		).toBe(true);
+
+		const next = run(repo, [A, "--base", "HEAD~1"], { FAIL_WORKTREE_ADD: "1" });
+		expect(next.status).toBe(0);
+		expect(next.stderr).not.toContain("worktree remove failed");
+		expectCleanedUp(repo);
+		expect(fs.existsSync(stranded.cwd)).toBe(false);
+		expect(fs.existsSync(path.join(repo.root, "node_modules"))).toBe(true);
+		expect(cleanupLines(repo)).toEqual([]);
 	});
 });
 

@@ -4,7 +4,7 @@
 // the base commit and the HEAD commit of a fixture repo can disagree. The
 // report shape is vitest's JSON reporter (checked against a real run):
 // testResults[].{name, status, assertionResults[].{fullName, status}}.
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import {
 	appendFileSync,
 	existsSync,
@@ -26,6 +26,18 @@ if (args.includes("--build")) {
 	probe({ phase: "build" });
 	process.exit(scenario.buildExit ?? 0);
 }
+
+// A governance test that reads Git state (tracked-control-bytes, the gitignore
+// shadow scan): green only in a tree whose index lists the committed files.
+const gitIndexListsScenario = () => {
+	try {
+		return execFileSync("git", ["ls-files"], { cwd, encoding: "utf8" })
+			.split("\n")
+			.includes("scenario.json");
+	} catch {
+		return false;
+	}
+};
 
 const outputFile = args
 	.find((arg) => arg.startsWith("--outputFile="))
@@ -84,8 +96,9 @@ if (scenario.signalParent && process.env.FAKE_SIGNAL_PARENT) {
 			title: test.name,
 			ancestorTitles: [],
 			status:
-				test.status === "failed" &&
-				(!test.failOnRuns || test.failOnRuns.includes(run))
+				(test.status === "failed" &&
+					(!test.failOnRuns || test.failOnRuns.includes(run))) ||
+				(scenario.needsGitIndex && !gitIndexListsScenario())
 					? "failed"
 					: "passed",
 		}));

@@ -45,9 +45,12 @@ import {
 	nextOrderTurn,
 	type PersistedStores,
 	retireScope,
+	startKey,
 	stashHandoff,
+	successorStartKey,
 	takeHandoff,
 } from "../../clients/session-scope.js";
+import { SUCCESSOR_HANDOFF_TTL_MS } from "../../clients/session-lifecycle.js";
 import {
 	getRememberedLazyTools,
 	rememberLazyTools,
@@ -85,6 +88,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	vi.useRealTimers();
 	clearWidgetState();
 	// The hand-off slot is a process singleton; leave none behind. A
 	// file-less slot is keyed by a ticket, so replace it with a known one.
@@ -314,6 +318,57 @@ function scopeWith(tools: string[]) {
  * witness either direction (mutations c05 and c06 survive there).
  */
 describe("#3612 the hand-off slot (F2)", () => {
+	it("adopts a stashed hand-off just inside the fixed retention window", () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+		stashHandoff(scopeWith(["ast_grep_search"]), {
+			reason: "fork",
+			sessionFile: "/s/parent.jsonl",
+			targetSessionFile: "/s/child.jsonl",
+		});
+		vi.advanceTimersByTime(SUCCESSOR_HANDOFF_TTL_MS - 1);
+		expect(takeHandoff("fork", "/s/child.jsonl")).toEqual(
+			expect.objectContaining({ "lazy-tool-memory": ["ast_grep_search"] }),
+		);
+	});
+
+	it("retires a hand-off just beyond the window and records dropped activations", () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+		stashHandoff(scopeWith(["ast_grep_search"]), {
+			reason: "fork",
+			sessionFile: "/s/parent.jsonl",
+			targetSessionFile: "/s/child.jsonl",
+		});
+		vi.advanceTimersByTime(SUCCESSOR_HANDOFF_TTL_MS + 1);
+		expect(takeHandoff("fork", "/s/child.jsonl")).toBeUndefined();
+		const expired = getDegradationSummary().find(
+			(group) => group.kind === "session-scope-handoff-expired",
+		);
+		expect(expired?.count).toBe(1);
+		expect(expired?.latestReasons[0]?.reason).toContain(
+			"dropped 1 activation(s)",
+		);
+	});
+
+	it("superseding a slot retires the old activation stash", () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+		stashHandoff(scopeWith(["ast_grep_search"]), {
+			reason: "fork",
+			sessionFile: "/s/parent.jsonl",
+			targetSessionFile: "/s/old.jsonl",
+		});
+		stashHandoff(scopeWith(["ast_grep_replace"]), {
+			reason: "fork",
+			sessionFile: "/s/parent.jsonl",
+			targetSessionFile: "/s/new.jsonl",
+		});
+		expect(takeHandoff("fork", "/s/old.jsonl")).toBeUndefined();
+		expect(takeHandoff("fork", "/s/new.jsonl")).toEqual(
+			expect.objectContaining({ "lazy-tool-memory": ["ast_grep_replace"] }),
+		);
+	});
 	it("is taken by the start whose reason and session file equal its key, once", () => {
 		stashHandoff(scopeWith(["ast_grep_search"]), {
 			reason: "fork",
@@ -382,6 +437,166 @@ describe("#3612 the hand-off slot (F2)", () => {
 			}),
 		).toBe(true);
 		expect(takeHandoff("reload", "/s/own.jsonl")).toBeDefined();
+	});
+});
+
+/**
+ * #3855: a primary replacement shutdown names its successor by the key that
+ * successor's own start computes (`startKey`), so only that start is primary
+ * in the gap. The recurrences: a name its successor cannot reproduce (the real
+ * successor is declined and no session is primary), a name that a subagent's
+ * start reproduces (it takes the primary slot), and a name read before this
+ * shutdown's own stash or forward bound a file-less ticket (#3881).
+ */
+describe("#3855 the successor a primary shutdown names", () => {
+	const primaryScope = () => beginScope({ role: "primary" });
+
+	it("names a file-backed /reload successor by the session's own file", () => {
+		const args = {
+			reason: "reload",
+			sessionFile: "/s/host.jsonl",
+			targetSessionFile: undefined,
+			sessionManager: {},
+		};
+		expect(successorStartKey(args)).toBe("/s/host.jsonl");
+		expect(startKey("/s/host.jsonl", {})).toBe("/s/host.jsonl");
+	});
+
+	for (const reason of ["reload", "fork"]) {
+		it(`names a file-less ${reason} successor by the ticket its stash bound to the manager pi hands it`, () => {
+			const manager = {};
+			const scope = primaryScope();
+			const args = {
+				reason,
+				sessionFile: undefined,
+				targetSessionFile: undefined,
+				sessionManager: manager,
+			};
+			stashHandoff(scope, args);
+
+			expect(successorStartKey(args)).toBe(scope.scopeId);
+			expect(startKey(undefined, manager)).toBe(scope.scopeId);
+			// A subagent's start, on a manager no primary shutdown bound.
+			expect(startKey(undefined, {})).toBeUndefined();
+		});
+	}
+
+	for (const reason of ["fork", "new", "resume"]) {
+		it(`names a ${reason} successor by pi's target file, not the session's own`, () => {
+			expect(
+				successorStartKey({
+					reason,
+					sessionFile: "/s/host.jsonl",
+					targetSessionFile: `/s/${reason}.jsonl`,
+					sessionManager: {},
+				}),
+			).toBe(`/s/${reason}.jsonl`);
+		});
+	}
+
+	it("names no key for an in-memory /new, which pi links to nothing", () => {
+		const manager = {};
+		stashHandoff(primaryScope(), {
+			reason: "reload",
+			sessionFile: undefined,
+			targetSessionFile: undefined,
+			sessionManager: manager,
+		});
+		takeHandoff("reload", startKey(undefined, manager));
+		// Even on a manager a stash bound, a /new successor gets a new manager.
+		expect(
+			successorStartKey({
+				reason: "new",
+				sessionFile: undefined,
+				targetSessionFile: undefined,
+				sessionManager: manager,
+			}),
+		).toBeUndefined();
+		expect(startKey(undefined, {})).toBeUndefined();
+	});
+
+	it("names a file-less reload successor on an unbound manager by a fresh ticket, bound to that manager (verify r4 V6)", () => {
+		// An in-memory /new runs on a new manager; its /reload lands before its
+		// start stashed anything, in any window, so no ticket is on it yet.
+		const manager = {};
+		const args = {
+			reason: "reload",
+			sessionFile: undefined,
+			targetSessionFile: undefined,
+			sessionManager: manager,
+		};
+		const interrupted = primaryScope();
+		forwardHandoff({ ...args, startReason: "new" });
+
+		const named = successorStartKey(args);
+		expect(named).not.toBe(interrupted.scopeId);
+		expect(typeof named).toBe("number");
+		expect(startKey(undefined, manager)).toBe(named);
+		// Named once: a second read returns the same ticket.
+		expect(successorStartKey(args)).toBe(named);
+		// A gap subagent's own start, on a manager nothing bound, is not it.
+		expect(startKey(undefined, {})).toBeUndefined();
+		// Process-unique: never a ticket a scope holds.
+		expect(beginScope({ role: "primary" }).scopeId).not.toBe(named);
+	});
+
+	it("names no ticket for a successor pi links by its file, or for an in-memory /new", () => {
+		const manager = {};
+		expect(
+			successorStartKey({
+				reason: "reload",
+				sessionFile: "/s/own.jsonl",
+				targetSessionFile: undefined,
+				sessionManager: manager,
+			}),
+		).toBe("/s/own.jsonl");
+		expect(
+			successorStartKey({
+				reason: "new",
+				sessionFile: undefined,
+				targetSessionFile: undefined,
+				sessionManager: manager,
+			}),
+		).toBeUndefined();
+		expect(startKey(undefined, manager)).toBeUndefined();
+	});
+
+	it("keeps the ticket a stash bound when it forwards an interrupted reload (#3881)", () => {
+		const manager = {};
+		const left = primaryScope();
+		const args = {
+			reason: "reload",
+			sessionFile: undefined,
+			targetSessionFile: undefined,
+			sessionManager: manager,
+		};
+		stashHandoff(left, args);
+		forwardHandoff({ ...args, startReason: "reload" });
+
+		expect(successorStartKey(args)).toBe(left.scopeId);
+		expect(takeHandoff("reload", left.scopeId)).toBeDefined();
+	});
+
+	it("names an interrupted start's successor by the key its forwarded slot keeps (#3881)", () => {
+		const manager = {};
+		const left = primaryScope();
+		stashHandoff(left, {
+			reason: "reload",
+			sessionFile: undefined,
+			targetSessionFile: undefined,
+			sessionManager: manager,
+		});
+		const args = {
+			reason: "reload",
+			sessionFile: undefined,
+			targetSessionFile: undefined,
+			sessionManager: manager,
+		};
+		forwardHandoff({ ...args, startReason: "reload" });
+
+		const named = successorStartKey(args);
+		expect(named).toBe(left.scopeId);
+		expect(takeHandoff("reload", named)).toBeDefined();
 	});
 });
 

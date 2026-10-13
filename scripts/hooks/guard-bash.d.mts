@@ -8,6 +8,7 @@ export type DenyRule =
 	| "reset"
 	| "worktreeForce"
 	| "worktreeSymlink"
+	| "worktreeUnresolved"
 	| "probe"
 	| "tmpdirCollision"
 	| "sharedKill"
@@ -16,7 +17,9 @@ export type DenyRule =
 	| "hookBypass"
 	| "forcePush"
 	| "ciVerdictStatus"
-	| "rebase";
+	| "rebase"
+	| "npmLinkedInstall"
+	| "linkedNodeModulesDelete";
 
 export const RULE_MESSAGES: Readonly<Record<DenyRule, string>>;
 

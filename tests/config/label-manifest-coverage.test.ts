@@ -31,9 +31,8 @@ import { docsSectionLines } from "../support/docs-section.js";
  * can silently drift from what those sources say — the TYPE, AREA and
  * "reuse GitHub defaults" labels come from AGENTS.md's own
  * "Issue triage & labels" section, and the merge-train warden's labels
- * come from grepping the merge policy doc, the `scripts/lib/merge-train-*`
- * modules, and every `.github/workflows/*.yml` file for their literal
- * label strings.
+ * come from grepping the merge policy doc and every `.github/workflows/*.yml`
+ * file for their literal label strings.
  */
 
 const REPO_ROOT = resolve(import.meta.dirname, "../..");
@@ -155,9 +154,8 @@ function reuseDefaultLabelsFromSection(lines: readonly string[]): string[] {
 // ── Merge-train label literals ──────────────────────────────────────────────
 //
 // Enumerated by directory scan, not a hand-typed file list, so a new
-// `scripts/lib/merge-train-*.mjs` module or `.github/workflows/*.yml`
-// workflow is swept in automatically rather than needing this test updated
-// in lockstep (the same single-source-of-truth reasoning as the AREA list).
+// `.github/workflows/*.yml` workflow is swept in automatically rather than
+// needing this test updated in lockstep (the same single-source-of-truth reasoning as the AREA list).
 
 function filesMatching(dir: string, pattern: RegExp): string[] {
 	return fs
@@ -169,14 +167,12 @@ function filesMatching(dir: string, pattern: RegExp): string[] {
 
 const MERGE_TRAIN_LITERAL_SOURCE_FILES = [
 	"docs/pi-lens-merge-policy.md",
-	...filesMatching("scripts/lib", /^merge-train-.*\.mjs$/),
 	...filesMatching(".github/workflows", /\.ya?ml$/),
 ];
 
 /**
  * Every `red-ci`, `conflict` and `priority:*` label literal named in the
- * merge policy doc, its `scripts/lib/merge-train-*.mjs` seams, or any
- * workflow file. `priority:p1|p2|p3` is the policy doc's own
+ * merge policy doc or any workflow file. `priority:p1|p2|p3` is the policy doc's own
  * pipe-alternation shorthand for three labels, not one — expanded here
  * rather than mis-read as a single literal string.
  */
@@ -239,7 +235,7 @@ describe("label manifest coverage (#2553)", () => {
 
 		const required = requiredLabels();
 		// Same reasoning, for the derived requirement side: today's derived
-		// set is 27 labels (4 TYPE + 12 AREA + 5 reuse-defaults + 5
+		// set is 26 labels (4 TYPE + 12 AREA + 5 reuse-defaults + 4
 		// merge-train literals + the drift label) — a floor near that catches the derivation
 		// itself silently collapsing, not just a manifest that dropped one.
 		assertNonEmptyScan(

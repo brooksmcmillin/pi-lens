@@ -16,6 +16,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import {
+	RUNTIME_SCRATCH_DIRS,
 	assertNonEmptyScan,
 	assignNearestExclusive,
 	auditRegistry,
@@ -427,6 +428,108 @@ describe("sweep-kit: listSourceFiles", () => {
 			exclude: (rel) => rel === "skip-me.ts",
 		}).map((p) => relativePosix(root, p));
 		expect(found).toEqual(["a.ts", "nested/b.ts", "nested/c.mjs"]);
+	});
+});
+
+describe("sweep-kit: listSourceFiles scratch roots (#4097)", () => {
+	// Named recurrence (#4097): tests/config/bounded-container-guard.test.ts
+	// walked the repo root, `.probe-home/` included, and died with
+	// `ENOENT ... scandir '.probe-home/worker-home-ci-...-shard-1-3125'` when a
+	// sibling vitest worker removed its home between the parent's listing and
+	// the descent (job 112833360697 on #4070).
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-4097-walk-"));
+	afterAll(() => fs.rmSync(root, { recursive: true, force: true }));
+
+	it("never descends into runtime scratch or third-party trees", () => {
+		for (const dir of [".git", ".probe-home", ".claude", "node_modules"]) {
+			fs.mkdirSync(path.join(root, "pruned", dir, "inner"), {
+				recursive: true,
+			});
+			fs.writeFileSync(path.join(root, "pruned", dir, "inner", "x.ts"), "");
+		}
+		fs.writeFileSync(path.join(root, "pruned", "kept.ts"), "");
+		const found = listSourceFiles(path.join(root, "pruned")).map((p) =>
+			relativePosix(root, p),
+		);
+		expect(found).toEqual(["pruned/kept.ts"]);
+	});
+
+	it("skips a directory that vanished between its parent's listing and its own", () => {
+		const vanishRoot = path.join(root, "vanish");
+		const names = ["d0", "d1", "d2", "d3"];
+		for (const name of names) {
+			fs.mkdirSync(path.join(vanishRoot, name), { recursive: true });
+			fs.writeFileSync(path.join(vanishRoot, name, "f.ts"), "");
+		}
+		// `exclude` runs for a file after the walk root's listing was already
+		// returned and before the sibling directories are descended. The first
+		// directory walked deletes every other one, whatever readdir order
+		// the filesystem uses: a real sibling-removes-its-home schedule.
+		const write = vi
+			.spyOn(process.stderr, "write")
+			.mockImplementation(() => true);
+		let removed = false;
+		try {
+			const found = listSourceFiles(vanishRoot, {
+				exclude: (rel) => {
+					if (removed) return false;
+					removed = true;
+					const keep = rel.split("/")[0];
+					for (const name of names) {
+						if (name !== keep) {
+							fs.rmSync(path.join(vanishRoot, name), { recursive: true });
+						}
+					}
+					return false;
+				},
+			});
+			expect(found).toHaveLength(1);
+			expect(write).toHaveBeenCalledTimes(3);
+			expect(write.mock.calls[0]?.[0]).toMatch(/vanished between the walk/);
+		} finally {
+			write.mockRestore();
+		}
+	});
+
+	it("prunes exactly the four runtime scratch names (review F1)", () => {
+		// Recurrence: widening this set silently empties every sweep that walks
+		// a pruned name (adding "tests" reddened nothing in the #4102 review).
+		expect([...RUNTIME_SCRATCH_DIRS].sort()).toEqual([
+			".claude",
+			".git",
+			".probe-home",
+			"node_modules",
+		]);
+	});
+
+	it("rethrows a non-ENOENT readdir failure on a non-root directory (review F2)", () => {
+		// Recurrence: only a vanished directory may be skipped; a directory that
+		// turned into a file (ENOTDIR) is a real fault and must stay loud.
+		const notDirRoot = path.join(root, "notdir");
+		for (const name of ["a", "b"]) {
+			fs.mkdirSync(path.join(notDirRoot, name), { recursive: true });
+			fs.writeFileSync(path.join(notDirRoot, name, "f.ts"), "");
+		}
+		let swapped = false;
+		expect(() =>
+			listSourceFiles(notDirRoot, {
+				exclude: (rel) => {
+					if (!swapped) {
+						swapped = true;
+						const other = rel.split("/")[0] === "a" ? "b" : "a";
+						fs.rmSync(path.join(notDirRoot, other), { recursive: true });
+						fs.writeFileSync(path.join(notDirRoot, other), "not a directory");
+					}
+					return false;
+				},
+			}),
+		).toThrow(/ENOTDIR/);
+	});
+
+	it("still throws for a missing walk root", () => {
+		expect(() => listSourceFiles(path.join(root, "no-such-root"))).toThrow(
+			/ENOENT/,
+		);
 	});
 });
 

@@ -14,6 +14,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { execFileSync } from "../support/git-fixture-env.js";
 import { getDegradationSummary } from "../../clients/degradation-ledger.js";
 import { getGlobalPiLensDir } from "../../clients/file-utils.js";
+import { pathsEqual } from "../../clients/path-utils.js";
 import {
 	_resetProbeHomeRedirectStateForTests,
 	getGlobalPiLensLogDir,
@@ -178,9 +179,16 @@ function expectCwdOutsideChildTmpdir(facts: ChildFacts, cwd: string): void {
 }
 
 function expectExternalLogs(logDir: string, home: string, cwd: string): void {
-	expect(path.dirname(logDir)).toBe(path.join(home, ".pi-lens", "probe-logs"));
+	expectSamePath(
+		path.dirname(logDir),
+		path.join(home, ".pi-lens", "probe-logs"),
+	);
 	expect(path.basename(logDir)).toMatch(/^[a-f0-9]{64}$/);
 	expect(fs.existsSync(path.join(cwd, ".pi-lens-probe-home"))).toBe(false);
+}
+
+function expectSamePath(actual: string, expected: string): void {
+	expect(pathsEqual(actual, expected)).toBe(true);
 }
 
 describe("getGlobalPiLensLogDir probe-home redirect (#2506)", () => {
@@ -201,14 +209,14 @@ describe("getGlobalPiLensLogDir probe-home redirect (#2506)", () => {
 
 			expectExternalLogs(facts.logDir, fakeHome, worktree);
 			const fromRoot = await runChild(worktree, fakeHome, isolatedTmp);
-			expect(fromRoot.logDir).toBe(facts.logDir);
+			expectSamePath(fromRoot.logDir, facts.logDir);
 
 			// ...while every machine-global path stayed on the (fake) real home.
 			// This is the whole point of the round-3 split: a pi session running
 			// from a worktree must still find the tools it installed and the one
 			// instances.json every other process on the box reads.
-			expect(facts.globalDir).toBe(path.join(fakeHome, ".pi-lens"));
-			expect(facts.toolsDir).toBe(path.join(fakeHome, ".pi-lens", "tools"));
+			expectSamePath(facts.globalDir, path.join(fakeHome, ".pi-lens"));
+			expectSamePath(facts.toolsDir, path.join(fakeHome, ".pi-lens", "tools"));
 
 			// The degradation row actually landed under the redirected log dir.
 			const probeLatencyLog = path.join(facts.logDir, "latency.log");
@@ -497,13 +505,15 @@ describe("a VITEST-marked process with no PI_LENS_HOME pin (#2516 round 2)", () 
 			expectCwdOutsideChildTmpdir(facts, probeCwd);
 
 			expectExternalLogs(facts.logDir, fakeHome, worktree);
-			expect(facts.logDir).not.toBe(path.join(fakeHome, ".pi-lens"));
+			expect(pathsEqual(facts.logDir, path.join(fakeHome, ".pi-lens"))).toBe(
+				false,
+			);
 			// ...and nothing was written into the stand-in for the real home.
 			expect(
 				fs.existsSync(path.join(fakeHome, ".pi-lens", "latency.log")),
 			).toBe(false);
 			// Machine-global state is still NOT redirected, VITEST or not.
-			expect(facts.globalDir).toBe(path.join(fakeHome, ".pi-lens"));
+			expectSamePath(facts.globalDir, path.join(fakeHome, ".pi-lens"));
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -634,7 +644,13 @@ describe("the recorded resolution is visible through the leaf's reader (#2506)",
 		);
 		// #3696: a deep agent worktree/TMPDIR used to leave a dangling `(cwd:`
 		// stub after the fixed diagnostic consumed the ledger's 200-character cap.
-		const longCwd = path.join(root, `cwd-${"x".repeat(220)}`);
+		// The fixed diagnostic alone is ~190 characters, so any cwd overflows the
+		// cap; Windows cannot `chdir` into a path past MAX_PATH (ENAMETOOLONG on
+		// the 290-character cwd, #4019), so the pad stays under it there.
+		const longCwd = path.join(
+			root,
+			`cwd-${"x".repeat(process.platform === "win32" ? 100 : 220)}`,
+		);
 		fs.mkdirSync(longCwd, { recursive: true });
 		const savedHome = process.env.PI_LENS_HOME;
 		const savedProbe = process.env.PILENS_PROBE;

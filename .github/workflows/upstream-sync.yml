@@ -13,6 +13,7 @@ concurrency:
 
 jobs:
   propose:
+    if: github.event_name == 'schedule' || github.ref == 'refs/heads/master'
     name: Propose upstream sync
     runs-on: ubuntu-latest
     timeout-minutes: 5

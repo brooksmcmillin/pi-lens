@@ -173,6 +173,16 @@ const PULL_PUSH_VERSION = Number.parseInt(
 );
 const PULL_RESPONSE = process.env.FAKE_LSP_RESPOND_PULL_WITH;
 const PULL_COMPLETION_SIGNAL = process.env.FAKE_LSP_PULL_COMPLETION === "1";
+const PULL_DIAGNOSTIC_MESSAGE =
+	process.env.FAKE_LSP_DIAGNOSTIC_MESSAGE ??
+	"actual diagnostic\nfor further information visit https://example.test\nhttps://example.test/docs";
+const PULL_DIAGNOSTIC_SOURCE =
+	process.env.FAKE_LSP_DIAGNOSTIC_SOURCE ?? "fake-lsp";
+const DELAY_AFTER_FIRST_PULL_MS = Number.parseInt(
+	process.env.FAKE_LSP_DELAY_AFTER_FIRST_PULL_MS ?? "0",
+	10,
+);
+let pullCount = 0;
 
 function sendPullPush(uri) {
 	send({
@@ -686,6 +696,33 @@ function handle(raw) {
 	// capability gate is proved over the wire and not only in the negotiation
 	// unit. Off by default.
 	if (data.method === "textDocument/didSave") {
+		// #3405: a save-triggered server's WHOLE diagnose pass runs here and
+		// nowhere else (Expert recompiles the Mix project on didSave and on
+		// nothing else). `FAKE_LSP_PUBLISH_ON_SAVE=1` reproduces that shape: the
+		// fixture publishes a diagnostic only from this branch, so a real-init
+		// test reads the production consequence — the diagnostics a save-only
+		// server answers are reachable through pi-lens exactly when the save is.
+		if (process.env.FAKE_LSP_PUBLISH_ON_SAVE === "1") {
+			send({
+				jsonrpc: "2.0",
+				method: "textDocument/publishDiagnostics",
+				params: {
+					uri: data.params?.textDocument?.uri,
+					diagnostics: [
+						{
+							severity: 1,
+							source: "fake-save",
+							code: "P3405",
+							message: "diagnostic published only after didSave",
+							range: {
+								start: { line: 0, character: 0 },
+								end: { line: 0, character: 1 },
+							},
+						},
+					],
+				},
+			});
+		}
 		if (process.env.FAKE_LSP_ECHO_DID_SAVE) {
 			send({
 				jsonrpc: "2.0",
@@ -858,9 +895,8 @@ function handle(raw) {
 							{
 								severity: 1,
 								code: "FAKE1001",
-								source: "fake-lsp",
-								message:
-									"actual diagnostic\nfor further information visit https://example.test\nhttps://example.test/docs",
+								source: PULL_DIAGNOSTIC_SOURCE,
+								message: PULL_DIAGNOSTIC_MESSAGE,
 								range: {
 									start: { line: 0, character: 0 },
 									end: { line: 0, character: 5 },
@@ -873,6 +909,11 @@ function handle(raw) {
 				result: { kind: "full", items },
 			});
 		};
+		pullCount += 1;
+		if (pullCount > 1 && DELAY_AFTER_FIRST_PULL_MS > 0) {
+			setTimeout(sendPullResponse, DELAY_AFTER_FIRST_PULL_MS).unref?.();
+			return;
+		}
 		if (PULL_PUSH_BEFORE_RESPONSE) sendPullPush(uri);
 		sendPullResponse();
 		if (PULL_PUSH_AFTER_RESPONSE) sendPullPush(uri);

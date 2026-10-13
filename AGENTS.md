@@ -32,6 +32,12 @@ writes, dispatches LSP and CLI runners, stores diagnostics, and exposes pi and
 MCP tools. The host adapters are `index.ts` and `mcp/server.ts`; internal work
 flows through `clients/lens-engine.ts` or the appropriate client seam.
 
+Analysis-root invariant: `clients/analysis-root.ts` is the sole classifier for
+out-of-session edits. A marked project may be adopted for LSP and per-file
+linters, but adopted roots are separate from session roots, capped at two with
+early idle eviction, and never receive session bookkeeping, whole-project
+scanners, turn-end tests, or project-local executables under unknown pi trust.
+
 The repository ships compiled JavaScript. TypeScript sources are authoritative;
 compiled twins are generated and must not be edited by hand.
 
@@ -70,6 +76,8 @@ structure, and CI does not gate on production dependency audit findings.
   A demonstrated correctness gap or missing required guard proof blocks merge;
   score, incidental survivors, and unevaluated population alone do not. Disclose
   stale, absent, partial, and zero-mutant reports; never call them clean.
+  The nightly Stryker report complements, rather than replaces, the per-PR
+  advisory job, sticky comment, and `ci-verdict` mutation line.
 - A declared behaviour-preserving refactor proves itself with an old-versus-new
   probe table through the built seam plus a shared-seam mutation that reds a
   caller-side witness; a passing pre-fix run is expected there.
@@ -104,6 +112,12 @@ The principles' delegation contract applies. pi-lens adds:
 - After every completion, push, verdict, merge, or status request, trigger the
   next named owner in the same pass, and keep the handoff (exact head, verdict,
   dispositions, next owner) on the PR or the ledger.
+- Review intake generalizes before it routes. For every HIGH, MEDIUM or
+  CRITICAL finding, name the defect shape, grep the tree for other members, and
+  record a verdict before the fix round dispatches: contained in this PR (with
+  the sweep), sibling issue filed with the member list, or none (with the
+  grep). The fix brief carries it as a `Shape:` line. History: `HISTORY.md`,
+  2026-10-10.
 - Plegma reads are token-budgeted (#417): settlements via `watch --next --mine`,
   `result` only when the transcript or handoff artifact is needed.
 - Human decision, never an agent verdict alone: workflow permission grants,
@@ -192,6 +206,29 @@ the surface they bite; each block loads only when its trigger applies.
 39. **Walk-up result used as eligibility:** return ownership and start-directory
     identity separately; enumerate root-position by ambient-input cells.
 
+64. **Named path vs written set:** a guard keyed on the path a tool NAMES must
+    hold for every path the tool WRITES; enumerate the written set (a rename's
+    importers, an `ast_grep_replace` folder or its project default, a
+    server-initiated `workspace/applyEdit` with no call at all) and key the
+    permission per call, never per path. Three rounds on the read guard's
+    authorship seam (#4187 R2-3, R4-1, R5): the pre-write retire covered the
+    named path while the post-write advance covered every recorded one, so a
+    file nothing checked was re-baselined over another writer's bytes. The
+    screen: for each writer, table named-at-call against actually-written, and
+    ask which rule answers for a path in the second column only.
+    A first credit from a bridge is range-scoped to the bytes it reports, and
+    settled-sweep drift never creates authorship (#4210); screen the next
+    positional edit both inside and outside the reported range. This is the
+    bridge/LSP/native-edit rule only: recognized bash (#4131 R2), pipeline
+    sibling files, and agent_end are pinned whole-file exceptions.
+
+65. **Unknown authorship range:** a producer that cannot recover a truthful
+    range must carry UNKNOWN to `ReadGuard.creditAuthorship`; UNKNOWN retires
+    the existing scoped license and creates none. Only an explicit
+    `whole-file` signal may widen authorship. Enforced at
+    `clients/mutation-bridge.ts` and `clients/read-guard.ts`, with the
+    F-4210-2 production bridge witness.
+
 </important>
 
 <important if="adding or reading a cache, durable record, or project-intelligence state">
@@ -253,6 +290,15 @@ the surface they bite; each block loads only when its trigger applies.
 
 ### a delivery surface or lane
 
+Project-wide scanner delivery has one owner per live worklist. The primary
+session owns turn-end delivery; a concurrent secondary owns only its own
+file-scoped worklist and receives no project-wide scanner output.
+
+| Producer population | Primary turn_end | Secondary turn_end |
+|---|---|---|
+| Project-wide scanners (gitleaks, knip, jscpd, and equivalent shared stores) | admit and deliver | suppress at the delivery gate |
+| Session-owned file or runner findings | admit its own session | admit its own session |
+
 5. **Dropped side channel:** trace flags, bindings, and provenance through
    spreads, maps, filters, and JSON serialization.
 
@@ -261,6 +307,10 @@ the surface they bite; each block loads only when its trigger applies.
     path discloses its truncation on the rendered surface; a count recorded
     only in `latency.log` is not disclosure (#3166 r2: an 80-finding input
     bound zeroed a neighbour's genuine errors, counted only in the log).
+    An out-of-session-root project edit records one bounded degradation and
+    uses the existing advisory notice seam; intended vendor skips and pi-owned
+    OS-temp artifacts stay silent (`clients/runtime-tool-result.ts`,
+    `clients/ephemeral-root.ts`).
 
 26. **Old-role filter on a substitute:** compare fallback output with the
     substituted surface's contract, including non-blocking findings.
@@ -277,6 +327,17 @@ the surface they bite; each block loads only when its trigger applies.
 
 43. **Prose mistaken for executable structure:** define lexical states and
     reachability before scanning shell, workflow, or source text.
+
+61. **Stand-in for unknown text stripped per consumer:** when a lexer leaves a
+    placeholder for text it cannot know (a command substitution's output),
+    read the input under each bounding assumption rather than teaching each
+    consumer to ignore the placeholder: empty (the text the rules matched
+    before it existed) and opaque (no rule word matches it, no path resolves
+    through it), denying if either reading denies. Enforced by `findDeny` in
+    `scripts/hooks/guard-bash.mjs`, pinned by the "substitution next to a rule
+    word (#3997)" rows in `tests/scripts/guard-bash-hook.test.ts`. Recurrence:
+    #3997 round 3 stripped the mark at three call sites and left
+    `checkUngated`, `mktemp` flags, and `git $(:) stash` open.
 
 49. **Whitespace counted as structure when it is alignment:** a leading run can
     be alignment, not one nesting unit (call continuations, block-comment and
@@ -303,6 +364,10 @@ the surface they bite; each block loads only when its trigger applies.
 
 13. **Wrong failure classification:** derive availability and verdicts from raw
     evidence; preserve the classifier and evidence when a caller asserts a fact.
+    Runner log parsers tolerate ANSI control sequences, padding, and CRLF before
+    extracting a count; the exact Windows bytes are pinned by
+    `tests/config/windows-vitest-failure-count.test.ts`, and the parser is
+    `parseVitestSummary` (shape 63).
 
 16. **Unverified external-tool claim:** probe the real binary before encoding
     exit codes, output shapes, severity names, or fixtures. For a third-party
@@ -331,6 +396,70 @@ the surface they bite; each block loads only when its trigger applies.
     listeners by `tests/clients/socket-error-listener-sweep.test.ts`; screen
     `close` and timer callbacks by hand.
 
+60. **Wasm failure outside the #3605 containment:** every failure thrown out
+    of web-tree-sitter classifies through `classifyTreeSitterWasmError`, and a
+    `catch` inside a `withParsedTree` consumer calls `reportWasmAbort` before it
+    swallows the error. An unclassified or swallowed trap is never counted,
+    charged or recycled, and the runtime later fails elsewhere (#3996: the
+    bash wasm's unresolved `isalpha` import threw an unclassified `TypeError`
+    on every `[ a == b ]`, and a callback-traversal trap surfaced raw).
+    `tests/clients/grammar-runtime-imports.test.ts` reds on a shipped grammar
+    that imports a function the runtime does not export.
+
+62. **Delete or rewrite through a dependency link:** a lane's `node_modules` is
+    a symlink to the main checkout's install, so any verb that removes or
+    rewrites under it reaches every lane (#3173: `git worktree remove` followed
+    the link twice; #4044: a worker's `npm ci --dry-run` emptied it under ~7
+    lanes, because npm 9.2.0 ignores `--dry-run` for the clean-install family).
+    Such a verb runs only where `node_modules` is a real directory, or in a
+    scratch copy. The hook's verb list (`NPM_NODE_MODULES_WRITERS` in
+    `scripts/hooks/guard-bash.mjs`) is the catalog: a new verb alias or
+    package manager (pnpm, yarn, bun) needs its own entry, and the hook binds
+    Claude lanes only, so a codex worker's half is the plegma shim
+    (apmantza/plegma#693). Sweep 2026-10-07, clean in the repo's own scripts
+    (`grep -rnE "rmSync\(.*node_modules|rm -rf .*node_modules|npm ci"
+    scripts clients tools`): no script runs a writer in a lane tree.
+    Deletes are the second member, measured with GNU coreutils on 2026-10-07:
+    `rm -rf node_modules/`, `rm -rf node_modules/*`, `find node_modules/
+    -delete`, `find -L|-H node_modules -delete`, `find node_modules/ -exec rm`
+    and `cd node_modules && rm -rf ./*` empty the link target, while `rm -rf
+    node_modules` (no slash) removes only the link. `classifyNodeModulesDelete`
+    denies the first set through the same `hasNodeModulesSymlinkOutside` seam;
+    that seam follows the complete symlink chain with a fail-closed fallback
+    when the target cannot be resolved (#4080).
+    a lane unlinks without a slash or glob. Consolidation verdict: two rules on
+    one classifier seam, kept apart because the npm rule judges a verb and the
+    delete rule a path operand (deleting the delete rule relocates nothing the
+    npm rule could absorb). Both share one path test,
+    `operandThroughNodeModulesLink` (npm's is `<prefix>/node_modules/`, or its
+    cwd plus the project its walk-up finds), and one rule for every value form
+    (#4054 round 4, after round 3 regressed `--prefix "$(pwd)"`): a directory
+    is tested where the program lands (the holder of each `node_modules`
+    component physically, as the kernel follows a link before `..`; npm's
+    `--prefix` lexically; npm's walk-up from the physical cwd), and a part
+    the resolver cannot read (an unknown cwd, `$( … )`, backticks, an unknown
+    variable) is the project the command runs in, failing closed in a linked
+    lane only. `find -L|-follow` also counts an operand that holds the link.
+    Unguarded, listed in the header's not-handled list: a glob that expands to
+    the link (`rm -rf */`), `xargs rm`, `rsync --delete`, `mv`, `npx rimraf`.
+
+63. **Tool console output parsed unstripped:** parsing Vitest or any tool's
+    console output: strip ANSI first, and test with `FORCE_COLOR=1`. CI runs
+    Vitest with colour, and escape codes split `Tests` from its counts and
+    `FAIL` from its file, so a parser reads "no tests", "no red" or the wrong
+    class (#4074, #4075, #4079, #4087: the pre-push hook recorded `failed: 0`
+    for a red run). Read a Vitest transcript only through `parseVitestSummary`
+    in `scripts/lib/vitest-summary.mjs` (pure, so importing it does not make a
+    script a workflow writer); its consumers are guarded over a real coloured
+    run by `tests/scripts/vitest-summary-consumers.test.ts`.
+    Consolidation verdict: folded onto that seam (deleting it would send seven
+    scripts back to private regexes). Sweep 2026-10-07 over `scripts/`,
+    `scripts/lib/`, `tests/support/` and `.github/`
+    (`grep -rnE "Tests\s|Test Files|stripVTControl|u001b|x1b"`): the other
+    hits are the classifier's own already-normalized patterns, `ci-verdict`'s
+    line classifier (strips before it matches), `check-pr-body`'s lint of pasted
+    body text, and readers of Vitest's JSON report.
+
 </important>
 
 <important if="a test double, ratchet or sweep">
@@ -338,7 +467,12 @@ the surface they bite; each block loads only when its trigger applies.
 ### a test double, ratchet or sweep
 
 7. **Vacuous test:** prove the real entry point and real fixture arm. A skip is
-   visible, a mock has the required fields, and the test fails pre-fix.
+   visible, a mock has the required fields, and the test fails pre-fix. A hook
+   handler that swallows its own throw (`handleToolCall` returns `undefined`
+   and records `tool-call-handler-throw`) reads a crash as the verdict under
+   test: call it through `runHandlerExpectingNoThrow`
+   (`tests/support/handler-verdict.ts`; the pi mock does it for `tool_call`
+   hooks), enforced by `tests/config/handler-verdict-sweep.test.ts` (#4182).
 
 8. **Name heuristic:** a filename skip has an observable count and a content
    escape hatch; never silently drop a real file.
@@ -380,6 +514,21 @@ the surface they bite; each block loads only when its trigger applies.
     range. Pids are enforced by `tests/support/kill-guard.ts`; screen the
     other identifier kinds by hand.
 
+59. **Generated edit with unlisted consumers:** a bot edit to a value that tests
+    pin must leave green every test that names the edited ids. Screen: apply
+    the generator's real output to the real tree (all-eligible case included),
+    build, and run every test that mentions the field or the registry; this
+    sweep is manual (#3994 F1, r3). Tests take "an unmeasured server" from a
+    class the generator never touches, never a hard-coded id.
+    A removed or demoted CI job is the same shape: before deleting it, list
+    every consumer of its check name, comment marker and ci-verdict line (job
+    and gate pins, advisory and deferred allowlists, contracts, PR template) and
+    give each a disposition in the PR body (#4005).
+
+66. **In-process module double with a real seam:** when a `clients/` module has
+    a test setter, adopter, or reset, drive that seam; keep a double only at a
+    process or host boundary.
+
 </important>
 
 <important if="session, turn or generation lifecycle">
@@ -388,6 +537,10 @@ the surface they bite; each block loads only when its trigger applies.
 
 17. **Process latch for session state:** every once-latch has a session reset;
     session dedupe belongs in the degradation ledger where possible.
+    Host `session_start` admission survives extension factory re-runs through
+    the process-lifetime `WeakSet<object>` in `clients/session-scope.ts`:
+    pi's RPC re-delivery reuses one event object, while each genuine start
+    allocates another, and weak identity needs no `session_shutdown` release.
 
 19. **Re-derived identity:** carry resolved identity or correlation across
     asynchronous stages; do not reconstruct it from ambiguous later inputs.
@@ -427,6 +580,15 @@ the surface they bite; each block loads only when its trigger applies.
 58. **Known identity carried forward:** when a producer knows an identity,
     carry it through asynchronous stages instead of re-deriving it downstream
     (#3643 F3).
+
+**Expired successor hand-off:** an expired successor marker may authorize
+    its named interrupted successor only for the fixed retention window in
+    `clients/session-lifecycle.ts`; the shared slot retires at that boundary
+    and records its dropped activation count before releasing the payload.
+    Its test-only pending-window override is accepted only in a Vitest process;
+    production keeps the fixed 60-second pending window.
+    The window and supersession paths are pinned by the session lifecycle and
+    session-scope tests.
 
 </important>
 
@@ -469,6 +631,10 @@ the surface they bite; each block loads only when its trigger applies.
   legacy migrations, and namespaces live in the config-location/schema modules.
   A new config key or environment flag needs a forcing function, stability tier,
   diagnostic code, tests, and docs.
+- `rules.<id>.ignorePaths` is an experimental, project-relative path denial
+  resolved by config-core with array-union semantics: global entries cannot be
+  cleared by project config. Ast-grep and tree-sitter apply it before scanning;
+  other runner output uses the shared rule-policy filter.
 - `lens_diagnostics` has one model-facing diagnostic surface. `source` is
   `session` or `lsp`; `scope` is `paths` or `workspace`; explicit paths always
   win. Severity is a threshold. Retired compatibility names must not widen a
@@ -527,26 +693,75 @@ the surface they bite; each block loads only when its trigger applies.
   `buildWindowsShellCommand`: validate command, arguments, and SystemRoot
   before quoting. Spawn explicit cmd.exe with `shell: false`; `.exe`/`.com`
   paths use direct argv even when they contain spaces.
-- Project trust is consumed through `isProjectTrusted`; pi-lens never registers
-  the host's trust-answer handler. Missing trust APIs are unknown/fail-open for
-  compatibility; a throwing accessor is fail-closed.
+- Under pi, project trust is consumed through `isProjectTrusted`; pi-lens never
+  registers the host's trust-answer handler. `compileLspRegistry` is the one admission
+  seam for LSP executable fields: global config and built-ins remain allowed,
+  while project `command`, command overrides, `env`, and
+  `initializationOptions` require pi's `trusted` answer. Missing trust APIs are
+  fail-closed for those project fields with one bounded notice; installs keep
+  their existing compatibility policy. `tests/clients/lsp/lsp-registry-trust.test.ts`
+  and the LSP config/service suites pin the boundary.
+  Non-pi process entry points (`mcp/server.ts`, `mcp/worker.ts`,
+  `mcp/analyze-cli.ts`, and `mcp/cli.ts`) declare trusted execution once at
+  startup through `setProjectTrustState`: workspace trust belongs to their
+  calling client, and pi trust is not consulted.
+  `tests/mcp/server.smoke.test.ts` and `tests/mcp/analyze-cli.test.ts` pin it.
 - LSP service generations, workspace-sweep holds, and repair latches use
   versioned process singletons. Reset tears down the old generation before a
   replacement can spawn. Idle eviction is lease-guarded and clears ownership
   timers on every removal path.
+- Production callers use the grouped experimental `LspCapabilities` adapter in
+  `clients/lsp/capabilities.ts`; direct `LSPService` module imports are limited
+  to that adapter and are enforced by
+  `tests/config/lsp-capabilities-import-sweep.test.ts` (#2372/#277).
 - Idle-eviction policy is the registry's `idleEviction` field, declared per
   server. The nightly (`scripts/measure-lsp-idle-eviction.mjs`) measures every
   registry server's eviction cost and respawn safety into
   `docs/lsp-idle-eviction.md` and changes no policy; a declaration change is a
-  follow-up that cites its row. `tests/config/lsp-idle-eviction-measurement.test.ts`
+  follow-up that cites its row, or the nightly's draft promotion PR
+  (`bot/lsp-idle-evict-promote`, #3989: two consecutive eligible nights, idle
+  RSS floor, cold-start cap, hold list in
+  `scripts/lib/lsp-idle-eviction-promote.mjs`, derived from the registry test's
+  `HOLD_INDEXER_IDS` class; the PR also moves the id into
+  the registry test's `TRANSPARENT_IDS`; night memory in the matrix doc's
+  refresh-state block; never auto-merged, never demotes). `tests/config/lsp-idle-eviction-measurement.test.ts`
   fails when a registry server can go unmeasured without an admission or when
   the committed measurement vetoes a server declared `transparent`.
+- The server-role vocabulary and the declared trait table have one owner,
+  `clients/lsp/server-traits.ts` (#1488, #1756 stage 1). Ask `isAuxiliary`,
+  never a comparison against the role literal, and read `notifyInflightLimit`
+  or `replyOrdering` through `serverTraits`, never by re-deriving a default;
+  `LspServerRole` is declared there and nowhere else, so a second
+  `"primary" | "auxiliary"` is a re-fork. `LSPServerInfo.role` is
+  non-optional: a row declares it, or the factory and custom-server builders
+  apply `DEFAULT_LSP_SERVER_ROLE`. Measured-behaviour markers (`silentOnClean`
+  and the census siblings named by `STRATEGY_TABLE_TRAITS`) stay on
+  `wait-policy/strategies.ts`, which their probes and expiry tests own; the two
+  tables stay disjoint. The auxiliary lifecycle and wait policy lives in
+  `clients/lsp/auxiliary-lifecycle.ts`, the diagnostic policy in
+  `clients/dispatch/auxiliary-lsp.ts`. Enforced by
+  `tests/config/lsp-role-predicate-sweep.test.ts` (production and `scripts/`
+  trees at zero inlined predicates) and
+  `tests/config/lsp-server-trait-table.test.ts` (registered-or-fail).
 - LSP roots never exceed the session-cwd ceiling. Root/config discovery uses
   shared marker seams. Child cwd resolution uses `resolveToolCwd` and its
   caller-specific markers.
+- Temporary roots (#1129) are classified once per process by
+  `clients/ephemeral-root.ts`, on real paths on both sides. A directory inside
+  a real git checkout below `os.tmpdir()` (root or subdirectory) is a normal
+  LSP root with the ephemeral idle window, and `getProjectDataDir` gives it
+  its usual slug under `<base>/.ephemeral/<pid>-<8 hex>/`: normal within the
+  process, never read by another one, removed by the exit hook and, for a
+  dead pid, by the session-start sweep. A `pi-agent-*` path below the tmpdir
+  that no checkout owns is declined at `resolveLspServerCwd` with one
+  `lsp-root-declined` record per staging root per session.
 - Per-path LSP notifications serialize read/build/send/record work. Pull
   cancellation blocks a same-path replacement until settlement. Waits are
   deadline- and abort-bounded, and silence is never clean.
+- `touchFile` fires a type-2 watched-file announcement at entry for the first
+  seen content hash of a path, before the owner's didChange; it reaches every
+  other live client of the same server across package roots through the client
+  watch queue. Content hashes are session-scoped and bounded (#4156).
 - A capability the client advertises has a sender, or the advertisement states
   why it has none. `textDocument/didSave` follows a landed didOpen/didChange
   only when the server declared `textDocumentSync.save` and the caller declared
@@ -554,7 +769,11 @@ the surface they bite; each block loads only when its trigger applies.
   query, never a warm-up, cascade or sweep touch.
 - `touchFile` freezes content-bound auxiliary coverage at merge time. A later
   publication cannot undo a finding drop. Auxiliary gaps narrow coverage and
-  never turn a primary answer inconclusive.
+  never turn a primary answer inconclusive. When a primary touch is
+  inconclusive but the merged result contains answered diagnostics, dispatch
+  preserves only diagnostics from content-confirmed contributors and carries
+  the named primary gap as unconfirmed; only an empty inconclusive result is
+  skipped (#4219, #4231).
 - The explicit `lsp_diagnostics` read checks `exceedsLspSyncLimits` once before
   warm attachment or `touchFile`; an over-bound file returns a `too_large`
   result with its byte/line measurement and records
@@ -562,6 +781,11 @@ the surface they bite; each block loads only when its trigger applies.
 - Every new LSP server has a smoke fixture or a documented alternate/toolchain
   exemption. Real LSP-spawn tests belong in the serialized `lsp-spawn-heavy`
   lane.
+- A `fallbackFor` family is one primary for workspace grouping: a selected
+  preferred server and its sequential alternate do not disable the workspace-
+  pull fast path merely because both registry members match the file. Measure
+  the alternate independently; do not attribute the preferred server's
+  capabilities or diagnostics to it (#3939).
 
 </important>
 <important if="touching dispatch, runners, formatters, and installers rules">
@@ -583,10 +807,14 @@ the surface they bite; each block loads only when its trigger applies.
   `test-target-foreign-checkout`. Proven by
   `tests/clients/test-runner-worktree-isolation.test.ts`.
 - By design, a session whose cwd is a plain folder with no `.git` that holds several repositories, a submodule, or a nested linked worktree gets no automatic tests for the files inside them: any nested `.git` is a foreign checkout, and there is no per-project opt-in (maintainer decision, #3649/#3691). Run them explicitly.
-- The one exception to that boundary is a linked worktree of the session's own repository (same git commondir, different top level, `resolveLinkedWorktreeOwner` in `clients/review-graph/git-identity.ts`, #3871): turn_end selects and runs its tests with that worktree's root as the project root (`clients/test-target-roots.ts`), so config, `node_modules` and the failed-first state are the worktree's own. A worktree root without its own runner install (no `node_modules/.bin`, venv or `vendor/bin`) is skipped with a counted `turn-end-test-root-skipped` row rather than run through `npx` or a bare interpreter; a failure there is located relative to the session checkout; a sibling worktree's file is still foreign to every other root.
+- The one exception to that boundary is a linked worktree of the session's own repository (same git commondir, different top level, `resolveLinkedWorktreeOwner` in `clients/review-graph/git-identity.ts`, #3871): turn_end selects and runs its tests with that worktree's root as the project root (`clients/test-target-roots.ts`), so config, `node_modules` and the failed-first state are the worktree's own. A worktree root without its own runner install (no `node_modules/.bin`, venv or `vendor/bin`) is skipped with a counted `turn-end-test-root-skipped` row rather than run through `npx` or a bare interpreter; a reported location is rebased through `displayRoot` using the runner cwd first, then the dispatch root, only when that file exists, and otherwise remains as printed. A sibling worktree's file is still foreign to every other root. Python's ambient `VIRTUAL_ENV`, `CONDA_PREFIX`, or absolute `UV_PROJECT_ENVIRONMENT` is accepted for the session checkout, and for a linked worktree only when the environment root is inside that checkout; a skipped pytest row says that ambient environments were not borrowed when one is set. The edit worklist is the session's project worklist (#2504), so a session whose cwd is itself a linked worktree never sees an edit in the main checkout or a sibling and runs only its own tests. Each turn that edited files writes one `turn_end_test_selection` record to `latency.log` (candidates, selected, why not, and selected/candidates per owning root; first 8 roots, the rest in `rootsOmitted`; `selected` includes carried deferred targets, which no candidate bucket counts, so per-root `selected` can sum below it; one row of about 570 B per edit turn with candidates, bounded by log rotation only), so a turn with 0 tests is explained without the dbg lines the MCP route drops.
 - Managed tools resolve through the registry and sanctioned availability seams.
   Do not hand-roll install, PATH, or package-manager discovery. Use typed
   `SpawnFailure.kind`; repair only `tool-not-found`.
+- Windows LSP startup exit-code-1 failures are repairable only when the shared
+  command resolver finds no command or an npm shim target is absent; present
+  binaries that exit 1 remain runtime failures (#4263, #1199). The launch and
+  repair gate are pinned by `tests/clients/lsp/windows-startup-repair.test.ts`.
 - Expected skips remain distinct from clean success and failure. Extend the
   closed `RUNNER_SKIP_REASONS` taxonomy when policy intentionally defers work.
   Preserve the skip reason through runner latency and model-facing delivery.
@@ -640,6 +868,9 @@ the surface they bite; each block loads only when its trigger applies.
 - Every cache states its freshness axes, bound, eviction axis, and invalidation
   source. A bounded entry count does not excuse unbounded bytes, timers, WASM
   objects, or persisted evidence.
+- Tree-sitter's `queryBatchCache` is invalidated by `clearWasmInput` when a
+  trapped query heals, because an in-flight batch may have cached a result that
+  omitted the healed rule (#3834).
 - Async publication carries a generation or epoch and checks it before and
   after awaited work. Graph snapshots are immutable by replacement.
 - Review-graph, snapshot, reverse-dependency, word-index, and call-graph data
@@ -661,9 +892,19 @@ the surface they bite; each block loads only when its trigger applies.
   their tool family is selected. Explicit skill invocation remains intact.
   The registry-derived activation catalog retains package-root guide paths
   while honoring upstream tool-disable filters and session-file activation memory.
+- Registry root ownership (#3849): each holder's record in a pid entry's
+  `projectRootHolders` lists exactly the roots THAT holder registered (`host`
+  for `registerInstance`, a per-activation id for a declined secondary). Only
+  its own `deregisterInstanceRoot`, whole-entry removal, or cap eviction ends
+  a record; a root stays while any record lists it. No anonymous counts; one
+  settle (`settleRootHolders`) for every writer; `getInstanceRoots` reads.
 - Session state is owned by the stable session identity and activation owner.
   Detached callbacks resolve live emitters at delivery time and pair them with
   their own activation context. Never use a process-global latest session.
+- Process-global bridge dependencies and the quiet-window turn-summary holder
+  bind only from a live primary `SessionScope`; `clients/process-bridge.ts`
+  accepts only a strictly newer scope ticket, so a concurrent secondary or
+  stale activation cannot rebind a held bridge/task to its runtime (#4258).
 - Session degradation uses the ledger's bounded once/count APIs and resets at
   the correct primary session boundary. `SessionStartClassification`
   (`clients/session-lifecycle.ts`): `primary` and `sequential-replacement`
@@ -671,9 +912,34 @@ the surface they bite; each block loads only when its trigger applies.
   `concurrent-secondary` skips the reset, since a subagent reset tears down the
   primary's warm state. `secondary` belongs to the shutdown classification. A process-lifetime latch cannot store a
   session fact without an explicit reset.
+- Turn state is the turn's session's (#3613): `RuntimeCoordinator.beginTurn`
+  takes the ctx's stable session id and moves the coordinator's counters,
+  write-order turn and change window only for its own session, and per-turn
+  warnings are partitioned by the session that recorded them. Every
+  producer and reader passes that id (`tool_result`, a partial apply's
+  pipeline, `turn_end`). A concurrent secondary still shares the read guard
+  and the turn-end worklist (the open half of #3613). State `turn_end` parks
+  in a scope cell for a later turn lives on the activation's own scope
+  (`TurnEndDeps.sessionScope`, passed by `index.ts`), never on
+  `runtime.sessionScope`, which is the primary's during a secondary's turn
+  (#4154: the late dead-code scan). A turn-end drain or write-back is fenced
+  by the scope that owns the store, taken at entry (#4161, #4168 round 3):
+  the coordinator's for the coordinator and module stores a secondary
+  shares, the activation's for its own scope cell. One store never answers
+  to two scopes, and a secondary's end fences only its cell.
+- Every session-scope hand-off decision leaves one `latency.log` row per
+  lifecycle event, never one per occurrence in a loop (#3873):
+  `session_handoff_slot`, `session_handoff_adopt`, `session_store_action`
+  (a store's `restore` returns its `StoreCarry`, items in and kept),
+  `session_scope_transition` (`end`, `demote`) and `session_end_fence_rollup`.
+  `docs/pi-lens-monitor.md` lists the fields; a new session store or hand-off
+  branch adds its row there in the same change.
 - Logger writes use `createNdjsonLogger`; flush before reading a log. Redact at
   the sink. New failure records preserve the discriminating file/tool/record
   identity and retain dropped counts.
+- `memory_sample` remains one bounded latency record. Its heap, external,
+  worker-isolate, tree-sitter, and word-index fields are latest-value or O(1)
+  reads; sampler assembly time is recorded in `samplerDurationMs`.
 - Delivery surfaces are registered in `clients/finding-delivery-gate.ts`.
   Every model-facing diagnostic, blocker, advisory, widget, nudge, and snapshot
   either passes the shared freshness/disposition gate or carries an explicit
@@ -700,7 +966,8 @@ the surface they bite; each block loads only when its trigger applies.
 
 - Git command classification has one lexer and one guarded-verb matcher seam.
   Unknown wrappers and indirect guarded verbs fail closed. Text-consumer
-  allowances recurse through command substitutions and execution contexts.
+  allowances recurse through command substitutions and execution contexts. A
+  substitution's output is read both empty and opaque (shape 61).
 - The commit gate reads two states: the inline-blocker map's latch
   (`RuntimeCoordinator`), then the persisted `turn-end-findings` record. A
   collect-later runner's blocking findings join the map through
@@ -775,17 +1042,42 @@ The four primary host hooks are:
   run the test/actionable-warning drains. One-shot state a producer consumes
   for a part of the message (a retirement, a delivery count, a drained run)
   commits only when that part reaches the capped message; a cut part stays
-  pending for the next turn (`clients/turn-end/delivery-holds.ts`, #3813).
+  pending for the next turn (`clients/turn-end/delivery-holds.ts`, #3813). An
+  item-bearing advisory with no queue to restore (knip, dead-code, call-graph
+  impact) parks the items it showed on the coordinator for ONE re-offer, taken
+  by the lane's next successful run and offered only while that run still
+  reports them (#3901); count-and-pointer advisories (actionable and
+  code-quality warnings) are not held, their report is the pull record.
 - Only the write/edit `tool_result` path may block the host; `session_start`, `turn_end`, `agent_end`, `agent_settled`, and read-only `tool_result` are bounded by the outer wall; new hook awaits register in `tests/config/hook-await-bounds.test.ts`.
 
 `RuntimeCoordinator.recordProjectMutation` is the one mutation bookkeeping seam.
 Do not pair `bumpFileSeq` and change-log writes at a new call site. The mutation
 bridge and opaque-write recovery feed this seam for non-native producers.
 
+Tier-4 mutation attribution is only for third-party tool names. Names in
+`clients/tool-config.ts`'s `PI_LENS_TOOL_NAMES` projection are never learned or
+observed as generic edits, because one pi-lens tool may mix write and read-only
+operations (for example `lsp_navigation`). MCP-only registry names remain
+third-party names on pi and retain the bounded observation path.
+
 The read guard keys all path state through its normalizer. It accepts Read,
 search, LSP, bridge, bash-view, and authored-write evidence, but name-only
 `ls`/`find` output is not file content. Partial edits consume preflight-approved
-spans and never re-search stale bytes.
+spans and never re-search stale bytes. Normalized oldText matches map back to
+one raw span only when the normalized span has no length-expanding fold (for
+example `ﬁ`→`fi`); the existing end validation remains the final guard. When
+oldText is absent, the preflight wording distinguishes an unchanged full-file
+read binding from actual content drift (#4265). Authorship (`writtenThisSession`)
+follows content identity (#4131): it holds the bytes the conversation last
+wrote, `stat` only pre-filters the hash, and another writer's byte change ends
+it at the next zero-read edit, bash write or drain on the file
+(`retireChangedAuthorship`); no later write resumes it. A mutation-bridge
+write (no pre-write check) may create a first authorship but ends an
+existing one; the observed replay alone advances it, its tool_call having
+retired every file it may replay. The store holds at most 4096 files. A branch move keeps it
+iff its write's tool result is on the branch (#3603). FileTime moves only over
+bytes the conversation holds whole: process bridges, observed replays and
+range bridge reads leave it (#3865).
 
 Canonical TaskManager claim receipts stay opaque to read coverage. Their
 create-or-replace preflight admits a missing target only beneath stable
@@ -808,19 +1100,29 @@ npm run fmt:check                     oxfmt gate
 npm run knip                          unused-code gate (CI job `knip`, gating)
 npm test                              serialized full suite
 npm run test:targeted -- <paths>      shared-slot targeted suite
+
+For `tests/config/heavy-advisory-gate-workflow.test.ts`, set
+`PI_LENS_PRINT_PINS=1` to print the current parsed census pins as pasteable
+assertion lines after workflow edits; the assertions remain shrink-only pins.
 npm run test:unit                     serialized unit suite
 npm run test:integration              serialized integration suite
 npm run preflight                     local merge/preflight gates
 npm run check:lockfile                lockfile consistency
+npm run check:allow-scripts           allowScripts policy vs the resolved lockfile (#1185)
 npm run changelog:check               rollup check; fragments use check-changelog-fragments.mjs
 npm run docs:rule-catalogs            regenerate rule catalogs
 npm run hygiene -- --dry-run          inspect worktree/process hygiene
 node scripts/ci-verdict.mjs <pr|sha>  exact-head CI verdict
 node scripts/gen-test-shard-weights.mjs --run <dir>...  regenerate the Unit tests shard weights
+node scripts/guard-bash-probe.mjs <matrix.jsonl> [--head <ref|file>] [--base <ref|file>]
+                                  [--lane linked|real|both]
+                                        real-hook corpus probe (#4071): per-row verdicts
+                                        against tests/fixtures/guard-bash-probes; --base
+                                        prints only the rows that changed head vs base
 ```
 
-CI cost gates (#3801). The heavy advisory jobs (`mutation (advisory)`, `Unit
-tests Windows (advisory)`) start only after every required check passed on the
+CI cost gates (#3801). The heavy advisory jobs (`CodeQL (<language>) (advisory)`,
+`Unit tests Windows (advisory)`) start only after every required check passed on the
 head (`heavy-gate` in ci.yml; it is red when a lint.yml required check was red
 or unfinished at its deadline). ci-verdict lists them with their real state
 (PENDING, or NOT RUN with the gate's reason) before and after the verdict turns
@@ -838,9 +1140,19 @@ The Unit shards are packed by the per-file seconds in
 
 A workflow job no pull request can run needs a registered reason in
 `tests/config/workflow-pull-request-reachability.test.ts`, and the branch run
-(`gh workflow run <file> --ref <branch>`) quoted with its run id (#3043).
+(`gh workflow run <file> --ref <branch>`) quoted with its run id (#3043). The
+same quote is enforced per file for an edit to any workflow whose post-image no
+`pull_request` run executes (no trigger, `pull_request_target` only, or a
+filter that excludes the file): `scripts/check-pr-body.mjs` reds the body
+without it. `Workflow run unaffected: <file> — <reason>` clears the rule only
+for a workflow with no `workflow_dispatch` trigger or an edit of comments and
+blank lines, verified against the merge base (#3085). The run id is quoted
+evidence, not verified provenance.
 
-The stale-build guard rejects a missing or older compiled twin. Pre-push fails
+The stale-build guard rejects a missing or older compiled twin. Pre-push and
+`lane:check` also rebuild the bounded `dist/` dependency population before
+governance suites when a bundled file is missing or older than its source.
+Pre-push fails
 when its bounded test-lock wait times out (#3717); `PI_LENS_PREPUSH_LOCK_SKIP=1`
 is the only lock opt-out and is logged to `pre-push.log`. CI stays the gate.
 
@@ -853,6 +1165,11 @@ Never hand-edit generated `.js` or `dist/`. Open and close PR worktrees with
 `node scripts/pr-worktree.mjs open <PR|branch> [--merge|--head]` and
 `close <path>`; close unlinks a symlinked `node_modules` before removal
 (#2704) and refuses the main checkout, a dirty tree, or a real `node_modules`.
+Open refuses (exit 2, before any fetch or mkdir) a destination that is the main
+checkout or inside a registered non-bare checkout, symlinks resolved: a probe
+HOME pinned under the source makes the default root a child of it (#3981). An
+exact hit on another registered tree is left to git. Set `PI_LENS_WORKTREES_ROOT` to a
+directory outside every checkout.
 
 <important if="relocating project data, machine state, or telemetry">
 
@@ -870,7 +1187,8 @@ checkout and separate from ordinary telemetry. Machine state is not redirected.
 The `global-dir-probe-redirect` degradation records the chosen log directory.
 
 All loggers use `createNdjsonLogger`. Flush the specific logger before reading
-its file. Relevant logs are `latency.log`, `sessionstart.log`, `cascade.log`,
+its file; graceful `session_shutdown` returns the shared bounded drain before
+pi closes stdin or exits. Relevant logs are `latency.log`, `sessionstart.log`, `cascade.log`,
 `review-graph.log`, `read-guard.log`, `actionable-warnings.log`,
 `extension.log`, `tree-sitter.log`, and `dispositions.log`.
 
@@ -894,6 +1212,8 @@ edit `CHANGELOG.md` for ordinary PR notes. Upstream syncs retain unchanged
 imported fragments; `check-changelog-fragments.mjs --upstream <trusted-ref>`
 excludes only shared-ancestor records from the count, never schema validation.
 CI pins the upstream repository; see `.changelog/README.md`.
+New user-facing fragments begin with a bold lead of at most 100 characters
+(issue references are excluded from the count); internal fragments are exempt.
 
 </important>
 ## Test requirements
@@ -912,6 +1232,13 @@ processes. Real elapsed-time assertions belong in the serialized
 `wallClockBudgetInclude` lane. Real LSP child tests belong in
 `lsp-spawn-heavy`. Any admitted real spawn or timer carries the flake-shape
 header, baseline row, and lane membership.
+
+The real-pi harness defaults to `--no-session`; a persisted-session witness
+opts into `withRealPi({ persistedSession: true })`, which pins `--session-dir`
+under the probe home and uses pi's documented `--continue` flag for a second
+process. Read lifecycle order from the real `session_scope_transition` rows
+and dead-weight rows, not from the pi mock; the mock does not re-run the
+extension factory or reproduce pi lifecycle ordering.
 
 When the defect is an ordering of awaits on one seam (a coalescing queue, a
 per-key serializer), or the seam has regressed before, write a scheduler
@@ -956,11 +1283,28 @@ and durable fields must update their registered-or-fail coverage tests.
 ## Rule and analyzer contracts
 
 Ast-grep rules live under `rules/ast-grep-rules/` and tree-sitter rules under
-`rules/tree-sitter-queries/`. Use AST patterns over regex where possible. A
-rule with an unknown post-filter fails closed. Every shipped rule has a real
-behavioral fixture; Java/Kotlin rules use the real CLI path because NAPI lacks
-their grammars. The bundled ast-grep source census is recursive and respects
-project-over-bundled precedence.
+`rules/tree-sitter-queries/`; shared user rules use the same layout under
+`<PI_LENS_HOME>/rules/`. Precedence is project > user > bundled, and a
+shadowed rule is excluded from execution. Use AST patterns over regex where
+possible. A rule with an unknown post-filter fails closed. Every shipped rule
+has a real behavioral fixture; Java/Kotlin rules use the real CLI path because
+NAPI lacks their grammars. The bundled ast-grep source census is recursive and
+respects the same precedence.
+
+The mutable rule corpus (project + user roots; bundled stays immutable per
+process) has ONE identity seam, `ruleCorpusFingerprintForCycle` in
+`clients/custom-rule-locations.ts`: a content fingerprint computed at most once
+per dispatch cycle, keyed on `getTurnId()`, and shared by the tree-sitter
+loader memo and the ast-grep source fingerprint, so both families refresh on
+the same boundary. A per-call walk of that corpus is a measured regression
+(#4212, 1000 warm loader calls over 170 rule files: ~1000x master for a
+per-call content hash, ~220x for a per-call stat signature, ~1.1x for the
+per-cycle memo), and a per-cycle memo that omits the turn identity never
+invalidates. A path that must see an edit inside its own
+cycle passes `force`, which recomputes and republishes into the cycle; the
+dispatch runner does, and its RuleCache key is the content fingerprint
+recomputed per dispatched file. `resolveBaselineSgconfig` forces because #497
+point 7 pins mid-session freshness for a spawned ast-grep LSP.
 
 Tree-sitter queries compile against the grammar of the file, not the rule's
 language label. Alternative capture groups share capture names. An unsupported or
@@ -1040,7 +1384,14 @@ Bare-Node scripts import only `.js`/`.mjs`; type stripping is not assumed.
 Every agent `Bash` call under Claude Code runs through
 `scripts/hooks/guard-bash.mjs` (`PreToolUse`), which denies with its reason:
 `git stash`; `git reset --soft`/`--hard`; double-force `git worktree remove`,
-or any remove over a symlinked `node_modules`; an unpinned `node` probe loading
+or any remove over a symlinked `node_modules` or over a path it cannot resolve
+statically (`$(…)`, `~user`, an unset `$VAR`, a glob; #3988), where `~`, `$HOME`
+and relative paths (against a preceding `cd`/`git -C`) are resolved first; a
+mutating `npm` verb (`ci`, `install`, `update`, `prune`, …, or `npx npm@… ci`)
+where `node_modules` is a symlink out of the project, `--dry-run` or not, and a
+delete through such a link (`rm -rf node_modules/`, `node_modules/*`, `find
+node_modules/ -delete`; unlinking it with `rm node_modules` stays allowed;
+#4044); an unpinned `node` probe loading
 `clients/` or `dist/`; `TMPDIR`/`TMP`/`TEMP` aimed at the harness home; bare
 `pkill`/`killall` patterns (#3556); worktrees, clones, or `mktemp -d` under
 `/tmp` (#3526); a commit or push chained after a check with `;` or a pipe

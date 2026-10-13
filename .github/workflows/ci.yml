@@ -22,7 +22,7 @@ jobs:
   # #3801: classify the diff once. `code` is false ONLY for a pull_request whose
   # every changed path is on the strict docs allowlist (root *.md, docs/**,
   # .changelog/**; scripts/ci-changed-files.mjs), and then the HEAVY ADVISORY
-  # jobs (mutation, the Windows run) do not start. The Unit shards, the Install
+  # jobs (CodeQL, the Windows run) do not start. The Unit shards, the Install
   # tests and every other test job still run for a docs-only diff: a docs edit
   # can red tests/clients and tests/scripts (docs/public-api-stability.md,
   # docs/*_rules_catalog.md are read by them), so the suite is never skipped.
@@ -33,7 +33,7 @@ jobs:
   #
   # `TLA+ models` is a REQUIRED check and never skips at job level: a job `if:`
   # that evaluates false reports `skipped`, which GitHub counts as passing, but
-  # ci-verdict and the merge-train warden demand a literal `success` on a
+  # ci-verdict demands a literal `success` on a
   # required row (#2618). It always starts and skips its STEPS. The name ends
   # in `(advisory)`: this job reports, never gates.
   changes:
@@ -54,7 +54,7 @@ jobs:
           persist-credentials: false
           sparse-checkout: |
             scripts
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: '22'
       - name: Classify the changed files
@@ -64,6 +64,48 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: node scripts/ci-changed-files.mjs --event "$EVENT_NAME" --repo "$GITHUB_REPOSITORY" --pr "$PR_NUMBER"
+
+  # #4064: the ordinary strict installs can inherit a warm runner/npm cache,
+  # which lets a nested `npm exec --package` skip its install and hide an
+  # uncovered lifecycle script (#4028). Keep this early PR/push signal
+  # independent of the required install lanes and make the cache boundary
+  # explicit: the job-local directory starts empty and setup-node has no npm
+  # cache input. The exact PR head is checked out because `github.ref` is the
+  # mutable pull-request merge ref and can disappear after the run starts.
+  strict-install-cold-cache:
+    name: Strict install (cold npm cache) (fast-fail)
+    runs-on: ubuntu-latest
+    # refs #3123: this is a single dependency install plus prepare; keep a
+    # bounded runner even if the registry or a lifecycle child hangs.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22"
+
+      # The `runner` context is not available in job-level `env:` (GitHub
+      # rejects the whole workflow), so the cache path is exported here.
+      - name: Create empty job-local npm cache
+        run: |
+          set -eu
+          cache="$RUNNER_TEMP/pi-lens-empty-npm-cache"
+          test ! -e "$cache"
+          mkdir -p "$cache"
+          test -z "$(find "$cache" -mindepth 1 -print -quit)"
+          echo "npm_config_cache=$cache" >> "$GITHUB_ENV"
+
+      - name: Install dependencies with the pinned npm (cold cache)
+        run: |
+          set -euxo pipefail
+          npm_pin="$(node -p "require('./package.json').packageManager.replace(/^npm@/, '')")"
+          npx -y "npm@${npm_pin}" install --strict-allow-scripts --no-audit --no-fund
 
   dependency-boundaries:
     name: Dependency boundaries
@@ -81,7 +123,7 @@ jobs:
           ref: ${{ github.ref }}
           persist-credentials: false
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: '22'
 
@@ -120,12 +162,14 @@ jobs:
       - name: Fetch changelog comparison history
         run: |
           git fetch --no-tags origin "${{ github.event.pull_request.base.sha }}"
+          git fetch --no-tags origin "${{ github.event.pull_request.head.sha }}"
           git fetch --no-tags https://github.com/apmantza/pi-lens.git refs/heads/master:refs/remotes/changelog-upstream/master
 
-      # Only records unchanged from shared upstream history escape the count.
-      # Every fragment still passes schema validation.
+      # Compare the PR head, not master-only additions in the merge ref.
+      # Only unchanged shared upstream records escape the count; all fragments
+      # still pass schema validation.
       - name: Validate changelog fragments
-        run: node scripts/check-changelog-fragments.mjs --base "${{ github.event.pull_request.base.sha }}" --merge-ref --upstream refs/remotes/changelog-upstream/master
+        run: node scripts/check-changelog-fragments.mjs --base "${{ github.event.pull_request.base.sha }}" --head "${{ github.event.pull_request.head.sha }}" --upstream refs/remotes/changelog-upstream/master
 
   # #3918: TLC over formal/*/*.cfg runs as parallel `--shard i/N` jobs, N being
   # the matrix length (`strategy.job-total`, so the count has ONE source). The
@@ -173,7 +217,7 @@ jobs:
           ref: ${{ github.ref }}
           persist-credentials: false
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         if: needs.changes.outputs.formal != 'false'
         with:
           node-version: '22'
@@ -228,18 +272,30 @@ jobs:
           ref: ${{ github.ref }}
           persist-credentials: false
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: '22'
 
       - name: Lockfile complete under the CI npm pin
         run: npm run check:lockfile -- --complete
 
+      # #1185: the whole dependency tree installs through the pinned npm with
+      # --strict-allow-scripts, so a lifecycle script package.json's allowScripts
+      # does not decide fails the install (ESTRICTALLOWSCRIPTS) instead of being
+      # skipped with a warning. The runner's bundled npm does not know the flag.
       - name: Install dependencies
-        run: npm install --no-audit --no-fund
+        run: |
+          npm_pin="$(node -p "require('./package.json').packageManager.replace(/^npm@/, '')")"
+          npx -y "npm@${npm_pin}" install --strict-allow-scripts --no-audit --no-fund
 
       - name: Lockfile in sync with package.json
         run: npm run check:lockfile
+
+      # #1185: names the package, resolved version, phase and fix for a missing,
+      # mismatched, stale or name-only approval, or a floating direct range --
+      # the cases npm's own strict flag does not report (#1176).
+      - name: allowScripts policy matches the resolved lockfile
+        run: npm run check:allow-scripts
 
       # `npm install` above ran `prepare` → downloaded the core grammars into
       # grammars/ with provenance sidecars. Verify their bytes/versions match the
@@ -277,7 +333,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: '22'
 
@@ -295,6 +351,12 @@ jobs:
       - name: Build
         run: npm run build
 
+      # #4003: `--ignore-scripts` above skips `prepare`, so nothing here builds
+      # dist/; the LSP fixture files in the targeted set import it and fail with
+      # a named "run npm run build:dist first" precondition without it.
+      - name: Build dist
+        run: npm run build:dist
+
       - name: Run targeted tests
         # --include-ci-only admits the real-spawn suites that exceed the local
         # pre-push budget (#3426 H3432-1); this job is their CI row.
@@ -307,7 +369,7 @@ jobs:
   # succeeded). The check-run the ruleset requires is the `unit-tests`
   # aggregate below, named exactly `Unit tests`.
   #
-  # Why four, and why balanced (#3771, #3801): vitest's own `--shard` assigns
+  # Why five, and why balanced (#3771, #3801): vitest's own `--shard` assigns
   # files by sha1 of the path in equal COUNTS, not equal duration, and the
   # serialized projects (wall-clock-budget, real-harness, lsp-spawn-heavy) are a
   # per-shard floor, so #3756's five shards ran `Run tests` from 107 s to 252 s
@@ -322,11 +384,10 @@ jobs:
   #   N=4  301 s  1.09  18.4 min
   #   N=5  248 s  1.07  19.2 min   (hash-count N=5 before: 274-292 s, 1.4, 19.2 min)
   #
-  # Four is the fewest shards that put the slowest job at the 5-minute bar the
-  # sharding was opened for (#3753): three misses it by 90 s. The repo sits at
-  # the 20-concurrent-job cap, where every extra job is its own queue wait, so
-  # the count stays as low as that bar allows. Raising it to five buys 53 s of
-  # critical path for one more job and 0.8 more runner-minutes per push.
+  # The current target is a <=6-minute required-check median (#3801). Five is
+  # the measured choice: it buys 53 s over four for 0.8 more runner-minutes.
+  # The repo sits at the 20-concurrent-job cap, so this is the largest tested
+  # count retained only because its measured slowest shard is 53 s faster.
   test:
     name: Unit tests (shard ${{ matrix.shard }}/${{ strategy.job-total }})
     runs-on: ubuntu-latest
@@ -335,7 +396,7 @@ jobs:
       # failing tests of every red shard, not just the first to finish.
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5]
     # Bounds the job so a reader that is alive but never drains (e.g. an
     # unbounded stdout stall in the mem-watch wrapper, #3106) cannot hold the
     # runner for GitHub's 360-minute default. Sized at measured-max x2 plus margin
@@ -358,18 +419,19 @@ jobs:
           ref: ${{ github.ref }}
           persist-credentials: false
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: '22'
+
+      - name: Cache npm cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-node-22-${{ hashFiles('package-lock.json') }}
 
       - name: Install dependencies
         run: npm install --no-audit --no-fund
 
-      # The #448 CI-loud ast-grep-CLI guard (ast-grep-rule-tests.test.ts's
-      # "ast-grep CLI is installed in CI") depends on `ast-grep` resolving off
-      # PATH, which it does only implicitly today via `npm test`. Make that
-      # dependency explicit so a PATH regression fails here with a legible
-      # error instead of surfacing as an oblique test failure downstream.
       - name: Verify ast-grep CLI is on PATH
         run: npx ast-grep --version
 
@@ -496,6 +558,7 @@ jobs:
             ${{ runner.temp }}/vitest-results.json
             ${{ runner.temp }}/test-history-metadata.json
           if-no-files-found: warn
+          retention-days: 14
 
       # #2042 2026-09-15: the wrapper's console line is a step-crossing summary
       # of host memory only — it cannot show per-cgroup RSS, PID-count churn, or
@@ -580,7 +643,7 @@ jobs:
           exit 0
 
   # #3753: the ONE check-run named exactly `Unit tests`, the name the ruleset
-  # requires and every tool (ci-verdict, merge-train-warden) keys on. A job
+  # requires and every tool (ci-verdict) keys on. A job
   # whose `needs` failed is SKIPPED by default, and GitHub
   # counts a skipped required check as passing, so `if: always()` is what
   # makes a red or cancelled shard red here instead of green-by-skip.
@@ -606,7 +669,7 @@ jobs:
             exit 1
           fi
 
-  # #3801: the heavy ADVISORY jobs (mutation, the Windows Vitest subset) start
+  # #3801: the heavy ADVISORY jobs (CodeQL, the Windows Vitest subset) start
   # only after every required check passed on this head. A runner-slot pool
   # shared by 10+ PRs made them compete with the required jobs for slots
   # (about 40 jobs per push against about 20 concurrent slots), and on a head
@@ -622,7 +685,7 @@ jobs:
   # check, the gate step reports `ready=false` and FAILS, so the row is red and a
   # run that was deferred for that reason is visible and distinguishable from a
   # dropped one (ci-verdict reads it). The job name ends in `(advisory)` so
-  # ci-verdict and the merge-train warden never gate on it, red or not.
+  # ci-verdict never gates on it, red or not.
   heavy-gate:
     name: Heavy advisory gate (advisory)
     needs:
@@ -632,7 +695,7 @@ jobs:
       - unit-tests
       - install-test
     # #3801: only a code diff starts the heavy jobs: a docs-only pull request
-    # runs every test job but not mutation, CodeQL or the Windows run. Every
+    # runs every test job but not CodeQL or the Windows run. Every
     # needed job must have succeeded (the implicit `success()`), so a red or
     # skipped one skips the gate.
     if: needs.changes.outputs.code == 'true'
@@ -651,7 +714,7 @@ jobs:
           persist-credentials: false
           sparse-checkout: |
             scripts
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: '22'
       - name: Require the lint.yml required checks, then release the heavy advisory jobs
@@ -681,7 +744,7 @@ jobs:
       # after auto-merge may have deleted the mutable `refs/pull/<n>/merge` that
       # `github.ref` names. Leave `ref` unset: the pinned action then fetches the
       # captured commit (`github.sha`, the validated test-merge tree) exactly as
-      # the sibling gated jobs `mutation` and `codeql` do; the commit survives
+      # the sibling gated job `codeql` does; the commit survives
       # the ref's deletion. Do not restore `ref: ${{ github.ref }}`.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -694,7 +757,7 @@ jobs:
         shell: bash
         run: echo "PI_LENS_HOME=$RUNNER_TEMP/pi-lens-home" >> "$GITHUB_ENV"
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: '22'
 
@@ -724,7 +787,7 @@ jobs:
         run: |
           set -euo pipefail
           mapfile -t FILES < "$RUNNER_TEMP/windows-vitest-files.txt"
-          node_modules/.bin/vitest run "${FILES[@]}" --configLoader runner
+          node_modules/.bin/vitest run "${FILES[@]}" --configLoader runner 2>&1 | tee "$RUNNER_TEMP/windows-vitest.log"
 
       - name: Record Windows Vitest outcome
         # #3926: a failed checkout leaves no repository, so the summary must not
@@ -741,9 +804,25 @@ jobs:
             else
               echo "Not executed: no executed-file list was produced (the checkout or enumeration step did not complete), so the Windows subset summary is unavailable."
             fi
+            if [[ -f "$RUNNER_TEMP/windows-vitest.log" ]]; then
+              failures="$(node scripts/lib/windows-vitest-failure-count.mjs "$RUNNER_TEMP/windows-vitest.log")"
+              echo "Windows Vitest failures: ${failures:-unknown}"
+            else
+              echo "Windows Vitest failures: unavailable"
+            fi
             echo "Windows Vitest subset step outcome: $outcome"
             echo "windows_vitest=$outcome"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail Windows advisory when Vitest fails
+        if: always()
+        shell: bash
+        run: |
+          if [[ "${{ steps.windows-vitest.outcome }}" == "failure" ]]; then
+            failures="$(node scripts/lib/windows-vitest-failure-count.mjs "$RUNNER_TEMP/windows-vitest.log")"
+            echo "::error title=Windows advisory::${failures:-unknown} Vitest tests failed"
+            exit 1
+          fi
 
   # Simulates pi's real install path: a `git:` install runs `npm install
   # --omit=dev`, which triggers `prepare` → `build:dist` FROM SOURCE with the
@@ -766,7 +845,7 @@ jobs:
           ref: ${{ github.ref }}
           persist-credentials: false
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: '22'
 
@@ -796,7 +875,7 @@ jobs:
       - name: Install without devDeps (--omit=dev)
         run: |
           npm_pin="$(node -p "require('./package.json').packageManager.replace(/^npm@/, '')")"
-          npx -y "npm@${npm_pin}" install --omit=dev --no-audit --no-fund
+          npx -y "npm@${npm_pin}" install --omit=dev --strict-allow-scripts --no-audit --no-fund
 
       - name: Build dist from source under --omit=dev (the prepare path)
         run: npm run build:dist
@@ -855,7 +934,7 @@ jobs:
           git clone --quiet . "$RUNNER_TEMP/gh-install"
           cd "$RUNNER_TEMP/gh-install"
           npm_pin="$(node -p "require('./package.json').packageManager.replace(/^npm@/, '')")"
-          npx -y "npm@${npm_pin}" install --omit=dev --no-audit --no-fund
+          npx -y "npm@${npm_pin}" install --omit=dev --strict-allow-scripts --no-audit --no-fund
           if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
             echo "ERROR: npm install --omit=dev changed tracked source files"
             git status --short --untracked-files=no
@@ -960,7 +1039,7 @@ jobs:
           ref: ${{ github.ref }}
           persist-credentials: false
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: '22'
 

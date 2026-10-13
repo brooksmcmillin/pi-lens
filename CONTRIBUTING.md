@@ -25,6 +25,8 @@ audit findings or PR-body structure. The PR template is reviewer guidance.
 
 Pull requests must pass `npm run lint`. Run targeted test files for touched seams locally after `npm run build`; the full `npm test` suite is CI's job. CI also runs `npm run check:lockfile` and a production `--omit=dev` build (`npm run build:dist`), so keep `package-lock.json` in sync with `package.json`.
 
+Source builds read the exact esbuild and TypeScript versions from the root entries in `package-lock.json`. Both esbuild bundles and the TypeScript fallback retain an isolated npm exec prefix and approve only the exact package spec they install. Keep the source lockfile available when running `build:dist`; missing or invalid tool versions fail the build rather than falling back to independent pins.
+
 ## Local git hooks
 
 `npm install` wires Husky-managed hooks:
@@ -74,7 +76,12 @@ every `Bash` call, `scripts/hooks/guard-bash.mjs` (wired in
 `.claude/settings.json`), which denies `git stash` in any form, a `git reset
 --soft`/`--hard`, a hand-typed `git worktree remove` with two force flags (use
 `node scripts/prune-agent-worktrees.mjs` instead), any `git worktree remove`
-on a worktree whose `node_modules` is a symlink pointing outside it, an
+on a worktree whose `node_modules` is a symlink pointing outside it (or on a
+path the hook cannot resolve statically; `~`, `$HOME` and relative paths are
+resolved first, #3988), a mutating `npm` verb (`ci`, `install`, `update`,
+`prune`, …) run where `node_modules` is such a symlink, `--dry-run` or not
+(#4044: `npm ci` empties the shared install through the link), a delete through
+that link (`rm -rf node_modules/`, `find node_modules/ -delete`), an
 unpinned `node` probe that loads built runtime code from `clients/`/`dist/`
 without a `PI_LENS_HOME` pin, and a `TMPDIR`/`TMP`/`TEMP` aimed at the vitest
 harness's own home. It exists so these six rules (previously prose-only) are
@@ -85,12 +92,15 @@ mechanically enforced rather than relied on.
 - **Test workers.** `PI_LENS_TEST_MAX_WORKERS` caps the vitest worker-fork
   count (`vitest.config.ts`); set it (`=6` is what CI and agent worktrees use)
   on a memory-constrained host to avoid an OOM under a full or targeted run.
-- **Mutation testing.** `npm run mutation:diff` runs Stryker over only the
-  lines changed against `origin/master` (`scripts/stryker-diff.mjs
-  --base origin/master --max-files 6`), bounded to a
-  `--budget-minutes`/`MUTATION_BUDGET_MINUTES` wall-clock budget (60 minutes
-  by default). See "Mutation output is quoted, not ticked" in `AGENTS.md` for
-  when a mutation proof is required.
+  Without it a local run uses half the logical CPUs, up to 8 forks.
+- **Mutation testing.** The PR proof is hand mutation of each new guard (see
+  "Mutation output is quoted, not ticked" in `AGENTS.md`). Stryker is not a PR
+  check: `.github/workflows/stryker-nightly.yml` runs it nightly on master over
+  the runtime diff since the last report and updates one tracking issue.
+  `npm run mutation:diff` runs the same driver locally
+  (`scripts/stryker-diff.mjs --base origin/master --max-files 6`), bounded to a
+  `--budget-minutes`/`MUTATION_BUDGET_MINUTES` wall-clock budget (60 minutes by
+  default); never run it in a shared worktree.
 - **Release QA.** `node scripts/release-qa.mjs` runs the pre-release
   readiness pass documented in `docs/release-qa-baseline.md` and
   `.claude/skills/release-qa/SKILL.md`; there is no `npm run` alias.
@@ -138,9 +148,44 @@ This avoids spending time on a direction the maintainers may not accept.
 - [ ] Targeted test files for the touched seams pass locally after `npm run build`; the full suite is CI's job
 - [ ] `npm run build:dist` succeeds if you changed code under `clients/`, `commands/`, `tools/`, or `index.ts`
 - [ ] `package-lock.json` is in sync with `package.json` (run `npm install` after dep changes)
+- [ ] `npm run check:allow-scripts` passes (a dependency bump that changes a lifecycle-script package moves its `allowScripts` entry in the same PR)
 - [ ] New rules, runners, or LSP servers follow the wiring checklists below
 - [ ] PR title uses a conventional prefix; issue references are optional
 - [ ] `AGENTS.md` is updated if your change changes behavior, commands, conventions, or invariants documented there
+
+## Lifecycle-script approvals
+
+`package.json` `allowScripts` is the reviewed list of dependencies whose
+install-time scripts (`preinstall`, `install`, `postinstall`, an implicit
+`node-gyp rebuild`) may run. CI installs through the pinned npm with
+`--strict-allow-scripts`, so an undecided script fails the install, and
+`npm run check:allow-scripts` reconciles the map with the resolved
+`package-lock.json`. It names the package, resolved version, phase and the fix
+for each of these:
+
+- **missing-decision**: a resolved package has an install script and no entry.
+- **version-mismatch**: the entry pins another version (the `@ast-grep/cli`
+  0.44.1 against 0.45.x drift of #1176).
+- **stale-approval**: an entry decides no resolved version of its package while
+  every resolved version is decided anyway (the package no longer resolves with
+  a script, or an old-version entry sits beside the current one).
+- **unpinned-approval**: a positive entry is name-only or a range. Approvals are
+  exact `name@x.y.z`.
+- **floating-direct**: a direct dependency that runs a script is on a range
+  (`@ast-grep/cli` is pinned exactly for this reason).
+
+To review a change: read the package's script (`npm view <name>@<version> scripts`),
+then write `"name@x.y.z": true` to let it run or `false` to skip it. Skip only
+when the script is an optimisation or notice (`fsevents` ships its binary
+prebuilt; `node-gyp rebuild` is not needed). An approval is not an endorsement
+of the dependency, and it moves in the same PR as the lockfile bump; a
+Dependabot bump of a script-bearing package needs that maintainer commit.
+
+A consumer's own `allowScripts` is read from the install root, never from an
+installed dependency. pi's generated root declares none, so under
+`--strict-allow-scripts` an install of `pi-lens` there fails closed on
+`@ast-grep/cli`; the `npm-strict` job in `install-smoke.yml` pins that and the
+approved-root install.
 
 ## How the codebase is organized
 
@@ -164,7 +209,7 @@ A runner is a tool that runs on a file write/edit and produces `Diagnostic`s. Ex
    - Pick a unique `id`.
    - Set `appliesTo` to the relevant `FileKind`(s) from `clients/file-kinds.ts`. An empty array means "all kinds".
    - Set `priority` using values from `clients/dispatch/priorities.ts`.
-   - `status` is not a severity channel: severity lives in each diagnostic's `semantic`. A run that completed with findings returns `status: "succeeded"`, or `status: "failed"` when the runner's own threshold says the findings fail the check (in a multi-member `fallback` group, `failed` is what lets the next runner run). Build every findings verdict with `findingsResult` (`clients/dispatch/types.ts`) or `finishParsedRun`, which stamps a findings `failed` with `failureKind: "blocking_diagnostics"`. A `failed` without that kind means the runner itself broke; give it its own kind (`timeout`, `server_error`, …) where the cause is known. `tests/clients/dispatch/runners/runner-findings-failure-kind.test.ts` drives every registered runner, so a new one needs a row there.
+   - `status` is not a severity channel: severity lives in each diagnostic's `semantic`. A run that completed with findings returns `status: "succeeded"`, or `status: "failed"` when the runner's own threshold says the findings fail the check (in a multi-member `fallback` group, `failed` is what lets the next runner run). Build every findings verdict with `findingsResult` (`clients/dispatch/types.ts`) or `finishParsedRun`, which stamps a findings `failed` with `failureKind: "blocking_diagnostics"`. A `failed` without that kind means the runner itself broke; give it its own kind (`timeout`, `server_error`, `parser_error`, `unconfirmed_output`, …) where the cause is known, even when the arm also returns a synthetic diagnostic: turn end and the log analyzer read the kind, not the diagnostic count (#3796). `tests/clients/dispatch/runners/runner-findings-failure-kind.test.ts` drives every registered runner, so a new one needs a row there.
    - Prefer `safeSpawnAsync` and `createAvailabilityChecker`/`resolveAvailableOrInstall` from `clients/dispatch/runners/utils/runner-helpers.ts`.
    - If the tool has auto-fix, set `fixable`/`autoFixAvailable` correctly so the diagnostic lands in actionable warnings rather than code-quality history only (see [Actionable warnings routing](#actionable-warnings-routing)).
 
@@ -252,7 +297,7 @@ Ast-grep rules live in `rules/ast-grep-rules/rules/` (and vendored CodeRabbit ru
 1. Write a YAML rule file. See `docs/custom-rules.md` and the `pi-lens-write-ast-grep-rule` skill (`skills/pi-lens-write-ast-grep-rule/SKILL.md`).
 2. Every shipped rule must have a corresponding `<id>-test.yml` fixture in `rules/ast-grep-rules/rule-tests/`.
 3. Add the rule to `rules/ast-grep-rules/.sgconfig.yml` if it's not picked up automatically by `ruleDirs`.
-4. Run `npx ast-grep test -c rules/ast-grep-rules/.sgconfig.yml --skip-snapshot-tests` locally.
+4. Run `npx --no --package @ast-grep/cli -- ast-grep test -c rules/ast-grep-rules/.sgconfig.yml --skip-snapshot-tests` locally.
 5. If the rule is security/critical, consider adding it to `rules/rule-catalog.json`.
 6. Add a behavioral or validity test if the existing guards don't cover it.
 

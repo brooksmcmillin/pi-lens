@@ -9,6 +9,7 @@
 import * as fs from "node:fs";
 import fsModule from "node:fs";
 import { describe, expect, it, vi } from "vitest";
+import { withPlatform } from "../support/platform-stub.js";
 import {
 	ageMsFromPosixEtime,
 	buildProcessQuery,
@@ -35,22 +36,6 @@ import {
  * runner covers both. The seam reads `process.platform` live for exactly this
  * reason, so the tests drive it.
  */
-function withPlatform<T>(platform: NodeJS.Platform, body: () => T): T {
-	const original = process.platform;
-	Object.defineProperty(process, "platform", {
-		value: platform,
-		configurable: true,
-	});
-	try {
-		return body();
-	} finally {
-		Object.defineProperty(process, "platform", {
-			value: original,
-			configurable: true,
-		});
-	}
-}
-
 describe("LSP_PROCESS_MARKERS", () => {
 	it("is a non-empty array of distinctive command fragments", () => {
 		expect(Array.isArray(LSP_PROCESS_MARKERS)).toBe(true);

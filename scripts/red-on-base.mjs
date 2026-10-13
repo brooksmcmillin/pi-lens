@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import {
 	existsSync,
 	lstatSync,
@@ -156,7 +156,9 @@ function tail(text) {
 }
 
 /** Unlink the shared-install symlink BEFORE git sees the worktree: a forced
- *  remove that follows it can delete the shared install (#3173). */
+ *  remove that follows it can delete the shared install (#3173). An archive
+ *  base tree has its own `.git` directory and is no registered worktree, so Git
+ *  is only asked to remove a linked one (whose `.git` is a file). */
 function removeWorktree(cwd, worktree) {
 	const nodeModules = join(worktree, "node_modules");
 	try {
@@ -164,12 +166,56 @@ function removeWorktree(cwd, worktree) {
 	} catch {
 		// no link (never created, or already gone)
 	}
+	let linked = false;
 	try {
-		git(["worktree", "remove", "--force", worktree], cwd);
+		linked = lstatSync(join(worktree, ".git")).isFile();
+	} catch {
+		// no `.git` at all: an archive tree cut short, or nothing was created
+	}
+	if (linked)
+		try {
+			git(["worktree", "remove", "--force", worktree], cwd);
+		} catch (error) {
+			console.error(`red-on-base: worktree remove failed: ${error.message}`);
+		}
+	rmSync(worktree, { recursive: true, force: true });
+}
+
+/** The base tree at `baseSha`. A linked worktree when Git allows it; when the
+ *  lane refuses `git worktree add` (a guarded plegma worker), the same commit
+ *  from the object database: `git archive | tar -x`, then `git init` + `git
+ *  add -A` (no commit). The index is not optional: without it the governance
+ *  suites that read Git state red on a clean base and a real head red would
+ *  read RED-ON-BASE (#4047 review H1: 5 false reds in 4 files). */
+function materializeBase(cwd, worktree, baseSha, tarFile, ref) {
+	try {
+		git(["worktree", "add", "--detach", worktree, baseSha], cwd);
+		return;
 	} catch (error) {
-		console.error(`red-on-base: worktree remove failed: ${error.message}`);
+		const reason = String(error.stderr || error.message)
+			.trim()
+			.split("\n")[0];
+		console.error(
+			`red-on-base: git worktree add refused (${reason}); using a git archive base tree`,
+		);
 	}
 	rmSync(worktree, { recursive: true, force: true });
+	mkdirSync(worktree);
+	git(["archive", "--format=tar", "-o", tarFile, baseSha], cwd);
+	execFileSync("tar", ["-xf", tarFile, "-C", worktree], { stdio: "pipe" });
+	rmSync(tarFile, { force: true });
+	git(["init", "-q"], worktree);
+	git(["add", "-A"], worktree);
+	// The archive is only the base if Git reads the same tree back: a file an
+	// `export-ignore`, a tar fault or an ignore rule dropped would make base
+	// reds that are not the base's (or hide the change's).
+	const got = git(["write-tree"], worktree).trim();
+	const want = git(["rev-parse", `${baseSha}^{tree}`], cwd).trim();
+	if (got !== want)
+		throw new Error(
+			`archive base tree ${got} differs from ${ref}^{tree} ${want}; not evidence of unrelated`,
+		);
+	console.log("BASE-TREE git-archive");
 }
 
 /** A SIGKILLed run leaves a registered worktree behind; reap the ones whose
@@ -356,8 +402,8 @@ export async function main(argv = process.argv.slice(2)) {
 			);
 			return EXIT.BUILD;
 		}
-		git(["worktree", "add", "--detach", worktree, baseSha], cwd);
 		added = true;
+		materializeBase(cwd, worktree, baseSha, join(runRoot, "base.tar"), base);
 		symlinkSync(
 			resolve(cwd, "node_modules"),
 			join(worktree, "node_modules"),

@@ -22,7 +22,7 @@ import type { FileComplexity } from "./complexity-client.js";
 import type { MutationKind } from "./mutating-tool.js";
 import { normalizeMapKey, pathsEqual } from "./path-utils.js";
 import { PathKeyedMap } from "./path-keyed-map.js";
-import { BoundedLruCache } from "./bounded-cache.js";
+import { BoundedFifoMap, BoundedLruCache } from "./bounded-cache.js";
 import { PartialApplyRecordStore } from "./partial-edit-apply.js";
 import { ReadGuard } from "./read-guard.js";
 import type { RuleScanResult } from "./rules-scanner.js";
@@ -30,9 +30,17 @@ import { RUNTIME_CONFIG } from "./runtime-config.js";
 import { TurnSummaryCollector } from "./turn-summary.js";
 import { deriveProviderFromModelId } from "./model-provider.js";
 import { beginTurnContext, setTurnContextSession } from "./turn-context.js";
-import { recordDegradationOnce } from "./degradation-ledger.js";
+import {
+	incrementDegradationCount,
+	recordDegradationOnce,
+} from "./degradation-ledger.js";
 import { WriteOrderingGuard, writeOrderToken } from "./write-ordering-guard.js";
+import { getProcessSingleton } from "./process-singletons.js";
 import type { GenerationHandle } from "./generation-guard.js";
+import {
+	canWriteAnalysisRoot,
+	type AnalysisRootMode,
+} from "./analysis-root.js";
 import {
 	beginScope,
 	type LineageHandle,
@@ -43,6 +51,21 @@ import {
 
 /** Keep deferred cascade admission bounded without dropping late findings. */
 export const MAX_PENDING_CASCADE_RUNS = 32;
+
+function nextTelemetrySessionId(): string {
+	const state = getProcessSingleton("runtime-coordinator-telemetry", 1, () => ({
+		processId: randomBytes(6).toString("hex"),
+		nextGeneration: 0,
+	}));
+	return `lens-${state.processId}-${++state.nextGeneration}`;
+}
+
+/**
+ * Lanes whose cut advisory items may be parked at once (#3813/#3901): the
+ * knip roots, dead-code clients and the call-graph lane of one session. The
+ * oldest is evicted past it, and the eviction is counted by the caller.
+ */
+export const MAX_CUT_ADVISORY_LANES = 16;
 
 export interface ErrorDebtBaseline {
 	testsPassed: boolean;
@@ -443,6 +466,35 @@ const TOOL_CALL_ATTRIBUTION_CAPACITY = 256;
  */
 const TOOL_CALL_ATTRIBUTION_TTL_MS = 5 * 60_000;
 
+/**
+ * #3613 (session-scope S4): per-turn warnings partitioned by the session
+ * whose turn produced them. A concurrent secondary (an in-process subagent)
+ * adds, reads and clears its own partition on the primary's coordinator, so
+ * neither session's turn moves the other's warnings. A partition is removed
+ * when its turn drains it, at its session's shutdown, or at the primary's
+ * reset.
+ */
+class TurnWarningsBySession<T extends { id: string }> {
+	private readonly bySession = new Map<string, Map<string, T>>();
+
+	add(sessionId: string, items: readonly T[]): void {
+		let partition = this.bySession.get(sessionId);
+		if (!partition) {
+			partition = new Map();
+			this.bySession.set(sessionId, partition);
+		}
+		for (const item of items) partition.set(item.id, item);
+	}
+
+	peek(sessionId: string): T[] {
+		return [...(this.bySession.get(sessionId)?.values() ?? [])];
+	}
+
+	clear(sessionId: string): void {
+		this.bySession.delete(sessionId);
+	}
+}
+
 export class RuntimeCoordinator {
 	private _projectRoot = normalizeMapKey(process.cwd());
 	// #3611: the session generation is this scope's ticket, drawn from one
@@ -457,6 +509,12 @@ export class RuntimeCoordinator {
 	private _cachedExports = new Map<string, string>();
 	private _startupScansInFlight = new Map<string, number>();
 	private _cascadeRuns: CascadeRun[] = [];
+	// #3813/#3901: items an item-bearing turn-end advisory showed and the cap
+	// cut (knip, dead-code, call-graph impact), keyed by lane. Parked once,
+	// taken once; see `parkCutAdvisoryItems`.
+	private readonly _cutAdvisoryItems = new BoundedFifoMap<string, unknown[]>(
+		MAX_CUT_ADVISORY_LANES,
+	);
 	private _turnEndCascadeSettleStarts = new Map<number, number>();
 	private _nextCascadeSettleToken = 0;
 	// Cascade computes are kicked off unawaited by the pipeline (#450); their
@@ -481,7 +539,8 @@ export class RuntimeCoordinator {
 		rules: [],
 		hasCustomRules: false,
 	};
-	private _telemetrySessionId = `lens-${Date.now().toString(36)}`;
+	/** Process-unique and monotonic across coordinator reloads (#4213). */
+	private _telemetrySessionId = nextTelemetrySessionId();
 	private _lifecycleReason: string | undefined;
 	private _hasStableSessionId = false;
 	private _telemetryModel = "unknown";
@@ -511,6 +570,19 @@ export class RuntimeCoordinator {
 	 */
 	private _writeOrderTurn = 0;
 	private _writeIndex = 0;
+	/**
+	 * #3613 F2: the per-turn cap key of each concurrent session's current turn
+	 * (`turnKey`), and how many such turns have started. Entries go at the
+	 * session's shutdown (`forgetTurnSession`).
+	 */
+	private readonly _foreignTurnKeys = new Map<string, number>();
+	private _foreignTurns = 0;
+	/**
+	 * #3613 G1: every turn start on this coordinator, of any session, since the
+	 * session reset: what `_turnIndex` counted before #3613, kept for the
+	 * process-level turn cadences (`turnStartCount`).
+	 */
+	private _turnStarts = 0;
 	private _projectSeq = 0;
 	// #3511: the highest logged seq this runtime's view is known to have missed
 	// (a sibling process logged it above our seq); 0 when none. Cleared by a
@@ -541,9 +613,10 @@ export class RuntimeCoordinator {
 		ToolCallAttribution
 	>(TOOL_CALL_ATTRIBUTION_CAPACITY);
 	/**
-	 * #3555: reads carry no {@link ToolCallAttribution} (it is recorded for
-	 * mutations, and its origin cwd would change how a read's path resolves),
-	 * so a widening rides its own correlation, with the same bound.
+	 * #3555: a widening rides its own correlation, with the same bound. Since
+	 * #4138 a read also carries a {@link ToolCallAttribution} (its origin cwd
+	 * is what a relative read path resolves against at tool_result); the
+	 * widening stays separate because it outlives a blocked call's attribution.
 	 */
 	private readonly _readWidenings = new BoundedLruCache<string, ReadWidening>(
 		TOOL_CALL_ATTRIBUTION_CAPACITY,
@@ -578,14 +651,10 @@ export class RuntimeCoordinator {
 	private readonly _resolvedBlockerFilesThisTurn =
 		new PathKeyedMap<ResolvedBlockerFile>(normalizeMapKey);
 	private _resolvedBlockerFilesDropped = 0;
-	private readonly _actionableWarningsThisTurn = new Map<
-		string,
-		ActionableWarningRecord
-	>();
-	private readonly _codeQualityWarningsThisTurn = new Map<
-		string,
-		CodeQualityWarningRecord
-	>();
+	private readonly _actionableWarningsThisTurn =
+		new TurnWarningsBySession<ActionableWarningRecord>();
+	private readonly _codeQualityWarningsThisTurn =
+		new TurnWarningsBySession<CodeQualityWarningRecord>();
 	// #484: opt-in per-RUN summary of diagnostics/autofixes/formats,
 	// accumulated across the run's turns and consumed once at the
 	// agent_settled quiet window. The collector itself is always constructed
@@ -613,6 +682,7 @@ export class RuntimeCoordinator {
 		this.wordIndex = null;
 		this._startupScansInFlight.clear();
 		this._cascadeRuns = [];
+		this._cutAdvisoryItems.clear();
 		this._pendingCascadeRuns = [];
 		this._turnEndCascadeSettleStarts.clear();
 		this._cascadeSessionStats = {
@@ -626,13 +696,18 @@ export class RuntimeCoordinator {
 		this._reportedThisTurn.clear();
 		this._mutationReceipts = [];
 		this._droppedMutationReceipts = 0;
-		this._telemetrySessionId = `lens-${Date.now().toString(36)}-${randomBytes(4).toString("hex")}`;
+		// #3613: the outgoing session's per-turn records; a live secondary's
+		// partition is its own and survives the primary's replacement.
+		this._actionableWarningsThisTurn.clear(this._telemetrySessionId);
+		this._codeQualityWarningsThisTurn.clear(this._telemetrySessionId);
+		this._telemetrySessionId = nextTelemetrySessionId();
 		this._hasStableSessionId = false;
 		this._telemetryModel = "unknown";
 		this._telemetryModelId = "";
 		this._telemetryProvider = "";
 		this._telemetryProviderIsExplicit = false;
 		this._turnIndex = 0;
+		this._turnStarts = 0;
 		this._writeIndex = 0;
 		this._projectSeq = 0;
 		this._viewMissingThrough = 0;
@@ -655,8 +730,6 @@ export class RuntimeCoordinator {
 		this._inlineBlockerWriteOrder.clear();
 		this._resolvedBlockerFilesThisTurn.clear();
 		this._resolvedBlockerFilesDropped = 0;
-		this._actionableWarningsThisTurn.clear();
-		this._codeQualityWarningsThisTurn.clear();
 		this._turnSummary.clear();
 		// #2402: an applied-edit record is a fact about the session that applied
 		// it; a new session must re-resolve identical payloads from content.
@@ -763,7 +836,31 @@ export class RuntimeCoordinator {
 		return this._gitGuardCacheUnknownReason;
 	}
 
-	beginTurn(): void {
+	/**
+	 * Start a turn. `sessionId` is the turn's own session (its ctx's stable id);
+	 * omitted, or equal to this coordinator's session, the turn is the
+	 * coordinator's own. #3613 (S4, N2): a concurrent secondary's turn on this
+	 * coordinator advances only its own turn identity and its own per-turn
+	 * records. The turn counter, the write-order turn, the turn's change
+	 * window and the carried cascade runs are the primary's.
+	 */
+	beginTurn(sessionId?: string): void {
+		this._turnStarts += 1;
+		const turnSession = this.turnSession(sessionId);
+		if (turnSession !== this._telemetrySessionId) {
+			beginTurnContext(turnSession);
+			// A fresh key strictly between this coordinator's turn and its next
+			// (n / (n + 1) < 1 grows with n): distinct from every other turn's,
+			// and drawn in start order.
+			this._foreignTurns += 1;
+			this._foreignTurnKeys.set(
+				turnSession,
+				this._turnIndex + this._foreignTurns / (this._foreignTurns + 1),
+			);
+			this._actionableWarningsThisTurn.clear(turnSession);
+			this._codeQualityWarningsThisTurn.clear(turnSession);
+			return;
+		}
 		// #1443: runs sitting here at turn_start were appended AFTER the last
 		// turn_end drained them (consumeCascadeRuns) — the quiet-window reconcile's
 		// late re-injection (`onResolvedFound`, clients/lsp/cascade-tier.ts) lands
@@ -796,8 +893,8 @@ export class RuntimeCoordinator {
 		// Inline blockers are session-scoped per-file state. They are cleared only
 		// when that file is re-analyzed clean or the session resets; a new turn must
 		// not let a clean unrelated file erase an unresolved blocker.
-		this._actionableWarningsThisTurn.clear();
-		this._codeQualityWarningsThisTurn.clear();
+		this._actionableWarningsThisTurn.clear(turnSession);
+		this._codeQualityWarningsThisTurn.clear(turnSession);
 		// _turnSummary is deliberately NOT cleared here (#484 rework): the
 		// summary entry is emitted once per RUN at the agent_settled quiet
 		// window (sendMessage during a live stream would STEER the agent, and
@@ -1033,6 +1130,16 @@ export class RuntimeCoordinator {
 		return this._turnIndex;
 	}
 
+	/**
+	 * #3613 G1: the turn starts of every session on this coordinator since the
+	 * session reset. A process-level turn cadence (the memory sample, the
+	 * smells re-check) paces on it: an integer, so its `% N` gate is met, and
+	 * moved by a subagent's turns, which run inside one primary turn.
+	 */
+	get turnStartCount(): number {
+		return this._turnStarts;
+	}
+
 	/** #3540 r2: the order turn a write token is drawn in; never restarts. */
 	get writeOrderTurn(): number {
 		return this._writeOrderTurn;
@@ -1250,7 +1357,9 @@ export class RuntimeCoordinator {
 		p: Promise<CascadeRun>,
 		generation: GenerationHandle,
 		filePath: string,
+		analysisRootMode: AnalysisRootMode = "session",
 	): void {
+		if (!canWriteAnalysisRoot(analysisRootMode)) return;
 		// A stale admission is dropped on both branches below.
 		if (generation.guardedWrite(filePath, () => true) === undefined) return;
 		if (this._pendingCascadeRuns.length < MAX_PENDING_CASCADE_RUNS) {
@@ -1312,12 +1421,21 @@ export class RuntimeCoordinator {
 			 * #3499: the session this settle belongs to. The quiet window runs
 			 * fire-and-forget and can outlive its session; after a replacement,
 			 * both the append and the re-park are dropped.
+			 * #4161: a settle called after the replacement takes nothing: the
+			 * computes parked then are the successor's (turn_end calls it after
+			 * awaits a replacement can land in).
 			 */
 			generation?: GenerationHandle | undefined;
 		} = {},
 	): Promise<{ settled: number; timedOut: number }> {
 		const pending = this._pendingCascadeRuns;
 		if (pending.length === 0) return { settled: 0, timedOut: 0 };
+		const { generation } = settleOptions;
+		if (
+			generation &&
+			generation.guardedWrite("cascade-settle", () => true) === undefined
+		)
+			return { settled: 0, timedOut: 0 };
 		this._pendingCascadeRuns = [];
 		const settleToken = settleOptions.trackTurnEndClock
 			? ++this._nextCascadeSettleToken
@@ -1351,7 +1469,6 @@ export class RuntimeCoordinator {
 				timeout,
 			]);
 
-			const { generation } = settleOptions;
 			const commit = (subject: string, write: () => void): void => {
 				if (generation) generation.guardedWrite(subject, write);
 				else write();
@@ -1377,6 +1494,27 @@ export class RuntimeCoordinator {
 				this._turnEndCascadeSettleStarts.delete(settleToken);
 			}
 		}
+	}
+
+	/**
+	 * #3813/#3901: park the items a lane's advisory showed and the turn-end cap
+	 * cut. Their producers have no queue to restore (the scan cache is
+	 * overwritten and the edited-file worklist retired before the cap runs), so
+	 * the lane re-checks each parked item against its next fresh run. Replaces
+	 * the lane's earlier entry. Returns the lane evicted to stay within
+	 * `MAX_CUT_ADVISORY_LANES`, if any.
+	 */
+	parkCutAdvisoryItems(lane: string, items: readonly unknown[]): string[] {
+		this._cutAdvisoryItems.delete(lane);
+		if (items.length === 0) return [];
+		return this._cutAdvisoryItems.set(lane, [...items]).map(([key]) => key);
+	}
+
+	/** Remove and return a lane's parked items: they are offered once. */
+	takeCutAdvisoryItems<T>(lane: string): T[] {
+		const items = this._cutAdvisoryItems.get(lane);
+		this._cutAdvisoryItems.delete(lane);
+		return (items ?? []) as T[];
 	}
 
 	consumeCascadeRuns(): CascadeRun[] {
@@ -1563,13 +1701,43 @@ export class RuntimeCoordinator {
 
 	/**
 	 * Clear a file's verdict after a clean dispatch. Returns false when a newer
-	 * dispatch of the same file already recorded or cleared it (#3507).
+	 * dispatch of the same file already recorded or cleared it (#3507), or when
+	 * `analysis` ran without authorship over the very bytes the record is about
+	 * (#4137 round 3). Such a run withholds the blocker channel (#3226), so its
+	 * clean result is no evidence against an authored verdict on the same bytes;
+	 * before this, an opaque recovery of bytes the agent authored cleared the
+	 * record whenever the already-analysed latch was gone (a concurrent
+	 * session's turn start, the session's own next turn), and turn end then
+	 * reported a false "Resolved". The refusal consumes no write order and is
+	 * counted as `blocker-clear-refused` per file key. A record with no
+	 * `recordedHash` (#2982: the file was unreadable or over the baseline cap at
+	 * record time) cannot be matched and is cleared as before.
 	 */
 	clearInlineBlockers(
 		filePath: string,
 		writeIndex?: number,
 		orderTurn = this._writeOrderTurn,
+		analysis?: { authored: boolean; sha256: string | undefined },
 	): boolean {
+		const existing = this._pendingInlineBlockers.get(path.resolve(filePath));
+		if (
+			existing &&
+			analysis &&
+			!analysis.authored &&
+			analysis.sha256 !== undefined &&
+			existing.recordedHash === analysis.sha256
+		) {
+			// Counted per file key: one ledger entry per file, a durable row at the
+			// first refusal and the ledger's power-of-two milestones, never one per
+			// occurrence.
+			incrementDegradationCount({
+				kind: "blocker-clear-refused",
+				subject: normalizeMapKey(filePath),
+				reason:
+					"an analysis without authorship read the bytes an authored verdict is about; its clean result does not retire the record (#4137)",
+			});
+			return false;
+		}
 		if (
 			!this._inlineBlockerWriteOrder.shouldWrite(
 				normalizeMapKey(filePath),
@@ -1577,7 +1745,6 @@ export class RuntimeCoordinator {
 			)
 		)
 			return false;
-		const existing = this._pendingInlineBlockers.get(path.resolve(filePath));
 		if (existing) {
 			this.noteResolvedBlockerFile(
 				existing,
@@ -1973,32 +2140,83 @@ export class RuntimeCoordinator {
 		return entries;
 	}
 
-	recordActionableWarnings(warnings: ActionableWarningRecord[]): void {
-		for (const warning of warnings) {
-			this._actionableWarningsThisTurn.set(warning.id, warning);
-		}
+	/**
+	 * #3613: the partition a per-turn record of `sessionId`'s turn lives in,
+	 * the rule {@link beginTurn} applies too: a turn with no session id of its
+	 * own is this coordinator's.
+	 */
+	private turnSession(sessionId: string | undefined): string {
+		return sessionId ?? this._telemetrySessionId;
 	}
 
-	peekActionableWarnings(): ActionableWarningRecord[] {
-		return [...this._actionableWarningsThisTurn.values()];
+	recordActionableWarnings(
+		warnings: ActionableWarningRecord[],
+		sessionId?: string,
+	): void {
+		this._actionableWarningsThisTurn.add(this.turnSession(sessionId), warnings);
 	}
 
-	clearActionableWarnings(): void {
-		this._actionableWarningsThisTurn.clear();
+	peekActionableWarnings(sessionId?: string): ActionableWarningRecord[] {
+		return this._actionableWarningsThisTurn.peek(this.turnSession(sessionId));
 	}
 
-	recordCodeQualityWarnings(warnings: CodeQualityWarningRecord[]): void {
-		for (const warning of warnings) {
-			this._codeQualityWarningsThisTurn.set(warning.id, warning);
-		}
+	clearActionableWarnings(sessionId?: string): void {
+		this._actionableWarningsThisTurn.clear(this.turnSession(sessionId));
 	}
 
-	peekCodeQualityWarnings(): CodeQualityWarningRecord[] {
-		return [...this._codeQualityWarningsThisTurn.values()];
+	recordCodeQualityWarnings(
+		warnings: CodeQualityWarningRecord[],
+		sessionId?: string,
+	): void {
+		this._codeQualityWarningsThisTurn.add(
+			this.turnSession(sessionId),
+			warnings,
+		);
 	}
 
-	clearCodeQualityWarnings(): void {
-		this._codeQualityWarningsThisTurn.clear();
+	peekCodeQualityWarnings(sessionId?: string): CodeQualityWarningRecord[] {
+		return this._codeQualityWarningsThisTurn.peek(this.turnSession(sessionId));
+	}
+
+	clearCodeQualityWarnings(sessionId?: string): void {
+		this._codeQualityWarningsThisTurn.clear(this.turnSession(sessionId));
+	}
+
+	/**
+	 * #3613 F2: the key a per-turn cap (the observed-mutation budget, a
+	 * bounded-telemetry `capPerTurn`) uses for the current turn of `sessionId`.
+	 * This coordinator's own turn is its turn index, as before; a concurrent
+	 * session's turn is the key its own turn start drew, so each of its turns
+	 * re-arms and no two sessions' turns share a cap.
+	 */
+	turnKey(sessionId?: string): number {
+		const turnSession = this.turnSession(sessionId);
+		if (turnSession === this._telemetrySessionId) return this._turnIndex;
+		return this._foreignTurnKeys.get(turnSession) ?? this._turnIndex;
+	}
+
+	/**
+	 * #3613 G2: whether `key` is a live turn key: this coordinator's current
+	 * turn, or a live concurrent session's current one.
+	 */
+	isLiveTurnKey(key: number): boolean {
+		if (key === this._turnIndex) return true;
+		for (const live of this._foreignTurnKeys.values())
+			if (live === key) return true;
+		return false;
+	}
+
+	/**
+	 * #3613: a concurrent session's per-turn records end with its session, so
+	 * a subagent that shuts down before its turn end leaves no partition
+	 * behind. This coordinator's own records are reset by `resetForSession`.
+	 */
+	forgetTurnSession(sessionId: string | undefined): void {
+		const turnSession = this.turnSession(sessionId);
+		if (turnSession === this._telemetrySessionId) return;
+		this._foreignTurnKeys.delete(turnSession);
+		this._actionableWarningsThisTurn.clear(turnSession);
+		this._codeQualityWarningsThisTurn.clear(turnSession);
 	}
 
 	/** #484: the per-run diagnostics/autofix/format collector (accumulates
@@ -2122,7 +2340,9 @@ export class RuntimeCoordinator {
 		originCwd?: string,
 		/** #3521: a producer that awaited since it captured the epoch passes it. */
 		readGuardBranchEpoch = this.readGuard.currentBranchEpoch,
+		analysisRootMode: AnalysisRootMode = "session",
 	): boolean {
+		if (!canWriteAnalysisRoot(analysisRootMode)) return false;
 		const key = path.resolve(filePath);
 		const now = Date.now();
 		const resolvedOriginCwd = originCwd ?? turnStateCwd;
@@ -2169,6 +2389,7 @@ export class RuntimeCoordinator {
 		turnStateCwd: string,
 		ownerSessionId?: string,
 		originCwd?: string,
+		analysisRootMode: AnalysisRootMode = "session",
 	): boolean {
 		return this.deferMutation(
 			filePath,
@@ -2178,7 +2399,26 @@ export class RuntimeCoordinator {
 			"format",
 			ownerSessionId,
 			originCwd,
+			undefined,
+			analysisRootMode,
 		);
+	}
+
+	/** Return the ownership identity of a queued format record for bus events. */
+	deferredFormatIdentity(filePath: string):
+		| {
+				ownerSessionId: string | undefined;
+				turnIndex: number;
+				batchId: string;
+		  }
+		| undefined {
+		const record = this._pendingDeferredMutations.get(path.resolve(filePath));
+		if (!record || !record.kinds.has("format")) return undefined;
+		return {
+			ownerSessionId: record.ownerSessionId,
+			turnIndex: record.queuedTurnIndex,
+			batchId: record.queuedTurnId,
+		};
 	}
 
 	get pendingDeferredFormatCount(): number {

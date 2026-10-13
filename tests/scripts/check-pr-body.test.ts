@@ -4,11 +4,14 @@ import {
 	mkdtempSync,
 	readFileSync,
 	rmSync,
+	statSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { Worker } from "node:worker_threads";
 import { beforeEach, describe, expect, it, afterEach, vi } from "vitest";
 import {
 	gitExecFileSync,
@@ -27,11 +30,137 @@ import {
 	repairFlattenedBody,
 	resolveLivePrBody,
 	resolveTouchesTests,
+	DETECTION_LAYERS,
+	lintDetectionSection,
+	resolveBugClosing,
 } from "../../scripts/check-pr-body.mjs";
 import { blankCommentsAndStrings } from "../../scripts/check-pr-body.mjs";
 
-const body = `## Why\nThe body gate makes review intent explicit.\n\n## Notes for the reviewer\nNone.\n\n## Change outline\n- caller\n  + changed symbol\n    + callee\n\n## Summary\nOpening context.\n\n## Tests\nTargeted tests pass.\n\n## Blast radius\nNo runtime module touched.\n\n## Class sweep\nWhole-tree grep completed.\n\n## Observability\nThe advisory check run is the record.`;
+const body = `## Why\nThe body gate makes review intent explicit.\n\n## Notes for the reviewer\nNone.\n\n## Change outline\n- caller\n  + changed symbol\n    + callee\n\n## Summary\nOpening context.\n\n## Tests\nTargeted tests pass.\n\n## Blast radius\nNo runtime module touched.\n\n## Class sweep\nDefect shape: a body section answered with generic text. Search: \`rg -n "whole-tree grep" scripts\`. Verdict: none outside this fixture.\n\n## Observability\nThe advisory check run is the record.`;
+// A synthetic runtime file: `rows` is the whole post-image and `added` lists
+// the 1-based post-image lines the diff adds. The harvest reads `rows`, so a
+// test that needs the block-comment opener passes real rows — a bare hunk
+// cannot say whether a `*`-led line is a comment or a generator head (#3906).
+function runtimeFixture(
+	file: string,
+	rows: string[],
+	added: number[] = rows.map((_, index) => index + 1),
+) {
+	const hunks: string[] = [];
+	const sorted = [...added].sort((a, b) => a - b);
+	for (let index = 0; index < sorted.length; index += 1) {
+		const start = sorted[index];
+		let end = start;
+		while (sorted[index + 1] === end + 1) end = sorted[++index];
+		hunks.push(
+			`@@ -${Math.max(0, start - 1)},0 +${start},${end - start + 1} @@`,
+		);
+		for (let line = start; line <= end; line += 1)
+			hunks.push(`+${rows[line - 1] ?? ""}`);
+	}
+	return {
+		diff: [`diff --git a/${file} b/${file}`, ...hunks].join("\n"),
+		headFiles: new Map<string, string>([[file, rows.join("\n")]]),
+	};
+}
+
+// A JSDoc block whose `/**` opener sits directly above the added continuation
+// lines, followed by real code lines. The opener is what lets the whole-file
+// lexer decide, so a bare-hunk fixture cannot stand in for it.
+function docFixture(file: string, doc: string[], code: string[]) {
+	const rows = ["/**", ...doc, " */", ...code];
+	return runtimeFixture(file, rows, [
+		...doc.map((_, index) => index + 2),
+		...code.map((_, index) => index + doc.length + 3),
+	]);
+}
+
+// Rebuild a whole post-image from a hand-built diff whose subject is not the
+// lexer's block-comment state: added and context lines land at `+start`, gaps
+// are blank. Diffs whose subject IS that state use `runtimeFixture`/`docFixture`
+// with real rows instead.
+function postImageFromDiff(diff: string) {
+	const files: { name: string; rows: string[]; cursor: number }[] = [];
+	for (const line of diff.split("\n")) {
+		const header = /^diff --git a\/(.+) b\/(.+)$/.exec(line);
+		if (header) {
+			files.push({ name: header[2], rows: [], cursor: 1 });
+			continue;
+		}
+		const file = files[files.length - 1];
+		if (!file) continue;
+		const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+		if (hunk) {
+			file.cursor = Number(hunk[1]);
+			continue;
+		}
+		if (line.startsWith("---") || line.startsWith("+++")) continue;
+		if (line.startsWith("+") || line.startsWith(" ")) {
+			file.rows[file.cursor - 1] = line.slice(1);
+			file.cursor += 1;
+		}
+	}
+	const headFiles = new Map<string, string>();
+	for (const file of files) {
+		headFiles.set(
+			file.name,
+			Array.from(
+				{ length: file.rows.length },
+				(_, index) => file.rows[index] ?? "",
+			).join("\n"),
+		);
+	}
+	return { diff, headFiles };
+}
+
+// Git's blob identity: sha1 over `blob <byteLength>\0` plus the raw bytes.
+function gitBlobOid(text: string) {
+	const bytes = Buffer.from(text, "utf8");
+	return createHash("sha1")
+		.update(`blob ${bytes.length}\0`)
+		.update(bytes)
+		.digest("hex");
+}
+
+// An archived `--unified=0` fixture records its post-image blob in the `index`
+// line. A shallow CI checkout does not carry those historical objects, so the
+// bytes are vendored beside the fixture and read back; each is verified against
+// the blob oid the diff names. A missing or mismatched vendored image fails
+// loudly: there is no reconstruction fallback (#3945).
+function fixtureWithBlob(diff: string) {
+	const corpusDir = join(repositoryRoot, "tests", "fixtures", "ci-pr-bodies");
+	const provenance = JSON.parse(
+		readFileSync(join(corpusDir, "pr-3906-hermetic-provenance.json"), "utf8"),
+	) as { postImages: Record<string, { path: string; oid: string }> };
+	const headFiles = new Map<string, string>();
+	let file: string | null = null;
+	for (const line of diff.split("\n")) {
+		const header = /^diff --git a\/(.+) b\/(.+)$/.exec(line);
+		if (header) {
+			file = header[2];
+			continue;
+		}
+		const index = /^index [0-9a-f]+\.\.([0-9a-f]+)/.exec(line);
+		if (!index || !file) continue;
+		const meta = provenance.postImages[file];
+		if (!meta) throw new Error(`no vendored post-image for ${file} (#3945)`);
+		const source = readFileSync(join(corpusDir, meta.path), "utf8");
+		const oid = gitBlobOid(source);
+		if (oid !== meta.oid || !oid.startsWith(index[1]))
+			throw new Error(
+				`vendored post-image for ${file} does not match ${index[1]} (#3945)`,
+			);
+		headFiles.set(file, source);
+	}
+	return { diff, headFiles };
+}
 const repositoryRoot = process.cwd();
+// The stub `clients/new-path.ts` diff several existing-record tests use: a
+// single added `catch`, so its whole post-image is that one line. `headFiles`
+// lets the harvest verify the diff text against the post-image it reads.
+const NEW_PATH_RUNTIME_DIFF =
+	"diff --git a/clients/new-path.ts b/clients/new-path.ts\n+catch (error) { resolveToolCwd(error); }";
+const NEW_PATH_HEAD_FILES = postImageFromDiff(NEW_PATH_RUNTIME_DIFF).headFiles;
 type MergedRuntimeRecord = { name: string; kind: string; diff: string };
 const mergedRuntimeRecords = JSON.parse(
 	readFileSync(
@@ -58,7 +187,7 @@ function fetchForEvent(bodyText: string, files: unknown) {
 	});
 }
 const flattenedBody =
-	"## Summary Await the first lifecycle run's asynchronous word-index snapshot promotion before reseeding the current-format snapshot for the fallback run. ## Tests - Native master flake justification for the count barrier: 2/10 forced runs reproduced the promotion race. - Fixed lifecycle test: 5/5 tests passed. ### Test assessment - tests/clients/word-index-lifecycle.test.ts uniquely pins the ordering guard. ## Blast radius This change is test-only. ## Class sweep The async-persist lifecycle race is fully covered. ## Observability The test observes existing project snapshot records.";
+	"## Summary Await the first lifecycle run's asynchronous word-index snapshot promotion before reseeding the current-format snapshot for the fallback run. ## Tests - Native master flake justification for the count barrier: 2/10 forced runs reproduced the promotion race. - Fixed lifecycle test: 5/5 tests passed. ### Test assessment - tests/clients/word-index-lifecycle.test.ts uniquely pins the ordering guard. ## Blast radius This change is test-only. ## Class sweep Defect shape: async-persist lifecycle race. Search `rg -n async-persist clients`. Verdict: none outside this fixture. ## Observability The test observes existing project snapshot records.";
 const multiRoundFlattenedBody =
 	"## Summary Preserve the repair context across multiple review rounds. ## Tests - The repair fixture exercises distinct numbered fix rounds. ### Test assessment - tests/scripts/check-pr-body.test.ts uniquely pins numbered fix-round repair. ## Fix round 1 The first review round records the initial correction. ## Fix round 2 The second review round records the follow-up correction. ## Blast radius This change is test-only. ## Class sweep Numbered fix rounds remain distinct during repair. ## Observability The repaired body is validated by the existing body lint.";
 const motivatingFlattenedBodies = [
@@ -67,15 +196,72 @@ const motivatingFlattenedBodies = [
 	flattenedBody,
 ].map((candidate) => candidate.replaceAll("\\n", " "));
 
-function createOriginMasterFixture(mappedFile?: string) {
+type RuntimePostImageFixture = {
+	path: string;
+	pre: string[];
+	post: string[];
+	dirty: string[];
+	// Unchanged padding appended to the pre- and post-images (#3906 r5): the
+	// committed diff stays one added line while the post-image blob crosses the
+	// reader's byte ceiling. Over the shell argv limit it is written with
+	// `writeFileSync` and `cp`ed into place instead of a `printf` argument.
+	padLines?: number;
+};
+
+function shellRows(rows: string[]): string {
+	// The fixture rows are single-quote free, so each is a POSIX single-quoted
+	// word; joining them with spaces makes one `printf '%s\n' a b c` call.
+	return rows.map((row) => `'${row}'`).join(" ");
+}
+
+// One shared `git init` call site keeps the file's pinned real-spawn count
+// while several fixture tests each need a fresh repository.
+function initFixtureRepo(fixtureRepo: string) {
+	gitExecFileSync(["init", "-q"], { cwd: fixtureRepo });
+}
+
+function createOriginMasterFixture(
+	mappedFile?: string,
+	postImage?: RuntimePostImageFixture,
+) {
 	const directory = mkdtempSync(join(repositoryRoot, ".tmp-pr-body-origin-"));
 	// `mappedFile` (#3802 F3) commits one extra repo-relative file in the same
 	// shell command, so a mapped-path diff costs no additional git spawn.
 	const mapped = mappedFile
 		? ` && mkdir -p '${directory}/${dirname(mappedFile)}' && printf 'touched\\n' > '${directory}/${mappedFile}' && git -C '${directory}' add '${mappedFile}' && git -C '${directory}' -c user.name=pi-lens-test -c user.email=pi-lens-test@example.com commit --quiet -m fixture-mapped`
 		: "";
+	// A real runtime post-image (#3906 r4 R3-A): the pre-image is committed as
+	// the base, `origin/master` points at it, the post-image is committed as the
+	// head so the diff names `index <pre>..<post>`, and the working tree is then
+	// dirtied in an unchanged line. The reader must take the named blob; reading
+	// the dirty tree would flip the lexical state without changing any added line.
+	//
+	// A `padLines` post-image (#3906 r5 byte-ceiling witnesses) is over the
+	// argv limit, so its bytes come from a fixture-local file and a `cp`; a small
+	// image keeps the single-argument `printf` writer.
+	const writePostImageContent = (rows: string[], tempName: string) => {
+		const destination = `${directory}/${postImage?.path}`;
+		if (!postImage?.padLines)
+			return `printf '%s\\n' ${shellRows(rows)} > '${destination}'`;
+		writeFileSync(
+			join(directory, tempName),
+			`${rows.join("\n")}\n${"// pad\n".repeat(postImage.padLines)}`,
+		);
+		return `cp '${directory}/${tempName}' '${destination}'`;
+	};
+	const preImage = postImage
+		? `mkdir -p '${directory}/${dirname(postImage.path)}' && ${writePostImageContent(postImage.pre, ".fixture-pre")} && git -C '${directory}' add '${postImage.path}' && `
+		: "";
+	const postImageSegment = postImage
+		? ` && ${writePostImageContent(postImage.post, ".fixture-post")} && git -C '${directory}' add '${postImage.path}' && git -C '${directory}' -c user.name=pi-lens-test -c user.email=pi-lens-test@example.com commit --quiet -m fixture-post-image && ${writePostImageContent(postImage.dirty, ".fixture-dirty")}`
+		: "";
+	// Spawn from the repository root: every command in the chain addresses the
+	// fixture by absolute path, so the caller's cwd must not decide which
+	// repository the commit chain moves. A caller already inside another fixture
+	// repo made that fixture's branch the HEAD-moving target of this chain.
 	gitExecSync(
-		`git init --quiet --initial-branch=main '${directory}' && git -C '${directory}' -c user.name=pi-lens-test -c user.email=pi-lens-test@example.com commit --quiet --allow-empty -m fixture-base && git -C '${directory}' update-ref refs/remotes/origin/master HEAD && printf 'fixture change\n' > '${directory}/fixture.md' && git -C '${directory}' add fixture.md && git -C '${directory}' -c user.name=pi-lens-test -c user.email=pi-lens-test@example.com commit --quiet -m fixture-head${mapped}`,
+		`git init --quiet --initial-branch=main '${directory}' && ${preImage}git -C '${directory}' -c user.name=pi-lens-test -c user.email=pi-lens-test@example.com commit --quiet --allow-empty -m fixture-base && git -C '${directory}' update-ref refs/remotes/origin/master HEAD && printf 'fixture change\n' > '${directory}/fixture.md' && git -C '${directory}' add fixture.md && git -C '${directory}' -c user.name=pi-lens-test -c user.email=pi-lens-test@example.com commit --quiet -m fixture-head${mapped}${postImageSegment}`,
+		{ cwd: repositoryRoot },
 	);
 	return directory;
 }
@@ -201,10 +387,7 @@ describe("flattened PR body repair", () => {
 	);
 
 	it.each([
-		[
-			"plain quoted headings",
-			`${flattenedBody} \"## Summary one ## Tests two\"`,
-		],
+		["plain quoted headings", `${flattenedBody} "## Summary one ## Tests two"`],
 		[
 			"fenced quoted headings",
 			`${flattenedBody} \`\`\`text ## Summary one ## Tests two \`\`\``,
@@ -286,6 +469,22 @@ describe("Markdown claim units", () => {
 				kind: "sentence",
 				text: "E.g. keep this sentence together... Then finish.",
 			},
+		]);
+	});
+
+	it("starts a sentence after a code span or numeric token", () => {
+		expect(
+			splitMarkdownUnits(
+				"The first sentence ends here. `tests/x.test.ts` already parses that source.\nA second sentence ends here. 4.4.2 is the pinned version.",
+			),
+		).toEqual([
+			{ kind: "sentence", text: "The first sentence ends here." },
+			{
+				kind: "sentence",
+				text: "`tests/x.test.ts` already parses that source.",
+			},
+			{ kind: "sentence", text: "A second sentence ends here." },
+			{ kind: "sentence", text: "4.4.2 is the pinned version." },
 		]);
 	});
 
@@ -476,10 +675,15 @@ describe("test-reference shape and placement", () => {
 		try {
 			mkdirSync(join(fixtureRepo, "tests"));
 			writeFileSync(join(fixtureRepo, "tests", "fixture.test.ts"), "fixture\n");
-			gitExecFileSync(["init", "-q"], { cwd: fixtureRepo });
+			initFixtureRepo(fixtureRepo);
 			gitExecFileSync(["add", "tests/fixture.test.ts"], { cwd: fixtureRepo });
+			// `-C` keeps the path resolution in the fixture; the spawn cwd stays at
+			// the repository root so the commit's HEAD-moving target is not the
+			// fixture repo's own branch.
 			gitExecFileSync(
 				[
+					"-C",
+					fixtureRepo,
 					"-c",
 					"user.email=pi-lens-test@example.com",
 					"-c",
@@ -488,7 +692,7 @@ describe("test-reference shape and placement", () => {
 					"-qm",
 					"fixture",
 				],
-				{ cwd: fixtureRepo },
+				{ cwd: repositoryRoot },
 			);
 			const direct = lintPrBody(fixture).errors.join(" ");
 			const local = lintLocalPrBody(fixture, fixtureRepo).errors.join(" ");
@@ -525,7 +729,7 @@ describe("test-reference shape and placement", () => {
 			writeFileSync(join(fixtureRepo, "vendor", "lib.js"), "ignored\n");
 			// `git check-ignore` reads .gitignore from the work tree; no commit is
 			// needed, so the fixture costs one spawn.
-			gitExecFileSync(["init", "-q"], { cwd: fixtureRepo });
+			initFixtureRepo(fixtureRepo);
 			const citing = (file: string) =>
 				lintLocalPrBody(
 					`${body}\nThe helper is at \`${file}:1\`.`,
@@ -815,7 +1019,7 @@ describe("test-reference positive recognition (#3013)", () => {
 });
 
 const escapedNewlineFlattenedBody =
-	"## Summary\\nRestore real newlines for the escaped-newline flattening class (#2145).\\n\\n## Tests\\nAdds fixtures pinning literal backslash-n repair outside fences.\\n\\n## Blast radius\\nLimited to the body-lint script.\\n\\n## Class sweep\\nEscaped-newline flattening is the sibling of the space-flattening class already handled.\\n\\n## Observability\\nA notice logs the repaired PR number.";
+	"## Summary\\nRestore real newlines for the escaped-newline flattening class (#2145).\\n\\n## Tests\\nAdds fixtures pinning literal backslash-n repair outside fences.\\n\\n## Blast radius\\nLimited to the body-lint script.\\n\\n## Class sweep\\nDefect shape: escaped-newline flattening. Search `rg -n backslash-n scripts`. Verdict: sibling of the space-flattening class.\\n\\n## Observability\\nA notice logs the repaired PR number.";
 
 const escapedNewlineWithFence =
 	'## Summary\\nRestore real newlines outside fences only (#2145).\\n\\n## Tests\\n```json\\n{"note": "line1\\nline2"}\\n```\\nThe JSON example above documents a genuine escaped newline.\\n\\n## Blast radius\\nLimited to the body-lint script.\\n\\n## Class sweep\\nFence content must never be rewritten during escaped-newline repair.\\n\\n## Observability\\nA notice logs the repaired PR number.';
@@ -1104,6 +1308,7 @@ describe("PR body lint (#1844)", () => {
 			),
 			process.cwd(),
 			() => runtimeDiff,
+			{ headFiles: postImageFromDiff(runtimeDiff).headFiles },
 		);
 		expect(result.valid).toBe(false);
 		expect(result.errors.join(" ")).toContain("runtime-example");
@@ -1118,7 +1323,7 @@ describe("PR body lint (#1844)", () => {
 					"The advisory check run is the record.",
 					`The bounded record is ${kind}.`,
 				),
-				{ diff },
+				postImageFromDiff(diff),
 			);
 			expect(result, name).toEqual({ valid: true, errors: [] });
 		},
@@ -1145,7 +1350,7 @@ describe("PR body lint (#1844)", () => {
 			(record) => {
 				expect(
 					lintPrBody(withObservability(`The bounded record is ${record}.`), {
-						diff: pr2895Diff,
+						...postImageFromDiff(pr2895Diff),
 					}),
 				).toEqual({ valid: true, errors: [] });
 			},
@@ -1153,22 +1358,20 @@ describe("PR body lint (#1844)", () => {
 
 		it("still refuses a record #2895's diff does not add", () => {
 			expect(
-				lintPrBody(withObservability("The bounded record is not-in-diff."), {
-					diff: pr2895Diff,
-				}).valid,
+				lintPrBody(
+					withObservability("The bounded record is not-in-diff."),
+					postImageFromDiff(pr2895Diff),
+				).valid,
 			).toBe(false);
 		});
 
 		it("requires a record for a failure path added to index.ts", () => {
+			const fixture = runtimeFixture("index.ts", [
+				"try { start(); } catch { return null; }",
+			]);
 			const result = lintPrBody(
 				withObservability("No new failure path; no record added."),
-				{
-					diff: [
-						"diff --git a/index.ts b/index.ts",
-						"@@ -1,0 +1,1 @@",
-						"+try { start(); } catch { return null; }",
-					].join("\n"),
-				},
+				fixture,
 			);
 			expect(result.errors.join(" ")).toContain(
 				"not valid when the added lines contain a failure path",
@@ -1176,62 +1379,791 @@ describe("PR body lint (#1844)", () => {
 		});
 
 		it("harvests a new call whose closing brace is an unchanged context line", () => {
-			const diff = [
-				"diff --git a/clients/example.ts b/clients/example.ts",
-				"@@ -10,2 +10,4 @@",
-				"+\tlogLatency({",
-				'+\t\tphase: "example_context_close",',
-				" \t});",
-				" }",
-			].join("\n");
+			// The whole post-image holds the closing brace; only the opening lines
+			// are added, so the span test still finds the call (#2915).
+			const fixture = runtimeFixture(
+				"clients/example.ts",
+				["\tlogLatency({", '\t\tphase: "example_context_close",', "\t});", "}"],
+				[1, 2],
+			);
 			expect(
-				lintPrBody(withObservability("The record is example_context_close."), {
-					diff,
-				}),
+				lintPrBody(
+					withObservability("The record is example_context_close."),
+					fixture,
+				),
 			).toEqual({ valid: true, errors: [] });
 		});
 
-		it("does not count an untouched record in the hunk's context as added", () => {
-			const diff = [
-				"diff --git a/clients/example.ts b/clients/example.ts",
-				"@@ -10,2 +10,3 @@",
-				' \trecordDegradationOnce({ kind: "old-kind" });',
-				"+\tnext();",
-				" }",
-			].join("\n");
+		it("does not count an untouched record in the post-image as added", () => {
+			const fixture = runtimeFixture(
+				"clients/example.ts",
+				['\trecordDegradationOnce({ kind: "old-kind" });', "\tnext();", "}"],
+				[2],
+			);
 			expect(
-				lintPrBody(withObservability("The record is old-kind."), { diff })
-					.valid,
+				lintPrBody(withObservability("The record is old-kind."), fixture).valid,
 			).toBe(false);
 		});
 
 		it("harvests a read-time fold row's kind (#3721)", () => {
-			const diff = [
-				"diff --git a/clients/degradation-ledger.ts b/clients/degradation-ledger.ts",
-				"@@ -1,0 +1,4 @@",
-				"+\tsummary.push({",
-				'+\t\tkind: "fold-row-kind",',
-				"+\t\tcount: 1,",
-				"+\t});",
-			].join("\n");
+			const fixture = runtimeFixture("clients/degradation-ledger.ts", [
+				"\tsummary.push({",
+				'\t\tkind: "fold-row-kind",',
+				"\t\tcount: 1,",
+				"\t});",
+			]);
 			expect(
-				lintPrBody(withObservability("The record is fold-row-kind."), { diff }),
+				lintPrBody(withObservability("The record is fold-row-kind."), fixture),
 			).toEqual({ valid: true, errors: [] });
 			expect(
-				lintPrBody(withObservability("The record is not-in-diff."), { diff })
+				lintPrBody(withObservability("The record is not-in-diff."), fixture)
 					.valid,
 			).toBe(false);
 		});
 
 		it("harvests recordDegradation's kind", () => {
-			const diff = [
-				"diff --git a/clients/example.ts b/clients/example.ts",
-				"@@ -1,0 +1,1 @@",
-				'+recordDegradation({ kind: "single-record-kind" });',
-			].join("\n");
+			const fixture = runtimeFixture("clients/example.ts", [
+				'recordDegradation({ kind: "single-record-kind" });',
+			]);
 			expect(
-				lintPrBody(withObservability("The record is single-record-kind."), {
+				lintPrBody(
+					withObservability("The record is single-record-kind."),
+					fixture,
+				),
+			).toEqual({ valid: true, errors: [] });
+		});
+	});
+
+	// #3906: `git diff --unified=0` hands the runtime scan the hunk, not a file.
+	// A JSDoc body's continuation line can look exactly like a generator head
+	// (` * name(...) {`), so a hunk-local lexer cannot tell a comment from code.
+	// The scan now reads the whole post-image the diff names, lexes it once, and
+	// intersects the records with the added POST-image lines. These fixtures
+	// carry the real `/**` opener (or the real generator head), so the lexer's
+	// block-comment state, not a regex guess, decides.
+	describe("block-comment continuations never hide or satisfy a record (#3906)", () => {
+		const withObservability = (text: string) =>
+			body.replace("The advisory check run is the record.", text);
+
+		it.each([
+			["an unbalanced backtick", " * the `findRelocation window"],
+			[
+				"a balanced backtick and apostrophe",
+				" * the `findRelocation`'s window",
+			],
+			["an unbalanced double quote", ' * the "relocation window'],
+		])(
+			"finds the record below a JSDoc continuation carrying %s",
+			(_name, continuation) => {
+				expect(
+					lintPrBody(
+						withObservability("The record is real-kind."),
+						docFixture(
+							"clients/widget.ts",
+							[continuation],
+							['\treturn recordDegradationOnce({ kind: "real-kind" });'],
+						),
+					),
+				).toEqual({ valid: true, errors: [] });
+			},
+		);
+
+		it("keeps a record's line number when a continuation line sits above it", () => {
+			// The record's line must stay the post-image line the diff added, not
+			// shift when a continuation line leaves the hunk.
+			const fixture = runtimeFixture(
+				"clients/widget.ts",
+				[
+					"\tconst before = 1;",
+					"/**",
+					" * the `findRelocation window",
+					" */",
+					'\treturn recordDegradationOnce({ kind: "shift-kind" });',
+					"\tconst after = 2;",
+				],
+				[2, 3, 4, 5],
+			);
+			expect(
+				lintPrBody(withObservability("The record is shift-kind."), fixture),
+			).toEqual({ valid: true, errors: [] });
+		});
+
+		it("refuses a prose record literal inside a JSDoc continuation", () => {
+			expect(
+				lintPrBody(
+					withObservability("The record is prose-kind."),
+					docFixture(
+						"clients/widget.ts",
+						[
+							' * recordDegradationOnce({ kind: "prose-kind" }) is documentation.',
+						],
+						[],
+					),
+				).valid,
+			).toBe(false);
+		});
+
+		// N1 (#3906 r3, AC 5): the ordinary ` * name(...) { ... }` JSDoc form is
+		// indistinguishable from a generator head without the opener. A prose
+		// `recordDegradationOnce` in it must neither satisfy the check nor set a
+		// failure path.
+		it("refuses a prose record on a `* example()` JSDoc continuation", () => {
+			expect(
+				lintPrBody(
+					withObservability("The record is doc-example."),
+					docFixture(
+						"clients/widget.ts",
+						[' * example() { recordDegradationOnce({ kind: "doc-example" }) }'],
+						[],
+					),
+				).valid,
+			).toBe(false);
+		});
+
+		it("accepts the honest sentence when only a `* example()` JSDoc continuation is added", () => {
+			expect(
+				lintPrBody(
+					withObservability("No new failure path; no record added."),
+					docFixture(
+						"clients/widget.ts",
+						[' * example() { recordDegradationOnce({ kind: "doc-example" }) }'],
+						[],
+					),
+				),
+			).toEqual({ valid: true, errors: [] });
+		});
+
+		it("keeps a record on a generator method line", () => {
+			expect(
+				lintPrBody(
+					withObservability("The record is gen-kind."),
+					runtimeFixture("clients/widget.ts", [
+						'*entries() { return recordDegradationOnce({ kind: "gen-kind" }); }',
+					]),
+				),
+			).toEqual({ valid: true, errors: [] });
+		});
+
+		it("keeps a record on a computed generator method line", () => {
+			expect(
+				lintPrBody(
+					withObservability("The record is computed-kind."),
+					runtimeFixture("clients/widget.ts", [
+						'*[Symbol.iterator]() { return recordDegradationOnce({ kind: "computed-kind" }); }',
+					]),
+				),
+			).toEqual({ valid: true, errors: [] });
+		});
+
+		it("finds the record below a multiline generator head", () => {
+			expect(
+				lintPrBody(
+					withObservability("The record is multi-kind."),
+					runtimeFixture("clients/widget.ts", [
+						"*multi(",
+						"\ta,",
+						") {",
+						'\treturn recordDegradationOnce({ kind: "multi-kind" });',
+						"}",
+					]),
+				),
+			).toEqual({ valid: true, errors: [] });
+		});
+
+		// N2 (#3906 r3, AC 7): a comment between the `*` and the method name is
+		// what `oxfmt 0.71.0` writes; the real record below the head must not be
+		// blanked away, and the honest sentence must be refused because a record
+		// really is added.
+		it("finds a real record below a `*/* head-comment */ entries()` generator head", () => {
+			const fixture = runtimeFixture("clients/widget.ts", [
+				"\t*/* head-comment */ entries(): Generator<string> {",
+				'\t\tyield "a";',
+				'\t\trecordDegradationOnce({ kind: "below-kind" });',
+				"\t}",
+			]);
+			expect(
+				lintPrBody(withObservability("The record is below-kind."), fixture),
+			).toEqual({ valid: true, errors: [] });
+			expect(
+				lintPrBody(
+					withObservability("No new failure path; no record added."),
+					fixture,
+				).valid,
+			).toBe(false);
+		});
+
+		// A `*the`/`**Note:**` continuation with no space after the `*` is a
+		// formatter-stable shape; the opener, not the leading run, decides.
+		it.each([
+			["an unbalanced backtick", " *the `findRelocation window"],
+			["a balanced backtick and apostrophe", " *the `findRelocation`'s window"],
+			["an unbalanced double quote", ' *the "relocation window'],
+			["a doubled star", " **Note:** the `window"],
+		])(
+			"finds the record below a no-space JSDoc continuation carrying %s",
+			(_name, continuation) => {
+				expect(
+					lintPrBody(
+						withObservability("The record is no-space-kind."),
+						docFixture(
+							"clients/widget.ts",
+							[continuation],
+							['\treturn recordDegradationOnce({ kind: "no-space-kind" });'],
+						),
+					),
+				).toEqual({ valid: true, errors: [] });
+			},
+		);
+
+		it.each([
+			[
+				"a no-space continuation",
+				' *the `window` and recordDegradationOnce({ kind: "prose-kind" }) docs',
+			],
+			[
+				"a doubled-star continuation",
+				' **recordDegradationOnce({ kind: "prose-kind" })** docs',
+			],
+			[
+				"a bare call at the star",
+				'*recordDegradationOnce({ kind: "prose-kind" }) is documented.',
+			],
+		])("refuses a prose record literal inside %s", (_name, line) => {
+			expect(
+				lintPrBody(
+					withObservability("The record is prose-kind."),
+					docFixture("clients/widget.ts", [line], []),
+				).valid,
+			).toBe(false);
+		});
+
+		// A no-space continuation carrying an unbalanced quote used to open a
+		// template string that blanked the failure path or seam branch below it,
+		// so the bare sentence passed (#3906 F1 false clean).
+		it.each([
+			[
+				"a failure path",
+				"clients/widget.ts",
+				"\tcatch (error) { warn(error); }",
+			],
+			[
+				"a seam branch",
+				"clients/session-scope.ts",
+				"\tif (adopt) apply(slot);",
+			],
+		])(
+			"still refuses the no-record sentence when a no-space continuation precedes %s",
+			(_name, file, branch) => {
+				const result = lintPrBody(
+					withObservability("No new failure path; no record added."),
+					docFixture(file, [" *the `window"], [branch]),
+				);
+				expect(result.valid).toBe(false);
+			},
+		);
+	});
+
+	describe("post-image identity and bounds (#3906 r3)", () => {
+		const withObservability = (text: string) =>
+			body.replace("The advisory check run is the record.", text);
+
+		it("reads a C-quoted Git path with a non-ASCII byte", () => {
+			// Git C-quotes the UTF-8 bytes of a non-ASCII path; a byte-wise unquote
+			// must still find the file, or the harvest silently skips it. The honest
+			// sentence is refused only when the file was actually read.
+			const diff = [
+				'diff --git "a/clients/caf\\303\\251.ts" "b/clients/caf\\303\\251.ts"',
+				"@@ -1 +1 @@",
+				"-\texport const a = 1;",
+				'+\trecordDegradationOnce({ kind: "cafe-kind" });',
+			].join("\n");
+			const headFiles = new Map([
+				["clients/café.ts", '\trecordDegradationOnce({ kind: "cafe-kind" });'],
+			]);
+			expect(
+				lintPrBody(withObservability("The record is cafe-kind."), {
 					diff,
+					headFiles,
+				}),
+			).toEqual({ valid: true, errors: [] });
+			expect(
+				lintPrBody(withObservability("No new failure path; no record added."), {
+					diff,
+					headFiles,
+				}).valid,
+			).toBe(false);
+		});
+
+		it("reads a C-quoted Git path with a backslash", () => {
+			const diff = [
+				'diff --git "a/clients/back\\\\slash.ts" "b/clients/back\\\\slash.ts"',
+				"@@ -1 +1 @@",
+				"-\texport const c = 1;",
+				'+\trecordDegradationOnce({ kind: "back-kind" });',
+			].join("\n");
+			const headFiles = new Map([
+				[
+					"clients/back\\slash.ts",
+					'\trecordDegradationOnce({ kind: "back-kind" });',
+				],
+			]);
+			expect(
+				lintPrBody(withObservability("The record is back-kind."), {
+					diff,
+					headFiles,
+				}),
+			).toEqual({ valid: true, errors: [] });
+			expect(
+				lintPrBody(withObservability("No new failure path; no record added."), {
+					diff,
+					headFiles,
+				}).valid,
+			).toBe(false);
+		});
+
+		it("reads a real Git C-quoted runtime path with an embedded quote", () => {
+			// Recurrence: #3945 mutations 64/66/67 — without the `\\` escape branch
+			// in `readQuotedPath`, Git's `"a/clients/we\"ird.ts"` token ends at the
+			// escaped quote, `gitHeaderPaths` returns null, the file reads as
+			// non-runtime, and the denial body becomes a false clean.
+			const fixture = createOriginMasterFixture(undefined, {
+				path: 'clients/we"ird.ts',
+				pre: ["export let x = 0;"],
+				post: [
+					"export let x = 0;",
+					'\trecordDegradationOnce({ kind: "quote-kind" });',
+				],
+				dirty: [
+					"export let x = 0;",
+					'\trecordDegradationOnce({ kind: "quote-kind" });',
+				],
+			});
+			try {
+				const diff = localDiff(fixture);
+				// The producer must actually C-quote the embedded quote; otherwise the
+				// fixture is not the shape this escape branch exists for.
+				expect(diff).toContain('"a/clients/we\\"ird.ts"');
+				expect(
+					lintPrBody(withObservability("The record is quote-kind."), {
+						diff,
+						cwd: fixture,
+						workingTree: true,
+					}),
+				).toEqual({ valid: true, errors: [] });
+				const denied = lintPrBody(
+					withObservability("No new failure path; no record added."),
+					{ diff, cwd: fixture, workingTree: true },
+				);
+				expect(denied.valid).toBe(false);
+				expect(denied.errors.join(" ")).toContain("failure path");
+			} finally {
+				rmSync(fixture, { recursive: true, force: true });
+			}
+		});
+
+		it("reads an unquoted path that contains a space", () => {
+			const diff = [
+				"diff --git a/clients/brand new.ts b/clients/brand new.ts",
+				"@@ -1 +1 @@",
+				"-\texport const s = 1;",
+				'+\trecordDegradationOnce({ kind: "space-kind" });',
+			].join("\n");
+			const headFiles = new Map([
+				[
+					"clients/brand new.ts",
+					'\trecordDegradationOnce({ kind: "space-kind" });',
+				],
+			]);
+			expect(
+				lintPrBody(withObservability("The record is space-kind."), {
+					diff,
+					headFiles,
+				}),
+			).toEqual({ valid: true, errors: [] });
+			expect(
+				lintPrBody(withObservability("No new failure path; no record added."), {
+					diff,
+					headFiles,
+				}).valid,
+			).toBe(false);
+		});
+
+		it("follows a rename to a runtime path", () => {
+			const diff = [
+				"diff --git a/clients/old.ts b/clients/new.ts",
+				"similarity index 100%",
+				"rename from clients/old.ts",
+				"rename to clients/new.ts",
+				"@@ -0,0 +1 @@",
+				'+\trecordDegradationOnce({ kind: "renamed-kind" });',
+			].join("\n");
+			const headFiles = new Map([
+				[
+					"clients/new.ts",
+					'\trecordDegradationOnce({ kind: "renamed-kind" });',
+				],
+			]);
+			expect(
+				lintPrBody(withObservability("The record is renamed-kind."), {
+					diff,
+					headFiles,
+				}),
+			).toEqual({ valid: true, errors: [] });
+			expect(
+				lintPrBody(withObservability("No new failure path; no record added."), {
+					diff,
+					headFiles,
+				}).valid,
+			).toBe(false);
+		});
+
+		it("refuses visibly when the post-image is missing", () => {
+			const diff = [
+				"diff --git a/clients/ghost-post-image.ts b/clients/ghost-post-image.ts",
+				"@@ -0,0 +1 @@",
+				'+\trecordDegradationOnce({ kind: "ghost-kind" });',
+			].join("\n");
+			const result = lintPrBody(
+				withObservability("The record is ghost-kind."),
+				{
+					diff,
+				},
+			);
+			expect(result.valid).toBe(false);
+			expect(result.errors.join(" ")).toContain("could not classify");
+			expect(result.errors.join(" ")).toContain("clients/ghost-post-image.ts");
+		});
+
+		it("refuses an unreadable post-image whose only added line is blank", () => {
+			// Recurrence: #3945 mutations 140/143 — skipping the unavailable-source
+			// guard lets `sourceLines(null)` produce `[""]`, the blank added line
+			// "matches" it, and `blankCommentsAndStrings(null)` throws instead of
+			// refusing with "could not classify".
+			const diff = [
+				"diff --git a/clients/unreadable-blank.ts b/clients/unreadable-blank.ts",
+				"@@ -1 +1 @@",
+				"-export const before = 1;",
+				"+",
+			].join("\n");
+			// The enclosing fixture repository has no such file, so the real
+			// working-tree read fails and the post-image is genuinely unavailable.
+			const result = lintPrBody(
+				withObservability("No new failure path; no record added."),
+				{ diff, cwd: process.cwd(), workingTree: true },
+			);
+			expect(result.valid).toBe(false);
+			expect(result.errors.join(" ")).toContain("could not classify");
+			expect(result.errors.join(" ")).toContain("clients/unreadable-blank.ts");
+		});
+
+		it("refuses visibly when the post-image does not match the diff", () => {
+			const diff = [
+				"diff --git a/clients/widget.ts b/clients/widget.ts",
+				"@@ -1,0 +1 @@",
+				'+\trecordDegradationOnce({ kind: "diff-kind" });',
+			].join("\n");
+			const result = lintPrBody(withObservability("The record is diff-kind."), {
+				diff,
+				headFiles: new Map([
+					["clients/widget.ts", "export const different = 1;"],
+				]),
+			});
+			expect(result.valid).toBe(false);
+			expect(result.errors.join(" ")).toContain("could not classify");
+		});
+
+		it("reads the post-image from HEAD, not the citation ref", () => {
+			// `ref` is the base revision for `--ref` path citations; the runtime
+			// post-image is HEAD or the working tree. Reading the ref instead would
+			// classify the added lines from the pre-image.
+			const diff = [
+				"diff --git a/clients/widget.ts b/clients/widget.ts",
+				"@@ -0,0 +1 @@",
+				'+\trecordDegradationOnce({ kind: "head-kind" });',
+			].join("\n");
+			const result = lintPrBody(
+				withObservability("No new failure path; no record added."),
+				{
+					diff,
+					ref: "base-ref",
+					git: (args: string[]) => {
+						if (args[0] !== "show") return "";
+						if (args[1] === "HEAD:clients/widget.ts")
+							return '\trecordDegradationOnce({ kind: "head-kind" });';
+						return "export const pre = 1;";
+					},
+				},
+			);
+			expect(result.valid).toBe(false);
+			expect(result.errors.join(" ")).toContain("failure path");
+		});
+
+		it("refuses a working-tree post-image over the byte ceiling", () => {
+			const root = mkdtempSync(join(tmpdir(), "pi-lens-pr-body-oversize-"));
+			try {
+				const added = '\trecordDegradationOnce({ kind: "big-kind" });';
+				mkdirSync(join(root, "clients"), { recursive: true });
+				writeFileSync(
+					join(root, "clients", "big.ts"),
+					`${added}\n${"x".repeat(17 * 1024 * 1024)}`,
+				);
+				const diff = [
+					"diff --git a/clients/big.ts b/clients/big.ts",
+					"@@ -0,0 +1 @@",
+					`+${added}`,
+				].join("\n");
+				const result = lintPrBody(
+					withObservability("The record is big-kind."),
+					{
+						diff,
+						cwd: root,
+						workingTree: true,
+					},
+				);
+				expect(result.valid).toBe(false);
+				expect(result.errors.join(" ")).toContain("could not classify");
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
+		});
+
+		// #3906 r5 F1: the blob branch's byte ceiling is the boundary that keeps a
+		// truncated read from being classified. A committed post-image over
+		// `MAX_SOURCE_BYTES` must decline visibly (`indeterminate`), and a size
+		// between Node's 1 MiB default and the 16 MiB ceiling must read, or the
+		// reader drops legitimate records. Both go through production
+		// `headFileSource` with the real `git cat-file -p` transport; no
+		// `headFiles` override stands in for the blob.
+		it("refuses a committed post-image blob over the byte ceiling", () => {
+			const fixtureCwd = createOriginMasterFixture(undefined, {
+				path: "clients/over-ceiling.ts",
+				pre: ["export let x = 0;"],
+				post: [
+					"export let x = 0;",
+					'recordDegradationOnce({ kind: "over-kind" });',
+				],
+				dirty: [
+					"export let x = 0;",
+					'recordDegradationOnce({ kind: "over-kind" });',
+				],
+				padLines: 2_546_542,
+			});
+			try {
+				const bytes = statSync(
+					join(fixtureCwd, "clients", "over-ceiling.ts"),
+				).size;
+				expect(bytes).toBeGreaterThan(16 * 1024 * 1024);
+				const diff = localDiff(fixtureCwd);
+				expect(diff).toContain("index ");
+				const result = lintPrBody(
+					withObservability("The record is over-kind."),
+					{ diff, cwd: fixtureCwd, workingTree: true },
+				);
+				expect(result.valid).toBe(false);
+				expect(result.errors.join(" ")).toContain("could not classify");
+				expect(result.errors.join(" ")).toContain("clients/over-ceiling.ts");
+			} finally {
+				rmSync(fixtureCwd, { recursive: true, force: true });
+			}
+		});
+
+		it("reads a committed post-image blob over Node's default buffer", () => {
+			const fixtureCwd = createOriginMasterFixture(undefined, {
+				path: "clients/mid-ceiling.ts",
+				pre: ["export let x = 0;"],
+				post: [
+					"export let x = 0;",
+					'recordDegradationOnce({ kind: "mid-kind" });',
+				],
+				dirty: [
+					"export let x = 0;",
+					'recordDegradationOnce({ kind: "mid-kind" });',
+				],
+				padLines: 299_592,
+			});
+			try {
+				const bytes = statSync(
+					join(fixtureCwd, "clients", "mid-ceiling.ts"),
+				).size;
+				expect(bytes).toBeGreaterThan(1024 * 1024);
+				expect(bytes).toBeLessThan(16 * 1024 * 1024);
+				const diff = localDiff(fixtureCwd);
+				expect(diff).toContain("index ");
+				expect(
+					lintPrBody(withObservability("The record is mid-kind."), {
+						diff,
+						cwd: fixtureCwd,
+						workingTree: true,
+					}),
+				).toEqual({ valid: true, errors: [] });
+			} finally {
+				rmSync(fixtureCwd, { recursive: true, force: true });
+			}
+		});
+
+		it("reads the diff's immutable post-image blob, not a dirty working tree", () => {
+			// R3-A: the diff names `index <pre>..<post>`; the working tree dirties
+			// an UNCHANGED line so a block comment would swallow the added record.
+			// Every added line still matches, so an added-line-only check passes
+			// and the honest sentence becomes a false clean. The named blob holds
+			// the real state, so the reader must take it.
+			const fixtureCwd = createOriginMasterFixture(undefined, {
+				path: "clients/rec.ts",
+				pre: ["export let x = 0;"],
+				post: [
+					"export let x = 0;",
+					'recordDegradationOnce({ kind: "real-kind" });',
+				],
+				dirty: [
+					"export let x = 0;/*",
+					'recordDegradationOnce({ kind: "real-kind" });',
+				],
+			});
+			try {
+				const diff = localDiff(fixtureCwd);
+				expect(diff).toContain("index ");
+				expect(
+					lintPrBody(withObservability("The record is real-kind."), {
+						diff,
+						cwd: fixtureCwd,
+						workingTree: true,
+					}),
+				).toEqual({ valid: true, errors: [] });
+				expect(
+					lintPrBody(
+						withObservability("No new failure path; no record added."),
+						{
+							diff,
+							cwd: fixtureCwd,
+							workingTree: true,
+						},
+					).valid,
+				).toBe(false);
+			} finally {
+				rmSync(fixtureCwd, { recursive: true, force: true });
+			}
+		});
+
+		it("prefers a named post-image blob over the mutable working tree", () => {
+			const root = mkdtempSync(join(tmpdir(), "pi-lens-pr-body-blob-"));
+			try {
+				mkdirSync(join(root, "clients"), { recursive: true });
+				writeFileSync(
+					join(root, "clients", "dirty.ts"),
+					'export let x = 0;/*\nrecordDegradationOnce({ kind: "real-kind" });',
+				);
+				const diff = [
+					"diff --git a/clients/dirty.ts b/clients/dirty.ts",
+					"index 0a8fa80..0340955 100644",
+					"@@ -1,0 +2 @@ export let x = 0;",
+					'+recordDegradationOnce({ kind: "real-kind" });',
+				].join("\n");
+				const git = (args: string[]) => {
+					expect(args).toEqual(["cat-file", "-p", "0340955"]);
+					return 'export let x = 0;\nrecordDegradationOnce({ kind: "real-kind" });';
+				};
+				expect(
+					lintPrBody(withObservability("The record is real-kind."), {
+						diff,
+						cwd: root,
+						workingTree: true,
+						git,
+					}),
+				).toEqual({ valid: true, errors: [] });
+				expect(
+					lintPrBody(
+						withObservability("No new failure path; no record added."),
+						{
+							diff,
+							cwd: root,
+							workingTree: true,
+							git,
+						},
+					).valid,
+				).toBe(false);
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
+		});
+
+		it("declines when the diff names a blob that cannot be read", () => {
+			const diff = [
+				"diff --git a/clients/gone.ts b/clients/gone.ts",
+				"index 1111111..2222222 100644",
+				"@@ -0,0 +1 @@",
+				'+recordDegradationOnce({ kind: "gone-kind" });',
+			].join("\n");
+			const result = lintPrBody(withObservability("The record is gone-kind."), {
+				diff,
+				git: () => {
+					throw new Error("missing object");
+				},
+			});
+			expect(result.valid).toBe(false);
+			expect(result.errors.join(" ")).toContain("could not classify");
+		});
+
+		it("harvests an added line whose content starts with `++`", () => {
+			// Git emits an added code line `++counter;` as `+++counter;`. Inside a
+			// hunk that is content, not a file header, so the record is found
+			// (#3906 R3-B). Base and f0 both refused it.
+			const fixture = runtimeFixture(
+				"clients/incr.ts",
+				[
+					"export let counter = 0;",
+					'++counter; recordDegradationOnce({ kind: "sneaky" });',
+				],
+				[2],
+			);
+			expect(
+				lintPrBody(withObservability("The record is sneaky."), fixture),
+			).toEqual({ valid: true, errors: [] });
+			expect(
+				lintPrBody(
+					withObservability("No new failure path; no record added."),
+					fixture,
+				).valid,
+			).toBe(false);
+		});
+
+		it("does not advance the POST cursor on a removed line starting with --", () => {
+			// Git emits a removed code line `--old` as `---old`. In the hunk body it
+			// is a removal, not a file header, so the added line stays at its POST
+			// number.
+			const diff = [
+				"diff --git a/clients/del.ts b/clients/del.ts",
+				"@@ -2,1 +2,1 @@",
+				"---old",
+				'+recordDegradationOnce({ kind: "del-kind" });',
+			].join("\n");
+			const headFiles = new Map([
+				[
+					"clients/del.ts",
+					'export let keep = 0;\nrecordDegradationOnce({ kind: "del-kind" });',
+				],
+			]);
+			expect(
+				lintPrBody(withObservability("The record is del-kind."), {
+					diff,
+					headFiles,
+				}),
+			).toEqual({ valid: true, errors: [] });
+		});
+
+		it("ignores a `No newline at end of file` marker without moving the cursor", () => {
+			const fixture = runtimeFixture(
+				"clients/nonl.ts",
+				[
+					"export const x = 1;",
+					'recordDegradationOnce({ kind: "nonl-kind" });',
+				],
+				[2],
+			);
+			const marker = "\\ No newline at end of file";
+			expect(
+				lintPrBody(withObservability("The record is nonl-kind."), {
+					diff: `${fixture.diff}\n${marker}`,
+					headFiles: fixture.headFiles,
 				}),
 			).toEqual({ valid: true, errors: [] });
 		});
@@ -1257,9 +2189,10 @@ describe("PR body lint (#1844)", () => {
 		const refusal = "decision branch";
 
 		it("refuses the no-record sentence for a branch added to a seam file", () => {
-			const result = lintPrBody(withObservability(sentence), {
-				diff: seamBranch,
-			});
+			const result = lintPrBody(
+				withObservability(sentence),
+				postImageFromDiff(seamBranch),
+			);
 			expect(result.valid).toBe(false);
 			expect(result.errors.join(" ")).toContain(refusal);
 			expect(result.errors.join(" ")).toContain("clients/session-scope.ts: 1");
@@ -1274,9 +2207,10 @@ describe("PR body lint (#1844)", () => {
 			["case", '\t\tcase "adopt":'],
 		])("detects a %s branch", (_name, line) => {
 			expect(
-				lintPrBody(withObservability(sentence), {
-					diff: diffAdding("clients/session-scope.ts", line),
-				}).errors.join(" "),
+				lintPrBody(
+					withObservability(sentence),
+					postImageFromDiff(diffAdding("clients/session-scope.ts", line)),
+				).errors.join(" "),
 			).toContain(refusal);
 		});
 
@@ -1296,9 +2230,10 @@ describe("PR body lint (#1844)", () => {
 			expect(rows.length).toBeGreaterThan(0);
 			const missed = rows.filter(
 				(file) =>
-					!lintPrBody(withObservability(sentence), {
-						diff: diffAdding(file, "\tif (adopt) apply(slot);"),
-					})
+					!lintPrBody(
+						withObservability(sentence),
+						postImageFromDiff(diffAdding(file, "\tif (adopt) apply(slot);")),
+					)
 						.errors.join(" ")
 						.includes(refusal),
 			);
@@ -1306,19 +2241,22 @@ describe("PR body lint (#1844)", () => {
 		});
 
 		it("accepts the same diff when the body names a record literal the diff adds", () => {
-			const diff = diffAdding(
-				"clients/session-scope.ts",
-				"\tif (slot.sessionFile === sessionFile) {",
-				'\t\tlogLatency({ phase: "session_handoff_adopt" });',
-				"\t}",
+			const diff = postImageFromDiff(
+				diffAdding(
+					"clients/session-scope.ts",
+					"\tif (slot.sessionFile === sessionFile) {",
+					'\t\tlogLatency({ phase: "session_handoff_adopt" });',
+					"\t}",
+				),
 			);
 			expect(
-				lintPrBody(withObservability("The record is session_handoff_adopt."), {
+				lintPrBody(
+					withObservability("The record is session_handoff_adopt."),
 					diff,
-				}),
+				),
 			).toEqual({ valid: true, errors: [] });
 			expect(
-				lintPrBody(withObservability(sentence), { diff }).errors.join(" "),
+				lintPrBody(withObservability(sentence), diff).errors.join(" "),
 			).toContain(refusal);
 		});
 
@@ -1326,7 +2264,7 @@ describe("PR body lint (#1844)", () => {
 		// `none: <reason> goes here` passed, so one throwaway line answered every
 		// branch in every file. The reason now names each flagged file.
 		const none = (reason: string) =>
-			lintPrBody(withObservability(reason), { diff: seamBranch });
+			lintPrBody(withObservability(reason), postImageFromDiff(seamBranch));
 
 		it("accepts `none: <reason>` that names the flagged file", () => {
 			expect(
@@ -1372,39 +2310,42 @@ describe("PR body lint (#1844)", () => {
 			["clients/lsp/index.ts", "clients/lsp/other-index.ts"],
 			["clients/lsp/client.ts", "tree-sitter-client.ts"],
 		])("refuses %s when the reason only names %s", (flagged, token) => {
-			const diff = diffAdding(flagged, "\tif (ready) adopt(slot);");
+			const diff = postImageFromDiff(
+				diffAdding(flagged, "\tif (ready) adopt(slot);"),
+			);
 			const result = lintPrBody(
 				withObservability(
 					`none: ${token} only forwards the already-recorded outcome`,
 				),
-				{ diff },
+				diff,
 			);
 			expect(result.valid).toBe(false);
 			expect(result.errors.join(" ")).toContain(refusal);
 		});
 
 		it("accepts the flagged basename at a path boundary", () => {
-			const diff = diffAdding(
-				"clients/lsp/server.ts",
-				"\tif (ready) adopt(slot);",
+			const diff = postImageFromDiff(
+				diffAdding("clients/lsp/server.ts", "\tif (ready) adopt(slot);"),
 			);
 			expect(
 				lintPrBody(
 					withObservability(
 						"none: clients/lsp/server.ts only forwards the recorded outcome",
 					),
-					{ diff },
+					diff,
 				),
 			).toEqual({ valid: true, errors: [] });
 		});
 
 		it("accepts one none line per flagged file", () => {
-			const diff = [
-				seamBranch,
-				diffAdding("clients/agent-nudge.ts", "\tif (queued) flush();"),
-			].join("\n");
+			const diff = postImageFromDiff(
+				[
+					seamBranch,
+					diffAdding("clients/agent-nudge.ts", "\tif (queued) flush();"),
+				].join("\n"),
+			);
 			const reasons = (text: string) =>
-				lintPrBody(withObservability(text), { diff });
+				lintPrBody(withObservability(text), diff);
 			expect(
 				reasons(
 					"none: session-scope.ts only selects a recorded outcome\nnone: agent-nudge.ts only flushes an already counted queue",
@@ -1461,9 +2402,12 @@ describe("PR body lint (#1844)", () => {
 			"refuses the placeholder reason %j when no file is flagged",
 			(reason) => {
 				expect(
-					lintPrBody(withObservability(`none: ${reason}`), {
-						diff: diffAdding("clients/example.ts", "\tif (ready) go();"),
-					}).valid,
+					lintPrBody(
+						withObservability(`none: ${reason}`),
+						postImageFromDiff(
+							diffAdding("clients/example.ts", "\tif (ready) go();"),
+						),
+					).valid,
 				).toBe(false);
 			},
 		);
@@ -1475,32 +2419,38 @@ describe("PR body lint (#1844)", () => {
 		});
 
 		it("still requires a record for a failure path, whatever the reason says", () => {
-			const diff = diffAdding(
-				"clients/session-scope.ts",
-				"\ttry { adopt(); } catch (error) { warn(error); }",
+			const diff = postImageFromDiff(
+				diffAdding(
+					"clients/session-scope.ts",
+					"\ttry { adopt(); } catch (error) { warn(error); }",
+				),
 			);
 			expect(
 				lintPrBody(
 					withObservability("none: the catch only forwards to the host"),
-					{ diff },
+					diff,
 				).errors.join(" "),
 			).toContain("not valid when the added lines contain a failure path");
 		});
 
 		it("leaves a branch in a file outside the coverage map on the old form", () => {
-			const diff = diffAdding("clients/example.ts", "\tif (ready) go();");
-			expect(lintPrBody(withObservability(sentence), { diff })).toEqual({
+			const diff = postImageFromDiff(
+				diffAdding("clients/example.ts", "\tif (ready) go();"),
+			);
+			expect(lintPrBody(withObservability(sentence), diff)).toEqual({
 				valid: true,
 				errors: [],
 			});
 		});
 
 		it("leaves a seam file without an added branch on the old form", () => {
-			const diff = diffAdding(
-				"clients/session-scope.ts",
-				"\tconst keyHash = hashKey(slot.sessionFile);",
+			const diff = postImageFromDiff(
+				diffAdding(
+					"clients/session-scope.ts",
+					"\tconst keyHash = hashKey(slot.sessionFile);",
+				),
 			);
-			expect(lintPrBody(withObservability(sentence), { diff })).toEqual({
+			expect(lintPrBody(withObservability(sentence), diff)).toEqual({
 				valid: true,
 				errors: [],
 			});
@@ -1513,14 +2463,6 @@ describe("PR body lint (#1844)", () => {
 			[
 				"a whole block, then code",
 				["/**", " * a note", " */", "\tif (adopt) apply(slot);"],
-			],
-			[
-				"an orphan closer, then code",
-				[" * the end of a note", " */", "\tif (adopt) apply(slot);"],
-			],
-			[
-				"an orphan closer sharing a line with code",
-				[" * the end of a note", " */ if (adopt) apply(slot);"],
 			],
 			[
 				"a one-line block, then code",
@@ -1541,62 +2483,76 @@ describe("PR body lint (#1844)", () => {
 			["a multiplication line", ["\tconst n = a * b; if (adopt) apply(slot);"]],
 		])("still sees a seam branch after %s", (_name, lines) => {
 			expect(
-				lintPrBody(withObservability(sentence), {
-					diff: diffAdding("clients/session-scope.ts", ...lines),
-				}).errors.join(" "),
+				lintPrBody(
+					withObservability(sentence),
+					runtimeFixture("clients/session-scope.ts", lines),
+				).errors.join(" "),
 			).toContain(refusal);
 		});
 
 		it("still sees a failure path after a whole JSDoc block", () => {
-			const diff = diffAdding(
-				"clients/example.ts",
-				"/**",
-				" * installs the thing",
-				" */",
-				"\ttry { install(); } catch (error) { warn(error); }",
+			const diff = postImageFromDiff(
+				diffAdding(
+					"clients/example.ts",
+					"/**",
+					" * installs the thing",
+					" */",
+					"\ttry { install(); } catch (error) { warn(error); }",
+				),
 			);
 			expect(
-				lintPrBody(withObservability(sentence), { diff }).errors.join(" "),
+				lintPrBody(withObservability(sentence), diff).errors.join(" "),
 			).toContain("not valid when the added lines contain a failure path");
 		});
 
-		it("does not let an opener without a closer in one hunk hide the next hunk", () => {
-			const diff = [
-				"diff --git a/clients/session-scope.ts b/clients/session-scope.ts",
-				"@@ -1,0 +1,2 @@",
-				"+/**",
-				"+ * an opener whose closer is an unchanged context line",
-				"@@ -40,0 +42,1 @@",
-				"+\tif (adopt) apply(slot);",
-			].join("\n");
+		it("reads the whole post-image, so an earlier hunk's block close is visible to a later hunk", () => {
+			// The `/**` opener is in the first hunk and its closer is an unchanged
+			// context line present in the post-image, so the second hunk's branch is
+			// real code. A hunk-local lexer could not see the closer.
+			const rows = [
+				"/**",
+				" * an opener whose closer is an unchanged context line",
+				" */",
+				...Array.from({ length: 38 }, () => ""),
+				"\tif (adopt) apply(slot);",
+			];
+			const fixture = runtimeFixture(
+				"clients/session-scope.ts",
+				rows,
+				[1, 2, 42],
+			);
 			expect(
-				lintPrBody(withObservability(sentence), { diff }).errors.join(" "),
+				lintPrBody(withObservability(sentence), fixture).errors.join(" "),
 			).toContain(refusal);
 		});
 
 		// A file's hunks are separate lexing units that sum back to one verdict.
 		const twoHunks = (first: string, second: string) =>
-			[
-				"diff --git a/clients/session-scope.ts b/clients/session-scope.ts",
-				"@@ -1,0 +1,1 @@",
-				`+${first}`,
-				"@@ -40,0 +41,1 @@",
-				`+${second}`,
-			].join("\n");
+			postImageFromDiff(
+				[
+					"diff --git a/clients/session-scope.ts b/clients/session-scope.ts",
+					"@@ -1,0 +1,1 @@",
+					`+${first}`,
+					"@@ -40,0 +41,1 @@",
+					`+${second}`,
+				].join("\n"),
+			);
 
 		it("keeps a failure path found in an earlier hunk when the last hunk has none", () => {
 			expect(
-				lintPrBody(withObservability(sentence), {
-					diff: twoHunks("\ttry { adopt(); } catch { warn(); }", "\tnext();"),
-				}).errors.join(" "),
+				lintPrBody(
+					withObservability(sentence),
+					twoHunks("\ttry { adopt(); } catch { warn(); }", "\tnext();"),
+				).errors.join(" "),
 			).toContain("not valid when the added lines contain a failure path");
 		});
 
 		it("sums a file's branches over its hunks", () => {
 			expect(
-				lintPrBody(withObservability(sentence), {
-					diff: twoHunks("\tif (a) adopt();", "\tif (b) reset();"),
-				}).errors.join(" "),
+				lintPrBody(
+					withObservability(sentence),
+					twoHunks("\tif (a) adopt();", "\tif (b) reset();"),
+				).errors.join(" "),
 			).toContain("clients/session-scope.ts: 2");
 		});
 
@@ -1604,55 +2560,64 @@ describe("PR body lint (#1844)", () => {
 			// Real `--unified=0` diff of #3770: `} catch {` and `.catch(() => {})`
 			// follow added JSDoc blocks. origin/master refused it under the bare
 			// sentence; the r1 filter accepted it.
-			const diff = readFileSync(
-				join(
-					repositoryRoot,
-					"tests",
-					"fixtures",
-					"ci-pr-bodies",
-					"pr-3770-runtime.diff",
+			const diff = fixtureWithBlob(
+				readFileSync(
+					join(
+						repositoryRoot,
+						"tests",
+						"fixtures",
+						"ci-pr-bodies",
+						"pr-3770-runtime.diff",
+					),
+					"utf8",
 				),
-				"utf8",
 			);
 			expect(
-				lintPrBody(withObservability(sentence), { diff }).errors.join(" "),
+				lintPrBody(withObservability(sentence), diff).errors.join(" "),
 			).toContain("not valid when the added lines contain a failure path");
 		});
 
 		it("reads code, not prose: comments, strings and JSDoc continuations never count", () => {
-			const diff = diffAdding(
-				"clients/session-scope.ts",
-				"\t// if (adopt) the other case wins, else reset",
-				'\tconst note = "if (adopt) else switch (kind) case";',
-				"\t * is the unverifiable case above and else nothing",
-			);
-			expect(lintPrBody(withObservability(sentence), { diff })).toEqual({
-				valid: true,
-				errors: [],
-			});
+			expect(
+				lintPrBody(
+					withObservability(sentence),
+					docFixture(
+						"clients/session-scope.ts",
+						[" * is the unverifiable case above and else nothing"],
+						[
+							"\t// if (adopt) the other case wins, else reset",
+							'\tconst note = "if (adopt) else switch (kind) case";',
+						],
+					),
+				),
+			).toEqual({ valid: true, errors: [] });
 		});
 
 		// Same lexer, same `--unified=0` blind spot, on the failure-path scan the
 		// sentence also depends on: a JSDoc continuation line carries no opener.
 		it("does not read a failure path out of a JSDoc continuation line", () => {
-			const diff = diffAdding(
-				"clients/example.ts",
-				" * a retry may throw here and the caller must catch it",
-			);
-			expect(lintPrBody(withObservability(sentence), { diff })).toEqual({
-				valid: true,
-				errors: [],
-			});
+			expect(
+				lintPrBody(
+					withObservability(sentence),
+					docFixture(
+						"clients/example.ts",
+						[" * a retry may throw here and the caller must catch it"],
+						[],
+					),
+				),
+			).toEqual({ valid: true, errors: [] });
 		});
 
 		it("does not let a backtick in a JSDoc continuation line hide a failure path", () => {
-			const diff = diffAdding(
-				"clients/example.ts",
-				" * the `findRelocation`'s window saturates at",
-				"\ttry { adopt(); } catch (error) { warn(error); }",
-			);
 			expect(
-				lintPrBody(withObservability(sentence), { diff }).errors.join(" "),
+				lintPrBody(
+					withObservability(sentence),
+					docFixture(
+						"clients/example.ts",
+						[" * the `findRelocation`'s window saturates at"],
+						["\ttry { adopt(); } catch (error) { warn(error); }"],
+					),
+				).errors.join(" "),
 			).toContain("not valid when the added lines contain a failure path");
 		});
 
@@ -1660,39 +2625,45 @@ describe("PR body lint (#1844)", () => {
 			// Real runtime hunks of #3785: `if (opts?.stampFileTime !== false)` and
 			// `if (fileTimeMoved && toolCallId !== undefined)` shipped under this
 			// exact sentence with no record of the FileTime decision.
-			const diff = readFileSync(
-				join(
-					repositoryRoot,
-					"tests",
-					"fixtures",
-					"ci-pr-bodies",
-					"pr-3785-runtime.diff",
+			const diff = fixtureWithBlob(
+				readFileSync(
+					join(
+						repositoryRoot,
+						"tests",
+						"fixtures",
+						"ci-pr-bodies",
+						"pr-3785-runtime.diff",
+					),
+					"utf8",
 				),
-				"utf8",
 			);
 			expect(
-				lintPrBody(withObservability(sentence), { diff }).errors.join(" "),
+				lintPrBody(withObservability(sentence), diff).errors.join(" "),
 			).toContain("clients/read-guard.ts");
 		});
 
 		it("does not flag #3774's comment-only edit, whose prose said `case`", () => {
-			// Real `--unified=0` hunk: the block comment's opener is not in the
-			// diff, so the continuation line `unverifiable case above` read as a
-			// `case` label in the first calibration run.
-			const diff = readFileSync(
-				join(
-					repositoryRoot,
-					"tests",
-					"fixtures",
-					"ci-pr-bodies",
-					"pr-3774-comment-runtime.diff",
+			// The archived `--unified=0` hunk's post-image is vendored beside the
+			// fixture and pinned by the blob oid its `index` line names, so the real
+			// continuation lines are lexed under their real JSDoc opener. The visible
+			// consequence is unchanged: a prose `case` in a comment is not a branch.
+			expect(
+				lintPrBody(
+					withObservability(sentence),
+					fixtureWithBlob(
+						readFileSync(
+							join(
+								repositoryRoot,
+								"tests",
+								"fixtures",
+								"ci-pr-bodies",
+								"pr-3774-comment-runtime.diff",
+							),
+							"utf8",
+						),
+					),
 				),
-				"utf8",
-			);
-			expect(lintPrBody(withObservability(sentence), { diff })).toEqual({
-				valid: true,
-				errors: [],
-			});
+			).toEqual({ valid: true, errors: [] });
 		});
 
 		it("reaches the local preflight entry point", () => {
@@ -1700,6 +2671,7 @@ describe("PR body lint (#1844)", () => {
 				withObservability(sentence),
 				process.cwd(),
 				() => seamBranch,
+				{ headFiles: postImageFromDiff(seamBranch).headFiles },
 			);
 			expect(result.valid).toBe(false);
 			expect(result.errors.join(" ")).toContain(refusal);
@@ -1719,8 +2691,8 @@ describe("PR body lint (#1844)", () => {
 				"covered by existing record `tool-cwd-resolution` at `clients/existing-record.ts:1`",
 			),
 			process.cwd(),
-			() =>
-				"diff --git a/clients/new-path.ts b/clients/new-path.ts\n+catch (error) { resolveToolCwd(error); }",
+			() => NEW_PATH_RUNTIME_DIFF,
+			{ headFiles: NEW_PATH_HEAD_FILES },
 		);
 		expect(result.valid).toBe(true);
 	});
@@ -1735,8 +2707,8 @@ describe("PR body lint (#1844)", () => {
 				"covered by existing record `test-record` at `tests/existing-record.test.ts:1`",
 			),
 			process.cwd(),
-			() =>
-				"diff --git a/clients/new-path.ts b/clients/new-path.ts\n+catch (error) { resolveToolCwd(error); }",
+			() => NEW_PATH_RUNTIME_DIFF,
+			{ headFiles: NEW_PATH_HEAD_FILES },
 		);
 		expect(result).toEqual({
 			valid: false,
@@ -1772,8 +2744,8 @@ describe("PR body lint (#1844)", () => {
 						`covered by existing record \`${kind}\` at \`${file}\``,
 					),
 					root,
-					() =>
-						"diff --git a/clients/new-path.ts b/clients/new-path.ts\n+catch (error) { resolveToolCwd(error); }",
+					() => NEW_PATH_RUNTIME_DIFF,
+					{ headFiles: NEW_PATH_HEAD_FILES },
 				);
 				expect(result).toEqual({
 					valid: false,
@@ -1795,8 +2767,8 @@ describe("PR body lint (#1844)", () => {
 				"covered by existing record `missing-record` at `clients/does-not-exist.ts:1`",
 			),
 			process.cwd(),
-			() =>
-				"diff --git a/clients/new-path.ts b/clients/new-path.ts\n+catch (error) { resolveToolCwd(error); }",
+			() => NEW_PATH_RUNTIME_DIFF,
+			{ headFiles: NEW_PATH_HEAD_FILES },
 		);
 		expect(result).toEqual({
 			valid: false,
@@ -1821,7 +2793,12 @@ describe("PR body lint (#1844)", () => {
 			),
 			process.cwd(),
 			() =>
-				"diff --git a/clients/touched-record.ts b/clients/touched-record.ts\n+catch (error) { resolveToolCwd(error); }",
+				`diff --git a/clients/touched-record.ts b/clients/touched-record.ts\n+catch (error) { resolveToolCwd(error); }`,
+			{
+				headFiles: postImageFromDiff(
+					`diff --git a/clients/touched-record.ts b/clients/touched-record.ts\n+catch (error) { resolveToolCwd(error); }`,
+				).headFiles,
+			},
 		);
 		expect(result.valid).toBe(false);
 	});
@@ -1861,8 +2838,8 @@ describe("PR body lint (#1844)", () => {
 				"covered by existing record `tool-cwd-resolution` at `clients/wrong-kind-record.ts:1`",
 			),
 			process.cwd(),
-			() =>
-				"diff --git a/clients/new-path.ts b/clients/new-path.ts\n+catch (error) { resolveToolCwd(error); }",
+			() => NEW_PATH_RUNTIME_DIFF,
+			{ headFiles: NEW_PATH_HEAD_FILES },
 		);
 		expect(result.valid).toBe(false);
 	});
@@ -1900,8 +2877,8 @@ describe("PR body lint (#1844)", () => {
 				"covered by existing record `tool-cwd-resolution` at `clients/missing-record.ts:42`",
 			),
 			process.cwd(),
-			() =>
-				"diff --git a/clients/new-path.ts b/clients/new-path.ts\n+catch (error) { resolveToolCwd(error); }",
+			() => NEW_PATH_RUNTIME_DIFF,
+			{ headFiles: NEW_PATH_HEAD_FILES },
 		);
 		expect(result.valid).toBe(false);
 		expect(result.errors.join(" ")).toContain("record literal");
@@ -1920,6 +2897,7 @@ describe("PR body lint (#1844)", () => {
 			),
 			process.cwd(),
 			() => runtimeDiff,
+			{ headFiles: postImageFromDiff(runtimeDiff).headFiles },
 		);
 		expect(result.valid).toBe(false);
 		expect(result.errors.join(" ")).toContain("failure path");
@@ -1969,6 +2947,11 @@ describe("PR body lint (#1844)", () => {
 			),
 			process.cwd(),
 			() => `diff --git a/clients/example.ts b/clients/example.ts\n+${line}`,
+			{
+				headFiles: postImageFromDiff(
+					`diff --git a/clients/example.ts b/clients/example.ts\n+${line}`,
+				).headFiles,
+			},
 		);
 		expect(result.valid).toBe(false);
 		expect(result.errors.join(" ")).toContain("record literal");
@@ -2252,6 +3235,113 @@ describe("PR body lint (#1844)", () => {
 	});
 });
 
+// The archived `--unified=0` fixtures (#3770, #3774, #3785) name their
+// post-image blobs in the `index` line. CI checks out at depth 1, so those
+// historical objects are unreachable from the checkout that runs this suite.
+// The bytes are vendored beside the fixtures
+// (`pr-3906-hermetic-provenance.json`) and every one is pinned by the git blob
+// oid the diff names (#3945). A missing or byte-flipped sidecar fails loudly;
+// `fixtureWithBlob` never reconstructs an authentic archive from its hunks.
+describe("archived post-image corpus (#3945)", () => {
+	const corpusDir = join(repositoryRoot, "tests", "fixtures", "ci-pr-bodies");
+	const provenance = JSON.parse(
+		readFileSync(join(corpusDir, "pr-3906-hermetic-provenance.json"), "utf8"),
+	) as { postImages: Record<string, { path: string; oid: string }> };
+
+	it("vendors every named post-image and pins it to its blob oid", () => {
+		const entries = Object.entries(provenance.postImages);
+		expect(entries.length).toBeGreaterThanOrEqual(5);
+		for (const [file, meta] of entries) {
+			const sidecar = join(corpusDir, meta.path);
+			expect(statSync(sidecar).isFile(), `${file} -> ${meta.path}`).toBe(true);
+			expect(gitBlobOid(readFileSync(sidecar, "utf8")), `${file} oid`).toBe(
+				meta.oid,
+			);
+		}
+	});
+
+	it("fails loudly for a fixture whose post-image is not vendored", () => {
+		const diff = [
+			"diff --git a/clients/unvendored.ts b/clients/unvendored.ts",
+			"index 1111111..2222222 100644",
+			"@@ -1,0 +1 @@",
+			"+\tif (adopt) apply(slot);",
+		].join("\n");
+		expect(() => fixtureWithBlob(diff)).toThrow(
+			/no vendored post-image for clients\/unvendored\.ts/,
+		);
+	});
+
+	it("fails loudly when the diff names an oid the vendored bytes do not hash to", () => {
+		const diff = [
+			"diff --git a/clients/read-guard.ts b/clients/read-guard.ts",
+			"index 0000000..deadbeef 100644",
+			"@@ -1,0 +1 @@",
+			"+\tif (adopt) apply(slot);",
+		].join("\n");
+		expect(() => fixtureWithBlob(diff)).toThrow(
+			/vendored post-image for clients\/read-guard\.ts does not match deadbeef/,
+		);
+	});
+});
+
+// #3906 AC2: the #3799 pull-coverage decision in clients/dispatch/dispatcher.ts
+// must be visible to the seam record rule. The corpus is the exact published
+// #3799 body + diff and the three post-image sources the diff names, pinned by
+// each source's git blob oid. CI's shallow checkout does not carry the 2026
+// #3799 objects, so the explicit `headFiles` seam supplies the immutable
+// post-image and the source hash proves the fixture is that exact object.
+describe("dispatcher seam row (#3906 AC2)", () => {
+	const corpusDir = join(repositoryRoot, "tests", "fixtures", "ci-pr-bodies");
+	const provenance = JSON.parse(
+		readFileSync(join(corpusDir, "pr-3799-provenance.json"), "utf8"),
+	) as {
+		bodyPath: string;
+		bodySha256: string;
+		diffPath: string;
+		diffSha256: string;
+		postImages: Record<string, { path: string; oid: string }>;
+	};
+	const sha256 = (text: string) =>
+		createHash("sha256").update(text, "utf8").digest("hex");
+	const readCorpus = (name: string) =>
+		readFileSync(join(corpusDir, name), "utf8");
+	const body = readCorpus(provenance.bodyPath);
+	const diff = readCorpus(provenance.diffPath);
+	const headFiles = new Map<string, string>();
+	for (const [file, meta] of Object.entries(provenance.postImages)) {
+		const source = readCorpus(meta.path);
+		expect(gitBlobOid(source), `${file} fixture git blob oid`).toBe(meta.oid);
+		headFiles.set(file, source);
+	}
+
+	it("pins the archived #3799 body and diff bytes", () => {
+		expect(sha256(body)).toBe(provenance.bodySha256);
+		expect(sha256(diff)).toBe(provenance.diffSha256);
+	});
+
+	it("refuses #3799's no-record sentence over the dispatcher's four branches", () => {
+		const result = lintPrBody(body, { diff, headFiles });
+		expect(result.valid).toBe(false);
+		const refusal = result.errors.find((error) =>
+			error.includes("clients/dispatch/dispatcher.ts"),
+		);
+		expect(refusal).toBeDefined();
+		expect(refusal).toContain("decision branch");
+		expect(refusal).toContain("(clients/dispatch/dispatcher.ts: 4)");
+	});
+
+	it("accepts an honest `none:` naming dispatcher.ts for the same diff", () => {
+		const honest = body.replace(
+			"No new failure path; no record added.",
+			"none: dispatcher.ts keeps no new record kind for its coverage-notice decision yet",
+		);
+		const result = lintPrBody(honest, { diff, headFiles });
+		expect(result.errors.join(" ")).not.toContain("decision branch");
+		expect(result.valid).toBe(true);
+	});
+});
+
 describe("live PR body resolution (#2085)", () => {
 	const payloadPr = { number: 2085, body: "fallback" };
 	const flattenedCloseKeywordBody =
@@ -2467,6 +3557,67 @@ describe("head-tree citations and test references", () => {
 			{ quote: '"', text: "a\\b" },
 			{ quote: "`", text: "value" },
 		]);
+	});
+
+	// Pins what `prefix` means (the up-to-256 blanked characters before the
+	// opening quote, trailing blanks trimmed) so the lexer's single-pass
+	// rewrite for #4088 cannot drift: `testCorpus` classifies `it(`/`.each(`
+	// titles from exactly this text.
+	it("reports each string's blanked 256-character prefix, trailing blanks trimmed", () => {
+		const result = blankCommentsAndStrings(
+			`it(/* note */ "first");\n${"a".repeat(300)}("second", 'third');`,
+		);
+		const [first, second, third] = result.strings.map(({ prefix }) => prefix);
+		expect(first).toBe("it(");
+		// 256 characters end at the blanked opening quote; the trim drops it.
+		expect(second).toBe(`${"a".repeat(254)}(`);
+		// "second" is blanked to eight spaces, then the comma; the two blanks
+		// before the quote are trimmed.
+		expect(third).toBe(`${"a".repeat(244)}(${" ".repeat(8)},`);
+	});
+
+	// Recurrence: #4088. The lexer sliced its growing output string once per
+	// string literal; each slice flattened the whole concatenation and its
+	// parent stayed alive through `prefix`, so memory grew with strings x
+	// bytes (the PR-body corpus lexed 20 MB of tests into ~900 MB, and
+	// check-pr-body.test.ts peaked at 1883 of 2048 MB on CI). Measured on 8000
+	// string literals in a worker: 6-24 MB retained on the single-pass lexer,
+	// 1533 MB on the quadratic one (an unflagged host kills it at the 128 MB
+	// cap with ERR_WORKER_OUT_OF_MEMORY; the suite's own --max-old-space-size
+	// lifts that cap, so the retained heap is asserted too).
+	it("lexes thousands of string literals within a bounded heap", async () => {
+		const lexerUrl = new URL("../../scripts/check-pr-body.mjs", import.meta.url)
+			.href;
+		const code = `
+			const { parentPort, workerData } = require("node:worker_threads");
+			import(workerData.lexerUrl).then(({ blankCommentsAndStrings }) => {
+				const source = Array.from(
+					{ length: 8000 },
+					(_, index) => 'it("title ' + index + '", () => { expect(a).toBe(1); });',
+				).join("\\n");
+				const lexed = blankCommentsAndStrings(source);
+				parentPort.postMessage({
+					count: lexed.strings.length,
+					heapMb: process.memoryUsage().heapUsed / 1048576,
+				});
+			});
+		`;
+		const result = await new Promise<{ count: number; heapMb: number }>(
+			(resolvePromise, reject) => {
+				const worker = new Worker(code, {
+					eval: true,
+					workerData: { lexerUrl },
+					resourceLimits: { maxOldGenerationSizeMb: 128 },
+				});
+				worker.once("message", (value) => {
+					resolvePromise(value);
+					void worker.terminate();
+				});
+				worker.once("error", reject);
+			},
+		);
+		expect(result.count).toBe(8000);
+		expect(result.heapMb).toBeLessThan(256);
 	});
 
 	it("rejects a citation to a missing or out-of-range head file", () => {
@@ -2852,7 +4003,7 @@ describe("head-tree citations and test references", () => {
 					'it("title after typeof regex", () => {});',
 					"const quotient = numerator / denominator;",
 					'it("title after division", () => {});',
-					'it.each([{ value: fn(1) }])(\"array each title\", () => {});',
+					'it.each([{ value: fn(1) }])("array each title", () => {});',
 				].join("\n"),
 			);
 			const git = (args: string[]) =>
@@ -3016,7 +4167,7 @@ describe("head-tree citations and test references", () => {
 			mkdirSync(join(fixtureCwd, "tests"), { recursive: true });
 			writeFileSync(
 				join(fixtureCwd, "tests", "lexer.test.ts"),
-				`it(\"${title.replaceAll("\\", "\\\\")}\", () => {});\n`,
+				`it("${title.replaceAll("\\", "\\\\")}", () => {});\n`,
 			);
 			const git = (args: string[]) =>
 				args[0] === "ls-files" ? "tests/lexer.test.ts\n" : "";
@@ -3124,6 +4275,11 @@ describe("local lint parity", () => {
 			process.cwd(),
 			() =>
 				'diff --git a/clients/example.ts b/clients/example.ts\n+throw new Error("boom");',
+			{
+				headFiles: postImageFromDiff(
+					'diff --git a/clients/example.ts b/clients/example.ts\n+throw new Error("boom");',
+				).headFiles,
+			},
 		);
 		expect(result.valid).toBe(false);
 		expect(result.errors.join(" ")).toContain("record literal");
@@ -3527,5 +4683,870 @@ describe("TLA+ coverage through the CI entry point (#3802 F3)", () => {
 		});
 		expect(errors.mock.calls.flat().join("\n")).not.toContain("formal/");
 		expect(result).toMatchObject({ valid: true });
+	});
+});
+
+// #3945 recovery: independent reviewer12 reconciled the audit to 27 survivors
+// and 15 unsampled ranges (7 EQUIVALENT, 19 production-reachable caller gaps,
+// 1 synthetic-only, 2 latent manual-range gaps). These witnesses call the real
+// exported `lintPrBody` seam with compile-valid source-identity mutations; each
+// block names the survivor `line`, `original`, and `replacement` it reds. The
+// seven equivalents (ids 4, 7, 8, 10, 11, 40, 49) and the synthetic-only id 2
+// keep their recorded disposition and get no manufactured test.
+describe("post-image mutation witnesses (#3945 survivors)", () => {
+	const withObservability = (text: string) =>
+		body.replace("The advisory check run is the record.", text);
+
+	// ids 36/37 (line 533, `\breturn\s+null\b`): the failure-path scan must
+	// match a one-space and a two-space `return null`. A missed failure path
+	// turns the honest sentence into a false clean.
+	it("refuses the honest sentence for an added one-space `return null` failure path (#3945 id 37)", () => {
+		const added = "\treturn null;";
+		const diff = [
+			"diff --git a/clients/failure.ts b/clients/failure.ts",
+			"@@ -0,0 +1 @@",
+			`+${added}`,
+		].join("\n");
+		const result = lintPrBody(
+			withObservability("No new failure path; no record added."),
+			{ diff, headFiles: new Map([["clients/failure.ts", added]]) },
+		);
+		expect(result.valid).toBe(false);
+		expect(result.errors.join(" ")).toContain("failure path");
+	});
+
+	it("refuses the honest sentence for an added two-space `return  null` failure path (#3945 id 36)", () => {
+		const added = "\treturn  null;";
+		const diff = [
+			"diff --git a/clients/failure.ts b/clients/failure.ts",
+			"@@ -0,0 +1 @@",
+			`+${added}`,
+		].join("\n");
+		const result = lintPrBody(
+			withObservability("No new failure path; no record added."),
+			{ diff, headFiles: new Map([["clients/failure.ts", added]]) },
+		);
+		expect(result.valid).toBe(false);
+		expect(result.errors.join(" ")).toContain("failure path");
+	});
+
+	// id 6 (line 430, `/^rename to (.+)$/`): the `rename to` scan must stay
+	// anchored. A `+++` header path that contains the words is a header, not a
+	// rename directive; an unanchored match rewrites the post path and the
+	// harvest reads the wrong file (indeterminate).
+	it("keeps a `+++` header path containing `rename to` as the diff header path (#3945 id 6)", () => {
+		const diff = [
+			"diff --git a/clients/widget.ts b/clients/widget.ts",
+			"--- a/clients/widget.ts",
+			"+++ b/clients/rename to moved.ts",
+			"@@ -0,0 +1 @@",
+			'+recordDegradationOnce({ kind: "keep-kind" });',
+		].join("\n");
+		expect(
+			lintPrBody(withObservability("The record is keep-kind."), {
+				diff,
+				headFiles: new Map([
+					[
+						"clients/widget.ts",
+						'recordDegradationOnce({ kind: "keep-kind" });',
+					],
+				]),
+			}),
+		).toEqual({ valid: true, errors: [] });
+	});
+
+	// id 12 (line 436, `/^index ([0-9a-f]+)\.\.([0-9a-f]+)/`): an
+	// `index ab..cd` token inside a `+++` path is not the post-image blob. The
+	// mutant reads the wrong identity; the real working tree is the source here,
+	// so no fabricated `headFiles` can mask the divergence.
+	it("does not read an `index ab..cd` token inside a `+++` path as the post blob (#3945 id 12)", () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-lens-pr-body-index-token-"));
+		try {
+			const added = 'recordDegradationOnce({ kind: "index-kind" });';
+			mkdirSync(join(root, "clients"), { recursive: true });
+			writeFileSync(join(root, "clients", "widget.ts"), added);
+			const diff = [
+				"diff --git a/clients/widget.ts b/clients/widget.ts",
+				"--- a/clients/widget.ts",
+				"+++ b/clients/widget.ts index ab..cd",
+				"@@ -0,0 +1 @@",
+				`+${added}`,
+			].join("\n");
+			expect(
+				lintPrBody(withObservability("The record is index-kind."), {
+					diff,
+					cwd: root,
+					workingTree: true,
+				}),
+			).toEqual({ valid: true, errors: [] });
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	// id 20 (line 442, `/^@@ -\d+.../`): an added code line whose content
+	// begins with `@@` is content, not a hunk header, so its record is harvested.
+	it("harvests an added code line whose content begins with `@@` (#3945 id 20)", () => {
+		const source = [
+			"@@ -1 +1 @@",
+			'recordDegradationOnce({ kind: "hunk-kind" });',
+		].join("\n");
+		const diff = [
+			"diff --git a/clients/hunk.ts b/clients/hunk.ts",
+			"@@ -0,0 +1,2 @@",
+			"+@@ -1 +1 @@",
+			'+recordDegradationOnce({ kind: "hunk-kind" });',
+		].join("\n");
+		expect(
+			lintPrBody(withObservability("The record is hunk-kind."), {
+				diff,
+				headFiles: new Map([["clients/hunk.ts", source]]),
+			}),
+		).toEqual({ valid: true, errors: [] });
+	});
+
+	// id 24 (line 442, `-\d+(?:,\d+)?`): a two-digit old-hunk count followed
+	// by a second hunk must still reset the POST cursor.
+	it("maps a two-digit old-hunk count in a second hunk (#3945 id 24)", () => {
+		const rows = [
+			'recordDegradationOnce({ kind: "first-kind" });',
+			"",
+			"",
+			"",
+			"",
+			"",
+			"",
+			"",
+			"",
+			'recordDegradationOnce({ kind: "second-kind" });',
+		];
+		const diff = [
+			"diff --git a/clients/two.ts b/clients/two.ts",
+			"@@ -1,1 +1,1 @@",
+			'+recordDegradationOnce({ kind: "first-kind" });',
+			"@@ -10,20 +10,2 @@",
+			'+recordDegradationOnce({ kind: "second-kind" });',
+		].join("\n");
+		expect(
+			lintPrBody(withObservability("The record is first-kind."), {
+				diff,
+				headFiles: new Map([["clients/two.ts", rows.join("\n")]]),
+			}),
+		).toEqual({ valid: true, errors: [] });
+	});
+
+	// id 60 (line 726, `"utf8"`): a working-tree-only read must be decoded to
+	// a string, or a small post-image with no `headFiles` declines.
+	it("classifies a small working-tree post-image with no headFiles (#3945 id 60)", () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-lens-pr-body-worktree-small-"));
+		try {
+			const added = '\trecordDegradationOnce({ kind: "small-kind" });';
+			mkdirSync(join(root, "clients"), { recursive: true });
+			writeFileSync(join(root, "clients", "small.ts"), `${added}\n`);
+			const diff = [
+				"diff --git a/clients/small.ts b/clients/small.ts",
+				"@@ -0,0 +1 @@",
+				`+${added}`,
+			].join("\n");
+			expect(
+				lintPrBody(withObservability("The record is small-kind."), {
+					diff,
+					cwd: root,
+					workingTree: true,
+				}),
+			).toEqual({ valid: true, errors: [] });
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	// id 58 (line 725, `>` -> `>=`) and manual range 39-41 (`MAX_SOURCE_BYTES`):
+	// a working-tree post-image of exactly the ceiling is classified; only a
+	// strictly larger one declines.
+	it("classifies a working-tree post-image of exactly MAX_SOURCE_BYTES (#3945 id 58, range 39-41)", () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-lens-pr-body-boundary-"));
+		const ceiling = 16 * 1024 * 1024;
+		try {
+			const added = '\trecordDegradationOnce({ kind: "boundary-kind" });';
+			mkdirSync(join(root, "clients"), { recursive: true });
+			const head = `${added}\n`;
+			const padding = ceiling - Buffer.byteLength(head, "utf8");
+			const path = join(root, "clients", "boundary.ts");
+			writeFileSync(path, `${head}${"x".repeat(padding)}`);
+			expect(statSync(path).size).toBe(ceiling);
+			const diff = [
+				"diff --git a/clients/boundary.ts b/clients/boundary.ts",
+				"@@ -0,0 +1 @@",
+				`+${added}`,
+			].join("\n");
+			expect(
+				lintPrBody(withObservability("The record is boundary-kind."), {
+					diff,
+					cwd: root,
+					workingTree: true,
+				}),
+			).toEqual({ valid: true, errors: [] });
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	// manual range 383-413 (`gitHeaderPaths` pre/post split): a runtime file
+	// renamed AWAY to a non-runtime path must stay in the population through its
+	// pre path, or a real failure path becomes a false clean.
+	it("keeps a runtime file renamed away to a non-runtime path in the population (#3945 range 383-413)", () => {
+		const diff = [
+			"diff --git a/clients/moved.ts b/docs/moved.md",
+			"similarity index 80%",
+			"rename from clients/moved.ts",
+			"rename to docs/moved.md",
+			"@@ -0,0 +1 @@",
+			"+\treturn null;",
+		].join("\n");
+		const result = lintPrBody(
+			withObservability("No new failure path; no record added."),
+			{ diff, headFiles: new Map([["docs/moved.md", "\treturn null;"]]) },
+		);
+		expect(result.valid).toBe(false);
+		expect(result.errors.join(" ")).toContain("failure path");
+	});
+
+	// ids 64, 66, 67, 68, 69, 70, 71, 72, 73, 76 (lines 1365-1373): the
+	// indeterminate refusal renders the `file:line` location, the first five
+	// entries, its overflow count, the `-` difference, and the `, ` separator.
+	it("renders one mismatched post-image line as `file:line` (#3945 ids 66, 67, 69, 73)", () => {
+		const diff = [
+			"diff --git a/clients/render.ts b/clients/render.ts",
+			"@@ -1,0 +2 @@",
+			'+recordDegradationOnce({ kind: "render-kind" });',
+		].join("\n");
+		const result = lintPrBody(withObservability("The record is render-kind."), {
+			diff,
+			headFiles: new Map([
+				["clients/render.ts", "export const a = 1;\nexport const b = 2;"],
+			]),
+		});
+		expect(result.errors).toEqual([
+			"PR body Observability could not classify the added lines of clients/render.ts:2: the post-image is missing, could not be read, or does not match the diff, so a record or a decision branch cannot be confirmed. Re-run with the changed files present, or name the record on a line the diff adds.",
+		]);
+	});
+
+	it("renders the first five indeterminate files and the overflow count (#3945 ids 64, 68, 70, 71, 72, 76)", () => {
+		const files = [1, 2, 3, 4, 5, 6].map((n) => `clients/render-${n}.ts`);
+		const diff = files
+			.map(
+				(file) =>
+					`diff --git a/${file} b/${file}\n@@ -0,0 +1 @@\n+recordDegradationOnce({ kind: "render-${file}" });`,
+			)
+			.join("\n");
+		const headFiles = new Map(
+			files.map((file) => [file, "export const mismatch = 0;"]),
+		);
+		const result = lintPrBody(
+			withObservability("No new failure path; no record added."),
+			{ diff, headFiles },
+		);
+		const shown = files
+			.slice(0, 5)
+			.map((file) => `${file}:1`)
+			.join(", ");
+		expect(result.errors).toEqual([
+			`PR body Observability could not classify the added lines of ${shown} (+1 more): the post-image is missing, could not be read, or does not match the diff, so a record or a decision branch cannot be confirmed. Re-run with the changed files present, or name the record on a line the diff adds.`,
+		]);
+	});
+
+	// id 77 (line 1400, `??` -> `&&`): `lintPullRequestEvent` calls `lintPrBody`
+	// with no `cwd`, so the existing-record read must default to `process.cwd()`.
+	it("resolves an existing-record citation when cwd is omitted (#3945 id 77)", () => {
+		const previousCwd = process.cwd();
+		const root = mkdtempSync(join(tmpdir(), "pi-lens-pr-body-ci-cwd-"));
+		try {
+			const source = 'recordDegradationOnce({ kind: "tool-cwd-resolution" });';
+			mkdirSync(join(root, "clients"), { recursive: true });
+			writeFileSync(join(root, "clients", "existing-record.ts"), `${source}\n`);
+			process.chdir(root);
+			const result = lintPrBody(
+				withObservability(
+					"covered by existing record `tool-cwd-resolution` at `clients/existing-record.ts:1`",
+				),
+				{
+					diff: NEW_PATH_RUNTIME_DIFF,
+					headFiles: NEW_PATH_HEAD_FILES,
+					workingTree: true,
+				},
+			);
+			expect(result).toEqual({ valid: true, errors: [] });
+		} finally {
+			process.chdir(previousCwd);
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
+
+// #3085 gap 1. Recurrence: #3033 (#3043) edited workflow steps no pull request
+// executed, and AGENTS.md's one-sentence `gh workflow run` rule was the only
+// cover. The rule is only real if BOTH CI's entry (`lintPullRequestEvent`) and
+// the local preflight (`lintLocalPrBody`) refuse a no-PR-trigger workflow edit
+// that quotes no run id; deleting either wire must red here.
+describe("workflow edits with no pull request run (#3085 gap 1)", () => {
+	const WORKFLOW = ".github/workflows/stryker-nightly.yml";
+	const NIGHTLY = [
+		"name: nightly",
+		"on:",
+		"  schedule:",
+		"    - cron: '0 3 * * *'",
+		"  workflow_dispatch:",
+		"jobs:",
+		"  a:",
+		"    runs-on: ubuntu-latest",
+		"",
+	].join("\n");
+	const runBody = `${body}\n\n\`\`\`text\n$ gh workflow run stryker-nightly.yml --ref test/x\nhttps://github.com/o/r/actions/runs/12345678901\n\`\`\``;
+	let previousCwd: string;
+	let fixtureCwd: string;
+	beforeEach(() => {
+		previousCwd = process.cwd();
+		fixtureCwd = createOriginMasterFixture(WORKFLOW);
+		writeFileSync(join(fixtureCwd, WORKFLOW), NIGHTLY);
+		process.chdir(fixtureCwd);
+		vi.stubEnv("GITHUB_TOKEN", "t");
+		vi.stubEnv("GITHUB_API_URL", "https://api.example");
+		vi.stubEnv("GITHUB_REPOSITORY", "o/r");
+	});
+	afterEach(() => {
+		vi.unstubAllEnvs();
+		vi.restoreAllMocks();
+		process.chdir(previousCwd);
+		rmSync(fixtureCwd, { recursive: true, force: true });
+	});
+
+	it("fails CI's entry on a schedule-only workflow edit with no quoted run", async () => {
+		const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+		const result = await lintPullRequestEvent(fetchForEvent(body, []), {
+			pull_request: { number: 7, body },
+		});
+		expect(result.valid).toBe(false);
+		expect(errors.mock.calls.flat().join("\n")).toContain(
+			`Changed workflow ${WORKFLOW} has no pull request run of its edit`,
+		);
+	});
+
+	it("passes CI's entry once the body quotes the branch run with its id", async () => {
+		const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+		const result = await lintPullRequestEvent(fetchForEvent(runBody, []), {
+			pull_request: { number: 7, body: runBody },
+		});
+		expect(errors.mock.calls.flat().join("\n")).not.toContain(
+			"Changed workflow",
+		);
+		expect(result).toMatchObject({ valid: true });
+	});
+
+	it("fails the local preflight the same way and passes with the run id", () => {
+		const bare = lintLocalPrBody(body, fixtureCwd);
+		expect(bare.valid).toBe(false);
+		expect(bare.errors.join("\n")).toContain(`Changed workflow ${WORKFLOW}`);
+		expect(
+			lintLocalPrBody(runBody, fixtureCwd).errors.join("\n"),
+		).not.toContain("Changed workflow");
+	});
+
+	it("does not ask for a run when the edited workflow has a pull_request trigger", () => {
+		writeFileSync(
+			join(fixtureCwd, WORKFLOW),
+			NIGHTLY.replace("  workflow_dispatch:", "  pull_request:"),
+		);
+		expect(lintLocalPrBody(body, fixtureCwd).errors.join("\n")).not.toContain(
+			"Changed workflow",
+		);
+	});
+
+	it("fails closed, naming the file, when the post-image cannot be read", () => {
+		rmSync(join(fixtureCwd, WORKFLOW));
+		mkdirSync(join(fixtureCwd, WORKFLOW));
+		expect(lintLocalPrBody(body, fixtureCwd).errors.join("\n")).toContain(
+			`Changed workflow ${WORKFLOW} could not be read`,
+		);
+	});
+});
+
+// #3085 round 2. Recurrence: round 1 accepted any prose after
+// `Workflow run unaffected: <file> —`, so an executable-step edit cleared the
+// rule. Through the real merge-base read (`git merge-base` and `git show` in
+// `lintWorkflowRunEvidence`) the declaration now clears only a comment-only
+// edit or a workflow with no workflow_dispatch trigger.
+describe("Workflow run unaffected declaration is verified (#3085 round 2)", () => {
+	const WORKFLOW = ".github/workflows/stryker-nightly.yml";
+	const rows = (extra: string[] = [], dispatch = true) => [
+		"name: nightly",
+		"on:",
+		"  schedule:",
+		'    - cron: "0 3 * * *"',
+		...(dispatch ? ["  workflow_dispatch:"] : ["  push:"]),
+		"jobs:",
+		"  a:",
+		"    runs-on: ubuntu-latest",
+		...extra,
+	];
+	const declared = `${body}\n\nWorkflow run unaffected: stryker-nightly.yml \u2014 only a comment moved.`;
+	let fixtureCwd = "";
+	const useFixture = (pre: string[], post: string[]) => {
+		fixtureCwd = createOriginMasterFixture(undefined, {
+			path: WORKFLOW,
+			pre,
+			post,
+			dirty: post,
+		});
+	};
+	afterEach(() => {
+		rmSync(fixtureCwd, { recursive: true, force: true });
+	});
+	const errorsFor = (text: string) =>
+		lintLocalPrBody(text, fixtureCwd).errors.join("\n");
+
+	it("accepts the declaration for an edit of comments and blank lines only", () => {
+		useFixture(rows(), ["# header comment", "", ...rows()]);
+		expect(errorsFor(declared)).not.toContain("Changed workflow");
+	});
+
+	it("rejects the declaration when an executable step also changed, naming the evidence form", () => {
+		useFixture(rows(), [
+			"# header comment",
+			...rows(["    steps:", "      - run: echo changed"]),
+		]);
+		const errors = errorsFor(declared);
+		expect(errors).toContain('"Workflow run unaffected" line is not accepted');
+		expect(errors).toContain(
+			"gh workflow run stryker-nightly.yml --ref <branch>",
+		);
+	});
+
+	// Recurrence: PR #4020 round 2 verify. An added `#!/bin/bash` line inside a
+	// `run: |` body is shell payload; through the real merge-base read it must
+	// not pass as a comment-only edit.
+	it("rejects the declaration when the only change is a # line inside a run: | body", () => {
+		const steps = (extra: string[]) => [
+			"    steps:",
+			"      - run: |",
+			"          echo hi",
+			...extra,
+		];
+		useFixture(rows(steps([])), rows(steps(["          #!/bin/bash"])));
+		const errors = errorsFor(declared);
+		expect(errors).toContain('"Workflow run unaffected" line is not accepted');
+	});
+
+	it("still accepts a quoted run id for the same executable edit", () => {
+		useFixture(rows(), rows(["    steps:", "      - run: echo changed"]));
+		const quoted = `${body}\n\n\`\`\`text\n$ gh workflow run stryker-nightly.yml --ref test/x\nhttps://github.com/o/r/actions/runs/12345678901\n\`\`\``;
+		expect(errorsFor(quoted)).not.toContain("Changed workflow");
+	});
+
+	it("accepts the declaration for a workflow with no workflow_dispatch trigger", () => {
+		useFixture(
+			rows([], false),
+			rows(["    steps:", "      - run: echo changed"], false),
+		);
+		expect(errorsFor(declared)).not.toContain("Changed workflow");
+	});
+});
+
+// #4273 F6: the class-sweep rule is composed into `lintPullRequestEvent`, the
+// CI entry point, not only `lintLocalPrBody`/`lintClassSweep`. Without a case
+// through the event seam, deleting that wire leaves the suite green.
+describe("class sweep reaches the CI event entry (#4273 F6)", () => {
+	let previousCwd: string;
+	let fixtureCwd: string;
+	const classSweepBody = (name: string) =>
+		readFileSync(
+			join(repositoryRoot, "tests", "fixtures", "ci-pr-bodies", name),
+			"utf8",
+		);
+	beforeEach(() => {
+		previousCwd = process.cwd();
+		fixtureCwd = createOriginMasterFixture();
+		process.chdir(fixtureCwd);
+		vi.stubEnv("GITHUB_TOKEN", "t");
+		vi.stubEnv("GITHUB_API_URL", "https://api.example");
+		vi.stubEnv("GITHUB_REPOSITORY", "o/r");
+	});
+	afterEach(() => {
+		vi.unstubAllEnvs();
+		process.chdir(previousCwd);
+		rmSync(fixtureCwd, { recursive: true, force: true });
+	});
+
+	it("refuses the #4248 changed-file sweep on the live body", async () => {
+		const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			const live = classSweepBody("pr-4248-body.md");
+			await lintPullRequestEvent(fetchForEvent(live, []), {
+				pull_request: { number: 4248, body: live },
+			});
+			expect(errors.mock.calls.flat().join("\n")).toContain('"## Class sweep"');
+		} finally {
+			errors.mockRestore();
+		}
+	});
+
+	it("does not class-sweep-refuse the #4245 named shape, search, and verdict", async () => {
+		const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			const live = classSweepBody("pr-4245-body.md");
+			await lintPullRequestEvent(fetchForEvent(live, []), {
+				pull_request: { number: 4245, body: live },
+			});
+			expect(errors.mock.calls.flat().join("\n")).not.toContain(
+				'"## Class sweep"',
+			);
+		} finally {
+			errors.mockRestore();
+		}
+	});
+});
+
+// #4288 (docs/pi-lens-merge-policy.md, "Detection retrospective on every
+// merged bug fix"): a PR closing a bug-labelled issue names the layer that
+// caught the bug, the layer that should have caught it, and the gap. The
+// label read is best-effort, so an offline/unreadable label warns and skips.
+describe("detection retrospective for bug-closing PRs (#4288)", () => {
+	const withDetection = (lines: string) => `${body}\n\n## Detection\n${lines}`;
+	const validDetection =
+		"- **Caught by:** reviewer probe\n" +
+		"- **Should have been caught by:** CI unit\n" +
+		"- **Gap:** none: no existing test covered the shape";
+
+	it("exports one layer vocabulary", () => {
+		expect(DETECTION_LAYERS).toEqual([
+			"external user",
+			"reviewer probe",
+			"CI unit",
+			"governance sweep",
+			"smoke",
+			"nightly",
+			"dogfood",
+			"release gate",
+		]);
+	});
+
+	it("keeps the merge policy pointing at the exported vocabulary", () => {
+		// R4: the policy prose named a divergent list (`CI job`,
+		// `install/compat/tool smoke`). It now points at DETECTION_LAYERS; this
+		// pin fails if a copied list drifts back in.
+		const doc = readFileSync(
+			resolve(repositoryRoot, "docs/pi-lens-merge-policy.md"),
+			"utf8",
+		);
+		expect(doc).toContain("DETECTION_LAYERS");
+		for (const stale of ["CI job", "install/compat/tool smoke"])
+			expect(doc).not.toContain(stale);
+	});
+
+	it("fails a bug-closing body without the section", () => {
+		const result = lintPrBody(body, { bugClosing: true });
+		expect(result.valid).toBe(false);
+		expect(result.errors.join(" ")).toContain('"## Detection"');
+	});
+
+	it("needs no section on a feature PR", () => {
+		expect(lintPrBody(body)).toEqual({ valid: true, errors: [] });
+	});
+
+	it("accepts the valid three-line lesson with a reasoned none:", () => {
+		expect(
+			lintPrBody(withDetection(validDetection), { bugClosing: true }),
+		).toEqual({ valid: true, errors: [] });
+	});
+
+	it("accepts this layer and an issue-reference gap", () => {
+		expect(
+			lintPrBody(
+				withDetection(
+					"- Caught by: smoke\n" +
+						"- Should have been caught by: this layer\n" +
+						"- Gap: #4288",
+				),
+				{ bugClosing: true },
+			),
+		).toEqual({ valid: true, errors: [] });
+	});
+
+	it("accepts an exists: test path", () => {
+		expect(
+			lintPrBody(
+				withDetection(
+					"- Caught by: nightly\n" +
+						"- Should have been caught by: governance sweep\n" +
+						"- Gap: exists: tests/scripts/check-pr-body.test.ts",
+				),
+				{ bugClosing: true },
+			),
+		).toEqual({ valid: true, errors: [] });
+	});
+
+	it("fails an unknown layer word", () => {
+		const result = lintPrBody(
+			withDetection(
+				"- Caught by: maintainer\n" +
+					"- Should have been caught by: CI unit\n" +
+					"- Gap: #1",
+			),
+			{ bugClosing: true },
+		);
+		expect(result.valid).toBe(false);
+		expect(result.errors.join(" ")).toContain('"## Detection"');
+	});
+
+	it("does not count a fenced example", () => {
+		const result = lintPrBody(
+			withDetection(
+				"```md\n" +
+					"- Caught by: smoke\n" +
+					"- Should have been caught by: CI unit\n" +
+					"- Gap: #1\n" +
+					"```",
+			),
+			{ bugClosing: true },
+		);
+		expect(result.valid).toBe(false);
+		expect(result.errors.join(" ")).toContain('"## Detection"');
+	});
+
+	it("does not count a tilde-fenced example", () => {
+		const result = lintPrBody(
+			withDetection(
+				"~~~md\n" +
+					"- Caught by: smoke\n" +
+					"- Should have been caught by: CI unit\n" +
+					"- Gap: #1\n" +
+					"~~~",
+			),
+			{ bugClosing: true },
+		);
+		expect(result.valid).toBe(false);
+		expect(result.errors.join(" ")).toContain('"## Detection"');
+	});
+
+	it("does not count a four-space indented code block", () => {
+		const result = lintPrBody(
+			withDetection(
+				"    - Caught by: smoke\n" +
+					"    - Should have been caught by: CI unit\n" +
+					"    - Gap: #1",
+			),
+			{ bugClosing: true },
+		);
+		expect(result.valid).toBe(false);
+		expect(result.errors.join(" ")).toContain('"## Detection"');
+	});
+
+	it("accepts a one-word none: reason", () => {
+		expect(
+			lintPrBody(
+				withDetection(
+					"- Caught by: smoke\n" +
+						"- Should have been caught by: CI unit\n" +
+						"- Gap: none: n/a",
+				),
+				{ bugClosing: true },
+			),
+		).toEqual({ valid: true, errors: [] });
+	});
+
+	it("accepts the Detection retrospective heading", () => {
+		expect(
+			lintPrBody(`${body}\n\n## Detection retrospective\n${validDetection}`, {
+				bugClosing: true,
+			}),
+		).toEqual({ valid: true, errors: [] });
+	});
+
+	it("refuses a non-test exists: path", () => {
+		expect(
+			lintDetectionSection(
+				"## Detection\n" +
+					"- Caught by: smoke\n" +
+					"- Should have been caught by: CI unit\n" +
+					"- Gap: exists: TBD",
+			),
+		).toEqual([expect.stringContaining('"## Detection"')]);
+	});
+
+	it("refuses the template's optional hint as a bug-closing answer", () => {
+		const template = readFileSync(
+			resolve(repositoryRoot, ".github/PULL_REQUEST_TEMPLATE.md"),
+			"utf8",
+		);
+		const hint = /## Detection\r?\n\r?\n([^#]*)/.exec(template)?.[1] ?? "";
+		expect(hint.trim().length).toBeGreaterThan(0);
+		const result = lintPrBody(`${body}\n\n## Detection\n${hint}`, {
+			bugClosing: true,
+		});
+		expect(result.valid).toBe(false);
+	});
+});
+
+describe("bug label resolution (#4288)", () => {
+	const closed = "## Summary\nFixes #12 in the detector.\n";
+	const labelFetch = (names: string[]) =>
+		vi
+			.fn()
+			.mockImplementation(
+				async () =>
+					new Response(
+						JSON.stringify({ labels: names.map((name) => ({ name })) }),
+						{ status: 200 },
+					),
+			);
+
+	afterEach(() => vi.unstubAllEnvs());
+
+	function stubApi() {
+		vi.stubEnv("GITHUB_TOKEN", "t");
+		vi.stubEnv("GITHUB_API_URL", "https://api.example");
+		vi.stubEnv("GITHUB_REPOSITORY", "o/r");
+	}
+
+	it("returns true when a closed issue carries the bug label", async () => {
+		stubApi();
+		expect(await resolveBugClosing(closed, labelFetch(["bug"]))).toBe(true);
+	});
+
+	it("returns false when no closed issue carries the bug label", async () => {
+		stubApi();
+		expect(await resolveBugClosing(closed, labelFetch(["enhancement"]))).toBe(
+			false,
+		);
+	});
+
+	it("returns false with no close keyword and never fetches", async () => {
+		const fetchImpl = vi.fn();
+		expect(await resolveBugClosing("## Summary\nRefs #12.\n", fetchImpl)).toBe(
+			false,
+		);
+		expect(fetchImpl).not.toHaveBeenCalled();
+	});
+
+	it("returns null when no API credentials are available", async () => {
+		vi.stubEnv("GITHUB_TOKEN", "");
+		expect(await resolveBugClosing(closed, labelFetch(["bug"]))).toBe(null);
+	});
+
+	it("returns null on a failed label read", async () => {
+		stubApi();
+		const fetchImpl = vi
+			.fn()
+			.mockResolvedValue(new Response("denied", { status: 500 }));
+		expect(await resolveBugClosing(closed, fetchImpl)).toBe(null);
+	});
+
+	it("returns null on a malformed label body", async () => {
+		stubApi();
+		const fetchImpl = vi
+			.fn()
+			.mockResolvedValue(new Response("not json", { status: 200 }));
+		expect(await resolveBugClosing(closed, fetchImpl)).toBe(null);
+	});
+});
+
+describe("detection reaches the CI event entry (#4288)", () => {
+	const bugBody = `${body}\n\nCloses #4288.`;
+
+	const eventFetch = (bug: boolean | "fail") =>
+		vi.fn().mockImplementation(async (url: string) => {
+			if (String(url).includes("/files"))
+				return new Response(JSON.stringify([]), { status: 200 });
+			if (String(url).includes("/issues/"))
+				return bug === "fail"
+					? new Response("denied", { status: 500 })
+					: new Response(
+							JSON.stringify({ labels: bug ? [{ name: "bug" }] : [] }),
+							{ status: 200 },
+						);
+			return new Response(JSON.stringify({ body: bugBody }), {
+				status: 200,
+			});
+		});
+
+	beforeEach(() => {
+		vi.stubEnv("GITHUB_TOKEN", "t");
+		vi.stubEnv("GITHUB_API_URL", "https://api.example");
+		vi.stubEnv("GITHUB_REPOSITORY", "o/r");
+	});
+	afterEach(() => vi.unstubAllEnvs());
+
+	it("requires Detection when the closed issue is bug-labelled", async () => {
+		const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			// #4288 R1: the CI checkout is shallow, so `git diff origin/master...HEAD`
+			// has no merge base and GITHUB_ACTIONS makes that fatal. The detection
+			// wires are independent of git, so inject an empty diff and pin the CI
+			// environment the unit-test job actually runs in.
+			vi.stubEnv("GITHUB_ACTIONS", "true");
+			const result = await lintPullRequestEvent(
+				eventFetch(true),
+				{ pull_request: { number: 4288, body: bugBody } },
+				() => "",
+			);
+			expect(result.valid).toBe(false);
+			expect(errors.mock.calls.flat().join("\n")).toContain('"## Detection"');
+		} finally {
+			errors.mockRestore();
+		}
+	});
+
+	it("does not require Detection when the closed issue is not a bug", async () => {
+		vi.stubEnv("GITHUB_ACTIONS", "true");
+		const result = await lintPullRequestEvent(
+			eventFetch(false),
+			{ pull_request: { number: 4288, body: bugBody } },
+			() => "",
+		);
+		expect(result).toEqual({ valid: true, repaired: false });
+	});
+
+	it("warns and skips Detection when the label read fails", async () => {
+		const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			vi.stubEnv("GITHUB_ACTIONS", "true");
+			const result = await lintPullRequestEvent(
+				eventFetch("fail"),
+				{ pull_request: { number: 4288, body: bugBody } },
+				() => "",
+			);
+			expect(result.valid).toBe(true);
+			// R2: the skip must be a visible GitHub Actions annotation on the job
+			// log, naming the reason and the issue, not a silent pass.
+			expect(warning).toHaveBeenCalledWith(
+				expect.stringMatching(/^::warning::.*## Detection.*#4288/s),
+			);
+		} finally {
+			warning.mockRestore();
+		}
+	});
+});
+
+describe("detection on the local preflight (#4288)", () => {
+	it("requires the section for a resolved bug", () => {
+		const result = lintLocalPrBody(body, process.cwd(), () => "", {
+			bugClosing: true,
+		});
+		expect(result.valid).toBe(false);
+		expect(result.errors.join(" ")).toContain('"## Detection"');
+	});
+
+	it("warns rather than requiring when the label cannot be read", () => {
+		const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const result = lintLocalPrBody(
+				`${body}\n\nCloses #4288.`,
+				process.cwd(),
+				() => "",
+			);
+			expect(result.valid).toBe(true);
+			expect(warning).toHaveBeenCalledWith(expect.stringContaining("#4288"));
+		} finally {
+			warning.mockRestore();
+		}
 	});
 });
