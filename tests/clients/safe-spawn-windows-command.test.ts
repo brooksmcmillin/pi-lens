@@ -152,21 +152,17 @@ describe.runIf(process.platform === "win32")(
 			const interpreter = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\cmd.exe`;
 			vi.stubEnv("SystemRoot", path.join(fixtureDir, "missing & root"));
 			try {
-				const result = spawnSync(
-					interpreter,
-					[
-						"/d",
-						"/s",
-						"/c",
-						buildWindowsShellCommand(echoArgsCmd, ["safe & literal"]),
-					],
-					{
-						encoding: "utf8",
-						windowsVerbatimArguments: true,
-						shell: false,
-						timeout: 5000,
-					},
-				);
+				const payload = buildWindowsShellCommand(echoArgsCmd, [
+					"safe & literal",
+				]);
+				// Keep the malformed prefix, but let the Node child initialize normally.
+				vi.unstubAllEnvs();
+				const result = spawnSync(interpreter, ["/d", "/s", "/c", payload], {
+					encoding: "utf8",
+					windowsVerbatimArguments: true,
+					shell: false,
+					timeout: 5000,
+				});
 				expect(result.error).toBeUndefined();
 				expect(result.status).toBe(0);
 				expect(JSON.parse(result.stdout)).toEqual(["safe & literal"]);
