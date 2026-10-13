@@ -66,7 +66,6 @@ jobs:
       HOME: ${{ github.workspace }}/.probe-home
       PI_LENS_HOME: ${{ github.workspace }}/.probe-home
       PILENS_DATA_DIR: ${{ github.workspace }}/.probe-home/data
-      TMPDIR: ${{ runner.temp }}/pr24-hook-profile-tmp
       PI_LENS_TEST_MAX_WORKERS: "6"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -74,7 +73,9 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       - name: Create private probe directories
-        run: mkdir -p "$HOME" "$PILENS_DATA_DIR" "$TMPDIR"
+        run: |
+          mkdir -p "$HOME" "$PILENS_DATA_DIR" "$RUNNER_TEMP/pr24-hook-profile-tmp"
+          printf 'TMPDIR=%s/pr24-hook-profile-tmp\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: "22.23.3"
