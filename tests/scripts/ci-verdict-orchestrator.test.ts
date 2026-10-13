@@ -240,6 +240,14 @@ function ghFor(w: World) {
 		const endpoint = args.find((arg) => arg.startsWith("repos/")) ?? "";
 		const bySha = (sha: string) =>
 			w.prs.find((p) => (p.sha ?? shaOf(p.number)) === sha);
+		if (
+			args[0] === "api" &&
+			w.prs.some(
+				(p) =>
+					endpoint === `repos/${w.owner}/pi-lens/issues/${p.number}/comments`,
+			)
+		)
+			return "[]";
 		if (endpoint.endsWith("/branches/master/protection"))
 			throw new Error("HTTP 404: Not Found");
 		if (endpoint.endsWith("/branches/master")) {
@@ -521,12 +529,21 @@ describe("run — failing-test extraction from the recorded job log (#3700)", ()
 		expect(w.calls.some((call) => call.includes("/actions/jobs/"))).toBe(false);
 	});
 
-	// Recurrence (#4005): the per-PR `MUTATION` line (and its `/comments` read)
-	// outliving the mutation job it reported on, as a permanent PENDING or
-	// "unreadable" line on every verdict.
-	it("prints no MUTATION line and reads no PR comments", async () => {
+	it("reports the retained mutation advisory and reads PR comments once", async () => {
 		const w = world({ prs: [{ number: 5, checkRuns: GREEN }] });
 		const { exitCode, lines } = await cli(["5"], w);
+		expect(exitCode).toBe(EXIT_SUCCESS);
+		expect(lines.filter((line) => /MUTATION/i.test(line))).toEqual([
+			"MUTATION (advisory, never gates): PENDING -- no Mutation diff comment on this PR yet",
+		]);
+		expect(w.calls.filter((call) => call.includes("/comments"))).toEqual([
+			"api repos/apmantza/pi-lens/issues/5/comments --paginate",
+		]);
+	});
+
+	it("prints no MUTATION line and reads no comments for a bare SHA", async () => {
+		const w = world({ prs: [{ number: 5, checkRuns: GREEN }] });
+		const { exitCode, lines } = await cli([shaOf(5)], w);
 		expect(exitCode).toBe(EXIT_SUCCESS);
 		expect(lines.join("\n")).not.toMatch(/MUTATION/i);
 		expect(w.calls.some((call) => call.includes("/comments"))).toBe(false);
