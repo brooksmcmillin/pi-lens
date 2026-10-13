@@ -141,6 +141,8 @@ describe.skipIf(!realPiAvailable)("real pi RPC: tools.<name>.enabled", () => {
 						(name) => name !== "ast_grep_replace",
 					).sort(),
 				);
+				// Assistant completion does not flush the buffered session-start log.
+				await pi.quit();
 				const disabledLines = pi.lens
 					.sessionStartLog()
 					.filter((line) =>
@@ -273,6 +275,7 @@ describe.skipIf(!realPiAvailable)("real pi RPC: tools.<name>.enabled", () => {
 			async (pi) => {
 				await pi.prompt("report the disabled tools");
 				await pi.awaitAssistantTurn();
+				await pi.quit();
 				expect(
 					pi.lens
 						.sessionStartLog()
