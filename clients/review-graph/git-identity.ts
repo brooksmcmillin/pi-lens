@@ -16,7 +16,12 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { dirname, join, resolve } from "node:path";
-import { normalizeFilePath, pathsEqual, walkUpDirs } from "../path-utils.js";
+import {
+	isUnderDir,
+	normalizeFilePath,
+	pathsEqual,
+	walkUpDirs,
+} from "../path-utils.js";
 
 export interface GitIdentity {
 	/** Resolved HEAD commit SHA (detached or resolved from a symbolic ref). */
@@ -203,13 +208,35 @@ export function listLinkedWorktreeRoots(commonDir: string): string[] {
 		try {
 			const entryDir = join(commonDir, "worktrees", name);
 			const gitFile = fs.readFileSync(join(entryDir, "gitdir"), "utf-8").trim();
-			if (gitFile)
-				roots.push(canonicalDirectory(dirname(resolve(entryDir, gitFile))));
+			if (gitFile) {
+				const root = canonicalDirectory(dirname(resolve(entryDir, gitFile)));
+				// A prunable registration can outlive its checkout. Do not let that
+				// stale identity hide a later plain directory from scanners (#4132).
+				if (fs.existsSync(join(root, ".git"))) roots.push(root);
+			}
 		} catch {
 			/* a worktree whose registration is unreadable is not listed */
 		}
 	}
 	return roots;
+}
+
+/**
+ * The linked worktrees of `scanRoot`'s repository that sit strictly inside
+ * `scanRoot`, by real path (#4117). These are the directories a whole-tree
+ * scan of `scanRoot` would walk into and count as project files, whatever
+ * they are called; a worktree beside or above the root is not walked and is
+ * not listed. `[]` when `scanRoot` is not a git checkout.
+ */
+export function listNestedLinkedWorktreeRoots(scanRoot: string): string[] {
+	const checkout = resolveGitCheckout(scanRoot);
+	if (!checkout) return [];
+	const base = canonicalDirectory(scanRoot);
+	const nested: string[] = [];
+	for (const root of listLinkedWorktreeRoots(checkout.commonDir)) {
+		if (!pathsEqual(root, base) && isUnderDir(root, base)) nested.push(root);
+	}
+	return nested;
 }
 
 function resolveRefToSha(commonDir: string, ref: string): string | null {

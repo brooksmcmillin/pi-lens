@@ -130,7 +130,7 @@ describe("lsp launch", () => {
 			const spawnMock = vi.fn(() => new MockChildProcess(2468));
 
 			vi.doMock("node:child_process", () => ({
-				execSync: vi.fn(() => ""),
+				execFileSync: vi.fn(() => ""),
 				spawn: spawnMock,
 			}));
 
@@ -147,6 +147,44 @@ describe("lsp launch", () => {
 		},
 	);
 
+	it("isolates concurrent adopted and owned launch permission (#4299 R2-F1)", async () => {
+		const root = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-launch-scope-"),
+		);
+		const command = path.join(root, "node_modules", ".bin", "language-server");
+		fs.mkdirSync(path.dirname(command), { recursive: true });
+		fs.writeFileSync(command, "");
+		const spawnMock = vi.fn(() => new MockChildProcess(2468));
+		vi.doMock("node:child_process", () => ({
+			execFileSync: vi.fn(() => ""),
+			spawn: spawnMock,
+		}));
+		const { launchLSP, withLspProjectCodePermission } =
+			await import("../../../clients/lsp/launch.js");
+		const { setProjectTrustState, resetProjectTrust } =
+			await import("../../../clients/project-trust.js");
+		setProjectTrustState("trusted");
+		try {
+			// Both continuations resume after the other scope has been installed;
+			// a process-global flag borrows the owned permission and executes twice.
+			const launch = () =>
+				Promise.resolve().then(() => launchLSP(command, [], { cwd: root }));
+			const results = await Promise.allSettled([
+				withLspProjectCodePermission(false, launch),
+				withLspProjectCodePermission(true, launch),
+			]);
+			expect(results[0].status).toBe("rejected");
+			expect(results[1].status).toBe("fulfilled");
+			expect(spawnMock).toHaveBeenCalledTimes(1);
+			// Outside any scope there is no root permission, so a project-local
+			// launcher is refused even under trusted trust (#4296 R3-F1).
+			await expect(launch()).rejects.toThrow();
+			expect(spawnMock).toHaveBeenCalledTimes(1);
+		} finally {
+			resetProjectTrust();
+			removeTempDirSync(root);
+		}
+	});
 	it("redacts secrets in crash-adjacent session-start writes", async () => {
 		const tempDir = fs.mkdtempSync(
 			path.join(os.tmpdir(), "pi-lens-launch-log-"),
@@ -220,7 +258,7 @@ describe("lsp launch", () => {
 
 			vi.doMock("node:child_process", () => {
 				return {
-					execSync: vi.fn(() => ""),
+					execFileSync: vi.fn(() => ""),
 					spawn: vi.fn(() => {
 						const proc = new MockChildProcess(4321);
 						setTimeout(() => {
@@ -260,8 +298,8 @@ describe("lsp launch", () => {
 			fs.writeFileSync(resolvedBinary, "");
 			vi.doMock("node:child_process", () => {
 				return {
-					execSync: vi.fn((command: string) => {
-						if (command === "where taplo") {
+					execFileSync: vi.fn((command: string, args: string[]) => {
+						if (command === "where" && args[0] === "taplo") {
 							return `${resolvedBinary}\r\n`;
 						}
 						return "";
@@ -353,7 +391,7 @@ describe("lsp launch", () => {
 			});
 			vi.doMock("node:child_process", () => {
 				return {
-					execSync: vi.fn(() => ""),
+					execFileSync: vi.fn(() => ""),
 					spawn: spawnSpy,
 				};
 			});
@@ -380,7 +418,7 @@ describe("lsp launch", () => {
 			let spawnedCommand: string | undefined;
 			vi.doMock("node:child_process", () => {
 				return {
-					execSync: vi.fn(() => ""),
+					execFileSync: vi.fn(() => ""),
 					spawn: vi.fn((command: string) => {
 						spawnedCommand = command;
 						return new MockChildProcess(1234);
@@ -404,8 +442,13 @@ describe("lsp launch", () => {
 		async () => {
 			vi.useFakeTimers();
 			const dir = setupTestEnvironment("pi-lens-ps1-").tmpDir;
-			const ps1 = path.join(dir, "test.ps1");
-			const jsTarget = path.join(dir, "..", "pkg", "bin", "cli.js");
+			// The wrapper resolves `$basedir/../pkg/bin/cli.js`: keep both under the
+			// fixture root. `path.join(dir, "..", "pkg")` put the package directly in
+			// the shared tmpdir, outside the root `useTrackedTempDirs` removes, so it
+			// outlived the file (#4019).
+			const ps1 = path.join(dir, "bin", "test.ps1");
+			const jsTarget = path.join(dir, "pkg", "bin", "cli.js");
+			fs.mkdirSync(path.dirname(ps1), { recursive: true });
 			fs.mkdirSync(path.dirname(jsTarget), { recursive: true });
 			fs.writeFileSync(jsTarget, "console.log('hello')");
 			fs.writeFileSync(ps1, `"$basedir/../pkg/bin/cli.js" "$@"`);
@@ -414,7 +457,7 @@ describe("lsp launch", () => {
 			let spawnedArgs: string[] | undefined;
 			vi.doMock("node:child_process", () => {
 				return {
-					execSync: vi.fn(() => ""),
+					execFileSync: vi.fn(() => ""),
 					spawn: vi.fn((command: string, args: string[]) => {
 						spawnedCommand = command;
 						spawnedArgs = args;

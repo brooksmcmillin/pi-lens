@@ -59,8 +59,10 @@ function findDeadPid(): number {
 // afterEach cleanup would then race). supportsLSP:false short-circuits the warm
 // before it opens any file.
 const mockTouchFile = vi.fn(async () => undefined);
-vi.mock("../../clients/lsp/index.js", async (importOriginal) => ({
-	...(await importOriginal<typeof import("../../clients/lsp/index.js")>()),
+vi.mock("../../clients/lsp/capabilities.js", async (importOriginal) => ({
+	...(await importOriginal<
+		typeof import("../../clients/lsp/capabilities.js")
+	>()),
 	getLSPService: vi.fn(() =>
 		makeLspServiceDouble({
 			supportsLSP: () => false,
@@ -684,6 +686,43 @@ describe("fixture-loaded startup precedence", () => {
 			expect(rows[0]?.count).toBe(1);
 			expect(rows[0]?.latestReasons[0]?.subject).toMatch(/^[0-9a-f]{8}$/);
 			expect(rows[0]?.latestReasons[0]?.reason).not.toContain("/");
+		} finally {
+			await result.env.cleanup();
+		}
+	});
+
+	// Recurrence (#1129 F9 and F3, review of d873c8d74): marking a tmp checkout
+	// ephemeral was silent, and nothing reaped a dead process's data dir.
+	it("records a tmp checkout's ephemeral data dir once and sweeps a dead process's dir at session start", async () => {
+		// 2147483646 is above every platform's pid ceiling, so kill(pid, 0)
+		// answers ESRCH: a dead owner without signalling anything.
+		let deadDir = "";
+		const result = await runSessionStart("quick", (tmpDir) => {
+			fs.mkdirSync(path.join(tmpDir, ".git", "objects"), { recursive: true });
+			fs.writeFileSync(
+				path.join(tmpDir, ".git", "HEAD"),
+				"ref: refs/heads/main\n",
+			);
+			const ephemeralBase = path.dirname(
+				path.dirname(getProjectDataDir(tmpDir)),
+			);
+			deadDir = path.join(ephemeralBase, "2147483646-deadbeef");
+			fs.mkdirSync(path.join(deadDir, "slug-0123abcd"), { recursive: true });
+			_resetProjectDataDirMemoForTests();
+		});
+		try {
+			const rows = getDegradationSummary().filter(
+				(entry) => entry.kind === "data-dir-ephemeral",
+			);
+			expect(rows).toHaveLength(1);
+			expect(rows[0]?.count).toBe(1);
+			expect(rows[0]?.latestReasons[0]?.subject).toMatch(/^[0-9a-f]{8}$/);
+			expect(rows[0]?.latestReasons[0]?.reason).not.toContain("/");
+			await waitForCondition(
+				() => fs.existsSync(deadDir),
+				(exists) => !exists,
+				{ timeoutMs: 2000 },
+			);
 		} finally {
 			await result.env.cleanup();
 		}

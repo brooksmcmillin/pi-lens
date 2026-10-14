@@ -19,6 +19,9 @@
  * and compare the finding keys. A declaration that is not `transparent` never
  * arms the timer, so this case is red pre-fix and green after the flip.
  */
+import { readFileSync } from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	getServerById,
@@ -30,6 +33,10 @@ import {
 	selectFixtureForServer,
 } from "../../../scripts/lib/lsp-idle-eviction-probe.mjs";
 import { LSP_FIXTURES } from "../../../scripts/smoke-tools.mjs";
+import {
+	resetProjectTrust,
+	setProjectTrustState,
+} from "../../../clients/project-trust.js";
 
 const createLSPClient = vi.fn();
 
@@ -53,8 +60,27 @@ const ENABLED_IDS = [
 	"yaml",
 ] as const;
 
-/** A server that must stay resident after this PR (excluded-default witness). */
-const RESIDENT_WITNESS_ID = "docker";
+/**
+ * A server that must stay resident (excluded-default witness). Taken from
+ * #3952's HOLD_INDEXER class, which the nightly promotion (#3989) never
+ * auto-promotes: a hard-coded `docker` here went red the moment the promotion
+ * PR flipped it (#3994 r3).
+ */
+const RESIDENT_WITNESS_ID = (() => {
+	const registryTest = readFileSync(
+		path.join(
+			path.dirname(fileURLToPath(import.meta.url)),
+			"../../config/lsp-idle-eviction-registry.test.ts",
+		),
+		"utf8",
+	);
+	const body = /const HOLD_INDEXER_IDS = \[([^\]]*)\] as const;/.exec(
+		registryTest,
+	)?.[1];
+	const id = /"([^"]+)"/.exec(body ?? "")?.[1];
+	if (!id) throw new Error("HOLD_INDEXER_IDS not found in the registry test");
+	return id;
+})();
 
 const IDLE_WINDOW_MS = 20;
 
@@ -146,6 +172,7 @@ describe("declared-transparent servers evict through the real registry (#3952)",
 	let spawned: ClientDouble[] = [];
 
 	beforeEach(() => {
+		setProjectTrustState("trusted");
 		nextPid = 0;
 		spawned = [];
 		createLSPClient.mockReset();
@@ -159,6 +186,7 @@ describe("declared-transparent servers evict through the real registry (#3952)",
 	});
 
 	afterEach(() => {
+		resetProjectTrust();
 		vi.restoreAllMocks();
 		vi.useRealTimers();
 		delete process.env.PI_LENS_LSP_IDLE_EVICT_MS;

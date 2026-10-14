@@ -4,11 +4,13 @@
  * per-read `read_recorded` event stays gated as before.
  */
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
 	sanitizeCorrelationId,
 	shouldLogEvent,
 } from "../../clients/read-guard-logger.js";
+import { setupTestEnvironment } from "./test-utils.js";
 
 describe("shouldLogEvent", () => {
 	it("always logs read_cap_trimmed, even at default verbosity", () => {
@@ -32,6 +34,91 @@ describe("shouldLogEvent", () => {
 
 	it("still logs the pre-existing always-on events", () => {
 		expect(shouldLogEvent("edit_blocked")).toBe(true);
+	});
+
+	// #3962: the supersession decision must be visible in the REAL sink, not
+	// only in the mocked logger `read-guard.test.ts` installs. A non-zero
+	// bridge contentBinding followed by a covering native re-read of the
+	// changed bytes records `edit_allowed`, never `edit_blocked` with
+	// `contentBindingMismatch`.
+	it("records edit_allowed for a native re-read, not a contentBindingMismatch block", async () => {
+		const env = setupTestEnvironment("read-guard-sink-3962-");
+		const previousMode = process.env.PI_LENS_TEST_MODE;
+		const previousAllows = process.env.PI_LENS_READ_GUARD_LOG_ALLOWS;
+		process.env.PI_LENS_TEST_MODE = "0";
+		process.env.PI_LENS_READ_GUARD_LOG_ALLOWS = "1";
+		vi.resetModules();
+		try {
+			const filePath = path.join(env.tmpDir, "sink.ts");
+			fs.writeFileSync(filePath, "const a = 1;\nconst b = 2;\nconst c = 3;\n");
+			const { captureReadContentBinding, createReadGuard } =
+				await import("../../clients/read-guard.js");
+			const logger = await import("../../clients/read-guard-logger.js");
+			const guard = createReadGuard("sink-3962");
+			const binding = captureReadContentBinding(filePath, 1, 1);
+			expect(binding).toBeDefined();
+			guard.recordRead({
+				filePath,
+				requestedOffset: 1,
+				requestedLimit: 1,
+				effectiveOffset: 1,
+				effectiveLimit: 1,
+				expandedByLsp: false,
+				turnIndex: 0,
+				writeIndex: 0,
+				timestamp: Date.now(),
+				source: "bridge:test",
+				contentBinding: binding,
+			});
+			// External change the bridge never saw, then the native re-read remedy.
+			fs.writeFileSync(filePath, "const a = 99;\nconst b = 2;\nconst c = 3;\n");
+			guard.recordRead({
+				filePath,
+				requestedOffset: 1,
+				requestedLimit: 3,
+				effectiveOffset: 1,
+				effectiveLimit: 3,
+				expandedByLsp: false,
+				turnIndex: 0,
+				writeIndex: 0,
+				timestamp: Date.now(),
+			});
+			expect(guard.checkEdit(filePath, [1, 1])).toEqual({ action: "allow" });
+
+			await logger.flushReadGuardLog();
+			const entries = fs
+				.readFileSync(logger.getReadGuardLogPath(), "utf8")
+				.trim()
+				.split("\n")
+				.filter(Boolean)
+				.map(
+					(line) =>
+						JSON.parse(line) as {
+							sessionId?: string;
+							event?: string;
+							metadata?: { contentBindingMismatch?: boolean };
+						},
+				)
+				.filter((entry) => entry.sessionId === "sink-3962");
+			expect(entries.some((entry) => entry.event === "edit_allowed")).toBe(
+				true,
+			);
+			expect(
+				entries.some(
+					(entry) =>
+						entry.event === "edit_blocked" &&
+						entry.metadata?.contentBindingMismatch === true,
+				),
+			).toBe(false);
+		} finally {
+			if (previousMode === undefined) delete process.env.PI_LENS_TEST_MODE;
+			else process.env.PI_LENS_TEST_MODE = previousMode;
+			if (previousAllows === undefined)
+				delete process.env.PI_LENS_READ_GUARD_LOG_ALLOWS;
+			else process.env.PI_LENS_READ_GUARD_LOG_ALLOWS = previousAllows;
+			vi.resetModules();
+			env.cleanup();
+		}
 	});
 
 	it("writes partial-apply outcomes to the real sink at default verbosity", async () => {

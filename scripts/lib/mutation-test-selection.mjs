@@ -13,7 +13,8 @@ import { safeSpawnAsync } from "../../clients/safe-spawn.js";
  * cap kept the first 47 by path: #3794's own new test file was dropped and its
  * 37 survivors were false. The rules here replace that: a test is kept only if
  * V8 coverage shows it executing a changed line, ranked by how many changed
- * lines it executes, and the PR's own test files are never dropped.
+ * lines it executes, and the PR's own test files are exempt from the count cap
+ * (not from the runtime cap, #4092).
  */
 
 const sha256 = (value) => createHash("sha256").update(value).digest("hex");
@@ -112,12 +113,14 @@ export function coveredChangedLinesInReport(
 }
 
 /**
- * Written beside `.stryker/incremental.json` (the workflow caches both): the
+ * Written beside `.stryker/incremental.json` (a local run reuses both; the
+ * nightly workflow starts cold): the
  * fingerprint of the inputs that file's results were computed under.
  */
 export const INCREMENTAL_FINGERPRINT_PATH = ".stryker/incremental.fingerprint";
 
 export const PROBE_REPORTS_ROOT = ".stryker/coverage";
+const PROBE_RESULT_FILE = "result.json";
 
 /**
  * One scratch directory per probed test file, for its coverage report.
@@ -154,6 +157,10 @@ export function buildCoverageProbeArgs(
 		"--testTimeout",
 		String(testTimeoutMs),
 		test,
+		// The test time vitest measured for the file (`readProbeSeconds`): the
+		// runtime cap needs it, and the default reporter's text carries none.
+		"--reporter=json",
+		`--outputFile=${reportsDirectory}/${PROBE_RESULT_FILE}`,
 		"--coverage.enabled",
 		"--coverage.provider=v8",
 		"--coverage.autoAttachSubprocess=true",
@@ -285,12 +292,25 @@ export function probeConcurrency(cpus) {
  * Ranking is by relevance, never by name: covered changed lines (descending),
  * then the import-graph priority (sibling before importer), then a hash of the
  * path -- a tie-break that depends on nothing a rename or a directory listing
- * can reorder. The PR's own tests are kept first and are exempt from the cap.
+ * can reorder. The PR's own tests are kept first and are exempt from the count
+ * cap (`maxTests`), not from the runtime cap below.
  * A test whose probe failed (`null`) stays a candidate, ranked after every test
  * proven to cover a changed line, so a flaky probe cannot drop evidence.
  *
  * `lines` null, or a map in which every probe failed, selects by the
  * import-graph priority alone: `mode: "import-graph"`.
+ *
+ * `runtime` bounds the run by estimated time (#4092) and then replaces the count
+ * cap. The count cap leaves the own tests out of its arithmetic, so in the
+ * nightly (where every test file changed in the window is "own") it bound
+ * nothing: both shards of run 37629970371 ran 122 files, and at 47 own tests
+ * it dropped every other covering test. When the candidates' estimated seconds exceed
+ * `maxSeconds`, they are fitted first-fit in rank order: own tests that
+ * execute a changed line (or whose probe failed), then the other tests, then
+ * the own tests proven to execute none. A test that does not fit is skipped
+ * and a cheaper one after it may still fit; the top-ranked test is always kept,
+ * so a cap can never empty the run. A test with no measured seconds costs
+ * `unknownSeconds`; every test adds `fileOverheadSeconds`.
  *
  * @param {{
  *   related: string[],
@@ -300,6 +320,12 @@ export function probeConcurrency(cpus) {
  *   maxTests: number,
  *   activeSources?: string[],
  *   sourceCoverage?: Map<string, Map<string, number> | null>,
+ *   runtime?: {
+ *     seconds: Map<string, number | null>,
+ *     maxSeconds: number,
+ *     unknownSeconds: number,
+ *     fileOverheadSeconds: number,
+ *   },
  * }} args
  * @returns {{
  *   mode: "coverage" | "import-graph",
@@ -307,6 +333,9 @@ export function probeConcurrency(cpus) {
  *   covering: number | null,
  *   kept: string[],
  *   dropped: string[],
+ *   overBudget: string[],
+ *   unmeasured: number,
+ *   estimatedSeconds: number | null,
  *   own: string[],
  *   unknown: string[],
  * }}
@@ -319,6 +348,7 @@ export function selectMutationTests({
 	maxTests,
 	activeSources,
 	sourceCoverage,
+	runtime,
 }) {
 	if (!Number.isInteger(maxTests) || maxTests < 0) {
 		throw new RangeError("maxTests must be a non-negative integer");
@@ -357,7 +387,47 @@ export function selectMutationTests({
 	);
 	const own = candidates.filter((test) => ownSet.has(test)).sort(rank);
 	const rest = candidates.filter((test) => !ownSet.has(test)).sort(rank);
-	const slots = Math.max(0, maxTests - own.length);
+	// With a runtime budget the time fit below is the only limit: the count slice
+	// is `maxTests - own.length`, which is 0 whenever the own tests reach the cap,
+	// so it kept every zero-coverage own test and dropped every covering test that
+	// is not own before the time fit saw it (R2 F3 of #4108).
+	const slots = runtime ? rest.length : Math.max(0, maxTests - own.length);
+	let kept = [...own, ...rest.slice(0, slots)];
+	const overBudget = [];
+	let estimatedSeconds = null;
+	if (runtime) {
+		const cost = (test) =>
+			(runtime.seconds.get(test) ?? runtime.unknownSeconds) +
+			runtime.fileOverheadSeconds;
+		const total = kept.reduce((sum, test) => sum + cost(test), 0);
+		estimatedSeconds = total;
+		if (total > runtime.maxSeconds) {
+			const ordered = [
+				...own.filter((test) => known(test) !== 0),
+				...kept.filter((test) => !ownSet.has(test)),
+				...own.filter((test) => known(test) === 0),
+			];
+			kept = [];
+			estimatedSeconds = 0;
+			for (const test of ordered) {
+				const seconds = cost(test);
+				if (
+					kept.length === 0 ||
+					estimatedSeconds + seconds <= runtime.maxSeconds
+				) {
+					kept.push(test);
+					estimatedSeconds += seconds;
+				} else overBudget.push(test);
+			}
+		}
+	}
+	const keptSet = new Set(kept);
+	// Kept tests costed at the unknown default: a probe that failed, or one whose
+	// json report was missing or unreadable (a vitest that stopped writing it
+	// would otherwise cost every test silently).
+	const unmeasured = runtime
+		? kept.filter((test) => (runtime.seconds.get(test) ?? null) === null).length
+		: 0;
 	return {
 		mode: lines === null ? "import-graph" : "coverage",
 		pool: pool.length,
@@ -365,9 +435,15 @@ export function selectMutationTests({
 			lines === null
 				? null
 				: pool.filter((test) => (known(test) ?? 0) > 0).length,
-		kept: [...own, ...rest.slice(0, slots)],
+		kept,
 		dropped: rest.slice(slots),
-		own,
+		overBudget,
+		unmeasured,
+		// Whole seconds, rounded up: an estimate, and a float of measured
+		// timings would make every report differ run to run.
+		estimatedSeconds:
+			estimatedSeconds === null ? null : Math.ceil(estimatedSeconds),
+		own: own.filter((test) => keptSet.has(test)),
 		unknown: lines === null ? [] : pool.filter((test) => known(test) === null),
 	};
 }
@@ -662,14 +738,50 @@ export function readProbeCoverage({ exists, read, remove }, directory) {
 }
 
 /**
+ * The test time one probe measured for its file, in seconds: the sum over the
+ * files vitest's json reporter wrote to the probe's scratch directory. Null
+ * when the report is absent or unreadable, so the test is costed as unknown
+ * (`selectMutationTests`), never as free. Read BEFORE `readProbeCoverage`,
+ * which removes the directory.
+ *
+ * @param {{exists: (file: string) => boolean, read: (file: string) => string}} io
+ * @param {string} directory
+ * @returns {number | null}
+ */
+export function readProbeSeconds({ exists, read }, directory) {
+	const file = `${directory}/${PROBE_RESULT_FILE}`;
+	try {
+		if (!exists(file)) return null;
+		const seconds = JSON.parse(read(file)).testResults.reduce(
+			(sum, result) => sum + (result.endTime - result.startTime) / 1000,
+			0,
+		);
+		return Number.isFinite(seconds) && seconds >= 0 ? seconds : null;
+	} catch {
+		return null;
+	}
+}
+
+/**
  * The log lines that explain a selection beyond its counts.
  *
- * @param {{dropped: string[], unknown: string[]}} choice
+ * @param {{dropped: string[], unknown: string[], overBudget?: string[], unmeasured?: number, estimatedSeconds?: number | null}} choice
  * @param {number} maxTests
+ * @param {number} [maxSeconds]
  * @returns {string[]}
  */
-export function selectionNotes(choice, maxTests) {
+export function selectionNotes(choice, maxTests, maxSeconds) {
 	const notes = [];
+	if (choice.unmeasured > 0) {
+		notes.push(
+			`${choice.unmeasured} kept test(s) had no measured time and were costed at the unknown default`,
+		);
+	}
+	if (choice.overBudget?.length > 0) {
+		notes.push(
+			`runtime-capped at ${maxSeconds} s of estimated test time (kept ${choice.estimatedSeconds} s); dropped, in rank order: ${choice.overBudget.join(", ")}`,
+		);
+	}
 	if (choice.dropped.length > 0) {
 		notes.push(
 			`capped at ${maxTests} tests; dropped, by covered changed lines: ${choice.dropped.join(", ")}`,

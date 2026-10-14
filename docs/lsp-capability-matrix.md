@@ -1,5 +1,22 @@
 # LSP capability matrix — affirmative-clean-signal strategy
 
+## Project-code trust class (#4269)
+
+Some global language-server binaries execute repository-owned build, plugin, or
+macro code while starting or indexing. The built-in registry marks these with
+`executesProjectCode`; the launch gate refuses them unless pi reports the
+project as trusted. Unknown trust is a `spawn-failed` refusal, not
+`tool-not-found`, and does not install or retry the server. The class currently
+includes rust-analyzer (Cargo `build.rs` and proc macros), Ruby LSP
+(Bundler/Gemfile composed-bundle setup), PowerShell Editor Services (workspace
+modules), C# / F# servers (MSBuild targets), JDT LS and Kotlin (Gradle/Maven),
+SourceKit-LSP (SwiftPM plugins), Haskell Language Server (Cabal/Stack and
+Template Haskell), ElixirLS / Expert (`mix compile`), and the project-configured
+analysis servers whose startup evaluates workspace configuration: Dart, ZLS,
+OCaml, Clojure, Terraform, Nix, CMake, Vue, and Svelte. Lean is tracked by
+#4122 and will declare itself when that change lands. gopls is excluded: its
+startup/index discovery uses `go list`; cgo is not compiled by gopls startup.
+
 How pi-lens knows a just-edited file is **clean** (no diagnostics) vs the server
 simply **hasn't answered yet** (cold/crashed/silent). pi-lens waits *synchronously*
 for a verdict, so — unlike an editor, which renders asynchronously and never needs
@@ -68,8 +85,10 @@ discriminator either.
 
 `tests/config/lsp-first-publish-census.test.ts` compares this column against the
 `emptyFirstPublish` markers and reds in BOTH directions, which is the expiry
-check: when the nightly re-measures a server into a different class, the docs
-refresh cannot merge until the marker is updated with it.
+check: when two consecutive nights re-measure a server into a different class,
+the docs refresh commits the confirmed class and the marker must move with it.
+A single-night flip remains in the refresh-state JSON below and does not change
+the census's confirmed population.
 
 ## The strategies
 
@@ -148,7 +167,7 @@ carries the named admission until then.
 | deno | deno (alt of typescript) | pull | — | n/a (pull) | 1 | dev+ci |
 | ruby | ruby-lsp | pull | — | n/a (pull) | 1 | ci |
 | csharp | csharp-ls | pull | — | n/a (pull) | 1 | ci |
-| typescript | typescript-language-server | push-only | silent | direct | 3 | dev+ci |
+| typescript | typescript-language-server | push-only | silent | empty-first | 3 | dev+ci |
 | markdown | marksman | push-only | silent | direct | 3 | ci |
 | lua | lua-language-server | push-only | silent | direct | 3 | dev+ci |
 | python | pyright | push-only | publishes-versioned | direct | 2 | dev+ci |
@@ -156,6 +175,7 @@ carries the named admission until then.
 | yaml | yaml-language-server | push-only | publishes-unversioned | direct | 2* | dev+ci |
 | shell | bash-language-server | push-only | publishes-versioned | direct | 2 | dev+ci |
 | dockerfile | docker-langserver | push-only | publishes-unversioned | direct | 2* | dev+ci |
+| dockerfile-official | docker-language-server (official) | push-only | publishes-versioned | direct | 2 | dev+ci |
 | toml | taplo | push-only | publishes-unversioned | direct | 2* | dev+ci |
 | terraform | terraform-ls | push-only | publishes-unversioned | empty-first | 2* | dev+ci |
 | prisma | @prisma/language-server | push-only | publishes-unversioned | direct | 2* | dev+ci |
@@ -210,6 +230,9 @@ and were characterized `push-only` in the run above).
   `first-publish` measurements on the dev box, 2026-09-23: php `empty-first`,
   typescript / opengrep / ast-grep / marksman `direct` (so the class does not
   extend to them on the measurement, whatever their comments suggest).
+- The official Docker row's clean-gate witness requires the BuildKit-backed
+  `JSONArgsRecommended` rule and skips when `docker buildx` is unavailable;
+  its first-publish class is the nightly's measured `direct`.
 - **#458's learned-deadline target set = the tier-3 rows only.** 2\* rows resolve
   the wait at runtime and must NOT be given learned deadlines.
 - **Tier 3 is budget-bound by necessity**, not laziness: a silent server's silence is
@@ -251,4 +274,14 @@ Telemetry only — never a CI gate. Compares each probed server's observed
 marker; a mismatch means the marker may need a human update (#529). `unknown`
 observations are never compared (a slow/absent server is not evidence either way).
 
-_None observed as of the last probe run._
+- **[marked-not-silent]** wait-policy/strategies.ts marks "typescript" silentOnClean:true but this run observed publishes-unversioned — the marker may be stale (too pessimistic; cascade is skipping a wait the server would have resolved with a real publish)
+
+## Capability matrix refresh state (nightly-generated)
+
+Bookkeeping for the two-run `first-publish`/`clean-behavior` hysteresis, the
+date-based `direct` expiry (#3401) and consecutive-night `idle-eviction`
+counts (#3989). Regenerated every run; never a measurement.
+
+```json
+{"clean-behavior":{"typescript":{"pendingBehavior":"publishes-unversioned","pendingTier":"2*","runs":1}},"first-publish":{"clojure":{"firstMissed":"2026-10-11"},"dart":{"firstMissed":"2026-10-11"},"dockerfile":{"firstMissed":"2026-10-10"},"prisma":{"firstMissed":"2026-10-10"},"python":{"firstMissed":"2026-10-10"},"shell":{"firstMissed":"2026-10-10"},"yaml":{"firstMissed":"2026-10-10"},"zig":{"firstMissed":"2026-10-11"}}}
+```

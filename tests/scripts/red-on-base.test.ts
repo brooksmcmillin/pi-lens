@@ -12,9 +12,10 @@ import { acquireTestLock, getLockPath } from "../../scripts/lib/suite-lock.mjs";
 
 // flake-shape: real-process-spawn — the real CLI, Git worktree lifecycle,
 // signal delivery and child-process cleanup ordering are the contract;
-// in-process stubs cannot prove them. The ONLY seam is --test-command, a fake
+// in-process stubs cannot prove them. --test-command supplies a fake
 // `vitest run --reporter=json` (tests/support/red-on-base-fake-vitest.mjs)
-// whose report shape is pinned to a real vitest 5.0.2 report below.
+// whose report shape is pinned to a real vitest 5.0.2 report below. The link-type
+// witness records actual fs.symlinkSync arguments at the filesystem boundary.
 // lane: ubuntu Unit tests (POSIX sh git shim, TMPDIR-derived scratch root).
 
 const CLI = path.resolve("scripts/red-on-base.mjs");
@@ -34,9 +35,13 @@ type Scenario = {
 		{ tests: TestSpec[] } | { suiteFailure: true | string }
 	>;
 	buildExit?: number;
+	dependencyProbe?: boolean;
 	noReport?: boolean;
 	failExit?: boolean;
 	signalParent?: boolean;
+	// Every test reds unless `git ls-files` lists the tree's files (a governance
+	// test that reads Git state).
+	needsGitIndex?: boolean;
 };
 type Repo = ReturnType<typeof makeRepo>;
 
@@ -71,6 +76,7 @@ function makeRepo(base: Scenario, head: Scenario) {
 			JSON.stringify({ scripts: { build: `node ${FAKE} --build` } }),
 		);
 		fs.writeFileSync(path.join(root, ".gitignore"), "node_modules\n");
+		fs.writeFileSync(path.join(root, ".gitattributes"), "*.mjs text eol=lf\n");
 		fs.writeFileSync(
 			path.join(root, "scenario.json"),
 			JSON.stringify(scenario),
@@ -112,7 +118,22 @@ function makeRepo(base: Scenario, head: Scenario) {
 			'  echo unlink-before-remove >> "$CLEANUP_LOG"',
 			"fi",
 			"if [ \"$1 $2\" = 'worktree add' ] && [ -n \"$FAIL_WORKTREE_ADD\" ]; then echo 'add refused' >&2; exit 92; fi",
+			"if [ \"$1\" = 'archive' ] && [ -n \"$FAIL_ARCHIVE\" ]; then echo 'archive refused' >&2; exit 93; fi",
 			'exec "$real" "$@"',
+		].join("\n"),
+		{ mode: 0o755 },
+	);
+	// `tar` that, on request, drops .gitattributes after extracting: an archive
+	// that loses a file a future `export-ignore` or ignore rule would lose.
+	const realTar = spawnSync("sh", ["-c", "command -v tar"], {
+		encoding: "utf8",
+	}).stdout.trim();
+	fs.writeFileSync(
+		path.join(bin, "tar"),
+		[
+			"#!/bin/sh",
+			`"${realTar}" "$@" || exit $?`,
+			'if [ -n "$DROP_GITATTRIBUTES" ]; then for a; do dir=$a; done; rm -f "$dir/.gitattributes"; fi',
 		].join("\n"),
 		{ mode: 0o755 },
 	);
@@ -161,6 +182,13 @@ type Probe = {
 	home: string;
 	tmp: string;
 	files?: string[];
+	linked?: boolean;
+	cli?: string;
+	absoluteTarget?: string;
+	directoryTarget?: string;
+	hardlinkInode?: number;
+	target?: string;
+	linkType?: string;
 };
 const probes = (repo: Repo): Probe[] =>
 	fs.existsSync(repo.probeLog)
@@ -206,6 +234,249 @@ describe("red-on-base report parsing", () => {
 			"tests/scripts/zz/vec.test.ts > suite fails",
 		]);
 	});
+});
+
+describe("red-on-base private dependencies", () => {
+	function dependencies(repo: Repo) {
+		const deps = path.join(repo.root, "node_modules");
+		fs.mkdirSync(path.join(deps, ".bin"));
+		fs.mkdirSync(path.join(deps, "pkg", "bin"), { recursive: true });
+		fs.writeFileSync(
+			path.join(deps, "pkg", "value.cjs"),
+			'module.exports = "package-relative";',
+		);
+		fs.writeFileSync(
+			path.join(deps, "pkg", "bin", "cli.cjs"),
+			'console.log(require("../value.cjs"));',
+		);
+		fs.symlinkSync("../pkg/bin/cli.cjs", path.join(deps, ".bin", "fixture"));
+		fs.writeFileSync(path.join(deps, "bytes"), "source bytes");
+		fs.linkSync(path.join(deps, "bytes"), path.join(deps, "hard"));
+		fs.symlinkSync(path.join(deps, "bytes"), path.join(deps, "absolute"));
+		fs.symlinkSync(path.join(deps, "pkg"), path.join(deps, "directory"), "dir");
+		return deps;
+	}
+
+	it.each([false, true])(
+		"preserves entrypoint resolution and mode-specific dependency ownership (copy=%s)",
+		(copy) => {
+			// Recurrence: a copied .bin executable loses package-relative resolution;
+			// a retained absolute link or hardlink lets base writes corrupt HEAD.
+			const scenario = {
+				files: { [A]: file(pass("t")) },
+				dependencyProbe: true,
+			};
+			const repo = makeRepo(scenario, scenario);
+			const deps = dependencies(repo);
+			const sourceInode = fs.statSync(path.join(deps, "bytes")).ino;
+			const result = run(
+				repo,
+				[A, "--base", "HEAD~1", ...(copy ? ["--copy-node-modules"] : [])],
+				{ DEPENDENCY_SOURCE_ROOT: repo.root },
+			);
+			expect(result.status, result.stderr).toBe(0);
+			const rows = probes(repo).filter((e) => e.phase === "dependencies");
+			expect(rows.map((e) => e.cli)).toEqual([
+				"package-relative",
+				"package-relative",
+			]);
+			const base = rows[1];
+			expect(base.linked).toBe(!copy);
+			expect(base.absoluteTarget).toBe(
+				path.join(copy ? base.cwd : repo.root, "node_modules", "bytes"),
+			);
+			expect(base.directoryTarget).toBe(
+				path.join(copy ? base.cwd : repo.root, "node_modules", "pkg"),
+			);
+			expect(base.hardlinkInode === sourceInode).toBe(!copy);
+			expect(fs.readFileSync(path.join(deps, "bytes"), "utf8")).toBe(
+				copy ? "source bytes" : "base changed bytes",
+			);
+			expect(fs.readFileSync(path.join(deps, "pkg", "value.cjs"), "utf8")).toBe(
+				copy ? 'module.exports = "package-relative";' : "base changed bytes",
+			);
+			if (copy)
+				expect(result.stdout).toContain("BASE-DEPENDENCIES private-copy");
+			expect(cleanupLines(repo)).toEqual(["unlink-before-remove"]);
+			expectCleanedUp(repo);
+		},
+	);
+
+	it("passes directory and file hints to the filesystem when rebasing absolute links", () => {
+		// S12-R1: POSIX ignores symlink's type argument, hiding an inverted Windows hint.
+		// Observe the real CLI's filesystem calls without replacing its selection logic.
+		const scenario = { files: { [A]: file(pass("t")) }, dependencyProbe: true };
+		const repo = makeRepo(scenario, scenario);
+		dependencies(repo);
+		const preload = path.join(repo.bin, "record-symlink.cjs");
+		fs.writeFileSync(
+			preload,
+			[
+				'const fs = require("node:fs");',
+				'const { syncBuiltinESMExports } = require("node:module");',
+				"const symlink = fs.symlinkSync;",
+				"fs.symlinkSync = (target, destination, linkType) => {",
+				'  fs.appendFileSync(process.env.PROBE_LOG, JSON.stringify({ phase: "symlink", target, destination, linkType }) + "\\n");',
+				"  return symlink(target, destination, linkType);",
+				"};",
+				"syncBuiltinESMExports();",
+			].join("\n"),
+		);
+		const result = run(repo, [A, "--base", "HEAD~1", "--copy-node-modules"], {
+			DEPENDENCY_SOURCE_ROOT: repo.root,
+			NODE_OPTIONS: `--require ${JSON.stringify(preload)}`,
+		});
+		expect(result.status, result.stderr).toBe(0);
+		expect(
+			probes(repo)
+				.filter(
+					(entry) => entry.phase === "symlink" && entry.linkType !== undefined,
+				)
+				.map(({ target, linkType }) => [target, linkType])
+				.sort(),
+		).toEqual([
+			["bytes", "file"],
+			["pkg", "dir"],
+		]);
+		expect(
+			probes(repo)
+				.filter((entry) => entry.phase === "dependencies")
+				.map((entry) => entry.cli),
+		).toEqual(["package-relative", "package-relative"]);
+		expectCleanedUp(repo);
+	});
+
+	it.each(["outward-file", "outward-directory", "dangling", "cycle"])(
+		"refuses %s links before base build and cleans partial output",
+		(kind) => {
+			// Recurrence: copying a dependency link can retain a write route outside the owned lane.
+			const scenario = { files: { [A]: file(pass("t")) } };
+			const repo = makeRepo(scenario, scenario);
+			const deps = path.join(repo.root, "node_modules");
+			const outside = path.join(repo.root, "node_modules-sibling");
+			fs.mkdirSync(outside);
+			fs.writeFileSync(path.join(outside, "sentinel"), "untouched");
+			fs.writeFileSync(path.join(deps, "ordinary"), "copy me");
+			const target = {
+				"outward-file": path.join(outside, "sentinel"),
+				"outward-directory": outside,
+				dangling: "missing",
+				cycle: "unsafe",
+			}[kind];
+			fs.symlinkSync(target!, path.join(deps, "unsafe"));
+			const result = run(repo, [A, "--base", "HEAD~1", "--copy-node-modules"]);
+			expect(result.status).toBe(3);
+			expect(result.stderr).toContain(
+				kind.startsWith("outward")
+					? "dependency copy escapes its root"
+					: kind === "dangling"
+						? "ENOENT"
+						: "ELOOP",
+			);
+			expect(
+				probes(repo)
+					.filter((e) => e.phase === "build")
+					.map((e) => e.cwd),
+			).toEqual([repo.root]);
+			expect(fs.readFileSync(path.join(outside, "sentinel"), "utf8")).toBe(
+				"untouched",
+			);
+			expect(fs.lstatSync(path.join(deps, "unsafe")).isSymbolicLink()).toBe(
+				true,
+			);
+			expectCleanedUp(repo);
+		},
+	);
+
+	it("rejects a relative link that leaves and re-enters the source but cannot resolve in the copy", () => {
+		// Recurrence: source containment alone does not prove copied relative links are private.
+		const scenario = { files: { [A]: file(pass("t")) } };
+		const repo = makeRepo(scenario, scenario);
+		const deps = path.join(repo.root, "node_modules");
+		fs.writeFileSync(path.join(deps, "bytes"), "source bytes");
+		fs.symlinkSync(
+			"../../repo/node_modules/bytes",
+			path.join(deps, "roundtrip"),
+		);
+		const result = run(repo, [A, "--base", "HEAD~1", "--copy-node-modules"]);
+		expect(result.status).toBe(3);
+		expect(result.stderr).toContain("ENOENT");
+		expect(probes(repo).filter((e) => e.phase === "build")).toHaveLength(1);
+		expect(fs.readFileSync(path.join(deps, "bytes"), "utf8")).toBe(
+			"source bytes",
+		);
+		expectCleanedUp(repo);
+	});
+
+	it.each(["non-directory source", "occupied destination"])(
+		"refuses %s before copying",
+		(kind) => {
+			// Recurrence: never merge a private install into pre-existing base dependencies.
+			const scenario = { files: { [A]: file(pass("t")) } };
+			const repo = makeRepo(scenario, scenario);
+			const deps = path.join(repo.root, "node_modules");
+			if (kind === "non-directory source") {
+				fs.rmdirSync(deps);
+				fs.writeFileSync(deps, "not an install");
+			} else {
+				fs.writeFileSync(path.join(deps, "occupied"), "tracked dependency");
+				git(repo.root, "add", "-f", "node_modules/occupied");
+				git(
+					repo.root,
+					"-c",
+					"user.email=t@example.com",
+					"-c",
+					"user.name=T",
+					"commit",
+					"-qm",
+					"tracked dependency",
+				);
+			}
+			const result = run(repo, [A, "--base", "HEAD", "--copy-node-modules"]);
+			expect(result.status).toBe(3);
+			expect(result.stderr).toContain(
+				"dependency copy requires a directory and an absent destination",
+			);
+			expect(probes(repo).filter((e) => e.phase === "build")).toHaveLength(1);
+			expectCleanedUp(repo);
+		},
+	);
+
+	it.each([false, true])(
+		"copies a linked source install and safely cleans a failed base build (archive=%s)",
+		(archive) => {
+			// Recurrence: cleanup over private dependencies must not follow links added by a build.
+			const scenario = {
+				files: { [A]: file(pass("t")) },
+				dependencyProbe: true,
+			};
+			const repo = makeRepo({ ...scenario, buildExit: 2 }, scenario);
+			const deps = dependencies(repo);
+			const source = path.join(repo.root, "private-source");
+			fs.renameSync(deps, source);
+			fs.symlinkSync(source, deps, "dir");
+			// Rebase fixture absolute links to the real source install.
+			for (const [name, target] of [
+				["absolute", "bytes"],
+				["directory", "pkg"],
+			]) {
+				fs.unlinkSync(path.join(source, name));
+				fs.symlinkSync(path.join(source, target), path.join(source, name));
+			}
+			const result = run(repo, [A, "--base", "HEAD~1", "--copy-node-modules"], {
+				DEPENDENCY_SOURCE_ROOT: repo.root,
+				DEPENDENCY_CLEANUP_TARGET: source,
+				...(archive ? { FAIL_WORKTREE_ADD: "1" } : {}),
+			});
+			expect(result.status, result.stderr).toBe(4);
+			expect(result.stderr).toContain("base build failed");
+			expect(fs.readFileSync(path.join(source, "bytes"), "utf8")).toBe(
+				"source bytes",
+			);
+			expect(fs.lstatSync(deps).isSymbolicLink()).toBe(true);
+			expectCleanedUp(repo);
+		},
+	);
 });
 
 describe("red-on-base CLI verdicts", () => {
@@ -491,13 +762,72 @@ describe("red-on-base usage and build failures", () => {
 		expectCleanedUp(repo);
 	});
 
-	it("a tool failure (git refuses the base worktree) is exit 3, never 0, and prints no verdict", () => {
+	// Recurrence (#4047 review H1): a plegma lane refuses `git worktree add`, so
+	// every comparison was INCONCLUSIVE and the gate above read it as success.
+	it("a lane that refuses `git worktree add` still gets a real verdict from an archive base tree", () => {
+		const repo = makeRepo(
+			{ files: { [A]: file(pass("t")) } },
+			{ files: { [A]: file(red("t")) } },
+		);
+		const result = run(repo, [A, "--base", "HEAD~1"], {
+			FAIL_WORKTREE_ADD: "1",
+		});
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain("git worktree add refused");
+		expect(result.stdout).toContain("BASE-TREE git-archive");
+		expect(result.stdout).toContain(`CAUSED-BY-CHANGE  ${A} > t`);
+		expect(verdictLine(result.stdout)).toBe("VERDICT: CAUSED-BY-CHANGE");
+		// Nothing registered, nothing left behind, the shared install untouched.
+		expectCleanedUp(repo);
+		expect(cleanupLines(repo)).toEqual([]);
+		expect(fs.existsSync(path.join(repo.root, "node_modules"))).toBe(true);
+	});
+
+	it("the archive base tree is a Git index, or a Git-reading governance test reds on base and masks a real red", () => {
+		// The review measured 5 false reds in 4 governance files on a bare
+		// archive tree; each would have read RED-ON-BASE (unrelated) for a head red.
+		const repo = makeRepo(
+			{ files: { [A]: file(pass("t")) }, needsGitIndex: true },
+			{ files: { [A]: file(red("t")) }, needsGitIndex: true },
+		);
+		const result = run(repo, [A, "--base", "HEAD~1"], {
+			FAIL_WORKTREE_ADD: "1",
+		});
+		expect(result.status).toBe(1);
+		expect(verdictLine(result.stdout)).toBe("VERDICT: CAUSED-BY-CHANGE");
+		expect(result.stdout).not.toContain("RED-ON-BASE");
+	});
+
+	// Recurrence (#4074 verify r2 F2b): the archive tree's fidelity was true
+	// only by luck; a tar that drops a file left all 33 tests green.
+	it("an archive base tree whose Git tree differs from the base's is exit 3 naming both tree ids, never a verdict", () => {
+		const repo = makeRepo(
+			{ files: { [A]: file(pass("t")) } },
+			{ files: { [A]: file(red("t")) } },
+		);
+		const result = run(repo, [A, "--base", "HEAD~1"], {
+			FAIL_WORKTREE_ADD: "1",
+			DROP_GITATTRIBUTES: "1",
+		});
+		const expected = git(repo.root, "rev-parse", "HEAD~1^{tree}");
+		expect(result.status).toBe(3);
+		expect(result.stderr).toMatch(
+			new RegExp(
+				`archive base tree [0-9a-f]{40} differs from HEAD~1\\^\\{tree\\} ${expected}`,
+			),
+		);
+		expect(result.stdout).not.toContain("VERDICT");
+		expectCleanedUp(repo);
+	});
+
+	it("a lane that refuses both `git worktree add` and `git archive` is exit 3, never 0, with no verdict", () => {
 		const repo = makeRepo(
 			{ files: { [A]: file(pass("t")) } },
 			{ files: { [A]: file(pass("t")) } },
 		);
 		const result = run(repo, [A, "--base", "HEAD~1"], {
 			FAIL_WORKTREE_ADD: "1",
+			FAIL_ARCHIVE: "1",
 		});
 		expect(result.status).toBe(3);
 		expect(result.stderr).toContain("red-on-base:");
@@ -608,6 +938,31 @@ describe("red-on-base interruption", () => {
 			"unlink-before-remove",
 			"unlink-before-remove",
 		]);
+	});
+
+	// An archive base tree is not a registered worktree: the reaper must not ask
+	// Git to remove it (a "worktree remove failed" line on every stale run) and
+	// must still unlink the shared node_modules before deleting the directory.
+	it("a SIGKILLed archive-tree run is reaped by the next run without a git worktree remove", () => {
+		const repo = makeRepo(interrupted, green);
+		const killed = run(repo, [A, "--base", "HEAD~1"], {
+			FAKE_SIGNAL_PARENT: "SIGKILL",
+			FAIL_WORKTREE_ADD: "1",
+		});
+		expect(killed.signal).toBe("SIGKILL");
+		const [stranded] = baseTests(repo);
+		expect(worktrees(repo)).toBe(1);
+		expect(
+			fs.lstatSync(path.join(stranded.cwd, "node_modules")).isSymbolicLink(),
+		).toBe(true);
+
+		const next = run(repo, [A, "--base", "HEAD~1"], { FAIL_WORKTREE_ADD: "1" });
+		expect(next.status).toBe(0);
+		expect(next.stderr).not.toContain("worktree remove failed");
+		expectCleanedUp(repo);
+		expect(fs.existsSync(stranded.cwd)).toBe(false);
+		expect(fs.existsSync(path.join(repo.root, "node_modules"))).toBe(true);
+		expect(cleanupLines(repo)).toEqual([]);
 	});
 });
 

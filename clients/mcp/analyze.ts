@@ -12,6 +12,7 @@
  * + perf impact first-hand rather than inferring it from pasted logs.
  */
 
+import { resolveAnalysisRoot } from "../analysis-root.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { CacheManager, MCP_TURN_STATE_OWNER_ID } from "../cache-manager.js";
@@ -23,7 +24,7 @@ import { FactStore } from "../dispatch/fact-store.js";
 import type { Diagnostic, DispatchResult } from "../dispatch/types.js";
 import { detectFileKind } from "../file-kinds.js";
 import { getDiagnosticTracker } from "../diagnostic-tracker.js";
-import { getLSPService } from "../lsp/index.js";
+import { getLSPService } from "../lsp/capabilities.js";
 import { PathKeyedMap } from "../path-keyed-map.js";
 import { normalizeMapKey } from "../path-utils.js";
 import { loadProjectSnapshot } from "../project-snapshot.js";
@@ -493,6 +494,7 @@ export async function analyzeFile(
 		undefined,
 		{
 			blockingOnly: options.blockingOnly ?? false,
+			analysisRootMode: resolveAnalysisRoot(absPath, cwd),
 			// #3791: this is a pull surface. Each call is an independent question,
 			// so the synthetic coverage notice must come back on every call rather
 			// than being latched once per session by the dispatcher — otherwise a

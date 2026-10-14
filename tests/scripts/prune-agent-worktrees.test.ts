@@ -152,6 +152,12 @@ describe("parseArgs", () => {
 });
 
 describe("#3694 live cwd safety rail (planners)", () => {
+	// The planners compare `toComparablePath` KEYS (liveCwdWithin's contract).
+	// The synthetic POSIX fixtures below are raw strings, which on Windows
+	// resolve to a drive-qualified key (`d:/repo/...`) and never matched, so
+	// the rail looked absent and five cases read the wrong way (#4019).
+	const comparableSet = (...paths: string[]) =>
+		new Set(paths.map(toComparablePath));
 	const AGENT = "/repo/.claude/worktrees/agent-a";
 	const agentRow = {
 		path: AGENT,
@@ -173,7 +179,7 @@ describe("#3694 live cwd safety rail (planners)", () => {
 			worktrees: [agentRow],
 			nowMs: 10_000_000,
 			minAgeMs: 1,
-			liveProcessCwds: new Set([`${AGENT}/src`]),
+			liveProcessCwds: comparableSet(`${AGENT}/src`),
 		});
 		expect(result.remove).toHaveLength(0);
 		expect(result.keep[0]).toMatchObject({ reason: "live-cwd" });
@@ -187,7 +193,7 @@ describe("#3694 live cwd safety rail (planners)", () => {
 				worktrees: [agentRow],
 				nowMs: 10_000_000,
 				minAgeMs: 1,
-				liveProcessCwds: new Set([cwd]),
+				liveProcessCwds: comparableSet(cwd),
 			});
 		expect(plan(`${AGENT}b/src`).remove).toHaveLength(1);
 		expect(plan(AGENT).keep[0]).toMatchObject({ reason: "live-cwd" });
@@ -204,7 +210,7 @@ describe("#3694 live cwd safety rail (planners)", () => {
 			nowMs: 10_000_000,
 			minAgeMs: 1,
 			only: [AGENT],
-			liveProcessCwds: new Set([`${AGENT}/src`]),
+			liveProcessCwds: comparableSet(`${AGENT}/src`),
 		});
 		expect(result.keep).toHaveLength(0);
 		expect(result.remove).toHaveLength(1);
@@ -236,7 +242,7 @@ describe("#3694 live cwd safety rail (planners)", () => {
 			const result = planMergedWorktreeRemovals({
 				candidates: [mergedRow],
 				nowMs: 10_000_000,
-				liveProcessCwds: new Set(["/repo/elsewhere/merged-a/src"]),
+				liveProcessCwds: comparableSet("/repo/elsewhere/merged-a/src"),
 			});
 			expect(result.remove).toHaveLength(0);
 			expect(result.keep[0]).toMatchObject({ reason: "live-cwd" });
@@ -272,13 +278,13 @@ describe("#3694 live cwd safety rail (planners)", () => {
 		});
 
 		it("does not protect a named tree from its own leftover processes", () => {
-			const named = new Set(["/repo/elsewhere/merged-a"]);
+			const named = comparableSet("/repo/elsewhere/merged-a");
 			const result = planMergedWorktreeRemovals({
 				candidates: [{ ...mergedRow, mtimeMs: 9_999_999 }],
 				nowMs: 10_000_000,
 				minAgeMs: 1_000_000,
 				selectedKeys: named,
-				liveProcessCwds: new Set(["/repo/elsewhere/merged-a/src"]),
+				liveProcessCwds: comparableSet("/repo/elsewhere/merged-a/src"),
 			});
 			expect(result.remove).toHaveLength(1);
 			const unknown = planMergedWorktreeRemovals({
@@ -1225,6 +1231,27 @@ function createSubagentStopFixture(agentId: string) {
 	}
 
 	/**
+	 * Make the process-listing seam return its real failure shape without
+	 * relying on how quickly a Windows PowerShell spawn fails. The old
+	 * `SystemRoot` setup could let a fast runner complete the listing inside
+	 * the 400ms ceiling, so the `listing-failed` record was never produced
+	 * (#4019).
+	 */
+	function patchProcessScanFailure() {
+		fs.renameSync(processScanPath, realProcessScanPath);
+		fs.writeFileSync(
+			processScanPath,
+			[
+				'export * from "./process-scan-real.mjs";',
+				"export function snapshotProcesses() {",
+				"\treturn Promise.resolve({ rows: [], ok: false });",
+				"}",
+				"",
+			].join("\n"),
+		);
+	}
+
+	/**
 	 * #2519: the same module-substitution hook as `patchProcessScan`, but
 	 * DETERMINISTIC rather than wall-clock-timed. `snapshotProcesses` is
 	 * only ever called from `readProcessTable`, itself only reached AFTER
@@ -1405,6 +1432,7 @@ function createSubagentStopFixture(agentId: string) {
 		cli,
 		git,
 		patchProcessScan,
+		patchProcessScanFailure,
 		patchRecheck,
 		patchProcessScanAppendRows,
 		addNodeModulesJunction,
@@ -1422,6 +1450,7 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 	let ledgerDir = "";
 	let worktree = "";
 	let cli = "";
+	let patchProcessScanFailure: () => void;
 	// #2519 round 2, S4: exposed by the builder rather than redeclared here
 	// -- the exact describe-private duplicate of the builder's own `git`
 	// this finding flagged.
@@ -1429,7 +1458,8 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 
 	beforeEach(() => {
 		fixture = createSubagentStopFixture(AGENT_ID);
-		({ root, repo, ledgerDir, worktree, cli, git } = fixture);
+		({ root, repo, ledgerDir, worktree, cli, git, patchProcessScanFailure } =
+			fixture);
 	});
 
 	afterEach(() => {
@@ -1848,7 +1878,14 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 	// F5 (orchestrator decision): the live-cwd rail protects OTHER trees. The
 	// stopped agent's own tree is reaped WITH its leftover process, as before
 	// #3694 -- a hook that refuses to reap its own agent is the #2486 regression.
-	it(
+	//
+	// Linux only: the leftover is a `node -e` whose command line never names the
+	// tree, so only a procfs cwd read can find it (`enrichCwd`, "absent on
+	// Windows and macOS, where command-line matching is the sole signal"). On
+	// Windows the process is unreachable by design, `git worktree remove` hits
+	// its held cwd and the tree stays: that is the documented platform limit,
+	// not a regression (#4019).
+	linuxOnly(
 		"still reaps the stopped agent's own tree, and its leftover process, on SubagentStop (#3694 F5)",
 		{ timeout: 90_000 },
 		async () => {
@@ -1875,15 +1912,17 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 		"reaps under the registered argv when the listing itself fails (#2486's own reason)",
 		{ timeout: 90_000 },
 		() => {
-			// The exact reason string from the reported hygiene.log, driven by
-			// a ceiling the REAL listing cannot meet: measured on this box the
-			// Windows listing costs ~524ms at its floor (~208ms powershell
-			// startup + ~316ms projected WQL query) and 584-707ms in practice,
-			// so a 400ms ceiling times the spawn out and `ok` comes back
-			// false. Windows-only because POSIX `ps` answers in ~15ms — the
-			// portable case above drives the same degraded state through the
-			// `skipped` branch instead (both yield listingOk=false and an
-			// empty table; only the reason string differs).
+			// The exact reason string from the reported hygiene.log. The listing
+			// failure is forced through the fixture's copy of the real process-scan
+			// seam, rather than by relying on how quickly a missing PowerShell
+			// executable reports its spawn error. The old setup raced a fast listing
+			// and never produced the record (#4019). `--scan-timeout-ms 400` stays
+			// because it is the ceiling the record reports. The forced seam makes the
+			// case platform-neutral; it stays Windows-gated only for its win32 lane
+			// membership (tests/config/win32-gate-lane.test.ts). The portable case above drives the
+			// same degraded state through the `skipped` branch instead (both yield
+			// listingOk=false and an empty table; only the reason string differs).
+			patchProcessScanFailure();
 			runCli(
 				[...registeredArgv(), "--scan-timeout-ms", "400"],
 				subagentStopPayload(AGENT_ID),

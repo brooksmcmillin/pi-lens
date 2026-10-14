@@ -2,10 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import {
-	buildWeights,
-	testFileId,
-} from "../../scripts/gen-test-shard-weights.mjs";
+import { buildWeights } from "../../scripts/gen-test-shard-weights.mjs";
 
 // #3771: the weights snapshot is regenerated from CI's per-shard vitest JSON.
 // Recurrence: a regeneration that keys on the CI checkout's absolute prefix
@@ -37,13 +34,20 @@ function report(dir: string, name: string, entries: Array<[string, number]>) {
 
 describe("#3771 test shard weights generator", () => {
 	it("keys files repo-relative whatever the checkout prefix", () => {
-		expect(
-			testFileId("/home/runner/work/pi-lens/pi-lens/tests/a/b.test.ts"),
-		).toBe("tests/a/b.test.ts");
-		expect(testFileId("C:\\work\\pi-lens\\tests\\a\\b.test.ts")).toBe(
-			"tests/a/b.test.ts",
-		);
-		expect(testFileId("/elsewhere/not-a-test.ts")).toBeNull();
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-shard-gen-"));
+		try {
+			report(dir, "r1/vitest-results.json", [
+				["/home/runner/work/pi-lens/pi-lens/tests/a/b.test.ts", 1],
+				["C:\\work\\pi-lens\\tests\\c.test.ts", 2],
+				["/elsewhere/not-a-test.ts", 3],
+			]);
+			expect(buildWeights([path.join(dir, "r1")])).toEqual({
+				"tests/a/b.test.ts": 1,
+				"tests/c.test.ts": 2,
+			});
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
 	it("takes the per-run median, merges shards of one run and sorts the keys", () => {

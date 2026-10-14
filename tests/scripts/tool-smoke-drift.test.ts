@@ -331,7 +331,7 @@ describe("buildToolSmokeDriftComment (#2723)", () => {
 	});
 });
 
-// #2723 review F3: a job failure BEFORE the five tracked layers even start
+// #2723 review F3: a job failure BEFORE the six tracked layers even start
 // (checkout, a best-effort setup action, npm install, build:dist) leaves
 // Tool/LSP handshake/Format layer all "skipped" — the EXACT SAME shape a
 // genuine GitHub Actions cancellation produces (install-smoke-drift.mjs's

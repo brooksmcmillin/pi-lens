@@ -9,6 +9,8 @@
 // real child. `createServiceDriver` is the production driver over an
 // `LSPService`; tests run it over the real service class with fake clients.
 
+import { isAuxiliary } from "../../dist/clients/lsp/server-traits.js";
+
 /** Fixture extension/basename match, the same rule `selectionReason` applies. */
 function fixtureMatchesExtension(server, fixture) {
 	const file = String(fixture.file ?? "");
@@ -91,7 +93,7 @@ export async function measureRegistry({
 		if (now() - startedAt > budgetMs) {
 			rows.push({
 				serverId: server.id,
-				role: server.role === "auxiliary" ? "auxiliary" : "primary",
+				role: isAuxiliary(server) ? "auxiliary" : "primary",
 				declared: server.idleEviction,
 				fixture: null,
 				result: "unavailable",
@@ -171,7 +173,7 @@ const unavailable = (base, reason) => ({
  * @property {() => Promise<void>} dispose
  */
 export async function probeServer({ server, fixture, createDriver, budgets }) {
-	const role = server.role === "auxiliary" ? "auxiliary" : "primary";
+	const role = isAuxiliary(server) ? "auxiliary" : "primary";
 	const base = {
 		serverId: server.id,
 		role,
@@ -189,7 +191,7 @@ export async function probeServer({ server, fixture, createDriver, budgets }) {
 		// Baseline: a scanner's first scan may overrun and only cache its result,
 		// so an empty answer is re-asked a bounded number of times.
 		const auxRe =
-			role === "auxiliary" && fixture.auxiliarySourceMatch
+			isAuxiliary(server) && fixture.auxiliarySourceMatch
 				? new RegExp(fixture.auxiliarySourceMatch, "i")
 				: null;
 		const attributed = (findings) =>
@@ -219,7 +221,7 @@ export async function probeServer({ server, fixture, createDriver, budgets }) {
 		}
 		if (!touched || !driver.isTargetAlive())
 			return unavailable(base, "server-not-started");
-		if (!baseline || baseline.length === 0) {
+		if (!baseline || (baseline.length === 0 && !fixture.allowEmptyBaseline)) {
 			return {
 				...base,
 				result: "inconclusive",
@@ -354,8 +356,8 @@ export function createServiceDriver(args) {
 	// The registry, not the fixture, says whether this is a scanner (`role`;
 	// opengrep, ast-grep, zizmor and typos today). Only the target is attached,
 	// so another scanner's spawn and eviction never enter the row.
-	const isAuxiliary = server.role === "auxiliary";
-	const auxIds = isAuxiliary ? [server.id] : [];
+	const auxiliary = isAuxiliary(server);
+	const auxIds = auxiliary ? [server.id] : [];
 	const touchOptions = {
 		diagnostics: "document",
 		collectDiagnostics: true,
@@ -375,7 +377,7 @@ export function createServiceDriver(args) {
 	// One ordinary request for the target's client: the spawned entry when it is
 	// warm, and the use that (re)schedules its idle timer.
 	const acquire = async () =>
-		isAuxiliary
+		auxiliary
 			? (
 					await lsp.getAuxiliaryClientsForFile(
 						target.absFile,
@@ -405,18 +407,28 @@ export function createServiceDriver(args) {
 		},
 		async armEviction() {
 			const policy = server.idleEviction;
-			const hadWindow = Object.hasOwn(env, "PI_LENS_LSP_IDLE_EVICT_MS");
-			const priorWindow = env.PI_LENS_LSP_IDLE_EVICT_MS;
+			const hadGenericWindow = Object.hasOwn(env, "PI_LENS_LSP_IDLE_EVICT_MS");
+			const priorGenericWindow = env.PI_LENS_LSP_IDLE_EVICT_MS;
+			const hadEphemeralWindow = Object.hasOwn(
+				env,
+				"PI_LENS_EPHEMERAL_LSP_IDLE_EVICT_MS",
+			);
+			const priorEphemeralWindow = env.PI_LENS_EPHEMERAL_LSP_IDLE_EVICT_MS;
 			let restored = false;
 			const restore = () => {
 				if (restored) return;
 				restored = true;
 				server.idleEviction = policy;
-				if (hadWindow) env.PI_LENS_LSP_IDLE_EVICT_MS = priorWindow;
+				if (hadGenericWindow)
+					env.PI_LENS_LSP_IDLE_EVICT_MS = priorGenericWindow;
 				else delete env.PI_LENS_LSP_IDLE_EVICT_MS;
+				if (hadEphemeralWindow)
+					env.PI_LENS_EPHEMERAL_LSP_IDLE_EVICT_MS = priorEphemeralWindow;
+				else delete env.PI_LENS_EPHEMERAL_LSP_IDLE_EVICT_MS;
 			};
 			server.idleEviction = "transparent";
 			env.PI_LENS_LSP_IDLE_EVICT_MS = String(args.windowMs);
+			env.PI_LENS_EPHEMERAL_LSP_IDLE_EVICT_MS = String(args.windowMs);
 			try {
 				const client = (await acquire())?.client;
 				if (client && typeof client.shutdown === "function") {

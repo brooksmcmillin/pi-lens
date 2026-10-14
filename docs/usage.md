@@ -200,4 +200,7 @@ turn-end is skipped, not faked: one line on stderr and nothing on stdout.
 - Check `~/.pi-lens/sessionstart.log`, `~/.pi-lens/latency.log`, and
   `~/.pi-lens/cascade.log` for lifecycle/performance/debug traces.
 - For live tool validation, use `node scripts/smoke-tools.mjs` with the relevant
-  `--lsp`, `--format`, or `--autofix` layer.
+  `--lsp`, `--format`, or `--autofix` layer. `--resolution` checks, without
+  installing or spawning anything, that the resolvers find project-local tools in
+  `.venv/bin`, `vendor/bin` and `node_modules/.bin` (it runs nightly in
+  tool-smoke).

@@ -92,11 +92,9 @@ const CONVERSATION_MODULE_STATE: Readonly<Record<string, readonly string[]>> = {
 	"index.ts": [
 		"_bridgeGetFlag",
 		"_lspConfigInitializedCwds",
-		"_mutationBridgeRegistered",
 		"_nextTestRunnerDeliveryOwnerId",
-		"_readBridgeRegistered",
 		"_testRunnerDeliveryRegistered",
-		"_turnSummaryEmitCtx",
+		"_turnSummaryEmitCtxGetter",
 		"_turnSummaryEmitRegistered",
 		"cacheManager",
 		"lastLoggedLoopWorstMs",
@@ -121,19 +119,21 @@ const ACTIVATION_STATE: Readonly<Record<string, string>> = {
 		"the /lens-context-toggle choice; D6 was not approved, so it resets per activation (N6 accepted)",
 	enabledLazyTools:
 		"the lazy tools the config enables, derived once per activation (design B6)",
-	lastSessionStartIdentity:
-		"the #2890 duplicate-start gate, which must be per activation",
 	lensEnabled:
 		"the /lens-toggle choice; D6 was not approved, so it resets per activation (N6 accepted)",
 	lensWidgetVisible:
 		"the /lens-widget-toggle choice; D6 was not approved, so it resets per activation (N6 accepted)",
 	mountedLensWidgetUi: "the UI this activation mounted its widget on",
 	ownEventCtx: "the live ctx of this activation's own events",
+	ownedSecondaryRoot:
+		"the root this declined activation asked to hold under its own holder id, released by its own shutdown (#3849)",
 	ownedSessionRole: "this activation's primary or secondary role (#1996)",
 	renderInvalidator: "this activation's widget repaint callback",
 	scope: "this activation's session scope (#3611)",
 	startInFlight:
 		"this activation's primary session_start until it returns, so a shutdown that lands before the start adopted hands on the slot left for it (#3881)",
+	turnStartScope:
+		"the session scope captured at turn_start so a sibling session cannot change the identity used by this turn's delayed delivery (#3613)",
 	widgetMountFailureLogged: "a once-per-activation log latch for the mount",
 };
 
@@ -152,12 +152,17 @@ const COORDINATOR_FIELDS: Readonly<Record<string, "reset" | string>> = {
 	_complexityBaselines: "reset",
 	_coordinatorId:
 		"kept: the construction scope's ticket names this coordinator on every session_scope_transition row (#3611)",
+	_cutAdvisoryItems: "reset",
 	_droppedMutationReceipts: "reset",
 	_errorDebtBaseline:
 		"kept: a project baseline (design A14), re-derived by its own producer",
 	_fileLastProjectSeq: "reset",
 	_fileSeq: "reset",
 	_fixedThisTurn: "reset",
+	_foreignTurnKeys:
+		"kept: a live concurrent session's turn key outlives the primary's replacement; its own shutdown removes it (forgetTurnSession, #3613)",
+	_foreignTurns:
+		"kept: a count that only orders concurrent sessions' turn keys, which stay distinct across a reset (#3613)",
 	_gitGuardCacheUnknownReason: "reset",
 	_gitGuardHasBlockers: "reset",
 	_gitGuardSummary: "reset",
@@ -194,6 +199,7 @@ const COORDINATOR_FIELDS: Readonly<Record<string, "reset" | string>> = {
 	_turnEndCascadeSettleStarts: "reset",
 	_turnIndex: "reset",
 	_turnStartProjectSeq: "reset",
+	_turnStarts: "reset",
 	_turnSummary: "reset",
 	_viewLogEntries: "reset",
 	_viewMissingThrough: "reset",
@@ -320,7 +326,7 @@ describe("session-scope ratchet (#3609 S8)", () => {
 			scanned += live.length;
 			problems.push(...diffNames(file, live, [...pinned].sort()));
 		}
-		assertNonEmptyScan("conversation module state", scanned, 36);
+		assertNonEmptyScan("conversation module state", scanned, 34);
 		expect(problems).toEqual([]);
 	});
 
@@ -420,7 +426,7 @@ describe("session stores (#3609 §3.8, #3612)", () => {
 
 	/**
 	 * The recurrence: an async snapshot. The hand-off snapshots every store in
-	 * `session_shutdown`, which may not await (#2523); a promise there would
+	 * the synchronous portion of `session_shutdown`, which does not await; a promise there would
 	 * reach the successor as an empty payload.
 	 */
 	it("snapshots every store synchronously, as JSON (item 2.6)", () => {

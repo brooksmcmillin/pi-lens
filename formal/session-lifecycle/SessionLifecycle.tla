@@ -31,9 +31,10 @@
 (*   LSP idle reset: pi-lens' own timer; resets the LSP service only.      *)
 (*   subagent start/stop: an in-process subagent binds its own session     *)
 (*       while the primary is live (I6).                                   *)
-(*   subagent /reload, /fork: its own replacement. A start in the          *)
-(*       primary's replacement gap with a reason other than "startup" is   *)
-(*       classified primary (#3668 row 17, a stated residual).             *)
+(*   subagent /reload, /fork, /new: its own replacement, a shutdown and a  *)
+(*       later start (SecDown, SecUp). In the primary's replacement gap a  *)
+(*       start with a reason other than "startup" was classified primary   *)
+(*       (#3668 row 17); #3855 r2 admits only the named successor.         *)
 (*                                                                         *)
 (* Writers begin in a live scope and land at ANY later step. pi refuses    *)
 (* /tree and /reload while streaming, but agent_settled handlers run after *)
@@ -90,6 +91,75 @@
 (*                       stores its own start's reason adopts; without it, *)
 (*                       every store, so the successor's /reload policy    *)
 (*                       carries a /fork start's advisory (AD fork: none)  *)
+(*   "inheritRole"       #3855 r1: a secondary's replacement shutdown      *)
+(*                       leaves a note keyed by its successor's hand-off   *)
+(*                       key; the start that finds its note stays          *)
+(*                       secondary, and so does a primary successor whose  *)
+(*                       key a note holds. An in-memory /new leaves none   *)
+(*                       (R1); a note can be evicted, or go stale          *)
+(*   "namedSuccessor"    #3855 r2: a primary replacement shutdown names    *)
+(*                       its successor by (reason, key); in the gap only   *)
+(*                       that start is primary, and the real successor     *)
+(*                       (Begin) is declined if its own key differs.       *)
+(*                       Without either, any non-startup gap start is      *)
+(*                       primary (#3668 row 17)                            *)
+(*   "rolelessKey"       #4106: a shutdown whose start never ran, in a     *)
+(*                       named gap, is the primary's only when its own     *)
+(*                       manager's key is the named one (SecRoleless)      *)
+(*   "forwardUnstarted"  #4113: a shutdown that lands before pi-lens's     *)
+(*                       start handler ran (W0: no mark, no scope) forwards *)
+(*                       the slot left for the start its gap names, as     *)
+(*                       forwardUnadopted does; without it nothing is      *)
+(*                       written and the slot keeps the start's reason     *)
+(*   "nameAtShutdown"    #3855 r5 (merged): the naming site binds a fresh  *)
+(*                       ticket to a file-less reload/fork session's       *)
+(*                       manager that carries none, in every window        *)
+(*   "markerTtl"         #3668 (F1 of #3803): the successor-pending marker *)
+(*                       expires. MarkerExpire (a nondeterministic step,   *)
+(*                       no clock) says SUCCESSOR_PENDING_TTL_MS elapsed;  *)
+(*                       with this part every start that reaches an        *)
+(*                       expired gap classifies primary, as the code does  *)
+(*                       (successorStillPending). Without it the marker    *)
+(*                       never expires, a rejected design alternative      *)
+(*   "perEvalSvc"        #3755 (F1): the LSP service generation is a       *)
+(*                       counter of each entry-module evaluation, so a     *)
+(*                       /reload that re-evaluates restarts it at 0        *)
+(*                       (MutGenPerEval); merged is one process counter    *)
+(*   "bindInterrupted"   #3855 r4: a forward binds the interrupted scope's *)
+(*                       ticket when its manager carries none (an in-memory*)
+(*                       /new or startup), so no reload gap is named by no *)
+(*                       key                                               *)
+(*   "keylessFailSafe"   #3855 r2's J6, a rejected alternative: a key-less *)
+(*                       gap start with the named reason passes for a      *)
+(*                       ticket name                                       *)
+(*                                                                         *)
+(* Lane M4 (#3803) adds the coordinator's other session-scoped stores and  *)
+(* their writers (section "M4"), each part a merged fix or a rejected      *)
+(* alternative:                                                            *)
+(*   "bridgeStamp", "bridgeRanges", "bridgeDefer"  the bridge producer's   *)
+(*                       three hops: the read-guard stamp, the turn-state  *)
+(*                       range, the deferral                               *)
+(*   "bridgeEpoch"       a bridge producer sends the read-guard branch     *)
+(*                       epoch it captured (#3521's settled sweep)         *)
+(*   "bridgeLineage"     S3 (#3759): it also sends the lineage handle it   *)
+(*                       captured, and the bridge drops a retired scope's  *)
+(*                       stamp, turn state and deferral; without it the    *)
+(*                       entry fails open (I4, #3763)                      *)
+(*   "deferAboveIgnore"  #3763 item 5: a captured epoch above the live one *)
+(*                       is ignored (the deferral takes the current one)   *)
+(*   "deferAboveSkip"    #3705 round 3: it queues nothing instead          *)
+(*   "deferResetClear"   resetForSession clears the deferral queue         *)
+(*   "debounceEntryCapture" S3 row 16: the debounce re-entry keeps the     *)
+(*                       session its handler entered in                    *)
+(*   "stateWBranchFence" a rejected alternative: the S3 non-read-guard     *)
+(*                       writers fenced at branch level                    *)
+(*   "parkSessionKey"    #4112 r2: a parked lane is keyed by the turn's    *)
+(*                       session id                                        *)
+(*   "parkResetClear"    resetForSession clears the park map               *)
+(*   "parkFence"         the park settles only while the coordinator's     *)
+(*                       scope is the one the turn captured at entry       *)
+(*   "turnEndScoped"     #3613 R2: a shipped shape in which turn_end drains *)
+(*                       only its own scope's work                         *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
@@ -98,10 +168,13 @@ CONSTANTS
                     \*   {"New","Resume","Fork","Clone","CancelFork","Reload",
                     \*    "Quit","PiFork","Tree","IdleReset","SecStart",
                     \*    "SecEnd","SecTurn","SecReload","SecFork","Dup",
-                    \*    "Interrupt"}
+                    \*    "Interrupt","InterruptPreScope","InterruptUnstarted",
+                    \*    "DeferOwn","DrainDefer","TurnWork","TurnEnd",
+                    \*    "SecTurnEnd","ParkTake"}
     Writers,        \* the writers in play, a subset of
                     \*   {"read","secRead","heartbeat","lsp","widget",
-                    \*    "advisory","activate"}
+                    \*    "advisory","activate","stateW","debounce",
+                    \*    "bridge","park"}
     FixParts,       \* see the header
     FileLess,       \* the conversations whose sessions have no session file
                     \*   (pi --no-session, an in-memory subagent): their slot
@@ -111,6 +184,8 @@ CONSTANTS
     LateHandlers,   \* TRUE: a read-guard writer may hold any entry of its
                     \*   branch, so its handler outlived a later entry;
                     \*   FALSE: it holds the branch's newest entry
+    ForwardExpiredUnstarted, \* TRUE: fixed forwarding for an expired W0 gap;
+                              \* FALSE: pre-fix behavior for the witness
     Policy(_, _),   \* [store, reason] -> action
     Fence(_),       \* store -> "branch" | "session" | "service" | "none"
     SecPolicy(_)    \* store -> "own" | "shared"
@@ -180,10 +255,16 @@ LegacyFence(s) == IF s = "RG" THEN "session" ELSE TargetFence(s)
 TargetSec(s) ==
     CASE s \in {"RG", "TC", "LZ"} -> "own" [] OTHER -> "shared"
 
-\* Merged master: S2 gave the lazy-tool memory a cell per scope (#3653); a
-\* subagent's handlers still reach the module-level runtime, so its read
-\* guard and turn counter are the primary's (#3607, N2, #3613 open).
-MergedSec(s) == IF s = "LZ" THEN "own" ELSE "shared"
+\* Merged master: S2 gave the lazy-tool memory a cell per scope (#3653), and
+\* #3613 the turn state: `beginTurn` takes the turn's session id and the
+\* per-turn records are partitioned by it (`clients/runtime-coordinator.ts`).
+\* A subagent's handlers still reach the module-level runtime's read guard
+\* (#3607, F4, the rest of #3613).
+MergedSec(s) == IF s \in {"LZ", "TC"} THEN "own" ELSE "shared"
+
+\* Merged master before #3613: the turn counter and per-turn maps were the
+\* module-level runtime's too (N2).
+PreS4TurnSec(s) == IF s = "LZ" THEN "own" ELSE "shared"
 
 \* Before S2, the subagent shared everything.
 LegacySec(s) == "shared"
@@ -192,12 +273,15 @@ LegacySec(s) == "shared"
 (* The world.                                                              *)
 
 Tickets == 1..(MaxSteps + 2)
-Files   == {"A", "N", "F", "C", "P", "S", "T"}  \* initial, /new, /fork,
-                                                \* /clone, pi --fork, the
-                                                \* subagent's, its fork
+Files   == {"A", "N", "F", "C", "P", "S", "T", "U"}
+                                \* initial, /new, /fork, /clone, pi --fork,
+                                \* the subagent's, its fork, its /new
 Entries == 1..4
 Facts   == [e : Entries, o : Tickets]
-FlightIds == Writers \ {"widget", "activate"}
+\* The M4 writers keep their own slots (`mw`), so the generic flight writers
+\* below stay as they were.
+M4Writers == {"stateW", "debounce", "bridge", "park"}
+FlightIds == Writers \ ({"widget", "activate"} \cup M4Writers)
 
 InitBranch(f) ==
     CASE f = "A" -> {1, 2} [] f = "N" -> {3} [] f = "S" -> {4} [] OTHER -> {}
@@ -215,10 +299,28 @@ SR(k) == IF k = "clone" THEN "fork" ELSE k
 \* The start reasons whose source list begins with the slot (SOURCES).
 SlotReasons == {"fork", "reload"}
 
-NoSlot == [has |-> FALSE, from |-> 0, reason |-> "-", file |-> "-",
+\* `from` is the scope that wrote the slot (HandoffOnce); `tk` is the ticket
+\* a file-less slot is keyed by (#3819), which a forward keeps (#3881).
+NoSlot == [has |-> FALSE, from |-> 0, tk |-> 0, reason |-> "-", file |-> "-",
            facts |-> {}, act |-> {}, adv |-> {}]
-NoPend == [k |-> "none", from |-> 0, file |-> "-", target |-> "-"]
+\* A hand-off key (startKey): a session file, or, file-less, the ticket bound
+\* to the session manager; NoKey when pi links nothing.
+NoKey  == [f |-> "-", t |-> 0]
+\* `exp` is the marker's clock (#3668, F1 of #3803): TRUE once its TTL ran out.
+\* It is a field of the marker, so a replacement's new marker starts at FALSE.
+NoPend == [k |-> "none", from |-> 0, file |-> "-", target |-> "-", key |-> NoKey,
+           exp |-> FALSE]
+NoSpend == [k |-> "none", from |-> 0, file |-> "-", key |-> NoKey]
+
+\* #3855 r2 (successorStartKey): the key a primary shutdown of scope p names
+\* for its successor on file succ. pi names the file of a file-backed
+\* successor, and hands a /reload or in-memory /fork successor the same
+\* manager, so p's ticket; an in-memory /new is linked to nothing.
+NamedKey(k, p, succ) ==
+    IF succ \notin FileLess THEN [f |-> succ, t |-> 0]
+    ELSE IF SR(k) \in SlotReasons THEN [f |-> "-", t |-> p] ELSE NoKey
 IdleW  == [pc |-> "idle", s |-> 0, ep |-> 0, e |-> 0, svc |-> 0]
+IdleM  == [pc |-> "idle", s |-> 0, hs |-> 0, ep |-> 0, k |-> "-"]
 
 RegOn   == "heartbeat" \in Writers
 LspOn   == "lsp" \in Writers
@@ -259,17 +361,51 @@ VARIABLES
     act, acts,               \* scope -> activations it holds; every activation
     adv, advOut, advDrop,    \* queued advisories [o, tag, late]; delivered
                              \* [o, to]; dropped with a record [o, why, late]
-    steps, used
+    steps, used,
+    notes,                   \* #3855 r1: secondary-successor notes (keys)
+    spend,                   \* a subagent replacement between its shutdown and start
+    subBorn,                 \* ghost: scopes of the subagent's chain
+    userDeclined,            \* ghost: a user scope's own replacement start was
+                             \* declined while no scope held the primary slot
+    fwd,                     \* scopes whose start a /reload interrupted (#3881):
+                             \* their shutdown forwarded, it stashed nothing
+    preScope,                \* of those, the ones interrupted before the start
+                             \* held its scope (verify r4 V6: W0-W2)
+    mw,                      \* M4: in-flight stateW/debounce/bridge/park writers
+    co,                      \* M4: generation -> the coordinator's work records
+                             \*   [k: store, o: producing scope]
+    dq,                      \* M4: generation -> the deferral queue's pairs
+                             \*   [o: producing scope, e: branch epoch]
+    pk,                      \* M4: generation -> the park map's entries
+                             \*   [o: parking scope, k: session key]
+    consumed,                \* M4: ghost, work a turn_end drained [k, o, by]
+    pkOut                    \* M4: ghost, parked items taken [o, to]
 
 vars == <<st, role, sess, ep, why, primary, last, nxt, pend, forking, branch,
           cell, imp, lin, slot, taken, side, sideAct, wr, entry, intent, reg,
           svc, fleet, turn, begun, turns, procTurn, evalTurn, wgTok, wgDone,
           lastTok, prevMax, ownDrop, recorded, resets, dupDone, landed, reads,
-          predOf, act, acts, adv, advOut, advDrop, steps, used>>
+          predOf, act, acts, adv, advOut, advDrop, steps, used, notes, spend,
+          subBorn, userDeclined, fwd, preScope, mw, co, dq, pk, consumed, pkOut>>
 
 \* Groups for UNCHANGED.
 lzV  == <<act, acts>>
 adV  == <<adv, advOut, advDrop>>
+r2V  == <<notes, spend, subBorn, userDeclined, fwd, preScope>>
+m4V  == <<mw, co, dq, pk, consumed, pkOut>>
+\* Every pre-M4 variable but the five a read-guard-shaped write moves, for the
+\* M4 actions below.
+uScope == <<st, role, sess, ep, why, primary, last, nxt, pend, forking, predOf,
+            resets, dupDone>>
+uFiles == <<branch, imp, lin, slot, taken, side, sideAct>>
+uMisc  == <<wr, entry, intent, reg, svc, fleet>>
+uTurn  == <<turn, begun, turns, procTurn, evalTurn, wgTok, wgDone, lastTok,
+            prevMax>>
+uLz    == <<act, acts, adv, advOut, advDrop>>
+uOld   == <<uScope, uFiles, uMisc, uTurn, uLz, steps, used, r2V>>
+
+\* The successor born from scope p is of the subagent's chain when p is.
+Born(t, p) == IF p \in subBorn THEN subBorn \cup {t} ELSE subBorn
 
 Init ==
     /\ st = [t \in Tickets |-> IF t = 1 THEN "live" ELSE "free"]
@@ -302,6 +438,12 @@ Init ==
     /\ act = [t \in Tickets |-> {}] /\ acts = {}
     /\ adv = {} /\ advOut = {} /\ advDrop = {}
     /\ steps = 0 /\ used = {}
+    /\ notes = {} /\ spend = NoSpend /\ subBorn = {} /\ userDeclined = FALSE
+    /\ fwd = {} /\ preScope = {}
+    /\ mw = [x \in M4Writers |-> IdleM]
+    /\ co = [t \in Tickets |-> {}] /\ dq = [t \in Tickets |-> {}]
+    /\ pk = [t \in Tickets |-> {}]
+    /\ consumed = {} /\ pkOut = {}
 
 -----------------------------------------------------------------------------
 (* Helpers.                                                                *)
@@ -312,6 +454,21 @@ CellOf(t) == IF role[t] = "secondary" /\ SecPolicy("RG") = "shared"
              THEN last ELSE t
 ActCell(t) == IF role[t] = "secondary" /\ SecPolicy("LZ") = "shared"
               THEN last ELSE t
+\* The scope whose turn counter and per-turn maps a turn of scope t should
+\* move: its own, or, when the turn state is shared, the module-level
+\* runtime's.
+TurnCellOf(t) == IF role[t] = "secondary" /\ SecPolicy("TC") = "shared"
+                 THEN last ELSE t
+\* #3613 F1: the coordinator holds the stable id of the session it serves.
+\* The start pins it; `startThrows` is a start whose handler throws after its
+\* reset, which skips a pin placed after the start's await, so the
+\* coordinator keeps the reset's random id. `pinAtReset` pins it before the
+\* await (merged).
+Pinned == ~Has("startThrows") \/ Has("pinAtReset")
+\* The code's rule (`turnSession`, `beginTurn`): a turn is the coordinator's
+\* own when its session's id equals the id the coordinator holds. Selected by
+\* id, not by role, like the code.
+OwnTurn(t) == Pinned /\ sess[t] = sess[last]
 
 Ents(S) == {x.e : x \in S}
 
@@ -341,9 +498,21 @@ SameMgr(s) ==
 \* scope s's session manager. A primary shutdown that stashes (Retire with a
 \* slot reason) binds its ticket; a secondary's shutdown stashes nothing, so
 \* it binds nothing.
+\* The manager of interrupted scope s, carrying no ticket, gets one: r5 at
+\* the naming site (always); r4 in the forward, only once the start held its
+\* scope.
+Bound(s) == Has("nameAtShutdown")
+            \/ (Has("bindInterrupted") /\ s \notin preScope)
+
+\* A forwarded scope (#3881) stashed nothing: its manager carries the ticket
+\* its own start's manager carried, its predecessor's when that start kept
+\* the manager, else, under "bindInterrupted" (#3855 r4), its own.
 RECURSIVE Carrier(_)
 Carrier(s) ==
     IF s = 0 THEN 0
+    ELSE IF s \in fwd
+         THEN LET c == IF SameMgr(s) THEN Carrier(predOf[s]) ELSE 0
+              IN IF c = 0 /\ Bound(s) THEN s ELSE c
     ELSE IF role[s] = "primary" /\ Has("handoffAtShutdown")
             /\ why[s] \in {"reload", "fork", "clone"} THEN s
     ELSE IF SameMgr(s) THEN Carrier(predOf[s])
@@ -355,11 +524,11 @@ Via(k, s) == IF k \in {"reload", "fork", "clone"} THEN Carrier(s) ELSE 0
 
 \* takeHandoff (clients/session-scope.ts): the slot's key equals the start's
 \* (start reason, session file). A file-less session's file is undefined;
-\* under "ticketKey" its key is the ticket that left the slot (slot.from),
+\* under "ticketKey" its key is the ticket that left the slot (slot.tk),
 \* and the start's is c, the ticket bound to its manager (Via).
 SlotMatch(r, f, c) ==
     /\ slot.has /\ slot.reason = r /\ slot.file = Key(f)
-    /\ (Has("ticketKey") /\ f \in FileLess) => slot.from = c
+    /\ (Has("ticketKey") /\ f \in FileLess) => slot.tk = c
 
 \* The queue after a prune: under #3757, a retired scope's advisories go
 \* (pruneRetiredAdvisories), each with a counted record.
@@ -390,7 +559,7 @@ BeforeFork(k) ==
     /\ HostOk
     /\ forking' = k
     /\ slot' = IF Has("handoffAtShutdown") THEN slot
-               ELSE [has |-> TRUE, from |-> primary, reason |-> "fork",
+               ELSE [has |-> TRUE, from |-> primary, tk |-> primary, reason |-> "fork",
                      file |-> Key(IF k = "fork" THEN "F" ELSE "C"),
                      facts |-> cell[primary], act |-> act[primary],
                      adv |-> {a.o : a \in {b \in adv : b.tag = primary}}]
@@ -432,19 +601,18 @@ RetireOk(k) ==
 \* with pi's reason, the root is deregistered, the LSP service reset, and the
 \* primary registration released (#3662: every reason but quit leaves the
 \* successor pending). `quit` ends the process: in-flight work dies.
-Retire(k) ==
-    /\ RetireOk(k)
+RetireTo(k, tgt, tag) ==
     /\ LET p == primary
            quit == k = "quit"
            stash == Has("handoffAtShutdown") /\ SR(k) \in SlotReasons
-           succ == IF k = "reload" THEN sess[p] ELSE TargetOf(k)
+           succ == IF k = "reload" THEN sess[p] ELSE tgt
            ends(t) == t = p \/ (quit /\ st[t] = "live")
        IN
        /\ st' = [t \in Tickets |-> IF ends(t) THEN "retired" ELSE st[t]]
        /\ why' = [t \in Tickets |-> IF ends(t) THEN k ELSE why[t]]
        /\ primary' = 0
        /\ slot' = IF stash
-                  THEN [has |-> TRUE, from |-> p, reason |-> SR(k),
+                  THEN [has |-> TRUE, from |-> p, tk |-> p, reason |-> SR(k),
                         file |-> Key(succ), facts |-> cell[p],
                         act |-> act[p],
                         adv |-> {a.o : a \in {b \in adv : b.tag = p}}]
@@ -460,16 +628,28 @@ Retire(k) ==
                         IF wr[x].pc = "flight" THEN [wr[x] EXCEPT !.pc = "dead"]
                         ELSE wr[x]]
                 ELSE wr
-       /\ pend' = [k |-> k, from |-> p, file |-> sess[p], target |-> TargetOf(k)]
+       /\ pend' = [k |-> k, from |-> p, file |-> sess[p], target |-> tgt,
+                    key |-> NamedKey(k, p, succ), exp |-> FALSE]
        /\ forking' = "no"
        /\ steps' = steps + 1
-       /\ used' = used \cup {k}
+       /\ used' = used \cup {tag}
     /\ UNCHANGED <<role, sess, ep, last, nxt, branch, cell, imp, lin, taken,
                    intent, reg, turn, begun, turns, procTurn, evalTurn, wgTok,
                    wgDone, lastTok, prevMax, ownDrop, recorded, resets, dupDone,
                    landed, reads, predOf, lzV, adV>>
 
-NewFile(k) == IF k = "reload" THEN pend.file ELSE TargetOf(k)
+Retire(k) == RetireOk(k) /\ RetireTo(k, TargetOf(k), k)
+
+\* #3855 F3 (review probe PR7): the primary resumes the subagent's session
+\* file once no live scope serves it.
+RetireSub ==
+    /\ "ResumeSub" \in Transitions /\ "resumeSub" \notin used
+    /\ pend.k = "none" /\ primary # 0 /\ steps < MaxSteps /\ forking = "no"
+    /\ lin["S"] # {} /\ sess[primary] # "S"
+    /\ \A t \in Tickets : ~(st[t] = "live" /\ sess[t] = "S")
+    /\ RetireTo("resume", "S", "resumeSub")
+
+NewFile(k) == IF k = "reload" THEN pend.file ELSE pend.target
 
 NewBranch(k) ==
     CASE k = "fork"  -> ForkBranch(branch[pend.file])
@@ -494,9 +674,43 @@ Src(k, match) ==
 \* A primary session_start of the replacement (#3668: no primary is
 \* registered, and its reason is not "startup"): resetForSession begins the
 \* scope, then adoptHandoff takes the slot once and runs each store's action.
+\* #3855 r1: the real successor's key is in a note (a stale one, F3), so its
+\* start is declined as a secondary's successor.
+R1Declines == Has("inheritRole") /\ ~Has("namedSuccessor")
+              /\ pend.key # NoKey /\ pend.key \in notes
+
+\* #3855 r2 (verify V2): the key the real successor's own start computes
+\* (startKey), derived from its side, independently of NamedKey: its file,
+\* else the ticket bound to the manager pi hands a /reload or in-memory
+\* /fork successor (Via, #3819's Carrier), else none.
+BeginKey ==
+    LET f == NewFile(pend.k) IN
+    IF f \notin FileLess THEN [f |-> f, t |-> 0]
+    ELSE IF SR(pend.k) \in SlotReasons
+         THEN [f |-> "-", t |-> Via(pend.k, pend.from)] ELSE NoKey
+
+\* The named pair admits a start key (keylessFailSafe: round 2's J6).
+Admits(key) == key = pend.key
+               \/ (Has("keylessFailSafe") /\ key = NoKey /\ pend.key.t # 0)
+
+\* #3668 (F1 of #3803): the marker's TTL has run out, so a start in the gap is
+\* not held to the named pair. Time is one step, MarkerExpire, which sets the
+\* marker's `exp`; with no "markerTtl" the flag is only the ghost "time
+\* passed" and the marker still declines (`successorStillPending`'s expiry,
+\* clients/session-lifecycle.ts).
+Expired == pend.exp
+Honored == Has("markerTtl") /\ Expired
+\* Ghost for ExpiredGapAdmits: a start declined after the TTL ran out.
+LateDecline(declined) == IF Expired /\ declined THEN {"declinedLate"} ELSE {}
+
+\* The real successor's start is declined: round 1's stale note, or, under
+\* #3855 r2, its own key is not the one its predecessor's shutdown named.
+Declines == R1Declines \/ (Has("namedSuccessor") /\ ~Admits(BeginKey))
+
 Begin ==
     /\ pend.k \in {"new", "resume", "fork", "clone", "reload"}
     /\ primary = 0
+    /\ ~Declines
     /\ LET k == pend.k
            t == nxt
            f == NewFile(k)
@@ -543,13 +757,20 @@ Begin ==
           THEN \E reEval \in BOOLEAN :
                    evalTurn' = IF reEval THEN 0 ELSE evalTurn
           ELSE UNCHANGED evalTurn
+       \* #3755 (MutGenPerEval): a per-evaluation LSP generation restarts with
+       \* the re-evaluated entry module.
+       /\ IF k = "reload" /\ LspOn /\ Has("perEvalSvc")
+          THEN \E reEvalSvc \in BOOLEAN :
+                   svc' = IF reEvalSvc THEN 0 ELSE svc
+          ELSE UNCHANGED svc
        /\ resets' = [resets EXCEPT ![t] = 1]
        /\ predOf' = [predOf EXCEPT ![t] = pend.from]
        /\ pend' = NoPend
+       /\ subBorn' = Born(t, pend.from)
     /\ UNCHANGED <<ep, why, forking, side, sideAct, wr, entry, intent,
-                   svc, fleet, turn, begun, turns, procTurn, wgDone, lastTok,
+                   fleet, turn, begun, turns, procTurn, wgDone, lastTok,
                    prevMax, ownDrop, recorded, dupDone, landed, reads, steps,
-                   used, acts, advOut, advDrop>>
+                   used, acts, advOut, advDrop, notes, spend, userDeclined, fwd, preScope>>
 
 \* The replacement's session_start when another start already registered as
 \* primary in its gap (a subagent's own /reload or /fork, #3668 row 17): the
@@ -574,11 +795,42 @@ BeginDemoted ==
        /\ slot' = IF Has("demotedDiscard")
                      /\ SlotMatch(SR(k), f, Via(k, pend.from))
                   THEN NoSlot ELSE slot
+       /\ subBorn' = Born(t, pend.from)
     /\ UNCHANGED <<ep, why, primary, last, forking, cell, imp, taken,
                    side, sideAct, wr, entry, intent, reg, svc, fleet, turn,
                    begun, turns, procTurn, evalTurn, wgTok, wgDone, lastTok,
                    prevMax, ownDrop, recorded, resets, dupDone, landed, reads,
-                   lzV, adV, steps, used>>
+                   lzV, adV, steps, used, notes, spend, userDeclined, fwd, preScope>>
+
+\* #3855 r1 F3: the real successor's start, with no primary registered,
+\* finds its own key in a (stale) secondary note and is declined as that
+\* secondary's successor; it consumes the note and the process is left with
+\* no primary. Under "demotedDiscard" it discards the slot left for it.
+BeginDeclined ==
+    /\ pend.k \in {"new", "resume", "fork", "clone", "reload"}
+    /\ primary = 0 /\ Declines
+    /\ LET k == pend.k
+           t == nxt
+           f == NewFile(k)
+       IN
+       /\ st' = [st EXCEPT ![t] = "live"]
+       /\ role' = [role EXCEPT ![t] = "secondary"]
+       /\ sess' = [sess EXCEPT ![t] = f]
+       /\ nxt' = t + 1
+       /\ branch' = [branch EXCEPT ![f] = NewBranch(k)]
+       /\ lin' = NewLin(k, t)
+       /\ predOf' = [predOf EXCEPT ![t] = pend.from]
+       /\ pend' = NoPend
+       /\ slot' = IF Has("demotedDiscard")
+                     /\ SlotMatch(SR(k), f, Via(k, pend.from))
+                  THEN NoSlot ELSE slot
+       /\ notes' = notes \ {BeginKey}
+       /\ subBorn' = Born(t, pend.from)
+    /\ UNCHANGED <<ep, why, primary, last, forking, cell, imp, taken,
+                   side, sideAct, wr, entry, intent, reg, svc, fleet, turn,
+                   begun, turns, procTurn, evalTurn, wgTok, wgDone, lastTok,
+                   prevMax, ownDrop, recorded, resets, dupDone, landed, reads,
+                   lzV, adV, steps, used, spend, userDeclined, fwd, preScope>>
 
 \* #3881: the replacement's primary session_start begins (resetForSession
 \* draws its ticket; the module-level runtime serves it) and, before
@@ -596,15 +848,44 @@ BeginDemoted ==
 \* every action but reset and none).
 Keeps(s, k) == ~Has("forwardPolicy") \/ Policy(s, k) \notin {"reset", "none"}
 
-Interrupt ==
-    /\ "Interrupt" \in Transitions /\ "interrupt" \notin used
+\* w = "pre": the reload lands before the start held its scope (verify r4
+\* V6), inside its awaits before `scope = runtime.sessionScope` (W1, W2).
+\* w = "unstarted" (#4113): before pi-lens's start handler ran (W0), so there
+\* is no in-flight mark either; the shutdown is primary by the gap's named
+\* key (#4106), and the name is the start reason pi-lens never saw. Nothing
+\* was reset yet in either, and only the naming-site rule can bind a ticket
+\* to the start's manager.
+InterruptAt(w) ==
+    /\ \/ w = "post" /\ "Interrupt" \in Transitions
+       \/ w = "pre" /\ "InterruptPreScope" \in Transitions
+       \/ w = "unstarted" /\ "InterruptUnstarted" \in Transitions
+    /\ "interrupt" \notin used
     /\ ~RegOn /\ ~LspOn
     /\ pend.k \in {"new", "resume", "fork", "clone", "reload"}
     /\ primary = 0 /\ steps < MaxSteps
     /\ LET k == pend.k
            t == nxt
            f == NewFile(k)
+           pre == w # "post"
+           \* The code's forward: the in-flight mark's reason, or at W0 the
+           \* gap's name (pend.k either way).
+           fwdOn == Has("forwardUnadopted")
+                    /\ (w # "unstarted" \/ Has("forwardUnstarted"))
+                    \* A W0 shutdown reads the gap's name from either
+           \* namedSuccessorReason or expiredSuccessorReason. The
+           \* expired marker still authorizes forwarding; it only
+           \* stops declining unrelated starts (#4236).
+                    /\ (ForwardExpiredUnstarted \/ ~(w = "unstarted" /\ Honored))
            left == SR(k) \in SlotReasons /\ SlotMatch(SR(k), f, Via(k, pend.from))
+           \* SameMgr for t: its start kept pend.from's manager.
+           keeps == k \in {"reload", "fork", "clone"} /\ (k = "reload" \/ f \in FileLess)
+           kept == IF keeps THEN Carrier(pend.from) ELSE 0
+           bound == Has("nameAtShutdown") \/ (Has("bindInterrupted") /\ ~pre)
+           tick == IF ~Has("forwardUnadopted") THEN t
+                   ELSE IF kept # 0 THEN kept
+                   ELSE IF bound THEN t ELSE 0
+           ikey == IF f \notin FileLess THEN [f |-> f, t |-> 0]
+                   ELSE IF tick = 0 THEN NoKey ELSE [f |-> "-", t |-> tick]
        IN
        /\ st' = [st EXCEPT ![t] = "retired"]
        /\ role' = [role EXCEPT ![t] = "primary"]
@@ -614,8 +895,8 @@ Interrupt ==
        /\ branch' = [branch EXCEPT ![f] = NewBranch(k)]
        /\ lin' = NewLin(k, t)
        /\ predOf' = [predOf EXCEPT ![t] = pend.from]
-       /\ resets' = [resets EXCEPT ![t] = 1]
-       /\ slot' = IF Has("forwardUnadopted")
+       /\ resets' = IF pre THEN resets ELSE [resets EXCEPT ![t] = 1]
+       /\ slot' = IF fwdOn
                   THEN IF left
                        THEN [slot EXCEPT !.from = t, !.reason = "reload",
                                          !.file = Key(f),
@@ -623,15 +904,25 @@ Interrupt ==
                                          !.act = IF Keeps("LZ", k) THEN @ ELSE {},
                                          !.adv = IF Keeps("AD", k) THEN @ ELSE {}]
                        ELSE slot
-                  ELSE [has |-> TRUE, from |-> t, reason |-> "reload",
+                  \* W0 without the fix: no mark and no scope, nothing written.
+                  ELSE IF w = "unstarted" THEN slot
+                  ELSE [has |-> TRUE, from |-> t, tk |-> t, reason |-> "reload",
                         file |-> Key(f), facts |-> {}, act |-> {}, adv |-> {}]
-       /\ pend' = [k |-> "reload", from |-> t, file |-> f, target |-> "-"]
+       \* #3855 r4 (verify r3 V4): the gap is named by the key the code's
+       \* successorStartKey reads after the forward: the ticket on the
+       \* interrupted start's manager (ikey).
+       /\ pend' = [k |-> "reload", from |-> t, file |-> f, target |-> "-",
+                    key |-> ikey, exp |-> FALSE]
+       /\ subBorn' = Born(t, pend.from)
+       /\ fwd' = IF Has("forwardUnadopted") THEN fwd \cup {t} ELSE fwd
+       /\ preScope' = IF pre THEN preScope \cup {t} ELSE preScope
        /\ steps' = steps + 1
        /\ used' = used \cup {"interrupt"}
     /\ UNCHANGED <<ep, primary, forking, cell, imp, taken, side, sideAct, wr,
                    entry, intent, reg, svc, fleet, turn, begun, turns,
                    procTurn, evalTurn, wgTok, wgDone, lastTok, prevMax,
-                   ownDrop, recorded, dupDone, landed, reads, lzV, adV>>
+                   ownDrop, recorded, dupDone, landed, reads, lzV, adV,
+                   notes, spend, userDeclined>>
 
 \* pi --fork <path>: a new process after this one quit. The header names the
 \* parent; the parent's sidecar is the only channel ("startup" reads its own
@@ -664,10 +955,11 @@ PiFork ==
        /\ resets' = [resets EXCEPT ![t] = 1]
        /\ predOf' = [predOf EXCEPT ![t] = pend.from]
        /\ pend' = NoPend
+       /\ subBorn' = Born(t, pend.from)
        /\ steps' = steps + 1 /\ used' = used \cup {"piFork"}
     /\ UNCHANGED <<ep, why, forking, taken, side, sideAct, wr, svc, turn,
                    begun, turns, wgDone, ownDrop, recorded, dupDone, landed,
-                   reads, acts, advOut, advDrop>>
+                   reads, acts, advOut, advDrop, notes, spend, userDeclined, fwd, preScope>>
 
 \* /tree: the same activation. The branch loses its last entry and the scope's
 \* branch epoch bumps (S1's moveBranch, from retainBranch). D7: the lazy-tool
@@ -715,22 +1007,69 @@ IdleReset ==
 SecStart ==
     /\ "SecStart" \in Transitions /\ steps < MaxSteps /\ "secStart" \notin used
     /\ pend.k # "quit"
-    /\ LET t == nxt IN
+    /\ LET t == nxt
+           gap == primary = 0 /\ pend.k # "none"
+           \* #3668: an expired marker no longer declines the start, so it
+           \* registers as the primary (`decideSessionStart`).
+           asPrimary == gap /\ Honored
+       IN
        /\ st' = [st EXCEPT ![t] = "live"]
-       /\ role' = [role EXCEPT ![t] = "secondary"]
+       /\ role' = [role EXCEPT ![t] = IF asPrimary THEN "primary" ELSE "secondary"]
        /\ sess' = [sess EXCEPT ![t] = "S"]
        /\ lin' = [lin EXCEPT !["S"] = {t}]
        /\ nxt' = t + 1
+       /\ primary' = IF asPrimary THEN t ELSE primary
+       /\ last' = IF asPrimary THEN t ELSE last
+       /\ resets' = IF asPrimary THEN [resets EXCEPT ![t] = 1] ELSE resets
+       /\ subBorn' = subBorn \cup {t}
        /\ LET takes == ~Has("consumeOnMatch") /\ slot.has IN
           /\ slot' = IF takes THEN NoSlot ELSE slot
           /\ taken' = IF takes THEN taken \cup {[by |-> t, from |-> slot.from]}
                       ELSE taken
-    /\ steps' = steps + 1 /\ used' = used \cup {"secStart"}
-    /\ UNCHANGED <<ep, why, primary, last, pend, forking, branch, cell, imp,
+       /\ steps' = steps + 1
+       /\ used' = used \cup {"secStart"} \cup LateDecline(gap /\ ~asPrimary)
+    /\ UNCHANGED <<ep, why, pend, forking, branch, cell, imp,
                    side, sideAct, wr, entry, intent, reg, svc,
                    fleet, turn, begun, turns, procTurn, evalTurn, wgTok,
-                   wgDone, lastTok, prevMax, ownDrop, recorded, resets, dupDone,
-                   landed, reads, predOf, lzV, adV>>
+                   wgDone, lastTok, prevMax, ownDrop, recorded, dupDone,
+                   landed, reads, predOf, lzV, adV, notes, spend, userDeclined, fwd, preScope>>
+
+\* #3855 verify r2 (probe PR8): an SDK subagent's FIRST bind with a
+\* replacement reason (createAgentSessionFromServices({ sessionStartEvent }),
+\* pi sdk.js), in memory unless file S is file-backed. No shutdown precedes
+\* it. In the primary's gap #3668 took it for the successor; #3855 r2 admits
+\* it only on the named pair. It never adopts (a fresh session's sources hold
+\* nothing of the primary's).
+SecBind(k) ==
+    /\ "SecBindReplace" \in Transitions /\ steps < MaxSteps
+    /\ "secStart" \notin used /\ pend.k # "quit"
+    /\ LET t == nxt
+           key == IF "S" \in FileLess THEN NoKey ELSE [f |-> "S", t |-> 0]
+           asPrimary ==
+               /\ primary = 0
+               /\ \/ Honored
+                  \/ IF Has("namedSuccessor")
+                     THEN pend.k \in {"new", "resume", "fork", "clone", "reload"}
+                          /\ SR(pend.k) = k /\ Admits(key)
+                     ELSE TRUE
+       IN
+       /\ st' = [st EXCEPT ![t] = "live"]
+       /\ role' = [role EXCEPT ![t] = IF asPrimary THEN "primary" ELSE "secondary"]
+       /\ sess' = [sess EXCEPT ![t] = "S"]
+       /\ lin' = [lin EXCEPT !["S"] = {t}]
+       /\ nxt' = t + 1
+       /\ primary' = IF asPrimary THEN t ELSE primary
+       /\ last' = IF asPrimary THEN t ELSE last
+       /\ resets' = IF asPrimary THEN [resets EXCEPT ![t] = 1] ELSE resets
+       /\ subBorn' = subBorn \cup {t}
+       /\ used' = used \cup {"secStart"}
+                    \cup LateDecline(primary = 0 /\ pend.k # "none" /\ ~asPrimary)
+    /\ steps' = steps + 1
+    /\ UNCHANGED <<ep, why, pend, forking, branch, cell, imp, slot, taken,
+                   side, sideAct, wr, entry, intent, reg, svc, fleet, turn,
+                   begun, turns, procTurn, evalTurn, wgTok, wgDone, lastTok,
+                   prevMax, ownDrop, recorded, dupDone, landed, reads, predOf,
+                   lzV, adV, notes, spend, userDeclined, fwd, preScope>>
 
 \* A subagent's session_shutdown: its scope retires and its own cells go.
 SecEnd ==
@@ -747,75 +1086,209 @@ SecEnd ==
                    evalTurn, wgTok, wgDone, lastTok, prevMax, ownDrop, recorded,
                    resets, dupDone, landed, reads, predOf, lzV, adV, used>>
 
-\* A subagent's own /reload or /fork (k): its session_shutdown takes the
-\* secondary path (its activation's role, #3668 I3: no stash), then its
-\* successor's session_start arrives with reason k. With no primary
-\* registered (the primary's replacement gap), a non-"startup" start is the
-\* successor by #3668's rule and classifies primary: it runs the full start
-\* and adoptHandoff with its own file. Otherwise it is a concurrent
-\* secondary with fresh cells.
-SecReplace(k) ==
+\* A subagent's own /reload, /fork or /new (k), in two steps, because pi
+\* awaits the shutdown's handlers before it builds the successor: anything,
+\* the primary's own replacement included, can land between them.
+\*
+\* SecDown: its session_shutdown takes the secondary path (its activation's
+\* role, #3668 I3: no stash). Under "inheritRole" (#3855 r1) it leaves a
+\* note keyed by its successor's hand-off key: the successor's file, else
+\* (a /reload or in-memory /fork, which keep pi's manager) its ticket. An
+\* in-memory /new is linked to nothing and leaves no note (R1). The start may
+\* never come (pi's reload() emits no session_start to a session without host
+\* bindings), and the note then stays (F3).
+SecDown(k) ==
     /\ \/ k = "reload" /\ "SecReload" \in Transitions /\ "secReload" \notin used
        \/ k = "fork" /\ "SecFork" \in Transitions /\ "secFork" \notin used
-    /\ steps < MaxSteps /\ pend.k # "quit"
+       \/ k = "new" /\ "SecNew" \in Transitions /\ "secNew" \notin used
+    /\ steps < MaxSteps /\ pend.k # "quit" /\ spend.k = "none"
     /\ \E s \in Tickets :
           /\ st[s] = "live" /\ role[s] = "secondary"
-          /\ LET t == nxt
-                 f == IF k = "reload" THEN sess[s] ELSE "T"
-                 nb == IF k = "reload" THEN branch[sess[s]]
-                       ELSE ForkBranch(branch[sess[s]])
-                 asPrimary == primary = 0
-                 takes == asPrimary /\
-                          IF Has("consumeOnMatch") THEN SlotMatch(k, f, Via(k, s))
-                          ELSE slot.has
-                 match == takes /\ SlotMatch(k, f, Via(k, s))
-                 src == IF ~asPrimary THEN "none"
-                        ELSE IF match THEN "slot"
-                        ELSE IF k = "fork" THEN "parent" ELSE "own"
-                 a == Policy("RG", k)
-                 base == IF ~asPrimary \/ a \in {"reset", "none"} THEN {}
-                         ELSE CASE src = "slot"   -> slot.facts
-                                [] src = "parent" -> side[sess[s]]
-                                [] src = "own"    -> side[f]
-                                [] OTHER          -> {}
-                 kept == IF a = "carry" THEN base ELSE {x \in base : x.e \in nb}
-                 abase == IF ~asPrimary \/ Policy("LZ", k) \in {"reset", "none"}
-                          THEN {}
-                          ELSE CASE src = "slot"   -> slot.act
-                                 [] src = "parent" -> sideAct[sess[s]]
-                                 [] src = "own"    -> sideAct[f]
-                                 [] OTHER          -> {}
-                 carried == IF asPrimary /\ Policy("AD", k) = "carry" /\ src = "slot"
-                            THEN slot.adv ELSE {}
+          /\ LET f == CASE k = "reload" -> sess[s] [] k = "fork" -> "T"
+                         [] OTHER -> "U"
+                 \* Only round 1 binds a secondary's manager (its note's
+                 \* ticket); under #3855 r2 nothing does, so a file-less
+                 \* subagent successor carries no key.
+                 key == IF f \notin FileLess THEN [f |-> f, t |-> 0]
+                        ELSE IF Has("inheritRole") /\ ~Has("namedSuccessor")
+                                /\ k \in {"reload", "fork"}
+                             THEN [f |-> "-", t |-> s] ELSE NoKey
+                 noted == Has("inheritRole") /\ ~Has("namedSuccessor")
+                          /\ key # NoKey
              IN
-             /\ st' = [st EXCEPT ![s] = "retired", ![t] = "live"]
+             /\ st' = [st EXCEPT ![s] = "retired"]
              /\ why' = [why EXCEPT ![s] = k]
-             /\ role' = [role EXCEPT ![t] = IF asPrimary THEN "primary"
-                                             ELSE "secondary"]
-             /\ sess' = [sess EXCEPT ![t] = f]
-             /\ nxt' = t + 1
-             /\ primary' = IF asPrimary THEN t ELSE primary
-             /\ last' = IF asPrimary THEN t ELSE last
-             /\ branch' = [branch EXCEPT ![f] = nb]
-             /\ lin' = IF k = "fork"
-                       THEN [lin EXCEPT ![f] = lin[sess[s]] \cup {t}]
-                       ELSE [lin EXCEPT ![f] = @ \cup {t}]
-             /\ cell' = [cell EXCEPT ![s] = {}, ![t] = kept]
-             /\ imp' = [imp EXCEPT ![t] = kept]
-             /\ slot' = IF takes THEN NoSlot ELSE slot
-             /\ taken' = IF takes
-                         THEN taken \cup {[by |-> t, from |-> slot.from]}
-                         ELSE taken
-             /\ act' = [act EXCEPT ![t] = abase]
-             /\ adv' = Retag(adv, carried, t)
-             /\ resets' = IF asPrimary THEN [resets EXCEPT ![t] = 1] ELSE resets
-             /\ predOf' = [predOf EXCEPT ![t] = s]
+             /\ cell' = [cell EXCEPT ![s] = {}]
+             /\ notes' = IF noted THEN notes \cup {key} ELSE notes
+             /\ spend' = [k |-> k, from |-> s, file |-> f, key |-> key]
     /\ steps' = steps + 1
-    /\ used' = used \cup {IF k = "reload" THEN "secReload" ELSE "secFork"}
-    /\ UNCHANGED <<ep, pend, forking, side, sideAct, wr, entry, intent, reg,
-                   svc, fleet, turn, begun, turns, procTurn, evalTurn, wgTok,
-                   wgDone, lastTok, prevMax, ownDrop, recorded, dupDone, landed,
-                   reads, acts, advOut, advDrop>>
+    /\ used' = used \cup {CASE k = "reload" -> "secReload"
+                              [] k = "fork" -> "secFork" [] OTHER -> "secNew"}
+    /\ UNCHANGED <<role, sess, ep, primary, last, nxt, pend, forking, branch,
+                   imp, lin, slot, taken, side, sideAct, wr, entry, intent,
+                   reg, svc, fleet, turn, begun, turns, procTurn, evalTurn,
+                   wgTok, wgDone, lastTok, prevMax, ownDrop, recorded, resets,
+                   dupDone, landed, reads, predOf, lzV, adV, subBorn,
+                   userDeclined, fwd, preScope>>
+
+\* SecUp: the successor's session_start, reason k. With no primary
+\* registered (the primary's replacement gap):
+\*   - neither part (#3668 row 17): a non-"startup" start is primary;
+\*   - "inheritRole" (#3855 r1): primary unless its note is still there;
+\*   - "namedSuccessor" (#3855 r2): primary only when its (reason, key) is
+\*     the pair the primary's shutdown named.
+\* A primary start runs the full start and adoptHandoff with its own file;
+\* a secondary start has fresh cells and never adopts.
+SecUp ==
+    /\ spend.k # "none"
+    /\ LET k == spend.k
+           s == spend.from
+           t == nxt
+           f == spend.file
+           gap == primary = 0
+           asPrimary ==
+               /\ gap
+               /\ \/ Honored
+                  \/ CASE Has("namedSuccessor") ->
+                           pend.k \in {"new", "resume", "fork", "clone", "reload"}
+                           /\ SR(pend.k) = k /\ Admits(spend.key)
+                       [] Has("inheritRole") -> spend.key \notin notes
+                       [] OTHER -> TRUE
+           nb == CASE k = "reload" -> branch[sess[s]]
+                   [] k = "fork" -> ForkBranch(branch[sess[s]])
+                   [] OTHER -> branch[f]
+           takes == asPrimary /\
+                    IF Has("consumeOnMatch") THEN SlotMatch(k, f, Via(k, s))
+                    ELSE slot.has
+           match == takes /\ SlotMatch(k, f, Via(k, s))
+           src == IF ~asPrimary \/ k = "new" THEN "none"
+                  ELSE IF match THEN "slot"
+                  ELSE IF k = "fork" THEN "parent" ELSE "own"
+           a == Policy("RG", k)
+           base == IF ~asPrimary \/ a \in {"reset", "none"} THEN {}
+                   ELSE CASE src = "slot"   -> slot.facts
+                          [] src = "parent" -> side[sess[s]]
+                          [] src = "own"    -> side[f]
+                          [] OTHER          -> {}
+           kept == IF a = "carry" THEN base ELSE {x \in base : x.e \in nb}
+           abase == IF ~asPrimary \/ Policy("LZ", k) \in {"reset", "none"}
+                    THEN {}
+                    ELSE CASE src = "slot"   -> slot.act
+                           [] src = "parent" -> sideAct[sess[s]]
+                           [] src = "own"    -> sideAct[f]
+                           [] OTHER          -> {}
+           carried == IF asPrimary /\ Policy("AD", k) = "carry" /\ src = "slot"
+                      THEN slot.adv ELSE {}
+       IN
+       /\ st' = [st EXCEPT ![t] = "live"]
+       /\ role' = [role EXCEPT ![t] = IF asPrimary THEN "primary"
+                                       ELSE "secondary"]
+       /\ sess' = [sess EXCEPT ![t] = f]
+       /\ nxt' = t + 1
+       /\ primary' = IF asPrimary THEN t ELSE primary
+       /\ last' = IF asPrimary THEN t ELSE last
+       /\ branch' = [branch EXCEPT ![f] = nb]
+       /\ lin' = IF k = "fork"
+                 THEN [lin EXCEPT ![f] = lin[sess[s]] \cup {t}]
+                 ELSE [lin EXCEPT ![f] = @ \cup {t}]
+       /\ cell' = [cell EXCEPT ![t] = kept]
+       /\ imp' = [imp EXCEPT ![t] = kept]
+       /\ slot' = IF takes THEN NoSlot ELSE slot
+       /\ taken' = IF takes
+                   THEN taken \cup {[by |-> t, from |-> slot.from]}
+                   ELSE taken
+       /\ act' = [act EXCEPT ![t] = abase]
+       /\ adv' = Retag(adv, carried, t)
+       /\ resets' = IF asPrimary THEN [resets EXCEPT ![t] = 1] ELSE resets
+       /\ predOf' = [predOf EXCEPT ![t] = s]
+       /\ notes' = notes \ {spend.key}
+       /\ spend' = NoSpend
+       /\ subBorn' = Born(t, s)
+       /\ userDeclined' = (userDeclined \/ (gap /\ ~asPrimary /\ s \notin subBorn))
+       /\ used' = used \cup LateDecline(gap /\ pend.k # "none" /\ ~asPrimary)
+    /\ UNCHANGED <<ep, why, pend, forking, side, sideAct, wr, entry, intent,
+                   reg, svc, fleet, turn, begun, turns, procTurn, evalTurn,
+                   wgTok, wgDone, lastTok, prevMax, ownDrop, recorded, dupDone,
+                   landed, reads, acts, advOut, advDrop, steps, fwd, preScope>>
+
+\* #4106 (V7 of #3855): the gap subagent's own /new start (SecDown(new) done,
+\* its SecUp not yet) is interrupted by its own /reload before pi-lens's start
+\* handler ran (micro:0), so that activation t shuts down with no recorded
+\* role, in the primary's gap (no primary registered). Without "rolelessKey"
+\* it fails safe to primary: it names the gap by a fresh ticket on its own
+\* manager, and its reload successor t2 matches that name and is primary, so
+\* the real successor is demoted later (BeginDemoted). With it, the shutdown
+\* is the primary's only when its own key (its file, else none: nothing bound
+\* its new manager) is the named key; otherwise it is a secondary's, the gap
+\* keeps its name, and t2 (reload, its key) is declined. A key of none in a
+\* gap named (new, none) still matches: residual R3.
+SecRoleless ==
+    /\ "SecRoleless" \in Transitions /\ "secRoleless" \notin used
+    /\ steps < MaxSteps
+    /\ spend.k = "new" /\ primary = 0
+    /\ pend.k \in {"new", "resume", "fork", "clone", "reload"}
+    /\ LET t == nxt
+           t2 == nxt + 1
+           f == spend.file
+           own == IF f \in FileLess THEN NoKey ELSE [f |-> f, t |-> 0]
+           \* An expired marker reads as an unnamed gap: the role-less shutdown
+           \* fails safe to primary (`noteSessionShutdown`, #4106).
+           asPrimary == ~Has("rolelessKey") \/ own = pend.key \/ Honored
+       IN
+       /\ st' = [st EXCEPT ![t] = "retired", ![t2] = "live"]
+       /\ why' = [why EXCEPT ![t] = "reload"]
+       /\ role' = [role EXCEPT ![t] = IF asPrimary THEN "primary" ELSE "secondary",
+                                 ![t2] = IF asPrimary THEN "primary" ELSE "secondary"]
+       /\ sess' = [sess EXCEPT ![t] = f, ![t2] = f]
+       /\ lin' = [lin EXCEPT ![f] = @ \cup {t, t2}]
+       /\ nxt' = t + 2
+       /\ primary' = IF asPrimary THEN t2 ELSE primary
+       /\ last' = IF asPrimary THEN t2 ELSE last
+       /\ resets' = IF asPrimary THEN [resets EXCEPT ![t2] = 1] ELSE resets
+       /\ predOf' = [predOf EXCEPT ![t] = spend.from, ![t2] = t]
+       /\ subBorn' = subBorn \cup {t, t2}
+       /\ spend' = NoSpend
+       /\ used' = used \cup {"secRoleless"} \cup LateDecline(~asPrimary)
+    /\ steps' = steps + 1
+    /\ UNCHANGED <<ep, pend, forking, branch, cell, imp, slot, taken, side,
+                   sideAct, wr, entry, intent, reg, svc, fleet, turn, begun,
+                   turns, procTurn, evalTurn, wgTok, wgDone, lastTok, prevMax,
+                   ownDrop, recorded, dupDone, landed, reads, lzV, adV, notes,
+                   userDeclined, fwd, preScope>>
+
+\* #3668 (F1 of #3803): the successor-pending marker's TTL runs out
+\* (SUCCESSOR_PENDING_TTL_MS, `successorStillPending`). Time is not modelled,
+\* so this is a nondeterministic step, once per marker, while a primary
+\* replacement is pending and nothing is registered. The marker names nothing
+\* after it: with "markerTtl" a start in the gap classifies primary, whatever
+\* its reason and key (Honored). The real successor arriving later is then a
+\* secondary behind that start (AcceptedLateSuccessor).
+MarkerExpire ==
+    /\ "MarkerExpire" \in Transitions /\ ~Expired
+    /\ primary = 0 /\ pend.k \in {"new", "resume", "fork", "clone", "reload"}
+    /\ pend' = [pend EXCEPT !.exp = TRUE]
+    /\ used' = used \cup {"expired"}
+    /\ UNCHANGED <<st, role, sess, ep, why, primary, last, nxt, forking,
+                   branch, cell, imp, lin, slot, taken, side, sideAct, wr,
+                   entry, intent, reg, svc, fleet, turn, begun, turns,
+                   procTurn, evalTurn, wgTok, wgDone, lastTok, prevMax,
+                   ownDrop, recorded, resets, dupDone, landed, reads, predOf,
+                   lzV, adV, steps, notes, spend, subBorn, userDeclined, fwd,
+                   preScope>>
+
+\* #3855 r1: a note is evicted over the cap. With one modelled subagent the
+\* cap is never reached by its own notes, so this models the unmodelled
+\* subagents' notes pushing it out: any note, at any time, once.
+Evict ==
+    /\ "Evict" \in Transitions /\ "evict" \notin used
+    /\ \E n \in notes : notes' = notes \ {n}
+    /\ used' = used \cup {"evict"}
+    /\ UNCHANGED <<st, role, sess, ep, why, primary, last, nxt, pend, forking,
+                   branch, cell, imp, lin, slot, taken, side, sideAct, wr,
+                   entry, intent, reg, svc, fleet, turn, begun, turns,
+                   procTurn, evalTurn, wgTok, wgDone, lastTok, prevMax,
+                   ownDrop, recorded, resets, dupDone, landed, reads, predOf,
+                   lzV, adV, steps, spend, subBorn, userDeclined, fwd, preScope>>
 
 \* A duplicate session_start for the same replacement (I5, #2890).
 Dup ==
@@ -837,7 +1310,9 @@ Dup ==
 
 TurnStart ==
     /\ turns < MaxTurns /\ primary # 0 /\ pend.k = "none"
-    /\ turn' = [turn EXCEPT ![primary] = @ + 1]
+    \* Not the coordinator's own (F1): only the turn's own id moves.
+    /\ turn' = IF OwnTurn(primary) THEN [turn EXCEPT ![primary] = @ + 1]
+               ELSE turn
     /\ begun' = [begun EXCEPT ![primary] = @ + 1]
     /\ turns' = turns + 1
     /\ Draw
@@ -847,14 +1322,16 @@ TurnStart ==
                    resets, dupDone, landed, reads, predOf, lzV, adV, steps,
                    used>>
 
-\* A subagent's turn_start. onTurnStart calls runtime.beginTurn() with no
-\* role gate (onTurnStart in index.ts), which advances the primary's turn (N2).
+\* A subagent's turn_start. onTurnStart passes the turn's session id to
+\* runtime.beginTurn (#3613), which advances only that session's turn state;
+\* before it (TC shared) the call advanced the primary's turn (N2).
 SecTurn ==
     /\ "SecTurn" \in Transitions /\ turns < MaxTurns
     /\ \E s \in Tickets :
           /\ st[s] = "live" /\ role[s] = "secondary"
-          /\ LET tgt == IF SecPolicy("TC") = "own" THEN s ELSE last IN
-             turn' = [turn EXCEPT ![tgt] = @ + 1]
+          /\ LET tgt == IF SecPolicy("TC") = "shared" \/ OwnTurn(s)
+                        THEN last ELSE s
+             IN turn' = [turn EXCEPT ![tgt] = @ + 1]
           /\ begun' = [begun EXCEPT ![s] = @ + 1]
     /\ turns' = turns + 1
     /\ Draw
@@ -1051,31 +1528,282 @@ RegLand(t) ==
                    resets, dupDone, landed, reads, predOf, lzV, adV, steps,
                    used>>
 
+-----------------------------------------------------------------------------
+(* M4 (#3803): the coordinator's other session-scoped stores, their late    *)
+(* writers, and the turn_end composer.                                      *)
+(*                                                                          *)
+(* `resetForSession` (`clients/runtime-coordinator.ts`) clears about forty  *)
+(* stores. Each store below is a cell per coordinator GENERATION, indexed   *)
+(* by `last`, the scope the module-level runtime serves: the reset is a new *)
+(* ticket, so the new generation's cell starts empty and a write that       *)
+(* resolves the module-level runtime when it lands reaches `co[last]` of    *)
+(* whichever generation is current THEN. A handle captured at entry         *)
+(* (`captureSessionGeneration`) answers `st[handle]` instead. A record      *)
+(* carries the scope that produced it (`o`, a ghost: production records     *)
+(* keep no such field), which is what the invariants read.                  *)
+(*                                                                          *)
+(*   co  the work records a tool_result settle leaves: the turn-state       *)
+(*       worklist (`ranges`, `addModifiedRange`), the turn summary          *)
+(*       (`summary`, `runtime.turnSummary`), the git-guard latch            *)
+(*       (`gitguard`, `updateGitGuardStatus`, `markGitGuardCacheUnknown`),  *)
+(*       and the stores a turn_end composer drains (`cascade`, `runner`).   *)
+(*   dq  the deferral queue (`deferMutation`): one file, so one merged      *)
+(*       record; its epoch is the `Math.max` of its pairs'.                 *)
+(*   pk  the cut-advisory park map (`parkCutAdvisoryItems`).                *)
+(***************************************************************************)
+
+StateKinds == {"ranges", "summary", "gitguard"}
+WorkKinds  == {"ranges", "cascade", "runner"}
+
+M4Kinds(x) == IF x \in {"stateW", "debounce"} THEN StateKinds ELSE {"-"}
+
+\* A writer begins once in a live scope, after the hook's entry captured the
+\* handle, and lands at any later step. `hs` is the coordinator's scope when
+\* it began (what `holdScope` captures at handleTurnEnd's entry).
+M4Begin(x) ==
+    /\ mw[x].pc = "idle"
+    /\ \E s \in Tickets :
+          /\ st[s] = "live"
+          /\ (x = "park" \/ s = primary)
+          /\ \E k \in M4Kinds(x) :
+                mw' = [mw EXCEPT ![x] = [pc |-> "flight", s |-> s, hs |-> last,
+                                         ep |-> ep[s], k |-> k]]
+    /\ UNCHANGED <<uOld, cell, landed, reads, recorded, ownDrop, co, dq, pk,
+                   consumed, pkOut>>
+
+\* Rows 7, 12, 14, 15 and 16 of S3's writer table (#3759): a tool_result
+\* settle writes the turn-state worklist (`addTurnRange` behind `entryLive`,
+\* the changed-files loop behind `resultLive`), the turn summary
+\* (`runtime.turnSummary.record*`) and the git-guard latch
+\* (`runtime.updateGitGuardStatus`, `syncGitGuardRecord`,
+\* `markGitGuardCacheUnknown`) after the pipeline's awaits, each behind
+\* `writeSession.guardedWrite`, the handle `handleToolResult` captured at
+\* entry. A debounced call re-enters `handleToolResult` from the timer
+\* (`scheduleDebounced`); the re-entry keeps the entry's handle through
+\* `_sessionGeneration` ("debounceEntryCapture", #3596 G), and without it
+\* captures at timer time. The fence is the scope's session: a `/tree` moves no
+\* worklist, so "stateWBranchFence" drops a live scope's own record (I3).
+LandState(x) ==
+    /\ x \in {"stateW", "debounce"} /\ x \in Writers /\ mw[x].pc = "flight"
+    /\ LET w == mw[x]
+           captured == IF x = "debounce" THEN Has("debounceEntryCapture")
+                       ELSE Has("entryCapture")
+           hs == IF captured THEN w.s ELSE last
+           ok == st[hs] = "live" /\ (Has("stateWBranchFence") => ep[hs] = w.ep)
+       IN
+       /\ co' = IF ok THEN [co EXCEPT ![last] = @ \cup {[k |-> w.k, o |-> w.s]}]
+                ELSE co
+       /\ ownDrop' = (ownDrop \/ (~ok /\ st[w.s] = "live"))
+       /\ mw' = [mw EXCEPT ![x].pc = IF ok THEN "landed" ELSE "dropped"]
+    /\ UNCHANGED <<uOld, cell, landed, reads, recorded, dq, pk, consumed, pkOut>>
+
+\* The mutation bridge's producer (`recordMutationThroughSeam`,
+\* `clients/mutation-bridge.ts`; the v2 route is `recordMutateFacet`,
+\* `clients/io-bridge.ts`). Three hops in one body, each only when the
+\* producer's scope is live, each a part so a config can isolate one
+\* ("bridgeStamp", "bridgeRanges", "bridgeDefer"):
+\*   1. `stampLiveMutation`: the read-guard stamp, `recordWritten` with the
+\*      captured epoch (refused when a /tree moved the branch);
+\*   2. `applyTurnAndChangeLog`: the turn-state range;
+\*   3. `queueDeferredMutation`: the deferral, with the epoch
+\*      `resolveReadGuardBranchEpoch` resolves.
+\* "bridgeLineage": the entry carries the handle the producer captured (the
+\* settled sweep, `ast_grep_replace`, the LSP fallback), so `lineage.guardedWrite`
+\* answers currency. Without it the entry fails open (I4): no handle, no epoch,
+\* so the live module-level runtime takes the write whenever it lands. The
+\* bridge exposes neither, so a third-party producer cannot send them
+\* (BridgeExtNoLineage).
+BridgeAlive(w) == ~Has("bridgeLineage") \/ st[w.s] = "live"
+\* Whether the deferral gets a record, and the epoch it carries.
+BridgeQueues(w) ==
+    ~(Has("bridgeEpoch") /\ w.ep > ep[last] /\ Has("deferAboveSkip"))
+BridgeEpoch(w) ==
+    IF ~Has("bridgeEpoch") THEN ep[last]
+    ELSE IF w.ep <= ep[last] THEN w.ep
+    ELSE IF Has("deferAboveIgnore") THEN ep[last]
+    ELSE w.ep
+
+LandBridge ==
+    /\ "bridge" \in Writers /\ mw["bridge"].pc = "flight"
+    /\ LET w == mw["bridge"]
+           alive == BridgeAlive(w)
+           f == [e |-> 1, o |-> w.s]
+           \* The stamp always reaches the live module-level runtime's guard,
+           \* which refuses a capture from another branch epoch.
+           credit == alive /\ (~Has("bridgeEpoch") \/ ep[last] = w.ep)
+       IN
+       /\ cell' = IF credit /\ Has("bridgeStamp")
+                  THEN [cell EXCEPT ![last] = @ \cup {f}] ELSE cell
+       /\ co' = IF alive /\ Has("bridgeRanges")
+                THEN [co EXCEPT ![last] = @ \cup {[k |-> "ranges", o |-> w.s]}]
+                ELSE co
+       /\ dq' = IF alive /\ Has("bridgeDefer") /\ BridgeQueues(w)
+                THEN [dq EXCEPT ![last] = @ \cup {[o |-> w.s, e |-> BridgeEpoch(w)]}]
+                ELSE dq
+       /\ mw' = [mw EXCEPT !["bridge"].pc = IF alive THEN "landed" ELSE "dropped"]
+    /\ UNCHANGED <<uOld, landed, reads, recorded, ownDrop, pk, consumed, pkOut>>
+
+\* A TLC state constraint, for the configs that isolate #3705's rows 5 to 7:
+\* the producer captured its epoch after a /tree, so it is above the epoch a
+\* new session restarts at (row 8's equal epoch is the alias that needs no
+\* /tree, and is the shortest counterexample whenever the lineage is absent).
+AboveLiveOnly == mw["bridge"].pc = "idle" \/ mw["bridge"].ep >= 1
+
+\* The deferral queue as the drain sees it: the live generation's, or, when
+\* `resetForSession` does not clear it, every generation's.
+DQView == IF Has("deferResetClear") THEN dq[last] ELSE UNION {dq[g] : g \in Tickets}
+
+\* The live primary's own edit queues its file synchronously, at the live
+\* epoch (`deferFormat`, the default of `deferMutation`'s epoch parameter).
+DeferOwn ==
+    /\ "DeferOwn" \in Transitions /\ "deferOwn" \notin used
+    /\ primary # 0 /\ pend.k = "none"
+    /\ dq' = [dq EXCEPT ![last] = @ \cup {[o |-> primary, e |-> ep[primary]]}]
+    /\ used' = used \cup {"deferOwn"}
+    /\ UNCHANGED <<uScope, uFiles, uMisc, uTurn, uLz, steps, r2V, cell, landed,
+                   reads, recorded, ownDrop, mw, co, pk, consumed, pkOut>>
+
+\* The agent_end drain (`handleAgentEnd`): the second hop of the credit. The
+\* merged record's epoch is the `Math.max` of what was queued
+\* (`deferMutation`); `ReadGuard.recordWritten` credits the rewrite only at
+\* the live branch epoch and refuses it otherwise. A refusal of a record that
+\* holds a live scope's own current-epoch write is a false block (#3677's
+\* poison); a credit of a record that holds another scope's write is state
+\* from another session (#3705 rows 5 and 7).
+DrainDefer ==
+    /\ "DrainDefer" \in Transitions /\ primary # 0 /\ pend.k = "none"
+    /\ DQView # {}
+    /\ LET p == primary
+           Q == DQView
+           credit == Max({r.e : r \in Q}) = ep[p]
+       IN
+       /\ cell' = IF credit
+                  THEN [cell EXCEPT ![p] = @ \cup {[e |-> 1, o |-> r.o] : r \in Q}]
+                  ELSE cell
+       /\ ownDrop' = (ownDrop \/ (~credit /\ \E r \in Q :
+                                      st[r.o] = "live" /\ r.e = ep[r.o]))
+       /\ dq' = IF Has("deferResetClear") THEN [dq EXCEPT ![last] = {}]
+                ELSE [g \in Tickets |-> {}]
+    /\ UNCHANGED <<uOld, landed, reads, recorded, mw, co, pk, consumed, pkOut>>
+
+\* The park (`cutAdvisoryHold`'s `onHeld`, run by `settleHolds` after the cap)
+\* writes the lane's entry under the turn's session id (`carryScope`), only
+\* while the coordinator's scope is the one the turn captured at entry
+\* (`planDeliveryHolds`' `isCurrentSession`, `holdScope.isCurrent()`).
+\* "parkSessionKey" is #4112 round 2; without it a lane is keyed by its name
+\* alone.
+LandPark ==
+    /\ "park" \in Writers /\ mw["park"].pc = "flight"
+    /\ LET w == mw["park"]
+           ok == ~Has("parkFence") \/ st[w.hs] = "live"
+       IN
+       /\ pk' = IF ok
+                THEN [pk EXCEPT ![last] = @ \cup
+                        {[o |-> w.s,
+                          k |-> IF Has("parkSessionKey") THEN sess[w.s] ELSE "-"]}]
+                ELSE pk
+       /\ mw' = [mw EXCEPT !["park"].pc = IF ok THEN "landed" ELSE "dropped"]
+    /\ UNCHANGED <<uOld, cell, landed, reads, recorded, ownDrop, co, dq,
+                   consumed, pkOut>>
+
+\* The park map as the next run sees it: the live generation's, or, when
+\* `resetForSession` does not clear it, every generation's.
+PkView == IF Has("parkResetClear") THEN pk[last] ELSE UNION {pk[g] : g \in Tickets}
+
+\* The lane's next successful run (`takeCutAdvisoryItems` through `takeParked`)
+\* takes the entries under its key and shows them.
+ParkTake ==
+    /\ "ParkTake" \in Transitions /\ primary # 0 /\ pend.k = "none"
+    /\ \E t \in Tickets :
+          /\ st[t] = "live"
+          /\ LET mine == {r \in PkView : r.k = "-" \/ r.k = sess[t]} IN
+             /\ mine # {}
+             /\ pkOut' = pkOut \cup {[o |-> r.o, to |-> t] : r \in mine}
+             /\ pk' = IF Has("parkResetClear") THEN [pk EXCEPT ![last] = @ \ mine]
+                      ELSE [g \in Tickets |-> pk[g] \ mine]
+    /\ UNCHANGED <<uOld, cell, landed, reads, recorded, ownDrop, mw, co, dq,
+                   consumed>>
+
+\* A live scope's tool_result leaves a work record in the coordinator's stores
+\* (the turn-state worklist owned by the coordinator's session id, cascade runs,
+\* pending runner findings), in the hook, with no await. A concurrent
+\* subagent's tool results reach the same coordinator.
+TurnWork ==
+    /\ "TurnWork" \in Transitions /\ primary # 0 /\ pend.k = "none"
+    /\ \E s \in Tickets, k \in WorkKinds :
+          /\ st[s] = "live"
+          /\ ~\E c \in consumed : c.k = k /\ c.o = s
+          /\ [k |-> k, o |-> s] \notin co[last]
+          /\ co' = [co EXCEPT ![last] = @ \cup {[k |-> k, o |-> s]}]
+    /\ UNCHANGED <<uOld, cell, landed, reads, recorded, ownDrop, mw, dq, pk,
+                   consumed, pkOut>>
+
+\* A turn_end (`handleTurnEnd`, from `onTurnEnd` in `index.ts`, every
+\* activation, primary or concurrent subagent) runs the whole composer on the
+\* process's runtime: it reads and clears the turn-state worklist the
+\* coordinator's session id owns, consumes the cascade runs and drains the
+\* pending runner findings. The shipped "turnEndScoped" rule keys each
+\* durable work record by its producing activation; shared cascade lifecycle
+\* remains settled through the coordinator scope.
+TurnEnd ==
+    /\ primary # 0 /\ pend.k = "none"
+    /\ \E s \in Tickets :
+          /\ st[s] = "live"
+          /\ \/ (s = primary /\ "TurnEnd" \in Transitions)
+             \/ (role[s] = "secondary" /\ "SecTurnEnd" \in Transitions)
+          /\ LET take == {r \in co[last] : r.k \in WorkKinds
+                                           /\ (Has("turnEndScoped") => r.o = s)}
+             IN
+             /\ take # {}
+             /\ consumed' = consumed \cup
+                              {[k |-> r.k, o |-> r.o, by |-> s] : r \in take}
+             /\ co' = [co EXCEPT ![last] = @ \ take]
+    /\ UNCHANGED <<uOld, cell, landed, reads, recorded, ownDrop, mw, dq, pk,
+                   pkOut>>
+
+\* Actions that move no #3855 r2 variable keep them in Next.
 Next ==
-    \/ \E k \in {"fork", "clone"} : BeforeFork(k)
-    \/ CancelFork
-    \/ \E k \in {"new", "resume", "fork", "clone", "reload", "quit"} : Retire(k)
-    \/ Begin
-    \/ BeginDemoted
-    \/ Interrupt
-    \/ PiFork
-    \/ Tree
-    \/ IdleReset
-    \/ SecStart
-    \/ SecEnd
-    \/ \E k \in {"reload", "fork"} : SecReplace(k)
-    \/ Dup
-    \/ TurnStart
-    \/ SecTurn
-    \/ WidgetWrite
-    \/ Activate
-    \/ Context
-    \/ \E x \in FlightIds : WriterBegin(x)
-    \/ \E x \in FlightIds : LandRead(x)
-    \/ LandHeartbeat
-    \/ LandLsp
-    \/ LandAdvisory
-    \/ \E t \in Tickets : RegLand(t)
+    \/ (\E k \in {"fork", "clone"} : BeforeFork(k) /\ UNCHANGED r2V) /\ UNCHANGED m4V
+    \/ CancelFork /\ UNCHANGED <<r2V, m4V>>
+    \/ (\E k \in {"new", "resume", "fork", "clone", "reload", "quit"} :
+          Retire(k) /\ UNCHANGED r2V) /\ UNCHANGED m4V
+    \/ RetireSub /\ UNCHANGED <<r2V, m4V>>
+    \/ Begin /\ UNCHANGED m4V
+    \/ BeginDemoted /\ UNCHANGED m4V
+    \/ BeginDeclined /\ UNCHANGED m4V
+    \/ (\E w \in {"post", "pre", "unstarted"} : InterruptAt(w)) /\ UNCHANGED m4V
+    \/ PiFork /\ UNCHANGED m4V
+    \/ Tree /\ UNCHANGED <<r2V, m4V>>
+    \/ IdleReset /\ UNCHANGED <<r2V, m4V>>
+    \/ SecStart /\ UNCHANGED m4V
+    \/ (\E k \in {"reload", "fork"} : SecBind(k)) /\ UNCHANGED m4V
+    \/ SecEnd /\ UNCHANGED <<r2V, m4V>>
+    \/ (\E k \in {"reload", "fork", "new"} : SecDown(k)) /\ UNCHANGED m4V
+    \/ SecUp /\ UNCHANGED m4V
+    \/ SecRoleless /\ UNCHANGED m4V
+    \/ Evict /\ UNCHANGED m4V
+    \/ MarkerExpire /\ UNCHANGED m4V
+    \/ Dup /\ UNCHANGED <<r2V, m4V>>
+    \/ TurnStart /\ UNCHANGED <<r2V, m4V>>
+    \/ SecTurn /\ UNCHANGED <<r2V, m4V>>
+    \/ WidgetWrite /\ UNCHANGED <<r2V, m4V>>
+    \/ Activate /\ UNCHANGED <<r2V, m4V>>
+    \/ Context /\ UNCHANGED <<r2V, m4V>>
+    \/ (\E x \in FlightIds : WriterBegin(x) /\ UNCHANGED r2V) /\ UNCHANGED m4V
+    \/ (\E x \in FlightIds : LandRead(x) /\ UNCHANGED r2V) /\ UNCHANGED m4V
+    \/ LandHeartbeat /\ UNCHANGED <<r2V, m4V>>
+    \/ LandLsp /\ UNCHANGED <<r2V, m4V>>
+    \/ LandAdvisory /\ UNCHANGED <<r2V, m4V>>
+    \/ (\E t \in Tickets : RegLand(t) /\ UNCHANGED r2V) /\ UNCHANGED m4V
+    \/ \E x \in M4Writers : x \in Writers /\ M4Begin(x)
+    \/ \E x \in {"stateW", "debounce"} : LandState(x)
+    \/ LandBridge
+    \/ LandPark
+    \/ DeferOwn
+    \/ DrainDefer
+    \/ ParkTake
+    \/ TurnWork
+    \/ TurnEnd
 
 Spec == Init /\ [][Next]_vars
 
@@ -1090,6 +1818,10 @@ TypeOK ==
     /\ primary \in 0..(MaxSteps + 2)
     /\ slot.reason \in {"-"} \cup SlotReasons
     /\ \A s \in Stores : \A r \in Reasons : Policy(s, r) \in Actions
+    /\ \A t \in Tickets : co[t] \subseteq [k : StateKinds \cup WorkKinds, o : Tickets]
+    /\ \A t \in Tickets : dq[t] \subseteq [o : Tickets, e : Nat]
+    /\ \A t \in Tickets : pk[t] \subseteq [o : Tickets, k : Files \cup {"-"}]
+    /\ \A x \in M4Writers : mw[x].pc \in {"idle", "flight", "landed", "dropped"}
 
 \* The design's NoCrossScopeWrite (#3528, #3568, #3596, #3576): a live
 \* scope's read-guard cell holds only its own facts and the facts it
@@ -1100,6 +1832,13 @@ NoCrossSessionState ==
           st[t] = "live" => \A x \in cell[t] : x.o = t \/ x \in imp[t]
     /\ \A r \in entry : st[r] = "live"
     /\ \A srv \in fleet : srv.g = svc
+    \* M4: the live coordinator generation's work records come from its own
+    \* scope or a concurrent subagent's (a shared coordinator, by design); a
+    \* record from another primary scope is a retired session's write that
+    \* landed in the live one (#3759's rows 7, 12, 14, 15, 16).
+    /\ \A t \in Tickets :
+          st[t] = "live" =>
+              \A r \in co[t] : r.o = t \/ role[r.o] = "secondary"
 
 \* The design's NoOffBranchFact (#3521): a live scope's own-lineage facts
 \* name entries on its current branch.
@@ -1140,14 +1879,22 @@ NoUnrecordedFalseBlock ==
 \* No guard drops a write whose own lineage is still current (shape 54).
 NoOwnDrop == ~ownDrop
 
-\* #3607 and N2: a primary transition never removes a live secondary's own
-\* facts, and a secondary's turn never moves a primary's turn.
+\* #3607, N2 and #3613: a primary transition never removes a live
+\* secondary's own facts, and every live scope's turn state is moved by its
+\* own turns only: a secondary's turn never moves the primary's, and the
+\* primary's turns and replacements never move or reset a secondary's (its
+\* per-turn records are not dropped).
 SecondaryIsolation ==
     /\ \A s \in Tickets :
           (st[s] = "live" /\ role[s] = "secondary")
               => {x \in landed : x.o = s} \subseteq cell[CellOf(s)]
-    /\ \A p \in Tickets :
-          (st[p] = "live" /\ role[p] = "primary") => turn[p] = begun[p]
+    /\ \A t \in Tickets :
+          (st[t] = "live" /\ role[t] # "-") => turn[TurnCellOf(t)] = begun[t]
+    \* M4, the turn_end half (#3613's R2, #3758): a turn_end drains only its
+    \* own scope's work, so a subagent's never clears the primary's worklist,
+    \* cascade runs or pending runner findings, and the primary's never takes
+    \* a subagent's.
+    /\ \A c \in consumed : c.o = c.by
 
 \* F2: the slot is taken only by a primary start that replaced the scope
 \* that wrote it.
@@ -1181,12 +1928,25 @@ NoForeignFact ==
 NoForeignActivation ==
     \A t \in Tickets : st[t] = "live" => act[t] \subseteq lin[sess[t]]
 
-\* #3604: a live scope holds every activation its conversation made
-\* (/tree keeps them, D7; /new starts a conversation of its own). A demoted
-\* real successor is a secondary, so the check covers every role.
+\* The subagent's conversations: its own file and its fork's.
+SubagentFiles == {"S", "T"}
+
+\* #3604: a live scope of a primary's conversation holds every activation
+\* the conversation made (/tree keeps them, D7; /new starts a conversation
+\* of its own). A demoted real successor is a secondary on the primary's
+\* file, so the check covers every role.
 NoLostActivation ==
     \A t \in Tickets :
-        st[t] = "live" =>
+        (st[t] = "live" /\ sess[t] \notin SubagentFiles) =>
+            \A o \in acts : o \in lin[sess[t]] => o \in act[t]
+
+\* #3855's answer to the #3835 r2 question: the same over the subagent's own
+\* conversations. A secondary never stashes or adopts, so its own /fork or
+\* /reload starts without its activations; the merged design accepts that
+\* (AcceptedSecondaryForkActivation). A secondary hand-off would flip it.
+SecondaryKeepsActivation ==
+    \A t \in Tickets :
+        (st[t] = "live" /\ sess[t] \in SubagentFiles) =>
             \A o \in acts : o \in lin[sess[t]] => o \in act[t]
 
 \* #3748: an advisory reaches only a context call of its own conversation.
@@ -1211,5 +1971,40 @@ NoLostAdvisory ==
                 => \/ \E a \in adv : a.o = d.o
                    \/ \E x \in advOut : x.o = d.o
                    \/ \E d2 \in advDrop : d2.o = d.o /\ (d2.why # "reload" \/ d2.late)
+
+\* #3668 (F1 of #3803): once the marker's TTL ran out, no start in the gap is
+\* declined as "not the successor": a marker that never expired would leave the
+\* process with no primary for as long as the successor does not come (the
+\* #2129 F3 starvation the TTL bounds).
+ExpiredGapAdmits == "declinedLate" \notin used
+
+\* NoLostCarry for a conversation whose successor started inside the marker's
+\* TTL: the late successor of AcceptedLateSuccessor is the accepted loss, so a
+\* behaviour in which the marker ever expired is exempt.
+NoLostCarryUntilExpiry == "expired" \in used \/ NoLostCarry
+
+\* #3755 (F1 of #3803): every LSP server in the fleet belongs to a live scope.
+\* NoCrossSessionState compares a server's generation with the service's, so a
+\* per-evaluation generation that repeats a value is invisible to it
+\* (MutGenPerEval passed it); the owner is the discriminator.
+FleetOwnersLive == \A srv \in fleet : st[srv.o] = "live"
+\* M4, #4112: a parked cut-advisory item is shown only by the scope that parked
+\* it. A parked entry is never carried across a replacement (`resetForSession`
+\* clears the map), and the lane's key is the turn's session, so a concurrent
+\* subagent neither takes nor shows the primary's.
+ParkedStaysInScope == \A d \in pkOut : d.o = d.to
+
+\* #3855 r2 (review F3): the process has a primary whenever no primary
+\* replacement is pending. A declined real successor leaves it with none.
+HasPrimary == pend.k = "none" => primary # 0
+
+\* #3855 r2 (review F1, R1): the primary slot is never held by a scope of the
+\* subagent's chain. A gap start the primary did not name took it.
+PrimaryIsUsers == primary # 0 => primary \notin subBorn
+
+\* #3855 r2 (review F2): a user conversation's own replacement start is never
+\* declined while no scope holds the primary slot. Round 1's notes declined
+\* it after an R1 demotion, so the subagent kept the primary.
+UserNotDeclined == ~userDeclined
 
 =============================================================================

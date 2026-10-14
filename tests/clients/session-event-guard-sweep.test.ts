@@ -54,6 +54,8 @@ const UNWRAPPED_HANDLER_REASONS: Readonly<Record<string, string>> = {
 		"The handler takes `_event, _ctx` and reads neither, so there is no accessor for the SDK to invalidate.",
 	before_agent_start:
 		"The handler reads only the event payload and never accepts or accesses ctx, so stale ctx cannot affect it.",
+	tool_execution_end:
+		"The handler takes only the event and reads no ctx property: it releases a read capture by the event's own call id (#4185 round 4), so there is no accessor for the SDK to invalidate.",
 	tool_call:
 		"Delegates straight to handleToolCall, which already owns a total guard recording `tool-call-handler-throw` (clients/runtime-tool-call.ts); the registration body itself reads no ctx property.",
 	session_shutdown:

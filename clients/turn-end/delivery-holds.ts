@@ -8,7 +8,7 @@
  * the part it produced, and the composer settles every hold once, after the
  * cap, against what the message actually kept.
  *
- * A hold carries one of two shapes, never both needed:
+ * A hold carries one of three shapes, never all needed:
  *
  * - peek-then-commit: the producer left its state alone at compose time and
  *   `onDelivered` commits it (the past-EOF retirement, the dependency-drift
@@ -16,6 +16,14 @@
  * - drain-then-restore: the producer's state is already drained (a cascade
  *   run, a settled runner result, an auxiliary pair) and `onHeld` puts it
  *   back for the next turn.
+ *
+ * - park-then-recheck: the producer has no queue (knip, dead-code and
+ *   call-graph impact derive their items from a scan baseline or the edited
+ *   files, both gone by the next turn). `onHeld` parks the items the part
+ *   showed on the coordinator; the lane's next successful run takes them and
+ *   offers each once more, only while that run still reports it
+ *   (`stillReportedParked`, #3901). `canHold`/`onDropped` end the chain: a part
+ *   showing only re-offers is not held again.
  *
  * Reach rule, per part: the part is reached when it lies whole inside the kept
  * prefix, or when it LEADS the message and could not fit the cap even alone
@@ -137,4 +145,23 @@ export function planDeliveryHolds(args: {
 			return { delivered, held, dropped };
 		},
 	};
+}
+
+/**
+ * The items a lane parked on a cut turn that its fresh run still reports
+ * (#3901), as that run's own records, minus those it already offers as new.
+ * A parked item the run no longer reports was fixed in between and is not
+ * re-announced; one it does report bypasses the baseline and the edited-file
+ * gate that the cut turn overwrote or retired.
+ */
+export function stillReportedParked<T>(
+	parked: readonly T[],
+	current: readonly T[],
+	keyOf: (item: T) => string,
+	offeredKeys: ReadonlySet<string>,
+): T[] {
+	const parkedKeys = new Set(parked.map(keyOf));
+	return current.filter(
+		(item) => parkedKeys.has(keyOf(item)) && !offeredKeys.has(keyOf(item)),
+	);
 }

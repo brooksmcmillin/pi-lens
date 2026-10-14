@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
  * Renders reports/mutation/mutation.json (this repo's driver output, or any
- * Stryker JSON reporter output) as the same markdown the mutation workflow
- * posts as a job summary and a sticky PR comment (#3531). Usable standalone
- * by a fixer or reviewer to cite PR evidence:
+ * Stryker JSON reporter output) as the same markdown the nightly Stryker
+ * workflow writes as a job summary and tracking-issue body (#3531, #4005).
+ * Usable standalone to read a downloaded `mutation-report` artifact:
  *
  *   node scripts/mutation-report.mjs [--report path] [--out path]
  *

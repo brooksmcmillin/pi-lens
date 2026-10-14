@@ -23,8 +23,7 @@ neither is needed. Sharded Unit tests (#3753) keep one queue run short.
   job names, and that no required job (or a job it `needs:`) is gated off on
   `merge_group`.
 - `scripts/ci-verdict.mjs` reports a queued PR as kind `in-queue` (exit 3) and
-  a failed queue run as a FAIL event; the warden never update-branches a PR in
-  the queue or anywhere master has a queue.
+  a failed queue run as a FAIL event.
 
 ## Maintainer settings (Settings, Rules, Rulesets, New branch ruleset)
 
@@ -48,7 +47,7 @@ Branch protection on `master` today is classic (no ruleset exists).
 `scripts/ci-verdict.mjs` reads the live required-check names from classic
 branch protection; if you move the required checks into the ruleset it falls
 back to the static list (`Unit tests`, `Lint & type-check`) and still gates on
-every non-advisory check-run it discovers. Either keep the classic rule
+every non-advisory check-run from a PR/push run it discovers. Either keep the classic rule
 (enable "Require merge queue" there) or accept the narrower absent-check
 detection.
 

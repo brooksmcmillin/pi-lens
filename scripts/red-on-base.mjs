@@ -1,17 +1,19 @@
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import {
+	cpSync,
 	existsSync,
 	lstatSync,
 	mkdirSync,
 	readFileSync,
 	readdirSync,
+	readlinkSync,
 	realpathSync,
 	rmSync,
 	symlinkSync,
 	unlinkSync,
 } from "node:fs";
 import { constants as osConstants } from "node:os";
-import { join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gitExecFileSync } from "./lib/git-fixture-env.mjs";
 import {
@@ -41,7 +43,7 @@ const LOAD_FAILURE_MESSAGE =
 
 const RUN_PREFIX = "pi-lens-red-on-base-";
 const USAGE =
-	"usage: node scripts/red-on-base.mjs <test files…> [--base ref] [--repeat N]";
+	"usage: node scripts/red-on-base.mjs <test files…> [--base ref] [--repeat N] [--copy-node-modules]";
 
 class UsageError extends Error {}
 class Interrupted extends Error {}
@@ -133,18 +135,20 @@ function parseArgs(argv) {
 	let base = "origin/master";
 	let repeat = 1;
 	let testCommand;
+	let copyNodeModules = false;
 	for (let index = 0; index < argv.length; index += 1) {
 		const arg = argv[index];
 		if (arg === "--base") base = argv[++index];
 		else if (arg === "--repeat") repeat = Number(argv[++index]);
 		else if (arg === "--test-command") testCommand = argv[++index];
+		else if (arg === "--copy-node-modules") copyNodeModules = true;
 		else if (arg.startsWith("--")) throw new UsageError(`unknown flag ${arg}`);
 		else files.push(arg);
 	}
 	if (!files.length) throw new UsageError("no test files given");
 	if (!Number.isInteger(repeat) || repeat < 1)
 		throw new UsageError("--repeat must be a positive integer");
-	return { files, base, repeat, testCommand };
+	return { files, base, repeat, testCommand, copyNodeModules };
 }
 
 function git(args, cwd) {
@@ -155,21 +159,120 @@ function tail(text) {
 	return text.slice(-1500).trim();
 }
 
+/** Copy bytes, not hardlinks; retain internal symlink topology so .bin entrypoints
+ * resolve their package-relative imports from the original package location. */
+function copyNodeModules(source, destination) {
+	const root = realpathSync(source);
+	if (!lstatSync(root).isDirectory() || existsSync(destination))
+		throw new Error(
+			"dependency copy requires a directory and an absent destination",
+		);
+	const links = [];
+	const within = (root, target) => {
+		const rel = relative(root, target);
+		if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel))
+			throw new Error(`dependency copy escapes its root: ${target}`);
+		return rel;
+	};
+	cpSync(root, destination, {
+		recursive: true,
+		dereference: false,
+		verbatimSymlinks: true,
+		force: false,
+		errorOnExist: true,
+		filter: (entry) => {
+			within(root, realpathSync(entry));
+			if (lstatSync(entry).isSymbolicLink())
+				links.push({
+					path: relative(root, entry),
+					target: readlinkSync(entry),
+				});
+			return true;
+		},
+	});
+	for (const link of links) {
+		const copied = join(destination, link.path);
+		if (isAbsolute(link.target)) {
+			const target = join(destination, within(root, link.target));
+			unlinkSync(copied);
+			symlinkSync(
+				relative(dirname(copied), target),
+				copied,
+				lstatSync(realpathSync(join(root, link.path))).isDirectory()
+					? "dir"
+					: "file",
+			);
+		}
+	}
+	for (const link of links)
+		within(destination, realpathSync(join(destination, link.path)));
+}
+
 /** Unlink the shared-install symlink BEFORE git sees the worktree: a forced
- *  remove that follows it can delete the shared install (#3173). */
+ *  remove that follows it can delete the shared install (#3173). An archive
+ *  base tree has its own `.git` directory and is no registered worktree, so Git
+ *  is only asked to remove a linked one (whose `.git` is a file). */
 function removeWorktree(cwd, worktree) {
 	const nodeModules = join(worktree, "node_modules");
+	let privateInstall = false;
 	try {
 		if (lstatSync(nodeModules).isSymbolicLink()) unlinkSync(nodeModules);
+		else privateInstall = true;
 	} catch {
 		// no link (never created, or already gone)
 	}
+	// Do not ask Git to remove an install we failed to remove ourselves.
+	if (privateInstall) rmSync(nodeModules, { recursive: true, force: true });
+	let linked = false;
 	try {
-		git(["worktree", "remove", "--force", worktree], cwd);
+		linked = lstatSync(join(worktree, ".git")).isFile();
+	} catch {
+		// no `.git` at all: an archive tree cut short, or nothing was created
+	}
+	if (linked)
+		try {
+			git(["worktree", "remove", "--force", worktree], cwd);
+		} catch (error) {
+			console.error(`red-on-base: worktree remove failed: ${error.message}`);
+		}
+	rmSync(worktree, { recursive: true, force: true });
+}
+
+/** The base tree at `baseSha`. A linked worktree when Git allows it; when the
+ *  lane refuses `git worktree add` (a guarded plegma worker), the same commit
+ *  from the object database: `git archive | tar -x`, then `git init` + `git
+ *  add -A` (no commit). The index is not optional: without it the governance
+ *  suites that read Git state red on a clean base and a real head red would
+ *  read RED-ON-BASE (#4047 review H1: 5 false reds in 4 files). */
+function materializeBase(cwd, worktree, baseSha, tarFile, ref) {
+	try {
+		git(["worktree", "add", "--detach", worktree, baseSha], cwd);
+		return;
 	} catch (error) {
-		console.error(`red-on-base: worktree remove failed: ${error.message}`);
+		const reason = String(error.stderr || error.message)
+			.trim()
+			.split("\n")[0];
+		console.error(
+			`red-on-base: git worktree add refused (${reason}); using a git archive base tree`,
+		);
 	}
 	rmSync(worktree, { recursive: true, force: true });
+	mkdirSync(worktree);
+	git(["archive", "--format=tar", "-o", tarFile, baseSha], cwd);
+	execFileSync("tar", ["-xf", tarFile, "-C", worktree], { stdio: "pipe" });
+	rmSync(tarFile, { force: true });
+	git(["init", "-q"], worktree);
+	git(["add", "-A"], worktree);
+	// The archive is only the base if Git reads the same tree back: a file an
+	// `export-ignore`, a tar fault or an ignore rule dropped would make base
+	// reds that are not the base's (or hide the change's).
+	const got = git(["write-tree"], worktree).trim();
+	const want = git(["rev-parse", `${baseSha}^{tree}`], cwd).trim();
+	if (got !== want)
+		throw new Error(
+			`archive base tree ${got} differs from ${ref}^{tree} ${want}; not evidence of unrelated`,
+		);
+	console.log("BASE-TREE git-archive");
 }
 
 /** A SIGKILLed run leaves a registered worktree behind; reap the ones whose
@@ -356,13 +459,21 @@ export async function main(argv = process.argv.slice(2)) {
 			);
 			return EXIT.BUILD;
 		}
-		git(["worktree", "add", "--detach", worktree, baseSha], cwd);
 		added = true;
-		symlinkSync(
-			resolve(cwd, "node_modules"),
-			join(worktree, "node_modules"),
-			"dir",
-		);
+		materializeBase(cwd, worktree, baseSha, join(runRoot, "base.tar"), base);
+		if (args.copyNodeModules) {
+			console.log("BASE-DEPENDENCIES private-copy");
+			copyNodeModules(
+				resolve(cwd, "node_modules"),
+				join(worktree, "node_modules"),
+			);
+		} else {
+			symlinkSync(
+				resolve(cwd, "node_modules"),
+				join(worktree, "node_modules"),
+				"dir",
+			);
+		}
 		const baseBuild = await build(worktree, "base");
 		if (baseBuild.status !== 0) {
 			console.error(

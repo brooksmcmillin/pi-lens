@@ -60,6 +60,9 @@ export type TestSelection = {
 	covering: number | null;
 	kept: string[];
 	dropped: string[];
+	overBudget: string[];
+	unmeasured: number;
+	estimatedSeconds: number | null;
 	own: string[];
 	unknown: string[];
 };
@@ -71,6 +74,12 @@ export declare function selectMutationTests(args: {
 	maxTests: number;
 	activeSources?: string[];
 	sourceCoverage?: Map<string, Map<string, number> | null>;
+	runtime?: {
+		seconds: Map<string, number | null>;
+		maxSeconds: number;
+		unknownSeconds: number;
+		fileOverheadSeconds: number;
+	};
 }): TestSelection;
 export declare function fingerprintPaths(args: {
 	changedFiles: string[];
@@ -143,9 +152,23 @@ export declare function readProbeCoverage(
 	},
 	directory: string,
 ): Record<string, object> | null;
+export declare function readProbeSeconds(
+	io: {
+		exists: (file: string) => boolean;
+		read: (file: string) => string;
+	},
+	directory: string,
+): number | null;
 export declare function selectionNotes(
-	choice: { dropped: string[]; unknown: string[] },
+	choice: {
+		dropped: string[];
+		unknown: string[];
+		overBudget?: string[];
+		unmeasured?: number;
+		estimatedSeconds?: number | null;
+	},
 	maxTests: number,
+	maxSeconds?: number,
 ): string[];
 export declare function planIncrementalAttempt(args: {
 	attempt: number;

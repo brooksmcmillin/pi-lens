@@ -289,12 +289,17 @@ export function shouldLogEvent(event: string): boolean {
 		// the per-file edits-cap trim. Idle-timeout eviction is deliberately
 		// EXCLUDED from this event (see read-guard.ts's evictFile doc
 		// comment) — it's routine housekeeping, not a fault, and its
-		// per-file cardinality is unbounded in a healthy session. Same
-		// rarity argument as #1913 for the reasons that DO fire: each is
+		// per-file cardinality is unbounded in a healthy session — except
+		// when it drops a write record (#3520), once per file per session.
+		// Same rarity argument as #1913 for the reasons that DO fire: each is
 		// rising-edge gated once per file per session, so always-on
 		// visibility costs nothing.
 		event === "read_file_evicted" ||
-		event === "edits_cap_trimmed"
+		event === "edits_cap_trimmed" ||
+		// #4131: a file's authorship ended because another writer changed its
+		// bytes. Once per authorship episode: the retired file needs a read or
+		// a known-content write before a writer can author it again.
+		event === "authorship_retired"
 	);
 }
 

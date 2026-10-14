@@ -829,9 +829,6 @@ describe("run() — REST transport end to end (#3497)", () => {
 		expect(stdoutLines).toContain("Transport: rest");
 		expect(stdoutLines.join("\n")).not.toContain("failed step");
 		expect(stdoutLines.join("\n")).not.toContain("could not read the job");
-		// #3779: the MUTATION line reads a PR comment through `gh` only; the REST
-		// transport adds no network path for it.
-		expect(stdoutLines.join("\n")).not.toContain("MUTATION");
 	});
 
 	it("still exits 70 when gh is missing and NO token is set (unchanged acceptance case)", async () => {

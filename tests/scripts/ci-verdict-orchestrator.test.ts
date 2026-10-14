@@ -240,6 +240,14 @@ function ghFor(w: World) {
 		const endpoint = args.find((arg) => arg.startsWith("repos/")) ?? "";
 		const bySha = (sha: string) =>
 			w.prs.find((p) => (p.sha ?? shaOf(p.number)) === sha);
+		if (
+			args[0] === "api" &&
+			w.prs.some(
+				(p) =>
+					endpoint === `repos/${w.owner}/pi-lens/issues/${p.number}/comments`,
+			)
+		)
+			return "[]";
 		if (endpoint.endsWith("/branches/master/protection"))
 			throw new Error("HTTP 404: Not Found");
 		if (endpoint.endsWith("/branches/master")) {
@@ -520,6 +528,26 @@ describe("run — failing-test extraction from the recorded job log (#3700)", ()
 		expect(exitCode).toBe(EXIT_SUCCESS);
 		expect(w.calls.some((call) => call.includes("/actions/jobs/"))).toBe(false);
 	});
+
+	it("reports the retained mutation advisory and reads PR comments once", async () => {
+		const w = world({ prs: [{ number: 5, checkRuns: GREEN }] });
+		const { exitCode, lines } = await cli(["5"], w);
+		expect(exitCode).toBe(EXIT_SUCCESS);
+		expect(lines.filter((line) => /MUTATION/i.test(line))).toEqual([
+			"MUTATION (advisory, never gates): PENDING -- no Mutation diff comment on this PR yet",
+		]);
+		expect(w.calls.filter((call) => call.includes("/comments"))).toEqual([
+			"api repos/apmantza/pi-lens/issues/5/comments --paginate",
+		]);
+	});
+
+	it("prints no MUTATION line and reads no comments for a bare SHA", async () => {
+		const w = world({ prs: [{ number: 5, checkRuns: GREEN }] });
+		const { exitCode, lines } = await cli([shaOf(5)], w);
+		expect(exitCode).toBe(EXIT_SUCCESS);
+		expect(lines.join("\n")).not.toMatch(/MUTATION/i);
+		expect(w.calls.some((call) => call.includes("/comments"))).toBe(false);
+	});
 });
 
 describe("run — gating and advisory reported apart (#3700)", () => {
@@ -532,7 +560,7 @@ describe("run — gating and advisory reported apart (#3700)", () => {
 					number: 5,
 					checkRuns: [
 						...GREEN,
-						row("mutation (advisory)", "failure", 21),
+						row("jscpd (advisory)", "failure", 21),
 						row("OSV scan (advisory)", "timed_out", 22),
 						row("PR body (advisory)", "success", 23),
 					],
@@ -543,8 +571,49 @@ describe("run — gating and advisory reported apart (#3700)", () => {
 		expect(exitCode).toBe(EXIT_SUCCESS);
 		expect(lines).toContain("Gating: 2 checks, 0 failing");
 		expect(lines).toContain(
-			"Advisory (never gates): 3 checks, 2 red: OSV scan (advisory) (timed_out), mutation (advisory) (failure)",
+			"Advisory (never gates): 3 checks, 2 red: OSV scan (advisory) (timed_out), jscpd (advisory) (failure)",
 		);
+	});
+
+	it("includes the failed Vitest count for a red Windows advisory", async () => {
+		const windows = job(
+			"unit-tests-fail-101554674114",
+			"Tests  56 failed | 1593 passed | 19 skipped (1668)\n",
+		);
+		windows.json.name = "Unit tests Windows (advisory)";
+		const w = world({
+			prs: [
+				{
+					number: 5,
+					checkRuns: [...GREEN, jobRow(windows)],
+				},
+			],
+			jobs: [windows],
+		});
+		const { exitCode, lines } = await cli(["5"], w);
+		expect(exitCode).toBe(EXIT_SUCCESS);
+		expect(lines).toContain(
+			"Advisory (never gates): 1 checks, 1 red: Unit tests Windows (advisory) (failure, 56 failed)",
+		);
+	});
+
+	// Recurrence: #4042 review F2 — a persistent advisory red must not reread
+	// the same Actions job metadata and log on every watch poll for one head.
+	it("reads advisory failure details once per watched head", async () => {
+		const windows = job(
+			"unit-tests-fail-101554674114",
+			"Tests  56 failed | 1593 passed | 19 skipped (1668)\n",
+		);
+		windows.json.name = "Unit tests Windows (advisory)";
+		const w = world({
+			prs: [{ number: 5, login: "apmantza", checkRuns: [jobRow(windows)] }],
+			jobs: [windows],
+		});
+		const result = await cli(["--watch-open", "--stream", "--wait", "180"], w);
+		expect(result.exitCode).toBe(EXIT_PENDING);
+		expect(
+			w.calls.filter((call) => call.includes("/actions/jobs/101554674114")),
+		).toHaveLength(2);
 	});
 
 	it("keeps a gating red out of the advisory line and an advisory red out of the gating line", async () => {
@@ -555,7 +624,7 @@ describe("run — gating and advisory reported apart (#3700)", () => {
 					checkRuns: [
 						row("Unit tests", "failure", 11),
 						GREEN[1],
-						row("mutation (advisory)", "failure", 21),
+						row("jscpd (advisory)", "failure", 21),
 					],
 				},
 			],
@@ -566,7 +635,7 @@ describe("run — gating and advisory reported apart (#3700)", () => {
 			"Gating: 2 checks, 1 failing: Unit tests (failure)",
 		);
 		expect(lines).toContain(
-			"Advisory (never gates): 1 checks, 1 red: mutation (advisory) (failure)",
+			"Advisory (never gates): 1 checks, 1 red: jscpd (advisory) (failure)",
 		);
 	});
 });

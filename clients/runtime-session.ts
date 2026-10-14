@@ -24,6 +24,7 @@ import type { FileKind } from "./file-kinds.js";
 import { clearAllSessions as clearFileTimeSessions } from "./file-time.js";
 import {
 	drainProjectDataDirMigrations,
+	sweepDeadEphemeralDataDirs,
 	getGlobalPiLensDir,
 	getKnipIgnorePatterns,
 	getProjectDataDir,
@@ -35,7 +36,7 @@ import {
 	GovulncheckClient,
 	type GovulncheckResult,
 } from "./govulncheck-client.js";
-import { sweepAtomicWriteStages } from "./instance-reaper.js";
+import { realIsPidAlive, sweepAtomicWriteStages } from "./instance-reaper.js";
 import type { JscpdClient } from "./jscpd-client.js";
 import type { KnipResult } from "./knip-client.js";
 import { canRunStartupHeavyScans } from "./language-policy.js";
@@ -104,7 +105,6 @@ import {
 import { resetSituationalToolTelemetry } from "./situational-tool-telemetry.js";
 import {
 	findNearestProjectRoot,
-	getStartupScanMaxEntries,
 	isStartupScanVerdictFresh,
 	resolveStartupScanContext,
 	type StartupScanContext,
@@ -130,7 +130,11 @@ import { resetZizmorTokenAvailability } from "./zizmor-config.js";
 import { resetSpawnTimeoutCooldowns } from "./spawn-timeout-cooldown.js";
 import { resetTestRunnerDelivery } from "./test-runner-delivery.js";
 import { resetLspMutationNoBridgeDbgLatch } from "./lsp-mutation.js";
-import type { SessionStartClassification } from "./session-lifecycle.js";
+import type {
+	ClassificationBasis,
+	SessionStartClassification,
+	SessionStartGuardDecision,
+} from "./session-lifecycle.js";
 import type { PiLensGlobalConfig } from "./lens-config.js";
 import type { PiLensProjectConfig } from "./project-lens-config.js";
 
@@ -156,6 +160,13 @@ interface SessionStartDeps {
 	dbg: (msg: string) => void;
 	log: (msg: string) => void;
 	/**
+	 * #2967: the registration predicate's complement — every registry tool the
+	 * loaded, enabled pi tool set omits. The session-start orientation renders
+	 * from it instead of a constant. Absent (MCP and unit callers) means the
+	 * full all-enabled default, unchanged from before.
+	 */
+	disabledToolNames?: readonly string[];
+	/**
 	 * Host-provided startup-mode override. When set, the first-call-quick
 	 * heuristic (TUI cold-start latency mitigation) is skipped and this value
 	 * wins — but only when `PI_LENS_STARTUP_MODE` is NOT explicitly set in the
@@ -179,6 +190,11 @@ interface SessionStartDeps {
 	/** The root-identity input that classification consulted (mirrors
 	 *  `ClassifySessionStartInput.sameRoot`). */
 	sessionStartSameRoot?: boolean;
+	/** #3873 O6: which classifier branch decided, the age of a replacement
+	 *  gap's marker and the start's match against the successor it named. */
+	sessionStartBasis?: ClassificationBasis;
+	sessionStartGapMs?: number;
+	sessionStartLineageMatch?: SessionStartGuardDecision["lineageMatch"];
 	runtime: RuntimeCoordinator;
 	cacheManager: CacheManager;
 	astGrepClient: AstGrepClient;
@@ -200,6 +216,55 @@ interface SessionStartDeps {
 	cleanStaleTsBuildInfo: (cwd: string) => string[];
 	resetDispatchBaselines: (cwd?: string) => void;
 	resetLSPService: (options?: LSPShutdownOptions) => void;
+}
+
+/**
+ * Surface every project-size warm skip through the same bounded seam (#4126):
+ * one visible line and one `startup-warm-skipped` record per session start,
+ * delivered by the session generation that observed the skip.
+ */
+function notifyStartupWarmSkip(args: {
+	scan: StartupScanContext;
+	analysisRoot: string;
+	notify: SessionStartDeps["notify"];
+	runtime: RuntimeCoordinator;
+	sessionGeneration: number;
+}): void {
+	// The quick-mode warmup reaches here after an await, so its session may
+	// have been superseded by a later start (`resetForSession` moved the
+	// scope) or retired by a shutdown with no replacement; both are stale and
+	// deliver nothing (catalog shape 22). The same guard every other post-await
+	// publish in this file uses.
+	if (!args.runtime.isCurrentSession(args.sessionGeneration)) return;
+	const reason = args.scan.reason;
+	if (reason !== "too-many-source-files" && reason !== "too-many-entries") {
+		return;
+	}
+	// The bound named is the one stored on the verdict, the one that produced
+	// it (shape 58): a computed verdict carries both bounds, and a reused one is
+	// fresh only while they equal the bounds now in effect.
+	const bound =
+		reason === "too-many-entries"
+			? {
+					name: "maxScanEntries",
+					value: args.scan.maxScanEntries,
+					hint: `set PI_LENS_STARTUP_SCAN_MAX_ENTRIES=<n> to override the ${args.scan.maxScanEntries}-entry cap`,
+				}
+			: {
+					name: "maxProjectFiles",
+					value: args.scan.maxProjectFiles,
+					hint: `set maxProjectFiles in .pi-lens.json to override the ${args.scan.maxProjectFiles}-source-file cap`,
+				};
+	recordDegradationOnce({
+		kind: "startup-warm-skipped",
+		subject: args.analysisRoot,
+		reason: `${reason}; ${bound.name}=${bound.value}`,
+		metadata: { reason, [bound.name]: bound.value },
+	});
+	args.notify(
+		`📦 Project-size limits disabled background warm scans (heavy scans, TODO scan, LSP pre-warm) (${bound.hint}).`,
+		"warning",
+	);
 }
 
 /** `SessionStartDeps` with the analyzer clients merged in. */
@@ -1934,19 +1999,127 @@ function scheduleDeferredToolProbesWithClients(
  * and the distinction between cached reporting and active verification
  * — per-tool argument detail lives in each tool's own registered description, so
  * re-documenting it here would just pay the tokens twice every session.
+ *
+ * Rendered from the registered, enabled tool set (#2967): `disabledToolNames`
+ * is the registration predicate's complement (`index.ts`'s `isToolEnabled`), so a
+ * tool disabled with `tools.<name>.enabled: false` is never mentioned. The
+ * tool names are spelled once, in the prose below, and gated by the same
+ * names; there is no parallel roster to drift from `TOOL_REGISTRY`.
  */
-export const SESSION_START_GUIDANCE: string[] = [
-	"📌 pi-lens active — automated checks run on every edit/write; blocking errors (including pre-existing) show inline and must be fixed.\n" +
-		"Key tools (see each tool's own description for args):\n" +
-		"• lens_diagnostics — source=session reads cache; empty cache ≠ clean; use source=lsp scope=paths for changed files with absent or stale findings (aggregate hosts: lens(action=diagnostics)).\n" +
-		"• symbol_search → module_report → read_symbol/read_enclosing — ranked identifier search, then navigable outline/callback handles + exact body reads; cheaper than reading a whole file before editing.\n" +
-		"• Situational (activate via pi_lens_activate_tools): lsp_navigation, ast_grep_search, ast_grep_replace. Use ast_grep_search with dump=true to inspect AST nodes.",
-];
+export interface SessionStartGuidanceOptions {
+	/** Registry tool names absent from the loaded, enabled pi tool set. */
+	disabledToolNames?: readonly string[] | undefined;
+	/**
+	 * Whether the orientation demands pre-existing blocking errors be fixed.
+	 * Defaults true (the shipped wording); false scopes the demand to errors
+	 * introduced by the agent's own edits (`contextInjection.requirePreExistingFixes`).
+	 */
+	requirePreExistingFixes?: boolean | undefined;
+}
+
+/** Compose the read-substitute funnel from whichever of its tools are enabled. */
+function readSubstituteGuidance(
+	isEnabled: (name: string) => boolean,
+): string | undefined {
+	const units: Array<{ name: string; role: string }> = [];
+	if (isEnabled("symbol_search")) {
+		units.push({ name: "symbol_search", role: "ranked identifier search" });
+	}
+	if (isEnabled("module_report")) {
+		units.push({
+			name: "module_report",
+			role: "navigable outline/callback handles",
+		});
+	}
+	const readSymbol = isEnabled("read_symbol");
+	const readEnclosing = isEnabled("read_enclosing");
+	if (readSymbol && readEnclosing) {
+		units.push({
+			name: "read_symbol/read_enclosing",
+			role: "exact body reads",
+		});
+	} else if (readSymbol) {
+		units.push({ name: "read_symbol", role: "exact body reads" });
+	} else if (readEnclosing) {
+		units.push({ name: "read_enclosing", role: "exact body reads" });
+	}
+	if (units.length === 0) return undefined;
+	const roles = units.map((unit) => unit.role);
+	const roleTail =
+		roles.length === 1
+			? roles[0]
+			: roles.length === 2
+				? `${roles[0]}, then ${roles[1]}`
+				: `${roles[0]}, then ${roles[1]} + ${roles[2]}`;
+	return `• ${units.map((unit) => unit.name).join(" → ")} — ${roleTail}; cheaper than reading a whole file before editing.`;
+}
+
+/** Compose the situational-tool bullet from whichever members are enabled. */
+function situationalGuidance(
+	isEnabled: (name: string) => boolean,
+): string | undefined {
+	const active: string[] = [];
+	for (const name of [
+		"lsp_navigation",
+		"ast_grep_search",
+		"ast_grep_replace",
+	]) {
+		if (isEnabled(name)) active.push(name);
+	}
+	if (active.length === 0) return undefined;
+	let text = `• Situational (activate via pi_lens_activate_tools): ${active.join(", ")}.`;
+	if (isEnabled("ast_grep_search")) {
+		text += " Use ast_grep_search with dump=true to inspect AST nodes.";
+	}
+	return text;
+}
+
+/** Render the orientation for one registered tool set. */
+export function renderSessionStartGuidance(
+	options: SessionStartGuidanceOptions = {},
+): string[] {
+	const disabled = new Set(options.disabledToolNames ?? []);
+	const isEnabled = (name: string): boolean => !disabled.has(name);
+	const requirePreExistingFixes = options.requirePreExistingFixes !== false;
+
+	const header =
+		"📌 pi-lens active — automated checks run on every edit/write; " +
+		(requirePreExistingFixes
+			? "blocking errors (including pre-existing) show inline and must be fixed."
+			: "blocking errors you introduce must be fixed; pre-existing ones are only reported.");
+
+	const bullets: string[] = [];
+	if (isEnabled("lens_diagnostics")) {
+		bullets.push(
+			"• lens_diagnostics — source=session reads cache; empty cache ≠ clean; use source=lsp scope=paths for changed files with absent or stale findings (aggregate hosts: lens(action=diagnostics)).",
+		);
+	}
+	const readSubstitute = readSubstituteGuidance(isEnabled);
+	if (readSubstitute) bullets.push(readSubstitute);
+	const situational = situationalGuidance(isEnabled);
+	if (situational) bullets.push(situational);
+
+	const lines = [header];
+	if (bullets.length > 0) {
+		lines.push("Key tools (see each tool's own description for args):");
+		lines.push(...bullets);
+	}
+	return [lines.join("\n")];
+}
+
+/** The all-enabled default: byte-identical to the pre-#2967 constant. */
+export const SESSION_START_GUIDANCE: string[] = renderSessionStartGuidance();
 
 export async function handleSessionStart(
 	deps: SessionStartDeps,
 ): Promise<void> {
 	resetDegradationLedger();
+	// #4126: the generation the deferred quick-mode warmup publishes under. The
+	// warmup timer is armed before `runtime.resetForSession` below moves the
+	// scope, so this is reassigned right after that reset; the warmup reads it
+	// only after its own awaits, and nothing between this line and the reset
+	// awaits, so a replacement start can never observe the pre-reset value.
+	let sessionGenerationAtStart = deps.runtime.sessionGeneration;
 	// #2467: re-arm the analyzer bootstrap's shutdown gate. The gate is a
 	// per-SESSION claim ("this session is over") held in process-lived storage,
 	// so without this a replacement session in the same process would find
@@ -2175,6 +2348,13 @@ export async function handleSessionStart(
 						warmupDbg(
 							`warmup: skipping language-profile (canWarm=false, reason=${scan.reason ?? "unknown"})`,
 						);
+						notifyStartupWarmSkip({
+							scan,
+							analysisRoot: scan.projectRoot ?? warmupCwd,
+							notify: deps.notify,
+							runtime: deps.runtime,
+							sessionGeneration: sessionGenerationAtStart,
+						});
 						return;
 					}
 					const languageRoot = scan.projectRoot ?? warmupCwd;
@@ -2461,6 +2641,7 @@ export async function handleSessionStart(
 	// next session's first reconcile gauge.
 	resetCascadeTierSessionState();
 	runtime.resetForSession(sessionStartMs);
+	sessionGenerationAtStart = runtime.sessionGeneration;
 	logLatency({
 		type: "phase",
 		phase: "session_start_runtime_reset",
@@ -2529,6 +2710,16 @@ export async function handleSessionStart(
 	for (const migration of drainProjectDataDirMigrations()) {
 		const targetName = path.basename(migration.to);
 		const hash = targetName.match(/([0-9a-f]{8})$/)?.[1] ?? "unknown";
+		if (migration.outcome === "ephemeral") {
+			// #1129 decision B: say once that this root's state dies with the process.
+			recordDegradationOnce({
+				kind: "data-dir-ephemeral",
+				subject: hash,
+				reason:
+					"temporary checkout: project data lives in a process-owned directory and is not kept after exit",
+			});
+			continue;
+		}
 		recordDegradationOnce({
 			kind: "data_dir_migrated",
 			subject: hash,
@@ -2558,6 +2749,11 @@ export async function handleSessionStart(
 		path.join(globalDir, "bin"),
 		path.join(globalDir, "tools"),
 	]).catch(() => {
+		// best-effort lifecycle cleanup — never fail session_start
+	});
+	// #1129: reap the ephemeral data dirs of processes that died before their
+	// exit hook ran. Fire-and-forget and bounded like the stage sweep above.
+	void sweepDeadEphemeralDataDirs({ isPidAlive: realIsPidAlive }).catch(() => {
 		// best-effort lifecycle cleanup — never fail session_start
 	});
 	if (quickMode) {
@@ -2730,10 +2926,7 @@ export async function handleSessionStart(
 				// alongside `mode` — every start reaching this line already
 				// classified `primary`/`sequential-replacement` (a `secondary-root`
 				// start returns before `handleSessionStart` is ever called).
-				classification: deps.sessionStartClassification,
-				// `undefined` is omitted by JSON.stringify. Keep unknown explicit so
-				// strict log readers can distinguish it from legacy omission.
-				sameRoot: deps.sessionStartSameRoot ?? "unknown",
+				...sessionStartDecisionMetadata(deps),
 			},
 		});
 		logHostReadyDelay(deps, cwd);
@@ -3049,7 +3242,11 @@ export async function handleSessionStart(
 	log(`Active tools: ${tools.join(", ")}`);
 	dbg(`session_start tools: ${tools.join(", ")}`);
 
-	const agentStartupGuidance = SESSION_START_GUIDANCE;
+	const agentStartupGuidance = renderSessionStartGuidance({
+		disabledToolNames: deps.disabledToolNames,
+		requirePreExistingFixes:
+			deps.globalConfig?.contextInjection?.requirePreExistingFixes,
+	});
 
 	runtime.projectRulesScan = scanProjectRules(analysisRoot);
 	saveRuntimeProjectSnapshot({
@@ -3104,19 +3301,13 @@ export async function handleSessionStart(
 		// `else` branch runs once per handleSessionStart call — the
 		// dominant-language LSP pre-warm skip further down reuses this same
 		// verdict rather than notifying a second time).
-		if (
-			startupScan.reason === "too-many-source-files" ||
-			startupScan.reason === "too-many-entries"
-		) {
-			const overrideHint =
-				startupScan.reason === "too-many-entries"
-					? ` (set PI_LENS_STARTUP_SCAN_MAX_ENTRIES=<n> to override the ${getStartupScanMaxEntries()}-entry cap)`
-					: "";
-			notify(
-				`📦 Project-size limits disabled background warm scans (heavy scans, TODO scan, LSP pre-warm)${overrideHint}.`,
-				"warning",
-			);
-		}
+		notifyStartupWarmSkip({
+			scan: startupScan,
+			analysisRoot,
+			notify,
+			runtime,
+			sessionGeneration,
+		});
 	} else {
 		scheduleStartupScans(
 			deps,
@@ -3199,13 +3390,33 @@ export async function handleSessionStart(
 			mode: startupMode,
 			reason: deps.sessionReason,
 			// #2129: see the quick-mode session_start_total record above.
-			classification: deps.sessionStartClassification,
 			// Keep the full path's durable shape identical to quick mode.
-			sameRoot: deps.sessionStartSameRoot ?? "unknown",
+			...sessionStartDecisionMetadata(deps),
 		},
 	});
 	logHostReadyDelay(deps, cwd);
 	emitSmellsSessionStartLine(dbg, sessionStartMs);
+}
+
+/**
+ * What `decideSessionStart` consulted, for both `session_start_total` rows
+ * (#2129, #3873 O6). `sameRoot` is explicit when unknown, because
+ * `JSON.stringify` omits `undefined` and strict log readers must tell unknown
+ * from a legacy row. `basis` names the classifier branch, `gapMs` the age of
+ * a replacement gap's marker and `lineageMatch` the start against the
+ * successor that marker named, so a `primary` with `sameRoot: unknown` says
+ * why it was primary.
+ */
+function sessionStartDecisionMetadata(
+	deps: SessionStartDeps,
+): Record<string, unknown> {
+	return {
+		classification: deps.sessionStartClassification,
+		sameRoot: deps.sessionStartSameRoot ?? "unknown",
+		basis: deps.sessionStartBasis,
+		gapMs: deps.sessionStartGapMs,
+		lineageMatch: deps.sessionStartLineageMatch,
+	};
 }
 
 /**

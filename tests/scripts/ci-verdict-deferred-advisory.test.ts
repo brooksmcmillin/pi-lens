@@ -1,4 +1,4 @@
-// #3801: ci.yml starts the heavy advisory jobs (mutation, the Windows Vitest
+// #3801: ci.yml starts the heavy advisory jobs (CodeQL, the Windows Vitest
 // subset) only after every required check passed, so until then GitHub has no
 // check-run for them. ci-verdict lists each as PENDING while the verdict is
 // pending, and never lets one move an exit code.
@@ -17,7 +17,6 @@ import {
 	EXIT_PENDING,
 	EXIT_SUCCESS,
 	formatGatingSplit,
-	formatMutationLine,
 	formatVerdictTable,
 } from "../../scripts/ci-verdict.mjs";
 import {
@@ -110,49 +109,25 @@ describe("ci-verdict deferred advisory rows (#3801)", () => {
 			check_runs: [
 				checkRun("Unit tests", "completed", "success", 1),
 				checkRun("Lint & type-check", "in_progress", null, 2),
-				checkRun("mutation (advisory)", "in_progress", null, 3),
+				checkRun("Unit tests Windows (advisory)", "in_progress", null, 3),
 			],
 		});
 		expect(
 			verdict.rows.filter(
-				(row: { name: string }) => row.name === "mutation (advisory)",
+				(row: { name: string }) => row.name === "Unit tests Windows (advisory)",
 			),
 		).toHaveLength(1);
 		expect(deferred(verdict.rows)).toEqual(
-			DEFERRED_ADVISORY_CHECKS.filter((name) => name !== "mutation (advisory)"),
-		);
-	});
-
-	// Recurrence: the MUTATION line read a deferred job as "not running" and
-	// printed STALE for the previous head's comment while the new head's job was
-	// only waiting on the required checks.
-	it("makes the MUTATION line say PENDING, not STALE, for a deferred job", () => {
-		const verdict = computeVerdict({
-			check_runs: [
-				checkRun("Unit tests", "completed", "success", 1),
-				checkRun("Lint & type-check", "in_progress", null, 2),
-			],
-		});
-		const head = "b".repeat(40);
-		expect(formatMutationLine([], head, verdict.rows)).toMatch(
-			/PENDING -- no Mutation diff comment on this PR yet$/,
-		);
-		const previousHead = "a".repeat(40);
-		const comment = {
-			id: 9,
-			user: { login: "github-actions[bot]" },
-			body: `<!-- pi-lens-mutation-diff -->\n### Mutation diff (advisory)\n\n- **Head:** \`${previousHead}\`\n\nNo survivors.`,
-		};
-		const line = formatMutationLine([comment], head, verdict.rows);
-		expect(line).toContain(
-			"PENDING -- the mutation job is waiting for the required checks on PR head",
+			DEFERRED_ADVISORY_CHECKS.filter(
+				(name) => name !== "Unit tests Windows (advisory)",
+			),
 		);
 	});
 
 	// Recurrence (review r1 F3): the deferred rows vanished exactly when the
-	// verdict turned success, so "mutation starts when the gate gets a runner",
-	// "the gate decided not-ready" and "mutation will never run" all read the
-	// same (exit 0, MUTATION: STALE). Every gate state must be distinguishable
+	// verdict turned success, so "the heavy jobs start when the gate gets a runner",
+	// "the gate decided not-ready" and "they will never run" all read the
+	// same (exit 0, no rows). Every gate state must be distinguishable
 	// AFTER the required checks are green, and never move the exit code.
 	describe("after the required checks are green (the window a merger reads)", () => {
 		const green = [
@@ -160,12 +135,6 @@ describe("ci-verdict deferred advisory rows (#3801)", () => {
 			checkRun("Lint & type-check", "completed", "success", 2),
 			checkRun(CHANGES_CHECK, "completed", "success", 3),
 		];
-		const head = "b".repeat(40);
-		const stale = {
-			id: 9,
-			user: { login: "github-actions[bot]" },
-			body: `<!-- pi-lens-mutation-diff -->\n### Mutation diff (advisory)\n\n- **Head:** \`${"a".repeat(40)}\`\n\nNo survivors.`,
-		};
 		const read = (gate: ReturnType<typeof checkRun> | null) => {
 			const verdict = computeVerdict({
 				check_runs: gate ? [...green, gate] : green,
@@ -176,69 +145,46 @@ describe("ci-verdict deferred advisory rows (#3801)", () => {
 					.split("\n")
 					.map((line) => line.split(/\s{2,}/))
 					.find((columns) => columns[0] === name)?.[1];
-			return {
-				verdict,
-				status,
-				line: formatMutationLine([stale], head, verdict.rows),
-			};
+			return { verdict, status };
 		};
 
 		const gateStates: Array<
-			[string, ReturnType<typeof checkRun> | null, string, RegExp]
+			[string, ReturnType<typeof checkRun> | null, string]
 		> = [
-			[
-				"no gate row yet",
-				null,
-				"PENDING",
-				/PENDING -- the mutation job is waiting for the required checks/,
-			],
-			[
-				"gate queued",
-				checkRun(HEAVY_GATE_CHECK, "queued", null, 4),
-				"PENDING",
-				/PENDING -- the mutation job is waiting for the required checks/,
-			],
+			["no gate row yet", null, "PENDING"],
+			["gate queued", checkRun(HEAVY_GATE_CHECK, "queued", null, 4), "PENDING"],
 			[
 				"gate running",
 				checkRun(HEAVY_GATE_CHECK, "in_progress", null, 4),
 				"PENDING",
-				/PENDING -- the mutation job is waiting for the required checks/,
 			],
 			[
 				"gate passed, jobs not queued yet",
 				checkRun(HEAVY_GATE_CHECK, "completed", "success", 4),
 				"PENDING",
-				/PENDING -- the mutation job is the gate passed and the job is about to be queued/,
 			],
 			[
 				"gate skipped",
 				checkRun(HEAVY_GATE_CHECK, "completed", "skipped", 4),
 				"NOT RUN",
-				/NOT RUN -- the heavy gate was skipped .*STALE \(PR head is b{12}\)/,
 			],
 			[
 				"gate red (ready=false)",
 				checkRun(HEAVY_GATE_CHECK, "completed", "failure", 4),
 				"NOT RUN",
-				/NOT RUN -- the heavy gate concluded failure .*lint\.yml required check was red or unfinished/,
 			],
 		];
-		it.each(
-			gateStates.map(([label, gate, state, mutationLine]) => ({
-				label,
-				gate,
-				state,
-				mutationLine,
-			})),
-		)("$label -> $state", ({ gate, state, mutationLine }) => {
-			const { verdict, status, line } = read(gate);
-			expect(verdict.exitCode).toBe(EXIT_SUCCESS);
-			expect(verdict.kind).toBe("success");
-			for (const name of DEFERRED_ADVISORY_CHECKS) {
-				expect(status(name), name).toBe(state);
-			}
-			expect(line).toMatch(mutationLine);
-		});
+		it.each(gateStates.map(([label, gate, state]) => ({ label, gate, state })))(
+			"$label -> $state",
+			({ gate, state }) => {
+				const { verdict, status } = read(gate);
+				expect(verdict.exitCode).toBe(EXIT_SUCCESS);
+				expect(verdict.kind).toBe("success");
+				for (const name of DEFERRED_ADVISORY_CHECKS) {
+					expect(status(name), name).toBe(state);
+				}
+			},
+		);
 
 		// An older workflow (neither the gate nor `changes` exists) must not be
 		// relabelled once its verdict is terminal.
@@ -247,95 +193,6 @@ describe("ci-verdict deferred advisory rows (#3801)", () => {
 				check_runs: green.filter((run) => run.name !== CHANGES_CHECK),
 			});
 			expect(deferred(verdict.rows)).toEqual([]);
-		});
-	});
-
-	// Recurrence (verify r2 V2): once the heavy gate is red or skipped, GitHub
-	// writes a completed `skipped` check-run for the mutation job, so it is a
-	// PRESENT row and the NOT RUN branch (written for absent rows) never fired in
-	// production: the line read "STALE" or "no report (job skipped)" without the
-	// cause. The line must name the gate's state when the mutation row is skipped.
-	describe("when the mutation job has a completed skipped check-run", () => {
-		const base = [
-			checkRun("Unit tests", "completed", "success", 1),
-			checkRun("Lint & type-check", "completed", "success", 2),
-			checkRun(CHANGES_CHECK, "completed", "success", 3),
-			checkRun("mutation (advisory)", "completed", "skipped", 5),
-			checkRun("Unit tests Windows (advisory)", "completed", "skipped", 6),
-		];
-		const head = "b".repeat(40);
-		const comment = {
-			id: 9,
-			user: { login: "github-actions[bot]" },
-			body: `<!-- pi-lens-mutation-diff -->\n### Mutation diff (advisory)\n\n- **Head:** \`${"a".repeat(40)}\`\n\nNo survivors.`,
-		};
-		const line = (
-			gate: ReturnType<typeof checkRun> | null,
-			withComment = true,
-		) => {
-			const verdict = computeVerdict({
-				check_runs: gate ? [...base, gate] : base,
-			});
-			return formatMutationLine(
-				withComment ? [comment] : [],
-				head,
-				verdict.rows,
-			);
-		};
-
-		it("names a red gate as the cause, with the stale comment's head", () => {
-			expect(
-				line(checkRun(HEAVY_GATE_CHECK, "completed", "failure", 4)),
-			).toMatch(
-				/NOT RUN -- the heavy gate concluded failure .*lint\.yml required check was red or unfinished.*STALE \(PR head is b{12}\)/,
-			);
-		});
-
-		it("names a skipped gate as the cause, with and without a sticky comment", () => {
-			const gate = checkRun(HEAVY_GATE_CHECK, "completed", "skipped", 4);
-			expect(line(gate)).toMatch(
-				/NOT RUN -- the heavy gate was skipped .*STALE/,
-			);
-			expect(line(gate, false)).toMatch(
-				/NOT RUN -- the heavy gate was skipped .*; no Mutation diff comment on this PR$/,
-			);
-		});
-
-		it("says so when the job was skipped although the gate passed", () => {
-			expect(
-				line(checkRun(HEAVY_GATE_CHECK, "completed", "success", 4)),
-			).toMatch(
-				/NOT RUN -- the job was skipped although the heavy gate passed/,
-			);
-		});
-
-		// The reinterpretation is for a SKIPPED mutation row only: a mutation job
-		// that ran keeps its own wording whatever the gate's row says.
-		it("leaves a mutation job that ran alone", () => {
-			const ran = base.map((run) =>
-				run.name === "mutation (advisory)"
-					? checkRun(run.name, "completed", "success", 5)
-					: run,
-			);
-			const verdict = computeVerdict({
-				check_runs: [
-					...ran,
-					checkRun(HEAVY_GATE_CHECK, "completed", "success", 4),
-				],
-			});
-			expect(formatMutationLine([], head, verdict.rows)).toBe(
-				"MUTATION (advisory, never gates): no report (job success) -- no Mutation diff comment on this PR",
-			);
-			expect(formatMutationLine([comment], head, verdict.rows)).toMatch(
-				/STALE \(PR head is b{12}\)$/,
-			);
-		});
-
-		// Without a gate row (an older workflow) the line keeps its old wording.
-		it("keeps the old wording when there is no gate row", () => {
-			expect(line(null, false)).toBe(
-				"MUTATION (advisory, never gates): no report (job skipped) -- no Mutation diff comment on this PR",
-			);
 		});
 	});
 });

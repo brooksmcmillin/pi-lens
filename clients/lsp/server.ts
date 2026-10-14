@@ -29,6 +29,7 @@ import {
 	DOTNET_CSHARP_ROOT_MARKERS,
 	DOTNET_FSHARP_ROOT_MARKERS,
 	KIND_EXTENSIONS,
+	LEAN_ROOT_MARKERS,
 } from "../file-kinds.js";
 import { extensionsForLanguage } from "../language-registry.js";
 import {
@@ -36,6 +37,7 @@ import {
 	direntsHaveMarkerGlobMatch,
 	isAtOrAboveHomeDir,
 	isFullyQualified,
+	isUnderDir,
 	isWindowsPath,
 	matchesWorkspaceMemberPattern,
 	normalizeEphemeralMapKey,
@@ -72,6 +74,11 @@ import {
 	unknownDirMtimeRecords,
 } from "../workspace-topology.js";
 import { bounded } from "../deadline-utils.js";
+import {
+	DEFAULT_LSP_SERVER_ROLE,
+	type LspReplyOrdering,
+	type LspServerRole,
+} from "./server-traits.js";
 import { FRESHNESS_CADENCE_MS } from "../freshness-cadence.js";
 import { HOOK_WALL_BUDGET_MS } from "../hook-budgets.js";
 import { recordDegradationOnce } from "../degradation-ledger.js";
@@ -87,7 +94,12 @@ import {
 	isCommandAvailableAsync,
 	safeSpawnAsync,
 } from "../safe-spawn.js";
-import { type LSPProcess, launchLSP } from "./launch.js";
+import {
+	type LSPProcess,
+	admitProjectSuppliedTsserver,
+	launchLSP,
+} from "./launch.js";
+import { ephemeralStagingRoot } from "../ephemeral-root.js";
 import { createLombokJdtlsArgs } from "./lombok.js";
 import { resolveJavaRuntimeEnv } from "./jvm-runtime.js";
 import { normalizeMapKey } from "./path-utils.js";
@@ -154,6 +166,15 @@ export async function resolveLspServerCwd(
 	onRootFailure?: (reason: string) => void,
 	onRootFallback?: (fallback: LspRootFallback) => void,
 ): Promise<string | undefined> {
+	const stagingRoot = ephemeralStagingRoot(filePath);
+	if (stagingRoot) {
+		recordDegradationOnce({
+			kind: "lsp-root-declined",
+			subject: stagingRoot,
+			reason: "LSP root declined for host pi-agent staging directory",
+		});
+		return undefined;
+	}
 	const rootMarkers = server.rootMarkers ?? server.root.rootMarkers;
 	let serverRoot: string | undefined;
 	let rootFailed = false;
@@ -469,6 +490,9 @@ async function nearestNonExcludedFallbackRoot(
 
 export interface LSPSpawnOptions {
 	allowInstall?: boolean;
+	/** Session trust does not authorize adopted project code. */
+	projectCodeAllowed?: boolean;
+	sessionRoot?: string;
 }
 
 export interface LSPServerInfo {
@@ -485,17 +509,62 @@ export interface LSPServerInfo {
 	idleEviction: "transparent" | "resident" | "unmeasured";
 	/** True for entries supplied through `lsp.servers.*`, not the built-in table. */
 	custom?: boolean;
+	/** True when startup/indexing can execute project-owned build or plugin code. */
+	executesProjectCode?: boolean;
+	/** Set by compileLspRegistry after the source trust decision is admitted. */
+	trustAllowed?: boolean;
+	/**
+	 * The server's own binary command token (args are a separate field, so
+	 * the token IS what an availability probe would ask for). Present on
+	 * custom rows — projected from `CustomServerConfig.command` at
+	 * registration — and read by the runner-coverage seam as the availability
+	 * gate for that row's config-declared `covers` claim: a custom command
+	 * the probe cannot find fails the claim closed and the CLI runner runs.
+	 * Builtin rows leave this undefined; their lane availability speaks
+	 * through {@link BUILTIN_SERVER_RUNNER_COVERS}'s gate commands.
+	 */
+	command?: string;
+	/**
+	 * Dispatch runner ids this server subsumes (`#233` dormant-when-LSP-covers).
+	 * Config-supplied for custom servers (`lsp.servers.<id>.covers`, the stacked
+	 * PR); BUILTIN rows keep this undefined and declare the same fact through
+	 * {@link BUILTIN_SERVER_RUNNER_COVERS}, which also carries the availability
+	 * gates the runner must pass before honouring the fact. Undefined never
+	 * means "covers nothing" — only the facts table may claim a builtin's reach,
+	 * so a covers entry cannot be invented per row without review.
+	 */
+	covers?: readonly string[];
 	root: RootFunction;
 	/** Marker table used by the shared LSP cwd/root seam. */
 	rootMarkers?: readonly string[];
 	/**
-	 * "language" (default) = the file's primary language server (one is chosen per
-	 * file). "auxiliary" = a cross-cutting, diagnostic-only server (security,
-	 * spelling, …) that attaches across many languages and runs ALONGSIDE the
-	 * primary — never selected as primary, collected only on the with-auxiliary
-	 * diagnostics path. See clients/dispatch/auxiliary-lsp.ts.
+	 * The lifecycle-class trait (#1488, #1756 stage 1): "language" = the file's
+	 * primary language server (one is chosen per file); "auxiliary" = a
+	 * cross-cutting, diagnostic-only server (security, spelling, …) that
+	 * attaches across many languages and runs ALONGSIDE the primary — never
+	 * selected as primary, collected only on the with-auxiliary diagnostics
+	 * path. See clients/dispatch/auxiliary-lsp.ts.
+	 *
+	 * NON-OPTIONAL. It was `role?:` before #1488 and 44 sites answered "is this
+	 * an auxiliary?" with their own `role !== "auxiliary"` test, so an absent
+	 * role read as a language server by negation: a third role would have been
+	 * silently classified as a primary at every one of them, with no compile
+	 * error and no failing test. Every registry row now declares it, and the
+	 * two constructions that cannot — a custom server from `lsp.servers.<id>`,
+	 * whose public `role` field stays reserved and inert until its catalog
+	 * slice, and this file's two server factories — apply
+	 * {@link DEFAULT_LSP_SERVER_ROLE} explicitly. Ask {@link isAuxiliary},
+	 * never the literal.
 	 */
-	role?: "language" | "auxiliary";
+	role: LspServerRole;
+	/**
+	 * #1722 reply-ordering trait: whether a reply proves the server processed
+	 * the content notifications written before it. Consumed by the auxiliary
+	 * notify barrier (`paceAuxNotify` in clients/lsp/index.ts), whose soundness
+	 * rests on the answer — see {@link LspReplyOrdering} for the measured
+	 * evidence and the fail-safe `unmeasured` default.
+	 */
+	replyOrdering?: LspReplyOrdering;
 	/**
 	 * ID of the preferred language server this server backs up. Primary selection
 	 * already tries language servers in registry order; this marker prevents an
@@ -515,6 +584,8 @@ export interface LSPServerInfo {
 	requiresProjectRoot?: boolean;
 	/** Simple command name whose absence disables spawn attempts briefly across roots. */
 	availabilityKey?: string;
+	/** Simple binary name whose project-local install must be refused for adopted roots. */
+	projectLocalCommand?: string;
 	/**
 	 * Optional extra candidacy gate beyond `extensions`. When present, a file
 	 * must ALSO satisfy this predicate to be a candidate server for it — for a
@@ -537,14 +608,17 @@ export interface LSPServerInfo {
 	 */
 	clientWaitTimeoutMs?: number;
 	/**
-	 * #1714: how many document notifies this AUXILIARY server may hold
-	 * unacknowledged before the next notify has to prove the server drained its
-	 * input (`awaitAuxNotifyDrain`, clients/lsp/index.ts). Ignored for primaries —
-	 * they serve one file per touch and are not the fan-out target a project
-	 * sweep floods.
+	 * #1714 backlog trait: how many document notifies this AUXILIARY server may
+	 * hold unacknowledged before the next notify has to prove the server
+	 * drained its input (`paceAuxNotify` and `auxNotifyBacklogAtCeiling`,
+	 * clients/lsp/index.ts). Ignored for primaries — they serve one file per
+	 * touch and are not the fan-out target a project sweep floods.
 	 *
 	 * Omit to take the shared auxiliary default. Set it only for a server class
-	 * with evidence of a lower ceiling.
+	 * with evidence of a lower ceiling. Read through
+	 * {@link serverTraits}, which is the one place the declaration, the
+	 * `PI_LENS_LSP_AUX_NOTIFY_INFLIGHT` override and the default are ordered
+	 * (#1756 stage 1).
 	 */
 	notifyInflightLimit?: number;
 	/**
@@ -1479,6 +1553,7 @@ interface InteractiveServerSpec {
 	language: string;
 	fallbackFor?: string;
 	requiresProjectRoot?: boolean;
+	executesProjectCode?: boolean;
 	command: string | ((root: string) => string);
 	args?: string[] | ((root: string) => string[]);
 	initialization?:
@@ -1499,10 +1574,16 @@ function createInteractiveServer(spec: InteractiveServerSpec): LSPServerInfo {
 		name: spec.name,
 		extensions: spec.extensions,
 		idleEviction: "unmeasured",
+		// `InteractiveServerSpec` declares no role, so the factory applies the
+		// stated default rather than leaving `role` absent for each consumer to
+		// read by negation (#1488). An auxiliary would declare its role on a
+		// row of its own, the way the four scanner rows do.
+		role: DEFAULT_LSP_SERVER_ROLE,
 		root: spec.root,
 		rootMarkers: spec.root.rootMarkers,
 		fallbackFor: spec.fallbackFor,
 		requiresProjectRoot: spec.requiresProjectRoot,
+		executesProjectCode: spec.executesProjectCode,
 		availabilityKey:
 			typeof spec.command === "string" && isSimpleCommand(spec.command)
 				? spec.command
@@ -2058,8 +2139,49 @@ async function typescriptVersionForTsc(
 async function findTsserverPath(
 	root: string,
 	allowInstall: boolean | undefined,
+	options?: LSPSpawnOptions,
 ): Promise<string | undefined> {
 	const fs = await import("node:fs/promises");
+	// All sources fold here. Real paths prevent a managed spelling that links
+	// back into project bytes from escaping the provenance decision.
+	const projectRoots = await Promise.all(
+		[root, options?.sessionRoot ?? process.cwd(), process.cwd()].map((dir) =>
+			fs.realpath(dir).catch(() => path.resolve(dir)),
+		),
+	);
+	const admitCandidate = async (
+		candidate: string,
+		projectSupplied: boolean,
+	) => {
+		try {
+			const real = await fs.realpath(candidate);
+			// Only this filename makes the wrapper use the exact file; other
+			// names are reinterpreted as a package directory (5.3.0 resolver).
+			if (
+				path.basename(real) !== "tsserver.js" ||
+				!(await fs.stat(real)).isFile()
+			)
+				return undefined;
+			const manifest = JSON.parse(
+				await fs.readFile(
+					path.join(path.dirname(real), "..", "package.json"),
+					"utf8",
+				),
+			);
+			// The wrapper ignores an explicit path without a package version, then
+			// searches the workspace (#4299 F1). Never hand it such a path.
+			if (typeof manifest?.version !== "string" || !manifest.version)
+				return undefined;
+			return admitProjectSuppliedTsserver(
+				real,
+				options?.sessionRoot ?? process.cwd(),
+				projectSupplied || projectRoots.some((dir) => isUnderDir(real, dir)),
+				options?.projectCodeAllowed,
+			);
+		} catch {
+			return undefined;
+		}
+	};
 	const ancestorHit = await findAncestorFile(
 		root,
 		"node_modules",
@@ -2067,7 +2189,10 @@ async function findTsserverPath(
 		"lib",
 		"tsserver.js",
 	);
-	if (ancestorHit) return ancestorHit;
+	if (ancestorHit) {
+		const admittedAncestor = await admitCandidate(ancestorHit, true);
+		if (admittedAncestor) return admittedAncestor;
+	}
 	const cwdCandidate = path.join(
 		process.cwd(),
 		"node_modules",
@@ -2077,19 +2202,21 @@ async function findTsserverPath(
 	);
 	try {
 		await fs.access(cwdCandidate);
-		return cwdCandidate;
+		// cwd is a session project source, even outside a nested LSP root.
+		const admittedCwd = await admitCandidate(cwdCandidate, false);
+		if (admittedCwd) return admittedCwd;
 	} catch {
 		/* not found */
 	}
 	const tsserverForTsc = async (
 		tscPath: string | undefined,
 	): Promise<string | undefined> => {
-		if (!tscPath) return undefined;
+		if (!tscPath || !path.isAbsolute(tscPath)) return undefined;
 		for (const dir of typescriptDirsForTsc(tscPath)) {
 			const candidate = path.join(dir, "lib", "tsserver.js");
 			try {
-				await fs.access(candidate);
-				return candidate;
+				const admitted = await admitCandidate(candidate, false);
+				if (admitted) return admitted;
 			} catch {
 				/* not found */
 			}
@@ -2479,15 +2606,24 @@ const TypeScriptRoot: RootFunction = withRootMarkers(
 export const TypeScriptServer: LSPServerInfo = {
 	id: "typescript",
 	idleEviction: "transparent",
+	role: "language",
 	name: "TypeScript Language Server",
+	projectLocalCommand: "typescript-language-server",
 	extensions: JS_TS_LSP_EXTENSIONS,
 	autoPropagateDiagnostics: true,
 	root: TypeScriptRoot,
 	rootMarkers: TypeScriptRoot.rootMarkers,
 	async spawn(root, options) {
-		const fs = await import("node:fs/promises");
 		const nativeLsp = await findNativeTypeScriptLsp(root);
-		if (nativeLsp) {
+		if (
+			nativeLsp &&
+			admitProjectSuppliedTsserver(
+				nativeLsp.command,
+				root,
+				true,
+				options?.projectCodeAllowed,
+			)
+		) {
 			const env = await getToolEnvironment();
 			logSessionStart(
 				`lsp typescript-native: version=${nativeLsp.version} command=${nativeLsp.command}`,
@@ -2525,26 +2661,29 @@ export const TypeScriptServer: LSPServerInfo = {
 			}
 		}
 
-		// Find tsserver.js — also try relative to the LSP binary for local installs
-		let tsserverPath = await findTsserverPath(root, options?.allowInstall);
+		// An unset/invalid hint lets the wrapper select project bytes itself.
+		// Require an admitted compiler before launching the classic wrapper.
+		const tsserverPath = await findTsserverPath(
+			root,
+			options?.allowInstall,
+			options,
+		);
 		if (!tsserverPath) {
-			const localCandidate = path.join(
-				path.dirname(lspPath),
-				"..",
-				"typescript",
-				"lib",
-				"tsserver.js",
+			admitProjectSuppliedTsserver(
+				undefined,
+				root,
+				true,
+				options?.projectCodeAllowed,
 			);
-			try {
-				await fs.access(localCandidate);
-				tsserverPath = localCandidate;
-			} catch {
-				/* not found */
-			}
+			return undefined;
 		}
 		if (tsserverPath) source = "managed";
 
-		// Use absolute path and proper environment
+		// The installed wrapper selects its child from the
+		// `initialization.tsserver.path` returned below; the legacy
+		// `TSSERVER_PATH` variable is set too, but this wrapper version does not
+		// read it. Both name the same admitted path, so neither an older wrapper
+		// that reads the variable nor this one can fork a different compiler.
 		const env = await getToolEnvironment();
 		const proc = await launchLSP(lspPath, ["--stdio"], {
 			cwd: root,
@@ -2568,6 +2707,7 @@ export const TypeScriptServer: LSPServerInfo = {
 export const DenoServer: LSPServerInfo = {
 	id: "deno",
 	idleEviction: "transparent",
+	role: "language",
 	name: "Deno Language Server",
 	fallbackFor: "typescript",
 	extensions: JS_TS_LSP_EXTENSIONS,
@@ -2589,6 +2729,7 @@ export const DenoServer: LSPServerInfo = {
 export const PythonServer: LSPServerInfo = {
 	id: "python",
 	idleEviction: "transparent",
+	role: "language",
 	name: "Pyright Language Server",
 	extensions: KIND_EXTENSIONS["python"],
 	root: RootWithFallback(
@@ -2735,7 +2876,8 @@ export const PythonServer: LSPServerInfo = {
 
 export const PythonJediServer: LSPServerInfo = {
 	id: "python-jedi",
-	idleEviction: "unmeasured",
+	idleEviction: "transparent",
+	role: "language",
 	name: "Jedi Language Server",
 	fallbackFor: "python",
 	extensions: KIND_EXTENSIONS["python"],
@@ -2774,6 +2916,7 @@ export const PythonJediServer: LSPServerInfo = {
 export const GoServer: LSPServerInfo = {
 	id: "go",
 	idleEviction: "unmeasured",
+	role: "language",
 	name: "gopls",
 	extensions: KIND_EXTENSIONS["go"],
 	root: RootWithFallback(
@@ -3018,9 +3161,11 @@ function JavaWorkspaceRoot(): RootFunction {
 export const RustServer: LSPServerInfo = {
 	id: "rust",
 	idleEviction: "unmeasured",
+	role: "language",
 	// Measured (#3750): rust-analyzer answers an empty result for a detached file.
 	requiresProjectRoot: true,
 	name: "rust-analyzer",
+	executesProjectCode: true,
 	extensions: KIND_EXTENSIONS["rust"],
 	// No FileDirRoot fallback (#201): rust-analyzer is a heavy workspace server
 	// that is useless without a Cargo manifest. With the fallback, every .rs file
@@ -3059,7 +3204,9 @@ export const RustServer: LSPServerInfo = {
 export const RubyServer: LSPServerInfo = {
 	id: "ruby",
 	idleEviction: "unmeasured",
+	role: "language",
 	name: "Ruby LSP",
+	executesProjectCode: true,
 	extensions: KIND_EXTENSIONS["ruby"],
 	root: RootWithFallback(
 		PriorityRoot([["Gemfile", ".ruby-version"], [".git"]]),
@@ -3121,6 +3268,7 @@ export const RubyServer: LSPServerInfo = {
 export const PHPServer: LSPServerInfo = {
 	id: "php",
 	idleEviction: "transparent",
+	role: "language",
 	name: "Intelephense",
 	extensions: KIND_EXTENSIONS["php"],
 	root: RootWithFallback(
@@ -3203,7 +3351,9 @@ function buildPsesArgs(bundleDir: string): string[] {
 export const PowerShellServer: LSPServerInfo = {
 	id: "powershell",
 	idleEviction: "unmeasured",
+	role: "language",
 	name: "PowerShell Editor Services",
+	executesProjectCode: true,
 	extensions: KIND_EXTENSIONS["powershell"],
 	// Index at the workspace (script modules reference siblings); fall back to the
 	// file dir.
@@ -3228,9 +3378,11 @@ export const PowerShellServer: LSPServerInfo = {
 export const CSharpServer: LSPServerInfo = {
 	id: "csharp",
 	idleEviction: "unmeasured",
+	role: "language",
 	// Documented (#3750): csharp-ls needs a solution or project.
 	requiresProjectRoot: true,
 	name: "csharp-ls",
+	executesProjectCode: true,
 	extensions: KIND_EXTENSIONS["csharp"],
 	// No FileDirRoot fallback (#201): csharp-ls is a workspace server and should
 	// not spawn once per source directory before a .sln/.csproj exists. Glob root
@@ -3259,6 +3411,7 @@ export const CSharpServer: LSPServerInfo = {
 export const OmniSharpServer = createInteractiveServer({
 	id: "omnisharp",
 	name: "OmniSharp",
+	executesProjectCode: true,
 	// Documented (#3750): OmniSharp needs a solution or project.
 	requiresProjectRoot: true,
 	fallbackFor: "csharp",
@@ -3272,9 +3425,11 @@ export const OmniSharpServer = createInteractiveServer({
 export const FSharpServer: LSPServerInfo = {
 	id: "fsharp",
 	idleEviction: "unmeasured",
+	role: "language",
 	// Documented (#3750): FSAutocomplete needs a project.
 	requiresProjectRoot: true,
 	name: "FSAutocomplete",
+	executesProjectCode: true,
 	extensions: KIND_EXTENSIONS["fsharp"],
 	root: createRootDetector([...DOTNET_FSHARP_ROOT_MARKERS]),
 	async spawn(root, options) {
@@ -3302,6 +3457,7 @@ export const FSharpServer: LSPServerInfo = {
 export const JavaServer = createInteractiveServer({
 	id: "java",
 	name: "JDT Language Server",
+	executesProjectCode: true,
 	extensions: KIND_EXTENSIONS["java"],
 	root: RootWithFallback(JavaWorkspaceRoot()),
 	language: "java",
@@ -3313,7 +3469,9 @@ export const JavaServer = createInteractiveServer({
 export const KotlinServer: LSPServerInfo = {
 	id: "kotlin",
 	idleEviction: "unmeasured",
+	role: "language",
 	name: "Kotlin Language Server",
+	executesProjectCode: true,
 	extensions: KIND_EXTENSIONS["kotlin"],
 	root: RootWithFallback(
 		createRootDetector(["build.gradle.kts", "build.gradle", "pom.xml"]),
@@ -3337,9 +3495,27 @@ export const KotlinServer: LSPServerInfo = {
 	},
 };
 
+export const LeanServer = createInteractiveServer({
+	id: "lean",
+	name: "Lean 4 Language Server",
+	extensions: KIND_EXTENSIONS.lean,
+	root: RootWithFallback(createRootDetector([...LEAN_ROOT_MARKERS])),
+	language: "lean",
+	// Documented (#3750): `lake serve` analyses a file only when a Lake project
+	// roots it; a root-fallback empty answer is unconfirmed, not clean.
+	requiresProjectRoot: true,
+	// `lake serve` loads and interprets the project's `lakefile.lean` and its
+	// imported build scripts, so it executes project-owned code: refuse it until
+	// the host grants project trust (#4269).
+	executesProjectCode: true,
+	command: "lake",
+	args: ["serve"],
+});
+
 export const SwiftServer = createInteractiveServer({
 	id: "swift",
 	name: "SourceKit-LSP",
+	executesProjectCode: true,
 	extensions: KIND_EXTENSIONS["swift"],
 	root: createRootDetector(["Package.swift"]),
 	language: "swift",
@@ -3348,6 +3524,7 @@ export const SwiftServer = createInteractiveServer({
 
 export const DartServer = createInteractiveServer({
 	id: "dart",
+	executesProjectCode: true,
 	name: "Dart Analysis Server",
 	extensions: KIND_EXTENSIONS["dart"],
 	root: RootWithFallback(createRootDetector(["pubspec.yaml"])),
@@ -3387,6 +3564,9 @@ function createTreeBinaryServer(spec: {
 		name: spec.name,
 		extensions: spec.extensions,
 		idleEviction: spec.idleEviction ?? "unmeasured",
+		// The spec declares no role, so the factory applies the stated default
+		// (#1488) — see `createInteractiveServer`.
+		role: DEFAULT_LSP_SERVER_ROLE,
 		root: spec.root,
 		spawn(root, options) {
 			return resolveAndLaunchTreeBinary(
@@ -3441,7 +3621,9 @@ export const CppServer: LSPServerInfo = createTreeBinaryServer({
 
 export const ZigServer: LSPServerInfo = {
 	id: "zig",
+	executesProjectCode: true,
 	idleEviction: "unmeasured",
+	role: "language",
 	name: "ZLS",
 	extensions: KIND_EXTENSIONS["zig"],
 	root: RootWithFallback(createRootDetector(["build.zig"])),
@@ -3461,6 +3643,7 @@ export const ZigServer: LSPServerInfo = {
 export const HaskellServer = createInteractiveServer({
 	id: "haskell",
 	name: "Haskell Language Server",
+	executesProjectCode: true,
 	extensions: KIND_EXTENSIONS["haskell"],
 	root: createRootDetector(["stack.yaml", "cabal.project", "*.cabal"]),
 	language: "haskell",
@@ -3471,6 +3654,7 @@ export const HaskellServer = createInteractiveServer({
 export const ElixirServer = createInteractiveServer({
 	id: "elixir",
 	name: "ElixirLS",
+	executesProjectCode: true,
 	extensions: KIND_EXTENSIONS["elixir"],
 	root: RootWithFallback(createRootDetector(["mix.exs"])),
 	language: "elixir",
@@ -3480,7 +3664,9 @@ export const ElixirServer = createInteractiveServer({
 export const ElixirExpertServer: LSPServerInfo = {
 	id: "expert",
 	idleEviction: "unmeasured",
+	role: "language",
 	name: "Expert",
+	executesProjectCode: true,
 	fallbackFor: "elixir",
 	extensions: KIND_EXTENSIONS["elixir"],
 	root: RootWithFallback(createRootDetector(["mix.exs"])),
@@ -3502,6 +3688,7 @@ export const ElixirExpertServer: LSPServerInfo = {
 export const GleamServer: LSPServerInfo = {
 	id: "gleam",
 	idleEviction: "unmeasured",
+	role: "language",
 	name: "Gleam LSP",
 	extensions: KIND_EXTENSIONS["gleam"],
 	root: RootWithFallback(createRootDetector(["gleam.toml"])),
@@ -3522,7 +3709,9 @@ export const GleamServer: LSPServerInfo = {
 
 export const TinymistServer: LSPServerInfo = {
 	id: "tinymist",
+	executesProjectCode: true,
 	idleEviction: "unmeasured",
+	role: "language",
 	name: "Tinymist",
 	extensions: extensionsForLanguage("typst"),
 	root: RootWithFallback(createRootDetector(["typst.toml", ".git"])),
@@ -3543,6 +3732,7 @@ export const TinymistServer: LSPServerInfo = {
 export const MarksmanServer: LSPServerInfo = {
 	id: "marksman",
 	idleEviction: "transparent",
+	role: "language",
 	name: "Marksman",
 	extensions: KIND_EXTENSIONS["markdown"],
 	// Index at the workspace root so cross-file checks (broken intra-repo links,
@@ -3566,6 +3756,7 @@ export const MarksmanServer: LSPServerInfo = {
 
 export const OCamlServer = createInteractiveServer({
 	id: "ocaml",
+	executesProjectCode: true,
 	name: "ocamllsp",
 	extensions: KIND_EXTENSIONS["ocaml"],
 	root: createRootDetector(["dune-project", "opam"]),
@@ -3575,7 +3766,9 @@ export const OCamlServer = createInteractiveServer({
 
 export const ClojureServer: LSPServerInfo = {
 	id: "clojure",
+	executesProjectCode: true,
 	idleEviction: "transparent",
+	role: "language",
 	name: "Clojure LSP",
 	extensions: KIND_EXTENSIONS["clojure"],
 	root: createRootDetector(["deps.edn", "project.clj"]),
@@ -3597,6 +3790,7 @@ export const ClojureServer: LSPServerInfo = {
 export const CueServer: LSPServerInfo = {
 	id: "cue",
 	idleEviction: "unmeasured",
+	role: "language",
 	name: "CUE Language Server",
 	extensions: KIND_EXTENSIONS["cue"],
 	root: RootWithFallback(createRootDetector(["cue.mod", ".git"])),
@@ -3615,7 +3809,9 @@ export const CueServer: LSPServerInfo = {
 
 export const TerraformServer: LSPServerInfo = {
 	id: "terraform",
+	executesProjectCode: true,
 	idleEviction: "unmeasured",
+	role: "language",
 	name: "Terraform LSP",
 	extensions: KIND_EXTENSIONS["terraform"],
 	root: RootWithFallback(
@@ -3636,6 +3832,7 @@ export const TerraformServer: LSPServerInfo = {
 
 export const NixServer = createInteractiveServer({
 	id: "nix",
+	executesProjectCode: true,
 	name: "nixd",
 	extensions: KIND_EXTENSIONS["nix"],
 	root: createRootDetector(["flake.nix"]),
@@ -3646,8 +3843,15 @@ export const NixServer = createInteractiveServer({
 export const BashServer: LSPServerInfo = {
 	id: "bash",
 	idleEviction: "transparent",
+	role: "language",
 	name: "Bash Language Server",
-	extensions: [".bash", ".sh", ".zsh"],
+	// #3968: narrowed from [".bash", ".sh", ".zsh"] — bash-language-server does
+	// not support zsh (its own analyzer refuses the dialect), and its ≥5.7.0
+	// lint flow even feeds shebang'd zsh to its embedded shellcheck, importing
+	// SC1071-class noise through the LSP lane. `shuck` owns `.zsh` when
+	// installed; when it is not, the shellcheck runner's dialect gate keeps
+	// zsh quiet instead of falling back to a zsh-illiterate analyzer.
+	extensions: [".bash", ".sh"],
 	root: FileDirRoot,
 	// #2194 bounded the installer's own verification at 20s; the dispatch
 	// touch's client-wait floor stayed at the shared 5s default, so a cold
@@ -3675,9 +3879,55 @@ export const BashServer: LSPServerInfo = {
 	},
 };
 
+/**
+ * Builtin runner-cover facts live in `./server-covers.js` — the leaf the
+ * dispatch seam (`clients/dispatch/runners/utils/runner-helpers.ts`) can
+ * import without pulling this registry in (a registry import closes a cycle
+ * through the installer's graph; `no-client-cycles`, #2125). Re-exported so
+ * the {@link LSPServerInfo} consumers import covers facts from the registry
+ * module like the rest of its surface. See {@link LSPServerInfo.covers}.
+ */
+export type { ServerRunnerCoverFact } from "./server-covers.js";
+export { BUILTIN_SERVER_RUNNER_COVERS } from "./server-covers.js";
+
+/**
+ * Shuck — zsh-aware shell language server (#3968). The builtin primary for
+ * `.zsh`: bash-language-server refuses the dialect outright, and its ≥5.7.0
+ * lint flow even feeds shebang'd zsh to its embedded shellcheck, so the
+ * `.zsh` extension claim moved here from {@link BashServer} (settled with the
+ * maintainer: bash ≠ zsh, and the incumbent cannot parse it).
+ *
+ * Provenance pinned per defect shape 16 to `ewhauser/shuck@21e04198463a54be
+ * 70aa7826acc4dcdbe7996b2b` (v0.2.3, MIT): `shuck server` is a plain stdio
+ * LSP; `textDocumentSync` declares incremental change with `openClose` and
+ * NO `save` capability (a didSave never follows — the capability check in
+ * the shared sync machinery keeps that true); diagnostics carry source
+ * `"shuck"` and native `C/S/P/X/K` codes; `# shellcheck disable=SC…`
+ * directives in owned files are honored by the server itself (suppression
+ * spec 006 maps SC codes through). The builtin covers fact — shuck subsumes
+ * the `shellcheck` runner's lint — lives in the covers-fact leaf
+ * (`clients/lsp/server-covers.ts`), not on the row, so the availability
+ * gates can travel with it without giving the dispatch seam a reason to
+ * import this registry (cycle boundary).
+ *
+ * No managed install and no `shuck check` CLI runner in this work:
+ * distribution is brew/pip/cargo/npm-wasm/release binaries, and the #233
+ * pair between a future shuck runner and this LSP is its own round.
+ */
+export const ShuckServer: LSPServerInfo = createInteractiveServer({
+	id: "shuck",
+	name: "Shuck",
+	extensions: [".zsh"],
+	root: FileDirRoot,
+	language: "shell",
+	command: "shuck",
+	args: ["server"],
+});
+
 export const FishServer: LSPServerInfo = {
 	id: "fish",
 	idleEviction: "transparent",
+	role: "language",
 	name: "Fish Language Server",
 	extensions: KIND_EXTENSIONS["fish"],
 	root: RootWithFallback(createRootDetector([".git"])),
@@ -3696,7 +3946,9 @@ export const FishServer: LSPServerInfo = {
 
 export const CMakeServer: LSPServerInfo = {
 	id: "cmake",
+	executesProjectCode: true,
 	idleEviction: "unmeasured",
+	role: "language",
 	name: "CMake Language Server",
 	// CMake's canonical project file has no .cmake suffix. The configured-server
 	// matcher supports exact basenames as well as extensions.
@@ -3717,7 +3969,8 @@ export const CMakeServer: LSPServerInfo = {
 
 export const DockerServer: LSPServerInfo = {
 	id: "docker",
-	idleEviction: "unmeasured",
+	idleEviction: "transparent",
+	role: "language",
 	name: "Dockerfile Language Server",
 	extensions: [".dockerfile", "Dockerfile"],
 	root: RootWithFallback(
@@ -3744,9 +3997,58 @@ export const DockerServer: LSPServerInfo = {
 	},
 };
 
+/**
+ * Official Docker Language Server (`docker-language-server start --stdio`,
+ * docker/docker-language-server). It is a same-language alternate of
+ * {@link DockerServer} whose binary name AND argv differ from the legacy
+ * rcjsuen npm server, so it cannot be a candidate inside DockerServer's spec:
+ * that spec's `args` are shared by every candidate and omit `start` (#3939).
+ *
+ * It is acquired only through the registry's `fallbackFor` owner when `docker`
+ * declines (binary absent, spawn throws, or the id is denied). The argv vector
+ * is a third-party CLI contract (AGENTS.md shape 16), pinned at upstream
+ * docker/docker-language-server commit 5187ff578db630f5df5b5922a10d8415a5bb7d32
+ * (main, 26 commits after tag v0.20.1 = cb62b8b3710e81988521238c89232e95ef728111;
+ * `internal/pkg/cli/start.go` declares `Use: "start"` and the `--stdio` flag at
+ * both commits). Its capabilities,
+ * publish order, and idle cost are UNMEASURED: no official binary is installed
+ * on CI, so the legacy row's measurements must not be attributed here, and it
+ * declares no `managedToolId` (no installer entry and no automatic download).
+ */
+export const DockerOfficialServer: LSPServerInfo = {
+	id: "docker-official",
+	idleEviction: "unmeasured",
+	role: "language",
+	name: "Docker Language Server (official)",
+	fallbackFor: "docker",
+	extensions: [".dockerfile", "Dockerfile"],
+	root: RootWithFallback(
+		PriorityRoot([
+			[
+				"docker-compose.yml",
+				"docker-compose.yaml",
+				"compose.yml",
+				"compose.yaml",
+			],
+			[".git"],
+		]),
+	),
+	spawn(root, options) {
+		return resolveAndLaunch(
+			{
+				candidates: nodeBinCandidates(root, "docker-language-server"),
+				args: ["start", "--stdio"],
+				cwd: root,
+			},
+			options?.allowInstall,
+		);
+	},
+};
+
 export const YamlServer: LSPServerInfo = {
 	id: "yaml",
 	idleEviction: "transparent",
+	role: "language",
 	name: "YAML Language Server",
 	extensions: KIND_EXTENSIONS["yaml"],
 	root: RootWithFallback(
@@ -3770,7 +4072,8 @@ export const YamlServer: LSPServerInfo = {
 
 export const JsonServer: LSPServerInfo = {
 	id: "json",
-	idleEviction: "unmeasured",
+	idleEviction: "transparent",
+	role: "language",
 	name: "VSCode JSON Language Server",
 	extensions: KIND_EXTENSIONS["json"],
 	root: RootWithFallback(
@@ -3802,6 +4105,7 @@ export const JsonServer: LSPServerInfo = {
 export const HtmlServer: LSPServerInfo = {
 	id: "html",
 	idleEviction: "transparent",
+	role: "language",
 	name: "VSCode HTML Language Server",
 	extensions: KIND_EXTENSIONS["html"],
 	root: RootWithFallback(
@@ -3825,6 +4129,7 @@ export const HtmlServer: LSPServerInfo = {
 export const TomlServer: LSPServerInfo = {
 	id: "toml",
 	idleEviction: "unmeasured",
+	role: "language",
 	name: "Taplo",
 	extensions: KIND_EXTENSIONS["toml"],
 	root: RootWithFallback(
@@ -3846,6 +4151,7 @@ export const TomlServer: LSPServerInfo = {
 export const PrismaServer: LSPServerInfo = {
 	id: "prisma",
 	idleEviction: "transparent",
+	role: "language",
 	name: "Prisma Language Server",
 	extensions: KIND_EXTENSIONS["prisma"],
 	root: RootWithFallback(
@@ -3879,7 +4185,9 @@ export const PrismaServer: LSPServerInfo = {
 
 export const VueServer: LSPServerInfo = {
 	id: "vue",
+	executesProjectCode: true,
 	idleEviction: "unmeasured",
+	role: "language",
 	name: "Vue Language Server",
 	extensions: [".vue"],
 	root: RootWithFallback(
@@ -3904,7 +4212,11 @@ export const VueServer: LSPServerInfo = {
 	clientWaitTimeoutMs: 30_000,
 	initializeTimeoutMs: 30_000,
 	async spawn(root, options) {
-		const tsserverPath = await findTsserverPath(root, options?.allowInstall);
+		const tsserverPath = await findTsserverPath(
+			root,
+			options?.allowInstall,
+			options,
+		);
 
 		// Vue Language Server needs Vue dependencies installed to resolve types.
 		// Without node_modules, navigation requests will timeout or return empty.
@@ -3939,7 +4251,9 @@ export const VueServer: LSPServerInfo = {
 
 export const SvelteServer: LSPServerInfo = {
 	id: "svelte",
+	executesProjectCode: true,
 	idleEviction: "unmeasured",
+	role: "language",
 	name: "Svelte Language Server",
 	extensions: [".svelte"],
 	root: RootWithFallback(
@@ -3962,7 +4276,11 @@ export const SvelteServer: LSPServerInfo = {
 	clientWaitTimeoutMs: 20_000,
 	initializeTimeoutMs: 20_000,
 	async spawn(root, options) {
-		const tsserverPath = await findTsserverPath(root, options?.allowInstall);
+		const tsserverPath = await findTsserverPath(
+			root,
+			options?.allowInstall,
+			options,
+		);
 		const proc = await resolveAndLaunch(
 			{
 				candidates: [
@@ -3989,6 +4307,7 @@ export const SvelteServer: LSPServerInfo = {
 export const CssServer: LSPServerInfo = {
 	id: "css",
 	idleEviction: "transparent",
+	role: "language",
 	name: "CSS Language Server",
 	extensions: KIND_EXTENSIONS["css"],
 	root: RootWithFallback(
@@ -4074,8 +4393,8 @@ function opengrepInitialization(root: string): Record<string, unknown> {
 export const OpengrepServer: LSPServerInfo = {
 	id: "opengrep",
 	idleEviction: "transparent",
-	name: "Opengrep Security Scanner",
 	role: "auxiliary",
+	name: "Opengrep Security Scanner",
 	extensions: OPENGREP_EXTENSIONS,
 	// Stable per-repo root so ONE warm server serves the whole project (a
 	// per-directory root would spawn a fresh server — and re-pay rule load —
@@ -4151,8 +4470,8 @@ const AST_GREP_EXTENSIONS: readonly string[] = Array.from(
 export const AstGrepServer: LSPServerInfo = {
 	id: "ast-grep",
 	idleEviction: "unmeasured",
-	name: "ast-grep structural linter",
 	role: "auxiliary",
+	name: "ast-grep structural linter",
 	extensions: AST_GREP_EXTENSIONS,
 	// Attaches everywhere (#239 Phase 2): prefer a project `sgconfig.y[a]ml` root,
 	// else the repo root (.git) or cwd — like Opengrep. When there's no project
@@ -4171,6 +4490,13 @@ export const AstGrepServer: LSPServerInfo = {
 	// the whole file on every didOpen, so it absorbs a sweep more slowly than the
 	// other scanners — hold it to half the shared default.
 	notifyInflightLimit: 4,
+	// #1722, measured against the real binary over 30 repository files rather
+	// than assumed: ast-grep-lsp is tower-lsp-server and drains its message
+	// stream in order on one task, so the notify barrier's round-trip proves
+	// the backlog was scanned. Declared here because the barrier's soundness
+	// rests on it (#1756 stage 1); the evidence table is on
+	// `LspReplyOrdering`.
+	replyOrdering: "single-task-ordered",
 	// First scan of a session compiles the rules.
 	initializeTimeoutMs: 15000,
 	async spawn(root, options) {
@@ -4221,8 +4547,8 @@ const ZIZMOR_EXTENSIONS: readonly string[] = KIND_EXTENSIONS["yaml"];
 export const ZizmorServer: LSPServerInfo = {
 	id: "zizmor",
 	idleEviction: "unmeasured",
-	name: "zizmor Actions Security Scanner",
 	role: "auxiliary",
+	name: "zizmor Actions Security Scanner",
 	extensions: ZIZMOR_EXTENSIONS,
 	pathFilter: isZizmorAuditTarget,
 	// Stable per-repo root so ONE warm server serves the whole project (like
@@ -4310,8 +4636,8 @@ function typosInitialization(
 export const TyposServer: LSPServerInfo = {
 	id: "typos",
 	idleEviction: "unmeasured",
-	name: "typos Spell Checker",
 	role: "auxiliary",
+	name: "typos Spell Checker",
 	extensions: TYPOS_EXTENSIONS,
 	// Stable per-repo root so ONE warm server serves the whole project (like the
 	// other auxiliaries) — typos.toml discovery is repo-relative.
@@ -4349,6 +4675,7 @@ export const LSP_SERVERS: LSPServerInfo[] = [
 	FSharpServer,
 	JavaServer,
 	KotlinServer,
+	LeanServer,
 	SwiftServer,
 	DartServer,
 	LuaServer,
@@ -4366,9 +4693,11 @@ export const LSP_SERVERS: LSPServerInfo[] = [
 	TerraformServer,
 	NixServer,
 	BashServer,
+	ShuckServer,
 	FishServer,
 	CMakeServer,
 	DockerServer,
+	DockerOfficialServer, // alternate of docker; acquired only when docker declines (#3939)
 	YamlServer,
 	JsonServer,
 	HtmlServer,

@@ -42,6 +42,50 @@ const step = (job: Job, name: string) => {
 };
 
 describe("#3753 sharded Unit tests workflow contract", () => {
+	it("keeps shard setup local and cache-only", () => {
+		const shard = CI().test;
+		expect(asList(shard.needs)).toEqual([]);
+		expect(step(shard, "Install dependencies").run).toContain("npm install");
+		expect(step(shard, "Build").run).toBe("npm run build");
+		const cache = step(shard, "Cache npm cache");
+		expect(cache.with?.key).toContain("hashFiles('package-lock.json')");
+		expect(cache.with?.path).toBe("~/.npm");
+	});
+
+	// Recurrence: changing the matrix job or its shard population without
+	// updating the required aggregate can make branch protection observe the
+	// wrong job. The aggregate must follow the one matrix job by id.
+	it("makes the Unit aggregate depend on the shard matrix job", () => {
+		const jobs = CI();
+		const matrixJobs = Object.entries(jobs).filter(
+			([, job]) =>
+				job.name?.startsWith("Unit tests (shard ") &&
+				job.strategy?.matrix?.shard !== undefined,
+		);
+		expect(matrixJobs.map(([id]) => id)).toEqual(["test"]);
+		expect(asList(jobs["unit-tests"].needs)).toContain(matrixJobs[0][0]);
+		expect(matrixJobs[0][1].strategy?.matrix?.shard?.length).toBeGreaterThan(1);
+	});
+
+	// Recurrence: #4039 round 2 left `tla-models` with `needs: test` while its
+	// env still read `needs.tla-shards.result`; actionlint caught it on CI only
+	// (run 37599120579). Any job reading `needs.<id>.result` must need <id>.
+	it("every job that reads needs.<id>.result lists <id> in needs", () => {
+		const jobs = CI();
+		const broken: string[] = [];
+		for (const [id, job] of Object.entries(jobs)) {
+			const text = JSON.stringify({
+				env: job.env,
+				if: job.if,
+				steps: (job as { steps?: unknown }).steps,
+			});
+			for (const m of text.matchAll(/needs\.([A-Za-z0-9_-]+)\.result/g))
+				if (!asList(job.needs).includes(m[1]))
+					broken.push(`${id} reads needs.${m[1]} without needing it`);
+		}
+		expect(broken).toEqual([]);
+	});
+
 	// Recurrence: a required check that is SKIPPED (its `needs` failed) counts
 	// as passing in branch protection. An aggregate without `if: always()`
 	// would turn a red shard into a green `Unit tests`.
@@ -76,6 +120,7 @@ describe("#3753 sharded Unit tests workflow contract", () => {
 			Array.from({ length: shards.length }, (_, index) => index + 1),
 		);
 		expect(shards.length).toBeGreaterThan(1);
+		expect(shards.length).toBe(5);
 		expect(shard.strategy?.["fail-fast"]).toBe(false);
 		expect(shard.name).toBe(
 			"Unit tests (shard ${{ matrix.shard }}/${{ strategy.job-total }})",
@@ -132,6 +177,10 @@ describe("#3753 sharded Unit tests workflow contract", () => {
 		const upload = step(shard, "Upload per-file test results");
 		const name = String(upload.with?.name);
 		expect(name).toBe("unit-test-results-linux-shard-${{ matrix.shard }}");
+		const downloader = readFileSync(
+			resolve(ROOT, "scripts/download-test-history-artifacts.mjs"),
+			"utf8",
+		);
 		const rollup = String(
 			step(
 				jobsOf(".github/workflows/tool-smoke.yml")["test-history-rollup"],
@@ -139,9 +188,10 @@ describe("#3753 sharded Unit tests workflow contract", () => {
 			).run,
 		);
 		for (const index of shard.strategy?.matrix?.shard ?? []) {
-			expect(rollup).toContain(` unit-test-results-linux-shard-${index}`);
+			expect(downloader).toContain(`"unit-test-results-linux-shard-${index}"`);
 		}
 		// Artifacts uploaded before the sharding keep the unsuffixed name.
-		expect(rollup).toContain("for artifact_name in unit-test-results-linux ");
+		expect(downloader).toContain('"unit-test-results-linux"');
+		expect(rollup).toContain("download-test-history-artifacts.mjs");
 	});
 });

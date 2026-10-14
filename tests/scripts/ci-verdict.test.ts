@@ -632,8 +632,7 @@ describe("computeVerdict — rerun de-duplication (latest-started wins)", () => 
 	// #2539 round 2, F2/F5: the shared `resolveLatestByName` tie policy
 	// (scripts/lib/ci-checks.mjs) is fail-closed, not id-based. A superseded
 	// SUCCESS carrying the HIGHER id, or a duplicate with no `started_at` at
-	// all, must not read as success -- both are covered again here (beyond
-	// merge-train-warden.test.ts's own coverage of the shared resolver)
+	// all, must not read as success -- both are covered here
 	// because ci-verdict.mjs is what actually calls it with REST-shaped runs.
 	it("does not let a superseded success with the higher id win an unorderable tie (in_progress first)", () => {
 		const payload = {
@@ -1431,14 +1430,14 @@ describe("isAdvisoryCheck — every job name from a PR-triggered workflow is cla
 		"typos (advisory)",
 		"taplo (advisory)",
 		"mutation (advisory)",
-		// #3531: posts the mutation job's survivors as a sticky PR comment;
-		// continue-on-error like the job it reports on, so never gating.
 		"mutation comment (advisory)",
 		"complexity (advisory)",
 		// #2697 item 9: the strictness census lane (two scratch tsconfigs) is advisory.
 		"strictness (advisory)",
 		"Targeted tests (advisory)",
 		"host latest nightly (advisory)",
+		// #4077: its tracking-issue writer job, same suffix rule.
+		"host latest notify (advisory)",
 		// #3801: PR-time CodeQL (advanced setup), matrix-expanded from ci.yml's
 		// `codeql` job. Classified by the suffix; tests/config/codeql-workflow
 		// pins the job shape.
@@ -1525,7 +1524,6 @@ describe("isAdvisoryCheck — every job name from a PR-triggered workflow is cla
 			"yamllint (advisory)",
 			"typos (advisory)",
 			"taplo (advisory)",
-			"mutation (advisory)",
 		]) {
 			expect(isAdvisoryCheck(name)).toBe(true);
 		}
@@ -1552,7 +1550,6 @@ describe("isAdvisoryCheck — every job name from a PR-triggered workflow is cla
 				"yamllint (advisory)",
 				"typos (advisory)",
 				"taplo (advisory)",
-				"mutation (advisory)",
 				"complexity (advisory)",
 				"Targeted tests (advisory)",
 			]),
@@ -2233,7 +2230,7 @@ describe("run --wait — transient gh errors back off instead of exiting 70 (#29
 						},
 					},
 				});
-			// #3779: the advisory MUTATION read is not a check-runs call.
+			// The retained advisory comment read is not a check-runs request.
 			if (String(args[1]).endsWith("/comments")) return "[]";
 			checkRunsCalls += 1;
 			const failure = failures[checkRunsCalls - 1];
@@ -2959,7 +2956,11 @@ describe("run — a registered ci.yml run suppresses the re-arm advice (#3861)",
 	// N1: pin the exact rendered lines, never the formatter under test, so a
 	// formatter regression reds here.
 	const REARM_LINE = `required checks absent for 45 min on ${FORK_APPROVAL.sha} (auto-merge on) — push or merge master to re-arm`;
-	const REGISTERED_TAIL = "the run is registered, so no re-arm is needed";
+	// Recurrence: a queued or in-progress run was described only by the
+	// negative fact that re-arm was unnecessary, leaving the operator without
+	// the action that matches the live state: wait for CI.
+	const REGISTERED_TAIL =
+		"wait for the registered run to finish; no re-arm is needed";
 	const TERMINAL_TAIL =
 		"the run is terminal and cannot produce the missing check-runs -- inspect it or re-run it manually (gh run rerun 4242); the verdict never re-arms automatically";
 	const UNKNOWN_LINE = `required checks absent for 45 min on ${FORK_APPROVAL.sha} and the ci.yml run lookup was unreadable: no re-arm advice without a run answer`;
@@ -3895,7 +3896,7 @@ describe("formatAbsentRunReason — unnamed run, omitted age, terminal rerun tex
 			sha: "abc123",
 		});
 		expect(text).toBe(
-			"ci.yml an unnamed run is queued for abc123: the run is registered, so no re-arm is needed",
+			"ci.yml an unnamed run is queued for abc123: wait for the registered run to finish; no re-arm is needed",
 		);
 		expect(text).not.toContain("Stryker");
 	});

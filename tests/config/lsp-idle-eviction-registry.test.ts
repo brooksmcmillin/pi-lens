@@ -45,15 +45,16 @@ const TRANSPARENT_IDS = [
 	"php",
 	"prisma",
 	"yaml",
+	"docker",
+	"json",
+	"python-jedi",
 ] as const;
 const NEXT_PHASE_ELIGIBLE_IDS = [
 	"ast-grep",
 	"cue",
-	"docker",
+	"docker-official",
 	"gleam",
-	"json",
 	"lua",
-	"python-jedi",
 	"terraform",
 	"tinymist",
 	"toml",
@@ -70,6 +71,8 @@ const HOLD_INDEXER_IDS = [
 ] as const;
 const UNPROVEN_IDS = [
 	"cmake",
+	"lean",
+	"shuck",
 	"vue",
 	"csharp",
 	"dart",
@@ -124,7 +127,7 @@ describe("LSP idle-eviction registry (#3622)", () => {
 		expect(LSP_SERVERS.length).toBeGreaterThan(40);
 	});
 
-	it("pins the 46-server registry by idle-eviction decision class (#3952)", () => {
+	it("pins the 49-server registry by idle-eviction decision class (#3952, #3939)", () => {
 		const declared = new Map(LSP_SERVERS.map((s) => [s.id, s.idleEviction]));
 		const classified = [
 			...TRANSPARENT_IDS,

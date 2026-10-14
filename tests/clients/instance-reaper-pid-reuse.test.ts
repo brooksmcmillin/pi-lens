@@ -43,6 +43,8 @@
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import * as fs from "node:fs";
+// The CJS object the code under test reads through: the namespace is frozen.
+import nodeFs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -527,6 +529,37 @@ describe.skipIf(process.platform !== "linux")(
 			expect(signalledPids().has(child.pid as number)).toBe(false);
 		});
 
+		// #3986 recurrence: a cross-session or cross-worker kill. The backstop
+		// is machine-wide, so the sweeping session's home tracks none of another
+		// live session's (or plegma worker's) children, and a POSIX child whose
+		// launcher exited has a ppid that names neither owner. Only the owner
+		// tag says it is still owned; a rule that shields only the sweeper's own
+		// children would kill it.
+		it("[CrossHome] a live owner that is not the sweeper keeps its reparented child until that owner dies", async () => {
+			const owner = spawnHost(); // a live owner that is not the sweeper
+			const ownerPid = owner.pid as number;
+			const child = spawnLsp(tag(ownerPid, startOf(ownerPid)));
+			const pid = child.pid as number;
+			// The sweeper tracks none of its children: its registry is empty.
+			// (getGlobalPiLensDir is mocked to one dir, so "owner is not the
+			// sweeper" is what this case varies, not a second real home.)
+
+			await backstop();
+			expect(signalledPids().has(pid)).toBe(false);
+			expect(
+				h.latency.find((r) => r.phase === "orphan_backstop_reaped")?.metadata,
+			).toMatchObject({ eligible: 0, killed: 0 });
+
+			const ownerExited = once(owner, "exit");
+			owner.kill("SIGKILL"); // the other session dies
+			await ownerExited;
+			const exited = once(child, "exit");
+			await backstop();
+			expect(signalledPids().has(pid)).toBe(true);
+			expect((await exited)[1]).toBe("SIGKILL");
+			expect(signalledPids().has(ownerPid)).toBe(false);
+		});
+
 		it("an owner pid now held by a process with another start is a dead owner", async () => {
 			const stranger = spawnHost();
 			const orphan = spawnLsp(tag(stranger.pid as number, OTHER_START));
@@ -638,6 +671,52 @@ describe.skipIf(process.platform !== "linux")(
 			expect(environ).toContain(
 				`PI_LENS_OWNER=${tag(process.pid, startOf(process.pid))}`,
 			);
+			handle.process.kill("SIGKILL");
+		});
+
+		// #3986 recurrence: an inherited stale owner tag making a live server
+		// look orphaned. A host whose own start is unreadable gets no tag to
+		// give; launchLSP then used to leave whatever PI_LENS_OWNER the host
+		// itself inherited (a dead foreign owner's) in the child's environment,
+		// so the live host's server read as owned by a dead process and the
+		// backstop was entitled to kill it. An untagged server is spared.
+		it("[StaleInheritedTag] a host that cannot read its own start gives its server no owner tag, not an inherited dead one", async () => {
+			const { launchLSP } = await import("../../clients/lsp/launch.js");
+			const stale = tag(deadPid(), OTHER_START);
+			const realRead = nodeFs.readFileSync;
+			// The boot id is half of every start this process can name; without it
+			// ownProcessStart is undefined, exactly as on a host that hides it.
+			const hideBootId = vi.spyOn(nodeFs, "readFileSync").mockImplementation(((
+				file: unknown,
+				...rest: unknown[]
+			) => {
+				if (file === "/proc/sys/kernel/random/boot_id")
+					throw new Error("EACCES: boot_id hidden by the test");
+				return (realRead as (...a: unknown[]) => unknown)(file, ...rest);
+			}) as typeof nodeFs.readFileSync);
+			const hadOwner = process.env.PI_LENS_OWNER;
+			process.env.PI_LENS_OWNER = stale;
+			let handle: Awaited<ReturnType<typeof launchLSP>>;
+			try {
+				handle = await launchLSP(
+					process.execPath,
+					["-e", "setInterval(()=>{},1e6)", TSLS, "--stdio"],
+					{ cwd: process.cwd() },
+				);
+			} finally {
+				hideBootId.mockRestore();
+				if (hadOwner === undefined) delete process.env.PI_LENS_OWNER;
+				else process.env.PI_LENS_OWNER = hadOwner;
+			}
+			children.push(handle.process);
+			h.mine.add(handle.pid as number);
+			const environ = fs
+				.readFileSync(`/proc/${handle.pid}/environ`, "utf8")
+				.split("\0");
+
+			expect(environ.filter((v) => v.startsWith("PI_LENS_OWNER="))).toEqual([]);
+			await backstop();
+			expect(signalledPids().has(handle.pid as number)).toBe(false);
 			handle.process.kill("SIGKILL");
 		});
 	},

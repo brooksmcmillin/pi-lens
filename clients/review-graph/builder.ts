@@ -30,6 +30,7 @@ import {
 import type { LSPSymbol } from "../lsp/client.js";
 import {
 	isAtOrAboveHomeDir,
+	isUnderDir,
 	normalizeFilePath,
 	normalizeMapKey,
 	toProjectRelativePath,
@@ -94,6 +95,10 @@ import type {
 	ReviewGraphPersistWorkerRequest,
 	ReviewGraphPersistWorkerResult,
 } from "./persist-worker.js";
+import {
+	readWorkerHeapStatistics,
+	type PersistWorkerHeapStatistics,
+} from "../persist-worker-stats.js";
 import {
 	clearReviewGraphFileIr,
 	getFreshReviewGraphFileIr,
@@ -2091,6 +2096,31 @@ let _workerDisabled = false;
 let _persistWorkerUnavailableReason: string | undefined;
 let _lastWorkerFallbackReasonForTests: string | undefined;
 
+let _persistWorkerHeapStatistics: PersistWorkerHeapStatistics | null = null;
+
+/**
+ * Refreshes a bounded, last-known view; Worker#getHeapStatistics is async.
+ * The sampler does not await the result (the reading lags one sample); tests
+ * await it instead of polling ticks.
+ */
+export function refreshReviewGraphPersistWorkerHeapStatistics(): Promise<void> {
+	const worker = _persistWorker;
+	if (!worker || typeof worker.getHeapStatistics !== "function") {
+		return Promise.resolve();
+	}
+	return readWorkerHeapStatistics(worker)
+		.then((stats) => {
+			// An answer that lands after the worker's exit or death clear belongs
+			// to a dead isolate; every clear also drops the worker reference.
+			if (_persistWorker === worker) _persistWorkerHeapStatistics = stats;
+		})
+		.catch(() => {});
+}
+
+export function getReviewGraphPersistWorkerHeapStatistics(): PersistWorkerHeapStatistics | null {
+	return _persistWorkerHeapStatistics;
+}
+
 // #936/#958 follow-up: the mid-build resume checkpoint offloads its stringify+
 // gzip to the SAME shared persist worker (keeping the gzip of a growing graph
 // off the event loop during a background build). Tracked in a disjoint id/
@@ -2589,6 +2619,7 @@ function handleCheckpointWorkerResult(
 function handleWorkerDeath(reason: string): void {
 	_persistWorkerUnavailableReason = reason;
 	_persistWorker = undefined;
+	_persistWorkerHeapStatistics = null;
 	_workerDisabled = true;
 	const requests = [..._workerRequests.values()];
 	_workerRequests.clear();
@@ -2681,6 +2712,7 @@ function getPersistWorker(): Worker | undefined {
 				// recycling): drop the stale reference so a later persist respawns
 				// instead of posting into a dead worker (#950 review F7).
 				_persistWorker = undefined;
+				_persistWorkerHeapStatistics = null;
 			}
 		});
 		// #1148: adding a message listener refs the Worker's public MessagePort.
@@ -3505,6 +3537,7 @@ export async function terminateReviewGraphPersistWorkerForTests(): Promise<void>
 export function resetReviewGraphPersistWorkerForTests(): void {
 	_workerDisabled = false;
 	_persistWorker = undefined;
+	_persistWorkerHeapStatistics = null;
 	_persistWorkerUnavailableReason = undefined;
 	_lastWorkerFallbackReasonForTests = undefined;
 	_checkpointWorkerRequests.clear();
@@ -3740,17 +3773,16 @@ function localImportToFile(
 		}
 		return undefined;
 	}
+	// #4101: `filePath` is a canonical key (`normalizeMapKey`) and `cwd` is the
+	// caller's spelling of the root. `isUnderDir` canonicalizes BOTH sides, so a
+	// root reached through an 8.3 name, a junction or a subst drive no longer
+	// drops the edge. Existence runs first: it rejects the many absent
+	// source-twin candidates for a stat, before any realpath.
 	const root = path.resolve(cwd);
 	for (const candidate of jsTsCandidatePaths(filePath, source)) {
-		const relative = path.relative(root, candidate);
-		if (
-			(relative.startsWith("..") &&
-				(relative.length === 2 || relative.startsWith(`..${path.sep}`))) ||
-			path.isAbsolute(relative) ||
-			!fs.existsSync(candidate)
-		)
-			continue;
+		if (!fs.existsSync(candidate)) continue;
 		const normalized = normalizeMapKey(candidate);
+		if (!isUnderDir(normalized, root)) continue;
 		if (ignoredIds?.has(normalized)) continue;
 		return normalized;
 	}

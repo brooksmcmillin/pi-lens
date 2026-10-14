@@ -37,6 +37,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { setPlatform } from "../support/platform-stub.js";
 
 interface SpawnRecord {
 	command: string;
@@ -122,13 +123,6 @@ vi.mock("../../clients/instance-registry.js", () => ({
 }));
 
 const realPlatform = process.platform;
-function setPlatform(platform: NodeJS.Platform): void {
-	Object.defineProperty(process, "platform", {
-		value: platform,
-		configurable: true,
-	});
-}
-
 /**
  * `instance-reaper.ts` reads `process.platform` into a module-load-time
  * `const isWindows`, so forcing the platform only takes effect on a FRESH

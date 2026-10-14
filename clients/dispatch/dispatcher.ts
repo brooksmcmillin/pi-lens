@@ -67,10 +67,22 @@ import {
 	observeRunnerLatency,
 } from "./collect-later-tier.js";
 import { deferRunnerFindings } from "./pending-runner-findings.js";
+import {
+	ADOPTED_ROOT_RUNNER_ALLOWLIST,
+	filterGroupsForAdoptedRoot,
+} from "./adopted-root-runners.js";
 
-import { applyRulePolicy, rulePolicyMapFromConfig } from "./rule-policy.js";
+import {
+	applyRulePolicy,
+	resolvedRulePolicyMap,
+	rulePolicyMapFromConfig,
+} from "./rule-policy.js";
 import { getToolProfile } from "./tool-profile.js";
-import { hasUsableResult, isRunnerSkipReason } from "./types.js";
+import {
+	hasUsableResult,
+	isRunnerClaimSource,
+	isRunnerSkipReason,
+} from "./types.js";
 
 const dispatcherProbeFlights = createAvailabilityProbeFlight<
 	Awaited<ReturnType<typeof probeToolAsync>>
@@ -85,12 +97,14 @@ import type {
 	RunnerGroup,
 	RunnerRegistry as RunnerRegistryContract,
 	RunnerResult,
+	RunnerClaimSource,
 	RunnerSkipReason,
 } from "./types.js";
 import {
 	DELTA_UNUSED_PROMOTION_NOTE,
 	formatDiagnostics,
 } from "./utils/format-utils.js";
+import { registerRunnerId } from "./known-runner-ids.js";
 
 // --- Runner Registry ---
 
@@ -100,6 +114,11 @@ export class RunnerRegistry implements RunnerRegistryContract {
 	register(runner: RunnerDefinition): void {
 		if (this.runners.has(runner.id)) return;
 		this.runners.set(runner.id, runner);
+		// The registry is the runner-id identity source (#3968): every id that
+		// enters any registry is the set `lsp.servers.<id>.covers` validation
+		// projects from (`clients/dispatch/known-runner-ids.ts`, an import
+		// leaf so the config loader can ask without importing this graph).
+		registerRunnerId(runner.id);
 	}
 
 	get(id: string): RunnerDefinition | undefined {
@@ -330,6 +349,10 @@ export function createDispatchContext(
 	telemetryProvider?: string,
 	/** #3568: the session of a post-write dispatch, for its deferred runners. */
 	sessionGeneration?: GenerationHandle,
+	/** Stable session identity for deferred runner delivery. */
+	sessionId?: string,
+	/** Root ownership selected by the shared analysis-root seam. */
+	analysisRootMode?: import("../analysis-root.js").AnalysisRootMode,
 ): DispatchContext {
 	const absoluteFilePath = resolveRunnerPath(cwd, filePath);
 	const normalizedProjectRoot = normalizeMapKey(
@@ -362,6 +385,7 @@ export function createDispatchContext(
 				})
 			: undefined;
 	const projectConfig = loadPiLensProjectConfig(normalizedCwd);
+	const rulePolicy = resolvedRulePolicyMap(normalizedProjectRoot);
 
 	return {
 		filePath: normalizedFilePath,
@@ -369,6 +393,7 @@ export function createDispatchContext(
 		cwd: normalizedCwd,
 		kind,
 		fileRole,
+		analysisRootMode,
 		generatedEvidence: generatedDetail?.evidence,
 		generatedLineShapeMean: generatedDetail?.lineShapeMean,
 		pi,
@@ -376,10 +401,12 @@ export function createDispatchContext(
 		deltaMode: !pi.getFlag("no-delta"),
 		facts,
 		projectConfig,
+		rulePolicy,
 		blockingOnly,
 		modifiedRanges,
 		writeIndex,
 		sessionGeneration,
+		sessionId,
 		telemetryModel,
 		telemetryProvider,
 		toolCwdMemo: {},
@@ -587,6 +614,8 @@ export interface RunnerLatency {
 	/** The runner's own `failureKind`, when it set one (#3781). */
 	failureKind?: string;
 	skipReason?: RunnerSkipReason;
+	/** WHO supplied the `covered-by-primary` claim (#3968 F2). */
+	claimSource?: RunnerClaimSource;
 	unconfirmedServerIds?: readonly string[];
 	deferredServerIds?: readonly string[];
 }
@@ -738,13 +767,19 @@ function buildCoverageNotice(
 		"fact-rules",
 		"opengrep",
 	]);
-	const anyLinterHasCoverage = runnerLatencies.some(
+
+	// These fallback runners provide type coverage when the primary group is
+	// unavailable. Keep this explicit until runner metadata owns this capability.
+	const TYPE_CAPABLE_FALLBACK_RUNNERS = new Set(["mypy"]);
+	const anyFallbackHasCoverage = runnerLatencies.some(
 		(r) =>
 			fallbackRunnerIds.has(r.runnerId) &&
 			!STRUCTURAL_RUNNERS.has(r.runnerId) &&
-			hasUsableResult(r),
+			hasUsableResult(r) &&
+			(!plan?.capabilities.includes("types") ||
+				TYPE_CAPABLE_FALLBACK_RUNNERS.has(r.runnerId)),
 	);
-	if (anyLinterHasCoverage) return undefined;
+	if (anyFallbackHasCoverage) return undefined;
 
 	const onceKey = `${ctx.kind}:${ctx.filePath}`;
 	if (dedupe) {
@@ -1033,7 +1068,11 @@ async function runGroup(
 					status: result.status,
 					diagnosticCount: result.diagnostics.length,
 					semantic: result.semantic ?? semantic,
-					metadata: { tier: "collect-later", delivered: "turn_end" },
+					metadata: {
+						tier: "collect-later",
+						delivered: "turn_end",
+						...failureRowMetadata(result),
+					},
 				});
 				return result;
 			});
@@ -1046,6 +1085,7 @@ async function runGroup(
 				writeIndex: ctx.writeIndex,
 				promise: deferred,
 				session: ctx.sessionGeneration,
+				sessionId: ctx.sessionId,
 			});
 			// A deferred runner is still an observed runner. Keep it visible in
 			// both the edit latency report and the widget until its turn-end result
@@ -1114,6 +1154,13 @@ async function runGroup(
 			result.status === "skipped" && isRunnerSkipReason(result.skipReason)
 				? result.skipReason
 				: undefined;
+		// WHO claimed, for `covered-by-primary` (#3968 F2). Admitted only on
+		// actual skips and only through the closed-taxonomy guard, like
+		// skipReason, so free text cannot enter durable latency metadata.
+		const claimSource =
+			result.status === "skipped" && isRunnerClaimSource(result.claimSource)
+				? result.claimSource
+				: undefined;
 
 		latencies.push({
 			runnerId,
@@ -1128,6 +1175,9 @@ async function runGroup(
 			}),
 			...(skipReason !== undefined && {
 				skipReason,
+			}),
+			...(claimSource !== undefined && {
+				claimSource,
 			}),
 			...(result.unconfirmedServerIds !== undefined && {
 				unconfirmedServerIds: result.unconfirmedServerIds,
@@ -1155,14 +1205,10 @@ async function runGroup(
 						}))
 					: undefined,
 			metadata:
-				result.status === "failed" && result.failureKind
-					? {
-							failureKind: result.failureKind,
-							failureMessage: result.failureMessage,
-						}
-					: skipReason
-						? { skipReason }
-						: undefined,
+				failureRowMetadata(result) ??
+				(skipReason
+					? { skipReason, ...(claimSource !== undefined && { claimSource }) }
+					: undefined),
 		});
 		recordRunner(
 			ctx.filePath,
@@ -1207,6 +1253,45 @@ export async function dispatchForFile(
 	options?: { dedupeCoverageNotice?: boolean },
 ): Promise<DispatchResult> {
 	const _overallStart = Date.now();
+	if (ctx.analysisRootMode === "adopted") {
+		// #4242 phase A (per-file linters): an adopted root runs ONLY the explicit
+		// admission list of config-free, code-free runners, and only from global or
+		// pi-lens-managed binaries. The default is refused, so a newly registered
+		// runner stays off an adopted root until `ADOPTED_ROOT_RUNNER_ALLOWLIST`
+		// admits it. Whole-project scanners and test runners are not in the plan
+		// for a per-file dispatch, and turn-end tests stay off via the foreign
+		// checkout gate.
+		const planned = groups.flatMap((g) => g.runnerIds);
+		groups = filterGroupsForAdoptedRoot(groups);
+		const admitted = new Set(groups.flatMap((g) => g.runnerIds));
+		logLatency({
+			type: "phase",
+			filePath: ctx.filePath,
+			phase: "dispatch_adopted_root_allowlist",
+			durationMs: 0,
+			metadata: {
+				admissionList: ADOPTED_ROOT_RUNNER_ALLOWLIST.join(","),
+				admitted: groups.flatMap((g) => g.runnerIds).join(","),
+				refused: planned
+					.flatMap((id) => (admitted.has(id) ? [] : [id]))
+					.join(","),
+				noAdmittedRunner: groups.length === 0,
+			},
+		});
+		if (groups.length === 0) {
+			return {
+				diagnostics: [],
+				blockers: [],
+				warnings: [],
+				baselineWarningCount: 0,
+				fixed: [],
+				resolvedCount: 0,
+				output: "",
+				blockerOutput: "",
+				hasBlockers: false,
+			};
+		}
+	}
 	if (ctx.fileRole === "generated") {
 		// The generated short-circuit (refs #2346): never ran before this fix
 		// for name-less machine-emitted files (a scraped/minified page has no
@@ -1348,9 +1433,11 @@ export async function dispatchForFile(
 	// the same root here keeps the two surfaces in agreement. `ctx.projectConfig`
 	// itself is untouched — thresholds and mutation flags keep their existing
 	// language-root resolution.
-	const rulePolicy = rulePolicyMapFromConfig(
-		loadPiLensProjectConfig(ctx.projectRoot ?? ctx.cwd).rules,
-	);
+	const rulePolicy =
+		ctx.rulePolicy ??
+		rulePolicyMapFromConfig(
+			loadPiLensProjectConfig(ctx.projectRoot ?? ctx.cwd).rules,
+		);
 	// The output-only filter pipeline: LSP/docker overlap suppression + inline
 	// `pi-lens-ignore` + agent/user dispositions + project rule policy. Applied
 	// AFTER dedupe so the pi renderer, widget, and delta all see one filtered
@@ -1381,7 +1468,10 @@ export async function dispatchForFile(
 			ctx.filePath,
 			fileContent,
 		);
-		return applyRulePolicy(disposition, rulePolicy);
+		return applyRulePolicy(disposition, rulePolicy, {
+			root: ctx.projectRoot ?? ctx.cwd,
+			filePath: ctx.filePath,
+		});
 	};
 	let visibleDiagnostics = applyOutputFilters(dedupedDiagnostics);
 	let resolvedCount = 0;
@@ -1571,6 +1661,21 @@ function normalizeDiagnosticFilePath(
 	}
 
 	return resolveRunnerPath(ctx.cwd, rawPath || ctx.filePath);
+}
+
+/**
+ * The `failureKind` of a failed run, for the latency.log runner row (#3796).
+ * Inline and collect-later rows share it, so the log analyzer reads one place.
+ */
+function failureRowMetadata(
+	result: RunnerResult,
+): { failureKind: string; failureMessage: string | undefined } | undefined {
+	return result.status === "failed" && result.failureKind
+		? {
+				failureKind: result.failureKind,
+				failureMessage: result.failureMessage,
+			}
+		: undefined;
 }
 
 async function runRunner(

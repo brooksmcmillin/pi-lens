@@ -1159,6 +1159,25 @@ describe("project-scope tools.<name>.enabled (#3112)", () => {
 		expect(warnCountFor('"lsp.enabled" is a global-only')).toBe(1);
 	});
 
+	// #3968 AC 4 — verify, don't fix: `tools.shellcheck.enabled` is spelled
+	// against a RUNNER id, not a TOOL_REGISTRY tool, so `readToolConfig` must
+	// keep emitting PILENS_CFG_0009 instead of silently no-op'ing. This pin
+	// exists so a future change cannot widen `tools.*` to accept runner ids
+	// without review — the knob would start reading like it works while
+	// governing nothing.
+	it("keeps refusing a runner id under tools.* — shellcheck is a runner, not a tool", () => {
+		fs.writeFileSync(
+			path.join(tmpDir, ".pi-lens.json"),
+			JSON.stringify({ tools: { shellcheck: { enabled: false } } }),
+		);
+		loadPiLensProjectConfig(tmpDir);
+		expect(warnedFor("[PILENS_CFG_0009]")).toBe(true);
+		expect(
+			warnedFor('"tools.shellcheck.enabled" is not a recognized pi-lens tool'),
+		).toBe(true);
+		// The setting must not be accepted into tool state either way: no
+		// `tools.shellcheck` entry exists to resolve.
+	});
 	it("leaves an unknown tool name to readToolConfig — one notice, not two", () => {
 		// `readToolConfig` already reports an unrecognized tool name with its own
 		// code (`PILENS_CFG_0009`). A second, generic "check for a typo" notice

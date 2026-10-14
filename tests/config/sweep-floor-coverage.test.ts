@@ -80,6 +80,8 @@ function sweepShapeFiles(): Array<{ file: string; source: string }> {
 }
 
 const DECLARED_EXCEPTIONS: Readonly<Record<string, string>> = {
+	"tests/clients/ast-grep-rule-regex-budget.test.ts":
+		"rule YAML corpus enumeration, not a production population sweep",
 	"tests/config/lsp-idle-eviction-registry.test.ts":
 		"LSP registry policy census; its registry-specific boundary tests are not a sweep-kit floor",
 	"tests/config/github-token-write-gates.test.ts":
@@ -104,10 +106,14 @@ const DECLARED_EXCEPTIONS: Readonly<Record<string, string>> = {
 		"policy unit cases over synthetic language definitions, not a production walk",
 	"tests/clients/lsp/lsp-primary-reachability.test.ts":
 		"synthetic candidate-routing behavior tests; server population coverage is lsp-fixture-coverage",
+	"tests/clients/lsp/docker-official-fallback.test.ts":
+		"docker-official acquisition and argv behavior matrix; the registry/admission population is guarded by lsp-gate-population, lsp-fixture-coverage and the idle-eviction census",
 	"tests/clients/lsp/lsp-registry-consistency.test.ts":
 		"registry relation assertions without a blindable source walk",
 	"tests/clients/lsp/server-policy.test.ts":
 		"server policy behavior cases, not the LSP fixture population sweep",
+	"tests/clients/ephemeral-root.test.ts":
+		"temporary-checkout behavior cases (#1129); it lists one fixture checkout and one sweep directory, not a source population sweep",
 	"tests/tools/lens-diagnostics.test.ts":
 		"diagnostic projection behavior cases, not a production population sweep",
 	"tests/clients/ast-grep-rule-precedence-followups.test.ts":
@@ -194,6 +200,9 @@ const DECLARED_EXCEPTIONS: Readonly<Record<string, string>> = {
 		"host type cases, not a production population sweep",
 	"tests/packaging.test.ts":
 		"packaging behavior cases, not a production population sweep",
+	"tests/scripts/guard-bash-probe.test.ts":
+		"corpus-runner behavior cases over fixture rows and stub hooks (#4071), " +
+		"not a production source-population sweep",
 	"tests/scripts/exec-isolation.test.ts":
 		"checks a freshly created temp directory is empty, not a production " +
 		"population sweep",
@@ -201,6 +210,9 @@ const DECLARED_EXCEPTIONS: Readonly<Record<string, string>> = {
 		"enumerates .github/workflows/*.yml job names for gating/advisory " +
 		"classification (#2618 F3) -- an external CI-contract governance " +
 		"walk, not a clients/ production module registry sweep",
+	"tests/scripts/lane-check.test.ts":
+		"asserts empty failedFiles/scratch results of CLI fixture runs " +
+		"(toEqual([])); behavior cases, not a production population sweep",
 	"tests/scripts/red-on-base.test.ts":
 		"lists one TMPDIR-scoped scratch directory of a CLI fixture run and " +
 		"asserts it is empty after cleanup; not a production population sweep",

@@ -16,6 +16,7 @@ import {
 	parseNameList,
 	planIncrementalAttempt,
 	readProbeCoverage,
+	readProbeSeconds,
 	runProbeProcess,
 	selectionNotes,
 	withReuseCount,
@@ -31,6 +32,7 @@ import {
 	pruneIncrementalReport,
 	selectMutationTests,
 } from "../../scripts/lib/mutation-test-selection.mjs";
+import { UNKNOWN_TEST_SECONDS } from "../../scripts/lib/stryker-diff.mjs";
 
 // Coverage-based test selection and the incremental-cache rules of the mutation
 // diff lane (#3810). The old selector kept the first 47 related tests by path:
@@ -1631,5 +1633,381 @@ describe("incremental cache rules", () => {
 		].join("\n");
 		expect(parseIncrementalReuse(log)).toEqual({ reused: 41, total: 57 });
 		expect(parseIncrementalReuse("no such line")).toBeNull();
+	});
+});
+
+// #4092: the count cap never bound the nightly. Every test file changed in the
+// window is "own" and exempt from it, so both shards of run 37629970371 ran 122
+// files (358 s on 4 cores, 449 s on 2) against Stryker's 5-minute initial-run
+// bound. The runtime cap bounds the kept tests by measured seconds.
+describe("the runtime cap (#4092)", () => {
+	const MEASUREMENT = JSON.parse(
+		readFileSync(
+			resolve(
+				import.meta.dirname,
+				"../fixtures/mutation-dry-run-measurement.json",
+			),
+			"utf8",
+		),
+	);
+	const lines = (entries: Record<string, number | null>) =>
+		new Map(Object.entries(entries));
+	const runtime = (
+		seconds: Record<string, number | null>,
+		maxSeconds: number,
+	) => ({
+		seconds: new Map(Object.entries(seconds)),
+		maxSeconds,
+		unknownSeconds: 3,
+		fileOverheadSeconds: 1,
+	});
+
+	it("replays the measured failing selection: all 122 own files ran before, an estimate within the cap runs now", () => {
+		const seconds: Record<string, number> =
+			MEASUREMENT.local.fileSecondsAtTwoCores;
+		const ownTests = Object.keys(seconds);
+		const common = { related: [], ownTests, lines: null, maxTests: 47 };
+		const before = selectMutationTests(common);
+		expect(before.kept).toHaveLength(122);
+		const after = selectMutationTests({
+			...common,
+			runtime: {
+				seconds: new Map(Object.entries(seconds)),
+				maxSeconds: MEASUREMENT.recommended.maxDryRunSeconds,
+				unknownSeconds: MEASUREMENT.recommended.unknownTestSeconds,
+				fileOverheadSeconds: MEASUREMENT.recommended.testFileOverheadSeconds,
+			},
+		});
+		// Recomputed from the raw measurement, not from the function's own estimate.
+		const total = (tests: string[]) =>
+			tests.reduce(
+				(sum, test) =>
+					sum + seconds[test] + MEASUREMENT.recommended.testFileOverheadSeconds,
+				0,
+			);
+		expect(total(before.kept)).toBeGreaterThan(5 * 60 * 0.9);
+		expect(total(after.kept)).toBeLessThanOrEqual(
+			MEASUREMENT.recommended.maxDryRunSeconds,
+		);
+		expect(after.kept.length).toBeGreaterThan(20);
+		expect(after.overBudget.length + after.kept.length).toBe(122);
+		expect(after.estimatedSeconds).toBe(Math.ceil(total(after.kept)));
+	});
+
+	it("skips a test that does not fit and still fits a cheaper one ranked after it", () => {
+		const selection = selectMutationTests({
+			related: [
+				"tests/big.test.ts",
+				"tests/mid.test.ts",
+				"tests/small.test.ts",
+			],
+			lines: lines({
+				"tests/big.test.ts": 9,
+				"tests/mid.test.ts": 5,
+				"tests/small.test.ts": 1,
+			}),
+			maxTests: 47,
+			// 1 s overhead each: 8 + 5 + 3 would be 16; the cap is 11.
+			runtime: runtime(
+				{
+					"tests/big.test.ts": 7,
+					"tests/mid.test.ts": 4,
+					"tests/small.test.ts": 2,
+				},
+				11,
+			),
+		});
+		expect(selection.kept).toEqual([
+			"tests/big.test.ts",
+			"tests/small.test.ts",
+		]);
+		expect(selection.overBudget).toEqual(["tests/mid.test.ts"]);
+		expect(selection.estimatedSeconds).toBe(11);
+	});
+
+	it("ranks an own test proven to cover nothing behind the other tests when the cap binds (a filter one stage late must not starve covering tests)", () => {
+		const selection = selectMutationTests({
+			related: ["tests/covering.test.ts"],
+			ownTests: ["tests/own-zero.test.ts"],
+			lines: lines({
+				"tests/covering.test.ts": 4,
+				"tests/own-zero.test.ts": 0,
+			}),
+			maxTests: 47,
+			runtime: runtime(
+				{ "tests/covering.test.ts": 5, "tests/own-zero.test.ts": 5 },
+				8,
+			),
+		});
+		expect(selection.kept).toEqual(["tests/covering.test.ts"]);
+		expect(selection.overBudget).toEqual(["tests/own-zero.test.ts"]);
+		// Without a binding cap the zero-coverage own test is still kept, as before.
+		const roomy = selectMutationTests({
+			related: ["tests/covering.test.ts"],
+			ownTests: ["tests/own-zero.test.ts"],
+			lines: lines({
+				"tests/covering.test.ts": 4,
+				"tests/own-zero.test.ts": 0,
+			}),
+			maxTests: 47,
+			runtime: runtime(
+				{ "tests/covering.test.ts": 5, "tests/own-zero.test.ts": 5 },
+				100,
+			),
+		});
+		expect(roomy.kept).toEqual([
+			"tests/own-zero.test.ts",
+			"tests/covering.test.ts",
+		]);
+		expect(roomy.overBudget).toEqual([]);
+	});
+
+	it("keeps the top-ranked test although it alone exceeds the cap, so the cap never empties the run", () => {
+		const selection = selectMutationTests({
+			related: ["tests/huge.test.ts", "tests/other.test.ts"],
+			lines: lines({ "tests/huge.test.ts": 9, "tests/other.test.ts": 1 }),
+			maxTests: 47,
+			runtime: runtime(
+				{ "tests/huge.test.ts": 500, "tests/other.test.ts": 1 },
+				10,
+			),
+		});
+		expect(selection.kept).toEqual(["tests/huge.test.ts"]);
+		expect(selection.overBudget).toEqual(["tests/other.test.ts"]);
+	});
+
+	it("costs a test with no measured time as the unknown default, never as free", () => {
+		const selection = selectMutationTests({
+			related: ["tests/measured.test.ts", "tests/unmeasured.test.ts"],
+			lines: lines({
+				"tests/measured.test.ts": 2,
+				"tests/unmeasured.test.ts": 1,
+			}),
+			maxTests: 47,
+			// unknownSeconds 3 + overhead 1 = 4 > the 3 left after the measured one.
+			runtime: runtime(
+				{ "tests/measured.test.ts": 4, "tests/unmeasured.test.ts": null },
+				8,
+			),
+		});
+		expect(selection.kept).toEqual(["tests/measured.test.ts"]);
+		expect(selection.overBudget).toEqual(["tests/unmeasured.test.ts"]);
+	});
+
+	it("reports only the kept own tests once the cap has dropped some", () => {
+		const selection = selectMutationTests({
+			related: [],
+			ownTests: ["tests/a.test.ts", "tests/b.test.ts"],
+			lines: lines({ "tests/a.test.ts": 2, "tests/b.test.ts": 1 }),
+			maxTests: 47,
+			runtime: runtime({ "tests/a.test.ts": 5, "tests/b.test.ts": 5 }, 7),
+		});
+		expect(selection.kept).toEqual(["tests/a.test.ts"]);
+		expect(selection.own).toEqual(["tests/a.test.ts"]);
+	});
+
+	it("changes nothing when the estimate fits, and without a runtime option", () => {
+		const base = {
+			related: ["tests/a.test.ts"],
+			ownTests: ["tests/b.test.ts"],
+			lines: lines({ "tests/a.test.ts": 2, "tests/b.test.ts": 1 }),
+			maxTests: 47,
+		};
+		const plain = selectMutationTests(base);
+		const fitting = selectMutationTests({
+			...base,
+			runtime: runtime({ "tests/a.test.ts": 1, "tests/b.test.ts": 1 }, 100),
+		});
+		expect(fitting.kept).toEqual(plain.kept);
+		expect(fitting.own).toEqual(plain.own);
+		expect(fitting.overBudget).toEqual([]);
+		expect(fitting.estimatedSeconds).toBe(4);
+		expect(plain.overBudget).toEqual([]);
+		expect(plain.estimatedSeconds).toBeNull();
+	});
+
+	// R2 F2 of #4108: probing ends at its budget share and the unprobed tail was the
+	// own tests, so the dominant real case is an all-unknown own set. Replayed
+	// through the real selector on the measured per-file seconds (the "actual"
+	// side), over 400 path-hash orders (the population renamed per variant).
+	const replayAllUnknown = (unknownSeconds: number) => {
+		const actual: Record<string, number> =
+			MEASUREMENT.local.fileSecondsAtTwoCores;
+		const names = Object.keys(actual);
+		const totals = Array.from({ length: 400 }, (_, variant) => {
+			const renamed = names.map((name) => `v${variant}/${name}`);
+			const original = new Map(renamed.map((name, i) => [name, names[i]]));
+			const selection = selectMutationTests({
+				related: [],
+				ownTests: renamed,
+				lines: null,
+				maxTests: 47,
+				runtime: {
+					seconds: new Map(),
+					maxSeconds: MEASUREMENT.recommended.maxDryRunSeconds,
+					unknownSeconds,
+					fileOverheadSeconds: MEASUREMENT.recommended.testFileOverheadSeconds,
+				},
+			});
+			return selection.kept.reduce(
+				(sum, test) =>
+					sum +
+					actual[original.get(test) as string] +
+					MEASUREMENT.recommended.testFileOverheadSeconds,
+				0,
+			);
+		}).sort((a, b) => a - b);
+		return { p95: totals[379], max: totals[399] };
+	};
+
+	it("keeps the actual seconds of an all-unknown own set inside the cap at the p95 over 400 orders, and inside half of Stryker's bound at the worst", () => {
+		const cap = MEASUREMENT.recommended.maxDryRunSeconds;
+		const bound = MEASUREMENT.recommended.dryRunTimeoutMinutes * 60;
+		// The shipped constant, not the fixture's copy of it.
+		const replay = replayAllUnknown(UNKNOWN_TEST_SECONDS);
+		expect(replay.p95).toBeLessThanOrEqual(cap);
+		expect(replay.max).toBeLessThanOrEqual(bound / 2);
+		expect(replay.p95).toBeCloseTo(
+			MEASUREMENT.allUnknownReplay.actualSecondsP95,
+			6,
+		);
+		expect(replay.max).toBeCloseTo(
+			MEASUREMENT.allUnknownReplay.actualSecondsMax,
+			6,
+		);
+		// The mean as the unknown cost (what d9ae33280 shipped) breaks the cap: the
+		// 64 files it keeps run past it at the p95.
+		expect(
+			replayAllUnknown(MEASUREMENT.derived.meanFileSeconds).p95,
+		).toBeGreaterThan(cap);
+	});
+
+	// R2 F3 of #4108: `maxTests - own.length` is 0 once the own tests reach the
+	// cap, so every covering test that is not own was count-capped out before the
+	// time fit saw it, while zero-coverage own tests stayed.
+	it("lets the time fit decide when the own tests reach the count cap: covering tests that are not own outrank an own test proven to cover nothing", () => {
+		const selection = selectMutationTests({
+			related: ["tests/other1.test.ts", "tests/other2.test.ts"],
+			ownTests: [
+				"tests/own-a.test.ts",
+				"tests/own-b.test.ts",
+				"tests/own-zero.test.ts",
+			],
+			lines: lines({
+				"tests/other1.test.ts": 30,
+				"tests/other2.test.ts": 20,
+				"tests/own-a.test.ts": 5,
+				"tests/own-b.test.ts": 4,
+				"tests/own-zero.test.ts": 0,
+			}),
+			maxTests: 3,
+			// Each costs 2 s: four fit in 8 s, the fifth does not.
+			runtime: runtime(
+				{
+					"tests/other1.test.ts": 1,
+					"tests/other2.test.ts": 1,
+					"tests/own-a.test.ts": 1,
+					"tests/own-b.test.ts": 1,
+					"tests/own-zero.test.ts": 1,
+				},
+				8,
+			),
+		});
+		expect(selection.kept).toEqual([
+			"tests/own-a.test.ts",
+			"tests/own-b.test.ts",
+			"tests/other1.test.ts",
+			"tests/other2.test.ts",
+		]);
+		expect(selection.overBudget).toEqual(["tests/own-zero.test.ts"]);
+		expect(selection.dropped).toEqual([]);
+		// Without a runtime option the count cap still holds, as before.
+		const counted = selectMutationTests({
+			related: ["tests/other1.test.ts"],
+			ownTests: ["tests/own-a.test.ts"],
+			lines: lines({ "tests/other1.test.ts": 9, "tests/own-a.test.ts": 1 }),
+			maxTests: 1,
+		});
+		expect(counted.dropped).toEqual(["tests/other1.test.ts"]);
+	});
+
+	it("counts the kept tests costed at the unknown default, and says so in the log note", () => {
+		// A vitest that stopped writing its json report would otherwise cost every
+		// test at the default without a word.
+		const selection = selectMutationTests({
+			related: ["tests/a.test.ts", "tests/b.test.ts", "tests/c.test.ts"],
+			lines: lines({
+				"tests/a.test.ts": 3,
+				"tests/b.test.ts": 2,
+				"tests/c.test.ts": 1,
+			}),
+			maxTests: 47,
+			runtime: runtime({ "tests/a.test.ts": 1, "tests/b.test.ts": null }, 100),
+		});
+		expect(selection.kept).toHaveLength(3);
+		expect(selection.unmeasured).toBe(2);
+		expect(selectionNotes(selection, 47, 100)).toEqual([
+			"2 kept test(s) had no measured time and were costed at the unknown default",
+		]);
+		expect(
+			selectMutationTests({
+				related: ["tests/a.test.ts"],
+				lines: lines({ "tests/a.test.ts": 1 }),
+				maxTests: 47,
+			}).unmeasured,
+		).toBe(0);
+	});
+
+	it("names the cap, the kept estimate and the dropped tests in the log note", () => {
+		expect(
+			selectionNotes(
+				{
+					dropped: [],
+					unknown: [],
+					overBudget: ["tests/a.test.ts", "tests/b.test.ts"],
+					estimatedSeconds: 231,
+				},
+				47,
+				240,
+			),
+		).toEqual([
+			"runtime-capped at 240 s of estimated test time (kept 231 s); dropped, in rank order: tests/a.test.ts, tests/b.test.ts",
+		]);
+	});
+
+	it("asks vitest for a json report beside the coverage report, and reads the file seconds out of vitest's own shape", () => {
+		const args = buildCoverageProbeArgs(
+			"tests/x.test.ts",
+			[],
+			".stryker/coverage/x",
+		);
+		expect(args).toContain("--reporter=json");
+		expect(args).toContain("--outputFile=.stryker/coverage/x/result.json");
+		// A report vitest 5.0.3 really wrote for a probe (provenance in the fixture).
+		const { report } = JSON.parse(
+			readFileSync(
+				resolve(
+					import.meta.dirname,
+					"../fixtures/mutation-probe-vitest-report.json",
+				),
+				"utf8",
+			),
+		);
+		const file = report.testResults[0];
+		const read = (text: string | null) =>
+			readProbeSeconds(
+				{ exists: () => text !== null, read: () => text ?? "" },
+				".stryker/coverage/x",
+			);
+		expect(read(JSON.stringify(report))).toBeCloseTo(
+			(file.endTime - file.startTime) / 1000,
+			6,
+		);
+		expect(read(JSON.stringify(report))).toBeGreaterThan(0.1);
+		// Absent, unparseable, or shaped otherwise: unknown (null), never 0.
+		expect(read(null)).toBeNull();
+		expect(read("{not json")).toBeNull();
+		expect(read(JSON.stringify({ testResults: [{}] }))).toBeNull();
+		expect(read(JSON.stringify({}))).toBeNull();
 	});
 });

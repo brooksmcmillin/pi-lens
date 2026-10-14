@@ -17,6 +17,7 @@
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { setPlatform } from "../support/platform-stub.js";
 
 const h = vi.hoisted(() => ({
 	namespaces: new Map<number, string | undefined>(),
@@ -42,13 +43,6 @@ const { parseOwnerTag, readOwnerTags } =
 	await import("../../clients/process-snapshot.js");
 
 const realPlatform = process.platform;
-function setPlatform(platform: NodeJS.Platform): void {
-	Object.defineProperty(process, "platform", {
-		value: platform,
-		configurable: true,
-	});
-}
-
 afterEach(() => {
 	setPlatform(realPlatform);
 	h.namespaces.clear();

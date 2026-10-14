@@ -82,11 +82,11 @@ import {
 } from "../../clients/dispatch/integration.js";
 
 // Mock LSP service
-vi.mock("../../clients/lsp/index.js", () => ({
+vi.mock("../../clients/lsp/capabilities.js", () => ({
 	getLSPService: vi.fn(),
 }));
 
-import { getLSPService } from "../../clients/lsp/index.js";
+import { getLSPService } from "../../clients/lsp/capabilities.js";
 
 describe("Pipeline", () => {
 	let tmpDir: string;
@@ -351,6 +351,39 @@ describe("Pipeline", () => {
 			createMockDeps(),
 		);
 
+		expect(result.inlineBlockerFileContent).toEqual({
+			size: Buffer.byteLength("const x = 1;\n"),
+			sha256: createHash("sha256").update("const x = 1;\n").digest("hex"),
+		});
+	});
+
+	// #4137 round 3: `clearInlineBlockers` compares the bytes a run without
+	// authorship read against the record it would clear, so the baseline is
+	// returned for a clean result too, not only beside a blocker.
+	it("carries the content baseline of the bytes it analysed on a clean result", async () => {
+		const filePath = createTempFile(
+			tmpDir,
+			"clean-baseline.ts",
+			"const x = 1;\n",
+		);
+		vi.mocked(dispatchLintWithResult).mockImplementationOnce(async () => ({
+			diagnostics: [],
+			blockers: [],
+			warnings: [],
+			baselineWarningCount: 0,
+			fixed: [],
+			resolvedCount: 0,
+			output: "clean",
+			blockerOutput: "",
+			hasBlockers: false,
+		}));
+
+		const result = await runPipeline(
+			createMockContext(filePath, { allowAutonomousWriters: false }),
+			createMockDeps(),
+		);
+
+		expect(result.hasBlockers).toBe(false);
 		expect(result.inlineBlockerFileContent).toEqual({
 			size: Buffer.byteLength("const x = 1;\n"),
 			sha256: createHash("sha256").update("const x = 1;\n").digest("hex"),
@@ -817,7 +850,11 @@ describe("Pipeline", () => {
 				retainedEntries: 0,
 			});
 			expect(getDegradationSummary()).toEqual([]);
-		});
+			// 10,000 sequential real pipeline runs: ~0.7 s on Linux, past Vitest's
+			// 5 s default on the Windows runner where every run pays native
+			// path-canonicalization syscalls (#4019). The population is the claim, so
+			// the budget grows rather than the population shrinking.
+		}, 60_000);
 
 		it("surfaces formatter failures instead of plain clean output", async () => {
 			const filePath = createTempFile(

@@ -11,7 +11,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
 	boundToolText,
 	COMPLETE_MCP_RESULT_INPUT_BUDGET_BYTES,
@@ -24,7 +24,9 @@ import {
 	findIgnoredArguments,
 	refusalResult,
 } from "../../mcp/tool-arguments.js";
+import { setupTestEnvironment } from "../clients/test-utils.js";
 import { McpHarness, repoRoot } from "./harness.js";
+import { isProcessAlive } from "../support/process-tree.js";
 import { stripSource } from "../support/sweep-kit.js";
 
 // Spawns the MCP server as a real stdio subprocess; like analyze-cli, it can lose
@@ -32,13 +34,16 @@ import { stripSource } from "../support/sweep-kit.js";
 // absorbs the transient spike (the established pattern for load-sensitive tests).
 describe("pi-lens MCP server (stdio smoke)", { retry: 2 }, () => {
 	let harness: McpHarness;
+	let workspace: ReturnType<typeof setupTestEnvironment>;
 
 	beforeAll(() => {
-		harness = new McpHarness();
+		workspace = setupTestEnvironment("mcp-smoke-session-");
+		harness = new McpHarness({ cwd: workspace.tmpDir });
 	});
 
 	afterAll(() => {
 		harness.dispose();
+		workspace.cleanup();
 	});
 
 	// #2860 round 4 N6: this scans the production construction itself. The
@@ -456,29 +461,23 @@ describe("pi-lens MCP server (stdio smoke)", { retry: 2 }, () => {
 	}, 60_000);
 
 	it("answers tools/call pilens_analyze (warm) with a real dispatch result", async () => {
-		// Stryker annotates repository sources with @ts-nocheck, which makes
-		// dispatch classify them as generated. Author the input after instrumentation.
-		const directory = fs.mkdtempSync(
-			path.join(os.tmpdir(), "pi-lens-mcp-analyze-"),
-		);
-		try {
-			const target = path.join(directory, "analyze-input.ts");
-			fs.writeFileSync(target, "export const answer = 42;\n");
-			const res = await harness.request(7, "tools/call", {
-				name: "pilens_analyze",
-				arguments: { file: target, mode: "warm", flags: { "no-lsp": true } },
-			});
-			const result = res.result as {
-				content: { type: string; text: string }[];
-				isError?: boolean;
-			};
-			expect(result.isError).toBeFalsy();
-			expect(result.content[0].text).toContain("[warm]");
-			expect(result.content[0].text).toContain("analyze-input.ts");
-			expect(result.content[0].text).toContain('"latency"');
-		} finally {
-			fs.rmSync(directory, { recursive: true, force: true });
-		}
+		// Write after Stryker instrumentation to avoid its generated-file marker,
+		// and inside the server session to exercise ordinary dispatch (#4309).
+		const target = path.join(workspace.tmpDir, "analyze-input.ts");
+		fs.writeFileSync(target, "export const answer = 42;\n");
+		const res = await harness.request(7, "tools/call", {
+			name: "pilens_analyze",
+			arguments: { file: target, mode: "warm", flags: { "no-lsp": true } },
+		});
+		const result = res.result as {
+			content: { type: string; text: string }[];
+			isError?: boolean;
+		};
+		expect(result.isError).toBeFalsy();
+		expect(result.content[0].text).toContain("[warm]");
+		expect(result.content[0].text).toContain("analyze-input.ts");
+		// The structured JSON payload (fenced) carries the latency record.
+		expect(result.content[0].text).toContain('"latency"');
 	}, 60_000);
 
 	// pilens_module_report + pilens_read_symbol execute against a tiny project in
@@ -1416,4 +1415,148 @@ describe("pi-lens MCP unknown arguments (#3749)", { retry: 2 }, () => {
 				?.reason,
 		).toContain("ignored argument(s): maxFiles");
 	}, 25_000);
+});
+
+// Recurrence (#4081): dispose() SIGKILLed only the server, so a descendant it
+// had spawned (detached, as the real tools are) outlived it, kept writing under
+// PI_LENS_HOME, and failed the recursive removal. A preload makes the server
+// spawn exactly that writer at startup; the removal of its directory succeeds
+// only when dispose() killed the whole tree.
+describe("McpHarness.dispose tears down the server's process tree", () => {
+	it.skipIf(process.platform === "win32")(
+		"kills a detached descendant and removes the home it writes into",
+		async () => {
+			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-mcp-tree-");
+			const info = path.join(tmpDir, "info.json");
+			const preload = path.join(
+				repoRoot,
+				"tests/fixtures/mcp-orphan-writer-preload.cjs",
+			);
+			const harness = new McpHarness({
+				cwd: tmpDir,
+				env: {
+					NODE_OPTIONS: `--require ${preload}`,
+					ORPHAN_WRITER_INFO: info,
+				},
+			});
+			let stderr = "";
+			const write = vi
+				.spyOn(process.stderr, "write")
+				.mockImplementation((chunk) => {
+					stderr += String(chunk);
+					return true;
+				});
+			try {
+				await harness.request(90, "initialize", {
+					protocolVersion: "2025-06-18",
+					capabilities: {},
+					clientInfo: { name: "dispose-test", version: "0" },
+				});
+				const { home, writer: pid } = JSON.parse(
+					fs.readFileSync(info, "utf8"),
+				) as { home: string; writer: number };
+				expect(isProcessAlive(pid)).toBe(true);
+				harness.dispose();
+				// PI_LENS_HOME is <isolationDir>/home, which dispose() removes whole.
+				expect(fs.existsSync(path.dirname(home))).toBe(false);
+				expect(stderr).not.toContain("[test cleanup] could not remove");
+			} finally {
+				write.mockRestore();
+				cleanup();
+			}
+		},
+		60_000,
+	);
+});
+
+// #4300: the real MCP child must not inherit pi's absent-host trust policy.
+// Real transport and process are required: in-process setters cannot witness startup.
+describe("non-pi workspace trust (#4300)", () => {
+	it("uses the project-local oxlint in warm and fresh MCP analysis", async () => {
+		const env = setupTestEnvironment("pi-lens-mcp-trust-bin-");
+		const bin = path.join(env.tmpDir, "node_modules", ".bin");
+		fs.mkdirSync(bin, { recursive: true });
+		const marker = path.join(env.tmpDir, "used-oxlint");
+		const script = path.join(env.tmpDir, "oxlint.cjs");
+		fs.writeFileSync(
+			script,
+			`require("node:fs").appendFileSync(${JSON.stringify(marker)}, "used\\n"); console.log(JSON.stringify({diagnostics: []}));`,
+		);
+		fs.writeFileSync(
+			path.join(bin, "oxlint"),
+			`#!/usr/bin/env node\nrequire(${JSON.stringify(script)});\n`,
+			{ mode: 0o755 },
+		);
+		fs.writeFileSync(
+			path.join(bin, "oxlint.cmd"),
+			`@"${process.execPath}" "${script}" %*\r\n`,
+		);
+		fs.writeFileSync(path.join(env.tmpDir, ".oxlintrc.json"), "{}");
+		const file = path.join(env.tmpDir, "sample.js");
+		fs.writeFileSync(file, "export const answer = 42;\n");
+		const child = new McpHarness({ cwd: env.tmpDir });
+		try {
+			for (const [index, mode] of ["warm", "fresh"].entries()) {
+				fs.rmSync(marker, { force: true });
+				await child.request(4300 + index, "tools/call", {
+					name: "pilens_analyze",
+					arguments: { file, mode, flags: { "no-lsp": true } },
+				});
+				expect(fs.existsSync(marker), `${mode} uses local oxlint`).toBe(true);
+			}
+		} finally {
+			child.dispose();
+			env.cleanup();
+		}
+	}, 60_000);
+
+	it("admits Lean's code-running server through the real MCP spawn gate", async () => {
+		const env = setupTestEnvironment("pi-lens-mcp-trust-lean-");
+		const home = path.join(env.tmpDir, "home");
+		fs.mkdirSync(home);
+		const marker = path.join(env.tmpDir, "spawned-lean");
+		const script = path.join(env.tmpDir, "lean.mjs");
+		fs.writeFileSync(
+			script,
+			`import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(marker)}, "spawned"); await import(${JSON.stringify(new URL("../fixtures/fake-lsp-server.mjs", import.meta.url).href)});`,
+		);
+		fs.writeFileSync(
+			path.join(home, "lsp.json"),
+			JSON.stringify({
+				serverOverrides: { lean: { command: [process.execPath, script] } },
+			}),
+		);
+		fs.writeFileSync(path.join(env.tmpDir, "lakefile.lean"), "import Lake\n");
+		const file = path.join(env.tmpDir, "Main.lean");
+		fs.writeFileSync(file, "def main := 1\n");
+		const child = new McpHarness({
+			cwd: env.tmpDir,
+			env: { PI_LENS_HOME: home, PI_LENS_TEST_MODE: "0" },
+		});
+		try {
+			await child.request(4302, "tools/call", {
+				name: "pilens_lsp_navigation",
+				arguments: { operation: "documentSymbol", path: file },
+			});
+			expect(fs.existsSync(marker), "Lean crossed the project-code gate").toBe(
+				true,
+			);
+			await child.closeInput();
+			const records = fs
+				.readFileSync(path.join(home, "extension.log"), "utf8")
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line) as { message: string });
+			expect(
+				records.filter(
+					(row) =>
+						row.message ===
+						"mcp: workspace trust belongs to the MCP client; pi trust not consulted",
+				),
+			).toHaveLength(1);
+		} finally {
+			child.dispose();
+			env.cleanup();
+		}
+	}, 60_000);
 });

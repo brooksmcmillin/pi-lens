@@ -29,7 +29,7 @@ function errorTextWithHint(raw: string): string {
 	const hint = astGrepRemediationHint(classifyAstGrepError(raw));
 	return hint ? `Error: ${raw}\n\n${hint}` : `Error: ${raw}`;
 }
-import { LANGUAGES } from "./shared.js";
+import { LANGUAGES, resolveAstGrepPaths } from "./shared.js";
 
 function lineCount(value: string): number {
 	if (!value) return 0;
@@ -213,7 +213,7 @@ export function createAstGrepReplaceTool(
 					details: {},
 				};
 			}
-			const searchPaths = paths?.length ? paths : [ctx.cwd || "."];
+			const searchPaths = resolveAstGrepPaths(paths, ctx.cwd);
 
 			// Phase 3: structural-intent params → synthesize YAML with fix: field
 			if (
@@ -254,6 +254,7 @@ export function createAstGrepReplaceTool(
 					ruleYaml,
 					searchPaths,
 					applyFlag,
+					{ lineage, toolCallId: _toolCallId },
 				);
 				if (ruleResult.stalePreview) {
 					logOutcome("error", { errorRaw: "stale_preview" });
@@ -305,7 +306,7 @@ export function createAstGrepReplaceTool(
 				lang,
 				searchPaths,
 				applyFlag,
-				{ strictness, lineage },
+				{ strictness, lineage, toolCallId: _toolCallId },
 			);
 
 			if (result.stalePreview) {

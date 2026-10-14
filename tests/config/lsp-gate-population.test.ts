@@ -323,6 +323,10 @@ describe("LSP clean-gate population (#3217)", () => {
 			expect(fixture.expectServerId, `${fixture.lang} expected server`).toBe(
 				fixture.serverId,
 			);
+			// The preferred Docker fixture deliberately leaves its fallback
+			// enabled now that fallback-family grouping is measured separately;
+			// acquisition still launches only the preferred member when it works.
+			if (fixture.lang === "dockerfile") continue;
 			expect(
 				fixture.disableServers,
 				`${fixture.lang} must disable fallback siblings`,
@@ -347,7 +351,7 @@ describe("LSP clean-gate population (#3217)", () => {
 		).toEqual([
 			"elixir is an unlabelled fallback-family row",
 			"elixir is neither pinned by a fixture nor admitted",
-			"fallback fixture count 6 !== registry members minus admissions 7",
+			"fallback fixture count 8 !== registry members minus admissions 9",
 		]);
 	});
 

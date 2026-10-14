@@ -21,10 +21,10 @@
 // a second time — it is a generic property of the platform (not an
 // install-smoke domain rule), and duplicating it would be exactly the
 // "hand-maintained list that mirrors a registry" AGENTS.md flags as a
-// defect. tool-smoke's five gating layer steps (Tool layer, LSP handshake
-// layer, LSP gate, lens_diagnostics mode=full row, Format layer — the only
-// five WITHOUT `continue-on-error` in
-// tool-smoke.yml, so the only five whose `outcome` can actually turn the
+// defect. tool-smoke's six gating layer steps (Tool layer, LSP handshake
+// layer, LSP gate, lens_diagnostics mode=full row, Format layer, Resolution
+// layer — the only six WITHOUT `continue-on-error` in
+// tool-smoke.yml, so the only six whose `outcome` can actually turn the
 // job red) duck-type the exact same `{name, outcome}` shape those functions
 // already consume.
 // #2723 review F7: only decideAction (re-exported -- consumed directly by
@@ -68,7 +68,7 @@ export const TOOL_SMOKE_DRIFT_TITLE =
  */
 
 // scripts/smoke-tools.mjs's own `report()` prints this exact line for each
-// of the five layers this file tracks:
+// of the six layers this file tracks:
 //   `${pass} passed · ${fail} failed · ${setupFailed} setup-failed · ${skip} skipped (tool/config unavailable)`
 const SUMMARY_LINE_RE =
 	/(SKIPPED:\s*)?(\d+) passed · (\d+) failed · (\d+) setup-failed · (\d+) skipped/;
@@ -183,19 +183,19 @@ export function nextConsecutiveRedCount(existingBody) {
 }
 
 /**
- * #2723 review F3: `decideAction`'s five-layer-outcome view cannot
- * distinguish "the job failed somewhere BEFORE the five tracked layers
+ * #2723 review F3: `decideAction`'s six-layer-outcome view cannot
+ * distinguish "the job failed somewhere BEFORE the six tracked layers
  * even started" (checkout, seven best-effort setup actions — already
  * `continue-on-error` and so cannot flip this, `npm install`, or
  * `build:dist`) from a genuine GitHub Actions cancellation: both leave
- * Tool/LSP handshake/LSP gate/lens_diagnostics full row/Format layer all "skipped", which `decideAction` reads
+ * Tool/LSP handshake/LSP gate/lens_diagnostics full row/Format/Resolution layer all "skipped", which `decideAction` reads
  * as "no-action" either way (see install-smoke-drift.mjs's own
  * cancelled-mid-run/before-start attacks — the identical shape). GitHub's
  * `job.status` context (passed through as JOB_STATUS) disambiguates: it
  * reads "failure" only when a non-`continue-on-error` step genuinely failed
  * somewhere in the job; a plain cancellation reports "cancelled", never
  * "failure". This promotes "no-action" to "file-or-refresh" ONLY when the
- * job is genuinely red for a reason outside the five tracked layers, and
+ * job is genuinely red for a reason outside the six tracked layers, and
  * leaves an actual cancellation exactly as untouched as before.
  *
  * #2723 review F4: `set -o pipefail` on each layer step is load-bearing —

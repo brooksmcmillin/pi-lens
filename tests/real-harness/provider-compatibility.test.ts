@@ -10,6 +10,7 @@ import { pathToFileURL } from "node:url";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { withRealPi } from "../support/real-pi-harness.js";
+import { removeTempDirSync } from "../clients/test-utils.js";
 
 const repoRoot = path.resolve(import.meta.dirname, "../..");
 function latestToolNames(pi: {
@@ -153,7 +154,7 @@ async function observeProviderContext(
 		if (previousObservation === undefined)
 			delete process.env.REAL_PI_HARNESS_PROVIDER_LOG;
 		else process.env.REAL_PI_HARNESS_PROVIDER_LOG = previousObservation;
-		rmSync(root, { recursive: true, force: true });
+		removeTempDirSync(root);
 	}
 }
 

@@ -1,6 +1,6 @@
 {
 	"name": "pi-lens",
-	"version": "4.3.0",
+	"version": "4.4.3",
 	"type": "module",
 	"description": "Real-time code feedback for pi — LSP, linters, formatters, type-checking, structural analysis & booboo",
 	"repository": {
@@ -40,6 +40,7 @@
 		"check": "node scripts/check-extensions.mjs",
 		"selftest:install": "node scripts/install-selftest.mjs",
 		"check:lockfile": "node scripts/check-lockfile-sync.mjs",
+		"check:allow-scripts": "node scripts/check-allow-scripts.mjs",
 		"preflight": "node scripts/pr-preflight.mjs",
 		"knip": "node scripts/run-knip.mjs",
 		"check:grammars": "node scripts/check-grammar-provenance.mjs",
@@ -48,6 +49,7 @@
 		"audit:rule-catalog": "node scripts/validate-rule-catalog.mjs",
 		"audit:astgrep-rule-pairs": "node scripts/audit-astgrep-rule-pairs.mjs",
 		"astgrep:self-scan": "node scripts/run-astgrep-pi-lens.mjs",
+		"lane:check": "node scripts/lane-check.mjs",
 		"astgrep:self-scan:update-baseline": "node scripts/run-astgrep-pi-lens.mjs --update-baseline",
 		"audit:playground": "node scripts/playground-verify-rule.mjs",
 		"bench:cascade-budget": "node scripts/bench-cascade-budget.mjs",
@@ -122,7 +124,7 @@
 		"banner.png"
 	],
 	"dependencies": {
-		"@ast-grep/cli": "^0.45.0",
+		"@ast-grep/cli": "0.45.3",
 		"@ast-grep/napi": "^0.45.0",
 		"js-yaml": "^5.2.2",
 		"minimatch": "^10.2.6",
@@ -187,8 +189,10 @@
 	},
 	"allowScripts": {
 		"@ast-grep/cli@0.45.3": true,
-		"@google/genai@1.52.0": true,
-		"protobufjs@7.6.5": true
+		"@google/genai@2.21.0": true,
+		"esbuild@0.28.2": true,
+		"fsevents@2.3.3": false,
+		"protobufjs@7.6.6": true
 	},
 	"overrides": {
 		"qs": "^6.15.4"

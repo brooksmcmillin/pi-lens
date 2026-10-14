@@ -27,8 +27,17 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { envFor, gitExecFileSync } from "../../scripts/lib/git-fixture-env.mjs";
+import {
+	loadHistorySelection,
+	resolveHeadPaths,
+} from "../../scripts/lib/test-history-selection.mjs";
+import {
+	METADATA_FILENAME,
+	rollupTestHistory,
+} from "../../scripts/test-history-rollup.mjs";
 import {
 	CI_ONLY_PRE_PUSH_TESTS,
 	collectTestFiles,
@@ -39,6 +48,8 @@ import {
 	changesTestTreeFile,
 	selectTargetedTests,
 	resolveDiffRange,
+	readPrePushRecord,
+	writePrePushRecord,
 } from "../../scripts/pre-push-targeted-tests.mjs";
 
 const repoRoot = path.resolve(__dirname, "..", "..");
@@ -170,18 +181,21 @@ describe("resolveDiffRange — pre-push ref population (#3661)", () => {
 			path.join(fixtureDir as string, "node_modules"),
 			"dir",
 		);
-		fs.symlinkSync(
-			path.join(repoRoot, "vitest.config.ts"),
-			path.join(fixtureDir as string, "vitest.config.ts"),
+		write(
+			"vitest.config.ts",
+			'export default { test: { include: ["tests/**/*.test.ts"] } };\n',
 		);
-		fs.symlinkSync(
-			path.join(repoRoot, "package.json"),
-			path.join(fixtureDir as string, "package.json"),
-		);
+		write("package.json", '{"type":"module"}\n');
 		write("clients/first.ts", "export const first = true;\n");
-		write("tests/clients/first.test.ts", "it('first', () => {});\n");
+		write(
+			"tests/clients/first.test.ts",
+			"import { it } from 'vitest'; it('first', () => {});\n",
+		);
 		write("clients/second.ts", "export const second = true;\n");
-		write("tests/clients/second.test.ts", "it('second', () => {});\n");
+		write(
+			"tests/clients/second.test.ts",
+			"import { it } from 'vitest'; it('second', () => {});\n",
+		);
 		const git = (args: string[]) =>
 			String(gitExecFileSync(args, { cwd: fixtureDir, encoding: "utf8" }));
 		git(["init", "--quiet", "--initial-branch=main"]);
@@ -202,10 +216,7 @@ describe("resolveDiffRange — pre-push ref population (#3661)", () => {
 
 		const result = spawnSync(
 			process.execPath,
-			[
-				path.join(repoRoot, "scripts/pre-push-targeted-tests.mjs"),
-				"--skip-build",
-			],
+			[path.join(scriptDir, "pre-push-targeted-tests.mjs"), "--skip-build"],
 			{
 				cwd: fixtureDir,
 				encoding: "utf8",
@@ -215,10 +226,255 @@ describe("resolveDiffRange — pre-push ref population (#3661)", () => {
 		expect(result.status).toBe(0);
 		expect(result.stdout).toContain("tests/clients/first.test.ts");
 		expect(result.stdout).toContain("tests/clients/second.test.ts");
+		// #4086 recurrence: a fixture suite reports green without running vitest
+		// when the pre-push script reaches with-test-lock through a symlinked
+		// scripts/ directory. The known fixture test must appear in real output.
+		expect(result.stdout).toContain("2 passed");
+	});
+
+	// Recurrence (#4047 review H3): `lane:check` was blind to a grant-none lane,
+	// whose whole deliverable is uncommitted tracked edits plus new files; the
+	// selector only diffed committed ranges, so an edit that reds 8 tests
+	// selected nothing and the gate read green.
+	it("--include-worktree adds uncommitted tracked edits and untracked files to the changed set", () => {
+		fixtureDir = fs.mkdtempSync(path.join(repoRoot, ".tmp-pre-push-test-"));
+		process.chdir(fixtureDir);
+		fs.symlinkSync(
+			path.join(repoRoot, "scripts"),
+			path.join(fixtureDir as string, "scripts"),
+			"dir",
+		);
+		fs.symlinkSync(
+			path.join(repoRoot, "node_modules"),
+			path.join(fixtureDir as string, "node_modules"),
+			"dir",
+		);
+		// Not the repo's vitest.config.ts: its globalSetup file does not exist in
+		// this fixture (#4086 recurrence: the same shape as the history-pass
+		// fixture, missed by the first sweep). The tests import vitest because
+		// the minimal config enables no globals.
+		write(
+			"vitest.config.ts",
+			'export default { test: { include: ["tests/**/*.test.ts"] } };\n',
+		);
+		write("package.json", '{"type":"module"}\n');
+		write("clients/first.ts", "export const first = true;\n");
+		write(
+			"tests/clients/first.test.ts",
+			"import { it } from 'vitest'; it('first', () => {});\n",
+		);
+		const git = (args: string[]) =>
+			String(gitExecFileSync(args, { cwd: fixtureDir, encoding: "utf8" }));
+		git(["init", "--quiet", "--initial-branch=main"]);
+		git(["config", "user.name", "pi-lens test"]);
+		git(["config", "user.email", "test@example.com"]);
+		git(["add", "."]);
+		git(["commit", "--quiet", "-m", "base"]);
+		git([
+			"update-ref",
+			"refs/remotes/origin/master",
+			git(["rev-parse", "HEAD"]).trim(),
+		]);
+		// Nothing committed past origin/master: only the working tree differs.
+		write("clients/first.ts", "export const first = false;\n");
+		write(
+			"tests/clients/third.test.ts",
+			"import { it } from 'vitest'; it('third', () => {});\n",
+		);
+
+		const run = (extra: string[]) =>
+			spawnSync(
+				process.execPath,
+				[
+					path.join(repoRoot, "scripts/pre-push-targeted-tests.mjs"),
+					"--skip-build",
+					...extra,
+				],
+				{ cwd: fixtureDir, encoding: "utf8", input: "" },
+			);
+		const without = run([]);
+		expect(without.status).toBe(0);
+		expect(without.stdout).not.toContain("tests/clients/first.test.ts");
+		expect(without.stdout).not.toContain("tests/clients/third.test.ts");
+		const withTree = run(["--include-worktree"]);
+		expect(withTree.status).toBe(0);
+		expect(withTree.stdout).toContain("  - tests/clients/first.test.ts");
+		expect(withTree.stdout).toContain("  - tests/clients/third.test.ts");
+	});
+});
+
+describe("entry-point guard through the real CLIs (#4086)", () => {
+	const lockScript = path.join(repoRoot, "scripts/with-test-lock.mjs");
+	const selectorScript = path.join(
+		repoRoot,
+		"scripts/pre-push-targeted-tests.mjs",
+	);
+	const importProbe = (script: string) =>
+		`import(${JSON.stringify(pathToFileURL(script).href)}).then(() => console.log("IMPORT-OK"));`;
+	const run = (args: string[], input?: string, cwd = repoRoot) =>
+		spawnSync(process.execPath, args, {
+			cwd,
+			encoding: "utf8",
+			input,
+			timeout: 30_000,
+			env: { ...process.env, PI_LENS_TEST_NO_LOCK: "1" },
+		});
+
+	// Outside any repo: a guard that wrongly runs the selector's main() on import
+	// then fails fast on git instead of running the real hook over this checkout.
+	const runAway = (args: string[], input?: string) =>
+		run(args, input, os.tmpdir());
+
+	it.each([
+		["with-test-lock", lockScript],
+		["pre-push-targeted-tests", selectorScript],
+	])(
+		"importing %s from `node -e` (bare and with an argument) and from stdin is not the entry point and exits 0",
+		(_name, script) => {
+			// #4086 review F2 recurrence: an entry check that threw on an
+			// unresolvable argv[1] made merely importing a script exit 1 under
+			// `node -e foo` (argv[1] = "foo") or stdin (argv[1] = "-"). The negative
+			// direction too: a guard that is always true would run main() on import
+			// (with-test-lock prints its usage and exits 2).
+			const bare = runAway(["-e", importProbe(script)]);
+			expect(bare.stderr).toBe("");
+			expect(bare.stdout).toBe("IMPORT-OK\n");
+			expect(bare.status).toBe(0);
+			// A real file that is not this script: the only shape that reaches the
+			// compare with a resolvable argv[1], so it is the one an always-true
+			// guard cannot hide behind a failed realpath.
+			const otherFile = runAway([
+				"-e",
+				importProbe(script),
+				path.join(repoRoot, "package.json"),
+			]);
+			expect(otherFile.stderr).toBe("");
+			expect(otherFile.stdout).toBe("IMPORT-OK\n");
+			expect(otherFile.status).toBe(0);
+			const viaEval = runAway(["-e", importProbe(script), "foo"]);
+			expect(viaEval.stderr).toBe("");
+			expect(viaEval.stdout).toBe("IMPORT-OK\n");
+			expect(viaEval.status).toBe(0);
+			const viaStdin = runAway(["-"], importProbe(script));
+			expect(viaStdin.stderr).toBe("");
+			expect(viaStdin.stdout).toBe("IMPORT-OK\n");
+			expect(viaStdin.status).toBe(0);
+		},
+	);
+
+	it("reaches both CLIs through a symlinked scripts/ under --preserve-symlinks-main", () => {
+		// #4086 review F5 recurrence: under --preserve-symlinks-main the main
+		// module's import.meta.url keeps its symlinked spelling, so a guard that
+		// realpaths only argv[1] sees a lexical self path, returns false, and the
+		// CLI exits 0 having done nothing. Default Node already realpaths the
+		// main URL, which is why the default-mode witness above cannot see this.
+		enterFixture();
+		const linked = path.join(fixtureDir as string, "scripts");
+		fs.symlinkSync(path.join(repoRoot, "scripts"), linked, "dir");
+		const lock = run([
+			"--preserve-symlinks-main",
+			path.join(linked, "with-test-lock.mjs"),
+			"--",
+			process.execPath,
+			"-e",
+			"console.log('RAN')",
+		]);
+		expect(lock.stdout).toContain("RAN");
+		expect(lock.status).toBe(0);
+		const selector = run(
+			[
+				"--preserve-symlinks-main",
+				path.join(linked, "pre-push-targeted-tests.mjs"),
+				"--skip-build",
+			],
+			`(delete) ${"0".repeat(40)} refs/heads/removed abc123\n`,
+		);
+		expect(selector.stdout).toContain(
+			"deletion-only push; skipping build and tests",
+		);
+		expect(selector.status).toBe(0);
 	});
 });
 
 describe("selectTargetedTests — path-mirror pass", () => {
+	it("keeps the live production and tests scanner populations on their own change paths", () => {
+		// #3951 F1: the census union allowed a tests-tree scanner to move to the
+		// production registry while a tests-only push stopped selecting it.
+		// These literal populations are independently reviewed against the live
+		// census; exercise the production selector on the real checkout inventory.
+		const productionScanners = [
+			"tests/clients/mutation-bridge-lineage-epoch-sweep.test.ts",
+			"tests/clients/session-state-conformance.test.ts",
+			"tests/config/glossary-synonym-sweep.test.ts",
+			"tests/config/covers-config-claim-sweep.test.ts",
+			"tests/config/shell-dialect-ownership-sweep.test.ts",
+			"tests/config/strictness-ratchet.test.ts",
+			"tests/config/hook-await-bounds.test.ts",
+			"tests/config/dmts-export-drift.test.ts",
+			"tests/config/vi-mock-export-sweep.test.ts",
+			"tests/config/vi-domock-undo.test.ts",
+			"tests/config/degradation-kind-coverage.test.ts",
+			"tests/config/degradation-kind-order.test.ts",
+			"tests/config/sweep-floor-coverage.test.ts",
+			"tests/config/tracked-control-bytes.test.ts",
+			"tests/config/session-scope-sweep.test.ts",
+			"tests/config/lsp-idle-eviction-measurement.test.ts",
+			"tests/clients/atomic-write-sweep.test.ts",
+			"tests/clients/availability-classifiedby-ok-sweep.test.ts",
+			"tests/clients/availability-policy-coverage.test.ts",
+			"tests/clients/bounded-telemetry-sweep.test.ts",
+			"tests/clients/single-flight-ratchet.test.ts",
+			"tests/config/bounded-container-guard.test.ts",
+			"tests/scripts/dist-freshness.test.ts",
+			"tests/config/turn-state-partition-owner-sweep.test.ts",
+			"tests/config/project-trust-seam-ratchet.test.ts",
+		];
+		const testScanners = [
+			"tests/clients/flake-shape-ratchet.test.ts",
+			"tests/real-harness/bridge-reload-ts.test.ts",
+			"tests/real-harness/bridge-reload.test.ts",
+			"tests/real-harness/child-exit.test.ts",
+			"tests/real-harness/diagnostic-provenance.test.ts",
+			"tests/real-harness/lifecycle.test.ts",
+			"tests/real-harness/negative.test.ts",
+			"tests/real-harness/provider-compatibility.test.ts",
+			"tests/real-harness/read-guard-moves.test.ts",
+			"tests/real-harness/scenario-1.test.ts",
+			"tests/real-harness/scenario-2.test.ts",
+			"tests/real-harness/scenario-3.test.ts",
+			"tests/real-harness/tools-enabled.test.ts",
+			"tests/config/handler-verdict-sweep.test.ts",
+			"tests/config/module-instance-coverage.test.ts",
+			"tests/config/tmp-fixture-hygiene.test.ts",
+			"tests/config/vacuous-skip-coverage.test.ts",
+			"tests/support/host-event-shape-scan.test.ts",
+		];
+		// Pin live scanner shapes behind the independent buckets: direct
+		// production walk, delegated tests/support walk, and the production walk
+		// that enters through a support re-export. The census's import-alias and
+		// default-export fixtures below cover the other resolver entry forms.
+		expect(productionScanners).toContain(
+			"tests/config/hook-await-bounds.test.ts",
+		);
+		expect(testScanners).toContain("tests/clients/flake-shape-ratchet.test.ts");
+		expect(TREE_SCANNING_GOVERNANCE_TESTS).toEqual(productionScanners);
+		expect(TEST_TREE_GOVERNANCE_TESTS).toEqual(testScanners);
+
+		const allTests = collectTestFiles(path.join(repoRoot, "tests")).map(
+			(file) => path.relative(repoRoot, file).split(path.sep).join("/"),
+		);
+		const production = selectTargetedTests(
+			["clients/__production_probe__.ts"],
+			allTests,
+		);
+		const testsOnly = selectTargetedTests(
+			["tests/support/__test_probe__.ts"],
+			allTests,
+		);
+		expect(production.selected).toEqual(productionScanners);
+		expect(testsOnly.selected).toEqual(testScanners);
+	});
+
 	it("selects the registered tree scanners for production changes", () => {
 		enterFixture();
 		for (const test of TREE_SCANNING_GOVERNANCE_TESTS)
@@ -430,6 +686,81 @@ describe("selectTargetedTests — the >25-file cap (F1)", () => {
 		expect(result.totalBeforeCap).toBe(testCount);
 	});
 
+	// #3215 lane 3: history picks are bounded by their own cap, so a hub-module
+	// change that caps the import selection must still run them, and the
+	// import-only tests it dropped stay dropped (the cap's own contract).
+	it("keeps history picks when the import selection caps, and counts none of them toward the cap", () => {
+		enterFixture();
+		write("clients/shared.ts", "export const shared = 1;\n");
+		for (let i = 0; i < MAX_SELECTED_TESTS; i++)
+			write(
+				`tests/generated-${i}.test.ts`,
+				`import { shared } from '../clients/shared.js';\n`,
+			);
+		write("tests/by-history.test.ts", "export const h = 1;\n");
+		const allTests = collectTestFiles("tests");
+		const result = selectTargetedTests(["clients/shared.ts"], allTests, {
+			historyPicks: ["tests/by-history.test.ts"],
+		});
+		// 25 import matches do not cap; one more would. The history pick is the
+		// 26th selected file and must not trip the cap by itself.
+		expect(result.capped).toBe(false);
+		expect(result.selected).toHaveLength(MAX_SELECTED_TESTS + 1);
+		write(
+			`tests/generated-${MAX_SELECTED_TESTS}.test.ts`,
+			`import { shared } from '../clients/shared.js';\n`,
+		);
+		const capped = selectTargetedTests(
+			["clients/shared.ts"],
+			collectTestFiles("tests"),
+			{ historyPicks: ["tests/by-history.test.ts"] },
+		);
+		expect(capped.capped).toBe(true);
+		expect(capped.selected).toEqual(["tests/by-history.test.ts"]);
+		expect(capped.fromHistory).toEqual(["tests/by-history.test.ts"]);
+	});
+
+	it("counts an import match that only history kept as a history pick on a capped selection", () => {
+		// Recurrence: PR #4026 review F4. A capped selection drops the import
+		// matches; a pick that history also named is kept because of history, and
+		// the hook's capped line must count it as one.
+		enterFixture();
+		write("clients/shared.ts", "export const shared = 1;\n");
+		for (let i = 0; i <= MAX_SELECTED_TESTS; i++)
+			write(
+				`tests/generated-${i}.test.ts`,
+				`import { shared } from '../clients/shared.js';\n`,
+			);
+		const result = selectTargetedTests(
+			["clients/shared.ts"],
+			collectTestFiles("tests"),
+			{ historyPicks: ["tests/generated-3.test.ts"] },
+		);
+		expect(result.capped).toBe(true);
+		expect(result.selected).toEqual(["tests/generated-3.test.ts"]);
+		expect(result.fromHistory).toEqual(["tests/generated-3.test.ts"]);
+	});
+
+	it("does not let a history pick smuggle a CI-only suite into the local pre-push run", () => {
+		// Recurrence: #3426 H3432-1 kept budget-busting suites out of the hook;
+		// the history pass must go through the same exclusion.
+		enterFixture();
+		const [ciOnly] = Object.keys(CI_ONLY_PRE_PUSH_TESTS);
+		write(ciOnly as string, "export const t = 1;\n");
+		write("clients/x.ts", "export const x = 1;\n");
+		const allTests = collectTestFiles("tests");
+		const local = selectTargetedTests(["clients/x.ts"], allTests, {
+			historyPicks: [ciOnly as string],
+		});
+		expect(local.selected).not.toContain(ciOnly);
+		expect(local.fromHistory).toEqual([]);
+		const ci = selectTargetedTests(["clients/x.ts"], allTests, {
+			historyPicks: [ciOnly as string],
+			includeCiOnly: true,
+		});
+		expect(ci.selected).toContain(ciOnly);
+	});
+
 	// #3492 (2026-09-26): 0b5cb182a changed clients/lsp/client.ts, which 71
 	// test files match, so the heuristic selection capped and the hook ran
 	// NOTHING; the raw 60 s timer it added reached CI. The registries are
@@ -507,6 +838,79 @@ describe("selectTargetedTests — no-match fallback (F7)", () => {
 		expect(result.selected).toEqual([]);
 		expect(result.unmatched).toEqual(["clients/orphan.ts"]);
 		expect(result.capped).toBe(false);
+	});
+});
+
+describe("pre-push result records (#4034)", () => {
+	it("writes selected reasons and vitest counts under the git common dir", () => {
+		const commonDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-prepush-record-"),
+		);
+		const now = new Date("2026-10-07T12:00:00.000Z");
+		writePrePushRecord({
+			commonDir,
+			head: "a".repeat(40),
+			base: "b".repeat(40),
+			at: now,
+			selected: [
+				{ file: "tests/import.test.ts", reason: "import" },
+				{ file: "tests/history.test.ts", reason: "history" },
+				{ file: "tests/governance.test.ts", reason: "governance" },
+			],
+			passed: 2,
+			failed: 1,
+			skipped: 3,
+			vitestExitCode: 1,
+			wallTimeMs: 417,
+			outcome: "tests-failed",
+		});
+		const record = readPrePushRecord(commonDir, "a".repeat(40));
+		expect(record).toMatchObject({
+			head: "a".repeat(40),
+			base: "b".repeat(40),
+			passed: 2,
+			failed: 1,
+			skipped: 3,
+			vitestExitCode: 1,
+			wallTimeMs: 417,
+			outcome: "tests-failed",
+		});
+		expect(record?.selected).toEqual([
+			{ file: "tests/import.test.ts", reason: "import" },
+			{ file: "tests/history.test.ts", reason: "history" },
+			{ file: "tests/governance.test.ts", reason: "governance" },
+		]);
+		fs.rmSync(commonDir, { recursive: true, force: true });
+	});
+
+	it("prunes records older than fourteen days when writing", () => {
+		const commonDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-prepush-prune-"),
+		);
+		const dir = path.join(commonDir, "pi-lens-prepush");
+		fs.mkdirSync(dir);
+		const old = path.join(dir, `${"c".repeat(40)}.json`);
+		fs.writeFileSync(old, "{}\n");
+		fs.utimesSync(
+			old,
+			new Date("2026-09-01T00:00:00.000Z"),
+			new Date("2026-09-01T00:00:00.000Z"),
+		);
+		writePrePushRecord({
+			commonDir,
+			head: "d".repeat(40),
+			base: "e".repeat(40),
+			at: new Date("2026-10-07T00:00:00.000Z"),
+			selected: [],
+			passed: 0,
+			failed: 0,
+			skipped: 0,
+			vitestExitCode: null,
+			wallTimeMs: 0,
+			outcome: "build-only",
+		});
+		expect(fs.existsSync(old)).toBe(false);
+		fs.rmSync(commonDir, { recursive: true, force: true });
 	});
 });
 
@@ -623,7 +1027,7 @@ describe("pre-push ast-grep self-scan (#3886)", () => {
 	 * `built.marker`. `astgrep:self-scan` refuses to run before that marker
 	 * exists, so the test observes the real build-before-scan ordering through
 	 * real npm resolution. */
-	function makeOrderingFixture() {
+	function makeOrderingFixture({ build = "write", distBuild = "write" } = {}) {
 		const root = fs.mkdtempSync(
 			path.join(os.tmpdir(), "pi-lens-prepush-scan-order-"),
 		);
@@ -633,6 +1037,8 @@ describe("pre-push ast-grep self-scan (#3886)", () => {
 			"scripts/pre-push-targeted-tests.mjs",
 			"scripts/with-test-lock.mjs",
 			"scripts/lib/suite-lock.mjs",
+			"scripts/lib/test-history-selection.mjs",
+			"scripts/lib/vitest-summary.mjs",
 		])
 			put(root, rel, fs.readFileSync(path.join(repoRoot, rel), "utf8"));
 		put(
@@ -654,11 +1060,18 @@ describe("pre-push ast-grep self-scan (#3886)", () => {
 			JSON.stringify({
 				scripts: {
 					build:
-						"node -e \"require('node:fs').writeFileSync('built.marker','1')\"",
+						build === "fail"
+							? 'node -e "process.exit(7)"'
+							: "node -e \"require('node:fs').writeFileSync('built.marker','1')\"",
+					"build:dist":
+						distBuild === "fail"
+							? 'node -e "process.exit(8)"'
+							: "node -e \"require('node:fs').mkdirSync('dist/clients/lsp',{recursive:true}); require('node:fs').writeFileSync('dist/clients/lsp/server-traits.js','1')\"",
 					"astgrep:self-scan": "node scan.mjs",
 				},
 			}),
 		);
+		put(root, "clients/lsp/server-traits.ts", "export const fixture = true;\n");
 		fs.symlinkSync(
 			path.join(repoRoot, "node_modules"),
 			path.join(root, "node_modules"),
@@ -681,6 +1094,48 @@ describe("pre-push ast-grep self-scan (#3886)", () => {
 		expect(result.status).toBe(0);
 		expect(result.stdout).toContain("[scan] ran after build");
 		expect(fs.existsSync(path.join(fx.root, "built.marker"))).toBe(true);
+		expect(result.stdout).toContain(
+			"[pre-push] dist/ missing or stale (dist/clients/lsp/server-traits.js); running npm run build:dist...",
+		);
+		expect(
+			fs.existsSync(path.join(fx.root, "dist/clients/lsp/server-traits.js")),
+		).toBe(true);
+	});
+
+	it("reports a dist build failure before the self-scan", () => {
+		const fx = makeOrderingFixture({ distBuild: "fail" });
+		const result = runHook(fx.root, fx.refs);
+		expect(result.status).toBe(1);
+		expect(result.stdout + result.stderr).toContain(
+			"[pre-push] dist build failed; run `npm run build:dist` to rebuild dist/.",
+		);
+		expect(result.stdout + result.stderr).not.toContain(
+			"[scan] ran after build",
+		);
+		const recordPath = path.join(
+			fx.root,
+			".git",
+			"pi-lens-prepush",
+			`${fx.refs.split(/\s+/)[1]}.json`,
+		);
+		expect(JSON.parse(fs.readFileSync(recordPath, "utf8"))).toMatchObject({
+			outcome: "build-failed",
+		});
+	});
+
+	it("records a build failure after the provisional tests-not-started record", () => {
+		const fx = makeOrderingFixture({ build: "fail" });
+		const result = runHook(fx.root, fx.refs);
+		const recordPath = path.join(
+			fx.root,
+			".git",
+			"pi-lens-prepush",
+			`${fx.refs.split(/\s+/)[1]}.json`,
+		);
+		expect(result.status).toBe(1);
+		expect(JSON.parse(fs.readFileSync(recordPath, "utf8"))).toMatchObject({
+			outcome: "build-failed",
+		});
 	});
 
 	it("a deletion-only push exits 0 before the build or the self-scan", () => {
@@ -718,6 +1173,8 @@ describe("pre-push ast-grep self-scan (#3886)", () => {
 			"scripts/pre-push-targeted-tests.mjs",
 			"scripts/with-test-lock.mjs",
 			"scripts/lib/suite-lock.mjs",
+			"scripts/lib/test-history-selection.mjs",
+			"scripts/lib/vitest-summary.mjs",
 			"scripts/run-astgrep-pi-lens.mjs",
 			"scripts/lib/astgrep-self-scan.mjs",
 			"scripts/lib/git-fixture-env.mjs",
@@ -840,7 +1297,8 @@ describe("pre-push lock admission (#3717)", () => {
 	const STUB_LOCK = `import path from "node:path";
 import { fileURLToPath } from "node:url";
 export function quoteForWindowsCmd(arg) { return arg; }
-if (path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+export function isEntryPoint(url) { return path.resolve(process.argv[1]) === fileURLToPath(url); }
+if (isEntryPoint(import.meta.url)) {
 	console.error(\`[with-test-lock] timed out after \${process.env.PI_LENS_TEST_LOCK_TIMEOUT_MS}ms waiting for test-suite lock held by PID 4242 since 2026-01-01T00:00:00.000Z\`);
 	process.exitCode = 1;
 }
@@ -850,7 +1308,8 @@ if (path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
 	const KILLED_LOCK = `import path from "node:path";
 import { fileURLToPath } from "node:url";
 export function quoteForWindowsCmd(arg) { return arg; }
-if (path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) process.kill(process.pid, "SIGKILL");
+export function isEntryPoint(url) { return path.resolve(process.argv[1]) === fileURLToPath(url); }
+if (isEntryPoint(import.meta.url)) process.kill(process.pid, "SIGKILL");
 `;
 
 	function makeFixture(
@@ -869,6 +1328,8 @@ if (path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) process.ki
 			"scripts/pre-push-targeted-tests.mjs",
 			"scripts/with-test-lock.mjs",
 			"scripts/lib/suite-lock.mjs",
+			"scripts/lib/test-history-selection.mjs",
+			"scripts/lib/vitest-summary.mjs",
 		])
 			put(rel, fs.readFileSync(path.join(repoRoot, rel), "utf8"));
 		if (stubLock) put("scripts/with-test-lock.mjs", stubLock);
@@ -1211,4 +1672,221 @@ if (process.argv[1] && process.argv[1].endsWith("pre-push-targeted-tests.mjs")) 
 		expect(result.stderr).toContain("could not run targeted tests");
 		expect(result.stderr).toContain("push blocked");
 	});
+});
+
+describe("history pass through the real hook and real git (#3215 lane 3)", () => {
+	function repo() {
+		fixtureDir = fs.mkdtempSync(path.join(repoRoot, ".tmp-history-pass-test-"));
+		const cwd = fixtureDir as string;
+		const git = (args: string[]) =>
+			String(gitExecFileSync(args, { cwd, encoding: "utf8" }));
+		git(["init", "--quiet", "--initial-branch=main"]);
+		git(["config", "user.name", "pi-lens test"]);
+		git(["config", "user.email", "test@example.com"]);
+		const commit = (files: Record<string, string>, message: string) => {
+			for (const [file, content] of Object.entries(files)) write(file, content);
+			git(["add", "."]);
+			git(["commit", "--quiet", "-m", message]);
+			return git(["rev-parse", "HEAD"]).trim();
+		};
+		return { cwd, git, commit };
+	}
+
+	it("resolves each head to its own first-parent paths, and omits a merge commit and a head the clone lacks", () => {
+		// Recurrence: the selector attributes a failing head to the paths it
+		// changed; a merge commit has no such diff (its paths would be the whole
+		// of master's side) and an unmerged PR head is simply not in the clone.
+		const { cwd, git, commit } = repo();
+		const base = commit(
+			{ "rules/x/a.yml": "a\n", "docs/readme.md": "r\n" },
+			"base",
+		);
+		const topic = commit(
+			{ "rules/x/b.yml": "b\n", "docs/z.md": "z\n" },
+			"topic",
+		);
+		git(["checkout", "--quiet", "-b", "side", base]);
+		const side = commit({ "side.txt": "s\n" }, "side");
+		git(["checkout", "--quiet", "main"]);
+		git(["merge", "--quiet", "--no-ff", "-m", "merge side", side]);
+		const merge = git(["rev-parse", "HEAD"]).trim();
+		const missing = "f".repeat(40);
+		const resolved = resolveHeadPaths([topic, merge, missing, side], { cwd });
+		expect([...resolved.keys()].sort()).toEqual([side, topic].sort());
+		expect(resolved.get(topic)).toEqual(["docs/z.md", "rules/x/b.yml"]);
+		expect(resolved.get(side)).toEqual(["side.txt"]);
+	});
+
+	it("reads the summary from the data-branch ref, and degrades to unavailable when the ref is absent", () => {
+		// Recurrence: the CI advisory job and a developer clone have only the
+		// `origin/data/test-history` remote-tracking ref; a missing ref (a fresh
+		// clone, a fork) must disclose "unavailable", never throw into the hook.
+		const { cwd, git, commit } = repo();
+		const failing = commit({ "rules/x/a.yml": "a\n" }, "round 1");
+		const noRef = loadHistorySelection({
+			changed: ["rules/x/b.yml"],
+			allTests: ["tests/scripts/rule-catalogs.test.ts"],
+			cwd,
+		});
+		expect(noRef.status).toBe("unavailable");
+		expect(noRef.detail).toContain("history unreadable");
+		expect(noRef.detail).toContain("origin/data/test-history");
+		write(
+			"history/summary.json",
+			JSON.stringify({
+				generatedAt: new Date().toISOString(),
+				heads: [failing],
+				failures: [
+					{
+						file: "tests/scripts/rule-catalogs.test.ts",
+						headSha: failing,
+						flake: false,
+					},
+				],
+			}),
+		);
+		git(["add", "history/summary.json"]);
+		git(["commit", "--quiet", "-m", "data"]);
+		git(["update-ref", "refs/remotes/origin/data/test-history", "HEAD"]);
+		// The checked-out tree no longer holds the summary: only the ref does.
+		git(["reset", "--quiet", "--hard", "HEAD~1"]);
+		const viaRef = loadHistorySelection({
+			changed: ["rules/x/b.yml"],
+			allTests: ["tests/scripts/rule-catalogs.test.ts"],
+			cwd,
+		});
+		expect(viaRef.picks).toEqual(["tests/scripts/rule-catalogs.test.ts"]);
+	});
+
+	/** Runs the real hook over a real git fixture whose history summary the real
+	 * rollup wrote from a Windows-rooted artifact (so the selection also proves
+	 * #3367's repo-relative key is what the checkout's paths match). */
+	function runHookWithHistory({
+		baseFiles,
+		failingChange,
+		pushedChange,
+	}: {
+		baseFiles: Record<string, string>;
+		failingChange: Record<string, string>;
+		pushedChange: Record<string, string>;
+	}) {
+		const { cwd, commit } = repo();
+		for (const link of ["scripts", "node_modules"])
+			fs.symlinkSync(path.join(repoRoot, link), path.join(cwd, link), "dir");
+		// Not the repo's vitest.config.ts: its globalSetup file does not exist in
+		// this fixture. #4086 recurrence: the symlinked lock wrapper was a silent
+		// no-op, so the repo config was never loaded and exit 0 was an artifact.
+		fs.writeFileSync(
+			path.join(cwd, "vitest.config.ts"),
+			'export default { test: { include: ["tests/**/*.test.ts"] } };\n',
+		);
+		fs.writeFileSync(path.join(cwd, "package.json"), '{"type":"module"}\n');
+		const passing = "import { it } from 'vitest';\nit('ok', () => {});\n";
+		commit(
+			{
+				"tests/scripts/rule-catalogs.test.ts": passing,
+				"tests/config/sweep-floor-coverage.test.ts": passing,
+				...baseFiles,
+			},
+			"base",
+		);
+		const failingHead = commit(failingChange, "round 1");
+		const pushed = commit(pushedChange, "round 2");
+		const artifact = path.join(cwd, ".history-artifact");
+		fs.mkdirSync(artifact);
+		fs.writeFileSync(
+			path.join(artifact, METADATA_FILENAME),
+			JSON.stringify({
+				headSha: failingHead,
+				runId: "1",
+				lane: "win32",
+				recordedAt: new Date().toISOString(),
+			}),
+		);
+		fs.writeFileSync(
+			path.join(artifact, "vitest-results.json"),
+			JSON.stringify({
+				testResults: [
+					"scripts\\rule-catalogs",
+					"config\\sweep-floor-coverage",
+				].map((name) => ({
+					name: `D:\\a\\pi-lens\\pi-lens\\tests\\${name}.test.ts`,
+					status: "failed",
+					duration: 5,
+				})),
+			}),
+		);
+		const summary = path.join(cwd, ".history-summary.json");
+		rollupTestHistory({
+			artifactPaths: [artifact],
+			historyPath: path.join(cwd, ".history.ndjson"),
+			summaryPath: summary,
+		});
+		const stepSummary = path.join(cwd, ".step-summary.md");
+		const result = spawnSync(
+			process.execPath,
+			[
+				path.join(repoRoot, "scripts/pre-push-targeted-tests.mjs"),
+				"--skip-build",
+				"--history-summary",
+				summary,
+			],
+			{
+				cwd,
+				encoding: "utf8",
+				env: { ...process.env, GITHUB_STEP_SUMMARY: stepSummary },
+				input: `refs/heads/topic ${pushed} refs/heads/topic ${failingHead}\n`,
+			},
+		);
+		const stepText = fs.existsSync(stepSummary)
+			? fs.readFileSync(stepSummary, "utf8")
+			: "";
+		return { result, stepText };
+	}
+
+	it("adds the tests that failed on a past head touching the same directory, from a summary the real rollup wrote", () => {
+		// #3214 round 1: a rule YAML change reds only rule-catalogs.test.ts, which
+		// imports nothing the YAML is; the hook must select it from history.
+		const { result } = runHookWithHistory({
+			baseFiles: { "rules/x/seed.yml": "seed\n" },
+			failingChange: { "rules/x/a.yml": "a\n" },
+			pushedChange: { "rules/x/b.yml": "b\n" },
+		});
+		expect(result.stdout).toContain("history selection selected");
+		expect(result.stdout).toContain(
+			"history added tests/scripts/rule-catalogs.test.ts",
+		);
+		expect(result.stdout).toContain(
+			"history added tests/config/sweep-floor-coverage.test.ts",
+		);
+		expect(result.stdout).toContain("running 2 targeted test file(s)");
+		expect(result.status).toBe(0);
+	}, 120_000);
+
+	it("labels a capped selection's history picks as history picks, not governance registry suites", () => {
+		// Recurrence: PR #4026 review F4. On the capped path `selected` is the
+		// armed registries plus the history picks, and the console line and the
+		// step summary called all of it "governance registry suite(s)".
+		const importers = Object.fromEntries(
+			Array.from({ length: MAX_SELECTED_TESTS + 1 }, (_, i) => [
+				`tests/gen-${i}.test.ts`,
+				"import { hub } from '../clients/hub.js';\nimport { it } from 'vitest';\nvoid hub;\nit('ok', () => {});\n",
+			]),
+		);
+		const { result, stepText } = runHookWithHistory({
+			baseFiles: { "clients/hub.ts": "export const hub = 1;\n", ...importers },
+			failingChange: { "clients/other.ts": "a\n" },
+			pushedChange: { "clients/hub.ts": "export const hub = 2;\n" },
+		});
+		// sweep-floor-coverage is an armed registry suite; rule-catalogs is the
+		// history pick.
+		expect(result.stdout + result.stderr).toContain(
+			"running only the 1 governance registry suite(s) and 1 history pick(s)",
+		);
+		expect(stepText).toContain(
+			"1 governance registries and 1 history pick(s) only",
+		);
+		expect(stepText).not.toContain("governance registries only");
+		expect(result.status).toBe(0);
+	}, 120_000);
 });
