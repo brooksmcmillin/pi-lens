@@ -1,17 +1,19 @@
 import { execFileSync, spawn } from "node:child_process";
 import {
+	cpSync,
 	existsSync,
 	lstatSync,
 	mkdirSync,
 	readFileSync,
 	readdirSync,
+	readlinkSync,
 	realpathSync,
 	rmSync,
 	symlinkSync,
 	unlinkSync,
 } from "node:fs";
 import { constants as osConstants } from "node:os";
-import { join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gitExecFileSync } from "./lib/git-fixture-env.mjs";
 import {
@@ -41,7 +43,7 @@ const LOAD_FAILURE_MESSAGE =
 
 const RUN_PREFIX = "pi-lens-red-on-base-";
 const USAGE =
-	"usage: node scripts/red-on-base.mjs <test files…> [--base ref] [--repeat N]";
+	"usage: node scripts/red-on-base.mjs <test files…> [--base ref] [--repeat N] [--copy-node-modules]";
 
 class UsageError extends Error {}
 class Interrupted extends Error {}
@@ -133,18 +135,20 @@ function parseArgs(argv) {
 	let base = "origin/master";
 	let repeat = 1;
 	let testCommand;
+	let copyNodeModules = false;
 	for (let index = 0; index < argv.length; index += 1) {
 		const arg = argv[index];
 		if (arg === "--base") base = argv[++index];
 		else if (arg === "--repeat") repeat = Number(argv[++index]);
 		else if (arg === "--test-command") testCommand = argv[++index];
+		else if (arg === "--copy-node-modules") copyNodeModules = true;
 		else if (arg.startsWith("--")) throw new UsageError(`unknown flag ${arg}`);
 		else files.push(arg);
 	}
 	if (!files.length) throw new UsageError("no test files given");
 	if (!Number.isInteger(repeat) || repeat < 1)
 		throw new UsageError("--repeat must be a positive integer");
-	return { files, base, repeat, testCommand };
+	return { files, base, repeat, testCommand, copyNodeModules };
 }
 
 function git(args, cwd) {
@@ -155,17 +159,70 @@ function tail(text) {
 	return text.slice(-1500).trim();
 }
 
+/** Copy bytes, not hardlinks; retain internal symlink topology so .bin entrypoints
+ * resolve their package-relative imports from the original package location. */
+function copyNodeModules(source, destination) {
+	const root = realpathSync(source);
+	if (!lstatSync(root).isDirectory() || existsSync(destination))
+		throw new Error(
+			"dependency copy requires a directory and an absent destination",
+		);
+	const links = [];
+	const within = (root, target) => {
+		const rel = relative(root, target);
+		if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel))
+			throw new Error(`dependency copy escapes its root: ${target}`);
+		return rel;
+	};
+	cpSync(root, destination, {
+		recursive: true,
+		dereference: false,
+		verbatimSymlinks: true,
+		force: false,
+		errorOnExist: true,
+		filter: (entry) => {
+			within(root, realpathSync(entry));
+			if (lstatSync(entry).isSymbolicLink())
+				links.push({
+					path: relative(root, entry),
+					target: readlinkSync(entry),
+				});
+			return true;
+		},
+	});
+	for (const link of links) {
+		const copied = join(destination, link.path);
+		if (isAbsolute(link.target)) {
+			const target = join(destination, within(root, link.target));
+			unlinkSync(copied);
+			symlinkSync(
+				relative(dirname(copied), target),
+				copied,
+				lstatSync(realpathSync(join(root, link.path))).isDirectory()
+					? "dir"
+					: "file",
+			);
+		}
+	}
+	for (const link of links)
+		within(destination, realpathSync(join(destination, link.path)));
+}
+
 /** Unlink the shared-install symlink BEFORE git sees the worktree: a forced
  *  remove that follows it can delete the shared install (#3173). An archive
  *  base tree has its own `.git` directory and is no registered worktree, so Git
  *  is only asked to remove a linked one (whose `.git` is a file). */
 function removeWorktree(cwd, worktree) {
 	const nodeModules = join(worktree, "node_modules");
+	let privateInstall = false;
 	try {
 		if (lstatSync(nodeModules).isSymbolicLink()) unlinkSync(nodeModules);
+		else privateInstall = true;
 	} catch {
 		// no link (never created, or already gone)
 	}
+	// Do not ask Git to remove an install we failed to remove ourselves.
+	if (privateInstall) rmSync(nodeModules, { recursive: true, force: true });
 	let linked = false;
 	try {
 		linked = lstatSync(join(worktree, ".git")).isFile();
@@ -404,11 +461,19 @@ export async function main(argv = process.argv.slice(2)) {
 		}
 		added = true;
 		materializeBase(cwd, worktree, baseSha, join(runRoot, "base.tar"), base);
-		symlinkSync(
-			resolve(cwd, "node_modules"),
-			join(worktree, "node_modules"),
-			"dir",
-		);
+		if (args.copyNodeModules) {
+			console.log("BASE-DEPENDENCIES private-copy");
+			copyNodeModules(
+				resolve(cwd, "node_modules"),
+				join(worktree, "node_modules"),
+			);
+		} else {
+			symlinkSync(
+				resolve(cwd, "node_modules"),
+				join(worktree, "node_modules"),
+				"dir",
+			);
+		}
 		const baseBuild = await build(worktree, "base");
 		if (baseBuild.status !== 0) {
 			console.error(

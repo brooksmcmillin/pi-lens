@@ -8,6 +8,10 @@ import { execFileSync, spawn } from "node:child_process";
 import {
 	appendFileSync,
 	existsSync,
+	lstatSync,
+	realpathSync,
+	statSync,
+	symlinkSync,
 	readFileSync,
 	writeFileSync,
 } from "node:fs";
@@ -24,6 +28,31 @@ const probe = (entry) =>
 
 if (args.includes("--build")) {
 	probe({ phase: "build" });
+	if (scenario.dependencyProbe) {
+		const deps = join(cwd, "node_modules");
+		probe({
+			phase: "dependencies",
+			linked: lstatSync(deps).isSymbolicLink(),
+			cli: execFileSync(process.execPath, [join(deps, ".bin", "fixture")], {
+				encoding: "utf8",
+			}).trim(),
+			absoluteTarget: realpathSync(join(deps, "absolute")),
+			directoryTarget: realpathSync(join(deps, "directory")),
+			hardlinkInode: statSync(join(deps, "hard")).ino,
+		});
+		if (cwd !== process.env.DEPENDENCY_SOURCE_ROOT) {
+			for (const name of ["absolute", "hard", "directory/value.cjs"])
+				writeFileSync(join(deps, name), "base changed bytes");
+			// Cleanup must unlink, not traverse, even a link a base build creates.
+			if (process.env.DEPENDENCY_CLEANUP_TARGET) {
+				symlinkSync(
+					process.env.DEPENDENCY_CLEANUP_TARGET,
+					join(deps, "cleanup-link"),
+					"dir",
+				);
+			}
+		}
+	}
 	process.exit(scenario.buildExit ?? 0);
 }
 

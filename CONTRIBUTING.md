@@ -71,6 +71,15 @@ Code, `guard-bash` denies `PI_LENS_SKIP_HOOKS=`, `HUSKY=0`, `--no-verify`,
 red that looks unrelated, prove it with `node scripts/red-on-base.mjs`; to
 repair a wrong `core.hooksPath`, run `node scripts/setup-git-hooks.mjs`.
 
+For an isolated base dependency tree, use
+`node scripts/red-on-base.mjs <test files…> --copy-node-modules`. The default
+still links the current install. Copy mode copies file bytes (not hardlinks),
+preserves internal symlinks, and rebases absolute internal links. Outward,
+dangling, or cyclic symlinks fail visibly before the base build; no packages
+are installed. The source install must stay unchanged during copying. Both
+modes build HEAD in place; only the base dependency tree is isolated. Owned
+scratch dependencies are removed before worktree cleanup, including on failure.
+
 An agent driven through Claude Code also runs under a `PreToolUse` hook on
 every `Bash` call, `scripts/hooks/guard-bash.mjs` (wired in
 `.claude/settings.json`), which denies `git stash` in any form, a `git reset

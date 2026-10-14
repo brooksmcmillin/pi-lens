@@ -2795,7 +2795,9 @@ describe("scripts/hooks/guard-bash.mjs -- never throws (#2699)", () => {
 describe("scripts/hooks/guard-bash.mjs -- drains stdin to EOF on a large payload (#3089)", () => {
 	function payloadOfAtLeast(bytes: number, tailCommand: string): string {
 		const pad = "x".repeat(bytes);
-		return `echo ${pad} && ${tailCommand}`;
+		// Exercise stdin draining, not giant-token stress: keep padding inert
+		// and the denied command after it so a short read cannot see the tail.
+		return `# ${pad}\n${tailCommand}`;
 	}
 
 	it.each([
