@@ -588,12 +588,8 @@ it("restores when a real timeout sends SIGTERM", async () => {
 		.digest("hex");
 	await expect(
 		execFileAsync(
-			"timeout",
+			process.execPath,
 			[
-				"-s",
-				"TERM",
-				"2s",
-				process.execPath,
 				cli,
 				"--built",
 				"--file",
@@ -605,10 +601,16 @@ it("restores when a real timeout sends SIGTERM", async () => {
 				"--tests",
 				target,
 			],
-			{ cwd: root, env: { ...process.env, PI_LENS_MUTATION_RUN: "1" } },
+			{
+				cwd: root,
+				env: { ...process.env, PI_LENS_MUTATION_RUN: "1" },
+				timeout: 2000,
+				killSignal: "SIGTERM",
+			},
 		),
 	).rejects.toMatchObject({
-		code: 124,
+		killed: true,
+		signal: "SIGTERM",
 	});
 	expect(
 		createHash("sha256").update(readFileSync(builtTarget)).digest("hex"),

@@ -1,6 +1,6 @@
 ---
 section: Fixed
-audience: internal
+audience: user
 ---
 
-- Reconcile upstream integration with fork governance, conditional skill filtering, and Windows shell validation. Make installer, path, subprocess, and IPC validation fixtures portable without weakening their behavioral assertions.
+- **Keep named `/tmp` directory guards effective on macOS.** Preserve fork governance, conditional skill filtering, and Windows shell validation during the upstream integration, with portable validation fixtures.

@@ -296,7 +296,9 @@ const ok =
 	payload.hook_event_name === "PreToolUse" &&
 	(lane === "lane" ? link : lane === "real" && !link) &&
 	dirname(process.env.HOME) === dirname(cwd) &&
-	Object.keys(process.env).sort().join() === "HOME,PATH,TMPDIR";
+	Object.keys(process.env)
+		.filter((key) => process.platform !== "darwin" || key !== "__CF_USER_TEXT_ENCODING")
+		.sort().join() === "HOME,PATH,TMPDIR";
 process.exit(ok ? 2 : 0);
 `,
 			);

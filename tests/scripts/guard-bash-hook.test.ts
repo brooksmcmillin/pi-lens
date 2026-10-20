@@ -32,6 +32,7 @@ import {
 	mkdtempSync,
 	openSync,
 	readFileSync,
+	realpathSync,
 	rmSync,
 	symlinkSync,
 	unlinkSync,
@@ -40,7 +41,7 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
 	classifySegment,
 	classifyPayload,
@@ -2649,6 +2650,58 @@ describe("scripts/hooks/guard-bash.mjs -- path-argument resolver (#3988)", () =>
 // c0184f1 allowed: the substitution's mark split or fused a rule word, or
 // (H1) the inline hook-bypass env never reached classifyGit.
 describe("scripts/hooks/guard-bash.mjs -- substitution next to a rule word (#3997)", () => {
+	it("protects lexical and physical tmp roots across guard callers", () => {
+		// PR25 corpus row504: a physical /private/tmp operand escaped a lexical /tmp guard.
+		const actual = realpathSync.native;
+		const probe = vi
+			.spyOn(realpathSync, "native")
+			.mockImplementation((value) => {
+				if (String(value) === "/tmp") return "/private/tmp";
+				if (String(value) === "/tmp/escape/..") return "/home/dev/safe";
+				if (String(value) === "/tmp/new-tree") {
+					throw Object.assign(new Error("missing"), { code: "ENOENT" });
+				}
+				return actual(value);
+			});
+		try {
+			for (const [command, rule] of [
+				["mktemp $(:)-d /tmp/x.XXXX", "tmpCheckout"],
+				["git worktree add /tmp/new-tree", "tmpCheckout"],
+				["git -C /tmp worktree add new-tree", "tmpCheckout"],
+				["git -C /tmp clone repo new-tree", "tmpCheckout"],
+				["cp -t /tmp a b", "tmpWrite"],
+				["echo a > /private/tmp/x", "tmpWrite"],
+			] as const) {
+				expect(findDeny(command, PAYLOAD_CWD), command).toBe(rule);
+			}
+			expect(
+				findDeny("mktemp -d /home/dev/safe/x.XXXX", PAYLOAD_CWD),
+			).toBeNull();
+			// A symlink/.. path that physically lands outside the protected root stays allowed.
+			expect(
+				findDeny("mktemp -d /tmp/escape/../x.XXXX", PAYLOAD_CWD),
+			).toBeNull();
+		} finally {
+			probe.mockRestore();
+		}
+	});
+
+	it("keeps the lexical tmp guard when root resolution fails", () => {
+		const probe = vi.spyOn(realpathSync, "native").mockImplementation(() => {
+			throw Object.assign(new Error("unreadable"), { code: "EACCES" });
+		});
+		try {
+			expect(findDeny("mktemp -d /tmp/x.XXXX", PAYLOAD_CWD)).toBe(
+				"tmpCheckout",
+			);
+			expect(
+				findDeny("mktemp -d /home/dev/safe/x.XXXX", PAYLOAD_CWD),
+			).toBeNull();
+		} finally {
+			probe.mockRestore();
+		}
+	});
+
 	it.each([
 		["git $(:) stash", "stash"],
 		["$(:) git stash", "stash"],
@@ -5317,6 +5370,26 @@ describe("scripts/hooks/guard-bash.mjs -- writes under /tmp (#4348)", () => {
 		expect(allowed.stderr).toBe("");
 	});
 
+	it.each([
+		["/tmp", null],
+		["/private/tmp", "tmpWrite"],
+	] as const)(
+		"judges /private/tmp against the measured root %s",
+		(physicalRoot, rule) => {
+			const actual = realpathSync.native;
+			const probe = vi
+				.spyOn(realpathSync, "native")
+				.mockImplementation((value) =>
+					String(value) === "/tmp" ? physicalRoot : actual(value),
+				);
+			try {
+				expect(deny("echo a > /private/tmp/x")).toBe(rule);
+			} finally {
+				probe.mockRestore();
+			}
+		},
+	);
+
 	// Named limits, pinned so each is a visible decision rather than an
 	// untested docblock claim. Every one is a write this static scan does not
 	// follow (see the PR body "Limits"); none is promised denied.
@@ -5333,7 +5406,6 @@ describe("scripts/hooks/guard-bash.mjs -- writes under /tmp (#4348)", () => {
 		"awk '{print > \"/tmp/x\"}' f",
 		"cp --target=/tmp a",
 		"echo a > ${TMPDIR:-/tmp}/x",
-		"echo a > /private/tmp/x",
 	])("limit: %j is not judged", (command) => {
 		expect(deny(command)).toBeNull();
 	});

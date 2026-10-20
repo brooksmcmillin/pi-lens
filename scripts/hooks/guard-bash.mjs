@@ -1193,11 +1193,15 @@ const TMP_ROOT = "/tmp";
  * @returns {boolean}
  */
 function isUnderTmpRoot(absoluteDir, root = TMP_ROOT) {
-	const rel = relative(root, absoluteDir);
-	return (
-		rel === "" ||
-		(!rel.startsWith(`..${SEP}`) && rel !== ".." && !isAbsolute(rel))
-	);
+	// Existing operands may be physical (/tmp -> /private/tmp on macOS),
+	// while not-yet-created operands retain their lexical spelling.
+	return [root, resolveShellPath(root, undefined, {}).path].some((spelling) => {
+		const rel = relative(spelling, absoluteDir);
+		return (
+			rel === "" ||
+			(!rel.startsWith(`..${SEP}`) && rel !== ".." && !isAbsolute(rel))
+		);
+	});
 }
 
 /** Bounds {@link expandShellWord}'s indirection loop -- generous for the real
