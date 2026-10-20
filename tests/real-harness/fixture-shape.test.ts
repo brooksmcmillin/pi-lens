@@ -99,6 +99,23 @@ describe("real harness fixture shape", () => {
 				path.join(fixtureDir, "scripted-provider.mjs"),
 			);
 			writeFileSync(path.join(tmpDir, "package.json"), '{"type":"module"}\n');
+			const sdkRoot = path.join(
+				tmpDir,
+				"node_modules/@earendil-works/pi-coding-agent",
+			);
+			mkdirSync(path.join(sdkRoot, "dist"), { recursive: true });
+			writeFileSync(
+				path.join(sdkRoot, "package.json"),
+				JSON.stringify({
+					name: "@earendil-works/pi-coding-agent",
+					type: "module",
+					exports: { ".": { import: "./dist/index.js" } },
+				}),
+			);
+			writeFileSync(
+				path.join(sdkRoot, "dist/index.js"),
+				'throw new Error("host fixture is metadata-only");\n',
+			);
 			const piAiDist = path.join(
 				tmpDir,
 				"node_modules/@earendil-works",
@@ -106,6 +123,14 @@ describe("real harness fixture shape", () => {
 				"dist",
 			);
 			mkdirSync(piAiDist, { recursive: true });
+			writeFileSync(
+				path.join(path.dirname(piAiDist), "package.json"),
+				JSON.stringify({
+					name: "@earendil-works/pi-ai",
+					type: "module",
+					exports: { ".": { import: "./dist/index.js" } },
+				}),
+			);
 			writeFileSync(
 				path.join(piAiDist, "index.js"),
 				`export const createAssistantMessageEventStream = () => ({ layout: ${JSON.stringify(layout)}, push() {}, end() {} });\n`,

@@ -42,7 +42,8 @@ const FIXED_WEDGE_MS = NOTIFY_BUDGET_MS * 5;
 const BIG_CONTENT = "export const wedge = 1;\n".repeat(60_000);
 const AUX_CLIENT_KEY = `opengrep:${normalizeMapKey(ROOT)}`;
 
-const CPU_SAMPLE_MS = 300;
+// Darwin pidusage differences ps's integer-second elapsed time; use the production window.
+const CPU_SAMPLE_MS = process.platform === "darwin" ? 1200 : 300;
 
 let latencyLogger:
 	| typeof import("../../../clients/latency-logger.js")

@@ -10,7 +10,7 @@
  * golden artifact under `tests/fixtures/witness/scanner-freshness/`.
  *
  * The only doubles are process boundaries: `clients/pipeline.js` (it spawns
- * every configured linter) and the scanner RESULT caches, which are written
+ * every configured linter), POSIX resource sampling (`pidusage`), and the scanner RESULT caches, which are written
  * through the REAL `CacheManager` into the project's real cache directory —
  * exactly what a session_start scan leaves behind and what turn_end reads. The
  * cache manager, the coordinator, the freshness gate, the disposition store and
@@ -26,6 +26,15 @@ const logLatency = vi.hoisted(() => vi.fn());
 vi.mock("../clients/latency-logger.js", async (importOriginal) => ({
 	...(await importOriginal<typeof import("../clients/latency-logger.js")>()),
 	logLatency,
+}));
+
+// A short-lived process can disappear during OS sampling; freshness does not
+// depend on CPU/RSS. Keep that external boundary deterministic, not the ledger.
+vi.mock("pidusage", () => ({
+	default: (pids: number[]) =>
+		Promise.resolve(
+			Object.fromEntries(pids.map((pid) => [pid, { cpu: 0, memory: 0 }])),
+		),
 }));
 
 const pipeline = vi.hoisted(() => ({ runPipeline: vi.fn() }));

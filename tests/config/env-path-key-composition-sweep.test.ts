@@ -1721,8 +1721,6 @@ const SEEDED_OFFENDERS: Readonly<Record<string, PathKeyReason>> = {
 		"unclassified-spelling",
 	"tests/clients/safe-spawn-windows-resolution.test.ts#markFilesAsPresent:f14b6003#pAtH":
 		"unclassified-spelling",
-	"tests/clients/turn-scenarios.test.ts#knipUnavailableReason:8aacd496#PATH":
-		"unclassified-spelling",
 	"tests/scripts/astgrep-self-scan.test.ts#d:9989b09e#PATH": "spread-override",
 	"tests/scripts/check-pr-body.test.ts#existsBaseFixtures:bf4943de#PATH":
 		"spread-override",
