@@ -1,0 +1,107 @@
+# CodeRabbit repo config. Every key below is defined in the CodeRabbit
+# configuration reference: https://docs.coderabbit.ai/reference/configuration
+# (fetched 2026-10-20). Keys the reference does not define are not set here.
+# The PR body of the change that added this file carries the measurements.
+
+language: en-US # https://docs.coderabbit.ai/reference/configuration
+early_access: false # https://docs.coderabbit.ai/reference/configuration
+
+reviews:
+  # Keep the chill profile. Assertive adds more Minor threads, which the
+  # measured sample showed are the least actioned class.
+  profile: chill # https://docs.coderabbit.ai/reference/configuration
+  # Do not use CodeRabbit's change-request workflow; merge policy counts threads.
+  request_changes_workflow: false # https://docs.coderabbit.ai/reference/configuration
+  # Summary, walkthrough and labelling output: off, because it carried no
+  # actionable threads in the measured sample.
+  high_level_summary: false # https://docs.coderabbit.ai/reference/configuration
+  poem: false # https://docs.coderabbit.ai/reference/configuration
+  review_status: false # https://docs.coderabbit.ai/reference/configuration
+  collapse_walkthrough: true # https://docs.coderabbit.ai/reference/configuration
+  sequence_diagrams: false # https://docs.coderabbit.ai/reference/configuration
+  changed_files_summary: false # https://docs.coderabbit.ai/reference/configuration
+  estimate_code_review_effort: false # https://docs.coderabbit.ai/reference/configuration
+  related_issues: false # https://docs.coderabbit.ai/reference/configuration
+  related_prs: false # https://docs.coderabbit.ai/reference/configuration
+  suggested_labels: false # https://docs.coderabbit.ai/reference/configuration
+  suggested_reviewers: false # https://docs.coderabbit.ai/reference/configuration
+  in_progress_fortune: false # https://docs.coderabbit.ai/reference/configuration
+
+  pre_merge_checks:
+    docstrings:
+      mode: off # https://docs.coderabbit.ai/reference/configuration
+    title:
+      mode: off # https://docs.coderabbit.ai/reference/configuration
+    description:
+      mode: off # https://docs.coderabbit.ai/reference/configuration
+    issue_assessment:
+      mode: off # https://docs.coderabbit.ai/reference/configuration
+
+  # Auto-fix and generated-change finishing touches are off: every change
+  # goes through the fixer and reviewer lanes.
+  finishing_touches:
+    docstrings:
+      enabled: false # https://docs.coderabbit.ai/reference/configuration
+    unit_tests:
+      enabled: false # https://docs.coderabbit.ai/reference/configuration
+    simplify:
+      enabled: false # https://docs.coderabbit.ai/reference/configuration
+    autofix:
+      enabled: false # https://docs.coderabbit.ai/reference/configuration
+    fix_ci:
+      enabled: false # https://docs.coderabbit.ai/reference/configuration
+    resolve_merge_conflict:
+      enabled: false # https://docs.coderabbit.ai/reference/configuration
+
+  # Per-path instructions point CodeRabbit at the repo contract instead of
+  # restating it here. Path globs and instruction limits:
+  # https://docs.coderabbit.ai/reference/configuration
+  path_instructions:
+    - path: "**/*"
+      instructions: >-
+        Check the change against the "Recurring defect shapes" section of
+        AGENTS.md (knowledge file, see knowledge_base below). Report only
+        findings that a code path or test can demonstrate; do not comment on
+        style that the lint gates enforce.
+    - path: ".github/workflows/**"
+      instructions: >-
+        CI workflow changes are reviewed against the merge policy: a claimed
+        fix needs the lane's own run evidence. Do not ask for evidence that the
+        workflow cannot produce from a PR head (workflow_run executes the
+        default branch copy).
+    - path: "AGENTS.md"
+      instructions: >-
+        This file is the contract. Do not flag PR round references here as
+        inline threads unless they break a rule in AGENTS.md itself.
+    - path: "docs/**"
+      instructions: >-
+        Docs changes: flag factual contradictions with code only. Do not
+        comment on wording.
+    - path: "tests/**"
+      instructions: >-
+        Flag a test only when it cannot fail on the defect it claims to prove
+        (a tautology or a fake seam). Do not ask for more tests.
+
+  auto_review:
+    enabled: true # https://docs.coderabbit.ai/reference/configuration
+    # Maintainer PRs are not auto-reviewed. Contributor PRs are reviewed once,
+    # on open. Author split is by exact, case-sensitive username.
+    ignore_usernames: # https://docs.coderabbit.ai/reference/configuration
+      - "apmantza"
+      - "dependabot[bot]"
+    # No per-push re-review: incremental review is repo-wide, not per author,
+    # so it is off for everyone. The orchestrator requests one review per final
+    # head.
+    auto_incremental_review: false # https://docs.coderabbit.ai/reference/configuration
+    drafts: false # https://docs.coderabbit.ai/reference/configuration
+
+knowledge_base:
+  code_guidelines:
+    enabled: true # https://docs.coderabbit.ai/reference/configuration
+    filePatterns: # https://docs.coderabbit.ai/reference/configuration
+      - "AGENTS.md"
+      - "docs/pi-lens-*.md"
+
+chat:
+  # Do not auto-reply in threads: it adds thread churn on items already decided.
+  auto_reply: false # https://docs.coderabbit.ai/reference/configuration

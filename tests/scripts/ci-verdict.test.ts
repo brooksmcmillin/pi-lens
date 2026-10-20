@@ -178,6 +178,7 @@ function checkRun({
 	status = "completed",
 	conclusion = "success",
 	started_at = "2026-09-03T00:00:00Z",
+	completed_at,
 	id = 1,
 	html_url = `https://github.com/apmantza/pi-lens/actions/runs/${id}`,
 	details_url = `${html_url}/job/${id}`,
@@ -186,11 +187,21 @@ function checkRun({
 	status?: string;
 	conclusion?: string | null;
 	started_at?: string;
+	completed_at?: string;
 	id?: number;
 	html_url?: string;
 	details_url?: string;
 }) {
-	return { name, status, conclusion, started_at, id, html_url, details_url };
+	return {
+		name,
+		status,
+		conclusion,
+		started_at,
+		...(completed_at === undefined ? {} : { completed_at }),
+		id,
+		html_url,
+		details_url,
+	};
 }
 
 const BOTH_SUCCESS = {
@@ -1231,6 +1242,177 @@ describe("computeVerdict — a discovered row's cancelled conclusion is uncertai
 	// `requiredNameSet` guard is structurally dead code (removing it changes
 	// no test outcome: `failingGatingRows` always wins precedence first for a
 	// required row), so there is no separate line left to guard against.
+});
+
+// #4672 V3: the merge policy's own gate step runs THIS tool, and it kept
+// reading a cancelled shard row as blocking after #4680 taught the ci.yml
+// aggregates that a teardown race is a pass. Reproduced before the fix: green
+// aggregates plus one cancelled shard row returned exit 3 / kind `cancelled`,
+// so `node scripts/ci-verdict.mjs <pr>` could never return 0 on the very run
+// shape the seam makes green.
+describe("computeVerdict — a cancelled shard row its aggregate judged green is not blocking (#4672 V3)", () => {
+	// Timestamps in the order a real run posts them (run 39481284562: every
+	// aggregate starts 2-3 s after its last shard ends). The aggregates start
+	// at 00:25, after the cancelled shards (00:10 -> 00:22) have completed.
+	const AFTER_SHARDS = "2026-09-03T00:25:00Z";
+	const shardShape = () => [
+		checkRun({ name: "Unit tests", started_at: AFTER_SHARDS, id: 1 }),
+		checkRun({ name: "Lint & type-check", id: 2 }),
+		checkRun({ name: "TLA+ models", started_at: AFTER_SHARDS, id: 3 }),
+		checkRun({ name: "Unit tests (shard 1/5)", id: 4 }),
+		checkRun({ name: "Unit tests (shard 3/5)", id: 5 }),
+		checkRun({
+			name: "Unit tests (shard 3/5)",
+			conclusion: "cancelled",
+			started_at: "2026-09-03T00:10:00Z",
+			completed_at: "2026-09-03T00:22:00Z",
+			id: 6,
+		}),
+		checkRun({ name: "TLA+ models (shard 1/4)", id: 7 }),
+		checkRun({
+			name: "TLA+ models (shard 4/4)",
+			conclusion: "cancelled",
+			started_at: "2026-09-03T00:10:00Z",
+			completed_at: "2026-09-03T00:22:00Z",
+			id: 8,
+		}),
+	];
+
+	it("returns green when the cancelled shard's own aggregate concluded success", () => {
+		const verdict = computeVerdict(
+			{ check_runs: shardShape() },
+			undefined,
+			"MERGEABLE",
+		);
+		expect(verdict.exitCode).toBe(0);
+		expect(verdict.kind).toBe("success");
+		// The cancellation is still RECORDED -- the judgement is "a teardown
+		// race the aggregate already read", not "no cancellation happened".
+		expect(verdict.cancelledRows).toEqual([]);
+		const rows = new Map(verdict.rows.map((row) => [row.name, row]));
+		expect(rows.get("Unit tests (shard 3/5)")?.conclusion).toBe("cancelled");
+	});
+
+	it("returns green for a REQUIRED name that has shard rows beside it", () => {
+		// `Unit tests` is a required name, so its own row is the only input that
+		// decides the required half; the shard rows must not resurrect a pending.
+		const verdict = computeVerdict(
+			{ check_runs: shardShape() },
+			["Unit tests", "Lint & type-check", "TLA+ models"],
+			"MERGEABLE",
+		);
+		expect(verdict.exitCode).toBe(0);
+	});
+
+	it.each([
+		["cancelled", "the aggregate was itself cancelled"],
+		["failure", "the aggregate concluded a real failure"],
+		[null, "the aggregate has not concluded"],
+	])("still pends when the aggregate is %s (%s)", (conclusion, _why) => {
+		const runs = shardShape().map((run) =>
+			run.name === "TLA+ models" ? { ...run, conclusion } : run,
+		);
+		const verdict = computeVerdict(
+			{ check_runs: runs },
+			undefined,
+			"MERGEABLE",
+		);
+		expect(verdict.exitCode).toBe(3);
+		expect(verdict.kind).toBe("cancelled");
+		expect(verdict.cancelledRows.map((row) => row.name)).toContain(
+			"TLA+ models (shard 4/4)",
+		);
+	});
+
+	// #4680 r4 F2 (greptile "Old success clears new cancellation"): the
+	// aggregate was looked up by NAME only, so a green `TLA+ models` from an
+	// earlier run excused a shard cancelled LATER, in a run whose own aggregate
+	// row did not exist yet. Reproduced before the fix: exit 0. An aggregate
+	// judges a shard only when it started at or after that shard completed;
+	// anything else, a missing or unparsable timestamp included, judges
+	// nothing, so the row keeps its cancelled reading.
+	it.each([
+		[
+			"started before the shard completed",
+			{ started_at: "2026-09-03T00:05:00Z" },
+		],
+		["has no started_at", { started_at: "" }],
+		["has an unparsable started_at", { started_at: "not a time" }],
+	])(
+		"still pends when the green aggregate %s",
+		(_why, aggregate: { started_at: string }) => {
+			const runs = shardShape().map((run) =>
+				run.name === "TLA+ models" ? { ...run, ...aggregate } : run,
+			);
+			const verdict = computeVerdict(
+				{ check_runs: runs },
+				undefined,
+				"MERGEABLE",
+			);
+			expect(verdict.exitCode).toBe(3);
+			expect(verdict.kind).toBe("cancelled");
+			expect(verdict.cancelledRows.map((row) => row.name)).toEqual([
+				"TLA+ models (shard 4/4)",
+			]);
+		},
+	);
+
+	it("still pends when the cancelled shard has no completed_at to order by", () => {
+		const runs = shardShape().map((run) =>
+			run.name === "TLA+ models (shard 4/4)"
+				? { ...run, completed_at: undefined }
+				: run,
+		);
+		const verdict = computeVerdict(
+			{ check_runs: runs },
+			undefined,
+			"MERGEABLE",
+		);
+		expect(verdict.exitCode).toBe(3);
+		expect(verdict.cancelledRows.map((row) => row.name)).toEqual([
+			"TLA+ models (shard 4/4)",
+		]);
+	});
+
+	// The boundary of `>=`: an aggregate that starts in the same second its
+	// shard ended has judged it (timestamps are whole seconds).
+	it("returns green when the aggregate starts in the second the shard ended", () => {
+		const runs = shardShape().map((run) =>
+			run.name === "TLA+ models"
+				? { ...run, started_at: "2026-09-03T00:22:00Z" }
+				: run,
+		);
+		const verdict = computeVerdict(
+			{ check_runs: runs },
+			undefined,
+			"MERGEABLE",
+		);
+		expect(verdict.exitCode).toBe(0);
+	});
+
+	it("still pends for a cancelled row that belongs to no aggregate", () => {
+		const runs = [
+			...shardShape(),
+			checkRun({
+				name: "Production install build (--omit=dev, from source)",
+				conclusion: "cancelled",
+				started_at: "2026-09-03T00:10:00Z",
+				id: 9,
+			}),
+		];
+		const verdict = computeVerdict(
+			{ check_runs: runs },
+			undefined,
+			"MERGEABLE",
+		);
+		expect(verdict.exitCode).toBe(3);
+		expect(verdict.kind).toBe("cancelled");
+		expect(verdict.cancelledRows.map((row) => row.name)).toEqual(
+			expect.arrayContaining([
+				"Production install build (--omit=dev, from source)",
+			]),
+		);
+	});
 });
 
 describe("resolveRequiredCheckNames — live branch-protection read (#2609)", () => {

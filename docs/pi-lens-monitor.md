@@ -40,19 +40,51 @@ snapshots; no additional telemetry sink is created.
 
 ## Inputs
 
-- `~/.pi-lens/latency.log` and `~/.pi-lens/extension.log` (JSON lines; every
-  row carries `pid` and `ts`). The session is the `pid` the brief names, or the
-  newest pid with rows in the last hour when the brief says "live".
+Read the monitored process's log directory, resolved by `getGlobalPiLensLogDir()`
+in `clients/probe-home-state.ts`: a non-empty `PI_LENS_HOME` wins, otherwise
+any applicable probe-home redirect, otherwise `~/.pi-lens`. Do not infer this
+from the monitor's own environment. The brief names the root. When it does
+not, a `PI_LENS_HOME` in the monitored pid's environment (`/proc/<pid>/environ`
+on Linux, `ps eww -p <pid>` on macOS) settles it; otherwise a probe-home
+redirect may have chosen the root from that process's working directory, so
+ask the orchestrator for the root instead of reading `~/.pi-lens`. Pass that directory as `--root` to
+`scripts/analyze-pi-lens-logs.mjs`, whose default is `~/.pi-lens`.
+
+- `latency.log` and `extension.log` (JSON lines; every row carries `pid`
+  and `ts`). The session is the `pid` the brief names, or the newest pid with
+  rows in the last hour when the brief says "live".
+- `cascade.log` (JSON lines with `ts`, `phase`, and `filePath`,
+  but no `pid` or `type`). Use the selected time window and `filePath` to
+  narrow by project. Label counts as project/time-window evidence, not
+  pid-attributed evidence; flag shared-project and non-path rows as
+  attribution-ambiguous.
 - The previous readout for the same project when one exists (an issue comment
   the brief links, or a file under the scratch directory). Every number is
   reported as a delta against it when available.
+
+Read active files, retained numbered siblings (for example, `cascade.log.1`),
+and date-only archives (for example, `cascade.log.2026-03-01`), plus timestamped
+archives that overlap the selected window. The analyzer includes numbered and
+date-only siblings by default; use `--archived` for timestamped archive names
+containing `T` (for example, `cascade.2026-03-01T12-00-00Z.log`, the form session-start cleanup writes). Filter rows by
+the selected window in every file. A missing active file does not make its
+retained siblings empty; flag incomplete retention when the files do not cover
+the requested window.
 
 ## The readout (fixed shape, one comment or file, never stdout to the session)
 
 1. **Session line**: pid, project root, first/last row timestamps, row count,
    pi-lens version if a session-start row carries it.
-2. **Phase table**: for every `type:"phase"` value, `n | p50 | p95 | max |
-   total_ms`, sorted by total, top 15. Durations in ms, from `durationMs`.
+2. **Phase table**: group `latency.log` rows with `type:"phase"` and
+   `cascade.log` rows from all selected files by `source | phase`, using the
+   log family as `source` across active and archived siblings. Report
+   `n | timed_n | p50 | p95 | max | total_ms`, sorted by total, top 15.
+   Count every row in `n`; compute
+   timing columns only from numeric `durationMs`, in ms, with `timed_n`
+   showing that sample count. Show `-` when no durations exist. List count-only
+   phases separately so the timing top 15 cannot hide `cascade_carry_rendered`;
+   include its `metadata.carriedRunsRendered` and `metadata.labeledAdvisories`
+   totals.
 3. **Bounds reached at p50** (shape 41): every phase whose p50 is within 10%
    of a declared budget or timeout in its metadata (`budgetMs`, `timeoutMs`,
    `elapsedMs` ≈ budget). Name the constant when it is known
@@ -153,8 +185,22 @@ snapshots; no additional telemetry sink is created.
 - File nothing yourself unless the brief grants `gh`; then one comment on the
   issue the brief names, never a new issue: the orchestrator decides what
   becomes a lane.
-- A worker that finds the logs empty or the pid absent reports exactly that
-  with the `ls -la` of the two files and stops.
+- The analyzer reads discovered sources independently and does not apply a
+  pid-evidence stop rule. It reports per-family file and row counts
+  (`filesScanned`, `rowsSeen`, `parseErrors`) but cannot classify each input
+  as absent, empty, unreadable, or out-of-window.
+  Missing files and unreadable directories can yield no discovered input;
+  empty files and out-of-window rows contribute no rows. A discovered file
+  read error fails the command instead of producing an empty report. Do not
+  infer absent or empty inputs from zero counts alone.
+- Apply the evidence policy in the monitor's own readout: if the pid is absent
+  from the selected latency/extension rows, report that and stop only
+  pid-attributed analysis. Continue the project/time-window cascade readout,
+  including carry counters, without claiming pid ownership. Inspect the inputs
+  separately and report absent, empty, unreadable, or out-of-window states as
+  observed, with a bounded `ls -la` inventory of the resolved active files and
+  retained archives. After reporting those limits, stop the whole readout only
+  when neither kind of evidence is available.
 
 ## Deliverable
 

@@ -202,7 +202,7 @@ import {
 	rmSync,
 	writeFileSync,
 } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
 	ASSERTION_LINE,
@@ -218,11 +218,13 @@ import {
 	HEAVY_GATE_CHECK,
 	isAdvisoryCheck,
 	isBlockingConclusion,
-	isNonPrCiEvent,
+	isGatingCheckName,
 	isUncertainConclusion,
 	isUnitTestsJobName,
 	REQUIRED_CHECKS,
 	resolveLatestByName,
+	resolveTriggerAdvisoryNames,
+	shardAggregateName,
 } from "./lib/ci-checks.mjs";
 
 import { findStickyCommentId } from "./lib/mutation-pr-comment.mjs";
@@ -664,27 +666,20 @@ export function computeVerdict(
 	// #4090: a name every one of whose runs came from a schedule/dispatch/
 	// workflow_run workflow is not part of this commit's PR/push CI. One run of
 	// the name from any other (or unknown) event keeps it gating, and a
-	// required name is never excused.
-	const eventsByName = new Map();
-	for (const checkRun of checkRuns) {
-		const events = eventsByName.get(checkRun.name) ?? [];
-		events.push(checkRun.workflow_event);
-		eventsByName.set(checkRun.name, events);
-	}
-	const triggerAdvisoryNames = new Set(
-		[...eventsByName]
-			.filter(([, events]) => events.every((event) => isNonPrCiEvent(event)))
-			.map(([name]) => name),
-	);
+	// required name is never excused. The rule and its one resolution live in
+	// `scripts/lib/ci-checks.mjs`, because `runtimeCapLines` prints the same
+	// answer as a `(gating)` marker and the two disagreed (V5a).
+	const triggerAdvisoryNames = resolveTriggerAdvisoryNames(checkRuns);
 
 	const buildRow = (name) => {
 		const run = byName.get(name);
 		// requiredNameSet.has(name): see the doc comment above -- a name GitHub
 		// itself confirms as required always gates, even if it were also (by
 		// mistake) on the static advisory allowlist.
-		const gating =
-			requiredNameSet.has(name) ||
-			(!isAdvisoryCheck(name) && !triggerAdvisoryNames.has(name));
+		const gating = isGatingCheckName(name, {
+			required: requiredNameSet,
+			triggerAdvisoryNames,
+		});
 		if (!run) {
 			return {
 				name,
@@ -759,13 +754,47 @@ export function computeVerdict(
 					: isBlockingConclusion(row.conclusion)),
 		),
 	);
+	// #4672 V3: a SHARD row's cancellation is judged by its aggregate, not here.
+	// The aggregate (`Unit tests`, `TLA+ models`) is the required context, and
+	// its own job runs `scripts/check-shard-verdict.mjs`, which reads every
+	// shard's step conclusions and keeps a teardown race as a pass with a
+	// warning. So when that aggregate row concluded `success`, the cancellation
+	// below has already been judged benign -- and this tool used to report
+	// PENDING / `cancelled` for it, leaving the merge policy's own gate step
+	// (which runs this script) waiting on the very run shape that seam makes
+	// green. An aggregate that did not conclude success judges nothing here, and
+	// the row keeps its old pending reading.
+	//
+	// #4680 r4 F2: and only an aggregate that STARTED AT OR AFTER the shard
+	// completed has read that shard. The lookup is by name, so without the
+	// ordering a green aggregate from an earlier run excused a shard cancelled in
+	// a later run whose own aggregate row did not exist yet. A real run posts
+	// them in this order (run 39481284562: each aggregate starts 2-3 s after its
+	// last shard ends). A missing or unparsable timestamp on either side proves
+	// no ordering, so it judges nothing (fail closed): `Date.parse` gives NaN,
+	// and every comparison with NaN is false.
+	const aggregateJudgedGreen = (row) => {
+		const aggregate = shardAggregateName(row.name);
+		if (aggregate === null) return false;
+		const parent = byName.get(aggregate);
+		const parentStarted = Date.parse(String(parent?.started_at ?? ""));
+		const shardCompleted = Date.parse(
+			String(byName.get(row.name)?.completed_at ?? ""),
+		);
+		return (
+			String(parent?.status ?? "").toLowerCase() === "completed" &&
+			String(parent?.conclusion ?? "").toLowerCase() === "success" &&
+			parentStarted >= shardCompleted
+		);
+	};
 	const cancelledLatestRows = rows.filter(
 		(row) =>
 			row.gating &&
 			row.present &&
 			row.status === "completed" &&
 			!supersededRows.has(row) &&
-			isUncertainConclusion(row.conclusion),
+			isUncertainConclusion(row.conclusion) &&
+			!aggregateJudgedGreen(row),
 	);
 	// #3700: a row the caller proved is post-merge noise (its job could not
 	// fetch `refs/pull/N/merge` after the PR merged) is not a failure. The proof
@@ -988,6 +1017,248 @@ export function formatRerunHint(row) {
 	if (rerun) return `rerun ${rerun.at(-1)} (gh ${rerun.join(" ")})`;
 
 	return `${row?.name ?? "unknown check"} cannot be rerun via gh (not a GitHub Actions job; details: ${detailsUrl || "unavailable"})`;
+}
+
+// ---------------------------------------------------------------------------
+// #3920 item 3: a required job's recent runtime against its `timeout-minutes`.
+//
+// The TLA+ shard cap was found only when pull requests started timing out
+// (623-881 s against a 720 s cap), and #4672 then showed the other half: a
+// 735 s shard `cancelled` at its own timeout reddens a REQUIRED check with no
+// violation. Nothing compared a job's runtime to its cap, so the cap sat at the
+// measured maximum and nobody could see it coming.
+//
+// This is a non-gating REPORT, never a verdict: it prints one line per job whose
+// last completed run reached `RUNTIME_CAP_WARN_RATIO` of its own cap, and it can
+// never change this script's exit code. It is printed from the check-runs this
+// run already fetched (each row carries `started_at`/`completed_at`), so it
+// costs no extra API call and no network access of its own. A MATRIX shard is
+// its own subject: `TLA+ models (shard 4/4)` warns on its own even while the
+// `TLA+ models` aggregate is momentarily fine, which is exactly the shard that
+// was cancelled.
+//
+// The caps come from the workflow YAML itself -- ONE source, no second table
+// that can drift from the file the runner enforces. `${{ matrix.shard }}` and
+// `${{ strategy.job-total }}` in a job's `name:` are expanded to patterns so a
+// check-run's real name still resolves to its job's cap.
+// ---------------------------------------------------------------------------
+
+/** Warn at 70% of the cap: the headroom the repo's own size rule (#3123)
+ * assumes, and what surfaces a shard "running at the cap" before it lands. */
+export const RUNTIME_CAP_WARN_RATIO = 0.7;
+
+/** Most runtime lines one report prints; the rest are counted (#3166 shape 10:
+ * a bound on a human-facing surface discloses its truncation). */
+export const MAX_RUNTIME_CAP_LINES = 12;
+
+/**
+ * A workflow job's `name:` (or its id, which GitHub uses when `name:` is
+ * absent) as a RegExp that matches the EXPANDED check-run name. Matrix and
+ * job-total placeholders expand; any other expression admits any token, so an
+ * unrecognised placeholder still matches its job rather than silently dropping
+ * the job from the report.
+ *
+ * `escapeRegExp` is the ONE runtime copy (`clients/string-utils.ts`, #2558),
+ * passed in rather than imported: that file is build output, and this script
+ * must load in a checkout that never ran `npm run build` (#4680 r4 F1).
+ * `readJobTimeCaps` loads it lazily beside the YAML parser, the other compiled
+ * file this report needs, so an unbuilt checkout loses this report alone.
+ *
+ * @param {string} jobName
+ * @param {(text: string) => string} escapeRegExp
+ * @returns {RegExp}
+ */
+export function checkNamePattern(jobName, escapeRegExp) {
+	// Split on the placeholders FIRST and escape only the literal chunks: a
+	// name is escaped after expansion would leave `matrix\.shard` behind, and
+	// an expansion pattern escaped with the rest would stop being a pattern.
+	const raw = String(jobName);
+	const placeholder = /\$\{\{\s*([^}]*?)\s*\}\}/g;
+	const parts = [];
+	let previous = 0;
+	for (const match of raw.matchAll(placeholder)) {
+		parts.push(escapeRegExp(raw.slice(previous, match.index)));
+		// `strategy.job-total` is always a count; everything else (a matrix leg,
+		// an env value this reader cannot resolve) admits any one token, so an
+		// unrecognised placeholder matches its own job instead of dropping it.
+		parts.push(match[1] === "strategy.job-total" ? "[0-9]+" : "[^()\\s]+");
+		previous = match.index + match[0].length;
+	}
+	parts.push(escapeRegExp(raw.slice(previous)));
+	return new RegExp(`^${parts.join("")}$`);
+}
+
+/**
+ * The cap entries of one parsed workflow document.
+ *
+ * @param {object} doc a `yaml.load` of a workflow file
+ * @param {string} file the workflow's path, for the printed line
+ * @param {(text: string) => string} escapeRegExp see `checkNamePattern`
+ * @returns {Array<{ file: string, jobId: string, name: string, capMinutes: number, pattern: RegExp }>}
+ */
+export function jobCapEntries(doc, file, escapeRegExp) {
+	const jobs = doc?.jobs;
+	if (!jobs || typeof jobs !== "object") return [];
+	const entries = [];
+	for (const [jobId, job] of Object.entries(jobs)) {
+		if (!job || typeof job !== "object") continue;
+		const cap = Number(job["timeout-minutes"]);
+		if (!Number.isFinite(cap) || cap <= 0) continue;
+		const name = typeof job.name === "string" && job.name ? job.name : jobId;
+		entries.push({
+			file,
+			jobId,
+			name,
+			capMinutes: cap,
+			pattern: checkNamePattern(name, escapeRegExp),
+		});
+	}
+	return entries;
+}
+
+/**
+ * The caps of every workflow file under `<root>/.github/workflows`, parsed from
+ * the YAML the runner itself reads. The YAML parser and the escape helper are
+ * loaded dynamically: both are compiled `clients/` files, and this script is
+ * documented to run with nothing but `gh` on PATH, so a checkout with no
+ * install or build degrades to one `unavailable` line instead of a crash.
+ *
+ * @param {string} root repository root
+ * @returns {Promise<Array<{ file: string, jobId: string, name: string, capMinutes: number, pattern: RegExp }>>}
+ */
+export async function readJobTimeCaps(root) {
+	const { readdirSync } = await import("node:fs");
+	const dir = join(root, ".github", "workflows");
+	const files = readdirSync(dir)
+		.filter((file) => /\.ya?ml$/.test(file))
+		.sort();
+	const yaml = (await import("../clients/deps/js-yaml.js")).default;
+	const { escapeRegExp } = await import("../clients/string-utils.js");
+	const entries = [];
+	for (const file of files) {
+		const doc = yaml.load(readFileSync(join(dir, file), "utf8"));
+		entries.push(
+			...jobCapEntries(doc, `.github/workflows/${file}`, escapeRegExp),
+		);
+	}
+	return entries;
+}
+
+/** Seconds a completed check-run took, or null when GitHub omitted either end. */
+function checkRunSeconds(run) {
+	const start = Date.parse(String(run?.started_at ?? ""));
+	const end = Date.parse(String(run?.completed_at ?? ""));
+	if (!Number.isFinite(start) || !Number.isFinite(end) || end < start)
+		return null;
+	return Math.round((end - start) / 1000);
+}
+
+/**
+ * The report lines: one per check-run at or above the ratio of its job's cap,
+ * heaviest ratio first, with a counted remainder past the print bound. A job
+ * whose name matches no cap entry, or whose run has no duration, is simply not
+ * reported (it is not a finding, and this report never gates).
+ *
+ * @param {{ checkRuns: object[], caps: Array<{ name: string, capMinutes: number, pattern: RegExp }>, requiredChecks?: string[], ratio?: number, limit?: number }} args
+ * @returns {string[]}
+ */
+export function runtimeCapLines({
+	checkRuns,
+	caps,
+	requiredChecks = REQUIRED_CHECKS,
+	ratio = RUNTIME_CAP_WARN_RATIO,
+	limit = MAX_RUNTIME_CAP_LINES,
+}) {
+	const payload = Array.isArray(checkRuns) ? checkRuns : [];
+	const latest = resolveLatestByName(payload);
+	const required = new Set(requiredChecks);
+	// The same #4090 resolution the verdict applies: a nightly lane's check-run
+	// attaches to whatever head it ran on, so its name is not a gate on THIS
+	// commit. Without it the marker labelled seven schedule-only jobs
+	// `(gating)` while `computeVerdict` scored the same names `gating: false`
+	// (V5a).
+	const triggerAdvisoryNames = resolveTriggerAdvisoryNames(payload);
+	const measured = [];
+	for (const [name, run] of latest) {
+		const entry = caps.find((candidate) => candidate.pattern.test(name));
+		if (!entry) continue;
+		const seconds = checkRunSeconds(run);
+		if (seconds === null) continue;
+		const capSeconds = entry.capMinutes * 60;
+		const used = seconds / capSeconds;
+		measured.push({
+			name,
+			seconds,
+			capSeconds,
+			used,
+			jobId: entry.jobId,
+			file: entry.file,
+			// A row is gating when branch protection requires its name -- the
+			// live read's list, else `REQUIRED_CHECKS` -- or when the name is
+			// neither on the advisory allowlist nor a schedule-only lane. The
+			// printed line reads it, and `computeVerdict` answers the same
+			// question through the same owner, so the two markers cannot
+			// disagree again (V5a).
+			gating: isGatingCheckName(name, {
+				required,
+				triggerAdvisoryNames,
+			}),
+		});
+	}
+	// A matrix shard is its own subject: the aggregate's row measures seconds of
+	// `echo`, and the shard that gets cancelled is the one worth naming.
+	const over = measured
+		.filter((row) => row.used >= ratio)
+		.sort(
+			(left, right) =>
+				right.used - left.used || left.name.localeCompare(right.name),
+		);
+	if (over.length === 0) {
+		return [
+			`Runtime vs cap: no job is at ${Math.round(ratio * 100)}% of its timeout (${measured.length} job(s) measured)`,
+		];
+	}
+	const printed = over.slice(0, limit).map((row) => {
+		const percent = Math.round(row.used * 100);
+		const verdict =
+			row.used >= 1
+				? "at or over its cap -- a slower runner turns finished work into `cancelled` (#4672)"
+				: `within ${Math.round((1 - ratio) * 100)}% of its cap`;
+		return `Runtime vs cap: ${row.name} ${row.seconds}s of ${row.capSeconds}s (${percent}%) -- ${verdict} [${row.file} job \`${row.jobId}\`]${row.gating ? " (gating)" : " (advisory)"}`;
+	});
+	const hidden = over.length - printed.length;
+	if (hidden > 0)
+		printed.push(
+			`Runtime vs cap: +${hidden} more job(s) at or above ${Math.round(ratio * 100)}% of their cap, not printed`,
+		);
+	return printed;
+}
+
+/**
+ * `runtimeCapLines` over the real checkout, failing open into ONE line: an
+ * unreadable workflow tree or a missing YAML parser must not turn an advisory
+ * report into a verdict (#3920 item 3 is a report, never a gate).
+ *
+ * @param {{ checkRuns: object[], root: string, requiredChecks?: string[] }} args
+ * @returns {Promise<string[]>}
+ */
+export async function formatRuntimeCapLines({
+	checkRuns,
+	root,
+	requiredChecks = REQUIRED_CHECKS,
+}) {
+	try {
+		const caps = await readJobTimeCaps(root);
+		if (caps.length === 0)
+			return [
+				`Runtime vs cap: unavailable (no job in ${root}/.github/workflows declares timeout-minutes)`,
+			];
+		return runtimeCapLines({ checkRuns, caps, requiredChecks });
+	} catch (error) {
+		return [
+			`Runtime vs cap: unavailable (${firstLine(error).replace(/\s+/g, " ").slice(0, 200)})`,
+		];
+	}
 }
 
 /** Fixed-column table: CHECK / STATUS / CONCLUSION / URL. Exported for tests
@@ -3070,6 +3341,9 @@ export async function run({
 	absentSinceMs = null,
 	// Watch polls discard stdout and need no sticky-comment read.
 	mutation = true,
+	// #3920 item 3: the checkout whose `.github/workflows/*.yml` carry the job
+	// caps. Injected so a test can point at a fixture tree.
+	runtimeCapRoot = process.cwd(),
 } = {}) {
 	const {
 		target,
@@ -3427,6 +3701,18 @@ export async function run({
 		for (const line of formatTriggerAdvisoryLines(verdict.rows)) stdout(line);
 		if (triggerScopeNote) stdout(triggerScopeNote);
 		for (const line of formatFailureLines(verdict)) stdout(line);
+		// #3920 item 3: a non-gating runtime-vs-cap report over the same
+		// check-runs. It never changes `code` below -- it exists so a shard
+		// running at its cap is visible BEFORE it reports `cancelled`.
+		for (const line of await formatRuntimeCapLines({
+			checkRuns: Array.isArray(lastPayload?.check_runs)
+				? lastPayload.check_runs
+				: [],
+			root: runtimeCapRoot,
+			requiredChecks,
+		})) {
+			stdout(line);
+		}
 		// Merge state is always printed, not just when it drives the verdict
 		// (round 3, F1) -- a reviewer reading the report should never have to
 		// infer it from `reason` text alone. `"n/a"` for a bare-SHA target

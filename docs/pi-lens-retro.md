@@ -25,8 +25,8 @@ which is where mistake rows land.
 ## Inputs (primary sources, never memory)
 
 The lane ledger, the session transcripts, PR bodies and review verdicts, CI
-job logs on the exact head, `~/.pi-lens/latency.log` when runtime behaviour
-is involved. Every finding cites the source it came from.
+job logs on the exact head, `latency.log` under the resolved log root (`docs/pi-lens-monitor.md`
+"Inputs") when runtime behaviour is involved. Every finding cites the source it came from.
 
 ## Procedure
 

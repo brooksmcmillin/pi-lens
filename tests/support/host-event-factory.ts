@@ -34,3 +34,62 @@ export function makeSessionStartEvent(
 	}
 	return event;
 }
+
+/**
+ * The leading SYSTEM message pi 1.3.0 hands the `context_with_system` phase.
+ *
+ * #4631 round 5 (F2): the host ALWAYS leads this transcript with it —
+ * `ExtensionRunner.emitContext` emits `{ type: "context_with_system", messages:
+ * currentMessages }` where `currentMessages[0]` is the system message, and
+ * reports `Handler removed the leading system message` when a handler's return
+ * loses it (`dist/core/extensions/runner.js`, the 0.87+ two-phase emit). The
+ * head is not `{ role, content }`: `content` is EMPTY, the prompt lives in
+ * `sections`, and the initial tool table in `toolsAdded`.
+ *
+ * A double that omits it makes `messages[0]` a USER message, which is a shape
+ * the host never sends. That made `observeCachePrefix` hash a user message in
+ * every witness (production records `firstMessageRole: "system"`), and left the
+ * head-loss regression invisible: dropping the head kept every delivery
+ * assertion green, because nothing asserted the head survived.
+ */
+export function makeSystemHead(
+	overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+	return {
+		role: "system",
+		content: "",
+		sections: {
+			preamble: "You are an expert coding assistant operating inside pi.",
+			tools:
+				"<tools>\n- read: Read file contents\n- bash: Execute bash commands\n</tools>",
+			rules:
+				"<rules>\n- Use bash for file operations like ls, rg, find\n</rules>",
+			cwd: "<cwd>\n/proj\n</cwd>",
+		},
+		timestamp: 1792479807686,
+		toolsAdded: [{ name: "read" }, { name: "bash" }],
+		...overrides,
+	};
+}
+
+/**
+ * A `context_with_system` event carrying the conversation behind the hosted
+ * system head — the shape pi 1.3.0 emits, so a case that injects here asserts
+ * against the transcript production sees.
+ *
+ * `head: null` builds the headless event some cases need on purpose: the
+ * extension's empty-transcript prepend fallback (`existingMessages.length === 0`)
+ * is unreachable from any host, so its two cells keep the shape that reaches it.
+ */
+export function makeContextWithSystemEvent(
+	conversation: ReadonlyArray<Record<string, unknown>> = [],
+	head: Record<string, unknown> | null = makeSystemHead(),
+): {
+	type: "context_with_system";
+	messages: Array<Record<string, unknown>>;
+} {
+	return {
+		type: "context_with_system",
+		messages: [...(head ? [head] : []), ...conversation],
+	};
+}

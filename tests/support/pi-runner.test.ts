@@ -34,6 +34,10 @@ const DECLARED_HANDLERS = [
 	"session_shutdown",
 	"message_end",
 	"context",
+	// #4631: the 0.87+ request hook. `context` injects on a pre-0.87 host and
+	// defers here; the roster is pinned in both directions, so a second
+	// registration is a change to this line, never a silent extra.
+	"context_with_system",
 ];
 
 /** Every flag `index.ts` registers: `LENS_FLAGS` plus `no-tool`. */

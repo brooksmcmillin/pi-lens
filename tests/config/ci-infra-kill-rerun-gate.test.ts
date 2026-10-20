@@ -242,9 +242,33 @@ const ROWS: Array<[string, WorkflowRunContext, boolean]> = [
 		ctx({ event: "push", headBranch: "master", conclusion: "success" }),
 		false,
 	],
+	// #4672: a CANCELLED master push is now judged (and rerun at most once)
+	// when the classifier proves every cancelled job finished its work. Before
+	// this, run 39380875926's cancelled `TLA+ models (shard 4/4)` reddened a
+	// required check on master and nothing recovered it.
 	[
-		"a CANCELLED run (nothing to classify)",
+		"a CANCELLED master push (the #4672 shard teardown race)",
 		ctx({ event: "push", headBranch: "master", conclusion: "cancelled" }),
+		true,
+	],
+	[
+		"a CANCELLED pull_request run (superseded by concurrency, not a race)",
+		ctx({ event: "pull_request", conclusion: "cancelled" }),
+		false,
+	],
+	[
+		"a CANCELLED push to a non-master branch",
+		ctx({ event: "push", headBranch: "not-master", conclusion: "cancelled" }),
+		false,
+	],
+	[
+		"a CANCELLED master push on its THIRD attempt (the same two-rerun bound)",
+		ctx({
+			event: "push",
+			headBranch: "master",
+			conclusion: "cancelled",
+			runAttempt: 3,
+		}),
 		false,
 	],
 	["a schedule-triggered run", ctx({ event: "schedule" }), false],
@@ -320,6 +344,22 @@ describe("ci-infra-kill-rerun.yml classify job gate (#2668 review F3)", () => {
 	// on) must get --allow-missing-pr, or the classifier throws and the rerun
 	// never fires (#2668 again). The arm no longer names an event: the PR_NUMBER
 	// env decides.
+	// #4672 mutation-proof: the cancelled arm must be a CONJUNCTION with the
+	// master-push lane, not `conclusion == 'cancelled'` alone -- a PR run
+	// cancelled by `cancel-in-progress` would otherwise be rerun, spending
+	// quota on a head a newer run already owns.
+	it("mutation-proof: dropping the master-push conjunct from the cancelled arm would rerun a superseded PR run (#4672)", () => {
+		const cancelledPr = ctx({ event: "pull_request", conclusion: "cancelled" });
+		expect(evaluateIf(ifExpr, cancelledPr)).toBe(false);
+		const flat = ifExpr.replace(/\s+/g, " ");
+		const withoutLane = flat.replace(
+			/github\.event\.workflow_run\.conclusion == 'cancelled' && github\.event\.workflow_run\.event == 'push' && github\.event\.workflow_run\.head_branch == 'master'/,
+			"github.event.workflow_run.conclusion == 'cancelled'",
+		);
+		expect(withoutLane).not.toBe(flat);
+		expect(evaluateIf(withoutLane, cancelledPr)).toBe(true);
+	});
+
 	it("the step's --allow-missing-pr branch is the empty-PR_NUMBER arm and no retired event returns (review round 2, MUT J; #4382)", () => {
 		const stepRun = readClassifyStepRun();
 		expect(stepRun).toMatch(

@@ -27,7 +27,10 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
 import { getLSPService, resetLSPService } from "../../clients/lsp/index.js";
 import { RUNTIME_CONFIG } from "../../clients/runtime-config.js";
-import { makeSessionStartEvent } from "../support/host-event-factory.js";
+import {
+	makeContextWithSystemEvent,
+	makeSessionStartEvent,
+} from "../support/host-event-factory.js";
 import { createPiMock, makeCtx } from "../support/pi-mock.js";
 import {
 	cleanupTestEnvironmentsDrained,
@@ -201,11 +204,19 @@ async function deliveredCascadeLines(
 	ctx: unknown,
 ): Promise<string[]> {
 	const context = (await pi.emit(
-		"context",
-		{ messages: [{ role: "user", content: "continue" }] },
+		// #4631: on pi 0.87+ the full transcript arrives at this hook and its
+		// returned list is used verbatim; `context` sees the conversation alone.
+		"context_with_system",
+		makeContextWithSystemEvent([{ role: "user", content: "continue" }]),
 		ctx,
-	)) as { messages?: Array<{ content: unknown }> } | undefined;
-	return (context?.messages ?? [])
+	)) as { messages?: Array<{ role?: string; content: unknown }> } | undefined;
+	// #4631 round 5 (F2): the host leads this transcript with its system head, and
+	// pi reports `Handler removed the leading system message` if a handler's
+	// return loses it. When this turn delivered anything, that head survived:
+	// dropping it would red this suite rather than ship a promptless request.
+	const delivered = context?.messages ?? [];
+	if (delivered.length > 0) expect(delivered[0]?.role).toBe("system");
+	return delivered
 		.map((message) =>
 			typeof message.content === "string"
 				? message.content

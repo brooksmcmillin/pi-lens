@@ -9,7 +9,11 @@
  * here asserts pi-lens's own return-value shaping for transcripts a scripted
  * provider cannot produce — an image block list, an empty array, a custom
  * `{ weird: true }` content object, an empty transcript — so those stay on the
- * pi double, which is the cheaper and only possible driver for them.
+ * pi double, which is the cheaper and only possible driver for them. Each of
+ * those direct-handler cells now carries the host's real system head
+ * (`makeContextWithSystemEvent`), so its index positions are the shape pi
+ * actually sends (#4631 round 6, R6-1); the empty-transcript cell is the one
+ * exception, because the branch it reaches is unreachable from a host.
  */
 
 import * as fs from "node:fs";
@@ -18,6 +22,10 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CacheManager } from "../../clients/cache-manager.js";
 import { _resetProcessSingletonsForTests } from "../../clients/process-singletons.js";
+import {
+	makeContextWithSystemEvent,
+	makeSystemHead,
+} from "../support/host-event-factory.js";
 import { createPiMock, makeCtx } from "../support/pi-mock.js";
 import {
 	fauxAssistantMessage,
@@ -54,7 +62,10 @@ async function loadContextHandler() {
 	const { default: registerExtension } = await import("../../index.js");
 	const mock = createPiMock();
 	registerExtension(mock.asExtensionAPI() as any);
-	const context = mock.handlers.get("context")?.[0];
+	// #4631: pi 0.87+ delivers the full transcript to `context_with_system` and
+	// strips system messages from `context`, so the injector is that hook. Its
+	// event carries the transcript the placement rule reads.
+	const context = mock.handlers.get("context_with_system")?.[0];
 	expect(context).toBeTypeOf("function");
 	return { context: context!, mock };
 }
@@ -108,15 +119,23 @@ describe("context injection appends to last user message (#3693)", () => {
 
 			const emptyPrompt = { role: "user", content: "" };
 			const existing = [emptyPrompt];
+			const head = makeSystemHead();
 
 			const result = (await context(
-				{ messages: existing },
+				makeContextWithSystemEvent(existing, head),
 				makeCtx({ cwd: tmpDir, sessionId: "sess-2" }),
 			)) as { messages: Array<{ role: string; content: unknown }> };
 
 			expect(result).toBeDefined();
-			expect(result.messages).toHaveLength(1);
-			const last = result.messages[0];
+			expect(result.messages).toHaveLength(2);
+			// #4631 round 6 (R6-1): the host's request leads with the system head,
+			// which the handler must hand back untouched — the user prompt and the
+			// injected block follow it.
+			// Compared against a FRESH builder output, not the event's own object: a
+			// handler that mutated the head in place would pass the reference check.
+			expect(result.messages[0]).toEqual(makeSystemHead());
+			expect(result.messages[0].role).toBe("system");
+			const last = result.messages[1];
 			expect(last.role).toBe("user");
 			expect(typeof last.content).toBe("string");
 			expect((last.content as string).startsWith("\n")).toBe(false);
@@ -149,15 +168,23 @@ describe("context injection appends to last user message (#3693)", () => {
 			const originalArray = [imagePart, textPart];
 			const originalUser = { role: "user", content: originalArray };
 			const originalUserSnapshot = JSON.stringify(originalUser);
+			const head = makeSystemHead();
 
 			const result = (await context(
-				{ messages: [originalUser] },
+				makeContextWithSystemEvent([originalUser], head),
 				makeCtx({ cwd: tmpDir, sessionId: "sess-3" }),
 			)) as { messages: Array<{ role: string; content: unknown }> };
 
 			expect(result).toBeDefined();
-			expect(result.messages).toHaveLength(1);
-			const last = result.messages[0];
+			expect(result.messages).toHaveLength(2);
+			// #4631 round 6 (R6-1): the host's request leads with the system head,
+			// which the handler must hand back untouched — the user prompt and the
+			// injected block follow it.
+			// Compared against a FRESH builder output, not the event's own object: a
+			// handler that mutated the head in place would pass the reference check.
+			expect(result.messages[0]).toEqual(makeSystemHead());
+			expect(result.messages[0].role).toBe("system");
+			const last = result.messages[1];
 			expect(last.role).toBe("user");
 			expect(Array.isArray(last.content)).toBe(true);
 
@@ -195,15 +222,23 @@ describe("context injection appends to last user message (#3693)", () => {
 
 			const emptyArray: unknown[] = [];
 			const originalUser = { role: "user", content: emptyArray };
+			const head = makeSystemHead();
 
 			const result = (await context(
-				{ messages: [originalUser] },
+				makeContextWithSystemEvent([originalUser], head),
 				makeCtx({ cwd: tmpDir, sessionId: "sess-4" }),
 			)) as { messages: Array<{ role: string; content: unknown }> };
 
 			expect(result).toBeDefined();
-			expect(result.messages).toHaveLength(1);
-			const last = result.messages[0];
+			expect(result.messages).toHaveLength(2);
+			// #4631 round 6 (R6-1): the host's request leads with the system head,
+			// which the handler must hand back untouched — the user prompt and the
+			// injected block follow it.
+			// Compared against a FRESH builder output, not the event's own object: a
+			// handler that mutated the head in place would pass the reference check.
+			expect(result.messages[0]).toEqual(makeSystemHead());
+			expect(result.messages[0].role).toBe("system");
+			const last = result.messages[1];
 			expect(Array.isArray(last.content)).toBe(true);
 			const contentBlocks = last.content as Array<{
 				type: string;
@@ -283,6 +318,10 @@ describe("context injection appends to last user message (#3693)", () => {
 				tmpDir,
 			);
 
+			// #4631 round 6 (R6-1): this cell stays HEADLESS on purpose. The branch
+			// it reaches (`existingMessages.length === 0`) is unreachable from a
+			// host, which always leads the transcript with the system head; giving
+			// it a head would delete the branch's only coverage.
 			const result = (await context(
 				{ messages: [] },
 				makeCtx({ cwd: tmpDir, sessionId: "sess-6" }),
@@ -310,23 +349,30 @@ describe("context injection appends to last user message (#3693)", () => {
 			const customContent = { weird: true };
 			const customUser = { role: "user", content: customContent };
 			const existing = [{ role: "assistant", content: "Ready." }, customUser];
+			const head = makeSystemHead();
 
 			const result = (await context(
-				{ messages: existing },
+				makeContextWithSystemEvent(existing, head),
 				makeCtx({ cwd: tmpDir, sessionId: "sess-7" }),
 			)) as { messages: Array<{ role: string; content: unknown }> };
 
 			expect(result).toBeDefined();
 			// Appends AFTER the transcript as a new message, leaving customContent untouched
-			expect(result.messages).toHaveLength(3);
-			expect(result.messages[0]).toEqual({
+			expect(result.messages).toHaveLength(4);
+			// #4631 round 6 (R6-1): the host's head leads the transcript; the
+			// prior turns and the appended message follow it.
+			// Compared against a FRESH builder output, not the event's own object: a
+			// handler that mutated the head in place would pass the reference check.
+			expect(result.messages[0]).toEqual(makeSystemHead());
+			expect(result.messages[0].role).toBe("system");
+			expect(result.messages[1]).toEqual({
 				role: "assistant",
 				content: "Ready.",
 			});
-			expect(result.messages[1]).toBe(customUser);
-			expect(result.messages[1].content).toBe(customContent);
-			expect(result.messages[2].role).toBe("user");
-			expect(result.messages[2].content).toContain("Uncoerced test guidance.");
+			expect(result.messages[2]).toBe(customUser);
+			expect(result.messages[2].content).toBe(customContent);
+			expect(result.messages[3].role).toBe("user");
+			expect(result.messages[3].content).toContain("Uncoerced test guidance.");
 		},
 		TIMEOUT_MS,
 	);

@@ -238,6 +238,9 @@ re-verification; small code folds carry a red-first test and return to the same
 reviewer. File only different-seam, blocked, decision-dependent, untouched
 pre-existing, or risk-class-changing items, as one consolidated issue per PR.
 
+Folds also decide the issue list itself, one step earlier than a review
+finding: `AGENTS.md`, "Orchestration and delegated work" states that check.
+
 A brief carries the lane's facts and the task, and points at the role
 contract for everything else. Lane facts are the worktree, branch, base,
 TMPDIR, test-worker cap, Git grant, and deliverable path. It never restates

@@ -1,5 +1,23 @@
 # HISTORY
 
+## 2026-10-20 — a fold rule that ran only after the lane was written
+
+Three documents decided folding before this date, and none of them read the
+open-issue board when a lane was still being planned: the consolidation audit in
+`AGENTS.md`, the brief-time sibling fold in `docs/pi-lens-merge-policy.md`
+"Brief contract (orchestrator)", and the review-follow-up folds in that file's
+"Filing issues (orchestrator)" and `docs/pi-lens-subagent.md` "Follow-ups". So
+an issue a planned lane could settle still became its own fix later, which is
+the issue-list growth the p3 known-gap rules exist to prevent.
+
+The fix is a `fold check` in `AGENTS.md` "Orchestration and delegated work": as
+soon as a lane's mechanism is known, read every open issue against it, fold the
+candidates into that PR with one `Closes #…` each, and record a decision for
+each one that stays out. #4672 is the first lane to run it: it planned to fold
+#3920's three members into one change, refused #3753 with a reason, and sent two
+findings that no lane could carry (#4673, and the `index-3248` shuffle member on
+#4561) to the record instead of the folder.
+
 ## 2026-10-20 — instrument attributes by id and order (shape 76)
 
 The nightly capability census bracketed each fixture phase with a byte offset

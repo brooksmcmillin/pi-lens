@@ -49,6 +49,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs as parseNodeArgs } from "node:util";
+import { assignShards, shardLoads } from "./lib/test-shard-assignment.mjs";
 
 export const TLA_TOOLS = Object.freeze({
 	release: "v1.7.4",
@@ -141,9 +142,318 @@ export function parseShardArg(raw) {
 	return { index, total };
 }
 
-/** Shard `index` (1-based) of `total`: round-robin over the given order. */
-export function selectShard(configs, { index, total }) {
-	return configs.filter((_, position) => position % total === index - 1);
+/**
+ * The measured per-config TLC seconds, from scripts/tla-model-costs.json
+ * (`scripts/gen-tla-model-costs.mjs`). The table's own provenance -- the run
+ * ids it was measured from and the note -- lives in that file.
+ *
+ * A config the table does not know costs the table's MAXIMUM, not zero and not
+ * the median: a config added without a regeneration is usually a NEW model
+ * (heavier than the ones already there), and over-pricing it can only move it
+ * into a lighter shard, while under-pricing it is how a fresh tail shard
+ * appears. Same fail-closed direction as the Unit shards' weights file
+ * (`scripts/lib/test-shard-assignment.mjs`), whose median fallback is safe
+ * there because a new test file is small; a new TLC config is not.
+ */
+export const MODEL_COSTS_FILE = "scripts/tla-model-costs.json";
+
+/**
+ * @param {string} root repository root
+ * @returns {{ files: Record<string, number>, max: number }}
+ */
+export function loadModelCosts(root) {
+	const file = path.join(root, MODEL_COSTS_FILE);
+	let parsed;
+	try {
+		parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+	} catch (error) {
+		// Loud, like the Unit shards' weights loader: every shard reads the same
+		// checkout, so a missing or malformed table is a repository defect.
+		throw new Error(
+			`TLA+ model costs unreadable at ${file}: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	const files = parsed?.files;
+	if (!files || typeof files !== "object" || Array.isArray(files))
+		throw new Error(`TLA+ model costs at ${file} have no "files" object`);
+	const seconds = [];
+	for (const [id, value] of Object.entries(files)) {
+		if (typeof value !== "number" || !Number.isFinite(value) || value < 0)
+			throw new Error(
+				`TLA+ model costs at ${file}: "${id}" is not a finite non-negative number`,
+			);
+		seconds.push(value);
+	}
+	// A table whose max is 0 is not a table: every config would price at 0,
+	// `assignShards` would leave the whole corpus in shard 1 and three runners
+	// would red with "selects no formal/*/*.cfg" -- a confusing diagnosis for
+	// one bad regeneration (V4). The rule is the max, not the row count: `{}`
+	// and a table of zero rows have the same max (#4680 r4 F5). Refuse it here
+	// as well as at the generator, because a committed file can also be
+	// truncated by hand.
+	const max = seconds.length === 0 ? 0 : Math.max(...seconds);
+	if (max <= 0)
+		throw new Error(
+			`TLA+ model costs at ${file} price no config above 0 s; regenerate with scripts/gen-tla-model-costs.mjs (a config with no row costs the table max, so a table whose max is 0 sends every config to shard 1)`,
+		);
+	return { files, max };
+}
+
+/**
+ * The cost table's key for `config`: its path under `root`, ALWAYS posix.
+ *
+ * One seam for the table's key, because the table's keys are posix and the host
+ * separator is not: keyed by hand, `<root>`-relative paths carry `\` on a
+ * Windows runner, every lookup misses, and a miss costs the table's MAXIMUM --
+ * so all configs become equal-cost and the balance this shard prints reads a
+ * flat 1.00x by construction (AGENTS.md "Windows path shapes" 1 and 2; the
+ * #4356 recurrence: a host-default separator reddening the Windows lane).
+ * `pathImpl` is injectable so a posix lane can prove the win32 shape
+ * (AGENTS.md shape 35) instead of trusting it.
+ *
+ * @param {string} root repository root
+ * @param {string} config an absolute config path
+ * @param {typeof path} [pathImpl] the host path module, or `path.win32` to dose one
+ * @returns {string} the table key
+ */
+export function modelCostId(root, config, pathImpl = path) {
+	return pathImpl.relative(root, config).split(pathImpl.sep).join("/");
+}
+
+/** `config`'s measured TLC seconds, or the table's max when it has no row. */
+function costOf(config, root, costs) {
+	return costs.files[modelCostId(root, config)] ?? costs.max;
+}
+
+/**
+ * Shard `index` (1-based) of `total`.
+ *
+ * With no cost table (`costs === null`) this is the original round-robin over
+ * the given order: equal costs make the LPT pack below assign exactly the same
+ * way, and the pure helper stays usable without touching disk.
+ *
+ * With the measured table it is the same longest-processing-time pack the Unit
+ * shards use (`assignShards`), over per-config TLC seconds. Round-robin by
+ * COUNT was the #4672 defect: configs' costs differ by two orders of magnitude
+ * (1.2 s to 422 s on the 2026-10-20 runs), so master run 39380875926's four
+ * shards summed 733 s / 1255 s / 1617 s / 2148 s of TLC time, and the heaviest
+ * was cancelled at 735 s against its 720 s `timeout-minutes` with every step
+ * `success`.
+ *
+ * The result is re-sorted into the input (path) order, so a shard's execution
+ * order -- and the log's config order -- is stable across runs.
+ */
+export function selectShard(configs, { index, total }, costs = null) {
+	if (costs === null)
+		return configs.filter((_, position) => position % total === index - 1);
+	const { assignment } = packShards(configs, total, costs);
+	return configs.filter((config) => assignment.get(config) === index);
+}
+
+/**
+ * The pack itself, keyed by the config path: the ONE item id scheme the
+ * selector and the printed balance share.
+ *
+ * `assignShards` breaks a cost TIE by ascending id, so the id decides which
+ * shard a config lands in whenever two configs cost the same -- and 714 of the
+ * 811 configs here sit in tie groups. Keyed by `String(position)` in the
+ * selector and by the config path in the printed line, the two packs agreed on
+ * every count and every summed second while disagreeing on 102 of the 201
+ * configs in shard 1 (V5d). With the path as the id they are one pack, and
+ * "equal-cost input reproduces round-robin exactly" is true of the membership
+ * too, not only of the counts.
+ *
+ * @param {string[]} configs
+ * @param {number} total
+ * @param {{ root: string, files: Record<string, number>, max: number }} costs
+ * @returns {{ items: Array<{ id: string, cost: number }>, assignment: Map<string, number> }}
+ */
+function packShards(configs, total, costs) {
+	const items = configs.map((config) => ({
+		id: config,
+		cost: costOf(config, costs.root, costs),
+	}));
+	return { items, assignment: assignShards(items, total) };
+}
+
+/**
+ * How far this shard's own measurement may disagree with the table's ORDERING
+ * before the balance line calls the table stale.
+ *
+ * The old band compared one shard's summed seconds against the table's
+ * projection for the same configs and called 1.25x drift. Re-measured against
+ * the partition's first live run (39435284236), that quantity is not a table
+ * property at all: the four shards spent 990.2 / 1753.5 / 1617.2 / 1578.8 s
+ * where the table projected 1537.6 / 1538.8 / 1537.6 / 1537.6 s -- 0.64x,
+ * 1.14x, 1.05x, 1.03x on a table generated the previous day. A shard's sum
+ * carries the runner's own speed (a whole shard's configs run on one machine,
+ * in one window), so it cancels the partition but not the machine.
+ *
+ * The ordering does not: every shard of that same run ranks its configs
+ * exactly as the table does (rank agreement 0.865, 0.874, 0.889, 0.875 over
+ * 201-204 configs), while a table whose rows were handed out in reverse order
+ * scores -0.03 to 0.09 on those same runs. 0.60 sits between the two with the
+ * low side 0.26 clear of the worst healthy shard, and it is scale-free: a
+ * table that is uniformly wrong by 2x still ranks identically, and uniform
+ * error cannot move a config out of its shard.
+ */
+export const MODEL_COST_RANK_TOLERANCE = 0.6;
+
+/** Fewer priced configs than this cannot rank a table against a run. */
+const MIN_RANKED_CONFIGS = 5;
+
+/**
+ * Spearman's rank agreement between the table's costs and this run's own
+ * seconds over the configs where both are known, or `null` when the sample is
+ * too small or one side has no spread (nothing to rank).
+ *
+ * @param {Array<[number, number]>} pairs [projected, measured]
+ * @returns {number | null}
+ */
+function rankAgreement(pairs) {
+	if (pairs.length < MIN_RANKED_CONFIGS) return null;
+	const projected = averageRanks(pairs.map(([value]) => value));
+	const measured = averageRanks(pairs.map(([, value]) => value));
+	const n = pairs.length;
+	const meanA = projected.reduce((sum, value) => sum + value, 0) / n;
+	const meanB = measured.reduce((sum, value) => sum + value, 0) / n;
+	let covariance = 0;
+	let varianceA = 0;
+	let varianceB = 0;
+	for (let at = 0; at < n; at += 1) {
+		const da = projected[at] - meanA;
+		const db = measured[at] - meanB;
+		covariance += da * db;
+		varianceA += da * da;
+		varianceB += db * db;
+	}
+	// A column with no spread (every config priced or measured the same) has
+	// no ordering to compare, so this is "cannot tell", never "agrees".
+	if (varianceA <= 0 || varianceB <= 0) return null;
+	return covariance / Math.sqrt(varianceA * varianceB);
+}
+
+/** 1-based ranks with ties averaged, so an equal-cost group shares its rank. */
+function averageRanks(values) {
+	const order = values
+		.map((value, position) => [value, position])
+		.sort((left, right) => left[0] - right[0] || left[1] - right[1]);
+	const ranks = Array.from({ length: values.length });
+	let at = 0;
+	while (at < order.length) {
+		let end = at;
+		while (end + 1 < order.length && order[end + 1][0] === order[at][0])
+			end += 1;
+		const rank = (at + end) / 2 + 1;
+		for (let slot = at; slot <= end; slot += 1) ranks[order[slot][1]] = rank;
+		at = end + 1;
+	}
+	return ranks;
+}
+
+/**
+ * The one line a shard prints about its own share of the measured work.
+ *
+ * The projected balance is computed from `scripts/tla-model-costs.json`, so it
+ * is 1.00x BY CONSTRUCTION: it can never reveal drift in that table. The
+ * second half is therefore the part that tests the table, and it reports two
+ * independent things about this run's own seconds:
+ *
+ *  - the ratio between what this shard spent and what the table projected for
+ *    its configs, printed as an ADVISORY number. It is not a drift verdict: on
+ *    the partition's first live run (39435284236) the four shards sat at
+ *    0.64x / 1.14x / 1.05x / 1.03x of a table generated the day before, so a
+ *    band tight enough to be worth printing fires on a healthy run (V1).
+ *  - the rank agreement between the table's ordering and this run's, which is
+ *    scale-free and IS the verdict (`MODEL_COST_RANK_TOLERANCE`). The same run
+ *    scored 0.865-0.889 on every shard; a table whose rows no longer describe
+ *    the run scores near zero.
+ *
+ * @param {{ configs: string[], total: number, costs: { root: string, files: Record<string, number>, max: number }, observed?: Map<string, number> | Record<string, number> | null, rankTolerance?: number }} args
+ * `observed` maps the cost table's keys (`modelCostId`) to the seconds this run
+ * measured for that config; absent means "no measurement to compare", and the
+ * line then says only that the projection is a projection.
+ */
+export function formatShardBalance({
+	configs,
+	total,
+	costs,
+	observed = null,
+	rankTolerance = MODEL_COST_RANK_TOLERANCE,
+}) {
+	const all = listModelConfigs(costs.root);
+	const { items, assignment } = packShards(all, total, costs);
+	const { loads, files } = shardLoads(items, assignment, total);
+	const unmeasured = all.filter(
+		(config) => !(modelCostId(costs.root, config) in costs.files),
+	);
+	const hereLoad = items
+		.filter((item) => configs.includes(item.id))
+		.reduce((sum, item) => sum + item.cost, 0);
+	const heaviest = Math.max(...loads);
+	const lightest = Math.min(...loads);
+	const shards = loads
+		.map((load, at) => `${files[at]} configs/${load.toFixed(0)}s`)
+		.join(", ");
+	const headline =
+		`this shard: ${configs.length} configs, ${hereLoad.toFixed(1)}s projected from ${MODEL_COSTS_FILE}; ` +
+		`all shards (projected, so 1.00x says nothing about this run): ${shards}; ` +
+		`heaviest/lightest = ${(heaviest / Math.max(1, lightest)).toFixed(2)}x`;
+	return (
+		headline +
+		describeRunAgainstTable({ configs, costs, observed, rankTolerance }) +
+		(unmeasured.length === 0
+			? ""
+			: `; ${unmeasured.length} config(s) have no row in ${MODEL_COSTS_FILE} and cost the table max -- rerun scripts/gen-tla-model-costs.mjs`)
+	);
+}
+
+/** `observed` as a `modelCostId` -> seconds reader, or null. */
+function observedSecondsReader(observed) {
+	if (!observed) return null;
+	if (typeof observed.get === "function")
+		return (id) => observed.get(id) ?? null;
+	return (id) => (id in observed ? observed[id] : null);
+}
+
+/**
+ * The "this run" half of the balance line. Only configs the table prices are
+ * compared -- an unmeasured config is priced at the table maximum on purpose,
+ * so a comparison against it would measure that fallback and not the table.
+ *
+ * The summed ratio is reported, then the rank agreement decides. See
+ * `MODEL_COST_RANK_TOLERANCE` for why one shard's ratio cannot be the verdict
+ * and why the ordering can.
+ */
+function describeRunAgainstTable({ configs, costs, observed, rankTolerance }) {
+	const read = observedSecondsReader(observed);
+	const unavailable =
+		"; this run's own seconds unavailable, so the table's projection above is unverified";
+	if (read === null) return unavailable;
+	let measured = 0;
+	let compared = 0;
+	let projectedCompared = 0;
+	const pairs = [];
+	for (const config of configs) {
+		const id = modelCostId(costs.root, config);
+		if (!(id in costs.files)) continue;
+		const seconds = read(id);
+		if (seconds === null) continue;
+		measured += seconds;
+		projectedCompared += costs.files[id];
+		compared += 1;
+		pairs.push([costs.files[id], seconds]);
+	}
+	if (compared === 0) return unavailable;
+	const ratio = measured / Math.max(1e-9, projectedCompared);
+	const text = `; this run measured ${measured.toFixed(1)}s for ${compared} of them (${ratio.toFixed(2)}x the table's ${projectedCompared.toFixed(1)}s -- one shard's own ratio, so it moves with this runner as well as with the table)`;
+	const agreement = rankAgreement(pairs);
+	if (agreement === null)
+		return `${text}; too few priced configs (${compared}) to compare the table's ordering with this run, so the table is unverified here`;
+	const scored = `rank agreement ${agreement.toFixed(2)} over ${compared} configs`;
+	return agreement < rankTolerance
+		? `${text} -- COST-TABLE DRIFT: the table's ordering no longer describes this run (${scored}, outside the ${rankTolerance.toFixed(2)} tolerance), so balance it with a fresh measurement (scripts/gen-tla-model-costs.mjs) rather than trusting the projection`
+		: `${text}; the table's ordering still describes this run (${scored}, inside the ${rankTolerance.toFixed(2)} tolerance)`;
 }
 
 const CLI_OPTIONS = Object.freeze({
@@ -178,15 +488,27 @@ export function parseCliArgs(argv) {
 export function selectConfigs(argv, root) {
 	const { shard } = parseCliArgs(argv);
 	const all = listModelConfigs(root);
-	const configs =
-		shard === undefined ? all : selectShard(all, parseShardArg(shard));
+	if (shard === undefined) {
+		if (all.length === 0) throw new Error("no formal/*/*.cfg found");
+		return all;
+	}
+	// The measured cost table is what makes a shard's WORK, not its config
+	// COUNT, the thing the partition balances (#4672, see selectShard).
+	const table = loadModelCosts(root);
+	const configs = selectShard(all, parseShardArg(shard), {
+		root,
+		...table,
+	});
 	if (configs.length === 0)
-		throw new Error(
-			shard === undefined
-				? "no formal/*/*.cfg found"
-				: `--shard ${shard} selects no formal/*/*.cfg`,
-		);
+		throw new Error(`--shard ${shard} selects no formal/*/*.cfg`);
 	return configs;
+}
+
+/** The model costs a run loaded, or null when it ran unsharded. */
+export function resolveShardCosts(argv, root) {
+	const { shard } = parseCliArgs(argv);
+	if (shard === undefined) return null;
+	return { root, ...loadModelCosts(root) };
 }
 
 /**
@@ -375,6 +697,10 @@ async function main() {
 		shard,
 	} = parseCliArgs(argv);
 	const configs = selectConfigs(argv, root);
+	// #4672: with a shard, the run also prints how the measured work split
+	// across ALL shards -- the balance is otherwise invisible until a shard
+	// loses its race against `timeout-minutes` and reports `cancelled`.
+	const shardCosts = resolveShardCosts(argv, root);
 
 	const availableParallelism =
 		typeof os.availableParallelism === "function"
@@ -390,10 +716,14 @@ async function main() {
 	const wallStarted = Date.now();
 	const outcomes = await runPool(configs, concurrency, async (config) => {
 		const name = path.relative(root, config);
+		// The table's own key, so the balance line's drift half compares THIS
+		// run's seconds against the table for the same configs (never a second
+		// spelling of the key: `modelCostId` is the only one).
+		const id = modelCostId(root, config);
 		const header = parseModelHeader(fs.readFileSync(config, "utf8"));
 		if (header.error) {
 			console.log(`FAIL ${name}: ${header.error}`);
-			return { name, dir: path.dirname(name), ok: false, seconds: 0 };
+			return { name, id, dir: path.dirname(name), ok: false, seconds: 0 };
 		}
 		const started = Date.now();
 		const actual = await runTlc(jar, config, header.module);
@@ -402,7 +732,7 @@ async function main() {
 		console.log(
 			`${ok ? "ok  " : "FAIL"} ${name}: expected ${describeVerdict(header.expect)}, got ${describeVerdict(actual)} (${seconds.toFixed(1)}s)`,
 		);
-		return { name, dir: path.dirname(name), ok, seconds };
+		return { name, id, dir: path.dirname(name), ok, seconds };
 	});
 	const wallSeconds = (Date.now() - wallStarted) / 1000;
 
@@ -422,6 +752,19 @@ async function main() {
 		);
 	console.log("");
 	console.log(formatSummary(configs.length, shard, wallSeconds, concurrency));
+	if (shard !== undefined && shardCosts) {
+		const { total } = parseShardArg(shard);
+		console.log(
+			formatShardBalance({
+				configs,
+				total,
+				costs: shardCosts,
+				observed: new Map(
+					outcomes.map((outcome) => [outcome.id, outcome.seconds]),
+				),
+			}),
+		);
+	}
 	console.log("Per-directory TLC time (summed, not wall time):");
 	for (const line of dirLines) console.log(line);
 

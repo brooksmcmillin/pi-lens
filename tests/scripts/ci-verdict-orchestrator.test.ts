@@ -644,6 +644,32 @@ describe("run — gating and advisory reported apart (#3700)", () => {
 	});
 });
 
+// #3920 item 3, the integration the unit test could not reach (review thread on
+// ci-verdict-runtime-cap.test.ts:271/#272): the report is a separate read of
+// the payload the verdict already has, so its lines appear in the command's own
+// output and the exit code is untouched. Driven through `run()` on a real
+// over-cap row rather than through `runtimeCapLines` alone.
+describe("run — the runtime-vs-cap report prints and never gates (#3920 item 3)", () => {
+	it("prints an over-cap gating row and still exits 0", async () => {
+		// `TLA+ models` is the aggregate job, `timeout-minutes: 10` in ci.yml.
+		const overCap = {
+			...row("TLA+ models", "success", 31),
+			completed_at: "2026-09-30T11:10:40Z", // 640 s of its 600 s cap = 107%
+		};
+		const w = world({ prs: [{ number: 5, checkRuns: [...GREEN, overCap] }] });
+		const { exitCode, lines } = await cli(["5"], w);
+		expect(exitCode).toBe(EXIT_SUCCESS);
+		const report = lines.filter((line) => line.startsWith("Runtime vs cap:"));
+		expect(report).toHaveLength(1);
+		expect(report[0]).toContain("TLA+ models 640s of 600s (107%)");
+		expect(report[0]).toContain("at or over its cap");
+		expect(report[0]).toContain("(gating)");
+		// And the verdict line the merger reads still says green, so the report
+		// cannot be mistaken for a gate.
+		expect(lines).toContain("Gating: 3 checks, 0 failing");
+	});
+});
+
 describe("run — sharded Unit tests (#3753)", () => {
 	// Recurrence: `Unit tests` is now an aggregate over `Unit tests (shard k/3)`
 	// jobs. The failing test lines live in the SHARD's log; the aggregate's own

@@ -175,7 +175,10 @@ import {
 } from "../clients/degradation-ledger.js";
 import { _resetSessionLifecycleForTests } from "../clients/session-lifecycle.js";
 import { _settleRegistryMutationsForTests } from "../clients/instance-registry.js";
-import { makeSessionStartEvent } from "./support/host-event-factory.js";
+import {
+	makeContextWithSystemEvent,
+	makeSessionStartEvent,
+} from "./support/host-event-factory.js";
 import { createPiMock, makeCtx, makeStaleCtx } from "./support/pi-mock.js";
 import {
 	cleanupTestEnvironmentsDrained,
@@ -293,6 +296,10 @@ const EXPECTED_HOOKS = [
 	"agent_end",
 	"turn_end",
 	"context",
+	// #4631: pi 0.87+ delivers the full request transcript (system head in
+	// place) to this hook and strips system messages from `context`; pi-lens
+	// registers both so exactly one of them injects per request.
+	"context_with_system",
 ];
 
 /**
@@ -1892,7 +1899,10 @@ describe("stale extension ctx tolerance in event handlers (#1925)", () => {
 		// `session_start crashed: …` / `context event error: …` and counted
 		// nowhere, so `expectStaleSkipRecorded` is what reds on pre-fix code.
 		{ event: "session_start", payload: makeSessionStartEvent() },
-		{ event: "context", payload: { messages: [] } },
+		// #4631: the INJECTING hook on pi 0.87+. `context` above sees the
+		// conversation without system messages and answers `undefined` without
+		// reading the event at all, so it is that later hook which touches ctx.
+		{ event: "context_with_system", payload: makeContextWithSystemEvent() },
 	];
 
 	for (const { event, payload } of CASES) {
@@ -1934,9 +1944,10 @@ describe("stale extension ctx tolerance in event handlers (#1925)", () => {
 	 *
 	 * `makeStaleCtx` is dead on arrival, so the wrapper's probe catches it and
 	 * the handler never runs. The other half of the race is a swap that lands
-	 * while the handler is already inside its own body. `session_start` and
-	 * `context` each wrap their body in a total catch, so without an explicit
-	 * rethrow that catch eats the stale throw and the wrapper never sees it.
+	 * while the handler is already inside its own body. `session_start` and the
+	 * two request hooks (`context`, `context_with_system`) each wrap their body in
+	 * a total catch, so without an explicit rethrow that catch eats the stale
+	 * throw and the wrapper never sees it.
 	 */
 	function makeCtxThatDiesMidHandler() {
 		const ctx = makeCtx({ sessionId: "dies-mid-handler" });
@@ -1954,7 +1965,8 @@ describe("stale extension ctx tolerance in event handlers (#1925)", () => {
 
 	for (const { event, payload } of [
 		{ event: "session_start", payload: makeSessionStartEvent() },
-		{ event: "context", payload: { messages: [] } },
+		// #4631: the hook that reads ctx to build an injection on pi 0.87+.
+		{ event: "context_with_system", payload: makeContextWithSystemEvent() },
 	]) {
 		it(`hands a MID-handler stale throw to the wrapper from ${event} (#1929)`, async () => {
 			const pi = createPiMock();

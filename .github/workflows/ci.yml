@@ -178,9 +178,30 @@ jobs:
   # estimate this comment used to carry. The job id `tla-models` and the check
   # name `TLA+ models` stay with the aggregate below (CodeQL `needs:` it, and
   # the ruleset requires that name); the shard jobs are `tla-shards`.
-  # scripts/check-tla-models.mjs partitions the sorted config list round-robin,
-  # and tests/config/tla-models-shard-workflow.test.ts pins that every config
-  # lands in exactly one shard. Measured per-shard times: PENDING this PR's run.
+  # Measured per-shard WALL time on master run 39380875926 (attempt 1):
+  # 268 s, 349 s, 494 s and 726 s -- the round-robin split was unbalanced by
+  # ~2.7x and shard 4 owned the tail. That shard hit the 12-minute cap TWICE,
+  # every step of it concluded `success` both times: attempt 1 job
+  # 118491126416 was `cancelled` at 735 s, attempt 2 job 118632989721 at 726 s.
+  # Each cancellation reded the required `TLA+ models` check with no model
+  # violation, and a rerun lost the same race.
+  #
+  # #4672: scripts/check-tla-models.mjs now partitions by MEASURED COST
+  # (longest-processing-time pack over scripts/tla-model-costs.json), not
+  # round-robin by config count. Round-robin was the defect: configs' TLC times
+  # run 1.2 s to 422 s, so on that run the four shards summed 733 s / 1255 s /
+  # 1617 s / 2148 s of TLC time (2.9x). Same four shards, measured cost table,
+  # summed work per shard: 1538 s / 1539 s / 1538 s / 1538 s (1.00x).
+  # tests/config/tla-models-shard-workflow.test.ts pins that every config lands
+  # in exactly one shard and that the measured split stays balanced.
+  # Measured per-shard WALL time over 15 model-checking runs (master pushes and
+  # PR heads, 2026-10-20; `started_at` -> `completed_at` of each
+  # `TLA+ models (shard k/N)` job): per-shard-position p50/p90 465/510 s
+  # (shard 1), 334/357 s (shard 2), 337/348 s (shard 3), 685/700 s (shard 4).
+  # The balanced partition's projected worst shard is 1538 s of TLC work, which
+  # is 505 s at that run's measured 3.05 s-of-work-per-second-of-wall. The
+  # first CI run on this change observes it (a ci.yml or checker edit is a
+  # `formal` trigger).
   tla-shards:
     name: TLA+ models (shard ${{ matrix.shard }}/${{ strategy.job-total }})
     needs: changes
@@ -198,7 +219,26 @@ jobs:
     # refs #3572, #3517: each shard runs its configs through the CPU-sized
     # concurrency pool in scripts/check-tla-models.mjs, one TLC worker per
     # config (deterministic first violation).
-    timeout-minutes: 12
+    #
+    # #4672 cap sizing (the #3123 rule: measured maximum plus margin). The
+    # 12-minute cap was AT the measured maximum, so a slower runner turned
+    # finished work into `cancelled`: 735 s and then 726 s against 720 s on run
+    # 39380875926, with every step `success` both times, and 20 minutes is the
+    # floor of the next whole step above that tail (the way #3591 raised the
+    # pre-shard job 10 -> 20). Measured over 15 model-checking runs
+    # (2026-10-20, both master pushes and PR heads): per-shard-position p90
+    # 510 s (shard 1), 357 s (shard 2), 348 s (shard 3), 700 s (shard 4) --
+    # that window excludes the two attempts the 720 s cap cut short, so its
+    # 724 s maximum is not the worst shard ever observed: the censored 735 s
+    # attempt named above is. The tail is shard 4 because the old partition packed
+    # it by count while its configs cost 2.9x the others. After the
+    # cost-weighted partition the projected worst shard is 505 s of wall, so
+    # 20 min is 2.4x the projected worst and 1.63x the worst shard ever
+    # observed (735 s), the `test` job's
+    # documented measured-max x2 rule (#3111). The cap is the SECOND mechanism:
+    # the partition removes the tail, the cap and the cancelled-shard verdict
+    # keep a slow runner's teardown race from reddening a required check.
+    timeout-minutes: 20
     permissions:
       contents: read
 
@@ -233,28 +273,55 @@ jobs:
   # #3918: the ONE check-run named exactly `TLA+ models`, the name branch
   # protection requires. A job whose `needs` failed is SKIPPED by default, and
   # GitHub counts a skipped required check as passing, so `if: always()` is
-  # what makes a red or cancelled shard red here instead of green-by-skip.
-  # `needs.tla-shards.result` must be exactly `success`: skipped, cancelled and
-  # failure all fail this job.
+  # what makes a red shard red here instead of green-by-skip.
+  #
+  # #4672: the verdict itself is `scripts/check-shard-verdict.mjs`, the ONE
+  # seam both sharded aggregates share. `needs.tla-shards.result == 'success'`
+  # still passes without any API read; any other result is classified from the
+  # run's own job list, because a shard that FINISHED its model check and then
+  # lost the race against its own `timeout-minutes` reports `cancelled` with
+  # every step `success` (run 39380875926, shard 4/4, 735 s against 720 s).
+  # That reading is kept as a pass with a recorded `::warning::`; a shard
+  # cancelled BEFORE its model-check step finished stays red, and unreadable
+  # evidence fails closed. The reasoning is in the script's header.
   tla-models:
     name: TLA+ models
     needs: tla-shards
     if: always()
     runs-on: ubuntu-latest
-    # Runs one `echo` and a comparison; 10 min is the repo's floor (refs #3123).
+    # Runs a checkout, one `node` and one API read; 10 min is the repo's floor
+    # (refs #3123).
     timeout-minutes: 10
     permissions:
       contents: read
+      # #4672: the cancelled-shard verdict reads this run's job list
+      # (GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs). Read-only, and
+      # the narrowest scope that endpoint accepts.
+      actions: read
     env:
       SHARDS_RESULT: ${{ needs.tla-shards.result }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
       - name: Require every TLA+ models shard to succeed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          SHARD_JOB_PATTERN: '^TLA\+ models \(shard [0-9]+/[0-9]+\)$'
+          SHARD_CHECK_STEP: "Model-check formal/ against each config's expected verdict"
         run: |
           echo "TLA+ models shard jobs (tla-shards): ${SHARDS_RESULT}"
-          if [[ "${SHARDS_RESULT}" != "success" ]]; then
-            echo "::error::a TLA+ models shard did not succeed (${SHARDS_RESULT}); the mismatched models are in that shard's own log, check-run 'TLA+ models (shard k/N)'"
-            exit 1
-          fi
+          node scripts/check-shard-verdict.mjs \
+            --label "TLA+ models" \
+            --result "${SHARDS_RESULT}" \
+            --shard-pattern "${SHARD_JOB_PATTERN}" \
+            --check-step "${SHARD_CHECK_STEP}" \
+            --repository "${GITHUB_REPOSITORY}" \
+            --run "${GITHUB_RUN_ID}"
 
   lint-and-typecheck:
     name: Lint & type-check
@@ -667,28 +734,59 @@ jobs:
   # requires and every tool (ci-verdict) keys on. A job
   # whose `needs` failed is SKIPPED by default, and GitHub
   # counts a skipped required check as passing, so `if: always()` is what
-  # makes a red or cancelled shard red here instead of green-by-skip.
-  # `needs.test.result` must be exactly `success`: skipped, cancelled and
-  # failure all fail this job.
+  # makes a red shard red here instead of green-by-skip.
+  #
+  # #4672: same verdict seam as `tla-models` above
+  # (`scripts/check-shard-verdict.mjs`), with this aggregate's own shard-job
+  # pattern and check step. The shard count is NOT baked in anywhere: the
+  # pattern matches `Unit tests (shard k/N)` for any N, so a future re-shard
+  # (#3753) moves the matrix and nothing here.
   unit-tests:
     name: Unit tests
     needs: test
     if: always()
     runs-on: ubuntu-latest
-    # Runs one `echo` and a comparison; 10 min is the repo's floor (refs #3123).
+    # Runs a checkout, one `node` and one API read; 10 min is the repo's floor
+    # (refs #3123).
     timeout-minutes: 10
     permissions:
       contents: read
+      # #4672: readable job list for the cancelled-shard verdict, as above.
+      actions: read
     env:
       SHARDS_RESULT: ${{ needs.test.result }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
       - name: Require every Unit tests shard to succeed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          SHARD_JOB_PATTERN: '^Unit tests \(shard [0-9]+/[0-9]+\)$'
+          # The step that runs the tests...
+          SHARD_CHECK_STEP: 'Run tests'
+          # ...and the gate that runs AFTER it in the same job. `--check-step`
+          # is repeatable and every listed step must have concluded: a cancel
+          # between `Run tests` and this step leaves a real gate (tmp entries
+          # another file leaked) unjudged, so one step was not enough (#4672
+          # review, V2b). A NEW gating step added after `Run tests` belongs in
+          # this list -- tests/config/unit-tests-shard-workflow.test.ts reds
+          # until it is, because it reads the job's own step order.
+          SHARD_TRAILING_CHECK_STEP: 'Tmp-fixture hygiene owner'
         run: |
           echo "Unit tests shard jobs (test): ${SHARDS_RESULT}"
-          if [[ "${SHARDS_RESULT}" != "success" ]]; then
-            echo "::error::a Unit tests shard did not succeed (${SHARDS_RESULT}); the failing tests are in that shard's own log, check-run 'Unit tests (shard k/N)'"
-            exit 1
-          fi
+          node scripts/check-shard-verdict.mjs \
+            --label "Unit tests" \
+            --result "${SHARDS_RESULT}" \
+            --shard-pattern "${SHARD_JOB_PATTERN}" \
+            --check-step "${SHARD_CHECK_STEP}" \
+            --check-step "${SHARD_TRAILING_CHECK_STEP}" \
+            --repository "${GITHUB_REPOSITORY}" \
+            --run "${GITHUB_RUN_ID}"
 
   # #3801: the heavy ADVISORY jobs (CodeQL) start only after every required
   # check passed on this head. A runner-slot pool

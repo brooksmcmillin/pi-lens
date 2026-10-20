@@ -526,3 +526,36 @@ export declare function watchOpenPrs(args: {
 	sleepImpl?: (ms: number) => Promise<void>;
 	now?: () => number;
 }): Promise<number>;
+
+// #3920 item 3: runtime against `timeout-minutes`, read from the workflow YAML.
+export declare const RUNTIME_CAP_WARN_RATIO: number;
+export declare const MAX_RUNTIME_CAP_LINES: number;
+export type JobCapEntry = {
+	file: string;
+	jobId: string;
+	name: string;
+	capMinutes: number;
+	pattern: RegExp;
+};
+export declare function checkNamePattern(
+	jobName: string,
+	escapeRegExp: (text: string) => string,
+): RegExp;
+export declare function jobCapEntries(
+	doc: unknown,
+	file: string,
+	escapeRegExp: (text: string) => string,
+): JobCapEntry[];
+export declare function readJobTimeCaps(root: string): Promise<JobCapEntry[]>;
+export declare function runtimeCapLines(args: {
+	checkRuns: readonly unknown[];
+	caps: readonly JobCapEntry[];
+	requiredChecks?: readonly string[];
+	ratio?: number;
+	limit?: number;
+}): string[];
+export declare function formatRuntimeCapLines(args: {
+	checkRuns: readonly unknown[];
+	root: string;
+	requiredChecks?: readonly string[];
+}): Promise<string[]>;

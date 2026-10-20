@@ -392,7 +392,8 @@
         "tool_call": ["dispatch-pipeline", "read-guard", "opaque-baseline-slot"],
         "tool_result": ["dispatch-pipeline", "read-guard", "session-straddle"],
         "tool_execution_end": ["read-guard"],
-        "context": ["read-guard", "session-lifecycle"]
+        "context": ["read-guard", "session-lifecycle"],
+        "context_with_system": ["read-guard", "session-lifecycle"]
       }
     },
     "clients/opaque-mutation-scan.ts": [
@@ -440,6 +441,6 @@
     "clients/turn-summary.ts": "The run's turn summary collector: a session-scoped store `resetForSession` clears, written by `handleToolResult` and the deferred-format drain behind the handle each captured at entry (#3759 row 14). Modelled as the `summary` kind of session-lifecycle's `stateW` and `debounce` writers (`StateWLate`, `Pre3759StateWUncaptured`); the collector's content is not.",
     "clients/dispatch/integration.ts": "The in-lane cascade (`computeCascadeForFile`: the passive snapshot's post-edit gate, the tier branch, the bounded silent-push wait, the fallbacks, the unconfirmed marker) is modelled by cascade-delivery's `Compute`. The row stays at three families: a fourth would make it a hub and silence its gate (#3878).",
     "clients/runtime-turn.ts": "`handleTurnEnd`'s drains and the park of a cut advisory: modelled by session-lifecycle's `TurnEnd` (a turn_end drains only its own scope's work: `SecondaryTurnEnd` is master's open half of #3613 and #3758, `SecondaryTurnEndScoped` the proposed shape) and `park`/`ParkTake` (`ParkMerged`, `Pre4112ParkNoSessionKey`, `Mut4112ParkNoResetClear`, `MutParkNoFence`; the key and fence are also turn-end-delivery-holds'). The row is deliberately not given session-lifecycle: a fourth family would make it a hub and silence its gate (#3878). Its cascade sections (the registry peek, the pending and unresolved lines, the pending record) are cascade-delivery's `TurnEnd`, left off the row for the same reason.",
-    "index.ts": "The hook handlers in index.ts: an edit inside one (session_start, session_shutdown, session_tree, turn_start, turn_end, agent_end, agent_settled, tool_call, tool_result, context) gates on that hook's families only, found by `findHookRanges` in scripts/lib/tla-coverage.mjs from the post-image the diff names (#3878). An edit outside every handler (activation setup, helpers) prints a note and never gates."
+    "index.ts": "The hook handlers in index.ts: an edit inside one (session_start, session_shutdown, session_tree, turn_start, turn_end, agent_end, agent_settled, tool_call, tool_result, context, context_with_system) gates on that hook's families only, found by `findHookRanges` in scripts/lib/tla-coverage.mjs from the post-image the diff names (#3878). An edit outside every handler (activation setup, helpers) prints a note and never gates. `context_with_system` is the pi 0.87+ request hook that sees the full transcript; `context` injects on a pre-0.87 host and defers on 0.87+ (#4631)."
   }
 }

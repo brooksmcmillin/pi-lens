@@ -342,7 +342,7 @@ function censusPins(
 }
 
 const PINNED_PRINT = [
-	"expect(CENSUS_SITES.length).toBe(78);",
+	"expect(CENSUS_SITES.length).toBe(80);",
 	'expect(CENSUS_ROWS.filter((row) => row.stage !== "gate").length).toBe(84);',
 	'expect(stageJobs("A")).toBe(28);',
 	'expect(stageJobs("B")).toBe(2);',
@@ -819,13 +819,16 @@ describe("#3941 early-start advisory checkouts pin the captured commit", () => {
 		// census registered under the sweep-floor meta-sweep: an empty walk fails
 		// instead of reading clean. #4518 moved ci.yml's `unit-tests-windows` from
 		// B to A (the advisory suffix and `needs: heavy-gate` both went), so A
-		// grew by one row and B shrank by one. No checkout site moved.
+		// grew by one row and B shrank by one. #4672 gave the two required
+		// aggregates (`tla-models`, `unit-tests`) a checkout so they can run
+		// `scripts/check-shard-verdict.mjs`: two new A-stage sites, 77 -> 79, and
+		// both land in A because a required job starts on every event.
 		assertNonEmptyScan(
 			"early-start advisory checkout census",
 			CENSUS_SITES.length,
-			78,
+			80,
 		);
-		pinnedNumber("checkout sites", CENSUS_SITES.length, 78);
+		pinnedNumber("checkout sites", CENSUS_SITES.length, 80);
 		pinnedNumber(
 			"non-gate job rows",
 			CENSUS_ROWS.filter((row) => row.stage !== "gate").length,

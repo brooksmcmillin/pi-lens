@@ -69,7 +69,10 @@ import {
 import extension from "../index.js";
 import { _resetSessionLifecycleForTests } from "../clients/session-lifecycle.js";
 import { removeTempDirSync } from "./clients/test-utils.js";
-import { makeSessionStartEvent } from "./support/host-event-factory.js";
+import {
+	makeContextWithSystemEvent,
+	makeSessionStartEvent,
+} from "./support/host-event-factory.js";
 import { createPiMock, makeCtx } from "./support/pi-mock.js";
 
 const SESSION_ID = "pi-3814-deferred-gate-session";
@@ -301,8 +304,8 @@ async function startSession(guard = true) {
 		turnEnd: async () => {
 			await pi.emit("turn_end", {}, ctx());
 			const injected = (await pi.emit(
-				"context",
-				{ messages: [{ role: "user", content: "keep working" }] },
+				"context_with_system",
+				makeContextWithSystemEvent([{ role: "user", content: "keep working" }]),
 				ctx(),
 			)) as { messages?: Array<{ content: string }> } | undefined;
 			return (injected?.messages ?? []).map((m) => m.content).join("\n\n");

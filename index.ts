@@ -319,6 +319,7 @@ import {
 	startSituationalToolTelemetrySession,
 } from "./clients/situational-tool-telemetry.js";
 import {
+	type CacheContextInjectionHook,
 	type CacheContextInjectionSlice,
 	type CacheContextPlacement,
 	clearCachePrefixSession,
@@ -4453,189 +4454,252 @@ function activateExtension(hostPi: ExtensionAPI) {
 		}
 		return [...content, { type: "text", text: injectedText }];
 	};
+	// #4631: pi 0.87+ splits the request transform in two. A `context` handler
+	// sees the conversation WITHOUT its system messages, and a changed list makes
+	// pi rebuild one merged system head from every system message
+	// (`restoreSystemMessages` in the host's core/extensions/runner). A transcript
+	// carrying a mid-list system message — pi appends one whenever prompt sections
+	// or tools change, which `pi_lens_activate_tools` and a reload both do — then
+	// got a head the provider had never cached, so every injecting turn missed the
+	// prompt cache (#4631: 22.8k cacheRead on injecting turns against 212k+ on
+	// quiet ones). `context_with_system` runs later in the SAME request, receives
+	// the full transcript, and its returned list is used verbatim, so the head
+	// stays byte-identical.
+	//
+	// The host generation is read from the EVENT, never from a version string: a
+	// `context` event whose first message is a system message is a pre-0.87 host
+	// (there the handler's return is assigned verbatim, so injecting is safe); one
+	// without it is 0.87+, and this hook then contributes NOTHING so the later
+	// `context_with_system` is the only injector. `pi.on` stores an unknown event
+	// name silently, so registering both is inert on an older host.
+	type ContextEventMessages = Array<{ role: string; content: unknown }>;
+	const carriesSystemHead = (messages: ContextEventMessages): boolean =>
+		messages[0]?.role === "system";
+	const injectIntoRequest = async (
+		event: { messages?: ContextEventMessages } | unknown,
+		ctx: { cwd?: string },
+		injectionHook: CacheContextInjectionHook,
+	) => {
+		// #1018: context telemetry deliberately runs even when the lens or its
+		// injection toggle is off, so an A/B run has a no-injection observation.
+		const existingMessages =
+			(event as { messages?: ContextEventMessages })?.messages ?? [];
+		const prefixSessionId = getStableSessionId(ctx);
+		const sessionRole = classifyOwnedSessionEmission(ctx, prefixSessionId);
+		// #1938: `observeCachePrefix` still owns the unbounded, always-accurate
+		// `cache_prefix_break` signal below. Its return value used to be threaded
+		// into `observeCacheContext` as `prefixObservation`, but that field was
+		// removed there (see the cache-observability.ts module doc) — the call
+		// stays for its `cache_prefix_break` side effect only.
+		observeCachePrefix(
+			existingMessages,
+			runtime.turnIndex,
+			prefixSessionId,
+			sessionRole,
+			dbg,
+		);
+		const effectiveInjectionEnabled = lensEnabled && contextInjectionEnabled;
+		let telemetryLogged = false;
+		const logContextObservation = (
+			resultMessages: Array<{ role: string; content: unknown }>,
+			placement: CacheContextPlacement,
+			// #1071: the per-source slices ARE the telemetry input. The source
+			// name list and the flat message list are both derived from them
+			// inside observeCacheContext, so this call site cannot report a
+			// source that contributed nothing.
+			injectionSlices: ReadonlyArray<CacheContextInjectionSlice>,
+		) => {
+			if (telemetryLogged) return;
+			telemetryLogged = true;
+			observeCacheContext({
+				existingMessages,
+				resultMessages,
+				sessionId: prefixSessionId,
+				sessionRole,
+				turnIndex: runtime.turnIndex,
+				injectionEnabled: effectiveInjectionEnabled,
+				injectionSlices,
+				placement,
+				// #4631: which request hook delivered this observation, so a
+				// reader can tell a 0.87+ full-transcript observation from a
+				// pre-0.87 one without guessing from the host version.
+				injectionHook,
+				dbg,
+			});
+		};
+		try {
+			const cwd = ctx.cwd ?? process.cwd();
+
+			if (!effectiveInjectionEnabled) {
+				logContextObservation(existingMessages, "none", []);
+				return;
+			}
+
+			const turnEndFindings = consumeTurnEndFindings(
+				cacheManager,
+				cwd,
+				runtime,
+			);
+			const sessionGuidance = consumeSessionStartGuidance(cacheManager, cwd);
+			const testFindings = consumeStagedTestRunnerFindings({
+				cwd,
+				sessionId: runtime.telemetrySessionId,
+				ownerId: testRunnerDeliveryOwnerId,
+				cacheManager,
+				runtime,
+			});
+			// #4631 round 5 (F3): drain the nudge for the scope THIS request
+			// belongs to, not the activation-wide `scope` above. `session_start`
+			// reassigns that variable (both the primary and the declined-secondary
+			// arms), and on 0.87+ this consume runs in `context_with_system` — the
+			// LAST phase of the host's `emitContext`, after every other extension's
+			// `context` handler has been awaited. A concurrent in-process session
+			// start (#473) landing in that window used to reassign `scope`, so this
+			// request drained the OTHER session's advisories into its own messages
+			// and the owning session lost them. `liveSessionMembers` records each
+			// session's own scope at its start (#4554), and this is the same
+			// identity `leaveLiveSession` reads; when this activation never recorded
+			// the requesting session, the activation-wide scope is the only answer
+			// left and stays the fallback.
+			const requestScope =
+				(prefixSessionId === undefined
+					? undefined
+					: liveSessionMembers.find(
+							(member) => member.sessionId === prefixSessionId,
+						)?.scope) ?? scope;
+			const agentNudge = consumeAgentNudge(dbg, requestScope);
+			const sourceMessages = [
+				{
+					source: "session-guidance" as const,
+					messages: sessionGuidance?.messages ?? [],
+				},
+				{
+					source: "turn-findings" as const,
+					messages: turnEndFindings?.messages ?? [],
+				},
+				{
+					source: "test-findings" as const,
+					messages: testFindings?.messages ?? [],
+				},
+				{
+					source: "agent-nudge" as const,
+					messages: agentNudge?.messages ?? [],
+				},
+			].filter((source) => source.messages.length > 0);
+			const injectedMessages = sourceMessages.flatMap(
+				(source) => source.messages,
+			);
+			if (injectedMessages.length === 0) {
+				logContextObservation(existingMessages, "none", []);
+				return;
+			}
+
+			// Empty transcript (no turns yet): fall back to prepend semantics —
+			// there is no trailing user message to sit before, and we must never
+			// emit empty input (fe0ed5da: OpenAI Responses fails on empty input).
+			if (existingMessages.length === 0) {
+				const resultMessages = [...injectedMessages];
+				logContextObservation(resultMessages, "prepend", sourceMessages);
+				return { messages: resultMessages };
+			}
+
+			const lastMessage = existingMessages[existingMessages.length - 1];
+
+			// Mid-loop the tail can be a tool_result (or assistant/tool) message;
+			// inserting before it would break tool_use↔tool_result adjacency. Only
+			// splice before the last message when it is a plain user prompt.
+			if (!isPlainUserPrompt(lastMessage)) {
+				// Append after the whole transcript — pure append preserves the
+				// adjacency AND leaves the entire prior transcript as an untouched
+				// cache prefix.
+				const resultMessages = [...existingMessages, ...injectedMessages];
+				logContextObservation(resultMessages, "append", sourceMessages);
+				return { messages: resultMessages };
+			}
+
+			const injectedText = injectedMessages.map((m) => m.content).join("\n\n");
+			if (!injectedText) {
+				logContextObservation(existingMessages, "none", []);
+				return;
+			}
+
+			const updatedLastMessage = {
+				...lastMessage,
+				content: appendToUserPromptContent(
+					lastMessage.content as string | unknown[],
+					injectedText,
+				),
+			};
+
+			const resultMessages = [
+				...existingMessages.slice(0, -1),
+				updatedLastMessage,
+			];
+			logContextObservation(
+				resultMessages,
+				"append-to-last-user",
+				sourceMessages,
+			);
+			return { messages: resultMessages };
+		} catch (err) {
+			// The stale-ctx class has ONE classifier and one record, in
+			// clients/session-event-guard.ts. Rethrow BEFORE the fallback
+			// observation (#1929): a session that no longer exists must not
+			// leave a "no injection" cache-context row behind, and the
+			// wrapper's own record is the accurate one.
+			if (isStaleExtensionCtxError(err)) throw err;
+			if (!telemetryLogged) logContextObservation(existingMessages, "none", []);
+			dbg(`context event error: ${err}`);
+		}
+	};
+	// #1929: `context` and `context_with_system` are reachable with a ctx the SDK
+	// already invalidated, exactly like the five handlers #1925 wrapped. They
+	// cannot use the void wrapper because the host CONSUMES their return value on
+	// the live path, so they use the value-returning variant and state their own
+	// stale-path answer below. Before this, a stale ctx surfaced as
+	// `context event error: …`, indistinguishable from a real handler bug, and
+	// counted nothing.
+	const contextInjectionGuard = {
+		dbg,
+		// #1929: a dead ctx means pi-lens contributes NOTHING to this request.
+		// `undefined` is that answer, and is what the non-injecting paths above
+		// already return, so the host keeps its own message list byte-for-byte.
+		// Never a half-built injection: the consume* calls that feed one have side
+		// effects and may not have run.
+		onStaleResult: () => undefined,
+	};
 	// biome-ignore lint/suspicious/noExplicitAny: pi.on("context") overload has TS resolution bug
 	(pi as any).on(
 		"context",
-		// #1929: `context` is reachable with a ctx the SDK already invalidated,
-		// exactly like the five handlers #1925 wrapped. It could not use the void
-		// wrapper because the host CONSUMES its return value on the live path, so
-		// it uses the value-returning variant and states its own stale-path answer
-		// below. Before this, a stale ctx surfaced as `context event error: …`,
-		// indistinguishable from a real handler bug, and counted nothing.
 		wrapSessionEventHandlerWithResult(
 			"context",
 			async (
-				event:
-					| { messages?: Array<{ role: string; content: unknown }> }
-					| unknown,
+				event: { messages?: ContextEventMessages } | unknown,
 				ctx: { cwd?: string },
 			) => {
-				// #1018: context telemetry deliberately runs even when the lens or its
-				// injection toggle is off, so an A/B run has a no-injection observation.
-				const existingMessages =
-					(event as { messages?: Array<{ role: string; content: unknown }> })
-						?.messages ?? [];
-				const prefixSessionId = getStableSessionId(ctx);
-				const sessionRole = classifyOwnedSessionEmission(ctx, prefixSessionId);
-				// #1938: `observeCachePrefix` still owns the unbounded, always-accurate
-				// `cache_prefix_break` signal below. Its return value used to be threaded
-				// into `observeCacheContext` as `prefixObservation`, but that field was
-				// removed there (see the cache-observability.ts module doc) — the call
-				// stays for its `cache_prefix_break` side effect only.
-				observeCachePrefix(
-					existingMessages,
-					runtime.turnIndex,
-					prefixSessionId,
-					sessionRole,
-					dbg,
-				);
-				const effectiveInjectionEnabled =
-					lensEnabled && contextInjectionEnabled;
-				let telemetryLogged = false;
-				const logContextObservation = (
-					resultMessages: Array<{ role: string; content: unknown }>,
-					placement: CacheContextPlacement,
-					// #1071: the per-source slices ARE the telemetry input. The source
-					// name list and the flat message list are both derived from them
-					// inside observeCacheContext, so this call site cannot report a
-					// source that contributed nothing.
-					injectionSlices: ReadonlyArray<CacheContextInjectionSlice>,
-				) => {
-					if (telemetryLogged) return;
-					telemetryLogged = true;
-					observeCacheContext({
-						existingMessages,
-						resultMessages,
-						sessionId: prefixSessionId,
-						sessionRole,
-						turnIndex: runtime.turnIndex,
-						injectionEnabled: effectiveInjectionEnabled,
-						injectionSlices,
-						placement,
-						dbg,
-					});
-				};
-				try {
-					const cwd = ctx.cwd ?? process.cwd();
-
-					if (!effectiveInjectionEnabled) {
-						logContextObservation(existingMessages, "none", []);
-						return;
-					}
-
-					const turnEndFindings = consumeTurnEndFindings(
-						cacheManager,
-						cwd,
-						runtime,
-					);
-					const sessionGuidance = consumeSessionStartGuidance(
-						cacheManager,
-						cwd,
-					);
-					const testFindings = consumeStagedTestRunnerFindings({
-						cwd,
-						sessionId: runtime.telemetrySessionId,
-						ownerId: testRunnerDeliveryOwnerId,
-						cacheManager,
-						runtime,
-					});
-					const agentNudge = consumeAgentNudge(dbg, scope);
-					const sourceMessages = [
-						{
-							source: "session-guidance" as const,
-							messages: sessionGuidance?.messages ?? [],
-						},
-						{
-							source: "turn-findings" as const,
-							messages: turnEndFindings?.messages ?? [],
-						},
-						{
-							source: "test-findings" as const,
-							messages: testFindings?.messages ?? [],
-						},
-						{
-							source: "agent-nudge" as const,
-							messages: agentNudge?.messages ?? [],
-						},
-					].filter((source) => source.messages.length > 0);
-					const injectedMessages = sourceMessages.flatMap(
-						(source) => source.messages,
-					);
-					if (injectedMessages.length === 0) {
-						logContextObservation(existingMessages, "none", []);
-						return;
-					}
-
-					// Empty transcript (no turns yet): fall back to prepend semantics —
-					// there is no trailing user message to sit before, and we must never
-					// emit empty input (fe0ed5da: OpenAI Responses fails on empty input).
-					if (existingMessages.length === 0) {
-						const resultMessages = [...injectedMessages];
-						logContextObservation(resultMessages, "prepend", sourceMessages);
-						return { messages: resultMessages };
-					}
-
-					const lastMessage = existingMessages[existingMessages.length - 1];
-
-					// Mid-loop the tail can be a tool_result (or assistant/tool) message;
-					// inserting before it would break tool_use↔tool_result adjacency. Only
-					// splice before the last message when it is a plain user prompt.
-					if (!isPlainUserPrompt(lastMessage)) {
-						// Append after the whole transcript — pure append preserves the
-						// adjacency AND leaves the entire prior transcript as an untouched
-						// cache prefix.
-						const resultMessages = [...existingMessages, ...injectedMessages];
-						logContextObservation(resultMessages, "append", sourceMessages);
-						return { messages: resultMessages };
-					}
-
-					const injectedText = injectedMessages
-						.map((m) => m.content)
-						.join("\n\n");
-					if (!injectedText) {
-						logContextObservation(existingMessages, "none", []);
-						return;
-					}
-
-					const updatedLastMessage = {
-						...lastMessage,
-						content: appendToUserPromptContent(
-							lastMessage.content as string | unknown[],
-							injectedText,
-						),
-					};
-
-					const resultMessages = [
-						...existingMessages.slice(0, -1),
-						updatedLastMessage,
-					];
-					logContextObservation(
-						resultMessages,
-						"append-to-last-user",
-						sourceMessages,
-					);
-					return { messages: resultMessages };
-				} catch (err) {
-					// The stale-ctx class has ONE classifier and one record, in
-					// clients/session-event-guard.ts. Rethrow BEFORE the fallback
-					// observation (#1929): a session that no longer exists must not
-					// leave a "no injection" cache-context row behind, and the
-					// wrapper's own record is the accurate one.
-					if (isStaleExtensionCtxError(err)) throw err;
-					if (!telemetryLogged)
-						logContextObservation(existingMessages, "none", []);
-					dbg(`context event error: ${err}`);
-				}
+				const messages =
+					(event as { messages?: ContextEventMessages })?.messages ?? [];
+				// #4631 gate: a `context` event that carries the transcript's system
+				// head is a pre-0.87 host. On 0.87+ the head is filtered out here and
+				// the full transcript arrives at `context_with_system` later in this
+				// same request, so this hook must return `undefined` (pi's "this
+				// extension contributed nothing") and leave pi's list untouched.
+				if (!carriesSystemHead(messages)) return undefined;
+				return injectIntoRequest(event, ctx, "context");
 			},
-			{
-				dbg,
-				// #1929: a dead ctx means pi-lens contributes NOTHING to this
-				// request. `undefined` is that answer, and is what the four
-				// non-injecting paths above already return, so the host keeps its
-				// own message list byte-for-byte. Never a half-built injection: the
-				// consume* calls that feed one have side effects and may not have run.
-				onStaleResult: () => undefined,
-			},
+			contextInjectionGuard,
+		),
+	);
+	// biome-ignore lint/suspicious/noExplicitAny: pi.on("context_with_system") overload has TS resolution bug
+	(pi as any).on(
+		"context_with_system",
+		wrapSessionEventHandlerWithResult(
+			"context_with_system",
+			(
+				event: { messages?: ContextEventMessages } | unknown,
+				ctx: { cwd?: string },
+			) => injectIntoRequest(event, ctx, "context_with_system"),
+			contextInjectionGuard,
 		),
 	);
 }

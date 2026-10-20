@@ -193,6 +193,68 @@ function isConcludedSuccess(run) {
 }
 
 /**
+ * The aggregate check a SHARDED job row belongs to, or `null` for any other
+ * name: `"Unit tests (shard 3/5)"` -> `"Unit tests"`. The aggregate is the ONE
+ * required context (#3753, #4672), and it is the job that reads every shard's
+ * row and decides whether a cancellation was a teardown race.
+ *
+ * @param {unknown} name
+ * @returns {string | null}
+ */
+export function shardAggregateName(name) {
+	const match = /^(.+?) \(shard [0-9]+\/[0-9]+\)$/.exec(String(name ?? ""));
+	return match ? match[1] : null;
+}
+
+/**
+ * The names every one of whose runs came from a schedule/dispatch/
+ * workflow_run workflow (#4090). Those runs are not part of a commit's PR/push
+ * CI, so the name is advisory for this head. One run of the name from any other
+ * (or an unknown) event keeps it out of the set.
+ *
+ * @param {CheckRunRecord[]} checkRuns
+ * @returns {Set<string>}
+ */
+export function resolveTriggerAdvisoryNames(checkRuns) {
+	const events = new Map();
+	for (const run of checkRuns ?? []) {
+		const seen = events.get(run.name) ?? [];
+		seen.push(run.workflow_event);
+		events.set(run.name, seen);
+	}
+	return new Set(
+		[...events]
+			.filter(([, seen]) => seen.every((event) => isNonPrCiEvent(event)))
+			.map(([name]) => name),
+	);
+}
+
+/**
+ * Whether a check NAME gates this head: branch protection requires it, or it
+ * is not on the advisory allowlist and not a schedule-only lane.
+ *
+ * ONE owner for the rule, because two readers of the same payload answer it --
+ * `computeVerdict`'s rows and `runtimeCapLines`' printed `(gating)` marker --
+ * and they disagreed: the marker labelled seven schedule-only nightly jobs
+ * `(gating)` while the verdict scored them `gating: false` (V5a). The shape-38
+ * override still wins: a name branch protection requires always gates.
+ *
+ * @param {string} name
+ * @param {{ required?: Iterable<string>, triggerAdvisoryNames?: Set<string> }} [context]
+ * @returns {boolean}
+ */
+export function isGatingCheckName(
+	name,
+	{ required = REQUIRED_CHECKS, triggerAdvisoryNames = new Set() } = {},
+) {
+	const requiredSet = required instanceof Set ? required : new Set(required);
+	return (
+		requiredSet.has(name) ||
+		(!isAdvisoryCheck(name) && !triggerAdvisoryNames.has(name))
+	);
+}
+
+/**
  * Fail-closed tie policy (#2190 incident): when two check-runs share a name
  * and neither `startedAt`/`started_at` orders them (missing, unparsable, or
  * exactly equal), the run that is NOT a concluded success wins. An

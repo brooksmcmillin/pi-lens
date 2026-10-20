@@ -53,7 +53,10 @@ import type { GitleaksResult } from "../clients/gitleaks-client.js";
 import type { TrivyResult } from "../clients/trivy-client.js";
 import extension from "../index.js";
 import { removeTempDirSync } from "./clients/test-utils.js";
-import { makeSessionStartEvent } from "./support/host-event-factory.js";
+import {
+	makeContextWithSystemEvent,
+	makeSessionStartEvent,
+} from "./support/host-event-factory.js";
 import { createPiMock, makeCtx } from "./support/pi-mock.js";
 
 const SESSION_ID = "pi-1892-secrets-lane-session";
@@ -207,14 +210,20 @@ describe("#1892 witness: the turn-end secrets lane through pi", () => {
 		);
 		await pi.emit("turn_end", {}, makeCtx({ cwd: tmpDir }));
 		const injected = (await pi.emit(
-			"context",
-			{ messages: [{ role: "user", content: "keep working" }] },
+			"context_with_system",
+			makeContextWithSystemEvent([{ role: "user", content: "keep working" }]),
 			makeCtx({ cwd: tmpDir }),
-		)) as { messages?: Array<{ content: string }> } | undefined;
+		)) as { messages?: Array<{ role?: string; content: string }> } | undefined;
 
+		// #4631 round 5 (F2): the transcript leads with the host's system head, so the
+		// golden records the messages pi-lens APPENDED. The assertion pins that the
+		// head is still at index 0: a regression that dropped it would shift this
+		// golden instead of slipping through.
+		expect((injected?.messages ?? [])[0]?.role).toBe("system");
 		const actual = `${[
 			"=== context message the agent receives ===",
 			(injected?.messages ?? [])
+				.slice(1)
 				.map((m) => m.content)
 				.join("\n\n")
 				.replaceAll(tmpDir, "<PROJECT>")

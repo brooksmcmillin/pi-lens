@@ -1490,7 +1490,9 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/spawn-timeout-cooldown.ts": 1,
 		"clients/test-runner-client.ts": 15,
 		"clients/tree-sitter-logger.ts": 2,
-		"clients/tree-sitter-query-loader.ts": 1,
+		// 1 -> 4 (#2678): the health-check record reads the resource status
+		// twice and writes metadata.status; none denotes a delivery status.
+		"clients/tree-sitter-query-loader.ts": 4,
 		"clients/tree-sitter-shared.ts": 1,
 		"clients/widget-state.ts": 12,
 		"clients/word-index.ts": 6,

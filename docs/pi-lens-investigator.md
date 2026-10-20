@@ -17,6 +17,12 @@ issue and the requested evidence surface.
 
 ## Evidence sources
 
+The log root is the monitored process's, resolved as in
+`docs/pi-lens-monitor.md` "Inputs": a non-empty `PI_LENS_HOME`, then any
+probe-home redirect, then `~/.pi-lens`. The paths below assume the default.
+Rotation also writes timestamped archives; pass `--archived` to the analyzer
+to read them.
+
 - `~/.pi-lens/latency.log` and its `.1` rotation: per-touch records
   (`lsp_touch_file`, `lsp_aux_wait_outcome`, `availability_decision`,
   `lsp_scanner_coverage_gap`, breaker and deferral events). Rotation is by size:

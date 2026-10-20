@@ -173,6 +173,14 @@ The principles' delegation contract applies. pi-lens adds:
 - Three open issues on one mechanism, in any seam groups, open a consolidation
   audit across every consumer of that mechanism before the next one is filed
   (history: `HISTORY.md`, 2026-10-16).
+- Run the **fold check** as soon as a lane's mechanism is known, which is when
+  the brief is written: read every open issue against that mechanism and decide
+  each candidate as folded into this PR (one `Closes #…` per folded issue) or
+  not folded, with the reason (two hazards in one review, a maintainer decision,
+  a blocked dependency, a different seam). The brief carries the candidate list
+  and its decisions, and the PR body records them under `## Fold check`.
+  Planning precedes filing: a new issue is the answer for p2+ work no lane can
+  carry, never for a p3 the lane could fold (history: `HISTORY.md`, 2026-10-20).
 - The per-PR loop (review, verify, auto-merge on green), round routing, the
   merge gate and the Common mistakes table live in `docs/pi-lens-merge-policy.md`.
 - Read CI with `node scripts/ci-verdict.mjs <pr|sha>` (exact head, all pages).
@@ -702,10 +710,8 @@ file-scoped worklist and receives no project-wide scanner output.
     flips between two answers and a data refresh commits the artifact as a
     finding. Stamp each row with the subject that emitted it, or scope the drain
     to that subject, and require the last writer of a verdict to be the subject's
-    own emitter. Guard: planned, not yet running; the regression test is
-    `tests/clients/lsp/lsp-publish-trace-attribution.test.ts` on
-    `fix/4615-typescript-first-publish`, off master. Instance and dates:
-    `HISTORY.md`.
+    own emitter. Enforced by `tests/clients/lsp/lsp-publish-trace-attribution.test.ts`.
+    Instance and dates: `HISTORY.md`.
 
 77. **Cancellation read as failure:** an aggregate that compares each shard's
     result against `success` reds a required check when the shard finished every
@@ -713,11 +719,14 @@ file-scoped worklist and receives no project-wide scanner output.
     because the infra-kill classifier reads only `failure` runs. A shard's own
     step conclusions tell a teardown cancellation from a mid-check one, and every
     required job's measured runtime belongs beside its cap, because a cap set at
-    the measured maximum fails the first time a runner is slow. Guard: planned,
-    not yet running; the shard-verdict test is
-    `tests/scripts/check-shard-verdict.test.ts` on
-    `ci/4672-cancelled-shard-verdict`, off master. Instance and dates:
-    `HISTORY.md`.
+    the measured maximum fails the first time a runner is slow. That runtime is
+    also a per-shard SUM, so it can never be the stale-cost verdict: only the
+    table's rank agreement with the run's own ordering is scale-free enough to
+    survive one shard's machine. Guard: `tests/scripts/check-shard-verdict.test.ts`
+    (the seam, both fail-closed directions), the gating-step list in
+    `tests/config/unit-tests-shard-workflow.test.ts`, and
+    `tests/scripts/ci-verdict-runtime-cap.test.ts` (a measured runtime beside its
+    cap). Instance and dates: `HISTORY.md`.
 
 78. **A dependency's cache directory attributed to the fixture that triggered
     it:** a loader that materialises `os.tmpdir()/<tool>` on the caller's own

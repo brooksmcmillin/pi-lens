@@ -760,6 +760,21 @@ async function fetchRunAndFailedJob({ fetcher, owner, repo, runId, jobName }) {
 		`${base}/actions/runs/${runId}/jobs`,
 	);
 	const jobs = jobsResponse.jobs ?? [];
+	// #4672: a CANCELLED run has no failed job to read, so it used to fall
+	// through to the "has no failed job" throw below and the lane never judged
+	// it. Hand the run and its job rows back instead and let `runClassifier`
+	// ask `classifyCancelledRun` whether this is the teardown race.
+	if (String(run.conclusion ?? "") === "cancelled") {
+		return {
+			cancelledRun: { run, jobs },
+			sha: run.head_sha,
+			prNumber: ownPullRequestNumber(run, owner, repo),
+			runAttempt: Number(run.run_attempt) || 1,
+			jobId: null,
+			jobName: jobName ?? "",
+			jobIds: [],
+		};
+	}
 	const failedJobs = jobName
 		? failedJobsNamed(jobs, jobName)
 		: jobs.filter((job) => job.conclusion === "failure").slice(0, 1);
@@ -793,6 +808,118 @@ async function fetchRunAndFailedJob({ fetcher, owner, repo, runId, jobName }) {
 		jobId: failedJob.id,
 		jobName: failedJobs.map((job) => job.name).join(", "),
 		jobIds: failedJobs.map((job) => job.id),
+	};
+}
+
+/** Step conclusions that mean "this step ran to its end". A `skipped` step ran
+ * nothing, which is not a failure of the work it skipped. */
+const STEP_DONE_CONCLUSIONS = new Set(["success", "skipped"]);
+
+/**
+ * #4672: judge a CANCELLED `CI` run as the teardown race it is, or refuse it.
+ *
+ * The defect (master push run 39380875926, head e3767bd78): `TLA+ models
+ * (shard 4/4)` started 06:36:59Z, was `cancelled` at 06:49:14Z -- 735 s
+ * against a `timeout-minutes: 12` cap -- with EVERY step concluded `success`,
+ * the model check itself 06:37:06Z -> 06:49:12Z. The aggregate job then read
+ * `needs.tla-shards.result == cancelled` and failed the required
+ * `TLA+ models` check on master's tip with no model violation, and this lane
+ * could not recover it: `classify` required
+ * `workflow_run.conclusion == 'failure'`, so the run got no verdict, no
+ * classification and no rerun.
+ *
+ * The gate is deliberately narrow, in three directions:
+ *   - MASTER PUSHES ONLY. A pull_request run cancelled by
+ *     `concurrency.cancel-in-progress` is superseded by design; rerunning it
+ *     would spend quota re-testing a head nothing waits on, and the newer run
+ *     owns the verdict. Only `event == 'push'` on `master` ("nothing reruns a
+ *     cancelled run") is eligible, and this function decides that itself so a
+ *     bare CLI invocation cannot route around the workflow's own `if:`.
+ *   - EVERY CANCELLED job's steps must have concluded `success` (or been
+ *     skipped). A job with a `cancelled`/`failure`/absent step was killed
+ *     mid-work, so its tests or models did not finish: rerunning it would be
+ *     papering over a real red, and the classifier must say no.
+ *   - Unreadable is not eligible. A job row with no `steps` array is not
+ *     evidence of completion, so it refuses rather than assumes.
+ *
+ * FAILED jobs are deliberately NOT part of the gate, and the witness shows
+ * why: run 39380875926's `TLA+ models` aggregate job concluded `failure`
+ * BECAUSE shard 4/4 concluded `cancelled` -- that is the defect #4672 fixes
+ * (the aggregate now keeps it as a pass-with-warning). Gating on failed jobs
+ * would therefore refuse to judge the very shape this branch exists for. A
+ * genuinely failed job is not hidden by this: a rerun replays it, the replayed
+ * attempt concludes `failure`, and the ordinary failure path above classifies
+ * and labels THAT run -- so a real red still reads `real` on the attempt the
+ * truth appears. On the master lane there is no label write at all.
+ *
+ * The kind is `infra-kill` on purpose: that is the classification the label
+ * step (`ci:infra`) and `shouldTriggerRerun`'s attempt bound already handle,
+ * and the detail says plainly what happened, so a human reading the sticky
+ * comment knows this was a teardown race and not an assertion failure.
+ *
+ * @param {{ run: object, jobs: object[] }} args
+ * @returns {{ eligible: true, kind: "infra-kill", detail: string } | { eligible: false, reason: string }}
+ */
+export function classifyCancelledRun({ run, jobs }) {
+	const event = String(run?.event ?? "");
+	const branch = String(run?.head_branch ?? "");
+	if (event !== "push" || branch !== "master") {
+		return {
+			eligible: false,
+			reason: `run ${run?.id ?? "?"} was cancelled on a ${event || "unknown"} event (branch ${branch || "unknown"}); only a push to master is a teardown race, every other cancelled run is superseded by design`,
+		};
+	}
+	const cancelled = (Array.isArray(jobs) ? jobs : []).filter(
+		(job) => String(job?.conclusion ?? "") === "cancelled",
+	);
+	if (cancelled.length === 0) {
+		return {
+			eligible: false,
+			reason: `run ${run?.id ?? "?"} concluded cancelled but reports no cancelled job to judge`,
+		};
+	}
+	const offenders = [];
+	for (const job of cancelled) {
+		const steps = Array.isArray(job?.steps) ? job.steps : null;
+		if (steps === null || steps.length === 0) {
+			offenders.push(`${job?.name ?? "(unnamed job)"} has no readable steps`);
+			continue;
+		}
+		const unfinished = steps.filter(
+			(step) => !STEP_DONE_CONCLUSIONS.has(String(step?.conclusion ?? "")),
+		);
+		if (unfinished.length > 0) {
+			offenders.push(
+				`${job?.name ?? "(unnamed job)"}: ${unfinished
+					.map(
+						(step) =>
+							`${step?.name ?? "?"} concluded ${step?.conclusion ?? "no conclusion"}`,
+					)
+					.join(", ")}`,
+			);
+		}
+	}
+	if (offenders.length > 0) {
+		return {
+			eligible: false,
+			reason: `run ${run?.id ?? "?"} was cancelled mid-work, not in teardown: ${offenders.join("; ")}`,
+		};
+	}
+	const failed = (Array.isArray(jobs) ? jobs : []).filter((job) =>
+		isBlockingConclusion(job?.conclusion),
+	);
+	const otherRed =
+		failed.length > cancelled.length
+			? "; the run's other red job(s) are re-read by the rerun, which classifies and labels them on its own attempt"
+			: "";
+	return {
+		eligible: true,
+		kind: "infra-kill",
+		detail: `no failing assertion; ${cancelled.length} job(s) cancelled with every step concluded success (${cancelled
+			.map((job) => job.name)
+			.join(
+				", ",
+			)}) -- a job lost its teardown race with its own timeout-minutes after its work finished${otherRed}`,
 	};
 }
 
@@ -1023,6 +1150,7 @@ export async function runClassifier({
 		jobId,
 		jobIds,
 		jobName: resolvedJobName,
+		cancelledRun,
 	} = runAndJob;
 	const prNumber = prNumberOverride ?? resolvedPrNumber;
 	// #4382: the sticky comment is bookkeeping; a refused write (403 on a
@@ -1046,6 +1174,19 @@ export async function runClassifier({
 		);
 	}
 
+	// #4672: a cancelled master run is judged from its job rows, never from a
+	// log -- there is no failed job, and "every step concluded success" is the
+	// whole evidence. An ineligible cancelled run (a PR run superseded by
+	// concurrency, or a job killed mid-work) is SKIPPED with its reason, so the
+	// lane never reruns a red or a superseded head.
+	let cancelledClassification = null;
+	if (cancelledRun) {
+		const judged = classifyCancelledRun(cancelledRun);
+		if (!judged.eligible) {
+			return { skipped: true, reason: judged.reason };
+		}
+		cancelledClassification = { kind: judged.kind, detail: judged.detail };
+	}
 	let rawLogs;
 	try {
 		rawLogs = [];
@@ -1083,7 +1224,13 @@ export async function runClassifier({
 		// One log per failed job (several failed shards, #3753). A real failure
 		// in ANY of them wins: a rerun that would only replay the infra-killed
 		// shard cannot fix a shard that is genuinely red.
-		const classified = rawLogs.map((rawLog) => classifyFailureLog(rawLog));
+		//
+		// #4672: a cancelled run carries no log to read -- `classifyCancelledRun`
+		// already decided, from the job rows, that every step of every cancelled
+		// job finished.
+		const classified = cancelledClassification
+			? [cancelledClassification]
+			: rawLogs.map((rawLog) => classifyFailureLog(rawLog));
 		classification =
 			classified.find((entry) => entry.kind === "real") ?? classified[0];
 	} catch (error) {
