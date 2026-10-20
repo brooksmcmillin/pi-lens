@@ -15,6 +15,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { assertNonEmptyScan, auditRegistry } from "../support/sweep-kit.js";
+import { scaledTestTimeout } from "../support/test-timeout-scale.js";
 import {
 	listTestFiles,
 	repoRoot,
@@ -192,41 +193,51 @@ const CLEARED: readonly Fixture[] = [
 ];
 
 describe("tests skip visibly instead of returning early (#2089)", () => {
-	it("no test body returns before it asserts or skips", () => {
-		const scannedCount = listTestFiles().length;
-		// Calibration: 786 test files walked on 2026-08-25; half is 393, rounded
-		// down to the documented 390 floor.
-		assertNonEmptyScan("vacuous-skip file walk", scannedCount, 390);
+	// #4634: the census parses every test file in the tree, so its cost follows
+	// the host's scheduler, not the fixture's size. Measured 731 ms on an idle
+	// host and 4,657 ms under load average 78 — 93% of vitest's 5 s default with
+	// no margin left — so it takes an explicit 60 s budget.
+	it(
+		"no test body returns before it asserts or skips",
+		() => {
+			const scannedCount = listTestFiles().length;
+			// Calibration: 786 test files walked on 2026-08-25; half is 393, rounded
+			// down to the documented 390 floor.
+			assertNonEmptyScan("vacuous-skip file walk", scannedCount, 390);
 
-		const findings = scanVacuousSkips();
-		const audit = auditRegistry({
-			sweepName: "vacuous-skip sweep",
-			flagged: findings.map(vacuousSkipKey),
-			registered: [],
-			exemptions: REVIEWED_EXCEPTIONS,
-			minReasonLength: 20,
-			scannedCount,
-			minScanned: 390,
-			// A ZERO-flag census is the healthy state here, unlike every other
-			// sweep in this repo: the population it counts is defects, not
-			// surfaces, and #2089 emptied it. The detector's liveness is proved by
-			// the two-direction probe below instead — a floor of 1 here would only
-			// force a defect to be kept alive to satisfy it.
-			minFlagged: 0,
-			remediation:
-				"Use it.skipIf(cond)(...) with a stated reason, or call ctx.skip(reason) " +
-				"before the return. A bare return reports as PASSED and claims coverage " +
-				"the run never had (AGENTS.md test-authoring screen 2).",
-		});
-		// The line numbers first, because that is what an author needs to act;
-		// `audit.problems` then covers the floors and the exemption bookkeeping the
-		// list alone cannot express.
-		const unaccounted = findings
-			.filter((entry) => audit.unaccounted.includes(vacuousSkipKey(entry)))
-			.map((entry) => `${entry.file}:${entry.line} — ${entry.testName}`);
-		expect(unaccounted, "test bodies that return before asserting").toEqual([]);
-		expect(audit.problems, audit.problems.join("\n")).toEqual([]);
-	});
+			const findings = scanVacuousSkips();
+			const audit = auditRegistry({
+				sweepName: "vacuous-skip sweep",
+				flagged: findings.map(vacuousSkipKey),
+				registered: [],
+				exemptions: REVIEWED_EXCEPTIONS,
+				minReasonLength: 20,
+				scannedCount,
+				minScanned: 390,
+				// A ZERO-flag census is the healthy state here, unlike every other
+				// sweep in this repo: the population it counts is defects, not
+				// surfaces, and #2089 emptied it. The detector's liveness is proved by
+				// the two-direction probe below instead — a floor of 1 here would only
+				// force a defect to be kept alive to satisfy it.
+				minFlagged: 0,
+				remediation:
+					"Use it.skipIf(cond)(...) with a stated reason, or call ctx.skip(reason) " +
+					"before the return. A bare return reports as PASSED and claims coverage " +
+					"the run never had (AGENTS.md test-authoring screen 2).",
+			});
+			// The line numbers first, because that is what an author needs to act;
+			// `audit.problems` then covers the floors and the exemption bookkeeping the
+			// list alone cannot express.
+			const unaccounted = findings
+				.filter((entry) => audit.unaccounted.includes(vacuousSkipKey(entry)))
+				.map((entry) => `${entry.file}:${entry.line} — ${entry.testName}`);
+			expect(unaccounted, "test bodies that return before asserting").toEqual(
+				[],
+			);
+			expect(audit.problems, audit.problems.join("\n")).toEqual([]);
+		},
+		scaledTestTimeout(60_000),
+	);
 
 	it("catches the shapes it claims to catch", () => {
 		const missed = CAUGHT.filter(

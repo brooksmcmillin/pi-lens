@@ -90,6 +90,14 @@ the docs refresh commits the confirmed class and the marker must move with it.
 A single-night flip remains in the refresh-state JSON below and does not change
 the census's confirmed population.
 
+The class is defined on a DIRTY file — is the first publish for a file that HAS
+findings the answer, or an empty placeholder while a one-time index builds? — so
+the probe takes it from a dirty fixture and never from a `clean: true` one: a
+clean file has no finding to publish, so its trace can only ever be `empty-only`.
+Before #4615 the clean fixture supplied both axes, which is how a publish that
+belonged to another live client of the same server id became `typescript`'s
+`empty-first`.
+
 ## The strategies
 
 | Tier | Signal | Affirmative clean? | Example |
@@ -132,11 +140,15 @@ re-observe is stamped once with the date of its first miss and degrades to
 `unknown` once five calendar days have elapsed since it (skipped nights do not
 stall it, and a re-observation clears the stamp). `empty-first` cells are never
 expired: they back the live `emptyFirstPublish` markers (php, terraform) and
-expiring one would erase the measurement behind a marker. A `clean-behavior`/
-`tier` change is written only after two consecutive nightly runs observe the
-same new value, so one flapping nightly (ast-grep went 2 → 2* → 3 → 2* across
-four runs) cannot rewrite a cell; a night that measured nothing for the lang
-resets the hold. A subset probe (`probe-clean-signal.mjs <langs>`) leaves the
+expiring one would erase the measurement behind a marker. That exception is
+bounded too (#4615): the refresh stamps the FIRST night it does not re-observe an
+`empty-first` cell, and the first-publish census reds once that stamp is five
+days old, so the cell+marker pair cannot outlive the instrument that produced it
+— a cell with no live measurement behind it is no longer indistinguishable from
+a healthy one. A `clean-behavior`/`tier` change is written only after two
+consecutive nightly runs observe the same new value, so one flapping nightly
+(ast-grep went 2 → 2* → 3 → 2* across four runs) cannot rewrite a cell; a night
+that measured nothing for the lang resets the hold. A subset probe (`probe-clean-signal.mjs <langs>`) leaves the
 bookkeeping of the langs it did not probe untouched.
 
 The bookkeeping lives in the generated `## Capability matrix refresh state`
@@ -167,7 +179,7 @@ carries the named admission until then.
 | deno | deno (alt of typescript) | pull | — | n/a (pull) | 1 | dev+ci |
 | ruby | ruby-lsp | pull | — | n/a (pull) | 1 | ci |
 | csharp | csharp-ls | pull | — | n/a (pull) | 1 | ci |
-| typescript | typescript-language-server | push-only | silent | empty-first | 3 | dev+ci |
+| typescript | typescript-language-server | push-only | silent | direct | 3 | dev+ci |
 | markdown | marksman | push-only | silent | direct | 3 | ci |
 | lua | lua-language-server | push-only | silent | direct | 3 | dev+ci |
 | python | pyright | push-only | publishes-versioned | direct | 2 | dev+ci |
@@ -274,14 +286,4 @@ Telemetry only — never a CI gate. Compares each probed server's observed
 marker; a mismatch means the marker may need a human update (#529). `unknown`
 observations are never compared (a slow/absent server is not evidence either way).
 
-- **[marked-not-silent]** wait-policy/strategies.ts marks "typescript" silentOnClean:true but this run observed publishes-unversioned — the marker may be stale (too pessimistic; cascade is skipping a wait the server would have resolved with a real publish)
-
-## Capability matrix refresh state (nightly-generated)
-
-Bookkeeping for the two-run `first-publish`/`clean-behavior` hysteresis, the
-date-based `direct` expiry (#3401) and consecutive-night `idle-eviction`
-counts (#3989). Regenerated every run; never a measurement.
-
-```json
-{"clean-behavior":{"typescript":{"pendingBehavior":"publishes-unversioned","pendingTier":"2*","runs":1}},"first-publish":{"clojure":{"firstMissed":"2026-10-11"},"dart":{"firstMissed":"2026-10-11"},"dockerfile":{"firstMissed":"2026-10-10"},"prisma":{"firstMissed":"2026-10-10"},"python":{"firstMissed":"2026-10-10"},"shell":{"firstMissed":"2026-10-10"},"yaml":{"firstMissed":"2026-10-10"},"zig":{"firstMissed":"2026-10-11"}}}
-```
+_None observed as of the last probe run._

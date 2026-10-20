@@ -1,0 +1,48 @@
+{
+	"provenance": {
+		"runner": "helm-lint",
+		"tool": "helm",
+		"version": "4.3.0+gbec5b06",
+		"command": "helm lint __WORKSPACE__",
+		"argv": [
+			"lint",
+			"__WORKSPACE__"
+		],
+		"workspace": "tests/fixtures/tool-smoke/helm-space-name",
+		"platform": "linux-x64",
+		"capturedAt": "2026-10-15",
+		"versionArgv": [
+			"version",
+			"--short"
+		]
+	},
+	"file": "templates/my file.yaml",
+	"exitCode": 1,
+	"stdout": "==> Linting __WORKSPACE__\n[INFO] Chart.yaml: icon is recommended\n[ERROR] templates/: parse error at (pi-lens-smoke/templates/my file.yaml:5): unclosed action started at pi-lens-smoke/templates/my file.yaml:4\n\n",
+	"stderr": "Error: 1 chart(s) linted, 1 chart(s) failed\n",
+	"availability": [
+		{
+			"command": "helm",
+			"argv": [
+				"version",
+				"--short"
+			],
+			"version": "4.3.0+gbec5b06",
+			"exitCode": 0,
+			"stdout": "v4.3.0+gbec5b06\n",
+			"stderr": ""
+		}
+	],
+	"clean": {
+		"workspace": "tests/fixtures/runner-output-clean/helm-lint",
+		"file": "templates/my file.yaml",
+		"argv": [
+			"lint",
+			"__WORKSPACE__"
+		],
+		"version": "4.3.0+gbec5b06",
+		"exitCode": 0,
+		"stdout": "==> Linting __WORKSPACE__\n\n1 chart(s) linted, 0 chart(s) failed\n",
+		"stderr": ""
+	}
+}

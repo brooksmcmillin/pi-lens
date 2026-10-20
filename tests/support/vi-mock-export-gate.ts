@@ -49,37 +49,71 @@ export function unquote(text: string): string | undefined {
 }
 
 /**
- * Semantic mock-call check: the object must be `vi` and the property must be
- * one of `names`, whether written dot (`vi.mock`), bracket (`vi["mock"]` — a
- * `subscript_expression`, not a `member_expression`), or spaced
- * (`vi . mock`). Checking `callee.text() === "vi.mock"` enumerates one surface
- * spelling and misses the others (shape 34); structural fields do not.
- * `names` defaults to `["mock"]`, so the whole-module export gate keeps its
- * existing population; a caller that also owns the non-hoisted `vi.doMock`
- * passes both names instead of re-deriving the structural match.
+ * The module a `vi.mock`/`vi.doMock` call names: a string, a template with no
+ * substitution, or vitest's typed `import("…")` form. Anything else (a
+ * variable, a computed template) is unreadable and returns `undefined`, which
+ * every caller treats as unknown and fails closed on: the flake-shape scan
+ * counts it as an in-process mock, and the project-trust seam ratchet reports
+ * it as an unclassified spelling (#4429).
+ */
+export function mockSpecifier(arg: SgNode | undefined): string | undefined {
+	if (!arg) return undefined;
+	const node = unwrapParens(arg);
+	if (node.kind() === "string") return unquote(node.text());
+	if (node.kind() === "template_string") {
+		return node
+			.children()
+			.some((child) => child.kind() === "template_substitution")
+			? undefined
+			: unquote(node.text());
+	}
+	if (
+		node.kind() === "call_expression" &&
+		node.field("function")?.kind() === "import"
+	) {
+		return mockSpecifier(node.field("arguments")?.namedChildren()[0]);
+	}
+	return undefined;
+}
+
+/**
+ * Vitest's utils object. Vitest hoists `vitest.mock` exactly like `vi.mock`
+ * (`utilsObjectNames = ["vi", "vitest"]` in `@vitest/mocker`'s hoister), so
+ * both names are the object, as globals or imported from `"vitest"`.
+ */
+const VITEST_UTILS: ReadonlySet<string> = new Set(["vi", "vitest"]);
+
+/**
+ * Semantic mock-call check: the callee is one of `names` on vitest's utils
+ * object written directly, `vi` or `vitest` (through parentheses, `as`,
+ * `satisfies` or `!`), with a dot, spaced or literal bracket key
+ * (`vi["mock"]`, a `subscript_expression`). Checking
+ * `callee.text() === "vi.mock"` enumerates one surface spelling and misses
+ * the others (shape 34). It follows no values (an alias, a destructure, a
+ * helper's parameter): the fail-closed consumer, the project-trust seam
+ * ratchet, keys on the mocked specifier instead (#4429 round 3). It reads
+ * the callee alone, so a caller looping over every call pays no per-file
+ * cost (#4457 review F8). `names` defaults to `["mock"]`, so the
+ * whole-module export gate keeps its existing population; a caller that
+ * also owns the non-hoisted `vi.doMock` passes both names.
  */
 export function isViMockCall(
 	callee: SgNode | undefined | null,
 	names: readonly string[] = ["mock"],
 ): boolean {
 	if (!callee) return false;
-	if (callee.kind() === "member_expression") {
-		if (callee.field("object")?.text() !== "vi") return false;
-		const property = callee.field("property");
-		if (!property) return false;
-		const name =
-			property.kind() === "property_identifier"
-				? property.text()
-				: unquote(property.text());
-		return name !== undefined && names.includes(name);
-	}
-	if (callee.kind() === "subscript_expression") {
-		const named = callee.children().filter((child) => child.isNamed());
-		if (named.length < 2 || named[0].text() !== "vi") return false;
-		const name = unquote(named[1].text());
-		return name !== undefined && names.includes(name);
-	}
-	return false;
+	const node = unwrapExpression(callee);
+	const member = node.kind() === "member_expression";
+	if (!member && node.kind() !== "subscript_expression") return false;
+	const object = node.field("object");
+	if (!object) return false;
+	const owner = unwrapExpression(object);
+	if (owner.kind() !== "identifier" || !VITEST_UTILS.has(owner.text()))
+		return false;
+	const key = node.field(member ? "property" : "index") ?? undefined;
+	const name =
+		key?.kind() === "property_identifier" ? key.text() : mockSpecifier(key);
+	return name !== undefined && names.includes(name);
 }
 
 function objectReturns(factory: SgNode): SgNode | undefined {
@@ -105,7 +139,7 @@ function objectReturns(factory: SgNode): SgNode | undefined {
  * a text-only helper cannot carry because the zero-argument and await
  * requirements live on the nodes it returns.
  */
-function unwrapExpression(node: SgNode): SgNode {
+export function unwrapExpression(node: SgNode): SgNode {
 	let current = unwrapParens(node);
 	while (
 		current?.kind() === "as_expression" ||
@@ -209,10 +243,58 @@ function isAwaitedBinding(
 	return false;
 }
 
+/**
+ * `await vi.importActual(spec)` / `await vi.importActual<T>(spec)` for the
+ * SAME module the factory mocks (#4427 review F5): runtime-complete exactly
+ * like the factory-parameter `importOriginal()`. Reuses `isViMockCall` for the
+ * `vi` member match. The generic form arrives misparsed as
+ * `(await vi.importActual) < typeof import(..) > (spec)` comparisons (the
+ * `isMisparsedGenericAwait` grammar quirk), so that spine is read here too.
+ * A spec that names another module is not a pass-through.
+ */
+function isAwaitedViImportActual(node: SgNode, specifier: string): boolean {
+	const unwrapped = unwrapExpression(node);
+	const sameModule = (argument: SgNode | undefined): boolean => {
+		const text = argument ? unquote(argument.text()) : undefined;
+		return text !== undefined && text === specifier;
+	};
+	if (unwrapped.kind() === "await_expression") {
+		const call = namedParts(unwrapped)[0];
+		const operand = call ? unwrapExpression(call) : undefined;
+		if (operand?.kind() !== "call_expression") return false;
+		if (!isViMockCall(operand.field("function"), ["importActual"]))
+			return false;
+		const args = namedParts(operand.field("arguments"));
+		return args.length === 1 && sameModule(args[0]);
+	}
+	if (unwrapped.kind() !== "binary_expression") return false;
+	// Left spine: ... < ... then the trailing `> (spec)`.
+	let current = unwrapped;
+	let sawComparison = false;
+	let trailing: SgNode | undefined;
+	while (current.kind() === "binary_expression") {
+		const operator = current.children().find((child) => !child.isNamed());
+		if (operator?.text() === "<") sawComparison = true;
+		if (operator?.text() === ">" && !trailing)
+			trailing = namedParts(current).at(-1);
+		const left = namedParts(current)[0];
+		if (!left) return false;
+		current = unwrapParens(left);
+	}
+	if (!sawComparison || !trailing || current.kind() !== "await_expression")
+		return false;
+	const awaited = namedParts(current)[0];
+	if (!awaited || !isViMockCall(unwrapExpression(awaited), ["importActual"]))
+		return false;
+	if (trailing.kind() !== "parenthesized_expression") return false;
+	const spec = unwrapParens(trailing);
+	return spec.kind() === "string" && sameModule(spec);
+}
+
 function isSameModulePassThrough(
 	object: SgNode,
 	factory: SgNode,
-	_specifier: string,
+	specifier: string,
 ): boolean {
 	const parameters = factory.field("parameters");
 	const actualBindings = new Set(
@@ -220,7 +302,6 @@ function isSameModulePassThrough(
 			.map((parameter) => parameter.text())
 			.filter((name) => /^(?:importActual|importOriginal)$/.test(name)),
 	);
-	if (actualBindings.size === 0) return false;
 	// Two-statement factories bind the awaited module first:
 	// `const actual = await importOriginal<T>(); return { ...actual };`
 	// Only the factory body's OWN top-level declarations qualify: a binding
@@ -242,7 +323,8 @@ function isSameModulePassThrough(
 				if (
 					name?.kind() === "identifier" &&
 					value &&
-					isAwaitedBinding(value, actualBindings, statement)
+					(isAwaitedBinding(value, actualBindings, statement) ||
+						isAwaitedViImportActual(value, specifier))
 				)
 					awaitedAliases.add(name.text());
 			}
@@ -252,7 +334,11 @@ function isSameModulePassThrough(
 		if (child.kind() !== "spread_element") return false;
 		const content = namedParts(child)[0];
 		if (!content) return false;
-		if (isAwaitedBinding(content, actualBindings, child)) return true;
+		if (
+			isAwaitedBinding(content, actualBindings, child) ||
+			isAwaitedViImportActual(content, specifier)
+		)
+			return true;
 		const target = unwrapExpression(content);
 		return target.kind() === "identifier" && awaitedAliases.has(target.text());
 	});
@@ -561,7 +647,7 @@ function mockedSpecifiers(calls: readonly SgNode[]): Set<string> {
 		const callee = call.field("function");
 		if (!isViMockCall(callee)) continue;
 		const mocked = call.field("arguments")?.namedChildren()[0];
-		const mockedSpecifier = mocked ? unquote(mocked.text()) : undefined;
+		const mockedSpecifier = mockSpecifier(mocked);
 		if (mockedSpecifier) specifiers.add(mockedSpecifier);
 	}
 	return specifiers;
@@ -619,7 +705,7 @@ export function findViMockExportGaps(
 		const callee = call.field("function");
 		if (!isViMockCall(callee)) continue;
 		const args = call.field("arguments")?.namedChildren() ?? [];
-		const specifier = args[0] ? unquote(args[0].text()) : undefined;
+		const specifier = mockSpecifier(args[0]);
 		const rawFactory = args[1];
 		if (!specifier || isSkippedSpecifier(specifier) || !rawFactory) continue;
 		const factory = resolveFactoryNode(rawFactory, root);

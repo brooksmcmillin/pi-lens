@@ -57,7 +57,11 @@ describe("oxlint advisory rule-count floor guard (#2700 review round 2, F2)", ()
 	it("the real job step defines a RULE_FLOOR and compares $rules against it", () => {
 		const run = readStepRun(loadWorkflow());
 		expect(run).toMatch(/RULE_FLOOR=\d+/);
-		expect(run).toMatch(/"\$rules"\s+-lt\s+"\$RULE_FLOOR"/);
+		// #4518: the compare is the shared helper's, not a shell `-lt`.
+		expect(run).toMatch(
+			/assert-evaluated\.mjs --count "oxlint-rules=\$\{rules\}" --floor "\$RULE_FLOOR"/,
+		);
+		expect(run).not.toMatch(/-lt\s+"\$RULE_FLOOR"/);
 	});
 
 	it("breaching the floor emits a named ::error:: annotation and fails the step", () => {

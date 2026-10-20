@@ -1,5 +1,11 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import nodeFs, {
+	existsSync,
+	readdirSync,
+	readFileSync,
+	writeFileSync,
+} from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -259,23 +265,103 @@ describe("removeTempDirSync under a live writer", () => {
 		cleanup();
 	}, 15_000);
 
-	// Recurrence: a teardown that blocks the worker for as long as a writer
-	// lives. The writer outlives the 2 s budget; removal gives up with one
-	// diagnostic and never throws into the test.
-	it("gives up with one diagnostic when the writer outlives the budget", async () => {
+	// Recurrence (#4349): the give-up path was driven by a real writer that had
+	// to outlive the budget, so a starved writer let the first rmSync pass win
+	// and the one-diagnostic assertion failed on CI (master run 38144066641,
+	// PR #4341 run 115473062346). The directory's removal is made to fail the
+	// way a busy directory does, so the path is reached on every run.
+	const RUNAWAY_PASSES = 150;
+	const restoreFs: Array<() => void> = [];
+	afterEach(() => {
+		for (const restore of restoreFs.splice(0)) restore();
+	});
+	/** Make the first `failures` rmSync passes over `dir` throw `code`; return the pass count. */
+	function failRemoval(
+		dir: string,
+		code: string,
+		failures: number,
+	): () => number {
+		const real = nodeFs.rmSync;
+		let passes = 0;
+		nodeFs.rmSync = ((target, options) => {
+			if (target !== dir) return real(target, options);
+			// A removal loop that lost its deadline retries for ever and hangs the
+			// worker (exit 124). A pass far past the expected ~40 throws an error
+			// with no retryable code, so the loop ends and the pass-count
+			// assertion below fails by name instead.
+			if (++passes > RUNAWAY_PASSES)
+				throw new Error(
+					`runaway removal loop: pass ${passes} past the 2 s budget`,
+				);
+			if (passes <= failures)
+				throw Object.assign(new Error(`${code}: directory busy`), { code });
+			return real(target, options);
+		}) as typeof nodeFs.rmSync;
+		syncBuiltinESMExports();
+		restoreFs.push(() => {
+			nodeFs.rmSync = real;
+			syncBuiltinESMExports();
+		});
+		return () => passes;
+	}
+	function dirWithFile(): { tmpDir: string; cleanup: () => void } {
+		const env = setupTestEnvironment("pi-lens-rm-giveup-");
+		writeFileSync(path.join(env.tmpDir, "f"), "x");
+		return env;
+	}
+
+	it("gives up once, bounded and without throwing, when every removal pass fails", () => {
 		const write = vi
 			.spyOn(process.stderr, "write")
 			.mockImplementation(() => true);
-		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-rm-writer-");
-		await startWriter(tmpDir, 8_000);
+		const { tmpDir, cleanup } = dirWithFile();
+		const passes = failRemoval(tmpDir, "ENOTEMPTY", Infinity);
 		expect(() => removeTempDirSync(tmpDir)).not.toThrow();
+		// Retried (not one-shot) and bounded: a 2 s budget at a 50 ms retry is
+		// about 40 passes, and 100 leaves room for a run that is not slow.
+		expect(passes()).toBeGreaterThan(1);
+		expect(
+			passes(),
+			"removeTempDirSync kept retrying past its 2 s budget (deadline guard regressed)",
+		).toBeLessThan(100);
+		expect(existsSync(tmpDir)).toBe(true);
 		expect(write).toHaveBeenCalledTimes(1);
 		expect(String(write.mock.calls[0]?.[0])).toContain(
-			"[test cleanup] could not remove temp dir",
+			`[test cleanup] could not remove temp dir ${tmpDir}`,
 		);
-		for (const child of stray.splice(0)) child.kill("SIGKILL");
+		restoreFs.splice(0).forEach((restore) => restore());
+		write.mockClear();
 		cleanup();
+		expect(existsSync(tmpDir)).toBe(false);
+		expect(write).not.toHaveBeenCalled();
 	}, 15_000);
+
+	it("gives up at once on an error that is not transient", () => {
+		const write = vi
+			.spyOn(process.stderr, "write")
+			.mockImplementation(() => true);
+		const { tmpDir, cleanup } = dirWithFile();
+		const passes = failRemoval(tmpDir, "EACCES", Infinity);
+		expect(() => removeTempDirSync(tmpDir)).not.toThrow();
+		expect(passes()).toBe(1);
+		expect(write).toHaveBeenCalledTimes(1);
+		restoreFs.splice(0).forEach((restore) => restore());
+		write.mockClear();
+		cleanup();
+	});
+
+	it("removes the directory with no diagnostic when removal succeeds after transient failures", () => {
+		const write = vi
+			.spyOn(process.stderr, "write")
+			.mockImplementation(() => true);
+		const { tmpDir, cleanup } = dirWithFile();
+		const passes = failRemoval(tmpDir, "EBUSY", 3);
+		removeTempDirSync(tmpDir);
+		expect(passes()).toBe(4);
+		expect(existsSync(tmpDir)).toBe(false);
+		expect(write).not.toHaveBeenCalled();
+		cleanup();
+	});
 });
 
 // A root with a detached leaf and a mid-tree shell that starts three sleepers

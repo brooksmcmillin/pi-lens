@@ -501,3 +501,203 @@ describe("FactStore file-fact bound (#2240)", () => {
 		expect(subjects[0]).toBe("emit-subject");
 	});
 });
+
+// #4365 rotation batch 1: survivors of the per-module Stryker campaign. Every
+// case drives the real FactStore; each comment names the mutants it kills.
+describe("FactStore accounting and pin survivors (#4365)", () => {
+	const keep = "/repo/src/survivor-keep.ts";
+	const content100 = contentOfBytes(100);
+
+	it("counts only file.content toward the retained byte total, on write and on delete", () => {
+		// Kills `factId === "file.content"` forced true in setFileFact and in
+		// deleteFileFact: a string-valued fact under any other id was weighed as
+		// content, inflating the byte budget that drives eviction.
+		const store = new FactStore();
+		store.setFileFact(keep, "other.fact", "not file content at all");
+		expect(store.getRetainedContentBytes()).toBe(0);
+
+		store.setFileFact(keep, "file.content", contentOfBytes(5));
+		store.deleteFileFact(keep, "other.fact");
+
+		expect(store.getRetainedContentBytes()).toBe(5);
+	});
+
+	it("tolerates deleting, dropping or clearing a file it has never seen", () => {
+		// Kills the `!facts` guards forced false in deleteFileFact and
+		// deleteFileFactsRecord (a TypeError on `facts.get` for an unseen path).
+		const store = new FactStore();
+		expect(() =>
+			store.deleteFileFact("/repo/src/never-a.ts", "x"),
+		).not.toThrow();
+		expect(() => store.dropFileFacts("/repo/src/never-b.ts")).not.toThrow();
+		expect(() => store.clearFileFactsFor("/repo/src/never-c.ts")).not.toThrow();
+	});
+
+	it("keeps the pinned byte total exact when a pinned file's content is deleted or its record cleared", () => {
+		// Kills `this.pinnedFiles.has(key)` forced false in deleteFileFact and in
+		// deleteFileFactsRecord, and their `-=` turned `+=` (both were uncovered):
+		// the pinned total fed the pinned-over-budget decision and drifted.
+		const store = new FactStore();
+		store.beginDispatchFor(keep);
+		store.setFileFact(keep, "file.content", content100);
+		expect(store.getPinnedContentBytes()).toBe(100);
+
+		store.deleteFileFact(keep, "file.content");
+		expect(store.getPinnedContentBytes()).toBe(0);
+		expect(store.getRetainedContentBytes()).toBe(0);
+
+		store.setFileFact(keep, "file.content", content100);
+		// A second, overlapping dispatch of the same pinned file clears its record.
+		store.clearFileFactsFor(keep);
+		expect(store.getPinnedContentBytes()).toBe(0);
+		expect(store.getRetainedContentBytes()).toBe(0);
+	});
+
+	it("frees a file's record slot when its last fact is deleted", () => {
+		// Kills `facts.size === 0` forced false and `this.fileFacts.delete(key)`
+		// removed in deleteFileFact: an emptied record kept counting toward the
+		// 1024-record cap, so refilling the store evicted live files.
+		const reports: string[] = [];
+		setFactStoreEvictionReporter((_subject, axis) => reports.push(axis));
+		const store = new FactStore();
+		const first = batchPaths("slot-first", MAX_RECORDS);
+		for (const p of first) store.setFileFact(p, "only.fact", 1);
+		for (const p of first) store.deleteFileFact(p, "only.fact");
+
+		const second = batchPaths("slot-second", MAX_RECORDS);
+		for (const p of second) store.setFileFact(p, "file.content", "x");
+
+		expect(reports).toEqual([]);
+		expect(retained(store, second)).toBe(MAX_RECORDS);
+	});
+
+	it("holds an overlapped pin until the LAST dispatch ends, and counts its content once", () => {
+		// Kills pinFile `count === 0` forced true (content counted again for the
+		// second dispatch), `count + 1` turned `count - 1` (the refcount never
+		// reached 2), and unpinFile `count <= 1` forced true (the first end
+		// released a pin the second dispatch still holds).
+		const store = new FactStore();
+		store.setFileFact(keep, "file.content", content100);
+		store.beginDispatchFor(keep);
+		store.beginDispatchFor(keep);
+		expect(store.getPinnedContentBytes()).toBe(100);
+
+		store.endDispatchFor(keep);
+		for (const p of batchPaths("overlap-a", MAX_RECORDS + 100))
+			store.setFileFact(p, "file.content", "x");
+		expect(store.hasFileFact(keep, "file.content")).toBe(true);
+		expect(store.getPinnedContentBytes()).toBe(100);
+
+		store.endDispatchFor(keep);
+		expect(store.getPinnedContentBytes()).toBe(0);
+		for (const p of batchPaths("overlap-b", MAX_RECORDS + 100))
+			store.setFileFact(p, "file.content", "x");
+		expect(store.hasFileFact(keep, "file.content")).toBe(false);
+	});
+
+	it("ignores endDispatchFor for a file that was never pinned", () => {
+		// Kills unpinFile `count === undefined` forced false: the missing count
+		// became NaN and pinned the file for good, exempting it from the cap.
+		const store = new FactStore();
+		store.setFileFact(keep, "file.content", content100);
+		store.endDispatchFor(keep);
+
+		for (const p of batchPaths("never-pinned", MAX_RECORDS + 100))
+			store.setFileFact(p, "file.content", "x");
+
+		expect(store.hasFileFact(keep, "file.content")).toBe(false);
+	});
+
+	it("still enforces the record cap while pinned content alone is over the byte budget, with no reporter wired", () => {
+		// Kills `axis === "bytes"` forced true in evictColdFileFacts (the pinned
+		// guard fired on the COUNT axis too, so no record was ever evicted), and
+		// `capacityEvictionReporter?.(...)` made unconditional in
+		// reportPinnedOverBudget (a TypeError once pinned bytes alone exceed the
+		// budget and nothing is wired).
+		setFactStoreEvictionReporter(undefined);
+		const store = new FactStore();
+		const pinned = "/repo/src/survivor-pinned-big.ts";
+		store.clearFileFactsFor(pinned);
+		store.setFileFact(pinned, "file.content", contentOfBytes(65 * MIB));
+
+		const normal = batchPaths("pinned-pressure", MAX_RECORDS + 100);
+		for (const p of normal) store.setFileFact(p, "file.content", "x");
+
+		expect(store.hasFileFact(pinned, "file.content")).toBe(true);
+		expect(retained(store, normal)).toBeLessThanOrEqual(MAX_RECORDS - 1);
+	});
+
+	it("treats pinned content of exactly the byte budget as within budget", () => {
+		// Kills `pinnedContentBytesTotal > MAX` turned `>=`: exactly 64 MiB pinned
+		// is not over budget, so a cold unpinned record must still be evicted
+		// instead of the store giving up on eviction.
+		const store = new FactStore();
+		const pinned = "/repo/src/survivor-pinned-exact.ts";
+		store.clearFileFactsFor(pinned);
+		store.setFileFact(pinned, "file.content", contentOfBytes(64 * MIB));
+		const cold = "/repo/src/survivor-cold.ts";
+
+		store.setFileFact(cold, "file.content", "tiny");
+
+		expect(store.hasFileFact(pinned, "file.content")).toBe(true);
+		expect(store.hasFileFact(cold, "file.content")).toBe(false);
+	});
+
+	it("retains unpinned content of exactly the byte budget, and evicts one byte more", () => {
+		// Kills `retainedContentBytes > MAX` turned `>=` in overCapacity.
+		const store = new FactStore();
+		const exact = "/repo/src/survivor-exact.ts";
+		store.setFileFact(exact, "file.content", contentOfBytes(64 * MIB));
+		expect(store.hasFileFact(exact, "file.content")).toBe(true);
+
+		store.setFileFact("/repo/src/survivor-one-more.ts", "file.content", "x");
+		expect(store.hasFileFact(exact, "file.content")).toBe(false);
+	});
+
+	it("names the bytes axis when the store holds exactly the record cap and is over the byte budget", () => {
+		// Kills `fileFacts.size > MAX_FILE_FACT_RECORDS` turned `>=` in
+		// capacityAxis: at exactly 1024 records the pressure is bytes, and the
+		// ledger row (and its once-per-session slot) must say so.
+		const axes: string[] = [];
+		setFactStoreEvictionReporter((_subject, axis) => axes.push(axis));
+		const store = new FactStore();
+		for (const p of batchPaths("axis-small", MAX_RECORDS - 1))
+			store.setFileFact(p, "file.content", "x");
+
+		store.setFileFact(
+			"/repo/src/survivor-axis-big.ts",
+			"file.content",
+			contentOfBytes(65 * MIB),
+		);
+
+		expect(axes[0]).toBe("bytes");
+	});
+
+	it("leaves no phantom record behind when a path it never stored is read", () => {
+		// Kills `!facts` forced false in touchFileFacts (campaign id 61): a read
+		// miss re-inserted `undefined` under the key, so the lone read of a missing
+		// path counted as a record and pushed the oldest real file out at the cap.
+		const store = new FactStore();
+		const paths = batchPaths("phantom", MAX_RECORDS);
+		for (const p of paths) store.setFileFact(p, "file.content", "x");
+
+		expect(
+			store.getFileFact("/repo/src/never-stored.ts", "file.content"),
+		).toBeUndefined();
+		store.setFileFact(paths[MAX_RECORDS - 1] as string, "other.fact", 1);
+
+		expect(store.hasFileFact(paths[0] as string, "file.content")).toBe(true);
+	});
+
+	it("labels an unnamed store's eviction record with the default subject", () => {
+		// Kills the constructor default `"session-fact-store"` emptied: the ledger
+		// dedupes on kind + subject, so an empty subject merges unrelated stores.
+		const subjects: string[] = [];
+		setFactStoreEvictionReporter((subject) => subjects.push(subject));
+		const store = new FactStore();
+		for (const p of batchPaths("default-subject", MAX_RECORDS + 1))
+			store.setFileFact(p, "file.content", "x");
+
+		expect(subjects[0]).toBe("session-fact-store");
+	});
+});

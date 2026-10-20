@@ -39,7 +39,15 @@ describe("git fixture environment", () => {
 			const env = gitFixtureEnv("C:/fixture");
 			for (const variable of SCRUBBED_GIT_VARIABLES)
 				expect(env[variable], variable).toBeUndefined();
-			expect(env.GIT_CONFIG_GLOBAL).toBe(path.join("C:/fixture", "gitconfig"));
+			expect(env.GIT_CONFIG_GLOBAL).toBe(
+				path.resolve(
+					import.meta.dirname,
+					"../fixtures/git-fixture-global.gitconfig",
+				),
+			);
+			// The policy is the checked-in file, not a path a fixture writes: it
+			// must exist, or git ignores it and auto-maintenance returns (#4552).
+			expect(fs.existsSync(env.GIT_CONFIG_GLOBAL)).toBe(true);
 			expect(env.GIT_CONFIG_NOSYSTEM).toBe("1");
 		} finally {
 			for (const variable of SCRUBBED_GIT_VARIABLES) {

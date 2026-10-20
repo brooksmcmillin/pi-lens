@@ -73,7 +73,7 @@ function makeDeps(ctxCwd: string, dbg: (msg: string) => void = () => {}) {
 			isCurrentSession: () => true,
 			markStartupScanInFlight: () => {},
 			clearStartupScanInFlight: () => {},
-			complexityBaselines: new Map(),
+			complexityBaselines: new Set(),
 			resetForSession: () => {},
 			projectRoot: "",
 			projectRulesScan: { hasCustomRules: false, rules: [] },

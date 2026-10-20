@@ -1,13 +1,28 @@
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { assertEvaluated } from "./lib/assert-evaluated.mjs";
 
 export const COMPLEXITY_FUNCTION_THRESHOLD = 15;
 export const COMPLEXITY_FILE_SIZE_THRESHOLD = 1000;
 
+/**
+ * The fewest source files a healthy run analyses. 521 of 521 under clients/,
+ * tools/ and mcp/ at 86336d00a (tests/fixtures/nightly-floors/measurements.json
+ * holds the command and output); a run that loses its grammars analyses none,
+ * and one that loses a directory analyses far fewer. The floor sits at about
+ * 85% of the measurement so deleting files never reds it. A report of "no
+ * hotspots" over a handful of files is not a clean report (#4518).
+ */
+export const COMPLEXITY_ANALYZED_FILES_FLOOR = 440;
+
 export function requireAnalyzedFiles(results) {
-	if (results.length === 0)
-		throw new Error("complexity analysis produced zero analyzed files");
+	const verdict = assertEvaluated({
+		producer: "complexity-report",
+		evaluated: results.length,
+		expectedAtLeast: COMPLEXITY_ANALYZED_FILES_FLOOR,
+	});
+	if (!verdict.ok) throw new Error(`complexity analysis ${verdict.reason}`);
 }
 
 export function shapeComplexityReport(results, options = {}) {
@@ -116,6 +131,7 @@ async function main() {
 			});
 	}
 	requireAnalyzedFiles(results);
+	console.error(`[evaluated] complexity-report: ${results.length}`);
 	const report = shapeComplexityReport(results, {
 		topN: Number(process.env.COMPLEXITY_TOP_N) || 20,
 	});

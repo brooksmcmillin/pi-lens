@@ -51,6 +51,3 @@ export function formatSummary(
 		priorityCoverage?: PriorityCoverage;
 	},
 ): string;
-export function defaultFetcher(
-	token: string,
-): (url: string, init?: RequestInit) => Promise<Response>;

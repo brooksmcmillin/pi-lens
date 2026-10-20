@@ -94,6 +94,8 @@ export type SuccessfulClassifierRun = ClassifierDecision & {
 	jobId: number;
 	jobName: string;
 	supersededByCommentId?: number;
+	// One line when a PR comment write was refused (#4382).
+	commentWarning?: string;
 };
 export type SkippedClassifierRun = {
 	skipped: true;

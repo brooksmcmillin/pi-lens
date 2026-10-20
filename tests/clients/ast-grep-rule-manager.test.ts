@@ -58,8 +58,14 @@ function inNextCycle<T>(fn: () => T): T {
 
 beforeEach(() => {
 	tmpDirs = [];
-	vi.mocked(fs.readdirSync).mockClear();
-	vi.mocked(fs.existsSync).mockClear();
+	// Recurrence (#4561, shuffle seed 202): `mockClear()` keeps the previous
+	// case's implementation, and `restoreAllMocks()` only restores `vi.spyOn`
+	// spies — not the `vi.fn` mocks this file's `vi.mock("node:fs")` factory
+	// created. One case's `mockReturnValue(false)` therefore made every later
+	// health check see an absent rule dir. `mockReset()` puts back the factory's
+	// original implementation (the real fs function).
+	vi.mocked(fs.readdirSync).mockReset();
+	vi.mocked(fs.existsSync).mockReset();
 	_resetRuleCorpusCycleFingerprintsForTests();
 });
 

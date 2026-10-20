@@ -5,7 +5,8 @@ Read the engineering principles (in your global instructions; vendored at
 starting with its "Recurring defect shapes". Claude Code does not load
 AGENTS.md automatically; this file carries only what precedes that read.
 
-- `npm run build` before any test run; tests execute the compiled twins.
+- `npm run build` before any test run; tests execute the compiled twins
+  (`npm run build:dist` too for the census files that read `dist/`).
 - `scripts/hooks/guard-bash.mjs` (`PreToolUse`) denies `git stash`, hook
   bypasses, and the rest of AGENTS.md "Contributing". Fix the command; never
   route around it.

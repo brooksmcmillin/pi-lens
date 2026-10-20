@@ -237,6 +237,21 @@ describe("evaluateWorkflowRunEvidence: the quoted branch run (#3085)", () => {
 		).toHaveLength(1);
 	});
 
+	// Recurrence (#4565): this rule carried its own copy of the comment-end
+	// rule, recognising `-->` alone, so a body whose comment GitHub closed at
+	// `--!>` or `<!-->` read as hidden and its real evidence was rejected.
+	it.each([
+		["--!>", "<!-- note: keep --!>"],
+		["<!-->", "<!-->"],
+		["<!--->", "<!--->"],
+	])("accepts evidence after a comment GitHub closes at %s", (_name, open) => {
+		expect(
+			run(
+				`${open} gh workflow run stryker-nightly.yml --ref test/x\nhttps://github.com/o/r/actions/runs/12345678901`,
+			),
+		).toEqual([]);
+	});
+
 	// Recurrence: PR #4020 round 1 accepted any prose after the dash, so an
 	// edit of executable steps cleared the rule. The declaration is accepted only
 	// when the check can verify it: no workflow_dispatch trigger, or an edit of

@@ -20,6 +20,7 @@ import { resolve } from "node:path";
 import yaml from "../../clients/deps/js-yaml.js";
 import { setupTestEnvironment } from "../clients/test-utils.js";
 import { gitExecFileSync } from "../support/git-fixture-env.js";
+import { siblingPin } from "../support/sibling-pin.js";
 import { assertNonEmptyScan } from "../support/sweep-kit.js";
 import { provesNotPullRequestEligible } from "../support/workflow-pull-request-reachability.js";
 import {
@@ -32,9 +33,10 @@ import { DEFAULT_DEADLINE_SECONDS } from "../../scripts/ci-heavy-gate.mjs";
 
 const byCodeUnit = (a = "", b = "") => (a < b ? -1 : a > b ? 1 : 0);
 
-// #3801: the heavy advisory jobs (CodeQL, the Windows Vitest subset) start
-// only after the required checks passed on the same head. Each case names the
-// regression it keeps out; the real YAML is loaded, never a source regex.
+// #3801: the heavy advisory jobs (CodeQL) start only after the required checks
+// passed on the same head. Each case names the regression it keeps out; the real
+// YAML is loaded, never a source regex. #4518 promoted the Windows Vitest subset
+// out of this gate, so it has its own contract in windows-vitest-workflow.test.ts.
 
 const ROOT = resolve(import.meta.dirname, "../..");
 
@@ -127,8 +129,11 @@ const gated = Object.entries(CI.jobs).filter(
 const WORKFLOW_DIR = resolve(ROOT, ".github/workflows");
 const EPHEMERAL_PULL_REF = "${{ github.ref }}";
 const CAPTURED_COMMIT = "${{ github.sha }}";
-const PINNED_CHECKOUT =
-	"actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1";
+// Recurrence #4418/#4421: a literal pin goes stale on every Dependabot bump of
+// the action. Derive it from ci.yml's other jobs (called inside a test, because
+// siblingPin asserts).
+const pinnedCheckout = () =>
+	siblingPin(CI.jobs, "actions/checkout", "heavy-gate");
 
 type Stage = "A" | "B" | "C" | "D" | "gate";
 type CensusRow = {
@@ -337,12 +342,12 @@ function censusPins(
 }
 
 const PINNED_PRINT = [
-	"expect(CENSUS_SITES.length).toBe(69);",
-	'expect(CENSUS_ROWS.filter((row) => row.stage !== "gate").length).toBe(75);',
-	'expect(stageJobs("A")).toBe(25);',
-	'expect(stageJobs("B")).toBe(3);',
-	'expect(stageJobs("C")).toBe(14);',
-	'expect(stageJobs("D")).toBe(33);',
+	"expect(CENSUS_SITES.length).toBe(78);",
+	'expect(CENSUS_ROWS.filter((row) => row.stage !== "gate").length).toBe(84);',
+	'expect(stageJobs("A")).toBe(28);',
+	'expect(stageJobs("B")).toBe(2);',
+	'expect(stageJobs("C")).toBe(17);',
+	'expect(stageJobs("D")).toBe(37);',
 	"expect(CENSUS_SITES.filter((site) => site.ref !== undefined).length).toBe(21);",
 	"expect(CENSUS_SITES.filter((site) => site.ref === EPHEMERAL_PULL_REF).length).toBe(17);",
 	'expect(stageRefs("A")).toBe(16);',
@@ -352,7 +357,7 @@ const PINNED_PRINT = [
 // Snapshot identities make a pin failure actionable. Counts alone say that a
 // row moved; these keys say which job added or removed it.
 const PINNED_ROW_KEYS =
-	"action-pins.yml::check::A|ci-infra-kill-rerun.yml::clear-stale-verdict-labels::A|ci-infra-kill-rerun.yml::classify::A|ci-infra-kill-rerun.yml::finalize-rerun::A|ci.yml::changes::C|ci.yml::strict-install-cold-cache::A|ci.yml::dependency-boundaries::A|ci.yml::changelog-fragment-fastfail::A|ci.yml::tla-shards::A|ci.yml::tla-models::A|ci.yml::lint-and-typecheck::A|ci.yml::targeted-tests-advisory::C|ci.yml::test::A|ci.yml::unit-tests::A|ci.yml::heavy-gate::gate|ci.yml::unit-tests-windows::B|ci.yml::prod-install-build::A|ci.yml::install-test::A|ci.yml::codeql::B|ci.yml::mutation::B|ci.yml::mutation-comment::C|close-keyword-verification.yml::verify::D|codeql.yml::analyze::D|codeql.yml::upload::D|compat-smoke.yml::compat-smoke::D|compat-smoke.yml::compat-smoke-alert::D|grammar-health.yml::guard::D|grammar-health.yml::swift-crash-watch::D|greetings.yml::greeting::D|install-smoke.yml::smoke::A|install-smoke.yml::npm-strict::A|install-smoke.yml::pi-load::A|install-smoke.yml::mise-repro::C|install-smoke.yml::host-range-smoke::A|install-smoke.yml::host-latest-smoke::D|install-smoke.yml::host-latest-notify::C|labels.yml::sync::D|lifecycle-smoke.yml::psscriptanalyzer-classification::D|lifecycle-smoke.yml::availability-lifecycle::D|lifecycle-smoke.yml::gitleaks-scratch-exclusion::D|lint.yml::actionlint::A|lint.yml::oxfmt::A|lint.yml::knip::A|lint.yml::markdownlint::A|lint.yml::vale::C|lint.yml::oxlint-advisory::C|lint.yml::jscpd::C|lint.yml::complexity::C|lint.yml::strictness::C|lint.yml::yamllint::C|lint.yml::typos::C|lint.yml::taplo::C|osv-scan.yml::detect-lockfile-change::A|osv-scan.yml::osv-scan::C|parser-smoke.yml::parser-smoke::D|pr-metadata.yml::pr-title-lint::A|pr-metadata.yml::close-keyword-lint::A|release.yml::prepare::D|release.yml::release::D|release.yml::publish-npm::D|stale-open-issues.yml::detect::D|stale.yml::stale::D|stryker-nightly.yml::prepare::D|stryker-nightly.yml::mutate::D|stryker-nightly.yml::publish::D|stryker-nightly.yml::publish-issue::D|tool-smoke.yml::test-history-rollup::D|tool-smoke.yml::test-history-publish::D|tool-smoke.yml::test-history-notify::D|tool-smoke.yml::tool-smoke::D|tool-smoke.yml::tool-smoke-prs::D|tool-smoke.yml::tool-smoke-notify::D|tool-smoke.yml::snapshot-persist-bench::D|tool-smoke.yml::snapshot-persist-notify::D|untriaged-issues.yml::detect::D|upstream-sync.yml::propose::D".split(
+	"action-pins.yml::check::A|cache-prune.yml::plan::A|cache-prune.yml::prune::A|ci-infra-kill-rerun.yml::clear-stale-verdict-labels::A|ci-infra-kill-rerun.yml::classify::A|ci-infra-kill-rerun.yml::finalize-rerun::A|ci.yml::changes::C|ci.yml::strict-install-cold-cache::A|ci.yml::dependency-boundaries::A|ci.yml::changelog-fragment-fastfail::A|ci.yml::tla-shards::A|ci.yml::tla-models::A|ci.yml::lint-and-typecheck::A|ci.yml::targeted-tests-advisory::C|ci.yml::test::A|ci.yml::unit-tests::A|ci.yml::heavy-gate::gate|ci.yml::unit-tests-windows::A|ci.yml::prod-install-build::A|ci.yml::install-test::A|ci.yml::codeql::B|ci.yml::mutation::B|ci.yml::mutation-comment::C|close-keyword-verification.yml::verify::D|codeql.yml::analyze::D|codeql.yml::upload::D|compat-smoke.yml::compat-smoke::D|compat-smoke.yml::compat-smoke-alert::D|grammar-health.yml::guard::D|grammar-health.yml::swift-crash-watch::D|greetings.yml::greeting::D|hot-path-latency.yml::latency::C|install-smoke.yml::scope::C|install-smoke.yml::smoke::A|install-smoke.yml::npm-strict::A|install-smoke.yml::pi-load::A|install-smoke.yml::lsp-handshake::C|install-smoke.yml::mise-repro::C|install-smoke.yml::host-range-smoke::A|install-smoke.yml::host-latest-smoke::D|install-smoke.yml::host-latest-notify::C|labels.yml::sync::D|lifecycle-smoke.yml::psscriptanalyzer-classification::D|lifecycle-smoke.yml::availability-lifecycle::D|lifecycle-smoke.yml::gitleaks-scratch-exclusion::D|lint.yml::actionlint::A|lint.yml::oxfmt::A|lint.yml::knip::A|lint.yml::markdownlint::A|lint.yml::vale::C|lint.yml::oxlint-advisory::C|lint.yml::jscpd::C|lint.yml::complexity::C|lint.yml::strictness::C|lint.yml::yamllint::C|lint.yml::typos::C|lint.yml::taplo::C|osv-scan.yml::detect-lockfile-change::A|osv-scan.yml::osv-scan::C|parser-smoke.yml::parser-smoke::D|pr-metadata.yml::pr-title-lint::A|pr-metadata.yml::close-keyword-lint::A|release.yml::prepare::D|release.yml::release::D|release.yml::publish-npm::D|shuffle-census-nightly.yml::census::D|shuffle-census-nightly.yml::confirm-report::D|shuffle-census-nightly.yml::publish-issue::D|stale-open-issues.yml::detect::D|stale.yml::stale::D|stryker-nightly.yml::prepare::D|stryker-nightly.yml::mutate::D|stryker-nightly.yml::publish::D|stryker-nightly.yml::publish-issue::D|stryker-pertest.yml::mutate::D|tool-smoke.yml::test-history-rollup::D|tool-smoke.yml::test-history-publish::D|tool-smoke.yml::test-history-notify::D|tool-smoke.yml::tool-smoke::D|tool-smoke.yml::tool-smoke-prs::D|tool-smoke.yml::tool-smoke-notify::D|tool-smoke.yml::snapshot-persist-bench::D|tool-smoke.yml::snapshot-persist-notify::D|untriaged-issues.yml::detect::D|upstream-sync.yml::propose::D".split(
 		"|",
 	);
 const PINNED_NO_CHECKOUT_KEYS = new Set([
@@ -499,8 +504,7 @@ describe("#3801 heavy advisory jobs wait for the required checks", () => {
 	});
 
 	// Recurrence (#3801 docs-only scope): a gate that starts on a docs-only diff
-	// would launch CodeQL and the Windows run for a change the maintainer wants
-	// spared them. And a status function in the gate's `if` (always(),
+	// would launch CodeQL for a change the maintainer wants spared it. And a status function in the gate's `if` (always(),
 	// cancelled(), failure()) would replace the implicit success() over its
 	// needs, releasing the heavy jobs on a head whose required job is red.
 	it("starts only for a code diff, and only when every needed job succeeded", () => {
@@ -614,7 +618,6 @@ describe("#3801 heavy advisory jobs wait for the required checks", () => {
 		expect(gated.map(([id]) => id).sort(byCodeUnit)).toEqual([
 			"codeql",
 			"mutation",
-			"unit-tests-windows",
 		]);
 		expect(existsSync(resolve(ROOT, ".github/workflows/mutation.yml"))).toBe(
 			false,
@@ -661,8 +664,21 @@ describe("#3926 a gated checkout pins the captured commit, never the merge ref",
 		expect(offenders).toEqual([]);
 	});
 
-	// Positive pin: the one site #3807/#3924 proved red now uses the default.
-	it("uses the captured commit on unit-tests-windows", () => {
+	// Positive pin: the site #3807/#3924 proved red is CodeQL, the one job that
+	// still starts after the gate.
+	it("uses the captured commit on codeql", () => {
+		expect(checkoutRefs("codeql")).not.toContain("${{ github.ref }}");
+		expect(
+			checkoutRefs("codeql").every(
+				(ref) => ref === undefined || ref === "${{ github.sha }}",
+			),
+		).toBe(true);
+	});
+
+	// #4518: `unit-tests-windows` left stage B, but its checkout keeps the
+	// default (`github.sha`), so promotion did not trade a deleted merge ref for
+	// a required row that cannot find its tree.
+	it("keeps the promoted Windows job's checkout on the captured commit", () => {
 		expect(checkoutRefs("unit-tests-windows")).not.toContain(
 			"${{ github.ref }}",
 		);
@@ -679,9 +695,7 @@ describe("#3926 a gated checkout pins the captured commit, never the merge ref",
 		for (const [id, job] of gated) {
 			for (const step of job.steps ?? []) {
 				if (!step.uses?.startsWith("actions/checkout@")) continue;
-				expect(step.uses, `${id} checkout revision`).toBe(
-					"actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-				);
+				expect(step.uses, `${id} checkout revision`).toBe(pinnedCheckout());
 			}
 		}
 	});
@@ -693,7 +707,7 @@ describe("#3926 a gated checkout pins the captured commit, never the merge ref",
 // `refs/pull/<n>/merge` that `github.ref` names. This is the separate producer
 // the gate-based #3926 rule cannot cover. No field incident is claimed on
 // these eleven: the failure class is proven by the same pinned checkout
-// source contract (`actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1`,
+// source contract (the pinned `actions/checkout` revision ci.yml's other jobs use,
 // asserted below) and the real deleted-ref / captured-SHA witness in the
 // #3926 block; the production failure (#3926) is the same checkout mechanism
 // on the one gated Windows site. The rule folds onto the shared census, so a
@@ -772,7 +786,7 @@ describe("#3941 early-start advisory checkouts pin the captured commit", () => {
 			`    name: ${jobName}`,
 			"    runs-on: ubuntu-latest",
 			"    steps:",
-			`      - uses: ${PINNED_CHECKOUT} # v7`,
+			`      - uses: ${pinnedCheckout()} # v7`,
 			"        with:",
 			refLine,
 			"          persist-credentials: false",
@@ -803,22 +817,24 @@ describe("#3941 early-start advisory checkouts pin the captured commit", () => {
 		// non-pull_request, and its name is advisory, so it is stage C). Sites and jobs are counted separately so a no-checkout
 		// job cannot launder a stage's population. The floor call keeps this
 		// census registered under the sweep-floor meta-sweep: an empty walk fails
-		// instead of reading clean.
+		// instead of reading clean. #4518 moved ci.yml's `unit-tests-windows` from
+		// B to A (the advisory suffix and `needs: heavy-gate` both went), so A
+		// grew by one row and B shrank by one. No checkout site moved.
 		assertNonEmptyScan(
 			"early-start advisory checkout census",
 			CENSUS_SITES.length,
-			69,
+			78,
 		);
-		pinnedNumber("checkout sites", CENSUS_SITES.length, 69);
+		pinnedNumber("checkout sites", CENSUS_SITES.length, 78);
 		pinnedNumber(
 			"non-gate job rows",
 			CENSUS_ROWS.filter((row) => row.stage !== "gate").length,
-			75,
+			84,
 		);
-		pinnedNumber("stage A rows", stageJobs("A"), 25);
-		pinnedNumber("stage B rows", stageJobs("B"), 3);
-		pinnedNumber("stage C rows", stageJobs("C"), 14);
-		pinnedNumber("stage D rows", stageJobs("D"), 33);
+		pinnedNumber("stage A rows", stageJobs("A"), 28);
+		pinnedNumber("stage B rows", stageJobs("B"), 2);
+		pinnedNumber("stage C rows", stageJobs("C"), 17);
+		pinnedNumber("stage D rows", stageJobs("D"), 37);
 		// The gate's own checkout is its own stage and is excluded from A-D.
 		pinnedNumber("gate checkout sites", summary.get("gate")?.sites ?? 0, 1);
 		// #3941 F1: the schedule/dispatch-only advisory job is NOT early-start,
@@ -844,7 +860,7 @@ describe("#3941 early-start advisory checkouts pin the captured commit", () => {
 		// Recurrence (#4068 F-4068-1): a newly added checkout job was present only
 		// in the actual census, so the old implicit expected count of one erased
 		// its +1 row and site deltas. A removed baseline job must remain -1.
-		const addedSource = `${CENSUS_SOURCES.get("ci.yml")}\n  census-review-fake:\n    name: census review fake\n    if: github.event_name == 'pull_request'\n    runs-on: ubuntu-latest\n    steps:\n      - uses: ${PINNED_CHECKOUT}\n`;
+		const addedSource = `${CENSUS_SOURCES.get("ci.yml")}\n  census-review-fake:\n    name: census review fake\n    if: github.event_name == 'pull_request'\n    runs-on: ubuntu-latest\n    steps:\n      - uses: ${pinnedCheckout()}\n`;
 		const addedSources = new Map(CENSUS_SOURCES).set("ci.yml", addedSource);
 		const addedRows = censusRows(addedSources);
 		const addedDelta = censusDelta(addedRows, sitesOf(addedRows));
@@ -959,7 +975,7 @@ describe("#3941 early-start advisory checkouts pin the captured commit", () => {
 			// actions/checkout revision whose default fetches the captured
 			// `github.sha`.
 			expect(site?.events, `${key} trigger`).toContain("pull_request");
-			expect(site?.uses, `${key} checkout revision`).toBe(PINNED_CHECKOUT);
+			expect(site?.uses, `${key} checkout revision`).toBe(pinnedCheckout());
 			// The captured commit is the default, so `ref` is unset.
 			expect(site?.ref, `${key} ref`).toBeUndefined();
 		}
@@ -1101,7 +1117,7 @@ describe("#3941 stage eligibility is the shared event-only projection", () => {
 			`    if: ${JSON.stringify(ifLine)}`,
 			"    runs-on: ubuntu-latest",
 			"    steps:",
-			`      - uses: ${PINNED_CHECKOUT} # v7`,
+			`      - uses: ${pinnedCheckout()} # v7`,
 			"        with:",
 			...(refLine ? [refLine] : []),
 			"          persist-credentials: false",

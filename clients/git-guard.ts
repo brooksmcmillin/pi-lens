@@ -1334,6 +1334,11 @@ export function evaluateGitGuard(
 		// `tool_result`; a recording at the gate has no turn end to do it, and a
 		// session boundary reads the record, not the latch (r1 M3).
 		if (absorbed.recorded > 0) syncGitGuardRecord(runtime, cacheManager, cwd);
+		// #4484 r2: a retire speaks for its file, as a clean write does, so the
+		// persisted record drops that file's section.
+		for (const filePath of absorbed.retiredFiles) {
+			syncGitGuardRecord(runtime, cacheManager, cwd, filePath);
+		}
 	} catch (failure) {
 		incrementDegradationCount({
 			kind: "deferred-blocker-gate-error",

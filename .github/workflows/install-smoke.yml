@@ -25,6 +25,15 @@ name: install-smoke
 #            then runs the selftest with NO soft allowance and runs the ast-grep
 #            executable.
 #
+# - scope / lsp-handshake: the deep pull-request run (#4291). `scope` reads the PR's
+#            changed files through scripts/ci-changed-files.mjs and says whether
+#            they touch PR_SMOKE_PATHS (RPC, install, LSP launch, trust). If so,
+#            pi-load runs all four pi-install cells on the PR (ubuntu only), and
+#            `lsp-handshake` runs scripts/smoke-tools.mjs --lsp (the tool-smoke
+#            handshake layer) as an advisory check. Any other PR that reaches
+#            this workflow keeps the one pnpm-global cell. One list, so the two
+#            cannot drift: tests/config/pr-smoke-paths.test.ts.
+#
 # Together they reproduce the #285 (pnpm symlink store) / #335 (nested npm)
 # conditions end to end. Resolution failures are hard failures; the build-script
 # assets pnpm/bun skip (ast-grep CLI, tree-sitter grammars) are soft-warned.
@@ -56,6 +65,41 @@ on:
       - "scripts/install-selftest.mjs"
       - "scripts/lib/web-tree-sitter-dir.mjs" # #1185: the selftest's grammar probe
       - "scripts/rpc-load-check.mjs"
+      - "scripts/lib/latency-log-phases.mjs" # #4401: the session smoke imports it
+      # #4291: the rest of PR_SMOKE_PATHS (scripts/ci-changed-files.mjs). Every
+      # entry of that list sits in this filter verbatim, or a PR touching only
+      # that path starts no install-smoke run at all.
+      - "tests/fixtures/rpc-load-check/**"
+      - "clients/installer/**"
+      - "clients/bootstrap.ts"
+      - "scripts/smoke-tools.mjs"
+      - "scripts/lib/git-fixture-env.mjs"
+      - "scripts/lib/lsp-fixture-session-guard.mjs"
+      - "scripts/lib/lsp-fixture-workspace.mjs"
+      - "scripts/lib/safe-rm.mjs"
+      - "scripts/lib/scratch-dir.mjs"
+      - "scripts/lib/touch-result.mjs"
+      - "clients/lsp/client-registry.ts"
+      - "clients/lsp/jvm-runtime.ts"
+      - "clients/lsp/launch.ts"
+      - "clients/lsp/server.ts"
+      - "clients/lsp/config.ts"
+      - "clients/lsp/resolved-config.ts"
+      - "clients/safe-spawn.ts"
+      - "clients/project-trust.ts"
+      # #4401, the #4400 / #4314 recurrence: the smoke exists to catch a break in
+      # the bundle and the persist workers on the PR, not only nightly. A path
+      # filter on every clients/ change would run this workflow (about 250
+      # runner-seconds over 6 jobs) for ~half of all merged PRs (408 of 783 in
+      # 14 days touched clients/, index.ts, tools/ or commands/); these paths are
+      # the seams that crash a host or break the warm, ~7% of merges (53).
+      - "scripts/bundle-dist.mjs"
+      - "clients/project-snapshot.ts"
+      - "clients/project-snapshot-persist-worker.ts"
+      - "clients/gzip-stage-write.ts"
+      - "clients/review-graph/builder.ts"
+      - "clients/review-graph/persist-worker.ts"
+      - "clients/lsp-lazy.ts"
       - "scripts/resolve-newest-in-range-host.mjs"
       - "scripts/lib/resolve-newest-in-range-host.mjs"
       # Review F3: these four are on host-range-smoke/host-latest-smoke's
@@ -112,9 +156,43 @@ env:
   # minor line from 0.86 onward; 0.81-0.83 are in-window without a dedicated
   # host. The ratchet also records 0.80, 0.84, and 0.85, so an unrun minor
   # cannot be silently admitted by a higher ceiling.
-  PI_HOST_SUPPORTED_RANGE: ">=0.80.10 <1.2.0"
+  PI_HOST_SUPPORTED_RANGE: ">=0.80.10 <1.4.0"
 
 jobs:
+  # #4291: classify the diff once. `smoke` is true when a pull request touches
+  # PR_SMOKE_PATHS and on every other event; pi-load and lsp-handshake read it.
+  # Fail-open: the script exits 0 on an unreadable file list, and a failed job
+  # (continue-on-error) leaves the output empty, which pi-load reads as "not
+  # false", so the full matrix runs. "(advisory)" is load-bearing (#3087).
+  scope:
+    name: Deep smoke scope (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    # A sparse checkout, one API read and a script: the repo's 10 min floor
+    # (refs #3123).
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      smoke: ${{ steps.classify.outputs.smoke }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            scripts
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - name: Classify the changed files
+        id: classify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: node scripts/ci-changed-files.mjs --event "$EVENT_NAME" --repo "$GITHUB_REPOSITORY" --pr "$PR_NUMBER"
+
   smoke:
     name: ${{ matrix.os }} · ${{ matrix.pm }}
     # #3043's shape, swept (2026-09-15 retro F2): this job carried
@@ -158,7 +236,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Node
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
 
@@ -268,7 +346,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Node
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
 
@@ -354,10 +432,19 @@ jobs:
     # runs on a PR -- shipped to master with NO lane able to execute it, and
     # broke six matrix cells on every master push for a day. PR-time this job
     # now runs EXACTLY ONE cell (ubuntu-latest x pnpm-global, via the matrix
-    # expressions below); push/nightly/dispatch keep the full 2x4 matrix. The
+    # expressions below); push/nightly/dispatch keep the full 2x4 matrix. #4291:
+    # a PR whose diff touches PR_SMOKE_PATHS (`scope`) runs all four pi-install
+    # cells on ubuntu, because #4409 passed this one cell and then broke the
+    # npm-global, bun-global and curl legs on master. Only an explicit
+    # `smoke == 'false'` narrows, so a missing output runs the full set. The
     # `os` list stays a literal array so the macOS-reachability sweep in
     # tests/support/workflow-shell-portability.ts still sees this job as
     # macOS-capable; the PR-time narrowing is done with `exclude`.
+    needs: scope
+    # A failed or skipped `scope` must not skip the four-cell fallback: its
+    # output is then empty, and the matrix below widens on anything but an
+    # explicit 'false'. Only a cancelled run stops (#4291 review F4).
+    if: ${{ !cancelled() }}
     runs-on: ${{ matrix.os }}
     # refs #3123: bounds a hang against GitHub's 360-min default.
     # Measured max leg over last 10 successful master runs (80 matrix legs):
@@ -369,7 +456,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        pi_install: ${{ github.event_name == 'pull_request' && fromJSON('["pnpm-global"]') || fromJSON('["npm-global", "pnpm-global", "bun-global", "curl"]') }}
+        pi_install: ${{ github.event_name == 'pull_request' && needs.scope.outputs.smoke == 'false' && fromJSON('["pnpm-global"]') || fromJSON('["npm-global", "pnpm-global", "bun-global", "curl"]') }}
         # NOTE: no space after the JSON colon -- a plain YAML scalar may not
         # contain ": ", so `{"os": "macos-latest"}` makes this whole file
         # unparseable (every tests/config workflow test yaml.loads it).
@@ -381,7 +468,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Node
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
 
@@ -462,20 +549,137 @@ jobs:
           pi list | grep -i 'pi-lens' || { echo "::error::pi-lens not registered after install"; exit 1; }
           echo "layout: $(readlink -f "$HOME/.pi/agent/npm/node_modules/pi-lens" 2>/dev/null || echo '(real dir)')"
 
-      - name: Verify pi-lens loads via RPC (get_commands — no model)
+      - name: Verify pi-lens loads via RPC (session, warm-up and first turn — fake provider)
         shell: bash
         env:
           ANTHROPIC_API_KEY: sk-ant-dummy-ci-no-credits-needed
         run: |
           set -uo pipefail
-          # Run from a clean git project; the driver spawns `pi --mode rpc`,
-          # asserts pi-lens's lens-* commands registered, fails on extension_error.
+          # Run from a clean git project; the driver spawns `pi --mode rpc`
+          # against a local fake provider (no credentials), asserts pi-lens's
+          # lens-* commands registered, waits for the warm-up, sends a prompt,
+          # and fails on a host exit, extension_error, a warning/error notice or
+          # a pi-lens failure log line (#4401; #4314 passed this step on a notice).
           mkdir -p "$RUNNER_TEMP/proj" && cd "$RUNNER_TEMP/proj"
           git init -q; git config user.email t@t.t; git config user.name t
           printf 'export const x: number = 1;\n' > a.ts
           printf '{ "name": "d", "version": "1.0.0", "type": "module" }\n' > package.json
+          # A TypeScript project has its own compiler (#4401). This leg runs the
+          # PUBLISHED pi-lens, and 4.4.3 refuses the TS server when the only
+          # compiler is a runner-image `tsc` found on PATH as a bare name (#4414,
+          # fixed in #4415, unreleased). With this install the leg no longer
+          # covers that shape at all; host-range-smoke covers it on PR code.
+          # REMOVAL TRIGGER: once a release carries #4415, drop these install
+          # lines in at least one published leg, so the shipped artifact runs
+          # the common user shape (global tsc, project without typescript) again.
+          # The pin is the one pi-lens installs for itself (classic tsserver.js).
+          printf 'node_modules\n' > .gitignore
+          # pi-lens-ignore: zizmor:adhoc-packages
+          node "$GITHUB_WORKSPACE/scripts/npm-retry.mjs" install --no-audit --no-fund --ignore-scripts --save-dev typescript@5.9.3
           git add -A && git commit -qm init
           node "$GITHUB_WORKSPACE/scripts/rpc-load-check.mjs" "$(command -v pi)"
+
+  # #4291: the tool-smoke LSP handshake layer (install + spawn + initialize each
+  # server) on a pull request that touches PR_SMOKE_PATHS, so a break in LSP
+  # launch or the installer shows on the PR and not only in the nightly. Same
+  # command and fixtures as tool-smoke.yml's "LSP handshake layer" step; the
+  # gating diagnostics gate and the other layers stay nightly-only. ADVISORY:
+  # continue-on-error keeps the workflow run green, and its check row can still
+  # read failure (run 38641583432), so the "(advisory)" name is what tells
+  # ci-verdict not to gate on it (#3087). The failing rows are the signal, in
+  # the step summary and as warning annotations. A PR runner provisions node, python
+  # and the Elixir toolchain, so a server whose other toolchain is absent
+  # reports a skipped row, as it does on a dev box; tool-smoke.yml provisions
+  # the full set.
+  lsp-handshake:
+    name: LSP handshake (advisory)
+    needs: scope
+    if: github.event_name == 'pull_request' && needs.scope.outputs.smoke == 'true'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PI_LENS_HOME: /tmp/pi-lens-home
+      PILENS_DATA_DIR: /tmp/pi-lens-home
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+
+      # yamllint disable-line rule:line-length
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      # The two Elixir servers compile with `mix`; without it they report a
+      # setup failure (run 38641583432), which would keep this advisory job red
+      # on every filtered PR. Best-effort like the nightly's toolchains.
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
+        continue-on-error: true
+        with:
+          otp-version: "27"
+          elixir-version: "1.18"
+
+      # The sibling shape (hot-path-latency.yml, ci.yml): a locked install with no
+      # lifecycle scripts (Sonar S6505), then the one script this job needs.
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund --ignore-scripts
+
+      - name: Build dist
+        run: npm run build:dist
+
+      # `set -o pipefail` is load-bearing: the default shell has none, so
+      # `smoke-tools | tee` would take tee's exit code (tool-smoke.yml, #2723).
+      # --min-pass is the floor that keeps a green handshake honest (#4518): an
+      # unavailable server reports a warning, never a failure, so a run where
+      # every install failed would exit 0 having proved nothing. A PR runner
+      # provisions fewer toolchains than the nightly: 41 and 40 passed on the two
+      # measured runs (tests/fixtures/nightly-floors/measurements.json), against
+      # the nightly's 46 with --min-pass=40.
+      - name: LSP handshake layer (install + spawn + initialize each server)
+        id: handshake
+        run: |
+          set -o pipefail
+          node scripts/smoke-tools.mjs --lsp --install --verbose --min-pass=35 2>&1 | tee "$RUNNER_TEMP/lsp-handshake.log"
+
+      # The failing rows (a line starting with the cross mark, the shape
+      # scripts/lib/tool-smoke-drift.mjs parses) go to the check's summary and
+      # to annotations, so the PR shows which servers failed without opening
+      # the log.
+      - name: Report failing handshake rows
+        if: always()
+        env:
+          HANDSHAKE_OUTCOME: ${{ steps.handshake.outcome }}
+        run: |
+          log="$RUNNER_TEMP/lsp-handshake.log"
+          rows=""
+          if [ -s "$log" ]; then rows="$(grep '^✗' "$log" || true)"; fi
+          {
+            echo "### LSP handshake failing rows"
+            if [ -n "$rows" ]; then
+              echo '```'
+              echo "$rows"
+              echo '```'
+            elif [ "$HANDSHAKE_OUTCOME" = success ]; then
+              echo "No failing rows."
+            else
+              echo "The handshake did not run to a result (step outcome: $HANDSHAKE_OUTCOME); see the step output."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$rows" ]; then
+            while IFS= read -r row; do
+              echo "::warning title=LSP handshake::$row"
+            done <<< "$rows"
+          elif [ "$HANDSHAKE_OUTCOME" != success ]; then
+            echo "::warning title=LSP handshake::the handshake did not run to a result (step outcome: $HANDSHAKE_OUTCOME)"
+          fi
 
   # mise install coverage (+ a #285 probe): pi under mise + pnpm as npmCommand,
   # across OS × pi-install-topology. mise layers a node install + shim/realpath step
@@ -496,6 +700,14 @@ jobs:
   # mise.run curl + npm backend are external-dep-heavy, and a green cell is not proof
   # of #285 coverage.
   mise-repro:
+    # No floor (#4518): a leg either runs the whole pi session through
+    # rpc-load-check.mjs (pi-lens commands registered, warm-up logged, a clean
+    # first turn, trust adopted) or its step exits non-zero, so "evaluated
+    # nothing" has no green spelling: a leg that installed nothing has no `pi`
+    # for the last step to drive. The job-level continue-on-error below keeps
+    # the run green on purpose; the failing leg's check row is the signal, and
+    # no notifier reads it. A notifier is a separate decision (see #4518).
+    #
     # "(advisory)" is load-bearing (#3087): this job is continue-on-error on
     # every event, so its check always concludes success. The suffix is how
     # scripts/lib/ci-checks.mjs and ci-verdict tell advisory from gating.
@@ -653,7 +865,7 @@ jobs:
               || echo "::warning::typescript UNRESOLVABLE from pi-lens/dist/clients — this is #285"
           fi
 
-      - name: Verify pi-lens loads via RPC (get_commands — no model)
+      - name: Verify pi-lens loads via RPC (session, warm-up and first turn — fake provider)
         shell: bash
         env:
           ANTHROPIC_API_KEY: sk-ant-dummy-ci-no-credits-needed
@@ -663,6 +875,18 @@ jobs:
           git init -q; git config user.email t@t.t; git config user.name t
           printf 'export const x: number = 1;\n' > a.ts
           printf '{ "name": "d", "version": "1.0.0", "type": "module" }\n' > package.json
+          # A TypeScript project has its own compiler (#4401). This leg runs the
+          # PUBLISHED pi-lens, and 4.4.3 refuses the TS server when the only
+          # compiler is a runner-image `tsc` found on PATH as a bare name (#4414,
+          # fixed in #4415, unreleased). With this install the leg no longer
+          # covers that shape at all; host-range-smoke covers it on PR code.
+          # REMOVAL TRIGGER: once a release carries #4415, drop these install
+          # lines in at least one published leg, so the shipped artifact runs
+          # the common user shape (global tsc, project without typescript) again.
+          # The pin is the one pi-lens installs for itself (classic tsserver.js).
+          printf 'node_modules\n' > .gitignore
+          # pi-lens-ignore: zizmor:adhoc-packages
+          node "$GITHUB_WORKSPACE/scripts/npm-retry.mjs" install --no-audit --no-fund --ignore-scripts --save-dev typescript@5.9.3
           git add -A && git commit -qm init
           node "$GITHUB_WORKSPACE/scripts/rpc-load-check.mjs" "$(command -v pi)"
 
@@ -707,7 +931,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Node
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
 
@@ -805,6 +1029,33 @@ jobs:
           SELFTEST="$(node -e 'console.log(require.resolve("pi-lens/scripts/install-selftest.mjs"))')"
           bun "$SELFTEST" --allow-soft
 
+      # #4401, the #4400 / #4314 recurrence: start the PACKED tarball under
+      # `pi --mode rpc` (the way a studio chat runs it) at this cell's host, wait
+      # out the warm-up, run a real first turn against a local fake provider,
+      # and red on any host exit, extension_error, warning/error notice or
+      # pi-lens failure log line. The second run forces the snapshot persist
+      # worker to answer without a stagePath (the #4400 wire shape) and must see
+      # pi survive. Measured ~4 s per run; the step cap sits well below the job's
+      # 10-minute cap.
+      - name: RPC session smoke (packed tarball, fake provider) + failing-worker variant
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          PI="$GITHUB_WORKSPACE/node_modules/.bin/pi"
+          PKG="$RUNNER_TEMP/proj/node_modules/pi-lens"
+          mkdir -p "$RUNNER_TEMP/rpcproj" && cd "$RUNNER_TEMP/rpcproj"
+          git init -q; git config user.email t@t.t; git config user.name t
+          printf 'export const x: number = 1;\n' > a.ts
+          printf '{ "name": "d", "version": "1.0.0", "type": "module" }\n' > package.json
+          git add -A && git commit -qm init
+          echo "::group::session smoke"
+          node "$GITHUB_WORKSPACE/scripts/rpc-load-check.mjs" "$PI" --extension "$PKG"
+          echo "::endgroup::"
+          echo "::group::session smoke, snapshot worker forced to fail"
+          node "$GITHUB_WORKSPACE/scripts/rpc-load-check.mjs" "$PI" --extension "$PKG" --fail-worker
+          echo "::endgroup::"
+
       # Acceptance (#2613): a newest-in-range failure that ALSO fails on
       # master is upstream drift, not this PR's regression. Compares against
       # the same named job's conclusion on the last completed master run of
@@ -880,7 +1131,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Node
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
 
@@ -990,7 +1241,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Node
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
 

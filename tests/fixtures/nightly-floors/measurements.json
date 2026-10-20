@@ -1,0 +1,148 @@
+{
+	"_comment": "Raw nightly log lines behind the floors in scripts/lib/assert-evaluated.mjs and the LSP handshake --min-pass in .github/workflows/tool-smoke.yml (#4514). Measuring command: `gh run view <run> --log`, filtered to the lines below (timestamp prefix removed). `healthy` is the last good run before #4248 (2026-10-09 14:01Z); `degraded` is the first nightly after the regression that read green (2026-10-15). tests/config/nightly-evaluated-floors.test.ts pins every floor above the degraded count and at or below the healthy one.",
+	"command": "gh run view <run> --log",
+	"producers": {
+		"characterize-lsp": {
+			"healthy": {
+				"run": 37867865627,
+				"evaluated": 46,
+				"lines": [
+					"  pull-capable (clean confirmable via pull): 9",
+					"  push-only (needs re-publish-empty, else silent → budget-bound): 37"
+				]
+			},
+			"degraded": {
+				"run": 38722270673,
+				"evaluated": 21,
+				"lines": [
+					"  pull-capable (clean confirmable via pull): 2",
+					"  push-only (needs re-publish-empty, else silent → budget-bound): 19"
+				]
+			}
+		},
+		"probe-clean-signal": {
+			"healthy": {
+				"run": 37867865627,
+				"evaluated": 42,
+				"lines": [
+					"  Tier 2  (publishes-versioned — affirmative + currency-proven):        11",
+					"  Tier 2* (publishes-unversioned — early-returns, currency correlated): 19",
+					"  Tier 3  (silent on clean — budget-wait, the #458 target set):         3",
+					"  pull-capable (clean confirmable via pull): 9"
+				]
+			},
+			"degraded": {
+				"run": 38722270673,
+				"evaluated": 21,
+				"lines": [
+					"  Tier 2  (publishes-versioned — affirmative + currency-proven):        9",
+					"  Tier 2* (publishes-unversioned — early-returns, currency correlated): 7",
+					"  Tier 3  (silent on clean — budget-wait, the #458 target set):         3",
+					"  pull-capable (clean confirmable via pull): 2"
+				]
+			}
+		},
+		"server-capabilities": {
+			"healthy": {
+				"run": 37867865627,
+				"evaluated": 41,
+				"lines": [
+					"Wrote docs/servercapabilities.md (41 servers captured this run, 8 unavailable)."
+				]
+			},
+			"degraded": {
+				"run": 38722270673,
+				"evaluated": 16,
+				"lines": [
+					"Wrote docs/servercapabilities.md (16 servers captured this run, 33 unavailable)."
+				]
+			}
+		},
+		"measure-lsp-idle-eviction": {
+			"healthy": {
+				"run": 37867865627,
+				"evaluated": 35,
+				"lines": [
+					"48 registry servers: 33 eligible, 0 vetoed, 2 inconclusive, 13 unavailable (0 not reached: budget)."
+				]
+			},
+			"degraded": {
+				"run": 38722270673,
+				"evaluated": 15,
+				"lines": [
+					"49 registry servers: 7 eligible, 0 vetoed, 8 inconclusive, 34 unavailable (0 not reached: budget)."
+				]
+			}
+		}
+	},
+	"lspHandshake": {
+		"note": "The handshake layer passed 46 rows in BOTH runs: it adopts trust (#4262), so its --min-pass guards a different failure (an install lane that proved nothing), not this regression.",
+		"healthy": {
+			"run": 37867865627,
+			"passed": 46,
+			"line": "46 passed · 0 failed · 0 setup-failed · 8 skipped (tool/config unavailable)"
+		},
+		"degraded": {
+			"run": 38722270673,
+			"passed": 46,
+			"line": "46 passed · 0 failed · 0 setup-failed · 9 skipped (tool/config unavailable)"
+		}
+	},
+	"nonLspFloors": {
+		"_comment": "Measured counts behind the floors #4518 added to the producers outside the LSP nightly. `healthy` is a real run (or, for the file-count floor, a deterministic local run at the named sha); each floor in the workflow or script sits at or below it. tests/config/nightly-evaluated-floors.test.ts pins every floor against these rows. Measuring commands: `gh run view <run> --log` filtered to `line` for the CI rows; `node scripts/complexity-report.mjs 2>&1 >/dev/null` for complexity-report.",
+		"apfs-anchors": {
+			"producer": "ci.yml install-test (macos-latest), step 'POSIX case-insensitive anchors (APFS)'",
+			"evaluated": "tests executed (passed plus failed; skipped excluded)",
+			"healthy": {
+				"run": 38875637520,
+				"job": "Install test (macos-latest)",
+				"evaluated": 223,
+				"line": "Tests 223 passed | 5 skipped (228)"
+			}
+		},
+		"install-smoke-lsp-handshake": {
+			"producer": "install-smoke.yml lsp-handshake (advisory), pull_request",
+			"evaluated": "handshake rows that passed",
+			"healthy": [
+				{
+					"run": 38880758299,
+					"passed": 41,
+					"line": "41 passed · 0 failed · 0 setup-failed · 14 skipped (tool/config unavailable)"
+				},
+				{
+					"run": 38873403996,
+					"passed": 40,
+					"line": "40 passed · 1 failed · 0 setup-failed · 14 skipped (tool/config unavailable)"
+				}
+			]
+		},
+		"swift-crash-watch": {
+			"producer": "grammar-health.yml swift-crash-watch",
+			"evaluated": "1 when the forced load ran to a verdict (loaded, or the runtime went down); 0 when the grammar did not load or the runtime was unavailable",
+			"healthy": {
+				"run": 38724538192,
+				"evaluated": 1,
+				"line": "# Fatal process out of memory: Zone"
+			}
+		},
+		"complexity-report": {
+			"producer": "lint.yml complexity (advisory), scripts/complexity-report.mjs",
+			"evaluated": "source files under clients/, tools/ and mcp/ the ComplexityClient analysed",
+			"healthy": {
+				"sha": "86336d00a2ffa88cf8e9a7c438fd71d60c3465c4",
+				"evaluated": 521,
+				"line": "[evaluated] complexity-report: 521"
+			}
+		},
+		"windows-vitest": {
+			"producer": "ci.yml unit-tests-windows, step 'Fail a failed or under-executed Windows Vitest subset'",
+			"evaluated": "tests executed (passed plus failed; skipped excluded)",
+			"healthy": {
+				"run": 38875637520,
+				"job": "Unit tests Windows (advisory)",
+				"evaluated": 2516,
+				"line": "Tests 2516 passed | 26 skipped (2542)"
+			}
+		}
+	}
+}

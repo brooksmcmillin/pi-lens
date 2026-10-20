@@ -355,6 +355,96 @@ describe("parseHelmLintOutput", () => {
 	});
 });
 
+// #4453: the ERROR lines below are helm 4.3.0's own bytes over a scratch chart
+// named `mychart` (the capture in tests/fixtures/runner-output/helm-lint covers
+// the parse error). The chart name rides inside the message, so the path the
+// parser reports must have it stripped, and a leading path must not.
+describe("parseHelmLintOutput template locations", () => {
+	const chartRoot = path.resolve("mychart-root");
+
+	it("takes the file and line of an execution error and drops the chart name", () => {
+		const [diagnostic] = parseHelmLintOutput(
+			[
+				"[ERROR] templates/: mychart/templates/exec.yaml:6:15",
+				'  executing "mychart/templates/exec.yaml" at <.Values.a.b.c>:',
+				"    nil pointer evaluating interface {}.b",
+			].join("\n"),
+			chartRoot,
+		);
+		expect(diagnostic.filePath).toBe(
+			path.join(chartRoot, "templates", "exec.yaml"),
+		);
+		expect(diagnostic.line).toBe(6);
+	});
+
+	it("keeps a subchart's directory when it drops the chart name", () => {
+		const [diagnostic] = parseHelmLintOutput(
+			"[ERROR] templates/: parse error at (mychart/charts/sub/templates/subbad.yaml:5): unclosed action started at mychart/charts/sub/templates/subbad.yaml:4",
+			chartRoot,
+		);
+		expect(diagnostic.filePath).toBe(
+			path.join(chartRoot, "charts", "sub", "templates", "subbad.yaml"),
+		);
+		expect(diagnostic.line).toBe(5);
+	});
+
+	it("leaves a message-leading path relative to the chart root", () => {
+		const [diagnostic] = parseHelmLintOutput(
+			"[ERROR] templates/yamlbad.yaml: unable to parse YAML: error converting YAML to JSON: yaml: line 5: found unexpected end of stream",
+			chartRoot,
+		);
+		expect(diagnostic.filePath).toBe(
+			path.join(chartRoot, "templates", "yamlbad.yaml"),
+		);
+	});
+
+	// Strings below are helm 4.3.0 output for a template named `my file.yaml`
+	// (probe in the PR body; the parse-error spelling is also the
+	// helm-lint/space-in-name capture). Recurrence: the parser read
+	// `<root>/file.yaml`, the deleted-path gate dropped the blocker (#4453).
+	it("keeps a space in a template name in all three helm spellings", () => {
+		const spaced = path.join(chartRoot, "templates", "my file.yaml");
+		const [leading, parse, exec] = parseHelmLintOutput(
+			[
+				"[ERROR] templates/my file.yaml: unable to parse YAML: error converting YAML to JSON: yaml: line 2: mapping values are not allowed in this context",
+				"[ERROR] templates/: parse error at (pi-lens-smoke/templates/my file.yaml:5): unclosed action started at pi-lens-smoke/templates/my file.yaml:4",
+				'[ERROR] templates/: pi-lens-smoke/templates/my file.yaml:1:10\n  executing "pi-lens-smoke/templates/my file.yaml" at <.Values.a.b.c>:\n    nil pointer evaluating interface {}.c',
+			].join("\n"),
+			chartRoot,
+		);
+		expect([leading.filePath, parse.filePath, exec.filePath]).toEqual([
+			spaced,
+			spaced,
+			spaced,
+		]);
+		expect([parse.line, exec.line]).toEqual([5, 1]);
+	});
+
+	// Recurrence: allowing a space anywhere in the path class would read the
+	// prose before a slash-free file name as part of the path
+	// (`<root>/cannot load values.yaml`), which names a file that does not exist.
+	it("does not fold prose before a slash-free file name into the path", () => {
+		const [loadFail, unreadable] = parseHelmLintOutput(
+			[
+				"[ERROR] templates/: cannot load values.yaml: cannot unmarshal yaml document: error converting YAML to JSON: yaml: line 1: did not find expected node content",
+				"[ERROR] unable to read values.yaml: permission denied",
+			].join("\n"),
+			chartRoot,
+		);
+		expect(loadFail.filePath).toBe(path.join(chartRoot, "values.yaml"));
+		expect(unreadable.filePath).toBe(path.join(chartRoot, "values.yaml"));
+	});
+
+	it("falls back to Chart.yaml when the message names no chart file", () => {
+		const [diagnostic] = parseHelmLintOutput(
+			"[ERROR] /abs/path/to/mychart: chart metadata is missing these dependencies: sub",
+			chartRoot,
+		);
+		expect(diagnostic.filePath).toBe(path.join(chartRoot, "Chart.yaml"));
+		expect(diagnostic.line).toBeUndefined();
+	});
+});
+
 // #1342 review: helm indents multi-line detail under its [LEVEL] header —
 // continuations must fold into the diagnostic message, not vanish.
 describe("parseHelmLintOutput continuations", () => {

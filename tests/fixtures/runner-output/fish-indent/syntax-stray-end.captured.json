@@ -1,0 +1,58 @@
+{
+	"provenance": {
+		"runner": "fish-indent",
+		"tool": "fish",
+		"version": "4.9.3",
+		"command": "fish --no-config --no-execute stray-end.fish",
+		"argv": [
+			"--no-config",
+			"--no-execute",
+			"stray-end.fish"
+		],
+		"workspace": "tests/fixtures/tool-smoke/fish-syntax",
+		"platform": "linux-x64",
+		"capturedAt": "2026-10-15",
+		"versionArgv": [
+			"--version"
+		]
+	},
+	"file": "stray-end.fish",
+	"exitCode": 127,
+	"stdout": "",
+	"stderr": "stray-end.fish (line 2): 'end' outside of a block\nend\n^~^\nwarning: Error while reading file stray-end.fish\n",
+	"availability": [
+		{
+			"command": "fish_indent",
+			"argv": [
+				"--version"
+			],
+			"version": "4.2.1",
+			"exitCode": 0,
+			"stdout": "fish_indent, version 4.2.1\n",
+			"stderr": ""
+		},
+		{
+			"command": "fish",
+			"argv": [
+				"--version"
+			],
+			"version": "4.2.1",
+			"exitCode": 0,
+			"stdout": "fish, version 4.2.1\n",
+			"stderr": ""
+		}
+	],
+	"clean": {
+		"workspace": "tests/fixtures/runner-output-clean/fish-indent",
+		"file": "stray-end.fish",
+		"argv": [
+			"--no-config",
+			"--no-execute",
+			"stray-end.fish"
+		],
+		"version": "4.2.1",
+		"exitCode": 0,
+		"stdout": "",
+		"stderr": ""
+	}
+}

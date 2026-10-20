@@ -54,6 +54,7 @@ import {
 	setHostFileMutationQueueLoader,
 	withHostFileMutationQueues,
 } from "../../clients/file-mutation-queue.js";
+import { pathBirthtimeMs } from "../../clients/path-birth.js";
 import { getProcessSingleton } from "../../clients/process-singletons.js";
 import { beginScope } from "../../clients/session-scope.js";
 import {
@@ -89,9 +90,19 @@ vi.mock("../../clients/safe-spawn.js", async (importOriginal) => {
 				if (command === "cargo" && args[0] === "--version") {
 					return { stdout: "cargo 1.82.0", stderr: "", status: 0 };
 				}
-				if (command === "cargo" && args[0] === "clippy") {
+				// Only the fixer is the gated double. A lint-only `cargo clippy`
+				// (the rust-clippy dispatch runner, which the #4483 pre-edit
+				// capture also runs at an agent edit's tool_call) answers clean.
+				if (
+					command === "cargo" &&
+					args[0] === "clippy" &&
+					args.includes("--fix")
+				) {
 					const status = (await fake.clippy?.(options?.cwd ?? "")) ?? 0;
 					return { stdout: "", stderr: "", status };
+				}
+				if (command === "cargo" && args[0] === "clippy") {
+					return { stdout: "", stderr: "", status: 0 };
 				}
 				if (command === "dart" && args[0] === "--version") {
 					return { stdout: "Dart SDK version: 3.5.0", stderr: "", status: 0 };
@@ -173,7 +184,18 @@ describe("whole-package fixer restores agent edits (#3598)", () => {
 		_resetAgentNudgeForTests();
 		previousDebounce = process.env.PI_LENS_TOOL_RESULT_DEBOUNCE_MS;
 		process.env.PI_LENS_TOOL_RESULT_DEBOUNCE_MS = "0";
-		const env = setupTestEnvironment("pi-lens-fix-run-restore-");
+		// `{ rootMarker: false }`: this describe drives the real `runPipeline` and
+		// `handleToolResult`, so a fixture that carries the shared `.git` marker is
+		// a *project root* to the LSP seam, and every case booted the auxiliary
+		// language servers (`opengrep lsp`, `typos-lsp`) against a root it does not
+		// assert anything about: 53 pairs of children for this file, and with them
+		// the neighbours it starved in CI (#4574: the census file beside it ran
+		// 4.5-5.5 s against a 5000 ms budget, master 0.9-2.4 s). The cell asserts no
+		// root resolution, and its Rust root comes from the `Cargo.toml` markers it
+		// writes below, not from `.git`.
+		const env = setupTestEnvironment("pi-lens-fix-run-restore-", {
+			rootMarker: false,
+		});
 		tmpDir = env.tmpDir;
 		cleanup = env.cleanup;
 		const crateDir = path.join(tmpDir, "crate");
@@ -379,6 +401,37 @@ describe("whole-package fixer restores agent edits (#3598)", () => {
 		expect(fs.readFileSync(aRs, "utf-8")).toBe("let AGENT = 1;\n");
 		expect(result.changedFiles ?? []).not.toContain(aRs);
 		expect(overwrittenCount()).toBe(1);
+	}, 10000);
+
+	// #4320 r3 (G4): the restore rewrites the agent's file through a temp file
+	// and a rename, so the file gets a new inode born now. Without the carried
+	// birth its next first open told the language server Created, and every
+	// cached finding of that server under the root was dropped and re-checked.
+	it("keeps the restored file's path birth across its atomic rewrite", async (ctx) => {
+		const aRs = path.join(srcDir, "a.rs");
+		const born = fs.statSync(aRs);
+		if (!(born.birthtimeMs > 0)) ctx.skip("filesystem reports no birth time");
+		const started = gate();
+		const proceed = gate();
+		fake.clippy = async () => {
+			started.open();
+			await proceed.p;
+			fs.writeFileSync(aRs, TOOL_FIXED);
+			return 0;
+		};
+
+		const run = runPipelineSettled(pipelineContext(mainRs), pipelineDeps());
+		await started.p;
+		const edit = agentEdit(aRs, "let AGENT = 1;");
+		edit.write();
+		await edit.deliver();
+		proceed.open();
+		await run;
+
+		const restored = fs.statSync(aRs);
+		expect(fs.readFileSync(aRs, "utf-8")).toBe("let AGENT = 1;\n");
+		expect(restored.ino).not.toBe(born.ino);
+		expect(pathBirthtimeMs(restored)).toBe(born.birthtimeMs);
 	}, 10000);
 
 	it("leaves the tool's fix on a sibling the agent did not edit", async () => {
@@ -2065,6 +2118,62 @@ describe("whole-package fixer restores agent edits (#3598)", () => {
 
 			expect(lspRan).toBe(true);
 			expect(fs.readFileSync(aRs, "utf-8")).toBe("let ONE = 1;\n");
+		});
+
+		// Recurrence: `TargetHold` of formal/dispatch-pipeline/SiblingRestore.tla
+		// (#4393). The pipeline takes the target F's queue entry before the
+		// whole-package fixer starts (#3506) and keeps it while the fixer runs;
+		// the lock-order cycle of the two tests above exists only because of that
+		// hold. Removing the acquire before `beginFixRun` left every other test
+		// green: the deadlock tests pass trivially with no hold, and no test
+		// asserted that F's own edits wait for the fixer. Two code sites decide
+		// it, `tryRustClippyFix` and `tryDartFix` (clients/pipeline.ts), one test
+		// each: the Dart site's acquire survived the Rust test alone (#4432 r1 F1).
+		async function expectTargetHeldWhileFixerRuns(
+			target: string,
+			setFixer: (body: () => Promise<number>) => void,
+		) {
+			const started = gate();
+			const proceed = gate();
+			setFixer(async () => {
+				started.open();
+				await proceed.p;
+				return 0;
+			});
+			const run = runPipelineSettled(pipelineContext(target), pipelineDeps());
+			await started.p;
+			const edit = agentAppend(target, "// AGENT_EDIT\n");
+			await afterQueueRegistration();
+			expect(edit.wrote()).toBe(false);
+			proceed.open();
+			await run;
+			await edit.done;
+			// No-drop: once the pipeline releases F, the edit lands.
+			expect(edit.wrote()).toBe(true);
+			expect(fs.readFileSync(target, "utf-8")).toContain("// AGENT_EDIT");
+		}
+
+		it("TargetHold (#3506): an agent edit of the target made while a whole-package fixer runs waits for the pipeline", async () => {
+			await expectTargetHeldWhileFixerRuns(mainRs, (body) => {
+				fake.clippy = body;
+			});
+		});
+
+		it("TargetHold (#3506): an agent edit of a Dart target made while dart fix --apply runs waits for the pipeline", async () => {
+			const libDir = path.join(tmpDir, "pkg", "lib");
+			fs.mkdirSync(libDir, { recursive: true });
+			fs.writeFileSync(
+				path.join(tmpDir, "pkg", "pubspec.yaml"),
+				"name: fixture\nenvironment:\n  sdk: ^3.5.0\n",
+			);
+			// The agreement evidence is anchored at the pipeline cwd (#3005 fixture
+			// recurrence, as the Cargo.toml above).
+			fs.writeFileSync(path.join(tmpDir, "pubspec.yaml"), "name: root\n");
+			const mainDart = path.join(libDir, "main.dart");
+			fs.writeFileSync(mainDart, "void main() {}\n");
+			await expectTargetHeldWhileFixerRuns(mainDart, (body) => {
+				fake.dartFix = body;
+			});
 		});
 
 		// Recurrence: #3914 r1, F2. The handler awaited the restore at its end, so

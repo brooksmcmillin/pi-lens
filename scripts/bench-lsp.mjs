@@ -24,9 +24,11 @@ import * as path from "node:path";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
+	adoptFixtureProjectTrust,
 	bootstrapFixtureWorkspace,
 	withScratchHome,
 } from "./lib/lsp-fixture-workspace.mjs";
+import { touchAnsweredDiagnostics } from "./lib/touch-result.mjs";
 
 const repoRoot = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -57,6 +59,10 @@ const {
 	getServersForFileWithConfig,
 	resetLSPConfigStateForTests,
 } = await imp("dist/clients/lsp/config.js");
+// #4514: this script is a standalone host, not pi. Adopt project trust before
+// the first touch, or the launch gate refuses project-local and project-code
+// servers and the rows read as unavailable.
+await adoptFixtureProjectTrust({ repoRoot });
 let ensureTool;
 if (install) {
 	({ ensureTool } = await imp("dist/clients/installer/index.js"));
@@ -133,27 +139,31 @@ for (const fx of fixtures) {
 		continue;
 	}
 	let content = fs.readFileSync(absFile, "utf8");
-	const touch = (c) =>
-		lsp.touchFile(absFile, c, {
-			diagnostics: "document",
-			collectDiagnostics: true,
-			clientScope: auxIds.length ? "with-auxiliary" : "primary",
-			...(auxIds.length ? { auxiliaryServerIds: auxIds } : {}),
-			maxClientWaitMs: 40000,
-			// Production-realistic diagnostic cap. Each fixture spawns a SINGLE
-			// server (primaries disabled for aux fixtures), so this is that one
-			// server's per-server ceiling (#242): the wait early-returns the moment
-			// it publishes and only caps the tail. 3000ms covers the slowest strategy
-			// budget (rust-analyzer) and reflects the dispatch per-edit cap.
-			maxDiagnosticsWaitMs: 3000,
-			source: "bench",
-		});
+	const touchOptions = {
+		diagnostics: "document",
+		collectDiagnostics: true,
+		clientScope: auxIds.length ? "with-auxiliary" : "primary",
+		...(auxIds.length ? { auxiliaryServerIds: auxIds } : {}),
+		maxClientWaitMs: 40000,
+		// Production-realistic diagnostic cap. Each fixture spawns a SINGLE
+		// server (primaries disabled for aux fixtures), so this is that one
+		// server's per-server ceiling (#242): the wait early-returns the moment
+		// it publishes and only caps the tail. 3000ms covers the slowest strategy
+		// budget (rust-analyzer) and reflects the dispatch per-edit cap.
+		maxDiagnosticsWaitMs: 3000,
+		source: "bench",
+	};
+	const touch = (c) => lsp.touchFile(absFile, c, touchOptions);
 
 	try {
 		const c0 = performance.now();
 		const cold = await touch(content);
 		const coldMs = performance.now() - c0;
-		if (!Array.isArray(cold)) {
+		// An auxiliary fixture's primaries are off, so its touch answers only
+		// through a running auxiliary; one that never started is unavailable,
+		// not a measurement (#4466 review F1).
+		const coldDiags = touchAnsweredDiagnostics(cold, touchOptions, lsp);
+		if (coldDiags === undefined) {
 			results.push({
 				lang: fx.lang,
 				server: fx.serverHint,
@@ -177,11 +187,11 @@ for (const fx of fixtures) {
 			role,
 			coldMs,
 			warmMs: warmAvg,
-			diags: cold.length,
+			diags: coldDiags.length,
 			status: "ok",
 		});
 		console.error(
-			`[${fx.lang}] ${role} cold=${coldMs.toFixed(0)}ms warm=${warmAvg.toFixed(0)}ms diags=${cold.length}`,
+			`[${fx.lang}] ${role} cold=${coldMs.toFixed(0)}ms warm=${warmAvg.toFixed(0)}ms diags=${coldDiags.length}`,
 		);
 	} catch (e) {
 		results.push({

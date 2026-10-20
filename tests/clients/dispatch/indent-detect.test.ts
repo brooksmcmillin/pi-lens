@@ -16,7 +16,7 @@ const T = "\t";
 const ROWS: Array<{
 	id: string;
 	content: string;
-	expected: { style: string; width: number } | undefined;
+	expected: { style: "tab" } | { style: "space"; width: number } | undefined;
 }> = [
 	{
 		id: "R1 2-space file, no comments",
@@ -57,7 +57,7 @@ const ROWS: Array<{
 	{
 		id: "R6 tab file, no comments",
 		content: `function a() {\n${T}const x = 1;\n${T}if (x) {\n${T}${T}return x;\n${T}}\n}\n`,
-		expected: { style: "tab", width: 1 },
+		expected: { style: "tab" },
 	},
 	{
 		// Recurrence this pins (#3039 F2): a top-level JSDoc has more 1-space
@@ -67,7 +67,7 @@ const ROWS: Array<{
 		content:
 			"/**\n * Adds two numbers.\n * @param a first\n * @param b second\n * @returns the sum\n */\n" +
 			`function add(a, b) {\n${T}const sum = a + b;\n${T}if (sum) {\n${T}${T}return sum;\n${T}}\n${T}return 0;\n}\n`,
-		expected: { style: "tab", width: 1 },
+		expected: { style: "tab" },
 	},
 	{
 		// Recurrence this pins (#3038): the shallowest run is continuation
@@ -103,7 +103,7 @@ const ROWS: Array<{
 	{
 		id: "R10b mixed tabs and spaces, tab majority",
 		content: `top\n${T}one\n${T}${T}two\n${T}three\n  four\n`,
-		expected: { style: "tab", width: 1 },
+		expected: { style: "tab" },
 	},
 	{
 		id: "R11 minimum above the plausible-unit cap, nested-only",
@@ -229,7 +229,7 @@ const ROWS: Array<{
 	{
 		id: "R22 shell tabs with # comments",
 		content: `#!/bin/sh\n# a script\nf() {\n${T}echo hi\n${T}if true; then\n${T}${T}echo deep\n${T}fi\n}\n`,
-		expected: { style: "tab", width: 1 },
+		expected: { style: "tab" },
 	},
 	{
 		// Recurrence this pins (#3059, AGENTS.md defect 49's fourth member): a
@@ -281,7 +281,7 @@ const ROWS: Array<{
 		content:
 			`/**\n * Handles \`template literals in strings.\n */\nfunction main() {\n${T}doStuff();\n${T}if (ok) {\n${T}${T}run();\n${T}}\n}\n` +
 			'const s = "closes ` here";\n',
-		expected: { style: "tab", width: 1 },
+		expected: { style: "tab" },
 	},
 ];
 
@@ -880,5 +880,215 @@ describe("templateLiteralInteriorMask", () => {
 			style: "space",
 			width: 2,
 		});
+	});
+});
+
+// #4365 rotation batch 1: survivors of the per-module Stryker campaign. The
+// rows below drive the real detector and the two exported masks; each comment
+// names the mutants it kills. Inputs that only an infinite loop would
+// distinguish (`j -= 1` on a character-class `[`, `k < line.length` forced
+// true at end of line) are exercised by these inputs too, so those mutants
+// time out here instead of passing.
+describe("indent-detect survivors (#4365)", () => {
+	it("counts a line that only holds a tab MID-line as no tab evidence", () => {
+		// Kills the `^` anchor dropped from `/^\t+\S/`: a tab inside a line is not
+		// indentation. With one space-indented line and one such line the mutant
+		// saw a tie and fell back to the 2-space default.
+		expect(detectIndentation("a\n    b\nx\ty\n")).toEqual({
+			style: "space",
+			width: 4,
+		});
+	});
+
+	it("recognises a line indented by several tabs as tab indentation", () => {
+		// Kills `/^\t+\S/` narrowed to a single tab: `\t\tb` stopped counting, so
+		// a file indented only by nested tabs lost its style.
+		expect(detectIndentation("a\n\t\tb\n")).toEqual({ style: "tab" });
+	});
+
+	it("falls back to the default width on an exact tab/space tie, not to a tab or an ambiguity", () => {
+		// Kills `tabs > spaceCounts.length` as `>=` and `spaceCounts.length > tabs`
+		// as `>=` or forced true: one tab line against one space line is no
+		// majority, so neither style may be pinned.
+		expect(detectIndentation("\ta\n    b\n")).toEqual({
+			style: "space",
+			width: 2,
+		});
+	});
+
+	it("ignores tab-indented lines when it looks for a space unit's boundary", () => {
+		// Kills the `^` anchor dropped from `/^( *)\S/` (a tab line then counted
+		// as a zero-indent line and manufactured a structural boundary): two
+		// 4-space runs behind a tab line prove no unit, so nothing is pinned.
+		expect(detectIndentation("\ta\n    b\n    c\n")).toBeUndefined();
+	});
+
+	it("pins a width of exactly 8 from a structural boundary, and from a GCD of exactly 8", () => {
+		// Kills `minimum <= 8` as `< 8` and `gcd <= 8` as `< 8`: 8 is the widest
+		// unit the detector accepts, on both routes to it.
+		expect(detectIndentation("a\n        b\n")).toEqual({
+			style: "space",
+			width: 8,
+		});
+		// 16/24 with no shallower line before them: no boundary, GCD 8.
+		expect(
+			detectIndentation("                a\n                        b\n"),
+		).toEqual({ style: "space", width: 8 });
+	});
+
+	it("sees an indented block-comment opener, but not one behind a line comment", () => {
+		// Kills `line.indexOf("//")` emptied (every opener not at column 0 read as
+		// sitting behind a line comment), and `blockAt + 2` as `blockAt - 2` (the
+		// `*` of `/*/` counted as its own closer).
+		expect(blockCommentInteriorMask(["    /*", "     * x", "     */"])).toEqual(
+			[false, true, true],
+		);
+		expect(blockCommentInteriorMask(["// see /*", "  x"])).toEqual([
+			false,
+			false,
+		]);
+		expect(blockCommentInteriorMask(["/*/", "  x", "*/"])).toEqual([
+			false,
+			true,
+			true,
+		]);
+	});
+
+	it("still closes a template whose last line closes it, and clears one that never closes", () => {
+		// Kills `hasLiveFrame(stack)` forced true in the end-of-file fail-safe: a
+		// template that closes on the final line was wiped as if unterminated.
+		expect(templateLiteralInteriorMask(["a = `", "  inner", "`;"])).toEqual([
+			false,
+			true,
+			true,
+		]);
+		expect(templateLiteralInteriorMask(["a = `", "  inner"])).toEqual([
+			false,
+			false,
+		]);
+	});
+
+	it("skips a closed string, escapes and both quote kinds without losing the backtick that follows", () => {
+		// Kills skipQuoted's escape handling (`\\` block emptied, condition forced
+		// true or negated), its terminator test forced false, `j + 1` as `j - 1`
+		// and the `j < line.length` loop negated or inverted, plus the `'` quote
+		// test forced false or emptied: each ate the rest of the line or opened a
+		// template inside a string, so the backtick after the string was lost (or
+		// one inside it was found).
+		const opener = (prefix: string) =>
+			templateLiteralInteriorMask([`${prefix} + \``, "  inner", "`;"]);
+		const opens = [false, true, true];
+		expect(opener('const s = "x"')).toEqual(opens);
+		expect(opener("const s = 'x'")).toEqual(opens);
+		expect(opener('const s = "q\\""')).toEqual(opens);
+		// An ESCAPED backtick inside a string opens nothing (kills `j += 2` as
+		// `j -= 2`, which returned into the middle of the string).
+		expect(
+			templateLiteralInteriorMask(['const s = "\\`";', "  not inside", "`;"]),
+		).toEqual([false, false, false]);
+		// A backtick INSIDE a single-quoted string opens nothing.
+		// (The closing backtick on line 3 makes a wrongly opened template a
+		// well-formed one, so the fail-safe for unterminated templates cannot
+		// hide the mistake.)
+		expect(
+			templateLiteralInteriorMask(["const s = '`';", "  not inside", "`;"]),
+		).toEqual([false, false, false]);
+	});
+
+	it("keeps a `//` that follows an operator a line comment, not an empty regex", () => {
+		// Kills `line.startsWith("//", j)` as `endsWith`: after `=` the first `/`
+		// is a regex-opener position, so a late comment test read `//` as an empty
+		// regex literal and then found the backtick in the comment.
+		expect(
+			templateLiteralInteriorMask(["x = // use `tick`", "  after", "y"]),
+		).toEqual([false, false, false]);
+	});
+
+	it("recognises a regex literal after each opener punctuation, so its backtick opens nothing", () => {
+		// Kills each member of REGEX_OPENER_PUNCTUATION emptied (`(` `,` `=` `:` `[`
+		// `!` `&` `|` `?`): the `/` after it was read as division and the backtick
+		// in the pattern opened a template that swallowed the next line.
+		for (const punctuation of ["(", ",", "=", ":", "[", "!", "&", "|", "?"]) {
+			expect(
+				templateLiteralInteriorMask([`x ${punctuation} /\`/`, "  after", "`;"]),
+				punctuation,
+			).toEqual([false, false, false]);
+		}
+	});
+
+	it("tolerates several spaces between the opener and the regex, and a keyword opener, but not a longer identifier", () => {
+		// Kills the trailing-whitespace trim `/[ \t]+$/` as a single character, and
+		// the `$` end anchor dropped from the `return|typeof|case` pattern (so
+		// `returned / ...` read the `/` as a regex opener).
+		expect(
+			templateLiteralInteriorMask(["foo(   /`/.test(a)", "  after", "`;"]),
+		).toEqual([false, false, false]);
+		expect(
+			templateLiteralInteriorMask(["return   /`/.test(a)", "  after", "`;"]),
+		).toEqual([false, false, false]);
+		// `returned` is an identifier, so this `/` divides and the backtick opens.
+		expect(
+			templateLiteralInteriorMask(["y = returned / `a / 2", "  inner", "`;"]),
+		).toEqual([false, true, true]);
+	});
+
+	it("closes a regex's character class at `]`, so a `/` inside the class does not end the literal", () => {
+		// Kills the in-class `c === "]"` test forced true or negated: the class
+		// ended at its first character and the `/` inside it closed the regex
+		// early, exposing the backtick after it.
+		expect(
+			templateLiteralInteriorMask(["x = /[ab/`]/;", "  after", "`;"]),
+		).toEqual([false, false, false]);
+	});
+
+	it("rejects a regex-shaped span whose closing slash is followed by more identifier text", () => {
+		// Kills the flag-skipping loop's `k += 1` as `k -= 1`: `/x/gz` is not a
+		// regex literal (flags `g` then the stray `z`), so the backtick inside it
+		// is real and opens a template.
+		expect(
+			templateLiteralInteriorMask(["a = /x`/gz;", "  inner", "`;"]),
+		).toEqual([false, true, true]);
+		// While a real flag run ends the literal and hides the same backtick.
+		expect(
+			templateLiteralInteriorMask(["a = /x`/gi;", "  after", "`;"]),
+		).toEqual([false, false, false]);
+	});
+
+	it("resumes scanning code right after a block comment that closes at column 0 of a later line", () => {
+		// Kills `closeAt < 0` as `<= 0`: a line that begins with the closing `*/`
+		// has `closeAt === 0`, and the mutant read that as "still inside".
+		expect(
+			templateLiteralInteriorMask(["x = /* start", "*/ y = `", "tpl", "`;"]),
+		).toEqual([false, false, true, true]);
+	});
+
+	it("resumes scanning exactly after a block comment's closing marker", () => {
+		// Kills `j = closeAt + 2` as `closeAt - 2` (campaign id 197): rescanning
+		// from inside `//*/` read a line comment, so the backtick after the
+		// comment never opened its template and the next lines lost their mask.
+		expect(templateLiteralInteriorMask(["/*a//*/ `x", " y", "`"])).toEqual([
+			false,
+			true,
+			true,
+		]);
+	});
+
+	it("keeps a template open across an escape that ends the line", () => {
+		// Kills the template escape's `j += 2` as `j -= 2` (campaign id 210): the
+		// mutant stepped back onto the opening backtick, closed the template and
+		// left the next line unmasked. Bounded on purpose: this input ends the line
+		// on the escape, so the mutant fails here instead of hanging the suite the
+		// way a mid-line `\x` escape does.
+		expect(templateLiteralInteriorMask(["`\\", "  z", "`;"])).toEqual([
+			false,
+			true,
+			true,
+		]);
+	});
+
+	it("treats doubly tab-indented content as detectable indentation", () => {
+		// Kills `\t+` narrowed to `\t` in hasDetectableIndentation: the content has
+		// indentation evidence, and the formatter gate must see it.
+		expect(hasDetectableIndentation("a\n\t\tb\n")).toBe(true);
 	});
 });

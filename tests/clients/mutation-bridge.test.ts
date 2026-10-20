@@ -232,15 +232,93 @@ describe("mutation bridge bookkeeping", () => {
 			expect(runtime.readGuard.checkEdit(filePath, [2, 2]).action).toBe(
 				"block",
 			);
-			// UNKNOWN retires the prior range too; no guessed replacement survives.
+			// UNKNOWN empties the prior range too; no guessed replacement survives.
 			expect(runtime.readGuard.checkEdit(filePath, [3, 3]).action).toBe(
 				"block",
 			);
+			// #4387: an empty scope, not a retirement: no other writer is blamed.
 			expect(
-				getDegradationSummary()
-					.find((group) => group.kind === "read-guard-authorship-retired")
-					?.latestReasons.some((row) => row.subject === filePath),
-			).toBe(true);
+				runtime.readGuard
+					.exportAuthorship()
+					.entries?.find(
+						(entry) =>
+							normalizeFilePath(entry.filePath) === normalizeFilePath(filePath),
+					)?.authoredRanges,
+			).toEqual([]);
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+
+	// #4387: over a whole-file authorship an UNKNOWN range is moot, so the
+	// writer rule decides, as for a partial credit (#4210 N3): the licensed
+	// observed replay advances it, and one its call did not license ends it.
+	// Recurrence: the UNKNOWN short-circuit ended every authorship, including
+	// the ones a checked writer of the conversation's own call advanced.
+	it("advances whole-file authorship over a licensed observed replay with no range only with a bounding read, and ends it over an unlicensed one (#4387)", () => {
+		const env = setupTestEnvironment("pi-lens-4387-observed-unknown-whole-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			const run = (name: string, licensed: boolean, bounded: boolean) => {
+				const filePath = path.join(env.tmpDir, name);
+				fs.writeFileSync(filePath, "one\ntwo\nthree\n");
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+				runtime.setTelemetryIdentity({ sessionId: `s-4387-${name}` });
+				runtime.beginTurn();
+				const deps = makeDeps({
+					tmpDir: env.tmpDir,
+					runtime,
+					cacheManager: new CacheManager(false),
+				});
+				// A whole-file first credit.
+				expect(
+					recordMutationThroughSeam(
+						{ filePath, kind: "write", consumer: "bridge-v1" },
+						deps,
+					),
+				).toBe(true);
+				// The agent's read of the file, which a move keeps with its call.
+				if (bounded)
+					runtime.readGuard.recordRead({
+						filePath,
+						requestedOffset: 1,
+						requestedLimit: 3,
+						effectiveOffset: 1,
+						effectiveLimit: 3,
+						expandedByLsp: false,
+						turnIndex: 0,
+						writeIndex: 0,
+						timestamp: Date.now(),
+						toolCallId: "call-4387-read",
+					});
+				if (licensed)
+					runtime.readGuard.noteCheckedPaths("call-4387-observed", [filePath]);
+				fs.writeFileSync(filePath, "one\nobserved\nthree\nfour\n");
+				expect(
+					recordMutationThroughSeam(
+						{
+							filePath,
+							kind: "edit",
+							consumer: "observed-replay",
+							provenance: "observed",
+							toolCallId: "call-4387-observed",
+						},
+						deps,
+					),
+				).toBe(true);
+				return runtime.readGuard
+					.exportAuthorship()
+					.entries?.find((entry) => path.basename(entry.filePath) === name);
+			};
+			const licensed = run("licensed.ts", true, true);
+			expect(licensed?.retired).toBeUndefined();
+			expect(licensed?.authoredRanges).toBeUndefined();
+			expect(run("unbounded.ts", true, false)?.authoredRanges).toEqual([]);
+			expect(run("unlicensed.ts", false, true)?.retired).toBe(true);
 		} finally {
 			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
 			else process.env.PILENS_DATA_DIR = previousDataDir;

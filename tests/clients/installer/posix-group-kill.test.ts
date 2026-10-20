@@ -17,7 +17,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { safeSpawnAsync } from "../../../clients/safe-spawn.js";
 import { removeTempDirSync } from "../test-utils.js";
@@ -62,13 +62,11 @@ describe("safeSpawnAsync POSIX process-group kill (#2026/#2027)", () => {
 			);
 			fs.chmodSync(script, 0o755);
 
-			const transient = vi.fn();
 			const result = await safeSpawnAsync(script, ["--version"], {
 				timeout: 300,
 			});
 
 			expect(result.status === null || result.signal !== undefined).toBe(true);
-			expect(transient).toHaveBeenCalledTimes(0); // not wired here
 
 			// Poll past the writer's scheduled mark (+6s): the group kill must
 			// have taken out the hardy grandchild too.
@@ -81,7 +79,7 @@ describe("safeSpawnAsync POSIX process-group kill (#2026/#2027)", () => {
 	);
 
 	d(
-		"a live group gets the delayed SIGKILL even when the direct child exits first",
+		"a direct child that exits normally triggers no kill on its live group",
 		async () => {
 			const marker = path.join(repoDir, "hardy-grandchild.marker");
 			const writer = writeHardyWriter(marker);

@@ -1,0 +1,48 @@
+{
+	"provenance": {
+		"runner": "zig-check",
+		"tool": "zig",
+		"version": "0.17.0",
+		"command": "zig build-exe bad.zig -fno-emit-bin",
+		"argv": [
+			"build-exe",
+			"bad.zig",
+			"-fno-emit-bin"
+		],
+		"workspace": "tests/fixtures/tool-smoke/zig",
+		"platform": "linux-x64",
+		"capturedAt": "2026-10-14",
+		"versionArgv": [
+			"version"
+		]
+	},
+	"file": "bad.zig",
+	"exitCode": 1,
+	"stdout": "",
+	"stderr": "bad.zig:3:11: error: unused local constant\n    const x: u32 = 5;\n          ^\n",
+	"availability": [
+		{
+			"command": "zig",
+			"argv": [
+				"version"
+			],
+			"version": "0.17.0",
+			"exitCode": 0,
+			"stdout": "0.17.0\n",
+			"stderr": ""
+		}
+	],
+	"clean": {
+		"workspace": "tests/fixtures/runner-output-clean/zig-check",
+		"file": "bad.zig",
+		"argv": [
+			"build-exe",
+			"bad.zig",
+			"-fno-emit-bin"
+		],
+		"version": "0.17.0",
+		"exitCode": 0,
+		"stdout": "",
+		"stderr": ""
+	}
+}

@@ -77,8 +77,12 @@ function readStepRun(
 	return step.run;
 }
 
-function evaluateIf(expr: string, eventName: string): boolean {
+// `scope` is the #4291 deep-smoke verdict (`needs.scope.outputs.smoke`); a
+// gate that does not read it ignores the argument.
+function evaluateIf(expr: string, eventName: string, scope = "true"): boolean {
 	const substituted = expr
+		.split("needs.scope.outputs.smoke")
+		.join(JSON.stringify(scope))
 		.split("github.event_name")
 		.join(JSON.stringify(eventName));
 	if (substituted.includes("github.")) {
@@ -113,7 +117,7 @@ describe("install-smoke.yml job event gates (#2613 review T1)", () => {
 		expect(GATES.map(([name]) => name)).toEqual(["host-latest-smoke"]);
 	});
 
-	it.each(["host-range-smoke", "pi-load", "smoke", "mise-repro"])(
+	it.each(["host-range-smoke", "smoke", "mise-repro"])(
 		"%s deliberately carries no event gate (its matrix is the whole gate)",
 		(jobName) => {
 			expect(workflow.jobs?.[jobName]?.if).toBeUndefined();
@@ -335,11 +339,17 @@ describe("PI_HOST_SUPPORTED_RANGE is a genuinely bounded range, never a wildcard
 // `github.event_name`, string equality, `&&`/`||`, and `fromJSON` of a
 // literal. JS agrees with Actions on all of it (and `A && X || Y` picks X
 // when A holds, Y otherwise, in both languages).
-function evaluateMatrixExpression(raw: unknown, eventName: string): unknown {
+function evaluateMatrixExpression(
+	raw: unknown,
+	eventName: string,
+	scope = "false",
+): unknown {
 	if (typeof raw !== "string") return raw;
 	const body = raw.trim().match(/^\$\{\{([\s\S]*)\}\}$/)?.[1];
 	if (body === undefined) return raw;
 	const substituted = body
+		.split("needs.scope.outputs.smoke")
+		.join(JSON.stringify(scope))
 		.split("github.event_name")
 		.join(JSON.stringify(eventName))
 		.split("fromJSON(")
@@ -363,6 +373,8 @@ type MatrixGatedJob = {
 	prCells: readonly string[];
 	/** Cells that run on every non-PR event. */
 	fullCells: readonly string[];
+	/** #4291: cells on a pull_request `scope` marks deep, when they differ. */
+	deepCells?: readonly string[];
 };
 
 const MATRIX_GATED_JOBS: readonly MatrixGatedJob[] = [
@@ -370,6 +382,12 @@ const MATRIX_GATED_JOBS: readonly MatrixGatedJob[] = [
 		job: "pi-load",
 		axis: "pi_install",
 		prCells: ["ubuntu-latest · pnpm-global"],
+		deepCells: [
+			"ubuntu-latest · npm-global",
+			"ubuntu-latest · pnpm-global",
+			"ubuntu-latest · bun-global",
+			"ubuntu-latest · curl",
+		],
 		fullCells: [
 			"ubuntu-latest · npm-global",
 			"ubuntu-latest · pnpm-global",
@@ -411,7 +429,7 @@ const MATRIX_GATED_JOBS: readonly MatrixGatedJob[] = [
 
 describe.each(MATRIX_GATED_JOBS)(
 	"install-smoke.yml $job matrix: a pull_request-eligible cell, not an event gate (#3043)",
-	({ job, axis, prCells, fullCells }) => {
+	({ job, axis, prCells, fullCells, deepCells }) => {
 		const workflow = loadWorkflow() as unknown as {
 			jobs?: Record<
 				string,
@@ -420,14 +438,22 @@ describe.each(MATRIX_GATED_JOBS)(
 		};
 		const matrix = workflow.jobs?.[job]?.strategy?.matrix;
 
-		function cellsFor(eventName: string): string[] {
-			const os = evaluateMatrixExpression(matrix?.os, eventName) as string[];
+		function cellsFor(eventName: string, scope = "false"): string[] {
+			const os = evaluateMatrixExpression(
+				matrix?.os,
+				eventName,
+				scope,
+			) as string[];
 			const axisValues = evaluateMatrixExpression(
 				matrix?.[axis],
 				eventName,
+				scope,
 			) as string[];
-			const exclude = (evaluateMatrixExpression(matrix?.exclude, eventName) ??
-				[]) as Array<Record<string, string>>;
+			const exclude = (evaluateMatrixExpression(
+				matrix?.exclude,
+				eventName,
+				scope,
+			) ?? []) as Array<Record<string, string>>;
 			return os
 				.flatMap((osValue) =>
 					axisValues.map((axisValue) => ({ os: osValue, [axis]: axisValue })),
@@ -446,8 +472,12 @@ describe.each(MATRIX_GATED_JOBS)(
 				);
 		}
 
-		it("carries no job-level `if:` (the matrix is the whole gate)", () => {
-			expect(workflow.jobs?.[job]?.if).toBeUndefined();
+		// pi-load alone carries `!cancelled()` (#4291 F4): not an event gate, it
+		// only keeps the job alive when `scope` fails.
+		it("carries no event gate (the matrix is the whole gate)", () => {
+			expect(workflow.jobs?.[job]?.if).toBe(
+				job === "pi-load" ? "${{ !cancelled() }}" : undefined,
+			);
 		});
 
 		it(`runs exactly ${prCells.join(", ")} on pull_request`, () => {
@@ -461,6 +491,25 @@ describe.each(MATRIX_GATED_JOBS)(
 			},
 		);
 
+		// Recurrence (#4291): #4409 passed its PR run on the one pnpm-global cell
+		// and broke npm-global, bun-global and curl on master. A deep pull_request
+		// runs every pi-install cell on ubuntu; macOS stays push-only. A scope
+		// verdict that is missing (the scope job failed) must not narrow, so only
+		// an explicit "false" does.
+		if (deepCells !== undefined) {
+			it("runs every pi-install cell on ubuntu for a deep pull_request", () => {
+				expect(cellsFor("pull_request", "true").sort()).toEqual(
+					[...deepCells].sort(),
+				);
+			});
+
+			it("fails open to the deep cells when the scope output is missing", () => {
+				expect(cellsFor("pull_request", "").sort()).toEqual(
+					[...deepCells].sort(),
+				);
+			});
+		}
+
 		// The PR-time narrowing is done with `exclude`, NOT by turning `os` into
 		// an expression, because tests/support/workflow-shell-portability.ts
 		// decides "can this job run on macOS?" by looking for a literal `macos-`
@@ -472,6 +521,24 @@ describe.each(MATRIX_GATED_JOBS)(
 		});
 	},
 );
+
+// #4291: the LSP handshake job runs on a deep pull_request and nowhere else.
+// Recurrence: a handshake that ran on every PR (a runner-hour per PR) or on
+// push and schedule (duplicating tool-smoke.yml's nightly layer).
+describe("install-smoke.yml lsp-handshake gate (#4291)", () => {
+	const ifExpr = readJobIf(loadWorkflow(), "lsp-handshake");
+
+	it.each([
+		["pull_request", "true", true],
+		["pull_request", "false", false],
+		["pull_request", "", false],
+		["push", "true", false],
+		["schedule", "true", false],
+		["workflow_dispatch", "true", false],
+	])("%s with smoke=%j runs: %s", (event, scope, expected) => {
+		expect(evaluateIf(ifExpr, event, scope)).toBe(expected);
+	});
+});
 
 // #4077: `host-latest-smoke` is read-only and runs on any dispatched ref (the
 // gate table above); its tracking issue is written by `host-latest-notify`,

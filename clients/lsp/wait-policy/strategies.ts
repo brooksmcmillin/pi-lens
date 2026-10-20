@@ -260,10 +260,20 @@ export const SERVER_DIAGNOSTIC_STRATEGIES: Record<string, DiagnosticStrategy> =
 			debounceMs: 50,
 			aggregateWaitMs: 1000,
 			expectSemanticSecondPush: false,
-			// #3310 / nightly run 37930006227: the clean TypeScript fixture
-			// published an empty pre-index result before its settled result.
-			// Hold that first publish so it cannot resolve a push wait as clean.
-			emptyFirstPublish: "indexing",
+			// #4615: NO `emptyFirstPublish` marker. Measured 2026-10-20 over a raw
+			// JSON-RPC wire against typescript-language-server@5.3.0 with
+			// typescript@5.9.3: the DIRTY fixture's first publish already carries
+			// the finding (code 2322) — `direct`, so holding it can only delay the
+			// answer — and a CLEAN file's only publish is an EMPTY settled answer
+			// (one publish, nothing after it, nothing on the edit). The hold
+			// swallows that answer, so a first clean touch stays unconfirmed and
+			// spends the full `aggregateWaitMs` budget for a verdict the server had
+			// already sent. The `empty-first` this row used to carry was measured on
+			// the `typescript-clean` fixture, whose publish trace was scoped by
+			// server id alone while five live fixtures share "typescript": a foreign
+			// client's late publish decided the class (#4615). The axis is defined on
+			// a DIRTY file and docs/lsp-capability-matrix.md now records this row's
+			// measured `direct`; a `clean: true` fixture can never be its source.
 			// Tier 3 (#458): typescript-language-server publishes nothing on a
 			// clean→clean edit (docs/lsp-capability-matrix.md, re-confirmed
 			// 2026-07-12). It's the lone core-set tier-3 server, which is exactly

@@ -1,6 +1,15 @@
 /**
  * Tests for #3693: Appending context injection to active user prompt to preserve KV cache
  * for local models (llama.cpp / Qwen) and prefix-caching providers.
+ *
+ * TWO TIERS (#4632). The first and the fourth case run through a REAL pi
+ * session (`tests/support/pi-session.ts`, tier 2): the extension is the built
+ * `index.js` loaded by pi's own loader, and the observable is the message the
+ * SCRIPTED MODEL received, after pi's own request processing. Every other case
+ * here asserts pi-lens's own return-value shaping for transcripts a scripted
+ * provider cannot produce — an image block list, an empty array, a custom
+ * `{ weird: true }` content object, an empty transcript — so those stay on the
+ * pi double, which is the cheaper and only possible driver for them.
  */
 
 import * as fs from "node:fs";
@@ -10,8 +19,24 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CacheManager } from "../../clients/cache-manager.js";
 import { _resetProcessSingletonsForTests } from "../../clients/process-singletons.js";
 import { createPiMock, makeCtx } from "../support/pi-mock.js";
+import {
+	fauxAssistantMessage,
+	fauxText,
+	fauxToolCall,
+	piSessionFixture,
+	startPiSession,
+} from "../support/pi-session.js";
 
 const TIMEOUT_MS = 30_000;
+
+/** The delimiter every injected block is prefixed with. */
+const INJECTION_DELIMITER = "[pi-lens automated context — not a user request]";
+
+const fixture = piSessionFixture();
+// No per-case handle list: the helper registers every session it creates and
+// disposes the live ones in its own `afterEach`, so a case that fails before
+// `dispose()` cannot leak one (#4664 M2).
+const sessionCwd = (name: string) => path.join(fixture.root, name, "proj");
 
 let tmpDir: string;
 
@@ -36,42 +61,36 @@ async function loadContextHandler() {
 
 describe("context injection appends to last user message (#3693)", () => {
 	it(
-		"appends findings to a string user prompt with delimiter and preserves original message immutability",
+		"appends the injected block to the prompt the model actually receives, on a real pi turn",
 		async () => {
-			const { context } = await loadContextHandler();
-
-			new CacheManager(false).writeCache(
-				"session-start-guidance",
-				{ content: "Always verify tests." },
-				tmpDir,
-			);
-
-			const originalUser = { role: "user", content: "Optimize performance" };
-			const originalUserSnapshot = JSON.stringify(originalUser);
-			const existing = [{ role: "assistant", content: "Ready." }, originalUser];
-
-			const result = (await context(
-				{ messages: existing },
-				makeCtx({ cwd: tmpDir, sessionId: "sess-1" }),
-			)) as { messages: Array<{ role: string; content: unknown }> };
-
-			expect(result).toBeDefined();
-			expect(result.messages).toHaveLength(2);
-			expect(result.messages[0]).toEqual({
-				role: "assistant",
-				content: "Ready.",
+			const handle = await startPiSession({
+				root: fixture.root,
+				cwd: sessionCwd("string-prompt"),
+				responses: [fauxAssistantMessage(fauxText("ready"))],
 			});
 
-			const updatedUser = result.messages[1];
-			expect(updatedUser.role).toBe("user");
-			expect(updatedUser.content).toBe(
-				"Optimize performance\n\n[pi-lens automated context — not a user request]\n\nAlways verify tests.",
-			);
+			await handle.prompt("Optimize performance");
 
-			// Constraint 1: Never mutate original message object in place
-			expect(updatedUser).not.toBe(originalUser);
-			expect(JSON.stringify(originalUser)).toBe(originalUserSnapshot);
-			expect(originalUser.content).toBe("Optimize performance");
+			// What the model received on the turn, as pi built it: the host's
+			// own system head, then ONE user message carrying the prompt and the
+			// injected block — appended, not added as its own message.
+			const transcript = handle.requests[0];
+			expect(transcript[0]).toMatchObject({ role: "system" });
+			expect(transcript).toHaveLength(2);
+			const blocks = transcript[1].content as Array<{
+				type: string;
+				text: string;
+			}>;
+			expect(blocks[0]).toEqual({
+				type: "text",
+				text: "Optimize performance",
+			});
+			expect(blocks[1].type).toBe("text");
+			// The delimiter opens the block, exactly as the unit-level cases
+			// above require; the body is pi-lens's own session-start guidance.
+			expect(blocks[1].text.startsWith(INJECTION_DELIMITER)).toBe(true);
+			expect(blocks[1].text).toContain("pi-lens active");
+			expect(handle.errors).toEqual([]);
 		},
 		TIMEOUT_MS,
 	);
@@ -202,40 +221,53 @@ describe("context injection appends to last user message (#3693)", () => {
 	);
 
 	it(
-		"preserves trailing tool_result adjacency by appending after transcript instead of into tool_result",
+		"appends after a trailing tool result on a real pi turn instead of into it",
 		async () => {
-			const { context } = await loadContextHandler();
-
-			new CacheManager(false).writeCache(
-				"session-start-guidance",
-				{ content: "Tool findings." },
-				tmpDir,
-			);
-
-			const toolUse = {
-				role: "assistant",
-				content: [{ type: "tool_use", id: "call_1", name: "read", input: {} }],
-			};
-			const toolResult = {
-				role: "user",
-				content: [
-					{ type: "tool_result", tool_use_id: "call_1", content: "ok" },
+			// The cache the request hook consumes is staged while pi assembles
+			// the FIRST request, so it is present for the request that follows
+			// the tool call — the transcript that ends in a tool result.
+			const MID_RUN = "MIDRUN-GUIDANCE";
+			const handle = await startPiSession({
+				root: fixture.root,
+				cwd: sessionCwd("tool-result-adjacency"),
+				responses: [
+					() => {
+						new CacheManager(false).writeCache(
+							"session-start-guidance",
+							{ content: MID_RUN },
+							sessionCwd("tool-result-adjacency"),
+						);
+						return fauxAssistantMessage([
+							fauxText("checking"),
+							fauxToolCall("lens_diagnostics", { paths: [] }),
+						]);
+					},
+					fauxAssistantMessage(fauxText("done")),
 				],
-			};
-			const existing = [toolUse, toolResult];
+			});
 
-			const result = (await context(
-				{ messages: existing },
-				makeCtx({ cwd: tmpDir, sessionId: "sess-5" }),
-			)) as { messages: Array<{ role: string; content: unknown }> };
+			await handle.prompt("keep working");
 
-			expect(result).toBeDefined();
-			// Injected message must be appended AFTER the tool_result message
-			expect(result.messages).toHaveLength(3);
-			expect(result.messages[0]).toBe(toolUse);
-			expect(result.messages[1]).toBe(toolResult);
-			expect(result.messages[2].role).toBe("user");
-			expect(result.messages[2].content).toContain("Tool findings.");
+			// pi's own transcript: system head, the prompt, the assistant's call,
+			// the tool result — then the injection as a NEW user message.
+			const second = handle.requests[1];
+			expect(second.map((message) => message.role)).toEqual([
+				"system",
+				"user",
+				"assistant",
+				"toolResult",
+				"user",
+			]);
+
+			// Nothing was appended inside the tool result: it still carries the
+			// tool's own answer only.
+			const toolResultText = JSON.stringify(second[3]);
+			expect(toolResultText).not.toContain(MID_RUN);
+			expect(toolResultText).toContain("No issues in the current turn delta.");
+
+			// The injection is the trailing message, prefixed with the delimiter.
+			expect(second[4].content).toBe(`${INJECTION_DELIMITER}\n\n${MID_RUN}`);
+			expect(handle.errors).toEqual([]);
 		},
 		TIMEOUT_MS,
 	);

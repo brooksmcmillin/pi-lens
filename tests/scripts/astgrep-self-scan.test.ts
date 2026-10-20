@@ -19,6 +19,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { safeSpawn } from "../../clients/safe-spawn.js";
 import { envFor, gitExecFileSync } from "../../scripts/lib/git-fixture-env.mjs";
+import { copyFixtureGitHelper } from "../support/fixture-git-copy.js";
 import { removeTempDirSync } from "../clients/test-utils.js";
 import {
 	findingSignature,
@@ -497,9 +498,11 @@ describe("self-scan argv and tracked filter (#3886 r3)", () => {
 		for (const rel of [
 			"scripts/run-astgrep-pi-lens.mjs",
 			"scripts/lib/astgrep-self-scan.mjs",
-			"scripts/lib/git-fixture-env.mjs",
 		])
 			put(root, rel, fs.readFileSync(path.join(repoRoot(), rel), "utf8"));
+		// The helper resolves the maintenance policy relative to its own module, so
+		// the policy file is copied with it (#4552 R2).
+		copyFixtureGitHelper(root);
 		for (const rel of ["clients/safe-spawn.js", "clients/string-utils.js"]) {
 			fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
 			fs.symlinkSync(path.join(repoRoot(), rel), path.join(root, rel));

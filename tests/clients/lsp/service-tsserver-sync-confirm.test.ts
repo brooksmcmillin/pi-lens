@@ -26,7 +26,15 @@
  *   d. dirty-file sync winner — findings surfaced, not discarded
  */
 
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	onTestFinished,
+	vi,
+} from "vitest";
 import { normalizeMapKey } from "../../../clients/path-utils.js";
 
 // --- Module-level mocks set up BEFORE any imports of the tested module ---
@@ -240,6 +248,67 @@ describe("#707 per-edit tsserver sync clean-confirm in touchFile", () => {
 		);
 		expect({ ...result! }.binding?.boundToCurrentDisk).toBeDefined();
 	});
+
+	// Recurrence (#4495 review F2): the cascade's command-pull path (#4485)
+	// relies on this confirm for a classic tsserver neighbour, and no CI test
+	// sent a touch shaped like the cascade's; switching the confirm off for
+	// `source: "cascade"` survived 402 tests. The options are the in-lane
+	// compute's waiting touch (clients/dispatch/integration.ts, the
+	// `nameUnansweredPrimaries` touchFile).
+	it(
+		"a cascade-shaped waiting touch gets the sync answer for a classic tsserver neighbour",
+		{ timeout: 3_000 },
+		async () => {
+			const syncDiag = {
+				message: "Type 'number' is not assignable to type 'string'.",
+				category: "error",
+				code: 2322,
+				startLocation: { line: 1, offset: 5 },
+				endLocation: { line: 1, offset: 10 },
+			};
+			process.env.PI_LENS_TSSERVER_SYNC_GRACE_MS = "25";
+			const executeCommand = makeSyncResponse({
+				semanticDiagnosticsSync: [syncDiag],
+			});
+			// Silent on the edit, as classic tsserver is for a neighbour whose
+			// verdict it has not re-checked: the push wait is held until the
+			// case ends, so only the sync can answer. Without the sync the touch
+			// does not settle and the case's own 3 s timeout is the red.
+			let releasePush: () => void = () => {};
+			const heldPush = new Promise<void>((resolve) => {
+				releasePush = resolve;
+			});
+			onTestFinished(() => releasePush());
+			createLSPClient.mockResolvedValue(
+				makeClient({
+					executeCommand,
+					waitForDiagnostics: vi.fn(() => heldPush),
+				}),
+			);
+			getServersForFileWithConfig.mockReturnValue([makeServer("typescript")]);
+
+			const { LSPService } = await import("../../../clients/lsp/index.js");
+			const service = new LSPService();
+
+			const result = await service.touchFile(FILE, "const x: string = 1;\n", {
+				diagnostics: "document",
+				collectDiagnostics: true,
+				maxClientWaitMs: 1000,
+				silent: true,
+				source: "cascade",
+				clientScope: "primary",
+				readStamp: performance.now(),
+				nameUnansweredPrimaries: true,
+			});
+
+			expect(executeCommand).toHaveBeenCalled();
+			expect(result?.diags).toHaveLength(1);
+			expect(result?.diags[0]?.message).toContain(
+				"not assignable to type 'string'",
+			);
+			expect(result?.inconclusive).toBeFalsy();
+		},
+	);
 
 	it("non-typescript server (gopls): sync is never attempted", async () => {
 		// gopls is push-only but NOT silentOnClean — tier3-silent check won't fire

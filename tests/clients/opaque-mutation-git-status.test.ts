@@ -220,6 +220,37 @@ describe("opaque Git status parsing", () => {
 		}
 	});
 
+	// Recurrence: #4493 review r1 residual 3 resolves porcelain paths against
+	// the checkout top found by a file walk. An empty `.git` directory above
+	// the cwd (a stray one existed at `/tmp/.git` on a maintainer host) stopped
+	// that walk, so every path resolved against the wrong directory and the
+	// pre-push run lost this file's dirty paths. Git skips a `.git` directory
+	// with no HEAD; the walk must not answer there either.
+	it("resolves porcelain paths against the cwd when the nearest .git above it is not a repository", async () => {
+		const ghost = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-opaque-status-"),
+		);
+		try {
+			fs.mkdirSync(path.join(ghost, ".git"));
+			const root = path.join(ghost, "proj");
+			fs.mkdirSync(root);
+			const startedAt = Date.now();
+			fs.writeFileSync(path.join(root, "path-0.ts"), "dirty\n", "utf8");
+			safeSpawnAsync.mockResolvedValue({
+				status: 0,
+				stdout: porcelainOutput([" M"]),
+			});
+
+			const outcome = await recoverOpaqueChangesViaGit(root, startedAt);
+
+			expect(outcome.paths).toEqual([
+				normalizeMapKey(path.join(root, "path-0.ts")),
+			]);
+		} finally {
+			fs.rmSync(ghost, { recursive: true, force: true });
+		}
+	});
+
 	it("returns an explicit unknown verdict for unterminated porcelain output", async () => {
 		safeSpawnAsync.mockResolvedValue({
 			status: 0,

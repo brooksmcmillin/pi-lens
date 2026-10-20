@@ -1,9 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import extension from "../../index.js";
 import { McpHarness } from "../mcp/harness.js";
-import { createPiMock } from "../support/pi-mock.js";
+import { startPiRunner } from "../support/pi-runner.js";
 
 type Tool = {
 	name: string;
@@ -57,9 +56,9 @@ describe("trimmed parameter schema structure (#2800 item 13)", () => {
 	let mcpTools: Tool[];
 
 	beforeAll(async () => {
-		const pi = createPiMock();
-		extension(pi.asExtensionAPI());
-		piTools = [...pi.tools.values()] as Tool[];
+		// The real host's tool definitions, not the registration arguments (#4632).
+		const pi = await startPiRunner();
+		piTools = pi.getAllRegisteredTools().map((tool) => tool.definition);
 		mcp = new McpHarness();
 		const listed = await mcp.request(1, "tools/list");
 		mcpTools = ((listed.result as { tools: Tool[] }).tools ?? []) as Tool[];

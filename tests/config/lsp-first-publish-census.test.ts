@@ -36,7 +36,13 @@ import {
 	COMPARABLE_FIRST_PUBLISH,
 	strategyKeyForLang,
 } from "../../scripts/lib/clean-signal.mjs";
-import { parseTable } from "../../scripts/lib/md-matrix.mjs";
+import {
+	FIRST_PUBLISH_EXPIRY_DAYS,
+	elapsedDays,
+	parseRefreshState,
+	parseTable,
+	refreshCapabilityMatrix,
+} from "../../scripts/lib/md-matrix.mjs";
 import { SERVER_DIAGNOSTIC_STRATEGIES } from "../../clients/lsp/wait-policy/strategies.js";
 
 const repoRoot = path.resolve(
@@ -51,8 +57,7 @@ interface MatrixRow {
 	firstPublish: string;
 }
 
-function matrixRows(): MatrixRow[] {
-	const text = fs.readFileSync(MATRIX_PATH, "utf8");
+function matrixRows(text = fs.readFileSync(MATRIX_PATH, "utf8")): MatrixRow[] {
 	const table = parseTable(text, "| lang | server |");
 	expect(table, "capability matrix table is parseable").not.toBeNull();
 	const header = table!.header;
@@ -112,6 +117,103 @@ describe("#3310 first-publish census", () => {
 			.map(([serverId]) => serverId)
 			.filter((serverId) => !langs.has(serverId));
 		expect(orphans).toEqual([]);
+	});
+
+	/**
+	 * #4615: the other direction of the same census. An `empty-first` cell is
+	 * never expired (it backs a live `emptyFirstPublish` marker), which made the
+	 * cell+marker pair immortal: a probe that stopped observing the axis left the
+	 * cell standing with nothing behind it, and the census — comparing the two
+	 * committed sources only — could not tell a dead instrument from a healthy
+	 * one. `refreshCapabilityMatrix` now stamps the first unobserved night, the
+	 * same `firstMissed` clock a stale `direct` cell gets; this rule reds when
+	 * that stamp is old enough that the cell's measurement can no longer be
+	 * called live.
+	 *
+	 * The rule is bounded by the nightly, and says so: a cell with no stamp (an
+	 * unstamped committed cell, or one a human flipped) is not named here until a
+	 * full nightly miss writes one. So a green census means "observed since the
+	 * last miss, or not yet missed by a full nightly" — the accepted p3 residual,
+	 * not a claim that every unstamped cell was observed recently.
+	 */
+	function unbackedEmptyFirstCells(
+		text: string,
+		today = new Date().toISOString().slice(0, 10),
+	): string[] {
+		const state = parseRefreshState(text)["first-publish"] ?? {};
+		const stale: string[] = [];
+		for (const row of matrixRows(text)) {
+			if (row.firstPublish !== "empty-first") continue;
+			const elapsed = elapsedDays(state[row.lang]?.firstMissed, today);
+			if (elapsed === null || elapsed < FIRST_PUBLISH_EXPIRY_DAYS) continue;
+			stale.push(
+				`${row.lang} (${row.server}): first-publish is empty-first and backs a live emptyFirstPublish marker, but the probe has not observed that axis since ${state[row.lang]?.firstMissed} (${elapsed} days) — the cell is standing on no measurement`,
+			);
+		}
+		return stale;
+	}
+
+	it("keeps every committed empty-first cell backed by a live measurement", () => {
+		expect(
+			unbackedEmptyFirstCells(fs.readFileSync(MATRIX_PATH, "utf8")),
+		).toEqual([]);
+	});
+
+	it("names an empty-first cell whose axis the probe stopped observing (#4615 plant)", () => {
+		// Plant: the real matrix, refreshed for a month of nights that observed
+		// nothing on the first-publish axis — the dead-instrument shape of #3310,
+		// in the direction the expiry cannot reach on its own.
+		const real = fs.readFileSync(MATRIX_PATH, "utf8");
+		let text = refreshCapabilityMatrix(real, [], {
+			src: "ci",
+			now: "2026-09-01",
+		}).text;
+		text = refreshCapabilityMatrix(text, [], {
+			src: "ci",
+			now: "2026-09-20",
+		}).text;
+		const unbacked = unbackedEmptyFirstCells(text, "2026-09-20");
+		expect(unbacked.map((line) => line.split(" ")[0]).sort()).toEqual([
+			"php",
+			"terraform",
+		]);
+		expect(unbacked.join("\n")).toContain("standing on no measurement");
+		// The cells themselves are NOT expired: they still back their markers.
+		const table = parseTable(text, "| lang | server |")!;
+		const langIdx = table.header.indexOf("lang");
+		const fpIdx = table.header.indexOf("first-publish");
+		for (const lang of ["php", "terraform"]) {
+			const cells = table.rows.find((row) => row[langIdx] === lang)!;
+			expect(cells[fpIdx], lang).toBe("empty-first");
+		}
+	});
+
+	it("clears the miss stamp when the axis is observed again", () => {
+		// The reverse direction: a live measurement makes the cell back its marker
+		// again, so the census rule stops naming it.
+		const real = fs.readFileSync(MATRIX_PATH, "utf8");
+		let text = refreshCapabilityMatrix(real, [], {
+			src: "ci",
+			now: "2026-09-01",
+		}).text;
+		text = refreshCapabilityMatrix(
+			text,
+			[
+				{
+					lang: "php",
+					firstPublish: "empty-first",
+					cleanBehavior: null,
+					tier: null,
+				},
+			],
+			{ src: "ci", now: "2026-09-20" },
+		).text;
+		expect(unbackedEmptyFirstCells(text, "2026-09-20")).toEqual([
+			expect.stringContaining("terraform"),
+		]);
+		expect(unbackedEmptyFirstCells(text, "2026-09-20").join(" ")).not.toContain(
+			"php",
+		);
 	});
 
 	it("never marks one server both seedFirstPush and emptyFirstPublish", () => {

@@ -119,7 +119,10 @@ function makeSilentClient(serverId: string, root: string) {
 		getLaunchVariant: () => undefined,
 		serverId,
 		root,
-		notify: { open: vi.fn(async () => {}) },
+		notify: {
+			announceCreated: () => undefined,
+			open: vi.fn(async () => {}),
+		},
 		waitForDiagnostics: vi.fn(async (_filePath: string, ms: number) => {
 			await new Promise<void>((resolve) => {
 				const t = setTimeout(resolve, ms);

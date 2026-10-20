@@ -210,6 +210,7 @@ import {
 	stripAnsi,
 	stripLineTimestamps,
 } from "./lib/ci-failure-classifier.mjs";
+import { githubHeaders } from "./lib/github-rest.mjs";
 import { parseVitestSummary } from "./lib/vitest-summary.mjs";
 import {
 	CHANGES_CHECK,
@@ -2217,11 +2218,7 @@ async function restGet(
 	try {
 		response = await fetchImpl(`${apiBase}/${path}`, {
 			signal: AbortSignal.timeout(timeoutMs),
-			headers: {
-				Accept: "application/vnd.github+json",
-				Authorization: `Bearer ${token}`,
-				"X-GitHub-Api-Version": "2022-11-28",
-			},
+			headers: githubHeaders(token),
 		});
 	} catch (error) {
 		if (error?.name === "TimeoutError" || error?.name === "AbortError") {

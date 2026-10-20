@@ -16,6 +16,7 @@ import {
 } from "../../scripts/lane-check.mjs";
 import { acquireTestLock, getLockPath } from "../../scripts/lib/suite-lock.mjs";
 import { setupTestEnvironment } from "../clients/test-utils.js";
+import { copyFixtureGitHelper } from "../support/fixture-git-copy.js";
 import { gitExecFileSync, gitFixtureEnv } from "../support/git-fixture-env.js";
 
 const LANE_CHECK = path.resolve("scripts/lane-check.mjs");
@@ -42,7 +43,7 @@ type LaneSpec = {
 	detach?: boolean;
 };
 
-const packageJson = (buildExit = 0, distBuildExit = 0) =>
+const packageJson = (buildExit = 0, distBuildExit = 0, depcruiseExit = 0) =>
 	JSON.stringify({
 		name: "lane-fixture",
 		private: true,
@@ -52,6 +53,7 @@ const packageJson = (buildExit = 0, distBuildExit = 0) =>
 			"build:dist": `node -e "process.env.BUILD_LOG && require('fs').appendFileSync(process.env.BUILD_LOG, 'd\\n'); if (${distBuildExit}) process.exit(${distBuildExit}); require('fs').mkdirSync('dist/clients/lsp', {recursive:true}); require('fs').writeFileSync('dist/clients/lsp/server-traits.js', '')"`,
 			"test:targeted": "node scripts/with-test-lock.mjs --shared -- vitest run",
 			"astgrep:self-scan": 'node -e ""',
+			"depcruise:check": `node -e "process.exit(${depcruiseExit})"`,
 		},
 	});
 const GREEN = 'import { it } from "vitest";\nit("green", () => {});\n';
@@ -92,6 +94,10 @@ function makeLane(spec: LaneSpec) {
 	// A copy, not a symlink: with-test-lock.mjs is a no-op behind a symlinked
 	// `scripts/` (its entry-point check compares real paths).
 	fs.cpSync(REAL_SCRIPTS, path.join(root, "scripts"), { recursive: true });
+	// The copied scripts run their own Git reads (lane-check's changelog check,
+	// check-pr-body, red-on-base), so the copied helper needs its policy file:
+	// without it the helper refuses, every case lands on `unproven` (#4552 R2).
+	copyFixtureGitHelper(root);
 	fs.copyFileSync(OXFMTRC, path.join(root, ".oxfmtrc.json"));
 	fs.symlinkSync(REAL_NODE_MODULES, path.join(root, "node_modules"), "dir");
 	const write = (files: Files) => {
@@ -581,6 +587,26 @@ describe("lane-check verdict table (#4047 round 2)", () => {
 		TIMEOUT,
 	);
 
+	// #4344 r2: a declared-client-leaf violation redded CI's Dependency
+	// boundaries job after a lane:check that never ran the cruise.
+	it(
+		"a failed dependency-boundary check is unproven, exit 3, with every test green",
+		() => {
+			const lane = makeLane({
+				base: BASE_FILES,
+				head: { "package.json": packageJson(0, 0, 1) },
+			});
+			const run = runLane(lane);
+			expect(run.status).toBe(3);
+			expect(run.record.checks.depcruise).toBe(1);
+			expect(run.record.findings).toContainEqual({
+				kind: "unproven",
+				reason: "check depcruise failed (exit 1)",
+			});
+		},
+		TIMEOUT,
+	);
+
 	it(
 		"an unformatted untracked file is checked too: unproven, exit 3",
 		() => {
@@ -617,12 +643,14 @@ describe("lane-check verdict table (#4047 round 2)", () => {
 
 	// Recurrence (#4074 verify r2 F1): one comment line in a hub file matched 144
 	// test files, the selector ran only the governance registries and exited 0,
-	// and lane:check printed `verdict: clean`.
+	// and lane:check printed `verdict: clean`. Since #4489 the capped run also
+	// keeps the change's own tests and the best 25 import matches; it is still
+	// unproven, because the matches past the cap did not run.
 	it(
 		"a capped selection is unproven, never clean, and says what ran",
 		() => {
 			const many: Files = {};
-			for (let i = 0; i < 25; i += 1)
+			for (let i = 0; i < 26; i += 1)
 				many[`tests/clients/many-${i}.test.ts`] = FOO_TEST;
 			const lane = makeLane({
 				base: { ...BASE_FILES, ...many },
@@ -634,19 +662,19 @@ describe("lane-check verdict table (#4047 round 2)", () => {
 			expect(run.record.checks.targeted).toEqual({
 				status: 0,
 				failed: [],
-				selected: 0,
-				matched: 26,
+				selected: 26,
+				matched: 27,
 				capped: true,
 			});
 			expect(run.record.findings).toEqual([
 				{
 					kind: "unproven",
 					reason:
-						"selection capped: 26 test files matched, 0 ran; run the full suite or narrow the change",
+						"selection capped: 27 test files matched, 26 ran; run the full suite or narrow the change",
 				},
 			]);
 			expect(run.out).toContain(
-				"selection: selected 0, matched 26, capped true",
+				"selection: selected 26, matched 27, capped true",
 			);
 			expect(run.out).toContain(
 				"selection capped: run the full suite or narrow the change",

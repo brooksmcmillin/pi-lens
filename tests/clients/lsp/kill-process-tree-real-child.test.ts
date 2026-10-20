@@ -26,6 +26,14 @@ import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import {
+	getDegradationSummary,
+	resetDegradationLedger,
+} from "../../../clients/degradation-ledger.js";
+import {
+	flushLatencyLog,
+	getLatencyLogPath,
+} from "../../../clients/latency-logger.js";
 import { killProcessTree } from "../../../clients/lsp/client.js";
 import { launchLSP, type LSPProcess } from "../../../clients/lsp/launch.js";
 import {
@@ -33,6 +41,7 @@ import {
 	releaseOwnChildPid,
 	VERIFIED_OWN_PID_CAP,
 } from "../../../clients/safe-spawn.js";
+import { withEnv } from "../../support/with-env.js";
 
 const children: ChildProcess[] = [];
 
@@ -44,8 +53,10 @@ const handles: LSPProcess[] = [];
  * the `sh` leader is gone — #2026's shape, the grandchild the group signal
  * exists to reach.
  */
-async function launchLspGroup(): Promise<LSPProcess> {
-	const handle = await launchLSP("/bin/sh", ["-c", "sleep 30 & sleep 60"], {
+async function launchLspGroup(
+	script = "sleep 30 & sleep 60",
+): Promise<LSPProcess> {
+	const handle = await launchLSP("/bin/sh", ["-c", script], {
 		cwd: process.cwd(),
 	});
 	handles.push(handle);
@@ -261,5 +272,118 @@ describe.skipIf(process.platform !== "linux")(
 			expect(isOwnLiveChild(verifiedPid, "test-memo")).toBe(true);
 			expect(isOwnLiveChild(unverifiedPid, "test-memo")).toBe(false);
 		});
+	},
+);
+
+// `HELD_OWN_PID_SWEEP_AT` in clients/safe-spawn.ts, restated: the issue's own
+// number, so a changed ceiling reds these cases instead of following it.
+const HELD_CEILING = 256;
+
+/**
+ * `held[0]` is launched alone so it is provably the oldest held pid; the rest
+ * go out together (admission order among them does not matter to any case),
+ * which keeps 256 real `launchLSP` calls to a few seconds.
+ */
+async function fillHeldCeiling(): Promise<LSPProcess[]> {
+	const held = [await launchLspGroup("exec sleep 60")];
+	held.push(
+		...(await Promise.all(
+			Array.from({ length: HELD_CEILING - 1 }, () =>
+				launchLspGroup("exec sleep 60"),
+			),
+		)),
+	);
+	return held;
+}
+
+function evictionRows() {
+	return getDegradationSummary().filter(
+		(row) => row.kind === "held-own-pid-evicted",
+	);
+}
+
+async function reapAll(held: LSPProcess[]): Promise<void> {
+	for (const handle of held) handle.process.kill("SIGKILL");
+	await Promise.all(held.map((handle) => exited(handle.process)));
+	for (const handle of held) {
+		expect(fs.existsSync(`/proc/${handle.pid}`)).toBe(false);
+	}
+}
+
+describe.skipIf(process.platform !== "linux")(
+	"holdOwnChildPid at the held-pid ceiling, against real launchLSP children (#3096)",
+	() => {
+		it("records one bounded degradation when a live held leader is dropped, and silently admits below it", async () => {
+			resetDegradationLedger();
+			// The latency sink is off in test mode; this case reads the real one.
+			const restoreEnv = withEnv({ PI_LENS_TEST_MODE: "0" });
+			const held: LSPProcess[] = [];
+			try {
+				held.push(...(await fillHeldCeiling()));
+				// 256 live groups held: nothing was dropped, so nothing is recorded.
+				expect(evictionRows()).toEqual([]);
+
+				// The 257th launch finds every held group alive; the oldest goes.
+				held.push(await launchLspGroup("exec sleep 60"));
+				const rows = evictionRows();
+				expect(rows).toHaveLength(1);
+				expect(rows[0]?.count).toBe(1);
+				expect(rows[0]?.latestReasons).toEqual([
+					{
+						subject: "lsp-spawn",
+						reason: expect.stringContaining(`pid ${held[0]!.pid}`),
+					},
+				]);
+
+				await flushLatencyLog();
+				const durable = fs
+					.readFileSync(getLatencyLogPath(), "utf8")
+					.trim()
+					.split("\n")
+					.map((line) => JSON.parse(line))
+					.filter(
+						(row) =>
+							row.phase === "degradation_ledger" &&
+							row.metadata?.kind === "held-own-pid-evicted",
+					);
+				expect(durable).toHaveLength(1);
+				expect(durable[0].metadata).toMatchObject({
+					subject: "lsp-spawn",
+					count: 1,
+					evicted: "1",
+				});
+
+				// The record names a real loss: the dropped leader, once dead, is no
+				// longer answerable; any other held leader still is.
+				held[0]!.process.kill("SIGKILL");
+				held[1]!.process.kill("SIGKILL");
+				await exited(held[0]!.process);
+				await exited(held[1]!.process);
+				expect(isOwnLiveChild(held[0]!.pid, "after-evict")).toBe(false);
+				expect(isOwnLiveChild(held[1]!.pid, "after-evict")).toBe(true);
+			} finally {
+				restoreEnv();
+				await reapAll(held);
+			}
+		}, 60_000);
+
+		it("sweeps a dead group before admitting, so a full set with one dead member drops nothing (state C)", async () => {
+			resetDegradationLedger();
+			const held = await fillHeldCeiling();
+			try {
+				held[10]!.process.kill("SIGKILL");
+				await exited(held[10]!.process);
+
+				held.push(await launchLspGroup("exec sleep 60"));
+				expect(evictionRows()).toEqual([]);
+
+				// The oldest live leader is still held: dead, it stays answerable.
+				held[0]!.process.kill("SIGKILL");
+				await exited(held[0]!.process);
+				expect(isOwnLiveChild(held[0]!.pid, "after-sweep")).toBe(true);
+			} finally {
+				await reapAll(held);
+			}
+		}, 60_000);
 	},
 );

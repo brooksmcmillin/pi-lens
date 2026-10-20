@@ -1,0 +1,58 @@
+/**
+ * #4414 F3: `where` (Windows) prints one match per line with CRLF endings, and
+ * `where tsc` lists both `tsc` and `tsc.cmd` for an npm-global install.
+ * `findCommandAsync` and its sync twin split on `"\n"` only, so the first match
+ * kept a trailing `\r` and `realpath` of it rejected, which the TypeScript
+ * server lookup read as "no compiler". Only the child-process boundary is
+ * doubled; the output is the CRLF text `where` prints.
+ */
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { makeFakeChild } from "../support/fake-child.js";
+
+const WHERE_OUTPUT =
+	"C:\\Users\\a\\AppData\\Roaming\\npm\\tsc\r\nC:\\Users\\a\\AppData\\Roaming\\npm\\tsc.cmd\r\n";
+const FIRST_MATCH = "C:\\Users\\a\\AppData\\Roaming\\npm\\tsc";
+
+const spawnMock = vi.hoisted(() => vi.fn());
+const spawnSyncMock = vi.hoisted(() => vi.fn());
+vi.mock("node:child_process", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:child_process")>();
+	return { ...actual, spawn: spawnMock, spawnSync: spawnSyncMock };
+});
+
+const { findCommand, findCommandAsync } =
+	await import("../../clients/safe-spawn.js");
+
+beforeEach(() => {
+	spawnMock.mockReset();
+	spawnSyncMock.mockReset();
+});
+
+describe("findCommand keeps the first match free of CRLF (#4414)", () => {
+	it("sync: returns the first `where` line without a trailing carriage return", () => {
+		spawnSyncMock.mockReturnValue({
+			stdout: Buffer.from(WHERE_OUTPUT),
+			stderr: Buffer.from(""),
+			status: 0,
+			error: undefined,
+		});
+
+		expect(findCommand("tsc")).toBe(FIRST_MATCH);
+	});
+
+	it("async: returns the first `where` line without a trailing carriage return", async () => {
+		const finder = makeFakeChild(4243);
+		spawnMock.mockImplementation((command: string) =>
+			command === "which" || command === "where" ? finder : makeFakeChild(),
+		);
+
+		const found = findCommandAsync("tsc");
+		// Let the call reach `spawn`, then feed the child its output and exit.
+		for (let tick = 0; tick < 10; tick += 1) await Promise.resolve();
+		finder.stdout.emit("data", WHERE_OUTPUT);
+		finder.emit("exit", 0, null);
+		finder.emit("close", 0, null);
+
+		await expect(found).resolves.toBe(FIRST_MATCH);
+	});
+});

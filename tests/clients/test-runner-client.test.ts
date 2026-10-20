@@ -3217,7 +3217,6 @@ describe("#2522 — turn-end selection excludes integration/e2e test targets", (
 			"pi-lens-nested-worktree-",
 		);
 		exclusionCleanups.push(cleanup);
-		fs.mkdirSync(path.join(tmpDir, ".git"));
 		fs.writeFileSync(
 			path.join(tmpDir, ".git", "HEAD"),
 			"ref: refs/heads/main\n",

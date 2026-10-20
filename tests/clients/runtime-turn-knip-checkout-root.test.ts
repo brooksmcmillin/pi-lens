@@ -94,8 +94,9 @@ import {
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
 import { _resetInstanceRegistryEnabledForTests } from "../../clients/instance-registry.js";
-import { KnipClient } from "../../clients/knip-client.js";
+import { KnipClient, type KnipResult } from "../../clients/knip-client.js";
 import { resolveKnipScanRoots } from "../../clients/knip-scan-roots.js";
+import { fetchFreshProjectDiagnostics } from "../../clients/project-diagnostics/fresh-fetch.js";
 import { consumeTurnEndFindings } from "../../clients/runtime-context.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { handleTurnEnd } from "../../clients/runtime-turn.js";
@@ -1293,5 +1294,321 @@ describe("#4154 a failed scan never replaces the good knip row on disk", () => {
 			(row) => (row.metadata as { success?: boolean }).success === false,
 		);
 		expect(failedRow?.metadata).toMatchObject({ cacheKept: true });
+	});
+});
+
+describe("#4166 a joined knip scan is delivered, and the turn's files are carried to the next scan", () => {
+	const unread = (): string =>
+		consumeTurnEndFindings(cacheManager, main)?.messages?.[0]?.content ?? "";
+	const fileA = (): string => path.join(main, "src", "a.ts");
+	/** The analyzers other than knip, unavailable: only knip's lane runs in the fetch. */
+	const unavailable = {
+		ensureAvailable: async () => false,
+		getAvailabilityVerdict: () => undefined,
+	};
+	/** A real `lens_diagnostics` fresh fetch, which starts knip and writes its row. */
+	function freshFetch(signal?: AbortSignal) {
+		const clients = {
+			knipClient,
+			jscpdClient: unavailable,
+			depChecker: unavailable,
+			gitleaksClient: unavailable,
+			govulncheckClient: unavailable,
+			opengrepClient: unavailable,
+			trivyClient: unavailable,
+			deadCodeClients: [],
+			testRunnerClient: { getTestRunTarget: () => null },
+		} as unknown as Parameters<typeof fetchFreshProjectDiagnostics>[2];
+		return fetchFreshProjectDiagnostics(cacheManager, main, clients, signal, {
+			runtime,
+		});
+	}
+	/**
+	 * The next knip spawn parks until released and answers for the tree as it
+	 * was at spawn, so a scan cannot see an edit made after it started. Fake
+	 * timers start here, so the stamps of the scan and the turn differ.
+	 */
+	function gateNextScan(output: () => string = () => fakeKnip(main)): {
+		spawned: Promise<void>;
+		release: () => void;
+	} {
+		let tree = "";
+		knipProcess.scan = () => tree;
+		let release!: () => void;
+		knipProcess.gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let spawn!: () => void;
+		const spawned = new Promise<void>((resolve) => {
+			spawn = resolve;
+		});
+		knipProcess.onSpawn = () => {
+			tree = output();
+			knipProcess.onSpawn = undefined;
+			spawn();
+		};
+		vi.useFakeTimers();
+		return { spawned, release };
+	}
+	function ungate(): void {
+		vi.useRealTimers();
+		knipProcess.gate = undefined;
+		knipProcess.scan = fakeKnip;
+	}
+	/** T0: the baseline row (`unusedA`), its own delivery read and dropped. */
+	async function baseline(): Promise<void> {
+		edit(fileA());
+		await turnEnd();
+	}
+	/**
+	 * A fresh fetch starts knip, then the agent adds `marker` to `file`, then
+	 * turn_end joins that scan inside the budget. Returns what the turn delivered.
+	 */
+	async function joinedPreEditTurn(
+		file = fileA(),
+		marker = "unusedNew",
+		options: { output?: () => string; beforeRelease?: () => void } = {},
+	): Promise<string> {
+		const gate = gateNextScan(options.output);
+		const fetch = freshFetch();
+		await gate.spawned;
+		await vi.advanceTimersByTimeAsync(50);
+		fs.appendFileSync(file, `export const ${marker} = 3;\n`);
+		edit(file);
+		const turn = handleTurnEnd(turnEndDeps());
+		await vi.advanceTimersByTimeAsync(100);
+		options.beforeRelease?.();
+		gate.release();
+		await turn;
+		await fetch;
+		ungate();
+		return unread();
+	}
+	/** `/new`, resume or reload: session_start resets the runtime and the client's memo (`runtime-session.ts`). */
+	function replaceSession(): void {
+		runtime.resetForSession();
+		knipClient.resetSessionState();
+	}
+	async function editAndTurn(
+		relative: string,
+		marker: string,
+	): Promise<string> {
+		write(main, relative, `export const ${marker} = 2;\n`);
+		edit(path.join(main, relative));
+		return turnEnd();
+	}
+
+	it("carries an edit past the previous turn's deferred scan when the next turn joins it", async () => {
+		// Recurrence prevented (#4166, the fully in-path premise): T1's scan
+		// outlives the budget and runs on with the tree before T2's edit; T2
+		// joins it and, on master, wrote it as the baseline, so `unusedNew` was
+		// never attributed to any turn.
+		await baseline();
+		fs.appendFileSync(fileA(), "export const unusedPre = 2;\n");
+		edit(fileA());
+		const gate = gateNextScan();
+		const t1 = handleTurnEnd(turnEndDeps());
+		await gate.spawned;
+		await vi.advanceTimersByTimeAsync(3_100);
+		await t1;
+		expect(knipRows().at(-1)?.metadata).toMatchObject({
+			execution: "deferred",
+		});
+		unread();
+
+		fs.appendFileSync(fileA(), "export const unusedNew = 3;\n");
+		edit(fileA());
+		const t2 = handleTurnEnd(turnEndDeps());
+		await vi.advanceTimersByTimeAsync(100);
+		gate.release();
+		await t2;
+		const second = unread();
+		ungate();
+
+		const joinedRow = knipRows().at(-1)?.metadata;
+		expect(knipProcess.spawns).toHaveLength(2);
+		// The joined delta is delivered as master delivers it.
+		expect(second).toContain("unusedPre");
+		expect(second).not.toContain("unusedNew");
+
+		const third = await editAndTurn("src/b.ts", "unusedB");
+		expect(third).toContain("unusedNew");
+		expect(third).toContain("unusedB");
+		expect(third).not.toContain("unusedPre");
+		expect(knipRows().at(-1)?.metadata).not.toHaveProperty("joined");
+		expect(joinedRow).toMatchObject({
+			execution: "executed",
+			success: true,
+			joined: true,
+			carried: 1,
+		});
+
+		expect(await editAndTurn("src/c.ts", "unusedC")).not.toContain("unusedNew");
+	});
+
+	it("delivers at the turn an edit made before the scan it joins, and never again", async () => {
+		// Recurrence prevented (#4462 review F1): a fresh fetch started after
+		// the edit is cut by its signal while knip runs, and turn_end joins
+		// that scan. Round 1 withheld the answer; the fetch then wrote the
+		// post-edit row, so the next delta treated `unusedNew` as pre-existing
+		// and nothing ever delivered it. Master delivers it at T1.
+		await baseline();
+		fs.appendFileSync(fileA(), "export const unusedNew = 3;\n");
+		edit(fileA());
+		const gate = gateNextScan();
+		const controller = new AbortController();
+		const fetch = freshFetch(controller.signal);
+		await gate.spawned;
+		controller.abort();
+		expect((await fetch).aborted).toBe(true);
+		await vi.advanceTimersByTimeAsync(50);
+		const t1 = handleTurnEnd(turnEndDeps());
+		await vi.advanceTimersByTimeAsync(100);
+		gate.release();
+		await t1;
+		await vi.advanceTimersByTimeAsync(10);
+		const first = unread();
+		ungate();
+		const joinedRow = knipRows().at(-1)?.metadata;
+		// The row the next delta is judged against holds the item.
+		const rowNames = cacheManager
+			.readCache<KnipResult>("knip", main)
+			?.data.issues.map((issue) => issue.name);
+		// src/a.ts is carried, and the row keeps the item from being doubled.
+		const second = await editAndTurn("src/b.ts", "unusedB");
+
+		expect(rowNames).toContain("unusedNew");
+		expect(
+			[first, second].filter((out) => out.includes("unusedNew")),
+		).toHaveLength(1);
+		expect(first).toContain("unusedNew");
+		expect(second).toContain("unusedB");
+		expect(knipProcess.spawns).toHaveLength(3);
+		expect(joinedRow).toMatchObject({ joined: true, carried: 1, newIssues: 1 });
+	});
+
+	it("carries the turn's files past a joined pre-edit scan, so the next scan reports what the edit added", async () => {
+		await baseline();
+		const first = await joinedPreEditTurn();
+		const joinedRow = knipRows().at(-1)?.metadata;
+		expect(knipProcess.spawns).toHaveLength(2);
+		expect(first).not.toContain("unusedNew");
+
+		const second = await editAndTurn("src/b.ts", "unusedB");
+		expect(second).toContain("unusedNew");
+		expect(second).toContain("unusedB");
+		expect(knipProcess.spawns).toHaveLength(3);
+		expect(knipRows().at(-1)?.metadata).not.toHaveProperty("joined");
+		expect(joinedRow).toMatchObject({
+			execution: "executed",
+			success: true,
+			joined: true,
+			carried: 1,
+		});
+	});
+
+	it("delivers each edit once across two joined scans in a row", async () => {
+		await baseline();
+		const outputs = [
+			await joinedPreEditTurn(fileA(), "unusedNew1"),
+			await joinedPreEditTurn(path.join(main, "src", "d.ts"), "unusedNew2"),
+			await editAndTurn("src/b.ts", "unusedB"),
+			await editAndTurn("src/c.ts", "unusedC"),
+		];
+
+		const deliveries = (marker: string) =>
+			outputs.filter((output) => output.includes(marker)).length;
+		expect(deliveries("unusedNew1")).toBe(1);
+		expect(deliveries("unusedNew2")).toBe(1);
+		// Neither joined scan read the edit it was joined for.
+		expect(outputs[0]).not.toContain("unusedNew1");
+		expect(outputs[1]).not.toContain("unusedNew2");
+	});
+
+	it("clears the carry once a scan has attributed it", async () => {
+		await baseline();
+		await joinedPreEditTurn();
+		await editAndTurn("src/b.ts", "unusedB");
+
+		// A change nobody recorded: src/a.ts is no longer one of the turn's files.
+		fs.appendFileSync(fileA(), "export const unusedExternal = 4;\n");
+		const third = await editAndTurn("src/c.ts", "unusedC");
+
+		expect(third).toContain("unusedC");
+		expect(third).not.toContain("unusedExternal");
+	});
+
+	it("keeps the carry through a scan that fails, until a scan succeeds", async () => {
+		await baseline();
+		await joinedPreEditTurn();
+
+		knipProcess.failure = new Error("spawn knip ENOENT");
+		await editAndTurn("src/b.ts", "unusedB");
+		expect(knipRows().at(-1)?.metadata).toMatchObject({ success: false });
+
+		knipProcess.failure = undefined;
+		expect(await editAndTurn("src/c.ts", "unusedC")).toContain("unusedNew");
+	});
+
+	it("records a joined scan's parse failure as a failure and carries nothing", async () => {
+		// Recurrence prevented (#4462 review F4, mutation M8): a parse failure
+		// still carries the initiator's `scannedAt`, so a join predicate without
+		// its `success` check logged it as `success: true, joined: true` and
+		// skipped the failure row's reason.
+		await baseline();
+		await joinedPreEditTurn(fileA(), "unusedNew", {
+			output: () => "not knip json",
+		});
+
+		const row = knipRows().at(-1)?.metadata;
+		expect(row).toMatchObject({
+			execution: "executed",
+			success: false,
+			reason: "Failed to parse output",
+			cacheKept: true,
+		});
+		expect(row).not.toHaveProperty("joined");
+		expect(row).not.toHaveProperty("carried");
+	});
+
+	it("does not carry a scan this turn started, nor an answer for the unchanged project", async () => {
+		edit(fileA());
+		await turnEnd();
+		expect(knipRows().at(-1)?.metadata).not.toHaveProperty("joined");
+
+		cacheManager.addModifiedRange(
+			fileA(),
+			{ start: 1, end: 1 },
+			false,
+			main,
+			SESSION,
+		);
+		await turnEnd();
+
+		expect(knipRows().at(-1)?.metadata).toMatchObject({ execution: "cache" });
+		expect(knipRows().at(-1)?.metadata).not.toHaveProperty("joined");
+		expect(knipProcess.spawns).toHaveLength(1);
+	});
+
+	it("leaves a replaced session's carry behind", async () => {
+		await baseline();
+		await joinedPreEditTurn();
+		replaceSession();
+
+		expect(await editAndTurn("src/b.ts", "unusedB")).not.toContain("unusedNew");
+	});
+
+	it("leaves the carry on a session replaced while the joined scan is awaited", async () => {
+		// Recurrence prevented (#4154 F1 shape on this lane): a carry cell read
+		// after the knip await is the new session's, so the old session's edit
+		// would be attributed to the new session's next turn.
+		await baseline();
+		await joinedPreEditTurn(fileA(), "unusedNew", {
+			beforeRelease: replaceSession,
+		});
+
+		const second = await editAndTurn("src/b.ts", "unusedB");
+		expect(second).toContain("unusedB");
+		expect(second).not.toContain("unusedNew");
 	});
 });

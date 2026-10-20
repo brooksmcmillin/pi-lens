@@ -1,0 +1,52 @@
+{
+	"provenance": {
+		"runner": "dotnet-build",
+		"tool": "dotnet",
+		"version": "10.0.402",
+		"command": "dotnet build toolsmoke.csproj --nologo --verbosity minimal",
+		"argv": [
+			"build",
+			"toolsmoke.csproj",
+			"--nologo",
+			"--verbosity",
+			"minimal"
+		],
+		"workspace": "tests/fixtures/tool-smoke/csharp",
+		"platform": "linux-x64",
+		"capturedAt": "2026-10-14",
+		"versionArgv": [
+			"--version"
+		]
+	},
+	"file": "Program.cs",
+	"exitCode": 1,
+	"stdout": "  Determining projects to restore...\n  Restored __WORKSPACE__/toolsmoke.csproj (in 1.92 sec).\n__WORKSPACE__/Program.cs(7,17): error CS0029: Cannot implicitly convert type 'string' to 'int' [__WORKSPACE__/toolsmoke.csproj]\n\nBuild FAILED.\n\n__WORKSPACE__/Program.cs(7,17): error CS0029: Cannot implicitly convert type 'string' to 'int' [__WORKSPACE__/toolsmoke.csproj]\n    0 Warning(s)\n    1 Error(s)\n\nTime Elapsed 00:00:03.28\n",
+	"stderr": "",
+	"availability": [
+		{
+			"command": "dotnet",
+			"argv": [
+				"--version"
+			],
+			"version": "9.0.319",
+			"exitCode": 0,
+			"stdout": "9.0.319\n",
+			"stderr": ""
+		}
+	],
+	"clean": {
+		"workspace": "tests/fixtures/runner-output-clean/dotnet-build",
+		"file": "Program.cs",
+		"argv": [
+			"build",
+			"toolsmoke.csproj",
+			"--nologo",
+			"--verbosity",
+			"minimal"
+		],
+		"version": "9.0.319",
+		"exitCode": 0,
+		"stdout": "  Determining projects to restore...\n  Restored __WORKSPACE__/toolsmoke.csproj (in 44 ms).\n  toolsmoke -> __WORKSPACE__/bin/Debug/net9.0/toolsmoke.dll\n\nBuild succeeded.\n    0 Warning(s)\n    0 Error(s)\n\nTime Elapsed 00:00:00.75\n",
+		"stderr": ""
+	}
+}

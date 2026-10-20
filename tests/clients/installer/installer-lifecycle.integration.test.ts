@@ -168,10 +168,8 @@ function runEnsure(
 	const id = JSON.stringify(toolId);
 	const program =
 		'import("./clients/installer/index.js").then(async m => {' +
-		`const value = await m.ensureTool(${id}); await new Promise(r => setTimeout(r, 500));` +
-		'const fs = await import("node:fs"); const path = await import("node:path");' +
-		'let log = ""; try { log = fs.readFileSync(path.join(process.env.PI_LENS_HOME, "sessionstart.log"), "utf8"); } catch {}' +
-		`console.log(JSON.stringify({ value, log, attempt: m.getInstallAttempt(${id}), reason: m.getInstallFailureReason(${id}) }));` +
+		`const value = await m.ensureTool(${id});` +
+		`console.log(JSON.stringify({ value, attempt: m.getInstallAttempt(${id}), reason: m.getInstallFailureReason(${id}) }));` +
 		"}).catch(e => { console.error(e); process.exitCode = 1; });";
 	return new Promise((resolve) => {
 		const child = spawn(process.execPath, ["-e", program], {

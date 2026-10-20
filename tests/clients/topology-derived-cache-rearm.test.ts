@@ -107,7 +107,11 @@ describe("topology-derived cache re-arm (#2263)", () => {
 	it("re-arms all registered topology caches through a live primary→/new start", async () => {
 		// Operator recipe: in an interactive pi session, run `/new`; the host
 		// emits the second primary session_start that this test drives below.
-		const env = setupTestEnvironment("pi-lens-topology-live-session-");
+		const env = setupTestEnvironment("pi-lens-topology-live-session-", {
+			// #4560: this cell asserts the walk has NO root at the fixture yet, so
+			// the shared default marker is the one thing it must opt out of.
+			rootMarker: false,
+		});
 		const previousFirst = processGlobals.__piLensFirstSessionDone;
 		const previousWarmup = processGlobals.__piLensWarmupScheduled;
 		const languageDerive = vi.spyOn(
@@ -166,7 +170,7 @@ describe("topology-derived cache re-arm (#2263)", () => {
 
 			const runtime = {
 				sessionGeneration: 0,
-				complexityBaselines: new Map(),
+				complexityBaselines: new Set(),
 				resetForSession() {
 					(this as { sessionGeneration: number }).sessionGeneration += 1;
 				},
@@ -248,7 +252,10 @@ describe("topology-derived cache re-arm (#2263)", () => {
 	}, 30_000);
 
 	it("re-derives startup scan context after topology reset", () => {
-		const env = setupTestEnvironment("pi-lens-topology-startup-");
+		const env = setupTestEnvironment("pi-lens-topology-startup-", {
+			// #4560: the `before` assertion below pins a marker-less walk.
+			rootMarker: false,
+		});
 		try {
 			// #2495: see the sibling test above — `homeDir` only pins the ceiling
 			// check (nested inside `env.tmpDir`, so any found root is necessarily

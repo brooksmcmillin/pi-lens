@@ -53,4 +53,38 @@ describe("document notification telemetry (#2357)", () => {
 		) as { metadata?: { coalescedCount?: number } } | undefined;
 		expect(record?.metadata?.coalescedCount).toBe(2);
 	});
+
+	// #3405 r1: a save with no content (`notify.save`) that merges into an
+	// unsent push folds no send into it, so the count names superseded content
+	// sends only.
+	it("does not count a merged save as a coalesced send", async () => {
+		vi.resetModules();
+		const [{ handleNotifyChange, handleNotifySave }, latencyLogger] =
+			await Promise.all([
+				import("../../../clients/lsp/client.js"),
+				import("../../../clients/latency-logger.js"),
+			]);
+		flushLatencyLog = latencyLogger.flushLatencyLog;
+		const state = createMockState();
+		state.saveOptions = { includeText: false };
+		state.openDocuments.add(TEST_KEY);
+		state.documentVersions.set(TEST_KEY, 0);
+
+		await Promise.all([
+			handleNotifyChange(state, TEST_FILE, "v1"),
+			handleNotifyChange(state, TEST_FILE, "v2"),
+			handleNotifySave(state, TEST_FILE),
+		]);
+		await latencyLogger.flushLatencyLog();
+
+		const records = fs
+			.readFileSync(path.join(getGlobalPiLensDir(), "latency.log"), "utf8")
+			.split("\n")
+			.filter(Boolean)
+			.map((line) => JSON.parse(line) as Record<string, unknown>);
+		const record = records.find(
+			(entry) => entry.phase === "lsp_document_send",
+		) as { metadata?: { coalescedCount?: number } } | undefined;
+		expect(record?.metadata?.coalescedCount).toBe(1);
+	});
 });

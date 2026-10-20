@@ -498,6 +498,11 @@ export function classifyProbeFailure(
 	if (result.spawnFailure?.kind === "tool-not-found") {
 		return { outcome: "missing", cause: "not-found", evidence };
 	}
+	// #4515: trust declined a project binary; the managed install still repairs
+	// the tool, so it is missing by policy, not a binary that rejected a probe.
+	if (result.spawnFailure?.kind === "trust-refused") {
+		return { outcome: "missing", cause: "policy-denied", evidence };
+	}
 	if (
 		result.failure === "timeout" ||
 		result.failure === "aborted" ||

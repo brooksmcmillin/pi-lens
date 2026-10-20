@@ -1,0 +1,56 @@
+{
+	"provenance": {
+		"runner": "fish-indent",
+		"tool": "fish_indent",
+		"version": "4.9.3",
+		"command": "fish_indent --check bad.fish",
+		"argv": [
+			"--check",
+			"bad.fish"
+		],
+		"workspace": "tests/fixtures/tool-smoke/fish",
+		"platform": "linux-x64",
+		"capturedAt": "2026-10-15",
+		"versionArgv": [
+			"--version"
+		]
+	},
+	"file": "bad.fish",
+	"exitCode": 1,
+	"stdout": "",
+	"stderr": "bad.fish\n",
+	"availability": [
+		{
+			"command": "fish_indent",
+			"argv": [
+				"--version"
+			],
+			"version": "4.2.1",
+			"exitCode": 0,
+			"stdout": "fish_indent, version 4.2.1\n",
+			"stderr": ""
+		},
+		{
+			"command": "fish",
+			"argv": [
+				"--version"
+			],
+			"version": "4.2.1",
+			"exitCode": 0,
+			"stdout": "fish, version 4.2.1\n",
+			"stderr": ""
+		}
+	],
+	"clean": {
+		"workspace": "tests/fixtures/runner-output-clean/fish-indent",
+		"file": "bad.fish",
+		"argv": [
+			"--check",
+			"bad.fish"
+		],
+		"version": "4.2.1",
+		"exitCode": 0,
+		"stdout": "",
+		"stderr": ""
+	}
+}

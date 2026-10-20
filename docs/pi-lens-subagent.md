@@ -58,9 +58,11 @@ explicit orchestrator authorization for
 `--force-with-lease=<branch>:<sha>`.
 
 Push forms are in "Orchestrator lane mechanics". Before `gh pr create` or `gh pr edit`, lint the body with
-`node scripts/check-pr-body.mjs --lint-local <body-file> "<title>"`. Multiline
-text (bodies, commit messages, comments) goes through a file (`--body-file`,
-`git commit -F`); re-read what GitHub stored and check the newlines survived.
+`node scripts/check-pr-body.mjs --lint-local <body-file> "<title>"`. Read the
+lint's exit code directly, never through a pipe, before `gh pr create` or
+`gh pr edit`: a piped status is the last command's, and a failing lint opened a
+PR (#4348). Multiline text (bodies, commit messages, comments) goes through a
+file (`--body-file`, `git commit -F`); re-read what GitHub stored and check the newlines survived.
 
 ## Orchestrator lane mechanics
 
@@ -130,8 +132,11 @@ the brief gives.
     ("Worktree and Git"). A reviewer is always `none` and read-only.
   GitHub comments and issue edits are separate: only a brief that grants them
   allows them.
-- **Deliverable.** The report opens with an `ORCHESTRATOR SUMMARY` of at most
-  30 lines: the PR (or branch), the head SHA, the change or verdict in a few
+- **Deliverable.** The report opens with an `ORCHESTRATOR SUMMARY`. Its cap
+  follows the lane kind: at most 6 lines for a mechanical lane (trailing fold,
+  pin or allowlist move, merge-and-resolve), 20 for a locate or investigation
+  pass, and 30 for a fix or review round. The summary carries the PR (or
+  branch), the head SHA, the change or verdict in a few
   lines, red and green evidence as counts with the quoted transcript below it,
   every skipped check or environment block, and what the orchestrator must
   decide. The RETURNED message (the agent's final reply, or the plegma answer)
@@ -169,8 +174,9 @@ sets the exit code and only `clean` exits 0:
   file is tracked.
 - `unproven` (3): a step failed or a red could not be attributed (the build, a
   run with no named failing file, an `INCONCLUSIVE` red-on-base verdict, a
-  failed lint or format check, a selection over the 25-file cap where only
-  governance suites ran). That is not evidence of unrelated: report it and
+  failed lint or format check, a selection over the 25-file cap, where the
+  change's own tests, the governance suites and the best 25 import matches ran
+  and the rest did not). That is not evidence of unrelated: report it and
   stop, or fix the cause. The summary prints `selection: selected S, matched
   M, capped C`.
 - `2`: usage error (`--body <path>` or `--body=<path>` missing, unknown, or the
@@ -193,9 +199,9 @@ change adds or removes a pinned use, run it on the head and on the merge of
 
 Each pre-push head has a durable result record at
 `$(git rev-parse --git-common-dir)/pi-lens-prepush/<sha>.json`. It contains the
-head/base, timestamp, selected test files and their `import`, `history`, or
-`governance` reason, plus passed/failed/skipped counts, the Vitest exit code,
-and wall time. Re-pushes overwrite that head's record; writes prune records
+head/base, timestamp, selected test files and their `changed`, `mirror`,
+`import`, `history`, or `governance` reason, plus passed/failed/skipped
+counts, the Vitest exit code, and wall time. Re-pushes overwrite that head's record; writes prune records
 older than fourteen days. The provisional record is written before build and
 self-scan work with outcome `tests-not-started`; preparation failures update it
 to `build-failed` or `self-scan-failed`. The write uses a same-directory
@@ -234,10 +240,12 @@ of fixture tests, and a real red hidden among them reaches CI (#4308).
 Fold a review follow-up into the same PR when it shares the seam or files, is
 about one commit, and needs no maintainer decision. Contract-only folds (body,
 comments, wording) are trailing commits; small code folds carry a red-first
-test and are routed per principles §3 "Round routing". File only
-different-seam, blocked, decision-dependent, untouched pre-existing, or
-risk-class-changing residuals (for example lifecycle work on a tooling PR), as
-one consolidated issue per PR.
+test and are routed per principles §3 "Round routing". A MEDIUM or LOW that
+does not fold is an accepted residual: list it under `## Accepted residuals`,
+named `p3` with its severity and live population, and file nothing. File only p2 or
+higher work that cannot ride the PR (a HIGH outside its scope, or a MEDIUM
+with a live population), as one consolidated issue per PR. The merge bar is in
+`docs/pi-lens-merge-policy.md` "Filing issues".
 
 ## Evidence and reporting
 

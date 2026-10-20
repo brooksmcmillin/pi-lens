@@ -326,7 +326,7 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/mcp/session.ts": 4,
 		"clients/metrics-client.ts": 7,
 		"clients/observed-mutation.ts": 7,
-		"clients/runtime-tool-call.ts": 13,
+		"clients/runtime-tool-call.ts": 12,
 		"clients/sgconfig.ts": 6,
 		"clients/widget-state.ts": 2,
 	},
@@ -338,7 +338,7 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/installer/index.ts": 8,
 		"clients/lsp/inferred-project.ts": 4,
 		"clients/lsp/server.ts": 3,
-		"clients/lsp/workspace-diagnostics-cache.ts": 14,
+		"clients/lsp/workspace-diagnostics-cache.ts": 13,
 		"clients/project-diagnostics/runner-adapters/runner-findings.ts": 8,
 		"clients/review-graph/builder.ts": 4,
 		"clients/review-graph/tsconfig-paths.ts": 6,
@@ -434,7 +434,10 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/git-tracked-ignore.ts": 2,
 		"clients/gitleaks-client.ts": 3,
 		"clients/govulncheck-client.ts": 6,
-		"clients/gzip-stage-write.ts": 2,
+		// 2 -> 4 (#4402): the worker loop's catch answers with an `error`, and
+		// readGzipStageWorkerResult reads the wire field `error` (the worker
+		// protocol's own field name, not a delivery tier).
+		"clients/gzip-stage-write.ts": 4,
 		"clients/install-diagnostics.ts": 4,
 		"clients/installer/index.ts": 26,
 		"clients/installer/managed-tool-refresh.ts": 2,
@@ -446,15 +449,18 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/lens-events.ts": 1,
 		"clients/live-bus-emitter.ts": 2,
 		"clients/lsp/cascade-tier.ts": 1,
+		"clients/lsp/client-registry.ts": 4,
 		"clients/lsp/client.ts": 13,
-		"clients/lsp/index.ts": 28,
+		"clients/lsp/index.ts": 24,
 		"clients/lsp/jvm-runtime.ts": 1,
 		"clients/lsp/server.ts": 13,
 		"clients/mcp/ipc.ts": 8,
 		"clients/mcp/review.ts": 8,
 		"clients/mcp/session.ts": 1,
 		"clients/module-report.ts": 27,
-		"clients/opaque-mutation-scan.ts": 3,
+		// 3 -> 5 (#4493): readGitHead and listGitHeadDelta read the spawn
+		// result's `error` field (SpawnResult.error), not a delivery tier.
+		"clients/opaque-mutation-scan.ts": 5,
 		"clients/opengrep-client.ts": 11,
 		"clients/package-manager.ts": 2,
 		"clients/partial-edit-apply.ts": 7,
@@ -464,6 +470,7 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/project-diagnostics/runner-adapters/call-graph-impact.ts": 1,
 		"clients/project-diagnostics/runner-adapters/runner-findings.ts": 4,
 		"clients/project-lens-config.ts": 3,
+		"clients/project-snapshot-persist-worker.ts": 1,
 		"clients/project-snapshot.ts": 7,
 		"clients/project-trust.ts": 1,
 		"clients/review-graph-logger.ts": 1,
@@ -498,7 +505,7 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"tools/effective-config.ts": 2,
 		"tools/lens-diagnostic-mark.ts": 4,
 		"tools/lens-diagnostics.ts": 6,
-		"tools/lsp-diagnostics.ts": 10,
+		"tools/lsp-diagnostics.ts": 8,
 		"tools/module-report.ts": 11,
 		"mcp/analyze-cli.ts": 1,
 		"mcp/server.ts": 32,
@@ -517,7 +524,10 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/cache-manager.ts": 3,
 		"clients/cache-observability.ts": 2,
 		"clients/call-graph.ts": 4,
-		"clients/cascade-format.ts": 4,
+		// 4 -> 5 (#4403): `renderCascadeResult` keeps the notes whose servers
+		// are undelivered, an `Array.prototype.filter` call, not a delivery
+		// filter.
+		"clients/cascade-format.ts": 5,
 		"clients/code-quality-warnings.ts": 5,
 		"clients/codebase-model.ts": 4,
 		"clients/complexity-client.ts": 3,
@@ -542,7 +552,14 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/diagnostic-tracker.ts": 1,
 		"clients/diagnostics-publish.ts": 2,
 		"clients/dispatch/auxiliary-lsp.ts": 3,
-		"clients/dispatch/dispatcher.ts": 16,
+		// 16 -> 17 (#4484): `heldBackBlockers` keeps the blocking findings the
+		// delta calls not new, an `Array.prototype.filter` call, not a delivery
+		// filter.
+		// 17 -> 21 (#4483): the pre-edit seed classification keeps the
+		// blocking findings it reports and removes its matches from the visible
+		// and held-back lists, `Array.prototype.filter` calls, not a delivery
+		// filter.
+		"clients/dispatch/dispatcher.ts": 21,
 		"clients/dispatch/fact-runner.ts": 1,
 		"clients/dispatch/fact-scheduler.ts": 2,
 		"clients/dispatch/facts/function-facts.ts": 2,
@@ -550,16 +567,32 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/dispatch/finding-policy.ts": 3,
 		"clients/dispatch/indent-detect.ts": 4,
 		"clients/dispatch/inline-suppressions.ts": 2,
-		"clients/dispatch/integration.ts": 18,
+		// 18 -> 20 (#4438): the cascade's implicit-scope dependents keep the Go
+		// peers and the ranked JS/TS files a change reaches, two
+		// `Array.prototype.filter` calls, not a delivery filter.
+		// 20 -> 19 (#4485): the rolling delta's per-neighbour diagnostics
+		// `Array.prototype.filter` is deleted with the delta.
+		// 19 -> 20 (#4483): the pre-edit capture keeps a dispatch group's
+		// linter runner ids, an `Array.prototype.filter` call.
+		"clients/dispatch/integration.ts": 20,
+		// #4483: the seed's runner and line selection, `Array.prototype.filter`
+		// calls, not a delivery filter.
+		"clients/dispatch/pre-edit-seed.ts": 4,
 		"clients/dispatch/rule-policy.ts": 1,
 		"clients/dispatch/rules/high-fan-out.ts": 1,
 		"clients/dispatch/rules/missing-error-propagation.ts": 3,
+		// New (#4496): drops `true` parts from a literal requirement, an
+		// `Array.prototype.filter` call, not a delivery gate.
+		"clients/dispatch/runners/ast-grep-literal-anchors.ts": 1,
 		"clients/dispatch/runners/ast-grep-napi.ts": 2,
 		"clients/dispatch/runners/cue-vet.ts": 2,
 		"clients/dispatch/runners/go-vet.ts": 2,
 		"clients/dispatch/runners/golangci-lint.ts": 1,
 		"clients/dispatch/runners/helm-lint.ts": 1,
 		"clients/dispatch/runners/helm-render.ts": 3,
+		// 4 -> 5 (#4481), 5 -> 4 (#4484 r2): the per-edit pass partitions an
+		// ast-grep LSP blocker on an unchanged line into `outOfEditScope` instead
+		// of dropping it, so the scope decides delivery only.
 		"clients/dispatch/runners/lsp.ts": 4,
 		"clients/dispatch/runners/oxlint.ts": 1,
 		"clients/dispatch/runners/prisma-validate.ts": 3,
@@ -574,7 +607,7 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/dispatch/utils/lsp-diagnostics.ts": 1,
 		"clients/file-kinds.ts": 1,
 		"clients/file-role.ts": 3,
-		"clients/file-utils.ts": 4,
+		"clients/file-utils.ts": 3,
 		"clients/fix-worklog.ts": 1,
 		"clients/format-service.ts": 2,
 		"clients/formatters.ts": 6,
@@ -609,12 +642,16 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/lens-map.ts": 2,
 		"clients/lsp-budget.ts": 1,
 		"clients/lsp/aggregation.ts": 6,
+		"clients/lsp/client-registry.ts": 2,
 		"clients/lsp/client.ts": 18,
 		"clients/lsp/config.ts": 3,
 		"clients/lsp/diagnostic-binding.ts": 1,
 		"clients/lsp/edits.ts": 1,
 		// 48 → 50 (#3828 r3): `resyncGitChangedFiles` splits its held targets
 		// into the changed paths (queued as a save) and their importers (not).
+		// 50 -> 51 (#4346): the sweep selects its finding-bearing files to resolve.
+		// 49 -> 50 (#4323): a read that excludes a switched-off server drops
+		// that server's rows from the last known answer it falls back to.
 		"clients/lsp/index.ts": 50,
 		"clients/lsp/inferred-project.ts": 2,
 		"clients/lsp/jvm-runtime.ts": 3,
@@ -622,6 +659,12 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/lsp/launch.ts": 2,
 		"clients/lsp/ruby-drive-dirs.ts": 1,
 		"clients/lsp/server.ts": 5,
+		// 1 (#4403): `disabledPrimaryServerIds` is an `Array.prototype.filter`
+		// over registered servers, not a delivery filter.
+		// 1 -> 3 (#4403 round 4): `disabledPrimaries` selects the file's
+		// primaries once, then splits them into disabled ones and the
+		// `fallbackFor` alternates standing in for a disabled owner.
+		"clients/lsp/session-roots.ts": 3,
 		"clients/lsp/tsserver-sync.ts": 1,
 		"clients/lsp/wait-policy/classification.ts": 1,
 		// 1 -> 2 (#3752): the count-vs-list merge adds one `result.warnings.filter`
@@ -633,10 +676,18 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/mutation-attribution.ts": 2,
 		"clients/ndjson-logger.ts": 1,
 		"clients/observed-mutation.ts": 2,
+		// 0 -> 1 (#4493): listGitHeadDelta drops the empty NUL-split entries,
+		// an `Array.prototype.filter` call, not a delivery filter.
+		"clients/opaque-mutation-scan.ts": 1,
 		"clients/opengrep-client.ts": 2,
 		"clients/path-utils.ts": 1,
 		"clients/persistent-reverify.ts": 4,
-		"clients/pipeline.ts": 4,
+		// 4 -> 6 (#4484): `liveBlockers.filter` and `recordBlockers.filter` split the
+		// live blocking set into the delta's and the held-back ones, two
+		// `Array.prototype.filter` calls, not a delivery filter.
+		// 6 -> 8 (#4483): the seeded findings split into pre-existing and
+		// recorded ones, two `Array.prototype.filter` calls.
+		"clients/pipeline.ts": 8,
 		"clients/process-snapshot.ts": 5,
 		"clients/project-changes.ts": 3,
 		"clients/project-diagnostics/cache.ts": 2,
@@ -656,7 +707,8 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/recent-touches.ts": 2,
 		"clients/resource-sampler.ts": 2,
 		"clients/reverse-deps.ts": 1,
-		"clients/review-graph/builder.ts": 10,
+		// 10 -> 12 (#4346): the update selects the files new to the graph.
+		"clients/review-graph/builder.ts": 12,
 		"clients/review-graph/import-resolvers.ts": 3,
 		"clients/review-graph/query.ts": 5,
 		"clients/review-graph/service.ts": 1,
@@ -671,7 +723,10 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// branches onto the observational net's arm, and the surviving ast-grep
 		// site walks its `paths` array instead of filtering it.
 		"clients/runtime-tool-call.ts": 3,
-		"clients/runtime-tool-result.ts": 5,
+		// 5 -> 8 (#4493): the HEAD-move look keeps the held documents of the
+		// delta and the stale ones among them, and counts the dispositions;
+		// three `Array.prototype.filter` calls, not a delivery filter.
+		"clients/runtime-tool-result.ts": 8,
 		// 31 -> 33 (#3901): the cut-advisory hold keeps the fresh items of a part
 		// (one `Array.prototype.filter`), and the call-graph lane drops a parked
 		// file it already walks as fresh (one). The knip and dead-code re-offers
@@ -679,9 +734,12 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// 33 -> 31 (#2542 ask 3): the deferred-target merge and bound moved to
 		// clients/deferred-test-targets.ts, taking its two `Array.prototype.filter`
 		// passes with it.
-		"clients/runtime-turn.ts": 30,
+		// 30 -> 33 (#4485/#4487): the turn_end cascade delivery keeps the
+		// neighbours a run owns, the pending entries this turn did not observe
+		// and the runs that carry an unconfirmed bucket, three
+		// `Array.prototype.filter` calls, not a delivery filter.
+		"clients/runtime-turn.ts": 33,
 		"clients/safe-spawn.ts": 4,
-		"clients/sanitize.ts": 9,
 		"clients/scratch-tree-policy.ts": 2,
 		"clients/session-state-store.ts": 1,
 		"clients/sgconfig.ts": 3,
@@ -711,8 +769,13 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"tools/ast-grep-outline.ts": 1,
 		"tools/effective-config.ts": 4,
 		"tools/lens-diagnostic-mark.ts": 1,
-		"tools/lens-diagnostics.ts": 37,
-		"tools/lsp-diagnostics.ts": 12,
+		// Six array projections scope and count request-local session evidence;
+		// these are Array.prototype.filter calls, not new delivery-policy seams.
+		"tools/lens-diagnostics.ts": 43,
+		// 12 -> 13 (#4346): the batch selects its finding-bearing files to resolve.
+		// 13 -> 14 (#4322): the batch counts its files with auxiliary findings
+		// only, one `Array.prototype.filter` use, not a delivery filter.
+		"tools/lsp-diagnostics.ts": 14,
 		"tools/lsp-navigation.ts": 6,
 		"tools/render-compact.ts": 3,
 		"mcp/analyze-cli.ts": 1,
@@ -804,6 +867,12 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/ast-grep-rule-manager.ts": 4,
 		"clients/ast-grep-tool-logger.ts": 3,
 		"clients/atomic-write-staging.ts": 2,
+		// 7 -> 10 (#4577 M1): `resolveCandidate` follows SHELL rules again
+		// (bash expands `~` itself), so it keeps its own `path.isAbsolute` /
+		// `path.resolve` pair instead of the host-tool resolver, which applied
+		// host-argument stages a shell word never sees.
+		// 10 -> 9 (#4577 R4): an absolute operand keeps the spelling the command
+		// carried, so the re-resolving `path.resolve(operand)` is gone.
 		"clients/bash-file-access.ts": 9,
 		// 10 -> 7 (#4268): the hand-built `path.join` candidate list folds onto the
 		// shared `findLocalBinAt` trust seam, one construction site for the shim.
@@ -949,9 +1018,26 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/lens-map.ts": 14,
 		"clients/log-cleanup.ts": 9,
 		"clients/lsp-mutation.ts": 3,
-		"clients/lsp/config.ts": 9,
+		"clients/lsp/client-registry.ts": 4,
+		// 0 -> 1 (#4615): the `[lsp-pub]` debug row's `path` member carries the
+		// client's own normalized document key into extension.log. One more
+		// `path` use, same sense (a path value written to a sink), and it is an
+		// object member name, not a path operation the glossary retires.
+		"clients/lsp/client.ts": 1,
+		// 9 -> 3 (#4403): the file gates' `path.extname`/`basename` moved to
+		// clients/lsp/file-server-match.ts (3, with its own import) and the
+		// session-root walk to clients/lsp/session-roots.ts (6 -> 8).
+		"clients/lsp/config.ts": 3,
+		// #4346: resolves a Go importer's package directory to announce its peers.
+		"clients/lsp/created-import-targets.ts": 3,
 		"clients/lsp/edits.ts": 23,
-		"clients/lsp/index.ts": 18,
+		"clients/lsp/file-server-match.ts": 3,
+		"clients/lsp/index.ts": 15,
+		// #4346: Go package directories and TS/JS extensions of the implicit
+		// dependency scope (same-package files, ambient declarations).
+		// 7 -> 8 (#4438 r2): a Go file name's `_GOOS`/`_GOARCH` suffix, read
+		// with `path.basename`, a filesystem path.
+		"clients/lsp/implicit-scope.ts": 8,
 		"clients/lsp/inferred-project.ts": 3,
 		"clients/lsp/jvm-runtime.ts": 19,
 		"clients/lsp/language.ts": 3,
@@ -961,13 +1047,24 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/lsp/lombok.ts": 14,
 		// #4299: 121 -> 124; OS path namespace calls for canonical compiler
 		// validation replace the wrapper-relative guess. No path-key owner changes.
-		"clients/lsp/server.ts": 124,
-		"clients/lsp/session-roots.ts": 6,
-		"clients/lsp/workspace-diagnostics-cache.ts": 13,
+		// 124 -> 125 (#4414): the Windows npm-global layout adds one `path.join` to
+		// `typescriptDirsForTsc`, the list of package dirs beside a resolved `tsc`.
+		"clients/lsp/server.ts": 125,
+		"clients/lsp/session-roots.ts": 8,
+		// 13 -> 15 (#4346): a creation's path joins the entry's dependency
+		// scope test (Go package directory, created-file stem/directory names).
+		"clients/lsp/workspace-diagnostics-cache.ts": 15,
+		// #4346: a creation record carries the created file's path.
+		"clients/lsp/workspace-diagnostics-session.ts": 2,
 		// 6 -> 5 (#3643): removed the obsolete ring path-comparison branch;
 		// dispatch identity now arrives on DispatchResult.
-		"clients/mcp/analyze.ts": 5,
-		"clients/mcp/ipc.ts": 4,
+		// 5 -> 6 (#4583): the adopted warm entry keys its map lookup through
+		// `path.resolve(cwd)`, the same sense (a path operation) the entry's own
+		// creation site already uses.
+		"clients/mcp/analyze.ts": 6,
+		// 4 -> 7 (#4376): OS path namespace calls build the pid-first endpoint
+		// name and the stale-socket owner marker. No path-key owner changes.
+		"clients/mcp/ipc.ts": 7,
 		"clients/mcp/session.ts": 3,
 		"clients/metrics-client.ts": 6,
 		"clients/metrics-history.ts": 12,
@@ -977,10 +1074,16 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/mutation-attribution.ts": 3,
 		"clients/ndjson-logger.ts": 5,
 		"clients/observed-mutation.ts": 6,
-		"clients/opaque-mutation-scan.ts": 6,
+		// 6 -> 7 (#4493): listGitHeadDelta resolves git's relative names with
+		// the OS `path` namespace; the keys still go through normalizeMapKey.
+		// 7 -> 9 (#4493 r2): gitPathBase joins the `.git` entry and its HEAD
+		// with the same namespace to check the walk found a repository.
+		"clients/opaque-mutation-scan.ts": 9,
 		"clients/opengrep-client.ts": 8,
 		"clients/opengrep-config.ts": 3,
-		"clients/package-manager.ts": 21,
+		// 21 -> 23 (#4515 r2): commandSearchReachesProject splits PATH on
+		// `path.delimiter` and tests each entry with `path.isAbsolute`.
+		"clients/package-manager.ts": 23,
 		"clients/package-root.ts": 5,
 		"clients/path-keyed-map.ts": 11,
 		// 30 -> 34: findNearestMarkerRootDetailed (#3691) adds its own marker/root
@@ -1016,10 +1119,14 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/recent-touches.ts": 5,
 		"clients/reverse-deps.ts": 8,
 		"clients/review-graph-logger.ts": 2,
+		// 33 -> 36 (#4346): the importer pass names a created file by its stem
+		// and directory; 36 -> 33 (#4346 final lane): that name test moved to
+		// import-resolvers.ts `fileAnswerNames`, shared with the LSP cache.
 		"clients/review-graph/builder.ts": 33,
 		"clients/review-graph/format.ts": 4,
 		"clients/review-graph/git-identity.ts": 10,
-		"clients/review-graph/import-resolvers.ts": 61,
+		// 61 -> 64 (#4346 final lane): `fileAnswerNames`, moved from builder.ts.
+		"clients/review-graph/import-resolvers.ts": 64,
 		"clients/review-graph/tsconfig-paths.ts": 35,
 		"clients/review-graph/workspace-modules.ts": 27,
 		"clients/ruff-client.ts": 4,
@@ -1030,7 +1137,15 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// 28 -> 29 (#3814): the deferred-blocker merge derives the map key with
 		// `path.resolve(filePath)`, the expression every sibling method uses.
 		// 29 -> 30 (#4213): the lifecycle identity lookup uses the same map key.
-		"clients/runtime-coordinator.ts": 30,
+		// 30 -> 32 (#4484 r2): the record read for the carry and the settled-run
+		// retire derive the same map key.
+		// 32 -> 33 (#4484 round 4): the anchor moves onto its record, re-set
+		// under the display key every record writer uses; its reads route
+		// through the keyed map.
+		// 33 -> 34 (#4535): the bulk mutation writer resolves each path into the
+		// durable change-log entry, the same `path.resolve` the single writer
+		// uses, so the log's spelling does not depend on which form recorded it.
+		"clients/runtime-coordinator.ts": 34,
 		"clients/runtime-session.ts": 15,
 		// 22 -> 21 (#4137): the baseline slot's `path.resolve` moved into
 		// `opaqueBaselineSlot` (clients/opaque-mutation-scan.ts).
@@ -1042,15 +1157,22 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/runtime-tool-call.ts": 24,
 		// 22 -> 20 (#3650): the tool_result path read is routed through
 		// readToolResultPathField; the open-coded input.path cast is gone.
-		"clients/runtime-tool-result.ts": 19,
+		// 19 -> 18 (#4576): the tool_result path resolves through
+		// `resolveToolCallFilePath`, dropping the bare `path.*` pair.
+		// 18 -> 20 (#4504 r1): the recognized set is partitioned by the checkout
+		// the scan ran in, and the held-primary send groups the written set by
+		// the root that holds each file; three `path.resolve` reads where there
+		// were one, no new delivery path.
+		"clients/runtime-tool-result.ts": 20,
 		// 25 -> 27 (#3218): the resolved-blocker filter keys both the current
 		// blocker set and each resolved entry with `path.resolve`.
 		// 27 -> 26 (#2542 ask 3): `deferralEntryKey` moved to
 		// clients/deferred-test-targets.ts, taking its one `path.resolve` with it.
-		"clients/runtime-turn.ts": 26,
+		// 26 -> 27 (#4487): the turn_end cascade delivery resolves each edited
+		// file with `path.resolve` to forget its pending cascade errors.
+		"clients/runtime-turn.ts": 27,
 		"clients/rust-client.ts": 5,
 		"clients/safe-spawn.ts": 26,
-		"clients/sanitize.ts": 2,
 		"clients/search-read-registration.ts": 3,
 		"clients/security-scan-client.ts": 4,
 		"clients/session-state-store.ts": 3,
@@ -1066,7 +1188,9 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/slow-fs.ts": 4,
 		"clients/smells-rollup.ts": 3,
 		"clients/source-filter.ts": 11,
-		"clients/source-walker.ts": 3,
+		// 3 -> 4 (#1979): `DirectoryListing.mayContain` takes the final segment of
+		// the target with `path.basename`, the same call every walker path uses.
+		"clients/source-walker.ts": 4,
 		"clients/spawn-timeout-cooldown.ts": 3,
 		"clients/startup-scan.ts": 11,
 		// 61 -> 66: filesystem ownership/discovery operations plus the alias
@@ -1103,12 +1227,33 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"tools/ast-grep-outline.ts": 5,
 		"tools/ast-grep-search.ts": 2,
 		"tools/effective-config.ts": 2,
-		"tools/lens-diagnostic-mark.ts": 6,
-		"tools/lens-diagnostics.ts": 30,
-		"tools/lsp-diagnostics.ts": 10,
-		"tools/lsp-navigation.ts": 14,
-		"tools/module-report.ts": 29,
+		// 6 -> 4 (#4577 M2): the `path` argument folds onto
+		// `resolveHostToolPath`, dropping the `path.isAbsolute`/`path.resolve`
+		// pair.
+		"tools/lens-diagnostic-mark.ts": 4,
+		// 30 -> 27 (#4576): `resolvePathsScope` folds onto
+		// `resolveHostToolPath`, dropping three `path.*` calls.
+		"tools/lens-diagnostics.ts": 27,
+		// 10 -> 8 (#4577 M2): the scalar and batch `path`/`paths` arguments fold
+		// onto `resolveHostToolPath`, dropping one `path.resolve` each.
+		"tools/lsp-diagnostics.ts": 8,
+		// 14 -> 15 (#4403 round 5): `noServerAnsweredText` names the file by
+		// its `path.basename`, beside the install hint's own.
+		// 15 -> 11: both concurrent folds land here. #4578 takes the `rename_file`
+		// destination, #4577 M2 the navigation `path` argument, so each pair of
+		// `path.isAbsolute`/`path.resolve` calls goes and the merged file keeps
+		// path OPERATIONS only (`path.basename`, `path.resolve` of a read target),
+		// the sense the glossary does not retire.
+		"tools/lsp-navigation.ts": 11,
+		// 29 -> 27 (#4577 M2): `resolveFile` folds onto `resolveHostToolPath`,
+		// dropping the `path.isAbsolute`/`path.resolve` pair.
+		"tools/module-report.ts": 27,
 		"tools/render-compact.ts": 3,
+		// 0 -> 2 (#4577 R2-2): the defaulted (no `paths`) target is now built by
+		// `path.resolve(base)` alone instead of going through
+		// `resolveHostToolPath`, because that generated path is pi-lens's own and
+		// must keep its bytes.
+		"tools/shared.ts": 2,
 		"tools/symbol-search.ts": 5,
 		"mcp/analyze-cli.ts": 4,
 		"mcp/cli.ts": 2,
@@ -1150,7 +1295,7 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/project-lens-config.ts": 8,
 		"clients/project-snapshot.ts": 10,
 		"clients/read-guard-tool-lines.ts": 4,
-		"clients/read-guard.ts": 24,
+		"clients/read-guard.ts": 23,
 		"clients/runtime-agent-end.ts": 56,
 		"clients/runtime-context.ts": 2,
 		// 17 -> 23 (#3218): `noteResolvedBlockerFile` reads the removed
@@ -1179,7 +1324,9 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/dispatch/runners/tree-sitter.ts": 5,
 		"clients/file-utils.ts": 3,
 		"clients/lens-engine.ts": 11,
-		"clients/lsp/cascade-tier.ts": 2,
+		// 2 -> 3 (#4485): the command-pull tier reads the primary's capability
+		// `snapshot` for the tsserver request command.
+		"clients/lsp/cascade-tier.ts": 3,
 		"clients/lsp/index.ts": 6,
 		"clients/lsp/wait-policy/classification.ts": 11,
 		"clients/mcp/analyze.ts": 2,
@@ -1208,7 +1355,9 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/word-index.ts": 8,
 		"tools/lens-diagnostics.ts": 12,
 		"tools/lsp-navigation.ts": 9,
-		"mcp/server.ts": 22,
+		// 22 -> 23 (#1634): `pilens_project_scan` reads the policy's suppressed
+		// count off the scan result its handler already names `snapshot`.
+		"mcp/server.ts": 23,
 	},
 	status: {
 		// #3867 moved the coverage decision onto `hasUsableResult`: dispatcher.ts
@@ -1241,7 +1390,8 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/dispatch/runners/eslint.ts": 3,
 		"clients/dispatch/runners/fact-rules.ts": 2,
 		// #4309: folded unavailable/absent-command exits remove one status use.
-		"clients/dispatch/runners/fish-indent.ts": 5,
+		// 5 -> 6 (#4522): the exitless-run guard reads the exit status once.
+		"clients/dispatch/runners/fish-indent.ts": 6,
 		"clients/dispatch/runners/gleam-check.ts": 7,
 		"clients/dispatch/runners/go-vet.ts": 5,
 		"clients/dispatch/runners/golangci-lint.ts": 4,
@@ -1288,7 +1438,8 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/dispatch/runners/vale.ts": 4,
 		"clients/dispatch/runners/yamllint.ts": 2,
 		"clients/dispatch/runners/zig-check.ts": 3,
-		"clients/dispatch/types.ts": 5,
+		// 5 -> 6 (#4484 r2): `reachedNoVerdict` reads the runner result's status.
+		"clients/dispatch/types.ts": 6,
 		"clients/file-utils.ts": 2,
 		"clients/finding-delivery-gate.ts": 3,
 		"clients/formatters.ts": 8,
@@ -1305,15 +1456,18 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/lens-config.ts": 2,
 		"clients/lens-engine.ts": 4,
 		"clients/lsp-mutation.ts": 7,
+		"clients/lsp/client-registry.ts": 1,
 		"clients/lsp/client.ts": 31,
 		"clients/lsp/edits.ts": 2,
-		"clients/lsp/index.ts": 5,
+		"clients/lsp/index.ts": 4,
 		"clients/lsp/jvm-runtime.ts": 1,
 		"clients/lsp/server.ts": 4,
 		"clients/mcp/analyze.ts": 9,
 		"clients/mcp/review.ts": 1,
 		"clients/module-report.ts": 6,
-		"clients/opaque-mutation-scan.ts": 24,
+		// 24 -> 26 (#4493): readGitHead and listGitHeadDelta read the spawn
+		// result's exit `status`, not a delivery status.
+		"clients/opaque-mutation-scan.ts": 26,
 		"clients/opengrep-client.ts": 9,
 		"clients/package-manager.ts": 2,
 		"clients/pipeline.ts": 4,
@@ -1385,7 +1539,7 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// #4299: 16 -> 18; two reads of the external TypeScript package
 		// manifest's literal version field, not a pi-lens generation identity.
 		"clients/lsp/server.ts": 18,
-		"clients/lsp/workspace-diagnostics-cache.ts": 7,
+		"clients/lsp/workspace-diagnostics-cache.ts": 6,
 		"clients/mcp/ipc.ts": 15,
 		"clients/metrics-history.ts": 3,
 		"clients/module-report.ts": 1,
@@ -1452,7 +1606,7 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/pipeline.ts": 6,
 		"clients/project-diagnostics/runner-adapters/call-graph-impact.ts": 1,
 		"clients/runtime-agent-end.ts": 6,
-		"clients/runtime-turn.ts": 21,
+		"clients/runtime-turn.ts": 16,
 		"clients/secret-findings.ts": 3,
 		"clients/widget-state.ts": 1,
 		"tools/ast-grep-search.ts": 6,

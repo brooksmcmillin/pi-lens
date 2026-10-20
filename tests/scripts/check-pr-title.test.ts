@@ -100,6 +100,7 @@ describe("live PR title resolution (#2083)", () => {
 				headers: {
 					Authorization: "Bearer test-token",
 					Accept: "application/vnd.github+json",
+					"X-GitHub-Api-Version": "2022-11-28",
 				},
 			}),
 		);
@@ -192,7 +193,7 @@ describe("live PR title resolution (#2083)", () => {
 			expect.stringContaining("::warning::"),
 		);
 		expect(warning).toHaveBeenCalledWith(
-			expect.stringContaining("GITHUB_TOKEN is missing"),
+			expect.stringContaining("GITHUB_TOKEN is not set"),
 		);
 	});
 });

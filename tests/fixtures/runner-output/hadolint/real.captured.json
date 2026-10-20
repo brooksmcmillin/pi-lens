@@ -12,10 +12,39 @@
 		],
 		"workspace": "tests/fixtures/tool-smoke/dockerfile",
 		"platform": "win32-x64",
-		"capturedAt": "2026-08-21"
+		"capturedAt": "2026-08-21",
+		"versionArgv": [
+			"--version"
+		]
 	},
 	"file": "Dockerfile",
 	"exitCode": 0,
 	"stdout": "[{\"code\":\"DL3006\",\"column\":1,\"file\":\"Dockerfile\",\"level\":\"warning\",\"line\":3,\"message\":\"Always tag the version of an image explicitly\"},{\"code\":\"DL3008\",\"column\":1,\"file\":\"Dockerfile\",\"level\":\"warning\",\"line\":4,\"message\":\"Pin versions in apt get install. Instead of `apt-get install <package>` use `apt-get install <package>=<version>`\"},{\"code\":\"DL3015\",\"column\":1,\"file\":\"Dockerfile\",\"level\":\"info\",\"line\":4,\"message\":\"Avoid additional packages by specifying `--no-install-recommends`\"},{\"code\":\"DL3009\",\"column\":1,\"file\":\"Dockerfile\",\"level\":\"info\",\"line\":4,\"message\":\"Delete the apt lists (/var/lib/apt/lists) after installing something\"}]",
-	"stderr": ""
+	"stderr": "",
+	"availability": [
+		{
+			"command": "hadolint",
+			"argv": [
+				"--version"
+			],
+			"version": "2.15.1",
+			"exitCode": 0,
+			"stdout": "Haskell Dockerfile Linter 2.15.1\n",
+			"stderr": ""
+		}
+	],
+	"clean": {
+		"workspace": "tests/fixtures/runner-output-clean/hadolint",
+		"file": "Dockerfile",
+		"argv": [
+			"--format",
+			"json",
+			"--no-fail",
+			"Dockerfile"
+		],
+		"version": "2.15.1",
+		"exitCode": 0,
+		"stdout": "[]",
+		"stderr": ""
+	}
 }

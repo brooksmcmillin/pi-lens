@@ -1,9 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import extension from "../../index.js";
 import { McpHarness } from "../mcp/harness.js";
-import { createPiMock } from "../support/pi-mock.js";
+import { startPiRunner } from "../support/pi-runner.js";
 
 type ListedTool = {
 	name: string;
@@ -119,10 +118,9 @@ describe("tool roster description budget", () => {
 	let mcpTools: ListedTool[];
 
 	beforeAll(async () => {
-		// Use the same extension factory and registerTool seam as session_start.
-		const pi = createPiMock();
-		extension(pi.asExtensionAPI());
-		piTools = [...pi.tools.values()] as ListedTool[];
+		// The real host's tool definitions, not the registration arguments (#4632).
+		const pi = await startPiRunner();
+		piTools = pi.getAllRegisteredTools().map((tool) => tool.definition);
 
 		mcp = new McpHarness();
 		const listed = await mcp.request(1, "tools/list");

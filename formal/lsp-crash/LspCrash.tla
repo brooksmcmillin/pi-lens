@@ -1,7 +1,7 @@
 ------------------------------ MODULE LspCrash ------------------------------
 (***************************************************************************)
 (* An LSP server process dying while touches of one file are in flight,    *)
-(* and the lazy respawn that follows (clients/lsp/index.ts,                *)
+(* and the lazy respawn that follows (clients/lsp/client-registry.ts,      *)
 (* clients/lsp/client.ts). Issues #3501 and #3502; see README.md.          *)
 (*                                                                         *)
 (* Actors:                                                                 *)
@@ -110,7 +110,7 @@ Gens == 0..MaxGen
 None == -1
 
 \* The per-client-generation derived facts #3672/#3584 consolidate onto
-\* retireClient clients/lsp/index.ts: the aux-notify inflight count
+\* retireClient clients/lsp/client-registry.ts: the aux-notify inflight count
 \* (noteAuxNotifyIssued), the drained-barrier latency EWMA
 \* (noteAuxNotifyDrainLatency) and the consecutive write-timeout streak
 \* (recordNotifyWriteBackpressure, cleared through forgetReadiness). A

@@ -1,6 +1,7 @@
 // flake-shape: real-process-spawn — real `git worktree add` writes linked-worktree metadata that resolveAnalysisRoot must read
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -34,9 +35,11 @@ function registeredProjectRoot(prefix: string): string {
 	return root;
 }
 
+// Under the tmp root, not beside the checkout: a checkout's parent can sit in a
+// marked workspace (a package.json above it), which makes the root "adopted".
 function registeredUnmarkedRoot(): string {
 	const root = fs.mkdtempSync(
-		path.join(path.dirname(process.cwd()), ".analysis-root-unmarked-"),
+		path.join(os.tmpdir(), "pi-lens-analysis-root-unmarked-"),
 	);
 	registerTmpRoot(getTmpRootRegistry(), root, "registered");
 	environments.push({
@@ -65,7 +68,7 @@ describe("analysis-root seam", () => {
 		expect(canWriteAnalysisRoot("adopted")).toBe(false);
 	});
 
-	it("refuses symlinked protected roots and keeps linked-worktree vendors out", () => {
+	it("refuses symlinked protected roots and keeps linked-worktree vendors out", (ctx) => {
 		// Recurrence: #4257 F3/F7 must not create a second identity through a
 		// symlink or re-admit vendor content before the linked-worktree guard.
 		const env = setupTestEnvironment("pi-lens-analysis-root-links-");
@@ -76,9 +79,8 @@ describe("analysis-root seam", () => {
 		fs.writeFileSync(path.join(protectedRoot, "package.json"), "{}\n");
 		try {
 			fs.symlinkSync(protectedRoot, link, "dir");
-		} catch {
-			expect(true).toBe(true);
-			return;
+		} catch (error) {
+			ctx.skip(`symlinks are unavailable here: ${String(error)}`);
 		}
 		expect(resolveAnalysisRoot(path.join(link, "a.ts"), env.tmpDir)).toBe(
 			"session",
@@ -285,7 +287,18 @@ describe("analysis-root seam", () => {
 		// from persisting a receipt for an adopted root.
 		const env = setupTestEnvironment("pi-lens-analysis-root-project-change-");
 		environments.push(env);
-		const filePath = path.join(env.tmpDir, "..", "adopted-project", "file.ts");
+		// #4560: the adopted root is a sibling at the tmp root (its first segment
+		// must not start with `pi-`, or it would classify as pi-owned scratch).
+		// The cell removes it, so the widened tmp-root census sees no leftover.
+		const adoptedRoot = path.join(
+			env.tmpDir,
+			"..",
+			`adopted-project-change-${process.pid}`,
+		);
+		environments.push({
+			cleanup: () => fs.rmSync(adoptedRoot, { recursive: true, force: true }),
+		});
+		const filePath = path.join(adoptedRoot, "file.ts");
 		fs.mkdirSync(path.dirname(filePath), { recursive: true });
 		fs.writeFileSync(filePath, "export const value = 1;\n");
 		const runtime = new RuntimeCoordinator();
@@ -322,7 +335,15 @@ describe("analysis-root seam", () => {
 		// no-op until adopted-root analysis is explicitly admitted.
 		const env = setupTestEnvironment("pi-lens-analysis-root-turn-summary-");
 		environments.push(env);
-		const filePath = path.join(env.tmpDir, "..", "adopted-project", "file.ts");
+		const adoptedRoot = path.join(
+			env.tmpDir,
+			"..",
+			`adopted-project-turn-${process.pid}`,
+		);
+		environments.push({
+			cleanup: () => fs.rmSync(adoptedRoot, { recursive: true, force: true }),
+		});
+		const filePath = path.join(adoptedRoot, "file.ts");
 		fs.mkdirSync(path.dirname(filePath), { recursive: true });
 		fs.writeFileSync(filePath, "export const value = 1;\n");
 		const runtime = new RuntimeCoordinator();

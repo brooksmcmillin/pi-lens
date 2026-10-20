@@ -2,7 +2,6 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
-	canToolAutoFix,
 	getAutofixCapability,
 	getAutofixPolicyForFile,
 	getAutoInstallToolIdForFormatter,
@@ -51,7 +50,6 @@ import {
 	hasTflintConfig,
 	hasVitePlusConfig,
 	hasYamllintConfig,
-	isSafePipelineAutofixTool,
 	shouldAutoInstallTool,
 	_getSpotlessGradleReadCountForTests,
 } from "../../clients/tool-policy.js";
@@ -324,10 +322,6 @@ describe("tool-policy", () => {
 			fixKind: "pipeline",
 		});
 		expect(getAutofixCapability("prettier-check")).toBeUndefined();
-		expect(canToolAutoFix("rubocop")).toBe(true);
-		expect(isSafePipelineAutofixTool("rubocop")).toBe(true);
-		expect(canToolAutoFix("phpstan")).toBe(false);
-		expect(isSafePipelineAutofixTool("phpstan")).toBe(false);
 	});
 
 	it("exposes centralized linter policy metadata", () => {

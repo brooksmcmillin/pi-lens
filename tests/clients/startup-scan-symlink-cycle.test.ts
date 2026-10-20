@@ -41,7 +41,6 @@ describe("startup-scan symlink handling (#775)", () => {
 		const homeEnv = setupTestEnvironment("pi-lens-symlink-self-home-");
 		cleanups.push(homeEnv.cleanup);
 
-		fs.mkdirSync(path.join(env.tmpDir, ".git"));
 		fs.writeFileSync(path.join(env.tmpDir, "main.ts"), "export {};\n");
 		symlinkDir(env.tmpDir, path.join(env.tmpDir, "self-loop"));
 
@@ -60,7 +59,6 @@ describe("startup-scan symlink handling (#775)", () => {
 		const homeEnv = setupTestEnvironment("pi-lens-symlink-mutual-home-");
 		cleanups.push(homeEnv.cleanup);
 
-		fs.mkdirSync(path.join(env.tmpDir, ".git"));
 		const dirA = path.join(env.tmpDir, "a");
 		const dirB = path.join(env.tmpDir, "b");
 		fs.mkdirSync(dirA);
@@ -86,7 +84,6 @@ describe("startup-scan symlink handling (#775)", () => {
 		const outside = setupTestEnvironment("pi-lens-symlink-outside-");
 		cleanups.push(outside.cleanup);
 
-		fs.mkdirSync(path.join(env.tmpDir, ".git"));
 		fs.writeFileSync(path.join(env.tmpDir, "main.ts"), "export {};\n");
 		// A real directory full of source files, reachable ONLY via a symlink.
 		fs.writeFileSync(path.join(outside.tmpDir, "hidden1.ts"), "export {};\n");
@@ -110,7 +107,6 @@ describe("startup-scan symlink handling (#775)", () => {
 		const homeEnv = setupTestEnvironment("pi-lens-symlink-async-home-");
 		cleanups.push(homeEnv.cleanup);
 
-		fs.mkdirSync(path.join(env.tmpDir, ".git"));
 		fs.writeFileSync(path.join(env.tmpDir, "main.ts"), "export {};\n");
 		symlinkDir(env.tmpDir, path.join(env.tmpDir, "self-loop"));
 

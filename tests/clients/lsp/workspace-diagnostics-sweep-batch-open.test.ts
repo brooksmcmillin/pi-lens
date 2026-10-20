@@ -46,6 +46,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { hashDiagnosticContent } from "../../../clients/lsp/diagnostic-binding.js";
 import { WatchedFilesQueue } from "../../../clients/lsp/watch-queue.js";
 import { removeTempDirSync } from "../test-utils.js";
 
@@ -76,9 +77,17 @@ describe("runWorkspaceDiagnostics — batch-open restores #271 coalescing for a 
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-wsd-batchopen-"));
+		// The open count below depends on whether f0's per-file touch lands inside
+		// the touch debounce window of the warm-up's push; a window wider than
+		// the test makes that deterministic on a loaded runner. Read at import,
+		// after the resetModules above.
+		vi.stubEnv("PI_LENS_LSP_TOUCH_DEBOUNCE_MS", "600000");
 	});
 
-	afterEach(() => removeTempDirSync(tmp));
+	afterEach(() => {
+		vi.unstubAllEnvs();
+		removeTempDirSync(tmp);
+	});
 
 	it("fires the watched-files notification once for a sweep over N previously-unopened files, not once per file", async () => {
 		const fileNames = Array.from({ length: 12 }, (_, i) => `f${i}.ts`);
@@ -99,6 +108,12 @@ describe("runWorkspaceDiagnostics — batch-open restores #271 coalescing for a 
 			notifiedUriCount += changes.length;
 		});
 
+		// #4532 gap 9: the double answers the touch gate the way a real client
+		// does, with the record of the payloads its own `notify.open` took, and
+		// holds no queue of its own, so nothing is ever in flight. Without the
+		// record the gate fails closed and every touch pushes, which is not the
+		// coalescing seam this case pins.
+		const sent = new Map<string, { hash: string }>();
 		const client = {
 			isAlive: () => true,
 			shutdown: async () => {},
@@ -109,12 +124,16 @@ describe("runWorkspaceDiagnostics — batch-open restores #271 coalescing for a 
 			}),
 			getOperationSupport: () => ({}),
 			serverId: "typescript",
+			getSentContent: (filePath: string) => sent.get(filePath),
+			hasNotifyInFlight: () => false,
 			notify: {
+				announceCreated: () => undefined,
 				// Mirrors `handleNotifyOpen`'s real branch structure closely enough
 				// to reproduce the bug/fix: first open of a path enqueues a
 				// watched-files change; a later call for an already-open path is
 				// just a didChange (no further enqueue).
-				open: vi.fn(async (filePath: string) => {
+				open: vi.fn(async (filePath: string, content: string) => {
+					sent.set(filePath, { hash: hashDiagnosticContent(content) });
 					if (openDocuments.has(filePath)) return;
 					openDocuments.add(filePath);
 					watchQueue.enqueue(`file://${filePath}`, 2);
@@ -142,13 +161,16 @@ describe("runWorkspaceDiagnostics — batch-open restores #271 coalescing for a 
 		// second time by the main per-file loop's own `touchFile` — which by
 		// then finds the document already open and only sends the
 		// already-open didChange equivalent (no further enqueue, mirrored by
-		// this mock's early return). Plus exactly ONE extra `notify.open` from
-		// the #667 pre-sweep warm-up touch, which runs against the group's
-		// first file (f0.ts) BEFORE the #608 pre-open pass even starts — the
-		// warm-up call is the one that actually opens f0.ts first; the pre-open
-		// pass then finds it already open. One warm-up per GROUP (one server
-		// here), not one per file.
-		expect(client.notify.open).toHaveBeenCalledTimes(fileNames.length * 2 + 1);
+		// this mock's early return). The #667 pre-sweep warm-up touch runs
+		// against the group's first file (f0.ts) BEFORE the #608 pre-open pass
+		// even starts — the warm-up call is the one that actually opens f0.ts
+		// first; the pre-open pass then finds it already open. The per-file
+		// touch of f0.ts then pushes nothing: the warm-up pushed the same bytes
+		// to the same server inside the debounce window (#3405 r2: the debounce
+		// key no longer carries the client scope, so the warm-up's "primary"
+		// push covers the sweep's "all" touch). One warm-up per GROUP (one
+		// server here), not one per file.
+		expect(client.notify.open).toHaveBeenCalledTimes(fileNames.length * 2);
 		// The watched-files queue coalesces each CHUNK's first-opens into its
 		// own single flush — 12 files at the default chunk width of 8 is 2
 		// chunks (8+4), so 2 flushes from the #608 pre-open pass itself. The
@@ -250,6 +272,7 @@ describe("runWorkspaceDiagnostics — pre-open is bounded, not just fast (#615)"
 			getOperationSupport: () => ({}),
 			serverId: "typescript",
 			notify: {
+				announceCreated: () => undefined,
 				// Deliberately never resolves — reproduces a stuck notification
 				// write / hung server. Before #615 this hung `preOpenGroupFiles`
 				// forever, with no heartbeat and no way for the sweep to move on.
@@ -292,6 +315,7 @@ describe("runWorkspaceDiagnostics — pre-open is bounded, not just fast (#615)"
 			getOperationSupport: () => ({}),
 			serverId: "typescript",
 			notify: {
+				announceCreated: () => undefined,
 				open: vi.fn(() => new Promise<void>(() => {})),
 			},
 			waitForDiagnostics: vi.fn(async () => []),

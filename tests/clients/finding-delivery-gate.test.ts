@@ -23,15 +23,30 @@
  * fail" pattern.
  */
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import { stripCommentsAndStrings } from "../support/session-state-scan.js";
+import {
+	auditRegistry,
+	bindTagsToSeams,
+	escapeRegExp,
+	findSeams,
+	listSourceFiles,
+	matchingCloseIndex,
+	relativePosix,
+	scanTaggedSeams as scanTaggedSeamsWith,
+	type SeamHit,
+	stripSource,
+	tagPattern,
+} from "../support/sweep-kit.js";
+import { removeTempDirSync } from "./test-utils.js";
 import {
 	assertNoDeliveryBypass,
 	DELIVERY_SURFACES,
 	formatCacheAgeLabel,
 	type DeliverySurfaceEntry,
 } from "../../clients/finding-delivery-gate.js";
+import { LENS_TOOL_NAMES, TOOL_REGISTRY } from "../../clients/tool-config.js";
 
 const REPO_ROOT = path.resolve(__dirname, "../..");
 
@@ -67,6 +82,8 @@ const EXPECTED_SURFACE_IDS = [
 	"runtime-turn:late-auxiliary-findings",
 	"runtime-turn:late-runner-findings",
 	"runtime-turn:cascade-blocker",
+	// #4487: earlier-turn cascade errors not re-checked this turn.
+	"runtime-turn:cascade-pending-errors",
 	"runtime-turn:cascade-coverage-advisory",
 	// #3102: the cold-neighbour cascade run's own build-time lane, a turn
 	// earlier than the runtime-turn render that carries it.
@@ -96,225 +113,272 @@ const EXPECTED_SURFACE_IDS = [
 	// #2007: the shared-checkout refusal, the same live-preflight shape as
 	// `git-guard:commit-blocked`.
 	"shared-checkout-guard:worktree-mutation-blocked",
+	// #1634 enumeration round: the sinks the census found outside the list.
+	"lsp-navigation:workspace-diagnostics-path",
+	"lsp-navigation:tracked-snapshot",
+	"runtime-context:persisted-findings",
+	"index:turn-summary",
+	"lens-engine:project-scan",
+	"mcp-server:analyze",
+	"mcp-analyze-cli:post-edit-report",
 ].sort();
 
-// ── Real seam scan (#1634 review F2) ────────────────────────────────────────
+// ── Render-seam scan (#1634 review F2, #3165) ───────────────────────────────
 //
-// `stripCommentsAndStrings` blanks comments/string contents IN PLACE (same
-// line count, same column layout for anything left) — the same tool the
-// session-state sweep uses to avoid mis-lexing a commented-out declaration as
-// a real one. We reuse it here so a seam-shaped call inside a comment or a
-// string literal (e.g. this very file's own doc comments) is never counted
-// as a real seam, and a REAL seam hidden inside a template string is never
-// missed either.
+// Every production file is scanned, not a named list (#3165: the scan read two
+// files, so a render seam anywhere else was structurally invisible). Seams are
+// found in comment-and-string-blanked text, so a seam-shaped call quoted in a
+// comment or a string never counts, and each one binds to the tag comment on
+// the non-blank line directly above it (`bindTagsToSeams`). A tag must name a
+// registered surface whose `file` is the seam's own file, so a new seam cannot
+// borrow another file's entry.
 
-const TAG_RE = /@delivery-surface:\s*([\w:,-]+)/;
+const TAG = tagPattern("delivery-surface");
 
-/** One call-shaped seam found in the STRIPPED source, 1-based line number. */
-interface SeamHit {
-	line: number;
-	text: string;
+const SEAM_SHAPES: ReadonlyArray<{ name: string; pattern: RegExp }> = [
+	{
+		name: "turn-end tier push",
+		pattern: /\b(blockerParts|advisoryParts|staleSecretParts)\.push\(/,
+	},
+	{
+		name: "lens_diagnostics mode report",
+		pattern: /^(?:export\s+)?(?:async\s+)?function\s+format\w*Mode\(/,
+	},
+	{
+		// #3165: the cascade display render, called outside the two files the
+		// scan used to read. Its own definition is not a seam.
+		name: "cascade neighbour render",
+		pattern: /(?<!\bfunction\s+)\bformatCascadeNeighborDiagnostics\(/,
+	},
+];
+
+const RUNTIME_TURN_SEAM_PATTERN = SEAM_SHAPES[0].pattern;
+
+const PRODUCTION_DIRS = ["clients", "tools", "mcp"];
+
+/** Every production source under `root`, root-relative posix, sorted. */
+function productionFiles(root: string): string[] {
+	const files = PRODUCTION_DIRS.flatMap((dir) =>
+		fs.existsSync(path.join(root, dir))
+			? listSourceFiles(path.join(root, dir))
+			: [],
+	);
+	const entry = path.join(root, "index.ts");
+	if (fs.existsSync(entry)) files.push(entry);
+	return files.map((file) => relativePosix(root, file)).sort();
 }
 
-function findSeams(strippedSource: string, pattern: RegExp): SeamHit[] {
-	const lines = strippedSource.split("\n");
-	const hits: SeamHit[] = [];
-	lines.forEach((text, index) => {
-		if (pattern.test(text)) hits.push({ line: index + 1, text: text.trim() });
-	});
-	return hits;
+/** `rawSource`'s tagged seams, with the kit's binding rules. */
+function scanTaggedSeams(rawSource: string, pattern: RegExp) {
+	return scanTaggedSeamsWith(rawSource, pattern, TAG);
 }
 
-/**
- * For each seam hit, the tag binds to EXACTLY the immediately preceding
- * NON-BLANK raw line — no lookback window, no "nearest tag wins" (#1634
- * review round R1a: a 4-line lookback window let a NEW untagged seam
- * silently INHERIT the previous seam's tag — the most natural way someone
- * adds a new advisory without registering it: paste a second `push` call
- * right after an already-tagged one). Each tag LINE can bind at most one
- * seam — tracked in `consumedTagLines` — so two seams can never share one
- * tag comment.
- */
-function tagsForSeams(
+/** Problems for one file's render seams; empty means each is registered. */
+function seamProblems(
+	file: string,
 	rawSource: string,
-	seams: SeamHit[],
-): Array<{ seam: SeamHit; ids: string[] }> {
-	const rawLines = rawSource.split("\n");
-	const consumedTagLines = new Set<number>();
-	return seams.map((seam) => {
-		let i = seam.line - 2; // 0-based index of the raw line just above the seam
-		while (i >= 0 && rawLines[i].trim() === "") i--;
-		if (i < 0) return { seam, ids: [] };
-		const m = TAG_RE.exec(rawLines[i]);
-		if (!m || consumedTagLines.has(i)) return { seam, ids: [] };
-		consumedTagLines.add(i);
-		return { seam, ids: m[1].split(",").map((s) => s.trim()) };
-	});
-}
-
-/** Every real seam in `rawSource`, paired with its (possibly empty) tag ids. */
-function scanTaggedSeams(
-	rawSource: string,
-	seamPattern: RegExp,
-): Array<{ seam: SeamHit; ids: string[] }> {
-	const stripped = stripCommentsAndStrings(rawSource);
-	const seams = findSeams(stripped, seamPattern);
-	return tagsForSeams(rawSource, seams);
-}
-
-/**
- * Scanner entry point, exported so the red-proof tests below can run it
- * against a synthetic FIXTURE string (an untagged/mistagged mutant) without
- * touching the real repo files.
- */
-function scanUntaggedOrMistaggedSeams(
-	rawSource: string,
-	seamPattern: RegExp,
-	registryIds: ReadonlySet<string>,
+	registry: Record<string, DeliverySurfaceEntry> = DELIVERY_SURFACES,
 ): string[] {
+	const stripped = stripSource(rawSource);
 	const problems: string[] = [];
-	for (const { seam, ids } of scanTaggedSeams(rawSource, seamPattern)) {
-		if (ids.length === 0) {
-			problems.push(`line ${seam.line}: untagged seam — ${seam.text}`);
-			continue;
-		}
-		for (const id of ids) {
-			if (!registryIds.has(id)) {
-				problems.push(
-					`line ${seam.line}: tagged "${id}", which is not in DELIVERY_SURFACES — ${seam.text}`,
-				);
+	for (const shape of SEAM_SHAPES) {
+		const hits = findSeams(stripped, shape.pattern);
+		for (const { seam, ids, inlineTagOnSeamLine } of bindTagsToSeams(
+			rawSource,
+			hits,
+			TAG,
+		)) {
+			const at = `${file}:${seam.line}`;
+			if (inlineTagOnSeamLine || ids.length === 0) {
+				problems.push(`${at}: untagged ${shape.name} seam — ${seam.text}`);
+				continue;
+			}
+			for (const id of ids) {
+				const entry = registry[id];
+				if (!entry) {
+					problems.push(
+						`${at}: tagged "${id}", which is not in DELIVERY_SURFACES — ${seam.text}`,
+					);
+				} else if (entry.file !== file) {
+					problems.push(
+						`${at}: tagged "${id}", whose surface is registered in ${entry.file}`,
+					);
+				}
 			}
 		}
 	}
 	return problems;
 }
 
-const RUNTIME_TURN_SEAM_PATTERN =
-	/\b(blockerParts|advisoryParts|staleSecretParts)\.push\(/;
-const LENS_DIAGNOSTICS_MODE_FN_PATTERN =
-	/^(?:async\s+)?function\s+format\w*Mode\(/;
+/** Every render seam under `root`: the problems, and how many seams per shape. */
+function scanRenderSeams(root: string): {
+	problems: string[];
+	seamsByShape: Record<string, string[]>;
+	scanned: number;
+} {
+	const files = productionFiles(root);
+	const problems: string[] = [];
+	const seamsByShape: Record<string, string[]> = {};
+	for (const file of files) {
+		const raw = fs.readFileSync(path.join(root, file), "utf8");
+		const stripped = stripSource(raw);
+		for (const shape of SEAM_SHAPES) {
+			for (const hit of findSeams(stripped, shape.pattern)) {
+				(seamsByShape[shape.name] ??= []).push(`${file}:${hit.line}`);
+			}
+		}
+		problems.push(...seamProblems(file, raw));
+	}
+	return { problems, seamsByShape, scanned: files.length };
+}
 
-describe("finding-delivery-gate real seam scan (#1634 review F2)", () => {
-	const registryIds = new Set(Object.keys(DELIVERY_SURFACES));
+/** A throwaway production tree holding only `files`, for the red proofs. */
+function withSyntheticTree<T>(
+	files: Record<string, string>,
+	run: (root: string) => T,
+): T {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-1634-gate-"));
+	try {
+		for (const [file, text] of Object.entries(files)) {
+			fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+			fs.writeFileSync(path.join(root, file), text);
+		}
+		return run(root);
+	} finally {
+		removeTempDirSync(root);
+	}
+}
 
-	it("every blockerParts/advisoryParts/staleSecretParts push in runtime-turn.ts is tagged and registered", () => {
-		const problems = scanUntaggedOrMistaggedSeams(
-			source("clients/runtime-turn.ts"),
-			RUNTIME_TURN_SEAM_PATTERN,
-			registryIds,
-		);
-		expect(problems, problems.join("\n")).toEqual([]);
+describe("finding-delivery-gate render-seam scan (#1634 review F2, #3165)", () => {
+	const repo = scanRenderSeams(REPO_ROOT);
+
+	it("every render seam in every production file is tagged with its own file's surface", () => {
+		expect(repo.problems, repo.problems.join("\n")).toEqual([]);
 	});
 
-	it("every mode=<x> report function in lens-diagnostics.ts is tagged and registered", () => {
-		const problems = scanUntaggedOrMistaggedSeams(
-			source("tools/lens-diagnostics.ts"),
-			LENS_DIAGNOSTICS_MODE_FN_PATTERN,
-			registryIds,
-		);
-		expect(problems, problems.join("\n")).toEqual([]);
+	// The population, sized (#3165 item 4): the scan reads every production
+	// file and finds each shape where it lives today. A floor per shape keeps a
+	// broken pattern from passing as a clean tree.
+	it("scans the whole production tree and finds every seam shape", () => {
+		expect(repo.scanned).toBeGreaterThan(300);
+		const filesOf = (shape: string) =>
+			[
+				...new Set(
+					(repo.seamsByShape[shape] ?? []).map((at) => at.split(":")[0]),
+				),
+			].sort();
+		expect(filesOf("turn-end tier push")).toEqual(["clients/runtime-turn.ts"]);
+		expect(repo.seamsByShape["turn-end tier push"]?.length).toBeGreaterThan(15);
+		expect(filesOf("lens_diagnostics mode report")).toEqual([
+			"tools/lens-diagnostics.ts",
+		]);
+		expect(filesOf("cascade neighbour render")).toEqual([
+			"clients/cascade-format.ts",
+			"clients/dispatch/integration.ts",
+			// #4487: the turn_end re-render of a partly-owned or labeled section.
+			"clients/runtime-turn.ts",
+		]);
 	});
 
-	it("found at least one real seam in each scanned file (the scan itself is not a false negative)", () => {
-		const runtimeTurnStripped = stripCommentsAndStrings(
-			source("clients/runtime-turn.ts"),
+	// #3165 acceptance 1: the seam lives in a file nobody listed.
+	it("RED PROOF: an untagged render seam in a NEW file is flagged", () => {
+		const problems = withSyntheticTree(
+			{
+				"clients/cascade-preview.ts": `export function preview(cwd, neighbors) {
+	return formatCascadeNeighborDiagnostics(cwd, neighbors, { noun: "neighbor" });
+}
+`,
+			},
+			(root) => scanRenderSeams(root).problems,
 		);
-		const lensDiagStripped = stripCommentsAndStrings(
-			source("tools/lens-diagnostics.ts"),
-		);
-		expect(
-			findSeams(runtimeTurnStripped, RUNTIME_TURN_SEAM_PATTERN).length,
-		).toBeGreaterThan(15);
-		expect(
-			findSeams(lensDiagStripped, LENS_DIAGNOSTICS_MODE_FN_PATTERN).length,
-		).toBeGreaterThanOrEqual(3);
+		expect(problems).toEqual([
+			expect.stringMatching(
+				/^clients\/cascade-preview\.ts:2: untagged cascade neighbour render seam/,
+			),
+		]);
 	});
 
-	// RED PROOF (F2): reproduces the reviewer's exact mutant — a brand-new
-	// ungated `advisoryParts.push` seam with no tag — against a FIXTURE, not
-	// the real file, so this test's own correctness never depends on nobody
-	// breaking the real file later.
+	it("RED PROOF: a tag borrowing another file's surface is flagged", () => {
+		const problems = seamProblems(
+			"clients/cascade-preview.ts",
+			`export function preview(cwd, neighbors) {
+	// @delivery-surface: cascade-format:resolved-found-run
+	return formatCascadeNeighborDiagnostics(cwd, neighbors, { noun: "neighbor" });
+}
+`,
+		);
+		expect(problems).toEqual([
+			expect.stringContaining("registered in clients/cascade-format.ts"),
+		]);
+	});
+
 	it("RED PROOF: a new untagged advisoryParts.push seam is flagged, not silently accepted", () => {
-		const mutantSource = `
+		const problems = seamProblems(
+			"clients/runtime-turn.ts",
+			`
 function handleTurnEnd() {
 	// a brand-new surface nobody registered
 	advisoryParts.push("some new finding with no freshness gate");
 }
-`;
-		const problems = scanUntaggedOrMistaggedSeams(
-			mutantSource,
-			RUNTIME_TURN_SEAM_PATTERN,
-			registryIds,
+`,
 		);
 		expect(problems.length).toBeGreaterThan(0);
-		expect(problems[0]).toMatch(/untagged seam/);
+		expect(problems[0]).toMatch(/untagged turn-end tier push seam/);
 	});
 
 	it("RED PROOF: a tag naming an id absent from the registry is flagged", () => {
-		const mutantSource = `
+		const problems = seamProblems(
+			"clients/runtime-turn.ts",
+			`
 function handleTurnEnd() {
 	// @delivery-surface: runtime-turn:totally-made-up-id
 	advisoryParts.push(report);
 }
-`;
-		const problems = scanUntaggedOrMistaggedSeams(
-			mutantSource,
-			RUNTIME_TURN_SEAM_PATTERN,
-			registryIds,
+`,
 		);
 		expect(problems.length).toBeGreaterThan(0);
 		expect(problems[0]).toMatch(/not in DELIVERY_SURFACES/);
 	});
 
-	it("RED PROOF: a seam-shaped call inside a COMMENT is not mistaken for a real seam", () => {
-		// If the scanner didn't strip comments, this single-line comment would
-		// register as an untagged seam and the test would fail even though
-		// nothing here actually renders anything.
-		const mutantSource = `
-function handleTurnEnd() {
-	// see also advisoryParts.push(x) in the sibling module for reference
-}
-`;
-		const problems = scanUntaggedOrMistaggedSeams(
-			mutantSource,
-			RUNTIME_TURN_SEAM_PATTERN,
-			registryIds,
+	// #3165 acceptance 3: the scan reads code, not prose. Each seam shape
+	// quoted in a comment and in a string is no seam at all.
+	it("RED PROOF: a seam-shaped call inside a comment or a string is not mistaken for a real seam", () => {
+		const problems = withSyntheticTree(
+			{
+				"clients/notes.ts": `// see advisoryParts.push(x) and formatCascadeNeighborDiagnostics(cwd, n)
+/* function formatLegacyMode() was retired */
+export const hint = "call formatCascadeNeighborDiagnostics(cwd, n) here";
+`,
+			},
+			(root) => scanRenderSeams(root),
 		);
-		expect(problems).toEqual([]);
+		expect(problems.problems).toEqual([]);
+		expect(problems.seamsByShape).toEqual({});
 	});
 
-	// RED PROOF (R1a): reproduces the reviewer's exact "proximity laundering"
-	// probe — a second seam pasted right after an already-tagged one, with no
-	// tag of its own, must NOT inherit the first seam's tag. This is the
-	// natural way someone adds a new advisory: copy-paste an existing
-	// `push` call and edit the message, leaving the tag comment where it was.
+	// RED PROOF (R1a): a second seam pasted right after an already-tagged one,
+	// with no tag of its own, must NOT inherit the first seam's tag.
 	it("RED PROOF: a second untagged seam right after a tagged one does not inherit its tag", () => {
-		const mutantSource = `
+		const problems = seamProblems(
+			"clients/runtime-turn.ts",
+			`
 function handleTurnEnd() {
 	// @delivery-surface: runtime-turn:knip-advisory
 	advisoryParts.push("the real, registered finding");
 	advisoryParts.push("a brand-new finding pasted right after it — unregistered");
 }
-`;
-		const problems = scanUntaggedOrMistaggedSeams(
-			mutantSource,
-			RUNTIME_TURN_SEAM_PATTERN,
-			registryIds,
+`,
 		);
-		expect(problems.length).toBe(1);
-		expect(problems[0]).toMatch(/untagged seam/);
-		// Line 4 is the tagged (real) seam; line 5 is the untagged pasted-after
-		// one — the failure must name line 5, not silently accept it via
-		// inheritance from line 4's tag.
-		expect(problems[0]).toContain("line 5:");
+		expect(problems).toEqual([
+			expect.stringContaining("clients/runtime-turn.ts:5:"),
+		]);
+		expect(problems[0]).toMatch(/untagged/);
 	});
 
-	// RED PROOF (R1a): a blank-line gap between the tag and its seam still
-	// binds correctly (blank lines are the only thing the lookback skips) —
-	// and a SECOND seam after a blank gap does NOT reach back past the first
-	// seam to re-use the same tag.
 	it("RED PROOF: a tag cannot bind two seams even across a blank-line gap", () => {
-		const mutantSource = `
+		const problems = seamProblems(
+			"clients/runtime-turn.ts",
+			`
 function handleTurnEnd() {
 	// @delivery-surface: runtime-turn:knip-advisory
 
@@ -322,16 +386,920 @@ function handleTurnEnd() {
 
 	advisoryParts.push("a second finding, blank-line-separated, still unregistered");
 }
-`;
-		const problems = scanUntaggedOrMistaggedSeams(
-			mutantSource,
-			RUNTIME_TURN_SEAM_PATTERN,
-			registryIds,
+`,
 		);
-		expect(problems.length).toBe(1);
-		// Line 5 is the tagged (real) seam; line 7 is the blank-separated
-		// second seam, which must still be reported untagged on its own line.
-		expect(problems[0]).toContain("line 7:");
+		expect(problems).toEqual([
+			expect.stringContaining("clients/runtime-turn.ts:7:"),
+		]);
+	});
+});
+
+// ── Sink census (#1634 criterion 1) ─────────────────────────────────────────
+//
+// The render-seam scan covers seams with a known shape. The census covers the
+// rest: every production file that holds an agent-facing SINK is either the
+// `file` of a registered surface or classified here, with the surfaces it
+// carries or why it carries none. A new sink file is unclassified and fails;
+// a classified file whose sink is gone is stale and fails. Needle policy:
+// `type: "text"` and `role: "user"` are found in comment-blanked text with
+// strings kept, because their evidence IS a string literal; every other needle
+// is found in comment-and-string-blanked text.
+//
+// #4459 review F1: needles name the IDENTIFIER, not one spelling of a call. An
+// aliased import (`renderToolText as toolText`, the form `mcp/server.ts`
+// uses) still names `renderToolText`; a tool result built with a `type`
+// constant still has a `content: [` array, and a file-local constant bound to
+// "text" is resolved. A constant imported from another file and a content
+// array built away from its `content:` key are not resolved (named residual).
+// Verify r2 plant (g): the host's message APIs are a sink of their own.
+
+const SINK_SHAPES: ReadonlyArray<{
+	name: string;
+	pattern: RegExp;
+	strings: "keep" | "blank";
+}> = [
+	{ name: "tool result text", pattern: /\btype:\s*"text"/, strings: "keep" },
+	{
+		name: "tool result content",
+		pattern: /\bcontent:\s*\[/,
+		strings: "blank",
+	},
+	{ name: "user-role message", pattern: /\brole:\s*"user"/, strings: "keep" },
+	{ name: "tool_call block", pattern: /\bblock:\s*true\b/, strings: "blank" },
+	{
+		name: "hook context",
+		pattern: /\b(?:additionalContext|hookSpecificOutput)\b/,
+		strings: "blank",
+	},
+	{ name: "custom entry", pattern: /\bcustomType\s*:/, strings: "blank" },
+	{
+		name: "status or widget line",
+		pattern: /\bset(?:Widget|Status)\b/,
+		strings: "blank",
+	},
+	{ name: "host notification", pattern: /\.notify\(/, strings: "blank" },
+	// #4459 verify r2 plant (g): the host's message APIs put text in the
+	// agent's context; `sendMessage` built away from its `customType` key too.
+	{
+		name: "host message",
+		pattern: /\bsend(?:User)?Message\b/,
+		strings: "blank",
+	},
+	{
+		name: "rendered tool text",
+		pattern: /\brenderToolText\b/,
+		strings: "blank",
+	},
+];
+
+type Classification = { delivers: string[] } | { noFindings: string };
+
+/**
+ * Sink files that are no surface's `file`. `delivers` names the registered
+ * surfaces whose output reaches the agent through this file's sink.
+ */
+const SINK_FILES: Record<string, Classification> = {
+	"clients/runtime-session.ts": {
+		noFindings:
+			"session notices that background scans were skipped or limited; no finding rows",
+	},
+	"clients/runtime-tool-result.ts": {
+		delivers: ["tool-call:stop-blocker", "agent-behavior:thrashing-notice"],
+	},
+	"tools/activate-tools.ts": {
+		noFindings: "confirms which situational tools were activated",
+	},
+	"tools/ast-grep-outline.ts": {
+		noFindings: "syntax outline of the files the caller named",
+	},
+	"tools/ast-grep-replace.ts": {
+		noFindings: "the rewrite the caller's own pattern produced",
+	},
+	"tools/ast-grep-search.ts": {
+		noFindings: "matches for the caller's own structural pattern",
+	},
+	"tools/effective-config.ts": {
+		noFindings: "the resolved configuration and its provenance",
+	},
+	"tools/lens-diagnostic-mark.ts": {
+		noFindings:
+			"confirms the disposition the caller recorded for the finding it named",
+	},
+	"tools/module-report.ts": {
+		noFindings: "module structure and exact symbol bodies, no diagnostics",
+	},
+	"tools/project-report.ts": {
+		noFindings: "project structure overview, no diagnostics",
+	},
+	"tools/render-compact.ts": {
+		noFindings:
+			"formats text other tools hand it; each caller is censused on its own",
+	},
+	"tools/scan-progress.ts": {
+		noFindings: "a progress line while a scan runs",
+	},
+	"tools/symbol-search.ts": {
+		noFindings: "symbol matches for the caller's query",
+	},
+	"mcp/tool-arguments.ts": {
+		noFindings: "MCP argument validation errors",
+	},
+};
+
+/** `{file → sink names}` for every production file under `root`. */
+function scanSinkFiles(root: string): {
+	sinks: Record<string, string[]>;
+	scanned: number;
+} {
+	const files = productionFiles(root);
+	const sinks: Record<string, string[]> = {};
+	for (const file of files) {
+		const raw = fs.readFileSync(path.join(root, file), "utf8");
+		const kept = stripSource(raw, { strings: "keep" });
+		const blanked = stripSource(raw);
+		for (const shape of SINK_SHAPES) {
+			const text = shape.strings === "keep" ? kept : blanked;
+			if (shape.pattern.test(text)) (sinks[file] ??= []).push(shape.name);
+		}
+		if (textConstantTypes(kept, blanked)) {
+			(sinks[file] ??= []).push("tool result text constant");
+		}
+	}
+	return { sinks, scanned: files.length };
+}
+
+/**
+ * True when a file-local constant bound to the literal "text" is used as an
+ * object's `type` (`const TEXT = "text"; … { type: TEXT, text }`).
+ */
+function textConstantTypes(kept: string, blanked: string): boolean {
+	for (const [, name] of kept.matchAll(
+		/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=;]*)?=\s*"text"/g,
+	)) {
+		if (new RegExp(`\\btype:\\s*${escapeRegExp(name)}\\b`).test(blanked)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/** Problems with the census over `root`; empty means every sink file is accounted. */
+function censusProblems(
+	root: string,
+	classified: Record<string, Classification> = SINK_FILES,
+	registry: Record<string, DeliverySurfaceEntry> = DELIVERY_SURFACES,
+	floors: { minFlagged: number; minScanned: number } = {
+		minFlagged: 1,
+		minScanned: 1,
+	},
+): string[] {
+	const { sinks, scanned } = scanSinkFiles(root);
+	const registeredFiles = new Set(Object.values(registry).map((e) => e.file));
+	const audit = auditRegistry({
+		sweepName: "agent-facing sink census (#1634)",
+		flagged: Object.entries(sinks).map(([file, names]) => ({
+			key: file,
+			detail: names.join(", "),
+		})),
+		registered: registeredFiles,
+		exemptions: Object.fromEntries(
+			Object.entries(classified).map(([file, c]) => [
+				file,
+				"noFindings" in c ? c.noFindings : `delivers ${c.delivers.join(", ")}`,
+			]),
+		),
+		minFlagged: floors.minFlagged,
+		scannedCount: scanned,
+		minScanned: floors.minScanned,
+		remediation:
+			"Register the surface in DELIVERY_SURFACES, or classify the file in SINK_FILES.",
+	});
+	const problems = [...audit.problems];
+	for (const [file, c] of Object.entries(classified)) {
+		if (registeredFiles.has(file)) {
+			problems.push(
+				`${file} is a registered surface file and also classified in SINK_FILES; keep one`,
+			);
+		}
+		if ("delivers" in c) {
+			for (const id of c.delivers) {
+				if (!registry[id]) {
+					problems.push(
+						`${file} delivers "${id}", which is not in DELIVERY_SURFACES`,
+					);
+				}
+			}
+		}
+	}
+	return problems;
+}
+
+// ── noFindings proof (#4459 review F1) ─────────────────────────────────────
+//
+// A `noFindings` classification was prose nothing checked: raw findings
+// appended to `tools/project-report.ts`, or a raw branch in `pilens_health`,
+// stayed green. Each `noFindings` sink file, and the MCP handler of each
+// `noFindings` tool, must now reference no finding READ: a store getter, a
+// scanner, or a language server's diagnostics call. An exception is named
+// with its reason; one nothing needs any more fails as stale.
+//
+// Verify r2: a handler region also takes in the same-file helpers it reaches
+// and resolves renamed bindings (plants c and e), and the read list gained
+// the stores it missed (plant f). Named residual: a helper imported from
+// another module is not followed.
+
+/** Finding reads by defining module; each name is ground-truthed below. */
+const FINDING_READS: ReadonlyArray<{ module: string; names: string[] }> = [
+	{
+		module: "clients/widget-state.ts",
+		names: [
+			"exportWidgetState",
+			"getFileDiagnosticSummaries",
+			"getFileDiagnostics",
+			"getSuppressedDiagnostics",
+			"getWidgetBlockingFilesForSweep",
+		],
+	},
+	{
+		module: "clients/project-diagnostics/cache.ts",
+		names: [
+			"loadProjectDiagnosticsDeltaReport",
+			"loadProjectDiagnosticsSnapshot",
+		],
+	},
+	{
+		module: "clients/project-diagnostics/scanner.ts",
+		names: ["scanProjectDiagnostics"],
+	},
+	{ module: "clients/lens-engine.ts", names: ["projectScan"] },
+	// #4459 verify r2 plant (f): stores the round-2 list missed.
+	{
+		module: "clients/lsp/workspace-diagnostics-cache.ts",
+		names: ["loadWorkspaceDiagnosticsCache"],
+	},
+	{
+		module: "clients/dispatch/pending-runner-findings.ts",
+		names: ["drainPendingRunnerFindings", "peekSettledRunnerFindings"],
+	},
+	{ module: "clients/diagnostic-tracker.ts", names: ["getDiagnosticTracker"] },
+	{
+		module: "clients/test-runner-delivery.ts",
+		names: ["consumeStagedTestRunnerFindings"],
+	},
+	{
+		module: "clients/runtime-context.ts",
+		names: [
+			"consumeTestFindings",
+			"consumeTurnEndFindings",
+			"peekTestFindings",
+			"peekTurnEndFindings",
+		],
+	},
+];
+
+/** Language-server diagnostics reads, called as methods on the service. */
+const LSP_READ_METHODS = [
+	"getAllDiagnostics",
+	"getDiagnostics",
+	"runWorkspaceDiagnostics",
+];
+
+/**
+ * `region::read` → why this `noFindings` region may name that read. A region
+ * is a file, or `mcp/server.ts#<tool>` for an MCP handler.
+ */
+const NO_FINDINGS_READ_EXEMPTIONS: Record<string, string> = {
+	"tools/lens-diagnostic-mark.ts::getFileDiagnostics":
+		"looks up the marked finding's live line to anchor the mark; the result " +
+		"confirms the disposition and renders no finding rows",
+	"clients/runtime-session.ts::getDiagnosticTracker":
+		"resets the session tracker at session start; reads no rows",
+};
+
+/**
+ * The body of the `if (… name === "<tool>" …) { … }` handler in
+ * `mcp/server.ts` (one handler may serve two tools, as the ast-grep pair does),
+ * with the same-file helpers it reaches and the original name of every
+ * renamed binding it uses. A helper imported from another module is not
+ * followed (named residual).
+ */
+function mcpHandlerBody(raw: string, tool: string): string | undefined {
+	const kept = stripSource(raw, { strings: "keep" });
+	const match = new RegExp(
+		`\\bif\\s*\\([^{]*\\bname\\s*===\\s*"${tool}"[^{]*\\)\\s*\\{`,
+	).exec(kept);
+	if (!match) return undefined;
+	const open = match.index + match[0].length - 1;
+	const blanked = stripSource(raw);
+	const close = matchingCloseIndex(blanked, open, "{", "}");
+	if (close < 0) return undefined;
+	return withOriginalNames(
+		withSameFileHelpers(blanked, blanked.slice(open, close + 1)),
+		renamedBindings(blanked),
+	);
+}
+
+const IDENT = "[A-Za-z_$][\\w$]*";
+
+/**
+ * `local → original` for every renamed binding in blanked `text`:
+ * `import { X as Y }` and `const { X: Y } = …` (a destructured dynamic import).
+ * #4459 verify r2 plant (c): `pilens_health` read the snapshot through
+ * `loadProjectDiagnosticsSnapshot as probeSnapshot`, and only the alias sits in
+ * the handler body.
+ */
+function renamedBindings(text: string): Map<string, string> {
+	const renames = new Map<string, string>();
+	for (const [, list] of text.matchAll(/\bimport\s+(?:type\s+)?\{([^}]*)\}/g)) {
+		for (const [, from, to] of list.matchAll(
+			new RegExp(`\\b(${IDENT})\\s+as\\s+(${IDENT})`, "g"),
+		)) {
+			renames.set(to, from);
+		}
+	}
+	for (const [, list] of text.matchAll(
+		/\b(?:const|let|var)\s*\{([^}]*)\}\s*=/g,
+	)) {
+		for (const [, from, to] of list.matchAll(
+			new RegExp(`\\b(${IDENT})\\s*:\\s*(${IDENT})`, "g"),
+		)) {
+			renames.set(to, from);
+		}
+	}
+	return renames;
+}
+
+/** `region` plus the original name of every rename it references. */
+function withOriginalNames(region: string, renames: Map<string, string>) {
+	const originals = [...renames]
+		.filter(([local]) =>
+			new RegExp(`\\b${escapeRegExp(local)}\\b`).test(region),
+		)
+		.map(([, original]) => original);
+	return originals.length ? `${region}\n${originals.join(" ")}` : region;
+}
+
+/**
+ * Column-0 declarations in blanked `text` (oxfmt keeps top-level statements
+ * there), each spanning to the next column-0 statement.
+ */
+function topLevelDeclarations(
+	text: string,
+): Array<{ name: string; start: number; end: number }> {
+	const lines = text.split("\n");
+	const offsets: number[] = [];
+	let at = 0;
+	for (const line of lines) {
+		offsets.push(at);
+		at += line.length + 1;
+	}
+	const declaration = new RegExp(
+		`^(?:export\\s+)?(?:default\\s+)?(?:async\\s+)?(?:function\\*?\\s+(${IDENT})|(?:const|let|var|class)\\s+(${IDENT}))`,
+	);
+	const statementStarts = lines.flatMap((line, i) =>
+		/^[^\s})\]]/.test(line) ? [i] : [],
+	);
+	return lines.flatMap((line, i) => {
+		const m = declaration.exec(line);
+		if (!m) return [];
+		const next = statementStarts.find((j) => j > i);
+		return [
+			{
+				name: m[1] ?? m[2],
+				start: offsets[i],
+				end: next === undefined ? text.length : offsets[next],
+			},
+		];
+	});
+}
+
+/**
+ * `body` plus every top-level declaration of blanked `text` (its file) that it
+ * references, transitively. #4459 verify r2 plant (e):
+ * `pilens_health` delegated the read to a module-level helper. A handler that
+ * names its own dispatcher takes in every handler, since it can reach them.
+ */
+function withSameFileHelpers(text: string, body: string): string {
+	const helpers = topLevelDeclarations(text);
+	const taken = new Set<string>();
+	let region = body;
+	let frontier = body;
+	for (;;) {
+		const added = helpers.filter(
+			(d) =>
+				!taken.has(d.name) &&
+				new RegExp(`\\b${escapeRegExp(d.name)}\\b`).test(frontier),
+		);
+		if (added.length === 0) return region;
+		for (const d of added) taken.add(d.name);
+		frontier = added.map((d) => text.slice(d.start, d.end)).join("\n");
+		region += `\n${frontier}`;
+	}
+}
+
+/** Every `noFindings` region under `root`, as comment-and-string-blanked text. */
+function noFindingsRegions(
+	root: string,
+	classified: Record<string, Classification>,
+	tools: Record<string, Classification>,
+): { regions: Record<string, string>; problems: string[] } {
+	const regions: Record<string, string> = {};
+	const problems: string[] = [];
+	for (const [file, c] of Object.entries(classified)) {
+		if (!("noFindings" in c)) continue;
+		const full = path.join(root, file);
+		if (fs.existsSync(full)) {
+			regions[file] = stripSource(fs.readFileSync(full, "utf8"));
+		}
+	}
+	const serverFile = path.join(root, "mcp/server.ts");
+	const server = fs.existsSync(serverFile)
+		? fs.readFileSync(serverFile, "utf8")
+		: undefined;
+	for (const [tool, c] of Object.entries(tools)) {
+		if (!("noFindings" in c)) continue;
+		const mcpName = TOOL_REGISTRY.find((t) => t.name === tool)?.mcpName;
+		if (!mcpName || server === undefined) continue;
+		const body = mcpHandlerBody(server, mcpName);
+		if (body === undefined) {
+			problems.push(
+				`${tool}: no \`if (name === "${mcpName}")\` handler found in mcp/server.ts, so its noFindings claim cannot be checked`,
+			);
+			continue;
+		}
+		regions[`mcp/server.ts#${mcpName}`] = body;
+	}
+	return { regions, problems };
+}
+
+/** Problems for `noFindings` regions that name a finding read. */
+function noFindingsReadProblems(
+	root: string,
+	classified: Record<string, Classification> = SINK_FILES,
+	tools: Record<string, Classification> = TOOL_CENSUS,
+	exemptions: Record<string, string> = NO_FINDINGS_READ_EXEMPTIONS,
+): string[] {
+	const { regions, problems } = noFindingsRegions(root, classified, tools);
+	const used = new Set<string>();
+	const reads = [
+		...FINDING_READS.flatMap(({ names }) =>
+			names.map((name) => ({ name, pattern: new RegExp(`\\b${name}\\b`) })),
+		),
+		...LSP_READ_METHODS.map((name) => ({
+			name,
+			pattern: new RegExp(`\\.${name}\\s*\\(`),
+		})),
+	];
+	for (const [region, text] of Object.entries(regions)) {
+		for (const { name, pattern } of reads) {
+			if (!pattern.test(text)) continue;
+			const key = `${region}::${name}`;
+			if (exemptions[key]) {
+				used.add(key);
+				continue;
+			}
+			problems.push(
+				`${region} is classified noFindings but reads findings through ${name}; classify what it delivers, or name the exception in NO_FINDINGS_READ_EXEMPTIONS`,
+			);
+		}
+	}
+	for (const key of Object.keys(exemptions)) {
+		if (!used.has(key)) {
+			problems.push(`${key}: stale NO_FINDINGS_READ_EXEMPTIONS entry`);
+		}
+	}
+	return problems;
+}
+
+describe("finding-delivery-gate sink census (#1634)", () => {
+	it("every production file with an agent-facing sink is a surface file or classified", () => {
+		const problems = censusProblems(REPO_ROOT, SINK_FILES, DELIVERY_SURFACES, {
+			minFlagged: 20,
+			minScanned: 300,
+		});
+		expect(problems, problems.join("\n")).toEqual([]);
+	});
+
+	it("RED PROOF: a NEW file with a tool-result sink is unclassified", () => {
+		const problems = withSyntheticTree(
+			{
+				"tools/finding-digest.ts": `export function digest(text: string) {
+	return { content: [{ type: "text", text }] };
+}
+`,
+			},
+			(root) => censusProblems(root, {}, DELIVERY_SURFACES),
+		);
+		expect(problems.join("\n")).toContain(
+			"tools/finding-digest.ts (tool result text, tool result content)",
+		);
+	});
+
+	it("RED PROOF: a sink named only in a comment is no sink", () => {
+		const { sinks } = withSyntheticTree(
+			{
+				"tools/notes.ts": `// returns { type: "text" } and sets block: true
+export const unrelated = 1;
+`,
+			},
+			(root) => scanSinkFiles(root),
+		);
+		expect(sinks).toEqual({});
+	});
+
+	it("RED PROOF: a classified file whose sink is gone is stale", () => {
+		const problems = withSyntheticTree(
+			{ "tools/quiet.ts": "export const unrelated = 1;\n" },
+			(root) =>
+				censusProblems(
+					root,
+					{
+						"tools/quiet.ts": {
+							noFindings: "it used to print a progress line",
+						},
+					},
+					DELIVERY_SURFACES,
+					{ minFlagged: 0, minScanned: 1 },
+				),
+		);
+		expect(problems.join("\n")).toContain("tools/quiet.ts");
+	});
+
+	it("RED PROOF: a surface file classified a second time is flagged", () => {
+		const problems = withSyntheticTree(
+			{
+				"tools/lsp-navigation.ts":
+					'export const r = { content: [{ type: "text", text: "" }] };\n',
+			},
+			(root) =>
+				censusProblems(root, {
+					"tools/lsp-navigation.ts": {
+						noFindings: "a second home for one file",
+					},
+				}),
+		);
+		expect(problems).toContainEqual(
+			expect.stringContaining(
+				"tools/lsp-navigation.ts is a registered surface file",
+			),
+		);
+	});
+
+	it("RED PROOF: a classification naming an unknown surface is flagged", () => {
+		const problems = withSyntheticTree(
+			{
+				"tools/digest.ts":
+					'export const r = { content: [{ type: "text", text: "" }] };\n',
+			},
+			(root) =>
+				censusProblems(root, {
+					"tools/digest.ts": { delivers: ["digest:made-up"] },
+				}),
+		);
+		expect(problems).toContainEqual(
+			expect.stringContaining('"digest:made-up"'),
+		);
+	});
+
+	// #4459 review F1 plant (a): the alias `mcp/server.ts` itself uses.
+	it("RED PROOF: a NEW file rendering through an aliased renderToolText is unclassified", () => {
+		const problems = withSyntheticTree(
+			{
+				"tools/finding-digest.ts": `import { renderToolText as toolText } from "./render-compact.js";
+export const digest = (text: string) => toolText(text);
+`,
+			},
+			(root) => censusProblems(root, {}, DELIVERY_SURFACES),
+		);
+		expect(problems.join("\n")).toContain(
+			"tools/finding-digest.ts (rendered tool text)",
+		);
+	});
+
+	// #4459 review F1 plant (b): no `type: "text"` literal anywhere.
+	it("RED PROOF: a NEW file whose tool result types its text through a constant is unclassified", () => {
+		const problems = withSyntheticTree(
+			{
+				"tools/finding-digest.ts": `const TEXT = "text" as const;
+export function digest(text: string) {
+	const block = { type: TEXT, text };
+	return block;
+}
+`,
+			},
+			(root) => censusProblems(root, {}, DELIVERY_SURFACES),
+		);
+		expect(problems.join("\n")).toContain(
+			"tools/finding-digest.ts (tool result text constant)",
+		);
+	});
+
+	it("every noFindings sink file and noFindings MCP handler reads no findings", () => {
+		const problems = noFindingsReadProblems(REPO_ROOT);
+		expect(problems, problems.join("\n")).toEqual([]);
+	});
+
+	// A renamed or moved read would make the proof above vacuous.
+	it("every finding read the proof looks for still exists where it is listed", () => {
+		const missing = [
+			...FINDING_READS.flatMap(({ module, names }) => {
+				const text = stripSource(readSource(module));
+				return names
+					.filter(
+						(name) =>
+							!new RegExp(
+								`\\bexport\\s+(?:async\\s+)?(?:function\\s+|const\\s+)${name}\\b`,
+							).test(text),
+					)
+					.map((name) => `${module}: ${name}`);
+			}),
+			...LSP_READ_METHODS.filter(
+				(name) =>
+					!new RegExp(`^\\s*async\\s+${name}\\s*\\(`, "m").test(
+						stripSource(readSource("clients/lsp/index.ts")),
+					),
+			).map((name) => `clients/lsp/index.ts: ${name}`),
+		];
+		expect(missing).toEqual([]);
+	});
+
+	// #4459 review F1 plant (d).
+	it("RED PROOF: a noFindings file that reads the persisted snapshot is flagged", () => {
+		const problems = withSyntheticTree(
+			{
+				"tools/project-report.ts": `import { loadProjectDiagnosticsSnapshot } from "../clients/project-diagnostics/cache.js";
+export const report = (cwd: string) => ({ content: [{ type: "text", text: String(loadProjectDiagnosticsSnapshot(cwd)?.diagnostics) }] });
+`,
+			},
+			(root) => noFindingsReadProblems(root, SINK_FILES, {}, {}),
+		);
+		expect(problems).toEqual([
+			expect.stringContaining(
+				"tools/project-report.ts is classified noFindings but reads findings through loadProjectDiagnosticsSnapshot",
+			),
+		]);
+	});
+
+	// #4459 review F1 plant (c): the file is a registered surface file, so only
+	// the handler's own body can carry the proof.
+	it("RED PROOF: a noFindings MCP handler that reads the widget store is flagged", () => {
+		const problems = withSyntheticTree(
+			{
+				"mcp/server.ts": `async function call(name: string) {
+	if (name === "pilens_health") {
+		const rows = getFileDiagnosticSummaries();
+		return toolText(String(rows.length));
+	}
+	if (name === "pilens_latency") {
+		return toolText("ok");
+	}
+}
+`,
+			},
+			(root) =>
+				noFindingsReadProblems(
+					root,
+					{},
+					{ health: TOOL_CENSUS.health, latency: TOOL_CENSUS.latency },
+					{},
+				),
+		);
+		expect(problems).toEqual([
+			expect.stringContaining(
+				"mcp/server.ts#pilens_health is classified noFindings but reads findings through getFileDiagnosticSummaries",
+			),
+		]);
+	});
+
+	// #4459 verify r2 plant (c), verbatim: only the alias is in the handler.
+	it("RED PROOF: a noFindings MCP handler reading through an import alias is flagged", () => {
+		const problems = withSyntheticTree(
+			{
+				"mcp/server.ts": `import { loadProjectDiagnosticsSnapshot as probeSnapshot } from "../clients/project-diagnostics/cache.js";
+async function call(name: string) {
+	if (name === "pilens_health") {
+		const snap = probeSnapshot(DEFAULT_CWD);
+		return toolText(String(snap?.diagnostics.length));
+	}
+}
+`,
+			},
+			(root) =>
+				noFindingsReadProblems(root, {}, { health: TOOL_CENSUS.health }, {}),
+		);
+		expect(problems).toEqual([
+			expect.stringContaining(
+				"mcp/server.ts#pilens_health is classified noFindings but reads findings through loadProjectDiagnosticsSnapshot",
+			),
+		]);
+	});
+
+	// Same shape as plant (c), renamed by a module-level destructure instead.
+	it("RED PROOF: a noFindings MCP handler reading through a destructured rename is flagged", () => {
+		const problems = withSyntheticTree(
+			{
+				"mcp/server.ts": `const { loadProjectDiagnosticsSnapshot: snap } = await import("../clients/project-diagnostics/cache.js");
+async function call(name: string) {
+	if (name === "pilens_health") {
+		return toolText(String(snap(DEFAULT_CWD)));
+	}
+}
+`,
+			},
+			(root) =>
+				noFindingsReadProblems(root, {}, { health: TOOL_CENSUS.health }, {}),
+		);
+		expect(problems).toEqual([
+			expect.stringContaining(
+				"mcp/server.ts#pilens_health is classified noFindings but reads findings through loadProjectDiagnosticsSnapshot",
+			),
+		]);
+	});
+
+	// #4459 verify r2 plant (e): the read sits in a helper two calls away, and
+	// the sibling handler in the same dispatcher stays clean.
+	it("RED PROOF: a noFindings MCP handler reading through same-file helpers is flagged", () => {
+		const problems = withSyntheticTree(
+			{
+				"mcp/server.ts": `function findingRows() {
+	return getFileDiagnosticSummaries();
+}
+
+function healthFindingsLine(): string {
+	return String(findingRows().length);
+}
+
+async function call(name: string) {
+	if (name === "pilens_health") {
+		return toolText(healthFindingsLine());
+	}
+	if (name === "pilens_latency") {
+		return toolText("ok");
+	}
+}
+`,
+			},
+			(root) =>
+				noFindingsReadProblems(
+					root,
+					{},
+					{ health: TOOL_CENSUS.health, latency: TOOL_CENSUS.latency },
+					{},
+				),
+		);
+		expect(problems).toEqual([
+			expect.stringContaining(
+				"mcp/server.ts#pilens_health is classified noFindings but reads findings through getFileDiagnosticSummaries",
+			),
+		]);
+	});
+
+	// #4459 verify r2 plant (f).
+	it("RED PROOF: a noFindings file that reads the workspace diagnostics cache is flagged", () => {
+		const problems = withSyntheticTree(
+			{
+				"tools/project-report.ts": `import { loadWorkspaceDiagnosticsCache } from "../clients/lsp/workspace-diagnostics-cache.js";
+export const report = (cwd: string) => ({ content: [{ type: "text", text: JSON.stringify(loadWorkspaceDiagnosticsCache(cwd)) }] });
+`,
+			},
+			(root) => noFindingsReadProblems(root, SINK_FILES, {}, {}),
+		);
+		expect(problems).toEqual([
+			expect.stringContaining(
+				"tools/project-report.ts is classified noFindings but reads findings through loadWorkspaceDiagnosticsCache",
+			),
+		]);
+	});
+
+	// #4459 verify r2 plant (g).
+	it("RED PROOF: a NEW file sending findings through the host's user message is unclassified", () => {
+		const problems = withSyntheticTree(
+			{
+				"clients/finding-steer.ts": `export function steer(pi: { sendUserMessage(text: string): void }, rawFindings: string) {
+	pi.sendUserMessage(rawFindings);
+}
+`,
+			},
+			(root) => censusProblems(root, {}, DELIVERY_SURFACES),
+		);
+		expect(problems.join("\n")).toContain(
+			"clients/finding-steer.ts (host message)",
+		);
+	});
+
+	it("RED PROOF: a read named only in a comment or a string is no read", () => {
+		const problems = withSyntheticTree(
+			{
+				"tools/project-report.ts": `// never calls loadProjectDiagnosticsSnapshot or lsp.getDiagnostics()
+export const hint = "see getFileDiagnosticSummaries";
+`,
+			},
+			(root) => noFindingsReadProblems(root, SINK_FILES, {}, {}),
+		);
+		expect(problems).toEqual([]);
+	});
+
+	it("RED PROOF: a noFindings tool whose MCP handler cannot be found is flagged", () => {
+		const problems = withSyntheticTree(
+			{ "mcp/server.ts": "export const nothing = 1;\n" },
+			(root) =>
+				noFindingsReadProblems(root, {}, { health: TOOL_CENSUS.health }, {}),
+		);
+		expect(problems).toEqual([
+			expect.stringContaining('no `if (name === "pilens_health")` handler'),
+		]);
+	});
+
+	it("RED PROOF: an exemption nothing needs is stale", () => {
+		const problems = withSyntheticTree(
+			{ "tools/project-report.ts": "export const quiet = 1;\n" },
+			(root) =>
+				noFindingsReadProblems(
+					root,
+					SINK_FILES,
+					{},
+					{
+						"tools/project-report.ts::projectScan": "it used to scan",
+					},
+				),
+		);
+		expect(problems).toEqual([
+			"tools/project-report.ts::projectScan: stale NO_FINDINGS_READ_EXEMPTIONS entry",
+		]);
+	});
+});
+
+// ── Tool census (#1634 criterion 1) ─────────────────────────────────────────
+//
+// Every tool in TOOL_REGISTRY names the surfaces it renders, or why it renders
+// no findings. A new tool has no row and fails.
+
+const TOOL_CENSUS: Record<string, Classification> = {
+	ast_grep_search: {
+		noFindings: "structural matches for the caller's pattern",
+	},
+	ast_grep_replace: { noFindings: "the rewrite the caller's pattern produced" },
+	ast_grep_outline: { noFindings: "syntax outline, no index or diagnostics" },
+	lsp_navigation: {
+		delivers: [
+			"lsp-navigation:workspace-diagnostics-path",
+			"lsp-navigation:tracked-snapshot",
+		],
+	},
+	lens_diagnostics: {
+		delivers: [
+			"lens-diagnostics:mode-full",
+			"lens-diagnostics:mode-all",
+			"lens-diagnostics:mode-delta",
+			"project-diagnostics:persisted-snapshot",
+			"lsp-diagnostics:tool-output",
+		],
+	},
+	lens_diagnostic_mark: {
+		noFindings: "confirms the disposition recorded for the finding named",
+	},
+	symbol_search: { noFindings: "symbol matches for the caller's query" },
+	module_report: { noFindings: "module structure, no diagnostics" },
+	project_report: { noFindings: "project structure, no diagnostics" },
+	read_symbol: { noFindings: "an exact symbol body" },
+	read_enclosing: { noFindings: "the exact body enclosing a line" },
+	effective_config: { noFindings: "resolved configuration and provenance" },
+	pi_lens_activate_tools: { noFindings: "which tools were activated" },
+	analyze: { delivers: ["mcp-server:analyze"] },
+	health: { noFindings: "runtime health counters" },
+	latency: { noFindings: "dispatch timing records" },
+	rebuild: { noFindings: "the build command's outcome" },
+	project_scan: { delivers: ["lens-engine:project-scan"] },
+	session_start: {
+		noFindings: "session guidance and the error-debt baseline's status line",
+	},
+	turn_end: {
+		delivers: [
+			"runtime-context:persisted-findings",
+			...Object.keys(DELIVERY_SURFACES).filter((id) =>
+				id.startsWith("runtime-turn:"),
+			),
+		],
+	},
+	session_end: { noFindings: "a session-ended acknowledgement" },
+};
+
+describe("finding-delivery-gate tool census (#1634)", () => {
+	it("classifies exactly the tools in TOOL_REGISTRY", () => {
+		expect(Object.keys(TOOL_CENSUS).sort()).toEqual(
+			[...LENS_TOOL_NAMES].sort(),
+		);
+	});
+
+	it("every surface a tool names is registered", () => {
+		const unknown = Object.entries(TOOL_CENSUS).flatMap(([tool, c]) =>
+			"delivers" in c
+				? c.delivers
+						.filter((id) => !DELIVERY_SURFACES[id])
+						.map((id) => `${tool}: ${id}`)
+				: [],
+		);
+		expect(unknown).toEqual([]);
 	});
 });
 
@@ -477,54 +1445,10 @@ describe("finding-delivery-gate enumeration (#1634)", () => {
 // surfaces, so a file-wide search doesn't have the runtime-turn.ts push-seam
 // pattern's "many one-line entries" laundering risk R1b targets.
 
-/** Blanks `//` and `/* *\/` comments IN PLACE (newlines preserved, so line
- * numbers / line count stay aligned with the raw source) — unlike
- * `stripCommentsAndStrings`, string/template CONTENTS are left untouched,
- * since a surface's evidence is often itself a string/template argument. */
+/** Comments blanked in place, string contents kept: a surface's evidence is
+ * often itself a string or template argument. */
 function stripCommentsOnly(source: string): string {
-	const out = source.split("");
-	const blank = (i: number) => {
-		if (out[i] !== "\n") out[i] = " ";
-	};
-	let i = 0;
-	const n = source.length;
-	while (i < n) {
-		const c = source[i];
-		const c2 = source[i + 1];
-		if (c === "/" && c2 === "/") {
-			while (i < n && source[i] !== "\n") {
-				blank(i);
-				i++;
-			}
-			continue;
-		}
-		if (c === "/" && c2 === "*") {
-			blank(i);
-			blank(i + 1);
-			i += 2;
-			while (i < n && !(source[i] === "*" && source[i + 1] === "/")) {
-				blank(i);
-				i++;
-			}
-			if (i < n) {
-				blank(i);
-				blank(i + 1);
-				i += 2;
-			}
-			continue;
-		}
-		if (c === '"' || c === "'" || c === "`") {
-			const quote = c;
-			i++;
-			while (i < n && source[i] !== quote) {
-				i += source[i] === "\\" ? 2 : 1;
-			}
-			if (i < n) i++;
-			continue;
-		}
-		i++;
-	}
-	return out.join("");
+	return stripSource(source, { strings: "keep" });
 }
 
 function countOccurrences(haystack: string, needle: string): number {

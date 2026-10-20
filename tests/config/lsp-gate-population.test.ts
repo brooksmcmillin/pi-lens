@@ -36,6 +36,7 @@ type Fixture = (typeof LSP_FIXTURES)[number] & {
 	lspGateMarker?: string;
 	lspGateExempt?: string;
 	lensFull?: boolean;
+	createdModuleWitness?: unknown;
 	setup?: string | string[];
 	serverId?: string;
 	expectServerId?: string;
@@ -154,6 +155,18 @@ describe("LSP clean-gate population (#3217)", () => {
 		const lensFull = lensFullPopulation() as Fixture[];
 		expect(lensFull.map((fixture) => fixture.lang)).toEqual(["typescript"]);
 		expect(lensFull[0].lspGate).toBe(true);
+	});
+
+	// #4320/#4346: the created-module witness runs inside the clean gate, on
+	// the python fixture, whose server (pyright) caches a failed import lookup.
+	// Dropping the flag would silently retire the nightly's only end-to-end
+	// check that a created module clears its importer.
+	it("pins the created-module witness to the gated python fixture", () => {
+		const witnessed = fixtures.filter(
+			(fixture) => fixture.createdModuleWitness !== undefined,
+		);
+		expect(witnessed.map((fixture) => fixture.lang)).toEqual(["python"]);
+		expect(witnessed[0].lspGate).toBe(true);
 	});
 
 	// #2780's own guard, carried over from the deleted

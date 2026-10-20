@@ -2,7 +2,11 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
+import type { Diagnostic } from "../../clients/dispatch/types.js";
+import {
+	MAX_OWED_ANCHORS,
+	RuntimeCoordinator,
+} from "../../clients/runtime-coordinator.js";
 import {
 	getDegradationSummary,
 	resetDegradationLedger,
@@ -474,6 +478,297 @@ describe("RuntimeCoordinator", () => {
 				}),
 			).toBe(true);
 			expect(runtime.getInlineBlockersSnapshot()).toHaveLength(0);
+		});
+
+		// #4484: a blocker is pending until a fresh observation no longer holds
+		// it. A clearing run whose own observation still holds one (an opaque
+		// recovery of new bytes, whose blocker channel is withheld) left the
+		// record cleared and turn end reported a false "Resolved".
+		it("refuses a clear while the clearing run still observes a blocker, whatever its authorship (#4484)", () => {
+			const runtime = new RuntimeCoordinator();
+			runtime.recordInlineBlockers(
+				file,
+				"🔴 STOP L2",
+				1,
+				["biome"],
+				[2],
+				recorded,
+			);
+			for (const [writeIndex, authored] of [
+				[2, false],
+				[3, true],
+			] as const) {
+				expect(
+					runtime.clearInlineBlockers(file, writeIndex, undefined, {
+						authored,
+						sha256: "b".repeat(64),
+						blocking: 1,
+					}),
+				).toBe(false);
+			}
+			expect(runtime.getInlineBlockersSnapshot()).toHaveLength(1);
+			expect(runtime.hasResolvedBlockerFiles()).toBe(false);
+			expect(
+				getDegradationSummary().find((c) => c.kind === "blocker-clear-refused")
+					?.latestReasons,
+			).toEqual([
+				{
+					subject: normalizeMapKey(file),
+					reason: expect.stringMatching(
+						/still observed a blocker.*\(count: 2\)/,
+					),
+				},
+			]);
+			// An observation with nothing left clears and reports it resolved.
+			expect(
+				runtime.clearInlineBlockers(file, 4, undefined, {
+					authored: false,
+					sha256: "b".repeat(64),
+					blocking: 0,
+				}),
+			).toBe(true);
+			expect(runtime.getInlineBlockersSnapshot()).toHaveLength(0);
+			expect(runtime.hasResolvedBlockerFiles()).toBe(true);
+		});
+	});
+
+	// #4484 round 2: a settled collect-later run is the only observation that
+	// may retire what its runner left pending while it was in flight. Without
+	// the guards it would retire another runner's blocker, a server's it never
+	// heard from, or a verdict about bytes it did not read.
+	describe("retireUnobservedRunnerBlockers (#4484 round 2)", () => {
+		// A real file: the snapshot drops a record whose file is gone (#1245).
+		let dir = "";
+		let file = "";
+		beforeEach(() => {
+			dir = mkdtempSync(path.join(tmpdir(), "pi-lens-4484-retire-"));
+			file = path.join(dir, "carry.ts");
+			writeFileSync(file, "BAD_CALL();\n");
+		});
+		afterEach(() => rmSync(dir, { recursive: true, force: true }));
+		const sha256 = "c".repeat(64);
+		const blocker = (
+			runnerId: string,
+			message: string,
+			serverId?: string,
+		): Diagnostic => ({
+			id: `${runnerId}:${message}`,
+			message,
+			filePath: file,
+			line: 2,
+			severity: "error",
+			semantic: "blocking",
+			tool: runnerId === "lsp" ? "lsp" : runnerId,
+			rule: `${runnerId}:rule`,
+			runnerId,
+			...(serverId !== undefined && { serverId }),
+		});
+		const record = (runtime: RuntimeCoordinator, diags: Diagnostic[]) =>
+			runtime.recordInlineBlockers(
+				file,
+				"🔴 STOP",
+				1,
+				undefined,
+				[2],
+				{ size: 10, sha256 },
+				diags,
+				undefined,
+				1_000,
+			);
+
+		it("retires only its own runner's unobserved blockers and keeps an unconfirmed server's", () => {
+			const runtime = new RuntimeCoordinator();
+			const ts = blocker("lsp", "Cannot find name 'X'.", "typescript");
+			const deno = blocker("lsp", "Deno says no.", "deno");
+			const lint = blocker("eslint", "no-debugger");
+			record(runtime, [ts, deno, lint]);
+			expect(
+				runtime.retireUnobservedRunnerBlockers(file, {
+					runnerId: "lsp",
+					observed: [],
+					markedAtMs: 2_000,
+					sha256,
+					unconfirmedServerIds: ["deno"],
+				}),
+			).toBe(1);
+			expect(runtime.getInlineBlockerDiagnostics(file)).toEqual([deno, lint]);
+			expect(runtime.hasResolvedBlockerFiles()).toBe(false);
+		});
+
+		it("keeps a blocker the run still observes, as its observed copy", () => {
+			const runtime = new RuntimeCoordinator();
+			record(runtime, [blocker("lsp", "Cannot find name 'X'.")]);
+			const observed = blocker("lsp", "Cannot  find name 'x'.");
+			expect(
+				runtime.retireUnobservedRunnerBlockers(file, {
+					runnerId: "lsp",
+					observed: [observed],
+					markedAtMs: 2_000,
+					sha256,
+				}),
+			).toBe(0);
+			expect(runtime.getInlineBlockerDiagnostics(file)).toHaveLength(1);
+		});
+
+		// #4484 round 3 (R3): the run is about the recorded bytes, so the
+		// blocker is still observed only at its own line. Recurrence: another
+		// occurrence of the same rule kept a fixed blocker (review F1).
+		it("retires a blocker whose identity the run observes only at another line", () => {
+			const runtime = new RuntimeCoordinator();
+			record(runtime, [blocker("lsp", "Cannot find name 'X'.")]);
+			expect(
+				runtime.retireUnobservedRunnerBlockers(file, {
+					runnerId: "lsp",
+					observed: [{ ...blocker("lsp", "Cannot find name 'X'."), line: 7 }],
+					markedAtMs: 2_000,
+					sha256,
+				}),
+			).toBe(1);
+		});
+
+		it("refuses a run about other bytes, or marked before the record's read", () => {
+			const runtime = new RuntimeCoordinator();
+			record(runtime, [blocker("lsp", "Cannot find name 'X'.")]);
+			for (const run of [
+				{ markedAtMs: 2_000, sha256: "d".repeat(64) },
+				{ markedAtMs: 2_000, sha256: undefined },
+				{ markedAtMs: 999, sha256 },
+			]) {
+				expect(
+					runtime.retireUnobservedRunnerBlockers(file, {
+						runnerId: "lsp",
+						observed: [],
+						...run,
+					}),
+				).toBe(0);
+			}
+			expect(runtime.getInlineBlockersSnapshot()).toHaveLength(1);
+		});
+
+		it("deletes an emptied record and notes the file resolved", () => {
+			const runtime = new RuntimeCoordinator();
+			record(runtime, [blocker("lsp", "Cannot find name 'X'.")]);
+			expect(
+				runtime.retireUnobservedRunnerBlockers(file, {
+					runnerId: "lsp",
+					observed: [],
+					markedAtMs: 1_000,
+					sha256,
+				}),
+			).toBe(1);
+			expect(runtime.getInlineBlockersSnapshot()).toHaveLength(0);
+			expect(runtime.hasResolvedBlockerFiles()).toBe(true);
+		});
+	});
+
+	// #4484 round 3: the anchor follows the record. Recurrence: a new
+	// session's first write aligned its recorded lines (none) to a dead
+	// session's bytes, or an owed range outlived the session that owed it.
+	// Round 4 (G1, G3): the anchor lived in a 256-entry cache apart from the
+	// record, so writes to other files evicted a live record's anchor and the
+	// next edit retired its blocker with nothing to align (verify probe P18).
+	describe("analysis anchor (#4484 rounds 3 to 5)", () => {
+		const anchor = {
+			lineHashes: Uint32Array.of(1, 2),
+			owedRanges: new Map([["ast-grep-napi", [{ start: 2, end: 2 }]]]),
+		};
+
+		it("keeps the anchor on the file's record, under any spelling of its path", () => {
+			const runtime = new RuntimeCoordinator();
+			runtime.recordInlineBlockers("/p/src/a.ts", "blocker A");
+			runtime.setAnalysisAnchor("/p/src/../src/a.ts", anchor);
+			expect(runtime.getAnalysisAnchor("/p/src/a.ts")).toBe(anchor);
+		});
+
+		it("keeps a record's anchor however many other files take anchors", () => {
+			const runtime = new RuntimeCoordinator();
+			runtime.recordInlineBlockers("/p/a.ts", "blocker A");
+			runtime.setAnalysisAnchor("/p/a.ts", anchor);
+			for (let i = 0; i < 300; i += 1)
+				runtime.setAnalysisAnchor(`/p/other-${i}.ts`, {
+					lineHashes: Uint32Array.of(i),
+					owedRanges: new Map(),
+				});
+			expect(runtime.getAnalysisAnchor("/p/a.ts")).toBe(anchor);
+		});
+
+		// Round 5 (K2, verify probe P23): only the runner id stayed, so the
+		// next write owed it the whole file. The owed lines' texts stay.
+		it("drops the hashes with the record and keeps the owed line texts", () => {
+			const runtime = new RuntimeCoordinator();
+			runtime.recordInlineBlockers("/p/a.ts", "blocker A");
+			runtime.setAnalysisAnchor("/p/a.ts", anchor);
+			runtime.clearInlineBlockers("/p/a.ts");
+			expect(runtime.getAnalysisAnchor("/p/a.ts")).toEqual({
+				lineHashes: undefined,
+				owedRanges: new Map(),
+				owedContent: new Map([["ast-grep-napi", Uint32Array.of(2)]]),
+			});
+		});
+
+		// Round 5 (K2, verify probe P23): a file with no record kept only the
+		// owing runner's id. It keeps its whole anchor now, bounded; an evicted
+		// file falls back to owed line texts, never the whole file.
+		it("keeps a record-less file's whole anchor while a runner owes lines, then its owed texts", () => {
+			const runtime = new RuntimeCoordinator();
+			runtime.setAnalysisAnchor("/p/a.ts", anchor);
+			expect(runtime.getAnalysisAnchor("/p/a.ts")).toBe(anchor);
+			for (let i = 0; i < MAX_OWED_ANCHORS; i += 1)
+				runtime.setAnalysisAnchor(`/p/other-${i}.ts`, anchor);
+			expect(runtime.getAnalysisAnchor("/p/a.ts")).toEqual({
+				lineHashes: undefined,
+				owedRanges: new Map(),
+				owedContent: new Map([["ast-grep-napi", Uint32Array.of(2)]]),
+			});
+			runtime.setAnalysisAnchor("/p/a.ts", {
+				lineHashes: Uint32Array.of(1),
+				owedRanges: new Map(),
+			});
+			expect(runtime.getAnalysisAnchor("/p/a.ts")).toBeUndefined();
+		});
+
+		// Round 5 (K3, verify probe P25): a carry moved a blocker's line but kept
+		// its line-bound id, so the settled copy at the same line joined the
+		// record beside it and the turn end listed it twice.
+		it("merges a settled copy of a carried blocker whose id names its old line", () => {
+			const runtime = new RuntimeCoordinator();
+			const carried = {
+				id: "lsp:2304:2",
+				message: "Cannot find name 'BAD_CALL'.",
+				filePath: "/p/a.ts",
+				line: 4,
+				column: 1,
+				severity: "error" as const,
+				semantic: "blocking" as const,
+				tool: "lsp",
+				rule: "ts:2304",
+			};
+			expect(
+				runtime.recordDeferredInlineBlockers("/p/a.ts", [carried], {
+					recordedAtMs: 1,
+				}),
+			).toBe(1);
+			expect(
+				runtime.recordDeferredInlineBlockers(
+					"/p/a.ts",
+					[
+						{ ...carried, id: "lsp:2304:4" },
+						{ ...carried, line: 5, id: "lsp:2304:5" },
+					],
+					{ recordedAtMs: 2 },
+				),
+			).toBe(1);
+			expect(runtime.getInlineBlockerDiagnostics("/p/a.ts")).toHaveLength(2);
+		});
+
+		it("drops every anchor and owing runner at a session reset", () => {
+			const runtime = new RuntimeCoordinator();
+			runtime.recordInlineBlockers("/p/a.ts", "blocker A");
+			runtime.setAnalysisAnchor("/p/a.ts", anchor);
+			runtime.setAnalysisAnchor("/p/b.ts", anchor);
+			runtime.resetForSession();
+			expect(runtime.getAnalysisAnchor("/p/a.ts")).toBeUndefined();
+			expect(runtime.getAnalysisAnchor("/p/b.ts")).toBeUndefined();
 		});
 	});
 

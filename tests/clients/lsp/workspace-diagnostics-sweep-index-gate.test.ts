@@ -78,7 +78,10 @@ describe("runWorkspaceDiagnostics — sweep-scoped index gate for workspaceIndex
 			}),
 			getOperationSupport: () => ({}),
 			serverId: "marksman",
-			notify: { open: vi.fn(async () => {}) },
+			notify: {
+				announceCreated: () => undefined,
+				open: vi.fn(async () => {}),
+			},
 			waitForDiagnostics: vi.fn(async (filePath: string, ms: number) => {
 				waitCalls.push({ filePath, ms });
 				fileIndex += 1;
@@ -166,7 +169,10 @@ describe("runWorkspaceDiagnostics — sweep-scoped index gate for workspaceIndex
 			}),
 			getOperationSupport: () => ({}),
 			serverId: "python",
-			notify: { open: vi.fn(async () => {}) },
+			notify: {
+				announceCreated: () => undefined,
+				open: vi.fn(async () => {}),
+			},
 			waitForDiagnostics: vi.fn(async (_filePath: string, ms: number) => {
 				waitCalls.push(ms);
 				return undefined;

@@ -29,6 +29,7 @@ import {
 } from "../support/sweep-kit.js";
 import { removeTempDirSync } from "./test-utils.js";
 import { TMP_HYGIENE_HOME } from "../support/vitest-setup.js";
+import { scaledTestTimeout } from "../support/test-timeout-scale.js";
 
 import { EventEmitter } from "node:events";
 import { waitFor } from "./interleaving-kit.js";
@@ -845,29 +846,43 @@ describe("no tests/**/*.test.ts file drives a producer's registry against the ru
 		return flagged;
 	}
 
-	it("registered-or-fail: every unpinned reach into a producer's registry is named or exempted with a reason", () => {
-		assertNonEmptyScan("tests/ registry-isolation walk", testFiles.length, 900);
-		const flagged = scanFlagged();
-		const audit = auditRegistry({
-			sweepName: "tests/ registry isolation",
-			flagged,
-			registered: [],
-			exemptions: REGISTRY_ISOLATION_EXEMPTIONS,
-			// Zero is the HEALTHY steady state here (#3048 has merged, so nothing
-			// is flagged) — unlike a tagged-seam sweep, this floor would fail on
-			// exactly the day the codebase is clean. `minScanned` below is what
-			// still catches a broken walk (#1718's shape).
-			minFlagged: 0,
-			scannedCount: testFiles.length,
-			minScanned: 900,
-			remediation:
-				"Pin this file's own process.env.PI_LENS_HOME in beforeEach/" +
-				"afterEach (tests/clients/lsp-budget.test.ts's shape), or mock " +
-				"clients/file-utils.js's getGlobalPiLensDir (tests/clients/" +
-				"instance-registry.test.ts's shape) — see #3042/#3050.",
-		});
-		expect(audit.problems).toEqual([]);
-	});
+	// #4634: this case parses every `tests/**/*.test.ts` file, so its cost is
+	// host-bound, not fixture-bound. Measured 947 ms on an idle host and 5,314 ms
+	// under load average 57.75 (a timeout at vitest's 5 s default), so it takes
+	// 60 s — 9.4x its worst measurement, and this file's only scaled budget. The
+	// file's only other explicit budgets are raw `30_000` on the two
+	// `session_start` driver cases below, and neither walks the tree.
+	it(
+		"registered-or-fail: every unpinned reach into a producer's registry is named or exempted with a reason",
+		() => {
+			assertNonEmptyScan(
+				"tests/ registry-isolation walk",
+				testFiles.length,
+				900,
+			);
+			const flagged = scanFlagged();
+			const audit = auditRegistry({
+				sweepName: "tests/ registry isolation",
+				flagged,
+				registered: [],
+				exemptions: REGISTRY_ISOLATION_EXEMPTIONS,
+				// Zero is the HEALTHY steady state here (#3048 has merged, so nothing
+				// is flagged) — unlike a tagged-seam sweep, this floor would fail on
+				// exactly the day the codebase is clean. `minScanned` below is what
+				// still catches a broken walk (#1718's shape).
+				minFlagged: 0,
+				scannedCount: testFiles.length,
+				minScanned: 900,
+				remediation:
+					"Pin this file's own process.env.PI_LENS_HOME in beforeEach/" +
+					"afterEach (tests/clients/lsp-budget.test.ts's shape), or mock " +
+					"clients/file-utils.js's getGlobalPiLensDir (tests/clients/" +
+					"instance-registry.test.ts's shape) — see #3042/#3050.",
+			});
+			expect(audit.problems).toEqual([]);
+		},
+		scaledTestTimeout(60_000),
+	);
 
 	it("red-first proof: the same walk catches the pre-#3048 shape (scratch copy in a private root, never under tests/)", () => {
 		// #3042's own recurrence is fixed on master now, so this proves the

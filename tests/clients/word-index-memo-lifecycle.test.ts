@@ -5,8 +5,11 @@
  * backstop; the settle itself is exercised through `index.ts` in
  * `tests/index-word-index-memo-settle.test.ts`.
  */
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { getRecentLoggedPhases } from "../../clients/latency-logger.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	_setRecentPhasesForTest,
+	getRecentLoggedPhases,
+} from "../../clients/latency-logger.js";
 import {
 	buildWordIndex,
 	deserializeWordIndex,
@@ -37,6 +40,15 @@ describe("word-index serialized memo lifecycle (#4124)", () => {
 	afterEach(() => {
 		vi.useRealTimers();
 		vi.unstubAllEnvs();
+	});
+
+	// Recurrence (#4561, shuffle seed 202): `getRecentLoggedPhases()` is the
+	// process-wide ring, capped at RECENT_PHASE_CAP, and every sibling case's
+	// memo release logs one row into it. A `before + 1` assertion then measured
+	// the ring instead of this case's release (0 rows once full). Each case
+	// starts from an empty ring.
+	beforeEach(() => {
+		_setRecentPhasesForTest([]);
 	});
 
 	it("keeps the memo across a run's persists and drops it at settle, leaving the decoded index live", () => {

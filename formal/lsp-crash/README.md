@@ -2,7 +2,8 @@
 
 A TLA+ model of an LSP server process dying, or being evicted, while touches
 of one file are in flight, and of the lazy respawn that follows
-(`ensureClientForServer`'s dead-client branch in `clients/lsp/index.ts`).
+(`ensureClientForServer`'s dead-client branch, in `clients/lsp/client-registry.ts`
+since #2372 slice 3; it was in `clients/lsp/index.ts` before).
 Every config here states its expected verdict on its first line (see
 `formal/file-locks/README.md`), and the `TLA+ models` CI job checks them all.
 

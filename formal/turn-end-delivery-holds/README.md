@@ -25,7 +25,7 @@ the action abstracts.
 | peek-then-commit | 1 | dependency-drift count, `skipOnSuppressed` | `runtime-turn.ts` `countDriftDeliveryOnDelivery` |
 | peek-then-commit | 6 | past-EOF retirement (secondary's), settles delivered even when suppressed | `runtime-turn.ts` `retirePastEofOnDelivery` |
 | drain-then-restore, bounded | 2 | late auxiliary pair, `canHold` = `canRearmPendingAuxiliary` (#3900) | `runtime-turn.ts` (the late auxiliary hold), `clients/lsp/pending-aux-coverage.ts` `canRearmPendingAuxiliary` |
-| drain-then-restore, unbounded | 3 | settled runner result requeued (#3813); cascade run re-appended | `runtime-turn.ts` (the runner and cascade holds) |
+| drain-then-restore plus commit on reach, unbounded | 3 | settled runner result requeued (#3813); cascade run re-appended, and on reach the cascade hold commits the servers its unanswered-primary line named (#4403) | `runtime-turn.ts` (the runner and cascade holds), `cascade-format.ts` `markCascadeUnansweredPrimariesDelivered` |
 | park-then-recheck | 4, 5 | cut-advisory park of the primary (4) and of a concurrent secondary (5) (#4112, #3901) | `runtime-turn.ts` `cutAdvisoryHold`, `runtime-coordinator.ts` `parkCutAdvisoryItems`, `takeCutAdvisoryItems` |
 
 Actions, one per step of `handleTurnEnd`, per session `s`:

@@ -4,7 +4,6 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	createLombokJdtlsArgs,
-	createLombokJdtlsEnv,
 	hasLombokJavaAgent,
 	hasLombokProject,
 	resolveLombokJar,
@@ -80,22 +79,14 @@ describe("JDT LS Lombok launch configuration", () => {
 		]);
 	});
 
-	it("can append -javaagent to JDTLS_JVM_ARGS for wrappers that use env args", () => {
-		writeFile("lombok.config", "config.stopBubbling = true\n");
-		const jar = writeFile(".lombok/lombok.jar", "jar");
-		const env = createLombokJdtlsEnv(tmpDir, {
-			JDTLS_JVM_ARGS: "-Xmx2g",
-		});
-		expect(env?.JDTLS_JVM_ARGS).toBe(`-Xmx2g -javaagent:${jar}`);
-	});
-
 	it("does not duplicate an existing Lombok javaagent", () => {
 		writeFile("lombok.config", "config.stopBubbling = true\n");
 		writeFile(".lombok/lombok.jar", "jar");
-		const env = createLombokJdtlsEnv(tmpDir, {
-			JDTLS_JVM_ARGS: "-javaagent:/tools/lombok.jar",
-		});
-		expect(env).toBeUndefined();
+		expect(
+			createLombokJdtlsArgs(tmpDir, {
+				JDTLS_JVM_ARGS: "-javaagent:/tools/lombok.jar",
+			}),
+		).toEqual([]);
 		expect(hasLombokJavaAgent("-Xmx1g -javaagent:/tools/lombok.jar")).toBe(
 			true,
 		);
@@ -104,8 +95,8 @@ describe("JDT LS Lombok launch configuration", () => {
 	it("respects PI_LENS_JAVA_LOMBOK=0", () => {
 		writeFile("lombok.config", "config.stopBubbling = true\n");
 		writeFile(".lombok/lombok.jar", "jar");
-		expect(
-			createLombokJdtlsEnv(tmpDir, { PI_LENS_JAVA_LOMBOK: "0" }),
-		).toBeUndefined();
+		expect(createLombokJdtlsArgs(tmpDir, { PI_LENS_JAVA_LOMBOK: "0" })).toEqual(
+			[],
+		);
 	});
 });

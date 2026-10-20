@@ -9,10 +9,37 @@
 		],
 		"workspace": "tests/fixtures/tool-smoke/markdown",
 		"platform": "win32-x64",
-		"capturedAt": "2026-08-21"
+		"capturedAt": "2026-08-21",
+		"versionArgv": [
+			"--version"
+		]
 	},
 	"file": "bad.md",
 	"exitCode": 1,
 	"stdout": "markdownlint-cli2 v0.23.0 (markdownlint v0.41.0)\nFinding: bad.md\nLinting: 1 file(s)\nSummary: 1 error(s)\n",
-	"stderr": "bad.md:3 error MD025/single-title/single-h1 Multiple top-level headings in the same document [Context: \"Second Top-Level Heading\"]\n"
+	"stderr": "bad.md:3 error MD025/single-title/single-h1 Multiple top-level headings in the same document [Context: \"Second Top-Level Heading\"]\n",
+	"availability": [
+		{
+			"command": "markdownlint-cli2",
+			"argv": [
+				"--no-globs",
+				"-"
+			],
+			"version": "0.23.3",
+			"exitCode": 0,
+			"stdout": "markdownlint-cli2 v0.23.3 (markdownlint v0.41.1)\nFinding: \nLinting: 1 file\nSummary: 0 issues in 0 files\n",
+			"stderr": ""
+		}
+	],
+	"clean": {
+		"workspace": "tests/fixtures/runner-output-clean/markdownlint",
+		"file": "bad.md",
+		"argv": [
+			"bad.md"
+		],
+		"version": "0.23.3",
+		"exitCode": 0,
+		"stdout": "markdownlint-cli2 v0.23.3 (markdownlint v0.41.1)\nFinding: bad.md\nLinting: 1 file\nSummary: 0 issues in 0 files\n",
+		"stderr": ""
+	}
 }

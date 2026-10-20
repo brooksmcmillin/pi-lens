@@ -10,6 +10,7 @@
 // `LSPService`; tests run it over the real service class with fake clients.
 
 import { isAuxiliary } from "../../dist/clients/lsp/server-traits.js";
+import { touchAnsweredDiagnostics } from "./touch-result.mjs";
 
 /** Fixture extension/basename match, the same rule `selectionReason` applies. */
 function fixtureMatchesExtension(server, fixture) {
@@ -396,7 +397,7 @@ export function createServiceDriver(args) {
 				target.content,
 				touchOptions,
 			);
-			const diags = Array.isArray(result) ? result : result?.diags;
+			const diags = touchAnsweredDiagnostics(result, touchOptions, lsp);
 			return diags === undefined ? undefined : [...diags];
 		},
 		isTargetAlive: () => lsp.getAliveServerIds().includes(server.id),

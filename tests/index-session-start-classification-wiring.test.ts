@@ -19,9 +19,16 @@ import {
 	flushLatencyLog,
 	getLatencyLogPath,
 } from "../clients/latency-logger.js";
+import { flushAllNdjsonWriters } from "../clients/ndjson-logger.js";
 import { _resetSessionLifecycleForTests } from "../clients/session-lifecycle.js";
 import { makeSessionStartEvent } from "./support/host-event-factory.js";
 import { createPiMock, makeCtx, STALE_CTX_MESSAGE } from "./support/pi-mock.js";
+import {
+	fauxAssistantMessage,
+	fauxText,
+	piSessionFixture,
+	startPiSession,
+} from "./support/pi-session.js";
 import { removeTempDirSync } from "./clients/test-utils.js";
 
 /** Make an already-emitted ctx read as invalidated, the way the SDK does
@@ -44,10 +51,28 @@ type SessionStartTotalRecord = {
 	};
 };
 
-function sessionStartTotals(): SessionStartTotalRecord[] {
-	const text = fs.existsSync(getLatencyLogPath())
-		? fs.readFileSync(getLatencyLogPath(), "utf8")
-		: "";
+/**
+ * The `session_start_total` rows in a latency log. The default is this test
+ * graph's own log; the tier-2 case reads the log the LOADED copy wrote under
+ * the home `tests/support/pi-session.ts` pinned (its loggers bind their path at
+ * their own module load, so this graph's binding names a different file).
+ */
+//
+// The tier-2 case reads the LOADED copy's log, whose path this graph's
+// `getLatencyLogPath()` does not name (the copy's loggers bind their own path
+// at ITS module load). `flushAllNdjsonWriters` drains the process-global
+// writer map both graphs registered into, so it settles the copy's rows before
+// the read (#4381 shape: a sink read drains first).
+async function sessionStartTotalsAt(
+	filePath: string,
+): Promise<SessionStartTotalRecord[]> {
+	await flushAllNdjsonWriters();
+	return sessionStartTotals(filePath);
+}
+function sessionStartTotals(
+	filePath: string = getLatencyLogPath(),
+): SessionStartTotalRecord[] {
+	const text = fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "";
 	return text
 		.split(/\r?\n/)
 		.filter(Boolean)
@@ -72,6 +97,8 @@ function sessionStartTotals(): SessionStartTotalRecord[] {
 			} as SessionStartTotalRecord;
 		});
 }
+
+const fixture = piSessionFixture();
 
 describe("index session_start wiring — classification logged with mode (#2129)", () => {
 	let hostRoot: string;
@@ -103,19 +130,32 @@ describe("index session_start wiring — classification logged with mode (#2129)
 	});
 
 	it("a fresh primary start's session_start_total carries classification=primary", async () => {
-		const pi = createPiMock();
-		extension(pi.asExtensionAPI());
-		clearLatencyLog();
-		await flushLatencyLog();
+		// Tier 2 (#4632): a REAL pi session at this fixture's root, so the
+		// `session_start` the row describes is the host's own start with pi's
+		// own ctx and session manager, not a hand-built event. The row is read
+		// from the home the loaded copy pinned, after `dispose()` emitted
+		// `session_shutdown` and pi awaited the copy's writer drain.
+		//
+		// The shape is QUICK: the mode a real process's FIRST `session_start`
+		// takes (the cold-start heuristic in `clients/runtime-session.ts`), so
+		// the row asserts `mode: "quick"` exactly as the double-based version of
+		// this case did. The helper opts the quick mode's warmup timer out (its
+		// persist has no test-side drain); the START shape is what this case
+		// pins (#4664 F3).
+		const cwd = path.join(fixture.root, "primary", "proj");
+		const handle = await startPiSession({
+			root: fixture.root,
+			cwd,
+			responses: [fauxAssistantMessage(fauxText("ready"))],
+			startupMode: "quick",
+		});
+		await handle.prompt("hello");
+		await handle.dispose();
+		expect(handle.errors).toEqual([]);
 
-		await pi.emit(
-			"session_start",
-			makeSessionStartEvent(),
-			makeCtx({ cwd: hostRoot, sessionId: "host-session" }),
+		const totals = await sessionStartTotalsAt(
+			path.join(process.env.PI_LENS_HOME ?? "", "latency.log"),
 		);
-		await flushLatencyLog();
-
-		const totals = sessionStartTotals();
 		expect(totals).toHaveLength(1);
 		expect(totals[0].metadata).toMatchObject({
 			mode: "quick",

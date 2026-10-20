@@ -150,6 +150,9 @@ describe("#2499 analysed-state latch with the real pipeline", () => {
 			await runHandlerExpectingNoThrow(() =>
 				handleToolCall(callDeps(firstEvent, env.tmpDir, runtime, cacheManager)),
 			);
+			// The window below is the tool_result pipeline's first spawn; the
+			// tool_call's own HEAD look (#4493) already spawned `git rev-parse`.
+			spawnState.spawnCalls = 0;
 			fs.writeFileSync(filePath, `${SOURCE}# analysed-state\n`);
 
 			spawnState.releaseSpawn = () => {};

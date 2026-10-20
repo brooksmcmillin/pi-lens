@@ -24,6 +24,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { removeTempDirSync } from "../test-utils.js";
+import { scaledTestTimeout } from "../../support/test-timeout-scale.js";
 
 // Keep the budget short so a wedged double is bounded well inside the
 // per-test timeout. Assigned before the dynamic `index.js` import in each
@@ -38,7 +39,10 @@ type MockRenameClient = {
 	isDocumentOpen: ReturnType<typeof vi.fn>;
 	getDocumentUri: ReturnType<typeof vi.fn>;
 	closeDocument: ReturnType<typeof vi.fn>;
-	notify: { open: ReturnType<typeof vi.fn> };
+	notify: {
+		open: ReturnType<typeof vi.fn>;
+		watchedFileChange: ReturnType<typeof vi.fn>;
+	};
 	willRenameFiles: ReturnType<typeof vi.fn>;
 	getOperationSupport: ReturnType<typeof vi.fn>;
 	didRenameFiles: ReturnType<typeof vi.fn>;
@@ -51,7 +55,7 @@ function makeClient(root: string): MockRenameClient {
 		isDocumentOpen: vi.fn(() => false),
 		getDocumentUri: vi.fn(() => undefined),
 		closeDocument: vi.fn(async () => undefined),
-		notify: { open: vi.fn(async () => undefined) },
+		notify: { open: vi.fn(async () => undefined), watchedFileChange: vi.fn() },
 		willRenameFiles: vi.fn(async () => null),
 		getOperationSupport: vi.fn(() => ({
 			willRenameFiles: true,
@@ -59,6 +63,22 @@ function makeClient(root: string): MockRenameClient {
 		})),
 		didRenameFiles: vi.fn(async () => undefined),
 	};
+}
+
+/** Returns as soon as `promise` settles, or after `ms` if it never does. */
+async function settleWithin(
+	promise: Promise<unknown>,
+	ms: number,
+): Promise<void> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const deadline = new Promise<void>((resolve) => {
+		timer = setTimeout(resolve, ms);
+	});
+	try {
+		await Promise.race([promise, deadline]);
+	} finally {
+		clearTimeout(timer);
+	}
 }
 
 function addClient(
@@ -80,62 +100,80 @@ describe("LSPService.renameFile with a wedged notify (#1621)", () => {
 		vi.resetModules();
 	});
 
-	it("bounds a wedged closeDocument notify, recording it as timedOut instead of hanging the rename", async () => {
-		const mod: LSPServiceModule = await import("../../../clients/lsp/index.js");
-		const { normalizeMapKey } = await import("../../../clients/path-utils.js");
-		const tmpDir = fs.mkdtempSync(
-			path.join(os.tmpdir(), "pi-lens-lsp-rename-wedged-"),
-		);
-		const oldPath = path.join(tmpDir, "old.ts");
-		const newPath = path.join(tmpDir, "new.ts");
-		fs.writeFileSync(oldPath, "export const value = 1;\n", "utf-8");
-
-		const client = makeClient(tmpDir);
-		client.isDocumentOpen.mockReturnValue(true);
-		// A wedged pipe wedges every write on it, not just the first one: the
-		// didClose notify AND the resync `notify.open` that runs after it both
-		// go out over the same stdin. A double that only wedges closeDocument
-		// while leaving notify.open healthy is not production-faithful (F1 —
-		// the abort path's reopen is the identical unbounded-notify primitive
-		// one write later), so both are wedged here.
-		client.closeDocument.mockImplementation(() => new Promise<void>(() => {}));
-		client.notify.open.mockImplementation(() => new Promise<void>(() => {}));
-
-		const service = new mod.LSPService();
-		addClient(service, "typescript", tmpDir, client, normalizeMapKey);
-
-		try {
-			let settled = false;
-			const renamePromise = service
-				.renameFile(oldPath, newPath, { cwd: tmpDir, apply: true })
-				.catch((err: unknown) => err)
-				.then((result: unknown) => {
-					settled = true;
-					return result;
-				});
-
-			// Well inside vitest's default per-test timeout, but comfortably
-			// beyond even TWO sequential 80ms notify budgets (close, then resync).
-			await new Promise((resolve) => setTimeout(resolve, 1000));
-			expect(settled, "renameFile must settle within its notify budget").toBe(
-				true,
+	// #4634: this case loads `clients/lsp/index.js` through a fresh module
+	// registry and drives the real rename path, so its cost is the host's, not
+	// the double's. Measured 1,276 ms on an idle host and 4,920 ms under load
+	// average 78 — 98% of the 5 s budget this case used to declare, so a loaded
+	// host reds it on the budget rather than on the behaviour it guards. The
+	// behaviour guard inside the body (`settleWithin(..., 1000)`) is unchanged;
+	// only the outer ceiling moves.
+	it(
+		"bounds a wedged closeDocument notify, recording it as timedOut instead of hanging the rename",
+		async () => {
+			const mod: LSPServiceModule =
+				await import("../../../clients/lsp/index.js");
+			const { normalizeMapKey } =
+				await import("../../../clients/path-utils.js");
+			const tmpDir = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-lsp-rename-wedged-"),
 			);
+			const oldPath = path.join(tmpDir, "old.ts");
+			const newPath = path.join(tmpDir, "new.ts");
+			fs.writeFileSync(oldPath, "export const value = 1;\n", "utf-8");
 
-			const result = await renamePromise;
-			expect(result).toBeInstanceOf(Error);
-			const message = (result as Error).message;
-			expect(message).toMatch(/didClose failed; rename aborted/);
-			// The disposition must distinguish "timed out" from "rejected" — not
-			// collapse to a generic failure string.
-			expect(message).toMatch(/typescript \(timedOut\)/);
-			// The wedged resync must also be bounded and its own disposition
-			// recorded, not silently swallowed or left to hang the abort path.
-			expect(message).toMatch(/resync also failed.*typescript \(timedOut\)/);
-		} finally {
-			removeTempDirSync(tmpDir);
-		}
-	}, 5_000);
+			const client = makeClient(tmpDir);
+			client.isDocumentOpen.mockReturnValue(true);
+			// A wedged pipe wedges every write on it, not just the first one: the
+			// didClose notify AND the resync `notify.open` that runs after it both
+			// go out over the same stdin. A double that only wedges closeDocument
+			// while leaving notify.open healthy is not production-faithful (F1 —
+			// the abort path's reopen is the identical unbounded-notify primitive
+			// one write later), so both are wedged here.
+			client.closeDocument.mockImplementation(
+				() => new Promise<void>(() => {}),
+			);
+			client.notify.open.mockImplementation(() => new Promise<void>(() => {}));
 
+			const service = new mod.LSPService();
+			addClient(service, "typescript", tmpDir, client, normalizeMapKey);
+
+			try {
+				let settled = false;
+				const renamePromise = service
+					.renameFile(oldPath, newPath, { cwd: tmpDir, apply: true })
+					.catch((err: unknown) => err)
+					.then((result: unknown) => {
+						settled = true;
+						return result;
+					});
+
+				// Well inside vitest's default per-test timeout, but comfortably
+				// beyond even TWO sequential 80ms notify budgets (close, then resync).
+				await settleWithin(renamePromise, 1000);
+				expect(settled, "renameFile must settle within its notify budget").toBe(
+					true,
+				);
+
+				const result = await renamePromise;
+				expect(result).toBeInstanceOf(Error);
+				const message = (result as Error).message;
+				expect(message).toMatch(/didClose failed; rename aborted/);
+				// The disposition must distinguish "timed out" from "rejected" — not
+				// collapse to a generic failure string.
+				expect(message).toMatch(/typescript \(timedOut\)/);
+				// The wedged resync must also be bounded and its own disposition
+				// recorded, not silently swallowed or left to hang the abort path.
+				expect(message).toMatch(/resync also failed.*typescript \(timedOut\)/);
+			} finally {
+				removeTempDirSync(tmpDir);
+			}
+		},
+		scaledTestTimeout(60_000),
+	);
+
+	// Left on the 5 s default on purpose: this case measured 135 ms idle and
+	// 263 ms under load average 70 (#4634), 5% of its budget, so it needs no
+	// widening.
 	it("bounds a wedged didRenameFiles notify, applying the rename and recording the stall instead of hanging", async () => {
 		const mod: LSPServiceModule = await import("../../../clients/lsp/index.js");
 		const { normalizeMapKey } = await import("../../../clients/path-utils.js");
@@ -162,7 +200,7 @@ describe("LSPService.renameFile with a wedged notify (#1621)", () => {
 					return result;
 				});
 
-			await new Promise((resolve) => setTimeout(resolve, 1000));
+			await settleWithin(renamePromise, 1000);
 			expect(settled, "renameFile must settle within its notify budget").toBe(
 				true,
 			);

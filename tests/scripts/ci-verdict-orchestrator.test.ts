@@ -575,39 +575,43 @@ describe("run — gating and advisory reported apart (#3700)", () => {
 		);
 	});
 
-	it("includes the failed Vitest count for a red Windows advisory", async () => {
-		const windows = job(
+	it("includes the failed Vitest count for a red advisory row", async () => {
+		// #4592 review F7: the sample row names a live advisory job that runs
+		// Vitest. It used to say `Unit tests Windows (advisory)`, a name #4518
+		// retired, so the rendering case spoke about a row CI no longer emits; the
+		// job fixture itself is the generic Vitest-log capture, renamed here.
+		const advisory = job(
 			"unit-tests-fail-101554674114",
 			"Tests  56 failed | 1593 passed | 19 skipped (1668)\n",
 		);
-		windows.json.name = "Unit tests Windows (advisory)";
+		advisory.json.name = "Targeted tests (advisory)";
 		const w = world({
 			prs: [
 				{
 					number: 5,
-					checkRuns: [...GREEN, jobRow(windows)],
+					checkRuns: [...GREEN, jobRow(advisory)],
 				},
 			],
-			jobs: [windows],
+			jobs: [advisory],
 		});
 		const { exitCode, lines } = await cli(["5"], w);
 		expect(exitCode).toBe(EXIT_SUCCESS);
 		expect(lines).toContain(
-			"Advisory (never gates): 1 checks, 1 red: Unit tests Windows (advisory) (failure, 56 failed)",
+			"Advisory (never gates): 1 checks, 1 red: Targeted tests (advisory) (failure, 56 failed)",
 		);
 	});
 
 	// Recurrence: #4042 review F2 — a persistent advisory red must not reread
 	// the same Actions job metadata and log on every watch poll for one head.
 	it("reads advisory failure details once per watched head", async () => {
-		const windows = job(
+		const advisory = job(
 			"unit-tests-fail-101554674114",
 			"Tests  56 failed | 1593 passed | 19 skipped (1668)\n",
 		);
-		windows.json.name = "Unit tests Windows (advisory)";
+		advisory.json.name = "Targeted tests (advisory)";
 		const w = world({
-			prs: [{ number: 5, login: "apmantza", checkRuns: [jobRow(windows)] }],
-			jobs: [windows],
+			prs: [{ number: 5, login: "apmantza", checkRuns: [jobRow(advisory)] }],
+			jobs: [advisory],
 		});
 		const result = await cli(["--watch-open", "--stream", "--wait", "180"], w);
 		expect(result.exitCode).toBe(EXIT_PENDING);

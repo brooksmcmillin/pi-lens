@@ -13,6 +13,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { writeEvaluatedRecord } from "./lib/assert-evaluated.mjs";
 import {
 	mergeRows,
 	mergeSrc,
@@ -20,7 +21,9 @@ import {
 	replaceTable,
 } from "./lib/md-matrix.mjs";
 import {
+	adoptFixtureProjectTrust,
 	bootstrapFixtureWorkspace,
+	fixtureTrustRefusal,
 	withScratchHome,
 } from "./lib/lsp-fixture-workspace.mjs";
 
@@ -43,6 +46,10 @@ const { getLSPService, resetLSPService } = await imp(
 	"dist/clients/lsp/index.js",
 );
 const { initLSPConfig } = await imp("dist/clients/lsp/config.js");
+// #4514: this script is a standalone host, not pi. Adopt project trust before
+// the first touch, or the launch gate refuses every project-local and
+// project-code server and the rows read as unavailable.
+await adoptFixtureProjectTrust({ repoRoot });
 let ensureTool;
 if (install) {
 	({ ensureTool } = await imp("dist/clients/installer/index.js"));
@@ -81,12 +88,12 @@ for (const fx of fixtures) {
 			source: "characterize",
 		});
 		const support = await lsp.getWorkspaceDiagnosticsSupport(absFile);
-		rows.push({
-			lang: fx.lang,
-			server: fx.serverHint,
-			mode: support?.mode ?? "unknown",
-		});
-		console.error(`[${fx.lang}] mode=${support?.mode ?? "unknown"}`);
+		// #4514: a server trust kept from launching is `refused: <reason>`, never
+		// the "unknown" a slow or absent server also reads as.
+		const mode =
+			support?.mode ?? (await fixtureTrustRefusal(repoRoot)) ?? "unknown";
+		rows.push({ lang: fx.lang, server: fx.serverHint, mode });
+		console.error(`[${fx.lang}] mode=${mode}`);
 	} catch (e) {
 		rows.push({
 			lang: fx.lang,
@@ -113,6 +120,8 @@ console.log(`\n  pull-capable (clean confirmable via pull): ${pull}`);
 console.log(
 	`  push-only (needs re-publish-empty, else silent → budget-bound): ${push}`,
 );
+// #4514: the step exits 0 by design, so the nightly's floor step reads this.
+writeEvaluatedRecord({ producer: "characterize-lsp", input: rows });
 
 // Merge the measured `mode` (and derived tier for pull servers) into
 // docs/lsp-capability-matrix.md — MERGE, don't overwrite: a row we couldn't

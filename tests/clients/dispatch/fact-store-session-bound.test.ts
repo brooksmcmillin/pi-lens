@@ -312,3 +312,46 @@ describe("FactStore session-fact bound (#2282)", () => {
 		});
 	});
 });
+
+// #4365 rotation batch 1: survivors of the per-module Stryker campaign in the
+// eviction-tombstone bookkeeping of `setBoundedSessionFact`.
+describe("FactStore eviction tombstone survivors (#4365)", () => {
+	it("forgets a tombstone once its key is rewritten, and every tombstone on clearAll", () => {
+		// Kills `evictedSessionFactKeys.delete(factId)` removed in
+		// setBoundedSessionFact (a rewritten key still read as "evicted", so the
+		// entity-snapshot reader skipped a real diff) and `.clear()` removed in
+		// clearAll (tombstones outlived the session reset).
+		const store = new FactStore();
+		const paths = batchPaths("tomb", MAX_SESSION_RECORDS + 10);
+		for (const p of paths) store.setBoundedSessionFact(p, "x");
+		expect(store.wasBoundedSessionFactEvicted(paths[0])).toBe(true);
+
+		store.setBoundedSessionFact(paths[0], "again");
+		expect(store.wasBoundedSessionFactEvicted(paths[0])).toBe(false);
+
+		expect(store.wasBoundedSessionFactEvicted(paths[1])).toBe(true);
+		store.clearAll();
+		expect(store.wasBoundedSessionFactEvicted(paths[1])).toBe(false);
+	});
+
+	it("keeps exactly the tombstone cap of evicted keys, dropping the coldest one past it", () => {
+		// Kills the tombstone trim in setBoundedSessionFact: the `while` forced
+		// false, its `>` turned `>=`, the loop body emptied, the break guard
+		// forced to break at once, and the `.delete(oldestTombstone)` removed.
+		// Evicted keys equal inserts minus the record cap, so 2 x cap inserts
+		// leave exactly cap tombstones and one more insert pushes the first out.
+		const store = new FactStore();
+		const paths = batchPaths("tomb-cap", MAX_SESSION_RECORDS * 2 + 1);
+		for (const p of paths.slice(0, MAX_SESSION_RECORDS * 2))
+			store.setBoundedSessionFact(p, "x");
+		expect(store.wasBoundedSessionFactEvicted(paths[0])).toBe(true);
+		expect(
+			store.wasBoundedSessionFactEvicted(paths[MAX_SESSION_RECORDS - 1]),
+		).toBe(true);
+
+		store.setBoundedSessionFact(paths[MAX_SESSION_RECORDS * 2], "x");
+
+		expect(store.wasBoundedSessionFactEvicted(paths[0])).toBe(false);
+		expect(store.wasBoundedSessionFactEvicted(paths[1])).toBe(true);
+	});
+});

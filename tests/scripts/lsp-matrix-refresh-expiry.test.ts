@@ -172,8 +172,12 @@ describe("#3401 first-publish expiry (date-based)", () => {
 		expect(cellOf(final.text, "ast-grep", "first-publish")).toBe("unknown");
 		expect(final.expired).toBe(2);
 		expect(final.expiredLangs).toEqual(["vue", "ast-grep"]);
-		// The expired cell's bookkeeping is gone, so a settled doc is stable.
-		expect(parseRefreshState(final.text)["first-publish"]).toBeUndefined();
+		// The expired cells' bookkeeping is gone, so a settled doc is stable. The
+		// only entry left is the `empty-first` cell's miss stamp (#4615): the cell
+		// itself never expires.
+		expect(parseRefreshState(final.text)["first-publish"]).toEqual({
+			php: { firstMissed: day(0) },
+		});
 	});
 
 	it("writes firstMissed once, at the first miss, and never slides it", () => {
@@ -255,20 +259,44 @@ describe("#3401 first-publish expiry (date-based)", () => {
 		expect(parseRefreshState(text)["first-publish"]?.svelte).toBeUndefined();
 	});
 
-	it("never expires an empty-first cell (the evidence behind a live emptyFirstPublish marker)", () => {
+	it("never expires an empty-first cell, but stamps its first unobserved night (#4615)", () => {
 		// Recurrence (review F2, mutation M7b): php/terraform `empty-first` back a
 		// LIVE `emptyFirstPublish: "indexing"` marker. Expiring the cell erases the
 		// measurement behind the marker while the first-publish census stays green
 		// (it ignores `unknown`). Only a stale `direct` -- the no-op default -- may
 		// expire.
+		//
+		// #4615: "never expires" also made the cell+marker pair immortal — a probe
+		// that stopped observing this axis left the cell standing with nothing
+		// behind it, indistinguishable from a live one (the #3310 blindness, in the
+		// direction with no clock). The cell keeps its value, and the miss is
+		// stamped ONCE with the same `firstMissed` clock, so the census can require
+		// the evidence to be current instead of expiring the marker's measurement.
 		let text = FIXTURE;
 		for (let n = 0; n < FIRST_PUBLISH_EXPIRY_DAYS * 6; n++)
 			text = nightly(text, n).text;
 		expect(cellOf(text, "php", "first-publish")).toBe("empty-first");
-		expect(parseRefreshState(text)["first-publish"]?.php).toBeUndefined();
+		expect(parseRefreshState(text)["first-publish"]?.php).toEqual({
+			firstMissed: day(0),
+		});
 		// ...while the `direct` cells in the same doc did expire, so the loop
 		// genuinely ran the expiry.
 		expect(cellOf(text, "vue", "first-publish")).toBe("unknown");
+	});
+
+	it("clears an empty-first cell's miss stamp when the axis is observed again", () => {
+		// The stamp is not a tombstone: one comparable observation of the same
+		// class restores the cell's evidence and drops the bookkeeping.
+		let text = FIXTURE;
+		text = nightly(text, 0).text;
+		expect(parseRefreshState(text)["first-publish"]?.php).toEqual({
+			firstMissed: day(0),
+		});
+		text = nightly(text, 1, [
+			observation("php", { firstPublish: "empty-first" }),
+		]).text;
+		expect(parseRefreshState(text)["first-publish"]?.php).toBeUndefined();
+		expect(cellOf(text, "php", "first-publish")).toBe("empty-first");
 	});
 
 	it("keeps every marker-backed empty-first cell of the real matrix through a month of misses", () => {
@@ -477,6 +505,10 @@ describe("#3401 refresh state block", () => {
 		const steady = [
 			measured("ast-grep", "publishes-versioned", "2"),
 			observation("vue", { firstPublish: "direct" }),
+			// #4615: php's `empty-first` cell is measured here too — an unobserved
+			// `empty-first` cell earns a `firstMissed` stamp, which would make the
+			// first run a change.
+			observation("php", { firstPublish: "empty-first" }),
 		];
 		const first = refreshCapabilityMatrix(FIXTURE, steady, { src: "ci" });
 		expect(first.changed).toBe(false);
@@ -558,8 +590,11 @@ describe("#3401 state block parsing, rendering and replacement", () => {
 		const missed = nightly(FIXTURE, 0)
 			.text.split("\n")
 			.find((l) => l.startsWith("{"))!;
+		// #4615: php's unobserved `empty-first` cell is stamped beside the two
+		// stale `direct` cells, in the same sorted order.
 		expect(Object.keys(JSON.parse(missed)["first-publish"])).toEqual([
 			"ast-grep",
+			"php",
 			"vue",
 		]);
 	});

@@ -112,7 +112,10 @@ function makeClient(root: string) {
 			getOperationSupport: () => ({}),
 			serverId: "typescript",
 			root,
-			notify: { open: vi.fn(async () => {}) },
+			notify: {
+				announceCreated: () => undefined,
+				open: vi.fn(async () => {}),
+			},
 			waitForDiagnostics: vi.fn(async (filePath: string) => {
 				waits.push(filePath);
 				return undefined;

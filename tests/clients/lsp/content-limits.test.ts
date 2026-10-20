@@ -49,3 +49,54 @@ describe("exceedsLspSyncLimits (#3405 r2)", () => {
 		);
 	});
 });
+
+/**
+ * #2066: the line count used to be `content.split("\n").length`, and the walk
+ * that replaced it must land the SAME verdict on every terminator shape. Each
+ * row is sized to sit on or one past the LINE bound with a tiny byte total, so
+ * the row decides the verdict rather than the byte bound, and the expectation
+ * is recomputed with the split itself — the reference, not the new walk.
+ */
+describe("the line bound counts what its historical split counted (#2066)", () => {
+	const ROWS: ReadonlyArray<{ name: string; content: string }> = [
+		{ name: "an empty document (one addressable line)", content: "" },
+		{
+			name: "LF lines exactly at the bound",
+			content: "a\n".repeat(MAX_LINES - 1),
+		},
+		{ name: "LF lines one past the bound", content: "a\n".repeat(MAX_LINES) },
+		{
+			// #2066 review F1: the CRLF count is the native LF count, so this
+			// row reds if a `\r` is ever counted as a second newline.
+			name: "CRLF lines exactly at the bound (one terminator each, one LF each)",
+			content: "a\r\n".repeat(MAX_LINES - 1),
+		},
+		{
+			name: "CRLF lines one past the bound (one terminator each, one LF each)",
+			content: "a\r\n".repeat(MAX_LINES),
+		},
+		{
+			name: "a trailing newline one past the bound",
+			content: `${"a\n".repeat(MAX_LINES - 1)}\n`,
+		},
+		{
+			// Unchanged convention: `split("\n")` never saw a lone `\r` as a
+			// separator, so this stays ONE line however many CRs it holds.
+			name: "lone-CR text far past the bound",
+			content: "a\r".repeat(MAX_LINES + 2),
+		},
+	];
+
+	for (const row of ROWS) {
+		it(`agrees with the split for ${row.name}`, () => {
+			const reference = row.content.split("\n").length;
+			const verdict = exceedsLspSyncLimits(row.content);
+			if (reference > MAX_LINES) {
+				expect(verdict.tooLarge).toBe(true);
+				expect(verdict.reason).toBe(`${reference} lines > ${MAX_LINES} limit`);
+			} else {
+				expect(verdict).toEqual({ tooLarge: false, reason: "" });
+			}
+		});
+	}
+});

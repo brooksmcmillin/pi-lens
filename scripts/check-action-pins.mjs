@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import { readdir } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { githubHeaders } from "./lib/github-rest.mjs";
 
 const SHA = /^[0-9a-f]{40}$/i;
 const FULL_VERSION = /^v?\d+\.\d+\.\d+$/;
@@ -72,7 +73,7 @@ export function validatePins(pins, resolveTag, exemptions = {}) {
 	).then((results) => results.filter(Boolean));
 }
 
-async function workflowFiles(root = ROOT) {
+export async function workflowFiles(root = ROOT) {
 	const found = [];
 	async function walk(directory) {
 		let entries;
@@ -107,9 +108,7 @@ export async function resolveGithubTag(
 	const [owner, repo] = action.split("/");
 	if (!owner || !repo) throw new Error(`invalid action ${action}`);
 	const base = env.GITHUB_API_URL || "https://api.github.com";
-	const headers = { Accept: "application/vnd.github+json" };
-	const token = env.GITHUB_TOKEN || env.GH_TOKEN;
-	if (token) headers.Authorization = `Bearer ${token}`;
+	const headers = githubHeaders(env.GITHUB_TOKEN || env.GH_TOKEN);
 	const refUrl = `${base.replace(/\/$/, "")}/repos/${owner}/${repo}/git/ref/tags/${encodeURIComponent(tag)}`;
 	const response = await fetchImpl(refUrl, { headers });
 	if (!response.ok) throw new Error(`GitHub API ${response.status}`);
@@ -132,9 +131,7 @@ export async function resolveGithubMatchingTags(
 	const [owner, repo] = action.split("/");
 	if (!owner || !repo) throw new Error(`invalid action ${action}`);
 	const base = env.GITHUB_API_URL || "https://api.github.com";
-	const headers = { Accept: "application/vnd.github+json" };
-	const token = env.GITHUB_TOKEN || env.GH_TOKEN;
-	if (token) headers.Authorization = `Bearer ${token}`;
+	const headers = githubHeaders(env.GITHUB_TOKEN || env.GH_TOKEN);
 	const url = `${base.replace(/\/$/, "")}/repos/${owner}/${repo}/git/matching-refs/tags/${encodeURIComponent(prefix + ".")}`;
 	const response = await fetchImpl(url, { headers });
 	if (!response.ok) throw new Error(`GitHub API ${response.status}`);
@@ -166,9 +163,7 @@ export async function resolveGithubMatchingTags(
 async function resolveGithubTagObject(action, objectSha, fetchImpl, env) {
 	const [owner, repo] = action.split("/");
 	const base = env.GITHUB_API_URL || "https://api.github.com";
-	const headers = { Accept: "application/vnd.github+json" };
-	const token = env.GITHUB_TOKEN || env.GH_TOKEN;
-	if (token) headers.Authorization = `Bearer ${token}`;
+	const headers = githubHeaders(env.GITHUB_TOKEN || env.GH_TOKEN);
 	const response = await fetchImpl(
 		`${base.replace(/\/$/, "")}/repos/${owner}/${repo}/git/tags/${objectSha}`,
 		{ headers },

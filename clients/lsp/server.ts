@@ -8,7 +8,7 @@
  */
 
 import { existsSync, mkdirSync, statSync } from "node:fs";
-import { access, readFile, readdir, stat } from "node:fs/promises";
+import { access, readFile, readdir, realpath, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -51,6 +51,7 @@ import {
 	getToolPath,
 } from "../installer/index.js";
 import * as installer from "../installer/index.js";
+import { commandSearchReachesProject } from "../package-manager.js";
 import {
 	classifyProbeFailure,
 	describeInstallAttempt,
@@ -90,6 +91,7 @@ import {
 } from "../cargo-manifest.js";
 import { resolveAstGrepNativeExe } from "./wait-policy/index.js";
 import {
+	findCommandAsync,
 	hasSpawnFailureKind,
 	isCommandAvailableAsync,
 	safeSpawnAsync,
@@ -279,6 +281,9 @@ const PROJECT_BOUNDARY_MARKERS = [
 	"Cargo.toml",
 	"Cargo.lock",
 	"pyproject.toml",
+	"setup.py",
+	"setup.cfg",
+	"requirements.txt",
 	"uv.lock",
 	"poetry.lock",
 	"Pipfile",
@@ -292,6 +297,12 @@ const PROJECT_BOUNDARY_MARKERS = [
 	"pubspec.yaml",
 	"Package.swift",
 ] as const;
+const PYTHON_BOUNDARY_MARKERS = new Set([
+	"setup.py",
+	"setup.cfg",
+	"requirements.txt",
+]);
+const PYTHON_EXTENSIONS = new Set(extensionsForLanguage("python"));
 
 // This is process-global state, so each candidate pair is logged once per
 // process (not once per session). Keep the root-boundary marker below aligned
@@ -407,12 +418,20 @@ export function enforceLspRootCeiling(
 	return resolvedCwd;
 }
 
-export async function hasProjectBoundaryMarker(dir: string): Promise<boolean> {
+export async function hasProjectBoundaryMarker(
+	dir: string,
+	server: Pick<LSPServerInfo, "extensions">,
+): Promise<boolean> {
 	// A nested Git checkout is an independently hosted project even when it has
 	// no language manifest. Keep this directory boundary aligned with the shared
 	// FALLBACK_PROJECT_MARKERS policy used by nearestNonExcludedFallbackRoot.
 	if (await markerExists(dir, ".git")) return true;
 	for (const marker of PROJECT_BOUNDARY_MARKERS) {
+		if (
+			PYTHON_BOUNDARY_MARKERS.has(marker) &&
+			!server.extensions.some((extension) => PYTHON_EXTENSIONS.has(extension))
+		)
+			continue;
 		if (await markerExists(dir, marker)) return true;
 	}
 	return false;
@@ -1028,8 +1047,12 @@ export async function resolveAndLaunch(
 		);
 		trackRuntimeFailure(failure.err);
 	}
+	// #4515: a project-local candidate refused by trust is repairable too: the
+	// managed install lives outside the project, so it needs no trust.
 	const hasOnlyRepairableCandidateFailures = candidateFailures.every(
-		(failure) => hasSpawnFailureKind(failure.err, "tool-not-found"),
+		(failure) =>
+			hasSpawnFailureKind(failure.err, "tool-not-found") ||
+			hasSpawnFailureKind(failure.err, "trust-refused"),
 	);
 	if (!hasOnlyRepairableCandidateFailures) {
 		if (lastRuntimeFailure) throw lastRuntimeFailure;
@@ -1051,8 +1074,26 @@ export async function resolveAndLaunch(
 				globalInstallDisabled: isLspInstallDisabled(),
 			},
 		});
+		// A trust refusal is not tool-not-found: keep surfacing it.
+		if (lastRuntimeFailure) throw lastRuntimeFailure;
 		return undefined;
 	}
+
+	// #4515: after a trust refusal the repair must not run project code. The
+	// installer spawns bare names (its PATH rung, npm and Python probes, the
+	// package manager), so when a refused bare candidate or a PATH entry reaches
+	// the project, only pi-lens's own store is read and nothing is installed.
+	// Step 4 runs a runtime in the project cwd, so it is skipped after any
+	// refusal.
+	const isRefusal = (failure: (typeof candidateFailures)[number]): boolean =>
+		hasSpawnFailureKind(failure.err, "trust-refused");
+	const trustRefused = candidateFailures.some(isRefusal);
+	const storeOnly =
+		trustRefused &&
+		(candidateFailures.some(
+			(failure) => isRefusal(failure) && isSimpleCommand(failure.command),
+		) ||
+			commandSearchReachesProject(spec.cwd));
 
 	// Step 3 — managed install via installer registry
 	if (spec.managedToolId) {
@@ -1069,9 +1110,9 @@ export async function resolveAndLaunch(
 						? failedCandidate.err
 						: undefined,
 				spawnFailure: {
-					kind: hasSpawnFailureKind(failedCandidate?.err, "tool-not-found")
-						? "tool-not-found"
-						: undefined,
+					kind: (["tool-not-found", "trust-refused"] as const).find((kind) =>
+						hasSpawnFailureKind(failedCandidate?.err, kind),
+					),
 				},
 			},
 			{ command: failedCandidate?.command },
@@ -1087,12 +1128,25 @@ export async function resolveAndLaunch(
 			producer: "lsp-launch",
 			evidence: classifiedFailure.evidence,
 		});
+		if (storeOnly) {
+			recordDegradationOnce({
+				kind: "lsp-registry-decision",
+				subject: `store-only-repair:${spec.managedToolId}`,
+				reason:
+					"LSP repair read only the pi-lens tool store: after a trust refusal a bare-name lookup reaches the project, so nothing was probed on PATH or installed",
+				metadata: { field: "store-only-repair", tool: spec.managedToolId },
+			});
+		}
 		logSessionStart(
-			`lsp launch ensure-tool start tool=${spec.managedToolId} cwd=${spec.cwd}`,
+			`lsp launch ensure-tool start tool=${spec.managedToolId} cwd=${spec.cwd} storeOnly=${storeOnly}`,
 		);
 		const installStartedAt = Date.now();
-		const installed = await ensureTool(spec.managedToolId);
-		const installAttempt = captureInstallAttempt(spec.managedToolId);
+		const installed = await (storeOnly
+			? getToolPath(spec.managedToolId, { storeOnly: true })
+			: ensureTool(spec.managedToolId));
+		const installAttempt = storeOnly
+			? undefined
+			: captureInstallAttempt(spec.managedToolId);
 		if (staleLaunch(generation, `${toolLabel}:ensureTool`)) {
 			return undefined;
 		}
@@ -1271,7 +1325,7 @@ export async function resolveAndLaunch(
 	}
 
 	// Step 4 — language-native runtime install (go install, gem install, …)
-	const runtimeInstall = spec.runtimeInstall;
+	const runtimeInstall = trustRefused ? undefined : spec.runtimeInstall;
 	const runtimeAvailable = runtimeInstall
 		? await isOnPath(runtimeInstall.runtimeCommand)
 		: false;
@@ -2079,22 +2133,25 @@ export function _resetClassicTsRepairForTests(): void {
 /**
  * Directories that may hold the TypeScript package next to a resolved `tsc`
  * binary: `<bin>/../typescript` (npm-global layout) and
- * `<bin>/../../typescript` (managed `node_modules/.bin` layout).
+ * `<bin>/../../typescript` (managed `node_modules/.bin` layout), and
+ * `<bin>/node_modules/typescript` (Windows npm-global layout).
  */
 function typescriptDirsForTsc(tscPath: string): string[] {
 	const binDir = path.dirname(tscPath);
 	return [
 		path.join(binDir, "..", "typescript"),
 		path.join(binDir, "..", "..", "typescript"),
+		// Windows npm-global: `<prefix>/tsc.cmd` beside `<prefix>/node_modules`.
+		path.join(binDir, "node_modules", "typescript"),
 	];
 }
 
 /**
  * Read the major version of the TypeScript package that backs a resolved
- * `tsc` binary. Returns undefined when the version is unknowable: `ensureTool`
- * returns the bare string `"tsc"` for a PATH hit, and `path.dirname("tsc")` is
- * `"."`, so the candidates would go cwd-relative. Callers must not repair on
- * an unknown version — a healthy global TypeScript 5.x would be reinstalled
+ * `tsc` binary. Returns undefined when the version is unknowable: a bare
+ * command name (`path.dirname("tsc")` is `"."`, so the candidates would go
+ * cwd-relative) or a tree with no readable manifest. Callers must not repair
+ * on an unknown version — a healthy global TypeScript 5.x would be reinstalled
  * for nothing.
  */
 async function typescriptVersionForTsc(
@@ -2129,6 +2186,29 @@ async function typescriptVersionForTsc(
 		return { version, major };
 	}
 	return undefined;
+}
+
+/** True when a `typescript` package directory sits next to the resolved `tsc`. */
+async function hasTypescriptPackageDir(tscPath: string): Promise<boolean> {
+	for (const dir of typescriptDirsForTsc(tscPath)) {
+		if ((await stat(dir).catch(() => undefined))?.isDirectory()) return true;
+	}
+	return false;
+}
+
+/**
+ * Resolve an `ensureTool` answer to an absolute file. A bare command name (a
+ * PATH hit) is looked up through PATH and its symlinks followed, so an
+ * npm-global `bin/tsc` link lands in the package's own tree; an absolute
+ * answer needs no lookup. The result is absolute or undefined (a bare name that
+ * no longer resolves).
+ */
+async function absoluteCommandPath(
+	command: string | undefined,
+): Promise<string | undefined> {
+	if (!command || path.isAbsolute(command)) return command;
+	const found = await findCommandAsync(command);
+	return found ? realpath(found).catch(() => undefined) : undefined;
 }
 
 /**
@@ -2208,10 +2288,11 @@ async function findTsserverPath(
 	} catch {
 		/* not found */
 	}
+	// `tscPath` comes from `absoluteCommandPath`: absolute, or undefined.
 	const tsserverForTsc = async (
 		tscPath: string | undefined,
 	): Promise<string | undefined> => {
-		if (!tscPath || !path.isAbsolute(tscPath)) return undefined;
+		if (!tscPath) return undefined;
 		for (const dir of typescriptDirsForTsc(tscPath)) {
 			const candidate = path.join(dir, "lib", "tsserver.js");
 			try {
@@ -2227,9 +2308,12 @@ async function findTsserverPath(
 	// Discover the TypeScript install (PATH / npm-global) even when installation
 	// is disabled; only the download is gated by allowInstall.
 	const installAllowed = canInstall(allowInstall);
-	const discoveredTsc = await ensureTool("typescript", {
-		allowInstall: installAllowed,
-	});
+	// #4414: `ensureTool` answers a PATH hit with the bare command name. Resolve
+	// it to the real file once, so the tsserver layout probe and the version
+	// read below see the same absolute path a managed or npm-global hit has.
+	const discoveredTsc = await absoluteCommandPath(
+		await ensureTool("typescript", { allowInstall: installAllowed }),
+	);
 	const discoveredTsserver = await tsserverForTsc(discoveredTsc);
 	if (
 		discoveredTsserver ||
@@ -2240,24 +2324,31 @@ async function findTsserverPath(
 		return discoveredTsserver;
 	}
 
-	// Repair only a compiler we can prove is TypeScript 7+. TypeScript 7 dropped
-	// lib/tsserver.js, so the classic wrapper cannot start against it. Any other
-	// version — or a version we cannot read, such as a bare PATH `tsc` — is left
-	// alone rather than force-reinstalled.
+	// Reinstall only for a compiler we can prove cannot serve the classic
+	// wrapper: TypeScript 7+ (it dropped lib/tsserver.js), or a resolved file
+	// with no TypeScript package next to it at all (a volta, asdf or pnpm
+	// shim, #4414), which is the same as having no compiler. A package whose
+	// version we cannot read is left alone rather than force-reinstalled.
 	const discoveredVersion = await typescriptVersionForTsc(discoveredTsc);
-	if (!discoveredVersion || discoveredVersion.major < 7) return undefined;
+	const shim = !(await hasTypescriptPackageDir(discoveredTsc));
+	if (!shim && (!discoveredVersion || discoveredVersion.major < 7))
+		return undefined;
 
 	// An older managed tree took `latest` before the registry pinned the classic
 	// compiler. Reinstall the pinned version once so that tree self-heals,
 	// without deleting user or project-local TypeScript installations.
 	classicTsRepairState().attempted = true;
 	logSessionStart(
-		`lsp typescript: managed compiler resolved to TypeScript ${discoveredVersion.version}, which ships no tsserver.js; reinstalling pinned classic fallback`,
+		shim
+			? `lsp typescript: ${discoveredTsc} has no TypeScript package beside it; installing pinned classic fallback`
+			: `lsp typescript: managed compiler resolved to TypeScript ${discoveredVersion?.version}, which ships no tsserver.js; reinstalling pinned classic fallback`,
 	);
-	const repairedTsc = await ensureTool("typescript", {
-		allowInstall: true,
-		forceReinstall: true,
-	});
+	const repairedTsc = await absoluteCommandPath(
+		await ensureTool("typescript", {
+			allowInstall: true,
+			forceReinstall: true,
+		}),
+	);
 	return tsserverForTsc(repairedTsc);
 }
 

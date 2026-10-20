@@ -90,6 +90,11 @@ describe("taplo runner", () => {
 
 			expect(result.status).toBe("skipped");
 			expect(safeSpawn).not.toHaveBeenCalled(); // no redundant CLI scan
+			// #4484 round 8 (Q1): the skip names its lane, so the dispatcher
+			// voids it when the toml server does not answer. Without it, a
+			// silent server's cover retired a recorded taplo blocker (the
+			// shellcheck twin is witness row 32, P39).
+			expect(result.coveredBy).toEqual({ runnerId: "lsp", serverId: "toml" });
 		} finally {
 			env.cleanup();
 		}

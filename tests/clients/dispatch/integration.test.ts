@@ -1,7 +1,7 @@
 /**
  * Dispatch Integration Tests
  *
- * Tests dispatchLintWithResult, shouldDispatch, and getAvailableRunners
+ * Tests dispatchLintWithResult and getAvailableRunners
  * with mocked dispatcher to avoid real tool spawning.
  */
 
@@ -13,7 +13,6 @@ import {
 	dispatchLintWithResult,
 	getAvailableRunners,
 	resetDispatchBaselines,
-	shouldDispatch,
 } from "../../../clients/dispatch/integration.js";
 import { normalizeMapKey } from "../../../clients/path-utils.js";
 
@@ -386,39 +385,15 @@ describe("Dispatch Integration", () => {
 		});
 	});
 
-	describe("shouldDispatch", () => {
-		it("returns true for TypeScript files", () => {
-			expect(shouldDispatch("app.ts")).toBe(true);
-			expect(shouldDispatch("app.tsx")).toBe(true);
-		});
-
-		it("returns true for Python files", () => {
-			expect(shouldDispatch("app.py")).toBe(true);
-		});
-
-		it("returns true for Go files", () => {
-			expect(shouldDispatch("main.go")).toBe(true);
-		});
-
-		it("returns false for unknown extensions", () => {
-			expect(shouldDispatch("data.csv")).toBe(false);
-			expect(shouldDispatch("image.png")).toBe(false);
-			expect(shouldDispatch("unknown.xyz")).toBe(false);
-		});
-	});
-
 	describe("getAvailableRunners", () => {
-		it("returns runners for TypeScript files", async () => {
-			const runners = await getAvailableRunners("app.ts");
-			expect(runners.length).toBeGreaterThan(0);
-			expect(runners).toContain("lsp");
-		});
-
-		it("returns runners for Python files", async () => {
-			const runners = await getAvailableRunners("app.py");
-			expect(runners.length).toBeGreaterThan(0);
-			expect(runners).toContain("lsp");
-		});
+		it.each(["app.ts", "app.tsx", "app.py", "main.go"])(
+			"returns runners for %s",
+			async (file) => {
+				const runners = await getAvailableRunners(file);
+				expect(runners.length).toBeGreaterThan(0);
+				expect(runners).toContain("lsp");
+			},
+		);
 
 		// #1545: fish is lspCapable but was absent from the lsp runner's
 		// appliesTo, so every registry-consulting surface reported fish as having
@@ -428,10 +403,12 @@ describe("Dispatch Integration", () => {
 			expect(runners[0]).toBe("lsp");
 		});
 
-		it("returns empty array for unsupported files", async () => {
-			const runners = await getAvailableRunners("data.csv");
-			expect(runners).toEqual([]);
-		});
+		it.each(["data.csv", "image.png", "unknown.xyz"])(
+			"returns empty array for unsupported file %s",
+			async (file) => {
+				expect(await getAvailableRunners(file)).toEqual([]);
+			},
+		);
 	});
 
 	// #2243: importing this module (done at the top of this file) must install

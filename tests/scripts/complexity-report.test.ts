@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+	COMPLEXITY_ANALYZED_FILES_FLOOR,
 	requireAnalyzedFiles,
 	shapeComplexityReport,
 } from "../../scripts/complexity-report.mjs";
@@ -93,9 +94,22 @@ describe("complexity report shaper", () => {
 		);
 	});
 
+	// Recurrence #4518: the report read "no hotspots" over however few files the
+	// client managed to analyse; only an EMPTY run was refused. The floor is the
+	// shared helper's, measured at 521 files (nightly-floors/measurements.json).
 	it("rejects a report with zero analyzed files", () => {
 		expect(() => requireAnalyzedFiles([])).toThrow(
-			"complexity analysis produced zero analyzed files",
+			"complexity analysis evaluated 0, below the floor of 440",
 		);
+	});
+
+	it("rejects a run that analysed only part of the population, and accepts one at the floor", () => {
+		const files = (n: number) => Array.from({ length: n }, () => ({}));
+		expect(() =>
+			requireAnalyzedFiles(files(COMPLEXITY_ANALYZED_FILES_FLOOR - 1)),
+		).toThrow(/below the floor of 440/);
+		expect(() =>
+			requireAnalyzedFiles(files(COMPLEXITY_ANALYZED_FILES_FLOOR)),
+		).not.toThrow();
 	});
 });

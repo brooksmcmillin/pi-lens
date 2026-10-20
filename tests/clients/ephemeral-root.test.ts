@@ -39,8 +39,11 @@ function restore(name: string, value: string | undefined): void {
 	else process.env[name] = value;
 }
 
-function fixtureRoot(label: string): string {
-	return setupTestEnvironment(`${PREFIX}${label}-`).tmpDir;
+function fixtureRoot(
+	label: string,
+	options: { rootMarker?: boolean } = {},
+): string {
+	return setupTestEnvironment(`${PREFIX}${label}-`, options).tmpDir;
 }
 
 /** A real git marker: a `.git` directory holding `HEAD` (what `git init` writes). */
@@ -79,8 +82,9 @@ describe("temporary checkout policy (#1129)", () => {
 		const subdir = path.join(checkout, "packages", "x");
 		fs.mkdirSync(subdir, { recursive: true });
 		const fixture = fixtureRoot("fixture");
+		// #4560: the shared fixture marker already leaves this root with an
+		// EMPTY `.git`, the shape this cell classifies.
 		const emptyGit = fixtureRoot("empty-git");
-		fs.mkdirSync(path.join(emptyGit, ".git"));
 
 		expect(isEphemeralCheckoutRoot(checkout)).toBe(true);
 		expect(isEphemeralCheckoutRoot(subdir)).toBe(true);
@@ -157,7 +161,11 @@ describe("temporary checkout policy (#1129)", () => {
 	// suppressed outright, then re-enabled for session start only through an
 	// `allowEphemeral` option. Decision B: normal in process.
 	it("round-trips a tmp checkout's snapshot in process without writing into the checkout", async () => {
-		const checkout = makeCheckout(fixtureRoot("snapshot"));
+		// #4560: the assertion below is about what the SNAPSHOT writer added to the
+		// checkout, so the shared fixture marker must not be in the directory.
+		const checkout = makeCheckout(
+			fixtureRoot("snapshot", { rootMarker: false }),
+		);
 		const snapshot = {
 			version: 2,
 			projectRoot: checkout,

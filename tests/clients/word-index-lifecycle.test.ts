@@ -32,8 +32,13 @@ import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { handleSessionStart } from "../../clients/runtime-session.js";
 import {
 	buildWordIndex,
+	collectWordIndexDocs,
 	serializeWordIndex,
 } from "../../clients/word-index.js";
+import {
+	_resetWarmWordIndexCacheForTests,
+	acquireWarmWordIndex,
+} from "../../clients/mcp/analyze.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 import { makeLspServiceDouble } from "../support/lsp-service-double.js";
 import { matchingCloseIndex } from "../support/sweep-kit.js";
@@ -217,6 +222,12 @@ describe("word-index lifecycle — full mode (#348)", () => {
 			const runtime = new RuntimeCoordinator();
 			runtime.resetForSession();
 			const dbg = vi.fn();
+			// #4583: a query that lands before this session's build caches "nothing
+			// usable" for the root; the session-start build must hand its index over.
+			_resetWarmWordIndexCacheForTests();
+			const cold = acquireWarmWordIndex(env.tmpDir);
+			expect(cold.index).toBeUndefined();
+			cold.release();
 			// #2471: force the word-index-carrying promotion save to land ~1200ms
 			// after handleSessionStart resolves (the #2142 deferred-save seam,
 			// reused rather than hand-rolled). The old bare `loadProjectSnapshot`
@@ -250,7 +261,19 @@ describe("word-index lifecycle — full mode (#348)", () => {
 				},
 				{ timeout: 5000 },
 			);
+			await vi.waitFor(
+				() => {
+					const warm = acquireWarmWordIndex(env.tmpDir);
+					try {
+						expect(warm.index).toBeDefined();
+					} finally {
+						warm.release();
+					}
+				},
+				{ timeout: 5000 },
+			);
 		} finally {
+			_resetWarmWordIndexCacheForTests();
 			env.cleanup();
 			restore();
 		}
@@ -304,6 +327,73 @@ describe("word-index lifecycle — full mode (#348)", () => {
 			// ghost-only snapshot seeded above.
 			expect(runtime.wordIndex?.docLengths.has("stale/ghost.ts")).toBe(false);
 		} finally {
+			env.cleanup();
+			restore();
+		}
+	}, 15_000);
+
+	// #4583: the reuse path publishes a usable index into the process too, so an
+	// entry cached while this root had none must adopt it here as well.
+	it("an empty warm entry adopts the index the reuse path publishes (#4583)", async () => {
+		const env = setupTestEnvironment("pi-lens-wordindex-full-reuse-adopt-");
+		const restore = setStartupMode("full");
+		try {
+			createTempFile(
+				env.tmpDir,
+				"package.json",
+				JSON.stringify({ type: "module" }),
+			);
+			createTempFile(env.tmpDir, "src/a.ts", "export function helperA() {}");
+			// A query before any index existed cached "nothing usable" for the root.
+			_resetWarmWordIndexCacheForTests();
+			const cold = acquireWarmWordIndex(env.tmpDir);
+			expect(cold.index).toBeUndefined();
+			cold.release();
+			// Another writer publishes an index before this session starts, so the
+			// session takes the incremental reuse path rather than a full rebuild.
+			// Its documents carry the mtime/size metadata that path requires.
+			saveProjectSnapshot(env.tmpDir, {
+				version: PROJECT_SNAPSHOT_VERSION,
+				projectRoot: env.tmpDir,
+				generatedAt: new Date().toISOString(),
+				seq: 0,
+				files: {},
+				symbols: {},
+				reverseDeps: {},
+				cachedExports: [],
+				wordIndex: serializeWordIndex(
+					buildWordIndex(await collectWordIndexDocs(env.tmpDir)),
+				),
+			});
+			const runtime = new RuntimeCoordinator();
+			runtime.resetForSession();
+			const dbg = vi.fn();
+			const globals = globalThis as unknown as {
+				__piLensFirstSessionDone?: boolean;
+			};
+			globals.__piLensFirstSessionDone = true;
+			await handleSessionStart(makeDeps(env.tmpDir, runtime, dbg));
+			// One join for both facts this witness needs: the reuse path ran (a full
+			// rebuild here would pass for the wrong reason — the full-rebuild case
+			// covers that line) and the entry that arrived empty adopted its index.
+			await vi.waitFor(
+				() => {
+					expect(
+						dbg.mock.calls.some(([msg]) =>
+							String(msg).includes("word-index: incremental"),
+						),
+					).toBe(true);
+					const warm = acquireWarmWordIndex(env.tmpDir);
+					try {
+						expect(warm.index).toBeDefined();
+					} finally {
+						warm.release();
+					}
+				},
+				{ timeout: 5000 },
+			);
+		} finally {
+			_resetWarmWordIndexCacheForTests();
 			env.cleanup();
 			restore();
 		}

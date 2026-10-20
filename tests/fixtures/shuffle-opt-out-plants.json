@@ -1,0 +1,270 @@
+{
+	"about": "Permanent plants for tests/support/shuffle-opt-out-scan.ts (#4611 review r1 M2/M3, r2 M-a/M-b, r3 MEDIUM-1). Each entry is a source the gate reads; `accepted` and the four NO-FINDING controls (a harmless string, a type literal, a readable opt-in at a describe, and one bound outside any describe) must be admitted with no finding, every other entry is a spelling of vitest's shuffle suite option that the gate cannot attribute and must red. `expectedReason` is a fragment of the finding's message: without it a branch that reports the same COUNT for the wrong reason (P4 shorthand and P10 accessor were message-only) passes a count-only gate, so deleting a branch that merely rewords a neighbour reds here. The state table this fixture pins is the one in PR #4611 (lane deliverable STATE_TABLE.md; root markdown is gitignored): the reader is an allowlist over parsed object-literal property nodes (oxc-parser), so `harmless-string` and `type-literal` exist to keep the text-census false positive from coming back, `shorthand`, `shorthand-let` and `aliased-*` keep the r2 fail-open closed, and `two-hop-alias*`, `member-alias*`, `spread-before-readable-key` and `readable-opt-in-then-opt-out` keep the r3 one closed: an options object is a SEQUENCE (the effective shuffle value is the last key, no spread and no unnameable key may sit beside it), and a callee resolves through any number of aliases. Data, not a test file: the census scans the tracked tests tree for the option, so a plant written as a .ts file here would red the gate that reads it (and tests/fixtures/** is not collected by vitest either). Keep `expectedFindings` exact: lowering a gate branch without deleting a plant reds the mismatch.",
+	"plants": [
+		{
+			"name": "accepted",
+			"why": "the one admitted opt-out spelling: a literal options object holding only the bare shuffle key, set to false, passed directly to a live describe",
+			"measuredAs": "pass",
+			"expectedFindings": 0,
+			"expectedOptOuts": 1,
+			"source": "import { describe, it } from \"vitest\";\n\ndescribe(\"plant accepted\", { shuffle: false }, () => {\n\tit(\"a\", () => {});\n});\n"
+		},
+		{
+			"name": "harmless-string",
+			"why": "the r1 census read string CONTENTS as code, so an option-shaped string in an unrelated file red the gate (#4611 review r2 M-b, Greptile P2); a string is not a property node",
+			"measuredAs": "pass",
+			"expectedFindings": 0,
+			"expectedOptOuts": 0,
+			"source": "const harmless = \"{ shuffle: false }\";\nexport const harmlessLength = harmless.length;\n"
+		},
+		{
+			"name": "type-literal",
+			"why": "a TypeScript type member named shuffle is not a runtime option and must not red (#4611 review r2 M-b); only object literals carry options",
+			"measuredAs": "pass",
+			"expectedFindings": 0,
+			"expectedOptOuts": 0,
+			"source": "type Options = { shuffle: boolean };\nexport type { Options };\n"
+		},
+		{
+			"name": "literal-true-opt-in",
+			"why": "STATE_TABLE P2: an explicit shuffle OPT-IN is a readable value and the opposite of an exemption, so it needs no registry row and no finding",
+			"measuredAs": "pass",
+			"expectedFindings": 0,
+			"expectedOptOuts": 0,
+			"source": "import { describe } from \"vitest\";\n\ndescribe(\"plant opt-in\", { shuffle: true }, () => {});\n"
+		},
+		{
+			"name": "opt-in-elsewhere",
+			"why": "STATE_TABLE P2/F1: a readable shuffle opt-in needs no registry row even when its object literal is bound outside any describe, so the net must read the value, not only the key",
+			"measuredAs": "pass",
+			"expectedFindings": 0,
+			"expectedOptOuts": 0,
+			"source": "export const SUITE_OPTIONS = { shuffle: true };\n"
+		},
+		{
+			"name": "quoted-key",
+			"why": "a quoted key is honoured by vitest and invisible to a scanner that blanks string contents (#4611 review r1 M2); the property read names it",
+			"measuredAs": "red",
+			"expectedFindings": 1,
+			"expectedOptOuts": 0,
+			"expectedReason": "spelled as a quoted or computed key",
+			"source": "import { describe } from \"vitest\";\n\ndescribe(\"plant quoted\", { \"shuffle\": false }, () => {});\n"
+		},
+		{
+			"name": "computed-key",
+			"why": "a computed key is honoured by vitest and reads as no key at all to a text-only scanner (#4611 review r1 M2)",
+			"measuredAs": "red",
+			"expectedFindings": 1,
+			"expectedOptOuts": 0,
+			"expectedReason": "spelled as a quoted or computed key",
+			"source": "import { describe } from \"vitest\";\n\ndescribe(\"plant computed\", { [\"shuffle\"]: false }, () => {});\n"
+		},
+		{
+			"name": "computed-key-from-variable",
+			"why": "a computed key whose name is a value: no property-position text spells the option, so only a structural read can see it",
+			"measuredAs": "red",
+			"expectedFindings": 1,
+			"expectedOptOuts": 0,
+			"expectedReason": "computed key whose name this reader cannot resolve",
+			"source": "import { describe } from \"vitest\";\n\nconst OPTION = \"shuffle\";\n\ndescribe(\"plant variable key\", { [OPTION]: false }, () => {});\n"
+		},
+		{
+			"name": "unreadable-value",
+			"why": "STATE_TABLE P3: a shuffle value read from a binding is neither a literal true nor false, so whether the suite opts out cannot be attributed",
+			"measuredAs": "red",
+			"expectedFindings": 1,
+			"expectedOptOuts": 0,
+			"expectedReason": "not a literal true/false",
+			"source": "import { describe } from \"vitest\";\n\nconst optedOut = false;\n\ndescribe(\"plant bound value\", { shuffle: optedOut }, () => {});\n"
+		},
+		{
+			"name": "accessor",
+			"why": "STATE_TABLE P10: an accessor named shuffle is not a value this reader can read, so it must refuse rather than pass as an unknown property",
+			"measuredAs": "red",
+			"expectedFindings": 1,
+			"expectedOptOuts": 0,
+			"expectedReason": "its shuffle property is an accessor",
+			"source": "import { describe } from \"vitest\";\n\ndescribe(\"plant accessor\", { get shuffle() {\n\treturn false;\n} }, () => {});\n"
+		},
+		{
+			"name": "shorthand",
+			"why": "STATE_TABLE P4, the r2 fail-open: `{ shuffle }` passes the binding as the value, and a text census that requires a colon sees no key at all (#4611 review r2 M-a)",
+			"measuredAs": "red",
+			"expectedFindings": 1,
+			"expectedOptOuts": 0,
+			"expectedReason": "written as a shorthand",
+			"source": "import { describe } from \"vitest\";\n\nconst shuffle = false;\n\ndescribe(\"plant shorthand\", { shuffle }, () => {});\n"
+		},
+		{
+			"name": "shorthand-let",
+			"why": "STATE_TABLE P4: the fail-open is the property FORM, not the binding kind, so a `let` binding reds exactly like the `const` one (#4611 review r2 M-a)",
+			"measuredAs": "red",
+			"expectedFindings": 1,
+			"expectedOptOuts": 0,
+			"expectedReason": "written as a shorthand",
+			"source": "import { describe } from \"vitest\";\n\nlet shuffle = false;\n\ndescribe(\"plant shorthand let\", { shuffle }, () => {});\n"
+		},
+		{
+			"name": "shorthand-in-test-options",
+			"why": "STATE_TABLE F1: the same shorthand in a test's options object is not attributable to a suite at all, and the net reads it wherever the literal sits (#4611 review r2 M-a)",
+			"measuredAs": "red",
+			"expectedFindings": 1,
+			"expectedOptOuts": 0,
+			"expectedReason": "written as a shorthand",
+			"source": "import { it } from \"vitest\";\n\nconst shuffle = false;\n\nit(\"plant test shorthand\", { shuffle }, () => {});\n"
+		},
+		{
+			"name": "aliased-callee",
+			"why": "STATE_TABLE C3/D2: `const d = describe` rebinds the callee, so a per-file read cannot tie the opt-out to a live registered declaration (#4611 review r2 M-a)",
+			"measuredAs": "red",
+			"expectedFindings": 1,
+			"expectedOptOuts": 0,
+			"expectedReason": "through a callee alias",
+			"source": "const d = describe;\n\nd(\"plant aliased\", { shuffle: false }, () => {});\n"
+		},
+		{
+			"name": "aliased-computed-key",
+			"why": "STATE_TABLE C3/P7: an aliased callee plus a computed key is the second r2 fail-open, and the alias is resolved only far enough to refuse it (#4611 review r2 M-a)",
+			"measuredAs": "red",
+			"expectedFindings": 1,
+			"expectedOptOuts": 0,
+			"expectedReason": "computed key whose name this reader cannot resolve",
+			"source": "const d = describe;\nconst KEY = \"shuffle\";\n\nd(\"plant aliased computed\", { [KEY]: false }, () => {});\n"
+		},
+		{
+			"name": "bound-in-support-module",
+			"why": "an options object bound in a non-test module was never read at all: scanning .test.ts files only left it green (#4611 review r1 M2)",
+			"measuredAs": "red",
+			"expectedFindings": 1,
+			"expectedOptOuts": 0,
+			"expectedReason": "outside any describe options object",
+			"source": "/** A shared suite-options object, as a support module might export one. */\nexport const SUITE_OPTIONS = { shuffle: false };\n"
+		},
+		{
+			"name": "options-imported",
+			"why": "the use site names the options through an identifier, so a per-file read of the describe call sees nothing (#4611 review r1 M2); the refusal is per call",
+			"measuredAs": "red",
+			"expectedFindings": 1,
+			"expectedOptOuts": 0,
+			"expectedReason": "not a plain object literal",
+			"source": "import { describe } from \"vitest\";\nimport { SUITE_OPTIONS } from \"./suite-options.js\";\n\ndescribe(\"plant imported\", SUITE_OPTIONS, () => {});\n"
+		},
+		{
+			"name": "cast-options",
+			"why": "STATE_TABLE B4: `{ shuffle: false } as const` is not a plain options object argument, so the opt-out inside it is unattributable (#4611 review r2 probe 14)",
+			"measuredAs": "red",
+			"expectedFindings": 1,
+			"expectedOptOuts": 0,
+			"expectedReason": "not a plain object literal",
+			"source": "import { describe } from \"vitest\";\n\ndescribe(\"plant cast\", { shuffle: false } as const, () => {});\n"
+		},
+		{
+			"name": "spread-options",
+			"why": "a describe that spreads another object can carry the opt-out from anywhere; neither the spread site nor its source is attributable",
+			"measuredAs": "red",
+			"expectedFindings": 1,
+			"expectedOptOuts": 0,
+			"expectedReason": "spread another object",
+			"source": "import { describe } from \"vitest\";\n\nconst BASE = {};\n\ndescribe(\"plant spread\", { ...BASE }, () => {});\n"
+		},
+		{
+			"name": "spread-beside-opting-out",
+			"why": "STATE_TABLE P8: a spread beside a literal shuffle key makes the effective options object unreadable, so which value wins cannot be attributed",
+			"measuredAs": "red",
+			"expectedFindings": 1,
+			"expectedOptOuts": 0,
+			"expectedReason": "spread another object",
+			"source": "import { describe } from \"vitest\";\n\nconst BASE = {};\n\ndescribe(\"plant spread beside\", { ...BASE, shuffle: false }, () => {});\n"
+		},
+		{
+			"name": "other-options-beside",
+			"why": "STATE_TABLE P9: an opt-out is admitted only as the minimal `{ shuffle: false }` marker, so an exemption never hides inside a larger options object",
+			"measuredAs": "red",
+			"expectedFindings": 1,
+			"expectedOptOuts": 0,
+			"expectedReason": "not the only property",
+			"source": "import { describe } from \"vitest\";\n\ndescribe(\"plant extra options\", { timeout: 5000, shuffle: false }, () => {});\n"
+		},
+		{
+			"name": "unparseable",
+			"why": "STATE_TABLE H1: a file the parser rejects has no readable options object at all, so it must red with the parse error instead of passing as a file with no opt-out",
+			"measuredAs": "red",
+			"expectedFindings": 1,
+			"expectedOptOuts": 0,
+			"expectedReason": "this file does not parse",
+			"source": "import { describe } from \"vitest\";\n\ndescribe(\"plant unparseable\", { shuffle: false }, () => {};\n"
+		},
+		{
+			"name": "wrapped-in-skip",
+			"why": "a registered describe inside a skipped suite keeps its registry row valid while the run includes none of it (#4611 review r1 LOW-4)",
+			"measuredAs": "red",
+			"expectedFindings": 1,
+			"expectedOptOuts": 0,
+			"expectedReason": "vitest never runs it",
+			"source": "import { describe, it } from \"vitest\";\n\ndescribe.skip(\"wrapper\", () => {\n\tdescribe(\"plant wrapped\", { shuffle: false }, () => {\n\t\tit(\"a\", () => {});\n\t});\n});\n"
+		},
+		{
+			"name": "two-hop-alias",
+			"why": "r3 MEDIUM-1 (Greptile P2 r4307007027): the options are bound to a literal whose SPREAD carries a computed shuffle:false, and the callee is a two-hop alias; vitest evaluates the literal to shuffle:false while r2 read `shuffle: true` and stopped",
+			"measuredAs": "red",
+			"expectedFindings": 1,
+			"expectedOptOuts": 0,
+			"expectedReason": "not a plain object literal",
+			"source": "const a = describe;\nconst b = a;\nconst KEY = \"shuffle\";\nconst OPTIONS = { shuffle: true, ...{ [KEY]: false } };\nb(\"hidden\", OPTIONS, () => {});\n"
+		},
+		{
+			"name": "two-hop-alias-inline-literal",
+			"why": "r3 rule 2: the hidden override sits inline behind a two-hop alias, so the options object itself carries a spread the reader must refuse whatever the callee resolves to",
+			"measuredAs": "red",
+			"expectedFindings": 1,
+			"expectedOptOuts": 0,
+			"expectedReason": "spread another object",
+			"source": "const a = describe;\nconst b = a;\nconst KEY = \"shuffle\";\nb(\"hidden\", { shuffle: true, ...{ [KEY]: false } }, () => {});\n"
+		},
+		{
+			"name": "member-alias-inline-literal",
+			"why": "r3 rule 2: a member-expression alias (`const d = V.describe`) is the same defect as an identifier alias, so the binding resolves through the namespace's property name",
+			"measuredAs": "red",
+			"expectedFindings": 1,
+			"expectedOptOuts": 0,
+			"expectedReason": "spread another object",
+			"source": "import * as V from \"vitest\";\nconst KEY = \"shuffle\";\nconst d = V.describe;\nd(\"hidden\", { shuffle: true, ...{ [KEY]: false } }, () => {});\n"
+		},
+		{
+			"name": "spread-before-readable-key",
+			"why": "r3 rule 1, the other order: the readable `shuffle: true` comes AFTER the spread, so a reader that stops at its first readable key still fails open on a callee it does not know",
+			"measuredAs": "red",
+			"expectedFindings": 1,
+			"expectedOptOuts": 0,
+			"expectedReason": "spread another object",
+			"source": "const KEY = \"shuffle\";\nlater(\"hidden\", { ...{ [KEY]: false }, shuffle: true }, () => {});\n"
+		},
+		{
+			"name": "readable-opt-in-then-opt-out",
+			"why": "r3 rule 1, last key wins: the literal sets shuffle twice and the LAST value is false, so the effective value is an opt-out wherever the object is used",
+			"measuredAs": "red",
+			"expectedFindings": 1,
+			"expectedOptOuts": 0,
+			"expectedReason": "outside any describe options object",
+			"source": "export const SUITE_OPTIONS = { shuffle: true, shuffle: false };\n"
+		},
+		{
+			"name": "unresolved-callee-options",
+			"why": "r3 rule 2: the callee is a binding this reader cannot follow to a test callee and the call passes an options object, so the opt-out is unattributable rather than ignored",
+			"measuredAs": "red",
+			"expectedFindings": 1,
+			"expectedOptOuts": 0,
+			"expectedReason": "cannot follow to a test callee",
+			"source": "const s = wrap(describe);\ns(\"hidden\", { shuffle: false }, () => {});\n"
+		},
+		{
+			"name": "unresolved-callee-bound-options",
+			"why": "r3 rule 2, the bound spelling: the options are a name this file binds to an object literal, so the second argument is options-shaped, while the callee binding the reader cannot follow makes the opt-out unattributable",
+			"measuredAs": "red",
+			"expectedFindings": 1,
+			"expectedOptOuts": 0,
+			"expectedReason": "cannot follow to a test callee",
+			"source": "const s = wrap(describe);\nconst OPTIONS = { shuffle: false };\ns(\"hidden\", OPTIONS, () => {});\n"
+		}
+	]
+}

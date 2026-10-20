@@ -89,28 +89,26 @@ function writeShim(name: string, body: string): string {
 
 describe("inconclusive verification keeps its non-verdict (#2722)", () => {
 	// lane: ubuntu (the authoritative Unit tests lane) and every other POSIX dev
-	// box. The LOSS this fixture depends on is POSIX-only: Node's stdout/stderr
-	// are asynchronous over a pipe on Linux and macOS and SYNCHRONOUS over a
-	// pipe on Windows, so a Windows child flushes the tail and the marker DOES
-	// arrive (streamingMatch fires and the probe verifies). That is a property
-	// of the platform's stream semantics, not of the seam, so the Windows lane
-	// covers the same seam through the spawn boundary itself:
+	// box. POSIX asynchronous pipes lose the unflushed tail at process.exit.
+	// Windows pipes write synchronously and may deliver the marker; that lane
+	// covers the classification through the spawn boundary instead:
 	// markdownlint-verify-2045.test.ts's "bounds retained output for noisy
 	// language-server probes" drives a truncated, unmatched safeSpawnAsync
 	// result on every platform.
 	it.skipIf(process.platform === "win32")(
 		"a >2 MiB dump that swallows the transport marker is inconclusive, not broken",
 		async () => {
-			// The child does what intelephense does: one huge write to stderr, then
-			// the transport-required line, then exit. Node's async pipe write queue
-			// is dropped at exit, so the marker never reaches the parent.
+			// Drain a prefix above the cap before reproducing the unflushed huge write.
+			// Otherwise immediate exit can drop even the prefix below the cap on macOS.
 			const dump = path.join(root, "dump.cjs");
 			fs.writeFileSync(
 				dump,
 				[
+					'process.stderr.write("x".repeat(128 * 1024), () => {',
 					'process.stderr.write("x".repeat(2 * 1024 * 1024) + "\\n");',
 					`process.stderr.write(${JSON.stringify(`${TRANSPORT_MARKER}()\n`)});`,
 					"process.exit(1);",
+					"});",
 				].join("\n"),
 				"utf8",
 			);

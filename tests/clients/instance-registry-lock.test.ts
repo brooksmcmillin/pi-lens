@@ -19,13 +19,9 @@ import {
 	withGenerationLockSync,
 } from "../../clients/generation-lock.js";
 import { removeTempDirSync } from "./test-utils.js";
+import { scaledTestTimeout } from "../support/test-timeout-scale.js";
 
 const dirs: string[] = [];
-
-const testTimeoutScale = (() => {
-	const parsed = Number(process.env.PI_LENS_TEST_TIMEOUT_SCALE ?? "1");
-	return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
-})();
 
 afterEach(() => {
 	for (const dir of dirs.splice(0)) removeTempDirSync(dir);
@@ -46,7 +42,7 @@ const generationModuleUrl = pathToFileURL(
 
 function waitForFileSync(file: string): boolean {
 	const pause = new Int32Array(new SharedArrayBuffer(4));
-	const until = Date.now() + 10_000 * testTimeoutScale;
+	const until = Date.now() + scaledTestTimeout(10_000);
 	while (!fs.existsSync(file)) {
 		if (Date.now() > until) return false;
 		Atomics.wait(pause, 0, 0, 5);
@@ -535,7 +531,7 @@ describe("instance registry lock", () => {
 					{
 						encoding: "utf8",
 						cwd: process.cwd(),
-						timeout: 2_000 * testTimeoutScale,
+						timeout: scaledTestTimeout(2_000),
 						windowsHide: true,
 					},
 				).trim();

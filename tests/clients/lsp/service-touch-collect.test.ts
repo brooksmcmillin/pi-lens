@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { hashDiagnosticContent } from "../../../clients/lsp/diagnostic-binding.js";
 
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
@@ -123,7 +124,10 @@ describe("LSPService.touchFile collectDiagnostics", () => {
 			getOperationSupport: () => ({}),
 			getAdvertisedCommands: () => [],
 			getRawCapabilityKeys: () => ["diagnosticProvider"],
-			notify: { open: vi.fn().mockResolvedValue(undefined) },
+			notify: {
+				announceCreated: () => undefined,
+				open: vi.fn().mockResolvedValue(undefined),
+			},
 			waitForDiagnostics: vi.fn().mockResolvedValue(undefined),
 			getDiagnostics: vi.fn(() => []),
 		};
@@ -187,6 +191,7 @@ describe("LSPService.touchFile collectDiagnostics", () => {
 			}),
 			getOperationSupport: () => ({}),
 			notify: {
+				announceCreated: () => undefined,
 				open: vi.fn().mockResolvedValue(undefined),
 			},
 			waitForDiagnostics: vi.fn().mockResolvedValue(undefined),
@@ -226,6 +231,11 @@ describe("LSPService.touchFile collectDiagnostics", () => {
 		const service = new LSPService();
 		const diagnostic = makeDiagnostic("collected error");
 		const attributedDiagnostic = { ...diagnostic, serverId: "python" };
+		// #4532 gap 9: the double answers the touch gate the way a real client
+		// does — with the record of the payloads its own `notify.open` took — and
+		// queues nothing, so no send is ever in flight. Without the record the
+		// gate fails closed and pushes, which is not the seam this case pins.
+		const sent = new Map<string, { hash: string }>();
 		const client = {
 			isAlive: () => true,
 			shutdown: async () => {},
@@ -235,8 +245,13 @@ describe("LSPService.touchFile collectDiagnostics", () => {
 				diagnosticProviderKind: "none",
 			}),
 			getOperationSupport: () => ({}),
+			getSentContent: (filePath: string) => sent.get(filePath),
+			hasNotifyInFlight: () => false,
 			notify: {
-				open: vi.fn().mockResolvedValue(undefined),
+				announceCreated: () => undefined,
+				open: vi.fn(async (filePath: string, content: string) => {
+					sent.set(filePath, { hash: hashDiagnosticContent(content) });
+				}),
 			},
 			waitForDiagnostics: vi.fn().mockResolvedValue(undefined),
 			getDiagnostics: vi.fn(() => [diagnostic]),
@@ -289,7 +304,10 @@ describe("LSPService.touchFile collectDiagnostics", () => {
 				diagnosticProviderKind: "none",
 			}),
 			getOperationSupport: () => ({}),
-			notify: { open: vi.fn().mockResolvedValue(undefined) },
+			notify: {
+				announceCreated: () => undefined,
+				open: vi.fn().mockResolvedValue(undefined),
+			},
 			waitForDiagnostics: vi.fn().mockResolvedValue(undefined),
 			getDiagnostics: vi.fn(() => []),
 		};
@@ -337,7 +355,10 @@ describe("LSPService.touchFile collectDiagnostics", () => {
 				diagnosticProviderKind: "none",
 			}),
 			getOperationSupport: () => ({}),
-			notify: { open: vi.fn().mockResolvedValue(undefined) },
+			notify: {
+				announceCreated: () => undefined,
+				open: vi.fn().mockResolvedValue(undefined),
+			},
 			waitForDiagnostics: vi.fn().mockResolvedValue(undefined),
 			getDiagnostics: vi.fn(() => []),
 		};
@@ -373,7 +394,8 @@ describe("LSPService.touchFile collectDiagnostics", () => {
 
 		// Caller cap 2500, but python's strategy aggregateWaitMs is 1500 — on the
 		// single-server hot path the tighter per-server budget wins so a fast
-		// server isn't held to a flat multi-second wait.
+		// server isn't held to a flat multi-second wait. Also guards #573: the
+		// 'all' scope fix leaves the single-server primary budget unchanged.
 		await service.touchFile(FILE, "print('x')\n", {
 			clientScope: "primary",
 			diagnostics: "document",
@@ -394,7 +416,8 @@ describe("LSPService.touchFile collectDiagnostics", () => {
 		getServersForFileWithConfig.mockReturnValue([makeServer("python")]);
 
 		// No maxDiagnosticsWaitMs/maxClientWaitMs — the python strategy (1500)
-		// applies instead of the 1200 document-mode floor.
+		// applies instead of the 1200 document-mode floor. The exact two-argument
+		// expectation also guards #1639: a real touch carries no pullSettleSource.
 		await service.touchFile(FILE, "print('x')\n", {
 			clientScope: "primary",
 			diagnostics: "document",
@@ -596,27 +619,6 @@ describe("LSPService.touchFile collectDiagnostics", () => {
 		}
 	});
 
-	it("with-auxiliary and single-server primary per-server behavior is unchanged by the 'all' fix (#573 regression guard)", async () => {
-		const { LSPService } = await import("../../../clients/lsp/index.js");
-		const service = new LSPService();
-		const client = makeBudgetClient();
-		createLSPClient.mockResolvedValue(client);
-		getServersForFileWithConfig.mockReturnValue([makeServer("python")]);
-
-		await service.touchFile(FILE, "print('x')\n", {
-			clientScope: "primary",
-			diagnostics: "document",
-			collectDiagnostics: true,
-			maxClientWaitMs: 8000,
-			maxDiagnosticsWaitMs: 2500,
-			source: "dispatch-lsp-runner",
-		});
-
-		// Unchanged from the pre-#573 behavior: primary/single-server still gets
-		// its own strategy budget (1500), capped by the caller ceiling (2500).
-		expect(client.waitForDiagnostics).toHaveBeenCalledWith(FILE, 1500);
-	});
-
 	// #1639: `ensureWarmForSweep`'s readiness probe touches with `source:
 	// "lsp_sweep_warmup"` and runs a real pull round trip that can settle
 	// `lsp_typescript_diagnostic_sequence` independently of the sweep's real
@@ -644,23 +646,6 @@ describe("LSPService.touchFile collectDiagnostics", () => {
 		});
 	});
 
-	it("does NOT tag a real touch's wait with pullSettleSource (#1639 regression guard)", async () => {
-		const { LSPService } = await import("../../../clients/lsp/index.js");
-		const service = new LSPService();
-		const client = makeBudgetClient();
-		createLSPClient.mockResolvedValue(client);
-		getServersForFileWithConfig.mockReturnValue([makeServer("python")]);
-
-		await service.touchFile(FILE, "print('x')\n", {
-			clientScope: "primary",
-			diagnostics: "document",
-			collectDiagnostics: true,
-			source: "dispatch-lsp-runner",
-		});
-
-		expect(client.waitForDiagnostics).toHaveBeenCalledWith(FILE, 1500);
-	});
-
 	it("does not hang when notify.open backpressures — bounded by PI_LENS_LSP_NOTIFY_BUDGET_MS", async () => {
 		const prev = process.env.PI_LENS_LSP_NOTIFY_BUDGET_MS;
 		process.env.PI_LENS_LSP_NOTIFY_BUDGET_MS = "50";
@@ -679,7 +664,10 @@ describe("LSPService.touchFile collectDiagnostics", () => {
 				// notify.open never resolves = a server whose stdin backpressures
 				// (wedged/CPU-bound). Unbounded, this parked the dispatch LSP runner
 				// until its 30s dispatcher timeout. It must now bail at the budget.
-				notify: { open: vi.fn(() => new Promise(() => {})) },
+				notify: {
+					announceCreated: () => undefined,
+					open: vi.fn(() => new Promise(() => {})),
+				},
 				waitForDiagnostics: vi.fn().mockResolvedValue(undefined),
 				getDiagnostics: vi.fn(() => []),
 			};
@@ -721,7 +709,10 @@ describe("LSPService.touchFile collectDiagnostics", () => {
 					diagnosticProviderKind: "none",
 				}),
 				getOperationSupport: () => ({}),
-				notify: { open: vi.fn().mockResolvedValue(undefined) },
+				notify: {
+					announceCreated: () => undefined,
+					open: vi.fn().mockResolvedValue(undefined),
+				},
 				waitForDiagnostics: vi.fn().mockResolvedValue(undefined),
 				getDiagnostics: vi.fn(() => []),
 			};
@@ -772,7 +763,10 @@ describe("LSPService.touchFile collectDiagnostics", () => {
 					diagnosticProviderKind: "none",
 				}),
 				getOperationSupport: () => ({}),
-				notify: { open: vi.fn().mockResolvedValue(undefined) },
+				notify: {
+					announceCreated: () => undefined,
+					open: vi.fn().mockResolvedValue(undefined),
+				},
 				waitForDiagnostics: vi.fn().mockResolvedValue(undefined),
 				getDiagnostics: vi.fn(() => diagnosticsToReturn),
 			};
@@ -843,7 +837,10 @@ describe("LSPService.touchFile collectDiagnostics", () => {
 					diagnosticProviderKind: "none",
 				}),
 				getOperationSupport: () => ({}),
-				notify: { open: vi.fn().mockResolvedValue(undefined) },
+				notify: {
+					announceCreated: () => undefined,
+					open: vi.fn().mockResolvedValue(undefined),
+				},
 				waitForDiagnostics: vi.fn().mockResolvedValue(undefined),
 				getDiagnostics: vi.fn(() => diagnosticsToReturn),
 			};

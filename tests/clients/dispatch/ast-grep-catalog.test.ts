@@ -115,4 +115,37 @@ describe("buildEffectiveAstGrepCatalog (#3053)", () => {
 			origins.indexOf("bundled"),
 		);
 	});
+	it("sees a project rule edited in place at once, while a project rule added later is claimed too", () => {
+		// #4365 batch 1 survivors on `source.origin === "project"` (`false`, `!==`
+		// and the `"project"` literal blanked): a project tree is mutable and the
+		// agent edits it mid-session, so it must be loaded by content
+		// (`loadYamlRulesFresh`), never through the bundled catalog's cadence cache
+		// (`loadYamlRules` re-stats a directory at most once per 2 s). The edit
+		// lands inside that window on purpose.
+		const root = makeProject();
+		roots.push(root);
+		writeRule(root, PRIMARY_RULES, "edited.yml", {
+			id: "project-edited-rule",
+			message: "before",
+		});
+		expect(
+			buildEffectiveAstGrepCatalog(root).effectiveRules.get(
+				"project-edited-rule",
+			)?.rule.message,
+		).toBe("before");
+
+		writeRule(root, PRIMARY_RULES, "edited.yml", {
+			id: "project-edited-rule",
+			message: "after the edit",
+		});
+		writeRule(root, PRIMARY_RULES, "added.yml", { id: "project-added-rule" });
+
+		const catalog = buildEffectiveAstGrepCatalog(root);
+		expect(
+			catalog.effectiveRules.get("project-edited-rule")?.rule.message,
+		).toBe("after the edit");
+		expect(
+			catalog.effectiveRules.get("project-added-rule")?.source.origin,
+		).toBe("project");
+	});
 });

@@ -49,9 +49,12 @@ const EXPECTED_PERMISSIONS: Record<
 	".github/workflows/install-smoke.yml": {
 		workflow: {},
 		jobs: {
+			// #4291: the diff classifier reads the PR's file list.
+			scope: { contents: "read", "pull-requests": "read" },
 			smoke: { contents: "read" },
 			"npm-strict": { contents: "read" },
 			"pi-load": { contents: "read" },
+			"lsp-handshake": { contents: "read" },
 			"mise-repro": { contents: "read" },
 			"host-range-smoke": { contents: "read", actions: "read" },
 			"host-latest-smoke": { contents: "read" },

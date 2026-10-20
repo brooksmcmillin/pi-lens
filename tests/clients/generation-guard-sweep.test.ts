@@ -110,7 +110,8 @@ const HAND_ROLLED_GENERATION_GUARDS: Readonly<Record<string, string>> = {
 		"#3611 r2 F1: recordDroppedRead compares a dropped write's queue-time branch epoch with the epoch its drop's lineage captured, to decide whether the drop is COUNTED as a false block (session-scope-read-dropped). The write itself was already dropped by the handle's own GenerationSource; this compare only chooses between two records, so no write hangs on it. The scope's liveness and branch fences themselves go through createGenerationSource",
 	"review-graph-logger.ts":
 		"copies a persisted graph build generation into log metadata. Nothing is guarded; the value is a field in a record",
-	"lsp/index.ts":
+	// #2372 slice 3: the handoff wait moved with ensureClientForServer.
+	"lsp/client-registry.ts":
 		"the generation handoff compares PROMISE IDENTITY to decide whether the slot it is clearing is still its own. That is the eviction direction, but keyed on object identity rather than a counter, which is what the primitive models; a counter would add state where an identity compare already answers exactly",
 
 	// --- Permanent: migrating would be circular. ---

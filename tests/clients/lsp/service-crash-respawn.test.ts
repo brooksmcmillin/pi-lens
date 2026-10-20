@@ -104,6 +104,7 @@ function makeClient(serverId: string, root: string) {
 		getRawCapabilityKeys: () => [],
 		getLaunchVariant: () => undefined,
 		notify: {
+			announceCreated: () => undefined,
 			open: vi.fn(
 				(
 					filePath: string,

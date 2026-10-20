@@ -54,7 +54,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
 
@@ -79,7 +79,21 @@ jobs:
       - name: Build dist
         run: npm run build:dist
 
+      # #4358: restore the managed tool tree (npm tools and release binaries
+      # under PI_LENS_HOME) keyed on the installer registry's pins plus the ISO
+      # week. A prefix of its own: this job installs the tier-1 subset, and a
+      # shared key would let that subset shadow tool-smoke's full tree. pip
+      # tools (ruff, yamllint, sqlfluff) install outside PI_LENS_HOME and are
+      # not cached.
+      - name: Restore the managed tool tree
+        id: tool_tree
+        uses: ./.github/actions/tool-tree-cache
+        with:
+          mode: restore
+          prefix: parser-smoke-tools
+
       - name: Tier-1 parsers against real binaries
+        id: tier1
         # --min-pass is the floor that keeps a green verdict honest. An
         # unavailable tool reports a warning, never a failure, so without it a
         # run where every install failed would exit 0 having proved nothing.
@@ -88,3 +102,15 @@ jobs:
         run: >-
           node scripts/smoke-tools.mjs --step2 --tier1 --install --verbose
           --min-pass=11
+
+      # Saved once the tier-1 step has run, red or green: it is the only
+      # install-bearing step, so a tree saved after it is complete. Skipped when
+      # an earlier step failed (nothing installed), on an exact hit, and on a
+      # cancel.
+      - name: Save the managed tool tree
+        if: ${{ !cancelled() && steps.tool_tree.outputs.cache-hit != 'true' && steps.tier1.outcome != 'skipped' }}
+        continue-on-error: true
+        uses: ./.github/actions/tool-tree-cache
+        with:
+          mode: save
+          prefix: parser-smoke-tools

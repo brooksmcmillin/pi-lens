@@ -96,6 +96,7 @@ function makeSilentClient(serverId: string, budgets: number[]) {
 		getAllDiagnostics: vi.fn(() => new Map()),
 		getDiagnosticBinding: vi.fn(() => undefined),
 		notify: {
+			announceCreated: () => undefined,
 			open: vi.fn(async () => {}),
 			change: vi.fn(async () => {}),
 			close: vi.fn(async () => {}),

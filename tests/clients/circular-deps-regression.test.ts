@@ -86,12 +86,6 @@ describe("circular dependency regression - diagnostic taxonomy", () => {
 });
 
 describe("circular dependency regression - language policy", () => {
-	it("can import from language-profile.ts without circular errors", async () => {
-		const profileModule = await import("../../clients/language-profile.js");
-		expect(profileModule).toBeDefined();
-		expect(profileModule.getDefaultStartupTools).toBeDefined();
-	});
-
 	it("getDefaultStartupTools respects heavyScansRequireConfig", async () => {
 		const { getDefaultStartupTools } =
 			await import("../../clients/language-profile.js");

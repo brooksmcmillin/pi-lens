@@ -1,0 +1,452 @@
+<!--
+ORCHESTRATOR SUMMARY
+- PR: #4577 (closes #4576); branch refs/heads/sub-mvci9kbu-58. Fix round 3, lane 4576-r3.
+- Head: 30fae36c1 (08f472feb = R2-2 + R2-1 + the generated-path sibling, 30fae36c1 = the two ratchet responses).
+- Round-3 dispositions: R2-2 (MEDIUM, the generated cwd default re-resolved) fixed. R2-1 (LOW, grep operands lost the quoting bit) fixed at both sites. One more site the table exposed (tools/shared.ts's defaulted ast-grep target, identical shape) fixed. R2-3 (a viewer's redirect target credited as a read) left alone: it lives in the redirect-target scanner, which this PR never edits, so it is a separate shape and out of scope.
+- Shape: round 2 split resolution by provenance; round 3 adds the fourth class it missed. A path pi-lens GENERATES ITSELF (an injected default such as the session cwd) gets no resolver stage at all. The round opens with a grep-enumerated table of every resolveHostToolPath / resolveToolCallFilePath / resolveCandidate call site, each labelled host argument / shell operand / recovered identity / internally generated, with the stages it must get: that table is the proof no other site is missing.
+- Red first: sources restored from f25848d99 with the tests kept -> 4 failed | 336 passed (340) across 3 files, exactly the 4 new cases. Green on the head: 439 passed across 4 files.
+- Mutations: 4 rows, all RED, each on its own test only (the pathAlreadyResolved branch, the ast-grep generated-default branch, each threaded literalTilde).
+- Ratchets, both caught by running them and neither loosened: strictness-ratchet found 2 new TS2532 from `segments[i]` under noUncheckedIndexedAccess (now optional chaining, `clients` stays pinned at 427); glossary-synonym-sweep found 2 new `path` uses in tools/shared.ts (re-pinned with a #4577 reason).
+- Gates run: npm run build, pre-push (79 files, 1881 passed, 1 skipped, 0 failed), 38 client governance sweeps (835 passed), agents-governance + shape-history-governance + glossary-synonym-sweep + strictness-ratchet + flake-shape-ratchet (152 passed), read-guard/git-guard/search-read/runtime-tool-call/runtime-tool-result (1379 passed).
+- Environment block, not attributable: tests/scripts/guard-bash-hook.test.ts has 6 reds, all `Command failed: git init -q` refused by the plegma git guard for this lane, and this PR does not touch scripts/hooks/guard-bash.mjs. The same guard blocks red-on-base.mjs here, so no red is claimed RED-ON-BASE. No language server in this lane, so tsc/oxlint reviewed the touched files.
+- Greptile: both round-2 threads answered and resolved (P1 with 08f472feb; P2 shown inaccurate against the body's mutation table and red-first block). All five threads resolved.
+- CI on 30fae36c1, read once: `ci-verdict: exit 3 (pending)`, 25 gating checks / 0 failing, MERGEABLE.
+- Decide: read CI to completion on 30fae36c1; then merge.
+-->
+
+## Why
+
+A `~` path on a tool result, a quoted tilde in bash, and a recovered write's bytes reach the file the shell, the disk, or the tool argument names (closes #4576).
+
+## Notes for the reviewer
+
+- **This round is a split, not a widening.** Round 1 put the bash operand extractor on `resolveHostToolPath`, whose HOST-ARGUMENT stages (`@` strip, unicode-space fold, `file://` conversion) a shell never applies. So `cat @foo.ts` credited `<cwd>/foo.ts`, a file bash never opened, and a later edit of `foo.ts` stopped being a `zero_read` blocker. That guard weakening made round 1 unmergeable.
+- **Shell rules are the shell's, not pi's.** bash expands a tilde only when unquoted and word-initial (`info bash`, Tilde Expansion). The tokenizer drops quotes, so it records which words began with a quoted tilde; the resolver leaves those alone. The redirect-target scanner keeps the raw text, so `> "~/x.ts"` resolves from its own spelling.
+- **A recovered path is an identity (shape 58).** The bash-derived synthetic `write` event carries a path that came from disk, so the handler must not run it through the host resolver. The unicode fold rewrote `a\u202Fb.ts` to `a b.ts` and dispatched a file that does not exist. The recovery caller states the provenance; nothing re-detects it.
+- **M2 folds the five read-safe siblings; the sixth stays out.** `rename_file`'s `newFilePath` is a mutation target, a different risk class (#4578).
+- **A generated path is not a spelling (round 3).** The fourth provenance: a path pi-lens builds itself. Two examples: the cwd `lens_diagnostics` injects for `scope=workspace`, and the ast-grep target defaulted from the session cwd. Nothing typed it, so there is nothing to expand. Running it through the host stages folded its bytes, which failed the whole scan on a directory name holding a no-break space. Both sites state that at the injection point, and the round adds no third mechanism.
+- `~user/x` still does not expand on either seam. pi's `normalizePath` handles only `~` and `~/`, and bash would expand it to another user's home, which is not knowable here. Both stay resolved against the base.
+- The tests this round touched now share `pinTestHome` instead of hand-rolling the `HOME`/`USERPROFILE` save-restore block six times.
+- TLA+ unaffected: read-guard — only which path string an existing read-guard call receives changes, not when a read lands, and no as-built config constant encodes a path spelling.
+- TLA+ unaffected: dispatch-pipeline — only the resolved string handed to the existing dispatch call changes; no timing, lifecycle, or identity state moves.
+- TLA+ unaffected: store-freshness — `lens_diagnostics` resolves its path arguments before the existing cache and freshness reads; no generation, cache key, or freshness state changes.
+- TLA+ unaffected: lsp-rename-edit — only the navigation `path` argument changes; this round leaves `rename_file`'s destination and its willRename/didRename flow alone (#4578).
+
+## Fix round 2
+
+Which of pi's host-argument rules apply at each seam, and why. "Host rules" are the stages of `resolveHostToolPath` (`clients/path-utils.ts:1494`): `~`/`~/` expansion, `@` prefix strip, unicode-space fold, `file://` conversion, plus the variant ladder.
+
+| Seam | `~` | `@` | unicode fold | `file://` | Why |
+|---|---|---|---|---|---|
+| `tool_result` from a real host event | expand | strip | fold | convert | A tool argument the model typed; pi resolves it via `resolveToCwd` + `resolveReadPath` (#4576). |
+| `tool_result` from a synthetic/recovered write | none | none | none | none | The path came FROM disk (`extractWrittenPathsFromCommand` / opaque git recovery), so its bytes are the identity. Folding it names a file nothing wrote (shape 58). |
+| bash operand, unquoted leading `~` | expand | none | none | none | bash expands a bare leading tilde itself; the command really opened `$HOME/x`. |
+| bash operand, quoted or escaped `~` | none | none | none | none | bash leaves a quoted tilde alone, so the command opened `<cwd>/~/x`. |
+| bash operand, no `~` | none | none | none | none | `@x.ts`, `file://x` and `a\u202Fb.ts` are literal file names to a shell. The host stages credited other files. |
+| runner-reported path | expand | none | none | none | A runner reports the spelling it was given; only the tilde needs resolving before the ancestor walk (`clients/dispatch/runner-context.ts:6`). |
+| `lens_diagnostics` `paths` and scalar `path` | expand | strip | fold | convert | Model-typed tool arguments. |
+| the four pi-lens tool handlers (M2) | expand | strip | fold | convert | Model-typed tool arguments; folded this round except `rename_file`'s destination. |
+
+## Fix round 3
+
+Round 2's table named three provenances. It missed a fourth: a path pi-lens **generates itself** (an injected default such as the session cwd). That class must get no resolver stage at all, because nothing typed it and there is nothing to expand. This table is enumerated from `grep` over every call site of the three resolvers, not from memory, and it is the proof that no site is missing its provenance.
+
+```text
+grep -rn "resolveHostToolPath\|resolveToolCallFilePath\|resolveCandidate" --include=*.ts clients tools mcp index.ts
+```
+
+### `resolveHostToolPath` (`clients/path-utils.ts:1494`) — 8 call sites
+
+| Call site | Provenance | Stages it must get | Verdict |
+|---|---|---|---|
+| `clients/path-utils.ts:1643` (`resolveToolCallFilePath` internal) | forwards its own already-classified argument | host stages for the host arm only, by its caller | clean |
+| `clients/runtime-tool-call.ts:189` (`ast_grep_replace` `input.paths`) | host argument | all host stages | clean (round 2) |
+| `clients/runtime-tool-call.ts:705` (`readMutationPathField`) | host argument | all host stages | clean (round 2) |
+| `clients/runtime-tool-call.ts:781` (`getToolCallRawFilePath`) | host argument + variant ladder | all host stages | clean (round 2) |
+| `clients/runtime-tool-result.ts:1834` (`rawFilePath`) | host argument, OR recovered from disk when `_pathAlreadyResolved` | host stages for the host arm; none for the recovered arm | clean (round 2) |
+| `tools/shared.ts:32` (`resolveAstGrepPaths`) | host argument per `paths` entry; **internally generated** (the session cwd) when `paths` is omitted | host stages for the entries; **none** for the default | **R2-2 sibling — fixed this round** |
+| `tools/lsp-navigation.ts:1327` (navigation `path`) | host argument | all host stages | clean (round 2) |
+| `tools/lsp-diagnostics.ts:622` (scalar `path`) | host argument, **except** the internally generated cwd `lens_diagnostics` injects | host stages for the model arm; **none** for the injected default | **R2-2 — fixed this round** |
+| `tools/lsp-diagnostics.ts:2473` (batch `paths` entries) | host argument | all host stages | clean (round 2) |
+| `tools/lens-diagnostics.ts:1461` (`paths` scope entries) | host argument | all host stages | clean (round 2) |
+| `tools/module-report.ts:33` (`resolveFile`, 3 callers) | host argument | all host stages | clean (round 2) |
+| `tools/lens-diagnostic-mark.ts:332` (`path`) | host argument | all host stages | clean (round 2) |
+
+### `resolveCandidate` (`clients/bash-file-access.ts:354`) — 5 call sites
+
+Every one is a **shell operand**, so every one must get the segment's quoting bit.
+
+| Call site | Provenance | Stages it must get | Verdict |
+|---|---|---|---|
+| `clients/bash-file-access.ts:503` (`extractReadPathsFromCommand`) | shell operand | shell rules + `literalTilde` | clean (round 2) |
+| `clients/bash-file-access.ts:711` (`extractGrepSearchFiles`) | shell operand | shell rules + `literalTilde` | **R2-1 — fixed this round** |
+| `clients/bash-file-access.ts:734` (`parseGrepLineWithFile`) | shell operand | shell rules + `literalTilde` | **R2-1 — fixed this round** |
+| `clients/bash-file-access.ts:981` (`extractWrittenPathsFromCommand`) | shell operand | shell rules + `literalTilde` | clean (round 2) |
+| `clients/bash-file-access.ts:1162` (`extractDeletedPathsFromCommand`) | shell operand | shell rules + `literalTilde` | clean (round 2) |
+
+Table reading: two internally generated sites were being resolved as if a model had typed them, and two shell-operand sites were missing the quoting bit. Both classes are fixed here, each with its own red-first case. Everything else already matches its provenance.
+
+## Change outline
+
+```text
+- clients/bash-file-access.ts tokenizeShellCommand
+  + literalTilde?: ReadonlySet<string> on ShellCommandSegment   (:71)
+  + appendChar/wordFirstCharQuoted: a word's first char can be quoted (:206)
+- clients/bash-file-access.ts resolveCandidate                   (:354)
+  - resolveHostToolPath(cleaned, cwd)               [host-argument stages]
+  + shell rules: bare `~` expands, quoted/escaped `~` is literal, else literal path
+- clients/runtime-tool-result.ts handleToolResult
+  + _pathAlreadyResolved dep                                      (:515)
+  + filePath = rawFilePath when the caller states provenance       (:1831)
+  + synthetic write event passes _pathAlreadyResolved: true        (:2179)
+- tools/module-report.ts resolveFile -> resolveHostToolPath        (:33)
+- tools/lens-diagnostic-mark.ts absPath -> resolveHostToolPath      (:332)
+- tools/lsp-diagnostics.ts scalar path (:611), batch paths (:2461)
+- tools/lsp-navigation.ts navigation path -> resolveHostToolPath   (:1327)
+- clients/runtime-tool-call.ts: one ./path-utils.js import (Sonar S3863)
+```
+
+Round 3 (the fourth provenance class, plus the two shell sites):
+
+```text
+- tools/lens-diagnostics.ts injected workspace default
+  + lspParams.pathAlreadyResolved = true beside lspParams.path = cwd  (:616)
+- tools/lsp-diagnostics.ts scalar path
+  + skip resolveHostToolPath when pathAlreadyResolved is set          (:620)
+- tools/shared.ts resolveAstGrepPaths
+  - resolveHostToolPath(base, base) for the defaulted target
+  + path.resolve(base), no resolver stage                            (:31)
+- clients/bash-file-access.ts collectGrepCommandFiles
+  + literalTilde: ReadonlySet<string> on the return value             (:839)
+  + extractGrepSearchFiles(args, cwd, segments[i]?.literalTilde)      (:876)
+  + parseGrepOutputSearchReads(..., literalTilde) -> parseGrepLineWithFile
+```
+
+The shell resolver (`clients/bash-file-access.ts:354`):
+
+```ts
+function resolveCandidate(
+	token: string,
+	cwd: string,
+	literalTilde?: ReadonlySet<string>,
+): string | null {
+	const cleaned = stripQuotes(token);
+	if (!cleaned || cleaned.startsWith("-") || !isReadableSourceFile(cleaned)) {
+		return null;
+	}
+```
+
+The recovered-path branch (`clients/runtime-tool-result.ts:1831`):
+
+```ts
+	const filePath =
+		rawFilePath && deps._pathAlreadyResolved
+			? rawFilePath
+			: resolveToolCallFilePath(rawFilePath, resolutionBasis, workspaceRoot)
+					?.path;
+```
+
+## Summary
+
+Round 1 gave `tool_result` the same resolver as `tool_call`, fixing the reported phantom path. It also applied that resolver's HOST-ARGUMENT stages to two inputs they do not describe: a shell operand and an identity read back from disk. This round splits the seam by provenance.
+
+Bash operands follow shell rules again, quoting included. bash expands a tilde only when unquoted and word-initial, so the tokenizer records which words began with a quoted or escaped tilde. The resolver expands only a bare one. Everything else in a shell word is literal: `@x.ts` is a file name, not a mention; a no-break space is that byte; `file://x` is not a URL. Each of those credited a read of a file the command never opened.
+
+A recovered write keeps its bytes. The synthetic `write` event carries a path the extractor or git recovery read from disk. Re-running it through the host resolver folded a unicode space, dispatching `<root>/src/a b.ts` for a write that landed at `<root>/src/a\u202Fb.ts`.
+
+The five read-safe tool-argument sites fold onto `resolveHostToolPath` (M2), and `lsp_navigation`'s `rename_file` destination stays out as #4578 because it names a mutation target.
+
+Round 3 closes the two seams the split left unresolved. A path pi-lens generates itself now gets no resolver stage. `lens_diagnostics`' injected `scope=workspace` cwd and ast-grep's defaulted target both state that provenance where they build the value. A cwd holding a no-break space now scans instead of failing with `Path not found`. The two grep operand extractors also take the segment's quoting bit, like the other three `resolveCandidate` callers. So `grep -n bad '~/proj/x.ts'` credits the file bash actually opened, not the `$HOME` one.
+
+Closes #4576: every acceptance criterion still holds, and the two seams now agree on the three tilde spellings without either applying the other's rules.
+
+## Type of change
+
+- [x] Bug fix
+- [ ] New feature (net-new capability)
+- [ ] Enhancement (improvement to existing capability)
+- [ ] Documentation
+
+## Area
+
+- [ ] area:lsp
+- [x] area:dispatch
+- [ ] area:installer
+- [x] area:diagnostics
+- [ ] area:read-guard
+- [ ] area:project-intelligence
+- [ ] area:perf
+- [ ] area:observability
+- [ ] area:session
+- [ ] area:config
+- [ ] area:security
+- [x] area:tests
+
+## Checklist
+
+- [x] I have read [CONTRIBUTING.md](../CONTRIBUTING.md) and [AGENTS.md](../AGENTS.md)
+- [x] The change has tests (happy path, edge cases, regression test for bugs)
+- [x] Targeted test files for the touched seams pass locally after `npm run build`; the full suite is CI's job.
+- [x] Every NEW regression test is proven RED on pre-fix code; the red output is quoted in this PR
+- [x] New guards/branches/filters/caps/fallbacks have compile-valid hand-mutation proof (AGENTS.md, one PR mutation layer)
+- [x] PR title carries the conventional prefix and the issue ref
+- [x] `npm run lint` passes
+- [x] `npm run build:dist` succeeds if I changed code under `clients/`, `commands/`, `tools/`, or `index.ts`
+- [x] `package-lock.json` is in sync with `package.json` (no dependency change)
+- [ ] `AGENTS.md` is updated if this PR changes behavior, commands, conventions, or invariants documented there (not updated: the proposed shape is held for the maintainer's decision)
+- [x] `.changelog/4576-tool-result-tilde-path.md` has one valid entry **in this PR** for any user-facing change
+- [x] Commit subject includes the issue number: `(closes #4576)`
+
+## Tests
+
+Round-2 cases, all RED on the reviewed head `59c3b718d` (transcript below) and green on the head:
+
+| Test | File | Pins |
+|---|---|---|
+| `keeps a %s ~ operand literal under the cwd (#4577)` (`single-quoted`, `double-quoted`) | `tests/clients/bash-file-access.test.ts:688` | A quoted tilde is literal to bash, so the read is credited to `<cwd>/~/…`, never to the home file the command did not open. |
+| `keeps a quoted redirect target's ~ literal under the cwd (#4577)` | `tests/clients/bash-file-access.test.ts:706` | The redirect-target scanner keeps raw text, so `> '~/n.ts'` resolves from its own quoted spelling. |
+| `reads the literal @-prefixed and unicode-spaced file names the shell opened (#4577)` | `tests/clients/bash-file-access.test.ts:727` | `@config.ts` and `a\u202Fb.ts` are the files a shell opens; no `@` strip and no unicode fold apply. |
+| `dispatches a recovered write's byte-exact path, never the folded spelling` | `tests/clients/runtime-tool-result.test.ts:6023` | A bash-derived write keeps its byte-exact recovered path through the synthetic event (Greptile P1). |
+| `leaves a ~user path resolved against the base, as the tool_call seam does` | `tests/clients/runtime-tool-result.test.ts:5969` | Drives `handleToolResult` and asserts the dispatched path; an agreement witness, not a changed behaviour. |
+| `pins ~ resolving to the home directory itself` | `tests/clients/runtime-tool-result.test.ts:6001` | Labelled PIN: a bare `~` is a directory, so no mutation result can target it and the handler has no effect to observe. |
+| `resolves a ~ path to $HOME, not under the cwd` | `tests/tools/module-report.test.ts:568` | `module_report`'s `path` reaches the home file (available, line count, symbol, display path). |
+| `resolves a ~ path to $HOME, not under the cwd` | `tests/tools/lens-diagnostic-mark.test.ts:521` | `lens_diagnostic_mark` writes its ignore comment into the home file. |
+| `resolves a ~ path to $HOME, not under the cwd` | `tests/tools/lsp-navigation.test.ts:1876` | `lsp_navigation` asks the server about the expanded file. |
+| `resolves a ~ path to $HOME, not under the session cwd` | `tests/tools/lens-diagnostics.test.ts:5857` | The scalar `path` route reads the expanded file from the server. |
+| `resolves a ~ entry of the batch paths argument to $HOME` | `tests/tools/lens-diagnostics.test.ts:5893` | The batch `paths` route (`expandPathsToFiles`) resolves the entry before the per-file collector. |
+
+Round 1's cases stay: the end-to-end `~/…` dispatch case, the bash bare-`~` case, `resolveRunnerPath`, and `resolvePathsScope`'s `mode=full` case.
+
+### Round-3 cases
+
+| Test | File | Pins |
+|---|---|---|
+| `scans a cwd holding a host-unicode space instead of a folded sibling` | `tests/tools/lens-diagnostics.test.ts:5819` | `lens_diagnostics({source:"lsp", scope:"workspace"})` scans the real cwd (R2-2). Asserts `isError` falsy and the file `getDiagnostics` received. |
+| `passes the session cwd byte-exact when no paths are given (#4577 R2-2)` | `tests/tools/ast-grep-search.test.ts:100` | The defaulted ast-grep target is the cwd unchanged; asserts the argument the child receives. |
+| `credits a quoted ~ operand to the literal file, not the home file (#4577 R2-1)` | `tests/clients/bash-file-access.test.ts:480` | Single-operand grep credits `<cwd>/~/proj/x.ts`, not the `$HOME` file (covers `extractGrepSearchFiles`). |
+| `credits a multi-file hit's quoted ~ operand to the literal file (#4577 R2-1)` | `tests/clients/bash-file-access.test.ts:502` | Multi-file grep credits the literal operand from grep's own output (covers `parseGrepLineWithFile`). |
+
+### Red first (source restored from `59c3b718d`, tests kept)
+
+```text
+FAIL  tests/clients/bash-file-access.test.ts > extractWrittenPathsFromCommand — bash writes > keeps a single-quoted ~ operand literal under the cwd (#4577)
+FAIL  tests/clients/bash-file-access.test.ts > extractWrittenPathsFromCommand — bash writes > keeps a double-quoted ~ operand literal under the cwd (#4577)
+FAIL  tests/clients/bash-file-access.test.ts > extractWrittenPathsFromCommand — bash writes > keeps a quoted redirect target's ~ literal under the cwd (#4577)
+FAIL  tests/clients/bash-file-access.test.ts > extractWrittenPathsFromCommand — bash writes > reads the literal @-prefixed and unicode-spaced file names the shell opened (#4577)
+FAIL  tests/clients/runtime-tool-result.test.ts > host tool path resolution on the tool_result side (#4576) > dispatches a recovered write's byte-exact path, never the folded spelling
+FAIL  tests/tools/lens-diagnostic-mark.test.ts > lens_diagnostic_mark path resolution (#4577 M2) > resolves a ~ path to $HOME, not under the cwd
+FAIL  tests/tools/lsp-navigation.test.ts > lsp_navigation path resolution (#4577 M2) > resolves a ~ path to $HOME, not under the cwd
+Expected: "…/pi-lens-nav-tilde-zBkElr/home/proj/refs.ts"
+Received: "…/pi-lens-nav-tilde-zBkElr/home/proj/~/proj/refs.ts"
+FAIL  tests/tools/module-report.test.ts > module_report path resolution (#4577 M2) > resolves a ~ path to $HOME, not under the cwd
+ Test Files  5 failed (5)
+      Tests  8 failed | 285 passed (293)
+```
+
+`tools/lsp-diagnostics.ts` restored on its own, tests kept:
+
+```text
+FAIL  tests/tools/lens-diagnostics.test.ts > lens_diagnostics scalar path resolution (#4577 M2) > resolves a ~ path to $HOME, not under the session cwd
+AssertionError: expected true to be falsy
+FAIL  tests/tools/lens-diagnostics.test.ts > lens_diagnostics scalar path resolution (#4577 M2) > resolves a ~ entry of the batch paths argument to $HOME
+AssertionError: expected [] to include '…/home/proj/tilde.ts'
+      Tests  2 failed | 162 passed (164)
+```
+
+Restored and rebuilt: `Test Files 7 passed (7) / Tests 460 passed (460)`.
+
+### Red first, round 3 (sources restored from `f25848d99`, tests kept)
+
+```text
+FAIL  tests/clients/bash-file-access.test.ts > extractGrepSearchReadsFromOutput > credits a quoted ~ operand to the literal file, not the home file (#4577 R2-1)
+AssertionError: expected [ Array(1) ] to deeply equal [ Array(1) ]
+
+- Expected
++ Received
+
+  [
+-   "…/pi-lens-bfa-2RbpWL/~/proj/x.ts",
++   "…/pi-lens-bfa-2RbpWL/home/proj/x.ts",
+  ]
+
+FAIL  tests/clients/bash-file-access.test.ts > extractGrepSearchReadsFromOutput > credits a multi-file hit's quoted ~ operand to the literal file (#4577 R2-1)
+AssertionError: expected [ Array(1) ] to deeply equal [ Array(1) ]
+FAIL  tests/tools/ast-grep-search.test.ts > ast_grep_search tool > relative paths resolve against ctx.cwd (#4233 V3-HIGH-01) > passes the session cwd byte-exact when no paths are given (#4577 R2-2)
+AssertionError: expected "vi.fn()" to be called with arguments: [ 'foo($X)', 'typescript', …(2) ]
+FAIL  tests/tools/lens-diagnostics.test.ts > lens_diagnostics injected workspace default (#4577 R2-2) > scans a cwd holding a host-unicode space instead of a folded sibling
+AssertionError: expected true to be falsy
+
+- Expected
++ Received
+
+- false
++ true
+
+ Test Files  3 failed (3)
+      Tests  4 failed | 336 passed (340)
+```
+
+Round 3 pre-fix probe through the real tool object (`tools/lens-diagnostics.js`, a `getDiagnostics` double, cwd = `<lane tmp>/probe-ws/proj\u00A0x`):
+
+```text
+cwd      : "…/probe-ws/proj\u00A0x"
+isError  : true
+text     : "Path not found: …/probe-ws/proj x"
+folded   : "…/probe-ws/proj x" exists: false
+```
+
+Same probe on the head:
+
+```text
+isError  : false
+text     : "Directory: …/probe-ws/proj\u00A0x\nFiles scanned: 1\nNo diagnostics found."
+```
+
+### Mutation table
+
+`scripts/mutate.mjs --built`, each reverted by the tool; every row reds only the test that covers it.
+
+| File | Mutation (new → pre-fix) | Verdict | Red |
+|---|---|---|---|
+| `clients/bash-file-access.js` | `wordFirstCharQuoted && word.startsWith` → `false && word.startsWith` (drops the quoted-tilde bit) | RED | `× keeps a single-quoted ~ operand literal…`, `× keeps a double-quoted ~ operand literal…` |
+| `clients/bash-file-access.js` | `: cleaned;` → the host-argument stages (`normalizeUnicodeSpaces` + `stripAtPrefix`) | RED | the two quoted-`~` cases, `× keeps a quoted redirect target's ~ literal…`, `× reads the literal @-prefixed and unicode-spaced file names…` |
+| `clients/bash-file-access.js` | `? normalizeHostToolPath(cleaned)` → `? cleaned` (no expansion) | RED | `× expands a bare ~ operand to $HOME…` |
+| `clients/runtime-tool-result.js` | `rawFilePath && deps._pathAlreadyResolved` → `false && deps._pathAlreadyResolved` | RED | `× dispatches a recovered write's byte-exact path…` |
+| `tools/module-report.js` | `resolveHostToolPath(filePath, cwd` → `path.resolve(cwd \|\| process.cwd(), filePath` | RED | `× resolves a ~ path to $HOME, not under the cwd` (module-report) |
+| `tools/lens-diagnostic-mark.js` | `resolveHostToolPath(filePathArg, cwd` → `path.resolve(cwd, filePathArg \|\| process.cwd()` | RED | `× resolves a ~ path to $HOME, not under the cwd` (lens_diagnostic_mark) |
+| `tools/lsp-navigation.js` | `resolveHostToolPath(rawPath, ctx.cwd` → `path.resolve(ctx.cwd \|\| process.cwd(), rawPath` | RED | `× resolves a ~ path to $HOME, not under the cwd` (lsp_navigation) |
+| `tools/lsp-diagnostics.js` | scalar: `normalizeMapKey(resolveHostToolPath(rawPath, cwd))` → `normalizeMapKey(path.resolve(cwd, rawPath))` | RED | `× resolves a ~ path to $HOME, not under the session cwd` |
+| `tools/lsp-diagnostics.js` | batch: `normalizeMapKey(resolveHostToolPath(entry, cwd))` → `normalizeMapKey(path.resolve(cwd, entry))` | RED (after the second commit's witness; first run SURVIVED) | `× resolves a ~ entry of the batch paths argument to $HOME` |
+
+Spot-check of a round-1 row on this head: `clients/dispatch/runner-context.js` `filePath = normalizeHostToolPath(filePath)` → `filePath = filePath` reds `× expands a ~ file to $HOME instead of pinning it under the cwd` only.
+
+### Mutation table, round 3
+
+`scripts/mutate.mjs --built`, each restored by the tool; every row reds only the test that covers it.
+
+| File | Mutation (head → broken) | Verdict | Red |
+|---|---|---|---|
+| `tools/lsp-diagnostics.js` | `typedParams.pathAlreadyResolved === true` → `false` (always re-resolve the injected default) | RED | `× scans a cwd holding a host-unicode space instead of a folded sibling` — `Tests 1 failed \| 164 passed (165)` |
+| `tools/shared.js` | `return [path.resolve(base)];` → `return [resolveHostToolPath(base, base)];` (resolve the generated default) | RED | `× passes the session cwd byte-exact when no paths are given (#4577 R2-2)` — `Tests 1 failed \| 52 passed (53)` |
+| `clients/bash-file-access.js` | `extractGrepSearchFiles(args, cwd, segments[i].literalTilde)` → `extractGrepSearchFiles(args, cwd)` (drop the bit at that caller) | RED | `× credits a quoted ~ operand to the literal file, not the home file (#4577 R2-1)` — `Tests 1 failed \| 121 passed (122)` |
+| `clients/bash-file-access.js` | `resolveCandidate(match[1], cwd, literalTilde)` → `resolveCandidate(match[1], cwd)` (drop the bit at the multi-file site) | RED | `× credits a multi-file hit's quoted ~ operand to the literal file (#4577 R2-1)` — `Tests 1 failed \| 121 passed (122)` |
+
+## Blast radius
+
+`module_report` with `blastRadius: true` on the touched modules:
+
+- `clients/bash-file-access.ts` — `resolveCandidate` underlies both operand extractors, so every bash write/read/deletion in `runtime-tool-call.ts` and `runtime-tool-result.ts` flows through it. Plain relative and absolute operands resolve byte-identically to the reviewed head. A bare `~` expands as round 1 made it. A quoted `~`, an `@` name, a `file://` spelling and a no-break space now resolve to the literal file (the round-1 behaviour was the bug). `ShellCommandSegment` gains one optional field; `git-guard.ts`'s token consumers read `tokens` only and are unaffected (its suite passes).
+- `clients/runtime-tool-result.ts` — one branch in `handleToolResult` plus one dep field, set only by the bash-recovery loop. Every other `tool_result` (host write/edit/read, MCP routes) keeps the round-1 resolver path.
+- `tools/module-report.ts`, `tools/lens-diagnostic-mark.ts`, `tools/lsp-navigation.ts`, `tools/lsp-diagnostics.ts` — one expression each; the surrounding tool flow, guards, and stores are untouched.
+- `clients/path-utils.ts` is unchanged this round: no new resolver, no new stage.
+
+Hot-path cost: the shell resolver now does a `startsWith` test and a Set lookup per operand. It replaces one call into `resolveHostToolPath`, which itself did a regex replace, an `@` test, a homedir read and `path.resolve`. No new filesystem probe or directory walk; the `tool_result` variant ladder is unchanged for host events and skipped for recovered writes.
+
+Round 3 adds no per-path work on any hot path: the injected-default branch is one boolean read, the ast-grep default is one `path.resolve` instead of a resolver call (strictly less work), and the grep union is a Set add per contributing grep segment — a command with one grep adds one entry. `tools/shared.ts` moves from `resolveHostToolPath(base, base)` to `path.resolve(base)` for the no-`paths` case, which drops a regex replace, an `@` test and a homedir read from that call.
+
+## Observability
+
+No new failure path; no record added.
+
+The recovered-write branch and the shell-rule branch both only change which already-resolved string the existing callers receive. The existing `path_attribution_missing` / `path_attribution_refused` / `tool-result-outside-project-root` / `tool-result-adopted-project` records still describe every path decision they described before, and `clients/runtime-tool-result.ts:1831` feeds them the same way.
+
+Observation for round 3: the R2-2 defect is a regression this PR introduced, and it fails loudly rather than producing a wrong-file result. Master's `path.resolve(cwd, rawPath)` was a no-op on an already-absolute cwd; `resolveHostToolPath` folds it. No record was added or removed by the fix — the failing scan's existing error path simply stops firing.
+
+The table also found one site of the same shape that this PR does not touch, `tools/shared.ts`'s defaulted ast-grep target, which failed loudly too (the child exits 1 with `No such file or directory`): nothing was silently mis-credited anywhere in this class. Both statements are measured against the base:
+
+```text
+$ git diff origin/master...HEAD --stat -- tools/shared.ts
+(no output — this PR never edits tools/shared.ts, so its pre-fix resolver behaviour is origin/master's)
+
+$ git diff origin/master...HEAD -- clients/bash-file-access.ts | grep -E '^[+-].*extractRedirectTargets'
+(no output — the redirect-target scanner and the verb association are untouched by this PR)
+```
+
+Retrospective: round 1 fixed a real defect by making two seams share one resolver, then applied that resolver to two inputs it does not describe. Both additions looked like consistency work and both had a green test, because the test asserted the shared resolver's output rather than the file the command touched. The layer that would have caught it is a provenance test: for each seam, assert the EFFECT (what was read, what was dispatched) on the input class that seam actually receives. Round 2 adds it. Cost: one review round, and a guard weakening (a wrong-file read credit) that shipped green.
+
+Round 3's retrospective: the round-2 split was still incomplete, and the verify found it on the seam the PR exists for. Two causes. First, the split named the provenances the fix was *about* — host argument, shell operand, recovered identity — and not the ones the code contains; a fourth, **pi-lens-generated** path (an injected default) was being resolved as if a model had typed it, which is the same error the round existed to fix, one class over. Second, two of the five `resolveCandidate` callers were never given the round's new parameter, because the round threaded it at the call sites it happened to open rather than at every call site of the function it changed. The layer that catches both is a call-site census enumerated from `grep` over the resolver's own definitions, with a provenance and a required-stage column per row — which is the table at the top of this section, written before the round's first edit. Cost: one fix round; no new mechanism, and both defects were in the class this PR claims to own.
+
+## Detection
+
+Caught by: reviewer probe
+
+Should have been caught by: CI unit
+
+Gap: none: round 1's suite pinned the folded resolver's output, so it agreed with the defect; only a probe comparing the credited path with the file the shell or the disk names can see the split
+
+Shape: new: split host-path resolution by provenance (host argument vs shell operand vs recovered identity)
+
+Enforcer: none: judgment-only, the Class sweep below enumerates the population by grep and no census of resolvers by provenance exists
+
+Retrospective: round 1 fixed a real defect by making two seams share one resolver, then applied that resolver to two inputs it does not describe. Both additions looked like consistency work and both had a green test, because the test asserted the shared resolver's output rather than the file the command touched. The layer that would have caught it is a provenance test: for each seam, assert the EFFECT (what was read, what was dispatched) on the input class that seam actually receives. This round adds it. Cost: one review round, and a guard weakening (a wrong-file read credit) that shipped green.
+
+## Proposed contract change (maintainer decision)
+
+**Approved 2026-10-17.** Shape 74 and the paths bullet land in the docs PR #4579, not in this PR. This PR does not edit `AGENTS.md`.
+
+Not applied in this PR. If accepted, add a catalog shape and a paths bullet:
+
+- Shape: **Split host-path resolution by provenance.** A path resolves according to where its spelling came from. A path a host tool was given (a `tool_call`/`tool_result` argument, a pi-lens tool's own path argument) goes through `resolveHostToolPath` / `resolveToolCallFilePath`. A shell operand follows shell rules: a bare leading `~` expands, a quoted or escaped one is literal, and no `@` strip, unicode fold, or `file://` conversion applies. A path read back from disk is an identity and is never re-resolved (#4576, #4577).
+- Paths bullet: two seams may share a resolver only when both receive the same kind of spelling; state the provenance at the call site when it is not a host argument.
+
+Adding the shape also needs a `HISTORY.md` entry and an AGENTS reference-budget slot.
+
+## Class sweep
+
+Defect shape: new — split host-path resolution by provenance. A path's spelling type decides which resolver it may see. The host-argument stages applied to a shell word credit a file the shell never opened; applied to a path read from disk, they rewrite its bytes.
+
+Population grep (production tree):
+
+```text
+grep -rnE "resolveHostToolPath\(|normalizeHostToolPath\(|resolveHostToolFilePath\(" --include=*.ts clients tools mcp index.ts
+grep -rnE "path\.(resolve|isAbsolute)\(" --include=*.ts tools mcp clients/lens-engine.ts clients/bash-file-access.ts
+grep -rn "resolveHostPathVariants(" --include=*.ts clients tools
+```
+
+Members and disposition for this round:
+
+| Site | Resolution today | Verdict |
+|---|---|---|
+| `clients/runtime-tool-call.ts` (tool_call) | `resolveToolCallFilePath` | clean: host argument, unchanged |
+| `clients/runtime-tool-result.ts` (host event) | `resolveToolCallFilePath` | clean: host argument, round 1 |
+| `clients/runtime-tool-result.ts` (recovered write) | `rawFilePath` via `_pathAlreadyResolved` | **folded this round**: identity, never re-resolved |
+| `clients/bash-file-access.ts` (shell operands) | shell rules + quoted-tilde bit | **corrected this round**: was host stages (round 1) |
+| `clients/dispatch/runner-context.ts` (runner-reported) | `normalizeHostToolPath` at entry | clean: no `@` strip, no fold; round 1 |
+| `tools/lens-diagnostics.ts:607`/`:616`, `tools/lsp-diagnostics.ts:622`, `:2473` | `resolveHostToolPath`, with the injected default flagged | **round 3**: the model arm keeps host stages, the internally generated arm gets none |
+| `tools/module-report.ts:33` (`resolveFile`, 3 callers) | `resolveHostToolPath` | **folded this round** |
+| `tools/lens-diagnostic-mark.ts:332` | `resolveHostToolPath` | **folded this round** |
+| `tools/lsp-navigation.ts:1327` (navigation `path`) | `resolveHostToolPath` | **folded this round** |
+| `tools/lsp-navigation.ts:1822` (`rename_file` destination) | bare `path.resolve` | **residual: #4578** — a mutation target, risk-class change |
+| `tools/shared.ts:32` (ast-grep `paths`) | `resolveHostToolPath` per entry; `path.resolve` for the default | **round 3**: the entries keep host stages, the generated default gets none |
+| `clients/read-guard*.ts` | receive already-resolved paths | clean: no raw join |
+| `mcp/server.ts` | own cwd and display paths only | clean: no tool-path join |
+
+Named residuals:
+- `rename_file`'s destination (#4578, filed).
+- The `tool_call` write/edit path still uses pi's variant ladder, so a mutation whose naive path is absent can retarget a curly-quote sibling (review L2). Different seam, and this round does not touch the `tool_call` resolver.
+- An out-of-root bash `~` write is dropped by `isRecordableProjectPath` with no notice (review N2); the same is already true of any absolute out-of-root operand.
+- The tokenizer splits words on `\s`, which matches U+202F and U+00A0, so an UNQUOTED no-break-space operand is split before any resolver sees it. That split predates this round and is outside this shape; the quoted spelling in the test above pins the resolver half.
+
+Consolidation verdict: the host-argument population folds onto `resolveHostToolPath` (one seam, nine sites), and the identity population bypasses it entirely. The shell population keeps its own rule because bash's tilde rule is not pi's. Deleting the shell resolver would send the quoting bit back into each operand caller, so it stays beside the lexer that owns the quoting.
+
+Round-3 verdict: the **internally generated** population is now named and enumerated (two sites, both stated at their injection point, no shared helper). Fold or stay? **Stay two sites, no helper.** A shared "internally generated path" helper would be a one-line wrapper around `path.resolve` whose only caller logic is "don't call the resolver", so it would relocate the same two branches rather than concentrate anything; the provenance flag on the probe params already carries the meaning at the seam that needs it. What does change is the audit trail: the Fix round 3 table above is the census, so a new call site that resolves without stating its provenance is now visible against a list rather than against memory.
+
+The shell population is complete at five of five call sites: round 3 found two of them (`extractGrepSearchFiles`, `parseGrepLineWithFile`, both reached from `collectGrepCommandFiles`) had never received the quoting bit, which is the sweep the round-2 net-count rule asks for.
+
+## Test assessment
+
+- No test was deleted or relaxed this round. The round-1 `it.each` that asserted `resolveHostToolPath` directly (it passed pre-fix, N1/Greptile P2) is replaced by two handler-driven cases plus one labelled pin.
+- `pinTestHome` (`tests/clients/test-utils.ts:325`) replaces six hand-rolled `HOME`/`USERPROFILE` save-restore blocks across the four test files this round touched, so a restore cannot be forgotten in one `finally` and not another.
+- The second commit adds the batch-`paths` witness a mutation proved missing; without it that fold had no test.
+- The third commit answers the two ratchets the new code tripped, both caught by running them rather than by CI: `strictness-ratchet` (the lexer helper took an indexed `command[i]` as `string`, 427 -> 432 in `clients`) and `flake-shape-ratchet` (two hand-rolled LSP doubles in the new lens_diagnostics cases, 8 -> 10 hits, now seeded from `makeLspServiceDouble`).
+- Governance: `agents-governance`, `shape-history-governance` (45 passed together with the glossary sweep); `tests/config/glossary-synonym-sweep.test.ts` re-pins the five `path` counts this round shrank or grew, each with a `#4577` note.
+
+Round 3:
+
+- Four new cases, one per fixed site; each reds on the pre-fix sources and on a compile-valid mutation of the branch it covers (mutation table above). The two R2-1 cases are separate because they cover two different `resolveCandidate` callers and neither one catches the other's mutation.
+- No new LSP double: the R2-2 case is seeded from `makeLspServiceDouble` with two focused overrides, so the `flake-shape-ratchet` `service-double` count stays at its pin (verified by running it, not by editing the baseline).
+- `strictness-ratchet` red on the round-3 code (`clients: regression (427 -> 429)`), both new errors `TS2532` from `segments[i]` under `noUncheckedIndexedAccess`. Fixed in the code with the optional chaining the file already uses, so the pin stays at 427; the baseline file is untouched.
+- `glossary-synonym-sweep` red (`tools/shared.ts@2`, `UNPINNED live uses`). Re-pinned in both directions with a `#4577` reason, per the sweep's own contract, rather than avoiding the import at the cost of a hand-rolled absolute-path join.
+- No test was deleted or relaxed in round 3.
+
+

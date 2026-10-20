@@ -37,7 +37,16 @@ const SUBSCRIBERS: BusSurfaceEntry[] = [
 	},
 ];
 
+// The walk and each file read happen once; every case shares them.
+let scannedFiles: string[] | undefined;
+const readCache = new Map<string, string>();
+
 function sourceFiles(): string[] {
+	scannedFiles ??= scanSourceFiles();
+	return scannedFiles;
+}
+
+function scanSourceFiles(): string[] {
 	const roots = ["clients", "tools", "mcp", "scripts"];
 	const files = roots.flatMap((root) =>
 		listSourceFiles(path.join(repoRoot, root), {
@@ -57,7 +66,12 @@ function sourceFiles(): string[] {
 }
 
 function read(file: string): string {
-	return fs.readFileSync(path.join(repoRoot, file), "utf8");
+	let source = readCache.get(file);
+	if (source === undefined) {
+		source = fs.readFileSync(path.join(repoRoot, file), "utf8");
+		readCache.set(file, source);
+	}
+	return source;
 }
 
 function busPublisherFiles(

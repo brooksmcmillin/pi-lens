@@ -36,6 +36,13 @@
 (* "call" one key per tool-call id. Dedupe "content" is the pre-fix        *)
 (* dedupe (any analysis of the bytes satisfies any claim), "authority"     *)
 (* the fix (an unauthored analysis satisfies only an unauthored claim).    *)
+(* Root "one" is both hooks resolving the session's own root through       *)
+(* opaquePrescanRoot (#4504); "split" is the pre-fix code, whose tool_call  *)
+(* keyed on the host's ctx.cwd and whose tool_result keyed on the           *)
+(* coordinator's projectRoot, which differ for a concurrent secondary      *)
+(* session (#473). The root is part of the slot at BOTH keyings:           *)
+(* opaqueBaselineSlot puts it in the string and the call id is suffixed to  *)
+(* it, so a split names two slots however the call half is keyed.          *)
 (* Subtract is round 1's sibling subtraction: a recovery leaves out the    *)
 (* names of every still-pending entry and of every call that took after    *)
 (* this one recorded.                                                      *)
@@ -55,6 +62,8 @@ EXTENDS Naturals, Sequences, FiniteSets
 
 CONSTANTS
     Keying,      \* "cwd" (pre-fix) | "call" (per tool-call id)
+    Root,        \* "one": both hooks resolve the session's root (#4504)
+                 \* "split": the pre-fix per-hook roots
     Cap,         \* baselines the store holds before dropping the oldest
     Subtract,    \* TRUE: round 1's sibling subtraction
     Dedupe,      \* "content" (pre-fix) | "authority" (the fix)
@@ -129,7 +138,17 @@ TypeOK ==
     /\ recVer \in [Paths -> 0..3]
     /\ Len(slot) <= Cap
 
-Key(w) == IF Keying = "cwd" THEN 0 ELSE w
+(* #4504: which root the hook at `site` names. A session has ONE root — its  *)
+(* own cwd, where the host runs the command — so its tool_call and its       *)
+(* tool_result name the same slot. "split" is the pre-fix code: a secondary  *)
+(* session's ctx.cwd is its own tree while the shared coordinator still      *)
+(* holds the live primary's projectRoot.                                    *)
+RootOf(site) == IF Root = "split" /\ site = "take" THEN 2 ELSE 1
+
+Key(w, site) ==
+    IF Keying = "call"
+    THEN (RootOf(site) * 4) + w
+    ELSE RootOf(site) * 4
 
 HasKey(s, k) == \E i \in 1..Len(s) : s[i].key = k
 IndexOf(s, k) == CHOOSE i \in 1..Len(s) : s[i].key = k
@@ -173,18 +192,18 @@ Record(w) ==
     /\ LET live == IF Retire THEN SelectSeq(slot, LAMBDA e : e.turn = turn)
                    ELSE slot
            gone == Owners(slot) \ Owners(live)
-           entry == [key |-> Key(w), owner |-> w, turn |-> turn]
-       IN /\ \/ /\ HasKey(live, Key(w))
-                /\ LET i == IndexOf(live, Key(w))
+           entry == [key |-> Key(w, "record"), owner |-> w, turn |-> turn]
+       IN /\ \/ /\ HasKey(live, Key(w, "record"))
+                /\ LET i == IndexOf(live, Key(w, "record"))
                    IN /\ slot' = Append(DeleteAt(live, i), entry)
                       /\ lost' = lost \cup {live[i].owner}
                       /\ ledger' = ledger + Counted(Cardinality(gone) + 1)
-             \/ /\ ~HasKey(live, Key(w))
+             \/ /\ ~HasKey(live, Key(w, "record"))
                 /\ Len(live) < Cap
                 /\ slot' = Append(live, entry)
                 /\ lost' = lost
                 /\ ledger' = ledger + Counted(Cardinality(gone))
-             \/ /\ ~HasKey(live, Key(w))
+             \/ /\ ~HasKey(live, Key(w, "record"))
                 /\ Len(live) = Cap
                 /\ slot' = Append(Tail(live), entry)
                 /\ lost' = lost \cup {Head(live).owner}
@@ -222,8 +241,8 @@ Take(w) ==
     /\ w \in ran
     /\ pc' = [pc EXCEPT ![w] = "taken"]
     /\ LET recW == IF w \in Fails THEN {} ELSE Name[w]
-       IN IF HasKey(slot, Key(w))
-          THEN LET i == IndexOf(slot, Key(w))
+       IN IF HasKey(slot, Key(w, "take"))
+          THEN LET i == IndexOf(slot, Key(w, "take"))
                    rest == DeleteAt(slot, i)
                    changed == window[slot[i].owner]
                    auth == recW \cap changed
@@ -318,6 +337,12 @@ EveryWriteAttributed ==
         (pc[w] = "done" /\ w \notin Fails) =>
             \A p \in Name[w] \cap Writes[w] :
                 \E v \in 0..3, t \in Turns : <<p, v, TRUE, t>> \in analysed
+
+(* #4504: a call whose command ran finds the baseline its own tool_call     *)
+(* recorded. A hook pair that resolves two roots misses it and reports      *)
+(* no-pending-snapshot for a command that did write.                         *)
+EveryCallFindsItsBaseline ==
+    \A w \in Writers : (pc[w] = "done" /\ w \notin Blocked) => w \notin missed
 
 (* For a path no other call writes, the call's blocker record survives. *)
 BlockerKept ==

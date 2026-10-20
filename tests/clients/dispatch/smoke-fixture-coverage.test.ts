@@ -1,30 +1,52 @@
+// flake-shape: real-process-spawn — the git-ignored census needs git's own
+// tracked-versus-ignored decision through collectUntrackedIgnoredIds; no stub
+// reproduces the index state that decides whether a fixture survives checkout.
 /**
  * Smoke-fixture coverage drift guard (#209 requirement 4, #1937).
  *
  * `dispatch-coverage` proves every runner is wired into a PLAN. This proves
- * every runner's TOOL OUTPUT is covered by evidence, in one of three ways:
+ * every runner's PARSER has met real bytes, or says why it cannot:
  *
- *   1. a live tool-smoke fixture (`scripts/smoke-tools.mjs`) — the nightly lane
- *      spawns the real binary against a planted violation;
- *   2. a captured real-bytes fixture (`tests/fixtures/runner-output/`) — the
+ *   1. a captured real-bytes fixture (`tests/fixtures/runner-output/`) — the
  *      binary's actual stdout/stderr/exit code, replayed through the parser by
- *      `runners/captured-real-output.test.ts`;
- *   3. an explicit exemption below, which must name a CATEGORY explaining why
+ *      `runners/captured-real-output.test.ts`; or
+ *   2. an explicit exemption below, which must name a CATEGORY explaining why
  *      real output is unreachable.
+ *
+ * A live tool-smoke fixture (`scripts/smoke-tools.mjs`) is NOT coverage here.
+ * The nightly lane spawns the real binary, but Step 1 asserts only that it ran
+ * and exited cleanly, so a parser that reads the wrong shape passes it. Fourteen
+ * runners stood on a live fixture alone until the #1937 census counted captured
+ * bytes only, and the first two recaptures found `go vet` reporting a type
+ * error as clean (#4451) and `dart analyze` errors dropped as a rejected run.
+ *
+ * Out of scope: the project-scan clients (madge, knip, jscpd, gitleaks,
+ * govulncheck, trivy, vulture) are not dispatch runners; #3438 owns their
+ * captured replay.
  *
  * #1937 rewrote the exemption rules. The map used to accept free text, and
  * "no fixture yet" sat in it for nine runners. A standing exemption turns
  * "forces a decision" into "permanently undecided", and that is how the vale
  * parser (#1933) shipped reading `Data.Files` — a shape vale has never emitted.
  * Every exemption now carries one of a closed set of categories, each of which
- * says something true about the world rather than about the backlog. Only
- * `pending` defers, and it must name the issue that closes it.
+ * says something true about the world rather than about the backlog, and the
+ * deferral phrasing itself is rejected. Only `pending` defers, and it must name
+ * the issue that closes it. Every other category states a time-invariant fact
+ * about the tool, so it may not speak of evidence, the host or time, and the
+ * ids allowed under `toolchain` and `platform` are a pinned table.
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { RunnerRegistry } from "../../../clients/dispatch/dispatcher.js";
+// The production "untracked AND ignored" seam (#679), not a private git call:
+// one rule for what git hides, and no second child-process path in a census.
+import {
+	_resetUntrackedIgnoredCacheForTests,
+	collectUntrackedIgnoredIds,
+} from "../../../clients/git-tracked-ignore.js";
+import { normalizeMapKey } from "../../../clients/path-utils.js";
 import { registerDefaultRunners } from "../../../clients/dispatch/runners/index.js";
 // Typed via scripts/smoke-tools.d.mts (the harness itself is plain ESM JS).
 import {
@@ -32,11 +54,20 @@ import {
 	passFloorBreach,
 	tier1Fixtures,
 } from "../../../scripts/smoke-tools.mjs";
+// Typed via scripts/capture-runner-output.d.mts: the capture gate and this
+// census share one rule for what makes a record evidence.
+import { recordProblems } from "../../../scripts/capture-runner-output.mjs";
 import {
+	availabilityProblems,
 	CAPTURED_OUTPUT_DIR,
+	cleanProblems,
 	listCapturedOutputs,
 	provenanceProblems,
 } from "../../helpers/captured-runner-output.js";
+// This file is sweep-shaped by construction (a walk plus an emptiness
+// assertion), so its population carries a floor: 112 fixture files today, and a
+// sweep over nothing must fail rather than read as clean.
+import { assertNonEmptyScan } from "../../support/sweep-kit.js";
 
 const repoRoot = path.resolve(CAPTURED_OUTPUT_DIR, "../../..");
 
@@ -45,7 +76,7 @@ const repoRoot = path.resolve(CAPTURED_OUTPUT_DIR, "../../..");
  * part: it states a fact about the tool, not a position in a queue.
  */
 const EXEMPTION_CATEGORIES = {
-	/** In-process analysis. There is no external binary whose bytes to capture. */
+	/** In-process analysis. There is no external binary to capture. */
 	structural: "structural",
 	/**
 	 * A per-language alternate whose primary is covered. The detail must START
@@ -55,18 +86,52 @@ const EXEMPTION_CATEGORIES = {
 	alternate: "alternate",
 	/** Exercised through the LSP lane rather than the dispatch CLI path. */
 	lsp: "lsp",
-	/** Needs a language toolchain or build artifact absent from dev and CI. */
+	/**
+	 * A tool the CI image cannot provide: name the tool and why. Every id here
+	 * is pinned in `PINNED_FACT_EXEMPTIONS`, so a new one is a visible diff.
+	 */
 	toolchain: "toolchain",
-	/** No binary exists for any platform pi-lens develops or tests on. */
+	/** No binary exists for any platform pi-lens develops or tests on. Pinned. */
 	platform: "platform",
 	/** Flag-gated off by default; running it has side effects. */
 	"opt-in": "opt-in",
 	/**
-	 * The only category that expires. The detail must reference the issue or PR
-	 * that removes it, so the deferral has an owner and an end.
+	 * The only category that may describe the state of the repo, the host or
+	 * time, and the only one that expires. The detail must reference the issue
+	 * or PR that removes it, so the deferral has an owner and an end.
 	 */
 	pending: "pending",
 } as const;
+
+/**
+ * Every category but `pending` states a time-invariant fact about the TOOL. A
+ * fact about the capture host, the fixture backlog or the calendar is a
+ * deferral however it is worded, and no phrase list closes that (#1937 review:
+ * "awaiting capture on a CI image, fixture to follow" passed a lexical list, and
+ * "absent from this host" was filed as `toolchain` while ubuntu-latest ships
+ * Ruby and PowerShell). So the derived rule bans the vocabulary of evidence,
+ * host and time in those categories, instead of listing deferral phrases.
+ */
+const FACT_CATEGORIES: ReadonlySet<string> = new Set([
+	"structural",
+	"alternate",
+	"lsp",
+	"toolchain",
+	"platform",
+	"opt-in",
+]);
+const EVIDENCE_HOST_OR_TIME =
+	/\b(?:fixtures?|captur\w*|bytes|replay\w*|this host|the host|here|yet|later|will|soon|todo|tbd|to follow|awaiting|pending|missing|absent|currently|for now|right now)\b/i;
+
+/**
+ * Exemption ids allowed in the categories a reviewer must approve one by one.
+ * `toolchain` and `platform` are where "the tool is absent on my machine" gets
+ * laundered, so adding to either is a diff to this table, not a quiet map entry.
+ */
+const PINNED_FACT_EXEMPTIONS: Readonly<Record<string, readonly string[]>> = {
+	toolchain: [],
+	platform: [],
+};
 
 /**
  * Runners with neither a live tool-smoke fixture nor captured real bytes.
@@ -75,11 +140,11 @@ const EXEMPTION_CATEGORIES = {
 const EXEMPT = new Map<string, string>([
 	[
 		"tree-sitter",
-		"structural: in-process grammar queries on every dispatch; no external process emits bytes to parse",
+		"structural: in-process grammar queries on every dispatch; no external process emits output to parse",
 	],
 	[
 		"fact-rules",
-		"structural: in-process fact evaluation on every dispatch; no external process emits bytes to parse",
+		"structural: in-process fact evaluation on every dispatch; no external process emits output to parse",
 	],
 	[
 		"ast-grep-napi",
@@ -94,38 +159,20 @@ const EXEMPT = new Map<string, string>([
 		"alternate: ktlint is the Kotlin primary; detekt needs the detekt CLI plus its formatting plugin, which is not a single-binary install",
 	],
 	[
-		"golangci-lint",
-		"alternate: go-vet is the Go lint primary; golangci-lint is config-first and exercised by the --autofix lane",
-	],
-	[
 		"prisma-validate",
-		"lsp: covered through the --lsp prisma fixture; the runner shells out to the same @prisma/language-server package",
+		"lsp: exercised through the --lsp prisma smoke lane; the runner shells out to the same @prisma/language-server package",
 	],
 	[
 		"spotbugs",
-		"toolchain: analyses compiled JVM bytecode, so it needs a JDK plus a built artifact, and it is flag-gated behind withSpotbugsGroup",
+		"pending: #1937 analyses a compiled .class tree and is flag-gated behind withSpotbugsGroup; ubuntu-latest ships a JDK, so a CI job that builds the smoke java project can capture it",
 	],
 	[
-		"cpp-check",
-		"toolchain: shells out to the platform C/C++ compiler (cl, gcc, or clang); output shape is compiler-specific and no compiler is guaranteed in dev or CI",
-	],
-	// swiftlint and fish-indent are NOT `platform` exemptions: swift.org ships
-	// a Windows toolchain and fish is apt-installable on the CI image. The
-	// operative fact is that neither is on the image today, which is
-	// `toolchain`. swiftlint additionally carries an inline literal in
-	// exit-blind-runners.test.ts, and `toolchain` is not an escape from that
-	// rule, so it is filed as `pending` against the issue that captures it.
-	[
-		"swiftlint",
-		"pending: #1937 captures it on a CI image carrying the Swift toolchain; ubuntu-latest ships neither swift nor swiftlint today",
+		"lsp",
+		"lsp: the dispatch lsp runner relays language-server diagnostics rather than parsing a CLI; its evidence is the --lsp tool-smoke lane and the clients/lsp suites",
 	],
 	[
-		"fish-indent",
-		"toolchain: ships inside the fish shell, which is apt-installable but absent from the CI image and unavailable on the Windows dev host",
-	],
-	[
-		"trivy-config",
-		"opt-in: trivy.enabled is off by default; a capture would need trivy plus an opt-in fixture",
+		"psscriptanalyzer",
+		"pending: #1937 ubuntu-latest ships PowerShell 7 and the module installs from the PowerShell Gallery; the runner writes a per-pid temp script into its argv, which the replay argv tie does not model",
 	],
 	[
 		"helm-render",
@@ -151,10 +198,77 @@ function registeredRunnerIds(): string[] {
 	return registry.list().map((r) => r.id);
 }
 
-/** Runner ids backed by real tool output, live or captured. */
-function coveredRunnerIds(): Set<string> {
-	return new Set([...liveFixtureRunnerIds(), ...capturedFixtureRunnerIds()]);
+/**
+ * The census: registered runner ids that neither have a captured fixture nor an
+ * exemption. A pure function so a synthetic runner can prove it fires.
+ */
+function uncapturedRunners(
+	registered: readonly string[],
+	captured: ReadonlySet<string>,
+	exempt: ReadonlyMap<string, string>,
+): string[] {
+	return registered.filter((id) => !captured.has(id) && !exempt.has(id));
 }
+
+/**
+ * Exemptions for a runner that already has captured bytes. A pure function so
+ * a synthetic map can prove it fires; on the real map it is an empty loop.
+ */
+function redundantExemptions(
+	exempt: ReadonlyMap<string, string>,
+	captured: ReadonlySet<string>,
+): string[] {
+	return [...exempt.keys()].filter((id) => captured.has(id));
+}
+
+/** `toolchain`/`platform` exemptions that are not in the pinned table, or pinned ids that are gone. */
+function unpinnedFactExemptions(
+	exempt: ReadonlyMap<string, string>,
+	pinned: Readonly<Record<string, readonly string[]>>,
+): string[] {
+	const problems: string[] = [];
+	for (const category of Object.keys(pinned)) {
+		const actual = [...exempt]
+			.filter(
+				([, reason]) => parseExemptionReason(reason)?.category === category,
+			)
+			.map(([id]) => id)
+			.sort();
+		const expected = [...(pinned[category] ?? [])].sort();
+		for (const id of actual)
+			if (!expected.includes(id))
+				problems.push(`${category}: ${id} is not pinned`);
+		for (const id of expected)
+			if (!actual.includes(id))
+				problems.push(`${category}: ${id} is pinned but gone`);
+	}
+	return problems;
+}
+
+/**
+ * The exemption rules over the real fixture directory. `alternate` asks whether
+ * the primary is covered, and covered means captured: a live smoke fixture is
+ * not parser evidence (#4452 review F4).
+ */
+function realExemptionProblems(exempt: Iterable<[string, string]>): string[] {
+	return exemptionProblems(exempt, capturedFixtureRunnerIds());
+}
+
+/** The census over the real registry and fixture directory. */
+function censusGaps(exempt: ReadonlyMap<string, string>): string[] {
+	return uncapturedRunners(
+		registeredRunnerIds(),
+		capturedFixtureRunnerIds(),
+		exempt,
+	);
+}
+
+/**
+ * Deferral phrasing is not a reason. #1937 found "no fixture yet" standing in
+ * the map for nine runners; a category prefix would otherwise launder it.
+ */
+const DEFERRAL_PHRASE =
+	/\bno\s+(?:captured\s+)?fixtures?\b|\bnot\s+(?:yet\s+)?captured\b|\bcaptur(?:e|ed)\s+(?:it\s+)?(?:later|someday|eventually)\b|\bto\s?do\b/i;
 
 /** Split `"<category>: <detail>"`; null when the reason is not in that form. */
 function parseExemptionReason(
@@ -192,6 +306,19 @@ function exemptionProblems(
 				`${id}: unknown category "${parsed.category}" (allowed: ${Object.keys(EXEMPTION_CATEGORIES).join(", ")})`,
 			);
 		}
+		if (
+			FACT_CATEGORIES.has(parsed.category) &&
+			EVIDENCE_HOST_OR_TIME.test(parsed.detail)
+		) {
+			problems.push(
+				`${id}: ${parsed.category} detail "${parsed.detail}" speaks of evidence, the host or time; only pending may, and it needs an issue`,
+			);
+		}
+		if (DEFERRAL_PHRASE.test(parsed.detail)) {
+			problems.push(
+				`${id}: detail "${parsed.detail}" is deferral phrasing, not a fact about why real output is unreachable`,
+			);
+		}
 		if (parsed.detail.length < 20) {
 			problems.push(
 				`${id}: detail "${parsed.detail}" is too short to explain why real output is unreachable`,
@@ -219,14 +346,11 @@ function exemptionProblems(
 }
 
 describe("smoke-fixture coverage", () => {
-	it("every registered runner has real tool output or an explicit exemption", () => {
-		const covered = coveredRunnerIds();
-		const uncovered = registeredRunnerIds().filter(
-			(id) => !covered.has(id) && !EXEMPT.has(id),
-		);
+	it("every registered runner has a captured fixture or an explicit exemption", () => {
+		const uncovered = censusGaps(EXEMPT);
 		expect(
 			uncovered,
-			`registered runner(s) with no live tool-smoke fixture, no captured real-bytes fixture, and no exemption. Add a fixture in scripts/smoke-tools.mjs, capture bytes with scripts/capture-runner-output.mjs, or exempt with a category: ${uncovered.join(", ")}`,
+			`registered runner(s) with no captured real-bytes fixture and no exemption. Capture bytes with scripts/capture-runner-fixtures.mjs, or exempt with a category: ${uncovered.join(", ")}`,
 		).toEqual([]);
 	});
 
@@ -239,20 +363,102 @@ describe("smoke-fixture coverage", () => {
 		).toEqual([]);
 	});
 
-	// A runner that gained coverage must LOSE its exemption. Otherwise the map
-	// keeps growing and stops describing anything; #209's `lsp` and `pyright`
-	// entries had both outlived their reasons by the time #1937 looked.
-	it("no exemption for a runner that already has real tool output", () => {
-		const covered = coveredRunnerIds();
-		const redundant = [...EXEMPT.keys()].filter((id) => covered.has(id));
+	// A runner that gained a captured fixture must LOSE its exemption. Otherwise
+	// the map keeps growing and stops describing anything; #209's `lsp` and
+	// `pyright` entries had both outlived their reasons by the time #1937 looked.
+	it("no exemption for a runner that already has captured bytes", () => {
+		const redundant = redundantExemptions(EXEMPT, capturedFixtureRunnerIds());
 		expect(
 			redundant,
-			`runner(s) exempted despite having a live or captured fixture — delete the exemption: ${redundant.join(", ")}`,
+			`runner(s) exempted despite having a captured fixture — delete the exemption: ${redundant.join(", ")}`,
 		).toEqual([]);
 	});
 
+	// Recurrence: fourteen runners passed the old live-or-captured rule on a
+	// Step-1 smoke fixture alone, so go-vet (#4451) and dart-analyze kept parsers
+	// that had never met their binary's bytes. Run the census with NO exemptions
+	// and the runners that only a live fixture backs must still be flagged.
+	it("a live smoke fixture alone does not satisfy the census", () => {
+		const gaps = censusGaps(new Map());
+		for (const id of ["psscriptanalyzer"]) {
+			expect(
+				liveFixtureRunnerIds().has(id),
+				`${id} lost its live fixture, so this probe no longer separates live from captured; pick another live-only runner`,
+			).toBe(true);
+			expect(
+				gaps,
+				`${id} has a live smoke fixture and no captured bytes, so the census must flag it`,
+			).toContain(id);
+		}
+	});
+
+	// Recurrence: the census is a loop over the registry, and a loop that has
+	// never seen a gap proves nothing. Feed it a runner nobody captured.
+	// Recurrence: the rewritten redundancy test looped over the real map, which
+	// holds no redundant entry, so neutering its filter stayed green (#4452
+	// review F3). Feed the pure function a map that does hold one.
+	it("an exemption for a runner that has captured bytes is flagged", () => {
+		const exempt = new Map([
+			[
+				"captured-one",
+				"structural: in-process analysis with no external process",
+			],
+			["bare-one", "structural: in-process analysis with no external process"],
+		]);
+		expect(redundantExemptions(exempt, new Set(["captured-one"]))).toEqual([
+			"captured-one",
+		]);
+	});
+
+	// Recurrence: "absent from this host" was filed as `toolchain` for Ruby and
+	// PowerShell, both preinstalled on ubuntu-latest (#4452 review F2). The set
+	// of ids allowed there is a table a reviewer must edit.
+	// Recurrence: the alternate rule kept counting a live smoke fixture as the
+	// primary's coverage after the census stopped (#4452 review F4). psscriptanalyzer
+	// has a live fixture and no captured bytes.
+	it("an alternate whose primary has only a live fixture is rejected", () => {
+		expect(liveFixtureRunnerIds().has("psscriptanalyzer")).toBe(true);
+		expect(capturedFixtureRunnerIds().has("psscriptanalyzer")).toBe(false);
+		const problems = realExemptionProblems([
+			[
+				"synthetic-alt",
+				"alternate: psscriptanalyzer is the primary for this language",
+			],
+		]);
+		expect(problems).toHaveLength(1);
+		expect(problems[0]).toMatch(/names "psscriptanalyzer" as its primary/);
+	});
+
+	it("toolchain and platform exemptions are a pinned set", () => {
+		expect(
+			unpinnedFactExemptions(EXEMPT, PINNED_FACT_EXEMPTIONS),
+			"a toolchain or platform exemption was added or removed without editing PINNED_FACT_EXEMPTIONS; name the missing tool and why CI cannot provide it",
+		).toEqual([]);
+		const planted = new Map([
+			["rubocop", "toolchain: a Ruby gem, and Ruby is not installed"],
+		]);
+		expect(unpinnedFactExemptions(planted, PINNED_FACT_EXEMPTIONS)).toEqual([
+			"toolchain: rubocop is not pinned",
+		]);
+		expect(
+			unpinnedFactExemptions(new Map(), { toolchain: ["gone-one"] }),
+		).toEqual(["toolchain: gone-one is pinned but gone"]);
+	});
+
+	it("the census flags a synthetic runner with no fixture and no exemption", () => {
+		const exempt = new Map([
+			[
+				"b",
+				"structural: in-process analysis with no external process to capture",
+			],
+		]);
+		expect(
+			uncapturedRunners(["a", "b", "synthetic-runner"], new Set(["a"]), exempt),
+		).toEqual(["synthetic-runner"]);
+	});
+
 	it("every exemption is well formed under the shared rules", () => {
-		const problems = exemptionProblems(EXEMPT, coveredRunnerIds());
+		const problems = realExemptionProblems(EXEMPT);
 		expect(problems, `malformed exemption(s): ${problems.join(" | ")}`).toEqual(
 			[],
 		);
@@ -265,8 +471,10 @@ describe("smoke-fixture coverage", () => {
 		const covered = new Set(["oxlint"]);
 		const reject = (id: string, reason: string, expected: RegExp) => {
 			const problems = exemptionProblems([[id, reason]], covered);
-			expect(problems, `expected "${reason}" to be rejected`).toHaveLength(1);
-			expect(problems[0]).toMatch(expected);
+			expect(
+				problems.some((problem) => expected.test(problem)),
+				`expected "${reason}" to be rejected as ${expected}, got ${JSON.stringify(problems)}`,
+			).toBe(true);
 		};
 
 		reject("a", "no fixture yet", /not "<category>: <detail>"/);
@@ -278,13 +486,71 @@ describe("smoke-fixture coverage", () => {
 		reject("c", "platform: too short", /too short/);
 		reject(
 			"d",
-			"alternate: detekt is the primary here and covers this language",
+			"alternate: detekt is the primary and covers this language",
 			/names "detekt" as its primary/,
 		);
 		reject(
 			"e",
 			"pending: someone will get around to capturing this one",
 			/must reference the issue or PR/,
+		);
+		// Each DEFERRAL_PHRASE arm gets its own row under `pending`, where the
+		// derived rule does not apply, so a neutered arm reds here and nowhere
+		// else (#4452 review F3: two of four arms were unpinned).
+		reject(
+			"j",
+			"pending: #1937 we will capture it later on a bigger runner",
+			/deferral phrasing/,
+		);
+		reject(
+			"k",
+			"pending: #1937 TODO write the capture for this runner",
+			/deferral phrasing/,
+		);
+		// The derived rule: only `pending` may speak of evidence, the host or
+		// time. Each phrasing below slipped the lexical list or was filed as a
+		// fact about the capture host.
+		const rejectDerived = (id: string, reason: string) => {
+			const problems = exemptionProblems([[id, reason]], covered);
+			expect(
+				problems.some((problem) =>
+					/speaks of evidence, the host or time/.test(problem),
+				),
+				`expected "${reason}" to be rejected by the derived rule, got ${JSON.stringify(problems)}`,
+			).toBe(true);
+		};
+		rejectDerived(
+			"l",
+			"toolchain: awaiting capture on a CI image, fixture to follow",
+		);
+		rejectDerived("m", "toolchain: Ruby is absent from this host entirely");
+		rejectDerived("n", "platform: no binary exists here for macOS yet");
+		rejectDerived(
+			"o",
+			"opt-in: runs once the replay harness models its probes",
+		);
+		// A fact about the tool passes the same rule.
+		expect(
+			exemptionProblems(
+				[
+					[
+						"p",
+						"toolchain: needs the Swift toolchain, which ubuntu-latest does not ship",
+					],
+				],
+				covered,
+			),
+		).toEqual([]);
+		// The category prefix must not launder the phrase #1937 removed.
+		reject(
+			"h",
+			"toolchain: no fixture yet for this runner on any platform",
+			/deferral phrasing/,
+		);
+		reject(
+			"i",
+			"pending: #1937 the bytes are not captured yet for this one",
+			/deferral phrasing/,
 		);
 
 		// The well-formed shapes must pass, so the rules are not simply
@@ -321,6 +587,109 @@ describe("captured real-bytes fixture provenance", () => {
 		expect(
 			problems,
 			`captured fixture(s) with an incomplete provenance header. Re-capture with scripts/capture-runner-output.mjs rather than editing the header by hand:\n${problems.join("\n")}`,
+		).toEqual([]);
+	});
+
+	// #4473: the replay answers the availability checker's own spawn from this
+	// record. Without one it must mock the checker, and a mocked checker cannot
+	// see a tool that rejects its probe (helm 4 rejects `--version`).
+	it("every captured fixture records the availability probe its runner sends", () => {
+		const problems = captured.flatMap(availabilityProblems);
+		expect(
+			problems,
+			`captured fixture(s) with no complete availability record. The replay runs the REAL checker against this record, so a fixture without one cannot be replayed honestly:\n${problems.join("\n")}`,
+		).toEqual([]);
+	});
+
+	// #4522: the tool-state matrix's clean cell replays this run. A fixture with
+	// no clean record leaves that cell modelling bytes the tool never printed.
+	it("every captured fixture records a real clean run", () => {
+		const problems = captured.flatMap(cleanProblems);
+		expect(
+			problems,
+			`captured fixture(s) whose clean cell would model invented bytes. Re-capture with scripts/capture-runner-fixtures.mjs --records-only:\n${problems.join("\n")}`,
+		).toEqual([]);
+	});
+
+	// The one gate the capture refuses to write past, re-read over every fixture
+	// on disk (#4522 F2, F3, F10): a probe record must carry a version its own
+	// answer printed, and its clean run must be the fixture's own invocation.
+	it("every captured record is evidence about this binary and this invocation", () => {
+		const problems = captured.flatMap((fixture) => recordProblems(fixture));
+		expect(
+			problems,
+			`captured record(s) that name a binary which never answered, or a clean run this fixture never sends. Re-capture with scripts/capture-runner-fixtures.mjs --records-only:\n${problems.join("\n")}`,
+		).toEqual([]);
+	});
+
+	it("every captured clean run's workspace still exists", () => {
+		const missing = captured
+			.filter(
+				(fixture) =>
+					fixture.clean &&
+					!fs.existsSync(path.join(repoRoot, fixture.clean.workspace)),
+			)
+			.map((fixture) => `${fixture.relPath} → ${fixture.clean?.workspace}`);
+		expect(
+			missing,
+			`captured clean workspace(s) that no longer exist — the clean run cannot be reproduced: ${missing.join(", ")}`,
+		).toEqual([]);
+	});
+
+	it("every captured clean run's input exists in its workspace", () => {
+		const missing = captured
+			.filter(
+				(fixture) =>
+					fixture.clean &&
+					fs.existsSync(path.join(repoRoot, fixture.clean.workspace)) &&
+					!fs.existsSync(
+						path.join(repoRoot, fixture.clean.workspace, fixture.clean.file),
+					),
+			)
+			.map((fixture) => `${fixture.relPath} → ${fixture.clean?.file}`);
+		expect(
+			missing,
+			`captured clean run(s) whose analysed input is gone — the bytes are a report about nothing: ${missing.join(", ")}`,
+		).toEqual([]);
+	});
+
+	// #4522 F1: `.gitignore` ignores `*.js` and `*.md` globally, so a clean
+	// workspace whose inputs are JavaScript or Markdown was captured, replayed
+	// from the working tree, and never committed: five fixtures named workspaces
+	// no fresh checkout has. The population is every fixture input on disk, not a
+	// list of the extensions that broke, and git itself decides — a spelling list
+	// here would pass the next input shape.
+	it("no captured fixture input is hidden by .gitignore", async () => {
+		const roots = [
+			path.join(repoRoot, "tests/fixtures/runner-output"),
+			path.join(repoRoot, "tests/fixtures/runner-output-clean"),
+		];
+		const inputs: string[] = [];
+		const walk = (dir: string): void => {
+			for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+				const full = path.join(dir, entry.name);
+				if (entry.isDirectory()) walk(full);
+				else inputs.push(full);
+			}
+		};
+		for (const root of roots) walk(root);
+		assertNonEmptyScan("captured fixture inputs", inputs.length, 60);
+		_resetUntrackedIgnoredCacheForTests();
+		const hiddenIds = await collectUntrackedIgnoredIds(repoRoot);
+		// Fail closed: no git answer is not an empty population. A census that
+		// reads "unavailable" as "clean" is how the inputs went missing.
+		expect(
+			hiddenIds,
+			`git could not enumerate the ignored files under ${repoRoot}, so this census cannot say whether the fixtures survive a fresh checkout`,
+		).toBeDefined();
+		const hidden = inputs
+			.map((file) => path.relative(repoRoot, file).replace(/\\/g, "/"))
+			.filter((file) =>
+				hiddenIds?.has(normalizeMapKey(path.join(repoRoot, file))),
+			);
+		expect(
+			hidden,
+			`captured fixture input(s) .gitignore hides, so a fresh checkout cannot replay them: ${hidden.join(", ")}`,
 		).toEqual([]);
 	});
 
@@ -495,5 +864,15 @@ describe("tier-1 parser lane", () => {
 		expect(passFloorBreach(unavailable, 1)).toBeNull();
 		// No floor declared is the pre-existing behaviour, unchanged.
 		expect(passFloorBreach(unavailable, null)).toBeNull();
+		// `--min-pass=0` (and below) is "no floor", not an invalid one: the helper
+		// rejects a floor under 1, so the guard in front of it carries this.
+		expect(passFloorBreach(unavailable, 0)).toBeNull();
+		expect(passFloorBreach(unavailable, -1)).toBeNull();
+		// The message keeps its counts (the helper's record supplies them).
+		expect(passFloorBreach(unavailable, 3)).toContain(
+			"1 runner(s) passed, at least 3 required (2 unavailable)",
+		);
+		// A floor that is not a number (`--min-pass=abc`) is red, never "no floor".
+		expect(() => passFloorBreach(unavailable, Number.NaN)).toThrow(TypeError);
 	});
 });

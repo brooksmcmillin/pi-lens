@@ -1,5 +1,374 @@
 # HISTORY
 
+## 2026-10-20 — instrument attributes by id and order (shape 76)
+
+The nightly capability census bracketed each fixture phase with a byte offset
+into `extension.log`, a buffered async sink, and `filterPublishTrace` drained
+rows by `server` alone. Five typescript fixtures share that id, so a foreign
+client's late `diags=1` publish landed in the clean fixture's phase;
+`classifyFirstPublish` reads order only, so the cell flipped between
+`empty-first` and `direct` and the two-run hysteresis committed the flip. Raw
+JSON-RPC against ts-ls 5.3.0 with TS 5.9.3 showed what the fixtures actually
+do: `bad.ts` publishes one dirty set carrying 2322, `clean.ts` publishes one
+EMPTY set and nothing else. The marker had no measurement behind it (#4615).
+
+## 2026-10-20 — cancellation read as failure (shape 77)
+
+Master's required `TLA+ models` check reded while every model in the shard was
+`ok`: shard 4/4 finished all its steps and was recorded `cancelled` at 735 s
+against a 720 s cap, and the aggregate compares the shard result against
+`success` alone. A rerun reproduced it at 726 s, and the infra-kill classifier
+never looked, because that workflow gates on a `failure` conclusion. The four
+shards took 268, 349, 494 and 726 seconds, so one shard owns the tail of a
+round-robin split by count (#4672).
+
+## 2026-10-20 — a dependency's cache directory attributed to the fixture (shape 78)
+
+`jiti`'s `prepareCacheDir` runs `mkdirSync(os.tmpdir()/jiti)` on the caller's
+stack when pi's loader resolves an extension by path, so the tmp-root
+interposer recorded the directory as a fixture sibling of
+`tests/clients/skills-package-filter.test.ts` — accurate per process, wrong per
+cause. Pinning `JITI_FS_CACHE=0`/`JITI_CACHE=0` drops the write from 1/1 to 0/0
+and a planted sibling still reds (#4673).
+
+## 2026-10-20 — the lesson shapes 76, 77 and 78 share
+
+All three share one lesson: the surface that reports a result is not the surface
+that produced it, so a verdict read from an aggregate, an ordering, or a
+recorded creator needs the producing step's own evidence before anything trusts
+it.
+
+## 2026-10-19 — a defensive copy severed the identity the idle-eviction probe arms
+
+`compileLspRegistry` returned `{ ...server }` for every built-in with no command
+override (since `7f7c8cde6`, #2372), so the object the client registry kept as
+`SpawnedServer.info` was a copy. The nightly idle-eviction probe arms
+`server.idleEviction = "transparent"` on the object `LSP_SERVERS` /
+`getServerById` exposes; the copy never saw the arm, so `scheduleIdleEviction`
+declined to start a timer. From the 2026-10-10 nightly on, every candidate row
+in `docs/lsp-idle-eviction.md` read `not-evicted`, and the promotion sweep
+(#3989) had nothing to promote.
+
+Nine nights of those rows reached the doc and were read as a measurement
+verdict rather than as a defect: "not evicted yet" from a server whose timer
+never armed is indistinguishable, on that surface, from a server whose eviction
+is merely slow. CI stayed green because the probe's driver test doubles
+`getServersForFileWithConfig`, and the earlier rollout witness read the catalog
+fallback instead of a compiled session config.
+
+`clients/lsp/config.ts` now hands back the catalog entry itself, an overridden
+server keeps its own copy, and `scheduleIdleEviction` records
+`lsp-idle-eviction-declined` once per server per session so "no timer was
+scheduled" stops reading as "the eviction is slow". PR #4639.
+
+## 2026-10-18 — swallowed failure recorded as a different event (shape 75)
+
+Shape 75 ("Swallowed failure recorded as a different event") entered the catalog
+here.
+
+The user asked whether the week's bug fixes were observable. An audit of the 53
+`fix` PRs merged from 2026-10-11 to 2026-10-18 drove each production entry point
+with pinned homes and read the real `latency.log`. Four runtime failure paths
+ended in a silent `catch`. In two the log did worse than miss the failure: the
+out-of-band change scan from #4528 caught an unreadable directory with
+`continue` and then reported `deleted: 1` for a file that still existed, and
+#4527's didSave path reported a rejected save the same way as a sent one. Shape
+31 asks for a record on new behavior; it did not catch these, because each path
+did write a record, just the wrong one. #4596 tracks the four fixes and the
+planned guard. The #4575 round 7 verify found a third member: `lsp_touch_file`
+answers `failureKind: "success"` after a rejected didSave.
+
+The same retro gave three orchestrator mistakes a guard in the orchestrator's
+own tooling rather than a rule: a watcher left down after a context compaction,
+a resumed round that lost its `gh` passthrough (plegma #762), and a push onto a
+PR branch while a fix round was queued against the old head (plegma #723). A
+fourth, resumed reviews whose inherited deliverable name did not match the
+brief, stays a screen in the merge-policy table. Shape 69 recurred on five PRs
+despite its screen; #4602 plans a `check-pr-body` row for it instead of a
+reworded screen.
+
+The compliance pass on this change found a fault in the history governance
+test itself: its heading detector read a prose line opening with `#4527` as a
+heading, and let "shape" and its number sit on two lines, so shape 31 counted
+as covered. The detector now needs a real heading on one line, and shape 31
+stays in the no-history baseline.
+
+## 2026-10-18 — the Windows unit leg becomes a gate
+
+The maintainer decided on 2026-10-17 that `Unit tests Windows` gates. The lane
+had run as `Unit tests Windows (advisory)` since #2833, behind `heavy-gate` and
+with `continue-on-error` on its Vitest step, so its reds were reported and
+waivable: #4566 r14's `.cmd` branch and #4551 were both waved through on a
+head whose Linux legs were green. The promotion (#4518, PR #4592) drops the
+suffix, the deferral and the `continue-on-error`, so the job starts on every
+event and a failing conclusion gates everywhere ci-verdict reads rows.
+
+Two tests kept the lane from being green on master, and the promotion had to
+answer for both rather than wave them through as it had the earlier reds. The
+10,000-path opaque-ownership population (#4373) took more than its fixed 60 s
+budget on a loaded Windows runner while running 36.8 s green on one head, so
+it takes the lane's own `PI_LENS_TEST_TIMEOUT_SCALE` (180 s on the Windows leg)
+through one shared parse. The tmp-fixture hygiene census reds about one
+Windows run in ten on a root its own file's teardown had already removed, so
+its verdict is declined on `win32` only, pinned to #4591: the suite still runs
+and its `cleanupTmpHygiene` sweep still reaps, because a suite-level skip was
+measured to run no hook at all.
+
+Enforcement is the row a run posts. Until the maintainer adds the name to
+master's required status checks, an absent or job-skipped Windows row reads
+green (shape 11), which is why the wording in `AGENTS.md` says so and why the
+class sweep covers both spellings of the name.
+
+## 2026-10-17 — split host-path resolution (shape 74)
+
+Shape 74 ("Split host-path resolution") entered the catalog here.
+
+An external report, #4576, showed 46 ghost diagnostics in one day across biome,
+pyright, ruff and shellcheck, all on `<projectRoot>/~/…` paths that cannot
+exist. The `tool_call` seam expanded `~` through `resolveHostToolPath`; the
+`tool_result` seam joined the raw path onto the project root. #4577 routed the
+result side through the same resolver, and its review rounds found the rest of
+the class one provenance at a time. Round 1 applied the host-argument stages
+(`@` strip, unicode fold) to bash operands, so `cat @foo.ts` credited a read of
+`foo.ts`. Round 2 split by provenance: host argument, shell operand, recovered
+from disk. Round 3 added the fourth class, a path pi-lens generates itself (the
+cwd `lens_diagnostics` injects for a workspace scan), which the fold had
+re-resolved. A Greptile thread then found the shell quoting bit keyed by word
+text, so a quoted pattern and an unquoted filename with the same text shared
+one verdict. The rename destination stays out as #4578.
+
+The same session added a fixer contract line: a new shape is a PR-body
+proposal, because #4577's fixer wrote shape 74 into `AGENTS.md` unasked and
+redded the governance suites.
+
+## 2026-10-17 — one session identity per field; fixtures that adopt an ancestor root
+
+Shape 72 ("Process-global last-write-wins session field") and shape 73 ("Fixture
+adopts an ancestor root") entered the catalog here.
+
+**The last-write-wins fields.** One pi-lens activation serves several live
+sessions. #4554 kept the stored role of the last writer and asked that role for
+the shared teardown. A headless `pi -p` run that had started in-process
+sub-agents then printed its answer and never exited: 7 of 13 runs on
+2026-10-16/17. #4563 answers from live membership instead, so the teardown
+belongs to the last member that leaves. #4564 is the formatter's copy of the
+same field: one process-global `FormatService` and one `currentSessionID`
+replace each other on every alternating call, and each replacement drops the
+other session's `FileTime` record. No guard scans for the shape yet.
+
+**The ancestor root behind #4546.** #4546 asked for one session-scoped reset
+export for fresh-module seams, and #4559 delivered it. Its pre-push then redded
+three times on the quick-mode cell with `expected undefined`. That cell saved a
+snapshot under its fixture and planted no marker, so an empty `/tmp/.git` on the
+dev host became the project root and the snapshot was read from the tmp root. A
+`TMPDIR` holding only that `.git` reproduced the red; a clean one passed. #4559
+planted `package.json` in that cell. #4560 tracks the class: 91 real
+`handleSessionStart` invocations, 38 candidate cells, three private marker
+planters, and writes at the tmp root that nothing removes.
+
+**The daemon died at 10:48.** `systemd-oomd` killed the plegma daemon with four
+heavy lanes inside its cgroup, #4554's round 3 among them. Those rounds
+restarted in fresh trees, and no work was lost: a lane's tree keeps uncommitted
+work.
+
+**Two bot reviews went unanswered.** #4548 and #4558 landed with open Greptile
+threads. #4558's thread was answered "accepted and disclosed" only after the
+merge, when the land could no longer wait on it. `docs/pi-lens-merge-policy.md`
+now requires a disposition reply on every bot thread and its resolution before
+the merge, with a Common mistakes row for both PRs.
+
+**A trust fix shipped without an advisory.** #4530 describes a lookup class and
+states no attack path, so the maintainer decided it ships as an ordinary public
+PR with no security advisory. Its wording stays at class level.
+
+**The principles digest.** Greptile's custom context carried a pasted copy of
+`docs/engineering-principles.md`, a third copy that could drift from the repo
+file unnoticed. The maintainer replaced it with a pointer to the repo files. AGENTS.md "How to use this file" now carries a 12-line digest, each
+line linking its section of the vendored file, and
+`tests/config/principles-digest.test.ts` reds on an anchor the vendored file
+lacks.
+
+## 2026-10-16 — one signal wired consumer by consumer (shape 71)
+
+A read-only audit (#4535) found five push detectors for disk changes pi-lens
+did not author: opaque bash recovery, the HEAD look, the #4528 out-of-band
+look, the settled sweep and the LSP drift heartbeat. Each wired its own
+consumers. After a HEAD move, LSP resynced while the review graph, symbol
+search and project snapshot served the old content. Every fixer had written a
+consolidation verdict, and each searched only its own seam's call names. #4528
+searched `notifyExternalFileChange\(` and concluded that no seam stamped
+installs, while `clients/` held six freshness modules. Reviewers re-ran the
+same query. The orchestrator grouped issues by consumer and filed eleven
+gaps (#4532) before asking why. Fixes: the fixer and reviewer search by
+primitive (#4536), shape 71, the three-issue audit rule, and the publisher
+with a consumer census (#4535).
+
+## 2026-10-16 retro
+
+Run by the orchestrator over the 2026-10-16 session. Where each finding landed:
+
+- **Sibling search by call name (judgement, built).** See shape 71 above.
+- **Script imported `dist/` before any build (mechanical, built in #4531).**
+  #4525 shipped `scripts/assert-evaluated.mjs` importing `dist/` through
+  `lib/clean-signal.mjs`. `tool-smoke-prs` runs it on an unbuilt checkout, so
+  every refresh PR would hold on `ERR_MODULE_NOT_FOUND`. The #4518 fixer found
+  it from a `git archive`. #4531 adds an import-walk test whose dynamic-import,
+  side-effect and `createRequire` plants red.
+- **Workflow step shell pinned as text (mechanical, folded into #4531 r2).**
+  Four mutations of the Swift, APFS and handshake shell survived because tests
+  only matched the step text. Deleting `set +e` would turn the intended
+  "still crashes" outcome red.
+- **An inconclusive answer read as cleared (shape 7, folded into #4533 r2).**
+  The born-after-start witness accepted "check timed out - NOT the same as 0
+  diagnostics" as cleared.
+- **Line-only match across rules (judgement, folded into #4529 r2).** The new
+  dispatcher drop keyed a server finding to napi's blocker by line only, so a
+  different rule's warning on that line read as clean.
+- **Orchestrator tooling (mechanical, built outside this repo).** The
+  post-land tree prune deleted a live reviewer tree whose merge was not
+  committed. It now skips trees with local changes or a running process.
+  The hand-back router now resolves resumed agents and reads the round from
+  the ledger.
+
+## 2026-10-15 — population-deriving scanners fail closed
+
+`AGENTS.md` "Test requirements" gained the fail-closed rule. Issue #4429:
+#4411 review F3 found five spellings its route derivation skipped, and of
+seven `*ratchet*.test.ts` files only two (`flake-shape-ratchet`,
+`worker-message-boundary-ratchet`) redded on a spelling their scanner could
+not read. The single-flight, run-outcome, project-trust seam,
+delivery-surface and strictness scanners now report an unclassified spelling
+with its file and line. Making them fail closed surfaced three mis-scoped
+populations on master, none a bypass: `index.ts` strictness errors fell into
+an unratcheted bucket (4 and 23), two delivery exemptions were held only by
+a marker in a doc comment, and `clients/mutating-tool.ts` spelled its marker
+`\u{1F534}` (registered, but invisible to the raw-character needle).
+
+## 2026-10-14 retro (contract rules and shape backfill)
+
+Run over the 2026-10-14 orchestration session by the retro writer lane
+(#4426). Eight findings, two contract rules, no refutation. Where each landed:
+
+- **Dist precondition (mechanical, filed).** At least 5 lanes (#4417, #4418,
+  the #4422 verify, the #4410 r1 review, the #4423 review F5) ruled out the
+  same 3 census reds that need `npm run build:dist`. Filed as #4436; `CLAUDE.md`
+  build bullet names the command meanwhile. Mistake row in
+  `docs/pi-lens-merge-policy.md`.
+- **Fixed 3000 ms wait budget (mechanical, filed).** `interleaving-kit`
+  `waitFor` ran out under CI load (run 38618401454,
+  `tests/clients/fix-run-restore.test.ts:378`); the file passed alone and under 3 seeds.
+  Filed as #4437. Mistake row.
+- **Brief asked a worker to wait for an answer (judgement).** "Report the size
+  first" before a large migration; the #4432 fixer did the migration anyway.
+  `AGENTS.md` "Orchestration and delegated work" and a mistake row.
+- **Brief named a file by basename (judgement).** "index.ts" meant
+  `clients/lsp/index.ts`; a Haiku pass searched the root `index.ts` and
+  reported the #2052 comment missing. Same bullet group and a mistake row.
+- **Haiku on a design lane (judgement).** #4342 rounds 1 and 2 left a
+  wall-clock bound, a wrong offline premise and a 13-vs-20 population; a fresh
+  Opus round with a state table passed verify first time (#4410 round 3).
+  Haiku folds with a prescribed remedy (#4340, #4341, #4345, #4356, #4368,
+  #4372, #4374, #4417) landed first try. `docs/pi-lens-merge-policy.md` already
+  said Haiku takes mechanical lanes and never detectors or lifecycle seams; the
+  missing half, a lane that must find its own failure space, is one sentence in
+  the `AGENTS.md` routing bullet. Mistake row.
+- **Blast radius missed a caller (judgement, rule already present).** #4411
+  round 3 changed `touchFile`'s result and the body left out the cascade
+  neighbour caller (`clients/dispatch/integration.ts:2139`), which then printed an uncaused
+  "inconclusive" line every turn (review N2). `AGENTS.md` already requires
+  `module_report` with `blastRadius: true` before and after, and the reviewer
+  contract already reads every caller; no new line, a mistake row only.
+- **Stale ledger rows on refs to closes (mechanical, orchestrator tooling).**
+  The closes-check refused two lands (#4422, #4409). Not a repo rule or check;
+  mistake row names it for the orchestrator's land tooling.
+- **PR body linted only at hand-back (judgement).** #4423's advisory `PR body`
+  check went red on 5 consecutive pushes in round 2 with the same findings.
+  `docs/pi-lens-subagent.md` already lints before `gh pr create` and
+  `gh pr edit`, `docs/pi-lens-fixer.md` before hand-back; the gap was the push
+  that edits no body. One line in the fixer's "Fix rounds" and a mistake row.
+  A hook would need the network and the PR number, so it stays judgement.
+
+Contract rules added the same day:
+
+- **User-facing assertion** (`AGENTS.md` "Test requirements"). #4411 review F1:
+  the route matrix read the runner row while the write path printed "✓ JSON
+  clean" for an unconfirmed file. A test that pins user-facing behaviour
+  asserts the user-facing text or effect, not only an internal status field.
+  A close relative of shape 7 (vacuous test); one instance, so a rule and not
+  a catalog shape.
+- **Timing contention model** (same section). #4426: the loop-block CPU-spin
+  case failed at 79% CPU on a loaded runner (run 38604587190). An admitted
+  timing test states its contention model: it measures how long the OS paused
+  the worker, or asserts on CPU time rather than wall time. One instance;
+  `tests/clients/flake-shape-ratchet.test.ts` already admits timing tests but
+  cannot judge the model, so the rule stays judgement.
+- **Detection lesson names the shape and its enforcer** (`docs/pi-lens-fixer.md`
+  and `docs/pi-lens-merge-policy.md` "Detection retrospective on every merged
+  bug fix"). Merges #4390, #4391 and #4377 each closed their gap with a
+  one-bug test, and #4409 said "this layer" before its class went red on
+  master (install-smoke run 38610594076). The lint half is #4439.
+
+Catalog decisions: no new shape. The uncontained worker message listener
+(#4400) is already shape 53 (commit 2e9e44c45). Test-order dependence found by
+shuffling (#4405) is the case the "A case never reads state a sibling case or
+file wrote" screen and the `Targeted tests (advisory)` shuffle lane already
+cover; the repo-wide census is #4405 itself. Shapes 4, 6, 7, 9, 10, 13, 17, 21,
+22 and 25 now cite their live sweep tests (2026-10-14 shape triage: 68 shapes,
+9 fully and 13 partially enforced); each partial names its gap, and none of
+those paths was missing from `git ls-files`.
+
+Steering audit: no line in `AGENTS.md`, the role contracts or the skills had
+session evidence of changing no decision, so no line was deleted.
+
+## 2026-10-15 — enumerated detector (shape 69)
+
+Shape 69 entered the `AGENTS.md` catalog with a fixer contract bullet: a
+detector PR plants three spellings its author did not design for and quotes
+each result. Incident: three detector PRs in one day passed their own plants
+and missed the reviewer's. On #4457 (refs #4429) the vi-mock resolver let a
+helper parameter, a re-export alias and object members through in r2, the
+third round on that seam. On #4459 (refs #1634) the delivery census missed an
+aliased import, a missing store and `sendUserMessage`. The remedy in both was
+to key the needle on the seam, not on the spellings. Enforcer: the contract
+bullet; an advisory survivor list is #4467.
+
+## 2026-10-15 — joined single flight (shape 70)
+
+Shape 70 entered the catalog on its second instance. #4154 settled J1 as
+deliver-and-carry for a joined scan. The first fix for #4166 (contributor PR
+#4462) withheld the joined knip answer instead. The #4462 review showed a
+foreign row write between the join and the next scan dropped the finding,
+which master delivered. Its fix round uses J1's rule.
+
+## 2026-10-14 — sink read before drain (shape 67)
+
+Shape 67 entered the `AGENTS.md` catalog with `tests/config/sink-read-drain-sweep.test.ts`
+as its enforcer. Incident: master run 38515888889 (ba42937f8, a docs-only
+merge) went red in `tests/clients/config-resolved-phase.test.ts` "re-arms
+nothing and publishes no config-resolution line of its own" (expected 0 lines,
+got 2). `loadLSPConfig` publishes its row synchronously while `logSessionStart`
+only enqueues, so the test took its byte offset at `:622` with bytes from the
+load still queued and counted them. Earlier members of the same shape: #3682
+(PR #3720), #3721 (PR #3892), #3193. Issue #4381; fix and sweep PR #4384
+(`629d68661`, catalog `c61d81584`). Only one hit in 169 failed runs since
+09-30, which is why a sweep and not a retry.
+
+## 2026-10-14 — model switch drift (shape 68)
+
+Shape 68 entered the `AGENTS.md` catalog with `tests/config/tla-switch-pins.test.ts`
+over `formal/switch-pins.json` as its enforcer. Incident: #4235 (55fa5210c)
+removed the injected whole-file read on the zero-read allow; the read-guard TLA+
+model kept modelling that read, and TLC proved the old design green, so two
+read-guard defects stayed invisible until the external report #4387 (a
+top-level `write` then `edit` retired authorship as a bridge write and blocked
+a later edit with "File modified since your write"). The TLA+ coverage rule
+(#3802) checks that a PR touching a modelled file mentions the model, not that
+the model still matches the code; a `TLA+ unaffected` line cleared the drift.
+Fix #4392 added the switches `ZeroReadInjects` and `OldTextRetires`; PR #4395
+made an unaffected line never cover an as-built constant and added the shape;
+PRs #4399 and #4432 pin the switches (read-guard fully; dispatch and format).
+Open: #4393 (the other families' code choices stay `deferred` with a reason).
+
 ## 2026-10-10 — project-trust test doubles (#4281)
 
 Four recent regressions showed that whole-module in-process doubles and hand-built

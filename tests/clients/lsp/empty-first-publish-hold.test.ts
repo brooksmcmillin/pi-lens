@@ -44,11 +44,9 @@ const PHP_DEBOUNCE_MS = 150;
 // Keep one explicit row per marker server: a new marker must add its consumer
 // cases here, and removing a marker leaves the stale row red. This prevents a
 // parameterized suite from silently shrinking when the strategy table drifts.
-const EMPTY_FIRST_PUBLISH_CONSUMER_SERVERS = [
-	"php",
-	"terraform",
-	"typescript",
-] as const;
+// #4615: typescript left the class (its matrix `first-publish` cell is the
+// measured `direct`), so its row is gone rather than silently parametrized out.
+const EMPTY_FIRST_PUBLISH_CONSUMER_SERVERS = ["php", "terraform"] as const;
 
 const FINDING: LSPDiagnostic = {
 	severity: 1,
@@ -239,6 +237,27 @@ describe("#3310 empty-first-publish hold (php/intelephense class)", () => {
 		const yamlKey = normalizeMapKey("/project/app.yaml");
 		expect(state.pushDiagnostics.get(yamlKey)).toEqual([]);
 		expect(emitted).toEqual([yamlKey]);
+		expect(
+			logLatency.mock.calls.filter(
+				([row]) =>
+					(row as { phase?: string }).phase === "lsp_empty_first_publish_held",
+			),
+		).toEqual([]);
+	});
+
+	it("resolves TypeScript's clean empty first publish — the class no longer holds it (#4615)", () => {
+		// The matrix's `typescript` `first-publish` cell is the measured `direct`,
+		// so no hold exists: a clean file's only publish (an empty settled answer,
+		// measured on the wire 2026-10-20) resolves the wait instead of being
+		// swallowed into an unconfirmed touch that spends the full budget.
+		const { state, publish, emitted } = armHandler("typescript");
+
+		publish({ uri, diagnostics: [] });
+		vi.advanceTimersByTime(200);
+
+		expect(state.pushDiagnostics.get(KEY)).toEqual([]);
+		expect(emitted).toEqual([KEY]);
+		expect(state.emptyFirstPublishHoldSpent).toBeFalsy();
 		expect(
 			logLatency.mock.calls.filter(
 				([row]) =>

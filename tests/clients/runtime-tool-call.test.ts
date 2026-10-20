@@ -322,6 +322,8 @@ describe("handleToolCall", () => {
 					provisional: true,
 					source: "native-read:read-call:provisional",
 				}),
+				// #1649: the handler's one pass is the capture; the guard takes none.
+				{ captureLineHashes: false },
 			);
 			expect(recordRead.mock.calls[0]?.[0]).not.toHaveProperty("toolCallId");
 			expect(touchFileMock).toHaveBeenCalled();
@@ -2173,6 +2175,48 @@ describe("#4187 R4-1 — a bytes-less write advances only what its own call name
 					toolCallId: "call-reuse",
 				}),
 			).toBe(true);
+			expect(runtime.readGuard.checkEdit(filePath, [2, 2]).action).toBe(
+				"block",
+			);
+		} finally {
+			bridgeRuntime = undefined;
+			bridgeRoot = "";
+			env.cleanup();
+		}
+	});
+
+	it("spends an observed bridge license after one whole-file write (SpendLicense)", async () => {
+		// #4393 pin for formal/read-guard SpendLicense (== BridgeNoAdvance): a
+		// whole-file record keeps the authorship's whole-file scope, so only the
+		// spent license refuses the second writer's line. Recurrence: a reusable
+		// (call,path) license survived every suite (#4399 review F2).
+		const env = setupTestEnvironment("pi-lens-4393-license-spend-whole-");
+		try {
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			bridgeRuntime = runtime;
+			bridgeRoot = env.tmpDir;
+			const filePath = createTempFile(env.tmpDir, "whole.ts", LICENSE_FIXTURE);
+			bashAuthor(runtime, filePath, "call-whole-bash");
+			await callTool(runtime, env.tmpDir, {
+				toolName: "ast_grep_replace",
+				toolCallId: "call-whole",
+				input: { apply: true, paths: ["whole.ts"] },
+			});
+			const bridge = getMutationBridge();
+			const record = () =>
+				bridge?.recordMutation({
+					filePath,
+					kind: "write",
+					consumer: "observed-license-spend-whole",
+					provenance: "observed",
+					toolCallId: "call-whole",
+				});
+			toolRewriteLine3(filePath);
+			expect(record()).toBe(true);
+			foreignWriteLine2(filePath);
+			toolRewriteLine3(filePath);
+			expect(record()).toBe(true);
 			expect(runtime.readGuard.checkEdit(filePath, [2, 2]).action).toBe(
 				"block",
 			);

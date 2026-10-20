@@ -4,6 +4,10 @@
  *
  * The file is deliberately a small process boundary: callers can use it from
  * a shell or a test without importing the test runner or the project build.
+ *
+ * Vitest runs in its own process group, so SIGINT, SIGTERM and SIGHUP to this
+ * process kill that whole group, but a group SIGKILL of this process
+ * (`kill -KILL -<pgid>`) does not reach vitest (#4510).
  */
 import { createHash } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
@@ -21,6 +25,7 @@ import {
 	normalizeVitestOutput,
 	parseVitestSummary,
 } from "./lib/vitest-summary.mjs";
+import { escapeMarkdownCell } from "./lib/markdown-cell.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -28,7 +33,8 @@ function usage(message) {
 	if (message) console.error(`mutate.mjs: ${message}`);
 	console.error(
 		"usage: scripts/mutate.mjs --file <path> --find <text|/regex/> --replace <text> --tests <files…> [--built] [--table] [--allow-comment]\n       scripts/mutate.mjs --restore [--file <path>]\n" +
-			"exit codes: 0 or the test runner's code, 1 refused or failed, 2 usage, 4 the run could not restore its file (a journal remains)",
+			"exit codes: 0 or the test runner's code, 1 refused or failed, 2 usage, 4 the run could not restore its file (a journal remains)\n" +
+			"status line: SURVIVED (tests passed), RED (a test failed), REFUSED (no edit applied), BROKEN (build failed), ERROR (no verdict)",
 	);
 	process.exitCode = 2;
 }
@@ -301,11 +307,22 @@ function failedTitles(output) {
 }
 
 function classifyTestRun(testRun) {
-	if (parseVitestSummary(testRun.output).noTests) return "ERROR";
+	// Only a finished run that printed its `Tests` summary reached a verdict.
+	// A signal close (vitest killed from outside) or a missing summary (a bad
+	// --tests path prints "No test files found") is ERROR, never RED (#4510).
+	if (testRun.signal) return "ERROR";
+	const summary = parseVitestSummary(testRun.output);
+	if (
+		summary.noTests ||
+		(summary.testsPassed === null &&
+			summary.testsFailed === null &&
+			summary.testsSkipped === null)
+	)
+		return "ERROR";
 	return testRun.code === 0 ? "SURVIVED" : "RED";
 }
 
-function runTests(files, onSignal) {
+function runTests(files) {
 	return new Promise((resolve) => {
 		const command = path.join(root, "node_modules", ".bin", "vitest");
 		const child = spawn(
@@ -315,6 +332,9 @@ function runTests(files, onSignal) {
 				cwd: root,
 				env: process.env,
 				stdio: ["ignore", "pipe", "pipe"],
+				// Its own process group, so a signal can end the launcher and its
+				// worker forks together (#4510).
+				detached: process.platform !== "win32",
 			},
 		);
 		activeChild = child;
@@ -327,14 +347,8 @@ function runTests(files, onSignal) {
 			output += chunk;
 			process.stderr.write(chunk);
 		});
-		const stop = () => {
-			child.kill("SIGINT");
-			onSignal();
-		};
-		process.once("SIGINT", stop);
 		child.once("close", (code, signal) => {
 			activeChild = null;
-			process.removeListener("SIGINT", stop);
 			// The shared Vitest parser strips colour for the classification;
 			// report the same plain text in the table.
 			resolve({
@@ -347,6 +361,17 @@ function runTests(files, onSignal) {
 }
 
 let activeChild = null;
+
+/** SIGKILLs the running vitest's whole process group; the launcher alone leaves its worker fork spinning. */
+function killActiveRun() {
+	if (!activeChild) return;
+	try {
+		if (process.platform === "win32") activeChild.kill("SIGKILL");
+		else process.kill(-activeChild.pid, "SIGKILL");
+	} catch {
+		// Already gone; the journals are still restored.
+	}
+}
 
 function build() {
 	const result = spawnSync(
@@ -364,7 +389,7 @@ function build() {
 }
 
 function appendTable(options, result) {
-	const row = `| ${options.file} | ${result.code} | ${result.status} | ${result.failed.length ? result.failed.join(" ") : "—"} |\n`;
+	const row = `| ${options.file} | ${result.code} | ${result.status} | ${result.failed.length ? escapeMarkdownCell(result.failed.join(" ")) : "—"} |\n`;
 	const body = path.join(root, "PR_BODY.md");
 	if (options.table && statExists(body))
 		writeFileSync(body, `${readFileSync(body, "utf8")}${row}`);
@@ -431,8 +456,11 @@ async function main() {
 	}
 	// Files whose journal this run created, in creation order.
 	const owned = [];
-	let result = { code: 2, failed: [], status: "RED" };
-	let interrupted = false;
+	// Every status but RED means no test run failed the mutation (#4510):
+	// REFUSED (the edit was not applied), BROKEN (the build failed), ERROR (no
+	// verdict). `stage` says which step a thrown error came from.
+	let result = { code: 2, failed: [], status: "ERROR" };
+	let stage = "setup";
 	let handlingSignal = false;
 	const restoreOwned = () => {
 		const refusals = [];
@@ -445,9 +473,8 @@ async function main() {
 	const signalHandler = (signal) => {
 		if (handlingSignal) return;
 		handlingSignal = true;
-		interrupted = true;
 		try {
-			if (activeChild) activeChild.kill("SIGKILL");
+			killActiveRun();
 			for (const refusal of restoreOwned())
 				console.error(`mutate.mjs: ${refusal}`);
 		} finally {
@@ -471,6 +498,7 @@ async function main() {
 		const original = originals.get(target);
 		const lexer = lexerLanguage(target) ? await import("@ast-grep/napi") : null;
 		const text = original.toString("utf8");
+		stage = "edit";
 		const mutated = Buffer.from(
 			mutationFor(
 				text,
@@ -481,6 +509,7 @@ async function main() {
 			),
 			"utf8",
 		);
+		stage = "setup";
 		writeJournal(target, journalOf(target, original, mutated));
 		owned.push(target);
 		writeFileSync(target, mutated);
@@ -491,6 +520,7 @@ async function main() {
 			writeJournal(twin, journalOf(twin, twinBytes, twinBytes));
 			owned.push(twin);
 			try {
+				stage = "build";
 				build();
 			} finally {
 				// Nothing else runs between the build and this record, so the
@@ -498,20 +528,16 @@ async function main() {
 				replaceJournal(twin, journalOf(twin, twinBytes, readFileSync(twin)));
 			}
 		}
-		if (interrupted)
-			result = { code: 130, failed: ["interrupted"], status: "RED" };
-		else {
-			const testRun = await runTests(options.tests, () => {
-				interrupted = true;
-			});
-			result = {
-				code: testRun.code,
-				failed: failedTitles(testRun.output),
-				status: classifyTestRun(testRun),
-			};
-		}
+		stage = "test";
+		const testRun = await runTests(options.tests);
+		result = {
+			code: testRun.code,
+			failed: failedTitles(testRun.output),
+			status: classifyTestRun(testRun),
+		};
 	} catch (error) {
-		result = { code: 1, failed: [error.message], status: "RED" };
+		const status = { edit: "REFUSED", build: "BROKEN" }[stage] ?? "ERROR";
+		result = { code: 1, failed: [error.message], status };
 	}
 	const refusals = restoreOwned();
 	for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"])

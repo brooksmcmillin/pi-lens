@@ -1082,7 +1082,10 @@ describe("Git ownership certainty preserves the legacy marker API", () => {
 	);
 
 	it("retains valid and invalid file/directory marker semantics in both modes", () => {
-		const env = setupTestEnvironment("pi-lens-marker-certainty-shapes-");
+		// #4560: this cell writes `.git` as a FILE too, so no shared marker.
+		const env = setupTestEnvironment("pi-lens-marker-certainty-shapes-", {
+			rootMarker: false,
+		});
 		try {
 			const marker = path.join(env.tmpDir, ".git");
 			const check = (valid: boolean) => {
@@ -1184,7 +1187,6 @@ describe("Git ownership certainty preserves the legacy marker API", () => {
 	it("exposes the exact 64-iteration boundary and home ceiling without changing legacy null", () => {
 		const env = setupTestEnvironment("pi-lens-marker-certainty-depth-");
 		try {
-			fs.mkdirSync(path.join(env.tmpDir, ".git"));
 			fs.writeFileSync(
 				path.join(env.tmpDir, ".git", "HEAD"),
 				"ref: refs/heads/main\n",

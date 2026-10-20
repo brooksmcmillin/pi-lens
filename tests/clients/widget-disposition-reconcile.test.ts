@@ -5,7 +5,9 @@ import {
 	__testing,
 	admitWidgetDiagnosticsWrite,
 	clearWidgetState,
+	getFileDiagnosticSummaries,
 	getFileDiagnostics,
+	reconcileStaleWidgetFiles,
 	reconcileWidgetDisposition,
 	recordDiagnostics,
 	renderWidget,
@@ -202,6 +204,30 @@ describe("widget disposition reconciliation (#1616)", () => {
 				],
 			}),
 		]);
+	});
+
+	// #4625: the stale sweep keeps a record whose findings it shed as unfinished
+	// evidence. A mark only re-tags the rows a record already holds; it says
+	// nothing about whether the file was analysed again, so it must not turn
+	// that record into a final snapshot (a file that never re-ran reading ✓).
+	it("keeps a retained stale record unfinished, and unreported, when a mark reconciles it", async () => {
+		recordFinding();
+		const changed = new Date(Date.now() + 60_000);
+		fs.utimesSync(filePath, changed, changed);
+		expect(await reconcileStaleWidgetFiles()).toBe(1);
+
+		markDisposition(
+			process.cwd(),
+			{ ...targetBase, cwd: process.cwd(), filePath, content },
+			"false-positive",
+		);
+
+		expect(
+			getFileDiagnosticSummaries().map((s) => [s.filePath, s.hasFinalSnapshot]),
+		).toEqual([[filePath, false]]);
+		// The mark left the record's clock at the sweep, never below the file's
+		// mtime, so the next sweep finds nothing new to report.
+		expect(await reconcileStaleWidgetFiles()).toBe(0);
 	});
 
 	it("marks during an in-flight dispatch and rejects the stale completion", async () => {

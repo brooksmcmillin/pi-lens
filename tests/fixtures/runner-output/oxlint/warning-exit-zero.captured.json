@@ -11,10 +11,38 @@
 		],
 		"workspace": "tests/fixtures/tool-smoke/js-oxlint-warning",
 		"platform": "win32-x64",
-		"capturedAt": "2026-08-21"
+		"capturedAt": "2026-08-21",
+		"versionArgv": [
+			"--version"
+		]
 	},
 	"file": "bad.js",
 	"exitCode": 0,
 	"stdout": "{ \"diagnostics\": [{\"message\": \"Variable 'unused' is declared but never used. Unused variables should start with a '_'.\",\"code\": \"eslint(no-unused-vars)\",\"severity\": \"warning\",\"url\": \"https://oxc.rs/docs/guide/usage/linter/rules/eslint/no-unused-vars.html\",\"help\": \"Consider removing this declaration.\",\"filename\": \"bad.js\",\"labels\": [{\"label\": \"'unused' is declared here\",\"span\": {\"offset\": 188,\"length\": 6,\"line\": 4,\"column\": 8}}]}],\n              \"number_of_files\": 1,\n              \"number_of_rules\": 96,\n              \"threads_count\": 16,\n              \"start_time\": 0.606185\n            }\n            ",
-	"stderr": ""
+	"stderr": "",
+	"availability": [
+		{
+			"command": "oxlint",
+			"argv": [
+				"--version"
+			],
+			"version": "1.86.0",
+			"exitCode": 0,
+			"stdout": "Version: 1.86.0\n\n",
+			"stderr": ""
+		}
+	],
+	"clean": {
+		"workspace": "tests/fixtures/runner-output-clean/oxlint",
+		"file": "bad.js",
+		"argv": [
+			"--format",
+			"json",
+			"bad.js"
+		],
+		"version": "1.86.0",
+		"exitCode": 0,
+		"stdout": "{ \"diagnostics\": [],\n              \"number_of_files\": 1,\n              \"number_of_rules\": 96,\n              \"threads_count\": 32,\n              \"start_time\": 0.024232642\n            }\n            ",
+		"stderr": ""
+	}
 }

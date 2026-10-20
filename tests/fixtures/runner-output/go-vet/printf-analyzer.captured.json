@@ -1,0 +1,46 @@
+{
+	"provenance": {
+		"runner": "go-vet",
+		"tool": "go",
+		"version": "1.27.2",
+		"command": "go vet .",
+		"argv": [
+			"vet",
+			"."
+		],
+		"workspace": "tests/fixtures/tool-smoke/go-vet-printf",
+		"platform": "linux-x64",
+		"capturedAt": "2026-10-14",
+		"versionArgv": [
+			"version"
+		]
+	},
+	"file": "bad.go",
+	"exitCode": 1,
+	"stdout": "",
+	"stderr": "bad.go:9:14: fmt.Printf format %d has arg \"not a number\" of wrong type string\n",
+	"availability": [
+		{
+			"command": "go",
+			"argv": [
+				"version"
+			],
+			"version": "1.27.2",
+			"exitCode": 0,
+			"stdout": "go version go1.27.2 linux/amd64\n",
+			"stderr": ""
+		}
+	],
+	"clean": {
+		"workspace": "tests/fixtures/runner-output-clean/go-vet",
+		"file": "bad.go",
+		"argv": [
+			"vet",
+			"."
+		],
+		"version": "1.27.2",
+		"exitCode": 0,
+		"stdout": "",
+		"stderr": ""
+	}
+}

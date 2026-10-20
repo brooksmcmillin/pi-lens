@@ -20,19 +20,19 @@ import {
 	releaseGeneration,
 	tryAcquireGeneration,
 } from "../../clients/generation-lock.js";
+import { scaledTestTimeout } from "../support/test-timeout-scale.js";
 
 const tempDirs: string[] = [];
 
+// #4405: the degradation ledger is module state. Only some describes reset it,
+// so under a shuffle a `generation-lock-legacy-held` record from another
+// describe leaked into a count (seeds 3, 5 and 606: expected 4 to be 1).
 afterEach(() => {
 	for (const dir of tempDirs.splice(0)) {
 		fs.rmSync(dir, { recursive: true, force: true });
 	}
+	resetDegradationLedger();
 });
-
-const testTimeoutScale = (() => {
-	const parsed = Number(process.env.PI_LENS_TEST_TIMEOUT_SCALE ?? "1");
-	return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
-})();
 
 const lockModuleUrl = pathToFileURL(
 	path.resolve("clients/bounded-pid-file-lock.js"),
@@ -40,7 +40,7 @@ const lockModuleUrl = pathToFileURL(
 
 function waitForFileSync(file: string): boolean {
 	const pause = new Int32Array(new SharedArrayBuffer(4));
-	const until = Date.now() + 10_000 * testTimeoutScale;
+	const until = Date.now() + scaledTestTimeout(10_000);
 	while (!fs.existsSync(file)) {
 		if (Date.now() > until) return false;
 		Atomics.wait(pause, 0, 0, 5);
@@ -213,7 +213,7 @@ describe("pid-file locks: generation takeover (#3476)", () => {
 							const inside = path.join(dir, "p4.inside");
 							const gaveUp = path.join(dir, "p4.gaveup");
 							const pause = new Int32Array(new SharedArrayBuffer(4));
-							const until = Date.now() + 10_000 * testTimeoutScale;
+							const until = Date.now() + scaledTestTimeout(10_000);
 							while (!fs.existsSync(inside) && !fs.existsSync(gaveUp)) {
 								if (Date.now() > until) break;
 								Atomics.wait(pause, 0, 0, 5);
@@ -439,8 +439,6 @@ describe("acquireBoundedPidFileLock across versions (#3476)", () => {
 		);
 	}
 
-	afterEach(() => resetDegradationLedger());
-
 	// A writer from before #3476 takes only `<store>.lock`, with `wx`.
 	it("holds the pre-generation lock file while inside, so an older writer blocks", () => {
 		const { lockPath } = lockIn();
@@ -584,8 +582,6 @@ describe("acquireQuarantinePidFileLock across versions (#3476)", () => {
 			getDegradationSummary().find((group) => group.kind === kind)?.count ?? 0
 		);
 	}
-
-	afterEach(() => resetDegradationLedger());
 
 	// A writer from before #3476 takes only the `<store>.lock` directory.
 	it("holds the pre-generation lock directory while inside, so an older writer blocks", async () => {
@@ -740,7 +736,6 @@ describe("acquireBoundedPidFileLock: remembered-holder skip (#3594)", () => {
 	afterEach(() => {
 		vi.useRealTimers();
 		vi.restoreAllMocks();
-		resetDegradationLedger();
 	});
 
 	/**

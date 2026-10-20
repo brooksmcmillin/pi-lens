@@ -18,6 +18,7 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { LOCK_WAIT_THROUGH_LEASE_MS } from "../../clients/instance-registry-lock.js";
 import { normalizeFilePath } from "../../clients/path-utils.js";
+import { fixtureHomeRoot, pinFixtureHome } from "../clients/test-utils.js";
 import { REGISTRY_SETTLE_BOUND_MS } from "./vitest-setup.js";
 
 const REPO = fileURLToPath(new URL("../..", import.meta.url));
@@ -40,10 +41,18 @@ function outcomeOf(fixture: string): string | undefined {
 	return `${result.status}: ${result.message ?? ""}`;
 }
 
-beforeAll(async () => {
-	root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-registry-teardown-"));
-	const outputFile = path.join(root, "report.json");
-	stderr = await new Promise<string>((resolve) => {
+/**
+ * Run the fixture files in a child Vitest that loads the REAL shared setup, and
+ * read what its forks left behind. The environment is this worker's own plus
+ * the three values a child must not inherit differently, so the child is the
+ * production shape rather than a curated one (#4591 V1 inherits the rest).
+ */
+async function runChild(
+	label: string,
+	childRoot: string,
+): Promise<{ report: FixtureReport; stderr: string }> {
+	const outputFile = path.join(childRoot, `${label}-report.json`);
+	const childStderr = await new Promise<string>((resolve) => {
 		execFile(
 			process.execPath,
 			[
@@ -59,8 +68,8 @@ beforeAll(async () => {
 				timeout: 60_000,
 				env: {
 					...process.env,
-					PI_LENS_HOME: root,
-					REGISTRY_TEARDOWN_ROOT: root,
+					PI_LENS_HOME: childRoot,
+					REGISTRY_TEARDOWN_ROOT: childRoot,
 					// The `[mem-file]` line is written last, after the teardown
 					// checks, so it shows they ran.
 					PI_LENS_TEST_MEM_REPORT_MB: "1",
@@ -69,7 +78,21 @@ beforeAll(async () => {
 			(_error, _stdout, childStderr) => resolve(String(childStderr)),
 		);
 	});
-	report = JSON.parse(fs.readFileSync(outputFile, "utf8")) as FixtureReport;
+	let parsed: FixtureReport = { testResults: [] };
+	try {
+		parsed = JSON.parse(fs.readFileSync(outputFile, "utf8")) as FixtureReport;
+	} catch {
+		// A child that died before the reporter wrote has no results; the cases
+		// that need an outcome say so by name.
+	}
+	return { report: parsed, stderr: childStderr };
+}
+
+beforeAll(async () => {
+	root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-registry-teardown-"));
+	const child = await runChild("main", root);
+	report = child.report;
+	stderr = child.stderr;
 }, 90_000);
 
 afterAll(() => {
@@ -104,4 +127,30 @@ describe("shared setup registry settle, through the real afterAll (#3617)", () =
 			LOCK_WAIT_THROUGH_LEASE_MS,
 		);
 	});
+});
+
+describe("a nested Vitest child leaves this worker's fixture-home root alone (#4591)", () => {
+	// Both nested-Vitest spawners in this suite pass `...process.env`, so a child
+	// worker inherits `PI_LENS_TMP_HYGIENE_FIXTURE_HOME`. Publishing the inherited
+	// value made the child adopt THIS worker's root and remove it at its own
+	// teardown, taking any HOME a case had pinned inside it (#4591 V1). The child
+	// below is the real spawner, the pin is live, and both must survive it.
+	it("keeps a live pinned home under it after the child exits", async () => {
+		const { home, restore } = pinFixtureHome("registry-teardown-nested");
+		const nestedRoot = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-registry-teardown-nested-"),
+		);
+		try {
+			const child = await runChild("nested", nestedRoot);
+			// A child that never ran would read as clean here.
+			expect(child.report.testResults.length).toBeGreaterThan(0);
+			expect(fixtureHomeRoot()).toBe(path.dirname(home));
+			expect(fs.existsSync(home), `${home} was removed by the nested run`).toBe(
+				true,
+			);
+		} finally {
+			restore();
+			fs.rmSync(nestedRoot, { recursive: true, force: true });
+		}
+	}, 90_000);
 });

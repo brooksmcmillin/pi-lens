@@ -1,0 +1,260 @@
+name: Shuffle census nightly (order-dependent test files)
+
+# #4405: a test file that passes alone and fails inside the suite is invisible
+# to the changed-files shuffle job (ci.yml), which only sees the files a PR
+# touches. scripts/ci-shuffle-census.mjs runs EVERY test file inside shuffled
+# 25-file chunks under the changed-files job's two seeds (202 and 424; the
+# script default, so no flag here can drift from it), diffs the files it
+# finds against scripts/shuffle-census-ratchet.json (keyed by file), and keeps
+# ONE rolling tracking issue (the title-keyed upsert stryker-nightly.yml uses).
+# It is exploratory and gates nothing: schedule and manual only, so no PR check
+# exists.
+#
+# Shape (the design in the #4423 review, "nightly shape"):
+#   census         six parallel parts (`--part k/6`), each a slice of the
+#                  starts, each bounded by `--budget-ms` below its own
+#                  timeout-minutes; no ratchet diff here.
+#   confirm-report merges the six records, re-runs every failing member file
+#                  alone under its seed (`--confirm`), twice: the second pass
+#                  plans the rerun of any chunk whose member passed alone
+#                  (a cross-file failure repeats, a load flake does not). Each
+#                  pass stops at 15 min. Then `--report` plans the census again
+#                  from the same env and diffs against the ratchet: a planned
+#                  start with no record, or a census job that did not succeed
+#                  (`needs.census.result`), is unproven. Exit 1 (a new member,
+#                  or a ratchet entry clean two nights running) or 3 (unproven)
+#                  reds the job; exit 4 (stale entries, first night) is a
+#                  warning.
+#   publish-issue  the only writer (#4077/#4053): `issues: write`, and only on
+#                  the schedule or master. The report job hands it the body and
+#                  the exit code as an artifact, so a branch dispatch runs the
+#                  whole pipeline up to the issue edit.
+#
+# Daily runs skip the alone starts (`--no-alone`: the alone pass finds files
+# that fail by themselves, which a per-file run already shows); the weekly
+# Sunday run, or a dispatch with `with_alone`, includes them. The weekly cron
+# string below is compared with `github.event.schedule` in the workflow env,
+# which both the census parts and the report read, so they plan alike. The
+# dispatch inputs reach a shell only through that env, never inlined. The
+# daily cron skips Sunday: both crons on one night would publish the stale
+# marker at 04:30 and read it back at 05:00, counting one night as two.
+
+on:
+  schedule:
+    - cron: "30 4 * * 1-6" # Monday to Saturday 04:30 UTC, shuffled chunks only
+    - cron: "0 5 * * 0" # Sundays 05:00 UTC, the alone starts as well
+  workflow_dispatch:
+    inputs:
+      with_alone:
+        description: "Also run every test file alone (about 80 more runner-minutes)"
+        type: boolean
+        default: false
+      files:
+        description: "Comma-separated test files to census instead of the whole tree (a rehearsal subset)"
+        type: string
+        default: ""
+
+permissions: {}
+
+concurrency:
+  group: shuffle-census-nightly
+  cancel-in-progress: false
+
+env:
+  TRACKING_TITLE: "nightly: shuffle census (order-dependent test files)"
+  WITH_ALONE: ${{ github.event.schedule == '0 5 * * 0' || inputs.with_alone == true }}
+  CENSUS_FILES: ${{ inputs.files }}
+
+jobs:
+  census:
+    name: Census part ${{ matrix.part }} of 6
+    runs-on: ubuntu-latest
+    # Measured with three seeds and the alone starts (runs 38608471496 and
+    # 38618975465): a part 23 to 46 min, the slowest part holding the 350 s
+    # chunk of the LSP-heavy files; the alone starts are 78.5 min of the
+    # total. A daily run with the two seeds took 9.4 to 13.2 min a part (run
+    # 38638834171). The script stops starting vitest runs at 70 min
+    # (`--budget-ms`), so a start in flight at the cap still finishes under
+    # this timeout.
+    timeout-minutes: 80
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1, 2, 3, 4, 5]
+    permissions:
+      contents: read
+    env:
+      PI_LENS_TEST_MAX_WORKERS: "3"
+      PI_LENS_TEST_TIMEOUT_SCALE: "3"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci --no-audit --no-fund --ignore-scripts
+      # `--ignore-scripts` skips `prepare`, whose core grammar download the
+      # tests parse with; the explicit step ci.yml's targeted tests run.
+      - name: Download core grammars
+        run: node scripts/download-grammars.js --core --dest grammars
+      - run: npm run build
+      # The LSP fixture tests import dist/; the census refuses to start
+      # without it (scripts/ci-shuffle-census.mjs).
+      - run: npm run build:dist
+      - name: Run this part of the census
+        run: |
+          set -uo pipefail
+          # `npm run` puts node_modules/.bin on PATH; a bare `node` does not.
+          # The ast-grep and formatter tests look their CLI up on PATH and, with
+          # CI set, red "not installed" without it (rehearsal run 38608471496:
+          # seven files "failing alone", all tool absence).
+          export PATH="$GITHUB_WORKSPACE/node_modules/.bin:$PATH"
+          ARGS=(--out "$RUNNER_TEMP/census" --part "${{ matrix.part }}/6" --budget-ms 4200000)
+          if [ "$WITH_ALONE" != "true" ]; then
+            ARGS+=(--no-alone)
+          fi
+          if [ -n "$CENSUS_FILES" ]; then
+            ARGS+=(--files "$CENSUS_FILES")
+          fi
+          node scripts/ci-shuffle-census.mjs "${ARGS[@]}"
+      # A part that stopped at its budget exits 3 with records on disk; the
+      # confirm-report job judges what exists and names what is missing.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: census-${{ matrix.part }}
+          path: ${{ runner.temp }}/census/*.jsonl
+          if-no-files-found: ignore
+          overwrite: true
+
+  confirm-report:
+    name: Confirm members and report
+    needs: census
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # The report step only LISTS the tracking issue (`gh issue list`).
+    permissions:
+      contents: read
+      issues: read
+    env:
+      PI_LENS_TEST_MAX_WORKERS: "3"
+      PI_LENS_TEST_TIMEOUT_SCALE: "3"
+      GH_TOKEN: ${{ github.token }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          cache: npm
+      # An action input is not a shell string: `$RUNNER_TEMP` there is a
+      # literal directory under the workspace, so the path is the
+      # `runner.temp` expression the upload uses.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: census-*
+          path: ${{ runner.temp }}/census
+          merge-multiple: true
+      - run: npm ci --no-audit --no-fund --ignore-scripts
+      - name: Download core grammars
+        run: node scripts/download-grammars.js --core --dest grammars
+      - run: npm run build
+      - run: npm run build:dist
+      # Two passes: the first re-runs each failing member file alone under its
+      # seed, the second plans (and runs) the rerun of the chunk whose member
+      # passed alone. A pass that stops at its budget leaves "not confirmed
+      # yet" in the report, which is exit 3, so a failed pass is not fatal here.
+      # Each pass stops at 15 min, so both and the setup (about 4 min) fit the
+      # job's 45 with the report step still to run.
+      - name: Confirm each failing member file alone, then rerun green-alone chunks
+        run: |
+          set -uo pipefail
+          export PATH="$GITHUB_WORKSPACE/node_modules/.bin:$PATH"
+          for _pass in 1 2; do
+            node scripts/ci-shuffle-census.mjs --out "$RUNNER_TEMP/census" --confirm --part 0/1 --budget-ms 900000 || true
+          done
+      # The report plans the census again with the census parts' flags (the
+      # same workflow env) and reds a planned start with no record.
+      - name: Report against the ratchet
+        id: report
+        env:
+          CENSUS_RESULT: ${{ needs.census.result }}
+        run: |
+          set -uo pipefail
+          gh issue list --state open --label nightly-drift --search "$TRACKING_TITLE in:title" --json title,body,author --limit 100 > "$RUNNER_TEMP/census-issues.json"
+          mkdir -p "$RUNNER_TEMP/census-report"
+          ARGS=(--out "$RUNNER_TEMP/census" --census-result "$CENSUS_RESULT")
+          if [ "$WITH_ALONE" != "true" ]; then
+            ARGS+=(--no-alone)
+          fi
+          if [ -n "$CENSUS_FILES" ]; then
+            ARGS+=(--files "$CENSUS_FILES")
+          fi
+          rc=0
+          node scripts/ci-shuffle-census.mjs "${ARGS[@]}" --report --previous-issues "$RUNNER_TEMP/census-issues.json" --title "$TRACKING_TITLE" --stale-out "$RUNNER_TEMP/census-report/stale.txt" --body-out "$RUNNER_TEMP/census-report/body.md" --run-url "$RUN_URL" || rc=$?
+          echo "$rc" > "$RUNNER_TEMP/census-report/exit"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          # The issue body, rendered on the run page: a branch dispatch skips
+          # the writer, so this is where a rehearsal shows what it would post.
+          if [ -f "$RUNNER_TEMP/census-report/body.md" ]; then
+            cat "$RUNNER_TEMP/census-report/body.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ "$rc" = 4 ]; then
+            echo "::warning::ratchet entries are clean under every seed tonight; delete them if they stay clean (a second night reds)"
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: census-report
+          path: ${{ runner.temp }}/census-report/
+          if-no-files-found: ignore
+          overwrite: true
+      # 1 = a new member, a cross-file failure, or a stale entry two nights
+      # running; 3 = unproven; 2 or empty = the report itself did not run.
+      - name: Fail when the census is red or unproven
+        if: always() && steps.report.outputs.rc != '0' && steps.report.outputs.rc != '4'
+        run: |
+          echo "::error::shuffle census exit ${{ steps.report.outputs.rc }}; see the report step"
+          exit 1
+
+  # The only writer. `always()` so a red night still updates the issue; the
+  # report job's exit code and body arrive as an artifact. A `files` subset
+  # dispatch never writes: its clean exit says nothing about the whole tree
+  # and would close the tracking issue.
+  publish-issue:
+    name: Update the tracking issue
+    needs: confirm-report
+    if: always() && (github.event_name == 'schedule' || github.ref == 'refs/heads/master') && inputs.files == '' && needs.confirm-report.result != 'skipped' && needs.confirm-report.result != 'cancelled'
+    runs-on: ubuntu-latest
+    # One `gh` label call and one upsert.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: census-report
+          path: ${{ runner.temp }}/census-report
+      - name: Update the single tracking issue
+        run: |
+          set -euo pipefail
+          gh label create nightly-drift --color B60205 --description 'Nightly automated drift finding' || true
+          if [ "$(cat "$RUNNER_TEMP/census-report/exit")" = 0 ]; then
+            node scripts/upsert-tracking-issue.mjs --title "$TRACKING_TITLE" --label nightly-drift --clean --close-when-clean
+          else
+            node scripts/upsert-tracking-issue.mjs --title "$TRACKING_TITLE" --label nightly-drift --body-file "$RUNNER_TEMP/census-report/body.md"
+          fi

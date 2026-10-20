@@ -1,3 +1,4 @@
+// flake-shape: service-double — #4485: the touched client stays silent through the cascade's bounded wait so the neighbour is recorded outstanding; a real server cannot be made to stay silent on demand
 /**
  * #3499: a session-1 quiet window must not write cascade state into the
  * session that replaced it.
@@ -498,7 +499,16 @@ describe("quiet-window cascade writes across a session replacement (#3499)", () 
 					]),
 					getClientForFile: vi
 						.fn()
-						.mockResolvedValue({ client: { serverId: "typescript" } }),
+						// #4485: the touched client stays silent through the cascade's
+						// bounded wait, so the neighbour is recorded outstanding.
+						.mockResolvedValue({
+							client: {
+								serverId: "typescript",
+								diagnosticsVersion: 0,
+								getDiagnosticsVersionForPath: () => 0,
+								waitForDiagnostics: async () => undefined,
+							},
+						}),
 					// Session 1's compute is inside its touch when the replacement
 					// lands.
 					touchFile: vi.fn(async (filePath: string) => {

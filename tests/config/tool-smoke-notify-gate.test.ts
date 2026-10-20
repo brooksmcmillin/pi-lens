@@ -173,6 +173,13 @@ describe("tool-smoke.yml's issue writers are scoped to nightly/default runs (#33
 		expect(env.RESOLUTION_LAYER_OUTCOME).toBe(
 			"${{ needs.tool-smoke.outputs.resolution_layer }}",
 		);
+		// #4514: the seventh gating step, the LSP evaluated floor.
+		expect(env.EVALUATED_FLOOR_OUTCOME).toBe(
+			"${{ needs.tool-smoke.outputs.evaluated_floor }}",
+		);
+		expect(env.EVALUATED_FLOOR_LOG).toBe(
+			"${{ runner.temp }}/tool-smoke-evaluated-floor.log",
+		);
 	});
 
 	// Recurrence: an output wired to the wrong step id reads "" in the notifier,
@@ -185,6 +192,7 @@ describe("tool-smoke.yml's issue writers are scoped to nightly/default runs (#33
 			"lens_full",
 			"format_layer",
 			"resolution_layer",
+			"evaluated_floor",
 		]) {
 			expect(smokeJob.outputs?.[id]).toBe(`\${{ steps.${id}.outcome }}`);
 		}
@@ -201,6 +209,9 @@ describe("tool-smoke.yml's issue writers are scoped to nightly/default runs (#33
 		);
 		expect(findStep(workflow, "Format layer").id).toBe("format_layer");
 		expect(findStep(workflow, "Resolution layer").id).toBe("resolution_layer");
+		expect(findStep(workflow, "LSP evaluated floor").id).toBe(
+			"evaluated_floor",
+		);
 	});
 
 	// #2723 review F3: disambiguates "the job failed before the six
@@ -234,6 +245,7 @@ describe("tool-smoke.yml's issue writers are scoped to nightly/default runs (#33
 			"lens_diagnostics mode=full row",
 			"Format layer",
 			"Resolution layer",
+			"LSP evaluated floor",
 			"SonarCloud master quality gate",
 		])
 			expect(stage).toBeGreaterThan(index(layer));
@@ -388,6 +400,7 @@ describe("each gating layer step's pipe keeps set -o pipefail (#2723 review F4)"
 		"lens_diagnostics mode=full row",
 		"Format layer",
 		"Resolution layer",
+		"LSP evaluated floor",
 	];
 
 	it.each(LAYER_STEP_NAMES)("%s's run script sets pipefail", (name) => {

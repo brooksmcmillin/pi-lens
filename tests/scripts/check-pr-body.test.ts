@@ -1,5 +1,6 @@
-// flake-shape: real-process-spawn — the exact local CLI and shallow checkout are the subject; an in-process call cannot prove either command boundary.
+// flake-shape: real-process-spawn — the exact local CLI, shallow checkout and gh label read are the subject; an in-process call cannot prove any of those command boundaries.
 import {
+	existsSync,
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
@@ -8,11 +9,12 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
-import { execFileSync } from "node:child_process";
+import { delimiter, dirname, join, resolve } from "node:path";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { Worker } from "node:worker_threads";
 import { beforeEach, describe, expect, it, afterEach, vi } from "vitest";
+import { parseDefectShapes } from "../../scripts/lib/defect-shapes.mjs";
 import {
 	gitExecFileSync,
 	gitExecSync,
@@ -31,12 +33,22 @@ import {
 	resolveLivePrBody,
 	resolveTouchesTests,
 	DETECTION_LAYERS,
+	DETECTION_UNKNOWN_MESSAGE,
 	lintDetectionSection,
+	shapeCatalogReader,
 	resolveBugClosing,
 } from "../../scripts/check-pr-body.mjs";
 import { blankCommentsAndStrings } from "../../scripts/check-pr-body.mjs";
 
-const body = `## Why\nThe body gate makes review intent explicit.\n\n## Notes for the reviewer\nNone.\n\n## Change outline\n- caller\n  + changed symbol\n    + callee\n\n## Summary\nOpening context.\n\n## Tests\nTargeted tests pass.\n\n## Blast radius\nNo runtime module touched.\n\n## Class sweep\nDefect shape: a body section answered with generic text. Search: \`rg -n "whole-tree grep" scripts\`. Verdict: none outside this fixture.\n\n## Observability\nThe advisory check run is the record.`;
+const body = `## Why\nThe body gate makes review intent explicit.\n\n## Notes for the reviewer\nNone.\n\n## Change outline\n- caller\n  + changed symbol\n    + callee\n\n## Summary\nOpening context.\n\n## Tests\nTargeted tests pass.\n\n## Blast radius\nNo runtime module touched.\n\n## Class sweep\nDefect shape: a body section answered with generic text. Search: \`rg -n "whole-tree grep" scripts\`. Verdict: none outside this fixture.\n\n## Observability\nThe advisory check run is the record.\n\n`;
+// #4605 F12: the shared `body` fixture carries no mutation table, so a case
+// whose diff adds a guard states its own row-2 proof for the file it changes.
+function withMutationProof(text: string, ...files: string[]) {
+	const rows = files
+		.map((file) => `| \`${file}\` | drop the guard | \`Tests 1 failed\` |`)
+		.join("\n");
+	return `${text}\n\n## Mutations\n| File | Mutation | Transcript |\n| --- | --- | --- |\n${rows}\n`;
+}
 // A synthetic runtime file: `rows` is the whole post-image and `added` lists
 // the 1-based post-image lines the diff adds. The harvest reads `rows`, so a
 // test that needs the block-comment opener passes real rows — a bare hunk
@@ -223,8 +235,16 @@ function initFixtureRepo(fixtureRepo: string) {
 function createOriginMasterFixture(
 	mappedFile?: string,
 	postImage?: RuntimePostImageFixture,
+	baseFile?: { path: string; rows: string[] },
 ) {
 	const directory = mkdtempSync(join(repositoryRoot, ".tmp-pr-body-origin-"));
+	// `baseFile` commits a file the fixture needs as pre-existing evidence (the
+	// #4597 read-back witness), so the diff under test does not name it: a test
+	// file the diff adds would owe row 1 a red-first transcript this fixture is
+	// not about.
+	const baseExtra = baseFile
+		? `mkdir -p '${directory}/${dirname(baseFile.path)}' && printf '%s\\n' ${shellRows(baseFile.rows)} > '${directory}/${baseFile.path}' && git -C '${directory}' add '${baseFile.path}' && `
+		: "";
 	// `mappedFile` (#3802 F3) commits one extra repo-relative file in the same
 	// shell command, so a mapped-path diff costs no additional git spawn.
 	const mapped = mappedFile
@@ -260,7 +280,7 @@ function createOriginMasterFixture(
 	// repository the commit chain moves. A caller already inside another fixture
 	// repo made that fixture's branch the HEAD-moving target of this chain.
 	gitExecSync(
-		`git init --quiet --initial-branch=main '${directory}' && ${preImage}git -C '${directory}' -c user.name=pi-lens-test -c user.email=pi-lens-test@example.com commit --quiet --allow-empty -m fixture-base && git -C '${directory}' update-ref refs/remotes/origin/master HEAD && printf 'fixture change\n' > '${directory}/fixture.md' && git -C '${directory}' add fixture.md && git -C '${directory}' -c user.name=pi-lens-test -c user.email=pi-lens-test@example.com commit --quiet -m fixture-head${mapped}${postImageSegment}`,
+		`git init --quiet --initial-branch=main '${directory}' && ${preImage}${baseExtra}git -C '${directory}' -c user.name=pi-lens-test -c user.email=pi-lens-test@example.com commit --quiet --allow-empty -m fixture-base && git -C '${directory}' update-ref refs/remotes/origin/master HEAD && printf 'fixture change\n' > '${directory}/fixture.md' && git -C '${directory}' add fixture.md && git -C '${directory}' -c user.name=pi-lens-test -c user.email=pi-lens-test@example.com commit --quiet -m fixture-head${mapped}${postImageSegment}`,
 		{ cwd: repositoryRoot },
 	);
 	return directory;
@@ -553,7 +573,6 @@ describe("head-tree citations", () => {
 });
 
 describe("test-reference shape and placement", () => {
-	it("A01", () => {});
 	const clean = (extra: string) => lintPrBody(`${body}\n${extra}`);
 	const missing = (result: ReturnType<typeof lintPrBody>, value: string) => {
 		expect(result.valid).toBe(false);
@@ -695,7 +714,13 @@ describe("test-reference shape and placement", () => {
 				{ cwd: repositoryRoot },
 			);
 			const direct = lintPrBody(fixture).errors.join(" ");
-			const local = lintLocalPrBody(fixture, fixtureRepo).errors.join(" ");
+			// #4585: the local preflight now refuses an unavailable diff instead of
+			// linting structure alone, and this single-commit fixture repo has no
+			// upstream ref. An empty diff is the range it really has, and a stubbed
+			// git keeps this case on the body's own test references.
+			const local = lintLocalPrBody(fixture, fixtureRepo, () => "").errors.join(
+				" ",
+			);
 			for (const id of ["Z10", "P01", "P30"]) {
 				expect(direct).toContain(id);
 				expect(local).toContain(id);
@@ -1295,6 +1320,19 @@ describe("PR body lint (#1844)", () => {
 		expect(result.errors).toContain("  offending line: Closes #12, #13");
 	});
 
+	// #4371: the local preflight names the hedged close line, so the author can
+	// rephrase before GitHub closes the issue (#4344 closed #4346 this way).
+	it("names a hedged close-keyword line in the local lint result", () => {
+		const cell = "| review graph edge | not fixed: #4346 |";
+		const result = lintLocalPrBody(
+			`${body}\n${cell}\n`,
+			process.cwd(),
+			() => "",
+		);
+		expect(result.valid).toBe(false);
+		expect(result.errors).toContain(`  offending line: ${cell}`);
+	});
+
 	it("requires a diff record literal for runtime changes", () => {
 		const runtimeDiff = [
 			"diff --git a/clients/example.ts b/clients/example.ts",
@@ -1348,10 +1386,19 @@ describe("PR body lint (#1844)", () => {
 		it.each(["session_start_duplicate_suppressed", "session-start-duplicate"])(
 			"accepts #2895's honest body naming %s from a positional index.ts emitBounded",
 			(record) => {
+				// The diff adds a guard to index.ts, so this body owns row-2 proof
+				// for it; the shared `body` fixture carries none (#4605 F12).
+				const mutationEvidence =
+					"\n\n## Mutations\n| File | Mutation | Transcript |\n|---|---|---|\n" +
+					"| `index.ts` | drop the duplicate-start guard | `Tests 1 failed` |";
 				expect(
-					lintPrBody(withObservability(`The bounded record is ${record}.`), {
-						...postImageFromDiff(pr2895Diff),
-					}),
+					lintPrBody(
+						withObservability(`The bounded record is ${record}.`) +
+							mutationEvidence,
+						{
+							...postImageFromDiff(pr2895Diff),
+						},
+					),
 				).toEqual({ valid: true, errors: [] });
 			},
 		);
@@ -1968,19 +2015,35 @@ describe("PR body lint (#1844)", () => {
 		});
 
 		it("reads a committed post-image blob over Node's default buffer", () => {
-			const fixtureCwd = createOriginMasterFixture(undefined, {
-				path: "clients/mid-ceiling.ts",
-				pre: ["export let x = 0;"],
-				post: [
-					"export let x = 0;",
-					'recordDegradationOnce({ kind: "mid-kind" });',
-				],
-				dirty: [
-					"export let x = 0;",
-					'recordDegradationOnce({ kind: "mid-kind" });',
-				],
-				padLines: 299_592,
-			});
+			const fixtureCwd = createOriginMasterFixture(
+				undefined,
+				{
+					path: "clients/mid-ceiling.ts",
+					pre: ["export let x = 0;"],
+					post: [
+						"export let x = 0;",
+						'recordDegradationOnce({ kind: "mid-kind" });',
+					],
+					dirty: [
+						"export let x = 0;",
+						'recordDegradationOnce({ kind: "mid-kind" });',
+					],
+					padLines: 299_592,
+				},
+				// #4597 round 3: this body names a record, so the fixture owes the
+				// read-back the rule demands — the rule applies to the fixture's own
+				// tree too, and the bare spelling is no longer exempt. It sits on the
+				// base commit, so it is pre-existing evidence rather than a test file
+				// this diff changes (#4605 row 1).
+				{
+					path: "tests/record.test.ts",
+					rows: [
+						'it("reads the kind", () => {',
+						'\texpect(row.kind).toBe("mid-kind");',
+						"});",
+					],
+				},
+			);
 			try {
 				const bytes = statSync(
 					join(fixtureCwd, "clients", "mid-ceiling.ts"),
@@ -2251,7 +2314,10 @@ describe("PR body lint (#1844)", () => {
 			);
 			expect(
 				lintPrBody(
-					withObservability("The record is session_handoff_adopt."),
+					withMutationProof(
+						withObservability("The record is session_handoff_adopt."),
+						"clients/session-scope.ts",
+					),
 					diff,
 				),
 			).toEqual({ valid: true, errors: [] });
@@ -2264,7 +2330,13 @@ describe("PR body lint (#1844)", () => {
 		// `none: <reason> goes here` passed, so one throwaway line answered every
 		// branch in every file. The reason now names each flagged file.
 		const none = (reason: string) =>
-			lintPrBody(withObservability(reason), postImageFromDiff(seamBranch));
+			lintPrBody(
+				withMutationProof(
+					withObservability(reason),
+					"clients/session-scope.ts",
+				),
+				postImageFromDiff(seamBranch),
+			);
 
 		it("accepts `none: <reason>` that names the flagged file", () => {
 			expect(
@@ -2329,8 +2401,11 @@ describe("PR body lint (#1844)", () => {
 			);
 			expect(
 				lintPrBody(
-					withObservability(
-						"none: clients/lsp/server.ts only forwards the recorded outcome",
+					withMutationProof(
+						withObservability(
+							"none: clients/lsp/server.ts only forwards the recorded outcome",
+						),
+						"clients/lsp/server.ts",
 					),
 					diff,
 				),
@@ -2345,7 +2420,14 @@ describe("PR body lint (#1844)", () => {
 				].join("\n"),
 			);
 			const reasons = (text: string) =>
-				lintPrBody(withObservability(text), diff);
+				lintPrBody(
+					withMutationProof(
+						withObservability(text),
+						"clients/session-scope.ts",
+						"clients/agent-nudge.ts",
+					),
+					diff,
+				);
 			expect(
 				reasons(
 					"none: session-scope.ts only selects a recorded outcome\nnone: agent-nudge.ts only flushes an already counted queue",
@@ -2437,7 +2519,12 @@ describe("PR body lint (#1844)", () => {
 			const diff = postImageFromDiff(
 				diffAdding("clients/example.ts", "\tif (ready) go();"),
 			);
-			expect(lintPrBody(withObservability(sentence), diff)).toEqual({
+			expect(
+				lintPrBody(
+					withMutationProof(withObservability(sentence), "clients/example.ts"),
+					diff,
+				),
+			).toEqual({
 				valid: true,
 				errors: [],
 			});
@@ -2686,9 +2773,12 @@ describe("PR body lint (#1844)", () => {
 			'recordDegradationOnce({ kind: "tool-cwd-resolution" });\n',
 		);
 		const result = lintLocalPrBody(
-			body.replace(
-				"The advisory check run is the record.",
-				"covered by existing record `tool-cwd-resolution` at `clients/existing-record.ts:1`",
+			withMutationProof(
+				body.replace(
+					"The advisory check run is the record.",
+					"covered by existing record `tool-cwd-resolution` at `clients/existing-record.ts:1`",
+				),
+				"clients/new-path.ts",
 			),
 			process.cwd(),
 			() => NEW_PATH_RUNTIME_DIFF,
@@ -2702,9 +2792,12 @@ describe("PR body lint (#1844)", () => {
 		mkdirSync(join(process.cwd(), "tests"), { recursive: true });
 		writeFileSync(source, 'recordDegradationOnce({ kind: "test-record" });\n');
 		const result = lintLocalPrBody(
-			body.replace(
-				"The advisory check run is the record.",
-				"covered by existing record `test-record` at `tests/existing-record.test.ts:1`",
+			withMutationProof(
+				body.replace(
+					"The advisory check run is the record.",
+					"covered by existing record `test-record` at `tests/existing-record.test.ts:1`",
+				),
+				"clients/new-path.ts",
 			),
 			process.cwd(),
 			() => NEW_PATH_RUNTIME_DIFF,
@@ -2739,9 +2832,12 @@ describe("PR body lint (#1844)", () => {
 			);
 			try {
 				const result = lintLocalPrBody(
-					body.replace(
-						"The advisory check run is the record.",
-						`covered by existing record \`${kind}\` at \`${file}\``,
+					withMutationProof(
+						body.replace(
+							"The advisory check run is the record.",
+							`covered by existing record \`${kind}\` at \`${file}\``,
+						),
+						"clients/new-path.ts",
 					),
 					root,
 					() => NEW_PATH_RUNTIME_DIFF,
@@ -2762,9 +2858,12 @@ describe("PR body lint (#1844)", () => {
 
 	it("rejects a stale existing-record citation without throwing", () => {
 		const result = lintLocalPrBody(
-			body.replace(
-				"The advisory check run is the record.",
-				"covered by existing record `missing-record` at `clients/does-not-exist.ts:1`",
+			withMutationProof(
+				body.replace(
+					"The advisory check run is the record.",
+					"covered by existing record `missing-record` at `clients/does-not-exist.ts:1`",
+				),
+				"clients/new-path.ts",
 			),
 			process.cwd(),
 			() => NEW_PATH_RUNTIME_DIFF,
@@ -3050,8 +3149,110 @@ describe("PR body lint (#1844)", () => {
 		}
 	});
 
+	// F-4551-3: pr-preflight and lane-check pass only `--lint-local <body>`, so
+	// the refactor "Behavior equivalence" rule (title-gated) never ran locally,
+	// and the documented positional title form was ignored.
+	it("feeds the local CLI a title from the positional form or COMMIT_MSG.txt (#4551)", () => {
+		const directory = mkdtempSync(join(tmpdir(), "pi-lens-pr-body-cli-title-"));
+		const bodyPath = join(directory, "PR_BODY.md");
+		const checker = resolve(repositoryRoot, "scripts/check-pr-body.mjs");
+		const refactorTitle = "refactor(test): verify local body lint (refs #2807)";
+		const run = (args: string[]) =>
+			spawnSync(process.execPath, [checker, ...args], {
+				cwd: fixtureCwd,
+				encoding: "utf8",
+			});
+		try {
+			writeFileSync(
+				bodyPath,
+				`${body}\n\n### Test assessment\nThe targeted test covers the local CLI.`,
+			);
+			const positional = run(["--lint-local", bodyPath, refactorTitle]);
+			expect(positional.status).toBe(1);
+			expect(positional.stderr).toContain('"## Behavior equivalence"');
+
+			writeFileSync(join(fixtureCwd, "COMMIT_MSG.txt"), `${refactorTitle}\n`);
+			const fromCommit = run(["--lint-local", bodyPath]);
+			expect(fromCommit.status).toBe(1);
+			expect(fromCommit.stderr).toContain('"## Behavior equivalence"');
+
+			writeFileSync(
+				join(fixtureCwd, "COMMIT_MSG.txt"),
+				"ci(test): verify local body lint (refs #2807)\n",
+			);
+			const control = run(["--lint-local", bodyPath]);
+			expect(control.stderr).not.toContain('"## Behavior equivalence"');
+			expect(control.status).toBe(0);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
 	it("accepts the required sections", () => {
 		expect(lintPrBody(body)).toEqual({ valid: true, errors: [] });
+	});
+
+	it("rejects a refactor title without Behavior equivalence", () => {
+		const result = lintPrBody(body, {
+			title: "refactor(freshness): fold stamps",
+		});
+		expect(result.valid).toBe(false);
+		expect(result.errors.join(" ")).toContain(
+			'"## Behavior equivalence" must contain a markdown table',
+		);
+	});
+
+	it("rejects a placeholder-only Behavior equivalence table", () => {
+		const result = lintPrBody(
+			`${body}\n\n## Behavior equivalence\n\n| Site | Before | After |\n| --- | --- | --- |\n| n/a | none | tbd |`,
+			{ title: "refactor(freshness): fold stamps" },
+		);
+		expect(result.valid).toBe(false);
+		expect(result.errors.join(" ")).toContain(
+			'"## Behavior equivalence" must contain a markdown table',
+		);
+	});
+
+	it("accepts a real Behavior equivalence row for a refactor", () => {
+		expect(
+			lintPrBody(
+				`${body}\n\n## Behavior equivalence\n\n| Site | Before | After |\n| --- | --- | --- |\n| cache | mtime > stamp | freshnessFromMtime(..., 0) |`,
+				{ title: "refactor(freshness): fold stamps" },
+			),
+		).toEqual({ valid: true, errors: [] });
+	});
+
+	// F-4551-4: the row scan ran to the end of the section instead of stopping
+	// at the table's edge, so an empty equivalence table passed when a later,
+	// unrelated table happened to have three filled cells (its header line
+	// counted as a data row too).
+	it("rejects an empty Behavior equivalence table with a filled table later in the section", () => {
+		const result = lintPrBody(
+			`${body}\n\n## Behavior equivalence\n\n| Site | Before | After |\n| --- | --- | --- |\n\nSome prose.\n\n| Step | Input | Output |\n| --- | --- | --- |\n| build | source | bundle |`,
+			{ title: "refactor(freshness): fold stamps" },
+		);
+		expect(result.valid).toBe(false);
+		expect(result.errors.join(" ")).toContain(
+			'"## Behavior equivalence" must contain a markdown table',
+		);
+	});
+
+	it("still accepts a filled Behavior equivalence table followed by prose and another table", () => {
+		expect(
+			lintPrBody(
+				`${body}\n\n## Behavior equivalence\n\n| Site | Before | After |\n| --- | --- | --- |\n| cache | mtime > stamp | freshnessFromMtime(..., 0) |\n\nSome prose.\n\n| Step | Input | Output |\n| --- | --- | --- |\n| build | source | bundle |`,
+				{ title: "refactor(freshness): fold stamps" },
+			),
+		).toEqual({ valid: true, errors: [] });
+	});
+
+	it("does not require Behavior equivalence for a fix title", () => {
+		expect(
+			lintPrBody(body, { title: "fix(freshness): preserve stamps" }),
+		).toEqual({
+			valid: true,
+			errors: [],
+		});
 	});
 
 	it("rejects two sentences in Why but accepts one", () => {
@@ -3287,10 +3488,11 @@ describe("archived post-image corpus (#3945)", () => {
 
 // #3906 AC2: the #3799 pull-coverage decision in clients/dispatch/dispatcher.ts
 // must be visible to the seam record rule. The corpus is the exact published
-// #3799 body + diff and the three post-image sources the diff names, pinned by
-// each source's git blob oid. CI's shallow checkout does not carry the 2026
-// #3799 objects, so the explicit `headFiles` seam supplies the immutable
-// post-image and the source hash proves the fixture is that exact object.
+// #3799 body + diff and every post-image the rows read, pinned by each source's
+// git blob oid: the three production sources and the five changed test files
+// row 1 classifies. CI's shallow checkout does not carry the 2026 #3799
+// objects, so the explicit `headFiles` seam supplies the immutable post-image
+// and the source hash proves the fixture is that exact object.
 describe("dispatcher seam row (#3906 AC2)", () => {
 	const corpusDir = join(repositoryRoot, "tests", "fixtures", "ci-pr-bodies");
 	const provenance = JSON.parse(
@@ -3324,10 +3526,10 @@ describe("dispatcher seam row (#3906 AC2)", () => {
 		const result = lintPrBody(body, { diff, headFiles });
 		expect(result.valid).toBe(false);
 		const refusal = result.errors.find((error) =>
-			error.includes("clients/dispatch/dispatcher.ts"),
+			error.includes("decision branch"),
 		);
 		expect(refusal).toBeDefined();
-		expect(refusal).toContain("decision branch");
+		expect(refusal).toContain("clients/dispatch/dispatcher.ts");
 		expect(refusal).toContain("(clients/dispatch/dispatcher.ts: 4)");
 	});
 
@@ -3338,7 +3540,29 @@ describe("dispatcher seam row (#3906 AC2)", () => {
 		);
 		const result = lintPrBody(honest, { diff, headFiles });
 		expect(result.errors.join(" ")).not.toContain("decision branch");
-		expect(result.valid).toBe(true);
+		// #4585 row 1 is file-level (issuecomment-6252599595): a changed test file
+		// owes one fenced red-first transcript naming it. The archived body quotes
+		// a red naming dispatcher-flow, runner-status-semantics and the smoke test,
+		// and none naming integration.test.ts or analyze-cli.test.ts, so exactly
+		// those two owe. Every post-image the rows read is vendored and pinned by
+		// blob oid, so the verdict does not depend on which git objects a checkout
+		// holds: a shallow CI clone decides it exactly as a full clone does.
+		const rowOneFiles = result.errors
+			.filter((error) => error.includes("row 1"))
+			.map((error) => /^PR body compliance row 1: (\S+)/.exec(error)?.[1]);
+		expect(rowOneFiles).toEqual([
+			"tests/clients/dispatch/integration.test.ts",
+			"tests/mcp/analyze-cli.test.ts",
+		]);
+		// The archived body predates a per-file mutation row, so row 2 fires here
+		// as a true positive; this case isolates the Observability rule and the
+		// row-2 binding is pinned by check-pr-body-compliance.test.ts. No other
+		// rule fires, and no file is unclassifiable.
+		expect(
+			result.errors.filter(
+				(error) => !error.includes("row 1") && !error.includes("row 2"),
+			),
+		).toEqual([]);
 	});
 });
 
@@ -4349,8 +4573,12 @@ describe("local lint parity", () => {
 			return "tests/scripts/example.test.ts\n";
 		});
 		expect(result.valid).toBe(false);
+		// #4585: the diff-keyed rows need the range itself, so the failed diff is
+		// reported rather than replaced by an empty one; the test-detection
+		// fallback still resolves whether tests changed.
 		expect(ranges).toEqual([
 			["diff", "--unified=0", "--no-color", "origin/master...HEAD"],
+			["rev-parse", "--verify", "origin/master"],
 			["diff", "--name-only", "origin/master...HEAD"],
 			["diff", "--name-only", "HEAD~1"],
 		]);
@@ -4927,6 +5155,7 @@ describe("post-image mutation witnesses (#3945 survivors)", () => {
 			]),
 		});
 		expect(result.errors).toEqual([
+			`PR body compliance: cannot classify rows 1, 2 and 4 for 1 changed file(s) whose post-image is missing, unreadable, or does not match the diff: clients/render.ts.`,
 			"PR body Observability could not classify the added lines of clients/render.ts:2: the post-image is missing, could not be read, or does not match the diff, so a record or a decision branch cannot be confirmed. Re-run with the changed files present, or name the record on a line the diff adds.",
 		]);
 	});
@@ -4951,6 +5180,7 @@ describe("post-image mutation witnesses (#3945 survivors)", () => {
 			.map((file) => `${file}:1`)
 			.join(", ");
 		expect(result.errors).toEqual([
+			`PR body compliance: cannot classify rows 1, 2 and 4 for 6 changed file(s) whose post-image is missing, unreadable, or does not match the diff: ${files.slice(0, 5).join(", ")} (+1 more).`,
 			`PR body Observability could not classify the added lines of ${shown} (+1 more): the post-image is missing, could not be read, or does not match the diff, so a record or a decision branch cannot be confirmed. Re-run with the changed files present, or name the record on a line the diff adds.`,
 		]);
 	});
@@ -4965,10 +5195,16 @@ describe("post-image mutation witnesses (#3945 survivors)", () => {
 			mkdirSync(join(root, "clients"), { recursive: true });
 			writeFileSync(join(root, "clients", "existing-record.ts"), `${source}\n`);
 			process.chdir(root);
+			// #4585 row 2: the diff adds a `catch`, so the body owes file-scoped
+			// mutation evidence. Keep it here so this test still isolates the
+			// existing-record citation.
+			const mutationEvidence =
+				"\n\n## Mutations\n| File | Mutation | Transcript |\n|---|---|---|\n" +
+				"| `clients/new-path.ts` | drop the catch | `Tests 1 failed` |";
 			const result = lintPrBody(
 				withObservability(
 					"covered by existing record `tool-cwd-resolution` at `clients/existing-record.ts:1`",
-				),
+				) + mutationEvidence,
 				{
 					diff: NEW_PATH_RUNTIME_DIFF,
 					headFiles: NEW_PATH_HEAD_FILES,
@@ -5211,10 +5447,14 @@ describe("class sweep reaches the CI event entry (#4273 F6)", () => {
 // label read is best-effort, so an offline/unreadable label warns and skips.
 describe("detection retrospective for bug-closing PRs (#4288)", () => {
 	const withDetection = (lines: string) => `${body}\n\n## Detection\n${lines}`;
+	const shapeLines =
+		"- **Shape:** new: stale mirror\n" +
+		"- **Enforcer:** none: judgment-only, no tree-wide scan exists yet";
 	const validDetection =
 		"- **Caught by:** reviewer probe\n" +
 		"- **Should have been caught by:** CI unit\n" +
-		"- **Gap:** none: no existing test covered the shape";
+		"- **Gap:** none: no existing test covered the shape\n" +
+		shapeLines;
 
 	it("exports one layer vocabulary", () => {
 		expect(DETECTION_LAYERS).toEqual([
@@ -5222,6 +5462,15 @@ describe("detection retrospective for bug-closing PRs (#4288)", () => {
 			"reviewer probe",
 			"CI unit",
 			"governance sweep",
+			// #4490: CodeQL code scanning found the escaping defect, and no layer
+			// named it; the body had to claim "CI unit" for a static analyser.
+			"static analysis",
+			// #4519: the 2026-10-16 retro could not record 43 TLA+ catches, nor any
+			// mutation, pre-push or type/lint catch.
+			"TLA+",
+			"mutation",
+			"pre-push",
+			"lint/type check",
 			"smoke",
 			"nightly",
 			"dogfood",
@@ -5240,6 +5489,161 @@ describe("detection retrospective for bug-closing PRs (#4288)", () => {
 		expect(doc).toContain("DETECTION_LAYERS");
 		for (const stale of ["CI job", "install/compat/tool smoke"])
 			expect(doc).not.toContain(stale);
+	});
+
+	// Recurrence: the 2026-10-16 detection retro (#4519) read 139 of 363 closed
+	// bugs as "unknown" and had no word for the 43 bugs TLA+ found, nor for
+	// mutation, the pre-push hook or the type/lint gate.
+	it.each(["TLA+", "mutation", "pre-push", "lint/type check"])(
+		"accepts %s as the catching and the should-have layer",
+		(layer) => {
+			expect(
+				lintPrBody(
+					withDetection(
+						`- Caught by: ${layer}\n` +
+							`- Should have been caught by: ${layer}\n` +
+							"- Gap: none: the layer saw it before merge\n" +
+							shapeLines,
+					),
+					{ bugClosing: true },
+				),
+			).toEqual({ valid: true, errors: [] });
+		},
+	);
+
+	it.each(["nightly:tool-smoke", "nightly: stryker-nightly.yml", "nightly"])(
+		"accepts %s as a nightly layer",
+		(layer) => {
+			expect(
+				lintPrBody(
+					withDetection(
+						`- Caught by: ${layer}\n` +
+							`- Should have been caught by: ${layer}\n` +
+							"- Gap: none: the nightly saw it first\n" +
+							shapeLines,
+					),
+					{ bugClosing: true },
+				),
+			).toEqual({ valid: true, errors: [] });
+		},
+	);
+
+	it.each([
+		"nightly:../x",
+		"nightly:two words",
+		"nightlyish",
+		"tla",
+		"prenightly:tool-smoke",
+	])("refuses %s as a layer word", (layer) => {
+		const result = lintPrBody(
+			withDetection(
+				`- Caught by: ${layer}\n` +
+					"- Should have been caught by: CI unit\n" +
+					"- Gap: #1\n" +
+					shapeLines,
+			),
+			{ bugClosing: true },
+		);
+		expect(result.valid).toBe(false);
+		expect(result.errors.join(" ")).toContain('"## Detection"');
+	});
+
+	// Recurrence: 139 of 363 bugs carried no recorded layer; a bug-closing PR
+	// must not be able to write the same non-answer into its own record.
+	it.each([
+		["Caught by", "unknown", "CI unit", "none: a reason"],
+		["Should have been caught by", "smoke", "**Unknown**", "none: a reason"],
+		["Gap", "smoke", "CI unit", "none: unknown."],
+	])(
+		"refuses unknown in %s of a bug-closing PR",
+		(_field, caught, should, gap) => {
+			const result = lintPrBody(
+				withDetection(
+					`- Caught by: ${caught}\n` +
+						`- Should have been caught by: ${should}\n` +
+						`- Gap: ${gap}\n` +
+						shapeLines,
+				),
+				{ bugClosing: true },
+			);
+			expect(result.valid).toBe(false);
+			expect(result.errors).toEqual([DETECTION_UNKNOWN_MESSAGE]);
+		},
+	);
+
+	// Recurrence: the exact-match refusal let "none: unknown reason", "n/a",
+	// "tbd" and "?" through as a Gap reason (review r1 of #4524, F1).
+	it.each([
+		"none: unknown reason",
+		"none: Unknown (not investigated)",
+		"none: n/a",
+		"none: tbd",
+		"none: ?",
+	])("refuses the placeholder Gap reason %s of a bug-closing PR", (gap) => {
+		const result = lintPrBody(
+			withDetection(
+				"- Caught by: smoke\n" +
+					"- Should have been caught by: CI unit\n" +
+					`- Gap: ${gap}\n` +
+					shapeLines,
+			),
+			{ bugClosing: true },
+		);
+		expect(result.errors).toEqual([DETECTION_UNKNOWN_MESSAGE]);
+	});
+
+	// Recurrence: F2 of the same review; the Shape name and the Enforcer reason
+	// are free text too, and "unknown" there recorded the retro's non-answer.
+	it.each([
+		["new: unknown", "none: judgment-only, no tree-wide scan exists yet"],
+		["new: TBD", "none: judgment-only, no tree-wide scan exists yet"],
+		["new: stale mirror", "none: judgment-only, unknown for now"],
+	])("refuses a placeholder in Shape %s / Enforcer %s", (shape, enforcer) => {
+		const result = lintPrBody(
+			withDetection(
+				"- Caught by: smoke\n" +
+					"- Should have been caught by: CI unit\n" +
+					"- Gap: none: a reason\n" +
+					`- Shape: ${shape}\n` +
+					`- Enforcer: ${enforcer}\n`,
+			),
+			{ bugClosing: true },
+		);
+		expect(result.errors).toEqual([DETECTION_UNKNOWN_MESSAGE]);
+	});
+
+	it("leaves a non-bug Shape and Enforcer placeholder alone", () => {
+		// Like the layer fields, the placeholder refusal rides the bug-closing seam.
+		expect(
+			lintDetectionSection(
+				"## Detection\n- Caught by: smoke\n- Should have been caught by: CI unit\n- Gap: #1\n" +
+					"- Shape: new: unknown\n- Enforcer: none: judgment-only, unknown for now\n",
+			),
+		).toEqual([]);
+	});
+
+	it("leaves a non-bug section that says unknown on the generic refusal", () => {
+		// The unknown-specific message belongs to the bug-closing seam only; a
+		// non-bug PR that fills the section badly still reds as it did before.
+		const result = lintDetectionSection(
+			"## Detection\n- Caught by: unknown\n- Should have been caught by: CI unit\n- Gap: #1\n",
+		);
+		expect(result).toEqual([expect.stringContaining("five lines")]);
+		expect(result).not.toContain(DETECTION_UNKNOWN_MESSAGE);
+	});
+
+	it("keeps unknown reasons that merely contain the word", () => {
+		expect(
+			lintPrBody(
+				withDetection(
+					"- Caught by: smoke\n" +
+						"- Should have been caught by: CI unit\n" +
+						"- Gap: none: tools were never probed, status unknown\n" +
+						shapeLines,
+				),
+				{ bugClosing: true },
+			),
+		).toEqual({ valid: true, errors: [] });
 	});
 
 	it("fails a bug-closing body without the section", () => {
@@ -5264,7 +5668,8 @@ describe("detection retrospective for bug-closing PRs (#4288)", () => {
 				withDetection(
 					"- Caught by: smoke\n" +
 						"- Should have been caught by: this layer\n" +
-						"- Gap: #4288",
+						"- Gap: #4288\n" +
+						shapeLines,
 				),
 				{ bugClosing: true },
 			),
@@ -5277,7 +5682,23 @@ describe("detection retrospective for bug-closing PRs (#4288)", () => {
 				withDetection(
 					"- Caught by: nightly\n" +
 						"- Should have been caught by: governance sweep\n" +
-						"- Gap: exists: tests/scripts/check-pr-body.test.ts",
+						"- Gap: exists: tests/scripts/check-pr-body.test.ts\n" +
+						shapeLines,
+				),
+				{ bugClosing: true },
+			),
+		).toEqual({ valid: true, errors: [] });
+	});
+
+	it("accepts a static analysis catch", () => {
+		// #4490: a CodeQL-found bug had no honest layer word and claimed "CI unit".
+		expect(
+			lintPrBody(
+				withDetection(
+					"- Caught by: static analysis\n" +
+						"- Should have been caught by: this layer\n" +
+						"- Gap: none: the analyser caught it before any user\n" +
+						shapeLines,
 				),
 				{ bugClosing: true },
 			),
@@ -5346,7 +5767,8 @@ describe("detection retrospective for bug-closing PRs (#4288)", () => {
 				withDetection(
 					"- Caught by: smoke\n" +
 						"- Should have been caught by: CI unit\n" +
-						"- Gap: none: n/a",
+						"- Gap: none: oversight\n" +
+						shapeLines,
 				),
 				{ bugClosing: true },
 			),
@@ -5383,6 +5805,255 @@ describe("detection retrospective for bug-closing PRs (#4288)", () => {
 			bugClosing: true,
 		});
 		expect(result.valid).toBe(false);
+	});
+});
+
+// Recurrence: #4390, #4391 and #4377 (2026-10-14) each closed a bug with a
+// regression test for one instance while the defect shape stayed unenforced
+// across the tree, and #4409 wrote "Gap: none: this change is the layer"
+// before install-smoke run 38610594076 failed on master (#4439). A bug-closing
+// body now names the AGENTS.md shape and its tree-wide enforcer, and a path
+// enforcer must be one the shape's catalog entry names.
+describe("Detection names the defect shape and its enforcer (#4439)", () => {
+	const catalog = parseDefectShapes(
+		readFileSync(resolve(repositoryRoot, "AGENTS.md"), "utf8"),
+	);
+	const head =
+		"## Detection\nCaught by: smoke\nShould have been caught by: CI unit\nGap: #4439\n";
+	const lines = (shape?: string, enforcer?: string) =>
+		head +
+		(shape === undefined ? "" : `Shape: ${shape}\n`) +
+		(enforcer === undefined ? "" : `Enforcer: ${enforcer}\n`);
+	const lint = (
+		section: string,
+		options: Parameters<typeof lintDetectionSection>[1] = {},
+	) =>
+		lintDetectionSection(section, {
+			requireShape: true,
+			existsOnBase: () => true,
+			shapeCatalog: () => catalog,
+			...options,
+		});
+	const SINK = "tests/config/sink-read-drain-sweep.test.ts";
+	const JUDGMENT = "none: judgment-only, the population has no lexical marker";
+
+	it("refuses a bug-closing body that names neither line", () => {
+		expect(lint(lines())).toEqual([expect.stringContaining('"Shape: #N')]);
+		const result = lintPrBody(`${body}\n\n${lines()}`, { bugClosing: true });
+		expect(result.valid).toBe(false);
+		expect(result.errors.join(" ")).toContain('"Enforcer:');
+	});
+
+	it("refuses a body with Shape but no Enforcer, and the reverse", () => {
+		expect(lint(lines("#67"))).toHaveLength(1);
+		expect(lint(lines(undefined, JUDGMENT))).toHaveLength(1);
+	});
+
+	it.each([
+		["a word instead of a number", "maybe", JUDGMENT],
+		["an empty new: name", "new:", JUDGMENT],
+		["an enforcer that is a non-test path", "#67", "docs/pi-lens-fixer.md"],
+		["a judgment-only line with no reason", "#67", "none: judgment-only"],
+		[
+			"a none: line that is not judgment-only",
+			"#67",
+			"none: oversight in the lint",
+		],
+		[
+			"a judgment-only reason of two words",
+			"#67",
+			"none: judgment-only, no scan",
+		],
+	])("refuses %s", (_name, shape, enforcer) => {
+		expect(lint(lines(shape, enforcer))).toEqual([
+			expect.stringContaining('"Shape: #N'),
+		]);
+	});
+
+	it("refuses a shape number the catalog does not have", () => {
+		expect(lint(lines("#999", JUDGMENT))).toEqual([
+			expect.stringContaining("has no shape 999"),
+		]);
+	});
+
+	it("refuses a path enforcer that the shape's catalog entry does not name", () => {
+		// Shape 68's enforcer is not shape 67's.
+		expect(lint(lines("#67", "tests/config/tla-switch-pins.test.ts"))).toEqual([
+			expect.stringContaining("AGENTS.md shape 67 does not name that path"),
+		]);
+	});
+
+	it("refuses a prefix or an extension of a path the entry names", () => {
+		for (const path of [
+			"tests/config/sink-read-drain-sweep",
+			`${SINK}.bak`,
+			"tests/config/sink-read-drain-sweep.test",
+		])
+			expect(lint(lines("#67", path))).toEqual([
+				expect.stringContaining("does not name that path"),
+			]);
+	});
+
+	it("refuses a suffix of a path the entry names", () => {
+		// Recurrence (#4448 review F3): a lookbehind-free match accepts
+		// `config/x.test.ts` for an entry that names `tests/config/x.test.ts`.
+		expect(lint(lines("#67", SINK.replace("tests/", "")))).toEqual([
+			expect.stringContaining("does not name that path"),
+		]);
+	});
+
+	it("accepts the path the catalog entry names", () => {
+		expect(lint(lines("#67", SINK))).toEqual([]);
+		expect(
+			lint(lines("#68", "`tests/config/tla-switch-pins.test.ts`")),
+		).toEqual([]);
+	});
+
+	it("accepts the judgement spelling of judgment-only", () => {
+		// Recurrence (#4448 round 3): a mutation that dropped the alternative
+		// survived, because every case used the other spelling.
+		expect(
+			lint(
+				lines(
+					"#67",
+					"none: judgement-only, the population has no lexical marker",
+				),
+			),
+		).toEqual([]);
+	});
+
+	it("accepts an issue enforcer and a judgment-only enforcer", () => {
+		expect(lint(lines("#67", "#4439 (build the census)"))).toEqual([]);
+		expect(lint(lines("#67", JUDGMENT))).toEqual([]);
+	});
+
+	it("accepts a new shape with a base path, and refuses a path off the base", () => {
+		const path = "tests/config/anything-on-base.test.ts";
+		expect(lint(lines("new: stale mirror", path))).toEqual([]);
+		const offBase = lint(lines("new: stale mirror", path), {
+			existsOnBase: () => false,
+		});
+		expect(offBase).toEqual([expect.stringContaining("not on the PR's base")]);
+	});
+
+	it("refuses a catalog path enforcer that this PR adds", () => {
+		expect(lint(lines("#67", SINK), { existsOnBase: () => false })).toEqual([
+			expect.stringContaining("regression test, not the enforcer"),
+		]);
+	});
+
+	it("fails closed on a path enforcer when the catalog cannot be read", () => {
+		const unreadable = lint(lines("#67", SINK), { shapeCatalog: () => null });
+		expect(unreadable).toEqual([expect.stringContaining("could not be read")]);
+		expect(lint(lines("#67", JUDGMENT), { shapeCatalog: () => null })).toEqual(
+			[],
+		);
+	});
+
+	it("does not count lines in a fenced block or an HTML comment", () => {
+		const fenced = `${head}\`\`\`md\nShape: #67\nEnforcer: ${JUDGMENT}\n\`\`\`\n`;
+		const commented = `${head}<!--\nShape: #67\nEnforcer: ${JUDGMENT}\n-->\n`;
+		// GitHub hides everything after an unterminated `<!--`.
+		const unterminated = `${head}<!--\nShape: #67\nEnforcer: ${JUDGMENT}\n`;
+		for (const section of [fenced, commented, unterminated])
+			expect(lint(section)).toEqual([expect.stringContaining('"Shape: #N')]);
+	});
+
+	it("leaves an old three-line section on a non-bug PR green", () => {
+		const old = head;
+		expect(lintDetectionSection(old, {})).toEqual([]);
+		expect(lintPrBody(`${body}\n\n${old}`)).toEqual({
+			valid: true,
+			errors: [],
+		});
+	});
+
+	it("validates a Shape or Enforcer line that a non-bug PR does write", () => {
+		const options = { shapeCatalog: () => catalog };
+		expect(lintDetectionSection(lines("maybe"), options)).toHaveLength(1);
+		expect(
+			lintDetectionSection(lines(undefined, "docs/pi-lens-fixer.md"), options),
+		).toHaveLength(1);
+	});
+
+	it("describes both fields in the template and the message", () => {
+		const template = readFileSync(
+			resolve(repositoryRoot, ".github/PULL_REQUEST_TEMPLATE.md"),
+			"utf8",
+		);
+		const hint =
+			/## Detection\r?\n\r?\n([\s\S]*?)(?=\r?\n## |$)/.exec(template)?.[1] ??
+			"";
+		const message = lint(lines())[0];
+		for (const text of [hint, message])
+			for (const field of ["Shape:", "Enforcer:", "judgment-only"])
+				expect(text).toContain(field);
+	});
+});
+
+// Recurrence (#4448 review F4): the catalog was read from the PR's own
+// checkout while the enforcer path was read from its base, so a PR could add
+// its test to catalog entry N and approve its own enforcer. The reader takes
+// AGENTS.md from the base commit. `git` is stubbed at the process boundary (a
+// stub, not a spawn): the checkout holds the head's AGENTS.md on disk, and the
+// stub answers `merge-base` and `show <base>:AGENTS.md` like a two-commit repo.
+describe("the shape catalog is read from the PR's base (#4439)", () => {
+	const ENFORCER = "tests/config/claimed-enforcer.test.ts";
+	const entry = (extra: string) =>
+		`## Recurring defect shapes\n\n4. **Unsettled resource:** settle it.${extra}\n\n## Next\n`;
+	const naming = `\n   Enforced by \`${ENFORCER}\`.`;
+	const checkouts: string[] = [];
+	afterEach(() => {
+		for (const checkout of checkouts.splice(0))
+			rmSync(checkout, { recursive: true, force: true });
+	});
+
+	function lintAgainst(base: string | null, head: string) {
+		const checkout = mkdtempSync(join(tmpdir(), "pi-lens-shape-catalog-"));
+		checkouts.push(checkout);
+		writeFileSync(join(checkout, "AGENTS.md"), head);
+		const git = (args: string[]): string => {
+			if (args[0] === "merge-base" && base !== null) return "base0000\n";
+			if (
+				args[0] === "show" &&
+				args[1] === "base0000:AGENTS.md" &&
+				base !== null
+			)
+				return base;
+			// A repository answers a show of HEAD with the head's file.
+			if (args[0] === "show" && args[1] === "HEAD:AGENTS.md") return head;
+			throw new Error(`git ${args.join(" ")} failed`);
+		};
+		return {
+			reader: shapeCatalogReader(checkout, git),
+			errors: lintDetectionSection(
+				"## Detection\nCaught by: smoke\nShould have been caught by: CI unit\nGap: #4439\n" +
+					`Shape: #4\nEnforcer: ${ENFORCER}\n`,
+				{
+					requireShape: true,
+					existsOnBase: () => true,
+					shapeCatalog: shapeCatalogReader(checkout, git),
+				},
+			),
+		};
+	}
+
+	it("refuses an enforcer that only the head's AGENTS.md names", () => {
+		expect(lintAgainst(entry(""), entry(naming)).errors).toEqual([
+			expect.stringContaining("AGENTS.md shape 4 does not name that path"),
+		]);
+	});
+
+	it("accepts an enforcer that the base's AGENTS.md names", () => {
+		expect(lintAgainst(entry(naming), entry(naming)).errors).toEqual([]);
+	});
+
+	it("fails closed when the base cannot be resolved", () => {
+		// The checkout names the enforcer; with no base the reader must say null
+		// rather than fall back to the checkout.
+		const run = lintAgainst(null, entry(naming));
+		expect(run.reader()).toBeNull();
+		expect(run.errors).toEqual([expect.stringContaining("could not be read")]);
 	});
 });
 
@@ -5548,5 +6219,408 @@ describe("detection on the local preflight (#4288)", () => {
 		} finally {
 			warning.mockRestore();
 		}
+	});
+});
+
+// Repositories for the `Gap: exists:` base rule (#4404): `origin/master` is an
+// empty commit and the head adds NEW_TEST, or `origin/master` already holds
+// OLD_TEST and the head edits it, or the `origin/master` ref is gone.
+const NEW_TEST = "tests/new-layer.test.ts";
+const OLD_TEST = "tests/old-layer.test.ts";
+const existsBaseFixtures = {
+	headAdds: () => createOriginMasterFixture(NEW_TEST),
+	baseHas: () => {
+		const rows = ["// layer"];
+		return createOriginMasterFixture(undefined, {
+			path: OLD_TEST,
+			pre: rows,
+			post: [...rows, "// edited"],
+			dirty: [...rows, "// edited"],
+		});
+	},
+	noBase: () => {
+		const fixture = createOriginMasterFixture(NEW_TEST);
+		rmSync(join(fixture, ".git", "refs", "remotes", "origin", "master"));
+		return fixture;
+	},
+};
+
+// Recurrence: #4340 and #4341 (2026-10-13) linted green with
+// `check-pr-body.mjs --lint-local` and then failed CI's "PR body (advisory)"
+// on the `## Detection` rule, because the offline preflight could not read the
+// closed issue's labels, warned, and skipped the section (#4288 remainder).
+// The CLI is spawned for real; `gh` is stubbed only at the process boundary
+// (PATH), so the transport, the label read and the exit code are the real ones.
+describe("--lint-local resolves the closed issue label through gh (#4288)", () => {
+	const closing = `${body}\n\nCloses #4321.`;
+	const detection = (caught: string) =>
+		`\n\n## Detection\n\nCaught by: ${caught}\nShould have been caught by: CI unit\nGap: none: no layer would have seen it\nShape: new: stale mirror\nEnforcer: #4439\n`;
+	const proseDetection = detection(
+		"external report (issue #4321 filed after a user saw wrapped tabs)",
+	);
+	// The template's own hint, read from the file so a template edit cannot
+	// leave this fixture describing the old wording.
+	const templateHint = `\n\n## Detection\n\n${
+		/## Detection\r?\n\r?\n([\s\S]*?)(?=\r?\n## |$)/.exec(
+			readFileSync(
+				resolve(repositoryRoot, ".github/PULL_REQUEST_TEMPLATE.md"),
+				"utf8",
+			),
+		)?.[1] ?? ""
+	}\n`;
+	const roots: string[] = [];
+	const fixtures: string[] = [];
+	afterEach(() => {
+		for (const root of roots.splice(0))
+			rmSync(root, { recursive: true, force: true });
+		for (const fixture of fixtures.splice(0))
+			rmSync(fixture, { recursive: true, force: true });
+	});
+
+	function runLint(
+		text: string,
+		gh: "bug" | "feature" | "fail",
+		repository: string = createOriginMasterFixture(),
+	) {
+		const root = mkdtempSync(join(tmpdir(), "pi-lens-lint-local-gh-"));
+		roots.push(root);
+		const fixture = repository;
+		fixtures.push(fixture);
+		const binDir = join(root, "bin");
+		const log = join(root, "gh-calls.log");
+		mkdirSync(binDir);
+		writeFileSync(
+			join(binDir, "gh"),
+			[
+				"#!/usr/bin/env node",
+				`require("fs").appendFileSync(${JSON.stringify(log)}, process.argv.slice(2).join(" ") + "\\n");`,
+				gh === "fail"
+					? `console.error("gh: To get started with GitHub CLI, please run: gh auth login"); process.exit(4);`
+					: `console.log(JSON.stringify({ labels: ${gh === "bug" ? `[{ name: "area:format" }, { name: "bug" }]` : `[{ name: "enhancement" }]`} }));`,
+				"",
+			].join("\n"),
+			{ mode: 0o755 },
+		);
+		const bodyPath = join(root, "PR_BODY.md");
+		writeFileSync(bodyPath, text);
+		const result = spawnSync(
+			process.execPath,
+			[
+				resolve(repositoryRoot, "scripts/check-pr-body.mjs"),
+				"--lint-local",
+				bodyPath,
+			],
+			{
+				cwd: fixture,
+				encoding: "utf8",
+				env: {
+					...process.env,
+					PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+				},
+			},
+		);
+		return {
+			status: result.status,
+			output: `${result.stdout}${result.stderr}`,
+			calls: existsSync(log) ? readFileSync(log, "utf8").trim() : "",
+		};
+	}
+
+	// Skipped on Windows: the stub is a shebang script, which CreateProcess
+	// does not execute.
+	const posix = it.skipIf(process.platform === "win32");
+
+	posix("reds a prose-form Detection section for a bug-labelled issue", () => {
+		const run = runLint(closing + proseDetection, "bug");
+		expect(run.calls).toBe("api repos/{owner}/{repo}/issues/4321");
+		expect(run.output).toContain('"## Detection"');
+		// One report, not one from the CI rule and another from the any-label rule.
+		expect(run.output.split('"## Detection" must state').length).toBe(2);
+		expect(run.status).toBe(1);
+	});
+
+	posix("requires the section when the resolved label is bug", () => {
+		const run = runLint(closing, "bug");
+		expect(run.output).toContain('missing "## Detection"');
+		expect(run.status).toBe(1);
+	});
+
+	posix("passes a three-line section for a bug-labelled issue", () => {
+		const run = runLint(closing + detection("external user"), "bug");
+		expect(run.output).not.toContain("Detection");
+		expect(run.status).toBe(0);
+	});
+
+	posix("does not require the section for a non-bug issue", () => {
+		const run = runLint(closing, "feature");
+		expect(run.calls).toBe("api repos/{owner}/{repo}/issues/4321");
+		expect(run.output).not.toContain("Detection");
+		expect(run.status).toBe(0);
+	});
+
+	posix("validates a present section whatever the label", () => {
+		const run = runLint(closing + proseDetection, "feature");
+		expect(run.output).toContain('"## Detection"');
+		expect(run.status).toBe(1);
+	});
+
+	posix(
+		"treats the unedited template hint as absent for a non-bug issue",
+		() => {
+			const run = runLint(closing + templateHint, "feature");
+			expect(run.output).not.toContain("Detection");
+			expect(run.status).toBe(0);
+		},
+	);
+
+	// Recurrence: #4345 review F1 (2026-10-13). With Detection as the last
+	// section, the mandatory "Generated with" footer sits inside it; counting
+	// that footer as content revoked the unedited hint's exemption and reds a
+	// non-bug PR that the template explicitly makes optional.
+	posix(
+		"treats the unedited hint as absent when the footer follows it as the last section",
+		() => {
+			const footer =
+				"🤖 Generated with [Claude Code](https://claude.com/claude-code)";
+			const run = runLint(`${closing}${templateHint}\n${footer}\n`, "feature");
+			expect(run.output).not.toContain("Detection");
+			expect(run.status).toBe(0);
+		},
+	);
+
+	posix(
+		"warns that the check was skipped when gh cannot read the label",
+		() => {
+			const run = runLint(closing, "fail");
+			expect(run.output).toMatch(/::warning::.*Detection.*skipped.*#4288/s);
+			expect(run.status).toBe(0);
+		},
+	);
+
+	posix(
+		"still validates a present section when gh cannot read the label",
+		() => {
+			const run = runLint(closing + proseDetection, "fail");
+			expect(run.output).toContain('"## Detection"');
+			expect(run.status).toBe(1);
+		},
+	);
+
+	posix("never calls gh for a body that closes nothing", () => {
+		const run = runLint(`${body}\n\nRefs #4321.`, "bug");
+		expect(run.calls).toBe("");
+		expect(run.status).toBe(0);
+	});
+
+	// Recurrence: a rule wired into the bug-closing route only would pass the
+	// same body through the any-label route and the CI entry (#4439). The
+	// fixture checkout has no AGENTS.md, so a `Shape: #N` path enforcer reaches
+	// the catalog reader's unreadable branch on every route.
+	describe("Shape and Enforcer lines (#4439)", () => {
+		const shaped = (shape: string, enforcer: string) =>
+			`${closing}\n\n### Test assessment\nThe fixture file is the subject.${detection("external user").replace(/Shape: .*\nEnforcer: .*\n/, `Shape: ${shape}\nEnforcer: ${enforcer}\n`)}`;
+
+		posix("reds a bug-labelled body that has only the three old lines", () => {
+			const run = runLint(
+				`${closing}${detection("external user").replace(/Shape: .*\nEnforcer: .*\n/, "")}`,
+				"bug",
+			);
+			expect(run.output).toContain('"Shape: #N');
+			expect(run.status).toBe(1);
+		});
+
+		posix("reds a catalog path enforcer when AGENTS.md is unreadable", () => {
+			const run = runLint(
+				shaped("#4", OLD_TEST),
+				"bug",
+				existsBaseFixtures.baseHas(),
+			);
+			expect(run.output).toContain("could not be read from the base commit");
+			expect(run.status).toBe(1);
+		});
+
+		posix("validates the same lines for a non-bug issue", () => {
+			const run = runLint(
+				shaped("#4", OLD_TEST),
+				"feature",
+				existsBaseFixtures.baseHas(),
+			);
+			expect(run.output).toContain("could not be read from the base commit");
+			expect(run.status).toBe(1);
+		});
+
+		posix("accepts a new shape with a base path enforcer", () => {
+			const run = runLint(
+				shaped("new: stale mirror", OLD_TEST),
+				"bug",
+				existsBaseFixtures.baseHas(),
+			);
+			expect(run.output).not.toContain("Detection");
+			expect(run.status).toBe(0);
+		});
+	});
+
+	// Recurrence: #4390, #4391 and #4340 (October 2026) each answered the
+	// Detection retrospective with `Gap: exists: <test>` where the test was the
+	// regression test the PR itself added, so no layer issue was ever filed
+	// (#4404). The CLI runs for real over a real two-commit repository:
+	// `exists:` must name a file on the merge base of `origin/master` and HEAD,
+	// the same base `localDiff` and the workflow-run rule read.
+	describe("Gap exists: names a file on the PR's base (#4404)", () => {
+		const assessed = (gap: string) =>
+			`${closing}\n\n### Test assessment\nThe fixture file is the subject.${detection("external user").replace(/Gap: .*\n/, `Gap: ${gap}\n`)}`;
+		const lint = (repository: string, gap: string) =>
+			runLint(assessed(gap), "bug", repository);
+
+		posix(
+			"refuses an exists: path the head adds, pointing at an issue ref or none:",
+			() => {
+				const run = lint(existsBaseFixtures.headAdds(), `exists: ${NEW_TEST}`);
+				expect(run.output).toContain(
+					`"Gap: exists: ${NEW_TEST}", but that file is not on the PR's base commit`,
+				);
+				expect(run.output).toContain('issue ref (#NNN) or "none: <reason>"');
+				expect(run.status).toBe(1);
+			},
+		);
+
+		// The local preflight validates a present section whatever the label, a
+		// route separate from the bug-closing one (#4288): both carry the rule.
+		posix("refuses an exists: path the head adds for a non-bug issue", () => {
+			const run = runLint(
+				assessed(`exists: ${NEW_TEST}`),
+				"feature",
+				existsBaseFixtures.headAdds(),
+			);
+			expect(run.output).toContain("is not on the PR's base commit");
+			expect(run.status).toBe(1);
+		});
+
+		posix("accepts an exists: path that is on the base", () => {
+			const run = lint(existsBaseFixtures.baseHas(), `exists: ${OLD_TEST}`);
+			expect(run.output).not.toContain("Detection");
+			expect(run.status).toBe(0);
+		});
+
+		posix("refuses an exists: path that is on neither side", () => {
+			const run = lint(
+				existsBaseFixtures.baseHas(),
+				"exists: tests/nowhere.test.ts",
+			);
+			expect(run.output).toContain("is not on the PR's base commit");
+			expect(run.status).toBe(1);
+		});
+
+		posix("refuses an exists: path that names a directory on the base", () => {
+			const run = lint(existsBaseFixtures.baseHas(), "exists: tests/");
+			expect(run.output).toContain("is not on the PR's base commit");
+			expect(run.status).toBe(1);
+		});
+
+		posix(
+			"fails closed with a fetch hint when the base cannot be resolved",
+			() => {
+				const run = lint(existsBaseFixtures.noBase(), `exists: ${NEW_TEST}`);
+				expect(run.output).toContain("base commit could not be resolved");
+				expect(run.output).toContain("git fetch origin master");
+				expect(run.status).toBe(1);
+			},
+		);
+
+		posix(
+			"keeps the issue-ref and none: forms available when the head adds the test",
+			() => {
+				for (const gap of ["#4404", "none: no layer would have seen it"]) {
+					const run = lint(existsBaseFixtures.headAdds(), gap);
+					expect(run.output).not.toContain("Detection");
+					expect(run.status).toBe(0);
+				}
+			},
+		);
+
+		posix(
+			"keeps the issue-ref and none: forms available when the base cannot be resolved",
+			() => {
+				for (const gap of ["#4404", "none: no layer would have seen it"]) {
+					const run = lint(existsBaseFixtures.noBase(), gap);
+					expect(run.output).not.toContain("Detection");
+					expect(run.status).toBe(0);
+				}
+			},
+		);
+	});
+});
+
+// Recurrence: the CI entry builds its own options for `lintPrBody`; a rule wired
+// only into the local preflight would pass the same body in CI (#4404).
+describe("Gap exists: names a file on the PR's base through the CI event entry (#4404)", () => {
+	const closing = (gap: string) =>
+		`${body}\n\n### Test assessment\nThe fixture file is the subject.\n\n## Detection\n\nCaught by: external user\nShould have been caught by: CI unit\nGap: ${gap}\nShape: new: stale mirror\nEnforcer: #4439\n\nCloses #4404.\n`;
+	const eventFetch = (text: string) =>
+		vi.fn().mockImplementation(async (url: string) => {
+			if (String(url).includes("/files"))
+				return new Response(JSON.stringify([]), { status: 200 });
+			if (String(url).includes("/issues/"))
+				return new Response(JSON.stringify({ labels: [{ name: "bug" }] }), {
+					status: 200,
+				});
+			return new Response(JSON.stringify({ body: text }), { status: 200 });
+		});
+	const fixtures: string[] = [];
+	let previousCwd = "";
+	beforeEach(() => {
+		previousCwd = process.cwd();
+		vi.stubEnv("GITHUB_TOKEN", "t");
+		vi.stubEnv("GITHUB_API_URL", "https://api.example");
+		vi.stubEnv("GITHUB_REPOSITORY", "o/r");
+	});
+	afterEach(() => {
+		vi.unstubAllEnvs();
+		vi.restoreAllMocks();
+		process.chdir(previousCwd);
+		for (const fixture of fixtures.splice(0))
+			rmSync(fixture, { recursive: true, force: true });
+	});
+
+	async function lintAt(fixture: string, text: string) {
+		fixtures.push(fixture);
+		const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		process.chdir(fixture);
+		const result = await lintPullRequestEvent(eventFetch(text), {
+			pull_request: { number: 4404, body: text },
+		});
+		return { result, output: errors.mock.calls.flat().join("\n") };
+	}
+
+	it("refuses an exists: path the head adds", async () => {
+		const run = await lintAt(
+			existsBaseFixtures.headAdds(),
+			closing(`exists: ${NEW_TEST}`),
+		);
+		expect(run.output).toContain("is not on the PR's base commit");
+		expect(run.result.valid).toBe(false);
+	});
+
+	it("accepts an exists: path on the base", async () => {
+		const run = await lintAt(
+			existsBaseFixtures.baseHas(),
+			closing(`exists: ${OLD_TEST}`),
+		);
+		expect(run.output).not.toContain("Detection");
+		expect(run.result.valid).toBe(true);
+	});
+
+	// Recurrence: the CI entry builds its own `lintPrBody` options, so the
+	// catalog reader wired only into the local preflight would pass the same
+	// body in CI (#4439). The fixture checkout has no AGENTS.md.
+	it("reads the shape catalog through the CI event entry", async () => {
+		const text = closing("#4404").replace(
+			/Shape: .*\nEnforcer: .*\n/,
+			`Shape: #4\nEnforcer: ${OLD_TEST}\n`,
+		);
+		const run = await lintAt(existsBaseFixtures.baseHas(), text);
+		expect(run.output).toContain("could not be read from the base commit");
+		expect(run.result.valid).toBe(false);
 	});
 });

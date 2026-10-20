@@ -19,11 +19,13 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { writeEvaluatedRecord } from "./lib/assert-evaluated.mjs";
 import {
 	mergeServerCapabilitiesDoc,
 	renderServerCapabilitiesDoc,
 } from "./lib/md-matrix.mjs";
 import {
+	adoptFixtureProjectTrust,
 	bootstrapFixtureWorkspace,
 	withScratchHome,
 } from "./lib/lsp-fixture-workspace.mjs";
@@ -47,6 +49,10 @@ const { getLSPService, resetLSPService } = await imp(
 	"dist/clients/lsp/index.js",
 );
 const { initLSPConfig } = await imp("dist/clients/lsp/config.js");
+// #4514: this script is a standalone host, not pi. Adopt project trust before
+// the first touch, or the launch gate refuses every project-local and
+// project-code server and the rows read as unavailable.
+await adoptFixtureProjectTrust({ repoRoot });
 let ensureTool;
 if (install) {
 	({ ensureTool } = await imp("dist/clients/installer/index.js"));
@@ -165,6 +171,8 @@ fs.writeFileSync(docPath, output);
 console.error(
 	`\nWrote docs/servercapabilities.md (${rows.length} servers captured this run, ${unavailable.size} unavailable).`,
 );
+// #4514: the step exits 0 by design, so the nightly's floor step reads this.
+writeEvaluatedRecord({ producer: "server-capabilities", input: rows });
 
 try {
 	await resetLSPService?.({ fast: true });

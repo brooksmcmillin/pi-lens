@@ -5,9 +5,7 @@
  */
 
 import { withResidentBootstrap } from "../support/bootstrap-access.js";
-import * as fs from "node:fs";
 import * as os from "node:os";
-import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { handleSessionStart } from "../../clients/runtime-session.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
@@ -48,7 +46,7 @@ function makeDefaultRuntime() {
 		isCurrentSession: () => true,
 		markStartupScanInFlight: () => {},
 		clearStartupScanInFlight: () => {},
-		complexityBaselines: new Map(),
+		complexityBaselines: new Set(),
 		resetForSession: () => {},
 		projectRoot: "",
 		projectRulesScan: { hasCustomRules: false, rules: [] },
@@ -283,9 +281,8 @@ describe("warmFiles session start", () => {
 		const restoreStartupMode = setStartupMode("full");
 
 		// Pure-config repo: the non-code fallback keeps #203's warm-something
-		// behavior instead of skipping warmup entirely. A .git marker makes the
-		// root warm-eligible (canWarmCaches) without adding any code files.
-		fs.mkdirSync(path.join(env.tmpDir, ".git"), { recursive: true });
+		// behavior instead of skipping warmup entirely. The fixture root marker
+		// makes the root warm-eligible (canWarmCaches) without adding code files.
 		createTempFile(env.tmpDir, "a.yaml", "a: 1\n");
 		createTempFile(env.tmpDir, "b.yaml", "b: 2\n");
 

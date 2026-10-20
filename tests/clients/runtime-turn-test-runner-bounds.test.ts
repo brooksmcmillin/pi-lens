@@ -563,7 +563,6 @@ describe("#2522 AC1 — turn_end selection excludes integration/e2e targets", ()
 		try {
 			const runtime = new RuntimeCoordinator();
 			const cacheManager = new CacheManager(false);
-			fs.mkdirSync(path.join(env.tmpDir, ".git"));
 			fs.writeFileSync(
 				path.join(env.tmpDir, ".git", "HEAD"),
 				"ref: refs/heads/main\n",

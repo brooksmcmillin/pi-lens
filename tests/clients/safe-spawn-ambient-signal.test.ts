@@ -11,6 +11,7 @@
 import { ChildProcess } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+	spawnAbortScope,
 	safeSpawnAsync,
 	setAmbientAbortSignal,
 } from "../../clients/safe-spawn.js";
@@ -61,10 +62,20 @@ describe("safeSpawnAsync ambient abort signal (#197)", () => {
 		setAmbientAbortSignal(AbortSignal.abort());
 		const live = new AbortController();
 
-		const result = await safeSpawnAsync(NODE, EXIT_OK, { signal: live.signal });
-
-		expect(result.error?.message ?? "").not.toMatch(/aborted before start/i);
-		expect(result.status).not.toBeNull();
+		// #4543: scoped cancellation reaches runners with explicit options;
+		// the next unscoped iteration proves async-context isolation.
+		for (const scoped of [AbortSignal.abort(), undefined]) {
+			const result = await spawnAbortScope.run(scoped as AbortSignal, () =>
+				safeSpawnAsync(NODE, EXIT_OK, { signal: live.signal }),
+			);
+			if (scoped) expect(result.failure).toBe("aborted");
+			else {
+				expect(result.error?.message ?? "").not.toMatch(
+					/aborted before start/i,
+				);
+				expect(result.status).not.toBeNull();
+			}
+		}
 	});
 
 	it("with no ambient and no explicit signal, the spawn runs normally", async () => {

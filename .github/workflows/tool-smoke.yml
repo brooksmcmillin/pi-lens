@@ -53,7 +53,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: true
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
       # The publish step checks out the data branch over this tree, so the
@@ -108,7 +108,7 @@ jobs:
         env:
           SINCE: ${{ steps.watermark.outputs.since }}
         run: printf 'since=%s\n' "$SINCE" > "$RUNNER_TEMP/test-history-ingest.txt"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-history-ingest
           path: |
@@ -135,10 +135,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: true
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
-      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: test-history-ingest
           path: ${{ runner.temp }}
@@ -204,7 +204,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
       - name: Notify on test-history rollup red (file/update/close tracking issue)
@@ -248,6 +248,7 @@ jobs:
       lens_full: ${{ steps.lens_full.outcome }}
       format_layer: ${{ steps.format_layer.outcome }}
       resolution_layer: ${{ steps.resolution_layer.outcome }}
+      evaluated_floor: ${{ steps.evaluated_floor.outcome }}
       docs_changed: ${{ steps.docs_diff.outputs.changed }}
       promoted: ${{ steps.idle_promote.outputs.promoted }}
       census: ${{ steps.lsp_census.outcome }}
@@ -281,12 +282,16 @@ jobs:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       PI_LENS_HOME: /tmp/pi-lens-home
       PILENS_DATA_DIR: /tmp/pi-lens-home
+      # #4514: where the four best-effort LSP producers leave how much each
+      # evaluated, for the `evaluated_floor` step below. Bare /tmp for the same
+      # reason as the two pins above (the `runner` context is unavailable here).
+      PI_LENS_EVALUATED_DIR: /tmp/pi-lens-evaluated
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
 
@@ -304,18 +309,18 @@ jobs:
       # nightly (the harness already treats an unavailable tool as ⚠, not a
       # failure), so each is continue-on-error.
       # yamllint disable-line rule:line-length
-      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         continue-on-error: true
         with:
           distribution: temurin
           java-version: '21'
-      - uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1
+      - uses: ruby/setup-ruby@651ff0d62c5c79bed6d53ec518387aae20e72c1a # v1
         continue-on-error: true
         with:
           ruby-version: '3.3'
       - uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d # v1.8.1
         continue-on-error: true
-      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
         continue-on-error: true
         with:
           php-version: '8.3'
@@ -369,6 +374,18 @@ jobs:
           echo "$dest/bin" >> "$GITHUB_PATH"
           "$dest/bin/docker-language-server" --version
 
+      # #4358: restore the managed tool tree (the npm tools and release
+      # binaries every `--install` step below shares through PI_LENS_HOME)
+      # instead of re-downloading it nightly. The key is the installer
+      # registry's hash plus the ISO week, so a pin change installs cold and a
+      # floating package refreshes weekly. Saved by the last step of the job.
+      - name: Restore the managed tool tree
+        id: tool_tree
+        uses: ./.github/actions/tool-tree-cache
+        with:
+          mode: restore
+          prefix: tool-smoke-tools
+
       # `id:` + a captured log (#2723): this is one of the six steps whose
       # outcome can actually turn the job red (no continue-on-error), so the
       # final notify step below needs both this step's `outcome` and its raw
@@ -395,11 +412,17 @@ jobs:
           set -o pipefail
           node scripts/smoke-tools.mjs --install --verbose 2>&1 | tee "$RUNNER_TEMP/tool-smoke-tool-layer.log"
 
+      # --min-pass is the floor that keeps a green handshake honest (#4514): an
+      # unavailable server reports a warning, never a failure, so a run where
+      # every install failed would exit 0 having proved nothing. 46 passed on
+      # both 2026-10-09 and 2026-10-15 (tests/fixtures/nightly-floors/
+      # measurements.json); the floor sits below that by the runner's usual
+      # toolchain wobble.
       - name: LSP handshake layer (install + spawn + initialize each server)
         id: lsp_handshake
         run: |
           set -o pipefail
-          node scripts/smoke-tools.mjs --lsp --install --verbose 2>&1 | tee "$RUNNER_TEMP/tool-smoke-lsp-handshake.log"
+          node scripts/smoke-tools.mjs --lsp --install --verbose --min-pass=40 2>&1 | tee "$RUNNER_TEMP/tool-smoke-lsp-handshake.log"
 
       # Gating diagnostic layer (#2780, recurrence #2776): the handshake above
       # proves initialize only. This row family drives the real lsp_diagnostics
@@ -547,7 +570,7 @@ jobs:
         continue-on-error: true
         run: |
           set -o pipefail
-          npx vitest run \
+          node_modules/.bin/vitest run \
             tests/config/lsp-first-publish-census.test.ts \
             tests/config/lsp-clean-behavior-census.test.ts \
             tests/config/lsp-idle-eviction-measurement.test.ts \
@@ -575,7 +598,7 @@ jobs:
             cp --parents clients/lsp/server.ts tests/config/lsp-idle-eviction-reasons.json tests/config/lsp-idle-eviction-registry.test.ts .changelog/3989-lsp-idle-eviction-promote.md "$stage/files/"
             cp "$RUNNER_TEMP/lsp-idle-eviction-promote.md" "$stage/idle-eviction-promote.md"
           fi
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always() && (steps.docs_diff.outputs.changed == 'true' || steps.idle_promote.outputs.promoted == 'true')
         with:
           name: tool-smoke-pr-inputs
@@ -624,6 +647,45 @@ jobs:
           set -o pipefail
           node scripts/smoke-tools.mjs --resolution --verbose 2>&1 | tee "$RUNNER_TEMP/tool-smoke-resolution-layer.log"
 
+      # #4514: the four LSP producers above (characterize, clean-signal,
+      # capabilities, idle-eviction) exit 0 by design under continue-on-error,
+      # so a night that evaluated almost nothing read green for six days
+      # (41 servers captured fell to 16; ~54 classified rows to ~24). Each
+      # leaves `{producer, evaluated}` in $PI_LENS_EVALUATED_DIR; this step,
+      # which is NOT continue-on-error, fails when a count is under its floor
+      # or has dropped more than 20% against the doc at HEAD
+      # (scripts/lib/assert-evaluated.mjs). `--docs` also judges the docs the
+      # producers just regenerated (a classified matrix cell gone `unknown`,
+      # which no count margin sees), so a doc-only loss reds this step, which
+      # the notifier reads, and not only the refresh job. It runs after the
+      # last layer, so a degraded night still reports every layer;
+      # notify-tool-smoke-red.mjs
+      # reads its outcome. Skipped only when the producers themselves never
+      # ran (an earlier gating layer failed): that night is already red.
+      - name: LSP evaluated floor (characterize, clean-signal, capabilities, idle-eviction)
+        id: evaluated_floor
+        if: ${{ !cancelled() && steps.lsp_matrix.outcome != 'skipped' }}
+        timeout-minutes: 2
+        run: |
+          set -o pipefail
+          node scripts/assert-evaluated.mjs --records "$PI_LENS_EVALUATED_DIR" --docs 2>&1 | tee "$RUNNER_TEMP/tool-smoke-evaluated-floor.log"
+
+      # #4358: save the tool tree once every `--install` layer above has run.
+      # The key is first-wins for the week, so a tree saved after an early red
+      # layer (the later layers skipped, their tools never installed) would be
+      # restored all week and re-download the rest each night. A red layer that
+      # still let the last install step run saves a complete tree, so the gate
+      # is that step's outcome, not the job's. Skipped on an exact hit, and on
+      # a cancel, which can leave a half-written tree. A save problem never
+      # reds the job.
+      - name: Save the managed tool tree
+        if: ${{ !cancelled() && steps.tool_tree.outputs.cache-hit != 'true' && steps.lens_full.outcome != 'skipped' }}
+        continue-on-error: true
+        uses: ./.github/actions/tool-tree-cache
+        with:
+          mode: save
+          prefix: tool-smoke-tools
+
       # #3319: PR analyses cover only their diff, so a master-only SonarCloud
       # quality regression otherwise stays invisible to the merge train. Keep
       # this as a real gate, but let the script classify SonarCloud transport
@@ -658,7 +720,7 @@ jobs:
           summary="$(node --input-type=module -e "import { DRIFT_SUMMARY_PATH } from './scripts/lib/clean-signal.mjs'; process.stdout.write(DRIFT_SUMMARY_PATH)")"
           cp -f "$summary" "$stage/pilens-clean-signal-drift-summary.json" 2>/dev/null || true
           echo "staged by ${GITHUB_JOB}" > "$stage/staged.txt"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: tool-smoke-notify-inputs
@@ -686,12 +748,26 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: tool-smoke-pr-inputs
           path: ${{ runner.temp }}/pr-inputs
       - name: Overlay the regenerated files
         run: cp -r "$RUNNER_TEMP/pr-inputs/files/." .
+
+      # #4514: a refresh that only records a degraded night (41 servers
+      # captured fell to 16, five classified cells flipped to `unknown`) must
+      # not open as a PR a maintainer can merge. Compares each regenerated doc's
+      # count against HEAD's and fails the job on a drop of more than 20% or a
+      # count under the floor; the create-pull-request steps below then do not
+      # run. A failed guard also holds the promotion PR: both read this night's
+      # measurement.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+      - name: Refuse a degraded refresh (regenerated docs against HEAD)
+        id: refresh_guard
+        run: node scripts/assert-evaluated.mjs --docs
 
       # Commit-back (#390 item 2): the three steps above regenerate the LSP docs
       # in-place. master has required checks the schedule's GITHUB_TOKEN can't
@@ -776,10 +852,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
-      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: tool-smoke-notify-inputs
           path: ${{ runner.temp }}
@@ -855,6 +931,8 @@ jobs:
           FORMAT_LAYER_LOG: ${{ runner.temp }}/tool-smoke-format-layer.log
           RESOLUTION_LAYER_OUTCOME: ${{ needs.tool-smoke.outputs.resolution_layer }}
           RESOLUTION_LAYER_LOG: ${{ runner.temp }}/tool-smoke-resolution-layer.log
+          EVALUATED_FLOOR_OUTCOME: ${{ needs.tool-smoke.outputs.evaluated_floor }}
+          EVALUATED_FLOOR_LOG: ${{ runner.temp }}/tool-smoke-evaluated-floor.log
           # #2723 review F3: a job failure BEFORE the six tracked layers
           # even start (checkout, a best-effort setup action, npm install,
           # build:dist — twelve steps, none of which set an *_OUTCOME above)
@@ -942,7 +1020,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
       # --ignore-scripts: the bench needs the compiled clients/ only, never the
@@ -985,7 +1063,7 @@ jobs:
           mkdir -p "$stage"
           cp -f "$RUNNER_TEMP/snapshot-persist-drift-state" "$RUNNER_TEMP/snapshot-persist-drift.md" "$stage/" 2>/dev/null || true
           echo "staged by ${GITHUB_JOB}" > "$stage/staged.txt"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: snapshot-persist-notify-inputs
@@ -1014,10 +1092,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
-      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: snapshot-persist-notify-inputs
           path: ${{ runner.temp }}

@@ -67,7 +67,13 @@ extend-exclude = [
 # allowlist would blind the checker to a REAL "immedaite"/"erro" typo
 # anywhere else in the repo, forever. Scoping to the exact line keeps the
 # checker live everywhere else.
-extend-ignore-re = ["(?Rm)^.*(#|//)\\s*spellchecker:disable-line$"]
+extend-ignore-re = [
+  "(?Rm)^.*(#|//)\\s*spellchecker:disable-line$",
+  # #4603: the sweep pins are 16-hex content identities, and a hex digest can
+  # spell a flagged trigram by chance (`abd`, `ded`). Ignore the VALUE, not a
+  # word, so a re-pin is not a coin flip and no real trigram is blinded.
+  'identities: "[0-9a-f]{16}"',
+]
 
 # Dictionary tuning — reaches BOTH lanes (typos-lsp and typos-cli).
 [default.extend-words]

@@ -11,11 +11,6 @@ import { createMcpHost } from "../../../clients/mcp/host-shim.js";
 import { removeTempDirSync } from "../test-utils.js";
 
 describe("createMcpHost", () => {
-	it("returns a PiAgentAPI with a getFlag method", () => {
-		const host = createMcpHost();
-		expect(typeof host.getFlag).toBe("function");
-	});
-
 	it("lets a per-call override win over global-config defaults", () => {
 		const host = createMcpHost({ "no-lsp": true });
 		expect(host.getFlag("no-lsp")).toBe(true);

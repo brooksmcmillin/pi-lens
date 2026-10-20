@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { gitExecFileSync } from "../../scripts/lib/git-fixture-env.mjs";
+import { copyFixtureGitHelper } from "../support/fixture-git-copy.js";
 
 const root = process.cwd();
 const probe = path.join(root, "scripts", "guard-bash-probe.mjs");
@@ -349,10 +350,11 @@ process.exit(ok ? 2 : 0);
 			expect(() => git(clone, "cat-file", "-e", denying)).toThrow();
 			mkdirSync(path.join(clone, "scripts", "lib"), { recursive: true });
 			copyFileSync(probe, path.join(clone, "scripts", "guard-bash-probe.mjs"));
-			copyFileSync(
-				path.join(root, "scripts", "lib", "git-fixture-env.mjs"),
-				path.join(clone, "scripts", "lib", "git-fixture-env.mjs"),
-			);
+			// The copied helper resolves its background-maintenance policy relative
+			// to its own module, so the policy file travels with it; the clone has
+			// no `tests/fixtures/` otherwise, and Git would fall back to
+			// `maintenance.auto` and fork the detached child again (#4552 R2).
+			copyFixtureGitHelper(clone);
 			const matrix = writeMatrix("ref.jsonl", [
 				{ command: "echo a", lane: "real", expect: "deny" },
 			]);

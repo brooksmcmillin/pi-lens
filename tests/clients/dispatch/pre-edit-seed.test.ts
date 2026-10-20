@@ -1,0 +1,55 @@
+/**
+ * #4483: the pre-edit seed's bound and filter (clients/dispatch/pre-edit-seed.ts).
+ *
+ * Recurrence it prevents: a file with thousands of old linter errors growing
+ * one session fact without limit (the seed sits in the bounded session facts,
+ * whose cap counts records, not their size), and a language-server finding
+ * being seeded against the maintainer's linters-only scope. The behaviour
+ * through the real host chain is tests/index-4483-first-write-seed-witness.test.ts.
+ */
+import { describe, expect, it } from "vitest";
+import {
+	MAX_PRE_EDIT_SEED_FINDINGS,
+	seedFromCapture,
+} from "../../../clients/dispatch/pre-edit-seed.js";
+import type { Diagnostic } from "../../../clients/dispatch/types.js";
+
+function finding(line: number, runnerId: string): Diagnostic {
+	return {
+		id: `${runnerId}:SC1072:${line}`,
+		message: "Unexpected BAD_SH token",
+		filePath: "/p/a.sh",
+		line,
+		column: 1,
+		severity: "error",
+		semantic: "blocking",
+		tool: runnerId,
+		runnerId,
+		rule: "SC1072",
+	};
+}
+
+describe("seedFromCapture", () => {
+	it("keeps at most MAX_PRE_EDIT_SEED_FINDINGS entries", () => {
+		const lines = MAX_PRE_EDIT_SEED_FINDINGS + 5;
+		const content = Array.from({ length: lines }, () => "BAD_SH").join("\n");
+		const findings = Array.from({ length: lines }, (_, i) =>
+			finding(i + 1, "shellcheck"),
+		);
+		const seed = seedFromCapture(findings, content);
+		expect(seed).toHaveLength(MAX_PRE_EDIT_SEED_FINDINGS);
+		expect(seed.every((d) => d.lineHash !== undefined)).toBe(true);
+	});
+
+	it("seeds only linter findings", () => {
+		const seed = seedFromCapture(
+			[
+				finding(1, "shellcheck"),
+				finding(1, "lsp"),
+				finding(1, "ast-grep-napi"),
+			],
+			"BAD_SH\n",
+		);
+		expect(seed.map((d) => d.runnerId)).toEqual(["shellcheck"]);
+	});
+});

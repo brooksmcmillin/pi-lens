@@ -106,7 +106,17 @@ vi.mock("../clients/child-unref.js", async (importOriginal) => {
 			if (image !== "ps" && image !== "powershell.exe") {
 				return original.spawnCollectStdoutResult(...args);
 			}
-			seam.listings.push(image);
+			// Registration reads only this process's identity on macOS, not the host table.
+			const selfIdentityRead =
+				image === "ps" &&
+				JSON.stringify(args[1]) ===
+					JSON.stringify([
+						"-p",
+						String(process.pid),
+						"-o",
+						"pid=,lstart=,args=",
+					]);
+			if (!selfIdentityRead) seam.listings.push(image);
 			return Promise.resolve({ stdout: "", status: "ok" as const });
 		},
 	};

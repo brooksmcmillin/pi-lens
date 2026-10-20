@@ -69,6 +69,7 @@ describe("runWorkspaceDiagnostics — per-server serialization (#387)", () => {
 			getOperationSupport: () => ({}),
 			serverId,
 			notify: {
+				announceCreated: () => undefined,
 				open: vi.fn(async () => {
 					const n = (live.get(serverId) ?? 0) + 1;
 					live.set(serverId, n);
@@ -140,7 +141,10 @@ describe("runWorkspaceDiagnostics — per-server serialization (#387)", () => {
 					diagnosticProviderKind: "object",
 				}),
 				getOperationSupport: () => ({}),
-				notify: { open: notifyOpen },
+				notify: {
+					announceCreated: () => undefined,
+					open: notifyOpen,
+				},
 				requestWorkspaceDiagnostics,
 				waitForDiagnostics: vi.fn().mockResolvedValue(undefined),
 				getDiagnostics: vi.fn(() => []),
@@ -183,7 +187,10 @@ describe("runWorkspaceDiagnostics — per-server serialization (#387)", () => {
 				diagnosticProviderKind: "object",
 			}),
 			getOperationSupport: () => ({}),
-			notify: { open: notifyOpen },
+			notify: {
+				announceCreated: () => undefined,
+				open: notifyOpen,
+			},
 			requestWorkspaceDiagnostics,
 			waitForDiagnostics: vi.fn().mockResolvedValue(undefined),
 			getDiagnostics: vi.fn(() => []),

@@ -261,13 +261,13 @@ describe("collectMemorySampleSubsystems (O(1)/O(bounded-cache-size) live reads)"
 	it("attributes bytes to session-fact entries, not just the neighbor cache", () => {
 		expect(
 			estimateDispatchCacheBytes({
-				recentlyCleanNeighborCacheSize: 2,
+				pendingNeighborCount: 2,
 				sessionFactEntries: 1000,
 			}),
-		).toBe(440_640);
+		).toBe(441_230);
 		expect(
 			estimateDispatchCacheBytes({
-				recentlyCleanNeighborCacheSize: 0,
+				pendingNeighborCount: 0,
 				sessionFactEntries: 1000,
 			}),
 		).toBe(440_000);
@@ -366,7 +366,7 @@ describe("collectMemorySampleSubsystems (O(1)/O(bounded-cache-size) live reads)"
 		expect(subsystems.reviewGraph.totalEdges).toBeGreaterThanOrEqual(0);
 		expect(subsystems.reviewGraph.residentBytes).toBeGreaterThanOrEqual(0);
 		expect(
-			subsystems.dispatchCaches.recentlyCleanNeighborCacheSize,
+			subsystems.dispatchCaches.pendingNeighborCount,
 		).toBeGreaterThanOrEqual(0);
 		expect(subsystems.dispatchCaches.estimatedBytes).toBeGreaterThanOrEqual(0);
 		// Registry sweep: every non-null subsystem must expose a byte field, so

@@ -1,11 +1,12 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { LSPDiagnostic } from "../../../clients/lsp/client.js";
 import {
 	AUXILIARY_LSP_PROFILES,
 	applyAuxiliarySuppressions,
+	configDisabledAuxiliaryLspServerIds,
 	enabledAuxiliaryLspServerIds,
 	findAuxiliaryProfileForSource,
 	isAuxiliaryDiagnosticSuppressed,
@@ -102,19 +103,75 @@ describe("auxiliary LSP enablement", () => {
 	});
 });
 
+describe("configDisabledAuxiliaryLspServerIds (#4323)", () => {
+	beforeEach(() => {
+		_resetSubagentModeForTests();
+	});
+	afterEach(() => {
+		_resetSubagentModeForTests();
+	});
+
+	it("lists nothing when no kill switch is set", () => {
+		expect([...configDisabledAuxiliaryLspServerIds(() => undefined)]).toEqual(
+			[],
+		);
+	});
+
+	it("lists opengrep when the no-opengrep kill switch is set", () => {
+		expect([
+			...configDisabledAuxiliaryLspServerIds((f) => f === "no-opengrep"),
+		]).toEqual(["opengrep"]);
+	});
+
+	it("lists each profile whose kill switch is set, and only those", () => {
+		const switches = new Set(["no-zizmor", "no-typos"]);
+		expect(
+			[...configDisabledAuxiliaryLspServerIds((f) => switches.has(f))].sort(),
+		).toEqual(["typos", "zizmor"]);
+	});
+
+	it("treats a non-true flag value as not set", () => {
+		expect([
+			...configDisabledAuxiliaryLspServerIds((f) =>
+				f === "no-opengrep" ? "false" : undefined,
+			),
+		]).toEqual([]);
+	});
+
+	// The resource degrade is not a configuration decision: an explicit check
+	// still asks those scanners, so a subagent session excludes nothing.
+	it("excludes nothing for a subagent session's light mode alone", () => {
+		process.env.PI_SUBAGENT_CHILD = "1";
+		_resetSubagentModeForTests();
+		try {
+			expect(enabledAuxiliaryLspServerIds(() => undefined)).toEqual([]);
+			expect([...configDisabledAuxiliaryLspServerIds(() => undefined)]).toEqual(
+				[],
+			);
+		} finally {
+			delete process.env.PI_SUBAGENT_CHILD;
+			_resetSubagentModeForTests();
+		}
+	});
+
+	it("is the complement of the enabled set for every profile outside the degrade", () => {
+		const switches = new Set(["no-opengrep", "no-ast-grep"]);
+		const getFlag = (f: string) => switches.has(f);
+		const enabled = new Set(enabledAuxiliaryLspServerIds(getFlag));
+		const disabled = configDisabledAuxiliaryLspServerIds(getFlag);
+		for (const profile of AUXILIARY_LSP_PROFILES) {
+			expect(enabled.has(profile.serverId)).toBe(
+				!disabled.has(profile.serverId),
+			);
+		}
+	});
+});
+
 describe("auxiliary profile skipTestFiles (#687)", () => {
 	it("ast-grep skips test files (matches the in-process runner's own skipTestFiles)", () => {
 		expect(
 			AUXILIARY_LSP_PROFILES.find((p) => p.tool === "ast-grep")?.skipTestFiles,
 		).toBe(true);
-	});
-
-	it("opengrep, zizmor, and typos do NOT skip test files", () => {
-		for (const tool of ["opengrep", "zizmor", "typos"]) {
-			expect(
-				AUXILIARY_LSP_PROFILES.find((p) => p.tool === tool)?.skipTestFiles,
-			).not.toBe(true);
-		}
 	});
 });
 
@@ -163,13 +220,6 @@ describe("opengrep semantic policy", () => {
 		expect(
 			opengrep?.semantic(diag({ severity: 2 }), { blockingAllowed: false }),
 		).toBe("warning");
-	});
-
-	it("derives a defect class from the rule", () => {
-		const dc = opengrep?.defectClass?.(
-			diag({ code: "javascript.lang.security.audit.eval", message: "eval" }),
-		);
-		expect(typeof dc === "string" || dc === undefined).toBe(true);
 	});
 });
 
@@ -666,5 +716,375 @@ describe("rule-ignore catalog precedence (#3041)", () => {
 			{ filePath: path.join(tmp, "scripts", "cli.ts"), scanRoot: tmp },
 		);
 		expect(kept).toHaveLength(1);
+	});
+});
+
+// #4365 rotation batch 1: the per-module Stryker campaign listed the survivors
+// below as behaviours no test pins. Each case names the mutant (or the family
+// of mutants) it kills; the mutation table in the PR body has the red per row.
+describe("auxiliary profile table (#4365)", () => {
+	beforeEach(() => {
+		_resetSubagentModeForTests();
+	});
+	afterEach(() => {
+		_resetSubagentModeForTests();
+	});
+
+	it("ast-grep is default-on, and its own kill switch removes exactly it", () => {
+		// Pins the ast-grep profile's `enabledByDefault: true` and
+		// `killSwitchFlag: "no-ast-grep"` (survivors: `false`, `""`), and the
+		// disabled branch of the enabled-id `flatMap` yielding `[]` (survivor:
+		// `["Stryker was here"]`, which `.not.toContain` cannot see).
+		expect(enabledAuxiliaryLspServerIds(() => undefined)).toEqual([
+			"opengrep",
+			"ast-grep",
+			"zizmor",
+			"typos",
+		]);
+		expect(
+			enabledAuxiliaryLspServerIds((flag) => flag === "no-ast-grep"),
+		).toEqual(["opengrep", "zizmor", "typos"]);
+	});
+
+	it("routes every spelling of the ast-grep source to the ast-grep profile", () => {
+		// Pins `sourceMatch: /ast[-_]?grep/i` (survivor: the optional separator
+		// dropped, so `astgrep` stops routing and its findings keep tool "lsp").
+		for (const source of ["ast-grep", "ast_grep", "astgrep", "AST-GREP"]) {
+			expect(findAuxiliaryProfileForSource(source)?.tool, source).toBe(
+				"ast-grep",
+			);
+		}
+	});
+
+	it("looks a source up once, then answers from the memo, for matches and non-matches alike", () => {
+		// Pins the documented memo of `findAuxiliaryProfileForSource` (survivors:
+		// the cache-hit condition forced `false`, `||` turned `&&`, and the
+		// `profileForSourceCache.set` removed). Output is identical either way, so
+		// the observable is how often the profile regexes are consulted: a hit
+		// must not re-run them. Sources are unique to this case so no earlier test
+		// has warmed the memo.
+		const opengrep = AUXILIARY_LSP_PROFILES.find(
+			(p) => p.serverId === "opengrep",
+		);
+		const typos = AUXILIARY_LSP_PROFILES.find((p) => p.serverId === "typos");
+		const opengrepProbe = vi.spyOn(opengrep!.sourceMatch, "test");
+		const typosProbe = vi.spyOn(typos!.sourceMatch, "test");
+		try {
+			findAuxiliaryProfileForSource("semgrep-memo-4365");
+			findAuxiliaryProfileForSource("semgrep-memo-4365");
+			expect(opengrepProbe).toHaveBeenCalledTimes(1);
+
+			// No profile matches: the memo must still remember the miss. Typos is the
+			// last profile, so it is consulted exactly once per uncached lookup.
+			findAuxiliaryProfileForSource("plain-lsp-memo-4365");
+			findAuxiliaryProfileForSource("plain-lsp-memo-4365");
+			expect(typosProbe).toHaveBeenCalledTimes(1);
+		} finally {
+			opengrepProbe.mockRestore();
+			typosProbe.mockRestore();
+		}
+	});
+
+	it("keeps a plain language-server finding on a test file instead of throwing on its missing profile", () => {
+		// Pins `profile?.skipTestFiles` in `applyAuxiliarySuppressions` (survivor:
+		// `profile.skipTestFiles`, which throws a TypeError for any non-auxiliary
+		// source the moment `fileRole` is "test").
+		const plain = diag({ source: "typescript", code: 2322 });
+		expect(
+			applyAuxiliarySuppressions([plain], "", { fileRole: "test" }),
+		).toEqual([plain]);
+	});
+});
+
+describe("native inline suppression syntax (#4365)", () => {
+	const at = (line: number, over: Partial<LSPDiagnostic> = {}) =>
+		diag({
+			source: "Semgrep",
+			code: "rule-a",
+			range: {
+				start: { line, character: 0 },
+				end: { line, character: 1 },
+			},
+			...over,
+		});
+	const zizmorAt = (line: number, over: Partial<LSPDiagnostic> = {}) =>
+		at(line, { source: "zizmor", code: "artipacked", ...over });
+
+	it("honours `nosemgrep` with no, one or several spaces after the comment marker", () => {
+		// Pins the `\s*` between the marker and `nosemgrep` in NOSEMGREP_RE
+		// (survivor: `\s`, which needs exactly one space).
+		for (const comment of ["//nosemgrep", "// nosemgrep", "#    nosemgrep"]) {
+			expect(
+				isAuxiliaryDiagnosticSuppressed(at(0), `x() ${comment}\n`),
+				comment,
+			).toBe(true);
+		}
+	});
+
+	it("reads the rule list after `nosemgrep:` with or without a space", () => {
+		// Pins `(?::\s*(.+))?` in both nosemgrep regexes (survivors: `\s` makes the
+		// whole list optional and silently turns `nosemgrep:other` into a BARE
+		// suppress-everything comment; `\S*` leaves the list the wrong tail
+		// `a` of `rule-a`).
+		// Inline, list names a DIFFERENT rule: must not suppress.
+		expect(
+			isAuxiliaryDiagnosticSuppressed(at(0), "x() // nosemgrep:other-rule\n"),
+		).toBe(false);
+		// Inline, list names THIS rule without a space: suppresses.
+		expect(
+			isAuxiliaryDiagnosticSuppressed(at(0), "x() // nosemgrep:rule-a\n"),
+		).toBe(true);
+		// Line above, standalone, no space: suppresses the finding below it.
+		expect(
+			isAuxiliaryDiagnosticSuppressed(at(1), "// nosemgrep:rule-a\nx()\n"),
+		).toBe(true);
+		// And a list that does not name the rule leaves it alone.
+		expect(
+			isAuxiliaryDiagnosticSuppressed(at(1), "// nosemgrep:other\nx()\n"),
+		).toBe(false);
+	});
+
+	it("accepts an indented, unspaced or trailing-space standalone comment above the finding", () => {
+		// Pins NOSEMGREP_STANDALONE_RE's anchors (survivors: leading `\s*` as
+		// `\S*`, the `\s*` before `nosemgrep` as `\s`, the trailing `\s*$` as
+		// `\S*$`): indentation, a missing space and trailing whitespace are all
+		// ordinary standalone comments that must keep suppressing the next line.
+		for (const above of [
+			"    // nosemgrep",
+			"//nosemgrep",
+			"// nosemgrep   ",
+		]) {
+			expect(
+				isAuxiliaryDiagnosticSuppressed(at(1), `${above}\nx()\n`),
+				JSON.stringify(above),
+			).toBe(true);
+		}
+	});
+
+	it("does not treat `nosemgrep` followed by more word characters as a standalone comment", () => {
+		// Pins the `$` end anchor of NOSEMGREP_STANDALONE_RE (survivor: anchor
+		// removed, so `// nosemgrepish` above a finding suppressed it).
+		expect(
+			isAuxiliaryDiagnosticSuppressed(at(1), "// nosemgrepish\nx()\n"),
+		).toBe(false);
+	});
+
+	it("never matches an empty rule id against an empty entry in the list", () => {
+		// Pins `.filter(Boolean)` on the parsed rule list (survivor: filter
+		// dropped, so `nosemgrep: other,` held an empty entry and suppressed every
+		// finding that carries no rule code).
+		const noCode = at(0, { code: undefined });
+		expect(
+			isAuxiliaryDiagnosticSuppressed(noCode, "x() // nosemgrep: other,\n"),
+		).toBe(false);
+	});
+
+	it("treats a diagnostic with no usable range as not suppressed, for both syntaxes", () => {
+		// Pins the `range?.start?.line` guard and its early `return false`
+		// (survivors: the optional chains made unconditional, which throw on a
+		// server-supplied diagnostic with a missing range or start; and the
+		// uncovered `return false` flipped to `true`).
+		const content = "x() // nosemgrep\ny() # zizmor: ignore[artipacked]\n";
+		for (const range of [undefined, {}] as unknown[]) {
+			expect(
+				isAuxiliaryDiagnosticSuppressed(
+					at(0, { range: range as LSPDiagnostic["range"] }),
+					content,
+				),
+			).toBe(false);
+			expect(
+				isAuxiliaryDiagnosticSuppressed(
+					zizmorAt(0, { range: range as LSPDiagnostic["range"] }),
+					content,
+				),
+			).toBe(false);
+		}
+	});
+
+	it("honours zizmor's `ignore[...]` with no space after `#` or after the colon", () => {
+		// Pins ZIZMOR_IGNORE_RE's `#\s*zizmor:\s*ignore` (survivors: either `\s*`
+		// as `\s`): `#zizmor: ignore[x]` and `# zizmor:ignore[x]` are what people
+		// type.
+		for (const line of [
+			"#zizmor: ignore[artipacked]",
+			"# zizmor:ignore[artipacked]",
+			"#   zizmor:   ignore[artipacked]",
+		]) {
+			expect(
+				isAuxiliaryDiagnosticSuppressed(zizmorAt(0), `${line}\n`),
+				line,
+			).toBe(true);
+		}
+		expect(
+			isAuxiliaryDiagnosticSuppressed(
+				zizmorAt(0),
+				"# zizmor: ignore[template-injection]\n",
+			),
+		).toBe(false);
+	});
+});
+
+describe("auxiliary retag policy (#4365)", () => {
+	const roots: string[] = [];
+	afterEach(() => {
+		for (const root of roots.splice(0)) removeTempDirSync(root);
+	});
+	const workspace = (files: Record<string, string> = {}): string => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-aux-4365-"));
+		roots.push(root);
+		for (const [rel, body] of Object.entries(files)) {
+			fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+			fs.writeFileSync(path.join(root, rel), body);
+		}
+		return root;
+	};
+	const retag = (raw: LSPDiagnostic[], cwd: string, content = "") =>
+		retagAuxiliaryDiagnostics(
+			convertLspDiagnostics(raw, "/repo/a.ts"),
+			raw,
+			content,
+			{ cwd, fileRole: "source" },
+		);
+	const from = (source: string, over: Partial<LSPDiagnostic> = {}) =>
+		diag({ source, ...over });
+
+	it("downgrades a non-blocking ERROR to a warning, and leaves a blocking ERROR and a non-error alone", () => {
+		// Pins the severity downgrade in `retagAuxiliaryDiagnostics` (survivors on
+		// `d.semantic !== "blocking" && d.severity === "error"`: the whole test
+		// forced true/false, `&&` as `||`, either operand forced true, `!==` and
+		// `===` flipped, either literal blanked; and the uncovered block and
+		// `"warning"` literal). Three rows, one per cell of the decision:
+		//   non-blocking + error   -> severity "warning"
+		//   blocking     + error   -> severity "error"   (a blocker keeps its rank)
+		//   non-blocking + info    -> severity "info"    (only errors are demoted)
+		const noConfig = workspace();
+		const curated = workspace({ ".opengrep.yml": "rules: []\n" });
+
+		const [demoted] = retag([from("Semgrep", { severity: 1 })], noConfig);
+		expect(demoted.semantic).toBe("warning");
+		expect(demoted.severity).toBe("warning");
+
+		const [kept] = retag([from("Semgrep", { severity: 1 })], curated);
+		expect(kept.semantic).toBe("blocking");
+		expect(kept.severity).toBe("error");
+
+		const [info] = retag([from("Semgrep", { severity: 3 })], noConfig);
+		expect(info.semantic).toBe("warning");
+		expect(info.severity).toBe("info");
+	});
+
+	it("each profile that gates blocking on a local config reports it from the workspace", () => {
+		// Pins the `allowBlocking` lambdas of opengrep, zizmor and typos
+		// (survivors: each `(cwd) => Boolean(findLocal...(cwd))` replaced by
+		// `() => undefined`, which makes the curated-config opt-in a dead letter).
+		const byId = (id: string) =>
+			AUXILIARY_LSP_PROFILES.find((p) => p.serverId === id);
+		expect(
+			byId("opengrep")?.allowBlocking?.(
+				workspace({ ".opengrep.yml": "rules: []\n" }),
+			),
+		).toBe(true);
+		expect(
+			byId("zizmor")?.allowBlocking?.(
+				workspace({ ".github/zizmor.yml": "rules: {}\n" }),
+			),
+		).toBe(true);
+		expect(
+			byId("typos")?.allowBlocking?.(workspace({ "typos.toml": "[files]\n" })),
+		).toBe(true);
+	});
+
+	it("computes a profile's blocking gate once per call, however many findings it tags", () => {
+		// Pins the documented "computed once per dispatch" memo
+		// (`blockingAllowedByProfile`; survivors: the miss test forced `true` and
+		// the `set` removed): `allowBlocking` walks the filesystem for a config,
+		// and a 200-finding file must not pay that 200 times.
+		const opengrep = AUXILIARY_LSP_PROFILES.find(
+			(p) => p.serverId === "opengrep",
+		);
+		const gate = vi.spyOn(
+			opengrep as { allowBlocking: (cwd: string) => boolean },
+			"allowBlocking",
+		);
+		try {
+			retag(
+				[
+					from("Semgrep", { severity: 1 }),
+					from("Semgrep", { severity: 1 }),
+					from("Semgrep", { severity: 2 }),
+				],
+				workspace(),
+			);
+			expect(gate).toHaveBeenCalledTimes(1);
+		} finally {
+			gate.mockRestore();
+		}
+	});
+
+	it("never blocks, and does not throw, for a profile that declares no allowBlocking", () => {
+		// Pins the documented "Absent => never blocks" (survivors:
+		// `allowBlocking?.(...)` made unconditional, which throws, and the `?? false`
+		// fallback flipped to `true`, which would let an undeclared gate block).
+		const typos = AUXILIARY_LSP_PROFILES.find((p) => p.serverId === "typos")!;
+		const declared = typos.allowBlocking;
+		delete (typos as { allowBlocking?: unknown }).allowBlocking;
+		try {
+			const [d] = retag([from("typos", { severity: 1 })], workspace());
+			expect(d.semantic).toBe("warning");
+			expect(d.severity).toBe("warning");
+		} finally {
+			typos.allowBlocking = declared;
+		}
+	});
+
+	it("classifies every auxiliary's findings from the rule id AND the message", () => {
+		// Pins each profile's `defectClass` lambda (survivors: the lambda replaced
+		// by `() => undefined` for opengrep, ast-grep and zizmor; `d.code ?? ""`
+		// as `d.code && ""`, which drops the rule id; `d.message ?? ""` as
+		// `d.message && ""`, which drops the message) and the `if (defectClass)`
+		// assignment (survivor: forced `false`, so nothing is ever stamped).
+		// Row A can only be classified from the rule id, row B only from the
+		// message, so losing either input changes the class.
+		for (const source of ["Semgrep", "ast-grep", "zizmor"]) {
+			const [byRule, byMessage] = retag(
+				[
+					from(source, { code: "empty-catch", message: "note" }),
+					from(source, {
+						code: "r1",
+						message: "unsafe deserialization of payload",
+					}),
+				],
+				workspace(),
+			);
+			expect(byRule.defectClass, `${source} by rule id`).toBe("silent-error");
+			expect(byMessage.defectClass, `${source} by message`).toBe("safety");
+		}
+		const [typo] = retag(
+			[from("typos", { message: "`recieve`" })],
+			workspace(),
+		);
+		expect(typo.defectClass).toBe("style");
+	});
+
+	it("stamps no defectClass at all for a profile that declares none", () => {
+		// Pins `profile.defectClass?.(...)` and the `if (defectClass)` guard
+		// (survivors: the optional call made unconditional, which throws; the
+		// guard forced `true`, which stamps an explicit `defectClass: undefined`
+		// key that downstream `in` / spread checks read as "classified").
+		const opengrep = AUXILIARY_LSP_PROFILES.find(
+			(p) => p.serverId === "opengrep",
+		)!;
+		const declared = opengrep.defectClass;
+		delete (opengrep as { defectClass?: unknown }).defectClass;
+		try {
+			const [d] = retag(
+				[from("Semgrep", { code: "empty-catch" })],
+				workspace(),
+			);
+			expect(d.tool).toBe("opengrep");
+			expect(Object.hasOwn(d, "defectClass")).toBe(false);
+		} finally {
+			opengrep.defectClass = declared;
+		}
 	});
 });

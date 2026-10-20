@@ -1,6 +1,15 @@
-import { describe, expect, it } from "vitest";
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+	copyFileSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
+import { setupTestEnvironment } from "../clients/test-utils.js";
 import {
 	realHarnessFixtureRoot,
 	validateScript,
@@ -10,6 +19,9 @@ import {
 
 // flake-shape: real-process-spawn — the child environment is the subject of this boundary test
 describe("real harness fixture shape", () => {
+	afterEach(() => {
+		vi.unstubAllEnvs();
+	});
 	it("requires every scenario to provide a project directory and valid script fields", () => {
 		for (const scenario of readdirSync(realHarnessFixtureRoot)) {
 			const dir = path.join(realHarnessFixtureRoot, scenario);
@@ -66,5 +78,57 @@ describe("real harness fixture shape", () => {
 				expect(statSync(pi.childTempDir()).isDirectory()).toBe(true);
 			},
 		);
+	});
+	// Recurrence prevented (#4513): pi 1.3 pins pi-ai exactly, and which layout npm
+	// produces (pi-ai hoisted beside the host, or nested under it as 1.0.0's
+	// shrinkwrap did, #4004) changes with the dependency tree. A fixture that
+	// finds only one layout reds every real-harness test on the other.
+	it.each([
+		["hoisted beside the host", ["pi-ai"]],
+		[
+			"nested under the host",
+			["pi-coding-agent", "node_modules", "@earendil-works", "pi-ai"],
+		],
+	])("resolves the scripted provider's pi-ai %s", async (layout, segments) => {
+		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-4513-pi-ai-");
+		try {
+			const fixtureDir = path.join(tmpDir, "tests/fixtures/real-harness");
+			mkdirSync(fixtureDir, { recursive: true });
+			copyFileSync(
+				path.join(realHarnessFixtureRoot, "scripted-provider.mjs"),
+				path.join(fixtureDir, "scripted-provider.mjs"),
+			);
+			writeFileSync(path.join(tmpDir, "package.json"), '{"type":"module"}\n');
+			const piAiDist = path.join(
+				tmpDir,
+				"node_modules/@earendil-works",
+				...segments,
+				"dist",
+			);
+			mkdirSync(piAiDist, { recursive: true });
+			writeFileSync(
+				path.join(piAiDist, "index.js"),
+				`export const createAssistantMessageEventStream = () => ({ layout: ${JSON.stringify(layout)}, push() {}, end() {} });\n`,
+			);
+			const scriptFile = path.join(tmpDir, "script.json");
+			writeFileSync(scriptFile, '[[{"type":"text","text":"x"}]]\n');
+			vi.stubEnv("REAL_PI_HARNESS_SCRIPT", scriptFile);
+			vi.stubEnv("REAL_PI_HARNESS_PI_AI_INDEX", undefined);
+			const { default: provider } = (await import(
+				pathToFileURL(path.join(fixtureDir, "scripted-provider.mjs")).href
+			)) as { default: (pi: unknown) => void };
+			let stream: { layout?: string } | undefined;
+			provider({
+				registerProvider: (
+					_name: string,
+					config: { streamSimple: (...args: unknown[]) => unknown },
+				) => {
+					stream = config.streamSimple({}, {}, {}) as { layout?: string };
+				},
+			});
+			expect(stream?.layout).toBe(layout);
+		} finally {
+			cleanup();
+		}
 	});
 });

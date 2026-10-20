@@ -574,7 +574,7 @@ const DRIVERS: Record<string, Driver> = {
 				{
 					file: filePath,
 					errors: [
-						{ line: 4, col: 5, detail: MARKER, ruleId: "standard:indent" },
+						{ line: 4, column: 5, message: MARKER, rule: "standard:indent" },
 					],
 				},
 			]),

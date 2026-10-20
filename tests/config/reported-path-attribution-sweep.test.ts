@@ -651,9 +651,6 @@ const LOCAL_COMPARE_PINS: Readonly<Record<string, number>> = {};
  * that grows a real reported path here presents a count of 1 against a pin of 1
  * and the per-runner dispatch cells are what must then change.
  *
- * - `fish-indent.ts@1` — `/\(line\s+(\d+)\)/` over the first non-blank stderr
- *   line. The matched span holds a parse POSITION and no path token;
- *   `fish_indent --check` is handed exactly one file.
  * - `shfmt.ts@1` — `/^@@\s+-(\d+)/m` over a unified diff BODY. The only path in
  *   `--diff` output is the `---`/`+++` echo of our own argv, which this parser
  *   never reads.
@@ -681,7 +678,6 @@ const LOCAL_COMPARE_PINS: Readonly<Record<string, number>> = {};
  *   cwd (#265 A3), which is the attribute policy, not a blanket stamp.
  */
 const NO_PREDICATE_PINS: Readonly<Record<string, number>> = {
-	"clients/dispatch/runners/fish-indent.ts": 1,
 	"clients/dispatch/runners/phpstan.ts": 1,
 	"clients/dispatch/runners/prisma-validate.ts": 1,
 	"clients/dispatch/runners/psscriptanalyzer.ts": 1,

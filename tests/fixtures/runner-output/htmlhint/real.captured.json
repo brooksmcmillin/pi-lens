@@ -13,10 +13,40 @@
 		],
 		"workspace": "tests/fixtures/tool-smoke/html",
 		"platform": "win32-x64",
-		"capturedAt": "2026-08-22"
+		"capturedAt": "2026-08-22",
+		"versionArgv": [
+			"--version"
+		]
 	},
 	"file": "bad.html",
 	"exitCode": 1,
 	"stdout": "__WORKSPACE__\\bad.html:6:5: Tag must be paired, missing: [ </div> ], start tag match failed [ <div> ] on line 6. [error/tag-pair]\n\n\u001b[31m1 problems\u001b[39m\n",
-	"stderr": ""
+	"stderr": "",
+	"availability": [
+		{
+			"command": "htmlhint",
+			"argv": [
+				"--version"
+			],
+			"version": "1.9.2",
+			"exitCode": 0,
+			"stdout": "1.9.2\n",
+			"stderr": ""
+		}
+	],
+	"clean": {
+		"workspace": "tests/fixtures/runner-output-clean/htmlhint",
+		"file": "bad.html",
+		"argv": [
+			"--rules",
+			"tag-pair,attr-no-duplication,tagname-lowercase,spec-char-escape,id-unique",
+			"--format",
+			"unix",
+			"bad.html"
+		],
+		"version": "1.9.2",
+		"exitCode": 0,
+		"stdout": "",
+		"stderr": ""
+	}
 }

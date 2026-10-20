@@ -37,7 +37,6 @@ afterEach(() => {
  */
 function makeMixedRepo(prefix: string, nonSourceFiles: number) {
 	const env = setupTestEnvironment(prefix);
-	fs.mkdirSync(path.join(env.tmpDir, ".git"));
 	// A few real source files — well under MAX_STARTUP_SOURCE_FILES.
 	for (let i = 0; i < 3; i++) {
 		fs.writeFileSync(path.join(env.tmpDir, `script${i}.ts`), "export {};\n");
@@ -212,7 +211,6 @@ describe("nested agent-data directories and the startup entry budget (#3112)", (
 	/** A small source project whose bulk lives under `bulkDir`. */
 	function makeProjectWithBulkDir(prefix: string, bulkDir: string) {
 		const env = setupTestEnvironment(prefix);
-		fs.mkdirSync(path.join(env.tmpDir, ".git"));
 		for (let i = 0; i < 3; i++) {
 			fs.writeFileSync(path.join(env.tmpDir, `script${i}.ts`), "export {};\n");
 		}

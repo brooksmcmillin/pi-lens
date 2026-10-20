@@ -1273,6 +1273,15 @@ describe("#2464 — the observed-settle path also dispatches pipeline analysis",
 			const verdict = runtime.readGuard.checkEdit(filePath, [11, 11]);
 			expect(verdict.action).toBe("block");
 			expect(verdict.reason).toContain("File modified since read");
+			// #4387 (review r2, 3c): a move to this leaf keeps the observed call
+			// and drops the id-less read. The observed credit named line 2 only,
+			// and the pipeline's whole-file credit after it holds no bytes, so it
+			// keeps that scope. Recurrence: it widened the scope to the whole
+			// file, and line 11 passed after the move.
+			runtime.readGuard.retainBranch(new Set(["call-3865-observed"]));
+			expect(runtime.readGuard.checkEdit(filePath, [11, 11]).action).toBe(
+				"block",
+			);
 		} finally {
 			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
 			else process.env.PILENS_DATA_DIR = previousDataDir;

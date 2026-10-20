@@ -289,7 +289,6 @@ describe("computedAt stamping", () => {
 	it("resolveStartupScanContext stamps computedAt close to now", () => {
 		const env = setupTestEnvironment("pi-lens-scan-stamp-");
 		cleanups.push(env.cleanup);
-		fs.mkdirSync(path.join(env.tmpDir, ".git"));
 		const before = Date.now();
 		const ctx = resolveStartupScanContext(env.tmpDir, {
 			homeDir: path.join(env.tmpDir, "unrelated-home"),
@@ -302,7 +301,6 @@ describe("computedAt stamping", () => {
 	it("resolveStartupScanContextAsync stamps computedAt close to now", async () => {
 		const env = setupTestEnvironment("pi-lens-scan-stamp-async-");
 		cleanups.push(env.cleanup);
-		fs.mkdirSync(path.join(env.tmpDir, ".git"));
 		const before = Date.now();
 		const ctx = await resolveStartupScanContextAsync(env.tmpDir, {
 			homeDir: path.join(env.tmpDir, "unrelated-home"),

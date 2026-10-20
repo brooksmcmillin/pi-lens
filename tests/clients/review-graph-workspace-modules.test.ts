@@ -224,7 +224,6 @@ describe("getModuleSourceFiles memo (#1137)", () => {
 		try {
 			// Pin resolveGitIgnoreRoot to the workspace so the .gitignore below is
 			// the matcher's tracked input (existsSync(".git") is the only check).
-			fs.mkdirSync(path.join(env.tmpDir, ".git"));
 			const libRoot = makeWorkspace(env);
 			write(path.join(libRoot, "ignored/skip.ts"), "export const skip = 1;\n");
 			clearModuleGraphCache();

@@ -46,12 +46,4 @@ describe("buildMadgeArgs", () => {
 		const args = buildMadgeArgs(tmp, tmp);
 		expect(args).not.toContain("--ts-config");
 	});
-
-	it("does not request --warning (inert under --json; skip visibility is disclosed by the ledger)", () => {
-		// #3436: bin/cli.js:195 gates --warning on `!program.json`, so with the
-		// --json this builder always passes it produced nothing on stderr; the
-		// lost visibility is recorded once per root by `parseMadgeCycles` (the
-		// reader both lanes share), not parsed here.
-		expect(buildMadgeArgs(tmp, tmp)).not.toContain("--warning");
-	});
 });

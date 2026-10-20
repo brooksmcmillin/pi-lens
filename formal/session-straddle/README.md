@@ -320,3 +320,10 @@ reset already clears session 2's parked computes and recorded touches, so the
 guards make the detached paths agree with it. Whether the host can dispatch
 a tool_result between the two `session_start` events is not established
 here; this is recorded as a model finding, not as a bug.
+
+`PreEditCapture.tla` (#4543) covers the first-write capture's four live
+slots: abandon/reset cancels without releasing a slot until teardown;
+completion cannot publish a cancelled seed. `PreEditCapture.cfg` passes;
+`PreEditCaptureNoCancel.cfg` reproduces the late-seed violation. Five paths
+exercise refusal at the four-slot cap. Child process-group teardown is proven
+by the real safe-spawn probe, outside this state abstraction.

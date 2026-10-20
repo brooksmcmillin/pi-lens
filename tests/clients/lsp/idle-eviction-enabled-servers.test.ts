@@ -18,6 +18,17 @@
  * findings, let the shared idle timer release it, respawn on the next request,
  * and compare the finding keys. A declaration that is not `transparent` never
  * arms the timer, so this case is red pre-fix and green after the flip.
+ *
+ * #3952 root cause (2026-10-19): every case here ALSO compiles the real
+ * session config for its fixture root (`initLSPConfig`), because that is the
+ * seam the nightly measurement runs through: with a served root, the service
+ * reads `config.registeredServers` rather than the catalog fallback. Before
+ * `clients/lsp/config.ts` returned the catalog entry there, that list held a
+ * shallow copy per built-in, so the nightly probe's `server.idleEviction =
+ * "transparent"` arm on the catalog object never reached `scheduleIdleEviction`
+ * and every candidate read `not-evicted` from 2026-10-10 onward. Without the
+ * `initLSPConfig` call these cases read the catalog directly and stay green on
+ * the broken code, which is how the rollout shipped unmeasured.
  */
 import { readFileSync } from "node:fs";
 import * as path from "node:path";
@@ -37,6 +48,7 @@ import {
 	resetProjectTrust,
 	setProjectTrustState,
 } from "../../../clients/project-trust.js";
+import { pinFixtureHome } from "../test-utils.js";
 
 const createLSPClient = vi.fn();
 
@@ -161,18 +173,32 @@ function doubleSpawnBoundary(targetId: string, nextPid: () => number) {
 	}
 }
 
-function fixtureFileFor(server: LSPServerInfo): string {
+/**
+ * The fixture file AND its root directory: the file the measurement touches,
+ * and the root the real session config is compiled for. A relative `dir`
+ * (`tests/fixtures/tool-smoke/<lang>`) resolves against this worktree, which
+ * is also the cwd the probe runs from.
+ */
+function fixtureFor(server: LSPServerInfo): { dir: string; file: string } {
 	const fixture = selectFixtureForServer(server, LSP_FIXTURES);
 	expect(fixture, `${server.id} has an owned smoke fixture`).not.toBeNull();
-	return `${fixture!.dir}/${fixture!.file}`;
+	return {
+		dir: path.resolve(fixture!.dir),
+		file: `${fixture!.dir}/${fixture!.file}`,
+	};
 }
 
 describe("declared-transparent servers evict through the real registry (#3952)", () => {
 	let nextPid = 0;
 	let spawned: ClientDouble[] = [];
+	let home: { restore: () => void } | undefined;
 
 	beforeEach(() => {
 		setProjectTrustState("trusted");
+		// `initLSPConfig` resolves the loader's global config against
+		// `os.homedir()`, so the case reads a fixture home and never the
+		// maintainer's (#4591).
+		home = pinFixtureHome("pi-lens-3952-idle-evict");
 		nextPid = 0;
 		spawned = [];
 		createLSPClient.mockReset();
@@ -185,7 +211,11 @@ describe("declared-transparent servers evict through the real registry (#3952)",
 		delete process.env.PI_LENS_TS_IDLE_EVICT_MS;
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
+		const config = await import("../../../clients/lsp/config.js");
+		config.resetLSPConfigStateForTests();
+		home?.restore();
+		home = undefined;
 		resetProjectTrust();
 		vi.restoreAllMocks();
 		vi.useRealTimers();
@@ -201,7 +231,11 @@ describe("declared-transparent servers evict through the real registry (#3952)",
 			process.env.PI_LENS_LSP_IDLE_EVICT_MS = String(IDLE_WINDOW_MS);
 			doubleSpawnBoundary(id, () => nextPid);
 			const server = getServerById(id) as LSPServerInfo;
-			const file = fixtureFileFor(server);
+			const { dir, file } = fixtureFor(server);
+			const config = await import("../../../clients/lsp/config.js");
+			// The seam the nightly probe runs through: this root is served, so the
+			// service reads the COMPILED registry instead of the catalog fallback.
+			await config.initLSPConfig(dir);
 			const { LSPService } = await import("../../../clients/lsp/index.js");
 			const service = new LSPService();
 
@@ -245,7 +279,9 @@ describe("declared-transparent servers evict through the real registry (#3952)",
 		expect(server.idleEviction, `${RESIDENT_WITNESS_ID} declared`).toBe(
 			"unmeasured",
 		);
-		const file = fixtureFileFor(server);
+		const { dir, file } = fixtureFor(server);
+		const config = await import("../../../clients/lsp/config.js");
+		await config.initLSPConfig(dir);
 		const { LSPService } = await import("../../../clients/lsp/index.js");
 		const service = new LSPService();
 
@@ -259,5 +295,54 @@ describe("declared-transparent servers evict through the real registry (#3952)",
 		expect(service.getAliveClientCount()).toBe(1);
 
 		await service.shutdown();
+	});
+
+	it("evicts a server the probe arms, through the compiled registry (#3952)", async () => {
+		vi.useFakeTimers();
+		process.env.PI_LENS_LSP_IDLE_EVICT_MS = String(IDLE_WINDOW_MS);
+		doubleSpawnBoundary(RESIDENT_WITNESS_ID, () => nextPid);
+		const server = getServerById(RESIDENT_WITNESS_ID) as LSPServerInfo;
+		expect(server.idleEviction, `${RESIDENT_WITNESS_ID} declared`).toBe(
+			"unmeasured",
+		);
+		const { dir, file } = fixtureFor(server);
+		const config = await import("../../../clients/lsp/config.js");
+		await config.initLSPConfig(dir);
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+
+		try {
+			// The probe's order: spawn and read the baseline under the DECLARED
+			// policy (no timer), then arm the catalog object and issue one ordinary
+			// request, which is what (re)schedules the timer under the new policy.
+			const entry = await service.getClientForFile(file);
+			const baseline = (await service.getDiagnostics(file, "document")).map(
+				findingKey,
+			);
+			expect(baseline.length, "baseline findings").toBeGreaterThan(0);
+
+			server.idleEviction = "transparent";
+			await service.getClientForFile(file);
+
+			await vi.advanceTimersByTimeAsync(IDLE_WINDOW_MS);
+			expect(
+				entry!.client.shutdown,
+				"armed server shutdown",
+			).toHaveBeenCalledWith({
+				reason: "idle_eviction",
+			});
+			expect(service.getAliveClientCount(), "alive after idle").toBe(0);
+
+			const post = (await service.getDiagnostics(file, "document")).map(
+				findingKey,
+			);
+			expect(spawned.length, "client generations").toBe(2);
+			expect(new Set(post), "no finding dropped").toEqual(new Set(baseline));
+		} finally {
+			// The catalog entry is process-wide: put the declaration back before
+			// any other case in this file reads it.
+			server.idleEviction = "unmeasured";
+			await service.shutdown();
+		}
 	});
 });

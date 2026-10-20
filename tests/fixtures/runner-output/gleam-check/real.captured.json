@@ -1,0 +1,44 @@
+{
+	"provenance": {
+		"runner": "gleam-check",
+		"tool": "gleam",
+		"version": "1.19.2",
+		"command": "gleam check",
+		"argv": [
+			"check"
+		],
+		"workspace": "tests/fixtures/tool-smoke/gleam",
+		"platform": "linux-x64",
+		"capturedAt": "2026-10-14",
+		"versionArgv": [
+			"--version"
+		]
+	},
+	"file": "src/smoke.gleam",
+	"exitCode": 1,
+	"stdout": "",
+	"stderr": "  Resolving versions\n   Checking smoke\nerror: Type mismatch\n  ┌─ __WORKSPACE__/src/smoke.gleam:4:3\n  │\n4 │   \"not an int\"\n  │   ^^^^^^^^^^^^\n\nThe type of this returned value doesn't match the return type\nannotation of this function.\n\nExpected type:\n\n    Int\n\nFound type:\n\n    String\n\n",
+	"availability": [
+		{
+			"command": "gleam",
+			"argv": [
+				"--version"
+			],
+			"version": "1.19.2",
+			"exitCode": 0,
+			"stdout": "gleam 1.19.2\n",
+			"stderr": ""
+		}
+	],
+	"clean": {
+		"workspace": "tests/fixtures/runner-output-clean/gleam-check",
+		"file": "src/smoke.gleam",
+		"argv": [
+			"check"
+		],
+		"version": "1.19.2",
+		"exitCode": 0,
+		"stdout": "",
+		"stderr": "  Resolving versions\n   Checking smoke\n   Compiled in 0.27s\n"
+	}
+}

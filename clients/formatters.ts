@@ -893,35 +893,33 @@ async function indentationArgs(
 		});
 		return null;
 	}
+	// A tab file pins the style and nothing else (#4321): the formatter's own
+	// default (or the project's explicit config, handled above) owns the width.
+	const tab = indentation.style === "tab";
 	if (tool === "shfmt")
-		return indentation.style === "tab"
-			? ["-i", "0"]
-			: ["-i", String(indentation.width)];
+		return tab ? ["-i", "0"] : ["-i", String(indentation.width)];
 	if (tool === "prettier") {
-		return [
-			indentation.style === "tab" ? "--use-tabs" : "--no-use-tabs",
-			"--tab-width",
-			String(indentation.width),
-		];
+		return tab
+			? ["--use-tabs"]
+			: ["--no-use-tabs", "--tab-width", String(indentation.width)];
 	}
 	if (tool === "ruff") {
 		// `ruff format` has NO --indent-style/--indent-width flags (it errors with
 		// "unexpected argument" and exits 2, which formatFile reported as a silent
 		// clean no-op back when exit-code strictness was opt-in). Style is pinned
 		// through inline TOML overrides instead (#1144 follow-up).
-		return [
-			"--config",
-			`indent-width=${indentation.width}`,
-			"--config",
-			`format.indent-style='${indentation.style}'`,
-		];
+		return tab
+			? ["--config", "format.indent-style='tab'"]
+			: [
+					"--config",
+					`indent-width=${indentation.width}`,
+					"--config",
+					"format.indent-style='space'",
+				];
 	}
-	return [
-		"--indent-style",
-		indentation.style,
-		"--indent-width",
-		String(indentation.width),
-	];
+	return tab
+		? ["--indent-style", "tab"]
+		: ["--indent-style", "space", "--indent-width", String(indentation.width)];
 }
 
 /**

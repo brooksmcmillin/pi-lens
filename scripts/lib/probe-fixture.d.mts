@@ -30,8 +30,14 @@ export function createProbeFixture(deps: {
 		fx: unknown,
 		options: { initLSPConfig: unknown; repoRoot: string; workspace: string },
 	): Promise<{ absFile: string }>;
+	/** #4514: `refused: <reason>` when trust kept the server from launching. */
+	trustRefusal?: () => Promise<string | undefined>;
 	drainPublishTrace: {
-		(sink: Array<{ server?: string }>, serverId: string): void;
+		(
+			sink: Array<{ server?: string; path?: string }>,
+			serverId: string,
+			fixturePath: string,
+		): void;
 		reset(offset: number): void;
 	};
 	pubLogSize(): number;

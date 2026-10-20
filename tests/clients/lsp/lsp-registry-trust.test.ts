@@ -250,4 +250,37 @@ describe("compiled LSP registry trust boundary (#2372)", () => {
 			initializationOptions: { check: { command: "clippy" } },
 		});
 	});
+
+	// #3952: the compiled list must be the CATALOG ENTRY for every built-in with
+	// no command override. The idle-eviction probe arms `idleEviction` on the
+	// object `LSP_SERVERS`/`getServerById` exposes and expects the client
+	// registry to read it back; while this branch copied every built-in, the arm
+	// never reached `scheduleIdleEviction` and no candidate could earn a night
+	// (2026-10-10 → 2026-10-19). The other direction matters just as much: an
+	// OVERRIDDEN server keeps its own copy, so its `spawn` and `trustAllowed`
+	// never land in the shared catalog the probe reads.
+	it("compiles the catalog entry itself, and a copy only for a command override", async () => {
+		const project = tempDir();
+		fs.writeFileSync(
+			path.join(project, ".pi-lens.json"),
+			JSON.stringify({
+				lsp: { serverOverrides: { rust: { command: "trusted-rust" } } },
+			}),
+		);
+		const trust = await import("../../../clients/project-trust.js");
+		trust.setProjectTrustState("trusted");
+		const { loadLSPConfig, compileLspRegistry } =
+			await import("../../../clients/lsp/config.js");
+		const { getServerById } = await import("../../../clients/lsp/server.js");
+		const config = await loadLSPConfig(project);
+		const compiled = compileLspRegistry(
+			config,
+			config.__provenance,
+		).registeredServers;
+		const byId = new Map(compiled.map((entry) => [entry.id, entry]));
+
+		expect(byId.get("typescript")).toBe(getServerById("typescript"));
+		expect(byId.get("rust")).not.toBe(getServerById("rust"));
+		expect(byId.get("rust")?.spawn).not.toBe(getServerById("rust")?.spawn);
+	});
 });

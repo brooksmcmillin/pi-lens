@@ -64,3 +64,19 @@ export interface WithScratchHomeResult {
 export function withScratchHome(
 	opts?: WithScratchHomeOptions,
 ): WithScratchHomeResult;
+
+export interface AdoptFixtureProjectTrustOptions {
+	/** Repo root whose `dist/clients/project-trust.js` is imported. */
+	repoRoot: string;
+	/** Test seam: an `adoptProjectTrustFromContext` stand-in (smoke-tools.mjs `deps`). */
+	adopt?: (ctx: { isProjectTrusted: () => boolean }) => unknown;
+}
+
+export function adoptFixtureProjectTrust(
+	opts: AdoptFixtureProjectTrustOptions,
+): Promise<void>;
+
+/** `refused: project trust is <state>`, or undefined when trust is adopted. */
+export function fixtureTrustRefusal(
+	repoRoot: string,
+): Promise<string | undefined>;

@@ -21,8 +21,8 @@
  * runs, but this host does not have the tool it drives (scenario 2 shells out
  * to a real knip).
  *
- * Live as of this revision: scenario 1 (#1627 merged) and scenario 2 (#1637
- * merged 2026-08-18). Pending: scenario 3 on PR #1633, still open, and
+ * Live as of this revision: scenario 1 (#1627 merged), scenario 2 (#1637
+ * merged 2026-08-18) and scenario 3 (#1633 merged 2026-08-19). Pending:
  * scenario 4 on nothing — that blind spot has no fix in flight.
  */
 
@@ -216,15 +216,13 @@ const knipStaleCache = defineTurnScenario({
 	},
 });
 
-// ── Scenario 3 — dependency-drift replay (#1631, PR #1633 open) ──────────────
+// ── Scenario 3 — dependency-drift replay (#1631, fixed by PR #1633) ──────────
 
 const dependencyDriftReplay = defineTurnScenario({
 	id: "dependency-drift-replay",
 	incident:
 		"a blocker on the consumer file replayed for 50 minutes after the missing export was added to its dependency by a bash script",
 	issue: "#1631",
-	pendingOn:
-		"#1631 / PR #1633 — cached cross-file blockers are not revalidated against out-of-band dependency changes",
 	async run(h) {
 		h.write("src/worktree.ts", "export const other = 1;\n");
 		h.edit(

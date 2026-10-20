@@ -1,3 +1,4 @@
+// flake-shape: service-double — #4485: the expiry and peek reads go to the client an outstanding touch holds; a real server cannot be made to publish before the touch expires on demand
 /**
  * #1899: the tier-3 outstanding-touch registry's own bounds, and the backlog
  * gauge the reconcile sweep writes.
@@ -318,5 +319,242 @@ describe("unresolved reason discrimination", () => {
 		expect(await reasonFor(vi.fn().mockRejectedValue(new Error("boom")))).toBe(
 			"error",
 		);
+	});
+});
+
+/**
+ * #4485: the registry keeps only touches the in-lane wait left unanswered.
+ * turn_end peeks it once after its settle, and an entry reaching the age bound
+ * is read once more before it goes, so what it held is delivered or logged
+ * instead of vanishing.
+ */
+describe("residual peek, expiry read and reset count (#4485)", () => {
+	const errorDiag = {
+		severity: 1,
+		message: "late error",
+		range: {
+			start: { line: 0, character: 0 },
+			end: { line: 0, character: 1 },
+		},
+	};
+
+	function liveClient(rows: [string, unknown[], number][]) {
+		return {
+			serverId: "typescript",
+			getAllDiagnostics: () =>
+				new Map(
+					rows.map(([p, diags, ts]) => [normalizeMapKey(p), { diags, ts }]),
+				),
+			isAlive: () => true,
+		};
+	}
+
+	function rowsOf(phase: string) {
+		return logCascade.mock.calls
+			.map((call) => call[0])
+			.filter((candidate) => candidate?.phase === phase);
+	}
+
+	// Recurrence (#4485): touches past the age bound were discarded unread;
+	// the forensic window could not say what 153 of them held.
+	it("an expiring outstanding touch is peeked once and its path logged", () => {
+		const onResolvedFound = vi.fn();
+		mod.registerCascadeTierReconcileTask(
+			() => ({ getWarmClientForFile: vi.fn() }) as never,
+			{ onResolvedFound },
+		);
+		const touchedAt = Date.now() - 1_000;
+		const client = liveClient([[FILE, [errorDiag], touchedAt + 10]]);
+		const silentClient = liveClient([]);
+		mod.recordOutstandingCascadeTouch({
+			filePath: FILE,
+			serverId: "typescript",
+			touchedAt,
+			client: new WeakRef(client),
+		} as never);
+		mod.recordOutstandingCascadeTouch({
+			filePath: "C:/repo/silent.ts",
+			serverId: "typescript",
+			touchedAt,
+			client: new WeakRef(silentClient),
+		} as never);
+
+		// Both age past the bound together; the next touch's record-time prune
+		// reaches them in one sweep.
+		vi.useFakeTimers({ now: touchedAt + MAX_AGE_MS + 1_000 });
+		try {
+			record("C:/repo/fresh.ts", Date.now());
+		} finally {
+			vi.useRealTimers();
+		}
+
+		expect(heldPaths()).toEqual(["C:/repo/fresh.ts"]);
+		expect(onResolvedFound).toHaveBeenCalledTimes(1);
+		expect(onResolvedFound).toHaveBeenCalledWith(
+			expect.objectContaining({
+				filePath: FILE,
+				diagnostics: [errorDiag],
+				publishedAt: touchedAt + 10,
+			}),
+		);
+		const expired = rowsOf("cascade_tier3_expired");
+		expect(expired).toHaveLength(1);
+		expect(expired[0].metadata).toMatchObject({
+			count: 2,
+			found: 1,
+			clean: 0,
+			unanswered: 1,
+			paths: [FILE, "C:/repo/silent.ts"],
+		});
+	});
+
+	it("a peek delivers answered touches and keeps the silent ones outstanding", () => {
+		const onResolvedFound = vi.fn();
+		const onResolvedClean = vi.fn();
+		mod.registerCascadeTierReconcileTask(
+			() => ({ getWarmClientForFile: vi.fn() }) as never,
+			{ onResolvedFound, onResolvedClean },
+		);
+		const touchedAt = Date.now() - 1_000;
+		const client = liveClient([
+			["C:/repo/found.ts", [errorDiag], touchedAt + 5],
+			["C:/repo/clean.ts", [], touchedAt + 5],
+			// Published before the touch: not an answer to it.
+			["C:/repo/stale.ts", [], touchedAt - 5],
+		]);
+		for (const filePath of [
+			"C:/repo/found.ts",
+			"C:/repo/clean.ts",
+			"C:/repo/stale.ts",
+			"C:/repo/silent.ts",
+		]) {
+			mod.recordOutstandingCascadeTouch({
+				filePath,
+				serverId: "typescript",
+				touchedAt,
+				client: new WeakRef(client),
+			} as never);
+		}
+
+		mod.peekOutstandingCascadeTouches();
+
+		expect(onResolvedFound).toHaveBeenCalledTimes(1);
+		expect(onResolvedFound).toHaveBeenCalledWith(
+			expect.objectContaining({ filePath: "C:/repo/found.ts" }),
+		);
+		expect(onResolvedClean).toHaveBeenCalledTimes(1);
+		expect(onResolvedClean).toHaveBeenCalledWith(
+			expect.objectContaining({
+				filePath: "C:/repo/clean.ts",
+				publishedAt: touchedAt + 5,
+			}),
+		);
+		expect(heldPaths()).toEqual(["C:/repo/stale.ts", "C:/repo/silent.ts"]);
+		const peek = rowsOf("cascade_tier3_peek");
+		expect(peek).toHaveLength(1);
+		expect(peek[0].metadata).toMatchObject({
+			count: 4,
+			found: 1,
+			clean: 1,
+			outstanding: 2,
+		});
+	});
+
+	// Recurrence (#4495 round-2 verify R2-1): a late answer's run carried
+	// only its publish stamp, so the pending record could not tell a write
+	// that landed between the touch and the publish from no write at all.
+	// Both reads hand on the touch's pre-notify stamp, the read bound.
+	it("a late answer carries the touch's pre-notify stamp, from the peek and from the quiet-window reconcile", async () => {
+		const onResolvedFound = vi.fn();
+		mod.registerCascadeTierReconcileTask(
+			() => ({ getWarmClientForFile: vi.fn() }) as never,
+			{ onResolvedFound },
+		);
+		const touchedAt = Date.now() - 1_000;
+		const client = liveClient([[FILE, [errorDiag], touchedAt + 5]]);
+		mod.recordOutstandingCascadeTouch({
+			filePath: FILE,
+			serverId: "typescript",
+			touchedAt,
+			client: new WeakRef(client),
+		} as never);
+		mod.peekOutstandingCascadeTouches();
+		expect(onResolvedFound).toHaveBeenCalledWith(
+			expect.objectContaining({ filePath: FILE, touchedAt }),
+		);
+
+		record(FILE, touchedAt);
+		const outcomes = await mod.reconcileOutstandingCascadeTouches({
+			getWarmClientForFile: vi
+				.fn()
+				.mockResolvedValue(
+					warm("typescript", [[FILE, [errorDiag], touchedAt + 5]]),
+				),
+		} as never);
+		expect(outcomes[0]).toMatchObject({ outcome: "resolved-found", touchedAt });
+	});
+
+	// Recurrence (#4495 review F3): the peek rebuilt the client's whole
+	// per-file diagnostics map once per outstanding touch, O(touches x
+	// tracked files) on turn_end's synchronous path.
+	it("a peek reads each client's diagnostics once, however many touches it holds", () => {
+		mod.registerCascadeTierReconcileTask(
+			() => ({ getWarmClientForFile: vi.fn() }) as never,
+			{ onResolvedFound: vi.fn(), onResolvedClean: vi.fn() },
+		);
+		const touchedAt = Date.now() - 1_000;
+		const client = liveClient([
+			["C:/repo/found.ts", [errorDiag], touchedAt + 5],
+			["C:/repo/clean.ts", [], touchedAt + 5],
+		]);
+		const read = vi.spyOn(client, "getAllDiagnostics");
+		const other = liveClient([["C:/repo/other.ts", [], touchedAt + 5]]);
+		const otherRead = vi.spyOn(other, "getAllDiagnostics");
+		for (const filePath of [
+			"C:/repo/found.ts",
+			"C:/repo/clean.ts",
+			"C:/repo/silent-1.ts",
+			"C:/repo/silent-2.ts",
+		]) {
+			mod.recordOutstandingCascadeTouch({
+				filePath,
+				serverId: "typescript",
+				touchedAt,
+				client: new WeakRef(client),
+			} as never);
+		}
+		mod.recordOutstandingCascadeTouch({
+			filePath: "C:/repo/other.ts",
+			serverId: "typescript",
+			touchedAt,
+			client: new WeakRef(other),
+		} as never);
+
+		mod.peekOutstandingCascadeTouches();
+
+		expect(read).toHaveBeenCalledTimes(1);
+		expect(otherRead).toHaveBeenCalledTimes(1);
+		expect(heldPaths()).toEqual(["C:/repo/silent-1.ts", "C:/repo/silent-2.ts"]);
+	});
+
+	it("a peek of an empty registry writes no row", () => {
+		mod.peekOutstandingCascadeTouches();
+		expect(rowsOf("cascade_tier3_peek")).toEqual([]);
+	});
+
+	it("a session reset logs how many outstanding touches it dropped", () => {
+		record("C:/repo/a.ts", Date.now());
+		record("C:/repo/b.ts", Date.now());
+
+		mod.resetCascadeTierSessionState();
+
+		expect(heldPaths()).toEqual([]);
+		const dropped = rowsOf("cascade_tier3_dropped");
+		expect(dropped).toHaveLength(1);
+		expect(dropped[0].metadata).toMatchObject({ count: 2 });
+
+		logCascade.mockClear();
+		mod.resetCascadeTierSessionState();
+		expect(rowsOf("cascade_tier3_dropped")).toEqual([]);
 	});
 });

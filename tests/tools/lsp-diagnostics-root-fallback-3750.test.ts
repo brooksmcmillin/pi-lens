@@ -21,12 +21,15 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
 	resetProjectTrust,
 	setProjectTrustState,
 } from "../../clients/project-trust.js";
-import { getDegradationSummary } from "../../clients/degradation-ledger.js";
+import {
+	getDegradationSummary,
+	resetDegradationLedger,
+} from "../../clients/degradation-ledger.js";
 import {
 	cleanupTestEnvironmentsDrained,
 	setupTestEnvironment,
@@ -132,6 +135,13 @@ describe("#3750 an empty result under a server-root fallback", () => {
 		process.env.PATH = `${shimDir}${path.delimiter}${originalPath ?? ""}`;
 		const lsp = await import("../../clients/lsp/index.js");
 		service = lsp.getLSPService();
+	});
+
+	// #4397: the ledger keeps the first ENTRIES_PER_KIND rows of a kind. Every
+	// sibling case records a `tool-cwd-resolution` row, so the case reading the
+	// row for its own file saw it dropped once enough siblings had run first.
+	beforeEach(() => {
+		resetDegradationLedger();
 	});
 
 	afterAll(async () => {

@@ -132,6 +132,12 @@ export function getActiveSessionId(): string | undefined {
 	return state().activeSessionId;
 }
 
+/** Whether this context still holds the process's primary registration.
+ * Context identity distinguishes /reload activations sharing one session id (#4554 r5). */
+export function isPrimarySessionOwner(ctx: unknown): boolean {
+	return state().activeCtx === ctx;
+}
+
 /**
  * The normalized project root of the currently registered primary session
  * (#2129), or `undefined` when no primary has registered a root yet.

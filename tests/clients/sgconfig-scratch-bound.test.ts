@@ -1,8 +1,9 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getGlobalPiLensDir } from "../../clients/file-utils.js";
+import { resetDegradationLedger } from "../../clients/degradation-ledger.js";
 import { flushLatencyLog } from "../../clients/latency-logger.js";
 import {
 	_resetBaselineSgconfigForTests,
@@ -25,6 +26,15 @@ const ROOTS_OVER_CAP = 20;
 describe("sgconfig scratch bound", () => {
 	const roots: string[] = [];
 	let prevTestMode: string | undefined;
+
+	beforeEach(() => {
+		// Recurrence (#4561, shuffle seed 202): `recordDegradationOnce` spends the
+		// (kind, subject) key in the module-scope ledger, and the sibling case
+		// drives the same shared scratch dir in test mode, so it consumed the key
+		// without writing the row the other case reads. Each case starts from a
+		// fresh session ledger.
+		resetDegradationLedger();
+	});
 
 	afterEach(() => {
 		for (const root of roots.splice(0)) removeTempDirSync(root);

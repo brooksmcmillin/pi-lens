@@ -64,6 +64,17 @@ const EXEMPT: Record<string, string> = {
 		"the edited file by absolute path. A sibling unit's error therefore " +
 		"exits nonzero, prints a full JSON array, and correctly yields zero " +
 		"diagnostics for the edited file — the go-vet shape.",
+	"shfmt.ts":
+		"exit-status protocol with no parser to come up empty: exit 1 puts a " +
+		"unified diff on stdout and exit above 1 puts the parse error on stderr, " +
+		"both read as prose. Only a run that reported no exit status (killed, " +
+		"timed out, spawn error) is skipped, through skipUnlessToolRan (#4522).",
+	"fish-indent.ts":
+		"its --check step is an exit-status protocol: a nonzero exit with an " +
+		"empty stderr is a format finding, so the nonzero-no-output rule would " +
+		"drop it. Only a run that reported no exit status is skipped, through " +
+		"skipUnlessToolRan behind a narrow test (#4522); the syntax step already " +
+		"runs on parseToolRun.",
 	"cue-vet.ts":
 		"already answers this question, and more loudly than a ledger row: on " +
 		"a nonzero exit whose output attributes to NO file, filterToTouchedFile " +
@@ -179,7 +190,7 @@ describe("parsed-nothing sweep (#1948)", () => {
 		expect(
 			ratchetDeclared.size,
 			"the ratchet registry scraper matched nothing",
-		).toBeGreaterThanOrEqual(13);
+		).toBeGreaterThanOrEqual(12);
 
 		const doubleDeclared = Object.keys(EXEMPT).filter((name) =>
 			ratchetDeclared.has(name),

@@ -1,0 +1,79 @@
+name: Tool tree cache
+description: >-
+  Restore or save the managed tool tree (npm tools and release binaries) a
+  smoke job installs under PI_LENS_HOME, keyed on the installer's pins.
+
+# #4358. The nightly smoke jobs reinstall every pinned tool and language server
+# on each run. The installer registry (clients/installer/index.ts) holds every
+# pin, so that file's hash is the key: a pin change misses and installs cold.
+# The ISO week is in the key too, because the registry also lists packages
+# whose version floats; those refresh at most weekly instead of never, and the
+# smoke keeps catching a dead or renamed package within seven days.
+#
+# Two modes, because a composite action has no post step and a job that goes
+# red after its installs must still save them: `restore` runs before the first
+# `--install` step, `save` runs after the last one. The caller gates the save on
+# that last install step having run (`outcome != 'skipped'`), because the key is
+# first-wins for the week and a tree saved after an early red layer would stick.
+#
+# Only schedule and workflow_dispatch workflows may use this: the cache scope
+# is the ref, and tests/config/untrusted-trigger-cache.test.ts fails a
+# pull_request_target or workflow_run workflow that restores or saves a cache
+# (cache poisoning).
+#
+# Caller contract: the job exports PI_LENS_HOME (the tool tree is
+# $PI_LENS_HOME/tools and $PI_LENS_HOME/bin). pip and gem tools install outside
+# it and are not cached here.
+
+inputs:
+  mode:
+    description: restore (before the install steps) or save (after them)
+    required: true
+  prefix:
+    description: >-
+      Cache key family, one per workflow: parser-smoke installs a subset of
+      what tool-smoke does, and sharing a key would let the subset's tree win.
+    required: true
+
+outputs:
+  cache-hit:
+    description: >-
+      'true' when restore found the exact key. Gate the save step on it being
+      anything else, because a save to an existing key only logs a warning.
+    value: ${{ steps.restore.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve the cache key
+      id: key
+      shell: bash
+      env:
+        PREFIX: ${{ inputs.prefix }}
+        MODE: ${{ inputs.mode }}
+        PINS: ${{ hashFiles('clients/installer/index.ts') }}
+      run: |
+        case "$MODE" in restore|save) ;; *) echo "::error::mode must be restore or save, got '$MODE'"; exit 1 ;; esac
+        test -n "$PINS" || { echo "::error::clients/installer/index.ts hashed to nothing; the key would never change with a pin"; exit 1; }
+        echo "key=$PREFIX-$RUNNER_OS-$RUNNER_ARCH-$(date -u +%G-W%V)-$PINS" >> "$GITHUB_OUTPUT"
+
+    - name: Restore the managed tool tree
+      if: ${{ inputs.mode == 'restore' }}
+      id: restore
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ${{ env.PI_LENS_HOME }}/tools
+          ${{ env.PI_LENS_HOME }}/bin
+          !${{ env.PI_LENS_HOME }}/tools/.install.lock*
+        key: ${{ steps.key.outputs.key }}
+
+    - name: Save the managed tool tree
+      if: ${{ inputs.mode == 'save' }}
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ${{ env.PI_LENS_HOME }}/tools
+          ${{ env.PI_LENS_HOME }}/bin
+          !${{ env.PI_LENS_HOME }}/tools/.install.lock*
+        key: ${{ steps.key.outputs.key }}

@@ -15,7 +15,8 @@ Issue: #3483.
   `runWhenWorkspaceSweepIdle`. Otherwise it calls `resetFn()` in the
   same tick.
 - **What a reset does.** `resetLSPService` marks the service destroyed:
-  `shutdown()` sets `isDestroyed` before its first await (`clients/lsp/index.ts`).
+  `shutdown()` sets `isDestroyed` before its first await (`clients/lsp/index.ts`,
+  through `ClientRegistry.markDestroyed` in `clients/lsp/client-registry.ts`).
   It also nulls the singleton, so the next `getLSPService()`
   builds a new generation. The clients are torn down in a later step.
 - **The workspace sweep** (`runWorkspaceDiagnostics`). It holds the sweep hold

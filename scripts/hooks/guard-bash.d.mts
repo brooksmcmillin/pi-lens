@@ -13,6 +13,7 @@ export type DenyRule =
 	| "tmpdirCollision"
 	| "sharedKill"
 	| "tmpCheckout"
+	| "tmpWrite"
 	| "checkUngated"
 	| "hookBypass"
 	| "forcePush"
@@ -41,6 +42,12 @@ export function splitSegmentsWithSeparators(
 ): Array<{ text: string; sep: string | null }>;
 
 export function splitWords(segment: string): string[];
+
+export function hasLiveStdinRedirect(segment: string): boolean;
+
+export function commandBasename(cmd: string): string;
+
+export function stripCommandGroupAndRunnerPrefixes(words: string[]): string[];
 
 export function stripEnvAssignments(words: string[]): {
 	env: Record<string, string>;

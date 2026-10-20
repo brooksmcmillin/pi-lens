@@ -26,11 +26,11 @@ Code references name symbols, read on master at `cf1b548e5`.
   3. `Capture`: `captureRenameExpectedContent` binds each file.
   4. `ApplyEdit`: `applyWorkspaceEdit` with that `expectedContent`.
 - **The `renameFile` flow** (`LSPService.renameFile` in
-  `clients/lsp/index.ts`): `willRenameFiles` (`Request`), the merged text
-  edits applied with no `expectedContent` (`applyWorkspaceEdit(merged.edit`),
-  then `didClose` and the resource move. Either can fail after the text
-  edits (`Abort`; `didClose` throws "workspace/didClose failed; rename
-  aborted").
+  `clients/lsp/index.ts`): `willRenameFiles` (`Request`, with `T` taken just
+  before it, #3734), `Capture` over the merged text edits with the same rule
+  and no target, `ApplyEdit` with that `expectedContent`, then `didClose` and
+  the resource move. Either can fail after the text edits (`Abort`; `didClose`
+  throws "workspace/didClose failed; rename aborted").
 - **The send-change stamp** (`changedAtMs`): `recordSentContent` in
   `clients/lsp/client.ts` moves it only when the bytes change. A first
   `didOpen` has no previous record, so it always stamps. The record also
@@ -87,7 +87,7 @@ lands, `ApplyEdit` should cite its action by name.
 
 | Rule | Target | Opened non-target | Unopened non-target | Code |
 |---|---|---|---|---|
-| `none` | not bound | not bound | not bound | before #3736; `renameFile` on master |
+| `none` | not bound | not bound | not bound | before #3736 (`rename`), before #3734 (`renameFile`) |
 | `r1` | bytes `Prepare` read | bytes read at capture | bytes read at capture | #3736 round 1 (`1fbc52f4d`) |
 | `r2` | same | refuse if disk differs from the last send | refused | round 2 (`92d14c0c6`) |
 | `r3` | same | as `r2` | refuse if mtime is at or after `T - Margin` | round 3 (`c64b10a8f`) |
@@ -231,8 +231,8 @@ TLC's traces, because it is chosen under `\E p \in pending`.
 | `FirstOpenThenKeepMtimeNoHash` | #3827 verify r2 F4 | r2 (`"quietNoHash"`), same shape | `Prepare`, `Request`, `Touch` (the first open, disk bytes), `ExternalWrite` keeping the old mtime, `Capture`, `ApplyEdit`. Probe P7 through the real tool: `let 77;` on disk. |
 | `FirstOpenThenKeepMtimeHashOnly` | #3827 r3 row B11 | the verify-r2 prescription (`"quietHash"`), same shape | `Prepare`, `Request`, `Touch`, `ExternalWrite` keeping the old mtime, `Touch` (the resync: disk equals the last send), `Capture`, `ApplyEdit`. Probe P9 through the real tool. |
 | `FirstOpenThenKeepMtimeOff` | #3827 r3 baseline | master before #3827 (`"off"`), same shape | none (pass on `NoStaleApply`, `AtomicRefusal`). |
-| `Issue3734Master` | #3734 (open) | master: `renameFile` applies with no `expectedContent` | `Request` (`willRenameFiles`), `Capture` (nothing bound), a pi write, `ApplyEdit`. |
-| `Issue3734Bound` | #3734 | candidate: the #3736 rule, with `T` taken before `willRenameFiles`, and no `didClose` or move failure (`AbortAfterText = FALSE`) | none (pass) |
+| `Issue3734Master` | #3734 | pre-fix: `renameFile` applies with no `expectedContent` | `Request` (`willRenameFiles`), `Capture` (nothing bound), a pi write, `ApplyEdit`. |
+| `Issue3734Bound` | #3734 | master: the #3736 rule, with `T` taken before `willRenameFiles`, and no `didClose` or move failure (`AbortAfterText = FALSE`) | none (pass) |
 | `Issue3734Abort` | #3734, model finding | master order, even with the candidate binding: text edits, then `didClose` and the move | `Request`, `Capture`, `ApplyEdit` writes both files, `Abort`: the rename is reported aborted with the edits written. |
 
 ## Findings
@@ -293,9 +293,9 @@ TLC's traces, because it is chosen under `\E p \in pending`.
    exemption, not the same violation as with the exemption off;
    `FirstOpenExternalKeepMtime` and `FirstOpenExternalNoWatcher` report
    #3747's shorter traces, which `"off"` shares.
-7. **#3734:** binding the `willRenameFiles` edits with the #3736 rule closes
-   the stale apply for opened files only when nothing fails after the text
-   edits (`Issue3734Bound` sets `AbortAfterText = FALSE`; unopened files
+7. **#3734, fixed:** binding the `willRenameFiles` edits with the #3736 rule
+   closes the stale apply for opened files only when nothing fails after the
+   text edits (`Issue3734Bound` sets `AbortAfterText = FALSE`; unopened files
    then inherit #3747). Binding alone does not make `rename_file` atomic:
    `renameFile` writes the text edits before `didClose` and the resource
    move, and a failure in either aborts with the importers already

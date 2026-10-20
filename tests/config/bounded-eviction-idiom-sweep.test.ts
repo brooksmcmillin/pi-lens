@@ -1,90 +1,87 @@
 /**
- * #2442: forbid a NEW hand-rolled evict-oldest block outside
+ * #2442: forbid a NEW hand-rolled evict-oldest program outside
  * `clients/bounded-cache.ts`.
  *
  * `clients/bounded-cache.ts` ships three small bounded collections —
  * `BoundedLruCache` (get() re-inserts), `BoundedFifoMap` (get() never
  * re-inserts, insertion-order eviction), and `BoundedSet` (the Set-shaped,
  * membership-only sibling, #2460) — built specifically so a call site never
- * has to hand-roll `const oldest = map.keys().next().value; if (oldest !==
- * undefined) map.delete(oldest);` again. #2432's round-3 review named two such
- * hand-rolled sites (`clients/hashline-anchor.ts`, `clients/mutating-tool.ts`);
- * a repo-wide sweep found the idiom 27 times.
+ * has to hand-roll an eviction again. #2432's round-3 review named two such
+ * hand-rolled sites; a repo-wide sweep found the idiom 27 times.
  *
- * ## Properties this sweep learned the hard way (#2442 review F5/F6, #2460
- * review S1, #2460 round-3 review F1/F2)
+ * ## The question is structural (#4606 S1)
  *
- * 1. **Four spellings, not one.** The first draft matched only
- *    `.keys().next().value`, so `tree-sitter-client.ts`'s two live
- *    `.entries().next().value` evictions and `debug-handles.ts`'s
- *    `for (const k of map.keys()) { …; break }` walk were invisible to a guard
- *    whose whole job was finding them. A fourth spelling — a BARE
- *    `for (const x of set) { set.delete(x); break; }`, with no
- *    `.keys()/.values()/.entries()` call at all — was still invisible after
- *    that fix: #2460's review planted it in `clients/lsp/session-roots.ts` and
- *    it passed silently, because iterating a `Set` directly already yields
- *    its values and neither prior regex requires the accessor call the bare
- *    form has no reason to make. All four spellings are matched now, across
- *    `keys`/`values`/`entries`/bare — the Set-shaped sites use `.values()` or
- *    the bare form; the bare form is additionally gated on a `.size`
- *    comparison in the surrounding loop, since a bare `for...of` is common for
- *    reasons that have nothing to do with eviction.
- * 2. **Per-OCCURRENCE, not per-FILE.** Exemptions used to name a file, so a
+ * Five lexical spellings (#2442, #2460, #4570, #4580) each left a neighbour
+ * invisible: a wrapped accessor chain, an alias, an indirect accessor, a
+ * binding split across statements, destructured iterator results, an ordering
+ * that finishes in a statement of its own. That is AGENTS.md shape 69: a
+ * detector that lists the spellings it knows passes every spelling it does
+ * not. So the eviction question moved to `tests/support/eviction-programs.ts`,
+ * a recognizer over the TypeScript AST built on the S0 census seam
+ * (`tests/support/ast-census.ts`): one parse per source text, one native
+ * candidate query, and a semantic test for the four stages every eviction
+ * program passes through — bound, order, selection, effect.
+ *
+ * The recognizer admits exactly four forms, each tabled in its module header
+ * with the live member that needs it:
+ *
+ * | Form | Live members |
+ * | --- | --- |
+ * | `iterator-head` | `clients/lsp/index.ts`, `clients/lsp/client.ts`, `scripts/check-pr-body.mjs` |
+ * | `ordered-victim` | the comparator family: `clients/dispatch/integration.ts`, `clients/lsp/client-registry.ts` ×2, `clients/mcp/analyze.ts`, `clients/project-snapshot.ts`, `clients/read-guard.ts` ×2, `clients/review-graph/builder.ts`, `clients/workspace-topology.ts` ×2, `clients/widget-state.ts#pruneInactiveFileRecords` |
+ * | `ordered-scan` | `clients/debug-handles.ts`, `clients/lsp/document-drift.ts`, `clients/observed-mutation.ts`, `clients/resource-sampler.ts` |
+ * | `count-truncation` | `clients/sgconfig.ts`, `clients/cache-manager.ts`, `clients/mutation-attribution.ts`, `clients/widget-state.ts` (retention cap), `clients/lens-map.ts`, `scripts/analyze-pi-lens-logs.mjs#pushTop` |
+ *
+ * Selection is structural, not a spelling: an iterator's `.next()` head, an
+ * array-destructured head (`const [oldest] = m.keys()`), and a `for…of` head
+ * that breaks after its first victim are the same eviction, and a victim
+ * reached through a second binding or an alias is resolved before the removal
+ * test (#4606 r2 F1).
+ *
+ * Everything outside those forms refuses. A shape the recognizer cannot place
+ * is not silently clean: the refused LIVE programs are tabled below
+ * (`REFUSED_PROGRAMS`) with the stage each lacks and the policy that owns it,
+ * and the accounting test re-reads EVERY anchor from the real file and proves
+ * the site is still unflagged (#4580 r5's intake, kept; every anchor, not the
+ * first, since #4606 r2 F3).
+ *
+ * ## Properties this sweep learned the hard way
+ *
+ * 1. **Per-OCCURRENCE, not per-FILE.** Exemptions used to name a file, so a
  *    NEW hand-rolled eviction appended to an already-exempted file passed
- *    silently — the exemption laundered it. Every flagged item is now keyed
- *    by `stableOccurrenceKey` (`tests/support/sweep-kit.ts`), so an exemption
- *    is supposed to excuse exactly one occurrence and nothing else — but the
- *    key alone cannot fully guarantee that: in a class-shaped file, every
- *    method's flagged line resolves to the SAME enclosing symbol (the class
- *    name), so two sibling methods that each flag a byte-identical line
- *    collide on one key, and one exemption would silently excuse both (#2487
- *    review F1 — the exact laundering this property exists to prevent, one
- *    layer down). `auditRegistry`'s `requireUniqueFlagged` (on by default)
- *    is what actually closes that: a duplicate flagged key fails LOUD before
- *    exemption-matching ever runs, so a real collision cannot ride through
- *    silently regardless of how the key was derived.
- * 3. **Content-keyed, not line-keyed (#2475).** The first version of property
- *    2 keyed on `path:line`, which re-keys on every unrelated line inserted
- *    ABOVE a flagged site — #2459, #2449, and #2474 each had to re-pin a line
- *    number that had nothing to do with their own change, and a textual merge
- *    of two such re-keys can silently land a WRONG number with no conflict
- *    marker. `stableOccurrenceKey` keys on the occurrence's own TEXT instead
- *    (its enclosing top-level declaration name, via `findEnclosingSymbol`,
- *    plus a short content hash of the flagged line via `lineContentHash`), so
- *    moving the site by inserting lines elsewhere in the file is a no-op for
- *    the key. Deleting or editing the flagged line still changes its key —
- *    correctly, since `auditRegistry`'s stale-exemption check must still
- *    catch an exemption whose target moved or vanished; it now reports the
- *    drift by name/hash instead of by line number.
- * 4. **A tighter-LOOKING check can be narrower, not stronger.** The bare
- *    form's original delete check required the SAME pair
- *    (`container.delete(loopVar)`), which read as a stricter guard against
- *    false positives but was strictly narrower than spelling 2's own
- *    `break`+`.delete(` window check — and vacuous besides, since a generic
- *    `.delete(` catches every fixture the pair check did. It missed
- *    assign-inside/delete-below (`oldest = v; …; set.delete(oldest)`, where
- *    the deleted name is never the loop variable), `set.delete(loopVar!)`,
- *    and `set?.delete(loopVar)` (#2460 round-3 review F1) — now matched by
- *    dropping to spelling 2's semantics. Its `.size` gate had the mirror
- *    problem: it matched a bare `.size` MENTION, not a bounded-loop
- *    COMPARISON, so a `.size` log line or a `size === 0` early-return guard
- *    sitting near an unrelated break+delete (find-first-match, drain-one)
- *    was misread as the `while (set.size > cap)` shape (#2460 round-3 review
- *    F2) — now gated on `SIZE_COMPARISON` (`>`/`>=`).
+ *    silently — the exemption laundered it. Every flagged item is keyed by
+ *    `stableOccurrenceKey` (`tests/support/sweep-kit.ts`), so an exemption
+ *    excuses exactly one occurrence. `auditRegistry`'s
+ *    `requireUniqueFlagged` (on by default) fails LOUD when two occurrences
+ *    derive one key, so a real collision cannot ride through either.
+ * 2. **Content-keyed, not line-keyed (#2475).** #2459, #2449, and #2474 each
+ *    had to re-pin a line number inserted ABOVE a flagged site; the key is the
+ *    occurrence's own text (enclosing declaration name plus a content hash of
+ *    the flagged line), so moving a site without editing it is a no-op.
+ * 3. **A tighter-LOOKING check can be narrower (#2460 round 3).** The bare
+ *    `for…of` gate once required the delete to name the loop variable, which
+ *    missed `oldest = v; …set.delete(oldest)` and `set?.delete(oldest)`; the
+ *    structural form gates on the victim moving, not on the spelling.
+ * 4. **Population is the DETECTOR's, not the tree's (#4580 r5, shape 69).**
+ *    `EXEMPT_SITES` is every occurrence this sweep FLAGS. What it refuses is
+ *    tabled and asserted, never described in prose.
  *
- * Built on tests/support/sweep-kit.ts, same as this repo's other
- * registered-or-fail sweeps. `EXEMPT_SITES` below is the FULL, reasoned list
- * of every remaining occurrence. A NEW site must migrate to `BoundedLruCache`
- * or `BoundedFifoMap`, or be added here with a real reason.
+ * Built on `tests/support/sweep-kit.ts`, same as this repo's other
+ * registered-or-fail sweeps. A NEW site this sweep flags must migrate to a
+ * bounded class or be added to `EXEMPT_SITES` with a real reason.
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { censusSourceFiles } from "../support/ast-census.js";
+import {
+	EVICTION_FORMS,
+	findEvictionPrograms,
+} from "../support/eviction-programs.js";
 import {
 	auditRegistry,
-	listSourceFiles,
 	relativePosix,
 	stableOccurrenceKey,
 	stripSource,
@@ -95,57 +92,6 @@ const REPO_ROOT = path.resolve(
 	"../..",
 );
 
-/**
- * Spelling 1: `<container>.keys()/.values()/.entries().next().value` — pull
- * the first entry out of an insertion-ordered container. `.values()` is the
- * `Set` form, `.entries()` the form used when the eviction needs the VALUE
- * too (a compiled query to free, a WASM tree to retire).
- */
-const ITERATOR_HEAD = /\.(?:keys|values|entries)\(\)\.next\(\)\.value/;
-
-/**
- * Spelling 2: a `for (const k of container.keys())` walk that breaks out
- * early and deletes — the same evict-oldest intent written as a loop. Both
- * `break` and `.delete(` must appear within {@link FOR_OF_WINDOW} lines of
- * the `for`, because the delete frequently happens AFTER the loop
- * (`debug-handles.ts` assigns the key inside and deletes below it).
- */
-const FOR_OF_ITERATOR =
-	/\bfor\s*\(\s*(?:const|let|var)\s+[\w$]+\s+of\s+[\w$.[\]]+\.(?:keys|values|entries)\(\)\s*\)/;
-const FOR_OF_WINDOW = 12;
-
-/**
- * Spelling 3 (#2460 review S1): a BARE `for (const x of container)` — no
- * `.keys()/.values()/.entries()` call at all, because iterating a `Set`
- * directly already yields its values (a `Map` yields `[k, v]` pairs, so this
- * spelling is Set-shaped in practice). The reviewer's probe
- * (`clients/lsp/session-roots.ts`) proved this invisible to both
- * {@link ITERATOR_HEAD} and {@link FOR_OF_ITERATOR}, which both require an
- * explicit accessor call the bare form has no reason to make.
- *
- * The window check below is spelling 2's own: `break`+`.delete(` somewhere in
- * {@link FOR_OF_WINDOW} lines after the `for`. An earlier cut required the
- * delete to name the SAME identifier as the loop variable
- * (`container.delete(loopVar)`), which read as tighter but was both vacuous
- * (dropping it to a generic `.delete(` catches every real fixture this file
- * has) and narrower than spelling 2 — it missed `oldest = v; …
- * set.delete(oldest)` (the deleted name is never the loop variable),
- * `set.delete(oldest!)`, and `set?.delete(oldest)` (#2460 round-3 review F1).
- * Because a bare identifier iteration is common for reasons that have nothing
- * to do with eviction, this spelling ALSO requires a `.size` COMPARISON —
- * not just a `.size` MENTION — within {@link SIZE_LOOP_WINDOW} lines above
- * the `for`, gated to `>`/`>=`, the bounded-loop shape every real eviction
- * site has (`while (set.size > cap)` / `for (...; set.size > cap; ...)`). A
- * bare `.size` mention with no comparison — a log line reporting the current
- * size, or a `size === 0` early-return guard in front of an unconditional
- * single-item drain — is not a bounded loop and must not gate the flag in
- * (#2460 round-3 review F2).
- */
-const BARE_FOR_OF_ITERATOR =
-	/\bfor\s*\(\s*(?:const|let|var)\s+[\w$]+\s+of\s+[\w$.[\]]+\s*\)/;
-const SIZE_LOOP_WINDOW = 6;
-const SIZE_COMPARISON = /\.size\s*>=?/;
-
 /** The one file allowed to spell the idiom: the canonical implementation. */
 const DEFINITION_FILE = "clients/bounded-cache.ts";
 
@@ -154,20 +100,34 @@ const DEFINITION_FILE = "clients/bounded-cache.ts";
  * `path#contentHash` with no enclosing symbol) → why this exact occurrence
  * stays hand-rolled.
  *
- * Every entry is a container shape neither bounded class covers. There are no
- * "deferred" entries left: #2442's review round migrated the three
- * `clients/review-graph/*` sites (their stated owner, the build-latch fix,
- * merged as #2446) and the four eviction-side-effect sites in
- * `tree-sitter-cache.ts` / `tree-sitter-client.ts`, which is what
- * `set()`'s `[key, value]` return exists for.
+ * Every entry is a container shape no bounded class covers. #4606 S1 re-keyed
+ * this table once, in the same change that replaced the lexical detector with
+ * the structural one: 16 rows kept their reasons, the three rows that recorded
+ * NON-members of the lexical overmatch were deleted (the structural recognizer
+ * never flags them, so no exemption is needed), and the seven live programs
+ * the lexical detector could not see joined with their own reasons.
  *
- * Keys were migrated from `path:line` to `stableOccurrenceKey` by #2475. When
- * a genuine edit to the flagged line itself invalidates a key (not a line
- * inserted elsewhere — that's the churn this migration removes), the failing
- * test's `audit.problems` output prints the new key the scan now computes;
- * paste it in.
+ * When a genuine edit to the flagged line invalidates a key, the failing
+ * test's `audit.problems` output prints the new key the scan computes; paste
+ * it in.
  */
 const EXEMPT_SITES: Readonly<Record<string, string>> = {
+	"clients/widget-state.ts#pruneInactiveFileRecords:15adad3b":
+		"Only inactive files with no live diagnostic qualify; touchedAt orders " +
+		"multiple victims until the soft cap is met. Neither bounded class " +
+		"expresses eligibility partition plus external recency (document-drift class).",
+	"clients/lsp/index.ts#LSPService:2676aced":
+		"Frozen LSP source (#4580 r4): markTouched maintains write recency by " +
+		"delete/set and trims oldest-first; reads must not promote. BoundedFifoMap " +
+		"fits this count cap, but migration is deferred under the explicit LSP freeze.",
+	"clients/lsp/document-drift.ts#DocumentDriftTracker:add9342e":
+		"Not evict-OLDEST (#4503): the walk SKIPS every record whose document a " +
+		"live server still holds and evicts the oldest one nobody holds, because " +
+		"dropping a held document's record leaves its stale view with nothing " +
+		"comparing disk against it. When every record is held, nothing is evicted " +
+		"at all. BoundedFifoMap can only drop its head, so it cannot express a " +
+		"skip-held victim policy, and growing it a skip policy to serve one caller " +
+		"is the same trade the debug-handles entry below already declined.",
 	"clients/debug-handles.ts#recordTrackedInit:3737b5dc":
 		"Not evict-OLDEST: this walk deliberately SKIPS the first " +
 		"TRACKER_PROTECTED_COUNT insertion-order entries and evicts the " +
@@ -176,56 +136,277 @@ const EXEMPT_SITES: Readonly<Record<string, string>> = {
 		"dropped. A protected prefix is a policy neither BoundedFifoMap nor " +
 		"BoundedLruCache expresses, and encoding it into a shared primitive " +
 		"for one debug-only caller is not worth the surface.",
+	"clients/lsp/client.ts#recordSentContent:1bb76b36":
+		"Not evict-OLDEST (#4580 round 2, family 1 with the accessor chain " +
+		"wrapped across lines): the loop is bounded on TWO axes at once " +
+		"(retained entries and retained bytes) and SKIPS every path whose " +
+		"binding no longer carries text before either counter moves, so it drops " +
+		"the oldest TEXT-BEARING path. Neither bounded class holds a second axis " +
+		"or a skip policy, and growing BoundedFifoMap one to serve this single " +
+		"caller is the trade the two entries above already declined.",
+	"clients/review-graph/builder.ts#setWorkspaceGraph:5d6480b6":
+		"Not a bounded class's recency (#4580 round 2, comparator family): the " +
+		"victim is the oldest by an explicitly maintained `lastUsedAt`, and the " +
+		"eviction clears the entry's armed idle timer. `BoundedLruCache` promotes " +
+		"on `get`, which these caches do NOT do through their equality-checking " +
+		"reads, so adopting it would change which entry is evicted under a " +
+		"read-only workload; no bounded class carries an external recency stamp " +
+		"or a per-entry timer.",
+	"clients/dispatch/integration.ts#setReverseDepsEntry:cfec6940":
+		"Not a bounded class's recency (#4580 round 2, comparator family): the " +
+		"victim is the oldest by the explicitly maintained `lastUsedAt` that " +
+		"`touchReverseDepsEntry` stamps, and the eviction clears the entry's " +
+		"armed idle timer. `BoundedLruCache`'s `get` would promote on the " +
+		"equality-checking reads this cache makes, changing eviction order; no " +
+		"bounded class carries an external recency stamp or a per-entry timer.",
+	"clients/project-snapshot.ts#enforceAuthoritativeSnapshotCap:c15ce8a2":
+		"Not a bounded class's recency (#4580 round 2, comparator family): the " +
+		"victim is the oldest by the explicitly maintained `lastUsedAt`, and the " +
+		"eviction must clear the single timer `scheduleAuthoritativeSnapshotEviction` " +
+		"armed for it. `BoundedLruCache` would promote on `get`, which this " +
+		"cache's equality-checking reads must not do; no bounded class carries an " +
+		"external recency stamp or a per-entry timer.",
+	"clients/workspace-topology.ts#getDirectoryMarkers:d43899c7":
+		"Not a bounded class's recency (#4580 round 2, comparator family): the " +
+		"victim is the oldest by the `lastUsedAt` that `touchDirMarker` stamps, " +
+		"and `deleteDirMarker` must clear that entry's idle timer. " +
+		"`BoundedLruCache`'s `get` would promote on reads this cache makes without " +
+		"touching the stamp, changing eviction order; no bounded class carries an " +
+		"external recency stamp or a per-entry timer.",
+	"clients/workspace-topology.ts#walkToNearestMatch:79da3cc7":
+		"Not a bounded class's recency (#4580 round 2, comparator family): the " +
+		"victim is the oldest by the `lastUsedAt` that `touchWalk` stamps, and " +
+		"`deleteWalk` must clear that entry's idle timer. `BoundedLruCache`'s " +
+		"`get` would promote on reads this cache makes without touching the " +
+		"stamp, changing eviction order; no bounded class carries an external " +
+		"recency stamp or a per-entry timer.",
+	"clients/read-guard.ts#ReadGuard:61e2665a":
+		"Consumed reads are evicted first, ordered by the separately maintained " +
+		"fileLastUsed stamp. evictFile removes read/authorship/last-used state. " +
+		"Neither bounded class expresses this eligibility partition plus external recency.",
+	"clients/read-guard.ts#ReadGuard:fe37c09d":
+		"Unconsumed reads are the second eligibility partition, ordered by " +
+		"fileLastUsed only after consumed eviction. evictFile clears associated " +
+		"read/authorship state; a single FIFO/LRU container cannot encode the two passes.",
+	"clients/mcp/analyze.ts#enforceWarmWordIndexLruCap:625c660e":
+		"Only unleased warm roots may be evicted; lastUsedAt orders eligible roots " +
+		"and evictWarmWordIndex performs retirement. Neither bounded class has " +
+		"lease eligibility plus explicitly maintained recency.",
+	"clients/lsp/client-registry.ts#ClientRegistry:4d17a873":
+		"Frozen LSP member: adopted roots are ordered by explicit recency, " +
+		"excluding the root just normalized. Eviction also retires that root's " +
+		"adopted clients. Neither bounded class expresses protected-root selection.",
+	"clients/lsp/client-registry.ts#ClientRegistry:4fd64a7c":
+		"Frozen LSP member: ceiling capacity counts live and in-flight clients. " +
+		"Only alive, idle, unleased clients other than the requested key qualify; " +
+		"the victim must be shut down asynchronously. A bounded map cannot own " +
+		"that eligibility or shutdown lifecycle.",
+
+	"scripts/check-pr-body.mjs#testCorpus:9825b2b8":
+		"Tooling-only FIFO corpus memo; importing the shipped clients container " +
+		"would cross the script/runtime dependency boundary. This admission names " +
+		"one pre-existing bounded script cache, not a shipped runtime policy.",
+
+	// #4606 S1: the seven live programs the lexical detector could not see.
+	"clients/sgconfig.ts#enforceBaselineEntryCap:1ee0be8a":
+		"Baseline artifacts on DISK, not map entries: eligibility is a keep-set " +
+		"plus mtime recency over directory entries, the victim is removed with " +
+		"`rmSync`, and its cached baseline is retired. No bounded class owns a " +
+		"filesystem directory, and the survivor set is written by the tool the " +
+		"eviction protects, not by this block.",
+	"clients/cache-manager.ts#CacheManager:9b87dd70":
+		"Persisted turn-state partitions: eligibility is the TTL filter, order is " +
+		"the stored `lastUpdated` stamp, and the survivors are rebuilt with " +
+		"`Object.fromEntries` and written back to a JSON cache. No bounded class " +
+		"owns a persisted record with external recency, and dropping a partition " +
+		"here also re-writes the envelope's writer identity.",
+	"clients/mutation-attribution.ts#persistAttribution:497e44c7":
+		"Persisted tool records: the cap keeps the freshest `lastSeen` tail of a " +
+		"JSON record and writes the survivors back to disk. No bounded class owns " +
+		"a persisted record keyed by an external recency stamp, and the file " +
+		"rewrite is the point of the block.",
+	"clients/widget-state.ts#retainSuppressedRows:8f784012":
+		"Per-file suppressed-row retention ordered by the stored `observedAt`, " +
+		"with one degradation record per capped file and re-emitted retained rows. " +
+		"External recency plus a degradation record no bounded class carries; the " +
+		"sibling policy in the same file is already an exemption.",
+	"clients/lens-map.ts#aggregateGraphToFiles:140b5988":
+		"Non-member: a degree-ranked render view capped for output (#679). Nothing " +
+		"is evicted from a stored container — the graph keeps every file — so no " +
+		"bounded class applies. The row stays because the structural recognizer " +
+		"cannot distinguish a capped view from a capped retention without knowing " +
+		"who owns the survivors, and a silent absence would read as a judgement.",
+	"clients/observed-mutation.ts#budgetFor:44e908ca":
+		"Minimum dead-turn scan (#4606): the victim is the smallest turn index " +
+		"that is not live, with `Math.min(...keys())` as the all-live fallback, so " +
+		"eviction is oldest-dead-first rather than insertion-ordered. BoundedFifoMap " +
+		"drops its head and cannot express a live-predicate skip.",
+	"clients/resource-sampler.ts#sampleProcessesWindows:42adf4b2":
+		"Windows CPU-history trim: insertion order is irrelevant because the " +
+		"victim is the entry with the smallest timestamp, scanned explicitly. A " +
+		"bounded map cannot carry a per-entry timestamp scan, and the map also " +
+		"drops entries on a 60 s age bound evaluated before this trim.",
+	"scripts/analyze-pi-lens-logs.mjs#pushTop:26d430bd":
+		"Tooling-only sorted top-N list: a script keeps its ranking bounded by " +
+		"sorting and truncating in place, and importing the shipped clients " +
+		"container into a log analyzer would cross the script/runtime boundary. " +
+		"This is the same class as the corpus memo above, not a shipped policy.",
 };
 
-function shippedSourceFiles(): string[] {
-	const files = ["clients", "tools", "mcp"].flatMap((dir) => {
-		const abs = path.join(REPO_ROOT, dir);
-		return fs.existsSync(abs)
-			? listSourceFiles(abs, { extensions: [".ts"], skipTests: true })
-			: [];
-	});
-	const indexTs = path.join(REPO_ROOT, "index.ts");
-	if (fs.existsSync(indexTs)) files.push(indexTs);
-	return files;
+/**
+ * Live programs the recognizer REFUSES, with the stage each lacks.
+ *
+ * The recognizer admits four forms; these are retention programs whose bound is
+ * a runtime argument, whose order is plain insertion, or whose victim is chosen
+ * by a reduction, so the stages they share with a member do not prove an
+ * eviction. Each row is re-read from the real file — EVERY anchor named must
+ * survive as CODE (`stripSource`, so a comment or a string quoting it is
+ * prose) and stay unflagged — so a row can neither go stale nor claim a site
+ * that migrated, and a recognizer round that starts catching one of these reds
+ * here instead of passing silently (#4580 r5's intake, kept for the structural
+ * detector; #4606 r2 F3 fixed the single-anchor check).
+ *
+ * Each anchor is the statement the owning form WOULD report if it learned this
+ * shape (`statementOf` the truncation, the declaration, the loop), not the
+ * guard above it: a row anchored on a line the form never reports cannot red
+ * (#4606 r2 F3, `clients/runtime-turn.ts`).
+ */
+const REFUSED_PROGRAMS: Readonly<
+	Record<
+		string,
+		{ readonly file: string; readonly anchor: string; readonly count: number }
+	>
+> = {
+	"insertion-order suffix retention, literal cap": {
+		file: "clients/agent-behavior-client.ts",
+		anchor: "this.toolHistory = this.toolHistory.slice(-50);",
+		count: 1,
+	},
+	"insertion-order suffix retention, record field": {
+		file: "clients/metrics-history.ts",
+		anchor: "existing.history = existing.history.slice(-MAX_HISTORY_PER_FILE);",
+		count: 2,
+	},
+	"array of edits scanned in order, no victim hand-off": {
+		file: "clients/partial-edit-apply.ts",
+		anchor:
+			"const ordered = [...args.edits].sort((a, b) => a.spanStart - b.spanStart);",
+		count: 1,
+	},
+	"line-window rendering, runtime line budget": {
+		file: "clients/runtime-turn.ts",
+		// The assignment that owns the slice, not the guard above it: a runtime
+		// recognizer would report `statementOf(sliceCall)`, which is this line.
+		// The string argument is left out of the anchor because `liveAnchorLines`
+		// reads comment/string-blanked source.
+		anchor: "kept = lines.slice(0, maxLines).join(",
+		count: 1,
+	},
+	"minimum reduction under a tracked-count cap": {
+		file: "clients/bounded-telemetry.ts",
+		anchor: "const oldestTrackedTurn = Math.min(...turnCounts.keys());",
+		count: 1,
+	},
+	"insertion-order suffix retention, runtime bound": {
+		file: "clients/deferred-test-targets.ts",
+		anchor: "return ordered.slice(-max);",
+		count: 1,
+	},
+};
+
+/** 0-based start offset of every line, for offset→line mapping. */
+function lineStartOffsets(source: string): number[] {
+	const starts = [0];
+	for (let i = 0; i < source.length; i++) {
+		if (source[i] === "\n") starts.push(i + 1);
+	}
+	return starts;
 }
 
-/** Every hand-rolled eviction in one file, as 1-based line numbers. */
-export function findEvictionLines(stripped: string): number[] {
-	const lines = stripped.split("\n");
-	const hits = new Set<number>();
-	for (let i = 0; i < lines.length; i++) {
-		const line = lines[i] ?? "";
-		if (ITERATOR_HEAD.test(line)) hits.add(i + 1);
-
-		if (FOR_OF_ITERATOR.test(line)) {
-			const window = lines.slice(i + 1, i + 1 + FOR_OF_WINDOW).join("\n");
-			if (/\bbreak\b/.test(window) && /\.delete\(/.test(window))
-				hits.add(i + 1);
-			continue;
-		}
-
-		if (BARE_FOR_OF_ITERATOR.test(line)) {
-			const window = lines.slice(i + 1, i + 1 + FOR_OF_WINDOW).join("\n");
-			const precedingWindow = lines
-				.slice(Math.max(0, i - SIZE_LOOP_WINDOW), i)
-				.join("\n");
-			if (
-				/\bbreak\b/.test(window) &&
-				/\.delete\(/.test(window) &&
-				SIZE_COMPARISON.test(precedingWindow)
-			) {
-				hits.add(i + 1);
-			}
+/** End of a balanced initializer or call in comment/string-blanked source. */
+function balancedEnd(source: string, start: number, call = false): number {
+	let depth = call ? 1 : 0;
+	for (let index = start; index < source.length; index++) {
+		const token = source[index];
+		if (token === ";" && depth === 0) return index;
+		if (token === "(" || token === "[" || token === "{") depth++;
+		if (token === ")" || token === "]" || token === "}") {
+			depth--;
+			if (depth < 0 || (call && depth === 0)) return index + 1;
 		}
 	}
-	return [...hits].sort((a, b) => a - b);
+	return source.length;
+}
+
+/** 1-based line numbers where `anchor` survives as CODE in `source`. */
+function liveAnchorLines(source: string, anchor: string): number[] {
+	return stripSource(source)
+		.split("\n")
+		.flatMap((line, index) => (line.includes(anchor) ? [index + 1] : []));
+}
+
+/**
+ * Every refusal row that no longer holds: an anchor that stopped surviving as
+ * code, whose count moved, or that the REAL recognizer now flags.
+ *
+ * EVERY anchor is visited, not the first one: a row with two sites used to
+ * pass while its second started flagging (#4606 r2 F3, Greptile P2). Each
+ * anchor is also the statement the owning form would report, so the check can
+ * actually red.
+ */
+function refusalWitnesses(
+	rows: typeof REFUSED_PROGRAMS,
+	read: (file: string) => string,
+): { witnesses: string[]; anchorsChecked: number } {
+	const witnesses: string[] = [];
+	let anchorsChecked = 0;
+	for (const [spelling, row] of Object.entries(rows)) {
+		const source = read(row.file);
+		const anchors = liveAnchorLines(source, row.anchor);
+		if (anchors.length !== row.count) {
+			witnesses.push(
+				`${row.file}: ${spelling} anchor ${JSON.stringify(row.anchor)} matched ${anchors.length} lines`,
+			);
+			continue;
+		}
+		const findings = findEvictionPrograms(source).map(
+			(program) => program.line,
+		);
+		for (const anchor of anchors) {
+			anchorsChecked += 1;
+			if (findings.includes(anchor))
+				witnesses.push(
+					`${row.file}:${anchor}: ${JSON.stringify(row.anchor)} is now flagged — delete or migrate the row`,
+				);
+		}
+	}
+	return { witnesses, anchorsChecked };
+}
+
+/**
+ * This sweep's own roots. The enumeration (and the `.js`-twin rule) lives in
+ * `tests/support/ast-census.ts`; the container guard keeps its own root list
+ * and the two populations never merge (#4606 S0).
+ */
+function shippedSourceFiles(): string[] {
+	return censusSourceFiles(
+		["clients", "tools", "mcp", "scripts", "tests/support", "index.ts"].map(
+			(root) => path.join(REPO_ROOT, root),
+		),
+		{ extensions: [".ts", ".mjs", ".js"], skipTests: true },
+	);
+}
+
+/** Every eviction program in one source text, as 1-based line numbers. */
+export function findEvictionLines(stripped: string): number[] {
+	return findEvictionPrograms(stripped).map((program) => program.line);
 }
 
 /** One flagged occurrence: its stable key plus a `file:line` diagnostic detail. */
 interface FlaggedOccurrence {
 	key: string;
 	detail: string;
+	form: string;
 }
 
 function findFlaggedOccurrences(): {
@@ -237,201 +418,718 @@ function findFlaggedOccurrences(): {
 	for (const abs of files) {
 		const rel = relativePosix(REPO_ROOT, abs);
 		if (rel === DEFINITION_FILE) continue;
-		// Strip first: an idiom named only in a comment or a string is not one.
-		// Layout is preserved, so these line numbers (and the hash inputs derived
-		// from them) match the raw source.
-		const stripped = stripSource(fs.readFileSync(abs, "utf8"));
+		const source = fs.readFileSync(abs, "utf8");
+		const stripped = stripSource(source);
 		const lines = stripped.split("\n");
-		for (const line of findEvictionLines(stripped)) {
+		const starts = lineStartOffsets(stripped);
+		for (const program of findEvictionPrograms(source)) {
+			const line = program.line;
 			occurrences.push({
-				key: stableOccurrenceKey(rel, lines, line - 1),
+				key: stableOccurrenceKey(
+					rel,
+					lines.map((text, index) => {
+						// Same first line, different eligibility policy (#4580 r3):
+						// hash the complete declaration, not its formatter's first line.
+						if (index !== line - 1 || !/^\s*(?:const|let|var)\b/.test(text))
+							return text;
+						const start = starts[index] ?? 0;
+						return stripped
+							.slice(start, balancedEnd(stripped, start))
+							.replace(/\s+/g, " ");
+					}),
+					line - 1,
+				),
 				detail: `${rel}:${line}`,
+				form: program.form,
 			});
 		}
 	}
 	return { occurrences, scanned: files.length };
 }
 
-describe("#2442 no new hand-rolled evict-oldest idiom outside bounded-cache.ts", () => {
+describe("#2442 no new hand-rolled evict-oldest program outside bounded-cache.ts", () => {
 	const { occurrences, scanned } = findFlaggedOccurrences();
 	const flagged = occurrences.map((o) => o.key);
 
 	it("actually finds the family (a dead scan must not read as clean)", () => {
-		// Vacuity guard on the DETECTOR: as of #2449's review round 4, five
-		// occurrences remain (four Set-shaped, one protected-prefix policy). If
-		// this drops to zero, EITHER every exemption's site was migrated (update
-		// the sweep) OR the regexes broke (fix the sweep) — never assume the
-		// former without checking.
+		// The registered population includes runtime eviction policies and two
+		// tooling matches. The registry audit below rejects missing/stale entries.
 		expect(flagged.length).toBeGreaterThanOrEqual(1);
 	});
 
-	it("detects all four spellings, not just `.keys().next().value`", () => {
-		// Mutation guard on the DETECTOR itself (#2442 review F5): the first
-		// draft matched one spelling and silently missed the other two. Each
-		// fixture below is a real shape found in this tree.
-		expect(findEvictionLines("const a = m.keys().next().value;")).toEqual([1]);
-		expect(findEvictionLines("const b = s.values().next().value;")).toEqual([
-			1,
-		]);
-		expect(findEvictionLines("const c = m.entries().next().value;")).toEqual([
-			1,
-		]);
+	// #4606 S1: one plant per ADMITTED FORM, plus the refusal that proves the
+	// form's own gate. Each plant is a shape the lexical detector missed; the
+	// red-first evidence (master's detector returns [] for every one of them) is
+	// in the PR body, and the per-form mutation that reds these rows is quoted
+	// there too.
+	const FORM_PLANTS: Readonly<
+		Record<
+			string,
+			{
+				readonly plant: string;
+				readonly line: number;
+				readonly refused: string;
+			}
+		>
+	> = {
+		"iterator-head": {
+			plant: [
+				"function trim(m, CAP) {",
+				"  while (m.size > CAP) {",
+				"    const oldest = m.keys().next();",
+				"    if (oldest.done) break;",
+				"    m.delete(oldest.value);",
+				"  }",
+				"}",
+			].join("\n"),
+			line: 3,
+			refused: [
+				"function peek(m) {",
+				"  const oldest = m.keys().next();",
+				"  return oldest.done ? undefined : oldest.value;",
+				"}",
+			].join("\n"),
+		},
+		"ordered-victim": {
+			plant: [
+				"function trim(m, CAP) {",
+				"  while (m.size > CAP) {",
+				"    const victim = [...m.entries()].sort(cmp)[0];",
+				"    if (!victim) break;",
+				"    evictFile(victim[0]);",
+				"  }",
+				"}",
+			].join("\n"),
+			line: 3,
+			refused: [
+				"function rank(rows) {",
+				"  const victim = [...rows].sort(cmp)[0];",
+				"  return victim;",
+				"}",
+			].join("\n"),
+		},
+		"ordered-scan": {
+			plant: [
+				"function trim(m, CAP) {",
+				"  while (m.size > CAP) {",
+				"    let victim;",
+				"    for (const key of m.keys()) if (pred(key)) victim = key;",
+				"    m.delete(victim ?? Math.min(...m.keys()));",
+				"  }",
+				"}",
+			].join("\n"),
+			line: 4,
+			refused: [
+				"function sweep(m, CAP) {",
+				"  while (m.size > CAP) {",
+				"    for (const key of m.keys()) if (pred(key)) m.delete(key);",
+				"  }",
+				"}",
+			].join("\n"),
+		},
+		"count-truncation": {
+			plant: [
+				"const MAX_TOOLS = 4;",
+				"function persist(tools) {",
+				"  tools.sort(byLastSeen);",
+				"  const bounded = tools.slice(-MAX_TOOLS);",
+				"  writeFileSync(path, JSON.stringify({ tools: bounded }));",
+				"}",
+			].join("\n"),
+			line: 4,
+			refused: [
+				"const LIMIT = 12;",
+				"function show(rows) {",
+				"  const ranked = [...rows].sort(cmp);",
+				"  const shown = ranked.slice(0, LIMIT);",
+				"  console.log(shown);",
+				"}",
+			].join("\n"),
+		},
+	};
+
+	it("tables every admitted form, and only those", () => {
+		expect(Object.keys(FORM_PLANTS).sort()).toEqual([...EVICTION_FORMS].sort());
+		// Every form the recognizer knows is exercised by a plant, and every plant
+		// belongs to a form the recognizer knows: a new form without a plant, or a
+		// plant for a form that no longer exists, reds here.
+		expect(new Set(Object.keys(FORM_PLANTS)).size).toBe(EVICTION_FORMS.length);
+	});
+
+	it.each(EVICTION_FORMS)(
+		"flags the %s plant and refuses the shape it gates",
+		(form) => {
+			const plan = FORM_PLANTS[form];
+			if (plan === undefined) throw new Error(`no plant for form ${form}`);
+			const found = findEvictionPrograms(plan.plant);
+			expect(found.map((program) => program.line)).toEqual([plan.line]);
+			expect(found[0]?.form).toBe(form);
+			// The refusal is the same shape with ONE stage removed, so a gate that
+			// stops gating turns this row red instead of quietly widening.
+			expect(findEvictionPrograms(plan.refused)).toEqual([]);
+		},
+	);
+
+	// Shape-69 spellings INSIDE an admitted form. Each resolves to the form that
+	// owns it; a matcher anchored on one spelling would pass the others.
+	it("resolves an alias, an indirect accessor, and a `$`-initial victim", () => {
 		expect(
-			findEvictionLines(
+			findEvictionPrograms(
+				[
+					"const byCall = this.checked;",
+					"while (byCall.size > CAP) {",
+					"  const oldest = byCall.keys().next();",
+					"  if (oldest.done) break;",
+					"  byCall.delete(oldest.value);",
+					"}",
+				].join("\n"),
+			).map((program) => program.line),
+		).toEqual([3]);
+		expect(
+			findEvictionPrograms(
+				[
+					"const iteratorOf = (container) => container.keys();",
+					"while (m.size > CAP) {",
+					"  const oldest = iteratorOf(m).next();",
+					"  if (oldest.done) break;",
+					"  m.delete(oldest.value);",
+					"}",
+				].join("\n"),
+			).map((program) => program.line),
+		).toEqual([3]);
+		expect(
+			findEvictionPrograms(
+				[
+					"while (m.size > CAP) {",
+					"  const $oldest = m.keys().next();",
+					"  if ($oldest.done) break;",
+					"  m.delete($oldest?.value);",
+					"}",
+				].join("\n"),
+			).map((program) => program.line),
+		).toEqual([2]);
+	});
+
+	it("resolves the head-selection spellings the lexical detector counted", () => {
+		// #4606 r2 F1: these five programs were passing cases of the lexical
+		// detector, and the structural round refused them untabled. Each selects
+		// the insertion-order head; only the selection spelling differs.
+		// Destructured from an accessor chain, including one behind a helper.
+		for (const [source, line] of [
+			["const [oldest] = m.keys();", 2],
+			["const [key, value] = m.entries();", 2],
+		] as const) {
+			expect(
+				findEvictionPrograms(
+					[
+						"while (m.size > CAP) {",
+						`  ${source}`,
+						"  m.delete(oldest ?? key);",
+						"}",
+					].join("\n"),
+				).map((program) => program.line),
+				source,
+			).toEqual([line]);
+		}
+		expect(
+			findEvictionPrograms(
+				[
+					"const iteratorOf = (container) => container.keys();",
+					"while (m.size > CAP) {",
+					"  const [oldest] = iteratorOf(m);",
+					"  m.delete(oldest);",
+					"}",
+				].join("\n"),
+			).map((program) => program.line),
+			"accessor behind a helper",
+		).toEqual([3]);
+		// A `for…of` head that breaks after the first victim. An accessor walk is
+		// its own order stage, so it needs no separate bound (the retired
+		// detector's `#2442` F5 case); a bare container does.
+		expect(
+			findEvictionPrograms(
 				["for (const k of m.keys()) {", "  m.delete(k);", "  break;", "}"].join(
 					"\n",
 				),
-			),
+			).map((program) => program.line),
+			"accessor loop, no bound",
 		).toEqual([1]);
-		// A plain iteration that neither breaks nor deletes is NOT an eviction.
+		for (const removal of [
+			"set.delete(oldest);",
+			"set.delete(oldest!);",
+			"set?.delete(oldest);",
+		]) {
+			expect(
+				findEvictionPrograms(
+					[
+						"while (set.size > cap) {",
+						"  for (const oldest of set) {",
+						`    ${removal}`,
+						"    break;",
+						"  }",
+						"}",
+					].join("\n"),
+				).map((program) => program.line),
+				removal,
+			).toEqual([2]);
+		}
+		// A victim reached through a second binding is the same eviction (#4570's
+		// shape-69 plant); the derived name is resolved before the removal test.
 		expect(
-			findEvictionLines(
-				["for (const k of m.keys()) {", "  total += k;", "}"].join("\n"),
-			),
-		).toEqual([]);
-		// Spelling 4 (#2460 review S1): a BARE `for (const x of set)` — no
-		// `.keys()/.values()/.entries()` call at all, because iterating a `Set`
-		// directly already yields its values. The reviewer planted this exact
-		// shape in `clients/lsp/session-roots.ts` and it passed the sweep
-		// silently — ITERATOR_HEAD and FOR_OF_ITERATOR both require an explicit
-		// accessor call. This spelling also requires a `.size`-bounded loop
-		// around it, so an ordinary `for...of` walk that happens to `break` and
-		// `delete` an unrelated key elsewhere is not misread as an eviction.
-		expect(
-			findEvictionLines(
+			findEvictionPrograms(
 				[
-					"while (set.size > cap) {",
-					"  for (const oldest of set) {",
-					"    set.delete(oldest);",
-					"    break;",
-					"  }",
+					"while (m.size > CAP) {",
+					"  const oldest = m.keys().next();",
+					"  if (oldest.done) break;",
+					"  const victim = oldest.value;",
+					"  m.delete(victim);",
 					"}",
 				].join("\n"),
-			),
-		).toEqual([2]);
-		// Bare for-of with no size-bounded loop around it, and no break/delete
-		// of the loop variable, is NOT an eviction.
-		expect(
-			findEvictionLines(
-				["for (const x of set) {", "  total += x;", "}"].join("\n"),
-			),
-		).toEqual([]);
-		// Bare for-of that breaks+deletes but is NOT inside a `.size` loop is not
-		// flagged by this spelling either — it needs a real bounded-eviction
-		// shape, not just any early-exit delete.
-		expect(
-			findEvictionLines(
-				[
-					"for (const oldest of set) {",
-					"  set.delete(oldest);",
-					"  break;",
-					"}",
-				].join("\n"),
-			),
-		).toEqual([]);
-	});
-
-	// (#2460 round-3 review F1) The first cut required the bare form's delete to
-	// name the EXACT loop variable (`container.delete(loopVar)`), which is both
-	// vacuous (dropping it to a generic `.delete(` still catches every fixture
-	// above) and narrower than spelling 2's own `break`+`.delete(` window check
-	// — so it missed three real shapes below. Each fixture is wrapped in a
-	// `.size`-bounded loop so only the pair-narrowing is under test.
-
-	it("bare form catches assign-inside/delete-below, where the deleted identifier is never the loop variable (#2460 round-3 review F1)", () => {
-		// The deleted identifier ("oldest") is never the loop variable ("v") at
-		// all, so a same-pair check can never match this shape regardless of
-		// syntax — this is the fixture that most directly proves the narrowing
-		// itself must go, not just be patched around.
-		expect(
-			findEvictionLines(
-				[
-					"while (set.size > cap) {",
-					"  let oldest;",
-					"  for (const v of set) {",
-					"    oldest = v;",
-					"    break;",
-					"  }",
-					"  if (oldest !== undefined) set.delete(oldest);",
-					"}",
-				].join("\n"),
-			),
-		).toEqual([3]);
-	});
-
-	it("bare form catches a non-null-asserted delete of the loop variable (#2460 round-3 review F1)", () => {
-		// `oldest!` is not the bare identifier `oldest` the old regex demanded
-		// immediately before `)`.
-		expect(
-			findEvictionLines(
-				[
-					"while (set.size > cap) {",
-					"  for (const oldest of set) {",
-					"    set.delete(oldest!);",
-					"    break;",
-					"  }",
-					"}",
-				].join("\n"),
-			),
+			).map((program) => program.line),
+			"value through another binding",
 		).toEqual([2]);
 	});
 
-	it("bare form catches an optional-chain delete (#2460 round-3 review F1)", () => {
-		// `set?.delete(` is not the literal `set.delete(` the old regex demanded.
+	it("resolves an alias of the ordered sequence before testing selection", () => {
+		// #4606 r2 F1 (Greptile P1, T2b): selection used to be tested against the
+		// ordering's own names before aliases were followed, so a derived name's
+		// subscript was invisible.
 		expect(
-			findEvictionLines(
+			findEvictionPrograms(
 				[
-					"while (set.size > cap) {",
-					"  for (const oldest of set) {",
-					"    set?.delete(oldest);",
-					"    break;",
-					"  }",
-					"}",
+					"if (m.size <= CAP) return;",
+					" const ranked = sequence.sort(cmp);",
+					" const alias = ranked;",
+					" const derived = alias.filter(eligible);",
+					" m.delete(derived[0]);",
 				].join("\n"),
-			),
+			).map((program) => program.line),
 		).toEqual([2]);
 	});
 
-	// (#2460 round-3 review F2) The bare form's `.size` gate matched a bare
-	// mention, not a comparison, so a break+delete pair with nothing to do with
-	// bounded eviction rode through on an unrelated `.size` reference nearby.
-
-	it("bare form does NOT flag a break+delete guarded only by a `.size` log line above (#2460 round-3 review F2)", () => {
-		// find-first-match (a predicate, not evict-oldest) with a `.size` log
-		// line above it must not be misread as the bounded-eviction shape.
+	it("resolves a bounded program whose receiver is an alias", () => {
+		// #4606 r2 F5: this program is admitted ONLY by
+		// `governsOrderedProgram`'s enclosing-bounded-control arm — the cap's own
+		// subject (`cache`) is not the ranked receiver (`byCall`), so the
+		// subject-in-expression arm cannot carry it. The mutation that disables
+		// arm 1 reds here and nowhere else.
 		expect(
-			findEvictionLines(
+			findEvictionPrograms(
 				[
-					"function removeFirstMatch(set, pred) {",
-					"  console.log(`size=${set.size}`);",
-					"  for (const item of set) {",
-					"    if (pred(item)) {",
-					"      set.delete(item);",
-					"      break;",
+					"function trim(cache, CAP) {",
+					"  const byCall = cache;",
+					"  while (cache.size > CAP) {",
+					"    const victim = [...byCall.entries()].sort(cmp)[0];",
+					"    byCall.delete(victim[0]);",
+					"  }",
+					"}",
+				].join("\n"),
+			).map((program) => program.line),
+		).toEqual([4]);
+	});
+
+	it("does not let a string or a comment name the victim", () => {
+		// #4606 r2 F2 (Greptile P2): the recognizer reads raw source, so a
+		// reference must come from the AST's identifiers, never from the call's
+		// text (AGENTS.md shape 43).
+		for (const removal of [
+			'm.delete("oldest");',
+			"m.delete(/* oldest */ other);",
+			"m.delete(other.oldest);",
+		]) {
+			expect(
+				findEvictionPrograms(
+					[
+						"while (m.size > CAP) {",
+						"  const oldest = m.keys().next();",
+						"  if (oldest.done) break;",
+						`  ${removal}`,
+						"}",
+					].join("\n"),
+				),
+				removal,
+			).toEqual([]);
+		}
+	});
+
+	it("resolves a formatter wrap inside the accessor chain and after `=`", () => {
+		// #4580 review F1: two live members were invisible to a line-anchored
+		// matcher because the chain wrapped.
+		expect(
+			findEvictionPrograms(
+				[
+					"while (m.size > CAP) {",
+					"  const oldest =",
+					"    m.keys().next();",
+					"  if (oldest.done) break;",
+					"  m.delete(oldest.value);",
+					"}",
+				].join("\n"),
+			).map((program) => program.line),
+		).toEqual([2]);
+		// The tombstone trim's shape: `.values()` on its own line, `.next()` on
+		// the next.
+		expect(
+			findEvictionPrograms(
+				[
+					"while (evicted.size > CAP) {",
+					"  const oldest = evicted",
+					"    .values()",
+					"    .next().value;",
+					"  if (oldest === undefined) break;",
+					"  evicted.delete(oldest);",
+					"}",
+				].join("\n"),
+			).map((program) => program.line),
+		).toEqual([2]);
+	});
+
+	it("resolves destructured iterator results and a minimum scan", () => {
+		// The Windows CPU-history trim: `for (const [key, entry] of map)` with an
+		// explicit smallest-timestamp scan. The lexical detector required a bare
+		// identifier loop variable, so a destructured result was invisible.
+		expect(
+			findEvictionPrograms(
+				[
+					"while (history.size > CAP) {",
+					"  let oldestKey;",
+					"  let oldestTs = Number.POSITIVE_INFINITY;",
+					"  for (const [key, entry] of history) {",
+					"    if (entry.ts < oldestTs) {",
+					"      oldestKey = key;",
+					"      oldestTs = entry.ts;",
 					"    }",
 					"  }",
+					"  if (oldestKey === undefined) break;",
+					"  history.delete(oldestKey);",
+					"}",
+				].join("\n"),
+			).map((program) => program.line),
+		).toEqual([4]);
+	});
+
+	it("resolves comparator sources, transforms, and selectors", () => {
+		// Shape 69: the ordering operation owns recognition, not its receiver, and
+		// a transparent transform must not hide ordered removal.
+		for (const source of [
+			"[...m.keys()]",
+			"[...m.values()]",
+			"[...m.entries()]",
+			"Array.from(m.entries())",
+		]) {
+			for (const order of ["sort(cmp)", "sort()", "toSorted(cmp)"]) {
+				const found = findEvictionPrograms(
+					[
+						"function trim(m, CAP) {",
+						"  while (m.size > CAP) {",
+						`    const victim = ${source}.${order}[0];`,
+						"    m.delete(victim);",
+						"  }",
+						"}",
+					].join("\n"),
+				);
+				expect(
+					found.map((program) => program.line),
+					`${source}.${order}`,
+				).toEqual([3]);
+			}
+		}
+		for (const transform of [
+			".filter(eligible)",
+			".map(identity)",
+			".slice(0)",
+			".filter(([, e]) => { return eligible(e); }).map(identity)",
+		]) {
+			expect(
+				findEvictionPrograms(
+					[
+						"function trim(m, CAP) {",
+						"  while (m.size > CAP) {",
+						`    const victim = [...m.entries()]${transform}.sort(cmp)[0];`,
+						"    m.delete(victim[0]);",
+						"  }",
+						"}",
+					].join("\n"),
+				).map((program) => program.line),
+				transform,
+			).toEqual([3]);
+		}
+		for (const selector of [
+			"[0]",
+			".at(0)",
+			".find(eligible)",
+			".shift()",
+			".pop()",
+		]) {
+			expect(
+				findEvictionPrograms(
+					[
+						"function trim(m, CAP) {",
+						"  while (m.size > CAP) {",
+						`    const victim = [...m.entries()].sort(cmp)${selector};`,
+						"    if (!victim) break;",
+						"    m.delete(victim[0] ?? victim);",
+						"  }",
+						"}",
+					].join("\n"),
+				).map((program) => program.line),
+				selector,
+			).toEqual([3]);
+		}
+		// The temporary has no root name, so a consuming selector must be read
+		// from the ordering call itself. Deleting the PLAIN key proves the
+		// selector is what reaches the effect, not a `victim[0]` on the removal
+		// (#4606 r2 review round 2).
+		for (const selector of [".shift()", ".pop()"]) {
+			expect(
+				findEvictionPrograms(
+					[
+						"function trim(m, CAP) {",
+						"  while (m.size > CAP) {",
+						`    const victim = [...m.keys()].sort(cmp)${selector};`,
+						"    m.delete(victim);",
+						"  }",
+						"}",
+					].join("\n"),
+				).map((program) => program.line),
+				`plain key through ${selector}`,
+			).toEqual([3]);
+		}
+	});
+
+	it("keeps ordering and size facts tied to their own binding", () => {
+		// A sibling function's `const history = rows.sort(cmp)` says nothing about
+		// a Map parameter named `history` here (#4606 r2 review round 2): the
+		// ordered-array fact used to be file-scoped, so this scan was skipped.
+		expect(
+			findEvictionPrograms(
+				[
+					"function rank(rows) {",
+					"  const history = rows.sort(cmp);",
+					"  return history;",
+					"}",
+					"function trim(history, CAP) {",
+					"  while (history.size > CAP) {",
+					"    let victim;",
+					"    for (const key of history) victim = key;",
+					"    history.delete(victim);",
+					"  }",
+					"}",
+				].join("\n"),
+			).map((program) => program.line),
+			"a sibling's ordered binding is not this loop's",
+		).toEqual([8]);
+		// A comment or string that spells `.sort(` is not an ordering call either
+		// (AGENTS.md shape 43).
+		expect(
+			findEvictionPrograms(
+				[
+					"function trim(rows, CAP) {",
+					'  const history = getRows(rows, ".sort(");',
+					"  while (history.size > CAP) {",
+					"    let victim;",
+					"    for (const key of history) victim = key;",
+					"    history.delete(victim);",
+					"  }",
+					"}",
+				].join("\n"),
+			).map((program) => program.line),
+			"a string naming `.sort(` is not an ordering call",
+		).toEqual([5]);
+	});
+
+	it("resolves the early-return complement, a ceiling call, and a length cap", () => {
+		// The guard may stand OUTSIDE the program: a complement early return, a
+		// ceiling read through a call, or an in-place truncation under its own
+		// length cap all bound the same sequence.
+		expect(
+			findEvictionPrograms(
+				[
+					"function trim(m, CAP) {",
+					"  if (m.size <= CAP) return;",
+					"  const victim = [...m.entries()].sort(cmp)[0];",
+					"  evictEntry(victim[0]);",
+					"}",
+				].join("\n"),
+			).map((program) => program.line),
+		).toEqual([3]);
+		expect(
+			findEvictionPrograms(
+				[
+					"function trim(m, getCeiling) {",
+					"  const occupied = occupiedKeys.size;",
+					"  if (occupied < getCeiling()) return true;",
+					"  const idle = [...m.entries()].sort(cmp);",
+					"  const victim = idle[0];",
+					"  const [key, client] = victim;",
+					"  retireClient(key);",
+					"}",
+				].join("\n"),
+			).map((program) => program.line),
+		).toEqual([4]);
+		expect(
+			findEvictionPrograms(
+				[
+					"const MAX_ROWS = 8;",
+					"function trim(rows) {",
+					"  if (rows.length > MAX_ROWS) {",
+					"    rows.sort(byAge);",
+					"    rows.length = MAX_ROWS;",
+					"  }",
+					"}",
+				].join("\n"),
+			).map((program) => program.line),
+		).toEqual([5]);
+	});
+
+	it("does NOT flag a peek, a ranking read, an unrelated delete, or prose", () => {
+		// Each refusal removes exactly one stage from an admitted form.
+		expect(
+			findEvictionPrograms(
+				[
+					"export function getCurrentPhase() {",
+					"  const oldest = liveBrackets.keys().next();",
+					"  return oldest.done ? undefined : oldest.value;",
 					"}",
 				].join("\n"),
 			),
+			"a peek never removes",
 		).toEqual([]);
-	});
-
-	it("bare form does NOT flag a break+delete guarded only by a `size === 0` early return (#2460 round-3 review F2)", () => {
-		// A `size === 0` early-return guard above an unconditional single-item
-		// drain is a `.size` mention too, but it is not a bounded LOOP — the
-		// drain runs once regardless of size, it does not loop "while too big".
 		expect(
-			findEvictionLines(
+			findEvictionPrograms(
 				[
-					"function drainOne(set) {",
-					"  if (set.size === 0) return;",
-					"  for (const item of set) {",
-					"    set.delete(item);",
-					"    break;",
+					"function lastCandidates(candidates) {",
+					"  candidates.sort(byPriority);",
+					"  const selected = candidates[0];",
+					"  return selected;",
+					"}",
+				].join("\n"),
+			),
+			"a ranking read evicts nothing",
+		).toEqual([]);
+		expect(
+			findEvictionPrograms(
+				[
+					"while (m.size > CAP) {",
+					"  const oldest = m.keys().next();",
+					"  if (oldest.done) break;",
+					"  m.delete(other.key);",
+					"}",
+				].join("\n"),
+			),
+			"the removal names a different key",
+		).toEqual([]);
+		expect(
+			findEvictionPrograms(
+				[
+					"function sweep(m, CAP) {",
+					"  while (m.size > CAP) {",
+					"    for (const key of m.keys()) if (pred(key)) m.delete(key);",
 					"  }",
 					"}",
 				].join("\n"),
 			),
+			"a filtered drain chooses no victim",
+		).toEqual([]);
+		expect(
+			findEvictionPrograms(
+				[
+					"function trim(rows, CAP) {",
+					"  if (rows.length > CAP) {",
+					"    const victim = [...rows].sort(cmp)[0];",
+					"    consume(victim);",
+					"  }",
+					"}",
+				].join("\n"),
+			),
+			"an ordered ARRAY of values is scanned, not evicted",
+		).toEqual([]);
+		expect(
+			findEvictionPrograms(
+				[
+					"function pick(m) {",
+					"  const victim = [...m.entries()].sort(cmp)[0];",
+					"  evictFile(victim[0]);",
+					"}",
+				].join("\n"),
+			),
+			"a hand-off with no cap at all is a ranking",
+		).toEqual([]);
+		expect(
+			findEvictionPrograms(
+				[
+					"function drain(queue) {",
+					"  while (queue.length > 0) {",
+					"    const head = queue.keys().next();",
+					"    if (head.done) break;",
+					"    queue.delete(head.value);",
+					"  }",
+					"}",
+				].join("\n"),
+			),
+			"a loop bounded by emptiness has no cap to exceed",
+		).toEqual([]);
+		expect(
+			findEvictionPrograms(
+				[
+					"// while (m.size > CAP) { const victim = [...m.entries()].sort(cmp)[0]; m.delete(victim[0]); }",
+					'const note = "const oldest = m.keys().next(); m.delete(oldest.value);";',
+					"const unrelated = 1;",
+				].join("\n"),
+			),
+			"prose is not a program",
+		).toEqual([]);
+	});
+
+	it("does NOT flag a count window or a display truncation", () => {
+		// A count that states a size is not a cap, and a string window is never
+		// eviction: both would otherwise ride the retention row.
+		expect(
+			findEvictionPrograms(
+				[
+					"const targets = [...docs]",
+					"  .sort(bySize)",
+					"  .slice(0, editCount);",
+				].join("\n"),
+			),
+			"no cap, no retention",
+		).toEqual([]);
+		expect(
+			findEvictionPrograms(
+				[
+					"function firstKeyChange(before, after) {",
+					"  const added = [...after].filter((key) => !before.has(key)).sort();",
+					"  if (added.length > 0) return `added ${added[0]}`;",
+					"  return 'none';",
+					"}",
+				].join("\n"),
+			),
+			"a zero threshold is emptiness",
+		).toEqual([]);
+		expect(
+			findEvictionPrograms(
+				[
+					"function median(values) {",
+					"  const sorted = [...values].sort((a, b) => a - b);",
+					"  return sorted[Math.floor(sorted.length / 2)];",
+					"}",
+				].join("\n"),
+			),
+			"index arithmetic is not a truncation",
+		).toEqual([]);
+		expect(
+			findEvictionPrograms(
+				[
+					"const TAIL_LINES = 5;",
+					"function tail(output) {",
+					"  const record = {",
+					'    tail: output.split("\\n").slice(-TAIL_LINES).join("\\n"),',
+					"  };",
+					"  writeFileSync(path, JSON.stringify(record));",
+					"}",
+				].join("\n"),
+			),
+			"a string window is capped for display",
 		).toEqual([]);
 	});
 
@@ -441,7 +1139,9 @@ describe("#2442 no new hand-rolled evict-oldest idiom outside bounded-cache.ts",
 		// content-derived key (#2475: `path#symbol:hash` or `path#hash`, never a
 		// bare line number — see `stableOccurrenceKey`).
 		for (const item of flagged) {
-			expect(item).toMatch(/^[\w./-]+\.ts#(?:[A-Za-z_$][\w$]*:)?[0-9a-f]{8}$/);
+			expect(item).toMatch(
+				/^[\w./-]+\.(?:ts|mjs|js)#(?:[A-Za-z_$][\w$]*:)?[0-9a-f]{8}$/,
+			);
 		}
 		const exemptedFiles = new Set(
 			Object.keys(EXEMPT_SITES).map((k) => k.split("#")[0]),
@@ -465,30 +1165,30 @@ describe("#2442 no new hand-rolled evict-oldest idiom outside bounded-cache.ts",
 	// SAME string to itself when two occurrences hash to one key — it cannot
 	// distinguish "this occurrence is exempted" from "some occurrence sharing
 	// this key is exempted". This test runs a REAL twin-collision fixture
-	// through the actual detection pipeline (`findEvictionLines` +
-	// `stableOccurrenceKey`, not a hand-typed key) and proves `auditRegistry`
-	// itself refuses to let one exemption cover both — the property the
-	// vacuous test above could never have caught.
+	// through the actual detection pipeline, and proves `auditRegistry` itself
+	// refuses to let one exemption cover both.
 	it("ATTACK_TWIN_OCCURRENCE_COLLISION (#2487 review F1): two sibling methods with an identical flagged line cannot share one exemption", () => {
 		const rel = "clients/__probe_twin_cache.ts";
 		const source = [
 			"class ProbeTwinCache {",
 			"\tevictFirst() {",
-			"\t\tfor (const k of this.map.keys()) {",
-			"\t\t\tthis.map.delete(k);",
-			"\t\t\tbreak;",
+			"\t\tlet victim;",
+			"\t\twhile (this.map.size > CAP) {",
+			"\t\t\tfor (const k of this.map.keys()) victim = k;",
+			"\t\t\tthis.map.delete(victim);",
 			"\t\t}",
 			"\t}",
 			"\tevictSecond() {",
-			"\t\tfor (const k of this.map.keys()) {",
-			"\t\t\tthis.map.delete(k);",
-			"\t\t\tbreak;",
+			"\t\tlet victim;",
+			"\t\twhile (this.map.size > CAP) {",
+			"\t\t\tfor (const k of this.map.keys()) victim = k;",
+			"\t\t\tthis.map.delete(victim);",
 			"\t\t}",
 			"\t}",
 			"}",
 		].join("\n");
 		const evictionLines = findEvictionLines(source);
-		expect(evictionLines).toEqual([3, 9]); // both flagged by the REAL detector
+		expect(evictionLines).toEqual([5, 12]); // both flagged by the REAL detector
 		const lines = source.split("\n");
 		const twinOccurrences = evictionLines.map((line) => ({
 			key: stableOccurrenceKey(rel, lines, line - 1),
@@ -510,24 +1210,17 @@ describe("#2442 no new hand-rolled evict-oldest idiom outside bounded-cache.ts",
 		});
 		expect(laundered.problems.join("\n")).toContain("collide");
 
-		// The remedy this sweep ships (#2487 review round 3 F1): NOT an
-		// auto-numbered ordinal — `disambiguateFlaggedKeys` shipped that and was
-		// deleted, because numbering by SCAN POSITION let a genuinely new,
-		// unreviewed occurrence ride an existing exemption's ordinal the moment
-		// it landed between two already-exempted ones (proved against
-		// `sync-child-process-timeout.test.ts`'s real collision in that same
-		// review round). The actual remedy is the message's own instruction:
-		// "give each occurrence a distinguishing key ... before exempting
-		// either" — a human edits the flagged line's own text so its content
-		// hash genuinely differs, which is what distinguishes two occurrences
-		// that a mechanical scan cannot tell apart on its own.
+		// The remedy this sweep ships is the message's own instruction: a human
+		// edits the flagged line's own text so its content hash genuinely
+		// differs, which is what distinguishes two occurrences a mechanical scan
+		// cannot tell apart on its own.
 		const distinguishedSource = source.replace(
-			"\tevictSecond() {\n\t\tfor (const k of this.map.keys()) {",
-			"\tevictSecond() {\n\t\tfor (const key of this.map.keys()) {",
+			"\tevictSecond() {\n\t\tlet victim;\n\t\twhile (this.map.size > CAP) {\n\t\t\tfor (const k of this.map.keys()) victim = k;",
+			"\tevictSecond() {\n\t\tlet victim;\n\t\twhile (this.map.size > CAP) {\n\t\t\tfor (const key of this.map.keys()) victim = key;",
 		);
 		const distinguishedLines = distinguishedSource.split("\n");
 		const distinguishedEvictionLines = findEvictionLines(distinguishedSource);
-		expect(distinguishedEvictionLines).toEqual([3, 9]); // same lines...
+		expect(distinguishedEvictionLines).toEqual([5, 12]); // same lines...
 		const distinguishedOccurrences = distinguishedEvictionLines.map((line) => ({
 			key: stableOccurrenceKey(rel, distinguishedLines, line - 1),
 			detail: `${rel}:${line}`,
@@ -551,6 +1244,52 @@ describe("#2442 no new hand-rolled evict-oldest idiom outside bounded-cache.ts",
 		expect(properlyExempted.problems).toEqual([]);
 	});
 
+	it("accounts for the live programs the recognizer refuses", () => {
+		// The detector's population is not the tree's. Each refusal is proved a
+		// miss against the REAL recognizer and EVERY anchor is re-read from the
+		// real file, so a row can neither go stale nor describe a site that
+		// migrated, and a row with two sites cannot hide the second flagging
+		// (#4606 r2 F3).
+		const rows = Object.entries(REFUSED_PROGRAMS);
+		expect(rows.length).toBeGreaterThanOrEqual(6);
+		const { witnesses, anchorsChecked } = refusalWitnesses(
+			REFUSED_PROGRAMS,
+			(file) => fs.readFileSync(path.join(REPO_ROOT, file), "utf8"),
+		);
+		expect(witnesses, witnesses.join("\n")).toEqual([]);
+		// Pin what the loop performed: an emptied row set, or a row whose anchor
+		// matched nothing, must not read as proof (#4580 r6 F3).
+		expect(anchorsChecked).toBe(
+			rows.reduce((total, [, row]) => total + row.count, 0),
+		);
+	});
+
+	it("ATTACK_REFUSAL_SECOND_ANCHOR: a row with two anchors reds when the SECOND one starts flagging", () => {
+		// #4606 r2 F3: `anchors[0]` was the only compared line, so the second of
+		// a row's two sites could start being flagged while the row stayed green.
+		// The first anchor here is a ranking read (refused); the second is the
+		// same statement inside a bounded loop that removes the victim (flagged).
+		const anchor = "const victim = [...m.entries()].sort(cmp)[0];";
+		const source = [
+			"function rank(m) {",
+			`  ${anchor}`,
+			"  return victim;",
+			"}",
+			"function trim(m, CAP) {",
+			"  while (m.size > CAP) {",
+			`    ${anchor}`,
+			"    m.delete(victim[0]);",
+			"  }",
+			"}",
+		].join("\n");
+		const { witnesses, anchorsChecked } = refusalWitnesses(
+			{ probe: { file: "probe.ts", anchor, count: 2 } },
+			() => source,
+		);
+		expect(anchorsChecked).toBe(2);
+		expect(witnesses.join("\n")).toContain("probe.ts:7");
+	});
+
 	it("every occurrence is the definition file, migrated, or exempted with a reason", () => {
 		const audit = auditRegistry({
 			sweepName: "bounded-eviction-idiom sweep",
@@ -558,10 +1297,14 @@ describe("#2442 no new hand-rolled evict-oldest idiom outside bounded-cache.ts",
 			registered: [],
 			exemptions: EXEMPT_SITES,
 			scannedCount: scanned,
-			// Calibration: ~450 shipped .ts files across clients/tools/mcp/index.ts
-			// as of #2442; half rounded down is comfortably under that.
-			minScanned: 200,
-			minFlagged: 1,
+			// Calibration: ~789 shipped files across clients/tools/mcp/scripts/
+			// tests/support/index.ts as of #4606 S1; half rounded down is
+			// comfortably under that.
+			minScanned: 300,
+			// The structural population is 24 programs: 16 the lexical detector also
+			// saw, 8 it could not (7 from #4606's measurement plus the script-side
+			// `pushTop` cap). A lost member must red, so the floor is the count.
+			minFlagged: 24,
 			remediation:
 				"Migrate the site to BoundedLruCache (get() re-inserts — LRU), " +
 				"BoundedFifoMap (get() never re-inserts — FIFO), or BoundedSet " +
@@ -573,8 +1316,17 @@ describe("#2442 no new hand-rolled evict-oldest idiom outside bounded-cache.ts",
 				"`stableOccurrenceKey` from tests/support/sweep-kit.ts — " +
 				"`path#symbol:hash` or `path#hash`, printed above) with a real " +
 				"reason (see #2442's PR body verdict table for the shape of a " +
-				"legitimate exemption).",
+				"legitimate exemption). A shape the structural recognizer cannot " +
+				"place is a REFUSED_PROGRAMS row: it names the stage the shape " +
+				"lacks and the live site, never a silent pass.",
 		});
 		expect(audit.problems, audit.problems.join("\n")).toEqual([]);
+		const byForm = new Map<string, number>();
+		for (const occurrence of occurrences)
+			byForm.set(occurrence.form, (byForm.get(occurrence.form) ?? 0) + 1);
+		process.stdout.write(
+			`bounded-eviction population: ${flagged.length} flagged, ${audit.problems.length} problems, ${REFUSED_PROGRAMS && Object.keys(REFUSED_PROGRAMS).length} refused live programs, ${scanned} source files\n` +
+				`bounded-eviction stages: ${EVICTION_FORMS.map((form) => `${form} ${byForm.get(form) ?? 0}`).join(", ")}\n`,
+		);
 	});
 });

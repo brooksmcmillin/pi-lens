@@ -84,7 +84,10 @@ describe("runWorkspaceDiagnostics — service destroyed mid-sweep (#1618)", () =
 			getRawCapabilityKeys: () => [],
 			serverId: "typescript",
 			root: tmp,
-			notify: { open: vi.fn(async () => {}) },
+			notify: {
+				announceCreated: () => undefined,
+				open: vi.fn(async () => {}),
+			},
 			waitForDiagnostics: vi.fn(async () => {
 				waitCalls += 1;
 				if (waitCalls === DESTROY_AFTER_CALLS) {

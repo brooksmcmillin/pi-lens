@@ -17,7 +17,7 @@ import {
 	runPerServerGroups,
 } from "../clients/lsp/capabilities.js";
 import {
-	buildScopeKey,
+	buildProbeScopeKey,
 	createWorkspaceDiagnosticsCacheContext,
 	type WorkspaceDiagnosticsCacheContext,
 } from "../clients/lsp/workspace-diagnostics-cache.js";
@@ -38,29 +38,36 @@ import {
 } from "../clients/deadline-utils.js";
 import {
 	applyAuxiliarySuppressions,
+	configDisabledAuxiliaryLspServerIds,
 	retagAuxiliaryDiagnostics,
 } from "../clients/dispatch/auxiliary-lsp.js";
 import {
 	applyLspFindingPolicy,
 	loadProjectRulePolicyMap,
 } from "../clients/dispatch/finding-policy.js";
+import { readFileContent } from "../clients/dispatch/runners/utils.js";
 import { hasStrictDispositionMarks } from "../clients/diagnostic-dispositions.js";
+import { dispositionSuppressedLine } from "../clients/finding-delivery-gate.js";
 import { recordDegradationOnce } from "../clients/degradation-ledger.js";
 import { logLatency } from "../clients/latency-logger.js";
 import { detectFileRole } from "../clients/file-role.js";
 import type { LSPDiagnostic } from "../clients/lsp/client.js";
 import {
+	combinePrimaryUnavailableCauses,
 	hashDiagnosticContent,
+	PRIMARY_UNAVAILABLE_CAUSE,
+	primaryUnavailableCause,
 	touchCompletedConfirmationPolicy,
 	touchCoverageGap,
 	type DiagnosticBinding,
+	type PrimaryUnavailableCause,
 	type TouchFileResult,
 } from "../clients/lsp/diagnostic-binding.js";
 import { classifyCascadeWaitTier } from "../clients/lsp/wait-policy/index.js";
 import { attemptTsserverSyncDiagnostics } from "../clients/lsp/tsserver-sync.js";
 import { convertLspDiagnostics } from "../clients/dispatch/utils/lsp-diagnostics.js";
 import { demoteInferredProjectDiagnostics } from "../clients/lsp/inferred-project.js";
-import { normalizeMapKey } from "../clients/path-utils.js";
+import { normalizeMapKey, resolveHostToolPath } from "../clients/path-utils.js";
 import {
 	countRetainedSuppressedRows,
 	isBlocking,
@@ -76,6 +83,10 @@ import {
 	SCAN_LANGUAGE_PRIORITY,
 } from "../clients/language-registry.js";
 import { exceedsLspSyncLimits } from "../clients/lsp/content-limits.js";
+import {
+	goPackageFilesToAnnounce,
+	importTargetsToAnnounce,
+} from "../clients/lsp/created-import-targets.js";
 
 const MAX_FILES = 100;
 export const MAX_BATCH_FILES = 100;
@@ -102,6 +113,15 @@ type LspHealthLike = {
 	serverCountReady?: number;
 	candidateServerIds?: string[];
 	mergedCount?: number;
+	unavailablePrimaryServerIds?: readonly string[];
+	disabledPrimaryServerIds?: readonly string[];
+	primaryUnavailableCause?: PrimaryUnavailableCause;
+};
+
+/** #4403: how many unconfirmed files no primary answered for, and why. */
+type PrimaryUnavailableTally = {
+	count: number;
+	cause: PrimaryUnavailableCause | undefined;
 };
 
 type BatchOptions = {
@@ -127,7 +147,19 @@ type BatchOptions = {
 	// retires the same stale verdicts a single-file check does. A sibling surface
 	// left without it would be the very defect this fixes, one call site over.
 	onConfirmedNoBlockers?: (info: ConfirmedNoBlockersInfo) => void;
+	// #4323: auxiliaries the operator's configuration turns off; never acquired.
+	excludeServerIds?: ReadonlySet<string>;
 };
+
+/**
+ * #4323: the host's flag resolver (`getLensFlag` in pi, the config-backed
+ * `createMcpHost().getFlag` in the MCP server), for the project `cwd` the call
+ * runs in.
+ */
+export type LspDiagnosticsFlagReader = (
+	name: string,
+	cwd: string,
+) => boolean | string | undefined;
 
 type FileDiag = {
 	file: string;
@@ -147,6 +179,12 @@ type FileDiagnosticResult = {
 	unavailable?: string;
 	error?: string;
 	inconclusiveReason?: string;
+	/** #4322: see `DiagnosticsCollectionResult.primaryUnavailable`. */
+	primaryUnavailable?: string;
+	/** #4403: see `DiagnosticsCollectionResult.primaryUnavailableCause`. */
+	primaryUnavailableCause?: PrimaryUnavailableCause;
+	/** #4322: see `DiagnosticsCollectionResult.noClientAnswered`. */
+	noClientAnswered?: true;
 	/**
 	 * #533: discriminated per-file outcome, mirroring the #240 doctrine at the
 	 * LSP layer (found | clean | unresolved) up through the tool's aggregation.
@@ -399,6 +437,12 @@ export function createLspDiagnosticsTool(
 	// `runtime.retireInlineBlockerOnConfirmedClean`. Optional/undefined in tests.
 	onConfirmedNoBlockers?: (info: ConfirmedNoBlockersInfo) => void,
 	getService: () => ReturnType<typeof getLSPService> = getLSPService,
+	// #4323: the write-time runner leaves an auxiliary the operator turned off
+	// (`--no-opengrep`, `opengrep.enabled=false`) unstarted; this probe asks the
+	// same owner, `configDisabledAuxiliaryLspServerIds`, through the host's
+	// flag resolver. Both hosts inject it (index.ts, mcp/server.ts); omitted
+	// in tests, where no flag is set.
+	getFlag?: LspDiagnosticsFlagReader,
 ) {
 	return {
 		async execute(
@@ -424,6 +468,9 @@ export function createLspDiagnosticsTool(
 				concurrency?: number;
 				waitMs?: number;
 				serverScope?: string;
+				// #4577 R2-2: internal provenance, set only by
+				// `tools/lens-diagnostics.ts` when it injects its own cwd default.
+				pathAlreadyResolved?: boolean;
 			};
 			const severity = (typedParams.severity ?? "all") as string;
 			const cwd = ctx.cwd ?? process.cwd();
@@ -439,6 +486,9 @@ export function createLspDiagnosticsTool(
 					: undefined;
 			const serverScope: "primary" | "all" =
 				typedParams.serverScope === "primary" ? "primary" : "all";
+			const excludeServerIds = getFlag
+				? configDisabledAuxiliaryLspServerIds((name) => getFlag(name, cwd))
+				: undefined;
 
 			const lspService = getService();
 			if (!lspService) {
@@ -487,17 +537,15 @@ export function createLspDiagnosticsTool(
 				// scalar `path` route's own bounded walk (#3965) — reaching the
 				// per-file collector verbatim counted a `failed` outcome for the
 				// directory and silently dropped its whole subtree.
-				// #3160/#3182: `path.resolve(cwd, entry)` folds dot segments (and
-				// separators) structurally — it ignores `cwd` whenever `entry` is
-				// already absolute, so the old `path.isAbsolute` ternary is
-				// redundant. `normalizeMapKey` then adopts on-disk CASING where the
-				// path exists — an agent-typed, possibly mis-cased `paths` entry
-				// must key `reconcileScanDiagnostics`'s widget-state write the same
-				// way a canonical writer (clients/pipeline.ts's ctx.filePath) or the
-				// #3160-fixed lens_diagnostic_mark reader would. `path.resolve`
-				// stays required for the relative→absolute step: `normalizeMapKey`
-				// folds dot segments itself since #3184, but never resolves against
-				// `cwd` (a cwd fold there broke every monorepo, #2490).
+				// #4577 M2: each entry is a host-supplied tool path, so the
+				// relative→absolute step is the shared host resolver
+				// (`resolveHostToolPath`: `~`/`~/`, `file://`, `@` prefix, unicode
+				// spaces), which also ignores `cwd` whenever the entry is already
+				// absolute. `normalizeMapKey` still needs it — it never resolves
+				// against `cwd` (a cwd fold there broke every monorepo, #2490) — and
+				// then adopts on-disk CASING so an agent-typed, possibly mis-cased
+				// entry keys `reconcileScanDiagnostics`'s widget-state write the same
+				// way a canonical writer (clients/pipeline.ts's ctx.filePath) does.
 				const expanded = await expandPathsToFiles(cwd, rawPaths);
 				if (expanded.files.length === 0) {
 					// A requested directory with no eligible file (empty, unreadable,
@@ -530,6 +578,7 @@ export function createLspDiagnosticsTool(
 						serverScope,
 						cwd,
 						onConfirmedNoBlockers,
+						excludeServerIds,
 					},
 					expanded,
 				);
@@ -553,7 +602,25 @@ export function createLspDiagnosticsTool(
 			// `reconcileScanDiagnostics`, whose `normalizeEphemeralMapKey` key
 			// derivation folds neither dot segments nor casing. Same expression as
 			// :444 so both modes of this tool write under ONE key per file.
-			const absPath = normalizeMapKey(path.resolve(cwd, rawPath));
+			// #4577 M2: the entry is a host-supplied tool path like any other, so it
+			// resolves through the shared host resolver (`~`/`~/` expansion,
+			// `file://`, `@` prefix, unicode spaces). `normalizeMapKey` then adopts
+			// on-disk CASING where the path exists — an agent-typed, possibly
+			// mis-cased `path` entry must key `reconcileScanDiagnostics`'s
+			// widget-state write the same way a canonical writer
+			// (clients/pipeline.ts's ctx.filePath) does. A bare `path.resolve(cwd,
+			// rawPath)` pinned `~/x` under the session cwd, a path that cannot
+			// exist (#4576).
+			// #4577 R2-2: an internally generated default (`scope=workspace`'s
+			// injected cwd) is already an absolute identity, so it skips the
+			// resolver: folding its bytes named a sibling that does not exist and
+			// failed the whole scan. `normalizeMapKey` still applies — it folds no
+			// unicode spaces, only separators, dot segments and on-disk casing.
+			const absPath = normalizeMapKey(
+				typedParams.pathAlreadyResolved === true
+					? rawPath
+					: resolveHostToolPath(rawPath, cwd),
+			);
 
 			let stat: fs.Stats;
 			try {
@@ -578,6 +645,7 @@ export function createLspDiagnosticsTool(
 					serverScope,
 					cwd,
 					onConfirmedNoBlockers,
+					excludeServerIds,
 				});
 			}
 			return runFileDiagnostics(
@@ -589,6 +657,7 @@ export function createLspDiagnosticsTool(
 				serverScope,
 				cwd,
 				onConfirmedNoBlockers,
+				excludeServerIds,
 			);
 		},
 	};
@@ -628,6 +697,22 @@ type DiagnosticsCollectionResult = {
 	/** Custom navigation-only servers that supplied no diagnostic evidence. */
 	diagnosticsUnsupportedServerIds: readonly string[];
 	/**
+	 * #4322: the file has a language server, but the touch acquired only
+	 * auxiliaries (`inconclusiveReason: "primary-unavailable"`). Whatever the
+	 * result holds came from auxiliaries, so it is never a clean verdict for
+	 * the file.
+	 */
+	primaryUnavailable?: string;
+	/** #4403: why, so a count over many files can say it too. */
+	primaryUnavailableCause?: PrimaryUnavailableCause;
+	/**
+	 * #4322: this read acquired no client at all: the touch resolved none and
+	 * the `getDiagnostics` fallback's own health record says `no_clients`.
+	 * Whatever the result holds is the last known answer, from any server.
+	 * Read from this call's fallback, never from an earlier call's record.
+	 */
+	noClientAnswered?: true;
+	/**
 	 * #692: the file content read while collecting (undefined only when the
 	 * read itself failed) — reused by the widget-reconcile caller so it can
 	 * derive `fileRole` for `retagAuxiliaryDiagnostics`'s `skipTestFiles` gate
@@ -660,6 +745,9 @@ async function collectDiagnosticsForFile(
 	scanRoot: string,
 	waitMs?: number,
 	serverScope: "primary" | "all" = "all",
+	// #4323: auxiliaries the operator's configuration turns off. Both the touch
+	// and the clientless fallback below leave them unacquired.
+	excludeServerIds?: ReadonlySet<string>,
 ): Promise<DiagnosticsCollectionResult> {
 	let timedOut = false;
 	let content: string | undefined;
@@ -757,6 +845,7 @@ async function collectDiagnosticsForFile(
 			maxClientWaitMs: waitMs,
 			source: "lsp_diagnostics",
 			clientScope: serverScope,
+			excludeServerIds,
 			// #3405: the caller asked whether THIS file is clean right now, and the
 			// content above was just read from disk — so it is the file's saved
 			// state. Without the save a save-triggered server answers zero
@@ -764,7 +853,11 @@ async function collectDiagnosticsForFile(
 			// as clean.
 			saved: true,
 		});
-		timedOut = touched?.inconclusive === true;
+		// #4322: a missing language server is not a deadline; it is reported
+		// through `primaryUnavailable` below, with its own wording.
+		timedOut =
+			touched?.inconclusive === true &&
+			touched.inconclusiveReason !== "primary-unavailable";
 	} catch {
 		// Non-fatal: getDiagnostics may still have stale/health information.
 	}
@@ -781,7 +874,17 @@ async function collectDiagnosticsForFile(
 			: await lspService.getDiagnostics(
 					absPath,
 					waitMs !== undefined ? "document" : "full",
+					excludeServerIds,
 				);
+	// #4322: the fallback writes a health record on every path past root
+	// admission (touchFile declines an outside-root file before this runs), so
+	// this is the record of the answer just read.
+	const fallbackHealth =
+		touched === undefined
+			? (lspService.getDiagnosticsHealth?.(absPath) as
+					| LspHealthLike
+					| undefined)
+			: undefined;
 	// #586: honor each auxiliary profile's native inline-suppression comment
 	// (e.g. opengrep's `// nosemgrep`, #441) the same way the per-edit dispatch
 	// runner does — previously this standalone query path ignored it entirely.
@@ -809,11 +912,23 @@ async function collectDiagnosticsForFile(
 	// cut off. Excluding it would render "Primary LSP: unconfirmed" for a primary
 	// that did confirm. The coverage gap is carried separately, below.
 	const confirmedByTouch = touchCompletedConfirmationPolicy(touched);
+	const primaryUnavailable = describePrimaryUnavailable(
+		touched,
+		fallbackHealth,
+	);
+	const noClientAnswered =
+		fallbackHealth !== undefined &&
+		String(fallbackHealth.health ?? "").startsWith("no_clients");
 	return {
 		diagnostics: filtered,
 		timedOut,
 		skipReason: touched?.skipReason,
 		confirmedByTouch,
+		...(noClientAnswered && { noClientAnswered: true as const }),
+		...(primaryUnavailable !== undefined && {
+			primaryUnavailable: primaryUnavailable.text,
+			primaryUnavailableCause: primaryUnavailable.cause,
+		}),
 		// #1470: only a touch that resolved clients contributes a coverage gap;
 		// the getDiagnostics fallback never reports one, which is honest — that
 		// path claims no confirmation at all.
@@ -822,6 +937,51 @@ async function collectDiagnosticsForFile(
 			touched?.diagnosticsUnsupportedServerIds ?? [],
 		content,
 		binding,
+	};
+}
+
+/**
+ * #4322: the reason no language server answered for a file, or undefined when
+ * one did (or nothing says otherwise). Two shapes reach here: the touch
+ * acquired only auxiliaries, or none and the operator disabled the primary,
+ * and names the primaries that did not answer (`inconclusiveReason:
+ * "primary-unavailable"`); or the touch acquired no client and the
+ * `getDiagnostics` fallback acquired no primary: only auxiliaries, or no
+ * client at all (`unavailablePrimaryServerIds` non-empty). The service derives
+ * both lists with one rule (`UnansweredPrimaries` in clients/lsp/index.ts), so
+ * either way no primary answered. #4403: each record also lists the ones the
+ * operator disabled, so the cause comes from the read, not from config.
+ */
+export function describePrimaryUnavailable(
+	touched: TouchFileResult | undefined,
+	fallbackHealth: LspHealthLike | undefined,
+): { text: string; cause: PrimaryUnavailableCause } | undefined {
+	let serverIds: readonly string[];
+	let disabledServerIds: readonly string[];
+	let carriedCause: PrimaryUnavailableCause | undefined;
+	if (touched?.inconclusiveReason === "primary-unavailable") {
+		// The verdict always names the primary (clients/lsp/index.ts).
+		serverIds = touched.inconclusiveServerIds ?? [];
+		disabledServerIds = touched.disabledPrimaryServerIds ?? [];
+		carriedCause = touched.primaryUnavailableCause;
+	} else if (fallbackHealth?.unavailablePrimaryServerIds?.length) {
+		serverIds = fallbackHealth.unavailablePrimaryServerIds;
+		disabledServerIds = fallbackHealth.disabledPrimaryServerIds ?? [];
+		carriedCause = fallbackHealth.primaryUnavailableCause;
+	} else {
+		return undefined;
+	}
+	// The service computes the cause once (`unansweredPrimaries`); a record
+	// without one (an older shape or a test double) is classified from its ids.
+	const cause =
+		carriedCause ?? primaryUnavailableCause(serverIds, disabledServerIds);
+	return {
+		text:
+			`Primary LSP (${serverIds.join(", ")}): not available — no language ` +
+			`server answered for this file (${PRIMARY_UNAVAILABLE_CAUSE[cause]}). ` +
+			"NOT the same as 0 diagnostics; auxiliary scanners do not check the " +
+			"language itself.",
+		cause,
 	};
 }
 
@@ -1002,11 +1162,16 @@ type LspReconcileVerdict = {
  * for this content, so claiming coverage for it would be the #1470/#1493 lie one
  * layer up. (Today an aux gap also demotes the whole verdict to "unconfirmed",
  * so the hook does not fire at all — this stays correct if that ever narrows.)
+ *
+ * #4323: a server in `excludeServerIds` (an auxiliary the operator's
+ * configuration turns off) was never asked, so it is dropped as well; an
+ * Opengrep-origin blocker must outlive a check that left Opengrep unstarted.
  */
 function coveredSourcesForCheck(
 	file: string,
 	serverScope: "primary" | "all",
 	unconfirmedServerIds: readonly string[],
+	excludeServerIds?: ReadonlySet<string>,
 ): string[] {
 	const unconfirmed = new Set(unconfirmedServerIds);
 	const covered = new Set<string>();
@@ -1026,6 +1191,7 @@ function coveredSourcesForCheck(
 		const auxiliary = isAuxiliary(server);
 		if (auxiliary && serverScope === "primary") continue;
 		if (unconfirmed.has(server.id)) continue;
+		if (excludeServerIds?.has(server.id)) continue;
 		// The dispatch runner tags the primary language server's findings `lsp`;
 		// auxiliaries keep their own tool id.
 		covered.add(auxiliary ? server.id : "lsp");
@@ -1076,7 +1242,7 @@ function demoteInferredForFile(
  * hidden by a broken filter is the harm this lane exists to prevent
  * (AGENTS.md shape 48).
  */
-function applyProbeFindingPolicy(
+export function applyProbeFindingPolicy(
 	file: string,
 	diagnostics: LSPDiagnostic[],
 	cwd: string,
@@ -1094,6 +1260,12 @@ function applyProbeFindingPolicy(
 	 * other caller (`mode=full`) has no severity axis at all.
 	 */
 	severity: string,
+	/**
+	 * The tool whose result renders this filter's output, stamped on the
+	 * `lsp_probe_disposition_filter` record (#4459 review F5: the
+	 * `lsp_navigation` route's records said `lsp_diagnostics`).
+	 */
+	toolName: "lsp_diagnostics" | "lsp_navigation" = "lsp_diagnostics",
 ): { kept: LSPDiagnostic[]; inlineKept: LSPDiagnostic[]; suppressed: number } {
 	const started = Date.now();
 	try {
@@ -1125,7 +1297,7 @@ function applyProbeFindingPolicy(
 			// `retainedSuppressed` is what the footer chip is still counting.
 			logLatency({
 				type: "phase",
-				toolName: "lsp_diagnostics",
+				toolName,
 				filePath: file,
 				phase: "lsp_probe_disposition_filter",
 				durationMs: Date.now() - started,
@@ -1160,14 +1332,9 @@ function replayContentForStrictMarks(
 	file: string,
 	cwd: string,
 ): string | undefined {
-	if (!hasStrictDispositionMarks(cwd)) return undefined;
-	try {
-		return fs.readFileSync(file, "utf-8");
-	} catch {
-		// Fail open — an unreadable file degrades to the weak-anchored filter
-		// rather than hiding or dropping anything.
-		return undefined;
-	}
+	// Fail open — an unreadable file degrades to the weak-anchored filter
+	// rather than hiding or dropping anything.
+	return hasStrictDispositionMarks(cwd) ? readFileContent(file) : undefined;
 }
 
 /** #1561: everything the retire decision needs, as one argument. */
@@ -1199,7 +1366,15 @@ function reconcileWidgetFromLspResult(
 	// footer's `touchedAt` isn't re-armed to now() and the mtime-staleness gate
 	// stays live (the #1092 re-arming defect).
 	observedAt?: number,
+	// #4322: true when no language server answered (`primaryUnavailable`).
+	// Auxiliaries' findings are not the file's current view: reconciling them
+	// would replace the footer's language rows with the scanners' rows alone, and
+	// a non-blocking scanner finding would retire a language-server blocker
+	// (`coveredSourcesForCheck` would claim `lsp`). Same verdict as #1095's
+	// stale view: not confirmed, still blocking.
+	auxiliariesOnly = false,
 ): LspReconcileVerdict {
+	if (auxiliariesOnly) return { confirmed: false, blocking: true };
 	const confirmed =
 		(rawDiags.length > 0 || confirmation !== "unconfirmed") && !boundMismatch;
 	if (!confirmed) return { confirmed: false, blocking: true };
@@ -1258,6 +1433,8 @@ async function collectFileDiagnosticResult(
 	// FRESH observation — never on the cache-hit replay below, whose `rawDiags`
 	// are an OLD observation (#1093) and therefore no evidence about now.
 	onConfirmedNoBlockers?: (info: ConfirmedNoBlockersInfo) => void,
+	// #4323: see `BatchOptions.excludeServerIds`.
+	excludeServerIds?: ReadonlySet<string>,
 ): Promise<FileDiagnosticResult> {
 	// Reserve the ordering token when this diagnostic operation starts, not when
 	// its LSP promise settles. A slower old result must not receive a newer token
@@ -1352,12 +1529,16 @@ async function collectFileDiagnosticResult(
 		binding,
 		tooLargeReason,
 		skipReason,
+		primaryUnavailable,
+		primaryUnavailableCause,
+		noClientAnswered,
 	} = await collectDiagnosticsForFile(
 		file,
 		lspService,
 		cwd,
 		waitMs,
 		serverScope,
+		excludeServerIds,
 	);
 	if (tooLargeReason !== undefined) {
 		return { file, diagnostics: [], outcome: "too_large", tooLargeReason };
@@ -1378,7 +1559,7 @@ async function collectFileDiagnosticResult(
 		// No diagnostic provider and no push evidence is a capability boundary,
 		// not a clean result and not a timeout.
 		confirmation = undefined;
-	} else if (skipReason !== undefined) {
+	} else if (skipReason !== undefined || primaryUnavailable !== undefined) {
 		confirmation = "unconfirmed";
 	} else if (timedOut) {
 		if (applySeverityFilter(rawDiags, severity).length === 0) {
@@ -1447,6 +1628,7 @@ async function collectFileDiagnosticResult(
 		// #3505 r1 F1: the widget row is observed at the read, as the cache
 		// entry recorded below is.
 		scannedAt,
+		primaryUnavailable !== undefined,
 	);
 	if (verdict.confirmed && !verdict.blocking) {
 		onConfirmedNoBlockers?.({
@@ -1456,6 +1638,7 @@ async function collectFileDiagnosticResult(
 				file,
 				serverScope,
 				unconfirmedServerIds,
+				excludeServerIds,
 			),
 			cwd,
 		});
@@ -1501,6 +1684,11 @@ async function collectFileDiagnosticResult(
 		timedOut: confirmation === "unconfirmed" ? timedOut : undefined,
 		...(rootFallback && { rootFallback }),
 		...(skipReason !== undefined && { skipReason }),
+		...(primaryUnavailable !== undefined && {
+			primaryUnavailable,
+			primaryUnavailableCause,
+		}),
+		...(noClientAnswered && { noClientAnswered }),
 		primaryServerId: primaryServerId(file),
 		diagnosticsUnsupported: diagnosticsUnsupportedServerIds.length > 0,
 		...(policy.suppressed > 0 && {
@@ -1520,10 +1708,19 @@ async function runFileDiagnostics(
 	// #1561: see `createLspDiagnosticsTool`'s parameter doc. This is the path the
 	// live incident took (`mode: "file"`).
 	onConfirmedNoBlockers?: (info: ConfirmedNoBlockersInfo) => void,
+	// #4323: see `BatchOptions.excludeServerIds`.
+	excludeServerIds?: ReadonlySet<string>,
 ) {
 	// Reserve the token before awaiting this file's LSP result. The direct-file
 	// path performs its own confirmation/reconciliation below (#1198).
 	const writeIndex = nextWriteIndex?.();
+	// #4346: a module this file imports, created outside pi-lens, reaches its
+	// servers before the touch (the batch path gates this on cached findings;
+	// one file needs no gate), and so do a Go file's package files.
+	lspService.announceCreatedFiles([
+		...goPackageFilesToAnnounce([absPath]),
+		...(await importTargetsToAnnounce(cwd, [absPath])),
+	]);
 	// #3505 r2: the widget row is observed at the read, not after the touch.
 	const observedAt = Date.now();
 	const {
@@ -1536,12 +1733,14 @@ async function runFileDiagnostics(
 		binding,
 		tooLargeReason,
 		skipReason,
+		primaryUnavailable,
 	} = await collectDiagnosticsForFile(
 		absPath,
 		lspService,
 		cwd,
 		waitMs,
 		serverScope,
+		excludeServerIds,
 	);
 	if (tooLargeReason !== undefined) {
 		return {
@@ -1575,7 +1774,7 @@ async function runFileDiagnostics(
 	let confirmation: "clean" | "unconfirmed" | undefined;
 	if (diagnosticsUnsupportedServerIds.length > 0) {
 		confirmation = undefined;
-	} else if (skipReason !== undefined) {
+	} else if (skipReason !== undefined || primaryUnavailable !== undefined) {
 		confirmation = "unconfirmed";
 	} else if (timedOut) {
 		if (applySeverityFilter(rawDiags, severity).length === 0) {
@@ -1650,6 +1849,7 @@ async function runFileDiagnostics(
 		collectedContent,
 		boundMismatch,
 		observedAt,
+		primaryUnavailable !== undefined,
 	);
 	// #1561: a confirmed current view with nothing at the blocking tier retires
 	// this file's stale inline blocker — the store #571 corrected the footer for
@@ -1663,6 +1863,7 @@ async function runFileDiagnostics(
 				absPath,
 				serverScope,
 				unconfirmedServerIds,
+				excludeServerIds,
 			),
 			cwd,
 		});
@@ -1676,6 +1877,9 @@ async function runFileDiagnostics(
 	// auxiliary findings exist — a wall of ast-grep/opengrep noise must never
 	// bury whether the actual language server confirmed the file clean.
 	const primaryLine = (() => {
+		// #4322: the language server never answered, so neither "timed out" nor
+		// "silent-on-clean" describes it.
+		if (primaryUnavailable !== undefined) return primaryUnavailable;
 		if (diagnosticsUnsupportedServerIds.length > 0) {
 			return `Primary LSP${primaryId ? ` (${primaryId})` : ""}: navigation-only — diagnostics unsupported (no pull provider or publish evidence).`;
 		}
@@ -1725,12 +1929,26 @@ async function runFileDiagnostics(
 	// (AGENTS.md shape 10). Bounded: one line per call, whatever the count.
 	const suppressedLine = dispositionSuppressedLine(policy.suppressed);
 
+	// #4323 (#4391 F8): an auxiliary the operator turned off never ran, so a bare
+	// "No auxiliary findings." would read like a scanner result. Name it. A
+	// primary-only check never asks an auxiliary, so it keeps the plain line.
+	const switchedOffServerIds =
+		serverScope === "all" && excludeServerIds && excludeServerIds.size > 0
+			? getServersForFileWithConfig(absPath).flatMap((server) =>
+					excludeServerIds.has(server.id) ? [server.id] : [],
+				)
+			: [];
+	const noAuxiliaryLine =
+		switchedOffServerIds.length > 0
+			? `No auxiliary findings. Switched off, not run: ${switchedOffServerIds.join(", ")}.`
+			: "No auxiliary findings.";
+
 	let text: string;
 	if (total === 0) {
 		text = [
 			primaryLine,
 			"",
-			unavailable ?? "No auxiliary findings.",
+			unavailable ?? noAuxiliaryLine,
 			...(coverageLine ? [coverageLine] : []),
 			...(suppressedLine ? [suppressedLine] : []),
 		].join("\n");
@@ -1783,6 +2001,7 @@ async function runFileDiagnostics(
 			navigationOnlyFiles:
 				diagnosticsUnsupportedServerIds.length > 0 ? 1 : undefined,
 			...(skipReason !== undefined && { skipReason }),
+			...(primaryUnavailable !== undefined && { primaryUnavailable }),
 			...(rootFallback && {
 				rootFallbackReason: describeRootFallback(rootFallback),
 			}),
@@ -1809,6 +2028,7 @@ function tallyConfirmation(results: FileDiagnosticResult[]): {
 	clean: number;
 	unconfirmed: number;
 	timedOut: number;
+	primaryUnavailable: PrimaryUnavailableTally;
 	rootFallbackReasons: string[];
 	navigationOnly: number;
 	tooLarge: number;
@@ -1816,6 +2036,8 @@ function tallyConfirmation(results: FileDiagnosticResult[]): {
 	let clean = 0;
 	let unconfirmed = 0;
 	let timedOut = 0;
+	let primaryUnavailable = 0;
+	const primaryUnavailableCauses: PrimaryUnavailableCause[] = [];
 	const rootFallbackReasons = new Set<string>();
 	let navigationOnly = 0;
 	let tooLarge = 0;
@@ -1834,6 +2056,12 @@ function tallyConfirmation(results: FileDiagnosticResult[]): {
 			// #570: timed-out checks are a subset of "unconfirmed" — tallied
 			// separately so the aggregate text can say WHY, not just THAT.
 			if (result.timedOut) timedOut += 1;
+			// #4322: so is a file whose language server never answered.
+			if (result.primaryUnavailable !== undefined) {
+				primaryUnavailable += 1;
+				if (result.primaryUnavailableCause !== undefined)
+					primaryUnavailableCauses.push(result.primaryUnavailableCause);
+			}
 			if (result.rootFallback) {
 				rootFallbackReasons.add(describeRootFallback(result.rootFallback));
 			}
@@ -1846,6 +2074,10 @@ function tallyConfirmation(results: FileDiagnosticResult[]): {
 		clean,
 		unconfirmed,
 		timedOut,
+		primaryUnavailable: {
+			count: primaryUnavailable,
+			cause: combinePrimaryUnavailableCauses(primaryUnavailableCauses),
+		},
 		rootFallbackReasons: [...rootFallbackReasons],
 		navigationOnly,
 		tooLarge,
@@ -1858,6 +2090,11 @@ function classifyBatchFileOutcome(
 	if (result.error) return "failed";
 	if (result.tooLargeReason) return "too_large";
 	if (result.diagnosticsUnsupported) return "unsupported";
+	// #4322: this read acquired no client at all, and a primary resolved a root
+	// for the file. The result is unconfirmed, but "unavailable" names why.
+	if (result.noClientAnswered && result.primaryUnavailable !== undefined) {
+		return "unavailable";
+	}
 	// A timed-out/unconfirmed answer may contain partial findings, but it cannot
 	// honestly be called a complete findings result. Keep the raw findings for
 	// investigation while making the aggregate incomplete.
@@ -1886,6 +2123,48 @@ function inconclusiveBatchResult(
 	};
 }
 
+/** The one reason a batch or directory names for a file's outcome. */
+function batchOutcomeReason(result: FileDiagnosticResult): string | undefined {
+	return (
+		result.tooLargeReason ??
+		// #4322: a file only auxiliaries answered for names its language server.
+		result.primaryUnavailable ??
+		result.inconclusiveReason ??
+		result.error ??
+		result.unavailable
+	);
+}
+
+/**
+ * #4322: the unconfirmed tally counts files with no findings, so a file whose
+ * findings came from auxiliaries alone needs its own line: without it a batch
+ * shows those findings and never says the language itself was not checked.
+ * A read no client answered is left out: its rows are the last known answer,
+ * which can hold the language server's own rows, and its health warning
+ * already says they are stale.
+ */
+function auxiliaryOnlyFindingsLine(
+	results: readonly FileDiagnosticResult[],
+): string | undefined {
+	const auxiliaryOnly = results.filter(
+		(result) =>
+			result.diagnostics.length > 0 &&
+			result.primaryUnavailable !== undefined &&
+			result.noClientAnswered === undefined,
+	);
+	const count = auxiliaryOnly.length;
+	if (count === 0) return undefined;
+	const cause =
+		combinePrimaryUnavailableCauses(
+			auxiliaryOnly.flatMap((result) => result.primaryUnavailableCause ?? []),
+		) ?? "unstarted";
+	return (
+		`${count} file${count === 1 ? "" : "s"} with auxiliary findings only: no ` +
+		`language server answered (${PRIMARY_UNAVAILABLE_CAUSE[cause]}), so the ` +
+		"language itself was not checked."
+	);
+}
+
 /**
  * #570: build the explanatory clause for a batch/directory result that has
  * unconfirmed files, distinguishing timed-out checks from the pre-existing
@@ -1897,7 +2176,19 @@ function unconfirmedReasonClause(
 	unconfirmed: number,
 	timedOut: number,
 	rootFallbackReasons: readonly string[] = [],
+	primaryUnavailable: PrimaryUnavailableTally = { count: 0, cause: undefined },
 ): string {
+	// #4322: a fourth, disjoint reason — no language server answered at all.
+	// The rest of the unconfirmed files keep their own explanation.
+	if (primaryUnavailable.count > 0) {
+		const head =
+			`${primaryUnavailable.count} with no language server answer ` +
+			`(${PRIMARY_UNAVAILABLE_CAUSE[primaryUnavailable.cause ?? "unstarted"]})`;
+		const rest = unconfirmed - primaryUnavailable.count;
+		return rest > 0
+			? `${head}; the other ${rest}: ${unconfirmedReasonClause(rest, timedOut, rootFallbackReasons)}`
+			: `${head}.`;
+	}
 	// #3750: a third, disjoint reason — the file's server root fell back, so its
 	// empty answer was demoted (`primaryRootFallback`). Named per server.
 	if (rootFallbackReasons.length > 0) {
@@ -1953,6 +2244,7 @@ async function collectBatchDiagnostics(
 	unconfirmed: number;
 	timedOut: number;
 	rootFallbackReasons: string[];
+	primaryUnavailable: PrimaryUnavailableTally;
 	outcomeCounts: Record<BatchFileOutcome, number>;
 	incompleteFiles: number;
 }> {
@@ -1961,12 +2253,17 @@ async function collectBatchDiagnostics(
 	// `persist()` call below), rather than round-tripping the on-disk cache
 	// file per-file. Shared store with `runWorkspaceDiagnostics` (`lens_
 	// diagnostics mode=full`'s engine); `scopeKey` keeps the two tools'
-	// differently-scoped touches (this tool never excludes any server, that
-	// one excludes opengrep — see `buildScopeKey`'s doc) from cross-serving
-	// entries that wouldn't actually match what each asked for.
+	// differently-scoped touches from cross-serving entries that wouldn't
+	// actually match what each asked for (see `buildScopeKey`'s doc). #4323:
+	// a check excludes the auxiliaries the operator turned off, so they are
+	// part of its key. A primary-only check is included: its clientless
+	// fallback read acquires auxiliaries too. `buildProbeScopeKey` keeps
+	// this writer's keys apart from the sweep's, whose payload skips
+	// `pi-lens-ignore`.
 	const resolvedCwd = options.cwd ?? process.cwd();
 	const cacheCtx = createWorkspaceDiagnosticsCacheContext(resolvedCwd);
-	const scopeKey = buildScopeKey(options.serverScope ?? "all");
+	const serverScope = options.serverScope ?? "all";
+	const scopeKey = buildProbeScopeKey(serverScope, options.excludeServerIds);
 	const resultsByIndex = new Map<number, FileDiagnosticResult>();
 	let completed = 0;
 	const pendingIndices = new Map<string, number[]>();
@@ -1975,6 +2272,23 @@ async function collectBatchDiagnostics(
 		if (queue) queue.push(index);
 		else pendingIndices.set(file, [index]);
 	});
+	// #4320: a module created since a file was cached must reach its servers
+	// before any lookup below, whatever the order of `files`. #4346: so must a
+	// module named only by a file's imports, which nothing reports when it was
+	// created outside pi-lens: for every file a fresh clean entry will not
+	// answer (#4368 r1 F1; a write-hook touch records no entry). So must a Go
+	// file's package files, which no import names; and each resolved file's
+	// imports go to the cache, which refuses an entry only for a creation in
+	// its dependency scope.
+	lspService.announceCreatedFiles([
+		...files,
+		...goPackageFilesToAnnounce(files),
+		...(await importTargetsToAnnounce(
+			resolvedCwd,
+			files.filter((file) => !cacheCtx.servesClean(file, scopeKey)),
+			(file, scope) => cacheCtx.noteImportScope(file, scope),
+		)),
+	]);
 	const groups = groupFilesByPrimaryServer(files);
 	await runPerServerGroups(
 		groups,
@@ -2010,6 +2324,7 @@ async function collectBatchDiagnostics(
 						scopeKey,
 						resolvedCwd,
 						options.onConfirmedNoBlockers,
+						options.excludeServerIds,
 					);
 					const bounded = withDeadline(work, {
 						ms: batchFileDeadlineMs(),
@@ -2071,8 +2386,13 @@ async function collectBatchDiagnostics(
 	const total = allDiags.length;
 	const truncated = total > MAX_DIAGNOSTICS;
 	const display = truncated ? allDiags.slice(0, MAX_DIAGNOSTICS) : allDiags;
-	const { clean, unconfirmed, timedOut, rootFallbackReasons } =
-		tallyConfirmation(results);
+	const {
+		clean,
+		unconfirmed,
+		timedOut,
+		primaryUnavailable,
+		rootFallbackReasons,
+	} = tallyConfirmation(results);
 	for (const result of results) {
 		result.outcome = classifyBatchFileOutcome(result);
 	}
@@ -2118,6 +2438,7 @@ async function collectBatchDiagnostics(
 		unconfirmed,
 		timedOut,
 		rootFallbackReasons,
+		primaryUnavailable,
 		outcomeCounts,
 		incompleteFiles: Math.max(0, files.length - results.length),
 	};
@@ -2149,7 +2470,7 @@ async function expandPathsToFiles(
 	const directories: string[] = [];
 	const seenFileKeys = new Set<string>();
 	for (const entry of rawPaths) {
-		const abs = normalizeMapKey(path.resolve(cwd, entry));
+		const abs = normalizeMapKey(resolveHostToolPath(entry, cwd));
 		let stat: fs.Stats | undefined;
 		try {
 			stat = fs.statSync(abs);
@@ -2240,6 +2561,7 @@ async function runBatchFileDiagnostics(
 		unconfirmed,
 		timedOut,
 		rootFallbackReasons,
+		primaryUnavailable,
 		outcomeCounts,
 		incompleteFiles,
 	} = await collectBatchDiagnostics(absPaths, severity, lspService, options);
@@ -2292,11 +2614,7 @@ async function runBatchFileDiagnostics(
 	const outcomeDetails: BatchOutcomeDetail[] = results.map((result) => ({
 		file: result.file,
 		outcome: result.outcome!,
-		reason:
-			result.tooLargeReason ??
-			result.inconclusiveReason ??
-			result.error ??
-			result.unavailable,
+		reason: batchOutcomeReason(result),
 	}));
 	const tooLargeLines = renderBatchOutcomeLines(outcomeDetails);
 	if (tooLargeLines.length > 0) {
@@ -2315,9 +2633,11 @@ async function runBatchFileDiagnostics(
 		lines.push(
 			"",
 			`${clean} file${clean === 1 ? "" : "s"} confirmed clean, ${unconfirmed} unconfirmed: ` +
-				`${unconfirmedReasonClause(unconfirmed, timedOut, rootFallbackReasons)} NOT the same as 0 diagnostics.`,
+				`${unconfirmedReasonClause(unconfirmed, timedOut, rootFallbackReasons, primaryUnavailable)} NOT the same as 0 diagnostics.`,
 		);
 	}
+	const auxiliaryOnlyLine = auxiliaryOnlyFindingsLine(results);
+	if (auxiliaryOnlyLine) lines.push("", auxiliaryOnlyLine);
 	if (display.length === 0) {
 		if (unconfirmed === 0 && outcomeCounts.clean === results.length) {
 			lines.push("", "No diagnostics found.");
@@ -2367,11 +2687,7 @@ async function runBatchFileDiagnostics(
 			outcomes: results.map((result) => ({
 				file: result.file,
 				outcome: result.outcome,
-				reason:
-					result.tooLargeReason ??
-					result.inconclusiveReason ??
-					result.error ??
-					result.unavailable,
+				reason: batchOutcomeReason(result),
 				primaryDiagnosticsCount: result.diagnostics.filter(
 					(diagnostic) => diagnostic.serverId === result.primaryServerId,
 				).length,
@@ -2520,6 +2836,7 @@ async function runDirectoryDiagnostics(
 		unconfirmed,
 		timedOut,
 		rootFallbackReasons,
+		primaryUnavailable,
 		outcomeCounts,
 	} = await collectBatchDiagnostics(
 		filesToProcess,
@@ -2539,12 +2856,9 @@ async function runDirectoryDiagnostics(
 	const outcomeDetails: BatchOutcomeDetail[] = results.map((result) => ({
 		file: result.file,
 		outcome: result.outcome!,
-		reason:
-			result.tooLargeReason ??
-			result.inconclusiveReason ??
-			result.error ??
-			result.unavailable,
+		reason: batchOutcomeReason(result),
 	}));
+	const auxiliaryOnlyLine = auxiliaryOnlyFindingsLine(results);
 	const tooLargeLines = renderBatchOutcomeLines(outcomeDetails, (file) =>
 		path.relative(absPath, file),
 	);
@@ -2557,7 +2871,7 @@ async function runDirectoryDiagnostics(
 		const cleanLine =
 			unconfirmed > 0
 				? `${clean} clean · ${unconfirmed} unconfirmed: ` +
-					`${unconfirmedReasonClause(unconfirmed, timedOut, rootFallbackReasons)} NOT the same as 0 diagnostics.`
+					`${unconfirmedReasonClause(unconfirmed, timedOut, rootFallbackReasons, primaryUnavailable)} NOT the same as 0 diagnostics.`
 				: "No diagnostics found.";
 		text = [
 			`Directory: ${absPath}`,
@@ -2567,9 +2881,14 @@ async function runDirectoryDiagnostics(
 						"LSP unavailable for one or more files:",
 						...lspHealthWarnings.slice(0, 10),
 					]
-				: unconfirmed > 0 || outcomeCounts.clean === filesToProcess.length
-					? [cleanLine]
-					: []),
+				: []),
+			// #4403: an unconfirmed file says why even beside a health warning,
+			// which names what was missing but not that the file is unconfirmed.
+			...(unconfirmed > 0 ||
+			(lspHealthWarnings.length === 0 &&
+				outcomeCounts.clean === filesToProcess.length)
+				? [cleanLine]
+				: []),
 			...(tooLargeLines.length > 0
 				? ["", "Files too large for LSP diagnostics:", ...tooLargeLines]
 				: []),
@@ -2595,9 +2914,11 @@ async function runDirectoryDiagnostics(
 								unconfirmed,
 								timedOut,
 								rootFallbackReasons,
+								primaryUnavailable,
 							),
 					]
 				: []),
+			...(auxiliaryOnlyLine ? ["", auxiliaryOnlyLine] : []),
 			"",
 		];
 		const toRelative = (d: FileDiag): FileDiag => ({
@@ -2665,24 +2986,6 @@ async function runDirectoryDiagnostics(
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────
-
-/**
- * #3088: the one rendering of the probe lane's policy drop, shared by the
- * single-file, batch and directory renders so the three cannot word the same
- * fact differently. Returns `undefined` when nothing was dropped — the #1616
- * rule asks for a count when there IS one, not a "0 suppressed" line on every
- * clean probe.
- */
-function dispositionSuppressedLine(suppressed: number): string | undefined {
-	if (suppressed <= 0) return undefined;
-	return (
-		`suppressed by disposition: ${suppressed} finding(s) dropped from this ` +
-		"result because they're marked false-positive/won't-fix, disabled by " +
-		"`.pi-lens.json` rule policy, or suppressed by an inline `pi-lens-ignore` " +
-		"comment. Not a clean verdict for those locations — they were found, " +
-		"then intentionally hidden."
-	);
-}
 
 function applySeverityFilter<T extends { severity: number }>(
 	diags: T[],

@@ -1,14 +1,8 @@
-import { describe, expect, it, beforeEach } from "vitest";
+import { describe, expect, it } from "vitest";
 import { FactStore } from "../../../../clients/dispatch/fact-store.js";
 import { functionFactProvider } from "../../../../clients/dispatch/facts/function-facts.js";
-import {
-	highFanOutRule,
-	resetHighFanOutThreshold,
-} from "../../../../clients/dispatch/rules/high-fan-out.js";
-import {
-	highComplexityRule,
-	resetHighComplexityThresholds,
-} from "../../../../clients/dispatch/rules/high-complexity.js";
+import { highFanOutRule } from "../../../../clients/dispatch/rules/high-fan-out.js";
+import { highComplexityRule } from "../../../../clients/dispatch/rules/high-complexity.js";
 import {
 	isTestFrameworkNoiseCall,
 	isTestSuiteOrganizer,
@@ -43,11 +37,6 @@ async function evaluateBoth(filePath: string, content: string) {
 }
 
 describe("high-fan-out / high-complexity — test-framework-call awareness (#577)", () => {
-	beforeEach(() => {
-		resetHighFanOutThreshold();
-		resetHighComplexityThresholds();
-	});
-
 	it("does not flag a describe() block wrapping many assertion-heavy it()s (real shape from tests/clients/widget-state.test.ts)", async () => {
 		const filePath = "/tmp/widget-state-like.test.ts";
 		const content = `

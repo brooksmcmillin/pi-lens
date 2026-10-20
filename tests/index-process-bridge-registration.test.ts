@@ -12,7 +12,7 @@
  * `activateExtension`, unconditional on any event — activating the mock host
  * is enough to trigger both.
  */
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import {
 	getMutationBridge,
 	MUTATION_BRIDGE_KEY,
@@ -21,18 +21,32 @@ import { READ_BRIDGE_KEY } from "../clients/read-bridge.js";
 import extension from "../index.js";
 import { createPiMock } from "./support/pi-mock.js";
 
-// Runs before the describe below activates the extension — each test FILE
-// gets a fresh child process (vitest forks pool, `isolate: true`), so
-// `globalThis` here has never seen either bridge key yet.
+// Read at module load, before any hook runs, so the assertion holds in any test
+// order (the #4549 read-bridge idiom). Reading the global inside the test redded
+// whenever the describe's first case activated the extension first (#4561,
+// shuffle seed 424).
+const bridgesPresentAtLoad = {
+	read: READ_BRIDGE_KEY in (globalThis as object),
+	mutation: MUTATION_BRIDGE_KEY in (globalThis as object),
+};
 it("neither bridge is mounted before the extension activates", () => {
-	expect(READ_BRIDGE_KEY in (globalThis as object)).toBe(false);
-	expect(MUTATION_BRIDGE_KEY in (globalThis as object)).toBe(false);
+	expect(bridgesPresentAtLoad).toEqual({ read: false, mutation: false });
 });
 
 describe("process-bridge registration through the real extension factory (#2437)", () => {
+	// #4561 review r1: the module-load capture alone fixed only the case above.
+	// Every case below observes a MOUNTED slot (the first-wins comparison reads
+	// it, and "non-writable" needs an existing non-writable property or the
+	// assignment silently succeeds), so whichever case a shuffle runs first used
+	// to fail. One activation before the first of them makes all four
+	// order-free; a second activation in a case is first-wins and changes
+	// nothing.
+	beforeAll(() => {
+		extension(createPiMock().asExtensionAPI());
+	});
+
 	it("mounts the read bridge via the shared helper, version 1, frozen", () => {
-		const pi = createPiMock();
-		extension(pi.asExtensionAPI());
+		extension(createPiMock().asExtensionAPI());
 
 		expect(READ_BRIDGE_KEY in (globalThis as object)).toBe(true);
 		const bridge = (globalThis as Record<symbol, unknown>)[READ_BRIDGE_KEY] as
@@ -44,8 +58,7 @@ describe("process-bridge registration through the real extension factory (#2437)
 	});
 
 	it("mounts the mutation bridge via the shared helper, reachable through getMutationBridge", () => {
-		const pi = createPiMock();
-		extension(pi.asExtensionAPI());
+		extension(createPiMock().asExtensionAPI());
 
 		expect(MUTATION_BRIDGE_KEY in (globalThis as object)).toBe(true);
 		const mounted = getMutationBridge();
@@ -58,6 +71,8 @@ describe("process-bridge registration through the real extension factory (#2437)
 		// #473) must not replace either mount.
 		const readBefore = (globalThis as Record<symbol, unknown>)[READ_BRIDGE_KEY];
 		const mutationBefore = getMutationBridge();
+		expect(readBefore).toBeDefined();
+		expect(mutationBefore).toBeDefined();
 
 		const second = createPiMock();
 		extension(second.asExtensionAPI());

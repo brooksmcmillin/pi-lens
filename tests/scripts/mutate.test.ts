@@ -1,9 +1,19 @@
 // flake-shape: real-process-spawn — the mutation CLI's child Vitest process and SIGINT restoration are the process boundary under test.
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { promisify } from "node:util";
 import { expect, it, vi } from "vitest";
+import { waitFor } from "../clients/interleaving-kit.js";
+import { isProcessAlive } from "../support/process-tree.js";
 
 // Every case spawns a real Vitest child; a shared CI runner needs more than the
 // 5 s default (the round-2 orphan-journal test timed out there).
@@ -15,8 +25,8 @@ const cli = "scripts/mutate.mjs";
 const target = "tests/scripts/mutate-fixture.test.ts";
 const find = "true";
 const replace = "Boolean(1)";
-const digest = () =>
-	createHash("sha256").update(readFileSync(target)).digest("hex");
+const digest = (file: string = target) =>
+	createHash("sha256").update(readFileSync(file)).digest("hex");
 
 function invoke(testFile: string, ...extra: string[]) {
 	return execFileAsync(
@@ -32,24 +42,6 @@ function invoke(testFile: string, ...extra: string[]) {
 			"--tests",
 			testFile,
 			...extra,
-		],
-		{ cwd: root },
-	);
-}
-
-function invokeNoop() {
-	return execFileAsync(
-		process.execPath,
-		[
-			cli,
-			"--file",
-			target,
-			"--find",
-			"missing",
-			"--replace",
-			"changed",
-			"--tests",
-			target,
 		],
 		{ cwd: root },
 	);
@@ -108,10 +100,50 @@ it("restores the source after a failing test run and reports RED with a title", 
 	).rejects.toMatchObject({
 		code: 1,
 		stdout: expect.stringMatching(
-			/mutation fixture remains original[\s\S]*RED/,
+			/mutation fixture remains original[\s\S]*\nRED\n[\s\S]*\| 1 \| RED \|/,
 		),
 	});
 	expect(digest()).toBe(before);
+});
+
+// Recurrence (#4490 L1): a failed test title is free text, and the mutation-
+// table row is pasted into PR_BODY.md. A pipe in the title must not add a
+// table cell, so the escaped row keeps its five unescaped pipes.
+it("keeps a failed title's pipe inside its mutation-table cell (#4490 L1)", async () => {
+	const pipeTarget = "tests/scripts/mutate-pipe-title.test.ts";
+	const before = createHash("sha256")
+		.update(readFileSync(pipeTarget))
+		.digest("hex");
+	const error = await execFileAsync(
+		process.execPath,
+		[
+			cli,
+			"--file",
+			pipeTarget,
+			"--find",
+			"const mutatePipeMarker = true;",
+			"--replace",
+			"const mutatePipeMarker = false;",
+			"--tests",
+			pipeTarget,
+		],
+		{ cwd: root },
+	).then(
+		() => null,
+		(thrown: { stdout: string }) => thrown,
+	);
+	const row = error?.stdout
+		.split("\n")
+		.find((line) => line.startsWith("mutation-table:"));
+	expect(row).toContain("pipe \\| in a title");
+	const cells = row?.slice("mutation-table: ".length) ?? "";
+	let unescaped = 0;
+	for (let i = 0; i < cells.length; i++) {
+		if (cells[i] === "\\") i++;
+		else if (cells[i] === "|") unescaped++;
+	}
+	expect(unescaped).toBe(5);
+	expect(digest(pipeTarget)).toBe(before);
 });
 
 // The failed-title row is pasted into PR bodies; under CI's colour the titles
@@ -170,11 +202,81 @@ it("restores after a mutation throw", async () => {
 	expect(digest()).toBe(before);
 });
 
-it("refuses a no-op and leaves the source untouched", async () => {
+// Recurrence (#4510): the catch around edit, build and test printed every
+// thrown error as RED, so a mutation that never ran read as a test that
+// catches it (PR #4491 rounds 4 to 6). Each stage prints its own status line.
+it("refuses a no-op and leaves the source untouched, printing REFUSED (#4510)", async () => {
 	const before = digest();
-	await expect(invokeNoop()).rejects.toMatchObject({ code: 1 });
+	const result = await run([
+		cli,
+		"--file",
+		target,
+		"--find",
+		"missing",
+		"--replace",
+		"changed",
+		"--tests",
+		target,
+	]);
+	expect(result.code).toBe(1);
+	expect(result.stdout).toMatch(/\nREFUSED\n/);
+	expect(result.stdout).not.toMatch(/\nRED\n/);
+	expect(result.stdout).toContain(
+		"mutation-table: | tests/scripts/mutate-fixture.test.ts | 1 | REFUSED |",
+	);
 	expect(digest()).toBe(before);
 });
+
+it("prints ERROR, not RED, when the run fails before any edit (#4510)", async () => {
+	// A directory passes the existence and git-clean checks and then fails to
+	// read: a failure that is neither a refused edit nor a failed build.
+	const result = await run([
+		cli,
+		"--file",
+		"scripts/lib",
+		"--find",
+		"x",
+		"--replace",
+		"y",
+		"--tests",
+		target,
+	]);
+	expect(result.code).toBe(1);
+	expect(result.stdout).toMatch(/\nERROR\n/);
+	expect(result.stdout).not.toMatch(/\n(RED|REFUSED|BROKEN)\n/);
+});
+
+it("prints BROKEN, exits 1 and restores source and twin when the build fails (#4510)", async () => {
+	// A leaf client stands in for any built source (see the --restore twin case).
+	const source = "clients/freshness-cadence.ts";
+	const twin = "clients/freshness-cadence.js";
+	const sourceOriginal = readFileSync(source);
+	const twinOriginal = readFileSync(twin);
+	try {
+		const result = await run([
+			cli,
+			"--file",
+			source,
+			"--find",
+			"2_000",
+			"--replace",
+			"2_000 )",
+			"--tests",
+			target,
+		]);
+		expect(result.code).toBe(1);
+		expect(result.stdout).toMatch(/\nBROKEN\n/);
+		expect(result.stdout).not.toMatch(/\nRED\n/);
+		expect(result.stdout).toContain(
+			"mutation-table: | clients/freshness-cadence.ts | 1 | BROKEN |",
+		);
+		expect(readFileSync(source).equals(sourceOriginal)).toBe(true);
+		expect(readFileSync(twin).equals(twinOriginal)).toBe(true);
+	} finally {
+		forceRestore(source, sourceOriginal);
+		forceRestore(twin, twinOriginal);
+	}
+}, 120_000);
 
 it("restores on SIGINT", async () => {
 	const before = digest();
@@ -336,6 +438,106 @@ it.each([
 			stdout: expect.stringContaining("\nERROR\n"),
 		});
 		expect(digest()).toBe(before);
+	},
+	60_000,
+);
+
+// Recurrence (#4510 review F1): a test-stage run with no verdict printed RED,
+// so "only a failed test run prints RED" was false for a bad --tests path and
+// for a vitest killed from outside.
+it("prints ERROR, not RED, when --tests names no test file (#4510)", async () => {
+	const before = digest();
+	const result = await run([
+		cli,
+		"--file",
+		target,
+		"--find",
+		find,
+		"--replace",
+		replace,
+		"--tests",
+		"tests/scripts/does-not-exist-4510.test.ts",
+	]);
+	expect(result.code).toBe(1);
+	expect(result.stdout).toMatch(/\nERROR\n/);
+	expect(result.stdout).not.toMatch(/\nRED\n/);
+	expect(digest()).toBe(before);
+});
+
+it("prints ERROR, not RED, when vitest is killed from outside after a summary line (#4510)", async () => {
+	const before = digest();
+	const result = await run(
+		[
+			cli,
+			"--file",
+			target,
+			"--find",
+			find,
+			"--replace",
+			replace,
+			"--tests",
+			target,
+		],
+		{ PI_LENS_MUTATION_KILL_RUNNER: "1" },
+	);
+	expect(result.code).toBe(130);
+	expect(result.stdout).toMatch(/\nERROR\n/);
+	expect(result.stdout).not.toMatch(/\nRED\n/);
+	expect(digest()).toBe(before);
+});
+
+// Recurrence (#4510 review F2): a signal SIGKILLed only the vitest launcher and
+// its worker fork ran on until its test ended (two 99% CPU orphans, 4 h).
+it.each(["SIGINT", "SIGTERM", "SIGHUP"] as const)(
+	"%s to the run kills the vitest worker fork too (#4510)",
+	async (signal) => {
+		const before = digest();
+		const dir = mkdtempSync(join(tmpdir(), "pi-lens-mutate-pid-"));
+		const pidFile = join(dir, "worker.pid");
+		const child = spawn(
+			process.execPath,
+			[
+				cli,
+				"--file",
+				target,
+				"--find",
+				find,
+				"--replace",
+				replace,
+				"--tests",
+				target,
+			],
+			{
+				cwd: root,
+				env: {
+					...process.env,
+					PI_LENS_MUTATION_RUN: "1",
+					PI_LENS_MUTATION_PIDFILE: pidFile,
+				},
+				stdio: ["ignore", "ignore", "ignore"],
+			},
+		);
+		const closed = new Promise((resolve) => child.once("close", resolve));
+		try {
+			await waitFor(
+				() => existsSync(pidFile),
+				(found) => found,
+				{ timeoutMs: 60_000, intervalMs: 100 },
+			);
+			const worker = Number(readFileSync(pidFile, "utf8"));
+			expect(worker).toBeGreaterThan(0);
+			child.kill(signal);
+			await closed;
+			await waitFor(
+				() => isProcessAlive(worker),
+				(alive) => !alive,
+				{ timeoutMs: 5_000, intervalMs: 100 },
+			);
+			expect(digest()).toBe(before);
+		} finally {
+			child.kill("SIGKILL");
+			rmSync(dir, { recursive: true, force: true });
+		}
 	},
 	60_000,
 );

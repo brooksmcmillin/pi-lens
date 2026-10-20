@@ -32,12 +32,22 @@ exports change.
 - When a gate becomes fail-closed, sweep every construction site that reaches
   it, test doubles included, and prove the sweep with the behaviour suites
   (#3622).
+- A new module, or a new use of a detection or caching primitive (stat,
+  mtime, inode, content or line hash, directory walk, install stamp, sequence
+  counter), lists the existing modules that use the same primitive for the
+  same purpose. Find them by searching for the primitive, such as
+  `rg -l 'statSync|mtimeMs|createHash|readdir|projectSeq' clients`, never by
+  your own seam's call names. The consolidation verdict cites that list
+  (#4536).
 - A change on a lifecycle, timing, or identity seam extends or adds a TLA+
   model in this step (#3802; the rule itself is in `AGENTS.md`). Find the
   family in `formal/coverage-map.json`, write the invariant the change
   preserves or tightens, and show the violating config red on the pre-fix model
   and green after, or carry `TLA+ unaffected: <family> — <reason>` in the PR
-  body. A row is any-of (one listed family's model move or declaration
+  body. The unaffected line is wrong when the change alters a behaviour an
+  as-built config constant encodes: flip that constant, its configs and its
+  `formal/switch-pins.json` value instead, and keep its pin test red on the old
+  behaviour (#4387, #4393). A row is any-of (one listed family's model move or declaration
   satisfies it); a row of 4+ families only prints a note, except `index.ts`,
   whose row gates on the lifecycle hook handler a hunk lands in (#3878). The
   map owner is the lane that adds a `formal/<family>/`: it adds the family and
@@ -60,12 +70,13 @@ exports change.
   transcript quoted in `Test assessment`. A redundant test that still guards
   goes only with the named survivor that covers it.
 - Apply folded review follow-ups per `docs/pi-lens-subagent.md`
-  "Follow-ups", and list filed residuals in one **Residuals** section of the
-  PR body.
+  "Follow-ups", and list every gap left open in one **Accepted residuals** section of
+  the PR body, each named `p3` with its severity and live population (merge bar:
+  `docs/pi-lens-merge-policy.md` "Filing issues").
 
 ## Evidence
 
-- Use `scripts/mutate.mjs` for bounded hand mutations; it restores the target automatically, but only while the file still holds the mutated bytes. A leftover journal (`<file>.mutate-backup`) blocks the next run on that file; recover with `--restore`, which refuses and prints the three hashes when the file was edited since. If a crash left the file already at its original bytes, `--restore` also refuses; check the printed hashes and delete the journal by hand. `--restore` is crash recovery only: run against a live `mutate.mjs` run on the same file, it pulls that run's mutation, and that run then reports ERROR (exit 4).
+- Use `scripts/mutate.mjs` for bounded hand mutations; it restores the target automatically, but only while the file still holds the mutated bytes. A leftover journal (`<file>.mutate-backup`) blocks the next run on that file; recover with `--restore`, which refuses and prints the three hashes when the file was edited since. If a crash left the file already at its original bytes, `--restore` also refuses; check the printed hashes and delete the journal by hand. `--restore` is crash recovery only: run against a live `mutate.mjs` run on the same file, it pulls that run's mutation, and that run then reports ERROR (exit 4). The transcript's status line is `SURVIVED` (tests passed), `RED` (a test run failed), `REFUSED` (the edit was not applied), `BROKEN` (the build failed) or `ERROR` (no verdict); only `RED` proves a test catches the mutation (#4510).
 
 - Witness rule (ADR 0007): #1605 owns the witness lanes, and their fixtures
   live under `tests/fixtures/witness/<slice>/`.
@@ -88,12 +99,56 @@ exports change.
   with exact-head findings dispositioned through real callers. The nightly
   report complements it. Use bounded hand probes locally; never run a full
   Stryker campaign in a worktree.
-- Every record the `Observability` section names is asserted by a test in the
-  diff and quoted in the body (#2642, #2647, #2649, #2654).
+- A PR that relaxes or rewrites an existing assertion (a changed meaning makes
+  the old expectation wrong) mutates the behaviour that test is named for. Quote
+  the red on the new assertion. A rewrite that stays green with that
+  behaviour broken is a deleted test (#4390: the eviction smoke's rewrite
+  passed with root re-registration broken).
+- A PR that adds or changes a detector (a ratchet, census or source scan)
+  writes STATE_TABLE.md before the first edit: each form the detector
+  admits, and the statement that every other form refuses. It then plants
+  three spellings its author did not design for: an alias, an indirect
+  call and a value reached through another binding. Quote each result. A
+  plant that stays green is fixed. A stated residual names an admitted
+  form that is too broad, never an unread spelling (AGENTS.md shape 69).
+- The manual per-test campaign (`stryker-pertest.yml`, #4365) lists tests that
+  cover mutated code but kill no mutant. It is a triage input, not a verdict:
+  a candidate that guards another seam or a named recurrence stays, and a
+  deletion it proposes lands only with the covering test named and the
+  reviewer's agreement test by test.
+- Every record the `Observability` section names is asserted by a test under
+  `tests/` (any collected test, not only a file this PR touches) and quoted in
+  the body (#2642, #2647, #2649, #2654). Require a read-back for each named
+  record; the fork does not run the PR-body lint gate. `none: <reason>`
+  still answers a diff with no record. A mention counts whatever its spelling:
+  a backticked span, a bare word and a link label are all read against the
+  record values the runtime emits, so prose that reuses a record's own name is
+  a mention too.
+- The read-back is the record's full name in an assertion, a comparison, a
+  `case` label or a record-keyed row inside a declaration vitest collects and
+  runs, or inside a module-scope helper that one of them calls. A title, a
+  `console.log`, a skipped test and an excluded tree do not count, and a record
+  named only through a table imported from another file does not either, so
+  inline the name in the assertion. The declaration may be spelled with a
+  computed modifier or bracket link (`it["only"]`) and through an alias
+  (`const t = it`); a form the lint cannot classify (`it[modifier]`, a
+  destructured alias) makes its whole file contribute nothing, so write the
+  declaration the plain way. Naming a record that predates the PR owes the same
+  test.
 - Every behavioural sentence (a docstring invariant, a memo, a registry
   justification) maps to a test or a probe, or is deleted (#2643, #2654).
 - Name where new state sits in its ladder and what happens to it at
   `session_start` (#2649, #2654).
+- A change on a hot path (dispatch, `session_start`, LSP diagnostics, a cache
+  lookup, turn-end) quotes a before/after timing from the real path in the
+  body, with the command, at a small and a large input; per-input work on a
+  tool path also needs a size or time bound. Name and justify any regression
+  (#4344 r1; #4368 r1). The `Hot-path latency (advisory)` lane (#4363) times
+  `session_start`, `dispatchLint` and the diagnostics-cache replay on the head
+  and its first parent (`HEAD^1`); read its job summary, and time by hand any
+  hot path it does not cover (a language server's time, a dependency bump).
+  Green means no regression of 1.25x and 5 ms; a "slower, below threshold" row
+  is still a number to read.
 - A measured constant names its measuring command and keeps raw output as a
   tracked artifact pinned by a test (#3648). Run `git check-ignore -v` on every
   new artifact path before citing it (#3648).
@@ -114,10 +169,31 @@ exports change.
   `node_modules`.
 - Run release-QA end to end when a release-QA row changes.
 - Run the reviewer's standing probes (`docs/pi-lens-reviewer.md`) that the diff
-  can trip, and quote their output in the PR body.
+  can trip, and quote their output in the PR body. The `verify-pi-lens` skill
+  (`.claude/skills/verify-pi-lens/SKILL.md`) holds the real-path recipes.
 
 ## Fix rounds
 
+- When bot threads or code-scanning alerts exist, read and dispose of each
+  one. A missing bot review is never evidence of anything: it never blocks the
+  round and never becomes something to wait for. The threads, every page:
+  `gh api graphql --paginate -f query='query($owner:String!,$name:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{id isResolved isOutdated path line comments(first:1){nodes{author{login} body}}}}}}}' -F owner="$(gh repo view --json owner --jq .owner.login)" -F name="$(gh repo view --json name --jq .name)" -F number=<N> --jq '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false) | "\(.id) \(.path):\(.line) \(.comments.nodes[0].author.login): \(.comments.nodes[0].body)"'`,
+  and the alerts:
+  `gh api --paginate "repos/{owner}/{repo}/code-scanning/alerts?ref=refs/heads/<branch>&state=open" --jq '.[] | "\(.number) \(.rule.id) \(.most_recent_instance.location.path):\(.most_recent_instance.location.start_line)"'`.
+  Both commands follow their cursor to the last page, so the list is clear
+  only after that page prints: one page is never read as the whole list.
+  An alert on another branch is not this round's; read the head you pushed.
+  Before the hand-back, reply to and resolve every thread this round fixes, and
+  name every other open thread and alert in the PR body with its disposition.
+  A round that finds none says so in one line and moves on. Where the brief
+  withholds GitHub writes
+  (`docs/pi-lens-subagent.md`),
+  put the same list in the body and the hand-back for the orchestrator to post
+  and resolve. The disposition words and the merge condition are
+  `docs/pi-lens-merge-policy.md` "The loop, per PR" step 1 and step 4
+  (`:34`, `:81`); this contract does not restate them. Recurrence: #4566 and
+  #4575 (2026-10-17), where the threads outlived the rounds that should have
+  read them.
 - On `FIX ROUND` findings, reproduce each finding before fixing it, add a
   red-first test for every behavioural fix, rebuild, re-run the targeted suites
   plus anything the findings touched, and push the same branch. If the PR reads
@@ -137,6 +213,9 @@ exports change.
 - Spot-check one prior round's mutation on the new head (#2583).
 - Re-read the changelog fragment for any claim the round retracts (#3155), then
   add an honest review-round section to the PR body.
+- Lint the PR body (`--lint-local`) before the first push of a round, not only
+  at hand-back: `PR body (advisory)` re-reads the same body on every push, so
+  an unfixed finding reds each one.
 
 ## Before the report
 
@@ -160,8 +239,17 @@ rigor (#2599).
   GitHub ignores it in a title.
 - Run `node scripts/check-pr-body.mjs --lint-local PR_BODY.md` and
   `node scripts/check-changelog-fragments.mjs` before the hand-back; both
-  must pass, and the hand-back quotes them. A red `PR body (advisory)` check is
-  a fix-before-review item. A changelog fragment is `---` /
+  must pass, and the hand-back quotes them. The body lint reads the closed
+  issue's labels through `gh api`; a `::warning::` that the Detection check
+  was skipped means gh failed, so the section was not required, not that it
+  passed (#4288). A non-bug PR either deletes the `## Detection` section or
+  fills the three lines, and a `Shape:` or `Enforcer:` line it does write is
+  validated too; free text in between reds the local preflight. A bug-closing
+  PR that answers a layer, the `Gap: none:` reason, the `Shape: new:` name or
+  the `Enforcer: none:` reason with `unknown`, `n/a`, `tbd` or `?` is refused
+  (#4519); the layer words are `DETECTION_LAYERS`, `nightly:<workflow>`
+  included. A red `PR body (advisory)` check is a fix-before-review item.
+  A changelog fragment is `---` /
   `section: <Added|Changed|Deprecated|Removed|Fixed|Security>` /
   `audience: <user|internal>` / `---` / blank / one `- ` bullet. New
   `audience: user` fragments must begin with a bold lead of at most 100
@@ -172,6 +260,20 @@ rigor (#2599).
   hit); `internal` is CI, tests, `formal/`, contributor docs, orchestration, and
   refactors with no observable change. `npm run changelog:check` checks the
   rollup, not fragments (#2456).
+- A bug fix's detection lesson names the defect SHAPE and its tree-wide
+  enforcer, not only a test for the instance: the `Shape:` line names the
+  `AGENTS.md` "Recurring defect shapes" number (or `new: <name>`), and the
+  `Enforcer:` line a test on base that scans the whole population, an issue to
+  build one, or `none: judgment-only, <reason>`. With `Shape: #N` a path
+  enforcer must be one catalog entry N names. The fix's own one-bug test is its
+  regression test, not the closed gap. The body lint enforces both lines
+  (#4439).
+- A `Shape: new: <name>` is a proposal, not a catalog entry: write the
+  proposed shape text in the PR body under "Proposed contract change
+  (maintainer decision)" and never edit `AGENTS.md`. Catalog shapes and rule
+  changes are the maintainer's decision; the orchestrator lands an approved
+  one in its own change (#4577's fixer added shape 74 unasked, and the
+  governance suites redded).
 - Every code fact in the PR body is a `` `path:line` `` citation the check
   verifies: the file must be in the committed tree (never an untracked or
   git-ignored path, which CI cannot read), and a fenced quote after it must

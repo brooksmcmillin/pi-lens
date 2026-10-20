@@ -37,6 +37,10 @@ import {
 	getFormattersForFile,
 	prettierFormatter,
 } from "../../clients/formatters.js";
+import {
+	resetProjectTrust,
+	setProjectTrustState,
+} from "../../clients/project-trust.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
 const REPO_ROOT = path.resolve(
@@ -156,6 +160,7 @@ d("unconfigured template files survive the formatter drain (#2384)", () => {
 
 	afterEach(() => {
 		clearFormatterRuntimeState();
+		resetProjectTrust();
 		env?.cleanup();
 	});
 
@@ -185,6 +190,19 @@ d("unconfigured template files survive the formatter drain (#2384)", () => {
 	it("explicit prettier config still reformats an HTML file", async () => {
 		env = setupTestEnvironment("pi-lens-2384-optin-");
 		fs.writeFileSync(path.join(env.tmpDir, ".prettierrc"), "{}\n");
+		// A project-local binary runs only in a trusted project, and the
+		// "prettier" tool agreement needs package and lockfile evidence.
+		setProjectTrustState("trusted");
+		fs.writeFileSync(
+			path.join(env.tmpDir, "package.json"),
+			JSON.stringify({ devDependencies: { prettier: "3.3.3" } }),
+		);
+		fs.writeFileSync(
+			path.join(env.tmpDir, "package-lock.json"),
+			JSON.stringify({
+				packages: { "node_modules/prettier": { version: "3.3.3" } },
+			}),
+		);
 		plantLocalPrettier(env.tmpDir);
 		const target = path.join(env.tmpDir, "messy.html");
 		fs.writeFileSync(target, MESSY_HTML);

@@ -20,7 +20,6 @@ vi.mock("../../clients/latency-logger.js", async (importOriginal) => ({
 
 import {
 	dropFindingsForMissingPaths,
-	findingPathExistence,
 	partitionFindingsByCitedPath,
 	type FindingPathFacts,
 } from "../../clients/advisory-provenance.js";
@@ -151,13 +150,6 @@ describe("partitionFindingsByCitedPath (#1461 slice 1)", () => {
 		expect(result.truncated).toBe(true);
 	});
 
-	it("treats an ENOENT path as missing and an existing one as live", () => {
-		const { live, dead } = setup();
-		expect(findingPathExistence(live)).toBe("live");
-		fs.rmSync(path.dirname(dead), { recursive: true, force: true });
-		expect(findingPathExistence(dead)).toBe("missing");
-	});
-
 	// #1461 HIGH-1: the drop decision must resolve a cited path the SAME way
 	// `toRunnerDisplayPath` resolves it for the message the agent actually
 	// sees (runtime-turn.ts). A bare `path.resolve(cwd, cited)` cannot find a
@@ -216,11 +208,12 @@ describe("partitionFindingsByCitedPath (#1461 slice 1)", () => {
 		}
 		expect(spellings.length).toBeGreaterThan(1);
 
-		fs.rmSync(path.dirname(dead), { recursive: true, force: true });
+		// Keep identity available to canonicalization; inject disappearance at the stat boundary.
 		const result = partitionFindingsByCitedPath<Finding>({
 			findings: spellings.map((file, i) => ({ file, rule: `rule-${i}` })),
 			cwd: env.tmpDir,
 			citedPath,
+			probePath: () => ({ state: "missing" }),
 		});
 		expect(result.dropped).toHaveLength(spellings.length);
 		expect(result.live).toEqual([]);

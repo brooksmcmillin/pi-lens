@@ -1,0 +1,2439 @@
+{
+	"$comment": "#4393: every constant a formal/<family>/*.cfg assigns (`=` or `<-`), and every module `Name == TRUE|FALSE` that is not a `<-` target, is classified here, per family. `pins`: the constant mirrors a code choice; `value` is what every `\\* expect: pass` config resolves it to (its `=` value, the definition its `<-` names, or the module's `Name == <literal>`), and `test`/`title` name a test a run reaches, in a file vitest collects, that drives the real code and asserts that behaviour, so flipping the code reds the test and flipping the model alone reds tests/config/tla-switch-pins.test.ts. `also` names further tests when one value encodes several behaviours. `narrowedBy` admits, per value, the named as-built configs (file stems) that use it only to cut the explored schedules, with its reason; a config it does not list must match `value`. `notCodeChoice` and `deferred` groups carry a reason for each member, and tests/config/tla-switch-pins.test.ts pins the counts of deferred and notCodeChoice members exactly, so every move between them is a visible edit. Flipping a model value and this value together, without the code, reds neither the gate nor the pin, so a change to a value here is a reviewer's call. A PR that changes a pinned behaviour flips the constant, its configs and this value together (AGENTS.md shape 68).",
+	"families": {
+		"cascade-delivery": {
+			"pins": {
+				"CheckStamp": {
+					"value": "\"read\"",
+					"test": "tests/clients/cascade-turn-merge.test.ts",
+					"title": "an outside fix after the compute read and before turn_end is not left unresolved",
+					"also": [
+						{
+							"test": "tests/clients/cascade-compute.test.ts",
+							"title": "a run that lists neighbour errors carries its read time: the compute's start, before every read"
+						},
+						{
+							"test": "tests/clients/cascade-turn-merge.test.ts",
+							"title": "a late answer's errors, written over between the touch and the publish, are named as changed"
+						}
+					]
+				},
+				"Delta": {
+					"value": "\"none\"",
+					"test": "tests/clients/cascade-compute.test.ts",
+					"title": "#4487: three cascades over a persistent neighbour error list it each time",
+					"also": [
+						{
+							"test": "tests/clients/cascade-compute.test.ts",
+							"title": "lists a repeated cascade diagnostic on every run (no rolling delta)"
+						}
+					]
+				},
+				"ExpiryRead": {
+					"value": "\"peekLog\"",
+					"test": "tests/clients/lsp/cascade-tier-backlog.test.ts",
+					"title": "an expiring outstanding touch is peeked once and its path logged",
+					"also": [
+						{
+							"test": "tests/clients/lsp/cascade-tier-backlog.test.ts",
+							"title": "a peek delivers answered touches and keeps the silent ones outstanding"
+						},
+						{
+							"test": "tests/clients/cascade-turn-merge.test.ts",
+							"title": "turn_end peeks the outstanding touches after its settle and delivers a late answer"
+						}
+					]
+				},
+				"FallbackGate": {
+					"value": "\"afterEdit\"",
+					"test": "tests/clients/cascade-compute.test.ts",
+					"title": "#4486: the touch-error fallback does not display a snapshot from before the cascade started",
+					"also": [
+						{
+							"test": "tests/clients/cascade-compute.test.ts",
+							"title": "#4486: the degraded fallback does not display cache entries from before the cascade started"
+						}
+					]
+				},
+				"PassiveGate": {
+					"value": "\"afterEdit\"",
+					"test": "tests/clients/cascade-compute.test.ts",
+					"title": "#4486: a passive snapshot with ts <= cascadeStart is not served; the neighbour is touched",
+					"also": [
+						{
+							"test": "tests/clients/cascade-compute.test.ts",
+							"title": "#4486: a passive snapshot published after the cascade started serves the neighbour without a touch"
+						}
+					]
+				},
+				"PendingGate": {
+					"value": "\"notify\"",
+					"test": "tests/clients/cascade-turn-merge.test.ts",
+					"title": "an outside touch that keeps the error names it once as changed, then says nothing",
+					"also": [
+						{
+							"test": "tests/clients/cascade-turn-merge.test.ts",
+							"title": "is forgotten without a line when deleted"
+						},
+						{
+							"test": "tests/clients/turn-end-cap-consumed-state.test.ts",
+							"title": "a cut changed line keeps its entry and is named on the next turn, then forgotten"
+						}
+					]
+				},
+				"RecentlyClean": {
+					"value": "FALSE",
+					"test": "tests/clients/cascade-compute.test.ts",
+					"title": "a neighbour checked clean on an earlier turn is checked again after the next edit"
+				},
+				"Reserve": {
+					"value": "\"record\"",
+					"test": "tests/clients/cascade-turn-merge.test.ts",
+					"title": "a pending neighbour error no cascade covered this turn renders one unresolved line until a fresh observation clears it",
+					"also": [
+						{
+							"test": "tests/clients/cascade-turn-merge.test.ts",
+							"title": "a neighbour error re-observed on a later turn is labelled with the turn it was first delivered"
+						}
+					]
+				},
+				"TierPath": {
+					"value": "\"inLane\"",
+					"test": "tests/clients/cascade-compute.test.ts",
+					"title": "a tier-3 neighbour whose server advertises typescript.tsserverRequest is answered in-lane and records no outstanding touch",
+					"also": [
+						{
+							"test": "tests/clients/lsp/cascade-tier.test.ts",
+							"title": "classifies a silent classic typescript server that advertises typescript.tsserverRequest as command-pull"
+						},
+						{
+							"test": "tests/clients/cascade-compute.test.ts",
+							"title": "a silent-push neighbour that publishes inside the wait is answered with that publish"
+						}
+					]
+				},
+				"UnconfirmedMarker": {
+					"value": "\"marked\"",
+					"test": "tests/clients/cascade-compute.test.ts",
+					"title": "a run whose selected neighbours were all unanswered carries unconfirmed and never no_neighbors/clean",
+					"also": [
+						{
+							"test": "tests/clients/cascade-turn-merge.test.ts",
+							"title": "turn_end renders one pending line per server for unconfirmed neighbours, once per turn"
+						}
+					]
+				}
+			},
+			"notCodeChoice": [
+				{
+					"reason": "Scenario bound or actor set: it sizes the state space or picks which actors, inputs and steps TLC explores; no code branch reads it.",
+					"constants": [
+						"Neighbours",
+						"Models",
+						"MaxTurns",
+						"QuietFires",
+						"OutsidePhases",
+						"OutsideKinds"
+					]
+				},
+				{
+					"reason": "A code constant at model scale (a retry count, a cap, a tolerance or a budget in ticks): the model shrinks it to bound the state space, so its value is not the code's.",
+					"constants": [
+						"Expiry"
+					]
+				}
+			]
+		},
+		"dispatch-pipeline": {
+			"pins": {
+				"CarryPreRunCalls": {
+					"value": "TRUE",
+					"test": "tests/clients/fix-run-restore.test.ts",
+					"title": "reports an uncaptured edit whose tool_call began before the fixer run",
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"SiblingRestoreInFlight",
+								"SiblingRestoreInFlightEvery",
+								"SiblingRestoreInFlightHeld",
+								"SiblingRestoreLostVerdict",
+								"SiblingRestoreOneEdit",
+								"SiblingRestoreQueuedSilent",
+								"SiblingRestoreRecheck",
+								"SiblingSequential"
+							],
+							"reason": "No call is in flight at beginFixRun in these configs: every agent call reaches pi-lens inside the run (SCallInRun = TRUE), or Begin waits for an idle agent (SAtomic = TRUE, or SConcurrent = FALSE)."
+						}
+					}
+				},
+				"ClaimGap": {
+					"value": "FALSE",
+					"test": "tests/clients/dispatch-pipeline-formal.test.ts",
+					"title": "ClaimGap (#3508): with the bootstrap clients not resident, two handlers for one post-write state dispatch once",
+					"narrowedBy": {
+						"TRUE": {
+							"configs": [
+								"WidgetParallel"
+							],
+							"reason": "WidgetParallel keeps the claim gap of the code before #3508 as the harder case for the widget's own WriteOrderingGuard (its header); it checks WidgetNewest only."
+						}
+					}
+				},
+				"FixClear": {
+					"value": "TRUE",
+					"test": "tests/clients/dispatch-pipeline-formal.test.ts",
+					"title": "InlineParallel (#3507): an older clean pipeline that settles last does not erase the newer edit's blocker",
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"ClaimAtomic",
+								"ClaimGap",
+								"FixerAttribution",
+								"FixerOrphan",
+								"FixerParallel",
+								"FixerQueue",
+								"FixerSequential",
+								"InlineSequential",
+								"WidgetParallel"
+							],
+							"reason": "Pass configs that check no InlineNewest or InlineExact (ClaimAtomic, ClaimGap, FixerAttribution, FixerOrphan, FixerParallel, FixerQueue, FixerSequential, WidgetParallel), and InlineSequential, where pi awaits each handler (Parallel = FALSE, Orphan = FALSE), so no older verdict settles after a newer one."
+						}
+					}
+				},
+				"FixHoldWriter": {
+					"value": "TRUE",
+					"test": "tests/clients/dispatch-pipeline-formal.test.ts",
+					"title": "FixerOrphan (#3506 r1): the --immediate-format child the budget gave up on keeps pi's queue until it writes",
+					"also": [
+						{
+							"test": "tests/clients/dispatch-pipeline-formal.test.ts",
+							"title": "deferred drain (#3506 r1): the drain formatter its 30 s aggregate gave up on keeps pi's queue until it writes"
+						}
+					],
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"ClaimAtomic",
+								"ClaimGap",
+								"FixerSequential",
+								"InlineFix",
+								"InlineParallel",
+								"InlineSequential",
+								"WidgetParallel"
+							],
+							"reason": "No overlapping fixer run: ClaimGap, InlineFix, InlineParallel and InlineSequential set ImmediateEdits = {}, so no pipeline runs the autofix; ClaimAtomic checks NoDoubleDispatch only; FixerSequential runs pi's sequential tools (Parallel = FALSE, Orphan = FALSE), where pi awaits each handler and no agent edit overlaps the fixer (the baseline before #3506)."
+						}
+					}
+				},
+				"FixQueue": {
+					"value": "TRUE",
+					"test": "tests/clients/dispatch-pipeline-formal.test.ts",
+					"title": "FixerParallel (#3506): the immediate autofix does not write over an agent edit made through pi's queue",
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"ClaimAtomic",
+								"ClaimGap",
+								"FixerSequential",
+								"InlineFix",
+								"InlineParallel",
+								"InlineSequential",
+								"WidgetParallel"
+							],
+							"reason": "No overlapping fixer run: ClaimGap, InlineFix, InlineParallel and InlineSequential set ImmediateEdits = {}, so no pipeline runs the autofix; ClaimAtomic checks NoDoubleDispatch only; FixerSequential runs pi's sequential tools (Parallel = FALSE, Orphan = FALSE), where pi awaits each handler and no agent edit overlaps the fixer (the baseline before #3506)."
+						}
+					}
+				},
+				"FixQueueRefresh": {
+					"value": "TRUE",
+					"test": "tests/clients/dispatch-pipeline-formal.test.ts",
+					"title": "FixerAttribution (#3506): an agent edit is never reported as pi-lens' autofix, and its own analysis runs",
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"ClaimAtomic",
+								"ClaimGap",
+								"FixerSequential",
+								"InlineFix",
+								"InlineParallel",
+								"InlineSequential",
+								"WidgetParallel"
+							],
+							"reason": "No overlapping fixer run: ClaimGap, InlineFix, InlineParallel and InlineSequential set ImmediateEdits = {}, so no pipeline runs the autofix; ClaimAtomic checks NoDoubleDispatch only; FixerSequential runs pi's sequential tools (Parallel = FALSE, Orphan = FALSE), where pi awaits each handler and no agent edit overlaps the fixer (the baseline before #3506)."
+						}
+					}
+				},
+				"FixReToken": {
+					"value": "TRUE",
+					"test": "tests/clients/dispatch-pipeline-formal.test.ts",
+					"title": "FixerQueueNoReToken (#3506): a pipeline whose autofix fixed a newer revision records it under a fresh write index",
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"ClaimAtomic",
+								"ClaimGap",
+								"FixerSequential",
+								"InlineFix",
+								"InlineParallel",
+								"InlineSequential",
+								"WidgetParallel"
+							],
+							"reason": "No overlapping fixer run: ClaimGap, InlineFix, InlineParallel and InlineSequential set ImmediateEdits = {}, so no pipeline runs the autofix; ClaimAtomic checks NoDoubleDispatch only; FixerSequential runs pi's sequential tools (Parallel = FALSE, Orphan = FALSE), where pi awaits each handler and no agent edit overlaps the fixer (the baseline before #3506)."
+						}
+					}
+				},
+				"FixRecord": {
+					"value": "TRUE",
+					"test": "tests/clients/dispatch-pipeline-formal.test.ts",
+					"title": "InlineParallel (#3507): an older blocker that settles last does not replace the newer edit's verdict",
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"ClaimAtomic",
+								"ClaimGap",
+								"FixerAttribution",
+								"FixerOrphan",
+								"FixerParallel",
+								"FixerQueue",
+								"FixerSequential",
+								"InlineSequential",
+								"WidgetParallel"
+							],
+							"reason": "Pass configs that check no InlineNewest or InlineExact (ClaimAtomic, ClaimGap, FixerAttribution, FixerOrphan, FixerParallel, FixerQueue, FixerSequential, WidgetParallel), and InlineSequential, where pi awaits each handler (Parallel = FALSE, Orphan = FALSE), so no older verdict settles after a newer one."
+						}
+					}
+				},
+				"FixTomb": {
+					"value": "TRUE",
+					"test": "tests/clients/dispatch-pipeline-formal.test.ts",
+					"title": "InlineParallel (#3507): an older blocker that settles after the newer edit cleared the record neither restores it nor latches the commit gate",
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"ClaimAtomic",
+								"ClaimGap",
+								"FixerAttribution",
+								"FixerOrphan",
+								"FixerParallel",
+								"FixerQueue",
+								"FixerSequential",
+								"InlineSequential",
+								"WidgetParallel"
+							],
+							"reason": "Pass configs that check no InlineNewest or InlineExact (ClaimAtomic, ClaimGap, FixerAttribution, FixerOrphan, FixerParallel, FixerQueue, FixerSequential, WidgetParallel), and InlineSequential, where pi awaits each handler (Parallel = FALSE, Orphan = FALSE), so no older verdict settles after a newer one."
+						}
+					}
+				},
+				"InFlightDedupe": {
+					"value": "TRUE",
+					"test": "tests/clients/runtime-tool-result-debounce.test.ts",
+					"title": "inFlightPipelines dedupes concurrent same-state calls for divergently-spelled paths into one pipeline run",
+					"also": [
+						{
+							"test": "tests/clients/dispatch-pipeline-formal.test.ts",
+							"title": "ClaimGap (#3508): with the bootstrap clients not resident, two handlers for one post-write state dispatch once"
+						}
+					]
+				},
+				"KeepCaptureHistory": {
+					"value": "TRUE",
+					"test": "tests/clients/fix-run-restore.test.ts",
+					"title": "reports an earlier capture when a later agent capture replaces it",
+					"also": [
+						{
+							"test": "tests/clients/fix-run-restore.test.ts",
+							"title": "reports a verified earlier edit the fixer erased before a later edit started"
+						}
+					],
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"SiblingRestoreCallBeforeRun",
+								"SiblingRestoreInFlight",
+								"SiblingRestoreInFlightEvery",
+								"SiblingRestoreInFlightHeld",
+								"SiblingRestoreLostVerdict",
+								"SiblingRestoreOneEdit",
+								"SiblingRestoreRecheck",
+								"SiblingSequential"
+							],
+							"reason": "These configs check NoRestoreOverNewer, NoNoopRestore, NoRestoreOverPreCheckEdit or NoSilentLossUncaptured (checked without window C in the way, SiblingRestore.tla), which read no report a replaced capture adds, or run one agent edit or no concurrent edit, which replace no capture."
+						}
+					}
+				},
+				"LspMulti": {
+					"value": "TRUE",
+					"test": "tests/clients/lsp-writers-mutation-queue.test.ts",
+					"title": "two edits that name the same two files in opposite orders both apply",
+					"also": [
+						{
+							"test": "tests/clients/fix-run-restore.test.ts",
+							"title": "does not deadlock with an LSP multi-path edit that holds the sibling and waits for the target"
+						}
+					],
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"SiblingRestoreCallBeforeRun",
+								"SiblingRestoreInFlight",
+								"SiblingRestoreInFlightEvery",
+								"SiblingRestoreInFlightHeld",
+								"SiblingRestoreLostVerdict",
+								"SiblingRestoreOneEdit",
+								"SiblingRestoreOverlap",
+								"SiblingRestoreQueuedInHoldNoLsp",
+								"SiblingRestoreQueuedSilent",
+								"SiblingRestoreRecheck",
+								"SiblingSequential"
+							],
+							"reason": "The restore is explored without the LSP actor; the actor matters only beside TargetHold, in SiblingRestoreQueued."
+						}
+					}
+				},
+				"LspQueue": {
+					"value": "TRUE",
+					"test": "tests/clients/lsp-writers-mutation-queue.test.ts",
+					"title": "a server-initiated workspace/applyEdit does not erase an agent edit made while it applies"
+				},
+				"RestoreGatesHold": {
+					"value": "FALSE",
+					"test": "tests/clients/fix-run-restore.test.ts",
+					"title": "settles F's result while a third party holds the sibling's queue entry",
+					"narrowedBy": {
+						"TRUE": {
+							"configs": [
+								"SiblingRestoreQueuedInHoldNoLsp"
+							],
+							"reason": "SiblingRestoreQueuedInHoldNoLsp keeps the rejected shape without the LSP edit, to show that edit is the cycle's third edge (its header)."
+						}
+					}
+				},
+				"RestoreInFlight": {
+					"value": "TRUE",
+					"test": "tests/clients/fix-run-restore.test.ts",
+					"title": "does not restore an older capture over a newer edit whose tool_result is late"
+				},
+				"RestoreNoCapInFlight": {
+					"value": "TRUE",
+					"test": "tests/clients/fix-run-restore.test.ts",
+					"title": "reports an uncaptured edit whose tool_call began before the fixer run",
+					"also": [
+						{
+							"test": "tests/clients/fix-run-restore.test.ts",
+							"title": "names an uncaptured in-flight file that is unreadable at the restore"
+						}
+					],
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"SiblingRestoreCallBeforeRun",
+								"SiblingRestoreInFlightHeld",
+								"SiblingRestoreOneEdit",
+								"SiblingRestoreQueuedSilent",
+								"SiblingRestoreRecheck",
+								"SiblingSequential"
+							],
+							"reason": "The report is not read: these configs check NoRestoreOverNewer, NoNoopRestore or NoRestoreOverPreCheckEdit, which depend on no report, or their schedules leave no call in flight at the restore's read (SAtomic = TRUE, or SConcurrent = FALSE). The code reports a file with no capture and a call in flight (fix-run-restore.ts restoreRun, unverifiedInFlight)."
+						}
+					}
+				},
+				"RestoreQueue": {
+					"value": "TRUE",
+					"test": "tests/clients/fix-run-restore.test.ts",
+					"title": "an agent edit made while the restore writes survives it",
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"SiblingRestoreInFlight",
+								"SiblingRestoreOneEdit",
+								"SiblingRestoreRecheck",
+								"SiblingSequential"
+							],
+							"reason": "Merged-restore configs from before #3830 (#3598, #3741): one agent edit (SiblingRestoreInFlight, SiblingRestoreOneEdit), no concurrent edit (SiblingSequential: SConcurrent = FALSE), or a check of NoRestoreOverPreCheckEdit only (SiblingRestoreRecheck). MutSiblingNoSettleCapture and MutSiblingNoRestoreQueue are the violated witnesses that the two-edit schedules need the part."
+						}
+					}
+				},
+				"RestoreRecheck": {
+					"value": "TRUE",
+					"test": "tests/clients/fix-run-restore.test.ts",
+					"title": "does not write over a newer edit that lands while the restore is reading"
+				},
+				"SRestore": {
+					"value": "TRUE",
+					"test": "tests/clients/fix-run-restore.test.ts",
+					"title": "keeps an agent edit to a sibling file that landed during the run"
+				},
+				"SettleCapture": {
+					"value": "TRUE",
+					"test": "tests/clients/fix-run-restore.test.ts",
+					"title": "an edit whose tool_call comes after the tool exited is not overwritten",
+					"also": [
+						{
+							"test": "tests/clients/fix-run-restore.test.ts",
+							"title": "stays registered until the restore has written, and then restores"
+						}
+					],
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"SiblingRestoreInFlight",
+								"SiblingRestoreOneEdit",
+								"SiblingRestoreRecheck",
+								"SiblingSequential"
+							],
+							"reason": "Merged-restore configs from before #3830 (#3598, #3741): one agent edit (SiblingRestoreInFlight, SiblingRestoreOneEdit), no concurrent edit (SiblingSequential: SConcurrent = FALSE), or a check of NoRestoreOverPreCheckEdit only (SiblingRestoreRecheck). MutSiblingNoSettleCapture and MutSiblingNoRestoreQueue are the violated witnesses that the two-edit schedules need the part."
+						}
+					}
+				},
+				"TargetHold": {
+					"value": "TRUE",
+					"test": "tests/clients/fix-run-restore.test.ts",
+					"title": "TargetHold (#3506): an agent edit of the target made while a whole-package fixer runs waits for the pipeline",
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"SiblingRestoreCallBeforeRun",
+								"SiblingRestoreInFlight",
+								"SiblingRestoreInFlightEvery",
+								"SiblingRestoreInFlightHeld",
+								"SiblingRestoreLostVerdict",
+								"SiblingRestoreOneEdit",
+								"SiblingRestoreOverlap",
+								"SiblingRestoreQueuedSilent",
+								"SiblingRestoreRecheck",
+								"SiblingSequential"
+							],
+							"reason": "No LSP multi-path edit competes for F's entry (LspMulti = FALSE in these configs), so F's hold waits on nothing and changes no schedule."
+						}
+					},
+					"also": [
+						{
+							"test": "tests/clients/fix-run-restore.test.ts",
+							"title": "TargetHold (#3506): an agent edit of a Dart target made while dart fix --apply runs waits for the pipeline"
+						}
+					]
+				},
+				"WidgetGuard": {
+					"value": "TRUE",
+					"test": "tests/clients/dispatch-pipeline-formal.test.ts",
+					"title": "widget order (#3540): an older same-turn pipeline that settles last still does not replace the newer edit's widget verdict"
+				},
+				"WriterBound": {
+					"value": "TRUE",
+					"test": "tests/clients/dispatch-pipeline-formal.test.ts",
+					"title": "FixerOrphan (#3506 r1): the --immediate-format child the budget gave up on keeps pi's queue until it writes",
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"AllActorsFix",
+								"AllActorsFixOrphan",
+								"ClaimAtomic",
+								"ClaimGap",
+								"FixerAttribution",
+								"FixerQueue",
+								"FixerSequential",
+								"InlineFix",
+								"InlineParallel",
+								"InlineSequential",
+								"WidgetParallel"
+							],
+							"reason": "The config leaves out the writer's give-up (WriterAbandon, OrphanWrite) to keep its schedules small; the as-built configs with the bound on are FixerOrphan, FixerParallel and LspEditQueue."
+						}
+					}
+				}
+			},
+			"notCodeChoice": [
+				{
+					"reason": "Scenario bound or actor set: it sizes the state space or picks which actors, inputs and steps TLC explores; no code branch reads it.",
+					"constants": [
+						"Edits",
+						"ImmediateEdits",
+						"LspEdits",
+						"SEdits",
+						"SReplacer",
+						"SReplaced"
+					]
+				},
+				{
+					"reason": "Environment: a host, OS, server or scheduling behaviour the code must tolerate, not a choice the code makes.",
+					"constants": [
+						"Parallel",
+						"Orphan",
+						"SConcurrent",
+						"SInOrderNotes",
+						"SAtomic",
+						"SCallInRun"
+					]
+				}
+			]
+		},
+		"file-locks": {
+			"notCodeChoice": [
+				{
+					"reason": "Scenario bound or actor set: it sizes the state space or picks which actors, inputs and steps TLC explores; no code branch reads it.",
+					"constants": [
+						"Procs",
+						"MaxCrashes",
+						"MaxInodes",
+						"MaxGen",
+						"Rounds"
+					]
+				},
+				{
+					"reason": "Environment: a host, OS, server or scheduling behaviour the code must tolerate, not a choice the code makes.",
+					"constants": [
+						"AllowExpiry",
+						"HeartbeatStall"
+					]
+				}
+			],
+			"deferred": [
+				{
+					"reason": "Deferred: no single as-built value yet. This family's `expect: pass` configs set it both ways (a pass config here is not an as-built claim), so the family must first name its as-built value before a pin can agree with it.",
+					"constants": [
+						"EmptyIsDead",
+						"AtomicCreate",
+						"ListedMarker",
+						"Heartbeat",
+						"OwnsTop"
+					]
+				},
+				{
+					"reason": "Deferred: every `expect: pass` config agrees on one value, but no existing dispatcher or entry-point test was matched to it in #4393, which pinned read-guard first.",
+					"constants": [
+						"IdentityCheck",
+						"Cleanup",
+						"Recheck"
+					]
+				},
+				{
+					"reason": "Deferred: a code constant at its code value, not shrunk. Every config sets `Retries = 3`, which is `REGISTRY_WRITE_RETRIES = 3` (clients/instance-registry.ts), so the value mirrors the code; no test that drives the retry loop was matched in #4393.",
+					"constants": [
+						"Retries"
+					]
+				}
+			]
+		},
+		"format-drain": {
+			"pins": {
+				"EnterAfterResolve": {
+					"value": "TRUE",
+					"test": "tests/clients/format-drain-formal.test.ts",
+					"title": "InstallHold (#3558): a next-run edit made while the formatter resolves its command lands at once, and is formatted with the file"
+				},
+				"FixGen": {
+					"value": "TRUE",
+					"test": "tests/clients/format-drain-formal.test.ts",
+					"title": "Straddle (#3528): a session-1 drain's recordWritten does not admit a never-read session-2 edit",
+					"also": [
+						{
+							"test": "tests/clients/format-drain-formal.test.ts",
+							"title": "StraddleState (#3528): an abandoned session-1 format is not requeued into session 2's cleared queue"
+						}
+					],
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"Sequential",
+								"SequentialWide"
+							],
+							"reason": "Sequential and SequentialWide model the interactive host before the fixes: Overlap = FALSE, Orphan = FALSE and MaxSessions = 1, so no next-run edit, abandoned formatter or /new reaches a step this fix part guards."
+						}
+					}
+				},
+				"FixOrphanSync": {
+					"value": "TRUE",
+					"test": "tests/clients/format-drain-formal.test.ts",
+					"title": "OrphanLsp (#3529): the child the hook's 10 s bound gave up on is synced after it writes",
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"Sequential",
+								"SequentialWide"
+							],
+							"reason": "Sequential and SequentialWide model the interactive host before the fixes: Overlap = FALSE, Orphan = FALSE and MaxSessions = 1, so no next-run edit, abandoned formatter or /new reaches a step this fix part guards."
+						}
+					}
+				},
+				"FixQueue": {
+					"value": "TRUE",
+					"test": "tests/clients/format-drain-formal.test.ts",
+					"title": "OverlapLostEdit (#3527): a next-run edit made after the child read F waits for the child, so the format does not erase it",
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"Sequential",
+								"SequentialWide"
+							],
+							"reason": "Sequential and SequentialWide model the interactive host before the fixes: Overlap = FALSE, Orphan = FALSE and MaxSessions = 1, so no next-run edit, abandoned formatter or /new reaches a step this fix part guards."
+						}
+					}
+				},
+				"FixQueueHold": {
+					"value": "TRUE",
+					"test": "tests/clients/dispatch-pipeline-formal.test.ts",
+					"title": "deferred drain (#3506 r1): the drain formatter its 30 s aggregate gave up on keeps pi's queue until it writes",
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"Sequential",
+								"SequentialWide"
+							],
+							"reason": "Sequential and SequentialWide model the interactive host before the fixes: Overlap = FALSE, Orphan = FALSE and MaxSessions = 1, so no next-run edit, abandoned formatter or /new reaches a step this fix part guards."
+						}
+					}
+				},
+				"FixStamp": {
+					"value": "TRUE",
+					"test": "tests/clients/format-drain-formal.test.ts",
+					"title": "OverlapLsp (#3529): the drain's resync of bytes read before a next-run edit does not replace that edit's newer sync",
+					"also": [
+						{
+							"test": "tests/clients/format-drain-formal.test.ts",
+							"title": "OrphanLsp (#3529): the post-exit resync of a read taken before a next-run edit does not replace that edit's newer sync"
+						}
+					],
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"Sequential",
+								"SequentialWide"
+							],
+							"reason": "Sequential and SequentialWide model the interactive host before the fixes: Overlap = FALSE, Orphan = FALSE and MaxSessions = 1, so no next-run edit, abandoned formatter or /new reaches a step this fix part guards."
+						}
+					}
+				},
+				"HeldResync": {
+					"value": "TRUE",
+					"test": "tests/clients/format-drain-formal.test.ts",
+					"title": "R1: a replaced session's format resyncs the next session's open document to the bytes on disk, without a spawn",
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"Sequential",
+								"SequentialWide"
+							],
+							"reason": "Sequential and SequentialWide model the interactive host before the fixes: Overlap = FALSE, Orphan = FALSE and MaxSessions = 1, so no next-run edit, abandoned formatter or /new reaches a step this fix part guards."
+						}
+					}
+				},
+				"LspGen": {
+					"value": "TRUE",
+					"test": "tests/clients/format-drain-formal.test.ts",
+					"title": "the post-exit resync is skipped and recorded as stale-session",
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"Sequential",
+								"SequentialWide"
+							],
+							"reason": "Sequential and SequentialWide model the interactive host before the fixes: Overlap = FALSE, Orphan = FALSE and MaxSessions = 1, so no next-run edit, abandoned formatter or /new reaches a step this fix part guards."
+						}
+					}
+				},
+				"MtimeAuthored": {
+					"value": "FALSE",
+					"test": "tests/clients/read-guard.test.ts",
+					"title": "blocks zero-read edit on a file another writer touched after the guard started (#3520)"
+				},
+				"OrphanLateSync": {
+					"value": "TRUE",
+					"test": "tests/clients/format-drain-formal.test.ts",
+					"title": "OrphanGiveUp (#3828): the LSP document equals the disk once the child settles",
+					"also": [
+						{
+							"test": "tests/clients/format-drain-formal.test.ts",
+							"title": "OrphanGiveUp (#3858): the LSP document equals the disk once the formatter the budget gave up on writes"
+						}
+					],
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"OverlapClaim",
+								"OverlapLostEdit",
+								"OverlapLsp",
+								"Sequential",
+								"SequentialWide",
+								"Straddle"
+							],
+							"reason": "No give-up exists to chain a resync onto: these configs (Straddle, OverlapClaim, OverlapLostEdit, OverlapLsp, Sequential, SequentialWide) have Orphan = FALSE and InBand = FALSE, so no run is abandoned."
+						}
+					}
+				},
+				"OrphanSyncBound": {
+					"value": "TRUE",
+					"test": "tests/clients/format-drain-formal.test.ts",
+					"title": "AbandonedInstall (#3599): a formatter whose install never finishes no longer parks the post-exit resync",
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"FixInBand",
+								"InBandLsp",
+								"OverlapClaim",
+								"OverlapLostEdit",
+								"OverlapLsp",
+								"Sequential",
+								"SequentialWide",
+								"Straddle"
+							],
+							"reason": "The post-exit wait the bound limits never starts: Orphan = FALSE configs (Straddle, OverlapClaim, OverlapLostEdit, OverlapLsp, Sequential, SequentialWide) abandon no run, and InBand = TRUE configs (FixInBand, InBandLsp) wait for nothing after the bound, since Abandon sets gaveUp itself (FormatDrain.tla Abandon, OrphanGiveUp)."
+						}
+					}
+				},
+				"ResetClearsGuard": {
+					"value": "TRUE",
+					"test": "tests/index-3521-fork-tree-witness.test.ts",
+					"title": "blocks the same zero-read edit after a ${move} when no fix was applied"
+				},
+				"ServiceGen": {
+					"value": "TRUE",
+					"test": "tests/clients/format-drain-formal.test.ts",
+					"title": "the post-exit resync spawns no server after the idle reset retired the service",
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"Sequential",
+								"SequentialWide"
+							],
+							"reason": "Sequential and SequentialWide model the interactive host before the fixes: Overlap = FALSE, Orphan = FALSE and MaxSessions = 1, so no next-run edit, abandoned formatter or /new reaches a step this fix part guards."
+						}
+					}
+				},
+				"StartGen": {
+					"value": "TRUE",
+					"test": "tests/clients/format-drain-formal.test.ts",
+					"title": "the format phase does not start after /new during the autofix phase",
+					"also": [
+						{
+							"test": "tests/clients/format-drain-formal.test.ts",
+							"title": "the autofix loop does not start the next file after /new"
+						}
+					],
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"Sequential",
+								"SequentialWide"
+							],
+							"reason": "Sequential and SequentialWide model the interactive host before the fixes: Overlap = FALSE, Orphan = FALSE and MaxSessions = 1, so no next-run edit, abandoned formatter or /new reaches a step this fix part guards."
+						}
+					}
+				}
+			},
+			"notCodeChoice": [
+				{
+					"reason": "Scenario bound or actor set: it sizes the state space or picks which actors, inputs and steps TLC explores; no code branch reads it.",
+					"constants": [
+						"Edits",
+						"MaxOps",
+						"MaxTurns",
+						"MaxSessions",
+						"ExtWrites",
+						"InBand"
+					]
+				},
+				{
+					"reason": "Environment: a host, OS, server or scheduling behaviour the code must tolerate, not a choice the code makes.",
+					"constants": [
+						"Overlap",
+						"Orphan",
+						"IdleRetire"
+					]
+				},
+				{
+					"reason": "Mutant-only design: every as-built config sets the off value, and it breaks a guard to show a violation; no code ever had it.",
+					"constants": [
+						"GenDropsAll"
+					]
+				}
+			]
+		},
+		"instance-reaper": {
+			"notCodeChoice": [
+				{
+					"reason": "Scenario bound or actor set: it sizes the state space or picks which actors, inputs and steps TLC explores; no code branch reads it.",
+					"constants": [
+						"Pids",
+						"Insts",
+						"Mcp",
+						"Crashable",
+						"NoKids",
+						"MaxBirth",
+						"Reapers",
+						"Backstops",
+						"RecCmd"
+					]
+				},
+				{
+					"reason": "Environment: a host, OS, server or scheduling behaviour the code must tolerate, not a choice the code makes.",
+					"constants": [
+						"Posix",
+						"PidReuse",
+						"OtherProcs",
+						"LateRecord",
+						"ScanFail"
+					]
+				}
+			],
+			"deferred": [
+				{
+					"reason": "Deferred: no single as-built value yet. This family's `expect: pass` configs set it both ways (a pass config here is not an as-built claim), so the family must first name its as-built value before a pin can agree with it.",
+					"constants": [
+						"FootprintPrune",
+						"StalePrune",
+						"Guards",
+						"FixParts"
+					]
+				}
+			]
+		},
+		"late-aux-drain": {
+			"notCodeChoice": [
+				{
+					"reason": "Scenario bound or actor set: it sizes the state space or picks which actors, inputs and steps TLC explores; no code branch reads it.",
+					"constants": [
+						"AgentTouches",
+						"ExternalEdits",
+						"MaxDrains",
+						"Closes",
+						"AllowSave"
+					]
+				},
+				{
+					"reason": "Environment: a host, OS, server or scheduling behaviour the code must tolerate, not a choice the code makes.",
+					"constants": [
+						"ExtDuringGrace",
+						"Refresh",
+						"RefreshOvertake",
+						"AllowClosePublish",
+						"AllowDefer",
+						"AllowCancel"
+					]
+				},
+				{
+					"reason": "A code constant at model scale (a retry count, a cap, a tolerance or a budget in ticks): the model shrinks it to bound the state space, so its value is not the code's.",
+					"constants": [
+						"MaxRearms",
+						"Tol"
+					]
+				}
+			],
+			"deferred": [
+				{
+					"reason": "Deferred: no single as-built value yet. This family's `expect: pass` configs set it both ways (a pass config here is not an as-built claim), so the family must first name its as-built value before a pin can agree with it.",
+					"constants": [
+						"RefreshOnStale",
+						"CountBind",
+						"MarkAtNotify",
+						"RefreshRebaseline",
+						"SaveExpect",
+						"Carry"
+					]
+				},
+				{
+					"reason": "Deferred: every `expect: pass` config agrees on one value, but no existing dispatcher or entry-point test was matched to it in #4393, which pinned read-guard first.",
+					"constants": [
+						"PublishedAtCheck",
+						"MtimeGate",
+						"ClosePublishFiltered"
+					]
+				}
+			]
+		},
+		"lsp-crash": {
+			"notCodeChoice": [
+				{
+					"reason": "Scenario bound or actor set: it sizes the state space or picks which actors, inputs and steps TLC explores; no code branch reads it.",
+					"constants": [
+						"Shape",
+						"MaxCrashes",
+						"Uptimes",
+						"MaxEvicts",
+						"DerivedMissKinds"
+					]
+				},
+				{
+					"reason": "Environment: a host, OS, server or scheduling behaviour the code must tolerate, not a choice the code makes.",
+					"constants": [
+						"Concurrent",
+						"Silent"
+					]
+				},
+				{
+					"reason": "A code constant at model scale (a retry count, a cap, a tolerance or a budget in ticks): the model shrinks it to bound the state space, so its value is not the code's.",
+					"constants": [
+						"Trip"
+					]
+				}
+			],
+			"deferred": [
+				{
+					"reason": "Deferred: no single as-built value yet. This family's `expect: pass` configs set it both ways (a pass config here is not an as-built claim), so the family must first name its as-built value before a pin can agree with it.",
+					"constants": [
+						"LeaseCheck",
+						"FastPath",
+						"Fix",
+						"DerivedMissPath",
+						"RegStreak"
+					]
+				},
+				{
+					"reason": "Deferred: every `expect: pass` config agrees on one value, but no existing dispatcher or entry-point test was matched to it in #4393, which pinned read-guard first.",
+					"constants": [
+						"PingGuard",
+						"WaitTimeout",
+						"WindowTrip",
+						"ClearReadyOnDeath",
+						"ColdGuard",
+						"RegClear",
+						"ReadyGuard",
+						"DeriveGuard"
+					]
+				}
+			]
+		},
+		"lsp-diagnostics-freshness": {
+			"notCodeChoice": [
+				{
+					"reason": "Scenario bound or actor set: it sizes the state space or picks which actors, inputs and steps TLC explores; no code branch reads it.",
+					"constants": [
+						"SkippedWait",
+						"Preserve",
+						"MaxPubs"
+					]
+				},
+				{
+					"reason": "Environment: a host, OS, server or scheduling behaviour the code must tolerate, not a choice the code makes.",
+					"constants": [
+						"VersionedServer",
+						"AsyncServer",
+						"ReplyFirst"
+					]
+				},
+				{
+					"reason": "Mutant-only design: every as-built config sets the off value, and it breaks a guard to show a violation; no code ever had it.",
+					"constants": [
+						"Mutant"
+					]
+				}
+			],
+			"deferred": [
+				{
+					"reason": "Deferred: no single as-built value yet. This family's `expect: pass` configs set it both ways (a pass config here is not an as-built claim), so the family must first name its as-built value before a pin can agree with it.",
+					"constants": [
+						"SeedFirstPush",
+						"Fence"
+					]
+				}
+			]
+		},
+		"lsp-document-lifecycle": {
+			"notCodeChoice": [
+				{
+					"reason": "Scenario bound or actor set: it sizes the state space or picks which actors, inputs and steps TLC explores; no code branch reads it.",
+					"constants": [
+						"Touches",
+						"StartOpen"
+					]
+				},
+				{
+					"reason": "Environment: a host, OS, server or scheduling behaviour the code must tolerate, not a choice the code makes.",
+					"constants": [
+						"TouchAfterRename"
+					]
+				}
+			],
+			"deferred": [
+				{
+					"reason": "Deferred: every `expect: pass` config agrees on one value, but no existing dispatcher or entry-point test was matched to it in #4393, which pinned read-guard first.",
+					"constants": [
+						"QueuedClose"
+					]
+				}
+			]
+		},
+		"lsp-ephemeral-data-dir": {
+			"notCodeChoice": [
+				{
+					"reason": "Scenario bound or actor set: it sizes the state space or picks which actors, inputs and steps TLC explores; no code branch reads it.",
+					"constants": [
+						"ProcIds",
+						"Pids",
+						"Roots",
+						"MaxStarts"
+					]
+				}
+			],
+			"deferred": [
+				{
+					"reason": "Deferred: every `expect: pass` config agrees on one value, but no existing dispatcher or entry-point test was matched to it in #4393, which pinned read-guard first.",
+					"constants": [
+						"UniqueToken",
+						"SafeSweep"
+					]
+				}
+			]
+		},
+		"lsp-idle-reset": {
+			"notCodeChoice": [
+				{
+					"reason": "Scenario bound or actor set: it sizes the state space or picks which actors, inputs and steps TLC explores; no code branch reads it.",
+					"constants": [
+						"Sweep",
+						"Cascade",
+						"WarmAttach"
+					]
+				},
+				{
+					"reason": "Environment: a host, OS, server or scheduling behaviour the code must tolerate, not a choice the code makes.",
+					"constants": [
+						"SweepOverrun"
+					]
+				}
+			],
+			"deferred": [
+				{
+					"reason": "Deferred: no single as-built value yet. This family's `expect: pass` configs set it both ways (a pass config here is not an as-built claim), so the family must first name its as-built value before a pin can agree with it.",
+					"constants": [
+						"Reaping",
+						"FixParts"
+					]
+				},
+				{
+					"reason": "Deferred: every `expect: pass` config agrees on one value, but no existing dispatcher or entry-point test was matched to it in #4393, which pinned read-guard first.",
+					"constants": [
+						"HoldCheck"
+					]
+				}
+			]
+		},
+		"lsp-rename-edit": {
+			"pins": {
+				"Rule": {
+					"value": "\"merged\"",
+					"test": "tests/tools/lsp-navigation-rename-file-staleness.test.ts",
+					"title": "an opened importer re-sent while the server computes is refused on the send stamp, although its disk equals that send",
+					"also": [
+						{
+							"test": "tests/tools/lsp-navigation-rename-staleness.test.ts",
+							"title": "an agent write made while the rename is computed is not overwritten, and the refusal names the file"
+						}
+					]
+				}
+			},
+			"notCodeChoice": [
+				{
+					"reason": "Scenario bound or actor set: it sizes the state space or picks which actors, inputs and steps TLC explores; no code branch reads it.",
+					"constants": [
+						"Files",
+						"Target",
+						"Opened",
+						"Flow",
+						"PiWriteFiles",
+						"ExternalFiles",
+						"TouchFiles",
+						"SyncBeforeCapture",
+						"ForceFirstOpen",
+						"MaxWrites",
+						"MaxClock"
+					]
+				},
+				{
+					"reason": "Environment: a host, OS, server or scheduling behaviour the code must tolerate, not a choice the code makes.",
+					"constants": [
+						"KeepMtime",
+						"WatcherPrompt",
+						"AbortAfterText",
+						"Revert",
+						"SplitApply"
+					]
+				},
+				{
+					"reason": "A code constant at model scale (a retry count, a cap, a tolerance or a budget in ticks): the model shrinks it to bound the state space, so its value is not the code's.",
+					"constants": [
+						"Margin"
+					]
+				}
+			],
+			"deferred": [
+				{
+					"reason": "Deferred: no single as-built value yet. This family's `expect: pass` configs set it both ways (a pass config here is not an as-built claim), so the family must first name its as-built value before a pin can agree with it.",
+					"constants": [
+						"SyncCarriesRead",
+						"StampedPrepare",
+						"FirstOpenExempt"
+					]
+				}
+			]
+		},
+		"lsp-server-content": {
+			"pins": {
+				"Track": {
+					"value": "TRUE",
+					"test": "tests/clients/head-move-resync-4493.test.ts",
+					"title": "sends a held document's new bytes before the checkout's tool_result returns, and records no mutation"
+				},
+				"Keying": {
+					"value": "\"session\"",
+					"test": "tests/clients/head-move-resync-4493.test.ts",
+					"title": "keeps one HEAD record per session: a second session sees the move at its own call"
+				},
+				"Compare": {
+					"value": "TRUE",
+					"test": "tests/clients/head-move-resync-4493.test.ts",
+					"title": "records one move once when parallel bash calls share it"
+				},
+				"CurrentOnly": {
+					"value": "TRUE",
+					"test": "tests/clients/head-move-resync-4493.test.ts",
+					"title": "resends nothing when the move leaves the held bytes current, as a commit does"
+				},
+				"ReportDeferred": {
+					"value": "TRUE",
+					"test": "tests/clients/head-move-resync-4493.test.ts",
+					"title": "states in the one row how many held documents the drain cap deferred"
+				},
+				"Serial": {
+					"value": "TRUE",
+					"test": "tests/clients/head-move-resync-4493.test.ts",
+					"title": "returns no concurrent look of a session before the move's resync is sent"
+				},
+				"PrimaryFirst": {
+					"value": "TRUE",
+					"test": "tests/clients/head-move-resync-4493.test.ts",
+					"title": "sends every changed held document to the primary before the tool_result returns, however slow the auxiliary"
+				},
+				"Join": {
+					"value": "TRUE",
+					"test": "tests/clients/head-move-resync-4493.test.ts",
+					"title": "holds a parallel tool_call until the running look has sent the move's bytes"
+				},
+				"WritesPrimaryFirst": {
+					"value": "TRUE",
+					"test": "tests/clients/head-move-resync-4493.test.ts",
+					"title": "checks a dependent the command rewrote against its rewritten dependency"
+				},
+				"DispatchWaitsPhase": {
+					"value": "TRUE",
+					"test": "tests/clients/head-move-resync-4493.test.ts",
+					"title": "checks a dependent against its rewritten dependency when the primary phase outlasts the read-only bound (%s diagnostics)"
+				},
+				"RequireOrderedDrain": {
+					"value": "TRUE",
+					"test": "tests/clients/head-move-resync-4493.test.ts",
+					"title": "records undrained when %s replies overtake queued changes"
+				},
+				"ContentGate": {
+					"value": "\"sent\"",
+					"test": "tests/clients/lsp/touch-debounce-content-gate.test.ts",
+					"title": "leaves the server's bytes alone when only the elapsed window has passed",
+					"also": [
+						{
+							"test": "tests/clients/lsp/touch-debounce-content-gate.test.ts",
+							"title": "pushes a document again after it was closed and reopened"
+						}
+					],
+					"narrowedBy": {
+						"\"window\"": {
+							"configs": [
+								"GateWindowRepush"
+							],
+							"reason": "GateWindowRepush and GateWindowReopen run the pre-#4532 gate. The code reads it nowhere: since round 3 a client that cannot report the record is PUSHED (fail closed), because GateWindowReopen shows the window gate can leave a server holding no document at all for a file on disk. These two configs therefore pin what the old rule does, not what any path runs."
+						}
+					}
+				},
+				"SkipNeedsIdle": {
+					"value": "TRUE",
+					"test": "tests/clients/lsp/touch-debounce-fingerprint.test.ts",
+					"title": "pushes a touch while a send of other bytes is still in flight",
+					"also": [
+						{
+							"test": "tests/clients/lsp/touch-debounce-fingerprint.test.ts",
+							"title": "pushes when a client can report its record but not its queue"
+						}
+					]
+				},
+				"SaveBoundToContent": {
+					"value": "TRUE",
+					"test": "tests/clients/lsp/touch-debounce-content-gate.test.ts",
+					"title": "sends the save a skipped touch still owes after another writer advanced the record"
+				},
+				"SaveRetryOnFailure": {
+					"value": "TRUE",
+					"test": "tests/clients/lsp/touch-debounce-fingerprint.test.ts",
+					"title": "retries a standalone save whose notification failed",
+					"also": [
+						{
+							"test": "tests/clients/lsp/touch-debounce-fingerprint.test.ts",
+							"title": "owes the save again after the retry failed too"
+						}
+					]
+				},
+				"SaveMarkOnLanding": {
+					"value": "TRUE",
+					"test": "tests/clients/lsp/touch-debounce-fingerprint.test.ts",
+					"title": "saves the bytes skipped by a coalesced saved content push",
+					"also": [
+						{
+							"test": "tests/clients/lsp/touch-debounce-content-gate.test.ts",
+							"title": "sends the save a skipped touch still owes after another writer advanced the record"
+						},
+						{
+							"test": "tests/clients/lsp/service-did-save-option.test.ts",
+							"title": "sends one save for two saved touches over one unsaved push"
+						}
+					]
+				}
+			},
+			"notCodeChoice": [
+				{
+					"reason": "Scenario bound or actor set: it sizes the state space or picks which actors, inputs and steps TLC explores; no code branch reads it.",
+					"constants": [
+						"Cascade",
+						"EqualLength",
+						"InitRec",
+						"LossyFp",
+						"MaxMoves",
+						"MidClose",
+						"MidSweeps",
+						"OpenFilePushes",
+						"PriorInFlight",
+						"RecentA",
+						"Revert",
+						"SavedTouches",
+						"SaveSendFails",
+						"Writes"
+					]
+				},
+				{
+					"reason": "Environment: a host, OS, server or scheduling behaviour the code must tolerate, not a choice the code makes.",
+					"constants": [
+						"FifoLanding",
+						"Outside",
+						"ReplyOrdering"
+					]
+				},
+				{
+					"reason": "A code constant at model scale (a retry count, a cap, a tolerance or a budget in ticks): the model shrinks it to bound the state space, so its value is not the code's.",
+					"constants": [
+						"Cap"
+					]
+				}
+			],
+			"deferred": [
+				{
+					"reason": "Deferred: no single as-built value yet. This family's `expect: pass` configs set it both ways (a pass config here is not an as-built claim), so the family must first name its as-built value before a pin can agree with it.",
+					"constants": [
+						"FixCoalesce",
+						"FixDrop"
+					]
+				},
+				{
+					"reason": "Deferred: every `expect: pass` config agrees on one value, but no existing dispatcher or entry-point test was matched to it in #4393, which pinned read-guard first.",
+					"constants": [
+						"Debounce",
+						"SweepKey"
+					]
+				}
+			]
+		},
+		"opaque-baseline-slot": {
+			"pins": {
+				"Root": {
+					"value": "\"one\"",
+					"test": "tests/index-4504-opaque-prescan-root-witness.test.ts",
+					"title": "recovers the linked-worktree session's own opaque write at its tool_result"
+				}
+			},
+			"notCodeChoice": [
+				{
+					"reason": "Scenario bound or actor set: it sizes the state space or picks which actors, inputs and steps TLC explores; no code branch reads it.",
+					"constants": [
+						"Scenario"
+					]
+				},
+				{
+					"reason": "Environment: a host, OS, server or scheduling behaviour the code must tolerate, not a choice the code makes.",
+					"constants": [
+						"Sequential",
+						"LatchClear"
+					]
+				},
+				{
+					"reason": "A code constant at model scale (a retry count, a cap, a tolerance or a budget in ticks): the model shrinks it to bound the state space, so its value is not the code's.",
+					"constants": [
+						"Cap"
+					]
+				}
+			],
+			"deferred": [
+				{
+					"reason": "Deferred: no single as-built value yet. This family's `expect: pass` configs set it both ways (a pass config here is not an as-built claim), so the family must first name its as-built value before a pin can agree with it.",
+					"constants": [
+						"Keying",
+						"Dedupe",
+						"Retire",
+						"ClearRule"
+					]
+				},
+				{
+					"reason": "Deferred: every `expect: pass` config agrees on one value, but no existing dispatcher or entry-point test was matched to it in #4393, which pinned read-guard first.",
+					"constants": [
+						"Subtract",
+						"Observe"
+					]
+				}
+			]
+		},
+		"pending-runner-store": {
+			"notCodeChoice": [
+				{
+					"reason": "Scenario bound or actor set: it sizes the state space or picks which actors, inputs and steps TLC explores; no code branch reads it.",
+					"constants": [
+						"Slots"
+					]
+				}
+			],
+			"deferred": [
+				{
+					"reason": "Deferred: every `expect: pass` config agrees on one value, but no existing dispatcher or entry-point test was matched to it in #4393, which pinned read-guard first.",
+					"constants": [
+						"Peek",
+						"Drain",
+						"Requeue",
+						"NoHandle"
+					]
+				}
+			]
+		},
+		"read-guard": {
+			"pins": {
+				"AuthorBranch": {
+					"value": "TRUE",
+					"test": "tests/index-3521-fork-tree-witness.test.ts",
+					"title": "keeps the authorship of a brand-new file whose write is on the kept branch (#3603)"
+				},
+				"AuthorIdentity": {
+					"value": "TRUE",
+					"test": "tests/clients/read-guard-conversation-evidence.test.ts",
+					"title": "ends bash authorship when another writer changes the bytes (#4131 R1)"
+				},
+				"BlockRelease": {
+					"value": "\"end\"",
+					"test": "tests/clients/runtime-tool-result.test.ts",
+					"title": "refuses a %s oldText edit in the same run once the blocked read's call ended"
+				},
+				"BranchFilter": {
+					"value": "TRUE",
+					"test": "tests/index-3521-fork-tree-witness.test.ts",
+					"title": "blocks an edit backed only by a read on the abandoned branch (A1)"
+				},
+				"BridgeNoAdvance": {
+					"value": "TRUE",
+					"test": "tests/clients/mutation-bridge.test.ts",
+					"title": "ends the authorship a ${provenance ?? \"co-process\"} write lands on",
+					"also": [
+						{
+							"test": "tests/clients/runtime-tool-call.test.ts",
+							"title": "spends an observed bridge license after one whole-file write (SpendLicense)"
+						}
+					]
+				},
+				"CoverageCheck": {
+					"value": "TRUE",
+					"test": "tests/clients/read-guard-conversation-evidence.test.ts",
+					"title": "sizes a raced read from the delivered text, not from lines another writer appended"
+				},
+				"CreationHandlerEvidence": {
+					"value": "FALSE",
+					"test": "tests/clients/read-guard-conversation-evidence.test.ts",
+					"title": "does not credit a write that lands between the host write and its tool_result (CreationAtResult)"
+				},
+				"DrainMode": {
+					"value": "\"fenced\"",
+					"test": "tests/clients/runtime-agent-end.test.ts",
+					"title": "drains an abort-requeued format ${where} as ${verdict}",
+					"narrowedBy": {
+						"\"atomic\"": {
+							"configs": [
+								"AuthorBranch",
+								"AuthorBranchExt",
+								"AuthorBridgeForeign",
+								"AuthorBridgeOwn",
+								"AuthorDrainForeign",
+								"AuthorForeign",
+								"AuthorOwnExternal",
+								"AuthorOwnOldText",
+								"AuthorOwnOldTextForeign",
+								"AuthorOwnOldTextIdless",
+								"AuthorOwnOldTextIdlessBash",
+								"AuthorOwnOldTextInflight",
+								"AuthorOwnOldTextMove",
+								"AuthorRewriteForeign",
+								"AuthorSettledSweep",
+								"AuthorTouch",
+								"AutofixFalseBlock",
+								"AutofixPastEnd",
+								"AutofixRecorded",
+								"AutofixRelocate",
+								"BashAuthored",
+								"BlockedRead",
+								"ContextSuppress",
+								"CreationAtResult",
+								"EvidenceAtResult",
+								"EvidenceFromDelivered",
+								"FailedReadFork",
+								"ForkFilter",
+								"ForkFilterUnhashed",
+								"Guarded",
+								"MtimeAuthored",
+								"MtimeAuthoredNew",
+								"NewSession",
+								"OwnEditReloc",
+								"OwnEditRelocInsert",
+								"OwnReEdit",
+								"SpanAcrossReads",
+								"SpanSnapshotFix",
+								"TreeFilter",
+								"TreeFilterExt",
+								"TreeFilterUnhashed",
+								"Unhashed",
+								"UnhashedFormatStamp",
+								"UnhashedOwnEditRescue"
+							],
+							"reason": "The drain runs inside the turn boundary, so no /tree lands between its settle and its write: a schedule the fenced drain also takes. Configs that do not test the drain's timing use it to cut states (formal/read-guard/README.md, Switches)."
+						}
+					}
+				},
+				"FileTimeCheck": {
+					"value": "TRUE",
+					"test": "tests/clients/read-guard-conversation-evidence.test.ts",
+					"title": "leaves FileTime to recordWritten, so a write after it stays visible on an unhashed attachment"
+				},
+				"FormatStamp": {
+					"value": "FALSE",
+					"test": "tests/clients/read-guard-conversation-evidence.test.ts",
+					"title": "does not credit the deferred format's bytes to an unhashed read (UnhashedFormatStamp)"
+				},
+				"HandlerEvidence": {
+					"value": "FALSE",
+					"test": "tests/clients/read-guard-conversation-evidence.test.ts",
+					"title": "does not credit a write that lands after pi's read and before its tool_result (EvidenceAtResult)"
+				},
+				"InjectNamesAuthorship": {
+					"value": "TRUE",
+					"test": "tests/clients/read-guard-conversation-evidence.test.ts",
+					"title": "allows the next edit after a bash write and its own oldText edits, also after a branch move (#4387)"
+				},
+				"KeepEmptyScope": {
+					"value": "TRUE",
+					"test": "tests/clients/read-guard-conversation-evidence.test.ts",
+					"title": "keeps the in-flight line refused after a format drain and a move (#4387 S14)"
+				},
+				"MtimeAuthored": {
+					"value": "FALSE",
+					"test": "tests/clients/read-guard.test.ts",
+					"title": "blocks zero-read edit on a file another writer touched after the guard started (#3520)"
+				},
+				"OldTextNeedsNamedRead": {
+					"value": "TRUE",
+					"test": "tests/clients/read-guard-conversation-evidence.test.ts",
+					"title": "keeps a line another writer changed during an own oldText edit refused when only a bridge read was there (#4387 S12)"
+				},
+				"OldTextRetires": {
+					"value": "FALSE",
+					"test": "tests/clients/read-guard-conversation-evidence.test.ts",
+					"title": "does not retire a write's authorship at its own oldText edit (#4387)"
+				},
+				"OwnEditRescue": {
+					"value": "FALSE",
+					"test": "tests/clients/read-guard-conversation-evidence.test.ts",
+					"title": "keeps another writer's change stale after an own positional edit (UnhashedOwnEditRescue)"
+				},
+				"OwnEditSkipsReloc": {
+					"value": "TRUE",
+					"test": "tests/clients/read-guard-conversation-evidence.test.ts",
+					"title": "does not record a relocated edit at the agent's line numbers (OwnEditRelocInsert)"
+				},
+				"PipelineCreditsOldText": {
+					"value": "FALSE",
+					"test": "tests/clients/read-guard-conversation-evidence.test.ts",
+					"title": "makes no authorship from an oldText edit of a file the conversation only read (#4387 G3)"
+				},
+				"ProvisionalCredit": {
+					"value": "FALSE",
+					"test": "tests/clients/runtime-tool-result.test.ts",
+					"title": "records a relative nested read under its parent's transcript identity, after a provisional record keyed by its own call"
+				},
+				"RecordAuthoritative": {
+					"value": "TRUE",
+					"test": "tests/clients/read-guard-conversation-evidence.test.ts",
+					"title": "allows a one-line edit at the attachment's line numbers (AutofixFalseBlock)"
+				},
+				"RecordOwnEdit": {
+					"value": "TRUE",
+					"test": "tests/clients/read-guard-conversation-evidence.test.ts",
+					"title": "allows re-editing the line the agent just wrote (OwnReEdit)"
+				},
+				"RelocFromLatest": {
+					"value": "TRUE",
+					"test": "tests/clients/read-guard-conversation-evidence.test.ts",
+					"title": "does not relocate from the read that delivered the first line when a newer read delivered the last (SpanSnapshotFixAnyReloc)"
+				},
+				"RetireAtWrite": {
+					"value": "TRUE",
+					"test": "tests/clients/read-guard-conversation-evidence.test.ts",
+					"title": "does not let an own bash write re-author bytes another writer changed (#4131 F6 P2)"
+				},
+				"RevokeFailedRead": {
+					"value": "TRUE",
+					"test": "tests/clients/runtime-tool-result.test.ts",
+					"title": "drops the capture of a read that errored, so an oldText edit of unseen lines is refused"
+				},
+				"SnapshotCheck": {
+					"value": "TRUE",
+					"test": "tests/clients/read-guard-conversation-evidence.test.ts",
+					"title": "blocks a spanning edit when the SECOND read's line went stale"
+				},
+				"SpanSnapshot": {
+					"value": "TRUE",
+					"test": "tests/clients/read-guard-conversation-evidence.test.ts",
+					"title": "does not let a newer context-only read cancel a stale line (ContextSuppress)"
+				},
+				"WholeVouchesPastEnd": {
+					"value": "FALSE",
+					"test": "tests/clients/read-guard-conversation-evidence.test.ts",
+					"title": "lets an older read speak for a line past a newer whole-file read's end (WholeVouchesPastEnd)"
+				},
+				"ZeroReadInjects": {
+					"value": "TRUE",
+					"test": "tests/clients/read-guard-conversation-evidence.test.ts",
+					"title": "keeps a bash write's whole-file authorship vouching after its own positional edit (#4387)"
+				}
+			},
+			"notCodeChoice": [
+				{
+					"reason": "Scenario bound or actor set: it sizes the state space or picks which agent tools, edit spans, other-writer kinds, boundaries and formatter shapes TLC explores; no code branch reads it.",
+					"constants": [
+						"N0",
+						"MaxLen",
+						"AgentOps",
+						"Ops",
+						"Spans",
+						"ExtWrites",
+						"ExtKinds",
+						"ExtPhases",
+						"FixKind",
+						"FormatDrain",
+						"Bounds",
+						"MaxBounds"
+					]
+				},
+				{
+					"reason": "Input, not a choice: `Hashes` stands for a file at most READ_HASH_MAX_LINES long, and `Ctx` for the user's contextLines setting; the configs run both values of each.",
+					"constants": [
+						"Hashes",
+						"Ctx"
+					]
+				},
+				{
+					"reason": "Inert in every as-built config: the model reads `ForkImport` and `ForkAtBoundary` only when BranchFilter = FALSE, and `SuppressByNewerContext` only when SpanSnapshot = FALSE (ReadGuard.tla Fork, Tree and SnapBlock). The pinned BranchFilter and SpanSnapshot carry the code's choice.",
+					"constants": [
+						"ForkImport",
+						"ForkAtBoundary",
+						"SuppressByNewerContext"
+					]
+				}
+			]
+		},
+		"review-graph-promotion": {
+			"notCodeChoice": [
+				{
+					"reason": "Scenario bound or actor set: it sizes the state space or picks which actors, inputs and steps TLC explores; no code branch reads it.",
+					"constants": [
+						"Procs",
+						"MaxSeq",
+						"MaxBuilds"
+					]
+				},
+				{
+					"reason": "Environment: a host, OS, server or scheduling behaviour the code must tolerate, not a choice the code makes.",
+					"constants": [
+						"AllowCrash",
+						"AllowWorkerDeath"
+					]
+				}
+			],
+			"deferred": [
+				{
+					"reason": "Deferred: every `expect: pass` config agrees on one value, but no existing dispatcher or entry-point test was matched to it in #4393, which pinned read-guard first.",
+					"constants": [
+						"Conc",
+						"GenGate",
+						"SweepLiveness",
+						"FlushCurrentOnly"
+					]
+				}
+			]
+		},
+		"review-graph-signatures": {
+			"notCodeChoice": [
+				{
+					"reason": "Scenario bound or actor set: it sizes the state space or picks which actors, inputs and steps TLC explores; no code branch reads it.",
+					"constants": [
+						"Procs",
+						"Writers",
+						"Observers",
+						"Files",
+						"MaxWrites"
+					]
+				}
+			],
+			"deferred": [
+				{
+					"reason": "Deferred: no single as-built value yet. This family's `expect: pass` configs set it both ways (a pass config here is not an as-built claim), so the family must first name its as-built value before a pin can agree with it.",
+					"constants": [
+						"AllowFastpath",
+						"FixFpNoop",
+						"FixFpExtract"
+					]
+				},
+				{
+					"reason": "Deferred: every `expect: pass` config agrees on one value, but no existing dispatcher or entry-point test was matched to it in #4393, which pinned read-guard first.",
+					"constants": [
+						"SharedStore"
+					]
+				}
+			]
+		},
+		"session-lifecycle": {
+			"pins": {
+				"TeardownAtLastMember": {
+					"value": "TRUE",
+					"test": "tests/index-4554-last-member-teardown.test.ts",
+					"title": "runs the shared teardown once when the last session to leave is a secondary",
+					"also": [
+						{
+							"test": "tests/index-4554-last-member-teardown.test.ts",
+							"title": "runs the shared teardown when the primary is the last session to leave"
+						}
+					]
+				},
+				"UnmatchedLeaveIsLast": {
+					"value": "FALSE",
+					"test": "tests/index-4554-last-member-teardown.test.ts",
+					"title": "r6 a superseded primary's delayed shutdown never tears down its replacement"
+				}
+			},
+			"notCodeChoice": [
+				{
+					"reason": "Scenario bound or actor set: it sizes the state space or picks which actors, inputs and steps TLC explores; no code branch reads it.",
+					"constants": [
+						"Transitions",
+						"Writers",
+						"FileLess",
+						"MaxSteps",
+						"MaxTurns"
+					]
+				},
+				{
+					"reason": "Environment: a host, OS, server or scheduling behaviour the code must tolerate, not a choice the code makes.",
+					"constants": [
+						"LateHandlers"
+					]
+				}
+			],
+			"deferred": [
+				{
+					"reason": "Deferred: no single as-built value yet. This family's `expect: pass` configs set it both ways (a pass config here is not an as-built claim), so the family must first name its as-built value before a pin can agree with it.",
+					"constants": [
+						"FixParts",
+						"SecPolicy"
+					]
+				},
+				{
+					"reason": "Deferred: every `expect: pass` config agrees on one value, but no existing dispatcher or entry-point test was matched to it in #4393, which pinned read-guard first.",
+					"constants": [
+						"ForwardExpiredUnstarted",
+						"Policy",
+						"Fence"
+					]
+				}
+			]
+		},
+		"session-registry": {
+			"notCodeChoice": [
+				{
+					"reason": "Scenario bound or actor set: it sizes the state space or picks which actors, inputs and steps TLC explores; no code branch reads it.",
+					"constants": [
+						"SharedSec",
+						"Reaper"
+					]
+				},
+				{
+					"reason": "Environment: a host, OS, server or scheduling behaviour the code must tolerate, not a choice the code makes.",
+					"constants": [
+						"Contention",
+						"PeerStuck"
+					]
+				}
+			],
+			"deferred": [
+				{
+					"reason": "Deferred: no single as-built value yet. This family's `expect: pass` configs set it both ways (a pass config here is not an as-built claim), so the family must first name its as-built value before a pin can agree with it.",
+					"constants": [
+						"RootRemoval",
+						"Teardown",
+						"FixParts"
+					]
+				},
+				{
+					"reason": "Deferred: every `expect: pass` config agrees on one value, but no existing dispatcher or entry-point test was matched to it in #4393, which pinned read-guard first.",
+					"constants": [
+						"HbRepair",
+						"ClearIntent"
+					]
+				}
+			]
+		},
+		"session-straddle": {
+			"notCodeChoice": [
+				{
+					"reason": "Scenario bound or actor set: it sizes the state space or picks which actors, inputs and steps TLC explores; no code branch reads it.",
+					"constants": [
+						"QuietWindow"
+					]
+				},
+				{
+					"reason": "Environment: a host, OS, server or scheduling behaviour the code must tolerate, not a choice the code makes.",
+					"constants": [
+						"ToolDrift",
+						"Strays",
+						"Overflow",
+						"LateAdmit",
+						"EarlyAbandon"
+					]
+				}
+			],
+			"deferred": [
+				{
+					"reason": "Deferred: no single as-built value yet. This family's `expect: pass` configs set it both ways (a pass config here is not an as-built claim), so the family must first name its as-built value before a pin can agree with it.",
+					"constants": [
+						"FixParts"
+					]
+				},
+				{
+					"reason": "Deferred: every `expect: pass` config agrees on one value, but no existing dispatcher or entry-point test was matched to it in #4393, which pinned read-guard first.",
+					"constants": [
+						"ResetClears",
+						"Dedupe"
+					]
+				}
+			],
+			"pins": {
+				"Capacity": {
+					"value": "4",
+					"test": "tests/index-4483-first-write-seed-witness.test.ts",
+					"title": "bounds distinct captures and refuses a seed after cancellation"
+				},
+				"CheckCancellation": {
+					"value": "TRUE",
+					"test": "tests/index-4483-first-write-seed-witness.test.ts",
+					"title": "session reset cancels held captures before their unchanged bytes can seed",
+					"also": [
+						{
+							"test": "tests/index-4483-first-write-seed-witness.test.ts",
+							"title": "bounds distinct captures and refuses a seed after cancellation"
+						}
+					]
+				}
+			}
+		},
+		"snapshot-freshness": {
+			"notCodeChoice": [
+				{
+					"reason": "Scenario bound or actor set: it sizes the state space or picks which actors, inputs and steps TLC explores; no code branch reads it.",
+					"constants": [
+						"Procs",
+						"MaxEdits"
+					]
+				},
+				{
+					"reason": "Environment: a host, OS, server or scheduling behaviour the code must tolerate, not a choice the code makes.",
+					"constants": [
+						"ColdSeeds",
+						"UnlockedEdits"
+					]
+				},
+				{
+					"reason": "Mutant-only design: every as-built config sets the off value, and it breaks a guard to show a violation; no code ever had it.",
+					"constants": [
+						"NeverSeqMutant",
+						"RefuseAllMutant",
+						"AlwaysIncompleteMutant"
+					]
+				}
+			],
+			"deferred": [
+				{
+					"reason": "Deferred: every `expect: pass` config agrees on one value, but no existing dispatcher or entry-point test was matched to it in #4393, which pinned read-guard first.",
+					"constants": [
+						"LogAlloc",
+						"CompleteStamp",
+						"SeqCAS",
+						"ReaderRule"
+					]
+				}
+			]
+		},
+		"snapshot-promotion": {
+			"notCodeChoice": [
+				{
+					"reason": "Scenario bound or actor set: it sizes the state space or picks which actors, inputs and steps TLC explores; no code branch reads it.",
+					"constants": [
+						"Procs",
+						"MaxSeq",
+						"MaxSaves"
+					]
+				},
+				{
+					"reason": "Environment: a host, OS, server or scheduling behaviour the code must tolerate, not a choice the code makes.",
+					"constants": [
+						"AllowCrash"
+					]
+				},
+				{
+					"reason": "Mutant-only design: every as-built config sets the off value, and it breaks a guard to show a violation; no code ever had it.",
+					"constants": [
+						"SessionReset",
+						"RefuseAll"
+					]
+				}
+			],
+			"deferred": [
+				{
+					"reason": "Deferred: no single as-built value yet. This family's `expect: pass` configs set it both ways (a pass config here is not an as-built claim), so the family must first name its as-built value before a pin can agree with it.",
+					"constants": [
+						"SweepLiveness",
+						"PromoteCAS",
+						"AdmissionCAS",
+						"CASAtomic"
+					]
+				},
+				{
+					"reason": "Deferred: every `expect: pass` config agrees on one value, but no existing dispatcher or entry-point test was matched to it in #4393, which pinned read-guard first.",
+					"constants": [
+						"GenGate",
+						"SingleActive"
+					]
+				}
+			]
+		},
+		"store-freshness": {
+			"pins": {
+				"Retire": {
+					"value": "\"retain\"",
+					"test": "tests/clients/widget-state.test.ts",
+					"title": "keeps the record unfinished, reports it once, keeps it on the next sweep and reports a later change again",
+					"also": [
+						{
+							"test": "tests/tools/lens-diagnostics-session-evidence.test.ts",
+							"title": "stays inconclusive on a second read that rescans nothing"
+						},
+						{
+							"test": "tests/tools/lens-diagnostics-session-evidence.test.ts",
+							"title": "stays inconclusive when the footer's observer-less sweep ran first"
+						}
+					]
+				}
+			},
+			"notCodeChoice": [
+				{
+					"reason": "Scenario bound or actor set: it sizes the state space or picks which actors, inputs and steps TLC explores; no code branch reads it.",
+					"constants": [
+						"Writes",
+						"SizeMode",
+						"MaxTime",
+						"MinReadDelay",
+						"MaxServes"
+					]
+				},
+				{
+					"reason": "Environment: a host, OS, server or scheduling behaviour the code must tolerate, not a choice the code makes.",
+					"constants": [
+						"Skew",
+						"AllowRegress",
+						"ServerLag"
+					]
+				},
+				{
+					"reason": "A code constant at model scale (a retry count, a cap, a tolerance or a budget in ticks): the model shrinks it to bound the state space, so its value is not the code's.",
+					"constants": [
+						"Tol",
+						"Gran"
+					]
+				},
+				{
+					"reason": "Mutant-only design: every as-built config sets the off value, and it breaks a guard to show a violation; no code ever had it.",
+					"constants": [
+						"SizeOnly"
+					]
+				}
+			],
+			"deferred": [
+				{
+					"reason": "Deferred: no single as-built value yet. This family's `expect: pass` configs set it both ways (a pass config here is not an as-built claim), so the family must first name its as-built value before a pin can agree with it.",
+					"constants": [
+						"Stamp",
+						"Gate",
+						"ForceHash",
+						"StatAt",
+						"Binding",
+						"Latch"
+					]
+				},
+				{
+					"reason": "Deferred: every `expect: pass` config agrees on one value, but no existing dispatcher or entry-point test was matched to it in #4393, which pinned read-guard first.",
+					"constants": [
+						"SizeKey",
+						"BindingAt"
+					]
+				}
+			]
+		},
+		"tree-sitter-trap-budget": {
+			"notCodeChoice": [
+				{
+					"reason": "Scenario bound or actor set: it sizes the state space or picks which actors, inputs and steps TLC explores; no code branch reads it.",
+					"constants": [
+						"Inputs",
+						"Persistent",
+						"Files",
+						"Contents",
+						"Consumers",
+						"Swallowers",
+						"Owners",
+						"MaxHeap",
+						"MaxPend",
+						"PoisonCandidates",
+						"EnableFiles",
+						"EnableExt",
+						"EnableBatch",
+						"EnableRaw"
+					]
+				},
+				{
+					"reason": "Environment: a host, OS, server or scheduling behaviour the code must tolerate, not a choice the code makes.",
+					"constants": [
+						"Flaky"
+					]
+				}
+			],
+			"deferred": [
+				{
+					"reason": "Deferred: no single as-built value yet. This family's `expect: pass` configs set it both ways (a pass config here is not an as-built claim), so the family must first name its as-built value before a pin can agree with it.",
+					"constants": [
+						"Coalesce",
+						"BatchHealDrop"
+					]
+				},
+				{
+					"reason": "Deferred: every `expect: pass` config agrees on one value, but no existing dispatcher or entry-point test was matched to it in #4393, which pinned read-guard first.",
+					"constants": [
+						"Decay",
+						"Classify",
+						"KeyInputs",
+						"KeyExtractor",
+						"ParseNoCaller",
+						"ConsumeSharedKey",
+						"OwnHealOnly",
+						"FullIdentity",
+						"GuardF1",
+						"KeyBatch",
+						"CacheGuard",
+						"DistinctBatchKeys"
+					]
+				},
+				{
+					"reason": "Deferred: code constants at their code values, not shrunk. The as-built configs set `Budget = 3` (`WASM_TRAP_BUDGET = 3`) and `LatchThreshold = 2` (`GRAMMAR_TRAP_LATCH_THRESHOLD = WASM_TRAP_BUDGET - 1`, clients/tree-sitter-client.ts), so the values mirror the code; no budget or latch test was matched in #4393.",
+					"constants": [
+						"LatchThreshold",
+						"Budget"
+					]
+				}
+			]
+		},
+		"turn-end-delivery-holds": {
+			"notCodeChoice": [
+				{
+					"reason": "Scenario bound or actor set: it sizes the state space or picks which actors, inputs and steps TLC explores; no code branch reads it.",
+					"constants": [
+						"SizeSet",
+						"MaxTurns",
+						"MaxGen"
+					]
+				},
+				{
+					"reason": "A code constant at model scale (a retry count, a cap, a tolerance or a budget in ticks): the model shrinks it to bound the state space, so its value is not the code's.",
+					"constants": [
+						"CapChars",
+						"Sep",
+						"RearmMax"
+					]
+				}
+			],
+			"deferred": [
+				{
+					"reason": "Deferred: every `expect: pass` config agrees on one value, but no existing dispatcher or entry-point test was matched to it in #4393, which pinned read-guard first.",
+					"constants": [
+						"PeekCommit",
+						"DrainAsk",
+						"ReOffer",
+						"ParkKey",
+						"Lead",
+						"Recheck",
+						"Fence",
+						"OnReached",
+						"DrainFence"
+					]
+				}
+			]
+		},
+		"turn-end-late-scan": {
+			"notCodeChoice": [
+				{
+					"reason": "Scenario bound or actor set: it sizes the state space or picks which actors, inputs and steps TLC explores; no code branch reads it.",
+					"constants": [
+						"Edits",
+						"MaxSess",
+						"MaxScan",
+						"MaxEnt"
+					]
+				},
+				{
+					"reason": "Environment: a host, OS, server or scheduling behaviour the code must tolerate, not a choice the code makes.",
+					"constants": [
+						"Foreign"
+					]
+				}
+			],
+			"deferred": [
+				{
+					"reason": "Deferred: every `expect: pass` config agrees on one value, but no existing dispatcher or entry-point test was matched to it in #4393, which pinned read-guard first.",
+					"constants": [
+						"Settle",
+						"SettlePoison",
+						"Poison",
+						"Late",
+						"InFlight",
+						"CarryRec",
+						"EntryScope",
+						"TakeBackoff",
+						"Backoff",
+						"StampAt",
+						"Join"
+					]
+				}
+			]
+		},
+		"blocker-pending": {
+			"pins": {
+				"ClearOnCurrent": {
+					"value": "TRUE",
+					"test": "tests/index-4484-unfixed-blocker-witness.test.ts",
+					"title": "keeps an LSP error that write 2 left in place blocking on every surface (cell A)",
+					"also": [
+						{
+							"test": "tests/index-4484-unfixed-blocker-witness.test.ts",
+							"title": "keeps the later helm blocker when fixing the earlier one renumbers it (cell R)"
+						},
+						{
+							"test": "tests/clients/runtime-coordinator.test.ts",
+							"title": "refuses a clear while the clearing run still observes a blocker, whatever its authorship (#4484)"
+						}
+					],
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"NoDelta"
+							],
+							"reason": "NoDelta is the causal differential: the code before #4484 under --no-delta (Delta = FALSE), where the delta's blockers are the whole observation, so the switch is inert there and the config shows the defect needs the delta."
+						}
+					}
+				},
+				"OpaqueKeep": {
+					"value": "TRUE",
+					"test": "tests/clients/opaque-mutation-scan.test.ts",
+					"title": "keeps an authored blocker when an opaque run of changed bytes still observes it (#4484)",
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"NoDelta"
+							],
+							"reason": "NoDelta has no unauthored write (OpaqueWrites = 0), so the switch is inert; it keeps the whole code before #4484 for the --no-delta differential."
+						}
+					}
+				},
+				"ScopeDeliveryOnly": {
+					"value": "TRUE",
+					"test": "tests/index-4484-unfixed-blocker-witness.test.ts",
+					"title": "keeps an ast-grep blocker pending after an edit to another line (row 7)",
+					"also": [
+						{
+							"test": "tests/index-4484-unfixed-blocker-witness.test.ts",
+							"title": "keeps a tree-sitter blocker pending after an edit to another line (row 7)"
+						}
+					],
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"NoDelta"
+							],
+							"reason": "NoDelta keeps the whole code before #4484 for the --no-delta differential; it has no range-gated runner, no failing run, no collect-later finding and no unused value (RangeGated, MayFail, Deferred and Unused are FALSE), so the switch is inert there."
+						}
+					}
+				},
+				"CarryInconclusive": {
+					"value": "TRUE",
+					"test": "tests/index-4484-unfixed-blocker-witness.test.ts",
+					"title": "keeps an LSP error pending when the server does not answer the next write (row 10)",
+					"also": [
+						{
+							"test": "tests/index-4484-unfixed-blocker-witness.test.ts",
+							"title": "keeps an LSP error pending when the server fails on the next write (row 10)"
+						}
+					],
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"NoDelta"
+							],
+							"reason": "NoDelta keeps the whole code before #4484 for the --no-delta differential; it has no range-gated runner, no failing run, no collect-later finding and no unused value (RangeGated, MayFail, Deferred and Unused are FALSE), so the switch is inert there."
+						}
+					}
+				},
+				"CarryDeferred": {
+					"value": "TRUE",
+					"test": "tests/index-4484-unfixed-blocker-witness.test.ts",
+					"title": "keeps a blocker pending while its collect-later re-check runs, and retires it only when a current run settles clean (rows 12, 14)",
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"NoDelta"
+							],
+							"reason": "NoDelta keeps the whole code before #4484 for the --no-delta differential; it has no range-gated runner, no failing run, no collect-later finding and no unused value (RangeGated, MayFail, Deferred and Unused are FALSE), so the switch is inert there."
+						}
+					}
+				},
+				"CarryPromoted": {
+					"value": "TRUE",
+					"test": "tests/index-4484-unfixed-blocker-witness.test.ts",
+					"title": "keeps a delta-promoted unused value blocking on the next unrelated write (row 16)",
+					"narrowedBy": {
+						"FALSE": {
+							"configs": [
+								"NoDelta"
+							],
+							"reason": "NoDelta keeps the whole code before #4484 for the --no-delta differential; it has no range-gated runner, no failing run, no collect-later finding and no unused value (RangeGated, MayFail, Deferred and Unused are FALSE), so the switch is inert there."
+						}
+					}
+				},
+				"CarryByPosition": {
+					"value": "TRUE",
+					"test": "tests/index-4484-unfixed-blocker-witness.test.ts",
+					"title": "retires a fixed ast-grep blocker beside an untouched match of the same rule (row 6)",
+					"also": [
+						{
+							"test": "tests/index-4484-unfixed-blocker-witness.test.ts",
+							"title": "retires a fixed tree-sitter blocker beside an untouched match of the same rule (row 6)"
+						},
+						{
+							"test": "tests/clients/finding-identity-retain.test.ts",
+							"title": "retires a fixed finding although the same rule still matches elsewhere"
+						},
+						{
+							"test": "tests/clients/runtime-coordinator.test.ts",
+							"title": "retires a blocker whose identity the run observes only at another line"
+						}
+					]
+				},
+				"SkipNoVerdict": {
+					"value": "TRUE",
+					"test": "tests/index-4484-unfixed-blocker-witness.test.ts",
+					"title": "keeps an LSP error pending when the file outgrows the language server's sync limit (row 11)",
+					"also": [
+						{
+							"test": "tests/index-4484-unfixed-blocker-witness.test.ts",
+							"title": "keeps an ast-grep blocker pending when the file outgrows the runner's size cap (row 11)"
+						},
+						{
+							"test": "tests/clients/dispatch/reached-no-verdict.test.ts",
+							"title": "reads a skip without a stated reason as no verdict"
+						},
+						{
+							"test": "tests/clients/dispatch/dispatcher-flow.test.ts",
+							"title": "skips a runner whose when() throws and continues with the others"
+						}
+					]
+				},
+				"OwedRanges": {
+					"value": "TRUE",
+					"test": "tests/index-4484-unfixed-blocker-witness.test.ts",
+					"title": "records a blocker first written while its runner had no verdict once the runner next answers (row 15)",
+					"also": [
+						{
+							"test": "tests/clients/dispatch/dispatcher-flow.test.ts",
+							"title": "widens only the owing runner's range"
+						},
+						{
+							"test": "tests/clients/line-alignment.test.ts",
+							"title": "keeps every earlier owed line after a run that may not deliver"
+						}
+					]
+				},
+				"UnalignedIdentity": {
+					"value": "TRUE",
+					"test": "tests/index-4484-unfixed-blocker-witness.test.ts",
+					"title": "keeps an ast-grep blocker pending when the write cannot be aligned (row 4, P11c)",
+					"also": [
+						{
+							"test": "tests/index-4484-unfixed-blocker-witness.test.ts",
+							"title": "keeps a tree-sitter blocker pending when the write cannot be aligned (row 4, P11d)"
+						},
+						{
+							"test": "tests/index-4484-unfixed-blocker-witness.test.ts",
+							"title": "keeps a tree-sitter blocker pending when the file outgrows the 2 MiB hash cap (row 4)"
+						},
+						{
+							"test": "tests/clients/finding-identity-retain.test.ts",
+							"title": "matches an unaligned finding by its identity at any line"
+						}
+					]
+				},
+				"UnalignedText": {
+					"value": "TRUE",
+					"test": "tests/index-4484-unfixed-blocker-witness.test.ts",
+					"title": "retires a fixed blocker on an unaligned write although an older match with other text stays (row 4b, P22)",
+					"also": [
+						{
+							"test": "tests/clients/finding-identity-retain.test.ts",
+							"title": "matches an unplaced finding only where its own text is"
+						},
+						{
+							"test": "tests/clients/line-alignment.test.ts",
+							"title": "stamps each own finding with its line's hash and keeps an existing one"
+						}
+					]
+				},
+				"StaleAnywhere": {
+					"value": "TRUE",
+					"test": "tests/index-4484-unfixed-blocker-witness.test.ts",
+					"title": "keeps a blocker its runner skipped on an unaligned write once the next write aligns (row 6b)",
+					"also": [
+						{
+							"test": "tests/index-4484-unfixed-blocker-witness.test.ts",
+							"title": "keeps a blocker carried without a place although its old line number now holds its text (row 34, P29)"
+						}
+					]
+				},
+				"OwedByContent": {
+					"value": "TRUE",
+					"test": "tests/index-4484-unfixed-blocker-witness.test.ts",
+					"title": "owes a runner that skipped a file with no record only the lines it skipped (row 9, P23)",
+					"also": [
+						{
+							"test": "tests/clients/line-alignment.test.ts",
+							"title": "owes the lines whose text matches an owed line, wherever they moved"
+						},
+						{
+							"test": "tests/clients/runtime-coordinator.test.ts",
+							"title": "drops the hashes with the record and keeps the owed line texts"
+						},
+						{
+							"test": "tests/clients/line-alignment.test.ts",
+							"title": "does not owe a line with no word character by its text"
+						}
+					]
+				},
+				"EditScopedKeep": {
+					"value": "TRUE",
+					"test": "tests/index-4484-unfixed-blocker-witness.test.ts",
+					"title": "keeps a napi blocker absorbed during a covered skip's dispatch when it lies outside the edit (row 38)",
+					"also": [
+						{
+							"test": "tests/clients/dispatch/runners/ast-grep-napi.test.ts",
+							"title": "says Gate B's verdict covers only the edit on a ranged dispatch, and the whole file otherwise (#4484 round 6)"
+						}
+					]
+				},
+				"EditScopedOwed": {
+					"value": "TRUE",
+					"test": "tests/clients/line-alignment.test.ts",
+					"title": "keeps a runner whose verdict covers only the edit owed its earlier lines outside the edit"
+				},
+				"LaneVoids": {
+					"value": "TRUE",
+					"test": "tests/index-4484-unfixed-blocker-witness.test.ts",
+					"title": "keeps napi owed an edit its covered skip saw while the ast-grep server was silent (row 37)",
+					"also": [
+						{
+							"test": "tests/index-4484-unfixed-blocker-witness.test.ts",
+							"title": "keeps a shellcheck blocker when its covering bash server does not answer (row 32, P39)"
+						},
+						{
+							"test": "tests/clients/dispatch/runners/ast-grep-napi.test.ts",
+							"title": "states why Gate B skips, so the skip is a verdict (#4484 round 4)"
+						}
+					]
+				},
+				"SettleCoverKeep": {
+					"value": "TRUE",
+					"test": "tests/clients/deferred-runner-blockers.test.ts",
+					"title": "retires nothing on a settled skip that defers to a covering lane"
+				},
+				"RecordedRuns": {
+					"value": "TRUE",
+					"test": "tests/index-4484-unfixed-blocker-witness.test.ts",
+					"title": "retires a napi blocker fixed after an edit on its line that the ast-grep server missed (row 31, P42)",
+					"also": [
+						{
+							"test": "tests/index-4484-unfixed-blocker-witness.test.ts",
+							"title": "retires a napi blocker fixed after an unaligned write while the ast-grep server covers the file (row 33, P38)"
+						},
+						{
+							"test": "tests/clients/dispatch/runners/ast-grep-napi.test.ts",
+							"title": "runs under Gate B while it holds a recorded blocker, naming the covering lane (#4509)"
+						}
+					]
+				}
+			},
+			"notCodeChoice": [
+				{
+					"reason": "Scenario bound or actor set: it sizes the state space or picks which actors, inputs and steps TLC explores; no code branch reads it.",
+					"constants": [
+						"Writes",
+						"OpaqueWrites",
+						"Turns",
+						"MaxShift"
+					]
+				},
+				{
+					"reason": "Environment: which linter reports the finding (line-bound LSP ids or helm-lint's ordinal ids, a collect-later runner or none, a runner with an edit-range gate or without, an unused value or none, a second occurrence of a finding's rule already in the bytes or none, and whether that occurrence's line has the finding's own text), whether a run reaches a verdict or skips without reading the bytes, whether a write can be aligned to the bytes the record is about, whether a primary whose gate sees only the edit answers for the range-gated runner, and the user's --no-delta flag; the code must be honest under every value, so the as-built configs set them both ways.",
+					"constants": [
+						"Ordinal",
+						"Deferred",
+						"Delta",
+						"RangeGated",
+						"MayFail",
+						"Unused",
+						"Twin",
+						"MaySkip",
+						"MayUnalign",
+						"TwinSameText",
+						"GateB"
+					]
+				}
+			]
+		}
+	}
+}

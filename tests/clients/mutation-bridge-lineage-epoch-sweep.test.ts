@@ -1221,6 +1221,8 @@ describe("#3937 review round 2 — per-output soundness and callee/mutation cove
 		expect(site.kind).toBe("indeterminate");
 	});
 
+	// Non-regression: the outer overlay still repairs every arm (the `safe`
+	// counterexample to a "classify arms worst" remedy).
 	it("does not drop an outer lineage overlay over a conditional", () => {
 		const site = only(`
 			function replayCaller(cond: boolean) {
@@ -1488,18 +1490,6 @@ describe("#3937 review round 3 — value-level soundness and spelling coverage",
 		const site = only(`
 			function replayCaller() {
 				replayThroughMutationBridge({ filePath: "x" /* not a key */ });
-			}
-		`);
-		expect(site.kind).toBe("safe");
-	});
-
-	// Non-regression: the outer overlay still repairs every arm (the `safe`
-	// counterexample to a "classify arms worst" remedy).
-	it("keeps an outer lineage overlay repairing a conditional", () => {
-		const site = only(`
-			function replayCaller(cond: boolean) {
-				const hidden = cond ? { readGuardBranchEpoch: 5 } : {};
-				replayThroughMutationBridge({ ...hidden, lineage: 1 });
 			}
 		`);
 		expect(site.kind).toBe("safe");

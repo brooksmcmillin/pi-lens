@@ -1,0 +1,317 @@
+{
+	"provenance": {
+		"tool": "basedpyright",
+		"version": "1.40.2",
+		"versionOutput": "basedpyright 1.40.2\nbased on pyright 1.40.2",
+		"cli": {
+			"argv": [
+				"--outputjson",
+				"app.py"
+			],
+			"exitCode": 1
+		},
+		"lsp": {
+			"command": "basedpyright-langserver --stdio",
+			"initializationOptions": {
+				"openFilesOnly": true
+			},
+			"capturedMessage": "textDocument/publishDiagnostics after textDocument/didOpen"
+		},
+		"platform": "darwin-arm64",
+		"capturedAt": "2026-10-18",
+		"rewrite": "the absolute file path and file uri are rewritten to /project/app.py"
+	},
+	"file": "app.py",
+	"text": "import requests_nonexistent_pkg\nimport os\n\n\ndef add(a: int, b: int) -> int:\n    return \"x\"\n\n\ndef greet(name: str) -> str:\n    return \"hi \" + name\n\n\ngreet(42)\nprint(undefined_name)\nvalue: int = \"s\"\n\n\nclass A:\n    pass\n\n\nA().nope\n",
+	"cli": {
+		"stdout": "\n{\n    \"version\": \"1.40.2\",\n    \"time\": \"1792365163002\",\n    \"generalDiagnostics\": [\n        {\n            \"file\": \"/project/app.py\",\n            \"severity\": \"error\",\n            \"message\": \"Import \\\"requests_nonexistent_pkg\\\" could not be resolved\",\n            \"range\": {\n                \"start\": {\n                    \"line\": 0,\n                    \"character\": 7\n                },\n                \"end\": {\n                    \"line\": 0,\n                    \"character\": 31\n                }\n            },\n            \"rule\": \"reportMissingImports\"\n        },\n        {\n            \"file\": \"/project/app.py\",\n            \"severity\": \"warning\",\n            \"message\": \"Import \\\"requests_nonexistent_pkg\\\" is not accessed\",\n            \"range\": {\n                \"start\": {\n                    \"line\": 0,\n                    \"character\": 7\n                },\n                \"end\": {\n                    \"line\": 0,\n                    \"character\": 31\n                }\n            },\n            \"rule\": \"reportUnusedImport\"\n        },\n        {\n            \"file\": \"/project/app.py\",\n            \"severity\": \"warning\",\n            \"message\": \"Import \\\"os\\\" is not accessed\",\n            \"range\": {\n                \"start\": {\n                    \"line\": 1,\n                    \"character\": 7\n                },\n                \"end\": {\n                    \"line\": 1,\n                    \"character\": 9\n                }\n            },\n            \"rule\": \"reportUnusedImport\"\n        },\n        {\n            \"file\": \"/project/app.py\",\n            \"severity\": \"warning\",\n            \"message\": \"\\\"a\\\" is not accessed\",\n            \"range\": {\n                \"start\": {\n                    \"line\": 4,\n                    \"character\": 8\n                },\n                \"end\": {\n                    \"line\": 4,\n                    \"character\": 9\n                }\n            },\n            \"rule\": \"reportUnusedParameter\"\n        },\n        {\n            \"file\": \"/project/app.py\",\n            \"severity\": \"warning\",\n            \"message\": \"\\\"b\\\" is not accessed\",\n            \"range\": {\n                \"start\": {\n                    \"line\": 4,\n                    \"character\": 16\n                },\n                \"end\": {\n                    \"line\": 4,\n                    \"character\": 17\n                }\n            },\n            \"rule\": \"reportUnusedParameter\"\n        },\n        {\n            \"file\": \"/project/app.py\",\n            \"severity\": \"error\",\n            \"message\": \"Type \\\"Literal['x']\\\" is not assignable to return type \\\"int\\\"\\n  \\\"Literal['x']\\\" is not assignable to \\\"int\\\"\",\n            \"range\": {\n                \"start\": {\n                    \"line\": 5,\n                    \"character\": 11\n                },\n                \"end\": {\n                    \"line\": 5,\n                    \"character\": 14\n                }\n            },\n            \"rule\": \"reportReturnType\"\n        },\n        {\n            \"file\": \"/project/app.py\",\n            \"severity\": \"warning\",\n            \"message\": \"Result of call expression is of type \\\"str\\\" and is not used; assign to variable \\\"_\\\" if this is intentional\",\n            \"range\": {\n                \"start\": {\n                    \"line\": 12,\n                    \"character\": 0\n                },\n                \"end\": {\n                    \"line\": 12,\n                    \"character\": 9\n                }\n            },\n            \"rule\": \"reportUnusedCallResult\"\n        },\n        {\n            \"file\": \"/project/app.py\",\n            \"severity\": \"error\",\n            \"message\": \"Argument of type \\\"Literal[42]\\\" cannot be assigned to parameter \\\"name\\\" of type \\\"str\\\" in function \\\"greet\\\"\\n  \\\"Literal[42]\\\" is not assignable to \\\"str\\\"\",\n            \"range\": {\n                \"start\": {\n                    \"line\": 12,\n                    \"character\": 6\n                },\n                \"end\": {\n                    \"line\": 12,\n                    \"character\": 8\n                }\n            },\n            \"rule\": \"reportArgumentType\"\n        },\n        {\n            \"file\": \"/project/app.py\",\n            \"severity\": \"error\",\n            \"message\": \"\\\"undefined_name\\\" is not defined\",\n            \"range\": {\n                \"start\": {\n                    \"line\": 13,\n                    \"character\": 6\n                },\n                \"end\": {\n                    \"line\": 13,\n                    \"character\": 20\n                }\n            },\n            \"rule\": \"reportUndefinedVariable\"\n        },\n        {\n            \"file\": \"/project/app.py\",\n            \"severity\": \"warning\",\n            \"message\": \"Argument type is unknown\\n  Argument corresponds to parameter \\\"values\\\" in function \\\"print\\\"\",\n            \"range\": {\n                \"start\": {\n                    \"line\": 13,\n                    \"character\": 6\n                },\n                \"end\": {\n                    \"line\": 13,\n                    \"character\": 20\n                }\n            },\n            \"rule\": \"reportUnknownArgumentType\"\n        },\n        {\n            \"file\": \"/project/app.py\",\n            \"severity\": \"error\",\n            \"message\": \"Type \\\"Literal['s']\\\" is not assignable to declared type \\\"int\\\"\\n  \\\"Literal['s']\\\" is not assignable to \\\"int\\\"\",\n            \"range\": {\n                \"start\": {\n                    \"line\": 14,\n                    \"character\": 13\n                },\n                \"end\": {\n                    \"line\": 14,\n                    \"character\": 16\n                }\n            },\n            \"rule\": \"reportAssignmentType\"\n        },\n        {\n            \"file\": \"/project/app.py\",\n            \"severity\": \"warning\",\n            \"message\": \"Type of \\\"nope\\\" is unknown\",\n            \"range\": {\n                \"start\": {\n                    \"line\": 21,\n                    \"character\": 0\n                },\n                \"end\": {\n                    \"line\": 21,\n                    \"character\": 8\n                }\n            },\n            \"rule\": \"reportUnknownMemberType\"\n        },\n        {\n            \"file\": \"/project/app.py\",\n            \"severity\": \"error\",\n            \"message\": \"Cannot access attribute \\\"nope\\\" for class \\\"A\\\"\\n  Attribute \\\"nope\\\" is unknown\",\n            \"range\": {\n                \"start\": {\n                    \"line\": 21,\n                    \"character\": 4\n                },\n                \"end\": {\n                    \"line\": 21,\n                    \"character\": 8\n                }\n            },\n            \"rule\": \"reportAttributeAccessIssue\"\n        }\n    ],\n    \"summary\": {\n        \"filesAnalyzed\": 1,\n        \"errorCount\": 6,\n        \"warningCount\": 7,\n        \"informationCount\": 0,\n        \"timeInSec\": 0.147\n    }\n}\n"
+	},
+	"lsp": {
+		"uri": "file:///project/app.py",
+		"version": 1,
+		"diagnostics": [
+			{
+				"range": {
+					"start": {
+						"line": 0,
+						"character": 7
+					},
+					"end": {
+						"line": 0,
+						"character": 31
+					}
+				},
+				"message": "Import \"requests_nonexistent_pkg\" could not be resolved",
+				"severity": 1,
+				"code": "reportMissingImports",
+				"source": "basedpyright",
+				"codeDescription": {
+					"href": "https://docs.basedpyright.com/v1.40.2/configuration/config-files/#reportMissingImports"
+				}
+			},
+			{
+				"range": {
+					"start": {
+						"line": 0,
+						"character": 7
+					},
+					"end": {
+						"line": 0,
+						"character": 31
+					}
+				},
+				"message": "Import \"requests_nonexistent_pkg\" is not accessed",
+				"severity": 2,
+				"code": "reportUnusedImport",
+				"source": "basedpyright",
+				"tags": [
+					1
+				],
+				"data": {
+					"category": 1,
+					"rule": "reportUnusedImport"
+				},
+				"codeDescription": {
+					"href": "https://docs.basedpyright.com/v1.40.2/configuration/config-files/#reportUnusedImport"
+				}
+			},
+			{
+				"range": {
+					"start": {
+						"line": 1,
+						"character": 7
+					},
+					"end": {
+						"line": 1,
+						"character": 9
+					}
+				},
+				"message": "Import \"os\" is not accessed",
+				"severity": 2,
+				"code": "reportUnusedImport",
+				"source": "basedpyright",
+				"tags": [
+					1
+				],
+				"data": {
+					"category": 1,
+					"rule": "reportUnusedImport"
+				},
+				"codeDescription": {
+					"href": "https://docs.basedpyright.com/v1.40.2/configuration/config-files/#reportUnusedImport"
+				}
+			},
+			{
+				"range": {
+					"start": {
+						"line": 4,
+						"character": 8
+					},
+					"end": {
+						"line": 4,
+						"character": 9
+					}
+				},
+				"message": "\"a\" is not accessed",
+				"severity": 2,
+				"code": "reportUnusedParameter",
+				"source": "basedpyright",
+				"tags": [
+					1
+				],
+				"data": {
+					"category": 1,
+					"rule": "reportUnusedParameter"
+				},
+				"codeDescription": {
+					"href": "https://docs.basedpyright.com/v1.40.2/configuration/config-files/#reportUnusedParameter"
+				}
+			},
+			{
+				"range": {
+					"start": {
+						"line": 4,
+						"character": 16
+					},
+					"end": {
+						"line": 4,
+						"character": 17
+					}
+				},
+				"message": "\"b\" is not accessed",
+				"severity": 2,
+				"code": "reportUnusedParameter",
+				"source": "basedpyright",
+				"tags": [
+					1
+				],
+				"data": {
+					"category": 1,
+					"rule": "reportUnusedParameter"
+				},
+				"codeDescription": {
+					"href": "https://docs.basedpyright.com/v1.40.2/configuration/config-files/#reportUnusedParameter"
+				}
+			},
+			{
+				"range": {
+					"start": {
+						"line": 5,
+						"character": 11
+					},
+					"end": {
+						"line": 5,
+						"character": 14
+					}
+				},
+				"message": "Type \"Literal['x']\" is not assignable to return type \"int\"\n  \"Literal['x']\" is not assignable to \"int\"",
+				"severity": 1,
+				"code": "reportReturnType",
+				"source": "basedpyright",
+				"codeDescription": {
+					"href": "https://docs.basedpyright.com/v1.40.2/configuration/config-files/#reportReturnType"
+				}
+			},
+			{
+				"range": {
+					"start": {
+						"line": 12,
+						"character": 0
+					},
+					"end": {
+						"line": 12,
+						"character": 9
+					}
+				},
+				"message": "Result of call expression is of type \"str\" and is not used; assign to variable \"_\" if this is intentional",
+				"severity": 2,
+				"code": "reportUnusedCallResult",
+				"source": "basedpyright",
+				"codeDescription": {
+					"href": "https://docs.basedpyright.com/v1.40.2/configuration/config-files/#reportUnusedCallResult"
+				}
+			},
+			{
+				"range": {
+					"start": {
+						"line": 12,
+						"character": 6
+					},
+					"end": {
+						"line": 12,
+						"character": 8
+					}
+				},
+				"message": "Argument of type \"Literal[42]\" cannot be assigned to parameter \"name\" of type \"str\" in function \"greet\"\n  \"Literal[42]\" is not assignable to \"str\"",
+				"severity": 1,
+				"code": "reportArgumentType",
+				"source": "basedpyright",
+				"codeDescription": {
+					"href": "https://docs.basedpyright.com/v1.40.2/configuration/config-files/#reportArgumentType"
+				}
+			},
+			{
+				"range": {
+					"start": {
+						"line": 13,
+						"character": 6
+					},
+					"end": {
+						"line": 13,
+						"character": 20
+					}
+				},
+				"message": "\"undefined_name\" is not defined",
+				"severity": 1,
+				"code": "reportUndefinedVariable",
+				"source": "basedpyright",
+				"data": {
+					"actions": [
+						{
+							"action": "basedpyright.import"
+						}
+					]
+				},
+				"codeDescription": {
+					"href": "https://docs.basedpyright.com/v1.40.2/configuration/config-files/#reportUndefinedVariable"
+				}
+			},
+			{
+				"range": {
+					"start": {
+						"line": 13,
+						"character": 6
+					},
+					"end": {
+						"line": 13,
+						"character": 20
+					}
+				},
+				"message": "Argument type is unknown\n  Argument corresponds to parameter \"values\" in function \"print\"",
+				"severity": 2,
+				"code": "reportUnknownArgumentType",
+				"source": "basedpyright",
+				"codeDescription": {
+					"href": "https://docs.basedpyright.com/v1.40.2/configuration/config-files/#reportUnknownArgumentType"
+				}
+			},
+			{
+				"range": {
+					"start": {
+						"line": 14,
+						"character": 13
+					},
+					"end": {
+						"line": 14,
+						"character": 16
+					}
+				},
+				"message": "Type \"Literal['s']\" is not assignable to declared type \"int\"\n  \"Literal['s']\" is not assignable to \"int\"",
+				"severity": 1,
+				"code": "reportAssignmentType",
+				"source": "basedpyright",
+				"codeDescription": {
+					"href": "https://docs.basedpyright.com/v1.40.2/configuration/config-files/#reportAssignmentType"
+				}
+			},
+			{
+				"range": {
+					"start": {
+						"line": 21,
+						"character": 0
+					},
+					"end": {
+						"line": 21,
+						"character": 8
+					}
+				},
+				"message": "Type of \"nope\" is unknown",
+				"severity": 2,
+				"code": "reportUnknownMemberType",
+				"source": "basedpyright",
+				"codeDescription": {
+					"href": "https://docs.basedpyright.com/v1.40.2/configuration/config-files/#reportUnknownMemberType"
+				}
+			},
+			{
+				"range": {
+					"start": {
+						"line": 21,
+						"character": 4
+					},
+					"end": {
+						"line": 21,
+						"character": 8
+					}
+				},
+				"message": "Cannot access attribute \"nope\" for class \"A\"\n  Attribute \"nope\" is unknown",
+				"severity": 1,
+				"code": "reportAttributeAccessIssue",
+				"source": "basedpyright",
+				"codeDescription": {
+					"href": "https://docs.basedpyright.com/v1.40.2/configuration/config-files/#reportAttributeAccessIssue"
+				}
+			}
+		]
+	}
+}

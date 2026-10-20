@@ -496,6 +496,8 @@ describe("#1655 item 5 — pi's unicode path-variant ladder", () => {
 
 			expect(recordRead).toHaveBeenCalledWith(
 				expect.objectContaining({ filePath: onDisk }),
+				// #1649: the tool_call's one pass is the capture; the guard takes none.
+				{ captureLineHashes: false },
 			);
 			expect(
 				getDegradationSummary().find(
@@ -687,6 +689,8 @@ describe("#1655 review F1 — the base resolution pi runs BEFORE the ladder", ()
 
 				expect(recordRead).toHaveBeenCalledWith(
 					expect.objectContaining({ filePath: onDisk }),
+					// #1649: the tool_call's one pass is the capture; the guard takes none.
+					{ captureLineHashes: false },
 				);
 				expect(
 					getDegradationSummary().find(

@@ -165,13 +165,6 @@ describe("npm-retry.mjs (#2613 review S3a)", () => {
 		}
 	});
 
-	it("round 3: npm evidence wins over deterministic codes on a later line", () => {
-		const result = classifyNpmFailure(
-			"npm error ERESOLVE unable to resolve dependency tree\nnpm error ECONNRESET",
-		);
-		expect(result.retryable).toBe(true);
-	});
-
 	// Network evidence wins because losing a legitimate retry costs more than
 	// one redundant retry when npm prints both diagnostics.
 	it("gives network signals precedence over deterministic npm errors", () => {

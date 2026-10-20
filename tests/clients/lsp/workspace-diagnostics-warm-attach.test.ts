@@ -184,7 +184,10 @@ describe("runWorkspaceDiagnostics warm attach sweeps (#822)", () => {
 				diagnosticProviderKind: "none",
 			}),
 			getOperationSupport: () => ({}),
-			notify: { open: vi.fn(async () => {}) },
+			notify: {
+				announceCreated: () => undefined,
+				open: vi.fn(async () => {}),
+			},
 			waitForDiagnostics: vi.fn(async () => undefined),
 			getDiagnostics: vi.fn(() => [localDiagnostic]),
 		};

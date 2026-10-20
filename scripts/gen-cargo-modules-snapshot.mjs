@@ -26,6 +26,14 @@
  *   npm run build && node scripts/gen-cargo-modules-snapshot.mjs          # write
  *   npm run build && node scripts/gen-cargo-modules-snapshot.mjs --check  # verify
  *
+ * The walk is every `Cargo.toml`-bearing directory under `tests/fixtures/`,
+ * because the golden is a record of what this reader answers for fixture
+ * input, not a census of the repo's own workspaces. Adding such a fixture
+ * therefore adds a row (`null` when the directory is not a module-graph
+ * workspace) and the snapshot is regenerated in the same change — a new clean
+ * workspace under `tests/fixtures/runner-output-clean/` drifted it and reddened
+ * CI (#4522 NEW-1). Excluding a fixture family instead would stop watching it.
+ *
  * `tests/clients/review-graph-workspace-modules-cargo.test.ts` runs the same
  * comparison, so an accidental behavior change fails CI with a readable diff.
  */

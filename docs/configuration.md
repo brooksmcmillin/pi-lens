@@ -221,6 +221,17 @@ once no matter which spelling each file uses. Migrating does not change the
 answer, staying un-migrated is not a way around the denial, and a half-migrated
 pair of files merges rather than one clobbering the other.
 
+Denying a file's **language server** (its primary, such as `json` or
+`typescript`) leaves that file unchecked for the language itself. Every
+diagnostics route then reports a file with no findings as **unconfirmed**, not
+clean, with a "Primary LSP (…): not available" note that says it is disabled in
+config. On write-time checks the note appears once per server per session, and
+a later write of such a file shows a one-line "unconfirmed" status instead of
+"clean". When the denied server has a fallback (`deno` for `typescript`) that
+cannot start either, the note says so. Cross-file (cascade) checks name the
+server once per session. Auxiliary scanners such as `typos` still run and
+report their own findings.
+
 Two rules make the rest of the table unambiguous:
 
 - **The search stops at `$HOME`.** pi-lens never reads a config file in your

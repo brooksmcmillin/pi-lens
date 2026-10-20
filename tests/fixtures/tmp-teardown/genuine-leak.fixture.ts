@@ -1,7 +1,8 @@
 // Fixture for tests/support/tmp-root-teardown.test.ts (#2912): the two leaks the
 // sweep must NOT hide. A raw root the file never removes is a forgotten cleanup;
-// a directory made by `mkdirSync` is in no registry (it stands for a sibling
-// worker's live root, which this worker must never delete).
+// a directory made by `mkdirSync` is in no SWEEP registry (it stands for a
+// sibling worker's live root, which this worker must never delete), while its
+// creator is recorded for the #4560 fixture-sibling census.
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";

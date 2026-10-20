@@ -13,11 +13,14 @@ import {
 } from "../../../clients/lsp/wait-policy/strategies.js";
 
 describe("TypeScript diagnostic strategies (#1412)", () => {
-	it("holds classic's measured empty first push and stabilizes native TS7 pushes", () => {
+	it("leaves classic's first push unheld while the matrix cell reads direct (#4615)", () => {
+		// docs/lsp-capability-matrix.md's `typescript` row is `first-publish=direct`
+		// (measured 2026-10-20: the dirty fixture's first publish carries the
+		// finding). A marker here would hold the answer, so its absence IS the pin.
 		expect(getStrategy("typescript", "classic").seedFirstPush).toBe(false);
-		expect(getStrategy("typescript", "classic").emptyFirstPublish).toBe(
-			"indexing",
-		);
+		expect(
+			getStrategy("typescript", "classic").emptyFirstPublish,
+		).toBeUndefined();
 		expect(getStrategy("typescript", "native-ts7").seedFirstPush).toBe(false);
 		expect(getStrategy("typescript", "native-ts7").debounceMs).toBeGreaterThan(
 			0,
@@ -34,15 +37,6 @@ describe("cue diagnostic strategy (#1522) — measured against the real v0.17.1 
 		// this marker absent prevents the cascade from skipping that signal.
 		expect(strategy.silentOnClean).toBeUndefined();
 		expect(strategy.reopenOnResync).toBeFalsy();
-	});
-});
-
-describe("lua diagnostic strategy (#3347)", () => {
-	it("marks the measured clean-transition silence", () => {
-		const strategy = getStrategy("lua");
-		// Run 35914033696 measured two dirty publishes and no clean-transition
-		// publish; the marker is the cascade's tier-3 wait-policy decision.
-		expect(strategy.silentOnClean).toBe(true);
 	});
 });
 

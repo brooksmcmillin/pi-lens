@@ -723,9 +723,30 @@ async function fetchText(fetcher, url) {
 }
 
 /**
+ * The pull request of THIS repository a run belongs to, or null (#4382).
+ * `run.pull_requests` is not trustworthy on its own: GitHub fills it by head
+ * branch and sha, so a master push run listed other repositories' fork PRs
+ * whose head branch was also `master` (brooksmcmillin/pi-lens#23,
+ * floatGray/pi-lens#2), and the comment write to issue 23 of this repository
+ * then 403ed. A push run has no PR; any other run takes only an entry whose
+ * API url is under this repository and whose head sha is the run's own head.
+ */
+function ownPullRequestNumber(run, owner, repo) {
+	if (run.event === "push") return null;
+	const prefix = `https://api.github.com/repos/${owner}/${repo}/pulls/`;
+	const own = (run.pull_requests ?? []).find(
+		(pr) =>
+			typeof pr?.url === "string" &&
+			pr.url.startsWith(prefix) &&
+			pr.head?.sha === run.head_sha,
+	);
+	return own?.number ?? null;
+}
+
+/**
  * Resolve a run's head SHA, its associated PR number (when GitHub reports
- * one -- same-repo pushes and PRs both do; a fork PR or a bare workflow_run
- * event may not, so callers can pass an explicit PR number instead), and the
+ * one for this repository -- see ownPullRequestNumber; a fork PR or a push
+ * run has none, so callers can pass an explicit PR number instead), and the
  * id of the job to classify.
  *
  * @param {{ fetcher: typeof fetch, owner: string, repo: string, runId: number | string, jobName?: string }} args
@@ -745,8 +766,10 @@ async function fetchRunAndFailedJob({ fetcher, owner, repo, runId, jobName }) {
 	const failedJob = failedJobs[0];
 	if (!failedJob) {
 		// #3801 (verify r2 V3): a CI run that failed ONLY on advisory jobs (a
-		// not-ready `Heavy advisory gate`, the Windows run) is not a `real`
+		// not-ready `Heavy advisory gate`, a CodeQL language leg) is not a `real`
 		// failure of the change; the caller must not label the PR `ci:real`.
+		// #4518: `Unit tests Windows` is not on that list any more -- it gates, so
+		// a red Windows row is a blocking failure like any other.
 		// Every job with a BLOCKING conclusion (failure, timed_out, cancelled, ...)
 		// must be advisory: a required job that timed out beside a red gate is
 		// not "only advisory" (verify r3 V6).
@@ -759,10 +782,9 @@ async function fetchRunAndFailedJob({ fetcher, owner, repo, runId, jobName }) {
 		error.advisoryOnly = advisoryOnly;
 		throw error;
 	}
-	const prNumber = run.pull_requests?.[0]?.number ?? null;
 	return {
 		sha: run.head_sha,
-		prNumber,
+		prNumber: ownPullRequestNumber(run, owner, repo),
 		// GitHub's own per-head attempt counter (#2042): the rerun guard is
 		// keyed on it, so it is read from the run the classifier was pointed
 		// at rather than passed in by the caller. An API shape without it
@@ -1003,6 +1025,21 @@ export async function runClassifier({
 		jobName: resolvedJobName,
 	} = runAndJob;
 	const prNumber = prNumberOverride ?? resolvedPrNumber;
+	// #4382: the sticky comment is bookkeeping; a refused write (403 on a
+	// token without the scope, a deleted thread) must never stop the
+	// classification or the rerun. The first failure is recorded once and
+	// every later comment step is skipped: the same token fails the same way.
+	let commentWarning = null;
+	const bestEffortComment = async (step, fallback) => {
+		if (commentWarning !== null) return fallback;
+		try {
+			return await step();
+		} catch (error) {
+			const detail = error instanceof Error ? error.message : String(error);
+			commentWarning = `ci-classifier: PR #${prNumber} comment not written, classification and rerun continue: ${detail.replace(/\s+/g, " ").slice(0, 300)}`;
+			return fallback;
+		}
+	};
 	if (!prNumber && !allowMissingPr) {
 		throw new Error(
 			`run ${runId} has no associated pull request; pass an explicit PR number`,
@@ -1030,12 +1067,16 @@ export async function runClassifier({
 	// there is never a prior marker to recover, so this pass is always the
 	// first look at this SHA.
 	const existingComment = prNumber
-		? await findExistingClassifierComment({
-				fetcher,
-				owner,
-				repo,
-				prNumber,
-			})
+		? await bestEffortComment(
+				() =>
+					findExistingClassifierComment({
+						fetcher,
+						owner,
+						repo,
+						prNumber,
+					}),
+				null,
+			)
 		: null;
 	let classification;
 	try {
@@ -1111,14 +1152,18 @@ export async function runClassifier({
 	// classify job's own log (this function's caller prints commentBody) is
 	// the only trace for that run, by design (#2668).
 	const postedComment = prNumber
-		? await upsertComment({
-				fetcher,
-				owner,
-				repo,
-				prNumber,
-				existingComment,
-				body: commentBody,
-			})
+		? await bestEffortComment(
+				() =>
+					upsertComment({
+						fetcher,
+						owner,
+						repo,
+						prNumber,
+						existingComment,
+						body: commentBody,
+					}),
+				null,
+			)
 		: null;
 
 	let result = {
@@ -1135,14 +1180,18 @@ export async function runClassifier({
 	// -new comment into a duplicate -- a PATCH to an existing single comment
 	// cannot itself create one. No PR means no comment thread to reconcile.
 	if (prNumber && !existingComment) {
-		const reconciled = await reconcileDuplicateClassifierComments({
-			fetcher,
-			owner,
-			repo,
-			prNumber,
-			sha,
-			postedCommentId: postedComment?.id,
-		});
+		const reconciled = await bestEffortComment(
+			() =>
+				reconcileDuplicateClassifierComments({
+					fetcher,
+					owner,
+					repo,
+					prNumber,
+					sha,
+					postedCommentId: postedComment?.id,
+				}),
+			{ isWinner: true },
+		);
 		if (!reconciled.isWinner) {
 			// A concurrent invocation's earlier comment owns this SHA now; this
 			// call's own rerun attempt (if any) already fired and can't be
@@ -1156,7 +1205,7 @@ export async function runClassifier({
 		}
 	}
 
-	return result;
+	return commentWarning === null ? result : { ...result, commentWarning };
 }
 
 /**
@@ -1184,19 +1233,25 @@ async function commentClassificationFailure({
 	const body =
 		`ci-classifier: classification failed; no rerun was triggered: ${detail} ` +
 		buildMarker(sha, "false");
-	const existingComment = await findExistingClassifierComment({
-		fetcher,
-		owner,
-		repo,
-		prNumber,
-	});
-	await upsertComment({
-		fetcher,
-		owner,
-		repo,
-		prNumber,
-		existingComment,
-		body,
-	});
-	return true;
+	// #4382: callers rethrow the ORIGINAL classification error right after this
+	// returns; a refused comment write must not replace it with a 403.
+	try {
+		const existingComment = await findExistingClassifierComment({
+			fetcher,
+			owner,
+			repo,
+			prNumber,
+		});
+		await upsertComment({
+			fetcher,
+			owner,
+			repo,
+			prNumber,
+			existingComment,
+			body,
+		});
+		return true;
+	} catch {
+		return false;
+	}
 }

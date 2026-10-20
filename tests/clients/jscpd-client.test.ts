@@ -799,3 +799,133 @@ describe("jscpd-client scan setup cleanup (#4133)", () => {
 		}
 	});
 });
+
+/**
+ * #4505 round 2: `shutdown()` waits for a scan that is still in its
+ * availability probe.
+ *
+ * Recurrence: `scan()` fills `inFlight` only after its own `ensureAvailable()`
+ * probe (up to the 1.5 s `probeTimeout`), and the session_start task calls
+ * `ensureAvailable()` before `scan()`. A drain inside that window saw an empty
+ * map and returned; the fork then exited mid-scan and stranded the
+ * `pi-lens-jscpd-*` report directory. The review probe measured `shutdown()`
+ * returning at 203 ms for a scan that finished near 2600 ms.
+ *
+ * The probe and the scan are held at the process boundary (`safeSpawnAsync`),
+ * so the real client, availability checker and `shutdown()` run.
+ */
+describe("jscpd-client shutdown covers the availability probe (#4505)", () => {
+	const SPAWN_OK = { error: undefined, status: 0, stdout: "", stderr: "" };
+
+	/** Enough event-loop turns for a drain to return if nothing holds it. */
+	async function settleTurns(): Promise<void> {
+		for (let turn = 0; turn < 200; turn++)
+			await new Promise<void>((resolve) => setImmediate(resolve));
+	}
+
+	beforeEach(async () => {
+		const safeSpawnMod = await import("../../clients/safe-spawn.js");
+		vi.mocked(safeSpawnMod.safeSpawnAsync).mockReset();
+		vi.mocked(safeSpawnMod.safeSpawnAsync).mockResolvedValue(SPAWN_OK);
+		ensureTool.mockReset();
+		findNodeToolBinary.mockReset();
+		findNodeToolBinary.mockResolvedValue(null);
+		const helpers =
+			await import("../../clients/dispatch/runners/utils/runner-helpers.js");
+		helpers.resetDispatchAvailabilityState();
+	});
+
+	it("waits for the probe and the scan that follows it", async () => {
+		const { JscpdClient } = await import("../../clients/jscpd-client.js");
+		const safeSpawnMod = await import("../../clients/safe-spawn.js");
+		const { tmpDir } = setupTestEnvironment("pi-lens-jscpd-probe-");
+		const probe = gatedPromise<typeof SPAWN_OK>();
+		const scanSpawn = gatedPromise<typeof SPAWN_OK>();
+		try {
+			fs.writeFileSync(path.join(tmpDir, "src.ts"), "const x = 1;\n");
+			vi.mocked(safeSpawnMod.safeSpawnAsync)
+				.mockImplementationOnce((() => probe.promise) as never)
+				.mockImplementationOnce((() => scanSpawn.promise) as never);
+			const client = new JscpdClient(false);
+			let scanSettled = false;
+			const scan = client.scan(tmpDir).then((result) => {
+				scanSettled = true;
+				return result;
+			});
+			let drained = false;
+			const drain = client.shutdown().then(() => {
+				drained = true;
+			});
+
+			await settleTurns();
+			expect(drained).toBe(false);
+
+			probe.resolve(SPAWN_OK);
+			await settleTurns();
+			expect(drained).toBe(false);
+
+			scanSpawn.resolve(SPAWN_OK);
+			await drain;
+			expect(scanSettled).toBe(true);
+			expect((await scan).success).toBe(true);
+		} finally {
+			probe.resolve(SPAWN_OK);
+			scanSpawn.resolve(SPAWN_OK);
+			await cleanupTestEnvironmentsDrained("pi-lens-jscpd-");
+		}
+	});
+
+	it("keeps waiting when a second probe starts after the first settles", async () => {
+		// session_start's task shape: ensureAvailable(), then scan(), whose own
+		// ensureAvailable() is a second probe that begins after the first one
+		// settled. A drain that waits for the probes it sees once returns here.
+		const { JscpdClient } = await import("../../clients/jscpd-client.js");
+		const safeSpawnMod = await import("../../clients/safe-spawn.js");
+		const helpers =
+			await import("../../clients/dispatch/runners/utils/runner-helpers.js");
+		const { tmpDir } = setupTestEnvironment("pi-lens-jscpd-probe2-");
+		const first = gatedPromise<typeof SPAWN_OK>();
+		const second = gatedPromise<typeof SPAWN_OK>();
+		const scanSpawn = gatedPromise<typeof SPAWN_OK>();
+		try {
+			fs.writeFileSync(path.join(tmpDir, "src.ts"), "const x = 1;\n");
+			vi.mocked(safeSpawnMod.safeSpawnAsync)
+				.mockImplementationOnce((() => first.promise) as never)
+				.mockImplementationOnce((() => second.promise) as never)
+				.mockImplementationOnce((() => scanSpawn.promise) as never);
+			const client = new JscpdClient(false);
+			let chainSettled = false;
+			const chain = (async () => {
+				await client.ensureAvailable();
+				// A fresh probe for the scan's own check, as after a cooldown.
+				helpers.resetDispatchAvailabilityState();
+				return client.scan(tmpDir);
+			})().then((result) => {
+				chainSettled = true;
+				return result;
+			});
+			let drained = false;
+			const drain = client.shutdown().then(() => {
+				drained = true;
+			});
+
+			first.resolve(SPAWN_OK);
+			await settleTurns();
+			expect(drained).toBe(false);
+
+			second.resolve(SPAWN_OK);
+			await settleTurns();
+			expect(drained).toBe(false);
+
+			scanSpawn.resolve(SPAWN_OK);
+			await drain;
+			expect(chainSettled).toBe(true);
+			expect((await chain).success).toBe(true);
+		} finally {
+			first.resolve(SPAWN_OK);
+			second.resolve(SPAWN_OK);
+			scanSpawn.resolve(SPAWN_OK);
+			await cleanupTestEnvironmentsDrained("pi-lens-jscpd-");
+		}
+	});
+});

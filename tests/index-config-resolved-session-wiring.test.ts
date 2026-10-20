@@ -97,7 +97,10 @@ async function configResolvedRows(): Promise<ConfigResolvedRow[]> {
 		}));
 }
 
-function sessionStartOffset(): number {
+async function sessionStartOffset(): Promise<number> {
+	// Drain first (#4381): a line this test enqueued earlier and the writer has
+	// not appended yet would land after the offset and count inside the window.
+	await flushSessionStartLog();
 	return fs.existsSync(SESSIONSTART_LOG_FILE)
 		? fs.statSync(SESSIONSTART_LOG_FILE).size
 		: 0;
@@ -208,7 +211,7 @@ describe("index.ts session_start: ONE config_resolved row per session (#2526 R2 
 		);
 		expect(await configResolvedRows()).toHaveLength(1);
 
-		const offset = sessionStartOffset();
+		const offset = await sessionStartOffset();
 		_resetSessionLifecycleForTests();
 		await pi.emit(
 			"session_start",
@@ -250,7 +253,7 @@ describe("index.ts session_start: ONE config_resolved row per session (#2526 R2 
 		);
 		expect(await configResolvedRows()).toHaveLength(1);
 
-		const offset = sessionStartOffset();
+		const offset = await sessionStartOffset();
 		_resetSessionLifecycleForTests();
 		await pi.emit(
 			"session_start",
@@ -274,7 +277,7 @@ describe("index.ts session_start: ONE config_resolved row per session (#2526 R2 
 		extension(pi.asExtensionAPI());
 		clearLatencyLog();
 		await flushLatencyLog();
-		const offset = sessionStartOffset();
+		const offset = await sessionStartOffset();
 
 		await pi.emit(
 			"session_start",
@@ -313,7 +316,7 @@ describe("index.ts session_start: ONE config_resolved row per session (#2526 R2 
 		extension(pi.asExtensionAPI());
 		clearLatencyLog();
 		await flushLatencyLog();
-		const offset = sessionStartOffset();
+		const offset = await sessionStartOffset();
 
 		await pi.emit(
 			"session_start",

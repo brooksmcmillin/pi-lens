@@ -681,6 +681,35 @@ describe("ReadGuard", () => {
 			}
 		});
 
+		// #4187 R2-4 / #4131: a write no pre-write check guarded ends only an
+		// authorship whose bytes it changed (BridgeWrite in formal/read-guard).
+		// Recurrence: #4387 routes the opaque-recovery bash credit here, so a
+		// forced retire would end authorship over bytes the conversation still
+		// holds, which #4131's content identity keeps.
+		it("keeps an authorship whose bytes an unchecked write left identical", () => {
+			const env = setupTestEnvironment("read-guard-authorship-bridge-same-");
+			resetDegradationLedger();
+			try {
+				const filePath = path.join(env.tmpDir, "authored.ts");
+				fs.writeFileSync(filePath, "export const x = 1;\n");
+				const guard = createReadGuard("test-session");
+				guard.recordWritten(filePath, { toolCallId: "call_write" });
+				guard.recordWritten(filePath, {
+					stampFileTime: false,
+					authorship: "unknown",
+					advanceAuthorship: false,
+				});
+				expect(guard.checkEdit(filePath, [1, 1]).action).toBe("allow");
+				expect(
+					getDegradationSummary().find(
+						(group) => group.kind === "read-guard-authorship-retired",
+					),
+				).toBeUndefined();
+			} finally {
+				env.cleanup();
+			}
+		});
+
 		it("blocks zero-read edit on a file the agent never wrote and was last touched before this session", () => {
 			const env = setupTestEnvironment("read-guard-old-file-");
 			try {
@@ -2446,7 +2475,12 @@ describe("ReadGuard Tier-2 idle decay and bounds (#1389)", () => {
 		}
 	});
 
-	it("records unknown authored-range retirement distinctly", () => {
+	// #4387: an UNKNOWN credit names no line it produced, so over a range scope
+	// it leaves an empty scope. Every zero-read edit then needs a read, as
+	// before, and no record claims another writer changed the bytes.
+	// Recurrence: the credit force-retired the scope, so the next edit read
+	// "File modified since your write" with no other writer (review G2, S8).
+	it("leaves an empty scope, not a retirement, when an UNKNOWN credit lands on a range scope (#4387)", () => {
 		const env = setupTestEnvironment("read-guard-authorship-unknown-");
 		resetDegradationLedger();
 		try {
@@ -2462,12 +2496,136 @@ describe("ReadGuard Tier-2 idle decay and bounds (#1389)", () => {
 				stampFileTime: false,
 				authorship: "unknown",
 			});
-			expect(guard.checkEdit(filePath, [1, 1]).action).toBe("block");
+			const inside = guard.checkEdit(filePath, [1, 1]);
+			expect(inside.action).toBe("block");
+			expect(inside.reason).toContain("this write only covered part");
+			expect(guard.checkEdit(filePath, [2, 2]).action).toBe("block");
+			expect(
+				guard.exportAuthorship().entries?.find((entry) => entry.retired),
+			).toBeUndefined();
 			expect(
 				getDegradationSummary().find(
 					(group) => group.kind === "read-guard-authorship-retired",
-				)?.latestReasons[0]?.reason,
-			).toContain("authored range was unknown");
+				),
+			).toBeUndefined();
+			expect(
+				vi
+					.mocked(logReadGuardEvent)
+					.mock.calls.filter(([entry]) => entry.event === "authorship_retired"),
+			).toEqual([]);
+			// A read that names a call bounds a whole-file advance, never a scope:
+			// the scope stays empty, so after a resume that keeps the edit and
+			// drops the read, line 2 (never read, never authored) is still refused.
+			// Recurrence: an UNKNOWN credit composed into a range scope widens it
+			// to the whole file (F-4210-2's shape behind a read).
+			const scoped = path.join(env.tmpDir, "scoped.ts");
+			fs.writeFileSync(scoped, "one\ntwo\n");
+			guard.recordRead(
+				createReadRecord(scoped, {
+					requestedLimit: 1,
+					effectiveLimit: 1,
+					toolCallId: "call-read",
+				}),
+			);
+			guard.recordWritten(scoped, {
+				stampFileTime: false,
+				authoredRanges: [[1, 1]],
+				allowFirstAuthorship: true,
+				toolCallId: "call-scope",
+			});
+			guard.recordWritten(scoped, {
+				stampFileTime: false,
+				authorship: "unknown",
+				toolCallId: "call-edit",
+			});
+			const resumed = createReadGuard("authorship-unknown-resumed");
+			resumed.importAuthorship(
+				guard.exportAuthorship(),
+				new Set(["call-edit"]),
+			);
+			expect(resumed.checkEdit(scoped, [2, 2]).action).toBe("block");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	// #4387: over a whole-file authorship an UNKNOWN range is moot while a read
+	// that names a tool call bounds the advance (the zero-read allow records
+	// one), and the writer rule decides. Recurrences: the UNKNOWN short-circuit
+	// retired the authorship of the agent's own write at its own oldText edit;
+	// with no such read, a move kept the advanced authorship alone over bytes no
+	// check covered (review r1 F1, S12).
+	it("advances a whole-file authorship over an UNKNOWN credit only from a checked writer with a bounding read (#4387)", () => {
+		const env = setupTestEnvironment("read-guard-authorship-unknown-whole-");
+		resetDegradationLedger();
+		try {
+			const credit = (name: string) => {
+				const filePath = path.join(env.tmpDir, name);
+				fs.writeFileSync(filePath, "one\ntwo\n");
+				const guard = createReadGuard(`authorship-unknown-${name}`);
+				guard.recordWritten(filePath, {
+					stampFileTime: false,
+					authorship: "whole-file",
+					toolCallId: "call-write",
+				});
+				const entry = () =>
+					guard
+						.exportAuthorship()
+						.entries?.find(
+							(candidate) => path.basename(candidate.filePath) === name,
+						);
+				return { filePath, guard, entry };
+			};
+			const landEdit = (filePath: string) =>
+				fs.writeFileSync(filePath, "one\nTWO\nthree\n");
+			// A native oldText edit after the zero-read allow, which recorded a
+			// read naming the write. The licensed in-process writer is pinned
+			// through the bridge seam in mutation-bridge.test.ts.
+			const own = credit("own.ts");
+			expect(own.guard.checkEdit(own.filePath, [1, 1]).action).toBe("allow");
+			landEdit(own.filePath);
+			own.guard.recordWritten(own.filePath, {
+				authorship: "unknown",
+				toolCallId: "call-edit",
+			});
+			expect(own.entry()).toMatchObject({ toolCallId: "call-edit" });
+			expect(own.entry()?.retired).toBeUndefined();
+			expect(own.entry()?.authoredRanges).toBeUndefined();
+			// No read names a tool call, so nothing would bound the advance after
+			// a move: the credit leaves an empty scope.
+			const unbounded = credit("unbounded.ts");
+			landEdit(unbounded.filePath);
+			unbounded.guard.recordWritten(unbounded.filePath, {
+				authorship: "unknown",
+				toolCallId: "call-edit",
+			});
+			expect(unbounded.entry()?.authoredRanges).toEqual([]);
+			expect(
+				unbounded.guard.checkEdit(unbounded.filePath, [1, 1]).reason,
+			).toContain("this write only covered part");
+			// No pre-write check: it can only end the authorship it changed.
+			const unchecked = credit("unchecked.ts");
+			landEdit(unchecked.filePath);
+			unchecked.guard.recordWritten(unchecked.filePath, {
+				stampFileTime: false,
+				authorship: "unknown",
+				advanceAuthorship: false,
+			});
+			expect(unchecked.entry()?.retired).toBe(true);
+			expect(unchecked.guard.checkEdit(unchecked.filePath, [1, 1]).action).toBe(
+				"block",
+			);
+			// And an UNKNOWN credit still creates no first authorship.
+			const fresh = path.join(env.tmpDir, "fresh.ts");
+			fs.writeFileSync(fresh, "one\n");
+			const freshGuard = createReadGuard("authorship-unknown-fresh");
+			freshGuard.recordWritten(fresh, {
+				stampFileTime: false,
+				authorship: "unknown",
+				toolCallId: "call-edit",
+			});
+			expect(freshGuard.exportAuthorship().entries).toEqual([]);
+			expect(freshGuard.checkEdit(fresh, [1, 1]).action).toBe("block");
 		} finally {
 			env.cleanup();
 		}

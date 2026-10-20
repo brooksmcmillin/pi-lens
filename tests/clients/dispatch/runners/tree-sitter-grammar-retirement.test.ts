@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import treeSitterRunner from "../../../../clients/dispatch/runners/tree-sitter.js";
+import { reachedNoVerdict } from "../../../../clients/dispatch/types.js";
 import { getSharedTreeSitterClient } from "../../../../clients/tree-sitter-shared.js";
 import { resetDegradationLedger } from "../../../../clients/degradation-ledger.js";
 import { makeRealRunnerEnv } from "../../../support/real-runner-ctx.js";
@@ -44,5 +45,8 @@ describe("tree-sitter runner grammar retirement (#4010)", () => {
 			diagnostics: [],
 			semantic: "none",
 		});
+		// #4484: a skip with no stated reason reaches no verdict, so it never
+		// retires a tree-sitter blocker recorded before the grammar retired.
+		expect(reachedNoVerdict(result)).toBe(true);
 	});
 });

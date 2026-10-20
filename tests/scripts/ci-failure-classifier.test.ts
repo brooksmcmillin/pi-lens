@@ -1067,7 +1067,15 @@ describe("runClassifier orchestration against a mocked, STATEFUL GitHub API (#21
 				return jsonResponse({
 					head_sha: "deadbeef",
 					run_attempt: runAttempt,
-					pull_requests: [{ number: 42 }],
+					// The shape GitHub serves (#4382): only an entry of this
+					// repository at the run's own head names the run's PR.
+					pull_requests: [
+						{
+							number: 42,
+							url: "https://api.github.com/repos/acme/repo/pulls/42",
+							head: { sha: "deadbeef" },
+						},
+					],
 				});
 			}
 			if (url.endsWith("/actions/runs/999/jobs")) {
@@ -1745,6 +1753,74 @@ describe("runClassifier orchestration against a mocked, STATEFUL GitHub API (#21
 		expect(rejected).toEqual([]);
 
 		expect(comments).toHaveLength(1);
+	});
+
+	// #4382 recurrence (run 38514228860: a comment write 403ed and the classify
+	// step died before the rerun verdict). The CLI suite covers the first-call
+	// and upsert refusals; these two cover the seams it cannot reach: a refusal
+	// of ONLY the duplicate-reconcile re-read, and a refused failure comment.
+	describe("a refused PR comment never stops the classifier (#4382)", () => {
+		const forbidden = () =>
+			jsonResponse({ message: "Resource not accessible by integration" }, 403);
+
+		it("a 403 on the post-upsert reconcile read keeps the result and reports one commentWarning", async () => {
+			const rawLog = fixture("infra-kill-wrapper-killed.real.log");
+			let commentReads = 0;
+			const fetcher = async (url: string, init?: RequestInit) => {
+				const method = init?.method ?? "GET";
+				if (url.endsWith("/actions/runs/999")) {
+					return jsonResponse({ head_sha: "deadbeef", pull_requests: [] });
+				}
+				if (url.endsWith("/actions/runs/999/jobs")) {
+					return jsonResponse({
+						jobs: [{ id: 111, name: "Unit tests", conclusion: "failure" }],
+					});
+				}
+				if (url.endsWith("/actions/jobs/111/logs")) return textResponse(rawLog);
+				if (url.endsWith("/rerun-failed-jobs")) return jsonResponse({}, 201);
+				if (method === "GET" && url.includes("/issues/42/comments")) {
+					commentReads++;
+					return commentReads === 1 ? jsonResponse([]) : forbidden();
+				}
+				if (method === "POST" && url.includes("/issues/42/comments")) {
+					return jsonResponse({ id: 900, body: "x" }, 201);
+				}
+				throw new Error(`unmocked URL in test: ${method} ${url}`);
+			};
+			const result = await runClassifier({
+				fetcher,
+				owner: "acme",
+				repo: "repo",
+				runId: 999,
+				prNumber: 42,
+			});
+			expect(result.rerunTriggeredThisPass).toBe(true);
+			expect(result.commentWarning).toContain("HTTP 403");
+		});
+
+		it("a 403 while commenting a classification failure leaves the original error as the thrown one", async () => {
+			const fetcher = async (url: string, init?: RequestInit) => {
+				const method = init?.method ?? "GET";
+				if (url.endsWith("/actions/runs/999")) {
+					return jsonResponse({ head_sha: "deadbeef", pull_requests: [] });
+				}
+				if (url.endsWith("/actions/runs/999/jobs")) {
+					return jsonResponse({ message: "boom" }, 500);
+				}
+				if (url.includes("/issues/42/comments")) return forbidden();
+				throw new Error(`unmocked URL in test: ${method} ${url}`);
+			};
+			await expect(
+				runClassifier({
+					fetcher,
+					owner: "acme",
+					repo: "repo",
+					runId: 999,
+					prNumber: 42,
+					sha: "deadbeef",
+				}),
+			).rejects.toThrow("HTTP 500");
+		});
 	});
 
 	// #2668: a master-push run's workflow_run event carries an empty

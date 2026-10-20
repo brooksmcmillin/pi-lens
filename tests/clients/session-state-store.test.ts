@@ -273,7 +273,7 @@ describe("reconcileStaleWidgetFiles — live widget freshness (lens_diagnostics)
 	afterAll(() => rmSync(liveDir, { recursive: true, force: true }));
 	beforeEach(() => clearWidgetState());
 
-	it("drops files edited after their diagnostics were recorded, keeps unchanged ones", async () => {
+	it("sheds the findings of files edited after they were recorded, keeps unchanged ones", async () => {
 		const fixed = join(liveDir, "fixed.ts");
 		const unchanged = join(liveDir, "unchanged.ts");
 		writeFileSync(fixed, "before");
@@ -301,11 +301,23 @@ describe("reconcileStaleWidgetFiles — live widget freshness (lens_diagnostics)
 			new Date(recordedAt + 60_000),
 		);
 
-		const dropped = await reconcileStaleWidgetFiles();
-		expect(dropped).toBe(1);
-		expect(getFileDiagnosticSummaries().map((s) => s.filePath)).toEqual([
-			unchanged,
-		]);
+		const changed = await reconcileStaleWidgetFiles();
+		expect(changed).toBe(1);
+		// The edited file keeps an unfinished record with no findings (#4625); the
+		// unchanged file keeps its final snapshot and its warning.
+		const rows = new Map(
+			getFileDiagnosticSummaries().map((s) => [s.filePath, s]),
+		);
+		expect(rows.size).toBe(2);
+		expect(rows.get(fixed)).toMatchObject({
+			hasFinalSnapshot: false,
+			errors: 0,
+			blocking: 0,
+		});
+		expect(rows.get(unchanged)).toMatchObject({
+			hasFinalSnapshot: true,
+			warnings: 1,
+		});
 	});
 
 	it("drops entries whose file was deleted", async () => {

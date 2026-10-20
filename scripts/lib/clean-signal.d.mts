@@ -33,8 +33,14 @@ export function createPublishTraceDrainer(options: {
 		read: (offset: number) => { chunk: string; bytesRead: number } | null;
 	};
 	echoTrace?: boolean;
+	/** #4615: the client's own document-key normalizer, applied to both sides. */
+	documentPathKey?: (documentPath: string) => string;
 }): {
-	(sink: Array<{ server?: string }>, serverId: string): void;
+	(
+		sink: Array<{ server?: string; path?: string }>,
+		serverId: string,
+		fixturePath: string,
+	): void;
 	reset(offset: number): void;
 };
 
@@ -93,6 +99,36 @@ export const MEASURED_CLEAN_BEHAVIORS: Set<string>;
 
 /** #3401: the matrix lang a probe fixture writes to (`x-clean` -> `x`). */
 export function targetLangForFixture(lang: string, clean?: boolean): string;
+
+/**
+ * #4615: fixture rows -> one row per matrix lang, with each axis resolved to
+ * its own authoritative fixture (clean-behavior: the `clean: true` fixture;
+ * first-publish: a dirty sibling).
+ */
+export function resolveTargetLangRows<
+	T extends DriftInput & {
+		cleanFixture?: boolean;
+		behavior: string;
+		firstPublish?: string;
+		targetLang?: string;
+	},
+>(
+	measuredRows: readonly T[],
+): Array<
+	T & {
+		lang: string;
+		targetLang: string;
+		firstPublishFrom?: string;
+	}
+>;
+
+/** #4615: resolved rows -> the nightly log line naming each class's fixture. */
+export function describeFirstPublishAuthors(
+	targetLangRows: ReadonlyArray<{
+		targetLang?: string;
+		firstPublishFrom?: string;
+	}>,
+): string;
 
 /** #3401: resolved probe rows -> `refreshCapabilityMatrix` observations. */
 export function buildMatrixObservations(

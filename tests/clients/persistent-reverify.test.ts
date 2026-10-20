@@ -34,6 +34,7 @@ vi.mock("../../clients/latency-logger.js", async (importOriginal) => ({
 
 import {
 	runPersistentReverify,
+	selectPersistentReverifyFiles,
 	type ReverifyLspService,
 } from "../../clients/persistent-reverify.js";
 import type { TouchFileResult } from "../../clients/lsp/diagnostic-binding.js";
@@ -179,6 +180,20 @@ describe("persistent reverify (#3170)", () => {
 		}
 		removeTempDirSync(tmpDir);
 	});
+
+	it.each([0, 1, 50, 51])(
+		"preserves strict report mtime boundary at %i ms",
+		(delta) => {
+			const stamp = 1700000000000;
+			const report = makeCarriedReport(filePath);
+			report.files[0].generatedAt = new Date(stamp).toISOString();
+			fs.utimesSync(filePath, stamp / 1000, (stamp + delta) / 1000);
+			expect(fs.statSync(filePath).mtimeMs).toBeCloseTo(stamp + delta, 1);
+			const result = selectPersistentReverifyFiles(report, stamp + 1000);
+			expect(result.candidates).toHaveLength(delta === 0 ? 1 : 0);
+			expect(result.skippedChanged).toBe(delta === 0 ? 0 : 1);
+		},
+	);
 
 	it("C1: a confirmed-clean touch drops the carried finding — through the real CacheManager and publisher", async () => {
 		const carried = makeCarriedReport(filePath);

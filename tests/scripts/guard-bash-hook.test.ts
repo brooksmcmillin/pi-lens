@@ -16,6 +16,14 @@
 // tests/scripts/classify-ci-failure-cli.test.ts documents for its own CLI:
 // an in-process call to the exported functions can't notice a drift in the
 // stdin shape, the exit code, or which stream carries the message.
+//
+// Only that wiring needs a child. The verdict-only table rows (the deny and
+// allow lists, the #3778 hook-bypass rows, the #3988 path-argument rows) call
+// the exported classifyPayload through hookVerdict() under the env the child
+// would get; the spawn cases (the pipe-safe ci-verdict message, the tmpWrite
+// exit-2/exit-0 witness, malformed JSON, the large-payload drain, the broken
+// stderr and the transcript corpus) pin the stdin, exit-code and stderr wiring
+// those rows skip.
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
@@ -92,6 +100,44 @@ function runHook(
 		encoding: "utf8",
 		env,
 	});
+}
+
+/**
+ * runHook's verdict without the child: the same PreToolUse payload through the
+ * hook's own `classifyPayload`, with `process.env` swapped for exactly the
+ * `env` the child would get (the classifier reads `$NAME`, HOME and
+ * PI_LENS_HOME from it) and restored before returning. The rule-to-result
+ * mapping mirrors run()'s success path only (a throw must red here, where the
+ * child would allow with a note); the spawn cases pin run() itself.
+ */
+function hookVerdict(
+	command: string,
+	env: NodeJS.ProcessEnv = BASE_ENV,
+	cwd: string = PAYLOAD_CWD,
+): { status: number; stderr: string } {
+	const payload: unknown = JSON.parse(
+		JSON.stringify({
+			session_id: "test",
+			cwd,
+			permission_mode: "default",
+			hook_event_name: "PreToolUse",
+			tool_name: "Bash",
+			tool_input: { command },
+		}),
+	);
+	const saved = { ...process.env };
+	for (const key of Object.keys(process.env)) delete process.env[key];
+	for (const [key, value] of Object.entries(env))
+		if (value !== undefined) process.env[key] = value;
+	try {
+		const rule = classifyPayload(payload);
+		return rule
+			? { status: 2, stderr: `${RULE_MESSAGES[rule]}\n` }
+			: { status: 0, stderr: "" };
+	} finally {
+		for (const key of Object.keys(process.env)) delete process.env[key];
+		Object.assign(process.env, saved);
+	}
 }
 
 /**
@@ -521,18 +567,11 @@ const ALLOW_CASES: string[] = [
 	"npm run lint ; npm run build",
 ];
 
-// Round-2 survey harness retained as a regression fixture for #2705. The
-// synthetic 2026-09-07 corpus is above; the real transcript corpus below is
+// The real transcript corpus (#2705) is
 // `tests/fixtures/guard-bash/transcript-corpus-2026-09-08.json`, extracted
 // from this project's Claude Code session transcripts on 2026-09-06..08 with
 // secrets and the maintainer's email scrubbed. The fixture is data under
 // tests/fixtures, so test-file sweeps do not walk it as executable code.
-const SURVEY_CORPUS_DATE = "2026-09-07";
-const SURVEY_CORPUS = [
-	...DENY_CASES.map(([command]) => ({ command, expected: "deny" as const })),
-	...ALLOW_CASES.map((command) => ({ command, expected: "allow" as const })),
-];
-
 const TRANSCRIPT_CORPUS = JSON.parse(
 	readFileSync(
 		join(
@@ -682,7 +721,7 @@ const EXPECTED_TRANSCRIPT_ALLOWS = new Set([
 
 describe("scripts/hooks/guard-bash.mjs -- deny list (#2699)", () => {
 	it.each(DENY_CASES)("denies %j", (command, ruleNeedle) => {
-		const result = runHook(command);
+		const result = hookVerdict(command);
 		expect(result.status).toBe(2);
 		expect(result.stderr.toLowerCase()).toContain(ruleNeedle);
 	});
@@ -697,7 +736,7 @@ describe("scripts/hooks/guard-bash.mjs -- deny list (#2699)", () => {
 
 describe("scripts/hooks/guard-bash.mjs -- allow list (#2699)", () => {
 	it.each(ALLOW_CASES)("allows %j", (command) => {
-		const result = runHook(command);
+		const result = hookVerdict(command);
 		expect(result.status).toBe(0);
 		expect(result.stderr).toBe("");
 	});
@@ -1973,9 +2012,10 @@ describe("scripts/hooks/guard-bash.mjs -- npm writers and deletes through a link
 // cannot be resolved statically fails CLOSED for the destructive rule
 // (`git worktree remove`), with its own named rule.
 //
-// Every row goes through the real hook entry (stdin JSON -> exit code ->
-// stderr), against a REAL registered linked worktree whose node_modules is a
-// symlink into a shared directory, the reviewer's probe from the issue body.
+// Every row goes through the hook's classifier (hookVerdict, the PreToolUse
+// payload under the env the child would get), against a REAL registered
+// linked worktree whose node_modules is a symlink into a shared directory, the
+// reviewer's probe from the issue body.
 describe("scripts/hooks/guard-bash.mjs -- path-argument resolver (#3988)", () => {
 	type PathRow = {
 		label: string;
@@ -2034,7 +2074,7 @@ describe("scripts/hooks/guard-bash.mjs -- path-argument resolver (#3988)", () =>
 		for (const [key, value] of Object.entries(row.env ?? {}))
 			if (value === undefined) delete env[key];
 			else env[key] = fill(value);
-		return runHook(fill(row.command), env, fill(row.cwd ?? PAYLOAD_CWD));
+		return hookVerdict(fill(row.command), env, fill(row.cwd ?? PAYLOAD_CWD));
 	}
 
 	function expectRule(row: PathRow) {
@@ -2575,7 +2615,7 @@ describe("scripts/hooks/guard-bash.mjs -- path-argument resolver (#3988)", () =>
 		])(
 			"allows a %s spelling of a runtime file in ANOTHER repository",
 			(_label, spelling) => {
-				const result = runHook(
+				const result = hookVerdict(
 					`node ${spelling} --help`,
 					{ ...BASE_ENV, HOME: otherRepo },
 					repoRoot,
@@ -2591,7 +2631,7 @@ describe("scripts/hooks/guard-bash.mjs -- path-argument resolver (#3988)", () =>
 		])(
 			"denies a %s spelling of a runtime file in THIS repository, from a foreign cwd",
 			(_label, spelling) => {
-				const result = runHook(
+				const result = hookVerdict(
 					`node ${spelling}`,
 					{ ...BASE_ENV, HOME: repoRoot },
 					foreignDir,
@@ -2650,29 +2690,13 @@ describe("scripts/hooks/guard-bash.mjs -- ambient PI_LENS_HOME (#2699)", () => {
 	});
 });
 
-describe("scripts/hooks/guard-bash.mjs -- round-2 survey corpus (#2705)", () => {
-	it.each(SURVEY_CORPUS)(
-		`keeps the ${SURVEY_CORPUS_DATE} corpus free of non-rule denies: $command`,
-		({ command, expected }) => {
-			const result = runHook(command);
-			if (expected === "allow") {
-				expect(result.status, command).toBe(0);
-				expect(result.stderr, command).toBe("");
-			} else {
-				expect(result.status, command).toBe(2);
-				expect(result.stderr.toLowerCase(), command).toMatch(
-					/stash|reset|worktree|probe|tmpdir|tmp|pkill|chained|ci-verdict|force|rebase/,
-				);
-			}
-		},
-	);
-});
-
 describe(`scripts/hooks/guard-bash.mjs -- transcript corpus ${TRANSCRIPT_CORPUS_DATE} (#2705)`, () => {
 	it("keeps the transcript corpus at zero non-rule denies", () => {
-		const corpusHome = mkdtempSync(
-			join(tmpdir(), "pi-lens-guard-bash-corpus-home-"),
-		);
+		// A synthetic HOME that is never created, like PAYLOAD_CWD: the hook only
+		// resolves `~` against it. A mkdtemp under os.tmpdir() is /tmp when TMPDIR
+		// is unset or /tmp, which turned the corpus's `~/...` writes into /tmp
+		// writes (#4348 review r1: 5 rows flipped).
+		const corpusHome = "/home/dev/pi-lens-guard-bash-corpus-home";
 		const corpusEnv = {
 			...BASE_ENV,
 			HOME: corpusHome,
@@ -2683,28 +2707,35 @@ describe(`scripts/hooks/guard-bash.mjs -- transcript corpus ${TRANSCRIPT_CORPUS_
 		const started = performance.now();
 		const offenses: string[] = [];
 		let actualDenies = 0;
-		try {
-			for (const { command } of TRANSCRIPT_CORPUS) {
-				const result = runHook(command, corpusEnv);
-				const hash = commandHash(command);
-				const expectedDeny = EXPECTED_TRANSCRIPT_DENIES.has(hash);
-				const expectedAllow = EXPECTED_TRANSCRIPT_ALLOWS.has(hash);
-				if (result.status === 2) actualDenies++;
+		for (const { command } of TRANSCRIPT_CORPUS) {
+			// The fixture was captured as uid 1000: its 655 harness-scratch
+			// writes name /tmp/claude-1000/. The exemption is the RUNNER's own
+			// uid, so the hook sees the runner's directory; the hash and the
+			// EXPECTED_* sets stay keyed on the original row (#4348 review r1:
+			// a CI uid != 1000 gave `expected 313 to be 66`).
+			const result = runHook(
+				command.replaceAll(
+					"/tmp/claude-1000",
+					`/tmp/claude-${process.getuid?.() ?? 1000}`,
+				),
+				corpusEnv,
+			);
+			const hash = commandHash(command);
+			const expectedDeny = EXPECTED_TRANSCRIPT_DENIES.has(hash);
+			const expectedAllow = EXPECTED_TRANSCRIPT_ALLOWS.has(hash);
+			if (result.status === 2) actualDenies++;
 
-				if (expectedDeny) {
-					if (result.status !== 2)
-						offenses.push(`expected deny was allowed: ${command}`);
-					continue;
-				}
-				if (expectedAllow && result.status !== 0)
-					offenses.push(`expected allow was denied: ${command}`);
-				else if (!expectedAllow && result.status !== 0)
-					offenses.push(`non-rule deny (${result.status}): ${command}`);
-				else if (result.stderr !== "")
-					offenses.push(`unexpected stderr: ${command}`);
+			if (expectedDeny) {
+				if (result.status !== 2)
+					offenses.push(`expected deny was allowed: ${command}`);
+				continue;
 			}
-		} finally {
-			rmSync(corpusHome, { recursive: true, force: true });
+			if (expectedAllow && result.status !== 0)
+				offenses.push(`expected allow was denied: ${command}`);
+			else if (!expectedAllow && result.status !== 0)
+				offenses.push(`non-rule deny (${result.status}): ${command}`);
+			else if (result.stderr !== "")
+				offenses.push(`unexpected stderr: ${command}`);
 		}
 
 		const elapsedMs = performance.now() - started;
@@ -4513,8 +4544,8 @@ describe("scripts/hooks/guard-bash.mjs -- git hook bypass (#3778)", () => {
 		"git add -A && git commit --no-verify -m x",
 	];
 
-	it.each(DENY)("denies %j through the real hook entry", (command) => {
-		const result = runHook(command);
+	it.each(DENY)("denies %j", (command) => {
+		const result = hookVerdict(command);
 		expect(result.status).toBe(2);
 		expect(result.stderr).toContain("hook");
 		// the one-line teaching message names the sanctioned path
@@ -4584,8 +4615,8 @@ describe("scripts/hooks/guard-bash.mjs -- git hook bypass (#3778)", () => {
 		"git log --no-verify",
 	];
 
-	it.each(ALLOW)("allows %j through the real hook entry", (command) => {
-		const result = runHook(command);
+	it.each(ALLOW)("allows %j", (command) => {
+		const result = hookVerdict(command);
 		expect(result.status).toBe(0);
 		expect(result.stderr).toBe("");
 	});
@@ -5022,5 +5053,288 @@ describe("scripts/hooks/guard-bash.mjs -- branch history guard (#3888)", () => {
 		const rebase: DenyRule = "rebase";
 		expect(RULE_MESSAGES[force]).toContain("origin/master");
 		expect(RULE_MESSAGES[rebase]).toContain("origin/master");
+	});
+});
+
+// #4348: agent writes under /tmp. Recurrence: on 2026-10-13 two Haiku
+// investigators wrote an error file to /tmp and deleted it, and a Haiku helper
+// wrote gh output there; `tmpCheckout` (#3526) only covers checkouts and
+// mktemp directories, so redirects, tee and file writes passed. /tmp on the
+// maintainer host is tmpfs (RAM + swap). Every row below is a command from that
+// family or a lookalike the rule must leave alone.
+describe("scripts/hooks/guard-bash.mjs -- writes under /tmp (#4348)", () => {
+	const uid = typeof process.getuid === "function" ? process.getuid() : 1000;
+	const NO_AMBIENT_TMPDIR_ENV: NodeJS.ProcessEnv = Object.fromEntries(
+		Object.entries(BASE_ENV).filter(
+			([key]) => !["TMPDIR", "TMP", "TEMP"].includes(key),
+		),
+	);
+	const deny = (command: string) => findDeny(command, PAYLOAD_CWD);
+
+	// Recurrence: the redirect branch (`>`, `>>`, `2>`, `&>`, `>&file`) missing
+	// or limited to a space-separated target -- the Haiku error file was
+	// `2> /tmp/err.txt`, and `echo hi>/tmp/x` has no space at all.
+	it.each([
+		"echo hi > /tmp/x",
+		"echo hi >/tmp/x",
+		"echo hi>/tmp/x",
+		"echo hi >> /tmp/x",
+		"gh pr view 1 2> /tmp/err.txt",
+		"gh pr view 1 2>/tmp/err.txt",
+		"gh pr view 1 2>>/tmp/err.txt",
+		"gh pr view 1 &> /tmp/out",
+		"gh pr view 1 &>> /tmp/out",
+		"gh pr view 1 >& /tmp/out",
+		"gh pr view 1 2>&1 > /tmp/out",
+		"> /tmp/x",
+		"> /tmp/x echo hi",
+		'echo "a">/tmp/x',
+		"echo a > /tmp/../tmp/x",
+		"cat <<EOF > /tmp/x\nbody\nEOF",
+		"cd /tmp && echo x > y",
+		"S=/tmp/scratch; echo a > $S/out",
+	])("denies the redirect %j", (command) => {
+		expect(deny(command)).toBe("tmpWrite");
+	});
+
+	// Recurrence: `tee` as the stdout-to-file spelling a redirect-only rule
+	// misses; every operand is a file, not only the first.
+	it.each([
+		"echo a | tee /tmp/x",
+		"echo a | tee -a /tmp/x",
+		"echo a | tee ./ok /tmp/y",
+		"echo a | sudo tee /tmp/x",
+	])("denies tee: %j", (command) => {
+		expect(deny(command)).toBe("tmpWrite");
+	});
+
+	// Recurrence: a cp/mv rule that judged the FIRST operand (the source) or
+	// ignored `-t DIR`, which names the destination before the sources.
+	it.each([
+		"cp a /tmp/b",
+		"cp -r a b /tmp/",
+		"mv a /tmp/b",
+		"cp -t /tmp a b",
+		"cp --target-directory=/tmp a",
+		"cp --target-directory /tmp a",
+		"cp -rt /tmp a",
+		"cp -t/tmp a",
+		"mv -t /tmp a",
+		"install a /tmp/b",
+		"install -m 755 a /tmp/b",
+		"install -d /tmp/a /home/dev/b",
+	])("denies the cp/mv/install target %j", (command) => {
+		expect(deny(command)).toBe("tmpWrite");
+	});
+
+	// Recurrence: mkdir/touch judged by the last operand only, or `-m 755`'s
+	// value read as the directory.
+	it.each([
+		"mkdir /tmp/a",
+		"mkdir -p /tmp/a/b",
+		"mkdir -m 755 /tmp/a",
+		"mkdir ./ok /tmp/a",
+		"touch /tmp/a",
+		"touch -d yesterday /tmp/a",
+	])("denies mkdir/touch: %j", (command) => {
+		expect(deny(command)).toBe("tmpWrite");
+	});
+
+	// Recurrence: the rule widening into reads ("reads that /tmp cannot
+	// serve"): /tmp as a source, an input redirect, a listing or a delete must
+	// stay allowed.
+	it.each([
+		"cat /tmp/x",
+		"cat < /tmp/x",
+		"cp /tmp/x ./y",
+		"cp /tmp/x /tmp/y ./dir",
+		"cp -t ./dir /tmp/x",
+		"mv /tmp/x ./y",
+		"install /tmp/x ./y",
+		"touch -r /tmp/ref ./x",
+		"mkdir -m 755 ./a",
+		"grep -r foo /tmp",
+		"ls /tmp",
+		"rm -rf /tmp/x",
+	])("allows the read or non-/tmp write %j", (command) => {
+		expect(deny(command)).toBeNull();
+	});
+
+	// Recurrence: a prefix match on "/tmp" (`/tmpfoo`) or a relative `tmp/`.
+	it.each([
+		"echo a > /tmpfoo/x",
+		"echo a > ./tmp/x",
+		"echo a > tmp/x",
+		"echo a > /home/dev/tmp/x",
+		"mkdir -p /home/dev/tmp/x",
+		"cp a /var/tmp-not/b",
+	])("does not treat %j as /tmp", (command) => {
+		expect(deny(command)).toBeNull();
+	});
+
+	// Recurrence (principles §2, "Detectors match code, not prose"): a quoted
+	// string, a comment, an escaped `>` or a heredoc body that merely spells a
+	// write must never deny.
+	it.each([
+		'echo "> /tmp/x"',
+		"echo '> /tmp/x'",
+		'echo ">/tmp/x"',
+		"echo '>/tmp/x'",
+		'echo ">" /tmp/x',
+		"echo \\>/tmp/x",
+		'echo "cp a /tmp/b"',
+		"echo \\> /tmp/x",
+		"echo a # > /tmp/x",
+		"grep '>' /tmp/x",
+		"cat <<'EOF'\n> /tmp/x\ncp a /tmp/b\ntee /tmp/c\nEOF",
+		"cat <<EOF\n> /tmp/x\nmkdir /tmp/y\nEOF",
+		"git commit -m 'write > /tmp/x with tee /tmp/y'",
+	])("a /tmp write spelled as text never denies: %j", (command) => {
+		expect(deny(command)).toBeNull();
+	});
+
+	// Recurrence: `2>&1`, `>&2` and `>&-` read as redirects into a file named
+	// `1`/`2`/`-`, or into whatever follows them.
+	it.each([
+		"gh pr view 1 >/dev/null 2>&1",
+		"gh pr view 1 2>&1",
+		"echo hi >&2",
+		"echo hi 2>&-",
+		"echo hi >&2 /tmp/not-a-target",
+	])("a descriptor duplicate writes no file: %j", (command) => {
+		expect(deny(command)).toBeNull();
+	});
+
+	// Recurrence: a `>`/`>>` with its target attached takes the NEXT word (the
+	// command's own argument, here a /tmp READ) as its target too.
+	it.each([
+		"cat >out.txt /tmp/in",
+		"cat >>out.txt /tmp/in",
+		"sort 2>>err /tmp/in",
+	])(
+		"an attached redirect target does not borrow the next word: %j",
+		(command) => {
+			expect(deny(command)).toBeNull();
+		},
+	);
+
+	// Recurrence: a descriptor duplicate read as a file NAMED `1`/`2`/`-` --
+	// only visible when the cwd is itself under /tmp, where a relative file is
+	// a /tmp file. A real redirect there still denies.
+	it("a descriptor duplicate is not a relative file even when the cwd is under /tmp", () => {
+		const underTmp = "/tmp/pi-lens-guard-bash-4348-cwd-fixture";
+		for (const command of ["cmd 2>&1", "echo hi >&2", "echo hi >&-"])
+			expect(findDeny(command, underTmp), command).toBeNull();
+		expect(findDeny("echo hi > out.txt", underTmp)).toBe("tmpWrite");
+	});
+
+	// The acceptance's exemption: the harness's own session directory. Another
+	// uid's directory is not the harness's, and `..` out of it lands in /tmp.
+	it("exempts /tmp/claude-<uid>/ and nothing beside it", () => {
+		expect(deny(`echo a > /tmp/claude-${uid}/scratch/x`)).toBeNull();
+		expect(deny(`mkdir -p /tmp/claude-${uid}/scratch`)).toBeNull();
+		expect(deny(`cp a /tmp/claude-${uid}/scratch/b`)).toBeNull();
+		expect(deny(`echo a | tee /tmp/claude-${uid}/x`)).toBeNull();
+		expect(deny(`echo a > /tmp/claude-${uid + 1}/x`)).toBe("tmpWrite");
+		expect(deny(`echo a > /tmp/claude-${uid}/../x`)).toBe("tmpWrite");
+		expect(deny(`echo a > /tmp/claude-${uid}x/x`)).toBe("tmpWrite");
+	});
+
+	// Recurrence: guessing $TMPDIR. It is expanded by the same resolver as
+	// every other path rule: the shell's value (command text, then the hook's
+	// own environment), and /tmp only when neither sets it. A lane pinned off
+	// /tmp writes $TMPDIR freely; an unset or /tmp-pointing one does not.
+	describe("$TMPDIR", () => {
+		const lane = "/home/dev/lane-tmp";
+		it.each(["echo a > $TMPDIR/x", "echo a > ${TMPDIR}/x", "mkdir $TMPDIR/d"])(
+			"%j follows the ambient TMPDIR",
+			(command) => {
+				expect(runHook(command, { ...BASE_ENV, TMPDIR: lane }).status).toBe(0);
+				expect(
+					runHook(command, { ...BASE_ENV, TMPDIR: "/tmp/pi-lens-x" }).stderr,
+				).toBe(`${RULE_MESSAGES.tmpWrite}\n`);
+				expect(runHook(command, { ...BASE_ENV, TMPDIR: "/tmp" }).stderr).toBe(
+					`${RULE_MESSAGES.tmpWrite}\n`,
+				);
+			},
+		);
+
+		// Recurrence (review r1, 93,532 real commands): `> $TMPDIR/ci.txt` in a
+		// shell where TMPDIR was never exported. Bash expands the unset variable
+		// to the empty string -- the real write was `/ci.txt` ("Permission
+		// denied") -- so `/tmp` is mktemp's default, not the shell's. The hook's
+		// unresolved-expansion contract is to fail open; the rule must not
+		// invent /tmp for TMPDIR, TMP or TEMP.
+		it.each([
+			"echo a > $TMPDIR/x",
+			"echo a > ${TMPDIR}/x",
+			'echo a > "$TMPDIR/x"',
+			"mkdir -p $TMPDIR/d",
+			"echo a | tee $TMPDIR/x",
+			"cp a $TMP/x",
+			"touch $TEMP/x",
+		])("%j with TMPDIR unset everywhere fails open", (command) => {
+			const result = runHook(command, NO_AMBIENT_TMPDIR_ENV);
+			expect(result.status).toBe(0);
+			expect(result.stderr).toBe("");
+		});
+
+		it("an unset TMP does not hide a TMPDIR that points at /tmp", () => {
+			expect(
+				runHook("cp a $TMPDIR/x", { ...NO_AMBIENT_TMPDIR_ENV, TMPDIR: "/tmp" })
+					.stderr,
+			).toBe(`${RULE_MESSAGES.tmpWrite}\n`);
+		});
+
+		it("an assignment earlier in the command wins over the ambient value", () => {
+			expect(
+				runHook("TMPDIR=/tmp/y; echo a > $TMPDIR/x", {
+					...BASE_ENV,
+					TMPDIR: lane,
+				}).stderr,
+			).toBe(`${RULE_MESSAGES.tmpWrite}\n`);
+		});
+
+		// bash expands the redirect word before the inline `TMPDIR=` applies to
+		// the command (the #3997 rule for git's path words).
+		it("an inline TMPDIR= does not move the redirect target", () => {
+			expect(
+				runHook("TMPDIR=/tmp/y echo a > $TMPDIR/x", {
+					...BASE_ENV,
+					TMPDIR: lane,
+				}).status,
+			).toBe(0);
+		});
+	});
+
+	it("denies through the real hook with the rule's teaching message on stderr", () => {
+		const result = runHook("echo hi > /tmp/x");
+		expect(result.status).toBe(2);
+		expect(result.stderr).toBe(`${RULE_MESSAGES.tmpWrite}\n`);
+		expect(RULE_MESSAGES.tmpWrite).toContain("/tmp");
+		const allowed = runHook(`echo hi > /tmp/claude-${uid}/x`);
+		expect(allowed.status).toBe(0);
+		expect(allowed.stderr).toBe("");
+	});
+
+	// Named limits, pinned so each is a visible decision rather than an
+	// untested docblock claim. Every one is a write this static scan does not
+	// follow (see the PR body "Limits"); none is promised denied.
+	it.each([
+		"dd if=/dev/zero of=/tmp/x count=1",
+		"echo a >| /tmp/x",
+		"export A=1 > /tmp/x",
+		"bash -c 'echo a > /tmp/x'",
+		"sh -c 'cp a /tmp/b'",
+		"echo a | xargs -I{} touch /tmp/{}",
+		"find . -name x -exec cp {} /tmp/ ;",
+		"curl -o /tmp/x https://example.com",
+		"sed -i s/a/b/ /tmp/x",
+		"awk '{print > \"/tmp/x\"}' f",
+		"cp --target=/tmp a",
+		"echo a > ${TMPDIR:-/tmp}/x",
+		"echo a > /private/tmp/x",
+	])("limit: %j is not judged", (command) => {
+		expect(deny(command)).toBeNull();
 	});
 });

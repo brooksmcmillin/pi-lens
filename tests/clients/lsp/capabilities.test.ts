@@ -21,6 +21,20 @@ describe("LspCapabilities adapter", () => {
 		expect(adaptLspService(service)).toBe(facade);
 	});
 
+	// #2372 slice 3: the registry owns the client half of shutdown, but the
+	// group's shutdown must stay the service's, which also tears down the
+	// per-generation touch state; a route straight to the registry would not.
+	it("routes the lifecycle group's shutdown to the service, which tears down touch state too", async () => {
+		const service = new LSPService();
+		const shutdown = vi.spyOn(service, "shutdown");
+		const facade = adaptLspService(service);
+
+		await facade.clients?.shutdown({ fast: true });
+
+		expect(shutdown).toHaveBeenCalledWith({ fast: true });
+		expect(facade.clients?.checkDestroyed()).toBe(true);
+	});
+
 	it("keeps the singleton lifecycle compatibility export on the facade", () => {
 		const facade: LspCapabilities = getLSPService();
 		expect(facade.documents).toBeDefined();

@@ -51,9 +51,9 @@ const wire: Record<Tool, string> = {
 			errors: [
 				{
 					line: 2,
-					col: 3,
-					detail: "Missing spacing",
-					ruleId: "standard:spacing",
+					column: 3,
+					message: "Missing spacing",
+					rule: "standard:spacing",
 				},
 			],
 		},
@@ -152,6 +152,33 @@ describe("JSON/text runner outcome seam (#1816)", () => {
 		vi.resetModules();
 		safeSpawnAsync.mockReset();
 		available = true;
+	});
+
+	// Recurrence (#4522): ktlint 1.8.0 prints its own log lines on stdout around
+	// the reporter's JSON (tests/fixtures/runner-output/ktlint/real.captured.json),
+	// and the runner parsed the whole stream, so every finding replayed as a
+	// parse error.
+	it.each([
+		["a log line before the report", "WARN before\n{report}\n"],
+		[
+			"log lines before and after the report",
+			"WARN before\n{report}\n00:55:36.000 [main] INFO done [ok]\n",
+		],
+	])("ktlint: reads the findings with %s (#4522)", async (_name, template) => {
+		const observed = await dispatchOutcome("ktlint", {
+			error: null,
+			status: 1,
+			stdout: template.replace(
+				"{report}",
+				JSON.stringify(JSON.parse(wire.ktlint), null, 4),
+			),
+			stderr: "",
+		});
+		expect(observed.status).toBe("succeeded");
+		expect(observed.diagnostics).toHaveLength(1);
+		expect(JSON.stringify(observed.diagnostics)).toContain(
+			"[standard:spacing] Missing spacing",
+		);
 	});
 
 	for (const tool of ["ktlint", "php-lint"] as const) {

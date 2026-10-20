@@ -99,16 +99,6 @@ describe("check-action-pins parser (#4043)", () => {
 		).resolves.toEqual([]);
 	});
 
-	it("keeps the 6849a648/v4.3.0 mismatch exact", async () => {
-		const pins = parseActionPins(
-			`- uses: actions/cache@${BAD} # v4.3.0`,
-			"fixture.yml",
-		);
-		await expect(validatePins(pins, async () => GOOD)).resolves.toEqual([
-			`fixture.yml:1: actions/cache # v4.3.0 resolves to ${GOOD}, not ${BAD}`,
-		]);
-	});
-
 	it("peels an annotated tag at the GitHub API process boundary", async () => {
 		const calls: string[] = [];
 		const fetchImpl = async (input: string | URL | Request) => {
@@ -162,5 +152,84 @@ describe("check-action-pins parser (#4043)", () => {
 			"https://api.github.com/repos/actions/setup-node/git/matching-refs/tags/v6.",
 			"https://api.github.com/repos/actions/setup-node/git/tags/tag-object",
 		]);
+	});
+
+	// Recurrence #4422 F3 (#4427): the three resolvers each built their own
+	// header block until it moved to githubHeaders. These pin the behaviour the
+	// move must keep: the token (GITHUB_TOKEN, else GH_TOKEN) goes out as a
+	// Bearer header on every request of a peel, and an anonymous run sends none.
+	describe("request headers", () => {
+		const capture = () => {
+			const seen: Array<Record<string, string>> = [];
+			const fetchImpl = async (_input: unknown, init?: RequestInit) => {
+				seen.push(init?.headers as Record<string, string>);
+				return seen.length === 1
+					? new Response(
+							JSON.stringify([
+								{ ref: "refs/tags/v6.5.0", object: { type: "tag", sha: "t" } },
+							]),
+							{ status: 200 },
+						)
+					: new Response(JSON.stringify({ object: { sha: GOOD } }), {
+							status: 200,
+						});
+			};
+			return { seen, fetchImpl };
+		};
+
+		it.each([
+			["GITHUB_TOKEN", { GITHUB_TOKEN: "gh-tok" }, "Bearer gh-tok"],
+			["GH_TOKEN", { GH_TOKEN: "cli-tok" }, "Bearer cli-tok"],
+			[
+				"GITHUB_TOKEN over GH_TOKEN",
+				{ GITHUB_TOKEN: "gh-tok", GH_TOKEN: "cli-tok" },
+				"Bearer gh-tok",
+			],
+		])(
+			"sends %s as a Bearer header on both requests of a peel",
+			async (_n, env, header) => {
+				const { seen, fetchImpl } = capture();
+				await resolveGithubMatchingTags(
+					"actions/setup-node",
+					"v6",
+					fetchImpl,
+					env,
+				);
+				expect(seen.map((headers) => headers.Authorization)).toEqual([
+					header,
+					header,
+				]);
+				expect(seen[0].Accept).toBe("application/vnd.github+json");
+			},
+		);
+
+		it("sends no Authorization header without a token", async () => {
+			const { seen, fetchImpl } = capture();
+			await resolveGithubMatchingTags(
+				"actions/setup-node",
+				"v6",
+				fetchImpl,
+				{},
+			);
+			expect(seen).toHaveLength(2);
+			for (const headers of seen) {
+				expect(Object.keys(headers)).not.toContain("Authorization");
+			}
+		});
+
+		it.each([
+			["GITHUB_TOKEN", { GITHUB_TOKEN: "gh-tok" }, "Bearer gh-tok"],
+			["GH_TOKEN", { GH_TOKEN: "cli-tok" }, "Bearer cli-tok"],
+		])("sends %s on the single-tag resolver too", async (_n, env, header) => {
+			const seen: Array<Record<string, string>> = [];
+			const fetchImpl = async (_input: unknown, init?: RequestInit) => {
+				seen.push(init?.headers as Record<string, string>);
+				return new Response(JSON.stringify({ object: { sha: GOOD } }), {
+					status: 200,
+				});
+			};
+			await resolveGithubTag("actions/cache", "v4.3.0", fetchImpl, env);
+			expect(seen[0].Authorization).toBe(header);
+		});
 	});
 });

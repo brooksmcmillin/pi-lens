@@ -70,6 +70,9 @@
 - name: nightly-drift
   color: e11d21
   description: "Auto-filed and auto-closed by a nightly drift/job-verdict notifier; manifest-managed, never by hand"
+- name: known-gap
+  color: BFD4F2
+  description: "p3 gap accepted under the merge bar; closed as not planned, reopen if it turns material"
 - name: duplicate
   color: cfd3d7
   description: Duplicate of an existing issue

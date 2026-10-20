@@ -29,6 +29,7 @@ export function resolveGithubMatchingTags(
 	fetchImpl?: typeof fetch,
 	env?: NodeJS.ProcessEnv,
 ): Promise<MatchingTag[]>;
+export function workflowFiles(root?: string): Promise<string[]>;
 export function checkActionPins(options?: {
 	root?: string;
 	fetchImpl?: typeof fetch;

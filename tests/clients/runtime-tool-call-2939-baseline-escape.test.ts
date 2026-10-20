@@ -33,19 +33,39 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
  */
 const pendingLoad = vi.hoisted(() => ({
 	resolve: undefined as ((clients: unknown) => void) | undefined,
+	/** Called when the demand starts the load (see `loadStarted`). */
+	onStart: undefined as (() => void) | undefined,
 }));
+
+/**
+ * Resolves once the hook has started the bootstrap load. The hook awaits
+ * other work first (#4493: its HEAD look spawns `git rev-parse`, real I/O
+ * that a fake-timer pump does not run), so one pump is no proof the load has
+ * started; this waits for the load itself.
+ */
+function loadStarted(): Promise<void> {
+	if (pendingLoad.resolve) return Promise.resolve();
+	return new Promise((resolve) => {
+		pendingLoad.onStart = resolve;
+	});
+}
+
+const analyzedPaths: string[] = [];
 
 const LOADED_CLIENTS = {
 	complexityClient: {
 		isSupportedFile: () => true,
-		analyzeFile: async () => ({
-			maintainabilityIndex: 70,
-			cognitiveComplexity: 1,
-			maxNestingDepth: 1,
-			linesOfCode: 1,
-			maxCyclomaticComplexity: 1,
-			codeEntropy: 0,
-		}),
+		analyzeFile: async (analyzedPath: string) => {
+			analyzedPaths.push(analyzedPath);
+			return {
+				maintainabilityIndex: 70,
+				cognitiveComplexity: 1,
+				maxNestingDepth: 1,
+				linesOfCode: 1,
+				maxCyclomaticComplexity: 1,
+				codeEntropy: 0,
+			};
+		},
 	},
 	biomeClient: {},
 	ruffClient: {},
@@ -73,6 +93,7 @@ vi.mock("../../clients/bootstrap.js", async () => {
 		() =>
 			new Promise((resolve) => {
 				pendingLoad.resolve = resolve;
+				pendingLoad.onStart?.();
 			}),
 	);
 });
@@ -89,6 +110,8 @@ let filePath: string;
 
 beforeEach(() => {
 	pendingLoad.resolve = undefined;
+	pendingLoad.onStart = undefined;
+	analyzedPaths.length = 0;
 	env = setupTestEnvironment("pi-lens-2939-escape-");
 	runtime = new RuntimeCoordinator();
 	runtime.projectRoot = env.tmpDir;
@@ -154,10 +177,27 @@ describe("#2939 M7 — Escape releases the complexity-baseline demand", () => {
 		const call = runHandlerExpectingNoThrow(() =>
 			handleToolCall(deps(new AbortController().signal)),
 		);
-		await vi.advanceTimersByTimeAsync(0);
+		await loadStarted();
 		pendingLoad.resolve?.(LOADED_CLIENTS);
 		await call;
 
 		expect(runtime.complexityBaselines.size).toBe(1);
+	});
+});
+
+describe("#4125 S3 — the baseline memo keeps the path, not the analysis", () => {
+	it("analyzes a file once and holds only its path", async () => {
+		vi.useFakeTimers();
+		for (let call = 0; call < 2; call++) {
+			const pending = runHandlerExpectingNoThrow(() =>
+				handleToolCall(deps(new AbortController().signal)),
+			);
+			if (call === 0) await loadStarted();
+			pendingLoad.resolve?.(LOADED_CLIENTS);
+			await pending;
+		}
+
+		expect(analyzedPaths).toEqual([filePath]);
+		expect([...runtime.complexityBaselines]).toEqual([filePath]);
 	});
 });

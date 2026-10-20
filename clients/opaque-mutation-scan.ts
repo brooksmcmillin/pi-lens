@@ -37,6 +37,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
+import {
+	resolveGitCheckout,
+	resolveGitIdentity,
+} from "./review-graph/git-identity.js";
 import { collectSourceFilesWithBudgetAsync } from "./source-filter.js";
 import { createHash } from "node:crypto";
 
@@ -45,6 +49,7 @@ import { incrementDegradationCount } from "./degradation-ledger.js";
 import { normalizeMapKey } from "./path-utils.js";
 import { freshnessFromMtime } from "./freshness.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
+import { createSingleFlight } from "./single-flight.js";
 import { truncatedByOutputCap } from "./spawn-output-cap.js";
 
 interface FileStatEntry {
@@ -101,6 +106,17 @@ export interface PendingOpaqueBaseline {
 	strategy: "git" | "stat-diff";
 	stats?: FileStatsSnapshot;
 	statsUnknownReason?: OpaqueUnknownReason;
+}
+
+/**
+ * Opaque recovery feeds dispatch and LSP resync; it is not read evidence.
+ * Keep its lifecycle gate shared by the pre-call baseline and post-call take.
+ */
+export function shouldRunOpaqueRecovery(
+	toolName: string,
+	workspaceRoot: string | undefined,
+): workspaceRoot is string {
+	return toolName === "bash" && workspaceRoot !== undefined;
 }
 
 /**
@@ -291,10 +307,34 @@ export function diffFileContent(
 }
 
 /**
+ * The ONE root a prescan record is captured and consumed against: the session's
+ * own working directory, which is where the host runs the bash command and so
+ * the tree its writes land in.
+ *
+ * Both hooks ask this function, because a record written under one root and
+ * looked up under another reports `no-pending-snapshot` for a command that did
+ * write (#4504). `ctx.cwd` is per-session and frozen: it projects the same
+ * `_cwd` field the tools are constructed with and is never reassigned
+ * (`tests/clients/pi-host-contract.test.ts`), so one session's two hooks
+ * resolve the same value. The fallback is the coordinator's `projectRoot`, the
+ * only answer a host that offers no cwd leaves, and it is the same answer at
+ * both hooks. The root that differs between the two hooks in production is a
+ * concurrent secondary session's (#473): it is declined by the #2129 guard, so
+ * the coordinator keeps the live primary's root while `ctx.cwd` is its own.
+ */
+export function opaquePrescanRoot(
+	sessionCwd: string | undefined,
+	/** The coordinator's `projectRoot`, resolved by the caller for its host. */
+	projectRoot: string,
+): string {
+	return sessionCwd ?? projectRoot;
+}
+
+/**
  * The session-stamped slot (`<cwd>:<generation>`) a baseline lives in, derived
  * once for the `tool_call` record and the `tool_result` take (shape 19). The
  * generation keeps a concurrent-secondary session (#473) from consuming another
- * session's baseline.
+ * session's baseline; the root half is {@link opaquePrescanRoot}.
  */
 export function opaqueBaselineSlot(
 	scanRoot: string,
@@ -422,6 +462,125 @@ export function resetOpaqueMutationState(): void {
 	getOpaqueBaselineStore().takeAllForTest();
 	gitRepoMemo.clear();
 	gitToplevelMemo.clear();
+	headRecords.clear();
+	headLooks.clear();
+}
+
+/**
+ * #4493: the HEAD each session last saw in a scan slot, so a clean-tree HEAD
+ * move (checkout, reset --hard, a completed rebase or cherry-pick, or one made
+ * outside pi) is seen at all: `git status` is empty after one. Keyed by
+ * {@link headRecordKey}, so one session never reads or writes another's.
+ * Cleared with the rest of this module at the session boundary, where the LSP
+ * service resets too, so no held document outlives its record.
+ */
+const HEAD_RECORD_CAP = 64;
+const headRecords = new BoundedFifoMap<string, string>(HEAD_RECORD_CAP);
+
+/** One session's HEAD record key in a scan slot ({@link opaqueBaselineSlot}). */
+export function headRecordKey(
+	slot: string,
+	sessionId: string | undefined,
+): string {
+	return `${slot}|${sessionId ?? ""}`;
+}
+
+/**
+ * Record `head` for `key` and return the HEAD it replaces when that differs:
+ * the move to resync. A first observation returns `undefined`. Synchronous, so
+ * two looks cannot both claim a move; {@link serializeHeadLook} keeps the
+ * looks of one key in order.
+ */
+export function observeGitHead(key: string, head: string): string | undefined {
+	const previous = headRecords.get(key);
+	headRecords.delete(key);
+	headRecords.set(key, head);
+	return previous !== undefined && previous !== head ? previous : undefined;
+}
+
+/**
+ * #4493: one HEAD look per record key at a time. A session's parallel tool
+ * calls look concurrently. A look that arrives mid-flight joins it: it returns
+ * only once the flight has sent the move's bytes to the primary servers, so a
+ * parallel read or edit never runs against the stale view (review r1 F1). It
+ * also gets one trailing look of its own, which reads HEAD after the flight,
+ * so a move made after the flight read HEAD is seen before it returns (review
+ * r1 F2, #1687's shape). An entry lives while its flight runs.
+ */
+const headLooks = createSingleFlight<void>({ coalesceTrailing: true });
+
+/** Run `look` as the only HEAD look of `key` in flight. */
+export function serializeHeadLook(
+	key: string,
+	look: () => Promise<void>,
+): Promise<void> {
+	return headLooks.run(key, look);
+}
+
+const COMMIT_ID = /^[0-9a-f]{40,64}$/;
+
+/**
+ * HEAD's commit id, or `undefined` for an unborn HEAD or a failed read. Every
+ * non-bash tool_call looks, so the common case reads the files git keeps
+ * (`resolveGitIdentity`: HEAD, the loose ref, packed-refs; about 0.05 ms)
+ * and spawns `git rev-parse` only when those cannot answer: a reftable ref
+ * store, a SHA-256 detached HEAD, or anything else they do not resolve.
+ */
+export async function readGitHead(root: string): Promise<string | undefined> {
+	const fromFiles = resolveGitIdentity(root)?.headCommit;
+	if (fromFiles && COMMIT_ID.test(fromFiles)) return fromFiles;
+	const result = await safeSpawnAsync(
+		"git",
+		["rev-parse", "--verify", "-q", "HEAD"],
+		{ cwd: root, timeout: 3000 },
+	);
+	const head =
+		!result.error && result.status === 0 ? result.stdout?.trim() : undefined;
+	return head && COMMIT_ID.test(head) ? head : undefined;
+}
+
+/**
+ * The directory git prints porcelain and diff paths relative to: the top of
+ * the checkout `root` is in, in `root`'s own spelling (git's own toplevel is
+ * a real path). Read from files; `root` itself when that cannot answer.
+ *
+ * The file walk stops at the first `.git` it finds, but git skips a `.git`
+ * directory with no HEAD and keeps looking. Such a top is not git's, so it
+ * answers `root` (a stray `/tmp/.git` once sent every path to `/tmp`).
+ */
+function gitPathBase(root: string): string {
+	const top = resolveGitCheckout(root)?.spelledRoot;
+	if (!top) return root;
+	const dotGit = path.join(top, ".git");
+	// A `.git` file (a linked worktree) names a git dir the walk checked.
+	const linked =
+		fs.statSync(dotGit, { throwIfNoEntry: false })?.isFile() === true;
+	return linked || fs.existsSync(path.join(dotGit, "HEAD")) ? top : root;
+}
+
+/**
+ * The files that differ between commits `from` and `to`, as map keys, or
+ * `undefined` when git failed or the listing was cut. The whole checkout's
+ * delta, so a held document outside a subdirectory cwd is in it too;
+ * `--no-renames` lists both sides of a rename.
+ */
+export async function listGitHeadDelta(
+	root: string,
+	from: string,
+	to: string,
+): Promise<string[] | undefined> {
+	const result = await safeSpawnAsync(
+		"git",
+		["diff", "--name-only", "--no-renames", "-z", from, to],
+		{ cwd: root, timeout: 5000, maxOutputBytes: MAX_GIT_STATUS_OUTPUT_BYTES },
+	);
+	if (truncatedByOutputCap(result) || result.error || result.status !== 0)
+		return undefined;
+	const base = gitPathBase(root);
+	return (result.stdout ?? "")
+		.split("\0")
+		.filter(Boolean)
+		.map((relPath) => normalizeMapKey(path.resolve(base, relPath)));
 }
 
 /** Cached git-worktree probe (repos don't stop being git mid-session). */
@@ -648,6 +807,9 @@ export async function recoverOpaqueChangesViaGit(
 			scannedCount: 0,
 		};
 	}
+	// Porcelain paths are relative to the top of the checkout, not to `root`
+	// (#4493 residual 3): from a subdirectory each one pointed below itself.
+	const base = gitPathBase(root);
 	const entries: GitStatusEntry[] = [];
 	let unknownStatusCount = 0;
 	let skipNext = false; // rename's OLD path follows its NEW path
@@ -678,7 +840,7 @@ export async function recoverOpaqueChangesViaGit(
 		}
 		if (!isKnownPorcelainStatus(status)) unknownStatusCount += 1;
 		if (status.includes("R") || status.includes("C")) skipNext = true;
-		entries.push({ status, absPath: path.resolve(root, relPath) });
+		entries.push({ status, absPath: path.resolve(base, relPath) });
 	}
 	if (skipNext) {
 		return {

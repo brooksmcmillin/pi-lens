@@ -56,6 +56,10 @@ change.
     from the block to the action that releases it (`BlockRelease`): the run
     boundary (`Turn`, `"run"`, round 3) or the call's `tool_execution_end`
     (`"end"`, round 4, which keeps the run-boundary drop as a backstop);
+  - **id-less read** (`"iread"`, #4387 round 2): a whole-file read that
+    another extension's tool showed the agent and a read bridge recorded with
+    no `toolCallId` (`IdlessRead`). It stamps FileTime (#3865), and every move
+    drops it;
   - **positional edit** of 1 or 2 lines: `checkEdit` at tool_call,
     optional relocation, the host apply, then `recordWritten` at
     tool_result. Since #3523, an edit the guard allowed unrelocated
@@ -174,6 +178,15 @@ or is a mutant of a fix (`*NoRecord`, `EvidenceAtResultHandler`,
 `OwnEditRelocInsertRecorded`, `SpanSnapshotFixAnyReloc`, `SpanSnapshotFixNoOwnRecord`,
 `TreeDrainFencedMtime`, which sets `MtimeAuthored = TRUE`).
 
+Every switch above, and every `ReadGuard.tla` switch a config overrides with
+`<-` (`ZeroReadInjects`, `OldTextRetires`, `InjectNamesAuthorship`,
+`OldTextNeedsNamedRead`, `PipelineCreditsOldText`, `KeepEmptyScope`), is
+pinned in `formal/switch-pins.json` to a test that drives the real code
+(#4393). `tests/config/tla-switch-pins.test.ts` fails when an `expect: pass`
+config disagrees with a pinned value; `DrainMode = "atomic"` is admitted there
+as a narrowing of `"fenced"`. A change to a pinned behaviour flips the switch,
+its configs, the registry value and the pin test together.
+
 ## Guard (as coded)
 
 The model follows `checkEdit` step by step:
@@ -227,6 +240,7 @@ The model follows `checkEdit` step by step:
 | `NoStaleAllow` | An allowed or relocated edit of lines the agent was shown lands on lines that still hold what it was shown. `read-guard.ts` header items 2-3; `importBranch` never re-hashes a record from today's disk. |
 | `NoBlindAllow` | An edit of lines this conversation never showed the agent is refused. Header item 1, "Read state from session 1 never authorises session 2". With `contextLines > 0` the guard admits ±contextLines by design (`ContextSlack`). |
 | `NoFalseBlock` | With hashes, an edit whose target lines hold exactly what the agent was shown is never refused. The attachment is "authoritative for subsequent edits". `recordWritten` exists so an own write "doesn't trigger file_modified". |
+| `NoIdlessAuthoredRead` | The read the zero-read arm injects over an authorship that names a call names a call too (#4387 round 2, review F2), so no move keeps the authorship and drops the read that bounds it. It is a witness for the `InjectNamesAuthorship` switch: with the switch on it holds by construction, and `AuthorInjectIdlessPre4387R2` shows it fail with the switch off. |
 
 `NoStaleAllow` and `NoFalseBlock` are the two directions of catalog shape 54:
 a record built from the conversation's bytes must neither pass a stale edit
@@ -243,6 +257,9 @@ With #3521's eight configs and the deterministic `-workers 1` (#3517), the
 #3521 configs were 56 s of that, `TreeFilterExt` the slowest at 21 s. The
 three drain configs of #3521 round 2 took 13 s, 4 s and 4 s at load average
 about 45.
+The distinct-state counts below were measured again at `-workers 1` on
+#4387 round 3's head. A violated row's count depends on the order TLC
+explores the states in.
 
 `Guarded` runs at three agent ops to fit CI's `TLA+ models` budget (#3572).
 At three ops, every mutant keeps its verdict and the #3523 flip still flips.
@@ -254,48 +271,48 @@ head that added this model. It is not checked in CI.
 |---|---|---|---|
 | `AutofixFalseBlock` | #3519 fixed: a one-line edit of the attached content | pass | 19 |
 | `AutofixFalseBlockNoRecord` | the same without the attachment record (the code before #3519) | violated `NoFalseBlock` | 12 |
-| `AutofixRelocate` | #3519 fixed: a two-line edit of the attached content | pass | 19 |
+| `AutofixRelocate` | #3519 fixed: a two-line edit of the attached content | pass | 17 |
 | `AutofixRelocateNoRecord` | the same without the attachment record | violated `NoStaleAllow` | 13 |
-| `AutofixRecorded` | #3519 fixed, another writer anywhere, 1- and 2-line edits | pass | 334 |
-| `AutofixRecordedNoRecord` | the same without the attachment record | violated `NoFalseBlock` | 105 |
+| `AutofixRecorded` | #3519 fixed, another writer anywhere, 1- and 2-line edits | pass | 254 |
+| `AutofixRecordedNoRecord` | the same without the attachment record | violated `NoFalseBlock` | 76 |
 | `AutofixPastEnd` | an older creation read still covers a line past the attachment's end: the per-line rule refuses it (#3522 part 3 needs no code) | pass | 23 |
 | `OwnReEdit` | #3523 fixed: the agent re-edits a line it just wrote | pass | 2,036 |
-| `OwnReEditNoRecord` | the same without the own-edit record (the code before #3523) | violated `NoFalseBlock` | 327 |
-| `OwnEditReloc` | #3523 fixed: a relocated edit is not recorded; write + autofix, an other-writer insert, a relocated edit, then an edit | pass | 1,608 |
+| `OwnReEditNoRecord` | the same without the own-edit record (the code before #3523) | violated `NoFalseBlock` | 268 |
+| `OwnEditReloc` | #3523 fixed: a relocated edit is not recorded; write + autofix, an other-writer insert, a relocated edit, then an edit | pass | 1,619 |
 | `OwnEditRelocInsert` | #3760: ranged reads, another writer's insert, an own edit, a relocated two-line edit, then an edit at the agent's numbering; the relocated edit is not recorded | pass | 609,580 |
 | `OwnEditRelocInsertRecorded` | the same with the relocated edit recorded at the lines it wrote: the next edit passes on the wrong line of the agent's own text | violated `NoStaleAllow` | 39,157 |
 | `EvidenceAtResult` | #3524 fixed: another writer lands between the host read and the tool_result | pass | 23,571 |
-| `EvidenceAtResultHandler` | the same with the read taken from disk at tool_result (the code before #3524) | violated `NoStaleAllow` | 316 |
-| `EvidenceFromDelivered` | #3524 fixed, another writer anywhere, replace/delete/insert | pass | 93,904 |
-| `CreationAtResult` | #3524 remainder fixed: the injected creation read is hashed from the write's content | pass | 1,592 |
-| `CreationAtResultHandler` | the same hashed from disk at tool_result (the code before it) | violated `NoStaleAllow` | 907 |
+| `EvidenceAtResultHandler` | the same with the read taken from disk at tool_result (the code before #3524) | violated `NoStaleAllow` | 352 |
+| `EvidenceFromDelivered` | #3524 fixed, another writer anywhere, replace/delete/insert | pass | 96,907 |
+| `CreationAtResult` | #3524 remainder fixed: the injected creation read is hashed from the write's content | pass | 1,619 |
+| `CreationAtResultHandler` | the same hashed from disk at tool_result (the code before it) | violated `NoStaleAllow` | 923 |
 | `Guarded` | current code, reads, one-line edits, another writer between tool calls, three agent ops (#3572) | pass (all three invariants) | 69,531 |
-| `GuardedNoCoverage` / `GuardedNoSnapshot` | `Guarded` without `checkCoverage` / `validateRangeSnapshot` | violated `NoBlindAllow` / `NoStaleAllow` | 100 / 3,830 |
+| `GuardedNoCoverage` / `GuardedNoSnapshot` | `Guarded` without `checkCoverage` / `validateRangeSnapshot` | violated `NoBlindAllow` / `NoStaleAllow` | 316 / 6,757 |
 | `NewSession` | current code across `/new` | pass | 316,790 |
-| `Unhashed` / `UnhashedNoFileTime` | current code without line hashes / without FileTime | pass / violated `NoStaleAllow` | 13,370 / 243 |
-| `ContextSlack` | the admitted `contextLines` slack | violated `NoBlindAllow` | 79 |
+| `Unhashed` / `UnhashedNoFileTime` | current code without line hashes / without FileTime | pass / violated `NoStaleAllow` | 13,925 / 155 |
+| `ContextSlack` | the admitted `contextLines` slack | violated `NoBlindAllow` | 47 |
 | `MtimeAuthored`, `MtimeAuthoredNew` | #3520 fixed: another writer's mtime authors nothing, alone and across `/new` (`MtimeAuthored = TRUE`, the code before it, violated `NoBlindAllow` at 9 / 36 distinct states) | pass | 8 / 378 |
 | `BashAuthored` | #3520 no-drop witness: a recognized bash write authors a never-read file, no other writer, then an edit; three agent ops. With the zero-read check ignoring `written` it violates `NoFalseBlock` (6 distinct states). A fourth op (bash, edit, bash, edit) blocks with `file_modified`, since a bash write leaves FileTime stale by design (#3525), so the bound stays at three | pass | 57 |
-| `TreeFilter` | #3521 fixed: `/tree` with reads, ranged reads, edits and writes | pass | 50,413 |
-| `TreeFilterExt` | #3521 fixed, another writer anywhere | pass | 344,765 |
+| `TreeFilter` | #3521 fixed: `/tree` with reads, ranged reads, edits and writes | pass | 50,434 |
+| `TreeFilterExt` | #3521 fixed, another writer anywhere | pass | 344,794 |
 | `TreeFilterUnhashed` | #3521 fixed without hashes | pass | 1,174 |
 | `TreeCarriesReads` | the same as `TreeFilter`'s base with `BranchFilter = FALSE` (the code before #3521: no handler) | violated `NoBlindAllow` | 337 |
-| `ForkFilter` | #3521 fixed: `/fork` | pass | 50,036 |
+| `ForkFilter` | #3521 fixed: `/fork` | pass | 50,057 |
 | `ForkFilterUnhashed` | #3521 fixed at `/fork` without hashes | pass | 1,150 |
-| `ForkDropsReads` | `BranchFilter = FALSE`, `ForkImport = FALSE` (the code before #3521: the fork imports nothing) | violated `NoFalseBlock` | 876 |
-| `TreeDrainFenced` | #3521 review F1 and R2-F1 fixed: the settle drain lands after a `/tree`, possibly requeued first, and its stamp is refused | pass | 179,312 |
-| `TreeDrainRequeue` | the same with the epoch taken at the settle that dequeues it (round 2): requeued work is credited to the new branch | violated `NoBlindAllow` | 15,534 |
+| `ForkDropsReads` | `BranchFilter = FALSE`, `ForkImport = FALSE` (the code before #3521: the fork imports nothing) | violated `NoFalseBlock` | 1,232 |
+| `TreeDrainFenced` | #3521 review F1 and R2-F1 fixed: the settle drain lands after a `/tree`, possibly requeued first, and its stamp is refused | pass | 182,835 |
+| `TreeDrainRequeue` | the same with the epoch taken at the settle that dequeues it (round 2): requeued work is credited to the new branch | violated `NoBlindAllow` | 15,543 |
 | `TreeDrainUnfenced` | the same, stamp credited (the code before round 2) | violated `NoBlindAllow` | 2,529 |
 | `TreeDrainFencedMtime` | mutant of #3520: the fenced drain with the mtime fallback back on (the code before #3520); the formatter write postdates the re-anchor | violated `NoBlindAllow` | 2,528 |
-| `ContextSuppress`, `SpanAcrossReads` | #3522 fixed: a newer context-only read, and an edit spanning two reads | pass | 232,543 / 146,000 |
-| `SpanSnapshotFix` | #3522 fixed, one- and two-line edits, contextLines 1, another writer (replace/delete/insert), three agent ops | pass | 98,195 |
-| `SpanSnapshotFixAnyReloc` | the same relocating from any read that hashes the range | violated `NoStaleAllow` | 24,987 |
+| `ContextSuppress`, `SpanAcrossReads` | #3522 fixed: a newer context-only read, and an edit spanning two reads | pass | 233,415 / 146,000 |
+| `SpanSnapshotFix` | #3522 fixed, one- and two-line edits, contextLines 1, another writer (replace/delete/insert), three agent ops | pass | 97,423 |
+| `SpanSnapshotFixAnyReloc` | the same relocating from any read that hashes the range | violated `NoStaleAllow` | 24,502 |
 | `SpanSnapshotFixNoOwnRecord` | the same without the own-edit read record (the code before #3523, rescue on) | violated `NoStaleAllow` | 6,945 |
-| `UnhashedOwnEditRescue`, `UnhashedFormatStamp` | #3525 fixed: no own-edit rescue; the drain credits authorship only | pass | 1,338 / 245 |
+| `UnhashedOwnEditRescue`, `UnhashedFormatStamp` | #3525 fixed: no own-edit rescue; the drain credits authorship only | pass | 1,355 / 245 |
 | `UnhashedOwnEditRescueOn`, `UnhashedFormatStampOn` | the same with the rescue / the drain's FileTime stamp back (the code before #3525) | violated `NoStaleAllow` | 437 / 101 |
-| `AuthorForeign` | #4131 fixed: bash authors a never-read file, another writer changes it, three agent ops | pass | 292 |
+| `AuthorForeign` | #4131 fixed: bash authors a never-read file, another writer changes it, three agent ops | pass | 293 |
 | `AuthorForeignNoIdentity` | the same, authorship by `recordWritten` alone (the code before #4187): BashWrite, External, Edit | violated `NoStaleAllow` | 37 |
-| `AuthorRewriteForeign` | #4187 F6 P2 fixed: bash, another writer, a one-line bash write, an edit | pass | 397 |
+| `AuthorRewriteForeign` | #4187 F6 P2 fixed: bash, another writer, a one-line bash write, an edit | pass | 400 |
 | `AuthorRewriteForeignNoRetire` | the same, the second write re-baselining over the other writer's bytes (round 1 of #4187) | violated `NoStaleAllow` | 204 |
 | `AuthorBridgeForeign` | #4187 R2-4 fixed: bash, another writer, a one-line mutation-bridge write, an edit | pass | 374 |
 | `AuthorBridgeForeignAdvance` | the same, the bridge write re-baselining over the other writer's bytes (round 2 of #4187, probe A1): BashWrite, External, BridgeWrite, Edit | violated `NoStaleAllow` | 204 |
@@ -304,11 +321,28 @@ head that added this model. It is not checked in CI.
 | `AuthorOwnExternal` | #4187 R4-2 safety: bash, another writer at an idle phase, the licensed own write, an edit; the call's retire ends the broken authorship and the write does not advance a retired record | pass | — |
 | `AuthorOwnUnchecked` | the same with `ownwrite`, the R4-1 mutant and round 4's code: an own write no call licensed re-baselines over the other writer's bytes (BashWrite, External, OwnWriteUnchecked, Edit) | violated `NoStaleAllow` | — |
 | `AuthorOwnToctou` | the R4-6 residual, not a fix: a foreign write lands between the call's check and the write it licenses, inside the tool's run (BashWrite, OwnCall, External inflight, OwnWrite, Edit) | violated `NoStaleAllow` | — |
-| `AuthorDrainForeign` | #4187 F6 P3 fixed: bash, another writer, the agent_end drain (a whitespace-only format), an edit | pass | 209 |
-| `AuthorDrainForeignNoRetire` | the same, the drain re-baselining (round 1 of #4187) | violated `NoStaleAllow` | 121 |
+| `AuthorDrainForeign` | #4187 F6 P3 fixed: bash, another writer, the agent_end drain (a whitespace-only format), an edit | pass | 204 |
+| `AuthorDrainForeignNoRetire` | the same, the drain re-baselining (round 1 of #4187) | violated `NoStaleAllow` | 120 |
 | `AuthorTouch` | #4187 F5 no-drop: another writer's whitespace-only rewrite (a new mtime, the same tokens) keeps bash authorship | pass (all three invariants) | 39 |
+| `AuthorOwnOldText` | #4387 fixed: bash authors a never-read file, then the agent's own oldText edits, no other writer; the edit's UNKNOWN-range credit advances the whole-file authorship (`OldTextRetires = FALSE`) | pass (all three invariants) | 51 |
+| `AuthorOwnOldTextMove` | the same across `/tree` and `/fork`: the zero-read arm's injected read names the authorship's call (`InjectNamesAuthorship`), so a move keeps it exactly when it keeps the authorship | pass (all four invariants) | 1,034 |
+| `AuthorOwnOldTextPre4387` | the same on the code from #4235 until #4387 (both overrides): the own oldText edit retires its own write's authorship, and the next exact oldText edit is refused (BashWrite, Edit, EditRW, Edit) | violated `NoFalseBlock` | 29 |
+| `AuthorOwnOldTextForeign` | #4387 round 2, review S3: bash, the own oldText edit, another writer at an idle step, positional edits, `/tree` and turn ends; the injected read keeps refusing the other writer's line after a move | pass (`NoStaleAllow`, `NoBlindAllow`, `NoIdlessAuthoredRead`) | 148,569 |
+| `AuthorOwnOldTextForeignPre4387R2` | the same on #4387's round-1 head (`InjectNamesAuthorship` and `OldTextNeedsNamedRead` off): the move drops the id-less injected read and keeps the advanced authorship (BashWrite, Edit, External, Edit, EditRW, Turn, Tree, Edit) | violated `NoStaleAllow` | 37,541 |
+| `AuthorOwnOldTextInflight` | #4387 round 2, review S10: the other writer lands while the own oldText edit is in flight, between the host's apply and its tool_result | pass (`NoStaleAllow`, `NoBlindAllow`, `NoIdlessAuthoredRead`) | 217,627 |
+| `AuthorOwnOldTextInflightPre4387R2` | the same on the round-1 head | violated `NoStaleAllow` | 23,222 |
+| `AuthorOwnOldTextIdless` | #4387 round 2, S12: only an id-less read was there, so the zero-read arm never ran; the UNKNOWN credit leaves an empty scope instead of advancing (`OldTextNeedsNamedRead`) | pass (`NoStaleAllow`, `NoBlindAllow`, `NoIdlessAuthoredRead`) | 693,534 |
+| `AuthorOwnOldTextIdlessPre4387R2` | the same with the credit advancing over the id-less read (round 1): after a move the advanced authorship vouches for the in-flight line (IdlessRead, BashWrite, Edit, External, EditRW, Turn, Tree, Edit) | violated `NoStaleAllow` | 184,915 |
+| `AuthorOwnOldTextIdlessPipelinePre4387R2` | the same on the pipeline credit before review G3 (`PipelineCreditsOldText`): the pipeline's whole-file credit widens the empty scope the edit's credit left, under the edit's id (IdlessRead, BashWrite, Edit, External, EditRW, Turn, Tree, Edit) | violated `NoStaleAllow` | 188,054 |
+| `AuthorOwnOldTextIdlessDrain` | #4387 round 3, review F5 and F6 (S14): S12's empty scope, then the settle drain (`DrainMode = "fenced"`, a whitespace-only format) and a move. The drain holds none of the file's bytes, so it keeps the scope empty (`KeepEmptyScope`) | pass (`NoStaleAllow`, `NoBlindAllow`, `NoIdlessAuthoredRead`) | 2,411,674 |
+| `AuthorOwnOldTextIdlessDrainPre4387R3` | the same with the drain widening the empty scope (round 2): after the move the authorship vouches for the in-flight line (IdlessRead, BashWrite, Edit, External, EditRW, Settle, Turn, Drain, Tree, Edit) | violated `NoStaleAllow` | 233,571 |
+| `AuthorOwnOldTextIdlessBash` | #4387 round 3, review F5 and F6 (S16): S12's empty scope, then an own bash write of line 1 (`pbash`) and a move. The bash write holds none of the file's bytes, so it keeps the scope empty | pass (`NoStaleAllow`, `NoBlindAllow`, `NoIdlessAuthoredRead`) | 842,992 |
+| `AuthorOwnOldTextIdlessBashPre4387R3` | the same with the bash write widening the empty scope (round 2) (IdlessRead, BashWrite, Edit, External, EditRW, PartialBashWrite, Turn, Tree, Edit) | violated `NoStaleAllow` | 264,757 |
+| `AuthorInjectIdlessPre4387R2` | review F2: the injected read of round 1 names no tool call | violated `NoIdlessAuthoredRead` | 6 |
+| `AuthorOwnOldTextForeignNoIdentity` | the #4235 code's injection rule (`ZeroReadInjects` off) with `AuthorIdentity = FALSE`: with no read to check, the advanced authorship vouches for the other writer's line, so the identity clause is what refuses it | violated `NoStaleAllow` | 61 |
+| `BashAuthoredPre4387` | the #4387 sibling: `BashAuthored` on the code from #4235 until #4387, which dropped the zero-read injection for every authorship (55fa5210c); the own positional edit's read then shadows the authorship and an edit of another line is refused (BashWrite, Edit, EditRW, Edit). The code since #4387 injects again over a whole-file authorship only | violated `NoFalseBlock` | 30 |
 | `AuthorBranch` | #3603 fixed: bash, `/tree` or `/fork`, an edit; the kept branch shows the write | pass (all three invariants) | 303 |
-| `AuthorBranchCleared` | the same, every move clearing authorship (the code before #4187) | violated `NoFalseBlock` | 149 |
+| `AuthorBranchCleared` | the same, every move clearing authorship (the code before #4187) | violated `NoFalseBlock` | 146 |
 | `AuthorBranchExt` | #3603 with another writer before or after the move | pass | 1,833 |
 | `FailedReadFork` | #4185 round 2: reads, a read that errors and oldText edits across `/fork`; the errored read's capture is dropped at its result, and would carry no identity anyway. Positional edits are left out: an oldText edit records no own-edit read (#3760), so a positional re-edit of its line is the known refused re-edit, not this change's | pass | 1,194 |
 | `FailedReadForkCredited` | the same on #4185's round-1 head (`ProvisionalCredit = TRUE`, `RevokeFailedRead = FALSE`): the capture crosses `/fork` under the transcript identity and the zero-read check lets a blind oldText edit through | violated `NoBlindAllow` | 10 |
@@ -387,6 +421,38 @@ the `#3522` block of the same file.
 - The attachment record and the `recordWritten` before it are one step here.
   In the code they are separated by the pipeline's analysis; the record
   leaves FileTime to `recordWritten`, which the replays pin.
+- Authorship is whole-file here. A range scope (#4210's `authoredRanges`)
+  is modelled only as the empty scope an UNKNOWN credit leaves (`empty`),
+  which vouches for no line. A positional edit keeps it empty here; the
+  code composes the edit's produced lines into it, which is looser and
+  still bounded by bytes the conversation holds. Since #4387 round 3 the
+  code applies one rule at `creditAuthorship`: the scope after a credit is
+  what the credit holds plus what it may keep, so no credit widens a scope
+  past the lines it produced (`KeepEmptyScope`). A native write's creation
+  read vouches for the whole file instead. An UNKNOWN credit keeps a range
+  or whole-file scope only while a read that names a call bounds it;
+  otherwise it leaves an empty scope. The replays pin it ("#4387 S8",
+  "#4387 S13", "#4387 S15b").
+- `OldTextNeedsNamedRead` is the model's oldText edit only. In the code
+  the same condition covers every UNKNOWN credit that may advance an
+  authorship, an observed tool's too. The dispatcher replays pin it
+  ("#4387 S12", "#4387 S17").
+- Since #4387 round 2 (review G3) the pipeline's whole-file credit no
+  longer follows an oldText edit (`PipelineCreditsOldText`). Over an
+  existing authorship it widened the edit credit's empty scope
+  (`AuthorOwnOldTextIdlessPipelinePre4387R2`). Over a file with no
+  authorship it made an id-less record that no modelled verdict consults:
+  an allowed oldText edit implies a read, and every move drops an id-less
+  record. Probe configs over `rread`, `oedit`, `edit` and both moves passed
+  `NoStaleAllow` with and without it.
+- The pipeline's whole-file credit after it rewrote the bytes (a format or
+  autofix of the edited file) is not modelled. It holds none of the bytes,
+  so since #4387 round 3 it keeps a range or empty scope (the same
+  `KeepEmptyScope` rule as the drain); the replay "#3865" pins it for an
+  observed tool's partial credit.
+- An injected read is unhashed past `READ_HASH_MAX_LINES` (3,000 lines) in
+  the code; `Hashes` is global here. Such a file blocks every read-path edit,
+  before a move and after it, which fails closed.
 - Symbol (LSP-expanded) coverage, search-hit credits, bash read spans, the
   bridge `contentBinding`, record and file caps, idle eviction, and
   exemptions are not modelled.

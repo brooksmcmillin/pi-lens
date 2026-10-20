@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { checkProse } from "../../scripts/check-prose.mjs";
 import { lintPrBody } from "../../scripts/check-pr-body.mjs";
+import { htmlCommentEnd } from "../../scripts/lib/defect-shapes.mjs";
 
 describe("checkProse", () => {
 	it("blocks the long sentence from the #4274 comment", () => {
@@ -82,6 +83,56 @@ describe("checkProse", () => {
 		const result = checkProse("Please simply do this.", { mode: "warn" });
 		expect(result).toMatchObject({ valid: true, errors: [] });
 		expect(result.warnings.join(" ")).toContain("filler");
+	});
+
+	const longAfterEnd =
+		"This deliberately long sentence sits after a comment close and contains enough ordinary words in one unbroken unit to exceed the prose limit that the checker enforces on every submitted body because the guard must never miss visible text.";
+	// Recurrence (#4565): this masker ended an HTML comment at `-->` alone,
+	// so text GitHub renders after `--!>`, `<!-->` or `<!--->` was masked,
+	// and a gating rule read visible prose as absent. Each row names one of
+	// the four ends the HTML spec gives a comment (13.2.5.43-46).
+	const commentEnds: Array<[string, string]> = [
+		["`-->`", `<!-- note --> ${longAfterEnd}`],
+		["`--!>`", `<!-- note --!> ${longAfterEnd}`],
+		["`<!-->`", `<!--> ${longAfterEnd}`],
+		["`<!--->`", `<!---> ${longAfterEnd}`],
+	];
+	for (const [end, text] of commentEnds)
+		it(`counts a long sentence after the ${end} end`, () => {
+			expect(checkProse(text).errors.join(" ")).toContain("sentence-length");
+		});
+
+	it("still hides a long sentence inside a comment", () => {
+		const hidden =
+			"This comment body sits inside the comment and carries enough ordinary words in one unbroken unit to exceed the prose limit that the checker enforces on every submitted body because the guard must never count hidden text as prose.";
+		expect(
+			checkProse(`<!-- ${hidden} --> Run the test.`).errors.join(" "),
+		).not.toContain("sentence-length");
+	});
+
+	it("hides a continuation line that starts with the abrupt-end dash", () => {
+		// Recurrence (#4565 round 7): the masker calls the owner at index 0 of a
+		// continuation line, where the comment is in body state, but the owner
+		// applied its `>` and `->` abrupt-end arms at every `from`. A line that
+		// starts with `->` then closed the comment early and hidden words
+		// reached the gate. Both arms belong to the comment-start states only.
+		const hidden =
+			"This comment continuation carries enough ordinary words in one unbroken unit to exceed the prose limit that the checker enforces on every submitted body because the guard must never count hidden text as prose.";
+		const result = checkProse(`<!--\n-> ${hidden}\n--> Run the test.`);
+		expect(result.errors.join(" ")).not.toContain("sentence-length");
+		expect(result).toEqual({ valid: true, errors: [], warnings: [] });
+	});
+
+	it("applies the abrupt ends at the opener only, never mid-comment", () => {
+		// The owner's precondition, which F1 in the round-7 verify walked into:
+		// `>` and `->` close inside `<!--` itself, so they answer only when `from`
+		// is the opener's end. check-prose skips a blockquote line before it
+		// masks, so no masker row reaches the `>` arm; this pins the contract the
+		// next per-line consumer inherits.
+		expect(htmlCommentEnd("<!--> tail", 4)).toBe(5);
+		expect(htmlCommentEnd("<!---> tail", 4)).toBe(6);
+		expect(htmlCommentEnd("> tail", 0)).toBe(-1);
+		expect(htmlCommentEnd("-> tail", 0)).toBe(-1);
 	});
 
 	it("applies the checker to PR prose sections only", () => {

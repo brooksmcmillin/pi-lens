@@ -24,7 +24,7 @@ const depcruiseBin = resolve(
 	dependencyCruiserPackage.bin.depcruise,
 );
 
-function cruiseBuiltGraph(): {
+type CruiseResult = {
 	modules: Array<{
 		source: string;
 		dependencies?: Array<{
@@ -32,7 +32,24 @@ function cruiseBuiltGraph(): {
 			dynamic?: boolean;
 		}>;
 	}>;
-} {
+	summary: {
+		violations: Array<{
+			from: string;
+			to: string;
+			rule: { name: string; severity: string };
+		}>;
+	};
+};
+
+// One depcruise spawn serves both cases that read the graph.
+let cruised: CruiseResult | undefined;
+
+function cruiseBuiltGraph(): CruiseResult {
+	cruised ??= runCruise();
+	return cruised;
+}
+
+function runCruise(): CruiseResult {
 	const output = execFileSync(
 		process.execPath,
 		[
@@ -48,10 +65,45 @@ function cruiseBuiltGraph(): {
 		],
 		{ cwd: repoRoot, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
 	);
-	return JSON.parse(output) as ReturnType<typeof cruiseBuiltGraph>;
+	return JSON.parse(output) as CruiseResult;
+}
+
+/**
+ * The violations CI's Dependency boundaries job (`npm run depcruise:check`)
+ * would fail on: every violation in the cruise that the known-violations
+ * baseline does not list. JSON mode exits 0 whatever it finds, so the
+ * caller must read the summary.
+ */
+function unexpectedViolations(): string[] {
+	const key = (violation: {
+		from: string;
+		to: string;
+		rule: { name: string };
+	}) => `${violation.rule.name}: ${violation.from} -> ${violation.to}`;
+	const known = new Set(
+		(
+			parseJson5(
+				readFileSync(
+					resolve(repoRoot, ".dependency-cruiser-known-violations.json"),
+					"utf8",
+				),
+			) as Array<{ from: string; to: string; rule: { name: string } }>
+		).map(key),
+	);
+	return cruiseBuiltGraph()
+		.summary.violations.filter((violation) => !known.has(key(violation)))
+		.map((violation) => `${violation.rule.severity} ${key(violation)}`);
 }
 
 describe("dependency boundary governance", () => {
+	// #4344 r2: `workspace-diagnostics-session.js -> bounded-cache.js` broke
+	// the declared-client-leaf rule. CI's Dependency boundaries job went red,
+	// but this suite stayed green: it cruised in JSON mode, which exits 0 with
+	// errors, and asserted only rule names and counts.
+	it("finds no boundary violation outside the known-violations baseline", () => {
+		expect(unexpectedViolations()).toEqual([]);
+	}, 60_000);
+
 	it("keeps the configured boundary rules present", () => {
 		const config = require(resolve(repoRoot, ".dependency-cruiser.cjs")) as {
 			forbidden: Array<{ name?: string }>;

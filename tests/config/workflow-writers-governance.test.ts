@@ -29,6 +29,7 @@ import {
 	relativePosix,
 	stripSource,
 } from "../support/sweep-kit.js";
+import { siblingPin } from "../support/sibling-pin.js";
 
 const ROOT = resolve(import.meta.dirname, "../..");
 const WORKFLOWS = resolve(ROOT, ".github/workflows");
@@ -178,6 +179,7 @@ const SCRIPT_WRITERS: Record<string, string> = {
 	"scripts/notify-clean-signal-drift.mjs": "tracking issue",
 	"scripts/notify-install-smoke-drift.mjs": "tracking issue",
 	"scripts/notify-tool-smoke-red.mjs": "gh issue create/edit/close",
+	"scripts/prune-actions-cache.mjs": "gh cache delete (--apply only)",
 	"scripts/upsert-tracking-issue.mjs": "tracking issue",
 };
 
@@ -423,7 +425,7 @@ const REGISTERED_EXCEPTIONS: Record<string, string> = {};
 // A new writer (even a guarded one) or a new dispatchable workflow reds here so
 // its author reviews the guard; the failure prints the re-pin.
 // Fork upstream-sync adds one dispatchable workflow and one PR writer.
-const DISPATCHABLE_WORKFLOWS = 15;
+const DISPATCHABLE_WORKFLOWS = 18;
 // #4077: the split moved every writer step into its own job without adding one,
 // except codeql.yml, whose SARIF upload moved into the `upload` job as the
 // `github/codeql-action/upload-sarif` writer action (+1).
@@ -433,6 +435,7 @@ const WRITER_STEPS: Record<string, number> = {
 	".github/workflows/install-smoke.yml": 1,
 	".github/workflows/labels.yml": 1,
 	".github/workflows/release.yml": 3,
+	".github/workflows/shuffle-census-nightly.yml": 1,
 	".github/workflows/stale-open-issues.yml": 1,
 	".github/workflows/stale.yml": 1,
 	".github/workflows/stryker-nightly.yml": 1,
@@ -453,6 +456,7 @@ const WRITE_SCOPED_JOBS: Record<string, string> = {
 	".github/workflows/labels.yml:sync": "issues",
 	".github/workflows/release.yml:publish-npm": "id-token",
 	".github/workflows/release.yml:release": "contents",
+	".github/workflows/shuffle-census-nightly.yml:publish-issue": "issues",
 	".github/workflows/stale-open-issues.yml:detect": "issues",
 	".github/workflows/stale.yml:stale": "issues, pull-requests",
 	".github/workflows/stryker-nightly.yml:publish-issue": "issues",
@@ -625,10 +629,25 @@ const NON_WRITER_RUNS: Array<[string, string]> = [
 	["unrelated script", "node scripts/smoke-tools.mjs"],
 ];
 
+// Recurrence #4418/#4421: the first three used to spell the live SHA, which
+// goes stale on every Dependabot bump of the action. They derive it from the
+// workflow that uses the action, inside the test (siblingPin asserts).
+function workflowActionPin(file: string, action: string): string {
+	const workflow = load(readFileSync(resolve(WORKFLOWS, file), "utf8"));
+	return siblingPin(
+		(workflow.jobs ?? {}) as Parameters<typeof siblingPin>[0],
+		action,
+		"",
+	);
+}
+
+const PINNED_WRITER_ACTIONS: Array<[string, string]> = [
+	["actions/stale", "stale.yml"],
+	["micnncim/action-label-syncer", "labels.yml"],
+	["peter-evans/create-pull-request", "tool-smoke.yml"],
+];
+
 const WRITER_ACTION_FIXTURES = [
-	"actions/stale@4391f3da665fdf50b6810c1a66712fb9ba21aa93",
-	"micnncim/action-label-syncer@3abd5ab72fda571e69fffd97bd4e0033dd5f495c",
-	"peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1",
 	"peter-evans/create-or-update-comment@v4",
 	"actions/github-script@v7",
 	"softprops/action-gh-release@v2",
@@ -918,6 +937,13 @@ describe("workflow writer governance (#4053)", () => {
 			expect(flag({ uses })).toHaveLength(1);
 		});
 
+		it.each(PINNED_WRITER_ACTIONS)(
+			"flags %s at its live pin",
+			(action, file) => {
+				expect(flag({ uses: workflowActionPin(file, action) })).toHaveLength(1);
+			},
+		);
+
 		it("flags a reusable workflow job it cannot see inside", () => {
 			expect(flag({ jobUses: "./.github/workflows/publish.yml" })).toHaveLength(
 				1,
@@ -933,7 +959,7 @@ describe("workflow writer governance (#4053)", () => {
 		it("does not flag a reader action", () => {
 			expect(
 				flag({
-					uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+					uses: workflowActionPin("ci.yml", "actions/checkout"),
 				}),
 			).toEqual([]);
 		});

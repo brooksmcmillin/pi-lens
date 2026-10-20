@@ -1,6 +1,6 @@
-// #3801: ci.yml starts the heavy advisory jobs (CodeQL, the Windows Vitest
-// subset) only after every required check passed, so until then GitHub has no
-// check-run for them. ci-verdict lists each as PENDING while the verdict is
+// #3801: ci.yml starts the heavy advisory jobs (CodeQL) only after every
+// required check passed, so until then GitHub has no check-run for them. The
+// Windows Vitest subset was one of them until #4518 promoted it to gating. ci-verdict lists each as PENDING while the verdict is
 // pending, and never lets one move an exit code.
 //
 // Recurrences this file guards:
@@ -105,23 +105,49 @@ describe("ci-verdict deferred advisory rows (#3801)", () => {
 	});
 
 	it("does not duplicate a deferred job that already has a check-run", () => {
+		// #4518: the Windows Vitest subset left this list, so the row that can
+		// already exist is CodeQL's first language.
+		const present = DEFERRED_ADVISORY_CHECKS[0];
 		const verdict = computeVerdict({
 			check_runs: [
 				checkRun("Unit tests", "completed", "success", 1),
 				checkRun("Lint & type-check", "in_progress", null, 2),
-				checkRun("Unit tests Windows (advisory)", "in_progress", null, 3),
+				checkRun(present, "in_progress", null, 3),
 			],
 		});
 		expect(
-			verdict.rows.filter(
-				(row: { name: string }) => row.name === "Unit tests Windows (advisory)",
-			),
+			verdict.rows.filter((row: { name: string }) => row.name === present),
 		).toHaveLength(1);
 		expect(deferred(verdict.rows)).toEqual(
-			DEFERRED_ADVISORY_CHECKS.filter(
-				(name) => name !== "Unit tests Windows (advisory)",
-			),
+			DEFERRED_ADVISORY_CHECKS.filter((name) => name !== present),
 		);
+	});
+
+	// #4518: a promoted gating row is never deferred. The name that used to be
+	// listed here now reads as an ordinary gating check-run, so an absent one is
+	// PENDING rather than a deferred advisory row.
+	it("does not defer the promoted Windows unit leg", () => {
+		const verdict = computeVerdict({
+			check_runs: [
+				checkRun("Unit tests", "completed", "success", 1),
+				checkRun("Lint & type-check", "completed", "success", 2),
+				checkRun("Unit tests Windows", "completed", "failure", 3),
+			],
+		});
+		expect(DEFERRED_ADVISORY_CHECKS).not.toContain("Unit tests Windows");
+		// The name the list carried before the promotion, pinned as retired: a
+		// re-added entry would defer a job that now starts on every event.
+		expect(DEFERRED_ADVISORY_CHECKS).not.toContain(
+			"Unit tests Windows (advisory)",
+		);
+		// The red is a gating row now, so the head is terminally failed and no
+		// deferred row is relabelled onto it.
+		expect(verdict.exitCode).toBe(EXIT_FAILURE);
+		expect(deferred(verdict.rows)).toEqual([]);
+		const row = verdict.rows.find(
+			(entry: { name: string }) => entry.name === "Unit tests Windows",
+		);
+		expect(row?.gating).toBe(true);
 	});
 
 	// Recurrence (review r1 F3): the deferred rows vanished exactly when the

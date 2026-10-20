@@ -1,3 +1,5 @@
+// flake-shape: ungoverned-wait-for — the cold build is fire-and-forget (triggerBackgroundWordIndexBuild exposes no awaitable), so a real-time vi.waitFor is the only join on the snapshot it publishes.
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -30,12 +32,49 @@ import {
 	WordPostingList,
 } from "../../clients/word-index-store.js";
 import { KIND_EXTENSIONS } from "../../clients/file-kinds.js";
+import { flushAllNdjsonWriters } from "../../clients/ndjson-logger.js";
 import { loadProjectSnapshot } from "../../clients/project-snapshot.js";
+import { getWordIndexLogPath } from "../../clients/word-index-logger.js";
+import {
+	_resetWarmWordIndexCacheForTests,
+	acquireWarmWordIndex,
+} from "../../clients/mcp/analyze.js";
 import {
 	getDegradationSummary,
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
+
+/**
+ * Durable `warm_cache_adopted` rows the logger wrote for one root. Shape 67: a
+ * sink's writes are queued, so the drain is awaited immediately before the read
+ * and nothing else awaits in between.
+ */
+async function adoptionRowsFor(
+	cwd: string,
+): Promise<Array<Record<string, unknown>>> {
+	await flushAllNdjsonWriters();
+	let raw: string;
+	try {
+		raw = fs.readFileSync(getWordIndexLogPath(), "utf8");
+	} catch {
+		return [];
+	}
+	const rows: Array<Record<string, unknown>> = [];
+	for (const line of raw.split("\n")) {
+		if (!line.trim()) continue;
+		try {
+			rows.push(JSON.parse(line) as Record<string, unknown>);
+		} catch {
+			// A torn line is not this case's evidence.
+		}
+	}
+	return rows.filter(
+		(row) =>
+			row.phase === "warm_cache_adopted" &&
+			String(row.cwd).includes(path.basename(cwd)),
+	);
+}
 
 /**
  * Arena repacks recorded so far, read from the degradation ledger's own
@@ -697,6 +736,101 @@ describe("triggerBackgroundWordIndexBuild (#348 cold-query stampede guard)", () 
 			expect(results.length).toBeGreaterThan(0);
 			expect(path.basename(results[0].file)).toBe("auth.ts");
 		} finally {
+			env.cleanup();
+		}
+	}, 10_000);
+
+	it("adopts the built index into the warm entry created during the build (#4583)", async () => {
+		const env = setupTestEnvironment("pi-lens-wordindex-warm-adopt-");
+		try {
+			createTempFile(
+				env.tmpDir,
+				"src/auth.ts",
+				"export function authenticateUser(id) { return id; }",
+			);
+			// A query that arrives before the build caches "checked, nothing usable"
+			// for this root (`acquireWarmWordIndex`) and then triggers the build.
+			const cold = acquireWarmWordIndex(env.tmpDir);
+			expect(cold.index).toBeUndefined();
+			cold.release();
+			triggerBackgroundWordIndexBuild(env.tmpDir);
+			await vi.waitFor(
+				() => {
+					expect(loadProjectSnapshot(env.tmpDir)?.wordIndex).toBeDefined();
+				},
+				{ timeout: 5000 },
+			);
+			const warm = acquireWarmWordIndex(env.tmpDir);
+			try {
+				expect(warm.index).toBeDefined();
+				expect(searchWordIndex(warm.index!, "authenticate user").length).toBe(
+					1,
+				);
+			} finally {
+				warm.release();
+			}
+		} finally {
+			_resetWarmWordIndexCacheForTests();
+			env.cleanup();
+		}
+	}, 10_000);
+
+	// #4583 review F1 (#3875 record read-back): the adoption is announced only in
+	// the durable `word-index.log`, so a case reads that sink back rather than the
+	// object handed to it. `isTestMode()` gates the writer off for every other case
+	// in this file, so the opt-out is local to this one.
+	it("writes the adoption row with its trigger to the word-index log (#4583)", async () => {
+		const env = setupTestEnvironment("pi-lens-wordindex-adopt-record-");
+		const previousTestMode = process.env.PI_LENS_TEST_MODE;
+		process.env.PI_LENS_TEST_MODE = "0";
+		try {
+			createTempFile(
+				env.tmpDir,
+				"src/auth.ts",
+				"export function authenticateUser(id) { return id; }",
+			);
+			// The query that lands before the build caches "checked, nothing usable";
+			// that entry is the one the build's publish has to refresh.
+			_resetWarmWordIndexCacheForTests();
+			const cold = acquireWarmWordIndex(env.tmpDir);
+			expect(cold.index).toBeUndefined();
+			cold.release();
+			triggerBackgroundWordIndexBuild(env.tmpDir);
+
+			const written = await vi.waitFor(
+				async () => {
+					const rows = await adoptionRowsFor(env.tmpDir);
+					expect(rows).toHaveLength(1);
+					return rows;
+				},
+				{ timeout: 5000 },
+			);
+			expect(written[0]).toEqual(
+				expect.objectContaining({
+					phase: "warm_cache_adopted",
+					trigger: "cold_query",
+					indexedFileCount: 1,
+					tokens: expect.any(Number),
+				}),
+			);
+			// The row names the root it adopted for, not another project's.
+			expect(String(written[0].cwd)).toContain(path.basename(env.tmpDir));
+
+			// And it describes a real adoption: the entry that arrived empty answers
+			// from the index that build produced.
+			const warm = acquireWarmWordIndex(env.tmpDir);
+			try {
+				expect(warm.index).toBeDefined();
+				expect(searchWordIndex(warm.index!, "authenticate user").length).toBe(
+					1,
+				);
+			} finally {
+				warm.release();
+			}
+		} finally {
+			if (previousTestMode === undefined) delete process.env.PI_LENS_TEST_MODE;
+			else process.env.PI_LENS_TEST_MODE = previousTestMode;
+			_resetWarmWordIndexCacheForTests();
 			env.cleanup();
 		}
 	}, 10_000);

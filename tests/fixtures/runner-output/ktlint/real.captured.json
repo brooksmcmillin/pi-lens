@@ -1,0 +1,46 @@
+{
+	"provenance": {
+		"runner": "ktlint",
+		"tool": "ktlint",
+		"version": "1.8.0",
+		"command": "ktlint --reporter=json Bad.kt",
+		"argv": [
+			"--reporter=json",
+			"Bad.kt"
+		],
+		"workspace": "tests/fixtures/tool-smoke/kotlin",
+		"platform": "linux-x64",
+		"capturedAt": "2026-10-14",
+		"versionArgv": [
+			"--version"
+		]
+	},
+	"file": "Bad.kt",
+	"exitCode": 1,
+	"stdout": "00:55:35.632 [main] WARN com.pinterest.ktlint.cli.internal.KtlintCommandLine -- Lint has found errors than can be autocorrected using 'ktlint --format'\n[\n    {\n        \"file\": \"__WORKSPACE__/Bad.kt\",\n        \"errors\": [\n            {\n                \"line\": 3,\n                \"column\": 17,\n                \"message\": \"Missing spacing around \\\"=\\\"\",\n                \"rule\": \"standard:op-spacing\"\n            }\n        ]\n    }\n]\n",
+	"stderr": "",
+	"availability": [
+		{
+			"command": "ktlint",
+			"argv": [
+				"--version"
+			],
+			"version": "1.8.0",
+			"exitCode": 0,
+			"stdout": "ktlint version 1.8.0\n",
+			"stderr": ""
+		}
+	],
+	"clean": {
+		"workspace": "tests/fixtures/runner-output-clean/ktlint",
+		"file": "Bad.kt",
+		"argv": [
+			"--reporter=json",
+			"Bad.kt"
+		],
+		"version": "1.8.0",
+		"exitCode": 0,
+		"stdout": "[\n]\n",
+		"stderr": ""
+	}
+}

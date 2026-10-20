@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import { appendFileSync } from "node:fs";
+import { githubFetcher, githubHeaders } from "./lib/github-rest.mjs";
 import {
 	DETECTOR_ISSUE,
-	defaultFetcher,
 	detectStaleOpenIssues,
 	formatSummary,
 	shouldPost,
@@ -18,7 +18,7 @@ const runUrl =
 		: undefined;
 const { candidates, truncatedCommits, scannedOpenItems, priorityCoverage } =
 	await detectStaleOpenIssues({
-		fetcher: defaultFetcher(token),
+		fetcher: githubFetcher(token),
 		repository,
 	});
 const summary = formatSummary(candidates, {
@@ -32,8 +32,7 @@ if (process.env.GITHUB_STEP_SUMMARY)
 	appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${summary}\n`);
 if (shouldPost({ candidates, priorityCoverage })) {
 	const headers = {
-		accept: "application/vnd.github+json",
-		authorization: `Bearer ${token}`,
+		...githubHeaders(token),
 		"content-type": "application/json",
 	};
 	// Idempotence (#1356 review): update the previous detector comment instead
