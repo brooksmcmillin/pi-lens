@@ -407,6 +407,8 @@ describe("#4680 r4 F1: ci-verdict runs in a checkout that was never built", () =
 				"scripts/lib/ci-checks.mjs",
 				"scripts/lib/ci-failure-classifier.mjs",
 				"scripts/lib/github-rest.mjs",
+				"scripts/lib/mutation-pr-comment.mjs",
+				"scripts/lib/mutation-report-render.mjs",
 				"scripts/lib/vitest-summary.mjs",
 			])
 				copyFileSync(join(ROOT, file), join(dir, file));

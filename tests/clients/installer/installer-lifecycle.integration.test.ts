@@ -131,10 +131,13 @@ function writeDumpingPackageLayout(
 			},
 			{
 				path: entryRelative,
+				// Drain a cap-sized prefix before abrupt exit can discard the noisy tail.
 				content: [
+					'process.stderr.write("x".repeat(128 * 1024), () => {',
 					'process.stderr.write("x".repeat(2 * 1024 * 1024) + "\\n");',
 					'process.stderr.write("Connection input stream is not set. Please use listen()\\n");',
 					"process.exit(1);",
+					"});",
 				].join("\n"),
 			},
 			...(pkg.omitShim
